@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test'
-import { decideChannelPolicy, isBotDMBlocked, type ChannelPolicy } from './gate.ts'
+import {
+  decideChannelPolicy,
+  isBotDMBlocked,
+  selectNewReplies,
+  slackTsToMs,
+  msToSlackTs,
+  type ChannelPolicy,
+  type SlackReply,
+} from './gate.ts'
 
 const HUMAN = 'U012ABCDE'
 const BOT = 'B0123ABCD'
@@ -78,6 +86,86 @@ describe('decideChannelPolicy — bots (default-deny)', () => {
     // trigger Claude in that channel. (Same rule as upstream's pre-patch
     // human allowlist; surfaced here because the bot path makes it new.)
     expect(decideChannelPolicy(policy({ allowFrom: [BOT] }), HUMAN, true, false)).toBe('drop')
+  })
+})
+
+describe('slackTs <-> ms conversion', () => {
+  test('slackTsToMs parses seconds.micros to ms', () => {
+    expect(slackTsToMs('1712345678.000200')).toBe(1712345678000)
+    expect(slackTsToMs('1712345678.500000')).toBe(1712345678500)
+  })
+
+  test('msToSlackTs round-trips through slackTsToMs at ms precision', () => {
+    const ms = 1712345678500
+    expect(slackTsToMs(msToSlackTs(ms))).toBe(ms)
+  })
+})
+
+describe('selectNewReplies — thread catch-up poller', () => {
+  const BOT_USER = 'U0BOT00000'
+  const reply = (over: Partial<SlackReply> = {}): SlackReply => ({
+    ts: '1712345678.000100',
+    user: HUMAN,
+    text: 'hi',
+    ...over,
+  })
+
+  test('keeps only replies strictly newer than the cursor', () => {
+    const replies = [
+      reply({ ts: '1712345670.000000' }), // older — drop
+      reply({ ts: '1712345680.000000' }), // == cursor — drop (already delivered)
+      reply({ ts: '1712345690.000000' }), // newer — keep
+    ]
+    const out = selectNewReplies(replies, '1712345680.000000', BOT_USER)
+    expect(out.map((r) => r.ts)).toEqual(['1712345690.000000'])
+  })
+
+  test("drops the bot's own replies", () => {
+    const replies = [
+      reply({ ts: '1712345690.000000', user: BOT_USER }),
+      reply({ ts: '1712345691.000000', user: HUMAN }),
+    ]
+    const out = selectNewReplies(replies, '1712345680.000000', BOT_USER)
+    expect(out.map((r) => r.user)).toEqual([HUMAN])
+  })
+
+  test('drops other bots (handled by the live app_mention path, not the poller)', () => {
+    const replies = [reply({ ts: '1712345690.000000', bot_id: 'B123', user: undefined })]
+    expect(selectNewReplies(replies, '1712345680.000000', BOT_USER)).toEqual([])
+  })
+
+  test('drops system subtypes but keeps file_share', () => {
+    const replies = [
+      reply({ ts: '1712345690.000000', subtype: 'channel_join' }),
+      reply({ ts: '1712345691.000000', subtype: 'message_changed' }),
+      reply({ ts: '1712345692.000000', subtype: 'file_share', files: [{ id: 'F1' }] }),
+    ]
+    const out = selectNewReplies(replies, '1712345680.000000', BOT_USER)
+    expect(out.map((r) => r.ts)).toEqual(['1712345692.000000'])
+  })
+
+  test('drops replies with no user', () => {
+    const replies = [reply({ ts: '1712345690.000000', user: undefined })]
+    expect(selectNewReplies(replies, '1712345680.000000', BOT_USER)).toEqual([])
+  })
+
+  test('returns results oldest-first even if input is unordered', () => {
+    const replies = [
+      reply({ ts: '1712345693.000000' }),
+      reply({ ts: '1712345691.000000' }),
+      reply({ ts: '1712345692.000000' }),
+    ]
+    const out = selectNewReplies(replies, '1712345680.000000', BOT_USER)
+    expect(out.map((r) => r.ts)).toEqual([
+      '1712345691.000000',
+      '1712345692.000000',
+      '1712345693.000000',
+    ])
+  })
+
+  test('undefined botUserId keeps human replies (no accidental drop)', () => {
+    const out = selectNewReplies([reply({ ts: '1712345690.000000' })], '1712345680.000000', undefined)
+    expect(out).toHaveLength(1)
   })
 })
 
