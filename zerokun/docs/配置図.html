@@ -70,6 +70,7 @@
   .tag.th { background: var(--gen-bg);  color: var(--gen); }
   .tag.ta { background: var(--auto-bg); color: var(--auto); }
   .tag.ts { background: transparent; border: 1px solid var(--line); color: var(--sub); }
+  .tag.tsc { background: var(--ink); color: var(--paper); font-size: 11px; }
   /* ---- ツリー ---- */
   .treebox {
     background: var(--card);
@@ -206,31 +207,36 @@
     <span class="chip"><span class="key">★</span>ゼロくんが読み込む2ファイル</span>
   </div>
   <div class="treebox"><pre>
-<span class="old">~/.claude/channels/slack/</span>                      <span class="cm">ゼロくん専用の設定置き場（隠しフォルダ）</span>
-<span class="t">├── </span><span class="hand">.env</span>                             <span class="tag th">手貼り</span><span class="cm">Slackトークン2つ（唯一の秘密）</span>
-<span class="t">├── </span><span class="hand">access.json</span>                      <span class="tag th">手貼り</span><span class="cm">許可ユーザー・チャンネルのリスト</span>
-<span class="t">├── </span><span class="state">threads.json</span>                     <span class="tag ts">状態</span><span class="cm">スレッドと担当AIの対応表（空から始まる）</span>
-<span class="t">├── </span><span class="state">inbox/ ・ approved/</span>              <span class="tag ts">状態</span><span class="cm">Slack添付ファイル置き場</span>
-<span class="t">├── </span><span class="auto">mcp.slack-channel.json</span>           <span class="tag ta">自動</span><span class="cm">setup.sh がこのマシン用に生成</span>
-<span class="t">├── </span><span class="auto">zerokun-triage.md</span>                <span class="tag ta">自動</span><span class="cm">setup.sh が雛形からコピー（トリアージ指示）</span>
-<span class="t">├── </span><span class="auto">zerokun-heavy-mode.generated.md</span>  <span class="tag ta">自動</span><span class="cm">起動のたび triage + CLAUDE.md を連結し再生成</span>
-<span class="t">└── </span><span class="clone">owner/</span>                           <span class="tag tc">clone</span><span class="cm">setup.sh がオーナーの2リポを自動 clone</span>
-<span class="t">    ├── </span><span class="clone">claude-config/</span> … <span class="key">★ CLAUDE.md</span>        <span class="cm">レベル別モード本体（読み込む）。他ファイルは未使用</span>
-<span class="t">    └── </span><span class="clone">claude-skills/</span> … <span class="key">★ dev/</span>             <span class="cm">/dev スキル本体（読み込む）。他13個は未使用</span>
+<span class="tag tsc">グローバル</span><span class="old">~/.claude/</span>   <span class="cm">Claude の共通設定フォルダ（このMacの全プロジェクトに効く・隠しフォルダ）。この下に2つある↓</span>
+<span class="t">│</span>
+<span class="t">├── </span><span class="old">channels/slack/</span>                      <span class="cm">ゼロくん専用の設定置き場</span>
+<span class="t">│   ├── </span><span class="hand">.env</span>                             <span class="tag th">手貼り</span><span class="cm">Slackトークン2つ（唯一の秘密）</span>
+<span class="t">│   ├── </span><span class="hand">access.json</span>                      <span class="tag th">手貼り</span><span class="cm">許可ユーザー・チャンネルのリスト</span>
+<span class="t">│   ├── </span><span class="state">threads.json</span>                     <span class="tag ts">状態</span><span class="cm">スレッドと担当AIの対応表（空から始まる）</span>
+<span class="t">│   ├── </span><span class="state">inbox/ ・ approved/</span>              <span class="tag ts">状態</span><span class="cm">Slack添付ファイル置き場</span>
+<span class="t">│   ├── </span><span class="auto">mcp.slack-channel.json</span>           <span class="tag ta">自動</span><span class="cm">setup.sh がこのマシン用に生成</span>
+<span class="t">│   ├── </span><span class="auto">zerokun-triage.md</span>                <span class="tag ta">自動</span><span class="cm">setup.sh が雛形からコピー（トリアージ指示）</span>
+<span class="t">│   ├── </span><span class="auto">zerokun-heavy-mode.generated.md</span>  <span class="tag ta">自動</span><span class="cm">起動のたび triage + CLAUDE.md を連結し再生成</span>
+<span class="t">│   └── </span><span class="clone">owner/</span>                           <span class="tag tc">clone</span><span class="cm">setup.sh がオーナーの2リポを自動 clone</span>
+<span class="t">│       ├── </span><span class="clone">claude-config/</span> … <span class="key">★ CLAUDE.md</span>        <span class="cm">レベル別モード本体（読み込む）。他ファイルは未使用</span>
+<span class="t">│       └── </span><span class="clone">claude-skills/</span> … <span class="key">★ dev/</span>             <span class="cm">/dev スキル本体（読み込む）。他13個は未使用</span>
+<span class="t">│</span>
+<span class="t">└── </span><span class="old">skills/</span>                              <span class="cm">Claude がスキルを探す決まった場所（場所は変えられないので channels と別になる）</span>
+<span class="t">    ├── </span><span class="auto">threads →</span>                        <span class="tag ta">自動</span><span class="cm">setup.sh がリンクを張る（実体は下の本体リポ）</span>
+<span class="t">    ├── </span><span class="auto">dev →</span>                            <span class="tag ta">自動</span><span class="cm">setup.sh がリンクを張る（実体は上の owner）</span>
+<span class="t">    └── </span><span class="state">toolcall-recover/</span>                <span class="cm">ゼロくんと無関係（このマシン独自・対象外）</span>
 
-<span class="old">~/.claude/skills/</span>                              <span class="cm">スキルの共通置き場</span>
-<span class="t">├── </span><span class="auto">threads →</span>                        <span class="tag ta">自動</span><span class="cm">setup.sh がリンクを張る（実体は下の本体リポ）</span>
-<span class="t">├── </span><span class="auto">dev →</span>                            <span class="tag ta">自動</span><span class="cm">setup.sh がリンクを張る（実体は上の owner）</span>
-<span class="t">└── </span><span class="state">toolcall-recover/</span>                <span class="cm">ゼロくんと無関係（このマシン独自・対象外）</span>
 
-<span class="clone">~/Desktop/Project/claude-channel-slack/</span>        <span class="tag tc">clone</span><span class="cm">git clone github.com/akira8413/zerokun これ1発で丸ごと</span>
-<span class="t">├── </span><span class="clone">server.ts ・ gate.ts ・ skills/threads</span>   <span class="cm">Slack受信・許可判定・スレッド振り分け</span>
-<span class="t">├── </span><span class="clone">claude-channel.sh</span>                        <span class="cm">起動スクリプト（重厚モード配線込み）</span>
-<span class="t">├── </span><span class="clone">zerokun/setup.sh ・ templates/ ・ docs/</span>  <span class="cm">新マシンセットアップ＋この配置図</span>
-<span class="t">└── </span><span class="state">claude-channel.sh.bak-20260807-…</span> <span class="tag ts">状態</span><span class="cm">編集前バックアップ（ローカルのみ・git対象外）</span>
-
-<span class="clone">~/Desktop/Project/BellSalsesAI/</span>                <span class="tag tc">clone</span><span class="cm">会社の各リポを別途 clone（ゼロくんの作業場所）</span>
-<span class="t">└── </span><span class="clone">CLAUDE.md ・ .claude/ ・ bsb_front/ bsb_back/ meeting-app/</span>  <span class="cm">従来どおり。矛盾時はこちらのルール優先</span>
+<span class="tag tsc">ローカル</span><span class="old">~/Desktop/Project/</span>   <span class="cm">プロジェクトのフォルダ置き場（Finderで普通に見える場所）。この下に2つある↓</span>
+<span class="t">│</span>
+<span class="t">├── </span><span class="clone">claude-channel-slack/</span>                <span class="tag tc">clone</span><span class="cm">ゼロくん本体 = git clone github.com/akira8413/zerokun これ1発</span>
+<span class="t">│   ├── </span><span class="clone">server.ts ・ gate.ts ・ skills/threads</span>   <span class="cm">Slack受信・許可判定・スレッド振り分け</span>
+<span class="t">│   ├── </span><span class="clone">claude-channel.sh</span>                        <span class="cm">起動スクリプト（重厚モード配線込み）</span>
+<span class="t">│   ├── </span><span class="clone">zerokun/setup.sh ・ templates/ ・ docs/</span>  <span class="cm">新マシンセットアップ＋この配置図</span>
+<span class="t">│   └── </span><span class="state">claude-channel.sh.bak-20260807-…</span> <span class="tag ts">状態</span><span class="cm">編集前バックアップ（ローカルのみ・git対象外）</span>
+<span class="t">│</span>
+<span class="t">└── </span><span class="clone">BellSalsesAI/</span>                        <span class="tag tc">clone</span><span class="cm">会社の各リポを別途 clone（ゼロくんの作業場所）</span>
+<span class="t">    └── </span><span class="clone">CLAUDE.md ・ .claude/ ・ bsb_front/ bsb_back/ meeting-app/</span>  <span class="cm">従来どおり。矛盾時はこちらのルール優先</span>
 </pre></div>
 
   <h2>③ 起動時に何が起きるか</h2>
