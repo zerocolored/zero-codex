@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "slack-channel": {
+      "type": "stdio",
+      "command": "__BUN__",
+      "args": ["run", "--cwd", "__REPO__", "--silent", "start"]
+    }
+  }
+}

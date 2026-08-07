@@ -4,3 +4,5 @@ bun.lock
 .venv/
 *.log
 .letta/
+.DS_Store
+claude-channel.sh.bak-*

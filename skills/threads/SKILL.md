@@ -13,6 +13,8 @@ allowed-tools:
   - Bash(cat *)
   - Agent
   - SendMessage
+  - mcp__slack-channel__reply
+  - mcp__slack-channel__react
 ---
 
 # /slack-channel:threads — Per-thread subagent dispatcher
@@ -77,6 +79,17 @@ Routing applies **only when spawning new subagents**. Existing subagents already
 
 When a `<channel source="slack" chat_id="..." message_id="..." thread_ts="..." user="..." ...>` event arrives:
 
+### Step 0: Immediately acknowledge receipt (before anything else)
+
+As your VERY FIRST action — before loading state, spawning, or routing — post a brief one-line acknowledgment to the thread so the sender sees an instant response even when the actual work will take a while. This is the dispatcher's ONE allowed Slack message; every substantive reply still comes from the subagent.
+
+- Tool: `reply` (slack-channel MCP), passing `chat_id` and `thread_ts` from the event.
+- Keep it to one short line, in the sender's language. Japanese example: `🙌 承知しました！対応します、少々お待ちください。`
+- Do this for EVERY inbound message — new thread AND follow-up — because a consolidated or busy subagent may not reach its own reply for many minutes. **A thread must never sit visibly unanswered.** (This step exists specifically because batching several threads into one subagent once left ~10 threads silent for ~30 min while that subagent worked; the immediate ack prevents that.)
+- For a rapid burst of follow-ups in the SAME thread, a `react` (emoji) on the message is an acceptable lighter-weight ack to avoid stacking near-identical lines — but default to the one-line text reply.
+
+Then proceed to Step 1.
+
 ### Step 1: Load thread state
 
 Read `~/.claude/channels/slack/threads.json`. If the file doesn't exist, treat it as `{}`. Handle JSON parse errors by treating as `{}` and logging (don't crash — an empty mapping just means all threads are "new").
@@ -134,9 +147,9 @@ If `threads[thread_ts]` exists:
 
 Claude Code automatically resumes stopped subagents when they receive a SendMessage. The subagent picks up with its full prior context intact.
 
-### Step 4: Do not reply as the main session
+### Step 4: Only the brief receipt-ack comes from the dispatcher
 
-The subagent is responsible for calling the `reply` tool to respond to Slack. The main session's job is only to dispatch. Don't post to Slack from the main session — that would bypass the isolation and mix contexts.
+Apart from the one-line receipt acknowledgment in Step 0, the subagent is responsible for ALL substantive replies (results, PRs, questions, progress) via the `reply` tool. Don't do the actual work or post substantive answers from the main session — that would bypass the isolation and mix contexts. The dispatcher's entire Slack footprint is the Step 0 ack; everything else flows through the thread's subagent.
 
 ## Subagent prompt template
 
@@ -166,6 +179,51 @@ from your project context — don't rely on relative paths or `pwd`.
 You handle exactly ONE Slack thread. Every message you'll receive in this session
 comes from the same `thread_ts`. Keep your responses relevant to this thread only.
 
+## Answer EVERY message in your thread — never tunnel-vision on the first task
+
+The thread is a live conversation, not a one-shot ticket. While you work on the
+original request, MORE messages can arrive in the SAME thread (clarifications,
+side-questions, brand-new asks). You MUST address every one of them — not only the
+task you started with. Real incident that motivated this rule: a thread asked to
+remove some UI text; the subagent did that and reported the PR, but two follow-up
+questions posted in the same thread while it worked ("does it detect anything
+besides Zoom? what are the labels?") were silently ignored. That is a dropped
+message and it is not acceptable.
+
+Rules:
+- **Before every "done" / result reply, re-read the whole thread** with
+  `fetch_messages` (pass the thread_ts) and confirm there is NO unanswered question
+  or request. New messages may have landed while you were working — you will not be
+  re-notified of them, so you must pull them yourself.
+- If a newly-arrived message is a side-question outside your current task, still
+  answer it (investigate the code/docs if needed) — or explicitly say you'll handle
+  it next and then actually do. Never let a question pass in silence.
+- Each distinct question in the thread gets its own explicit answer, even after the
+  main task's PR is up. "I finished the task" is not a substitute for "I answered
+  everything you asked."
+
+## File-system safety — you share the working tree with other threads
+
+Other Slack threads are handled by other subagents **at the same time, in the same
+repository on disk**. Your conversation context is isolated, but the files are NOT.
+If two threads edit code at once they can clobber each other or corrupt git state.
+
+Before you make ANY code change:
+
+1. Read the target repo's `CLAUDE.md` and follow its git workflow exactly (which
+   branch to start from, how PRs are made). Do not invent a workflow.
+2. If the repo uses a branch-per-task / worktree-per-task flow, create your OWN
+   branch (or `git worktree`) for this thread's work before editing. Never commit
+   directly to a shared mainline (`main` / `develop` / `master`).
+3. Never run `git checkout <other-branch>` on the shared working tree — that yanks
+   the files out from under other threads. Use a `git worktree` if you need a clean
+   tree.
+4. If the repo has no `CLAUDE.md` and no obvious branch convention, keep changes
+   minimal, work on the current branch, and tell the user in Slack what you changed
+   rather than committing silently.
+
+Read-only work (search, explain, investigate) is always safe and needs no branch.
+
 ## Slack context
 
 - **channel_id**: <chat_id>
@@ -193,6 +251,13 @@ Slack. Always pass:
 
 For acknowledgments or progress signals on slow operations, use `react` or
 `edit_message`. For uploading artifacts, use `reply` with the `files` array.
+
+**UI/visual changes need BEFORE *and* AFTER screenshots, paired, in BOTH the
+Slack reply and the PR body.** AFTER-only is not acceptable (the most common
+miss). Reproduce the pre-change state (prior commit / separate worktree /
+`git stash`) and actually render it to verify — regressions like text wrapping
+only show on screen. Each visibly changed screen gets its own pair. Only a
+brand-new screen with no prior state is exempt, and then say so explicitly.
 
 ## Default response style (until repo CLAUDE.md says otherwise)
 
