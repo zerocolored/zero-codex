@@ -8,33 +8,28 @@
     --line: #E5E4DF;
     --new: #1F7A4D;
     --new-bg: #E8F4EC;
-    --gen: #8A6A1F;
-    --gen-bg: #F6EFDC;
+    --gen: #A05A1F;
+    --gen-bg: #F6E9DC;
+    --auto: #3D6FC2;
+    --auto-bg: #E3ECF9;
     --key-bg: #DFF0E6;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --paper: #16181B;
-      --card: #1E2126;
-      --ink: #E8E8E4;
-      --sub: #9CA3AF;
-      --line: #32363C;
-      --new: #4CC38A;
-      --new-bg: #1C2E25;
-      --gen: #D8B45A;
-      --gen-bg: #2E2818;
-      --key-bg: #21382C;
+      --paper: #16181B; --card: #1E2126; --ink: #E8E8E4; --sub: #9CA3AF;
+      --line: #32363C; --new: #4CC38A; --new-bg: #1C2E25; --gen: #E0A26A;
+      --gen-bg: #2E2418; --auto: #7FA6E8; --auto-bg: #1D2836; --key-bg: #21382C;
     }
   }
   :root[data-theme="dark"] {
     --paper: #16181B; --card: #1E2126; --ink: #E8E8E4; --sub: #9CA3AF;
-    --line: #32363C; --new: #4CC38A; --new-bg: #1C2E25; --gen: #D8B45A;
-    --gen-bg: #2E2818; --key-bg: #21382C;
+    --line: #32363C; --new: #4CC38A; --new-bg: #1C2E25; --gen: #E0A26A;
+    --gen-bg: #2E2418; --auto: #7FA6E8; --auto-bg: #1D2836; --key-bg: #21382C;
   }
   :root[data-theme="light"] {
     --paper: #FAFAF8; --card: #FFFFFF; --ink: #1E2124; --sub: #6B7280;
-    --line: #E5E4DF; --new: #1F7A4D; --new-bg: #E8F4EC; --gen: #8A6A1F;
-    --gen-bg: #F6EFDC; --key-bg: #DFF0E6;
+    --line: #E5E4DF; --new: #1F7A4D; --new-bg: #E8F4EC; --gen: #A05A1F;
+    --gen-bg: #F6E9DC; --auto: #3D6FC2; --auto-bg: #E3ECF9; --key-bg: #DFF0E6;
   }
   body {
     background: var(--paper);
@@ -44,13 +39,8 @@
     margin: 0;
     padding: 32px 20px 64px;
   }
-  main { max-width: 900px; margin: 0 auto; }
-  h1 {
-    font-size: 24px;
-    margin: 0 0 4px;
-    letter-spacing: .02em;
-    text-wrap: balance;
-  }
+  main { max-width: 940px; margin: 0 auto; }
+  h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: .02em; text-wrap: balance; }
   .date { color: var(--sub); font-size: 13px; margin: 0 0 24px; }
   h2 {
     font-size: 15px;
@@ -59,19 +49,28 @@
     border-bottom: 1px solid var(--line);
     letter-spacing: .04em;
   }
-  .legend {
-    display: flex; flex-wrap: wrap; gap: 10px;
-    margin: 0 0 16px; font-size: 12.5px;
-  }
+  /* ---- 凡例 ---- */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; font-size: 12.5px; }
   .chip {
-    display: inline-flex; align-items: center; gap: 6px;
+    display: inline-flex; align-items: center; gap: 7px;
     padding: 3px 10px; border-radius: 999px;
     border: 1px solid var(--line); background: var(--card);
   }
-  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
-  .dot.n { background: var(--new); }
-  .dot.g { background: var(--gen); }
-  .dot.o { background: var(--sub); opacity: .5; }
+  /* ---- 入手方法タグ ---- */
+  .tag {
+    display: inline-block;
+    font-size: 10.5px; font-weight: 700;
+    border-radius: 4px;
+    padding: 0 6px;
+    margin-right: 7px;
+    letter-spacing: .06em;
+    vertical-align: 1px;
+  }
+  .tag.tc { background: var(--new-bg);  color: var(--new); }
+  .tag.th { background: var(--gen-bg);  color: var(--gen); }
+  .tag.ta { background: var(--auto-bg); color: var(--auto); }
+  .tag.ts { background: transparent; border: 1px solid var(--line); color: var(--sub); }
+  /* ---- ツリー ---- */
   .treebox {
     background: var(--card);
     border: 1px solid var(--line);
@@ -83,14 +82,16 @@
     margin: 0;
     font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
     font-size: 13px;
-    line-height: 1.85;
+    line-height: 2.0;
     white-space: pre;
   }
-  .t { color: var(--sub); }                 /* tree罫線 */
-  .old { color: var(--ink); opacity: .58; } /* 既存 */
-  .new { color: var(--new); font-weight: 600; }
-  .gen { color: var(--gen); font-weight: 600; }
-  .cm { color: var(--sub); font-weight: 400; }  /* 注釈 */
+  .t { color: var(--sub); }
+  .old { color: var(--ink); opacity: .58; }
+  .clone { color: var(--new); font-weight: 600; }
+  .hand  { color: var(--gen); font-weight: 700; }
+  .auto  { color: var(--auto); font-weight: 600; }
+  .state { color: var(--ink); opacity: .5; }
+  .cm { color: var(--sub); font-weight: 400; }
   .key {
     background: var(--key-bg);
     border-radius: 4px;
@@ -98,13 +99,36 @@
     font-weight: 700;
     color: var(--new);
   }
-  .flow {
+  /* ---- 全体像カード ---- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+  .card {
     background: var(--card);
     border: 1px solid var(--line);
+    border-top: 3px solid var(--sub);
     border-radius: 8px;
-    padding: 4px 20px 16px;
-    overflow-x: auto;
+    padding: 14px 16px 16px;
+    font-size: 13.5px;
   }
+  .card.c1 { border-top-color: var(--new); }
+  .card.c2 { border-top-color: #7C6BD6; }
+  .card.c3 { border-top-color: var(--gen); }
+  .card h3 { margin: 0 0 2px; font-size: 15px; }
+  .card .sub { color: var(--sub); font-size: 12px; margin: 0 0 10px; }
+  .card dl { margin: 0; }
+  .card dt { font-size: 11px; color: var(--sub); letter-spacing: .06em; margin-top: 9px; }
+  .card dd { margin: 1px 0 0; font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-all; }
+  .card dd.plain { font-family: inherit; font-size: 13px; word-break: normal; }
+  .oneline {
+    margin-top: 14px;
+    background: var(--card);
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 14px;
+    text-align: center;
+  }
+  /* ---- 起動フロー ---- */
+  .flow { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 4px 20px 16px; overflow-x: auto; }
   .step { display: flex; gap: 14px; align-items: baseline; margin-top: 14px; }
   .num {
     flex: none;
@@ -116,7 +140,7 @@
     padding: 2px 9px;
   }
   .step p { margin: 0; font-size: 14px; }
-  .step code {
+  .step code, .oneline code {
     font-family: "SF Mono", ui-monospace, monospace;
     font-size: 12.5px;
     background: var(--paper);
@@ -133,54 +157,11 @@
     font-size: 14px;
   }
   .note strong { color: var(--new); }
-  .cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-    gap: 14px;
-  }
-  .card {
-    background: var(--card);
-    border: 1px solid var(--line);
-    border-top: 3px solid var(--sub);
-    border-radius: 8px;
-    padding: 14px 16px 16px;
-    font-size: 13.5px;
-  }
-  .card.c1 { border-top-color: var(--new); }
-  .card.c2 { border-top-color: #7C6BD6; }
-  .card.c3 { border-top-color: var(--gen); }
-  .card h3 { margin: 0 0 2px; font-size: 15px; }
-  .card .sub { color: var(--sub); font-size: 12px; margin: 0 0 10px; }
-  .card dl { margin: 0; }
-  .card dt { font-size: 11px; color: var(--sub); letter-spacing: .06em; margin-top: 9px; }
-  .card dd {
-    margin: 1px 0 0;
-    font-family: "SF Mono", ui-monospace, Menlo, monospace;
-    font-size: 12px;
-    word-break: break-all;
-  }
-  .card dd.plain { font-family: inherit; font-size: 13px; word-break: normal; }
-  .oneline {
-    margin-top: 14px;
-    background: var(--card);
-    border: 1px dashed var(--line);
-    border-radius: 8px;
-    padding: 10px 16px;
-    font-size: 14px;
-    text-align: center;
-  }
 </style>
 
 <main>
   <h1>ゼロくん重厚モード 配置図</h1>
-  <p class="date">2026-08-07 セットアップ分 — どこに何を置いて、何が読み込まれるか</p>
-
-  <div class="legend">
-    <span class="chip"><span class="dot n"></span>今日追加した</span>
-    <span class="chip"><span class="dot g"></span>起動のたび自動で作り直される</span>
-    <span class="chip"><span class="dot o"></span>もともとあった（触っていない）</span>
-    <span class="chip"><span class="key">★</span>ゼロくんが実際に読むのはこの2つだけ</span>
-  </div>
+  <p class="date">2026-08-07 — どこに何があり、新マシンでは何がどう手に入るか（棲み分け）</p>
 
   <h2>① 全体像 — ゼロくんは3つの塊でできている</h2>
   <div class="cards">
@@ -214,43 +195,42 @@
       </dl>
     </div>
   </div>
-  <p class="oneline">新マシン = <strong>① clone → setup.sh 実行（②は自動）→ ③だけ手貼り → <code>zerokun</code></strong></p>
+  <p class="oneline">新マシン = <strong>clone → setup.sh 実行 → トークンと許可リストだけ手貼り → <code>zerokun</code></strong></p>
 
-  <h2>② 詳細な置き場所（フォルダの中身）</h2>
+  <h2>② 詳細な置き場所と棲み分け — 新マシンでどう手に入るか</h2>
+  <div class="legend">
+    <span class="chip"><span class="tag tc">clone</span>git clone で手に入る</span>
+    <span class="chip"><span class="tag th">手貼り</span>人がコピペで入れる（秘密）</span>
+    <span class="chip"><span class="tag ta">自動</span>setup.sh か起動時に作られる</span>
+    <span class="chip"><span class="tag ts">状態</span>会話の記録＝新マシンでは空でOK</span>
+    <span class="chip"><span class="key">★</span>ゼロくんが読み込む2ファイル</span>
+  </div>
   <div class="treebox"><pre>
-<span class="old">~/.claude/</span>
-<span class="t">├── </span><span class="old">channels/slack/</span>                          <span class="cm">ゼロくん専用の設定置き場</span>
-<span class="t">│   ├── </span><span class="old">access.json</span>                          <span class="cm">既存：Slackの許可ユーザーリスト</span>
-<span class="t">│   ├── </span><span class="old">threads.json</span>                         <span class="cm">既存：スレッドと担当AIの対応表</span>
-<span class="t">│   ├── </span><span class="old">mcp.slack-channel.json</span>               <span class="cm">既存：Slack接続の定義</span>
-<span class="t">│   ├── </span><span class="old">inbox/ ・ approved/</span>                  <span class="cm">既存：Slack添付ファイル置き場</span>
-<span class="t">│   │</span>
-<span class="t">│   ├── </span><span class="new">owner/</span>                               <span class="cm">🟢 オーナーのリポ2つを clone（更新は git pull）</span>
-<span class="t">│   │   ├── </span><span class="new">claude-config/</span>
-<span class="t">│   │   │   ├── </span><span class="key">★ CLAUDE.md</span>                  <span class="cm">レベル別モード本体（読み込む）</span>
-<span class="t">│   │   │   └── </span><span class="old">README / hooks / commands …</span>  <span class="cm">置いてあるだけ・未使用</span>
-<span class="t">│   │   └── </span><span class="new">claude-skills/</span>
-<span class="t">│   │       ├── </span><span class="key">★ dev/</span>                       <span class="cm">/dev スキル本体（読み込む）</span>
-<span class="t">│   │       └── </span><span class="old">bug-fix-fable ほか13個</span>       <span class="cm">置いてあるだけ・未使用</span>
-<span class="t">│   │</span>
-<span class="t">│   ├── </span><span class="new">zerokun-triage.md</span>                    <span class="cm">🟢 トリアージ指示（簡単→単独／他→重厚）</span>
-<span class="t">│   └── </span><span class="gen">zerokun-heavy-mode.generated.md</span>      <span class="cm">🟡 triage + CLAUDE.md を連結した完成品</span>
-<span class="t">│</span>
-<span class="t">└── </span><span class="old">skills/</span>                                  <span class="cm">スキルの共通置き場</span>
-<span class="t">    ├── </span><span class="old">threads →</span>                            <span class="cm">既存：スレッド振り分け（リンク）</span>
-<span class="t">    ├── </span><span class="old">toolcall-recover/</span>                    <span class="cm">既存</span>
-<span class="t">    └── </span><span class="new">dev → owner/claude-skills/dev</span>        <span class="cm">🟢 /dev を使える化（リンクを張っただけ）</span>
+<span class="old">~/.claude/channels/slack/</span>                      <span class="cm">ゼロくん専用の設定置き場（隠しフォルダ）</span>
+<span class="t">├── </span><span class="hand">.env</span>                             <span class="tag th">手貼り</span><span class="cm">Slackトークン2つ（唯一の秘密）</span>
+<span class="t">├── </span><span class="hand">access.json</span>                      <span class="tag th">手貼り</span><span class="cm">許可ユーザー・チャンネルのリスト</span>
+<span class="t">├── </span><span class="state">threads.json</span>                     <span class="tag ts">状態</span><span class="cm">スレッドと担当AIの対応表（空から始まる）</span>
+<span class="t">├── </span><span class="state">inbox/ ・ approved/</span>              <span class="tag ts">状態</span><span class="cm">Slack添付ファイル置き場</span>
+<span class="t">├── </span><span class="auto">mcp.slack-channel.json</span>           <span class="tag ta">自動</span><span class="cm">setup.sh がこのマシン用に生成</span>
+<span class="t">├── </span><span class="auto">zerokun-triage.md</span>                <span class="tag ta">自動</span><span class="cm">setup.sh が雛形からコピー（トリアージ指示）</span>
+<span class="t">├── </span><span class="auto">zerokun-heavy-mode.generated.md</span>  <span class="tag ta">自動</span><span class="cm">起動のたび triage + CLAUDE.md を連結し再生成</span>
+<span class="t">└── </span><span class="clone">owner/</span>                           <span class="tag tc">clone</span><span class="cm">setup.sh がオーナーの2リポを自動 clone</span>
+<span class="t">    ├── </span><span class="clone">claude-config/</span> … <span class="key">★ CLAUDE.md</span>        <span class="cm">レベル別モード本体（読み込む）。他ファイルは未使用</span>
+<span class="t">    └── </span><span class="clone">claude-skills/</span> … <span class="key">★ dev/</span>             <span class="cm">/dev スキル本体（読み込む）。他13個は未使用</span>
 
-<span class="old">~/Desktop/Project/claude-channel-slack/</span>      <span class="cm">ゼロくん本体リポ = github.com/akira8413/zerokun (private)</span>
-<span class="t">├── </span><span class="old">server.ts ・ gate.ts ・ skills/threads</span>   <span class="cm">既存：Slack受信・許可判定・スレッド振り分け</span>
-<span class="t">├── </span><span class="new">claude-channel.sh</span>                        <span class="cm">🟢 起動スクリプト（ocusnight2 から移動＋重厚モード配線を追加）</span>
-<span class="t">├── </span><span class="new">zerokun/setup.sh ・ templates/</span>           <span class="cm">🟢 新マシンセットアップ（clone → これ1発で配線再現）</span>
-<span class="t">└── </span><span class="new">claude-channel.sh.bak-20260807-heavymode</span> <span class="cm">🟢 編集前のバックアップ（git対象外）</span>
+<span class="old">~/.claude/skills/</span>                              <span class="cm">スキルの共通置き場</span>
+<span class="t">├── </span><span class="auto">threads →</span>                        <span class="tag ta">自動</span><span class="cm">setup.sh がリンクを張る（実体は下の本体リポ）</span>
+<span class="t">├── </span><span class="auto">dev →</span>                            <span class="tag ta">自動</span><span class="cm">setup.sh がリンクを張る（実体は上の owner）</span>
+<span class="t">└── </span><span class="state">toolcall-recover/</span>                <span class="cm">ゼロくんと無関係（このマシン独自・対象外）</span>
 
-<span class="old">~/Desktop/Project/BellSalsesAI/</span>              <span class="cm">ゼロくんの作業場所（今回は何も触っていない）</span>
-<span class="t">├── </span><span class="old">CLAUDE.md</span>                                <span class="cm">既存：プロジェクトのルール（従来どおり適用・矛盾時はこちら優先）</span>
-<span class="t">├── </span><span class="old">.claude/skills/ …</span>                        <span class="cm">既存：プロジェクトのスキル群（従来どおり）</span>
-<span class="t">└── </span><span class="old">bsb_front/ ・ bsb_back/ ・ meeting-app/</span>  <span class="cm">既存：実作業リポ</span>
+<span class="clone">~/Desktop/Project/claude-channel-slack/</span>        <span class="tag tc">clone</span><span class="cm">git clone github.com/akira8413/zerokun これ1発で丸ごと</span>
+<span class="t">├── </span><span class="clone">server.ts ・ gate.ts ・ skills/threads</span>   <span class="cm">Slack受信・許可判定・スレッド振り分け</span>
+<span class="t">├── </span><span class="clone">claude-channel.sh</span>                        <span class="cm">起動スクリプト（重厚モード配線込み）</span>
+<span class="t">├── </span><span class="clone">zerokun/setup.sh ・ templates/ ・ docs/</span>  <span class="cm">新マシンセットアップ＋この配置図</span>
+<span class="t">└── </span><span class="state">claude-channel.sh.bak-20260807-…</span> <span class="tag ts">状態</span><span class="cm">編集前バックアップ（ローカルのみ・git対象外）</span>
+
+<span class="clone">~/Desktop/Project/BellSalsesAI/</span>                <span class="tag tc">clone</span><span class="cm">会社の各リポを別途 clone（ゼロくんの作業場所）</span>
+<span class="t">└── </span><span class="clone">CLAUDE.md ・ .claude/ ・ bsb_front/ bsb_back/ meeting-app/</span>  <span class="cm">従来どおり。矛盾時はこちらのルール優先</span>
 </pre></div>
 
   <h2>③ 起動時に何が起きるか</h2>
@@ -259,7 +239,7 @@
       <p>ゼロくんのタブで <code>zerokun-restart</code> → 起動スクリプトが動く</p>
     </div>
     <div class="step"><span class="num">2</span>
-      <p>スクリプトが <code>zerokun-triage.md</code> ＋ オーナーの <code>CLAUDE.md</code> を連結して完成品（🟡）を作る</p>
+      <p>スクリプトが <code>zerokun-triage.md</code> ＋ オーナーの <code>CLAUDE.md</code> を連結して完成品を作る</p>
     </div>
     <div class="step"><span class="num">3</span>
       <p>その完成品を<strong>ゼロくんの Claude にだけ</strong>渡して起動（<code>--append-system-prompt-file</code>）</p>
