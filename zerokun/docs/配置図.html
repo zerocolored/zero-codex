@@ -198,7 +198,25 @@
   </div>
   <p class="oneline">新マシン = <strong>clone → setup.sh 実行 → トークンと許可リストだけ手貼り → <code>zerokun</code></strong></p>
 
-  <h2>② 詳細な置き場所と棲み分け — 新マシンでどう手に入るか</h2>
+  <h2>② ~/.claude の実物 — 「匿名のフォルダ」ではなく Claude の家に間借りしているだけ</h2>
+  <div class="treebox"><pre>
+<span class="old">~/.claude/</span>                        <span class="cm">Claude をインストールすると必ずできる本体フォルダ（このMacの実物）</span>
+<span class="t">│</span>
+<span class="t">├── </span><span class="state">settings.json ・ projects/ ・ sessions/ ・ history.jsonl ・ cache/ …</span>
+<span class="t">│</span>                                 <span class="cm">↑ Claude 本体の持ち物 約25個（ログイン・履歴・設定）。ゼロくんは一切触らない</span>
+<span class="t">│</span>
+<span class="t">├── </span><span class="old">channels/</span>                     <span class="cm">チャット入口ごとの「部屋」</span>
+<span class="t">│   ├── </span><span class="state">fakechat/ ・ telegram/</span>    <span class="cm">別の入口の部屋（元からある・ゼロくんと無関係）</span>
+<span class="t">│   └── </span><span class="clone">slack/</span>                    <span class="cm">🟢 <b>ここが「ゼロくんの部屋」＝間借りは名前付きのこの1部屋だけ</b>（中身は下の③）</span>
+<span class="t">│</span>
+<span class="t">└── </span><span class="old">skills/</span>                       <span class="cm">スキルの共通置き場（Claude がここしか見ない固定住所）</span>
+<span class="t">    ├── </span><span class="state">toolcall-recover/</span>         <span class="cm">元からある（無関係）</span>
+<span class="t">    ├── </span><span class="clone">threads →</span>                 <span class="cm">🟢 ゼロくんのリンク1本目（実体は本体リポ）</span>
+<span class="t">    └── </span><span class="clone">dev →</span>                     <span class="cm">🟢 ゼロくんのリンク2本目（実体は slack 部屋の owner）</span>
+</pre></div>
+  <p class="oneline">ゼロくんの足あと＝<strong>名前付きの部屋1つ（channels/slack）＋リンク2本</strong>。散らばらないし、消せば跡形なく消える。</p>
+
+  <h2>③ 詳細な置き場所と棲み分け — 新マシンでどう手に入るか</h2>
   <div class="legend">
     <span class="chip"><span class="tag tc">clone</span>git clone で手に入る</span>
     <span class="chip"><span class="tag th">手貼り</span>人がコピペで入れる（秘密）</span>
@@ -239,7 +257,7 @@
 <span class="t">    └── </span><span class="clone">CLAUDE.md ・ .claude/ ・ bsb_front/ bsb_back/ meeting-app/</span>  <span class="cm">従来どおり。矛盾時はこちらのルール優先</span>
 </pre></div>
 
-  <h2>③ 起動時に何が起きるか</h2>
+  <h2>④ 起動時に何が起きるか</h2>
   <div class="flow">
     <div class="step"><span class="num">1</span>
       <p>ゼロくんのタブで <code>zerokun-restart</code> → 起動スクリプトが動く</p>
