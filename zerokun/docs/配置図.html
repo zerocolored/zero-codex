@@ -133,6 +133,42 @@
     font-size: 14px;
   }
   .note strong { color: var(--new); }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 14px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-top: 3px solid var(--sub);
+    border-radius: 8px;
+    padding: 14px 16px 16px;
+    font-size: 13.5px;
+  }
+  .card.c1 { border-top-color: var(--new); }
+  .card.c2 { border-top-color: #7C6BD6; }
+  .card.c3 { border-top-color: var(--gen); }
+  .card h3 { margin: 0 0 2px; font-size: 15px; }
+  .card .sub { color: var(--sub); font-size: 12px; margin: 0 0 10px; }
+  .card dl { margin: 0; }
+  .card dt { font-size: 11px; color: var(--sub); letter-spacing: .06em; margin-top: 9px; }
+  .card dd {
+    margin: 1px 0 0;
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    font-size: 12px;
+    word-break: break-all;
+  }
+  .card dd.plain { font-family: inherit; font-size: 13px; word-break: normal; }
+  .oneline {
+    margin-top: 14px;
+    background: var(--card);
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 14px;
+    text-align: center;
+  }
 </style>
 
 <main>
@@ -146,7 +182,41 @@
     <span class="chip"><span class="key">★</span>ゼロくんが実際に読むのはこの2つだけ</span>
   </div>
 
-  <h2>① 置き場所（ゼロくん専用の設定フォルダ）</h2>
+  <h2>① 全体像 — ゼロくんは3つの塊でできている</h2>
+  <div class="cards">
+    <div class="card c1">
+      <h3>本体</h3>
+      <p class="sub">git 管理 ✅（今日リポ化した）</p>
+      <dl>
+        <dt>どこ</dt><dd>~/Desktop/Project/claude-channel-slack/</dd>
+        <dt>なに</dt><dd class="plain">Slack受信・スレッド振り分け・起動スクリプト（←今日 ocusnight2 から引っ越したのはこれ）・新マシン用 setup.sh</dd>
+        <dt>リポ</dt><dd>github.com/akira8413/zerokun (private)</dd>
+        <dt>新マシンでは</dt><dd class="plain">git clone するだけ</dd>
+      </dl>
+    </div>
+    <div class="card c2">
+      <h3>オーナーのルール</h3>
+      <p class="sub">git 外（オーナーのリポの写し）</p>
+      <dl>
+        <dt>どこ</dt><dd>~/.claude/channels/slack/owner/（隠しフォルダ）</dd>
+        <dt>なに</dt><dd class="plain">CLAUDE.md（レベル別モード）と /dev スキル（←今日 owner として追加したのはこれ）</dd>
+        <dt>大元</dt><dd>github.com/ernie1358/…（オーナー管理・private）</dd>
+        <dt>新マシンでは</dt><dd class="plain">setup.sh が自動で clone</dd>
+      </dl>
+    </div>
+    <div class="card c3">
+      <h3>秘密・状態</h3>
+      <p class="sub">git 外（手作業で入れる）</p>
+      <dl>
+        <dt>どこ</dt><dd>~/.claude/channels/slack/ 直下</dd>
+        <dt>なに</dt><dd class="plain">Slackトークン（.env）・許可ユーザーリスト（access.json）・会話の対応表（threads.json）</dd>
+        <dt>新マシンでは</dt><dd class="plain">トークンと許可リストだけ手貼り（対応表は新規でOK）</dd>
+      </dl>
+    </div>
+  </div>
+  <p class="oneline">新マシン = <strong>① clone → setup.sh 実行（②は自動）→ ③だけ手貼り → <code>zerokun</code></strong></p>
+
+  <h2>② 詳細な置き場所（フォルダの中身）</h2>
   <div class="treebox"><pre>
 <span class="old">~/.claude/</span>
 <span class="t">├── </span><span class="old">channels/slack/</span>                          <span class="cm">ゼロくん専用の設定置き場</span>
@@ -183,7 +253,7 @@
 <span class="t">└── </span><span class="old">bsb_front/ ・ bsb_back/ ・ meeting-app/</span>  <span class="cm">既存：実作業リポ</span>
 </pre></div>
 
-  <h2>② 起動時に何が起きるか</h2>
+  <h2>③ 起動時に何が起きるか</h2>
   <div class="flow">
     <div class="step"><span class="num">1</span>
       <p>ゼロくんのタブで <code>zerokun-restart</code> → 起動スクリプトが動く</p>
