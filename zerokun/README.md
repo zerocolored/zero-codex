@@ -3,13 +3,23 @@
 このリポがゼロくんの実体。Slack 受信(bridge)・スレッド振り分け(threads)・起動スクリプト・
 オーナー重厚モード(トリアージ + レベル別検証 + /dev)の配線・新マシンセットアップを全部含む。
 
-## 新マシンは3手順
+## 新マシンセットアップ（4点セット）
 
 ```bash
-git clone <このリポ> ~/Desktop/Project/claude-channel-slack
+git clone https://github.com/akira8413/zerokun.git ~/Desktop/Project/claude-channel-slack
 bash ~/Desktop/Project/claude-channel-slack/zerokun/setup.sh
-# → 表示される手動ステップ(トークン貼り付け等)をやって、新しいターミナルで: zerokun
+# → 最後に表示される手動ステップを済ませ、新しいターミナルで: zerokun
 ```
+
+1. **clone + setup.sh**（上記。配線・設定雛形・オーナーリポ取得・エイリアス登録は全自動）
+2. **Slack アプリを新規に1個作り、トークン2つ(xoxb-/xapp-)を `~/.claude/channels/slack/.env` に貼る**
+   - **1台 = Slack アプリ1個 = ボット名1つ**。アプリ名がそのままメンション名になる(例: @ゼロくん, @イチくん)。
+     配達はトークン単位なので、台ごとに別アプリにすれば混線しない。ボット名はコードのどこにも焼き付いていない
+   - アプリの作成手順(Socket Mode 有効化〜トークン取得)はリポ直下の `README.md` (bridge 本体の説明書) 参照
+3. **各種ログイン** — `claude` のログイン、`gh auth login`(GitHub)。
+   オーナーの2リポ(ernie1358/claude-config, claude-skills)は private のため、使うアカウントに閲覧権限(collaborator招待)が必要
+4. **codex CLI の導入 + ログイン** — 重厚モードのレベル2以上と /dev が Codex(GPT-5.6-sol)を構成員に使う。
+   未導入だと多人数検証が回らない(`brew install codex` 等 → OpenAI アカウントでログイン)
 
 ## 構成
 
