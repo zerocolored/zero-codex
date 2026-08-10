@@ -1045,6 +1045,26 @@ type ThreadEntry = {
   last_activity_ms?: number
 }
 
+// How long a sweep waits to hear that its messages got out. Writing to stdout
+// has no timeout of its own — a reader that stops draining would park the
+// sweep forever, and with it `pollInFlight`, killing catch-up for good. Giving
+// up on the wait is not giving up on the message: the hand-off stays in flight,
+// the read position stays put, and the next sweep joins the same attempt rather
+// than starting a second one.
+const DELIVERY_CONFIRM_TIMEOUT_MS = 10_000
+
+async function confirmedWithin(handOffs: Promise<boolean>[]): Promise<boolean[] | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const gaveUp = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), DELIVERY_CONFIRM_TIMEOUT_MS)
+  })
+  try {
+    return await Promise.race([Promise.all(handOffs), gaveUp])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** null when the file could not be read — distinct from "no threads yet". */
 function loadThreads(): Record<string, ThreadEntry> | null {
   try {
@@ -1120,16 +1140,16 @@ async function pollThreads(): Promise<void> {
           `slack channel: poll skip (${reason}) thread=${threadTs} ts=${reply.ts}\n`,
         )
       }
-      const handedOver = await Promise.all(plan.deliver.map((r) => {
+      const handedOver = await confirmedWithin(plan.deliver.map((r) => {
         const fileIds = (r.files ?? []).map((f: any) => f.id)
         return deliver(channelId, r.ts!, r.user!, r.text ?? '', threadTs, fileIds.length ? fileIds : undefined)
       }))
 
       // Moving the read position means "these are dealt with", so hold it where
-      // it is if any of them did not make it out — the next sweep re-reads the
-      // page and tries again. Persist on first sight even when the page was
-      // empty, so the seed is computed once rather than recomputed each sweep.
-      if (!handedOver.every(Boolean)) continue
+      // it is unless every one of them is confirmed out — the next sweep
+      // re-reads the page and tries again. Persist on first sight even when the
+      // page was empty, so the seed is computed once rather than each sweep.
+      if (!handedOver?.every(Boolean)) continue
       if (plan.cursor !== cursorTs || state[threadTs] === undefined) {
         state[threadTs] = plan.cursor
         mutated = true
