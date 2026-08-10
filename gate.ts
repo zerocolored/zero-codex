@@ -180,23 +180,59 @@ export function advanceReadCursor(replies: SlackReply[], cursorTs: string): stri
   return maxTs
 }
 
+export type ThreadPollPlan = {
+  /** How far the thread has now been read, delivered or not. */
+  cursor: string
+  deliver: SlackReply[]
+  skipped: { reply: SlackReply; reason: 'policy' | 'others' }[]
+}
+
 /**
- * Where to resume reading a thread.
+ * Everything the poller decides about one page of a thread. Kept whole and
+ * pure so the decisions are testable: server.ts is left with the I/O — fetch
+ * the page, hand the plan to deliver(), persist the cursor — and cannot
+ * quietly diverge from the rules by dropping a check.
+ */
+export function planThreadPoll(
+  replies: SlackReply[],
+  cursorTs: string,
+  policy: ChannelPolicy | undefined,
+  botUserId: string | undefined,
+): ThreadPollPlan {
+  const plan: ThreadPollPlan = {
+    cursor: advanceReadCursor(replies, cursorTs),
+    deliver: [],
+    skipped: [],
+  }
+  for (const reply of selectNewReplies(replies, cursorTs, botUserId)) {
+    const verdict = decideThreadReplyDelivery(policy, reply, botUserId)
+    if (verdict === 'deliver') plan.deliver.push(reply)
+    else plan.skipped.push({ reply, reason: verdict === 'drop-policy' ? 'policy' : 'others' })
+  }
+  return plan
+}
+
+/**
+ * Where to resume reading a thread: the newest of what the poller has already
+ * read and what the dispatcher has already handled live.
  *
- * `seenTs` — the poller's own persisted high-water mark — is authoritative.
- * `lastActivityMs` (the dispatcher's wall clock, written AFTER a dispatch
- * finished) only seeds a thread we have never polled, so adopting an old
- * thread does not replay its human backlog. It deliberately does NOT act as a
- * floor afterwards: it sorts above replies posted while the agent was still
- * working, and using it as one made those replies unreachable forever.
+ * `handledTs` is the ts of the message that last triggered a dispatch — a real
+ * Slack ts, so it names a point in the thread. `lastActivityMs` is the older
+ * form of the same idea and is a WALL CLOCK stamped after the dispatch
+ * finished; it therefore sorts above replies posted while the agent was still
+ * working, and any thread whose entry still carries only that keeps the
+ * pre-existing blind spot until its next dispatch records a real ts.
  */
 export function threadPollCursor(
   seenTs: string | undefined,
+  handledTs: string | undefined,
   lastActivityMs: number | undefined,
   threadTs: string,
 ): string {
-  if (seenTs) return seenTs
-  return lastActivityMs ? msToSlackTs(lastActivityMs) : threadTs
+  const floor = handledTs ?? (lastActivityMs ? msToSlackTs(lastActivityMs) : undefined)
+  const known = [seenTs, floor].filter((ts): ts is string => !!ts)
+  if (known.length === 0) return threadTs
+  return known.reduce((a, b) => (parseFloat(a) > parseFloat(b) ? a : b))
 }
 
 /**

@@ -34,11 +34,20 @@ Thread-to-agent mappings live in `~/.claude/channels/slack/threads.json`:
   "1718400000.000100": {
     "agent_id": "agent-a3f2c1",
     "channel_id": "C0ASQSQCGCB",
+    "last_message_ts": "1718499990.000300",
     "last_activity_ms": 1718500000000,
     "topic": "GA CCNS disaster recovery questions"
   }
 }
 ```
+
+`last_message_ts` is the `message_id` of the event you just dispatched, and it
+is the catch-up poller's floor: it will not re-deliver anything up to that
+point. Record it on every dispatch, and record the event's own `message_id` —
+never a clock reading. `last_activity_ms` is a wall clock stamped *after* the
+dispatch, so it sorts above replies posted while the agent was still working;
+using it as the floor made those replies unreachable, which is why the message
+ts exists as a separate field.
 
 The file survives Claude Code restarts. Subagent context is stored separately by Claude Code itself (in `~/.claude/projects/*/subagents/`), so resuming a subagent by ID restores its full conversation history.
 
@@ -127,6 +136,7 @@ If no entry exists for this `thread_ts`:
     "channel_id": "<chat_id from event>",
     "repo_path": "<repo_path resolved above>",
     "label": "<label>",
+    "last_message_ts": "<message_id from event>",
     "last_activity_ms": <now>,
     "topic": "<first ~60 chars of the user's message>"
   }
@@ -143,7 +153,7 @@ If `threads[thread_ts]` exists:
    - **to**: `<agent_id from threads.json>`
    - **message**: The inbound event, formatted per the "Follow-up message template" below.
 
-2. Update `last_activity_ms` in `threads.json` to the current timestamp.
+2. Update `last_message_ts` (to the event's `message_id`) and `last_activity_ms` (to the current timestamp) in `threads.json`.
 
 Claude Code automatically resumes stopped subagents when they receive a SendMessage. The subagent picks up with its full prior context intact.
 

@@ -23,8 +23,8 @@ import {
 import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
 import {
-  decideChannelPolicy, isBotDMBlocked, selectNewReplies, threadPollCursor,
-  decideThreadReplyDelivery, resolveIsMention, advanceReadCursor,
+  decideChannelPolicy, isBotDMBlocked, threadPollCursor, planThreadPoll,
+  resolveIsMention,
   type ChannelPolicy,
 } from './gate.ts'
 
@@ -967,7 +967,13 @@ process.stdin.on('close', shutdown)
 // fires a notification (which wakes Claude) when there is a genuinely new
 // reply. Empty polls cost nothing on the Claude side.
 
-type ThreadEntry = { channel_id?: string; last_activity_ms?: number }
+type ThreadEntry = {
+  channel_id?: string
+  /** ts of the message that last triggered a dispatch — the poller's floor. */
+  last_message_ts?: string
+  /** Wall clock of that dispatch. Drives the active window; a legacy floor. */
+  last_activity_ms?: number
+}
 
 function loadThreads(): Record<string, ThreadEntry> {
   try {
@@ -1014,9 +1020,9 @@ async function pollThreads(): Promise<void> {
       const lastActivity = entry.last_activity_ms ?? 0
       if (now - lastActivity > THREAD_ACTIVE_WINDOW_MS) continue
 
-      // Replay of anything the live path already handled is caught by the
-      // (chat, ts) dedup in deliver().
-      const cursorTs = threadPollCursor(state[threadTs], lastActivity, threadTs)
+      const cursorTs = threadPollCursor(
+        state[threadTs], entry.last_message_ts, lastActivity, threadTs,
+      )
 
       let replies: any[]
       try {
@@ -1032,36 +1038,23 @@ async function pollThreads(): Promise<void> {
         continue
       }
 
-      // Read-position and delivery are tracked separately: the cursor moves
-      // past everything on the page (Slack pages `conversations.replies`
-      // oldest-first, so a page of nothing but the bot's own posts must still
-      // advance it or the human replies behind that page are never reached).
-      const maxTs = advanceReadCursor(replies, cursorTs)
+      const plan = planThreadPoll(replies, cursorTs, access.channels[channelId], botUserId)
 
-      // A reply in a thread the bot already owns is itself the opt-in, so the
-      // channel's requireMention is intentionally bypassed here — but the
-      // allowlist still applies (isMention forced true isolates that one rule).
-      //
-      // What owning a thread does NOT buy is the right to answer mail addressed
-      // to somebody else. When humans @ each other inside a thread the bot
-      // happens to own, the bot butting in is noise, so those replies are
-      // skipped.
-      const policy = access.channels[channelId]
-      for (const r of selectNewReplies(replies, cursorTs, botUserId)) {
-        const verdict = decideThreadReplyDelivery(policy, r, botUserId)
-        if (verdict === 'drop-policy') continue
-        if (verdict === 'drop-others') {
-          process.stderr.write(
-            `slack channel: poll skip (addressed to others) thread=${threadTs} ts=${r.ts}\n`,
-          )
-          continue
-        }
+      for (const { reply, reason } of plan.skipped) {
+        if (reason !== 'others') continue
+        process.stderr.write(
+          `slack channel: poll skip (addressed to others) thread=${threadTs} ts=${reply.ts}\n`,
+        )
+      }
+      for (const r of plan.deliver) {
         const fileIds = (r.files ?? []).map((f: any) => f.id)
         deliver(channelId, r.ts!, r.user!, r.text ?? '', threadTs, fileIds.length ? fileIds : undefined)
       }
 
-      if (maxTs !== cursorTs) {
-        state[threadTs] = maxTs
+      // Persist on first sight even when the page was empty, so the seed is
+      // computed once and never drifts with the dispatcher's clock.
+      if (plan.cursor !== cursorTs || state[threadTs] === undefined) {
+        state[threadTs] = plan.cursor
         mutated = true
       }
     }

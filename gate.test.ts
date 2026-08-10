@@ -7,6 +7,7 @@ import {
   msToSlackTs,
   threadPollCursor,
   advanceReadCursor,
+  planThreadPoll,
   classifyThreadReply,
   mentionsBot,
   resolveIsMention,
@@ -395,26 +396,93 @@ describe('resolveIsMention — the live-handler wiring', () => {
 describe('threadPollCursor — where the poller resumes', () => {
   const THREAD = '1786011979.655819'
 
-  test('a never-polled thread starts at the dispatcher’s stamp, not the thread root', () => {
-    // Otherwise adopting an old thread replays its whole human backlog.
-    expect(threadPollCursor(undefined, 1786325779155, THREAD)).toBe('1786325779.155000')
+  test('a never-polled thread starts where the dispatcher last handled a message', () => {
+    // Not at the thread root: adopting an old thread must not replay its
+    // whole human backlog.
+    expect(threadPollCursor(undefined, '1786325691.248419', 1786325779155, THREAD))
+      .toBe('1786325691.248419')
   })
 
-  test('a never-polled thread with no stamp starts at the thread root', () => {
-    expect(threadPollCursor(undefined, 0, THREAD)).toBe(THREAD)
-    expect(threadPollCursor(undefined, undefined, THREAD)).toBe(THREAD)
+  test('a never-polled thread with nothing to go on starts at the thread root', () => {
+    expect(threadPollCursor(undefined, undefined, 0, THREAD)).toBe(THREAD)
+    expect(threadPollCursor(undefined, undefined, undefined, THREAD)).toBe(THREAD)
   })
 
-  test('the persisted cursor wins even when it is older than the dispatcher stamp', () => {
-    // The regression this guards: last_activity_ms is stamped AFTER a dispatch
-    // finishes, so using it as a floor swallows every reply posted while the
-    // agent was still working. Here ts …050 was posted mid-run and must stay
-    // reachable, so the cursor has to stay at …040 rather than jump to …100.
-    expect(threadPollCursor('1786400040.000000', 1786400100000, THREAD)).toBe('1786400040.000000')
+  test('a reply posted while the agent was still working stays reachable', () => {
+    // The regression this guards: the floor used to be the wall clock stamped
+    // AFTER the dispatch finished (…100), which sorts above a reply posted
+    // mid-run (…050) and buried it forever. The floor is the ts of the
+    // message that was handled (…020), so …050 is still ahead of the cursor.
+    expect(threadPollCursor(undefined, '1786400020.000000', 1786400100000, THREAD))
+      .toBe('1786400020.000000')
   })
 
-  test('the persisted cursor is used verbatim when it is newer', () => {
-    expect(threadPollCursor('1786400200.000000', 1786400100000, THREAD)).toBe('1786400200.000000')
+  test('what the live path already handled is not re-delivered after a restart', () => {
+    // Persisted cursor lags because the poller had not run yet; the handled ts
+    // carries the message the live path took, so it wins.
+    expect(threadPollCursor('1786400000.000000', '1786400020.000000', 1786400100000, THREAD))
+      .toBe('1786400020.000000')
+  })
+
+  test('the persisted cursor wins once it has overtaken the dispatcher', () => {
+    expect(threadPollCursor('1786400200.000000', '1786400020.000000', 1786400100000, THREAD))
+      .toBe('1786400200.000000')
+  })
+
+  test('an entry predating last_message_ts falls back to the wall clock', () => {
+    // Legacy threads.json entries keep their old behaviour until their next
+    // dispatch records a real ts — no regression, no silent change.
+    expect(threadPollCursor('1786400000.000000', undefined, 1786400100000, THREAD))
+      .toBe('1786400100.000000')
+  })
+})
+
+describe('planThreadPoll — one page of a thread, end to end', () => {
+  const BOT_USER = 'U0B8JC02X7E'
+  const ALICE = 'U06R9GU88RF'
+  const CURSOR = '1786325000.000000'
+  const open = policy({ requireMention: true, allowFrom: [HUMAN] })
+  const reply = (ts: string, over: Partial<SlackReply> = {}): SlackReply => ({ ts, user: HUMAN, text: 'hi', ...over })
+
+  test('routes a mixed page: bot-addressed and bare delivered, human-addressed skipped', () => {
+    const replies = [
+      reply('1786325100.000000', { text: `<@${ALICE}> <@U0A0DCGSJA0> 共有します` }),
+      reply('1786325200.000000', { text: `<@${BOT_USER}> これやって` }),
+      reply('1786325300.000000', { text: 'いいね、マージして' }),
+      reply('1786325400.000000', { user: BOT_USER, text: '対応しました' }),
+    ]
+    const plan = planThreadPoll(replies, CURSOR, open, BOT_USER)
+    expect(plan.deliver.map((r) => r.ts)).toEqual(['1786325200.000000', '1786325300.000000'])
+    expect(plan.skipped).toEqual([{ reply: replies[0]!, reason: 'others' }])
+    expect(plan.cursor).toBe('1786325400.000000')
+  })
+
+  test('a page of nothing deliverable still moves the read cursor', () => {
+    const replies = [
+      reply('1786325100.000000', { user: BOT_USER }),
+      reply('1786325200.000000', { text: `<@${ALICE}> お願い` }),
+    ]
+    const plan = planThreadPoll(replies, CURSOR, open, BOT_USER)
+    expect(plan.deliver).toEqual([])
+    expect(plan.cursor).toBe('1786325200.000000')
+  })
+
+  test('replies at or before the cursor are neither delivered nor re-reported', () => {
+    const plan = planThreadPoll([reply(CURSOR), reply('1786324000.000000')], CURSOR, open, BOT_USER)
+    expect(plan.deliver).toEqual([])
+    expect(plan.skipped).toEqual([])
+    expect(plan.cursor).toBe(CURSOR)
+  })
+
+  test('a sender off the allowlist is reported as policy, not as noise', () => {
+    const closed = policy({ requireMention: true, allowFrom: [OTHER_USER] })
+    const plan = planThreadPoll([reply('1786325100.000000')], CURSOR, closed, BOT_USER)
+    expect(plan.skipped.map((s) => s.reason)).toEqual(['policy'])
+    expect(plan.cursor).toBe('1786325100.000000')
+  })
+
+  test('an empty page changes nothing', () => {
+    expect(planThreadPoll([], CURSOR, open, BOT_USER)).toEqual({ cursor: CURSOR, deliver: [], skipped: [] })
   })
 })
 
