@@ -717,9 +717,9 @@ function loadDeliveredKeys(): string[] {
 
 function saveDeliveredKeys(): void {
   try {
-    mkdirSync(STATE_DIR, { recursive: true })
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     const tmp = DELIVERED_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify([...recentlyDelivered]), 'utf8')
+    writeFileSync(tmp, JSON.stringify([...recentlyDelivered]), { mode: 0o600 })
     renameSync(tmp, DELIVERED_FILE)
   } catch (err) {
     // Worst case we forget and redeliver something once — never a reason to
@@ -736,7 +736,6 @@ function alreadyDelivered(key: string): boolean {
     recentlyDelivered.clear()
     for (const k of kept) recentlyDelivered.add(k)
   }
-  saveDeliveredKeys()
   return false
 }
 
@@ -766,6 +765,13 @@ function deliver(
     method: 'notifications/claude/channel',
     params: { content: text || '(attachment)', meta },
   })
+
+  // Recorded only once the message is on its way out. Writing it any earlier
+  // would let a crash in between leave a message marked as handled that Claude
+  // never saw — and dedup would then suppress the retry forever. This way the
+  // worst case is the opposite one: the note is lost, the poller finds the
+  // reply again, and it arrives twice.
+  saveDeliveredKeys()
 }
 
 // Handle @mentions in channels
@@ -1002,9 +1008,14 @@ process.stdin.on('close', shutdown)
 
 type ThreadEntry = {
   channel_id?: string
-  /** ts of the message that last triggered a dispatch — the poller's floor. */
-  last_message_ts?: string
-  /** Wall clock of that dispatch. Drives the active window; a legacy floor. */
+  /**
+   * ts of the message that adopted this thread. Written once and never moved,
+   * because it is where the poller starts reading a thread it has not polled
+   * yet — a mark that crept forward with each dispatch would step over replies
+   * behind it during that first window.
+   */
+  adopted_from_ts?: string
+  /** Wall clock of the last dispatch. Drives the active window. */
   last_activity_ms?: number
 }
 
@@ -1054,7 +1065,7 @@ async function pollThreads(): Promise<void> {
       if (now - lastActivity > THREAD_ACTIVE_WINDOW_MS) continue
 
       const cursorTs = threadPollCursor(
-        state[threadTs], entry.last_message_ts, lastActivity, threadTs,
+        state[threadTs], entry.adopted_from_ts, lastActivity, threadTs,
       )
 
       let replies: any[]
@@ -1090,6 +1101,16 @@ async function pollThreads(): Promise<void> {
         state[threadTs] = plan.cursor
         mutated = true
       }
+    }
+
+    // Forget threads the dispatcher has dropped. Without this the read
+    // position outlives its thread, so a thread pruned from threads.json and
+    // later re-adopted would resume from a cursor weeks old and replay all of
+    // it — and poll-state would grow forever besides.
+    for (const threadTs of Object.keys(state)) {
+      if (threadTs in threads) continue
+      delete state[threadTs]
+      mutated = true
     }
 
     if (mutated) savePollState(state)

@@ -278,11 +278,19 @@ describe('classifyThreadReply — who is this reply talking to?', () => {
     expect(classifyThreadReply('```\n<@U06R9GU88RF> hi\n```\nこれ直して', BOT_USER)).toBe('none')
   })
 
-  test('naming us survives backticks that do not pair up', () => {
-    // Quote detection must never be able to eat our own name: an odd number of
-    // backticks shifts every span, and the message would vanish silently.
-    expect(classifyThreadReply(`<@${ALICE}> みて \`a\` b\` c <@${BOT_USER}> やって\``, BOT_USER)).toBe('bot')
+  test('naming us survives quoting that swallows the token', () => {
+    // Quote detection must not be able to eat our own name when nobody else is
+    // addressed: a stray backtick shifts every span and the message would
+    // vanish in silence.
     expect(classifyThreadReply(`\`\`\`\n<@${BOT_USER}> これ実行して`, BOT_USER)).toBe('bot')
+    expect(classifyThreadReply(`&gt; 昨日の\n\`<@${BOT_USER}>\` やっといて`, BOT_USER)).toBe('bot')
+  })
+
+  test('but a quoted mention of us never outranks a human addressed in the open', () => {
+    // Quoting an old request to us while asking a colleague about it is the
+    // exact interruption this whole change exists to stop.
+    const text = `<@${ALICE}> 昨日の件です\n&gt; <@${BOT_USER}> デプロイして\nこれ確認お願いします`
+    expect(classifyThreadReply(text, BOT_USER)).toBe('others')
   })
 
   test('quoting does not smuggle a real address past the filter', () => {
@@ -414,6 +422,15 @@ describe('threadPollCursor — where the poller resumes', () => {
   test('a never-polled thread with nothing to go on starts at the thread root', () => {
     expect(threadPollCursor(undefined, undefined, 0, THREAD)).toBe(THREAD)
     expect(threadPollCursor(undefined, undefined, undefined, THREAD)).toBe(THREAD)
+  })
+
+  test('a thread not yet polled reads from where it was adopted, not from later traffic', () => {
+    // The adoption mark is fixed. If it crept forward with each dispatch it
+    // would be a floor again for as long as the first sweep has not landed:
+    // adopt at …020, "これ見て" at …030, "@ゼロくん やって" at …040 — a moving
+    // mark would start at …040 and the message with the content in it dies.
+    expect(threadPollCursor(undefined, '1786400020.000000', 1786400045000, THREAD))
+      .toBe('1786400020.000000')
   })
 
   test('nothing the dispatcher records may drag the read position forward', () => {

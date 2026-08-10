@@ -127,15 +127,17 @@ export function classifyThreadReply(
   text: string,
   botUserId: string | undefined,
 ): ThreadReplyAudience {
-  // Naming us anywhere at all wins, before any stripping: a request that says
-  // our name out loud must never be lost to a quote-detection edge (unbalanced
-  // backticks can otherwise swallow the token and silently drop the message).
-  if (mentionsBot(text, botUserId)) return 'bot'
-  // Only then does quoting matter, so citing a colleague before instructing us
-  // stays 'none' rather than being mistaken for mail addressed to them.
+  // Quoted text is set aside first, so citing a colleague before instructing us
+  // stays ours rather than being mistaken for mail addressed to them.
   const addressed = withoutQuotedSpans(text)
+  if (mentionsBot(addressed, botUserId)) return 'bot'
   if (ANY_USER_MENTION_RE.test(addressed)) return 'others'
-  return BROADCAST_RE.test(addressed) ? 'others' : 'none'
+  if (BROADCAST_RE.test(addressed)) return 'others'
+  // Nobody was addressed in the open. A mention of us that only survives in a
+  // quote or code span still counts here — quoting back an old request to us,
+  // or a stray backtick shifting every span, must not silently eat a message
+  // — but it never outranks somebody else being addressed plainly above.
+  return mentionsBot(text, botUserId) ? 'bot' : 'none'
 }
 
 /** Live channel path: a DM is self-addressed, a channel post must name us. */
@@ -227,18 +229,20 @@ export function planThreadPoll(
  * makes redelivery a no-op, across restarts too.
  *
  * The dispatcher's marks are therefore only a starting point for a thread that
- * has never been polled, and stop an adopted thread from replaying its whole
- * human backlog: `handledTs` (the ts of the message that triggered the
- * dispatch) if present, else the older wall-clock stamp.
+ * has never been polled, and exist to stop an adopted thread from replaying its
+ * whole human backlog: `adoptedFromTs`, the ts the thread was taken on, or the
+ * older wall-clock stamp. `adoptedFromTs` must be fixed at adoption — a mark
+ * that moved with each dispatch would be a floor again for as long as the
+ * first poll has not landed, and would step over anything behind it.
  */
 export function threadPollCursor(
   seenTs: string | undefined,
-  handledTs: string | undefined,
+  adoptedFromTs: string | undefined,
   lastActivityMs: number | undefined,
   threadTs: string,
 ): string {
   if (seenTs) return seenTs
-  if (handledTs) return handledTs
+  if (adoptedFromTs) return adoptedFromTs
   return lastActivityMs ? msToSlackTs(lastActivityMs) : threadTs
 }
 
