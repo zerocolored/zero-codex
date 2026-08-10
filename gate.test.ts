@@ -5,6 +5,12 @@ import {
   selectNewReplies,
   slackTsToMs,
   msToSlackTs,
+  threadPollCursor,
+  advanceReadCursor,
+  classifyThreadReply,
+  mentionsBot,
+  resolveIsMention,
+  decideThreadReplyDelivery,
   type ChannelPolicy,
   type SlackReply,
 } from './gate.ts'
@@ -166,6 +172,249 @@ describe('selectNewReplies — thread catch-up poller', () => {
   test('undefined botUserId keeps human replies (no accidental drop)', () => {
     const out = selectNewReplies([reply({ ts: '1712345690.000000' })], '1712345680.000000', undefined)
     expect(out).toHaveLength(1)
+  })
+})
+
+describe('classifyThreadReply — who is this reply talking to?', () => {
+  const BOT_USER = 'U0B8JC02X7E'
+  const ALICE = 'U06R9GU88RF'
+  const BOB = 'U0A0DCGSJA0'
+
+  // The three replies below are verbatim from the thread that exposed the bug:
+  // the bot answered all of them, and the humans only wanted the first.
+  test('bot mention → ours', () => {
+    const text = `<@${BOT_USER}> このmdファイルのタスクないようをCSVフォーマットにして`
+    expect(classifyThreadReply(text, BOT_USER)).toBe('bot')
+  })
+
+  test('addressed at two humans → not ours (the original complaint)', () => {
+    const text = `<@${ALICE}> <@${BOB}> ゼロくんが作ってくれたCSVのチェックリストを共有します`
+    expect(classifyThreadReply(text, BOT_USER)).toBe('others')
+  })
+
+  test('addressed at one human → not ours', () => {
+    expect(classifyThreadReply(`<@${ALICE}> すいません下記の詳細をお願いしたいです！`, BOT_USER)).toBe('others')
+  })
+
+  // Un-mentioned follow-ups are how the humans actually drive the bot in an
+  // owned thread — dropping these would break "いいね、マージして".
+  test('no mention at all → ours (the owned thread is the address)', () => {
+    expect(classifyThreadReply('いいね、マージして', BOT_USER)).toBe('none')
+    expect(classifyThreadReply('', BOT_USER)).toBe('none')
+  })
+
+  test('bot mentioned alongside humans → ours (explicit beats company)', () => {
+    expect(classifyThreadReply(`<@${ALICE}> <@${BOT_USER}> これ直して`, BOT_USER)).toBe('bot')
+    expect(classifyThreadReply(`<@${BOT_USER}> <@${ALICE}> これ直して`, BOT_USER)).toBe('bot')
+  })
+
+  test('the bot display name in plain text is NOT a mention', () => {
+    // Exactly why name-matching was rejected: this sentence is *about* the bot
+    // while being addressed at humans.
+    expect(classifyThreadReply(`<@${ALICE}> ゼロくんが作ってくれたCSV`, BOT_USER)).toBe('others')
+    expect(classifyThreadReply('ゼロくん、これお願い', BOT_USER)).toBe('none')
+  })
+
+  test('broadcasts are a call to the humans, not to us', () => {
+    for (const token of ['<!here>', '<!channel>', '<!everyone>', '<!subteam^S12345ABC>']) {
+      expect(classifyThreadReply(`${token} 確認お願いします`, BOT_USER)).toBe('others')
+    }
+  })
+
+  test('a broadcast that also names the bot is ours', () => {
+    expect(classifyThreadReply(`<!here> <@${BOT_USER}> 頼む`, BOT_USER)).toBe('bot')
+  })
+
+  test('link-style mention tokens (<@U…|label>) are matched', () => {
+    expect(classifyThreadReply(`<@${BOT_USER}|zerokun> 頼む`, BOT_USER)).toBe('bot')
+    expect(classifyThreadReply(`<@${ALICE}|alice> よろしく`, BOT_USER)).toBe('others')
+  })
+
+  test('workspace-shared user ids (W-prefix) count as human mentions', () => {
+    expect(classifyThreadReply('<@W012345AB> よろしく', BOT_USER)).toBe('others')
+  })
+
+  test('an unresolved botUserId cannot mute a plain reply', () => {
+    // Only reachable if auth.test has not returned yet. A reply with no mention
+    // still gets through; one naming us degrades to 'others' because we cannot
+    // recognise our own id — acceptable because pollThreads only runs after
+    // botUserId is assigned (server.ts start-up order).
+    expect(classifyThreadReply('マージして', undefined)).toBe('none')
+    expect(classifyThreadReply(`<@${BOT_USER}> 頼む`, undefined)).toBe('others')
+  })
+
+  test('a channel link is not a mention', () => {
+    expect(classifyThreadReply('<#C0B69UHBP7Y|dev> に貼っておいた', BOT_USER)).toBe('none')
+  })
+
+  test('labelled broadcast tokens (the common form) still count', () => {
+    expect(classifyThreadReply('<!here|@here> 確認お願いします', BOT_USER)).toBe('others')
+    expect(classifyThreadReply('<!subteam^S06ABC1DEF|@dev-team> 見てください', BOT_USER)).toBe('others')
+  })
+
+  test('escaped mention text is inert (Slack escapes < and > it did not author)', () => {
+    expect(classifyThreadReply('&lt;@U06R9GU88RF&gt; と書いた', BOT_USER)).toBe('none')
+  })
+
+  test('a bot-id token is not a user mention', () => {
+    expect(classifyThreadReply('<@B012345AB> が投稿した', BOT_USER)).toBe('none')
+  })
+
+  test('an id that merely starts with ours is somebody else', () => {
+    expect(classifyThreadReply('<@U0B8JC02X7EXTRA> よろしく', BOT_USER)).toBe('others')
+  })
+
+  // Quoting a colleague and then instructing us is the everyday Slack idiom;
+  // reading the citation as the address would swallow the instruction.
+  test('a mention inside a quote is a citation, not an address', () => {
+    expect(classifyThreadReply(`&gt; <@${ALICE}> さんの案\nいいね、マージして`, BOT_USER)).toBe('none')
+    expect(classifyThreadReply(`> <@${ALICE}> さんの案\nいいね、マージして`, BOT_USER)).toBe('none')
+  })
+
+  test('a mention inside code is a citation, not an address', () => {
+    expect(classifyThreadReply(`\`<@${ALICE}>\` の話だけど直して`, BOT_USER)).toBe('none')
+    expect(classifyThreadReply('```\n<@U06R9GU88RF> hi\n```\nこれ直して', BOT_USER)).toBe('none')
+  })
+
+  test('quoting does not smuggle a real address past the filter', () => {
+    // The quote is stripped, but the live line still addresses a human.
+    expect(classifyThreadReply(`&gt; 参考\n<@${ALICE}> お願いします`, BOT_USER)).toBe('others')
+  })
+})
+
+describe('decideThreadReplyDelivery — the poller wiring', () => {
+  const BOT_USER = 'U0B8JC02X7E'
+  const ALICE = 'U06R9GU88RF'
+  const reply = (over: Partial<SlackReply> = {}): SlackReply => ({
+    ts: '1786325691.248419',
+    user: HUMAN,
+    text: 'やっといて',
+    ...over,
+  })
+  const open = policy({ requireMention: true, allowFrom: [HUMAN] })
+
+  test('delivers a reply that names the bot', () => {
+    expect(decideThreadReplyDelivery(open, reply({ text: `<@${BOT_USER}> 頼む` }), BOT_USER)).toBe('deliver')
+  })
+
+  test('delivers a reply that names nobody (owned thread = the address)', () => {
+    expect(decideThreadReplyDelivery(open, reply({ text: 'いいね、マージして' }), BOT_USER)).toBe('deliver')
+  })
+
+  test('drops a reply addressed at a human — the whole point of this change', () => {
+    expect(decideThreadReplyDelivery(open, reply({ text: `<@${ALICE}> お願いします` }), BOT_USER)).toBe('drop-others')
+  })
+
+  test('the allowlist still wins, and reports itself as the reason', () => {
+    const closed = policy({ requireMention: true, allowFrom: [OTHER_USER] })
+    expect(decideThreadReplyDelivery(closed, reply(), BOT_USER)).toBe('drop-policy')
+    // Unknown channel (e.g. a DM thread in threads.json) — policy, not noise.
+    expect(decideThreadReplyDelivery(undefined, reply({ text: `<@${ALICE}> hi` }), BOT_USER)).toBe('drop-policy')
+  })
+
+  test('an attachment with no text is ours', () => {
+    expect(decideThreadReplyDelivery(open, reply({ text: undefined, files: [{ id: 'F1' }] }), BOT_USER)).toBe('deliver')
+  })
+
+  test('a requireMention:false channel keeps reading everything', () => {
+    // It opted into the firehose, and the live path honours that. Filtering
+    // only here would make the same message land or not depending on which
+    // path happened to see it first.
+    const firehose = policy({ requireMention: false, allowFrom: [HUMAN] })
+    expect(decideThreadReplyDelivery(firehose, reply({ text: `<@${ALICE}> お願いします` }), BOT_USER)).toBe('deliver')
+  })
+})
+
+describe('advanceReadCursor — read position vs delivery position', () => {
+  const reply = (ts: string, over: Partial<SlackReply> = {}): SlackReply => ({ ts, user: HUMAN, text: 'hi', ...over })
+
+  test('a page of nothing but the bot’s own posts still advances the cursor', () => {
+    // The stall this guards: delivery skips these, so advancing only past
+    // delivered replies pins the cursor and buries every human reply behind
+    // this page forever.
+    const replies = [
+      reply('1786400010.000000', { user: 'U0BOT00000' }),
+      reply('1786400020.000000', { user: 'U0BOT00000' }),
+      reply('1786400030.000000', { subtype: 'channel_join' }),
+    ]
+    expect(advanceReadCursor(replies, '1786400000.000000')).toBe('1786400030.000000')
+  })
+
+  test('skipped “addressed to others” replies advance it too', () => {
+    const replies = [reply('1786400050.000000', { text: '<@U06R9GU88RF> お願い' })]
+    expect(advanceReadCursor(replies, '1786400000.000000')).toBe('1786400050.000000')
+  })
+
+  test('never moves backwards, and holds still on an empty page', () => {
+    expect(advanceReadCursor([], '1786400000.000000')).toBe('1786400000.000000')
+    expect(advanceReadCursor([reply('1786399000.000000')], '1786400000.000000')).toBe('1786400000.000000')
+  })
+
+  test('takes the newest ts regardless of page order', () => {
+    const replies = [reply('1786400030.000000'), reply('1786400010.000000'), reply('1786400020.000000')]
+    expect(advanceReadCursor(replies, '1786400000.000000')).toBe('1786400030.000000')
+  })
+})
+
+describe('mentionsBot — live channel path', () => {
+  const BOT_USER = 'U0B8JC02X7E'
+
+  test('true only for the bot’s own token', () => {
+    expect(mentionsBot(`<@${BOT_USER}> hi`, BOT_USER)).toBe(true)
+    expect(mentionsBot(`<@${BOT_USER}|zerokun> hi`, BOT_USER)).toBe(true)
+    expect(mentionsBot('<@U06R9GU88RF> hi', BOT_USER)).toBe(false)
+    expect(mentionsBot('ゼロくん hi', BOT_USER)).toBe(false)
+    expect(mentionsBot('', BOT_USER)).toBe(false)
+  })
+
+  test('false when the bot id is unknown', () => {
+    expect(mentionsBot(`<@${BOT_USER}> hi`, undefined)).toBe(false)
+  })
+
+  test('a prefix-colliding id is not a match', () => {
+    expect(mentionsBot('<@U0B8JC02X7EXTRA> hi', BOT_USER)).toBe(false)
+  })
+})
+
+describe('resolveIsMention — the live-handler wiring', () => {
+  const BOT_USER = 'U0B8JC02X7E'
+
+  test('a DM is self-addressed', () => {
+    expect(resolveIsMention(true, 'マージして', BOT_USER)).toBe(true)
+  })
+
+  test('a channel post must actually name us', () => {
+    // Regression guard: this used to be a flat `!isDM`, which made
+    // requireMention dead config on every channel message.
+    expect(resolveIsMention(false, 'マージして', BOT_USER)).toBe(false)
+    expect(resolveIsMention(false, '<@U06R9GU88RF> お願いします', BOT_USER)).toBe(false)
+    expect(resolveIsMention(false, `<@${BOT_USER}> お願いします`, BOT_USER)).toBe(true)
+  })
+})
+
+describe('threadPollCursor — where the poller resumes', () => {
+  const THREAD = '1786011979.655819'
+
+  test('a never-polled thread starts at the dispatcher’s stamp, not the thread root', () => {
+    // Otherwise adopting an old thread replays its whole human backlog.
+    expect(threadPollCursor(undefined, 1786325779155, THREAD)).toBe('1786325779.155000')
+  })
+
+  test('a never-polled thread with no stamp starts at the thread root', () => {
+    expect(threadPollCursor(undefined, 0, THREAD)).toBe(THREAD)
+    expect(threadPollCursor(undefined, undefined, THREAD)).toBe(THREAD)
+  })
+
+  test('the persisted cursor wins even when it is older than the dispatcher stamp', () => {
+    // The regression this guards: last_activity_ms is stamped AFTER a dispatch
+    // finishes, so using it as a floor swallows every reply posted while the
+    // agent was still working. Here ts …050 was posted mid-run and must stay
+    // reachable, so the cursor has to stay at …040 rather than jump to …100.
+    expect(threadPollCursor('1786400040.000000', 1786400100000, THREAD)).toBe('1786400040.000000')
+  })
+
+  test('the persisted cursor is used verbatim when it is newer', () => {
+    expect(threadPollCursor('1786400200.000000', 1786400100000, THREAD)).toBe('1786400200.000000')
   })
 })
 

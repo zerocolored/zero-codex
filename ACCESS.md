@@ -86,6 +86,8 @@ Each channel entry has two settings:
 
 When true, Claude only responds to messages that @mention the bot. When false, Claude reads all messages in the channel (use carefully).
 
+Inside a thread Claude already owns, the catch-up poller relaxes this — the thread itself is the opt-in, so a follow-up needs no re-mention ("いいね、マージして" reaches Claude). What it does **not** relax is who the follow-up is for: a reply that @mentions somebody else, or broadcasts with `@here` / `@channel` / `@everyone` / a user group, without also naming the bot is skipped. Humans talking to each other in a thread Claude happens to own are not talking to Claude. A mention appearing only inside a quote or a code span is a citation, not an address, so quoting a colleague before instructing Claude still works.
+
 ### `allowFrom`
 
 An optional list of Slack IDs that can trigger Claude in this channel.

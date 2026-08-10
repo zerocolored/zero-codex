@@ -23,7 +23,8 @@ import {
 import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
 import {
-  decideChannelPolicy, isBotDMBlocked, selectNewReplies, msToSlackTs,
+  decideChannelPolicy, isBotDMBlocked, selectNewReplies, threadPollCursor,
+  decideThreadReplyDelivery, resolveIsMention, advanceReadCursor,
   type ChannelPolicy,
 } from './gate.ts'
 
@@ -804,7 +805,14 @@ slackApp.event('message', async ({ event }) => {
   const threadTs = msg.thread_ts
 
   const isDM = channelType === 'im'
-  const isMention = !isDM
+  const text = msg.text as string ?? ''
+  // A DM needs no mention — the DM *is* the address. In a channel the mention
+  // has to be real: treating every channel message as mentioning us would make
+  // `requireMention` dead config, and this handler sees ALL channel traffic
+  // whenever `message.channels` is subscribed (README tells operators to
+  // subscribe it). Un-mentioned follow-ups in threads we own are not lost —
+  // the catch-up poller picks those up.
+  const isMention = resolveIsMention(isDM, text, botUserId)
 
   const result = await gate(senderId, channelId, isDM ? 'im' : 'channel', isMention, isBot)
 
@@ -822,8 +830,6 @@ slackApp.event('message', async ({ event }) => {
     }
     return
   }
-
-  const text = msg.text as string ?? ''
 
   if (isDM) {
     dmChannelUsers.set(channelId, senderId)
@@ -1008,13 +1014,9 @@ async function pollThreads(): Promise<void> {
       const lastActivity = entry.last_activity_ms ?? 0
       if (now - lastActivity > THREAD_ACTIVE_WINDOW_MS) continue
 
-      // Cursor = newest of {what the poller already delivered, the dispatcher's
-      // last processed activity}. Using last_activity_ms means messages the
-      // dispatcher already handled live are never replayed, and taking the max
-      // with the persisted cursor prevents re-delivery across restarts.
-      const activityTs = lastActivity ? msToSlackTs(lastActivity) : threadTs
-      const seenTs = state[threadTs] ?? '0'
-      const cursorTs = parseFloat(seenTs) > parseFloat(activityTs) ? seenTs : activityTs
+      // Replay of anything the live path already handled is caught by the
+      // (chat, ts) dedup in deliver().
+      const cursorTs = threadPollCursor(state[threadTs], lastActivity, threadTs)
 
       let replies: any[]
       try {
@@ -1030,22 +1032,38 @@ async function pollThreads(): Promise<void> {
         continue
       }
 
-      const fresh = selectNewReplies(replies, cursorTs, botUserId)
-      if (fresh.length === 0) continue
+      // Read-position and delivery are tracked separately: the cursor moves
+      // past everything on the page (Slack pages `conversations.replies`
+      // oldest-first, so a page of nothing but the bot's own posts must still
+      // advance it or the human replies behind that page are never reached).
+      const maxTs = advanceReadCursor(replies, cursorTs)
 
       // A reply in a thread the bot already owns is itself the opt-in, so the
       // channel's requireMention is intentionally bypassed here — but the
       // allowlist still applies (isMention forced true isolates that one rule).
+      //
+      // What owning a thread does NOT buy is the right to answer mail addressed
+      // to somebody else. When humans @ each other inside a thread the bot
+      // happens to own, the bot butting in is noise, so those replies are
+      // skipped.
       const policy = access.channels[channelId]
-      let maxTs = cursorTs
-      for (const r of fresh) {
-        if (parseFloat(r.ts!) > parseFloat(maxTs)) maxTs = r.ts!
-        if (decideChannelPolicy(policy, r.user!, true, false) !== 'deliver') continue
+      for (const r of selectNewReplies(replies, cursorTs, botUserId)) {
+        const verdict = decideThreadReplyDelivery(policy, r, botUserId)
+        if (verdict === 'drop-policy') continue
+        if (verdict === 'drop-others') {
+          process.stderr.write(
+            `slack channel: poll skip (addressed to others) thread=${threadTs} ts=${r.ts}\n`,
+          )
+          continue
+        }
         const fileIds = (r.files ?? []).map((f: any) => f.id)
         deliver(channelId, r.ts!, r.user!, r.text ?? '', threadTs, fileIds.length ? fileIds : undefined)
       }
-      state[threadTs] = maxTs
-      mutated = true
+
+      if (maxTs !== cursorTs) {
+        state[threadTs] = maxTs
+        mutated = true
+      }
     }
 
     if (mutated) savePollState(state)
