@@ -96,7 +96,10 @@ const BROADCAST_RE = /<!(?:here|channel|everyone)(?:\|[^>]*)?>|<!subteam\^[A-Z0-
 // A mention inside a quote or a code span is a citation, not an address:
 // "> <@alice> の案 / いいね、マージして" is still an instruction to us. Slack
 // escapes a typed '>' to '&gt;' in the raw text, so both spellings count.
-const QUOTED_SPAN_RE = /```[\s\S]*?```|`[^`\n]*`|^[ \t]*(?:&gt;|>)+.*$/gm
+// An unclosed fence runs to the end, which is how Slack renders it too —
+// without that alternative the tail reads as ordinary prose and a mention
+// inside it would look like an address.
+const QUOTED_SPAN_RE = /```[\s\S]*?```|```[\s\S]*$|`[^`\n]*`|^[ \t]*(?:&gt;|>)+.*$/gm
 
 function withoutQuotedSpans(text: string): string {
   return text.replace(QUOTED_SPAN_RE, ' ')

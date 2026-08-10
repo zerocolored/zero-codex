@@ -286,6 +286,13 @@ describe('classifyThreadReply — who is this reply talking to?', () => {
     expect(classifyThreadReply(`&gt; 昨日の\n\`<@${BOT_USER}>\` やっといて`, BOT_USER)).toBe('bot')
   })
 
+  test('an unclosed fence quotes to the end, the way Slack renders it', () => {
+    // Otherwise the tail reads as ordinary prose and the mention inside it
+    // looks like a plain address, outranking the human named above.
+    const text = `<@${ALICE}> 確認して\n\`\`\`\n<@${BOT_USER}> デプロイして`
+    expect(classifyThreadReply(text, BOT_USER)).toBe('others')
+  })
+
   test('but a quoted mention of us never outranks a human addressed in the open', () => {
     // Quoting an old request to us while asking a colleague about it is the
     // exact interruption this whole change exists to stop.

@@ -739,6 +739,12 @@ function alreadyDelivered(key: string): boolean {
   return false
 }
 
+/**
+ * Hands one Slack message to Claude. Resolves true once it is on the wire (or
+ * was already sent earlier), false if the hand-off failed — in which case the
+ * message is forgotten again so the poller can bring it back. Never rejects:
+ * callers that cannot wait may ignore the result.
+ */
 function deliver(
   chatId: string,
   messageTs: string,
@@ -746,8 +752,9 @@ function deliver(
   text: string,
   threadTs?: string,
   fileIds?: string[],
-): void {
-  if (alreadyDelivered(`${chatId}:${messageTs}`)) return
+): Promise<boolean> {
+  const key = `${chatId}:${messageTs}`
+  if (alreadyDelivered(key)) return Promise.resolve(true)
   const meta: Record<string, string> = {
     chat_id: chatId,
     message_id: messageTs,
@@ -761,17 +768,24 @@ function deliver(
     meta.file_ids = fileIds.join(',')
   }
 
-  void mcp.notification({
+  return mcp.notification({
     method: 'notifications/claude/channel',
     params: { content: text || '(attachment)', meta },
-  })
-
-  // Recorded only once the message is on its way out. Writing it any earlier
-  // would let a crash in between leave a message marked as handled that Claude
-  // never saw — and dedup would then suppress the retry forever. This way the
-  // worst case is the opposite one: the note is lost, the poller finds the
-  // reply again, and it arrives twice.
-  saveDeliveredKeys()
+  }).then(
+    () => {
+      // Written down only once the message is actually out. Recording it any
+      // earlier would let a failure in between leave a message marked handled
+      // that Claude never saw, and dedup would then suppress the retry
+      // forever. Erring the other way costs at worst a repeat.
+      saveDeliveredKeys()
+      return true
+    },
+    (err) => {
+      recentlyDelivered.delete(key)
+      process.stderr.write(`slack channel: failed to hand ${key} to Claude: ${err}\n`)
+      return false
+    },
+  )
 }
 
 // Handle @mentions in channels
@@ -1019,11 +1033,12 @@ type ThreadEntry = {
   last_activity_ms?: number
 }
 
-function loadThreads(): Record<string, ThreadEntry> {
+/** null when the file could not be read — distinct from "no threads yet". */
+function loadThreads(): Record<string, ThreadEntry> | null {
   try {
     return JSON.parse(readFileSync(THREADS_FILE, 'utf8')) as Record<string, ThreadEntry>
   } catch {
-    return {}
+    return null
   }
 }
 
@@ -1053,6 +1068,7 @@ async function pollThreads(): Promise<void> {
   pollInFlight = true
   try {
     const threads = loadThreads()
+    if (!threads) return // unreadable, mid-write, or corrupt — not "no threads"
     const state = loadPollState()
     const access = loadAccess()
     const now = Date.now()
@@ -1090,13 +1106,16 @@ async function pollThreads(): Promise<void> {
           `slack channel: poll skip (addressed to others) thread=${threadTs} ts=${reply.ts}\n`,
         )
       }
-      for (const r of plan.deliver) {
+      const handedOver = await Promise.all(plan.deliver.map((r) => {
         const fileIds = (r.files ?? []).map((f: any) => f.id)
-        deliver(channelId, r.ts!, r.user!, r.text ?? '', threadTs, fileIds.length ? fileIds : undefined)
-      }
+        return deliver(channelId, r.ts!, r.user!, r.text ?? '', threadTs, fileIds.length ? fileIds : undefined)
+      }))
 
-      // Persist on first sight even when the page was empty, so the seed is
-      // computed once and never drifts with the dispatcher's clock.
+      // Moving the read position means "these are dealt with", so hold it where
+      // it is if any of them did not make it out — the next sweep re-reads the
+      // page and tries again. Persist on first sight even when the page was
+      // empty, so the seed is computed once rather than recomputed each sweep.
+      if (!handedOver.every(Boolean)) continue
       if (plan.cursor !== cursorTs || state[threadTs] === undefined) {
         state[threadTs] = plan.cursor
         mutated = true
