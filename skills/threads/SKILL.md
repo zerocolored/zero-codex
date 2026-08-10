@@ -34,11 +34,27 @@ Thread-to-agent mappings live in `~/.claude/channels/slack/threads.json`:
   "1718400000.000100": {
     "agent_id": "agent-a3f2c1",
     "channel_id": "C0ASQSQCGCB",
+    "adopted_from_ts": "1718499990.000300",
     "last_activity_ms": 1718500000000,
     "topic": "GA CCNS disaster recovery questions"
   }
 }
 ```
+
+`adopted_from_ts` is the `message_id` of the event that made this thread yours.
+**Write it once, when you create the entry, and never update it.** The catch-up
+poller reads a thread from there until its own first sweep lands, so that
+adopting a thread does not replay the backlog people wrote in it beforehand. A
+value that crept forward on later replies would step over anything posted
+behind it in that window, and those messages would never be seen.
+
+`last_activity_ms` is a wall clock stamped *after* a dispatch — update it every
+time. It drives the poller's 48h active window, and is the starting point for
+entries written before `adopted_from_ts` existed.
+
+Neither field gates delivery. Once a thread has been polled the poller keeps
+its own read position, and messages already handed to Claude are remembered
+separately, so nothing here can cause a message to be dropped or repeated.
 
 The file survives Claude Code restarts. Subagent context is stored separately by Claude Code itself (in `~/.claude/projects/*/subagents/`), so resuming a subagent by ID restores its full conversation history.
 
@@ -127,6 +143,7 @@ If no entry exists for this `thread_ts`:
     "channel_id": "<chat_id from event>",
     "repo_path": "<repo_path resolved above>",
     "label": "<label>",
+    "adopted_from_ts": "<message_id from event>",
     "last_activity_ms": <now>,
     "topic": "<first ~60 chars of the user's message>"
   }
@@ -143,7 +160,7 @@ If `threads[thread_ts]` exists:
    - **to**: `<agent_id from threads.json>`
    - **message**: The inbound event, formatted per the "Follow-up message template" below.
 
-2. Update `last_activity_ms` in `threads.json` to the current timestamp.
+2. Update `last_activity_ms` in `threads.json` to the current timestamp. Leave `adopted_from_ts` alone — it belongs to the adoption, not to this reply.
 
 Claude Code automatically resumes stopped subagents when they receive a SendMessage. The subagent picks up with its full prior context intact.
 
@@ -328,6 +345,8 @@ When invoked by the user with `--cleanup` or when the threads.json file exceeds
 
 This doesn't delete the subagent's transcript (Claude Code manages that separately),
 but it removes our mapping so the thread is treated as new if it ever reawakens.
+The plugin drops the matching `poll-state.json` entry on its next sweep, so a
+re-adopted thread really does start fresh rather than replaying weeks of it.
 
 ## Edge cases
 

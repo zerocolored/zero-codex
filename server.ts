@@ -23,7 +23,8 @@ import {
 import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
 import {
-  decideChannelPolicy, isBotDMBlocked, selectNewReplies, msToSlackTs,
+  decideChannelPolicy, isBotDMBlocked, threadPollCursor, planThreadPoll,
+  resolveIsMention, pruneDeliveredKeys,
   type ChannelPolicy,
 } from './gate.ts'
 
@@ -35,6 +36,7 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 const LOCK_FILE = join(STATE_DIR, 'plugin.lock')
 const THREADS_FILE = join(STATE_DIR, 'threads.json')
 const POLL_STATE_FILE = join(STATE_DIR, 'poll-state.json')
+const DELIVERED_FILE = join(STATE_DIR, 'delivered.json')
 
 // Thread catch-up poller cadence and reach. Only threads whose dispatcher
 // last_activity is within the active window are polled, to bound cost — the
@@ -689,23 +691,68 @@ slackApp = new App({
 
 let botUserId: string | undefined
 
-// In-process dedup of delivered messages, keyed by `${chatId}:${messageTs}`.
-// A single Slack message can reach us more than once: an @mention fires BOTH
-// `app_mention` and `message`, and the thread catch-up poller can re-surface a
-// reply the live path already delivered. Slack's message ts is stable across
-// all of these, so collapsing on it delivers each message to Claude exactly
-// once. Bounded so it can't grow without limit; cleared on restart (harmless —
-// the poller's persistent cursor prevents cross-restart replay).
-const recentlyDelivered = new Set<string>()
-function alreadyDelivered(key: string): boolean {
-  if (recentlyDelivered.has(key)) return true
-  recentlyDelivered.add(key)
-  if (recentlyDelivered.size > 1000) {
-    for (const k of [...recentlyDelivered].slice(0, 500)) recentlyDelivered.delete(k)
+// Dedup of delivered messages, keyed by `${chatId}:${messageTs}`. A single
+// Slack message can reach us more than once: an @mention fires BOTH
+// `app_mention` and `message`, and the thread catch-up poller re-reads pages
+// that include replies the live path already delivered. Slack's message ts is
+// stable across all of these, so collapsing on it hands each message to Claude
+// exactly once.
+//
+// This is persisted, and that is load-bearing rather than belt-and-braces: it
+// is what frees the poll cursor to be nothing but a read position. Without a
+// record that survives restart, the cursor would have to be dragged forward
+// past whatever the live path handled — and doing that skips any reply sitting
+// behind it, which is how un-mentioned follow-ups went missing.
+// `delivered` is the settled record and the only thing written to disk;
+// `inFlight` holds hand-offs still in progress. Keeping them apart matters:
+// one set would let a message that is merely being sent be written down as
+// sent — a sibling hand-off finishing first persists the whole set — and if
+// the in-progress one then failed it would be marked done on disk while
+// having been removed only from memory. It would never be retried.
+const DELIVERED_KEY_LIMIT = 1000
+const delivered = new Set<string>(loadDeliveredKeys())
+const inFlight = new Map<string, Promise<boolean>>()
+
+function loadDeliveredKeys(): string[] {
+  try {
+    const parsed = JSON.parse(readFileSync(DELIVERED_FILE, 'utf8'))
+    return Array.isArray(parsed) ? parsed.filter((k): k is string => typeof k === 'string') : []
+  } catch {
+    return []
   }
-  return false
 }
 
+function saveDeliveredKeys(): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = DELIVERED_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify([...delivered]), { mode: 0o600 })
+    renameSync(tmp, DELIVERED_FILE)
+  } catch (err) {
+    // Worst case we forget and redeliver something once — never a reason to
+    // drop the message we are in the middle of handing over.
+    process.stderr.write(`slack channel: failed to persist delivered keys: ${err}\n`)
+  }
+}
+
+function rememberDelivered(key: string): void {
+  delivered.add(key)
+  if (delivered.size > DELIVERED_KEY_LIMIT) {
+    const kept = pruneDeliveredKeys(delivered, DELIVERED_KEY_LIMIT)
+    delivered.clear()
+    for (const k of kept) delivered.add(k)
+  }
+  saveDeliveredKeys()
+}
+
+/**
+ * Hands one Slack message to Claude. Resolves true once it is out (or was
+ * already sent earlier), false if the hand-off failed — in which case nothing
+ * is written down, so the poller can bring it back. A message already being
+ * handed over returns that same attempt rather than a second one, so a caller
+ * never hears "done" about work that is still in the air. Never rejects:
+ * callers that cannot wait may ignore the result.
+ */
 function deliver(
   chatId: string,
   messageTs: string,
@@ -713,8 +760,11 @@ function deliver(
   text: string,
   threadTs?: string,
   fileIds?: string[],
-): void {
-  if (alreadyDelivered(`${chatId}:${messageTs}`)) return
+): Promise<boolean> {
+  const key = `${chatId}:${messageTs}`
+  if (delivered.has(key)) return Promise.resolve(true)
+  const pending = inFlight.get(key)
+  if (pending) return pending
   const meta: Record<string, string> = {
     chat_id: chatId,
     message_id: messageTs,
@@ -728,10 +778,26 @@ function deliver(
     meta.file_ids = fileIds.join(',')
   }
 
-  void mcp.notification({
+  const handOver = mcp.notification({
     method: 'notifications/claude/channel',
     params: { content: text || '(attachment)', meta },
-  })
+  }).then(
+    () => {
+      // Written down only once the message is actually out. Recording it any
+      // earlier would let a failure in between leave a message marked handled
+      // that Claude never saw, and dedup would then suppress the retry
+      // forever. Erring the other way costs at worst a repeat.
+      rememberDelivered(key)
+      return true
+    },
+    (err) => {
+      process.stderr.write(`slack channel: failed to hand ${key} to Claude: ${err}\n`)
+      return false
+    },
+  ).finally(() => inFlight.delete(key))
+
+  inFlight.set(key, handOver)
+  return handOver
 }
 
 // Handle @mentions in channels
@@ -804,7 +870,14 @@ slackApp.event('message', async ({ event }) => {
   const threadTs = msg.thread_ts
 
   const isDM = channelType === 'im'
-  const isMention = !isDM
+  const text = msg.text as string ?? ''
+  // A DM needs no mention — the DM *is* the address. In a channel the mention
+  // has to be real: treating every channel message as mentioning us would make
+  // `requireMention` dead config, and this handler sees ALL channel traffic
+  // whenever `message.channels` is subscribed (README tells operators to
+  // subscribe it). Un-mentioned follow-ups in threads we own are not lost —
+  // the catch-up poller picks those up.
+  const isMention = resolveIsMention(isDM, text, botUserId)
 
   const result = await gate(senderId, channelId, isDM ? 'im' : 'channel', isMention, isBot)
 
@@ -822,8 +895,6 @@ slackApp.event('message', async ({ event }) => {
     }
     return
   }
-
-  const text = msg.text as string ?? ''
 
   if (isDM) {
     dmChannelUsers.set(channelId, senderId)
@@ -961,13 +1032,45 @@ process.stdin.on('close', shutdown)
 // fires a notification (which wakes Claude) when there is a genuinely new
 // reply. Empty polls cost nothing on the Claude side.
 
-type ThreadEntry = { channel_id?: string; last_activity_ms?: number }
+type ThreadEntry = {
+  channel_id?: string
+  /**
+   * ts of the message that adopted this thread. Written once and never moved,
+   * because it is where the poller starts reading a thread it has not polled
+   * yet — a mark that crept forward with each dispatch would step over replies
+   * behind it during that first window.
+   */
+  adopted_from_ts?: string
+  /** Wall clock of the last dispatch. Drives the active window. */
+  last_activity_ms?: number
+}
 
-function loadThreads(): Record<string, ThreadEntry> {
+// How long a sweep waits to hear that its messages got out. Writing to stdout
+// has no timeout of its own — a reader that stops draining would park the
+// sweep forever, and with it `pollInFlight`, killing catch-up for good. Giving
+// up on the wait is not giving up on the message: the hand-off stays in flight,
+// the read position stays put, and the next sweep joins the same attempt rather
+// than starting a second one.
+const DELIVERY_CONFIRM_TIMEOUT_MS = 10_000
+
+async function confirmedWithin(handOffs: Promise<boolean>[]): Promise<boolean[] | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const gaveUp = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), DELIVERY_CONFIRM_TIMEOUT_MS)
+  })
+  try {
+    return await Promise.race([Promise.all(handOffs), gaveUp])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** null when the file could not be read — distinct from "no threads yet". */
+function loadThreads(): Record<string, ThreadEntry> | null {
   try {
     return JSON.parse(readFileSync(THREADS_FILE, 'utf8')) as Record<string, ThreadEntry>
   } catch {
-    return {}
+    return null
   }
 }
 
@@ -997,6 +1100,7 @@ async function pollThreads(): Promise<void> {
   pollInFlight = true
   try {
     const threads = loadThreads()
+    if (!threads) return // unreadable, mid-write, or corrupt — not "no threads"
     const state = loadPollState()
     const access = loadAccess()
     const now = Date.now()
@@ -1008,13 +1112,9 @@ async function pollThreads(): Promise<void> {
       const lastActivity = entry.last_activity_ms ?? 0
       if (now - lastActivity > THREAD_ACTIVE_WINDOW_MS) continue
 
-      // Cursor = newest of {what the poller already delivered, the dispatcher's
-      // last processed activity}. Using last_activity_ms means messages the
-      // dispatcher already handled live are never replayed, and taking the max
-      // with the persisted cursor prevents re-delivery across restarts.
-      const activityTs = lastActivity ? msToSlackTs(lastActivity) : threadTs
-      const seenTs = state[threadTs] ?? '0'
-      const cursorTs = parseFloat(seenTs) > parseFloat(activityTs) ? seenTs : activityTs
+      const cursorTs = threadPollCursor(
+        state[threadTs], entry.adopted_from_ts, lastActivity, threadTs,
+      )
 
       let replies: any[]
       try {
@@ -1030,21 +1130,39 @@ async function pollThreads(): Promise<void> {
         continue
       }
 
-      const fresh = selectNewReplies(replies, cursorTs, botUserId)
-      if (fresh.length === 0) continue
+      const plan = planThreadPoll(replies, cursorTs, access.channels[channelId], botUserId)
 
-      // A reply in a thread the bot already owns is itself the opt-in, so the
-      // channel's requireMention is intentionally bypassed here — but the
-      // allowlist still applies (isMention forced true isolates that one rule).
-      const policy = access.channels[channelId]
-      let maxTs = cursorTs
-      for (const r of fresh) {
-        if (parseFloat(r.ts!) > parseFloat(maxTs)) maxTs = r.ts!
-        if (decideChannelPolicy(policy, r.user!, true, false) !== 'deliver') continue
-        const fileIds = (r.files ?? []).map((f: any) => f.id)
-        deliver(channelId, r.ts!, r.user!, r.text ?? '', threadTs, fileIds.length ? fileIds : undefined)
+      for (const { reply, reason } of plan.skipped) {
+        // 'policy' covers DM threads too: access.channels has no `D…` entry, so
+        // the poller has never delivered DM catch-up at all. Logged rather than
+        // silent so that gap is visible while it stands.
+        process.stderr.write(
+          `slack channel: poll skip (${reason}) thread=${threadTs} ts=${reply.ts}\n`,
+        )
       }
-      state[threadTs] = maxTs
+      const handedOver = await confirmedWithin(plan.deliver.map((r) => {
+        const fileIds = (r.files ?? []).map((f: any) => f.id)
+        return deliver(channelId, r.ts!, r.user!, r.text ?? '', threadTs, fileIds.length ? fileIds : undefined)
+      }))
+
+      // Moving the read position means "these are dealt with", so hold it where
+      // it is unless every one of them is confirmed out — the next sweep
+      // re-reads the page and tries again. Persist on first sight even when the
+      // page was empty, so the seed is computed once rather than each sweep.
+      if (!handedOver?.every(Boolean)) continue
+      if (plan.cursor !== cursorTs || state[threadTs] === undefined) {
+        state[threadTs] = plan.cursor
+        mutated = true
+      }
+    }
+
+    // Forget threads the dispatcher has dropped. Without this the read
+    // position outlives its thread, so a thread pruned from threads.json and
+    // later re-adopted would resume from a cursor weeks old and replay all of
+    // it — and poll-state would grow forever besides.
+    for (const threadTs of Object.keys(state)) {
+      if (threadTs in threads) continue
+      delete state[threadTs]
       mutated = true
     }
 
