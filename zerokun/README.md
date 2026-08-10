@@ -6,7 +6,7 @@
 ## 新マシンセットアップ（4点セット）
 
 ```bash
-git clone https://github.com/akira8413/zerokun.git ~/Desktop/Project/claude-channel-slack
+git clone https://github.com/zerocolored/zero.git ~/Desktop/Project/claude-channel-slack
 bash ~/Desktop/Project/claude-channel-slack/zerokun/setup.sh
 # → 最後に表示される手動ステップを済ませ、新しいターミナルで: zerokun
 ```
