@@ -703,8 +703,15 @@ let botUserId: string | undefined
 // record that survives restart, the cursor would have to be dragged forward
 // past whatever the live path handled — and doing that skips any reply sitting
 // behind it, which is how un-mentioned follow-ups went missing.
+// `delivered` is the settled record and the only thing written to disk;
+// `inFlight` holds hand-offs still in progress. Keeping them apart matters:
+// one set would let a message that is merely being sent be written down as
+// sent — a sibling hand-off finishing first persists the whole set — and if
+// the in-progress one then failed it would be marked done on disk while
+// having been removed only from memory. It would never be retried.
 const DELIVERED_KEY_LIMIT = 1000
-const recentlyDelivered = new Set<string>(loadDeliveredKeys())
+const delivered = new Set<string>(loadDeliveredKeys())
+const inFlight = new Map<string, Promise<boolean>>()
 
 function loadDeliveredKeys(): string[] {
   try {
@@ -719,7 +726,7 @@ function saveDeliveredKeys(): void {
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     const tmp = DELIVERED_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify([...recentlyDelivered]), { mode: 0o600 })
+    writeFileSync(tmp, JSON.stringify([...delivered]), { mode: 0o600 })
     renameSync(tmp, DELIVERED_FILE)
   } catch (err) {
     // Worst case we forget and redeliver something once — never a reason to
@@ -728,21 +735,22 @@ function saveDeliveredKeys(): void {
   }
 }
 
-function alreadyDelivered(key: string): boolean {
-  if (recentlyDelivered.has(key)) return true
-  recentlyDelivered.add(key)
-  if (recentlyDelivered.size > DELIVERED_KEY_LIMIT) {
-    const kept = pruneDeliveredKeys(recentlyDelivered, DELIVERED_KEY_LIMIT)
-    recentlyDelivered.clear()
-    for (const k of kept) recentlyDelivered.add(k)
+function rememberDelivered(key: string): void {
+  delivered.add(key)
+  if (delivered.size > DELIVERED_KEY_LIMIT) {
+    const kept = pruneDeliveredKeys(delivered, DELIVERED_KEY_LIMIT)
+    delivered.clear()
+    for (const k of kept) delivered.add(k)
   }
-  return false
+  saveDeliveredKeys()
 }
 
 /**
- * Hands one Slack message to Claude. Resolves true once it is on the wire (or
- * was already sent earlier), false if the hand-off failed — in which case the
- * message is forgotten again so the poller can bring it back. Never rejects:
+ * Hands one Slack message to Claude. Resolves true once it is out (or was
+ * already sent earlier), false if the hand-off failed — in which case nothing
+ * is written down, so the poller can bring it back. A message already being
+ * handed over returns that same attempt rather than a second one, so a caller
+ * never hears "done" about work that is still in the air. Never rejects:
  * callers that cannot wait may ignore the result.
  */
 function deliver(
@@ -754,7 +762,9 @@ function deliver(
   fileIds?: string[],
 ): Promise<boolean> {
   const key = `${chatId}:${messageTs}`
-  if (alreadyDelivered(key)) return Promise.resolve(true)
+  if (delivered.has(key)) return Promise.resolve(true)
+  const pending = inFlight.get(key)
+  if (pending) return pending
   const meta: Record<string, string> = {
     chat_id: chatId,
     message_id: messageTs,
@@ -768,7 +778,7 @@ function deliver(
     meta.file_ids = fileIds.join(',')
   }
 
-  return mcp.notification({
+  const handOver = mcp.notification({
     method: 'notifications/claude/channel',
     params: { content: text || '(attachment)', meta },
   }).then(
@@ -777,15 +787,17 @@ function deliver(
       // earlier would let a failure in between leave a message marked handled
       // that Claude never saw, and dedup would then suppress the retry
       // forever. Erring the other way costs at worst a repeat.
-      saveDeliveredKeys()
+      rememberDelivered(key)
       return true
     },
     (err) => {
-      recentlyDelivered.delete(key)
       process.stderr.write(`slack channel: failed to hand ${key} to Claude: ${err}\n`)
       return false
     },
-  )
+  ).finally(() => inFlight.delete(key))
+
+  inFlight.set(key, handOver)
+  return handOver
 }
 
 // Handle @mentions in channels
@@ -1101,9 +1113,11 @@ async function pollThreads(): Promise<void> {
       const plan = planThreadPoll(replies, cursorTs, access.channels[channelId], botUserId)
 
       for (const { reply, reason } of plan.skipped) {
-        if (reason !== 'others') continue
+        // 'policy' covers DM threads too: access.channels has no `D…` entry, so
+        // the poller has never delivered DM catch-up at all. Logged rather than
+        // silent so that gap is visible while it stands.
         process.stderr.write(
-          `slack channel: poll skip (addressed to others) thread=${threadTs} ts=${reply.ts}\n`,
+          `slack channel: poll skip (${reason}) thread=${threadTs} ts=${reply.ts}\n`,
         )
       }
       const handedOver = await Promise.all(plan.deliver.map((r) => {
