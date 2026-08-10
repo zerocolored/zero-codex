@@ -41,13 +41,17 @@ Thread-to-agent mappings live in `~/.claude/channels/slack/threads.json`:
 }
 ```
 
-`last_message_ts` is the `message_id` of the event you just dispatched, and it
-is the catch-up poller's floor: it will not re-deliver anything up to that
-point. Record it on every dispatch, and record the event's own `message_id` —
-never a clock reading. `last_activity_ms` is a wall clock stamped *after* the
-dispatch, so it sorts above replies posted while the agent was still working;
-using it as the floor made those replies unreachable, which is why the message
-ts exists as a separate field.
+`last_message_ts` is the `message_id` of the event you just dispatched. The
+catch-up poller uses it as the starting point for a thread it has never polled,
+so it does not replay the thread's whole human backlog on adoption. Record the
+event's own `message_id` — never a clock reading. (`last_activity_ms` is a wall
+clock stamped *after* the dispatch, so it sorts above replies posted while the
+agent was still working; it remains the fallback for entries written before
+this field existed, and drives the poller's 48h active window.)
+
+Neither field gates delivery: once a thread has been polled the poller keeps
+its own read position, and messages it has already handed to Claude are
+remembered separately. So a stale or out-of-order value here costs nothing.
 
 The file survives Claude Code restarts. Subagent context is stored separately by Claude Code itself (in `~/.claude/projects/*/subagents/`), so resuming a subagent by ID restores its full conversation history.
 

@@ -8,6 +8,7 @@ import {
   threadPollCursor,
   advanceReadCursor,
   planThreadPoll,
+  pruneDeliveredKeys,
   classifyThreadReply,
   mentionsBot,
   resolveIsMention,
@@ -277,6 +278,13 @@ describe('classifyThreadReply — who is this reply talking to?', () => {
     expect(classifyThreadReply('```\n<@U06R9GU88RF> hi\n```\nこれ直して', BOT_USER)).toBe('none')
   })
 
+  test('naming us survives backticks that do not pair up', () => {
+    // Quote detection must never be able to eat our own name: an odd number of
+    // backticks shifts every span, and the message would vanish silently.
+    expect(classifyThreadReply(`<@${ALICE}> みて \`a\` b\` c <@${BOT_USER}> やって\``, BOT_USER)).toBe('bot')
+    expect(classifyThreadReply(`\`\`\`\n<@${BOT_USER}> これ実行して`, BOT_USER)).toBe('bot')
+  })
+
   test('quoting does not smuggle a real address past the filter', () => {
     // The quote is stripped, but the live line still addresses a human.
     expect(classifyThreadReply(`&gt; 参考\n<@${ALICE}> お願いします`, BOT_USER)).toBe('others')
@@ -408,32 +416,49 @@ describe('threadPollCursor — where the poller resumes', () => {
     expect(threadPollCursor(undefined, undefined, undefined, THREAD)).toBe(THREAD)
   })
 
-  test('a reply posted while the agent was still working stays reachable', () => {
-    // The regression this guards: the floor used to be the wall clock stamped
-    // AFTER the dispatch finished (…100), which sorts above a reply posted
-    // mid-run (…050) and buried it forever. The floor is the ts of the
-    // message that was handled (…020), so …050 is still ahead of the cursor.
-    expect(threadPollCursor(undefined, '1786400020.000000', 1786400100000, THREAD))
-      .toBe('1786400020.000000')
-  })
-
-  test('what the live path already handled is not re-delivered after a restart', () => {
-    // Persisted cursor lags because the poller had not run yet; the handled ts
-    // carries the message the live path took, so it wins.
+  test('nothing the dispatcher records may drag the read position forward', () => {
+    // The drop this guards, in both of its shapes. A bare reply lands at …010
+    // and, before the next poll, a mention at …020 is dispatched live. Letting
+    // either the handled ts (…020) or the wall clock (…100) act as a floor
+    // steps over …010 and buries it — "これ見て" then "@ゼロくん やって" is an
+    // ordinary way to type, not an edge case. Redelivering …020 is harmless:
+    // dedup catches it.
     expect(threadPollCursor('1786400000.000000', '1786400020.000000', 1786400100000, THREAD))
-      .toBe('1786400020.000000')
+      .toBe('1786400000.000000')
+    expect(threadPollCursor('1786400000.000000', undefined, 1786400100000, THREAD))
+      .toBe('1786400000.000000')
   })
 
-  test('the persisted cursor wins once it has overtaken the dispatcher', () => {
+  test('an out-of-order or stale dispatcher mark costs nothing', () => {
     expect(threadPollCursor('1786400200.000000', '1786400020.000000', 1786400100000, THREAD))
       .toBe('1786400200.000000')
   })
 
-  test('an entry predating last_message_ts falls back to the wall clock', () => {
-    // Legacy threads.json entries keep their old behaviour until their next
-    // dispatch records a real ts — no regression, no silent change.
-    expect(threadPollCursor('1786400000.000000', undefined, 1786400100000, THREAD))
+  test('a never-polled legacy entry still starts at the wall clock', () => {
+    expect(threadPollCursor(undefined, undefined, 1786400100000, THREAD))
       .toBe('1786400100.000000')
+  })
+})
+
+describe('pruneDeliveredKeys — bounding what we remember having delivered', () => {
+  const keys = (n: number, from = 0) => Array.from({ length: n }, (_, i) => `C1:${from + i}`)
+
+  test('keeps everything until the limit is passed', () => {
+    expect(pruneDeliveredKeys(keys(10), 10)).toEqual(keys(10))
+  })
+
+  test('drops the oldest half, keeping insertion order', () => {
+    expect(pruneDeliveredKeys(keys(11), 10)).toEqual(keys(5, 6))
+  })
+
+  test('keeps the NEWEST keys — forgetting those would redeliver what just arrived', () => {
+    const pruned = pruneDeliveredKeys(keys(1001), 1000)
+    expect(pruned).toHaveLength(500)
+    expect(pruned.at(-1)).toBe('C1:1000')
+  })
+
+  test('accepts a Set, which is what the caller actually holds', () => {
+    expect(pruneDeliveredKeys(new Set(keys(4)), 10)).toEqual(keys(4))
   })
 })
 

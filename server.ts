@@ -24,7 +24,7 @@ import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
 import {
   decideChannelPolicy, isBotDMBlocked, threadPollCursor, planThreadPoll,
-  resolveIsMention,
+  resolveIsMention, pruneDeliveredKeys,
   type ChannelPolicy,
 } from './gate.ts'
 
@@ -36,6 +36,7 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 const LOCK_FILE = join(STATE_DIR, 'plugin.lock')
 const THREADS_FILE = join(STATE_DIR, 'threads.json')
 const POLL_STATE_FILE = join(STATE_DIR, 'poll-state.json')
+const DELIVERED_FILE = join(STATE_DIR, 'delivered.json')
 
 // Thread catch-up poller cadence and reach. Only threads whose dispatcher
 // last_activity is within the active window are polled, to bound cost — the
@@ -690,20 +691,52 @@ slackApp = new App({
 
 let botUserId: string | undefined
 
-// In-process dedup of delivered messages, keyed by `${chatId}:${messageTs}`.
-// A single Slack message can reach us more than once: an @mention fires BOTH
-// `app_mention` and `message`, and the thread catch-up poller can re-surface a
-// reply the live path already delivered. Slack's message ts is stable across
-// all of these, so collapsing on it delivers each message to Claude exactly
-// once. Bounded so it can't grow without limit; cleared on restart (harmless —
-// the poller's persistent cursor prevents cross-restart replay).
-const recentlyDelivered = new Set<string>()
+// Dedup of delivered messages, keyed by `${chatId}:${messageTs}`. A single
+// Slack message can reach us more than once: an @mention fires BOTH
+// `app_mention` and `message`, and the thread catch-up poller re-reads pages
+// that include replies the live path already delivered. Slack's message ts is
+// stable across all of these, so collapsing on it hands each message to Claude
+// exactly once.
+//
+// This is persisted, and that is load-bearing rather than belt-and-braces: it
+// is what frees the poll cursor to be nothing but a read position. Without a
+// record that survives restart, the cursor would have to be dragged forward
+// past whatever the live path handled — and doing that skips any reply sitting
+// behind it, which is how un-mentioned follow-ups went missing.
+const DELIVERED_KEY_LIMIT = 1000
+const recentlyDelivered = new Set<string>(loadDeliveredKeys())
+
+function loadDeliveredKeys(): string[] {
+  try {
+    const parsed = JSON.parse(readFileSync(DELIVERED_FILE, 'utf8'))
+    return Array.isArray(parsed) ? parsed.filter((k): k is string => typeof k === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function saveDeliveredKeys(): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    const tmp = DELIVERED_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify([...recentlyDelivered]), 'utf8')
+    renameSync(tmp, DELIVERED_FILE)
+  } catch (err) {
+    // Worst case we forget and redeliver something once — never a reason to
+    // drop the message we are in the middle of handing over.
+    process.stderr.write(`slack channel: failed to persist delivered keys: ${err}\n`)
+  }
+}
+
 function alreadyDelivered(key: string): boolean {
   if (recentlyDelivered.has(key)) return true
   recentlyDelivered.add(key)
-  if (recentlyDelivered.size > 1000) {
-    for (const k of [...recentlyDelivered].slice(0, 500)) recentlyDelivered.delete(k)
+  if (recentlyDelivered.size > DELIVERED_KEY_LIMIT) {
+    const kept = pruneDeliveredKeys(recentlyDelivered, DELIVERED_KEY_LIMIT)
+    recentlyDelivered.clear()
+    for (const k of kept) recentlyDelivered.add(k)
   }
+  saveDeliveredKeys()
   return false
 }
 

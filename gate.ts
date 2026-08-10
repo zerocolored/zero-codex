@@ -88,6 +88,9 @@ export function msToSlackTs(ms: number): string {
 // would misfire — the reply that first exposed this rule read
 // "ゼロくんが作ってくれたCSV…" while being addressed at two humans.
 const USER_MENTION_RE = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g
+// Same pattern without /g: `test` on a global regex carries lastIndex between
+// calls, which would make the answer depend on what was asked before it.
+const ANY_USER_MENTION_RE = /<@[UW][A-Z0-9]+(?:\|[^>]*)?>/
 const BROADCAST_RE = /<!(?:here|channel|everyone)(?:\|[^>]*)?>|<!subteam\^[A-Z0-9]+(?:\|[^>]*)?>/
 
 // A mention inside a quote or a code span is a citation, not an address:
@@ -124,15 +127,14 @@ export function classifyThreadReply(
   text: string,
   botUserId: string | undefined,
 ): ThreadReplyAudience {
-  // Quoted text is stripped first, so citing a colleague before instructing us
+  // Naming us anywhere at all wins, before any stripping: a request that says
+  // our name out loud must never be lost to a quote-detection edge (unbalanced
+  // backticks can otherwise swallow the token and silently drop the message).
+  if (mentionsBot(text, botUserId)) return 'bot'
+  // Only then does quoting matter, so citing a colleague before instructing us
   // stays 'none' rather than being mistaken for mail addressed to them.
   const addressed = withoutQuotedSpans(text)
-  let sawUserMention = false
-  for (const m of addressed.matchAll(USER_MENTION_RE)) {
-    if (botUserId && m[1] === botUserId) return 'bot'
-    sawUserMention = true
-  }
-  if (sawUserMention) return 'others'
+  if (ANY_USER_MENTION_RE.test(addressed)) return 'others'
   return BROADCAST_RE.test(addressed) ? 'others' : 'none'
 }
 
@@ -213,15 +215,21 @@ export function planThreadPoll(
 }
 
 /**
- * Where to resume reading a thread: the newest of what the poller has already
- * read and what the dispatcher has already handled live.
+ * Where to resume reading a thread.
  *
- * `handledTs` is the ts of the message that last triggered a dispatch — a real
- * Slack ts, so it names a point in the thread. `lastActivityMs` is the older
- * form of the same idea and is a WALL CLOCK stamped after the dispatch
- * finished; it therefore sorts above replies posted while the agent was still
- * working, and any thread whose entry still carries only that keeps the
- * pre-existing blind spot until its next dispatch records a real ts.
+ * `seenTs` — how far the poller itself has read — is the only running
+ * position, and it only moves forward. Nothing the dispatcher records is
+ * allowed to push it: what the live path handled is NOT a read position, it is
+ * a single point that can sit anywhere ahead of unread replies, so treating it
+ * as a floor skips whatever is behind it. ("これ見て" then "@ゼロくん やって"
+ * seconds later would bury the first message.) Re-reading what the live path
+ * already delivered is fine — `deliverKeyLimit`-bounded dedup on (chat, ts)
+ * makes redelivery a no-op, across restarts too.
+ *
+ * The dispatcher's marks are therefore only a starting point for a thread that
+ * has never been polled, and stop an adopted thread from replaying its whole
+ * human backlog: `handledTs` (the ts of the message that triggered the
+ * dispatch) if present, else the older wall-clock stamp.
  */
 export function threadPollCursor(
   seenTs: string | undefined,
@@ -229,10 +237,20 @@ export function threadPollCursor(
   lastActivityMs: number | undefined,
   threadTs: string,
 ): string {
-  const floor = handledTs ?? (lastActivityMs ? msToSlackTs(lastActivityMs) : undefined)
-  const known = [seenTs, floor].filter((ts): ts is string => !!ts)
-  if (known.length === 0) return threadTs
-  return known.reduce((a, b) => (parseFloat(a) > parseFloat(b) ? a : b))
+  if (seenTs) return seenTs
+  if (handledTs) return handledTs
+  return lastActivityMs ? msToSlackTs(lastActivityMs) : threadTs
+}
+
+/**
+ * Which delivery keys to keep once the set outgrows `limit`: the newest
+ * `limit / 2`, in insertion order. Bounded so the on-disk record of what has
+ * already been handed to Claude cannot grow forever, halved rather than
+ * trimmed by one so the pruning is amortised.
+ */
+export function pruneDeliveredKeys(keys: Iterable<string>, limit: number): string[] {
+  const all = [...keys]
+  return all.length > limit ? all.slice(all.length - Math.floor(limit / 2)) : all
 }
 
 /**
