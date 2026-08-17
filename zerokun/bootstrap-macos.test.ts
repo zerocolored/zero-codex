@@ -15,6 +15,8 @@ describe('macOS bootstrap', () => {
     expect(result.stdout.toString()).toContain('--skip-slack')
     expect(result.stdout.toString()).toContain('--slack-app-name')
     expect(result.stdout.toString()).toContain('--slack-bot-name')
+    expect(result.stdout.toString()).toContain('--with-slack')
+    expect(result.stdout.toString()).toContain('--slack-only')
   })
 
   test('--doctor reports installed tool versions without changing HOME', () => {
@@ -65,20 +67,110 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('gh auth login')
     expect(script).toContain('zerocolored/zero')
     expect(script).toContain('zerocolored/skills')
+    expect(script).toContain('scripts/bootstrap-mac.sh')
+    expect(script).toContain('ensure_repo zerocolored/skills "$PROJECT_DIR" develop')
+    expect(script).toContain('ensure_repo zerocolored/bsb_front "$PROJECT_DIR/bsb_front" develop')
     expect(script).toContain('zerokun/setup.sh')
     expect(script).toContain('slack-app-manifest.yaml')
     expect(script).toContain('connections:write')
     expect(script).toContain('https://api.slack.com/apps?new_app=1')
     expect(script).toContain('Slack Appの表示名')
     expect(script).toContain('Slack bot username')
-    expect(script).toContain('xoxb-[A-Za-z0-9-]{10,}')
-    expect(script).toContain('xapp-[A-Za-z0-9-]{10,}')
+    expect(script).toContain('xoxb-[A-Za-z0-9._-]{10,}')
+    expect(script).toContain('xapp-[A-Za-z0-9._-]{10,}')
   })
 
   test('set -uでも変数直後の日本語を変数名として誤解しない', () => {
     const script = readFileSync(bootstrap, 'utf8')
     const unsafeExpansions = script.match(/\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/g) ?? []
     expect(unsafeExpansions).toEqual([])
+  })
+
+  test('default setup completes before Slack and does not enter Slack configuration', () => {
+    const command = [
+      'bootstrap_path="$1"',
+      'set --',
+      'source "$bootstrap_path"',
+      'calls=""',
+      'require_macos() { calls="$calls require_macos"; }',
+      'install_clt() { calls="$calls install_clt"; }',
+      'install_homebrew() { calls="$calls install_homebrew"; }',
+      'install_cli_tools() { calls="$calls install_cli_tools"; }',
+      'ensure_logins() { calls="$calls ensure_logins"; }',
+      'install_repositories() { calls="$calls install_repositories"; }',
+      'run_setup() { calls="$calls run_setup"; }',
+      'run_project_bootstrap() { calls="$calls run_project_bootstrap"; }',
+      'run_doctor() { calls="$calls run_doctor"; }',
+      'configure_slack() { calls="$calls configure_slack"; }',
+      'MODE="install"',
+      'WITH_SLACK=0',
+      'main',
+      'printf "CALLS:%s\\n" "$calls"',
+    ].join('; ')
+    const result = Bun.spawnSync(['/bin/bash', '-c', command, 'bash', bootstrap], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const output = result.stdout.toString()
+    expect(result.exitCode).toBe(0)
+    expect(output).toContain('Claude Codeを利用できます')
+    expect(output).toContain('run_setup run_project_bootstrap run_doctor')
+    expect(output).not.toContain('CALLS: configure_slack')
+    expect(output.split('CALLS:')[1]).not.toContain('configure_slack')
+  })
+
+  test('Slack-only mode skips every core installation step', () => {
+    const command = [
+      'bootstrap_path="$1"',
+      'set --',
+      'source "$bootstrap_path"',
+      'calls=""',
+      'require_macos() { calls="$calls require_macos"; }',
+      'install_clt() { calls="$calls install_clt"; }',
+      'install_homebrew() { calls="$calls install_homebrew"; }',
+      'install_cli_tools() { calls="$calls install_cli_tools"; }',
+      'ensure_logins() { calls="$calls ensure_logins"; }',
+      'install_repositories() { calls="$calls install_repositories"; }',
+      'run_setup() { calls="$calls run_setup"; }',
+      'run_project_bootstrap() { calls="$calls run_project_bootstrap"; }',
+      'run_doctor() { calls="$calls run_doctor"; }',
+      'configure_slack() { calls="$calls configure_slack"; }',
+      'MODE="slack-only"',
+      'main',
+      'printf "CALLS:%s\\n" "$calls"',
+    ].join('; ')
+    const result = Bun.spawnSync(['/bin/bash', '-c', command, 'bash', bootstrap], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const calls = result.stdout.toString().split('CALLS:')[1]
+    expect(result.exitCode).toBe(0)
+    expect(calls).toContain('require_macos configure_slack')
+    expect(calls).not.toContain('install_clt')
+    expect(calls).not.toContain('run_setup')
+    expect(calls).not.toContain('run_project_bootstrap')
+  })
+
+  test('Slack token input retries and normalizes copied env assignment without exposing it', () => {
+    const token = 'xoxb-1234567890-abcdefghijklmnopqrstuvwxyz'
+    const command = [
+      'bootstrap_path="$1"',
+      'set --',
+      'source "$bootstrap_path"',
+      `exec 3<<< $'wrong\\n  SLACK_BOT_TOKEN="${token}"  '`,
+      'read_slack_token xoxb "Bot Token" SLACK_BOT_TOKEN <&3',
+      'exec 3<&-',
+      'printf "RESULT:%s\\n" "${SLACK_TOKEN_RESULT%%-*}"',
+    ].join('; ')
+    const result = Bun.spawnSync(['/bin/bash', '-c', command, 'bash', bootstrap], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const output = result.stdout.toString() + result.stderr.toString()
+    expect(result.exitCode).toBe(0)
+    expect(output).toContain('もう一度入力')
+    expect(output).toContain('RESULT:xoxb')
+    expect(output).not.toContain(token)
   })
 
   test('Slack manifest contains the complete Socket Mode contract', () => {

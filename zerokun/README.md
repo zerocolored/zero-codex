@@ -15,11 +15,10 @@ bash ~/Downloads/bootstrap-macos.sh
 
 Command Line Toolsはバージョン選択不要。スクリプトが`xcode-select --install`を呼び、
 そのmacOSに適合する版の導入完了を待つ。Homebrew、GitHub CLI、tmux、Bun、Claude Code、
-Codex CLI、3つのBellSalesAI実装リポを含む必要リポ、ゼロくん配線まで自動で行う。
+Codex CLI、必要リポ、ゼロくん配線、Chrome・Muxy等のアプリ、依存関係とbuildまで自動で行う。
 
-人の操作が残るのは、macOSの確認ダイアログ、各アカウントのログイン、
-Slack App作成とトークン入力だけ。Slack Appは用意済みmanifestから作成し、
-bootstrapで既存Appと区別する表示名とSlack仕様に適合するbot usernameを入力する。
+通常実行ではClaude/Codexと開発環境の完成を優先し、Slack設定は行わない。後から
+`--slack-only`を指定したときだけ、用意済みmanifestによるSlack App作成へ進む。
 
 ### 既にclone済みの場合
 
@@ -39,7 +38,7 @@ bash ~/Desktop/Project/claude-channel-slack/zerokun/bootstrap-macos.sh
 | `zerokun/job-runner.ts` | SQLiteへjobを永続化し、全チャンネル共通で1件ずつFIFO実行 |
 | `claude-channel.sh` | 起動スクリプト(`zerokun` コマンドの実体)。オーナー重厚モードの読み込み配線込み |
 | `zerokun/setup.sh` | 新マシンセットアップ(配線の再現) |
-| `zerokun/bootstrap-macos.sh` | まっさらなMacのCLT・CLI・ログイン・clone・Slack設定を順番に実行 |
+| `zerokun/bootstrap-macos.sh` | まっさらなMacのCLT・CLI・ログイン・clone・開発環境を構築。Slackは後から任意実行 |
 | `zerokun/NEW_MAC_SETUP.md` | 新Macセットアップ手順の正本 |
 | `zerokun/update.ts` | 3リポを安全に更新・検証し、ゼロくんとjob runnerを再起動 |
 | `zerokun/update-request.ts` | Slack更新依頼を独立workerへ渡し、元スレッドへ完了通知 |

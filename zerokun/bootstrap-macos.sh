@@ -15,6 +15,7 @@ MODE="install"
 SKIP_LOGINS=0
 SKIP_SLACK=0
 SKIP_PROJECTS=0
+WITH_SLACK=0
 SLACK_APP_NAME="${ZEROKUN_SLACK_APP_NAME:-}"
 SLACK_BOT_USERNAME="${ZEROKUN_SLACK_BOT_USERNAME:-}"
 SLACK_APP_CREATE_URL="https://api.slack.com/apps?new_app=1"
@@ -30,6 +31,8 @@ Options:
   --doctor              何も変更せず、必要ツールとバージョンだけ確認
   --skip-logins         GitHub / Claude / Codexの対話ログインを呼び出さない
   --skip-slack          Slack App作成とトークン入力の案内を省略
+  --with-slack          基本セットアップ完了後、そのままSlack設定も行う
+  --slack-only          導入済み環境でSlack設定だけを行う
   --skip-projects       BellSalesAIの4リポをcloneしない
   --slack-app-name NAME Slack上で表示するApp名（35文字以内）
   --slack-bot-name NAME bot username（英小文字・数字・-・_・.のみ）
@@ -37,7 +40,8 @@ Options:
   --project-dir PATH    BellSalesAIの配置先
   -h, --help            このヘルプを表示
 
-ログイン、macOSのインストール確認ダイアログ、Slack App作成だけは人の操作が必要です。
+通常実行はClaude Codeを使える状態まで完了して終了します。Slack設定は後から
+`--slack-only`で行えます。ログインとmacOSの確認ダイアログだけは人の操作が必要です。
 EOF
 }
 
@@ -45,7 +49,9 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --doctor) MODE="doctor" ;;
     --skip-logins) SKIP_LOGINS=1 ;;
-    --skip-slack) SKIP_SLACK=1 ;;
+    --skip-slack) SKIP_SLACK=1; WITH_SLACK=0 ;;
+    --with-slack) WITH_SLACK=1 ;;
+    --slack-only) MODE="slack-only"; WITH_SLACK=1 ;;
     --skip-projects) SKIP_PROJECTS=1 ;;
     --slack-app-name)
       [ "$#" -ge 2 ] || { echo "❌ --slack-app-nameには名前が必要です" >&2; exit 2; }
@@ -257,6 +263,7 @@ repo_is_clean() {
 ensure_repo() {
   local slug="$1"
   local target="$2"
+  local target_branch="${3:-main}"
   if [ -d "$target/.git" ]; then
     local remote
     remote="$(git -C "$target" remote get-url origin 2>/dev/null || true)"
@@ -264,7 +271,17 @@ ensure_repo() {
       *"$slug"*) ;;
       *) fail "既存ディレクトリのoriginが想定と違います: $target ($remote)" ;;
     esac
-    if repo_is_clean "$target" && [ "$(git -C "$target" branch --show-current)" = "main" ]; then
+    local current_branch
+    current_branch="$(git -C "$target" branch --show-current)"
+    if repo_is_clean "$target" && [ "$current_branch" = "$target_branch" ]; then
+      git -C "$target" pull --ff-only
+    elif repo_is_clean "$target" && [ "$current_branch" = "main" ] && [ "$target_branch" != "main" ]; then
+      git -C "$target" fetch origin "$target_branch"
+      if git -C "$target" show-ref --verify --quiet "refs/heads/$target_branch"; then
+        git -C "$target" switch "$target_branch"
+      else
+        git -C "$target" switch --create "$target_branch" --track "origin/$target_branch"
+      fi
       git -C "$target" pull --ff-only
     else
       warn "既存作業を守るため更新を省略: $target"
@@ -275,17 +292,17 @@ ensure_repo() {
     fail "clone先が空ではありません: $target"
   fi
   /bin/mkdir -p "$(dirname "$target")"
-  gh repo clone "$slug" "$target"
+  gh repo clone "$slug" "$target" -- --branch "$target_branch"
 }
 
 install_repositories() {
   section "ゼロくんと作業リポ"
-  ensure_repo zerocolored/zero "$REPO_DIR"
+  ensure_repo zerocolored/zero "$REPO_DIR" main
   if [ "$SKIP_PROJECTS" != "1" ]; then
-    ensure_repo zerocolored/skills "$PROJECT_DIR"
-    ensure_repo zerocolored/bsb_front "$PROJECT_DIR/bsb_front"
-    ensure_repo zerocolored/bsb_back "$PROJECT_DIR/bsb_back"
-    ensure_repo zerocolored/meeting-app "$PROJECT_DIR/meeting-app"
+    ensure_repo zerocolored/skills "$PROJECT_DIR" develop
+    ensure_repo zerocolored/bsb_front "$PROJECT_DIR/bsb_front" develop
+    ensure_repo zerocolored/bsb_back "$PROJECT_DIR/bsb_back" develop
+    ensure_repo zerocolored/meeting-app "$PROJECT_DIR/meeting-app" develop
   fi
   ok "リポジトリを配置しました"
 }
@@ -296,10 +313,23 @@ run_setup() {
   ZEROKUN_BOOTSTRAP=1 ZEROKUN_PROJECT_DIR="$PROJECT_DIR" /bin/bash "$REPO_DIR/zerokun/setup.sh"
 }
 
+run_project_bootstrap() {
+  if [ "$SKIP_PROJECTS" = "1" ]; then
+    warn "--skip-projectsによりBellSalesAI全体bootstrapを省略しました"
+    return
+  fi
+  local project_bootstrap="$PROJECT_DIR/scripts/bootstrap-mac.sh"
+  [ -f "$project_bootstrap" ] \
+    || fail "BellSalesAI全体bootstrapがありません: $project_bootstrap"
+  section "Chrome / Muxy / BellSalesAI開発環境"
+  /bin/bash "$project_bootstrap"
+  ok "Chrome・Muxy・開発ツール・依存関係・build検証まで完了しました"
+}
+
 slack_tokens_ready() {
   local env_file="$HOME/.claude/channels/slack/.env"
-  /usr/bin/grep -Eq '^SLACK_BOT_TOKEN=xoxb-[A-Za-z0-9-]{10,}$' "$env_file" 2>/dev/null \
-    && /usr/bin/grep -Eq '^SLACK_APP_TOKEN=xapp-[A-Za-z0-9-]{10,}$' "$env_file" 2>/dev/null
+  /usr/bin/grep -Eq '^SLACK_BOT_TOKEN=xoxb-[A-Za-z0-9._-]{10,}$' "$env_file" 2>/dev/null \
+    && /usr/bin/grep -Eq '^SLACK_APP_TOKEN=xapp-[A-Za-z0-9._-]{10,}$' "$env_file" 2>/dev/null
 }
 
 save_slack_tokens() {
@@ -407,6 +437,45 @@ render_slack_manifest() {
     || fail "Slack manifestの名前を生成できませんでした"
 }
 
+normalize_slack_token() {
+  local value="$1"
+  local env_key="$2"
+  value="$(printf '%s' "$value" | /usr/bin/tr -d '\r' \
+    | /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  case "$value" in export\ *) value="${value#export }" ;; esac
+  case "$value" in "$env_key="*) value="${value#*=}" ;; esac
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  printf '%s' "$value"
+}
+
+read_slack_token() {
+  local prefix="$1"
+  local label="$2"
+  local env_key="$3"
+  local entered
+  while true; do
+    printf '   %s（入力内容は表示されません）: ' "$label"
+    if ! IFS= read -r -s entered; then
+      printf '\n'
+      fail "${label}の入力を読み取れませんでした"
+    fi
+    printf '\n'
+    SLACK_TOKEN_RESULT="$(normalize_slack_token "$entered" "$env_key")"
+    if printf '%s\n' "$SLACK_TOKEN_RESULT" \
+      | /usr/bin/grep -Eq "^${prefix}-[A-Za-z0-9._-]{10,}$"; then
+      return
+    fi
+    if [ -z "$SLACK_TOKEN_RESULT" ]; then
+      warn "${label}が未入力です。Slack画面からコピーして、もう一度入力してください"
+    else
+      warn "${label}は${prefix}-で始まる値です。コピーし直して、もう一度入力してください"
+    fi
+  done
+}
+
 configure_slack() {
   section "Slack App"
   if [ "$SKIP_SLACK" = "1" ]; then
@@ -423,6 +492,7 @@ configure_slack() {
   local generated_manifest="$HOME/.claude/channels/slack/slack-app-manifest.generated.yaml"
   local temp_manifest="$generated_manifest.tmp.$$"
   [ -f "$manifest" ] || fail "Slack manifestがありません: $manifest"
+  /bin/mkdir -p "$(dirname "$generated_manifest")"
   choose_slack_names
   umask 077
   render_slack_manifest "$manifest" "$temp_manifest"
@@ -438,19 +508,17 @@ configure_slack() {
   cat <<EOF
    上のURLで Create New App → From a manifest を選び、manifestを貼り付けて作成します。
    App表示名は「${SLACK_APP_NAME}」、bot usernameは「${SLACK_BOT_USERNAME}」です。
-   次に App-Level Tokenを connections:write で生成してxapp-を取得し、
-   Install to Workspace後にBot User OAuth Tokenのxoxb-を取得してください。
+   1. Basic Information → App-Level Tokens → Generate Token and Scopes
+      → connections:write を追加し、xapp-をコピー
+   2. OAuth & Permissions → Install to Workspace
+      → Bot User OAuth Tokenのxoxb-をコピー
+   Appを既に作成済みなら、新しく作らず既存Appのトークンを使用してください。
 EOF
   local bot_token app_token
-  printf '   xoxb-トークン: '
-  IFS= read -r -s bot_token
-  printf '\n   xapp-トークン: '
-  IFS= read -r -s app_token
-  printf '\n'
-  printf '%s\n' "$bot_token" | /usr/bin/grep -Eq '^xoxb-[A-Za-z0-9-]{10,}$' \
-    || fail "Bot Tokenのxoxb-形式が不正です"
-  printf '%s\n' "$app_token" | /usr/bin/grep -Eq '^xapp-[A-Za-z0-9-]{10,}$' \
-    || fail "App Tokenのxapp-形式が不正です"
+  read_slack_token xapp 'App-Level Token（xapp-）' SLACK_APP_TOKEN
+  app_token="$SLACK_TOKEN_RESULT"
+  read_slack_token xoxb 'Bot User OAuth Token（xoxb-）' SLACK_BOT_TOKEN
+  bot_token="$SLACK_TOKEN_RESULT"
   save_slack_tokens "$bot_token" "$app_token"
   ok "Slackトークンを権限600で保存しました"
   configure_access
@@ -460,6 +528,13 @@ main() {
   require_macos
   if [ "$MODE" = "doctor" ]; then
     run_doctor
+    return
+  fi
+  if [ "$MODE" = "slack-only" ]; then
+    echo "== ゼロくん Slack設定だけ再開 =="
+    configure_slack
+    section "Slack設定完了"
+    echo "   新しいターミナルで実行: zerokun"
     return
   fi
 
@@ -473,12 +548,27 @@ main() {
   fi
   install_repositories
   run_setup
-  configure_slack
 
-  section "完了"
+  section "Claude / Codex 利用可能"
+  echo "   この時点で別ターミナルからClaude Codeを利用できます:"
+  echo "   cd \"$PROJECT_DIR\" && claude"
+  run_project_bootstrap
+
+  section "基本セットアップ完了"
   run_doctor
-  echo "   Slack Appを対象チャンネルへ招待後、新しいターミナルで次を実行してください:"
-  echo "   zerokun"
+  echo "   Claude Codeを利用できます:"
+  echo "   cd \"$PROJECT_DIR\" && claude"
+  echo "   Codex CLIを利用できます:"
+  echo "   cd \"$PROJECT_DIR\" && codex"
+  if [ "$WITH_SLACK" = "1" ]; then
+    configure_slack
+    section "Slack設定完了"
+    echo "   Slack Appを対象チャンネルへ招待後、新しいターミナルで実行: zerokun"
+  else
+    warn "Slack設定は後回しにしました。Claude/Codexの利用には不要です"
+    echo "   後からSlack設定だけ行う:"
+    echo "   bash \"$REPO_DIR/zerokun/bootstrap-macos.sh\" --slack-only"
+  fi
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
