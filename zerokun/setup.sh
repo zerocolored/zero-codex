@@ -73,7 +73,9 @@ if ! grep -q "alias zerokun=" "$HOME/.zshrc" 2>/dev/null; then
 # ゼロくん（Slack から自分の Claude を動かすボット）— zerokun/setup.sh が追記
 export PATH="$HOME/.local/bin:$PATH"
 alias zerokun='CHANNEL=slack claude-channel ~/Desktop/Project/BellSalsesAI'
-alias zerokun-restart='CLAUDE_CHANNEL_REPLACE=1 CHANNEL=slack claude-channel ~/Desktop/Project/BellSalsesAI'
+# 稼働中を止めて入れ替えるかは端末の y/N プロンプトで都度確認する。
+# CLAUDE_CHANNEL_REPLACE=1 は付けない(付けても自己更新のトークンが無いと入れ替わらない)。
+alias zerokun-restart='CHANNEL=slack claude-channel ~/Desktop/Project/BellSalsesAI'
 alias zerokun-status='pgrep -fl "dangerously-load-development-channels server:slack-channel" || echo "ゼロくんは停止中"'
 EOF
   echo "   .zshrc にエイリアスを追記しました(新しいターミナルで有効)"
