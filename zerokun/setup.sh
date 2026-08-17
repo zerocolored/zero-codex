@@ -55,7 +55,8 @@ done
 # 4. スキルの symlink (スレッド振り分け + /dev)
 mkdir -p "$HOME/.claude/skills"
 ln -sfn "$REPO_DIR/skills/threads" "$HOME/.claude/skills/threads"
-ln -sfn "$REPO_DIR/skills/update-zerokun" "$HOME/.claude/skills/update-zerokun"
+rm -f "$HOME/.claude/skills/update-zerokun"
+ln -sfn "$REPO_DIR/skills/zerokun-update" "$HOME/.claude/skills/zerokun-update"
 ln -sfn "$CH/owner/claude-skills/dev" "$HOME/.claude/skills/dev"
 
 # 5. SQLite直列job runner・安全更新・起動コマンド

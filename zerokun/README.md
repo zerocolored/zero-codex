@@ -35,7 +35,7 @@ bash ~/Desktop/Project/claude-channel-slack/zerokun/setup.sh
 | `zerokun/setup.sh` | 新マシンセットアップ(配線の再現) |
 | `zerokun/update.ts` | 3リポを安全に更新・検証し、ゼロくんとjob runnerを再起動 |
 | `zerokun/update-request.ts` | Slack更新依頼を独立workerへ渡し、元スレッドへ完了通知 |
-| `skills/update-zerokun/` | 「ゼロくん更新して」を専用更新経路へ送るSkill |
+| `skills/zerokun-update/` | 「ゼロくん更新して」を専用更新経路へ送るSkill |
 | `zerokun/templates/` | 設定ファイルの雛形(トークン等の秘密は含まない) |
 | `~/.claude/channels/slack/` | 実際の設定・状態(トークン・許可リスト・スレッド対応表)。**git 管理外** |
 | `~/.claude/channels/slack/owner/` | オーナーの CLAUDE.md + /dev スキル(ernie1358 の2リポを clone。更新は `git pull`) |

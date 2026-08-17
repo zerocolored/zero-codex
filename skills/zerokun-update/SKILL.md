@@ -1,5 +1,5 @@
 ---
-name: update-zerokun
+name: zerokun-update
 description: Slackからゼロくん本体・claude-config・claude-skillsの3リポを安全に更新し、テスト・setup・再起動まで依頼する。「ゼロくん更新して」「3リポを最新にして」「updateかけて」「claude-skillsを反映して」など、ゼロくん自身の更新を明示的に頼まれたときに使う。
 ---
 

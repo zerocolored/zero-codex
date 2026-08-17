@@ -203,7 +203,7 @@ comes from the same `thread_ts`. Keep your responses relevant to this thread onl
 Classify every inbound message before doing substantive work:
 
 - If the sender explicitly asks to update Zero-kun itself or the three managed
-  repositories, invoke `/update-zerokun`. `enqueue_job`を呼ばない。The dedicated
+  repositories, invoke `/zerokun-update`. `enqueue_job`を呼ばない。The dedicated
   maintenance worker must own this operation so the current job never waits for itself.
 - Keep greetings, explanations, status questions, and quick read-only checks in this
   thread subagent.

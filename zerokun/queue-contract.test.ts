@@ -48,14 +48,16 @@ describe('Zero-kun queue wiring', () => {
 
   test('Slack update skill uses the dedicated request tool without entering the job queue', () => {
     const server = readFileSync(join(root, 'server.ts'), 'utf8')
-    const skill = readFileSync(join(root, 'skills/update-zerokun/SKILL.md'), 'utf8')
+    const skill = readFileSync(join(root, 'skills/zerokun-update/SKILL.md'), 'utf8')
     const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
     const queuePolicy = readFileSync(join(import.meta.dir, 'templates/zerokun-queue-policy.md'), 'utf8')
     expect(server).toContain("name: 'request_update'")
+    expect(skill).toContain('name: zerokun-update')
     expect(skill).toContain('mcp__slack-channel__request_update')
     expect(skill).toContain('`enqueue_job`を呼ばない')
     expect(setup).toContain('update-request.ts')
-    expect(setup).toContain('skills/update-zerokun')
+    expect(setup).toContain('skills/zerokun-update')
+    expect(setup).toContain('rm -f "$HOME/.claude/skills/update-zerokun"')
     expect(queuePolicy).toContain('`request_update`')
     expect(queuePolicy).toContain('`enqueue_job`を呼ばない')
   })
