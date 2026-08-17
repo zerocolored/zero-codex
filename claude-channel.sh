@@ -24,6 +24,9 @@ CHANNEL="${CHANNEL:-fakechat}"
 MARKETPLACE="${MARKETPLACE:-claude-plugins-official}"
 MODEL="${MODEL:-opus}"
 CH_DIR="$HOME/.claude/channels/slack"
+# 稼働中ボットの入れ替えを許可するワンタイムトークンの置き場。
+# 書けるのは自己更新(zerokun-update)だけで、使ったら消える。
+REPLACE_TOKEN_FILE="${CLAUDE_CHANNEL_REPLACE_TOKEN_FILE:-$HOME/.claude/channels/${CHANNEL}/replace-token}"
 JOB_RUNNER="$CH_DIR/job-runner.ts"
 JOB_RUNNER_PID="$CH_DIR/job-runner.lock/pid"
 JOB_RUNNER_LOG="$CH_DIR/job-runner.log"
@@ -108,12 +111,23 @@ if [ "$CHANNEL" = "slack" ] || [ "$CHANNEL" = "telegram" ]; then
 
     # 安全方針: 既定では「絶対に kill しない」。うっかり起動しても既存ボットは無傷で、
     # こちらの起動を中止するだけ。入れ替えは次の2つの“意図的な操作”でのみ発動する:
-    #   (1) 対話プロンプトで y を入力
-    #   (2) CLAUDE_CHANNEL_REPLACE=1 を明示的に付与(対話できない場面の上書き用)
+    #   (1) 端末の対話プロンプトで y を入力(人がその場にいる)
+    #   (2) 自己更新が発行したワンタイムトークンを CLAUDE_CHANNEL_REPLACE_TOKEN で提示
+    #
+    # 2026-08-17: 以前は CLAUDE_CHANNEL_REPLACE=1 だけで既存を kill できた。そのため
+    # 自己更新の検証を手で流すたびに稼働中のゼロくんが落とされ(実測7回)、Slack から
+    # 見ると「ゼロくんが落ちる」障害になった。フラグ単独では殺せないようにし、
+    # 殺せるのは「更新処理が今まさに発行したトークンを持つ起動」だけにする。
     do_replace=0
-    if [ "${CLAUDE_CHANNEL_REPLACE:-0}" = "1" ]; then
+    if [ "${CLAUDE_CHANNEL_REPLACE:-0}" = "1" ] && [ -s "$REPLACE_TOKEN_FILE" ] \
+       && [ -n "${CLAUDE_CHANNEL_REPLACE_TOKEN:-}" ] \
+       && [ "${CLAUDE_CHANNEL_REPLACE_TOKEN}" = "$(cat "$REPLACE_TOKEN_FILE" 2>/dev/null)" ]; then
       do_replace=1
-      echo "   CLAUDE_CHANNEL_REPLACE=1 が指定されています。" >&2
+      rm -f "$REPLACE_TOKEN_FILE"   # ワンタイム。使い回しでの再 kill を防ぐ
+      echo "   自己更新のワンタイムトークンを確認しました。" >&2
+    elif [ "${CLAUDE_CHANNEL_REPLACE:-0}" = "1" ]; then
+      echo "   CLAUDE_CHANNEL_REPLACE=1 は指定されていますが、有効なワンタイムトークンがありません。" >&2
+      echo "   稼働中のゼロくんは kill しません(検証や手動起動が現役を落とす事故を防ぐため)。" >&2
     elif [ -t 0 ]; then
       printf "   既存を止めて入れ替えますか? (y を打たない限り既存は無傷) [y/N]: " >&2
       read -r _ans || _ans=""
@@ -122,14 +136,25 @@ if [ "$CHANNEL" = "slack" ] || [ "$CHANNEL" = "telegram" ]; then
 
     if [ "$do_replace" = "1" ]; then
       echo "   → 既存(PID: $(echo $EXISTING | tr '\n' ' '))を終了して起動し直します..." >&2
+      if [ "${CLAUDE_CHANNEL_DRY_RUN:-0}" = "1" ]; then
+        echo "   (dry-run: 実際には kill も起動もしません)" >&2
+        exit 0
+      fi
       # shellcheck disable=SC2086
       kill $EXISTING 2>/dev/null || true
       sleep 1
     else
       echo "   → 起動を中止しました。既存ボットはそのまま稼働中です(無傷)。" >&2
-      echo "     入れ替えたい時: 上のプロンプトで y / または CLAUDE_CHANNEL_REPLACE=1 を付けて実行" >&2
+      echo "     入れ替えたい時: 端末のプロンプトで y / 自己更新なら zerokun-update を使う" >&2
       exit 1
     fi
+  fi
+
+  # 既存が居ない場合でも、dry-run はここで判定結果だけ返して終わる。
+  # 「起動シーケンスが通るか」を現役ゼロくんに触れず確認するための出口。
+  if [ "${CLAUDE_CHANNEL_DRY_RUN:-0}" = "1" ]; then
+    echo "   (dry-run: 起動条件を満たしています。実際の起動はしません)" >&2
+    exit 0
   fi
 
   # --- bridge モード (slack-channel / telegram-channel) ---

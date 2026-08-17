@@ -9,7 +9,8 @@ import {
   rmSync,
   writeFileSync,
 } from 'fs'
-import { tmpdir } from 'os'
+import { randomUUID } from 'crypto'
+import { homedir, tmpdir } from 'os'
 import { dirname, join } from 'path'
 
 interface Repository {
@@ -296,13 +297,24 @@ export async function startBotInTmux(options: {
   sessionName?: string
   confirmationTimeoutMs?: number
   tmuxPath?: string
+  replaceTokenFile?: string
 }): Promise<number> {
   const tmux = options.tmuxPath ?? resolveTmuxPath()
   const sessionName = options.sessionName ?? 'zerokun-slack'
   const timeoutMs = Math.max(1_000, options.confirmationTimeoutMs ?? 25_000)
   const launcher = join(options.rootRepo, 'claude-channel.sh')
+  // 稼働中ボットの入れ替えは「自己更新が今まさに発行したワンタイムトークン」を
+  // 持つ起動だけに許す。CLAUDE_CHANNEL_REPLACE=1 を手で付けただけでは現役を
+  // kill できない(2026-08-17 の「検証のたびにゼロくんが落ちる」再発防止)。
+  const replaceTokenFile = options.replaceTokenFile
+    ?? join(homedir(), '.claude', 'channels', 'slack', 'replace-token')
+  const replaceToken = randomUUID()
+  mkdirSync(dirname(replaceTokenFile), { recursive: true, mode: 0o700 })
+  writeFileSync(replaceTokenFile, replaceToken, { mode: 0o600 })
   const launchCommand = [
     'exec /usr/bin/env CHANNEL=slack CLAUDE_CHANNEL_REPLACE=1',
+    `CLAUDE_CHANNEL_REPLACE_TOKEN=${shellQuote(replaceToken)}`,
+    `CLAUDE_CHANNEL_REPLACE_TOKEN_FILE=${shellQuote(replaceTokenFile)}`,
     shellQuote(launcher),
     shellQuote(options.projectDir),
   ].join(' ')
@@ -353,6 +365,10 @@ export async function startBotInTmux(options: {
   } catch (error) {
     command([tmux, 'kill-session', '-t', sessionName])
     throw error
+  } finally {
+    // 起動が成功しても失敗しても、トークンを残さない。
+    // 残すと後からの手動 CLAUDE_CHANNEL_REPLACE=1 が 1 回だけ通ってしまう。
+    rmSync(replaceTokenFile, { force: true })
   }
 }
 
@@ -374,6 +390,7 @@ async function restartServices(
     rootRepo,
     projectDir,
     logPath,
+    replaceTokenFile: join(stateDir, 'replace-token'),
   })
   // Claude Codeはdevelopment channel起動時に毎回確認画面を出す。
   // detached tmuxが実端末を保持し、確認表示後にEnterを送る。
