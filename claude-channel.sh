@@ -23,6 +23,10 @@ PROJECT="${1:-/Users/zerocolored-macpro-suetsugu/Desktop/Project/BellSalsesAI}"
 CHANNEL="${CHANNEL:-fakechat}"
 MARKETPLACE="${MARKETPLACE:-claude-plugins-official}"
 MODEL="${MODEL:-opus}"
+CH_DIR="$HOME/.claude/channels/slack"
+JOB_RUNNER="$CH_DIR/job-runner.ts"
+JOB_RUNNER_PID="$CH_DIR/job-runner.lock/pid"
+JOB_RUNNER_LOG="$CH_DIR/job-runner.log"
 
 # bun(channel MCP サーバーの実行に必須)を PATH に通す
 export PATH="$HOME/.bun/bin:$PATH"
@@ -36,6 +40,48 @@ if [ ! -d "$PROJECT" ]; then
   echo "❌ 作業ディレクトリが存在しません: $PROJECT" >&2
   exit 1
 fi
+
+job_runner_is_alive() {
+  [ -f "$JOB_RUNNER_PID" ] || return 1
+  local runner_pid
+  runner_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_PID")"
+  [ -n "$runner_pid" ] \
+    && kill -0 "$runner_pid" 2>/dev/null \
+    && ps -o command= -p "$runner_pid" 2>/dev/null | grep -Eq 'job-runner\.ts[[:space:]]+daemon'
+}
+
+start_job_runner() {
+  if job_runner_is_alive; then
+    echo "   job-runner: running (PID $(tr -d '[:space:]' < "$JOB_RUNNER_PID"), FIFO workers=1)"
+    return
+  fi
+
+  if [ ! -x "$JOB_RUNNER" ]; then
+    echo "❌ SQLite job runner が未導入です: $JOB_RUNNER" >&2
+    echo "   zerokun/setup.sh を再実行してください。" >&2
+    exit 1
+  fi
+
+  mkdir -p "$CH_DIR"
+  nohup caffeinate -dimsu bun "$JOB_RUNNER" daemon \
+    >>"$JOB_RUNNER_LOG" 2>&1 </dev/null &
+  local starter_pid=$!
+
+  for _ in {1..30}; do
+    if job_runner_is_alive; then
+      echo "   job-runner: started (PID $(tr -d '[:space:]' < "$JOB_RUNNER_PID"), FIFO workers=1)"
+      return
+    fi
+    if ! kill -0 "$starter_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  echo "❌ SQLite job runner の起動に失敗しました: $JOB_RUNNER_LOG" >&2
+  tail -n 20 "$JOB_RUNNER_LOG" >&2 2>/dev/null || true
+  exit 1
+}
 
 cd "$PROJECT"
 
@@ -90,6 +136,9 @@ if [ "$CHANNEL" = "slack" ] || [ "$CHANNEL" = "telegram" ]; then
   # MCP サーバー "${BRIDGE}" を ~/.claude.json に登録済みである前提。
   # トークンは ~/.claude/channels/${CHANNEL}/.env に保存済みである前提。
   export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1   # Agent/SendMessage を有効化(スレッド分配に必須)
+  if [ "$CHANNEL" = "slack" ]; then
+    start_job_runner
+  fi
   # bridge の MCP 定義は「専用 config ファイルがあればそれ経由で、この起動だけに」読み込む。
   # 専用ファイル(~/.claude/channels/<ch>/mcp.<bridge>.json)があれば --mcp-config で渡し、
   # グローバル ~/.claude.json から外しても本起動は server:<bridge> を解決できる。
@@ -107,12 +156,15 @@ if [ "$CHANNEL" = "slack" ] || [ "$CHANNEL" = "telegram" ]; then
   # ファイルが無い channel (telegram 等) では何もしない = 従来どおり。
   HEAVY_SRC="$HOME/.claude/channels/${CHANNEL}/owner/claude-config/CLAUDE.md"
   HEAVY_TRIAGE="$HOME/.claude/channels/${CHANNEL}/zerokun-triage.md"
+  QUEUE_POLICY="$HOME/.claude/channels/${CHANNEL}/zerokun-queue-policy.md"
   HEAVY_OUT="$HOME/.claude/channels/${CHANNEL}/zerokun-heavy-mode.generated.md"
   HEAVY_ARGS=()
   if [ -f "$HEAVY_SRC" ] && [ -f "$HEAVY_TRIAGE" ]; then
-    if cat "$HEAVY_TRIAGE" "$HEAVY_SRC" > "$HEAVY_OUT" 2>/dev/null && [ -s "$HEAVY_OUT" ]; then
+    HEAVY_INPUTS=("$HEAVY_TRIAGE" "$HEAVY_SRC")
+    [ ! -f "$QUEUE_POLICY" ] || HEAVY_INPUTS+=("$QUEUE_POLICY")
+    if cat "${HEAVY_INPUTS[@]}" > "$HEAVY_OUT" 2>/dev/null && [ -s "$HEAVY_OUT" ]; then
       HEAVY_ARGS=(--append-system-prompt-file "$HEAVY_OUT")
-      echo "   heavy-mode: ON (トリアージ + オーナー CLAUDE.md を読込)"
+      echo "   heavy-mode: ON (トリアージ + オーナー CLAUDE.md + SQLite queue policy)"
     fi
   fi
   echo "   channel  : server:${BRIDGE} (${CHANNEL} bridge)"

@@ -13,6 +13,7 @@ allowed-tools:
   - Bash(cat *)
   - Agent
   - SendMessage
+  - mcp__slack-channel__enqueue_job
   - mcp__slack-channel__reply
   - mcp__slack-channel__react
 ---
@@ -196,6 +197,32 @@ from your project context — don't rely on relative paths or `pwd`.
 You handle exactly ONE Slack thread. Every message you'll receive in this session
 comes from the same `thread_ts`. Keep your responses relevant to this thread only.
 
+## Route conflict-prone work through the global serial queue
+
+Classify every inbound message before doing substantive work:
+
+- Keep greetings, explanations, status questions, and quick read-only checks in this
+  thread subagent.
+- **Call `enqueue_job` exactly once** for a deep or multi-step investigation, or when
+  the sender requests changes to code, settings, or documentation; tests/builds;
+  commit/push; deployment; or PR work. The SQLite runner owns the task after enqueue.
+  **Do not also investigate, edit files, run commands, or delegate the same task from
+  this thread subagent.**
+
+Pass the exact inbound values to `enqueue_job`:
+
+- `chat_id`: Slack `chat_id`
+- `thread_ts`: Slack `thread_ts`
+- `message_id`: Slack `message_id` (for a follow-up, use its Timestamp)
+- `user_id`: Slack `user` / `user_id`
+- `repo_path`: the absolute routed project path above
+- `task`: the sender's complete request, preserving requirements and links
+
+After enqueue succeeds, reply once with the returned short job ID and queue position.
+An exact duplicate Slack delivery returns the existing job. All queued jobs share one
+global worker, so even requests from different channels or threads start in FIFO order
+and never execute as separate implementation jobs at the same time.
+
 ## Answer EVERY message in your thread — never tunnel-vision on the first task
 
 The thread is a live conversation, not a one-shot ticket. While you work on the
@@ -219,7 +246,7 @@ Rules:
   main task's PR is up. "I finished the task" is not a substitute for "I answered
   everything you asked."
 
-## File-system safety — you share the working tree with other threads
+## File-system safety for lightweight work
 
 Other Slack threads are handled by other subagents **at the same time, in the same
 repository on disk**. Your conversation context is isolated, but the files are NOT.
@@ -325,10 +352,14 @@ New message in the same Slack thread:
 Channel: <chat_id>
 Thread: <thread_ts>
 User: <user>
-Timestamp: <ts>
+Message ID / Timestamp: <ts>
 
 Content:
 "<content>"
+
+Before acting, apply the current global SQLite queue policy. For code/settings/docs
+changes, long investigations, tests/builds, deploys, or PR work, call `enqueue_job`
+exactly once and do not perform or delegate that same work in this thread subagent.
 
 Respond via the `reply` tool. Use chat_id and thread_ts above.
 ```
