@@ -34,5 +34,15 @@ describe('Zero-kun queue wiring', () => {
     expect(setup).toContain('job-runner.ts')
     expect(setup).toContain('zerokun-jobs')
     expect(setup).toContain('zerokun-queue-policy.md')
+    expect(setup).toContain('zerokun-update')
+  })
+
+  test('updater is wired to all three repositories and restarts both processes', () => {
+    const updater = readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')
+    expect(updater).toContain("'claude-config'")
+    expect(updater).toContain("'claude-skills'")
+    expect(updater).toContain("'origin/main'")
+    expect(updater).toContain('job-runner.lock')
+    expect(updater).toContain('dangerously-load-development-channels server:slack-channel')
   })
 })

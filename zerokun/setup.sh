@@ -56,12 +56,14 @@ mkdir -p "$HOME/.claude/skills"
 ln -sfn "$REPO_DIR/skills/threads" "$HOME/.claude/skills/threads"
 ln -sfn "$CH/owner/claude-skills/dev" "$HOME/.claude/skills/dev"
 
-# 5. SQLite直列job runnerと起動コマンド
+# 5. SQLite直列job runner・安全更新・起動コマンド
 mkdir -p "$HOME/.local/bin"
 install -m 0700 "$REPO_DIR/zerokun/job-runner.ts" "$CH/job-runner.ts"
 ln -sfn "$CH/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
+ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"
 ln -sfn "$REPO_DIR/claude-channel.sh" "$HOME/.local/bin/claude-channel"
 echo "   SQLite job runner を設置しました(永続FIFO / 同時実行数1)"
+echo "   安全更新コマンドを設置しました: zerokun-update"
 
 # 6. zsh エイリアス(未登録なら追記)
 if ! grep -q "alias zerokun=" "$HOME/.zshrc" 2>/dev/null; then
@@ -86,4 +88,5 @@ echo "  4. codex CLI を導入しログイン(重厚モードのレベル2以上
 echo "  5. 作業リポを ~/Desktop/Project/BellSalsesAI に用意(別プロジェクト機なら .zshrc の zerokun エイリアスの引数をそのプロジェクトに変更)"
 echo "  6. 新しいターミナルで: zerokun"
 echo "     queue確認: zerokun-jobs status"
+echo "     3リポ更新: zerokun-update"
 command -v codex >/dev/null 2>&1 || echo "  ⚠️ codex CLI が未導入です(上の 4)"

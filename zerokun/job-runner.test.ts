@@ -228,6 +228,34 @@ describe('single worker', () => {
     store.close()
   })
 
+  test('更新ロック中は新しいjobをclaimせず、解除後に再開する', async () => {
+    const store = makeStore()
+    store.enqueue(input({ messageId: 'maintenance-1', task: 'wait-for-update' }))
+    let paused = true
+    let executions = 0
+
+    const running = runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      shouldPause: () => paused,
+      executor: async job => {
+        executions += 1
+        return { sessionId: job.sessionId!, result: 'ok' }
+      },
+    })
+
+    await Bun.sleep(10)
+    expect(executions).toBe(0)
+    expect(store.list()[0]?.status).toBe('queued')
+
+    paused = false
+    expect(await running).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
+    expect(executions).toBe(1)
+    store.close()
+  })
+
   test('実CLIのrun-until-idleが永続queueを最後まで処理する', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'zerokun-run-until-idle-'))
     tempDirs.push(dir)
