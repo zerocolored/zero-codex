@@ -117,7 +117,7 @@ function runUpdater(f: ReturnType<typeof fixture>) {
 }
 
 describe('zerokun-update', () => {
-  test('再起動するClaudeへ疑似TTYと確認用Enterを渡せる', async () => {
+  test('更新process終了後も疑似TTYを保持し、確認表示後にEnterを渡せる', async () => {
     const root = mkdtempSync(join(tmpdir(), 'zerokun-pty-test-'))
     tempDirs.push(root)
     const launcher = join(root, 'claude-channel.sh')
@@ -137,22 +137,32 @@ describe('zerokun-update', () => {
     )
     chmodSync(launcher, 0o755)
 
-    const proc = Bun.spawn(buildRestartCommand(root, root, 1), {
-      stdin: 'ignore',
-      stdout: 'ignore',
-      stderr: 'ignore',
-    })
-    for (let attempt = 0; attempt < 40 && !existsSync(join(root, 'confirmed')); attempt += 1) {
-      await Bun.sleep(25)
+    const launched = Bun.spawnSync(
+      buildRestartCommand(root, root, 1, join(root, 'expect.log')),
+      {
+        stdin: 'ignore',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    )
+    expect(launched.exitCode).toBe(0)
+    const launcherPid = Number(new TextDecoder().decode(launched.stdout).trim())
+    expect(Number.isInteger(launcherPid)).toBe(true)
+
+    try {
+      for (let attempt = 0; attempt < 40 && !existsSync(join(root, 'confirmed')); attempt += 1) {
+        await Bun.sleep(25)
+      }
+      expect(existsSync(join(root, 'confirmed'))).toBe(true)
+      expect(() => process.kill(launcherPid, 0)).not.toThrow()
+    } finally {
+      try {
+        process.kill(launcherPid, 'SIGTERM')
+      } catch {
+        // 失敗時もafterEachで一時ディレクトリを片付けられるようにする。
+      }
+      await Bun.sleep(100)
     }
-    expect(existsSync(join(root, 'confirmed'))).toBe(true)
-    const state = await Promise.race([
-      proc.exited.then(exitCode => `exited:${exitCode}`),
-      Bun.sleep(100).then(() => 'running'),
-    ])
-    expect(state).toBe('running')
-    proc.kill()
-    await proc.exited
   })
 
   test('SIGTERM後のゾンビprocessを終了済みとして扱う', () => {

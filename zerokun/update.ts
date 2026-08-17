@@ -1,11 +1,9 @@
 #!/usr/bin/env bun
 
 import {
-  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
-  openSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -276,6 +274,7 @@ export function buildRestartCommand(
   rootRepo: string,
   projectDir: string,
   confirmationTimeoutSeconds = 25,
+  logPath = '/dev/null',
 ): string[] {
   const timeout = Math.max(1, Math.floor(confirmationTimeoutSeconds))
   const expectScript = [
@@ -293,11 +292,12 @@ export function buildRestartCommand(
   return [
     '/bin/sh',
     '-c',
-    'exec /usr/bin/env ZEROKUN_EXPECT_LAUNCHER="$1" ZEROKUN_EXPECT_PROJECT="$2" /usr/bin/expect -c "$3"',
+    '/usr/bin/nohup /usr/bin/env ZEROKUN_EXPECT_LAUNCHER="$1" ZEROKUN_EXPECT_PROJECT="$2" /usr/bin/expect -c "$3" >>"$4" 2>&1 </dev/null & printf "%s\\n" "$!"',
     'zerokun-update',
     join(rootRepo, 'claude-channel.sh'),
     projectDir,
     expectScript,
+    logPath,
   ]
 }
 
@@ -315,24 +315,16 @@ async function restartServices(
 
   releaseUpdateLock()
   const logPath = join(stateDir, 'zerokun.log')
-  const logFd = openSync(logPath, 'a', 0o600)
-  try {
-    const proc = Bun.spawn(buildRestartCommand(rootRepo, projectDir), {
-      env: {
-        ...process.env,
-        CHANNEL: 'slack',
-        CLAUDE_CHANNEL_REPLACE: '1',
-      },
-      stdin: 'ignore',
-      stdout: logFd,
-      stderr: logFd,
-    })
-    // Claude Codeはdevelopment channel起動時に毎回確認画面を出す。
-    // expectが疑似TTYを保持し、確認表示を検出してからEnterを送り、Claude終了まで待ち続ける。
-    proc.unref()
-  } finally {
-    closeSync(logFd)
-  }
+  const launcherPid = requireCommand(buildRestartCommand(rootRepo, projectDir, 25, logPath), {
+    env: {
+      ...process.env,
+      CHANNEL: 'slack',
+      CLAUDE_CHANNEL_REPLACE: '1',
+    },
+  })
+  // Claude Codeはdevelopment channel起動時に毎回確認画面を出す。
+  // nohupで更新processから切り離したexpectが疑似TTYを保持し、確認表示後にEnterを送る。
+  output(`   launcher: detached PID ${launcherPid}`)
 
   await waitForStableHealth({
     requiredConsecutive: 10,
