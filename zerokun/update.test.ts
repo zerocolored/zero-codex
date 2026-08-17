@@ -9,6 +9,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { waitForStableHealth } from './update'
 
 const tempDirs: string[] = []
 const updater = join(import.meta.dir, 'update.ts')
@@ -115,6 +116,29 @@ function runUpdater(f: ReturnType<typeof fixture>) {
 }
 
 describe('zerokun-update', () => {
+  test('一瞬だけ起動したprocessを成功扱いせず、3回連続healthyまで待つ', async () => {
+    const observations = [true, false, true, true, true]
+    let checks = 0
+
+    await waitForStableHealth({
+      observe: () => observations[checks++] ?? false,
+      requiredConsecutive: 3,
+      maxChecks: 6,
+      sleep: async () => {},
+    })
+
+    expect(checks).toBe(5)
+  })
+
+  test('bot・bridge・runnerが安定しなければ再起動失敗にする', async () => {
+    await expect(waitForStableHealth({
+      observe: () => false,
+      requiredConsecutive: 2,
+      maxChecks: 3,
+      sleep: async () => {},
+    })).rejects.toThrow('安定稼働を確認できません')
+  })
+
   test('3リポを事前検査してからmainへfast-forwardしsetupを実行する', () => {
     const f = fixture()
     must(['git', 'switch', '-c', 'merged-feature'], f.zero.local)

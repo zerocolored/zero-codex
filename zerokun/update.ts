@@ -251,6 +251,21 @@ function matchingPids(pattern: string): number[] {
     .filter(pid => Number.isInteger(pid) && pid > 0 && pid !== process.pid)
 }
 
+export async function waitForStableHealth(options: {
+  observe: () => boolean
+  requiredConsecutive: number
+  maxChecks: number
+  sleep: () => Promise<void>
+}): Promise<void> {
+  let consecutive = 0
+  for (let check = 0; check < options.maxChecks; check += 1) {
+    consecutive = options.observe() ? consecutive + 1 : 0
+    if (consecutive >= options.requiredConsecutive) return
+    await options.sleep()
+  }
+  fail('bot・bridge・runnerの安定稼働を確認できません')
+}
+
 async function restartServices(
   rootRepo: string,
   stateDir: string,
@@ -282,16 +297,23 @@ async function restartServices(
     closeSync(logFd)
   }
 
-  const startedAt = Date.now()
-  while (Date.now() - startedAt < 30_000) {
-    const newRunnerPid = readPid(join(stateDir, 'job-runner.lock', 'pid'))
-    if (matchingPids(botPattern).length > 0 && newRunnerPid && pidIsAlive(newRunnerPid)) {
-      output(`   start: Slack bot + job runner PID ${newRunnerPid}`)
-      return
-    }
-    await Bun.sleep(500)
-  }
-  fail(`再起動確認に失敗しました。ログ: ${logPath}`)
+  await waitForStableHealth({
+    requiredConsecutive: 10,
+    maxChecks: 60,
+    sleep: () => Bun.sleep(500),
+    observe: () => {
+      const newRunnerPid = readPid(join(stateDir, 'job-runner.lock', 'pid'))
+      const bridgePid = readPid(join(stateDir, 'plugin.lock'))
+      return matchingPids(botPattern).length > 0
+        && Boolean(newRunnerPid && pidIsAlive(newRunnerPid))
+        && Boolean(bridgePid && pidIsAlive(bridgePid))
+    },
+  }).catch(error => {
+    fail(`${error instanceof Error ? error.message : String(error)}。ログ: ${logPath}`)
+  })
+  const newRunnerPid = readPid(join(stateDir, 'job-runner.lock', 'pid'))
+  const bridgePid = readPid(join(stateDir, 'plugin.lock'))
+  output(`   start: Slack bot + bridge PID ${bridgePid} + job runner PID ${newRunnerPid}`)
 }
 
 async function main(): Promise<void> {
