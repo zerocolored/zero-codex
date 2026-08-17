@@ -14,6 +14,7 @@ echo "== ゼロくんセットアップ開始 (repo: $REPO_DIR)"
 command -v bun >/dev/null 2>&1 || { echo "❌ bun がありません → curl -fsSL https://bun.sh/install | bash"; exit 1; }
 command -v claude >/dev/null 2>&1 || { echo "❌ claude CLI がありません → https://claude.com/claude-code"; exit 1; }
 command -v git >/dev/null 2>&1 || { echo "❌ git がありません"; exit 1; }
+command -v tmux >/dev/null 2>&1 || { echo "❌ tmux がありません → brew install tmux"; exit 1; }
 (cd "$REPO_DIR" && bun install --silent)
 
 # 1. 設定ディレクトリ
