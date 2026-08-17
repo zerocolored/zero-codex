@@ -487,14 +487,79 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
   return stats
 }
 
-function parseClaudeResult(stdout: string): string {
+/**
+ * 完了通知に載せる本文の上限。Slack は 3500 字ずつ分割投稿するので、
+ * これを超えると 1 ジョブの報告がスレッドを何十通も占有する。
+ */
+const MAX_RESULT_CHARS = 12_000
+/** 形を解釈できなかった時に添える stdout 末尾の量。 */
+const RAW_FALLBACK_TAIL_CHARS = 2_000
+
+function capResult(result: string): string {
+  if (result.length <= MAX_RESULT_CHARS) return result
+  return `${result.slice(0, MAX_RESULT_CHARS)}\n\n…(長いため ${MAX_RESULT_CHARS} 字で打ち切りました)`
+}
+
+function findResultEvent(events: unknown[]): string | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i] as { type?: unknown; result?: unknown } | null
+    if (!event || typeof event !== 'object') continue
+    if (event.type === 'result' && typeof event.result === 'string') return event.result
+  }
+  // type を持たない実装差に備えた二段目の探索。
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i] as { result?: unknown } | null
+    if (event && typeof event === 'object' && typeof event.result === 'string') return event.result
+  }
+  return null
+}
+
+/**
+ * Claude の最終メッセージだけを stdout から取り出す。
+ *
+ * `--output-format json` の形は `--verbose` の有無で変わる:
+ *   - verbose 無し … `{ "type": "result", "result": "..." }` の単一オブジェクト
+ *   - verbose 有り … 全イベントを含む配列 `[ {...}, ..., { "type": "result", ... } ]`
+ * 実装差で JSONL(1 行 1 イベント)になる経路もある。
+ *
+ * 旧実装は配列形でも `.result`(配列には無い)だけを見ており、取れないと raw 全文へ
+ * フォールバックしていた。そのため 2026-08-17 の job 4c8501fb で 2.6MB の
+ * セッション全ログが完了通知として Slack へ流れ、70 通投稿された時点で
+ * rate limit に当たって停止した。形に依存せず result イベントを探し、
+ * 解釈できない場合も raw 全文は絶対に返さない。
+ */
+export function parseClaudeResult(stdout: string, logPath?: string): string {
   const trimmed = stdout.trim()
   if (!trimmed) return '(Claude returned no text output)'
+
   try {
-    const parsed = JSON.parse(trimmed) as { result?: unknown }
-    if (typeof parsed.result === 'string') return parsed.result
-  } catch {}
-  return trimmed
+    const parsed = JSON.parse(trimmed) as unknown
+    if (Array.isArray(parsed)) {
+      const found = findResultEvent(parsed)
+      if (found !== null) return capResult(found)
+    } else if (parsed && typeof parsed === 'object') {
+      const result = (parsed as { result?: unknown }).result
+      if (typeof result === 'string') return capResult(result)
+    }
+  } catch {
+    const events: unknown[] = []
+    for (const line of trimmed.split('\n')) {
+      const text = line.trim()
+      if (!text) continue
+      try {
+        events.push(JSON.parse(text))
+      } catch {}
+    }
+    const found = findResultEvent(events)
+    if (found !== null) return capResult(found)
+  }
+
+  return [
+    '(Claude の最終メッセージを stdout から取り出せませんでした)',
+    `全文ログ: ${logPath ?? 'job-logs/<job-id>.stdout.log'}`,
+    `--- stdout 末尾 ${RAW_FALLBACK_TAIL_CHARS} 字 ---`,
+    trimmed.slice(-RAW_FALLBACK_TAIL_CHARS),
+  ].join('\n')
 }
 
 export async function executeClaudeJob(
@@ -550,7 +615,8 @@ export async function executeClaudeJob(
   clearTimeout(timer)
   options.signal?.removeEventListener('abort', abort)
   const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
-  writeFileSync(join(logDir, `${job.id}.stdout.log`), stdout, { mode: 0o600 })
+  const stdoutPath = join(logDir, `${job.id}.stdout.log`)
+  writeFileSync(stdoutPath, stdout, { mode: 0o600 })
   writeFileSync(join(logDir, `${job.id}.stderr.log`), stderr, { mode: 0o600 })
 
   if (options.signal?.aborted) {
@@ -562,7 +628,7 @@ export async function executeClaudeJob(
     throw new Error(`Claude exited with code ${exitCode}: ${detail}`)
   }
 
-  return { sessionId: job.sessionId, result: parseClaudeResult(stdout) }
+  return { sessionId: job.sessionId, result: parseClaudeResult(stdout, stdoutPath) }
 }
 
 function stateDir(): string {
@@ -586,12 +652,29 @@ function loadStateEnv(dir: string): void {
   } catch {}
 }
 
+const SLACK_CHUNK_CHARS = 3_500
+/** 1 通知が占有してよい Slack メッセージ数の上限。 */
+const MAX_SLACK_MESSAGES = 5
+const SLACK_TRUNCATION_NOTICE = '\n\n…(長すぎるため以降を省略しました。全文は job-logs を参照)'
+
+/**
+ * 通知本文を Slack の投稿単位へ分割する。何があっても MAX_SLACK_MESSAGES 通を超えない。
+ * parseClaudeResult 側でも長さを抑えているが、想定外の入力が来ても
+ * スレッドを埋め尽くさないための最後の防波堤としてここでも切る。
+ */
+export function splitSlackChunks(text: string): string[] {
+  const limit = SLACK_CHUNK_CHARS * MAX_SLACK_MESSAGES
+  const body = text.length <= limit
+    ? text
+    : text.slice(0, limit - SLACK_TRUNCATION_NOTICE.length) + SLACK_TRUNCATION_NOTICE
+  return body.match(new RegExp(`[\\s\\S]{1,${SLACK_CHUNK_CHARS}}`, 'g')) ?? ['']
+}
+
 class SlackNotifier implements JobNotifier {
   constructor(private readonly token: string, private readonly log: (message: string) => void) {}
 
   private async post(job: JobRecord, text: string): Promise<void> {
-    const chunks = text.match(/[\s\S]{1,3500}/g) ?? ['']
-    for (const chunk of chunks) {
+    for (const chunk of splitSlackChunks(text)) {
       const response = await fetch('https://slack.com/api/chat.postMessage', {
         method: 'POST',
         headers: {
