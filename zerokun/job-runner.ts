@@ -412,6 +412,7 @@ export interface RunQueuedJobsOptions {
   notifier?: JobNotifier
   pollMs?: number
   stopWhenIdle?: boolean
+  shouldPause?: () => boolean
   signal?: AbortSignal
   onLog?: (message: string) => void
 }
@@ -440,6 +441,11 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
 
   log(`${workerId} started`)
   while (!options.signal?.aborted) {
+    if (options.shouldPause?.()) {
+      await Bun.sleep(pollMs)
+      continue
+    }
+
     const job = options.store.claimNext(workerId, maxJobsPerSession)
     if (!job) {
       if (stopWhenIdle && options.store.countActive() === 0) return stats
@@ -667,6 +673,17 @@ function acquireDaemonLock(lockDir: string): boolean {
   }
 }
 
+function updateIsRunning(lockDir: string): boolean {
+  try {
+    const updaterPid = Number(readFileSync(join(lockDir, 'pid'), 'utf8').trim())
+    if (updaterPid <= 0) return false
+    process.kill(updaterPid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function readJsonStdin(): Promise<unknown> {
   return new Response(Bun.stdin.stream()).json()
 }
@@ -731,6 +748,7 @@ async function runCli(): Promise<void> {
       maxJobsPerSession: positiveInteger(process.env.ZEROKUN_MAX_JOBS_PER_SESSION, 5),
       pollMs: positiveInteger(process.env.ZEROKUN_JOB_POLL_MS, 1000),
       stopWhenIdle: command === 'run-until-idle',
+      shouldPause: () => updateIsRunning(join(dir, 'update.lock')),
       signal: controller.signal,
       notifier,
       executor: (job, signal) => executeClaudeJob(job, { signal }),

@@ -31,6 +31,7 @@ bash ~/Desktop/Project/claude-channel-slack/zerokun/setup.sh
 | `zerokun/job-runner.ts` | SQLiteへjobを永続化し、全チャンネル共通で1件ずつFIFO実行 |
 | `claude-channel.sh` | 起動スクリプト(`zerokun` コマンドの実体)。オーナー重厚モードの読み込み配線込み |
 | `zerokun/setup.sh` | 新マシンセットアップ(配線の再現) |
+| `zerokun/update.ts` | 3リポを安全に更新・検証し、ゼロくんとjob runnerを再起動 |
 | `zerokun/templates/` | 設定ファイルの雛形(トークン等の秘密は含まない) |
 | `~/.claude/channels/slack/` | 実際の設定・状態(トークン・許可リスト・スレッド対応表)。**git 管理外** |
 | `~/.claude/channels/slack/owner/` | オーナーの CLAUDE.md + /dev スキル(ernie1358 の2リポを clone。更新は `git pull`) |
@@ -63,6 +64,9 @@ tail -f ~/.claude/channels/slack/job-runner.log
 
 ## 運用の注意
 
+- 更新は `zerokun-update` を使う。実行中jobの完了を待ち、3リポを事前検査してから
+  `origin/main` へfast-forwardし、全テスト・build・setup・再起動・プロセス確認まで行う。
+  dirty worktreeまたは未マージbranchが1つでもあれば、作業内容を上書きせず停止する。
 - 停止は Ctrl-C か通常の kill。`kill -9` 禁止(plugin.lock が残って次回起動が無言で死ぬ)
 - 二重起動は起動スクリプトがガードする(既存がいたら中止)
 - 詳細な運用ドキュメントは Notion「AI管理 → ノートDB」の引継書を参照
