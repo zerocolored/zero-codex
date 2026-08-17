@@ -78,10 +78,13 @@ Bridge your Slack workspace into a running Claude Code session. DMs and @mention
 
 ゼロくん用の権限・Event Subscription・Socket Modeを再現する
 [`zerokun/templates/slack-app-manifest.yaml`](zerokun/templates/slack-app-manifest.yaml)を用意済み。
+[https://api.slack.com/apps?new_app=1](https://api.slack.com/apps?new_app=1)を開き、
 **Create New App → From a manifest** で貼り付ければ、以下の手設定の大半は不要。
 App-Level Tokenの`connections:write`とWorkspaceへのInstallだけはSlack画面で行う。
 
-`zerokun/bootstrap-macos.sh`でセットアップする場合は、manifestのコピーと作成画面の起動もスクリプトが行う。
+`zerokun/bootstrap-macos.sh`でセットアップする場合は、App表示名とbot usernameを入力すると、
+名前を反映したmanifestのコピー、作成URLの表示、作成画面の起動までスクリプトが行う。
+bot usernameはSlackの制約により英小文字・数字・`-`・`_`・`.`だけを使用する。
 
 ### 1. Create the app
 
