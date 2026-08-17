@@ -92,6 +92,19 @@ echo "▶ claude-channel V1.5"
 echo "   model    : $MODEL"
 echo "   project  : $PROJECT"
 
+# ユーザートークンで動く Slack MCP(claude.ai / Anthropic hosted の Slack コネクタ)を封じる。
+# これらは認証主体が bot ではなく「オーナー本人」なので、bridge やそのサブエージェントが
+# 使うと、ゼロくんの文章が本人の書いた発言として Slack に残る(2026-08-17 に発覚。
+# Slack 側を遡ると同種の誤送信が過去にも複数あり、最も古いものは 2026-06-05)。
+#
+# パターンの広さは意図的に「Slack だけ」。bridge は Notion/Gmail/Calendar の
+# claude.ai コネクタを正規に使うので、worker 側(zerokun/job-runner.ts)のように
+# mcp__claude_ai_* ごと落とすことはできない。代わりに末尾ワイルドカードで
+# 表示名の揺れ(Slack / Slack Workspace 等)を吸収する。実 CLI で
+# mcp__claude_ai_Slack_Workspace__* が塞がれ、mcp__claude_ai_Notion__* が通ることを確認済み。
+# bot 経路の mcp__slack-channel__* はどのパターンにも一致しないため従来どおり使える。
+DENY_ARGS=(--disallowed-tools 'mcp__claude_ai_Slack*' 'mcp__slack__*' 'mcp__slack_*')
+
 if [ "$CHANNEL" = "slack" ] || [ "$CHANNEL" = "telegram" ]; then
   BRIDGE="${CHANNEL}-channel"   # slack-channel / telegram-channel
   # --- 単一インスタンスガード: 二重起動を防ぐ ---
@@ -199,6 +212,7 @@ if [ "$CHANNEL" = "slack" ] || [ "$CHANNEL" = "telegram" ]; then
     claude \
       --model "$MODEL" \
       --dangerously-skip-permissions \
+      "${DENY_ARGS[@]}" \
       "${MCP_ARGS[@]}" \
       "${HEAVY_ARGS[@]}" \
       --dangerously-load-development-channels "server:${BRIDGE}"
@@ -212,5 +226,6 @@ else
     claude \
       --model "$MODEL" \
       --dangerously-skip-permissions \
+      "${DENY_ARGS[@]}" \
       --channels "plugin:${CHANNEL}@${MARKETPLACE}"
 fi
