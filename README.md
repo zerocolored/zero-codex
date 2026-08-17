@@ -82,7 +82,8 @@ Bridge your Slack workspace into a running Claude Code session. DMs and @mention
 **Create New App → From a manifest** で貼り付ければ、以下の手設定の大半は不要。
 App-Level Tokenの`connections:write`とWorkspaceへのInstallだけはSlack画面で行う。
 
-`zerokun/bootstrap-macos.sh`でセットアップする場合は、App表示名とbot usernameを入力すると、
+基本セットアップではSlackを後回しにする。`zerokun/bootstrap-macos.sh --slack-only`を実行し、
+App表示名とbot usernameを入力すると、
 名前を反映したmanifestのコピー、作成URLの表示、作成画面の起動までスクリプトが行う。
 bot usernameはSlackの制約により英小文字・数字・`-`・`_`・`.`だけを使用する。
 
