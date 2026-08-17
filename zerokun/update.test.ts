@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -122,18 +123,32 @@ describe('zerokun-update', () => {
     const launcher = join(root, 'claude-channel.sh')
     writeFileSync(
       launcher,
-      '#!/usr/bin/env bash\n[ -t 0 ] || exit 42\nread -r _confirmation\nread -r _keepalive\n',
+      [
+        '#!/usr/bin/env bash',
+        '[ -t 0 ] || exit 42',
+        'sleep 0.2',
+        "python3 -c 'import sys, termios; termios.tcflush(sys.stdin, termios.TCIFLUSH)'",
+        "printf 'Enter to confirm\\n'",
+        'read -r _confirmation',
+        ': > "$1/confirmed"',
+        'read -r _keepalive',
+        '',
+      ].join('\n'),
     )
     chmodSync(launcher, 0o755)
 
-    const proc = Bun.spawn(buildRestartCommand(root, '/tmp/project', 10), {
+    const proc = Bun.spawn(buildRestartCommand(root, root, 1), {
       stdin: 'ignore',
       stdout: 'ignore',
       stderr: 'ignore',
     })
+    for (let attempt = 0; attempt < 40 && !existsSync(join(root, 'confirmed')); attempt += 1) {
+      await Bun.sleep(25)
+    }
+    expect(existsSync(join(root, 'confirmed'))).toBe(true)
     const state = await Promise.race([
       proc.exited.then(exitCode => `exited:${exitCode}`),
-      Bun.sleep(250).then(() => 'running'),
+      Bun.sleep(100).then(() => 'running'),
     ])
     expect(state).toBe('running')
     proc.kill()

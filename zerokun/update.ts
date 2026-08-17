@@ -275,15 +275,19 @@ export async function waitForStableHealth(options: {
 export function buildRestartCommand(
   rootRepo: string,
   projectDir: string,
-  confirmationDelayMs = 2_000,
+  confirmationTimeoutSeconds = 25,
 ): string[] {
-  const delay = Math.max(0, Math.floor(confirmationDelayMs))
+  const timeout = Math.max(1, Math.floor(confirmationTimeoutSeconds))
   const expectScript = [
     'log_user 1',
-    'set timeout -1',
+    `set timeout ${timeout}`,
     'spawn -noecho $env(ZEROKUN_EXPECT_LAUNCHER) $env(ZEROKUN_EXPECT_PROJECT)',
-    `after ${delay}`,
-    'send -- "\\r"',
+    'expect {',
+    '  -re {Enter} { send -- "\\r" }',
+    '  timeout { exit 44 }',
+    '  eof { exit 45 }',
+    '}',
+    'set timeout -1',
     'expect eof',
   ].join('\n')
   return [
@@ -324,7 +328,7 @@ async function restartServices(
       stderr: logFd,
     })
     // Claude Codeはdevelopment channel起動時に毎回確認画面を出す。
-    // expectが疑似TTYを保持し、画面描画後にEnterを送り、Claude終了まで待ち続ける。
+    // expectが疑似TTYを保持し、確認表示を検出してからEnterを送り、Claude終了まで待ち続ける。
     proc.unref()
   } finally {
     closeSync(logFd)
