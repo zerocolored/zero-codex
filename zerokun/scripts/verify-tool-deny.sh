@@ -65,8 +65,21 @@ EOF
   fi
 }
 
-WORKER_DENY=('mcp__claude_ai_*' 'mcp__slack__*' 'mcp__slack_*')
-BRIDGE_DENY=('mcp__claude_ai_Slack*' 'mcp__slack__*' 'mcp__slack_*')
+# 本番の値をここに写経すると、production から pattern を消しても
+# このスクリプトだけ旧配列で success してしまう。実ファイルから読み出す。
+read -r -a WORKER_DENY <<< "$("$BUN_BIN" --silent -e \
+  'import {WORKER_DENIED_TOOL_PATTERNS as p} from "'"$REPO_DIR"'/zerokun/job-runner.ts"; console.log(p.join(" "))')"
+read -r -a BRIDGE_DENY <<< "$(
+  sed -n "s/^DENY_ARGS=(--disallowed-tools \(.*\))$/\1/p" "$REPO_DIR/claude-channel.sh" | tr -d "'"
+)"
+
+if [ "${#WORKER_DENY[@]}" -eq 0 ] || [ "${#BRIDGE_DENY[@]}" -eq 0 ]; then
+  echo "❌ deny パターンを実ファイルから読めませんでした(job-runner.ts / claude-channel.sh)" >&2
+  exit 1
+fi
+echo "   worker deny: ${WORKER_DENY[*]}"
+echo "   bridge deny: ${BRIDGE_DENY[*]}"
+echo ""
 
 echo "▶ control (deny 無し。ここが TOOL_REACHED でないと以降の結果に意味がない)"
 check "no deny / slack" slack TOOL_REACHED
@@ -75,7 +88,9 @@ echo "▶ worker denylist (zerokun/job-runner.ts)"
 check "claude.ai Slack connector"        claude_ai_Slack           BLOCKED      "${WORKER_DENY[@]}"
 check "同 connector が改名されても塞ぐ"  claude_ai_Slack_Workspace BLOCKED      "${WORKER_DENY[@]}"
 check "hosted slack MCP"                 slack                     BLOCKED      "${WORKER_DENY[@]}"
-check "bot 経路は巻き込まない"           slack-channel             TOOL_REACHED "${WORKER_DENY[@]}"
+check "ハイフン名の user-token MCP"       slack-user                BLOCKED      "${WORKER_DENY[@]}"
+check "実装用 MCP は残す"                github                    TOOL_REACHED "${WORKER_DENY[@]}"
+check "bot 経路も worker では塞ぐ"       slack-channel             BLOCKED      "${WORKER_DENY[@]}"
 
 echo "▶ bridge denylist (claude-channel.sh)"
 check "claude.ai Slack connector"        claude_ai_Slack           BLOCKED      "${BRIDGE_DENY[@]}"

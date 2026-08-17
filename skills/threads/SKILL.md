@@ -236,6 +236,11 @@ only — it carries no files. So when a worker reports a path to a CSV, screensh
 other artifact, relay it yourself from this thread subagent with `reply`'s `files` array,
 which uploads under the bot token.
 
+The worker also cannot reach the owner's claude.ai connectors (Notion, Gmail, Calendar,
+Slack) — they authenticate as the owner, so they are denied there wholesale. If a job
+needs content from one of those, read it here first, write it to a local absolute path,
+and name that path in the `task`.
+
 After enqueue succeeds, reply once with the returned short job ID and queue position.
 An exact duplicate Slack delivery returns the existing job. All queued jobs share one
 global worker, so even requests from different channels or threads start in FIFO order
@@ -378,6 +383,10 @@ Content:
 Before acting, apply the current global SQLite queue policy. For code/settings/docs
 changes, long investigations, tests/builds, deploys, or PR work, call `enqueue_job`
 exactly once and do not perform or delegate that same work in this thread subagent.
+
+Never put a Slack-posting instruction in the `task` you enqueue — the worker has no bot
+identity and reaching for a Slack tool makes it post as the human owner. Ask for
+artifacts as local absolute paths and relay them yourself with `reply`.
 
 Respond via the `reply` tool. Use chat_id and thread_ts above.
 ```
