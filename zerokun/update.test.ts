@@ -9,7 +9,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { waitForStableHealth } from './update'
+import { processStateIsAlive, waitForStableHealth } from './update'
 
 const tempDirs: string[] = []
 const updater = join(import.meta.dir, 'update.ts')
@@ -116,6 +116,14 @@ function runUpdater(f: ReturnType<typeof fixture>) {
 }
 
 describe('zerokun-update', () => {
+  test('SIGTERM後のゾンビprocessを終了済みとして扱う', () => {
+    expect(processStateIsAlive('Z+')).toBe(false)
+    expect(processStateIsAlive('Z')).toBe(false)
+    expect(processStateIsAlive('S+')).toBe(true)
+    expect(processStateIsAlive('R')).toBe(true)
+    expect(processStateIsAlive('')).toBe(false)
+  })
+
   test('一瞬だけ起動したprocessを成功扱いせず、3回連続healthyまで待つ', async () => {
     const observations = [true, false, true, true, true]
     let checks = 0
