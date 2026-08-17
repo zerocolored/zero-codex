@@ -17,6 +17,7 @@ import {
   buildWorkerPrompt,
   executeClaudeJob,
   runQueuedJobs,
+  splitSlackChunks,
   type EnqueueInput,
   type JobExecutor,
 } from './job-runner'
@@ -398,5 +399,82 @@ console.log(JSON.stringify({ result: 'fixture completed' }))
       else process.env.CLAUDECODE = previousClaudeCode
       store.close()
     }
+  })
+})
+
+describe('job result extraction', () => {
+  // 2026-08-17: job 4c8501fb の完了通知が 2.6MB のセッション全ログになり、
+  // Slack へ 3500 字ずつ 70 通投稿されて rate limit で止まった。
+  // `--output-format json --verbose` は「全イベントの配列」を返すのに、
+  // parseClaudeResult は単一オブジェクトの `.result` しか見ておらず、
+  // 取り出せないと raw 全文をそのまま返していたのが原因。
+  async function runFakeClaude(stdoutScript: string): Promise<string> {
+    const store = makeStore()
+    store.enqueue(input())
+    const claimed = store.claimNext('serial-worker')!
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'zerokun-claude-result-'))
+    tempDirs.push(fixtureDir)
+    const repoDir = join(fixtureDir, 'repo')
+    const fakeClaude = join(fixtureDir, 'fake-claude')
+    mkdirSync(repoDir)
+    writeFileSync(fakeClaude, `#!/usr/bin/env bun\n${stdoutScript}\n`)
+    chmodSync(fakeClaude, 0o755)
+    try {
+      const execution = await executeClaudeJob(
+        { ...claimed, repoPath: repoDir },
+        { claudeBin: fakeClaude, logDir: join(fixtureDir, 'logs'), timeoutMs: 10_000 },
+      )
+      return execution.result
+    } finally {
+      store.close()
+    }
+  }
+
+  test('--verbose の配列出力からは最終メッセージだけを取り出す', async () => {
+    const result = await runFakeClaude(`
+const events = [
+  { type: 'system', subtype: 'init', session_id: 'sess-1', tools: ['Bash'] },
+  { type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(100000) }] } },
+  { type: 'user', message: { content: [{ type: 'tool_result', content: 'y'.repeat(100000) }] } },
+  { type: 'result', subtype: 'success', result: 'PR を作成しました: https://example.com/pr/1' },
+]
+console.log(JSON.stringify(events))
+`)
+
+    expect(result).toBe('PR を作成しました: https://example.com/pr/1')
+  })
+
+  test('JSONL 出力でも最終メッセージだけを取り出す', async () => {
+    const result = await runFakeClaude(`
+console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-1' }))
+console.log(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'z'.repeat(50000) }] } }))
+console.log(JSON.stringify({ type: 'result', subtype: 'success', result: '完了しました' }))
+`)
+
+    expect(result).toBe('完了しました')
+  })
+
+  test('形を解釈できなくても raw 全文は返さず Slack 投稿量を抑える', async () => {
+    const result = await runFakeClaude(`
+console.log('x'.repeat(2000000))
+`)
+
+    // Slack は 3500 字ずつ分割投稿する。数十通に膨らむ長さを返してはならない。
+    expect(result.length).toBeLessThan(3500 * 4)
+    expect(result).toContain('stdout.log')
+  })
+
+  test('最終メッセージ自体が長すぎる場合も打ち切る', async () => {
+    const result = await runFakeClaude(`
+console.log(JSON.stringify([{ type: 'result', subtype: 'success', result: 'a'.repeat(500000) }]))
+`)
+
+    expect(result.length).toBeLessThan(3500 * 5)
+  })
+
+  test('通知本文が何字でもSlack投稿は5通を超えない', () => {
+    expect(splitSlackChunks('短い通知')).toEqual(['短い通知'])
+    expect(splitSlackChunks('x'.repeat(3_000_000)).length).toBeLessThanOrEqual(5)
+    expect(splitSlackChunks('x'.repeat(3_000_000)).join('')).toContain('以降を省略')
   })
 })
