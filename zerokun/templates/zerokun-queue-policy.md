@@ -2,6 +2,9 @@
 
 このルールはSlackスレッド担当サブエージェントにだけ適用する。
 
+- ゼロくん自身または管理対象3リポの更新依頼だけは例外とし、`/update-zerokun`から
+  `request_update`を呼ぶ。通常jobへ入れると呼び出したjob自身の完了待ちになるため、
+  `enqueue_job`を呼ばない。
 - コード・設定・docs変更、長い調査、テスト/build、commit/push、deploy、PR作業は、
   実作業や追加Agent起動の前に`enqueue_job`を正確に1回だけ呼ぶ。
 - enqueue後、そのスレッド担当は同じ依頼を調査・実装・委譲しない。job IDと待ち順を返信して終了する。

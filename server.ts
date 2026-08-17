@@ -27,6 +27,7 @@ import {
   resolveIsMention, pruneDeliveredKeys,
   type ChannelPolicy,
 } from './gate.ts'
+import { requestUpdate } from './zerokun/update-request.ts'
 
 const STATE_DIR = process.env.SLACK_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'slack')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -38,6 +39,7 @@ const THREADS_FILE = join(STATE_DIR, 'threads.json')
 const POLL_STATE_FILE = join(STATE_DIR, 'poll-state.json')
 const DELIVERED_FILE = join(STATE_DIR, 'delivered.json')
 const JOB_RUNNER_FILE = process.env.ZEROKUN_JOB_RUNNER ?? join(STATE_DIR, 'job-runner.ts')
+const UPDATE_REQUEST_FILE = process.env.ZEROKUN_UPDATE_REQUEST ?? join(STATE_DIR, 'update-request.ts')
 
 // Thread catch-up poller cadence and reach. Only threads whose dispatcher
 // last_activity is within the active window are polled, to bound cost — the
@@ -513,6 +515,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'request_update',
+      description:
+        'Request a detached safe update of Zero-kun and its three repositories. The tool posts acceptance and final result to the originating Slack thread; do not enqueue this as a normal job.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Channel or DM ID from the inbound message' },
+          thread_ts: { type: 'string', description: 'Slack thread timestamp for status notifications' },
+          message_id: { type: 'string', description: 'Unique inbound Slack message timestamp' },
+          user_id: { type: 'string', description: 'Authorized Slack user ID' },
+        },
+        required: ['chat_id', 'thread_ts', 'message_id', 'user_id'],
+      },
+    },
+    {
       name: 'reply',
       description:
         'Reply on Slack. Pass chat_id from the inbound message. Use thread_ts for threading. Pass files (absolute paths) for attachments.',
@@ -624,6 +641,62 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           ? `job ${shortId} was already queued (duplicate Slack event ignored)`
           : `job ${shortId} queued (position: ${result.queuePosition})`
         return { content: [{ type: 'text', text }] }
+      }
+
+      case 'request_update': {
+        const chatId = args.chat_id as string
+        const threadTs = args.thread_ts as string
+        const messageId = args.message_id as string
+        const userId = args.user_id as string
+        await fetchAllowedChannel(chatId)
+        for (const [key, value] of Object.entries({
+          chat_id: chatId,
+          thread_ts: threadTs,
+          message_id: messageId,
+          user_id: userId,
+        })) {
+          if (typeof value !== 'string' || value.trim() === '') {
+            throw new Error(`${key} is required`)
+          }
+        }
+
+        try {
+          const result = await requestUpdate(
+            { chatId, threadTs, messageId, userId },
+            {
+              stateDir: STATE_DIR,
+              workerFile: UPDATE_REQUEST_FILE,
+              onAccepted: async request => {
+                await slackApp!.client.chat.postMessage({
+                  channel: chatId,
+                  thread_ts: threadTs,
+                  text: `🔄 ゼロくん更新を受け付けました（request ${request.id.slice(0, 8)}）。実行中jobの完了を待ってから3リポを更新し、完了結果をこのスレッドへ通知します。`,
+                })
+              },
+              onDuplicate: async request => {
+                await slackApp!.client.chat.postMessage({
+                  channel: chatId,
+                  thread_ts: threadTs,
+                  text: `🔄 ゼロくんはすでに更新待ちまたは更新中です（request ${request.id.slice(0, 8)}）。二重実行せず、先の更新を継続します。`,
+                })
+              },
+            },
+          )
+          const text = result.accepted
+            ? `update request ${result.request.id.slice(0, 8)} accepted by detached worker`
+            : `update request ${result.request.id.slice(0, 8)} already pending`
+          return { content: [{ type: 'text', text }] }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          try {
+            await slackApp!.client.chat.postMessage({
+              channel: chatId,
+              thread_ts: threadTs,
+              text: `❌ ゼロくん更新依頼を処理できませんでした。${message}`,
+            })
+          } catch {}
+          throw error
+        }
       }
 
       case 'reply': {

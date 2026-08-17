@@ -34,6 +34,8 @@ bash ~/Desktop/Project/claude-channel-slack/zerokun/setup.sh
 | `claude-channel.sh` | 起動スクリプト(`zerokun` コマンドの実体)。オーナー重厚モードの読み込み配線込み |
 | `zerokun/setup.sh` | 新マシンセットアップ(配線の再現) |
 | `zerokun/update.ts` | 3リポを安全に更新・検証し、ゼロくんとjob runnerを再起動 |
+| `zerokun/update-request.ts` | Slack更新依頼を独立workerへ渡し、元スレッドへ完了通知 |
+| `skills/update-zerokun/` | 「ゼロくん更新して」を専用更新経路へ送るSkill |
 | `zerokun/templates/` | 設定ファイルの雛形(トークン等の秘密は含まない) |
 | `~/.claude/channels/slack/` | 実際の設定・状態(トークン・許可リスト・スレッド対応表)。**git 管理外** |
 | `~/.claude/channels/slack/owner/` | オーナーの CLAUDE.md + /dev スキル(ernie1358 の2リポを clone。更新は `git pull`) |
@@ -69,6 +71,8 @@ tail -f ~/.claude/channels/slack/job-runner.log
 - 更新は `zerokun-update` を使う。実行中jobの完了を待ち、3リポを事前検査してから
   `origin/main` へfast-forwardし、全テスト・build・setup・再起動・プロセス確認まで行う。
   dirty worktreeまたは未マージbranchが1つでもあれば、作業内容を上書きせず停止する。
+- 通常はSlackで「ゼロくん更新して」と依頼する。専用Skillが受付後に独立workerを起動し、
+  完了・失敗を同じスレッドへ通知する。`zerokun-update`はSlackが使えない場合の手動経路として残す。
 - 更新後のSlack botはdetached tmux session `zerokun-slack`で常駐する。
   画面確認は`tmux attach -t zerokun-slack`、確認後に抜ける操作は`Ctrl-b`→`d`。
 - 停止は Ctrl-C か通常の kill。`kill -9` 禁止(plugin.lock が残って次回起動が無言で死ぬ)

@@ -1,0 +1,4 @@
+interface:
+  display_name: "ゼロくん更新"
+  short_description: "Slackから3リポを安全に更新してゼロくんを再起動"
+  default_prompt: "Use $update-zerokun to safely update and restart Zero-kun from Slack."

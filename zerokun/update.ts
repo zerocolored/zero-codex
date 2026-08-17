@@ -228,6 +228,10 @@ function validateZero(rootRepo: string): void {
       ['bun', 'build', 'zerokun/update.ts', '--target=bun', '--outfile', join(buildDir, 'update.js')],
       { cwd: rootRepo },
     )
+    requireCommand(
+      ['bun', 'build', 'zerokun/update-request.ts', '--target=bun', '--outfile', join(buildDir, 'update-request.js')],
+      { cwd: rootRepo },
+    )
     requireCommand(['bash', '-n', 'claude-channel.sh'], { cwd: rootRepo })
     requireCommand(['bash', '-n', 'zerokun/setup.sh'], { cwd: rootRepo })
   } finally {

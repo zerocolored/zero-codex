@@ -55,15 +55,18 @@ done
 # 4. スキルの symlink (スレッド振り分け + /dev)
 mkdir -p "$HOME/.claude/skills"
 ln -sfn "$REPO_DIR/skills/threads" "$HOME/.claude/skills/threads"
+ln -sfn "$REPO_DIR/skills/update-zerokun" "$HOME/.claude/skills/update-zerokun"
 ln -sfn "$CH/owner/claude-skills/dev" "$HOME/.claude/skills/dev"
 
 # 5. SQLite直列job runner・安全更新・起動コマンド
 mkdir -p "$HOME/.local/bin"
 install -m 0700 "$REPO_DIR/zerokun/job-runner.ts" "$CH/job-runner.ts"
+install -m 0700 "$REPO_DIR/zerokun/update-request.ts" "$CH/update-request.ts"
 ln -sfn "$CH/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
 ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"
 ln -sfn "$REPO_DIR/claude-channel.sh" "$HOME/.local/bin/claude-channel"
 echo "   SQLite job runner を設置しました(永続FIFO / 同時実行数1)"
+echo "   Slack更新リクエストworkerを設置しました"
 echo "   安全更新コマンドを設置しました: zerokun-update"
 
 # 6. zsh エイリアス(未登録なら追記)
