@@ -22,6 +22,8 @@ bash ~/Desktop/Project/claude-channel-slack/zerokun/setup.sh
 4. **codex CLI の導入 + ログイン** — 重厚モードのレベル2以上と /dev が Codex(GPT-5.6-sol)を構成員に使う。
    未導入だと多人数検証が回らない(`brew install codex` 等 → OpenAI アカウントでログイン)
 
+`setup.sh`と自動再起動には、Claudeの実端末を常駐させる`tmux`も必要（未導入なら`brew install tmux`）。
+
 ## 構成
 
 | 場所 | 役割 |
@@ -67,6 +69,8 @@ tail -f ~/.claude/channels/slack/job-runner.log
 - 更新は `zerokun-update` を使う。実行中jobの完了を待ち、3リポを事前検査してから
   `origin/main` へfast-forwardし、全テスト・build・setup・再起動・プロセス確認まで行う。
   dirty worktreeまたは未マージbranchが1つでもあれば、作業内容を上書きせず停止する。
+- 更新後のSlack botはdetached tmux session `zerokun-slack`で常駐する。
+  画面確認は`tmux attach -t zerokun-slack`、確認後に抜ける操作は`Ctrl-b`→`d`。
 - 停止は Ctrl-C か通常の kill。`kill -9` 禁止(plugin.lock が残って次回起動が無言で死ぬ)
 - 二重起動は起動スクリプトがガードする(既存がいたら中止)
 - 詳細な運用ドキュメントは Notion「AI管理 → ノートDB」の引継書を参照

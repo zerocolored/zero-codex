@@ -10,7 +10,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { buildRestartCommand, processStateIsAlive, waitForStableHealth } from './update'
+import { processStateIsAlive, startBotInTmux, waitForStableHealth } from './update'
 
 const tempDirs: string[] = []
 const updater = join(import.meta.dir, 'update.ts')
@@ -117,7 +117,7 @@ function runUpdater(f: ReturnType<typeof fixture>) {
 }
 
 describe('zerokun-update', () => {
-  test('更新process終了後も疑似TTYを保持し、確認表示後にEnterを渡せる', async () => {
+  test('detached tmuxで実端末を保持し、確認表示後にEnterを渡せる', async () => {
     const root = mkdtempSync(join(tmpdir(), 'zerokun-pty-test-'))
     tempDirs.push(root)
     const launcher = join(root, 'claude-channel.sh')
@@ -137,30 +137,26 @@ describe('zerokun-update', () => {
     )
     chmodSync(launcher, 0o755)
 
-    const launched = Bun.spawnSync(
-      buildRestartCommand(root, root, 1, join(root, 'expect.log')),
-      {
-        stdin: 'ignore',
-        stdout: 'pipe',
-        stderr: 'pipe',
-      },
-    )
-    expect(launched.exitCode).toBe(0)
-    const launcherPid = Number(new TextDecoder().decode(launched.stdout).trim())
-    expect(Number.isInteger(launcherPid)).toBe(true)
+    const tmux = must(['/usr/bin/which', 'tmux'])
+    const sessionName = `zerokun-update-test-${process.pid}-${Date.now()}`
+    const panePid = await startBotInTmux({
+      rootRepo: root,
+      projectDir: root,
+      logPath: join(root, 'tmux.log'),
+      sessionName,
+      confirmationTimeoutMs: 2_000,
+      tmuxPath: tmux,
+    })
 
     try {
       for (let attempt = 0; attempt < 40 && !existsSync(join(root, 'confirmed')); attempt += 1) {
         await Bun.sleep(25)
       }
       expect(existsSync(join(root, 'confirmed'))).toBe(true)
-      expect(() => process.kill(launcherPid, 0)).not.toThrow()
+      expect(command([tmux, 'has-session', '-t', sessionName]).exitCode).toBe(0)
+      expect(() => process.kill(panePid, 0)).not.toThrow()
     } finally {
-      try {
-        process.kill(launcherPid, 'SIGTERM')
-      } catch {
-        // 失敗時もafterEachで一時ディレクトリを片付けられるようにする。
-      }
+      command([tmux, 'kill-session', '-t', sessionName])
       await Bun.sleep(100)
     }
   })

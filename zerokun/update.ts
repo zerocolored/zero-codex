@@ -270,35 +270,86 @@ export async function waitForStableHealth(options: {
   fail('bot・bridge・runnerの安定稼働を確認できません')
 }
 
-export function buildRestartCommand(
-  rootRepo: string,
-  projectDir: string,
-  confirmationTimeoutSeconds = 25,
-  logPath = '/dev/null',
-): string[] {
-  const timeout = Math.max(1, Math.floor(confirmationTimeoutSeconds))
-  const expectScript = [
-    'log_user 1',
-    `set timeout ${timeout}`,
-    'spawn -noecho $env(ZEROKUN_EXPECT_LAUNCHER) $env(ZEROKUN_EXPECT_PROJECT)',
-    'expect {',
-    '  -re {Enter} { send -- "\\r" }',
-    '  timeout { exit 44 }',
-    '  eof { exit 45 }',
-    '}',
-    'set timeout -1',
-    'expect eof',
-  ].join('\n')
-  return [
-    '/bin/sh',
-    '-c',
-    '/usr/bin/nohup /usr/bin/env ZEROKUN_EXPECT_LAUNCHER="$1" ZEROKUN_EXPECT_PROJECT="$2" /usr/bin/expect -c "$3" >>"$4" 2>&1 </dev/null & printf "%s\\n" "$!"',
-    'zerokun-update',
-    join(rootRepo, 'claude-channel.sh'),
-    projectDir,
-    expectScript,
-    logPath,
-  ]
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`
+}
+
+function resolveTmuxPath(): string {
+  const configured = process.env.ZEROKUN_TMUX_PATH
+  if (configured && existsSync(configured)) return configured
+  for (const candidate of ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux']) {
+    if (existsSync(candidate)) return candidate
+  }
+  const found = command(['/usr/bin/which', 'tmux'])
+  if (found.exitCode === 0 && found.stdout) return found.stdout
+  fail('tmuxがありません。brew install tmux を実行してから再試行してください')
+}
+
+export async function startBotInTmux(options: {
+  rootRepo: string
+  projectDir: string
+  logPath: string
+  sessionName?: string
+  confirmationTimeoutMs?: number
+  tmuxPath?: string
+}): Promise<number> {
+  const tmux = options.tmuxPath ?? resolveTmuxPath()
+  const sessionName = options.sessionName ?? 'zerokun-slack'
+  const timeoutMs = Math.max(1_000, options.confirmationTimeoutMs ?? 25_000)
+  const launcher = join(options.rootRepo, 'claude-channel.sh')
+  const launchCommand = [
+    'exec /usr/bin/env CHANNEL=slack CLAUDE_CHANNEL_REPLACE=1',
+    shellQuote(launcher),
+    shellQuote(options.projectDir),
+  ].join(' ')
+
+  command([tmux, 'kill-session', '-t', sessionName])
+  requireCommand([
+    tmux,
+    'new-session',
+    '-d',
+    '-s',
+    sessionName,
+    '-x',
+    '120',
+    '-y',
+    '40',
+    launchCommand,
+  ])
+
+  try {
+    requireCommand([
+      tmux,
+      'pipe-pane',
+      '-o',
+      '-t',
+      sessionName,
+      `/bin/cat >> ${shellQuote(options.logPath)}`,
+    ])
+    const maxChecks = Math.ceil(timeoutMs / 100)
+    for (let check = 0; check < maxChecks; check += 1) {
+      const pane = command([tmux, 'capture-pane', '-p', '-t', sessionName])
+      if (pane.exitCode !== 0) fail('Claudeのtmuxセッションが確認画面より前に終了しました')
+      if (/Enter\s+to\s+confirm/.test(pane.stdout)) {
+        requireCommand([tmux, 'send-keys', '-t', sessionName, 'Enter'])
+        const panePid = Number(requireCommand([
+          tmux,
+          'list-panes',
+          '-t',
+          sessionName,
+          '-F',
+          '#{pane_pid}',
+        ]))
+        if (!Number.isInteger(panePid) || panePid <= 0) fail('tmux pane PIDを取得できません')
+        return panePid
+      }
+      await Bun.sleep(100)
+    }
+    fail(`Claudeの確認画面が${timeoutMs / 1_000}秒以内に表示されませんでした`)
+  } catch (error) {
+    command([tmux, 'kill-session', '-t', sessionName])
+    throw error
+  }
 }
 
 async function restartServices(
@@ -315,16 +366,14 @@ async function restartServices(
 
   releaseUpdateLock()
   const logPath = join(stateDir, 'zerokun.log')
-  const launcherPid = requireCommand(buildRestartCommand(rootRepo, projectDir, 25, logPath), {
-    env: {
-      ...process.env,
-      CHANNEL: 'slack',
-      CLAUDE_CHANNEL_REPLACE: '1',
-    },
+  const panePid = await startBotInTmux({
+    rootRepo,
+    projectDir,
+    logPath,
   })
   // Claude Codeはdevelopment channel起動時に毎回確認画面を出す。
-  // nohupで更新processから切り離したexpectが疑似TTYを保持し、確認表示後にEnterを送る。
-  output(`   launcher: detached PID ${launcherPid}`)
+  // detached tmuxが実端末を保持し、確認表示後にEnterを送る。
+  output(`   terminal: tmux zerokun-slack (pane PID ${panePid})`)
 
   await waitForStableHealth({
     requiredConsecutive: 10,
