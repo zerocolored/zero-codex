@@ -9,7 +9,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { processStateIsAlive, waitForStableHealth } from './update'
+import { buildRestartCommand, processStateIsAlive, waitForStableHealth } from './update'
 
 const tempDirs: string[] = []
 const updater = join(import.meta.dir, 'update.ts')
@@ -116,6 +116,28 @@ function runUpdater(f: ReturnType<typeof fixture>) {
 }
 
 describe('zerokun-update', () => {
+  test('再起動するClaudeへ疑似TTYと確認用Enterを渡せる', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerokun-pty-test-'))
+    tempDirs.push(root)
+    const launcher = join(root, 'claude-channel.sh')
+    writeFileSync(
+      launcher,
+      '#!/usr/bin/env bash\n[ -t 0 ] || exit 42\nprintf \'tty=yes\\n\'\nread -r _confirmation\n',
+    )
+    chmodSync(launcher, 0o755)
+
+    const proc = Bun.spawn(buildRestartCommand(root, '/tmp/project'), {
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const stdout = await new Response(proc.stdout).text()
+    const stderr = await new Response(proc.stderr).text()
+
+    await proc.exited
+    expect(`${stdout}${stderr}`).toContain('tty=yes')
+  })
+
   test('SIGTERM後のゾンビprocessを終了済みとして扱う', () => {
     expect(processStateIsAlive('Z+')).toBe(false)
     expect(processStateIsAlive('Z')).toBe(false)

@@ -272,6 +272,17 @@ export async function waitForStableHealth(options: {
   fail('bot・bridge・runnerの安定稼働を確認できません')
 }
 
+export function buildRestartCommand(rootRepo: string, projectDir: string): string[] {
+  return [
+    '/bin/sh',
+    '-c',
+    'printf \'\\n\' | exec /usr/bin/script -q /dev/null "$1" "$2"',
+    'zerokun-update',
+    join(rootRepo, 'claude-channel.sh'),
+    projectDir,
+  ]
+}
+
 async function restartServices(
   rootRepo: string,
   stateDir: string,
@@ -288,7 +299,7 @@ async function restartServices(
   const logPath = join(stateDir, 'zerokun.log')
   const logFd = openSync(logPath, 'a', 0o600)
   try {
-    const proc = Bun.spawn([join(rootRepo, 'claude-channel.sh'), projectDir], {
+    const proc = Bun.spawn(buildRestartCommand(rootRepo, projectDir), {
       env: {
         ...process.env,
         CHANNEL: 'slack',
@@ -298,6 +309,8 @@ async function restartServices(
       stdout: logFd,
       stderr: logFd,
     })
+    // Claude Codeはdevelopment channel起動時に毎回確認画面を出す。
+    // OS pipeから疑似TTYへEnterを1回送り、確認後はEOFでもscript配下のClaudeは常駐する。
     proc.unref()
   } finally {
     closeSync(logFd)
