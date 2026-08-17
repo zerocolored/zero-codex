@@ -122,20 +122,22 @@ describe('zerokun-update', () => {
     const launcher = join(root, 'claude-channel.sh')
     writeFileSync(
       launcher,
-      '#!/usr/bin/env bash\n[ -t 0 ] || exit 42\nprintf \'tty=yes\\n\'\nread -r _confirmation\n',
+      '#!/usr/bin/env bash\n[ -t 0 ] || exit 42\nread -r _confirmation\nread -r _keepalive\n',
     )
     chmodSync(launcher, 0o755)
 
-    const proc = Bun.spawn(buildRestartCommand(root, '/tmp/project'), {
+    const proc = Bun.spawn(buildRestartCommand(root, '/tmp/project', 10), {
       stdin: 'ignore',
-      stdout: 'pipe',
-      stderr: 'pipe',
+      stdout: 'ignore',
+      stderr: 'ignore',
     })
-    const stdout = await new Response(proc.stdout).text()
-    const stderr = await new Response(proc.stderr).text()
-
+    const state = await Promise.race([
+      proc.exited.then(exitCode => `exited:${exitCode}`),
+      Bun.sleep(250).then(() => 'running'),
+    ])
+    expect(state).toBe('running')
+    proc.kill()
     await proc.exited
-    expect(`${stdout}${stderr}`).toContain('tty=yes')
   })
 
   test('SIGTERM後のゾンビprocessを終了済みとして扱う', () => {

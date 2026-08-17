@@ -272,14 +272,28 @@ export async function waitForStableHealth(options: {
   fail('bot・bridge・runnerの安定稼働を確認できません')
 }
 
-export function buildRestartCommand(rootRepo: string, projectDir: string): string[] {
+export function buildRestartCommand(
+  rootRepo: string,
+  projectDir: string,
+  confirmationDelayMs = 2_000,
+): string[] {
+  const delay = Math.max(0, Math.floor(confirmationDelayMs))
+  const expectScript = [
+    'log_user 1',
+    'set timeout -1',
+    'spawn -noecho $env(ZEROKUN_EXPECT_LAUNCHER) $env(ZEROKUN_EXPECT_PROJECT)',
+    `after ${delay}`,
+    'send -- "\\r"',
+    'expect eof',
+  ].join('\n')
   return [
     '/bin/sh',
     '-c',
-    'printf \'\\n\' | exec /usr/bin/script -q /dev/null "$1" "$2"',
+    'exec /usr/bin/env ZEROKUN_EXPECT_LAUNCHER="$1" ZEROKUN_EXPECT_PROJECT="$2" /usr/bin/expect -c "$3"',
     'zerokun-update',
     join(rootRepo, 'claude-channel.sh'),
     projectDir,
+    expectScript,
   ]
 }
 
@@ -310,7 +324,7 @@ async function restartServices(
       stderr: logFd,
     })
     // Claude Codeはdevelopment channel起動時に毎回確認画面を出す。
-    // OS pipeから疑似TTYへEnterを1回送り、確認後はEOFでもscript配下のClaudeは常駐する。
+    // expectが疑似TTYを保持し、画面描画後にEnterを送り、Claude終了まで待ち続ける。
     proc.unref()
   } finally {
     closeSync(logFd)
