@@ -16,6 +16,7 @@ import {
   buildChildEnvironment,
   buildWorkerPrompt,
   executeClaudeJob,
+  describeFailure,
   runQueuedJobs,
   splitSlackChunks,
   type EnqueueInput,
@@ -476,5 +477,50 @@ console.log(JSON.stringify([{ type: 'result', subtype: 'success', result: 'a'.re
     expect(splitSlackChunks('短い通知')).toEqual(['短い通知'])
     expect(splitSlackChunks('x'.repeat(3_000_000)).length).toBeLessThanOrEqual(5)
     expect(splitSlackChunks('x'.repeat(3_000_000)).join('')).toContain('以降を省略')
+  })
+})
+
+describe('job failure notice', () => {
+  // 2026-08-17 job 9c5efaef: 使用量上限(429)で落ちた時、Slack に
+  // `tus":"rejected","resetsAt":...` という JSON の途中から始まる文字列が流れた。
+  // 成功時の本文は #12 で直したが、失敗時の本文は素の stdout 末尾のままだった。
+  const RATE_LIMIT_STDOUT = JSON.stringify([
+    { type: 'system', subtype: 'init', session_id: 'sess-1' },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: "You've hit your session limit · resets 3:50pm (Asia/Tokyo)" }] },
+      error: 'rate_limit',
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      api_error_status: 429,
+      result: "You've hit your session limit · resets 3:50pm (Asia/Tokyo)",
+    },
+  ])
+
+  test('使用量上限は日本語1行 + 理由文で通知する', () => {
+    const notice = describeFailure(1, RATE_LIMIT_STDOUT, '', '/tmp/x.stdout.log')
+
+    expect(notice).toContain('使用量の上限に達したため中断しました')
+    expect(notice).toContain('resets 3:50pm')
+    expect(notice).not.toContain('resetsAt')      // 生 JSON の断片を貼らない
+    expect(notice).not.toContain('cache_read_input_tokens')
+    expect(notice.length).toBeLessThan(700)
+  })
+
+  test('理由を取り出せない場合もログパスを添えて短く保つ', () => {
+    const notice = describeFailure(1, 'x'.repeat(500_000), '', '/tmp/y.stdout.log')
+
+    expect(notice).toContain('exit code 1')
+    expect(notice).toContain('/tmp/y.stdout.log')
+    expect(notice.length).toBeLessThan(1_000)
+  })
+
+  test('失敗通知もSlack1通に収まる', () => {
+    const notice = describeFailure(1, RATE_LIMIT_STDOUT, '', '/tmp/x.stdout.log')
+
+    expect(splitSlackChunks(`ゼロくん job 9c5efaef は失敗しました。\n${notice}`).length).toBe(1)
   })
 })

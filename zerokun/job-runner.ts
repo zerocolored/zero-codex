@@ -562,6 +562,76 @@ export function parseClaudeResult(stdout: string, logPath?: string): string {
   ].join('\n')
 }
 
+/** 失敗通知に載せる本文の上限。Slack で読めない長さの JSON を貼らないための上限。 */
+const MAX_FAILURE_CHARS = 600
+
+/**
+ * stdout のイベント列から、人が読める失敗理由を組み立てる。
+ *
+ * 成功時の本文は parseClaudeResult が最終メッセージだけを取り出すのに対し、
+ * 失敗時は stdout / stderr の末尾 2000 字を素で貼っていた。そのため使用量上限
+ * (429)で落ちた時に、Slack へ `tus":"rejected","resetsAt":...` のような JSON の
+ * 途中から始まる読めない文字列が流れていた(2026-08-17 job 9c5efaef)。
+ * 理由が分かるものは日本語 1 行にし、分からないものだけ末尾を短く添える。
+ */
+export function describeFailure(
+  exitCode: number,
+  stdout: string,
+  stderr: string,
+  logPath?: string,
+): string {
+  const events: Array<Record<string, unknown>> = []
+  const collect = (value: unknown): void => {
+    if (Array.isArray(value)) value.forEach(collect)
+    else if (value && typeof value === 'object') events.push(value as Record<string, unknown>)
+  }
+  const trimmed = stdout.trim()
+  try {
+    collect(JSON.parse(trimmed))
+  } catch {
+    for (const line of trimmed.split('\n')) {
+      const text = line.trim()
+      if (!text) continue
+      try {
+        collect(JSON.parse(text))
+      } catch {}
+    }
+  }
+
+  // Claude が返す人間向けの一文(「You've hit your session limit · resets 3:50pm」等)を拾う。
+  let reason: string | null = null
+  let rateLimited = false
+  for (const event of events) {
+    if (event.error === 'rate_limit' || event.api_error_status === 429) rateLimited = true
+    if (typeof event.rateLimitType === 'string') rateLimited = true
+    if (typeof event.result === 'string' && event.result.trim() && event.is_error !== false) {
+      reason = event.result.trim()
+    }
+    const message = event.message as { content?: unknown } | undefined
+    const content = message?.content
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        const text = (block as { type?: unknown; text?: unknown })?.text
+        if ((block as { type?: unknown })?.type === 'text' && typeof text === 'string' && text.trim()) {
+          reason = text.trim()
+        }
+      }
+    }
+  }
+
+  if (reason) {
+    const head = rateLimited ? '使用量の上限に達したため中断しました。' : 'Claude が異常終了しました。'
+    return `${head}\n${reason.slice(0, MAX_FAILURE_CHARS)}`
+  }
+
+  const fallback = (stderr.trim() || trimmed).slice(-MAX_FAILURE_CHARS)
+  return [
+    `Claude が exit code ${exitCode} で終了しました。`,
+    fallback,
+    `全文ログ: ${logPath ?? 'job-logs/<job-id>.stdout.log'}`,
+  ].join('\n')
+}
+
 export async function executeClaudeJob(
   job: JobRecord,
   options: {
@@ -624,8 +694,7 @@ export async function executeClaudeJob(
   }
   if (timedOut) throw new Error(`Claude timed out after ${timeoutMs}ms`)
   if (exitCode !== 0) {
-    const detail = stderr.trim().slice(-2000) || stdout.trim().slice(-2000)
-    throw new Error(`Claude exited with code ${exitCode}: ${detail}`)
+    throw new Error(describeFailure(exitCode, stdout, stderr, stdoutPath))
   }
 
   return { sessionId: job.sessionId, result: parseClaudeResult(stdout, stdoutPath) }
