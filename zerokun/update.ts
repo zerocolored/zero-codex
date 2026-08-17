@@ -65,11 +65,17 @@ function requireCommand(
   return result.stdout
 }
 
+export function processStateIsAlive(state: string): boolean {
+  const normalized = state.trim().toUpperCase()
+  return normalized.length > 0 && !normalized.startsWith('Z')
+}
+
 function pidIsAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try {
     process.kill(pid, 0)
-    return true
+    const state = command(['ps', '-o', 'state=', '-p', String(pid)])
+    return state.exitCode === 0 && processStateIsAlive(state.stdout)
   } catch {
     return false
   }
