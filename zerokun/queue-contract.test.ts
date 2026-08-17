@@ -29,6 +29,22 @@ describe('Zero-kun queue wiring', () => {
     )
   })
 
+  test('launcher denies the owner-token Slack MCP on every claude it execs', () => {
+    const launcher = readFileSync(join(root, 'claude-channel.sh'), 'utf8')
+    expect(launcher).toContain("DENY_ARGS=(--disallowed-tools 'mcp__claude_ai_Slack*'")
+    // bridge モードと plugin モードの両方の起動行に渡っていること。
+    // 片方だけだと、その経路のサブエージェントが本人名義で投稿できてしまう。
+    const execLines = launcher.split('\n').filter((line) => line.includes('"${DENY_ARGS[@]}"'))
+    expect(execLines.length).toBe(2)
+    // DENY_ARGS は if/else の外で無条件に定義されていること(set -u で未定義参照は即死)。
+    expect(launcher.indexOf('DENY_ARGS=(')).toBeLessThan(launcher.indexOf('if [ "$CHANNEL" ='))
+  })
+
+  test('thread handler forbids putting Slack-post instructions into the job task', () => {
+    const skill = readFileSync(join(root, 'skills/threads/SKILL.md'), 'utf8')
+    expect(skill).toContain('Never tell the worker to post to Slack in `task`')
+  })
+
   test('setup installs the runner and status CLI', () => {
     const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
     expect(setup).toContain('job-runner.ts')

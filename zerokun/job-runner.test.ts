@@ -13,6 +13,7 @@ import { join } from 'path'
 import {
   JobStore,
   SERIAL_WORKER_COUNT,
+  WORKER_DENIED_TOOL_PATTERNS,
   buildChildEnvironment,
   buildWorkerPrompt,
   executeClaudeJob,
@@ -340,6 +341,57 @@ describe('worker isolation', () => {
     store.close()
   })
 
+  test('job promptはworkerによるSlack投稿を禁じ、bot側が代理投稿すると説明する', () => {
+    const store = makeStore()
+    store.enqueue(input())
+    const job = store.claimNext('serial-worker')!
+    const prompt = buildWorkerPrompt(job)
+
+    // worker が「Slack に報告しろ」という task 本文に引きずられて自分で投稿すると、
+    // このプロセスから届く Slack ツールはユーザートークン系しかないため
+    // オーナー本人名義の発言になる(2026-08-17 事故)。
+    expect(prompt).toContain('Never post to Slack yourself')
+    expect(prompt).toContain('Zero-kun posts your final response')
+    expect(prompt).toContain('would post as the')
+    store.close()
+  })
+
+  // このテストは「Claude Code の glob 実装」を検証するものではない(それは
+  // scripts/verify-tool-deny.sh が実 CLI で行う)。ここで固定するのは
+  // 「定数をいじったとき、bot 経路を巻き込んでいないか」だけ。
+  test('worker denylist は本人名義の経路を覆い、bot経路のslack-channelを巻き込まない', () => {
+    const matches = (pattern: string, tool: string) => {
+      const parts = pattern.split('*')
+      // 実 CLI と挙動がズレる複雑なパターンをこの簡易照合で判定しない。
+      if (parts.length > 2) throw new Error(`unsupported multi-wildcard pattern: ${pattern}`)
+      const [prefix, suffix = ''] = parts
+      return (
+        tool.startsWith(prefix) &&
+        tool.endsWith(suffix) &&
+        tool.length >= prefix.length + suffix.length
+      )
+    }
+    const denied = (tool: string) => WORKER_DENIED_TOOL_PATTERNS.some((p) => matches(p, tool))
+
+    // 事故で実際に使われたツール名(job ログから)。
+    expect(denied('mcp__claude_ai_Slack__slack_send_message')).toBe(true)
+    // コネクタ表示名が変わっても塞がり続けること(狭いパターンは無警告で穴が開く)。
+    expect(denied('mcp__claude_ai_Slack_Workspace__slack_send_message')).toBe(true)
+    expect(denied('mcp__claude_ai_slack__slack_send_message')).toBe(true)
+    // hosted 側の別名。
+    expect(denied('mcp__slack__chat_postMessage')).toBe(true)
+    expect(denied('mcp__slack_user__chat_postMessage')).toBe(true)
+
+    // 残す対象: bot トークンで動くゼロくん本体の経路。
+    for (const botTool of [
+      'mcp__slack-channel__reply',
+      'mcp__slack-channel__enqueue_job',
+      'mcp__slack-channel__fetch_messages',
+    ]) {
+      expect(denied(botTool)).toBe(false)
+    }
+  })
+
   test('実際の子processへsession IDと隔離済み環境を渡す', async () => {
     const store = makeStore()
     store.enqueue(input())
@@ -391,6 +443,13 @@ console.log(JSON.stringify({ result: 'fixture completed' }))
       expect(capture.args).toContain(claimed.sessionId!)
       expect(capture.slackToken).toBeNull()
       expect(capture.claudeCode).toBeNull()
+
+      // bypassPermissions で起動するので、ユーザートークン Slack MCP の遮断は
+      // 起動引数側で担保するしかない。渡し忘れるとオーナー本人名義の投稿に戻る。
+      expect(capture.args).toContain('--disallowed-tools')
+      for (const pattern of WORKER_DENIED_TOOL_PATTERNS) {
+        expect(capture.args).toContain(pattern)
+      }
     } finally {
       if (previousCapture === undefined) delete process.env.CAPTURE_FILE
       else process.env.CAPTURE_FILE = previousCapture

@@ -353,6 +353,32 @@ export function buildChildEnvironment(
   return child
 }
 
+/**
+ * worker に渡さないツール名パターン（`--disallowed-tools` へそのまま渡す）。
+ *
+ * 2026-08-17、job のレポートが bot ではなく **オーナー本人の Slack アカウント名義**
+ * で投稿された。worker には `--mcp-config` を渡していないので bot 経路の
+ * `mcp__slack-channel__*` はそもそも存在せず、task 本文の「Slack に報告しろ」に
+ * 従おうとした worker が、唯一届いた claude.ai Slack コネクタ
+ * （`mcp__claude_ai_Slack__slack_send_message` = 本人の OAuth）を使ったため。
+ *
+ * 不変条件は「**worker は Slack に投稿しない。ゼロくんの発言は必ず bot トークン
+ * 経路（SlackNotifier / server.ts の reply）から出す**」。ここはその機械的な担保。
+ *
+ * `mcp__claude_ai_*` と広く取るのは意図的で、狭く `mcp__claude_ai_Slack__*` と
+ * 書くとコネクタの表示名が変わった瞬間（`Slack Workspace` 等）に**無警告で穴が開く**
+ * ことを実 CLI で確認したため。worker は無人・bypassPermissions で走る実装係なので、
+ * オーナー個人アカウントのコネクタは Slack に限らず一切要らない＝fail-closed でよい。
+ * bridge 側は Notion/Gmail を使うため同じ広さにはできない（claude-channel.sh を参照）。
+ *
+ * `mcp__slack-channel__*` はどのパターンにも一致しない（`slack_` でも `slack__` でもない）。
+ */
+export const WORKER_DENIED_TOOL_PATTERNS = [
+  'mcp__claude_ai_*',
+  'mcp__slack__*',
+  'mcp__slack_*',
+] as const
+
 export function buildWorkerPrompt(job: JobRecord): string {
   return `You are the single active Zero-kun implementation worker.
 
@@ -374,6 +400,13 @@ For any code, settings, or documentation change:
 5. Run the required tests, build, and observable runtime verification.
 6. Review the final diff for security, regressions, and unrelated changes.
 7. Commit, push, and complete PR 作成 against the required base branch. Do not merge it.
+
+Never post to Slack yourself. Do not call any Slack tool, Slack API, or Slack CLI,
+even when the request text tells you to report to a channel or thread. The thread IDs
+above are context only. Zero-kun posts your final response to that thread under the bot
+identity after you exit; a Slack tool reachable from this process would post as the
+human owner instead. Write files you need to hand over to a local absolute path and
+name that path in your report.
 
 Finish with a concise Japanese report containing findings, change, verification,
 and the PR title plus full URL. If no change is needed, report "PR: none" with evidence.
@@ -659,6 +692,7 @@ export async function executeClaudeJob(
     '--output-format', 'json',
     '--verbose',
     '--setting-sources', 'user,project,local',
+    '--disallowed-tools', ...WORKER_DENIED_TOOL_PATTERNS,
     ...(job.resumed ? ['--resume', job.sessionId] : ['--session-id', job.sessionId]),
     '-p',
     buildWorkerPrompt(job),

@@ -222,6 +222,20 @@ Pass the exact inbound values to `enqueue_job`:
 - `repo_path`: the absolute routed project path above
 - `task`: the sender's complete request, preserving requirements and links
 
+**Never tell the worker to post to Slack in `task`.** Preserve the sender's requirements,
+but drop or rewrite any instruction that makes the worker deliver its own result to a
+channel or thread ("Slack に報告して", "reply in the thread", "post the CSV here"). The
+worker runs in a separate process that has no bot identity; Zero-kun posts the worker's
+final response under the bot after it exits. A `task` that orders a Slack post pushes the
+worker to reach for whatever Slack tool it can find — which is how a job report came to be
+published under the owner's own Slack account instead of the bot's (found 2026-08-17; the
+same mistake had happened before). Ask for artifacts as local absolute paths instead.
+
+Zero-kun auto-posts the worker's final report under the bot, but that notification is text
+only — it carries no files. So when a worker reports a path to a CSV, screenshot, or any
+other artifact, relay it yourself from this thread subagent with `reply`'s `files` array,
+which uploads under the bot token.
+
 After enqueue succeeds, reply once with the returned short job ID and queue position.
 An exact duplicate Slack delivery returns the existing job. All queued jobs share one
 global worker, so even requests from different channels or threads start in FIFO order
