@@ -75,6 +75,12 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('xapp-[A-Za-z0-9-]{10,}')
   })
 
+  test('set -uでも変数直後の日本語を変数名として誤解しない', () => {
+    const script = readFileSync(bootstrap, 'utf8')
+    const unsafeExpansions = script.match(/\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/g) ?? []
+    expect(unsafeExpansions).toEqual([])
+  })
+
   test('Slack manifest contains the complete Socket Mode contract', () => {
     const manifest = readFileSync(join(import.meta.dir, 'templates/slack-app-manifest.yaml'), 'utf8')
     for (const expected of [

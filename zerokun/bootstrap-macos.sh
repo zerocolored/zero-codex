@@ -437,7 +437,7 @@ configure_slack() {
   /usr/bin/open "$SLACK_APP_CREATE_URL" >/dev/null 2>&1 || true
   cat <<EOF
    上のURLで Create New App → From a manifest を選び、manifestを貼り付けて作成します。
-   App表示名は「$SLACK_APP_NAME」、bot usernameは「$SLACK_BOT_USERNAME」です。
+   App表示名は「${SLACK_APP_NAME}」、bot usernameは「${SLACK_BOT_USERNAME}」です。
    次に App-Level Tokenを connections:write で生成してxapp-を取得し、
    Install to Workspace後にBot User OAuth Tokenのxoxb-を取得してください。
 EOF
