@@ -7,14 +7,15 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CH="$HOME/.claude/channels/slack"
 TPL="$REPO_DIR/zerokun/templates"
+PROJECT_DIR="${ZEROKUN_PROJECT_DIR:-$HOME/Desktop/Project/BellSalsesAI}"
 
 echo "== ゼロくんセットアップ開始 (repo: $REPO_DIR)"
 
 # 0. 依存確認
-command -v bun >/dev/null 2>&1 || { echo "❌ bun がありません → curl -fsSL https://bun.sh/install | bash"; exit 1; }
-command -v claude >/dev/null 2>&1 || { echo "❌ claude CLI がありません → https://claude.com/claude-code"; exit 1; }
-command -v git >/dev/null 2>&1 || { echo "❌ git がありません"; exit 1; }
-command -v tmux >/dev/null 2>&1 || { echo "❌ tmux がありません → brew install tmux"; exit 1; }
+command -v bun >/dev/null 2>&1 || { echo "❌ bun がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
+command -v claude >/dev/null 2>&1 || { echo "❌ claude CLI がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
+command -v git >/dev/null 2>&1 || { echo "❌ git がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
+command -v tmux >/dev/null 2>&1 || { echo "❌ tmux がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 (cd "$REPO_DIR" && bun install --silent)
 
 # 1. 設定ディレクトリ
@@ -70,30 +71,41 @@ echo "   SQLite job runner を設置しました(永続FIFO / 同時実行数1)"
 echo "   Slack更新リクエストworkerを設置しました"
 echo "   安全更新コマンドを設置しました: zerokun-update"
 
-# 6. zsh エイリアス(未登録なら追記)
-if ! grep -q "alias zerokun=" "$HOME/.zshrc" 2>/dev/null; then
-  cat >> "$HOME/.zshrc" <<'EOF'
+# 6. zsh エイリアス(管理ブロックが未登録なら追記)
+if ! grep -q "# >>> zerokun setup >>>" "$HOME/.zshrc" 2>/dev/null; then
+  {
+    cat <<'EOF'
 
-# ゼロくん（Slack から自分の Claude を動かすボット）— zerokun/setup.sh が追記
-export PATH="$HOME/.local/bin:$PATH"
-alias zerokun='CHANNEL=slack claude-channel ~/Desktop/Project/BellSalsesAI'
+# >>> zerokun setup >>>
+# Slack から自分の Claude を動かすボット — zerokun/setup.sh が追記
+export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
+EOF
+    printf 'export ZEROKUN_PROJECT_DIR=%q\n' "$PROJECT_DIR"
+    cat <<'EOF'
+alias zerokun='CHANNEL=slack claude-channel "$ZEROKUN_PROJECT_DIR"'
 # 稼働中を止めて入れ替えるかは端末の y/N プロンプトで都度確認する。
 # CLAUDE_CHANNEL_REPLACE=1 は付けない(付けても自己更新のトークンが無いと入れ替わらない)。
-alias zerokun-restart='CHANNEL=slack claude-channel ~/Desktop/Project/BellSalsesAI'
+alias zerokun-restart='CHANNEL=slack claude-channel "$ZEROKUN_PROJECT_DIR"'
 alias zerokun-status='pgrep -fl "dangerously-load-development-channels server:slack-channel" || echo "ゼロくんは停止中"'
+# <<< zerokun setup <<<
 EOF
+  } >> "$HOME/.zshrc"
   echo "   .zshrc にエイリアスを追記しました(新しいターミナルで有効)"
 fi
 
 echo ""
-echo "✅ 配線完了。残りの手動ステップ:"
-echo "  1. Slack アプリをこのマシン用に新規作成し(1台=1アプリ=1ボット名)、"
-echo "     トークン2つを $CH/.env に貼る (xoxb- / xapp-。作成手順はリポ直下 README.md)"
-echo "  2. $CH/access.json に許可する Slack ユーザーID/チャンネルIDを入れる"
-echo "  3. claude にログイン済みか確認"
-echo "  4. codex CLI を導入しログイン(重厚モードのレベル2以上が使う。無いと多人数検証が回らない)"
-echo "  5. 作業リポを ~/Desktop/Project/BellSalsesAI に用意(別プロジェクト機なら .zshrc の zerokun エイリアスの引数をそのプロジェクトに変更)"
-echo "  6. 新しいターミナルで: zerokun"
-echo "     queue確認: zerokun-jobs status"
-echo "     3リポ更新: zerokun-update"
-command -v codex >/dev/null 2>&1 || echo "  ⚠️ codex CLI が未導入です(上の 4)"
+if [ "${ZEROKUN_BOOTSTRAP:-0}" = "1" ]; then
+  echo "✅ 配線完了。bootstrapのSlack設定へ続きます。"
+else
+  echo "✅ 配線完了。残りの手動ステップ:"
+  echo "  1. Slack アプリをこのマシン用に新規作成し(1台=1アプリ=1ボット名)、"
+  echo "     トークン2つを $CH/.env に貼る (xoxb- / xapp-。作成手順はリポ直下 README.md)"
+  echo "  2. $CH/access.json に許可する Slack ユーザーID/チャンネルIDを入れる"
+  echo "  3. claude にログイン済みか確認"
+  echo "  4. codex CLI にログイン(bootstrap-macos.sh経由なら導入済み)"
+  echo "  5. 作業リポを $PROJECT_DIR に用意(bootstrap-macos.sh経由ならclone済み)"
+  echo "  6. 新しいターミナルで: zerokun"
+  echo "     queue確認: zerokun-jobs status"
+  echo "     3リポ更新: zerokun-update"
+  command -v codex >/dev/null 2>&1 || echo "  ⚠️ codex CLI が未導入です(上の 4)"
+fi

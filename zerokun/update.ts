@@ -235,6 +235,7 @@ function validateZero(rootRepo: string): void {
     )
     requireCommand(['bash', '-n', 'claude-channel.sh'], { cwd: rootRepo })
     requireCommand(['bash', '-n', 'zerokun/setup.sh'], { cwd: rootRepo })
+    requireCommand(['bash', '-n', 'zerokun/bootstrap-macos.sh'], { cwd: rootRepo })
   } finally {
     rmSync(buildDir, { recursive: true, force: true })
   }

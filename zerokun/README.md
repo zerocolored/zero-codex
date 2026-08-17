@@ -4,25 +4,30 @@
 起動スクリプト・オーナー重厚モード(トリアージ + レベル別検証 + /dev)の配線・
 新マシンセットアップを全部含む。
 
-## 新マシンセットアップ（4点セット）
+## 新しいMacのセットアップ
+
+最短手順は [NEW_MAC_SETUP.md](NEW_MAC_SETUP.md) が正本。旧Macから`bootstrap-macos.sh`を
+1ファイルだけAirDropし、新Macで次を実行する。
 
 ```bash
-git clone https://github.com/zerocolored/zero.git ~/Desktop/Project/claude-channel-slack
-bash ~/Desktop/Project/claude-channel-slack/zerokun/setup.sh
-# → 最後に表示される手動ステップを済ませ、新しいターミナルで: zerokun
+bash ~/Downloads/bootstrap-macos.sh
 ```
 
-1. **clone + setup.sh**（上記。配線・設定雛形・オーナーリポ取得・エイリアス登録は全自動）
-2. **Slack アプリを新規に1個作り、トークン2つ(xoxb-/xapp-)を `~/.claude/channels/slack/.env` に貼る**
-   - **1台 = Slack アプリ1個 = ボット名1つ**。アプリ名がそのままメンション名になる(例: @ゼロくん, @イチくん)。
-     配達はトークン単位なので、台ごとに別アプリにすれば混線しない。ボット名はコードのどこにも焼き付いていない
-   - アプリの作成手順(Socket Mode 有効化〜トークン取得)はリポ直下の `README.md` (bridge 本体の説明書) 参照
-3. **各種ログイン** — `claude` のログイン、`gh auth login`(GitHub)。
-   オーナーの2リポ(ernie1358/claude-config, claude-skills)は private のため、使うアカウントに閲覧権限(collaborator招待)が必要
-4. **codex CLI の導入 + ログイン** — 重厚モードのレベル2以上と /dev が Codex(GPT-5.6-sol)を構成員に使う。
-   未導入だと多人数検証が回らない(`brew install codex` 等 → OpenAI アカウントでログイン)
+Command Line Toolsはバージョン選択不要。スクリプトが`xcode-select --install`を呼び、
+そのmacOSに適合する版の導入完了を待つ。Homebrew、GitHub CLI、tmux、Bun、Claude Code、
+Codex CLI、3つのBellSalesAI実装リポを含む必要リポ、ゼロくん配線まで自動で行う。
 
-`setup.sh`と自動再起動には、Claudeの実端末を常駐させる`tmux`も必要（未導入なら`brew install tmux`）。
+人の操作が残るのは、macOSの確認ダイアログ、各アカウントのログイン、
+Slack App作成とトークン入力だけ。Slack Appは用意済みmanifestから作成する。
+
+### 既にclone済みの場合
+
+```bash
+bash ~/Desktop/Project/claude-channel-slack/zerokun/bootstrap-macos.sh
+```
+
+必要CLIとログインがすべて済んでおり、配線だけ再実行する場合に限り
+`bash zerokun/setup.sh`を直接使う。
 
 ## 構成
 
@@ -33,6 +38,8 @@ bash ~/Desktop/Project/claude-channel-slack/zerokun/setup.sh
 | `zerokun/job-runner.ts` | SQLiteへjobを永続化し、全チャンネル共通で1件ずつFIFO実行 |
 | `claude-channel.sh` | 起動スクリプト(`zerokun` コマンドの実体)。オーナー重厚モードの読み込み配線込み |
 | `zerokun/setup.sh` | 新マシンセットアップ(配線の再現) |
+| `zerokun/bootstrap-macos.sh` | まっさらなMacのCLT・CLI・ログイン・clone・Slack設定を順番に実行 |
+| `zerokun/NEW_MAC_SETUP.md` | 新Macセットアップ手順の正本 |
 | `zerokun/update.ts` | 3リポを安全に更新・検証し、ゼロくんとjob runnerを再起動 |
 | `zerokun/update-request.ts` | Slack更新依頼を独立workerへ渡し、元スレッドへ完了通知 |
 | `skills/zerokun-update/` | 「ゼロくん更新して」を専用更新経路へ送るSkill |

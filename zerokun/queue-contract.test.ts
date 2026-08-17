@@ -44,6 +44,7 @@ describe('Zero-kun queue wiring', () => {
     expect(updater).toContain("'origin/main'")
     expect(updater).toContain('job-runner.lock')
     expect(updater).toContain('dangerously-load-development-channels server:slack-channel')
+    expect(updater).toContain('bootstrap-macos.sh')
   })
 
   test('Slack update skill uses the dedicated request tool without entering the job queue', () => {

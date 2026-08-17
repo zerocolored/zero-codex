@@ -19,7 +19,7 @@
 #
 set -euo pipefail
 
-PROJECT="${1:-/Users/zerocolored-macpro-suetsugu/Desktop/Project/BellSalsesAI}"
+PROJECT="${1:-${ZEROKUN_PROJECT_DIR:-$HOME/Desktop/Project/BellSalsesAI}}"
 CHANNEL="${CHANNEL:-fakechat}"
 MARKETPLACE="${MARKETPLACE:-claude-plugins-official}"
 MODEL="${MODEL:-opus}"
