@@ -1,7 +1,8 @@
 # ゼロくん一式（Slack → ローカル Claude ボット）
 
-このリポがゼロくんの実体。Slack 受信(bridge)・スレッド振り分け(threads)・起動スクリプト・
-オーナー重厚モード(トリアージ + レベル別検証 + /dev)の配線・新マシンセットアップを全部含む。
+このリポがゼロくんの実体。Slack 受信(bridge)・スレッド振り分け(threads)・SQLite直列job queue・
+起動スクリプト・オーナー重厚モード(トリアージ + レベル別検証 + /dev)の配線・
+新マシンセットアップを全部含む。
 
 ## 新マシンセットアップ（4点セット）
 
@@ -27,11 +28,29 @@ bash ~/Desktop/Project/claude-channel-slack/zerokun/setup.sh
 |---|---|
 | `server.ts` / `gate.ts` | Slack bridge 本体(受信・許可判定) |
 | `skills/threads/` | スレッドごとの担当AI振り分け |
+| `zerokun/job-runner.ts` | SQLiteへjobを永続化し、全チャンネル共通で1件ずつFIFO実行 |
 | `claude-channel.sh` | 起動スクリプト(`zerokun` コマンドの実体)。オーナー重厚モードの読み込み配線込み |
 | `zerokun/setup.sh` | 新マシンセットアップ(配線の再現) |
 | `zerokun/templates/` | 設定ファイルの雛形(トークン等の秘密は含まない) |
 | `~/.claude/channels/slack/` | 実際の設定・状態(トークン・許可リスト・スレッド対応表)。**git 管理外** |
 | `~/.claude/channels/slack/owner/` | オーナーの CLAUDE.md + /dev スキル(ernie1358 の2リポを clone。更新は `git pull`) |
+
+## SQLite直列job queue
+
+コード・設定・docs変更、長い調査、テスト/build、commit/push、PRなどの依頼は、
+スレッド担当が`enqueue_job`を1回だけ呼び、`~/.claude/channels/slack/jobs.sqlite3`へ保存する。
+job runnerのワーカー数は設定変更できない固定値`1`で、別チャンネル・別スレッドの依頼も
+受付順に1件ずつ実行する。軽い説明や短い読み取り確認はキューへ入れず、スレッド担当が即答する。
+
+```bash
+zerokun-jobs status
+tail -f ~/.claude/channels/slack/job-runner.log
+```
+
+- 同じSlackイベントの再配信は`chat_id + message_id`で重複登録を防ぐ
+- daemon再起動時は`running`だったjobを`queued`へ戻す
+- 失敗したjobは`failed`へ確定し、次のjobは止めない
+- 同じSlackスレッドの後続jobは、最大5件まで同じClaude sessionを再開する
 
 ## 重厚モードの仕組み
 

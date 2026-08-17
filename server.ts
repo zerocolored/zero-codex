@@ -17,7 +17,7 @@ import { z } from 'zod'
 import { App } from '@slack/bolt'
 import { randomBytes } from 'crypto'
 import {
-  readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
+  readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, existsSync,
   statSync, renameSync, realpathSync, chmodSync, unlinkSync,
 } from 'fs'
 import { homedir } from 'os'
@@ -37,6 +37,7 @@ const LOCK_FILE = join(STATE_DIR, 'plugin.lock')
 const THREADS_FILE = join(STATE_DIR, 'threads.json')
 const POLL_STATE_FILE = join(STATE_DIR, 'poll-state.json')
 const DELIVERED_FILE = join(STATE_DIR, 'delivered.json')
+const JOB_RUNNER_FILE = process.env.ZEROKUN_JOB_RUNNER ?? join(STATE_DIR, 'job-runner.ts')
 
 // Thread catch-up poller cadence and reach. Only threads whose dispatcher
 // last_activity is within the active window are polled, to bound cost — the
@@ -453,8 +454,64 @@ async function fetchAllowedChannel(chatId: string): Promise<void> {
   throw new Error(`channel ${chatId} is not allowlisted — add via /slack:access`)
 }
 
+async function enqueueImplementationJob(payload: {
+  chatId: string
+  threadTs: string
+  messageId: string
+  userId: string
+  repoPath: string
+  task: string
+}): Promise<{ id: string; status: string; duplicate: boolean; queuePosition: number }> {
+  if (!existsSync(JOB_RUNNER_FILE)) {
+    throw new Error(`job runner is not installed: ${JOB_RUNNER_FILE} — rerun zerokun/setup.sh`)
+  }
+
+  const proc = Bun.spawn([process.execPath, JOB_RUNNER_FILE, 'enqueue'], {
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: process.env,
+  })
+  proc.stdin.write(JSON.stringify(payload))
+  proc.stdin.end()
+  const stdoutPromise = new Response(proc.stdout).text()
+  const stderrPromise = new Response(proc.stderr).text()
+  const exitCode = await proc.exited
+  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
+  if (exitCode !== 0) {
+    throw new Error(stderr.trim() || `job runner exited with code ${exitCode}`)
+  }
+  try {
+    return JSON.parse(stdout) as {
+      id: string
+      status: string
+      duplicate: boolean
+      queuePosition: number
+    }
+  } catch {
+    throw new Error(`job runner returned invalid JSON: ${stdout.slice(0, 500)}`)
+  }
+}
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    {
+      name: 'enqueue_job',
+      description:
+        'Persist a long-running investigation or implementation job in the global SQLite FIFO queue. Exactly one job runs at a time.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Channel or DM ID from the inbound message' },
+          thread_ts: { type: 'string', description: 'Slack thread timestamp' },
+          message_id: { type: 'string', description: 'Unique inbound Slack message timestamp' },
+          user_id: { type: 'string', description: 'Authorized Slack user ID' },
+          repo_path: { type: 'string', description: 'Absolute project root selected by routing' },
+          task: { type: 'string', description: 'Complete request from the sender' },
+        },
+        required: ['chat_id', 'thread_ts', 'message_id', 'user_id', 'repo_path', 'task'],
+      },
+    },
     {
       name: 'reply',
       description:
@@ -532,6 +589,43 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
     switch (req.params.name) {
+      case 'enqueue_job': {
+        const chatId = args.chat_id as string
+        const threadTs = args.thread_ts as string
+        const messageId = args.message_id as string
+        const userId = args.user_id as string
+        const repoPath = args.repo_path as string
+        const task = args.task as string
+        await fetchAllowedChannel(chatId)
+
+        for (const [key, value] of Object.entries({
+          chat_id: chatId,
+          thread_ts: threadTs,
+          message_id: messageId,
+          user_id: userId,
+          repo_path: repoPath,
+          task,
+        })) {
+          if (typeof value !== 'string' || value.trim() === '') {
+            throw new Error(`${key} is required`)
+          }
+        }
+
+        const result = await enqueueImplementationJob({
+          chatId,
+          threadTs,
+          messageId,
+          userId,
+          repoPath,
+          task,
+        })
+        const shortId = result.id.slice(0, 8)
+        const text = result.duplicate
+          ? `job ${shortId} was already queued (duplicate Slack event ignored)`
+          : `job ${shortId} queued (position: ${result.queuePosition})`
+        return { content: [{ type: 'text', text }] }
+      }
+
       case 'reply': {
         const chatId = args.chat_id as string
         const text = args.text as string

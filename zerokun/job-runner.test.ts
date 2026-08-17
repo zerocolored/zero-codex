@@ -1,0 +1,374 @@
+import { afterEach, describe, expect, test } from 'bun:test'
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import {
+  JobStore,
+  SERIAL_WORKER_COUNT,
+  buildChildEnvironment,
+  buildWorkerPrompt,
+  executeClaudeJob,
+  runQueuedJobs,
+  type EnqueueInput,
+  type JobExecutor,
+} from './job-runner'
+
+const tempDirs: string[] = []
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+function makeStore(): JobStore {
+  const dir = mkdtempSync(join(tmpdir(), 'zerokun-job-runner-test-'))
+  tempDirs.push(dir)
+  return new JobStore(join(dir, 'jobs.sqlite3'))
+}
+
+function input(overrides: Partial<EnqueueInput> = {}): EnqueueInput {
+  return {
+    chatId: 'C123',
+    threadTs: '100.0001',
+    messageId: '100.0001',
+    userId: 'U123',
+    repoPath: '/tmp/project',
+    task: 'ログイン処理を修正してPRを作成する',
+    ...overrides,
+  }
+}
+
+describe('SQLite job queue', () => {
+  test('同一Slackイベントを再受信してもjobを二重登録しない', () => {
+    const store = makeStore()
+    const first = store.enqueue(input())
+    const duplicate = store.enqueue(input())
+
+    expect(first.duplicate).toBe(false)
+    expect(duplicate.duplicate).toBe(true)
+    expect(duplicate.job.id).toBe(first.job.id)
+    expect(store.list()).toHaveLength(1)
+    store.close()
+  })
+
+  test('受付順にclaimする', () => {
+    const store = makeStore()
+    for (let i = 1; i <= 3; i += 1) {
+      store.enqueue(input({
+        chatId: `C${i}`,
+        threadTs: `${i}.0001`,
+        messageId: `${i}.0001`,
+        task: `job-${i}`,
+      }))
+    }
+
+    for (let i = 1; i <= 3; i += 1) {
+      const claimed = store.claimNext('serial-worker')
+      expect(claimed?.task).toBe(`job-${i}`)
+      store.complete(claimed!.id, claimed!.sessionId!, `done-${i}`)
+    }
+    store.close()
+  })
+
+  test('10プロセスから同時enqueueしても全件を永続化する', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-concurrent-enqueue-'))
+    tempDirs.push(dir)
+    const repoDir = join(dir, 'repo')
+    mkdirSync(repoDir)
+    const runner = join(import.meta.dir, 'job-runner.ts')
+
+    const results = await Promise.all(Array.from({ length: 10 }, async (_, i) => {
+      const proc = Bun.spawn([process.execPath, runner, 'enqueue'], {
+        env: { ...process.env, SLACK_STATE_DIR: dir },
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      proc.stdin.write(JSON.stringify(input({
+        chatId: `C${i}`,
+        threadTs: `${i}.0001`,
+        messageId: `${i}.0001`,
+        repoPath: repoDir,
+        task: `job-${i}`,
+      })))
+      proc.stdin.end()
+      const stdoutPromise = new Response(proc.stdout).text()
+      const stderrPromise = new Response(proc.stderr).text()
+      const exitCode = await proc.exited
+      return { exitCode, stdout: await stdoutPromise, stderr: await stderrPromise }
+    }))
+
+    expect(results.filter(result => result.exitCode !== 0)).toEqual([])
+    expect(results.every(result => result.stderr === '')).toBe(true)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    expect(store.list()).toHaveLength(10)
+    store.close()
+  })
+
+  test('daemon再起動時は取り残したrunning jobをqueuedへ戻す', () => {
+    const store = makeStore()
+    const job = store.enqueue(input()).job
+    expect(store.claimNext('serial-worker')?.status).toBe('running')
+
+    expect(store.recoverInterrupted()).toBe(1)
+    const recovered = store.get(job.id)
+    expect(recovered?.status).toBe('queued')
+    expect(recovered?.workerId).toBeNull()
+    expect(recovered?.lastError).toContain('daemon restarted')
+    store.close()
+  })
+
+  test('同じSlackスレッドは5jobまで同じClaude sessionを再利用する', () => {
+    const store = makeStore()
+    for (let i = 1; i <= 6; i += 1) {
+      store.enqueue(input({ messageId: `100.000${i}`, task: `follow-up-${i}` }))
+    }
+
+    const sessionIds: string[] = []
+    const resumed: boolean[] = []
+    for (let i = 1; i <= 6; i += 1) {
+      const job = store.claimNext('serial-worker', 5)!
+      sessionIds.push(job.sessionId!)
+      resumed.push(job.resumed)
+      store.complete(job.id, job.sessionId!, `done-${i}`)
+    }
+
+    expect(new Set(sessionIds.slice(0, 5)).size).toBe(1)
+    expect(resumed.slice(0, 5)).toEqual([false, true, true, true, true])
+    expect(sessionIds[5]).not.toBe(sessionIds[4])
+    expect(resumed[5]).toBe(false)
+    store.close()
+  })
+
+  test('失敗したsessionを同じスレッドの次jobでresumeしない', () => {
+    const store = makeStore()
+    store.enqueue(input())
+    const failed = store.claimNext('serial-worker')!
+    store.fail(failed.id, 'Claude process failed')
+    store.enqueue(input({ messageId: '100.0002', task: '失敗後の再依頼' }))
+
+    const followUp = store.claimNext('serial-worker')!
+    expect(followUp.sessionId).not.toBe(failed.sessionId)
+    expect(followUp.resumed).toBe(false)
+    store.close()
+  })
+})
+
+describe('single worker', () => {
+  test('ワーカー数は設定で増やせず常に1', () => {
+    expect(SERIAL_WORKER_COUNT).toBe(1)
+  })
+
+  test('10件同時投入しても実行中は必ず1件でFIFOを維持する', async () => {
+    const store = makeStore()
+    for (let i = 0; i < 10; i += 1) {
+      store.enqueue(input({
+        chatId: `C${i}`,
+        threadTs: `${i}.0001`,
+        messageId: `${i}.0001`,
+        task: `job-${i}`,
+      }))
+    }
+
+    let active = 0
+    let maxActive = 0
+    const started: string[] = []
+    const executor: JobExecutor = async job => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      started.push(job.task)
+      await Bun.sleep(5)
+      active -= 1
+      return { sessionId: job.sessionId!, result: `done:${job.task}` }
+    }
+
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      executor,
+      pollMs: 1,
+      stopWhenIdle: true,
+    })
+
+    expect(maxActive).toBe(1)
+    expect(started).toEqual(Array.from({ length: 10 }, (_, i) => `job-${i}`))
+    expect(stats).toEqual({ completed: 10, failed: 0, workersStarted: 1 })
+    expect(store.list().every(job => job.status === 'completed')).toBe(true)
+    store.close()
+  })
+
+  test('executor失敗をfailedとして保存し、次jobへ進む', async () => {
+    const store = makeStore()
+    store.enqueue(input({ messageId: '1', task: 'fail' }))
+    store.enqueue(input({ messageId: '2', task: 'pass' }))
+
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async job => {
+        if (job.task === 'fail') throw new Error('test failure')
+        return { sessionId: job.sessionId!, result: 'ok' }
+      },
+    })
+
+    expect(stats.completed).toBe(1)
+    expect(stats.failed).toBe(1)
+    expect(store.list().map(job => job.status)).toEqual(['failed', 'completed'])
+    store.close()
+  })
+
+  test('実CLIのrun-until-idleが永続queueを最後まで処理する', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-run-until-idle-'))
+    tempDirs.push(dir)
+    const repoDir = join(dir, 'repo')
+    const fakeClaude = join(dir, 'fake-claude')
+    mkdirSync(repoDir)
+    writeFileSync(
+      fakeClaude,
+      `#!/usr/bin/env bun
+console.log(JSON.stringify({ result: 'completed by fixture' }))
+`,
+    )
+    chmodSync(fakeClaude, 0o755)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    for (let i = 0; i < 3; i += 1) {
+      store.enqueue(input({
+        chatId: `C${i}`,
+        threadTs: `${i}.0001`,
+        messageId: `${i}.0001`,
+        repoPath: repoDir,
+        task: `cli-job-${i}`,
+      }))
+    }
+    store.close()
+
+    const runner = join(import.meta.dir, 'job-runner.ts')
+    const childEnv = { ...process.env, SLACK_STATE_DIR: dir, ZEROKUN_CLAUDE_BIN: fakeClaude }
+    delete childEnv.SLACK_BOT_TOKEN
+    const proc = Bun.spawn([process.execPath, runner, 'run-until-idle'], {
+      env: childEnv,
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const stdoutPromise = new Response(proc.stdout).text()
+    const stderrPromise = new Response(proc.stderr).text()
+    expect(await proc.exited).toBe(0)
+    expect(await stdoutPromise).toBe('')
+    expect(await stderrPromise).toContain('serial-worker started')
+
+    const completed = new JobStore(join(dir, 'jobs.sqlite3'))
+    expect(completed.list().map(job => job.status)).toEqual([
+      'completed',
+      'completed',
+      'completed',
+    ])
+    completed.close()
+  })
+})
+
+describe('worker isolation', () => {
+  test('子ClaudeへSlack tokenと親Claudeのネスト判定を渡さない', () => {
+    const child = buildChildEnvironment({
+      PATH: '/usr/bin',
+      CLAUDECODE: '1',
+      SLACK_APP_TOKEN: 'xapp-secret',
+      SLACK_BOT_TOKEN: 'xoxb-secret',
+      SLACK_SIGNING_SECRET: 'signing-secret',
+      KEEP_ME: 'ok',
+    })
+
+    expect(child.PATH).toBe('/usr/bin')
+    expect(child.KEEP_ME).toBe('ok')
+    expect(child.CLAUDECODE).toBeUndefined()
+    expect(child.SLACK_APP_TOKEN).toBeUndefined()
+    expect(child.SLACK_BOT_TOKEN).toBeUndefined()
+    expect(child.SLACK_SIGNING_SECRET).toBeUndefined()
+  })
+
+  test('job promptは専用worktree・回帰テスト・PR完了を要求する', () => {
+    const store = makeStore()
+    const queued = store.enqueue(input()).job
+    const job = store.claimNext('serial-worker')!
+    const prompt = buildWorkerPrompt(job)
+
+    expect(prompt).toContain(queued.id)
+    expect(prompt).toContain('専用 worktree')
+    expect(prompt).toContain('回帰テスト')
+    expect(prompt).toContain('PR 作成')
+    store.close()
+  })
+
+  test('実際の子processへsession IDと隔離済み環境を渡す', async () => {
+    const store = makeStore()
+    store.enqueue(input())
+    const claimed = store.claimNext('serial-worker')!
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'zerokun-claude-fixture-'))
+    tempDirs.push(fixtureDir)
+    const repoDir = join(fixtureDir, 'repo')
+    const captureFile = join(fixtureDir, 'capture.json')
+    const fakeClaude = join(fixtureDir, 'fake-claude')
+    mkdirSync(repoDir)
+    writeFileSync(
+      fakeClaude,
+      `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+writeFileSync(process.env.CAPTURE_FILE!, JSON.stringify({
+  args: process.argv.slice(2),
+  cwd: process.cwd(),
+  slackToken: process.env.SLACK_BOT_TOKEN ?? null,
+  claudeCode: process.env.CLAUDECODE ?? null,
+}))
+console.log(JSON.stringify({ result: 'fixture completed' }))
+`,
+    )
+    chmodSync(fakeClaude, 0o755)
+    const executableJob = { ...claimed, repoPath: repoDir }
+    const previousCapture = process.env.CAPTURE_FILE
+    const previousSlackToken = process.env.SLACK_BOT_TOKEN
+    const previousClaudeCode = process.env.CLAUDECODE
+    process.env.CAPTURE_FILE = captureFile
+    process.env.SLACK_BOT_TOKEN = 'xoxb-should-not-leak'
+    process.env.CLAUDECODE = '1'
+
+    try {
+      const result = await executeClaudeJob(executableJob, {
+        claudeBin: fakeClaude,
+        logDir: join(fixtureDir, 'logs'),
+        timeoutMs: 5_000,
+      })
+      const capture = JSON.parse(readFileSync(captureFile, 'utf8')) as {
+        args: string[]
+        cwd: string
+        slackToken: string | null
+        claudeCode: string | null
+      }
+
+      expect(result.result).toBe('fixture completed')
+      expect(capture.cwd).toBe(realpathSync(repoDir))
+      expect(capture.args).toContain('--session-id')
+      expect(capture.args).toContain(claimed.sessionId!)
+      expect(capture.slackToken).toBeNull()
+      expect(capture.claudeCode).toBeNull()
+    } finally {
+      if (previousCapture === undefined) delete process.env.CAPTURE_FILE
+      else process.env.CAPTURE_FILE = previousCapture
+      if (previousSlackToken === undefined) delete process.env.SLACK_BOT_TOKEN
+      else process.env.SLACK_BOT_TOKEN = previousSlackToken
+      if (previousClaudeCode === undefined) delete process.env.CLAUDECODE
+      else process.env.CLAUDECODE = previousClaudeCode
+      store.close()
+    }
+  })
+})

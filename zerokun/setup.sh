@@ -23,6 +23,8 @@ mkdir -p "$CH/inbox" "$CH/approved"
 [ -f "$CH/access.json" ] || cp "$TPL/access.json.example" "$CH/access.json"
 [ -f "$CH/.env" ] || { cp "$TPL/env.example" "$CH/.env"; chmod 600 "$CH/.env"; }
 [ -f "$CH/zerokun-triage.md" ] || cp "$TPL/zerokun-triage.md" "$CH/zerokun-triage.md"
+# 動作規則なので既存マシンもsetup再実行時に最新版へ揃える。
+install -m 0600 "$TPL/zerokun-queue-policy.md" "$CH/zerokun-queue-policy.md"
 
 # mcp 定義はこのマシンのパスに合わせて毎回生成(中身は経路情報だけなので上書きOK)
 sed -e "s|__BUN__|$(command -v bun)|" -e "s|__REPO__|$REPO_DIR|" \
@@ -54,9 +56,12 @@ mkdir -p "$HOME/.claude/skills"
 ln -sfn "$REPO_DIR/skills/threads" "$HOME/.claude/skills/threads"
 ln -sfn "$CH/owner/claude-skills/dev" "$HOME/.claude/skills/dev"
 
-# 5. 起動コマンド (claude-channel → このリポの起動スクリプト)
+# 5. SQLite直列job runnerと起動コマンド
 mkdir -p "$HOME/.local/bin"
+install -m 0700 "$REPO_DIR/zerokun/job-runner.ts" "$CH/job-runner.ts"
+ln -sfn "$CH/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
 ln -sfn "$REPO_DIR/claude-channel.sh" "$HOME/.local/bin/claude-channel"
+echo "   SQLite job runner を設置しました(永続FIFO / 同時実行数1)"
 
 # 6. zsh エイリアス(未登録なら追記)
 if ! grep -q "alias zerokun=" "$HOME/.zshrc" 2>/dev/null; then
@@ -80,4 +85,5 @@ echo "  3. claude にログイン済みか確認"
 echo "  4. codex CLI を導入しログイン(重厚モードのレベル2以上が使う。無いと多人数検証が回らない)"
 echo "  5. 作業リポを ~/Desktop/Project/BellSalsesAI に用意(別プロジェクト機なら .zshrc の zerokun エイリアスの引数をそのプロジェクトに変更)"
 echo "  6. 新しいターミナルで: zerokun"
+echo "     queue確認: zerokun-jobs status"
 command -v codex >/dev/null 2>&1 || echo "  ⚠️ codex CLI が未導入です(上の 4)"
