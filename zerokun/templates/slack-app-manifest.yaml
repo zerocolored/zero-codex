@@ -1,7 +1,8 @@
 _metadata:
   major_version: 1
 display_information:
-  name: ゼロくん
+  # bootstrap実行時に入力した表示名へ置換される。直接使う場合もこの名前は変更可能。
+  name: Zero-kun Custom
   description: ローカルClaudeをSlackから安全に呼び出すボット
 features:
   app_home:
@@ -9,7 +10,8 @@ features:
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
   bot_user:
-    display_name: ゼロくん
+    # Slackの制約: a-z、0-9、-、_、. のみ。日本語は使用不可。
+    display_name: zerokun-custom
     always_online: false
 oauth_config:
   scopes:

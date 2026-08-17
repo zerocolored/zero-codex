@@ -13,6 +13,8 @@ describe('macOS bootstrap', () => {
     expect(result.stdout.toString()).toContain('bootstrap-macos.sh')
     expect(result.stdout.toString()).toContain('--doctor')
     expect(result.stdout.toString()).toContain('--skip-slack')
+    expect(result.stdout.toString()).toContain('--slack-app-name')
+    expect(result.stdout.toString()).toContain('--slack-bot-name')
   })
 
   test('--doctor reports installed tool versions without changing HOME', () => {
@@ -66,6 +68,9 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('zerokun/setup.sh')
     expect(script).toContain('slack-app-manifest.yaml')
     expect(script).toContain('connections:write')
+    expect(script).toContain('https://api.slack.com/apps?new_app=1')
+    expect(script).toContain('Slack Appの表示名')
+    expect(script).toContain('Slack bot username')
     expect(script).toContain('xoxb-[A-Za-z0-9-]{10,}')
     expect(script).toContain('xapp-[A-Za-z0-9-]{10,}')
   })
@@ -76,6 +81,8 @@ describe('macOS bootstrap', () => {
       'socket_mode_enabled: true',
       'messages_tab_enabled: true',
       'messages_tab_read_only_enabled: false',
+      'name: Zero-kun Custom',
+      'display_name: zerokun-custom',
       '- app_mention',
       '- message.im',
       '- message.channels',
@@ -83,6 +90,54 @@ describe('macOS bootstrap', () => {
       '- files:write',
       '- reactions:write',
     ]) expect(manifest).toContain(expected)
+    expect(manifest).not.toContain('display_name: ゼロくん')
+  })
+
+  test('Slack manifest renderer applies a custom app name and valid bot username', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'zerokun-slack-manifest-'))
+    const rendered = join(tempDir, 'manifest.yaml')
+    const template = join(import.meta.dir, 'templates/slack-app-manifest.yaml')
+    try {
+      const command = [
+        'bootstrap_path="$1"',
+        'template_path="$2"',
+        'rendered_path="$3"',
+        'set --',
+        'source "$bootstrap_path"',
+        'SLACK_APP_NAME="ゼロくん-新Mac"',
+        'SLACK_BOT_USERNAME="zerokun-new-mac"',
+        'render_slack_manifest "$template_path" "$rendered_path"',
+      ].join('; ')
+      const result = Bun.spawnSync(['/bin/bash', '-c', command, 'bash', bootstrap, template, rendered], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(0)
+      const manifest = readFileSync(rendered, 'utf8')
+      expect(manifest).toContain('name: "ゼロくん-新Mac"')
+      expect(manifest).toContain('display_name: zerokun-new-mac')
+      expect(manifest).not.toContain('name: Zero-kun Custom')
+      expect(manifest).not.toContain('display_name: zerokun-custom')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Slack bot username validation rejects Japanese names before manifest creation', () => {
+    const command = [
+      'bootstrap_path="$1"',
+      'set --',
+      'source "$bootstrap_path"',
+      'SLACK_APP_NAME="別のゼロくん"',
+      'SLACK_BOT_USERNAME="ゼロくん"',
+      'validate_slack_names',
+    ].join('; ')
+    const result = Bun.spawnSync(['/bin/bash', '-c', command, 'bash', bootstrap], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr.toString()).toContain('英小文字・数字・ハイフン・アンダースコア・ピリオド')
   })
 
   test('launcher and setup use HOME-based project paths instead of one Mac username', () => {

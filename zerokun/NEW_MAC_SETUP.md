@@ -43,10 +43,15 @@ bash zerokun/bootstrap-macos.sh --doctor
 1. macOSが表示するCommand Line Toolsのインストール確認
 2. Homebrewが求めるMacの管理者パスワード
 3. GitHub、Claude、Codexのブラウザログイン
-4. Slack Appの作成とWorkspaceへの許可
+4. [Slack App作成画面](https://api.slack.com/apps?new_app=1)で`Create New App → From a manifest`を選び、Workspaceへの許可
 5. Slackの`xoxb-`と`xapp-`トークン、ユーザーID、チャンネルIDの入力
 
 Slackトークンは画面に表示せず、`~/.claude/channels/slack/.env`へ権限600で保存される。
+
+Slack App作成前に、スクリプトがAppの表示名を聞く。既存の「ゼロくん」と区別できる
+`ゼロくん-新Mac`などを入力する。続くbot usernameはSlackの制約により日本語を使えないため、
+`zerokun-new-mac`のように英小文字・数字・`-`・`_`・`.`だけで指定する。
+入力した名前を反映したmanifestがクリップボードへコピーされ、作成URLもターミナルへ表示される。
 
 ## 初回起動
 
@@ -68,6 +73,9 @@ bash zerokun/bootstrap-macos.sh --skip-logins
 
 # Slack設定を後回しにする
 bash zerokun/bootstrap-macos.sh --skip-slack
+
+# Slack App名を先に指定する
+bash zerokun/bootstrap-macos.sh --slack-app-name 'ゼロくん-新Mac' --slack-bot-name zerokun-new-mac
 
 # BellSalesAIの各リポをcloneしない
 bash zerokun/bootstrap-macos.sh --skip-projects

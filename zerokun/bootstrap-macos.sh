@@ -15,6 +15,9 @@ MODE="install"
 SKIP_LOGINS=0
 SKIP_SLACK=0
 SKIP_PROJECTS=0
+SLACK_APP_NAME="${ZEROKUN_SLACK_APP_NAME:-}"
+SLACK_BOT_USERNAME="${ZEROKUN_SLACK_BOT_USERNAME:-}"
+SLACK_APP_CREATE_URL="https://api.slack.com/apps?new_app=1"
 
 usage() {
   cat <<'EOF'
@@ -28,6 +31,8 @@ Options:
   --skip-logins         GitHub / Claude / Codexの対話ログインを呼び出さない
   --skip-slack          Slack App作成とトークン入力の案内を省略
   --skip-projects       BellSalesAIの4リポをcloneしない
+  --slack-app-name NAME Slack上で表示するApp名（35文字以内）
+  --slack-bot-name NAME bot username（英小文字・数字・-・_・.のみ）
   --repo-dir PATH       zeroリポの配置先
   --project-dir PATH    BellSalesAIの配置先
   -h, --help            このヘルプを表示
@@ -42,6 +47,16 @@ while [ "$#" -gt 0 ]; do
     --skip-logins) SKIP_LOGINS=1 ;;
     --skip-slack) SKIP_SLACK=1 ;;
     --skip-projects) SKIP_PROJECTS=1 ;;
+    --slack-app-name)
+      [ "$#" -ge 2 ] || { echo "❌ --slack-app-nameには名前が必要です" >&2; exit 2; }
+      SLACK_APP_NAME="$2"
+      shift
+      ;;
+    --slack-bot-name)
+      [ "$#" -ge 2 ] || { echo "❌ --slack-bot-nameには名前が必要です" >&2; exit 2; }
+      SLACK_BOT_USERNAME="$2"
+      shift
+      ;;
     --repo-dir)
       [ "$#" -ge 2 ] || { echo "❌ --repo-dirにはパスが必要です" >&2; exit 2; }
       REPO_DIR="$2"
@@ -342,6 +357,56 @@ EOF
   ok "Slack allowlistを設定しました"
 }
 
+validate_slack_names() {
+  [ -n "$SLACK_APP_NAME" ] || fail "Slack Appの表示名を入力してください"
+  [ "${#SLACK_APP_NAME}" -le 35 ] || fail "Slack Appの表示名は35文字以内にしてください"
+  case "$SLACK_APP_NAME" in
+    *\"*|*\\*) fail "Slack Appの表示名にダブルクォートまたはバックスラッシュは使用できません" ;;
+  esac
+  if printf '%s' "$SLACK_APP_NAME" | /usr/bin/grep -q '[[:cntrl:]]'; then
+    fail "Slack Appの表示名に制御文字は使用できません"
+  fi
+  printf '%s\n' "$SLACK_BOT_USERNAME" | /usr/bin/grep -Eq '^[a-z0-9._-]{1,80}$' \
+    || fail "Slack bot usernameは英小文字・数字・ハイフン・アンダースコア・ピリオドだけで指定してください"
+}
+
+choose_slack_names() {
+  local entered_name
+  if [ -z "$SLACK_APP_NAME" ]; then
+    printf '   Slack Appの表示名（例: ゼロくん-新Mac、35文字以内）: '
+    IFS= read -r SLACK_APP_NAME
+  fi
+  if [ -z "$SLACK_BOT_USERNAME" ]; then
+    printf '   Slack bot username（英小文字・数字・-・_・.） [zerokun-new-mac]: '
+    IFS= read -r entered_name
+    SLACK_BOT_USERNAME="${entered_name:-zerokun-new-mac}"
+  fi
+  validate_slack_names
+}
+
+render_slack_manifest() {
+  local source_manifest="$1"
+  local target_manifest="$2"
+  validate_slack_names
+  /usr/bin/awk -v app_name="$SLACK_APP_NAME" -v bot_username="$SLACK_BOT_USERNAME" '
+    $0 == "  name: Zero-kun Custom" {
+      print "  name: \"" app_name "\""
+      app_name_replaced = 1
+      next
+    }
+    $0 == "    display_name: zerokun-custom" {
+      print "    display_name: " bot_username
+      bot_name_replaced = 1
+      next
+    }
+    { print }
+    END {
+      if (!app_name_replaced || !bot_name_replaced) exit 3
+    }
+  ' "$source_manifest" > "$target_manifest" \
+    || fail "Slack manifestの名前を生成できませんでした"
+}
+
 configure_slack() {
   section "Slack App"
   if [ "$SKIP_SLACK" = "1" ]; then
@@ -355,14 +420,24 @@ configure_slack() {
   fi
   require_interactive "Slack App設定"
   local manifest="$REPO_DIR/zerokun/templates/slack-app-manifest.yaml"
+  local generated_manifest="$HOME/.claude/channels/slack/slack-app-manifest.generated.yaml"
+  local temp_manifest="$generated_manifest.tmp.$$"
   [ -f "$manifest" ] || fail "Slack manifestがありません: $manifest"
+  choose_slack_names
+  umask 077
+  render_slack_manifest "$manifest" "$temp_manifest"
+  /bin/mv "$temp_manifest" "$generated_manifest"
+  /bin/chmod 600 "$generated_manifest"
   if command -v pbcopy >/dev/null 2>&1; then
-    pbcopy < "$manifest"
-    echo "   Slack App manifestをクリップボードへコピーしました。"
+    pbcopy < "$generated_manifest"
+    echo "   選んだ名前を反映したSlack App manifestをクリップボードへコピーしました。"
   fi
-  /usr/bin/open 'https://api.slack.com/apps?new_app=1' >/dev/null 2>&1 || true
+  echo "   生成したmanifest: $generated_manifest"
+  echo "   Slack App作成URL: $SLACK_APP_CREATE_URL"
+  /usr/bin/open "$SLACK_APP_CREATE_URL" >/dev/null 2>&1 || true
   cat <<EOF
-   ブラウザで Create New App → From a manifest を選び、manifestを貼り付けて作成します。
+   上のURLで Create New App → From a manifest を選び、manifestを貼り付けて作成します。
+   App表示名は「$SLACK_APP_NAME」、bot usernameは「$SLACK_BOT_USERNAME」です。
    次に App-Level Tokenを connections:write で生成してxapp-を取得し、
    Install to Workspace後にBot User OAuth Tokenのxoxb-を取得してください。
 EOF
@@ -406,4 +481,6 @@ main() {
   echo "   zerokun"
 }
 
-main
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main
+fi

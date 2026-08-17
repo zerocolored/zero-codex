@@ -18,7 +18,8 @@ Command Line Toolsはバージョン選択不要。スクリプトが`xcode-sele
 Codex CLI、3つのBellSalesAI実装リポを含む必要リポ、ゼロくん配線まで自動で行う。
 
 人の操作が残るのは、macOSの確認ダイアログ、各アカウントのログイン、
-Slack App作成とトークン入力だけ。Slack Appは用意済みmanifestから作成する。
+Slack App作成とトークン入力だけ。Slack Appは用意済みmanifestから作成し、
+bootstrapで既存Appと区別する表示名とSlack仕様に適合するbot usernameを入力する。
 
 ### 既にclone済みの場合
 
