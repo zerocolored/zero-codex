@@ -40,6 +40,13 @@ describe('Zero-kun queue wiring', () => {
     expect(launcher.indexOf('DENY_ARGS=(')).toBeLessThan(launcher.indexOf('if [ "$CHANNEL" ='))
   })
 
+  test('launcher starts Claude with max effort on every execution path', () => {
+    const launcher = readFileSync(join(root, 'claude-channel.sh'), 'utf8')
+    // bridgeモードとpluginモードの両方。片方だけだと起動方法によってeffortが変わる。
+    const effortArgs = launcher.split('\n').filter((line) => line.includes('--effort max'))
+    expect(effortArgs.length).toBe(2)
+  })
+
   test('thread handler forbids putting Slack-post instructions into the job task', () => {
     const skill = readFileSync(join(root, 'skills/threads/SKILL.md'), 'utf8')
     expect(skill).toContain('Never tell the worker to post to Slack in `task`')

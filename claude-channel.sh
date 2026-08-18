@@ -90,6 +90,7 @@ cd "$PROJECT"
 
 echo "▶ claude-channel V1.5"
 echo "   model    : $MODEL"
+echo "   effort   : max"
 echo "   project  : $PROJECT"
 
 # ユーザートークンで動く Slack MCP(claude.ai / Anthropic hosted の Slack コネクタ)を封じる。
@@ -211,6 +212,7 @@ if [ "$CHANNEL" = "slack" ] || [ "$CHANNEL" = "telegram" ]; then
   exec caffeinate -dimsu \
     claude \
       --model "$MODEL" \
+      --effort max \
       --dangerously-skip-permissions \
       "${DENY_ARGS[@]}" \
       "${MCP_ARGS[@]}" \
@@ -225,6 +227,7 @@ else
   exec caffeinate -dimsu \
     claude \
       --model "$MODEL" \
+      --effort max \
       --dangerously-skip-permissions \
       "${DENY_ARGS[@]}" \
       --channels "plugin:${CHANNEL}@${MARKETPLACE}"
