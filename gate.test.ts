@@ -8,6 +8,7 @@ import {
   threadPollCursor,
   advanceReadCursor,
   planThreadPoll,
+  planCatchupSweep,
   pruneDeliveredKeys,
   classifyThreadReply,
   mentionsBot,
@@ -413,6 +414,68 @@ describe('resolveIsMention — the live-handler wiring', () => {
     expect(resolveIsMention(false, 'マージして', BOT_USER)).toBe(false)
     expect(resolveIsMention(false, '<@U06R9GU88RF> お願いします', BOT_USER)).toBe(false)
     expect(resolveIsMention(false, `<@${BOT_USER}> お願いします`, BOT_USER)).toBe(true)
+  })
+})
+
+describe('planCatchupSweep — startup recovery', () => {
+  const BOT_USER = 'U0B8JC02X7E'
+  const NOW = 1_786_400_000_000
+  const ts = (offsetMs: number) => ((NOW + offsetMs) / 1000).toFixed(6)
+  const message = (offsetMs: number, over: Partial<SlackReply> = {}): SlackReply => ({
+    ts: ts(offsetMs),
+    user: HUMAN,
+    text: `<@${BOT_USER}> お願い`,
+    ...over,
+  })
+
+  test('channelはメンション済み・未配送・窓内の人間メッセージだけを古い順に返す', () => {
+    const history = [
+      message(-50_000),
+      message(-40_000, { text: 'メンションなし' }),
+      message(-30_000),
+      message(-20_000),
+      message(-10_000, { user: BOT_USER }),
+      message(-5_000, { subtype: 'message_changed' }),
+      message(-70_000),
+    ]
+    const delivered = new Set([`C123:${ts(-30_000)}`])
+
+    const plan = planCatchupSweep(history, delivered, {
+      channelId: 'C123',
+      channelType: 'channel',
+      channelPolicy: policy({ requireMention: true }),
+      oldestMs: NOW - 60_000,
+      limit: 20,
+    }, BOT_USER)
+
+    expect(plan.map(item => item.ts)).toEqual([ts(-50_000), ts(-20_000)])
+  })
+
+  test('DMはメンション不要だがbot DMは除外する', () => {
+    const plan = planCatchupSweep([
+      message(-20_000, { text: '止まっている間のDM' }),
+      message(-10_000, { user: undefined, bot_id: OTHER_BOT, text: 'bot DM' }),
+    ], [], {
+      channelId: 'D123',
+      channelType: 'im',
+      oldestMs: NOW - 60_000,
+      limit: 20,
+    }, BOT_USER)
+
+    expect(plan.map(item => item.text)).toEqual(['止まっている間のDM'])
+  })
+
+  test('上限超過時は最新分を選び、その中を古い順に返す', () => {
+    const history = [message(-40_000), message(-10_000), message(-30_000), message(-20_000)]
+    const plan = planCatchupSweep(history, [], {
+      channelId: 'C123',
+      channelType: 'channel',
+      channelPolicy: policy({ requireMention: true }),
+      oldestMs: NOW - 60_000,
+      limit: 2,
+    }, BOT_USER)
+
+    expect(plan.map(item => item.ts)).toEqual([ts(-20_000), ts(-10_000)])
   })
 })
 

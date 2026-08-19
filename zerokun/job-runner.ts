@@ -42,6 +42,7 @@ export interface JobRecord {
   resumed: boolean
   workerId: string | null
   attempts: number
+  notBefore: number | null
   result: string | null
   lastError: string | null
   createdAt: number
@@ -64,6 +65,7 @@ type JobRow = {
   resumed: number
   worker_id: string | null
   attempts: number
+  not_before: number | null
   result: string | null
   last_error: string | null
   created_at: number
@@ -88,6 +90,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   resumed INTEGER NOT NULL DEFAULT 0,
   worker_id TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
+  not_before INTEGER,
   result TEXT,
   last_error TEXT,
   created_at INTEGER NOT NULL,
@@ -97,6 +100,20 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_status_seq ON jobs(status, seq);
 CREATE INDEX IF NOT EXISTS idx_jobs_thread_seq ON jobs(chat_id, thread_ts, seq);
 `
+
+function ensureJobSchemaMigrations(db: Database): void {
+  const columns = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
+  if (!columns.some(column => column.name === 'not_before')) {
+    try {
+      db.exec('ALTER TABLE jobs ADD COLUMN not_before INTEGER')
+    } catch (error) {
+      // enqueue CLI と daemon が古いDBを同時に開く場合、片方が先に追加しうる。
+      const migrated = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
+      if (!migrated.some(column => column.name === 'not_before')) throw error
+    }
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_ready_seq ON jobs(status, not_before, seq)')
+}
 
 function mapRow(row: JobRow): JobRecord {
   return {
@@ -114,6 +131,7 @@ function mapRow(row: JobRow): JobRecord {
     resumed: row.resumed === 1,
     workerId: row.worker_id,
     attempts: row.attempts,
+    notBefore: row.not_before,
     result: row.result,
     lastError: row.last_error,
     createdAt: row.created_at,
@@ -169,6 +187,7 @@ export class JobStore {
           db.exec('PRAGMA journal_mode=WAL')
           db.exec('PRAGMA synchronous=NORMAL')
           db.exec(JOB_SCHEMA)
+          ensureJobSchemaMigrations(db)
           return db
         } catch (error) {
           db.close()
@@ -250,34 +269,53 @@ export class JobStore {
     ).get()?.count ?? 0
   }
 
-  claimNext(workerId: string, maxJobsPerSession = 5): JobRecord | null {
+  countClaimable(now = Date.now()): number {
+    return this.db.query<{ count: number }, [number]>(
+      `SELECT COUNT(*) AS count
+       FROM jobs
+       WHERE status = 'queued' AND (not_before IS NULL OR not_before <= ?)`,
+    ).get(now)?.count ?? 0
+  }
+
+  claimNext(workerId: string, maxJobsPerSession = 5, now = Date.now()): JobRecord | null {
     const sessionJobLimit = Math.max(1, Math.floor(maxJobsPerSession))
-    const claim = this.db.transaction((claimingWorkerId: string): JobRecord | null => {
-      const row = this.db.query<JobRow, []>(
-        `SELECT * FROM jobs WHERE status = 'queued' ORDER BY seq ASC LIMIT 1`,
-      ).get()
+    const claim = this.db.transaction((claimingWorkerId: string, claimAt: number): JobRecord | null => {
+      const row = this.db.query<JobRow, [number]>(
+        `SELECT * FROM jobs
+         WHERE status = 'queued' AND (not_before IS NULL OR not_before <= ?)
+         ORDER BY seq ASC
+         LIMIT 1`,
+      ).get(claimAt)
       if (!row) return null
 
-      const prior = this.db.query<{ session_id: string }, [string, string, number]>(
-        `SELECT session_id
-         FROM jobs
-         WHERE chat_id = ?
-           AND thread_ts = ?
-           AND seq < ?
-           AND session_id IS NOT NULL
-           AND status = 'completed'
-         ORDER BY seq DESC
-         LIMIT 1`,
-      ).get(row.chat_id, row.thread_ts, row.seq)
-      const sessionJobCount = prior
-        ? this.db.query<{ count: number }, [string, string, string]>(
-          `SELECT COUNT(*) AS count
+      const isRetry = row.attempts > 0 && row.session_id !== null
+      let sessionId: string
+      let resumed: boolean
+      if (isRetry) {
+        sessionId = row.session_id!
+        resumed = true
+      } else {
+        const prior = this.db.query<{ session_id: string }, [string, string, number]>(
+          `SELECT session_id
            FROM jobs
-           WHERE chat_id = ? AND thread_ts = ? AND session_id = ?`,
-        ).get(row.chat_id, row.thread_ts, prior.session_id)?.count ?? 0
-        : 0
-      const canResume = prior !== null && sessionJobCount < sessionJobLimit
-      const sessionId = canResume && prior ? prior.session_id : randomUUID()
+           WHERE chat_id = ?
+             AND thread_ts = ?
+             AND seq < ?
+             AND session_id IS NOT NULL
+             AND status = 'completed'
+           ORDER BY seq DESC
+           LIMIT 1`,
+        ).get(row.chat_id, row.thread_ts, row.seq)
+        const sessionJobCount = prior
+          ? this.db.query<{ count: number }, [string, string, string]>(
+            `SELECT COUNT(*) AS count
+             FROM jobs
+             WHERE chat_id = ? AND thread_ts = ? AND session_id = ?`,
+          ).get(row.chat_id, row.thread_ts, prior.session_id)?.count ?? 0
+          : 0
+        resumed = prior !== null && sessionJobCount < sessionJobLimit
+        sessionId = resumed && prior ? prior.session_id : randomUUID()
+      }
 
       const update = this.db.run(
         `UPDATE jobs
@@ -287,22 +325,24 @@ export class JobStore {
              worker_id = ?,
              attempts = attempts + 1,
              started_at = ?,
+             not_before = NULL,
              finished_at = NULL,
              last_error = NULL
          WHERE id = ? AND status = 'queued'`,
-        [sessionId, canResume ? 1 : 0, claimingWorkerId, Date.now(), row.id],
+        [sessionId, resumed ? 1 : 0, claimingWorkerId, claimAt, row.id],
       )
       if (update.changes !== 1) return null
       return this.get(row.id)
     })
 
-    return claim.immediate(workerId)
+    return claim.immediate(workerId, now)
   }
 
   complete(id: string, sessionId: string, result: string): void {
     this.db.run(
       `UPDATE jobs
-       SET status = 'completed', session_id = ?, result = ?, last_error = NULL, finished_at = ?
+       SET status = 'completed', session_id = ?, result = ?, last_error = NULL,
+           not_before = NULL, finished_at = ?
        WHERE id = ?`,
       [sessionId, result, Date.now(), id],
     )
@@ -310,7 +350,9 @@ export class JobStore {
 
   fail(id: string, error: string): void {
     this.db.run(
-      `UPDATE jobs SET status = 'failed', last_error = ?, finished_at = ? WHERE id = ?`,
+      `UPDATE jobs
+       SET status = 'failed', not_before = NULL, last_error = ?, finished_at = ?
+       WHERE id = ?`,
       [error, Date.now(), id],
     )
   }
@@ -319,9 +361,20 @@ export class JobStore {
     this.db.run(
       `UPDATE jobs
        SET status = 'queued', worker_id = NULL, started_at = NULL,
-           finished_at = NULL, last_error = ?
+           not_before = NULL, finished_at = NULL, last_error = ?
        WHERE id = ?`,
       [reason, id],
+    )
+  }
+
+  requeueAt(id: string, notBefore: number, reason: string, sessionId?: string): void {
+    this.db.run(
+      `UPDATE jobs
+       SET status = 'queued', worker_id = NULL, started_at = NULL,
+           session_id = COALESCE(?, session_id), not_before = ?,
+           finished_at = NULL, last_error = ?
+       WHERE id = ?`,
+      [sessionId ?? null, notBefore, reason, id],
     )
   }
 
@@ -400,7 +453,10 @@ export const WORKER_SLACK_BAN_PROMPT = [
 ].join('\n')
 
 export function buildWorkerPrompt(job: JobRecord): string {
-  return `You are the single active Zero-kun implementation worker.
+  const resumeNotice = job.attempts > 1
+    ? `前回の実行は途中で中断された。まず git branch / worktree / 途中成果を確認し、\n最初からやり直すのではなく続きから完了させること。\n\n`
+    : ''
+  return `${resumeNotice}You are the single active Zero-kun implementation worker.
 
 Job ID: ${job.id}
 Slack thread: ${job.chatId} / ${job.threadTs}
@@ -443,6 +499,7 @@ export interface JobNotifier {
   started?(job: JobRecord): Promise<void>
   completed?(job: JobRecord, result: string): Promise<void>
   failed?(job: JobRecord, error: string): Promise<void>
+  rateLimited?(job: JobRecord, resumeAt: number, reason: string): Promise<void>
 }
 
 export interface RunStats {
@@ -464,6 +521,19 @@ export interface RunQueuedJobsOptions {
 }
 
 class JobInterruptedError extends Error {}
+
+export class ClaudeRateLimitError extends Error {
+  constructor(
+    message: string,
+    readonly resetsAtMs: number,
+    readonly sessionId?: string,
+  ) {
+    super(message)
+    this.name = 'ClaudeRateLimitError'
+  }
+}
+
+export const MAX_RATE_LIMIT_ATTEMPTS = 5
 
 async function notifySafely(
   action: (() => Promise<void>) | undefined,
@@ -494,7 +564,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
 
     const job = options.store.claimNext(workerId, maxJobsPerSession)
     if (!job) {
-      if (stopWhenIdle && options.store.countActive() === 0) return stats
+      if (stopWhenIdle && options.store.countClaimable() === 0) return stats
       await Bun.sleep(pollMs)
       continue
     }
@@ -521,6 +591,18 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         options.store.requeue(job.id, message || 'worker interrupted')
         log(`${workerId} requeued ${job.id}: ${message}`)
         return stats
+      }
+      if (error instanceof ClaudeRateLimitError && job.attempts < MAX_RATE_LIMIT_ATTEMPTS) {
+        const resumeAt = error.resetsAtMs + 60_000
+        options.store.requeueAt(job.id, resumeAt, message, error.sessionId)
+        log(`${workerId} deferred ${job.id} until ${new Date(resumeAt).toISOString()}: ${message}`)
+        await notifySafely(
+          options.notifier?.rateLimited
+            ? () => options.notifier!.rateLimited!(job, resumeAt, message)
+            : undefined,
+          log,
+        )
+        continue
       }
       options.store.fail(job.id, message)
       stats.failed += 1
@@ -611,6 +693,97 @@ export function parseClaudeResult(stdout: string, logPath?: string): string {
 /** 失敗通知に載せる本文の上限。Slack で読めない長さの JSON を貼らないための上限。 */
 const MAX_FAILURE_CHARS = 600
 
+function parseClaudeEvents(stdout: string): Array<Record<string, unknown>> {
+  const events: Array<Record<string, unknown>> = []
+  const collectTopLevel = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          events.push(item as Record<string, unknown>)
+        }
+      }
+      return
+    }
+    if (value && typeof value === 'object') events.push(value as Record<string, unknown>)
+  }
+  const trimmed = stdout.trim()
+  try {
+    collectTopLevel(JSON.parse(trimmed))
+  } catch {
+    for (const line of trimmed.split('\n')) {
+      const text = line.trim()
+      if (!text) continue
+      try {
+        collectTopLevel(JSON.parse(text))
+      } catch {}
+    }
+  }
+  return events
+}
+
+function walkClaudeObjects(events: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const objects: Array<Record<string, unknown>> = []
+  const collect = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(collect)
+      return
+    }
+    if (!value || typeof value !== 'object') return
+    const object = value as Record<string, unknown>
+    objects.push(object)
+    Object.values(object).forEach(collect)
+  }
+  events.forEach(collect)
+  return objects
+}
+
+function isClaudeUsageLimitMessage(value: string): boolean {
+  return value.split(/\r?\n/).some(line => (
+    /^you(?:'|’)ve hit your (?:usage|session) limit\b/i.test(line.trim())
+  ))
+}
+
+export type RateLimitInfo = {
+  rateLimited: boolean
+  resetsAtMs: number | null
+}
+
+/** Claudeのイベント列から使用量上限と再開可能時刻を取り出す。 */
+export function extractRateLimit(stdout: string, now = Date.now()): RateLimitInfo {
+  const events = parseClaudeEvents(stdout)
+  const objects = walkClaudeObjects(events)
+  let rateLimited = false
+  let resetsAtMs: number | null = null
+
+  // rateLimitInfo のような入れ子も見るが、一般の result 文字列は見ない。
+  // tool result や会話本文に「rate limit」が出ただけで上限扱いすると、通常の
+  // 失敗通知を最大5時間遅らせるため、機械判定は構造化シグナルに限定する。
+  for (const event of objects) {
+    if (event.error === 'rate_limit' || event.api_error_status === 429) rateLimited = true
+    if (typeof event.rateLimitType === 'string') rateLimited = true
+    if (event.type === 'rate_limit_event') rateLimited = true
+    if (typeof event.resetsAt === 'number' && Number.isFinite(event.resetsAt) && event.resetsAt > 0) {
+      resetsAtMs = event.resetsAt >= 1_000_000_000_000
+        ? Math.floor(event.resetsAt)
+        : Math.floor(event.resetsAt * 1000)
+    }
+  }
+
+  // CLI実装差で構造化フィールドが無い場合も、Claude自身の定型エラーだけは拾う。
+  // top-level result またはそれ単独のplain-text行に限定し、会話ログ全文は検索しない。
+  if (!rateLimited) {
+    rateLimited = events.some(event => (
+      event.type === 'result'
+      && event.is_error !== false
+      && typeof event.result === 'string'
+      && isClaudeUsageLimitMessage(event.result)
+    ))
+  }
+  if (!rateLimited) rateLimited = isClaudeUsageLimitMessage(stdout)
+  if (!rateLimited) return { rateLimited: false, resetsAtMs: null }
+  return { rateLimited: true, resetsAtMs: resetsAtMs ?? now + 60 * 60 * 1000 }
+}
+
 /**
  * stdout のイベント列から、人が読める失敗理由を組み立てる。
  *
@@ -626,23 +799,8 @@ export function describeFailure(
   stderr: string,
   logPath?: string,
 ): string {
-  const events: Array<Record<string, unknown>> = []
-  const collect = (value: unknown): void => {
-    if (Array.isArray(value)) value.forEach(collect)
-    else if (value && typeof value === 'object') events.push(value as Record<string, unknown>)
-  }
+  const events = parseClaudeEvents(stdout)
   const trimmed = stdout.trim()
-  try {
-    collect(JSON.parse(trimmed))
-  } catch {
-    for (const line of trimmed.split('\n')) {
-      const text = line.trim()
-      if (!text) continue
-      try {
-        collect(JSON.parse(text))
-      } catch {}
-    }
-  }
 
   // Claude が返す人間向けの一文(「You've hit your session limit · resets 3:50pm」等)を拾う。
   let reason: string | null = null
@@ -698,54 +856,83 @@ export async function executeClaudeJob(
   const logDir = options.logDir ?? join(dirname(defaultDbPath()), 'job-logs')
   mkdirSync(logDir, { recursive: true, mode: 0o700 })
 
-  const args = [
-    claudeBin,
-    '--model', model,
-    '--permission-mode', 'bypassPermissions',
-    '--output-format', 'json',
-    '--verbose',
-    '--setting-sources', 'user,project,local',
-    '--disallowed-tools', ...WORKER_DENIED_TOOL_PATTERNS,
-    '--append-system-prompt', WORKER_SLACK_BAN_PROMPT,
-    ...(job.resumed ? ['--resume', job.sessionId] : ['--session-id', job.sessionId]),
-    '-p',
-    buildWorkerPrompt(job),
-  ]
-  const proc = Bun.spawn(args, {
-    cwd: job.repoPath,
-    env: buildChildEnvironment(),
-    stdin: 'ignore',
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  const stdoutPromise = new Response(proc.stdout).text()
-  const stderrPromise = new Response(proc.stderr).text()
-
-  let timedOut = false
-  const timer = setTimeout(() => {
-    timedOut = true
-    proc.kill()
-  }, timeoutMs)
-  const abort = () => proc.kill()
-  options.signal?.addEventListener('abort', abort, { once: true })
-
-  const exitCode = await proc.exited
-  clearTimeout(timer)
-  options.signal?.removeEventListener('abort', abort)
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
-  const stdoutPath = join(logDir, `${job.id}.stdout.log`)
-  writeFileSync(stdoutPath, stdout, { mode: 0o600 })
-  writeFileSync(join(logDir, `${job.id}.stderr.log`), stderr, { mode: 0o600 })
-
-  if (options.signal?.aborted) {
-    throw new JobInterruptedError('job runner stopped while Claude was running')
-  }
-  if (timedOut) throw new Error(`Claude timed out after ${timeoutMs}ms`)
-  if (exitCode !== 0) {
-    throw new Error(describeFailure(exitCode, stdout, stderr, stdoutPath))
+  const runAttempt = async (sessionId: string, resumed: boolean) => {
+    const args = [
+      claudeBin,
+      '--model', model,
+      '--permission-mode', 'bypassPermissions',
+      '--output-format', 'json',
+      '--verbose',
+      '--setting-sources', 'user,project,local',
+      '--disallowed-tools', ...WORKER_DENIED_TOOL_PATTERNS,
+      '--append-system-prompt', WORKER_SLACK_BAN_PROMPT,
+      ...(resumed ? ['--resume', sessionId] : ['--session-id', sessionId]),
+      '-p',
+      buildWorkerPrompt(job),
+    ]
+    const proc = Bun.spawn(args, {
+      cwd: job.repoPath,
+      env: buildChildEnvironment(),
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const stdoutPromise = new Response(proc.stdout).text()
+    const stderrPromise = new Response(proc.stderr).text()
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      proc.kill()
+    }, timeoutMs)
+    const abort = () => proc.kill()
+    options.signal?.addEventListener('abort', abort, { once: true })
+    const exitCode = await proc.exited
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', abort)
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
+    return { exitCode, stdout, stderr, timedOut }
   }
 
-  return { sessionId: job.sessionId, result: parseClaudeResult(stdout, stdoutPath) }
+  let sessionId = job.sessionId
+  let resumed = job.resumed
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const execution = await runAttempt(sessionId, resumed)
+    const stdoutPath = join(logDir, `${job.id}.stdout.log`)
+    const stderrPath = join(logDir, `${job.id}.stderr.log`)
+    writeFileSync(stdoutPath, execution.stdout, { mode: 0o600 })
+    writeFileSync(stderrPath, execution.stderr, { mode: 0o600 })
+
+    if (options.signal?.aborted) {
+      throw new JobInterruptedError('job runner stopped while Claude was running')
+    }
+    if (execution.timedOut) throw new Error(`Claude timed out after ${timeoutMs}ms`)
+    if (execution.exitCode === 0) {
+      return { sessionId, result: parseClaudeResult(execution.stdout, stdoutPath) }
+    }
+
+    const rateLimit = extractRateLimit(execution.stdout)
+    const failure = describeFailure(
+      execution.exitCode,
+      execution.stdout,
+      execution.stderr,
+      stdoutPath,
+    )
+    if (rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
+      throw new ClaudeRateLimitError(failure, rateLimit.resetsAtMs, sessionId)
+    }
+
+    const missingTranscript = /(?:no conversation found|conversation[^\n]*not found|session[^\n]*(?:not found|does not exist)|transcript[^\n]*(?:not found|missing))/i
+      .test(`${execution.stderr}\n${execution.stdout}`)
+    if (resumed && attempt === 0 && missingTranscript) {
+      writeFileSync(join(logDir, `${job.id}.resume-missing.stdout.log`), execution.stdout, { mode: 0o600 })
+      writeFileSync(join(logDir, `${job.id}.resume-missing.stderr.log`), execution.stderr, { mode: 0o600 })
+      sessionId = randomUUID()
+      resumed = false
+      continue
+    }
+    throw new Error(failure)
+  }
+  throw new Error(`job ${job.id} exhausted resume fallback`)
 }
 
 function stateDir(): string {
@@ -822,6 +1009,19 @@ class SlackNotifier implements JobNotifier {
     await this.post(
       job,
       `ゼロくん job ${job.id.slice(0, 8)} は失敗しました。\n${error.slice(0, 1500)}`,
+    )
+  }
+
+  async rateLimited(job: JobRecord, resumeAt: number): Promise<void> {
+    const time = new Intl.DateTimeFormat('ja-JP', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(new Date(resumeAt))
+    await this.post(
+      job,
+      `⏸ ゼロくん job ${job.id.slice(0, 8)} は使用量上限のため一時停止しました。`
+      + `${time} に自動再開します。`,
     )
   }
 }

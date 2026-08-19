@@ -24,10 +24,11 @@ import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
 import {
   decideChannelPolicy, isBotDMBlocked, threadPollCursor, planThreadPoll,
-  resolveIsMention, pruneDeliveredKeys,
+  resolveIsMention, pruneDeliveredKeys, planCatchupSweep, msToSlackTs,
   type ChannelPolicy,
 } from './gate.ts'
 import { requestUpdate } from './zerokun/update-request.ts'
+import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
 
 const STATE_DIR = process.env.SLACK_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'slack')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -50,6 +51,11 @@ const THREAD_ACTIVE_WINDOW_MS = 48 * 60 * 60 * 1000
 
 const MAX_CHUNK_LIMIT = 3900
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Math.floor(Number(value))
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : fallback
+}
 
 // Load ~/.claude/channels/slack/.env into process.env. Real env wins.
 try {
@@ -81,28 +87,18 @@ if (!BOT_TOKEN || !APP_TOKEN) {
 // live process binds to Slack at a time.
 function acquirePluginLock(): void {
   try {
-    const existing = readFileSync(LOCK_FILE, 'utf8').trim()
-    const heldPid = parseInt(existing, 10)
-    if (Number.isFinite(heldPid) && heldPid > 0 && heldPid !== process.pid) {
-      try {
-        process.kill(heldPid, 0)
-        process.stderr.write(
-          `slack channel: another instance (PID ${heldPid}) already holds ${LOCK_FILE}\n` +
-          `  this instance (PID ${process.pid}) will exit — Socket Mode is single-consumer,\n` +
-          `  and running multiple plugin processes causes event fanout + missed messages.\n` +
-          `  if you believe the lock is stale, remove ${LOCK_FILE} and retry.\n`,
-        )
-        process.exit(0)
-      } catch {
-        process.stderr.write(`slack channel: stale lock from PID ${heldPid}, reclaiming\n`)
-      }
+    const result = claimPluginLock(LOCK_FILE, STATE_DIR)
+    if (!result.acquired) {
+      process.stderr.write(
+        `slack channel: another instance (PID ${result.heldPid}) already holds ${LOCK_FILE}\n` +
+        `  this instance (PID ${process.pid}) will exit — Socket Mode is single-consumer,\n` +
+        `  and running multiple plugin processes causes event fanout + missed messages.\n`,
+      )
+      process.exit(0)
     }
-  } catch {
-    // no lock file, or unreadable — proceed
-  }
-  try {
-    mkdirSync(STATE_DIR, { recursive: true })
-    writeFileSync(LOCK_FILE, String(process.pid), 'utf8')
+    if (result.reclaimedPid !== undefined) {
+      process.stderr.write(`slack channel: stale lock from PID ${result.reclaimedPid}, reclaiming\n`)
+    }
   } catch (err) {
     process.stderr.write(`slack channel: failed to write lock ${LOCK_FILE}: ${err}\n`)
     process.exit(1)
@@ -1232,6 +1228,116 @@ async function confirmedWithin(handOffs: Promise<boolean>[]): Promise<boolean[] 
   }
 }
 
+async function listDirectMessageChannels(): Promise<string[]> {
+  if (!slackApp) return []
+  const channels: string[] = []
+  let cursor: string | undefined
+  do {
+    const response = await slackApp.client.conversations.list({
+      types: 'im',
+      limit: 200,
+      ...(cursor ? { cursor } : {}),
+    })
+    for (const channel of response.channels ?? []) {
+      if (channel.id) channels.push(channel.id)
+    }
+    cursor = response.response_metadata?.next_cursor || undefined
+  } while (cursor)
+  return channels
+}
+
+/** Socket Mode停止中に失われた新規mentionとDMを、起動直後に一度だけ回収する。 */
+async function catchupSweep(): Promise<void> {
+  if (!slackApp) return
+  const windowHours = positiveInteger(process.env.ZEROKUN_CATCHUP_WINDOW_H, 48)
+  const perChannelLimit = positiveInteger(process.env.ZEROKUN_CATCHUP_LIMIT, 20)
+  const oldestMs = Date.now() - windowHours * 60 * 60 * 1000
+  const access = loadAccess()
+  const channelIds = new Set(Object.keys(access.channels))
+  const dmChannels = new Set<string>()
+
+  try {
+    for (const channelId of await listDirectMessageChannels()) {
+      dmChannels.add(channelId)
+      channelIds.add(channelId)
+    }
+  } catch (err) {
+    process.stderr.write(`slack channel: catch-up DM list failed: ${err}\n`)
+  }
+
+  let deliveredCount = 0
+  let candidateCount = 0
+  for (const channelId of channelIds) {
+    const isDM = dmChannels.has(channelId)
+    let history: any[]
+    try {
+      const response = await slackApp.client.conversations.history({
+        channel: channelId,
+        oldest: msToSlackTs(oldestMs),
+        inclusive: true,
+        limit: 100,
+      })
+      history = response.messages ?? []
+    } catch (err) {
+      process.stderr.write(`slack channel: catch-up history failed for ${channelId}: ${err}\n`)
+      continue
+    }
+
+    const plan = planCatchupSweep(history, delivered, {
+      channelId,
+      channelType: isDM ? 'im' : 'channel',
+      channelPolicy: access.channels[channelId],
+      oldestMs,
+      limit: perChannelLimit,
+    }, botUserId)
+    candidateCount += plan.length
+
+    for (const message of plan) {
+      const isBot = !!message.bot_id
+      const senderId = isBot ? message.bot_id : message.user
+      if (!senderId || !message.ts) continue
+      const text = message.text ?? ''
+      const result = await gate(
+        senderId,
+        channelId,
+        isDM ? 'im' : 'channel',
+        resolveIsMention(isDM, text, botUserId),
+        isBot,
+      )
+      if (result.action === 'drop') continue
+      if (result.action === 'pair') {
+        const lead = result.isResend ? 'Still pending' : 'Pairing required'
+        try {
+          await slackApp.client.chat.postMessage({
+            channel: channelId,
+            text: `${lead} — run in Claude Code:\n\n\`/slack:access pair ${result.code}\``,
+          })
+        } catch (err) {
+          process.stderr.write(`slack channel: catch-up pairing notice failed for ${channelId}: ${err}\n`)
+        }
+        continue
+      }
+
+      if (isDM) dmChannelUsers.set(channelId, senderId)
+      const fileIds = (message.files ?? []).map(file => file.id)
+      const handedOver = await deliver(
+        channelId,
+        message.ts,
+        senderId,
+        isDM ? text : text.replace(/<@[A-Z0-9]+>/g, '').trim(),
+        message.thread_ts || message.ts,
+        fileIds.length > 0 ? fileIds : undefined,
+      )
+      if (handedOver) deliveredCount += 1
+    }
+  }
+
+  process.stderr.write(
+    `slack channel: catch-up sweep delivered=${deliveredCount}`
+    + ` candidates=${candidateCount} channels=${channelIds.size} window=${windowHours}h\n`,
+  )
+}
+
 /** null when the file could not be read — distinct from "no threads yet". */
 function loadThreads(): Record<string, ThreadEntry> | null {
   try {
@@ -1357,7 +1463,8 @@ try {
   botUserId = authResult.user_id
   process.stderr.write(`slack channel: connected as ${authResult.user} (${botUserId})\n`)
 
-  // Sweep once on startup (recovers replies missed while no session was live),
+  // Sweep once on startup for new mentions/DMs, and recover replies in owned threads.
+  void catchupSweep()
   // then keep a light timer for near-real-time follow-ups in owned threads.
   void pollThreads()
   setInterval(() => { void pollThreads() }, THREAD_POLL_INTERVAL_MS).unref()
