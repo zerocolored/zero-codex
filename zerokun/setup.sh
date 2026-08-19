@@ -60,10 +60,23 @@ rm -f "$HOME/.claude/skills/update-zerokun"
 ln -sfn "$REPO_DIR/skills/zerokun-update" "$HOME/.claude/skills/zerokun-update"
 ln -sfn "$CH/owner/claude-skills/dev" "$HOME/.claude/skills/dev"
 
-# 5. SQLite直列job runner・安全更新・起動コマンド
+# 5. SQLite直列job runner・watchdog・安全更新・起動コマンド
 mkdir -p "$HOME/.local/bin"
 install -m 0700 "$REPO_DIR/zerokun/job-runner.ts" "$CH/job-runner.ts"
 install -m 0700 "$REPO_DIR/zerokun/update-request.ts" "$CH/update-request.ts"
+install -m 0700 "$REPO_DIR/zerokun/watchdog.sh" "$CH/watchdog.sh"
+mkdir -p "$HOME/Library/LaunchAgents"
+WATCHDOG_PLIST="$HOME/Library/LaunchAgents/com.zerokun.watchdog.plist"
+sed "s|__HOME__|$HOME|g" \
+  "$TPL/com.zerokun.watchdog.plist.template" > "$WATCHDOG_PLIST"
+chmod 600 "$WATCHDOG_PLIST"
+if [ "${ZEROKUN_SKIP_WATCHDOG_LAUNCHD:-0}" = "1" ]; then
+  echo "   watchdog のlaunchd登録をスキップしました"
+else
+  /bin/launchctl bootout "gui/$(id -u)/com.zerokun.watchdog" 2>/dev/null || true
+  /bin/launchctl bootstrap "gui/$(id -u)" "$WATCHDOG_PLIST"
+  echo "   watchdog をlaunchdへ登録しました(60秒間隔・自動再起動なし)"
+fi
 ln -sfn "$CH/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
 ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"
 ln -sfn "$REPO_DIR/claude-channel.sh" "$HOME/.local/bin/claude-channel"

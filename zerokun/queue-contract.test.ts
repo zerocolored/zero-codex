@@ -58,6 +58,9 @@ describe('Zero-kun queue wiring', () => {
     expect(setup).toContain('zerokun-jobs')
     expect(setup).toContain('zerokun-queue-policy.md')
     expect(setup).toContain('zerokun-update')
+    expect(setup).toContain('watchdog.sh')
+    expect(setup).toContain('com.zerokun.watchdog.plist')
+    expect(setup).toContain('launchctl bootstrap')
   })
 
   test('updater is wired to all three repositories and restarts both processes', () => {

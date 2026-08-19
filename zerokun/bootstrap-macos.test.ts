@@ -259,7 +259,12 @@ describe('macOS bootstrap', () => {
 
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
-        env: { ...process.env, HOME: fakeHome, ZEROKUN_PROJECT_DIR: projectDir },
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_PROJECT_DIR: projectDir,
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+        },
         stdout: 'pipe',
         stderr: 'pipe',
       })

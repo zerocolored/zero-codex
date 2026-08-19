@@ -10,7 +10,9 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { Database } from 'bun:sqlite'
 import {
+  ClaudeRateLimitError,
   JobStore,
   SERIAL_WORKER_COUNT,
   WORKER_DENIED_TOOL_PATTERNS,
@@ -19,6 +21,7 @@ import {
   buildWorkerPrompt,
   executeClaudeJob,
   describeFailure,
+  extractRateLimit,
   runQueuedJobs,
   splitSlackChunks,
   type EnqueueInput,
@@ -52,6 +55,46 @@ function input(overrides: Partial<EnqueueInput> = {}): EnqueueInput {
 }
 
 describe('SQLite job queue', () => {
+  test('既存DBへnot_before列を冪等に追加する', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-job-schema-migration-'))
+    tempDirs.push(dir)
+    const dbPath = join(dir, 'jobs.sqlite3')
+    const legacy = new Database(dbPath, { create: true })
+    legacy.exec(`
+      CREATE TABLE jobs (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        chat_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        repo_path TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        session_id TEXT,
+        resumed INTEGER NOT NULL DEFAULT 0,
+        worker_id TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        result TEXT,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER
+      )
+    `)
+    legacy.close()
+
+    const store = new JobStore(dbPath)
+    expect(store.enqueue(input()).job.notBefore).toBeNull()
+    store.close()
+
+    const migrated = new Database(dbPath)
+    const columns = migrated.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
+    expect(columns.map((column) => column.name)).toContain('not_before')
+    migrated.close()
+  })
+
   test('同一Slackイベントを再受信してもjobを二重登録しない', () => {
     const store = makeStore()
     const first = store.enqueue(input())
@@ -121,13 +164,34 @@ describe('SQLite job queue', () => {
   test('daemon再起動時は取り残したrunning jobをqueuedへ戻す', () => {
     const store = makeStore()
     const job = store.enqueue(input()).job
-    expect(store.claimNext('serial-worker')?.status).toBe('running')
+    const firstClaim = store.claimNext('serial-worker')
+    expect(firstClaim?.status).toBe('running')
 
     expect(store.recoverInterrupted()).toBe(1)
     const recovered = store.get(job.id)
     expect(recovered?.status).toBe('queued')
     expect(recovered?.workerId).toBeNull()
     expect(recovered?.lastError).toContain('daemon restarted')
+
+    const reclaimed = store.claimNext('serial-worker')
+    expect(reclaimed?.sessionId).toBe(firstClaim?.sessionId)
+    expect(reclaimed?.resumed).toBe(true)
+    store.close()
+  })
+
+  test('予約時刻まではclaimせず、経過後は自分のsessionを温存して再開する', () => {
+    const store = makeStore()
+    const first = store.enqueue(input()).job
+    const claimed = store.claimNext('serial-worker', 5, 10_000)!
+    store.requeueAt(first.id, 20_000, 'rate limited')
+
+    expect(store.get(first.id)?.notBefore).toBe(20_000)
+    expect(store.claimNext('serial-worker', 5, 19_999)).toBeNull()
+
+    const resumed = store.claimNext('serial-worker', 5, 20_000)
+    expect(resumed?.sessionId).toBe(claimed.sessionId)
+    expect(resumed?.resumed).toBe(true)
+    expect(resumed?.notBefore).toBeNull()
     store.close()
   })
 
@@ -229,6 +293,59 @@ describe('single worker', () => {
     expect(stats.completed).toBe(1)
     expect(stats.failed).toBe(1)
     expect(store.list().map(job => job.status)).toEqual(['failed', 'completed'])
+    store.close()
+  })
+
+  test('使用量上限は予約時刻へ再キューしfailed通知を出さない', async () => {
+    const store = makeStore()
+    const queued = store.enqueue(input()).job
+    const resumeAt = Date.now() + 60_000
+    const paused: number[] = []
+    const failed: string[] = []
+
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async () => {
+        throw new ClaudeRateLimitError('使用量上限', resumeAt)
+      },
+      notifier: {
+        rateLimited: async (_job, scheduledAt) => { paused.push(scheduledAt) },
+        failed: async (_job, message) => { failed.push(message) },
+      },
+    })
+
+    expect(stats).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+    expect(store.get(queued.id)?.status).toBe('queued')
+    expect(store.get(queued.id)?.notBefore).toBe(resumeAt + 60_000)
+    expect(paused).toEqual([resumeAt + 60_000])
+    expect(failed).toEqual([])
+    store.close()
+  })
+
+  test('使用量上限が5回続いたjobはfailedへ確定する', async () => {
+    const store = makeStore()
+    const queued = store.enqueue(input()).job
+    for (let attempt = 1; attempt < 5; attempt += 1) {
+      const claimed = store.claimNext('serial-worker')!
+      store.requeueAt(claimed.id, Date.now() - 1, `rate limit ${attempt}`)
+    }
+
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async () => {
+        throw new ClaudeRateLimitError('使用量上限', Date.now() + 60_000)
+      },
+    })
+
+    expect(stats.failed).toBe(1)
+    expect(store.get(queued.id)?.status).toBe('failed')
+    expect(store.get(queued.id)?.attempts).toBe(5)
     store.close()
   })
 
@@ -339,6 +456,19 @@ describe('worker isolation', () => {
     expect(prompt).toContain('専用 worktree')
     expect(prompt).toContain('回帰テスト')
     expect(prompt).toContain('PR 作成')
+    store.close()
+  })
+
+  test('中断後のpromptは途中成果を確認して続きから完了するよう指示する', () => {
+    const store = makeStore()
+    store.enqueue(input())
+    const first = store.claimNext('serial-worker')!
+    store.requeue(first.id, 'interrupted')
+    const resumed = store.claimNext('serial-worker')!
+
+    expect(resumed.attempts).toBe(2)
+    expect(buildWorkerPrompt(resumed)).toContain('前回の実行は途中で中断された')
+    expect(buildWorkerPrompt(resumed)).toContain('最初からやり直すのではなく続きから')
     store.close()
   })
 
@@ -471,6 +601,57 @@ console.log(JSON.stringify({ result: 'fixture completed' }))
       store.close()
     }
   })
+
+  test('--resumeのtranscript不在時だけ新規sessionで1回再試行する', async () => {
+    const store = makeStore()
+    store.enqueue(input())
+    const first = store.claimNext('serial-worker')!
+    store.requeue(first.id, 'interrupted')
+    const resumed = store.claimNext('serial-worker')!
+    const oldSessionId = resumed.sessionId!
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'zerokun-resume-fallback-'))
+    tempDirs.push(fixtureDir)
+    const repoDir = join(fixtureDir, 'repo')
+    const fakeClaude = join(fixtureDir, 'fake-claude')
+    const captureFile = join(fixtureDir, 'capture.jsonl')
+    mkdirSync(repoDir)
+    writeFileSync(
+      fakeClaude,
+      `#!/usr/bin/env bun
+import { appendFileSync } from 'fs'
+const args = process.argv.slice(2)
+appendFileSync(process.env.CAPTURE_FILE!, JSON.stringify(args) + '\\n')
+if (args.includes('--resume')) {
+  console.error('No conversation found with session ID')
+  process.exit(1)
+}
+console.log(JSON.stringify({ result: 'fresh session completed' }))
+`,
+    )
+    chmodSync(fakeClaude, 0o755)
+    const previousCapture = process.env.CAPTURE_FILE
+    process.env.CAPTURE_FILE = captureFile
+
+    try {
+      const result = await executeClaudeJob(
+        { ...resumed, repoPath: repoDir },
+        { claudeBin: fakeClaude, logDir: join(fixtureDir, 'logs'), timeoutMs: 5_000 },
+      )
+      const calls = readFileSync(captureFile, 'utf8').trim().split('\n').map(JSON.parse) as string[][]
+
+      expect(calls).toHaveLength(2)
+      expect(calls[0]).toContain('--resume')
+      expect(calls[0]).toContain(oldSessionId)
+      expect(calls[1]).toContain('--session-id')
+      expect(calls[1]).not.toContain(oldSessionId)
+      expect(result.sessionId).not.toBe(oldSessionId)
+      expect(result.result).toBe('fresh session completed')
+    } finally {
+      if (previousCapture === undefined) delete process.env.CAPTURE_FILE
+      else process.env.CAPTURE_FILE = previousCapture
+      store.close()
+    }
+  })
 })
 
 describe('job result extraction', () => {
@@ -569,6 +750,26 @@ describe('job failure notice', () => {
       result: "You've hit your session limit · resets 3:50pm (Asia/Tokyo)",
     },
   ])
+
+  test('使用量上限イベントからepoch秒のreset時刻を取り出す', () => {
+    const stdout = JSON.stringify([
+      { type: 'rate_limit_event', rateLimitType: 'five_hour', resetsAt: 1_786_949_400 },
+      { type: 'result', is_error: true, api_error_status: 429 },
+    ])
+
+    expect(extractRateLimit(stdout, 123)).toEqual({
+      rateLimited: true,
+      resetsAtMs: 1_786_949_400_000,
+    })
+  })
+
+  test('reset時刻が無い使用量上限は60分後へフォールバックする', () => {
+    const now = 1_786_900_000_000
+    expect(extractRateLimit(RATE_LIMIT_STDOUT, now)).toEqual({
+      rateLimited: true,
+      resetsAtMs: now + 60 * 60 * 1000,
+    })
+  })
 
   test('使用量上限は日本語1行 + 理由文で通知する', () => {
     const notice = describeFailure(1, RATE_LIMIT_STDOUT, '', '/tmp/x.stdout.log')

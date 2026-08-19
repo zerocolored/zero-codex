@@ -65,6 +65,7 @@ export function isBotDMBlocked(channelType: 'im' | 'channel', isBot: boolean): b
 
 export type SlackReply = {
   ts?: string
+  thread_ts?: string
   user?: string
   bot_id?: string
   subtype?: string
@@ -150,6 +151,50 @@ export function resolveIsMention(
   botUserId: string | undefined,
 ): boolean {
   return isDM || mentionsBot(text, botUserId)
+}
+
+export type CatchupSweepPolicy = {
+  channelId: string
+  channelType: 'im' | 'channel'
+  channelPolicy?: ChannelPolicy
+  oldestMs: number
+  limit?: number
+}
+
+/**
+ * 起動時に履歴から回収するメッセージを決める。Slack I/O と access.json の
+ * DM allowlist 判定は server.ts に残し、ここではlive handlerと同じメッセージ形状・
+ * mention・channel policy・dedup・時間窓・件数上限を固定する。
+ */
+export function planCatchupSweep(
+  history: SlackReply[],
+  deliveredKeys: Iterable<string>,
+  policy: CatchupSweepPolicy,
+  botUserId: string | undefined,
+): SlackReply[] {
+  const delivered = new Set(deliveredKeys)
+  const limit = Math.max(1, Math.floor(policy.limit ?? 20))
+  const candidates = history.filter((message) => {
+    if (!message.ts) return false
+    const messageMs = slackTsToMs(message.ts)
+    if (!Number.isFinite(messageMs) || messageMs < policy.oldestMs) return false
+    if (delivered.has(`${policy.channelId}:${message.ts}`)) return false
+    if (message.subtype && message.subtype !== 'bot_message' && message.subtype !== 'file_share') {
+      return false
+    }
+    if (botUserId && message.user === botUserId) return false
+
+    const isBot = !!message.bot_id
+    const senderId = isBot ? message.bot_id : message.user
+    if (!senderId) return false
+    if (isBotDMBlocked(policy.channelType, isBot)) return false
+    if (policy.channelType === 'im') return true
+
+    const isMention = resolveIsMention(false, message.text ?? '', botUserId)
+    return decideChannelPolicy(policy.channelPolicy, senderId, isMention, isBot) === 'deliver'
+  }).sort((a, b) => parseFloat(a.ts!) - parseFloat(b.ts!))
+
+  return candidates.slice(-limit)
 }
 
 /**

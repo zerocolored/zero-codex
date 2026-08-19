@@ -36,6 +36,7 @@ bash ~/Desktop/Project/claude-channel-slack/zerokun/bootstrap-macos.sh
 | `server.ts` / `gate.ts` | Slack bridge 本体(受信・許可判定) |
 | `skills/threads/` | スレッドごとの担当AI振り分け |
 | `zerokun/job-runner.ts` | SQLiteへjobを永続化し、全チャンネル共通で1件ずつFIFO実行 |
+| `zerokun/watchdog.sh` | bridge/job runnerの停止をlaunchdから検知し、状態遷移をSlack DM通知 |
 | `claude-channel.sh` | 起動スクリプト(`zerokun` コマンドの実体)。オーナー重厚モードの読み込み配線込み |
 | `zerokun/setup.sh` | 新マシンセットアップ(配線の再現) |
 | `zerokun/bootstrap-macos.sh` | まっさらなMacのCLT・CLI・ログイン・clone・開発環境を構築。Slackは後から任意実行 |
@@ -60,8 +61,9 @@ tail -f ~/.claude/channels/slack/job-runner.log
 ```
 
 - 同じSlackイベントの再配信は`chat_id + message_id`で重複登録を防ぐ
-- daemon再起動時は`running`だったjobを`queued`へ戻す
-- 失敗したjobは`failed`へ確定し、次のjobは止めない
+- daemon再起動時は`running`だったjobを`queued`へ戻し、同じClaude sessionを`--resume`する
+- 使用量上限はリセット時刻の1分後まで保留し、自動再開する（5回で`failed`）
+- その他の失敗jobは`failed`へ確定し、次のjobは止めない
 - 同じSlackスレッドの後続jobは、最大5件まで同じClaude sessionを再開する
 
 ## 重厚モードの仕組み
@@ -82,6 +84,13 @@ tail -f ~/.claude/channels/slack/job-runner.log
   完了・失敗を同じスレッドへ通知する。`zerokun-update`はSlackが使えない場合の手動経路として残す。
 - 更新後のSlack botはdetached tmux session `zerokun-slack`で常駐する。
   画面確認は`tmux attach -t zerokun-slack`、確認後に抜ける操作は`Ctrl-b`→`d`。
-- 停止は Ctrl-C か通常の kill。`kill -9` 禁止(plugin.lock が残って次回起動が無言で死ぬ)
+- bridge起動時は直近48時間（`ZEROKUN_CATCHUP_WINDOW_H`）の未配送DMと新規@メンションを
+  チャンネルごとに最大20件（`ZEROKUN_CATCHUP_LIMIT`）、古い順に回収する。
+- watchdogはbridge/job runnerのどちらかが2回連続で停止した時だけ本人へDMし、停止中は
+  60分ごとに再通知、復旧時は1回通知する。自動再起動は行わない。通知先は`.env`の
+  `ZEROKUN_WATCHDOG_NOTIFY`、再通知間隔（分）は`ZEROKUN_WATCHDOG_REALERT_MIN`で変更できる。
+  一時停止は`touch ~/.claude/channels/slack/watchdog-off`、再開は同ファイルを削除する。
+  ログは`~/.claude/channels/slack/watchdog.log`、状態は`watchdog-state.json`。
+- 停止は Ctrl-C か通常の killを使う。残ったplugin.lockはPIDと`server.ts`を照合して自動回収する。
 - 二重起動は起動スクリプトがガードする(既存がいたら中止)
 - 詳細な運用ドキュメントは Notion「AI管理 → ノートDB」の引継書を参照
