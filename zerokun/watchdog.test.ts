@@ -3,6 +3,7 @@ import { readFileSync } from 'fs'
 import { join } from 'path'
 
 const watchdog = join(import.meta.dir, 'watchdog.sh')
+const watchdogSource = readFileSync(watchdog, 'utf8')
 
 describe('Zero-kun watchdog', () => {
   test('selftestで連続down・再通知抑制・復旧・muteの状態遷移を検証する', () => {
@@ -34,5 +35,9 @@ describe('Zero-kun watchdog', () => {
     expect(plist).toContain('<integer>60</integer>')
     expect(plist).toContain('<key>RunAtLoad</key>')
     expect(plist).not.toContain('Desktop')
+  })
+
+  test('Slack API呼び出しは10秒でtimeoutする', () => {
+    expect(watchdogSource.match(/--max-time 10/g)?.length).toBe(2)
   })
 })

@@ -771,6 +771,44 @@ describe('job failure notice', () => {
     })
   })
 
+  test('会話ログにrate limitという語があっても構造化シグナルが無ければ上限扱いしない', () => {
+    const now = 1_786_900_000_000
+    const stdout = JSON.stringify([
+      {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'text', text: 'rate limit対応を実装しましたがテストが失敗しました' }],
+        },
+      },
+      { type: 'result', is_error: true, result: 'TypeScript compilation failed' },
+    ])
+
+    expect(extractRateLimit(stdout, now)).toEqual({
+      rateLimited: false,
+      resetsAtMs: null,
+    })
+  })
+
+  test('入れ子のrateLimitInfoは構造化シグナルとしてreset時刻を取り出す', () => {
+    const stdout = JSON.stringify([{
+      type: 'rate_limit_event',
+      rate_limit_info: { rateLimitType: 'five_hour', resetsAt: 1_786_949_400 },
+    }])
+
+    expect(extractRateLimit(stdout, 123)).toEqual({
+      rateLimited: true,
+      resetsAtMs: 1_786_949_400_000,
+    })
+  })
+
+  test('非JSONのClaude定型文だけは使用量上限として扱う', () => {
+    const now = 1_786_900_000_000
+    expect(extractRateLimit("You've hit your usage limit · resets 3:50pm", now)).toEqual({
+      rateLimited: true,
+      resetsAtMs: now + 60 * 60 * 1000,
+    })
+  })
+
   test('使用量上限は日本語1行 + 理由文で通知する', () => {
     const notice = describeFailure(1, RATE_LIMIT_STDOUT, '', '/tmp/x.stdout.log')
 
@@ -787,6 +825,22 @@ describe('job failure notice', () => {
     expect(notice).toContain('exit code 1')
     expect(notice).toContain('/tmp/y.stdout.log')
     expect(notice.length).toBeLessThan(1_000)
+  })
+
+  test('入れ子のtool resultでトップレベルの失敗理由を上書きしない', () => {
+    const stdout = JSON.stringify([
+      { type: 'result', is_error: true, result: '本来の失敗理由' },
+      {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'tool_result', result: '入れ子のツール実行結果' }],
+        },
+      },
+    ])
+
+    const notice = describeFailure(1, stdout, '', '/tmp/nested.stdout.log')
+    expect(notice).toContain('本来の失敗理由')
+    expect(notice).not.toContain('入れ子のツール実行結果')
   })
 
   test('失敗通知もSlack1通に収まる', () => {

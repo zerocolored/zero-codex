@@ -8,6 +8,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CH="$HOME/.claude/channels/slack"
 TPL="$REPO_DIR/zerokun/templates"
 PROJECT_DIR="${ZEROKUN_PROJECT_DIR:-$HOME/Desktop/Project/BellSalsesAI}"
+LAUNCHCTL_BIN="${ZEROKUN_LAUNCHCTL_BIN:-/bin/launchctl}"
 
 echo "== ゼロくんセットアップ開始 (repo: $REPO_DIR)"
 
@@ -73,9 +74,12 @@ chmod 600 "$WATCHDOG_PLIST"
 if [ "${ZEROKUN_SKIP_WATCHDOG_LAUNCHD:-0}" = "1" ]; then
   echo "   watchdog のlaunchd登録をスキップしました"
 else
-  /bin/launchctl bootout "gui/$(id -u)/com.zerokun.watchdog" 2>/dev/null || true
-  /bin/launchctl bootstrap "gui/$(id -u)" "$WATCHDOG_PLIST"
-  echo "   watchdog をlaunchdへ登録しました(60秒間隔・自動再起動なし)"
+  "$LAUNCHCTL_BIN" bootout "gui/$(id -u)/com.zerokun.watchdog" 2>/dev/null || true
+  if "$LAUNCHCTL_BIN" bootstrap "gui/$(id -u)" "$WATCHDOG_PLIST"; then
+    echo "   watchdog をlaunchdへ登録しました(60秒間隔・自動再起動なし)"
+  else
+    echo "⚠️ watchdog のlaunchd登録に失敗しました。CLIとaliasの設置は続行します。" >&2
+  fi
 fi
 ln -sfn "$CH/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
 ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"

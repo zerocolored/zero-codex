@@ -79,7 +79,7 @@ send_notification() {
   notify_user="$(notification_user)"
   [ -n "$notify_user" ] || { printf 'zerokun watchdog: notification user is unavailable\n' >&2; return 1; }
 
-  open_response="$(/usr/bin/curl -sS -X POST 'https://slack.com/api/conversations.open' \
+  open_response="$(/usr/bin/curl -sS --max-time 10 -X POST 'https://slack.com/api/conversations.open' \
     -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
     --data-urlencode "users=$notify_user" 2>/dev/null)" || return 1
   dm_channel="$(printf '%s' "$open_response" | /usr/bin/python3 -c \
@@ -94,7 +94,7 @@ send_notification() {
 
   payload="$(WATCHDOG_CHANNEL="$dm_channel" WATCHDOG_BODY="$body" /usr/bin/python3 -c \
     'import json,os; print(json.dumps({"channel":os.environ["WATCHDOG_CHANNEL"],"text":os.environ["WATCHDOG_BODY"]},ensure_ascii=False), end="")')"
-  post_response="$(/usr/bin/curl -sS -X POST 'https://slack.com/api/chat.postMessage' \
+  post_response="$(/usr/bin/curl -sS --max-time 10 -X POST 'https://slack.com/api/chat.postMessage' \
     -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
     -H 'Content-Type: application/json; charset=utf-8' \
     --data "$payload" 2>/dev/null)" || return 1

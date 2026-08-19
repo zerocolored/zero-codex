@@ -695,29 +695,52 @@ const MAX_FAILURE_CHARS = 600
 
 function parseClaudeEvents(stdout: string): Array<Record<string, unknown>> {
   const events: Array<Record<string, unknown>> = []
+  const collectTopLevel = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          events.push(item as Record<string, unknown>)
+        }
+      }
+      return
+    }
+    if (value && typeof value === 'object') events.push(value as Record<string, unknown>)
+  }
+  const trimmed = stdout.trim()
+  try {
+    collectTopLevel(JSON.parse(trimmed))
+  } catch {
+    for (const line of trimmed.split('\n')) {
+      const text = line.trim()
+      if (!text) continue
+      try {
+        collectTopLevel(JSON.parse(text))
+      } catch {}
+    }
+  }
+  return events
+}
+
+function walkClaudeObjects(events: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const objects: Array<Record<string, unknown>> = []
   const collect = (value: unknown): void => {
     if (Array.isArray(value)) {
       value.forEach(collect)
       return
     }
     if (!value || typeof value !== 'object') return
-    const event = value as Record<string, unknown>
-    events.push(event)
-    Object.values(event).forEach(collect)
+    const object = value as Record<string, unknown>
+    objects.push(object)
+    Object.values(object).forEach(collect)
   }
-  const trimmed = stdout.trim()
-  try {
-    collect(JSON.parse(trimmed))
-  } catch {
-    for (const line of trimmed.split('\n')) {
-      const text = line.trim()
-      if (!text) continue
-      try {
-        collect(JSON.parse(text))
-      } catch {}
-    }
-  }
-  return events
+  events.forEach(collect)
+  return objects
+}
+
+function isClaudeUsageLimitMessage(value: string): boolean {
+  return value.split(/\r?\n/).some(line => (
+    /^you(?:'|’)ve hit your (?:usage|session) limit\b/i.test(line.trim())
+  ))
 }
 
 export type RateLimitInfo = {
@@ -728,15 +751,17 @@ export type RateLimitInfo = {
 /** Claudeのイベント列から使用量上限と再開可能時刻を取り出す。 */
 export function extractRateLimit(stdout: string, now = Date.now()): RateLimitInfo {
   const events = parseClaudeEvents(stdout)
+  const objects = walkClaudeObjects(events)
   let rateLimited = false
   let resetsAtMs: number | null = null
 
-  for (const event of events) {
+  // rateLimitInfo のような入れ子も見るが、一般の result 文字列は見ない。
+  // tool result や会話本文に「rate limit」が出ただけで上限扱いすると、通常の
+  // 失敗通知を最大5時間遅らせるため、機械判定は構造化シグナルに限定する。
+  for (const event of objects) {
     if (event.error === 'rate_limit' || event.api_error_status === 429) rateLimited = true
     if (typeof event.rateLimitType === 'string') rateLimited = true
-    if (typeof event.result === 'string' && /(?:hit your .*limit|rate.?limit)/i.test(event.result)) {
-      rateLimited = true
-    }
+    if (event.type === 'rate_limit_event') rateLimited = true
     if (typeof event.resetsAt === 'number' && Number.isFinite(event.resetsAt) && event.resetsAt > 0) {
       resetsAtMs = event.resetsAt >= 1_000_000_000_000
         ? Math.floor(event.resetsAt)
@@ -744,7 +769,17 @@ export function extractRateLimit(stdout: string, now = Date.now()): RateLimitInf
     }
   }
 
-  if (!rateLimited && /(?:hit your .*limit|rate.?limit)/i.test(stdout)) rateLimited = true
+  // CLI実装差で構造化フィールドが無い場合も、Claude自身の定型エラーだけは拾う。
+  // top-level result またはそれ単独のplain-text行に限定し、会話ログ全文は検索しない。
+  if (!rateLimited) {
+    rateLimited = events.some(event => (
+      event.type === 'result'
+      && event.is_error !== false
+      && typeof event.result === 'string'
+      && isClaudeUsageLimitMessage(event.result)
+    ))
+  }
+  if (!rateLimited) rateLimited = isClaudeUsageLimitMessage(stdout)
   if (!rateLimited) return { rateLimited: false, resetsAtMs: null }
   return { rateLimited: true, resetsAtMs: resetsAtMs ?? now + 60 * 60 * 1000 }
 }

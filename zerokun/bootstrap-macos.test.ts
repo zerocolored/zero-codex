@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -276,6 +276,38 @@ describe('macOS bootstrap', () => {
       expect(readFileSync(tokenFile, 'utf8')).toBe(
         'SLACK_BOT_TOKEN=xoxb-existing\nSLACK_APP_TOKEN=xapp-existing\n',
       )
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('watchdogのlaunchctl登録失敗後もCLIリンクとzsh aliasを設置する', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-launchctl-failure-'))
+    const stateDir = join(fakeHome, '.claude/channels/slack')
+    const projectDir = join(fakeHome, 'Work/BellSalesAI')
+    const fakeLaunchctl = join(fakeHome, 'launchctl-fails')
+    try {
+      mkdirSync(join(stateDir, 'owner/claude-config/.git'), { recursive: true })
+      mkdirSync(join(stateDir, 'owner/claude-skills/.git'), { recursive: true })
+      mkdirSync(projectDir, { recursive: true })
+      writeFileSync(fakeLaunchctl, '#!/bin/bash\nexit 42\n', { mode: 0o700 })
+
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_PROJECT_DIR: projectDir,
+          ZEROKUN_LAUNCHCTL_BIN: fakeLaunchctl,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+
+      expect(result.exitCode).toBe(0)
+      expect(result.stderr.toString()).toContain('watchdog のlaunchd登録に失敗')
+      expect(existsSync(join(fakeHome, '.local/bin/zerokun-jobs'))).toBe(true)
+      expect(readFileSync(join(fakeHome, '.zshrc'), 'utf8')).toContain("alias zerokun=")
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
