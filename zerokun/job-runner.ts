@@ -565,9 +565,51 @@ For any code, settings, or documentation change:
 6. Review the final diff for security, regressions, and unrelated changes.
 7. Commit, push, and complete PR 作成 against the required base branch. Do not merge it.
 
-Finish with a concise Japanese report containing findings, change, verification,
-and the PR title plus full URL. If no change is needed, report "PR: none" with evidence.
-If blocked, start the final response with "BLOCKED:" and state what was proven first.
+Finish with a Japanese report for a reader who did not watch you work and has to see at a
+glance whether it needs them. Pick the one type that fits the job and follow only its
+shape.
+
+The report is posted to Slack as-is, so write Slack mrkdwn. Bold is a SINGLE asterisk
+(*完了*); \`**bold**\` is not Slack syntax and shows up as literal asterisks. Set every
+heading — the type on line 1 and *やってほしいこと* — in bold.
+
+完了 / 要確認 / 未完了 — you did work.
+  Line 1: *the type*, then one sentence of what is now true.
+  Then the *やってほしいこと* heading and the actions inside a \`\`\` code block — one action
+  per line, imperative, no explanation — or a block containing なし. Never drop this
+  section: without it a report reads as a request for action.
+  Then the PR URL in full, or PR: なし. Under 10 lines.
+
+回答 — the job was a question.
+  Line 1: *回答*: and the answer in one sentence, then at most three supporting lines.
+  Every supporting line opens with its own label in backticks — ・\`承認の場所\`: … — so the
+  reader knows what each line is about before reading it. A line that starts straight
+  into content makes them work out the subject themselves.
+  No やってほしいこと section: nothing is being asked of them, and writing なし is noise.
+
+提案 — the job asked what to do, or for options.
+  Line 1: *提案*: and how many options there are, in one sentence.
+  Then at most four options, each with its headline in bold and its facts as labelled
+  lines: ・\`根拠\`: … ・\`効果\`: … ・\`手間\`: …
+  根拠 is required on every option — the measurement, the count, or the incident it rests
+  on. An option you did not measure says ・\`根拠\`: 未計測（推測）. Never invent a number and
+  never dress a guess as evidence: options without 根拠 are just plausible-sounding noise
+  and cannot be chosen between, which is the failure this format exists to prevent.
+  Then *おすすめ*: one option and why it beats the others.
+  Then the *やってほしいこと* block asking which one to take. Under 20 lines.
+
+Labels in backticks belong to the explanation lists (回答 / 提案). Do NOT use them inside
+a \`\`\` code block: Slack renders no inline formatting there, so the backticks would show
+as characters. The やってほしいこと block stays plain text.
+
+Whatever the type, leave out job or
+session IDs, file paths, function names, commit hashes,
+log excerpts, tool names, and the step-by-step of what you did. The reader cannot
+act on those and they bury the point — that detail belongs in the PR body, which is where
+you should put it. Needing more lines than the type allows is a sign the material belongs
+in the PR, not in the message.
+
+If blocked, start the final response with "BLOCKED:" and put what you proved first.
 
 Slack request:
 ${job.task}`
