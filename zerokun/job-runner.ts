@@ -565,20 +565,36 @@ For any code, settings, or documentation change:
 6. Review the final diff for security, regressions, and unrelated changes.
 7. Commit, push, and complete PR 作成 against the required base branch. Do not merge it.
 
-Finish with a Japanese report for a reader who did not watch you work and wants to know,
-in one glance, whether this needs them. Exactly this shape, nothing else:
+Finish with a Japanese report for a reader who did not watch you work and has to see at a
+glance whether it needs them. Pick the one type that fits the job and follow only its
+shape.
 
-1. One sentence starting with 完了 / 要確認 / 未完了 that says what is now true.
-2. \`やってほしいこと:\` followed by a bullet list — one action per line, imperative, no
-   explanation. Write \`なし\` when the reader has nothing to do. This line is how they tell
-   your report apart from a status update, so never omit it.
-3. The PR URL in full if there is one, or \`PR: なし\`.
+完了 / 要確認 / 未完了 — you did work.
+  Line 1: the type, then one sentence of what is now true.
+  Then \`やってほしいこと:\` and a bullet list — one action per line, imperative, no
+  explanation — or \`なし\`. Never drop this line: without it a report reads as a request.
+  Then the PR URL in full, or \`PR: なし\`. Under 8 lines.
 
-Leave everything else out: job or session IDs, file paths, function names, commit hashes,
-log excerpts, tool names, and the step-by-step of what you did. The reader cannot act on
-those and they bury the point — that detail belongs in the PR body, which is where you
-should put it. Keep the report under 8 lines no matter how large the work was; needing
-more lines is a sign the material belongs in the PR, not the message.
+回答 — the job was a question.
+  Line 1: \`回答:\` and the answer in one sentence, then at most three supporting lines.
+  No \`やってほしいこと\` line: there is nothing to do, and writing なし is noise.
+
+提案 — the job asked what to do, or for options.
+  Line 1: \`提案:\` and how many options there are, in one sentence.
+  Then at most four options. Every option carries 根拠 on its own line — the measurement,
+  the count, or the incident it rests on. An option you did not measure says
+  \`根拠: 未計測（推測）\`. Never invent a number and never dress a guess as evidence: an
+  option list without 根拠 is just plausible-sounding noise, which is the failure this
+  format exists to prevent.
+  Then one sentence naming the option you recommend and why it beats the others.
+  Then \`やってほしいこと:\` asking which one to take. Under 16 lines.
+
+Whatever the type, leave out job or
+session IDs, file paths, function names, commit hashes,
+log excerpts, tool names, and the step-by-step of what you did. The reader cannot
+act on those and they bury the point — that detail belongs in the PR body, which is where
+you should put it. Needing more lines than the type allows is a sign the material belongs
+in the PR, not in the message.
 
 If blocked, start the final response with "BLOCKED:" and put what you proved first.
 

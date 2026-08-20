@@ -118,6 +118,11 @@ describe('Zero-kun queue wiring', () => {
       // 依頼は箇条書き。無いなら「なし」と書かせる（無言だと依頼と読まれる）。
       expect(text).toContain('やってほしいこと')
       expect(text).toContain('なし')
+      // 提案には案ごとの根拠を必須にする。根拠の無い案の羅列は「それっぽい話」に
+      // なるだけで選べない。測っていない案は正直に未計測と書かせ、数字を捏造させない。
+      expect(text).toContain('提案')
+      expect(text).toContain('根拠')
+      expect(text).toContain('未計測（推測）')
       // 読み手が動かせない内部値を並べない。詳細は PR 本文へ。
       expect(text).toMatch(/session IDs, file paths, function names, commit hashes/)
     }

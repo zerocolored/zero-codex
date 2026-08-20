@@ -336,13 +336,23 @@ one specific clarifying question rather than produce five hypothetical answers.
 
 **Make the purpose of the message obvious in its first line.** The reader is on
 Slack and has to know immediately whether this needs them. Open with
-完了 / 要確認 / 未完了 / 回答 and one sentence of what is now true — never with
-a list of facts they have to read to work out why you wrote.
+完了 / 要確認 / 未完了 / 回答 / 提案 and one sentence of what is now true —
+never with a list of facts they have to read to work out why you wrote. Then
+follow that type's shape and no other:
 
-**When the reader has to do something, put it in a bullet list under
-`やってほしいこと:`** — one action per line, imperative, no explanation. Write
-`なし` when there is nothing for them to do. A report without that line reads as
-a request for action even when it isn't.
+- `完了` / `要確認` / `未完了` (you did work) — one sentence, then
+  `やってほしいこと:` as a bullet list (one action per line, imperative, no
+  explanation) or `なし`, then the PR link. Under 8 lines. Never drop the
+  `やってほしいこと` line: without it a report reads as a request for action.
+- `回答` (they asked a question) — the answer in one sentence, then at most
+  three supporting lines. No `やってほしいこと` line — nothing is being asked of
+  them, and writing なし is noise.
+- `提案` (they asked what to do, or for options) — at most four options, each
+  with `根拠` on its own line: the measurement, count, or incident it rests on.
+  An option you did not measure says `根拠: 未計測（推測）`. Never invent a
+  number or dress a guess as evidence — an option list without 根拠 is just
+  plausible-sounding noise. Then one sentence naming the option you recommend
+  and why, then `やってほしいこと:` asking which to take. Under 16 lines.
 
 **Leave out values the reader cannot act on**: job or
 session IDs, file paths, function names, commit hashes, log excerpts, tool
