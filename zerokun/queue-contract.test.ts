@@ -114,7 +114,6 @@ describe('Zero-kun queue wiring', () => {
     // 片方だけ直しても体験は揃わないので両方で固定する。
     for (const text of [runner, skill]) {
       // 1行目で「これは自分の操作が要る話か」が分かること。
-      expect(text).toContain('完了 / 要確認')
       // 依頼は箇条書き。無いなら「なし」と書かせる（無言だと依頼と読まれる）。
       expect(text).toContain('やってほしいこと')
       expect(text).toContain('なし')
@@ -125,6 +124,15 @@ describe('Zero-kun queue wiring', () => {
       expect(text).toContain('未計測（推測）')
       // Slack は * 1個が太字。** は書式にならずアスタリスクがそのまま出る。
       expect(text).toContain('SINGLE asterisk')
+      // 1行目は絵文字で挟んだ見出しだけの行。本文は2行目から。
+      expect(text).toContain('✅完了✅')
+      expect(text).toContain('⚠️要確認⚠️')
+      expect(text).toContain('🛑未完了🛑')
+      expect(text).toContain('💬回答💬')
+      expect(text).toContain('💡提案💡')
+      // 読み手が何もしない文を消す最終パス。実例で落ちたのが下の2つ。
+      expect(text).toMatch(/I lost the thread history|I did not touch the code/)
+      expect(text).toMatch(/inventory of what shipped/)
       // 行動リストはコードブロック、説明リストは行頭ラベル。コードブロック内では
       // Slack が inline 書式を描画しないので、バッククォートを持ち込ませない。
       expect(text).toContain('code block')
