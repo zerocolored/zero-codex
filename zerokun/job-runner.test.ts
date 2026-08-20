@@ -16,9 +16,12 @@ import {
   JobStore,
   SERIAL_WORKER_COUNT,
   WORKER_DENIED_TOOL_PATTERNS,
+  WORKER_DEV_SKILL_PROMPT,
   WORKER_SLACK_BAN_PROMPT,
   buildChildEnvironment,
   buildWorkerPrompt,
+  buildWorkerSystemPrompt,
+  workerRulesPath,
   executeClaudeJob,
   describeFailure,
   extractRateLimit,
@@ -459,6 +462,80 @@ describe('worker isolation', () => {
     store.close()
   })
 
+  test('job promptは7手順より上に/devを置き、代替手順として読ませない', () => {
+    const store = makeStore()
+    store.enqueue(input())
+    const job = store.claimNext('serial-worker')!
+    const prompt = buildWorkerPrompt(job)
+
+    // 旧文面は "If the project provides a development workflow or skill, use it." と
+    // 曖昧に触れるだけで、直後に自前の 7 手順を並べていた。worker は常に 7 手順を選び、
+    // /dev は一度も起動しなかった（job-logs 18 件で Skill 呼び出し 0 件）。
+    expect(prompt).toContain('/dev')
+    expect(prompt).not.toContain('If the project provides a development workflow or skill')
+    // 必須化そのものは system prompt 側の責務。ここに置くと job.task（外部入力）と
+    // 同じ優先度になり「今回は軽いから /dev 無しで」で上書きされうる。
+    expect(prompt).not.toContain(WORKER_DEV_SKILL_PROMPT)
+    store.close()
+  })
+
+  test('system promptは/devをフルサイクルで必須化し、縮小の逃げ道を残さない', () => {
+    expect(WORKER_DEV_SKILL_PROMPT).toContain('/dev skill')
+    expect(WORKER_DEV_SKILL_PROMPT).toContain('Skill tool, skill:')
+    // 「今回は簡単だから」の自己判定は必ず手抜き側へ倒れる。tier による縮小も禁止。
+    expect(WORKER_DEV_SKILL_PROMPT).toContain('Run the full /dev cycle every time')
+    expect(WORKER_DEV_SKILL_PROMPT).toContain('tier S/M shortcuts in')
+    expect(WORKER_DEV_SKILL_PROMPT).not.toContain('shrink the fan-out')
+    // 無人実行なので gate 待ちで固まらせない・未検証を検証済みと言わせない。
+    expect(WORKER_DEV_SKILL_PROMPT).toContain('unattended')
+    expect(WORKER_DEV_SKILL_PROMPT).toContain('未検証')
+  })
+
+  test('system promptはオーナー共通ルールを載せ、Slack禁止を最後に置く', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-worker-rules-'))
+    tempDirs.push(dir)
+    const rulesPath = join(dir, 'CLAUDE.md')
+    // /dev は「実装タスクの規模 tier」等をオーナールール側に依存している。
+    // bridge だけがこれを読み、worker には渡っていなかった。
+    writeFileSync(rulesPath, '## 実装タスクの規模 tier\nS/M/L の定義')
+
+    const prompt = buildWorkerSystemPrompt({ rulesPath })
+
+    expect(prompt).toContain('実装タスクの規模 tier')
+    expect(prompt.indexOf(WORKER_DEV_SKILL_PROMPT)).toBeGreaterThan(
+      prompt.indexOf('実装タスクの規模 tier'),
+    )
+    // 禁止は最後の言葉にする。前段の汎用ルールに報告手段の記述があっても、
+    // 「worker は Slack に投稿しない」が上書きされないため。
+    expect(prompt.indexOf(WORKER_SLACK_BAN_PROMPT)).toBeGreaterThan(
+      prompt.indexOf(WORKER_DEV_SKILL_PROMPT),
+    )
+  })
+
+  test('オーナー共通ルールが無いマシンでもfail-openで/devと禁止は載る', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-worker-rules-'))
+    tempDirs.push(dir)
+
+    const prompt = buildWorkerSystemPrompt({ rulesPath: join(dir, 'missing', 'CLAUDE.md') })
+
+    expect(prompt).toContain(WORKER_DEV_SKILL_PROMPT)
+    expect(prompt).toContain(WORKER_SLACK_BAN_PROMPT)
+    expect(prompt).not.toContain('オーナー共通ルール')
+  })
+
+  test('worker rules の既定パスは owner/claude-config で、envで差し替えられる', () => {
+    const previous = process.env.ZEROKUN_WORKER_RULES_FILE
+    try {
+      delete process.env.ZEROKUN_WORKER_RULES_FILE
+      expect(workerRulesPath()).toContain(join('owner', 'claude-config', 'CLAUDE.md'))
+      process.env.ZEROKUN_WORKER_RULES_FILE = '/tmp/zerokun-rules-override.md'
+      expect(workerRulesPath()).toBe('/tmp/zerokun-rules-override.md')
+    } finally {
+      if (previous === undefined) delete process.env.ZEROKUN_WORKER_RULES_FILE
+      else process.env.ZEROKUN_WORKER_RULES_FILE = previous
+    }
+  })
+
   test('中断後のpromptは途中成果を確認して続きから完了するよう指示する', () => {
     const store = makeStore()
     store.enqueue(input())
@@ -590,7 +667,11 @@ console.log(JSON.stringify({ result: 'fixture completed' }))
         expect(capture.args).toContain(pattern)
       }
       expect(capture.args).toContain('--append-system-prompt')
-      expect(capture.args).toContain(WORKER_SLACK_BAN_PROMPT)
+      // 起動引数に載っていることが「worker が /dev を実行する」唯一の担保。
+      // ここが落ちると worker は自前の 7 手順に戻る（実測で 18 job 連続そうなっていた）。
+      const appended = capture.args[capture.args.indexOf('--append-system-prompt') + 1]!
+      expect(appended).toContain(WORKER_DEV_SKILL_PROMPT)
+      expect(appended).toContain(WORKER_SLACK_BAN_PROMPT)
     } finally {
       if (previousCapture === undefined) delete process.env.CAPTURE_FILE
       else process.env.CAPTURE_FILE = previousCapture

@@ -452,6 +452,93 @@ export const WORKER_SLACK_BAN_PROMPT = [
   'your report.',
 ].join('\n')
 
+/**
+ * worker に `/dev`（設計→影響レビュー→実装→レビュー往復→検証→報告のフルサイクル）を
+ * 必須化する system prompt 断片。
+ *
+ * `zerokun-queue-policy.md` は「`/dev` や多人数検証を実行するのは queue から取り出された
+ * 独立 job worker 側である」と定義しているが、その worker には `/dev` を起動する指示が
+ * どこにも無かった。worker プロンプトは "If the project provides a development workflow
+ * or skill, use it." と曖昧に触れるだけで、直後に自前の 7 手順を並べていたため、worker は
+ * 常に 7 手順の方を実行していた。実測: job-logs 18 件中 `Skill` 呼び出し 0 件（2026-08-20）。
+ * つまり方針は書かれていたのに配線されていなかった。
+ *
+ * ban と同じ理由でユーザープロンプト側には置かない。`job.task`（Slack から来る外部入力）と
+ * 同じ枠に置くと「今回は軽いから /dev 無しでいい」で上書きされうる。
+ *
+ * 縮小の逃げ道は作らない。「今回は簡単だから」の自己判定は、判定コストの安い方＝手を抜く
+ * 方へ必ず倒れる（旧文面「開発フローやスキルがあれば使え」が 18 job 連続で無視された実測が
+ * その反例）。オーナールールの tier S/M による省略も、この worker には適用しない
+ * （オーナールール自身が「スキルが /dev を必須化している場合はスキル定義が優先」と定めている）。
+ * 無人実行なので gate では止まらせない。
+ */
+export const WORKER_DEV_SKILL_PROMPT = [
+  'Design and implementation go through the /dev skill. Before you plan, edit, or write',
+  'code for a request that changes behavior, invoke the `dev` skill (Skill tool, skill:',
+  '"dev") and follow its phases. Do not hand-roll a lighter procedure instead: the',
+  'numbered requirements in the request are the minimum /dev has to satisfy, not an',
+  'alternative to running it.',
+  '',
+  'Run the full /dev cycle every time. You do not get to decide that a job is small enough',
+  'to skip a phase, shrink a fan-out, or cut a review round, and the tier S/M shortcuts in',
+  'the owner rules do not apply here — those rules defer to a skill that mandates /dev, and',
+  'this one does. "It is a one-line change" is not a reason; run /dev anyway.',
+  '',
+  'You run unattended: nobody can answer a gate. Auto-pass every /dev gate the rules allow',
+  'to auto-pass and never wait for input. If a step is physically impossible here (GUI',
+  'permission, USB token, missing account), finish everything else, call that step 未検証 in',
+  'your report with what you tried, and reserve "BLOCKED:" for when nothing verifiable is',
+  'left. Never present an unverified step as verified.',
+  '',
+  'State the route you took in your final report: `/dev` — or `fallback` plus the reason if',
+  'the skill is not installed on this machine.',
+].join('\n')
+
+/**
+ * worker の system prompt に載せるオーナー共通ルールのパス。
+ *
+ * bridge（`claude-channel.sh` の重厚モード）はこのルールを
+ * `--append-system-prompt-file` で読み込むのに、実際に設計・実装を行う worker には
+ * 渡していなかった。`/dev` は「タスク規模 tier」「多人数検証のモデル構成」など
+ * このルール側の規定を参照するので、worker に届かないと参照先が空になる。
+ *
+ * bridge が使う triage / queue policy は worker には渡さない。あれはスレッド担当向けの
+ * 指示（`enqueue_job` しろ）なので、worker が読むと自分自身を queue に入れかねない。
+ */
+export function workerRulesPath(): string {
+  return (
+    process.env.ZEROKUN_WORKER_RULES_FILE ??
+    join(stateDir(), 'owner', 'claude-config', 'CLAUDE.md')
+  )
+}
+
+/**
+ * worker へ `--append-system-prompt` で渡す文面を組み立てる。
+ *
+ * 順序は「オーナールール → /dev 必須化 → Slack 投稿禁止」。禁止を最後に置くのは、
+ * 前段の汎用ルールに報告手段の記述があっても不変条件（worker は Slack に投稿しない）が
+ * 最後の言葉として残るようにするため。
+ *
+ * ルールファイルが無いマシン（配布先の別 Mac 等）では黙ってその段を落とす＝fail-open。
+ * ここで落とすのは参考情報であり、`/dev` 必須化と Slack 禁止は常に載る。
+ */
+export function buildWorkerSystemPrompt(options: { rulesPath?: string } = {}): string {
+  const rulesPath = options.rulesPath ?? workerRulesPath()
+  const sections: string[] = []
+  let ownerRules = ''
+  try {
+    ownerRules = readFileSync(rulesPath, 'utf8').trim()
+  } catch {
+    ownerRules = ''
+  }
+  if (ownerRules) {
+    sections.push(`# オーナー共通ルール（${rulesPath}）\n\n${ownerRules}`)
+  }
+  sections.push(WORKER_DEV_SKILL_PROMPT)
+  sections.push(WORKER_SLACK_BAN_PROMPT)
+  return sections.join('\n\n---\n\n')
+}
+
 export function buildWorkerPrompt(job: JobRecord): string {
   const resumeNotice = job.attempts > 1
     ? `前回の実行は途中で中断された。まず git branch / worktree / 途中成果を確認し、\n最初からやり直すのではなく続きから完了させること。\n\n`
@@ -463,7 +550,8 @@ Slack thread: ${job.chatId} / ${job.threadTs}
 Project root: ${job.repoPath}
 
 First read AGENTS.md and CLAUDE.md from the project root and follow every referenced
-repository rule. If the project provides a development workflow or skill, use it.
+repository rule. Then run the /dev skill as required by the system rules — the numbered
+requirements below are what /dev has to satisfy for this job, not a substitute for it.
 The Slack request authorizes implementation, tests, commit, push, and PR creation.
 Ask only when a missing human decision, GUI permission, physical action, or account
 input makes further progress impossible.
@@ -855,6 +943,7 @@ export async function executeClaudeJob(
   )
   const logDir = options.logDir ?? join(dirname(defaultDbPath()), 'job-logs')
   mkdirSync(logDir, { recursive: true, mode: 0o700 })
+  const systemPrompt = buildWorkerSystemPrompt()
 
   const runAttempt = async (sessionId: string, resumed: boolean) => {
     const args = [
@@ -865,7 +954,7 @@ export async function executeClaudeJob(
       '--verbose',
       '--setting-sources', 'user,project,local',
       '--disallowed-tools', ...WORKER_DENIED_TOOL_PATTERNS,
-      '--append-system-prompt', WORKER_SLACK_BAN_PROMPT,
+      '--append-system-prompt', systemPrompt,
       ...(resumed ? ['--resume', sessionId] : ['--session-id', sessionId]),
       '-p',
       buildWorkerPrompt(job),
