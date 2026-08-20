@@ -56,6 +56,144 @@ describe('macOS bootstrap', () => {
     }
   })
 
+  // 退避先の後始末が速いので「実行後にHOMEが空か」だけでは、HOME配下に作って
+  // すぐ消す実装を見逃す。CODEX_HOMEの実際の行き先を偽codexに報告させて捕まえる。
+  const codexHomeProbe = (report: string) =>
+    [
+      '#!/bin/sh',
+      `printf '%s\\n' "\${CODEX_HOME:-unset}" > '${report}'`,
+      `if [ -d "\${CODEX_HOME:-/nonexistent}" ]; then printf 'dir=yes\\n' >> '${report}'; fi`,
+      'echo "codex-cli 0.0.0-test"',
+      '',
+    ].join('\n')
+
+  test('--doctor keeps its scratch outside HOME even when TMPDIR points inside HOME', () => {
+    if (process.platform !== 'darwin') return
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-tmpdir-'))
+    const insideHome = join(fakeHome, '.tmp')
+    mkdirSync(insideHome)
+    const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-tmpdirbin-'))
+    const report = join(fakeBin, 'report.txt')
+    try {
+      writeFileSync(join(fakeBin, 'codex'), codexHomeProbe(report), { mode: 0o755 })
+      const result = Bun.spawnSync([bootstrap, '--doctor'], {
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          TMPDIR: insideHome,
+          PATH: `${fakeBin}:${process.env.PATH}`,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(0)
+      const seen = readFileSync(report, 'utf8').trim().split('\n')
+      // TMPDIRがHOME配下を指していても、退避先はHOMEの外へ逃がす。
+      expect(seen[0].startsWith(fakeHome)).toBe(false)
+      expect(seen).toContain('dir=yes')
+      // HOME配下に存在してよいのは、このテストが用意した .tmp だけ。
+      const entries = Bun.spawnSync(['/usr/bin/find', fakeHome, '-mindepth', '1'])
+        .stdout.toString()
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+      expect(entries).toEqual([insideHome])
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeBin, { recursive: true, force: true })
+    }
+  })
+
+  test('--doctor still reports every tool when TMPDIR is unusable', () => {
+    if (process.platform !== 'darwin') return
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-fallback-'))
+    try {
+      const result = Bun.spawnSync([bootstrap, '--doctor'], {
+        env: { ...process.env, HOME: fakeHome, TMPDIR: '/nonexistent/zerokun-doctor' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout.toString()).toContain('Codex CLI:')
+      expect(Bun.spawnSync(['/bin/ls', '-A', fakeHome]).stdout.toString()).toBe('')
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('--doctor removes the scratch directory it used', () => {
+    if (process.platform !== 'darwin') return
+    const scratchParent = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-scratch-'))
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-home-'))
+    try {
+      const result = Bun.spawnSync([bootstrap, '--doctor'], {
+        env: { ...process.env, HOME: fakeHome, TMPDIR: scratchParent },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(0)
+      expect(Bun.spawnSync(['/bin/ls', '-A', scratchParent]).stdout.toString()).toBe('')
+    } finally {
+      rmSync(scratchParent, { recursive: true, force: true })
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('--doctor hands codex a real scratch CODEX_HOME outside HOME', () => {
+    if (process.platform !== 'darwin') return
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-codexhome-'))
+    const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-codexbin-'))
+    const report = join(fakeBin, 'report.txt')
+    try {
+      writeFileSync(join(fakeBin, 'codex'), codexHomeProbe(report), { mode: 0o755 })
+      const result = Bun.spawnSync([bootstrap, '--doctor'], {
+        env: { ...process.env, HOME: fakeHome, PATH: `${fakeBin}:${process.env.PATH}` },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(0)
+      const seen = readFileSync(report, 'utf8').trim().split('\n')
+      // 実在するディレクトリを渡す。存在しないパスだとcodex側の寛容さ頼みになる。
+      expect(seen).toContain('dir=yes')
+      expect(seen[0].startsWith(fakeHome)).toBe(false)
+      expect(Bun.spawnSync(['/bin/ls', '-A', fakeHome]).stdout.toString()).toBe('')
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeBin, { recursive: true, force: true })
+    }
+  })
+
+  test('--doctor treats a failing version command as a problem', () => {
+    if (process.platform !== 'darwin') return
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-broken-'))
+    const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-brokenbin-'))
+    try {
+      writeFileSync(join(fakeBin, 'claude'), '#!/bin/sh\necho "boom" >&2\nexit 3\n', { mode: 0o755 })
+      const result = Bun.spawnSync([bootstrap, '--doctor'], {
+        env: { ...process.env, HOME: fakeHome, PATH: `${fakeBin}:${process.env.PATH}` },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(1)
+      expect(result.stdout.toString()).toContain('実行失敗')
+      expect(Bun.spawnSync(['/bin/ls', '-A', fakeHome]).stdout.toString()).toBe('')
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeBin, { recursive: true, force: true })
+    }
+  })
+
+  test('--doctor refuses to be combined with --slack-only', () => {
+    for (const args of [
+      ['--doctor', '--slack-only'],
+      ['--slack-only', '--doctor'],
+    ]) {
+      const result = Bun.spawnSync([bootstrap, ...args], { stdout: 'pipe', stderr: 'pipe' })
+      expect(result.exitCode).toBe(2)
+      expect(result.stderr.toString()).toContain('同時に指定できません')
+    }
+  })
+
   test('bootstrap owns dependency installation, login, clone, setup and Slack handoff', () => {
     const script = readFileSync(bootstrap, 'utf8')
     expect(script).toContain('xcode-select --install')

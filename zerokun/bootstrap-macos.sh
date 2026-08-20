@@ -47,11 +47,23 @@ EOF
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --doctor) MODE="doctor" ;;
+    # 後勝ちでモードを上書きすると、--doctor --slack-only が「何も変更しない」と
+    # 言いながらHOMEへ書き込む。競合は受け付けずに使い方の誤りとして止める。
+    --doctor)
+      case "$MODE" in
+        install|doctor) MODE="doctor" ;;
+        *) echo "❌ --doctor と --slack-only は同時に指定できません" >&2; exit 2 ;;
+      esac
+      ;;
     --skip-logins) SKIP_LOGINS=1 ;;
     --skip-slack) SKIP_SLACK=1; WITH_SLACK=0 ;;
     --with-slack) WITH_SLACK=1 ;;
-    --slack-only) MODE="slack-only"; WITH_SLACK=1 ;;
+    --slack-only)
+      case "$MODE" in
+        install|slack-only) MODE="slack-only"; WITH_SLACK=1 ;;
+        *) echo "❌ --doctor と --slack-only は同時に指定できません" >&2; exit 2 ;;
+      esac
+      ;;
     --skip-projects) SKIP_PROJECTS=1 ;;
     --slack-app-name)
       [ "$#" -ge 2 ] || { echo "❌ --slack-app-nameには名前が必要です" >&2; exit 2; }
@@ -125,62 +137,76 @@ first_line() {
 # gh は $HOME/.local/state/gh/device-id を、codex は $CODEX_HOME/tmp/arg0 を作る。
 # --doctor は「何も変更しない」と約束しているので、副作用は呼び出し側で止める。
 DOCTOR_TMP=""
+DOCTOR_TMP_UNAVAILABLE=0
 
 cleanup_doctor_tmp() {
   [ -n "$DOCTOR_TMP" ] || return 0
-  # 後始末の失敗で診断の終了値を書き換えない。
-  /bin/rm -rf "$DOCTOR_TMP" || true
+  local path="$DOCTOR_TMP"
+  # 先に手放してから消す。二重に呼ばれても同じ場所を二度消しにいかない。
   DOCTOR_TMP=""
+  # 後始末の失敗で診断の終了値は書き換えないが、黙って残すこともしない。
+  /bin/rm -rf "$path" 2>/dev/null \
+    || warn "診断用の一時領域を削除できませんでした: $path"
+  return 0
 }
 
-# EXITだけでは、bashの版とシグナルの位相によって後始末が走らないことがある。
-# INT/TERM/HUPは明示的に受けて、片付けてから既定の動作で落とし直す。
-on_doctor_signal() {
-  local signal="$1"
+# 後始末はEXIT trapだけで足りる。bash 3.2では未捕捉のINT/TERM/HUPでもEXIT trapは走る。
+# 逆にINT/TERM/HUPを捕捉すると、bashは同期実行中の子の終了までハンドラを遅らせるため、
+# バージョン取得がhangしたときに外から止められなくなる
+# （実測: 子が10秒hangすると、TERMでの停止も10秒待たされる。捕捉しなければ即時）。
+finish_doctor_tmp() {
   cleanup_doctor_tmp
-  trap - "$signal" EXIT
-  kill -"$signal" "$$"
+  trap - EXIT
 }
 
-# 退避先はHOMEの外にだけ作る。TMPDIRがHOME配下・不在・書込み不可なら/tmpへ落とす。
-# TMPDIRをそのまま信用すると、TMPDIRがHOME配下のときに診断がHOMEを書き換える。
-doctor_tmp_base() {
-  local candidate resolved home_resolved
+# 実パスを解決する。CDPATHがexportされていると cd は移動先も標準出力へ書くため、
+# 相対パスのTMPDIRで戻り値が2行になる。サブシェルの中でCDPATHを外して捨てる。
+resolve_dir() {
+  ( CDPATH='' cd -- "$1" >/dev/null 2>&1 && pwd -P ) 2>/dev/null
+}
+
+# 退避先はHOMEの外にだけ作る。TMPDIRをそのまま信じると、TMPDIRがHOME配下のときに
+# 診断がHOMEを書き換えてしまう。候補は順に試し、実際に作れたものを採用する。
+ensure_doctor_tmp() {
+  [ -z "$DOCTOR_TMP" ] || return 0
+  local candidate resolved home_resolved created
   home_resolved=""
   if [ -n "${HOME:-}" ]; then
-    home_resolved="$(cd "$HOME" 2>/dev/null && pwd -P)" || home_resolved=""
+    home_resolved="$(resolve_dir "$HOME")" || home_resolved=""
+    # HOMEが / なら「HOMEの外」はどこにも無い。退避先は作らない。
+    if [ "$home_resolved" = "/" ]; then
+      DOCTOR_TMP_UNAVAILABLE=1
+      return 1
+    fi
   fi
   for candidate in "${TMPDIR:-}" /tmp; do
     [ -n "$candidate" ] || continue
     [ -d "$candidate" ] && [ -w "$candidate" ] || continue
-    resolved="$(cd "$candidate" 2>/dev/null && pwd -P)" || continue
+    # 自分の持ち物か、/tmpのようなstickyな場所だけを使う。他人も書ける非stickyな
+    # ディレクトリでは、mktempが作った直後に同名のsymlinkへ差し替えられる余地がある。
+    [ -O "$candidate" ] || [ -k "$candidate" ] || continue
+    resolved="$(resolve_dir "$candidate")" || continue
     [ -n "$resolved" ] || continue
     if [ -n "$home_resolved" ]; then
       case "$resolved/" in
         "$home_resolved"/*) continue ;;
       esac
     fi
-    printf '%s' "$resolved"
-    return 0
+    # 判定を通っても、quota・inode枯渇・直前の権限変更で実際の作成は失敗しうる。
+    # そのときは黙って諦めず、次の候補へ落とす。
+    created="$(/usr/bin/mktemp -d "$resolved/zerokun-doctor.XXXXXX" 2>/dev/null)" || continue
+    trap cleanup_doctor_tmp EXIT
+    DOCTOR_TMP="$created"
+    # CODEX_HOMEには実在するディレクトリを渡す。存在しないパスを渡すと
+    # 「作れないが続行する」というcodex側の未仕様の寛容さに寄りかかることになり、
+    # そこが厳格化された版では診断が落ちて自己更新が止まる。
+    if /bin/mkdir -p "$DOCTOR_TMP/codex" 2>/dev/null; then
+      return 0
+    fi
+    cleanup_doctor_tmp
   done
+  DOCTOR_TMP_UNAVAILABLE=1
   return 1
-}
-
-ensure_doctor_tmp() {
-  [ -z "$DOCTOR_TMP" ] || return 0
-  local base
-  base="$(doctor_tmp_base)" || return 1
-  # mktempより先にtrapを張る。DOCTOR_TMPが空の間は後始末が何もしないので、
-  # 生成直後にシグナルを受けても取りこぼす窓を最小にできる。
-  trap cleanup_doctor_tmp EXIT
-  trap 'on_doctor_signal INT' INT
-  trap 'on_doctor_signal TERM' TERM
-  trap 'on_doctor_signal HUP' HUP
-  DOCTOR_TMP="$(/usr/bin/mktemp -d "$base/zerokun-doctor.XXXXXX")" || return 1
-  # CODEX_HOMEには実在するディレクトリを渡す。存在しないパスを渡すと
-  # 「作れないが続行する」というcodex側の未仕様の寛容さに寄りかかることになり、
-  # そこが厳格化された版では診断が落ちて自己更新が止まる。
-  /bin/mkdir -p "$DOCTOR_TMP/codex" || return 1
 }
 
 doctor_item() {
@@ -237,8 +263,11 @@ doctor_item() {
   printf '   %-20s %s\n' "$label:" "$version"
 }
 
+# 戻り値: 0=問題なし / 1=CLIに問題あり / 2=退避先を作れずCodexだけ未診断
 run_doctor() {
   local missing=0
+  local tmp_skipped=0
+  DOCTOR_TMP_UNAVAILABLE=0
   section "セットアップ診断（変更は行いません）"
   if clt_ready; then
     printf '   %-20s %s\n' 'Command Line Tools:' "$(clt_version)"
@@ -252,10 +281,18 @@ run_doctor() {
   doctor_item 'tmux' tmux -V || missing=1
   doctor_item 'Bun' bun --version || missing=1
   doctor_item 'Claude Code' claude --version || missing=1
-  doctor_item 'Codex CLI' codex --version || missing=1
-  # 診断が終わった時点で退避先を消す。EXITまで持ち越さない。
-  cleanup_doctor_tmp
+  if ! doctor_item 'Codex CLI' codex --version; then
+    # 退避先を作れずに見送っただけなら、CLI自体の異常とは区別する。
+    if [ "$DOCTOR_TMP_UNAVAILABLE" = "1" ]; then
+      tmp_skipped=1
+    else
+      missing=1
+    fi
+  fi
+  # 診断が終わった時点で退避先を消し、trapも外す。後続の処理へ持ち越さない。
+  finish_doctor_tmp
   [ "$missing" = "0" ] || return 1
+  [ "$tmp_skipped" = "0" ] || return 2
   return 0
 }
 
@@ -637,10 +674,13 @@ EOF
 }
 
 main() {
+  local doctor_status=0
   require_macos
   if [ "$MODE" = "doctor" ]; then
-    run_doctor
-    return
+    run_doctor || doctor_status=$?
+    # 退避先を作れず見送った場合も診断としては未完なので、非0で返す。
+    [ "$doctor_status" = "0" ] || return 1
+    return 0
   fi
   if [ "$MODE" = "slack-only" ]; then
     echo "== ゼロくん Slack設定だけ再開 =="
@@ -667,9 +707,14 @@ main() {
   run_project_bootstrap
 
   section "基本セットアップ完了"
-  # 締めの診断は要約表示なので、ここで落ちると導入完了後の案内とSlack設定が飛ぶ。
-  # 診断の厳格さは --doctor 単独実行のほうで担保する。
-  run_doctor || warn "診断で未確認の項目があります。後から --doctor で確認してください"
+  # 締めの診断は要約表示なので、ここで即座に落ちると案内とSlack設定が飛ぶ。
+  # 案内は最後まで出しきり、CLIの異常が残っていたときだけ最後に非0で終える。
+  run_doctor || doctor_status=$?
+  case "$doctor_status" in
+    0) ;;
+    2) warn "一時領域を確保できずCodex CLIだけ未診断です。導入自体は完了しています" ;;
+    *) warn "セットアップ診断で問題を検出しました。下の案内のあとに再確認してください" ;;
+  esac
   echo "   Claude Codeを利用できます:"
   echo "   cd \"$PROJECT_DIR\" && claude"
   echo "   Codex CLIを利用できます:"
@@ -683,6 +728,11 @@ main() {
     echo "   後からSlack設定だけ行う:"
     echo "   bash \"$REPO_DIR/zerokun/bootstrap-macos.sh\" --slack-only"
   fi
+  # 「利用できます」と案内した以上、実際に使えない状態を成功で終わらせない。
+  case "$doctor_status" in
+    0|2) ;;
+    *) fail "セットアップ診断の問題が残っています: bash \"$REPO_DIR/zerokun/bootstrap-macos.sh\" --doctor で確認してください" ;;
+  esac
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
