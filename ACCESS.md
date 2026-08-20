@@ -36,6 +36,18 @@ Only users whose Slack IDs appear in `allowFrom` can reach Claude via DM. All ot
 /slack:access policy allowlist
 ```
 
+Here and everywhere else DMs are gated, `allowFrom` means the **effective** list — see [Channel opt-in is DM opt-in](#channel-opt-in-is-dm-opt-in).
+
+### Channel opt-in is DM opt-in
+
+There is one trust set, not two. Anyone named on **any** opted-in channel's `allowFrom` may also DM the bot, on top of the global `allowFrom`. Adding a teammate to a channel is all it takes; there is no second list to keep in sync.
+
+This matters beyond DMs: permission prompts are delivered by DM, so a user who could drive Claude in a channel but was absent from the global list would silently never be asked to approve a tool.
+
+Only user IDs (`U…`, or `W…` on Enterprise Grid) are carried over. A channel's `allowFrom` doubles as its bot opt-in list, and bot IDs never reach the DM surface.
+
+`dmPolicy` still outranks the list: `disabled` turns DMs off for everyone, and under `pairing` the list is who skips pairing rather than who is allowed at all.
+
 ### `disabled`
 
 All DMs are silently dropped. Useful if you only want channel interactions.
@@ -102,6 +114,8 @@ For bot users (Slack bot IDs, `B…`), the list is **default-deny**: bots are dr
 
 Bot DMs are always dropped regardless of allowlist contents.
 
+Listing a human here also grants them DM access — see [Channel opt-in is DM opt-in](#channel-opt-in-is-dm-opt-in). An empty list grants DM access to nobody: it authorizes the channel's members to @mention the bot *there*, which is not the same as naming them.
+
 ---
 
 ## Delivery Config
@@ -164,10 +178,10 @@ How to split long messages:
 | Field | Type | Description |
 |---|---|---|
 | `dmPolicy` | `"pairing" \| "allowlist" \| "disabled"` | DM gating mode |
-| `allowFrom` | `string[]` | Slack user IDs approved for DMs |
+| `allowFrom` | `string[]` | Slack user IDs approved for DMs, *in addition to* everyone named on a channel's `allowFrom` |
 | `channels` | `Record<string, ChannelPolicy>` | Per-channel policies (keyed by channel ID) |
 | `channels[id].requireMention` | `boolean` | Require @mention to trigger Claude |
-| `channels[id].allowFrom` | `string[]` | Restrict channel to specific users (`U…`, empty = all humans). Bots (`B…`) are always default-deny: include a bot id here to opt it in. |
+| `channels[id].allowFrom` | `string[]` | Restrict channel to specific users (`U…`, empty = all humans). Listed humans also gain DM access. Bots (`B…`) are always default-deny: include a bot id here to opt it in, but bot ids never gain DM access. |
 | `pending` | `Record<string, PendingEntry>` | Active pairing codes (managed automatically) |
 | `ackReaction` | `string?` | Emoji for inbound acknowledgment |
 | `doneReaction` | `string?` | Emoji for completion (reserved) |
@@ -207,4 +221,4 @@ All access management goes through the `/slack:access` skill in Claude Code.
 
 **`assertSendable` path guard.** The `reply` tool refuses to upload files from inside `~/.claude/channels/slack/` unless they are in the `inbox/` subdirectory. This prevents Claude from being tricked into exfiltrating state files (tokens, access policy) as Slack attachments.
 
-**Permission relay is allowlist-scoped.** When Claude Code requests a tool permission, the plugin sends the permission prompt only to users listed in `allowFrom` — not to everyone in a channel, and not to unpaired users. Button responses (Allow/Deny) are validated against the same allowlist before being honored.
+**Permission relay is allowlist-scoped.** When Claude Code requests a tool permission, the plugin sends the permission prompt only to users on the effective DM allowlist — the global `allowFrom` plus every opted-in channel's named humans. It does not go to everyone in a channel (an `allowFrom: []` channel names nobody), to unpaired users, or to bots. Button responses (Allow/Deny) are validated against the same list before being honored.

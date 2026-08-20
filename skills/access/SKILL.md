@@ -49,11 +49,15 @@ Arguments passed: `$ARGUMENTS`
 
 Fields:
 - `dmPolicy`: `"pairing"` | `"allowlist"` | `"disabled"` — controls who may send DMs
-- `allowFrom`: array of Slack user IDs (`U...`) approved for DM access
+- `allowFrom`: array of Slack user IDs (`U...`) approved for DM access, **in addition to**
+  everyone named on a channel's `allowFrom`. Channel opt-in is DM opt-in: the two lists are
+  unioned (user ids only — bot ids never gain DM access), so a user allowed in any channel can
+  DM the bot and receives permission prompts without being repeated here.
 - `channels`: map of channel IDs (`C...` or `G...`) to per-channel settings
   - `requireMention`: if true, bot only responds when mentioned
   - `allowFrom`: channel-level allowlist. Accepts both Slack user ids (`U...`) and bot ids (`B...`).
-    - Humans: empty = any sender allowed; populated = only listed humans.
+    - Humans: empty = any sender allowed; populated = only listed humans. Listed humans also
+      gain DM access; an empty list names nobody and so grants no DM access.
     - Bots: **default-deny**. A bot is blocked unless its bot id is explicitly listed (empty
       `allowFrom` blocks all bots; populated `allowFrom` blocks any bot whose id isn't in it).
 - `pending`: map of pairing codes to pending requests (set by the server, cleared here)
@@ -121,6 +125,10 @@ Slack user IDs start with `U`. Validate the format before proceeding.
 2. Filter `<userId>` out of `allowFrom`
 3. Write `access.json` (pretty-print)
 4. Confirm: "<userId> removed from allowFrom." (or "Not found in allowFrom." if absent)
+5. Then check every `channels[*].allowFrom` for the same id. If it still appears in any of them,
+   say so and name those channels: channel opt-in is DM opt-in, so the user keeps DM access
+   until they are removed there too (`channel deny <channel-id> <user-id>`). Removing them from
+   the DM list alone has revoked nothing.
 
 ---
 

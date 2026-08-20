@@ -50,6 +50,46 @@ export function isBotDMBlocked(channelType: 'im' | 'channel', isBot: boolean): b
   return isBot && channelType === 'im'
 }
 
+// Slack user ids are "U…", or "W…" on Enterprise Grid. Bot ids are "B…".
+const SLACK_USER_ID_RE = /^[UW][A-Z0-9]+$/
+
+/**
+ * Who may reach the bot through a DM.
+ *
+ * Channel opt-in IS DM opt-in: the global `allowFrom` and every channel's
+ * `allowFrom` are one list. Keeping them separate only created bookkeeping —
+ * somebody added to a channel would be dropped in DMs, and would silently never
+ * receive a permission prompt, because those are delivered by DM. There is no
+ * threat the split defended against: a user trusted to drive the bot from an
+ * opted-in channel can already say the same thing there.
+ *
+ * Only user ids survive the union. A channel's `allowFrom` doubles as its bot
+ * opt-in list ("B…"), and a bot must never reach the DM surface — `gate()`
+ * stops bot DMs via isBotDMBlocked, but the permission-relay recipients and the
+ * permission button check read this list directly and have no such guard.
+ *
+ * `dmPolicy` still outranks this list: 'disabled' turns DMs off wholesale
+ * before it is consulted, and under 'pairing' it is the set that skips pairing
+ * rather than the set that is allowed at all.
+ */
+export function effectiveDmAllowFrom(access: {
+  allowFrom?: string[]
+  channels?: Record<string, ChannelPolicy | undefined>
+}): string[] {
+  // Insertion order keeps the global list first, so the permission relay still
+  // DMs the long-standing operators before anyone gained via a channel.
+  const allowed = new Set<string>()
+  for (const id of access.allowFrom ?? []) {
+    if (SLACK_USER_ID_RE.test(id)) allowed.add(id)
+  }
+  for (const policy of Object.values(access.channels ?? {})) {
+    for (const id of policy?.allowFrom ?? []) {
+      if (SLACK_USER_ID_RE.test(id)) allowed.add(id)
+    }
+  }
+  return [...allowed]
+}
+
 // ── Thread catch-up poller helpers ───────────────────────────────────────────
 //
 // The bridge only receives an inbound event for a channel message when the
