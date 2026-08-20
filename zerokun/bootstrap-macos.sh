@@ -79,7 +79,13 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# 導入経路は、これから配置する場所を先にPATHへ足しておく必要がある。
+# 診断(--doctor)は「呼び出し元の環境でそのまま使えるか」を答えるものなので、
+# 渡されたPATHをそのまま評価する。ここで足し戻すと、PATHから届かないCLIまで
+# 「導入済み」と報告してしまう。
+if [ "$MODE" != "doctor" ]; then
+  export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+fi
 
 section() { printf '\n▶ %s\n' "$1"; }
 ok() { printf '   ✅ %s\n' "$1"; }
@@ -115,20 +121,68 @@ first_line() {
   "$@" 2>&1 | /usr/bin/head -n 1
 }
 
+# バージョンを聞くだけでもCLIはHOME配下を書き換えることがある。
+# gh は $HOME/.local/state/gh/device-id を、codex は $CODEX_HOME/tmp/arg0 を作る。
+# --doctor は「何も変更しない」と約束しているので、副作用は呼び出し側で止める。
+DOCTOR_TMP=""
+
+cleanup_doctor_tmp() {
+  [ -n "$DOCTOR_TMP" ] || return 0
+  /bin/rm -rf "$DOCTOR_TMP"
+  DOCTOR_TMP=""
+}
+
+ensure_doctor_tmp() {
+  [ -z "$DOCTOR_TMP" ] || return 0
+  # 診断はTMPDIRの無い最小環境からも呼ばれる。HOME配下には絶対に作らない。
+  DOCTOR_TMP="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/zerokun-doctor.XXXXXX")"
+  trap cleanup_doctor_tmp EXIT
+}
+
 doctor_item() {
   local label="$1"
   local command_name="$2"
   shift 2
-  if command -v "$command_name" >/dev/null 2>&1; then
-    printf '   %-20s %s\n' "$label:" "$(first_line "$command_name" "$@")"
-  else
+  local version
+  local status=0
+
+  if ! command -v "$command_name" >/dev/null 2>&1; then
     printf '   %-20s %s\n' "$label:" '未導入'
     return 1
   fi
+
+  # 下の環境変数はバージョン取得だけに効かせる。認証状態を見る診断には流用しないこと
+  # （実環境ではなく退避先を診断してしまう）。
+  case "$command_name" in
+    gh)
+      version="$(GH_TELEMETRY=false GH_NO_UPDATE_NOTIFIER=1 "$command_name" "$@" 2>/dev/null)" || status=$?
+      ;;
+    codex)
+      ensure_doctor_tmp
+      version="$(CODEX_HOME="$DOCTOR_TMP/codex" "$command_name" "$@" 2>/dev/null)" || status=$?
+      ;;
+    *)
+      version="$("$command_name" "$@" 2>/dev/null)" || status=$?
+      ;;
+  esac
+
+  # 以前はstderrを混ぜて先頭行を表示していたため、バージョン取得自体が失敗しても
+  # 警告文をバージョンとして表示し、診断は成功扱いになっていた。
+  if [ "$status" != "0" ]; then
+    printf '   %-20s %s\n' "$label:" '実行失敗'
+    return 1
+  fi
+  version="${version%%$'\n'*}"
+  if [ -z "$version" ]; then
+    printf '   %-20s %s\n' "$label:" 'バージョン不明'
+    return 1
+  fi
+  printf '   %-20s %s\n' "$label:" "$version"
 }
 
 run_doctor() {
   local missing=0
+  ensure_doctor_tmp
   section "セットアップ診断（変更は行いません）"
   if clt_ready; then
     printf '   %-20s %s\n' 'Command Line Tools:' "$(clt_version)"
