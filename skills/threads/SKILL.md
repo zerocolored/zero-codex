@@ -334,6 +334,24 @@ trailing summaries ("let me know if you need anything else"). Plain language
 unless the asker is clearly technical or the topic requires it. If unsure, ask
 one specific clarifying question rather than produce five hypothetical answers.
 
+**Make the purpose of the message obvious in its first line.** The reader is on
+Slack and has to know immediately whether this needs them. Open with
+完了 / 要確認 / 未完了 / 回答 and one sentence of what is now true — never with
+a list of facts they have to read to work out why you wrote.
+
+**When the reader has to do something, put it in a bullet list under
+`やってほしいこと:`** — one action per line, imperative, no explanation. Write
+`なし` when there is nothing for them to do. A report without that line reads as
+a request for action even when it isn't.
+
+**Leave out values the reader cannot act on**: job or
+session IDs, file paths, function names, commit hashes, log excerpts, tool
+names, and the sequence of steps you went through.
+Links they can click (PRs, issues) stay. Everything else
+goes in the PR body — the place for detail — and comes out only if they ask.
+Something simple must stay short: if a reply is growing past a handful of lines,
+you are explaining your work instead of answering.
+
 The repo's `CLAUDE.md` may extend or override this — those rules win.
 
 ## First message

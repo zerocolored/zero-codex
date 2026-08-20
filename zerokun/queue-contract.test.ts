@@ -105,4 +105,21 @@ describe('Zero-kun queue wiring', () => {
     // スレッド担当の即答に置き換わる。
     expect(queuePolicy).toContain('設計・仕様決定')
   })
+
+  test('Slack へ出る文面は、目的が1行目で分かり、依頼は箇条書きになる', () => {
+    const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
+    const skill = readFileSync(join(root, 'skills/threads/SKILL.md'), 'utf8')
+
+    // worker 報告もスレッド担当の返信も、読み手にとっては同じ「ゼロくんの発言」。
+    // 片方だけ直しても体験は揃わないので両方で固定する。
+    for (const text of [runner, skill]) {
+      // 1行目で「これは自分の操作が要る話か」が分かること。
+      expect(text).toContain('完了 / 要確認')
+      // 依頼は箇条書き。無いなら「なし」と書かせる（無言だと依頼と読まれる）。
+      expect(text).toContain('やってほしいこと')
+      expect(text).toContain('なし')
+      // 読み手が動かせない内部値を並べない。詳細は PR 本文へ。
+      expect(text).toMatch(/session IDs, file paths, function names, commit hashes/)
+    }
+  })
 })

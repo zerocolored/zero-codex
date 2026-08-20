@@ -565,9 +565,22 @@ For any code, settings, or documentation change:
 6. Review the final diff for security, regressions, and unrelated changes.
 7. Commit, push, and complete PR 作成 against the required base branch. Do not merge it.
 
-Finish with a concise Japanese report containing findings, change, verification,
-and the PR title plus full URL. If no change is needed, report "PR: none" with evidence.
-If blocked, start the final response with "BLOCKED:" and state what was proven first.
+Finish with a Japanese report for a reader who did not watch you work and wants to know,
+in one glance, whether this needs them. Exactly this shape, nothing else:
+
+1. One sentence starting with 完了 / 要確認 / 未完了 that says what is now true.
+2. \`やってほしいこと:\` followed by a bullet list — one action per line, imperative, no
+   explanation. Write \`なし\` when the reader has nothing to do. This line is how they tell
+   your report apart from a status update, so never omit it.
+3. The PR URL in full if there is one, or \`PR: なし\`.
+
+Leave everything else out: job or session IDs, file paths, function names, commit hashes,
+log excerpts, tool names, and the step-by-step of what you did. The reader cannot act on
+those and they bury the point — that detail belongs in the PR body, which is where you
+should put it. Keep the report under 8 lines no matter how large the work was; needing
+more lines is a sign the material belongs in the PR, not the message.
+
+If blocked, start the final response with "BLOCKED:" and put what you proved first.
 
 Slack request:
 ${job.task}`
