@@ -47,11 +47,23 @@ EOF
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --doctor) MODE="doctor" ;;
+    # 後勝ちでモードを上書きすると、--doctor --slack-only が「何も変更しない」と
+    # 言いながらHOMEへ書き込む。競合は受け付けずに使い方の誤りとして止める。
+    --doctor)
+      case "$MODE" in
+        install|doctor) MODE="doctor" ;;
+        *) echo "❌ --doctor と --slack-only は同時に指定できません" >&2; exit 2 ;;
+      esac
+      ;;
     --skip-logins) SKIP_LOGINS=1 ;;
     --skip-slack) SKIP_SLACK=1; WITH_SLACK=0 ;;
     --with-slack) WITH_SLACK=1 ;;
-    --slack-only) MODE="slack-only"; WITH_SLACK=1 ;;
+    --slack-only)
+      case "$MODE" in
+        install|slack-only) MODE="slack-only"; WITH_SLACK=1 ;;
+        *) echo "❌ --doctor と --slack-only は同時に指定できません" >&2; exit 2 ;;
+      esac
+      ;;
     --skip-projects) SKIP_PROJECTS=1 ;;
     --slack-app-name)
       [ "$#" -ge 2 ] || { echo "❌ --slack-app-nameには名前が必要です" >&2; exit 2; }
@@ -79,7 +91,13 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# 導入経路は、これから配置する場所を先にPATHへ足しておく必要がある。
+# 診断(--doctor)は「呼び出し元の環境でそのまま使えるか」を答えるものなので、
+# 渡されたPATHをそのまま評価する。ここで足し戻すと、PATHから届かないCLIまで
+# 「導入済み」と報告してしまう。
+if [ "$MODE" != "doctor" ]; then
+  export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+fi
 
 section() { printf '\n▶ %s\n' "$1"; }
 ok() { printf '   ✅ %s\n' "$1"; }
@@ -115,20 +133,177 @@ first_line() {
   "$@" 2>&1 | /usr/bin/head -n 1
 }
 
+# バージョンを聞くだけでもCLIはHOME配下を書き換えることがある。
+# gh は $HOME/.local/state/gh/device-id を、codex は $CODEX_HOME/tmp/arg0 を作る。
+# --doctor は「何も変更しない」と約束しているので、副作用は呼び出し側で止める。
+DOCTOR_TMP=""
+DOCTOR_TMP_UNAVAILABLE=0
+
+cleanup_doctor_tmp() {
+  [ -n "$DOCTOR_TMP" ] || return 0
+  local path="$DOCTOR_TMP"
+  # 先に手放してから消す。二重に呼ばれても同じ場所を二度消しにいかない。
+  DOCTOR_TMP=""
+  # 後始末の失敗で診断の終了値は書き換えないが、黙って残すこともしない。
+  /bin/rm -rf "$path" 2>/dev/null \
+    || warn "診断用の一時領域を削除できませんでした: $path"
+  return 0
+}
+
+# 後始末はEXIT trapだけで足りる。bash 3.2では未捕捉のINT/TERM/HUPでもEXIT trapが走ることを
+# 実測で確認している。INT/TERM/HUPを捕捉しても後始末の効果は増えない。
+# 一方でbashは捕捉したシグナルのハンドラを同期実行中の子の終了まで遅らせるため、
+# 子を直接前景で走らせる形にすると停止が遅くなる
+# （実測: 子が10秒hangするとTERMでの停止も10秒待たされる。捕捉しなければ即時）。
+# 現在のバージョン取得はコマンド置換の中で走るので、いまはどちらでも停止性は変わらない。
+# 得るものが無く、書き方次第で損をするだけなので捕捉しない。
+finish_doctor_tmp() {
+  cleanup_doctor_tmp
+  trap - EXIT
+}
+
+# 実パスを解決する。CDPATHがexportされていると cd は移動先も標準出力へ書くため、
+# 相対パスのTMPDIRで戻り値が2行になる。サブシェルの中でCDPATHを外して捨てる。
+resolve_dir() {
+  ( CDPATH='' cd -- "$1" >/dev/null 2>&1 && pwd -P ) 2>/dev/null
+}
+
+# 退避先の親として信用できるのは次のどちらかだけ。
+#   - 自分の持ち物で、他人が書けない（または他人が書けてもstickyで守られている）
+#   - rootの持ち物で sticky（/private/tmp）
+# 他人が書ける非stickyな場所や、他人が所有する場所は使わない。mktempが作った直後に
+# エントリごと差し替えられる余地があり、stickyであっても親の所有者は他人のエントリを
+# 動かせるため。判定は必ず物理解決したパスに対して行う（/tmpはsymlink）。
+doctor_tmp_parent_is_trusted() {
+  local dir="$1"
+  local uid perm me shared
+  uid="$(/usr/bin/stat -f '%u' "$dir" 2>/dev/null)" || return 1
+  perm="$(/usr/bin/stat -f '%Sp' "$dir" 2>/dev/null)" || return 1
+  me="$(/usr/bin/id -u 2>/dev/null)" || return 1
+  [ "${#perm}" -ge 10 ] || return 1
+  # drwxrwxrwt の 5 番目がグループのw、8 番目がその他のw。
+  shared=0
+  case "${perm:5:1}${perm:8:1}" in
+    *w*) shared=1 ;;
+  esac
+  if [ "$uid" = "$me" ]; then
+    [ "$shared" = "0" ] || [ -k "$dir" ] || return 1
+    return 0
+  fi
+  if [ "$uid" = "0" ]; then
+    [ -k "$dir" ] || return 1
+    return 0
+  fi
+  return 1
+}
+
+# 退避先はHOMEの外にだけ作る。TMPDIRをそのまま信じると、TMPDIRがHOME配下のときに
+# 診断がHOMEを書き換えてしまう。候補は順に試し、実際に作れたものを採用する。
+ensure_doctor_tmp() {
+  [ -z "$DOCTOR_TMP" ] || return 0
+  local candidate resolved home_resolved created
+  home_resolved=""
+  if [ -n "${HOME:-}" ]; then
+    home_resolved="$(resolve_dir "$HOME")" || home_resolved=""
+    # HOMEが / なら「HOMEの外」はどこにも無い。退避先は作らない。
+    if [ "$home_resolved" = "/" ]; then
+      DOCTOR_TMP_UNAVAILABLE=1
+      return 1
+    fi
+  fi
+  for candidate in "${TMPDIR:-}" /tmp; do
+    [ -n "$candidate" ] || continue
+    [ -d "$candidate" ] && [ -w "$candidate" ] || continue
+    resolved="$(resolve_dir "$candidate")" || continue
+    [ -n "$resolved" ] || continue
+    doctor_tmp_parent_is_trusted "$resolved" || continue
+    if [ -n "$home_resolved" ]; then
+      case "$resolved/" in
+        "$home_resolved"/*) continue ;;
+      esac
+    fi
+    # 判定を通っても、quota・inode枯渇・直前の権限変更で実際の作成は失敗しうる。
+    # そのときは黙って諦めず、次の候補へ落とす。
+    created="$(/usr/bin/mktemp -d "$resolved/zerokun-doctor.XXXXXX" 2>/dev/null)" || continue
+    trap cleanup_doctor_tmp EXIT
+    DOCTOR_TMP="$created"
+    # 作った直後に別物へ差し替えられていないか確かめる。
+    if [ -L "$DOCTOR_TMP" ] || [ ! -d "$DOCTOR_TMP" ] || [ ! -O "$DOCTOR_TMP" ]; then
+      cleanup_doctor_tmp
+      continue
+    fi
+    # CODEX_HOMEには実在するディレクトリを渡す。存在しないパスを渡すと
+    # 「作れないが続行する」というcodex側の未仕様の寛容さに寄りかかることになり、
+    # そこが厳格化された版では診断が落ちて自己更新が止まる。
+    # -p は付けない。先にsymlinkを置かれていた場合、追わずに失敗させる。
+    if /bin/mkdir "$DOCTOR_TMP/codex" 2>/dev/null; then
+      return 0
+    fi
+    cleanup_doctor_tmp
+  done
+  DOCTOR_TMP_UNAVAILABLE=1
+  return 1
+}
+
 doctor_item() {
   local label="$1"
   local command_name="$2"
   shift 2
-  if command -v "$command_name" >/dev/null 2>&1; then
-    printf '   %-20s %s\n' "$label:" "$(first_line "$command_name" "$@")"
-  else
+  local version
+  local status=0
+
+  if ! command -v "$command_name" >/dev/null 2>&1; then
     printf '   %-20s %s\n' "$label:" '未導入'
     return 1
   fi
+
+  # 下の環境変数はバージョン取得のときだけ効かせる。認証状態を見る診断へ流用すると
+  # 実環境ではなく退避先を診断してしまうので、コマンド名だけでなく引数でも限定する。
+  local suppress='none'
+  case "${1:-}" in
+    --version|-V|-v|version)
+      case "$command_name" in
+        gh) suppress='gh' ;;
+        codex) suppress='codex' ;;
+      esac
+      ;;
+  esac
+
+  case "$suppress" in
+    gh)
+      version="$(GH_TELEMETRY=false GH_NO_UPDATE_NOTIFIER=1 "$command_name" "$@" 2>/dev/null)" || status=$?
+      ;;
+    codex)
+      if ! ensure_doctor_tmp; then
+        printf '   %-20s %s\n' "$label:" '一時領域を確保できず未診断'
+        return 1
+      fi
+      version="$(CODEX_HOME="$DOCTOR_TMP/codex" "$command_name" "$@" 2>/dev/null)" || status=$?
+      ;;
+    *)
+      version="$("$command_name" "$@" 2>/dev/null)" || status=$?
+      ;;
+  esac
+
+  # 以前はstderrを混ぜて先頭行を表示していたため、バージョン取得自体が失敗しても
+  # 警告文をバージョンとして表示し、診断は成功扱いになっていた。
+  if [ "$status" != "0" ]; then
+    printf '   %-20s %s\n' "$label:" '実行失敗'
+    return 1
+  fi
+  version="${version%%$'\n'*}"
+  if [ -z "$version" ]; then
+    printf '   %-20s %s\n' "$label:" 'バージョン不明'
+    return 1
+  fi
+  printf '   %-20s %s\n' "$label:" "$version"
 }
 
+# 戻り値: 0=問題なし / 1=CLIに問題あり / 2=退避先を作れずCodexだけ未診断
 run_doctor() {
   local missing=0
+  local tmp_skipped=0
+  DOCTOR_TMP_UNAVAILABLE=0
   section "セットアップ診断（変更は行いません）"
   if clt_ready; then
     printf '   %-20s %s\n' 'Command Line Tools:' "$(clt_version)"
@@ -142,8 +317,18 @@ run_doctor() {
   doctor_item 'tmux' tmux -V || missing=1
   doctor_item 'Bun' bun --version || missing=1
   doctor_item 'Claude Code' claude --version || missing=1
-  doctor_item 'Codex CLI' codex --version || missing=1
+  if ! doctor_item 'Codex CLI' codex --version; then
+    # 退避先を作れずに見送っただけなら、CLI自体の異常とは区別する。
+    if [ "$DOCTOR_TMP_UNAVAILABLE" = "1" ]; then
+      tmp_skipped=1
+    else
+      missing=1
+    fi
+  fi
+  # 診断が終わった時点で退避先を消し、trapも外す。後続の処理へ持ち越さない。
+  finish_doctor_tmp
   [ "$missing" = "0" ] || return 1
+  [ "$tmp_skipped" = "0" ] || return 2
   return 0
 }
 
@@ -525,10 +710,13 @@ EOF
 }
 
 main() {
+  local doctor_status=0
   require_macos
   if [ "$MODE" = "doctor" ]; then
-    run_doctor
-    return
+    run_doctor || doctor_status=$?
+    # 退避先を作れず見送った場合も診断としては未完なので、非0で返す。
+    [ "$doctor_status" = "0" ] || return 1
+    return 0
   fi
   if [ "$MODE" = "slack-only" ]; then
     echo "== ゼロくん Slack設定だけ再開 =="
@@ -555,7 +743,14 @@ main() {
   run_project_bootstrap
 
   section "基本セットアップ完了"
-  run_doctor
+  # 締めの診断は要約表示なので、ここで即座に落ちると案内とSlack設定が飛ぶ。
+  # 案内は最後まで出しきり、CLIの異常が残っていたときだけ最後に非0で終える。
+  run_doctor || doctor_status=$?
+  case "$doctor_status" in
+    0) ;;
+    2) warn "一時領域を確保できずCodex CLIだけ未診断です。導入自体は完了しています" ;;
+    *) warn "セットアップ診断で問題を検出しました。下の案内のあとに再確認してください" ;;
+  esac
   echo "   Claude Codeを利用できます:"
   echo "   cd \"$PROJECT_DIR\" && claude"
   echo "   Codex CLIを利用できます:"
@@ -569,6 +764,11 @@ main() {
     echo "   後からSlack設定だけ行う:"
     echo "   bash \"$REPO_DIR/zerokun/bootstrap-macos.sh\" --slack-only"
   fi
+  # 「利用できます」と案内した以上、実際に使えない状態を成功で終わらせない。
+  case "$doctor_status" in
+    0|2) ;;
+    *) fail "セットアップ診断の問題が残っています: bash \"$REPO_DIR/zerokun/bootstrap-macos.sh\" --doctor で確認してください" ;;
+  esac
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
