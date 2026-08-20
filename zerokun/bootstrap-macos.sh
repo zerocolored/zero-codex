@@ -150,10 +150,13 @@ cleanup_doctor_tmp() {
   return 0
 }
 
-# 後始末はEXIT trapだけで足りる。bash 3.2では未捕捉のINT/TERM/HUPでもEXIT trapは走る。
-# 逆にINT/TERM/HUPを捕捉すると、bashは同期実行中の子の終了までハンドラを遅らせるため、
-# バージョン取得がhangしたときに外から止められなくなる
-# （実測: 子が10秒hangすると、TERMでの停止も10秒待たされる。捕捉しなければ即時）。
+# 後始末はEXIT trapだけで足りる。bash 3.2では未捕捉のINT/TERM/HUPでもEXIT trapが走ることを
+# 実測で確認している。INT/TERM/HUPを捕捉しても後始末の効果は増えない。
+# 一方でbashは捕捉したシグナルのハンドラを同期実行中の子の終了まで遅らせるため、
+# 子を直接前景で走らせる形にすると停止が遅くなる
+# （実測: 子が10秒hangするとTERMでの停止も10秒待たされる。捕捉しなければ即時）。
+# 現在のバージョン取得はコマンド置換の中で走るので、いまはどちらでも停止性は変わらない。
+# 得るものが無く、書き方次第で損をするだけなので捕捉しない。
 finish_doctor_tmp() {
   cleanup_doctor_tmp
   trap - EXIT
@@ -163,6 +166,35 @@ finish_doctor_tmp() {
 # 相対パスのTMPDIRで戻り値が2行になる。サブシェルの中でCDPATHを外して捨てる。
 resolve_dir() {
   ( CDPATH='' cd -- "$1" >/dev/null 2>&1 && pwd -P ) 2>/dev/null
+}
+
+# 退避先の親として信用できるのは次のどちらかだけ。
+#   - 自分の持ち物で、他人が書けない（または他人が書けてもstickyで守られている）
+#   - rootの持ち物で sticky（/private/tmp）
+# 他人が書ける非stickyな場所や、他人が所有する場所は使わない。mktempが作った直後に
+# エントリごと差し替えられる余地があり、stickyであっても親の所有者は他人のエントリを
+# 動かせるため。判定は必ず物理解決したパスに対して行う（/tmpはsymlink）。
+doctor_tmp_parent_is_trusted() {
+  local dir="$1"
+  local uid perm me shared
+  uid="$(/usr/bin/stat -f '%u' "$dir" 2>/dev/null)" || return 1
+  perm="$(/usr/bin/stat -f '%Sp' "$dir" 2>/dev/null)" || return 1
+  me="$(/usr/bin/id -u 2>/dev/null)" || return 1
+  [ "${#perm}" -ge 10 ] || return 1
+  # drwxrwxrwt の 5 番目がグループのw、8 番目がその他のw。
+  shared=0
+  case "${perm:5:1}${perm:8:1}" in
+    *w*) shared=1 ;;
+  esac
+  if [ "$uid" = "$me" ]; then
+    [ "$shared" = "0" ] || [ -k "$dir" ] || return 1
+    return 0
+  fi
+  if [ "$uid" = "0" ]; then
+    [ -k "$dir" ] || return 1
+    return 0
+  fi
+  return 1
 }
 
 # 退避先はHOMEの外にだけ作る。TMPDIRをそのまま信じると、TMPDIRがHOME配下のときに
@@ -182,11 +214,9 @@ ensure_doctor_tmp() {
   for candidate in "${TMPDIR:-}" /tmp; do
     [ -n "$candidate" ] || continue
     [ -d "$candidate" ] && [ -w "$candidate" ] || continue
-    # 自分の持ち物か、/tmpのようなstickyな場所だけを使う。他人も書ける非stickyな
-    # ディレクトリでは、mktempが作った直後に同名のsymlinkへ差し替えられる余地がある。
-    [ -O "$candidate" ] || [ -k "$candidate" ] || continue
     resolved="$(resolve_dir "$candidate")" || continue
     [ -n "$resolved" ] || continue
+    doctor_tmp_parent_is_trusted "$resolved" || continue
     if [ -n "$home_resolved" ]; then
       case "$resolved/" in
         "$home_resolved"/*) continue ;;
@@ -197,10 +227,16 @@ ensure_doctor_tmp() {
     created="$(/usr/bin/mktemp -d "$resolved/zerokun-doctor.XXXXXX" 2>/dev/null)" || continue
     trap cleanup_doctor_tmp EXIT
     DOCTOR_TMP="$created"
+    # 作った直後に別物へ差し替えられていないか確かめる。
+    if [ -L "$DOCTOR_TMP" ] || [ ! -d "$DOCTOR_TMP" ] || [ ! -O "$DOCTOR_TMP" ]; then
+      cleanup_doctor_tmp
+      continue
+    fi
     # CODEX_HOMEには実在するディレクトリを渡す。存在しないパスを渡すと
     # 「作れないが続行する」というcodex側の未仕様の寛容さに寄りかかることになり、
     # そこが厳格化された版では診断が落ちて自己更新が止まる。
-    if /bin/mkdir -p "$DOCTOR_TMP/codex" 2>/dev/null; then
+    # -p は付けない。先にsymlinkを置かれていた場合、追わずに失敗させる。
+    if /bin/mkdir "$DOCTOR_TMP/codex" 2>/dev/null; then
       return 0
     fi
     cleanup_doctor_tmp

@@ -1,5 +1,14 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import {
+  existsSync,
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -58,14 +67,29 @@ describe('macOS bootstrap', () => {
 
   // 退避先の後始末が速いので「実行後にHOMEが空か」だけでは、HOME配下に作って
   // すぐ消す実装を見逃す。CODEX_HOMEの実際の行き先を偽codexに報告させて捕まえる。
+  // 報告は物理パスで受け取る。mkdtempSyncは /var/folders/... を返すのに
+  // スクリプト側は pwd -P で /private/var/folders/... を返すため、
+  // 論理パスのままprefix比較すると「HOME配下に作った」場合でも素通りする。
   const codexHomeProbe = (report: string) =>
     [
       '#!/bin/sh',
-      `printf '%s\\n' "\${CODEX_HOME:-unset}" > '${report}'`,
-      `if [ -d "\${CODEX_HOME:-/nonexistent}" ]; then printf 'dir=yes\\n' >> '${report}'; fi`,
+      'target="${CODEX_HOME:-unset}"',
+      'if [ -d "$target" ]; then',
+      `  printf '%s\\n' "$(cd "$target" 2>/dev/null && pwd -P)" > '${report}'`,
+      `  printf 'dir=yes\\n' >> '${report}'`,
+      'else',
+      `  printf '%s\\n' "$target" > '${report}'`,
+      'fi',
       'echo "codex-cli 0.0.0-test"',
       '',
     ].join('\n')
+
+  // 論理パスと物理パスの両方でHOME配下を否定する。片方だけだと取り落とす。
+  const expectOutsideHome = (reported: string, fakeHome: string) => {
+    for (const form of new Set([fakeHome, realpathSync(fakeHome)])) {
+      expect(reported.startsWith(form)).toBe(false)
+    }
+  }
 
   test('--doctor keeps its scratch outside HOME even when TMPDIR points inside HOME', () => {
     if (process.platform !== 'darwin') return
@@ -89,7 +113,7 @@ describe('macOS bootstrap', () => {
       expect(result.exitCode).toBe(0)
       const seen = readFileSync(report, 'utf8').trim().split('\n')
       // TMPDIRがHOME配下を指していても、退避先はHOMEの外へ逃がす。
-      expect(seen[0].startsWith(fakeHome)).toBe(false)
+      expectOutsideHome(seen[0], fakeHome)
       expect(seen).toContain('dir=yes')
       // HOME配下に存在してよいのは、このテストが用意した .tmp だけ。
       const entries = Bun.spawnSync(['/usr/bin/find', fakeHome, '-mindepth', '1'])
@@ -155,7 +179,7 @@ describe('macOS bootstrap', () => {
       const seen = readFileSync(report, 'utf8').trim().split('\n')
       // 実在するディレクトリを渡す。存在しないパスだとcodex側の寛容さ頼みになる。
       expect(seen).toContain('dir=yes')
-      expect(seen[0].startsWith(fakeHome)).toBe(false)
+      expectOutsideHome(seen[0], fakeHome)
       expect(Bun.spawnSync(['/bin/ls', '-A', fakeHome]).stdout.toString()).toBe('')
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
@@ -181,6 +205,57 @@ describe('macOS bootstrap', () => {
       rmSync(fakeHome, { recursive: true, force: true })
       rmSync(fakeBin, { recursive: true, force: true })
     }
+  })
+
+  test('--doctor refuses a scratch parent that other local users can write to', () => {
+    if (process.platform !== 'darwin') return
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-untrusted-'))
+    const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-untrustedbin-'))
+    const sharedTmp = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-shared-'))
+    const report = join(fakeBin, 'report.txt')
+    try {
+      // 自分の持ち物でも、他人が書けてstickyでない場所は退避先に使わない。
+      // mktempが作った直後にエントリごと差し替えられる余地があるため。
+      chmodSync(sharedTmp, 0o777)
+      writeFileSync(join(fakeBin, 'codex'), codexHomeProbe(report), { mode: 0o755 })
+      const result = Bun.spawnSync([bootstrap, '--doctor'], {
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          TMPDIR: sharedTmp,
+          PATH: `${fakeBin}:${process.env.PATH}`,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(0)
+      const seen = readFileSync(report, 'utf8').trim().split('\n')
+      expect(seen).toContain('dir=yes')
+      // 信用できないTMPDIRは使わず、/tmp へ落ちる。
+      for (const form of new Set([sharedTmp, realpathSync(sharedTmp)])) {
+        expect(seen[0].startsWith(form)).toBe(false)
+      }
+      expectOutsideHome(seen[0], fakeHome)
+      expect(Bun.spawnSync(['/bin/ls', '-A', sharedTmp]).stdout.toString()).toBe('')
+    } finally {
+      rmSync(sharedTmp, { recursive: true, force: true })
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeBin, { recursive: true, force: true })
+    }
+  })
+
+  test('--doctor says so plainly when no scratch parent is usable', () => {
+    if (process.platform !== 'darwin') return
+    // HOMEが / のとき「HOMEの外」は存在しないので、退避先を作れない。
+    const result = Bun.spawnSync([bootstrap, '--doctor'], {
+      env: { ...process.env, HOME: '/' },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(1)
+    expect(result.stdout.toString()).toContain('一時領域を確保できず未診断')
+    // Codex以外の診断は続ける。
+    expect(result.stdout.toString()).toContain('Homebrew:')
   })
 
   test('--doctor refuses to be combined with --slack-only', () => {
