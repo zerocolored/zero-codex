@@ -75,6 +75,33 @@ tail -f ~/.claude/channels/slack/job-runner.log
 - トリアージ: ごく簡単な質問・軽微な UI 変更 → 単独即答 / それ以外 → レベル別多人数検証、実装は /dev
 - レベル2以上は codex CLI が必要(`brew install` 等で導入し OpenAI アカウントでログイン)
 
+### 設計・実装は worker 側で /dev フルサイクルを強制する
+
+重厚モードが載るのは bridge(スレッド担当)だが、**設計と実装を実際にやるのは queue の
+job worker** で、そこには重厚モードが届いていなかった。worker のプロンプトは
+「プロジェクトに開発フローやスキルがあれば使え」と曖昧に触れるだけで、直後に自前の
+7 手順を並べていたため、worker は常に 7 手順を選んだ。実測(2026-08-20)で job-logs
+18 件すべてが `Skill` 呼び出し 0 件＝**/dev は一度も起動していなかった**。
+
+現在は `job-runner.ts` が worker の `--append-system-prompt` を次の順で組む
+（`buildWorkerSystemPrompt()`）。
+
+1. オーナー共通ルール（`~/.claude/channels/slack/owner/claude-config/CLAUDE.md`。
+   /dev が参照する多人数検証のモデル構成等の正本。無いマシンでは黙って省略＝fail-open。
+   差し替えは `ZEROKUN_WORKER_RULES_FILE`）
+2. `/dev` フルサイクル強制（`WORKER_DEV_SKILL_PROMPT`）。**フェーズを飛ばす・fan-out を
+   縮める・レビュー周回を削るの判断を worker にさせない**。「今回は簡単だから」の自己判定は
+   手を抜く側へ倒れるため（上の 18/18 がその実測）、オーナールールの tier S/M 短縮も
+   worker には適用しない。無人実行なので gate は自動通過し、物理的に不能な検証は
+   「未検証」と報告させる
+3. Slack 投稿禁止（`WORKER_SLACK_BAN_PROMPT`。最後に置くことで不変条件を最優先にする）
+
+実際に走ったかの確認は job のログを見る。
+
+```bash
+grep -c '"name":"Skill"' ~/.claude/channels/slack/job-logs/<job-id>.stdout.log
+```
+
 ## 運用の注意
 
 - 更新は `zerokun-update` を使う。実行中jobの完了を待ち、3リポを事前検査してから

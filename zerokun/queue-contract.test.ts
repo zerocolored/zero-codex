@@ -89,4 +89,20 @@ describe('Zero-kun queue wiring', () => {
     expect(queuePolicy).toContain('`request_update`')
     expect(queuePolicy).toContain('`enqueue_job`を呼ばない')
   })
+
+  test('design and implementation reach the worker, and the worker is told to run /dev', () => {
+    const queuePolicy = readFileSync(join(import.meta.dir, 'templates/zerokun-queue-policy.md'), 'utf8')
+    const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
+
+    // policy は「/dev を実行するのは worker 側」と宣言していたが、その worker に
+    // /dev を起動させる指示が job-runner 側に無く、宣言が配線されていなかった。
+    // 実測 2026-08-20: job-logs 18 件すべてで Skill 呼び出し 0 件。
+    expect(queuePolicy).toContain('`/dev`のフルサイクルが必須')
+    expect(runner).toContain('WORKER_DEV_SKILL_PROMPT')
+    expect(runner).toContain("'--append-system-prompt', systemPrompt,")
+
+    // 設計だけの依頼が worker に届かないと、/dev の最初のフェーズ(設計)が
+    // スレッド担当の即答に置き換わる。
+    expect(queuePolicy).toContain('設計・仕様決定')
+  })
 })
