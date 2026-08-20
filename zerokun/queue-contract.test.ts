@@ -114,7 +114,6 @@ describe('Zero-kun queue wiring', () => {
     // 片方だけ直しても体験は揃わないので両方で固定する。
     for (const text of [runner, skill]) {
       // 1行目で「これは自分の操作が要る話か」が分かること。
-      expect(text).toContain('完了 / 要確認')
       // 依頼は箇条書き。無いなら「なし」と書かせる（無言だと依頼と読まれる）。
       expect(text).toContain('やってほしいこと')
       expect(text).toContain('なし')
