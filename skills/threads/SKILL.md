@@ -339,7 +339,7 @@ Slack and has to know immediately whether this needs them. Line 1 is the type
 banner and nothing else — the type wrapped in its emoji, alone on its own line,
 with your sentence starting on line 2:
 
-    ✅完了✅   ✋要確認✋   🛑未完了🛑   💬回答💬   💡提案💡
+    ✅完了✅   ⚠️要確認⚠️   🛑未完了🛑   💬回答💬   💡提案💡
 
 Never open with a list of facts they have to read to work out why you wrote.
 Then follow that type's shape and no other:

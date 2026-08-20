@@ -576,7 +576,7 @@ Line 1 is the type banner and NOTHING else — the type wrapped in its emoji, al
 own line, with the sentence starting on line 2:
 
   ✅完了✅
-  ✋要確認✋
+  ⚠️要確認⚠️
   🛑未完了🛑
   💬回答💬
   💡提案💡

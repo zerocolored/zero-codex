@@ -126,7 +126,7 @@ describe('Zero-kun queue wiring', () => {
       expect(text).toContain('SINGLE asterisk')
       // 1行目は絵文字で挟んだ見出しだけの行。本文は2行目から。
       expect(text).toContain('✅完了✅')
-      expect(text).toContain('✋要確認✋')
+      expect(text).toContain('⚠️要確認⚠️')
       expect(text).toContain('🛑未完了🛑')
       expect(text).toContain('💬回答💬')
       expect(text).toContain('💡提案💡')
