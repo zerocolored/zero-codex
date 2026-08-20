@@ -17,6 +17,8 @@ import { join } from 'path'
 
 const REQUEST_FILE = 'update-request.json'
 const WORKER_SESSION = 'zerokun-update-worker'
+// 更新後のゼロくん本体が常駐する detached session。update.ts の sessionName 既定と同じ値。
+const BOT_SESSION = 'zerokun-slack'
 const DEFAULT_STALE_MS = 6 * 60 * 60 * 1000
 
 export interface UpdateRequestInput {
@@ -353,7 +355,9 @@ export async function runUpdateWorker(
   }
 
   const text = success
-    ? `✅ ゼロくん更新完了（request ${request.id.slice(0, 8)}）\n3リポの更新・テスト・setup・再起動が完了しました。`
+    // 更新は再起動を伴うので、ゼロくんは起動元のタブから消えて detached tmux に移る。
+    // 画面が見当たらず「どこで動いてる?」と毎回聞かせないため、開き方と抜け方まで書く。
+    ? `✅ ゼロくん更新完了（request ${request.id.slice(0, 8)}）\n3リポの更新・テスト・setup・再起動が完了しました。\n画面を見る: tmux attach -t ${BOT_SESSION} （抜けるのは Ctrl-b → d。閉じてもゼロくんは止まりません）`
     : `❌ ゼロくん更新失敗（request ${request.id.slice(0, 8)}）\n${errorText}\nログ: ${logPath}`
   let notificationSent = false
   try {

@@ -111,6 +111,7 @@ grep -c '"name":"Skill"' ~/.claude/channels/slack/job-logs/<job-id>.stdout.log
   完了・失敗を同じスレッドへ通知する。`zerokun-update`はSlackが使えない場合の手動経路として残す。
 - 更新後のSlack botはdetached tmux session `zerokun-slack`で常駐する。
   画面確認は`tmux attach -t zerokun-slack`、確認後に抜ける操作は`Ctrl-b`→`d`。
+  再起動で起動元のタブからは消えるため、この開き方はSlackの更新完了通知にも毎回載せる。
 - bridge起動時は直近48時間（`ZEROKUN_CATCHUP_WINDOW_H`）の未配送DMと新規@メンションを
   チャンネルごとに最大20件（`ZEROKUN_CATCHUP_LIMIT`）、古い順に回収する。
 - watchdogはbridge/job runnerのどちらかが2回連続で停止した時だけ本人へDMし、停止中は
