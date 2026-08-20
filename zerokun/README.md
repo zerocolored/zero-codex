@@ -102,6 +102,37 @@ job worker** で、そこには重厚モードが届いていなかった。work
 grep -c '"name":"Skill"' ~/.claude/channels/slack/job-logs/<job-id>.stdout.log
 ```
 
+## 画面にゼロくんがいないとき
+
+ゼロくんはdetached tmux session `zerokun-slack`で常駐する。**どのターミナルタブにも
+表示されないのが正常**で、特に更新直後は再起動で起動元のタブから消える。
+
+- 動いているかだけ見る: `zerokun-status`
+- 画面を開く: `tmux attach -t zerokun-slack`（抜けるのは`Ctrl-b`→`d`。閉じてもゼロくんは止まらない）
+- 画面を奪わずに覗く: `tmux capture-pane -pt zerokun-slack | tail -40`
+- MuxyでもTerminalでも手順は同じ。専用機能はなく、新規タブ（`Cmd+T`）で上のコマンドを打つ。
+  Terminalを自動で開くなら
+  `osascript -e 'tell application "Terminal" to do script "tmux attach -t zerokun-slack"'`。
+  Muxyの`muxy://new-tab`URLスキームはコマンド付き起動のパラメータが非公開で、渡しても効かない。
+
+### 「どこで動いてる?」をLLMが調べる手順
+
+人に聞かず、この順で地面を見る。過去に順序を飛ばして誤答した実例をそのまま書いてある。
+
+1. `pgrep -fl "dangerously-load-development-channels server:slack-channel"` で本体PIDを取る。
+2. `tmux list-sessions` と `tmux list-clients` を見る。**clientsが空＝そのsessionは誰も見ていない**
+   ＝画面はどこにも出ていない。`tmux list-panes -a -F '#{session_name} tty=#{pane_tty} pid=#{pane_pid} attached=#{session_attached}'`
+   で本体PIDがどのsessionのpaneかまで確定する。
+3. 親を辿る（`ps -o pid=,ppid=,command= -p <pid>`）。tmux server（ppid=1）に着いたらdetachedで確定。
+   更新直後は親が`zerokun-update-worker`のtmuxになる（更新workerが再起動をかけた名残）。
+
+間違えやすい点:
+
+- `ps`のTTY欄に`ttysNNN`が出ていても、**ターミナルタブが開いている証拠にはならない**。
+  それはtmuxが握っているptyで、attachedなclientがなければ画面は存在しない。
+- `~/.session-snapshot/latest.txt`の`tab=`表記は祖先から推定した値で、tmux配下のプロセスでは
+  実際のタブと一致しない。**これを根拠に「◯◯タブにいる」と答えない**（2026-08-20に誤答した）。
+
 ## 運用の注意
 
 - 更新は `zerokun-update` を使う。実行中jobの完了を待ち、3リポを事前検査してから
@@ -111,6 +142,7 @@ grep -c '"name":"Skill"' ~/.claude/channels/slack/job-logs/<job-id>.stdout.log
   完了・失敗を同じスレッドへ通知する。`zerokun-update`はSlackが使えない場合の手動経路として残す。
 - 更新後のSlack botはdetached tmux session `zerokun-slack`で常駐する。
   画面確認は`tmux attach -t zerokun-slack`、確認後に抜ける操作は`Ctrl-b`→`d`。
+  再起動で起動元のタブからは消えるため、この開き方はSlackの更新完了通知にも毎回載せる。
 - bridge起動時は直近48時間（`ZEROKUN_CATCHUP_WINDOW_H`）の未配送DMと新規@メンションを
   チャンネルごとに最大20件（`ZEROKUN_CATCHUP_LIMIT`）、古い順に回収する。
 - watchdogはbridge/job runnerのどちらかが2回連続で停止した時だけ本人へDMし、停止中は

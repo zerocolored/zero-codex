@@ -152,7 +152,35 @@ describe('Slack update request', () => {
     expect(result.success).toBe(true)
     expect(notifications).toHaveLength(1)
     expect(notifications[0]).toContain('更新完了')
+    // 更新は再起動を伴い、ゼロくんは元のタブから消えて detached tmux へ移る。
+    // 「どこに行った」を毎回聞かせないよう、開き方と抜け方を完了通知に必ず載せる。
+    expect(notifications[0]).toContain('tmux attach -t zerokun-slack')
+    expect(notifications[0]).toContain('Ctrl-b')
     expect(existsSync(join(stateDir, 'update-request.json'))).toBe(false)
+  })
+
+  test('完了通知が案内するsessionは、再起動が実際に作るsessionと一致する', async () => {
+    const stateDir = fixtureDir()
+    const notifications: string[] = []
+    await requestUpdate(input(), {
+      stateDir,
+      idFactory: () => 'request-session-name',
+      launchWorker: () => {},
+    })
+
+    await runUpdateWorker('request-session-name', {
+      stateDir,
+      executeUpdater: async () => 0,
+      notify: async (_request, text) => { notifications.push(text) },
+    })
+
+    // 案内した session 名が update.ts の既定とズレると、開こうとしても存在せず
+    // 案内そのものが嘘になる。両者をここで突き合わせて固定する。
+    const guided = notifications[0].match(/tmux attach -t (\S+)/)?.[1]
+    const actual = readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')
+      .match(/options\.sessionName \?\? '([^']+)'/)?.[1]
+    expect(actual).toBeTruthy()
+    expect(guided).toBe(actual)
   })
 
   test('更新失敗も元のSlackスレッドへ通知して次の依頼を受けられる', async () => {
