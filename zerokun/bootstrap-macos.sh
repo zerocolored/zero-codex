@@ -128,15 +128,59 @@ DOCTOR_TMP=""
 
 cleanup_doctor_tmp() {
   [ -n "$DOCTOR_TMP" ] || return 0
-  /bin/rm -rf "$DOCTOR_TMP"
+  # 後始末の失敗で診断の終了値を書き換えない。
+  /bin/rm -rf "$DOCTOR_TMP" || true
   DOCTOR_TMP=""
+}
+
+# EXITだけでは、bashの版とシグナルの位相によって後始末が走らないことがある。
+# INT/TERM/HUPは明示的に受けて、片付けてから既定の動作で落とし直す。
+on_doctor_signal() {
+  local signal="$1"
+  cleanup_doctor_tmp
+  trap - "$signal" EXIT
+  kill -"$signal" "$$"
+}
+
+# 退避先はHOMEの外にだけ作る。TMPDIRがHOME配下・不在・書込み不可なら/tmpへ落とす。
+# TMPDIRをそのまま信用すると、TMPDIRがHOME配下のときに診断がHOMEを書き換える。
+doctor_tmp_base() {
+  local candidate resolved home_resolved
+  home_resolved=""
+  if [ -n "${HOME:-}" ]; then
+    home_resolved="$(cd "$HOME" 2>/dev/null && pwd -P)" || home_resolved=""
+  fi
+  for candidate in "${TMPDIR:-}" /tmp; do
+    [ -n "$candidate" ] || continue
+    [ -d "$candidate" ] && [ -w "$candidate" ] || continue
+    resolved="$(cd "$candidate" 2>/dev/null && pwd -P)" || continue
+    [ -n "$resolved" ] || continue
+    if [ -n "$home_resolved" ]; then
+      case "$resolved/" in
+        "$home_resolved"/*) continue ;;
+      esac
+    fi
+    printf '%s' "$resolved"
+    return 0
+  done
+  return 1
 }
 
 ensure_doctor_tmp() {
   [ -z "$DOCTOR_TMP" ] || return 0
-  # 診断はTMPDIRの無い最小環境からも呼ばれる。HOME配下には絶対に作らない。
-  DOCTOR_TMP="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/zerokun-doctor.XXXXXX")"
+  local base
+  base="$(doctor_tmp_base)" || return 1
+  # mktempより先にtrapを張る。DOCTOR_TMPが空の間は後始末が何もしないので、
+  # 生成直後にシグナルを受けても取りこぼす窓を最小にできる。
   trap cleanup_doctor_tmp EXIT
+  trap 'on_doctor_signal INT' INT
+  trap 'on_doctor_signal TERM' TERM
+  trap 'on_doctor_signal HUP' HUP
+  DOCTOR_TMP="$(/usr/bin/mktemp -d "$base/zerokun-doctor.XXXXXX")" || return 1
+  # CODEX_HOMEには実在するディレクトリを渡す。存在しないパスを渡すと
+  # 「作れないが続行する」というcodex側の未仕様の寛容さに寄りかかることになり、
+  # そこが厳格化された版では診断が落ちて自己更新が止まる。
+  /bin/mkdir -p "$DOCTOR_TMP/codex" || return 1
 }
 
 doctor_item() {
@@ -151,14 +195,27 @@ doctor_item() {
     return 1
   fi
 
-  # 下の環境変数はバージョン取得だけに効かせる。認証状態を見る診断には流用しないこと
-  # （実環境ではなく退避先を診断してしまう）。
-  case "$command_name" in
+  # 下の環境変数はバージョン取得のときだけ効かせる。認証状態を見る診断へ流用すると
+  # 実環境ではなく退避先を診断してしまうので、コマンド名だけでなく引数でも限定する。
+  local suppress='none'
+  case "${1:-}" in
+    --version|-V|-v|version)
+      case "$command_name" in
+        gh) suppress='gh' ;;
+        codex) suppress='codex' ;;
+      esac
+      ;;
+  esac
+
+  case "$suppress" in
     gh)
       version="$(GH_TELEMETRY=false GH_NO_UPDATE_NOTIFIER=1 "$command_name" "$@" 2>/dev/null)" || status=$?
       ;;
     codex)
-      ensure_doctor_tmp
+      if ! ensure_doctor_tmp; then
+        printf '   %-20s %s\n' "$label:" '一時領域を確保できず未診断'
+        return 1
+      fi
       version="$(CODEX_HOME="$DOCTOR_TMP/codex" "$command_name" "$@" 2>/dev/null)" || status=$?
       ;;
     *)
@@ -182,7 +239,6 @@ doctor_item() {
 
 run_doctor() {
   local missing=0
-  ensure_doctor_tmp
   section "セットアップ診断（変更は行いません）"
   if clt_ready; then
     printf '   %-20s %s\n' 'Command Line Tools:' "$(clt_version)"
@@ -197,6 +253,8 @@ run_doctor() {
   doctor_item 'Bun' bun --version || missing=1
   doctor_item 'Claude Code' claude --version || missing=1
   doctor_item 'Codex CLI' codex --version || missing=1
+  # 診断が終わった時点で退避先を消す。EXITまで持ち越さない。
+  cleanup_doctor_tmp
   [ "$missing" = "0" ] || return 1
   return 0
 }
@@ -609,7 +667,9 @@ main() {
   run_project_bootstrap
 
   section "基本セットアップ完了"
-  run_doctor
+  # 締めの診断は要約表示なので、ここで落ちると導入完了後の案内とSlack設定が飛ぶ。
+  # 診断の厳格さは --doctor 単独実行のほうで担保する。
+  run_doctor || warn "診断で未確認の項目があります。後から --doctor で確認してください"
   echo "   Claude Codeを利用できます:"
   echo "   cd \"$PROJECT_DIR\" && claude"
   echo "   Codex CLIを利用できます:"
