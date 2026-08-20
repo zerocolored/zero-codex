@@ -123,6 +123,12 @@ describe('Zero-kun queue wiring', () => {
       expect(text).toContain('提案')
       expect(text).toContain('根拠')
       expect(text).toContain('未計測（推測）')
+      // Slack は * 1個が太字。** は書式にならずアスタリスクがそのまま出る。
+      expect(text).toContain('SINGLE asterisk')
+      // 行動リストはコードブロック、説明リストは行頭ラベル。コードブロック内では
+      // Slack が inline 書式を描画しないので、バッククォートを持ち込ませない。
+      expect(text).toContain('code block')
+      expect(text).toContain('承認の場所')
       // 読み手が動かせない内部値を並べない。詳細は PR 本文へ。
       expect(text).toMatch(/session IDs, file paths, function names, commit hashes/)
     }
