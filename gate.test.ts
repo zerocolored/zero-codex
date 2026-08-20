@@ -14,6 +14,7 @@ import {
   mentionsBot,
   resolveIsMention,
   decideThreadReplyDelivery,
+  effectiveDmAllowFrom,
   type ChannelPolicy,
   type SlackReply,
 } from './gate.ts'
@@ -613,5 +614,55 @@ describe('isBotDMBlocked', () => {
 
   test('does not block human channel posts', () => {
     expect(isBotDMBlocked('channel', false)).toBe(false)
+  })
+})
+
+describe('effectiveDmAllowFrom — channel opt-in is DM opt-in', () => {
+  test('empty access yields nobody', () => {
+    expect(effectiveDmAllowFrom({})).toEqual([])
+    expect(effectiveDmAllowFrom({ allowFrom: [], channels: {} })).toEqual([])
+  })
+
+  test('keeps the global list when there are no channels', () => {
+    expect(effectiveDmAllowFrom({ allowFrom: [HUMAN], channels: {} })).toEqual([HUMAN])
+  })
+
+  test('a user allowed in a channel may DM without being on the global list', () => {
+    const access = { allowFrom: [], channels: { C1: policy({ allowFrom: [OTHER_USER] }) } }
+    expect(effectiveDmAllowFrom(access)).toEqual([OTHER_USER])
+  })
+
+  test('unions across every channel, global first, without duplicates', () => {
+    const access = {
+      allowFrom: [HUMAN],
+      channels: {
+        C1: policy({ allowFrom: [OTHER_USER, HUMAN] }),
+        C2: policy({ allowFrom: ['U333THIRD'] }),
+      },
+    }
+    expect(effectiveDmAllowFrom(access)).toEqual([HUMAN, OTHER_USER, 'U333THIRD'])
+  })
+
+  test('an open channel (empty allowFrom) grants DM access to nobody', () => {
+    const access = { allowFrom: [], channels: { C1: policy({ allowFrom: [] }) } }
+    expect(effectiveDmAllowFrom(access)).toEqual([])
+  })
+
+  test('bot ids opted into a channel never reach the DM list', () => {
+    const access = { allowFrom: [], channels: { C1: policy({ allowFrom: [BOT, OTHER_BOT, HUMAN] }) } }
+    expect(effectiveDmAllowFrom(access)).toEqual([HUMAN])
+  })
+
+  test('a bot id sitting in the global list is ignored too', () => {
+    expect(effectiveDmAllowFrom({ allowFrom: [BOT, HUMAN], channels: {} })).toEqual([HUMAN])
+  })
+
+  test('accepts Enterprise Grid "W…" user ids', () => {
+    expect(effectiveDmAllowFrom({ allowFrom: ['W012ABCDE'], channels: {} })).toEqual(['W012ABCDE'])
+  })
+
+  test('tolerates missing/undefined channel policies', () => {
+    const access = { allowFrom: [HUMAN], channels: { C1: undefined } }
+    expect(effectiveDmAllowFrom(access)).toEqual([HUMAN])
   })
 })
