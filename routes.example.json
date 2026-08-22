@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to ~/.claude/channels/slack/routes.json and edit. Maps Slack channel IDs to target repo paths. Each entry becomes the working context for subagents dispatched from that channel's threads. DMs and unmapped channels fall back to the dispatcher session's cwd.",
+  "_comment": "Copy to the Zero-kun state directory as routes.json. Each Slack channel must name an absolute repo_path and is pinned to it when its first Codex job is enqueued. DMs use the gateway working directory; unmapped channels are ignored.",
 
   "C0ABC123EXAMPLE": {
     "repo_path": "/absolute/path/to/project-a",

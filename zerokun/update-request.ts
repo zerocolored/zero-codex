@@ -1,25 +1,39 @@
 #!/usr/bin/env bun
 
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import {
-  appendFileSync,
   chmodSync,
   closeSync,
   existsSync,
   mkdirSync,
   openSync,
-  readFileSync,
   unlinkSync,
   writeFileSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import { buildUpdaterEnvironment } from './child-environment.ts'
+import { atomicWritePrivateFile, openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
+import { requireManagedStateRoot } from './managed-path.ts'
+import { resolveZeroStateDir } from './state-dir.ts'
 
 const REQUEST_FILE = 'update-request.json'
 const WORKER_SESSION = 'zerokun-update-worker'
-// 更新後のゼロくん本体が常駐する detached session。update.ts の sessionName 既定と同じ値。
-const BOT_SESSION = 'zerokun-slack'
+const BOT_SESSION_FALLBACK = 'zerokun-slack'
 const DEFAULT_STALE_MS = 6 * 60 * 60 * 1000
+const DEFAULT_SLACK_HTTP_TIMEOUT_MS = 120_000
+const DEFAULT_UPDATE_NOTIFY_ATTEMPTS = 3
+
+function botSessionName(stateDir: string): string {
+  try {
+    const content = readOptionalPrivateFile(join(stateDir, 'tmux-session.json'))
+    if (content === null) return BOT_SESSION_FALLBACK
+    const parsed = JSON.parse(content) as { version?: unknown; name?: unknown }
+    if (parsed.version === 1 && typeof parsed.name === 'string'
+      && /^[A-Za-z0-9_-]{1,128}$/.test(parsed.name)) return parsed.name
+  } catch {}
+  return BOT_SESSION_FALLBACK
+}
 
 export interface UpdateRequestInput {
   chatId: string
@@ -31,6 +45,13 @@ export interface UpdateRequestInput {
 export interface UpdateRequest extends UpdateRequestInput {
   id: string
   requestedAt: number
+  outcome?: {
+    success: boolean
+    exitCode: number
+    text: string
+    completedAt: number
+    notifiedAt?: number
+  }
 }
 
 export interface UpdateRequestResult {
@@ -65,6 +86,8 @@ interface WorkerOptions {
   updaterPath?: string
   executeUpdater?: () => Promise<number>
   notify?: (request: UpdateRequest, text: string) => Promise<void>
+  maxNotifyAttempts?: number
+  notificationRetryMs?: number
 }
 
 export interface UpdateWorkerResult {
@@ -76,7 +99,7 @@ export interface UpdateWorkerResult {
 const decoder = new TextDecoder()
 
 function stateDir(): string {
-  return process.env.SLACK_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'slack')
+  return resolveZeroStateDir()
 }
 
 function requestPath(dir: string): string {
@@ -100,7 +123,9 @@ function validateInput(input: UpdateRequestInput): UpdateRequestInput {
 
 function readRequest(dir: string): UpdateRequest | undefined {
   try {
-    const parsed = JSON.parse(readFileSync(requestPath(dir), 'utf8')) as UpdateRequest
+    const content = readOptionalPrivateFile(requestPath(dir))
+    if (content === null) return undefined
+    const parsed = JSON.parse(content) as UpdateRequest
     const requestedAt = Number(parsed.requestedAt)
     if (!Number.isFinite(requestedAt)) throw new Error('requestedAt is invalid')
     return {
@@ -110,9 +135,37 @@ function readRequest(dir: string): UpdateRequest | undefined {
       messageId: requireText(parsed.messageId, 'messageId'),
       userId: requireText(parsed.userId, 'userId'),
       requestedAt,
+      ...(parsed.outcome && typeof parsed.outcome.text === 'string'
+        ? {
+          outcome: {
+            success: parsed.outcome.success === true,
+            exitCode: Number(parsed.outcome.exitCode),
+            text: parsed.outcome.text,
+            completedAt: Number(parsed.outcome.completedAt),
+            ...(Number.isFinite(Number(parsed.outcome.notifiedAt))
+              ? { notifiedAt: Number(parsed.outcome.notifiedAt) }
+              : {}),
+          },
+        }
+        : {}),
     }
   } catch {
     return undefined
+  }
+}
+
+function persistRequest(dir: string, request: UpdateRequest): void {
+  const path = requestPath(dir)
+  atomicWritePrivateFile(path, JSON.stringify(request, null, 2) + '\n')
+  chmodSync(path, 0o600)
+}
+
+function appendUpdateLog(path: string, content: string): void {
+  const descriptor = openSafeLog(path, 'append')
+  try {
+    writeFileSync(descriptor, content)
+  } finally {
+    closeSync(descriptor)
   }
 }
 
@@ -129,7 +182,7 @@ function command(args: string[]): CommandResult {
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
-    env: process.env,
+    env: buildUpdaterEnvironment(),
   })
   return {
     exitCode: result.exitCode,
@@ -217,6 +270,16 @@ export async function requestUpdate(
   const session = options.tmuxSession ?? WORKER_SESSION
   const isWorkerRunning = options.isWorkerRunning
     ?? (() => tmuxSessionExists(resolveTmuxPath(options.tmuxPath), session))
+  const launch = options.launchWorker ?? ((value: UpdateRequest) => {
+    launchDetachedUpdateWorker(value, {
+      stateDir: dir,
+      workerFile: options.workerFile,
+      updaterPath: options.updaterPath,
+      tmuxPath: options.tmuxPath,
+      tmuxSession: session,
+    })
+  })
+  const input = validateInput(rawInput)
   let existing = readRequest(dir)
   if (!existing && existsSync(requestPath(dir))) {
     // Another process may still be finishing its small atomic reservation write.
@@ -231,15 +294,26 @@ export async function requestUpdate(
     }
   }
   if (existing) {
+    if (existing.outcome?.notifiedAt) {
+      if (existing.chatId === input.chatId && existing.messageId === input.messageId) {
+        await options.onDuplicate?.(existing)
+        return { accepted: false, duplicate: true, request: existing }
+      }
+      clearRequest(dir, existing.id)
+      existing = undefined
+    }
+  }
+  if (existing) {
     const age = now() - existing.requestedAt
-    if (age <= (options.staleAfterMs ?? DEFAULT_STALE_MS) || isWorkerRunning()) {
+    const running = isWorkerRunning()
+    if (age <= (options.staleAfterMs ?? DEFAULT_STALE_MS) || running || existing.outcome) {
+      if (!running) launch(existing)
       await options.onDuplicate?.(existing)
       return { accepted: false, duplicate: true, request: existing }
     }
     clearRequest(dir, existing.id)
   }
 
-  const input = validateInput(rawInput)
   const request: UpdateRequest = {
     ...input,
     id: options.idFactory?.() ?? randomUUID(),
@@ -260,15 +334,6 @@ export async function requestUpdate(
 
   try {
     await options.onAccepted?.(request)
-    const launch = options.launchWorker ?? ((value: UpdateRequest) => {
-      launchDetachedUpdateWorker(value, {
-        stateDir: dir,
-        workerFile: options.workerFile,
-        updaterPath: options.updaterPath,
-        tmuxPath: options.tmuxPath,
-        tmuxSession: session,
-      })
-    })
     launch(request)
     return { accepted: true, duplicate: false, request }
   } catch (error) {
@@ -277,14 +342,55 @@ export async function requestUpdate(
   }
 }
 
+export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean {
+  const dir = options.stateDir ?? stateDir()
+  const request = readRequest(dir)
+  if (!request || request.outcome?.notifiedAt) return false
+  const session = options.tmuxSession ?? WORKER_SESSION
+  const running = options.isWorkerRunning
+    ? options.isWorkerRunning()
+    : tmuxSessionExists(resolveTmuxPath(options.tmuxPath), session)
+  if (running) return false
+  const launch = options.launchWorker ?? ((value: UpdateRequest) => {
+    launchDetachedUpdateWorker(value, {
+      stateDir: dir,
+      workerFile: options.workerFile,
+      updaterPath: options.updaterPath,
+      tmuxPath: options.tmuxPath,
+      tmuxSession: session,
+    })
+  })
+  launch(request)
+  return true
+}
+
 function loadSlackToken(dir: string): string {
   const envPath = join(dir, '.env')
-  chmodSync(envPath, 0o600)
-  for (const line of readFileSync(envPath, 'utf8').split('\n')) {
+  for (const line of (readOptionalPrivateFile(envPath) ?? '').split('\n')) {
     const match = line.match(/^SLACK_BOT_TOKEN=(.*)$/)
     if (match?.[1]) return match[1]
   }
   throw new Error(`SLACK_BOT_TOKENがありません: ${envPath}`)
+}
+
+export async function withUpdateSlackDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeout = DEFAULT_SLACK_HTTP_TIMEOUT_MS,
+): Promise<T> {
+  const deadline = Math.max(1, Math.floor(timeout))
+  const controller = new AbortController()
+  let rejectTimeout: ((error: Error) => void) | undefined
+  const timeoutPromise = new Promise<never>((_, reject) => { rejectTimeout = reject })
+  const timer = setTimeout(() => {
+    controller.abort()
+    rejectTimeout?.(new Error(`Slack update notification timed out after ${deadline}ms`))
+  }, deadline)
+  try {
+    return await Promise.race([operation(controller.signal), timeoutPromise])
+  } finally {
+    clearTimeout(timer)
+    controller.abort()
+  }
 }
 
 async function notifySlack(dir: string, request: UpdateRequest, text: string): Promise<void> {
@@ -292,7 +398,8 @@ async function notifySlack(dir: string, request: UpdateRequest, text: string): P
   let lastError = 'unknown error'
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const response = await fetch('https://slack.com/api/chat.postMessage', {
+      const response = await withUpdateSlackDeadline(signal => fetch(
+        'https://slack.com/api/chat.postMessage', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -302,8 +409,10 @@ async function notifySlack(dir: string, request: UpdateRequest, text: string): P
           channel: request.chatId,
           thread_ts: request.threadTs,
           text,
+          client_msg_id: updateNotificationClientId(request.id),
         }),
-      })
+        signal,
+      }), Number(process.env.ZEROKUN_SLACK_HTTP_TIMEOUT_MS) || DEFAULT_SLACK_HTTP_TIMEOUT_MS)
       const result = await response.json() as { ok?: boolean; error?: string }
       if (result.ok) return
       lastError = result.error ?? `HTTP ${response.status}`
@@ -315,15 +424,20 @@ async function notifySlack(dir: string, request: UpdateRequest, text: string): P
   throw new Error(`Slack完了通知に失敗しました: ${lastError}`)
 }
 
+function updateNotificationClientId(requestId: string): string {
+  const hex = createHash('sha256').update(`zerokun-update:${requestId}`).digest('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+}
+
 async function executeUpdater(updaterPath: string, logPath: string): Promise<number> {
-  const logFd = openSync(logPath, 'a', 0o600)
+  const logFd = openSafeLog(logPath, 'append')
   try {
-    appendFileSync(logPath, `\n${new Date().toISOString()} update request started\n`, { mode: 0o600 })
+    writeFileSync(logFd, `\n${new Date().toISOString()} update request started\n`)
     const proc = Bun.spawn([process.execPath, updaterPath], {
       stdin: 'ignore',
       stdout: logFd,
       stderr: logFd,
-      env: process.env,
+      env: buildUpdaterEnvironment(),
     })
     return await proc.exited
   } finally {
@@ -336,6 +450,7 @@ export async function runUpdateWorker(
   options: WorkerOptions = {},
 ): Promise<UpdateWorkerResult> {
   const dir = options.stateDir ?? stateDir()
+  requireManagedStateRoot(dir)
   const request = readRequest(dir)
   if (!request || request.id !== requestId) throw new Error(`更新依頼が見つかりません: ${requestId}`)
   const logPath = join(dir, 'update-request.log')
@@ -343,36 +458,44 @@ export async function runUpdateWorker(
   const run = options.executeUpdater ?? (() => executeUpdater(updaterPath, logPath))
   const notify = options.notify ?? ((value: UpdateRequest, text: string) => notifySlack(dir, value, text))
 
-  let exitCode = 1
-  let success = false
-  let errorText = ''
-  try {
-    exitCode = await run()
-    success = exitCode === 0
-    if (!success) errorText = `zerokun-updateが終了コード${exitCode}で失敗しました。`
-  } catch (error) {
-    errorText = error instanceof Error ? error.message : String(error)
+  let outcome = request.outcome
+  if (!outcome) {
+    let exitCode = 1
+    let success = false
+    let errorText = ''
+    try {
+      exitCode = await run()
+      success = exitCode === 0
+      if (!success) errorText = `zerokun-updateが終了コード${exitCode}で失敗しました。`
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error)
+    }
+    const text = success
+      ? `✅ Codex版ゼロくん更新完了（request ${request.id.slice(0, 8)}）\n更新・テスト・setup・再起動が完了しました。\n画面を見る: tmux attach -t ${botSessionName(dir)} （抜けるのは Ctrl-b → d。閉じてもゼロくんは止まりません）`
+      : `❌ ゼロくん更新失敗（request ${request.id.slice(0, 8)}）\n${errorText}\nログ: ${logPath}`
+    outcome = { success, exitCode, text, completedAt: Date.now() }
+    persistRequest(dir, { ...request, outcome })
   }
 
-  const text = success
-    // 更新は再起動を伴うので、ゼロくんは起動元のタブから消えて detached tmux に移る。
-    // 画面が見当たらず「どこで動いてる?」と毎回聞かせないため、開き方と抜け方まで書く。
-    ? `✅ ゼロくん更新完了（request ${request.id.slice(0, 8)}）\n3リポの更新・テスト・setup・再起動が完了しました。\n画面を見る: tmux attach -t ${BOT_SESSION} （抜けるのは Ctrl-b → d。閉じてもゼロくんは止まりません）`
-    : `❌ ゼロくん更新失敗（request ${request.id.slice(0, 8)}）\n${errorText}\nログ: ${logPath}`
-  let notificationSent = false
-  try {
-    await notify(request, text)
-    notificationSent = true
-  } catch (error) {
-    appendFileSync(
-      logPath,
-      `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}\n`,
-      { mode: 0o600 },
-    )
-  } finally {
-    clearRequest(dir, request.id)
+  const maxAttempts = Math.max(1, Math.floor(
+    options.maxNotifyAttempts ?? DEFAULT_UPDATE_NOTIFY_ATTEMPTS,
+  ))
+  const retryMs = Math.max(1, options.notificationRetryMs ?? 60_000)
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await notify(request, outcome.text)
+      outcome = { ...outcome, notifiedAt: Date.now() }
+      persistRequest(dir, { ...request, outcome })
+      return { success: outcome.success, exitCode: outcome.exitCode, notificationSent: true }
+    } catch (error) {
+      appendUpdateLog(
+        logPath,
+        `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}\n`,
+      )
+      if (attempt < maxAttempts) await Bun.sleep(retryMs)
+    }
   }
-  return { success, exitCode, notificationSent }
+  return { success: outcome.success, exitCode: outcome.exitCode, notificationSent: false }
 }
 
 function optionValue(args: string[], name: string): string | undefined {

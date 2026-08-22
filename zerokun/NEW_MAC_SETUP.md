@@ -1,96 +1,157 @@
-# 新しいMacへゼロくんを入れる手順
+# 新しい Mac へ Zero-kun for Codex を入れる
 
-## 結論
+## 最短手順
 
-旧Macから`bootstrap-macos.sh`を1ファイルだけAirDropし、新Macのターミナルで実行する。
-
-```bash
-bash ~/Downloads/bootstrap-macos.sh
-```
-
-これで次を自動実行する。
-
-- Apple Command Line Toolsの確認と導入
-- Homebrewの導入
-- GitHub CLI、tmux、Bun、Claude Code、Codex CLIの導入
-- GitHub、Claude、Codexのログイン画面の起動
-- `zero`は`main`、`skills`と3つの実装リポは`develop`でclone
-- SQLite直列queue、Skill、MCP、起動コマンドの配線
-- Chrome、Muxy、VS Code等のアプリと開発依存関係の導入
-- TypeScript buildとmeeting-appのRustチェック
-
-ここまで完了した時点でClaude CodeとCodexを利用できる。Slack設定は標準では実行せず、最後に必要なときだけ行う。
-
-## Command Line Toolsのバージョン
-
-**バージョンは選ばない。** `xcode-select --install`が、そのMacのmacOSに対応する版をAppleから導入する。
-ゼロくんにフル版Xcodeは不要。ターミナルからの導入では、通常Apple Accountへのログインも不要。
-
-導入済み版は次で確認できる。
+まだ repository がない Mac では、`codex` ブランチの bootstrap を一度ファイルへ保存してから
+実行します。
 
 ```bash
-pkgutil --pkg-info=com.apple.pkg.CLTools_Executables
+bootstrap_path="$(mktemp "${TMPDIR:-/tmp}/zerokun-bootstrap.XXXXXX")"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/zerocolored/zero/codex/zerokun/bootstrap-macos.sh \
+  --output "$bootstrap_path"
+bash "$bootstrap_path" --with-slack
+rm -f "$bootstrap_path"
 ```
 
-ゼロくんに必要なツールをまとめて確認するときは次を使う。これは何も変更しない。
+実行前に保存したスクリプトの内容を確認できます。既に clone 済みなら、その repository で
+`git switch codex` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使います。
+
+スクリプトが扱うもの:
+
+- Apple Command Line Tools
+- Homebrew
+- Git / Bun / tmux / Codex CLI 0.149.0以上
+- Codex login
+- zero repository の `codex` branch
+- Zero-kun本体とは分離した既定`zerokun-workspace` repository（既存projectも指定可能）
+- Zero-kun runtime、管理 CLI、watchdog
+- Slack manifest の生成、token 入力、access 初期設定
+
+Claude Code と Claude login は導入しません。
+
+## 人が操作する箇所
+
+macOS や外部サービスの確認画面だけは自動化しません。
+
+1. Command Line Tools の install dialog
+2. Codex CLI の browser login
+3. Slack App 作成・Workspace install
+4. App-Level Token（`xapp-...`）と Bot Token（`xoxb-...`）の貼付け
+5. Slack user/channel ID の選択
+
+token は terminal 入力から state dir の `.env` へ mode 0600 で保存します。標準出力へ token を
+表示しません。
+
+## 段階的に行う
+
+まず何も変更せず診断:
 
 ```bash
 bash zerokun/bootstrap-macos.sh --doctor
 ```
 
-## 人が行う操作
-
-スクリプトが順番に画面を開く。次だけは自動化しない。
-
-1. macOSが表示するCommand Line Toolsのインストール確認
-2. Homebrewが求めるMacの管理者パスワード
-3. GitHub、Claude、Codexのブラウザログイン
-4. Linear、Supabase等のブラウザログイン
-
-Slack App作成は基本セットアップ完了後に、必要なときだけ次で行う。
+基本導入だけ行い Slack を後回し:
 
 ```bash
-bash "$HOME/Desktop/Project/claude-channel-slack/zerokun/bootstrap-macos.sh" --slack-only
+bash zerokun/bootstrap-macos.sh --skip-slack
 ```
 
-Slackトークンは画面に表示せず、形式が違えば終了せず再入力を求める。正しい値は
-`~/.claude/channels/slack/.env`へ権限600で保存される。
+後から Slack 設定だけ再開:
 
-Slack App作成前に、スクリプトがAppの表示名を聞く。既存の「ゼロくん」と区別できる
-`ゼロくん-新Mac`などを入力する。続くbot usernameはSlackの制約により日本語を使えないため、
-`zerokun-new-mac`のように英小文字・数字・`-`・`_`・`.`だけで指定する。
-入力した名前を反映したmanifestがクリップボードへコピーされ、作成URLもターミナルへ表示される。
+```bash
+bash zerokun/bootstrap-macos.sh --slack-only
+```
+
+ログイン画面を起動しない:
+
+```bash
+bash zerokun/bootstrap-macos.sh --skip-logins
+```
+
+配置先を変える:
+
+```bash
+bash zerokun/bootstrap-macos.sh \
+  --repo-dir "$HOME/src/zero" \
+  --project-dir "$HOME/src/my-project" \
+  --with-slack
+```
+
+その他:
+
+```text
+--slack-app-name NAME
+--slack-bot-name NAME
+```
+
+bot username は Slack の制約により英小文字・数字・`-`・`_`・`.` だけです。
 
 ## 初回起動
 
-Slack Appを対象チャンネルへ招待し、新しいターミナルで実行する。
+bootstrap 完了後、新しい terminal を開きます。
 
 ```bash
+codex login status
+zerokun-access status
 zerokun
 ```
 
-Slackからゼロくんを更新するときは、「ゼロくん更新して」と送る。
-
-## 再実行とオプション
-
-bootstrapは再実行可能。設定済みトークンは上書きせず、dirty worktreeも自動更新しない。
+別 terminal で確認:
 
 ```bash
-# ログイン画面を開かない
-bash zerokun/bootstrap-macos.sh --skip-logins
-
-# 基本セットアップ後に続けてSlackも設定する（標準では実行しない）
-bash zerokun/bootstrap-macos.sh --with-slack
-
-# 後からSlack設定だけ再開する
-bash zerokun/bootstrap-macos.sh --slack-only
-
-# Slack App名を先に指定する
-bash zerokun/bootstrap-macos.sh --slack-only --slack-app-name 'ゼロくん-新Mac' --slack-bot-name zerokun-new-mac
-
-# BellSalesAIの各リポをcloneしない
-bash zerokun/bootstrap-macos.sh --skip-projects
+zerokun-status
+zerokun-jobs status
 ```
 
-`zero`はprivateリポのため、まっさらなMacでは旧MacからbootstrapファイルをAirDropするのが最短。
-GitHub Desktop等で先に`zero`をclone済みなら、リポ内の`zerokun/bootstrap-macos.sh`をそのまま実行する。
+Slack で DM し、返された code を端末で承認します。
+
+```bash
+zerokun-access pair <6桁code>
+```
+
+変更依頼も許可する利用者だけ write access を追加します。
+
+```bash
+zerokun-access write allow <Slack user ID>
+```
+
+write access を付けない利用者は、HOME/stateをdenyして対象repositoryと当該添付だけを読む
+job専用permission profileで調査・説明だけを利用できます。
+
+Zero-kun本体repositoryへのwrite jobはhost runtime保護のため拒否されます。変更対象は必ず別の
+`--project-dir`/`routes.json`へ割り当ててください。Codex shellはHOME credentialを継承しないため、
+commit identityは対象repositoryのlocal configへ設定し、認証pushは別の安全なHOME外方式を用意します。
+
+## 再実行
+
+`setup.sh` と bootstrap は既存の `.env` / `access.json` を上書きしません。Claude版からの
+初回切替では旧runnerの新規claimを止め、実行中jobをdrainしてから停止し、待機jobをCodexへ
+sessionなしで引き継ぎます。途中で停止した場合は
+同じ command を再実行できます。自己更新は次を使います。
+
+```bash
+zerokun-update
+```
+
+`origin/codex` への fast-forward だけを行い、未コミット変更や未 push commit がある場合は
+何も更新せず停止します。
+
+## State path
+
+新規環境の既定は次です。
+
+```text
+~/.codex/zerokun
+```
+
+旧版の`~/.claude/channels/slack`に`.env` / `access.json` / `jobs.sqlite3`のいずれかがある
+設定済み環境では、token/access/queueを移行するため旧directoryを自動選択します。
+空directoryは無視します。別の場所を使う場合は最初のsetupより前に設定します。
+
+```bash
+export ZEROKUN_STATE_DIR="$HOME/.codex/zerokun"
+```
+
+launchdからも同じ場所を参照できるようにする必要があります。自動選択されるpathのままなら
+追加設定は不要です。

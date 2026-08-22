@@ -3,7 +3,7 @@ _metadata:
 display_information:
   # bootstrap実行時に入力した表示名へ置換される。直接使う場合もこの名前は変更可能。
   name: Zero-kun Custom
-  description: ローカルClaudeをSlackから安全に呼び出すボット
+  description: ローカルCodexをSlackから安全に呼び出すボット
 features:
   app_home:
     home_tab_enabled: false
@@ -32,8 +32,10 @@ settings:
   event_subscriptions:
     bot_events:
       - app_mention
+      - member_joined_channel
       - message.im
       - message.channels
+      - message.groups
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

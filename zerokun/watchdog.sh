@@ -7,11 +7,25 @@ export PATH
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 
+resolve_state_dir() {
+  if [ -n "${ZEROKUN_STATE_DIR:-}" ]; then
+    printf '%s\n' "$ZEROKUN_STATE_DIR"
+  elif [ -n "${SLACK_STATE_DIR:-}" ]; then
+    printf '%s\n' "$SLACK_STATE_DIR"
+  elif [ -f "$HOME/.claude/channels/slack/jobs.sqlite3" ] \
+    || [ -f "$HOME/.claude/channels/slack/.env" ] \
+    || [ -f "$HOME/.claude/channels/slack/access.json" ]; then
+    printf '%s\n' "$HOME/.claude/channels/slack"
+  else
+    printf '%s\n' "$HOME/.codex/zerokun"
+  fi
+}
+
 process_matches() {
   local pid_file="$1"
   local expected="$2"
   local pid command
-  [ -f "$pid_file" ] || return 1
+  private_regular_file "$pid_file" || return 1
   pid="$(tr -d '[:space:]' < "$pid_file" 2>/dev/null)"
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
@@ -22,9 +36,34 @@ process_matches() {
   [[ "$command" =~ $expected ]]
 }
 
+prepare_state_dir() {
+  if [ -L "$STATE_DIR" ]; then
+    printf 'zerokun watchdog: unsafe state directory symlink: %s\n' "$STATE_DIR" >&2
+    return 1
+  fi
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+  local owner
+  [ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || return 1
+  owner="$(/usr/bin/stat -f '%u' "$STATE_DIR" 2>/dev/null)" || return 1
+  [ "$owner" = "$(/usr/bin/id -u)" ] || return 1
+  chmod 700 "$STATE_DIR" || return 1
+}
+
+private_regular_file() {
+  local file="$1" owner links
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  owner="$(/usr/bin/stat -f '%u' "$file" 2>/dev/null)" || return 1
+  links="$(/usr/bin/stat -f '%l' "$file" 2>/dev/null)" || return 1
+  [ "$owner" = "$(/usr/bin/id -u)" ] && [ "$links" = "1" ]
+}
+
 load_state_env() {
   local line
   [ -f "$STATE_DIR/.env" ] || return 0
+  private_regular_file "$STATE_DIR/.env" || {
+    printf 'zerokun watchdog: unsafe .env; refusing to read it\n' >&2
+    return 1
+  }
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       SLACK_BOT_TOKEN=*)
@@ -55,6 +94,7 @@ notification_user() {
     printf '%s' "$ZEROKUN_WATCHDOG_NOTIFY"
     return 0
   fi
+  private_regular_file "$STATE_DIR/access.json" || return 1
   /usr/bin/python3 - "$STATE_DIR/access.json" <<'PY'
 import json, sys
 try:
@@ -151,7 +191,7 @@ else:
         since = dt.datetime.fromtimestamp(down_since).strftime("%H:%M")
         alert = (
             f"🚨 ゼロくん停止中（bridge: {bridge} / job-runner: {runner}）"
-            f"{since}から。復旧: Muxyのゼロくん用タブで zerokun-restart"
+            f"{since}から。復旧: 端末で zerokun-restart"
         )
         last_alert = now
     next_state = {
@@ -165,10 +205,6 @@ with open(next_path, "w", encoding="utf-8") as handle:
     json.dump(next_state, handle, ensure_ascii=False, separators=(",", ":"))
     handle.write("\n")
 os.chmod(next_path, 0o600)
-try:
-    os.unlink(alert_path)
-except FileNotFoundError:
-    pass
 if alert:
     with open(alert_path, "w", encoding="utf-8") as handle:
         handle.write(alert)
@@ -177,39 +213,35 @@ PY
 }
 
 run_watchdog() {
-  STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+  STATE_DIR="$(resolve_state_dir)"
   STATE_FILE="$STATE_DIR/watchdog-state.json"
-  NEXT_STATE_FILE="$STATE_FILE.next"
-  ALERT_FILE="$STATE_FILE.alert"
-  LOG_FILE="$STATE_DIR/watchdog.log"
-
-  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
-  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  prepare_state_dir || return 1
+  if [ -e "$STATE_FILE" ] && ! private_regular_file "$STATE_FILE"; then
+    printf 'zerokun watchdog: unsafe state file; refusing to read it\n' >&2
+    return 1
+  fi
   load_state_env
   REALERT_MIN="${ZEROKUN_WATCHDOG_REALERT_MIN:-60}"
   case "$REALERT_MIN" in
     ''|*[!0-9]*) REALERT_MIN=60 ;;
   esac
   [ "$REALERT_MIN" -ge 1 ] 2>/dev/null || REALERT_MIN=60
-  if [ -f "$LOG_FILE" ]; then
-    local log_bytes
-    log_bytes="$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d '[:space:]')"
-    if [ -n "$log_bytes" ] && [ "$log_bytes" -gt 1048576 ] 2>/dev/null; then
-      : > "$LOG_FILE"
-    fi
-  fi
-
   if [ -e "$STATE_DIR/watchdog-off" ]; then
     printf '%s zerokun watchdog: muted\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     return 0
   fi
+  NEXT_STATE_FILE="$(mktemp "$STATE_DIR/.watchdog-state.next.XXXXXX")" || return 1
+  ALERT_FILE="$(mktemp "$STATE_DIR/.watchdog-state.alert.XXXXXX")" || {
+    rm -f "$NEXT_STATE_FILE"
+    return 1
+  }
 
   bridge_up=0
   runner_up=0
   process_matches "$STATE_DIR/plugin.lock" 'server\.ts' && bridge_up=1
   process_matches "$STATE_DIR/job-runner.lock/pid" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)' && runner_up=1
   now_epoch="$(date +%s)"
-  export STATE_DIR STATE_FILE NEXT_STATE_FILE ALERT_FILE LOG_FILE REALERT_MIN
+  export STATE_DIR STATE_FILE NEXT_STATE_FILE ALERT_FILE REALERT_MIN
   export bridge_up runner_up now_epoch
 
   if ! prepare_state_transition; then
@@ -218,7 +250,7 @@ run_watchdog() {
     return 0
   fi
 
-  if [ -f "$ALERT_FILE" ]; then
+  if [ -s "$ALERT_FILE" ]; then
     local alert
     alert="$(cat "$ALERT_FILE")"
     if send_notification "$alert"; then
@@ -230,6 +262,7 @@ run_watchdog() {
   else
     mv -f "$NEXT_STATE_FILE" "$STATE_FILE"
   fi
+  rm -f "$ALERT_FILE"
 
   printf '%s zerokun watchdog: bridge=%s runner=%s\n' \
     "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
@@ -248,8 +281,8 @@ selftest() {
   test_dir="$(mktemp -d "${TMPDIR:-/tmp}/zerokun-watchdog.XXXXXX")" || return 1
   fake_server="$test_dir/server.ts"
   fake_runner="$test_dir/job-runner.ts"
-  printf '#!/bin/bash\nsleep 30\n' > "$fake_server"
-  printf '#!/bin/bash\nsleep 30\n' > "$fake_runner"
+  printf '#!/bin/bash\nexec -a "$0" sleep 30\n' > "$fake_server"
+  printf '#!/bin/bash\nexec -a "$0 $1" sleep 30\n' > "$fake_runner"
   /bin/bash "$fake_server" & server_pid=$!
   /bin/bash "$fake_runner" daemon & runner_pid=$!
   trap "kill $server_pid $runner_pid 2>/dev/null || true; wait $server_pid $runner_pid 2>/dev/null || true; rm -rf '$test_dir'" EXIT
@@ -315,7 +348,8 @@ if [ "${1:-}" = "--selftest" ]; then
 fi
 
 if [ "${1:-}" = "--test-notification" ]; then
-  STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+  STATE_DIR="$(resolve_state_dir)"
+  prepare_state_dir || exit 1
   load_state_env
   if send_notification '🧪 ゼロくんwatchdog通知テスト（実装確認のための1通です）'; then
     printf 'zerokun watchdog: test notification sent\n'
@@ -324,5 +358,5 @@ if [ "${1:-}" = "--test-notification" ]; then
   exit 1
 fi
 
-run_watchdog || true
-exit 0
+run_watchdog
+exit $?

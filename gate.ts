@@ -2,12 +2,63 @@
  * Pure access-policy helpers for the Slack channel plugin.
  *
  * Extracted from server.ts so the policy decisions can be unit-tested
- * without spinning up the Slack/MCP runtime. server.ts imports these.
+ * without spinning up the Slack runtime. server.ts imports these.
  */
 
 export type ChannelPolicy = {
   requireMention: boolean
   allowFrom: string[]
+}
+
+export type LegacyThreadEntry = {
+  channel_id: string
+  repo_path?: string
+  adopted_from_ts?: string
+  last_activity_ms?: number
+}
+
+export type ValidLegacyThread = {
+  threadTs: string
+  entry: LegacyThreadEntry
+}
+
+/**
+ * Validate the complete legacy threads.json shape without silently discarding
+ * ownership records. Valid rows may be adopted immediately, but any structural
+ * error keeps the migration marker unset so an operator can repair and retry.
+ */
+export function validateLegacyThreadMap(value: unknown): {
+  valid: ValidLegacyThread[]
+  invalidKeys: string[]
+} {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { valid: [], invalidKeys: ['<root>'] }
+  }
+
+  const valid: ValidLegacyThread[] = []
+  const invalidKeys: string[] = []
+  for (const [threadTs, candidate] of Object.entries(value)) {
+    if (!/^\d+\.\d+$/.test(threadTs)
+      || candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      invalidKeys.push(threadTs)
+      continue
+    }
+    const entry = candidate as Record<string, unknown>
+    if (typeof entry.channel_id !== 'string' || entry.channel_id.trim() === ''
+      || (entry.repo_path !== undefined && typeof entry.repo_path !== 'string')
+      || (entry.adopted_from_ts !== undefined
+        && (typeof entry.adopted_from_ts !== 'string'
+          || !/^\d+\.\d+$/.test(entry.adopted_from_ts)))
+      || (entry.last_activity_ms !== undefined
+        && (typeof entry.last_activity_ms !== 'number'
+          || !Number.isFinite(entry.last_activity_ms)
+          || entry.last_activity_ms < 0))) {
+      invalidKeys.push(threadTs)
+      continue
+    }
+    valid.push({ threadTs, entry: entry as LegacyThreadEntry })
+  }
+  return { valid, invalidKeys }
 }
 
 /**
@@ -94,9 +145,9 @@ export function effectiveDmAllowFrom(access: {
 //
 // The bridge only receives an inbound event for a channel message when the
 // sender @mentions the bot (app_mention) — a follow-up reply in a thread the
-// bot already owns, posted WITHOUT a re-mention, never reaches Claude. On top
+// bot already owns, posted WITHOUT a re-mention, never reaches the worker. On top
 // of that, Socket Mode has no durable queue, so any event that arrives while no
-// Claude session is consuming is simply lost. The poller closes both gaps by
+// gateway is consuming is simply lost. The poller closes both gaps by
 // periodically re-reading `conversations.replies` for the threads the bot
 // already owns (the threads.json map is itself the subscription list) and
 // delivering replies newer than a per-thread cursor. These pure helpers hold
@@ -106,11 +157,31 @@ export function effectiveDmAllowFrom(access: {
 export type SlackReply = {
   ts?: string
   thread_ts?: string
+  reply_count?: number
+  latest_reply?: string
   user?: string
   bot_id?: string
   subtype?: string
   text?: string
   files?: { id: string }[]
+}
+
+/**
+ * `conversations.history` omits reply bodies. Select parents whose newest
+ * reply may fall inside the catch-up window so server.ts can expand them via
+ * `conversations.replies`. Otherwise an offline mention in an unadopted thread
+ * never reaches the durable queue.
+ */
+export function catchupThreadParents(history: SlackReply[], oldestMs: number): string[] {
+  const parents = new Set<string>()
+  for (const message of history) {
+    if (!message.ts || !Number.isFinite(message.reply_count) || message.reply_count! <= 0) continue
+    if (message.thread_ts && message.thread_ts !== message.ts) continue
+    const latestReplyMs = message.latest_reply ? slackTsToMs(message.latest_reply) : Number.NaN
+    if (Number.isFinite(latestReplyMs) && latestReplyMs < oldestMs) continue
+    parents.add(message.ts)
+  }
+  return [...parents]
 }
 
 /** Slack ts ("1712345678.000200") → epoch milliseconds. */
@@ -121,6 +192,72 @@ export function slackTsToMs(ts: string): number {
 /** Epoch milliseconds → Slack ts string, usable as a `conversations.replies` cursor. */
 export function msToSlackTs(ms: number): string {
   return (ms / 1000).toFixed(6)
+}
+
+export function slackThreadKey(chatId: string, threadTs: string): string {
+  return JSON.stringify([chatId, threadTs])
+}
+
+export function singleFlightAsync(
+  operation: () => Promise<void>,
+  onError: (error: unknown) => void = () => {},
+): () => Promise<void> {
+  let inFlight: Promise<void> | null = null
+  return () => {
+    if (inFlight) return inFlight
+    inFlight = operation().catch(onError).finally(() => { inFlight = null })
+    return inFlight
+  }
+}
+
+/**
+ * Return one durable round-robin ordering. The caller persists the last item
+ * it actually completed; a restart can therefore resume after that item
+ * without depending on in-memory array position.
+ */
+export function roundRobinAfter<T>(items: T[], lastCompleted: T | null): T[] {
+  if (lastCompleted === null) return items
+  const index = items.indexOf(lastCompleted)
+  return index < 0
+    ? items
+    : [...items.slice(index + 1), ...items.slice(0, index + 1)]
+}
+
+/** Slack SDK PlatformError keeps the Web API code in `data.error`. */
+export function slackApiErrorCode(error: unknown): string | null {
+  if (error && typeof error === 'object') {
+    const data = (error as { data?: unknown }).data
+    if (data && typeof data === 'object'
+      && typeof (data as { error?: unknown }).error === 'string') {
+      return (data as { error: string }).error
+    }
+    if (typeof (error as { code?: unknown }).code === 'string') {
+      return (error as { code: string }).code
+    }
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  const match = message.match(/(?:^|\b)(invalid_cursor|channel_not_found|thread_not_found|not_in_channel|is_archived)(?:\b|$)/i)
+  return match?.[1]?.toLowerCase() ?? null
+}
+
+export function isInvalidSlackCursor(error: unknown): boolean {
+  return slackApiErrorCode(error) === 'invalid_cursor'
+}
+
+/** A missing DM/channel identifier cannot recover without discovering a new ID. */
+export function isTerminalSlackHistoryError(error: unknown): boolean {
+  return slackApiErrorCode(error) === 'channel_not_found'
+}
+
+/** A missing channel or thread makes this exact durable reply-scan key unusable. */
+export function isTerminalSlackReplyScanError(error: unknown): boolean {
+  return ['channel_not_found', 'thread_not_found'].includes(
+    slackApiErrorCode(error) ?? '',
+  )
+}
+
+export function slackReplyScanFailureDisposition(error: unknown): 'discard' | 'defer' {
+  return isTerminalSlackReplyScanError(error) ? 'discard' : 'defer'
 }
 
 // Slack renders an addressed mention as a token, never as plain text:
@@ -193,6 +330,26 @@ export function resolveIsMention(
   return isDM || mentionsBot(text, botUserId)
 }
 
+/**
+ * Detached self-update is a privileged side effect, so only a short imperative
+ * utterance is accepted. Questions and explanatory mentions stay in the
+ * normal read-only/FIFO path instead of accidentally updating the bot.
+ */
+export function isExplicitUpdateRequest(text: string): boolean {
+  const normalized = text
+    .trim()
+    // `message.channels` and `app_mention` can race for the same Slack post.
+    // Accept the same explicit command whether its leading mention was already
+    // stripped by the app_mention handler or not.
+    .replace(/^(?:<@[UW][A-Z0-9]+(?:\|[^>]+)?>[ \t]*)+/i, '')
+    .toLowerCase()
+    .replace(/[。．.!！]+$/g, '')
+    .replace(/\s+/g, ' ')
+  const japanese = /^(?:ゼロくん|zero-?kun|zerokun)(?:を|の)?(?:最新版(?:へ|に)?|本体(?:を)?|コード(?:を)?)?(?:更新|アップデート)(?:して|してください|して下さい|をお願い|お願い|お願いします|をお願いします|を実行して|を実行してください)$/i
+  const english = /^(?:please )?(?:(?:update|upgrade) (?:zero[ -]?kun|zerokun)|(?:zero[ -]?kun|zerokun) (?:update|upgrade))(?: now)?$/i
+  return japanese.test(normalized) || english.test(normalized)
+}
+
 export type CatchupSweepPolicy = {
   channelId: string
   channelType: 'im' | 'channel'
@@ -243,7 +400,7 @@ export function planCatchupSweep(
  * allowlist is checked first so an unknown channel reports the real reason.
  *
  * The noise rule only applies where `requireMention` is on. A channel with it
- * off has explicitly asked Claude to read everything, and the live path obeys
+ * off has explicitly asked Codex to read everything, and the live path obeys
  * that; filtering here too would make the two paths disagree about the same
  * message depending on which one happened to see it first.
  */
@@ -270,6 +427,15 @@ export function advanceReadCursor(replies: SlackReply[], cursorTs: string): stri
     if (r.ts && parseFloat(r.ts) > parseFloat(maxTs)) maxTs = r.ts
   }
   return maxTs
+}
+
+/** Oldest timestamp in a newest-first history page, for stable time pagination. */
+export function retreatReadCursor(messages: SlackReply[], latestTs: string): string {
+  let minTs = latestTs
+  for (const message of messages) {
+    if (message.ts && parseFloat(message.ts) < parseFloat(minTs)) minTs = message.ts
+  }
+  return minTs
 }
 
 export type ThreadPollPlan = {
@@ -300,6 +466,30 @@ export function planThreadPoll(
     const verdict = decideThreadReplyDelivery(policy, reply, botUserId)
     if (verdict === 'deliver') plan.deliver.push(reply)
     else plan.skipped.push({ reply, reason: verdict === 'drop-policy' ? 'policy' : 'others' })
+  }
+  return plan
+}
+
+/**
+ * DM threads have no channel policy entry. They still need catch-up, but only
+ * for currently authorized human senders. Keeping this separate prevents the
+ * channel helper's default-deny rule from silently dropping every DM reply.
+ */
+export function planDirectMessageThreadPoll(
+  replies: SlackReply[],
+  cursorTs: string,
+  allowedUsers: Iterable<string>,
+  botUserId: string | undefined,
+): ThreadPollPlan {
+  const allowed = new Set(allowedUsers)
+  const plan: ThreadPollPlan = {
+    cursor: advanceReadCursor(replies, cursorTs),
+    deliver: [],
+    skipped: [],
+  }
+  for (const reply of selectNewReplies(replies, cursorTs, botUserId)) {
+    if (reply.user && allowed.has(reply.user)) plan.deliver.push(reply)
+    else plan.skipped.push({ reply, reason: 'policy' })
   }
   return plan
 }
@@ -337,7 +527,7 @@ export function threadPollCursor(
 /**
  * Which delivery keys to keep once the set outgrows `limit`: the newest
  * `limit / 2`, in insertion order. Bounded so the on-disk record of what has
- * already been handed to Claude cannot grow forever, halved rather than
+ * already been handed to Codex cannot grow forever, halved rather than
  * trimmed by one so the pruning is amortised.
  */
 export function pruneDeliveredKeys(keys: Iterable<string>, limit: number): string[] {

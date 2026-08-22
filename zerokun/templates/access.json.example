@@ -1,11 +1,7 @@
 {
-  "dmPolicy": "allowlist",
-  "allowFrom": ["U_あなたのSlackユーザーID"],
-  "channels": {
-    "C_許可するチャンネルID": {
-      "requireMention": true,
-      "allowFrom": ["U_あなたのSlackユーザーID"]
-    }
-  },
+  "dmPolicy": "pairing",
+  "allowFrom": [],
+  "writeAllowFrom": [],
+  "channels": {},
   "pending": {}
 }

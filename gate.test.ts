@@ -7,17 +7,80 @@ import {
   msToSlackTs,
   threadPollCursor,
   advanceReadCursor,
+  retreatReadCursor,
   planThreadPoll,
+  planDirectMessageThreadPoll,
   planCatchupSweep,
+  catchupThreadParents,
   pruneDeliveredKeys,
   classifyThreadReply,
   mentionsBot,
   resolveIsMention,
   decideThreadReplyDelivery,
   effectiveDmAllowFrom,
+  isExplicitUpdateRequest,
+  slackThreadKey,
+  singleFlightAsync,
+  validateLegacyThreadMap,
+  roundRobinAfter,
+  isInvalidSlackCursor,
+  slackApiErrorCode,
+  isTerminalSlackHistoryError,
+  isTerminalSlackReplyScanError,
+  slackReplyScanFailureDisposition,
   type ChannelPolicy,
   type SlackReply,
 } from './gate.ts'
+
+describe('durable round-robin scheduling', () => {
+  test('channel budgetを超える30件も次周期で11件目から再開する', () => {
+    const channels = Array.from({ length: 30 }, (_, index) => `C${String(index + 1).padStart(2, '0')}`)
+    const first = roundRobinAfter(channels, null).slice(0, 10)
+    const second = roundRobinAfter(channels, first.at(-1)!).slice(0, 10)
+    const third = roundRobinAfter(channels, second.at(-1)!).slice(0, 10)
+    expect([...first, ...second, ...third]).toEqual(channels)
+  })
+
+  test('40-call replies budgetを超える55 threadも次周期で41件目から再開する', () => {
+    const threads = Array.from({ length: 55 }, (_, index) => `thread-${String(index + 1).padStart(2, '0')}`)
+    const first = roundRobinAfter(threads, null).slice(0, 40)
+    const second = roundRobinAfter(threads, first.at(-1)!).slice(0, 40)
+    expect(second.slice(0, 15)).toEqual(threads.slice(40))
+    expect(second.at(15)).toBe(threads[0])
+  })
+
+  test('前回itemが削除済みなら現在の先頭から安全に再開する', () => {
+    expect(roundRobinAfter(['C02', 'C03'], 'C01')).toEqual(['C02', 'C03'])
+  })
+})
+
+describe('Slack cursor recovery', () => {
+  test('Slack SDK PlatformErrorとplain errorのinvalid_cursorを識別する', () => {
+    expect(isInvalidSlackCursor({ data: { ok: false, error: 'invalid_cursor' } })).toBe(true)
+    expect(isInvalidSlackCursor({ code: 'invalid_cursor' })).toBe(true)
+    expect(isInvalidSlackCursor(new Error('Slack API error: invalid_cursor'))).toBe(true)
+    expect(isInvalidSlackCursor({ data: { error: 'channel_not_found' } })).toBe(false)
+    expect(slackApiErrorCode({ data: { error: 'channel_not_found' } })).toBe('channel_not_found')
+    expect(isTerminalSlackHistoryError({ data: { error: 'channel_not_found' } })).toBe(true)
+    expect(isTerminalSlackHistoryError({ data: { error: 'not_in_channel' } })).toBe(false)
+    expect(isTerminalSlackHistoryError(new Error('Slack: is_archived'))).toBe(false)
+
+    expect(isTerminalSlackReplyScanError({ data: { error: 'thread_not_found' } })).toBe(true)
+    expect(isTerminalSlackReplyScanError({ data: { error: 'channel_not_found' } })).toBe(true)
+    expect(isTerminalSlackReplyScanError({ data: { error: 'not_in_channel' } })).toBe(false)
+    expect(isTerminalSlackReplyScanError(new Error('Slack: is_archived'))).toBe(false)
+    expect(isTerminalSlackReplyScanError({ data: { error: 'ratelimited' } })).toBe(false)
+    expect(slackReplyScanFailureDisposition({ data: { error: 'not_in_channel' } })).toBe('defer')
+    expect(slackReplyScanFailureDisposition({ data: { error: 'thread_not_found' } })).toBe('discard')
+  })
+
+  test('historyはopaque cursorでなくoldest timestampへ後退して再開する', () => {
+    expect(retreatReadCursor([
+      { ts: '300.000000' }, { ts: '250.000000' }, { ts: '275.000000' },
+    ], '400.000000')).toBe('250.000000')
+    expect(retreatReadCursor([], '400.000000')).toBe('400.000000')
+  })
+})
 
 const HUMAN = 'U012ABCDE'
 const BOT = 'B0123ABCD'
@@ -28,6 +91,38 @@ const policy = (over: Partial<ChannelPolicy> = {}): ChannelPolicy => ({
   requireMention: false,
   allowFrom: [],
   ...over,
+})
+
+describe('validateLegacyThreadMap', () => {
+  test('valid ownership rowを型付きで返す', () => {
+    const input = {
+      '1786325000.000001': {
+        channel_id: 'C012ABCDE',
+        repo_path: '/tmp/project',
+        adopted_from_ts: '1786324999.000001',
+        last_activity_ms: 1_786_325_000_000,
+      },
+    }
+    expect(validateLegacyThreadMap(input)).toEqual({
+      valid: [{ threadTs: '1786325000.000001', entry: input['1786325000.000001'] }],
+      invalidKeys: [],
+    })
+  })
+
+  test('valid JSONでもownership欠損や不正thread tsをmigration対象外として報告する', () => {
+    const result = validateLegacyThreadMap({
+      '1786325000.000001': {},
+      invalid: { channel_id: 'C012ABCDE' },
+      '1786325001.000001': null,
+    })
+    expect(result.valid).toEqual([])
+    expect(result.invalidKeys).toEqual([
+      '1786325000.000001',
+      'invalid',
+      '1786325001.000001',
+    ])
+    expect(validateLegacyThreadMap([]).invalidKeys).toEqual(['<root>'])
+  })
 })
 
 describe('decideChannelPolicy — humans (default-allow)', () => {
@@ -109,6 +204,12 @@ describe('slackTs <-> ms conversion', () => {
     const ms = 1712345678500
     expect(slackTsToMs(msToSlackTs(ms))).toBe(ms)
   })
+})
+
+test('poll cursor keyは同じthread_tsでもchannelごとに分離する', () => {
+  expect(slackThreadKey('C-FIRST', '123.456')).not.toBe(
+    slackThreadKey('C-SECOND', '123.456'),
+  )
 })
 
 describe('selectNewReplies — thread catch-up poller', () => {
@@ -418,7 +519,39 @@ describe('resolveIsMention — the live-handler wiring', () => {
   })
 })
 
+describe('isExplicitUpdateRequest — privileged detached route', () => {
+  test('短い命令形だけを自己更新として扱う', () => {
+    expect(isExplicitUpdateRequest('ゼロくんを最新版に更新してください。')).toBe(true)
+    expect(isExplicitUpdateRequest('ゼロくんのアップデートお願いします')).toBe(true)
+    expect(isExplicitUpdateRequest('please update zero-kun now')).toBe(true)
+    expect(isExplicitUpdateRequest('zerokun update')).toBe(true)
+    expect(isExplicitUpdateRequest('<@U0123456789> ゼロくんを更新してください')).toBe(true)
+  })
+
+  test('質問・説明・否定は通常jobに残す', () => {
+    expect(isExplicitUpdateRequest('ゼロくんの更新方法を教えて')).toBe(false)
+    expect(isExplicitUpdateRequest('ゼロくんを更新できますか？')).toBe(false)
+    expect(isExplicitUpdateRequest('ゼロくんを更新しないで')).toBe(false)
+    expect(isExplicitUpdateRequest('update zero-kun の仕組み')).toBe(false)
+  })
+})
+
 describe('planCatchupSweep — startup recovery', () => {
+  test('一時失敗後の定期catch-upを再実行し、同時実行は重ねない', async () => {
+    let calls = 0
+    let successes = 0
+    const run = singleFlightAsync(async () => {
+      calls += 1
+      if (calls <= 2) throw new Error('temporary Slack failure')
+      successes += 1
+    })
+    await Promise.all([run(), run()])
+    await run()
+    await run()
+    expect(calls).toBe(3)
+    expect(successes).toBe(1)
+  })
+
   const BOT_USER = 'U0B8JC02X7E'
   const NOW = 1_786_400_000_000
   const ts = (offsetMs: number) => ((NOW + offsetMs) / 1000).toFixed(6)
@@ -427,6 +560,15 @@ describe('planCatchupSweep — startup recovery', () => {
     user: HUMAN,
     text: `<@${BOT_USER}> お願い`,
     ...over,
+  })
+
+  test('履歴parentの窓内replyを展開対象にし、古いthread replyはAPI取得前に除外する', () => {
+    expect(catchupThreadParents([
+      message(-50_000, { reply_count: 2, latest_reply: ts(-5_000) }),
+      message(-86_400_000, { reply_count: 1, latest_reply: ts(-1_000) }),
+      message(-40_000, { reply_count: 1, latest_reply: ts(-70_000) }),
+      message(-30_000, { reply_count: 0 }),
+    ], NOW - 60_000)).toEqual([ts(-50_000), ts(-86_400_000)])
   })
 
   test('channelはメンション済み・未配送・窓内の人間メッセージだけを古い順に返す', () => {
@@ -477,6 +619,24 @@ describe('planCatchupSweep — startup recovery', () => {
     }, BOT_USER)
 
     expect(plan.map(item => item.ts)).toEqual([ts(-20_000), ts(-10_000)])
+  })
+
+  test('durable ledgerで既処理を除外すればlimitを消費せず全件が有限回で進む', () => {
+    const history = Array.from({ length: 1_001 }, (_, index) => message(-1_001_000 + index * 1_000))
+    const handled = new Set<string>()
+    let rounds = 0
+    while (handled.size < history.length && rounds < 60) {
+      const plan = planCatchupSweep(history, handled, {
+        channelId: 'C123', channelType: 'channel',
+        channelPolicy: policy({ requireMention: true }),
+        oldestMs: NOW - 2_000_000,
+        limit: 20,
+      }, BOT_USER)
+      for (const item of plan) handled.add(`C123:${item.ts}`)
+      rounds += 1
+    }
+    expect(handled.size).toBe(1_001)
+    expect(rounds).toBe(51)
   })
 })
 
@@ -596,6 +756,26 @@ describe('planThreadPoll — one page of a thread, end to end', () => {
 
   test('an empty page changes nothing', () => {
     expect(planThreadPoll([], CURSOR, open, BOT_USER)).toEqual({ cursor: CURSOR, deliver: [], skipped: [] })
+  })
+})
+
+describe('planDirectMessageThreadPoll — DM follow-up recovery', () => {
+  const CURSOR = '1786325000.000000'
+  const BOT_USER = 'U0B8JC02X7E'
+
+  test('authorized human replies are delivered without a channel policy', () => {
+    const reply = { ts: '1786325100.000000', user: HUMAN, text: '続けて' }
+    const plan = planDirectMessageThreadPoll([reply], CURSOR, [HUMAN], BOT_USER)
+    expect(plan.deliver).toEqual([reply])
+    expect(plan.skipped).toEqual([])
+  })
+
+  test('revoked senders are skipped while the read cursor still advances', () => {
+    const reply = { ts: '1786325100.000000', user: HUMAN, text: '続けて' }
+    const plan = planDirectMessageThreadPoll([reply], CURSOR, [], BOT_USER)
+    expect(plan.deliver).toEqual([])
+    expect(plan.skipped).toEqual([{ reply, reason: 'policy' }])
+    expect(plan.cursor).toBe(reply.ts)
   })
 })
 

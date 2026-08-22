@@ -1,119 +1,204 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import {
+  chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync,
+} from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 
-// 2026-08-17: 自己更新の検証を手で流すたびに、稼働中のゼロくんが kill されていた
-// (実測 7 回)。原因は claude-channel.sh が CLAUDE_CHANNEL_REPLACE=1 だけで
-// 既存ボットを kill していたこと。フラグ単独では殺せないことをここで固定する。
-
-const LAUNCHER = join(dirname(import.meta.dir), 'claude-channel.sh')
-const BOT_PATTERN = 'dangerously-load-development-channels server:slack-channel'
-
-const tempDirs: string[] = []
-const fakeBots: Array<{ kill: () => void }> = []
+const LAUNCHER = join(dirname(import.meta.dir), 'codex-channel.sh')
+const temporaryDirs: string[] = []
+const processes: Bun.Subprocess[] = []
 
 afterEach(() => {
-  for (const bot of fakeBots.splice(0)) bot.kill()
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  for (const process of processes.splice(0)) {
+    try { process.kill() } catch {}
+  }
+  for (const dir of temporaryDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-function makeTempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'zerokun-launcher-test-'))
-  tempDirs.push(dir)
+function fixture(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'zerokun-codex-launcher-'))
+  temporaryDirs.push(dir)
   return dir
 }
 
-/** 稼働中ゼロくんの代役。pgrep -f が拾う形の command line を持つ。 */
-function startFakeBot(dir: string) {
-  const script = join(dir, 'fake-bot.sh')
-  writeFileSync(script, '#!/bin/bash\nsleep 30\n')
-  chmodSync(script, 0o755)
-  const proc = Bun.spawn(['/bin/bash', script, `--${BOT_PATTERN}`], {
-    stdin: 'ignore',
-    stdout: 'ignore',
-    stderr: 'ignore',
+function startGateway(state: string): Bun.Subprocess {
+  const server = join(state, 'server.ts')
+  writeFileSync(server, '#!/bin/bash\nsleep 30\n')
+  chmodSync(server, 0o700)
+  const process = Bun.spawn(['/bin/bash', server], {
+    stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
   })
-  fakeBots.push({ kill: () => { try { proc.kill() } catch {} } })
-  return proc
+  processes.push(process)
+  writeFileSync(join(state, 'plugin.lock'), `${process.pid}\n`)
+  const started = Bun.spawnSync(['/bin/ps', '-o', 'lstart=', '-p', String(process.pid)], {
+    stdout: 'pipe',
+  }).stdout.toString().trim()
+  writeFileSync(join(state, 'plugin.lock.identity'), JSON.stringify({
+    pid: process.pid, started, nonce: 'launcher-test',
+  }))
+  return process
 }
 
-async function runLauncher(env: Record<string, string>, projectDir: string) {
-  const proc = Bun.spawn([LAUNCHER, projectDir], {
-    env: { ...process.env, CHANNEL: 'slack', ...env },
-    stdin: 'ignore',
-    stdout: 'pipe',
-    stderr: 'pipe',
+async function runLauncher(state: string, env: Record<string, string>) {
+  const fakeBin = join(state, 'bin')
+  mkdirSync(fakeBin, { recursive: true })
+  for (const command of ['bun', 'caffeinate']) {
+    const path = join(fakeBin, command)
+    writeFileSync(path, [
+      '#!/bin/bash',
+      '[ -z "${FAKE_BUN_LOG:-}" ] || printf "%s\\n" "$*" >> "$FAKE_BUN_LOG"',
+      'exit 0',
+      '',
+    ].join('\n'))
+    chmodSync(path, 0o700)
+  }
+  const codex = join(fakeBin, 'codex')
+  writeFileSync(codex, `#!/bin/bash
+if [ "\${FAKE_BARE_VERSION:-0}" = "1" ]; then
+  echo "\${FAKE_CODEX_VERSION:-0.149.0}"
+else
+  echo "codex-cli \${FAKE_CODEX_VERSION:-0.149.0}"
+fi
+`)
+  chmodSync(codex, 0o700)
+  const process = Bun.spawn(['/bin/bash', LAUNCHER, state], {
+    env: {
+      ...processEnvWithout('ZEROKUN_REPLACE_TOKEN'),
+      HOME: state,
+      PATH: `${fakeBin}:/usr/bin:/bin`,
+      ZEROKUN_CODEX_BIN: codex,
+      ZEROKUN_STATE_DIR: state,
+      ...env,
+    },
+    stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
   })
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(process.stdout).text(),
+    new Response(process.stderr).text(),
+    process.exited,
   ])
-  const exitCode = await proc.exited
   return { exitCode, output: `${stdout}\n${stderr}` }
 }
 
-describe('claude-channel.sh の入れ替えガード', () => {
-  test('CLAUDE_CHANNEL_REPLACE=1 だけでは稼働中ボットを kill しない', async () => {
-    const dir = makeTempDir()
-    const bot = startFakeBot(dir)
-    await Bun.sleep(300)
+function processEnvWithout(key: string): Record<string, string> {
+  const environment: Record<string, string> = {}
+  for (const [name, value] of Object.entries(process.env)) {
+    if (name !== key && value !== undefined) environment[name] = value
+  }
+  return environment
+}
 
-    const result = await runLauncher(
-      {
-        CLAUDE_CHANNEL_REPLACE: '1',
-        CLAUDE_CHANNEL_REPLACE_TOKEN_FILE: join(dir, 'replace-token'),
-      },
-      dir,
-    )
+describe('codex-channel.sh replacement guard', () => {
+  test('Codex 0.149.0未満をjob受付前に拒否する', async () => {
+    const state = fixture()
+    const result = await runLauncher(state, {
+      FAKE_CODEX_VERSION: '0.148.9',
+      ZEROKUN_DRY_RUN: '1',
+    })
+    expect(result.exitCode).toBe(1)
+    expect(result.output).toContain('0.149.0 以上')
+  })
 
+  test('prefixなしのCodex semverも正しく検出する', async () => {
+    const state = fixture()
+    const result = await runLauncher(state, {
+      FAKE_BARE_VERSION: '1',
+      FAKE_CODEX_VERSION: '0.149.0',
+      ZEROKUN_DRY_RUN: '1',
+    })
+    expect(result.output).not.toContain('0.149.0 以上が必要')
+  })
+
+  test('ZEROKUN_REPLACE=1だけでは稼働中gatewayを停止しない', async () => {
+    const state = fixture()
+    const gateway = startGateway(state)
+    await Bun.sleep(100)
+    const result = await runLauncher(state, {
+      ZEROKUN_REPLACE: '1',
+      ZEROKUN_REPLACE_TOKEN_FILE: join(state, 'replace-token'),
+    })
     expect(result.exitCode).toBe(1)
     expect(result.output).toContain('有効なワンタイムトークンがありません')
-    expect(result.output).toContain('起動を中止しました')
-    // 代役が生きたまま = 稼働中ゼロくんが巻き添えで落ちない
-    expect(bot.killed).toBe(false)
+    expect(gateway.killed).toBe(false)
   })
 
-  test('トークンが一致しなければ kill しない', async () => {
-    const dir = makeTempDir()
-    const bot = startFakeBot(dir)
-    const tokenFile = join(dir, 'replace-token')
-    writeFileSync(tokenFile, 'correct-token')
-    await Bun.sleep(300)
-
-    const result = await runLauncher(
-      {
-        CLAUDE_CHANNEL_REPLACE: '1',
-        CLAUDE_CHANNEL_REPLACE_TOKEN: 'wrong-token',
-        CLAUDE_CHANNEL_REPLACE_TOKEN_FILE: tokenFile,
-      },
-      dir,
-    )
-
+  test('不一致tokenでは停止しない', async () => {
+    const state = fixture()
+    const gateway = startGateway(state)
+    writeFileSync(join(state, 'replace-token'), 'correct')
+    await Bun.sleep(100)
+    const result = await runLauncher(state, {
+      ZEROKUN_REPLACE: '1',
+      ZEROKUN_REPLACE_TOKEN: 'wrong',
+      ZEROKUN_REPLACE_TOKEN_FILE: join(state, 'replace-token'),
+    })
     expect(result.exitCode).toBe(1)
-    expect(result.output).toContain('起動を中止しました')
-    expect(bot.killed).toBe(false)
+    expect(gateway.killed).toBe(false)
   })
 
-  test('自己更新が発行したトークンが一致した時だけ入れ替えを許可する', async () => {
-    const dir = makeTempDir()
-    startFakeBot(dir)
-    const tokenFile = join(dir, 'replace-token')
-    writeFileSync(tokenFile, 'one-time-token')
-    await Bun.sleep(300)
-
-    const result = await runLauncher(
-      {
-        CLAUDE_CHANNEL_REPLACE: '1',
-        CLAUDE_CHANNEL_REPLACE_TOKEN: 'one-time-token',
-        CLAUDE_CHANNEL_REPLACE_TOKEN_FILE: tokenFile,
-        CLAUDE_CHANNEL_DRY_RUN: '1', // 実機のゼロくんを巻き込まないため kill 手前で止める
-      },
-      dir,
-    )
-
+  test('一致するone-time tokenだけがdry-run入れ替えを許可し、tokenを消す', async () => {
+    const state = fixture()
+    const gateway = startGateway(state)
+    const tokenFile = join(state, 'replace-token')
+    writeFileSync(tokenFile, 'one-time')
+    await Bun.sleep(100)
+    const result = await runLauncher(state, {
+      ZEROKUN_REPLACE: '1',
+      ZEROKUN_REPLACE_TOKEN: 'one-time',
+      ZEROKUN_REPLACE_TOKEN_FILE: tokenFile,
+      ZEROKUN_DRY_RUN: '1',
+    })
     expect(result.exitCode).toBe(0)
     expect(result.output).toContain('ワンタイムトークンを確認しました')
-    expect(existsSync(tokenFile)).toBe(false) // 使い回せない
+    expect(existsSync(tokenFile)).toBe(false)
+    expect(gateway.killed).toBe(false)
+  })
+
+  test('親updaterのone-time tokenだけがjournal保持中のrestartを許可する', async () => {
+    const state = fixture()
+    const tokenFile = join(state, 'replace-token')
+    const bunLog = join(state, 'bun.log')
+    writeFileSync(join(state, 'update-transaction.json'), '{}')
+    writeFileSync(tokenFile, 'restart-once')
+    const result = await runLauncher(state, {
+      ZEROKUN_UPDATE_RESTART: '1',
+      ZEROKUN_REPLACE_TOKEN: 'restart-once',
+      ZEROKUN_REPLACE_TOKEN_FILE: tokenFile,
+      ZEROKUN_DRY_RUN: '1',
+      FAKE_BUN_LOG: bunLog,
+    })
+    expect(result.exitCode).toBe(0)
+    expect(result.output).toContain('自己更新restartのワンタイムトークンを確認しました')
+    expect(existsSync(tokenFile)).toBe(false)
+    expect(readFileSync(bunLog, 'utf8')).not.toContain('recover-only')
+  })
+
+  test('tokenなしではjournalを無視できずrecover-onlyを呼ぶ', async () => {
+    const state = fixture()
+    const bunLog = join(state, 'bun.log')
+    writeFileSync(join(state, 'update-transaction.json'), '{}')
+    const result = await runLauncher(state, {
+      ZEROKUN_UPDATE_RESTART: '1',
+      ZEROKUN_DRY_RUN: '1',
+      FAKE_BUN_LOG: bunLog,
+    })
+    expect(result.output).toContain('未完了の自己更新を検出しました')
+    expect(readFileSync(bunLog, 'utf8')).toContain('recover-only')
+  })
+
+  test('candidateのCodex version検査が失敗してもjournal recoveryを先に呼ぶ', async () => {
+    const state = fixture()
+    const bunLog = join(state, 'bun.log')
+    writeFileSync(join(state, 'update-transaction.json'), '{}')
+    const result = await runLauncher(state, {
+      FAKE_CODEX_VERSION: '0.1.0',
+      ZEROKUN_DRY_RUN: '1',
+      FAKE_BUN_LOG: bunLog,
+    })
+    expect(result.exitCode).toBe(1)
+    expect(readFileSync(bunLog, 'utf8')).toContain('update.ts --recover-only')
+    expect(result.output.indexOf('未完了の自己更新'))
+      .toBeLessThan(result.output.indexOf('0.149.0 以上'))
   })
 })

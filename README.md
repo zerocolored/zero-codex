@@ -1,479 +1,230 @@
-# Slack Channel Plugin for Claude Code
+# Zero-kun for Codex
 
-Bridge your Slack workspace into a running Claude Code session. DMs and @mentions arrive in your session as channel events, and Claude replies back through Slack using bot messages, reactions, edits, and file uploads. Built for real conversation: each Slack thread gets its own isolated subagent with persistent memory, so parallel conversations don't bleed into each other and you can pick up threads days later with full context intact.
+Slack の DM・メンションをローカルの Codex CLI へ安全に渡す、macOS 向けの常駐ゲートウェイです。
+この `codex` ブランチは Claude Code を起動しません。必要なのは Codex CLI のログインです。
 
----
+## 仕組み
 
-## Highlights
-
-- **Per-thread subagent dispatch** — every unique Slack `thread_ts` spawns a dedicated subagent with its own context window. Parallel conversations stay independent; Claude never mixes up which thread it's in.
-- **Persistence across restarts** — thread state is stored on disk (`~/.claude/channels/slack/threads.json` + Claude Code's built-in subagent storage). Close your terminal, come back tomorrow, reply in a thread — the subagent wakes up with full memory of the prior conversation.
-- **Full Claude Code capability inside Slack** — subagents inherit every tool, skill, MCP server, and CLAUDE.md context from the parent session. Unlike a restricted Agent SDK bot, you get Read/Write/Edit/Bash/WebSearch/WebFetch and everything else natively.
-- **Three-tier access control** — DM pairing with code exchange, explicit allowlists, per-channel opt-in policies. Nothing responds until you authorize it.
-- **Permission relay** — if Claude needs tool approval while you're away, you can approve/deny from Slack via Block Kit buttons or text (`yes <code>` / `no <code>`).
-- **Anti-prompt-injection design** — skills refuse to mutate access control based on channel messages; only the terminal user can pair, allow, or change policy.
-
----
-
-## How it works
-
-```
-                Slack workspace
-                       │
-             Socket Mode WebSocket
-                       │
-                       ▼
-              slack-channel plugin
-         (Bun + @slack/bolt + MCP SDK)
-                       │
-         gate() access control → accept/drop/pair
-                       │
-       ┌───────────────┴────────────────┐
-       │                                │
-  notifications/                 reply / react /
-  claude/channel      ◄──────    edit_message
-       │                                │
-       ▼                                │
-      ┌────────────────────────────┐    │
-      │ Running Claude Code session│    │
-      │                            │    │
-      │ /slack-channel:threads     │    │
-      │  dispatches event to       │    │
-      │  per-thread subagent       │    │
-      │                            │    │
-      │  ┌──────────┐ ┌──────────┐ │    │
-      │  │ Thread A │ │ Thread B │ │    │
-      │  │ subagent │ │ subagent │ │────┘
-      │  └──────────┘ └──────────┘ │
-      │                            │
-      │ Each: isolated context,    │
-      │ project CLAUDE.md, all     │
-      │ tools/MCPs, persists       │
-      │ across session restarts    │
-      └────────────────────────────┘
+```text
+Slack Socket Mode
+  ↓ access.json で受信認可
+server.ts（添付をローカル保存し、SQLiteへcommit）
+  ↓ jobs.sqlite3 / 1本のFIFO
+job-runner.ts
+  ↓ codex exec --json / codex exec resume
+Codex CLI（job専用 permission profile）
+  ↓ 最終回答と明示された成果物だけ
+Slack bot
 ```
 
-1. A message arrives in Slack (DM or @mention in an opted-in channel).
-2. The plugin's `gate()` checks it against access policy. If authorized, it delivers a `<channel source="slack" thread_ts="..." ...>` notification to the running Claude Code session.
-3. Claude invokes the `/slack-channel:threads` skill, which looks up the `thread_ts` in a mapping file. If it's a new thread, a fresh subagent is spawned via the `Agent` tool; if it's a follow-up, `SendMessage` resumes the existing subagent.
-4. The subagent does the work and calls the `reply` tool (or `react` / `edit_message`) to respond back to Slack in the original thread.
+- Slack 受信と Codex 実行を別プロセスに分離しています。Codex が長時間動いても受信を続けます。
+- job は SQLite に先に保存し、常に1件ずつ FIFO で処理します。再起動時、read-only job は再開し、write job は外部副作用の二重実行を避けるため failed にして確認・再送を求めます。
+- 同じ Slack スレッド・repository・sender・write mode では Codex の thread ID を最大5 jobまで再利用します。旧 Claude Code の
+  待機jobはsession IDを破棄してCodexへ移行し、完了済み履歴のsession IDはCodexへ渡しません。
+- Codex 子プロセスには Slack token や任意の親process環境を渡しません。Slack 投稿は gateway/runner の bot 経路だけです。
+- 受信許可と書込み許可は別です。既定profileはrepository readとjob outbox writeだけ、明示した利用者だけ
+  repository・`.git` write とネットワークを使えます。
+- Socket Mode 停止中の DM・メンションと、採用済みスレッドの未メンション返信を履歴から回収します。
 
----
+Codex CLI 連携は安定した非対話実行インターフェースである
+`codex exec --json`、`thread.started.thread_id`、`codex exec resume`、
+`--output-last-message` を使います。job本体はapp-serverで実行しませんが、起動前のmanaged/MDMを含む
+実効permission検査には実験的な`app-server config/read`と`configRequirements/read`を使うため、
+CIで対応するCodex CLI versionごとにprotocol互換性を確認します。
 
-## Prerequisites
+## 必要なもの
 
-- [Bun](https://bun.sh) (runtime)
-- Claude Code v2.1.80 or later
-- `claude.ai` login (required for channels — API-key-only sessions aren't supported)
-- A Slack workspace where you can create apps
-- `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` set in your environment (enables the `Agent` and `SendMessage` tools that power thread dispatch)
+- macOS
+- Git、Bun、tmux
+- Codex CLI 0.149.0 以上（`codex login status` が成功すること）
+- App を作成できる Slack workspace
 
-**Enterprise note:** On Team and Enterprise Claude plans, an admin must enable channels in the admin console (Claude Code → Channels → "Allow channel notifications"). Pro/Max personal accounts don't need this.
+Claude Code、Claude のログイン、Claude channel/MCP、Anthropic API key は不要です。
 
----
+## セットアップ
 
-## Slack App Setup
-
-### Manifestから作る（推奨）
-
-ゼロくん用の権限・Event Subscription・Socket Modeを再現する
-[`zerokun/templates/slack-app-manifest.yaml`](zerokun/templates/slack-app-manifest.yaml)を用意済み。
-[https://api.slack.com/apps?new_app=1](https://api.slack.com/apps?new_app=1)を開き、
-**Create New App → From a manifest** で貼り付ければ、以下の手設定の大半は不要。
-App-Level Tokenの`connections:write`とWorkspaceへのInstallだけはSlack画面で行う。
-
-基本セットアップではSlackを後回しにする。`zerokun/bootstrap-macos.sh --slack-only`を実行し、
-App表示名とbot usernameを入力すると、
-名前を反映したmanifestのコピー、作成URLの表示、作成画面の起動までスクリプトが行う。
-bot usernameはSlackの制約により英小文字・数字・`-`・`_`・`.`だけを使用する。
-
-### 1. Create the app
-
-1. Go to [https://api.slack.com/apps](https://api.slack.com/apps) and click **Create New App → From scratch**.
-2. Give it a name (e.g. "Claude") and pick your workspace.
-
-### 2. Enable Socket Mode
-
-1. In the sidebar go to **Settings → Socket Mode** and toggle it **On**.
-2. Create an **App-Level Token** when prompted:
-   - Name it anything (e.g. "socket-token")
-   - Add the scope `connections:write`
-   - Click **Generate** and copy the token — it starts with `xapp-`
-
-### 3. Subscribe to events
-
-1. Go to **Features → Event Subscriptions** and toggle **Enable Events** on.
-2. Under **Subscribe to bot events** add:
-   - `app_mention`
-   - `message.im`
-   - `message.channels`
-
-### 4. Enable the Messages tab
-
-1. Go to **Features → App Home**.
-2. Toggle **Messages Tab** on.
-3. Check **Allow users to send Slash commands and messages from the messages tab**.
-
-### 5. Set bot token scopes
-
-Go to **Features → OAuth & Permissions → Scopes → Bot Token Scopes** and add:
-
-| Scope | Purpose |
-|---|---|
-| `app_mentions:read` | Receive @mentions |
-| `channels:history` | Read channel messages |
-| `channels:read` | Look up channel info |
-| `chat:write` | Post messages |
-| `files:read` | Download shared files |
-| `files:write` | Upload file attachments |
-| `groups:history` | Read private channel messages |
-| `im:history` | Read DM messages |
-| `im:read` | Look up DM info |
-| `im:write` | Open DMs to users |
-| `reactions:write` | Add emoji reactions |
-| `users:read` | Resolve user names |
-
-### 6. Install to workspace
-
-1. Go to **OAuth & Permissions → Install to Workspace**.
-2. Authorize the requested permissions.
-3. Copy the **Bot User OAuth Token** (starts with `xoxb-`).
-4. You already have the App-Level Token from step 2 (starts with `xapp-`).
-
----
-
-## Plugin Installation
-
-### Development (clone and load locally)
+既に clone 済みなら:
 
 ```bash
-git clone https://github.com/retrodigio/claude-channel-slack ~/dev/claude-channel-slack
-cd ~/dev/claude-channel-slack
+git switch codex
+bash zerokun/setup.sh
+codex login status
+```
+
+Claude版から切り替える場合、`setup.sh` は旧runnerの新規claimを止め、稼働を確認できる実行中jobを
+drainして旧Claude親process・runner・gatewayを終了します。待機jobはClaude sessionを捨ててCodex
+queueへ引き継ぎます。旧runner停止後も`running`だった不確実なjobは二重実行せずfailed通知にし、
+内容を確認して再送するよう求めます。
+
+新しい Mac へ一式入れる場合:
+
+```bash
+bootstrap_path="$(mktemp "${TMPDIR:-/tmp}/zerokun-bootstrap.XXXXXX")"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/zerocolored/zero/codex/zerokun/bootstrap-macos.sh \
+  --output "$bootstrap_path"
+bash "$bootstrap_path" --with-slack
+rm -f "$bootstrap_path"
+```
+
+先にファイルを保存するため、実行前に内容を確認できます。既に clone 済みなら、その repository で
+`git switch codex` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使えます。
+
+bootstrapはZero-kun本体とは別の`zerokun-workspace` Git repositoryを既定projectとして作ります。
+既存projectを使う場合は`--project-dir /absolute/path/to/project`を指定してください。
+Zero-kun本体はhost runtimeなので、そこを対象にしたSlack write jobは常に拒否されます。
+
+依存関係だけ診断する場合は `--doctor`、導入済み環境で Slack 設定だけ再開する場合は
+`--slack-only` を使います。詳しくは
+[`zerokun/NEW_MAC_SETUP.md`](zerokun/NEW_MAC_SETUP.md) を参照してください。
+
+### Slack App
+
+推奨は [`zerokun/templates/slack-app-manifest.yaml`](zerokun/templates/slack-app-manifest.yaml)
+を Slack の **Create New App → From a manifest** へ貼る方法です。その後:
+
+1. App-Level Token に `connections:write` を付け、`xapp-...` を取得する。
+2. Workspace へ Install し、Bot User OAuth Token `xoxb-...` を取得する。
+3. 次のファイルへ保存する（既存ファイルは setup が上書きしません）。
+
+```bash
+~/.codex/zerokun/.env
+```
+
+```dotenv
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+```
+
+新規環境の既定stateは `~/.codex/zerokun` です。旧版の
+`~/.claude/channels/slack` に `.env` / `access.json` / `jobs.sqlite3` のいずれかがある
+設定済み環境では、token・access・queueを安全に引き継ぐためそのdirectoryを自動選択します。
+空directoryは移行対象にしません。明示する場合はgateway、runner、管理コマンドで同じ
+`ZEROKUN_STATE_DIR` を設定してください。
+
+## Access 設定
+
+DM の初回メッセージには pairing code が返ります。表示された code を正確に指定します。
+code の省略や自動承認はできません。
+
+```bash
+zerokun-access pair abc123
+zerokun-access status
+```
+
+チャンネルを有効にする例:
+
+```bash
+zerokun-access channel add C0123456789
+zerokun-access channel allow C0123456789 U0123456789
+```
+
+受信を許可しても repository write は許可されません。書込みが必要な利用者だけ別に付与します。
+
+```bash
+zerokun-access write allow U0123456789
+zerokun-access write deny U0123456789
+```
+
+全コマンドと設定項目は [`ACCESS.md`](ACCESS.md) にあります。
+
+## 起動と運用
+
+```bash
+# setup後、新しいterminalで
+zerokun
+
+# 別terminalから
+zerokun-status
+zerokun-jobs status
+```
+
+`zerokun` は永続 job runner を起動してから Slack gateway を前景で起動します。gateway は
+`Ctrl-C` で停止しますが、runner は未処理 queue のため常駐します。macOS の watchdog が
+60秒ごとに両方を確認します。
+
+更新:
+
+```bash
+zerokun-update
+```
+
+更新対象は `origin/codex` の fast-forward のみです。未コミット変更や未 push の local commit
+がある場合は停止します。書込み許可済みの利用者は Slack で「ゼロくんを更新して」と依頼でき、
+通常 FIFO の外にある detached updater が自己デッドロックを避けて実行します。
+remoteの候補commitは隔離cloneをCodex sandbox内でtest/buildしてからlive branchをfast-forwardします。
+更新元は`https://github.com/zerocolored/zero(.git)`だけで、local Git configは安全なallowlist外の
+helper・include・HTTP/credential設定があれば実行前に停止します。
+停止前に更新journalとSQLiteの整合snapshotを作成し、setupまたは再起動後の接続確認に失敗した場合は
+旧commit・旧DB・旧serviceへ自動rollbackします。強制終了でjournalが残った場合も次回起動前に
+rollbackを完了します。
+
+## Routing
+
+チャンネルごとの作業 repository は state dir の `routes.json` で固定します。
+
+```json
+{
+  "C0123456789": {
+    "repo_path": "/Users/me/Desktop/Project/example",
+    "label": "example"
+  }
+}
+```
+
+DM は launcher に渡した project directory、チャンネルは route の directoryを使います。
+一度採用した Slack thread の route は SQLite に固定され、途中で設定を変えても別 repository
+へ飛びません。
+
+## セキュリティ境界
+
+- 未登録 channel、未許可 DM、bot DM は受け取りません。
+- pairing は1時間で失効し、同時 pending は3件までです。
+- Codex 0.149.0+ の named permission profile を使います。minimal runtimeから始め、
+  対象repository、当該jobの添付、scratch、outboxだけを許可します。HOME・state・共用tempはdenyします。
+- read senderはrepository readのみ、write senderだけrepository・`.git` writeとnetworkを許可し、
+  どちらも `-a never` で対話的な権限昇格を行いません。
+- host runtimeをSlack経由で書き換えられないよう、Zero-kun自身のrepositoryへのwrite jobは拒否します。
+  Codex shellのHOME/TMPDIRはjob scratchへ隔離されるため、commit identityはprojectのlocal
+  `.git/config`へ設定してください。HOMEのcredentialを使うpushは既定ではできません。
+- 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
+  linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。HOMEのglobal
+  Git/GitHub credentialは公開しないため、remote操作は安全なHOME外認証がない環境では利用できません。
+- Codex は`--ignore-user-config --ignore-rules`で起動し、起動直前の`config/read`でnamed
+  permissionの実効値をmanaged/MDM layerまで照合します。安全規則は`developer_instructions`、
+  未信頼のSlack本文はstdinへ分離します。子環境は必要変数のallowlistです。
+- apps・plugins・MCP・hookは無効化し、Web検索はwrite許可jobだけに限定します。
+  write jobのcommand networkはproxyを通し、Slack関連domainだけは常に拒否します。
+- 添付と成果物は50MBまでです。成果物はjob専用 `outbox/<job-id>/` 直下のregular fileをrunner専用
+  sealed領域へ移してから上限付きFDで読み、任意path・symlink・device/FIFOを拒否します。
+- terminal通知と成果物単位のdelivery checkpointはSQLiteへ保存します。checkpoint確定済みの成果物は再送しませんが、Slack upload成功直後・checkpoint確定前のprocess crashでは同じfileが再uploadされる可能性があるat-least-once配送です。
+- Codex stdout/stderr logは各20MBを上限にし、解析用memoryは各1MBのtailに制限します。
+- 完了jobは通知と成果物の配送checkpointが全て確定した後だけretention対象になります。既定30日で
+  job固有fileをGCし、Slack再配送を防ぐidempotency tombstoneは既定10年保持します。runtime logも
+  20MBで上限化します。`zerokun-jobs gc`で即時実行できます。
+- `danger-full-access`、Slack 上の承認ボタン、Codex からの Slack API 呼出しは使いません。
+
+## 主なファイル
+
+- `server.ts`: Slack Socket Mode、access gate、添付取得、durable enqueue、履歴回収
+- `zerokun/job-runner.ts`: SQLite queue、session/thread 所有権、Slack 完了通知
+- `zerokun/codex-executor.ts`: Codex CLI 実行、JSONL/session解析、sandbox分離
+- `zerokun/access.ts`: pairing・受信権限・書込み権限の管理 CLI
+- `codex-channel.sh`: standalone gateway と runner の launcher
+- `zerokun/update.ts`: `codex` ブランチ用の安全な自己更新
+- `zerokun/watchdog.sh`: bridge/runner の状態監視
+
+## 開発時の検証
+
+```bash
 bun install
+bun run verify
 ```
 
-Add the server to your user-level MCP config at `~/.claude.json` under `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "slack-channel": {
-      "type": "stdio",
-      "command": "bun",
-      "args": ["run", "--cwd", "/absolute/path/to/claude-channel-slack", "--silent", "start"]
-    }
-  }
-}
-```
-
-> **Heads up on naming:** the server key must be something other than `slack`. Claude Code and the `claude-plugins-official` marketplace both ship an MCP server named `slack`; if you use that name here, deduplication may route events to the wrong transport. `slack-channel` is recommended.
-
-Start Claude Code with the channel enabled:
-
-```bash
-claude --dangerously-load-development-channels server:slack-channel
-```
-
-You should see **"Listening for channel messages from: server:slack-channel"** in the startup banner, and `slack-channel · ✓ connected` under User MCPs in `/mcp`.
-
-### Configure tokens
-
-With Claude Code running, save your Slack tokens:
-
-```
-/slack-channel:configure <xoxb-bot-token> <xapp-app-token>
-```
-
-Tokens are written to `~/.claude/channels/slack/.env` with permissions `600`. The server reads this file at startup — restart Claude Code after saving tokens for the first time.
-
----
-
-## Quick Start
-
-### Pair your Slack account
-
-1. Open a DM with your bot in Slack and send any message.
-2. The bot replies with a pairing command — copy it.
-3. Run it in Claude Code:
-   ```
-   /slack-channel:access pair <code>
-   ```
-4. Lock down DM access to approved users only:
-   ```
-   /slack-channel:access policy allowlist
-   ```
-
-### Enable a channel
-
-To let Claude respond to @mentions in a channel:
-
-```
-/slack-channel:access channel add <channel-id>
-```
-
-Find the channel ID by right-clicking the channel name in Slack → **View channel details** → scroll to bottom for "Channel ID" (starts with `C` for public or `G` for private).
-
-By default, an opted-in channel requires an explicit @mention of the bot, and anyone in the channel can trigger a response via @mention. To restrict further:
-
-```
-/slack-channel:access channel add <channel-id> --allow U01ABC,U02DEF
-```
-
-### Start talking
-
-- In a DM: just type. The bot acknowledges with :eyes:, dispatches a subagent, and replies in the same DM.
-- In a channel: @mention the bot. Each top-level @mention starts a new thread with its own subagent; follow-ups in that thread route to the same subagent.
-
----
-
-## Per-Thread Subagents
-
-Every Slack `thread_ts` gets a dedicated subagent. State is tracked in `~/.claude/channels/slack/threads.json`:
-
-```json
-{
-  "1718400000.000100": {
-    "agent_id": "agent-a3f2c1",
-    "channel_id": "C0ASQSQCGCB",
-    "repo_path": "/Users/you/projects/rfp-knowledge",
-    "label": "RFP Knowledge",
-    "started_at": "2026-04-17T17:04:35Z",
-    "last_activity_ms": 1718500000000,
-    "topic": "GA CCNS disaster recovery questions"
-  }
-}
-```
-
-**New thread:** dispatcher resolves routing (see next section), spawns a subagent via the `Agent` tool, saves the mapping.
-**Follow-up:** dispatcher looks up the `agent_id` and uses `SendMessage` to resume the subagent. Claude Code auto-resumes stopped subagents from their on-disk transcripts, so the subagent wakes up with full prior context.
-**Persistence:** the mapping file survives session restarts, and Claude Code stores subagent transcripts at `~/.claude/projects/*/subagents/*.jsonl` independently.
-
-**When the parent session is offline:** Slack events queue briefly at Slack and then drop. For 24/7 coverage, run `claude --dangerously-load-development-channels server:slack-channel` inside a persistent terminal (tmux, screen, or a dedicated machine). Conversation state is preserved across restarts, but inbound events require a live session.
-
----
-
-## Dispatcher Orchestrator (recommended)
-
-For any non-trivial deployment, run the dispatcher session from a dedicated folder with its own CLAUDE.md that defines the orchestrator's role. This gives you:
-
-- Stable, role-aware starting context every session (dispatcher vs project-worker personas are kept separate)
-- Dedicated home for DM behavior, health checks, and runbooks
-- A place to persist orchestrator-specific memory and learnings
-- Cleaner separation of concerns: plugin (transport) → orchestrator (policy, routing, DM UX) → projects (domain knowledge)
-
-A starter template is included at [`templates/orchestrator/`](templates/orchestrator/). Copy it to your own location:
-
-```bash
-cp -r templates/orchestrator ~/your/path/claude-slack-orchestrator
-cd ~/your/path/claude-slack-orchestrator
-git init
-# customize CLAUDE.md, reference/projects.md, reference/slack-workspace.md
-```
-
-Then run the dispatcher from there:
-
-```bash
-cd ~/your/path/claude-slack-orchestrator
-claude --dangerously-load-development-channels server:slack-channel
-```
-
-The template README explains the structure in detail.
-
----
-
-## One Bot, Many Projects — Channel-to-Repo Routing
-
-A single Slack app can serve many repos. Map channels to repo paths in `~/.claude/channels/slack/routes.json`, invite the bot to each channel, and run one dispatcher session that routes each channel's threads to subagents grounded in the correct project context.
-
-### Setup
-
-1. Create `~/.claude/channels/slack/routes.json`:
-
-```json
-{
-  "C0ASQSQCGCB": {
-    "repo_path": "/Users/you/projects/rfp-knowledge",
-    "label": "RFP Knowledge"
-  },
-  "C0ARZ5AS550": {
-    "repo_path": "/Users/you/projects/sdlc-transformation",
-    "label": "SDLC Transformation"
-  }
-}
-```
-
-See [`routes.example.json`](routes.example.json) for the template.
-
-2. Opt each channel in via `/slack-channel:access`:
-```
-/slack-channel:access channel add C0ASQSQCGCB
-/slack-channel:access channel add C0ARZ5AS550
-```
-
-3. Invite the bot to each Slack channel: `/invite @YourBot` in Slack.
-
-4. Start one dispatcher session (cwd doesn't matter much — subagents run in their routed repos regardless):
-
-```bash
-claude --dangerously-load-development-channels server:slack-channel
-```
-
-### How it works
-
-When a new thread arrives:
-- Dispatcher looks up `chat_id` in `routes.json`
-- Subagent is spawned with the target `repo_path` baked into its prompt
-- First thing the subagent does is `Read <repo_path>/CLAUDE.md` to load project workflows
-- All file operations use absolute paths rooted at the target repo
-
-Follow-ups in an existing thread resume the same subagent — routing is resolved once per thread, at creation.
-
-DMs and unmapped channels fall back to the dispatcher session's cwd as project context.
-
-### What about project-level skills?
-
-The subagent inherits skills and MCP servers from the dispatcher session — so **global skills** (`~/.claude/skills/`, user-scoped plugins) and the dispatcher's cwd repo's skills are available to every subagent. Project-level skills from OTHER routed repos are not auto-loaded (Claude Code only loads skills from one cwd at a time). For knowledge-base-style projects where CLAUDE.md + repo files are the main context, this works well. If you need skills available across projects, put them at the user level (`~/.claude/skills/<name>/`).
-
-### Alternative: per-repo bots
-
-If you want full project-level skill isolation or separate bot identities, you can run **one bot per repo** instead. Each gets its own `SLACK_STATE_DIR`, tokens, and MCP entry:
-
-```json
-{
-  "slack-channel-project-a": {
-    "type": "stdio",
-    "command": "bun",
-    "args": ["run", "--cwd", "/path/to/plugin", "--silent", "start"],
-    "env": { "SLACK_STATE_DIR": "/Users/you/.claude/channels/slack-project-a" }
-  },
-  "slack-channel-project-b": {
-    "type": "stdio",
-    "command": "bun",
-    "args": ["run", "--cwd", "/path/to/plugin", "--silent", "start"],
-    "env": { "SLACK_STATE_DIR": "/Users/you/.claude/channels/slack-project-b" }
-  }
-}
-```
-
-Then start each project's session with its own server name (`--channels server:slack-channel-project-a`). More operational overhead (N Slack apps, N tokens, N sessions to keep running), but complete isolation.
-
----
-
-## Access Control
-
-### Three-tier gate
-
-1. **DM policy** — `pairing` (default), `allowlist`, or `disabled`. Controls who can DM the bot.
-2. **Channel policies** — per-channel opt-in map keyed by channel ID. Optionally require @mentions and/or restrict to specific users.
-3. **Outbound gate** — the `reply` / `react` / `edit_message` / `fetch_messages` tools only target channels and DMs that the inbound gate would accept. Prevents Claude from being tricked into posting to arbitrary channels.
-
-### Trust the gate
-
-If a `<channel source="slack">` event reaches Claude, access control has already approved it. Claude is instructed not to re-check the sender against any allowlist or refuse to respond. Channel mentions go through channel policy, NOT the DM allowlist. The only thing Claude refuses on behalf of a channel message is access-control mutations — those always require the terminal.
-
-### /slack-channel:access commands
-
-```
-/slack-channel:access                           # show status
-/slack-channel:access pair <code>               # approve a pending DM pairing
-/slack-channel:access deny <code>               # reject a pending pairing
-/slack-channel:access allow <userId>            # add to DM allowlist
-/slack-channel:access remove <userId>           # remove from DM allowlist
-/slack-channel:access policy <mode>             # pairing | allowlist | disabled
-/slack-channel:access channel add <channelId>   # opt in a channel (with optional --no-mention, --allow)
-/slack-channel:access channel rm <channelId>    # opt out a channel
-/slack-channel:access set <key> <value>         # tune ackReaction, textChunkLimit, chunkMode, etc.
-```
-
-See [ACCESS.md](ACCESS.md) for the complete access model, `access.json` schema, and security notes.
-
----
-
-## Permission Relay
-
-When Claude needs a tool approval while you're away from the terminal, the plugin can relay the prompt to Slack. Allowlisted DM users receive a Block Kit message with **Allow** / **Deny** / **See more** buttons, or can reply with a text code (`yes xxxxx` / `no xxxxx`). Permission approvals are scoped to the DM allowlist only — channel members don't get them, because they haven't been explicitly paired.
-
-Powered by the `claude/channel/permission` MCP capability.
-
----
-
-## MCP Tool Reference
-
-Tools the plugin exposes to the Claude Code session and its subagents:
-
-| Tool | Description |
-|---|---|
-| `reply` | Post a message (or file) to a channel/DM, optionally threaded via `thread_ts`. Splits long text at `textChunkLimit`. |
-| `react` | Add an emoji reaction to a message. |
-| `edit_message` | Edit a previously sent bot message — useful for progress updates on long tasks. |
-| `download_attachment` | Download a Slack file to `~/.claude/channels/slack/inbox/` and return the path. |
-| `fetch_messages` | Pull channel or thread history via `conversations.history` / `conversations.replies`. |
-
-All tools validate the target against access policy before acting.
-
----
-
-## File Layout
-
-```
-claude-channel-slack/
-├── .claude-plugin/plugin.json    # plugin manifest
-├── .mcp.json                     # MCP launch config (plugin-install style)
-├── server.ts                     # entire server: Slack + MCP + gate + tools
-├── skills/
-│   ├── access/SKILL.md           # /slack-channel:access
-│   ├── configure/SKILL.md        # /slack-channel:configure
-│   └── threads/SKILL.md          # /slack-channel:threads (per-thread dispatch)
-├── package.json
-├── README.md
-├── ACCESS.md                     # full access-control reference
-└── LICENSE
-```
-
-Runtime state:
-
-```
-~/.claude/channels/slack/
-├── .env                # SLACK_BOT_TOKEN + SLACK_APP_TOKEN (chmod 600)
-├── access.json         # access policy + per-channel config
-├── threads.json        # thread_ts → subagent mapping
-├── inbox/              # downloaded Slack file attachments
-└── approved/           # one-shot pairing confirmations (server polls every 5s)
-```
-
----
-
-## Security Model
-
-- **Stdio-only MCP transport** — the server runs as a local subprocess; no network listener.
-- **Token files are chmod 600** — the `.env` gets permissions locked at boot.
-- **`assertSendable()`** — the `reply` tool refuses to upload files from the plugin's own state directory, blocking exfiltration of `.env` or `access.json` via tool abuse.
-- **Filename sanitization** — uploader-controlled filenames are scrubbed of `[]<>;\r\n` before appearing in `<channel>` tag attributes, preventing tag-structure injection.
-- **Pairing never auto-picks** — even with a single pending code, `/slack-channel:access pair` requires the explicit code. Prevents an attacker from seeding one pending entry and getting it auto-approved via prompt injection.
-- **Permission relay is DM-only** — approval buttons never go to channel members, only to users on the DM allowlist.
-- **Orphan watchdog** — the server exits cleanly if its parent Claude Code process dies, preventing zombies that hold the Socket Mode token hostage.
-
----
-
-## Common Issues
-
-**"1 MCP server failed" with no details**
-Start Claude Code with `--debug` and check the log path it prints. Look for `slack-channel:` lines in the log to see startup errors. Common causes: missing tokens, wrong working directory in the MCP config, or a conflicting MCP server named `slack`.
-
-**Bot doesn't respond to DMs**
-Check `/mcp` shows `slack-channel · ✓ connected`. Verify the Slack app has Messages Tab enabled (App Home), `message.im` event subscribed, and you've restarted Slack after the app install (Slack caches the disabled state aggressively).
-
-**Messages in channel drop silently**
-The channel isn't opted in. Run `/slack-channel:access channel add <channelId>` to allow @mentions in that channel.
-
-**Thread subagent has no memory of prior conversation**
-Check `~/.claude/channels/slack/threads.json` has an entry for that `thread_ts`. If missing, the dispatcher will spawn a fresh agent. If present but the agent transcript is missing (rare — would happen if `~/.claude/projects/` was cleared), the dispatcher falls back to a new subagent and posts a notice in the thread.
-
-**"Blocked by org policy" on Team/Enterprise**
-An admin needs to toggle **Allow channel notifications** in claude.ai → Admin settings → Claude Code → Channels.
-
----
+`verify` は型検査、全test、build、shell構文検査を実行します。同じ検証を
+`.github/workflows/codex.yml` がmacOSで実行します。実際のSlack接続には有効な
+`xoxb-` / `xapp-` tokenが必要です。テストsuiteはtokenや外部Slack workspaceを変更しません。
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0

@@ -7,15 +7,20 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>__HOME__/.claude/channels/slack/watchdog.sh</string>
+    <string>__STATE_DIR__/watchdog.sh</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ZEROKUN_STATE_DIR</key>
+    <string>__STATE_DIR__</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
   <integer>60</integer>
   <key>StandardOutPath</key>
-  <string>__HOME__/.claude/channels/slack/watchdog.log</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/.claude/channels/slack/watchdog.log</string>
+  <string>/dev/null</string>
 </dict>
 </plist>
