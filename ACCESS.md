@@ -3,10 +3,11 @@
 Zero-kun for Codex は「メッセージを受け取れる人」と「repository を変更できる人」を分離します。
 pairing や channel opt-in だけでは書込み権限は付きません。
 
-新規環境の設定ファイルは `~/.codex/zerokun/access.json` にあります。旧版の
-`~/.claude/channels/slack` に `.env` / `access.json` / `jobs.sqlite3` のいずれかがある
-設定済み環境だけは、安全な移行のため旧stateを選びます。空directoryは移行対象にしません。
-`ZEROKUN_STATE_DIR` を設定した場合は常にその配下を使います。
+設定ファイルは既定で `~/.codex/zerokun/access.json` にあります。旧版の
+`~/.claude/channels/slack` は自動選択しません。別PCのClaude版と比較する場合は新しい
+Slack AppとCodex stateを使い、旧token・access・routesをコピーしないでください。
+同一PCのin-place cutover時だけ`ZEROKUN_LEGACY_CUTOVER=1`と
+`ZEROKUN_STATE_DIR`の両方で旧stateを明示します。
 
 ## 管理コマンド
 
@@ -148,5 +149,5 @@ channel を `add` すると次の既定値になります。
   pathごとに再許可します。
 - 添付ファイルは認可後に gateway が state の `inbox/` へ保存し、そのjobに記録したfileだけを
   Codex profileへread許可します。
-- 成果物 upload は50MBまでで、job専用 `outbox/<job-id>/` 直下のregular fileだけを許可します。
+- 成果物 upload は50MBまでで、job専用 `outbox/<job-id>/` 直下の空でないregular fileだけを許可します。
   symlinkによるoutbox外へのescape、device、FIFO、他jobのfileは拒否します。

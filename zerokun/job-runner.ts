@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
 import { createHash, randomUUID } from 'crypto'
@@ -32,9 +32,18 @@ import {
   releaseProcessLock,
   tryAcquireProcessLock,
 } from './process-lock.ts'
-import { resolveZeroStateDir } from './state-dir.ts'
+import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
+import { applyStateEnvironment, parseStateSlackTokens } from './child-environment.ts'
 import { atomicWritePrivateFile, readOptionalPrivateFile } from './safe-file.ts'
-import { slackWebClientOptions, withSlackDeadline } from './slack-http.ts'
+import {
+  postDirectSlackApi,
+  slackWebClientOptions,
+  withSlackDeadline,
+} from './slack-http.ts'
+import {
+  slackTokenPairRuntimeIdentity,
+  verifySlackAppTokenPair,
+} from './slack-app-identity.ts'
 import {
   capRuntimeLogs,
   removeOrphanedJobState,
@@ -45,6 +54,11 @@ import {
   requireManagedDirectory,
   requireManagedStateRoot,
 } from './managed-path.ts'
+import {
+  processIdentityIsLive,
+  readProcessIdentity,
+  type ProcessIdentity,
+} from './process-tree.ts'
 
 export const SERIAL_WORKER_COUNT = 1 as const
 export const JOB_RUNNER_HANDSHAKE = 'zerokun-codex-runner-v1' as const
@@ -217,6 +231,7 @@ CREATE TABLE IF NOT EXISTS terminal_notifications (
   not_before INTEGER,
   last_error TEXT,
   created_at INTEGER NOT NULL,
+  body_delivered_at INTEGER,
   delivered_at INTEGER,
   FOREIGN KEY (job_id) REFERENCES jobs(id)
 );
@@ -226,6 +241,8 @@ CREATE TABLE IF NOT EXISTS artifact_deliveries (
   job_id TEXT NOT NULL,
   artifact_path TEXT NOT NULL,
   delivered_at INTEGER,
+  abandoned_at INTEGER,
+  last_error TEXT,
   PRIMARY KEY (job_id, artifact_path),
   FOREIGN KEY (job_id) REFERENCES jobs(id)
 );
@@ -333,6 +350,34 @@ function ensureJobSchemaMigrations(db: Database): void {
       if (!migrated.some(column => column.name === 'executor_pid')) throw error
     }
   }
+  const notificationColumns = db.query<{ name: string }, []>(
+    'PRAGMA table_info(terminal_notifications)',
+  ).all()
+  if (!notificationColumns.some(column => column.name === 'body_delivered_at')) {
+    try {
+      db.exec('ALTER TABLE terminal_notifications ADD COLUMN body_delivered_at INTEGER')
+    } catch (error) {
+      const migrated = db.query<{ name: string }, []>(
+        'PRAGMA table_info(terminal_notifications)',
+      ).all()
+      if (!migrated.some(column => column.name === 'body_delivered_at')) throw error
+    }
+  }
+  const artifactColumns = db.query<{ name: string }, []>(
+    'PRAGMA table_info(artifact_deliveries)',
+  ).all()
+  for (const [name, definition] of [
+    ['abandoned_at', 'INTEGER'],
+    ['last_error', 'TEXT'],
+  ] as const) {
+    if (artifactColumns.some(column => column.name === name)) continue
+    try {
+      db.exec(`ALTER TABLE artifact_deliveries ADD COLUMN ${name} ${definition}`)
+    } catch (error) {
+      const migrated = db.query<{ name: string }, []>('PRAGMA table_info(artifact_deliveries)').all()
+      if (!migrated.some(column => column.name === name)) throw error
+    }
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_ready_seq ON jobs(status, not_before, seq)')
   db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_runtime_ready_seq ON jobs(runtime, status, not_before, seq)")
 }
@@ -407,7 +452,7 @@ function retrySqlite<T>(action: () => T, attempts = 20): T {
   throw lastError
 }
 
-function requireSafeDatabasePath(dbPath: string): void {
+export function requireSafeDatabasePath(dbPath: string): void {
   const parent = dirname(dbPath)
   const parentMetadata = lstatSync(parent)
   const parentOwner = typeof process.getuid !== 'function' || parentMetadata.uid === process.getuid()
@@ -1165,7 +1210,7 @@ export class JobStore {
          ON CONFLICT(job_id) DO UPDATE SET
            kind = excluded.kind, payload = excluded.payload,
            attempts = 0, not_before = NULL, last_error = NULL,
-           created_at = excluded.created_at, delivered_at = NULL`,
+           created_at = excluded.created_at, body_delivered_at = NULL, delivered_at = NULL`,
         [randomUUID(), id, result, finishedAt],
       )
       for (const artifactPath of extractArtifactPaths(result).files) {
@@ -1294,7 +1339,7 @@ export class JobStore {
          ON CONFLICT(job_id) DO UPDATE SET
            kind = excluded.kind, payload = excluded.payload,
            attempts = 0, not_before = NULL, last_error = NULL,
-           created_at = excluded.created_at, delivered_at = NULL`,
+           created_at = excluded.created_at, body_delivered_at = NULL, delivered_at = NULL`,
         [randomUUID(), id, error, finishedAt],
       )
     })
@@ -1330,6 +1375,24 @@ export class JobStore {
     )
   }
 
+  terminalNotificationBodyDelivered(id: string): boolean {
+    return this.db.query<{ delivered: number }, [string]>(
+      `SELECT body_delivered_at IS NOT NULL AS delivered
+       FROM terminal_notifications WHERE id = ?`,
+    ).get(id)?.delivered === 1
+  }
+
+  markTerminalNotificationBodyDelivered(id: string): void {
+    const updated = this.db.run(
+      `UPDATE terminal_notifications SET body_delivered_at = COALESCE(body_delivered_at, ?)
+       WHERE id = ? AND delivered_at IS NULL`,
+      [Date.now(), id],
+    )
+    if (updated.changes !== 1 && !this.terminalNotificationBodyDelivered(id)) {
+      throw new Error(`terminal notification is missing: ${id}`)
+    }
+  }
+
   deferTerminalNotification(
     id: string,
     error: string,
@@ -1356,6 +1419,14 @@ export class JobStore {
        WHERE job_id = ? AND artifact_path = ?`,
     ).get(jobId, artifactPath)
     return row !== null && row.delivered_at !== null
+  }
+
+  abandonPendingArtifacts(jobId: string, error: string): number {
+    return this.db.run(
+      `UPDATE artifact_deliveries SET abandoned_at = ?, last_error = ?
+       WHERE job_id = ? AND delivered_at IS NULL AND abandoned_at IS NULL`,
+      [Date.now(), error, jobId],
+    ).changes
   }
 
   pruneSettled(options: {
@@ -1389,7 +1460,7 @@ export class JobStore {
            )
            AND NOT EXISTS (
              SELECT 1 FROM artifact_deliveries AS a
-             WHERE a.job_id = j.id AND a.delivered_at IS NULL
+             WHERE a.job_id = j.id AND a.delivered_at IS NULL AND a.abandoned_at IS NULL
            )`,
       ).all(cutoff)
       for (const row of candidates) {
@@ -1557,6 +1628,7 @@ export interface JobNotifier {
   started?(job: JobRecord, signal?: AbortSignal): Promise<void>
   completed?(job: JobRecord, result: string, notificationId?: string, signal?: AbortSignal): Promise<void>
   failed?(job: JobRecord, error: string, notificationId?: string, signal?: AbortSignal): Promise<void>
+  artifactsAbandoned?(job: JobRecord, error: string, notificationId?: string, signal?: AbortSignal): Promise<void>
   rateLimited?(job: JobRecord, resumeAt: number, reason: string, signal?: AbortSignal): Promise<void>
 }
 
@@ -1580,6 +1652,7 @@ export interface RunQueuedJobsOptions {
 }
 
 export const MAX_RATE_LIMIT_ATTEMPTS = 5
+export const MAX_ARTIFACT_DELIVERY_ATTEMPTS = 5
 
 async function notifySafely(
   action: (() => Promise<void>) | undefined,
@@ -1616,7 +1689,33 @@ export async function flushTerminalNotifications(
     } catch (error) {
       if (signal?.aborted) return
       const message = error instanceof Error ? error.message : String(error)
-      store.deferTerminalNotification(notification.id, message, Date.now(), retryMs)
+      const nextAttempt = notification.attempts + 1
+      if (notification.kind === 'completed'
+        && store.terminalNotificationBodyDelivered(notification.id)
+        && nextAttempt >= MAX_ARTIFACT_DELIVERY_ATTEMPTS
+        && notifier.artifactsAbandoned) {
+        try {
+          await notifier.artifactsAbandoned(
+            notification.job, message, notification.id, signal,
+          )
+          if (signal?.aborted) return
+          store.abandonPendingArtifacts(notification.job.id, message)
+          store.markTerminalNotificationDelivered(notification.id)
+          log(`terminal notification ${notification.id}: artifacts abandoned after ${nextAttempt} attempts`)
+          continue
+        } catch (fallbackError) {
+          if (signal?.aborted) return
+          const fallbackMessage = fallbackError instanceof Error
+            ? fallbackError.message
+            : String(fallbackError)
+          const backoff = Math.min(retryMs * (2 ** Math.min(nextAttempt, 10)), 6 * 60 * 60 * 1000)
+          store.deferTerminalNotification(notification.id, fallbackMessage, Date.now(), backoff)
+          log(`artifact abandonment notice ${notification.id} deferred: ${fallbackMessage}`)
+          continue
+        }
+      }
+      const backoff = Math.min(retryMs * (2 ** Math.min(notification.attempts, 10)), 6 * 60 * 60 * 1000)
+      store.deferTerminalNotification(notification.id, message, Date.now(), backoff)
       log(`terminal notification ${notification.id} deferred: ${message}`)
       // A permanently broken artifact or Slack policy must not suppress every
       // later terminal result. This notification retains its own retry state.
@@ -1775,16 +1874,46 @@ export function maintainState(
 }
 
 function defaultDbPath(): string {
-  return process.env.ZEROKUN_JOB_DB ?? join(stateDir(), 'jobs.sqlite3')
+  const dir = stateDir()
+  return resolveZeroJobDatabasePath(dir)
 }
 
 function loadStateEnv(dir: string): void {
   const envFile = join(dir, '.env')
-  for (const line of (readOptionalPrivateFile(envFile) ?? '').split('\n')) {
-    const match = line.match(/^(\w+)=(.*)$/)
-    if (match && process.env[match[1]] === undefined) {
-      process.env[match[1]] = match[2]
+  applyStateEnvironment(readOptionalPrivateFile(envFile) ?? '')
+}
+
+/** A daemon must never keep claiming work after its selected Slack App changes. */
+export function stateSlackTokenPairMatches(dir: string, expectedRuntimeId: string): boolean {
+  try {
+    const tokens = parseStateSlackTokens(readOptionalPrivateFile(join(dir, '.env')) ?? '')
+    return Boolean(
+      tokens.SLACK_BOT_TOKEN
+      && tokens.SLACK_APP_TOKEN
+      && slackTokenPairRuntimeIdentity(tokens.SLACK_BOT_TOKEN, tokens.SLACK_APP_TOKEN)
+        === expectedRuntimeId,
+    )
+  } catch {
+    return false
+  }
+}
+
+/** Stop before a new claim when the selected credential pair changes. */
+export function createSlackIdentityPauseGuard(
+  dir: string,
+  expectedRuntimeId: string | undefined,
+  controller: AbortController,
+  log: (message: string) => void,
+): () => boolean {
+  let reported = false
+  return () => {
+    if (!expectedRuntimeId || stateSlackTokenPairMatches(dir, expectedRuntimeId)) return false
+    if (!reported) {
+      log('selected Slack App changed; stopping this runner before claiming more work')
+      reported = true
     }
+    controller.abort()
+    return true
   }
 }
 
@@ -1878,9 +2007,9 @@ export function sealArtifactResult(job: JobRecord, result: string, dir = stateDi
         const candidates = readdirSync(sealedRoot)
           .filter(name => name.startsWith(prefix) && name.endsWith(suffix))
           .map(name => join(sealedRoot, name))
-          .filter(path => {
+        .filter(path => {
             const metadata = lstatSync(path)
-            return metadata.isFile() && metadata.size <= MAX_ARTIFACT_BYTES
+            return metadata.isFile() && metadata.size > 0 && metadata.size <= MAX_ARTIFACT_BYTES
           })
         if (candidates.length === 1) {
           sealed.push(candidates[0]!)
@@ -1899,6 +2028,7 @@ export function sealArtifactResult(job: JobRecord, result: string, dir = stateDi
       if (metadata.nlink !== 1) {
         throw new Error(`artifact must not have multiple hard links: ${requested}`)
       }
+      if (metadata.size === 0) throw new Error(`artifact is empty: ${requested}`)
       if (metadata.size > MAX_ARTIFACT_BYTES) {
         throw new Error(`artifact is larger than 50MB: ${requested}`)
       }
@@ -1993,6 +2123,7 @@ export function readUploadableArtifact(
   try {
     const metadata = fstatSync(descriptor)
     if (!metadata.isFile()) throw new Error(`artifact is not a regular file: ${file}`)
+    if (metadata.size === 0) throw new Error(`artifact is empty: ${file}`)
     if (metadata.size > MAX_ARTIFACT_BYTES) {
       throw new Error(`artifact is larger than 50MB: ${file}`)
     }
@@ -2033,26 +2164,17 @@ class SlackNotifier implements JobNotifier {
     const chunks = splitSlackChunks(text)
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index]!
-      const response = await withSlackDeadline(signal => fetch(
-        'https://slack.com/api/chat.postMessage', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${this.token}`,
-            'Content-Type': 'application/json; charset=utf-8',
-          },
-          body: JSON.stringify({
-            channel: job.chatId,
-            thread_ts: job.threadTs,
-            text: chunk,
-            ...(notificationId
-              ? { client_msg_id: slackClientMessageId(notificationId, index) }
-              : {}),
-          }),
-          signal,
-        },
+      const result = await withSlackDeadline(signal => postDirectSlackApi(
+        'chat.postMessage', this.token, {
+        channel: job.chatId,
+        thread_ts: job.threadTs,
+        text: chunk,
+        ...(notificationId
+          ? { client_msg_id: slackClientMessageId(notificationId, index) }
+          : {}),
+        }, signal,
       ), undefined, 'Slack chat.postMessage', parentSignal)
-      const result = await response.json() as { ok?: boolean; error?: string }
-      if (!result.ok) throw new Error(result.error ?? `HTTP ${response.status}`)
+      if (!result.ok) throw new Error(result.error ?? 'Slack chat.postMessage failed')
     }
   }
 
@@ -2073,7 +2195,11 @@ class SlackNotifier implements JobNotifier {
     signal?: AbortSignal,
   ): Promise<void> {
     const output = extractArtifactPaths(result)
-    await this.post(job, output.text || 'Codexの処理が完了しました。', notificationId, signal)
+    if (!notificationId || !this.store.terminalNotificationBodyDelivered(notificationId)) {
+      await this.post(job, output.text || 'Codexの処理が完了しました。', notificationId, signal)
+      if (signal?.aborted) return
+      if (notificationId) this.store.markTerminalNotificationBodyDelivered(notificationId)
+    }
     for (const requested of output.files) {
       if (this.store.artifactDelivered(job.id, requested)) continue
       const file = readUploadableArtifact(job, requested)
@@ -2090,10 +2216,29 @@ class SlackNotifier implements JobNotifier {
 
   async failed(job: JobRecord, error: string, notificationId?: string, signal?: AbortSignal): Promise<void> {
     this.log(`job ${job.id} failed: ${error}`)
+    if (!notificationId || !this.store.terminalNotificationBodyDelivered(notificationId)) {
+      await this.post(
+        job,
+        `ゼロくん job ${job.id.slice(0, 8)} は失敗しました。\n${error.slice(0, 1500)}`,
+        notificationId,
+        signal,
+      )
+      if (signal?.aborted) return
+      if (notificationId) this.store.markTerminalNotificationBodyDelivered(notificationId)
+    }
+  }
+
+  async artifactsAbandoned(
+    job: JobRecord,
+    error: string,
+    notificationId?: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
     await this.post(
       job,
-      `ゼロくん job ${job.id.slice(0, 8)} は失敗しました。\n${error.slice(0, 1500)}`,
-      notificationId,
+      `成果物の添付を${MAX_ARTIFACT_DELIVERY_ATTEMPTS}回試しましたが完了できなかったため、`
+        + `添付を打ち切りました。必要なら再度依頼してください。\n${error.slice(0, 500)}`,
+      notificationId ? `${notificationId}:artifacts-abandoned` : undefined,
       signal,
     )
   }
@@ -2134,13 +2279,14 @@ function validateEnqueueInput(raw: unknown): EnqueueInput {
   }
 }
 
-function acquireDaemonLock(lockDir: string, stateRoot: string): boolean {
+function acquireDaemonLock(lockDir: string, stateRoot: string, appId?: string): boolean {
   const pidFile = join(lockDir, 'pid')
   const versionFile = join(lockDir, 'runtime')
   ensureManagedDirectory(stateRoot, lockDir)
   const attempt = tryAcquireProcessLock(pidFile)
   if (!attempt.acquired) return false
-  atomicWritePrivateFile(versionFile, `${JOB_RUNNER_HANDSHAKE}\n`)
+  const runtime = appId ? `${JOB_RUNNER_HANDSHAKE}:${appId}` : JOB_RUNNER_HANDSHAKE
+  atomicWritePrivateFile(versionFile, `${runtime}\n`)
   return true
 }
 
@@ -2191,7 +2337,7 @@ function processStateIsAlive(pid: number): boolean {
     return false
   }
   const state = Bun.spawnSync(
-    ['ps', '-o', 'state=', '-p', String(pid)],
+    ['/bin/ps', '-o', 'state=', '-p', String(pid)],
     { stdout: 'pipe', stderr: 'ignore' },
   )
   const value = new TextDecoder().decode(state.stdout).trim().toUpperCase()
@@ -2200,20 +2346,22 @@ function processStateIsAlive(pid: number): boolean {
 
 function trackedExecutorCommand(pid: number): string {
   const result = Bun.spawnSync(
-    ['ps', '-ww', '-o', 'command=', '-p', String(pid)],
+    ['/bin/ps', '-ww', '-o', 'command=', '-p', String(pid)],
     { stdout: 'pipe', stderr: 'ignore' },
   )
   return result.exitCode === 0 ? new TextDecoder().decode(result.stdout) : ''
 }
 
-function signalTrackedExecutor(pid: number, signal: NodeJS.Signals): void {
-  if (process.platform !== 'win32') {
+function signalTrackedExecutor(identity: ProcessIdentity, signal: NodeJS.Signals): void {
+  if (!processIdentityIsLive(identity)) return
+  if (process.platform !== 'win32' && identity.pgid === identity.pid) {
     try {
-      process.kill(-pid, signal)
+      process.kill(-identity.pgid, signal)
       return
     } catch {}
   }
-  try { process.kill(pid, signal) } catch {}
+  if (!processIdentityIsLive(identity)) return
+  try { process.kill(identity.pid, signal) } catch {}
 }
 
 export async function terminateTrackedExecutors(
@@ -2222,7 +2370,7 @@ export async function terminateTrackedExecutors(
   timeoutMs = 5_000,
   stateDirectory = stateDir(),
 ): Promise<void> {
-  const registrations = new Map<number, { jobId: string; path?: string }>()
+  const registrations = new Map<number, { jobId: string; path?: string; started?: string }>()
   for (const job of store.runningJobs()) {
     if (job.executorPid !== null) registrations.set(job.executorPid, { jobId: job.id })
   }
@@ -2241,18 +2389,32 @@ export async function terminateTrackedExecutors(
         || metadata.size > 4096 || !ownerMatches) {
         throw new Error(`unsafe executor registration: ${path}`)
       }
-      const value = JSON.parse(readFileSync(path, 'utf8')) as { jobId?: string; pid?: number }
+      const value = JSON.parse(readFileSync(path, 'utf8')) as {
+        jobId?: string
+        pid?: number
+        started?: string
+      }
       if (typeof value.jobId !== 'string' || !Number.isInteger(value.pid) || Number(value.pid) <= 0) {
         throw new Error(`invalid executor registration: ${path}`)
       }
-      registrations.set(Number(value.pid), { jobId: value.jobId, path })
+      if (value.started !== undefined && (typeof value.started !== 'string' || !value.started)) {
+        throw new Error(`invalid executor registration identity: ${path}`)
+      }
+      registrations.set(Number(value.pid), { jobId: value.jobId, path, started: value.started })
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
 
   for (const [pid, registration] of registrations) {
-    if (!processStateIsAlive(pid)) {
+    const initialIdentity = readProcessIdentity(pid)
+    if (!initialIdentity) {
+      if (registration.path) rmSync(registration.path, { force: true })
+      continue
+    }
+    if (registration.started && registration.started !== initialIdentity.started) {
+      log(`discarding stale executor PID ${pid} for job ${registration.jobId}: start identity mismatch`)
+      store.clearExecutorPid(registration.jobId, pid)
       if (registration.path) rmSync(registration.path, { force: true })
       continue
     }
@@ -2269,17 +2431,25 @@ export async function terminateTrackedExecutors(
       if (registration.path) rmSync(registration.path, { force: true })
       continue
     }
+    const signalIdentity = readProcessIdentity(pid)
+    if (!signalIdentity || signalIdentity.started !== initialIdentity.started
+      || signalIdentity.pgid !== initialIdentity.pgid) {
+      log(`discarding stale executor PID ${pid} for job ${registration.jobId}: identity changed before signal`)
+      store.clearExecutorPid(registration.jobId, pid)
+      if (registration.path) rmSync(registration.path, { force: true })
+      continue
+    }
     log(`stopping orphaned Codex executor PID ${pid} for job ${registration.jobId}`)
-    signalTrackedExecutor(pid, 'SIGTERM')
+    signalTrackedExecutor(signalIdentity, 'SIGTERM')
     const startedAt = Date.now()
-    while (processStateIsAlive(pid) && Date.now() - startedAt < timeoutMs) {
+    while (processIdentityIsLive(signalIdentity) && Date.now() - startedAt < timeoutMs) {
       await Bun.sleep(50)
     }
-    if (processStateIsAlive(pid)) {
-      signalTrackedExecutor(pid, 'SIGKILL')
+    if (processIdentityIsLive(signalIdentity)) {
+      signalTrackedExecutor(signalIdentity, 'SIGKILL')
       await Bun.sleep(100)
     }
-    if (processStateIsAlive(pid)) {
+    if (processIdentityIsLive(signalIdentity)) {
       throw new Error(`orphaned Codex executor PID ${pid} did not stop`)
     }
     if (registration.path) rmSync(registration.path, { force: true })
@@ -2295,6 +2465,11 @@ async function runCli(): Promise<void> {
   const dir = stateDir()
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   requireManagedStateRoot(dir)
+  if (command === 'validate-storage') {
+    requireSafeDatabasePath(defaultDbPath())
+    process.stdout.write('{"storage":"safe"}\n')
+    return
+  }
   const store = new JobStore(defaultDbPath())
 
   if (command === 'enqueue') {
@@ -2398,14 +2573,43 @@ async function runCli(): Promise<void> {
     )
   }
 
+  const log = (message: string) => process.stderr.write(`${new Date().toISOString()} ${message}\n`)
+  loadStateEnv(dir)
+  const botToken = process.env.SLACK_BOT_TOKEN
+  const appToken = process.env.SLACK_APP_TOKEN
+  let notifier: SlackNotifier | undefined
+  let runnerRuntimeId: string | undefined
+  if (botToken || appToken) {
+    if (!botToken || !appToken) {
+      store.close()
+      throw new Error('Slack progress notifications require one Bot/App token pair')
+    }
+    try {
+      const identityClient = new WebClient(botToken, slackWebClientOptions(10_000))
+      await verifySlackAppTokenPair(appToken, {
+        authTest: () => identityClient.auth.test({}),
+        botsInfo: async bot => {
+          const result = await identityClient.bots.info({ bot })
+          return { app_id: result.bot?.app_id }
+        },
+      })
+      runnerRuntimeId = slackTokenPairRuntimeIdentity(botToken, appToken)
+      notifier = new SlackNotifier(botToken, log, store)
+    } catch (error) {
+      store.close()
+      throw error
+    }
+  } else {
+    log('Slack Bot/App tokens not found; Slack progress notifications are disabled')
+  }
+
   const lockDir = join(dir, 'job-runner.lock')
-  if (!acquireDaemonLock(lockDir, dir)) {
+  if (!acquireDaemonLock(lockDir, dir, runnerRuntimeId)) {
     process.stderr.write(`zerokun job runner already running (${lockDir})\n`)
     store.close()
     return
   }
 
-  const log = (message: string) => process.stderr.write(`${new Date().toISOString()} ${message}\n`)
   const updateJournal = join(dir, 'update-transaction.json')
   if (!updateTransactionPending(updateJournal)) {
     await terminateTrackedExecutors(store, log, 5_000, dir)
@@ -2419,18 +2623,15 @@ async function runCli(): Promise<void> {
   } else {
     log('update transaction pending; startup recovery and job execution are paused')
   }
-  loadStateEnv(dir)
   if (!updateTransactionPending(updateJournal)) {
     const initialMaintenance = maintainState(store, dir)
     log(`state maintenance: ${JSON.stringify(initialMaintenance)}`)
   }
-  const token = process.env.SLACK_BOT_TOKEN
-  const notifier = token ? new SlackNotifier(token, log, store) : undefined
-  if (!notifier) log('SLACK_BOT_TOKEN not found; Slack progress notifications are disabled')
-
   const controller = new AbortController()
   const stop = () => controller.abort()
-  process.on('SIGINT', stop)
+  const ignoreInterrupt = () => {}
+  if (command === 'daemon') process.on('SIGINT', ignoreInterrupt)
+  else process.on('SIGINT', stop)
   process.on('SIGTERM', stop)
   const maintenanceTimer = setInterval(() => {
     if (updateTransactionPending(updateJournal)) return
@@ -2442,14 +2643,21 @@ async function runCli(): Promise<void> {
   }, positiveInteger(process.env.ZEROKUN_GC_INTERVAL_MS, 6 * 60 * 60 * 1000))
   maintenanceTimer.unref()
 
+  const slackIdentityChanged = createSlackIdentityPauseGuard(
+    dir, runnerRuntimeId, controller, log,
+  )
+  const shouldPause = (): boolean => {
+    if (slackIdentityChanged()) return true
+    return updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
+  }
+
   try {
     await runQueuedJobs({
       store,
       maxJobsPerSession: positiveInteger(process.env.ZEROKUN_MAX_JOBS_PER_SESSION, 5),
       pollMs: positiveInteger(process.env.ZEROKUN_JOB_POLL_MS, 1000),
       stopWhenIdle: command === 'run-until-idle',
-      shouldPause: () => updateTransactionPending(updateJournal)
-        || updateIsRunning(join(dir, 'update.lock')),
+      shouldPause,
       signal: controller.signal,
       notifier,
       executor: async (job, signal) => {
@@ -2468,7 +2676,8 @@ async function runCli(): Promise<void> {
   } finally {
     const interrupted = controller.signal.aborted
     clearInterval(maintenanceTimer)
-    process.off('SIGINT', stop)
+    if (command === 'daemon') process.off('SIGINT', ignoreInterrupt)
+    else process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
     store.close()
     releaseDaemonLock(lockDir)

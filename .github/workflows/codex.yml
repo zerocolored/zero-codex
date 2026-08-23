@@ -1,10 +1,10 @@
-name: Codex branch verification
+name: Codex runtime verification
 
 on:
   push:
-    branches: [codex]
+    branches: [main, codex]
   pull_request:
-    branches: [codex]
+    branches: [main, codex]
 
 permissions:
   contents: read

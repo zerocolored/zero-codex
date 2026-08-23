@@ -29,6 +29,8 @@ describe('Zero-kun Codex wiring', () => {
     const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
     const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
     expect(runner).toContain('executeCodexJob(job')
+    expect(runner).toContain('verifySlackAppTokenPair')
+    expect(runner).toContain('verifySlackAppTokenPair')
     expect(executor).toContain("'exec'")
     expect(executor).toContain("...(resumed && sessionId ? ['resume', sessionId] : [])")
     expect(executor).toContain("'--ignore-user-config'")
@@ -52,7 +54,12 @@ describe('Zero-kun Codex wiring', () => {
   test('launcher starts runner then standalone gateway, without Claude development channels', () => {
     const launcher = readFileSync(join(root, 'codex-channel.sh'), 'utf8')
     expect(launcher).toContain('start_job_runner')
-    expect(launcher).toContain('bun "$REPO_DIR/server.ts"')
+    expect(launcher).toContain('bun --config=/dev/null --no-env-file "$REPO_DIR/server.ts"')
+    expect(launcher).toContain('"$RUNNER_LAUNCHER" "$JOB_RUNNER" "$STATE_DIR" "$JOB_RUNNER_LOG"')
+    expect(readFileSync(join(import.meta.dir, 'runner-launcher.ts'), 'utf8'))
+      .toContain("detached: process.platform !== 'win32'")
+    expect(readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8'))
+      .toContain("if (command === 'daemon') process.on('SIGINT', ignoreInterrupt)")
     expect(launcher.indexOf('start_job_runner')).toBeLessThan(
       launcher.lastIndexOf('exec caffeinate -dimsu'),
     )
@@ -68,6 +75,8 @@ describe('Zero-kun Codex wiring', () => {
       'job-runner.ts',
       'codex-executor.ts',
       'state-dir.ts',
+      'slack-http.ts',
+      'slack-app-identity.ts',
       'zerokun-access',
       'codex-channel',
       'zerokun-update',
@@ -78,9 +87,9 @@ describe('Zero-kun Codex wiring', () => {
     expect(setup).not.toContain('claude-skills')
   })
 
-  test('self update follows the codex branch and restarts gateway without TUI confirmation', () => {
+  test('self update follows the main branch and restarts gateway without TUI confirmation', () => {
     const updater = readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')
-    expect(updater).toContain("ZEROKUN_UPDATE_BRANCH ?? 'codex'")
+    expect(updater).toContain("ZEROKUN_UPDATE_BRANCH ?? 'main'")
     expect(updater).toContain("join(options.rootRepo, 'codex-channel.sh')")
     expect(updater).toContain("join(stateDir, 'plugin.lock')")
     expect(updater).not.toContain('Enter\\s+to\\s+confirm')

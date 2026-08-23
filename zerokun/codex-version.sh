@@ -32,7 +32,7 @@ zerokun_require_codex_version() {
   actual="$(zerokun_codex_version)"
   if [ -z "$actual" ] || ! zerokun_version_at_least "$actual" "$ZEROKUN_MIN_CODEX_VERSION"; then
     echo "❌ Codex CLI ${ZEROKUN_MIN_CODEX_VERSION} 以上が必要です（検出: ${actual:-不明}）。" >&2
-    echo "   curl -fsSL https://chatgpt.com/codex/install.sh | sh で更新してください。" >&2
+    echo "   このrepositoryで bash zerokun/bootstrap-macos.sh --skip-slack を実行してください。" >&2
     return 1
   fi
 }

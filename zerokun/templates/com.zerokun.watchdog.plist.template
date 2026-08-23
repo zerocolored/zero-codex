@@ -13,6 +13,8 @@
   <dict>
     <key>ZEROKUN_STATE_DIR</key>
     <string>__STATE_DIR__</string>
+    <key>ZEROKUN_LEGACY_CUTOVER</key>
+    <string>__LEGACY_CUTOVER__</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

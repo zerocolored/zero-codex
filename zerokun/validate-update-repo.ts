@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { realpathSync } from 'fs'
 
@@ -15,17 +15,17 @@ function gitConfigOverrides(): string[] {
     'core.sshCommand=/usr/bin/false',
     'protocol.allow=never',
     'protocol.https.allow=always',
-    ...(process.env.ZEROKUN_UPDATE_TESTING === '1' ? ['protocol.file.allow=always'] : []),
+    'protocol.file.allow=never',
   ]
 }
 
 function git(repo: string, args: string[], allowExitOne = false): string {
   const result = Bun.spawnSync([
-    'git', ...gitConfigOverrides().flatMap(value => ['-c', value]), '-C', repo, ...args,
+    '/usr/bin/git', ...gitConfigOverrides().flatMap(value => ['-c', value]), '-C', repo, ...args,
   ], {
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
     env: {
-      PATH: process.env.PATH ?? '/usr/bin:/bin',
+      PATH: '/usr/bin:/bin',
       HOME: process.env.HOME ?? '/',
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_GLOBAL: '/dev/null',
@@ -85,13 +85,12 @@ function validateLocalConfig(repo: string, branch: string): void {
   }
 }
 
-const [path, branch = 'codex'] = process.argv.slice(2)
+const [path, branch = 'main'] = process.argv.slice(2)
 if (!path) throw new Error('usage: validate-update-repo.ts REPOSITORY [BRANCH]')
 const repo = realpathSync(path)
 validateLocalConfig(repo, branch)
 const origin = git(repo, ['remote', 'get-url', 'origin'])
-if (process.env.ZEROKUN_UPDATE_TESTING !== '1'
-  && origin !== 'https://github.com/zerocolored/zero.git'
-  && origin !== 'https://github.com/zerocolored/zero') {
+if (origin !== 'https://github.com/zerocolored/zero-codex.git'
+  && origin !== 'https://github.com/zerocolored/zero-codex') {
   throw new Error(`origin is not the public Codex HTTPS URL: ${origin}`)
 }

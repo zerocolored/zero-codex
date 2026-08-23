@@ -2,20 +2,24 @@
 
 ## 最短手順
 
-まだ repository がない Mac では、`codex` ブランチの bootstrap を一度ファイルへ保存してから
+まだ repository がない Mac では、`zero-codex` の `main` ブランチにある bootstrap を一度ファイルへ保存してから
 実行します。
 
 ```bash
-bootstrap_path="$(mktemp "${TMPDIR:-/tmp}/zerokun-bootstrap.XXXXXX")"
-curl --fail --location --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/zerocolored/zero/codex/zerokun/bootstrap-macos.sh \
-  --output "$bootstrap_path"
+bootstrap_dir="$(/usr/bin/mktemp -d /tmp/zerokun-bootstrap.XXXXXX)"
+/bin/chmod 700 "$bootstrap_dir"
+bootstrap_path="$bootstrap_dir/bootstrap-macos.sh"
+/usr/bin/env -i PATH=/usr/bin:/bin TMPDIR=/tmp \
+  /usr/bin/curl -q --fail --location --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --noproxy '*' --output "$bootstrap_path" \
+    https://raw.githubusercontent.com/zerocolored/zero-codex/main/zerokun/bootstrap-macos.sh
 bash "$bootstrap_path" --with-slack
-rm -f "$bootstrap_path"
+/bin/rm -f "$bootstrap_path"
+/bin/rmdir "$bootstrap_dir"
 ```
 
-実行前に保存したスクリプトの内容を確認できます。既に clone 済みなら、その repository で
-`git switch codex` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使います。
+実行前に保存したスクリプトの内容を確認できます。既に `zero-codex` をclone済みなら、その repository で
+`git switch main` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使います。
 
 スクリプトが扱うもの:
 
@@ -23,7 +27,7 @@ rm -f "$bootstrap_path"
 - Homebrew
 - Git / Bun / tmux / Codex CLI 0.149.0以上
 - Codex login
-- zero repository の `codex` branch
+- zero-codex repository の `main` branch（既定 `~/Desktop/Project/zero-codex`）
 - Zero-kun本体とは分離した既定`zerokun-workspace` repository（既存projectも指定可能）
 - Zero-kun runtime、管理 CLI、watchdog
 - Slack manifest の生成、token 入力、access 初期設定
@@ -125,16 +129,15 @@ commit identityは対象repositoryのlocal configへ設定し、認証pushは別
 
 ## 再実行
 
-`setup.sh` と bootstrap は既存の `.env` / `access.json` を上書きしません。Claude版からの
-初回切替では旧runnerの新規claimを止め、実行中jobをdrainしてから停止し、待機jobをCodexへ
-sessionなしで引き継ぎます。途中で停止した場合は
-同じ command を再実行できます。自己更新は次を使います。
+`setup.sh` と bootstrap はCodex state内の既存 `.env` / `access.json` を上書きしません。
+別PCのClaude版は停止せず、そのSlack Appやtokenも流用しません。途中で停止した場合は
+同じcommandを再実行できます。自己更新は次を使います。
 
 ```bash
 zerokun-update
 ```
 
-`origin/codex` への fast-forward だけを行い、未コミット変更や未 push commit がある場合は
+`origin/main` への fast-forward だけを行い、未コミット変更や未 push commit がある場合は
 何も更新せず停止します。
 
 ## State path
@@ -145,13 +148,14 @@ zerokun-update
 ~/.codex/zerokun
 ```
 
-旧版の`~/.claude/channels/slack`に`.env` / `access.json` / `jobs.sqlite3`のいずれかがある
-設定済み環境では、token/access/queueを移行するため旧directoryを自動選択します。
-空directoryは無視します。別の場所を使う場合は最初のsetupより前に設定します。
+旧版の`~/.claude/channels/slack`は存在しても自動選択しません。新しいMacでは
+新しいSlack App、token、DB、access、routesをCodex stateへ作成します。別の場所を使う場合、
+または同一PCでin-place cutoverする場合だけ、最初のsetupより前に明示します。
 
 ```bash
-export ZEROKUN_STATE_DIR="$HOME/.codex/zerokun"
+export ZEROKUN_LEGACY_CUTOVER=1
+export ZEROKUN_STATE_DIR="$HOME/.claude/channels/slack"
 ```
 
-launchdからも同じ場所を参照できるようにする必要があります。自動選択されるpathのままなら
-追加設定は不要です。
+setupはlaunchdにも同じ場所とcutoverフラグを設定します。別PC比較ではこの2つを使わず、既定の
+`~/.codex/zerokun`を使ってください。

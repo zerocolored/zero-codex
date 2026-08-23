@@ -2,26 +2,139 @@
 # Fresh macOS -> Zero-kun bootstrap.
 # This file can be copied to a new Mac and run before any project repository exists.
 set -euo pipefail
+unset BUN_OPTIONS BUN_CONFIG_PRELOAD NODE_OPTIONS
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_REPO_DIR="$HOME/Desktop/Project/zero"
+DEFAULT_REPO_DIR="$HOME/Desktop/Project/zero-codex"
 if [ -d "$SCRIPT_DIR/../.git" ] && [ -f "$SCRIPT_DIR/../server.ts" ]; then
   DEFAULT_REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
 
 REPO_DIR="${ZEROKUN_REPO_DIR:-$DEFAULT_REPO_DIR}"
 PROJECT_DIR="${ZEROKUN_PROJECT_DIR:-$(dirname "$REPO_DIR")/zerokun-workspace}"
-if [ -n "${ZEROKUN_STATE_DIR:-}" ]; then
-  STATE_DIR="$ZEROKUN_STATE_DIR"
-elif [ -n "${SLACK_STATE_DIR:-}" ]; then
-  STATE_DIR="$SLACK_STATE_DIR"
-elif [ -f "$HOME/.claude/channels/slack/jobs.sqlite3" ] \
-  || [ -f "$HOME/.claude/channels/slack/.env" ] \
-  || [ -f "$HOME/.claude/channels/slack/access.json" ]; then
-  STATE_DIR="$HOME/.claude/channels/slack"
-else
-  STATE_DIR="$HOME/.codex/zerokun"
-fi
+
+bootstrap_lexical_path() {
+  local input="$1" current rest component
+  case "$input" in /*) current="/" ;; *) current="$PWD" ;; esac
+  rest="$input"
+  while :; do
+    case "$rest" in
+      */*) component="${rest%%/*}"; rest="${rest#*/}" ;;
+      *) component="$rest"; rest="" ;;
+    esac
+    case "$component" in
+      ''|.) ;;
+      ..) current="${current%/*}"; [ -n "$current" ] || current="/" ;;
+      *) if [ "$current" = "/" ]; then current="/$component"; else current="$current/$component"; fi ;;
+    esac
+    [ -n "$rest" ] || break
+  done
+  printf '%s\n' "$current"
+}
+
+bootstrap_normalize_path() {
+  local input="$1" normalized ancestor suffix component physical
+  if [ -d "$input" ]; then
+    physical="$(CDPATH='' cd -P -- "$input" 2>/dev/null && pwd -P)" || physical=""
+    if [ -n "$physical" ]; then printf '%s\n' "$physical"; return; fi
+  fi
+  normalized="$(bootstrap_lexical_path "$input")"
+  ancestor="$normalized"
+  suffix=""
+  while [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ] && [ "$ancestor" != "/" ]; do
+    component="${ancestor##*/}"
+    suffix="/$component$suffix"
+    ancestor="${ancestor%/*}"
+    [ -n "$ancestor" ] || ancestor="/"
+  done
+  if [ -d "$ancestor" ]; then
+    physical="$(CDPATH='' cd -P -- "$ancestor" 2>/dev/null && pwd -P)" || physical=""
+    if [ -n "$physical" ]; then
+      [ "$physical" != "/" ] || physical=""
+      printf '%s%s\n' "$physical" "$suffix"
+      return
+    fi
+  fi
+  printf '%s\n' "$normalized"
+}
+
+bootstrap_path_selects_legacy() {
+  local logical physical legacy_physical
+  logical="$(bootstrap_lexical_path "$1")"
+  case "$logical" in */.claude/channels/slack) return 0 ;; esac
+  physical="$(bootstrap_normalize_path "$1")"
+  legacy_physical="$(bootstrap_normalize_path "$HOME/.claude/channels/slack")"
+  [ "$physical" != "$legacy_physical" ] || return 0
+  case "$physical" in */.claude/channels/slack) return 0 ;; esac
+  return 1
+}
+
+bootstrap_owned_regular_file() {
+  local file="$1" metadata
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  metadata="$(/usr/bin/stat -f '%u:%l' "$file" 2>/dev/null || true)"
+  [ "$metadata" = "$(/usr/bin/id -u):1" ]
+}
+
+bootstrap_valid_cutover_marker_only() {
+  local state="$1" marker physical first second third lines
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  physical="$(CDPATH='' cd -P -- "$state" 2>/dev/null && pwd -P)" || return 1
+  marker="$state/.codex-legacy-cutover"
+  bootstrap_owned_regular_file "$marker" || return 1
+  first="$(/usr/bin/sed -n '1p' "$marker" 2>/dev/null)" || return 1
+  second="$(/usr/bin/sed -n '2p' "$marker" 2>/dev/null)" || return 1
+  third="$(/usr/bin/sed -n '3p' "$marker" 2>/dev/null)" || return 1
+  lines="$(/usr/bin/wc -l < "$marker" 2>/dev/null | /usr/bin/tr -d '[:space:]')" || return 1
+  [ "$first" = 'zerokun-codex-legacy-cutover-v1' ] \
+    && [ "$second" = "$physical" ] && [ -z "$third" ] && [ "$lines" = "2" ]
+}
+
+bootstrap_valid_cutover_state() {
+  local state="$1" env_file physical legacy_physical owner
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  owner="$(/usr/bin/stat -f '%u' "$state" 2>/dev/null || true)"
+  [ "$owner" = "$(/usr/bin/id -u)" ] || return 1
+  env_file="$state/.env"
+  bootstrap_owned_regular_file "$env_file" && [ -s "$env_file" ] \
+    && [ "$(/usr/bin/grep -Ec '^SLACK_BOT_TOKEN=' "$env_file" || true)" = "1" ] \
+    && [ "$(/usr/bin/grep -Ec '^SLACK_APP_TOKEN=' "$env_file" || true)" = "1" ] \
+    && /usr/bin/grep -Eq '^SLACK_BOT_TOKEN=xoxb-[A-Za-z0-9._-]{10,}$' "$env_file" \
+    && /usr/bin/grep -Eq '^SLACK_APP_TOKEN=xapp-[A-Za-z0-9._-]{10,}$' "$env_file" \
+    || return 1
+  physical="$(CDPATH='' cd -P -- "$state" 2>/dev/null && pwd -P)" || return 1
+  bootstrap_valid_cutover_marker_only "$state" && return 0
+  [ -d "$HOME/.claude/channels/slack" ] || return 1
+  legacy_physical="$(CDPATH='' cd -P -- "$HOME/.claude/channels/slack" 2>/dev/null && pwd -P)" \
+    || return 1
+  [ "$physical" = "$legacy_physical" ]
+}
+
+bootstrap_resolve_state_dir() {
+  local selected
+  case "${ZEROKUN_LEGACY_CUTOVER:-0}" in
+    0) ;;
+    1)
+      selected="${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}"
+      bootstrap_valid_cutover_state "$selected" || {
+        echo "❌ legacy cutover stateが存在しないか不正です: $selected" >&2
+        return 1
+      }
+      printf '%s\n' "$selected"
+      return
+      ;;
+    *) echo "❌ ZEROKUN_LEGACY_CUTOVERは0または1で指定してください" >&2; return 1 ;;
+  esac
+  if [ -n "${ZEROKUN_STATE_DIR:-}" ] \
+    && ! bootstrap_valid_cutover_marker_only "$ZEROKUN_STATE_DIR" \
+    && ! bootstrap_path_selects_legacy "$ZEROKUN_STATE_DIR"; then
+    printf '%s\n' "$ZEROKUN_STATE_DIR"
+  else
+    printf '%s\n' "$HOME/.codex/zerokun"
+  fi
+}
+
+STATE_DIR=""
 MODE="install"
 SKIP_LOGINS=0
 SKIP_SLACK=0
@@ -116,6 +229,12 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$MODE" = "doctor" ]; then
+  STATE_DIR="$HOME/.codex/zerokun"
+else
+  STATE_DIR="$(bootstrap_resolve_state_dir)"
+fi
 
 # 導入経路は、これから配置する場所を先にPATHへ足しておく必要がある。
 # 診断(--doctor)は「呼び出し元の環境でそのまま使えるか」を答えるものなので、
@@ -418,11 +537,60 @@ persist_brew_path() {
   append_profile_block '# zerokun bootstrap: Homebrew' "$line"
 }
 
+secure_download() {
+  local output="$1" url="$2"
+  /usr/bin/env -i PATH=/usr/bin:/bin TMPDIR=/tmp \
+    /usr/bin/curl -q --fail --location --proto '=https' --proto-redir '=https' \
+      --tlsv1.2 --noproxy '*' --output "$output" "$url"
+}
+
+# Downloaded installers and package managers perform their own second-stage
+# network access. Give them the real account HOME only for their documented
+# install destination, while forcing every config/cache lookup that can alter
+# transport or Git routing into a fresh owner-only directory. env -i also
+# removes proxy, custom-CA, GIT_CONFIG_COUNT and similar ambient overrides.
+isolated_network_command() {
+  local isolated_root status=0
+  isolated_root="$(/usr/bin/mktemp -d /tmp/zerokun-network-env.XXXXXX)" \
+    || fail "network command用一時directoryを作成できません"
+  /bin/chmod 0700 "$isolated_root"
+  /bin/mkdir "$isolated_root/curl" "$isolated_root/xdg-config" \
+    "$isolated_root/xdg-cache" "$isolated_root/bun-cache"
+  /bin/chmod 0700 "$isolated_root/curl" "$isolated_root/xdg-config" \
+    "$isolated_root/xdg-cache" "$isolated_root/bun-cache"
+  /usr/bin/env -i \
+    HOME="$HOME" USER="$(/usr/bin/id -un)" LOGNAME="$(/usr/bin/id -un)" \
+    SHELL="${SHELL:-/bin/zsh}" TERM="${TERM:-dumb}" \
+    PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    TMPDIR=/tmp CURL_HOME="$isolated_root/curl" \
+    XDG_CONFIG_HOME="$isolated_root/xdg-config" \
+    XDG_CACHE_HOME="$isolated_root/xdg-cache" \
+    BUN_INSTALL_CACHE_DIR="$isolated_root/bun-cache" \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
+    SSH_ASKPASS=/usr/bin/false "$@" || status=$?
+  /bin/rm -rf "$isolated_root"
+  return "$status"
+}
+
 install_homebrew() {
+  local installer
   section "Homebrew"
   if ! load_brew; then
     require_interactive "Homebrewのインストール"
-    /bin/bash -c "$(/usr/bin/curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    installer="$(/usr/bin/mktemp /tmp/zerokun-homebrew-installer.XXXXXX)" \
+      || fail "Homebrew公式installer用一時fileを作成できません"
+    if ! secure_download "$installer" \
+      https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh; then
+      /bin/rm -f "$installer"
+      fail "Homebrew公式installerを取得できませんでした"
+    fi
+    /bin/chmod 0700 "$installer"
+    if ! isolated_network_command /bin/bash "$installer"; then
+      /bin/rm -f "$installer"
+      fail "Homebrew公式installerの実行に失敗しました"
+    fi
+    /bin/rm -f "$installer"
     load_brew || fail "HomebrewをPATHへ読み込めませんでした"
   fi
   persist_brew_path
@@ -430,16 +598,15 @@ install_homebrew() {
 }
 
 install_codex_standalone() {
-  local installer curl_bin
-  curl_bin="${ZEROKUN_CURL_BIN:-/usr/bin/curl}"
+  local installer
   installer="$(/usr/bin/mktemp /tmp/zerokun-codex-installer.XXXXXX)" \
     || fail "Codex公式installer用一時fileを作成できません"
-  if ! "$curl_bin" -fsSL https://chatgpt.com/codex/install.sh --output "$installer"; then
+  if ! secure_download "$installer" https://chatgpt.com/codex/install.sh; then
     /bin/rm -f "$installer"
     fail "Codex公式installerを取得できませんでした"
   fi
   /bin/chmod 700 "$installer"
-  if ! CODEX_NON_INTERACTIVE=true /bin/sh "$installer"; then
+  if ! isolated_network_command CODEX_NON_INTERACTIVE=true /bin/sh "$installer"; then
     /bin/rm -f "$installer"
     fail "Codex公式installerの実行に失敗しました"
   fi
@@ -452,12 +619,12 @@ install_codex_standalone() {
 install_cli_tools() {
   section "tmux / Codex CLI / Bun"
   if ! command -v tmux >/dev/null 2>&1; then
-    brew install tmux
+    isolated_network_command "$(command -v brew)" install tmux
   fi
   if ! command -v codex >/dev/null 2>&1; then
-    brew install --cask codex
+    isolated_network_command "$(command -v brew)" install --cask codex
   elif ! version_at_least "$(codex_version_number)" "$MIN_CODEX_VERSION"; then
-    if ! brew upgrade --cask codex; then
+    if ! isolated_network_command "$(command -v brew)" upgrade --cask codex; then
       warn "HomebrewのCodex更新に失敗したため公式installerへ切り替えます"
     fi
   fi
@@ -466,7 +633,19 @@ install_cli_tools() {
     install_codex_standalone
   fi
   if ! command -v bun >/dev/null 2>&1; then
-    /usr/bin/curl -fsSL https://bun.com/install | /bin/bash
+    local bun_installer
+    bun_installer="$(/usr/bin/mktemp /tmp/zerokun-bun-installer.XXXXXX)" \
+      || fail "Bun公式installer用一時fileを作成できません"
+    if ! secure_download "$bun_installer" https://bun.com/install; then
+      /bin/rm -f "$bun_installer"
+      fail "Bun公式installerを取得できませんでした"
+    fi
+    /bin/chmod 0700 "$bun_installer"
+    if ! isolated_network_command /bin/bash "$bun_installer"; then
+      /bin/rm -f "$bun_installer"
+      fail "Bun公式installerの実行に失敗しました"
+    fi
+    /bin/rm -f "$bun_installer"
     export PATH="$HOME/.bun/bin:$PATH"
   fi
   append_profile_block '# zerokun bootstrap: Bun' 'export BUN_INSTALL="$HOME/.bun"
@@ -498,14 +677,13 @@ repo_is_clean() {
 }
 
 safe_git() {
-  local file_protocol=never
-  [ "${ZEROKUN_UPDATE_TESTING:-0}" != "1" ] || file_protocol=always
-  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+  /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin TMPDIR="${TMPDIR:-/tmp}" \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
     GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false GIT_PAGER=cat \
-    git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
       -c credential.helper= -c core.sshCommand=/usr/bin/false \
       -c protocol.allow=never -c protocol.https.allow=always \
-      -c protocol.file.allow="$file_protocol" "$@"
+      -c protocol.file.allow=never "$@"
 }
 
 remote_matches_slug() {
@@ -520,25 +698,32 @@ remote_matches_slug() {
 
 validate_existing_repo() {
   local slug="$1" target="$2" target_branch="$3"
-  local validator="$SCRIPT_DIR/validate-update-repo.ts"
-  local downloaded_validator=""
-  if [ ! -f "$validator" ]; then
-    # The documented fresh-Mac path downloads this bootstrap as one standalone
-    # file. A rerun after clone must not depend on a sibling that was never
-    # downloaded, and must not execute the unvalidated checkout's validator.
-    downloaded_validator="$(/usr/bin/mktemp /tmp/zerokun-repo-validator.XXXXXX)" \
-      || { echo "repository validator用一時fileを作成できません" >&2; return 1; }
-    validator="$downloaded_validator"
-    if ! /usr/bin/curl --fail --location --proto '=https' --tlsv1.2 \
-      "https://raw.githubusercontent.com/${slug}/${target_branch}/zerokun/validate-update-repo.ts" \
-      --output "$validator"; then
-      /bin/rm -f "$downloaded_validator"
-      return 1
-    fi
+  # This bootstrap is commonly downloaded as one file into a temporary
+  # directory. Never trust an adjacent validator: the directory may be shared,
+  # and the target checkout is not trusted until this validation succeeds.
+  local validator_dir validator size status=0
+  validator_dir="$(/usr/bin/mktemp -d /tmp/zerokun-repo-validator.XXXXXX)" \
+    || { echo "repository validator用一時directoryを作成できません" >&2; return 1; }
+  /bin/chmod 0700 "$validator_dir"
+  validator="$validator_dir/validate-update-repo.ts"
+  if ! secure_download "$validator" \
+    "https://raw.githubusercontent.com/${slug}/${target_branch}/zerokun/validate-update-repo.ts"; then
+    /bin/rm -f "$validator"
+    /bin/rmdir "$validator_dir" 2>/dev/null || true
+    return 1
   fi
-  local status=0
-  bun "$validator" "$target" "$target_branch" || status=$?
-  [ -z "$downloaded_validator" ] || /bin/rm -f "$downloaded_validator"
+  /bin/chmod 0600 "$validator"
+  size="$(/usr/bin/stat -f '%z' "$validator" 2>/dev/null || true)"
+  if ! bootstrap_owned_regular_file "$validator" \
+    || [ -z "$size" ] || [ "$size" -le 0 ] || [ "$size" -gt 1048576 ]; then
+    echo "downloadしたrepository validatorが安全なregular fileではありません" >&2
+    /bin/rm -f "$validator"
+    /bin/rmdir "$validator_dir" 2>/dev/null || true
+    return 1
+  fi
+  bun --config=/dev/null --no-env-file "$validator" "$target" "$target_branch" || status=$?
+  /bin/rm -f "$validator"
+  /bin/rmdir "$validator_dir" 2>/dev/null || true
   return "$status"
 }
 
@@ -576,11 +761,13 @@ ensure_repo() {
   fi
   /bin/mkdir -p "$(dirname "$target")"
   safe_git clone --branch "$target_branch" "https://github.com/${slug}.git" "$target"
+  validate_existing_repo "$slug" "$target" "$target_branch" \
+    || fail "clone直後のGit設定またはoriginを独立検証できません: $target"
 }
 
 install_repositories() {
   section "ゼロくんリポジトリ"
-  ensure_repo zerocolored/zero "$REPO_DIR" codex
+  ensure_repo zerocolored/zero-codex "$REPO_DIR" main
   ok "リポジトリを配置しました"
 }
 
@@ -608,10 +795,19 @@ run_setup() {
 slack_tokens_ready() {
   local env_file="$STATE_DIR/.env"
   local content
-  content="$(bun "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$env_file" 2>/dev/null)" \
+  content="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$env_file" 2>/dev/null)" \
     || return 1
-  printf '%s\n' "$content" | /usr/bin/grep -Eq '^SLACK_BOT_TOKEN=xoxb-[A-Za-z0-9._-]{10,}$' \
+  [ "$(printf '%s\n' "$content" | /usr/bin/grep -Ec '^SLACK_BOT_TOKEN=' || true)" = "1" ] \
+    && [ "$(printf '%s\n' "$content" | /usr/bin/grep -Ec '^SLACK_APP_TOKEN=' || true)" = "1" ] \
+    && printf '%s\n' "$content" | /usr/bin/grep -Eq '^SLACK_BOT_TOKEN=xoxb-[A-Za-z0-9._-]{10,}$' \
     && printf '%s\n' "$content" | /usr/bin/grep -Eq '^SLACK_APP_TOKEN=xapp-[A-Za-z0-9._-]{10,}$'
+}
+
+verify_slack_app_identity() {
+  local bun_bin
+  bun_bin="$(command -v bun)" || return 1
+  /usr/bin/env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+    "$bun_bin" --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-identity.ts" verify-file "$STATE_DIR/.env"
 }
 
 save_slack_tokens() {
@@ -623,7 +819,7 @@ save_slack_tokens() {
   temp_file="$(/usr/bin/mktemp "$STATE_DIR/.env.zerokun.XXXXXX")" \
     || fail "Slack token用一時fileを作成できません"
   if [ -e "$env_file" ] || [ -L "$env_file" ]; then
-    existing="$(bun "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$env_file")" \
+    existing="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$env_file")" \
       || { /bin/rm -f "$temp_file"; fail ".envが安全な通常fileではありません"; }
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
@@ -635,7 +831,7 @@ $existing
 EOF
   fi
   printf 'SLACK_BOT_TOKEN=%s\nSLACK_APP_TOKEN=%s\n' "$bot_token" "$app_token" >> "$temp_file"
-  if ! bun "$REPO_DIR/zerokun/safe-file.ts" atomic-write-private "$env_file" < "$temp_file"; then
+  if ! bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" atomic-write-private "$env_file" < "$temp_file"; then
     /bin/rm -f "$temp_file"
     fail "Slack tokenを安全に保存できません"
   fi
@@ -646,7 +842,7 @@ configure_access() {
   local access_file="$STATE_DIR/access.json"
   local existing_access=""
   if [ -e "$access_file" ] || [ -L "$access_file" ]; then
-    existing_access="$(bun "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$access_file")" \
+    existing_access="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$access_file")" \
       || fail "access.jsonが安全な通常fileではありません"
   fi
   if [ -n "$existing_access" ] && ! printf '%s\n' "$existing_access" \
@@ -666,10 +862,10 @@ configure_access() {
   [ -n "$channel_id" ] || { warn "チャンネルは後で追加してください"; return; }
   case "$channel_id" in C?*|G?*) ;; *) fail "SlackチャンネルIDの形式が不正です" ;; esac
   case "$channel_id" in *[!A-Z0-9]*) fail "SlackチャンネルIDの形式が不正です" ;; esac
-  ZEROKUN_STATE_DIR="$STATE_DIR" bun "$REPO_DIR/zerokun/access.ts" policy allowlist >/dev/null
-  ZEROKUN_STATE_DIR="$STATE_DIR" bun "$REPO_DIR/zerokun/access.ts" allow "$user_id" >/dev/null
-  ZEROKUN_STATE_DIR="$STATE_DIR" bun "$REPO_DIR/zerokun/access.ts" channel add "$channel_id" >/dev/null
-  ZEROKUN_STATE_DIR="$STATE_DIR" bun "$REPO_DIR/zerokun/access.ts" channel allow "$channel_id" "$user_id" >/dev/null
+  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/access.ts" policy allowlist >/dev/null
+  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/access.ts" allow "$user_id" >/dev/null
+  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/access.ts" channel add "$channel_id" >/dev/null
+  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/access.ts" channel allow "$channel_id" "$user_id" >/dev/null
   configure_routes_from_access
   ok "Slack allowlistを設定しました"
 }
@@ -681,7 +877,7 @@ configure_routes_from_access() {
   [ -d "$PROJECT_DIR" ] || fail "初期route先がありません: $PROJECT_DIR"
   ZEROKUN_ACCESS_FILE="$access_file" ZEROKUN_ROUTES_FILE="$routes_file" \
     ZEROKUN_SAFE_FILE="$REPO_DIR/zerokun/safe-file.ts" \
-    ZEROKUN_ROUTE_PROJECT="$PROJECT_DIR" bun -e '
+    ZEROKUN_ROUTE_PROJECT="$PROJECT_DIR" bun --config=/dev/null --no-env-file -e '
       import { realpathSync } from "fs";
       const { atomicWritePrivateFile, readOptionalPrivateFile } = await import(process.env.ZEROKUN_SAFE_FILE!);
       const access = JSON.parse((readOptionalPrivateFile(process.env.ZEROKUN_ACCESS_FILE!) ?? "{}"));
@@ -791,9 +987,9 @@ read_slack_token() {
 
 configure_slack() {
   /bin/mkdir -p "$STATE_DIR"
-  bun "$REPO_DIR/zerokun/managed-path.ts" prepare-root "$STATE_DIR" >/dev/null \
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare-root "$STATE_DIR" >/dev/null \
     || fail "state directoryを安全に準備できませんでした: $STATE_DIR"
-  bun "$REPO_DIR/zerokun/safe-file.ts" validate-existing \
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-existing \
     "$STATE_DIR/.env" "$STATE_DIR/access.json" "$STATE_DIR/routes.json" \
     || fail "既存のSlack設定fileが安全ではありません"
   section "Slack App"
@@ -802,9 +998,12 @@ configure_slack() {
     return
   fi
   if slack_tokens_ready; then
-    ok "Slackトークンは設定済みです"
-    configure_access
-    return
+    if verify_slack_app_identity; then
+      ok "同じSlack Appのトークン2つを確認しました"
+      configure_access
+      return
+    fi
+    warn "既存tokenのApp identityを確認できないため、2つとも入力し直します"
   fi
   require_interactive "Slack App設定"
   local manifest="$REPO_DIR/zerokun/templates/slack-app-manifest.yaml"
@@ -817,7 +1016,7 @@ configure_slack() {
   temp_manifest="$(/usr/bin/mktemp "$STATE_DIR/.slack-manifest.zerokun.XXXXXX")" \
     || fail "Slack manifest用一時fileを作成できません"
   render_slack_manifest "$manifest" "$temp_manifest"
-  if ! bun "$REPO_DIR/zerokun/safe-file.ts" atomic-write-private "$generated_manifest" < "$temp_manifest"; then
+  if ! bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" atomic-write-private "$generated_manifest" < "$temp_manifest"; then
     /bin/rm -f "$temp_manifest"
     fail "Slack manifestを安全に保存できません"
   fi
@@ -836,7 +1035,9 @@ configure_slack() {
       → connections:write を追加し、xapp-をコピー
    2. OAuth & Permissions → Install to Workspace
       → Bot User OAuth Tokenのxoxb-をコピー
-   Appを既に作成済みなら、新しく作らず既存Appのトークンを使用してください。
+   このCodex版用に新しいAppを作成してください。別PCで稼働中のClaude版Appの
+   xapp-/xoxb-トークンは使用しません。同じCodex stateでの再設定時だけ、
+   そのCodex版Appの既存トークンを再利用できます。
 EOF
   local bot_token app_token
   read_slack_token xapp 'App-Level Token（xapp-）' SLACK_APP_TOKEN
@@ -844,7 +1045,9 @@ EOF
   read_slack_token xoxb 'Bot User OAuth Token（xoxb-）' SLACK_BOT_TOKEN
   bot_token="$SLACK_TOKEN_RESULT"
   save_slack_tokens "$bot_token" "$app_token"
-  ok "Slackトークンを権限600で保存しました"
+  verify_slack_app_identity \
+    || fail "Bot TokenとApp-Level Tokenが同じSlack Appか確認できませんでした"
+  ok "同じSlack Appのトークン2つを権限600で保存しました"
   configure_access
 }
 
@@ -860,6 +1063,9 @@ main() {
   if [ "$MODE" = "slack-only" ]; then
     echo "== ゼロくん Slack設定だけ再開 =="
     configure_slack
+    # Re-run setup after the new pair has been verified. This safely retires
+    # any runner/gateway tied to the previous Codex Slack App on this PC.
+    run_setup
     section "Slack設定完了"
     echo "   新しいターミナルで実行: zerokun"
     return

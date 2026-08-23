@@ -5,17 +5,143 @@ set -u
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
+# The selected state's token is authoritative. Ignore stale shell/launchd
+# tokens that could reconnect this machine to another Zero-kun Slack App.
+WATCHDOG_BOT_TOKEN=""
+WATCHDOG_APP_TOKEN=""
+unset SLACK_BOT_TOKEN SLACK_APP_TOKEN
+export -n WATCHDOG_BOT_TOKEN WATCHDOG_APP_TOKEN 2>/dev/null || true
+# Notifications carry a bearer token. Ignore inherited proxy/custom-CA and
+# curl configuration channels so local shell state cannot redirect or trace it.
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+unset http_proxy https_proxy all_proxy no_proxy
+unset CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
+
 SCRIPT_PATH="${BASH_SOURCE[0]}"
+CURL_BIN=/usr/bin/curl
+
+watchdog_lexical_path() {
+  local input="$1" current rest component
+  case "$input" in /*) current="/" ;; *) current="$PWD" ;; esac
+  rest="$input"
+  while :; do
+    case "$rest" in
+      */*) component="${rest%%/*}"; rest="${rest#*/}" ;;
+      *) component="$rest"; rest="" ;;
+    esac
+    case "$component" in
+      ''|.) ;;
+      ..) current="${current%/*}"; [ -n "$current" ] || current="/" ;;
+      *) if [ "$current" = "/" ]; then current="/$component"; else current="$current/$component"; fi ;;
+    esac
+    [ -n "$rest" ] || break
+  done
+  printf '%s\n' "$current"
+}
+
+watchdog_normalize_path() {
+  local input="$1" normalized ancestor suffix component physical
+  if [ -d "$input" ]; then
+    physical="$(CDPATH='' cd -P -- "$input" 2>/dev/null && pwd -P)" || physical=""
+    if [ -n "$physical" ]; then printf '%s\n' "$physical"; return; fi
+  fi
+  normalized="$(watchdog_lexical_path "$input")"
+  ancestor="$normalized"
+  suffix=""
+  while [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ] && [ "$ancestor" != "/" ]; do
+    component="${ancestor##*/}"
+    suffix="/$component$suffix"
+    ancestor="${ancestor%/*}"
+    [ -n "$ancestor" ] || ancestor="/"
+  done
+  if [ -d "$ancestor" ]; then
+    physical="$(CDPATH='' cd -P -- "$ancestor" 2>/dev/null && pwd -P)" || physical=""
+    if [ -n "$physical" ]; then
+      [ "$physical" != "/" ] || physical=""
+      printf '%s%s\n' "$physical" "$suffix"
+      return
+    fi
+  fi
+  printf '%s\n' "$normalized"
+}
+
+watchdog_path_selects_legacy() {
+  local logical physical legacy_physical
+  logical="$(watchdog_lexical_path "$1")"
+  case "$logical" in */.claude/channels/slack) return 0 ;; esac
+  physical="$(watchdog_normalize_path "$1")"
+  legacy_physical="$(watchdog_normalize_path "$HOME/.claude/channels/slack")"
+  [ "$physical" != "$legacy_physical" ] || return 0
+  case "$physical" in */.claude/channels/slack) return 0 ;; esac
+  return 1
+}
+
+watchdog_owned_regular_file() {
+  local file="$1" metadata
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  metadata="$(/usr/bin/stat -f '%u:%l' "$file" 2>/dev/null || true)"
+  [ "$metadata" = "$(/usr/bin/id -u):1" ]
+}
+
+watchdog_valid_cutover_marker_only() {
+  local state="$1" marker physical first second third lines
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  physical="$(CDPATH='' cd -P -- "$state" 2>/dev/null && pwd -P)" || return 1
+  marker="$state/.codex-legacy-cutover"
+  watchdog_owned_regular_file "$marker" || return 1
+  first="$(/usr/bin/sed -n '1p' "$marker" 2>/dev/null)" || return 1
+  second="$(/usr/bin/sed -n '2p' "$marker" 2>/dev/null)" || return 1
+  third="$(/usr/bin/sed -n '3p' "$marker" 2>/dev/null)" || return 1
+  lines="$(/usr/bin/wc -l < "$marker" 2>/dev/null | /usr/bin/tr -d '[:space:]')" || return 1
+  [ "$first" = 'zerokun-codex-legacy-cutover-v1' ] \
+    && [ "$second" = "$physical" ] && [ -z "$third" ] && [ "$lines" = "2" ]
+}
+
+watchdog_valid_cutover_state() {
+  local state="$1" env_file physical legacy_physical owner
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  owner="$(/usr/bin/stat -f '%u' "$state" 2>/dev/null || true)"
+  [ "$owner" = "$(/usr/bin/id -u)" ] || return 1
+  env_file="$state/.env"
+  watchdog_owned_regular_file "$env_file" && [ -s "$env_file" ] \
+    && [ "$(/usr/bin/grep -Ec '^SLACK_BOT_TOKEN=' "$env_file" || true)" = "1" ] \
+    && [ "$(/usr/bin/grep -Ec '^SLACK_APP_TOKEN=' "$env_file" || true)" = "1" ] \
+    && /usr/bin/grep -Eq '^SLACK_BOT_TOKEN=xoxb-[A-Za-z0-9._-]{10,}$' "$env_file" \
+    && /usr/bin/grep -Eq '^SLACK_APP_TOKEN=xapp-[A-Za-z0-9._-]{10,}$' "$env_file" \
+    || return 1
+  physical="$(CDPATH='' cd -P -- "$state" 2>/dev/null && pwd -P)" || return 1
+  watchdog_valid_cutover_marker_only "$state" && return 0
+  [ -d "$HOME/.claude/channels/slack" ] || return 1
+  legacy_physical="$(CDPATH='' cd -P -- "$HOME/.claude/channels/slack" 2>/dev/null && pwd -P)" \
+    || return 1
+  [ "$physical" = "$legacy_physical" ]
+}
 
 resolve_state_dir() {
+  local selected
+  case "${ZEROKUN_LEGACY_CUTOVER:-0}" in
+    0) ;;
+    1)
+      selected="${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}"
+      if ! watchdog_valid_cutover_state "$selected"; then
+        printf 'zerokun watchdog: legacy cutover state is missing or invalid: %s\n' "$selected" >&2
+        return 1
+      fi
+      printf '%s\n' "$selected"
+      return
+      ;;
+    *)
+      printf 'zerokun watchdog: ZEROKUN_LEGACY_CUTOVER must be 0 or 1\n' >&2
+      return 1
+      ;;
+  esac
   if [ -n "${ZEROKUN_STATE_DIR:-}" ]; then
-    printf '%s\n' "$ZEROKUN_STATE_DIR"
-  elif [ -n "${SLACK_STATE_DIR:-}" ]; then
-    printf '%s\n' "$SLACK_STATE_DIR"
-  elif [ -f "$HOME/.claude/channels/slack/jobs.sqlite3" ] \
-    || [ -f "$HOME/.claude/channels/slack/.env" ] \
-    || [ -f "$HOME/.claude/channels/slack/access.json" ]; then
-    printf '%s\n' "$HOME/.claude/channels/slack"
+    if watchdog_valid_cutover_marker_only "$ZEROKUN_STATE_DIR" \
+      || watchdog_path_selects_legacy "$ZEROKUN_STATE_DIR"; then
+      printf '%s\n' "$HOME/.codex/zerokun"
+    else
+      printf '%s\n' "$ZEROKUN_STATE_DIR"
+    fi
   else
     printf '%s\n' "$HOME/.codex/zerokun"
   fi
@@ -58,17 +184,25 @@ private_regular_file() {
 }
 
 load_state_env() {
-  local line
+  local line bot_assignments app_assignments
   [ -f "$STATE_DIR/.env" ] || return 0
   private_regular_file "$STATE_DIR/.env" || {
     printf 'zerokun watchdog: unsafe .env; refusing to read it\n' >&2
     return 1
   }
+  bot_assignments="$(/usr/bin/grep -Ec '^SLACK_BOT_TOKEN=' "$STATE_DIR/.env" || true)"
+  app_assignments="$(/usr/bin/grep -Ec '^SLACK_APP_TOKEN=' "$STATE_DIR/.env" || true)"
+  if [ "$bot_assignments" != "1" ] || [ "$app_assignments" != "1" ]; then
+    printf 'zerokun watchdog: .env must contain exactly one Slack Bot/App token pair\n' >&2
+    return 1
+  fi
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       SLACK_BOT_TOKEN=*)
-        [ -n "${SLACK_BOT_TOKEN:-}" ] || SLACK_BOT_TOKEN="${line#SLACK_BOT_TOKEN=}"
-        export SLACK_BOT_TOKEN
+        WATCHDOG_BOT_TOKEN="${line#SLACK_BOT_TOKEN=}"
+        ;;
+      SLACK_APP_TOKEN=*)
+        WATCHDOG_APP_TOKEN="${line#SLACK_APP_TOKEN=}"
         ;;
       ZEROKUN_WATCHDOG_NOTIFY=*)
         [ -n "${ZEROKUN_WATCHDOG_NOTIFY:-}" ] || ZEROKUN_WATCHDOG_NOTIFY="${line#ZEROKUN_WATCHDOG_NOTIFY=}"
@@ -82,11 +216,50 @@ load_state_env() {
   done < "$STATE_DIR/.env"
 }
 
-load_bot_token() {
-  [ -n "${SLACK_BOT_TOKEN:-}" ] && return 0
-  load_state_env
-  [ -n "${SLACK_BOT_TOKEN:-}" ] || return 1
-  return 0
+load_slack_tokens() {
+  if [ -z "$WATCHDOG_BOT_TOKEN" ] || [ -z "$WATCHDOG_APP_TOKEN" ]; then
+    load_state_env || return 1
+  fi
+  export -n WATCHDOG_BOT_TOKEN WATCHDOG_APP_TOKEN 2>/dev/null || true
+  case "$WATCHDOG_BOT_TOKEN" in
+    ''|*$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  case "$WATCHDOG_APP_TOKEN" in
+    ''|*$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  printf '%s\n' "$WATCHDOG_BOT_TOKEN" \
+    | /usr/bin/grep -Eq '^xoxb-[A-Za-z0-9._-]{10,}$' \
+    && printf '%s\n' "$WATCHDOG_APP_TOKEN" \
+      | /usr/bin/grep -Eq '^xapp-([0-9]+-)?A[A-Z0-9]+-[A-Za-z0-9._-]{10,}$'
+}
+
+verify_slack_app_identity() {
+  local expected_app_id auth_response identity bot_app_id bot_id bots_response
+  if [[ ! "$WATCHDOG_APP_TOKEN" =~ ^xapp-([0-9]+-)?(A[A-Z0-9]+)-[A-Za-z0-9._-]{10,}$ ]]; then
+    printf 'zerokun watchdog: SLACK_APP_TOKEN does not contain a valid Slack App ID\n' >&2
+    return 1
+  fi
+  expected_app_id="${BASH_REMATCH[2]}"
+  auth_response="$(printf 'Authorization: Bearer %s\n' "$WATCHDOG_BOT_TOKEN" \
+    | "$CURL_BIN" -q -sS --proxy '' --noproxy '*' --max-time 10 \
+      -X POST 'https://slack.com/api/auth.test' -H @- 2>/dev/null)" || return 1
+  identity="$(printf '%s' "$auth_response" | /usr/bin/python3 -c \
+    'import json,sys; d=json.load(sys.stdin); print("%s|%s" % (d.get("app_id",""), d.get("bot_id","")) if d.get("ok") else "|", end="")' \
+    2>/dev/null)" || return 1
+  IFS='|' read -r bot_app_id bot_id <<< "$identity"
+  if [ -z "$bot_app_id" ] && [ -n "$bot_id" ]; then
+    bots_response="$(printf 'Authorization: Bearer %s\n' "$WATCHDOG_BOT_TOKEN" \
+      | "$CURL_BIN" -q -sS --proxy '' --noproxy '*' --max-time 10 \
+        -X POST 'https://slack.com/api/bots.info' -H @- \
+        --data-urlencode "bot=$bot_id" 2>/dev/null)" || return 1
+    bot_app_id="$(printf '%s' "$bots_response" | /usr/bin/python3 -c \
+      'import json,sys; d=json.load(sys.stdin); print(d.get("bot",{}).get("app_id","") if d.get("ok") else "", end="")' \
+      2>/dev/null)" || return 1
+  fi
+  if [ -z "$bot_app_id" ] || [ "$bot_app_id" != "$expected_app_id" ]; then
+    printf 'zerokun watchdog: Slack Bot/App token identity mismatch; notification suppressed\n' >&2
+    return 1
+  fi
 }
 
 notification_user() {
@@ -115,12 +288,15 @@ send_notification() {
   fi
 
   local notify_user open_response dm_channel payload post_response api_error
-  load_bot_token || { printf 'zerokun watchdog: SLACK_BOT_TOKEN is unavailable\n' >&2; return 1; }
+  load_slack_tokens || { printf 'zerokun watchdog: Slack Bot/App tokens are unavailable\n' >&2; return 1; }
+  verify_slack_app_identity || return 1
   notify_user="$(notification_user)"
   [ -n "$notify_user" ] || { printf 'zerokun watchdog: notification user is unavailable\n' >&2; return 1; }
 
-  open_response="$(/usr/bin/curl -sS --max-time 10 -X POST 'https://slack.com/api/conversations.open' \
-    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  open_response="$(printf 'Authorization: Bearer %s\n' "$WATCHDOG_BOT_TOKEN" \
+    | "$CURL_BIN" -q -sS --proxy '' --noproxy '*' --max-time 10 \
+    -X POST 'https://slack.com/api/conversations.open' \
+    -H @- \
     --data-urlencode "users=$notify_user" 2>/dev/null)" || return 1
   dm_channel="$(printf '%s' "$open_response" | /usr/bin/python3 -c \
     'import json,sys; data=json.load(sys.stdin); print(data.get("channel",{}).get("id","") if data.get("ok") else "", end="")' \
@@ -134,8 +310,10 @@ send_notification() {
 
   payload="$(WATCHDOG_CHANNEL="$dm_channel" WATCHDOG_BODY="$body" /usr/bin/python3 -c \
     'import json,os; print(json.dumps({"channel":os.environ["WATCHDOG_CHANNEL"],"text":os.environ["WATCHDOG_BODY"]},ensure_ascii=False), end="")')"
-  post_response="$(/usr/bin/curl -sS --max-time 10 -X POST 'https://slack.com/api/chat.postMessage' \
-    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  post_response="$(printf 'Authorization: Bearer %s\n' "$WATCHDOG_BOT_TOKEN" \
+    | "$CURL_BIN" -q -sS --proxy '' --noproxy '*' --max-time 10 \
+    -X POST 'https://slack.com/api/chat.postMessage' \
+    -H @- \
     -H 'Content-Type: application/json; charset=utf-8' \
     --data "$payload" 2>/dev/null)" || return 1
   if ! printf '%s' "$post_response" | /usr/bin/python3 -c \
@@ -213,14 +391,14 @@ PY
 }
 
 run_watchdog() {
-  STATE_DIR="$(resolve_state_dir)"
+  STATE_DIR="$(resolve_state_dir)" || return 1
   STATE_FILE="$STATE_DIR/watchdog-state.json"
   prepare_state_dir || return 1
   if [ -e "$STATE_FILE" ] && ! private_regular_file "$STATE_FILE"; then
     printf 'zerokun watchdog: unsafe state file; refusing to read it\n' >&2
     return 1
   fi
-  load_state_env
+  load_state_env || return 1
   REALERT_MIN="${ZEROKUN_WATCHDOG_REALERT_MIN:-60}"
   case "$REALERT_MIN" in
     ''|*[!0-9]*) REALERT_MIN=60 ;;
@@ -276,6 +454,23 @@ selftest_fail() {
   return 1
 }
 
+selftest_environment() {
+  local name
+  load_slack_tokens || selftest_fail 'token unavailable' || return 1
+  if /usr/bin/env | /usr/bin/grep -Eq '^WATCHDOG_(BOT|APP)_TOKEN='; then
+    selftest_fail 'token inherited by child environment'
+    return 1
+  fi
+  for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+    http_proxy https_proxy all_proxy no_proxy CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR; do
+    if /usr/bin/env | /usr/bin/grep -q "^${name}="; then
+      selftest_fail "network override inherited by child environment: ${name}"
+      return 1
+    fi
+  done
+  printf 'watchdog environment selftest: PASS state=%s\n' "$STATE_DIR"
+}
+
 selftest() {
   local test_dir fake_server fake_runner server_pid runner_pid output
   test_dir="$(mktemp -d "${TMPDIR:-/tmp}/zerokun-watchdog.XXXXXX")" || return 1
@@ -291,25 +486,25 @@ selftest() {
   printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
   printf '%s\n' "$runner_pid" > "$test_dir/job-runner.lock/pid"
 
-  output="$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'healthy alert' || return 1
   printf 'ok: healthy sends nothing\n'
 
   rm -f "$test_dir/plugin.lock"
-  output="$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'first down alert' || return 1
   printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
-  output="$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'transient recovery alert' || return 1
   printf 'ok: transient down sends nothing\n'
 
   rm -f "$test_dir/plugin.lock"
-  SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH" >/dev/null
-  output="$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH" >/dev/null
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" == *'🚨 ゼロくん停止中'* ]] || selftest_fail 'second down did not alert' || return 1
   printf 'ok: second down sends alert\n'
 
-  output="$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'early reminder' || return 1
   printf 'ok: down reminder is suppressed\n'
 
@@ -322,21 +517,21 @@ state["lastAlertAt"] = int(time.time()) - 3601
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(state, handle)
 PY
-  output="$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" == *'🚨 ゼロくん停止中'* ]] || selftest_fail 'late reminder missing' || return 1
   printf 'ok: reminder is sent after interval\n'
 
   printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
-  output="$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" == *'✅ ゼロくん復旧'* ]] || selftest_fail 'recovery missing' || return 1
-  output="$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'duplicate recovery' || return 1
   printf 'ok: recovery sends once\n'
 
   touch "$test_dir/watchdog-off"
   rm -f "$test_dir/plugin.lock"
-  output="$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
-  output="$output$(SLACK_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$output$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'mute alert' || return 1
   printf 'ok: watchdog-off mutes notifications\n'
   printf 'watchdog selftest: PASS\n'
@@ -347,8 +542,15 @@ if [ "${1:-}" = "--selftest" ]; then
   exit $?
 fi
 
+if [ "${1:-}" = "--selftest-environment" ]; then
+  STATE_DIR="$(resolve_state_dir)" || exit 1
+  prepare_state_dir || exit 1
+  selftest_environment
+  exit $?
+fi
+
 if [ "${1:-}" = "--test-notification" ]; then
-  STATE_DIR="$(resolve_state_dir)"
+  STATE_DIR="$(resolve_state_dir)" || exit 1
   prepare_state_dir || exit 1
   load_state_env
   if send_notification '🧪 ゼロくんwatchdog通知テスト（実装確認のための1通です）'; then
@@ -356,6 +558,19 @@ if [ "${1:-}" = "--test-notification" ]; then
     exit 0
   fi
   exit 1
+fi
+
+if [ "${1:-}" = "--selftest-notification" ]; then
+  STATE_DIR="$(resolve_state_dir)" || exit 1
+  prepare_state_dir || exit 1
+  CURL_BIN="${ZEROKUN_WATCHDOG_TEST_CURL:-}"
+  if ! private_regular_file "$CURL_BIN" || [ ! -x "$CURL_BIN" ]; then
+    printf 'zerokun watchdog: invalid selftest curl helper\n' >&2
+    exit 1
+  fi
+  load_state_env || exit 1
+  send_notification 'watchdog identity selftest'
+  exit $?
 fi
 
 run_watchdog

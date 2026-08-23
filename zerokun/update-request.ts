@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { createHash, randomUUID } from 'crypto'
 import {
@@ -11,11 +11,12 @@ import {
   writeFileSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
-import { buildUpdaterEnvironment } from './child-environment.ts'
+import { dirname, join } from 'path'
+import { buildUpdaterEnvironment, parseStateSlackTokens } from './child-environment.ts'
 import { atomicWritePrivateFile, openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
 import { requireManagedStateRoot } from './managed-path.ts'
-import { resolveZeroStateDir } from './state-dir.ts'
+import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
+import { verifySlackAppTokenPair } from './slack-app-identity.ts'
 
 const REQUEST_FILE = 'update-request.json'
 const WORKER_SESSION = 'zerokun-update-worker'
@@ -23,6 +24,14 @@ const BOT_SESSION_FALLBACK = 'zerokun-slack'
 const DEFAULT_STALE_MS = 6 * 60 * 60 * 1000
 const DEFAULT_SLACK_HTTP_TIMEOUT_MS = 120_000
 const DEFAULT_UPDATE_NOTIFY_ATTEMPTS = 3
+const DEFAULT_UPDATE_WORKER_TIMEOUT_MS = 8 * 60 * 60 * 1000
+const DEFAULT_UPDATE_WORKER_TERM_GRACE_MS = 30 * 60_000
+const NOTIFICATION_NETWORK_OVERRIDE_KEYS = [
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+  'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+  'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+] as const
 
 function botSessionName(stateDir: string): string {
   try {
@@ -72,6 +81,8 @@ interface RequestOptions {
   updaterPath?: string
   tmuxPath?: string
   tmuxSession?: string
+  legacyCutover?: boolean
+  projectDir?: string
   staleAfterMs?: number
   now?: () => number
   idFactory?: () => string
@@ -88,6 +99,10 @@ interface WorkerOptions {
   notify?: (request: UpdateRequest, text: string) => Promise<void>
   maxNotifyAttempts?: number
   notificationRetryMs?: number
+  updaterTimeoutMs?: number
+  updaterTermGraceMs?: number
+  legacyCutover?: boolean
+  projectDir?: string
 }
 
 export interface UpdateWorkerResult {
@@ -225,6 +240,8 @@ export function launchDetachedUpdateWorker(
     updaterPath?: string
     tmuxPath?: string
     tmuxSession?: string
+    legacyCutover?: boolean
+    projectDir?: string
   } = {},
 ): void {
   const dir = options.stateDir ?? stateDir()
@@ -235,10 +252,23 @@ export function launchDetachedUpdateWorker(
   if (!existsSync(workerFile)) throw new Error(`update workerがありません: ${workerFile}`)
   if (!existsSync(updaterPath)) throw new Error(`zerokun-updateがありません: ${updaterPath}`)
   if (tmuxSessionExists(tmux, session)) throw new Error('別のゼロくん更新workerが実行中です')
+  const legacyCutover = options.legacyCutover
+    ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
+  const projectDir = options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
+  const launchEnvironment = {
+    ...buildUpdaterEnvironment(),
+    ZEROKUN_JOB_DB: resolveZeroJobDatabasePath(dir),
+    ZEROKUN_STATE_DIR: dir,
+    ZEROKUN_LEGACY_CUTOVER: legacyCutover ? '1' : '0',
+    ...(projectDir ? { ZEROKUN_PROJECT_DIR: projectDir } : {}),
+  }
 
   const launchCommand = [
-    'exec',
+    'exec /usr/bin/env -i',
+    ...Object.entries(launchEnvironment).map(([key, value]) => `${key}=${shellQuote(value)}`),
     shellQuote(process.execPath),
+    '--config=/dev/null',
+    '--no-env-file',
     shellQuote(workerFile),
     'run',
     shellQuote(request.id),
@@ -246,6 +276,9 @@ export function launchDetachedUpdateWorker(
     shellQuote(dir),
     '--updater',
     shellQuote(updaterPath),
+    '--legacy-cutover',
+    legacyCutover ? '1' : '0',
+    ...(projectDir ? ['--project-dir', shellQuote(projectDir)] : []),
   ].join(' ')
   requireCommand([
     tmux,
@@ -257,6 +290,8 @@ export function launchDetachedUpdateWorker(
     '100',
     '-y',
     '30',
+    '-c',
+    dir,
     launchCommand,
   ])
 }
@@ -273,6 +308,8 @@ export async function requestUpdate(
   const launch = options.launchWorker ?? ((value: UpdateRequest) => {
     launchDetachedUpdateWorker(value, {
       stateDir: dir,
+      legacyCutover: options.legacyCutover,
+      projectDir: options.projectDir,
       workerFile: options.workerFile,
       updaterPath: options.updaterPath,
       tmuxPath: options.tmuxPath,
@@ -354,6 +391,8 @@ export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean
   const launch = options.launchWorker ?? ((value: UpdateRequest) => {
     launchDetachedUpdateWorker(value, {
       stateDir: dir,
+      legacyCutover: options.legacyCutover,
+      projectDir: options.projectDir,
       workerFile: options.workerFile,
       updaterPath: options.updaterPath,
       tmuxPath: options.tmuxPath,
@@ -364,13 +403,13 @@ export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean
   return true
 }
 
-function loadSlackToken(dir: string): string {
+function loadSlackTokens(dir: string): { botToken: string; appToken: string } {
   const envPath = join(dir, '.env')
-  for (const line of (readOptionalPrivateFile(envPath) ?? '').split('\n')) {
-    const match = line.match(/^SLACK_BOT_TOKEN=(.*)$/)
-    if (match?.[1]) return match[1]
+  const tokens = parseStateSlackTokens(readOptionalPrivateFile(envPath) ?? '')
+  if (tokens.SLACK_BOT_TOKEN && tokens.SLACK_APP_TOKEN) {
+    return { botToken: tokens.SLACK_BOT_TOKEN, appToken: tokens.SLACK_APP_TOKEN }
   }
-  throw new Error(`SLACK_BOT_TOKENがありません: ${envPath}`)
+  throw new Error(`Slack Bot/App token pairがありません: ${envPath}`)
 }
 
 export async function withUpdateSlackDeadline<T>(
@@ -393,26 +432,81 @@ export async function withUpdateSlackDeadline<T>(
   }
 }
 
+export async function withoutUpdateNotificationNetworkOverrides<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  const saved = new Map<string, string>()
+  for (const key of NOTIFICATION_NETWORK_OVERRIDE_KEYS) {
+    const value = process.env[key]
+    if (value !== undefined) saved.set(key, value)
+    delete process.env[key]
+  }
+  try {
+    return await operation()
+  } finally {
+    for (const key of NOTIFICATION_NETWORK_OVERRIDE_KEYS) delete process.env[key]
+    for (const [key, value] of saved) process.env[key] = value
+  }
+}
+
 async function notifySlack(dir: string, request: UpdateRequest, text: string): Promise<void> {
-  const token = loadSlackToken(dir)
+  const { botToken, appToken } = loadSlackTokens(dir)
+  await withoutUpdateNotificationNetworkOverrides(async () => {
+    const callIdentityApi = async (
+      method: 'auth.test' | 'bots.info',
+      fields: Record<string, string> = {},
+    ): Promise<Record<string, any>> => {
+      const response = await withUpdateSlackDeadline(signal => fetch(
+        `https://slack.com/api/${method}`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${botToken}`,
+            'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+          },
+          body: new URLSearchParams(fields),
+          signal,
+        },
+      ), 10_000)
+      const result = await response.json() as Record<string, any>
+      if (!result.ok) throw new Error(result.error ?? `Slack ${method} HTTP ${response.status}`)
+      return result
+    }
+    await verifySlackAppTokenPair(appToken, {
+      authTest: async () => {
+        const result = await callIdentityApi('auth.test')
+        return {
+          app_id: result.app_id,
+          bot_id: result.bot_id,
+          user_id: result.user_id,
+        }
+      },
+      botsInfo: async bot => {
+        const result = await callIdentityApi('bots.info', { bot })
+        return { app_id: result.bot?.app_id as string | undefined }
+      },
+    })
+  })
   let lastError = 'unknown error'
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const response = await withUpdateSlackDeadline(signal => fetch(
-        'https://slack.com/api/chat.postMessage', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json; charset=utf-8',
-        },
-        body: JSON.stringify({
-          channel: request.chatId,
-          thread_ts: request.threadTs,
-          text,
-          client_msg_id: updateNotificationClientId(request.id),
-        }),
-        signal,
-      }), Number(process.env.ZEROKUN_SLACK_HTTP_TIMEOUT_MS) || DEFAULT_SLACK_HTTP_TIMEOUT_MS)
+      const response = await withoutUpdateNotificationNetworkOverrides(() => (
+        withUpdateSlackDeadline(signal => fetch(
+          'https://slack.com/api/chat.postMessage', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${botToken}`,
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+          body: JSON.stringify({
+            channel: request.chatId,
+            thread_ts: request.threadTs,
+            text,
+            client_msg_id: updateNotificationClientId(request.id),
+          }),
+          signal,
+        }), Number(process.env.ZEROKUN_SLACK_HTTP_TIMEOUT_MS) || DEFAULT_SLACK_HTTP_TIMEOUT_MS)
+      ))
       const result = await response.json() as { ok?: boolean; error?: string }
       if (result.ok) return
       lastError = result.error ?? `HTTP ${response.status}`
@@ -429,17 +523,66 @@ function updateNotificationClientId(requestId: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
 }
 
-async function executeUpdater(updaterPath: string, logPath: string): Promise<number> {
+function signalProcessGroup(proc: Bun.Subprocess, signal: NodeJS.Signals): void {
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-proc.pid, signal)
+      return
+    } catch {}
+  }
+  try { proc.kill(signal) } catch {}
+}
+
+export async function executeUpdater(
+  updaterPath: string,
+  logPath: string,
+  timeoutMs = Number(process.env.ZEROKUN_UPDATE_WORKER_TIMEOUT_MS)
+    || DEFAULT_UPDATE_WORKER_TIMEOUT_MS,
+  termGraceMs = DEFAULT_UPDATE_WORKER_TERM_GRACE_MS,
+  environment: Record<string, string | undefined> = process.env,
+): Promise<number> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('updater worker timeoutが不正です')
+  }
   const logFd = openSafeLog(logPath, 'append')
   try {
     writeFileSync(logFd, `\n${new Date().toISOString()} update request started\n`)
-    const proc = Bun.spawn([process.execPath, updaterPath], {
+    const childEnvironment = buildUpdaterEnvironment(environment)
+    if (environment.ZEROKUN_STATE_DIR) {
+      childEnvironment.ZEROKUN_JOB_DB = resolveZeroJobDatabasePath(
+        environment.ZEROKUN_STATE_DIR,
+        environment,
+      )
+    }
+    const proc = Bun.spawn([
+      process.execPath, '--config=/dev/null', '--no-env-file', updaterPath,
+    ], {
+      cwd: environment.ZEROKUN_STATE_DIR ?? dirname(updaterPath),
       stdin: 'ignore',
       stdout: logFd,
       stderr: logFd,
-      env: buildUpdaterEnvironment(),
+      env: childEnvironment,
+      detached: process.platform !== 'win32',
     })
-    return await proc.exited
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<'timeout'>(resolve => {
+      timeout = setTimeout(() => resolve('timeout'), timeoutMs)
+    })
+    const naturalExit = proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode }))
+    const outcome = await Promise.race([naturalExit, deadline])
+    if (timeout) clearTimeout(timeout)
+    if (outcome !== 'timeout') return outcome.exitCode
+
+    signalProcessGroup(proc, 'SIGTERM')
+    const afterTerm = await Promise.race([
+      proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
+      Bun.sleep(termGraceMs).then(() => ({ kind: 'grace' as const })),
+    ])
+    if (afterTerm.kind === 'grace') {
+      signalProcessGroup(proc, 'SIGKILL')
+      await proc.exited
+    }
+    throw new Error(`zerokun-updateが${timeoutMs}msでtimeoutしました`)
   } finally {
     closeSync(logFd)
   }
@@ -455,7 +598,23 @@ export async function runUpdateWorker(
   if (!request || request.id !== requestId) throw new Error(`更新依頼が見つかりません: ${requestId}`)
   const logPath = join(dir, 'update-request.log')
   const updaterPath = options.updaterPath ?? join(homedir(), '.local', 'bin', 'zerokun-update')
-  const run = options.executeUpdater ?? (() => executeUpdater(updaterPath, logPath))
+  const legacyCutover = options.legacyCutover
+    ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
+  const projectDir = options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
+  const updaterEnvironment = {
+    ...buildUpdaterEnvironment(),
+    ZEROKUN_JOB_DB: resolveZeroJobDatabasePath(dir),
+    ZEROKUN_STATE_DIR: dir,
+    ZEROKUN_LEGACY_CUTOVER: legacyCutover ? '1' : '0',
+    ...(projectDir ? { ZEROKUN_PROJECT_DIR: projectDir } : {}),
+  }
+  const run = options.executeUpdater ?? (() => executeUpdater(
+    updaterPath,
+    logPath,
+    options.updaterTimeoutMs,
+    options.updaterTermGraceMs,
+    updaterEnvironment,
+  ))
   const notify = options.notify ?? ((value: UpdateRequest, text: string) => notifySlack(dir, value, text))
 
   let outcome = request.outcome
@@ -508,9 +667,16 @@ async function runCli(): Promise<void> {
   if (args[0] !== 'run' || !args[1]) {
     throw new Error('usage: update-request.ts run <request-id> [--state-dir DIR] [--updater PATH]')
   }
+  const legacyCutover = optionValue(args, '--legacy-cutover')
+  const projectDir = optionValue(args, '--project-dir')
+  if (legacyCutover !== undefined && legacyCutover !== '0' && legacyCutover !== '1') {
+    throw new Error('--legacy-cutoverは0または1で指定してください')
+  }
   const result = await runUpdateWorker(args[1], {
     stateDir: optionValue(args, '--state-dir'),
     updaterPath: optionValue(args, '--updater'),
+    legacyCutover: legacyCutover === undefined ? undefined : legacyCutover === '1',
+    projectDir,
   })
   if (!result.success || !result.notificationSent) process.exitCode = 1
 }

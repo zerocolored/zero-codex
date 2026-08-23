@@ -1,11 +1,10 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --config=/dev/null --no-env-file
 /**
  * Standalone Slack gateway for Codex.
  *
  * Self-contained gateway with pairing, allowlists, per-channel policies,
- * durable FIFO hand-off, and thread catch-up. New installations use
- * ~/.codex/zerokun/. An existing ~/.claude/channels/slack/ is discovered only
- * for an in-place migration. ZEROKUN_STATE_DIR always takes precedence.
+ * durable FIFO hand-off, and thread catch-up. Installations use
+ * ~/.codex/zerokun/ unless ZEROKUN_STATE_DIR explicitly selects another state.
  */
 
 import { App } from '@slack/bolt'
@@ -35,10 +34,11 @@ import { requestUpdate, resumePendingUpdateWorker } from './zerokun/update-reque
 import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
 import { JobStore, updateIsRunning, updateTransactionPending } from './zerokun/job-runner.ts'
 import { requireLegacyThreadRepoRoute, requireRepoRoute } from './zerokun/routing.ts'
-import { resolveZeroStateDir } from './zerokun/state-dir.ts'
+import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './zerokun/state-dir.ts'
 import {
   slackHttpTimeoutMs,
   slackWebClientOptions,
+  openDirectSlackDownload,
   withSlackDeadline,
 } from './zerokun/slack-http.ts'
 import {
@@ -55,6 +55,8 @@ import {
   type AccessConfig,
 } from './zerokun/access.ts'
 import { readOptionalPrivateFile } from './zerokun/safe-file.ts'
+import { applyStateEnvironment } from './zerokun/child-environment.ts'
+import { verifySlackAppTokenPair } from './zerokun/slack-app-identity.ts'
 
 const STATE_DIR = resolveZeroStateDir()
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -131,19 +133,17 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 requireManagedStateRoot(STATE_DIR)
 ensureManagedDirectory(STATE_DIR, INBOX_DIR)
 
-// Load the selected state directory's .env into process.env. Real env wins.
+// The selected state's Slack tokens are authoritative; stale shell/tmux tokens
+// must not reconnect this machine to another Zero-kun Slack App.
 try {
-  for (const line of (readOptionalPrivateFile(ENV_FILE) ?? '').split('\n')) {
-    const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
-  }
+  applyStateEnvironment(readOptionalPrivateFile(ENV_FILE) ?? '')
 } catch (error) {
   process.stderr.write(`slack channel: unsafe or unreadable ${ENV_FILE}: ${error}\n`)
   process.exit(1)
 }
 
-const BOT_TOKEN = process.env.SLACK_BOT_TOKEN
-const APP_TOKEN = process.env.SLACK_APP_TOKEN
+const BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? ''
+const APP_TOKEN = process.env.SLACK_APP_TOKEN ?? ''
 
 if (!BOT_TOKEN || !APP_TOKEN) {
   process.stderr.write(
@@ -186,7 +186,7 @@ clearGatewayReadiness(READY_FILE)
 
 // The gateway owns inbound durability. The runner opens the same WAL database
 // from another process and claims Codex jobs one at a time.
-const jobStore = new JobStore(process.env.ZEROKUN_JOB_DB ?? join(STATE_DIR, 'jobs.sqlite3'))
+const jobStore = new JobStore(resolveZeroJobDatabasePath(STATE_DIR))
 const recoveredInbound = jobStore.recoverInboundDeliveries()
 if (recoveredInbound > 0) {
   process.stderr.write(`slack channel: recovered ${recoveredInbound} interrupted inbound delivery(s)\n`)
@@ -298,8 +298,6 @@ function checkApprovals(): void {
   }
 }
 
-setInterval(checkApprovals, 5000).unref()
-
 // ── Slack App Connection and Inbound Events ──────────────────────────────────
 
 // This process is the long-lived Slack parent and writes every authorized
@@ -377,11 +375,11 @@ async function downloadInboundFiles(fileIds: string[], messageTs: string): Promi
       if ((file.size ?? 0) > MAX_ATTACHMENT_BYTES) {
         throw new Error(`file ${fileId} is larger than 50MB`)
       }
-      const response = await fetch(file.url_private_download, {
-        headers: { Authorization: `Bearer ${BOT_TOKEN}` },
-        signal,
-      })
-      if (!response.ok) throw new Error(`file ${fileId} download failed: HTTP ${response.status}`)
+      const response = await openDirectSlackDownload(file.url_private_download, BOT_TOKEN, signal)
+      if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+        response.resume()
+        throw new Error(`file ${fileId} download failed: HTTP ${response.statusCode ?? 'unknown'}`)
+      }
       const name = safeName(file.name ?? fileId)
       const extension = extname(name) || '.bin'
       const directory = join(INBOX_DIR, messageTs.replace(/[^0-9.]/g, '_'))
@@ -395,17 +393,14 @@ async function downloadInboundFiles(fileIds: string[], messageTs: string): Promi
       )
       let received = 0
       try {
-        if (!response.body) throw new Error(`file ${fileId} download has no body`)
-        const reader = response.body.getReader()
-        while (true) {
-          const { value, done } = await reader.read()
-          if (done) break
-          received += value.byteLength
+        for await (const value of response) {
+          const chunk = typeof value === 'string' ? Buffer.from(value) : value
+          received += chunk.byteLength
           if (received > MAX_ATTACHMENT_BYTES) {
-            await reader.cancel()
+            response.destroy()
             throw new Error(`file ${fileId} is larger than 50MB`)
           }
-          writeSync(descriptor, value)
+          writeSync(descriptor, chunk)
         }
         closeSync(descriptor)
         renameSync(temporary, destination)
@@ -1555,14 +1550,24 @@ process.on('SIGINT', shutdown)
 
 // Start the Slack app
 try {
+  // Verify both credentials belong to the same Slack App before opening the
+  // Socket Mode connection. A mixed old/new pair must never receive events
+  // from one App while posting as another bot.
+  const identity = await verifySlackAppTokenPair(APP_TOKEN, {
+    authTest: () => slackApp.client.auth.test({}),
+    botsInfo: async bot => {
+      const result = await slackApp.client.bots.info({ bot })
+      return { app_id: result.bot?.app_id }
+    },
+  })
+  botUserId = identity.botUserId
   await slackApp.start()
-  const authResult = await slackApp.client.auth.test({})
-  botUserId = authResult.user_id
+  setInterval(checkApprovals, 5_000).unref()
   writeGatewayReadiness(
     READY_FILE,
     process.env.ZEROKUN_RELEASE_COMMIT ?? 'manual',
   )
-  process.stderr.write(`slack channel: connected as ${authResult.user} (${botUserId})\n`)
+  process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 
   // Sweep once on startup for new mentions/DMs, and recover replies in owned threads.
   scheduleInboundDrain()

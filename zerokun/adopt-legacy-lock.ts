@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { adoptLegacyProcessIdentity } from './process-lock.ts'
 

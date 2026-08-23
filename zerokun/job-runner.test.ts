@@ -20,18 +20,22 @@ import { slackReplyScanFailureDisposition } from '../gate.ts'
 import {
   JobStore,
   SERIAL_WORKER_COUNT,
+  createSlackIdentityPauseGuard,
   extractArtifactPaths,
   flushTerminalNotifications,
   finalizeSuccessfulExecution,
   readUploadableArtifact,
   runQueuedJobs,
   sealArtifactResult,
+  stateSlackTokenPairMatches,
   terminateTrackedExecutors,
   updateIsRunning,
   updateTransactionPending,
   splitSlackChunks,
   type EnqueueInput,
+  type JobRecord,
 } from './job-runner.ts'
+
 import {
   CODEX_WORKER_SAFETY_PROMPT,
   CodexInterruptedError,
@@ -51,6 +55,8 @@ import {
 } from './codex-executor.ts'
 import { capRuntimeLogs, removeSettledJobState } from './state-maintenance.ts'
 import { adoptLegacyProcessIdentity } from './process-lock.ts'
+import { slackTokenPairRuntimeIdentity } from './slack-app-identity.ts'
+import { readProcessIdentity } from './process-tree.ts'
 
 const temporaryDirs: string[] = []
 
@@ -88,9 +94,59 @@ function git(args: string[], cwd?: string): string {
 }
 
 describe('Codex job store', () => {
+  test('常駐runnerは選択stateのSlack App ID変更と不正設定を検出する', () => {
+    const dir = fixtureDir()
+    const envFile = join(dir, '.env')
+    writeFileSync(envFile, [
+      'SLACK_BOT_TOKEN=xoxb-runner-test-token-12345',
+      'SLACK_APP_TOKEN=xapp-1-AOLDAPP123-runner-test-token-12345',
+      '',
+    ].join('\n'), { mode: 0o600 })
+    const runtimeId = slackTokenPairRuntimeIdentity(
+      'xoxb-runner-test-token-12345',
+      'xapp-1-AOLDAPP123-runner-test-token-12345',
+    )
+    expect(stateSlackTokenPairMatches(dir, runtimeId)).toBe(true)
+    expect(stateSlackTokenPairMatches(dir, `${runtimeId}-different`)).toBe(false)
+    writeFileSync(envFile, 'SLACK_APP_TOKEN=malformed\n', { mode: 0o600 })
+    expect(stateSlackTokenPairMatches(dir, runtimeId)).toBe(false)
+  })
+
+  test('常駐runnerはstateのSlack App変更後に新規claimせず終了する', () => {
+    const dir = fixtureDir()
+    const envFile = join(dir, '.env')
+    writeFileSync(envFile, [
+      'SLACK_BOT_TOKEN=xoxb-runner-test-token-12345',
+      'SLACK_APP_TOKEN=xapp-1-AOLDAPP123-runner-test-token-12345',
+      '',
+    ].join('\n'), { mode: 0o600 })
+    const oldRuntimeId = slackTokenPairRuntimeIdentity(
+      'xoxb-runner-test-token-12345',
+      'xapp-1-AOLDAPP123-runner-test-token-12345',
+    )
+    const controller = new AbortController()
+    const logs: string[] = []
+    const shouldPause = createSlackIdentityPauseGuard(
+      dir, oldRuntimeId, controller, message => logs.push(message),
+    )
+    expect(shouldPause()).toBe(false)
+    writeFileSync(envFile, [
+      'SLACK_BOT_TOKEN=xoxb-runner-test-token-67890',
+      'SLACK_APP_TOKEN=xapp-1-AOLDAPP123-runner-test-token-12345',
+      '',
+    ].join('\n'), { mode: 0o600 })
+    expect(shouldPause()).toBe(true)
+    expect(controller.signal.aborted).toBe(true)
+    expect(logs).toEqual([
+      'selected Slack App changed; stopping this runner before claiming more work',
+    ])
+    expect(shouldPause()).toBe(true)
+    expect(logs).toHaveLength(1)
+  })
+
   test('既存auto_vacuum=NONE DBを停止中migrationでINCREMENTALへ変換する', () => {
     const dir = fixtureDir()
-    const dbPath = join(dir, 'legacy.sqlite3')
+    const dbPath = join(dir, 'jobs.sqlite3')
     const legacy = new Database(dbPath, { create: true })
     legacy.exec('CREATE TABLE legacy (value TEXT)')
     legacy.exec("INSERT INTO legacy VALUES ('preserved')")
@@ -737,6 +793,85 @@ describe('single FIFO worker', () => {
     }
   })
 
+  test('runnerのstdout pipe切断後もsupervisorはCodex監督を継続する', async () => {
+    const dir = fixtureDir()
+    const repo = join(dir, 'repo')
+    const fakeCodex = join(dir, 'fake-codex')
+    mkdirSync(repo)
+    writeFileSync(fakeCodex, '#!/bin/bash\nsleep 0.1\necho after-runner-exit\nsleep 30\n')
+    chmodSync(fakeCodex, 0o755)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo }))
+    const job = store.claimNext('serial-worker')!
+    const registration = join(dir, 'executors', `${job.id}.json`)
+    mkdirSync(join(dir, 'executors'), { recursive: true })
+    const supervisor = Bun.spawn([
+      process.execPath,
+      join(import.meta.dir, 'codex-supervisor.ts'),
+      job.id,
+      registration,
+      fakeCodex,
+    ], {
+      cwd: repo,
+      stdin: 'ignore', stdout: 'pipe', stderr: 'ignore',
+      detached: process.platform !== 'win32',
+    })
+    try {
+      const deadline = Date.now() + 2_000
+      while (!existsSync(registration) && Date.now() < deadline) await Bun.sleep(10)
+      expect(existsSync(registration)).toBe(true)
+      await supervisor.stdout.cancel()
+      await Bun.sleep(300)
+      expect(() => process.kill(supervisor.pid, 0)).not.toThrow()
+      await terminateTrackedExecutors(store, () => {}, 2_000, dir)
+      await supervisor.exited
+      expect(existsSync(registration)).toBe(false)
+    } finally {
+      try { supervisor.kill('SIGKILL') } catch {}
+      store.close()
+    }
+  })
+
+  test('runnerがstdout pipeを開いたまま読まなくてもsupervisorは停止しない', async () => {
+    const dir = fixtureDir()
+    const repo = join(dir, 'repo')
+    const fakeCodex = join(dir, 'fake-codex')
+    mkdirSync(repo)
+    writeFileSync(fakeCodex, [
+      '#!/bin/bash',
+      '( sleep 0.1; dd if=/dev/zero bs=1048576 count=8 2>/dev/null; sleep 30 ) &',
+      'sleep 0.2',
+      'exit 0',
+      '',
+    ].join('\n'))
+    chmodSync(fakeCodex, 0o755)
+    const registration = join(dir, 'executors', 'unread-output.json')
+    mkdirSync(join(dir, 'executors'), { recursive: true })
+    const supervisor = Bun.spawn([
+      process.execPath,
+      join(import.meta.dir, 'codex-supervisor.ts'),
+      'unread-output',
+      registration,
+      fakeCodex,
+    ], {
+      cwd: repo,
+      stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+      detached: process.platform !== 'win32',
+    })
+    try {
+      const result = await Promise.race([
+        supervisor.exited,
+        Bun.sleep(3_000).then(() => -999),
+      ])
+      expect(result).not.toBe(-999)
+      expect(existsSync(registration)).toBe(false)
+    } finally {
+      try { supervisor.kill('SIGKILL') } catch {}
+      await supervisor.stdout.cancel().catch(() => {})
+      await supervisor.stderr.cancel().catch(() => {})
+    }
+  })
+
   test('PID再利用でidentity不一致なら無関係processを殺さずstale登録だけを回収する', async () => {
     const dir = fixtureDir()
     const store = new JobStore(join(dir, 'jobs.sqlite3'))
@@ -747,7 +882,13 @@ describe('single FIFO worker', () => {
     })
     const registration = join(dir, 'executors', `${job.id}.json`)
     mkdirSync(dirname(registration), { recursive: true })
-    writeFileSync(registration, JSON.stringify({ jobId: job.id, pid: unrelated.pid }))
+    const identity = readProcessIdentity(unrelated.pid)
+    expect(identity).toBeDefined()
+    writeFileSync(registration, JSON.stringify({
+      jobId: job.id,
+      pid: unrelated.pid,
+      started: `${identity!.started} stale`,
+    }))
     store.saveExecutorPid(job.id, unrelated.pid)
     try {
       await terminateTrackedExecutors(store, () => {}, 100, dir)
@@ -1355,6 +1496,101 @@ process.exit(0)
     }
   })
 
+  test.skipIf(process.platform === 'win32')(
+    'Codexが別process groupへ切り離した子processも正常完了時に回収する',
+    async () => {
+      const dir = fixtureDir()
+      const repo = join(dir, 'repo')
+      const fakeCodex = join(dir, 'fake-codex')
+      const childPidFile = join(dir, 'detached-child.pid')
+      mkdirSync(repo)
+      writeFileSync(fakeCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+const args = process.argv.slice(2)
+const child = Bun.spawn(['/bin/sleep', '30'], {
+  detached: true,
+  stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+})
+child.unref()
+writeFileSync(process.env.CHILD_PID_FILE!, String(child.pid))
+await Bun.sleep(350)
+writeFileSync(args[args.indexOf('--output-last-message') + 1], 'ok')
+console.log(JSON.stringify({ type: 'thread.started', thread_id: 'detached-background-thread' }))
+process.exit(0)
+`)
+      chmodSync(fakeCodex, 0o755)
+      const store = new JobStore(join(dir, 'jobs.sqlite3'))
+      store.enqueue(input({ repoPath: repo }))
+      const job = store.claimNext('serial-worker')!
+      let childPid = 0
+      try {
+        await executeCodexJob(job, {
+          codexBin: fakeCodex,
+          skipEffectiveConfigCheck: true,
+          stateDir: join(dir, 'state'),
+          logDir: join(dir, 'state/job-logs'),
+          extraEnvironment: { CHILD_PID_FILE: childPidFile },
+          timeoutMs: 5_000,
+        })
+        childPid = Number(readFileSync(childPidFile, 'utf8'))
+        expect(childPid).toBeGreaterThan(0)
+        expect(() => process.kill(childPid, 0)).toThrow()
+      } finally {
+        if (childPid > 0) {
+          try { process.kill(childPid, 'SIGKILL') } catch {}
+        }
+        store.close()
+      }
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'Codexが即時detachしてstdoutを保持してもjob完了はhangしない',
+    async () => {
+      const dir = fixtureDir()
+      const repo = join(dir, 'repo')
+      const fakeCodex = join(dir, 'fake-codex')
+      const childPidFile = join(dir, 'instant-detached-child.pid')
+      mkdirSync(repo)
+      writeFileSync(fakeCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+const args = process.argv.slice(2)
+const child = Bun.spawn(['/bin/sleep', '30'], {
+  detached: true,
+  stdin: 'ignore', stdout: 'inherit', stderr: 'inherit',
+})
+child.unref()
+writeFileSync(process.env.CHILD_PID_FILE!, String(child.pid))
+writeFileSync(args[args.indexOf('--output-last-message') + 1], 'ok')
+console.log(JSON.stringify({ type: 'thread.started', thread_id: 'instant-detached-thread' }))
+process.exit(0)
+`)
+      chmodSync(fakeCodex, 0o755)
+      const store = new JobStore(join(dir, 'jobs.sqlite3'))
+      store.enqueue(input({ repoPath: repo }))
+      const job = store.claimNext('serial-worker')!
+      let childPid = 0
+      const startedAt = Date.now()
+      try {
+        await executeCodexJob(job, {
+          codexBin: fakeCodex,
+          skipEffectiveConfigCheck: true,
+          stateDir: join(dir, 'state'),
+          logDir: join(dir, 'state/job-logs'),
+          extraEnvironment: { CHILD_PID_FILE: childPidFile },
+          timeoutMs: 5_000,
+        })
+        childPid = Number(readFileSync(childPidFile, 'utf8'))
+        expect(Date.now() - startedAt).toBeLessThan(5_000)
+      } finally {
+        if (childPid > 0) {
+          try { process.kill(childPid, 'SIGKILL') } catch {}
+        }
+        store.close()
+      }
+    },
+  )
+
   test('大量JSONL出力は20MB logと1MB解析tailへ上限化する', async () => {
     const dir = fixtureDir()
     const repo = join(dir, 'repo')
@@ -1756,8 +1992,10 @@ describe('Slack output guard', () => {
     const secret = join(dir, 'secret.txt')
     const escaped = join(outbox, 'escaped.txt')
     const hardlink = join(outbox, 'hardlink.txt')
-    const fifo = join(outbox, 'pipe')
-    writeFileSync(good, 'safe report')
+      const fifo = join(outbox, 'pipe')
+      const empty = join(outbox, 'empty.txt')
+      writeFileSync(good, 'safe report')
+      writeFileSync(empty, '')
     writeFileSync(secret, 'secret')
     symlinkSync(secret, escaped)
     linkSync(secret, hardlink)
@@ -1788,6 +2026,11 @@ describe('Slack output guard', () => {
         `<zerokun_files>${JSON.stringify([hardlink])}</zerokun_files>`,
         state,
       )).toThrow('multiple hard links')
+      expect(() => sealArtifactResult(
+        job,
+        `<zerokun_files>${JSON.stringify([empty])}</zerokun_files>`,
+        state,
+      )).toThrow('empty')
     } finally {
       store.close()
     }
@@ -1965,6 +2208,43 @@ describe('durable terminal notifications', () => {
     expect(store.artifactDelivered(queued.id, artifact)).toBe(false)
     store.markArtifactDelivered(queued.id, artifact)
     expect(store.artifactDelivered(queued.id, artifact)).toBe(true)
+    store.close()
+  })
+
+  test('本文成功後の添付失敗は本文を再投稿せず5回で打ち切る', async () => {
+    const store = makeStore()
+    const job = store.enqueue(input()).job
+    const running = store.claimNext('serial-worker')!
+    const artifact = '/tmp/sealed/report.txt'
+    store.complete(
+      running.id,
+      'thread-1',
+      `done\n<zerokun_files>${JSON.stringify([artifact])}</zerokun_files>`,
+    )
+    let bodyPosts = 0
+    let uploadAttempts = 0
+    let abandonmentNotices = 0
+    const notifier = {
+      completed: async (_job: JobRecord, _result: string, notificationId?: string) => {
+        if (!notificationId) throw new Error('missing notification id')
+        if (!store.terminalNotificationBodyDelivered(notificationId)) {
+          bodyPosts += 1
+          store.markTerminalNotificationBodyDelivered(notificationId)
+        }
+        uploadAttempts += 1
+        throw new Error('files.uploadV2 unavailable')
+      },
+      artifactsAbandoned: async () => { abandonmentNotices += 1 },
+    }
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await flushTerminalNotifications(store, notifier, () => {}, 1)
+      await Bun.sleep(2 ** (attempt + 1) + 2)
+    }
+    expect(bodyPosts).toBe(1)
+    expect(uploadAttempts).toBe(5)
+    expect(abandonmentNotices).toBe(1)
+    expect(store.terminalNotificationCount()).toBe(0)
+    expect(store.artifactDelivered(job.id, artifact)).toBe(false)
     store.close()
   })
 })

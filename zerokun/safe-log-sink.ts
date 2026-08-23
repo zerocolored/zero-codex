@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { closeSync, writeSync } from 'fs'
 import { dirname } from 'path'

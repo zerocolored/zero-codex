@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -15,7 +16,7 @@ import {
   writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import {
   activeJobCounts,
   activeJobCountsFromDatabase,
@@ -24,9 +25,13 @@ import {
   fastForwardRepositories,
   preflightRepositories,
   processStateIsAlive,
+  resolveUpdaterCodexBinary,
+  restoreRollbackDatabase,
   startBotInTmux,
   stopLockedProcess,
   waitForStableHealth,
+  withUpdateTestPolicy,
+  updaterTrustedToolPath,
 } from './update.ts'
 import { tryAcquireProcessLock } from './process-lock.ts'
 
@@ -52,6 +57,23 @@ function must(args: string[], cwd?: string): string {
   const result = Bun.spawnSync(args, { cwd, stdout: 'pipe', stderr: 'pipe' })
   if (result.exitCode !== 0) throw new Error(result.stderr.toString())
   return result.stdout.toString().trim()
+}
+
+function installedNativeCodex(): string {
+  const launcher = resolveUpdaterCodexBinary()
+  if (!launcher.endsWith('.js')) return launcher
+  const packageRoot = dirname(dirname(launcher))
+  const target = process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin'
+  return realpathSync(join(
+    packageRoot,
+    'node_modules',
+    '@openai',
+    `codex-darwin-${process.arch}`,
+    'vendor',
+    target,
+    'bin',
+    'codex',
+  ))
 }
 
 function makeRepo(base: string) {
@@ -141,7 +163,6 @@ function updaterEnvironment(fixture: ReturnType<typeof updaterFixture>) {
     ZEROKUN_PROJECT_DIR: fixture.project,
     ZEROKUN_SETUP_SCRIPT: fixture.setup,
     ZEROKUN_UPDATE_BRANCH: 'codex',
-    ZEROKUN_UPDATE_TESTING: '1',
   }
 }
 
@@ -173,7 +194,11 @@ function runUpdater(
   args = ['--skip-tests', '--no-restart'],
   environment = updaterEnvironment(fixture),
 ) {
-  return Bun.spawnSync([process.execPath, join(import.meta.dir, 'update.ts'), ...args], {
+  const entry = [
+    `import { runUpdateForTests } from ${JSON.stringify(join(import.meta.dir, 'update.ts'))}`,
+    'await runUpdateForTests()',
+  ].join('; ')
+  return Bun.spawnSync([process.execPath, '--no-env-file', '-e', entry, '--', ...args], {
     cwd: fixture.repo.local,
     env: environment,
     stdout: 'pipe',
@@ -181,7 +206,116 @@ function runUpdater(
   })
 }
 
+function spawnUpdater(
+  fixture: ReturnType<typeof updaterFixture>,
+  args: string[],
+  environment = updaterEnvironment(fixture),
+) {
+  const entry = [
+    `import { runUpdateForTests } from ${JSON.stringify(join(import.meta.dir, 'update.ts'))}`,
+    'await runUpdateForTests()',
+  ].join('; ')
+  return Bun.spawn([process.execPath, '--no-env-file', '-e', entry, '--', ...args], {
+    cwd: fixture.repo.local,
+    env: environment,
+    stdout: 'pipe', stderr: 'pipe',
+  })
+}
+
 describe('updater helpers', () => {
+  test('standalone Codexを絶対pathへ固定しcandidate PATHでも解決できる', () => {
+    const home = fixtureDir()
+    const bin = join(home, '.local', 'bin')
+    mkdirSync(bin, { recursive: true })
+    const codex = join(bin, 'codex')
+    writeFileSync(codex, '#!/bin/sh\necho "codex-cli 0.149.0"\n', { mode: 0o755 })
+    const resolved = resolveUpdaterCodexBinary({ HOME: home, PATH: '/usr/bin:/bin' })
+    expect(resolved).toBe(realpathSync(codex))
+    const trusted = join(home, 'trusted-bin')
+    expect(updaterTrustedToolPath(trusted).split(':')[0]).toBe(trusted)
+  })
+
+  test('standalone Codexを古いBun隣接版より優先し、最低version未満は採用しない', () => {
+    const root = fixtureDir()
+    const homeBin = join(root, 'home', '.local', 'bin')
+    const runtimeBin = join(root, 'runtime')
+    mkdirSync(homeBin, { recursive: true })
+    mkdirSync(runtimeBin)
+    const standalone = join(homeBin, 'codex')
+    const adjacent = join(runtimeBin, 'codex')
+    writeFileSync(standalone, '#!/bin/sh\necho "codex-cli 0.149.0"\n', { mode: 0o755 })
+    writeFileSync(adjacent, '#!/bin/sh\necho "codex-cli 0.148.0"\n', { mode: 0o755 })
+    expect(resolveUpdaterCodexBinary(
+      { HOME: join(root, 'home') }, join(runtimeBin, 'bun'),
+    )).toBe(realpathSync(standalone))
+
+    writeFileSync(standalone, '#!/bin/sh\necho "codex-cli 0.148.9"\n', { mode: 0o755 })
+    writeFileSync(adjacent, '#!/bin/sh\necho "codex-cli 0.150.0"\n', { mode: 0o755 })
+    expect(resolveUpdaterCodexBinary(
+      { HOME: join(root, 'home') }, join(runtimeBin, 'bun'),
+    )).toBe(realpathSync(adjacent))
+  })
+
+  test.skipIf(process.platform !== 'darwin')('standalone Codex実体を候補sandboxで読取専用実行できる', () => {
+    const fixture = updaterFixture()
+    const standaloneHome = join(fixture.base, 'standalone-home')
+    const standaloneBin = join(standaloneHome, '.local', 'bin')
+    mkdirSync(standaloneBin, { recursive: true })
+    const standaloneCodex = join(standaloneBin, 'codex')
+    copyFileSync(installedNativeCodex(), standaloneCodex)
+    chmodSync(standaloneCodex, 0o700)
+
+    const verifyDir = join(fixture.repo.seed, 'zerokun')
+    writeFileSync(join(verifyDir, 'verify.sh'), [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      'test "${ZERO_CODEX_CANDIDATE_SANDBOX:-}" = 1',
+      'codex --version | grep -E "[0-9]+\\.[0-9]+\\.[0-9]+" >/dev/null',
+      'bun --version >/dev/null',
+      '',
+    ].join('\n'))
+    must(['git', 'add', '.'], fixture.repo.seed)
+    must(['git', 'commit', '-m', 'standalone candidate verification'], fixture.repo.seed)
+    must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+
+    const environment = {
+      ...updaterEnvironment(fixture),
+      HOME: standaloneHome,
+      PATH: `${standaloneBin}:${process.env.PATH ?? '/usr/bin:/bin'}`,
+    }
+    delete environment.ZEROKUN_CODEX_BIN
+    const result = runUpdater(fixture, ['--no-restart'], environment)
+    expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0)
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v2\n')
+  }, 30_000)
+
+  test('updaterのcustom Codexは相対pathやgroup/world writable実体を拒否する', () => {
+    expect(() => resolveUpdaterCodexBinary({ ZEROKUN_CODEX_BIN: 'codex-custom' }))
+      .toThrow('絶対path')
+    const dir = fixtureDir()
+    const unsafe = join(dir, 'codex')
+    writeFileSync(unsafe, '#!/bin/sh\nexit 0\n', { mode: 0o777 })
+    chmodSync(unsafe, 0o777)
+    expect(() => resolveUpdaterCodexBinary({ ZEROKUN_CODEX_BIN: unsafe }))
+      .toThrow('安全なCodex CLI')
+  })
+
+  test('本番entrypointはテスト専用の検証・再起動省略flagを拒否する', () => {
+    for (const flag of ['--skip-tests', '--no-restart']) {
+      const result = Bun.spawnSync([
+        process.execPath,
+        '--no-env-file',
+        join(import.meta.dir, 'update.ts'),
+        flag,
+      ], {
+        env: { PATH: '/usr/bin:/bin', HOME: fixtureDir() },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(1)
+      expect(result.stderr.toString()).toContain(`${flag} はテスト環境でのみ使用できます`)
+    }
+  })
+
   test('candidate sandboxはpreflightと同じrandom named permissionをdefaultにする', () => {
     const source = readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')
     const candidate = source.slice(source.indexOf('async function validateZero('), source.indexOf('export async function stopLockedProcess('))
@@ -190,6 +324,45 @@ describe('updater helpers', () => {
     expect(candidate).toContain("'--include-managed-config'")
     expect(candidate.indexOf('assertEffectiveCodexPermissionConfig('))
       .toBeLessThan(candidate.indexOf("'sandbox'"))
+  })
+
+  test('rollback用SQLite snapshotをsidecarごと原子的に復元する', () => {
+    const dir = fixtureDir()
+    const databasePath = join(dir, 'jobs.sqlite3')
+    const databaseBackup = join(dir, 'jobs.sqlite3.backup')
+    let database = new Database(databaseBackup, { create: true })
+    database.exec('CREATE TABLE marker (value TEXT NOT NULL)')
+    database.run('INSERT INTO marker (value) VALUES (?)', ['before-update'])
+    database.close()
+    database = new Database(databasePath, { create: true })
+    database.exec('CREATE TABLE marker (value TEXT NOT NULL)')
+    database.run('INSERT INTO marker (value) VALUES (?)', ['candidate'])
+    database.close()
+    writeFileSync(`${databasePath}-wal`, 'stale-wal')
+    writeFileSync(`${databasePath}-shm`, 'stale-shm')
+
+    restoreRollbackDatabase({ databasePath, databaseBackup })
+
+    const restored = new Database(databasePath)
+    expect(restored.query<{ value: string }, []>('SELECT value FROM marker').get()?.value)
+      .toBe('before-update')
+    restored.close()
+    expect(existsSync(`${databasePath}-wal`)).toBe(false)
+    expect(existsSync(`${databasePath}-shm`)).toBe(false)
+  })
+
+  test('rollbackはGitを戻してからSQLiteを復元し旧setupを実行する', () => {
+    const source = readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')
+    const rollback = source.slice(
+      source.indexOf('async function rollbackUpdate('),
+      source.indexOf('async function main('),
+    )
+    const gitReset = rollback.indexOf("['git', 'reset', '--hard', journal.originalHead]")
+    const databaseRestore = rollback.indexOf('restoreRollbackDatabase(journal)')
+    const legacySetup = rollback.indexOf("['/bin/bash', journal.setupScript]")
+    expect(gitReset).toBeGreaterThanOrEqual(0)
+    expect(databaseRestore).toBeGreaterThan(gitReset)
+    expect(legacySetup).toBeGreaterThan(databaseRestore)
   })
 
   test('zombieだけをdeadと判定する', () => {
@@ -243,25 +416,50 @@ describe('updater helpers', () => {
     const root = join(base, 'root')
     const project = join(base, 'project')
     const log = join(base, 'gateway.log')
+    const observedEnvironment = join(base, 'launch-environment-observed')
     const launcher = join(root, 'codex-channel.sh')
     mkdirSync(root)
     mkdirSync(project)
-    writeFileSync(launcher, '#!/bin/bash\necho gateway-started\nsleep 30\n')
+    writeFileSync(
+      launcher,
+      '#!/bin/bash\nprintf \'%s|%s|%s|%s\\n\' "$ZEROKUN_LEGACY_CUTOVER" "${ZEROKUN_JOB_DB:-}" "${ZEROKUN_SETUP_SCRIPT:-}" "${SLACK_BOT_TOKEN:-}" > "$ZEROKUN_STATE_DIR/launch-environment-observed"\necho gateway-started\nsleep 30\n',
+    )
     chmodSync(launcher, 0o700)
     const session = `zerokun-codex-test-${process.pid}-${Date.now()}`
     tmuxSessions.push(session)
 
-    const panePid = await startBotInTmux({
-      rootRepo: root,
-      projectDir: project,
-      logPath: log,
-      sessionName: session,
-      startupTimeoutMs: 2_000,
-      tmuxPath: tmux.stdout.toString().trim(),
-      replaceTokenFile: join(base, 'replace-token'),
-    })
-    expect(panePid).toBeGreaterThan(0)
-    expect(Bun.spawnSync([tmux.stdout.toString().trim(), 'has-session', '-t', session]).exitCode).toBe(0)
+    const previousJobDb = process.env.ZEROKUN_JOB_DB
+    const previousSetup = process.env.ZEROKUN_SETUP_SCRIPT
+    const previousSlack = process.env.SLACK_BOT_TOKEN
+    process.env.ZEROKUN_JOB_DB = join(base, 'jobs.sqlite3')
+    process.env.ZEROKUN_SETUP_SCRIPT = '/stale/setup.sh'
+    process.env.SLACK_BOT_TOKEN = 'xoxb-stale-not-real'
+    try {
+      const panePid = await startBotInTmux({
+        rootRepo: root,
+        projectDir: project,
+        logPath: log,
+        sessionName: session,
+        startupTimeoutMs: 2_000,
+        tmuxPath: tmux.stdout.toString().trim(),
+        replaceTokenFile: join(base, 'replace-token'),
+        legacyCutover: true,
+      })
+      expect(panePid).toBeGreaterThan(0)
+      expect(Bun.spawnSync([tmux.stdout.toString().trim(), 'has-session', '-t', session]).exitCode).toBe(0)
+      for (let attempt = 0; attempt < 100 && !existsSync(observedEnvironment); attempt += 1) {
+        await Bun.sleep(20)
+      }
+      expect(readFileSync(observedEnvironment, 'utf8').trim())
+        .toBe(`1|${join(realpathSync(base), 'jobs.sqlite3')}||`)
+    } finally {
+      if (previousJobDb === undefined) delete process.env.ZEROKUN_JOB_DB
+      else process.env.ZEROKUN_JOB_DB = previousJobDb
+      if (previousSetup === undefined) delete process.env.ZEROKUN_SETUP_SCRIPT
+      else process.env.ZEROKUN_SETUP_SCRIPT = previousSetup
+      if (previousSlack === undefined) delete process.env.SLACK_BOT_TOKEN
+      else process.env.SLACK_BOT_TOKEN = previousSlack
+    }
   })
 
   test('同名の無関係tmux sessionを停止せずfail-closedにする', async () => {
@@ -371,6 +569,36 @@ describe('updater helpers', () => {
 })
 
 describe('Codex branch self update', () => {
+  test('state ancestor aliasをphysical identityへ統一してsetupとjournalへ渡す', () => {
+    const fixture = updaterFixture()
+    writeFileSync(join(fixture.state, '.env'), [
+      'SLACK_BOT_TOKEN=xoxb-cutover-not-a-real-token',
+      'SLACK_APP_TOKEN=xapp-1-A0123456789-cutover-not-a-real-token',
+      '',
+    ].join('\n'), { mode: 0o600 })
+    writeFileSync(
+      join(fixture.state, '.codex-legacy-cutover'),
+      `zerokun-codex-legacy-cutover-v1\n${realpathSync(fixture.state)}\n`,
+      { mode: 0o600 },
+    )
+    const aliasParent = join(fixture.base, 'state-parent-alias')
+    const aliasState = join(aliasParent, 'state')
+    symlinkSync(fixture.base, aliasParent)
+    writeFileSync(fixture.setup, [
+      '#!/bin/bash',
+      `printf '%s\\n' "$ZEROKUN_STATE_DIR" > '${fixture.setupMarker}'`,
+      '',
+    ].join('\n'))
+    const result = runUpdater(fixture, ['--skip-tests', '--no-restart'], {
+      ...updaterEnvironment(fixture),
+      ZEROKUN_STATE_DIR: aliasState,
+      ZEROKUN_LEGACY_CUTOVER: '1',
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(readFileSync(fixture.setupMarker, 'utf8').trim()).toBe(realpathSync(fixture.state))
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
+  })
+
   test('無関係な同名tmux sessionを保持し一意なsessionで更新を完遂する', () => {
     const fixture = updaterFixture()
     const tmux = must(['/usr/bin/which', 'tmux'])
@@ -445,7 +673,11 @@ describe('Codex branch self update', () => {
       else linkSync(external, join(fixture.state, 'jobs.sqlite3'))
       const result = runUpdater(fixture)
       expect(result.exitCode).not.toBe(0)
-      expect(result.stderr.toString()).toContain('unsafe SQLite file')
+      expect(result.stderr.toString()).toContain(
+        kind === 'symlink'
+          ? "must be the selected state's jobs.sqlite3"
+          : 'unsafe SQLite file',
+      )
       expect(readFileSync(external)).toEqual(before)
     },
   )
@@ -724,17 +956,84 @@ describe('Codex branch self update', () => {
     expect(readFileSync(stateSecret, 'utf8')).toBe('must-not-read')
   })
 
-  test('検証中にorigin/codexが進んでも検証済みSHAだけを適用する', () => {
+  test('候補verifyがhangしてもdeadlineで停止しlive HEADを変更しない', () => {
+    const fixture = updaterFixture()
+    const verifyDir = join(fixture.repo.seed, 'zerokun')
+    mkdirSync(verifyDir, { recursive: true })
+    writeFileSync(join(verifyDir, 'verify.sh'), '#!/bin/bash\nsleep 30\n')
+    must(['git', 'add', '.'], fixture.repo.seed)
+    must(['git', 'commit', '-m', 'hanging candidate'], fixture.repo.seed)
+    must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+    const startedAt = Date.now()
+    const result = runUpdater(
+      fixture,
+      ['--no-restart'],
+      { ...updaterEnvironment(fixture), ZEROKUN_UPDATE_VERIFY_TIMEOUT_MS: '100' },
+    )
+    expect(Date.now() - startedAt).toBeLessThan(10_000)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr.toString()).toContain('timeout')
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
+  }, 15_000)
+
+  test('新版setupがhangしてもdeadlineで停止し旧版へrollbackする', () => {
+    const fixture = updaterFixture()
+    writeFileSync(fixture.setup, [
+      '#!/bin/bash',
+      `if grep -q '^v2' '${join(fixture.repo.local, 'version.txt')}'; then`,
+      '  sleep 30',
+      'fi',
+      `touch '${fixture.setupMarker}'`,
+      '',
+    ].join('\n'))
+    const startedAt = Date.now()
+    const result = runUpdater(
+      fixture,
+      ['--skip-tests', '--no-restart'],
+      { ...updaterEnvironment(fixture), ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '100' },
+    )
+    expect(Date.now() - startedAt).toBeLessThan(10_000)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr.toString()).toContain('timeout')
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
+    expect(existsSync(fixture.setupMarker)).toBe(true)
+  }, 15_000)
+
+  test('rollback側setupもhangした場合はjournalを保持しrecover-onlyで復旧する', () => {
+    const fixture = updaterFixture()
+    writeFileSync(fixture.setup, '#!/bin/bash\nsleep 30\n')
+    const failed = runUpdater(
+      fixture,
+      ['--skip-tests', '--no-restart'],
+      { ...updaterEnvironment(fixture), ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '100' },
+    )
+    expect(failed.exitCode).not.toBe(0)
+    expect(failed.stderr.toString()).toContain('timeout')
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(true)
+
+    writeFileSync(fixture.setup, `#!/bin/bash\ntouch '${fixture.setupMarker}'\n`)
+    const recovered = runUpdater(
+      fixture,
+      ['--recover-only'],
+      { ...updaterEnvironment(fixture), ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '2000' },
+    )
+    expect(recovered.exitCode, recovered.stderr.toString()).toBe(0)
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
+    expect(existsSync(fixture.setupMarker)).toBe(true)
+  }, 20_000)
+
+  test('検証中にorigin/codexが進んでも検証済みSHAだけを適用する', async () => {
     const fixture = updaterFixture()
     writeFileSync(join(fixture.repo.seed, 'version.txt'), 'v3-verified\n')
     must(['git', 'add', '.'], fixture.repo.seed)
     must(['git', 'commit', '-m', 'v3 verified'], fixture.repo.seed)
     must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
-    const previousTesting = process.env.ZEROKUN_UPDATE_TESTING
-    process.env.ZEROKUN_UPDATE_TESTING = '1'
-    try {
+    await withUpdateTestPolicy(async () => {
       const repositories = [{ label: 'zero-codex', path: fixture.repo.local, branch: 'codex' }]
-      const pinned = preflightRepositories(repositories)
+      const pinned = await preflightRepositories(repositories)
       writeFileSync(join(fixture.repo.seed, 'version.txt'), 'v4-unverified\n')
       must(['git', 'add', '.'], fixture.repo.seed)
       must(['git', 'commit', '-m', 'v4 unverified'], fixture.repo.seed)
@@ -744,26 +1043,18 @@ describe('Codex branch self update', () => {
       expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v3-verified\n')
       expect(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local))
         .not.toBe(must(['git', 'rev-parse', 'origin/codex'], fixture.repo.local))
-    } finally {
-      if (previousTesting === undefined) delete process.env.ZEROKUN_UPDATE_TESTING
-      else process.env.ZEROKUN_UPDATE_TESTING = previousTesting
-    }
+    })
   })
 
-  test('候補検証中にlive branchが変わればjournal作成前に停止する', () => {
+  test('候補検証中にlive branchが変わればjournal作成前に停止する', async () => {
     const fixture = updaterFixture()
-    const previousTesting = process.env.ZEROKUN_UPDATE_TESTING
-    process.env.ZEROKUN_UPDATE_TESTING = '1'
-    try {
+    await withUpdateTestPolicy(async () => {
       const repositories = [{ label: 'zero-codex', path: fixture.repo.local, branch: 'codex' }]
-      const [pinned] = preflightRepositories(repositories)
+      const [pinned] = await preflightRepositories(repositories)
       must(['git', 'switch', '-c', 'user-work'], fixture.repo.local)
       expect(() => assertPinnedRepositoryState(pinned!)).toThrow('branchまたはHEADが変更')
       expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
-    } finally {
-      if (previousTesting === undefined) delete process.env.ZEROKUN_UPDATE_TESTING
-      else process.env.ZEROKUN_UPDATE_TESTING = previousTesting
-    }
+    })
   })
 
   test('rollback開始後の未コミット変更はresetせずjournalを保持する', () => {
@@ -846,13 +1137,7 @@ describe('Codex branch self update', () => {
     })
     const lock = join(fixture.state, 'plugin.lock')
     expect(tryAcquireProcessLock(lock, gateway.pid).acquired).toBe(true)
-    const recover = Bun.spawn([
-      process.execPath, join(import.meta.dir, 'update.ts'), '--recover-only',
-    ], {
-      cwd: fixture.repo.local,
-      env: updaterEnvironment(fixture),
-      stdout: 'pipe', stderr: 'pipe',
-    })
+    const recover = spawnUpdater(fixture, ['--recover-only'])
     const deadline = Date.now() + 5_000
     while (!existsSync(stopping) && Date.now() < deadline) await Bun.sleep(10)
     expect(existsSync(stopping)).toBe(true)
@@ -886,14 +1171,7 @@ describe('Codex branch self update', () => {
         '',
       ].join('\n'),
     )
-    const first = Bun.spawn([
-      process.execPath, join(import.meta.dir, 'update.ts'), '--skip-tests', '--no-restart',
-    ], {
-      cwd: fixture.repo.local,
-      env: updaterEnvironment(fixture),
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
+    const first = spawnUpdater(fixture, ['--skip-tests', '--no-restart'])
     const deadline = Date.now() + 5_000
     while (!existsSync(setupStarted) && Date.now() < deadline) await Bun.sleep(10)
     expect(existsSync(setupStarted)).toBe(true)

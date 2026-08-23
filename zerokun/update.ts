@@ -1,7 +1,9 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
 import {
+  accessSync,
+  constants,
   existsSync,
   chmodSync,
   copyFileSync,
@@ -12,6 +14,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'fs'
 import { randomUUID } from 'crypto'
@@ -23,9 +26,13 @@ import {
   releaseProcessLock,
   tryAcquireProcessLock,
 } from './process-lock.ts'
-import { resolveZeroStateDir } from './state-dir.ts'
+import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
 import { readGatewayReadiness } from './readiness.ts'
-import { buildCandidateEnvironment, buildUpdaterEnvironment } from './child-environment.ts'
+import {
+  buildCandidateEnvironment,
+  buildRuntimeServiceEnvironment,
+  buildUpdaterEnvironment,
+} from './child-environment.ts'
 import {
   ensureManagedDirectory,
   prepareManagedStateRoot,
@@ -33,6 +40,7 @@ import {
 } from './managed-path.ts'
 import { atomicWritePrivateFile, readOptionalPrivateFile } from './safe-file.ts'
 import { assertEffectiveCodexPermissionConfig } from './codex-executor.ts'
+import { captureTrackedProcesses, reapTrackedProcesses } from './process-tree.ts'
 
 interface Repository {
   label: string
@@ -50,6 +58,135 @@ interface CommandResult {
   exitCode: number
   stdout: string
   stderr: string
+}
+
+const TRUSTED_TOOL_PATH = [
+  '/usr/bin',
+  '/bin',
+  '/usr/sbin',
+  '/sbin',
+  dirname(process.execPath),
+  '/opt/homebrew/bin',
+  '/usr/local/bin',
+].join(':')
+
+const MINIMUM_CODEX_VERSION = [0, 149, 0] as const
+
+function secureExecutable(candidate: string): string | null {
+  try {
+    const physical = realpathSync(candidate)
+    const metadata = statSync(physical)
+    const ownerAllowed = typeof process.getuid !== 'function'
+      || metadata.uid === process.getuid()
+      || metadata.uid === 0
+    if (!metadata.isFile() || !ownerAllowed || (metadata.mode & 0o022) !== 0) return null
+    accessSync(physical, constants.X_OK)
+    return physical
+  } catch {
+    return null
+  }
+}
+
+function codexVersionIsSupported(
+  codexBin: string,
+  source: Record<string, string | undefined>,
+): boolean {
+  const result = Bun.spawnSync([codexBin, '--version'], {
+    env: {
+      PATH: TRUSTED_TOOL_PATH,
+      HOME: source.HOME ?? '/var/empty',
+      CODEX_HOME: source.HOME ? join(source.HOME, '.codex') : '/var/empty',
+      LANG: source.LANG ?? 'C',
+    },
+    stdout: 'pipe',
+    stderr: 'pipe',
+    timeout: 10_000,
+    killSignal: 'SIGKILL',
+    maxBuffer: 64 * 1024,
+  })
+  if (result.exitCode !== 0) return false
+  const match = result.stdout.toString().match(/(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\s|$)/)
+  if (!match) return false
+  const actual = [Number(match[1]), Number(match[2]), Number(match[3])]
+  for (let index = 0; index < MINIMUM_CODEX_VERSION.length; index += 1) {
+    if (actual[index]! > MINIMUM_CODEX_VERSION[index]!) return true
+    if (actual[index]! < MINIMUM_CODEX_VERSION[index]!) return false
+  }
+  return true
+}
+
+export function resolveUpdaterCodexBinary(
+  source: Record<string, string | undefined> = process.env,
+  runtimeExecutable = process.execPath,
+): string {
+  const configured = source.ZEROKUN_CODEX_BIN
+  if (configured && !configured.startsWith('/')) {
+    fail('ZEROKUN_CODEX_BINは絶対pathで指定してください')
+  }
+  const home = source.HOME
+  const candidates = configured
+    ? [configured]
+    : [
+        ...(home ? [join(home, '.local', 'bin', 'codex')] : []),
+        join(dirname(runtimeExecutable), 'codex'),
+        '/opt/homebrew/bin/codex',
+        '/usr/local/bin/codex',
+      ]
+  for (const candidate of candidates) {
+    const physical = secureExecutable(candidate)
+    if (physical && codexVersionIsSupported(physical, source)) return physical
+    if (configured) {
+      fail('ZEROKUN_CODEX_BINは安全なCodex CLI 0.149.0以上を指定してください')
+    }
+  }
+  fail('信頼できるCodex CLI 0.149.0以上を ~/.local/bin またはHomebrewから解決できません')
+}
+
+export function updaterTrustedToolPath(trustedCodexDirectory: string): string {
+  return [...new Set([trustedCodexDirectory, ...TRUSTED_TOOL_PATH.split(':')])].join(':')
+}
+
+function candidateCodexExecutable(codexBin: string): string {
+  if (!codexBin.endsWith('.js')) return codexBin
+  const packageRoot = dirname(dirname(codexBin))
+  try {
+    const packageJson = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as {
+      name?: unknown
+    }
+    if (packageJson.name !== '@openai/codex') fail('Codex npm package identityが不正です')
+  } catch (error) {
+    if (error instanceof Error && error.message === 'Codex npm package identityが不正です') throw error
+    fail('Codex npm package identityを検証できません')
+  }
+  const platform = process.platform === 'darwin' ? 'darwin' : process.platform
+  const architecture = process.arch === 'arm64' ? 'arm64' : process.arch
+  const target = process.platform === 'darwin'
+    ? process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin'
+    : null
+  if (!target) fail('candidate検証用Codex binaryをこのplatformで解決できません')
+  const native = join(
+    packageRoot,
+    'node_modules',
+    '@openai',
+    `codex-${platform}-${architecture}`,
+    'vendor',
+    target,
+    'bin',
+    'codex',
+  )
+  const physical = secureExecutable(native)
+  if (!physical) fail('candidate検証用Codex native binaryを安全に解決できません')
+  return physical
+}
+
+function prepareCandidateToolDirectory(parent: string, codexBin: string): string {
+  const directory = join(parent, 'trusted-bin')
+  mkdirSync(directory, { mode: 0o700 })
+  const destination = join(directory, 'codex')
+  copyFileSync(candidateCodexExecutable(codexBin), destination, constants.COPYFILE_EXCL)
+  chmodSync(destination, 0o500)
+  chmodSync(directory, 0o500)
+  return directory
 }
 
 type UpdatePhase = 'prepared' | 'fast-forwarded' | 'setup-applied' | 'rolling-back'
@@ -70,21 +207,61 @@ export interface UpdateJournal {
 }
 
 const decoder = new TextDecoder()
+const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60_000
+const DEFAULT_GIT_TIMEOUT_MS = 5 * 60_000
+const DEFAULT_VERIFY_TIMEOUT_MS = 30 * 60_000
+const DEFAULT_SETUP_TIMEOUT_MS = 15 * 60_000
+interface UpdateExecutionPolicy {
+  allowLocalRemotes: boolean
+  skipCodexPermissionPreflight: boolean
+}
+
+const PRODUCTION_EXECUTION: Readonly<UpdateExecutionPolicy> = Object.freeze({
+  allowLocalRemotes: false,
+  skipCodexPermissionPreflight: false,
+})
+const TEST_EXECUTION: Readonly<UpdateExecutionPolicy> = Object.freeze({
+  allowLocalRemotes: true,
+  skipCodexPermissionPreflight: true,
+})
+let executionPolicy: Readonly<UpdateExecutionPolicy> = PRODUCTION_EXECUTION
+
+/** Test harness entry: production CLI never selects this policy from environment or argv. */
+export async function withUpdateTestPolicy<T>(action: () => T | Promise<T>): Promise<T> {
+  if (executionPolicy !== PRODUCTION_EXECUTION) throw new Error('nested update test policy')
+  executionPolicy = TEST_EXECUTION
+  try {
+    return await action()
+  } finally {
+    executionPolicy = PRODUCTION_EXECUTION
+  }
+}
+
+function timeoutFromEnvironment(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value <= 0) fail(`${name}が不正です`)
+  return Math.floor(value)
+}
+
 function gitConfigOverrides(): string[] {
   return [
     'core.hooksPath=/dev/null',
     'core.fsmonitor=false',
     'credential.helper=',
     'core.sshCommand=/usr/bin/false',
+    'http.proxy=',
+    'http.sslVerify=true',
     'protocol.allow=never',
     'protocol.https.allow=always',
-    ...(process.env.ZEROKUN_UPDATE_TESTING === '1' ? ['protocol.file.allow=always'] : []),
+    `protocol.file.allow=${executionPolicy.allowLocalRemotes ? 'always' : 'never'}`,
   ]
 }
 
 function hardenedGitArgs(args: string[]): string[] {
   if (args[0] !== 'git') return args
-  return ['git', ...gitConfigOverrides().flatMap(value => ['-c', value]), ...args.slice(1)]
+  return ['/usr/bin/git', ...gitConfigOverrides().flatMap(value => ['-c', value]), ...args.slice(1)]
 }
 
 function hardenedGitEnvironment(
@@ -92,6 +269,7 @@ function hardenedGitEnvironment(
 ): Record<string, string | undefined> {
   return {
     ...buildUpdaterEnvironment(source),
+    PATH: TRUSTED_TOOL_PATH,
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null',
     GIT_TERMINAL_PROMPT: '0',
@@ -142,6 +320,28 @@ function requireCommand(
   return result.stdout
 }
 
+async function collectCommandStream(
+  stream: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): Promise<string> {
+  const reader = stream.getReader()
+  const outputDecoder = new TextDecoder()
+  let output = ''
+  const cancel = () => { void reader.cancel().catch(() => {}) }
+  signal.addEventListener('abort', cancel, { once: true })
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      output = (output + outputDecoder.decode(value, { stream: true })).slice(-1_048_576)
+    }
+    return (output + outputDecoder.decode()).slice(-1_048_576)
+  } finally {
+    signal.removeEventListener('abort', cancel)
+    reader.releaseLock()
+  }
+}
+
 async function requireCommandAsync(
   args: string[],
   options: {
@@ -149,9 +349,12 @@ async function requireCommandAsync(
     inherit?: boolean
     env?: Record<string, string | undefined>
     signal?: AbortSignal
+    timeoutMs?: number
   } = {},
 ): Promise<string> {
   if (options.signal?.aborted) fail('更新を中断しました')
+  const timeoutMs = options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) fail('command timeoutが不正です')
   const commandArgs = hardenedGitArgs(args)
   const proc = Bun.spawn(commandArgs, {
     cwd: options.cwd,
@@ -163,28 +366,90 @@ async function requireCommandAsync(
     stderr: options.inherit ? 'inherit' : 'pipe',
     detached: process.platform !== 'win32',
   })
-  let forceKill: ReturnType<typeof setTimeout> | undefined
-  const terminate = () => {
-    if (process.platform !== 'win32') {
-      try { process.kill(-proc.pid, 'SIGTERM') } catch { try { proc.kill('SIGTERM') } catch {} }
-    } else {
-      try { proc.kill('SIGTERM') } catch {}
-    }
-    forceKill ??= setTimeout(() => {
-      if (process.platform !== 'win32') {
-        try { process.kill(-proc.pid, 'SIGKILL') } catch { try { proc.kill('SIGKILL') } catch {} }
-      } else {
-        try { proc.kill('SIGKILL') } catch {}
-      }
+  const tracked = new Map<number, string>()
+  let tracking = true
+  let trackingError: unknown
+  let timedOut = false
+  let termination: Promise<number[]> | undefined
+  let terminationError: unknown
+  let forceKillTimer: ReturnType<typeof setTimeout> | undefined
+  const terminateDirect = () => {
+    try { proc.kill('SIGTERM') } catch {}
+    forceKillTimer ??= setTimeout(() => {
+      try { proc.kill('SIGKILL') } catch {}
     }, 5_000)
   }
+  const terminate = () => {
+    termination ??= reapTrackedProcesses({
+      rootPids: [proc.pid],
+      groupId: proc.pid,
+      tracked,
+      termGraceMs: 5_000,
+    }).catch(error => {
+      terminationError = error
+      terminateDirect()
+      return []
+    })
+  }
+  const tracker = (async () => {
+    try {
+      while (tracking) {
+        captureTrackedProcesses([proc.pid], proc.pid, tracked)
+        await Bun.sleep(100)
+      }
+    } catch (error) {
+      trackingError = error
+      terminate()
+    }
+  })()
   options.signal?.addEventListener('abort', terminate, { once: true })
-  const stdoutPromise = options.inherit ? Promise.resolve('') : new Response(proc.stdout).text()
-  const stderrPromise = options.inherit ? Promise.resolve('') : new Response(proc.stderr).text()
-  const exitCode = await proc.exited
-  if (forceKill) clearTimeout(forceKill)
-  options.signal?.removeEventListener('abort', terminate)
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
+  if (options.signal?.aborted) terminate()
+  const timeout = setTimeout(() => {
+    if (proc.exitCode !== null) return
+    timedOut = true
+    terminate()
+  }, timeoutMs)
+  const outputController = new AbortController()
+  const stdoutPromise = options.inherit
+    ? Promise.resolve('')
+    : collectCommandStream(proc.stdout!, outputController.signal)
+  const stderrPromise = options.inherit
+    ? Promise.resolve('')
+    : collectCommandStream(proc.stderr!, outputController.signal)
+  const outputCompletion = Promise.all([stdoutPromise, stderrPromise])
+  let exitCode: number
+  try {
+    exitCode = await proc.exited
+  } finally {
+    clearTimeout(timeout)
+    if (forceKillTimer) clearTimeout(forceKillTimer)
+    options.signal?.removeEventListener('abort', terminate)
+    tracking = false
+    await tracker
+  }
+  if (termination) await termination
+  let remaining: number[] = []
+  let finalReapError: unknown
+  try {
+    remaining = await reapTrackedProcesses({
+      rootPids: [],
+      groupId: proc.pid,
+      tracked,
+      signalGroup: false,
+    })
+  } catch (error) {
+    finalReapError = error
+  }
+  await Promise.race([outputCompletion, Bun.sleep(500)])
+  outputController.abort()
+  const [stdout, stderr] = await outputCompletion
+  if (finalReapError) throw finalReapError
+  if (terminationError) throw terminationError
+  if (remaining.length > 0) {
+    fail(`子processを回収できませんでした: ${remaining.join(', ')}`)
+  }
+  if (trackingError) throw trackingError
+  if (timedOut) fail(`コマンドが${timeoutMs}msでtimeoutしました: ${args.join(' ')}`)
   if (options.signal?.aborted) fail('更新を中断しました')
   if (exitCode !== 0) {
     const detail = [stdout.trim(), stderr.trim()].filter(Boolean).join('\n')
@@ -202,7 +467,7 @@ function pidIsAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try {
     process.kill(pid, 0)
-    const state = command(['ps', '-o', 'state=', '-p', String(pid)])
+    const state = command(['/bin/ps', '-o', 'state=', '-p', String(pid)])
     return state.exitCode === 0 && processStateIsAlive(state.stdout)
   } catch {
     return false
@@ -315,7 +580,7 @@ async function waitForRunningJobs(
   jobRunnerFile: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const dbPath = process.env.ZEROKUN_JOB_DB ?? join(stateDir, 'jobs.sqlite3')
+  const dbPath = resolveZeroJobDatabasePath(stateDir)
   if (!existsSync(dbPath)) {
     output('   queue: 未導入（初回更新）')
     return
@@ -337,7 +602,7 @@ async function waitForRunningJobs(
     }
     const runnerPid = readPid(join(stateDir, 'job-runner.lock', 'pid'))
     const runnerCommand = runnerPid
-      ? command(['ps', '-o', 'command=', '-p', String(runnerPid)])
+      ? command(['/bin/ps', '-o', 'command=', '-p', String(runnerPid)])
       : { exitCode: 1, stdout: '', stderr: '' }
     const runnerAlive = Boolean(
       runnerPid && pidIsAlive(runnerPid) && runnerCommand.exitCode === 0
@@ -348,7 +613,7 @@ async function waitForRunningJobs(
     }
     if (!runnerAlive) {
       output(`   queue: 停止したrunnerの実行中job ${counts.running}件を安全に回収します`)
-      requireCommand(['bun', jobRunnerFile, 'recover-interrupted'], {
+      requireCommand([process.execPath, jobRunnerFile, 'recover-interrupted'], {
         env: { ...process.env, ZEROKUN_STATE_DIR: stateDir },
       })
       continue
@@ -419,9 +684,9 @@ export function assertSafeLocalGitConfig(
 
 export function assertExpectedOrigin(repo: Repository): void {
   const remote = requireCommand(['git', 'remote', 'get-url', 'origin'], { cwd: repo.path })
-  if (process.env.ZEROKUN_UPDATE_TESTING === '1') return
-  if (remote !== 'https://github.com/zerocolored/zero.git'
-    && remote !== 'https://github.com/zerocolored/zero') {
+  if (executionPolicy.allowLocalRemotes) return
+  if (remote !== 'https://github.com/zerocolored/zero-codex.git'
+    && remote !== 'https://github.com/zerocolored/zero-codex') {
     fail(`${repo.label} のoriginは公開Codex版のHTTPS URLではありません: ${remote}`)
   }
 }
@@ -436,7 +701,10 @@ function isAncestor(repo: Repository, ancestor: string, descendant: string): boo
   }).exitCode === 0
 }
 
-export function preflightRepositories(repositories: Repository[]): PinnedRepository[] {
+export async function preflightRepositories(
+  repositories: Repository[],
+  signal?: AbortSignal,
+): Promise<PinnedRepository[]> {
   for (const repo of repositories) {
     assertSafeLocalGitConfig(repo)
     assertExpectedOrigin(repo)
@@ -448,10 +716,14 @@ export function preflightRepositories(repositories: Repository[]): PinnedReposit
   }]))
   for (const repo of repositories) {
     output(`   fetch: ${repo.label}`)
-    requireCommand([
+    await requireCommandAsync([
       'git', 'fetch', '--no-tags', '--prune', 'origin',
       `+refs/heads/${repo.branch}:refs/remotes/origin/${repo.branch}`,
-    ], { cwd: repo.path })
+    ], {
+      cwd: repo.path,
+      signal,
+      timeoutMs: timeoutFromEnvironment('ZEROKUN_UPDATE_GIT_TIMEOUT_MS', DEFAULT_GIT_TIMEOUT_MS),
+    })
   }
 
   return repositories.map(repo => {
@@ -542,7 +814,7 @@ function readJournal(
     fail(`更新transaction journalが安全な通常fileではありません: ${path}`)
   }
   const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<UpdateJournal>
-  const databasePath = resolve(process.env.ZEROKUN_JOB_DB ?? join(stateDir, 'jobs.sqlite3'))
+  const databasePath = resolveZeroJobDatabasePath(stateDir)
   const backupPath = typeof value.id === 'string'
     ? resolve(stateDir, 'update-rollback', value.id, 'jobs.sqlite3')
     : ''
@@ -567,7 +839,7 @@ function snapshotDatabase(stateDir: string, id: string): {
   databasePath: string | null
   databaseBackup: string | null
 } {
-  const databasePath = process.env.ZEROKUN_JOB_DB ?? join(stateDir, 'jobs.sqlite3')
+  const databasePath = resolveZeroJobDatabasePath(stateDir)
   if (!existsSync(databasePath)) return { databasePath: null, databaseBackup: null }
   const beforeOpen = requireSafeDatabaseSource(databasePath)
   const rollbackRoot = ensureManagedDirectory(stateDir, join(stateDir, 'update-rollback'))
@@ -594,7 +866,9 @@ function snapshotDatabase(stateDir: string, id: string): {
   return { databasePath, databaseBackup }
 }
 
-function restoreDatabase(journal: UpdateJournal): void {
+export function restoreRollbackDatabase(
+  journal: Pick<UpdateJournal, 'databasePath' | 'databaseBackup'>,
+): void {
   if (!journal.databasePath || !journal.databaseBackup) return
   if (!existsSync(journal.databaseBackup)) fail(`rollback DB backupがありません: ${journal.databaseBackup}`)
   const metadata = lstatSync(journal.databaseBackup)
@@ -644,11 +918,33 @@ async function validateRemoteTargets(
       mkdirSync(isolatedHome, { mode: 0o700 })
       mkdirSync(join(isolatedHome, 'tmp'), { recursive: true, mode: 0o700 })
       const remote = requireCommand(['git', 'remote', 'get-url', 'origin'], { cwd: repo.path })
-      requireCommand(['git', 'clone', '--quiet', '--no-local', '--no-checkout', remote, checkout])
-      requireCommand(['git', 'checkout', '--quiet', '--detach', repo.targetHead], { cwd: checkout })
+      await requireCommandAsync(
+        ['git', 'clone', '--quiet', '--no-local', '--no-checkout', remote, checkout],
+        {
+          signal,
+          timeoutMs: timeoutFromEnvironment('ZEROKUN_UPDATE_GIT_TIMEOUT_MS', DEFAULT_GIT_TIMEOUT_MS),
+        },
+      )
+      await requireCommandAsync(['git', 'checkout', '--quiet', '--detach', repo.targetHead], {
+        cwd: checkout,
+        signal,
+        timeoutMs: timeoutFromEnvironment('ZEROKUN_UPDATE_GIT_TIMEOUT_MS', DEFAULT_GIT_TIMEOUT_MS),
+      })
       await validateZero(checkout, isolatedHome, repo.path, stateDir, signal)
     } finally {
-      rmSync(parent, { recursive: true, force: true })
+      try { chmodSync(join(parent, 'trusted-bin'), 0o700) } catch {}
+      let cleanupError: unknown
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        try {
+          rmSync(parent, { recursive: true, force: true })
+          cleanupError = undefined
+          break
+        } catch (error) {
+          cleanupError = error
+          await Bun.sleep(100)
+        }
+      }
+      if (cleanupError) throw cleanupError
     }
   }
 }
@@ -663,20 +959,24 @@ async function validateZero(
   const verifyScript = join(rootRepo, 'zerokun', 'verify.sh')
   if (!existsSync(verifyScript)) fail(`候補commitに公開検証scriptがありません: ${verifyScript}`)
   output('   validate: frozen install + tests + typecheck + build + shell syntax')
+  const codexBin = resolveUpdaterCodexBinary()
+  const trustedToolDirectory = prepareCandidateToolDirectory(dirname(isolatedHome), codexBin)
   const profile = `zerokun_update_${randomUUID().replaceAll('-', '')}`
   const filesystem = new Map<string, 'deny' | 'read' | 'write'>([
     [':minimal', 'read'],
     [realpathSync(homedir()), 'deny'],
     [realpathSync(liveRepo), 'deny'],
     [realpathSync(stateDir), 'deny'],
+    [realpathSync(process.execPath), 'read'],
+    [realpathSync(trustedToolDirectory), 'read'],
     [realpathSync(rootRepo), 'write'],
     [realpathSync(isolatedHome), 'write'],
   ])
   const filesystemToml = [...filesystem]
     .map(([path, access]) => `${JSON.stringify(path)}=${JSON.stringify(access)}`)
     .join(',')
-  const codexBin = process.env.ZEROKUN_CODEX_BIN ?? 'codex'
   const candidateEnvironment = buildCandidateEnvironment(isolatedHome)
+  candidateEnvironment.PATH = updaterTrustedToolPath(trustedToolDirectory)
   const permissionOverrides = [
     `permissions.${profile}.filesystem={${filesystemToml}}`,
     `permissions.${profile}.network.enabled=true`,
@@ -689,8 +989,10 @@ async function validateZero(
     'features.network_proxy=true',
     'features.apps=false',
     'features.plugins=false',
+    'shell_environment_policy.inherit="core"',
+    'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","*PROXY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
   ]
-  if (process.env.ZEROKUN_UPDATE_TESTING !== '1') {
+  if (!executionPolicy.skipCodexPermissionPreflight) {
     await assertEffectiveCodexPermissionConfig(
       codexBin, rootRepo, permissionOverrides, profile, candidateEnvironment,
     )
@@ -704,11 +1006,16 @@ async function validateZero(
     '-P', profile,
     '--include-managed-config',
     '--',
-    'bash', verifyScript,
+    '/usr/bin/env', 'ZERO_CODEX_CANDIDATE_SANDBOX=1',
+    '/bin/bash', verifyScript, '--candidate-sandbox',
   ], {
     cwd: rootRepo,
     inherit: true,
     signal,
+    timeoutMs: timeoutFromEnvironment(
+      'ZEROKUN_UPDATE_VERIFY_TIMEOUT_MS',
+      DEFAULT_VERIFY_TIMEOUT_MS,
+    ),
     env: candidateEnvironment,
   })
 }
@@ -757,7 +1064,7 @@ function trackedProcessCommand(pid: number): string {
 }
 
 function matchingPids(pattern: string): number[] {
-  const found = command(['pgrep', '-f', pattern])
+  const found = command(['/usr/bin/pgrep', '-f', pattern])
   if (found.exitCode !== 0 || !found.stdout) return []
   return found.stdout
     .split(/\s+/)
@@ -826,6 +1133,7 @@ export async function startBotInTmux(options: {
   startupTimeoutMs?: number
   tmuxPath?: string
   replaceTokenFile?: string
+  legacyCutover?: boolean
 }): Promise<number> {
   const tmux = options.tmuxPath ?? resolveTmuxPath()
   const sessionName = options.sessionName ?? 'zerokun-slack'
@@ -840,14 +1148,22 @@ export async function startBotInTmux(options: {
   const release = command(['git', 'rev-parse', 'HEAD'], { cwd: options.rootRepo }).stdout || 'unknown'
   ensureManagedDirectory(stateDir, dirname(replaceTokenFile))
   atomicWritePrivateFile(replaceTokenFile, replaceToken)
+  const launchEnvironment = {
+    ...buildRuntimeServiceEnvironment(),
+    ZEROKUN_JOB_DB: resolveZeroJobDatabasePath(stateDir),
+    ZEROKUN_REPLACE: '1',
+    ZEROKUN_UPDATE_RESTART: '1',
+    ZEROKUN_LEGACY_CUTOVER: (options.legacyCutover
+      ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1') ? '1' : '0',
+    ZEROKUN_STATE_DIR: stateDir,
+    ZEROKUN_PROJECT_DIR: options.projectDir,
+    ZEROKUN_REPLACE_TOKEN: replaceToken,
+    ZEROKUN_REPLACE_TOKEN_FILE: replaceTokenFile,
+    ZEROKUN_RELEASE_COMMIT: release,
+  }
   const launchCommand = [
-    'exec /usr/bin/env ZEROKUN_REPLACE=1',
-    'ZEROKUN_UPDATE_RESTART=1',
-    `ZEROKUN_STATE_DIR=${shellQuote(stateDir)}`,
-    `ZEROKUN_PROJECT_DIR=${shellQuote(options.projectDir)}`,
-    `ZEROKUN_REPLACE_TOKEN=${shellQuote(replaceToken)}`,
-    `ZEROKUN_REPLACE_TOKEN_FILE=${shellQuote(replaceTokenFile)}`,
-    `ZEROKUN_RELEASE_COMMIT=${shellQuote(release)}`,
+    'exec /usr/bin/env -i',
+    ...Object.entries(launchEnvironment).map(([key, value]) => `${key}=${shellQuote(value)}`),
     shellQuote(launcher),
     shellQuote(options.projectDir),
   ].join(' ')
@@ -862,6 +1178,8 @@ export async function startBotInTmux(options: {
     '120',
     '-y',
     '40',
+    '-c',
+    stateDir,
     launchCommand,
   ])
 
@@ -874,6 +1192,8 @@ export async function startBotInTmux(options: {
       sessionName,
       [
         shellQuote(process.execPath),
+        '--config=/dev/null',
+        '--no-env-file',
         shellQuote(join(options.rootRepo, 'zerokun', 'safe-log-sink.ts')),
         shellQuote(stateDir),
         shellQuote(options.logPath),
@@ -1008,8 +1328,8 @@ async function rollbackUpdate(
   await stopServices(stateDir)
   assertRollbackState()
   requireCommand(['git', 'reset', '--hard', journal.originalHead], { cwd: journal.repoPath })
-  restoreDatabase(journal)
-  await requireCommandAsync(['bash', journal.setupScript], {
+  restoreRollbackDatabase(journal)
+  await requireCommandAsync(['/bin/bash', journal.setupScript], {
     cwd: journal.repoPath,
     inherit: !options.testing,
     env: {
@@ -1017,6 +1337,10 @@ async function rollbackUpdate(
       ZEROKUN_STATE_DIR: stateDir,
       ZEROKUN_UPDATE_IN_PROGRESS: '1',
     },
+    timeoutMs: timeoutFromEnvironment(
+      'ZEROKUN_UPDATE_SETUP_TIMEOUT_MS',
+      DEFAULT_SETUP_TIMEOUT_MS,
+    ),
   })
   if (options.restart) {
     await restartServices(journal.repoPath, stateDir, journal.projectDir)
@@ -1025,9 +1349,8 @@ async function rollbackUpdate(
   output('✅ 旧Codex版へのロールバック完了')
 }
 
-async function main(): Promise<void> {
-  const args = new Set(process.argv.slice(2))
-  const testing = process.env.ZEROKUN_UPDATE_TESTING === '1'
+async function main(testing = false, argv = process.argv.slice(2)): Promise<void> {
+  const args = new Set(argv)
   const skipTests = args.has('--skip-tests')
   const noRestart = args.has('--no-restart')
   const recoverOnly = args.has('--recover-only')
@@ -1039,7 +1362,9 @@ async function main(): Promise<void> {
   if (unknown.length > 0) fail(`不明なオプション: ${unknown.join(', ')}`)
 
   const rootRepo = resolveRootRepo()
-  const stateDir = resolveZeroStateDir()
+  // Use one physical state identity for journals, DB snapshots, candidate
+  // setup, restart, and crash recovery even when an ancestor is a symlink.
+  const stateDir = prepareManagedStateRoot(resolveZeroStateDir())
   const projectDir = process.env.ZEROKUN_PROJECT_DIR
     ?? rootRepo
   const setupScript = process.env.ZEROKUN_SETUP_SCRIPT ?? join(rootRepo, 'zerokun', 'setup.sh')
@@ -1048,7 +1373,7 @@ async function main(): Promise<void> {
   if (!existsSync(projectDir)) fail(`作業ディレクトリがありません: ${projectDir}`)
   if (!existsSync(setupScript)) fail(`setup.shがありません: ${setupScript}`)
 
-  const branch = process.env.ZEROKUN_UPDATE_BRANCH ?? 'codex'
+  const branch = process.env.ZEROKUN_UPDATE_BRANCH ?? 'main'
   const repositories: Repository[] = [{ label: 'zero-codex', path: rootRepo, branch }]
 
   const updateLock = acquireUpdateLock(stateDir)
@@ -1092,7 +1417,7 @@ async function main(): Promise<void> {
     )
     throwIfInterrupted()
     output(`▶ Codex版リポを事前検査 (${branch})`)
-    const pinnedRepositories = preflightRepositories(repositories)
+    const pinnedRepositories = await preflightRepositories(repositories, controller.signal)
     throwIfInterrupted()
     if (!skipTests) {
       output('▶ 候補commitを一時worktreeで検証')
@@ -1140,7 +1465,7 @@ async function main(): Promise<void> {
       writeJournal(stateDir, journal)
       throwIfInterrupted()
       output('▶ setupを反映')
-      await requireCommandAsync(['bash', setupScript], {
+      await requireCommandAsync(['/bin/bash', setupScript], {
         cwd: rootRepo,
         inherit: !testing,
         env: {
@@ -1149,6 +1474,10 @@ async function main(): Promise<void> {
           ZEROKUN_UPDATE_IN_PROGRESS: '1',
         },
         signal: controller.signal,
+        timeoutMs: timeoutFromEnvironment(
+          'ZEROKUN_UPDATE_SETUP_TIMEOUT_MS',
+          DEFAULT_SETUP_TIMEOUT_MS,
+        ),
       })
       assertRepositoryClean(repositories[0]!)
       journal = { ...journal, phase: 'setup-applied' }
@@ -1179,8 +1508,12 @@ async function main(): Promise<void> {
   }
 }
 
+export async function runUpdateForTests(argv = process.argv.slice(1)): Promise<void> {
+  await withUpdateTestPolicy(() => main(true, argv))
+}
+
 if (import.meta.main) {
-  main().catch(error => {
+  main(false).catch(error => {
     process.stderr.write(`❌ ${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
   })

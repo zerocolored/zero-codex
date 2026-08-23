@@ -1,7 +1,7 @@
 # Zero-kun for Codex
 
 Slack の DM・メンションをローカルの Codex CLI へ安全に渡す、macOS 向けの常駐ゲートウェイです。
-この `codex` ブランチは Claude Code を起動しません。必要なのは Codex CLI のログインです。
+この `zero-codex` リポジトリは Claude Code を起動しません。必要なのは Codex CLI のログインです。
 
 ## 仕組み
 
@@ -43,32 +43,47 @@ Claude Code、Claude のログイン、Claude channel/MCP、Anthropic API key �
 
 ## セットアップ
 
-既に clone 済みなら:
+`zero-codex` を既に clone 済みなら:
 
 ```bash
-git switch codex
+git switch main
 bash zerokun/setup.sh
 codex login status
 ```
 
-Claude版から切り替える場合、`setup.sh` は旧runnerの新規claimを止め、稼働を確認できる実行中jobを
-drainして旧Claude親process・runner・gatewayを終了します。待機jobはClaude sessionを捨ててCodex
-queueへ引き継ぎます。旧runner停止後も`running`だった不確実なjobは二重実行せずfailed通知にし、
-内容を確認して再送するよう求めます。
+別PCのClaude版と比較する場合は、旧PCと既存Slack Appをそのまま残し、このPCでは
+`zero-codex`、`~/.codex/zerokun`、新しいSlack Appを使います。旧Appの`xapp-`/`xoxb-`
+tokenをこのPCへコピーしないでください。同一PCでClaude版とCodex版を同時稼働させる構成は
+サポートしません。
+
+同一PCのClaude版を完全に置き換える場合だけ、旧 `zero` cloneを残したまま`zero-codex`を
+別directoryへcloneし、旧stateを明示してsetupします。
+
+```bash
+ZEROKUN_LEGACY_CUTOVER=1 \
+ZEROKUN_STATE_DIR="$HOME/.claude/channels/slack" \
+bash zerokun/setup.sh
+```
+
+この明示的なcutoverでは旧runnerをdrainして停止し、待機jobをCodex queueへ引き継ぎます。
 
 新しい Mac へ一式入れる場合:
 
 ```bash
-bootstrap_path="$(mktemp "${TMPDIR:-/tmp}/zerokun-bootstrap.XXXXXX")"
-curl --fail --location --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/zerocolored/zero/codex/zerokun/bootstrap-macos.sh \
-  --output "$bootstrap_path"
+bootstrap_dir="$(/usr/bin/mktemp -d /tmp/zerokun-bootstrap.XXXXXX)"
+/bin/chmod 700 "$bootstrap_dir"
+bootstrap_path="$bootstrap_dir/bootstrap-macos.sh"
+/usr/bin/env -i PATH=/usr/bin:/bin TMPDIR=/tmp \
+  /usr/bin/curl -q --fail --location --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --noproxy '*' --output "$bootstrap_path" \
+    https://raw.githubusercontent.com/zerocolored/zero-codex/main/zerokun/bootstrap-macos.sh
 bash "$bootstrap_path" --with-slack
-rm -f "$bootstrap_path"
+/bin/rm -f "$bootstrap_path"
+/bin/rmdir "$bootstrap_dir"
 ```
 
-先にファイルを保存するため、実行前に内容を確認できます。既に clone 済みなら、その repository で
-`git switch codex` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使えます。
+先にファイルを保存するため、実行前に内容を確認できます。既に `zero-codex` をclone済みなら、その repository で
+`git switch main` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使えます。
 
 bootstrapはZero-kun本体とは別の`zerokun-workspace` Git repositoryを既定projectとして作ります。
 既存projectを使う場合は`--project-dir /absolute/path/to/project`を指定してください。
@@ -80,8 +95,9 @@ Zero-kun本体はhost runtimeなので、そこを対象にしたSlack write job
 
 ### Slack App
 
-推奨は [`zerokun/templates/slack-app-manifest.yaml`](zerokun/templates/slack-app-manifest.yaml)
-を Slack の **Create New App → From a manifest** へ貼る方法です。その後:
+推奨はこのPCのCodex版専用に新しいSlack Appを作ることです。
+[`zerokun/templates/slack-app-manifest.yaml`](zerokun/templates/slack-app-manifest.yaml)
+を Slack の **Create New App → From a manifest** へ貼り、その後:
 
 1. App-Level Token に `connections:write` を付け、`xapp-...` を取得する。
 2. Workspace へ Install し、Bot User OAuth Token `xoxb-...` を取得する。
@@ -96,11 +112,9 @@ SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 ```
 
-新規環境の既定stateは `~/.codex/zerokun` です。旧版の
-`~/.claude/channels/slack` に `.env` / `access.json` / `jobs.sqlite3` のいずれかがある
-設定済み環境では、token・access・queueを安全に引き継ぐためそのdirectoryを自動選択します。
-空directoryは移行対象にしません。明示する場合はgateway、runner、管理コマンドで同じ
-`ZEROKUN_STATE_DIR` を設定してください。
+既定stateは常に `~/.codex/zerokun` です。旧版の`~/.claude/channels/slack`は
+自動選択せず、token・access・queue・routesを暗黙に流用しません。in-place cutover時だけ
+`ZEROKUN_LEGACY_CUTOVER=1`と`ZEROKUN_STATE_DIR`の両方で旧stateを明示してください。
 
 ## Access 設定
 
@@ -139,8 +153,8 @@ zerokun-status
 zerokun-jobs status
 ```
 
-`zerokun` は永続 job runner を起動してから Slack gateway を前景で起動します。gateway は
-`Ctrl-C` で停止しますが、runner は未処理 queue のため常駐します。macOS の watchdog が
+`zerokun` は永続 job runner を独立process groupへ起動してから Slack gateway を前景で起動します。gateway は
+`Ctrl-C` で停止しますが、runner はそのsignalを受けず未処理 queue のため常駐します。macOS の watchdog が
 60秒ごとに両方を確認します。
 
 更新:
@@ -149,11 +163,13 @@ zerokun-jobs status
 zerokun-update
 ```
 
-更新対象は `origin/codex` の fast-forward のみです。未コミット変更や未 push の local commit
+更新対象は `origin/main` の fast-forward のみです。未コミット変更や未 push の local commit
 がある場合は停止します。書込み許可済みの利用者は Slack で「ゼロくんを更新して」と依頼でき、
 通常 FIFO の外にある detached updater が自己デッドロックを避けて実行します。
-remoteの候補commitは隔離cloneをCodex sandbox内でtest/buildしてからlive branchをfast-forwardします。
-更新元は`https://github.com/zerocolored/zero(.git)`だけで、local Git configは安全なallowlist外の
+remoteの候補commitは隔離cloneをCodex sandbox内でsandbox-safe contract test・型検査・build・shell検査してから
+live branchをfast-forwardします。macOSはsandboxの入れ子を拒否するため、実Codex sandbox・tmux・process制御を
+使うintegration testは通常の`verify.sh`と公開CIで全件実行し、候補sandbox内では再実行しません。
+更新元は`https://github.com/zerocolored/zero-codex(.git)`だけで、local Git configは安全なallowlist外の
 helper・include・HTTP/credential設定があれば実行前に停止します。
 停止前に更新journalとSQLiteの整合snapshotを作成し、setupまたは再起動後の接続確認に失敗した場合は
 旧commit・旧DB・旧serviceへ自動rollbackします。強制終了でjournalが残った場合も次回起動前に
@@ -197,7 +213,7 @@ DM は launcher に渡した project directory、チャンネルは route の di
   write jobのcommand networkはproxyを通し、Slack関連domainだけは常に拒否します。
 - 添付と成果物は50MBまでです。成果物はjob専用 `outbox/<job-id>/` 直下のregular fileをrunner専用
   sealed領域へ移してから上限付きFDで読み、任意path・symlink・device/FIFOを拒否します。
-- terminal通知と成果物単位のdelivery checkpointはSQLiteへ保存します。checkpoint確定済みの成果物は再送しませんが、Slack upload成功直後・checkpoint確定前のprocess crashでは同じfileが再uploadされる可能性があるat-least-once配送です。
+- terminal本文と成果物単位のdelivery checkpointはSQLiteへ別々に保存します。本文成功後に添付だけ失敗しても本文は再投稿しません。成果物は指数backoffで5回試し、なお失敗する場合は打切り通知を1回投稿します。checkpoint確定済みの成果物は再送しませんが、Slack upload成功直後・checkpoint確定前のprocess crashでは同じfileが再uploadされる可能性があるat-least-once配送です。空fileは添付しません。
 - Codex stdout/stderr logは各20MBを上限にし、解析用memoryは各1MBのtailに制限します。
 - 完了jobは通知と成果物の配送checkpointが全て確定した後だけretention対象になります。既定30日で
   job固有fileをGCし、Slack再配送を防ぐidempotency tombstoneは既定10年保持します。runtime logも
@@ -208,10 +224,11 @@ DM は launcher に渡した project directory、チャンネルは route の di
 
 - `server.ts`: Slack Socket Mode、access gate、添付取得、durable enqueue、履歴回収
 - `zerokun/job-runner.ts`: SQLite queue、session/thread 所有権、Slack 完了通知
+- `zerokun/runner-launcher.ts`: runnerの独立process group起動、安全なlog接続
 - `zerokun/codex-executor.ts`: Codex CLI 実行、JSONL/session解析、sandbox分離
 - `zerokun/access.ts`: pairing・受信権限・書込み権限の管理 CLI
 - `codex-channel.sh`: standalone gateway と runner の launcher
-- `zerokun/update.ts`: `codex` ブランチ用の安全な自己更新
+- `zerokun/update.ts`: `main` ブランチ用の安全な自己更新
 - `zerokun/watchdog.sh`: bridge/runner の状態監視
 
 ## 開発時の検証
@@ -221,7 +238,7 @@ bun install
 bun run verify
 ```
 
-`verify` は型検査、全test、build、shell構文検査を実行します。同じ検証を
+`verify` は型検査、全test、build、shell構文検査を実行します。同じ完全検証を
 `.github/workflows/codex.yml` がmacOSで実行します。実際のSlack接続には有効な
 `xoxb-` / `xapp-` tokenが必要です。テストsuiteはtokenや外部Slack workspaceを変更しません。
 

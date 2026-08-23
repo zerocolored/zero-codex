@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
-  rmSync, statSync, symlinkSync, writeFileSync,
+  realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -36,6 +36,7 @@ describe('Zero-kun watchdog', () => {
     )
     expect(plist).toContain('<string>__STATE_DIR__/watchdog.sh</string>')
     expect(plist).toContain('<key>ZEROKUN_STATE_DIR</key>')
+    expect(plist).toContain('<key>ZEROKUN_LEGACY_CUTOVER</key>')
     expect(plist).toContain('<key>StartInterval</key>')
     expect(plist).toContain('<integer>60</integer>')
     expect(plist).toContain('<key>RunAtLoad</key>')
@@ -49,7 +50,145 @@ describe('Zero-kun watchdog', () => {
   })
 
   test('Slack API呼び出しは10秒でtimeoutする', () => {
-    expect(watchdogSource.match(/--max-time 10/g)?.length).toBe(2)
+    expect(watchdogSource.match(/--max-time 10/g)?.length).toBe(4)
+  })
+
+  test('Slack tokenをcurl argvや子process環境へ渡さない', () => {
+    expect(watchdogSource).toContain('unset SLACK_BOT_TOKEN SLACK_APP_TOKEN')
+    expect(watchdogSource).toContain('WATCHDOG_BOT_TOKEN=""')
+    expect(watchdogSource).toContain('WATCHDOG_APP_TOKEN=""')
+    expect(watchdogSource).toContain('WATCHDOG_BOT_TOKEN="${line#SLACK_BOT_TOKEN=}"')
+    expect(watchdogSource).toContain('WATCHDOG_APP_TOKEN="${line#SLACK_APP_TOKEN=}"')
+    expect(watchdogSource).toContain('export -n WATCHDOG_BOT_TOKEN')
+    expect(watchdogSource).not.toContain('export SLACK_BOT_TOKEN')
+    expect(watchdogSource).not.toContain('-H "Authorization: Bearer $SLACK_BOT_TOKEN"')
+    expect(watchdogSource.match(/-H @-/g)?.length).toBe(4)
+    expect(watchdogSource.match(/printf 'Authorization: Bearer %s\\n'/g)?.length).toBe(4)
+    expect(watchdogSource).toContain('CURL_BIN=/usr/bin/curl')
+    expect(watchdogSource.match(/"\$CURL_BIN" -q/g)?.length).toBe(4)
+    expect(watchdogSource.match(/--proxy '' --noproxy '\*'/g)?.length).toBe(4)
+
+    const state = mkdtempSync(join(tmpdir(), 'zerokun-watchdog-env-'))
+    try {
+      writeFileSync(join(state, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-state-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-A0123456789-state-not-a-real-token',
+        '',
+      ].join('\n'), { mode: 0o600 })
+      const result = Bun.spawnSync(['/bin/bash', watchdog, '--selftest-environment'], {
+        env: {
+          ...process.env,
+          ZEROKUN_STATE_DIR: state,
+          SLACK_BOT_TOKEN: 'xoxb-sentinel-not-a-real-token',
+          WATCHDOG_BOT_TOKEN: 'exported-parent-placeholder',
+          HTTPS_PROXY: 'http://user:password@proxy.invalid',
+          http_proxy: 'http://user:password@proxy.invalid',
+          CURL_CA_BUNDLE: '/tmp/untrusted-ca.pem',
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(result.stdout.toString()).toContain('watchdog environment selftest: PASS')
+      expect(result.stdout.toString()).not.toContain('xoxb-sentinel')
+    } finally {
+      rmSync(state, { recursive: true, force: true })
+    }
+  })
+
+  test('異なるSlack Appのtoken pairは通知curl境界で拒否する', () => {
+    const state = mkdtempSync(join(tmpdir(), 'zerokun-watchdog-identity-'))
+    const fakeCurl = join(state, 'fake-curl')
+    const curlLog = join(state, 'curl.log')
+    try {
+      writeFileSync(join(state, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-old-app-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-ANEWAPP123-abcdefghijklmnopqrstuvwxyz',
+        '',
+      ].join('\n'), { mode: 0o600 })
+      writeFileSync(fakeCurl, [
+        '#!/bin/bash',
+        '/bin/cat >/dev/null',
+        'printf \'%s\\n\' "$*" >> "$ZEROKUN_WATCHDOG_TEST_LOG"',
+        'case "$*" in',
+        '  *auth.test*) printf \'%s\\n\' \'{"ok":true,"app_id":"AOLDAPP123","bot_id":"BOLDAPP123"}\' ;;',
+        '  *) printf \'%s\\n\' \'{"ok":true}\' ;;',
+        'esac',
+        '',
+      ].join('\n'), { mode: 0o700 })
+      const result = Bun.spawnSync(['/bin/bash', watchdog, '--selftest-notification'], {
+        env: {
+          ...process.env,
+          ZEROKUN_STATE_DIR: state,
+          ZEROKUN_WATCHDOG_TEST_CURL: fakeCurl,
+          ZEROKUN_WATCHDOG_TEST_LOG: curlLog,
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr.toString()).toContain('identity mismatch')
+      const requests = readFileSync(curlLog, 'utf8')
+      expect(requests).toContain('auth.test')
+      expect(requests).not.toContain('conversations.open')
+      expect(requests).not.toContain('chat.postMessage')
+    } finally {
+      rmSync(state, { recursive: true, force: true })
+    }
+  })
+
+  test('symlink化された.claudeのlogical/physical pathをflagなしで採用しない', () => {
+    const home = mkdtempSync(join(tmpdir(), 'zerokun-watchdog-symlink-home-'))
+    const physicalClaude = join(home, 'config/claude-home')
+    const physicalLegacy = join(physicalClaude, 'channels/slack')
+    const codexState = join(home, '.codex/zerokun')
+    try {
+      mkdirSync(physicalLegacy, { recursive: true })
+      mkdirSync(codexState, { recursive: true })
+      symlinkSync(physicalClaude, join(home, '.claude'))
+      writeFileSync(join(physicalLegacy, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-old-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-AOLDAPP123-old-not-a-real-token',
+        '',
+      ].join('\n'))
+      writeFileSync(join(codexState, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-codex-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-ACODEXAPP123-codex-not-a-real-token',
+        '',
+      ].join('\n'))
+      for (const configured of [join(home, '.claude/channels/slack'), physicalLegacy]) {
+        const result = Bun.spawnSync(['/bin/bash', watchdog, '--selftest-environment'], {
+          env: {
+            ...process.env,
+            HOME: home,
+            ZEROKUN_STATE_DIR: configured,
+            ZEROKUN_LEGACY_CUTOVER: '0',
+          },
+          stdout: 'pipe', stderr: 'pipe',
+        })
+        expect(result.exitCode, result.stderr.toString()).toBe(0)
+        expect(result.stdout.toString()).toContain('watchdog environment selftest: PASS')
+        expect(result.stdout.toString()).toContain(`state=${codexState}`)
+      }
+      writeFileSync(
+        join(physicalLegacy, '.codex-legacy-cutover'),
+        `zerokun-codex-legacy-cutover-v1\n${realpathSync(physicalLegacy)}\n`,
+        { mode: 0o600 },
+      )
+      rmSync(join(home, '.claude'))
+      const established = Bun.spawnSync(['/bin/bash', watchdog, '--selftest-environment'], {
+        env: {
+          ...process.env,
+          HOME: home,
+          ZEROKUN_STATE_DIR: physicalLegacy,
+          ZEROKUN_LEGACY_CUTOVER: '0',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(established.exitCode, established.stderr.toString()).toBe(0)
+      expect(established.stdout.toString()).toContain(`state=${codexState}`)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
   })
 
   test('state root symlinkを拒否して外部directoryを変更しない', () => {
@@ -62,7 +201,7 @@ describe('Zero-kun watchdog', () => {
       writeFileSync(join(external, 'sentinel'), 'keep')
       symlinkSync(external, state)
       const result = Bun.spawnSync(['/bin/bash', watchdog], {
-        env: { ...process.env, SLACK_STATE_DIR: state, DRY_RUN: '1' },
+        env: { ...process.env, ZEROKUN_STATE_DIR: state, DRY_RUN: '1' },
         stdout: 'pipe', stderr: 'pipe',
       })
       expect(result.exitCode).not.toBe(0)
@@ -89,7 +228,7 @@ describe('Zero-kun watchdog', () => {
         if (kind === 'symlink') symlinkSync(external, legacyNext)
         else linkSync(external, legacyNext)
         const result = Bun.spawnSync(['/bin/bash', watchdog], {
-          env: { ...process.env, SLACK_STATE_DIR: state, DRY_RUN: '1' },
+          env: { ...process.env, ZEROKUN_STATE_DIR: state, DRY_RUN: '1' },
           stdout: 'pipe', stderr: 'pipe',
         })
         expect(result.exitCode, result.stderr.toString()).toBe(0)

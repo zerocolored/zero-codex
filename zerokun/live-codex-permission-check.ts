@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 /**
  * Authenticated acceptance check for the exact named-permission wiring used by

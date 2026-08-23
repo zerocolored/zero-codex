@@ -5,6 +5,18 @@ import { join } from 'path'
 const server = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
 
 describe('Slack bridge resilience wiring', () => {
+  test('Bot tokenとApp tokenのApp ID一致をSocket接続前に検証する', () => {
+    const verify = server.lastIndexOf('await verifySlackAppTokenPair(')
+    const start = server.lastIndexOf('await slackApp.start()')
+    const approvals = server.lastIndexOf('setInterval(checkApprovals')
+    const ready = server.lastIndexOf('writeGatewayReadiness(')
+    expect(verify).toBeGreaterThan(-1)
+    expect(verify).toBeLessThan(start)
+    expect(verify).toBeLessThan(approvals)
+    expect(start).toBeLessThan(approvals)
+    expect(start).toBeLessThan(ready)
+  })
+
   test('Slack接続後にchannelとDMの起動時catch-upを一度開始する', () => {
     expect(server).toContain('async function catchupSweep()')
     expect(server).toContain("types: 'im'")
@@ -157,7 +169,8 @@ describe('Slack bridge resilience wiring', () => {
   })
 
   test('Slack添付はarrayBufferへ全量展開せずstream中にも50MB上限を強制する', () => {
-    expect(server).toContain('response.body.getReader()')
+    expect(server).toContain('for await (const value of response)')
+    expect(server).toContain('response.destroy()')
     expect(server).toContain('received > MAX_ATTACHMENT_BYTES')
     expect(server).not.toContain('response.arrayBuffer()')
     expect(server).toContain("if (!/^\\d+\\.\\d+$/.test(messageTs))")

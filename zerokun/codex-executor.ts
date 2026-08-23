@@ -1027,6 +1027,8 @@ export async function executeCodexJob(
     )
     const proc = Bun.spawn([
       process.execPath,
+      '--config=/dev/null',
+      '--no-env-file',
       supervisor,
       job.id,
       registrationPath,

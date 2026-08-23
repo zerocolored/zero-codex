@@ -1,11 +1,20 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs'
+import {
+  existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+} from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
-  requestUpdate, resumePendingUpdateWorker, runUpdateWorker, withUpdateSlackDeadline,
+  executeUpdater, requestUpdate, resumePendingUpdateWorker, runUpdateWorker,
+  withUpdateSlackDeadline, withoutUpdateNotificationNetworkOverrides,
 } from './update-request'
-import { buildCandidateEnvironment, buildUpdaterEnvironment } from './child-environment'
+import {
+  applyStateEnvironment,
+  buildCandidateEnvironment,
+  buildRuntimeLaunchEnvironment,
+  buildRuntimeServiceEnvironment,
+  buildUpdaterEnvironment,
+} from './child-environment'
 
 const tempDirs: string[] = []
 
@@ -29,21 +38,107 @@ function input(messageId = '1787000000.000100') {
 }
 
 describe('Slack update request', () => {
+  test('stateやprojectのdotenvをtrusted updater processへ自動読込しない', async () => {
+    const stateDir = fixtureDir()
+    const probe = join(stateDir, 'dotenv-payload-ran')
+    const updater = join(stateDir, 'fake-updater.ts')
+    writeFileSync(join(stateDir, '.env'), [
+      `ZEROKUN_SETUP_SCRIPT=${probe}`,
+      'ZEROKUN_UPDATE_TESTING=1',
+      '',
+    ].join('\n'), { mode: 0o600 })
+    writeFileSync(join(stateDir, 'bunfig.toml'), '[run]\npreload = ["./preload.ts"]\n')
+    writeFileSync(
+      join(stateDir, 'preload.ts'),
+      `await Bun.write(${JSON.stringify(probe)}, 'unexpected bunfig preload\\n')\n`,
+    )
+    writeFileSync(updater, [
+      'if (process.env.ZEROKUN_SETUP_SCRIPT || process.env.ZEROKUN_UPDATE_TESTING) {',
+      `  await Bun.write(${JSON.stringify(probe)}, 'unexpected dotenv load\\n')`,
+      '}',
+      '',
+    ].join('\n'), { mode: 0o700 })
+    const exitCode = await executeUpdater(updater, join(stateDir, 'update.log'), 5_000, 500, {
+      HOME: stateDir,
+      PATH: process.env.PATH,
+      ZEROKUN_STATE_DIR: stateDir,
+    })
+    expect(exitCode).toBe(0)
+    expect(existsSync(probe)).toBe(false)
+  })
+
+  test('選択stateのSlack tokenをambient tokenより優先する', () => {
+    const environment: Record<string, string | undefined> = {
+      SLACK_BOT_TOKEN: 'xoxb-old-app-not-real',
+      SLACK_APP_TOKEN: 'xapp-old-app-not-real',
+      ZEROKUN_JOB_POLL_MS: '250',
+      ZEROKUN_UPDATE_TESTING: '1',
+      ZEROKUN_SLACK_IDENTITY_TEST_APP_ID: 'AOLDAPP123',
+      ZEROKUN_SETUP_TEST_STOP_PROBE: '/tmp/should-not-be-used',
+      HTTPS_PROXY: 'http://ambient-proxy.invalid',
+      NODE_TLS_REJECT_UNAUTHORIZED: '0',
+    }
+    applyStateEnvironment([
+      'SLACK_BOT_TOKEN=xoxb-new-app-not-real',
+      'SLACK_APP_TOKEN=xapp-1-ANEWAPP123-new-app-not-real',
+      'ZEROKUN_JOB_POLL_MS=500',
+      'HTTPS_PROXY=http://state-proxy.invalid',
+      'NODE_TLS_REJECT_UNAUTHORIZED=0',
+      'ZEROKUN_UPDATE_TESTING=1',
+      'ZEROKUN_SLACK_IDENTITY_TEST_APP_ID=AATTACKER1',
+      'ZEROKUN_SETUP_TEST_STOP_PROBE=/tmp/state-probe',
+      '',
+    ].join('\n'), environment)
+    expect(environment.SLACK_BOT_TOKEN).toBe('xoxb-new-app-not-real')
+    expect(environment.SLACK_APP_TOKEN).toBe('xapp-1-ANEWAPP123-new-app-not-real')
+    expect(environment.ZEROKUN_JOB_POLL_MS).toBe('250')
+    expect(environment.HTTPS_PROXY).toBeUndefined()
+    expect(environment.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined()
+    expect(environment.ZEROKUN_UPDATE_TESTING).toBeUndefined()
+    expect(environment.ZEROKUN_SLACK_IDENTITY_TEST_APP_ID).toBeUndefined()
+    expect(environment.ZEROKUN_SETUP_TEST_STOP_PROBE).toBeUndefined()
+
+    expect(() => applyStateEnvironment([
+      'SLACK_BOT_TOKEN=xoxb-valid-not-a-real-token',
+      'SLACK_APP_TOKEN=xapp-1-A0123456789-valid-not-a-real-token',
+      'SLACK_BOT_TOKEN=',
+      'SLACK_APP_TOKEN=',
+    ].join('\n'), environment)).toThrow('exactly one valid')
+    expect(environment.SLACK_BOT_TOKEN).toBeUndefined()
+    expect(environment.SLACK_APP_TOKEN).toBeUndefined()
+
+    applyStateEnvironment('', environment)
+    expect(environment.SLACK_BOT_TOKEN).toBeUndefined()
+    expect(environment.SLACK_APP_TOKEN).toBeUndefined()
+  })
   test('updaterとcandidateへSlack/GitHub/AWS credentialを継承しない', () => {
     const source = {
       PATH: '/usr/bin',
       HOME: '/Users/example',
       LANG: 'ja_JP.UTF-8',
       ZEROKUN_STATE_DIR: '/safe/state',
+      ZEROKUN_LEGACY_CUTOVER: '1',
+      ZEROKUN_JOB_DB: '/safe/state/jobs.sqlite3',
+      ZEROKUN_SETUP_SCRIPT: '/unsafe/stale-setup.sh',
+      HTTPS_PROXY: 'http://fake-user:fake-password@proxy.invalid:8080',
+      ALL_PROXY: 'socks5://fake-user:fake-password@proxy.invalid:1080',
+      NO_PROXY: 'localhost',
       SLACK_BOT_TOKEN: 'xoxb-secret',
       GH_TOKEN: 'github-secret',
       AWS_SECRET_ACCESS_KEY: 'aws-secret',
+      ZEROKUN_UPDATE_TESTING: '1',
     }
     const updater = buildUpdaterEnvironment(source)
     expect(updater).toEqual({
       PATH: '/usr/bin', HOME: '/Users/example', LANG: 'ja_JP.UTF-8',
       ZEROKUN_STATE_DIR: '/safe/state',
+      ZEROKUN_LEGACY_CUTOVER: '1',
+      ZEROKUN_SETUP_SCRIPT: '/unsafe/stale-setup.sh',
     })
+    expect(updater.HTTPS_PROXY).toBeUndefined()
+    expect(updater.ALL_PROXY).toBeUndefined()
+    expect(updater.NO_PROXY).toBeUndefined()
+    expect(updater.ZEROKUN_UPDATE_TESTING).toBeUndefined()
     const candidate = buildCandidateEnvironment('/isolated', source)
     expect(candidate.HOME).toBe('/isolated')
     expect(candidate.CODEX_HOME).toBe('/isolated')
@@ -51,6 +146,59 @@ describe('Slack update request', () => {
     expect(candidate.SLACK_BOT_TOKEN).toBeUndefined()
     expect(candidate.GH_TOKEN).toBeUndefined()
     expect(candidate.AWS_SECRET_ACCESS_KEY).toBeUndefined()
+    expect(candidate.HTTPS_PROXY).toBeUndefined()
+    expect(candidate.ALL_PROXY).toBeUndefined()
+    expect(candidate.NO_PROXY).toBeUndefined()
+    const runtime = buildRuntimeLaunchEnvironment(source)
+    expect(runtime).toEqual({ PATH: '/usr/bin', HOME: '/Users/example', LANG: 'ja_JP.UTF-8' })
+    const service = buildRuntimeServiceEnvironment(source)
+    expect(service.ZEROKUN_JOB_DB).toBeUndefined()
+    expect(service.ZEROKUN_SETUP_SCRIPT).toBeUndefined()
+  })
+
+  test('workerは選択stateとcutover flagをambient環境に頼らずupdaterへ固定する', async () => {
+    const stateDir = fixtureDir()
+    const projectDir = join(stateDir, 'project')
+    const updater = join(stateDir, 'recording-updater.ts')
+    writeFileSync(updater, [
+      "import { writeFileSync } from 'fs'",
+      "import { join } from 'path'",
+      "writeFileSync(join(process.env.ZEROKUN_STATE_DIR!, 'updater-environment.json'), JSON.stringify({",
+      '  stateDir: process.env.ZEROKUN_STATE_DIR,',
+      '  legacyCutover: process.env.ZEROKUN_LEGACY_CUTOVER,',
+      '  projectDir: process.env.ZEROKUN_PROJECT_DIR,',
+      '  jobDb: process.env.ZEROKUN_JOB_DB,',
+      '  slackToken: process.env.SLACK_BOT_TOKEN,',
+      '}))',
+      '',
+    ].join('\n'))
+    await requestUpdate(input(), {
+      stateDir,
+      idFactory: () => 'request-explicit-environment',
+      launchWorker: () => {},
+    })
+    const previousJobDb = process.env.ZEROKUN_JOB_DB
+    process.env.ZEROKUN_JOB_DB = join(stateDir, 'jobs.sqlite3')
+    try {
+      const result = await runUpdateWorker('request-explicit-environment', {
+        stateDir,
+        updaterPath: updater,
+        legacyCutover: true,
+        projectDir,
+        notify: async () => {},
+      })
+      expect(result).toEqual({ success: true, exitCode: 0, notificationSent: true })
+      expect(JSON.parse(readFileSync(join(stateDir, 'updater-environment.json'), 'utf8')))
+        .toEqual({
+          stateDir,
+          legacyCutover: '1',
+          projectDir,
+          jobDb: join(realpathSync(stateDir), 'jobs.sqlite3'),
+        })
+    } finally {
+      if (previousJobDb === undefined) delete process.env.ZEROKUN_JOB_DB
+      else process.env.ZEROKUN_JOB_DB = previousJobDb
+    }
   })
 
   test('Slack完了通知のnetwork hangをdeadlineで中断する', async () => {
@@ -58,6 +206,62 @@ describe('Slack update request', () => {
       () => new Promise<void>(() => {}),
       20,
     )).rejects.toThrow('Slack update notification timed out after 20ms')
+  })
+
+  test('Slack完了通知中だけproxyとcustom CAを環境から除外して復元する', async () => {
+    const previousProxy = process.env.HTTPS_PROXY
+    const previousCa = process.env.SSL_CERT_FILE
+    const previousTlsVerification = process.env.NODE_TLS_REJECT_UNAUTHORIZED
+    process.env.HTTPS_PROXY = 'http://user:password@proxy.invalid'
+    process.env.SSL_CERT_FILE = '/tmp/untrusted-ca.pem'
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+    try {
+      await withoutUpdateNotificationNetworkOverrides(async () => {
+        expect(process.env.HTTPS_PROXY).toBeUndefined()
+        expect(process.env.SSL_CERT_FILE).toBeUndefined()
+        expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined()
+      })
+      expect(process.env.HTTPS_PROXY).toBe('http://user:password@proxy.invalid')
+      expect(process.env.SSL_CERT_FILE).toBe('/tmp/untrusted-ca.pem')
+      expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBe('0')
+    } finally {
+      if (previousProxy === undefined) delete process.env.HTTPS_PROXY
+      else process.env.HTTPS_PROXY = previousProxy
+      if (previousCa === undefined) delete process.env.SSL_CERT_FILE
+      else process.env.SSL_CERT_FILE = previousCa
+      if (previousTlsVerification === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED
+      else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsVerification
+    }
+  })
+
+  test('更新workerはhangしたupdaterをdeadline後に停止して失敗outcomeを保存する', async () => {
+    const stateDir = fixtureDir()
+    const updater = join(stateDir, 'hanging-updater.ts')
+    writeFileSync(updater, [
+      "process.on('SIGTERM', () => {})",
+      'await Bun.sleep(30_000)',
+      '',
+    ].join('\n'))
+    await requestUpdate(input(), {
+      stateDir,
+      idFactory: () => 'request-timeout',
+      launchWorker: () => {},
+    })
+    const notifications: string[] = []
+    const startedAt = Date.now()
+    const result = await runUpdateWorker('request-timeout', {
+      stateDir,
+      updaterPath: updater,
+      updaterTimeoutMs: 50,
+      updaterTermGraceMs: 50,
+      notify: async (_request, text) => { notifications.push(text) },
+    })
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+    expect(result).toEqual({ success: false, exitCode: 1, notificationSent: true })
+    expect(notifications[0]).toContain('timeout')
+    const saved = JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8'))
+    expect(saved.outcome.success).toBe(false)
+    expect(saved.outcome.notifiedAt).toBeNumber()
   })
 
   test('未通知outcomeのworkerが終了していれば定期回復で再起動する', async () => {
@@ -147,24 +351,57 @@ describe('Slack update request', () => {
     expect(recovered.request.id).toBe('request-after-corruption')
   })
 
-  test('tmux workerへ切り離し、受付process終了後もworkerを生存させる', async () => {
+  test('tmux workerへstate/cutoverを固定して切り離し、受付process終了後も生存させる', async () => {
     const stateDir = fixtureDir()
     const tmux = Bun.spawnSync(['/usr/bin/which', 'tmux'], { stdout: 'pipe' })
     expect(tmux.exitCode).toBe(0)
-    const tmuxPath = new TextDecoder().decode(tmux.stdout).trim()
+    const realTmux = new TextDecoder().decode(tmux.stdout).trim()
+    const tmuxPath = join(stateDir, 'isolated-tmux')
+    const socket = `zerokun-update-worker-${process.pid}-${Date.now()}`
+    writeFileSync(
+      tmuxPath,
+      `#!/bin/bash\nexec ${JSON.stringify(realTmux)} -L ${JSON.stringify(socket)} "$@"\n`,
+      { mode: 0o700 },
+    )
     const session = `zerokun-update-worker-test-${process.pid}-${Date.now()}`
+    const keeper = `keeper-${session}`
     const workerFile = join(stateDir, 'fake-worker.ts')
     const updaterPath = join(stateDir, 'fake-updater.ts')
+    const projectDir = join(stateDir, 'project')
     writeFileSync(workerFile, [
       "import { writeFileSync } from 'fs'",
       "import { join } from 'path'",
       "const args = process.argv.slice(2)",
       "const stateIndex = args.indexOf('--state-dir')",
-      "writeFileSync(join(args[stateIndex + 1], 'worker-started'), args[1])",
+      "const cutoverIndex = args.indexOf('--legacy-cutover')",
+      "const projectIndex = args.indexOf('--project-dir')",
+      "writeFileSync(join(args[stateIndex + 1], 'worker-started'), JSON.stringify({",
+      '  requestId: args[1],',
+      '  stateDir: process.env.ZEROKUN_STATE_DIR,',
+      '  legacyCutover: process.env.ZEROKUN_LEGACY_CUTOVER,',
+      '  legacyCutoverArg: args[cutoverIndex + 1],',
+      '  projectDir: process.env.ZEROKUN_PROJECT_DIR,',
+      '  projectDirArg: args[projectIndex + 1],',
+      '  jobDb: process.env.ZEROKUN_JOB_DB,',
+      '  staleSetup: process.env.ZEROKUN_SETUP_SCRIPT,',
+      '  staleSlackToken: process.env.SLACK_BOT_TOKEN,',
+      '}))',
       'await Bun.sleep(30_000)',
       '',
     ].join('\n'))
     writeFileSync(updaterPath, '#!/usr/bin/env bun\n')
+    expect(Bun.spawnSync([tmuxPath, 'new-session', '-d', '-s', keeper, 'sleep 30']).exitCode).toBe(0)
+    expect(Bun.spawnSync([
+      tmuxPath, 'set-environment', '-g', 'ZEROKUN_JOB_DB', '/tmux/stale/jobs.sqlite3',
+    ]).exitCode).toBe(0)
+    expect(Bun.spawnSync([
+      tmuxPath, 'set-environment', '-g', 'ZEROKUN_SETUP_SCRIPT', '/tmux/stale/setup.sh',
+    ]).exitCode).toBe(0)
+    expect(Bun.spawnSync([
+      tmuxPath, 'set-environment', '-g', 'SLACK_BOT_TOKEN', 'xoxb-tmux-stale-not-real',
+    ]).exitCode).toBe(0)
+    const previousJobDb = process.env.ZEROKUN_JOB_DB
+    process.env.ZEROKUN_JOB_DB = join(stateDir, 'jobs.sqlite3')
 
     try {
       const result = await requestUpdate(input(), {
@@ -173,17 +410,29 @@ describe('Slack update request', () => {
         updaterPath,
         tmuxPath,
         tmuxSession: session,
+        legacyCutover: true,
+        projectDir,
         idFactory: () => 'request-detached',
       })
       expect(result.accepted).toBe(true)
       for (let attempt = 0; attempt < 40 && !existsSync(join(stateDir, 'worker-started')); attempt += 1) {
         await Bun.sleep(25)
       }
-      expect(readFileSync(join(stateDir, 'worker-started'), 'utf8')).toBe('request-detached')
+      expect(JSON.parse(readFileSync(join(stateDir, 'worker-started'), 'utf8'))).toEqual({
+        requestId: 'request-detached',
+        stateDir,
+        legacyCutover: '1',
+        legacyCutoverArg: '1',
+        projectDir,
+        projectDirArg: projectDir,
+        jobDb: join(realpathSync(stateDir), 'jobs.sqlite3'),
+      })
       const alive = Bun.spawnSync([tmuxPath, 'has-session', '-t', session])
       expect(alive.exitCode).toBe(0)
     } finally {
-      Bun.spawnSync([tmuxPath, 'kill-session', '-t', session])
+      Bun.spawnSync([tmuxPath, 'kill-server'])
+      if (previousJobDb === undefined) delete process.env.ZEROKUN_JOB_DB
+      else process.env.ZEROKUN_JOB_DB = previousJobDb
     }
   })
 

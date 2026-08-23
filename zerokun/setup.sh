@@ -3,10 +3,14 @@
 # 使い方: リポを clone した直後に `bash zerokun/setup.sh` を1回実行するだけ。
 # 既存の設定ファイル(.env / access.json 等)があるマシンでは上書きしない(再実行しても安全)。
 set -euo pipefail
+unset BUN_OPTIONS BUN_CONFIG_PRELOAD NODE_OPTIONS
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$REPO_DIR/zerokun/state-dir.sh"
 CH="$(zerokun_resolve_state_dir)"
+ZEROKUN_JOB_DB="$(zerokun_resolve_job_db "$CH")"
+export ZEROKUN_JOB_DB
+LEGACY_STATE_DIR="$HOME/.claude/channels/slack"
 TPL="$REPO_DIR/zerokun/templates"
 PROJECT_DIR="${ZEROKUN_PROJECT_DIR:-$(dirname "$REPO_DIR")/zerokun-workspace}"
 LAUNCHCTL_BIN="${ZEROKUN_LAUNCHCTL_BIN:-/bin/launchctl}"
@@ -14,13 +18,127 @@ LAUNCHCTL_BIN="${ZEROKUN_LAUNCHCTL_BIN:-/bin/launchctl}"
 
 echo "== ゼロくんセットアップ開始 (repo: $REPO_DIR)"
 
+# Cutoverは既存legacy stateへの明示操作だけに限定する。検査より先にdirectoryを
+# 作成すると、空の標準pathでもglobal Claude process停止へ進んでしまう。
+LEGACY_CUTOVER=0
+LEGACY_CUTOVER_INITIAL=0
+CUTOVER_MARKER="$CH/.codex-legacy-cutover"
+valid_cutover_marker() {
+  local metadata first second third lines physical
+  [ -f "$CUTOVER_MARKER" ] && [ ! -L "$CUTOVER_MARKER" ] || return 1
+  metadata="$(/usr/bin/stat -f '%u:%l' "$CUTOVER_MARKER" 2>/dev/null || true)"
+  [ "$metadata" = "$(/usr/bin/id -u):1" ] || return 1
+  physical="$(cd "$CH" 2>/dev/null && pwd -P)" || return 1
+  first="$(/usr/bin/sed -n '1p' "$CUTOVER_MARKER" 2>/dev/null)" || return 1
+  second="$(/usr/bin/sed -n '2p' "$CUTOVER_MARKER" 2>/dev/null)" || return 1
+  third="$(/usr/bin/sed -n '3p' "$CUTOVER_MARKER" 2>/dev/null)" || return 1
+  lines="$(/usr/bin/wc -l < "$CUTOVER_MARKER" 2>/dev/null | /usr/bin/tr -d '[:space:]')" \
+    || return 1
+  [ "$first" = "zerokun-codex-legacy-cutover-v1" ] \
+    && [ "$second" = "$physical" ] && [ -z "$third" ] && [ "$lines" = "2" ]
+}
+case "${ZEROKUN_LEGACY_CUTOVER:-0}" in
+  0) ;;
+  1)
+    if valid_cutover_marker; then
+      LEGACY_CUTOVER=1
+    else
+      [ -d "$LEGACY_STATE_DIR" ] && [ -d "$CH" ] || {
+        echo "❌ legacy cutover stateがありません: $LEGACY_STATE_DIR" >&2
+        exit 1
+      }
+      LEGACY_STATE_REAL="$(cd "$LEGACY_STATE_DIR" && pwd -P)"
+      SELECTED_STATE_REAL="$(cd "$CH" && pwd -P)"
+      [ "$SELECTED_STATE_REAL" = "$LEGACY_STATE_REAL" ] || {
+        echo "❌ ZEROKUN_LEGACY_CUTOVER=1にはlegacy stateを指定してください: $LEGACY_STATE_DIR" >&2
+        exit 1
+      }
+      LEGACY_CUTOVER=1
+      LEGACY_CUTOVER_INITIAL=1
+    fi
+    LEGACY_ENV="$CH/.env"
+    LEGACY_ENV_METADATA="$(/usr/bin/stat -f '%u:%l' "$LEGACY_ENV" 2>/dev/null || true)"
+    if [ ! -f "$LEGACY_ENV" ] || [ -L "$LEGACY_ENV" ] || [ ! -s "$LEGACY_ENV" ] \
+      || [ "$LEGACY_ENV_METADATA" != "$(/usr/bin/id -u):1" ] \
+      || [ "$(/usr/bin/grep -Ec '^SLACK_BOT_TOKEN=' "$LEGACY_ENV" || true)" != "1" ] \
+      || [ "$(/usr/bin/grep -Ec '^SLACK_APP_TOKEN=' "$LEGACY_ENV" || true)" != "1" ] \
+      || ! /usr/bin/grep -Eq '^SLACK_BOT_TOKEN=xoxb-[A-Za-z0-9._-]{10,}$' "$LEGACY_ENV" \
+      || ! /usr/bin/grep -Eq '^SLACK_APP_TOKEN=xapp-[A-Za-z0-9._-]{10,}$' "$LEGACY_ENV"; then
+      echo "❌ legacy cutover stateに有効なSlack App token設定がありません: $LEGACY_STATE_DIR" >&2
+      exit 1
+    fi
+    ;;
+  *) echo "❌ ZEROKUN_LEGACY_CUTOVERは0または1で指定してください" >&2; exit 1 ;;
+esac
+
 # 0. 依存確認
 command -v bun >/dev/null 2>&1 || { echo "❌ bun がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 zerokun_require_codex_version || exit 1
-bun "$REPO_DIR/zerokun/codex-executor.ts" verify-system-config || exit 1
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" verify-system-config || exit 1
 command -v git >/dev/null 2>&1 || { echo "❌ git がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 command -v tmux >/dev/null 2>&1 || { echo "❌ tmux がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
-(cd "$REPO_DIR" && bun install --frozen-lockfile --silent)
+BUN_BIN="$(command -v bun)"
+INSTALL_ENV_ROOT="$(/usr/bin/mktemp -d /tmp/zerokun-bun-install.XXXXXX)" \
+  || { echo "❌ dependency install用一時directoryを作成できません" >&2; exit 1; }
+/bin/chmod 0700 "$INSTALL_ENV_ROOT"
+/bin/mkdir "$INSTALL_ENV_ROOT/home" "$INSTALL_ENV_ROOT/curl" \
+  "$INSTALL_ENV_ROOT/xdg-config" "$INSTALL_ENV_ROOT/xdg-cache" "$INSTALL_ENV_ROOT/bun-cache"
+/bin/chmod 0700 "$INSTALL_ENV_ROOT/home" "$INSTALL_ENV_ROOT/curl" \
+  "$INSTALL_ENV_ROOT/xdg-config" "$INSTALL_ENV_ROOT/xdg-cache" "$INSTALL_ENV_ROOT/bun-cache"
+INSTALL_STATUS=0
+(cd "$REPO_DIR" && /usr/bin/env -i \
+  HOME="$INSTALL_ENV_ROOT/home" USER="$(/usr/bin/id -un)" LOGNAME="$(/usr/bin/id -un)" \
+  SHELL="${SHELL:-/bin/zsh}" TERM="${TERM:-dumb}" \
+  PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+  TMPDIR=/tmp CURL_HOME="$INSTALL_ENV_ROOT/curl" \
+  XDG_CONFIG_HOME="$INSTALL_ENV_ROOT/xdg-config" XDG_CACHE_HOME="$INSTALL_ENV_ROOT/xdg-cache" \
+  BUN_INSTALL_CACHE_DIR="$INSTALL_ENV_ROOT/bun-cache" \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+  GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false \
+  "$BUN_BIN" --config=/dev/null --no-env-file install --frozen-lockfile --silent) \
+  || INSTALL_STATUS=$?
+/bin/rm -rf "$INSTALL_ENV_ROOT"
+[ "$INSTALL_STATUS" = "0" ] || { echo "❌ dependency installに失敗しました" >&2; exit "$INSTALL_STATUS"; }
+unset INSTALL_ENV_ROOT INSTALL_STATUS
+
+# Any configured state must prove that its Bot/App tokens belong to one Slack
+# App before setup can reach a process-stop boundary. A newly generated
+# placeholder file is the sole unconfigured exception.
+VERIFY_SLACK_IDENTITY=0
+if [ "$LEGACY_CUTOVER_INITIAL" = "1" ]; then
+  VERIFY_SLACK_IDENTITY=1
+elif [ -e "$CH/.env" ] || [ -L "$CH/.env" ]; then
+  STATE_ENV_CONTENT="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$CH/.env")" \
+    || { echo "❌ 既存Slack設定を安全に読み取れないためprocessは停止しません" >&2; exit 1; }
+  BOT_ASSIGNMENTS=0
+  APP_ASSIGNMENTS=0
+  BOT_PLACEHOLDERS=0
+  APP_PLACEHOLDERS=0
+  while IFS= read -r state_env_line; do
+    case "$state_env_line" in
+      SLACK_BOT_TOKEN=*) BOT_ASSIGNMENTS=$((BOT_ASSIGNMENTS + 1)) ;;
+    esac
+    case "$state_env_line" in
+      SLACK_APP_TOKEN=*) APP_ASSIGNMENTS=$((APP_ASSIGNMENTS + 1)) ;;
+    esac
+    [ "$state_env_line" != 'SLACK_BOT_TOKEN=xoxb-ここに貼る' ] \
+      || BOT_PLACEHOLDERS=$((BOT_PLACEHOLDERS + 1))
+    [ "$state_env_line" != 'SLACK_APP_TOKEN=xapp-ここに貼る' ] \
+      || APP_PLACEHOLDERS=$((APP_PLACEHOLDERS + 1))
+  done <<< "$STATE_ENV_CONTENT"
+  unset STATE_ENV_CONTENT state_env_line
+  if [ "$BOT_ASSIGNMENTS" != "1" ] || [ "$APP_ASSIGNMENTS" != "1" ] \
+    || [ "$BOT_PLACEHOLDERS" != "1" ] || [ "$APP_PLACEHOLDERS" != "1" ]; then
+    VERIFY_SLACK_IDENTITY=1
+  fi
+fi
+if [ "$VERIFY_SLACK_IDENTITY" = "1" ]; then
+  BUN_BIN="$(command -v bun)"
+  IDENTITY_ENV=(/usr/bin/env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}")
+  "${IDENTITY_ENV[@]}" "$BUN_BIN" --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-identity.ts" \
+    verify-file "$CH/.env" \
+    || { echo "❌ setup前にSlack App token identityを検証できないためprocessは停止しません" >&2; exit 1; }
+fi
 mkdir -p "$PROJECT_DIR"
 [ "$(cd "$PROJECT_DIR" && pwd -P)" != "$(cd "$REPO_DIR" && pwd -P)" ] \
   || { echo "❌ Slack作業projectはZero-kun本体と別directoryにしてください" >&2; exit 1; }
@@ -31,8 +149,9 @@ fi
 
 # 1. 設定ディレクトリ。既存rootはowner/symlinkを検査してから0700へ直す。
 mkdir -p "$CH"
-bun "$REPO_DIR/zerokun/managed-path.ts" prepare-root "$CH" >/dev/null
-bun "$REPO_DIR/zerokun/managed-path.ts" prepare-directories \
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare-root "$CH" >/dev/null
+CH="$(cd "$CH" && pwd -P)"
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare-directories \
   "$CH" "$CH/inbox" "$CH/approved" "$CH/update.lock" "$CH/job-runner.lock"
 
 # Claude版daemonが新しいCodex jobをclaimしないよう、cutover中はclaimを止める。
@@ -46,14 +165,14 @@ cleanup_setup_lock() {
   [ -z "$WATCHDOG_PLIST_TMP" ] || rm -f -- "$WATCHDOG_PLIST_TMP"
   [ -z "$ZSHRC_TMP" ] || rm -f -- "$ZSHRC_TMP"
   if [ "$SETUP_OWNS_LOCK" = "1" ]; then
-    bun "$REPO_DIR/zerokun/process-lock.ts" release "$SETUP_LOCK/pid" "$$" || true
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" release "$SETUP_LOCK/pid" "$$" || true
   fi
 }
 trap cleanup_setup_lock EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 LOCK_OWNER=""
-if LOCK_OWNER="$(bun "$REPO_DIR/zerokun/process-lock.ts" acquire "$SETUP_LOCK/pid" "$$")"; then
+if LOCK_OWNER="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" acquire "$SETUP_LOCK/pid" "$$")"; then
   SETUP_OWNS_LOCK=1
 else
   if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" != "1" ]; then
@@ -71,7 +190,7 @@ process_matches() {
 lock_process_matches() {
   local lock_file="$1" pid="$2" pattern="$3"
   process_matches "$pid" "$pattern" || return 1
-  bun "$REPO_DIR/zerokun/process-identity-check.ts" "$lock_file" "$pid" "$pattern"
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-identity-check.ts" "$lock_file" "$pid" "$pattern"
 }
 
 pid_is_alive() {
@@ -85,29 +204,37 @@ read_lock_pid() {
   tr -d '[:space:]' < "$1" 2>/dev/null || true
 }
 
-# The legacy launcher execs Claude with this development-channel marker. Stop
-# only that exact Zero-kun parent so it cannot respawn the old Slack gateway.
-while IFS= read -r legacy_parent; do
-  [ -n "$legacy_parent" ] || continue
-  [ "$legacy_parent" != "$$" ] || continue
-  if process_matches "$legacy_parent" 'claude.*dangerously-load-development-channels[[:space:]]+server:slack-channel'; then
-    kill "$legacy_parent"
-    for _ in {1..150}; do
-      pid_is_alive "$legacy_parent" || break
-      sleep 0.2
-    done
-    pid_is_alive "$legacy_parent" && {
-      echo "❌ 旧Claude Zero-kun親process PID $legacy_parent が正常終了しません。" >&2
-      exit 1
-    }
-    echo "   旧Claude Zero-kun親processを停止しました"
-  fi
-done < <(pgrep -f 'claude.*dangerously-load-development-channels.*server:slack-channel' 2>/dev/null || true)
+# Validate the database and sidecars before the first process-stop boundary.
+# Opening/migrating the database is intentionally deferred until services stop.
+ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file \
+  "$REPO_DIR/zerokun/job-runner.ts" validate-storage >/dev/null \
+  || { echo "❌ SQLite stateが安全でないためprocessは停止しません。" >&2; exit 1; }
+
+# Explicitly selecting the legacy state is the opt-in in-place cutover path.
+# A normal Codex setup never scans for or stops Claude processes.
+if [ "$LEGACY_CUTOVER_INITIAL" = "1" ]; then
+  while IFS= read -r legacy_parent; do
+    [ -n "$legacy_parent" ] || continue
+    [ "$legacy_parent" != "$$" ] || continue
+    if process_matches "$legacy_parent" 'claude.*dangerously-load-development-channels[[:space:]]+server:slack-channel'; then
+      kill "$legacy_parent"
+      for _ in {1..150}; do
+        pid_is_alive "$legacy_parent" || break
+        sleep 0.2
+      done
+      pid_is_alive "$legacy_parent" && {
+        echo "❌ 旧Claude Zero-kun親process PID $legacy_parent が正常終了しません。" >&2
+        exit 1
+      }
+      echo "   旧Claude Zero-kun親processを停止しました"
+    fi
+  done < <(pgrep -f 'claude.*dangerously-load-development-channels.*server:slack-channel' 2>/dev/null || true)
+fi
 
 legacy_running_count() {
   local db="$CH/jobs.sqlite3"
   [ -f "$db" ] || { printf '0\n'; return; }
-  ZEROKUN_CUTOVER_DB="$db" bun -e '
+  ZEROKUN_CUTOVER_DB="$db" bun --config=/dev/null --no-env-file -e '
     import { Database } from "bun:sqlite";
     const db = new Database(process.env.ZEROKUN_CUTOVER_DB!, { readonly: true });
     try {
@@ -117,16 +244,29 @@ legacy_running_count() {
   '
 }
 
+GATEWAY_SCRIPT="$CH/server.ts"
+RUNNER_SCRIPT="$CH/job-runner.ts"
+if [ "$LEGACY_CUTOVER" = "1" ]; then
+  # Existing legacy processes were launched from the user-facing HOME path,
+  # which may differ from pwd -P on macOS (for example /var vs /private/var).
+  GATEWAY_SCRIPT="$LEGACY_STATE_DIR/server.ts"
+  RUNNER_SCRIPT="$LEGACY_STATE_DIR/job-runner.ts"
+fi
 GATEWAY_PID="$(read_lock_pid "$CH/plugin.lock")"
 if process_matches "$GATEWAY_PID" 'server\.ts'; then
   if ! lock_process_matches "$CH/plugin.lock" "$GATEWAY_PID" 'server\.ts'; then
-    bun "$REPO_DIR/zerokun/adopt-legacy-lock.ts" \
-      "$CH/plugin.lock" "$GATEWAY_PID" "$CH/server.ts" \
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/adopt-legacy-lock.ts" \
+      "$CH/plugin.lock" "$GATEWAY_PID" "$GATEWAY_SCRIPT" \
       || { echo "❌ gateway lock identityを検証できないため自動停止しません。" >&2; exit 1; }
     lock_process_matches "$CH/plugin.lock" "$GATEWAY_PID" 'server\.ts' \
       || { echo "❌ gateway lock identityの移行に失敗しました。" >&2; exit 1; }
   fi
-  kill "$GATEWAY_PID"
+  if pid_is_alive "$GATEWAY_PID"; then
+    lock_process_matches "$CH/plugin.lock" "$GATEWAY_PID" 'server\.ts' \
+      || { echo "❌ gateway identityが停止直前に変化したためsignalしません。" >&2; exit 1; }
+    kill "$GATEWAY_PID" \
+      || { pid_is_alive "$GATEWAY_PID" && { echo "❌ 旧gatewayへsignalできません。" >&2; exit 1; }; }
+  fi
   for _ in {1..150}; do
     pid_is_alive "$GATEWAY_PID" || break
     sleep 0.2
@@ -142,8 +282,8 @@ RUNNER_PID="$(read_lock_pid "$CH/job-runner.lock/pid")"
 if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)'; then
   if ! lock_process_matches "$CH/job-runner.lock/pid" "$RUNNER_PID" \
     'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)'; then
-    bun "$REPO_DIR/zerokun/adopt-legacy-lock.ts" \
-      "$CH/job-runner.lock/pid" "$RUNNER_PID" "$CH/job-runner.ts" daemon \
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/adopt-legacy-lock.ts" \
+      "$CH/job-runner.lock/pid" "$RUNNER_PID" "$RUNNER_SCRIPT" daemon \
       || { echo "❌ job runner lock identityを検証できないため自動停止しません。" >&2; exit 1; }
     lock_process_matches "$CH/job-runner.lock/pid" "$RUNNER_PID" \
       'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)' \
@@ -158,7 +298,13 @@ if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$
     echo "   旧runnerの実行中job完了を待っています..."
     sleep 2
   done
-  kill "$RUNNER_PID"
+  if pid_is_alive "$RUNNER_PID"; then
+    lock_process_matches "$CH/job-runner.lock/pid" "$RUNNER_PID" \
+      'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)' \
+      || { echo "❌ job runner identityがdrain中に変化したためsignalしません。" >&2; exit 1; }
+    kill "$RUNNER_PID" \
+      || { pid_is_alive "$RUNNER_PID" && { echo "❌ 旧runnerへsignalできません。" >&2; exit 1; }; }
+  fi
   for _ in {1..150}; do
     pid_is_alive "$RUNNER_PID" || break
     sleep 0.2
@@ -173,11 +319,17 @@ fi
 # Legacy rows are handled only after both legacy processes are gone. Queued rows
 # move to Codex; uncertain running rows fail closed and require an explicit resend.
 # Opening JobStore for status/server startup is deliberately non-destructive.
-ZEROKUN_STATE_DIR="$CH" bun "$REPO_DIR/zerokun/job-runner.ts" prepare-storage
-ZEROKUN_STATE_DIR="$CH" bun "$REPO_DIR/zerokun/job-runner.ts" migrate-legacy
+ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/job-runner.ts" prepare-storage
+if [ "$LEGACY_CUTOVER" = "1" ]; then
+  ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/job-runner.ts" migrate-legacy
+fi
+if [ "$LEGACY_CUTOVER_INITIAL" = "1" ]; then
+  printf '%s\n%s\n' 'zerokun-codex-legacy-cutover-v1' "$CH" \
+    | bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" atomic-write-private "$CUTOVER_MARKER"
+fi
 
 # 2. 設定ファイル(既存があれば触らない)
-bun "$REPO_DIR/zerokun/safe-file.ts" validate-existing "$CH/access.json" "$CH/.env"
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-existing "$CH/access.json" "$CH/.env"
 [ -f "$CH/access.json" ] || cp "$TPL/access.json.example" "$CH/access.json"
 [ ! -f "$CH/access.json" ] || chmod 600 "$CH/access.json"
 [ -f "$CH/.env" ] || { cp "$TPL/env.example" "$CH/.env"; chmod 600 "$CH/.env"; }
@@ -191,14 +343,16 @@ install -m 0600 "$REPO_DIR/zerokun/child-environment.ts" "$CH/child-environment.
 install -m 0600 "$REPO_DIR/zerokun/safe-file.ts" "$CH/safe-file.ts"
 install -m 0600 "$REPO_DIR/zerokun/managed-path.ts" "$CH/managed-path.ts"
 install -m 0600 "$REPO_DIR/zerokun/state-dir.ts" "$CH/state-dir.ts"
+install -m 0600 "$REPO_DIR/zerokun/slack-http.ts" "$CH/slack-http.ts"
+install -m 0600 "$REPO_DIR/zerokun/slack-app-identity.ts" "$CH/slack-app-identity.ts"
 install -m 0700 "$REPO_DIR/zerokun/watchdog.sh" "$CH/watchdog.sh"
 mkdir -p "$HOME/Library/LaunchAgents"
 WATCHDOG_PLIST="$HOME/Library/LaunchAgents/com.zerokun.watchdog.plist"
 if [ -e "$WATCHDOG_PLIST" ] || [ -L "$WATCHDOG_PLIST" ]; then
-  bun "$REPO_DIR/zerokun/safe-file.ts" validate-owned-regular "$WATCHDOG_PLIST"
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-owned-regular "$WATCHDOG_PLIST"
 fi
 WATCHDOG_PLIST_TMP="$(mktemp "$HOME/Library/LaunchAgents/.com.zerokun.watchdog.plist.XXXXXX")"
-sed "s|__STATE_DIR__|$CH|g" \
+sed -e "s|__STATE_DIR__|$CH|g" -e "s|__LEGACY_CUTOVER__|$LEGACY_CUTOVER|g" \
   "$TPL/com.zerokun.watchdog.plist.template" > "$WATCHDOG_PLIST_TMP"
 chmod 600 "$WATCHDOG_PLIST_TMP"
 mv -f -- "$WATCHDOG_PLIST_TMP" "$WATCHDOG_PLIST"
@@ -224,9 +378,11 @@ remove_owned_legacy_link() {
     rm -f "$legacy_path"
   fi
 }
-remove_owned_legacy_link "$HOME/.local/bin/claude-channel" "$REPO_DIR/claude-channel.sh"
-remove_owned_legacy_link "$HOME/.claude/skills/threads" "$REPO_DIR/skills/threads"
-remove_owned_legacy_link "$HOME/.claude/skills/zerokun-update" "$REPO_DIR/skills/zerokun-update"
+if [ "$LEGACY_CUTOVER" = "1" ]; then
+  remove_owned_legacy_link "$HOME/.local/bin/claude-channel" "$REPO_DIR/claude-channel.sh"
+  remove_owned_legacy_link "$HOME/.claude/skills/threads" "$REPO_DIR/skills/threads"
+  remove_owned_legacy_link "$HOME/.claude/skills/zerokun-update" "$REPO_DIR/skills/zerokun-update"
+fi
 echo "   SQLite job runner を設置しました(永続FIFO / 同時実行数1)"
 echo "   Slack更新リクエストworkerを設置しました"
 echo "   安全更新コマンドを設置しました: zerokun-update"
@@ -236,9 +392,9 @@ echo "   安全更新コマンドを設置しました: zerokun-update"
 ZSHRC="$HOME/.zshrc"
 ZSHRC_TMP="$(mktemp "$HOME/.zshrc.zerokun-tmp.XXXXXX")"
 if [ -e "$ZSHRC" ] || [ -L "$ZSHRC" ]; then
-  bun "$REPO_DIR/zerokun/safe-file.ts" validate-owned-regular "$ZSHRC"
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-owned-regular "$ZSHRC"
   ZSHRC_MODE="$(stat -f '%Lp' "$ZSHRC")"
-  bun "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$ZSHRC" | awk '
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$ZSHRC" | awk '
     $0 == "# >>> zerokun setup >>>" { if (skip) exit 2; skip=1; next }
     $0 == "# <<< zerokun setup <<<" { if (!skip) exit 2; skip=0; next }
     !skip { print }
@@ -257,6 +413,7 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 EOF
     printf 'export ZEROKUN_PROJECT_DIR=%q\n' "$PROJECT_DIR"
     printf 'export ZEROKUN_STATE_DIR=%q\n' "$CH"
+    printf 'export ZEROKUN_LEGACY_CUTOVER=%q\n' "$LEGACY_CUTOVER"
     cat <<'EOF'
 alias zerokun='codex-channel "$ZEROKUN_PROJECT_DIR"'
 # 稼働中を止めて入れ替えるかは端末の y/N プロンプトで都度確認する。

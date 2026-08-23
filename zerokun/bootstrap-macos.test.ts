@@ -19,6 +19,91 @@ import { join } from 'path'
 const root = join(import.meta.dir, '..')
 const bootstrap = join(import.meta.dir, 'bootstrap-macos.sh')
 
+function setupTestPath(fakeHome: string, botAppId?: string): string {
+  const fakeBin = join(fakeHome, 'zerokun-test-bin')
+  mkdirSync(fakeBin, { recursive: true })
+  const configuredAppId = join(fakeHome, '.zerokun-test-bot-app-id')
+  if (botAppId) writeFileSync(configuredAppId, `${botAppId}\n`, { mode: 0o600 })
+  else rmSync(configuredAppId, { force: true })
+  writeFileSync(join(fakeBin, 'bun'), [
+    '#!/bin/bash',
+    'set -euo pipefail',
+    'if [[ "$*" == *"slack-app-identity.ts verify-file"* ]]; then',
+    '  env_file="${@: -1}"',
+    "  app_token=\"$(/usr/bin/sed -n 's/^SLACK_APP_TOKEN=//p' \"$env_file\")\"",
+    "  app_id=\"$(printf '%s\\n' \"$app_token\" | /usr/bin/sed -E 's/^xapp-([0-9]+-)?(A[A-Z0-9]+)-.*/\\2/')\"",
+    '  bot_app_id="$app_id"',
+    '  [ ! -f "$HOME/.zerokun-test-bot-app-id" ] || bot_app_id="$(/bin/cat "$HOME/.zerokun-test-bot-app-id")"',
+    '  if [ -z "$app_id" ] || [ "$app_id" != "$bot_app_id" ]; then',
+    '    echo "Slack App token identity verification failed: different Slack Apps" >&2',
+    '    exit 1',
+    '  fi',
+    '  echo "Slack App token identity: verified"',
+    '  exit 0',
+    'fi',
+    `exec ${JSON.stringify(process.execPath)} "$@"`,
+    '',
+  ].join('\n'), { mode: 0o700 })
+  return `${fakeBin}:${process.env.PATH ?? '/usr/bin:/bin'}`
+}
+
+function localRemoteGitTestPath(base: string, bare: string): string {
+  const fakeBin = join(base, 'zerokun-test-git-bin')
+  mkdirSync(fakeBin, { recursive: true })
+  const realGit = Bun.which('git') ?? '/usr/bin/git'
+  writeFileSync(join(fakeBin, 'git'), [
+    '#!/bin/bash',
+    'set -euo pipefail',
+    'args=()',
+    'needs_rewrite=0',
+    'for arg in "$@"; do',
+    '  [ "$arg" != "fetch" ] && [ "$arg" != "clone" ] || needs_rewrite=1',
+    '  if [ "$arg" = "protocol.file.allow=never" ]; then',
+    '    args+=("protocol.file.allow=always")',
+    '  else',
+    '    args+=("$arg")',
+    '  fi',
+    'done',
+    'if [ "$needs_rewrite" = "1" ]; then',
+    `  exec ${JSON.stringify(realGit)} -c ${JSON.stringify(`url.file://${bare}.insteadOf=https://github.com/zerocolored/zero-codex.git`)} "\${args[@]}"`,
+    'fi',
+    `exec ${JSON.stringify(realGit)} "\${args[@]}"`,
+    '',
+  ].join('\n'), { mode: 0o700 })
+  return `${fakeBin}:${process.env.PATH ?? '/usr/bin:/bin'}`
+}
+
+function validatorCurlTestBin(base: string): string {
+  const fakeBin = join(base, 'zerokun-test-curl-bin')
+  mkdirSync(fakeBin, { recursive: true })
+  const fakeCurl = join(fakeBin, 'curl')
+  const validator = join(import.meta.dir, 'validate-update-repo.ts')
+  writeFileSync(fakeCurl, [
+    '#!/bin/bash',
+    'set -euo pipefail',
+    'output=""',
+    'while [ "$#" -gt 0 ]; do',
+    '  if [ "$1" = "--output" ]; then shift; output="$1"; fi',
+    '  shift',
+    'done',
+    '[ -n "$output" ]',
+    `/bin/cp ${JSON.stringify(validator)} "$output"`,
+    '',
+  ].join('\n'), { mode: 0o700 })
+  return fakeCurl
+}
+
+function bootstrapWithTestCurl(base: string): string {
+  const fakeCurl = validatorCurlTestBin(base)
+  const patched = join(base, 'bootstrap-macos.test-copy.sh')
+  writeFileSync(
+    patched,
+    readFileSync(bootstrap, 'utf8').replaceAll('/usr/bin/curl', fakeCurl),
+    { mode: 0o700 },
+  )
+  return patched
+}
+
 describe('macOS bootstrap', () => {
   test('--help is read-only and documents the one-script setup', () => {
     const result = Bun.spawnSync([bootstrap, '--help'], { stdout: 'pipe', stderr: 'pipe' })
@@ -276,14 +361,17 @@ describe('macOS bootstrap', () => {
     const script = readFileSync(bootstrap, 'utf8')
     expect(script).toContain('xcode-select --install')
     expect(script).toContain('Homebrew/install/HEAD/install.sh')
-    expect(script).toContain('brew install tmux')
-    expect(script).toContain('brew install --cask codex')
+    expect(script).toContain('isolated_network_command "$(command -v brew)" install tmux')
+    expect(script).toContain('isolated_network_command "$(command -v brew)" install --cask codex')
     expect(script).toContain('https://chatgpt.com/codex/install.sh')
     expect(script).not.toContain('claude auth login')
     expect(script).toContain('codex login')
     expect(script).not.toContain('gh auth login')
-    expect(script).toContain('zerocolored/zero')
-    expect(script).toContain('ensure_repo zerocolored/zero "$REPO_DIR" codex')
+    expect(script).toContain('zerocolored/zero-codex')
+    expect(script).toContain('ensure_repo zerocolored/zero-codex "$REPO_DIR" main')
+    expect(script).toContain('clone直後のGit設定またはoriginを独立検証できません')
+    expect(script).toContain('/usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin')
+    expect(script).toContain('DEFAULT_REPO_DIR="$HOME/Desktop/Project/zero-codex"')
     expect(script).not.toContain('zerocolored/skills')
     expect(script).not.toContain('BellSalesAI')
     expect(script).toContain('zerokun/setup.sh')
@@ -299,7 +387,7 @@ describe('macOS bootstrap', () => {
   test('Homebrew版が最低version未満ならCodex公式standaloneへfallbackする', () => {
     const source = readFileSync(bootstrap, 'utf8')
     const functions = source.slice(
-      source.indexOf('install_codex_standalone()'),
+      source.indexOf('secure_download()'),
       source.indexOf('ensure_logins()'),
     )
     const base = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-codex-fallback-'))
@@ -323,7 +411,7 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = "--output" ]; then shift; output="$1"; fi
   shift
 done
-/bin/cp "$FAKE_CODEX_INSTALLER" "$output"
+/bin/cp ${JSON.stringify(installerSource)} "$output"
 `, { mode: 0o755 })
     const harness = join(base, 'harness.sh')
     writeFileSync(harness, `#!/bin/bash
@@ -347,7 +435,7 @@ version_at_least() {
   done
   return 0
 }
-${functions}
+${functions.replaceAll('/usr/bin/curl', fakeCurl)}
 install_cli_tools
 codex --version
 `)
@@ -357,8 +445,6 @@ codex --version
         env: {
           HOME: fakeHome,
           PATH: `${fakeBin}:/usr/bin:/bin`,
-          ZEROKUN_CURL_BIN: fakeCurl,
-          FAKE_CODEX_INSTALLER: installerSource,
         },
         stdout: 'pipe',
         stderr: 'pipe',
@@ -377,8 +463,153 @@ codex --version
       source.indexOf('ensure_repo()'),
     )
     expect(validator).toContain('raw.githubusercontent.com/${slug}/${target_branch}/zerokun/validate-update-repo.ts')
-    expect(validator).toContain('/usr/bin/mktemp /tmp/zerokun-repo-validator.')
+    expect(validator).toContain('/usr/bin/mktemp -d /tmp/zerokun-repo-validator.')
+    expect(validator).not.toContain('$SCRIPT_DIR/validate-update-repo.ts')
     expect(validator).not.toContain('$target/zerokun/validate-update-repo.ts')
+  })
+
+  test('単体bootstrapは同じ一時directoryの悪性validatorを無視する', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-adjacent-validator-'))
+    const standaloneDir = join(dir, 'standalone')
+    const temp = join(dir, 'tmp')
+    const repo = join(dir, 'repo')
+    const marker = join(dir, 'malicious-validator-executed')
+    mkdirSync(standaloneDir, { mode: 0o700 })
+    mkdirSync(temp, { mode: 0o700 })
+    try {
+      Bun.spawnSync(['git', 'init', '--initial-branch=main', repo])
+      Bun.spawnSync(['git', '-C', repo, 'remote', 'add', 'origin', 'https://github.com/zerocolored/zero-codex.git'])
+      const fakeCurl = validatorCurlTestBin(dir)
+      const standalone = join(standaloneDir, 'bootstrap-macos.sh')
+      writeFileSync(
+        standalone,
+        readFileSync(bootstrap, 'utf8').replaceAll('/usr/bin/curl', fakeCurl),
+        { mode: 0o700 },
+      )
+      writeFileSync(
+        join(standaloneDir, 'validate-update-repo.ts'),
+        `await Bun.write(${JSON.stringify(marker)}, 'executed')\n`,
+        { mode: 0o600 },
+      )
+      const command = [
+        'bootstrap_path="$1"',
+        'target_repo="$2"',
+        'set --',
+        'source "$bootstrap_path"',
+        'validate_existing_repo zerocolored/zero-codex "$target_repo" main',
+      ].join('; ')
+      const result = Bun.spawnSync([
+        '/bin/bash', '-c', command, 'bash', standalone, repo,
+      ], {
+        env: { ...process.env, TMPDIR: temp },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(existsSync(marker)).toBe(false)
+      expect(Bun.spawnSync(['/bin/ls', '-A', temp]).stdout.toString()).toBe('')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('secure_downloadはambient curl設定・proxy環境を継承しない', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-curl-env-'))
+    const fakeHome = join(dir, 'home')
+    const report = join(dir, 'curl-report')
+    const output = join(dir, 'download')
+    const fakeCurl = join(dir, 'curl')
+    mkdirSync(fakeHome)
+    writeFileSync(join(fakeHome, '.curlrc'), 'insecure\nproxy = https://attacker.invalid\n')
+    writeFileSync(fakeCurl, [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      `printf '%s|%s|%s\n' "\${HOME-unset}" "\${HTTPS_PROXY-unset}" "$1" > ${JSON.stringify(report)}`,
+      'target=""',
+      'while [ "$#" -gt 0 ]; do',
+      '  if [ "$1" = "--output" ]; then shift; target="$1"; fi',
+      '  shift',
+      'done',
+      ': > "$target"',
+      '',
+    ].join('\n'), { mode: 0o700 })
+    try {
+      const source = readFileSync(bootstrap, 'utf8')
+      const secureDownload = source.slice(
+        source.indexOf('secure_download()'),
+        source.indexOf('install_homebrew()'),
+      ).replaceAll('/usr/bin/curl', fakeCurl)
+      const harness = join(dir, 'harness.sh')
+      writeFileSync(harness, [
+        '#!/bin/bash',
+        'set -euo pipefail',
+        secureDownload,
+        `secure_download ${JSON.stringify(output)} https://example.com/file`,
+        '',
+      ].join('\n'), { mode: 0o700 })
+      const result = Bun.spawnSync([harness], {
+        env: { ...process.env, HOME: fakeHome, HTTPS_PROXY: 'https://attacker.invalid' },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(readFileSync(report, 'utf8').trim()).toBe('unset|unset|-q')
+      expect(existsSync(output)).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('二段目installerもambient proxy・CA・Git configを継承しない', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-second-stage-env-'))
+    const fakeHome = join(dir, 'home')
+    const report = join(dir, 'report')
+    const probe = join(dir, 'probe.sh')
+    mkdirSync(fakeHome)
+    writeFileSync(join(fakeHome, '.curlrc'), 'insecure\nproxy = https://attacker.invalid\n')
+    writeFileSync(probe, [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      `printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \\
+        "$HOME" "\${HTTPS_PROXY-unset}" "\${SSL_CERT_FILE-unset}" \\
+        "\${GIT_CONFIG_COUNT-unset}" "\${CODEX_NON_INTERACTIVE-unset}" \\
+        "$(/usr/bin/stat -f '%Lp' "$CURL_HOME")" "$(/bin/ls -A "$CURL_HOME")" \\
+        "$(/usr/bin/stat -f '%Lp' "$XDG_CONFIG_HOME")" "$(/bin/ls -A "$XDG_CONFIG_HOME")" \\
+        > ${JSON.stringify(report)}`,
+      '',
+    ].join('\n'), { mode: 0o700 })
+    try {
+      const source = readFileSync(bootstrap, 'utf8')
+      const isolatedCommand = source.slice(
+        source.indexOf('isolated_network_command()'),
+        source.indexOf('install_homebrew()'),
+      )
+      const harness = join(dir, 'harness.sh')
+      writeFileSync(harness, [
+        '#!/bin/bash',
+        'set -euo pipefail',
+        'fail() { echo "$1" >&2; exit 1; }',
+        isolatedCommand,
+        `isolated_network_command CODEX_NON_INTERACTIVE=true ${JSON.stringify(probe)}`,
+        '',
+      ].join('\n'), { mode: 0o700 })
+      const result = Bun.spawnSync([harness], {
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          HTTPS_PROXY: 'https://attacker.invalid',
+          SSL_CERT_FILE: join(dir, 'attacker-ca.pem'),
+          GIT_CONFIG_COUNT: '1',
+          GIT_CONFIG_KEY_0: 'url.https://attacker.invalid/.insteadOf',
+          GIT_CONFIG_VALUE_0: 'https://github.com/',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(readFileSync(report, 'utf8').trim()).toBe(
+        `${fakeHome}|unset|unset|unset|true|700||700|`,
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test('単体download validatorは相対依存なしで既存cloneを検証できる', () => {
@@ -386,10 +617,10 @@ codex --version
     const repo = join(dir, 'zero')
     const standalone = join(dir, 'validate-update-repo.ts')
     try {
-      Bun.spawnSync(['git', 'init', '--initial-branch=codex', repo])
-      Bun.spawnSync(['git', '-C', repo, 'remote', 'add', 'origin', 'https://github.com/zerocolored/zero.git'])
+      Bun.spawnSync(['git', 'init', '--initial-branch=main', repo])
+      Bun.spawnSync(['git', '-C', repo, 'remote', 'add', 'origin', 'https://github.com/zerocolored/zero-codex.git'])
       writeFileSync(standalone, readFileSync(join(import.meta.dir, 'validate-update-repo.ts'), 'utf8'))
-      const result = Bun.spawnSync(['bun', standalone, repo, 'codex'], {
+      const result = Bun.spawnSync(['bun', standalone, repo, 'main'], {
         stdout: 'pipe', stderr: 'pipe',
       })
       expect(result.exitCode, result.stderr.toString()).toBe(0)
@@ -431,12 +662,38 @@ codex --version
       'bootstrap_path="$1"',
       'set --',
       'source "$bootstrap_path"',
-      'remote_matches_slug zerocolored/zero https://github.com/zerocolored/zero.git',
-      '! remote_matches_slug zerocolored/zero https://github.com/evil/zerocolored/zero.git',
-      '! remote_matches_slug zerocolored/zero git@github.com:evil/zerocolored/zero.git',
+      'remote_matches_slug zerocolored/zero-codex https://github.com/zerocolored/zero-codex.git',
+      '! remote_matches_slug zerocolored/zero-codex https://github.com/evil/zerocolored/zero-codex.git',
+      '! remote_matches_slug zerocolored/zero-codex git@github.com:evil/zerocolored/zero-codex.git',
     ].join('; ')
     const result = Bun.spawnSync(['/bin/bash', '-c', command, 'bash', bootstrap])
     expect(result.exitCode).toBe(0)
+  })
+
+  test('safe_gitはambient Git config injectionを継承しない', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-git-env-'))
+    try {
+      const command = [
+        'bootstrap_path="$1"',
+        'set --',
+        'source "$bootstrap_path"',
+        'if safe_git config --get url.https://attacker.invalid/repo.git.insteadOf; then exit 90; fi',
+      ].join('; ')
+      const result = Bun.spawnSync(['/bin/bash', '-c', command, 'bash', bootstrap], {
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          GIT_CONFIG_COUNT: '1',
+          GIT_CONFIG_KEY_0: 'url.https://attacker.invalid/repo.git.insteadOf',
+          GIT_CONFIG_VALUE_0: 'https://github.com/zerocolored/zero-codex.git',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(result.stdout.toString()).not.toContain('zero-codex')
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
   })
 
   test('許可channelの初期routeを追加し、既存routeは保持する', () => {
@@ -479,8 +736,8 @@ codex --version
     const marker = join(dir, 'helper-executed')
     const helper = join(dir, 'fsmonitor.sh')
     try {
-      Bun.spawnSync(['git', 'init', '--initial-branch=codex', repo])
-      Bun.spawnSync(['git', '-C', repo, 'remote', 'add', 'origin', 'https://github.com/zerocolored/zero.git'])
+      Bun.spawnSync(['git', 'init', '--initial-branch=main', repo])
+      Bun.spawnSync(['git', '-C', repo, 'remote', 'add', 'origin', 'https://github.com/zerocolored/zero-codex.git'])
       writeFileSync(helper, `#!/bin/bash\ntouch '${marker}'\n`, { mode: 0o700 })
       Bun.spawnSync(['git', '-C', repo, 'config', 'core.fsmonitor', helper])
       const command = [
@@ -488,10 +745,11 @@ codex --version
         'target_repo="$2"',
         'set --',
         'source "$bootstrap_path"',
-        'ensure_repo zerocolored/zero "$target_repo" codex',
+        'ensure_repo zerocolored/zero-codex "$target_repo" main',
       ].join('; ')
+      const patchedBootstrap = bootstrapWithTestCurl(dir)
       const result = Bun.spawnSync([
-        '/bin/bash', '-c', command, 'bash', bootstrap, repo,
+        '/bin/bash', '-c', command, 'bash', patchedBootstrap, repo,
       ], { stdout: 'pipe', stderr: 'pipe' })
       expect(result.exitCode).not.toBe(0)
       expect(result.stderr.toString()).toContain('Git設定またはoriginが安全ではありません')
@@ -501,8 +759,8 @@ codex --version
     }
   })
 
-  test('既存main cloneを安全にorigin/codex tracking branchへ移行する', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-main-to-codex-'))
+  test('既存main cloneを安全にorigin/mainへfast-forwardする', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-main-fast-forward-'))
     const bare = join(dir, 'remote.git')
     const seed = join(dir, 'seed')
     const repo = join(dir, 'zero')
@@ -516,35 +774,46 @@ codex --version
       run(['git', 'init', '--initial-branch=main', seed])
       run(['git', 'config', 'user.email', 'test@example.com'], seed)
       run(['git', 'config', 'user.name', 'test'], seed)
-      writeFileSync(join(seed, 'version.txt'), 'main\n')
+      writeFileSync(join(seed, 'version.txt'), 'main-v1\n')
       run(['git', 'add', '.'], seed)
-      run(['git', 'commit', '-m', 'main'], seed)
+      run(['git', 'commit', '-m', 'main v1'], seed)
       run(['git', 'remote', 'add', 'origin', bare], seed)
       run(['git', 'push', '-u', 'origin', 'main'], seed)
-      run(['git', 'switch', '-c', 'codex'], seed)
-      writeFileSync(join(seed, 'version.txt'), 'codex\n')
-      run(['git', 'commit', '-am', 'codex'], seed)
-      run(['git', 'push', '-u', 'origin', 'codex'], seed)
       run(['git', 'clone', '--branch', 'main', bare, repo])
+      writeFileSync(join(seed, 'version.txt'), 'main-v2\n')
+      run(['git', 'commit', '-am', 'main v2'], seed)
+      run(['git', 'push', 'origin', 'main'], seed)
+      run(['git', 'remote', 'set-url', 'origin', 'https://github.com/zerocolored/zero-codex.git'], repo)
 
       const command = [
         'bootstrap_path="$1"',
         'target_repo="$2"',
         'set --',
         'source "$bootstrap_path"',
-        'ensure_repo zerocolored/zero "$target_repo" codex',
+        'ensure_repo zerocolored/zero-codex "$target_repo" main',
       ].join('; ')
+      const fakePath = localRemoteGitTestPath(dir, bare)
+      const fakeGitPath = join(fakePath.split(':')[0]!, 'git')
+      const fakeCurlPath = validatorCurlTestBin(dir)
+      const patchedBootstrap = join(dir, 'bootstrap-macos.sh')
+      writeFileSync(
+        patchedBootstrap,
+        readFileSync(bootstrap, 'utf8')
+          .replaceAll('/usr/bin/git', fakeGitPath)
+          .replaceAll('/usr/bin/curl', fakeCurlPath),
+        { mode: 0o700 },
+      )
       const result = Bun.spawnSync([
-        '/bin/bash', '-c', command, 'bash', bootstrap, repo,
+        '/bin/bash', '-c', command, 'bash', patchedBootstrap, repo,
       ], {
-        env: { ...process.env, ZEROKUN_UPDATE_TESTING: '1' },
+        env: { ...process.env, PATH: fakePath },
         stdout: 'pipe', stderr: 'pipe',
       })
       expect(result.exitCode, result.stderr.toString()).toBe(0)
-      expect(run(['git', 'branch', '--show-current'], repo)).toBe('codex')
-      expect(run(['git', 'rev-parse', 'HEAD'], repo)).toBe(run(['git', 'rev-parse', 'origin/codex'], repo))
-      expect(run(['git', 'config', 'branch.codex.remote'], repo)).toBe('origin')
-      expect(run(['git', 'config', 'branch.codex.merge'], repo)).toBe('refs/heads/codex')
+      expect(run(['git', 'branch', '--show-current'], repo)).toBe('main')
+      expect(run(['git', 'rev-parse', 'HEAD'], repo)).toBe(run(['git', 'rev-parse', 'origin/main'], repo))
+      expect(run(['git', 'config', 'branch.main.remote'], repo)).toBe('origin')
+      expect(run(['git', 'config', 'branch.main.merge'], repo)).toBe('refs/heads/main')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -555,17 +824,18 @@ codex --version
     const repo = join(dir, 'zero')
     try {
       Bun.spawnSync(['git', 'init', '--initial-branch=main', repo])
-      Bun.spawnSync(['git', '-C', repo, 'remote', 'add', 'origin', 'https://github.com/zerocolored/zero.git'])
+      Bun.spawnSync(['git', '-C', repo, 'remote', 'add', 'origin', 'https://github.com/zerocolored/zero-codex.git'])
       writeFileSync(join(repo, 'uncommitted.txt'), 'preserve\n')
       const command = [
         'bootstrap_path="$1"',
         'target_repo="$2"',
         'set --',
         'source "$bootstrap_path"',
-        'ensure_repo zerocolored/zero "$target_repo" codex',
+        'ensure_repo zerocolored/zero-codex "$target_repo" main',
       ].join('; ')
+      const patchedBootstrap = bootstrapWithTestCurl(dir)
       const result = Bun.spawnSync([
-        '/bin/bash', '-c', command, 'bash', bootstrap, repo,
+        '/bin/bash', '-c', command, 'bash', patchedBootstrap, repo,
       ], { stdout: 'pipe', stderr: 'pipe' })
       expect(result.exitCode).not.toBe(0)
       expect(result.stderr.toString()).toContain('変更をcommit/stash')
@@ -644,7 +914,7 @@ codex --version
     expect(result.exitCode).toBe(0)
     expect(calls).toContain('require_macos configure_slack')
     expect(calls).not.toContain('install_clt')
-    expect(calls).not.toContain('run_setup')
+    expect(calls).toContain('configure_slack run_setup')
   })
 
   test('Slack token input retries and normalizes copied env assignment without exposing it', () => {
@@ -743,6 +1013,8 @@ codex --version
     expect(launcher).not.toContain('/Users/zerocolored-macpro-suetsugu')
     expect(setup).toContain('${ZEROKUN_PROJECT_DIR:-$(dirname "$REPO_DIR")/zerokun-workspace}')
     expect(setup).toContain('Slack作業projectはZero-kun本体と別directoryにしてください')
+    expect(setup).toContain('/usr/bin/env -i')
+    expect(setup).toContain('BUN_INSTALL_CACHE_DIR="$INSTALL_ENV_ROOT/bun-cache"')
     expect(readFileSync(bootstrap, 'utf8')).not.toContain('BellSalesAI')
     expect(readFileSync(bootstrap, 'utf8')).not.toContain('Muxy')
   })
@@ -756,7 +1028,7 @@ codex --version
       mkdirSync(join(stateDir, 'owner/claude-config/.git'), { recursive: true })
       mkdirSync(join(stateDir, 'owner/claude-skills/.git'), { recursive: true })
       mkdirSync(projectDir, { recursive: true })
-      writeFileSync(tokenFile, 'SLACK_BOT_TOKEN=xoxb-existing\nSLACK_APP_TOKEN=xapp-existing\n')
+      writeFileSync(tokenFile, 'SLACK_BOT_TOKEN=xoxb-existing-not-a-real-token\nSLACK_APP_TOKEN=xapp-1-A0123456789-existing-not-a-real-token\n')
       writeFileSync(join(fakeHome, '.zshrc'), 'export EXISTING=1\n', { mode: 0o600 })
 
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
@@ -767,6 +1039,7 @@ codex --version
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          PATH: setupTestPath(fakeHome),
         },
         stdout: 'pipe',
         stderr: 'pipe',
@@ -775,24 +1048,29 @@ codex --version
       expect(result.exitCode).toBe(0)
       const zshrc = readFileSync(join(fakeHome, '.zshrc'), 'utf8')
       expect(zshrc).toContain(`export ZEROKUN_PROJECT_DIR=${projectDir.replace(' ', '\\ ')}`)
-      expect(zshrc).toContain(`export ZEROKUN_STATE_DIR=${stateDir.replaceAll(' ', '\\ ')}`)
+      expect(zshrc).toContain(
+        `export ZEROKUN_STATE_DIR=${realpathSync(stateDir).replaceAll(' ', '\\ ')}`,
+      )
+      expect(zshrc).toContain('export ZEROKUN_LEGACY_CUTOVER=0')
       expect(zshrc).toContain('codex-channel "$ZEROKUN_PROJECT_DIR"')
       expect(statSync(join(fakeHome, '.zshrc')).mode & 0o777).toBe(0o600)
       expect(readFileSync(
         join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),
         'utf8',
-      )).toContain(`${stateDir}/watchdog.sh`)
+      )).toContain(`${realpathSync(stateDir)}/watchdog.sh`)
       expect(readFileSync(
         join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),
         'utf8',
-      )).toContain(`<string>${stateDir}</string>`)
+      )).toContain(`<string>${realpathSync(stateDir)}</string>`)
       expect(readFileSync(tokenFile, 'utf8')).toBe(
-        'SLACK_BOT_TOKEN=xoxb-existing\nSLACK_APP_TOKEN=xapp-existing\n',
+        'SLACK_BOT_TOKEN=xoxb-existing-not-a-real-token\nSLACK_APP_TOKEN=xapp-1-A0123456789-existing-not-a-real-token\n',
       )
       const copiedWorker = Bun.spawnSync([
         process.execPath,
+        '--no-install',
         join(stateDir, 'update-request.ts'),
       ], {
+        cwd: projectDir,
         env: { ...process.env, HOME: fakeHome, ZEROKUN_STATE_DIR: stateDir },
         stdout: 'pipe',
         stderr: 'pipe',
@@ -934,17 +1212,26 @@ codex --version
     const stateDir = join(fakeHome, '.claude/channels/slack')
     const projectDir = join(fakeHome, 'Work/BellSalesAI')
     const fakeLaunchctl = join(fakeHome, 'launchctl-fails')
+    let claudeParent: Bun.Subprocess | undefined
     try {
       mkdirSync(join(stateDir, 'owner/claude-config/.git'), { recursive: true })
       mkdirSync(join(stateDir, 'owner/claude-skills/.git'), { recursive: true })
       mkdirSync(projectDir, { recursive: true })
+      writeFileSync(join(stateDir, '.env'), 'LEGACY_SENTINEL=keep\n')
       writeFileSync(fakeLaunchctl, '#!/bin/bash\nexit 42\n', { mode: 0o700 })
+      claudeParent = Bun.spawn([
+        '/bin/bash', '-c',
+        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+      ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
 
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
         env: {
           ...process.env,
           HOME: fakeHome,
+          ZEROKUN_STATE_DIR: `${join(fakeHome, '.claude/channels/../channels/slack')}//`,
+          ZEROKUN_LEGACY_CUTOVER: '0',
+          SLACK_STATE_DIR: stateDir,
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_LAUNCHCTL_BIN: fakeLaunchctl,
         },
@@ -956,10 +1243,348 @@ codex --version
       expect(result.stderr.toString()).toContain('watchdog のlaunchd登録に失敗')
       expect(existsSync(join(fakeHome, '.local/bin/zerokun-jobs'))).toBe(true)
       expect(readFileSync(join(fakeHome, '.zshrc'), 'utf8')).toContain("alias zerokun=")
+      expect(readFileSync(join(stateDir, '.env'), 'utf8')).toBe('LEGACY_SENTINEL=keep\n')
+      expect(existsSync(join(fakeHome, '.codex/zerokun/.env'))).toBe(true)
+      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+    } finally {
+      if (claudeParent) {
+        try { claudeParent.kill() } catch {}
+      }
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('存在しない標準legacy stateのcutoverは作成やClaude親停止より前に拒否する', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-missing-cutover-'))
+    const stateDir = join(fakeHome, '.claude/channels/slack')
+    const projectDir = join(fakeHome, 'project')
+    let claudeParent: Bun.Subprocess | undefined
+    try {
+      claudeParent = Bun.spawn([
+        '/bin/bash', '-c',
+        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+      ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_LEGACY_CUTOVER: '1',
+          ZEROKUN_PROJECT_DIR: projectDir,
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr.toString()).toContain('legacy cutover state')
+      expect(existsSync(stateDir)).toBe(false)
+      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+    } finally {
+      if (claudeParent) {
+        try { claudeParent.kill() } catch {}
+      }
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('重複行で実効tokenが空になるlegacy .envはClaude親停止より前に拒否する', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-empty-cutover-'))
+    const stateDir = join(fakeHome, '.claude/channels/slack')
+    let claudeParent: Bun.Subprocess | undefined
+    try {
+      mkdirSync(stateDir, { recursive: true })
+      const ambiguousEnvironment = [
+        'SLACK_BOT_TOKEN=xoxb-valid-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-A0123456789-valid-not-a-real-token',
+        'SLACK_BOT_TOKEN=',
+        'SLACK_APP_TOKEN=',
+        '',
+      ].join('\n')
+      writeFileSync(join(stateDir, '.env'), ambiguousEnvironment, { mode: 0o600 })
+      claudeParent = Bun.spawn([
+        '/bin/bash', '-c',
+        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+      ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_LEGACY_CUTOVER: '1',
+          ZEROKUN_PROJECT_DIR: join(fakeHome, 'project'),
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr.toString()).toContain('legacy cutover state')
+      expect(readFileSync(join(stateDir, '.env'), 'utf8')).toBe(ambiguousEnvironment)
+      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+    } finally {
+      if (claudeParent) {
+        try { claudeParent.kill() } catch {}
+      }
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('異なるSlack Appのtoken pairはcutover停止境界より前に拒否する', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-token-mismatch-cutover-'))
+    const stateDir = join(fakeHome, '.claude/channels/slack')
+    const stopProbe = join(fakeHome, 'cutover-stop-reached')
+    let claudeParent: Bun.Subprocess | undefined
+    try {
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(join(stateDir, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-valid-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-ANEWAPP123-abcdefghijklmnopqrstuvwxyz',
+        '',
+      ].join('\n'), { mode: 0o600 })
+      claudeParent = Bun.spawn([
+        '/bin/bash', '-c',
+        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+      ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_LEGACY_CUTOVER: '1',
+          PATH: setupTestPath(fakeHome, 'AOLDAPP123'),
+          ZEROKUN_PROJECT_DIR: join(fakeHome, 'project'),
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr.toString()).toContain('different Slack Apps')
+      expect(existsSync(stopProbe)).toBe(false)
+      expect(existsSync(join(stateDir, '.codex-legacy-cutover'))).toBe(false)
+      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+    } finally {
+      if (claudeParent) {
+        try { claudeParent.kill() } catch {}
+      }
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('通常の再setupも異なるSlack App tokenをgateway停止前に拒否する', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-token-mismatch-normal-'))
+    const stateDir = join(fakeHome, '.codex/zerokun')
+    const stopProbe = join(fakeHome, 'normal-stop-reached')
+    let gateway: Bun.Subprocess | undefined
+    try {
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(join(stateDir, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-valid-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-ANEWAPP123-abcdefghijklmnopqrstuvwxyz',
+        '',
+      ].join('\n'), { mode: 0o600 })
+      const server = join(stateDir, 'server.ts')
+      writeFileSync(server, '#!/bin/bash\nwhile :; do sleep 1; done\n', { mode: 0o700 })
+      gateway = Bun.spawn(['/bin/bash', server], {
+        stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+      })
+      writeFileSync(join(stateDir, 'plugin.lock'), `${gateway.pid}\n`, { mode: 0o600 })
+      const started = Bun.spawnSync(['/bin/ps', '-o', 'lstart=', '-p', String(gateway.pid)], {
+        stdout: 'pipe',
+      }).stdout.toString().trim()
+      writeFileSync(join(stateDir, 'plugin.lock.identity'), JSON.stringify({
+        pid: gateway.pid, started, nonce: 'normal-setup-token-test',
+      }), { mode: 0o600 })
+
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_STATE_DIR: stateDir,
+          PATH: setupTestPath(fakeHome, 'AOLDAPP123'),
+          ZEROKUN_PROJECT_DIR: join(fakeHome, 'project'),
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr.toString()).toContain('different Slack Apps')
+      expect(result.stderr.toString()).toContain('processは停止しません')
+      expect(existsSync(stopProbe)).toBe(false)
+      expect(() => process.kill(gateway!.pid, 0)).not.toThrow()
+    } finally {
+      if (gateway) {
+        try { gateway.kill() } catch {}
+      }
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('legacy DB symlinkはClaude親停止より前に拒否する', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-db-symlink-cutover-'))
+    const stateDir = join(fakeHome, '.claude/channels/slack')
+    const externalDb = join(fakeHome, 'external.sqlite3')
+    const stopProbe = join(fakeHome, 'cutover-stop-reached')
+    let claudeParent: Bun.Subprocess | undefined
+    try {
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(join(stateDir, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-valid-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-A0123456789-not-a-real-token',
+        '',
+      ].join('\n'), { mode: 0o600 })
+      writeFileSync(externalDb, 'preserve', { mode: 0o600 })
+      symlinkSync(externalDb, join(stateDir, 'jobs.sqlite3'))
+      claudeParent = Bun.spawn([
+        '/bin/bash', '-c',
+        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+      ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_LEGACY_CUTOVER: '1',
+          PATH: setupTestPath(fakeHome),
+          ZEROKUN_PROJECT_DIR: join(fakeHome, 'project'),
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr.toString()).toContain('unsafe SQLite file')
+      expect(readFileSync(externalDb, 'utf8')).toBe('preserve')
+      expect(existsSync(stopProbe)).toBe(false)
+      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+    } finally {
+      if (claudeParent) {
+        try { claudeParent.kill() } catch {}
+      }
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('初回cutover markerにより.claude alias削除後もphysical stateで再setupできる', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-established-cutover-'))
+    const physicalClaude = join(fakeHome, 'config/claude-home')
+    const physicalState = join(physicalClaude, 'channels/slack')
+    const logicalState = join(fakeHome, '.claude/channels/slack')
+    const projectDir = join(fakeHome, 'project')
+    try {
+      mkdirSync(physicalState, { recursive: true })
+      mkdirSync(projectDir, { recursive: true })
+      symlinkSync(physicalClaude, join(fakeHome, '.claude'))
+      writeFileSync(join(physicalState, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-established-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-A0123456789-established-not-a-real-token',
+        '',
+      ].join('\n'), { mode: 0o600 })
+      const baseEnvironment = {
+        ...process.env,
+        HOME: fakeHome,
+        ZEROKUN_LEGACY_CUTOVER: '1',
+        PATH: setupTestPath(fakeHome),
+        ZEROKUN_PROJECT_DIR: projectDir,
+        ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+      }
+      const first = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: { ...baseEnvironment, ZEROKUN_STATE_DIR: logicalState },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(first.exitCode, first.stderr.toString()).toBe(0)
+      expect(readFileSync(join(physicalState, '.codex-legacy-cutover'), 'utf8'))
+        .toBe(`zerokun-codex-legacy-cutover-v1\n${realpathSync(physicalState)}\n`)
+
+      rmSync(join(fakeHome, '.claude'))
+      const second = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: { ...baseEnvironment, ZEROKUN_STATE_DIR: physicalState },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(second.exitCode, second.stderr.toString()).toBe(0)
+      expect(readFileSync(join(fakeHome, '.zshrc'), 'utf8'))
+        .toContain(`export ZEROKUN_STATE_DIR=${realpathSync(physicalState)}`)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
   })
+
+  test('drain中にrunnerが自発終了しても古いPIDへsignalせずsetupを完了する', async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-runner-self-exit-'))
+    const stateDir = join(fakeHome, '.claude/channels/slack')
+    const projectDir = join(fakeHome, 'project')
+    let legacyRunner: Bun.Subprocess | undefined
+    try {
+      mkdirSync(join(stateDir, 'job-runner.lock'), { recursive: true })
+      mkdirSync(projectDir, { recursive: true })
+      writeFileSync(join(stateDir, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-self-exit-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-A0123456789-self-exit-not-a-real-token',
+        '',
+      ].join('\n'), { mode: 0o600 })
+      const dbPath = join(stateDir, 'jobs.sqlite3')
+      const legacyDb = new Database(dbPath, { create: true })
+      legacyDb.exec(`
+        CREATE TABLE jobs (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, idempotency_key TEXT UNIQUE,
+          chat_id TEXT, thread_ts TEXT, message_id TEXT, user_id TEXT, repo_path TEXT, task TEXT,
+          status TEXT, session_id TEXT, resumed INTEGER, worker_id TEXT, attempts INTEGER,
+          result TEXT, last_error TEXT, created_at INTEGER, started_at INTEGER, finished_at INTEGER
+        );
+        INSERT INTO jobs VALUES (
+          1, 'self-exit-job', 'C:self-exit', 'C', '1', '1', 'U', '/tmp/project', 'pending',
+          'running', 'claude-session', 0, 'legacy-worker', 1, NULL, NULL, 1, 2, NULL
+        );
+      `)
+      legacyDb.close()
+      const legacyPath = join(stateDir, 'job-runner.ts')
+      const updateScript = [
+        'import { Database } from "bun:sqlite"',
+        `const db = new Database(${JSON.stringify(dbPath)})`,
+        'db.run("UPDATE jobs SET status = ? WHERE id = ?", ["queued", "self-exit-job"])',
+        'db.close()',
+      ].join('; ')
+      writeFileSync(legacyPath, [
+        '#!/bin/bash',
+        'sleep 3',
+        `${JSON.stringify(process.execPath)} -e ${JSON.stringify(updateScript)}`,
+        'exit 0',
+        '',
+      ].join('\n'), { mode: 0o700 })
+      legacyRunner = Bun.spawn(['/bin/bash', legacyPath, 'daemon'], {
+        stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+      })
+      writeFileSync(join(stateDir, 'job-runner.lock/pid'), `${legacyRunner.pid}\n`)
+
+      const setup = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          PATH: setupTestPath(fakeHome),
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_LEGACY_CUTOVER: '1',
+          ZEROKUN_PROJECT_DIR: projectDir,
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          ZEROKUN_SETUP_DRAIN_SECONDS: '10',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(setup.exitCode, setup.stderr.toString()).toBe(0)
+      expect(setup.stdout.toString()).toContain('旧job runnerを安全に停止')
+      expect(await legacyRunner.exited).toBe(0)
+    } finally {
+      if (legacyRunner) {
+        try { legacyRunner.kill() } catch {}
+        try { await legacyRunner.exited } catch {}
+      }
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  }, 30_000)
 
   test('Claude版runnerを停止し、待機jobをsessionなしのCodex queueへcutoverする', async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-cutover-'))
@@ -967,10 +1592,14 @@ codex --version
     const projectDir = join(fakeHome, 'Work/BellSalesAI')
     let legacyRunner: Bun.Subprocess | undefined
     let legacyGateway: Bun.Subprocess | undefined
-    let codexRunner: Bun.Subprocess | undefined
     try {
       mkdirSync(join(stateDir, 'job-runner.lock'), { recursive: true })
       mkdirSync(projectDir, { recursive: true })
+      writeFileSync(join(stateDir, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-cutover-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-A0123456789-cutover-not-a-real-token',
+        '',
+      ].join('\n'), { mode: 0o600 })
       const legacyPath = join(stateDir, 'job-runner.ts')
       const legacyServer = join(stateDir, 'server.ts')
       writeFileSync(legacyPath, '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n', { mode: 0o700 })
@@ -1005,7 +1634,9 @@ codex --version
         env: {
           ...process.env,
           HOME: fakeHome,
-          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_STATE_DIR: `${join(fakeHome, '.claude/channels/../channels/slack')}/`,
+          ZEROKUN_LEGACY_CUTOVER: '1',
+          PATH: setupTestPath(fakeHome),
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
         },
@@ -1022,7 +1653,11 @@ codex --version
         join(root, 'zerokun/job-runner.ts'),
         'runtime-info',
       ], {
-        env: { ...process.env, ZEROKUN_STATE_DIR: stateDir },
+        env: {
+          ...process.env,
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_LEGACY_CUTOVER: '1',
+        },
         stdout: 'pipe', stderr: 'pipe',
       })
       expect(runtimeInfo.exitCode, runtimeInfo.stderr.toString()).toBe(0)
@@ -1032,24 +1667,8 @@ codex --version
         .get('legacy-job')).toEqual({ runtime: 'codex', status: 'queued', session_id: null })
       migrated.close()
 
-      mkdirSync(join(stateDir, 'update.lock'), { recursive: true })
-      writeFileSync(join(stateDir, 'update.lock/pid'), `${process.pid}\n`)
-      codexRunner = Bun.spawn([
-        process.execPath,
-        join(root, 'zerokun/job-runner.ts'),
-        'daemon',
-      ], {
-        env: { ...process.env, ZEROKUN_STATE_DIR: stateDir },
-        stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
-      })
-      for (let index = 0; index < 100; index += 1) {
-        if (existsSync(join(stateDir, 'job-runner.lock/runtime'))) break
-        await Bun.sleep(20)
-      }
-      expect(readFileSync(join(stateDir, 'job-runner.lock/runtime'), 'utf8').trim())
-        .toBe('zerokun-codex-runner-v1')
     } finally {
-      for (const child of [legacyRunner, legacyGateway, codexRunner]) {
+      for (const child of [legacyRunner, legacyGateway]) {
         if (!child) continue
         try { child.kill() } catch {}
         try { await child.exited } catch {}
