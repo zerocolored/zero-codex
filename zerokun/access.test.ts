@@ -55,6 +55,15 @@ describe('zerokun-access', () => {
     expect(readAccess(path).allowFrom).toEqual([])
   })
 
+  test('lock identity破損によるrelease失敗を成功扱いしない', () => {
+    const dir = fixture()
+    const path = join(dir, 'access.json')
+    expect(() => mutateAccess(access => {
+      access.allowFrom.push('U0123456789')
+      writeFileSync(`${path}.lock.identity`, '{}\n', { mode: 0o600 })
+    }, path)).toThrow('failed to release access config lock')
+  })
+
   test('期限切れcodeを拒否してpendingから除去する', () => {
     const dir = fixture()
     const path = join(dir, 'access.json')

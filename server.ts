@@ -50,6 +50,7 @@ import {
   requireManagedStateRoot,
 } from './zerokun/managed-path.ts'
 import {
+  AccessLockReleaseError,
   mutateAccess,
   readAccess,
   type AccessConfig,
@@ -165,8 +166,11 @@ function acquirePluginLock(): void {
   try {
     const result = claimPluginLock(LOCK_FILE, STATE_DIR)
     if (result.acquired === false) {
+      const owner = result.kind === 'held'
+        ? `another instance (PID ${result.heldPid})`
+        : 'a lock with an unreadable owner'
       process.stderr.write(
-        `slack channel: another instance (PID ${result.heldPid}) already holds ${LOCK_FILE}\n` +
+        `slack channel: ${owner} already holds ${LOCK_FILE}\n` +
         `  this instance (PID ${process.pid}) will exit — Socket Mode is single-consumer,\n` +
         `  and running multiple plugin processes causes event fanout + missed messages.\n`,
       )
@@ -222,41 +226,49 @@ type GateResult =
   | { action: 'pair'; code: string; isResend: boolean }
 
 async function gate(senderId: string, channelId: string, channelType: string, isMention: boolean, isBot: boolean = false): Promise<GateResult> {
-  return mutateAccess((access): GateResult => {
-    pruneExpired(access)
-    const isDM = channelType === 'im'
+  try {
+    return mutateAccess((access): GateResult => {
+      pruneExpired(access)
+      const isDM = channelType === 'im'
 
-    if (access.dmPolicy === 'disabled' && isDM) return { action: 'drop' }
-    if (isBotDMBlocked(isDM ? 'im' : 'channel', isBot)) return { action: 'drop' }
+      if (access.dmPolicy === 'disabled' && isDM) return { action: 'drop' }
+      if (isBotDMBlocked(isDM ? 'im' : 'channel', isBot)) return { action: 'drop' }
 
-    if (isDM) {
-      // Being on any opted-in channel's allowFrom carries into DMs — see effectiveDmAllowFrom.
-      if (effectiveDmAllowFrom(access).includes(senderId)) return { action: 'deliver', access }
-      if (access.dmPolicy === 'allowlist') return { action: 'drop' }
+      if (isDM) {
+        // Being on any opted-in channel's allowFrom carries into DMs.
+        if (effectiveDmAllowFrom(access).includes(senderId)) return { action: 'deliver', access }
+        if (access.dmPolicy === 'allowlist') return { action: 'drop' }
 
-      for (const [code, pending] of Object.entries(access.pending)) {
-        if (pending.senderId !== senderId) continue
-        if ((pending.replies ?? 1) >= 2) return { action: 'drop' }
-        pending.replies = (pending.replies ?? 1) + 1
-        return { action: 'pair', code, isResend: true }
+        for (const [code, pending] of Object.entries(access.pending)) {
+          if (pending.senderId !== senderId) continue
+          if ((pending.replies ?? 1) >= 2) return { action: 'drop' }
+          pending.replies = (pending.replies ?? 1) + 1
+          return { action: 'pair', code, isResend: true }
+        }
+        if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
+
+        const code = randomBytes(3).toString('hex')
+        const now = Date.now()
+        access.pending[code] = {
+          senderId,
+          chatId: channelId,
+          createdAt: now,
+          expiresAt: now + 60 * 60 * 1000,
+          replies: 1,
+        }
+        return { action: 'pair', code, isResend: false }
       }
-      if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
 
-      const code = randomBytes(3).toString('hex')
-      const now = Date.now()
-      access.pending[code] = {
-        senderId,
-        chatId: channelId,
-        createdAt: now,
-        expiresAt: now + 60 * 60 * 1000,
-        replies: 1,
-      }
-      return { action: 'pair', code, isResend: false }
+      const decision = decideChannelPolicy(access.channels[channelId], senderId, isMention, isBot)
+      return decision === 'drop' ? { action: 'drop' } : { action: 'deliver', access }
+    }, ACCESS_FILE)
+  } catch (error) {
+    if (error instanceof AccessLockReleaseError) {
+      process.stderr.write(`slack channel: fatal access lock release failure: ${error.message}\n`)
+      shutdown()
     }
-
-    const decision = decideChannelPolicy(access.channels[channelId], senderId, isMention, isBot)
-    return decision === 'drop' ? { action: 'drop' } : { action: 'deliver', access }
-  }, ACCESS_FILE)
+    throw error
+  }
 }
 
 let slackApp: InstanceType<typeof App> | null = null

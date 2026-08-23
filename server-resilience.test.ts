@@ -95,6 +95,16 @@ describe('Slack bridge resilience wiring', () => {
     expect(shutdown).not.toContain('jobStore.close()')
   })
 
+  test('access lockを解放できなければgatewayを継続せず再起動へ渡す', () => {
+    expect(server).toContain('error instanceof AccessLockReleaseError')
+    expect(server).toContain('fatal access lock release failure')
+    const handler = server.slice(
+      server.indexOf('if (error instanceof AccessLockReleaseError)'),
+      server.indexOf('let slackApp:'),
+    )
+    expect(handler).toContain('shutdown()')
+  })
+
   test('update journal中のcandidate gatewayは受信DBとdedupへeventを確定しない', () => {
     expect(server).toContain("const UPDATE_JOURNAL_FILE = join(STATE_DIR, 'update-transaction.json')")
     expect(server).toContain('if (updateTransactionPending(UPDATE_JOURNAL_FILE)) return Promise.resolve(false)')

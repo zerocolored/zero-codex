@@ -467,11 +467,13 @@ function pidIsAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try {
     process.kill(pid, 0)
-    const state = command(['/bin/ps', '-o', 'state=', '-p', String(pid)])
-    return state.exitCode === 0 && processStateIsAlive(state.stdout)
-  } catch {
-    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
   }
+  const state = command(['/bin/ps', '-o', 'state=', '-p', String(pid)])
+  // kill(2) confirmed that the PID exists. A failed/empty ps observation is
+  // unknown, not dead; callers must keep the lock and fail closed.
+  return state.exitCode !== 0 || state.stdout.length === 0 || processStateIsAlive(state.stdout)
 }
 
 function readPid(path: string): number | undefined {
@@ -498,7 +500,10 @@ function acquireUpdateLock(stateDir: string): { path: string; release: () => voi
   ensureManagedDirectory(stateDir, lockPath)
   const attempt = tryAcquireProcessLock(pidPath)
   if (attempt.acquired === false) {
-    fail(`別のzerokun-updateが実行中です (PID ${attempt.heldPid})`)
+    if (attempt.kind === 'held') {
+      fail(`別のzerokun-updateが実行中です (PID ${attempt.heldPid})`)
+    }
+    fail('zerokun-update lockの所有者を確認できません。安全のため更新を中止します')
   }
   let held = true
   return {
@@ -506,7 +511,9 @@ function acquireUpdateLock(stateDir: string): { path: string; release: () => voi
     release: () => {
       if (!held) return
       held = false
-      releaseProcessLock(pidPath)
+      if (!releaseProcessLock(pidPath, attempt.lease)) {
+        fail('zerokun-update lockを安全に解放できません')
+      }
     },
   }
 }
@@ -1029,7 +1036,9 @@ export async function stopLockedProcess(
   timeoutMs = 30_000,
 ): Promise<void> {
   if (!pidIsAlive(pid)) {
-    discardProcessLock(lockFile, pid)
+    if (!discardProcessLock(lockFile, pid) && readPid(lockFile) !== undefined) {
+      fail(`${label} lockが停止確認中に変化したため更新を停止します`)
+    }
     return
   }
   if (!processLockOwnerMatches(lockFile, pid, commandPattern)) {
@@ -1042,7 +1051,9 @@ export async function stopLockedProcess(
       )
     }
     output(`   stale lock: ${label} PID ${pid} は期待するprocessではないため停止しません`)
-    discardProcessLock(lockFile, pid)
+    if (!discardProcessLock(lockFile, pid)) {
+      fail(`${label} lockの所有者が生存中または確認不能なため更新を停止します`)
+    }
     return
   }
   output(`   stop: ${label} PID ${pid}`)

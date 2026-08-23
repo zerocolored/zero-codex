@@ -1394,7 +1394,7 @@ codex --version
         stdout: 'pipe',
       }).stdout.toString().trim()
       writeFileSync(join(stateDir, 'plugin.lock.identity'), JSON.stringify({
-        pid: gateway.pid, started, nonce: 'normal-setup-token-test',
+        pid: gateway.pid, started, nonce: '12345678-1234-4123-8123-123456789abc',
       }), { mode: 0o600 })
 
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
