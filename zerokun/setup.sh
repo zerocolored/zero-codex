@@ -159,13 +159,15 @@ bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare
 # SQLite migrationでsessionを破棄し、Codex jobとして引き継ぐ。
 SETUP_LOCK="$CH/update.lock"
 SETUP_OWNS_LOCK=0
+SETUP_LOCK_LEASE=""
 WATCHDOG_PLIST_TMP=""
 ZSHRC_TMP=""
 cleanup_setup_lock() {
   [ -z "$WATCHDOG_PLIST_TMP" ] || rm -f -- "$WATCHDOG_PLIST_TMP"
   [ -z "$ZSHRC_TMP" ] || rm -f -- "$ZSHRC_TMP"
   if [ "$SETUP_OWNS_LOCK" = "1" ]; then
-    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" release "$SETUP_LOCK/pid" "$$" || true
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+      release "$SETUP_LOCK/pid" "$SETUP_LOCK_LEASE" || true
   fi
 }
 trap cleanup_setup_lock EXIT
@@ -173,6 +175,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 LOCK_OWNER=""
 if LOCK_OWNER="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" acquire "$SETUP_LOCK/pid" "$$")"; then
+  SETUP_LOCK_LEASE="$LOCK_OWNER"
   SETUP_OWNS_LOCK=1
 else
   if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" != "1" ]; then
@@ -196,8 +199,9 @@ lock_process_matches() {
 pid_is_alive() {
   local pid="$1" state
   kill -0 "$pid" 2>/dev/null || return 1
-  state="$(ps -o state= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
-  [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+  state="$(ps -o state= -p "$pid" 2>/dev/null | tr -d '[:space:]')" || return 0
+  [ -z "$state" ] && return 0
+  [ "${state#Z}" = "$state" ]
 }
 
 read_lock_pid() {

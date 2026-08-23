@@ -5,7 +5,11 @@ import {
   mkdirSync,
 } from 'fs'
 import { join } from 'path'
-import { releaseProcessLock, tryAcquireProcessLock } from './process-lock.ts'
+import {
+  releaseProcessLock,
+  tryAcquireProcessLock,
+  type ProcessLockLease,
+} from './process-lock.ts'
 import { resolveZeroStateDir } from './state-dir.ts'
 import { atomicWritePrivateFile, readOptionalPrivateFile } from './safe-file.ts'
 
@@ -30,6 +34,8 @@ export type AccessConfig = {
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
 }
+
+export class AccessLockReleaseError extends Error {}
 
 export function accessStateDir(): string {
   return resolveZeroStateDir()
@@ -76,9 +82,13 @@ function writeAccessUnlocked(
 function withAccessLock<T>(path: string, action: () => T): T {
   const lockFile = `${path}.lock`
   const startedAt = Date.now()
+  let lease: ProcessLockLease | undefined
   while (true) {
     const attempt = tryAcquireProcessLock(lockFile)
-    if (attempt.acquired) break
+    if (attempt.acquired) {
+      lease = attempt.lease
+      break
+    }
     if (Date.now() - startedAt >= 5_000) {
       throw new Error(`timed out waiting for access config lock: ${lockFile}`)
     }
@@ -87,7 +97,9 @@ function withAccessLock<T>(path: string, action: () => T): T {
   try {
     return action()
   } finally {
-    releaseProcessLock(lockFile)
+    if (!releaseProcessLock(lockFile, lease!)) {
+      throw new AccessLockReleaseError(`failed to release access config lock: ${lockFile}`)
+    }
   }
 }
 

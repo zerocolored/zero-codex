@@ -56,7 +56,7 @@ describe('plugin.lock process identity', () => {
 
     const result = acquirePluginLock(lockFile, dir, process.pid)
 
-    expect(result).toEqual({ acquired: false, heldPid: child.pid })
+    expect(result).toEqual({ acquired: false, kind: 'held', heldPid: child.pid })
     expect(readFileSync(lockFile, 'utf8')).toBe(String(child.pid))
   })
 

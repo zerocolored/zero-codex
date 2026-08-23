@@ -41,6 +41,14 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
   candidate_contract_test() {
     bun test "$1" -t "$2"
   }
+  candidate_contract_test zerokun/process-lock.test.ts \
+    '公開中hardlinkのownerを読めなくても例外化やreclaimをしない'
+  candidate_contract_test zerokun/process-lock.test.ts \
+    '不正なowner内容は取得成功や削除として扱わない'
+  candidate_contract_test zerokun/process-lock.test.ts \
+    'kill成功後のps失敗や空出力をdeadにしない'
+  candidate_contract_test zerokun/process-lock.test.ts \
+    '正規化start時刻の一致とPID再利用を区別する'
   candidate_contract_test zerokun/job-runner.test.ts \
     'gateway再起動時にprocessing inboundをpendingへ戻してFIFOを再開する'
   candidate_contract_test zerokun/job-runner.test.ts \

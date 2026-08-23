@@ -28,9 +28,10 @@ import {
   executeCodexJob,
 } from './codex-executor.ts'
 import {
-  processLockOwnerMatches,
+  inspectProcessLock,
   releaseProcessLock,
   tryAcquireProcessLock,
+  type ProcessLockLease,
 } from './process-lock.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
 import { applyStateEnvironment, parseStateSlackTokens } from './child-environment.ts'
@@ -2279,40 +2280,34 @@ function validateEnqueueInput(raw: unknown): EnqueueInput {
   }
 }
 
-function acquireDaemonLock(lockDir: string, stateRoot: string, appId?: string): boolean {
+function acquireDaemonLock(
+  lockDir: string,
+  stateRoot: string,
+  appId?: string,
+): ProcessLockLease | undefined {
   const pidFile = join(lockDir, 'pid')
   const versionFile = join(lockDir, 'runtime')
   ensureManagedDirectory(stateRoot, lockDir)
   const attempt = tryAcquireProcessLock(pidFile)
-  if (!attempt.acquired) return false
+  if (!attempt.acquired) return undefined
   const runtime = appId ? `${JOB_RUNNER_HANDSHAKE}:${appId}` : JOB_RUNNER_HANDSHAKE
   atomicWritePrivateFile(versionFile, `${runtime}\n`)
-  return true
+  return attempt.lease
 }
 
-function releaseDaemonLock(lockDir: string): void {
-  releaseProcessLock(join(lockDir, 'pid'))
+function releaseDaemonLock(lockDir: string, lease: ProcessLockLease): void {
+  const lockFile = join(lockDir, 'pid')
+  if (!releaseProcessLock(lockFile, lease)) {
+    throw new Error(`failed to release job runner lock: ${lockFile}`)
+  }
 }
 
 export function updateIsRunning(lockDir: string): boolean {
-  try {
-    const lockFile = join(lockDir, 'pid')
-    const updaterPid = Number(readFileSync(lockFile, 'utf8').trim())
-    if (updaterPid <= 0) return false
-    process.kill(updaterPid, 0)
-    if (processLockOwnerMatches(
-      lockFile,
-      updaterPid,
-      /(?:update\.ts|zerokun-update|setup\.sh)(?:\s|$)/,
-    )) {
-      return true
-    }
-    // Backward compatibility for a live setup created before identity files.
-    const command = trackedExecutorCommand(updaterPid)
-    return /setup\.sh(?:\s|$)/.test(command)
-  } catch {
-    return false
-  }
+  const inspection = inspectProcessLock(
+    join(lockDir, 'pid'),
+    /(?:update\.ts|zerokun-update|setup\.sh)(?:\s|$)/,
+  )
+  return inspection.status !== 'missing' && inspection.status !== 'stale'
 }
 
 /**
@@ -2521,7 +2516,8 @@ async function runCli(): Promise<void> {
 
   if (command === 'migrate-legacy') {
     const lockDir = join(dir, 'job-runner.lock')
-    if (!acquireDaemonLock(lockDir, dir)) {
+    const lease = acquireDaemonLock(lockDir, dir)
+    if (!lease) {
       store.close()
       throw new Error('job runner is still running; refuse legacy migration')
     }
@@ -2530,7 +2526,7 @@ async function runCli(): Promise<void> {
       process.stdout.write(`${JSON.stringify({ migrated })}\n`)
     } finally {
       store.close()
-      releaseDaemonLock(lockDir)
+      releaseDaemonLock(lockDir, lease)
     }
     return
   }
@@ -2544,7 +2540,8 @@ async function runCli(): Promise<void> {
 
   if (command === 'recover-interrupted') {
     const lockDir = join(dir, 'job-runner.lock')
-    if (!acquireDaemonLock(lockDir, dir)) {
+    const lease = acquireDaemonLock(lockDir, dir)
+    if (!lease) {
       store.close()
       throw new Error('job runner is still running; refuse interrupted-job recovery')
     }
@@ -2555,7 +2552,7 @@ async function runCli(): Promise<void> {
       process.stdout.write(`${JSON.stringify(recovered)}\n`)
     } finally {
       store.close()
-      releaseDaemonLock(lockDir)
+      releaseDaemonLock(lockDir, lease)
     }
     return
   }
@@ -2604,7 +2601,8 @@ async function runCli(): Promise<void> {
   }
 
   const lockDir = join(dir, 'job-runner.lock')
-  if (!acquireDaemonLock(lockDir, dir, runnerRuntimeId)) {
+  const daemonLease = acquireDaemonLock(lockDir, dir, runnerRuntimeId)
+  if (!daemonLease) {
     process.stderr.write(`zerokun job runner already running (${lockDir})\n`)
     store.close()
     return
@@ -2680,7 +2678,7 @@ async function runCli(): Promise<void> {
     else process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
     store.close()
-    releaseDaemonLock(lockDir)
+    releaseDaemonLock(lockDir, daemonLease)
     // Slack SDK uploads do not expose AbortSignal. After DB/lock cleanup, force the
     // daemon to drop any orphaned HTTP socket so updater shutdown cannot exceed 30s.
     if (interrupted) process.exit(0)

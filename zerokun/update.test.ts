@@ -93,7 +93,7 @@ function makeRepo(base: string) {
     "  const ps = Bun.spawnSync(['/bin/ps', '-o', 'lstart=', '-p', String(process.pid)], { stdout: 'pipe' })",
     "  const started = ps.stdout.toString().trim()",
     "  writeFileSync(path, `${process.pid}\\n`, { mode: 0o600 })",
-    "  writeFileSync(`${path}.identity`, `${JSON.stringify({ pid: process.pid, started, nonce: 'fixture' })}\\n`, { mode: 0o600 })",
+    "  writeFileSync(`${path}.identity`, `${JSON.stringify({ pid: process.pid, started, nonce: '12345678-1234-4123-8123-123456789abc' })}\\n`, { mode: 0o600 })",
     '}',
     '',
   ].join('\n')
@@ -537,7 +537,17 @@ describe('updater helpers', () => {
     const dir = fixtureDir()
     const lockFile = join(dir, 'plugin.lock')
     const unrelated = Bun.spawn(['/bin/sleep', '30'])
-    writeFileSync(lockFile, `${unrelated.pid}\n`)
+    writeFileSync(lockFile, `${unrelated.pid}\n`, { mode: 0o600 })
+    const metadata = lstatSync(lockFile)
+    writeFileSync(`${lockFile}.identity`, `${JSON.stringify({
+      version: 2,
+      pid: unrelated.pid,
+      started: 'Thu Jan  1 00:00:00 1970',
+      canonicalStarted: 'Thu Jan  1 00:00:00 1970',
+      nonce: '12345678-1234-4123-8123-123456789abc',
+      device: metadata.dev,
+      inode: metadata.ino,
+    })}\n`, { mode: 0o600 })
     try {
       await stopLockedProcess(lockFile, unrelated.pid, 'Slack gateway', /server\.ts/)
       expect(() => process.kill(unrelated.pid, 0)).not.toThrow()

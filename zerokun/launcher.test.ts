@@ -40,7 +40,7 @@ function startGateway(state: string): Bun.Subprocess {
     stdout: 'pipe',
   }).stdout.toString().trim()
   writeFileSync(join(state, 'plugin.lock.identity'), JSON.stringify({
-    pid: process.pid, started, nonce: 'launcher-test',
+    pid: process.pid, started, nonce: '12345678-1234-4123-8123-123456789abc',
   }))
   return process
 }
@@ -228,7 +228,7 @@ describe('codex-channel.sh replacement guard', () => {
       writeFileSync(join(state, 'plugin.lock.identity'), JSON.stringify({
         pid: gateway.pid,
         started: 'identity changed while waiting',
-        nonce: 'replacement-process',
+        nonce: 'abcdefab-cdef-4abc-8def-abcdefabcdef',
       }))
     })
     expect(result.exitCode).toBe(1)

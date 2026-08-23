@@ -54,7 +54,7 @@ import {
   resolveGitMetadataPaths,
 } from './codex-executor.ts'
 import { capRuntimeLogs, removeSettledJobState } from './state-maintenance.ts'
-import { adoptLegacyProcessIdentity } from './process-lock.ts'
+import { tryAcquireProcessLock } from './process-lock.ts'
 import { slackTokenPairRuntimeIdentity } from './slack-app-identity.ts'
 import { readProcessIdentity } from './process-tree.ts'
 
@@ -918,11 +918,78 @@ describe('single FIFO worker', () => {
     mkdirSync(lockDir)
     writeFileSync(lockFile, `${process.pid}\n`, { mode: 0o600 })
     try {
-      adoptLegacyProcessIdentity(lockFile, process.pid, ['zerokun-update'])
+      const started = Bun.spawnSync(
+        ['/bin/ps', '-o', 'lstart=', '-p', String(process.pid)],
+        {
+          env: { PATH: '/usr/bin:/bin', TZ: 'Pacific/Honolulu', LC_ALL: 'C', LANG: 'C' },
+          stdout: 'pipe', stderr: 'pipe',
+        },
+      )
+      expect(started.exitCode).toBe(0)
+      writeFileSync(`${lockFile}.identity`, `${JSON.stringify({
+        pid: process.pid,
+        started: started.stdout.toString().trim(),
+        nonce: '12345678-1234-4123-8123-123456789abc',
+      })}\n`, { mode: 0o600 })
       expect(updateIsRunning(lockDir)).toBe(true)
     } finally {
       process.kill('SIGKILL')
       await process.exited
+    }
+  })
+
+  test('updater PIDが無関係processへ再利用されたv2 lockはpauseを解除する', async () => {
+    const dir = fixtureDir()
+    const lockDir = join(dir, 'update.lock')
+    const lockFile = join(lockDir, 'pid')
+    const unrelated = Bun.spawn(['/bin/sleep', '30'], {
+      stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+    })
+    try {
+      const attempt = tryAcquireProcessLock(lockFile, unrelated.pid)
+      expect(attempt.acquired).toBe(true)
+      const identity = JSON.parse(readFileSync(`${lockFile}.identity`, 'utf8'))
+      identity.canonicalStarted = 'Thu Jan  1 00:00:00 1970'
+      writeFileSync(`${lockFile}.identity`, `${JSON.stringify(identity)}\n`, { mode: 0o600 })
+
+      expect(updateIsRunning(lockDir)).toBe(false)
+      expect(() => process.kill(unrelated.pid, 0)).not.toThrow()
+    } finally {
+      unrelated.kill('SIGKILL')
+      await unrelated.exited
+    }
+  })
+
+  test('malformed updater lockはfail-closedでpauseを維持する', () => {
+    const dir = fixtureDir()
+    const lockDir = join(dir, 'update.lock')
+    mkdirSync(lockDir)
+    writeFileSync(join(lockDir, 'pid'), 'invalid\n', { mode: 0o600 })
+    expect(updateIsRunning(lockDir)).toBe(true)
+  })
+
+  test('identity作成前に停止した旧updater PID lockはpauseを解除する', () => {
+    const dir = fixtureDir()
+    const lockDir = join(dir, 'update.lock')
+    mkdirSync(lockDir)
+    writeFileSync(join(lockDir, 'pid'), '2147483647\n', { mode: 0o600 })
+    expect(updateIsRunning(lockDir)).toBe(false)
+  })
+
+  test('identity作成前のPIDが無関係processへ再利用されてもpauseを解除する', async () => {
+    const dir = fixtureDir()
+    const lockDir = join(dir, 'update.lock')
+    const unrelated = Bun.spawn(['/bin/sleep', '30'], {
+      stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+    })
+    mkdirSync(lockDir)
+    writeFileSync(join(lockDir, 'pid'), `${unrelated.pid}\n`, { mode: 0o600 })
+    try {
+      expect(updateIsRunning(lockDir)).toBe(false)
+      expect(() => process.kill(unrelated.pid, 0)).not.toThrow()
+    } finally {
+      unrelated.kill('SIGKILL')
+      await unrelated.exited
     }
   })
 

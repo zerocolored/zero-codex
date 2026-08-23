@@ -3,7 +3,8 @@ import { tryAcquireProcessLock } from './zerokun/process-lock.ts'
 
 export type PluginLockResult =
   | { acquired: true; reclaimedPid?: number }
-  | { acquired: false; heldPid: number }
+  | { acquired: false; kind: 'held'; heldPid: number }
+  | { acquired: false; kind: 'owner-unavailable' }
 
 /** 生存PIDは安全側で保持扱いにし、dead PIDだけをshlockがatomicに回収する。 */
 export function acquirePluginLock(
