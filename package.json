@@ -1,0 +1,22 @@
+{
+  "name": "zerokun-codex-slack",
+  "version": "0.0.1",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": "./server.ts",
+  "scripts": {
+    "start": "bun server.ts",
+    "test": "bun test",
+    "test:live-codex-permissions": "bun zerokun/live-codex-permission-check.ts",
+    "typecheck": "tsc --noEmit",
+    "verify": "bash zerokun/verify.sh"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.0.0",
+    "@slack/web-api": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.10",
+    "typescript": "^5.9.3"
+  }
+}

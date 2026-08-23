@@ -1,0 +1,7 @@
+{
+  "dmPolicy": "pairing",
+  "allowFrom": [],
+  "writeAllowFrom": [],
+  "channels": {},
+  "pending": {}
+}

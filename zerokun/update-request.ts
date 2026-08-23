@@ -1,0 +1,689 @@
+#!/usr/bin/env -S bun --config=/dev/null --no-env-file
+
+import { createHash, randomUUID } from 'crypto'
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs'
+import { homedir } from 'os'
+import { dirname, join } from 'path'
+import { buildUpdaterEnvironment, parseStateSlackTokens } from './child-environment.ts'
+import { atomicWritePrivateFile, openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
+import { requireManagedStateRoot } from './managed-path.ts'
+import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
+import { verifySlackAppTokenPair } from './slack-app-identity.ts'
+
+const REQUEST_FILE = 'update-request.json'
+const WORKER_SESSION = 'zerokun-update-worker'
+const BOT_SESSION_FALLBACK = 'zerokun-slack'
+const DEFAULT_STALE_MS = 6 * 60 * 60 * 1000
+const DEFAULT_SLACK_HTTP_TIMEOUT_MS = 120_000
+const DEFAULT_UPDATE_NOTIFY_ATTEMPTS = 3
+const DEFAULT_UPDATE_WORKER_TIMEOUT_MS = 8 * 60 * 60 * 1000
+const DEFAULT_UPDATE_WORKER_TERM_GRACE_MS = 30 * 60_000
+const NOTIFICATION_NETWORK_OVERRIDE_KEYS = [
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+  'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+  'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+] as const
+
+function botSessionName(stateDir: string): string {
+  try {
+    const content = readOptionalPrivateFile(join(stateDir, 'tmux-session.json'))
+    if (content === null) return BOT_SESSION_FALLBACK
+    const parsed = JSON.parse(content) as { version?: unknown; name?: unknown }
+    if (parsed.version === 1 && typeof parsed.name === 'string'
+      && /^[A-Za-z0-9_-]{1,128}$/.test(parsed.name)) return parsed.name
+  } catch {}
+  return BOT_SESSION_FALLBACK
+}
+
+export interface UpdateRequestInput {
+  chatId: string
+  threadTs: string
+  messageId: string
+  userId: string
+}
+
+export interface UpdateRequest extends UpdateRequestInput {
+  id: string
+  requestedAt: number
+  outcome?: {
+    success: boolean
+    exitCode: number
+    text: string
+    completedAt: number
+    notifiedAt?: number
+  }
+}
+
+export interface UpdateRequestResult {
+  accepted: boolean
+  duplicate: boolean
+  request: UpdateRequest
+}
+
+interface CommandResult {
+  exitCode: number
+  stdout: string
+  stderr: string
+}
+
+interface RequestOptions {
+  stateDir?: string
+  workerFile?: string
+  updaterPath?: string
+  tmuxPath?: string
+  tmuxSession?: string
+  legacyCutover?: boolean
+  projectDir?: string
+  staleAfterMs?: number
+  now?: () => number
+  idFactory?: () => string
+  isWorkerRunning?: () => boolean
+  launchWorker?: (request: UpdateRequest) => void
+  onAccepted?: (request: UpdateRequest) => Promise<void>
+  onDuplicate?: (request: UpdateRequest) => Promise<void>
+}
+
+interface WorkerOptions {
+  stateDir?: string
+  updaterPath?: string
+  executeUpdater?: () => Promise<number>
+  notify?: (request: UpdateRequest, text: string) => Promise<void>
+  maxNotifyAttempts?: number
+  notificationRetryMs?: number
+  updaterTimeoutMs?: number
+  updaterTermGraceMs?: number
+  legacyCutover?: boolean
+  projectDir?: string
+}
+
+export interface UpdateWorkerResult {
+  success: boolean
+  exitCode: number
+  notificationSent: boolean
+}
+
+const decoder = new TextDecoder()
+
+function stateDir(): string {
+  return resolveZeroStateDir()
+}
+
+function requestPath(dir: string): string {
+  return join(dir, REQUEST_FILE)
+}
+
+function requireText(value: string, field: string): string {
+  const normalized = value.trim()
+  if (!normalized) throw new Error(`${field} is required`)
+  return normalized
+}
+
+function validateInput(input: UpdateRequestInput): UpdateRequestInput {
+  return {
+    chatId: requireText(input.chatId, 'chatId'),
+    threadTs: requireText(input.threadTs, 'threadTs'),
+    messageId: requireText(input.messageId, 'messageId'),
+    userId: requireText(input.userId, 'userId'),
+  }
+}
+
+function readRequest(dir: string): UpdateRequest | undefined {
+  try {
+    const content = readOptionalPrivateFile(requestPath(dir))
+    if (content === null) return undefined
+    const parsed = JSON.parse(content) as UpdateRequest
+    const requestedAt = Number(parsed.requestedAt)
+    if (!Number.isFinite(requestedAt)) throw new Error('requestedAt is invalid')
+    return {
+      id: requireText(parsed.id, 'id'),
+      chatId: requireText(parsed.chatId, 'chatId'),
+      threadTs: requireText(parsed.threadTs, 'threadTs'),
+      messageId: requireText(parsed.messageId, 'messageId'),
+      userId: requireText(parsed.userId, 'userId'),
+      requestedAt,
+      ...(parsed.outcome && typeof parsed.outcome.text === 'string'
+        ? {
+          outcome: {
+            success: parsed.outcome.success === true,
+            exitCode: Number(parsed.outcome.exitCode),
+            text: parsed.outcome.text,
+            completedAt: Number(parsed.outcome.completedAt),
+            ...(Number.isFinite(Number(parsed.outcome.notifiedAt))
+              ? { notifiedAt: Number(parsed.outcome.notifiedAt) }
+              : {}),
+          },
+        }
+        : {}),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function persistRequest(dir: string, request: UpdateRequest): void {
+  const path = requestPath(dir)
+  atomicWritePrivateFile(path, JSON.stringify(request, null, 2) + '\n')
+  chmodSync(path, 0o600)
+}
+
+function appendUpdateLog(path: string, content: string): void {
+  const descriptor = openSafeLog(path, 'append')
+  try {
+    writeFileSync(descriptor, content)
+  } finally {
+    closeSync(descriptor)
+  }
+}
+
+function clearRequest(dir: string, requestId: string): void {
+  const current = readRequest(dir)
+  if (current?.id !== requestId) return
+  try {
+    unlinkSync(requestPath(dir))
+  } catch {}
+}
+
+function command(args: string[]): CommandResult {
+  const result = Bun.spawnSync(args, {
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: buildUpdaterEnvironment(),
+  })
+  return {
+    exitCode: result.exitCode,
+    stdout: result.stdout ? decoder.decode(result.stdout).trim() : '',
+    stderr: result.stderr ? decoder.decode(result.stderr).trim() : '',
+  }
+}
+
+function requireCommand(args: string[]): string {
+  const result = command(args)
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr || result.stdout || `command failed: ${args.join(' ')}`)
+  }
+  return result.stdout
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`
+}
+
+function resolveTmuxPath(configured?: string): string {
+  if (configured && existsSync(configured)) return configured
+  for (const candidate of ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux']) {
+    if (existsSync(candidate)) return candidate
+  }
+  const found = command(['/usr/bin/which', 'tmux'])
+  if (found.exitCode === 0 && found.stdout) return found.stdout
+  throw new Error('tmuxがありません。brew install tmux を実行してください')
+}
+
+function tmuxSessionExists(tmux: string, session: string): boolean {
+  return command([tmux, 'has-session', '-t', session]).exitCode === 0
+}
+
+export function launchDetachedUpdateWorker(
+  request: UpdateRequest,
+  options: {
+    stateDir?: string
+    workerFile?: string
+    updaterPath?: string
+    tmuxPath?: string
+    tmuxSession?: string
+    legacyCutover?: boolean
+    projectDir?: string
+  } = {},
+): void {
+  const dir = options.stateDir ?? stateDir()
+  const workerFile = options.workerFile ?? join(dir, 'update-request.ts')
+  const updaterPath = options.updaterPath ?? join(homedir(), '.local', 'bin', 'zerokun-update')
+  const tmux = resolveTmuxPath(options.tmuxPath)
+  const session = options.tmuxSession ?? WORKER_SESSION
+  if (!existsSync(workerFile)) throw new Error(`update workerがありません: ${workerFile}`)
+  if (!existsSync(updaterPath)) throw new Error(`zerokun-updateがありません: ${updaterPath}`)
+  if (tmuxSessionExists(tmux, session)) throw new Error('別のゼロくん更新workerが実行中です')
+  const legacyCutover = options.legacyCutover
+    ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
+  const projectDir = options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
+  const launchEnvironment = {
+    ...buildUpdaterEnvironment(),
+    ZEROKUN_JOB_DB: resolveZeroJobDatabasePath(dir),
+    ZEROKUN_STATE_DIR: dir,
+    ZEROKUN_LEGACY_CUTOVER: legacyCutover ? '1' : '0',
+    ...(projectDir ? { ZEROKUN_PROJECT_DIR: projectDir } : {}),
+  }
+
+  const launchCommand = [
+    'exec /usr/bin/env -i',
+    ...Object.entries(launchEnvironment).map(([key, value]) => `${key}=${shellQuote(value)}`),
+    shellQuote(process.execPath),
+    '--config=/dev/null',
+    '--no-env-file',
+    shellQuote(workerFile),
+    'run',
+    shellQuote(request.id),
+    '--state-dir',
+    shellQuote(dir),
+    '--updater',
+    shellQuote(updaterPath),
+    '--legacy-cutover',
+    legacyCutover ? '1' : '0',
+    ...(projectDir ? ['--project-dir', shellQuote(projectDir)] : []),
+  ].join(' ')
+  requireCommand([
+    tmux,
+    'new-session',
+    '-d',
+    '-s',
+    session,
+    '-x',
+    '100',
+    '-y',
+    '30',
+    '-c',
+    dir,
+    launchCommand,
+  ])
+}
+
+export async function requestUpdate(
+  rawInput: UpdateRequestInput,
+  options: RequestOptions = {},
+): Promise<UpdateRequestResult> {
+  const dir = options.stateDir ?? stateDir()
+  const now = options.now ?? Date.now
+  const session = options.tmuxSession ?? WORKER_SESSION
+  const isWorkerRunning = options.isWorkerRunning
+    ?? (() => tmuxSessionExists(resolveTmuxPath(options.tmuxPath), session))
+  const launch = options.launchWorker ?? ((value: UpdateRequest) => {
+    launchDetachedUpdateWorker(value, {
+      stateDir: dir,
+      legacyCutover: options.legacyCutover,
+      projectDir: options.projectDir,
+      workerFile: options.workerFile,
+      updaterPath: options.updaterPath,
+      tmuxPath: options.tmuxPath,
+      tmuxSession: session,
+    })
+  })
+  const input = validateInput(rawInput)
+  let existing = readRequest(dir)
+  if (!existing && existsSync(requestPath(dir))) {
+    // Another process may still be finishing its small atomic reservation write.
+    // Re-read once before treating the file as abandoned corruption.
+    await Bun.sleep(25)
+    existing = readRequest(dir)
+    if (!existing && existsSync(requestPath(dir))) {
+      if (isWorkerRunning()) {
+        throw new Error('更新予約ファイルが壊れていますがworkerは実行中です')
+      }
+      unlinkSync(requestPath(dir))
+    }
+  }
+  if (existing) {
+    if (existing.outcome?.notifiedAt) {
+      if (existing.chatId === input.chatId && existing.messageId === input.messageId) {
+        await options.onDuplicate?.(existing)
+        return { accepted: false, duplicate: true, request: existing }
+      }
+      clearRequest(dir, existing.id)
+      existing = undefined
+    }
+  }
+  if (existing) {
+    const age = now() - existing.requestedAt
+    const running = isWorkerRunning()
+    if (age <= (options.staleAfterMs ?? DEFAULT_STALE_MS) || running || existing.outcome) {
+      if (!running) launch(existing)
+      await options.onDuplicate?.(existing)
+      return { accepted: false, duplicate: true, request: existing }
+    }
+    clearRequest(dir, existing.id)
+  }
+
+  const request: UpdateRequest = {
+    ...input,
+    id: options.idFactory?.() ?? randomUUID(),
+    requestedAt: now(),
+  }
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  try {
+    writeFileSync(requestPath(dir), JSON.stringify(request, null, 2) + '\n', {
+      flag: 'wx',
+      mode: 0o600,
+    })
+  } catch (error) {
+    const raced = readRequest(dir)
+    if (!raced) throw error
+    await options.onDuplicate?.(raced)
+    return { accepted: false, duplicate: true, request: raced }
+  }
+
+  try {
+    await options.onAccepted?.(request)
+    launch(request)
+    return { accepted: true, duplicate: false, request }
+  } catch (error) {
+    clearRequest(dir, request.id)
+    throw error
+  }
+}
+
+export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean {
+  const dir = options.stateDir ?? stateDir()
+  const request = readRequest(dir)
+  if (!request || request.outcome?.notifiedAt) return false
+  const session = options.tmuxSession ?? WORKER_SESSION
+  const running = options.isWorkerRunning
+    ? options.isWorkerRunning()
+    : tmuxSessionExists(resolveTmuxPath(options.tmuxPath), session)
+  if (running) return false
+  const launch = options.launchWorker ?? ((value: UpdateRequest) => {
+    launchDetachedUpdateWorker(value, {
+      stateDir: dir,
+      legacyCutover: options.legacyCutover,
+      projectDir: options.projectDir,
+      workerFile: options.workerFile,
+      updaterPath: options.updaterPath,
+      tmuxPath: options.tmuxPath,
+      tmuxSession: session,
+    })
+  })
+  launch(request)
+  return true
+}
+
+function loadSlackTokens(dir: string): { botToken: string; appToken: string } {
+  const envPath = join(dir, '.env')
+  const tokens = parseStateSlackTokens(readOptionalPrivateFile(envPath) ?? '')
+  if (tokens.SLACK_BOT_TOKEN && tokens.SLACK_APP_TOKEN) {
+    return { botToken: tokens.SLACK_BOT_TOKEN, appToken: tokens.SLACK_APP_TOKEN }
+  }
+  throw new Error(`Slack Bot/App token pairがありません: ${envPath}`)
+}
+
+export async function withUpdateSlackDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeout = DEFAULT_SLACK_HTTP_TIMEOUT_MS,
+): Promise<T> {
+  const deadline = Math.max(1, Math.floor(timeout))
+  const controller = new AbortController()
+  let rejectTimeout: ((error: Error) => void) | undefined
+  const timeoutPromise = new Promise<never>((_, reject) => { rejectTimeout = reject })
+  const timer = setTimeout(() => {
+    controller.abort()
+    rejectTimeout?.(new Error(`Slack update notification timed out after ${deadline}ms`))
+  }, deadline)
+  try {
+    return await Promise.race([operation(controller.signal), timeoutPromise])
+  } finally {
+    clearTimeout(timer)
+    controller.abort()
+  }
+}
+
+export async function withoutUpdateNotificationNetworkOverrides<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  const saved = new Map<string, string>()
+  for (const key of NOTIFICATION_NETWORK_OVERRIDE_KEYS) {
+    const value = process.env[key]
+    if (value !== undefined) saved.set(key, value)
+    delete process.env[key]
+  }
+  try {
+    return await operation()
+  } finally {
+    for (const key of NOTIFICATION_NETWORK_OVERRIDE_KEYS) delete process.env[key]
+    for (const [key, value] of saved) process.env[key] = value
+  }
+}
+
+async function notifySlack(dir: string, request: UpdateRequest, text: string): Promise<void> {
+  const { botToken, appToken } = loadSlackTokens(dir)
+  await withoutUpdateNotificationNetworkOverrides(async () => {
+    const callIdentityApi = async (
+      method: 'auth.test' | 'bots.info',
+      fields: Record<string, string> = {},
+    ): Promise<Record<string, any>> => {
+      const response = await withUpdateSlackDeadline(signal => fetch(
+        `https://slack.com/api/${method}`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${botToken}`,
+            'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+          },
+          body: new URLSearchParams(fields),
+          signal,
+        },
+      ), 10_000)
+      const result = await response.json() as Record<string, any>
+      if (!result.ok) throw new Error(result.error ?? `Slack ${method} HTTP ${response.status}`)
+      return result
+    }
+    await verifySlackAppTokenPair(appToken, {
+      authTest: async () => {
+        const result = await callIdentityApi('auth.test')
+        return {
+          app_id: result.app_id,
+          bot_id: result.bot_id,
+          user_id: result.user_id,
+        }
+      },
+      botsInfo: async bot => {
+        const result = await callIdentityApi('bots.info', { bot })
+        return { app_id: result.bot?.app_id as string | undefined }
+      },
+    })
+  })
+  let lastError = 'unknown error'
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await withoutUpdateNotificationNetworkOverrides(() => (
+        withUpdateSlackDeadline(signal => fetch(
+          'https://slack.com/api/chat.postMessage', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${botToken}`,
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+          body: JSON.stringify({
+            channel: request.chatId,
+            thread_ts: request.threadTs,
+            text,
+            client_msg_id: updateNotificationClientId(request.id),
+          }),
+          signal,
+        }), Number(process.env.ZEROKUN_SLACK_HTTP_TIMEOUT_MS) || DEFAULT_SLACK_HTTP_TIMEOUT_MS)
+      ))
+      const result = await response.json() as { ok?: boolean; error?: string }
+      if (result.ok) return
+      lastError = result.error ?? `HTTP ${response.status}`
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error)
+    }
+    if (attempt < 3) await Bun.sleep(attempt * 1_000)
+  }
+  throw new Error(`Slack完了通知に失敗しました: ${lastError}`)
+}
+
+function updateNotificationClientId(requestId: string): string {
+  const hex = createHash('sha256').update(`zerokun-update:${requestId}`).digest('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+}
+
+function signalProcessGroup(proc: Bun.Subprocess, signal: NodeJS.Signals): void {
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-proc.pid, signal)
+      return
+    } catch {}
+  }
+  try { proc.kill(signal) } catch {}
+}
+
+export async function executeUpdater(
+  updaterPath: string,
+  logPath: string,
+  timeoutMs = Number(process.env.ZEROKUN_UPDATE_WORKER_TIMEOUT_MS)
+    || DEFAULT_UPDATE_WORKER_TIMEOUT_MS,
+  termGraceMs = DEFAULT_UPDATE_WORKER_TERM_GRACE_MS,
+  environment: Record<string, string | undefined> = process.env,
+): Promise<number> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('updater worker timeoutが不正です')
+  }
+  const logFd = openSafeLog(logPath, 'append')
+  try {
+    writeFileSync(logFd, `\n${new Date().toISOString()} update request started\n`)
+    const childEnvironment = buildUpdaterEnvironment(environment)
+    if (environment.ZEROKUN_STATE_DIR) {
+      childEnvironment.ZEROKUN_JOB_DB = resolveZeroJobDatabasePath(
+        environment.ZEROKUN_STATE_DIR,
+        environment,
+      )
+    }
+    const proc = Bun.spawn([
+      process.execPath, '--config=/dev/null', '--no-env-file', updaterPath,
+    ], {
+      cwd: environment.ZEROKUN_STATE_DIR ?? dirname(updaterPath),
+      stdin: 'ignore',
+      stdout: logFd,
+      stderr: logFd,
+      env: childEnvironment,
+      detached: process.platform !== 'win32',
+    })
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<'timeout'>(resolve => {
+      timeout = setTimeout(() => resolve('timeout'), timeoutMs)
+    })
+    const naturalExit = proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode }))
+    const outcome = await Promise.race([naturalExit, deadline])
+    if (timeout) clearTimeout(timeout)
+    if (outcome !== 'timeout') return outcome.exitCode
+
+    signalProcessGroup(proc, 'SIGTERM')
+    const afterTerm = await Promise.race([
+      proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
+      Bun.sleep(termGraceMs).then(() => ({ kind: 'grace' as const })),
+    ])
+    if (afterTerm.kind === 'grace') {
+      signalProcessGroup(proc, 'SIGKILL')
+      await proc.exited
+    }
+    throw new Error(`zerokun-updateが${timeoutMs}msでtimeoutしました`)
+  } finally {
+    closeSync(logFd)
+  }
+}
+
+export async function runUpdateWorker(
+  requestId: string,
+  options: WorkerOptions = {},
+): Promise<UpdateWorkerResult> {
+  const dir = options.stateDir ?? stateDir()
+  requireManagedStateRoot(dir)
+  const request = readRequest(dir)
+  if (!request || request.id !== requestId) throw new Error(`更新依頼が見つかりません: ${requestId}`)
+  const logPath = join(dir, 'update-request.log')
+  const updaterPath = options.updaterPath ?? join(homedir(), '.local', 'bin', 'zerokun-update')
+  const legacyCutover = options.legacyCutover
+    ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
+  const projectDir = options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
+  const updaterEnvironment = {
+    ...buildUpdaterEnvironment(),
+    ZEROKUN_JOB_DB: resolveZeroJobDatabasePath(dir),
+    ZEROKUN_STATE_DIR: dir,
+    ZEROKUN_LEGACY_CUTOVER: legacyCutover ? '1' : '0',
+    ...(projectDir ? { ZEROKUN_PROJECT_DIR: projectDir } : {}),
+  }
+  const run = options.executeUpdater ?? (() => executeUpdater(
+    updaterPath,
+    logPath,
+    options.updaterTimeoutMs,
+    options.updaterTermGraceMs,
+    updaterEnvironment,
+  ))
+  const notify = options.notify ?? ((value: UpdateRequest, text: string) => notifySlack(dir, value, text))
+
+  let outcome = request.outcome
+  if (!outcome) {
+    let exitCode = 1
+    let success = false
+    let errorText = ''
+    try {
+      exitCode = await run()
+      success = exitCode === 0
+      if (!success) errorText = `zerokun-updateが終了コード${exitCode}で失敗しました。`
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error)
+    }
+    const text = success
+      ? `✅ Codex版ゼロくん更新完了（request ${request.id.slice(0, 8)}）\n更新・テスト・setup・再起動が完了しました。\n画面を見る: tmux attach -t ${botSessionName(dir)} （抜けるのは Ctrl-b → d。閉じてもゼロくんは止まりません）`
+      : `❌ ゼロくん更新失敗（request ${request.id.slice(0, 8)}）\n${errorText}\nログ: ${logPath}`
+    outcome = { success, exitCode, text, completedAt: Date.now() }
+    persistRequest(dir, { ...request, outcome })
+  }
+
+  const maxAttempts = Math.max(1, Math.floor(
+    options.maxNotifyAttempts ?? DEFAULT_UPDATE_NOTIFY_ATTEMPTS,
+  ))
+  const retryMs = Math.max(1, options.notificationRetryMs ?? 60_000)
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await notify(request, outcome.text)
+      outcome = { ...outcome, notifiedAt: Date.now() }
+      persistRequest(dir, { ...request, outcome })
+      return { success: outcome.success, exitCode: outcome.exitCode, notificationSent: true }
+    } catch (error) {
+      appendUpdateLog(
+        logPath,
+        `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}\n`,
+      )
+      if (attempt < maxAttempts) await Bun.sleep(retryMs)
+    }
+  }
+  return { success: outcome.success, exitCode: outcome.exitCode, notificationSent: false }
+}
+
+function optionValue(args: string[], name: string): string | undefined {
+  const index = args.indexOf(name)
+  return index >= 0 ? args[index + 1] : undefined
+}
+
+async function runCli(): Promise<void> {
+  const args = process.argv.slice(2)
+  if (args[0] !== 'run' || !args[1]) {
+    throw new Error('usage: update-request.ts run <request-id> [--state-dir DIR] [--updater PATH]')
+  }
+  const legacyCutover = optionValue(args, '--legacy-cutover')
+  const projectDir = optionValue(args, '--project-dir')
+  if (legacyCutover !== undefined && legacyCutover !== '0' && legacyCutover !== '1') {
+    throw new Error('--legacy-cutoverは0または1で指定してください')
+  }
+  const result = await runUpdateWorker(args[1], {
+    stateDir: optionValue(args, '--state-dir'),
+    updaterPath: optionValue(args, '--updater'),
+    legacyCutover: legacyCutover === undefined ? undefined : legacyCutover === '1',
+    projectDir,
+  })
+  if (!result.success || !result.notificationSent) process.exitCode = 1
+}
+
+if (import.meta.main) {
+  runCli().catch(error => {
+    process.stderr.write(`zerokun update worker: ${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = 1
+  })
+}

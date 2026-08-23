@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to the Zero-kun state directory as routes.json. Each Slack channel must name an absolute repo_path and is pinned to it when its first Codex job is enqueued. DMs use the gateway working directory; unmapped channels are ignored.",
+
+  "C0ABC123EXAMPLE": {
+    "repo_path": "/absolute/path/to/project-a",
+    "label": "Project A"
+  },
+  "C0DEF456EXAMPLE": {
+    "repo_path": "/absolute/path/to/project-b",
+    "label": "Project B"
+  }
+}

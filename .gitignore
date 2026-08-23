@@ -1,0 +1,7 @@
+node_modules/
+.env
+.venv/
+*.log
+.letta/
+.DS_Store
+claude-channel.sh.bak-*
