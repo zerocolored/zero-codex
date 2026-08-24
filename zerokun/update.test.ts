@@ -49,6 +49,7 @@ import {
   type ProcessIdentity,
 } from './process-tree.ts'
 import { signalProcessIfLive } from './process-generation.ts'
+import { resolveOfficialStandaloneCodex } from './standalone-codex.ts'
 
 const directories: string[] = []
 const tmuxSessions: string[] = []
@@ -91,22 +92,7 @@ function must(args: string[], cwd?: string): string {
 }
 
 function installedNativeCodex(): string {
-  const discovered = Bun.which('codex')
-  if (!discovered) throw new Error('Codex CLI is not installed')
-  const launcher = realpathSync(discovered)
-  if (!launcher.endsWith('.js')) return launcher
-  const packageRoot = dirname(dirname(launcher))
-  const target = process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin'
-  return realpathSync(join(
-    packageRoot,
-    'node_modules',
-    '@openai',
-    `codex-darwin-${process.arch}`,
-    'vendor',
-    target,
-    'bin',
-    'codex',
-  ))
+  return resolveOfficialStandaloneCodex().physical
 }
 
 function makeRepo(base: string) {
@@ -183,7 +169,12 @@ function updaterFixture() {
   const setupMarker = join(base, 'setup-ran')
   mkdirSync(state)
   mkdirSync(project)
-  writeFileSync(setup, `#!/bin/bash\ntouch '${setupMarker}'\n`)
+  writeFileSync(setup, [
+    '#!/bin/bash',
+    '[ -z "${ZEROKUN_CODEX_BIN+x}" ] || { echo "updater-only Codex override leaked" >&2; exit 79; }',
+    `touch ${JSON.stringify(setupMarker)}`,
+    '',
+  ].join('\n'))
   chmodSync(setup, 0o700)
   return { base, repo, state, project, setup, setupMarker }
 }
@@ -375,8 +366,13 @@ describe('updater helpers', () => {
     const wrapper = join(root, 'codex')
     writeFileSync(wrapper, '#!/bin/sh\nexec /opt/homebrew/bin/codex "$@"\n', { mode: 0o700 })
     expect(nativeExecutableHeaderSupported(Buffer.from('#!/b'), 'darwin')).toBe(false)
-    expect(nativeExecutableHeaderSupported(Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), 'darwin'))
+    expect(nativeExecutableHeaderSupported(
+      Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1]), 'darwin', 'arm64',
+    ))
       .toBe(true)
+    expect(nativeExecutableHeaderSupported(
+      Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x07, 0, 0, 1]), 'darwin', 'arm64',
+    )).toBe(false)
     expect(() => resolveUpdaterCodexBinary({ ZEROKUN_CODEX_BIN: wrapper }))
       .toThrow('native binary')
   })

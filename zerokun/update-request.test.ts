@@ -14,6 +14,7 @@ import {
   buildCandidateEnvironment,
   buildRuntimeLaunchEnvironment,
   buildRuntimeServiceEnvironment,
+  buildSetupEnvironment,
   buildUpdaterEnvironment,
 } from './child-environment'
 import { observeProcessGeneration, readProcessIdentity } from './process-generation'
@@ -115,6 +116,7 @@ describe('Slack update request', () => {
       ZEROKUN_UPDATE_TESTING: '1',
       ZEROKUN_SLACK_IDENTITY_TEST_APP_ID: 'AOLDAPP123',
       ZEROKUN_SETUP_TEST_STOP_PROBE: '/tmp/should-not-be-used',
+      ZEROKUN_CODEX_BIN: '/tmp/ambient-codex',
       HTTPS_PROXY: 'http://ambient-proxy.invalid',
       NODE_TLS_REJECT_UNAUTHORIZED: '0',
     }
@@ -127,6 +129,12 @@ describe('Slack update request', () => {
       'ZEROKUN_UPDATE_TESTING=1',
       'ZEROKUN_SLACK_IDENTITY_TEST_APP_ID=AATTACKER1',
       'ZEROKUN_SETUP_TEST_STOP_PROBE=/tmp/state-probe',
+      'ZEROKUN_CODEX_BIN=/tmp/state-codex',
+      'ZEROKUN_SETUP_SCRIPT=/tmp/state-setup.sh',
+      'ZEROKUN_JOB_RUNNER=/tmp/state-runner.ts',
+      'ZEROKUN_TMUX_PATH=/tmp/state-tmux',
+      'ZEROKUN_UPDATE_BRANCH=attacker-branch',
+      'ZEROKUN_CATCHUP_LIMIT=25',
       '',
     ].join('\n'), environment)
     expect(environment.SLACK_BOT_TOKEN).toBe('xoxb-new-app-not-real')
@@ -137,6 +145,12 @@ describe('Slack update request', () => {
     expect(environment.ZEROKUN_UPDATE_TESTING).toBeUndefined()
     expect(environment.ZEROKUN_SLACK_IDENTITY_TEST_APP_ID).toBeUndefined()
     expect(environment.ZEROKUN_SETUP_TEST_STOP_PROBE).toBeUndefined()
+    expect(environment.ZEROKUN_CODEX_BIN).toBeUndefined()
+    expect(environment.ZEROKUN_SETUP_SCRIPT).toBeUndefined()
+    expect(environment.ZEROKUN_JOB_RUNNER).toBeUndefined()
+    expect(environment.ZEROKUN_TMUX_PATH).toBeUndefined()
+    expect(environment.ZEROKUN_UPDATE_BRANCH).toBeUndefined()
+    expect(environment.ZEROKUN_CATCHUP_LIMIT).toBe('25')
 
     expect(() => applyStateEnvironment([
       'SLACK_BOT_TOKEN=xoxb-valid-not-a-real-token',
@@ -179,6 +193,8 @@ describe('Slack update request', () => {
     expect(updater.ALL_PROXY).toBeUndefined()
     expect(updater.NO_PROXY).toBeUndefined()
     expect(updater.ZEROKUN_UPDATE_TESTING).toBeUndefined()
+    const setup = buildSetupEnvironment({ ...source, ZEROKUN_CODEX_BIN: '/trusted/updater-codex' })
+    expect(setup.ZEROKUN_CODEX_BIN).toBeUndefined()
     const candidate = buildCandidateEnvironment('/isolated', source)
     expect(candidate.HOME).toBe('/isolated')
     expect(candidate.CODEX_HOME).toBe('/isolated')
@@ -194,6 +210,7 @@ describe('Slack update request', () => {
     const service = buildRuntimeServiceEnvironment(source)
     expect(service.ZEROKUN_JOB_DB).toBeUndefined()
     expect(service.ZEROKUN_SETUP_SCRIPT).toBeUndefined()
+    expect(service.ZEROKUN_CODEX_BIN).toBeUndefined()
   })
 
   test('workerは選択stateとcutover flagをambient環境に頼らずupdaterへ固定する', async () => {

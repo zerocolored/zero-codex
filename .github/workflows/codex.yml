@@ -25,7 +25,19 @@ jobs:
       - name: Install test runtime
         run: |
           brew install tmux
-          npm install --global @openai/codex@${{ matrix.codex-version }}
+          export PATH="$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          installer="$(/usr/bin/mktemp "${RUNNER_TEMP}/codex-install.XXXXXX")"
+          trap '/bin/rm -f "$installer"' EXIT
+          /usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" \
+            /usr/bin/curl -q --fail --location --proto '=https' \
+              --proto-redir '=https' --tlsv1.2 --noproxy '*' \
+              --output "$installer" https://chatgpt.com/codex/install.sh
+          /usr/bin/env -i PATH="$PATH" HOME="$HOME" SHELL=/bin/bash \
+            CODEX_NON_INTERACTIVE=1 \
+            /bin/sh "$installer" --release '${{ matrix.codex-version }}'
+          "$HOME/.local/bin/codex" --version
+          bun --config=/dev/null --no-env-file zerokun/standalone-codex.ts version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Verify Codex-native Zero-kun
         run: bash zerokun/verify.sh
       - name: Verify Codex managed-config protocol

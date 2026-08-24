@@ -21,7 +21,12 @@ const bootstrap = join(import.meta.dir, 'bootstrap-macos.sh')
 
 function setupTestPath(fakeHome: string, botAppId?: string): string {
   const fakeBin = join(fakeHome, 'zerokun-test-bin')
+  const localBin = join(fakeHome, '.local', 'bin')
   mkdirSync(fakeBin, { recursive: true })
+  mkdirSync(localBin, { recursive: true })
+  writeFileSync(join(localBin, 'codex'), '#!/bin/bash\necho "codex-cli 0.149.1"\n', {
+    mode: 0o700,
+  })
   const configuredAppId = join(fakeHome, '.zerokun-test-bot-app-id')
   if (botAppId) writeFileSync(configuredAppId, `${botAppId}\n`, { mode: 0o600 })
   else rmSync(configuredAppId, { force: true })
@@ -39,6 +44,13 @@ function setupTestPath(fakeHome: string, botAppId?: string): string {
     '    exit 1',
     '  fi',
     '  echo "Slack App token identity: verified"',
+    '  exit 0',
+    'fi',
+    'if [[ "$*" == *"codex-executor.ts verify-system-config"* ]]; then',
+    '  exit 0',
+    'fi',
+    'if [[ "$*" == *"standalone-codex.ts version"* ]]; then',
+    '  echo "0.149.1"',
     '  exit 0',
     'fi',
     'if [[ "$*" == *"update.ts --setup-supervisor"* ]]; then',
@@ -368,12 +380,13 @@ describe('macOS bootstrap', () => {
     expect(script).not.toContain('install --cask codex')
     expect(script).toContain('standalone_codex="$HOME/.local/bin/codex"')
     expect(script).toContain('secure_standalone_codex()')
-    expect(script).toContain('.codex/packages/standalone/releases/')
+    expect(script).toContain('standalone = os.path.join(home, ".codex", "packages", "standalone")')
     expect(script).toContain("permissions & 8#22")
-    expect(script).toContain('feedfacf|cffaedfe')
+    expect(script).toContain('expected_header = b"\\xcf\\xfa\\xed\\xfe')
+    expect(script).toContain('expected_keys = {"layoutVersion"')
     expect(script).toContain('https://chatgpt.com/codex/install.sh')
     expect(script).not.toContain('claude auth login')
-    expect(script).toContain('codex login')
+    expect(script).toContain('"$standalone_codex" login')
     expect(script).not.toContain('gh auth login')
     expect(script).toContain('zerocolored/zero-codex')
     expect(script).toContain('ensure_repo zerocolored/zero-codex "$REPO_DIR" main')
@@ -476,17 +489,34 @@ codex --version
         source.indexOf('bootstrap_safe_directory_chain()'),
         source.indexOf('install_codex_standalone()'),
       )
-      const base = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-secure-codex-'))
+      const base = realpathSync(mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-secure-codex-')))
       const fakeHome = join(base, 'home')
       const localBin = join(fakeHome, '.local/bin')
-      const release = join(fakeHome, '.codex/packages/standalone/releases/0.149.0')
+      const target = process.arch === 'arm64'
+        ? 'aarch64-apple-darwin'
+        : 'x86_64-apple-darwin'
+      const standalone = join(fakeHome, '.codex/packages/standalone')
+      const release = join(standalone, `releases/0.149.0-${target}`)
       mkdirSync(localBin, { recursive: true })
-      mkdirSync(release, { recursive: true })
-      const native = join(release, 'codex')
-      writeFileSync(native, Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]), { mode: 0o700 })
-      symlinkSync(native, join(localBin, 'codex'))
+      mkdirSync(join(release, 'bin'), { recursive: true })
+      const native = join(release, 'bin/codex')
+      const cpu = process.arch === 'arm64'
+        ? [0x0c, 0x00, 0x00, 0x01]
+        : [0x07, 0x00, 0x00, 0x01]
+      writeFileSync(native, Buffer.from([0xcf, 0xfa, 0xed, 0xfe, ...cpu]), { mode: 0o700 })
+      writeFileSync(join(release, 'codex-package.json'), JSON.stringify({
+        layoutVersion: 1,
+        version: '0.149.0',
+        target,
+        variant: 'codex',
+        entrypoint: 'bin/codex',
+        resourcesDir: 'codex-resources',
+        pathDir: 'codex-path',
+      }), { mode: 0o600 })
+      symlinkSync(release, join(standalone, 'current'))
+      symlinkSync(join(standalone, 'current/bin/codex'), join(localBin, 'codex'))
       const harness = join(base, 'harness.sh')
-      writeFileSync(harness, `#!/bin/bash\nset -euo pipefail\n${functions}\nsecure_standalone_codex\n`)
+      writeFileSync(harness, `#!/bin/bash\nset -euo pipefail\nMIN_CODEX_VERSION=0.149.0\n${functions}\nsecure_standalone_codex\n`)
       chmodSync(harness, 0o700)
       try {
         const accepted = Bun.spawnSync([harness], {
@@ -495,7 +525,7 @@ codex --version
         })
         expect(accepted.exitCode, accepted.stderr.toString()).toBe(0)
         rmSync(join(localBin, 'codex'))
-        writeFileSync(join(localBin, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+        symlinkSync(native, join(localBin, 'codex'))
         const rejected = Bun.spawnSync([harness], {
           env: { HOME: realpathSync(fakeHome), PATH: '/usr/bin:/bin' },
           stdout: 'pipe', stderr: 'pipe',

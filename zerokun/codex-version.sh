@@ -3,10 +3,9 @@
 ZEROKUN_MIN_CODEX_VERSION="0.149.0"
 
 zerokun_codex_version() {
-  local codex_bin="${ZEROKUN_CODEX_BIN:-codex}"
-  "$codex_bin" --version 2>/dev/null \
-    | sed -nE 's/^[^0-9]*([0-9]+\.[0-9]+\.[0-9]+).*$/\1/p' \
-    | head -n 1
+  local repo_dir="$1"
+  bun --config=/dev/null --no-env-file \
+    "$repo_dir/zerokun/standalone-codex.ts" version 2>/dev/null
 }
 
 zerokun_version_at_least() {
@@ -23,13 +22,18 @@ zerokun_version_at_least() {
 }
 
 zerokun_require_codex_version() {
-  local codex_bin="${ZEROKUN_CODEX_BIN:-codex}"
-  command -v "$codex_bin" >/dev/null 2>&1 || {
-    echo "❌ Codex CLI が見つかりません。" >&2
+  local repo_dir="${1:-}"
+  if [[ -n "${ZEROKUN_CODEX_BIN+x}" ]]; then
+    echo "❌ ZEROKUN_CODEX_BIN はSlack runtimeでは利用できません。" >&2
+    echo "   .envから削除し、このrepositoryで bash zerokun/bootstrap-macos.sh --skip-slack を実行してください。" >&2
+    return 1
+  fi
+  [[ -n "$repo_dir" ]] && [[ -f "$repo_dir/zerokun/standalone-codex.ts" ]] || {
+    echo "❌ Codex runtime verifierを解決できません。" >&2
     return 1
   }
   local actual
-  actual="$(zerokun_codex_version)"
+  actual="$(zerokun_codex_version "$repo_dir")"
   if [ -z "$actual" ] || ! zerokun_version_at_least "$actual" "$ZEROKUN_MIN_CODEX_VERSION"; then
     echo "❌ Codex CLI ${ZEROKUN_MIN_CODEX_VERSION} 以上が必要です（検出: ${actual:-不明}）。" >&2
     echo "   このrepositoryで bash zerokun/bootstrap-macos.sh --skip-slack を実行してください。" >&2

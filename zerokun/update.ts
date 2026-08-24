@@ -45,6 +45,7 @@ import { readGatewayReadiness } from './readiness.ts'
 import {
   buildCandidateEnvironment,
   buildRuntimeServiceEnvironment,
+  buildSetupEnvironment,
   buildUpdaterEnvironment,
 } from './child-environment.ts'
 import {
@@ -175,15 +176,20 @@ function secureExecutable(candidate: string): string | null {
 export function nativeExecutableHeaderSupported(
   header: Uint8Array,
   platform = process.platform,
+  architecture = process.arch,
 ): boolean {
   if (header.byteLength < 4) return false
   const magic = [...header.subarray(0, 4)]
     .map(value => value.toString(16).padStart(2, '0')).join('')
   if (platform === 'darwin') {
-    return new Set([
-      'feedface', 'cefaedfe', 'feedfacf', 'cffaedfe',
-      'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca',
-    ]).has(magic)
+    if (header.byteLength < 8) return false
+    if (architecture !== 'arm64' && architecture !== 'x64') return false
+    const cpu = [...header.subarray(4, 8)]
+      .map(value => value.toString(16).padStart(2, '0')).join('')
+    const expectedLittleEndianCpu = architecture === 'arm64' ? '0c000001' : '07000001'
+    const expectedBigEndianCpu = architecture === 'arm64' ? '0100000c' : '01000007'
+    return (magic === 'cffaedfe' && cpu === expectedLittleEndianCpu)
+      || (magic === 'feedfacf' && cpu === expectedBigEndianCpu)
   }
   if (platform === 'linux') return magic === '7f454c46'
   return false
@@ -216,7 +222,7 @@ function copySecureExecutable(
       fail(`実行fileが検証中に変化しました: ${candidate}`)
     }
     if (requireNative) {
-      const header = Buffer.alloc(4)
+      const header = Buffer.alloc(8)
       if (readSync(source, header, 0, header.length, 0) !== header.length
         || !nativeExecutableHeaderSupported(header)) {
         fail(`Codex executableがnative binaryではありません: ${candidate}`)
@@ -1971,7 +1977,7 @@ async function rollbackUpdate(
     cwd: journal.repoPath,
     inherit: !options.testing,
     env: {
-      ...buildUpdaterEnvironment(),
+      ...buildSetupEnvironment(),
       ZEROKUN_STATE_DIR: stateDir,
       ZEROKUN_UPDATE_IN_PROGRESS: '1',
     },
@@ -2013,7 +2019,7 @@ async function superviseStandaloneSetup(testing = false): Promise<void> {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
     output('▶ Codex版standalone setup')
-    const setupEnvironment = buildUpdaterEnvironment()
+    const setupEnvironment = buildSetupEnvironment()
     for (const key of [
       'ZEROKUN_BOOTSTRAP',
       'ZEROKUN_SETUP_DRAIN_SECONDS',
@@ -2176,7 +2182,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
         cwd: rootRepo,
         inherit: !testing,
         env: {
-          ...buildUpdaterEnvironment(),
+          ...buildSetupEnvironment(),
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_UPDATE_IN_PROGRESS: '1',
         },

@@ -622,48 +622,104 @@ EOF
   done
 }
 
-bootstrap_resolve_executable() {
-  local current="$1" parent physical_parent target count=0
-  while [ "$count" -lt 32 ]; do
-    parent="$(/usr/bin/dirname "$current")"
-    physical_parent="$(CDPATH='' cd -P -- "$parent" 2>/dev/null && pwd -P)" || return 1
-    current="$physical_parent/$(/usr/bin/basename "$current")"
-    [ -L "$current" ] || { printf '%s\n' "$current"; return; }
-    target="$(/usr/bin/readlink "$current")" || return 1
-    case "$target" in
-      /*) current="$target" ;;
-      *) current="$physical_parent/$target" ;;
-    esac
-    count=$((count + 1))
-  done
-  return 1
-}
-
 secure_standalone_codex() {
-  local logical="$HOME/.local/bin/codex" physical home_physical metadata uid links mode type permissions magic
-  [ -e "$logical" ] || [ -L "$logical" ] || return 1
-  bootstrap_safe_directory_chain "$(/usr/bin/dirname "$logical")" || return 1
-  metadata="$(/usr/bin/stat -f '%u:%l:%HT' "$logical" 2>/dev/null)" || return 1
-  IFS=: read -r uid links type <<EOF
-$metadata
-EOF
-  [ "$uid" = "$(/usr/bin/id -u)" ] || [ "$uid" = "0" ] || return 1
-  case "$type" in 'Regular File') [ "$links" = "1" ] || return 1 ;; 'Symbolic Link') ;; *) return 1 ;; esac
-  physical="$(bootstrap_resolve_executable "$logical")" || return 1
-  home_physical="$(CDPATH='' cd -P -- "$HOME" 2>/dev/null && pwd -P)" || return 1
-  case "$physical" in "$home_physical/.codex/packages/standalone/releases/"*) ;; *) return 1 ;; esac
-  bootstrap_safe_directory_chain "$(/usr/bin/dirname "$physical")" || return 1
-  metadata="$(/usr/bin/stat -f '%u:%l:%Lp:%HT' "$physical" 2>/dev/null)" || return 1
-  IFS=: read -r uid links mode type <<EOF
-$metadata
-EOF
-  [ "$type" = "Regular File" ] && [ "$links" = "1" ] || return 1
-  [ "$uid" = "$(/usr/bin/id -u)" ] || [ "$uid" = "0" ] || return 1
-  permissions=$((8#$mode))
-  [ $((permissions & 8#22)) -eq 0 ] && [ $((permissions & 8#111)) -ne 0 ] || return 1
-  magic="$(/usr/bin/od -An -tx1 -N4 "$physical" 2>/dev/null | /usr/bin/tr -d '[:space:]')" || return 1
-  case "$magic" in feedface|cefaedfe|feedfacf|cffaedfe|cafebabe|bebafeca|cafebabf|bfbafeca) ;; *) return 1 ;; esac
-  printf '%s\n' "$physical"
+  [ -x /usr/bin/python3 ] || return 1
+  /usr/bin/python3 -c '
+import json
+import os
+import re
+import stat
+import sys
+
+home = os.path.realpath(sys.argv[1])
+uid = os.getuid()
+allowed_owners = {0, uid}
+target = "aarch64-apple-darwin" if os.uname().machine == "arm64" else "x86_64-apple-darwin" if os.uname().machine == "x86_64" else None
+if target is None:
+    raise SystemExit(1)
+logical = os.path.join(home, ".local", "bin", "codex")
+standalone = os.path.join(home, ".codex", "packages", "standalone")
+current = os.path.join(standalone, "current")
+releases = os.path.join(standalone, "releases")
+entry = os.path.join(current, "bin", "codex")
+
+def same(left, right):
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+def safe_directories(path):
+    current_path = os.path.sep
+    root = os.lstat(current_path)
+    if not stat.S_ISDIR(root.st_mode) or root.st_uid not in allowed_owners or root.st_mode & 0o022:
+        raise SystemExit(1)
+    for component in os.path.relpath(path, os.path.sep).split(os.path.sep):
+        current_path = os.path.join(current_path, component)
+        metadata = os.lstat(current_path)
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_uid not in allowed_owners or metadata.st_mode & 0o022:
+            raise SystemExit(1)
+
+def exact_link(path, expected):
+    before = os.lstat(path)
+    if not stat.S_ISLNK(before.st_mode) or before.st_uid not in allowed_owners or before.st_nlink != 1:
+        raise SystemExit(1)
+    raw = os.readlink(path)
+    after = os.lstat(path)
+    resolved = os.path.normpath(raw if os.path.isabs(raw) else os.path.join(os.path.dirname(path), raw))
+    if not same(before, after) or resolved != expected:
+        raise SystemExit(1)
+
+safe_directories(os.path.dirname(logical))
+safe_directories(releases)
+exact_link(logical, entry)
+current_before = os.lstat(current)
+if not stat.S_ISLNK(current_before.st_mode) or current_before.st_uid not in allowed_owners or current_before.st_nlink != 1:
+    raise SystemExit(1)
+current_raw = os.readlink(current)
+current_after = os.lstat(current)
+release = os.path.normpath(current_raw if os.path.isabs(current_raw) else os.path.join(os.path.dirname(current), current_raw))
+if not same(current_before, current_after) or os.path.dirname(release) != releases:
+    raise SystemExit(1)
+release_id = os.path.basename(release)
+if not re.fullmatch(r"[A-Za-z0-9._-]+", release_id):
+    raise SystemExit(1)
+safe_directories(os.path.join(release, "bin"))
+physical = os.path.join(release, "bin", "codex")
+leaf_before = os.lstat(physical)
+if not stat.S_ISREG(leaf_before.st_mode) or stat.S_ISLNK(leaf_before.st_mode) or leaf_before.st_nlink != 1 or leaf_before.st_uid not in allowed_owners or leaf_before.st_mode & 0o022 or not leaf_before.st_mode & 0o111:
+    raise SystemExit(1)
+leaf_fd = os.open(physical, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    leaf_opened = os.fstat(leaf_fd)
+    header = os.pread(leaf_fd, 8, 0)
+finally:
+    os.close(leaf_fd)
+expected_header = b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01" if target.startswith("aarch64") else b"\xcf\xfa\xed\xfe\x07\x00\x00\x01"
+if not same(leaf_before, leaf_opened) or header != expected_header:
+    raise SystemExit(1)
+manifest_path = os.path.join(release, "codex-package.json")
+manifest_before = os.lstat(manifest_path)
+if not stat.S_ISREG(manifest_before.st_mode) or stat.S_ISLNK(manifest_before.st_mode) or manifest_before.st_nlink != 1 or manifest_before.st_uid not in allowed_owners or manifest_before.st_mode & 0o022 or not 0 < manifest_before.st_size <= 65536:
+    raise SystemExit(1)
+manifest_fd = os.open(manifest_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    manifest_opened = os.fstat(manifest_fd)
+    raw_manifest = os.pread(manifest_fd, manifest_opened.st_size + 1, 0)
+    manifest_after = os.fstat(manifest_fd)
+finally:
+    os.close(manifest_fd)
+if not same(manifest_before, manifest_opened) or not same(manifest_opened, manifest_after) or len(raw_manifest) != manifest_opened.st_size:
+    raise SystemExit(1)
+manifest = json.loads(raw_manifest.decode("utf-8"))
+expected_keys = {"layoutVersion", "version", "target", "variant", "entrypoint", "resourcesDir", "pathDir"}
+version = manifest.get("version")
+if set(manifest) != expected_keys or manifest.get("layoutVersion") != 1 or manifest.get("target") != target or manifest.get("variant") != "codex" or manifest.get("entrypoint") != "bin/codex" or manifest.get("resourcesDir") != "codex-resources" or manifest.get("pathDir") != "codex-path" or not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+    raise SystemExit(1)
+parts = tuple(int(part) for part in version.split("."))
+minimum = tuple(int(part) for part in sys.argv[2].split("."))
+if len(minimum) != 3 or parts < minimum or release_id != version + "-" + target:
+    raise SystemExit(1)
+print(physical)
+' "$HOME" "$MIN_CODEX_VERSION" 2>/dev/null
 }
 
 install_codex_standalone() {
@@ -695,8 +751,7 @@ install_cli_tools() {
   fi
   # Homebrew prefix is group-writable on a standard multi-user macOS install.
   # Keep the executable used by Zero-kun under the account-owned standalone path.
-  if ! secure_standalone_codex >/dev/null \
-    || ! version_at_least "$(codex_version_number "$standalone_codex")" "$MIN_CODEX_VERSION"; then
+  if ! secure_standalone_codex >/dev/null; then
     install_codex_standalone
   fi
   export PATH="$HOME/.local/bin:$PATH"
@@ -719,26 +774,27 @@ install_cli_tools() {
   fi
   append_profile_block '# zerokun bootstrap: Bun' 'export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"'
-  for required in git tmux bun codex; do
+  for required in git tmux bun; do
     command -v "$required" >/dev/null 2>&1 || fail "$required の導入を確認できません"
   done
   secure_standalone_codex >/dev/null \
     || fail "Codex公式standaloneの安全性を確認できませんでした"
-  version_at_least "$(codex_version_number "$standalone_codex")" "$MIN_CODEX_VERSION" \
-    || fail "Codex CLI $MIN_CODEX_VERSION 以上を導入できませんでした"
   ok "必要なCLIを導入しました"
 }
 
 ensure_logins() {
+  local standalone_codex
   section "Codexログイン"
   if [ "$SKIP_LOGINS" = "1" ]; then
     warn "--skip-loginsにより省略しました"
     return
   fi
   require_interactive "Codexログイン"
-  if ! codex login status >/dev/null 2>&1; then
+  standalone_codex="$(secure_standalone_codex)" \
+    || fail "Codex公式standaloneの安全性を確認できませんでした"
+  if ! "$standalone_codex" login status >/dev/null 2>&1; then
     echo "   Codex CLIへログインします"
-    codex login
+    "$standalone_codex" login
   fi
   ok "Codexのログインを確認しました"
 }

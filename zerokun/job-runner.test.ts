@@ -53,12 +53,14 @@ import {
   executeCodexJob,
   extractCodexRateLimit,
   parseCodexResult,
+  resolveCodexExecutable,
   resolveGitMetadataPaths,
 } from './codex-executor.ts'
 import { capRuntimeLogs, removeSettledJobState } from './state-maintenance.ts'
 import { tryAcquireProcessLock } from './process-lock.ts'
 import { slackTokenPairRuntimeIdentity } from './slack-app-identity.ts'
 import { readProcessIdentity } from './process-tree.ts'
+import { resolveOfficialStandaloneCodex } from './standalone-codex.ts'
 import {
   observeProcessGeneration,
   signalProcessGroupIfLeaderLive,
@@ -73,6 +75,12 @@ afterEach(() => {
 
 function fixtureDir(prefix = 'zerokun-codex-test-'): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
+  temporaryDirs.push(dir)
+  return dir
+}
+
+function secureFixtureDir(prefix = '.zerokun-codex-test-'): string {
+  const dir = mkdtempSync(join(homedir(), prefix))
   temporaryDirs.push(dir)
   return dir
 }
@@ -795,9 +803,12 @@ describe('single FIFO worker', () => {
       join(import.meta.dir, 'codex-supervisor.ts'),
       job.id,
       registration,
+      '--unverified-for-tests',
+      '--',
       fakeCodex,
     ], {
       cwd: repo,
+      env: { ...process.env, ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1' },
       stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
       detached: process.platform !== 'win32',
     })
@@ -834,9 +845,12 @@ describe('single FIFO worker', () => {
       join(import.meta.dir, 'codex-supervisor.ts'),
       job.id,
       registration,
+      '--unverified-for-tests',
+      '--',
       fakeCodex,
     ], {
       cwd: repo,
+      env: { ...process.env, ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1' },
       stdin: 'ignore', stdout: 'pipe', stderr: 'ignore',
       detached: process.platform !== 'win32',
     })
@@ -876,9 +890,12 @@ describe('single FIFO worker', () => {
       join(import.meta.dir, 'codex-supervisor.ts'),
       'unread-output',
       registration,
+      '--unverified-for-tests',
+      '--',
       fakeCodex,
     ], {
       cwd: repo,
+      env: { ...process.env, ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1' },
       stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
       detached: process.platform !== 'win32',
     })
@@ -1268,6 +1285,337 @@ describe('Codex JSONL contract', () => {
 })
 
 describe('Codex process isolation', () => {
+  test('Codex commandは安全な物理実体へ固定しsymlink再実行を避ける', () => {
+    const dir = secureFixtureDir()
+    const trusted = join(dir, 'trusted')
+    const executable = join(trusted, 'codex')
+    const logical = join(dir, 'codex-link')
+    mkdirSync(trusted, { mode: 0o700 })
+    writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+    symlinkSync(executable, logical)
+
+    expect(resolveCodexExecutable(logical)).toBe(realpathSync(executable))
+    expect(resolveCodexExecutable(executable)).toBe(realpathSync(executable))
+    expect(() => resolveCodexExecutable('')).toThrow('non-empty command')
+    expect(() => resolveCodexExecutable(executable, { requireNative: true }))
+      .toThrow('not a native binary')
+
+    const second = join(trusted, 'second-link')
+    linkSync(executable, second)
+    expect(() => resolveCodexExecutable(logical)).toThrow('trusted regular file')
+  })
+
+  test('Codex commandはgroup/world writableな親directoryを拒否する', () => {
+    const dir = secureFixtureDir()
+    const unsafe = join(dir, 'unsafe')
+    const executable = join(unsafe, 'codex')
+    mkdirSync(unsafe, { mode: 0o777 })
+    chmodSync(unsafe, 0o777)
+    writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+    expect(() => resolveCodexExecutable(executable)).toThrow('unsafe parent directory')
+  })
+
+  test('write jobは書込み可能repo内のCodex executableを起動しない', async () => {
+    const dir = secureFixtureDir()
+    const repo = join(dir, 'repo')
+    const fakeCodex = join(repo, 'codex')
+    const spawned = join(dir, 'spawned')
+    mkdirSync(repo)
+    mkdirSync(join(repo, '.git'))
+    writeFileSync(fakeCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+writeFileSync(${JSON.stringify(spawned)}, 'spawned')
+`)
+    chmodSync(fakeCodex, 0o700)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo, writeEnabled: true }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      await expect(executeCodexJob(job, {
+        codexBinForTesting: fakeCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir: join(dir, 'state'),
+        logDir: join(dir, 'state/job-logs'),
+      })).rejects.toThrow('repository or Git metadata')
+      expect(existsSync(spawned)).toBe(false)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('repo内logical symlinkから外部Codexへ解決してもjobを起動しない', async () => {
+    const dir = secureFixtureDir()
+    const repo = join(dir, 'repo')
+    const trustedDir = join(dir, 'trusted')
+    const trustedCodex = join(trustedDir, 'codex')
+    const logicalCodex = join(repo, 'codex-link')
+    const spawned = join(dir, 'spawned')
+    mkdirSync(repo)
+    mkdirSync(join(repo, '.git'))
+    mkdirSync(trustedDir)
+    writeFileSync(trustedCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+writeFileSync(${JSON.stringify(spawned)}, 'spawned')
+`)
+    chmodSync(trustedCodex, 0o700)
+    symlinkSync(trustedCodex, logicalCodex)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo, writeEnabled: true }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      await expect(executeCodexJob(job, {
+        codexBinForTesting: logicalCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir: join(dir, 'state'),
+        logDir: join(dir, 'state/job-logs'),
+      })).rejects.toThrow('repository or Git metadata')
+      expect(existsSync(spawned)).toBe(false)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('repo内の中間symlinkを通るCodex chainを起動しない', async () => {
+    const dir = secureFixtureDir()
+    const repo = join(dir, 'repo')
+    const trustedDir = join(dir, 'trusted')
+    const trustedCodex = join(trustedDir, 'codex')
+    const middle = join(repo, 'middle-codex')
+    const logicalCodex = join(dir, 'codex-link')
+    const spawned = join(dir, 'spawned')
+    mkdirSync(repo)
+    mkdirSync(join(repo, '.git'))
+    mkdirSync(trustedDir)
+    writeFileSync(trustedCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+writeFileSync(${JSON.stringify(spawned)}, 'spawned')
+`)
+    chmodSync(trustedCodex, 0o700)
+    symlinkSync(trustedCodex, middle)
+    symlinkSync(middle, logicalCodex)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo, writeEnabled: true }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      await expect(executeCodexJob(job, {
+        codexBinForTesting: logicalCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir: join(dir, 'state'),
+        logDir: join(dir, 'state/job-logs'),
+      })).rejects.toThrow('repository or Git metadata')
+      expect(existsSync(spawned)).toBe(false)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('directory componentがrepoを経由して外へ戻るCodex chainも起動しない', async () => {
+    const dir = secureFixtureDir()
+    const repo = join(dir, 'repo')
+    const entryDir = join(dir, 'entry')
+    const trustedDir = join(dir, 'trusted')
+    const logicalDirectory = join(entryDir, 'through-repo')
+    const exitDirectory = join(repo, 'back-out')
+    const trustedCodex = join(trustedDir, 'codex')
+    const logicalCodex = join(logicalDirectory, 'back-out', 'codex')
+    const spawned = join(dir, 'spawned')
+    mkdirSync(repo)
+    mkdirSync(join(repo, '.git'))
+    mkdirSync(entryDir)
+    mkdirSync(trustedDir)
+    writeFileSync(trustedCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+writeFileSync(${JSON.stringify(spawned)}, 'spawned')
+`)
+    chmodSync(trustedCodex, 0o700)
+    symlinkSync(repo, logicalDirectory)
+    symlinkSync(trustedDir, exitDirectory)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo, writeEnabled: true }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      await expect(executeCodexJob(job, {
+        codexBinForTesting: logicalCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir: join(dir, 'state'),
+        logDir: join(dir, 'state/job-logs'),
+      })).rejects.toThrow('repository or Git metadata')
+      expect(existsSync(spawned)).toBe(false)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('linked worktreeの外部Git metadata内Codexを起動しない', async () => {
+    const dir = secureFixtureDir()
+    const mainRepo = join(dir, 'main')
+    const worktree = join(dir, 'worktree')
+    git(['init', mainRepo])
+    git(['config', 'user.email', 'fixture@example.invalid'], mainRepo)
+    git(['config', 'user.name', 'Zero-kun fixture'], mainRepo)
+    writeFileSync(join(mainRepo, 'README.md'), 'fixture\n')
+    git(['add', 'README.md'], mainRepo)
+    git(['commit', '-m', 'fixture'], mainRepo)
+    git(['worktree', 'add', '-b', 'fixture-worktree', worktree], mainRepo)
+    const fakeCodex = join(mainRepo, '.git', 'hooks', 'codex')
+    const spawned = join(dir, 'spawned')
+    writeFileSync(fakeCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+writeFileSync(${JSON.stringify(spawned)}, 'spawned')
+`)
+    chmodSync(fakeCodex, 0o700)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: worktree, writeEnabled: true }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      await expect(executeCodexJob(job, {
+        codexBinForTesting: fakeCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir: join(dir, 'state'),
+        logDir: join(dir, 'state/job-logs'),
+      })).rejects.toThrow('repository or Git metadata')
+      expect(existsSync(spawned)).toBe(false)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('repo内link差替え後のread-only jobもhost executableを起動しない', async () => {
+    const dir = secureFixtureDir()
+    const repo = join(dir, 'repo')
+    const trustedDir = join(dir, 'trusted')
+    const trustedCodex = join(trustedDir, 'codex')
+    const maliciousCodex = join(repo, 'malicious-codex')
+    const logicalCodex = join(repo, 'codex-link')
+    const spawned = join(dir, 'spawned')
+    mkdirSync(repo)
+    mkdirSync(join(repo, '.git'))
+    mkdirSync(trustedDir)
+    writeFileSync(trustedCodex, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+    writeFileSync(maliciousCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+writeFileSync(${JSON.stringify(spawned)}, 'spawned')
+`)
+    chmodSync(maliciousCodex, 0o700)
+    symlinkSync(trustedCodex, logicalCodex)
+
+    const writeStore = new JobStore(join(dir, 'write-jobs.sqlite3'))
+    writeStore.enqueue(input({ repoPath: repo, writeEnabled: true }))
+    const writeJob = writeStore.claimNext('serial-worker')!
+    try {
+      await expect(executeCodexJob(writeJob, {
+        codexBinForTesting: logicalCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir: join(dir, 'write-state'),
+        logDir: join(dir, 'write-state/job-logs'),
+      })).rejects.toThrow('repository or Git metadata')
+    } finally {
+      writeStore.close()
+    }
+
+    rmSync(logicalCodex)
+    symlinkSync(maliciousCodex, logicalCodex)
+    const readStore = new JobStore(join(dir, 'read-jobs.sqlite3'))
+    readStore.enqueue(input({ repoPath: repo, writeEnabled: false }))
+    const readJob = readStore.claimNext('serial-worker')!
+    try {
+      await expect(executeCodexJob(readJob, {
+        codexBinForTesting: logicalCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir: join(dir, 'read-state'),
+        logDir: join(dir, 'read-state/job-logs'),
+      })).rejects.toThrow('repository or Git metadata')
+      expect(existsSync(spawned)).toBe(false)
+    } finally {
+      readStore.close()
+    }
+  })
+
+  test('managed state内logical symlinkから外部Codexを起動しない', async () => {
+    const dir = secureFixtureDir()
+    const repo = join(dir, 'repo')
+    const stateDir = join(dir, 'state')
+    const trustedCodex = join(dir, 'trusted-codex')
+    const logicalCodex = join(stateDir, 'codex-link')
+    const spawned = join(dir, 'spawned')
+    mkdirSync(repo)
+    mkdirSync(join(repo, '.git'))
+    mkdirSync(stateDir, { mode: 0o700 })
+    writeFileSync(trustedCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+writeFileSync(${JSON.stringify(spawned)}, 'spawned')
+`)
+    chmodSync(trustedCodex, 0o700)
+    symlinkSync(trustedCodex, logicalCodex)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      await expect(executeCodexJob(job, {
+        codexBinForTesting: logicalCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir,
+        logDir: join(stateDir, 'job-logs'),
+      })).rejects.toThrow('inside Zero-kun managed state')
+      expect(existsSync(spawned)).toBe(false)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('Codex executableをmanaged state内から起動しない', async () => {
+    const dir = secureFixtureDir()
+    const repo = join(dir, 'repo')
+    const stateDir = join(dir, 'state')
+    const fakeCodex = join(stateDir, 'codex')
+    const spawned = join(dir, 'spawned')
+    mkdirSync(repo)
+    mkdirSync(join(repo, '.git'))
+    mkdirSync(stateDir, { mode: 0o700 })
+    writeFileSync(fakeCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+writeFileSync(${JSON.stringify(spawned)}, 'spawned')
+`)
+    chmodSync(fakeCodex, 0o700)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      await expect(executeCodexJob(job, {
+        codexBinForTesting: fakeCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir,
+        logDir: join(stateDir, 'job-logs'),
+      })).rejects.toThrow('inside Zero-kun managed state')
+      expect(existsSync(spawned)).toBe(false)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('Slack runtimeはambient ZEROKUN_CODEX_BINを拒否する', async () => {
+    const dir = secureFixtureDir()
+    const repo = join(dir, 'repo')
+    mkdirSync(repo)
+    mkdirSync(join(repo, '.git'))
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo }))
+    const job = store.claimNext('serial-worker')!
+    const previous = process.env.ZEROKUN_CODEX_BIN
+    process.env.ZEROKUN_CODEX_BIN = process.execPath
+    try {
+      await expect(executeCodexJob(job, {
+        skipEffectiveConfigCheck: true,
+        stateDir: join(dir, 'state'),
+        logDir: join(dir, 'state/job-logs'),
+      })).rejects.toThrow('ZEROKUN_CODEX_BIN is not supported')
+    } finally {
+      if (previous === undefined) delete process.env.ZEROKUN_CODEX_BIN
+      else process.env.ZEROKUN_CODEX_BIN = previous
+      store.close()
+    }
+  })
+
   test('Codex attemptはprocess終了前abortと終了後abortを区別する', () => {
     expect(codexAttemptDisposition(0, false, false)).toBe('success')
     expect(codexAttemptDisposition(0, false, true)).toBe('interrupted')
@@ -1295,7 +1643,7 @@ await Bun.sleep(30_000)
     const controller = new AbortController()
     try {
       await expect(executeCodexJob(job, {
-        codexBin: fakeCodex,
+        codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1325,7 +1673,7 @@ console.log(JSON.stringify({ type: 'thread.started', thread_id: 'completed-threa
     const controller = new AbortController()
     try {
       const result = await executeCodexJob(job, {
-        codexBin: fakeCodex,
+        codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1361,7 +1709,7 @@ console.log(JSON.stringify({ type: 'thread.started', thread_id: 'completed-threa
     controller.abort()
     try {
       await expect(executeCodexJob(job, {
-        codexBin: join(dir, 'must-not-be-spawned'),
+        codexBinForTesting: join(dir, 'must-not-be-spawned'),
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1380,7 +1728,7 @@ console.log(JSON.stringify({ type: 'thread.started', thread_id: 'completed-threa
     const job = store.claimNext('serial-worker')!
     try {
       await expect(executeCodexJob(job, {
-        codexBin: join(dir, 'must-not-run'),
+        codexBinForTesting: join(dir, 'must-not-run'),
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1396,7 +1744,7 @@ console.log(JSON.stringify({ type: 'thread.started', thread_id: 'completed-threa
     const job = store.claimNext('serial-worker')!
     try {
       await expect(executeCodexJob(job, {
-        codexBin: join(dir, 'must-not-run'),
+        codexBinForTesting: join(dir, 'must-not-run'),
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1411,7 +1759,7 @@ console.log(JSON.stringify({ type: 'thread.started', thread_id: 'completed-threa
     const job = store.claimNext('serial-worker')!
     try {
       await expect(executeCodexJob(job, {
-        codexBin: join(dir, 'must-not-run'),
+        codexBinForTesting: join(dir, 'must-not-run'),
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1455,6 +1803,7 @@ console.log(JSON.stringify({ type: 'thread.started', thread_id: 'completed-threa
     const repo = join(dir, 'repo')
     const capture = join(dir, 'capture.json')
     const fakeCodex = join(dir, 'fake-codex')
+    const logicalCodex = join(dir, 'codex-link')
     mkdirSync(repo)
     mkdirSync(join(repo, '.git'))
     writeFileSync(fakeCodex, `#!/usr/bin/env bun
@@ -1462,7 +1811,8 @@ import { writeFileSync } from 'fs'
 const args = process.argv.slice(2)
 const prompt = await Bun.stdin.text()
 writeFileSync(process.env.CAPTURE_FILE!, JSON.stringify({
-  args, prompt, cwd: process.cwd(), slack: process.env.SLACK_BOT_TOKEN ?? null,
+  args, prompt, cwd: process.cwd(), executable: process.argv[1],
+  slack: process.env.SLACK_BOT_TOKEN ?? null,
 }))
 const output = args[args.indexOf('--output-last-message') + 1]
 writeFileSync(output, 'final from fixture')
@@ -1470,6 +1820,7 @@ console.log(JSON.stringify({ type: 'thread.started', thread_id: 'codex-thread-fi
 console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'event text' } }))
 `)
     chmodSync(fakeCodex, 0o755)
+    symlinkSync(fakeCodex, logicalCodex)
     const store = new JobStore(join(dir, 'jobs.sqlite3'))
     store.enqueue(input({ repoPath: repo }))
     const job = store.claimNext('serial-worker')!
@@ -1480,7 +1831,7 @@ console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_messag
     process.env.SLACK_BOT_TOKEN = 'xoxb-must-not-leak'
     try {
       const result = await executeCodexJob(job, {
-        codexBin: fakeCodex,
+        codexBinForTesting: logicalCodex,
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1492,11 +1843,13 @@ console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_messag
         args: string[]
         prompt: string
         cwd: string
+        executable: string
         slack: string | null
       }
       expect(result).toEqual({ sessionId: 'codex-thread-fixture', result: 'final from fixture' })
       expect(observed).toEqual(['codex-thread-fixture'])
       expect(invocation.cwd).toBe(realpathSync(repo))
+      expect(invocation.executable).toBe(realpathSync(fakeCodex))
       expect(invocation.slack).toBeNull()
       expect(invocation.args).toContain('exec')
       expect(invocation.args).not.toContain('resume')
@@ -1549,7 +1902,7 @@ console.log(JSON.stringify({ type: 'thread.started', thread_id: 'write-thread' }
     process.env.CAPTURE_FILE = capture
     try {
       await executeCodexJob(job, {
-        codexBin: fakeCodex,
+        codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1603,7 +1956,7 @@ console.log(JSON.stringify({ type: 'thread.started', thread_id: 'replacement-thr
     process.env.CALLS_FILE = calls
     try {
       const result = await executeCodexJob(job, {
-        codexBin: fakeCodex,
+        codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1640,7 +1993,7 @@ await Bun.sleep(30_000)
     const startedAt = Date.now()
     try {
       await expect(executeCodexJob(job, {
-        codexBin: fakeCodex,
+        codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1674,7 +2027,7 @@ process.exit(0)
     const job = store.claimNext('serial-worker')!
     try {
       await executeCodexJob(job, {
-        codexBin: fakeCodex,
+        codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: join(dir, 'state/job-logs'),
@@ -1715,7 +2068,7 @@ await Bun.sleep(30_000)
       let childIdentity: ReturnType<typeof readProcessIdentity>
       try {
         const running = executeCodexJob(job, {
-          codexBin: fakeCodex,
+          codexBinForTesting: fakeCodex,
           skipEffectiveConfigCheck: true,
           stateDir: join(dir, 'state'),
           logDir: join(dir, 'state/job-logs'),
@@ -1770,7 +2123,7 @@ process.exit(0)
       let childPid = 0
       try {
         await executeCodexJob(job, {
-          codexBin: fakeCodex,
+          codexBinForTesting: fakeCodex,
           skipEffectiveConfigCheck: true,
           stateDir: join(dir, 'state'),
           logDir: join(dir, 'state/job-logs'),
@@ -1818,7 +2171,7 @@ process.exit(0)
       const startedAt = Date.now()
       try {
         await executeCodexJob(job, {
-          codexBin: fakeCodex,
+          codexBinForTesting: fakeCodex,
           skipEffectiveConfigCheck: true,
           stateDir: join(dir, 'state'),
           logDir: join(dir, 'state/job-logs'),
@@ -1857,7 +2210,7 @@ writeFileSync(args[args.indexOf('--output-last-message') + 1], 'ok')
     const job = store.claimNext('serial-worker')!
     try {
       const result = await executeCodexJob(job, {
-        codexBin: fakeCodex,
+        codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir: join(dir, 'state'),
         logDir: logs,
@@ -1905,6 +2258,7 @@ writeFileSync(args[args.indexOf('--output-last-message') + 1], 'ok')
       expect(overrides).toContain(`${JSON.stringify(realpathSync(attachment))}="read"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(state))}="deny"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(codexHome))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
       expect(overrides).toContain('"*PROXY*"')
       expect(overrides).toContain('network.enabled=true')
       expect(overrides).toContain('features.network_proxy=true')
@@ -2053,9 +2407,7 @@ writeFileSync(args[args.indexOf('--output-last-message') + 1], 'ok')
   })
 
   test.skipIf(process.platform !== 'darwin')('実Codex sandboxでlinked worktreeとsubmoduleはcommit可、.git pointerはread-only', () => {
-    const codex = Bun.spawnSync(['/usr/bin/which', 'codex'], { stdout: 'pipe' })
-      .stdout.toString().trim()
-    expect(codex).not.toBe('')
+    const codex = resolveOfficialStandaloneCodex().physical
 
     const runSandboxCommit = (repo: string, state: string, messageId: string) => {
       const store = new JobStore(join(state, 'jobs.sqlite3'))
@@ -2135,9 +2487,7 @@ writeFileSync(args[args.indexOf('--output-last-message') + 1], 'ok')
   }, 30_000)
 
   test.skipIf(process.platform !== 'darwin')('実Codex 0.149 sandboxでstate deny・添付read・outbox/.git writeを強制する', () => {
-    const codex = Bun.spawnSync(['/usr/bin/which', 'codex'], { stdout: 'pipe' })
-      .stdout.toString().trim()
-    expect(codex).not.toBe('')
+    const codex = resolveOfficialStandaloneCodex().physical
     const dir = fixtureDir()
     const state = join(dir, 'state')
     const repo = join(dir, 'repo')

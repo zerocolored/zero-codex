@@ -38,6 +38,16 @@ import {
   type ProcessIdentity,
 } from './process-generation.ts'
 import { openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
+import {
+  encodeOfficialCodexSnapshot,
+  resolveCodexExecutable,
+  resolveCodexExecutableDetails,
+  resolveOfficialStandaloneCodex,
+  verifyOfficialCodexSnapshot,
+  type OfficialCodexSnapshot,
+} from './standalone-codex.ts'
+
+export { resolveCodexExecutable } from './standalone-codex.ts'
 
 const MAX_RESULT_CHARS = 12_000
 const MAX_FAILURE_CHARS = 600
@@ -1045,7 +1055,8 @@ export function codexAttemptDisposition(
 export async function executeCodexJob(
   job: JobRecord,
   options: {
-    codexBin?: string
+    /** Explicit fixture injection. Production callers must use the official standalone install. */
+    codexBinForTesting?: string
     model?: string
     timeoutMs?: number
     logDir: string
@@ -1064,7 +1075,8 @@ export async function executeCodexJob(
   const runtimeRepo = realpathSync(join(import.meta.dir, '..'))
   const jobRepo = realpathSync(job.repoPath)
   const runtimeGitPaths = resolveGitMetadataPaths(runtimeRepo)
-  const sharesRuntimeGit = resolveGitMetadataPaths(jobRepo).some(path => (
+  const jobGitPaths = resolveGitMetadataPaths(jobRepo)
+  const sharesRuntimeGit = jobGitPaths.some(path => (
     runtimeGitPaths.some(runtimePath => (
       pathContains(runtimePath, path) || pathContains(path, runtimePath)
     ))
@@ -1079,7 +1091,30 @@ export async function executeCodexJob(
       + 'configure a separate project route to keep host runtime code immutable',
     )
   }
-  const codexBin = options.codexBin ?? process.env.ZEROKUN_CODEX_BIN ?? 'codex'
+  if (options.signal?.aborted) throw new CodexInterruptedError('Codex job was interrupted')
+  const testCodexBin = options.codexBinForTesting
+  if (testCodexBin === undefined && process.env.ZEROKUN_CODEX_BIN !== undefined) {
+    throw new Error(
+      'ZEROKUN_CODEX_BIN is not supported by the Slack runtime; '
+      + 'rerun bash zerokun/bootstrap-macos.sh --skip-slack',
+    )
+  }
+  const officialCodexSnapshot: OfficialCodexSnapshot | null = testCodexBin === undefined
+    ? resolveOfficialStandaloneCodex()
+    : null
+  const requestedCodex = testCodexBin ?? officialCodexSnapshot!.logical
+  const codexResolution = officialCodexSnapshot ?? resolveCodexExecutableDetails(testCodexBin!)
+  const codexBin = codexResolution.physical
+  const revalidateCodexExecutable = (): void => {
+    if (officialCodexSnapshot) {
+      verifyOfficialCodexSnapshot(officialCodexSnapshot)
+      return
+    }
+    const current = resolveCodexExecutableDetails(requestedCodex)
+    if (JSON.stringify(current) !== JSON.stringify(codexResolution)) {
+      throw new Error(`Codex executable changed after resolution: ${requestedCodex}`)
+    }
+  }
   const model = options.model ?? process.env.ZEROKUN_JOB_MODEL
   const timeoutMs = positiveInteger(
     options.timeoutMs ?? process.env.ZEROKUN_JOB_TIMEOUT_MS,
@@ -1087,7 +1122,36 @@ export async function executeCodexJob(
   )
   const stateDir = options.stateDir ?? dirname(options.logDir)
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-  requireManagedStateRoot(stateDir)
+  const managedStateDir = requireManagedStateRoot(stateDir)
+  if (officialCodexSnapshot) {
+    const officialStandaloneRoot = dirname(dirname(officialCodexSnapshot.releaseDir))
+    const officialEntryRoot = dirname(officialCodexSnapshot.logical)
+    const protectedRoots = [
+      jobRepo,
+      ...jobGitPaths,
+      runtimeRepo,
+      ...runtimeGitPaths,
+      managedStateDir,
+    ]
+    if ([officialStandaloneRoot, officialEntryRoot].some(codexRoot => (
+      protectedRoots.some(root => pathContains(root, codexRoot) || pathContains(codexRoot, root))
+    ))) {
+      throw new Error(
+        'Codex official standalone install must not overlap a repository, Git metadata, '
+        + 'or Zero-kun managed state',
+      )
+    }
+  }
+  if (codexResolution.resolutionPaths.some(path => pathContains(managedStateDir, path))) {
+    throw new Error('Codex executable cannot be stored inside Zero-kun managed state')
+  }
+  if ([jobRepo, ...jobGitPaths].some(root => (
+    codexResolution.resolutionPaths.some(path => pathContains(root, path))
+  ))) {
+    throw new Error(
+      'Slack job cannot execute Codex through its repository or Git metadata',
+    )
+  }
   ensureManagedDirectory(stateDir, options.logDir)
   const artifactDir = artifactDirForJob(stateDir, job.id)
   const scratchDir = scratchDirForJob(stateDir, job.id)
@@ -1106,6 +1170,7 @@ export async function executeCodexJob(
     profile: permissionProfile,
   })
   if (!options.skipEffectiveConfigCheck) {
+    revalidateCodexExecutable()
     await assertEffectiveCodexPermissionConfig(
       codexBin,
       job.repoPath,
@@ -1119,6 +1184,7 @@ export async function executeCodexJob(
 
   const runAttempt = async (sessionId: string | null, resumed: boolean) => {
     if (options.signal?.aborted) throw new CodexInterruptedError('Codex job was interrupted')
+    revalidateCodexExecutable()
     const finalPath = join(finalOutputDir, `${resumed ? 'resume' : 'new'}.final.txt`)
     const stdoutPath = join(options.logDir, `${job.id}.stdout.log`)
     const stderrPath = join(options.logDir, `${job.id}.stderr.log`)
@@ -1151,6 +1217,10 @@ export async function executeCodexJob(
       supervisor,
       job.id,
       registrationPath,
+      ...(officialCodexSnapshot
+        ? ['--official-codex-snapshot', encodeOfficialCodexSnapshot(officialCodexSnapshot)]
+        : ['--unverified-for-tests']),
+      '--',
       codexBin,
       ...codexArgs,
     ], {
@@ -1158,6 +1228,7 @@ export async function executeCodexJob(
       env: {
         ...buildCodexChildEnvironment(),
         ...options.extraEnvironment,
+        ...(officialCodexSnapshot ? {} : { ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1' }),
         TMPDIR: scratchDir,
       },
       stdin: 'pipe',
@@ -1425,11 +1496,18 @@ async function verifyEffectiveCodexConfigSpec(path: string): Promise<void> {
 
 async function verifySystemCodexConfig(inheritProcessGroup = false): Promise<void> {
   assertCompatibleSystemCodexConfig()
+  if (process.env.ZEROKUN_CODEX_BIN !== undefined) {
+    throw new Error(
+      'ZEROKUN_CODEX_BIN is not supported by the Slack runtime; '
+      + 'rerun bash zerokun/bootstrap-macos.sh --skip-slack',
+    )
+  }
   const repo = mkdtempSync(join(homedir(), '.zerokun-config-probe-repo-'))
   const stateDir = mkdtempSync(join(tmpdir(), 'zerokun-config-probe-state-'))
   try {
     mkdirSync(join(repo, '.git'), { mode: 0o700 })
     prepareManagedStateRoot(stateDir)
+    const officialCodexSnapshot = resolveOfficialStandaloneCodex()
     for (const writeEnabled of [false, true]) {
       const mode = writeEnabled ? 'write' : 'read'
       const probe: JobRecord = {
@@ -1446,8 +1524,10 @@ async function verifySystemCodexConfig(inheritProcessGroup = false): Promise<voi
       const overrides = buildCodexPermissionOverrides(probe, {
         stateDir, artifactDir, scratchDir, profile,
       })
+      verifyOfficialCodexSnapshot(officialCodexSnapshot)
       await assertEffectiveCodexPermissionConfig(
-        process.env.ZEROKUN_CODEX_BIN ?? 'codex', repo, overrides, profile,
+        officialCodexSnapshot.physical,
+        repo, overrides, profile,
         buildCodexChildEnvironment(),
         { inheritProcessGroup },
       )

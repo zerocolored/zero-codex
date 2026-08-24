@@ -147,7 +147,7 @@ SETUP_LOCK="$CH/update.lock"
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare-directories \
   "$CH" "$SETUP_LOCK"
 
-zerokun_require_codex_version || exit 1
+zerokun_require_codex_version "$REPO_DIR" || exit 1
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" \
   verify-system-config --inherit-process-group || exit 1
 command -v git >/dev/null 2>&1 || { echo "❌ git がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }

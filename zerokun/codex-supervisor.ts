@@ -15,6 +15,7 @@ import {
   seedTrackedProcess,
 } from './process-tree.ts'
 import { signalProcessIfLive } from './process-generation.ts'
+import { verifyEncodedOfficialCodexSnapshot } from './standalone-codex.ts'
 
 function relayStream(
   stream: ReadableStream<Uint8Array>,
@@ -78,9 +79,33 @@ function relayStream(
 }
 
 async function main(): Promise<void> {
-  const [jobId, registrationPath, codexBin, ...args] = process.argv.slice(2)
+  const [jobId, registrationPath, ...command] = process.argv.slice(2)
+  const hasOfficialSnapshot = command[0] === '--official-codex-snapshot'
+  const hasTestOverride = command[0] === '--unverified-for-tests'
+  const encodedOfficialSnapshot = hasOfficialSnapshot ? command[1] : undefined
+  const separatorIndex = hasOfficialSnapshot ? 2 : hasTestOverride ? 1 : -1
+  const codexBin = separatorIndex >= 0 && command[separatorIndex] === '--'
+    ? command[separatorIndex + 1]
+    : undefined
+  const args = separatorIndex >= 0 ? command.slice(separatorIndex + 2) : []
   if (!jobId || !registrationPath || !codexBin) {
-    throw new Error('usage: codex-supervisor.ts JOB_ID REGISTRATION_PATH CODEX_BIN [ARG ...]')
+    throw new Error(
+      'usage: codex-supervisor.ts JOB_ID REGISTRATION_PATH '
+      + '(--official-codex-snapshot SNAPSHOT | --unverified-for-tests) -- CODEX_BIN [ARG ...]',
+    )
+  }
+  if (!hasOfficialSnapshot && (!hasTestOverride
+    || process.env.ZEROKUN_SUPERVISOR_TEST_UNVERIFIED !== '1')) {
+    throw new Error('Codex supervisor requires a verified official standalone snapshot')
+  }
+  if (hasOfficialSnapshot) {
+    if (!encodedOfficialSnapshot) {
+      throw new Error('Codex official standalone snapshot is required')
+    }
+    const verified = verifyEncodedOfficialCodexSnapshot(encodedOfficialSnapshot)
+    if (verified.physical !== codexBin) {
+      throw new Error('Codex official standalone snapshot does not match the requested executable')
+    }
   }
   const registrationDirectory = lstatSync(dirname(registrationPath))
   const ownerMatches = typeof process.getuid !== 'function'
@@ -108,7 +133,14 @@ async function main(): Promise<void> {
   }), { mode: 0o600, flag: 'wx' })
   renameSync(temporary, registrationPath)
   let cleanupConfirmed = false
+  let childStarted = false
   try {
+    if (encodedOfficialSnapshot !== undefined) {
+      const verified = verifyEncodedOfficialCodexSnapshot(encodedOfficialSnapshot)
+      if (verified.physical !== codexBin) {
+        throw new Error('Codex official standalone changed before child spawn')
+      }
+    }
     const child = Bun.spawn([codexBin, ...args], {
       cwd: process.cwd(),
       env: process.env,
@@ -120,6 +152,7 @@ async function main(): Promise<void> {
       stdout: 'pipe',
       stderr: 'pipe',
     })
+    childStarted = true
     const seedDelayMs = Number(process.env.ZEROKUN_SUPERVISOR_TEST_SEED_DELAY_MS)
     if (Number.isFinite(seedDelayMs) && seedDelayMs > 0) await Bun.sleep(seedDelayMs)
     const tracked = new Map<number, string>([[process.pid, supervisorIdentity.started]])
@@ -182,6 +215,7 @@ async function main(): Promise<void> {
     if (relayFailure?.status === 'rejected') throw relayFailure.reason
     process.exitCode = exitCode
   } catch (error) {
+    if (!childStarted) cleanupConfirmed = true
     if (cleanupConfirmed) throw error
     // Keep the exact group leader and durable registration alive whenever
     // cleanup is uncertain. The executor/next runner can then TERM and KILL

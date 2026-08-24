@@ -98,6 +98,7 @@ for entry in \
   server.ts \
   zerokun/job-runner.ts \
   zerokun/runner-launcher.ts \
+  zerokun/standalone-codex.ts \
   zerokun/codex-executor.ts \
   zerokun/codex-supervisor.ts \
   zerokun/live-codex-permission-check.ts \

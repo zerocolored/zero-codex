@@ -44,6 +44,9 @@ describe('public Codex defaults', () => {
       expect(guide).toContain('--with-slack')
     }
     expect(codexVersion).not.toContain('curl -fsSL')
+    expect(codexVersion).toContain('standalone-codex.ts" version')
+    expect(codexVersion).not.toContain('"$codex_bin" --version')
+    expect(codexVersion).not.toContain('${ZEROKUN_CODEX_BIN:-codex}')
     expect(codexVersion).toContain('bash zerokun/bootstrap-macos.sh --skip-slack')
     expect(rootReadme).toContain('新しいSlack App')
     expect(rootReadme).toContain('tokenをこのPCへコピーしないでください')

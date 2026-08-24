@@ -79,26 +79,20 @@ async function runLauncher(
       '  fi',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
+      'if [[ "$*" == *"standalone-codex.ts version"* ]]; then',
+      '  echo "${FAKE_CODEX_VERSION:-0.149.0}"',
+      '  exit 0',
+      'fi',
       'exit 0',
       '',
     ].join('\n'))
     chmodSync(path, 0o700)
   }
-  const codex = join(fakeBin, 'codex')
-  writeFileSync(codex, `#!/bin/bash
-if [ "\${FAKE_BARE_VERSION:-0}" = "1" ]; then
-  echo "\${FAKE_CODEX_VERSION:-0.149.0}"
-else
-  echo "codex-cli \${FAKE_CODEX_VERSION:-0.149.0}"
-fi
-`)
-  chmodSync(codex, 0o700)
   const child = Bun.spawn(['/bin/bash', LAUNCHER, state], {
     env: {
       ...processEnvWithout('ZEROKUN_REPLACE_TOKEN'),
       HOME: state,
       PATH: `${fakeBin}:/usr/bin:/bin`,
-      ZEROKUN_CODEX_BIN: codex,
       ZEROKUN_STATE_DIR: state,
       ...env,
     },

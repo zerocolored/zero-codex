@@ -50,10 +50,16 @@ describe('Codex stable supervisor gate', () => {
         join(import.meta.dir, 'codex-supervisor.ts'),
         'non-leader-job',
         registration,
+        '--unverified-for-tests',
+        '--',
         fakeCodex,
       ], {
         cwd: root,
-        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root },
+        env: {
+          PATH: process.env.PATH ?? '/usr/bin:/bin',
+          HOME: root,
+          ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1',
+        },
         stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
       })
       expect(await supervisor.exited).not.toBe(0)
@@ -89,6 +95,8 @@ await Bun.write(process.env.CHILD_PID_FILE!, String(child.pid))
         join(import.meta.dir, 'codex-supervisor.ts'),
         'seed-failure-job',
         registration,
+        '--unverified-for-tests',
+        '--',
         fakeCodex,
       ], {
         cwd: root,
@@ -97,6 +105,7 @@ await Bun.write(process.env.CHILD_PID_FILE!, String(child.pid))
           HOME: root,
           CHILD_PID_FILE: childPidFile,
           ZEROKUN_SUPERVISOR_TEST_SEED_DELAY_MS: '300',
+          ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1',
         },
         stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
         detached: true,

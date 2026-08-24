@@ -10,7 +10,7 @@ const RUNTIME_SERVICE_KEYS = new Set([
   'ZEROKUN_CATCHUP_CHANNELS_PER_SWEEP', 'ZEROKUN_CATCHUP_HISTORY_PAGES_PER_SWEEP',
   'ZEROKUN_CATCHUP_LIMIT', 'ZEROKUN_CATCHUP_PARENT_PAGES_PER_SWEEP',
   'ZEROKUN_CATCHUP_REPLY_PAGES_PER_SWEEP', 'ZEROKUN_CATCHUP_WINDOW_H',
-  'ZEROKUN_CODEX_BIN', 'ZEROKUN_GC_INTERVAL_MS', 'ZEROKUN_IDEMPOTENCY_RETENTION_DAYS',
+  'ZEROKUN_GC_INTERVAL_MS', 'ZEROKUN_IDEMPOTENCY_RETENTION_DAYS',
   'ZEROKUN_INBOUND_MAX_ATTEMPTS', 'ZEROKUN_JOB_MODEL',
   'ZEROKUN_JOB_POLL_MS', 'ZEROKUN_JOB_RUNNER', 'ZEROKUN_JOB_TIMEOUT_MS',
   'ZEROKUN_MAX_JOBS_PER_SESSION', 'ZEROKUN_RETENTION_DAYS',
@@ -33,6 +33,17 @@ const UPDATE_KEYS = new Set([
 ])
 
 const SLACK_TOKEN_KEYS = new Set(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'])
+const RUNTIME_EXECUTABLE_OVERRIDE_KEYS = new Set(['ZEROKUN_CODEX_BIN'])
+const STATE_RUNTIME_SETTING_KEYS = new Set([
+  'ZEROKUN_CATCHUP_CHANNELS_PER_SWEEP', 'ZEROKUN_CATCHUP_HISTORY_PAGES_PER_SWEEP',
+  'ZEROKUN_CATCHUP_LIMIT', 'ZEROKUN_CATCHUP_PARENT_PAGES_PER_SWEEP',
+  'ZEROKUN_CATCHUP_REPLY_PAGES_PER_SWEEP', 'ZEROKUN_CATCHUP_WINDOW_H',
+  'ZEROKUN_GC_INTERVAL_MS', 'ZEROKUN_IDEMPOTENCY_RETENTION_DAYS',
+  'ZEROKUN_INBOUND_MAX_ATTEMPTS', 'ZEROKUN_JOB_MODEL', 'ZEROKUN_JOB_POLL_MS',
+  'ZEROKUN_JOB_TIMEOUT_MS', 'ZEROKUN_MAX_JOBS_PER_SESSION', 'ZEROKUN_RETENTION_DAYS',
+  'ZEROKUN_RUNTIME_LOG_MAX_BYTES', 'ZEROKUN_SLACK_HTTP_TIMEOUT_MS',
+  'ZEROKUN_UPDATE_WAIT_SECONDS', 'ZEROKUN_UPDATE_WORKER_TIMEOUT_MS',
+])
 const RUNTIME_NETWORK_OVERRIDE_KEYS = new Set([
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
@@ -87,6 +98,7 @@ export function applyStateEnvironment(
   environment: Record<string, string | undefined> = process.env,
 ): void {
   for (const key of SLACK_TOKEN_KEYS) delete environment[key]
+  for (const key of RUNTIME_EXECUTABLE_OVERRIDE_KEYS) delete environment[key]
   for (const key of RUNTIME_NETWORK_OVERRIDE_KEYS) delete environment[key]
   for (const key of TEST_CONTROL_KEYS) delete environment[key]
   const tokens = parseStateSlackTokens(content)
@@ -94,8 +106,7 @@ export function applyStateEnvironment(
     const match = line.match(/^(\w+)=(.*)$/)
     if (!match) continue
     const [key, value] = [match[1], match[2]]
-    if (!SLACK_TOKEN_KEYS.has(key) && !RUNTIME_NETWORK_OVERRIDE_KEYS.has(key)
-      && !TEST_CONTROL_KEYS.has(key)
+    if (STATE_RUNTIME_SETTING_KEYS.has(key)
       && environment[key] === undefined) {
       environment[key] = value
     }
@@ -146,6 +157,15 @@ export function buildUpdaterEnvironment(
 ): Record<string, string> {
   const result = copyAllowed(source, UPDATE_KEYS)
   if (source.HOME) result.HOME = source.HOME
+  return result
+}
+
+/** Candidate setup/rollback must not inherit the updater-only executable override. */
+export function buildSetupEnvironment(
+  source: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const result = buildUpdaterEnvironment(source)
+  delete result.ZEROKUN_CODEX_BIN
   return result
 }
 

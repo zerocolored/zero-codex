@@ -66,7 +66,7 @@ fi
 # candidateへfast-forwardした直後にcrashした場合でも、候補版の最小Codex versionや
 # system config検査よりjournal recoveryを必ず先に行う。rollback後の実体をここから検査する。
 . "$REPO_DIR/zerokun/codex-version.sh"
-zerokun_require_codex_version || exit 1
+zerokun_require_codex_version "$REPO_DIR" || exit 1
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" verify-system-config || exit 1
 [ -d "$PROJECT" ] || { echo "❌ 作業ディレクトリがありません: $PROJECT" >&2; exit 1; }
 [ -f "$REPO_DIR/server.ts" ] || { echo "❌ server.ts がありません: $REPO_DIR" >&2; exit 1; }
