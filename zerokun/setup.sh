@@ -251,7 +251,7 @@ pid_is_alive() {
 }
 
 read_lock_pid() {
-  tr -d '[:space:]' < "$1" 2>/dev/null || true
+  { tr -d '[:space:]' < "$1"; } 2>/dev/null || true
 }
 
 # Validate the database and sidecars before the first process-stop boundary.

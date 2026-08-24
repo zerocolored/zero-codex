@@ -1159,6 +1159,7 @@ codex --version
       })
 
       expect(result.exitCode).toBe(0)
+      expect(result.stderr.toString()).not.toContain('No such file or directory')
       const zshrc = readFileSync(join(fakeHome, '.zshrc'), 'utf8')
       expect(zshrc).toContain(`export ZEROKUN_PROJECT_DIR=${projectDir.replace(' ', '\\ ')}`)
       expect(zshrc).toContain(
