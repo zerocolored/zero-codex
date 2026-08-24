@@ -25,7 +25,7 @@ jobs:
       - name: Install test runtime
         run: |
           brew install tmux
-          export PATH="$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          export PATH="$HOME/.local/bin:$PATH"
           installer="$(/usr/bin/mktemp "${RUNNER_TEMP}/codex-install.XXXXXX")"
           trap '/bin/rm -f "$installer"' EXIT
           /usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" \
