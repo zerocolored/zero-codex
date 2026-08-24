@@ -1302,7 +1302,9 @@ describe('Codex process isolation', () => {
 
     const second = join(trusted, 'second-link')
     linkSync(executable, second)
-    expect(() => resolveCodexExecutable(logical)).toThrow('trusted regular file')
+    expect(() => resolveCodexExecutable(logical)).toThrow(
+      /Codex executable (?:is not a trusted regular file|changed while its path was verified)/,
+    )
   })
 
   test('Codex commandはgroup/world writableな親directoryを拒否する', () => {
