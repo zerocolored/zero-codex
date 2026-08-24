@@ -32,7 +32,9 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     zerokun/public-readiness.test.ts \
     zerokun/queue-contract.test.ts \
     zerokun/slack-app-identity.test.ts \
-    zerokun/process-tree.test.ts
+    zerokun/process-generation.test.ts \
+    zerokun/process-tree.test.ts \
+    zerokun/update-runtime.test.ts
 
   # Keep the authoritative SQLite/updater tests in their original files, but
   # run only cases that do not create a nested Codex sandbox, tmux session, or
@@ -49,6 +51,10 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     'kill成功後のps失敗や空出力をdeadにしない'
   candidate_contract_test zerokun/process-lock.test.ts \
     '正規化start時刻の一致とPID再利用を区別する'
+  candidate_contract_test zerokun/process-lock.test.ts \
+    'process groupはESRCHだけを自動回収可能なdeadとみなす'
+  candidate_contract_test zerokun/process-lock.test.ts \
+    '凍結した旧v2 readerは高精度追加fieldを無視できv3はfail-closedにする'
   candidate_contract_test zerokun/job-runner.test.ts \
     'gateway再起動時にprocessing inboundをpendingへ戻してFIFOを再開する'
   candidate_contract_test zerokun/job-runner.test.ts \
@@ -75,6 +81,14 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     'rollback用SQLite snapshotをsidecarごと原子的に復元する'
   candidate_contract_test zerokun/update.test.ts \
     'rollbackはGitを戻してからSQLiteを復元し旧setupを実行する'
+  candidate_contract_test zerokun/update.test.ts \
+    'setupは依存導入やproject初期化より前にupdate lockへ参加する'
+  candidate_contract_test zerokun/update.test.ts \
+    '全detached commandはlease登録後に開始しreaper後にだけ解除する'
+  candidate_contract_test zerokun/update.test.ts \
+    'cleanup evidenceが一つでも不確実ならundelegateを許可しない'
+  candidate_contract_test zerokun/update.test.ts \
+    'setup timeoutはlegacy drainと15分の作業budgetを必ず覆う'
 else
   bun test
 fi
@@ -89,7 +103,8 @@ for entry in \
   zerokun/live-codex-permission-check.ts \
   zerokun/access.ts \
   zerokun/update.ts \
-  zerokun/update-request.ts
+  zerokun/update-request.ts \
+  zerokun/update-runtime.ts
 do
   output="$BUILD_DIR/${entry//\//-}.js"
   bun build "$entry" --target=bun --outfile "$output" >/dev/null

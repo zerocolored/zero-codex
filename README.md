@@ -47,9 +47,12 @@ Claude Code、Claude のログイン、Claude channel/MCP、Anthropic API key �
 
 ```bash
 git switch main
-bash zerokun/setup.sh
+bash zerokun/bootstrap-macos.sh
 codex login status
 ```
+
+bootstrapは公式standalone Codexをaccount-owned領域へ導入してからsetupを実行します。
+Homebrew/npm版だけを使った直接`setup.sh`は、後日の安全な自己更新と同じ信頼条件を満たさないため公開手順では使いません。
 
 別PCのClaude版と比較する場合は、旧PCと既存Slack Appをそのまま残し、このPCでは
 `zero-codex`、`~/.codex/zerokun`、新しいSlack Appを使います。旧Appの`xapp-`/`xoxb-`
@@ -62,7 +65,7 @@ tokenをこのPCへコピーしないでください。同一PCでClaude版とCo
 ```bash
 ZEROKUN_LEGACY_CUTOVER=1 \
 ZEROKUN_STATE_DIR="$HOME/.claude/channels/slack" \
-bash zerokun/setup.sh
+bash zerokun/bootstrap-macos.sh
 ```
 
 この明示的なcutoverでは旧runnerをdrainして停止し、待機jobをCodex queueへ引き継ぎます。
@@ -174,6 +177,37 @@ helper・include・HTTP/credential設定があれば実行前に停止します�
 停止前に更新journalとSQLiteの整合snapshotを作成し、setupまたは再起動後の接続確認に失敗した場合は
 旧commit・旧DB・旧serviceへ自動rollbackします。強制終了でjournalが残った場合も次回起動前に
 rollbackを完了します。
+
+安全なprocess-group委譲に対応する前の旧Codex版から、最初の1回だけは`zerokun-update`やSlack経由で
+更新できません。旧updaterは変更開始前に停止して旧版へrollbackするため、上記の公開
+`bootstrap-macos.sh`を端末から実行し、旧checkoutとは別の空directoryへ配置してください。
+
+```bash
+bootstrap_dir="$(/usr/bin/mktemp -d /tmp/zerokun-bootstrap.XXXXXX)"
+/bin/chmod 700 "$bootstrap_dir"
+bootstrap_path="$bootstrap_dir/bootstrap-macos.sh"
+/usr/bin/curl -q --fail --location --proto '=https' --proto-redir '=https' \
+  --tlsv1.2 --noproxy '*' --output "$bootstrap_path" \
+  https://raw.githubusercontent.com/zerocolored/zero-codex/main/zerokun/bootstrap-macos.sh
+bash "$bootstrap_path" --repo-dir "$HOME/Desktop/Project/zero-codex-next" --skip-slack
+/bin/rm -f "$bootstrap_path"
+/bin/rmdir "$bootstrap_dir"
+```
+
+同じstate directoryを引き継いだ新checkoutのsetupがlock取得・旧service停止・配線切替を行い、
+旧checkoutを直接fast-forwardしません。以後の更新は
+`zerokun-update`で行えます。stateへ配置する自己更新runtimeは、全依存fileを検証済みbundleへ
+publishしてからentrypointをatomicに切り替えるため、途中終了しても旧bundleを維持します。
+
+更新中のprocess回収はmacOSのmicrosecond世代IDでPID/PGID再利用を判別し、観測不能または残存processが
+ある場合はlockを永続的に保持してrollbackを止めます。保証対象はZero-kun同梱commandが委譲された
+process groupを維持する通常実行です。`setsid`、double-fork、daemonizeで意図的にgroup外へ逃げる独自setupは
+対応外なので、custom setupへそのような処理を追加しないでください。primaryとgateがprocess-levelの
+SIGKILL等で強制終了した場合でも、
+保存済みPGIDが存在しないことをkernelが確認できれば、別processへsignalせず古いlockだけを回収します。
+cleanup不確実性を明示的に記録したlockは、PGID消滅後も自動回収しません。
+突然の電源断に対するfilesystem durabilityは保証対象外です。再起動後に更新journalが残る場合は、
+serviceを起動せずoffline bootstrapで復旧してください。
 
 ## Routing
 

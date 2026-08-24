@@ -5,7 +5,8 @@ import {
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
-  executeUpdater, requestUpdate, resumePendingUpdateWorker, runUpdateWorker,
+  acquireDetachedLeaderIdentity, executeUpdater, requestUpdate, resumePendingUpdateWorker,
+  runUpdaterGate, runUpdateWorker,
   withUpdateSlackDeadline, withoutUpdateNotificationNetworkOverrides,
 } from './update-request'
 import {
@@ -15,6 +16,7 @@ import {
   buildRuntimeServiceEnvironment,
   buildUpdaterEnvironment,
 } from './child-environment'
+import { observeProcessGeneration, readProcessIdentity } from './process-generation'
 
 const tempDirs: string[] = []
 
@@ -38,6 +40,44 @@ function input(messageId = '1787000000.000100') {
 }
 
 describe('Slack update request', () => {
+  test('gate identityを取得できなければupdaterを開始しない', async () => {
+    const stateDir = fixtureDir()
+    const probe = join(stateDir, 'updater-started')
+    const updater = join(stateDir, 'fake-updater.ts')
+    writeFileSync(updater, `await Bun.write(${JSON.stringify(probe)}, 'started\\n')\n`)
+    await expect(runUpdaterGate(updater, join(stateDir, 'update.log'), {
+      HOME: stateDir,
+      PATH: process.env.PATH,
+      ZEROKUN_STATE_DIR: stateDir,
+    }, {
+      identityReader: () => undefined,
+      identityAttempts: 2,
+      identityRetryMs: 1,
+    })).rejects.toThrow('exact process identity')
+    expect(existsSync(probe)).toBe(false)
+  })
+
+  test('detached leader identityは一時的な取得失敗を再試行する', async () => {
+    const identity = {
+      pid: 4242,
+      ppid: 1,
+      pgid: 4242,
+      status: 2,
+      bootSession: '11111111-1111-4111-8111-111111111111',
+      startSec: 1_800_000_000,
+      startUsec: 123,
+      started: '11111111-1111-4111-8111-111111111111:1800000000:000123',
+    }
+    let attempts = 0
+    expect(await acquireDetachedLeaderIdentity(
+      identity.pid,
+      () => (++attempts === 1 ? undefined : identity),
+      3,
+      1,
+    )).toEqual(identity)
+    expect(attempts).toBe(2)
+  })
+
   test('stateやprojectのdotenvをtrusted updater processへ自動読込しない', async () => {
     const stateDir = fixtureDir()
     const probe = join(stateDir, 'dotenv-payload-ran')
@@ -237,7 +277,10 @@ describe('Slack update request', () => {
   test('更新workerはhangしたupdaterをdeadline後に停止して失敗outcomeを保存する', async () => {
     const stateDir = fixtureDir()
     const updater = join(stateDir, 'hanging-updater.ts')
+    const updaterPid = join(stateDir, 'hanging-updater.pid')
     writeFileSync(updater, [
+      "import { writeFileSync } from 'fs'",
+      `writeFileSync(${JSON.stringify(updaterPid)}, String(process.pid))`,
       "process.on('SIGTERM', () => {})",
       'await Bun.sleep(30_000)',
       '',
@@ -249,19 +292,47 @@ describe('Slack update request', () => {
     })
     const notifications: string[] = []
     const startedAt = Date.now()
-    const result = await runUpdateWorker('request-timeout', {
+    const running = runUpdateWorker('request-timeout', {
       stateDir,
       updaterPath: updater,
       updaterTimeoutMs: 50,
       updaterTermGraceMs: 50,
       notify: async (_request, text) => { notifications.push(text) },
     })
+    let deadline = Date.now() + 2_000
+    while (!existsSync(updaterPid) && Date.now() < deadline) await Bun.sleep(10)
+    expect(existsSync(updaterPid)).toBe(true)
+    const childIdentity = readProcessIdentity(Number(readFileSync(updaterPid, 'utf8')))
+    expect(childIdentity).toBeDefined()
+    const result = await running
     expect(Date.now() - startedAt).toBeLessThan(2_000)
     expect(result).toEqual({ success: false, exitCode: 1, notificationSent: true })
     expect(notifications[0]).toContain('timeout')
     const saved = JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8'))
     expect(saved.outcome.success).toBe(false)
     expect(saved.outcome.notifiedAt).toBeNumber()
+    expect(observeProcessGeneration(childIdentity!).status).toBe('dead')
+  })
+
+  test('live detached gateがrequestへ残る間はworkerを二重起動しない', async () => {
+    const stateDir = fixtureDir()
+    await requestUpdate(input(), {
+      stateDir,
+      idFactory: () => 'request-live-gate',
+      launchWorker: () => {},
+    })
+    const current = JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8'))
+    const gate = readProcessIdentity(process.pid)
+    expect(gate).toBeDefined()
+    current.gate = gate
+    writeFileSync(join(stateDir, 'update-request.json'), JSON.stringify(current))
+    const launched: string[] = []
+    expect(resumePendingUpdateWorker({
+      stateDir,
+      isWorkerRunning: () => false,
+      launchWorker: value => launched.push(value.id),
+    })).toBe(false)
+    expect(launched).toEqual([])
   })
 
   test('未通知outcomeのworkerが終了していれば定期回復で再起動する', async () => {

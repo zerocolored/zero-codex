@@ -2,29 +2,43 @@
 
 import { Database } from 'bun:sqlite'
 import {
-  accessSync,
+  closeSync,
   constants,
   existsSync,
   chmodSync,
   copyFileSync,
+  fchmodSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
   lstatSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
-  statSync,
+  writeSync,
   writeFileSync,
+  type BigIntStats,
 } from 'fs'
 import { randomUUID } from 'crypto'
-import { homedir, tmpdir } from 'os'
-import { dirname, join, resolve } from 'path'
+import { homedir } from 'os'
+import { dirname, join, parse, relative, resolve, sep } from 'path'
 import {
+  blockProcessLockDelegate,
+  delegateProcessLock,
   discardProcessLock,
   processLockOwnerMatches,
+  processLockLeaseIsExclusive,
+  protectProcessLockDelegateCleanup,
+  stopProcessLockOwner,
+  type ProcessLockDelegate,
+  type ProcessLockLease,
   releaseProcessLock,
   tryAcquireProcessLock,
+  undelegateProcessLock,
+  encodeProcessLockDelegate,
 } from './process-lock.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
 import { readGatewayReadiness } from './readiness.ts'
@@ -39,8 +53,15 @@ import {
   requireManagedDirectory,
 } from './managed-path.ts'
 import { atomicWritePrivateFile, readOptionalPrivateFile } from './safe-file.ts'
-import { assertEffectiveCodexPermissionConfig } from './codex-executor.ts'
-import { captureTrackedProcesses, reapTrackedProcesses } from './process-tree.ts'
+import {
+  captureTrackedProcesses,
+  reapTrackedProcesses,
+  seedTrackedProcess,
+} from './process-tree.ts'
+import {
+  signalProcessGroupIfLeaderLive,
+  signalProcessIfLive,
+} from './process-generation.ts'
 
 interface Repository {
   label: string
@@ -60,6 +81,16 @@ interface CommandResult {
   stderr: string
 }
 
+type ProcessGroupLeaseCoordinator = {
+  delegate: (pid: number) => ProcessLockDelegate
+  undelegate: (delegate: ProcessLockDelegate) => void
+  block: (delegate: ProcessLockDelegate) => void
+  protect: (delegate: ProcessLockDelegate) => void
+  quiescenceLockFile: string
+  gateHelperRoot: string
+  gateLockTool: string
+}
+
 const TRUSTED_TOOL_PATH = [
   '/usr/bin',
   '/bin',
@@ -72,26 +103,251 @@ const TRUSTED_TOOL_PATH = [
 
 const MINIMUM_CODEX_VERSION = [0, 149, 0] as const
 
-function secureExecutable(candidate: string): string | null {
+function trustedSystemTemporaryDirectory(): string {
+  const physical = realpathSync('/tmp')
+  const root = parse(physical).root
+  let current = root
+  for (const component of relative(root, physical).split(sep).filter(Boolean)) {
+    current = join(current, component)
+    const metadata = lstatSync(current)
+    const writable = (metadata.mode & 0o022) !== 0
+    const stickyRootDirectory = metadata.uid === 0 && (metadata.mode & 0o1000) !== 0
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== 0
+      || (writable && !stickyRootDirectory)) {
+      fail(`system temporary directoryが安全ではありません: ${physical}`)
+    }
+  }
+  return physical
+}
+
+/** Ignore caller-controlled TMPDIR for executable/helper staging. */
+export function createUpdaterTemporaryDirectory(prefix: string): string {
+  if (!/^zerokun-[a-z0-9-]{1,64}-$/.test(prefix)) {
+    fail(`temporary directory prefixが不正です: ${prefix}`)
+  }
+  const directory = mkdtempSync(join(trustedSystemTemporaryDirectory(), prefix))
+  chmodSync(directory, 0o700)
+  const metadata = lstatSync(directory)
+  const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !ownerMatches
+    || (metadata.mode & 0o077) !== 0) {
+    fail(`temporary directoryを安全に作成できません: ${directory}`)
+  }
+  return directory
+}
+
+interface SecureExecutableSnapshot {
+  physical: string
+  metadata: BigIntStats
+}
+
+function secureExecutableSnapshot(candidate: string): SecureExecutableSnapshot | null {
   try {
     const physical = realpathSync(candidate)
-    const metadata = statSync(physical)
+    const root = parse(physical).root
+    let current = root
+    for (const component of relative(root, dirname(physical)).split(sep).filter(Boolean)) {
+      current = join(current, component)
+      const parent = lstatSync(current)
+      const parentOwnerAllowed = typeof process.getuid !== 'function'
+        || parent.uid === process.getuid()
+        || parent.uid === 0
+      if (!parent.isDirectory() || parent.isSymbolicLink() || !parentOwnerAllowed
+        || (parent.mode & 0o022) !== 0) return null
+    }
+    const metadata = lstatSync(physical, { bigint: true })
     const ownerAllowed = typeof process.getuid !== 'function'
-      || metadata.uid === process.getuid()
-      || metadata.uid === 0
-    if (!metadata.isFile() || !ownerAllowed || (metadata.mode & 0o022) !== 0) return null
-    accessSync(physical, constants.X_OK)
-    return physical
+      || metadata.uid === BigInt(process.getuid())
+      || metadata.uid === 0n
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1n
+      || !ownerAllowed || (metadata.mode & 0o022n) !== 0n
+      || (metadata.mode & 0o111n) === 0n) return null
+    return { physical, metadata }
   } catch {
     return null
+  }
+}
+
+function secureExecutable(candidate: string): string | null {
+  return secureExecutableSnapshot(candidate)?.physical ?? null
+}
+
+export function nativeExecutableHeaderSupported(
+  header: Uint8Array,
+  platform = process.platform,
+): boolean {
+  if (header.byteLength < 4) return false
+  const magic = [...header.subarray(0, 4)]
+    .map(value => value.toString(16).padStart(2, '0')).join('')
+  if (platform === 'darwin') {
+    return new Set([
+      'feedface', 'cefaedfe', 'feedfacf', 'cffaedfe',
+      'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca',
+    ]).has(magic)
+  }
+  if (platform === 'linux') return magic === '7f454c46'
+  return false
+}
+
+function copySecureExecutable(
+  candidate: string,
+  destination: string,
+  beforeOpen: () => void = () => {},
+  requireNative = false,
+): void {
+  const snapshot = secureExecutableSnapshot(candidate)
+  if (!snapshot) fail(`実行fileを安全に読めません: ${candidate}`)
+  const { physical, metadata: before } = snapshot
+  let source = -1
+  let target = -1
+  let complete = false
+  try {
+    beforeOpen()
+    source = openSync(physical, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const opened = fstatSync(source, { bigint: true })
+    const openedOwnerAllowed = typeof process.getuid !== 'function'
+      || opened.uid === BigInt(process.getuid()) || opened.uid === 0n
+    if (!opened.isFile() || opened.nlink !== 1n || !openedOwnerAllowed
+      || (opened.mode & 0o022n) !== 0n || (opened.mode & 0o111n) === 0n
+      || opened.dev !== before.dev || opened.ino !== before.ino
+      || opened.size !== before.size || opened.mode !== before.mode
+      || opened.uid !== before.uid || opened.mtimeNs !== before.mtimeNs
+      || opened.ctimeNs !== before.ctimeNs) {
+      fail(`実行fileが検証中に変化しました: ${candidate}`)
+    }
+    if (requireNative) {
+      const header = Buffer.alloc(4)
+      if (readSync(source, header, 0, header.length, 0) !== header.length
+        || !nativeExecutableHeaderSupported(header)) {
+        fail(`Codex executableがnative binaryではありません: ${candidate}`)
+      }
+    }
+    target = openSync(
+      destination,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o500,
+    )
+    const buffer = Buffer.allocUnsafe(64 * 1024)
+    while (true) {
+      const size = readSync(source, buffer, 0, buffer.length, null)
+      if (size === 0) break
+      let offset = 0
+      while (offset < size) {
+        offset += writeSync(target, buffer, offset, size - offset)
+      }
+    }
+    const after = fstatSync(source, { bigint: true })
+    if (after.dev !== opened.dev || after.ino !== opened.ino
+      || after.size !== opened.size || after.mode !== opened.mode
+      || after.uid !== opened.uid || after.mtimeNs !== opened.mtimeNs
+      || after.ctimeNs !== opened.ctimeNs) {
+      fail(`実行fileがcopy中に変化しました: ${candidate}`)
+    }
+    const copied = fstatSync(target)
+    if (!copied.isFile() || copied.nlink !== 1
+      || BigInt(copied.size) !== opened.size
+      || (typeof process.getuid === 'function' && copied.uid !== process.getuid())) {
+      fail(`staging実行fileが不正です: ${destination}`)
+    }
+    fchmodSync(target, 0o500)
+    complete = true
+  } finally {
+    if (target >= 0) closeSync(target)
+    if (source >= 0) closeSync(source)
+    if (!complete) {
+      try { rmSync(destination, { force: true }) } catch {}
+    }
+  }
+}
+
+/** Test-only deterministic race injection for the executable staging boundary. */
+export function copySecureExecutableForTesting(
+  candidate: string,
+  destination: string,
+  beforeOpen: () => void,
+): void {
+  copySecureExecutable(candidate, destination, beforeOpen)
+}
+
+function copyFrozenRuntimeFile(sourcePath: string, destination: string): void {
+  let source = -1
+  let target = -1
+  try {
+    source = openSync(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const before = fstatSync(source, { bigint: true })
+    const ownerAllowed = typeof process.getuid !== 'function'
+      || before.uid === BigInt(process.getuid()) || before.uid === 0n
+    if (!before.isFile() || before.nlink !== 1n || !ownerAllowed
+      || before.size <= 0n || before.size > 2n * 1024n * 1024n) {
+      fail(`runtime helper sourceが不正です: ${sourcePath}`)
+    }
+    target = openSync(
+      destination,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o400,
+    )
+    const buffer = Buffer.allocUnsafe(64 * 1024)
+    while (true) {
+      const size = readSync(source, buffer, 0, buffer.length, null)
+      if (size === 0) break
+      let offset = 0
+      while (offset < size) offset += writeSync(target, buffer, offset, size - offset)
+    }
+    const after = fstatSync(source, { bigint: true })
+    if (after.dev !== before.dev || after.ino !== before.ino
+      || after.size !== before.size || after.mode !== before.mode
+      || after.uid !== before.uid || after.mtimeNs !== before.mtimeNs
+      || after.ctimeNs !== before.ctimeNs) {
+      fail(`runtime helper sourceがcopy中に変化しました: ${sourcePath}`)
+    }
+    const copied = fstatSync(target)
+    if (!copied.isFile() || copied.nlink !== 1
+      || (typeof process.getuid === 'function' && copied.uid !== process.getuid())) {
+      fail(`runtime helper copyが不正です: ${destination}`)
+    }
+    fchmodSync(target, 0o400)
+  } finally {
+    if (target >= 0) closeSync(target)
+    if (source >= 0) closeSync(source)
+  }
+}
+
+function prepareProcessGroupGateHelper(): { root: string; lockTool: string } {
+  const root = createUpdaterTemporaryDirectory('zerokun-gate-helper-')
+  const lockTool = join(root, 'process-lock.ts')
+  try {
+    copyFrozenRuntimeFile(join(import.meta.dir, 'process-lock.ts'), lockTool)
+    copyFrozenRuntimeFile(
+      join(import.meta.dir, 'process-generation.ts'),
+      join(root, 'process-generation.ts'),
+    )
+    return { root, lockTool }
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true })
+    throw error
   }
 }
 
 function codexVersionIsSupported(
   codexBin: string,
   source: Record<string, string | undefined>,
+  requireNative = true,
 ): boolean {
-  const result = Bun.spawnSync([codexBin, '--version'], {
+  const stagingRoot = createUpdaterTemporaryDirectory('zerokun-codex-version-')
+  const staged = join(stagingRoot, 'codex')
+  try {
+    copySecureExecutable(codexBin, staged, () => {}, requireNative)
+    return stagedCodexVersionIsSupported(staged, source)
+  } finally {
+    rmSync(stagingRoot, { recursive: true, force: true })
+  }
+}
+
+function stagedCodexVersionIsSupported(
+  staged: string,
+  source: Record<string, string | undefined>,
+): boolean {
+  const result = Bun.spawnSync([staged, '--version'], {
     env: {
       PATH: TRUSTED_TOOL_PATH,
       HOME: source.HOME ?? '/var/empty',
@@ -105,7 +361,8 @@ function codexVersionIsSupported(
     maxBuffer: 64 * 1024,
   })
   if (result.exitCode !== 0) return false
-  const match = result.stdout.toString().match(/(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\s|$)/)
+  const versionOutput = result.stdout.toString()
+  const match = versionOutput.match(/(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\s|$)/)
   if (!match) return false
   const actual = [Number(match[1]), Number(match[2]), Number(match[3])]
   for (let index = 0; index < MINIMUM_CODEX_VERSION.length; index += 1) {
@@ -118,6 +375,7 @@ function codexVersionIsSupported(
 export function resolveUpdaterCodexBinary(
   source: Record<string, string | undefined> = process.env,
   runtimeExecutable = process.execPath,
+  allowScriptForTesting = false,
 ): string {
   const configured = source.ZEROKUN_CODEX_BIN
   if (configured && !configured.startsWith('/')) {
@@ -134,12 +392,16 @@ export function resolveUpdaterCodexBinary(
       ]
   for (const candidate of candidates) {
     const physical = secureExecutable(candidate)
-    if (physical && codexVersionIsSupported(physical, source)) return physical
+    if (physical) {
+      let native: string | null = null
+      try { native = candidateCodexExecutable(physical) } catch {}
+      if (native && codexVersionIsSupported(native, source, !allowScriptForTesting)) return physical
+    }
     if (configured) {
       fail('ZEROKUN_CODEX_BINは安全なCodex CLI 0.149.0以上を指定してください')
     }
   }
-  fail('信頼できるCodex CLI 0.149.0以上を ~/.local/bin またはHomebrewから解決できません')
+  fail('信頼できるnative Codex CLI 0.149.0以上を解決できません。先にbootstrap-macos.shを実行してください')
 }
 
 export function updaterTrustedToolPath(trustedCodexDirectory: string): string {
@@ -179,14 +441,21 @@ function candidateCodexExecutable(codexBin: string): string {
   return physical
 }
 
-function prepareCandidateToolDirectory(parent: string, codexBin: string): string {
+export function stageVerifiedCandidateCodex(
+  parent: string,
+  codexBin: string,
+  source: Record<string, string | undefined> = process.env,
+): { directory: string; executable: string } {
   const directory = join(parent, 'trusted-bin')
   mkdirSync(directory, { mode: 0o700 })
-  const destination = join(directory, 'codex')
-  copyFileSync(candidateCodexExecutable(codexBin), destination, constants.COPYFILE_EXCL)
-  chmodSync(destination, 0o500)
+  const executable = join(directory, 'codex')
+  copySecureExecutable(candidateCodexExecutable(codexBin), executable, () => {}, true)
+  if (!stagedCodexVersionIsSupported(executable, source)) {
+    fail('stagingしたCodex CLIが0.149.0以上ではありません')
+  }
+  chmodSync(executable, 0o500)
   chmodSync(directory, 0o500)
-  return directory
+  return { directory, executable }
 }
 
 type UpdatePhase = 'prepared' | 'fast-forwarded' | 'setup-applied' | 'rolling-back'
@@ -210,7 +479,9 @@ const decoder = new TextDecoder()
 const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_GIT_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_VERIFY_TIMEOUT_MS = 30 * 60_000
-const DEFAULT_SETUP_TIMEOUT_MS = 15 * 60_000
+export const DEFAULT_SETUP_WORK_MS = 15 * 60_000
+export const DEFAULT_SETUP_DRAIN_SECONDS = 21_600
+const MAX_SETUP_DRAIN_SECONDS = 7 * 24 * 60 * 60
 interface UpdateExecutionPolicy {
   allowLocalRemotes: boolean
   skipCodexPermissionPreflight: boolean
@@ -243,6 +514,39 @@ function timeoutFromEnvironment(name: string, fallback: number): number {
   const value = Number(raw)
   if (!Number.isFinite(value) || value <= 0) fail(`${name}が不正です`)
   return Math.floor(value)
+}
+
+export function setupTimeoutBudgetMs(
+  environment: Record<string, string | undefined> = process.env,
+): number {
+  if (environment.ZEROKUN_LEGACY_CUTOVER !== '1') return DEFAULT_SETUP_WORK_MS
+  const raw = environment.ZEROKUN_SETUP_DRAIN_SECONDS
+    ?? String(DEFAULT_SETUP_DRAIN_SECONDS)
+  if (!/^\d+$/.test(raw)) fail('ZEROKUN_SETUP_DRAIN_SECONDSが不正です')
+  const drainSeconds = Number(raw)
+  if (!Number.isSafeInteger(drainSeconds)
+    || drainSeconds < 0 || drainSeconds > MAX_SETUP_DRAIN_SECONDS) {
+    fail('ZEROKUN_SETUP_DRAIN_SECONDSが不正です')
+  }
+  return drainSeconds * 1_000 + DEFAULT_SETUP_WORK_MS
+}
+
+export function resolveSetupTimeoutMs(
+  environment: Record<string, string | undefined> = process.env,
+  allowShortTestTimeout = false,
+): number {
+  const budget = setupTimeoutBudgetMs(environment)
+  const raw = environment.ZEROKUN_UPDATE_SETUP_TIMEOUT_MS
+  if (raw === undefined || raw === '') return budget
+  const configured = Number(raw)
+  if (!Number.isFinite(configured) || configured <= 0) {
+    fail('ZEROKUN_UPDATE_SETUP_TIMEOUT_MSが不正です')
+  }
+  const normalized = Math.floor(configured)
+  if (!allowShortTestTimeout && normalized < budget) {
+    fail(`ZEROKUN_UPDATE_SETUP_TIMEOUT_MSは${budget}ms以上にしてください`)
+  }
+  return normalized
 }
 
 function gitConfigOverrides(): string[] {
@@ -342,6 +646,60 @@ async function collectCommandStream(
   }
 }
 
+const PROCESS_GROUP_GATE_SCRIPT = [
+  'IFS= read -r zerokun_gate || exit 125',
+  '[ "$zerokun_gate" = start ] || exit 125',
+  'IFS= read -r zerokun_delegate_token || exit 125',
+  'zerokun_bun=$1',
+  'zerokun_lock_tool=$2',
+  'zerokun_lock_file=$3',
+  'zerokun_helper_root=$4',
+  'shift 4',
+  'zerokun_probe_dir="$(/usr/bin/mktemp -d /tmp/zerokun-command-group.XXXXXX)" || exit 125',
+  '/bin/chmod 0700 "$zerokun_probe_dir" || exit 125',
+  "trap '/bin/rm -rf -- \"$zerokun_probe_dir\"' EXIT",
+  'zerokun_signal_status=0',
+  "trap 'zerokun_signal_status=129' HUP",
+  "trap 'zerokun_signal_status=130' INT",
+  "trap 'zerokun_signal_status=143' TERM",
+  'zerokun_command_status=0',
+  '"$@" || zerokun_command_status=$?',
+  '[ "$zerokun_signal_status" = 0 ] || zerokun_command_status="$zerokun_signal_status"',
+  // Keep the delegated leader alive until every non-detached descendant in
+  // its group exits. If reaping fails, the persisted delegate remains a
+  // fail-closed barrier after the updater itself exits.
+  'while :; do',
+  '  /bin/ps -axo pid=,pgid= > "$zerokun_probe_dir/processes" &',
+  '  zerokun_probe_pid=$!',
+  '  wait "$zerokun_probe_pid" || { /bin/sleep 0.05; continue; }',
+  "  /usr/bin/awk -v group=\"$$\" -v self=\"$$\" -v probe=\"$zerokun_probe_pid\" '",
+  '    $2 == group { seen=1; if ($1 != self && $1 != probe) other=1 }',
+  '    END { if (!seen) code=2; else if (other) code=0; else code=1; exit code }',
+  "  ' \"$zerokun_probe_dir/processes\"",
+  '  zerokun_group_status=$?',
+  '  case "$zerokun_group_status" in',
+  '    1) break ;;',
+  '    *) /bin/sleep 0.05 ;;',
+  '  esac',
+  'done',
+  '"$zerokun_bun" --config=/dev/null --no-env-file "$zerokun_lock_tool" quiescent "$zerokun_lock_file" "$zerokun_delegate_token" || exit 125',
+  'exit "$zerokun_command_status"',
+].join('\n')
+
+export function processGroupCleanupIsUncertain(input: {
+  remaining: readonly number[]
+  terminationError?: unknown
+  finalReapError?: unknown
+  trackingError?: unknown
+  cleanupProtectionError?: unknown
+}): boolean {
+  return input.remaining.length > 0
+    || input.terminationError !== undefined
+    || input.finalReapError !== undefined
+    || input.trackingError !== undefined
+    || input.cleanupProtectionError !== undefined
+}
+
 async function requireCommandAsync(
   args: string[],
   options: {
@@ -350,36 +708,86 @@ async function requireCommandAsync(
     env?: Record<string, string | undefined>
     signal?: AbortSignal
     timeoutMs?: number
+    processGroupLease?: ProcessGroupLeaseCoordinator
   } = {},
 ): Promise<string> {
   if (options.signal?.aborted) fail('更新を中断しました')
   const timeoutMs = options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) fail('command timeoutが不正です')
   const commandArgs = hardenedGitArgs(args)
-  const proc = Bun.spawn(commandArgs, {
+  const spawnedArgs = options.processGroupLease
+    ? [
+        '/bin/bash', '-c', PROCESS_GROUP_GATE_SCRIPT, 'zerokun-command-gate',
+        process.execPath, options.processGroupLease.gateLockTool,
+        options.processGroupLease.quiescenceLockFile,
+        options.processGroupLease.gateHelperRoot, ...commandArgs,
+      ]
+    : commandArgs
+  const proc = Bun.spawn(spawnedArgs, {
     cwd: options.cwd,
     env: args[0] === 'git'
       ? hardenedGitEnvironment(options.env ?? process.env)
       : options.env ?? process.env,
-    stdin: 'ignore',
+    stdin: options.processGroupLease ? 'pipe' : 'ignore',
     stdout: options.inherit ? 'inherit' : 'pipe',
     stderr: options.inherit ? 'inherit' : 'pipe',
     detached: process.platform !== 'win32',
   })
   const tracked = new Map<number, string>()
+  let rootIdentity: ReturnType<typeof seedTrackedProcess>
+  try {
+    rootIdentity = seedTrackedProcess(proc.pid, tracked)
+    if (process.platform !== 'win32' && rootIdentity.pgid !== rootIdentity.pid) {
+      throw new Error(`command gate ${proc.pid}を独立process groupへ起動できません`)
+    }
+  } catch (error) {
+    try { proc.stdin?.end() } catch {}
+    const exited = await Promise.race([
+      proc.exited.then(() => true, () => true),
+      Bun.sleep(500).then(() => false),
+    ])
+    if (!exited) {
+      throw new Error(
+        `command gate ${proc.pid}のgenerationを取得できず、安全に停止できません`,
+        { cause: error },
+      )
+    }
+    throw error
+  }
   let tracking = true
   let trackingError: unknown
   let timedOut = false
   let termination: Promise<number[]> | undefined
   let terminationError: unknown
-  let forceKillTimer: ReturnType<typeof setTimeout> | undefined
+  let directTermination: Promise<void> | undefined
+  let delegated: ProcessLockDelegate | undefined
+  let cleanupProtected = false
+  let cleanupProtectionError: unknown
+  const protectCleanup = () => {
+    if (!delegated || cleanupProtected) return
+    try {
+      options.processGroupLease!.protect(delegated)
+      cleanupProtected = true
+    } catch (error) {
+      cleanupProtectionError = error
+    }
+  }
   const terminateDirect = () => {
-    try { proc.kill('SIGTERM') } catch {}
-    forceKillTimer ??= setTimeout(() => {
-      try { proc.kill('SIGKILL') } catch {}
-    }, 5_000)
+    directTermination ??= (async () => {
+      // The normal reaper already attempted graceful TERM. Its failure path
+      // uses only the spawn-time exact generation and never a bare PID/PGID.
+      if (!signalProcessGroupIfLeaderLive(rootIdentity, 'SIGKILL')) {
+        signalProcessIfLive(rootIdentity, 'SIGKILL')
+      }
+      const exitedAfterKill = await Promise.race([
+        proc.exited.then(() => true, () => true),
+        Bun.sleep(5_000).then(() => false),
+      ])
+      if (!exitedAfterKill) throw new Error(`direct child ${proc.pid}を停止できません`)
+    })()
   }
   const terminate = () => {
+    protectCleanup()
     termination ??= reapTrackedProcesses({
       rootPids: [proc.pid],
       groupId: proc.pid,
@@ -409,6 +817,20 @@ async function requireCommandAsync(
     timedOut = true
     terminate()
   }, timeoutMs)
+  let gateError: unknown
+  if (options.processGroupLease) {
+    const gateInput = proc.stdin
+    try {
+      if (!gateInput) fail('process group gate stdinを作成できません')
+      delegated = options.processGroupLease.delegate(proc.pid)
+      gateInput.write(`start\n${encodeProcessLockDelegate(delegated)}\n`)
+      gateInput.end()
+    } catch (error) {
+      gateError = error
+      try { gateInput?.end() } catch {}
+      terminate()
+    }
+  }
   const outputController = new AbortController()
   const stdoutPromise = options.inherit
     ? Promise.resolve('')
@@ -417,17 +839,24 @@ async function requireCommandAsync(
     ? Promise.resolve('')
     : collectCommandStream(proc.stderr!, outputController.signal)
   const outputCompletion = Promise.all([stdoutPromise, stderrPromise])
-  let exitCode: number
+  let exitCode = -1
+  let exitError: unknown
   try {
     exitCode = await proc.exited
+  } catch (error) {
+    exitError = error
   } finally {
     clearTimeout(timeout)
-    if (forceKillTimer) clearTimeout(forceKillTimer)
     options.signal?.removeEventListener('abort', terminate)
     tracking = false
     await tracker
   }
   if (termination) await termination
+  if (terminationError && directTermination) await directTermination
+  // Even a natural gate exit may have skipped its quiescence write (for
+  // example, external SIGKILL). Persist the cleanup intent before the final
+  // generation-aware scan. A gate that already wrote quiescent is unchanged.
+  protectCleanup()
   let remaining: number[] = []
   let finalReapError: unknown
   try {
@@ -442,13 +871,43 @@ async function requireCommandAsync(
   }
   await Promise.race([outputCompletion, Bun.sleep(500)])
   outputController.abort()
-  const [stdout, stderr] = await outputCompletion
-  if (finalReapError) throw finalReapError
-  if (terminationError) throw terminationError
-  if (remaining.length > 0) {
-    fail(`子processを回収できませんでした: ${remaining.join(', ')}`)
+  let stdout = ''
+  let stderr = ''
+  let outputError: unknown
+  try {
+    [stdout, stderr] = await outputCompletion
+  } catch (error) {
+    outputError = error
   }
-  if (trackingError) throw trackingError
+  const cleanupUncertain = processGroupCleanupIsUncertain({
+    remaining,
+    terminationError,
+    finalReapError,
+    trackingError,
+    cleanupProtectionError,
+  })
+  if (cleanupUncertain) {
+    const cleanupError = cleanupProtectionError ?? trackingError ?? terminationError ?? finalReapError
+      ?? new Error(`子processを回収できませんでした: ${remaining.join(', ')}`)
+    if (delegated) {
+      try {
+        options.processGroupLease!.block(delegated)
+      } catch (blockError) {
+        throw new Error(
+          `子process cleanupが不確実でlockの永続blockにも失敗しました: ${String(blockError)}`,
+          { cause: cleanupError },
+        )
+      }
+    }
+    throw cleanupError
+  }
+  // Only a clean final scan may remove the persisted delegate. Timeout and
+  // command failures are evaluated afterwards so a verified-quiescent group
+  // can still roll back safely.
+  if (delegated) options.processGroupLease!.undelegate(delegated)
+  if (gateError) throw gateError
+  if (exitError) throw exitError
+  if (outputError) throw outputError
   if (timedOut) fail(`コマンドが${timeoutMs}msでtimeoutしました: ${args.join(' ')}`)
   if (options.signal?.aborted) fail('更新を中断しました')
   if (exitCode !== 0) {
@@ -493,7 +952,13 @@ function resolveRootRepo(): string {
   return realpathSync(join(dirname(invoked), '..'))
 }
 
-function acquireUpdateLock(stateDir: string): { path: string; release: () => void } {
+type UpdateLockCoordinator = ProcessGroupLeaseCoordinator & {
+  path: string
+  assertExclusive: () => void
+  release: () => void
+}
+
+function acquireUpdateLock(stateDir: string): UpdateLockCoordinator {
   prepareManagedStateRoot(stateDir)
   const lockPath = join(stateDir, 'update.lock')
   const pidPath = join(lockPath, 'pid')
@@ -505,16 +970,118 @@ function acquireUpdateLock(stateDir: string): { path: string; release: () => voi
     }
     fail('zerokun-update lockの所有者を確認できません。安全のため更新を中止します')
   }
+  let gateHelper: ReturnType<typeof prepareProcessGroupGateHelper>
+  try {
+    gateHelper = prepareProcessGroupGateHelper()
+  } catch (error) {
+    releaseProcessLock(pidPath, attempt.lease)
+    throw error
+  }
   let held = true
+  let activeDelegate: ProcessLockDelegate | undefined
+  const lease: ProcessLockLease = attempt.lease
   return {
     path: lockPath,
-    release: () => {
-      if (!held) return
-      held = false
-      if (!releaseProcessLock(pidPath, attempt.lease)) {
-        fail('zerokun-update lockを安全に解放できません')
+    quiescenceLockFile: pidPath,
+    gateHelperRoot: gateHelper.root,
+    gateLockTool: gateHelper.lockTool,
+    delegate: (pid: number) => {
+      if (!held) fail('zerokun-update lockは既に解放されています')
+      if (activeDelegate) fail('zerokun-update lockには既に実行中の委譲があります')
+      const delegated = delegateProcessLock(pidPath, lease, pid)
+      if (!delegated) fail('子processへzerokun-update lockを安全に委譲できません')
+      activeDelegate = delegated
+      return delegated
+    },
+    undelegate: (delegate: ProcessLockDelegate) => {
+      if (!held || !undelegateProcessLock(pidPath, delegate)) {
+        fail('子processのzerokun-update lock委譲を安全に解除できません')
+      }
+      activeDelegate = undefined
+    },
+    block: (delegate: ProcessLockDelegate) => {
+      if (!held || !activeDelegate
+        || activeDelegate.pid !== delegate.pid
+        || activeDelegate.nonce !== delegate.nonce
+        || !blockProcessLockDelegate(pidPath, delegate)) {
+        fail('子process cleanup不確実性をzerokun-update lockへ記録できません')
       }
     },
+    protect: (delegate: ProcessLockDelegate) => {
+      if (!held || !activeDelegate
+        || activeDelegate.pid !== delegate.pid
+        || activeDelegate.nonce !== delegate.nonce
+        || !protectProcessLockDelegateCleanup(pidPath, delegate)) {
+        fail('子process cleanupのwrite-ahead保護を記録できません')
+      }
+    },
+    assertExclusive: () => {
+      if (!held || activeDelegate || !processLockLeaseIsExclusive(pidPath, lease)) {
+        fail('実行中または観測不能な子processが残っているためrollbackを開始できません')
+      }
+    },
+    release: () => {
+      if (!held) return
+      if (activeDelegate || !releaseProcessLock(pidPath, lease)) {
+        fail('zerokun-update lockを安全に解放できません')
+      }
+      held = false
+      rmSync(gateHelper.root, { recursive: true, force: true })
+    },
+  }
+}
+
+async function requireSetupCommandAsync(
+  setupScript: string,
+  updateLock: UpdateLockCoordinator,
+  options: {
+    cwd: string
+    inherit: boolean
+    env: Record<string, string | undefined>
+    signal?: AbortSignal
+    timeoutMs: number
+  },
+): Promise<void> {
+  await requireCommandAsync(['/bin/bash', setupScript], {
+    ...options,
+    processGroupLease: updateLock,
+  })
+}
+
+/** Behavioral harness for the production gate→delegate topology. */
+export async function runLeasedCommandForTests(
+  args: string[],
+  stateDir: string,
+  options: {
+    cwd?: string
+    env?: Record<string, string | undefined>
+    timeoutMs?: number
+  } = {},
+): Promise<{ output: string; groupId: number }> {
+  const coordinator = acquireUpdateLock(stateDir)
+  let groupId = 0
+  const lease: ProcessGroupLeaseCoordinator = {
+    quiescenceLockFile: coordinator.quiescenceLockFile,
+    gateHelperRoot: coordinator.gateHelperRoot,
+    gateLockTool: coordinator.gateLockTool,
+    delegate: pid => {
+      const delegated = coordinator.delegate(pid)
+      groupId = delegated.groupId ?? delegated.pid
+      return delegated
+    },
+    undelegate: delegate => coordinator.undelegate(delegate),
+    block: delegate => coordinator.block(delegate),
+    protect: delegate => coordinator.protect(delegate),
+  }
+  try {
+    const output = await requireCommandAsync(args, {
+      ...options,
+      processGroupLease: lease,
+    })
+    if (groupId <= 1) fail('test command groupを取得できません')
+    return { output, groupId }
+  } finally {
+    coordinator.release()
   }
 }
 
@@ -711,6 +1278,7 @@ function isAncestor(repo: Repository, ancestor: string, descendant: string): boo
 export async function preflightRepositories(
   repositories: Repository[],
   signal?: AbortSignal,
+  processGroupLease?: ProcessGroupLeaseCoordinator,
 ): Promise<PinnedRepository[]> {
   for (const repo of repositories) {
     assertSafeLocalGitConfig(repo)
@@ -729,6 +1297,7 @@ export async function preflightRepositories(
     ], {
       cwd: repo.path,
       signal,
+      processGroupLease,
       timeoutMs: timeoutFromEnvironment('ZEROKUN_UPDATE_GIT_TIMEOUT_MS', DEFAULT_GIT_TIMEOUT_MS),
     })
   }
@@ -915,10 +1484,11 @@ export function clearJournal(
 async function validateRemoteTargets(
   repositories: PinnedRepository[],
   stateDir: string,
+  processGroupLease: ProcessGroupLeaseCoordinator,
   signal?: AbortSignal,
 ): Promise<void> {
   for (const repo of repositories) {
-    const parent = mkdtempSync(join(tmpdir(), 'zerokun-update-candidate-'))
+    const parent = createUpdaterTemporaryDirectory('zerokun-update-candidate-')
     const checkout = join(parent, 'checkout')
     const isolatedHome = join(parent, 'home')
     try {
@@ -929,15 +1499,17 @@ async function validateRemoteTargets(
         ['git', 'clone', '--quiet', '--no-local', '--no-checkout', remote, checkout],
         {
           signal,
+          processGroupLease,
           timeoutMs: timeoutFromEnvironment('ZEROKUN_UPDATE_GIT_TIMEOUT_MS', DEFAULT_GIT_TIMEOUT_MS),
         },
       )
       await requireCommandAsync(['git', 'checkout', '--quiet', '--detach', repo.targetHead], {
         cwd: checkout,
         signal,
+        processGroupLease,
         timeoutMs: timeoutFromEnvironment('ZEROKUN_UPDATE_GIT_TIMEOUT_MS', DEFAULT_GIT_TIMEOUT_MS),
       })
-      await validateZero(checkout, isolatedHome, repo.path, stateDir, signal)
+      await validateZero(checkout, isolatedHome, repo.path, stateDir, processGroupLease, signal)
     } finally {
       try { chmodSync(join(parent, 'trusted-bin'), 0o700) } catch {}
       let cleanupError: unknown
@@ -956,18 +1528,64 @@ async function validateRemoteTargets(
   }
 }
 
+async function requireEffectiveCodexPermissionPreflight(
+  codexBin: string,
+  cwd: string,
+  isolatedHome: string,
+  overrides: string[],
+  profile: string,
+  environment: Record<string, string>,
+  processGroupLease: ProcessGroupLeaseCoordinator,
+  signal?: AbortSignal,
+): Promise<void> {
+  const specPath = join(isolatedHome, 'zerokun-effective-config-preflight.json')
+  const trustedHelper = realpathSync(join(import.meta.dir, 'codex-executor.ts'))
+  atomicWritePrivateFile(specPath, JSON.stringify({
+    version: 1,
+    codexBin,
+    cwd,
+    overrides,
+    profile,
+  }) + '\n')
+  try {
+    await requireCommandAsync([
+      process.execPath,
+      '--config=/dev/null',
+      '--no-env-file',
+      trustedHelper,
+      'verify-effective-config',
+      specPath,
+    ], {
+      cwd,
+      inherit: true,
+      env: environment,
+      signal,
+      processGroupLease,
+      timeoutMs: timeoutFromEnvironment(
+        'ZEROKUN_UPDATE_VERIFY_TIMEOUT_MS',
+        DEFAULT_VERIFY_TIMEOUT_MS,
+      ),
+    })
+  } finally {
+    rmSync(specPath, { force: true })
+  }
+}
+
 async function validateZero(
   rootRepo: string,
   isolatedHome: string,
   liveRepo: string,
   stateDir: string,
+  processGroupLease: ProcessGroupLeaseCoordinator,
   signal?: AbortSignal,
 ): Promise<void> {
   const verifyScript = join(rootRepo, 'zerokun', 'verify.sh')
   if (!existsSync(verifyScript)) fail(`候補commitに公開検証scriptがありません: ${verifyScript}`)
   output('   validate: frozen install + tests + typecheck + build + shell syntax')
   const codexBin = resolveUpdaterCodexBinary()
-  const trustedToolDirectory = prepareCandidateToolDirectory(dirname(isolatedHome), codexBin)
+  const stagedCodex = stageVerifiedCandidateCodex(dirname(isolatedHome), codexBin)
+  const trustedToolDirectory = stagedCodex.directory
+  const stagedCodexBin = stagedCodex.executable
   const profile = `zerokun_update_${randomUUID().replaceAll('-', '')}`
   const filesystem = new Map<string, 'deny' | 'read' | 'write'>([
     [':minimal', 'read'],
@@ -1000,12 +1618,19 @@ async function validateZero(
     'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","*PROXY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
   ]
   if (!executionPolicy.skipCodexPermissionPreflight) {
-    await assertEffectiveCodexPermissionConfig(
-      codexBin, rootRepo, permissionOverrides, profile, candidateEnvironment,
+    await requireEffectiveCodexPermissionPreflight(
+      stagedCodexBin,
+      rootRepo,
+      isolatedHome,
+      permissionOverrides,
+      profile,
+      candidateEnvironment,
+      processGroupLease,
+      signal,
     )
   }
   await requireCommandAsync([
-    codexBin,
+    stagedCodexBin,
     '-a', 'never',
     'sandbox',
     '-C', rootRepo,
@@ -1019,6 +1644,7 @@ async function validateZero(
     cwd: rootRepo,
     inherit: true,
     signal,
+    processGroupLease,
     timeoutMs: timeoutFromEnvironment(
       'ZEROKUN_UPDATE_VERIFY_TIMEOUT_MS',
       DEFAULT_VERIFY_TIMEOUT_MS,
@@ -1057,16 +1683,16 @@ export async function stopLockedProcess(
     return
   }
   output(`   stop: ${label} PID ${pid}`)
-  if (!processLockOwnerMatches(lockFile, pid, commandPattern)) {
-    fail(`${label} PID ${pid} のidentityが停止直前に変化しました`)
-  }
-  process.kill(pid, 'SIGTERM')
-  const startedAt = Date.now()
-  while (pidIsAlive(pid)) {
-    if (signal?.aborted) fail('更新を中断しました')
-    if (Date.now() - startedAt >= timeoutMs) fail(`${label} PID ${pid} が正常終了しません`)
-    await Bun.sleep(200)
-  }
+  const result = await stopProcessLockOwner(
+    lockFile,
+    pid,
+    commandPattern,
+    { signal, timeoutMs },
+  )
+  if (result === 'stopped') return
+  if (result === 'aborted') fail('更新を中断しました')
+  if (result === 'timeout') fail(`${label} PID ${pid} が正常終了しません`)
+  fail(`${label} PID ${pid} のidentityをsignal直前に検証できません`)
 }
 
 function trackedProcessCommand(pid: number): string {
@@ -1303,11 +1929,12 @@ async function restartServices(
 async function rollbackUpdate(
   stateDir: string,
   journal: UpdateJournal,
-  options: { restart: boolean; testing: boolean },
+  options: { restart: boolean; testing: boolean; updateLock: UpdateLockCoordinator },
 ): Promise<void> {
   if (realpathSync(journal.repoPath) !== journal.repoPath) {
     fail(`rollback repository pathがcanonicalではありません: ${journal.repoPath}`)
   }
+  options.updateLock.assertExclusive()
   const assertRollbackState = () => {
     const currentBranch = requireCommand(['git', 'branch', '--show-current'], {
       cwd: journal.repoPath,
@@ -1340,7 +1967,7 @@ async function rollbackUpdate(
   assertRollbackState()
   requireCommand(['git', 'reset', '--hard', journal.originalHead], { cwd: journal.repoPath })
   restoreRollbackDatabase(journal)
-  await requireCommandAsync(['/bin/bash', journal.setupScript], {
+  await requireSetupCommandAsync(journal.setupScript, options.updateLock, {
     cwd: journal.repoPath,
     inherit: !options.testing,
     env: {
@@ -1348,16 +1975,75 @@ async function rollbackUpdate(
       ZEROKUN_STATE_DIR: stateDir,
       ZEROKUN_UPDATE_IN_PROGRESS: '1',
     },
-    timeoutMs: timeoutFromEnvironment(
-      'ZEROKUN_UPDATE_SETUP_TIMEOUT_MS',
-      DEFAULT_SETUP_TIMEOUT_MS,
-    ),
+    timeoutMs: resolveSetupTimeoutMs(process.env, options.testing),
   })
   if (options.restart) {
     await restartServices(journal.repoPath, stateDir, journal.projectDir)
   }
   clearJournal(stateDir, journal)
   output('✅ 旧Codex版へのロールバック完了')
+}
+
+async function superviseStandaloneSetup(testing = false): Promise<void> {
+  if (!['', '0'].includes(process.env.ZEROKUN_UPDATE_IN_PROGRESS ?? '')) {
+    fail('updater配下からstandalone setup supervisorは起動できません')
+  }
+  const rootRepo = resolveRootRepo()
+  // Direct setup must meet the same executable trust boundary as every later
+  // self-update. Reject Homebrew/npm wrappers before creating state or taking
+  // the update lock; the bootstrap installs the official standalone binary.
+  if (!testing) resolveUpdaterCodexBinary()
+  const stateDir = prepareManagedStateRoot(resolveZeroStateDir())
+  const setupScript = process.env.ZEROKUN_SETUP_SCRIPT ?? join(rootRepo, 'zerokun', 'setup.sh')
+  if (!existsSync(setupScript)) fail(`setup.shがありません: ${setupScript}`)
+  const updateLock = acquireUpdateLock(stateDir)
+  const controller = new AbortController()
+  const interrupt = () => controller.abort()
+  process.on('SIGINT', interrupt)
+  process.on('SIGTERM', interrupt)
+  try {
+    const pendingJournal = journalPath(stateDir)
+    try {
+      lstatSync(pendingJournal)
+      fail(
+        '未完了の更新transactionがあります。standalone setupを開始せず、'
+        + '先に zerokun-update --recover-only を実行してください',
+      )
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    output('▶ Codex版standalone setup')
+    const setupEnvironment = buildUpdaterEnvironment()
+    for (const key of [
+      'ZEROKUN_BOOTSTRAP',
+      'ZEROKUN_SETUP_DRAIN_SECONDS',
+      'ZEROKUN_SKIP_WATCHDOG_LAUNCHD',
+    ]) {
+      const value = process.env[key]
+      if (value !== undefined) setupEnvironment[key] = value
+    }
+    await requireSetupCommandAsync(setupScript, updateLock, {
+      cwd: rootRepo,
+      // The standalone coordinator is itself the user-facing command. Keep
+      // the delegated setup's stdout/stderr attached in tests as well so the
+      // harness verifies the same warnings and progress messages users see.
+      inherit: true,
+      env: {
+        ...setupEnvironment,
+        ZEROKUN_STATE_DIR: stateDir,
+        ZEROKUN_UPDATE_IN_PROGRESS: '1',
+      },
+      signal: controller.signal,
+      timeoutMs: resolveSetupTimeoutMs(process.env, testing),
+    })
+  } finally {
+    try {
+      updateLock.release()
+    } finally {
+      process.off('SIGINT', interrupt)
+      process.off('SIGTERM', interrupt)
+    }
+  }
 }
 
 async function main(testing = false, argv = process.argv.slice(2)): Promise<void> {
@@ -1406,6 +2092,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       await rollbackUpdate(stateDir, interrupted, {
         restart: !recoverOnly && !interrupted.noRestart,
         testing,
+        updateLock,
       })
       output('   未完了だった更新transactionを復旧しました')
       if (!recoverOnly) {
@@ -1428,11 +2115,20 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
     )
     throwIfInterrupted()
     output(`▶ Codex版リポを事前検査 (${branch})`)
-    const pinnedRepositories = await preflightRepositories(repositories, controller.signal)
+    const pinnedRepositories = await preflightRepositories(
+      repositories,
+      controller.signal,
+      updateLock,
+    )
     throwIfInterrupted()
     if (!skipTests) {
       output('▶ 候補commitを一時worktreeで検証')
-      await validateRemoteTargets(pinnedRepositories, stateDir, controller.signal)
+      await validateRemoteTargets(
+        pinnedRepositories,
+        stateDir,
+        updateLock,
+        controller.signal,
+      )
     }
     throwIfInterrupted()
     for (const repo of pinnedRepositories) assertPinnedRepositoryState(repo)
@@ -1476,7 +2172,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       writeJournal(stateDir, journal)
       throwIfInterrupted()
       output('▶ setupを反映')
-      await requireCommandAsync(['/bin/bash', setupScript], {
+      await requireSetupCommandAsync(setupScript, updateLock, {
         cwd: rootRepo,
         inherit: !testing,
         env: {
@@ -1485,10 +2181,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
           ZEROKUN_UPDATE_IN_PROGRESS: '1',
         },
         signal: controller.signal,
-        timeoutMs: timeoutFromEnvironment(
-          'ZEROKUN_UPDATE_SETUP_TIMEOUT_MS',
-          DEFAULT_SETUP_TIMEOUT_MS,
-        ),
+        timeoutMs: resolveSetupTimeoutMs(process.env, testing),
       })
       assertRepositoryClean(repositories[0]!)
       journal = { ...journal, phase: 'setup-applied' }
@@ -1505,7 +2198,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
     } catch (error) {
       const original = error instanceof Error ? error.message : String(error)
       try {
-        await rollbackUpdate(stateDir, journal, { restart: !noRestart, testing })
+        await rollbackUpdate(stateDir, journal, { restart: !noRestart, testing, updateLock })
       } catch (rollbackError) {
         const rollback = rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
         fail(`更新失敗: ${original}\nロールバックも失敗: ${rollback}`)
@@ -1523,8 +2216,18 @@ export async function runUpdateForTests(argv = process.argv.slice(1)): Promise<v
   await withUpdateTestPolicy(() => main(true, argv))
 }
 
+export async function runStandaloneSetupForTests(): Promise<void> {
+  await superviseStandaloneSetup(true)
+}
+
 if (import.meta.main) {
-  main(false).catch(error => {
+  const argv = process.argv.slice(2)
+  const action = argv[0] === '--setup-supervisor'
+    ? argv.length === 1
+      ? superviseStandaloneSetup(false)
+      : Promise.reject(new Error('--setup-supervisorに追加オプションは指定できません'))
+    : main(false, argv)
+  action.catch(error => {
     process.stderr.write(`❌ ${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
   })

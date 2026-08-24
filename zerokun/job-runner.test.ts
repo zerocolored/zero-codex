@@ -18,6 +18,8 @@ import { homedir, tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { slackReplyScanFailureDisposition } from '../gate.ts'
 import {
+  classifyExecutorCommandProbe,
+  classifyFallbackProcessState,
   JobStore,
   SERIAL_WORKER_COUNT,
   createSlackIdentityPauseGuard,
@@ -57,6 +59,11 @@ import { capRuntimeLogs, removeSettledJobState } from './state-maintenance.ts'
 import { tryAcquireProcessLock } from './process-lock.ts'
 import { slackTokenPairRuntimeIdentity } from './slack-app-identity.ts'
 import { readProcessIdentity } from './process-tree.ts'
+import {
+  observeProcessGeneration,
+  signalProcessGroupIfLeaderLive,
+  signalProcessIfLive,
+} from './process-generation.ts'
 
 const temporaryDirs: string[] = []
 
@@ -94,6 +101,14 @@ function git(args: string[], cwd?: string): string {
 }
 
 describe('Codex job store', () => {
+  test('executor command probe失敗や空出力をstaleではなくunknownにする', () => {
+    expect(classifyExecutorCommandProbe(1, '')).toEqual({ status: 'unknown' })
+    expect(classifyExecutorCommandProbe(0, '   ')).toEqual({ status: 'unknown' })
+    expect(classifyExecutorCommandProbe(0, 'codex-supervisor job-1\n')).toEqual({
+      status: 'known', command: 'codex-supervisor job-1',
+    })
+  })
+
   test('常駐runnerは選択stateのSlack App ID変更と不正設定を検出する', () => {
     const dir = fixtureDir()
     const envFile = join(dir, '.env')
@@ -666,6 +681,15 @@ describe('Codex job store', () => {
 })
 
 describe('single FIFO worker', () => {
+  test('legacy executorのps失敗や空出力を死亡扱いしない', () => {
+    expect(classifyFallbackProcessState('present', 1, '')).toBe('unknown')
+    expect(classifyFallbackProcessState('present', 0, '')).toBe('unknown')
+    expect(classifyFallbackProcessState('unknown', 0, 'S')).toBe('unknown')
+    expect(classifyFallbackProcessState('missing', 1, '')).toBe('dead')
+    expect(classifyFallbackProcessState('present', 0, 'Z+')).toBe('dead')
+    expect(classifyFallbackProcessState('present', 0, 'S+')).toBe('alive')
+  })
+
   test('ワーカー数は常に1', () => {
     expect(SERIAL_WORKER_COUNT).toBe(1)
   })
@@ -887,7 +911,11 @@ describe('single FIFO worker', () => {
     writeFileSync(registration, JSON.stringify({
       jobId: job.id,
       pid: unrelated.pid,
+      pgid: unrelated.pid,
       started: `${identity!.started} stale`,
+      bootSession: identity!.bootSession,
+      startSec: identity!.startSec,
+      startUsec: identity!.startUsec,
     }))
     store.saveExecutorPid(job.id, unrelated.pid)
     try {
@@ -902,6 +930,102 @@ describe('single FIFO worker', () => {
       store.close()
     }
   })
+
+  test('旧lstart registrationのlive supervisorをcommand照合後に停止する', async () => {
+    const dir = fixtureDir()
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    const job = store.enqueue(input()).job
+    store.claimNext('serial-worker')
+    const executable = join(dir, `codex-supervisor-${job.id}.sh`)
+    writeFileSync(executable, '#!/bin/bash\ntrap "" HUP\n/bin/sleep 30\n')
+    chmodSync(executable, 0o700)
+    const supervisor = Bun.spawn(['/bin/bash', executable, job.id], {
+      stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', detached: true,
+    })
+    const identity = readProcessIdentity(supervisor.pid)
+    expect(identity).toBeDefined()
+    const started = Bun.spawnSync(
+      ['/bin/ps', '-o', 'lstart=', '-p', String(supervisor.pid)],
+      {
+        env: { PATH: '/usr/bin:/bin', LC_ALL: 'C', LANG: 'C' },
+        stdout: 'pipe', stderr: 'pipe',
+      },
+    ).stdout.toString().trim()
+    const registration = join(dir, 'executors', `${job.id}.json`)
+    mkdirSync(dirname(registration), { recursive: true })
+    writeFileSync(registration, JSON.stringify({
+      jobId: job.id,
+      pid: supervisor.pid,
+      started,
+    }))
+    store.saveExecutorPid(job.id, supervisor.pid)
+    try {
+      await terminateTrackedExecutors(store, () => {}, 500, dir)
+      await supervisor.exited
+      expect(existsSync(registration)).toBe(false)
+      expect(store.get(job.id)?.executorPid).toBeNull()
+    } finally {
+      if (identity && !signalProcessGroupIfLeaderLive(identity, 'SIGKILL')) {
+        signalProcessIfLive(identity, 'SIGKILL')
+      }
+      await supervisor.exited
+      store.close()
+    }
+  })
+
+  test.skipIf(process.platform === 'win32')(
+    'supervisor leader死亡後も同PGID子が残ればregistrationを保持してfail-closedにする',
+    async () => {
+      const dir = fixtureDir()
+      const store = new JobStore(join(dir, 'jobs.sqlite3'))
+      const job = store.enqueue(input()).job
+      store.claimNext('serial-worker')
+      const childPidFile = join(dir, 'leaderless-child.pid')
+      const leaderScript = join(dir, `codex-supervisor-${job.id}.ts`)
+      writeFileSync(leaderScript, [
+        "import { writeFileSync } from 'fs'",
+        "const child = Bun.spawn(['/bin/sleep', '30'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })",
+        `writeFileSync(${JSON.stringify(childPidFile)}, String(child.pid))`,
+        'await Bun.sleep(30_000)',
+        '',
+      ].join('\n'))
+      const leader = Bun.spawn([
+        process.execPath, '--config=/dev/null', '--no-env-file', leaderScript, job.id,
+      ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', detached: true })
+      let deadline = Date.now() + 2_000
+      while (!existsSync(childPidFile) && Date.now() < deadline) await Bun.sleep(10)
+      expect(existsSync(childPidFile)).toBe(true)
+      const leaderIdentity = readProcessIdentity(leader.pid)
+      const childIdentity = readProcessIdentity(Number(readFileSync(childPidFile, 'utf8')))
+      expect(leaderIdentity?.pgid).toBe(leader.pid)
+      expect(childIdentity).toBeDefined()
+      const registration = join(dir, 'executors', `${job.id}.json`)
+      mkdirSync(dirname(registration), { recursive: true })
+      writeFileSync(registration, JSON.stringify({
+        version: 2,
+        cleanupPending: true,
+        jobId: job.id,
+        pid: leaderIdentity!.pid,
+        pgid: leaderIdentity!.pgid,
+        started: leaderIdentity!.started,
+        bootSession: leaderIdentity!.bootSession,
+        startSec: leaderIdentity!.startSec,
+        startUsec: leaderIdentity!.startUsec,
+      }))
+      store.saveExecutorPid(job.id, leader.pid)
+      signalProcessIfLive(leaderIdentity!, 'SIGKILL')
+      await leader.exited
+      try {
+        await expect(terminateTrackedExecutors(store, () => {}, 100, dir))
+          .rejects.toThrow('終了を確認できません')
+        expect(existsSync(registration)).toBe(true)
+        expect(store.get(job.id)?.executorPid).toBe(leader.pid)
+      } finally {
+        if (childIdentity) signalProcessIfLive(childIdentity, 'SIGKILL')
+        store.close()
+      }
+    },
+  )
 
   test('symlink名zerokun-updateで起動した本番updater lock中はclaimをpauseする', async () => {
     const dir = fixtureDir()
@@ -949,7 +1073,9 @@ describe('single FIFO worker', () => {
       const attempt = tryAcquireProcessLock(lockFile, unrelated.pid)
       expect(attempt.acquired).toBe(true)
       const identity = JSON.parse(readFileSync(`${lockFile}.identity`, 'utf8'))
-      identity.canonicalStarted = 'Thu Jan  1 00:00:00 1970'
+      identity.startUsec = identity.startUsec === 999_999
+        ? 999_998
+        : identity.startUsec + 1
       writeFileSync(`${lockFile}.identity`, `${JSON.stringify(identity)}\n`, { mode: 0o600 })
 
       expect(updateIsRunning(lockDir)).toBe(false)
@@ -1562,6 +1688,58 @@ process.exit(0)
       store.close()
     }
   })
+
+  test.skipIf(process.platform !== 'darwin')(
+    'job timeoutでも別PGIDへdetachしたTERM無視子をexact generationで回収する',
+    async () => {
+      const dir = fixtureDir()
+      const repo = join(dir, 'repo')
+      const fakeCodex = join(dir, 'fake-codex')
+      const childPidFile = join(dir, 'timeout-detached-child.pid')
+      mkdirSync(repo)
+      writeFileSync(fakeCodex, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+process.on('SIGTERM', () => {})
+const child = Bun.spawn([
+  process.execPath, '--no-env-file', '-e',
+  "process.on('SIGTERM', () => {}); await Bun.sleep(30_000)",
+], { detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+child.unref()
+writeFileSync(process.env.CHILD_PID_FILE!, String(child.pid))
+await Bun.sleep(30_000)
+`)
+      chmodSync(fakeCodex, 0o755)
+      const store = new JobStore(join(dir, 'jobs.sqlite3'))
+      store.enqueue(input({ repoPath: repo }))
+      const job = store.claimNext('serial-worker')!
+      let childIdentity: ReturnType<typeof readProcessIdentity>
+      try {
+        const running = executeCodexJob(job, {
+          codexBin: fakeCodex,
+          skipEffectiveConfigCheck: true,
+          stateDir: join(dir, 'state'),
+          logDir: join(dir, 'state/job-logs'),
+          extraEnvironment: { CHILD_PID_FILE: childPidFile },
+          timeoutMs: 300,
+          supervisorCleanupGraceMs: 500,
+        })
+        let deadline = Date.now() + 2_000
+        while (!existsSync(childPidFile) && Date.now() < deadline) await Bun.sleep(10)
+        expect(existsSync(childPidFile)).toBe(true)
+        childIdentity = readProcessIdentity(Number(readFileSync(childPidFile, 'utf8')))
+        expect(childIdentity).toBeDefined()
+        await expect(running).rejects.toThrow('Codex timed out')
+        expect(observeProcessGeneration(childIdentity!).status).toBe('dead')
+      } finally {
+        if (existsSync(childPidFile)) {
+          childIdentity = readProcessIdentity(Number(readFileSync(childPidFile, 'utf8')))
+          if (childIdentity) signalProcessIfLive(childIdentity, 'SIGKILL')
+        }
+        store.close()
+      }
+    },
+    10_000,
+  )
 
   test.skipIf(process.platform === 'win32')(
     'Codexが別process groupへ切り離した子processも正常完了時に回収する',

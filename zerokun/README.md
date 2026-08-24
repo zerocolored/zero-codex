@@ -26,10 +26,10 @@ bash "$bootstrap_path" --with-slack
 既に `zero-codex` をclone済みなら、その repository で`git switch main`を実行してから
 `bash zerokun/bootstrap-macos.sh --with-slack`を使います。
 
-既に clone と依存導入が済んでいる場合:
+既にclone済みの場合も、公式standalone Codexを同じ信頼条件で検証するbootstrapを使います:
 
 ```bash
-bash zerokun/setup.sh
+bash zerokun/bootstrap-macos.sh --with-slack
 codex login status
 zerokun
 ```
@@ -46,6 +46,7 @@ zerokun
 | `access.ts` | pairing、DM/channel、write 許可の端末 CLI |
 | `update.ts` | `origin/main` から安全に fast-forward 更新 |
 | `update-request.ts` | Slack 自己更新を FIFO 外の detached worker へ渡す |
+| `process-generation.ts` | macOS libprocによるmicrosecond process世代IDとsignal前再検証 |
 | `watchdog.sh` | gateway と runner の状態遷移を監視 |
 
 ## Durable FIFO
@@ -168,7 +169,7 @@ watchdog-state.json
 
 ```bash
 export ZEROKUN_STATE_DIR="$HOME/.codex/zerokun"
-bash zerokun/setup.sh
+bash zerokun/bootstrap-macos.sh --with-slack
 ```
 
 すべての launcher/CLI/launchd に同じ環境変数を渡してください。途中で state dir を分けると、
@@ -198,6 +199,15 @@ Slack eventのidempotency tombstoneは既定10年保持し、runtime logは20MB�
 即時maintenanceは`zerokun-jobs gc`で実行できます。
 
 watchdog は停止を2回連続検出した時だけ通知し、復旧も通知します。自動 restart はしません。
+
+安全なprocess-group委譲を持たない旧Codex版からの初回更新だけは、Slack経由や
+`zerokun-update`ではなく、冒頭の公開`bootstrap-macos.sh`を端末から実行し、旧checkoutとは別の
+空directory（例: `--repo-dir "$HOME/Desktop/Project/zero-codex-next"`）へ配置します。旧updater経由の
+setupはstate変更前に停止して旧版へrollbackし、新checkoutのsetupが同じstateをlockしてserviceを
+切り替えます。以後は`zerokun-update`を利用できます。
+自己更新用runtimeは全import companionをversioned bundleへpublishした後にentrypointをatomic切替します。
+process-levelのSIGKILLはfail-closedで復旧しますが、突然の電源断に対するfilesystem durabilityは
+保証対象外です。再起動後にjournalが残る場合はserviceを起動せずoffline bootstrapで復旧してください。
 
 ## 検証
 

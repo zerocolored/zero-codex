@@ -69,19 +69,28 @@ describe('Zero-kun Codex wiring', () => {
 
   test('setup requires Codex and installs every runtime companion', () => {
     const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
+    const runtime = readFileSync(join(import.meta.dir, 'update-runtime.ts'), 'utf8')
     for (const expected of [
       'zerokun_require_codex_version',
       'codex-version.sh',
       'job-runner.ts',
       'codex-executor.ts',
-      'state-dir.ts',
-      'slack-http.ts',
-      'slack-app-identity.ts',
+      'update-runtime.ts',
       'zerokun-access',
       'codex-channel',
       'zerokun-update',
       'watchdog.sh',
     ]) expect(setup).toContain(expected)
+    for (const companion of [
+      'update-request.ts',
+      'process-generation.ts',
+      'child-environment.ts',
+      'safe-file.ts',
+      'managed-path.ts',
+      'state-dir.ts',
+      'slack-http.ts',
+      'slack-app-identity.ts',
+    ]) expect(runtime).toContain(`'${companion}'`)
     expect(setup).not.toContain('command -v claude')
     expect(setup).not.toContain('claude-config')
     expect(setup).not.toContain('claude-skills')

@@ -1,41 +1,40 @@
-export interface ProcessIdentity {
-  pid: number
-  ppid: number
-  pgid: number
-  started: string
+import {
+  observeProcessGeneration,
+  parseProcessStartKey,
+  processIdentityIsLive,
+  readProcessIdentity,
+  readProcessTable,
+  signalProcessGroupIfLeaderLive,
+  signalProcessIfLive,
+  type ProcessIdentity,
+} from './process-generation.ts'
+
+export {
+  processIdentityIsLive,
+  readProcessIdentity,
+  readProcessTable,
+  type ProcessIdentity,
 }
 
-const decoder = new TextDecoder()
 const MAX_TRACKED_PROCESSES = 4_096
 
-export function readProcessTable(): ProcessIdentity[] {
-  if (process.platform === 'win32') return []
-  const result = Bun.spawnSync(
-    ['/bin/ps', '-ww', '-axo', 'pid=,ppid=,pgid=,lstart='],
-    { stdout: 'pipe', stderr: 'ignore' },
-  )
-  if (result.exitCode !== 0) throw new Error('process tableを取得できません')
-  const scannerPid = result.pid
-  return decoder.decode(result.stdout)
-    .split('\n')
-    .map(line => /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line))
-    .filter((match): match is RegExpExecArray => match !== null)
-    .map(match => ({
-      pid: Number(match[1]),
-      ppid: Number(match[2]),
-      pgid: Number(match[3]),
-      started: match[4]!,
-    }))
-    .filter(entry => entry.pid !== scannerPid)
-}
-
-export function readProcessIdentity(pid: number): ProcessIdentity | undefined {
-  return readProcessTable().find(entry => entry.pid === pid)
-}
-
-export function processIdentityIsLive(expected: ProcessIdentity): boolean {
-  const current = readProcessIdentity(expected.pid)
-  return current?.started === expected.started && current.pgid === expected.pgid
+/**
+ * Pin a freshly spawned PID to its exact Darwin generation before it can
+ * receive work. Callers use this as the root of every later table scan; an
+ * unreadable root is cleanup uncertainty, never an empty wildcard.
+ */
+export function seedTrackedProcess(
+  pid: number,
+  tracked: Map<number, string>,
+): ProcessIdentity {
+  const identity = readProcessIdentity(pid)
+  if (!identity) throw new Error(`spawned process ${pid}のgenerationを取得できません`)
+  const existing = tracked.get(pid)
+  if (existing !== undefined && existing !== identity.started) {
+    throw new Error(`spawned process ${pid}のgenerationが既存追跡情報と一致しません`)
+  }
+  tracked.set(pid, identity.started)
+  return identity
 }
 
 export function captureTrackedProcesses(
@@ -56,27 +55,53 @@ export function updateTrackedProcesses(
   tracked: Map<number, string>,
   excludePids: ReadonlySet<number> = new Set(),
 ): void {
-  const current = new Map(table.map(entry => [entry.pid, entry.started]))
+  const current = new Map(table.map(entry => [entry.pid, entry]))
   const requestedRoots = new Set(rootPids)
-  // Keep only live identities. Besides bounding the map by concurrent
-  // processes (rather than lifetime churn), this prevents a recycled PID from
-  // remaining a parent root. Requested roots retain their original identity
-  // even after exit so a recycled numeric PID can never be adopted later.
+  const observed = new Map<number, ProcessIdentity>()
+  // libproc may omit a live PID from one table scan. Absence is therefore not
+  // death: re-probe every pinned generation directly before forgetting it.
+  // Requested roots retain their original identity after exit so a recycled
+  // numeric PID can never become a root.
   for (const [pid, started] of tracked) {
-    if (current.get(pid) !== started && !requestedRoots.has(pid)) tracked.delete(pid)
+    const listed = current.get(pid)
+    if (listed?.started === started) {
+      observed.set(pid, listed)
+      continue
+    }
+    const expected = expectedIdentity(pid, started)
+    if (!expected) throw new Error(`process ${pid}のgenerationが不正です`)
+    const direct = observeProcessGeneration(expected)
+    if (direct.status === 'unknown') {
+      throw new Error(`process ${pid}のgenerationを確認できません`)
+    }
+    if (direct.status === 'alive') {
+      observed.set(pid, direct.identity)
+    } else if (!requestedRoots.has(pid)) {
+      tracked.delete(pid)
+    }
   }
   for (const rootPid of requestedRoots) {
-    if (!tracked.has(rootPid)) tracked.set(rootPid, current.get(rootPid) ?? '')
+    if (tracked.has(rootPid)) continue
+    const identity = current.get(rootPid) ?? readProcessIdentity(rootPid)
+    if (!identity) {
+      throw new Error(`追跡root process ${rootPid}のgenerationを取得できません`)
+    }
+    tracked.set(rootPid, identity.started)
+    observed.set(rootPid, identity)
   }
   const roots = new Set<number>()
-  for (const [pid, started] of tracked) {
-    if (started !== '' && current.get(pid) === started) roots.add(pid)
+  for (const [pid, identity] of observed) {
+    if (tracked.get(pid) === identity.started) roots.add(pid)
   }
   // A numeric PGID can be reused after its leader exits. Only use the group as
-  // a discovery root while the recorded leader identity is still alive.
+  // a discovery root while the exact recorded leader generation is live.
   const groupStarted = tracked.get(groupId)
-  const groupIsLive = (roots.has(groupId) && current.has(groupId))
-    || (groupStarted !== undefined && current.get(groupId) === groupStarted)
+  const listedGroupLeader = observed.get(groupId)
+  const groupLeader = listedGroupLeader?.pgid === groupId
+    && listedGroupLeader.started === groupStarted
+    ? listedGroupLeader
+    : undefined
+  const groupIsLive = groupLeader !== undefined
   let changed = true
   while (changed) {
     changed = false
@@ -94,24 +119,62 @@ export function updateTrackedProcesses(
   }
 }
 
-function liveTrackedPids(
+function expectedIdentity(pid: number, started: string): ProcessIdentity | undefined {
+  const generation = parseProcessStartKey(started)
+  if (!generation) return undefined
+  return {
+    pid,
+    ppid: 0,
+    pgid: 0,
+    status: 0,
+    ...generation,
+    started,
+  }
+}
+
+function liveTrackedIdentities(
   tracked: ReadonlyMap<number, string>,
   excludePids: ReadonlySet<number>,
-): number[] {
-  const current = new Map(readProcessTable().map(entry => [entry.pid, entry.started]))
-  return [...tracked]
-    .filter(([pid, started]) => !excludePids.has(pid) && current.get(pid) === started)
-    .map(([pid]) => pid)
+): ProcessIdentity[] {
+  const live: ProcessIdentity[] = []
+  for (const [pid, started] of tracked) {
+    if (excludePids.has(pid) || !started) continue
+    const expected = expectedIdentity(pid, started)
+    if (!expected) throw new Error(`process ${pid}のgenerationが不正です`)
+    const observation = observeProcessGeneration(expected)
+    if (observation.status === 'unknown') {
+      throw new Error(`process ${pid}のgenerationを確認できません`)
+    }
+    if (observation.status === 'alive') live.push(observation.identity)
+  }
+  return live
 }
 
-function signalProcessGroup(groupId: number, signal: NodeJS.Signals): void {
-  if (process.platform === 'win32') return
-  try { process.kill(-groupId, signal) } catch {}
+function signalGroupLeader(
+  expectedLeader: ProcessIdentity | undefined,
+  signal: NodeJS.Signals,
+): boolean {
+  if (!expectedLeader) return false
+  const observation = observeProcessGeneration(expectedLeader)
+  if (observation.status === 'unknown') {
+    throw new Error(`process group ${expectedLeader.pid}のgenerationを確認できません`)
+  }
+  if (observation.status === 'alive') {
+    return signalProcessGroupIfLeaderLive(expectedLeader, signal)
+  }
+  return false
 }
 
-function signalPids(pids: Iterable<number>, signal: NodeJS.Signals): void {
-  for (const pid of pids) {
-    try { process.kill(pid, signal) } catch {}
+function signalIdentities(
+  identities: Iterable<ProcessIdentity>,
+  signal: NodeJS.Signals,
+): void {
+  for (const identity of identities) {
+    if (signalProcessIfLive(identity, signal)) continue
+    const observation = observeProcessGeneration(identity)
+    if (observation.status === 'unknown') {
+      throw new Error(`process ${identity.pid}のgenerationを確認できません`)
+    }
   }
 }
 
@@ -129,30 +192,39 @@ export async function reapTrackedProcesses(options: {
     options.rootPids, options.groupId, options.tracked, exclude,
   )
   const groupStarted = options.tracked.get(options.groupId)
-  const maySignalGroup = options.signalGroup !== false
-    && groupStarted !== undefined
-    && initialTable.some(entry => entry.pid === options.groupId && entry.started === groupStarted)
-  if (maySignalGroup) signalProcessGroup(options.groupId, 'SIGTERM')
-  signalPids(liveTrackedPids(options.tracked, exclude), 'SIGTERM')
+  const groupLeader = groupStarted
+    ? initialTable.find(entry => entry.pid === options.groupId && entry.started === groupStarted)
+    : undefined
+  const termGroupSignaled = options.signalGroup !== false
+    && signalGroupLeader(groupLeader, 'SIGTERM')
+  signalIdentities(
+    liveTrackedIdentities(options.tracked, exclude)
+      .filter(identity => !termGroupSignaled || identity.pgid !== options.groupId),
+    'SIGTERM',
+  )
 
   const termDeadline = Date.now() + (options.termGraceMs ?? 1_000)
-  let live = liveTrackedPids(options.tracked, exclude)
+  let live = liveTrackedIdentities(options.tracked, exclude)
   while (live.length > 0 && Date.now() < termDeadline) {
     await Bun.sleep(25)
     captureTrackedProcesses(options.rootPids, options.groupId, options.tracked, exclude)
-    live = liveTrackedPids(options.tracked, exclude)
+    live = liveTrackedIdentities(options.tracked, exclude)
   }
   if (live.length === 0) return []
 
-  if (maySignalGroup && live.includes(options.groupId)) {
-    signalProcessGroup(options.groupId, 'SIGKILL')
-  }
-  signalPids(live, 'SIGKILL')
+  // TERM-time observations are never reused for delayed KILL. Both helpers
+  // perform a fresh microsecond-generation read immediately before signaling.
+  const killGroupSignaled = options.signalGroup !== false
+    && signalGroupLeader(groupLeader, 'SIGKILL')
+  signalIdentities(
+    live.filter(identity => !killGroupSignaled || identity.pgid !== options.groupId),
+    'SIGKILL',
+  )
   const killDeadline = Date.now() + (options.killWaitMs ?? 1_000)
   while (live.length > 0 && Date.now() < killDeadline) {
     await Bun.sleep(25)
     captureTrackedProcesses(options.rootPids, options.groupId, options.tracked, exclude)
-    live = liveTrackedPids(options.tracked, exclude)
+    live = liveTrackedIdentities(options.tracked, exclude)
   }
-  return live
+  return live.map(identity => identity.pid)
 }

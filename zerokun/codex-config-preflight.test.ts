@@ -1,8 +1,18 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { CodexInterruptedError, assertEffectiveCodexPermissionConfig } from './codex-executor.ts'
+import { captureTrackedProcesses } from './process-tree.ts'
+import { readProcessIdentity, signalProcessIfLive } from './process-generation.ts'
+import { runLeasedCommandForTests } from './update.ts'
 
 const temporaryRoots: string[] = []
 
@@ -153,6 +163,54 @@ await Bun.sleep(30_000)
     for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow()
   })
 
+  test('reaper失敗時もexact group SIGKILLでdirect childと子孫を止めてから失敗を返す', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerokun-config-reaper-failure-'))
+    temporaryRoots.push(root)
+    const repo = join(root, 'repo')
+    const executable = join(root, 'fake-codex')
+    const pidFile = join(root, 'pids')
+    mkdirSync(repo)
+    writeFileSync(executable, `#!/usr/bin/env bun
+import { writeFileSync } from 'fs'
+const child = Bun.spawn([process.execPath, '--no-env-file', '-e', "process.on('SIGTERM', () => {}); await Bun.sleep(30_000)"], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+writeFileSync(process.env.FAKE_PID_FILE!, process.pid + '\\n' + child.pid + '\\n')
+await Bun.sleep(30_000)
+`)
+    chmodSync(executable, 0o700)
+    await expect(assertEffectiveCodexPermissionConfig(
+      executable, repo, overrides, profile,
+      { PATH: process.env.PATH ?? '/usr/bin:/bin', FAKE_PID_FILE: pidFile },
+      {
+        // A full-suite run can spend more than 500ms starting a fresh Bun
+        // process under load. Leave enough startup time for the fixture to
+        // publish both PIDs before exercising the injected TERM/reaper race.
+        timeoutMs: 1_500,
+        shutdownGraceMs: 50,
+        reapProcessesForTesting: async options => {
+          captureTrackedProcesses(
+            options.rootPids,
+            options.groupId,
+            options.tracked,
+            options.excludePids,
+          )
+          const leaderPid = [...options.rootPids][0]!
+          const leader = readProcessIdentity(leaderPid)
+          if (leader) signalProcessIfLive(leader, 'SIGTERM')
+          await Bun.sleep(100)
+          throw new Error('injected reaper failure after TERM')
+        },
+      },
+    )).rejects.toThrow('injected reaper failure after TERM')
+    const pids = readFileSync(pidFile, 'utf8').trim().split('\n').map(Number)
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (pids.every(pid => {
+        try { process.kill(pid, 0); return false } catch { return true }
+      })) break
+      await Bun.sleep(20)
+    }
+    for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow()
+  })
+
   test('実効config preflightはrunner abortでhard deadlineを待たず中断する', async () => {
     const root = mkdtempSync(join(tmpdir(), 'zerokun-config-abort-test-'))
     temporaryRoots.push(root)
@@ -173,6 +231,80 @@ await Bun.sleep(30_000)
       { signal: controller.signal, timeoutMs: 5_000, shutdownGraceMs: 100 },
     )).rejects.toBeInstanceOf(CodexInterruptedError)
     expect(Date.now() - startedAt).toBeLessThan(1_500)
+  })
+
+  test('leased preflight helperのapp-serverは親process groupを継承する', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerokun-config-leased-test-'))
+    temporaryRoots.push(root)
+    const repo = join(root, 'repo')
+    const executable = join(root, 'fake-codex')
+    const groupFile = join(root, 'groups')
+    const spec = join(root, 'preflight.json')
+    const state = join(root, 'state')
+    mkdirSync(repo)
+    mkdirSync(state, { mode: 0o700 })
+    writeFileSync(executable, `#!/usr/bin/env bun
+import { appendFileSync } from 'fs'
+const group = Bun.spawnSync(['/bin/ps', '-o', 'pgid=', '-p', String(process.pid)], { stdout: 'pipe' }).stdout.toString().trim()
+appendFileSync(${JSON.stringify(groupFile)}, group + '\\n')
+const decoder = new TextDecoder()
+let pending = ''
+for await (const chunk of Bun.stdin.stream()) {
+  pending += decoder.decode(chunk, { stream: true })
+  const lines = pending.split('\\n')
+  pending = lines.pop() ?? ''
+  for (const line of lines) {
+    if (!line.trim()) continue
+    const request = JSON.parse(line)
+    if (request.id === 1) {
+      console.log(JSON.stringify({ id: 1, result: {} }))
+    } else if (request.id === 2 && request.method === 'configRequirements/read') {
+      console.log(JSON.stringify({ id: 2, result: { requirements: null } }))
+    } else if (request.id === 2) {
+      const config = {
+        default_permissions: ${JSON.stringify(profile)}, approval_policy: 'never', notify: [],
+        model_provider: 'openai', model_providers: {}, web_search: 'disabled',
+        permissions: { [${JSON.stringify(profile)}]: {
+          filesystem: { '/repo': 'read', '/outbox': 'write' }, network: { enabled: false },
+        } },
+      }
+      console.log(JSON.stringify({ id: 2, result: {
+        config: { loaded: true }, layers: [{ name: { type: 'sessionFlags' }, config }], origins: {},
+      } }))
+    }
+  }
+}
+`)
+    chmodSync(executable, 0o700)
+    writeFileSync(spec, JSON.stringify({
+      version: 1,
+      codexBin: executable,
+      cwd: repo,
+      overrides,
+      profile,
+    }) + '\n', { mode: 0o600 })
+    const leased = await runLeasedCommandForTests([
+      process.execPath,
+      '--config=/dev/null',
+      '--no-env-file',
+      join(import.meta.dir, 'codex-executor.ts'),
+      'verify-effective-config',
+      spec,
+    ], state, {
+      cwd: repo,
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root },
+      timeoutMs: 5_000,
+    })
+    const groups = readFileSync(groupFile, 'utf8').trim().split('\n').map(Number)
+    expect(groups).toHaveLength(2)
+    for (const group of groups) expect(group).toBe(leased.groupId)
+    expect(leased.groupId).not.toBe(process.pid)
+    const source = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+    const appServer = source.slice(
+      source.indexOf('async function readCodexAppServer('),
+      source.indexOf('function mergeConfigLayer('),
+    )
+    expect(appServer).not.toContain('process.kill(-proc.pid')
   })
 
   test('exec同様にuser configだけを除外する', async () => {

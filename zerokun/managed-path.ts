@@ -84,17 +84,30 @@ export function ensureManagedDirectory(root: string, candidate: string): string 
 
 if (import.meta.main) {
   const [command, root, ...candidates] = process.argv.slice(2)
-  if (!root || (command !== 'prepare-root' && command !== 'prepare-directories')) {
-    process.stderr.write('usage: managed-path.ts prepare-root <state-directory> | prepare-directories <state-directory> <directory>...\n')
+  const validCommand = command === 'require-root' || command === 'require-directories'
+    || command === 'prepare-root' || command === 'prepare-directories'
+  if (!root || !validCommand) {
+    process.stderr.write(
+      'usage: managed-path.ts require-root <state-directory>\n'
+      + '  | require-directories <state-directory> <directory>...\n'
+      + '  | prepare-root <state-directory>\n'
+      + '  | prepare-directories <state-directory> <directory>...\n',
+    )
     process.exit(2)
   }
   try {
-    if (command === 'prepare-root') {
-      process.stdout.write(`${prepareManagedStateRoot(root)}\n`)
+    if (command === 'prepare-root' || command === 'require-root') {
+      const path = command === 'prepare-root'
+        ? prepareManagedStateRoot(root)
+        : requireManagedStateRoot(root)
+      process.stdout.write(`${path}\n`)
     } else {
       requireManagedStateRoot(root)
       if (candidates.length === 0) throw new Error('at least one managed directory is required')
-      for (const candidate of candidates) ensureManagedDirectory(root, candidate)
+      for (const candidate of candidates) {
+        if (command === 'prepare-directories') ensureManagedDirectory(root, candidate)
+        else requireManagedDirectory(root, candidate)
+      }
     }
   } catch (error) {
     process.stderr.write(`unsafe state directory: ${error}\n`)

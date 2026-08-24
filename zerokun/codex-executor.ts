@@ -23,7 +23,21 @@ import {
   requireManagedDirectory,
   requireManagedStateRoot,
 } from './managed-path.ts'
-import { openSafeLog } from './safe-file.ts'
+import {
+  captureTrackedProcesses,
+  reapTrackedProcesses,
+  seedTrackedProcess,
+} from './process-tree.ts'
+import {
+  acquireProcessGroupLeaderIdentity,
+  observeProcessGeneration,
+  parseProcessStartKey,
+  readProcessIdentity,
+  signalProcessGroupIfLeaderLive,
+  signalProcessIfLive,
+  type ProcessIdentity,
+} from './process-generation.ts'
+import { openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
 
 const MAX_RESULT_CHARS = 12_000
 const MAX_FAILURE_CHARS = 600
@@ -103,11 +117,18 @@ async function readCodexAppServer(
   overrides: string[],
   method: 'config/read' | 'configRequirements/read',
   environment: Record<string, string>,
-  options: { signal?: AbortSignal; timeoutMs?: number; shutdownGraceMs?: number } = {},
+  options: {
+    signal?: AbortSignal
+    timeoutMs?: number
+    shutdownGraceMs?: number
+    inheritProcessGroup?: boolean
+    reapProcessesForTesting?: typeof reapTrackedProcesses
+  } = {},
 ): Promise<Record<string, unknown>> {
   if (options.signal?.aborted) throw new CodexInterruptedError(`Codex ${method} was interrupted`)
   const timeoutMs = positiveInteger(options.timeoutMs, 10_000)
   const shutdownGraceMs = positiveInteger(options.shutdownGraceMs, 500)
+  const reapProcesses = options.reapProcessesForTesting ?? reapTrackedProcesses
   const proc = Bun.spawn([
     codexBin,
     '-a', 'never',
@@ -118,8 +139,30 @@ async function readCodexAppServer(
     cwd,
     env: environment,
     stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
-    detached: process.platform !== 'win32',
+    detached: !options.inheritProcessGroup && process.platform !== 'win32',
   })
+  const tracked = new Map<number, string>()
+  let rootIdentity: ReturnType<typeof seedTrackedProcess>
+  try {
+    rootIdentity = seedTrackedProcess(proc.pid, tracked)
+    if (!options.inheritProcessGroup && process.platform !== 'win32'
+      && rootIdentity.pgid !== rootIdentity.pid) {
+      throw new Error(`Codex ${method} process groupを分離できません`)
+    }
+  } catch (error) {
+    try { proc.stdin.end() } catch {}
+    const exited = await Promise.race([
+      proc.exited.then(() => true, () => true),
+      Bun.sleep(500).then(() => false),
+    ])
+    if (!exited) {
+      throw new Error(
+        `Codex ${method}のgeneration取得に失敗し、安全に停止できないためprocessを残しました`,
+        { cause: error },
+      )
+    }
+    throw error
+  }
   proc.stdin.write(JSON.stringify({
     id: 1,
     method: 'initialize',
@@ -140,15 +183,79 @@ async function readCodexAppServer(
   const decoder = new TextDecoder()
   let buffer = ''
   let stderrTail = ''
-  const signalProcessGroup = (signal: NodeJS.Signals): void => {
-    if (process.platform !== 'win32') {
-      try {
-        process.kill(-proc.pid, signal)
-        return
-      } catch {}
-    }
-    try { proc.kill(signal) } catch {}
+  let tracking = true
+  let trackingError: unknown
+  let termination: Promise<number[]> | undefined
+  let terminationError: unknown
+  let remaining: number[] = []
+  let directTermination: Promise<void> | undefined
+  const terminateDirect = () => {
+    directTermination ??= (async () => {
+      // If the normal reaper fails after TERM made the group leader exit,
+      // negative-PGID signaling is no longer safe. Preserve the generations
+      // captured before TERM and KILL every still-live tracked identity.
+      if (!options.inheritProcessGroup) {
+        signalProcessGroupIfLeaderLive(rootIdentity, 'SIGKILL')
+      }
+      const exact: ProcessIdentity[] = []
+      for (const [pid, started] of tracked) {
+        const parsed = parseProcessStartKey(started)
+        if (!parsed) throw new Error(`Codex ${method} tracked an invalid generation for PID ${pid}`)
+        const observation = observeProcessGeneration({ pid, ...parsed })
+        if (observation.status === 'unknown') {
+          throw new Error(`Codex ${method} exact child ${pid} generation is unavailable`)
+        }
+        if (observation.status === 'alive') exact.push(observation.identity)
+      }
+      for (const identity of exact) {
+        if (signalProcessIfLive(identity, 'SIGKILL')) continue
+        if (observeProcessGeneration(identity).status !== 'dead') {
+          throw new Error(`Codex ${method} exact child ${identity.pid} could not be killed`)
+        }
+      }
+      const deadline = Date.now() + shutdownGraceMs
+      while (Date.now() < deadline) {
+        const live = exact.filter(identity => {
+          const observation = observeProcessGeneration(identity)
+          if (observation.status === 'unknown') {
+            throw new Error(`Codex ${method} exact child ${identity.pid} stop is unverifiable`)
+          }
+          return observation.status === 'alive'
+        })
+        if (live.length === 0) return
+        await Bun.sleep(25)
+      }
+      const live = exact.filter(identity => observeProcessGeneration(identity).status !== 'dead')
+      if (live.length > 0) {
+        throw new Error(`Codex ${method} exact children did not exit after SIGKILL: ${live.map(value => value.pid).join(', ')}`)
+      }
+    })()
   }
+  const terminate = () => {
+    termination ??= reapProcesses({
+      rootPids: [proc.pid],
+      groupId: proc.pid,
+      tracked,
+      signalGroup: !options.inheritProcessGroup,
+      termGraceMs: shutdownGraceMs,
+      killWaitMs: shutdownGraceMs,
+    }).catch(error => {
+      terminationError = error
+      terminateDirect()
+      return []
+    })
+  }
+  const tracker = (async () => {
+    try {
+      while (tracking) {
+        captureTrackedProcesses([proc.pid], proc.pid, tracked)
+        await Bun.sleep(50)
+      }
+    } catch (error) {
+      trackingError = error
+      terminate()
+    }
+  })()
   const responsePromise = (async (): Promise<Record<string, unknown> | undefined> => {
     while (true) {
       const chunk = await stdoutReader.read()
@@ -183,14 +290,14 @@ async function readCodexAppServer(
   let timeout: ReturnType<typeof setTimeout> | undefined
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeout = setTimeout(() => {
-      signalProcessGroup('SIGTERM')
+      terminate()
       reject(new Error(`Codex ${method} timed out after ${timeoutMs}ms`))
     }, timeoutMs)
   })
   let abortListener: (() => void) | undefined
   const abortPromise = new Promise<never>((_, reject) => {
     abortListener = () => {
-      signalProcessGroup('SIGTERM')
+      terminate()
       reject(new CodexInterruptedError(`Codex ${method} was interrupted`))
     }
     options.signal?.addEventListener('abort', abortListener, { once: true })
@@ -205,15 +312,19 @@ async function readCodexAppServer(
     if (timeout) clearTimeout(timeout)
     if (abortListener) options.signal?.removeEventListener('abort', abortListener)
     try { proc.stdin.end() } catch {}
-    // Always terminate the private group after the one-shot response. This
-    // also closes inherited stdout/stderr held by app-server descendants.
-    signalProcessGroup('SIGTERM')
-    await Promise.race([proc.exited, Bun.sleep(shutdownGraceMs)])
-    signalProcessGroup('SIGKILL')
-    await Promise.race([proc.exited, Bun.sleep(shutdownGraceMs)])
+    terminate()
+    if (termination) remaining = await termination
+    if (terminationError && directTermination) await directTermination
+    tracking = false
+    await tracker
     await Promise.allSettled([stdoutReader.cancel(), stderrReader.cancel()])
     await Promise.allSettled([responsePromise, stderrPromise])
   }
+  if (terminationError) throw terminationError
+  if (remaining.length > 0) {
+    throw new Error(`Codex ${method} left child processes running: ${remaining.join(', ')}`)
+  }
+  if (trackingError) throw trackingError
   if (failure) throw failure
   if (!response) throw new Error(`Codex ${method} returned no response: ${stderrTail}`)
   return response
@@ -342,7 +453,13 @@ export async function assertEffectiveCodexPermissionConfig(
   overrides: string[],
   profile: string,
   environment: Record<string, string> = buildCodexChildEnvironment(),
-  options: { signal?: AbortSignal; timeoutMs?: number; shutdownGraceMs?: number } = {},
+  options: {
+    signal?: AbortSignal
+    timeoutMs?: number
+    shutdownGraceMs?: number
+    inheritProcessGroup?: boolean
+    reapProcessesForTesting?: typeof reapTrackedProcesses
+  } = {},
 ): Promise<void> {
   const requirementsResponse = await readCodexAppServer(
     codexBin, cwd, overrides, 'configRequirements/read', environment, options,
@@ -908,6 +1025,7 @@ export class CodexRateLimitError extends Error {
 }
 
 export class CodexInterruptedError extends Error {}
+export class CodexCleanupPendingError extends Error {}
 
 export function codexAttemptDisposition(
   exitCode: number,
@@ -939,6 +1057,7 @@ export async function executeCodexJob(
     onSessionId?(sessionId: string): void
     onSessionReset?(): void
     onProcessExit?(exitCode: number): void
+    supervisorCleanupGraceMs?: number
   },
 ): Promise<JobExecutionResult> {
   assertCompatibleSystemCodexConfig()
@@ -1046,20 +1165,87 @@ export async function executeCodexJob(
       stderr: 'pipe',
       detached: process.platform !== 'win32',
     })
-    let timedOut = false
-    let forceKillTimer: ReturnType<typeof setTimeout> | undefined
-    const signalProcess = (signal: NodeJS.Signals): void => {
-      if (process.platform !== 'win32') {
-        try {
-          process.kill(-proc.pid, signal)
-          return
-        } catch {}
+    const supervisorIdentity = await acquireProcessGroupLeaderIdentity(proc.pid)
+    if (!supervisorIdentity) {
+      try { proc.stdin.end() } catch {}
+      let exited = await Promise.race([
+        proc.exited.then(() => true, () => true),
+        Bun.sleep(500).then(() => false),
+      ])
+      if (!exited) {
+        const current = readProcessIdentity(proc.pid)
+        if (current) signalProcessIfLive(current, 'SIGTERM')
+        exited = await Promise.race([
+          proc.exited.then(() => true, () => true),
+          Bun.sleep(500).then(() => false),
+        ])
       }
-      try { proc.kill(signal) } catch {}
+      if (!exited) {
+        const current = readProcessIdentity(proc.pid)
+        if (current) signalProcessIfLive(current, 'SIGKILL')
+        exited = await Promise.race([
+          proc.exited.then(() => true, () => true),
+          Bun.sleep(1_000).then(() => false),
+        ])
+      }
+      if (!exited) {
+        throw new Error('Codex supervisorのgenerationを取得できず、安全に停止できません')
+      }
+      throw new Error('Codex supervisorのgenerationを取得できません')
+    }
+    const tracked = new Map<number, string>([[proc.pid, supervisorIdentity.started]])
+    let tracking = true
+    let trackingError: unknown
+    const tracker = (async () => {
+      try {
+        while (tracking) {
+          captureTrackedProcesses([proc.pid], proc.pid, tracked)
+          await Bun.sleep(50)
+        }
+      } catch (error) {
+        trackingError = error
+      }
+    })()
+    const reapTrackedSupervisor = async (): Promise<void> => {
+      if (trackingError) {
+        throw new CodexCleanupPendingError(
+          `Codex supervisorの子process追跡が不確実です: ${trackingError}`,
+        )
+      }
+      let remaining: number[]
+      try {
+        remaining = await reapTrackedProcesses({
+          rootPids: [proc.pid],
+          groupId: proc.pid,
+          tracked,
+        })
+      } catch (error) {
+        throw new CodexCleanupPendingError(
+          `Codex supervisorの子process回収を確認できません: ${error}`,
+        )
+      }
+      if (remaining.length > 0) {
+        throw new CodexCleanupPendingError(
+          `Codex supervisorの子processが残っています: ${remaining.join(', ')}`,
+        )
+      }
+    }
+    let timedOut = false
+    let cleanupTimer: ReturnType<typeof setTimeout> | undefined
+    let requestForcedCleanup: (() => void) | undefined
+    const forcedCleanup = new Promise<'cleanup'>(resolve => {
+      requestForcedCleanup = () => resolve('cleanup')
+    })
+    const signalProcess = (signal: NodeJS.Signals): void => {
+      if (signalProcessGroupIfLeaderLive(supervisorIdentity, signal)) return
+      signalProcessIfLive(supervisorIdentity, signal)
     }
     const terminate = (): void => {
       signalProcess('SIGTERM')
-      forceKillTimer ??= setTimeout(() => signalProcess('SIGKILL'), 5_000)
+      cleanupTimer ??= setTimeout(
+        () => requestForcedCleanup?.(),
+        positiveInteger(options.supervisorCleanupGraceMs, 10_000),
+      )
     }
     let processPersistenceError: unknown
     try {
@@ -1097,13 +1283,31 @@ export async function executeCodexJob(
     // Close the narrow race where abort happened after the pre-spawn check but
     // before the listener was attached.
     if (options.signal?.aborted) abort()
-    const exitCode = await proc.exited
+    const processOutcome = await Promise.race([
+      proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
+      forcedCleanup,
+    ])
+    let exitCode: number
+    if (processOutcome === 'cleanup') {
+      tracking = false
+      await tracker
+      await reapTrackedSupervisor()
+      exitCode = await proc.exited
+    } else {
+      exitCode = processOutcome.exitCode
+      tracking = false
+      await tracker
+      // A clean supervisor removes its registration only after every tracked
+      // descendant is gone. If it crashed or was SIGKILLed, the parent-side
+      // exact-generation tracker is the last safe cleanup authority.
+      if (existsSync(registrationPath)) await reapTrackedSupervisor()
+    }
     // Freeze the lifecycle fact before collecting streams/final output. A
     // later runner shutdown must not rewrite a process success; an abort that
     // caused this exit must remain interrupted even if a shim exits with 0.
     const interruptedAtExit = abortedBeforeProcessExit
     clearTimeout(timer)
-    if (forceKillTimer) clearTimeout(forceKillTimer)
+    if (cleanupTimer) clearTimeout(cleanupTimer)
     options.signal?.removeEventListener('abort', abort)
     options.onProcessExit?.(exitCode)
     const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
@@ -1170,7 +1374,56 @@ export async function executeCodexJob(
   throw new Error(`job ${job.id} exhausted resume fallback`)
 }
 
-async function verifySystemCodexConfig(): Promise<void> {
+interface EffectiveConfigPreflightSpec {
+  version: 1
+  codexBin: string
+  cwd: string
+  overrides: string[]
+  profile: string
+}
+
+function readEffectiveConfigPreflightSpec(path: string): EffectiveConfigPreflightSpec {
+  if (!isAbsolute(path)) throw new Error('Codex preflight spec path must be absolute')
+  const home = process.env.HOME
+  if (!home) throw new Error('Codex preflight requires HOME')
+  const physicalHome = realpathSync(home)
+  const physicalPath = realpathSync(path)
+  if (!pathContains(physicalHome, physicalPath)) {
+    throw new Error('Codex preflight spec must be inside HOME')
+  }
+  const content = readOptionalPrivateFile(physicalPath)
+  if (content === null) throw new Error(`Codex preflight spec is missing: ${physicalPath}`)
+  const value = JSON.parse(content) as Partial<EffectiveConfigPreflightSpec>
+  const physicalCwd = typeof value.cwd === 'string' && isAbsolute(value.cwd)
+    ? realpathSync(value.cwd)
+    : ''
+  if (value.version !== 1 || typeof value.codexBin !== 'string'
+    || !isAbsolute(value.codexBin) || typeof value.cwd !== 'string'
+    || physicalCwd.length === 0
+    || !Array.isArray(value.overrides) || value.overrides.length === 0
+    || value.overrides.length > 128
+    || value.overrides.some(item => typeof item !== 'string'
+      || item.length === 0 || item.length > 65_536 || item.includes('\0'))
+    || typeof value.profile !== 'string'
+    || !/^[A-Za-z0-9_-]{1,128}$/.test(value.profile)) {
+    throw new Error('Codex preflight spec is invalid')
+  }
+  return { ...value, cwd: physicalCwd } as EffectiveConfigPreflightSpec
+}
+
+async function verifyEffectiveCodexConfigSpec(path: string): Promise<void> {
+  const spec = readEffectiveConfigPreflightSpec(path)
+  await assertEffectiveCodexPermissionConfig(
+    spec.codexBin,
+    spec.cwd,
+    spec.overrides,
+    spec.profile,
+    buildCodexChildEnvironment(),
+    { inheritProcessGroup: true },
+  )
+}
+
+async function verifySystemCodexConfig(inheritProcessGroup = false): Promise<void> {
   assertCompatibleSystemCodexConfig()
   const repo = mkdtempSync(join(homedir(), '.zerokun-config-probe-repo-'))
   const stateDir = mkdtempSync(join(tmpdir(), 'zerokun-config-probe-state-'))
@@ -1195,6 +1448,8 @@ async function verifySystemCodexConfig(): Promise<void> {
       })
       await assertEffectiveCodexPermissionConfig(
         process.env.ZEROKUN_CODEX_BIN ?? 'codex', repo, overrides, profile,
+        buildCodexChildEnvironment(),
+        { inheritProcessGroup },
       )
     }
   } finally {
@@ -1204,16 +1459,26 @@ async function verifySystemCodexConfig(): Promise<void> {
 }
 
 if (import.meta.main) {
-  if (process.argv[2] !== 'verify-system-config') {
-    process.stderr.write('usage: codex-executor.ts verify-system-config\n')
+  const [command, ...args] = process.argv.slice(2)
+  const systemConfigMode = command === 'verify-system-config'
+    && (args.length === 0 || (args.length === 1 && args[0] === '--inherit-process-group'))
+  const effectiveConfigMode = command === 'verify-effective-config' && args.length === 1
+  if (!systemConfigMode && !effectiveConfigMode) {
+    process.stderr.write(
+      'usage: codex-executor.ts verify-system-config [--inherit-process-group] '
+      + '| verify-effective-config <absolute-spec-path>\n',
+    )
     process.exitCode = 2
-  } else {
-    try {
-      await verifySystemCodexConfig()
+  } else try {
+    if (systemConfigMode) {
+      await verifySystemCodexConfig(args[0] === '--inherit-process-group')
       process.stdout.write('system and managed Codex config enforce Zero-kun read/write permissions\n')
-    } catch (error) {
-      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
-      process.exitCode = 1
+    } else {
+      await verifyEffectiveCodexConfigSpec(args[0]!)
+      process.stdout.write('effective Codex config enforces the requested Zero-kun permissions\n')
     }
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = 1
   }
 }

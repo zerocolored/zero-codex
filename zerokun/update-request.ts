@@ -12,11 +12,23 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { dirname, join } from 'path'
+import { fileURLToPath } from 'url'
 import { buildUpdaterEnvironment, parseStateSlackTokens } from './child-environment.ts'
 import { atomicWritePrivateFile, openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
 import { requireManagedStateRoot } from './managed-path.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
 import { verifySlackAppTokenPair } from './slack-app-identity.ts'
+import { inspectProcessLock } from './process-lock.ts'
+import {
+  acquireProcessGroupLeaderIdentity,
+  observeProcessGeneration,
+  processStartKey,
+  readProcessIdentity,
+  sameProcessGeneration,
+  signalProcessGroupIfLeaderLive,
+  signalProcessIfLive,
+  type ProcessIdentity,
+} from './process-generation.ts'
 
 const REQUEST_FILE = 'update-request.json'
 const WORKER_SESSION = 'zerokun-update-worker'
@@ -26,6 +38,10 @@ const DEFAULT_SLACK_HTTP_TIMEOUT_MS = 120_000
 const DEFAULT_UPDATE_NOTIFY_ATTEMPTS = 3
 const DEFAULT_UPDATE_WORKER_TIMEOUT_MS = 8 * 60 * 60 * 1000
 const DEFAULT_UPDATE_WORKER_TERM_GRACE_MS = 30 * 60_000
+const DEFAULT_UPDATE_GATE_HANDSHAKE_TIMEOUT_MS = 5_000
+const DEFAULT_UPDATE_GATE_KILL_WAIT_MS = 5_000
+const UPDATE_GATE_PROTOCOL = 1
+const UPDATE_GATE_START = 'START'
 const NOTIFICATION_NETWORK_OVERRIDE_KEYS = [
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
@@ -54,6 +70,7 @@ export interface UpdateRequestInput {
 export interface UpdateRequest extends UpdateRequestInput {
   id: string
   requestedAt: number
+  gate?: ProcessIdentity
   outcome?: {
     success: boolean
     exitCode: number
@@ -87,6 +104,7 @@ interface RequestOptions {
   now?: () => number
   idFactory?: () => string
   isWorkerRunning?: () => boolean
+  isUpdateRunning?: () => boolean
   launchWorker?: (request: UpdateRequest) => void
   onAccepted?: (request: UpdateRequest) => Promise<void>
   onDuplicate?: (request: UpdateRequest) => Promise<void>
@@ -103,6 +121,26 @@ interface WorkerOptions {
   updaterTermGraceMs?: number
   legacyCutover?: boolean
   projectDir?: string
+}
+
+interface ExecuteUpdaterOptions {
+  gateScriptPath?: string
+  gateHandshakeTimeoutMs?: number
+  gateKillWaitMs?: number
+  onGateIdentity?: (identity: ProcessIdentity) => void
+  onGateExit?: (identity: ProcessIdentity) => void
+}
+
+interface UpdaterGateOptions {
+  identityReader?: (pid: number) => ProcessIdentity | undefined
+  identityAttempts?: number
+  identityRetryMs?: number
+  ackTimeoutMs?: number
+}
+
+interface UpdateGateHandshake {
+  version: typeof UPDATE_GATE_PROTOCOL
+  identity: ProcessIdentity
 }
 
 export interface UpdateWorkerResult {
@@ -143,6 +181,25 @@ function readRequest(dir: string): UpdateRequest | undefined {
     const parsed = JSON.parse(content) as UpdateRequest
     const requestedAt = Number(parsed.requestedAt)
     if (!Number.isFinite(requestedAt)) throw new Error('requestedAt is invalid')
+    const gate = parsed.gate && typeof parsed.gate === 'object'
+      ? parsed.gate as Partial<ProcessIdentity>
+      : undefined
+    const validGate = gate
+      && Number.isSafeInteger(gate.pid) && Number(gate.pid) > 1
+      && Number.isSafeInteger(gate.ppid) && Number(gate.ppid) >= 0
+      && gate.pgid === gate.pid
+      && Number.isSafeInteger(gate.status)
+      && typeof gate.bootSession === 'string'
+      && Number.isSafeInteger(gate.startSec) && Number(gate.startSec) > 0
+      && Number.isSafeInteger(gate.startUsec) && Number(gate.startUsec) >= 0
+      && Number(gate.startUsec) <= 999_999
+      && typeof gate.started === 'string'
+      && processStartKey({
+        bootSession: gate.bootSession,
+        startSec: Number(gate.startSec),
+        startUsec: Number(gate.startUsec),
+      }) === gate.started
+    if (gate && !validGate) throw new Error('gate identity is invalid')
     return {
       id: requireText(parsed.id, 'id'),
       chatId: requireText(parsed.chatId, 'chatId'),
@@ -150,6 +207,7 @@ function readRequest(dir: string): UpdateRequest | undefined {
       messageId: requireText(parsed.messageId, 'messageId'),
       userId: requireText(parsed.userId, 'userId'),
       requestedAt,
+      ...(validGate ? { gate: gate as ProcessIdentity } : {}),
       ...(parsed.outcome && typeof parsed.outcome.text === 'string'
         ? {
           outcome: {
@@ -232,6 +290,14 @@ function tmuxSessionExists(tmux: string, session: string): boolean {
   return command([tmux, 'has-session', '-t', session]).exitCode === 0
 }
 
+function updateMutationIsRunning(dir: string): boolean {
+  const inspection = inspectProcessLock(
+    join(dir, 'update.lock', 'pid'),
+    /(?:update\.ts|zerokun-update|setup\.sh)(?:\s|$)/,
+  )
+  return inspection.status !== 'missing' && inspection.status !== 'stale'
+}
+
 export function launchDetachedUpdateWorker(
   request: UpdateRequest,
   options: {
@@ -305,6 +371,7 @@ export async function requestUpdate(
   const session = options.tmuxSession ?? WORKER_SESSION
   const isWorkerRunning = options.isWorkerRunning
     ?? (() => tmuxSessionExists(resolveTmuxPath(options.tmuxPath), session))
+  const isUpdateRunning = options.isUpdateRunning ?? (() => updateMutationIsRunning(dir))
   const launch = options.launchWorker ?? ((value: UpdateRequest) => {
     launchDetachedUpdateWorker(value, {
       stateDir: dir,
@@ -342,7 +409,18 @@ export async function requestUpdate(
   }
   if (existing) {
     const age = now() - existing.requestedAt
-    const running = isWorkerRunning()
+    let running = isWorkerRunning()
+    if (!running && existing.gate) {
+      const gate = observeProcessGeneration(existing.gate)
+      if (gate.status === 'dead') {
+        const { gate: _finishedGate, ...withoutGate } = existing
+        persistRequest(dir, withoutGate)
+        existing = withoutGate
+      } else {
+        running = true
+      }
+    }
+    running ||= isUpdateRunning()
     if (age <= (options.staleAfterMs ?? DEFAULT_STALE_MS) || running || existing.outcome) {
       if (!running) launch(existing)
       await options.onDuplicate?.(existing)
@@ -371,7 +449,7 @@ export async function requestUpdate(
 
   try {
     await options.onAccepted?.(request)
-    launch(request)
+    if (!isUpdateRunning()) launch(request)
     return { accepted: true, duplicate: false, request }
   } catch (error) {
     clearRequest(dir, request.id)
@@ -388,6 +466,16 @@ export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean
     ? options.isWorkerRunning()
     : tmuxSessionExists(resolveTmuxPath(options.tmuxPath), session)
   if (running) return false
+  if (request.gate) {
+    const gate = observeProcessGeneration(request.gate)
+    if (gate.status !== 'dead') return false
+    const current = readRequest(dir)
+    if (!current || current.id !== request.id || current.outcome) return false
+    const { gate: _finishedGate, ...withoutGate } = current
+    persistRequest(dir, withoutGate)
+  }
+  const isUpdateRunning = options.isUpdateRunning ?? (() => updateMutationIsRunning(dir))
+  if (isUpdateRunning()) return false
   const launch = options.launchWorker ?? ((value: UpdateRequest) => {
     launchDetachedUpdateWorker(value, {
       stateDir: dir,
@@ -523,33 +611,113 @@ function updateNotificationClientId(requestId: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
 }
 
-function signalProcessGroup(proc: Bun.Subprocess, signal: NodeJS.Signals): void {
-  if (process.platform !== 'win32') {
-    try {
-      process.kill(-proc.pid, signal)
-      return
-    } catch {}
-  }
-  try { proc.kill(signal) } catch {}
+function signalProcessGroup(
+  identity: ProcessIdentity,
+  signal: NodeJS.Signals,
+): boolean {
+  if (signalProcessGroupIfLeaderLive(identity, signal)) return true
+  return signalProcessIfLive(identity, signal)
 }
 
-export async function executeUpdater(
+function parseUpdateGateHandshake(value: string): UpdateGateHandshake | undefined {
+  try {
+    const parsed = JSON.parse(value) as { version?: unknown; identity?: Partial<ProcessIdentity> }
+    const identity = parsed.identity
+    if (parsed.version !== UPDATE_GATE_PROTOCOL || !identity
+      || !Number.isSafeInteger(identity.pid) || Number(identity.pid) <= 1
+      || !Number.isSafeInteger(identity.ppid) || Number(identity.ppid) < 0
+      || !Number.isSafeInteger(identity.pgid) || Number(identity.pgid) <= 1
+      || !Number.isSafeInteger(identity.status) || Number(identity.status) < 0
+      || typeof identity.bootSession !== 'string'
+      || !Number.isSafeInteger(identity.startSec) || Number(identity.startSec) <= 0
+      || !Number.isSafeInteger(identity.startUsec) || Number(identity.startUsec) < 0
+      || Number(identity.startUsec) > 999_999
+      || typeof identity.started !== 'string') return undefined
+    const complete = identity as ProcessIdentity
+    if (complete.started !== processStartKey(complete)) return undefined
+    return { version: UPDATE_GATE_PROTOCOL, identity: complete }
+  } catch {
+    return undefined
+  }
+}
+
+async function readControlLine(
+  stream: ReadableStream<Uint8Array>,
+  timeoutMs: number,
+  maxBytes = 4_096,
+): Promise<string> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('control timeoutが不正です')
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      void reader.cancel()
+      reject(new Error('update gate handshakeがtimeoutしました'))
+    }, timeoutMs)
+  })
+  try {
+    while (true) {
+      const item = await Promise.race([reader.read(), timeout])
+      if (item.done) throw new Error('update gate handshakeが完了前に閉じました')
+      total += item.value.byteLength
+      if (total > maxBytes) throw new Error('update gate handshakeが上限を超えました')
+      chunks.push(item.value)
+      const combined = Buffer.concat(chunks.map(chunk => Buffer.from(chunk)))
+      const newline = combined.indexOf(0x0a)
+      if (newline >= 0) return combined.subarray(0, newline).toString('utf8')
+    }
+  } finally {
+    if (timer) clearTimeout(timer)
+    try { reader.releaseLock() } catch {}
+  }
+}
+
+async function writeControlLine(value: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    process.stdout.write(`${value}\n`, error => error ? reject(error) : resolve())
+  })
+}
+
+export async function acquireDetachedLeaderIdentity(
+  pid: number,
+  identityReader: (pid: number) => ProcessIdentity | undefined = readProcessIdentity,
+  attempts = 100,
+  retryMs = 10,
+): Promise<ProcessIdentity | undefined> {
+  return acquireProcessGroupLeaderIdentity(pid, identityReader, attempts, retryMs)
+}
+
+export async function runUpdaterGate(
   updaterPath: string,
   logPath: string,
-  timeoutMs = Number(process.env.ZEROKUN_UPDATE_WORKER_TIMEOUT_MS)
-    || DEFAULT_UPDATE_WORKER_TIMEOUT_MS,
-  termGraceMs = DEFAULT_UPDATE_WORKER_TERM_GRACE_MS,
   environment: Record<string, string | undefined> = process.env,
+  options: UpdaterGateOptions = {},
 ): Promise<number> {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    throw new Error('updater worker timeoutが不正です')
-  }
+  const identity = await acquireDetachedLeaderIdentity(
+    process.pid,
+    options.identityReader,
+    options.identityAttempts,
+    options.identityRetryMs,
+  )
+  if (!identity) throw new Error('update gateのexact process identityを取得できません')
+  await writeControlLine(JSON.stringify({ version: UPDATE_GATE_PROTOCOL, identity }))
+  const ack = await readControlLine(
+    Bun.stdin.stream(),
+    options.ackTimeoutMs ?? DEFAULT_UPDATE_GATE_HANDSHAKE_TIMEOUT_MS,
+    64,
+  )
+  if (ack !== UPDATE_GATE_START) throw new Error('update gate start確認が不正です')
+
   const logFd = openSafeLog(logPath, 'append')
+  const retainLeader = () => {}
+  process.on('SIGINT', retainLeader)
+  process.on('SIGTERM', retainLeader)
   try {
-    writeFileSync(logFd, `\n${new Date().toISOString()} update request started\n`)
-    const childEnvironment = buildUpdaterEnvironment(environment)
+    const updaterEnvironment = buildUpdaterEnvironment(environment)
     if (environment.ZEROKUN_STATE_DIR) {
-      childEnvironment.ZEROKUN_JOB_DB = resolveZeroJobDatabasePath(
+      updaterEnvironment.ZEROKUN_JOB_DB = resolveZeroJobDatabasePath(
         environment.ZEROKUN_STATE_DIR,
         environment,
       )
@@ -561,9 +729,111 @@ export async function executeUpdater(
       stdin: 'ignore',
       stdout: logFd,
       stderr: logFd,
+      env: updaterEnvironment,
+    })
+    return await proc.exited
+  } finally {
+    process.off('SIGINT', retainLeader)
+    process.off('SIGTERM', retainLeader)
+    closeSync(logFd)
+  }
+}
+
+type TrackedExitState = 'stopped' | 'alive' | 'unknown'
+
+async function waitForTrackedExit(
+  exited: Promise<number>,
+  identity: ProcessIdentity,
+  timeoutMs: number,
+): Promise<TrackedExitState> {
+  let processExited = false
+  void exited.then(
+    () => { processExited = true },
+    () => { processExited = true },
+  )
+  const deadline = Date.now() + Math.max(1, timeoutMs)
+  let last: TrackedExitState = 'alive'
+  while (!processExited && Date.now() < deadline) {
+    const observation = observeProcessGeneration(identity)
+    if (observation.status === 'dead') return 'stopped'
+    last = observation.status === 'unknown' ? 'unknown' : 'alive'
+    await Bun.sleep(Math.min(50, Math.max(1, deadline - Date.now())))
+  }
+  if (processExited) return 'stopped'
+  const finalObservation = observeProcessGeneration(identity)
+  if (finalObservation.status === 'dead') return 'stopped'
+  return finalObservation.status === 'unknown' ? 'unknown' : last
+}
+
+export async function executeUpdater(
+  updaterPath: string,
+  logPath: string,
+  timeoutMs = Number(process.env.ZEROKUN_UPDATE_WORKER_TIMEOUT_MS)
+    || DEFAULT_UPDATE_WORKER_TIMEOUT_MS,
+  termGraceMs = DEFAULT_UPDATE_WORKER_TERM_GRACE_MS,
+  environment: Record<string, string | undefined> = process.env,
+  options: ExecuteUpdaterOptions = {},
+): Promise<number> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('updater worker timeoutが不正です')
+  }
+  if (!Number.isFinite(termGraceMs) || termGraceMs <= 0) {
+    throw new Error('updater worker TERM graceが不正です')
+  }
+  const logFd = openSafeLog(logPath, 'append')
+  let registeredGate: ProcessIdentity | undefined
+  let gateExitConfirmed = false
+  try {
+    writeFileSync(logFd, `\n${new Date().toISOString()} update request started\n`)
+    const childEnvironment = buildUpdaterEnvironment(environment)
+    if (environment.ZEROKUN_STATE_DIR) {
+      childEnvironment.ZEROKUN_JOB_DB = resolveZeroJobDatabasePath(
+        environment.ZEROKUN_STATE_DIR,
+        environment,
+      )
+    }
+    const gateScriptPath = options.gateScriptPath ?? fileURLToPath(import.meta.url)
+    const proc = Bun.spawn([
+      process.execPath, '--config=/dev/null', '--no-env-file', gateScriptPath,
+      'updater-gate', updaterPath, '--log', logPath,
+    ], {
+      cwd: environment.ZEROKUN_STATE_DIR ?? dirname(updaterPath),
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: logFd,
       env: childEnvironment,
       detached: process.platform !== 'win32',
     })
+    if (!proc.stdout || !proc.stdin || typeof proc.stdin === 'number') {
+      throw new Error('update gate control pipeを作成できません')
+    }
+    let updaterIdentity: ProcessIdentity
+    try {
+      const line = await readControlLine(
+        proc.stdout,
+        options.gateHandshakeTimeoutMs ?? DEFAULT_UPDATE_GATE_HANDSHAKE_TIMEOUT_MS,
+      )
+      const handshake = parseUpdateGateHandshake(line)
+      const current = handshake ? readProcessIdentity(proc.pid) : undefined
+      if (!handshake || handshake.identity.pid !== proc.pid
+        || handshake.identity.pgid !== proc.pid || !current
+        || !sameProcessGeneration(handshake.identity, current)) {
+        throw new Error('update gateのexact process identityを検証できません')
+      }
+      updaterIdentity = handshake.identity
+      options.onGateIdentity?.(updaterIdentity)
+      registeredGate = updaterIdentity
+      proc.stdin.write(`${UPDATE_GATE_START}\n`)
+      await proc.stdin.flush()
+      proc.stdin.end()
+    } catch (error) {
+      try { proc.stdin.end() } catch {}
+      await Promise.race([
+        proc.exited,
+        Bun.sleep(options.gateHandshakeTimeoutMs ?? DEFAULT_UPDATE_GATE_HANDSHAKE_TIMEOUT_MS),
+      ])
+      throw error
+    }
     let timeout: ReturnType<typeof setTimeout> | undefined
     const deadline = new Promise<'timeout'>(resolve => {
       timeout = setTimeout(() => resolve('timeout'), timeoutMs)
@@ -571,19 +841,38 @@ export async function executeUpdater(
     const naturalExit = proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode }))
     const outcome = await Promise.race([naturalExit, deadline])
     if (timeout) clearTimeout(timeout)
-    if (outcome !== 'timeout') return outcome.exitCode
-
-    signalProcessGroup(proc, 'SIGTERM')
-    const afterTerm = await Promise.race([
-      proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
-      Bun.sleep(termGraceMs).then(() => ({ kind: 'grace' as const })),
-    ])
-    if (afterTerm.kind === 'grace') {
-      signalProcessGroup(proc, 'SIGKILL')
-      await proc.exited
+    if (outcome !== 'timeout') {
+      gateExitConfirmed = true
+      return outcome.exitCode
     }
+
+    if (!signalProcessGroup(updaterIdentity, 'SIGTERM')) {
+      const stopped = await waitForTrackedExit(proc.exited, updaterIdentity, 100)
+      if (stopped !== 'stopped') {
+        throw new Error('timeoutしたupdate gateへgeneration-safeなSIGTERMを送れません')
+      }
+    }
+    const afterTerm = await waitForTrackedExit(proc.exited, updaterIdentity, termGraceMs)
+    if (afterTerm !== 'stopped') {
+      if (!signalProcessGroup(updaterIdentity, 'SIGKILL')) {
+        const stopped = await waitForTrackedExit(proc.exited, updaterIdentity, 100)
+        if (stopped !== 'stopped') {
+          throw new Error('timeoutしたupdate gateへgeneration-safeなSIGKILLを送れません')
+        }
+      }
+      const afterKill = await waitForTrackedExit(
+        proc.exited,
+        updaterIdentity,
+        options.gateKillWaitMs ?? DEFAULT_UPDATE_GATE_KILL_WAIT_MS,
+      )
+      if (afterKill !== 'stopped') {
+        throw new Error(`timeoutしたupdate gateの停止を確認できません: ${afterKill}`)
+      }
+    }
+    gateExitConfirmed = true
     throw new Error(`zerokun-updateが${timeoutMs}msでtimeoutしました`)
   } finally {
+    if (registeredGate && gateExitConfirmed) options.onGateExit?.(registeredGate)
     closeSync(logFd)
   }
 }
@@ -614,6 +903,22 @@ export async function runUpdateWorker(
     options.updaterTimeoutMs,
     options.updaterTermGraceMs,
     updaterEnvironment,
+    {
+      onGateIdentity: gate => {
+        const current = readRequest(dir)
+        if (!current || current.id !== request.id || current.outcome) {
+          throw new Error('update gateを現在のrequestへ永続化できません')
+        }
+        persistRequest(dir, { ...current, gate })
+      },
+      onGateExit: gate => {
+        const current = readRequest(dir)
+        if (!current || current.id !== request.id || !current.gate
+          || !sameProcessGeneration(current.gate, gate)) return
+        const { gate: _finishedGate, ...withoutGate } = current
+        persistRequest(dir, withoutGate)
+      },
+    },
   ))
   const notify = options.notify ?? ((value: UpdateRequest, text: string) => notifySlack(dir, value, text))
 
@@ -664,6 +969,14 @@ function optionValue(args: string[], name: string): string | undefined {
 
 async function runCli(): Promise<void> {
   const args = process.argv.slice(2)
+  if (args[0] === 'updater-gate') {
+    if (!args[1] || !optionValue(args, '--log')) {
+      throw new Error('usage: update-request.ts updater-gate <updater-path> --log <log-path>')
+    }
+    const exitCode = await runUpdaterGate(args[1], optionValue(args, '--log')!)
+    if (exitCode !== 0) process.exitCode = exitCode
+    return
+  }
   if (args[0] !== 'run' || !args[1]) {
     throw new Error('usage: update-request.ts run <request-id> [--state-dir DIR] [--updater PATH]')
   }

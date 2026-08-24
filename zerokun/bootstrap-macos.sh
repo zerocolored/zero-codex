@@ -145,7 +145,8 @@ SLACK_APP_CREATE_URL="https://api.slack.com/apps?new_app=1"
 MIN_CODEX_VERSION="0.149.0"
 
 codex_version_number() {
-  codex --version 2>/dev/null | sed -nE 's/.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1
+  local binary="${1:-codex}"
+  "$binary" --version 2>/dev/null | sed -nE 's/.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1
 }
 
 version_at_least() {
@@ -597,6 +598,74 @@ install_homebrew() {
   ok "$(first_line brew --version)"
 }
 
+bootstrap_safe_directory_chain() {
+  local path="$1" rest component current metadata uid mode type permissions
+  case "$path" in /*) ;; *) return 1 ;; esac
+  rest="${path#/}"
+  current=""
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*) component="${rest%%/*}"; rest="${rest#*/}" ;;
+      *) component="$rest"; rest="" ;;
+    esac
+    [ -n "$component" ] || continue
+    current="$current/$component"
+    [ -d "$current" ] && [ ! -L "$current" ] || return 1
+    metadata="$(/usr/bin/stat -f '%u:%Lp:%HT' "$current" 2>/dev/null)" || return 1
+    IFS=: read -r uid mode type <<EOF
+$metadata
+EOF
+    [ "$type" = "Directory" ] || return 1
+    [ "$uid" = "0" ] || [ "$uid" = "$(/usr/bin/id -u)" ] || return 1
+    permissions=$((8#$mode))
+    [ $((permissions & 8#22)) -eq 0 ] || return 1
+  done
+}
+
+bootstrap_resolve_executable() {
+  local current="$1" parent physical_parent target count=0
+  while [ "$count" -lt 32 ]; do
+    parent="$(/usr/bin/dirname "$current")"
+    physical_parent="$(CDPATH='' cd -P -- "$parent" 2>/dev/null && pwd -P)" || return 1
+    current="$physical_parent/$(/usr/bin/basename "$current")"
+    [ -L "$current" ] || { printf '%s\n' "$current"; return; }
+    target="$(/usr/bin/readlink "$current")" || return 1
+    case "$target" in
+      /*) current="$target" ;;
+      *) current="$physical_parent/$target" ;;
+    esac
+    count=$((count + 1))
+  done
+  return 1
+}
+
+secure_standalone_codex() {
+  local logical="$HOME/.local/bin/codex" physical home_physical metadata uid links mode type permissions magic
+  [ -e "$logical" ] || [ -L "$logical" ] || return 1
+  bootstrap_safe_directory_chain "$(/usr/bin/dirname "$logical")" || return 1
+  metadata="$(/usr/bin/stat -f '%u:%l:%HT' "$logical" 2>/dev/null)" || return 1
+  IFS=: read -r uid links type <<EOF
+$metadata
+EOF
+  [ "$uid" = "$(/usr/bin/id -u)" ] || [ "$uid" = "0" ] || return 1
+  case "$type" in 'Regular File') [ "$links" = "1" ] || return 1 ;; 'Symbolic Link') ;; *) return 1 ;; esac
+  physical="$(bootstrap_resolve_executable "$logical")" || return 1
+  home_physical="$(CDPATH='' cd -P -- "$HOME" 2>/dev/null && pwd -P)" || return 1
+  case "$physical" in "$home_physical/.codex/packages/standalone/releases/"*) ;; *) return 1 ;; esac
+  bootstrap_safe_directory_chain "$(/usr/bin/dirname "$physical")" || return 1
+  metadata="$(/usr/bin/stat -f '%u:%l:%Lp:%HT' "$physical" 2>/dev/null)" || return 1
+  IFS=: read -r uid links mode type <<EOF
+$metadata
+EOF
+  [ "$type" = "Regular File" ] && [ "$links" = "1" ] || return 1
+  [ "$uid" = "$(/usr/bin/id -u)" ] || [ "$uid" = "0" ] || return 1
+  permissions=$((8#$mode))
+  [ $((permissions & 8#22)) -eq 0 ] && [ $((permissions & 8#111)) -ne 0 ] || return 1
+  magic="$(/usr/bin/od -An -tx1 -N4 "$physical" 2>/dev/null | /usr/bin/tr -d '[:space:]')" || return 1
+  case "$magic" in feedface|cefaedfe|feedfacf|cffaedfe|cafebabe|bebafeca|cafebabf|bfbafeca) ;; *) return 1 ;; esac
+  printf '%s\n' "$physical"
+}
+
 install_codex_standalone() {
   local installer
   installer="$(/usr/bin/mktemp /tmp/zerokun-codex-installer.XXXXXX)" \
@@ -613,25 +682,25 @@ install_codex_standalone() {
   /bin/rm -f "$installer"
   export PATH="$HOME/.local/bin:$PATH"
   hash -r
+  secure_standalone_codex >/dev/null \
+    || fail "Codex公式standaloneのowner・path・native executable検証に失敗しました"
   append_profile_block '# zerokun bootstrap: Codex CLI' 'export PATH="$HOME/.local/bin:$PATH"'
 }
 
 install_cli_tools() {
+  local standalone_codex="$HOME/.local/bin/codex"
   section "tmux / Codex CLI / Bun"
   if ! command -v tmux >/dev/null 2>&1; then
     isolated_network_command "$(command -v brew)" install tmux
   fi
-  if ! command -v codex >/dev/null 2>&1; then
-    isolated_network_command "$(command -v brew)" install --cask codex
-  elif ! version_at_least "$(codex_version_number)" "$MIN_CODEX_VERSION"; then
-    if ! isolated_network_command "$(command -v brew)" upgrade --cask codex; then
-      warn "HomebrewのCodex更新に失敗したため公式installerへ切り替えます"
-    fi
-  fi
-  if ! command -v codex >/dev/null 2>&1 \
-    || ! version_at_least "$(codex_version_number)" "$MIN_CODEX_VERSION"; then
+  # Homebrew prefix is group-writable on a standard multi-user macOS install.
+  # Keep the executable used by Zero-kun under the account-owned standalone path.
+  if ! secure_standalone_codex >/dev/null \
+    || ! version_at_least "$(codex_version_number "$standalone_codex")" "$MIN_CODEX_VERSION"; then
     install_codex_standalone
   fi
+  export PATH="$HOME/.local/bin:$PATH"
+  hash -r
   if ! command -v bun >/dev/null 2>&1; then
     local bun_installer
     bun_installer="$(/usr/bin/mktemp /tmp/zerokun-bun-installer.XXXXXX)" \
@@ -653,7 +722,9 @@ export PATH="$BUN_INSTALL/bin:$PATH"'
   for required in git tmux bun codex; do
     command -v "$required" >/dev/null 2>&1 || fail "$required の導入を確認できません"
   done
-  version_at_least "$(codex_version_number)" "$MIN_CODEX_VERSION" \
+  secure_standalone_codex >/dev/null \
+    || fail "Codex公式standaloneの安全性を確認できませんでした"
+  version_at_least "$(codex_version_number "$standalone_codex")" "$MIN_CODEX_VERSION" \
     || fail "Codex CLI $MIN_CODEX_VERSION 以上を導入できませんでした"
   ok "必要なCLIを導入しました"
 }
@@ -727,6 +798,15 @@ validate_existing_repo() {
   return "$status"
 }
 
+repo_has_atomic_setup_delegate() {
+  local target="$1" setup size
+  setup="$target/zerokun/setup.sh"
+  bootstrap_owned_regular_file "$setup" || return 1
+  size="$(/usr/bin/stat -f '%z' "$setup" 2>/dev/null || true)"
+  [ -n "$size" ] && [ "$size" -gt 0 ] && [ "$size" -le 1048576 ] || return 1
+  /usr/bin/grep -Fq -- '--setup-supervisor' "$setup"
+}
+
 ensure_repo() {
   local slug="$1"
   local target="$2"
@@ -737,10 +817,14 @@ ensure_repo() {
     local current_branch
     current_branch="$(safe_git -C "$target" branch --show-current)"
     if repo_is_clean "$target" && [ "$current_branch" = "$target_branch" ]; then
+      repo_has_atomic_setup_delegate "$target" \
+        || fail "旧Codex版の既存checkoutは稼働中sourceを直接更新しません。空の別directoryを--repo-dirで指定してoffline bootstrapしてください: $target"
       safe_git -C "$target" fetch origin "$target_branch"
       safe_git -C "$target" branch --set-upstream-to="origin/$target_branch" "$target_branch"
       safe_git -C "$target" merge --ff-only "origin/$target_branch"
     elif repo_is_clean "$target" && [ "$current_branch" = "main" ] && [ "$target_branch" != "main" ]; then
+      repo_has_atomic_setup_delegate "$target" \
+        || fail "旧Codex版の既存checkoutは稼働中sourceを直接更新しません。空の別directoryを--repo-dirで指定してoffline bootstrapしてください: $target"
       safe_git -C "$target" fetch origin "$target_branch"
       if safe_git -C "$target" show-ref --verify --quiet "refs/heads/$target_branch"; then
         safe_git -C "$target" switch "$target_branch"

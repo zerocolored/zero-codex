@@ -8,6 +8,7 @@ unset BUN_OPTIONS BUN_CONFIG_PRELOAD NODE_OPTIONS
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$REPO_DIR/zerokun/state-dir.sh"
 CH="$(zerokun_resolve_state_dir)"
+CH="$(zerokun_normalize_path "$CH")"
 ZEROKUN_JOB_DB="$(zerokun_resolve_job_db "$CH")"
 export ZEROKUN_JOB_DB
 LEGACY_STATE_DIR="$HOME/.claude/channels/slack"
@@ -15,8 +16,6 @@ TPL="$REPO_DIR/zerokun/templates"
 PROJECT_DIR="${ZEROKUN_PROJECT_DIR:-$(dirname "$REPO_DIR")/zerokun-workspace}"
 LAUNCHCTL_BIN="${ZEROKUN_LAUNCHCTL_BIN:-/bin/launchctl}"
 . "$REPO_DIR/zerokun/codex-version.sh"
-
-echo "== ゼロくんセットアップ開始 (repo: $REPO_DIR)"
 
 # Cutoverは既存legacy stateへの明示操作だけに限定する。検査より先にdirectoryを
 # 作成すると、空の標準pathでもglobal Claude process停止へ進んでしまう。
@@ -71,10 +70,86 @@ case "${ZEROKUN_LEGACY_CUTOVER:-0}" in
   *) echo "❌ ZEROKUN_LEGACY_CUTOVERは0または1で指定してください" >&2; exit 1 ;;
 esac
 
+SETUP_DRAIN_SECONDS="${ZEROKUN_SETUP_DRAIN_SECONDS:-21600}"
+if [ "$LEGACY_CUTOVER" = "1" ]; then
+  case "$SETUP_DRAIN_SECONDS" in
+    ''|*[!0-9]*) echo "❌ ZEROKUN_SETUP_DRAIN_SECONDSは0以上の整数で指定してください" >&2; exit 1 ;;
+  esac
+  [ "${#SETUP_DRAIN_SECONDS}" -le 6 ] \
+    && [ "$SETUP_DRAIN_SECONDS" -le 604800 ] || {
+      echo "❌ ZEROKUN_SETUP_DRAIN_SECONDSは604800以下で指定してください" >&2
+      exit 1
+    }
+else
+  SETUP_DRAIN_SECONDS=0
+fi
+
 # 0. 依存確認
 command -v bun >/dev/null 2>&1 || { echo "❌ bun がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
+
+case "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" in
+  0|1) ;;
+  *) echo "❌ ZEROKUN_UPDATE_IN_PROGRESSは0または1で指定してください" >&2; exit 1 ;;
+esac
+
+# A human/bootstrap invocation first becomes a coordinator. The coordinator
+# owns the primary update lock and starts this script again inside a gated,
+# persisted process-group delegate before any setup mutation can begin.
+if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" = "0" ]; then
+  exec bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/update.ts" --setup-supervisor
+fi
+
+SETUP_LOCK="$CH/update.lock"
+WATCHDOG_PLIST_TMP=""
+ZSHRC_TMP=""
+cleanup_setup_temporary_files() {
+  [ -z "$WATCHDOG_PLIST_TMP" ] || rm -f -- "$WATCHDOG_PLIST_TMP"
+  [ -z "$ZSHRC_TMP" ] || rm -f -- "$ZSHRC_TMP"
+}
+trap cleanup_setup_temporary_files EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# A setup checked out by an updater must join that updater's existing lease
+# before even preparing state directories. It must never reclaim a dead
+# parent as a standalone primary: doing so would lose process-group coverage
+# if the setup leader were killed while one of its children kept mutating.
+if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" = "1" ]; then
+  CH="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" \
+    require-root "$CH")" || {
+      echo "❌ 現在のzerokun-update lock pathをread-only検証できません。Codex版のoffline bootstrapを実行してください。変更は開始しません。" >&2
+      exit 1
+    }
+  SETUP_LOCK="$CH/update.lock"
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" \
+    require-directories "$CH" "$SETUP_LOCK" || {
+      echo "❌ 現在のzerokun-update lock directoryが安全ではありません。Codex版のoffline bootstrapを実行してください。変更は開始しません。" >&2
+      exit 1
+    }
+  if bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+    delegate-active "$SETUP_LOCK/pid" "$$"; then
+    : # Current updater registered this gated setup before allowing mutation.
+  else
+    echo "❌ 現在のzerokun-updateは安全なlock委譲に対応していません。Codex版のoffline bootstrapを実行してください。変更は開始しません。" >&2
+    exit 1
+  fi
+fi
+
+echo "== ゼロくんセットアップ開始 (repo: $REPO_DIR)"
+
+# The update lock is the first mutation boundary. Every setup is already
+# running inside the coordinator's persisted process-group delegate here.
+CH="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" \
+  prepare-root "$CH")" \
+  || { echo "❌ state directoryを安全に準備できません" >&2; exit 1; }
+SETUP_LOCK="$CH/update.lock"
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare-directories \
+  "$CH" "$SETUP_LOCK"
+
 zerokun_require_codex_version || exit 1
-bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" verify-system-config || exit 1
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" \
+  verify-system-config --inherit-process-group || exit 1
 command -v git >/dev/null 2>&1 || { echo "❌ git がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 command -v tmux >/dev/null 2>&1 || { echo "❌ tmux がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 BUN_BIN="$(command -v bun)"
@@ -147,42 +222,13 @@ if [ ! -e "$PROJECT_DIR/.git" ]; then
     git -c core.hooksPath=/dev/null init --initial-branch=main "$PROJECT_DIR" >/dev/null
 fi
 
-# 1. 設定ディレクトリ。既存rootはowner/symlinkを検査してから0700へ直す。
-mkdir -p "$CH"
-bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare-root "$CH" >/dev/null
-CH="$(cd "$CH" && pwd -P)"
+# 1. 残りの設定ディレクトリをlock保持中に準備する。
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare-directories \
-  "$CH" "$CH/inbox" "$CH/approved" "$CH/update.lock" "$CH/job-runner.lock"
+  "$CH" "$CH/inbox" "$CH/approved" "$CH/job-runner.lock"
 
 # Claude版daemonが新しいCodex jobをclaimしないよう、cutover中はclaimを止める。
 # 実行中の旧jobだけをdrainしてから旧runner/gatewayを終了する。待機jobは
 # SQLite migrationでsessionを破棄し、Codex jobとして引き継ぐ。
-SETUP_LOCK="$CH/update.lock"
-SETUP_OWNS_LOCK=0
-SETUP_LOCK_LEASE=""
-WATCHDOG_PLIST_TMP=""
-ZSHRC_TMP=""
-cleanup_setup_lock() {
-  [ -z "$WATCHDOG_PLIST_TMP" ] || rm -f -- "$WATCHDOG_PLIST_TMP"
-  [ -z "$ZSHRC_TMP" ] || rm -f -- "$ZSHRC_TMP"
-  if [ "$SETUP_OWNS_LOCK" = "1" ]; then
-    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
-      release "$SETUP_LOCK/pid" "$SETUP_LOCK_LEASE" || true
-  fi
-}
-trap cleanup_setup_lock EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-LOCK_OWNER=""
-if LOCK_OWNER="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" acquire "$SETUP_LOCK/pid" "$$")"; then
-  SETUP_LOCK_LEASE="$LOCK_OWNER"
-  SETUP_OWNS_LOCK=1
-else
-  if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" != "1" ]; then
-    echo "❌ zerokun-updateが実行中です (PID ${LOCK_OWNER:-不明})。完了後にsetupを再実行してください。" >&2
-    exit 1
-  fi
-fi
 
 process_matches() {
   local pid="$1" pattern="$2"
@@ -221,15 +267,10 @@ if [ "$LEGACY_CUTOVER_INITIAL" = "1" ]; then
     [ -n "$legacy_parent" ] || continue
     [ "$legacy_parent" != "$$" ] || continue
     if process_matches "$legacy_parent" 'claude.*dangerously-load-development-channels[[:space:]]+server:slack-channel'; then
-      kill "$legacy_parent"
-      for _ in {1..150}; do
-        pid_is_alive "$legacy_parent" || break
-        sleep 0.2
-      done
-      pid_is_alive "$legacy_parent" && {
-        echo "❌ 旧Claude Zero-kun親process PID $legacy_parent が正常終了しません。" >&2
-        exit 1
-      }
+      bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-generation.ts" \
+        stop-matching "$legacy_parent" \
+        'claude.*dangerously-load-development-channels\s+server:slack-channel' 30000 \
+        || { echo "❌ 旧Claude Zero-kun親processを世代検証付きで停止できません。" >&2; exit 1; }
       echo "   旧Claude Zero-kun親processを停止しました"
     fi
   done < <(pgrep -f 'claude.*dangerously-load-development-channels.*server:slack-channel' 2>/dev/null || true)
@@ -256,32 +297,6 @@ if [ "$LEGACY_CUTOVER" = "1" ]; then
   GATEWAY_SCRIPT="$LEGACY_STATE_DIR/server.ts"
   RUNNER_SCRIPT="$LEGACY_STATE_DIR/job-runner.ts"
 fi
-GATEWAY_PID="$(read_lock_pid "$CH/plugin.lock")"
-if process_matches "$GATEWAY_PID" 'server\.ts'; then
-  if ! lock_process_matches "$CH/plugin.lock" "$GATEWAY_PID" 'server\.ts'; then
-    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/adopt-legacy-lock.ts" \
-      "$CH/plugin.lock" "$GATEWAY_PID" "$GATEWAY_SCRIPT" \
-      || { echo "❌ gateway lock identityを検証できないため自動停止しません。" >&2; exit 1; }
-    lock_process_matches "$CH/plugin.lock" "$GATEWAY_PID" 'server\.ts' \
-      || { echo "❌ gateway lock identityの移行に失敗しました。" >&2; exit 1; }
-  fi
-  if pid_is_alive "$GATEWAY_PID"; then
-    lock_process_matches "$CH/plugin.lock" "$GATEWAY_PID" 'server\.ts' \
-      || { echo "❌ gateway identityが停止直前に変化したためsignalしません。" >&2; exit 1; }
-    kill "$GATEWAY_PID" \
-      || { pid_is_alive "$GATEWAY_PID" && { echo "❌ 旧gatewayへsignalできません。" >&2; exit 1; }; }
-  fi
-  for _ in {1..150}; do
-    pid_is_alive "$GATEWAY_PID" || break
-    sleep 0.2
-  done
-  pid_is_alive "$GATEWAY_PID" && {
-    echo "❌ 旧gateway PID $GATEWAY_PID が正常終了しません。" >&2
-    exit 1
-  }
-  echo "   旧Slack gatewayを停止しました"
-fi
-
 RUNNER_PID="$(read_lock_pid "$CH/job-runner.lock/pid")"
 if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)'; then
   if ! lock_process_matches "$CH/job-runner.lock/pid" "$RUNNER_PID" \
@@ -293,7 +308,7 @@ if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$
       'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)' \
       || { echo "❌ job runner lock identityの移行に失敗しました。" >&2; exit 1; }
   fi
-  drain_deadline=$(( $(date +%s) + ${ZEROKUN_SETUP_DRAIN_SECONDS:-21600} ))
+  drain_deadline=$(( $(date +%s) + SETUP_DRAIN_SECONDS ))
   while [ "$(legacy_running_count)" -gt 0 ]; do
     [ "$(date +%s)" -lt "$drain_deadline" ] || {
       echo "❌ 実行中jobのdrain待ちがtimeoutしました。旧runnerは停止していません。" >&2
@@ -303,21 +318,33 @@ if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$
     sleep 2
   done
   if pid_is_alive "$RUNNER_PID"; then
-    lock_process_matches "$CH/job-runner.lock/pid" "$RUNNER_PID" \
-      'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)' \
-      || { echo "❌ job runner identityがdrain中に変化したためsignalしません。" >&2; exit 1; }
-    kill "$RUNNER_PID" \
-      || { pid_is_alive "$RUNNER_PID" && { echo "❌ 旧runnerへsignalできません。" >&2; exit 1; }; }
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+      stop-owner "$CH/job-runner.lock/pid" "$RUNNER_PID" \
+      'job-runner\.ts\s+daemon(?:\s|$)' 30000 \
+      || { echo "❌ 旧runnerを世代検証付きで停止できません。" >&2; exit 1; }
   fi
-  for _ in {1..150}; do
-    pid_is_alive "$RUNNER_PID" || break
-    sleep 0.2
-  done
-  pid_is_alive "$RUNNER_PID" && {
-    echo "❌ 旧runner PID $RUNNER_PID が正常終了しません。" >&2
-    exit 1
-  }
   echo "   旧job runnerを安全に停止しました"
+fi
+
+# Keep Slack intake available while an existing job drains. Once the runner
+# is stopped no accepted event can start work, so the gateway can be stopped
+# immediately before storage/setup mutation without leaving a partial outage
+# on a drain timeout.
+GATEWAY_PID="$(read_lock_pid "$CH/plugin.lock")"
+if process_matches "$GATEWAY_PID" 'server\.ts'; then
+  if ! lock_process_matches "$CH/plugin.lock" "$GATEWAY_PID" 'server\.ts'; then
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/adopt-legacy-lock.ts" \
+      "$CH/plugin.lock" "$GATEWAY_PID" "$GATEWAY_SCRIPT" \
+      || { echo "❌ gateway lock identityを検証できないため自動停止しません。" >&2; exit 1; }
+    lock_process_matches "$CH/plugin.lock" "$GATEWAY_PID" 'server\.ts' \
+      || { echo "❌ gateway lock identityの移行に失敗しました。" >&2; exit 1; }
+  fi
+  if pid_is_alive "$GATEWAY_PID"; then
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+      stop-owner "$CH/plugin.lock" "$GATEWAY_PID" 'server\.ts' 30000 \
+      || { echo "❌ 旧gatewayを世代検証付きで停止できません。" >&2; exit 1; }
+  fi
+  echo "   旧Slack gatewayを停止しました"
 fi
 
 # Legacy rows are handled only after both legacy processes are gone. Queued rows
@@ -342,13 +369,8 @@ bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-e
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$REPO_DIR/zerokun/job-runner.ts" "$CH/job-runner.ts"
 ln -sfn "$REPO_DIR/zerokun/codex-executor.ts" "$CH/codex-executor.ts"
-install -m 0700 "$REPO_DIR/zerokun/update-request.ts" "$CH/update-request.ts"
-install -m 0600 "$REPO_DIR/zerokun/child-environment.ts" "$CH/child-environment.ts"
-install -m 0600 "$REPO_DIR/zerokun/safe-file.ts" "$CH/safe-file.ts"
-install -m 0600 "$REPO_DIR/zerokun/managed-path.ts" "$CH/managed-path.ts"
-install -m 0600 "$REPO_DIR/zerokun/state-dir.ts" "$CH/state-dir.ts"
-install -m 0600 "$REPO_DIR/zerokun/slack-http.ts" "$CH/slack-http.ts"
-install -m 0600 "$REPO_DIR/zerokun/slack-app-identity.ts" "$CH/slack-app-identity.ts"
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/update-runtime.ts" \
+  install "$REPO_DIR/zerokun" "$CH" >/dev/null
 install -m 0700 "$REPO_DIR/zerokun/watchdog.sh" "$CH/watchdog.sh"
 mkdir -p "$HOME/Library/LaunchAgents"
 WATCHDOG_PLIST="$HOME/Library/LaunchAgents/com.zerokun.watchdog.plist"

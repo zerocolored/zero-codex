@@ -11,6 +11,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -22,10 +23,17 @@ import {
   activeJobCountsFromDatabase,
   assertPinnedRepositoryState,
   clearJournal,
+  copySecureExecutableForTesting,
+  createUpdaterTemporaryDirectory,
   fastForwardRepositories,
+  nativeExecutableHeaderSupported,
   preflightRepositories,
+  processGroupCleanupIsUncertain,
   processStateIsAlive,
+  resolveSetupTimeoutMs,
   resolveUpdaterCodexBinary,
+  setupTimeoutBudgetMs,
+  stageVerifiedCandidateCodex,
   restoreRollbackDatabase,
   startBotInTmux,
   stopLockedProcess,
@@ -34,16 +42,21 @@ import {
   updaterTrustedToolPath,
 } from './update.ts'
 import { tryAcquireProcessLock } from './process-lock.ts'
+import {
+  captureTrackedProcesses,
+  readProcessIdentity,
+  reapTrackedProcesses,
+  type ProcessIdentity,
+} from './process-tree.ts'
+import { signalProcessIfLive } from './process-generation.ts'
 
 const directories: string[] = []
 const tmuxSessions: string[] = []
-const servicePids: number[] = []
+const serviceIdentities: ProcessIdentity[] = []
 
 afterEach(() => {
   for (const session of tmuxSessions.splice(0)) Bun.spawnSync(['tmux', 'kill-session', '-t', session])
-  for (const pid of servicePids.splice(0)) {
-    try { process.kill(pid, 'SIGKILL') } catch {}
-  }
+  for (const identity of serviceIdentities.splice(0)) signalProcessIfLive(identity, 'SIGKILL')
   for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
@@ -53,6 +66,24 @@ function fixtureDir(): string {
   return dir
 }
 
+function snapshotFixtureGroup(groupId: number): Map<number, string> {
+  const tracked = new Map<number, string>()
+  captureTrackedProcesses([groupId], groupId, tracked)
+  return tracked
+}
+
+async function stopFixtureGroup(groupId: number, tracked: Map<number, string>): Promise<void> {
+  const remaining = await reapTrackedProcesses({
+    rootPids: [],
+    groupId,
+    tracked,
+    signalGroup: false,
+    termGraceMs: 50,
+    killWaitMs: 2_000,
+  })
+  if (remaining.length > 0) throw new Error(`test process group cleanup failed: ${remaining.join(', ')}`)
+}
+
 function must(args: string[], cwd?: string): string {
   const result = Bun.spawnSync(args, { cwd, stdout: 'pipe', stderr: 'pipe' })
   if (result.exitCode !== 0) throw new Error(result.stderr.toString())
@@ -60,7 +91,9 @@ function must(args: string[], cwd?: string): string {
 }
 
 function installedNativeCodex(): string {
-  const launcher = resolveUpdaterCodexBinary()
+  const discovered = Bun.which('codex')
+  if (!discovered) throw new Error('Codex CLI is not installed')
+  const launcher = realpathSync(discovered)
   if (!launcher.endsWith('.js')) return launcher
   const packageRoot = dirname(dirname(launcher))
   const target = process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin'
@@ -156,6 +189,11 @@ function updaterFixture() {
 }
 
 function updaterEnvironment(fixture: ReturnType<typeof updaterFixture>) {
+  const safeCodex = join(fixture.base, 'safe-codex')
+  if (!existsSync(safeCodex)) {
+    copyFileSync(installedNativeCodex(), safeCodex)
+    chmodSync(safeCodex, 0o700)
+  }
   return {
     ...process.env,
     ZEROKUN_REPO_DIR: fixture.repo.local,
@@ -163,6 +201,7 @@ function updaterEnvironment(fixture: ReturnType<typeof updaterFixture>) {
     ZEROKUN_PROJECT_DIR: fixture.project,
     ZEROKUN_SETUP_SCRIPT: fixture.setup,
     ZEROKUN_UPDATE_BRANCH: 'codex',
+    ZEROKUN_CODEX_BIN: safeCodex,
   }
 }
 
@@ -184,7 +223,10 @@ function rememberFixtureServices(state: string): void {
   for (const path of [join(state, 'plugin.lock'), join(state, 'job-runner.lock', 'pid')]) {
     try {
       const pid = Number(readFileSync(path, 'utf8').trim())
-      if (Number.isInteger(pid) && pid > 0) servicePids.push(pid)
+      if (Number.isInteger(pid) && pid > 0) {
+        const identity = readProcessIdentity(pid)
+        if (identity) serviceIdentities.push(identity)
+      }
     } catch {}
   }
 }
@@ -222,17 +264,121 @@ function spawnUpdater(
   })
 }
 
+function runStandaloneSetup(
+  fixture: ReturnType<typeof updaterFixture>,
+  environment = updaterEnvironment(fixture),
+) {
+  const entry = [
+    `import { runStandaloneSetupForTests } from ${JSON.stringify(join(import.meta.dir, 'update.ts'))}`,
+    'await runStandaloneSetupForTests()',
+  ].join('; ')
+  return Bun.spawnSync([process.execPath, '--no-env-file', '-e', entry], {
+    cwd: fixture.repo.local,
+    env: environment,
+    stdout: 'pipe', stderr: 'pipe',
+  })
+}
+
+function spawnStandaloneSetup(
+  fixture: ReturnType<typeof updaterFixture>,
+  environment = updaterEnvironment(fixture),
+) {
+  const entry = [
+    `import { runStandaloneSetupForTests } from ${JSON.stringify(join(import.meta.dir, 'update.ts'))}`,
+    'await runStandaloneSetupForTests()',
+  ].join('; ')
+  return Bun.spawn([process.execPath, '--no-env-file', '-e', entry], {
+    cwd: fixture.repo.local,
+    env: environment,
+    stdout: 'pipe', stderr: 'pipe',
+  })
+}
+
 describe('updater helpers', () => {
+  test('security-sensitive stagingはcaller TMPDIRを無視してroot-owned sticky parentを使う', () => {
+    const hostile = fixtureDir()
+    chmodSync(hostile, 0o777)
+    const previous = process.env.TMPDIR
+    process.env.TMPDIR = hostile
+    let staged = ''
+    try {
+      staged = createUpdaterTemporaryDirectory('zerokun-test-stage-')
+      expect(staged.startsWith(`${realpathSync(hostile)}/`)).toBe(false)
+      expect(lstatSync(staged).mode & 0o777).toBe(0o700)
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = previous
+      if (staged) rmSync(staged, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')(
+    'version確認済みstaged Codexは元path差替え後も同じcopyを実行する', () => {
+    const root = fixtureDir()
+    const original = join(root, 'codex')
+    copyFileSync(installedNativeCodex(), original)
+    chmodSync(original, 0o700)
+    const staged = stageVerifiedCandidateCodex(root, original, { HOME: root })
+    try {
+      const before = Bun.spawnSync([staged.executable, '--version'], {
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(before.exitCode).toBe(0)
+      writeFileSync(original, [
+        '#!/bin/sh',
+        'echo replaced',
+        '',
+      ].join('\n'), { mode: 0o700 })
+      const result = Bun.spawnSync([staged.executable, '--version'], {
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout.toString().trim()).toBe(before.stdout.toString().trim())
+      expect(staged.executable).not.toBe(realpathSync(original))
+    } finally {
+      chmodSync(staged.directory, 0o700)
+    }
+  })
+
+  test('実行file検証後のancestor相当swapをopened FD検査で拒否する', () => {
+    const root = fixtureDir()
+    const candidate = join(root, 'codex')
+    const original = join(root, 'codex-original')
+    const replacement = join(root, 'codex-replacement')
+    const staged = join(root, 'staged-codex')
+    writeFileSync(candidate, '#!/bin/sh\necho safe\n', { mode: 0o700 })
+    writeFileSync(replacement, '#!/bin/sh\necho malicious\n', { mode: 0o777 })
+    chmodSync(replacement, 0o777)
+    expect(() => copySecureExecutableForTesting(candidate, staged, () => {
+      renameSync(candidate, original)
+      renameSync(replacement, candidate)
+    })).toThrow('検証中に変化')
+    expect(existsSync(staged)).toBe(false)
+  })
+
   test('standalone Codexを絶対pathへ固定しcandidate PATHでも解決できる', () => {
     const home = fixtureDir()
     const bin = join(home, '.local', 'bin')
     mkdirSync(bin, { recursive: true })
     const codex = join(bin, 'codex')
     writeFileSync(codex, '#!/bin/sh\necho "codex-cli 0.149.0"\n', { mode: 0o755 })
-    const resolved = resolveUpdaterCodexBinary({ HOME: home, PATH: '/usr/bin:/bin' })
+    const resolved = resolveUpdaterCodexBinary(
+      { HOME: home, PATH: '/usr/bin:/bin' }, process.execPath, true,
+    )
     expect(resolved).toBe(realpathSync(codex))
     const trusted = join(home, 'trusted-bin')
     expect(updaterTrustedToolPath(trusted).split(':')[0]).toBe(trusted)
+  })
+
+  test('shell trampolineをnative Codexとしてstagingしない', () => {
+    const root = fixtureDir()
+    const wrapper = join(root, 'codex')
+    writeFileSync(wrapper, '#!/bin/sh\nexec /opt/homebrew/bin/codex "$@"\n', { mode: 0o700 })
+    expect(nativeExecutableHeaderSupported(Buffer.from('#!/b'), 'darwin')).toBe(false)
+    expect(nativeExecutableHeaderSupported(Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), 'darwin'))
+      .toBe(true)
+    expect(() => resolveUpdaterCodexBinary({ ZEROKUN_CODEX_BIN: wrapper }))
+      .toThrow('native binary')
   })
 
   test('standalone Codexを古いBun隣接版より優先し、最低version未満は採用しない', () => {
@@ -246,13 +392,13 @@ describe('updater helpers', () => {
     writeFileSync(standalone, '#!/bin/sh\necho "codex-cli 0.149.0"\n', { mode: 0o755 })
     writeFileSync(adjacent, '#!/bin/sh\necho "codex-cli 0.148.0"\n', { mode: 0o755 })
     expect(resolveUpdaterCodexBinary(
-      { HOME: join(root, 'home') }, join(runtimeBin, 'bun'),
+      { HOME: join(root, 'home') }, join(runtimeBin, 'bun'), true,
     )).toBe(realpathSync(standalone))
 
     writeFileSync(standalone, '#!/bin/sh\necho "codex-cli 0.148.9"\n', { mode: 0o755 })
     writeFileSync(adjacent, '#!/bin/sh\necho "codex-cli 0.150.0"\n', { mode: 0o755 })
     expect(resolveUpdaterCodexBinary(
-      { HOME: join(root, 'home') }, join(runtimeBin, 'bun'),
+      { HOME: join(root, 'home') }, join(runtimeBin, 'bun'), true,
     )).toBe(realpathSync(adjacent))
   })
 
@@ -298,6 +444,20 @@ describe('updater helpers', () => {
     chmodSync(unsafe, 0o777)
     expect(() => resolveUpdaterCodexBinary({ ZEROKUN_CODEX_BIN: unsafe }))
       .toThrow('安全なCodex CLI')
+
+    const unsafeParent = join(dir, 'group-writable')
+    mkdirSync(unsafeParent, { mode: 0o770 })
+    chmodSync(unsafeParent, 0o770)
+    const nested = join(unsafeParent, 'codex')
+    writeFileSync(nested, '#!/bin/sh\necho "codex-cli 0.149.0"\n', { mode: 0o700 })
+    expect(() => resolveUpdaterCodexBinary({ ZEROKUN_CODEX_BIN: nested }))
+      .toThrow('安全なCodex CLI')
+
+    const hardlink = join(dir, 'codex-hardlink')
+    linkSync(nested, hardlink)
+    expect(() => resolveUpdaterCodexBinary({ ZEROKUN_CODEX_BIN: hardlink }))
+      .toThrow('安全なCodex CLI')
+    expect(readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')).not.toContain('trustedHomebrew')
   })
 
   test('本番entrypointはテスト専用の検証・再起動省略flagを拒否する', () => {
@@ -322,8 +482,11 @@ describe('updater helpers', () => {
     expect(candidate).toContain('`default_permissions=${JSON.stringify(profile)}`')
     expect(candidate).toContain("'-P', profile")
     expect(candidate).toContain("'--include-managed-config'")
-    expect(candidate.indexOf('assertEffectiveCodexPermissionConfig('))
+    expect(candidate.indexOf('requireEffectiveCodexPermissionPreflight('))
       .toBeLessThan(candidate.indexOf("'sandbox'"))
+    expect(candidate).toContain('const stagedCodexBin = stagedCodex.executable')
+    expect(candidate).toContain('requireEffectiveCodexPermissionPreflight(\n      stagedCodexBin,')
+    expect(candidate).toContain('await requireCommandAsync([\n    stagedCodexBin,')
   })
 
   test('rollback用SQLite snapshotをsidecarごと原子的に復元する', () => {
@@ -359,10 +522,183 @@ describe('updater helpers', () => {
     )
     const gitReset = rollback.indexOf("['git', 'reset', '--hard', journal.originalHead]")
     const databaseRestore = rollback.indexOf('restoreRollbackDatabase(journal)')
-    const legacySetup = rollback.indexOf("['/bin/bash', journal.setupScript]")
+    const legacySetup = rollback.indexOf('requireSetupCommandAsync(journal.setupScript')
+    const exclusiveBarrier = rollback.indexOf('options.updateLock.assertExclusive()')
+    expect(exclusiveBarrier).toBeGreaterThanOrEqual(0)
+    expect(gitReset).toBeGreaterThan(exclusiveBarrier)
     expect(gitReset).toBeGreaterThanOrEqual(0)
     expect(databaseRestore).toBeGreaterThan(gitReset)
     expect(legacySetup).toBeGreaterThan(databaseRestore)
+  })
+
+  test('setupは依存導入やproject初期化より前にupdate lockへ参加する', () => {
+    const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
+    const standaloneMode = setup.indexOf('if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" = "0" ]; then')
+    const supervisor = setup.indexOf('"$REPO_DIR/zerokun/update.ts" --setup-supervisor')
+    const updateMode = setup.indexOf('if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" = "1" ]; then')
+    const delegateActive = setup.indexOf('delegate-active "$SETUP_LOCK/pid" "$$"')
+    const requireRoot = setup.indexOf('require-root "$CH"')
+    const requireLockDirectory = setup.indexOf('require-directories "$CH" "$SETUP_LOCK"')
+    const legacyUpdaterFailure = setup.lastIndexOf('Codex版のoffline bootstrapを実行してください')
+    const prepareState = setup.indexOf('prepare-root "$CH"')
+    const inheritedPreflight = setup.indexOf('verify-system-config --inherit-process-group')
+    const installDependencies = setup.indexOf('install --frozen-lockfile')
+    const createProject = setup.indexOf('mkdir -p "$PROJECT_DIR"')
+
+    expect(standaloneMode).toBeGreaterThanOrEqual(0)
+    expect(supervisor).toBeGreaterThan(standaloneMode)
+    expect(updateMode).toBeGreaterThanOrEqual(0)
+    expect(requireRoot).toBeGreaterThan(updateMode)
+    expect(requireLockDirectory).toBeGreaterThan(requireRoot)
+    expect(delegateActive).toBeGreaterThan(requireLockDirectory)
+    expect(delegateActive).toBeGreaterThan(updateMode)
+    expect(legacyUpdaterFailure).toBeGreaterThan(delegateActive)
+    expect(prepareState).toBeGreaterThan(legacyUpdaterFailure)
+    expect(inheritedPreflight).toBeGreaterThan(prepareState)
+    expect(installDependencies).toBeGreaterThan(inheritedPreflight)
+    expect(createProject).toBeGreaterThan(inheritedPreflight)
+    expect(setup).not.toContain('acquire "$SETUP_LOCK/pid" "$$"')
+    expect(setup).not.toContain('SETUP_OWNS_LOCK')
+    expect(setup).not.toContain('delegate-parent')
+  })
+
+  test('旧updaterからのsetupはstate作成より前にoffline bootstrapを案内して停止する', () => {
+    const root = fixtureDir()
+    const home = join(root, 'home')
+    const state = join(root, 'state-not-created')
+    mkdirSync(home)
+    const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+      env: {
+        ...process.env,
+        HOME: home,
+        PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+        ZEROKUN_STATE_DIR: state,
+        ZEROKUN_UPDATE_IN_PROGRESS: '1',
+        ZEROKUN_LEGACY_CUTOVER: '0',
+      },
+      stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr.toString()).toContain('Codex版のoffline bootstrap')
+    expect(existsSync(state)).toBe(false)
+  })
+
+  test('setupはupdate.lock symlinkをdelegate-active前に拒否しstate外へ書かない', () => {
+    const root = fixtureDir()
+    const home = join(root, 'home')
+    const state = join(root, 'state')
+    const external = join(root, 'external-lock')
+    mkdirSync(home)
+    mkdirSync(state, { mode: 0o700 })
+    mkdirSync(external)
+    symlinkSync(external, join(state, 'update.lock'))
+    const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+      env: {
+        ...process.env,
+        HOME: home,
+        PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+        ZEROKUN_STATE_DIR: state,
+        ZEROKUN_UPDATE_IN_PROGRESS: '1',
+        ZEROKUN_LEGACY_CUTOVER: '0',
+      },
+      stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr.toString()).toContain('lock directoryが安全ではありません')
+    expect(readdirSync(external)).toEqual([])
+  })
+
+  test('standalone supervisorは未完了journalを越えてsetupを開始しない', () => {
+    const fixture = updaterFixture()
+    writeFileSync(join(fixture.state, 'update-transaction.json'), '{}\n', { mode: 0o600 })
+    const result = runStandaloneSetup(fixture)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr.toString()).toContain('zerokun-update --recover-only')
+    expect(existsSync(fixture.setupMarker)).toBe(false)
+    expect(existsSync(join(fixture.state, 'update.lock/pid'))).toBe(false)
+  })
+
+  test('全detached commandはlease登録後に開始しreaper後にだけ解除する', () => {
+    const source = readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')
+    const commandRunner = source.slice(
+      source.indexOf('async function requireCommandAsync('),
+      source.indexOf('export function processStateIsAlive('),
+    )
+    const delegate = commandRunner.indexOf('options.processGroupLease.delegate(proc.pid)')
+    const openGate = commandRunner.indexOf(
+      'gateInput.write(`start\\n${encodeProcessLockDelegate(delegated)}\\n`)',
+    )
+    const finalReap = commandRunner.indexOf('rootPids: []')
+    const cleanupDecision = commandRunner.indexOf('processGroupCleanupIsUncertain({')
+    const undelegate = commandRunner.indexOf('options.processGroupLease!.undelegate(delegated)')
+    expect(delegate).toBeGreaterThanOrEqual(0)
+    expect(openGate).toBeGreaterThan(delegate)
+    expect(finalReap).toBeGreaterThan(openGate)
+    expect(cleanupDecision).toBeGreaterThan(finalReap)
+    expect(undelegate).toBeGreaterThan(cleanupDecision)
+    expect(undelegate).toBeGreaterThan(finalReap)
+    expect(commandRunner).toContain("signalProcessGroupIfLeaderLive(rootIdentity, 'SIGKILL')")
+    expect(commandRunner).toContain("signalProcessIfLive(rootIdentity, 'SIGKILL')")
+    expect(commandRunner).not.toContain('proc.kill(')
+    expect(commandRunner).not.toContain('process.kill(-proc.pid')
+
+    const candidate = source.slice(
+      source.indexOf('async function validateZero('),
+      source.indexOf('export async function stopLockedProcess('),
+    )
+    const preflight = candidate.slice(
+      candidate.indexOf('requireEffectiveCodexPermissionPreflight('),
+      candidate.indexOf("await requireCommandAsync([\n    stagedCodexBin"),
+    )
+    expect(preflight).toContain('processGroupLease')
+    expect(preflight).toContain('signal')
+
+    for (const marker of [
+      "'git', 'fetch'",
+      "'git', 'clone'",
+      "'git', 'checkout'",
+      "stagedCodexBin,\n    '-a', 'never'",
+    ]) {
+      const start = source.indexOf(marker)
+      expect(start).toBeGreaterThanOrEqual(0)
+      expect(source.slice(start, start + 900)).toContain('processGroupLease')
+    }
+    const main = source.slice(source.indexOf('async function main('))
+    expect(main.slice(main.indexOf('preflightRepositories('), main.indexOf('throwIfInterrupted()', main.indexOf('preflightRepositories('))))
+      .toContain('updateLock')
+    expect(main.slice(main.indexOf('validateRemoteTargets('), main.indexOf('throwIfInterrupted()', main.indexOf('validateRemoteTargets('))))
+      .toContain('updateLock')
+  })
+
+  test('cleanup evidenceが一つでも不確実ならundelegateを許可しない', () => {
+    expect(processGroupCleanupIsUncertain({ remaining: [] })).toBe(false)
+    expect(processGroupCleanupIsUncertain({ remaining: [42] })).toBe(true)
+    expect(processGroupCleanupIsUncertain({ remaining: [], terminationError: new Error() })).toBe(true)
+    expect(processGroupCleanupIsUncertain({ remaining: [], finalReapError: new Error() })).toBe(true)
+    expect(processGroupCleanupIsUncertain({ remaining: [], trackingError: new Error() })).toBe(true)
+    expect(processGroupCleanupIsUncertain({
+      remaining: [], cleanupProtectionError: new Error(),
+    })).toBe(true)
+  })
+
+  test('setup timeoutはlegacy drainと15分の作業budgetを必ず覆う', () => {
+    expect(setupTimeoutBudgetMs({ ZEROKUN_LEGACY_CUTOVER: '0' })).toBe(15 * 60_000)
+    expect(setupTimeoutBudgetMs({ ZEROKUN_LEGACY_CUTOVER: '1' }))
+      .toBe(21_600_000 + 15 * 60_000)
+    expect(setupTimeoutBudgetMs({
+      ZEROKUN_LEGACY_CUTOVER: '1',
+      ZEROKUN_SETUP_DRAIN_SECONDS: '10',
+    })).toBe(910_000)
+    expect(() => resolveSetupTimeoutMs({
+      ZEROKUN_LEGACY_CUTOVER: '1',
+      ZEROKUN_SETUP_DRAIN_SECONDS: '10',
+      ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '100',
+    })).toThrow('910000ms以上')
+    expect(resolveSetupTimeoutMs({
+      ZEROKUN_LEGACY_CUTOVER: '1',
+      ZEROKUN_SETUP_DRAIN_SECONDS: '10',
+      ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '100',
+    }, true)).toBe(100)
   })
 
   test('zombieだけをdeadと判定する', () => {
@@ -939,7 +1275,7 @@ describe('Codex branch self update', () => {
     expect(result.exitCode).toBe(1)
     expect(existsSync(verifyMarker)).toBe(false)
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
-  })
+  }, 15_000)
 
   test('候補verifyは隔離sandbox内だけを書け、stateや外部pathへ触れない', () => {
     const fixture = updaterFixture()
@@ -964,7 +1300,7 @@ describe('Codex branch self update', () => {
     expect(result.exitCode, result.stderr.toString()).toBe(0)
     expect(existsSync(externalMarker)).toBe(false)
     expect(readFileSync(stateSecret, 'utf8')).toBe('must-not-read')
-  })
+  }, 15_000)
 
   test('候補verifyがhangしてもdeadlineで停止しlive HEADを変更しない', () => {
     const fixture = updaterFixture()
@@ -1197,6 +1533,248 @@ describe('Codex branch self update', () => {
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
     expect(existsSync(join(fixture.state, 'update.lock/pid'))).toBe(false)
   })
+
+  test('standalone supervisorとdelegate leaderのSIGKILL後もsetup子が二本目を防ぐ', async () => {
+    const fixture = updaterFixture()
+    const setupStarted = join(fixture.base, 'standalone-setup-started')
+    const setupShellPidFile = join(fixture.base, 'standalone-setup-shell-pid')
+    const secondCompleted = join(fixture.base, 'standalone-second-completed')
+    writeFileSync(
+      fixture.setup,
+      [
+        '#!/bin/bash',
+        'test "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" = 1 || exit 91',
+        `if [ -f '${setupStarted}' ]; then`,
+        `  touch '${secondCompleted}'`,
+        '  exit 0',
+        'fi',
+        `printf '%s\\n' "$$" > '${setupShellPidFile}'`,
+        `touch '${setupStarted}'`,
+        "trap '' HUP TERM",
+        'while :; do sleep 1; done',
+        '',
+      ].join('\n'),
+    )
+    const first = spawnStandaloneSetup(fixture)
+    let delegatePid = 0
+    let trackedGroup = new Map<number, string>()
+    try {
+      let deadline = Date.now() + 5_000
+      while (!existsSync(setupStarted) && Date.now() < deadline) await Bun.sleep(10)
+      expect(existsSync(setupStarted)).toBe(true)
+      const identity = JSON.parse(
+        readFileSync(join(fixture.state, 'update.lock/pid.identity'), 'utf8'),
+      ) as { delegate?: { pid?: unknown; groupId?: unknown } }
+      delegatePid = Number(identity.delegate?.pid)
+      const setupShellPid = Number(readFileSync(setupShellPidFile, 'utf8').trim())
+      expect(identity.delegate?.groupId).toBe(delegatePid)
+      expect(Number.isInteger(delegatePid) && delegatePid > 0).toBe(true)
+      expect(Number.isInteger(setupShellPid) && setupShellPid > 0).toBe(true)
+      trackedGroup = snapshotFixtureGroup(delegatePid)
+
+      process.kill(first.pid, 'SIGKILL')
+      await first.exited
+      process.kill(delegatePid, 'SIGKILL')
+      deadline = Date.now() + 5_000
+      while (Date.now() < deadline) {
+        try { process.kill(delegatePid, 0); await Bun.sleep(10) } catch { break }
+      }
+      expect(() => process.kill(setupShellPid, 0)).not.toThrow()
+      expect(() => process.kill(-delegatePid, 0)).not.toThrow()
+
+      const blocked = runStandaloneSetup(fixture)
+      expect(blocked.exitCode).toBe(1)
+      expect(blocked.stderr.toString()).toContain(`PID ${delegatePid}`)
+      expect(existsSync(secondCompleted)).toBe(false)
+
+      await stopFixtureGroup(delegatePid, trackedGroup)
+      deadline = Date.now() + 5_000
+      while (Date.now() < deadline) {
+        try { process.kill(-delegatePid, 0); await Bun.sleep(10) } catch { break }
+      }
+      const recovered = runStandaloneSetup(fixture)
+      expect(recovered.exitCode, recovered.stderr.toString()).toBe(0)
+      expect(existsSync(secondCompleted)).toBe(true)
+      expect(existsSync(join(fixture.state, 'update.lock/pid'))).toBe(false)
+    } finally {
+      if (delegatePid > 0 && trackedGroup.size > 0) {
+        await stopFixtureGroup(delegatePid, trackedGroup).catch(() => {})
+      }
+      try { process.kill(first.pid, 'SIGKILL') } catch {}
+    }
+  }, 20_000)
+
+  test('親とsetup shellのSIGKILL後もlive子processが二本目のrollbackを防ぐ', async () => {
+    const fixture = updaterFixture()
+    const setupStarted = join(fixture.base, 'setup-started')
+    const setupShellPidFile = join(fixture.base, 'setup-shell-pid')
+    const rollbackSetupCompleted = join(fixture.base, 'rollback-setup-completed')
+    writeFileSync(
+      fixture.setup,
+      [
+        '#!/bin/bash',
+        `if [ -f '${setupStarted}' ]; then`,
+        `  touch '${rollbackSetupCompleted}'`,
+        '  exit 0',
+        'fi',
+        `printf '%s\\n' "$$" > '${setupShellPidFile}'`,
+        `touch '${setupStarted}'`,
+        "trap '' HUP",
+        'sleep 30',
+        '',
+      ].join('\n'),
+    )
+    const first = spawnUpdater(fixture, ['--skip-tests', '--no-restart'])
+    const deadline = Date.now() + 5_000
+    while (!existsSync(setupStarted) && Date.now() < deadline) await Bun.sleep(10)
+    expect(existsSync(setupStarted)).toBe(true)
+    const identityPath = join(fixture.state, 'update.lock/pid.identity')
+    const identity = JSON.parse(readFileSync(identityPath, 'utf8')) as {
+      delegate?: { pid?: unknown }
+    }
+    const delegatePid = Number(identity.delegate?.pid)
+    expect(Number.isInteger(delegatePid) && delegatePid > 0).toBe(true)
+    const setupShellPid = Number(readFileSync(setupShellPidFile, 'utf8').trim())
+    expect(Number.isInteger(setupShellPid) && setupShellPid > 0).toBe(true)
+    const trackedGroup = snapshotFixtureGroup(delegatePid)
+
+    process.kill(setupShellPid, 'SIGKILL')
+    await Bun.sleep(100)
+    expect(() => process.kill(-delegatePid, 0)).not.toThrow()
+    process.kill(first.pid, 'SIGKILL')
+    await first.exited
+    const second = runUpdater(fixture, ['--recover-only'])
+    expect(second.exitCode).toBe(1)
+    expect(second.stderr.toString()).toContain(`PID ${delegatePid}`)
+    expect(existsSync(rollbackSetupCompleted)).toBe(false)
+
+    await stopFixtureGroup(delegatePid, trackedGroup)
+    const stopped = Date.now() + 5_000
+    while (Date.now() < stopped) {
+      try { process.kill(delegatePid, 0); await Bun.sleep(10) } catch { break }
+    }
+    const recovered = runUpdater(fixture, ['--recover-only'])
+    expect(recovered.exitCode, recovered.stderr.toString()).toBe(0)
+    expect(existsSync(rollbackSetupCompleted)).toBe(true)
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
+    expect(existsSync(join(fixture.state, 'update.lock/pid'))).toBe(false)
+  }, 20_000)
+
+  test('updaterとdelegate leaderの二重SIGKILL後もorphan setup groupがrollbackを防ぐ', async () => {
+    const fixture = updaterFixture()
+    const setupStarted = join(fixture.base, 'setup-started')
+    const setupShellPidFile = join(fixture.base, 'setup-shell-pid')
+    const rollbackSetupCompleted = join(fixture.base, 'rollback-setup-completed')
+    writeFileSync(
+      fixture.setup,
+      [
+        '#!/bin/bash',
+        `if [ -f '${setupStarted}' ]; then`,
+        `  touch '${rollbackSetupCompleted}'`,
+        '  exit 0',
+        'fi',
+        `printf '%s\\n' "$$" > '${setupShellPidFile}'`,
+        `touch '${setupStarted}'`,
+        "trap '' HUP TERM",
+        'while :; do sleep 1; done',
+        '',
+      ].join('\n'),
+    )
+    const first = spawnUpdater(fixture, ['--skip-tests', '--no-restart'])
+    let deadline = Date.now() + 5_000
+    while (!existsSync(setupStarted) && Date.now() < deadline) await Bun.sleep(10)
+    expect(existsSync(setupStarted)).toBe(true)
+    const identity = JSON.parse(
+      readFileSync(join(fixture.state, 'update.lock/pid.identity'), 'utf8'),
+    ) as { delegate?: { pid?: unknown; groupId?: unknown } }
+    const delegatePid = Number(identity.delegate?.pid)
+    const setupShellPid = Number(readFileSync(setupShellPidFile, 'utf8').trim())
+    expect(identity.delegate?.groupId).toBe(delegatePid)
+    expect(Number.isInteger(delegatePid) && delegatePid > 0).toBe(true)
+    expect(Number.isInteger(setupShellPid) && setupShellPid > 0).toBe(true)
+    const trackedGroup = snapshotFixtureGroup(delegatePid)
+
+    process.kill(first.pid, 'SIGKILL')
+    await first.exited
+    process.kill(delegatePid, 'SIGKILL')
+    deadline = Date.now() + 5_000
+    while (Date.now() < deadline) {
+      try { process.kill(delegatePid, 0); await Bun.sleep(10) } catch { break }
+    }
+    expect(() => process.kill(setupShellPid, 0)).not.toThrow()
+    expect(() => process.kill(-delegatePid, 0)).not.toThrow()
+
+    const second = runUpdater(fixture, ['--recover-only'])
+    expect(second.exitCode).toBe(1)
+    expect(second.stderr.toString()).toContain(`PID ${delegatePid}`)
+    expect(existsSync(rollbackSetupCompleted)).toBe(false)
+
+    await stopFixtureGroup(delegatePid, trackedGroup)
+    deadline = Date.now() + 5_000
+    while (Date.now() < deadline) {
+      try { process.kill(-delegatePid, 0); await Bun.sleep(10) } catch { break }
+    }
+    const recovered = runUpdater(fixture, ['--recover-only'])
+    expect(recovered.exitCode, recovered.stderr.toString()).toBe(0)
+    expect(existsSync(rollbackSetupCompleted)).toBe(true)
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
+    expect(existsSync(join(fixture.state, 'update.lock/pid'))).toBe(false)
+  }, 20_000)
+
+  test('cleanup開始後のcoordinator死亡はwrite-ahead markerで永久fail-closedにする', async () => {
+    const fixture = updaterFixture()
+    const setupStarted = join(fixture.base, 'setup-started')
+    const setupTermObserved = join(fixture.base, 'setup-term-observed')
+    const rollbackSetupCompleted = join(fixture.base, 'rollback-setup-completed')
+    writeFileSync(
+      fixture.setup,
+      [
+        '#!/bin/bash',
+        `if [ -f '${setupStarted}' ]; then`,
+        `  touch '${rollbackSetupCompleted}'`,
+        '  exit 0',
+        'fi',
+        `trap 'touch "${setupTermObserved}"; while :; do sleep 1; done' TERM`,
+        `touch '${setupStarted}'`,
+        'while :; do sleep 1; done',
+        '',
+      ].join('\n'),
+    )
+    const first = spawnUpdater(fixture, ['--skip-tests', '--no-restart'])
+    let deadline = Date.now() + 5_000
+    while (!existsSync(setupStarted) && Date.now() < deadline) await Bun.sleep(10)
+    expect(existsSync(setupStarted)).toBe(true)
+    const identity = JSON.parse(
+      readFileSync(join(fixture.state, 'update.lock/pid.identity'), 'utf8'),
+    ) as { delegate?: { pid?: unknown } }
+    const delegatePid = Number(identity.delegate?.pid)
+    expect(Number.isInteger(delegatePid) && delegatePid > 0).toBe(true)
+    const trackedGroup = snapshotFixtureGroup(delegatePid)
+
+    process.kill(first.pid, 'SIGTERM')
+    deadline = Date.now() + 3_000
+    while (!existsSync(setupTermObserved) && Date.now() < deadline) await Bun.sleep(10)
+    expect(existsSync(setupTermObserved)).toBe(true)
+    expect(() => process.kill(delegatePid, 0)).not.toThrow()
+    process.kill(first.pid, 'SIGKILL')
+    await first.exited
+
+    const second = runUpdater(fixture, ['--recover-only'])
+    expect(second.exitCode).toBe(1)
+    expect(second.stderr.toString()).toContain('所有者を確認できません')
+    expect(existsSync(rollbackSetupCompleted)).toBe(false)
+
+    await stopFixtureGroup(delegatePid, trackedGroup)
+    deadline = Date.now() + 5_000
+    while (Date.now() < deadline) {
+      try { process.kill(delegatePid, 0); await Bun.sleep(10) } catch { break }
+    }
+    const recovered = runUpdater(fixture, ['--recover-only'])
+    expect(recovered.exitCode).toBe(1)
+    expect(recovered.stderr.toString()).toContain('所有者を確認できません')
+    expect(existsSync(rollbackSetupCompleted)).toBe(false)
+    expect(existsSync(join(fixture.state, 'update.lock/pid'))).toBe(true)
+  }, 20_000)
 
   test('origin/codexへ未反映のlocal commitがあれば停止する', () => {
     const fixture = updaterFixture()

@@ -23,6 +23,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'path'
 import { WebClient } from '@slack/web-api'
 import {
   artifactDirForJob,
+  CodexCleanupPendingError,
   CodexInterruptedError,
   CodexRateLimitError,
   executeCodexJob,
@@ -60,6 +61,11 @@ import {
   readProcessIdentity,
   type ProcessIdentity,
 } from './process-tree.ts'
+import {
+  readBootSession,
+  signalProcessGroupIfLeaderLive,
+  signalProcessIfLive,
+} from './process-generation.ts'
 
 export const SERIAL_WORKER_COUNT = 1 as const
 export const JOB_RUNNER_HANDSHAKE = 'zerokun-codex-runner-v1' as const
@@ -1190,7 +1196,7 @@ export class JobStore {
       return this.get(row.id)
     })
 
-    return claim.immediate(workerId, now)
+    return retrySqlite(() => claim.immediate(workerId, now))
   }
 
   complete(id: string, sessionId: string, result: string): void {
@@ -1226,30 +1232,30 @@ export class JobStore {
   }
 
   saveSession(id: string, sessionId: string): void {
-    this.db.run(
+    retrySqlite(() => this.db.run(
       `UPDATE jobs SET session_id = ? WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
       [requireText(sessionId, 'sessionId'), id],
-    )
+    ))
   }
 
   saveExecutorPid(id: string, executorPid: number): void {
     if (!Number.isInteger(executorPid) || executorPid <= 0) {
       throw new Error('invalid executor PID: ' + executorPid)
     }
-    const updated = this.db.run(
+    const updated = retrySqlite(() => this.db.run(
       `UPDATE jobs SET executor_pid = ?
        WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
       [executorPid, id],
-    )
+    ))
     if (updated.changes !== 1) throw new Error('job is no longer running: ' + id)
   }
 
   clearExecutorPid(id: string, executorPid: number): void {
-    this.db.run(
+    retrySqlite(() => this.db.run(
       `UPDATE jobs SET executor_pid = NULL
        WHERE id = ? AND runtime = 'codex' AND status = 'running' AND executor_pid = ?`,
       [id, executorPid],
-    )
+    ))
   }
 
   clearSession(id: string): void {
@@ -1548,17 +1554,17 @@ export class JobStore {
   }
 
   requeue(id: string, reason: string): void {
-    this.db.run(
+    retrySqlite(() => this.db.run(
       `UPDATE jobs
        SET status = 'queued', worker_id = NULL, started_at = NULL,
            executor_pid = NULL, not_before = NULL, finished_at = NULL, last_error = ?
        WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
       [reason, id],
-    )
+    ))
   }
 
   releaseUnstartedClaim(id: string, workerId: string, reason: string): boolean {
-    return this.db.run(
+    return retrySqlite(() => this.db.run(
       `UPDATE jobs
        SET status = 'queued',
            worker_id = NULL,
@@ -1573,18 +1579,18 @@ export class JobStore {
        WHERE id = ? AND runtime = 'codex' AND status = 'running'
          AND worker_id = ? AND executor_pid IS NULL`,
       [reason, id, workerId],
-    ).changes === 1
+    ).changes === 1)
   }
 
   requeueAt(id: string, notBefore: number, reason: string, sessionId?: string): void {
-    this.db.run(
+    retrySqlite(() => this.db.run(
       `UPDATE jobs
        SET status = 'queued', worker_id = NULL, started_at = NULL,
            executor_pid = NULL, session_id = COALESCE(?, session_id), not_before = ?,
            finished_at = NULL, last_error = ?
        WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
       [sessionId ?? null, notBefore, reason, id],
-    )
+    ))
   }
 
   recoverInterrupted(): { requeued: number; failedWrites: number } {
@@ -1790,6 +1796,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       scheduleTerminalFlush()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof CodexCleanupPendingError) throw error
       if (error instanceof CodexInterruptedError || options.signal?.aborted) {
         if (job.writeEnabled) {
           const uncertain = 'write-enabled job was interrupted after execution began; '
@@ -2325,38 +2332,99 @@ export function updateTransactionPending(journalFile: string): boolean {
   }
 }
 
-function processStateIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-  } catch {
-    return false
-  }
-  const state = Bun.spawnSync(
-    ['/bin/ps', '-o', 'state=', '-p', String(pid)],
-    { stdout: 'pipe', stderr: 'ignore' },
-  )
-  const value = new TextDecoder().decode(state.stdout).trim().toUpperCase()
-  return state.exitCode === 0 && value.length > 0 && !value.startsWith('Z')
+export type FallbackProcessState = 'alive' | 'dead' | 'unknown'
+
+export function classifyFallbackProcessState(
+  signalProbe: 'present' | 'missing' | 'unknown',
+  psExitCode: number,
+  psState: string,
+): FallbackProcessState {
+  if (signalProbe === 'missing') return 'dead'
+  if (signalProbe === 'unknown') return 'unknown'
+  const value = psState.trim().toUpperCase()
+  if (psExitCode !== 0 || value.length === 0) return 'unknown'
+  return value.startsWith('Z') ? 'dead' : 'alive'
 }
 
-function trackedExecutorCommand(pid: number): string {
+function fallbackProcessState(pid: number): FallbackProcessState {
+  try {
+    process.kill(pid, 0)
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH' ? 'dead' : 'unknown'
+  }
+  try {
+    const state = Bun.spawnSync(
+      ['/bin/ps', '-o', 'state=', '-p', String(pid)],
+      { stdout: 'pipe', stderr: 'ignore' },
+    )
+    return classifyFallbackProcessState(
+      'present', state.exitCode, new TextDecoder().decode(state.stdout),
+    )
+  } catch {
+    return 'unknown'
+  }
+}
+
+export function classifyExecutorCommandProbe(
+  exitCode: number,
+  command: string,
+): { status: 'known'; command: string } | { status: 'unknown' } {
+  const value = command.trim()
+  return exitCode === 0 && value.length > 0
+    ? { status: 'known', command: value }
+    : { status: 'unknown' }
+}
+
+function trackedExecutorCommand(
+  pid: number,
+): { status: 'known'; command: string } | { status: 'unknown' } {
   const result = Bun.spawnSync(
     ['/bin/ps', '-ww', '-o', 'command=', '-p', String(pid)],
     { stdout: 'pipe', stderr: 'ignore' },
   )
-  return result.exitCode === 0 ? new TextDecoder().decode(result.stdout) : ''
+  return classifyExecutorCommandProbe(
+    result.exitCode,
+    result.stdout ? new TextDecoder().decode(result.stdout) : '',
+  )
+}
+
+function legacyExecutorIdentity(pid: number): { started: string; pgid: number } | undefined {
+  const result = Bun.spawnSync(
+    ['/bin/ps', '-o', 'state=', '-o', 'pgid=', '-o', 'lstart=', '-p', String(pid)],
+    {
+      stdout: 'pipe', stderr: 'ignore',
+      // The previous release wrote `ps lstart` in the machine's ambient
+      // timezone. Keep that exact compatibility rule during the one-time
+      // legacy reconciliation; forcing UTC makes every non-UTC record stale.
+      env: { PATH: '/usr/bin:/bin', LC_ALL: 'C', LANG: 'C' },
+    },
+  )
+  if (result.exitCode !== 0) return undefined
+  const match = /^\s*(\S+)\s+(\d+)\s+(.+?)\s*$/.exec(result.stdout.toString())
+  if (!match || match[1]!.toUpperCase().startsWith('Z')) return undefined
+  const pgid = Number(match[2])
+  return Number.isSafeInteger(pgid) && pgid > 0
+    ? { pgid, started: match[3]! }
+    : undefined
 }
 
 function signalTrackedExecutor(identity: ProcessIdentity, signal: NodeJS.Signals): void {
   if (!processIdentityIsLive(identity)) return
-  if (process.platform !== 'win32' && identity.pgid === identity.pid) {
-    try {
-      process.kill(-identity.pgid, signal)
-      return
-    } catch {}
+  if (identity.pgid === identity.pid
+    && signalProcessGroupIfLeaderLive(identity, signal)) return
+  signalProcessIfLive(identity, signal)
+}
+
+function registeredProcessGroupState(groupId: number): FallbackProcessState {
+  if (process.platform === 'win32' || !Number.isSafeInteger(groupId) || groupId <= 1) {
+    return 'unknown'
   }
-  if (!processIdentityIsLive(identity)) return
-  try { process.kill(identity.pid, signal) } catch {}
+  try {
+    process.kill(-groupId, 0)
+    return 'alive'
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH' ? 'dead' : 'unknown'
+  }
 }
 
 export async function terminateTrackedExecutors(
@@ -2365,7 +2433,15 @@ export async function terminateTrackedExecutors(
   timeoutMs = 5_000,
   stateDirectory = stateDir(),
 ): Promise<void> {
-  const registrations = new Map<number, { jobId: string; path?: string; started?: string }>()
+  const registrations = new Map<number, {
+    jobId: string
+    path?: string
+    pgid?: number
+    started?: string
+    bootSession?: string
+    startSec?: number
+    startUsec?: number
+  }>()
   for (const job of store.runningJobs()) {
     if (job.executorPid !== null) registrations.set(job.executorPid, { jobId: job.id })
   }
@@ -2387,7 +2463,11 @@ export async function terminateTrackedExecutors(
       const value = JSON.parse(readFileSync(path, 'utf8')) as {
         jobId?: string
         pid?: number
+        pgid?: number
         started?: string
+        bootSession?: string
+        startSec?: number
+        startUsec?: number
       }
       if (typeof value.jobId !== 'string' || !Number.isInteger(value.pid) || Number(value.pid) <= 0) {
         throw new Error(`invalid executor registration: ${path}`)
@@ -2395,25 +2475,94 @@ export async function terminateTrackedExecutors(
       if (value.started !== undefined && (typeof value.started !== 'string' || !value.started)) {
         throw new Error(`invalid executor registration identity: ${path}`)
       }
-      registrations.set(Number(value.pid), { jobId: value.jobId, path, started: value.started })
+      const preciseCount = [value.bootSession, value.startSec, value.startUsec]
+        .filter(item => item !== undefined).length
+      if (preciseCount !== 0 && (preciseCount !== 3
+        || typeof value.bootSession !== 'string'
+        || !Number.isSafeInteger(value.startSec) || Number(value.startSec) <= 0
+        || !Number.isSafeInteger(value.startUsec) || Number(value.startUsec) < 0
+        || Number(value.startUsec) > 999_999)) {
+        throw new Error(`invalid executor registration generation: ${path}`)
+      }
+      if (preciseCount === 3 && (!Number.isSafeInteger(value.pgid)
+        || Number(value.pgid) !== Number(value.pid))) {
+        throw new Error(`invalid executor process group: ${path}`)
+      }
+      registrations.set(Number(value.pid), {
+        jobId: value.jobId,
+        path,
+        ...(value.pgid !== undefined ? { pgid: Number(value.pgid) } : {}),
+        started: value.started,
+        ...(preciseCount === 3 ? {
+          bootSession: value.bootSession,
+          startSec: value.startSec,
+          startUsec: value.startUsec,
+        } : {}),
+      })
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
 
   for (const [pid, registration] of registrations) {
+    const legacyRegistration = Boolean(registration.path && (!registration.bootSession
+      || registration.startSec === undefined || registration.startUsec === undefined))
+    if (!legacyRegistration && registration.bootSession) {
+      const currentBoot = readBootSession()
+      if (!currentBoot) {
+        throw new Error(`executor PID ${pid}のboot sessionを確認できません`)
+      }
+      if (currentBoot !== registration.bootSession) {
+        store.clearExecutorPid(registration.jobId, pid)
+        if (registration.path) rmSync(registration.path, { force: true })
+        continue
+      }
+    }
     const initialIdentity = readProcessIdentity(pid)
     if (!initialIdentity) {
+      if (fallbackProcessState(pid) !== 'dead') {
+        throw new Error(`executor PID ${pid}のprecise generationを確認できません`)
+      }
+      if (!legacyRegistration && registration.pgid === pid) {
+        const group = registeredProcessGroupState(registration.pgid)
+        if (group !== 'dead') {
+          throw new Error(`executor group ${registration.pgid}の終了を確認できません: ${group}`)
+        }
+      }
+      store.clearExecutorPid(registration.jobId, pid)
       if (registration.path) rmSync(registration.path, { force: true })
       continue
     }
-    if (registration.started && registration.started !== initialIdentity.started) {
+    let initialLegacy: { started: string; pgid: number } | undefined
+    let legacyIdentityMismatch = false
+    if (legacyRegistration) {
+      initialLegacy = legacyExecutorIdentity(pid)
+      if (!initialLegacy) {
+        throw new Error(`legacy executor PID ${pid}のidentityを確認できません`)
+      }
+      legacyIdentityMismatch = !registration.started
+        || registration.started !== initialLegacy.started
+        || initialLegacy.pgid !== initialIdentity.pgid
+    } else if ((registration.started && registration.started !== initialIdentity.started)
+      || (registration.bootSession && (registration.bootSession !== initialIdentity.bootSession
+        || registration.startSec !== initialIdentity.startSec
+        || registration.startUsec !== initialIdentity.startUsec))) {
+      if (registration.pgid === pid && initialIdentity.pgid !== pid) {
+        const group = registeredProcessGroupState(registration.pgid)
+        if (group !== 'dead') {
+          throw new Error(`stale executor group ${registration.pgid}の終了を確認できません: ${group}`)
+        }
+      }
       log(`discarding stale executor PID ${pid} for job ${registration.jobId}: start identity mismatch`)
       store.clearExecutorPid(registration.jobId, pid)
       if (registration.path) rmSync(registration.path, { force: true })
       continue
     }
-    const command = trackedExecutorCommand(pid)
+    const commandProbe = trackedExecutorCommand(pid)
+    if (commandProbe.status === 'unknown') {
+      throw new Error(`executor PID ${pid}のcommandを確認できません`)
+    }
+    const command = commandProbe.command
     const supervised = command.includes('codex-supervisor') && command.includes(registration.jobId)
     const legacyDirect = command.includes(registration.jobId)
       && /(?:^|[\/\s])codex(?:[\/\s]|$)|codex-cli/i.test(command)
@@ -2426,9 +2575,16 @@ export async function terminateTrackedExecutors(
       if (registration.path) rmSync(registration.path, { force: true })
       continue
     }
+    if (legacyIdentityMismatch) {
+      throw new Error(`legacy executor PID ${pid}のstart identityが一致しません`)
+    }
     const signalIdentity = readProcessIdentity(pid)
+    const signalLegacy = legacyRegistration ? legacyExecutorIdentity(pid) : undefined
     if (!signalIdentity || signalIdentity.started !== initialIdentity.started
-      || signalIdentity.pgid !== initialIdentity.pgid) {
+      || signalIdentity.pgid !== initialIdentity.pgid
+      || (legacyRegistration && (!signalLegacy || !initialLegacy
+        || signalLegacy.started !== initialLegacy.started
+        || signalLegacy.pgid !== initialLegacy.pgid))) {
       log(`discarding stale executor PID ${pid} for job ${registration.jobId}: identity changed before signal`)
       store.clearExecutorPid(registration.jobId, pid)
       if (registration.path) rmSync(registration.path, { force: true })
@@ -2447,6 +2603,7 @@ export async function terminateTrackedExecutors(
     if (processIdentityIsLive(signalIdentity)) {
       throw new Error(`orphaned Codex executor PID ${pid} did not stop`)
     }
+    store.clearExecutorPid(registration.jobId, pid)
     if (registration.path) rmSync(registration.path, { force: true })
   }
 }

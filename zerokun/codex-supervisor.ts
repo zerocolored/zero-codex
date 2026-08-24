@@ -12,7 +12,9 @@ import {
   captureTrackedProcesses,
   readProcessIdentity,
   reapTrackedProcesses,
+  seedTrackedProcess,
 } from './process-tree.ts'
+import { signalProcessIfLive } from './process-generation.ts'
 
 function relayStream(
   stream: ReadableStream<Uint8Array>,
@@ -90,13 +92,22 @@ async function main(): Promise<void> {
   const temporary = `${registrationPath}.${process.pid}.${randomUUID()}.tmp`
   const supervisorIdentity = readProcessIdentity(process.pid)
   if (!supervisorIdentity) throw new Error('supervisor process identityを取得できません')
+  if (supervisorIdentity.pgid !== supervisorIdentity.pid) {
+    throw new Error('supervisorが独立process group leaderではありません')
+  }
   writeFileSync(temporary, JSON.stringify({
+    version: 2,
+    cleanupPending: true,
     jobId,
     pid: supervisorIdentity.pid,
     pgid: supervisorIdentity.pgid,
     started: supervisorIdentity.started,
+    bootSession: supervisorIdentity.bootSession,
+    startSec: supervisorIdentity.startSec,
+    startUsec: supervisorIdentity.startUsec,
   }), { mode: 0o600, flag: 'wx' })
   renameSync(temporary, registrationPath)
+  let cleanupConfirmed = false
   try {
     const child = Bun.spawn([codexBin, ...args], {
       cwd: process.cwd(),
@@ -109,18 +120,21 @@ async function main(): Promise<void> {
       stdout: 'pipe',
       stderr: 'pipe',
     })
+    const seedDelayMs = Number(process.env.ZEROKUN_SUPERVISOR_TEST_SEED_DELAY_MS)
+    if (Number.isFinite(seedDelayMs) && seedDelayMs > 0) await Bun.sleep(seedDelayMs)
+    const tracked = new Map<number, string>([[process.pid, supervisorIdentity.started]])
+    const childIdentity = seedTrackedProcess(child.pid, tracked)
     const stdoutRelay = relayStream(child.stdout, process.stdout)
     const stderrRelay = relayStream(child.stderr, process.stderr)
     const relayCompletion = Promise.allSettled([stdoutRelay.done, stderrRelay.done])
-    const tracked = new Map<number, string>()
     const excluded = new Set([process.pid])
     let tracking = true
     let trackingError: unknown
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined
     const terminateChild = () => {
-      try { child.kill('SIGTERM') } catch {}
+      signalProcessIfLive(childIdentity, 'SIGTERM')
       forceKillTimer ??= setTimeout(() => {
-        try { child.kill('SIGKILL') } catch {}
+        signalProcessIfLive(childIdentity, 'SIGKILL')
       }, 5_000)
     }
     const tracker = (async () => {
@@ -161,16 +175,32 @@ async function main(): Promise<void> {
     if (remaining.length > 0) {
       throw new Error(`Codexの子processを回収できませんでした: ${remaining.join(', ')}`)
     }
+    if (trackingError) throw trackingError
+    cleanupConfirmed = true
     if (!relayResults) throw new Error('Codex output relay did not stop after cancellation')
     const relayFailure = relayResults.find(result => result.status === 'rejected')
     if (relayFailure?.status === 'rejected') throw relayFailure.reason
-    if (trackingError) throw trackingError
     process.exitCode = exitCode
+  } catch (error) {
+    if (cleanupConfirmed) throw error
+    // Keep the exact group leader and durable registration alive whenever
+    // cleanup is uncertain. The executor/next runner can then TERM and KILL
+    // the still-verifiable group without following a recycled numeric PGID.
+    process.stderr.write(
+      `Codex cleanup is pending; retaining supervisor registration: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`,
+    )
+    process.removeAllListeners('SIGINT')
+    process.removeAllListeners('SIGTERM')
+    process.on('SIGINT', () => {})
+    process.on('SIGTERM', () => {})
+    while (true) await Bun.sleep(60_000)
   } finally {
-    try {
-      const current = JSON.parse(readFileSync(registrationPath, 'utf8')) as { pid?: number }
-      if (current.pid === process.pid) rmSync(registrationPath, { force: true })
-    } catch {}
+    if (cleanupConfirmed) {
+      try {
+        const current = JSON.parse(readFileSync(registrationPath, 'utf8')) as { pid?: number }
+        if (current.pid === process.pid) rmSync(registrationPath, { force: true })
+      } catch {}
+    }
   }
 }
 

@@ -41,6 +41,9 @@ function setupTestPath(fakeHome: string, botAppId?: string): string {
     '  echo "Slack App token identity: verified"',
     '  exit 0',
     'fi',
+    'if [[ "$*" == *"update.ts --setup-supervisor"* ]]; then',
+    `  exec ${JSON.stringify(process.execPath)} --config=/dev/null --no-env-file -e ${JSON.stringify(`import { runStandaloneSetupForTests } from ${JSON.stringify(join(import.meta.dir, 'update.ts'))}; await runStandaloneSetupForTests()`)}`,
+    'fi',
     `exec ${JSON.stringify(process.execPath)} "$@"`,
     '',
   ].join('\n'), { mode: 0o700 })
@@ -362,7 +365,12 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('xcode-select --install')
     expect(script).toContain('Homebrew/install/HEAD/install.sh')
     expect(script).toContain('isolated_network_command "$(command -v brew)" install tmux')
-    expect(script).toContain('isolated_network_command "$(command -v brew)" install --cask codex')
+    expect(script).not.toContain('install --cask codex')
+    expect(script).toContain('standalone_codex="$HOME/.local/bin/codex"')
+    expect(script).toContain('secure_standalone_codex()')
+    expect(script).toContain('.codex/packages/standalone/releases/')
+    expect(script).toContain("permissions & 8#22")
+    expect(script).toContain('feedfacf|cffaedfe')
     expect(script).toContain('https://chatgpt.com/codex/install.sh')
     expect(script).not.toContain('claude auth login')
     expect(script).toContain('codex login')
@@ -382,9 +390,12 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('Slack bot username')
     expect(script).toContain('xoxb-[A-Za-z0-9._-]{10,}')
     expect(script).toContain('xapp-[A-Za-z0-9._-]{10,}')
+    const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
+    expect(setup.indexOf('RUNNER_PID="$(read_lock_pid'))
+      .toBeLessThan(setup.indexOf('GATEWAY_PID="$(read_lock_pid'))
   })
 
-  test('Homebrew版が最低version未満ならCodex公式standaloneへfallbackする', () => {
+  test('Homebrew版が存在してもowner-onlyなCodex公式standaloneを配置する', () => {
     const source = readFileSync(bootstrap, 'utf8')
     const functions = source.slice(
       source.indexOf('secure_download()'),
@@ -422,7 +433,7 @@ ok() { :; }
 warn() { :; }
 fail() { echo "$1" >&2; exit 1; }
 append_profile_block() { :; }
-codex_version_number() { codex --version | sed -nE 's/.*[^0-9]([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/p' | head -n 1; }
+codex_version_number() { "\${1:-codex}" --version | sed -nE 's/.*[^0-9]([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/p' | head -n 1; }
 version_at_least() {
   local actual="$1" minimum="$2" index left right
   for index in 1 2 3; do
@@ -436,6 +447,7 @@ version_at_least() {
   return 0
 }
 ${functions.replaceAll('/usr/bin/curl', fakeCurl)}
+secure_standalone_codex() { [ -x "$HOME/.local/bin/codex" ]; }
 install_cli_tools
 codex --version
 `)
@@ -455,6 +467,45 @@ codex --version
       rmSync(base, { recursive: true, force: true })
     }
   })
+
+  test.skipIf(process.platform !== 'darwin')(
+    'standalone検証は安全なrelease配下のnative実体だけを許可する',
+    () => {
+      const source = readFileSync(bootstrap, 'utf8')
+      const functions = source.slice(
+        source.indexOf('bootstrap_safe_directory_chain()'),
+        source.indexOf('install_codex_standalone()'),
+      )
+      const base = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-secure-codex-'))
+      const fakeHome = join(base, 'home')
+      const localBin = join(fakeHome, '.local/bin')
+      const release = join(fakeHome, '.codex/packages/standalone/releases/0.149.0')
+      mkdirSync(localBin, { recursive: true })
+      mkdirSync(release, { recursive: true })
+      const native = join(release, 'codex')
+      writeFileSync(native, Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]), { mode: 0o700 })
+      symlinkSync(native, join(localBin, 'codex'))
+      const harness = join(base, 'harness.sh')
+      writeFileSync(harness, `#!/bin/bash\nset -euo pipefail\n${functions}\nsecure_standalone_codex\n`)
+      chmodSync(harness, 0o700)
+      try {
+        const accepted = Bun.spawnSync([harness], {
+          env: { HOME: realpathSync(fakeHome), PATH: '/usr/bin:/bin' },
+          stdout: 'pipe', stderr: 'pipe',
+        })
+        expect(accepted.exitCode, accepted.stderr.toString()).toBe(0)
+        rmSync(join(localBin, 'codex'))
+        writeFileSync(join(localBin, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+        const rejected = Bun.spawnSync([harness], {
+          env: { HOME: realpathSync(fakeHome), PATH: '/usr/bin:/bin' },
+          stdout: 'pipe', stderr: 'pipe',
+        })
+        expect(rejected.exitCode).not.toBe(0)
+      } finally {
+        rmSync(base, { recursive: true, force: true })
+      }
+    },
+  )
 
   test('単体download bootstrapの再実行は未検証checkout内のvalidatorを直接実行しない', () => {
     const source = readFileSync(bootstrap, 'utf8')
@@ -774,6 +825,8 @@ codex --version
       run(['git', 'init', '--initial-branch=main', seed])
       run(['git', 'config', 'user.email', 'test@example.com'], seed)
       run(['git', 'config', 'user.name', 'test'], seed)
+      mkdirSync(join(seed, 'zerokun'), { recursive: true })
+      writeFileSync(join(seed, 'zerokun', 'setup.sh'), '# safe update delegate\n--setup-supervisor\n')
       writeFileSync(join(seed, 'version.txt'), 'main-v1\n')
       run(['git', 'add', '.'], seed)
       run(['git', 'commit', '-m', 'main v1'], seed)
@@ -814,6 +867,66 @@ codex --version
       expect(run(['git', 'rev-parse', 'HEAD'], repo)).toBe(run(['git', 'rev-parse', 'origin/main'], repo))
       expect(run(['git', 'config', 'branch.main.remote'], repo)).toBe('origin')
       expect(run(['git', 'config', 'branch.main.merge'], repo)).toBe('refs/heads/main')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('atomic setup delegate前の既存cloneはfetchせず別repo-dirを要求する', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-old-checkout-'))
+    const bare = join(dir, 'remote.git')
+    const seed = join(dir, 'seed')
+    const repo = join(dir, 'zero')
+    const run = (args: string[], cwd?: string) => {
+      const result = Bun.spawnSync(args, { cwd, stdout: 'pipe', stderr: 'pipe' })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      return result.stdout.toString().trim()
+    }
+    try {
+      run(['git', 'init', '--bare', '--initial-branch=main', bare])
+      run(['git', 'init', '--initial-branch=main', seed])
+      run(['git', 'config', 'user.email', 'test@example.com'], seed)
+      run(['git', 'config', 'user.name', 'test'], seed)
+      writeFileSync(join(seed, 'version.txt'), 'old-v1\n')
+      run(['git', 'add', '.'], seed)
+      run(['git', 'commit', '-m', 'old v1'], seed)
+      run(['git', 'remote', 'add', 'origin', bare], seed)
+      run(['git', 'push', '-u', 'origin', 'main'], seed)
+      run(['git', 'clone', '--branch', 'main', bare, repo])
+      const originalHead = run(['git', 'rev-parse', 'HEAD'], repo)
+      writeFileSync(join(seed, 'version.txt'), 'new-v2\n')
+      run(['git', 'commit', '-am', 'new v2'], seed)
+      run(['git', 'push', 'origin', 'main'], seed)
+      run(['git', 'remote', 'set-url', 'origin', 'https://github.com/zerocolored/zero-codex.git'], repo)
+
+      const command = [
+        'bootstrap_path="$1"',
+        'target_repo="$2"',
+        'set --',
+        'source "$bootstrap_path"',
+        'ensure_repo zerocolored/zero-codex "$target_repo" main',
+      ].join('; ')
+      const fakePath = localRemoteGitTestPath(dir, bare)
+      const fakeGitPath = join(fakePath.split(':')[0]!, 'git')
+      const fakeCurlPath = validatorCurlTestBin(dir)
+      const patchedBootstrap = join(dir, 'bootstrap-macos.sh')
+      writeFileSync(
+        patchedBootstrap,
+        readFileSync(bootstrap, 'utf8')
+          .replaceAll('/usr/bin/git', fakeGitPath)
+          .replaceAll('/usr/bin/curl', fakeCurlPath),
+        { mode: 0o700 },
+      )
+      const result = Bun.spawnSync([
+        '/bin/bash', '-c', command, 'bash', patchedBootstrap, repo,
+      ], {
+        env: { ...process.env, PATH: fakePath },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr.toString()).toContain('空の別directoryを--repo-dir')
+      expect(run(['git', 'rev-parse', 'HEAD'], repo)).toBe(originalHead)
+      expect(run(['git', 'rev-parse', 'refs/remotes/origin/main'], repo)).toBe(originalHead)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -1102,6 +1215,7 @@ codex --version
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          PATH: setupTestPath(fakeHome),
         },
         stdout: 'pipe',
         stderr: 'pipe',
@@ -1131,6 +1245,7 @@ codex --version
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          PATH: setupTestPath(fakeHome),
         },
         stdout: 'pipe', stderr: 'pipe',
       })
@@ -1234,6 +1349,7 @@ codex --version
           SLACK_STATE_DIR: stateDir,
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_LAUNCHCTL_BIN: fakeLaunchctl,
+          PATH: setupTestPath(fakeHome),
         },
         stdout: 'pipe',
         stderr: 'pipe',
@@ -1575,7 +1691,7 @@ codex --version
         stdout: 'pipe', stderr: 'pipe',
       })
       expect(setup.exitCode, setup.stderr.toString()).toBe(0)
-      expect(setup.stdout.toString()).toContain('旧job runnerを安全に停止')
+      expect(setup.stdout.toString()).toContain('▶ Codex版standalone setup')
       expect(await legacyRunner.exited).toBe(0)
     } finally {
       if (legacyRunner) {
@@ -1644,8 +1760,7 @@ codex --version
         stderr: 'pipe',
       })
       expect(setup.exitCode, setup.stderr.toString()).toBe(0)
-      expect(setup.stdout.toString()).toContain('旧job runnerを安全に停止')
-      expect(setup.stdout.toString()).toContain('旧Slack gatewayを停止')
+      expect(setup.stdout.toString()).toContain('▶ Codex版standalone setup')
       await Promise.all([legacyRunner.exited, legacyGateway.exited])
 
       const runtimeInfo = Bun.spawnSync([

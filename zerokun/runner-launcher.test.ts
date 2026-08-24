@@ -2,15 +2,20 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import {
+  readProcessIdentity,
+  signalProcessGroupIfLeaderLive,
+  type ProcessIdentity,
+} from './process-generation.ts'
 
-const processGroups: number[] = []
+const processGroups: ProcessIdentity[] = []
 const directories: string[] = []
 
 afterEach(async () => {
-  for (const group of processGroups.splice(0)) {
-    try { process.kill(-group, 'SIGTERM') } catch {}
+  for (const leader of processGroups.splice(0)) {
+    signalProcessGroupIfLeaderLive(leader, 'SIGTERM')
     await Bun.sleep(50)
-    try { process.kill(-group, 'SIGKILL') } catch {}
+    signalProcessGroupIfLeaderLive(leader, 'SIGKILL')
   }
   for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
@@ -48,14 +53,16 @@ describe('detached runner launcher', () => {
     expect(launched.exitCode, launched.stderr.toString()).toBe(0)
     const leaderPid = Number(launched.stdout.toString().trim())
     expect(leaderPid).toBeGreaterThan(0)
-    processGroups.push(leaderPid)
+    const leaderIdentity = readProcessIdentity(leaderPid)
+    expect(leaderIdentity).toBeDefined()
+    processGroups.push(leaderIdentity!)
     for (let attempt = 0; attempt < 100 && !existsSync(pidFile); attempt += 1) await Bun.sleep(20)
     expect(existsSync(pidFile)).toBe(true)
     const runnerPid = Number(readFileSync(pidFile, 'utf8'))
     expect(processGroup(leaderPid)).toBe(leaderPid)
     expect(processGroup(runnerPid)).toBe(leaderPid)
     expect(processGroup(process.pid)).not.toBe(leaderPid)
-    process.kill(-leaderPid, 'SIGINT')
+    expect(signalProcessGroupIfLeaderLive(leaderIdentity!, 'SIGINT')).toBe(true)
     await Bun.sleep(100)
     expect(() => process.kill(runnerPid, 0)).not.toThrow()
   })
