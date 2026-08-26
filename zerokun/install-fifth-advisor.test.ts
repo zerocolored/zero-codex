@@ -438,6 +438,33 @@ describe('fifth-advisor helper installer', () => {
     expect(JSON.parse(result.stdout.toString())).toEqual({ path: 'strict-trust' })
   })
 
+  test('Claude 2.1.246の警告付きtrust画面だけを完全一致で受理する', () => {
+    const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
+    const program = [
+      'import importlib.util,json,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'root="/tmp/project"',
+      'screen="\\n".join([',
+      ' "Accessing workspace:",',
+      ' root,',
+      ' "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what\'s in this folder first.",',
+      ' "Claude Code\'ll be able to read, edit, and execute files here.",',
+      ' "Security guide",',
+      ' "❯ 1. Yes, I trust this folder",',
+      ' "  2. No, exit",',
+      ' "Enter to confirm · Esc to cancel",',
+      '])',
+      'print(json.dumps({"exact":module._strict_trust_screen(screen,root),"changed":module._strict_trust_screen(screen.replace("Security guide","Security overview"),root)},sort_keys=True))',
+    ].join('\n')
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], {
+      stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout.toString())).toEqual({ changed: false, exact: true })
+  })
+
   test('sendは本文をprocess argvへ載せずowner-only Herdr socketへ1回だけ送る', async () => {
     const home = fixture()
     const { project, request } = gitProject(home)

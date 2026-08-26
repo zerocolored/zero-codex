@@ -1828,7 +1828,7 @@ def _strict_trust_screen(text: str, project_root: str) -> bool:
         if normalized:
             semantic_lines.append(normalized)
     observed = " ".join(semantic_lines)
-    expected = " ".join(
+    legacy_expected = " ".join(
         (
             "Accessing workspace:",
             project_root,
@@ -1838,7 +1838,21 @@ def _strict_trust_screen(text: str, project_root: str) -> bool:
             "Enter to confirm · Esc to cancel",
         )
     )
-    return observed == expected
+    claude_2_1_246_expected = " ".join(
+        (
+            "Accessing workspace:",
+            project_root,
+            "Quick safety check: Is this a project you created or one you trust? "
+            "(Like your own code, a well-known open source project, or work from your team). "
+            "If not, take a moment to review what's in this folder first.",
+            "Claude Code'll be able to read, edit, and execute files here.",
+            "Security guide",
+            "1. Yes, I trust this folder",
+            "2. No, exit",
+            "Enter to confirm · Esc to cancel",
+        )
+    )
+    return observed in {legacy_expected, claude_2_1_246_expected}
 
 
 def _settle_after_trust(
