@@ -18,6 +18,8 @@ import { readProcessIdentity } from './process-tree.ts'
 import { signalProcessIfLive } from './process-generation.ts'
 import {
   advanceAdvisorReceipt,
+  assertClaudeSubscriptionLogin,
+  brokerEnvironment,
   claudeSubscriptionStatusIsReady,
   createExclusivePrivateFile,
   decodeHerdrReadOutput,
@@ -251,6 +253,41 @@ async function brokerFixture(): Promise<BrokerFixture> {
 }
 
 describe('advisor broker boundaries', () => {
+  test('Claude認証preflightへOSユーザー文脈を渡しAPI credentialは継承しない', async () => {
+    const root = fixtureDir()
+    const fakeClaude = join(root, 'claude')
+    writeFileSync(fakeClaude, [
+      '#!/bin/sh',
+      'if [ -n "${USER:-}" ] && [ "$USER" = "${LOGNAME:-}" ] && [ -n "${SHELL:-}" ] && [ -n "${TMPDIR:-}" ]; then',
+      '  printf \'%s\\n\' \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\'',
+      'else',
+      '  printf \'%s\\n\' \'{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty","subscriptionType":null}\'',
+      'fi',
+      '',
+    ].join('\n'), { mode: 0o700 })
+
+    const environment = {
+      ...brokerEnvironment(),
+      ZEROKUN_CLAUDE_BIN_PATH: fakeClaude,
+    }
+    expect(environment.USER).toBe(environment.LOGNAME)
+    expect(environment.USER).not.toBe('')
+    expect(environment.SHELL).not.toBe('')
+    expect(environment.TMPDIR).not.toBe('')
+    expect(environment.ANTHROPIC_API_KEY).toBeUndefined()
+    expect(environment.XAI_API_KEY).toBeUndefined()
+    await expect(assertClaudeSubscriptionLogin(environment)).resolves.toBeUndefined()
+
+    const missingUserContext = { ...environment }
+    delete missingUserContext.USER
+    delete missingUserContext.LOGNAME
+    delete missingUserContext.SHELL
+    delete missingUserContext.TMPDIR
+    await expect(assertClaudeSubscriptionLogin(missingUserContext)).rejects.toThrow(
+      'first-party subscription',
+    )
+  })
+
   test('Claudeはfirst-party subscription statusだけを実行時に受理する', () => {
     expect(claudeSubscriptionStatusIsReady({
       loggedIn: true,

@@ -16,7 +16,7 @@ import {
   writeFileSync,
   writeSync,
 } from 'fs'
-import { homedir } from 'os'
+import { homedir, tmpdir, userInfo } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -463,9 +463,14 @@ export async function runBounded(
   }
 }
 
-function brokerEnvironment(runtime?: HerdrRuntimeIdentity): Record<string, string> {
+export function brokerEnvironment(runtime?: HerdrRuntimeIdentity): Record<string, string> {
+  const account = userInfo()
   const environment: Record<string, string> = {
-    HOME: homedir(),
+    HOME: account.homedir || homedir(),
+    USER: account.username,
+    LOGNAME: account.username,
+    SHELL: account.shell || '/bin/zsh',
+    TMPDIR: tmpdir(),
     PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
     LANG: process.env.LANG ?? 'en_US.UTF-8',
     LC_ALL: process.env.LC_ALL ?? process.env.LANG ?? 'en_US.UTF-8',
@@ -511,7 +516,7 @@ export function claudeSubscriptionStatusIsReady(value: unknown): boolean {
     && status.subscriptionType.length > 0
 }
 
-async function assertClaudeSubscriptionLogin(
+export async function assertClaudeSubscriptionLogin(
   environment: Record<string, string>,
 ): Promise<void> {
   const executable = environment.ZEROKUN_CLAUDE_BIN_PATH
