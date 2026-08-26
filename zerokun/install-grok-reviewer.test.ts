@@ -334,7 +334,7 @@ describe('dedicated Grok reviewer installer', () => {
       '',
       new Uint8Array([0]),
       new Uint8Array([0xc3, 0x28]),
-      new Uint8Array(512 * 1024 + 1),
+      new Uint8Array(2 * 1024 * 1024 + 1),
     ]) {
       const result = reviewSync(launcher, invalid, environment)
       expect(result.exitCode).toBe(64)

@@ -16,7 +16,31 @@ export {
   type ProcessIdentity,
 }
 
-const MAX_TRACKED_PROCESSES = 4_096
+export const MAX_TRACKED_PROCESSES = 4_096
+export const MAX_EXECUTOR_REGISTRATION_BYTES = 512 * 1024
+
+/**
+ * Keep the durable recovery ledger aligned with the exact generations that
+ * remain pinned by the live tracker. Confirmed-dead non-root generations no
+ * longer require cleanup and retaining them forever would turn process churn
+ * into an implicit lifetime limit for an otherwise unbounded job.
+ */
+export function synchronizeTrackedProcessLedger(
+  tracked: ReadonlyMap<number, string>,
+  ledger: Map<string, { pid: number; started: string }>,
+): void {
+  const currentKeys = new Set<string>()
+  for (const [pid, started] of tracked) currentKeys.add(`${pid}:${started}`)
+  for (const key of ledger.keys()) {
+    if (!currentKeys.has(key)) ledger.delete(key)
+  }
+  for (const [pid, started] of tracked) {
+    ledger.set(`${pid}:${started}`, { pid, started })
+  }
+  if (ledger.size > MAX_TRACKED_PROCESSES) {
+    throw new Error(`追跡process数が上限${MAX_TRACKED_PROCESSES}を超えました`)
+  }
+}
 
 /**
  * Pin a freshly spawned PID to its exact Darwin generation before it can
@@ -186,6 +210,10 @@ export async function reapTrackedProcesses(options: {
   termGraceMs?: number
   killWaitMs?: number
   signalGroup?: boolean
+  /** Normal cleanup waits without a wall-clock limit until explicit force is requested. */
+  waitForForce?: () => boolean
+  /** Records that live exact generations reached the bounded KILL phase. */
+  onForce?: () => void
 }): Promise<number[]> {
   const exclude = options.excludePids ?? new Set<number>()
   const initialTable = captureTrackedProcesses(
@@ -203,15 +231,24 @@ export async function reapTrackedProcesses(options: {
     'SIGTERM',
   )
 
-  const termDeadline = Date.now() + (options.termGraceMs ?? 1_000)
   let live = liveTrackedIdentities(options.tracked, exclude)
-  while (live.length > 0 && Date.now() < termDeadline) {
-    await Bun.sleep(25)
-    captureTrackedProcesses(options.rootPids, options.groupId, options.tracked, exclude)
-    live = liveTrackedIdentities(options.tracked, exclude)
+  if (options.waitForForce) {
+    while (live.length > 0 && !options.waitForForce()) {
+      await Bun.sleep(25)
+      captureTrackedProcesses(options.rootPids, options.groupId, options.tracked, exclude)
+      live = liveTrackedIdentities(options.tracked, exclude)
+    }
+  } else {
+    const termDeadline = Date.now() + (options.termGraceMs ?? 1_000)
+    while (live.length > 0 && Date.now() < termDeadline) {
+      await Bun.sleep(25)
+      captureTrackedProcesses(options.rootPids, options.groupId, options.tracked, exclude)
+      live = liveTrackedIdentities(options.tracked, exclude)
+    }
   }
   if (live.length === 0) return []
 
+  options.onForce?.()
   // TERM-time observations are never reused for delayed KILL. Both helpers
   // perform a fresh microsecond-generation read immediately before signaling.
   const killGroupSignaled = options.signalGroup !== false

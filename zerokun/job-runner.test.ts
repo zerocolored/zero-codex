@@ -35,9 +35,9 @@ import {
   finalizeSuccessfulExecution,
   persistExecutionResultJournal,
   readUploadableArtifact,
-  recoverExecutionCheckpointBeforeClaudeClear,
+  recoverExecutionCheckpointBeforeAdvisorCleanup,
   recoverExecutionResultJournals,
-  reconcileClaudeWithMonitorHealthBarrier,
+  reconcileAdvisorsWithMonitorHealthBarrier,
   runQueuedJobs,
   sealArtifactResult,
   SlackNotifier,
@@ -46,11 +46,13 @@ import {
   slackFileIsSharedInThread,
   slackRateLimitMessage,
   stateSlackTokenPairMatches,
+  synchronizeExecutorRecoveryLedger,
   terminateTrackedExecutors,
   updateIsRunning,
   updateTransactionPending,
   splitSlackChunks,
   type EnqueueInput,
+  type JobControlRecord,
   type JobRecord,
 } from './job-runner.ts'
 
@@ -88,7 +90,11 @@ import {
 } from './state-maintenance.ts'
 import { tryAcquireProcessLock } from './process-lock.ts'
 import { slackTokenPairRuntimeIdentity } from './slack-app-identity.ts'
-import { readProcessIdentity } from './process-tree.ts'
+import {
+  MAX_EXECUTOR_REGISTRATION_BYTES,
+  MAX_TRACKED_PROCESSES,
+  readProcessIdentity,
+} from './process-tree.ts'
 import { resolveOfficialStandaloneCodex } from './standalone-codex.ts'
 import {
   observeProcessGeneration,
@@ -96,10 +102,11 @@ import {
   signalProcessGroupIfLeaderLive,
   signalProcessIfLive,
 } from './process-generation.ts'
-import { ClaudeContextClearPendingError } from './claude-queue-boundary.ts'
+import { EphemeralClaudeCleanupPendingError } from './ephemeral-claude-session.ts'
 import { HerdrJobMonitorPendingError } from './herdr-job-monitor.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 import { readAdvisorInputSnapshot } from './advisor-input.ts'
+import { atomicWritePrivateFile } from './safe-file.ts'
 
 const temporaryDirs: string[] = []
 
@@ -117,6 +124,24 @@ function secureFixtureDir(prefix = '.zerokun-codex-test-'): string {
   const dir = mkdtempSync(join(homedir(), prefix))
   temporaryDirs.push(dir)
   return dir
+}
+
+async function waitForTestPath(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return
+    await Bun.sleep(10)
+  }
+  throw new Error(`test path did not appear: ${path}`)
+}
+
+async function waitForTestText(path: string, expected: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (existsSync(path) && readFileSync(path, 'utf8').includes(expected)) return
+    await Bun.sleep(10)
+  }
+  throw new Error(`test text did not appear in ${path}`)
 }
 
 function input(overrides: Partial<EnqueueInput> = {}): EnqueueInput {
@@ -569,12 +594,21 @@ describe('Codex job store', () => {
     const store = makeStore()
     const root = store.enqueue(input({ messageId: 'interrupt-race-root' })).job
     store.claimNext('serial-worker')
-    expect(store.stageInboundDelivery({
+    const activeTarget = store.liveControlTarget(root.chatId, root.threadTs)!
+    expect(store.stageInboundDeliveryForControl({
       ...input({ messageId: 'older-authorized-steer' }),
       chatId: root.chatId,
       threadTs: root.threadTs,
       text: '中止より前の追加入力',
-    })).toBe(true)
+    }, activeTarget)).toBe('bound')
+    expect(store.stageLiveControl(activeTarget, {
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      messageId: 'already-ready-steer',
+      userId: 'UOTHER',
+      task: '送信前の追加入力',
+      kind: 'steer',
+    })).toBe('staged')
     expect(store.stageInboundDelivery({
       ...input({ messageId: 'later-interrupt' }),
       chatId: root.chatId,
@@ -598,6 +632,10 @@ describe('Codex job store', () => {
 
     expect(store.inboundDeliveryCount()).toBe(0)
     expect(store.claimNextInboundDelivery()).toBeNull()
+    expect(store.listJobControls(root.id)).toEqual([
+      expect.objectContaining({ kind: 'steer', status: 'superseded', observedAt: null }),
+      expect.objectContaining({ kind: 'interrupt', status: 'ready', observedAt: null }),
+    ])
     expect(store.hasDurableEvent(`${root.chatId}:older-authorized-steer`)).toBe(true)
     expect(store.stageInboundDelivery({
       ...input({ messageId: 'older-authorized-steer' }),
@@ -614,13 +652,14 @@ describe('Codex job store', () => {
       messageId: 'write-interrupt-root', writeEnabled: true,
     })).job
     store.claimNext('serial-worker')
-    expect(store.stageInboundDelivery({
+    const activeTarget = store.liveControlTarget(root.chatId, root.threadTs)!
+    expect(store.stageInboundDeliveryForControl({
       ...input({ messageId: 'read-only-reply-before-stop' }),
       chatId: root.chatId,
       threadTs: root.threadTs,
       text: 'read-only userの返信',
       writeEnabled: false,
-    })).toBe(true)
+    }, activeTarget)).toBe('bound')
     expect(store.stageInboundDelivery({
       ...input({ messageId: 'write-job-stop' }),
       chatId: root.chatId,
@@ -642,6 +681,139 @@ describe('Codex job store', () => {
     store.completeInboundDelivery(interrupt.idempotencyKey)
     expect(store.claimNextInboundDelivery()).toBeNull()
     expect(store.hasDurableEvent(`${root.chatId}:read-only-reply-before-stop`)).toBe(true)
+    store.close()
+  })
+
+  test('seal後の通常入力は後続中止に削除されず後続FIFOとして残る', () => {
+    const store = makeStore()
+    const root = store.enqueue(input({ messageId: 'post-seal-stop-root' })).job
+    const running = store.claimNext('serial-worker')!
+    const activeTarget = store.liveControlTarget(root.chatId, root.threadTs)!
+    store.bindAppServerTurn(
+      running.id,
+      running.workerId!,
+      activeTarget.epoch,
+      'nonce-post-seal-stop',
+      'thread-post-seal-stop',
+      'turn-post-seal-stop',
+    )
+    expect(store.finishAppServerTurn({
+      jobId: running.id,
+      epoch: activeTarget.epoch,
+      executorNonce: 'nonce-post-seal-stop',
+      threadId: 'thread-post-seal-stop',
+      turnId: 'turn-post-seal-stop',
+    })).toEqual({ closeInput: true, cancelled: false, pending: 0, pendingInbound: 0 })
+    expect(store.liveControlTarget(root.chatId, root.threadTs)).toBeNull()
+
+    expect(store.stageInboundDelivery({
+      ...input({ messageId: 'post-seal-next-task' }),
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      text: 'この入力は後続FIFOへ残す',
+    })).toBe(true)
+    expect(store.stageInboundDelivery({
+      ...input({ messageId: 'post-seal-stop' }),
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      text: '中止',
+      isInterrupt: true,
+    })).toBe(true)
+
+    const interrupt = store.claimNextInboundDelivery()!
+    expect(interrupt).toMatchObject({ messageId: 'post-seal-stop', isInterrupt: true })
+    const interruptTarget = store.interruptControlTarget(root.chatId, root.threadTs)!
+    expect(store.stageLiveControl(interruptTarget, {
+      chatId: interrupt.chatId,
+      threadTs: interrupt.threadTs,
+      messageId: interrupt.messageId,
+      userId: interrupt.userId,
+      task: '中止',
+      kind: 'interrupt',
+    })).toBe('staged')
+    store.completeInboundDelivery(interrupt.idempotencyKey)
+
+    const retained = store.claimNextInboundDelivery()!
+    expect(retained).toMatchObject({
+      messageId: 'post-seal-next-task',
+      text: 'この入力は後続FIFOへ残す',
+      isInterrupt: false,
+      expectedControlJobId: null,
+    })
+    expect(store.hasDurableEvent(`${root.chatId}:post-seal-next-task`)).toBe(true)
+    store.close()
+  })
+
+  test('terminal中止は未送達steerへ観測時刻を捏造せず送達不明をambiguousにする', () => {
+    const store = makeStore()
+    const root = store.enqueue(input({ messageId: 'cancel-steer-audit-root' })).job
+    const running = store.claimNext('serial-worker')!
+    const target = store.liveControlTarget(root.chatId, root.threadTs)!
+    store.bindAppServerTurn(
+      running.id, running.workerId!, target.epoch,
+      'nonce-cancel-audit', 'thread-cancel-audit', 'turn-cancel-audit',
+    )
+    const stageSteer = (messageId: string): JobControlRecord => {
+      expect(store.stageLiveControl(target, {
+        chatId: root.chatId,
+        threadTs: root.threadTs,
+        messageId,
+        userId: 'UOTHER',
+        task: messageId,
+        kind: 'steer',
+      })).toBe('staged')
+      return store.listJobControls(root.id).find(control => control.messageId === messageId)!
+    }
+
+    const acknowledged = stageSteer('cancel-audit-acknowledged')
+    store.beginControlDispatch({
+      controlId: acknowledged.id,
+      jobId: root.id,
+      epoch: target.epoch,
+      executorNonce: 'nonce-cancel-audit',
+      threadId: 'thread-cancel-audit',
+      turnId: 'turn-cancel-audit',
+      requestId: 101,
+    })
+    store.acknowledgeControl(acknowledged.id, 101, 'turn-cancel-audit')
+
+    const dispatching = stageSteer('cancel-audit-dispatching')
+    store.beginControlDispatch({
+      controlId: dispatching.id,
+      jobId: root.id,
+      epoch: target.epoch,
+      executorNonce: 'nonce-cancel-audit',
+      threadId: 'thread-cancel-audit',
+      turnId: 'turn-cancel-audit',
+      requestId: 102,
+    })
+    stageSteer('cancel-audit-ready')
+    expect(store.stageLiveControl(target, {
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      messageId: 'cancel-audit-interrupt',
+      userId: 'UOTHER',
+      task: '中止',
+      kind: 'interrupt',
+    })).toBe('staged')
+
+    store.cancel(root.id)
+    const controls = new Map(
+      store.listJobControls(root.id).map(control => [control.messageId, control]),
+    )
+    expect(controls.get('cancel-audit-acknowledged')).toMatchObject({
+      status: 'superseded',
+    })
+    expect(controls.get('cancel-audit-acknowledged')?.observedAt).not.toBeNull()
+    expect(controls.get('cancel-audit-dispatching')).toMatchObject({
+      status: 'ambiguous', observedAt: null,
+    })
+    expect(controls.get('cancel-audit-ready')).toMatchObject({
+      status: 'superseded', observedAt: null,
+    })
+    expect(controls.get('cancel-audit-interrupt')).toMatchObject({
+      status: 'superseded', observedAt: null,
+    })
     store.close()
   })
 
@@ -976,6 +1148,9 @@ describe('Codex job store', () => {
       mkdirSync(path, { recursive: true })
       writeFileSync(join(path, 'evidence'), root)
     }
+    const pendingEphemeral = join(state, 'advisor-ephemeral', removable.id)
+    mkdirSync(pendingEphemeral, { recursive: true })
+    writeFileSync(join(pendingEphemeral, 'cleanup-receipt'), 'must remain')
     mkdirSync(join(state, 'job-logs'), { recursive: true })
     writeFileSync(join(state, 'job-logs', `${removable.id}.stdout.log`), 'old log')
     for (const phase of ['1-prepare.stdout.log', '1-implementation.stderr.log', '1-review-3.stdout.log']) {
@@ -1005,6 +1180,7 @@ describe('Codex job store', () => {
     for (const root of ['final-output', 'advisor-runtime', 'advisor-context', 'advisor-journal']) {
       expect(existsSync(join(state, root, removable.id))).toBe(false)
     }
+    expect(existsSync(pendingEphemeral)).toBe(true)
     expect(existsSync(join(state, 'job-logs', `${removable.id}.stdout.log`))).toBe(false)
     for (const phase of ['1-prepare.stdout.log', '1-implementation.stderr.log', '1-review-3.stdout.log']) {
       expect(existsSync(join(state, 'job-logs', `${removable.id}.${phase}`))).toBe(false)
@@ -1030,6 +1206,9 @@ describe('Codex job store', () => {
     for (const jobId of [active, orphan]) {
       for (const phase of phases) writeFileSync(join(logs, `${jobId}.${phase}`), phase)
     }
+    const pendingEphemeral = join(state, 'advisor-ephemeral', orphan)
+    mkdirSync(pendingEphemeral, { recursive: true })
+    writeFileSync(join(pendingEphemeral, 'cleanup-receipt'), 'must remain')
 
     expect(removeOrphanedJobState({
       stateDir: state,
@@ -1041,6 +1220,7 @@ describe('Codex job store', () => {
       expect(existsSync(join(logs, `${active}.${phase}`))).toBe(true)
       expect(existsSync(join(logs, `${orphan}.${phase}`))).toBe(false)
     }
+    expect(existsSync(pendingEphemeral)).toBe(true)
   })
 
   test('runtime log capは通常fileだけを切り詰め、symlinkを拒否する', () => {
@@ -1981,7 +2161,7 @@ describe('Codex job store', () => {
 })
 
 describe('single FIFO worker', () => {
-  test('claim直前のClaude clean receipt検証失敗ならCodexを起動しない', async () => {
+  test('claim直前のadvisor cleanup検証失敗ならworkerを起動しない', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'blocked-before-claim' })).job
     let executions = 0
@@ -1991,13 +2171,13 @@ describe('single FIFO worker', () => {
       pollMs: 1,
       stopWhenIdle: false,
       beforeClaim: async () => {
-        throw new ClaudeContextClearPendingError('Claude receipt changed')
+        throw new EphemeralClaudeCleanupPendingError('advisor receipt changed')
       },
       executor: async () => {
         executions += 1
         return { sessionId: 'must-not-run', result: 'must-not-run' }
       },
-    })).rejects.toBeInstanceOf(ClaudeContextClearPendingError)
+    })).rejects.toBeInstanceOf(EphemeralClaudeCleanupPendingError)
     expect(executions).toBe(0)
     expect(store.get(queued.id)).toMatchObject({ status: 'queued', attempts: 0 })
     store.close()
@@ -2015,9 +2195,9 @@ describe('single FIFO worker', () => {
       stopWhenIdle: true,
       executor: async () => ({ sessionId: 'staged-session', result: 'staged result' }),
       settleExternalContext: async () => {
-        throw new ClaudeContextClearPendingError('simulated crash boundary')
+        throw new EphemeralClaudeCleanupPendingError('simulated crash boundary')
       },
-    })).rejects.toBeInstanceOf(ClaudeContextClearPendingError)
+    })).rejects.toBeInstanceOf(EphemeralClaudeCleanupPendingError)
     expect(store.get(queued.id)?.status).toBe('running')
     store.close()
 
@@ -2050,7 +2230,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('再起動はjournalをSQLiteへstageしてからClaudeをclearし、その後completeする', async () => {
+  test('再起動はjournalをSQLiteへstageしてからadvisorをcleanupし、その後completeする', async () => {
     const dir = fixtureDir()
     const store = new JobStore(join(dir, 'jobs.sqlite3'))
     const queued = store.enqueue(input({ messageId: 'recovery-order' })).job
@@ -2060,7 +2240,7 @@ describe('single FIFO worker', () => {
     })
     const order: string[] = []
 
-    const recovered = await recoverExecutionCheckpointBeforeClaudeClear(
+    const recovered = await recoverExecutionCheckpointBeforeAdvisorCleanup(
       store,
       dir,
       async () => {
@@ -2097,7 +2277,7 @@ describe('single FIFO worker', () => {
     })).toBe('staged')
     expect(store.stagedExecutionJobIds()).toEqual([queued.id])
 
-    const checkpoint = await recoverExecutionCheckpointBeforeClaudeClear(
+    const checkpoint = await recoverExecutionCheckpointBeforeAdvisorCleanup(
       store,
       dir,
       async () => {
@@ -2169,7 +2349,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('startup staged recoveryはClaude clear前後のmonitor検証失敗でterminal化しない', async () => {
+  test('startup staged recoveryはadvisor cleanup前後のmonitor検証失敗でterminal化しない', async () => {
     for (const missingAt of ['before-clear', 'after-clear'] as const) {
       const store = makeStore()
       const queued = store.enqueue(input({ messageId: `startup-monitor-${missingAt}` })).job
@@ -2177,10 +2357,10 @@ describe('single FIFO worker', () => {
       store.stageExecutionResult(claimed.id, 'recovery-session', 'durable result')
       let checks = 0
       let clears = 0
-      await expect(recoverExecutionCheckpointBeforeClaudeClear(
+      await expect(recoverExecutionCheckpointBeforeAdvisorCleanup(
         store,
         fixtureDir(),
-        () => reconcileClaudeWithMonitorHealthBarrier(
+        () => reconcileAdvisorsWithMonitorHealthBarrier(
           store,
           async () => {
             checks += 1
@@ -2199,7 +2379,7 @@ describe('single FIFO worker', () => {
     }
   })
 
-  test('結果checkpoint失敗時はClaudeをclearせずrunningを保持する', async () => {
+  test('結果checkpoint失敗時はadvisorをcleanupせずrunningを保持する', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'checkpoint-before-clear' })).job
     let clears = 0
@@ -2218,7 +2398,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('Claude clear後のDB complete失敗も成功結果をstagedのまま保持する', async () => {
+  test('advisor cleanup後のDB complete失敗も成功結果をstagedのまま保持する', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'complete-retry' })).job
     const complete = store.completeStagedExecution.bind(store)
@@ -2252,7 +2432,7 @@ describe('single FIFO worker', () => {
       stopWhenIdle: true,
       executor: async () => ({ sessionId: 'plain-session', result: 'plain result' }),
       settleExternalContext: async () => { throw new Error('malformed boundary') },
-    })).rejects.toBeInstanceOf(ClaudeContextClearPendingError)
+    })).rejects.toBeInstanceOf(EphemeralClaudeCleanupPendingError)
     expect(store.get(queued.id)?.status).toBe('running')
     expect(store.recoverStagedExecutions()).toBe(1)
     expect(store.get(queued.id)).toMatchObject({
@@ -2261,7 +2441,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('Claude予約が完了するまでclaimed jobのCodexを起動しない', async () => {
+  test('external advisor準備が完了するまでclaimed jobのworkerを起動しない', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'prepare-first' })).job
     let release!: () => void
@@ -2292,7 +2472,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('Claude予約中の中止はcancel境界を使いCodexを起動せず次threadへ進む', async () => {
+  test('external advisor準備中の中止はcancel境界を使いworkerを起動せず次threadへ進む', async () => {
     const store = makeStore()
     const first = store.enqueue(input({ messageId: 'cancel-during-reserve-1' })).job
     const second = store.enqueue(input({
@@ -2430,7 +2610,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('monitorはClaude予約後に開き、DB terminal確定後だけ閉じる', async () => {
+  test('monitorはexternal advisor準備後に開き、DB terminal確定後だけ閉じる', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'monitor-order' })).job
     const order: string[] = []
@@ -2462,7 +2642,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('Claude clearやresult checkpointがpendingならmonitorを閉じない', async () => {
+  test('advisor cleanupやresult checkpointがpendingならmonitorを閉じない', async () => {
     for (const pending of ['claude', 'result'] as const) {
       const store = makeStore()
       const queued = store.enqueue(input({ messageId: `monitor-pending-${pending}` })).job
@@ -2481,12 +2661,12 @@ describe('single FIFO worker', () => {
           return { sessionId: 'pending-session', result: 'pending result' }
         },
         settleExternalContext: async () => {
-          throw new ClaudeContextClearPendingError('clear pending')
+          throw new EphemeralClaudeCleanupPendingError('cleanup pending')
         },
       })).rejects.toBeInstanceOf(
         pending === 'result'
           ? CodexResultPersistencePendingError
-          : ClaudeContextClearPendingError,
+          : EphemeralClaudeCleanupPendingError,
       )
       expect(store.get(queued.id)?.status).toBe('running')
       expect(closes).toBe(0)
@@ -2585,7 +2765,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('result checkpointからClaude clear完了までmonitor healthを維持する', async () => {
+  test('result checkpointからadvisor cleanup完了までmonitor healthを維持する', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'monitor-health-clear-gap' })).job
     let checks = 0
@@ -2620,7 +2800,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('Claude clear後status更新中のmonitor failureをDB terminal化前に止める', async () => {
+  test('advisor cleanup後status更新中のmonitor failureをDB terminal化前に止める', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'monitor-final-health-window' })).job
     let monitorFailed = false
@@ -2633,12 +2813,12 @@ describe('single FIFO worker', () => {
       openJobMonitor: async () => {},
       assertJobMonitorHealthy: () => {
         if (monitorFailed) {
-          throw new HerdrJobMonitorPendingError('viewer failed after Claude clear')
+          throw new HerdrJobMonitorPendingError('viewer failed after advisor cleanup')
         }
       },
       settleExternalContext: async () => {},
       updateJobMonitor: async (_job, message) => {
-        if (message.includes('作業コンテキストを消去')) {
+        if (message.includes('一時的な補助セッションを終了')) {
           await Bun.sleep(1)
           monitorFailed = true
         }
@@ -3336,7 +3516,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('write implementation送信後のreview失敗は副作用警告とClaude clear後に次threadへ進む', async () => {
+  test('write implementation送信後のreview失敗は副作用警告とadvisor cleanup後に次threadへ進む', async () => {
     const store = makeStore()
     const first = store.enqueue(input({
       messageId: 'write-review-failure-first',
@@ -3509,6 +3689,167 @@ describe('single FIFO worker', () => {
       store.close()
     }
   })
+
+  test('cleanup-confirmed直後に残るexact supervisorを復旧時に回収する', async () => {
+    const dir = fixtureDir()
+    const repo = join(dir, 'repo')
+    const fixture = join(dir, 'codex-supervisor-fixture.ts')
+    mkdirSync(repo)
+    writeFileSync(fixture, [
+      "process.on('SIGTERM', () => {})",
+      'setInterval(() => {}, 1_000)',
+      '',
+    ].join('\n'))
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    const job = store.enqueue(input({ repoPath: repo, messageId: 'cleanup-confirmed-live' })).job
+    const claimed = store.claimNext('serial-worker')!
+    const supervisor = Bun.spawn([process.execPath, fixture, job.id], {
+      cwd: repo,
+      stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+      detached: process.platform !== 'win32',
+    })
+    let identity = readProcessIdentity(supervisor.pid)
+    const identityDeadline = Date.now() + 2_000
+    while ((!identity || identity.pgid !== supervisor.pid) && Date.now() < identityDeadline) {
+      await Bun.sleep(10)
+      identity = readProcessIdentity(supervisor.pid)
+    }
+    expect(identity).toBeDefined()
+    expect(identity!.pgid).toBe(supervisor.pid)
+    const registration = join(dir, 'executors', `${job.id}.json`)
+    mkdirSync(dirname(registration), { recursive: true })
+    writeFileSync(registration, `${JSON.stringify({
+      version: 3,
+      phase: 'cleanup-confirmed',
+      revision: 1,
+      cleanupPending: true,
+      jobId: job.id,
+      pid: identity!.pid,
+      pgid: identity!.pgid,
+      started: identity!.started,
+      bootSession: identity!.bootSession,
+      startSec: identity!.startSec,
+      startUsec: identity!.startUsec,
+      tracked: [{ pid: identity!.pid, started: identity!.started }],
+    })}\n`, { mode: 0o600 })
+    store.beginMonitorPreparation(job.id, claimed.workerId!)
+    store.commitMonitorRequired(job.id, claimed.workerId!)
+    store.saveExecutorPid(job.id, supervisor.pid)
+
+    try {
+      await terminateTrackedExecutors(store, () => {}, 50, dir)
+      await supervisor.exited
+      expect(observeProcessGeneration(identity!).status).toBe('dead')
+      expect(existsSync(registration)).toBe(false)
+      expect(store.get(job.id)?.executorPid).toBeNull()
+    } finally {
+      try { supervisor.kill('SIGKILL') } catch {}
+      await supervisor.exited
+      store.close()
+    }
+  })
+
+  test.skipIf(process.platform === 'win32')(
+    '初回read直後のatomic replaceで追加されたdetached generationも失わず回収する',
+    async () => {
+      const dir = fixtureDir()
+      const repo = join(dir, 'repo')
+      mkdirSync(repo)
+      const store = new JobStore(join(dir, 'jobs.sqlite3'))
+      const job = store.enqueue(input({
+        repoPath: repo,
+        messageId: 'registration-atomic-replace-race',
+      })).job
+      const claimed = store.claimNext('serial-worker')!
+      const supervisorScript = join(dir, `codex-supervisor-${job.id}.ts`)
+      writeFileSync(supervisorScript, [
+        "process.on('SIGTERM', () => {})",
+        'setInterval(() => {}, 1_000)',
+        '',
+      ].join('\n'))
+      const supervisor = Bun.spawn([
+        process.execPath, '--config=/dev/null', '--no-env-file', supervisorScript, job.id,
+      ], {
+        cwd: repo,
+        stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+        detached: true,
+      })
+      const detached = Bun.spawn(['/bin/sleep', '30'], {
+        cwd: repo,
+        stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+        detached: true,
+      })
+      let supervisorIdentity = readProcessIdentity(supervisor.pid)
+      let detachedIdentity = readProcessIdentity(detached.pid)
+      const identityDeadline = Date.now() + 2_000
+      while ((!supervisorIdentity || supervisorIdentity.pgid !== supervisor.pid
+        || !detachedIdentity || detachedIdentity.pgid !== detached.pid)
+        && Date.now() < identityDeadline) {
+        await Bun.sleep(10)
+        supervisorIdentity = readProcessIdentity(supervisor.pid)
+        detachedIdentity = readProcessIdentity(detached.pid)
+      }
+      expect(supervisorIdentity?.pgid).toBe(supervisor.pid)
+      expect(detachedIdentity?.pgid).toBe(detached.pid)
+
+      const registration = join(dir, 'executors', `${job.id}.json`)
+      mkdirSync(dirname(registration), { recursive: true })
+      const registrationValue = (
+        revision: number,
+        tracked: Array<{ pid: number; started: string }>,
+      ) => ({
+        version: 3,
+        phase: 'active',
+        revision,
+        cleanupPending: true,
+        jobId: job.id,
+        pid: supervisorIdentity!.pid,
+        pgid: supervisorIdentity!.pgid,
+        started: supervisorIdentity!.started,
+        bootSession: supervisorIdentity!.bootSession,
+        startSec: supervisorIdentity!.startSec,
+        startUsec: supervisorIdentity!.startUsec,
+        tracked,
+      })
+      atomicWritePrivateFile(registration, `${JSON.stringify(registrationValue(0, [{
+        pid: supervisorIdentity!.pid,
+        started: supervisorIdentity!.started,
+      }]))}\n`)
+      const initialInode = statSync(registration).ino
+      store.beginMonitorPreparation(job.id, claimed.workerId!)
+      store.commitMonitorRequired(job.id, claimed.workerId!)
+      store.saveExecutorPid(job.id, supervisor.pid)
+
+      let replacementCount = 0
+      try {
+        await terminateTrackedExecutors(store, () => {}, 100, dir, {
+          afterInitialRegistrationRead(path) {
+            expect(path).toBe(registration)
+            replacementCount += 1
+            atomicWritePrivateFile(registration, `${JSON.stringify(registrationValue(1, [
+              { pid: supervisorIdentity!.pid, started: supervisorIdentity!.started },
+              { pid: detachedIdentity!.pid, started: detachedIdentity!.started },
+            ]))}\n`)
+            expect(statSync(registration).ino).not.toBe(initialInode)
+          },
+        })
+        await Promise.all([supervisor.exited, detached.exited])
+        expect(replacementCount).toBe(1)
+        expect(observeProcessGeneration(supervisorIdentity!).status).toBe('dead')
+        expect(observeProcessGeneration(detachedIdentity!).status).toBe('dead')
+        expect(existsSync(registration)).toBe(false)
+        expect(store.get(job.id)?.executorPid).toBeNull()
+      } finally {
+        signalProcessGroupIfLeaderLive(supervisorIdentity!, 'SIGKILL')
+        signalProcessGroupIfLeaderLive(detachedIdentity!, 'SIGKILL')
+        signalProcessIfLive(supervisorIdentity!, 'SIGKILL')
+        signalProcessIfLive(detachedIdentity!, 'SIGKILL')
+        await Promise.all([supervisor.exited, detached.exited])
+        store.close()
+      }
+    },
+    10_000,
+  )
 
   test('runnerのstdout pipe切断後もsupervisorはCodex監督を継続する', async () => {
     const dir = fixtureDir()
@@ -3863,6 +4204,55 @@ describe('single FIFO worker', () => {
     await expect(terminateTrackedExecutors(store, () => {}, 100, dir))
       .rejects.toThrow('duplicate executor tracked generation')
     expect(existsSync(registration)).toBe(true)
+    store.close()
+  })
+
+  test('supervisor最新snapshotは累積unionではなく上限内の置換として読む', () => {
+    const bootSession = 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE'
+    const snapshot = (pidBase: number, second: number) => Array.from(
+      { length: MAX_TRACKED_PROCESSES },
+      (_, index) => ({
+        pid: pidBase + index,
+        started: processStartKey({
+          bootSession,
+          startSec: second,
+          startUsec: index,
+        }),
+      }),
+    )
+    const initial = snapshot(1_000_000, 1_800_000_000)
+    const latest = snapshot(2_000_000, 1_800_000_001)
+    const ledger = new Map<string, { pid: number; started: string }>()
+
+    synchronizeExecutorRecoveryLedger(ledger, initial, 'replace')
+    synchronizeExecutorRecoveryLedger(ledger, latest, 'replace')
+
+    expect(ledger.size).toBe(MAX_TRACKED_PROCESSES)
+    expect(ledger.has(`${initial[0]!.pid}:${initial[0]!.started}`)).toBe(false)
+    expect(ledger.has(`${latest.at(-1)!.pid}:${latest.at(-1)!.started}`)).toBe(true)
+    expect(() => synchronizeExecutorRecoveryLedger(ledger, [{
+      pid: 3_000_000,
+      started: processStartKey({
+        bootSession,
+        startSec: 1_800_000_002,
+        startUsec: 1,
+      }),
+    }], 'merge')).toThrow(
+      `executor tracked generation ledger exceeded ${MAX_TRACKED_PROCESSES}`,
+    )
+  })
+
+  test('512KiBを超えるexecutor registrationをbounded read前に拒否する', async () => {
+    const dir = fixtureDir()
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    const registrationDir = join(dir, 'executors')
+    const registration = join(registrationDir, 'oversized.json')
+    mkdirSync(registrationDir, { recursive: true })
+    writeFileSync(registration, 'x'.repeat(MAX_EXECUTOR_REGISTRATION_BYTES + 1), { mode: 0o600 })
+
+    await expect(terminateTrackedExecutors(store, () => {}, 100, dir))
+      .rejects.toThrow('unsafe executor registration')
+    expect(statSync(registration).size).toBe(MAX_EXECUTOR_REGISTRATION_BYTES + 1)
     store.close()
   })
 
@@ -4872,7 +5262,7 @@ await Bun.sleep(30_000)
         stateDir,
         logDir: join(stateDir, 'job-logs'),
         timeoutMs: 10_000,
-        supervisorCleanupGraceMs: 2_000,
+        supervisorCleanupGraceMs: 5_000,
       })
       expect(result).toEqual({
         sessionId: 'logical-thread',
@@ -4883,9 +5273,9 @@ await Bun.sleep(30_000)
     } finally {
       store.close()
     }
-  }, 8_000)
+  }, 10_000)
 
-  test('論理完了後にparent-forced cleanupが必要なら公開せず登録を保持する', async () => {
+  test('論理完了後も明示abortまでは子を時間で打ち切らずabort後だけ有界回収する', async () => {
     const dir = fixtureDir()
     const repo = join(dir, 'repo')
     const stateDir = join(dir, 'state')
@@ -4895,6 +5285,7 @@ await Bun.sleep(30_000)
 import { writeFileSync } from 'fs'
 const args = process.argv.slice(2)
 const output = args[args.indexOf('--output-last-message') + 1]
+writeFileSync(process.env.ZERO_CHILD_PID, String(process.pid))
 const finalText = 'forced parent cleanup result'
 console.log(JSON.stringify({ type: 'thread.started', thread_id: 'forced-cleanup-thread' }))
 console.log(JSON.stringify({ type: 'turn.started' }))
@@ -4905,30 +5296,51 @@ console.log(JSON.stringify({ type: 'turn.completed', usage: {
   input_tokens: 1, cached_input_tokens: 0, output_tokens: 1,
 } }))
 writeFileSync(output, finalText)
-process.on('SIGTERM', () => {})
+process.on('SIGTERM', () => {
+  writeFileSync(process.env.ZERO_LOGICAL_STOP_OBSERVED, '')
+})
 await Bun.sleep(30_000)
 `)
     chmodSync(fakeCodex, 0o755)
     const store = new JobStore(join(dir, 'jobs.sqlite3'))
     store.enqueue(input({ repoPath: repo, writeEnabled: true }))
     const job = store.claimNext('serial-worker')!
+    const controller = new AbortController()
+    const childPidPath = join(dir, 'child.pid')
+    const logicalStopPath = join(dir, 'logical-stop-observed')
     try {
-      await expect(executeCodexJob(job, {
+      let settled = false
+      const execution = executeCodexJob(job, {
         codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir,
         logDir: join(stateDir, 'job-logs'),
         timeoutMs: 10_000,
-        supervisorCleanupGraceMs: 500,
-        extraEnvironment: { ZEROKUN_SUPERVISOR_TEST_CHILD_GRACE_MS: '5000' },
-      })).rejects.toBeInstanceOf(CodexCleanupPendingError)
-      expect(existsSync(join(stateDir, 'executors', `${job.id}.json`))).toBe(true)
+        supervisorCleanupGraceMs: 2_000,
+        signal: controller.signal,
+        extraEnvironment: {
+          ZERO_CHILD_PID: childPidPath,
+          ZERO_LOGICAL_STOP_OBSERVED: logicalStopPath,
+          ZEROKUN_SUPERVISOR_TEST_CHILD_GRACE_MS: '50',
+        },
+      }).then(
+        value => ({ value, error: null }),
+        error => ({ value: null, error }),
+      ).finally(() => { settled = true })
+      await waitForTestPath(logicalStopPath)
+      await Bun.sleep(200)
+      expect(settled).toBe(false)
+      const childPid = Number(readFileSync(childPidPath, 'utf8'))
+      expect(() => process.kill(childPid, 0)).not.toThrow()
+      controller.abort()
+      const outcome = await execution
+      expect(outcome.error).toBeInstanceOf(CodexInterruptedError)
+      expect(outcome.value).toBeNull()
+      expect(existsSync(join(stateDir, 'executors', `${job.id}.json`))).toBe(false)
     } finally {
-      try {
-        await terminateTrackedExecutors(store, () => {}, 5_000, stateDir)
-      } finally {
-        store.close()
-      }
+      controller.abort()
+      await terminateTrackedExecutors(store, () => {}, 5_000, stateDir)
+      store.close()
     }
   }, 8_000)
 
@@ -5068,19 +5480,47 @@ await Bun.sleep(30_000)
     const store = new JobStore(join(dir, 'jobs.sqlite3'))
     store.enqueue(input({ repoPath: repo, writeEnabled: true }))
     const job = store.claimNext('serial-worker')!
+    const processIds: number[] = []
+    let settled = false
+    let gateReleasePath: string | null = null
     try {
-      await expect(executeCodexJob(job, {
+      const execution = executeCodexJob(job, {
         codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir,
         logDir: join(stateDir, 'job-logs'),
         timeoutMs: 5_000,
-        supervisorCleanupGraceMs: 1_000,
-      })).rejects.toThrow('delayed terminal failure')
+        supervisorCleanupGraceMs: 25,
+        extraEnvironment: { ZEROKUN_SUPERVISOR_TEST_CLEANUP_GATE: '1' },
+        onProcessId: pid => { processIds.push(pid) },
+      }).then(
+        value => ({ value, error: null }),
+        error => ({ value: null, error }),
+      ).finally(() => { settled = true })
+      const processIdDeadline = Date.now() + 5_000
+      while (processIds.length === 0 && Date.now() < processIdDeadline) await Bun.sleep(10)
+      if (processIds.length === 0) throw new Error('logical cleanup supervisor did not start')
+      const gateBase = join(stateDir, `.test-cleanup-gate-${processIds[0]}`)
+      const gateReadyPath = `${gateBase}.ready`
+      gateReleasePath = `${gateBase}.release`
+      await waitForTestPath(gateReadyPath)
+      await Bun.sleep(100)
+      expect(settled).toBe(false)
+      writeFileSync(gateReleasePath, '', { mode: 0o600, flag: 'wx' })
+      gateReleasePath = null
+      const outcome = await execution
+      expect(outcome.value).toBeNull()
+      expect(outcome.error).toBeInstanceOf(Error)
+      expect((outcome.error as Error).message).toContain('delayed terminal failure')
+      expect(outcome.error).not.toBeInstanceOf(CodexCleanupPendingError)
+      expect(existsSync(join(stateDir, 'executors', `${job.id}.json`))).toBe(false)
     } finally {
+      if (gateReleasePath && !existsSync(gateReleasePath)) {
+        writeFileSync(gateReleasePath, '', { mode: 0o600, flag: 'wx' })
+      }
       store.close()
     }
-  }, 6_000)
+  }, 10_000)
 
   test('実行中abortを受けて0終了するCodexもinterruptedにする', async () => {
     const dir = fixtureDir()
@@ -5310,8 +5750,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('call advisor_round\nonce')
     expect(instructions).toContain('Poll advisor_round_poll')
     expect(instructions).toContain('exact receipt')
-    expect(instructions).toContain('existing live Claude Code')
-    expect(instructions).toContain('Never access Herdr')
+    expect(instructions).toContain('round-owned fresh ephemeral Claude Code workspace')
+    expect(instructions).toMatch(/Never\s+access Herdr/)
     expect(instructions).toContain('native close_agent capability exists')
     expect(instructions).not.toContain(nonce)
     expect(instructions).toContain('official App Server parent/child history')
@@ -5363,7 +5803,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     ])
   })
 
-  test('advisor publication gateは別PIDのGrok 2件と理由付きClaude試行だけを採択する', () => {
+  test('advisor publication gateは別PIDのGrok 2件とfresh Claude cleanupを要求する', () => {
     const state = fixtureDir()
     const job = { id: 'advisor-job', writeEnabled: false }
     const contextDigest = 'a'.repeat(64)
@@ -5376,7 +5816,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     )
     mkdirSync(root, { recursive: true, mode: 0o700 })
     const journal = {
-      version: 4,
+      version: 5,
       status: 'completed',
       phase: 'investigation',
       round: 1,
@@ -5414,9 +5854,14 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       ],
       claude: {
         attempted: true,
-        adopted: false,
-        promptMayHaveBeenDelivered: false,
-        reasonDigest: 'e'.repeat(64),
+        required: true,
+        lifecycle: 'ephemeral-v2',
+        adopted: true,
+        freshEphemeral: true,
+        cleanupVerified: true,
+        cleanupStatus: 'closed-and-verified',
+        responseDigest: 'e'.repeat(64),
+        cleanupReceiptDigest: '0'.repeat(64),
       },
     }
     const path = join(root, 'investigation-1.json')
@@ -5424,6 +5869,13 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(() => assertRequiredAdvisorRounds(
       job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
     )).not.toThrow()
+
+    journal.claude.cleanupVerified = false
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('incomplete')
+    journal.claude.cleanupVerified = true
 
     journal.status = 'reviewers-completed'
     writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
@@ -5466,7 +5918,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       inputBinding: typeof revisionOne,
       status: 'completed' | 'stale-input',
     ) => ({
-      version: 4,
+      version: 5,
       status,
       phase: 'investigation',
       round: 1,
@@ -5501,7 +5953,17 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         { adopted: true, perspective: 'risk', processId: 202, responseDigest: 'd'.repeat(64) },
       ] : [],
       claude: status === 'completed'
-        ? { attempted: true, adopted: false, reasonDigest: 'e'.repeat(64) }
+        ? {
+            attempted: true,
+            required: true,
+            lifecycle: 'ephemeral-v2',
+            adopted: true,
+            freshEphemeral: true,
+            cleanupVerified: true,
+            cleanupStatus: 'closed-and-verified',
+            responseDigest: 'e'.repeat(64),
+            cleanupReceiptDigest: '0'.repeat(64),
+          }
         : { attempted: false, adopted: false, reasonDigest: 'e'.repeat(64) },
     })
     const write = (inputBinding: typeof revisionOne, status: 'completed' | 'stale-input') => {
@@ -5564,7 +6026,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       repositoryDigest: string,
       startedAt: number,
     ) => ({
-      version: 4,
+      version: 5,
       status: 'completed',
       phase,
       round,
@@ -5590,7 +6052,17 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         { adopted: true, perspective: 'solution', processId: 200 + startedAt * 2, responseDigest: 'c'.repeat(64) },
         { adopted: true, perspective: 'risk', processId: 201 + startedAt * 2, responseDigest: 'd'.repeat(64) },
       ],
-      claude: { attempted: true, adopted: false, reasonDigest: 'e'.repeat(64) },
+      claude: {
+        attempted: true,
+        required: true,
+        lifecycle: 'ephemeral-v2',
+        adopted: true,
+        freshEphemeral: true,
+        cleanupVerified: true,
+        cleanupStatus: 'closed-and-verified',
+        responseDigest: 'e'.repeat(64),
+        cleanupReceiptDigest: '0'.repeat(64),
+      },
     })
     const writeJournal = (value: ReturnType<typeof journal>) => {
       writeFileSync(join(root, `${value.phase}-${value.round}.json`), `${JSON.stringify(value)}\n`, {
@@ -6056,21 +6528,43 @@ process.exit(0)
       const store = new JobStore(join(dir, 'jobs.sqlite3'))
       store.enqueue(input({ repoPath: repo }))
       const job = store.claimNext('serial-worker')!
+      const controller = new AbortController()
       let childPid = 0
       const startedAt = Date.now()
       try {
-        await expect(executeCodexJob(job, {
+        let settled = false
+        const execution = executeCodexJob(job, {
           codexBinForTesting: fakeCodex,
           skipEffectiveConfigCheck: true,
           stateDir: join(dir, 'state'),
           logDir: join(dir, 'state/job-logs'),
-          extraEnvironment: { CHILD_PID_FILE: childPidFile },
+          extraEnvironment: {
+            CHILD_PID_FILE: childPidFile,
+            ZEROKUN_SUPERVISOR_TEST_CHILD_GRACE_MS: '100',
+          },
           timeoutMs: 10_000,
-          supervisorCleanupGraceMs: 1_000,
-        })).rejects.toBeInstanceOf(CodexCleanupPendingError)
+          supervisorCleanupGraceMs: 100,
+          signal: controller.signal,
+        }).then(
+          value => ({ value, error: null }),
+          error => ({ value: null, error }),
+        ).finally(() => { settled = true })
+        await waitForTestPath(childPidFile)
         childPid = Number(readFileSync(childPidFile, 'utf8'))
+        // A normal logical completion has no relay deadline. The inherited
+        // descriptor remains open beyond the removed two-second cutoff and
+        // only the explicit runner abort may enter bounded forced cleanup.
+        await Bun.sleep(2_500)
+        expect(settled).toBe(false)
+        controller.abort()
+        const outcome = await execution
+        expect(outcome.value).toBeNull()
+        expect(outcome.error).toBeInstanceOf(CodexCleanupPendingError)
+        const registration = join(dir, 'state/executors', `${job.id}.json`)
+        expect(JSON.parse(readFileSync(registration, 'utf8')).phase).toBe('active')
         expect(Date.now() - startedAt).toBeLessThan(6_000)
       } finally {
+        controller.abort()
         try {
           await terminateTrackedExecutors(store, () => {}, 5_000, join(dir, 'state'))
         } finally {
@@ -6081,7 +6575,7 @@ process.exit(0)
         }
       }
     },
-    8_000,
+    10_000,
   )
 
   test('大量JSONL出力は20MB logと1MB解析tailへ上限化する', async () => {

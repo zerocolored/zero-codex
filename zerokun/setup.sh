@@ -137,21 +137,16 @@ if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" = "1" ]; then
 fi
 
 # Updater-launched setup must prove the inherited state/lock/delegation first.
-# Only after that mutation boundary may a one-release migration install the
-# dedicated read-only reviewer and the non-authenticating Herdr transport
-# helper from this checked-out release. Existing subscription authentication
-# is reused; setup never performs login or API authentication.
+# Detect a helper upgrade here, but do not replace the executable while an old
+# runner may still be using it for an owned Claude cleanup. The only helper
+# writer runs after the old runner and gateway have stopped below.
+FIFTH_ADVISOR_INSTALL_REQUIRED=0
 if ! bun --config=/dev/null --no-env-file \
   "$REPO_DIR/zerokun/install-fifth-advisor.ts" verify; then
   [ -f "$REPO_DIR/zerokun/install-fifth-advisor.ts" ] \
     || { echo "❌ fifth-advisor helper installerがありません。offline bootstrapを実行してください。" >&2; exit 1; }
-  echo "   fifth-advisor transport helperをこのrelease用に導入します。" >&2
-  bun --config=/dev/null --no-env-file \
-    "$REPO_DIR/zerokun/install-fifth-advisor.ts" install \
-    || { echo "❌ fifth-advisor helperを導入できません。Codex版のoffline bootstrapを実行してください。" >&2; exit 1; }
+  FIFTH_ADVISOR_INSTALL_REQUIRED=1
 fi
-bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-fifth-advisor.ts" verify \
-  || { echo "❌ fifth-advisor helperを確認できません。Codex版のoffline bootstrapを実行してください。" >&2; exit 1; }
 
 if ! bun --config=/dev/null --no-env-file \
   "$REPO_DIR/zerokun/advisor-prerequisites.ts" verify-grok; then
@@ -182,6 +177,10 @@ ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/
 command -v git >/dev/null 2>&1 || { echo "❌ git がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 command -v tmux >/dev/null 2>&1 || { echo "❌ tmux がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 zerokun_require_herdr_version || exit 1
+zerokun_resolve_claude_binary >/dev/null \
+  || { echo "❌ Claude Codeがありません。先に公式Claude Codeを導入してください。" >&2; exit 1; }
+zerokun_claude_subscription_ready \
+  || { echo "❌ Claude Codeはsubscription login済みである必要があります。Herdrで先にloginしてください。Zeroちゃんは認証操作を行いません。" >&2; exit 1; }
 BUN_BIN="$(command -v bun)"
 INSTALL_ENV_ROOT="$(/usr/bin/mktemp -d /tmp/zerokun-bun-install.XXXXXX)" \
   || { echo "❌ dependency install用一時directoryを作成できません" >&2; exit 1; }
@@ -376,6 +375,18 @@ if process_matches "$GATEWAY_PID" 'server\.ts'; then
   fi
   echo "   旧Slack gatewayを停止しました"
 fi
+
+# No old process can be executing the previous helper beyond this point. A
+# release upgrade may now atomically replace it, and every setup re-verifies
+# the exact owner-only copy before starting storage migration or new services.
+if [ "$FIFTH_ADVISOR_INSTALL_REQUIRED" = "1" ]; then
+  echo "   fifth-advisor transport helperをこのrelease用に導入します。" >&2
+  bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/install-fifth-advisor.ts" install \
+    || { echo "❌ fifth-advisor helperを導入できません。Codex版のoffline bootstrapを実行してください。" >&2; exit 1; }
+fi
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-fifth-advisor.ts" verify \
+  || { echo "❌ fifth-advisor helperを確認できません。Codex版のoffline bootstrapを実行してください。" >&2; exit 1; }
 
 # Legacy rows are handled only after both legacy processes are gone. Queued rows
 # move to Codex; uncertain running rows fail closed and require an explicit resend.

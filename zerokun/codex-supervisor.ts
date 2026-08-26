@@ -8,19 +8,23 @@
 import {
   closeSync,
   constants,
+  existsSync,
   fsyncSync,
   lstatSync,
   openSync,
   readFileSync,
   rmSync,
+  writeSync,
   writeFileSync,
 } from 'fs'
-import { dirname } from 'path'
+import { dirname, join } from 'path'
 import {
   captureTrackedProcesses,
+  MAX_EXECUTOR_REGISTRATION_BYTES,
   readProcessIdentity,
   reapTrackedProcesses,
   seedTrackedProcess,
+  synchronizeTrackedProcessLedger,
 } from './process-tree.ts'
 import {
   observeProcessGeneration,
@@ -43,6 +47,7 @@ function relayStream(
 ): { done: Promise<void>; cancel: () => Promise<void> } {
   const reader = stream.getReader()
   let cancelled = false
+  let completed = false
   let sinkClosed = destination.destroyed || destination.writableEnded
   let releasePendingWrite: (() => void) | undefined
   const closeSink = () => { sinkClosed = true }
@@ -79,6 +84,7 @@ function relayStream(
     } catch (error) {
       if (!cancelled) throw error
     } finally {
+      completed = true
       // Keep the error listener for the supervisor lifetime: a pipe write may
       // report EPIPE after the source has already reached EOF.
       destination.off('close', closeSink)
@@ -88,10 +94,10 @@ function relayStream(
   return {
     done,
     cancel: async () => {
+      if (cancelled || completed) return
       cancelled = true
-      // An open but unread runner pipe emits neither drain nor close. Release
-      // that wait explicitly so descendant cleanup never depends on the
-      // runner consuming supervisor output.
+      // A pipe can be open but backpressured forever. Release the pending
+      // destination callback as well as the source reader on explicit force.
       releasePendingWrite?.()
       try { await reader.cancel() } catch {}
     },
@@ -160,12 +166,7 @@ async function main(): Promise<void> {
   let registrationPhase: 'active' | 'cleanup-confirmed' = 'active'
   let revision = 0
   const mergeTrackedLedger = (): void => {
-    for (const [pid, started] of tracked) {
-      trackedLedger.set(`${pid}:${started}`, { pid, started })
-    }
-    if (trackedLedger.size > 4_096) {
-      throw new Error('Codex tracked generation ledger exceeded 4096 entries')
-    }
+    synchronizeTrackedProcessLedger(tracked, trackedLedger)
   }
   const registration = () => ({
     version: fingerprint ? 4 as const : 3 as const,
@@ -184,7 +185,16 @@ async function main(): Promise<void> {
     )),
     ...(fingerprint ? { fingerprint } : {}),
   })
-  writeFileSync(registrationPath, JSON.stringify(registration()), { mode: 0o600, flag: 'wx' })
+  const serializedRegistration = (): string => {
+    const value = JSON.stringify(registration())
+    if (Buffer.byteLength(value) > MAX_EXECUTOR_REGISTRATION_BYTES) {
+      throw new Error(
+        `Codex executor registration exceeded ${MAX_EXECUTOR_REGISTRATION_BYTES} bytes`,
+      )
+    }
+    return value
+  }
+  writeFileSync(registrationPath, serializedRegistration(), { mode: 0o600, flag: 'wx' })
   let registrationDescriptor = openSync(
     registrationPath,
     constants.O_RDONLY | constants.O_NOFOLLOW,
@@ -206,14 +216,14 @@ async function main(): Promise<void> {
     const nextTracked = JSON.stringify(registration().tracked)
     if (nextTracked === persistedTracked) return
     revision += 1
-    atomicWritePrivateFile(registrationPath, JSON.stringify(registration()))
+    atomicWritePrivateFile(registrationPath, serializedRegistration())
     persistedTracked = nextTracked
   }
   const persistCleanupConfirmed = (): void => {
     mergeTrackedLedger()
     registrationPhase = 'cleanup-confirmed'
     revision += 1
-    atomicWritePrivateFile(registrationPath, JSON.stringify(registration()))
+    atomicWritePrivateFile(registrationPath, serializedRegistration())
     persistedTracked = JSON.stringify(registration().tracked)
   }
   const clearOwnRegistration = (): void => {
@@ -260,7 +270,8 @@ async function main(): Promise<void> {
       // writers. Codex's shared code-mode host can outlive the direct CLI and
       // retain those descriptors after a multi-agent turn. The waitpid-backed
       // callback is the authoritative direct-process exit boundary; relays are
-      // cancelled explicitly below before descendant cleanup.
+      // kept open until their real EOF; explicit cancellation instead enters
+      // the parent-owned bounded process cleanup path.
       onExit: (_subprocess, exitCode, signalCode, error) => {
         if (error) {
           rejectDirectExit(error)
@@ -293,6 +304,16 @@ async function main(): Promise<void> {
     let tracking = true
     let trackingError: unknown
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined
+    let forceCleanupRequested = false
+    let resolveForceCleanup!: () => void
+    const forceCleanupSignal = new Promise<void>(resolve => {
+      resolveForceCleanup = resolve
+    })
+    const requestForceCleanup = (): void => {
+      if (forceCleanupRequested) return
+      forceCleanupRequested = true
+      resolveForceCleanup()
+    }
     const testChildGrace = Number(process.env.ZEROKUN_SUPERVISOR_TEST_CHILD_GRACE_MS)
     const childGraceMs = hasTestOverride
       && Number.isSafeInteger(testChildGrace)
@@ -300,34 +321,52 @@ async function main(): Promise<void> {
       && testChildGrace <= 5_000
       ? testChildGrace
       : 5_000
-    const terminateChild = (): boolean => {
+    const signalChildTermination = (forceAfterGrace: boolean): boolean => {
       const delivered = signalProcessIfLive(childIdentity, 'SIGTERM')
-      forceKillTimer ??= setTimeout(() => {
-        signalProcessIfLive(childIdentity, 'SIGKILL')
-      }, childGraceMs)
+      if (forceAfterGrace) {
+        forceKillTimer ??= setTimeout(() => {
+          signalProcessIfLive(childIdentity, 'SIGKILL')
+        }, childGraceMs)
+      }
       return delivered
     }
+    const terminateChild = (): boolean => signalChildTermination(true)
     const tracker = (async () => {
       try {
         while (tracking) {
           captureTrackedProcesses([process.pid, child.pid], process.pid, tracked, excluded)
           persistTracked()
+          if (hasTestOverride
+            && process.env.ZEROKUN_SUPERVISOR_TEST_FORCE_TRACKER_ERROR === '1'
+            && existsSync(join(stateDir, '.test-force-tracker-error-ready'))) {
+            throw new Error('forced supervisor tracker error for tests')
+          }
           await Bun.sleep(100)
         }
       } catch (error) {
         trackingError = error
+        // Tracker failure is an explicit cleanup fault, not ordinary cleanup.
+        // Bound the recovery path even when a descendant ignores TERM.
+        requestForceCleanup()
         terminateChild()
       }
     })()
     // group宛signalはCodexにも届く。wrapper自身は子孫の終了と後始末を待つ。
-    const forwardSignal = () => terminateChild()
+    const forwardSignal = () => {
+      requestForceCleanup()
+      return terminateChild()
+    }
     // The executor sends SIGUSR2 only after sealing a matching top-level
     // turn.completed event and final response file. Keep this distinct from
     // runner abort/timeout signals; the executor alone decides whether the
     // resulting non-zero Codex exit is a logically completed success.
     let logicalStopDelivered = false
     const finishCompletedTurn = () => {
-      logicalStopDelivered = terminateChild() || logicalStopDelivered
+      // A sealed logical completion is not an abort deadline. Give the direct
+      // child unlimited time to emit a delayed terminal event and close its
+      // relays. A later explicit parent SIGINT/SIGTERM still enters the
+      // bounded terminateChild TERM-to-KILL path above.
+      logicalStopDelivered = signalChildTermination(false) || logicalStopDelivered
     }
     process.on('SIGINT', forwardSignal)
     process.on('SIGTERM', forwardSignal)
@@ -336,9 +375,13 @@ async function main(): Promise<void> {
     if (forceKillTimer) clearTimeout(forceKillTimer)
     tracking = false
     await tracker
-    // Reap inherited descriptor holders before deciding that the JSONL relay
-    // is stuck. Cancelling the relay first can discard a buffered terminal
-    // event while a completed subagent or MCP descendant still owns the pipe.
+    if (hasTestOverride
+      && process.env.ZEROKUN_SUPERVISOR_TEST_FORCE_RETAIN_AFTER_CHILD_EXIT === '1') {
+      throw new Error('forced supervisor retained-state for tests')
+    }
+    // Reap inherited descriptor holders before waiting for the JSONL relay.
+    // Cancelling a slow relay can discard a buffered terminal event while a
+    // completed subagent or MCP descendant still owns the pipe.
     captureTrackedProcesses([process.pid], process.pid, tracked, excluded)
     persistTracked()
     const remaining = await reapTrackedProcesses({
@@ -347,6 +390,7 @@ async function main(): Promise<void> {
       tracked,
       excludePids: excluded,
       signalGroup: false,
+      waitForForce: () => forceCleanupRequested,
     })
     // Keep SIGUSR2 handled until the supervisor process itself exits. The
     // executor may seal the final file while this wrapper is draining relays
@@ -362,31 +406,60 @@ async function main(): Promise<void> {
         fingerprint,
         earliest: supervisorIdentity,
         excludePids: new Set([process.pid]),
+        waitForForce: () => forceCleanupRequested,
       })
     }
-    const relayResults = await Promise.race([
-      relayCompletion,
-      Bun.sleep(2_000).then(() => undefined),
+    // A logical job has no relay deadline. After an explicit force request,
+    // first reap every exact tracked/Seatbelt generation above and still give
+    // their pipes a bounded natural-EOF grace. Only a pipe that remains open
+    // after that proof is cancelled, and cancellation is retained as cleanup
+    // uncertainty rather than promoted to a publishable receipt.
+    const relayBoundary = await Promise.race([
+      relayCompletion.then(results => ({ kind: 'complete' as const, results })),
+      forceCleanupSignal.then(() => ({ kind: 'force' as const })),
     ])
-    if (!relayResults) {
-      // An untracked process may have detached before the polling tracker saw
-      // it while retaining a JSONL pipe. Cancel only to release the parent
-      // reader; never convert this uncertainty into a publishable success.
-      await Promise.all([stdoutRelay.cancel(), stderrRelay.cancel()])
-      const cancelledRelayResults = await Promise.race([
+    let relayResults: PromiseSettledResult<void>[]
+    if (relayBoundary.kind === 'complete') {
+      relayResults = relayBoundary.results
+    } else {
+      const forcedRelayResults = await Promise.race([
         relayCompletion,
-        Bun.sleep(1_000).then(() => undefined),
+        Bun.sleep(childGraceMs).then(() => null),
       ])
-      if (!cancelledRelayResults) {
-        throw new Error('Codex output relay remained open after descendant cleanup')
+      if (forcedRelayResults === null) {
+        await Promise.race([
+          Promise.allSettled([stdoutRelay.cancel(), stderrRelay.cancel()]),
+          Bun.sleep(1_000),
+        ])
+        throw new Error('Codex output relay remained open after explicit cleanup')
       }
-      const cancelledRelayFailure = cancelledRelayResults.find(
-        result => result.status === 'rejected',
-      )
-      if (cancelledRelayFailure?.status === 'rejected') throw cancelledRelayFailure.reason
+      relayResults = forcedRelayResults
     }
-    const relayFailure = relayResults?.find(result => result.status === 'rejected')
+    const relayFailure = relayResults.find(result => result.status === 'rejected')
     if (relayFailure?.status === 'rejected') throw relayFailure.reason
+    if (hasTestOverride && process.env.ZEROKUN_SUPERVISOR_TEST_CLEANUP_GATE === '1') {
+      // Deterministically hold the test-only supervisor after every real cleanup
+      // step but before the durable self-confirm receipt.  Derive both names
+      // from the private managed state root and this exact supervisor PID so a
+      // caller cannot turn the gate into an arbitrary-path write primitive.
+      const gateBase = join(stateDir, `.test-cleanup-gate-${process.pid}`)
+      const readyPath = `${gateBase}.ready`
+      const releasePath = `${gateBase}.release`
+      writeFileSync(readyPath, '', { mode: 0o600, flag: 'wx' })
+      try {
+        while (!existsSync(releasePath)) await Bun.sleep(10)
+        const release = lstatSync(releasePath)
+        const releaseOwnerMatches = typeof process.getuid !== 'function'
+          || release.uid === process.getuid()
+        if (!release.isFile() || release.isSymbolicLink() || release.nlink !== 1
+          || release.size !== 0 || !releaseOwnerMatches) {
+          throw new Error('unsafe supervisor test cleanup gate release')
+        }
+      } finally {
+        rmSync(readyPath, { force: true })
+        rmSync(releasePath, { force: true })
+      }
+    }
     process.off('SIGINT', forwardSignal)
     process.off('SIGTERM', forwardSignal)
     cleanupConfirmed = true
@@ -401,9 +474,31 @@ async function main(): Promise<void> {
     // Keep the exact group leader and durable registration alive whenever
     // cleanup is uncertain. The executor/next runner can then TERM and KILL
     // the still-verifiable group without following a recycled numeric PGID.
-    process.stderr.write(
-      `Codex cleanup is pending; retaining supervisor registration: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`,
-    )
+    // Wake the parent's ordered App Server reader before retaining this exact
+    // group leader. Merely closing Bun's process.stdout wrapper is not an EOF
+    // guarantee while the process remains alive, so use a fixed internal
+    // notification that the session rejects as a cleanup fault.
+    try {
+      writeSync(1, '{"method":"zerokun/supervisor-retained","params":{"version":1}}\n')
+    } catch {}
+    try {
+      writeSync(
+        2,
+        `Codex cleanup is pending; retaining supervisor registration: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`,
+      )
+    } catch {}
+    // The exact leader stays alive so the parent/recovery path can still use
+    // its generation and group. Close both relay outputs, however, so the
+    // executor can distinguish retained cleanup from a legitimately slow
+    // normal cleanup and enter its bounded explicit-recovery path.
+    // Bun keeps process.stdout/process.stderr stream wrappers alive after
+    // end() while this supervisor intentionally remains resident. Closing the
+    // exact inherited pipe descriptors is the OS-level EOF sentinel required
+    // by the parent; no repository or arbitrary descriptor is affected.
+    try { process.stdout.destroy() } catch {}
+    try { process.stderr.destroy() } catch {}
+    try { closeSync(1) } catch {}
+    try { closeSync(2) } catch {}
     process.removeAllListeners('SIGINT')
     process.removeAllListeners('SIGTERM')
     process.removeAllListeners('SIGUSR2')

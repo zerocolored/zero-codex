@@ -479,7 +479,7 @@ describe('Herdr job monitor', () => {
     expect(control.closeCalls).toBe(0)
   })
 
-  test('staged resultのmonitor消失状態はroot欠落でもClaude clearを拒否する', async () => {
+  test('staged resultのmonitor消失状態はroot欠落でもadvisor cleanupを拒否する', async () => {
     const state = fixtureDirectory()
     const record = job({ monitorState: 'lost-staged' })
 

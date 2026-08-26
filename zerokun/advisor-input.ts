@@ -5,7 +5,8 @@ import { resolveZeroJobDatabasePath } from './state-dir.ts'
 import { requireManagedStateRoot } from './managed-path.ts'
 
 const MAX_INPUT_ENTRIES = 512
-const MAX_CANONICAL_INPUT_CHARS = 256 * 1024
+export const MAX_CANONICAL_INPUT_CHARS = 256 * 1024
+export const MAX_CANONICAL_INPUT_BYTES = 1024 * 1024
 
 export type AdvisorInputEntry = {
   revision: number
@@ -101,7 +102,8 @@ export function createAdvisorInputSnapshot(
     ? entries.map(({ writeEnabled: _writeEnabled, ...entry }) => entry)
     : entries
   const canonical = JSON.stringify({ version: canonicalVersion, jobId: job.id, entries: canonicalEntries })
-  if (canonical.length > MAX_CANONICAL_INPUT_CHARS) {
+  if (canonical.length > MAX_CANONICAL_INPUT_CHARS
+    || Buffer.byteLength(canonical, 'utf8') > MAX_CANONICAL_INPUT_BYTES) {
     throw new Error('advisor input transcript exceeds the managed size limit')
   }
   const transcript = entries.map(entry => [

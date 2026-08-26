@@ -193,6 +193,45 @@ resolve_herdr_binary() {
   printf '%s\n' "$binary"
 }
 
+resolve_claude_binary() {
+  local binary resolved
+  binary="$(command -v claude 2>/dev/null)" || return 1
+  case "$binary" in /*) ;; *) return 1 ;; esac
+  [ -f "$binary" ] && [ -x "$binary" ] || return 1
+  resolved="$(/usr/bin/perl -MCwd=realpath -e 'print realpath($ARGV[0]) // q{}' "$binary" 2>/dev/null)" || return 1
+  [ -f "$resolved" ] && [ -x "$resolved" ] || return 1
+  [ "$(/usr/bin/stat -f '%u' "$resolved" 2>/dev/null)" = "$(/usr/bin/id -u)" ] || return 1
+  printf '%s\n' "$binary"
+}
+
+claude_subscription_ready() {
+  local binary binary_dir
+  binary="$(resolve_claude_binary)" || return 1
+  binary_dir="$(dirname "$binary")"
+  /usr/bin/env -i \
+    HOME="$HOME" \
+    PATH="$binary_dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    LANG="${LANG:-en_US.UTF-8}" \
+    LC_ALL="${LC_ALL:-${LANG:-en_US.UTF-8}}" \
+    "$binary" auth status --json 2>/dev/null \
+    | /usr/bin/python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+valid = (
+    isinstance(value, dict)
+    and value.get("loggedIn") is True
+    and value.get("authMethod") == "claude.ai"
+    and value.get("apiProvider") == "firstParty"
+    and isinstance(value.get("subscriptionType"), str)
+    and bool(value.get("subscriptionType"))
+)
+raise SystemExit(0 if valid else 1)
+'
+}
+
 herdr_capabilities_ready() {
   local binary="${1:-herdr}" help
   help="$(herdr_probe "$binary" pane current --help 2>&1)" || return 1
@@ -204,6 +243,12 @@ herdr_capabilities_ready() {
   esac
   help="$(herdr_probe "$binary" workspace list --help 2>&1)" || return 1
   case "$help" in *'Usage: herdr workspace list'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" workspace create --help 2>&1)" || return 1
+  case "$help" in *'--cwd'*'--label'*'--no-focus'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" workspace get --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr workspace get'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" workspace close --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr workspace close'*) ;; *) return 1 ;; esac
   help="$(herdr_probe "$binary" tab list --help 2>&1)" || return 1
   case "$help" in *'--workspace'*) ;; *) return 1 ;; esac
   help="$(herdr_probe "$binary" pane list --help 2>&1)" || return 1
@@ -217,6 +262,8 @@ herdr_capabilities_ready() {
   esac
   help="$(herdr_probe "$binary" pane process-info --help 2>&1)" || return 1
   case "$help" in *'--pane'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" pane get --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr pane get'*) ;; *) return 1 ;; esac
   help="$(herdr_probe "$binary" tab close --help 2>&1)" || return 1
   case "$help" in *'Usage: herdr tab close'*) ;; *) return 1 ;; esac
   help="$(herdr_probe "$binary" agent list --help 2>&1)" || return 1
@@ -227,6 +274,10 @@ herdr_capabilities_ready() {
   case "$help" in *'--source'*'--lines'*) ;; *) return 1 ;; esac
   help="$(herdr_probe "$binary" agent prompt --help 2>&1)" || return 1
   case "$help" in *'--wait'*'--until'*'--timeout'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" agent start --help 2>&1)" || return 1
+  case "$help" in *'--kind'*'--pane'*'--timeout'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" agent send-keys --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr agent send-keys'*) ;; *) return 1 ;; esac
 }
 
 herdr_compatible() {
@@ -665,7 +716,7 @@ run_doctor() {
     printf '   %-20s %s\n' 'Herdr:' "herdr $herdr_version"
   elif [ -n "$herdr_binary" ] && [ -n "$herdr_version" ]; then
     printf '   %-20s %s\n' 'Herdr:' \
-      "herdr $herdr_version (${MIN_HERDR_VERSION}以上とtab/pane APIが必要)"
+      "herdr $herdr_version (${MIN_HERDR_VERSION}以上とworkspace/tab/pane/agent APIが必要)"
     missing=1
   else
     printf '   %-20s %s\n' 'Herdr:' '未導入または実行失敗'
@@ -1017,7 +1068,7 @@ install_grok_build() {
 
 install_cli_tools() {
   local standalone_codex="$HOME/.local/bin/codex"
-  section "tmux / Herdr / Codex CLI / Grok Build / Bun"
+  section "tmux / Herdr / Codex CLI / Grok Build / Claude Code / Bun"
   if ! command -v tmux >/dev/null 2>&1; then
     isolated_network_command "$(command -v brew)" install tmux
   fi
@@ -1032,7 +1083,7 @@ install_cli_tools() {
   fi
   hash -r
   herdr_compatible \
-    || fail "Herdr ${MIN_HERDR_VERSION}以上と必要なtab/pane APIを確認できません"
+    || fail "Herdr ${MIN_HERDR_VERSION}以上と必要なworkspace/tab/pane/agent APIを確認できません"
   # Homebrew prefix is group-writable on a standard multi-user macOS install.
   # Keep the executable used by Zeroちゃん under the account-owned standalone path.
   if ! secure_standalone_codex >/dev/null; then
@@ -1068,6 +1119,8 @@ export PATH="$BUN_INSTALL/bin:$PATH"'
     || fail "Codex公式standaloneの安全性を確認できませんでした"
   grok_build_executable >/dev/null \
     || fail "Grok Build公式CLIの安全性を確認できませんでした"
+  resolve_claude_binary >/dev/null \
+    || fail "Claude Codeがありません。公式Claude Codeを導入してから同じbootstrapを再実行してください"
   ok "必要なCLIを導入しました"
 }
 
@@ -1086,7 +1139,9 @@ verify_logins() {
     || fail "Grok CLIの安全性を確認できませんでした"
   grok_auth_ready \
     || fail "Grok CLIが未ログインまたはauthがunsafeです。先にgrok loginを完了してください。Zeroちゃんは認証操作を行いません"
-  ok "Codex / Grok CLIは事前ログイン済みです"
+  claude_subscription_ready \
+    || fail "Claude Codeはsubscription login済みである必要があります。Herdrで先にloginしてください。Zeroちゃんは認証操作を行いません"
+  ok "Codex / Grok CLI / Claude Codeは事前ログイン済みです"
 }
 
 repo_is_clean() {
@@ -1203,18 +1258,12 @@ install_repositories() {
 
 install_grok_reviewer() {
   section "専用advisor runtime"
-  [ -f "$REPO_DIR/zerokun/install-fifth-advisor.ts" ] \
-    || fail "fifth-advisor helper installerがありません: $REPO_DIR/zerokun/install-fifth-advisor.ts"
-  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-fifth-advisor.ts" install \
-    || fail "fifth-advisor helperを導入できませんでした"
-  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-fifth-advisor.ts" verify \
-    || fail "fifth-advisor helperのowner-only配置を確認できませんでした"
   [ -f "$REPO_DIR/zerokun/install-grok-reviewer.ts" ] \
     || fail "Grok reviewer installerがありません: $REPO_DIR/zerokun/install-grok-reviewer.ts"
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-grok-reviewer.ts" install \
     || fail "専用Grok reviewerを導入できませんでした"
   grok_reviewer_ready || fail "専用Grok reviewerのowner-only配置を確認できませんでした"
-  ok "専用read-only reviewerとHerdr transport helperを導入しました"
+  ok "専用read-only reviewerを導入しました"
 }
 
 ensure_project_workspace() {

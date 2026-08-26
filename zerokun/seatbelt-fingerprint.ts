@@ -365,6 +365,10 @@ export async function reapSeatbeltFingerprint(options: {
   fingerprint: SeatbeltFingerprint
   earliest?: ProcessIdentity
   excludePids?: ReadonlySet<number>
+  /** Normal cleanup gives TERM unlimited time; explicit force then permits KILL. */
+  waitForForce?: () => boolean
+  /** Records that live exact generations reached the bounded KILL phase. */
+  onForce?: () => void
 }): Promise<number[]> {
   verifySeatbeltFingerprint(options.stateDir, options.fingerprint)
   const owner = typeof process.getuid === 'function' ? process.getuid() : undefined
@@ -406,7 +410,39 @@ export async function reapSeatbeltFingerprint(options: {
     await Bun.sleep(25)
   }
   if (stablePasses < 2) throw new Error('Seatbelt descendant freeze did not reach a fixed point')
-  for (const identity of caught.values()) {
+  let live = [...caught.values()].filter(identity => {
+    const observation = observeProcessGeneration(identity)
+    if (observation.status === 'unknown') {
+      throw new Error(`Seatbelt process ${identity.pid} generation is unknown before cleanup`)
+    }
+    return observation.status === 'alive'
+  })
+  if (options.waitForForce && live.length > 0) {
+    // The fixed-point capture above freezes detached/reparented descendants so
+    // they cannot escape the exact set. Resume each exact generation and give
+    // TERM unlimited time during ordinary cleanup. A later explicit parent
+    // signal flips waitForForce and authorizes the bounded KILL phase below.
+    for (const identity of live) {
+      signalProcessIfLive(identity, 'SIGCONT')
+      if (signalProcessIfLive(identity, 'SIGTERM')) continue
+      const after = observeProcessGeneration(identity)
+      if (after.status === 'unknown' || after.status === 'alive') {
+        throw new Error(`Seatbelt process ${identity.pid} could not receive TERM`)
+      }
+    }
+    while (live.length > 0 && !options.waitForForce()) {
+      await Bun.sleep(25)
+      live = live.filter(identity => {
+        const observation = observeProcessGeneration(identity)
+        if (observation.status === 'unknown') {
+          throw new Error(`Seatbelt process ${identity.pid} generation is unknown after TERM`)
+        }
+        return observation.status === 'alive'
+      })
+    }
+  }
+  if (live.length > 0) options.onForce?.()
+  for (const identity of live) {
     const observation = observeProcessGeneration(identity)
     if (observation.status === 'unknown') {
       throw new Error(`Seatbelt process ${identity.pid} generation is unknown before KILL`)

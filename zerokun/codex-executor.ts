@@ -26,6 +26,8 @@ import {
 } from './managed-path.ts'
 import {
   captureTrackedProcesses,
+  MAX_EXECUTOR_REGISTRATION_BYTES,
+  MAX_TRACKED_PROCESSES,
   reapTrackedProcesses,
   seedTrackedProcess,
 } from './process-tree.ts'
@@ -73,6 +75,7 @@ import {
   type AdvisorInputSnapshot,
 } from './advisor-input.ts'
 import {
+  APP_SERVER_CONTROL_POLL_MS,
   AppServerAmbiguousRequestError,
   AppServerProtocolError,
   CodexAppServerSession,
@@ -1241,7 +1244,7 @@ function parseCompletedAdvisorJournal(
     throw new Error('advisor journal must be an object')
   }
   const journal = parsed as Record<string, unknown>
-  if (journal.version !== 4 || journal.status !== 'completed'
+  if (journal.version !== 5 || journal.status !== 'completed'
     || journal.phase !== requirement.phase || journal.round !== requirement.round
     || journal.contextDigest !== expectedContextDigest
     || journal.attemptNonce !== expectedAttemptNonce
@@ -1293,18 +1296,19 @@ function parseCompletedAdvisorJournal(
   }
 
   if (!journal.claude || typeof journal.claude !== 'object' || Array.isArray(journal.claude)) {
-    throw new Error('advisor journal omitted the best-effort Claude attempt')
+    throw new Error('advisor journal omitted the required ephemeral Claude advisor')
   }
   const claude = journal.claude as Record<string, unknown>
-  if (claude.attempted !== true || typeof claude.adopted !== 'boolean') {
-    throw new Error('advisor journal has an invalid Claude attempt')
-  }
-  if (claude.adopted === true) {
-    if (!validSha256(claude.responseDigest)) {
-      throw new Error('advisor journal adopted Claude without a response digest')
-    }
-  } else if (!validSha256(claude.reasonDigest)) {
-    throw new Error('advisor journal skipped Claude without a reason digest')
+  if (claude.attempted !== true
+    || claude.required !== true
+    || claude.lifecycle !== 'ephemeral-v2'
+    || claude.adopted !== true
+    || claude.freshEphemeral !== true
+    || claude.cleanupVerified !== true
+    || claude.cleanupStatus !== 'closed-and-verified'
+    || !validSha256(claude.responseDigest)
+    || !validSha256(claude.cleanupReceiptDigest)) {
+    throw new Error('advisor journal has an incomplete required ephemeral Claude result')
   }
   return {
     startedAt: Number(journal.startedAt),
@@ -1360,7 +1364,7 @@ function collectNativeAdvisorJournalEvidence(options: {
       const journal = parsed as Record<string, unknown>
       const phase = journalMatch[1] as NativeAdvisorRoundEvidence['phase']
       const round = Number(journalMatch[2]) as NativeAdvisorRoundEvidence['round']
-      if (journal.version !== 4
+      if (journal.version !== 5
         || !['requested', 'completed', 'required-reviewer-failed', 'stale-input']
           .includes(String(journal.status))
         || journal.phase !== phase || journal.round !== round
@@ -2065,11 +2069,13 @@ export function buildCodexDeveloperInstructions(
       'full response and returned thread ID; do not summarize or invent IDs. The host validates',
       'the official App Server parent/child history, completed turns, exact markers, response',
       'digests, and the complete direct-child set before accepting a phase.',
-      'The broker is a narrow read-only transport for two isolated Grok reviewers and at most one',
-      'eligible existing live Claude Code. Never access Herdr, reviewer files, sockets, secrets,',
-      'or credentials directly. Never start, restore, attach, focus, or repurpose an agent or',
-      'pane. Advisors must not delegate. If a required advisor is unavailable, preserve the exact',
-      'skip/blocker instead of weakening the sandbox. Close completed native subagents only when',
+      'The broker is a narrow read-only transport for two isolated Grok reviewers and exactly one',
+      'round-owned fresh ephemeral Claude Code workspace. The host creates it for the round and',
+      'closes that exact workspace afterward; existing panes are never reused or cleared. Never',
+      'access Herdr, reviewer files, sockets, secrets, or credentials directly. Never start,',
+      'restore, attach, focus, or repurpose an agent or pane. Advisors must not delegate. If a',
+      'required advisor is unavailable, preserve the exact blocker instead of weakening the',
+      'sandbox. Close completed native subagents only when',
       'the native close_agent capability exists; otherwise the host retires the whole generation.',
       'Review rounds are contiguous and limited to 1 through 3. Do not change repository or Git',
       'state after a publish review. Only regular files directly under the artifact directory',
@@ -2091,8 +2097,9 @@ export function buildCodexDeveloperInstructions(
     'advisor_round once, poll advisor_round_poll with the same binding without a count or total-',
     'duration limit, and acknowledge the exact receipt before answering. Pass exact responses',
     'and real child thread IDs; do not summarize or invent them. Advisors must not delegate.',
-    'The broker is read-only. Never access Herdr, reviewer files, sockets, secrets, or credentials',
-    'directly, and never start, restore, attach, focus, or repurpose an agent or pane. Preserve an',
+    'The broker creates one fresh round-owned Claude workspace and closes it afterward; it never',
+    'reuses or clears an existing pane. Never access Herdr, reviewer files, sockets, secrets, or',
+    'credentials directly, and never start, restore, attach, focus, or repurpose an agent or pane. Preserve an',
     'exact unavailable-advisor blocker instead of weakening the sandbox. Do not create or modify',
     'a Codex goal. Only regular files directly under the current host artifact directory may be',
     'returned. If a change is requested, report the exact access command supplied by the host.',
@@ -2380,17 +2387,22 @@ function gitOutput(repo: string, args: string[]): string {
   return new TextDecoder().decode(result.stdout).trim()
 }
 
-function readSmallRegularFile(path: string, label: string): string {
+function readSmallRegularFile(path: string, label: string, maxBytes = 4_096): string {
   const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
     const metadata = fstatSync(descriptor)
     const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
-    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > 4096 || !ownerMatches
+    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > maxBytes || !ownerMatches
       || (metadata.mode & 0o022) !== 0) {
       throw new Error(`unsafe ${label}: ${path}`)
     }
     const buffer = Buffer.alloc(metadata.size)
-    if (metadata.size > 0) readSync(descriptor, buffer, 0, metadata.size, 0)
+    let offset = 0
+    while (offset < buffer.length) {
+      const count = readSync(descriptor, buffer, offset, buffer.length - offset, offset)
+      if (count <= 0) throw new Error(`${label} changed while reading: ${path}`)
+      offset += count
+    }
     return buffer.toString('utf8').trim()
   } finally {
     closeSync(descriptor)
@@ -3363,6 +3375,7 @@ export async function executeCodexJob(
     boundInput?: AdvisorInputSnapshot,
   ) => {
     if (options.signal?.aborted) throw new CodexInterruptedError('Codex job was interrupted')
+    if (options.liveControls?.cancellationRequested()) throw new CodexUserCancelledError()
     revalidateCodexExecutable()
     if (officialCodexSnapshot) {
       assertCodexChatGptSubscriptionLogin(codexBin)
@@ -3401,6 +3414,19 @@ export async function executeCodexJob(
       } catch (error) {
         await retireUnregisteredAttempt('Codex preflight')
         throw error
+      }
+    }
+    if (options.liveControls) {
+      let cancelled = false
+      try {
+        cancelled = options.liveControls.cancellationRequested()
+      } catch (error) {
+        await retireUnregisteredAttempt('Codex cancellation preflight')
+        throw error
+      }
+      if (cancelled) {
+        await retireUnregisteredAttempt('cancelled Codex preflight')
+        throw new CodexUserCancelledError()
       }
     }
     const stageLabel = stage === 'complete'
@@ -3516,7 +3542,10 @@ export async function executeCodexJob(
         trackingError = error
       }
     })()
-    const reapTrackedSupervisor = async (): Promise<void> => {
+    const reapTrackedSupervisor = async (cleanup: {
+      waitForForce?: () => boolean
+      onForce?: () => void
+    } = {}): Promise<void> => {
       if (trackingError) {
         throw new CodexCleanupPendingError(
           `Codex supervisorの子process追跡が不確実です: ${trackingError}`,
@@ -3528,6 +3557,8 @@ export async function executeCodexJob(
           rootPids: [proc.pid],
           groupId: proc.pid,
           tracked,
+          waitForForce: cleanup.waitForForce,
+          onForce: cleanup.onForce,
         })
       } catch (error) {
         throw new CodexCleanupPendingError(
@@ -3540,19 +3571,23 @@ export async function executeCodexJob(
         )
       }
     }
-    const verifyRegistration = (options: {
+    const readVerifiedRegistration = (options: {
       allowActive: boolean
       requirePresent: boolean
-    }): void => {
+    }): Record<string, unknown> | null => {
       if (!existsSync(registrationPath)) {
         if (options.requirePresent) {
           throw new CodexCleanupPendingError('Codex executor登録が消失しました')
         }
-        return
+        return null
       }
       let value: unknown
       try {
-        value = JSON.parse(readSmallRegularFile(registrationPath, 'executor registration'))
+        value = JSON.parse(readSmallRegularFile(
+          registrationPath,
+          'executor registration',
+          MAX_EXECUTOR_REGISTRATION_BYTES,
+        ))
       } catch (error) {
         throw new CodexCleanupPendingError(
           `Codex executor登録を安全に検証できません: ${error}`,
@@ -3577,7 +3612,7 @@ export async function executeCodexJob(
           && !(options.allowActive && record.phase === 'active'))
           || !Number.isSafeInteger(record.revision) || Number(record.revision) < 0
           || !Array.isArray(record.tracked) || record.tracked.length < 1
-          || record.tracked.length > 4_096
+          || record.tracked.length > MAX_TRACKED_PROCESSES
           || !record.tracked.some(value => value && typeof value === 'object'
             && (value as Record<string, unknown>).pid === supervisorIdentity.pid
             && (value as Record<string, unknown>).started === supervisorIdentity.started)) {
@@ -3592,6 +3627,13 @@ export async function executeCodexJob(
         throw new CodexCleanupPendingError('official Codex executor omitted Seatbelt cleanup evidence')
       }
       verifySeatbeltFingerprint(managedStateDir, advisorAttempt.seatbeltFingerprint)
+      return record
+    }
+    const verifyRegistration = (options: {
+      allowActive: boolean
+      requirePresent: boolean
+    }): void => {
+      readVerifiedRegistration(options)
       const observation = observeProcessGeneration(supervisorIdentity)
       if (observation.status === 'unknown') {
         throw new CodexCleanupPendingError('Codex supervisorの終了generationを確認できません')
@@ -3604,6 +3646,8 @@ export async function executeCodexJob(
       allowActive: boolean
       requirePresent: boolean
       label: string
+      waitForForce?: () => boolean
+      onForce?: () => void
     }): Promise<void> => {
       verifyRegistration(options)
       try {
@@ -3612,6 +3656,8 @@ export async function executeCodexJob(
           fingerprint: advisorAttempt.seatbeltFingerprint,
           earliest: advisorAttempt.fingerprintEarliest,
           excludePids: new Set([process.pid]),
+          waitForForce: options.waitForForce,
+          onForce: options.onForce,
         })
       } catch (error) {
         throw new CodexCleanupPendingError(
@@ -3625,11 +3671,21 @@ export async function executeCodexJob(
       }
       removeSeatbeltFingerprint(managedStateDir, advisorAttempt.seatbeltFingerprint)
     }
-    const retireCompletedRegistration = (): Promise<void> => retireRegistration({
-      allowActive: false,
-      requirePresent: false,
-      label: 'post-Codex App Server',
-    })
+    const retireCompletedRegistration = async (): Promise<void> => {
+      let forced = false
+      await retireRegistration({
+        allowActive: false,
+        requirePresent: false,
+        label: 'post-Codex App Server',
+        waitForForce: () => options.signal?.aborted === true,
+        onForce: () => { forced = true },
+      })
+      if (!forced) return
+      if (options.signal?.aborted) throw new CodexUserCancelledError()
+      throw new CodexCleanupPendingError(
+        'post-Codex App Server cleanup required bounded force and cannot be published',
+      )
+    }
     const retireCancelledRegistration = (): Promise<void> => retireRegistration({
       // A cancellation is never publishable. After the parent has proven that
       // the exact process group and every Seatbelt-tagged escape are gone, an
@@ -3642,8 +3698,12 @@ export async function executeCodexJob(
     let timedOut = false
     let cleanupTimer: ReturnType<typeof setTimeout> | undefined
     let requestForcedCleanup: (() => void) | undefined
+    let parentForceClaimed = false
     const forcedCleanup = new Promise<'cleanup'>(resolve => {
-      requestForcedCleanup = () => resolve('cleanup')
+      requestForcedCleanup = () => {
+        parentForceClaimed = true
+        resolve('cleanup')
+      }
     })
     const signalProcess = (signal: NodeJS.Signals): void => {
       if (signalProcessGroupIfLeaderLive(supervisorIdentity, signal)) return
@@ -3662,10 +3722,6 @@ export async function executeCodexJob(
       // reaps only descendants it already tracks. Abort/timeout continue to
       // use the process-group path above and remain distinguishable.
       signalProcessIfLive(supervisorIdentity, 'SIGUSR2')
-      cleanupTimer ??= setTimeout(
-        () => requestForcedCleanup?.(),
-        positiveInteger(options.supervisorCleanupGraceMs, 5_000),
-      )
     }
     if (options.liveControls) {
       const controls = options.liveControls
@@ -3737,10 +3793,54 @@ export async function executeCodexJob(
         error: string
       } | null } = { current: null }
       const parentTurnIds: string[] = []
+      let processBoundarySealed = false
+      let cancellationWatcherActive = true
+      let stopCancellationWatcher!: () => void
+      const cancellationWatcherStopped = new Promise<void>(resolve => {
+        stopCancellationWatcher = resolve
+      })
+      let cancellationControlError: unknown
+      let cancellationTerminationRequested = false
+
+      const terminateForCancellation = (): void => {
+        if (cancellationTerminationRequested) return
+        cancellationTerminationRequested = true
+        terminate()
+      }
+
+      const observeCancellation = (processStillLive: boolean): void => {
+        try {
+          if (!controls.cancellationRequested()) return
+          userCancelled = true
+          // Once an App Server turn is active, its durable interrupt row must
+          // still travel through turn/interrupt so the audit ledger can be
+          // acknowledged. Before a turn exists, or after its accepted
+          // terminal seals ordinary input, there is no request to steer and
+          // the exact owned process is stopped immediately.
+          if (processStillLive && (currentTurnId === null || protocolCompleted)) {
+            terminateForCancellation()
+          }
+        } catch (error) {
+          cancellationControlError ??= error
+          protocolError ??= error
+          if (processStillLive) terminateForCancellation()
+        }
+      }
+      const cancellationWatcher = (async () => {
+        while (cancellationWatcherActive) {
+          observeCancellation(!processBoundarySealed)
+          if (cancellationControlError) return
+          const stopped = await Promise.race([
+            Bun.sleep(APP_SERVER_CONTROL_POLL_MS).then(() => false),
+            cancellationWatcherStopped.then(() => true),
+          ])
+          if (stopped) return
+        }
+      })()
 
       const cancellationTerminalMissing = (): never => {
         userCancelled = true
-        terminate()
+        terminateForCancellation()
         throw new CodexUserCancelledError(
           'Codex acknowledged cancellation but did not emit a terminal turn before the grace deadline',
         )
@@ -4030,8 +4130,9 @@ export async function executeCodexJob(
 
         while (true) {
           if (abortedBeforeProcessExit) throw new CodexInterruptedError('Codex job was interrupted')
-          const appServerError = session.takeError()
-          if (appServerError) {
+          const activity = session.takeNextTurnActivity(currentThreadId, currentTurnId)
+          if (activity?.kind === 'error') {
+            const appServerError = activity.error
             if (appServerError.threadId !== currentThreadId
               || appServerError.turnId !== currentTurnId
               || typeof appServerError.willRetry !== 'boolean') {
@@ -4060,8 +4161,9 @@ export async function executeCodexJob(
             // notification. `willRetry: true` also means App Server itself is
             // retrying this same turn, so host-side requeue would duplicate the
             // initial prompt. Keep polling/steering until the terminal arrives.
+            continue
           }
-          const terminal = session.takeTurnTerminal(currentThreadId, currentTurnId)
+          const terminal = activity?.kind === 'terminal' ? activity.terminal : null
           if (terminal) {
             let reconciledTurn = terminal.turn
             finalTurn = reconciledTurn
@@ -4250,40 +4352,133 @@ export async function executeCodexJob(
         if (error instanceof CodexInputChangedBeforeDispatchError) {
           inputChangedBeforeDispatch = true
         }
-        if (error instanceof CodexUserCancelledError || controls.cancellationRequested()) {
-          userCancelled = true
+        let cancellationRequested = false
+        try {
+          cancellationRequested = controls.cancellationRequested()
+        } catch (cancellationError) {
+          protocolError = cancellationError
         }
-        if (!(error instanceof CodexUserCancelledError)) terminate()
+        if (error instanceof CodexUserCancelledError || cancellationRequested) {
+          userCancelled = true
+          terminateForCancellation()
+        } else {
+          terminate()
+        }
       } finally {
-        session.closeInput()
-        cleanupTimer ??= setTimeout(
-          () => requestForcedCleanup?.(),
-          positiveInteger(options.supervisorCleanupGraceMs, 10_000),
-        )
+        try {
+          session.closeInput()
+        } catch (error) {
+          protocolError ??= error
+          terminate()
+        }
       }
+      if (protocolCompleted && protocolError == null && !userCancelled) finishLogicalTurn()
+      // A cancellation already accepted by the active App Server turn must
+      // remain bounded even if the durable hook becomes temporarily
+      // unavailable after terminal delivery.
+      if (userCancelled) terminateForCancellation()
 
-      let processOutcome = await Promise.race([
+      let processOutcome: { kind: 'exit', exitCode: number } | 'cleanup' | {
+        kind: 'reader-closed'
+        error: unknown | null
+      } = await Promise.race([
         proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
         forcedCleanup,
+        session.waitForReader().then(
+          () => ({ kind: 'reader-closed' as const, error: null }),
+          error => ({ kind: 'reader-closed' as const, error }),
+        ),
       ])
+      if (typeof processOutcome === 'object' && processOutcome.kind === 'reader-closed') {
+        let outputCloseError = processOutcome.error
+        let outputClosePhase: unknown
+        try {
+          outputClosePhase = readVerifiedRegistration({
+            allowActive: true,
+            requirePresent: true,
+          })?.phase
+        } catch (error) {
+          outputCloseError ??= error
+        }
+        if (outputCloseError || outputClosePhase !== 'cleanup-confirmed') {
+          protocolError ??= outputCloseError ?? new CodexCleanupPendingError(
+            'Codex supervisor closed its output while cleanup remained active',
+          )
+          // Closing output while the exact supervisor remains active is the
+          // supervisor's retained-cleanup sentinel. This is an explicit crash
+          // recovery path, so bounded TERM-to-KILL cleanup is appropriate.
+          terminate()
+        }
+        processOutcome = await Promise.race([
+          proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
+          forcedCleanup,
+        ])
+      }
+      processBoundarySealed = true
+      // Seal both facts at the process/force boundary. A later runner abort
+      // cannot rewrite a self-confirmed exit, while a force callback that has
+      // already linearized remains sticky even if proc.exited races it.
+      const interruptedAtExit = abortedBeforeProcessExit
+      options.signal?.removeEventListener('abort', abort)
+      const forceWasClaimed = processOutcome === 'cleanup' || parentForceClaimed
+      if (!forceWasClaimed && cleanupTimer) clearTimeout(cleanupTimer)
+      observeCancellation(forceWasClaimed)
+      let registrationError: unknown
+      if (!forceWasClaimed) {
+        // The receipt state at the exact process-exit boundary is authoritative.
+        // Do this before the first await so a delayed writer cannot promote an
+        // active or missing receipt after the supervisor has already exited.
+        try {
+          verifyRegistration({ allowActive: false, requirePresent: true })
+        } catch (error) {
+          registrationError = error
+        }
+        // Close the poll-stop edge with one final durable read after sealing
+        // the receipt decision. No process signal is needed after exact exit.
+        observeCancellation(false)
+      }
+      cancellationWatcherActive = false
+      stopCancellationWatcher()
+      await cancellationWatcher
       let exitCode: number
-      let forcedCleanupUsed = false
-      if (processOutcome === 'cleanup') {
+      let forcedCleanupUsed = cancellationControlError != null || registrationError != null
+      let postExitCleanupForced = false
+      if (forceWasClaimed) {
         forcedCleanupUsed = true
         tracking = false
         await tracker
-        await reapTrackedSupervisor()
+        await reapTrackedSupervisor({
+          waitForForce: () => true,
+          onForce: () => { postExitCleanupForced = true },
+        })
         exitCode = await proc.exited
       } else {
+        if (typeof processOutcome !== 'object' || processOutcome.kind !== 'exit') {
+          throw new CodexCleanupPendingError('Codex process boundary remained unresolved')
+        }
         exitCode = processOutcome.exitCode
         tracking = false
         await tracker
-        if (existsSync(registrationPath)) {
-          await reapTrackedSupervisor()
-          try {
-            verifyRegistration({ allowActive: false, requirePresent: false })
-          } catch { forcedCleanupUsed = true }
-        } else forcedCleanupUsed = true
+        await reapTrackedSupervisor({
+          // A clean successful turn waits without a deadline. Exact Slack
+          // cancellation/host abort or an already-established internal fault
+          // authorizes the bounded KILL phase.
+          waitForForce: () => options.signal?.aborted === true
+            || registrationError != null
+            || protocolError != null
+            || exitCode !== 0,
+          onForce: () => { postExitCleanupForced = true },
+        })
+        if (registrationError) protocolError ??= registrationError
+      }
+      if (postExitCleanupForced) {
+        forcedCleanupUsed = true
+        observeCancellation(false)
+        if (!userCancelled) {
+          protocolError ??= new CodexCleanupPendingError(
+            'Codex post-exit cleanup required bounded force and cannot be published',
+          )
+        }
       }
       if (cleanupTimer) clearTimeout(cleanupTimer)
       if (herdrIdentityTimer) clearInterval(herdrIdentityTimer)
@@ -4293,6 +4488,19 @@ export async function executeCodexJob(
       options.onProcessExit?.(exitCode)
       let readerError: unknown
       try { await session.waitForReader() } catch (error) { readerError = error }
+      let lateProtocolError: unknown
+      const lateAppServerError = session.takeError()
+      if (lateAppServerError) {
+        lateProtocolError = lateAppServerError.threadId !== currentThreadId
+          || lateAppServerError.turnId !== currentTurnId
+          || typeof lateAppServerError.willRetry !== 'boolean'
+          ? new AppServerProtocolError(
+            `App Server late error is not bound to the accepted turn: ${JSON.stringify(lateAppServerError)}`,
+          )
+          : new AppServerProtocolError(
+            `App Server emitted an error after the accepted terminal: ${JSON.stringify(lateAppServerError)}`,
+          )
+      }
       closeSync(stdoutDescriptor)
       stdoutTail = (stdoutTail + stdoutDecoder.decode()).slice(-MAX_LOG_TAIL_CHARS)
       const stderr = await stderrPromise
@@ -4302,13 +4510,14 @@ export async function executeCodexJob(
         )
       }
       protocolError ??= readerError
+      protocolError ??= lateProtocolError
       if (protocolError && !userCancelled) {
         const detail = protocolError instanceof Error ? protocolError.message : String(protocolError)
         stdoutTail = `${stdoutTail}\n${JSON.stringify({
           type: 'error', message: detail,
         })}\n`.slice(-MAX_LOG_TAIL_CHARS)
       }
-      if (protocolCompleted && finalMessage) {
+      if (protocolCompleted && protocolError == null && finalMessage) {
         atomicWritePrivateFile(finalPath, finalMessage)
       }
       return {
@@ -4318,7 +4527,7 @@ export async function executeCodexJob(
         timedOut: false,
         finalMessage,
         observedSessionId,
-        interruptedAtExit: abortedBeforeProcessExit,
+        interruptedAtExit,
         protocolCompleted: protocolCompleted && protocolError == null,
         logicalCleanup: true,
         forcedCleanupUsed,
@@ -4487,8 +4696,19 @@ export async function executeCodexJob(
       }
     }, timeoutMs)
     let abortedBeforeProcessExit = false
+    let processBoundarySealed = false
     let runtimeIdentityError: unknown
     const abort = () => {
+      if (processBoundarySealed) return
+      if (stopCause === 'logical-complete') {
+        // Logical seal stops the job timeout but must not make a wedged cleanup
+        // uninterruptible. Abort after seal is an abnormal bounded recovery,
+        // distinct from the unlimited normal SIGUSR2 cleanup path.
+        stopCause = 'abort'
+        abortedBeforeProcessExit = true
+        terminate()
+        return
+      }
       if (claimStopCause('abort')) {
         abortedBeforeProcessExit = true
         terminate()
@@ -4526,32 +4746,51 @@ export async function executeCodexJob(
       ])
     }
     attemptEnded = true
+    const forceWasClaimed = processOutcome === 'cleanup' || parentForceClaimed
+    const interruptedAtExit = abortedBeforeProcessExit
+    processBoundarySealed = true
+    options.signal?.removeEventListener('abort', abort)
+    if (!forceWasClaimed && cleanupTimer) clearTimeout(cleanupTimer)
+    let registrationError: unknown
+    if (!forceWasClaimed) {
+      // Snapshot the exact self-confirm receipt in the same turn as process
+      // exit. Later awaits must not let an active/missing receipt be promoted.
+      try {
+        verifyRegistration({ allowActive: false, requirePresent: true })
+      } catch (error) {
+        registrationError = error
+      }
+    }
     let exitCode: number
-    let forcedCleanupUsed = false
-    if (processOutcome === 'cleanup') {
+    let forcedCleanupUsed = registrationError != null
+    let postExitCleanupForced = false
+    if (forceWasClaimed) {
       forcedCleanupUsed = true
       tracking = false
       await tracker
-      await reapTrackedSupervisor()
+      await reapTrackedSupervisor({
+        waitForForce: () => true,
+        onForce: () => { postExitCleanupForced = true },
+      })
       exitCode = await proc.exited
     } else {
+      if (processOutcome === 'cleanup') {
+        throw new CodexCleanupPendingError('Codex cleanup force state changed unexpectedly')
+      }
       exitCode = processOutcome.exitCode
       tracking = false
       await tracker
-      // A clean v3 supervisor leaves a durable cleanup-confirmed receipt after
-      // every tracked descendant is gone. Missing or active state is
-      // ambiguous and must block publication.
-      if (existsSync(registrationPath)) {
-        await reapTrackedSupervisor()
-        try {
-          verifyRegistration({ allowActive: false, requirePresent: false })
-        } catch { forcedCleanupUsed = true }
-      } else forcedCleanupUsed = true
+      await reapTrackedSupervisor({
+        waitForForce: () => options.signal?.aborted === true
+          || registrationError != null
+          || processPersistenceError != null
+          || sessionPersistenceError != null
+          || runtimeIdentityError != null
+          || exitCode !== 0,
+        onForce: () => { postExitCleanupForced = true },
+      })
     }
-    // Freeze the lifecycle fact before collecting streams/final output. A
-    // later runner shutdown must not rewrite a process success; an abort that
-    // caused this exit must remain interrupted even if a shim exits with 0.
-    const interruptedAtExit = abortedBeforeProcessExit
+    if (postExitCleanupForced) forcedCleanupUsed = true
     clearTimeout(timer)
     if (cleanupTimer) clearTimeout(cleanupTimer)
     if (herdrIdentityTimer) clearInterval(herdrIdentityTimer)

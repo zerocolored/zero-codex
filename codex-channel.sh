@@ -69,6 +69,8 @@ fi
 . "$REPO_DIR/zerokun/codex-version.sh"
 zerokun_require_codex_version "$REPO_DIR" || exit 1
 zerokun_require_herdr_version || exit 1
+zerokun_claude_subscription_ready \
+  || { echo "❌ Claude Codeはsubscription login済みである必要があります。Herdrで先にloginしてください。Zeroちゃんは認証操作を行いません。" >&2; exit 1; }
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" verify-system-config || exit 1
 HERDR_RUNTIME_ID="$(bun --config=/dev/null --no-env-file \
   "$REPO_DIR/zerokun/herdr-runtime.ts" runtime-id)" || {

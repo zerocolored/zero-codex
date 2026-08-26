@@ -54,7 +54,11 @@ import {
   parseStateSlackTokens,
   takeSlackTokensFromEnvironment,
 } from './child-environment.ts'
-import { atomicWritePrivateFile, readOptionalPrivateFile } from './safe-file.ts'
+import {
+  assertDescriptorStillNamesPath,
+  atomicWritePrivateFile,
+  readOptionalPrivateFile,
+} from './safe-file.ts'
 import {
   completeSlackSideEffect,
   postDirectSlackApi,
@@ -79,6 +83,8 @@ import {
 } from './managed-path.ts'
 import {
   captureTrackedProcesses,
+  MAX_EXECUTOR_REGISTRATION_BYTES,
+  MAX_TRACKED_PROCESSES,
   processIdentityIsLive,
   readProcessIdentity,
   type ProcessIdentity,
@@ -100,16 +106,9 @@ import {
 } from './herdr-runtime.ts'
 import { isSlackInterruptCommand } from './live-control.ts'
 import {
-  assertClaudeQueueReady,
-  cancelClaudeQueueJob,
-  ClaudeContextClearPendingError,
-  ClaudeJobCancellationRequestedError,
-  finalizeClaudeQueueJob,
-  prepareClaudeAdvisorTarget,
-  readClaudeQueueBoundary,
-  reconcileClaudeQueueBoundary,
-} from './claude-queue-boundary.ts'
-import { resolveAdvisorProjectLayout } from './advisor-snapshot.ts'
+  EphemeralClaudeCleanupPendingError,
+  reconcileEphemeralClaudeSessions,
+} from './ephemeral-claude-session.ts'
 import {
   appendHerdrJobMonitorChunk,
   appendHerdrJobMonitorStatus,
@@ -1975,8 +1974,8 @@ export class JobStore {
   /**
    * Exact Slack cancellation remains addressable after the App Server input
    * barrier has closed.  At that point ordinary steer is intentionally
-   * rejected, but the logical job can still be waiting for Claude to settle
-   * and clear.  Keep this lookup separate so non-interrupt replies never
+   * rejected, but the logical job can still be waiting for owned advisor
+   * cleanup. Keep this lookup separate so non-interrupt replies never
    * reopen a sealed App Server phase.
    */
   interruptControlTarget(chatIdInput: string, threadTsInput: string): LiveControlTarget | null {
@@ -2052,9 +2051,10 @@ export class JobStore {
       let inputRevision = target.input_revision
       if (input.kind === 'interrupt') {
         // An exact interrupt is allowed to overtake ordinary inbound replies.
-        // The active thread itself delegates control, so retire every older
-        // ordinary reply in that same thread. Otherwise one could be claimed
-        // after cancellation and come back as a fresh FIFO job.
+        // The active thread itself delegates control, so retire only older
+        // ordinary replies that were durably bound to this exact job/epoch.
+        // Unbound post-seal input and input bound to a later queued job are
+        // independent FIFO work and must survive cancellation of this job.
         const interruptInbound = this.db.query<{ seq: number }, [string]>(
           'SELECT seq FROM inbound_deliveries WHERE idempotency_key = ?',
         ).get(key)
@@ -2064,22 +2064,24 @@ export class JobStore {
              SELECT idempotency_key, write_enabled, ?
              FROM inbound_deliveries
              WHERE chat_id = ? AND thread_ts = ? AND seq < ? AND is_interrupt = 0
+               AND expected_control_job_id = ? AND expected_control_epoch = ?
              ON CONFLICT(idempotency_key) DO UPDATE SET
                write_enabled = MAX(write_enabled, excluded.write_enabled),
                completed_at = MAX(completed_at, excluded.completed_at)`,
-            [now, chatId, threadTs, interruptInbound.seq],
+            [now, chatId, threadTs, interruptInbound.seq, jobId, epoch],
           )
           this.db.run(
             `DELETE FROM inbound_deliveries
-             WHERE chat_id = ? AND thread_ts = ? AND seq < ? AND is_interrupt = 0`,
-            [chatId, threadTs, interruptInbound.seq],
+             WHERE chat_id = ? AND thread_ts = ? AND seq < ? AND is_interrupt = 0
+               AND expected_control_job_id = ? AND expected_control_epoch = ?`,
+            [chatId, threadTs, interruptInbound.seq, jobId, epoch],
           )
         }
         this.db.run(
-          `UPDATE job_controls SET status = 'superseded', observed_at = ?,
+          `UPDATE job_controls SET status = 'superseded',
              last_error = 'superseded by a later Slack interrupt'
            WHERE job_id = ? AND control_epoch = ? AND kind = 'steer' AND status = 'ready'`,
-          [now, jobId, epoch],
+          [jobId, epoch],
         )
         const closed = this.db.run(
           `UPDATE jobs SET accepts_control = 0,
@@ -3521,8 +3523,8 @@ export class JobStore {
 
   recoverStagedExecutions(): number {
     // A success checkpoint and a later durable Slack cancellation can coexist
-    // if the daemon stops while Claude is settling.  Keep those rows in
-    // stagedExecutionJobIds() so the monitor/Claude barriers still verify
+    // if the daemon stops during owned advisor cleanup. Keep those rows in
+    // stagedExecutionJobIds() so the monitor/advisor barriers still verify
     // them, but never publish the staged success. recoverInterrupted() will
     // terminalize the cancellation and discard the pending result afterward.
     const rows = this.db.query<{ id: string }, []>(
@@ -3838,17 +3840,38 @@ export class JobStore {
         [message, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer cancellable: ' + id)
+      // `finishAppServerTurn` is the sole authority that can move an
+      // acknowledged interrupt to observed after a matching terminal.  A
+      // terminal cancellation must not fabricate that audit evidence for a
+      // request that was never written or whose write outcome is unknown.
       this.db.run(
-        `UPDATE job_controls SET status = 'observed', observed_at = COALESCE(observed_at, ?)
-         WHERE job_id = ? AND kind = 'interrupt'
-           AND status IN ('ready', 'dispatching', 'acknowledged')`,
-        [finishedAt, id],
+        `UPDATE job_controls SET status = 'superseded',
+           last_error = 'cancellation was accepted after the App Server turn became terminal; turn/interrupt was not dispatched'
+         WHERE job_id = ? AND kind = 'interrupt' AND status = 'ready'`,
+        [id],
+      )
+      this.db.run(
+        `UPDATE job_controls SET status = 'ambiguous',
+           last_error = 'cancellation terminalized while turn/interrupt acknowledgement was unknown'
+         WHERE job_id = ? AND kind = 'interrupt' AND status = 'dispatching'`,
+        [id],
+      )
+      this.db.run(
+        `UPDATE job_controls SET status = 'superseded',
+           last_error = 'superseded by the terminal Slack interrupt before dispatch'
+         WHERE job_id = ? AND kind = 'steer' AND status = 'ready'`,
+        [id],
+      )
+      this.db.run(
+        `UPDATE job_controls SET status = 'ambiguous',
+           last_error = 'terminal Slack interrupt arrived while turn/steer acknowledgement was unknown'
+         WHERE job_id = ? AND kind = 'steer' AND status = 'dispatching'`,
+        [id],
       )
       this.db.run(
         `UPDATE job_controls SET status = 'superseded', observed_at = COALESCE(observed_at, ?),
-           last_error = 'superseded by the terminal Slack interrupt'
-         WHERE job_id = ? AND kind = 'steer'
-           AND status IN ('ready', 'dispatching', 'acknowledged')`,
+           last_error = 'superseded by the terminal Slack interrupt after acknowledgement'
+         WHERE job_id = ? AND kind = 'steer' AND status = 'acknowledged'`,
         [finishedAt, id],
       )
       this.db.run(
@@ -4502,13 +4525,13 @@ async function runExternalContextBoundary(
   try {
     await action()
   } catch (error) {
-    if (error instanceof ClaudeContextClearPendingError
+    if (error instanceof EphemeralClaudeCleanupPendingError
       || error instanceof CodexCleanupPendingError
       || error instanceof CodexInterruptedError
       || error instanceof CodexUserCancelledError
       || error instanceof CodexResultPersistencePendingError
       || error instanceof HerdrJobMonitorPendingError) throw error
-    throw new ClaudeContextClearPendingError(`${label}: ${error}`)
+    throw new EphemeralClaudeCleanupPendingError(`${label}: ${error}`)
   }
 }
 
@@ -4714,9 +4737,9 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
             : options.settleExternalContext
               ? () => options.settleExternalContext!(job)
               : undefined,
-          `Claude cancellation is pending for cancelled job ${job.id}`,
+          `advisor cancellation cleanup is pending for job ${job.id}`,
         )
-        await updateMonitor(job, 'Claude Code の作業コンテキストを消去しました')
+        await updateMonitor(job, '一時的な補助セッションを終了しました')
         await quiesceMonitorBeforeTerminal()
         options.store.cancel(job.id)
         stats.failed += 1
@@ -4729,7 +4752,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           options.prepareExternalContext
             ? () => options.prepareExternalContext!(job, options.signal)
             : undefined,
-          `Claude preparation is pending for job ${job.id}`,
+          `advisor preparation is pending for job ${job.id}`,
         )
         await options.openJobMonitor?.(job, options.signal)
       } catch (error) {
@@ -4740,14 +4763,14 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
               ? () => options.settleExternalContext!(job)
               : undefined,
           error instanceof CodexUserCancelledError
-            ? `Claude cancellation is pending for job ${job.id}`
-            : `Claude cleanup is pending for job ${job.id}`,
+            ? `advisor cancellation cleanup is pending for job ${job.id}`
+            : `advisor cleanup is pending for job ${job.id}`,
         )
         if (error instanceof CodexUserCancelledError) {
           skipMonitorClose = true
           options.store.cancel(job.id)
           stats.failed += 1
-          log(`${workerId} cancelled ${job.id} while reserving Claude`)
+          log(`${workerId} cancelled ${job.id} while preparing its advisor context`)
           scheduleTerminalFlush()
           continue
         }
@@ -4780,7 +4803,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       } catch (error) {
         // A supervisor cleanup failure means Codex/advisor descendants are not
         // yet proven stopped. Preserve the running row and reconcile both
-        // process and Claude boundaries on daemon restart.
+        // process and owned advisor boundaries on daemon restart.
         if (error instanceof CodexCleanupPendingError
           || error instanceof CodexResultPersistencePendingError
           || error instanceof CodexRateLimitError) throw error
@@ -4791,8 +4814,8 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
               ? () => options.settleExternalContext!(job)
               : undefined,
           error instanceof CodexUserCancelledError
-            ? `Claude cancellation is pending for job ${job.id}`
-            : `Claude cleanup is pending for job ${job.id}`,
+            ? `advisor cancellation cleanup is pending for job ${job.id}`
+            : `advisor cleanup is pending for job ${job.id}`,
         )
         throw error
       }
@@ -4811,13 +4834,13 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       await updateMonitor(job, '実行結果を安全に保存しました')
       await runExternalContextBoundary(
         options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
-        `Claude cleanup is pending for job ${job.id}`,
+        `advisor cleanup is pending for job ${job.id}`,
       )
       if (options.store.get(job.id)?.cancelRequestedAt !== null) {
         throw new CodexUserCancelledError()
       }
       options.assertJobMonitorHealthy?.(job)
-      await updateMonitor(job, 'Claude Code の作業コンテキストを消去しました')
+      await updateMonitor(job, '一時的な補助セッションを終了しました')
       await updateMonitor(job, 'キューの結果を確定します')
       // Stop and await the in-flight async Herdr probe, then synchronously
       // assert and commit in the same JS turn. A mere failure-flag read cannot
@@ -4830,7 +4853,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           throw new CodexUserCancelledError()
         }
         throw new CodexResultPersistencePendingError(
-          `Claude was cleared but the completed result remains staged for job ${job.id}: ${error}`,
+          `advisor cleanup completed but the result remains staged for job ${job.id}: ${error}`,
         )
       }
       stats.completed += 1
@@ -4841,7 +4864,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         && !executionStarted && !unstartedMonitorClaimReleased) {
         await runExternalContextBoundary(
           options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
-          `Claude cleanup is pending for job ${job.id}`,
+          `advisor cleanup is pending for job ${job.id}`,
         )
         if (!options.store.releaseUnstartedClaim(
           job.id,
@@ -4855,7 +4878,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         unstartedMonitorClaimReleased = true
       }
       if (error instanceof CodexCleanupPendingError
-        || error instanceof ClaudeContextClearPendingError
+        || error instanceof EphemeralClaudeCleanupPendingError
         || error instanceof CodexResultPersistencePendingError
         || error instanceof HerdrJobMonitorPendingError) throw error
       if (error instanceof CodexUserCancelledError) {
@@ -4905,7 +4928,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           + 'then resend only if needed.'
         await runExternalContextBoundary(
           options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
-          `Claude cleanup is pending for rate-limited write job ${job.id}`,
+          `advisor cleanup is pending for rate-limited write job ${job.id}`,
         )
         await updateMonitor(job, '利用上限後の副作用が不確実なため失敗として確定します')
         await quiesceMonitorBeforeTerminal()
@@ -4921,7 +4944,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           + 'delivered; it will not be resent automatically. Send a new request if needed.'
         await runExternalContextBoundary(
           options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
-          `Claude cleanup is pending for rate-limited advisor job ${job.id}`,
+          `advisor cleanup is pending for rate-limited advisor job ${job.id}`,
         )
         await updateMonitor(job, 'advisor 送信後の利用上限により失敗として確定します')
         await quiesceMonitorBeforeTerminal()
@@ -6250,25 +6273,24 @@ function normalizePersistedExecutionResult(
   return marker ? `${text}\n${marker}`.trim() : text
 }
 
-export async function recoverExecutionCheckpointBeforeClaudeClear(
+export async function recoverExecutionCheckpointBeforeAdvisorCleanup(
   store: JobStore,
   dir: string,
-  reconcileClaude: () => Promise<void>,
+  reconcileAdvisors: () => Promise<void>,
 ): Promise<{ journaled: number; completed: number }> {
-  // A result journal is the process-exit checkpoint, but the queue contract
-  // requires its SQLite stage to exist before Claude's context can be cleared.
-  // Keep this order in one helper so daemon startup and the recovery command
-  // cannot silently diverge.
+  // A result journal is the process-exit checkpoint, but its SQLite stage must
+  // exist before recovery may close a round-owned ephemeral advisor workspace.
+  // Keep this order identical for daemon startup and explicit recovery.
   const journaled = recoverExecutionResultJournals(store, dir)
-  await reconcileClaude()
+  await reconcileAdvisors()
   const completed = store.recoverStagedExecutions()
   return { journaled, completed }
 }
 
-export async function reconcileClaudeWithMonitorHealthBarrier(
+export async function reconcileAdvisorsWithMonitorHealthBarrier(
   store: JobStore,
   reconcileMonitors: () => Promise<{ retainedJobIds: string[] }>,
-  reconcileClaude: () => Promise<void>,
+  reconcileAdvisors: () => Promise<void>,
 ): Promise<void> {
   const verify = async (): Promise<void> => {
     const monitored = new Set((await reconcileMonitors()).retainedJobIds)
@@ -6280,11 +6302,11 @@ export async function reconcileClaudeWithMonitorHealthBarrier(
       }
     }
   }
-  // Do not clear Claude after an already-lost monitor. Re-verify after the
-  // asynchronous /clear boundary and return directly to the synchronous DB
-  // completion in recoverExecutionCheckpointBeforeClaudeClear.
+  // Do not close a round-owned advisor workspace after an already-lost
+  // monitor. Re-verify after asynchronous cleanup and return directly to the
+  // synchronous DB completion in the checkpoint helper above.
   await verify()
-  await reconcileClaude()
+  await reconcileAdvisors()
   await verify()
 }
 
@@ -6886,11 +6908,80 @@ function registeredProcessGroupState(groupId: number): FallbackProcessState {
   }
 }
 
+function serializeBoundedExecutorRegistration(value: unknown): string {
+  const serialized = `${JSON.stringify(value)}\n`
+  if (Buffer.byteLength(serialized) > MAX_EXECUTOR_REGISTRATION_BYTES) {
+    throw new Error(
+      `executor registration exceeded ${MAX_EXECUTOR_REGISTRATION_BYTES} bytes`,
+    )
+  }
+  return serialized
+}
+
+export function synchronizeExecutorRecoveryLedger(
+  ledger: Map<string, { pid: number; started: string }>,
+  items: readonly { pid: number; started: string }[],
+  mode: 'replace' | 'merge',
+): void {
+  if (mode === 'replace') ledger.clear()
+  for (const item of items) ledger.set(`${item.pid}:${item.started}`, item)
+  if (ledger.size > MAX_TRACKED_PROCESSES) {
+    throw new Error(`executor tracked generation ledger exceeded ${MAX_TRACKED_PROCESSES}`)
+  }
+}
+
+function readBoundedExecutorRegistration(path: string): string {
+  const descriptor = openSync(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  )
+  try {
+    const before = fstatSync(descriptor)
+    const ownerMatches = typeof process.getuid !== 'function' || before.uid === process.getuid()
+    if (!before.isFile() || before.nlink !== 1 || !ownerMatches
+      || before.size > MAX_EXECUTOR_REGISTRATION_BYTES) {
+      throw new Error(`unsafe executor registration: ${path}`)
+    }
+    const bytes = Buffer.alloc(before.size)
+    let offset = 0
+    while (offset < bytes.length) {
+      const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset)
+      if (count <= 0) throw new Error(`executor registration changed while reading: ${path}`)
+      offset += count
+    }
+    const extra = Buffer.alloc(1)
+    if (readSync(descriptor, extra, 0, 1, before.size) !== 0) {
+      throw new Error(`executor registration exceeded its bounded read: ${path}`)
+    }
+    const after = fstatSync(descriptor)
+    if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode
+      || after.uid !== before.uid || after.gid !== before.gid || after.nlink !== before.nlink
+      || after.size !== before.size || after.mtimeMs !== before.mtimeMs
+      || after.ctimeMs !== before.ctimeMs) {
+      throw new Error(`executor registration changed while reading: ${path}`)
+    }
+    try {
+      assertDescriptorStillNamesPath(descriptor, path)
+    } catch {
+      throw new Error(`executor registration path changed while reading: ${path}`)
+    }
+    return bytes.toString('utf8')
+  } finally {
+    closeSync(descriptor)
+  }
+}
+
+export interface ExecutorRecoveryTestHooks {
+  /** Deterministically exercise a supervisor write between the first read and freeze. */
+  afterInitialRegistrationRead?(registrationPath: string): void
+}
+
 export async function terminateTrackedExecutors(
   store: JobStore,
   log: (message: string) => void,
   timeoutMs = 15_000,
   stateDirectory = stateDir(),
+  testHooks: ExecutorRecoveryTestHooks = {},
 ): Promise<void> {
   const registrations = new Map<number, {
     jobId: string
@@ -6918,13 +7009,7 @@ export async function terminateTrackedExecutors(
     for (const name of readdirSync(registrationDir)) {
       if (!name.endsWith('.json')) continue
       const path = join(registrationDir, name)
-      const metadata = lstatSync(path)
-      const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
-      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1
-        || metadata.size > 512 * 1024 || !ownerMatches) {
-        throw new Error(`unsafe executor registration: ${path}`)
-      }
-      const value = JSON.parse(readFileSync(path, 'utf8')) as {
+      const value = JSON.parse(readBoundedExecutorRegistration(path)) as {
         jobId?: string
         pid?: number
         pgid?: number
@@ -6959,7 +7044,7 @@ export async function terminateTrackedExecutors(
       let fingerprint: SeatbeltFingerprint | undefined
       if (value.version === 3 || value.version === 4) {
         if (!Array.isArray(value.tracked) || value.tracked.length < 1
-          || value.tracked.length > 4_096) {
+          || value.tracked.length > MAX_TRACKED_PROCESSES) {
           throw new Error(`invalid executor tracked generations: ${path}`)
         }
         if (!['active', 'recovery', 'cleanup-confirmed'].includes(String(
@@ -7039,82 +7124,74 @@ export async function terminateTrackedExecutors(
     }
     const ledger = new Map<string, { pid: number; started: string }>()
     const mergeLedger = (items: Array<{ pid: number; started: string }>): void => {
-      for (const item of items) ledger.set(`${item.pid}:${item.started}`, item)
-      if (ledger.size > 4_096) throw new Error('executor tracked generation ledger exceeded 4096')
+      synchronizeExecutorRecoveryLedger(ledger, items, 'merge')
     }
-    mergeLedger(registration.tracked)
+    synchronizeExecutorRecoveryLedger(ledger, registration.tracked, 'replace')
     let phase = registration.phase ?? 'active'
     let revision = registration.revision ?? 0
+    let recoveryWriterFrozen = false
     const readLatest = (): void => {
-      let descriptor: number
-      try {
-        descriptor = openSync(registration.path!, constants.O_RDONLY | constants.O_NOFOLLOW)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-        throw error
+      const serialized = readBoundedExecutorRegistration(registration.path!)
+      const latest = JSON.parse(serialized) as Record<string, unknown>
+      if (![3, 4].includes(Number(latest.version))
+        || latest.version !== registration.version
+        || latest.jobId !== registration.jobId || latest.pid !== pid
+        || latest.started !== registration.started || !Array.isArray(latest.tracked)
+        || latest.tracked.length < 1 || latest.tracked.length > MAX_TRACKED_PROCESSES
+        || !['active', 'recovery', 'cleanup-confirmed'].includes(String(latest.phase))
+        || !Number.isSafeInteger(latest.revision) || Number(latest.revision) < revision) {
+        throw new Error(`executor registration changed during cleanup: ${registration.path}`)
       }
-      try {
-        const metadata = fstatSync(descriptor)
-        const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
-        if (!metadata.isFile() || metadata.nlink !== 1 || !ownerMatches
-          || metadata.size > 512 * 1024) {
-          throw new Error(`unsafe executor registration: ${registration.path}`)
+      if (registration.version === 4) {
+        if (JSON.stringify(latest.fingerprint) !== JSON.stringify(registration.fingerprint)) {
+          throw new Error(`executor Seatbelt fingerprint changed during cleanup: ${registration.path}`)
         }
-        const bytes = Buffer.alloc(metadata.size)
-        let offset = 0
-        while (offset < bytes.length) {
-          const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset)
-          if (count <= 0) throw new Error('executor registration changed while reading')
-          offset += count
-        }
-        const latest = JSON.parse(bytes.toString('utf8')) as Record<string, unknown>
-        if (![3, 4].includes(Number(latest.version))
-          || latest.version !== registration.version
-          || latest.jobId !== registration.jobId || latest.pid !== pid
-          || latest.started !== registration.started || !Array.isArray(latest.tracked)
-          || latest.tracked.length < 1 || latest.tracked.length > 4_096
-          || !['active', 'recovery', 'cleanup-confirmed'].includes(String(latest.phase))
-          || !Number.isSafeInteger(latest.revision) || Number(latest.revision) < revision) {
-          throw new Error(`executor registration changed during cleanup: ${registration.path}`)
-        }
-        if (registration.version === 4) {
-          if (JSON.stringify(latest.fingerprint) !== JSON.stringify(registration.fingerprint)) {
-            throw new Error(`executor Seatbelt fingerprint changed during cleanup: ${registration.path}`)
-          }
-          verifySeatbeltFingerprint(stateDirectory, registration.fingerprint!)
-        }
-        const parsed: Array<{ pid: number; started: string }> = []
-        const keys = new Set<string>()
-        for (const item of latest.tracked) {
-          if (!item || typeof item !== 'object' || Array.isArray(item)) {
-            throw new Error(`invalid executor tracked generation: ${registration.path}`)
-          }
-          const value = item as Record<string, unknown>
-          if (Object.keys(value).sort().join('\n') !== 'pid\nstarted'
-            || !Number.isSafeInteger(value.pid) || Number(value.pid) <= 0
-            || typeof value.started !== 'string' || !parseProcessStartKey(value.started)) {
-            throw new Error(`invalid executor tracked generation: ${registration.path}`)
-          }
-          const key = `${Number(value.pid)}:${value.started}`
-          if (keys.has(key)) throw new Error(`duplicate executor tracked generation: ${registration.path}`)
-          keys.add(key)
-          parsed.push({ pid: Number(value.pid), started: value.started })
-        }
-        mergeLedger(parsed)
-        phase = latest.phase as typeof phase
-        revision = Number(latest.revision)
-      } finally {
-        closeSync(descriptor)
+        verifySeatbeltFingerprint(stateDirectory, registration.fingerprint!)
       }
+      const parsed: Array<{ pid: number; started: string }> = []
+      const keys = new Set<string>()
+      for (const item of latest.tracked) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+          throw new Error(`invalid executor tracked generation: ${registration.path}`)
+        }
+        const value = item as Record<string, unknown>
+        if (Object.keys(value).sort().join('\n') !== 'pid\nstarted'
+          || !Number.isSafeInteger(value.pid) || Number(value.pid) <= 0
+          || typeof value.started !== 'string' || !parseProcessStartKey(value.started)) {
+          throw new Error(`invalid executor tracked generation: ${registration.path}`)
+        }
+        const key = `${Number(value.pid)}:${value.started}`
+        if (keys.has(key)) throw new Error(`duplicate executor tracked generation: ${registration.path}`)
+        keys.add(key)
+        parsed.push({ pid: Number(value.pid), started: value.started })
+      }
+      synchronizeExecutorRecoveryLedger(
+        ledger,
+        parsed,
+        recoveryWriterFrozen ? 'merge' : 'replace',
+      )
+      phase = latest.phase as typeof phase
+      revision = Number(latest.revision)
     }
     readLatest()
+    testHooks.afterInitialRegistrationRead?.(registration.path)
     const writeRecovery = (nextPhase: 'recovery' | 'cleanup-confirmed'): void => {
-      revision += 1
-      phase = nextPhase
-      atomicWritePrivateFile(registration.path!, `${JSON.stringify({
+      if (!recoveryWriterFrozen) {
+        throw new Error('executor recovery writer is not frozen')
+      }
+      // The daemon lock excludes another recovery writer and the exact
+      // supervisor generation is stopped/dead. Re-read the current pathname
+      // immediately before every replace so a newer durable revision can
+      // never be overwritten from a stale in-memory snapshot.
+      readLatest()
+      if (phase === 'cleanup-confirmed') {
+        throw new Error('executor cleanup was already confirmed before recovery write')
+      }
+      const nextRevision = revision + 1
+      atomicWritePrivateFile(registration.path!, serializeBoundedExecutorRegistration({
         version: registration.version,
-        phase,
-        revision,
+        phase: nextPhase,
+        revision: nextRevision,
         cleanupPending: true,
         jobId: registration.jobId,
         pid,
@@ -7127,7 +7204,9 @@ export async function terminateTrackedExecutors(
           left.pid - right.pid || left.started.localeCompare(right.started)
         )),
         ...(registration.fingerprint ? { fingerprint: registration.fingerprint } : {}),
-      })}\n`)
+      }))
+      phase = nextPhase
+      revision = nextRevision
     }
     const expectedIdentity = (item: { pid: number; started: string }): ProcessIdentity => {
       const generation = parseProcessStartKey(item.started)
@@ -7155,9 +7234,21 @@ export async function terminateTrackedExecutors(
     if (supervisorObservation.status === 'unknown') {
       throw new Error(`executor supervisor ${pid} generation is unknown`)
     }
-    if (phase === 'cleanup-confirmed') {
-      const deadline = Date.now() + 2_000
+    const reapCleanupConfirmedReceipt = async (): Promise<boolean> => {
+      if (phase !== 'cleanup-confirmed') return false
+      // The supervisor publishes this phase only after every relay and exact
+      // descendant cleanup has completed.  A runner-recovery pass may observe
+      // that durable receipt in the tiny window before the supervisor's final
+      // process.exit(), or while the host is heavily loaded.  Do not turn that
+      // scheduling window into a FIFO startup failure: this is already the
+      // explicit crash-recovery path, so terminate only the receipt's exact
+      // process generations and then verify that none remain.  Normal jobs and
+      // normal cleanup still have no automatic deadline.
       let receiptLive = liveTracked()
+      for (const [trackedPid, started] of receiptLive) {
+        signalProcessIfLive(expectedIdentity({ pid: trackedPid, started }), 'SIGKILL')
+      }
+      const deadline = Date.now() + Math.max(2_000, timeoutMs)
       while (receiptLive.size > 0 && Date.now() < deadline) {
         await Bun.sleep(25)
         receiptLive = liveTracked()
@@ -7172,8 +7263,9 @@ export async function terminateTrackedExecutors(
           earliest: supervisor,
         })
       }
-      return
+      return true
     }
+    if (await reapCleanupConfirmedReceipt()) return
     if (supervisorObservation.status === 'alive') {
       // Freeze the exact group first. A live group leader is the only safe
       // authority for negative-PGID signalling; a recycled numeric PGID must
@@ -7185,8 +7277,9 @@ export async function terminateTrackedExecutors(
     // generation regardless of root liveness, then discover from all of those
     // frozen roots. This closes the recovery gap where a dead/reused supervisor
     // previously caused us to skip fixed-point capture entirely.
-    for (const item of ledger.values()) signalProcessIfLive(expectedIdentity(item), 'SIGSTOP')
-    if (liveTracked().size > 0) {
+    const freezeLedger = async (label: string): Promise<void> => {
+      for (const item of ledger.values()) signalProcessIfLive(expectedIdentity(item), 'SIGSTOP')
+      if (liveTracked().size === 0) return
       const stopDeadline = Date.now() + 2_000
       while (true) {
         const notStopped = [...ledger.values()].filter(item => {
@@ -7198,10 +7291,26 @@ export async function terminateTrackedExecutors(
         })
         if (notStopped.length === 0) break
         if (Date.now() >= stopDeadline) {
-          throw new Error(`executor generations did not stop: ${notStopped.map(item => item.pid).join(', ')}`)
+          throw new Error(`${label} executor generations did not stop: ${notStopped.map(item => item.pid).join(', ')}`)
         }
         await Bun.sleep(10)
       }
+    }
+    await freezeLedger('initial')
+    // SIGSTOP is uncatchable and stops every thread in the exact supervisor.
+    // Only after proving that writer stopped (or died) may recovery consume
+    // the pathname's latest atomic revision and become its sole writer.
+    const frozenSupervisor = observeProcessGeneration(supervisor)
+    if (frozenSupervisor.status === 'unknown'
+      || (frozenSupervisor.status === 'alive'
+        && !processIdentityIsStopped(frozenSupervisor.identity))) {
+      throw new Error(`executor supervisor ${pid} was not frozen before recovery refresh`)
+    }
+    readLatest()
+    if (await reapCleanupConfirmedReceipt()) return
+    await freezeLedger('refreshed')
+    recoveryWriterFrozen = true
+    if (liveTracked().size > 0) {
       let stablePasses = 0
       let previousSize = -1
       for (let pass = 0; pass < 100 && stablePasses < 2; pass += 1) {
@@ -7397,55 +7506,6 @@ async function readJsonStdin(): Promise<unknown> {
   return new Response(Bun.stdin.stream()).json()
 }
 
-async function reserveClaudeForQueueJob(options: {
-  stateDir: string
-  runtime: ReturnType<typeof readPinnedHerdrRuntime>
-  job: JobRecord
-  signal?: AbortSignal
-  log: (message: string) => void
-  cancelRequested?: () => boolean
-  pollMs?: number
-}): Promise<void> {
-  const layout = resolveAdvisorProjectLayout(options.job.repoPath)
-  const repoRoot = layout.gitRoot ?? layout.projectPath
-  const attemptNonce = randomUUID().replaceAll('-', '')
-  const pollMs = positiveInteger(options.pollMs, 1_000)
-  let reported = ''
-  while (!options.signal?.aborted) {
-    if (options.cancelRequested?.()) throw new CodexUserCancelledError()
-    try {
-      const prepared = await prepareClaudeAdvisorTarget({
-        stateDir: options.stateDir,
-        runtime: options.runtime,
-        jobId: options.job.id,
-        attemptNonce,
-        repoRoot,
-      })
-      if (options.cancelRequested?.()) throw new CodexUserCancelledError()
-      if (prepared.target) return
-      if (prepared.skipped) {
-        options.log(`Claude advisor skipped for job ${options.job.id}: ${prepared.reason}`)
-        return
-      }
-      const reason = prepared.reason ?? 'the dedicated Claude advisor is unavailable'
-      if (reason !== reported) {
-        options.log(`waiting to reserve Claude for job ${options.job.id}: ${reason}`)
-        reported = reason
-      }
-    } catch (error) {
-      if (error instanceof CodexUserCancelledError) throw error
-      const reason = error instanceof Error ? error.message : String(error)
-      if (reason !== reported) {
-        options.log(`waiting for Claude boundary for job ${options.job.id}: ${reason}`)
-        reported = reason
-      }
-    }
-    if (options.cancelRequested?.()) throw new CodexUserCancelledError()
-    await Bun.sleep(pollMs)
-  }
-  throw new CodexInterruptedError('job stopped before its Claude advisor could be reserved')
-}
-
 async function runCli(): Promise<void> {
   const command = process.argv[2] ?? 'status'
   const dir = stateDir()
@@ -7484,22 +7544,15 @@ async function runCli(): Promise<void> {
 
   if (command === 'runtime-info') {
     try {
-      const claudeBoundary = readClaudeQueueBoundary(dir)
       process.stdout.write(`${JSON.stringify({
         runtime: 'codex',
         handshake: JOB_RUNNER_HANDSHAKE,
         active: store.countActive(),
         pendingNotifications: store.terminalNotificationCount(),
-        claudeBoundary: claudeBoundary
-          ? {
-              status: claudeBoundary.status,
-              jobId: claudeBoundary.status === 'ready'
-                || claudeBoundary.status === 'ready-no-target'
-                ? null
-                : claudeBoundary.jobId,
-              phase: claudeBoundary.status === 'clear-intent' ? claudeBoundary.phase : null,
-            }
-          : null,
+        claudeAdvisor: {
+          lifecycle: 'fresh-ephemeral-per-round',
+          existingPanesUntouched: true,
+        },
       })}\n`)
     } finally {
       store.close()
@@ -7583,10 +7636,10 @@ async function runCli(): Promise<void> {
         store.retireMonitorObligation(jobId)
         return 'terminalized'
       }
-      const { journaled, completed } = await recoverExecutionCheckpointBeforeClaudeClear(
+      const { journaled, completed } = await recoverExecutionCheckpointBeforeAdvisorCleanup(
         store,
         dir,
-        () => reconcileClaudeWithMonitorHealthBarrier(
+        () => reconcileAdvisorsWithMonitorHealthBarrier(
           store,
           () => reconcileHerdrJobMonitors({
             stateDir: dir,
@@ -7596,15 +7649,15 @@ async function runCli(): Promise<void> {
             recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
             onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
           }),
-          () => reconcileClaudeQueueBoundary({
+          async () => { await reconcileEphemeralClaudeSessions({
             stateDir: dir,
             runtime,
-            cancelRequested: jobId => store.get(jobId)?.cancelRequestedAt != null,
-          }),
+            log,
+          }) },
         ),
       )
       if (journaled > 0) log(`recovered ${journaled} durable execution result journal(s)`)
-      if (completed > 0) log(`completed ${completed} staged execution(s) after Claude recovery`)
+      if (completed > 0) log(`completed ${completed} staged execution(s) after advisor recovery`)
       const recovered = store.recoverInterrupted(dir)
       const monitors = await reconcileHerdrJobMonitors({
         stateDir: dir,
@@ -7734,10 +7787,10 @@ async function runCli(): Promise<void> {
       store.retireMonitorObligation(jobId)
       return 'terminalized'
     }
-    const { journaled, completed: staged } = await recoverExecutionCheckpointBeforeClaudeClear(
+    const { journaled, completed: staged } = await recoverExecutionCheckpointBeforeAdvisorCleanup(
       store,
       dir,
-      () => reconcileClaudeWithMonitorHealthBarrier(
+      () => reconcileAdvisorsWithMonitorHealthBarrier(
         store,
         () => reconcileHerdrJobMonitors({
           stateDir: dir,
@@ -7747,15 +7800,15 @@ async function runCli(): Promise<void> {
           recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
           onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
         }),
-        () => reconcileClaudeQueueBoundary({
+        async () => { await reconcileEphemeralClaudeSessions({
           stateDir: dir,
           runtime: pinnedHerdrRuntime,
-          cancelRequested: jobId => store.get(jobId)?.cancelRequestedAt != null,
-        }),
+          log,
+        }) },
       ),
     )
     if (journaled > 0) log(`recovered ${journaled} durable execution result journal(s)`)
-    if (staged > 0) log(`completed ${staged} staged execution(s) after Claude recovery`)
+    if (staged > 0) log(`completed ${staged} staged execution(s) after advisor recovery`)
     const recovered = store.recoverInterrupted(dir)
     if (recovered.requeued > 0) {
       log(`requeued ${recovered.requeued} interrupted read-only job(s)`)
@@ -7904,42 +7957,21 @@ async function runCli(): Promise<void> {
       stopWhenIdle: command === 'run-until-idle',
       shouldPause,
       advisorStateDir: dir,
-      beforeClaim: () => assertClaudeQueueReady({
+      beforeClaim: async () => { await reconcileEphemeralClaudeSessions({
         stateDir: dir,
         runtime: pinnedHerdrRuntime,
-        continuingJobId: store.claimableHeadId() ?? undefined,
-      }),
-      prepareExternalContext: (job, signal) => reserveClaudeForQueueJob({
-        stateDir: dir,
-        runtime: pinnedHerdrRuntime,
-        job,
-        signal,
         log,
-        cancelRequested: () => store.get(job.id)?.cancelRequestedAt != null,
-      }),
-      settleExternalContext: async job => {
-        try {
-          await finalizeClaudeQueueJob({
-            stateDir: dir,
-            runtime: pinnedHerdrRuntime,
-            jobId: job.id,
-            cancelRequested: () => store.get(job.id)?.cancelRequestedAt != null,
-          })
-        } catch (error) {
-          if (!(error instanceof ClaudeJobCancellationRequestedError)) throw error
-          await cancelClaudeQueueJob({
-            stateDir: dir,
-            runtime: pinnedHerdrRuntime,
-            jobId: job.id,
-          })
-          throw new CodexUserCancelledError()
-        }
-      },
-      cancelExternalContext: job => cancelClaudeQueueJob({
+      }) },
+      settleExternalContext: async () => { await reconcileEphemeralClaudeSessions({
         stateDir: dir,
         runtime: pinnedHerdrRuntime,
-        jobId: job.id,
-      }),
+        log,
+      }) },
+      cancelExternalContext: async () => { await reconcileEphemeralClaudeSessions({
+        stateDir: dir,
+        runtime: pinnedHerdrRuntime,
+        log,
+      }) },
       openJobMonitor: async job => {
         try {
           const current = store.get(job.id)

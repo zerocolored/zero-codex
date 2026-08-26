@@ -145,6 +145,20 @@ async function runLauncher(
     ].join('\n'))
     chmodSync(path, 0o700)
   }
+  const claude = join(fakeBin, 'claude')
+  writeFileSync(claude, [
+    '#!/bin/bash',
+    'if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ] && [ "${3:-}" = "--json" ]; then',
+    '  if [ -f "$HOME/fake-claude-auth-fail" ]; then',
+    '    echo \'{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty","subscriptionType":""}\'',
+    '  else',
+    '    echo \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\'',
+    '  fi',
+    '  exit 0',
+    'fi',
+    'exit 1',
+    '',
+  ].join('\n'), { mode: 0o700 })
   const herdr = join(fakeBin, 'herdr')
   writeFileSync(herdr, [
     '#!/bin/bash',
@@ -155,14 +169,17 @@ async function runLauncher(
     'fi',
     '[ "${FAKE_HERDR_CAPS:-1}" = "1" ] || { echo "unsupported"; exit 0; }',
     "echo 'Usage: herdr workspace list'",
+    "echo 'Usage: herdr workspace get'",
+    "echo 'Usage: herdr workspace close'",
     "echo 'Usage: herdr pane run'",
+    "echo 'Usage: herdr pane get'",
     "echo 'Usage: herdr tab close'",
     'if [ "${FAKE_HERDR_MISSING_UNTIL:-0}" = "1" ]; then',
-    "  echo '--current --workspace --cwd --label --no-focus --match --source --lines --timeout --pane --wait --timeout'",
+    "  echo '--current --workspace --cwd --label --no-focus --match --source --lines --kind --pane --wait --timeout'",
     'else',
-    "  echo '--current --workspace --cwd --label --no-focus --match --source --lines --timeout --pane --wait --until --timeout'",
+    "  echo '--current --workspace --cwd --label --no-focus --match --source --lines --kind --pane --wait --until --timeout'",
     'fi',
-    "echo 'Usage: herdr agent list Usage: herdr agent get'",
+    "echo 'Usage: herdr agent list Usage: herdr agent get Usage: herdr agent send-keys'",
     '',
   ].join('\n'), { mode: 0o700 })
   const child = Bun.spawn(['/bin/bash', LAUNCHER, state], {
@@ -219,6 +236,14 @@ describe('codex-channel.sh replacement guard', () => {
     expect(result.output).not.toContain('0.149.0 以上が必要')
   })
 
+  test('Claude subscription loginが無効ならjob受付前に停止する', async () => {
+    const state = fixture()
+    writeFileSync(join(state, 'fake-claude-auth-fail'), '1\n', { mode: 0o600 })
+    const result = await runLauncher(state, { ZEROKUN_DRY_RUN: '1' })
+    expect(result.exitCode).toBe(1)
+    expect(result.output).toContain('Claude Codeはsubscription login済みである必要があります')
+  })
+
   test('Herdr 0.8.2未満をjob受付前に拒否する', async () => {
     const state = fixture()
     const result = await runLauncher(state, {
@@ -229,14 +254,14 @@ describe('codex-channel.sh replacement guard', () => {
     expect(result.output).toContain('Herdr 0.8.2 以上')
   })
 
-  test('Herdrの必須tab/pane API不足をjob受付前に拒否する', async () => {
+  test('Herdrの必須workspace/tab/pane/agent API不足をjob受付前に拒否する', async () => {
     const state = fixture()
     const result = await runLauncher(state, {
       FAKE_HERDR_CAPS: '0',
       ZEROKUN_DRY_RUN: '1',
     })
     expect(result.exitCode).toBe(1)
-    expect(result.output).toContain('必要とするtab/pane APIがありません')
+    expect(result.output).toContain('必要とするworkspace/tab/pane/agent APIがありません')
   })
 
   test('PATH上の互換Herdrより明示HERDR_BIN_PATHを正本にする', async () => {
@@ -258,7 +283,7 @@ describe('codex-channel.sh replacement guard', () => {
       ZEROKUN_DRY_RUN: '1',
     })
     expect(result.exitCode).toBe(1)
-    expect(result.output).toContain('必要とするtab/pane APIがありません')
+    expect(result.output).toContain('必要とするworkspace/tab/pane/agent APIがありません')
   })
 
   test('停止したHerdr probeを期限付きで拒否する', async () => {

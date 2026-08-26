@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { readFileSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 
 const root = join(import.meta.dir, '..')
@@ -183,7 +183,7 @@ describe('Zero-kun Codex wiring', () => {
     expect(executor).toContain('both native advisors')
     expect(executor).toContain('call advisor_round')
     expect(executor).toContain('Poll advisor_round_poll')
-    expect(executor).toContain('existing live Claude Code')
+    expect(executor).toContain('round-owned fresh ephemeral Claude Code workspace')
     expect(executor).toContain('assertRequiredAdvisorRounds(')
     expect(executor).toContain('await assertNativeAdvisorHistory({')
     expect(executor).toContain("{ phase: 'design', round: 1 }")
@@ -202,9 +202,21 @@ describe('Zero-kun Codex wiring', () => {
     expect(broker).toContain('stdin: prompt')
     expect(broker).not.toContain('@ZEROKUN_GROK_PROMPT_FILE')
     const fifthHelper = readFileSync(join(import.meta.dir, 'fifth-advisor.py'), 'utf8')
+    expect(fifthHelper).toMatch(/"workspace",\s+"create",\s+"--cwd"/)
+    expect(fifthHelper).toContain('["workspace", "close", workspace_id]')
     expect(fifthHelper).toContain('"method": "agent.prompt"')
-    expect(fifthHelper).toContain('client.sendall(prepared.request + b"\\n")')
+    expect(fifthHelper).toContain('connection.sendall(prepared.request)')
     expect(fifthHelper).not.toContain('prepared.command')
+    expect(broker).toContain("'open', ...helperArgs")
+    expect(broker).toContain("'send', ...helperArgs, '--owned'")
+    expect(broker).toContain("'close', ...helperArgs")
+    expect(broker).not.toContain('prepareClaudeAdvisorTarget')
+    const authCheck = broker.indexOf('await assertClaudeSubscriptionLogin(helperEnvironment)')
+    const requestCreate = broker.indexOf('requestDir = createEphemeralClaudeRequestDirectory({')
+    const helperOpen = broker.indexOf("[python, helper, 'open', ...helperArgs]")
+    expect(authCheck).toBeGreaterThan(0)
+    expect(requestCreate).toBeGreaterThan(authCheck)
+    expect(helperOpen).toBeGreaterThan(requestCreate)
   })
 
   test('Slack上のsystem文面はZeroちゃん名義で実装名を露出しない', () => {
@@ -226,11 +238,17 @@ describe('Zero-kun Codex wiring', () => {
     expect(executor).not.toContain('(Codex returned no final text output)')
   })
 
-  test('Claude /clear confirmationはproductionで無期限、test注入時だけ有限にする', () => {
-    const boundary = readFileSync(join(import.meta.dir, 'claude-queue-boundary.ts'), 'utf8')
-    expect(boundary).toContain('options.clearConfirmationTimeoutMs === undefined')
-    expect(boundary).toContain('while (deadline === null || Date.now() < deadline)')
-    expect(boundary).not.toContain('clearConfirmationTimeoutMs ?? 30_000')
+  test('Claudeはround専用workspaceをfresh起動しexact cleanup後だけ採択する', () => {
+    const broker = readFileSync(join(import.meta.dir, 'advisor-broker.ts'), 'utf8')
+    const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
+    expect(broker).toContain("lifecycle: 'ephemeral-v2'")
+    expect(broker).toContain('cleanupVerified = true')
+    expect(broker).toContain('removeVerifiedEphemeralClaudeRequestDirectory')
+    expect(broker).not.toContain("'/clear'")
+    expect(runner).toContain('reconcileEphemeralClaudeSessions')
+    expect(runner).not.toContain('claude-queue-boundary')
+    expect(existsSync(join(import.meta.dir, 'claude-queue-boundary.ts'))).toBe(false)
+    expect(existsSync(join(import.meta.dir, 'claude-queue-boundary.test.ts'))).toBe(false)
   })
 
   test('self update follows the main branch and restarts gateway without TUI confirmation', () => {

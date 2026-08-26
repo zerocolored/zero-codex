@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto'
 import {
   closeSync, constants, fchmodSync, fstatSync, fsyncSync, ftruncateSync, openSync, readFileSync,
-  renameSync, unlinkSync, writeFileSync,
+  lstatSync, renameSync, unlinkSync, writeFileSync,
 } from 'fs'
 import { dirname } from 'path'
 
@@ -10,6 +10,31 @@ function requireSafeDescriptor(descriptor: number, path: string): void {
   const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
   if (!metadata.isFile() || metadata.nlink !== 1 || !ownerMatches) {
     throw new Error(`unsafe managed file: ${path}`)
+  }
+}
+
+/**
+ * Prove that an already-open descriptor still names the file currently
+ * reachable at `path`. Atomic rename keeps the old descriptor readable, so a
+ * same-FD before/after fstat alone cannot detect a pathname replacement.
+ */
+export function assertDescriptorStillNamesPath(descriptor: number, path: string): void {
+  const descriptorMetadata = fstatSync(descriptor)
+  const pathMetadata = lstatSync(path)
+  const ownerMatches = typeof process.getuid !== 'function'
+    || pathMetadata.uid === process.getuid()
+  if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink()
+    || pathMetadata.nlink !== 1 || !ownerMatches
+    || pathMetadata.dev !== descriptorMetadata.dev
+    || pathMetadata.ino !== descriptorMetadata.ino
+    || pathMetadata.mode !== descriptorMetadata.mode
+    || pathMetadata.uid !== descriptorMetadata.uid
+    || pathMetadata.gid !== descriptorMetadata.gid
+    || pathMetadata.nlink !== descriptorMetadata.nlink
+    || pathMetadata.size !== descriptorMetadata.size
+    || pathMetadata.mtimeMs !== descriptorMetadata.mtimeMs
+    || pathMetadata.ctimeMs !== descriptorMetadata.ctimeMs) {
+    throw new Error(`managed file path changed while open: ${path}`)
   }
 }
 
@@ -30,8 +55,7 @@ export function readOptionalPrivateFile(path: string): string | null {
   }
 }
 
-/** Read an owner-only-link regular file without changing its mode. */
-export function readOptionalOwnedRegularFile(path: string): string | null {
+function readOptionalOwnedFile(path: string, requireOwnerOnly: boolean): string | null {
   let descriptor: number
   try {
     descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
@@ -41,10 +65,23 @@ export function readOptionalOwnedRegularFile(path: string): string | null {
   }
   try {
     requireSafeDescriptor(descriptor, path)
+    if (requireOwnerOnly && (fstatSync(descriptor).mode & 0o077) !== 0) {
+      throw new Error(`managed file is not owner-only: ${path}`)
+    }
     return readFileSync(descriptor, 'utf8')
   } finally {
     closeSync(descriptor)
   }
+}
+
+/** Read an owner-owned, single-link regular file without changing its mode. */
+export function readOptionalOwnedRegularFile(path: string): string | null {
+  return readOptionalOwnedFile(path, false)
+}
+
+/** Read an owner-only, single-link regular file without changing its mode. */
+export function readOptionalOwnerOnlyRegularFile(path: string): string | null {
+  return readOptionalOwnedFile(path, true)
 }
 
 export function openSafeLog(path: string, mode: 'truncate' | 'append'): number {
@@ -79,7 +116,7 @@ export function atomicWritePrivateFile(path: string, content: string | Uint8Arra
     renameSync(temporary, path)
     // Persist the rename as well as the file contents. Queue boundary files
     // use this writer as an external-side-effect journal, so a process or
-    // machine crash must not roll the durable intent back behind `/clear`.
+    // machine crash must not roll a durable external-cleanup intent backward.
     parentDescriptor = openSync(dirname(path), constants.O_RDONLY | constants.O_NOFOLLOW)
     const parent = fstatSync(parentDescriptor)
     const ownerMatches = typeof process.getuid !== 'function' || parent.uid === process.getuid()

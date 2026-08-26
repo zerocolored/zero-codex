@@ -15,6 +15,7 @@ job-runner.ts
   ├→ task専用Herdr監視tab（stdout/stderrのread-only表示）
   ↓ verified Herdr context / codex app-server --stdio
 Codex App Server（read jobはRO、write jobはRO準備→RW実装→ROレビューの別process）
+  └→ 各advisor round専用のfresh Claude workspace（回答取得後にexact close）
   ↓ 最終回答と明示された成果物だけ
 Slack bot
 ```
@@ -28,16 +29,17 @@ Slack bot
   完全一致の`中止`（mentionと全角空白は正規化）は`turn/interrupt`です。別スレッドはFIFOのままで、
   実行中に限ってそのスレッド自体を操作権限の境界とするため、返信者個人がread-onlyでもactive write
   jobへ追加入力できます。write権限を共有したくない相手は同じ実行中スレッドへ参加させないでください。
+  最終入力barrier後の通常返信は次のFIFO入力として保持し、その後に`中止`が届いても削除しません。
 - Codex 子プロセスには Slack token や任意の親process環境を渡しません。Slack 投稿は gateway/runner の bot 経路だけです。
 - 起動時のHerdr socket・pane・terminal・workspaceを固定し、job開始前に同じidentityを再検証します。
   staleなHerdr環境ではCodexを起動しません。
 - job開始時に同じHerdr workspaceへ非フォーカスの`Zeroちゃん #<queue>`監視tabを1つ作り、実行中の
   stdout/stderrとqueue状態を表示します。監視tab内でCodexを再起動することはなく、rate-limit再開中は
-  同じtabを保持します。Codex・advisor・Claude `/clear`・SQLite terminal確定後だけ自動で閉じます。
+  同じtabを保持します。Codex・round専用advisorの終了・SQLite terminal確定後だけ自動で閉じます。
   viewerのprocess世代・argv・cwd・heartbeatを実行前からclose直前まで監視し、terminalへの最終出力の
   drain完了も確認します。create/run/closeの応答や監視状態が曖昧な場合はIDを推測・操作せず、
   後続jobを開始しないfail-closed動作になります。実行中の監視tabを人が閉じた場合も同様に停止し、
-  次回起動や`recover-interrupted`でも自動failed化・Claude clear・監視tab再作成は行いません。最終出力を
+  次回起動や`recover-interrupted`でも自動failed化・監視tab再作成は行いません。最終出力を
   表示した証拠を失ったjobとdurable monitor faultを保持してFIFOを止めるため、監視tabを手動で閉じないで
   ください。Slackへの通知配送だけはFIFOと独立して再試行します。
 - `project_doc_max_bytes=262144`をruntime側で固定し、global→projectの`AGENTS.md`をjobごとに読み直します。
@@ -46,21 +48,23 @@ Slack bot
   公開前の決定的な最低契約として、read jobはread-only processでinvestigationを行います。write jobは
   同じCodex threadを、read-only準備（investigation/design）→write実装→read-only reviewのfresh processへ
   順番にresumeします。各processを子processごと完全回収してから次を起動し、write processではadvisor MCPと
-  native multi-agentを無効化します。AGENTS.mdに従うnative subagent、専用Grok reviewer、同一物理worktreeに
-  既にいるClaude Code第五advisorはread-only phaseだけで試行します。Zeroちゃん自身はClaudeを新規起動・
-  復元しません。
+  native multi-agentを無効化します。AGENTS.mdに従うnative subagent、専用Grok reviewer、各round専用の
+  fresh Claude Code第五advisorはread-only phaseだけで実行します。第五advisorはHerdrの非フォーカス
+  workspaceへ新規起動し、回答取得の成否にかかわらず、そのroundが所有するworkspaceだけを閉じます。
+  既存のClaude paneは列挙しても入力・再利用・`/clear`・closeしません。
 - 受信許可と書込み許可は別です。既定profileはrepository readとjob outbox writeだけです。`writeAllowFrom` を
   明示した利用者だけrepository・`.git` writeとネットワークを使えますが、Mac全体のsandboxは解除しません。
 - Grok/Claude連携は、Codex shellへcredentialやHerdr socketを渡さない用途固定のhost-side MCP brokerが
   read-onlyで代行します。brokerが公開するtoolは開始用`advisor_round`と状態照会用`advisor_round_poll`だけで、対象repository・pane・実行fileを
   Slack本文やmodel側から指定できません。各必須roundについて、startup receiptを排他作成して
   安全に並行起動する別PIDのGrok solution/risk 2件と
-  理由付きClaude試行をhost journalで検証できない回答はSlackへ公開しません。
+  fresh Claudeの完全回答とexact cleanup receiptをhost journalで検証できない回答はSlackへ公開しません。
   canonical Slack thread本文と必要な一次情報は、Codex本体に加えて2つのGrok reviewerと、条件を満たす
-  既存Claude第五advisorへ送られます。Grok本文は専用launcherのstdinからowner-only一時fileへ固定し、
-  公式`--prompt-file`で渡します。Claude本文は起動時にdevice/inodeを固定したcurrent Herdr Unix socketを
-  connect前後に再照合し、`agent.prompt` request bodyで渡します。matching JSON-RPC rejectionだけは
-  stableな同一Claude snapshotを再確認して既知未送達とし、timeout/EOFは再送しない曖昧送達として保持します。
+  round専用Claude第五advisorへ送られます。Grok本文は専用launcherのstdinから渡します。Claude本文は
+  owner-only request directoryの固定`prompt`へ保存し、検証済みhelperの`send --owned`がHerdrのlocal
+  socket APIへ直接渡して、fresh workspaceの一意なagentへ1回送ります。送達境界後のtimeoutやstalledでは
+  再送せず、同じmarkerを追跡します。
+  reviewer/helperが通常終了後の子process回収にbounded forceを必要とした場合、その回答は採択・公開しません。
   どちらもprocess argvへ本文を載せません。秘密・credential・個人情報をSlack依頼へ貼り付けないでください。
 - native Codex advisorはmodelの自己申告IDだけを信用しません。親App Server turn終了後、公式履歴APIの
   `thread/read`・`thread/list`・`thread/turns/list`・`thread/items/list`を全page照合し、現在turnが直接
@@ -85,23 +89,18 @@ write実装中またはreview中に同じSlackスレッドから返信が来た�
 ## 必要なもの
 
 - macOS
-- Git、Bun、tmux、Herdr 0.8.2 以上（必要なtab/pane APIを含む）
+- Git、Bun、tmux、Herdr 0.8.2 以上（必要なworkspace/tab/pane/agent APIを含む）
 - Codex CLI 0.149.0 以上（`codex login status`が`Logged in using ChatGPT`と返すこと）
 - App を作成できる Slack workspace
-- このMacに導入済みの専用Grok reviewer。第五枠も使う場合は対象worktreeで既に起動済みのClaude Code
+- このMacでsubscription login済みのGrok CLIとClaude Code（Zeroちゃん稼働中にAPI key認証は行いません）
 
-通常jobのためにClaude channel/MCPは不要です。第五advisorは既存live Claude Codeが一意に存在するときだけ
-best-effortで使い、ZeroちゃんがClaude CodeやClaude版Slack Appを起動することはありません。
-Zeroちゃんが一意に予約して実際に使ったpaneだけがjob終了時の`/clear`対象です。候補0件または複数件では
-どのpaneも選択・入力・clearせず、そのjobの第五枠を理由付きskipに固定します。Herdrにcompare-and-sendの
-原子的APIはないため、予約paneはZeroちゃん専用とし、daemon稼働中に人が入力しないでください。
-
-Claude prompt送達直前、またはdurableな中止intent直後にMacが落ちた場合は、曖昧なpromptやCtrl-Cを
-再送も自動clearもしません。復旧時は
-Zeroちゃんを停止したまま専用Claude paneをsettle（必要ならCtrl-C）させ、そこで人が`/clear`を実行して
-新しい空sessionを確認し、`zerokun-jobs recover-interrupted`を実行してから再起動します。同じnative
-sessionのままではfail-closeを維持します。同じHerdr slotの新しいnative sessionとstable emptyを2回
-確認できた場合だけ、手動cleanupのreceiptとして採択し、Ctrl-Cや`/clear`を再送しません。
+通常jobのためにClaude channel/MCPや既存Claude paneは不要です。各必須roundでZeroちゃんが
+`fifth-advisor-<nonce>` workspaceとClaude paneを非フォーカスで新規作成し、回答とsnapshotを検証後、
+そのexact workspaceだけを自動で閉じます。既存のClaude Code sessionやClaude版Slack Appは変更しません。
+prompt送達後に中断しても同じpromptは再送せず、owner-only receiptから作成済みworkspaceだけを
+`zerokun-jobs recover-interrupted`または次回起動で回収します。所有identityやcleanupを証明できない場合は
+別workspaceを推測して閉じず、FIFOをfail-closedで停止します。workspace作成応答前の中断でnonce labelも
+観測されなかった場合はabsence guardを保持し、後続jobのclaim前ごとに同じlabelが現れていないことを再検証します。
 
 ## セットアップ
 
@@ -114,8 +113,9 @@ bash zerokun/bootstrap-macos.sh
 
 bootstrapは公式standalone Codexをaccount-owned領域へ導入してからsetupを実行します。
 Homebrew/npm版だけを使った直接`setup.sh`は、後日の安全な自己更新と同じ信頼条件を満たさないため公開手順では使いません。
-初回MacでCodex/Grokが未導入なら、最初のbootstrapは両CLIを導入したあと未ログインとして停止します。
-その時だけHerdr上で`codex login`と`grok login`を人が実行し、同じbootstrap commandを再実行してください。
+初回MacでCodex/Grok/Claude Codeが未導入・未ログインなら、必要なCLIを用意したあと安全に停止します。
+その時だけHerdr上で`codex login`、`grok login`、Claude Codeのsubscription loginを人が実行し、
+同じbootstrap commandを再実行してください。
 以後Zeroちゃんはdaemon起動時と各job attemptのApp Server起動直前に既存のsubscription loginを再検証して
 使うだけで、API key取得・API課金・認証画面操作は行いません。
 
@@ -313,17 +313,18 @@ DM は launcher に渡した project directory、チャンネルは route の di
   endpoint/provider差替え、legacy sandbox、named permissionの変更を拒否します。安全規則は
   `developerInstructions`、未信頼のSlack本文はJSON-RPC inputへ分離し、子環境はallowlistです。
 - `thread/start`は`ephemeral:false`なので、Codex/provider側のnative履歴はZeroちゃんのSQLiteとは別に
-  残り得ます。Grok/Claude側にも各serviceの保持方針が適用されます。Claudeの`/clear`は次jobへcontextを
-  引き継がないための操作で、provider履歴の削除保証ではありません。
+  残り得ます。Grok/Claude側にも各serviceの保持方針が適用されます。Claudeはroundごとにfresh sessionを
+  起動してworkspaceを閉じますが、provider側の履歴削除を保証するものではありません。
 - apps・plugins・hookと一般MCPは無効化し、用途固定の`zerokun_advisors/advisor_round`と
   `advisor_round_poll`だけを有効にします。
   Web検索はwrite許可jobだけに限定し、write jobのcommand networkはproxyを通してSlack関連domainを拒否します。
 - read jobは`investigation-1`、write jobはread-only準備の`investigation-1`/`design-1`と、別の
   read-only processで行う`review-1`のbroker journalを公開条件にします。write実装processはbrokerや
   subagentを持たず、各phaseのApp Server processは同時に存在しません。
-  journalは固定job/context digest、異なるGrok PID、solution/risk response digest、Claudeの採択responseまたは
-  skip理由digestを持ち、欠落・途中状態・改変時は完成本文があってもfail-closeします。
-- Codex job本体、Grok reviewer、Claude advisor、job終了時のClaude settleと`/clear`確認に壁時計上限はありません。
+  journalは固定job/context digest、異なるGrok PID、solution/risk response digest、Claudeの採択response、
+  fresh lifecycleとcleanup receipt digestを持ち、欠落・途中状態・改変時は完成本文があってもfail-closeします。
+- Codex job本体とGrok reviewerには全体の壁時計上限を設けません。Claude第五advisorの回答取得だけは
+  AGENTS.md契約どおりroundごとに最大1時間で、超過時も所有workspaceをexact cleanupしてpanel未成立にします。
   reviewerはdurable start後にbackgroundで継続し、Codexは完了まで回数・合計時間上限なしでpollします。
   terminal本文と一緒に返すrandom receiptを次pollで照合できた場合だけjournalを完了へ昇格します。
   30秒のMCP設定は各start/pollという制御通信だけのhang検出で、reviewerを停止しません。
@@ -333,14 +334,17 @@ DM は launcher に渡した project directory、チャンネルは route の di
   全子process回収を確認してから結果を公開するため、Codexの後処理が長時間残っても次jobと重なりません。
 - process回収は親子・PGID・microsecond世代のdurable ledgerに加え、job固有のowner-only Seatbelt tagを
   使用します。通常のCodex commandが`setsid`、stdio close、PID 1へのreparentでpolling追跡を抜けても、
-  kernelの継承sandbox signatureから`SIGSTOP`、固定点再走査、exact-generation `SIGKILL`、3回の空走査を
-  完了するまでregistrationを`cleanup-confirmed`にしません。runner crash後も同じtag identityを使って
+  kernelの継承sandbox signatureから`SIGSTOP`で固定点を作り、`SIGCONT`とexact-generation `SIGTERM`の後は
+  壁時計上限なしで自然終了を待ちます。完全一致の`中止`、host abort、内部追跡fault、runner crash recovery
+  だけがbounded `SIGKILL`を許可し、その後3回の空走査を完了するまでregistrationを`cleanup-confirmed`に
+  しません。relayを明示cancelしなければ終われなかった場合もcleanup不確実としてFIFOを開きません。
+  runner crash後は同じtag identityを使って
   recoveryし、欠落・差替え・照会不能ならFIFOを開きません。実効config preflight、Grokのcustom reviewer
   sandbox、native履歴用App Server、brokerから起動するHerdr／fifth-advisor helperも同じtagを継承します。
   brokerとreviewer launcher自身はexact-generation ledgerで追跡し、executor登録前のcrashはtag pair自体から
   startupで回収します。
-- このlocal process排他の対象は、公式Codex/Grokが通常のfork/execで起動したprocessと、Herdrで予約した
-  Claude paneです。launchd/XPC、外部daemon、remote serviceへの意図的handoffまで終了証明するものでは
+- このlocal process排他の対象は、公式Codex/Grokが通常のfork/execで起動したprocessと、Herdrでround専用に
+  作成したClaude workspace/paneです。launchd/XPC、外部daemon、remote serviceへの意図的handoffまで終了証明するものでは
   ありません。その経路を増やさないためhooks/apps/plugins、任意MCP、shellからのSlack操作を無効にしています。
 - 添付と成果物は50MBまでです。成果物はjob専用 `outbox/<job-id>/` 直下のregular fileをrunner専用
   sealed領域へ移してから上限付きFDで読み、任意path・symlink・device/FIFOを拒否します。

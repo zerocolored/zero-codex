@@ -2109,7 +2109,7 @@ export async function reconcileHerdrJobMonitors(input: {
       throw new Error(`monitor state is invalid for job ${name}`)
     }
     // Reconcile staged generation files even when the DB row became terminal
-    // during earlier result/Claude-boundary recovery, and before a queued
+    // during earlier result/advisor-cleanup recovery, and before a queued
     // rate-limit job is considered healthy again.
     initializeFeeds(directory, manifest)
     const job = input.getJob(name)

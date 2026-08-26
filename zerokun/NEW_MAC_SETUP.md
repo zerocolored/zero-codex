@@ -25,24 +25,25 @@ bash "$bootstrap_path" --with-slack
 
 - Apple Command Line Tools
 - Homebrew
-- Git / Bun / tmux / Herdr 0.8.2以上（必要なtab/pane APIを含む） / Codex CLI 0.149.0以上
-- Codex / Grok CLI（login操作はしない）
+- Git / Bun / tmux / Herdr 0.8.2以上（必要なworkspace/tab/pane/agent APIを含む） / Codex CLI 0.149.0以上
+- Codex / Grok CLI / Claude Code（Zeroちゃん自身はlogin操作をしない）
 - zero-codex repository の `main` branch（既定 `~/Desktop/Project/zero-codex`）
 - Zeroちゃん本体とは分離し、最小安全指示の`AGENTS.md`を初期commitした既定
   `zerokun-workspace` repository（`AGENTS.md`のある既存projectも指定可能）
 - Zeroちゃん runtime、管理 CLI、watchdog
 - Slack manifest の生成、token 入力、access 初期設定
 
-専用Grok reviewerは必須です。ZeroちゃんはClaude CodeやClaude loginを自動導入せず、第五枠だけ
-対象projectで既に起動済みのClaude CodeをHerdr経由でbest-effort利用します。read jobではinvestigation、
-write jobでは編集前designと編集後reviewのGrok 2件が完了しない限り、Slackへ成功回答を公開しません。
+専用Grok reviewerとClaude Code第五advisorは必須です。Claudeはあらかじめsubscription login済みにし、
+Zeroちゃんは各round専用のfresh Herdr workspaceへ起動して、回答後にそのworkspaceだけを閉じます。
+既存Claude paneは利用しません。read jobではinvestigation、write jobでは編集前designと編集後reviewの
+必須5者とcleanup receiptが揃わない限り、Slackへ成功回答を公開しません。
 
 ## 人が操作する箇所
 
 macOS や外部サービスの確認画面だけは自動化しません。
 
 1. Command Line Tools の install dialog
-2. Codex / Grok CLI のlogin
+2. Codex / Grok CLI / Claude Code のlogin
 3. Slack App 作成・Workspace install
 4. App-Level Token（`xapp-...`）と Bot Token（`xoxb-...`）の貼付け
 5. Slack user/channel ID の選択
@@ -76,16 +77,17 @@ bootstrapはログイン画面を自動操作しません。新しいMacでは�
 ```bash
 codex login
 grok login
+# Herdrの一時paneで `claude` を起動し、subscription loginを完了して終了
 codex login status
 # `Logged in using ChatGPT` と表示されることを確認
 ```
 
 これは初回だけの人による認証です。稼働中のZeroちゃんは既存のsubscription loginを利用し、API keyの
 取得・Grok API/Codex APIの呼出し・追加認証を行いません。
-Slack thread本文はCodexとread-only advisor（Grok 2件、条件を満たす既存Claude）へ送られます。
-Grokは専用`grok -p` launcherのstdin、Claudeは起動時にdevice/inodeを固定してconnect前後に再照合する
-current Herdr socketを使い、本文をprocess argvへ載せません。
-各provider側の履歴保持はlocal stateの30日GCやClaude `/clear`では削除されないため、秘密・credential・
+Slack thread本文はCodexとread-only advisor（Grok 2件、round専用fresh Claude）へ送られます。
+Grokは専用`grok -p` launcherのstdin、Claudeはowner-only prompt fileと検証済みhelperの
+`send --owned`からHerdr local socket APIへ直接送ります。Claude workspaceはround後にexact closeします。
+各provider側の履歴保持はlocal stateの30日GCやworkspace closeでは削除されないため、秘密・credential・
 個人情報を依頼へ貼り付けないでください。
 
 配置先を変える:
@@ -132,11 +134,11 @@ zerokun-access pair <6桁code>
 
 認可後の依頼が実行段階へ入ると、同じHerdr workspaceに`Zeroちゃん #<待ち順>`という監視tabが
 フォーカスを奪わず自動作成されます。このtabは実際の1本のCodex processの出力を表示するだけで、
-別のCodexを起動しません。rate-limit待機中は残り、Codex・advisor・Claude `/clear`・結果確定が
+別のCodexを起動しません。rate-limit待機中は残り、Codex・round専用advisor cleanup・結果確定が
 すべて終わり、terminalへの最終出力が表示済みだと確認できると自動で閉じます。viewerのPID世代・
 argv・cwd・heartbeatやtab identityが実行中に失われた場合は、実行を止めて後続queueを開始しません。
 監視tabを誤って閉じると、最終出力の実表示を後から証明できないため、`zerokun`の再起動や
-`zerokun-jobs recover-interrupted`でも自動failed化、Claude `/clear`、監視tab再作成は行いません。
+`zerokun-jobs recover-interrupted`でも自動failed化や監視tab再作成は行いません。
 durable monitor obligationを保持して後続queueを停止します。監視tabは手動で閉じないでください。
 Slack deliveryだけはFIFOと独立に再試行します。
 

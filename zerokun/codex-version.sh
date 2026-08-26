@@ -53,6 +53,45 @@ zerokun_resolve_herdr_binary() {
   printf '%s\n' "$binary"
 }
 
+zerokun_resolve_claude_binary() {
+  local binary resolved
+  binary="$(command -v claude 2>/dev/null)" || return 1
+  case "$binary" in /*) ;; *) return 1 ;; esac
+  [ -f "$binary" ] && [ -x "$binary" ] || return 1
+  resolved="$(/usr/bin/perl -MCwd=realpath -e 'print realpath($ARGV[0]) // q{}' "$binary" 2>/dev/null)" || return 1
+  [ -f "$resolved" ] && [ -x "$resolved" ] || return 1
+  [ "$(/usr/bin/stat -f '%u' "$resolved" 2>/dev/null)" = "$(/usr/bin/id -u)" ] || return 1
+  printf '%s\n' "$binary"
+}
+
+zerokun_claude_subscription_ready() {
+  local binary binary_dir
+  binary="$(zerokun_resolve_claude_binary)" || return 1
+  binary_dir="$(dirname "$binary")"
+  /usr/bin/env -i \
+    HOME="$HOME" \
+    PATH="$binary_dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    LANG="${LANG:-en_US.UTF-8}" \
+    LC_ALL="${LC_ALL:-${LANG:-en_US.UTF-8}}" \
+    "$binary" auth status --json 2>/dev/null \
+    | /usr/bin/python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+valid = (
+    isinstance(value, dict)
+    and value.get("loggedIn") is True
+    and value.get("authMethod") == "claude.ai"
+    and value.get("apiProvider") == "firstParty"
+    and isinstance(value.get("subscriptionType"), str)
+    and bool(value.get("subscriptionType"))
+)
+raise SystemExit(0 if valid else 1)
+'
+}
+
 zerokun_herdr_capabilities_ready() {
   local binary="${1:-herdr}" help
   help="$(zerokun_herdr_probe "$binary" pane current --help 2>&1)" || return 1
@@ -64,6 +103,12 @@ zerokun_herdr_capabilities_ready() {
   esac
   help="$(zerokun_herdr_probe "$binary" workspace list --help 2>&1)" || return 1
   case "$help" in *'Usage: herdr workspace list'*) ;; *) return 1 ;; esac
+  help="$(zerokun_herdr_probe "$binary" workspace create --help 2>&1)" || return 1
+  case "$help" in *'--cwd'*'--label'*'--no-focus'*) ;; *) return 1 ;; esac
+  help="$(zerokun_herdr_probe "$binary" workspace get --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr workspace get'*) ;; *) return 1 ;; esac
+  help="$(zerokun_herdr_probe "$binary" workspace close --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr workspace close'*) ;; *) return 1 ;; esac
   help="$(zerokun_herdr_probe "$binary" tab list --help 2>&1)" || return 1
   case "$help" in *'--workspace'*) ;; *) return 1 ;; esac
   help="$(zerokun_herdr_probe "$binary" pane list --help 2>&1)" || return 1
@@ -77,6 +122,8 @@ zerokun_herdr_capabilities_ready() {
   esac
   help="$(zerokun_herdr_probe "$binary" pane process-info --help 2>&1)" || return 1
   case "$help" in *'--pane'*) ;; *) return 1 ;; esac
+  help="$(zerokun_herdr_probe "$binary" pane get --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr pane get'*) ;; *) return 1 ;; esac
   help="$(zerokun_herdr_probe "$binary" tab close --help 2>&1)" || return 1
   case "$help" in *'Usage: herdr tab close'*) ;; *) return 1 ;; esac
   help="$(zerokun_herdr_probe "$binary" agent list --help 2>&1)" || return 1
@@ -87,6 +134,10 @@ zerokun_herdr_capabilities_ready() {
   case "$help" in *'--source'*'--lines'*) ;; *) return 1 ;; esac
   help="$(zerokun_herdr_probe "$binary" agent prompt --help 2>&1)" || return 1
   case "$help" in *'--wait'*'--until'*'--timeout'*) ;; *) return 1 ;; esac
+  help="$(zerokun_herdr_probe "$binary" agent start --help 2>&1)" || return 1
+  case "$help" in *'--kind'*'--pane'*'--timeout'*) ;; *) return 1 ;; esac
+  help="$(zerokun_herdr_probe "$binary" agent send-keys --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr agent send-keys'*) ;; *) return 1 ;; esac
 }
 
 zerokun_require_herdr_version() {
@@ -103,7 +154,7 @@ zerokun_require_herdr_version() {
     return 1
   fi
   if ! zerokun_herdr_capabilities_ready "$binary"; then
-    echo "❌ Herdr ${actual} にZeroちゃんが必要とするtab/pane APIがありません。" >&2
+    echo "❌ Herdr ${actual} にZeroちゃんが必要とするworkspace/tab/pane/agent APIがありません。" >&2
     echo "   このrepositoryで bash zerokun/bootstrap-macos.sh --skip-slack を実行してください。" >&2
     return 1
   fi

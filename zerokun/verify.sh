@@ -35,6 +35,7 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     zerokun/codex-app-server-session.test.ts \
     zerokun/seatbelt-fingerprint.test.ts \
     zerokun/inbound-attachment-cache.test.ts \
+    zerokun/ephemeral-claude-session.test.ts \
     zerokun/public-readiness.test.ts \
     zerokun/queue-contract.test.ts \
     zerokun/slack-app-identity.test.ts \

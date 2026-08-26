@@ -1,12 +1,19 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
-  chmodSync, closeSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync,
-  readdirSync, rmSync, statSync,
+  chmodSync, closeSync, constants, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync,
+  readFileSync, realpathSync, readdirSync, rmSync, statSync,
   symlinkSync, writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { atomicWritePrivateFile, openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
+import {
+  assertDescriptorStillNamesPath,
+  atomicWritePrivateFile,
+  openSafeLog,
+  readOptionalOwnedRegularFile,
+  readOptionalOwnerOnlyRegularFile,
+  readOptionalPrivateFile,
+} from './safe-file.ts'
 import {
   ensureManagedDirectory,
   prepareManagedStateRoot,
@@ -26,6 +33,16 @@ function fixture(): string {
 }
 
 describe('managed private files', () => {
+  test('通常のowner fileと秘密receiptのmode契約を分離する', () => {
+    const dir = fixture()
+    const publicConfig = join(dir, '.zshrc')
+    writeFileSync(publicConfig, 'export SAFE=1\n', { mode: 0o644 })
+    expect(readOptionalOwnedRegularFile(publicConfig)).toBe('export SAFE=1\n')
+    expect(() => readOptionalOwnerOnlyRegularFile(publicConfig)).toThrow('not owner-only')
+    chmodSync(publicConfig, 0o600)
+    expect(readOptionalOwnerOnlyRegularFile(publicConfig)).toBe('export SAFE=1\n')
+  })
+
   test('state rootはgroup/world accessを拒否し、owner確認後のprepareだけが0700へ直す', () => {
     const root = join(fixture(), 'state')
     mkdirSync(root, { mode: 0o777 })
@@ -133,5 +150,20 @@ describe('managed private files', () => {
     const descriptor = openSafeLog(path, 'truncate')
     closeSync(descriptor)
     expect(statSync(path).mode & 0o777).toBe(0o600)
+  })
+
+  test('open後のatomic replaceをpathname identityで検出する', () => {
+    const dir = fixture()
+    const path = join(dir, 'registration.json')
+    writeFileSync(path, '{"revision":0}\n', { mode: 0o600 })
+    const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      expect(() => assertDescriptorStillNamesPath(descriptor, path)).not.toThrow()
+      atomicWritePrivateFile(path, '{"revision":1}\n')
+      expect(() => assertDescriptorStillNamesPath(descriptor, path))
+        .toThrow('managed file path changed while open')
+    } finally {
+      closeSync(descriptor)
+    }
   })
 })

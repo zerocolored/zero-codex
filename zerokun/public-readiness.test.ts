@@ -33,7 +33,7 @@ describe('public Codex defaults', () => {
     const rootReadme = readFileSync(join(import.meta.dir, '..', 'README.md'), 'utf8')
     const runtimeReadme = readFileSync(join(import.meta.dir, 'README.md'), 'utf8')
     const broker = readFileSync(join(import.meta.dir, 'advisor-broker.ts'), 'utf8')
-    const claudeBoundary = readFileSync(join(import.meta.dir, 'claude-queue-boundary.ts'), 'utf8')
+    const fifthHelper = readFileSync(join(import.meta.dir, 'fifth-advisor.py'), 'utf8')
     for (const guide of [rootReadme, runtimeReadme]) {
       expect(guide).toContain('codex app-server --stdio')
       expect(guide).toContain('turn/steer')
@@ -48,7 +48,9 @@ describe('public Codex defaults', () => {
     expect(runtimeReadme).not.toContain('read-only jobは合計5回の実行まで再開')
     expect(broker).not.toContain('GROK_TIMEOUT_MS')
     expect(broker).not.toContain('CLAUDE_TIMEOUT_MS')
-    expect(claudeBoundary).toContain('options.settleTimeoutMs === undefined')
+    expect(fifthHelper).toContain('CLAUDE_START_TIMEOUT_MS = 300_000')
+    expect(fifthHelper).toContain('["workspace", "close", workspace_id]')
+    expect(broker).toContain('Date.now() + 60 * 60 * 1_000')
   })
 
   test('公開CIはGrok認証を要求せずCodex設定だけを実機検証する', () => {
@@ -143,6 +145,7 @@ describe('public Codex defaults', () => {
     const setupGuide = readFileSync(join(import.meta.dir, 'NEW_MAC_SETUP.md'), 'utf8')
     const bootstrap = readFileSync(join(import.meta.dir, 'bootstrap-macos.sh'), 'utf8')
     const codexVersion = readFileSync(join(import.meta.dir, 'codex-version.sh'), 'utf8')
+    const codexChannel = readFileSync(join(import.meta.dir, '..', 'codex-channel.sh'), 'utf8')
     const rawBootstrap = 'https://raw.githubusercontent.com/zerocolored/zero-codex/main/zerokun/bootstrap-macos.sh'
     for (const guide of [rootReadme, runtimeReadme, setupGuide]) {
       expect(guide).toContain(rawBootstrap)
@@ -161,6 +164,13 @@ describe('public Codex defaults', () => {
     expect(codexVersion).toContain('bash zerokun/bootstrap-macos.sh --skip-slack')
     expect(codexVersion).toContain('ZEROKUN_MIN_HERDR_VERSION="0.8.2"')
     expect(codexVersion).toContain('zerokun_herdr_capabilities_ready')
+    expect(codexVersion).toContain('zerokun_claude_subscription_ready')
+    expect(codexChannel).toContain('zerokun_claude_subscription_ready')
+    expect(codexChannel.indexOf('zerokun_claude_subscription_ready')).toBeLessThan(
+      codexChannel.indexOf('start_job_runner() {'),
+    )
+    expect(bootstrap).toContain('claude_subscription_ready')
+    expect(bootstrap).not.toContain('claude auth login')
     expect(rootReadme).toContain('新しいSlack App')
     expect(rootReadme).toContain('tokenをこのPCへコピーしないでください')
     expect(setupGuide).toContain('そのSlack Appやtokenも流用しません')

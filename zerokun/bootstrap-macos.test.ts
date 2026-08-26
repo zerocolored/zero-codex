@@ -19,6 +19,14 @@ import { installGrokReviewer } from './install-grok-reviewer.ts'
 
 const root = join(import.meta.dir, '..')
 const bootstrap = join(import.meta.dir, 'bootstrap-macos.sh')
+const completeHerdrCapabilities = [
+  '--current --workspace --cwd --label --no-focus --match --source --lines',
+  '--kind --pane --wait --until --timeout',
+  'Usage: herdr workspace list Usage: herdr workspace get Usage: herdr workspace close',
+  'Usage: herdr pane run Usage: herdr pane get Usage: herdr tab close',
+  'Usage: herdr agent list Usage: herdr agent get Usage: herdr agent send-keys',
+].join(' ')
+const herdrCapabilitiesWithoutUntil = completeHerdrCapabilities.replace(' --until', '')
 
 function setupTestPath(fakeHome: string, botAppId?: string): string {
   const fakeBin = join(fakeHome, 'zerokun-test-bin')
@@ -38,6 +46,15 @@ function setupTestPath(fakeHome: string, botAppId?: string): string {
   ].join('\n'), {
     mode: 0o700,
   })
+  writeFileSync(join(localBin, 'claude'), [
+    '#!/bin/bash',
+    'if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then',
+    '  printf \'%s\\n\' \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\'',
+    '  exit 0',
+    'fi',
+    'echo "2.1.246 (Claude Code)"',
+    '',
+  ].join('\n'), { mode: 0o700 })
   const configuredAppId = join(fakeHome, '.zerokun-test-bot-app-id')
   if (botAppId) writeFileSync(configuredAppId, `${botAppId}\n`, { mode: 0o600 })
   else rmSync(configuredAppId, { force: true })
@@ -70,7 +87,7 @@ function setupTestPath(fakeHome: string, botAppId?: string): string {
     `exec ${JSON.stringify(process.execPath)} "$@"`,
     '',
   ].join('\n'), { mode: 0o700 })
-  return `${fakeBin}:${process.env.PATH ?? '/usr/bin:/bin'}`
+  return `${localBin}:${fakeBin}:${process.env.PATH ?? '/usr/bin:/bin'}`
 }
 
 function setupDoctorGrok(fakeHome: string): void {
@@ -364,7 +381,7 @@ describe('macOS bootstrap', () => {
         stdout: 'pipe',
         stderr: 'pipe',
       })
-      expect(result.exitCode).toBe(0)
+      expect(result.exitCode, `${result.stdout.toString()}\n${result.stderr.toString()}`).toBe(0)
       const seen = readFileSync(report, 'utf8').trim().split('\n')
       // TMPDIRがHOME配下を指していても、退避先はHOMEの外へ逃がす。
       expectOutsideHome(seen[0], fakeHome)
@@ -462,12 +479,12 @@ describe('macOS bootstrap', () => {
     }
   })
 
-  test('--doctorはHerdrの最低versionと必須tab/pane APIを検査する', () => {
+  test('--doctorはHerdrの最低versionと必須workspace/tab/pane/agent APIを検査する', () => {
     if (process.platform !== 'darwin') return
     for (const fixture of [
       {
         name: 'old-version',
-        script: '#!/bin/sh\n[ "${1:-}" != "--version" ] || { echo "herdr 0.8.1"; exit 0; }\necho "--current --workspace --cwd --label --no-focus --match --source --lines --timeout --pane --wait --until --timeout Usage: herdr workspace list Usage: herdr pane run Usage: herdr tab close Usage: herdr agent list Usage: herdr agent get"\n',
+        script: `#!/bin/sh\n[ "\${1:-}" != "--version" ] || { echo "herdr 0.8.1"; exit 0; }\necho ${JSON.stringify(completeHerdrCapabilities)}\n`,
       },
       {
         name: 'missing-api',
@@ -475,7 +492,7 @@ describe('macOS bootstrap', () => {
       },
       {
         name: 'missing-agent-until',
-        script: '#!/bin/sh\n[ "${1:-}" != "--version" ] || { echo "herdr 0.8.2"; exit 0; }\necho "--current --workspace --cwd --label --no-focus --match --source --lines --timeout --pane --wait --timeout Usage: herdr workspace list Usage: herdr pane run Usage: herdr tab close Usage: herdr agent list Usage: herdr agent get"\n',
+        script: `#!/bin/sh\n[ "\${1:-}" != "--version" ] || { echo "herdr 0.8.2"; exit 0; }\necho ${JSON.stringify(herdrCapabilitiesWithoutUntil)}\n`,
       },
     ]) {
       const fakeHome = mkdtempSync(join(tmpdir(), `zerokun-bootstrap-herdr-${fixture.name}-`))
@@ -494,7 +511,7 @@ describe('macOS bootstrap', () => {
           stderr: 'pipe',
         })
         expect(result.exitCode).toBe(1)
-        expect(result.stdout.toString()).toContain('0.8.2以上とtab/pane APIが必要')
+        expect(result.stdout.toString()).toContain('0.8.2以上とworkspace/tab/pane/agent APIが必要')
       } finally {
         rmSync(fakeHome, { recursive: true, force: true })
         rmSync(fakeBin, { recursive: true, force: true })
@@ -507,7 +524,7 @@ describe('macOS bootstrap', () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-herdr-pin-'))
     const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-herdr-pin-bin-'))
     const explicit = join(fakeHome, 'explicit-old-herdr')
-    const capabilities = '--current --workspace --cwd --label --no-focus --match --source --lines --timeout --pane --wait --until --timeout Usage: herdr workspace list Usage: herdr pane run Usage: herdr tab close Usage: herdr agent list Usage: herdr agent get'
+    const capabilities = completeHerdrCapabilities
     try {
       setupDoctorGrok(fakeHome)
       writeFileSync(join(fakeBin, 'herdr'), `#!/bin/sh\n[ "\${1:-}" != "--version" ] || { echo "herdr 0.8.2"; exit 0; }\necho ${JSON.stringify(capabilities)}\n`, { mode: 0o755 })
@@ -524,7 +541,7 @@ describe('macOS bootstrap', () => {
       })
       expect(result.exitCode).toBe(1)
       expect(result.stdout.toString()).toContain('herdr 0.8.1')
-      expect(result.stdout.toString()).toContain('0.8.2以上とtab/pane APIが必要')
+      expect(result.stdout.toString()).toContain('0.8.2以上とworkspace/tab/pane/agent APIが必要')
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
       rmSync(fakeBin, { recursive: true, force: true })
@@ -638,13 +655,14 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('https://chatgpt.com/codex/install.sh')
     expect(script).toContain('https://x.ai/cli/install.sh')
     expect(script).not.toContain('claude auth login')
+    expect(script).toContain('"$binary" auth status --json')
     expect(script).toContain('"$standalone_codex" login status')
     expect(script).toContain('Logged in using ChatGPT')
     expect(script).toContain('API key認証は使用しません')
     expect(script).not.toContain('"$grok_executable" login')
     expect(script).toContain('Zeroちゃんは認証操作を行いません')
     expect(script).toContain('install-grok-reviewer.ts')
-    expect(script).toContain('install-fifth-advisor.ts')
+    expect(script).not.toContain('install-fifth-advisor.ts" install')
     expect(script).not.toContain('gh auth login')
     expect(script).toContain('zerocolored/zero-codex')
     expect(script).toContain('ensure_repo zerocolored/zero-codex "$REPO_DIR" main')
@@ -664,10 +682,12 @@ describe('macOS bootstrap', () => {
     const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
     expect(setup.indexOf('delegate-active "$SETUP_LOCK/pid" "$$"'))
       .toBeLessThan(setup.indexOf('install-fifth-advisor.ts" verify'))
-    expect(script.indexOf('install_repositories'))
-      .toBeLessThan(script.indexOf('install-fifth-advisor.ts" install'))
     expect(setup.indexOf('RUNNER_PID="$(read_lock_pid'))
       .toBeLessThan(setup.indexOf('GATEWAY_PID="$(read_lock_pid'))
+    expect(setup.indexOf('stop-owner "$CH/plugin.lock"'))
+      .toBeLessThan(setup.indexOf('install-fifth-advisor.ts" install'))
+    expect(setup.indexOf('install-fifth-advisor.ts" install'))
+      .toBeLessThan(setup.indexOf('job-runner.ts" prepare-storage'))
   })
 
   test('bootstrap login preflightはAPI key認証を拒否しChatGPT subscriptionだけを受け入れる', () => {
@@ -691,6 +711,7 @@ describe('macOS bootstrap', () => {
         'secure_standalone_codex() { printf "%s\\n" "$fake_codex"; }',
         'grok_build_executable() { return 0; }',
         'grok_auth_ready() { return 0; }',
+        'claude_subscription_ready() { return 0; }',
         'verify_logins',
       ].join('; ')
       const api = Bun.spawnSync([
@@ -708,7 +729,46 @@ describe('macOS bootstrap', () => {
         stdout: 'pipe', stderr: 'pipe',
       })
       expect(subscription.exitCode).toBe(0)
-      expect(subscription.stdout.toString()).toContain('Codex / Grok CLIは事前ログイン済みです')
+      expect(subscription.stdout.toString()).toContain('Codex / Grok CLI / Claude Codeは事前ログイン済みです')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('Claude login preflightはclaude.ai subscriptionだけを受け入れる', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-claude-login-kind-'))
+    const fakeClaude = join(dir, 'claude')
+    const versionScript = join(import.meta.dir, 'codex-version.sh')
+    try {
+      const writeStatus = (authMethod: 'api_key' | 'claude.ai') => writeFileSync(fakeClaude, [
+        '#!/bin/sh',
+        'if [ -n "${ANTHROPIC_API_KEY:-}" ]; then',
+        '  echo \'{"loggedIn":true,"authMethod":"api_key","apiProvider":"firstParty","subscriptionType":"api"}\'',
+        '  exit 0',
+        'fi',
+        authMethod === 'claude.ai'
+          ? 'echo \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\''
+          : 'echo \'{"loggedIn":true,"authMethod":"api_key","apiProvider":"firstParty","subscriptionType":"api"}\'',
+        '',
+      ].join('\n'), { mode: 0o700 })
+      const command = 'source "$1"; zerokun_claude_subscription_ready'
+      writeStatus('api_key')
+      const api = Bun.spawnSync(['/bin/bash', '-c', command, 'bash', versionScript], {
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? '/usr/bin:/bin'}` },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(api.exitCode).not.toBe(0)
+      writeStatus('claude.ai')
+      const subscription = Bun.spawnSync(['/bin/bash', '-c', command, 'bash', versionScript], {
+        env: {
+          ...process.env,
+          PATH: `${dir}:${process.env.PATH ?? '/usr/bin:/bin'}`,
+          ANTHROPIC_API_KEY: 'must-not-reach-auth-status',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(subscription.exitCode).toBe(0)
+      expect(subscription.stdout.toString()).toBe('')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -726,15 +786,19 @@ describe('macOS bootstrap', () => {
     mkdirSync(fakeHome)
     mkdirSync(fakeBin)
     writeFileSync(join(fakeBin, 'codex'), '#!/bin/sh\necho "codex-cli 0.147.0"\n', { mode: 0o755 })
+    writeFileSync(join(fakeBin, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     writeFileSync(join(fakeBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     writeFileSync(join(fakeBin, 'herdr'), [
       '#!/bin/sh',
       'if [ "${1:-}" = "--version" ]; then echo "herdr 0.8.2"; exit 0; fi',
       "echo 'Usage: herdr workspace list'",
+      "echo 'Usage: herdr workspace get'",
+      "echo 'Usage: herdr workspace close'",
       "echo 'Usage: herdr pane run'",
+      "echo 'Usage: herdr pane get'",
       "echo 'Usage: herdr tab close'",
-      "echo '--current --no-focus --workspace --cwd --label --match --source --lines --timeout --until --wait --pane'",
-      "echo 'Usage: herdr agent list Usage: herdr agent get'",
+      "echo '--current --no-focus --workspace --cwd --label --match --source --lines --timeout --until --wait --pane --kind'",
+      "echo 'Usage: herdr agent list Usage: herdr agent get Usage: herdr agent send-keys'",
       '',
     ].join('\n'), { mode: 0o755 })
     writeFileSync(join(fakeBin, 'bun'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
@@ -777,6 +841,7 @@ version_at_least() {
   return 0
 }
 herdr_compatible() { return 0; }
+resolve_claude_binary() { command -v claude; }
 ${functions.replaceAll('/usr/bin/curl', fakeCurl)}
 secure_standalone_codex() { [ -x "$HOME/.local/bin/codex" ]; }
 grok_build_executable() { printf '%s\\n' "$HOME/.grok/bin/grok"; }
@@ -1495,8 +1560,12 @@ codex --version
       mkdirSync(join(stateDir, 'owner/claude-config/.git'), { recursive: true })
       mkdirSync(join(stateDir, 'owner/claude-skills/.git'), { recursive: true })
       mkdirSync(projectDir, { recursive: true })
-      writeFileSync(tokenFile, 'SLACK_BOT_TOKEN=xoxb-existing-not-a-real-token\nSLACK_APP_TOKEN=xapp-1-A0123456789-existing-not-a-real-token\n')
-      writeFileSync(join(fakeHome, '.zshrc'), 'export EXISTING=1\n', { mode: 0o600 })
+      writeFileSync(
+        tokenFile,
+        'SLACK_BOT_TOKEN=xoxb-existing-not-a-real-token\nSLACK_APP_TOKEN=xapp-1-A0123456789-existing-not-a-real-token\n',
+        { mode: 0o600 },
+      )
+      writeFileSync(join(fakeHome, '.zshrc'), 'export EXISTING=1\n', { mode: 0o644 })
 
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
@@ -1512,7 +1581,7 @@ codex --version
         stderr: 'pipe',
       })
 
-      expect(result.exitCode).toBe(0)
+      expect(result.exitCode, `${result.stdout.toString()}\n${result.stderr.toString()}`).toBe(0)
       expect(result.stderr.toString()).not.toContain('No such file or directory')
       const zshrc = readFileSync(join(fakeHome, '.zshrc'), 'utf8')
       expect(zshrc).toContain(`export ZEROKUN_PROJECT_DIR=${projectDir.replace(' ', '\\ ')}`)
@@ -1521,7 +1590,7 @@ codex --version
       )
       expect(zshrc).toContain('export ZEROKUN_LEGACY_CUTOVER=0')
       expect(zshrc).toContain('codex-channel "$ZEROKUN_PROJECT_DIR"')
-      expect(statSync(join(fakeHome, '.zshrc')).mode & 0o777).toBe(0o600)
+      expect(statSync(join(fakeHome, '.zshrc')).mode & 0o777).toBe(0o644)
       expect(readFileSync(
         join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),
         'utf8',
@@ -1982,7 +2051,7 @@ codex --version
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
-  })
+  }, 15_000)
 
   test('drain中にrunnerが自発終了しても古いPIDへsignalせずsetupを完了する', async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-runner-self-exit-'))

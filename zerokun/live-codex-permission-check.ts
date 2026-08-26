@@ -232,11 +232,10 @@ async function waitForTurnTerminal(
 ): Promise<AppServerTurnTerminal> {
   const deadline = Date.now() + deadlineMs
   while (Date.now() < deadline) {
-    const terminal = session.takeTurnTerminal(threadId, turnId)
-    if (terminal) return terminal
-    const appServerError = session.takeError()
-    if (appServerError) {
-      throw new Error(`App Server emitted an error notification: ${JSON.stringify(appServerError)}`)
+    const activity = session.takeNextTurnActivity(threadId, turnId)
+    if (activity?.kind === 'terminal') return activity.terminal
+    if (activity?.kind === 'error') {
+      throw new Error(`App Server emitted an error notification: ${JSON.stringify(activity.error)}`)
     }
     await session.waitForActivity(Math.min(100, Math.max(1, deadline - Date.now())))
   }
@@ -623,9 +622,14 @@ async function main(): Promise<void> {
         )
         const startDeadline = Date.now() + CONTROL_START_DEADLINE_MS
         while (!existsSync(controlStarted) && Date.now() < startDeadline) {
-          const earlyTerminal = session.takeTurnTerminal(handshake.threadId, turnId)
-          if (earlyTerminal) {
-            throw new Error(`control probe ended before live steering: ${earlyTerminal.turn.status}`)
+          const earlyActivity = session.takeNextTurnActivity(handshake.threadId, turnId)
+          if (earlyActivity?.kind === 'terminal') {
+            throw new Error(`control probe ended before live steering: ${earlyActivity.terminal.turn.status}`)
+          }
+          if (earlyActivity?.kind === 'error') {
+            throw new Error(
+              `control probe emitted an error before live steering: ${JSON.stringify(earlyActivity.error)}`,
+            )
           }
           await session.waitForActivity(100)
         }

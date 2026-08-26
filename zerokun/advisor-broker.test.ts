@@ -18,12 +18,15 @@ import { readProcessIdentity } from './process-tree.ts'
 import { signalProcessIfLive } from './process-generation.ts'
 import {
   advanceAdvisorReceipt,
+  claudeSubscriptionStatusIsReady,
   createExclusivePrivateFile,
   decodeHerdrReadOutput,
   emptyClaudePrompt,
+  extractCompleteClaudeResponse,
   parseFifthAdvisorSendOutcome,
   releaseExclusivePrivateFile,
   runBounded,
+  MAX_ADVISOR_PROMPT_BYTES,
 } from './advisor-broker.ts'
 import { JobStore } from './job-runner.ts'
 import { readAdvisorInputSnapshot, type AdvisorInputSnapshot } from './advisor-input.ts'
@@ -248,18 +251,40 @@ async function brokerFixture(): Promise<BrokerFixture> {
 }
 
 describe('advisor broker boundaries', () => {
-  test('Herdr structured拒否だけを既知未送達として分類する', () => {
+  test('Claudeはfirst-party subscription statusだけを実行時に受理する', () => {
+    expect(claudeSubscriptionStatusIsReady({
+      loggedIn: true,
+      authMethod: 'claude.ai',
+      apiProvider: 'firstParty',
+      subscriptionType: 'max',
+    })).toBe(true)
+    for (const invalid of [
+      { loggedIn: false, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max' },
+      { loggedIn: true, authMethod: 'api_key', apiProvider: 'firstParty', subscriptionType: 'api' },
+      { loggedIn: true, authMethod: 'claude.ai', apiProvider: 'thirdParty', subscriptionType: 'max' },
+      { loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: '' },
+    ]) expect(claudeSubscriptionStatusIsReady(invalid)).toBe(false)
+  })
+
+  test('prompt-startedのexact markerだけを送達可能として分類する', () => {
     const marker = 'REQUEST_MARKER=' + 'A'.repeat(32)
     expect(parseFifthAdvisorSendOutcome([
       JSON.stringify({ status: 'prompt-started', marker }),
       JSON.stringify({ status: 'prompt-command-rejected' }),
-    ].join('\n'))).toEqual({ kind: 'rejected', marker })
+    ].join('\n'))).toEqual({ kind: 'possibly-delivered', marker })
     expect(parseFifthAdvisorSendOutcome([
       JSON.stringify({ status: 'prompt-started', marker }),
       JSON.stringify({ status: 'prompt-command-timeout-or-error' }),
     ].join('\n'))).toEqual({ kind: 'possibly-delivered', marker })
     expect(parseFifthAdvisorSendOutcome(
       JSON.stringify({ status: 'prompt-command-rejected' }),
+    )).toEqual({ kind: 'unconfirmed' })
+    expect(parseFifthAdvisorSendOutcome([
+      JSON.stringify({ status: 'prompt-started', marker }),
+      JSON.stringify({ status: 'prompt-started', marker }),
+    ].join('\n'))).toEqual({ kind: 'unconfirmed' })
+    expect(parseFifthAdvisorSendOutcome(
+      JSON.stringify({ status: 'prompt-started', marker: 'REQUEST_MARKER=bad' }),
     )).toEqual({ kind: 'unconfirmed' })
   })
 
@@ -280,6 +305,21 @@ describe('advisor broker boundaries', () => {
     expect(observed.argv.join(' ')).not.toContain(confidential)
   })
 
+  test('全reviewer transportは共通2MiB byte境界を使う', async () => {
+    const exact = new Uint8Array(MAX_ADVISOR_PROMPT_BYTES)
+    const result = await runBounded([
+      '/usr/bin/python3', '-c', 'import sys; print(len(sys.stdin.buffer.read()))',
+    ], { cwd: '/', env: { PATH: '/usr/bin:/bin' }, stdin: exact })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.trim()).toBe(String(MAX_ADVISOR_PROMPT_BYTES))
+    await expect(runBounded([
+      '/usr/bin/python3', '-c', 'import sys; sys.stdin.buffer.read()',
+    ], {
+      cwd: '/', env: { PATH: '/usr/bin:/bin' },
+      stdin: new Uint8Array(MAX_ADVISOR_PROMPT_BYTES + 1),
+    })).rejects.toThrow('shared transport byte limit')
+  })
+
   test('reviewer processはwhole-job deadlineなしで自然終了まで待つ', async () => {
     const startedAt = Date.now()
     const result = await runBounded([
@@ -293,6 +333,42 @@ describe('advisor broker boundaries', () => {
     expect(result.stdout).toBe('completed')
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(100)
   })
+
+  test.skipIf(process.platform === 'win32')(
+    'reviewer正常回答後のTERM無視子をforce回収した事実を成功として隠さない',
+    async () => {
+      const dir = fixtureDir()
+      const script = join(dir, 'forced-descendant.py')
+      const pidFile = join(dir, 'descendant.pid')
+      writeFileSync(script, `import os, signal, time
+child = os.fork()
+if child == 0:
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    devnull = os.open('/dev/null', os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    while True:
+        time.sleep(30)
+with open(os.environ['DESCENDANT_PID_FILE'], 'w', encoding='utf-8') as stream:
+    stream.write(str(child))
+time.sleep(0.3)
+print('review complete')
+`)
+      chmodSync(script, 0o700)
+      const result = await runBounded(['/usr/bin/python3', script], {
+        env: { PATH: '/usr/bin:/bin', DESCENDANT_PID_FILE: pidFile },
+        terminationGraceMs: 100,
+      })
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toContain('review complete')
+      expect(result.timedOut).toBe(false)
+      expect(result.forcedCleanup).toBe(true)
+      expect(readProcessIdentity(Number(readFileSync(pidFile, 'utf8')))).toBeUndefined()
+    },
+    5_000,
+  )
 
   test('reviewer出力がmanaged上限を超えた事実を黙って採択しない', async () => {
     const exact = await runBounded([
@@ -351,7 +427,7 @@ describe('advisor broker boundaries', () => {
       )
       const journal = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
       expect(journal).toMatchObject({
-        version: 4,
+        version: 5,
         status: 'stale-input',
         inputRevision: fixture.revisionOne.revision,
         inputDigest: fixture.revisionOne.digest,
@@ -420,6 +496,64 @@ describe('advisor broker boundaries', () => {
     expect(emptyClaudePrompt(decodeHerdrReadOutput(JSON.stringify({
       result: { content },
     })))).toBe(true)
+  })
+
+  test('Claude回答はprompt echoと最終独立markerの完全envelopeだけを採択する', () => {
+    const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      '独立したレビュー結果です。',
+      '二行目です。',
+      marker,
+      '❯',
+      '⏵⏵ bypass permissions on',
+    ].join('\n'), marker)).toBe('独立したレビュー結果です。\n二行目です。')
+
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      `本文中に ${marker} を含めます。`,
+      marker,
+      '❯',
+    ].join('\n'), marker)).toBeNull()
+
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      '途中回答です。',
+      marker,
+      'marker後にも回答を続けます。',
+    ].join('\n'), marker)).toBeNull()
+
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      '最終markerがありません。',
+    ].join('\n'), marker)).toBeNull()
+
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      marker,
+      '回答内だけにmarkerが二つあります。',
+      marker,
+      '❯',
+    ].join('\n'), marker)).toBeNull()
+
+    for (const continuation of ['· continuation', '✻ continuation']) {
+      expect(extractCompleteClaudeResponse([
+        '依頼本文',
+        '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+        marker,
+        '回答です。',
+        marker,
+        continuation,
+      ].join('\n'), marker)).toBeNull()
+    }
   })
 
   test('同一roundのexclusive claimは重複作成できずidentity一致時だけ解放する', () => {

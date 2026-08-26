@@ -25,6 +25,10 @@ export type AppServerTurnTerminal = {
   permissionEvidence: AppServerPermissionProbeEvidence
 }
 
+export type AppServerTurnActivity =
+  | { kind: 'error'; error: Record<string, unknown>; sequence: number }
+  | { kind: 'terminal'; terminal: AppServerTurnTerminal; sequence: number }
+
 export type AppServerNotification = {
   method: string
   params: Record<string, unknown>
@@ -679,6 +683,13 @@ export class CodexAppServerSession {
     if (typeof parsed.method !== 'string' || !parsed.method) {
       throw new AppServerProtocolError('App Server notification method is invalid')
     }
+    if (parsed.method === 'zerokun/supervisor-retained') {
+      const params = record(parsed.params, 'supervisor retained notification params')
+      if (Object.keys(params).join('\n') !== 'version' || params.version !== 1) {
+        throw new AppServerProtocolError('supervisor retained notification is invalid')
+      }
+      throw new AppServerProtocolError('Codex supervisor retained uncertain cleanup')
+    }
     // Any server-initiated request requires interactive authority that this
     // unattended Slack worker deliberately does not have.
     if ('id' in parsed) {
@@ -1011,6 +1022,46 @@ export class CodexAppServerSession {
           observed.permissionEvidence,
           permissionProbeEvidenceFromItems(turn.items),
         ),
+      }
+    }
+    return null
+  }
+
+  /**
+   * Consume the next relevant control notification in wire order.  Looking up
+   * `error` and `turn/completed` independently can invert two JSONL records
+   * that arrived in the same stdout chunk, allowing a post-terminal error to
+   * be mistaken for in-turn progress.
+   */
+  takeNextTurnActivity(threadId: string, turnId: string): AppServerTurnActivity | null {
+    for (let index = 0; index < this.notifications.length; index += 1) {
+      const notification = this.notifications[index]!
+      if (notification.method === 'error') {
+        this.notifications.splice(index, 1)
+        return {
+          kind: 'error',
+          error: notification.params,
+          sequence: notification.sequence,
+        }
+      }
+      if (notification.method !== 'turn/completed') continue
+      const params = notification.params
+      if (params.threadId !== threadId) continue
+      const turn = parseTurn(params.turn)
+      if (turn.id !== turnId || turn.status === 'inProgress') continue
+      this.notifications.splice(index, 1)
+      const observed = this.takeTurnProjection(threadId, turnId)
+      return {
+        kind: 'terminal',
+        sequence: notification.sequence,
+        terminal: {
+          threadId,
+          turn: mergeTurnItems(turn, observed.lastAgentMessage ? [observed.lastAgentMessage] : []),
+          permissionEvidence: mergeAppServerPermissionProbeEvidence(
+            observed.permissionEvidence,
+            permissionProbeEvidenceFromItems(turn.items),
+          ),
+        },
       }
     }
     return null

@@ -132,6 +132,40 @@ describe('Codex App Server session', () => {
     }
   })
 
+  test('errorとterminalをwire到着順のまま1件ずつ消費する', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    const threadId = 'thread-ordered-activity'
+    const turnId = 'turn-ordered-activity'
+    const activeTurn = {
+      id: turnId, status: 'inProgress', itemsView: 'full', items: [], error: null,
+    }
+    transport.emit({ method: 'turn/started', params: { threadId, turn: activeTurn } })
+    transport.emit({ method: 'error', params: {
+      threadId, turnId, willRetry: true,
+      error: { message: 'before terminal', codexErrorInfo: null, additionalDetails: null },
+    } })
+    transport.emit({ method: 'turn/completed', params: { threadId, turn: {
+      ...activeTurn,
+      status: 'completed',
+      items: [{ type: 'agentMessage', id: 'answer', text: '完了' }],
+    } } })
+    transport.emit({ method: 'error', params: {
+      threadId, turnId, willRetry: false,
+      error: { message: 'after terminal', codexErrorInfo: null, additionalDetails: null },
+    } })
+    transport.close()
+    await session.waitForReader()
+
+    const first = session.takeNextTurnActivity(threadId, turnId)
+    const second = session.takeNextTurnActivity(threadId, turnId)
+    const third = session.takeNextTurnActivity(threadId, turnId)
+    expect(first).toMatchObject({ kind: 'error', error: { willRetry: true } })
+    expect(second).toMatchObject({ kind: 'terminal', terminal: { turn: { status: 'completed' } } })
+    expect(third).toMatchObject({ kind: 'error', error: { willRetry: false } })
+    expect(session.takeNextTurnActivity(threadId, turnId)).toBeNull()
+  })
+
   test('initialize必須field欠落を通知送信前に拒否する', async () => {
     const transport = mockTransport((request, emit) => {
       if (request.method === 'initialize') emit({ id: request.id, result: { userAgent: 'test' } })

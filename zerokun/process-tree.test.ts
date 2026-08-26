@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  MAX_TRACKED_PROCESSES,
   readProcessIdentity,
+  synchronizeTrackedProcessLedger,
   updateTrackedProcesses,
   type ProcessIdentity,
 } from './process-tree.ts'
@@ -123,5 +125,29 @@ describe('process tree identity tracking', () => {
     ], [6_000], 6_000, tracked)
 
     expect([...tracked]).toEqual([[6_000, generation('live-root')]])
+  })
+
+  test('durable ledgerも終了済みgenerationをpruneして生涯上限にしない', () => {
+    const tracked = new Map<number, string>([[6_000, generation('live-root-ledger')]])
+    const ledger = new Map<string, { pid: number; started: string }>()
+    for (let pid = 1_000_000; pid < 1_005_000; pid += 1) {
+      const started = generation(`historical-${pid}`)
+      ledger.set(`${pid}:${started}`, { pid, started })
+    }
+
+    synchronizeTrackedProcessLedger(tracked, ledger)
+
+    expect([...ledger.values()]).toEqual([
+      { pid: 6_000, started: generation('live-root-ledger') },
+    ])
+  })
+
+  test('同時に生存するgenerationが上限を超える場合はfail closedを維持する', () => {
+    const tracked = new Map<number, string>()
+    for (let index = 0; index <= MAX_TRACKED_PROCESSES; index += 1) {
+      tracked.set(10_000 + index, generation(`concurrent-${index}`))
+    }
+    expect(() => synchronizeTrackedProcessLedger(tracked, new Map()))
+      .toThrow(`追跡process数が上限${MAX_TRACKED_PROCESSES}を超えました`)
   })
 })
