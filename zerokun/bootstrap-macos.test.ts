@@ -656,6 +656,10 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('https://x.ai/cli/install.sh')
     expect(script).not.toContain('claude auth login')
     expect(script).toContain('"$binary" auth status --json')
+    expect(script).toContain('USER="$user_name"')
+    expect(script).toContain('LOGNAME="$user_name"')
+    expect(script).toContain('SHELL="${SHELL:-/bin/zsh}"')
+    expect(script).toContain('TMPDIR="${TMPDIR:-/tmp}"')
     expect(script).toContain('"$standalone_codex" login status')
     expect(script).toContain('Logged in using ChatGPT')
     expect(script).toContain('API key認証は使用しません')
@@ -742,6 +746,10 @@ describe('macOS bootstrap', () => {
     try {
       const writeStatus = (authMethod: 'api_key' | 'claude.ai') => writeFileSync(fakeClaude, [
         '#!/bin/sh',
+        'if [ -z "${HOME:-}" ] || [ -z "${USER:-}" ] || [ -z "${LOGNAME:-}" ] || [ -z "${SHELL:-}" ] || [ -z "${TMPDIR:-}" ] || [ "$USER" != "$LOGNAME" ]; then',
+        '  echo \'{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty","subscriptionType":""}\'',
+        '  exit 0',
+        'fi',
         'if [ -n "${ANTHROPIC_API_KEY:-}" ]; then',
         '  echo \'{"loggedIn":true,"authMethod":"api_key","apiProvider":"firstParty","subscriptionType":"api"}\'',
         '  exit 0',

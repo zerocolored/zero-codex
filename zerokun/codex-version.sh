@@ -65,11 +65,16 @@ zerokun_resolve_claude_binary() {
 }
 
 zerokun_claude_subscription_ready() {
-  local binary binary_dir
+  local binary binary_dir user_name
   binary="$(zerokun_resolve_claude_binary)" || return 1
   binary_dir="$(dirname "$binary")"
+  user_name="$(/usr/bin/id -un)" || return 1
   /usr/bin/env -i \
     HOME="$HOME" \
+    USER="$user_name" \
+    LOGNAME="$user_name" \
+    SHELL="${SHELL:-/bin/zsh}" \
+    TMPDIR="${TMPDIR:-/tmp}" \
     PATH="$binary_dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     LANG="${LANG:-en_US.UTF-8}" \
     LC_ALL="${LC_ALL:-${LANG:-en_US.UTF-8}}" \
