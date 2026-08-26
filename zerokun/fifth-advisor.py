@@ -1903,6 +1903,20 @@ def _settle_after_trust(
         ):
             return agent
         if agent.get("agent_status") == "blocked":
+            blocked_text = _read_visible(target)
+            if (
+                agent.get("launch_pending") is True
+                and agent.get("state_change_seq") == first_sequence
+                and blocked_text == first_text
+                and _strict_trust_screen(
+                    blocked_text,
+                    str(workspace["project_root"]),
+                )
+            ):
+                # Herdr can briefly report the already-confirmed trust screen
+                # until Claude consumes the single Enter key. Never resend it.
+                time.sleep(0.25)
+                continue
             raise UnsafeRequest("ephemeral Claude reached another blocked startup UI")
         time.sleep(0.25)
     raise UnsafeRequest("ephemeral Claude did not become ready after trust confirmation")
