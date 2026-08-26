@@ -1314,6 +1314,66 @@ describe('Codex branch self update', () => {
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v2\n')
   }, 20_000)
 
+  test('Herdr restart pin欠落は稼働serviceを停止する前に失敗する', async () => {
+    const fixture = updaterFixture()
+    const environment = serviceUpdaterEnvironment(fixture, 'unused-fixture-session')
+    const started = await startBotInHerdr({
+      rootRepo: fixture.repo.local,
+      stateDir: fixture.state,
+      projectDir: fixture.project,
+      startupTimeoutMs: 3_000,
+    })
+    rememberFixtureServices(fixture.state)
+    const runnerPid = Number(readFileSync(join(fixture.state, 'job-runner.lock', 'pid'), 'utf8'))
+    rmSync(join(fixture.state, 'herdr-runtime.json'))
+
+    const result = runUpdater(fixture, ['--skip-tests'], environment)
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr.toString()).toContain('この検査ではserviceを停止していません')
+    expect(result.stderr.toString()).toContain('pinned Herdr runtime identity is missing')
+    expect(Number(readFileSync(join(fixture.state, 'plugin.lock'), 'utf8')))
+      .toBe(started.gatewayPid)
+    expect(Number(readFileSync(join(fixture.state, 'job-runner.lock', 'pid'), 'utf8')))
+      .toBe(runnerPid)
+    expect(() => process.kill(started.gatewayPid, 0)).not.toThrow()
+    expect(() => process.kill(runnerPid, 0)).not.toThrow()
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
+    expect(existsSync(fixture.setupMarker)).toBe(false)
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
+  }, 20_000)
+
+  test('pin欠落の未完了journalは通常再開でrollbackせずrecover-onlyを案内する', () => {
+    const fixture = updaterFixture()
+    const environment = serviceUpdaterEnvironment(fixture, 'unused-fixture-session')
+    const head = must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)
+    const journal = join(fixture.state, 'update-transaction.json')
+    writeFileSync(journal, JSON.stringify({
+      version: 1,
+      id: '12345678-1234-4123-8123-123456789abc',
+      phase: 'prepared',
+      repoPath: realpathSync(fixture.repo.local),
+      branch: 'codex',
+      originalHead: head,
+      targetHead: head,
+      projectDir: fixture.project,
+      setupScript: fixture.setup,
+      databasePath: null,
+      databaseBackup: null,
+      noRestart: false,
+    }) + '\n', { mode: 0o600 })
+    rmSync(join(fixture.state, 'herdr-runtime.json'))
+
+    const result = runUpdater(fixture, ['--skip-tests'], environment)
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr.toString()).toContain('zerokun-update --recover-only')
+    expect(result.stderr.toString()).toContain('pinned Herdr runtime identity is missing')
+    expect(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)).toBe(head)
+    expect(existsSync(fixture.setupMarker)).toBe(false)
+    expect(existsSync(journal)).toBe(true)
+  })
+
   test('candidate readiness失敗時は旧commitへrollbackし旧gatewayとrunnerを再起動する', () => {
     const fixture = updaterFixture()
     const originalHead = must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)

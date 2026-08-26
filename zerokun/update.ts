@@ -2032,6 +2032,29 @@ export async function startBotInHerdr(options: {
   fail(`ZeroちゃんのHerdr再起動を${timeoutMs / 1_000}秒以内に確認できませんでした`)
 }
 
+async function assertPinnedHerdrRestartReady(
+  stateDir: string,
+  recovery = false,
+): Promise<void> {
+  try {
+    const runtime = readPinnedHerdrRuntime(stateDir)
+    await verifyHerdrRuntimeIdentityAsync(
+      runtime,
+      environmentForPinnedHerdrRuntime(runtime),
+    )
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    fail(
+      'Zeroちゃんの再起動先Herdr paneを確認できません。'
+      + (recovery
+        ? ' 先に zerokun-update --recover-only を実行し、'
+          + '専用paneでZeroちゃんを起動してください。'
+        : ' 専用paneでZeroちゃんを一度起動してから更新してください。')
+      + ` この検査ではserviceを停止していません: ${reason}`,
+    )
+  }
+}
+
 async function stopServices(
   stateDir: string,
   signal?: AbortSignal,
@@ -2257,8 +2280,10 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       if (realpathSync(interrupted.repoPath) !== rootRepo) {
         fail(`別repositoryの未完了更新があります: ${interrupted.repoPath}`)
       }
+      const restartInterrupted = !recoverOnly && !interrupted.noRestart
+      if (restartInterrupted) await assertPinnedHerdrRestartReady(stateDir, true)
       await rollbackUpdate(stateDir, interrupted, {
-        restart: !recoverOnly && !interrupted.noRestart,
+        restart: restartInterrupted,
         testing,
         updateLock,
       })
@@ -2275,6 +2300,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       output('   未完了の更新transactionはありません')
       return
     }
+    if (!noRestart) await assertPinnedHerdrRestartReady(stateDir)
     await waitForRunningJobs(
       stateDir,
       waitSeconds,
@@ -2311,6 +2337,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       controller.signal,
     )
     throwIfInterrupted()
+    if (!noRestart) await assertPinnedHerdrRestartReady(stateDir)
     const transactionId = randomUUID()
     let journal: UpdateJournal = {
       version: 1,
