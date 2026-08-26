@@ -1615,7 +1615,8 @@ describe('Herdr job monitor', () => {
     await expect(readBoundedHerdrOutput(stream, 12)).rejects.toThrow('exceeded its bound')
   })
 
-  test('実viewerはterminal write完了後のoffsetをprogressへ記録する', async () => {
+  test.skipIf(process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
+    '実viewerはterminal write完了後のoffsetをprogressへ記録する', async () => {
     const state = fixtureDirectory()
     const directory = join(state, 'job-monitors', 'real-viewer')
     mkdirSync(join(state, 'job-monitors'), { mode: 0o700 })
@@ -1716,5 +1717,6 @@ describe('Herdr job monitor', () => {
     expect(stdout).not.toContain('\u001b[31m')
     expect(stderr).toContain('warning-line')
     expect(stderr).toContain('\uFFFD')
-  })
+    },
+  )
 })

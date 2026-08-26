@@ -36,7 +36,8 @@ function processIdentity(
 }
 
 describe('process tree identity tracking', () => {
-  test.skipIf(process.platform !== 'darwin')(
+  test.skipIf(process.platform !== 'darwin'
+    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
     'process tableから一時欠落したlive generationをdirect probeで保持する',
     () => {
       const identity = readProcessIdentity(process.pid)

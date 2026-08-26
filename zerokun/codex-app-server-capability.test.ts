@@ -190,7 +190,8 @@ describe('Codex App Server capability gate', () => {
     expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('commentary')
   })
 
-  test.skipIf(process.platform !== 'darwin')(
+  test.skipIf(process.platform !== 'darwin'
+    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
     'generate-ts親終了後にdetached子がpipeを保持してもboundedに失敗しfingerprintで回収できる',
     async () => {
       const root = mkdtempSync(join(tmpdir(), 'zero-app-server-pipe-holder-'))

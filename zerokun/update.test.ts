@@ -481,7 +481,7 @@ describe('updater helpers', () => {
     }
     delete environment.ZEROKUN_CODEX_BIN
     const result = runUpdater(fixture, ['--no-restart'], environment)
-    expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0)
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v2\n')
   }, 30_000)
 
@@ -1434,8 +1434,8 @@ describe('Codex branch self update', () => {
     writeFileSync(join(verifyDir, 'verify.sh'), [
       '#!/bin/bash',
       'set -e',
-      `if test -r '${stateSecret}'; then exit 41; fi`,
-      `if touch '${externalMarker}' 2>/dev/null; then exit 42; fi`,
+      `if test -r '${stateSecret}'; then echo 'state unexpectedly readable' >&2; exit 41; fi`,
+      `if touch '${externalMarker}' 2>/dev/null; then echo 'external path unexpectedly writable' >&2; exit 42; fi`,
       'touch candidate-local-output',
       'exit 0',
       '',
@@ -1444,9 +1444,35 @@ describe('Codex branch self update', () => {
     must(['git', 'commit', '-m', 'sandboxed candidate'], fixture.repo.seed)
     must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
     const result = runUpdater(fixture, ['--no-restart'])
-    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0)
     expect(existsSync(externalMarker)).toBe(false)
     expect(readFileSync(stateSecret, 'utf8')).toBe('must-not-read')
+  }, 15_000)
+
+  test('候補verifyは候補TMPDIR内Unix socketを実行できる', () => {
+    const fixture = updaterFixture()
+    const bunProgram = [
+      'import { existsSync } from "fs"',
+      'import { join } from "path"',
+      'const path = join(process.env.TMPDIR!, "candidate-bun.sock")',
+      'const server = Bun.listen({ unix: path, socket: { data() {} } })',
+      'if (!existsSync(path)) process.exit(43)',
+      'server.stop(true)',
+    ].join('; ')
+    const verifyDir = join(fixture.repo.seed, 'zerokun')
+    mkdirSync(verifyDir, { recursive: true })
+    writeFileSync(join(verifyDir, 'verify.sh'), [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      `bun --no-env-file -e ${JSON.stringify(bunProgram)}`,
+      '',
+    ].join('\n'))
+    must(['git', 'add', '.'], fixture.repo.seed)
+    must(['git', 'commit', '-m', 'candidate xcrun and socket'], fixture.repo.seed)
+    must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+
+    const result = runUpdater(fixture, ['--no-restart'])
+    expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0)
   }, 15_000)
 
   test('候補verifyがhangしてもdeadlineで停止しlive HEADを変更しない', () => {

@@ -28,19 +28,12 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     gate.test.ts \
     server-resilience.test.ts \
     zerokun/routing.test.ts \
-    zerokun/codex-config-preflight.test.ts \
-    zerokun/claude-queue-boundary.test.ts \
     zerokun/herdr-runtime.test.ts \
     zerokun/herdr-job-monitor.test.ts \
-    zerokun/advisor-broker.test.ts \
-    zerokun/advisor-prerequisites.test.ts \
-    zerokun/advisor-snapshot.test.ts \
     zerokun/native-advisor-evidence.test.ts \
     zerokun/codex-app-server-capability.test.ts \
     zerokun/codex-app-server-session.test.ts \
     zerokun/seatbelt-fingerprint.test.ts \
-    zerokun/install-fifth-advisor.test.ts \
-    zerokun/install-grok-reviewer.test.ts \
     zerokun/inbound-attachment-cache.test.ts \
     zerokun/public-readiness.test.ts \
     zerokun/queue-contract.test.ts \
@@ -90,12 +83,12 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     '成果物単位のdelivery checkpointで再送時の重複uploadを防ぐ'
   candidate_contract_test zerokun/job-runner.test.ts \
     'byte開始後の曖昧性だけをartifact単位で5回確認して打ち切る'
-  candidate_contract_test zerokun/update.test.ts \
-    'standalone Codexを絶対pathへ固定しcandidate PATHでも解決できる'
-  candidate_contract_test zerokun/update.test.ts \
-    'standalone Codexを古いBun隣接版より優先し、最低version未満は採用しない'
-  candidate_contract_test zerokun/update.test.ts \
-    'updaterのcustom Codexは相対pathやgroup/world writable実体を拒否する'
+  candidate_contract_test zerokun/codex-config-preflight.test.ts \
+    'discovered stdio/HTTP MCPを一つのtop-level tableで無効transportへ固定する'
+  candidate_contract_test zerokun/codex-config-preflight.test.ts \
+    'MCP transportが欠落またはstdio/HTTP併存ならfail closedする'
+  candidate_contract_test zerokun/codex-config-preflight.test.ts \
+    'Zeroちゃんbrokerだけをenabledのまま保持する'
   candidate_contract_test zerokun/update.test.ts \
     'candidate sandboxはpreflightと同じrandom named permissionをdefaultにする'
   candidate_contract_test zerokun/update.test.ts \
@@ -110,6 +103,12 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     'cleanup evidenceが一つでも不確実ならundelegateを許可しない'
   candidate_contract_test zerokun/update.test.ts \
     'setup timeoutはlegacy drainと15分の作業budgetを必ず覆う'
+  candidate_contract_test zerokun/install-fifth-advisor.test.ts \
+    'bundled helperをowner-onlyで配置して内容まで固定する'
+  candidate_contract_test zerokun/install-fifth-advisor.test.ts \
+    '改変、hardlink、symlink directoryを拒否する'
+  candidate_contract_test zerokun/install-fifth-advisor.test.ts \
+    'host共有helperを変更せずZero専用namespaceだけへ配置する'
 else
   bun test
 fi

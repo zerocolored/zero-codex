@@ -1708,6 +1708,7 @@ async function validateZero(
   const trustedToolDirectory = stagedCodex.directory
   const stagedCodexBin = stagedCodex.executable
   const profile = `zerokun_update_${randomUUID().replaceAll('-', '')}`
+  const candidateSocketRoot = realpathSync(join(isolatedHome, 'tmp'))
   const filesystem = new Map<string, 'deny' | 'read' | 'write'>([
     [':minimal', 'read'],
     [realpathSync(homedir()), 'deny'],
@@ -1745,6 +1746,7 @@ async function validateZero(
     ...permissionOverrides.flatMap(value => ['-c', value]),
     '-P', profile,
     '--include-managed-config',
+    '--allow-unix-socket', candidateSocketRoot,
     '--',
     '/usr/bin/env', 'ZERO_CODEX_CANDIDATE_SANDBOX=1',
     '/bin/bash', verifyScript, '--candidate-sandbox',
