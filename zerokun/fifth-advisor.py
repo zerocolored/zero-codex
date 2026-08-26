@@ -1894,6 +1894,40 @@ def _settle_after_trust(
     raise UnsafeRequest("ephemeral Claude did not become ready after trust confirmation")
 
 
+def _settle_after_agent_not_ready(
+    target: str,
+    workspace: Dict[str, object],
+) -> Dict[str, object]:
+    _result, first_agent = _agent_information(target)
+    if first_agent is None:
+        raise UnsafeRequest("ephemeral Claude disappeared after startup")
+    _validate_owned_agent(first_agent, workspace, require_ready=False)
+    if (
+        first_agent.get("agent_status") == "blocked"
+        and first_agent.get("launch_pending") is True
+    ):
+        return _settle_after_trust(target, workspace)
+
+    _validate_owned_agent(first_agent, workspace, require_ready=True)
+    first_sequence = first_agent.get("state_change_seq")
+    first_text = _read_visible(target)
+    if type(first_sequence) is not int or not _empty_claude_prompt_screen(first_text):
+        raise UnsafeRequest("ephemeral Claude is not at the exact empty ready prompt")
+    time.sleep(1.0)
+    _result, second_agent = _agent_information(target)
+    second_text = _read_visible(target)
+    if second_agent is None:
+        raise UnsafeRequest("ephemeral Claude disappeared at its ready prompt")
+    _validate_owned_agent(second_agent, workspace, require_ready=True)
+    if (
+        second_agent.get("state_change_seq") != first_sequence
+        or second_text != first_text
+        or not _empty_claude_prompt_screen(second_text)
+    ):
+        raise UnsafeRequest("ephemeral Claude ready prompt did not settle")
+    return second_agent
+
+
 def _protected_unchanged(project_root: str, request_dir: str) -> bool:
     root_descriptor, root = _physical_git_root(project_root)
     request_descriptor, _request = _request_directory(request_dir, root)
@@ -3715,7 +3749,7 @@ def _open_ephemeral_workspace(
                 raise UnsafeRequest("ephemeral Claude was not registered after startup")
             _validate_owned_agent(agent, workspace_receipt, require_ready=True)
         elif _error_code(started) == "agent_not_ready":
-            agent = _settle_after_trust(agent_name, workspace_receipt)
+            agent = _settle_after_agent_not_ready(agent_name, workspace_receipt)
         else:
             raise UnsafeRequest("ephemeral Claude could not start")
 

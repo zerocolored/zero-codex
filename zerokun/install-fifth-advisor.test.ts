@@ -394,6 +394,50 @@ describe('fifth-advisor helper installer', () => {
     expect(opened.stdout.toString()).not.toContain('ephemeral-claude-ready')
   })
 
+  test('agent_not_ready後に既trustのempty ready promptへ到達したClaudeを受理する', () => {
+    const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
+    const program = [
+      'import importlib.util,json,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'workspace={"agent_name":"fifth-test","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","project_root":"/tmp/project"}',
+      'ready={"name":"fifth-test","agent":"claude","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","cwd":"/tmp/project","agent_status":"idle","interactive_ready":True,"launch_pending":False,"state_change_seq":7}',
+      'module._agent_information=lambda target: ({},dict(ready))',
+      'module._read_visible=lambda target: "❯\\n"',
+      'module.time.sleep=lambda seconds: None',
+      'module._settle_after_trust=lambda target,workspace: (_ for _ in ()).throw(AssertionError("trust path must not run"))',
+      'resolved=module._settle_after_agent_not_ready("fifth-test",workspace)',
+      'print(json.dumps({"status":resolved["agent_status"],"sequence":resolved["state_change_seq"]},sort_keys=True))',
+    ].join('\n')
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], {
+      stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout.toString())).toEqual({ sequence: 7, status: 'idle' })
+  })
+
+  test('agent_not_ready後のblocked launchはexact trust検査へだけ渡す', () => {
+    const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
+    const program = [
+      'import importlib.util,json,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'workspace={"agent_name":"fifth-test","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","project_root":"/tmp/project"}',
+      'blocked={"name":"fifth-test","agent":"claude","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","cwd":"/tmp/project","agent_status":"blocked","interactive_ready":False,"launch_pending":True,"state_change_seq":8}',
+      'module._agent_information=lambda target: ({},dict(blocked))',
+      'module._settle_after_trust=lambda target,workspace: {"path":"strict-trust"}',
+      'resolved=module._settle_after_agent_not_ready("fifth-test",workspace)',
+      'print(json.dumps(resolved,sort_keys=True))',
+    ].join('\n')
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], {
+      stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout.toString())).toEqual({ path: 'strict-trust' })
+  })
+
   test('sendは本文をprocess argvへ載せずowner-only Herdr socketへ1回だけ送る', async () => {
     const home = fixture()
     const { project, request } = gitProject(home)
