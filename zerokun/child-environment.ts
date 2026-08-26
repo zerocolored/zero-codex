@@ -4,6 +4,8 @@ const BASE_KEYS = new Set([
 
 const RUNTIME_LAUNCH_KEYS = new Set([
   'PATH', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'LANG', 'TERM', 'NO_COLOR',
+  'HERDR_ENV', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'HERDR_PANE_ID',
+  'HERDR_TAB_ID', 'HERDR_TERMINAL_ID', 'HERDR_WORKSPACE_ID',
 ])
 
 const RUNTIME_SERVICE_KEYS = new Set([
@@ -12,7 +14,7 @@ const RUNTIME_SERVICE_KEYS = new Set([
   'ZEROKUN_CATCHUP_REPLY_PAGES_PER_SWEEP', 'ZEROKUN_CATCHUP_WINDOW_H',
   'ZEROKUN_GC_INTERVAL_MS', 'ZEROKUN_IDEMPOTENCY_RETENTION_DAYS',
   'ZEROKUN_INBOUND_MAX_ATTEMPTS', 'ZEROKUN_JOB_MODEL',
-  'ZEROKUN_JOB_POLL_MS', 'ZEROKUN_JOB_RUNNER', 'ZEROKUN_JOB_TIMEOUT_MS',
+  'ZEROKUN_JOB_POLL_MS', 'ZEROKUN_JOB_RUNNER',
   'ZEROKUN_MAX_JOBS_PER_SESSION', 'ZEROKUN_RETENTION_DAYS',
   'ZEROKUN_RUNTIME_LOG_MAX_BYTES', 'ZEROKUN_SLACK_HTTP_TIMEOUT_MS',
   'ZEROKUN_TMUX_SESSION', 'ZEROKUN_UPDATE_REQUEST', 'ZEROKUN_UPDATE_WAIT_SECONDS',
@@ -30,6 +32,8 @@ const UPDATE_KEYS = new Set([
   'ZEROKUN_UPDATE_VERIFY_TIMEOUT_MS', 'ZEROKUN_UPDATE_SETUP_TIMEOUT_MS',
   'ZEROKUN_SETUP_DRAIN_SECONDS',
   'ZEROKUN_UPDATE_WORKER_TIMEOUT_MS', 'ZEROKUN_LAUNCHCTL_BIN',
+  'HERDR_ENV', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'HERDR_PANE_ID',
+  'HERDR_TAB_ID', 'HERDR_TERMINAL_ID', 'HERDR_WORKSPACE_ID',
 ])
 
 const SLACK_TOKEN_KEYS = new Set(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'])
@@ -40,7 +44,7 @@ const STATE_RUNTIME_SETTING_KEYS = new Set([
   'ZEROKUN_CATCHUP_REPLY_PAGES_PER_SWEEP', 'ZEROKUN_CATCHUP_WINDOW_H',
   'ZEROKUN_GC_INTERVAL_MS', 'ZEROKUN_IDEMPOTENCY_RETENTION_DAYS',
   'ZEROKUN_INBOUND_MAX_ATTEMPTS', 'ZEROKUN_JOB_MODEL', 'ZEROKUN_JOB_POLL_MS',
-  'ZEROKUN_JOB_TIMEOUT_MS', 'ZEROKUN_MAX_JOBS_PER_SESSION', 'ZEROKUN_RETENTION_DAYS',
+  'ZEROKUN_MAX_JOBS_PER_SESSION', 'ZEROKUN_RETENTION_DAYS',
   'ZEROKUN_RUNTIME_LOG_MAX_BYTES', 'ZEROKUN_SLACK_HTTP_TIMEOUT_MS',
   'ZEROKUN_UPDATE_WAIT_SECONDS', 'ZEROKUN_UPDATE_WORKER_TIMEOUT_MS',
 ])
@@ -61,6 +65,27 @@ const TEST_CONTROL_KEYS = new Set([
 export interface StateSlackTokens {
   SLACK_BOT_TOKEN?: string
   SLACK_APP_TOKEN?: string
+}
+
+/**
+ * Move Slack credentials out of an inheritable process environment. Runtime
+ * owners keep the returned strings in memory, while every later child starts
+ * without either credential unless it is explicitly given one.
+ */
+export function takeSlackTokensFromEnvironment(
+  environment: Record<string, string | undefined> = process.env,
+): StateSlackTokens {
+  const tokens: StateSlackTokens = {
+    ...(environment.SLACK_BOT_TOKEN === undefined
+      ? {}
+      : { SLACK_BOT_TOKEN: environment.SLACK_BOT_TOKEN }),
+    ...(environment.SLACK_APP_TOKEN === undefined
+      ? {}
+      : { SLACK_APP_TOKEN: environment.SLACK_APP_TOKEN }),
+  }
+  delete environment.SLACK_BOT_TOKEN
+  delete environment.SLACK_APP_TOKEN
+  return tokens
 }
 
 /** Reject ambiguous or malformed token assignments so every consumer uses one App identity. */

@@ -1,8 +1,9 @@
 import { randomUUID } from 'crypto'
 import {
-  closeSync, constants, fchmodSync, fstatSync, ftruncateSync, openSync, readFileSync,
+  closeSync, constants, fchmodSync, fstatSync, fsyncSync, ftruncateSync, openSync, readFileSync,
   renameSync, unlinkSync, writeFileSync,
 } from 'fs'
+import { dirname } from 'path'
 
 function requireSafeDescriptor(descriptor: number, path: string): void {
   const metadata = fstatSync(descriptor)
@@ -64,12 +65,35 @@ export function openSafeLog(path: string, mode: 'truncate' | 'append'): number {
   }
 }
 
-export function atomicWritePrivateFile(path: string, content: string): void {
+export function atomicWritePrivateFile(path: string, content: string | Uint8Array): void {
   const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`
+  let temporaryDescriptor: number | undefined
+  let parentDescriptor: number | undefined
   try {
     writeFileSync(temporary, content, { mode: 0o600, flag: 'wx' })
+    temporaryDescriptor = openSync(temporary, constants.O_RDONLY | constants.O_NOFOLLOW)
+    requireSafeDescriptor(temporaryDescriptor, temporary)
+    fsyncSync(temporaryDescriptor)
+    closeSync(temporaryDescriptor)
+    temporaryDescriptor = undefined
     renameSync(temporary, path)
+    // Persist the rename as well as the file contents. Queue boundary files
+    // use this writer as an external-side-effect journal, so a process or
+    // machine crash must not roll the durable intent back behind `/clear`.
+    parentDescriptor = openSync(dirname(path), constants.O_RDONLY | constants.O_NOFOLLOW)
+    const parent = fstatSync(parentDescriptor)
+    const ownerMatches = typeof process.getuid !== 'function' || parent.uid === process.getuid()
+    if (!parent.isDirectory() || !ownerMatches) {
+      throw new Error(`unsafe managed directory: ${dirname(path)}`)
+    }
+    fsyncSync(parentDescriptor)
   } finally {
+    if (temporaryDescriptor !== undefined) {
+      try { closeSync(temporaryDescriptor) } catch {}
+    }
+    if (parentDescriptor !== undefined) {
+      try { closeSync(parentDescriptor) } catch {}
+    }
     try { unlinkSync(temporary) } catch {}
   }
 }

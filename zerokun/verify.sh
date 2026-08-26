@@ -29,6 +29,19 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     server-resilience.test.ts \
     zerokun/routing.test.ts \
     zerokun/codex-config-preflight.test.ts \
+    zerokun/claude-queue-boundary.test.ts \
+    zerokun/herdr-runtime.test.ts \
+    zerokun/herdr-job-monitor.test.ts \
+    zerokun/advisor-broker.test.ts \
+    zerokun/advisor-prerequisites.test.ts \
+    zerokun/advisor-snapshot.test.ts \
+    zerokun/native-advisor-evidence.test.ts \
+    zerokun/codex-app-server-capability.test.ts \
+    zerokun/codex-app-server-session.test.ts \
+    zerokun/seatbelt-fingerprint.test.ts \
+    zerokun/install-fifth-advisor.test.ts \
+    zerokun/install-grok-reviewer.test.ts \
+    zerokun/inbound-attachment-cache.test.ts \
     zerokun/public-readiness.test.ts \
     zerokun/queue-contract.test.ts \
     zerokun/slack-app-identity.test.ts \
@@ -57,6 +70,14 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     '凍結した旧v2 readerは高精度追加fieldを無視できv3はfail-closedにする'
   candidate_contract_test zerokun/job-runner.test.ts \
     'gateway再起動時にprocessing inboundをpendingへ戻してFIFOを再開する'
+  candidate_contract_test zerokun/job-runner.test.ts \
+    '先行steerを追い越した中止は対象入力をtombstone化して新規job復活を防ぐ'
+  candidate_contract_test zerokun/job-runner.test.ts \
+    '同一threadの別sender追記も後続中止が追い越してtombstone化する'
+  candidate_contract_test zerokun/job-runner.test.ts \
+    'write job中の同一thread返信は別senderのread-only判定でも即時controlを優先する'
+  candidate_contract_test zerokun/job-runner.test.ts \
+    'upgrade前pending exact中止をmigrationでinterruptへ再分類する'
   candidate_contract_test zerokun/job-runner.test.ts \
     '旧Claudeの実行中jobは副作用を二重実行せずfailedとして再送を求める'
   candidate_contract_test zerokun/job-runner.test.ts \
@@ -98,6 +119,9 @@ for entry in \
   server.ts \
   zerokun/job-runner.ts \
   zerokun/runner-launcher.ts \
+  zerokun/herdr-runtime.ts \
+  zerokun/herdr-job-monitor.ts \
+  zerokun/herdr-job-monitor-view.ts \
   zerokun/standalone-codex.ts \
   zerokun/codex-executor.ts \
   zerokun/codex-supervisor.ts \

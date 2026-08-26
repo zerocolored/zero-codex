@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fresh macOS -> Zero-kun bootstrap.
+# Fresh macOS -> Zeroちゃん bootstrap.
 # This file can be copied to a new Mac and run before any project repository exists.
 set -euo pipefail
 unset BUN_OPTIONS BUN_CONFIG_PRELOAD NODE_OPTIONS
@@ -136,13 +136,13 @@ bootstrap_resolve_state_dir() {
 
 STATE_DIR=""
 MODE="install"
-SKIP_LOGINS=0
 SKIP_SLACK=0
 WITH_SLACK=0
 SLACK_APP_NAME="${ZEROKUN_SLACK_APP_NAME:-}"
 SLACK_BOT_USERNAME="${ZEROKUN_SLACK_BOT_USERNAME:-}"
 SLACK_APP_CREATE_URL="https://api.slack.com/apps?new_app=1"
 MIN_CODEX_VERSION="0.149.0"
+MIN_HERDR_VERSION="0.8.2"
 
 codex_version_number() {
   local binary="${1:-codex}"
@@ -162,16 +162,90 @@ version_at_least() {
   return 0
 }
 
+herdr_version_number() {
+  local binary="${1:-herdr}"
+  herdr_probe "$binary" --version 2>/dev/null \
+    | /usr/bin/sed -nE 's/.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' \
+    | /usr/bin/head -n 1
+}
+
+herdr_probe() {
+  /usr/bin/perl -e '
+    $seconds = shift @ARGV;
+    $SIG{ALRM} = sub { exit 124 };
+    alarm $seconds;
+    exec @ARGV;
+    exit 127;
+  ' 5 "$@"
+}
+
+resolve_herdr_binary() {
+  local binary
+  if [ -n "${HERDR_BIN_PATH:-}" ]; then
+    binary="$HERDR_BIN_PATH"
+    case "$binary" in /*) ;; *) return 1 ;; esac
+    [ -f "$binary" ] && [ -x "$binary" ] || return 1
+  else
+    binary="$(command -v herdr 2>/dev/null)" || return 1
+    case "$binary" in /*) ;; *) return 1 ;; esac
+    [ -f "$binary" ] && [ -x "$binary" ] || return 1
+  fi
+  printf '%s\n' "$binary"
+}
+
+herdr_capabilities_ready() {
+  local binary="${1:-herdr}" help
+  help="$(herdr_probe "$binary" pane current --help 2>&1)" || return 1
+  case "$help" in *'--current'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" tab create --help 2>&1)" || return 1
+  case "$help" in
+    *'--workspace'*'--cwd'*'--label'*'--no-focus'*) ;;
+    *) return 1 ;;
+  esac
+  help="$(herdr_probe "$binary" workspace list --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr workspace list'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" tab list --help 2>&1)" || return 1
+  case "$help" in *'--workspace'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" pane list --help 2>&1)" || return 1
+  case "$help" in *'--workspace'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" pane run --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr pane run'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" pane wait-output --help 2>&1)" || return 1
+  case "$help" in
+    *'--match'*'--source'*'--lines'*'--timeout'*) ;;
+    *) return 1 ;;
+  esac
+  help="$(herdr_probe "$binary" pane process-info --help 2>&1)" || return 1
+  case "$help" in *'--pane'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" tab close --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr tab close'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" agent list --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr agent list'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" agent get --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr agent get'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" agent read --help 2>&1)" || return 1
+  case "$help" in *'--source'*'--lines'*) ;; *) return 1 ;; esac
+  help="$(herdr_probe "$binary" agent prompt --help 2>&1)" || return 1
+  case "$help" in *'--wait'*'--until'*'--timeout'*) ;; *) return 1 ;; esac
+}
+
+herdr_compatible() {
+  local binary actual
+  binary="$(resolve_herdr_binary)" || return 1
+  actual="$(herdr_version_number "$binary")"
+  [ -n "$actual" ] && version_at_least "$actual" "$MIN_HERDR_VERSION" \
+    && herdr_capabilities_ready "$binary"
+}
+
 usage() {
   cat <<'EOF'
 Usage: bootstrap-macos.sh [options]
 
-新しいMacへゼロくん一式を導入します。Command Line Toolsはバージョンを固定せず、
+新しいMacへZeroちゃん一式を導入します。Command Line Toolsはバージョンを固定せず、
 そのmacOSにAppleが提供する適合版を `xcode-select --install` で導入します。
 
 Options:
   --doctor              何も変更せず、必要ツールとバージョンだけ確認
-  --skip-logins         Codexの対話ログインを呼び出さない
   --skip-slack          Slack App作成とトークン入力の案内を省略
   --with-slack          基本セットアップ完了後、そのままSlack設定も行う
   --slack-only          導入済み環境でSlack設定だけを行う
@@ -196,7 +270,6 @@ while [ "$#" -gt 0 ]; do
         *) echo "❌ --doctor と --slack-only は同時に指定できません" >&2; exit 2 ;;
       esac
       ;;
-    --skip-logins) SKIP_LOGINS=1 ;;
     --skip-slack) SKIP_SLACK=1; WITH_SLACK=0 ;;
     --with-slack) WITH_SLACK=1 ;;
     --slack-only)
@@ -382,7 +455,7 @@ ensure_doctor_tmp() {
     # 「作れないが続行する」というcodex側の未仕様の寛容さに寄りかかることになり、
     # そこが厳格化された版では診断が落ちて自己更新が止まる。
     # -p は付けない。先にsymlinkを置かれていた場合、追わずに失敗させる。
-    if /bin/mkdir "$DOCTOR_TMP/codex" 2>/dev/null; then
+    if /bin/mkdir "$DOCTOR_TMP/codex" "$DOCTOR_TMP/grok" 2>/dev/null; then
       return 0
     fi
     cleanup_doctor_tmp
@@ -441,6 +514,133 @@ doctor_item() {
   printf '   %-20s %s\n' "$label:" "$version"
 }
 
+grok_build_executable() {
+  [ -x /usr/bin/python3 ] || return 1
+  /usr/bin/env -i HOME=/var/empty PATH=/usr/bin:/bin TMPDIR=/tmp \
+    /usr/bin/python3 -I -B -c '
+import os
+import re
+import stat
+import subprocess
+import sys
+
+home = os.path.realpath(sys.argv[1])
+uid = os.getuid()
+logical = os.path.join(home, ".grok", "bin", "grok")
+
+def same(left, right):
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+def safe_dir(path):
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != uid or metadata.st_mode & 0o022:
+        raise SystemExit(1)
+
+def safe_file(path):
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_uid != uid or before.st_nlink != 1 or before.st_mode & 0o022 or not before.st_mode & 0o111 or not 0 < before.st_size <= 1024 * 1024 * 1024:
+        raise SystemExit(1)
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not same(before, opened):
+        raise SystemExit(1)
+
+safe_dir(home)
+safe_dir(os.path.join(home, ".grok"))
+bin_dir = os.path.join(home, ".grok", "bin")
+safe_dir(bin_dir)
+before = os.lstat(logical)
+if stat.S_ISREG(before.st_mode):
+    target = logical
+elif stat.S_ISLNK(before.st_mode) and before.st_uid == uid and before.st_nlink == 1 and 0 < before.st_size <= 255:
+    raw = os.readlink(logical)
+    after = os.lstat(logical)
+    if not same(before, after):
+        raise SystemExit(1)
+    if re.fullmatch(r"grok-[0-9]+\.[0-9]+\.[0-9]+", raw):
+        target = os.path.join(bin_dir, raw)
+    else:
+        machine = os.uname().machine
+        if machine == "x86_64":
+            try:
+                translated = subprocess.run(["/usr/sbin/sysctl", "-in", "sysctl.proc_translated"], check=False, capture_output=True, timeout=2)
+                if translated.returncode == 0 and translated.stdout.strip() == b"1":
+                    machine = "arm64"
+            except (OSError, subprocess.SubprocessError):
+                pass
+        expected = "../downloads/grok-macos-aarch64" if machine == "arm64" else "../downloads/grok-macos-x86_64" if machine == "x86_64" else None
+        if expected is None or raw != expected:
+            raise SystemExit(1)
+        downloads = os.path.join(home, ".grok", "downloads")
+        safe_dir(downloads)
+        target = os.path.join(downloads, os.path.basename(raw))
+else:
+    raise SystemExit(1)
+safe_file(target)
+print(target)
+' "$HOME" 2>/dev/null
+}
+
+grok_auth_ready() {
+  local auth="$HOME/.grok/auth.json" metadata uid links mode size type
+  [ -f "$auth" ] && [ ! -L "$auth" ] || return 1
+  metadata="$(/usr/bin/stat -f '%u:%l:%Lp:%z:%HT' "$auth" 2>/dev/null)" || return 1
+  IFS=: read -r uid links mode size type <<EOF
+$metadata
+EOF
+  [ "$type" = "Regular File" ] && [ "$uid" = "$(/usr/bin/id -u)" ] \
+    && [ "$links" = "1" ] || return 1
+  case "$mode:$size" in *[!0-9:]*|:*) return 1 ;; esac
+  [ "$size" -gt 0 ] && [ "$size" -le 1048576 ] \
+    && [ $((8#$mode & 8#077)) -eq 0 ] && [ $((8#$mode & 8#400)) -ne 0 ]
+}
+
+grok_reviewer_file_ready() {
+  local file="$1" access="$2" metadata uid links mode size type
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  metadata="$(/usr/bin/stat -f '%u:%l:%Lp:%z:%HT' "$file" 2>/dev/null)" || return 1
+  IFS=: read -r uid links mode size type <<EOF
+$metadata
+EOF
+  [ "$type" = "Regular File" ] && [ "$uid" = "$(/usr/bin/id -u)" ] \
+    && [ "$links" = "1" ] || return 1
+  case "$mode:$size" in *[!0-9:]*|:*) return 1 ;; esac
+  [ "$size" -gt 0 ] && [ "$size" -le 1048576 ] || return 1
+  case "$access" in
+    executable) [ $((8#$mode & 8#111)) -ne 0 ] && [ $((8#$mode & 8#022)) -eq 0 ] ;;
+    private) [ $((8#$mode & 8#077)) -eq 0 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+grok_reviewer_directory_ready() {
+  local directory="$1" metadata uid mode type
+  [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+  metadata="$(/usr/bin/stat -f '%u:%Lp:%HT' "$directory" 2>/dev/null)" || return 1
+  IFS=: read -r uid mode type <<EOF
+$metadata
+EOF
+  [ "$type" = "Directory" ] && [ "$uid" = "$(/usr/bin/id -u)" ] || return 1
+  case "$mode" in ''|*[!0-7]*) return 1 ;; esac
+  [ $((8#$mode & 8#077)) -eq 0 ]
+}
+
+grok_reviewer_ready() {
+  local root="$HOME/.grok-reviewer"
+  grok_build_executable >/dev/null && grok_auth_ready \
+    && grok_reviewer_directory_ready "$root" \
+    && grok_reviewer_directory_ready "$root/bin" \
+    && grok_reviewer_file_ready "$root/bin/grok" executable \
+    && grok_reviewer_file_ready "$root/bin/reviewer-runtime.py" executable \
+    && grok_reviewer_file_ready "$root/config.toml" private \
+    && grok_reviewer_file_ready "$root/sandbox.toml" private \
+    && grok_reviewer_file_ready "$root/requirements.toml" private
+}
+
 # 戻り値: 0=問題なし / 1=CLIに問題あり / 2=退避先を作れずCodexだけ未診断
 run_doctor() {
   local missing=0
@@ -456,7 +656,54 @@ run_doctor() {
   doctor_item 'Homebrew' brew --version || missing=1
   doctor_item 'Git' git --version || missing=1
   doctor_item 'tmux' tmux -V || missing=1
+  local herdr_binary herdr_version
+  herdr_binary="$(resolve_herdr_binary 2>/dev/null || true)"
+  herdr_version="$(herdr_version_number "${herdr_binary:-herdr}" || true)"
+  if [ -n "$herdr_binary" ] && [ -n "$herdr_version" ] \
+    && version_at_least "$herdr_version" "$MIN_HERDR_VERSION" \
+    && herdr_capabilities_ready "$herdr_binary"; then
+    printf '   %-20s %s\n' 'Herdr:' "herdr $herdr_version"
+  elif [ -n "$herdr_binary" ] && [ -n "$herdr_version" ]; then
+    printf '   %-20s %s\n' 'Herdr:' \
+      "herdr $herdr_version (${MIN_HERDR_VERSION}以上とtab/pane APIが必要)"
+    missing=1
+  else
+    printf '   %-20s %s\n' 'Herdr:' '未導入または実行失敗'
+    missing=1
+  fi
   doctor_item 'Bun' bun --version || missing=1
+  local grok_executable grok_version grok_status=0
+  grok_executable="$(grok_build_executable)" || grok_executable=""
+  if [ -n "$grok_executable" ] && ensure_doctor_tmp; then
+    grok_version="$(/usr/bin/env -i HOME="$DOCTOR_TMP/grok" GROK_HOME="$DOCTOR_TMP/grok" \
+      PATH=/usr/bin:/bin TERM=dumb TMPDIR="${TMPDIR:-/tmp}" \
+      "$grok_executable" --version 2>/dev/null)" || grok_status=$?
+    grok_version="${grok_version%%$'\n'*}"
+    if [ "$grok_status" = "0" ] && [ -n "$grok_version" ]; then
+      printf '   %-20s %s\n' 'Grok Build:' "$grok_version"
+    else
+      printf '   %-20s %s\n' 'Grok Build:' '実行失敗'
+      missing=1
+    fi
+  elif [ -z "$grok_executable" ]; then
+    printf '   %-20s %s\n' 'Grok Build:' '未導入またはunsafe'
+    missing=1
+  else
+    printf '   %-20s %s\n' 'Grok Build:' '一時領域を確保できず未診断'
+    tmp_skipped=1
+  fi
+  if grok_auth_ready; then
+    printf '   %-20s %s\n' 'Grok login:' 'ready (owner-only auth)'
+  else
+    printf '   %-20s %s\n' 'Grok login:' '未ログインまたはunsafe'
+    missing=1
+  fi
+  if grok_reviewer_ready; then
+    printf '   %-20s %s\n' 'Grok reviewer:' 'ready (read-only検査)'
+  else
+    printf '   %-20s %s\n' 'Grok reviewer:' "$HOME/.grok-reviewer/bin/grok が未導入またはunsafe"
+    missing=1
+  fi
   if ! doctor_item 'Codex CLI' codex --version; then
     # 退避先を作れずに見送っただけなら、CLI自体の異常とは区別する。
     if [ "$DOCTOR_TMP_UNAVAILABLE" = "1" ]; then
@@ -743,14 +990,51 @@ install_codex_standalone() {
   append_profile_block '# zerokun bootstrap: Codex CLI' 'export PATH="$HOME/.local/bin:$PATH"'
 }
 
+install_grok_build() {
+  local installer logical="$HOME/.grok/bin/grok"
+  if grok_build_executable >/dev/null; then
+    return
+  fi
+  if [ -e "$logical" ] || [ -L "$logical" ]; then
+    fail "既存Grok Buildが安全な公式layoutではありません。手動で確認してください: $logical"
+  fi
+  installer="$(/usr/bin/mktemp /tmp/zerokun-grok-installer.XXXXXX)" \
+    || fail "Grok Build公式installer用一時fileを作成できません"
+  if ! secure_download "$installer" https://x.ai/cli/install.sh; then
+    /bin/rm -f "$installer"
+    fail "Grok Build公式installerを取得できませんでした"
+  fi
+  /bin/chmod 0700 "$installer"
+  if ! isolated_network_command /bin/bash "$installer"; then
+    /bin/rm -f "$installer"
+    fail "Grok Build公式installerの実行に失敗しました"
+  fi
+  /bin/rm -f "$installer"
+  grok_build_executable >/dev/null \
+    || fail "Grok Build公式CLIのowner・path・executable検証に失敗しました"
+  append_profile_block '# zerokun bootstrap: Grok Build' 'export PATH="$HOME/.grok/bin:$PATH"'
+}
+
 install_cli_tools() {
   local standalone_codex="$HOME/.local/bin/codex"
-  section "tmux / Codex CLI / Bun"
+  section "tmux / Herdr / Codex CLI / Grok Build / Bun"
   if ! command -v tmux >/dev/null 2>&1; then
     isolated_network_command "$(command -v brew)" install tmux
   fi
+  if ! command -v herdr >/dev/null 2>&1; then
+    isolated_network_command "$(command -v brew)" install herdr
+  elif ! herdr_compatible; then
+    if "$(command -v brew)" list --versions herdr >/dev/null 2>&1; then
+      isolated_network_command "$(command -v brew)" upgrade herdr
+    else
+      isolated_network_command "$(command -v brew)" install herdr
+    fi
+  fi
+  hash -r
+  herdr_compatible \
+    || fail "Herdr ${MIN_HERDR_VERSION}以上と必要なtab/pane APIを確認できません"
   # Homebrew prefix is group-writable on a standard multi-user macOS install.
-  # Keep the executable used by Zero-kun under the account-owned standalone path.
+  # Keep the executable used by Zeroちゃん under the account-owned standalone path.
   if ! secure_standalone_codex >/dev/null; then
     install_codex_standalone
   fi
@@ -772,31 +1056,37 @@ install_cli_tools() {
     /bin/rm -f "$bun_installer"
     export PATH="$HOME/.bun/bin:$PATH"
   fi
+  install_grok_build
+  export PATH="$HOME/.grok/bin:$PATH"
+  hash -r
   append_profile_block '# zerokun bootstrap: Bun' 'export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"'
-  for required in git tmux bun; do
+  for required in git tmux herdr bun; do
     command -v "$required" >/dev/null 2>&1 || fail "$required の導入を確認できません"
   done
   secure_standalone_codex >/dev/null \
     || fail "Codex公式standaloneの安全性を確認できませんでした"
+  grok_build_executable >/dev/null \
+    || fail "Grok Build公式CLIの安全性を確認できませんでした"
   ok "必要なCLIを導入しました"
 }
 
-ensure_logins() {
-  local standalone_codex
-  section "Codexログイン"
-  if [ "$SKIP_LOGINS" = "1" ]; then
-    warn "--skip-loginsにより省略しました"
-    return
-  fi
-  require_interactive "Codexログイン"
+verify_logins() {
+  local standalone_codex login_status
+  section "事前ログイン状態"
   standalone_codex="$(secure_standalone_codex)" \
     || fail "Codex公式standaloneの安全性を確認できませんでした"
-  if ! "$standalone_codex" login status >/dev/null 2>&1; then
-    echo "   Codex CLIへログインします"
-    "$standalone_codex" login
-  fi
-  ok "Codexのログインを確認しました"
+  login_status="$("$standalone_codex" login status 2>&1)" \
+    || fail "Codexが未ログインです。HerdrでCodexへ先にログインしてください。Zeroちゃんは認証操作を行いません"
+  case "$login_status" in
+    *"Logged in using ChatGPT"*) ;;
+    *) fail "CodexはChatGPT subscriptionログインが必要です。API key認証は使用しません" ;;
+  esac
+  grok_build_executable >/dev/null \
+    || fail "Grok CLIの安全性を確認できませんでした"
+  grok_auth_ready \
+    || fail "Grok CLIが未ログインまたはauthがunsafeです。先にgrok loginを完了してください。Zeroちゃんは認証操作を行いません"
+  ok "Codex / Grok CLIは事前ログイン済みです"
 }
 
 repo_is_clean() {
@@ -906,15 +1196,40 @@ ensure_repo() {
 }
 
 install_repositories() {
-  section "ゼロくんリポジトリ"
+  section "Zeroちゃんリポジトリ"
   ensure_repo zerocolored/zero-codex "$REPO_DIR" main
   ok "リポジトリを配置しました"
 }
 
+install_grok_reviewer() {
+  section "専用advisor runtime"
+  [ -f "$REPO_DIR/zerokun/install-fifth-advisor.ts" ] \
+    || fail "fifth-advisor helper installerがありません: $REPO_DIR/zerokun/install-fifth-advisor.ts"
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-fifth-advisor.ts" install \
+    || fail "fifth-advisor helperを導入できませんでした"
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-fifth-advisor.ts" verify \
+    || fail "fifth-advisor helperのowner-only配置を確認できませんでした"
+  [ -f "$REPO_DIR/zerokun/install-grok-reviewer.ts" ] \
+    || fail "Grok reviewer installerがありません: $REPO_DIR/zerokun/install-grok-reviewer.ts"
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-grok-reviewer.ts" install \
+    || fail "専用Grok reviewerを導入できませんでした"
+  grok_reviewer_ready || fail "専用Grok reviewerのowner-only配置を確認できませんでした"
+  ok "専用read-only reviewerとHerdr transport helperを導入しました"
+}
+
 ensure_project_workspace() {
   section "Slack作業repository"
+  if [ -e "$PROJECT_DIR" ] && [ ! -d "$PROJECT_DIR" ]; then
+    fail "--project-dirはdirectoryを指定してください: $PROJECT_DIR"
+  fi
+  if [ -d "$PROJECT_DIR" ] && [ ! -e "$PROJECT_DIR/.git" ]; then
+    local existing_entries
+    existing_entries="$(/bin/ls -A "$PROJECT_DIR" 2>/dev/null || true)"
+    [ -z "$existing_entries" ] \
+      || fail "未初期化projectに既存fileがあります。内容を確認してAGENTS.mdを用意してください: $PROJECT_DIR"
+  fi
   /bin/mkdir -p "$PROJECT_DIR"
-  local repo_real project_real
+  local repo_real project_real agents_template agents_path entries
   repo_real="$(resolve_dir "$REPO_DIR")" || fail "zero repositoryを解決できません: $REPO_DIR"
   project_real="$(resolve_dir "$PROJECT_DIR")" || fail "project directoryを解決できません: $PROJECT_DIR"
   [ "$repo_real" != "$project_real" ] \
@@ -922,11 +1237,32 @@ ensure_project_workspace() {
   if [ ! -e "$PROJECT_DIR/.git" ]; then
     safe_git init --initial-branch=main "$PROJECT_DIR" >/dev/null
   fi
+  agents_template="$REPO_DIR/zerokun/templates/AGENTS.md"
+  agents_path="$PROJECT_DIR/AGENTS.md"
+  [ -f "$agents_template" ] && [ ! -L "$agents_template" ] \
+    || fail "既定AGENTS.md templateがありません: $agents_template"
+  if [ ! -e "$agents_path" ] && [ ! -L "$agents_path" ]; then
+    if safe_git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+      fail "既存projectにAGENTS.mdがありません。project固有の指示を追加してから再実行してください: $agents_path"
+    fi
+    entries="$(/bin/ls -A "$PROJECT_DIR" | /usr/bin/grep -v '^\.git$' || true)"
+    [ -z "$entries" ] \
+      || fail "未初期化projectに既存fileがあります。内容を確認してAGENTS.mdを用意してください: $PROJECT_DIR"
+    /bin/cp "$agents_template" "$agents_path"
+    /bin/chmod 0644 "$agents_path"
+    safe_git -C "$PROJECT_DIR" add -- AGENTS.md
+    safe_git -C "$PROJECT_DIR" \
+      -c user.name='Zeroちゃん Bootstrap' \
+      -c user.email='zerochan-bootstrap@users.noreply.github.com' \
+      commit -m 'chore: initialize Zeroちゃん workspace instructions' >/dev/null
+  fi
+  bootstrap_owned_regular_file "$agents_path" \
+    || fail "AGENTS.mdはowner一致・hardlinkなしのregular fileにしてください: $agents_path"
   ok "Slack作業repository: $PROJECT_DIR"
 }
 
 run_setup() {
-  section "ゼロくん配線"
+  section "Zeroちゃん配線"
   [ -f "$REPO_DIR/zerokun/setup.sh" ] || fail "setup.shがありません: $REPO_DIR/zerokun/setup.sh"
   ZEROKUN_BOOTSTRAP=1 ZEROKUN_PROJECT_DIR="$PROJECT_DIR" ZEROKUN_STATE_DIR="$STATE_DIR" \
     /bin/bash "$REPO_DIR/zerokun/setup.sh"
@@ -1052,13 +1388,14 @@ validate_slack_names() {
 choose_slack_names() {
   local entered_name
   if [ -z "$SLACK_APP_NAME" ]; then
-    printf '   Slack Appの表示名（例: ゼロくん-新Mac、35文字以内）: '
-    IFS= read -r SLACK_APP_NAME
+    printf '   Slack Appの表示名（35文字以内） [Zeroちゃん]: '
+    IFS= read -r entered_name
+    SLACK_APP_NAME="${entered_name:-Zeroちゃん}"
   fi
   if [ -z "$SLACK_BOT_USERNAME" ]; then
-    printf '   Slack bot username（英小文字・数字・-・_・.） [zerokun-new-mac]: '
+    printf '   Slack bot username（英小文字・数字・-・_・.） [zerochan]: '
     IFS= read -r entered_name
-    SLACK_BOT_USERNAME="${entered_name:-zerokun-new-mac}"
+    SLACK_BOT_USERNAME="${entered_name:-zerochan}"
   fi
   validate_slack_names
 }
@@ -1068,12 +1405,12 @@ render_slack_manifest() {
   local target_manifest="$2"
   validate_slack_names
   /usr/bin/awk -v app_name="$SLACK_APP_NAME" -v bot_username="$SLACK_BOT_USERNAME" '
-    $0 == "  name: Zero-kun Custom" {
+    $0 == "  name: Zeroちゃん" {
       print "  name: \"" app_name "\""
       app_name_replaced = 1
       next
     }
-    $0 == "    display_name: zerokun-custom" {
+    $0 == "    display_name: zerochan" {
       print "    display_name: " bot_username
       bot_name_replaced = 1
       next
@@ -1201,22 +1538,24 @@ main() {
     return 0
   fi
   if [ "$MODE" = "slack-only" ]; then
-    echo "== ゼロくん Slack設定だけ再開 =="
+    echo "== Zeroちゃん Slack設定だけ再開 =="
+    install_grok_reviewer
     configure_slack
     # Re-run setup after the new pair has been verified. This safely retires
     # any runner/gateway tied to the previous Codex Slack App on this PC.
     run_setup
     section "Slack設定完了"
-    echo "   新しいターミナルで実行: zerokun"
+    echo "   Herdrの専用paneで実行: zerokun"
     return
   fi
 
-  echo "== ゼロくん macOS bootstrap =="
+  echo "== Zeroちゃん macOS bootstrap =="
   install_clt
   install_homebrew
   install_cli_tools
-  ensure_logins
+  verify_logins
   install_repositories
+  install_grok_reviewer
   ensure_project_workspace
   run_setup
 
@@ -1237,7 +1576,7 @@ main() {
   if [ "$WITH_SLACK" = "1" ]; then
     configure_slack
     section "Slack設定完了"
-    echo "   Slack Appを対象チャンネルへ招待後、新しいターミナルで実行: zerokun"
+    echo "   Slack Appを対象チャンネルへ招待後、Herdrの専用paneで実行: zerokun"
   else
     warn "Slack設定は後回しにしました。Codexの利用には不要です"
     echo "   後からSlack設定だけ行う:"

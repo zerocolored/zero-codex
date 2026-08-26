@@ -1,4 +1,4 @@
-# 新しい Mac へ Zero-kun for Codex を入れる
+# 新しいMacへZeroちゃんを入れる
 
 ## 最短手順
 
@@ -25,21 +25,24 @@ bash "$bootstrap_path" --with-slack
 
 - Apple Command Line Tools
 - Homebrew
-- Git / Bun / tmux / Codex CLI 0.149.0以上
-- Codex login
+- Git / Bun / tmux / Herdr 0.8.2以上（必要なtab/pane APIを含む） / Codex CLI 0.149.0以上
+- Codex / Grok CLI（login操作はしない）
 - zero-codex repository の `main` branch（既定 `~/Desktop/Project/zero-codex`）
-- Zero-kun本体とは分離した既定`zerokun-workspace` repository（既存projectも指定可能）
-- Zero-kun runtime、管理 CLI、watchdog
+- Zeroちゃん本体とは分離し、最小安全指示の`AGENTS.md`を初期commitした既定
+  `zerokun-workspace` repository（`AGENTS.md`のある既存projectも指定可能）
+- Zeroちゃん runtime、管理 CLI、watchdog
 - Slack manifest の生成、token 入力、access 初期設定
 
-Claude Code と Claude login は導入しません。
+専用Grok reviewerは必須です。ZeroちゃんはClaude CodeやClaude loginを自動導入せず、第五枠だけ
+対象projectで既に起動済みのClaude CodeをHerdr経由でbest-effort利用します。read jobではinvestigation、
+write jobでは編集前designと編集後reviewのGrok 2件が完了しない限り、Slackへ成功回答を公開しません。
 
 ## 人が操作する箇所
 
 macOS や外部サービスの確認画面だけは自動化しません。
 
 1. Command Line Tools の install dialog
-2. Codex CLI の browser login
+2. Codex / Grok CLI のlogin
 3. Slack App 作成・Workspace install
 4. App-Level Token（`xapp-...`）と Bot Token（`xoxb-...`）の貼付け
 5. Slack user/channel ID の選択
@@ -67,11 +70,23 @@ bash zerokun/bootstrap-macos.sh --skip-slack
 bash zerokun/bootstrap-macos.sh --slack-only
 ```
 
-ログイン画面を起動しない:
+bootstrapはログイン画面を自動操作しません。新しいMacでは最初の実行でCLIを導入し、未ログインなら
+安全に停止します。そのあとHerdr上で次を実行し、同じbootstrap commandをもう一度実行してください。
 
 ```bash
-bash zerokun/bootstrap-macos.sh --skip-logins
+codex login
+grok login
+codex login status
+# `Logged in using ChatGPT` と表示されることを確認
 ```
+
+これは初回だけの人による認証です。稼働中のZeroちゃんは既存のsubscription loginを利用し、API keyの
+取得・Grok API/Codex APIの呼出し・追加認証を行いません。
+Slack thread本文はCodexとread-only advisor（Grok 2件、条件を満たす既存Claude）へ送られます。
+Grokは専用`grok -p` launcherのstdin、Claudeは起動時にdevice/inodeを固定してconnect前後に再照合する
+current Herdr socketを使い、本文をprocess argvへ載せません。
+各provider側の履歴保持はlocal stateの30日GCやClaude `/clear`では削除されないため、秘密・credential・
+個人情報を依頼へ貼り付けないでください。
 
 配置先を変える:
 
@@ -93,10 +108,11 @@ bot username は Slack の制約により英小文字・数字・`-`・`_`・`.`
 
 ## 初回起動
 
-bootstrap 完了後、新しい terminal を開きます。
+bootstrap完了後、HerdrにZeroちゃん専用paneを用意して、そのpaneで起動します。
 
 ```bash
 codex login status
+# `Logged in using ChatGPT` 以外（API key認証を含む）ではZeroちゃんは起動しません
 zerokun-access status
 zerokun
 ```
@@ -114,6 +130,16 @@ Slack で DM し、返された code を端末で承認します。
 zerokun-access pair <6桁code>
 ```
 
+認可後の依頼が実行段階へ入ると、同じHerdr workspaceに`Zeroちゃん #<待ち順>`という監視tabが
+フォーカスを奪わず自動作成されます。このtabは実際の1本のCodex processの出力を表示するだけで、
+別のCodexを起動しません。rate-limit待機中は残り、Codex・advisor・Claude `/clear`・結果確定が
+すべて終わり、terminalへの最終出力が表示済みだと確認できると自動で閉じます。viewerのPID世代・
+argv・cwd・heartbeatやtab identityが実行中に失われた場合は、実行を止めて後続queueを開始しません。
+監視tabを誤って閉じると、最終出力の実表示を後から証明できないため、`zerokun`の再起動や
+`zerokun-jobs recover-interrupted`でも自動failed化、Claude `/clear`、監視tab再作成は行いません。
+durable monitor obligationを保持して後続queueを停止します。監視tabは手動で閉じないでください。
+Slack deliveryだけはFIFOと独立に再試行します。
+
 変更依頼も許可する利用者だけ write access を追加します。
 
 ```bash
@@ -123,7 +149,7 @@ zerokun-access write allow <Slack user ID>
 write access を付けない利用者は、HOME/stateをdenyして対象repositoryと当該添付だけを読む
 job専用permission profileで調査・説明だけを利用できます。
 
-Zero-kun本体repositoryへのwrite jobはhost runtime保護のため拒否されます。変更対象は必ず別の
+Zeroちゃん本体repositoryへのwrite jobはhost runtime保護のため拒否されます。変更対象は必ず別の
 `--project-dir`/`routes.json`へ割り当ててください。Codex shellはHOME credentialを継承しないため、
 commit identityは対象repositoryのlocal configへ設定し、認証pushは別の安全なHOME外方式を用意します。
 

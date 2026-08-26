@@ -24,7 +24,7 @@ jobs:
           bun-version: 1.4.0
       - name: Install test runtime
         run: |
-          brew install tmux
+          brew install tmux herdr
           export PATH="$HOME/.local/bin:$PATH"
           installer="$(/usr/bin/mktemp "${RUNNER_TEMP}/codex-install.XXXXXX")"
           trap '/bin/rm -f "$installer"' EXIT
@@ -37,10 +37,12 @@ jobs:
             /bin/sh "$installer" --release '${{ matrix.codex-version }}'
           "$HOME/.local/bin/codex" --version
           bun --config=/dev/null --no-env-file zerokun/standalone-codex.ts version
+          . ./zerokun/codex-version.sh
+          zerokun_require_herdr_version
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Verify Codex-native Zero-kun
         run: bash zerokun/verify.sh
       - name: Verify Codex managed-config protocol
         run: |
           export CODEX_HOME="$(mktemp -d "${RUNNER_TEMP}/zerokun-codex-home.XXXXXX")"
-          bun zerokun/codex-executor.ts verify-system-config
+          bun zerokun/codex-executor.ts verify-codex-config

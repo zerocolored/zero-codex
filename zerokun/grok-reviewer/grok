@@ -1,0 +1,154 @@
+#!/bin/sh
+
+# Dedicated Grok reviewer launcher. It isolates auth/config/state, removes
+# recursive agent routes, and permits only read-only repository inspection.
+umask 077
+
+if [ "${GROK_REVIEWER_ACTIVE:-}" = "1" ]; then
+  echo "Nested Grok reviewer invocation is disabled." >&2
+  exit 126
+fi
+if [ -z "${HOME:-}" ]; then
+  echo "HOME is required." >&2
+  exit 127
+fi
+case "$0" in
+  */*) launcher_directory=${0%/*} ;;
+  *) echo "Invoke the dedicated reviewer launcher by path." >&2; exit 127 ;;
+esac
+
+reviewer_root=$(CDPATH= cd -P -- "$launcher_directory/.." && pwd -P) || exit 127
+runtime_home_physical=$(CDPATH= cd -P -- "$HOME" 2>/dev/null && pwd -P) || exit 127
+case "$runtime_home_physical" in /*) ;; *) exit 127 ;; esac
+real_grok_logical="$runtime_home_physical/.grok/bin/grok"
+real_auth="$runtime_home_physical/.grok/auth.json"
+reviewer_python=/usr/bin/python3
+reviewer_runtime="$reviewer_root/bin/reviewer-runtime.py"
+reviewer_path="$reviewer_root/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+reviewer_lang=${LC_ALL:-${LANG:-en_US.UTF-8}}
+
+if [ ! -x "$reviewer_python" ] || [ ! -f "$reviewer_runtime" ] || [ -L "$reviewer_runtime" ]; then
+  echo "Dedicated Grok reviewer runtime is unavailable." >&2
+  exit 127
+fi
+"$reviewer_python" -I "$reviewer_runtime" verify-install \
+  "$reviewer_root" "$runtime_home_physical" "$real_grok_logical" "$real_auth" || {
+    echo "Grok Build or its owner-only authentication is unavailable." >&2
+    exit 127
+  }
+reviewer_run_root=$("$reviewer_python" -I "$reviewer_runtime" create-run \
+  "$reviewer_root" "$$") || {
+  echo "A prior Grok reviewer run was not safely cleaned up." >&2
+  exit 126
+}
+case "$reviewer_run_root" in "$reviewer_root"/run.*) ;; *) exit 126 ;; esac
+reviewer_workspace="$reviewer_run_root/workspace"
+reviewer_user_home="$reviewer_run_root/user-home"
+reviewer_tmp="$reviewer_run_root/tmp"
+reviewer_grok_home="$reviewer_user_home/.grok"
+reviewer_auth="$reviewer_grok_home/auth.json"
+
+cleanup_reviewer_run() {
+  case "$reviewer_run_root" in "$reviewer_root"/run.*) /bin/rm -rf -- "$reviewer_run_root" ;; esac
+}
+trap cleanup_reviewer_run EXIT
+real_grok=$("$reviewer_python" -I "$reviewer_runtime" pin-grok \
+  "$reviewer_root" "$reviewer_run_root" \
+  "$runtime_home_physical" "$real_grok_logical") || exit 127
+[ "$real_grok" = "$reviewer_run_root/official-grok" ] || exit 126
+for isolated_directory in "$reviewer_workspace" "$reviewer_user_home" "$reviewer_tmp"; do
+  [ ! -L "$isolated_directory" ] || exit 126
+  /bin/mkdir -p "$isolated_directory" || exit 126
+  /bin/chmod 700 "$isolated_directory" || exit 126
+done
+cd -P -- "$reviewer_workspace" || exit 126
+
+if [ "$#" -eq 1 ]; then
+  case "$1" in
+    -v|--version|version)
+      /bin/mkdir -p "$reviewer_grok_home" || exit 126
+      /bin/chmod 700 "$reviewer_grok_home" || exit 126
+      exec /usr/bin/env -i -- \
+        HOME="$reviewer_user_home" PATH="$reviewer_path" GROK_HOME="$reviewer_grok_home" \
+        XDG_CACHE_HOME="$reviewer_user_home/.cache" XDG_CONFIG_HOME="$reviewer_user_home/.config" \
+        XDG_DATA_HOME="$reviewer_user_home/.local/share" LANG="$reviewer_lang" LC_ALL="$reviewer_lang" \
+        TERM=dumb TMPDIR="$reviewer_tmp" \
+        "$reviewer_python" -I "$reviewer_runtime" run "$reviewer_root" "$reviewer_run_root" -- \
+        "$real_grok" --no-auto-update "$1"
+      ;;
+  esac
+fi
+if [ "$#" -ne 1 ] || [ "$1" != "-p" ]; then
+  echo "The dedicated reviewer only accepts: grok -p (prompt on stdin)" >&2
+  exit 64
+fi
+
+for project_config in .grok .claude .cursor AGENTS.md AGENTS.override.md CLAUDE.md .envrc; do
+  [ ! -e "$reviewer_workspace/$project_config" ] && [ ! -L "$reviewer_workspace/$project_config" ] || exit 126
+done
+for compatibility_home in .claude .cursor .codex .grok; do
+  [ ! -e "$reviewer_user_home/$compatibility_home" ] && [ ! -L "$reviewer_user_home/$compatibility_home" ] || exit 126
+done
+
+/bin/mkdir -p "$reviewer_grok_home" || exit 126
+/bin/chmod 700 "$reviewer_grok_home" || exit 126
+"$reviewer_python" -I "$reviewer_runtime" stage-prompt \
+  "$reviewer_root" "$reviewer_run_root" || {
+  echo "The Grok reviewer prompt is invalid." >&2
+  exit 64
+}
+if [ -z "${ZEROKUN_GROK_REVIEW_ROOT:-}" ]; then
+  echo "ZEROKUN_GROK_REVIEW_ROOT is required." >&2
+  exit 64
+fi
+if [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_ALLOW:-}" ] || \
+   [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_DENY:-}" ]; then
+  [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_ALLOW:-}" ] && \
+    [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_DENY:-}" ] || exit 126
+  "$reviewer_python" -I "$reviewer_runtime" prepare-run-home \
+    "$reviewer_root" "$reviewer_run_root" "$ZEROKUN_GROK_REVIEW_ROOT" \
+    "$ZEROKUN_SEATBELT_FINGERPRINT_ALLOW" \
+    "$ZEROKUN_SEATBELT_FINGERPRINT_DENY"
+else
+  "$reviewer_python" -I "$reviewer_runtime" prepare-run-home \
+    "$reviewer_root" "$reviewer_run_root" "$ZEROKUN_GROK_REVIEW_ROOT"
+fi || {
+  echo "The Grok reviewer project read allowlist is invalid." >&2
+  exit 126
+}
+"$reviewer_python" -I "$reviewer_runtime" copy-auth "$real_auth" "$reviewer_auth" || exit 126
+
+set -- --prompt-file "$reviewer_workspace/review-prompt"
+
+exec /usr/bin/env -i -- \
+  HOME="$reviewer_user_home" PATH="$reviewer_path" GROK_HOME="$reviewer_grok_home" \
+  GROK_AUTH_PATH="$reviewer_auth" GROK_REVIEWER_ACTIVE=1 \
+  XDG_CACHE_HOME="$reviewer_user_home/.cache" XDG_CONFIG_HOME="$reviewer_user_home/.config" \
+  XDG_DATA_HOME="$reviewer_user_home/.local/share" LANG="$reviewer_lang" LC_ALL="$reviewer_lang" \
+  TERM=dumb TMPDIR="$reviewer_tmp" \
+  "$reviewer_python" -I "$reviewer_runtime" run "$reviewer_root" "$reviewer_run_root" -- \
+  "$real_grok" --no-auto-update --sandbox reviewer --cwd "$reviewer_workspace" \
+  --no-subagents --no-memory --disable-web-search \
+  --tools "read_file,grep,list_dir" \
+  --disallowed-tools "search_replace,run_terminal_cmd,Agent,task,search_tool,use_tool,web_search,web_fetch" \
+  --deny "Bash(*)" --deny "Edit(*)" --deny "Write(*)" \
+  --deny "Read($reviewer_root/bin/**)" \
+  --deny "Read($reviewer_root/config.toml)" \
+  --deny "Read($reviewer_root/requirements.toml)" \
+  --deny "Read($reviewer_root/sandbox.toml)" --deny "Read($real_auth)" \
+  --deny "Read($reviewer_auth)" --deny "Read($reviewer_user_home/**)" \
+  --deny "Read(~/**)" \
+  --deny "Read($real_grok_logical)" \
+  --deny "Read($real_grok)" \
+  --deny "Read($runtime_home_physical/.codex/**)" \
+  --deny "Read($runtime_home_physical/.claude/**)" \
+  --deny "Read($runtime_home_physical/.cursor/**)" \
+  --deny "Read($runtime_home_physical/.grok/**)" \
+  --deny "Read($runtime_home_physical/.ssh/**)" \
+  --deny "Read($runtime_home_physical/.aws/**)" \
+  --deny "Read($runtime_home_physical/.config/gh/**)" \
+  --deny "Read(**/.env)" --deny "Read(**/.env.local)" \
+  --deny "Read(**/moshi-webhook-token)" \
+  --permission-mode dontAsk \
+  --rules "Single independent read-only reviewer. Work only from absolute paths named in the prompt. Do not edit files, run shell commands, use external services, delegate, invoke skills, or invoke other AI/CLI reviewers." \
+  "$@"

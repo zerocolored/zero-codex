@@ -20,6 +20,8 @@ import {
   resolveOfficialStandaloneCodexForTesting,
   verifyEncodedOfficialCodexSnapshot,
 } from './standalone-codex.ts'
+import { ensureManagedDirectory, prepareManagedStateRoot } from './managed-path.ts'
+import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 
 const temporaryRoots: string[] = []
 
@@ -128,7 +130,10 @@ describe('official standalone Codex trust boundary', () => {
     async () => {
       const root = mkdtempSync(join(tmpdir(), 'zerokun-official-supervisor-'))
       temporaryRoots.push(root)
-      const registration = join(root, 'executor.json')
+      const state = prepareManagedStateRoot(join(root, 'state'))
+      ensureManagedDirectory(state, join(state, 'executors'))
+      const registration = join(state, 'executors', 'official-version.json')
+      const fingerprint = createSeatbeltFingerprint(state, 'official-version', 'd'.repeat(32))
       const actual = resolveOfficialStandaloneCodex()
       const supervisor = Bun.spawn([
         process.execPath,
@@ -137,6 +142,7 @@ describe('official standalone Codex trust boundary', () => {
         join(import.meta.dir, 'codex-supervisor.ts'),
         'official-version',
         registration,
+        '--seatbelt-fingerprint', fingerprint.allow.path, fingerprint.deny.path,
         '--official-codex-snapshot',
         encodeOfficialCodexSnapshot(actual),
         '--',
@@ -155,7 +161,13 @@ describe('official standalone Codex trust boundary', () => {
       ])
       expect(exitCode, stderr).toBe(0)
       expect(stdout).toContain(`codex-cli ${actual.packageVersion}`)
-      expect(existsSync(registration)).toBe(false)
+      expect(existsSync(registration)).toBe(true)
+      expect(JSON.parse(readFileSync(registration, 'utf8'))).toMatchObject({
+        version: 4,
+        phase: 'cleanup-confirmed',
+        jobId: 'official-version',
+        fingerprint,
+      })
     },
     15_000,
   )

@@ -49,6 +49,19 @@ describe('Zero-kun watchdog', () => {
     expect(watchdogSource).not.toContain(': > "$LOG_FILE"')
   })
 
+  test('Slack alertはZeroちゃん名義だけで内部component名を出さない', () => {
+    const start = watchdogSource.indexOf('alert = "✅ Zeroちゃんが復旧しました。"')
+    const alertProgram = watchdogSource.slice(
+      start,
+      watchdogSource.indexOf('with open(next_path', start),
+    )
+    expect(alertProgram).toContain('Zeroちゃんが停止しています')
+    expect(alertProgram).not.toContain('bridge:')
+    expect(alertProgram).not.toContain('job-runner:')
+    expect(alertProgram).not.toContain('Codex')
+    expect(alertProgram).not.toContain('worker')
+  })
+
   test('Slack API呼び出しは10秒でtimeoutする', () => {
     expect(watchdogSource.match(/--max-time 10/g)?.length).toBe(4)
   })

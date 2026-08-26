@@ -1,6 +1,6 @@
 # Access Control Reference
 
-Zero-kun for Codex は「メッセージを受け取れる人」と「repository を変更できる人」を分離します。
+Zeroちゃんは「メッセージを受け取れる人」と「repository を変更できる人」を分離します。
 pairing や channel opt-in だけでは書込み権限は付きません。
 
 設定ファイルは既定で `~/.codex/zerokun/access.json` にあります。旧版の
@@ -79,6 +79,10 @@ zerokun-access write deny U0123456789
   write、request に必要な network accessを許可します。
 - job の権限は enqueue 時点で固定します。queue 待ちの途中で設定を変えても、既存 job の権限は
   変わりません。
+- 実行中の同じSlack threadへの返信はsenderが変わってもlive inputです。active jobの権限は途中で
+  変更せず、そのthreadへの参加をactive jobの操作委任とみなすため、read-only senderの返信も
+  write jobへ即時にsteerします。別threadは独立FIFOで、新jobの権限をsenderから判定します。
+  完全一致の`中止`も同じthread-scoped操作として受け付けます。
 - commit、push、deploy、PR は write 許可だけでは自動実行されず、Slack request が求めた範囲に
   限られます。
 - HOMEのcredential/configはCodexへ公開しません。commitにはrepository localのuser設定が必要で、
@@ -105,7 +109,10 @@ channel を `add` すると次の既定値になります。
 ```
 
 - `requireMention: true`: 新しい channel message は bot の `@mention` が必要です。いったん
-  Zero-kun が採用した thread の未メンション follow-up は poller が回収します。
+  Zeroちゃんが採用した thread の未メンション follow-up は、Socket Mode受信時に即時回収し、
+  取りこぼしはpollerが回収します。実行中の同じthreadはsenderにかかわらずそのactive jobへの
+  操作委任として扱い、別threadとして再解釈しません。別threadの新規依頼だけsenderの現在の
+  受信・write許可を確認します。
 - 人の `allowFrom: []`: opt-in 済み channel 内の人を許可します。
 - 人の populated `allowFrom`: listed user だけを許可します。
 - bot は default-deny です。投稿を受ける bot ID を明示的に `channel allow` してください。
@@ -151,3 +158,5 @@ channel を `add` すると次の既定値になります。
   Codex profileへread許可します。
 - 成果物 upload は50MBまでで、job専用 `outbox/<job-id>/` 直下の空でないregular fileだけを許可します。
   symlinkによるoutbox外へのescape、device、FIFO、他jobのfileは拒否します。
+- 成果物のfile形式は制限しません。送信byte列の明白な平文credentialだけをbest-effortで検出して省略し、
+  archive展開・復号・OCRは行わないため、社内利用でも成果物へ秘密を含めない運用を前提とします。

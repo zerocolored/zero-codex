@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   decideChannelPolicy,
+  canUseActiveThreadAuthority,
   isBotDMBlocked,
   selectNewReplies,
   slackTsToMs,
@@ -142,6 +143,13 @@ describe('decideChannelPolicy — humans (default-allow)', () => {
     expect(decideChannelPolicy(policy({ allowFrom: [OTHER_USER] }), HUMAN, true, false)).toBe('drop')
   })
 
+  test('active thread authorityだけは別humanのallowlistとmentionを上書きする', () => {
+    const restricted = policy({ requireMention: true, allowFrom: [OTHER_USER] })
+    expect(decideChannelPolicy(restricted, HUMAN, false, false, true)).toBe('deliver')
+    expect(decideChannelPolicy(undefined, HUMAN, false, false, true)).toBe('drop')
+    expect(decideChannelPolicy(restricted, BOT, false, true, true)).toBe('drop')
+  })
+
   test('drops when requireMention=true and isMention=false (even if listed)', () => {
     expect(decideChannelPolicy(policy({ requireMention: true, allowFrom: [HUMAN] }), HUMAN, false, false)).toBe('drop')
   })
@@ -191,6 +199,38 @@ describe('decideChannelPolicy — bots (default-deny)', () => {
     // trigger Claude in that channel. (Same rule as upstream's pre-patch
     // human allowlist; surfaced here because the bot path makes it new.)
     expect(decideChannelPolicy(policy({ allowFrom: [BOT] }), HUMAN, true, false)).toBe('drop')
+  })
+})
+
+describe('active Slack thread authority', () => {
+  test('別humanはlive targetへsteerでき、exact中止だけsettle targetへ届く', () => {
+    const base = {
+      isBot: false,
+      isDM: false,
+      text: '方針を変えて',
+      botUserId: 'U_ZERO',
+      hasInterruptTarget: true,
+      isInterrupt: false,
+    }
+    expect(canUseActiveThreadAuthority({ ...base, hasLiveTarget: true })).toBe(true)
+    expect(canUseActiveThreadAuthority({ ...base, hasLiveTarget: false })).toBe(false)
+    expect(canUseActiveThreadAuthority({
+      ...base, text: '中止', hasLiveTarget: false, isInterrupt: true,
+    })).toBe(true)
+  })
+
+  test('botと他人宛て返信はactive targetがあってもauthorityを得ない', () => {
+    const base = {
+      isDM: false,
+      botUserId: 'U_ZERO',
+      hasLiveTarget: true,
+      hasInterruptTarget: true,
+      isInterrupt: false,
+    }
+    expect(canUseActiveThreadAuthority({ ...base, isBot: true, text: '操作して' })).toBe(false)
+    expect(canUseActiveThreadAuthority({
+      ...base, isBot: false, text: '<@U0OTHER1> これはどう？',
+    })).toBe(false)
   })
 })
 
@@ -522,6 +562,8 @@ describe('resolveIsMention — the live-handler wiring', () => {
 describe('isExplicitUpdateRequest — privileged detached route', () => {
   test('短い命令形だけを自己更新として扱う', () => {
     expect(isExplicitUpdateRequest('ゼロくんを最新版に更新してください。')).toBe(true)
+    expect(isExplicitUpdateRequest('Zeroちゃんを更新してください。')).toBe(true)
+    expect(isExplicitUpdateRequest('ゼロちゃんのアップデートお願いします')).toBe(true)
     expect(isExplicitUpdateRequest('ゼロくんのアップデートお願いします')).toBe(true)
     expect(isExplicitUpdateRequest('please update zero-kun now')).toBe(true)
     expect(isExplicitUpdateRequest('zerokun update')).toBe(true)
@@ -606,6 +648,22 @@ describe('planCatchupSweep — startup recovery', () => {
     }, BOT_USER)
 
     expect(plan.map(item => item.text)).toEqual(['止まっている間のDM'])
+  })
+
+  test('channel allowlist外humanのchild replyもruntime active-thread gate用に残す', () => {
+    const child = message(-15_000, {
+      user: OTHER_USER,
+      text: 'active threadへの追記',
+      thread_ts: ts(-50_000),
+    })
+    const plan = planCatchupSweep([child], [], {
+      channelId: 'C123',
+      channelType: 'channel',
+      channelPolicy: policy({ requireMention: true, allowFrom: [HUMAN] }),
+      oldestMs: NOW - 60_000,
+      limit: 20,
+    }, BOT_USER)
+    expect(plan).toEqual([child])
   })
 
   test('上限超過時は最新分を選び、その中を古い順に返す', () => {

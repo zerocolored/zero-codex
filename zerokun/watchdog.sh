@@ -6,7 +6,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
 # The selected state's token is authoritative. Ignore stale shell/launchd
-# tokens that could reconnect this machine to another Zero-kun Slack App.
+# tokens that could reconnect this machine to another Zeroちゃん Slack App.
 WATCHDOG_BOT_TOKEN=""
 WATCHDOG_APP_TOKEN=""
 unset SLACK_BOT_TOKEN SLACK_APP_TOKEN
@@ -350,7 +350,7 @@ except Exception:
 alert = None
 if bridge_up and runner_up:
     if state.get("status") == "down":
-        alert = "✅ ゼロくん復旧（bridge: up / job-runner: up）"
+        alert = "✅ Zeroちゃんが復旧しました。"
     next_state = default.copy()
 else:
     consecutive = int(state.get("consecutiveDownChecks") or 0) + 1
@@ -364,12 +364,10 @@ else:
     elif status == "down" and (not last_alert or now - int(last_alert) >= realert_seconds):
         should_alert = True
     if should_alert:
-        bridge = "up" if bridge_up else "down"
-        runner = "up" if runner_up else "down"
         since = dt.datetime.fromtimestamp(down_since).strftime("%H:%M")
         alert = (
-            f"🚨 ゼロくん停止中（bridge: {bridge} / job-runner: {runner}）"
-            f"{since}から。復旧: 端末で zerokun-restart"
+            f"🚨 Zeroちゃんが停止しています。{since}から応答できていません。"
+            "復旧するには、端末で zerokun-restart を実行してください。"
         )
         last_alert = now
     next_state = {
@@ -501,7 +499,7 @@ selftest() {
   rm -f "$test_dir/plugin.lock"
   ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH" >/dev/null
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
-  [[ "$output" == *'🚨 ゼロくん停止中'* ]] || selftest_fail 'second down did not alert' || return 1
+  [[ "$output" == *'🚨 Zeroちゃんが停止しています'* ]] || selftest_fail 'second down did not alert' || return 1
   printf 'ok: second down sends alert\n'
 
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
@@ -518,12 +516,12 @@ with open(path, "w", encoding="utf-8") as handle:
     json.dump(state, handle)
 PY
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
-  [[ "$output" == *'🚨 ゼロくん停止中'* ]] || selftest_fail 'late reminder missing' || return 1
+  [[ "$output" == *'🚨 Zeroちゃんが停止しています'* ]] || selftest_fail 'late reminder missing' || return 1
   printf 'ok: reminder is sent after interval\n'
 
   printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
-  [[ "$output" == *'✅ ゼロくん復旧'* ]] || selftest_fail 'recovery missing' || return 1
+  [[ "$output" == *'✅ Zeroちゃんが復旧しました。'* ]] || selftest_fail 'recovery missing' || return 1
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'duplicate recovery' || return 1
   printf 'ok: recovery sends once\n'
@@ -553,7 +551,7 @@ if [ "${1:-}" = "--test-notification" ]; then
   STATE_DIR="$(resolve_state_dir)" || exit 1
   prepare_state_dir || exit 1
   load_state_env
-  if send_notification '🧪 ゼロくんwatchdog通知テスト（実装確認のための1通です）'; then
+  if send_notification '🧪 Zeroちゃんwatchdog通知テスト（実装確認のための1通です）'; then
     printf 'zerokun watchdog: test notification sent\n'
     exit 0
   fi

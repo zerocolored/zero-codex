@@ -8,16 +8,17 @@
  */
 
 import { App } from '@slack/bolt'
-import { randomBytes } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import {
-  closeSync, constants, existsSync, openSync, writeFileSync, writeSync,
+  closeSync, constants, existsSync, openSync, writeFileSync,
   mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync,
 } from 'fs'
 import { join, extname } from 'path'
 import {
   decideChannelPolicy, isBotDMBlocked, threadPollCursor, planThreadPoll,
   planDirectMessageThreadPoll,
-  resolveIsMention, pruneDeliveredKeys, planCatchupSweep, msToSlackTs,
+  classifyThreadReply, canUseActiveThreadAuthority, resolveIsMention,
+  pruneDeliveredKeys, planCatchupSweep, msToSlackTs,
   effectiveDmAllowFrom, isExplicitUpdateRequest, catchupThreadParents,
   slackThreadKey, slackTsToMs,
   singleFlightAsync,
@@ -32,7 +33,15 @@ import {
 } from './gate.ts'
 import { requestUpdate, resumePendingUpdateWorker } from './zerokun/update-request.ts'
 import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
-import { JobStore, updateIsRunning, updateTransactionPending } from './zerokun/job-runner.ts'
+import {
+  JobStore,
+  liveControlAcceptsInput,
+  updateIsRunning,
+  updateTransactionPending,
+  type InboundDeliveryInput,
+  type InboundDeliveryRecord,
+  type LiveControlTarget,
+} from './zerokun/job-runner.ts'
 import { requireLegacyThreadRepoRoute, requireRepoRoute } from './zerokun/routing.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './zerokun/state-dir.ts'
 import {
@@ -56,8 +65,24 @@ import {
   type AccessConfig,
 } from './zerokun/access.ts'
 import { readOptionalPrivateFile } from './zerokun/safe-file.ts'
-import { applyStateEnvironment } from './zerokun/child-environment.ts'
+import {
+  applyStateEnvironment,
+  takeSlackTokensFromEnvironment,
+} from './zerokun/child-environment.ts'
 import { verifySlackAppTokenPair } from './zerokun/slack-app-identity.ts'
+import {
+  copyLiveControlAttachments,
+  isSlackInterruptCommand,
+  normalizeSlackInboundText,
+  stripSlackUserMention,
+} from './zerokun/live-control.ts'
+import {
+  loadCachedInboundAttachment,
+  removeRenamedInboundAttachment,
+  verifyInboundDownloadBeforeRename,
+  writeAllSync,
+  type InboundAttachmentIdentity,
+} from './zerokun/inbound-attachment-cache.ts'
 
 const STATE_DIR = resolveZeroStateDir()
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -143,8 +168,9 @@ try {
   process.exit(1)
 }
 
-const BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? ''
-const APP_TOKEN = process.env.SLACK_APP_TOKEN ?? ''
+const slackTokens = takeSlackTokensFromEnvironment()
+const BOT_TOKEN = slackTokens.SLACK_BOT_TOKEN ?? ''
+const APP_TOKEN = slackTokens.SLACK_APP_TOKEN ?? ''
 
 if (!BOT_TOKEN || !APP_TOKEN) {
   process.stderr.write(
@@ -225,7 +251,14 @@ type GateResult =
   | { action: 'drop' }
   | { action: 'pair'; code: string; isResend: boolean }
 
-async function gate(senderId: string, channelId: string, channelType: string, isMention: boolean, isBot: boolean = false): Promise<GateResult> {
+async function gate(
+  senderId: string,
+  channelId: string,
+  channelType: string,
+  isMention: boolean,
+  isBot: boolean = false,
+  activeThreadAuthority = false,
+): Promise<GateResult> {
   try {
     return mutateAccess((access): GateResult => {
       pruneExpired(access)
@@ -235,8 +268,13 @@ async function gate(senderId: string, channelId: string, channelType: string, is
       if (isBotDMBlocked(isDM ? 'im' : 'channel', isBot)) return { action: 'drop' }
 
       if (isDM) {
+        if (activeThreadAuthority && !isBot) {
+          return { action: 'deliver', access }
+        }
         // Being on any opted-in channel's allowFrom carries into DMs.
-        if (effectiveDmAllowFrom(access).includes(senderId)) return { action: 'deliver', access }
+        if (effectiveDmAllowFrom(access).includes(senderId)) {
+          return { action: 'deliver', access }
+        }
         if (access.dmPolicy === 'allowlist') return { action: 'drop' }
 
         for (const [code, pending] of Object.entries(access.pending)) {
@@ -259,8 +297,11 @@ async function gate(senderId: string, channelId: string, channelType: string, is
         return { action: 'pair', code, isResend: false }
       }
 
-      const decision = decideChannelPolicy(access.channels[channelId], senderId, isMention, isBot)
-      return decision === 'drop' ? { action: 'drop' } : { action: 'deliver', access }
+      const decision = decideChannelPolicy(
+        access.channels[channelId], senderId, isMention, isBot, activeThreadAuthority,
+      )
+      if (decision === 'drop') return { action: 'drop' }
+      return { action: 'deliver', access }
     }, ACCESS_FILE)
   } catch (error) {
     if (error instanceof AccessLockReleaseError) {
@@ -272,6 +313,45 @@ async function gate(senderId: string, channelId: string, channelType: string, is
 }
 
 let slackApp: InstanceType<typeof App> | null = null
+
+function activeThreadAuthorityTarget(
+  channelId: string,
+  threadTs: string | undefined,
+  text: string,
+  isDM: boolean,
+  isBot: boolean,
+): LiveControlTarget | null {
+  if (!threadTs) return null
+  const normalized = normalizeSlackInboundText(text, botUserId, isDM)
+  const interrupt = isSlackInterruptCommand(normalized)
+  const liveTarget = jobStore.liveControlTarget(channelId, threadTs)
+  const interruptTarget = interrupt
+    ? jobStore.interruptControlTarget(channelId, threadTs)
+    : null
+  const authorized = canUseActiveThreadAuthority({
+    isBot,
+    isDM,
+    text,
+    botUserId,
+    hasLiveTarget: liveTarget !== null,
+    hasInterruptTarget: interruptTarget !== null,
+    isInterrupt: interrupt,
+  })
+  if (!authorized) return null
+  return interrupt ? (interruptTarget ?? liveTarget) : liveTarget
+}
+
+async function acknowledgeSlackDelivery(
+  channel: string,
+  timestamp: string,
+  access: Pick<AccessConfig, 'ackReaction'>,
+): Promise<void> {
+  const reaction = access.ackReaction ?? 'eyes'
+  if (!reaction || !slackApp) return
+  try {
+    await slackApp.client.reactions.add({ channel, name: reaction, timestamp })
+  } catch {}
+}
 
 function checkApprovals(): void {
   if (!slackApp) return
@@ -299,7 +379,7 @@ function checkApprovals(): void {
       try {
         await slackApp!.client.chat.postMessage({
           channel: dmChannelId,
-          text: "Paired! Say hi to Codex. Repository writes remain disabled until explicitly granted with zerokun-access write allow.",
+          text: "ペアリングが完了しました。Zeroちゃんに話しかけてください。リポジトリへの書込みは、管理者が明示的に許可するまで無効です。",
         })
         rmSync(file, { force: true })
       } catch (err) {
@@ -375,16 +455,41 @@ function resolveRepoPath(chatId: string, threadTs: string): string {
   return repoPath
 }
 
-async function downloadInboundFiles(fileIds: string[], messageTs: string): Promise<string[]> {
+async function downloadInboundFiles(
+  inbound: InboundDeliveryRecord,
+  parentSignal?: AbortSignal,
+): Promise<string[]> {
+  const { fileIds, messageId: messageTs } = inbound
   if (!/^\d+\.\d+$/.test(messageTs)) throw new Error(`invalid Slack message ts: ${messageTs}`)
   const paths: string[] = []
-  for (const fileId of fileIds) {
+  for (let ordinal = 0; ordinal < fileIds.length; ordinal += 1) {
+    const fileId = fileIds[ordinal]!
     if (!/^F[A-Z0-9]+$/.test(fileId)) throw new Error(`invalid Slack file id: ${fileId}`)
+    const manifest = inbound.downloadedFiles.find(file => (
+      file.fileId === fileId && file.ordinal === ordinal
+    ))
+    const cached = loadCachedInboundAttachment({
+      inboxDir: INBOX_DIR,
+      messageTs,
+      fileId,
+      ordinal,
+      ...(manifest ? { manifest } : {}),
+    })
+    if (cached) {
+      if (!manifest) jobStore.recordInboundDownloadedFile(inbound.idempotencyKey, cached)
+      paths.push(cached.path)
+      continue
+    }
     const localPath = await withSlackDeadline(async signal => {
+      if (signal.aborted) throw new Error(`Slack attachment ${fileId} aborted`)
       const info = await slackApp!.client.files.info({ file: fileId })
+      if (signal.aborted) throw new Error(`Slack attachment ${fileId} aborted`)
       const file = info.file
       if (!file?.url_private_download) throw new Error(`file ${fileId} is not downloadable`)
-      if ((file.size ?? 0) > MAX_ATTACHMENT_BYTES) {
+      const expectedSize = file.size
+      if (expectedSize !== undefined
+        && (!Number.isSafeInteger(expectedSize) || expectedSize < 0
+          || expectedSize > MAX_ATTACHMENT_BYTES)) {
         throw new Error(`file ${fileId} is larger than 50MB`)
       }
       const response = await openDirectSlackDownload(file.url_private_download, BOT_TOKEN, signal)
@@ -404,6 +509,10 @@ async function downloadInboundFiles(fileIds: string[], messageTs: string): Promi
         0o600,
       )
       let received = 0
+      const digest = createHash('sha256')
+      let descriptorOpen = true
+      let renamedIdentity: InboundAttachmentIdentity | undefined
+      let renamed = false
       try {
         for await (const value of response) {
           const chunk = typeof value === 'string' ? Buffer.from(value) : value
@@ -412,17 +521,42 @@ async function downloadInboundFiles(fileIds: string[], messageTs: string): Promi
             response.destroy()
             throw new Error(`file ${fileId} is larger than 50MB`)
           }
-          writeSync(descriptor, chunk)
+          digest.update(chunk)
+          writeAllSync(descriptor, chunk)
         }
+        renamedIdentity = verifyInboundDownloadBeforeRename(
+          descriptor,
+          received,
+          expectedSize,
+        )
         closeSync(descriptor)
+        descriptorOpen = false
         renameSync(temporary, destination)
+        renamed = true
+        const completed = loadCachedInboundAttachment({
+          inboxDir: INBOX_DIR,
+          messageTs,
+          fileId,
+          ordinal,
+        })
+        if (!completed || completed.size !== received
+          || completed.digest !== digest.digest('hex')) {
+          throw new Error(`file ${fileId} failed its completed-download verification`)
+        }
+        jobStore.recordInboundDownloadedFile(inbound.idempotencyKey, completed)
       } catch (error) {
-        try { closeSync(descriptor) } catch {}
-        rmSync(temporary, { force: true })
+        if (descriptorOpen) {
+          try { closeSync(descriptor) } catch {}
+        }
+        if (renamed && renamedIdentity) {
+          removeRenamedInboundAttachment(destination, renamedIdentity)
+        } else {
+          rmSync(temporary, { force: true })
+        }
         throw error
       }
       return destination
-    }, slackHttpTimeoutMs(), `Slack attachment ${fileId}`)
+    }, slackHttpTimeoutMs(), `Slack attachment ${fileId}`, parentSignal)
     paths.push(localPath)
   }
   return paths
@@ -439,18 +573,18 @@ async function enqueueUpdate(
     {
       stateDir: STATE_DIR,
       workerFile: UPDATE_REQUEST_FILE,
-      onAccepted: async request => {
+      onAccepted: async _request => {
         await slackApp!.client.chat.postMessage({
           channel: chatId,
           thread_ts: threadTs,
-          text: `🔄 Codex版ゼロくんの更新を受け付けました（request ${request.id.slice(0, 8)}）。実行中jobの完了後に更新し、このスレッドへ結果を通知します。`,
+          text: '🔄 Zeroちゃんの更新を受け付けました。現在の処理が終わり次第更新し、このスレッドへ結果を通知します。',
         })
       },
-      onDuplicate: async request => {
+      onDuplicate: async _request => {
         await slackApp!.client.chat.postMessage({
           channel: chatId,
           thread_ts: threadTs,
-          text: `🔄 更新はすでに待機中または実行中です（request ${request.id.slice(0, 8)}）。`,
+          text: '🔄 Zeroちゃんの更新はすでに待機中または実行中です。',
         })
       },
     },
@@ -461,6 +595,24 @@ const INBOUND_RETRY_MS = 30_000
 const INBOUND_MAX_ATTEMPTS = positiveInteger(process.env.ZEROKUN_INBOUND_MAX_ATTEMPTS, 5)
 let inboundDrainActive = false
 let inboundRetryTimer: ReturnType<typeof setTimeout> | undefined
+type ActiveInboundDownload = {
+  inbound: InboundDeliveryRecord
+  controller: AbortController
+  preempted: boolean
+}
+let activeInboundDownload: ActiveInboundDownload | null = null
+
+function preemptInboundDownloadForLiveControl(input: InboundDeliveryInput): void {
+  const active = activeInboundDownload
+  if (!active || active.preempted) return
+  const sameThread = active.inbound.chatId === input.chatId
+    && active.inbound.threadTs === input.threadTs
+  // Ordinary same-thread replies retain FIFO order. An exact interrupt may
+  // overtake them; any live control may overtake an unrelated attachment job.
+  if (!input.isInterrupt && sameThread) return
+  active.preempted = true
+  active.controller.abort()
+}
 
 function scheduleInboundDrain(delayMs = 0): void {
   if (inboundDrainActive && delayMs === 0) return
@@ -488,14 +640,118 @@ async function drainInboundDeliveries(): Promise<void> {
     while (!shuttingDown) {
       const inbound = jobStore.claimNextInboundDelivery()
       if (!inbound) return
+      let download: ActiveInboundDownload | null = null
       try {
-        const attachments = await downloadInboundFiles(inbound.fileIds, inbound.messageId)
-        const task = [
-          inbound.text.trim() || '(添付ファイルを確認してください)',
-          attachments.length > 0
-            ? `\n添付ファイル（ローカル絶対パス）:\n${attachments.map(path => `- ${path}`).join('\n')}`
-            : '',
-        ].join('').trim()
+        const interrupt = inbound.isInterrupt
+        let attachments: string[] = []
+        if (!interrupt) {
+          download = { inbound, controller: new AbortController(), preempted: false }
+          activeInboundDownload = download
+          try {
+            attachments = await downloadInboundFiles(
+              inbound,
+              download.controller.signal,
+            )
+          } finally {
+            if (activeInboundDownload === download) activeInboundDownload = null
+          }
+        }
+        // Keep the durable task as the Slack-authored text only. Attachment
+        // paths already have their own authoritative column and are rendered
+        // into the Codex transcript by the host; mixing them into `task`
+        // makes host paths indistinguishable from user-authored text later.
+        const taskFor = () => inbound.text.trim() || '(添付ファイルを確認してください)'
+        const task = taskFor()
+        const target = inbound.expectedControlJobId !== null
+          && inbound.expectedControlEpoch !== null
+          ? {
+              jobId: inbound.expectedControlJobId,
+              epoch: inbound.expectedControlEpoch,
+              repoPath: inbound.repoPath,
+              writeEnabled: inbound.writeEnabled,
+            }
+          : interrupt
+            ? jobStore.interruptControlTarget(inbound.chatId, inbound.threadTs)
+            : jobStore.liveControlTarget(inbound.chatId, inbound.threadTs)
+        if (target && liveControlAcceptsInput(target, {
+          repoPath: inbound.repoPath,
+          writeEnabled: inbound.writeEnabled,
+          interrupt,
+        })) {
+          const controlAttachments = interrupt || attachments.length === 0
+            ? []
+            : copyLiveControlAttachments({
+              stateDir: STATE_DIR,
+              jobId: target.jobId,
+              messageId: inbound.messageId,
+              attachments,
+            })
+          const staged = jobStore.stageLiveControl(target, {
+            chatId: inbound.chatId,
+            threadTs: inbound.threadTs,
+            messageId: inbound.messageId,
+            userId: inbound.userId,
+            writeEnabled: inbound.writeEnabled,
+            task: interrupt ? '中止' : taskFor(),
+            attachments: controlAttachments,
+            kind: interrupt ? 'interrupt' : 'steer',
+          })
+          if (staged !== 'closed') {
+            if (staged === 'staged' && interrupt) {
+              await slackApp!.client.chat.postMessage({
+                channel: inbound.chatId,
+                thread_ts: inbound.threadTs,
+                text: '中止を受け付けました。安全な後処理を開始します。',
+              }).catch(err => {
+                process.stderr.write(
+                  `slack channel: interrupt acceptance reply failed for ${inbound.idempotencyKey}: ${err}\n`,
+                )
+              })
+            }
+            jobStore.completeInboundDelivery(inbound.idempotencyKey)
+            continue
+          }
+        }
+        // A crash after staging an interrupt closes its target epoch before
+        // the inbound row is deleted. On recovery, do not reinterpret that
+        // already-durable control as an inactive cancellation or a new FIFO job.
+        if (jobStore.hasJobControl(inbound.idempotencyKey)) {
+          jobStore.completeInboundDelivery(inbound.idempotencyKey)
+          continue
+        }
+        // A reply admitted through active-thread authority belongs only to the
+        // exact job/epoch persisted with it. Never reinterpret it as a sibling
+        // FIFO job after cancellation or another terminal race.
+        if (inbound.expectedControlJobId !== null) {
+          jobStore.tombstoneInboundDelivery(inbound.idempotencyKey)
+          await slackApp!.client.chat.postMessage({
+            channel: inbound.chatId,
+            thread_ts: inbound.threadTs,
+            text: 'この返信を反映する前に現在の処理が終了しました。必要なら新しい依頼として送ってください。',
+          }).catch(err => {
+            process.stderr.write(
+              `slack channel: closed live-control notice failed for ${inbound.idempotencyKey}: ${err}\n`,
+            )
+          })
+          continue
+        }
+        // Exact cancellation is a host command, never an ordinary task. If
+        // the accepting epoch closed between lookup and staging (or no job is
+        // active), consume it as a deterministic no-op instead of enqueueing
+        // a new Codex job whose task text happens to be "中止".
+        if (isSlackInterruptCommand(inbound.text)) {
+          jobStore.tombstoneInboundDelivery(inbound.idempotencyKey)
+          await slackApp!.client.chat.postMessage({
+            channel: inbound.chatId,
+            thread_ts: inbound.threadTs,
+            text: '現在このスレッドで実行中のタスクはありません。',
+          }).catch(err => {
+            process.stderr.write(
+              `slack channel: inactive interrupt reply failed for ${inbound.idempotencyKey}: ${err}\n`,
+            )
+          })
+          continue
+        }
         const result = jobStore.enqueue({
           chatId: inbound.chatId,
           threadTs: inbound.threadTs,
@@ -510,7 +766,7 @@ async function drainInboundDeliveries(): Promise<void> {
           await slackApp!.client.chat.postMessage({
             channel: inbound.chatId,
             thread_ts: inbound.threadTs,
-            text: `🙌 Codexで受け付けました（queue ${result.queuePosition}）。`,
+            text: `🙌 受け付けました（待ち順 ${result.queuePosition}）。`,
           }).catch(err => {
             process.stderr.write(
               `slack channel: acceptance reply failed for ${inbound.idempotencyKey}: ${err}\n`,
@@ -520,7 +776,36 @@ async function drainInboundDeliveries(): Promise<void> {
         jobStore.completeInboundDelivery(inbound.idempotencyKey)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
+        if (download?.preempted) {
+          if (!jobStore.releaseInboundDelivery(inbound.idempotencyKey)) {
+            throw new Error(`preempted inbound delivery lost its processing lease: ${inbound.idempotencyKey}`)
+          }
+          continue
+        }
         if (inbound.attempts + 1 >= INBOUND_MAX_ATTEMPTS) {
+          if (inbound.expectedControlJobId !== null) {
+            try {
+              await slackApp!.client.chat.postMessage({
+                channel: inbound.chatId,
+                thread_ts: inbound.threadTs,
+                text: '添付ファイルを取得できなかったため、この返信は現在の処理へ反映できませんでした。もう一度送ってください。',
+              })
+              jobStore.tombstoneInboundDelivery(inbound.idempotencyKey)
+              process.stderr.write(
+                `slack channel: live-control inbound ${inbound.idempotencyKey} abandoned after attachment retries\n`,
+              )
+              continue
+            } catch (noticeError) {
+              const notice = noticeError instanceof Error ? noticeError.message : String(noticeError)
+              jobStore.deferInboundDelivery(
+                inbound.idempotencyKey,
+                `attachment failed and notice is pending: ${notice}`,
+                Date.now() + INBOUND_RETRY_MS,
+              )
+              scheduleInboundDrain(INBOUND_RETRY_MS)
+              return
+            }
+          }
           jobStore.failInboundDelivery(
             inbound.idempotencyKey,
             `Slack添付の取得を${INBOUND_MAX_ATTEMPTS}回試みましたが失敗しました: ${message}`,
@@ -555,6 +840,7 @@ function deliver(
   text: string,
   threadTs?: string,
   fileIds?: string[],
+  authority?: { target: LiveControlTarget },
 ): Promise<boolean> {
   // During self-update the candidate gateway must connect for readiness, but
   // its database can still be rolled back to the pre-update snapshot. Do not
@@ -583,7 +869,7 @@ function deliver(
     } else {
       // Persist Slack metadata before any file/network I/O. The single inbound
       // drain preserves arrival order and retries the head item after failures.
-      jobStore.stageInboundDelivery({
+      const inbound: InboundDeliveryInput = {
         chatId,
         threadTs: resolvedThreadTs,
         messageId: messageTs,
@@ -592,8 +878,26 @@ function deliver(
         text,
         fileIds,
         writeEnabled,
-      })
-      scheduleInboundDrain()
+        isInterrupt: isSlackInterruptCommand(text),
+      }
+      const staged = authority
+          ? jobStore.stageInboundDeliveryForControl(
+            inbound,
+            authority.target,
+          )
+        : jobStore.stageInboundDelivery(inbound) ? 'staged' : 'duplicate'
+      if (staged === 'authority-closed') {
+        await slackApp!.client.chat.postMessage({
+          channel: chatId,
+          thread_ts: resolvedThreadTs,
+          text: '返信を受け付けた時点の処理はすでに終了していました。必要なら新しい依頼として送ってください。',
+        }).catch(err => {
+          process.stderr.write(`slack channel: expired thread authority notice failed for ${key}: ${err}\n`)
+        })
+      } else {
+        if (staged === 'bound') preemptInboundDownloadForLiveControl(inbound)
+        scheduleInboundDrain()
+      }
     }
     rememberDelivered(key)
     return true
@@ -619,29 +923,27 @@ slackApp.event('app_mention', async ({ event }) => {
   if (!senderId) return
   const channelId = event.channel
   const threadTs = event.thread_ts || event.ts
+  const text = stripSlackUserMention(event.text, botUserId).trim()
+  const threadAuthorityTarget = activeThreadAuthorityTarget(
+    channelId, event.thread_ts, event.text, false, isBot,
+  )
 
-  const result = await gate(senderId, channelId, 'channel', true, isBot)
+  const result = await gate(
+    senderId, channelId, 'channel', true, isBot, threadAuthorityTarget !== null,
+  )
   if (result.action === 'drop') return
   if (result.action === 'pair') return
-
-  const text = event.text.replace(/<@[A-Z0-9]+>/g, '').trim()
 
   const fileIds = ((event as any).files ?? []).map((f: any) => f.id)
   const handedOver = await deliver(
     channelId, event.ts, senderId, text, threadTs,
     fileIds.length > 0 ? fileIds : undefined,
+    threadAuthorityTarget
+      ? { target: threadAuthorityTarget }
+      : undefined,
   )
   if (!handedOver) return
-  const ackReaction = result.access.ackReaction ?? 'eyes'
-  if (ackReaction) {
-    try {
-      await slackApp!.client.reactions.add({
-        channel: channelId,
-        name: ackReaction,
-        timestamp: event.ts,
-      })
-    } catch {}
-  }
+  await acknowledgeSlackDelivery(channelId, event.ts, result.access)
 })
 
 // Handle DMs and thread replies
@@ -680,24 +982,40 @@ slackApp.event('message', async ({ event }) => {
 
   const isDM = channelType === 'im'
   const text = msg.text as string ?? ''
+  const normalizedText = normalizeSlackInboundText(text, botUserId, isDM)
   // A DM needs no mention — the DM *is* the address. In a channel the mention
-  // has to be real: treating every channel message as mentioning us would make
-  // `requireMention` dead config, and this handler sees ALL channel traffic
-  // whenever `message.channels` is subscribed (README tells operators to
-  // subscribe it). Un-mentioned follow-ups in threads we own are not lost —
-  // the catch-up poller picks those up.
-  const isMention = resolveIsMention(isDM, text, botUserId)
+  // has to be real for a new root message. Once Zeroちゃん owns a thread, its
+  // allowlisted replies are live input and must not wait for the 60-second
+  // catch-up poller; exact cancellation in particular cannot survive that lag.
+  const ownedThread = typeof threadTs === 'string'
+    && jobStore.getThread(channelId, threadTs) !== null
+  if (ownedThread && !isDM
+    && loadAccess().channels[channelId]?.requireMention
+    && classifyThreadReply(text, botUserId) === 'others') return
+  const isMention = resolveIsMention(isDM, text, botUserId) || ownedThread
+  const threadAuthorityTarget = activeThreadAuthorityTarget(
+    channelId, typeof threadTs === 'string' ? threadTs : undefined, text, isDM, isBot,
+  )
 
-  const result = await gate(senderId, channelId, isDM ? 'im' : 'channel', isMention, isBot)
+  const result = await gate(
+    senderId,
+    channelId,
+    isDM ? 'im' : 'channel',
+    isMention,
+    isBot,
+    threadAuthorityTarget !== null,
+  )
 
   if (result.action === 'drop') return
 
   if (result.action === 'pair') {
-    const lead = result.isResend ? 'Still pending' : 'Pairing required'
+    const lead = result.isResend
+      ? 'Zeroちゃんとのペアリング待ちです'
+      : 'Zeroちゃんとのペアリングが必要です'
     try {
       await slackApp!.client.chat.postMessage({
         channel: channelId,
-        text: `${lead} — run in your terminal:\n\n\`zerokun-access pair ${result.code}\``,
+        text: `${lead}。ターミナルで次を実行してください。\n\n\`zerokun-access pair ${result.code}\``,
       })
     } catch (err) {
       process.stderr.write(`slack channel: failed to send pairing code: ${err}\n`)
@@ -710,21 +1028,15 @@ slackApp.event('message', async ({ event }) => {
     channelId,
     msg.ts,
     senderId,
-    text,
+    normalizedText,
     threadTs || msg.ts,
     fileIds.length > 0 ? fileIds : undefined,
+    threadAuthorityTarget
+      ? { target: threadAuthorityTarget }
+      : undefined,
   )
   if (!handedOver) return
-  const ackReaction = result.access.ackReaction ?? 'eyes'
-  if (ackReaction) {
-    try {
-      await slackApp!.client.reactions.add({
-        channel: channelId,
-        name: ackReaction,
-        timestamp: msg.ts,
-      })
-    } catch {}
-  }
+  await acknowledgeSlackDelivery(channelId, msg.ts, result.access)
 })
 
 // Handle being added to a channel — host-side routing is deliberately not delegated to Codex.
@@ -745,14 +1057,15 @@ slackApp.event('member_joined_channel', async ({ event }) => {
     await slackApp!.client.chat.postMessage({
       channel: channelId,
       text: [
-        `:wave: Hi, I'm *Zero-kun for Codex*. I've been added to this channel but I'm not configured for it yet.`,
+        `:wave: *Zeroちゃん*です。このチャンネルはまだ接続先が設定されていません。`,
         ``,
-        `A Mac administrator must register this channel from Terminal:`,
+        `Macの管理者がターミナルでこのチャンネルを登録してください:`,
         ``,
         `> \`zerokun-access channel add ${channelId}\``,
         ``,
-        `Then add this channel ID and its absolute \`repo_path\` to \`routes.json\` in the Zero-kun state directory.`,
-        `Messages in an unrouted channel are intentionally ignored.`,
+        `続けて、このチャンネルの接続先をMacの管理者に登録してもらってください。`,
+        `詳しい手順はZeroちゃんのセットアップガイドにあります。`,
+        `接続先がないチャンネルのメッセージには応答しません。`,
       ].join('\n'),
     })
   } catch (err) {
@@ -1118,12 +1431,18 @@ async function processPendingReplyScanPages(
       const senderId = isBot ? message.bot_id : message.user
       if (!senderId || !message.ts) continue
       const text = message.text ?? ''
+      const normalizedText = normalizeSlackInboundText(text, botUserId, isDM)
+      const resolvedThreadTs = message.thread_ts || scan.threadTs
+      const threadAuthorityTarget = activeThreadAuthorityTarget(
+        scan.channelId, resolvedThreadTs, text, isDM, isBot,
+      )
       const result = await gate(
         senderId,
         scan.channelId,
         isDM ? 'im' : 'channel',
         resolveIsMention(isDM, text, botUserId),
         isBot,
+        threadAuthorityTarget !== null,
       )
       if (result.action === 'drop') {
         outstanding.delete(message.ts)
@@ -1133,11 +1452,13 @@ async function processPendingReplyScanPages(
         continue
       }
       if (result.action === 'pair') {
-        const lead = result.isResend ? 'Still pending' : 'Pairing required'
+        const lead = result.isResend
+          ? 'Zeroちゃんとのペアリング待ちです'
+          : 'Zeroちゃんとのペアリングが必要です'
         try {
           await slackApp.client.chat.postMessage({
             channel: scan.channelId,
-            text: `${lead} — run in your terminal:\n\n\`zerokun-access pair ${result.code}\``,
+            text: `${lead}。ターミナルで次を実行してください。\n\n\`zerokun-access pair ${result.code}\``,
           })
           outstanding.delete(message.ts)
           if (candidateTimestamps.has(message.ts)) {
@@ -1153,13 +1474,17 @@ async function processPendingReplyScanPages(
         scan.channelId,
         message.ts,
         senderId,
-        isDM ? text : text.replace(/<@[A-Z0-9]+>/g, '').trim(),
-        message.thread_ts || scan.threadTs,
+        normalizedText,
+        resolvedThreadTs,
         fileIds.length > 0 ? fileIds : undefined,
+        threadAuthorityTarget
+          ? { target: threadAuthorityTarget }
+          : undefined,
       )
       if (handedOver) {
         deliveredCount += 1
         outstanding.delete(message.ts)
+        await acknowledgeSlackDelivery(scan.channelId, message.ts, result.access)
       }
     }
 
@@ -1290,12 +1615,18 @@ async function catchupSweep(): Promise<void> {
       const senderId = isBot ? message.bot_id : message.user
       if (!senderId || !message.ts) continue
       const text = message.text ?? ''
+      const normalizedText = normalizeSlackInboundText(text, botUserId, isDM)
+      const resolvedThreadTs = message.thread_ts || message.ts
+      const threadAuthorityTarget = activeThreadAuthorityTarget(
+        channelId, message.thread_ts, text, isDM, isBot,
+      )
       const result = await gate(
         senderId,
         channelId,
         isDM ? 'im' : 'channel',
         resolveIsMention(isDM, text, botUserId),
         isBot,
+        threadAuthorityTarget !== null,
       )
       if (result.action === 'drop') {
         outstandingScanReplies.delete(message.ts)
@@ -1309,11 +1640,13 @@ async function catchupSweep(): Promise<void> {
         continue
       }
       if (result.action === 'pair') {
-        const lead = result.isResend ? 'Still pending' : 'Pairing required'
+        const lead = result.isResend
+          ? 'Zeroちゃんとのペアリング待ちです'
+          : 'Zeroちゃんとのペアリングが必要です'
         try {
           await slackApp.client.chat.postMessage({
             channel: channelId,
-            text: `${lead} — run in your terminal:\n\n\`zerokun-access pair ${result.code}\``,
+            text: `${lead}。ターミナルで次を実行してください。\n\n\`zerokun-access pair ${result.code}\``,
           })
           outstandingScanReplies.delete(message.ts)
           outstandingRecentMessages.delete(message.ts)
@@ -1334,14 +1667,18 @@ async function catchupSweep(): Promise<void> {
         channelId,
         message.ts,
         senderId,
-        isDM ? text : text.replace(/<@[A-Z0-9]+>/g, '').trim(),
-        message.thread_ts || message.ts,
+        normalizedText,
+        resolvedThreadTs,
         fileIds.length > 0 ? fileIds : undefined,
+        threadAuthorityTarget
+          ? { target: threadAuthorityTarget }
+          : undefined,
       )
       if (handedOver) deliveredCount += 1
       if (handedOver) {
         outstandingScanReplies.delete(message.ts)
         outstandingRecentMessages.delete(message.ts)
+        await acknowledgeSlackDelivery(channelId, message.ts, result.access)
       }
     }
     if (catchup.commitRecentScan && outstandingRecentMessages.size === 0) {
@@ -1390,6 +1727,10 @@ const LEGACY_THREADS_MIGRATION = 'legacy-threads-json-v1'
 function importLegacyThreads(): void {
   if (legacyThreadsImported) return
   legacyThreadsImported = true
+  // A fresh Codex state must never adopt a copied Claude-era thread map just
+  // because the file exists. Only the explicit, setup-validated in-place
+  // cutover path is authorized to read and import legacy routing history.
+  if (process.env.ZEROKUN_LEGACY_CUTOVER !== '1') return
   if (jobStore.migrationApplied(LEGACY_THREADS_MIGRATION)) return
   let content: string | null
   try {
@@ -1505,7 +1846,7 @@ async function pollThreads(): Promise<void> {
         continue
       }
 
-      const plan = channelId.startsWith('D')
+      const planned = channelId.startsWith('D')
         ? planDirectMessageThreadPoll(
           replies,
           cursorTs,
@@ -1514,14 +1855,59 @@ async function pollThreads(): Promise<void> {
         )
         : planThreadPoll(replies, cursorTs, access.channels[channelId], botUserId)
 
+      const policyExists = channelId.startsWith('D')
+        ? access.dmPolicy !== 'disabled'
+        : access.channels[channelId] !== undefined
+      const promotedAuthorities = new Map<string, LiveControlTarget>()
+      const promoted = planned.skipped.filter(({ reply, reason }) => {
+        if (reason !== 'policy' || !policyExists || !reply.ts) return false
+        const target = activeThreadAuthorityTarget(
+          channelId,
+          threadTs,
+          reply.text ?? '',
+          channelId.startsWith('D'),
+          Boolean(reply.bot_id),
+        )
+        if (!target) return false
+        promotedAuthorities.set(reply.ts, target)
+        return true
+      }).map(({ reply }) => reply)
+      const promotedTs = new Set(promoted.map(reply => reply.ts))
+      const plan = {
+        ...planned,
+        deliver: [...planned.deliver, ...promoted]
+          .sort((left, right) => parseFloat(left.ts!) - parseFloat(right.ts!)),
+        skipped: planned.skipped.filter(({ reply }) => !promotedTs.has(reply.ts)),
+      }
+
       for (const { reply, reason } of plan.skipped) {
         process.stderr.write(
           `slack channel: poll skip (${reason}) thread=${threadTs} ts=${reply.ts}\n`,
         )
       }
-      const handedOver = await confirmedWithin(plan.deliver.map((r) => {
+      const handedOver = await confirmedWithin(plan.deliver.map(async (r) => {
         const fileIds = (r.files ?? []).map((f: any) => f.id)
-        return deliver(channelId, r.ts!, r.user!, r.text ?? '', threadTs, fileIds.length ? fileIds : undefined)
+        const promotedTarget = promotedAuthorities.get(r.ts!)
+        const ordinaryTarget = promotedTarget ?? activeThreadAuthorityTarget(
+          channelId,
+          threadTs,
+          r.text ?? '',
+          channelId.startsWith('D'),
+          Boolean(r.bot_id),
+        )
+        const accepted = await deliver(
+          channelId,
+          r.ts!,
+          r.user!,
+          normalizeSlackInboundText(r.text ?? '', botUserId, channelId.startsWith('D')),
+          threadTs,
+          fileIds.length ? fileIds : undefined,
+          ordinaryTarget
+            ? { target: ordinaryTarget }
+            : undefined,
+        )
+        if (accepted) await acknowledgeSlackDelivery(channelId, r.ts!, access)
+        return accepted
       }))
 
       // Moving the read position means "these are dealt with", so hold it where

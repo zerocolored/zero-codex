@@ -81,16 +81,39 @@ export function decideChannelPolicy(
   senderId: string,
   isMention: boolean,
   isBot: boolean,
+  activeHumanThreadAuthority = false,
 ): 'deliver' | 'drop' {
   if (!policy) return 'drop'
   const allowFrom = policy.allowFrom ?? []
   if (isBot) {
     if (!allowFrom.includes(senderId)) return 'drop'
-  } else if (allowFrom.length > 0 && !allowFrom.includes(senderId)) {
+  } else if (!activeHumanThreadAuthority
+    && allowFrom.length > 0 && !allowFrom.includes(senderId)) {
     return 'drop'
   }
-  if (policy.requireMention && !isMention) return 'drop'
+  if (policy.requireMention && !isMention && !activeHumanThreadAuthority) return 'drop'
   return 'deliver'
+}
+
+/**
+ * A currently active Zero thread is a delegated conversation boundary: any
+ * human participant may steer it, while bots, replies aimed at somebody else,
+ * completed threads and unrelated roots retain the ordinary access gate.
+ */
+export function canUseActiveThreadAuthority(options: {
+  isBot: boolean
+  isDM: boolean
+  text: string
+  botUserId: string | undefined
+  hasLiveTarget: boolean
+  hasInterruptTarget: boolean
+  isInterrupt: boolean
+}): boolean {
+  if (options.isBot) return false
+  if (!options.isDM && classifyThreadReply(options.text, options.botUserId) === 'others') {
+    return false
+  }
+  return options.hasLiveTarget || (options.isInterrupt && options.hasInterruptTarget)
 }
 
 /**
@@ -345,7 +368,7 @@ export function isExplicitUpdateRequest(text: string): boolean {
     .toLowerCase()
     .replace(/[。．.!！]+$/g, '')
     .replace(/\s+/g, ' ')
-  const japanese = /^(?:ゼロくん|zero-?kun|zerokun)(?:を|の)?(?:最新版(?:へ|に)?|本体(?:を)?|コード(?:を)?)?(?:更新|アップデート)(?:して|してください|して下さい|をお願い|お願い|お願いします|をお願いします|を実行して|を実行してください)$/i
+  const japanese = /^(?:Zeroちゃん|ゼロちゃん|ゼロくん|zero-?kun|zerokun)(?:を|の)?(?:最新版(?:へ|に)?|本体(?:を)?|コード(?:を)?)?(?:更新|アップデート)(?:して|してください|して下さい|をお願い|お願い|お願いします|をお願いします|を実行して|を実行してください)$/i
   const english = /^(?:please )?(?:(?:update|upgrade) (?:zero[ -]?kun|zerokun)|(?:zero[ -]?kun|zerokun) (?:update|upgrade))(?: now)?$/i
   return japanese.test(normalized) || english.test(normalized)
 }
@@ -387,6 +410,10 @@ export function planCatchupSweep(
     if (isBotDMBlocked(policy.channelType, isBot)) return false
     if (policy.channelType === 'im') return true
 
+    // Child replies are re-checked by the runtime gate because an active Zero
+    // thread may temporarily authorize a human outside the channel allowlist.
+    // Root messages still need the ordinary policy here.
+    if (!isBot && message.thread_ts && message.thread_ts !== message.ts) return true
     const isMention = resolveIsMention(false, message.text ?? '', botUserId)
     return decideChannelPolicy(policy.channelPolicy, senderId, isMention, isBot) === 'deliver'
   }).sort((a, b) => parseFloat(a.ts!) - parseFloat(b.ts!))

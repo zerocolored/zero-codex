@@ -24,6 +24,59 @@ function requireSlackDownloadUrl(value: string | URL): URL {
   return url
 }
 
+export function requireSlackUploadUrl(value: string | URL): URL {
+  const url = requireSlackDownloadUrl(value)
+  if (url.username || url.password) throw new Error('refusing credentialed Slack upload URL')
+  return url
+}
+
+/**
+ * Upload bytes directly to Slack's pre-signed external upload URL without
+ * inheriting host proxy settings. Redirects are rejected because replaying a
+ * non-idempotent body to another destination would make delivery ambiguous.
+ */
+export async function postDirectSlackUpload(
+  input: string | URL,
+  data: Uint8Array,
+  beforeRequestWrite: () => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const url = requireSlackUploadUrl(input)
+  const response = await new Promise<IncomingMessage>((resolve, reject) => {
+    const request = httpsRequest(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(data.byteLength),
+      },
+      rejectUnauthorized: true,
+      signal,
+    }, resolve)
+    request.once('error', reject)
+    try {
+      // Node does not flush this request until write/end/flushHeaders. Keep the
+      // durable at-most-once checkpoint in the same synchronous stack directly
+      // before the first operation that may emit HTTP bytes.
+      beforeRequestWrite()
+      request.end(data)
+    } catch (error) {
+      request.destroy()
+      reject(error)
+    }
+  })
+  let received = 0
+  for await (const value of response) {
+    received += Buffer.byteLength(value)
+    if (received > 1024 * 1024) {
+      response.destroy()
+      throw new Error('Slack upload response is too large')
+    }
+  }
+  if (response.statusCode !== 200) {
+    throw new Error(`Slack external upload failed: HTTP ${response.statusCode ?? 'unknown'}`)
+  }
+}
+
 /**
  * Download through Node's direct HTTPS transport, which does not consume
  * HTTP(S)_PROXY. TLS verification is forced on even if state tuning contains
@@ -101,6 +154,8 @@ export async function withSlackDeadline<T>(
   label = 'Slack request',
   parentSignal?: AbortSignal,
 ): Promise<T> {
+  // A pre-aborted parent must not start a request with external effects.
+  if (parentSignal?.aborted) throw new Error(`${label} aborted`)
   const controller = new AbortController()
   let timedOut = false
   let rejectTimeout: ((error: Error) => void) | undefined
@@ -109,8 +164,7 @@ export async function withSlackDeadline<T>(
     controller.abort()
     rejectTimeout?.(new Error(`${label} aborted`))
   }
-  if (parentSignal?.aborted) interrupted()
-  else parentSignal?.addEventListener('abort', interrupted, { once: true })
+  parentSignal?.addEventListener('abort', interrupted, { once: true })
   const timer = setTimeout(() => {
     timedOut = true
     controller.abort()
@@ -126,4 +180,19 @@ export async function withSlackDeadline<T>(
     parentSignal?.removeEventListener('abort', interrupted)
     controller.abort()
   }
+}
+
+/**
+ * Run a non-cooperative Slack side effect exactly once. Once the operation has
+ * started, its terminal result must be observed so the caller can durably
+ * checkpoint success before honoring a shutdown signal. WebClient supplies
+ * the network deadline for these SDK calls.
+ */
+export async function completeSlackSideEffect<T>(
+  operation: () => Promise<T>,
+  label = 'Slack side effect',
+  parentSignal?: AbortSignal,
+): Promise<T> {
+  if (parentSignal?.aborted) throw new Error(`${label} aborted before start`)
+  return operation()
 }

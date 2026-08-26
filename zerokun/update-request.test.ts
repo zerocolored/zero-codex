@@ -324,7 +324,8 @@ describe('Slack update request', () => {
     const result = await running
     expect(Date.now() - startedAt).toBeLessThan(2_000)
     expect(result).toEqual({ success: false, exitCode: 1, notificationSent: true })
-    expect(notifications[0]).toContain('timeout')
+    expect(notifications[0]).toContain('このMacの管理ログ')
+    expect(notifications[0]).not.toContain('Codex')
     const saved = JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8'))
     expect(saved.outcome.success).toBe(false)
     expect(saved.outcome.notifiedAt).toBeNumber()
@@ -542,10 +543,15 @@ describe('Slack update request', () => {
     expect(result.success).toBe(true)
     expect(notifications).toHaveLength(1)
     expect(notifications[0]).toContain('更新完了')
-    // 更新は再起動を伴い、ゼロくんは元のタブから消えて detached tmux へ移る。
-    // 「どこに行った」を毎回聞かせないよう、開き方と抜け方を完了通知に必ず載せる。
-    expect(notifications[0]).toContain('tmux attach -t zerokun-slack')
-    expect(notifications[0]).toContain('Ctrl-b')
+    // 実装方式はSlack上へ露出せず、Zeroちゃんとして完了だけを伝える。
+    expect(notifications[0]).toContain('Zeroちゃんの更新完了')
+    expect(notifications[0]).not.toContain('Codex')
+    expect(notifications[0]).not.toContain('tmux')
+    expect(notifications[0]).not.toContain('Ctrl-b')
+    expect(notifications[0]).not.toContain('request-success')
+    expect(notifications[0]).not.toMatch(/request\s+[0-9a-z-]+/i)
+    expect(notifications[0]).not.toContain(stateDir)
+    expect(notifications[0]).not.toContain('.codex')
     const tombstone = JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8'))
     expect(tombstone.outcome.notifiedAt).toBeNumber()
 
@@ -579,9 +585,10 @@ describe('Slack update request', () => {
       notify: async (_request, text) => { notifications.push(text) },
     })
 
-    // updaterは衝突回避用suffixを付けるため、通知は固定名ではなく起動時markerを読む。
-    const guided = notifications[0].match(/tmux attach -t (\S+)/)?.[1]
-    expect(guided).toBe(actualSession)
+    // 内部の旧tmux markerが残っていても、利用者向け文面へ実装詳細を露出しない。
+    expect(actualSession).toBe('zerokun-slack-a1b2c3d4')
+    expect(notifications[0]).not.toContain(actualSession)
+    expect(notifications[0]).not.toContain('tmux')
   })
 
   test('更新失敗も元のSlackスレッドへ通知して次の依頼を受けられる', async () => {
@@ -602,6 +609,11 @@ describe('Slack update request', () => {
     expect(result.success).toBe(false)
     expect(notifications).toHaveLength(1)
     expect(notifications[0]).toContain('更新失敗')
+    expect(notifications[0]).not.toContain('request-error')
+    expect(notifications[0]).not.toMatch(/request\s+[0-9a-z-]+/i)
+    expect(notifications[0]).not.toContain(stateDir)
+    expect(notifications[0]).not.toContain('.codex')
+    expect(notifications[0]).not.toMatch(/Codex|worker|job/i)
     expect(JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8')).outcome.notifiedAt)
       .toBeNumber()
   })

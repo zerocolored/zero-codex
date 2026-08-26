@@ -20,6 +20,13 @@ const reportUnsafeByDefault: UnsafeReporter = message => {
   process.stderr.write(`state maintenance: ${message}\n`)
 }
 
+function runtimeLogBelongsToJob(name: string, jobId: string): boolean {
+  if (name === `${jobId}.stdout.log` || name === `${jobId}.stderr.log`) return true
+  if (!name.startsWith(`${jobId}.`)) return false
+  const phase = name.slice(jobId.length + 1)
+  return /^(?:new|resume|\d+-(?:prepare|implementation|review-[123]))\.(?:stdout|stderr)\.log$/.test(phase)
+}
+
 function stateChild(root: string, candidate: string): string {
   const base = resolve(root)
   const path = resolve(candidate)
@@ -145,7 +152,10 @@ export function removeSettledJobState(options: {
     id !== '.' && id !== '..' && /^[A-Za-z0-9._-]+$/.test(id)
   )))
   for (const id of ids) {
-    for (const root of ['outbox', 'tmp', 'sealed-artifacts', 'final-output']) {
+    for (const root of [
+      'outbox', 'tmp', 'sealed-artifacts', 'final-output', 'execution-results',
+      'advisor-runtime', 'advisor-context', 'advisor-journal', 'live-input',
+    ]) {
       if (removeEntry(options.stateDir, join(options.stateDir, root, id), report)) removed += 1
     }
     for (const suffix of ['stdout.log', 'stderr.log']) {
@@ -155,6 +165,10 @@ export function removeSettledJobState(options: {
         report,
       )) removed += 1
     }
+  }
+  for (const entry of scanRoot(options.stateDir, 'job-logs', report)) {
+    if (![...ids].some(id => runtimeLogBelongsToJob(basename(entry), id))) continue
+    if (removeEntry(options.stateDir, entry, report)) removed += 1
   }
   const inbox = join(options.stateDir, 'inbox')
   for (const attachment of options.attachmentPaths) {
@@ -189,7 +203,10 @@ export function removeOrphanedJobState(options: {
 }): number {
   let removed = 0
   const report = options.onUnsafe ?? reportUnsafeByDefault
-  for (const root of ['outbox', 'tmp', 'sealed-artifacts', 'final-output']) {
+  for (const root of [
+    'outbox', 'tmp', 'sealed-artifacts', 'final-output', 'execution-results',
+    'advisor-runtime', 'advisor-context', 'advisor-journal', 'live-input',
+  ]) {
     for (const entry of scanRoot(options.stateDir, root, report)) {
       if (options.liveJobIds.has(basename(entry))) continue
       try {
@@ -199,8 +216,8 @@ export function removeOrphanedJobState(options: {
     }
   }
   for (const entry of scanRoot(options.stateDir, 'job-logs', report)) {
-    const match = basename(entry).match(/^(.+)\.(?:stdout|stderr)\.log$/)
-    if (match && options.liveJobIds.has(match[1]!)) continue
+    const name = basename(entry)
+    if ([...options.liveJobIds].some(id => runtimeLogBelongsToJob(name, id))) continue
     try {
       if (lstatSync(entry).mtimeMs < options.olderThan
         && removeEntry(options.stateDir, entry, report)) removed += 1

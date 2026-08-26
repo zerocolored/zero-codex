@@ -1060,7 +1060,12 @@ export async function stopProcessLockOwner(
   lockFile: string,
   expectedPid: number,
   commandPattern: RegExp,
-  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+  options: {
+    timeoutMs?: number
+    signal?: AbortSignal
+    forceKill?: boolean
+    killWaitMs?: number
+  } = {},
 ): Promise<ProcessLockStopResult> {
   const timeoutMs = options.timeoutMs ?? 30_000
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return 'owner-unavailable'
@@ -1081,8 +1086,23 @@ export async function stopProcessLockOwner(
     const observation = observeProcessGeneration(expected)
     if (observation.status === 'dead') return 'stopped'
     if (observation.status === 'unknown') return 'owner-unavailable'
-    if (Date.now() >= deadline) return 'timeout'
+    if (Date.now() >= deadline) break
     await Bun.sleep(50)
+  }
+  if (!options.forceKill) return 'timeout'
+  if (options.signal?.aborted) return 'aborted'
+  if (!signalProcessIfLive(expected, 'SIGKILL')) {
+    const observation = observeProcessGeneration(expected)
+    return observation.status === 'dead' ? 'stopped' : 'owner-unavailable'
+  }
+  const killDeadline = Date.now() + (options.killWaitMs ?? 2_000)
+  while (true) {
+    if (options.signal?.aborted) return 'aborted'
+    const observation = observeProcessGeneration(expected)
+    if (observation.status === 'dead') return 'stopped'
+    if (observation.status === 'unknown') return 'owner-unavailable'
+    if (Date.now() >= killDeadline) return 'timeout'
+    await Bun.sleep(25)
   }
 }
 
@@ -1348,7 +1368,7 @@ if (import.meta.main) {
   const [command, lockFile, owner, participant, timeoutValue] = process.argv.slice(2)
   const validCommand = command === 'acquire' || command === 'release'
     || command === 'delegate' || command === 'undelegate' || command === 'delegate-active'
-    || command === 'quiescent' || command === 'stop-owner'
+    || command === 'quiescent' || command === 'stop-owner' || command === 'stop-owner-force'
   if (!lockFile || !owner || !validCommand) {
     process.stderr.write(
       'usage: process-lock.ts acquire <lock-file> <pid>\n'
@@ -1357,7 +1377,8 @@ if (import.meta.main) {
       + '  | undelegate <lock-file> <delegate-token>\n'
       + '  | delegate-active <lock-file> <pid>\n'
       + '  | quiescent <lock-file> <delegate-token>\n'
-      + '  | stop-owner <lock-file> <pid> <command-pattern> [timeout-ms]\n',
+      + '  | stop-owner <lock-file> <pid> <command-pattern> [timeout-ms]\n'
+      + '  | stop-owner-force <lock-file> <pid> <command-pattern> [term-timeout-ms]\n',
     )
     process.exit(2)
   }
@@ -1392,7 +1413,7 @@ if (import.meta.main) {
       const pid = Number(owner)
       if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`invalid PID: ${owner}`)
       if (!processLockDelegateMatches(lockFile, pid)) process.exitCode = 3
-    } else if (command === 'stop-owner') {
+    } else if (command === 'stop-owner' || command === 'stop-owner-force') {
       const pid = Number(owner)
       const timeoutMs = timeoutValue === undefined ? 30_000 : Number(timeoutValue)
       if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`invalid PID: ${owner}`)
@@ -1402,7 +1423,7 @@ if (import.meta.main) {
         lockFile,
         pid,
         new RegExp(participant),
-        { timeoutMs },
+        { timeoutMs, forceKill: command === 'stop-owner-force' },
       )
       if (result !== 'stopped') {
         process.stderr.write(`process lock owner stop failed: ${result}\n`)

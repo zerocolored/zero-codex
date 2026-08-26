@@ -16,6 +16,7 @@ import {
   processLockLeaseIsExclusive,
   protectProcessLockDelegateCleanup,
   releaseProcessLock,
+  stopProcessLockOwner,
   tryAcquireProcessLock,
   undelegateProcessLock,
 } from './process-lock.ts'
@@ -98,6 +99,35 @@ function killFixtureGroup(_proc: Bun.Subprocess, identity?: ProcessIdentity): vo
 }
 
 describe('process lock contention states', () => {
+  test('TERMを無視するownerも同一generationだけをKILLして停止する', async () => {
+    const dir = fixture()
+    const lock = join(dir, 'lock')
+    const ready = join(dir, 'force-stop-ready')
+    const child = Bun.spawn([
+      process.execPath,
+      '--config=/dev/null',
+      '--no-env-file',
+      '-e',
+      `import { writeFileSync } from 'fs'; process.on('SIGTERM', () => {}); writeFileSync(${JSON.stringify(ready)}, 'ready'); await Bun.sleep(30_000)`,
+      'zerokun-force-stop-fixture',
+    ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+    try {
+      await waitUntilReady(ready)
+      const acquired = tryAcquireProcessLock(lock, child.pid)
+      expect(acquired.acquired).toBe(true)
+      expect(await stopProcessLockOwner(
+        lock,
+        child.pid,
+        /zerokun-force-stop-fixture/,
+        { timeoutMs: 100, forceKill: true, killWaitMs: 2_000 },
+      )).toBe('stopped')
+      expect(await child.exited).not.toBe(0)
+    } finally {
+      try { child.kill('SIGKILL') } catch {}
+      await child.exited
+    }
+  })
+
   test('公開中hardlinkのownerを読めなくても例外化やreclaimをしない', () => {
     const dir = fixture()
     const candidate = join(dir, 'candidate')

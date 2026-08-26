@@ -2,8 +2,8 @@ _metadata:
   major_version: 1
 display_information:
   # bootstrap実行時に入力した表示名へ置換される。直接使う場合もこの名前は変更可能。
-  name: Zero-kun Custom
-  description: ローカルCodexをSlackから安全に呼び出すボット
+  name: Zeroちゃん
+  description: ローカルで動くZeroちゃんとSlackでやり取りするためのアプリ
 features:
   app_home:
     home_tab_enabled: false
@@ -11,7 +11,7 @@ features:
     messages_tab_read_only_enabled: false
   bot_user:
     # Slackの制約: a-z、0-9、-、_、. のみ。日本語は使用不可。
-    display_name: zerokun-custom
+    display_name: zerochan
     always_online: false
 oauth_config:
   scopes:

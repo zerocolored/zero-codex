@@ -11,10 +11,15 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   observeProcessGeneration,
+  processIdentityIsStopped,
   readProcessIdentity,
+  readProcessTable,
+  signalProcessIfLive,
   signalProcessGroupIfLeaderLive,
   type ProcessIdentity,
 } from './process-generation.ts'
+import { prepareManagedStateRoot, ensureManagedDirectory } from './managed-path.ts'
+import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 
 const temporaryRoots: string[] = []
 const liveSupervisors: ProcessIdentity[] = []
@@ -70,23 +75,13 @@ describe('Codex stable supervisor gate', () => {
 
   test.skipIf(process.platform !== 'darwin'
     || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
-    'seed前にCodexが終了してもregistrationとleaderを保持しgroup全体を回収できる',
+    'seed前に停止gateが消えてもactive registrationとleaderを保持し回収できる',
     async () => {
       const root = mkdtempSync(join(tmpdir(), 'zerokun-supervisor-seed-failure-'))
       temporaryRoots.push(root)
       const registration = join(root, 'executor.json')
-      const childPidFile = join(root, 'child.pid')
       const fakeCodex = join(root, 'fake-codex')
-      writeFileSync(fakeCodex, `#!/usr/bin/env bun
-const child = Bun.spawn([
-  process.execPath,
-  '--no-env-file',
-  '-e',
-  "process.on('SIGTERM', () => {}); await Bun.sleep(30_000)",
-], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
-child.unref()
-await Bun.write(process.env.CHILD_PID_FILE!, String(child.pid))
-`, { mode: 0o700 })
+      writeFileSync(fakeCodex, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
       chmodSync(fakeCodex, 0o700)
       const supervisor = Bun.spawn([
         process.execPath,
@@ -103,8 +98,7 @@ await Bun.write(process.env.CHILD_PID_FILE!, String(child.pid))
         env: {
           PATH: process.env.PATH ?? '/usr/bin:/bin',
           HOME: root,
-          CHILD_PID_FILE: childPidFile,
-          ZEROKUN_SUPERVISOR_TEST_SEED_DELAY_MS: '300',
+          ZEROKUN_SUPERVISOR_TEST_SEED_DELAY_MS: '1500',
           ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1',
         },
         stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
@@ -113,14 +107,30 @@ await Bun.write(process.env.CHILD_PID_FILE!, String(child.pid))
       const supervisorIdentity = readProcessIdentity(supervisor.pid)
       expect(supervisorIdentity).toBeDefined()
       liveSupervisors.push(supervisorIdentity!)
-      await waitFor(() => existsSync(registration) && existsSync(childPidFile))
-      const childPid = Number(readFileSync(childPidFile, 'utf8'))
-      const childIdentity = readProcessIdentity(childPid)
-      expect(childIdentity).toBeDefined()
-      await Bun.sleep(500)
-      expect(observeProcessGeneration(supervisorIdentity!).status).toBe('alive')
-      expect(observeProcessGeneration(childIdentity!).status).toBe('alive')
+      await waitFor(() => existsSync(registration))
+      let gateIdentity: ProcessIdentity | undefined
+      await waitFor(() => {
+        gateIdentity = readProcessTable().find(identity => (
+          identity.ppid === supervisor.pid
+          && identity.pgid === supervisor.pid
+          && processIdentityIsStopped(identity)
+        ))
+        return gateIdentity !== undefined
+      })
+      expect(gateIdentity).toBeDefined()
       expect(JSON.parse(readFileSync(registration, 'utf8'))).toMatchObject({
+        phase: 'active',
+        cleanupPending: true,
+        pid: supervisor.pid,
+      })
+      expect(signalProcessIfLive(gateIdentity!, 'SIGKILL')).toBe(true)
+      await waitFor(() => observeProcessGeneration(gateIdentity!).status === 'dead')
+      // Wait past the injected seed delay so seedTrackedProcess observes the
+      // exact dead gate and the supervisor enters its retained-receipt loop.
+      await Bun.sleep(1_600)
+      expect(observeProcessGeneration(supervisorIdentity!).status).toBe('alive')
+      expect(JSON.parse(readFileSync(registration, 'utf8'))).toMatchObject({
+        phase: 'active',
         cleanupPending: true,
         pid: supervisor.pid,
       })
@@ -130,10 +140,79 @@ await Bun.write(process.env.CHILD_PID_FILE!, String(child.pid))
       expect(observeProcessGeneration(supervisorIdentity!).status).toBe('alive')
       expect(signalProcessGroupIfLeaderLive(supervisorIdentity!, 'SIGKILL')).toBe(true)
       await Promise.race([supervisor.exited, Bun.sleep(2_000)])
-      await waitFor(() => observeProcessGeneration(childIdentity!).status === 'dead')
       expect(observeProcessGeneration(supervisorIdentity!).status).toBe('dead')
       expect(existsSync(registration)).toBe(true)
       liveSupervisors.splice(0)
+    },
+    10_000,
+  )
+
+  test.skipIf(process.platform !== 'darwin'
+    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
+    'stdioと親子関係を捨てたSeatbelt子もcleanup-confirmed前に回収する',
+    async () => {
+      const root = prepareManagedStateRoot(mkdtempSync(join(tmpdir(), 'zerokun-supervisor-seatbelt-')))
+      temporaryRoots.push(root)
+      ensureManagedDirectory(root, join(root, 'executors'))
+      const registration = join(root, 'executors', 'seatbelt-job.json')
+      const escapedPidPath = join(root, 'escaped.pid')
+      const fakeCodex = join(root, 'fake-codex')
+      const fingerprint = createSeatbeltFingerprint(root, 'seatbelt-job', 'c'.repeat(32))
+      writeFileSync(fakeCodex, `#!/usr/bin/env bun
+const code = [
+  'import os,sys,time',
+  'pid=os.fork()',
+  'if pid:',
+  ' open(sys.argv[1],"w").write(str(pid))',
+  ' os._exit(0)',
+  'os.setsid()',
+  'os.close(0);os.close(1);os.close(2)',
+  'time.sleep(60)',
+].join('\\n')
+const profile = [
+  '(version 1)',
+  '(allow default)',
+  '(deny file-read-data (literal ' + JSON.stringify(process.env.FP_DENY) + '))',
+].join('\\n')
+const child = Bun.spawn(['/usr/bin/sandbox-exec','-p',profile,'/usr/bin/python3','-c',code,process.env.ESCAPED_PID], {
+  stdin:'ignore',stdout:'ignore',stderr:'ignore',
+})
+await child.exited
+`, { mode: 0o700 })
+      const supervisor = Bun.spawn([
+        process.execPath,
+        '--config=/dev/null',
+        '--no-env-file',
+        join(import.meta.dir, 'codex-supervisor.ts'),
+        'seatbelt-job',
+        registration,
+        '--seatbelt-fingerprint', fingerprint.allow.path, fingerprint.deny.path,
+        '--unverified-for-tests',
+        '--', fakeCodex,
+      ], {
+        cwd: root,
+        env: {
+          PATH: process.env.PATH ?? '/usr/bin:/bin',
+          HOME: root,
+          FP_DENY: fingerprint.deny.path,
+          ESCAPED_PID: escapedPidPath,
+          ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1',
+        },
+        stdin: 'ignore', stdout: 'ignore', stderr: 'pipe', detached: true,
+      })
+      const supervisorIdentity = readProcessIdentity(supervisor.pid)
+      expect(supervisorIdentity).toBeDefined()
+      liveSupervisors.push(supervisorIdentity!)
+      expect(await supervisor.exited).toBe(0)
+      liveSupervisors.splice(0)
+      await waitFor(() => existsSync(escapedPidPath))
+      const escapedPid = Number(readFileSync(escapedPidPath, 'utf8'))
+      expect(readProcessIdentity(escapedPid)).toBeUndefined()
+      expect(JSON.parse(readFileSync(registration, 'utf8'))).toMatchObject({
+        version: 4,
+        phase: 'cleanup-confirmed',
+        fingerprint,
+      })
     },
     10_000,
   )

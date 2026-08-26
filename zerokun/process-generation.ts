@@ -5,10 +5,12 @@ const PROC_BSDINFO_SIZE = 136
 const PROC_STATUS_OFFSET = 4
 const PROC_PID_OFFSET = 12
 const PROC_PPID_OFFSET = 16
+const PROC_UID_OFFSET = 20
 const PROC_PGID_OFFSET = 100
 const PROC_START_SEC_OFFSET = 120
 const PROC_START_USEC_OFFSET = 128
 const ZOMBIE_STATUS = 5
+const STOPPED_STATUS = 4
 const INITIAL_PID_CAPACITY = 4_096
 const MAX_PID_CAPACITY = 131_072
 
@@ -32,6 +34,8 @@ export interface ProcessIdentity {
   ppid: number
   pgid: number
   status: number
+  /** Effective UID reported by proc_bsdinfo (Darwin). */
+  uid?: number
   bootSession: string
   startSec: number
   startUsec: number
@@ -133,6 +137,7 @@ function rawProcessIdentity(pid: number): ProcessIdentity | undefined {
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
   const observedPid = view.getUint32(PROC_PID_OFFSET, true)
   const ppid = view.getUint32(PROC_PPID_OFFSET, true)
+  const uid = view.getUint32(PROC_UID_OFFSET, true)
   const pgid = view.getUint32(PROC_PGID_OFFSET, true)
   const status = view.getUint32(PROC_STATUS_OFFSET, true)
   const startSecBig = view.getBigUint64(PROC_START_SEC_OFFSET, true)
@@ -148,6 +153,7 @@ function rawProcessIdentity(pid: number): ProcessIdentity | undefined {
     ppid,
     pgid,
     status,
+    uid,
     bootSession: session,
     startSec,
     startUsec,
@@ -218,6 +224,10 @@ export function observeProcessGeneration(
 
 export function processIdentityIsLive(expected: ProcessIdentity): boolean {
   return observeProcessGeneration(expected).status === 'alive'
+}
+
+export function processIdentityIsStopped(identity: Pick<ProcessIdentity, 'status'>): boolean {
+  return identity.status === STOPPED_STATUS
 }
 
 export function readProcessTable(): ProcessIdentity[] {

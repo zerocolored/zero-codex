@@ -7,7 +7,10 @@ const root = join(import.meta.dir, '..')
 describe('Zero-kun Codex wiring', () => {
   test('standalone gateway persists authorized Slack events directly to SQLite', () => {
     const server = readFileSync(join(root, 'server.ts'), 'utf8')
-    expect(server).toContain("import { JobStore, updateIsRunning, updateTransactionPending } from './zerokun/job-runner.ts'")
+    expect(server).toContain('JobStore,')
+    expect(server).toContain('updateIsRunning,')
+    expect(server).toContain('updateTransactionPending,')
+    expect(server).toContain("} from './zerokun/job-runner.ts'")
     expect(server).toContain('const result = jobStore.enqueue({')
     expect(server).toContain('rememberDelivered(key)')
     expect(server.indexOf('jobStore.enqueue({')).toBeLessThan(
@@ -23,18 +26,62 @@ describe('Zero-kun Codex wiring', () => {
     expect(server.indexOf('await downloadInboundFiles')).toBeLessThan(server.indexOf('jobStore.enqueue({'))
     expect(runner).toContain('CREATE TABLE IF NOT EXISTS slack_threads')
     expect(runner).toContain('INSERT INTO slack_threads')
+    expect(server).toContain("process.env.ZEROKUN_LEGACY_CUTOVER !== '1'")
   })
 
-  test('worker runtime is Codex exec/resume and never invokes Claude', () => {
+  test('worker runtime is ordered Codex App Server with live steer/interrupt', () => {
+    const server = readFileSync(join(root, 'server.ts'), 'utf8')
     const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
     const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+    expect(server).toContain('? jobStore.interruptControlTarget(inbound.chatId, inbound.threadTs)')
+    expect(server).toContain(': jobStore.liveControlTarget(inbound.chatId, inbound.threadTs)')
     expect(runner).toContain('executeCodexJob(job')
     expect(runner).toContain('verifySlackAppTokenPair')
-    expect(runner).toContain('verifySlackAppTokenPair')
-    expect(executor).toContain("'exec'")
-    expect(executor).toContain("...(resumed && sessionId ? ['resume', sessionId] : [])")
-    expect(executor).toContain("'--ignore-user-config'")
-    expect(executor).not.toContain("'claude'")
+    expect(runner).toContain('liveControls: {')
+    expect(executor).toContain('production Codex jobs require the App Server live-control transport')
+    expect(executor).toContain("'app-server', '--stdio'")
+    expect(executor).toContain('const session = new CodexAppServerSession')
+    expect(executor).toContain('session.startThread(')
+    expect(executor).toContain('session.resumeThread(')
+    expect(executor).toContain('session.startTurn(')
+    expect(executor).toContain('session.steer(')
+    expect(executor).toContain('session.interrupt(')
+    expect(executor).toContain('session.loadFullTurn(')
+  })
+
+  test('jobごとのHerdr monitorは既存Codex出力だけを表示しterminal後に閉じる', () => {
+    const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
+    const monitor = readFileSync(join(import.meta.dir, 'herdr-job-monitor.ts'), 'utf8')
+    const viewer = readFileSync(join(import.meta.dir, 'herdr-job-monitor-view.ts'), 'utf8')
+    expect(runner).toContain('openHerdrJobMonitor({')
+    expect(runner).toContain('appendHerdrJobMonitorChunk(')
+    expect(runner).toContain('closeHerdrJobMonitor({')
+    expect(runner).toContain('watchHerdrJobMonitor({')
+    expect(runner).toContain('for (const jobId of startupRetainedMonitorJobIds) ensureMonitorGuard(jobId)')
+    expect(runner).toContain('assertJobMonitorHealthy:')
+    expect(runner).toContain('controller.abort()')
+    expect(runner).toContain('failAfterMonitorLoss(')
+    expect(runner.match(/recoverMissingBindingAfterExecutorsStopped:/g)).toHaveLength(4)
+    const recoveryCommand = runner.slice(
+      runner.indexOf("if (command === 'recover-interrupted')"),
+      runner.indexOf("if (command !== 'daemon'"),
+    )
+    expect(recoveryCommand.indexOf('await terminateTrackedExecutors(')).toBeLessThan(
+      recoveryCommand.indexOf('const recoverMissingMonitor ='),
+    )
+    const daemonStartup = runner.slice(runner.indexOf('if (!updateTransactionPending(updateJournal))'))
+    expect(daemonStartup.indexOf('await terminateTrackedExecutors(')).toBeLessThan(
+      daemonStartup.indexOf('const recoverMissingMonitor ='),
+    )
+    expect(monitor).toContain("'tab', 'create'")
+    expect(monitor).toContain("'--no-focus'")
+    expect(monitor).toContain("'tab', 'close'")
+    expect(monitor).toContain('exec /usr/bin/env -i PATH=/usr/bin:/bin TERM=dumb')
+    expect(monitor).not.toContain("'codex', 'exec'")
+    expect(monitor).toContain('monitor loss recovery did not terminalize non-terminal job')
+    expect(viewer).toContain('ZEROCHAN_MONITOR_READY:')
+    expect(viewer).toContain("'progress.json'")
+    expect(viewer).not.toContain('Bun.spawn(')
   })
 
   test('read and write authorization map to separate Codex sandboxes', () => {
@@ -56,8 +103,12 @@ describe('Zero-kun Codex wiring', () => {
     expect(launcher).toContain('start_job_runner')
     expect(launcher).toContain('bun --config=/dev/null --no-env-file "$REPO_DIR/server.ts"')
     expect(launcher).toContain('"$RUNNER_LAUNCHER" "$JOB_RUNNER" "$STATE_DIR" "$JOB_RUNNER_LOG"')
-    expect(readFileSync(join(import.meta.dir, 'runner-launcher.ts'), 'utf8'))
-      .toContain("detached: process.platform !== 'win32'")
+    expect(launcher).toContain('"$JOB_RUNNER_STARTER_LOCK"')
+    const runnerLauncher = readFileSync(join(import.meta.dir, 'runner-launcher.ts'), 'utf8')
+    expect(runnerLauncher).toContain("detached: process.platform !== 'win32'")
+    expect(runnerLauncher).toContain('tryAcquireProcessLock(canonicalStarterLock, process.pid)')
+    expect(runnerLauncher).not.toContain('daemon.unref()')
+    expect(launcher).toContain('starter_pid=$!')
     expect(readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8'))
       .toContain("if (command === 'daemon') process.on('SIGINT', ignoreInterrupt)")
     expect(launcher.indexOf('start_job_runner')).toBeLessThan(
@@ -65,6 +116,25 @@ describe('Zero-kun Codex wiring', () => {
     )
     expect(launcher).not.toContain('dangerously-load-development-channels')
     expect(launcher).not.toContain('command -v claude')
+    expect(launcher).toContain('zerokun/herdr-runtime.ts')
+    expect(launcher.indexOf('zerokun/herdr-runtime.ts')).toBeLessThan(
+      launcher.indexOf('existing_bridge_pid='),
+    )
+    expect(readFileSync(join(import.meta.dir, 'runner-launcher.ts'), 'utf8'))
+      .toContain('requireHerdrRuntime()')
+  })
+
+  test('Herdr runtime pinはdaemon lock勝者だけがshared stateへ公開する', () => {
+    const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
+    const launcher = readFileSync(join(import.meta.dir, 'runner-launcher.ts'), 'utf8')
+    expect(launcher).toContain('ZEROKUN_LAUNCH_HERDR_RUNTIME: encodeHerdrRuntimeIdentity(herdrRuntime)')
+    expect(launcher).not.toContain('writePinnedHerdrRuntime')
+    const decode = runner.indexOf('decodeHerdrRuntimeIdentity(process.env.ZEROKUN_LAUNCH_HERDR_RUNTIME)')
+    const acquire = runner.indexOf('const daemonLease = acquireDaemonLock(')
+    const publish = runner.indexOf('writePinnedHerdrRuntime(dir, launchHerdrRuntime)')
+    expect(decode).toBeGreaterThan(-1)
+    expect(acquire).toBeGreaterThan(decode)
+    expect(publish).toBeGreaterThan(acquire)
   })
 
   test('setup requires Codex and installs every runtime companion', () => {
@@ -80,6 +150,7 @@ describe('Zero-kun Codex wiring', () => {
       'codex-channel',
       'zerokun-update',
       'watchdog.sh',
+      'zerokun_require_herdr_version',
     ]) expect(setup).toContain(expected)
     for (const companion of [
       'update-request.ts',
@@ -96,6 +167,72 @@ describe('Zero-kun Codex wiring', () => {
     expect(setup).not.toContain('claude-skills')
   })
 
+  test('jobごとにAGENTS上限とHerdr Five-Advisor文脈を固定する', () => {
+    const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+    expect(executor).toContain('project_doc_max_bytes=262144')
+    expect(executor).toContain("features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}")
+    expect(executor).toContain("multiAgentEnabled: stage !== 'implementation'")
+    expect(executor).toContain('features.goals=false')
+    expect(executor).toContain('features.browser_use=false')
+    expect(executor).toContain('features.browser_use_external=false')
+    expect(executor).toContain('features.browser_use_full_cdp_access=false')
+    expect(executor).toContain('features.computer_use=false')
+    expect(executor).toContain('features.in_app_browser=false')
+    expect(executor).toContain('readPinnedHerdrRuntime(stateDir)')
+    expect(executor).toContain('await verifyHerdrRuntimeIdentityAsync(herdrRuntime)')
+    expect(executor).toContain('both native advisors')
+    expect(executor).toContain('call advisor_round')
+    expect(executor).toContain('Poll advisor_round_poll')
+    expect(executor).toContain('existing live Claude Code')
+    expect(executor).toContain('assertRequiredAdvisorRounds(')
+    expect(executor).toContain('await assertNativeAdvisorHistory({')
+    expect(executor).toContain("{ phase: 'design', round: 1 }")
+    expect(executor).toContain("{ phase: 'review', round: 1 }")
+    const broker = readFileSync(join(import.meta.dir, 'advisor-broker.ts'), 'utf8')
+    expect(broker.match(/server\.registerTool\(/g)).toHaveLength(2)
+    expect(broker).toContain("server.registerTool('advisor_round'")
+    expect(broker).toContain("server.registerTool('advisor_round_poll'")
+    expect(broker).toContain('version: 3')
+    expect(broker).toContain('nativeAdvisors')
+    expect(broker).toContain('response: z.string().min(1).max(MAX_INPUT_CHARS)')
+    expect(broker).toContain('nativeAdvisorResponseDigest(response)')
+    expect(broker).toContain('attemptNonce')
+    expect(broker).toContain('contextDigest')
+    expect(broker).toContain("runBounded([launcher, '-p']")
+    expect(broker).toContain('stdin: prompt')
+    expect(broker).not.toContain('@ZEROKUN_GROK_PROMPT_FILE')
+    const fifthHelper = readFileSync(join(import.meta.dir, 'fifth-advisor.py'), 'utf8')
+    expect(fifthHelper).toContain('"method": "agent.prompt"')
+    expect(fifthHelper).toContain('client.sendall(prepared.request + b"\\n")')
+    expect(fifthHelper).not.toContain('prepared.command')
+  })
+
+  test('Slack上のsystem文面はZeroちゃん名義で実装名を露出しない', () => {
+    const server = readFileSync(join(root, 'server.ts'), 'utf8')
+    const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
+    const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+    expect(server).toContain('Zeroちゃん')
+    expect(server).toContain('🙌 受け付けました（待ち順')
+    expect(server).not.toContain('Codexで受け付けました')
+    expect(server).not.toContain('Say hi to Codex')
+    expect(server).not.toContain('request ${request.id.slice')
+    expect(server).not.toContain('実行中jobの完了後')
+    expect(runner).toContain('処理が完了しました。')
+    expect(runner).toContain('Zeroちゃんが確認を始めました。')
+    expect(runner).not.toContain(' worker=${job.workerId}')
+    expect(runner).not.toContain('Zeroちゃんの job ${job.id.slice')
+    expect(runner).not.toContain('Codexの処理が完了しました。')
+    expect(executor).toContain('処理は完了しましたが、返答本文を取得できませんでした。')
+    expect(executor).not.toContain('(Codex returned no final text output)')
+  })
+
+  test('Claude /clear confirmationはproductionで無期限、test注入時だけ有限にする', () => {
+    const boundary = readFileSync(join(import.meta.dir, 'claude-queue-boundary.ts'), 'utf8')
+    expect(boundary).toContain('options.clearConfirmationTimeoutMs === undefined')
+    expect(boundary).toContain('while (deadline === null || Date.now() < deadline)')
+    expect(boundary).not.toContain('clearConfirmationTimeoutMs ?? 30_000')
+  })
+
   test('self update follows the main branch and restarts gateway without TUI confirmation', () => {
     const updater = readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')
     expect(updater).toContain("ZEROKUN_UPDATE_BRANCH ?? 'main'")
@@ -110,7 +247,7 @@ describe('Zero-kun Codex wiring', () => {
     expect(server).toContain('isExplicitUpdateRequest(text)')
     expect(server).toContain('await enqueueUpdate(')
     const updateBranch = server.indexOf('isExplicitUpdateRequest(text)')
-    const normalInboundFifo = server.indexOf('jobStore.stageInboundDelivery({', updateBranch)
+    const normalInboundFifo = server.indexOf('const inbound: InboundDeliveryInput = {', updateBranch)
     expect(updateBranch).toBeGreaterThan(-1)
     expect(updateBranch).toBeLessThan(normalInboundFifo)
   })

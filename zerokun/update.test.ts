@@ -35,6 +35,7 @@ import {
   setupTimeoutBudgetMs,
   stageVerifiedCandidateCodex,
   restoreRollbackDatabase,
+  startBotInHerdr,
   startBotInTmux,
   stopLockedProcess,
   waitForStableHealth,
@@ -50,6 +51,7 @@ import {
 } from './process-tree.ts'
 import { signalProcessIfLive } from './process-generation.ts'
 import { resolveOfficialStandaloneCodex } from './standalone-codex.ts'
+import { requireHerdrRuntime, writePinnedHerdrRuntime } from './herdr-runtime.ts'
 
 const directories: string[] = []
 const tmuxSessions: string[] = []
@@ -167,7 +169,8 @@ function updaterFixture() {
   const project = join(base, 'project')
   const setup = join(base, 'setup.sh')
   const setupMarker = join(base, 'setup-ran')
-  mkdirSync(state)
+  mkdirSync(state, { mode: 0o700 })
+  chmodSync(state, 0o700)
   mkdirSync(project)
   writeFileSync(setup, [
     '#!/bin/bash',
@@ -197,13 +200,58 @@ function updaterEnvironment(fixture: ReturnType<typeof updaterFixture>) {
 }
 
 function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, session: string) {
-  return {
+  const herdrSocket = join(fixture.base, `herdr-${Date.now()}.sock`)
+  const socketServer = Bun.spawn([
+    process.execPath,
+    '--no-env-file',
+    '-e',
+    [
+      `const server = Bun.listen({ unix: ${JSON.stringify(herdrSocket)}, socket: { data() {} } })`,
+      "process.on('SIGTERM', () => { server.stop(true); process.exit(0) })",
+      'await Bun.sleep(60_000)',
+    ].join('; '),
+  ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+  for (let attempt = 0; attempt < 100 && !existsSync(herdrSocket); attempt += 1) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+  }
+  if (!existsSync(herdrSocket)) throw new Error('fixture Herdr socket did not start')
+  chmodSync(herdrSocket, 0o600)
+  const socketIdentity = readProcessIdentity(socketServer.pid)
+  if (socketIdentity) serviceIdentities.push(socketIdentity)
+
+  const herdr = join(fixture.base, 'herdr-fixture')
+  writeFileSync(herdr, [
+    '#!/bin/sh',
+    'set -eu',
+    'if [ "$1" = pane ] && [ "$2" = current ] && [ "$3" = --current ]; then',
+    "  printf '%s\\n' '{\"result\":{\"pane\":{\"pane_id\":\"wT:p1\",\"tab_id\":\"wT:t1\",\"terminal_id\":\"term_abcdef012345\",\"workspace_id\":\"wT\"}}}'",
+    '  exit 0',
+    'fi',
+    'if [ "$1" = pane ] && [ "$2" = run ]; then',
+    '  shift 3',
+    '  /usr/bin/nohup "$@" >/dev/null 2>&1 &',
+    '  exit 0',
+    'fi',
+    'exit 64',
+    '',
+  ].join('\n'), { mode: 0o700 })
+
+  const environment = {
     ...updaterEnvironment(fixture),
     ZEROKUN_TMUX_SESSION: session,
     ZEROKUN_HEALTH_CONSECUTIVE: '2',
     ZEROKUN_HEALTH_MAX_CHECKS: '30',
     ZEROKUN_HEALTH_SLEEP_MS: '100',
+    HERDR_ENV: '1',
+    HERDR_BIN_PATH: herdr,
+    HERDR_SOCKET_PATH: herdrSocket,
+    HERDR_PANE_ID: 'wT:p1',
+    HERDR_TAB_ID: 'wT:t1',
+    HERDR_TERMINAL_ID: 'term_abcdef012345',
+    HERDR_WORKSPACE_ID: 'wT',
   }
+  writePinnedHerdrRuntime(fixture.state, requireHerdrRuntime(environment))
+  return environment
 }
 
 function rememberFixtureServices(state: string): void {
@@ -794,6 +842,40 @@ describe('updater helpers', () => {
     }
   })
 
+  test('Zeroちゃんgatewayは検証済みHerdr paneへ再起動できる', async () => {
+    const fixture = updaterFixture()
+    chmodSync(fixture.state, 0o700)
+    const environment = serviceUpdaterEnvironment(fixture, 'unused-fixture-session')
+    const herdrKeys = [
+      'HERDR_ENV', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'HERDR_PANE_ID',
+      'HERDR_TAB_ID', 'HERDR_TERMINAL_ID', 'HERDR_WORKSPACE_ID',
+    ] as const
+    const previous = Object.fromEntries(herdrKeys.map(key => [key, process.env[key]]))
+    for (const key of herdrKeys) process.env[key] = environment[key]
+    try {
+      const started = await startBotInHerdr({
+        rootRepo: fixture.repo.local,
+        stateDir: fixture.state,
+        projectDir: fixture.project,
+        startupTimeoutMs: 3_000,
+      })
+      expect(started.paneId).toBe('wT:p1')
+      expect(started.gatewayPid).toBeGreaterThan(0)
+      const marker = JSON.parse(
+        readFileSync(join(fixture.state, 'herdr-runtime.json'), 'utf8'),
+      ) as { paneId?: unknown; terminalId?: unknown }
+      expect(marker.paneId).toBe('wT:p1')
+      expect(marker.terminalId).toBe('term_abcdef012345')
+      rememberFixtureServices(fixture.state)
+    } finally {
+      for (const key of herdrKeys) {
+        const value = previous[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
   test('同名の無関係tmux sessionを停止せずfail-closedにする', async () => {
     const tmux = Bun.spawnSync(['/usr/bin/which', 'tmux'], { stdout: 'pipe' })
     expect(tmux.exitCode).toBe(0)
@@ -941,7 +1023,7 @@ describe('Codex branch self update', () => {
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
   })
 
-  test('無関係な同名tmux sessionを保持し一意なsessionで更新を完遂する', () => {
+  test('無関係なtmux sessionを保持し、検証済みHerdr paneで更新を完遂する', () => {
     const fixture = updaterFixture()
     const tmux = must(['/usr/bin/which', 'tmux'])
     const session = `zerokun-update-collision-${process.pid}-${Date.now()}`
@@ -964,9 +1046,9 @@ describe('Codex branch self update', () => {
     expect(existsSync(fixture.setupMarker)).toBe(true)
     expect(Bun.spawnSync([tmux, 'has-session', '-t', session]).exitCode).toBe(0)
     expect(() => process.kill(sentinelPid, 0)).not.toThrow()
-    const marker = JSON.parse(readFileSync(join(fixture.state, 'tmux-session.json'), 'utf8'))
-    expect(marker.name).toStartWith(`${session}-`)
-    expect(marker.name).not.toBe(session)
+    const marker = JSON.parse(readFileSync(join(fixture.state, 'herdr-runtime.json'), 'utf8'))
+    expect(marker.paneId).toBe('wT:p1')
+    expect(marker.terminalId).toBe('term_abcdef012345')
   }, 20_000)
 
   test('commit済みjournalをbackupより先に消し、後処理失敗後も復旧を妨げない', () => {
@@ -1333,7 +1415,7 @@ describe('Codex branch self update', () => {
     const result = runUpdater(
       fixture,
       ['--skip-tests', '--no-restart'],
-      { ...updaterEnvironment(fixture), ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '100' },
+      { ...updaterEnvironment(fixture), ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '750' },
     )
     expect(Date.now() - startedAt).toBeLessThan(10_000)
     expect(result.exitCode).not.toBe(0)
@@ -1507,8 +1589,8 @@ describe('Codex branch self update', () => {
         `  touch '${rollbackSetupCompleted}'`,
         '  exit 0',
         'fi',
-        `touch '${setupStarted}'`,
         "trap 'sleep 0.5; exit 143' TERM",
+        `touch '${setupStarted}'`,
         'sleep 30',
         '',
       ].join('\n'),

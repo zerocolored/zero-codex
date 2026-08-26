@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ゼロくん新マシンセットアップ
+# Zeroちゃん新マシンセットアップ
 # 使い方: リポを clone した直後に `bash zerokun/setup.sh` を1回実行するだけ。
 # 既存の設定ファイル(.env / access.json 等)があるマシンでは上書きしない(再実行しても安全)。
 set -euo pipefail
@@ -136,7 +136,36 @@ if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" = "1" ]; then
   fi
 fi
 
-echo "== ゼロくんセットアップ開始 (repo: $REPO_DIR)"
+# Updater-launched setup must prove the inherited state/lock/delegation first.
+# Only after that mutation boundary may a one-release migration install the
+# dedicated read-only reviewer and the non-authenticating Herdr transport
+# helper from this checked-out release. Existing subscription authentication
+# is reused; setup never performs login or API authentication.
+if ! bun --config=/dev/null --no-env-file \
+  "$REPO_DIR/zerokun/install-fifth-advisor.ts" verify; then
+  [ -f "$REPO_DIR/zerokun/install-fifth-advisor.ts" ] \
+    || { echo "❌ fifth-advisor helper installerがありません。offline bootstrapを実行してください。" >&2; exit 1; }
+  echo "   fifth-advisor transport helperをこのrelease用に導入します。" >&2
+  bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/install-fifth-advisor.ts" install \
+    || { echo "❌ fifth-advisor helperを導入できません。Codex版のoffline bootstrapを実行してください。" >&2; exit 1; }
+fi
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-fifth-advisor.ts" verify \
+  || { echo "❌ fifth-advisor helperを確認できません。Codex版のoffline bootstrapを実行してください。" >&2; exit 1; }
+
+if ! bun --config=/dev/null --no-env-file \
+  "$REPO_DIR/zerokun/advisor-prerequisites.ts" verify-grok; then
+  [ -f "$REPO_DIR/zerokun/install-grok-reviewer.ts" ] \
+    || { echo "❌ 専用Grok reviewer installerがありません。offline bootstrapを実行してください。" >&2; exit 1; }
+  echo "   専用Grok reviewerをこのrelease用に導入します。" >&2
+  bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/install-grok-reviewer.ts" install \
+    || { echo "❌ 専用Grok reviewerを導入できません。Codex版のoffline bootstrapを実行してください。" >&2; exit 1; }
+fi
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/advisor-prerequisites.ts" verify-grok \
+  || { echo "❌ 専用Grok reviewerを確認できません。Codex版のoffline bootstrapを実行してください。" >&2; exit 1; }
+
+echo "== Zeroちゃんセットアップ開始 (repo: $REPO_DIR)"
 
 # The update lock is the first mutation boundary. Every setup is already
 # running inside the coordinator's persisted process-group delegate here.
@@ -148,10 +177,11 @@ bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare
   "$CH" "$SETUP_LOCK"
 
 zerokun_require_codex_version "$REPO_DIR" || exit 1
-bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" \
+ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" \
   verify-system-config --inherit-process-group || exit 1
 command -v git >/dev/null 2>&1 || { echo "❌ git がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 command -v tmux >/dev/null 2>&1 || { echo "❌ tmux がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
+zerokun_require_herdr_version || exit 1
 BUN_BIN="$(command -v bun)"
 INSTALL_ENV_ROOT="$(/usr/bin/mktemp -d /tmp/zerokun-bun-install.XXXXXX)" \
   || { echo "❌ dependency install用一時directoryを作成できません" >&2; exit 1; }
@@ -216,7 +246,7 @@ if [ "$VERIFY_SLACK_IDENTITY" = "1" ]; then
 fi
 mkdir -p "$PROJECT_DIR"
 [ "$(cd "$PROJECT_DIR" && pwd -P)" != "$(cd "$REPO_DIR" && pwd -P)" ] \
-  || { echo "❌ Slack作業projectはZero-kun本体と別directoryにしてください" >&2; exit 1; }
+  || { echo "❌ Slack作業projectはZeroちゃん本体と別directoryにしてください" >&2; exit 1; }
 if [ ! -e "$PROJECT_DIR/.git" ]; then
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
     git -c core.hooksPath=/dev/null init --initial-branch=main "$PROJECT_DIR" >/dev/null
@@ -270,8 +300,8 @@ if [ "$LEGACY_CUTOVER_INITIAL" = "1" ]; then
       bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-generation.ts" \
         stop-matching "$legacy_parent" \
         'claude.*dangerously-load-development-channels\s+server:slack-channel' 30000 \
-        || { echo "❌ 旧Claude Zero-kun親processを世代検証付きで停止できません。" >&2; exit 1; }
-      echo "   旧Claude Zero-kun親processを停止しました"
+        || { echo "❌ 旧Claude版Zeroちゃん親processを世代検証付きで停止できません。" >&2; exit 1; }
+      echo "   旧Claude版Zeroちゃん親processを停止しました"
     fi
   done < <(pgrep -f 'claude.*dangerously-load-development-channels.*server:slack-channel' 2>/dev/null || true)
 fi
@@ -397,7 +427,7 @@ ln -sfn "$REPO_DIR/zerokun/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
 ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerokun-access"
 ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"
 ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/codex-channel"
-# Remove only dangling Claude-era links that this same Zero-kun checkout owned.
+# Remove only dangling Claude-era links that this same Zeroちゃん checkout owned.
 remove_owned_legacy_link() {
   local legacy_path="$1" legacy_target="$2"
   if [ -L "$legacy_path" ] && [ "$(readlink "$legacy_path")" = "$legacy_target" ]; then
@@ -434,7 +464,7 @@ fi
     cat <<'EOF'
 
 # >>> zerokun setup >>>
-# Slack からCodexを動かすボット — zerokun/setup.sh が管理
+# SlackからZeroちゃんを動かすボット — zerokun/setup.sh が管理
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 EOF
     printf 'export ZEROKUN_PROJECT_DIR=%q\n' "$PROJECT_DIR"
@@ -445,13 +475,13 @@ alias zerokun='codex-channel "$ZEROKUN_PROJECT_DIR"'
 # 稼働中を止めて入れ替えるかは端末の y/N プロンプトで都度確認する。
 # ZEROKUN_REPLACE=1 は自己更新のワンタイムトークン無しでは停止権限にならない。
 alias zerokun-restart='codex-channel "$ZEROKUN_PROJECT_DIR"'
-alias zerokun-status='pid=$(cat "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/plugin.lock" 2>/dev/null); [ -n "$pid" ] && ps -p "$pid" -o pid=,command= || echo "ゼロくんは停止中"'
+alias zerokun-status='pid=$(cat "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/plugin.lock" 2>/dev/null); [ -n "$pid" ] && ps -p "$pid" -o pid=,command= || echo "Zeroちゃんは停止中"'
 # <<< zerokun setup <<<
 EOF
   } >> "$ZSHRC_TMP"
 mv -f -- "$ZSHRC_TMP" "$ZSHRC"
 ZSHRC_TMP=""
-echo "   .zshrc のゼロくん管理ブロックを更新しました(新しいターミナルで有効)"
+echo "   .zshrc のZeroちゃん管理ブロックを更新しました(新しいターミナルで有効)"
 
 echo ""
 if [ "${ZEROKUN_BOOTSTRAP:-0}" = "1" ]; then
@@ -461,9 +491,9 @@ else
   echo "  1. Slack アプリをこのマシン用に新規作成し(1台=1アプリ=1ボット名)、"
   echo "     トークン2つを $CH/.env に貼る (xoxb- / xapp-。作成手順はリポ直下 README.md)"
   echo "  2. $CH/access.json に許可する Slack ユーザーID/チャンネルIDを入れる"
-  echo "  3. codex login status でログイン済みか確認"
+  echo "  3. codex login status が Logged in using ChatGPT と返すことを確認"
   echo "  4. 必要なら --project-dir でSlack DMの既定作業リポを指定"
-  echo "  5. 新しいターミナルで: zerokun"
+  echo "  5. Herdrの専用paneで: zerokun"
   echo "     queue確認: zerokun-jobs status"
   echo "     Codex版更新: zerokun-update"
   echo "     書込み許可: zerokun-access write allow <SlackユーザーID>"

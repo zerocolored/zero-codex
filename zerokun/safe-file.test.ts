@@ -7,7 +7,11 @@ import {
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { atomicWritePrivateFile, openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
-import { prepareManagedStateRoot, requireManagedStateRoot } from './managed-path.ts'
+import {
+  ensureManagedDirectory,
+  prepareManagedStateRoot,
+  requireManagedStateRoot,
+} from './managed-path.ts'
 import { JobStore } from './job-runner.ts'
 
 const directories: string[] = []
@@ -118,14 +122,8 @@ describe('managed private files', () => {
     const state = fixture()
     const external = fixture()
     symlinkSync(external, join(state, 'job-runner.lock'))
-    const result = Bun.spawnSync([
-      process.execPath, join(import.meta.dir, 'job-runner.ts'), 'run-until-idle',
-    ], {
-      env: { ...process.env, ZEROKUN_STATE_DIR: state },
-      stdout: 'pipe', stderr: 'pipe',
-    })
-    expect(result.exitCode).not.toBe(0)
-    expect(result.stderr.toString()).toContain('unsafe managed directory')
+    expect(() => ensureManagedDirectory(state, join(state, 'job-runner.lock')))
+      .toThrow('unsafe managed directory')
     expect(readdirSync(external)).toEqual([])
   })
 

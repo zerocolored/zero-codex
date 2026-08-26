@@ -317,7 +317,7 @@ export function launchDetachedUpdateWorker(
   const session = options.tmuxSession ?? WORKER_SESSION
   if (!existsSync(workerFile)) throw new Error(`update workerがありません: ${workerFile}`)
   if (!existsSync(updaterPath)) throw new Error(`zerokun-updateがありません: ${updaterPath}`)
-  if (tmuxSessionExists(tmux, session)) throw new Error('別のゼロくん更新workerが実行中です')
+  if (tmuxSessionExists(tmux, session)) throw new Error('別のZeroちゃん更新workerが実行中です')
   const legacyCutover = options.legacyCutover
     ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
   const projectDir = options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
@@ -935,8 +935,8 @@ export async function runUpdateWorker(
       errorText = error instanceof Error ? error.message : String(error)
     }
     const text = success
-      ? `✅ Codex版ゼロくん更新完了（request ${request.id.slice(0, 8)}）\n更新・テスト・setup・再起動が完了しました。\n画面を見る: tmux attach -t ${botSessionName(dir)} （抜けるのは Ctrl-b → d。閉じてもゼロくんは止まりません）`
-      : `❌ ゼロくん更新失敗（request ${request.id.slice(0, 8)}）\n${errorText}\nログ: ${logPath}`
+      ? '✅ Zeroちゃんの更新完了\n更新・テスト・setup・再起動が完了しました。'
+      : '❌ Zeroちゃんの更新失敗\n詳細はこのMacの管理ログを確認してください。'
     outcome = { success, exitCode, text, completedAt: Date.now() }
     persistRequest(dir, { ...request, outcome })
   }

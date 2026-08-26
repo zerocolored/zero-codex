@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Zero-kun for Codex: standalone Slack gateway + persistent SQLite worker.
+# Zeroちゃん: standalone Slack gateway + persistent SQLite worker.
 set -euo pipefail
 
 SOURCE_PATH="${BASH_SOURCE[0]}"
@@ -20,6 +20,7 @@ RUNNER_LAUNCHER="$REPO_DIR/zerokun/runner-launcher.ts"
 JOB_RUNNER_PID="$STATE_DIR/job-runner.lock/pid"
 JOB_RUNNER_RUNTIME="$STATE_DIR/job-runner.lock/runtime"
 JOB_RUNNER_LOG="$STATE_DIR/job-runner.log"
+JOB_RUNNER_STARTER_LOCK="$STATE_DIR/job-runner-starter.lock"
 EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1"
 
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -67,7 +68,19 @@ fi
 # system config検査よりjournal recoveryを必ず先に行う。rollback後の実体をここから検査する。
 . "$REPO_DIR/zerokun/codex-version.sh"
 zerokun_require_codex_version "$REPO_DIR" || exit 1
+zerokun_require_herdr_version || exit 1
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" verify-system-config || exit 1
+HERDR_RUNTIME_ID="$(bun --config=/dev/null --no-env-file \
+  "$REPO_DIR/zerokun/herdr-runtime.ts" runtime-id)" || {
+  echo "❌ ZeroちゃんはHerdr内の専用paneから起動してください。" >&2
+  exit 1
+}
+case "$HERDR_RUNTIME_ID" in
+  ''|*[!0-9a-f]*) echo "❌ Herdr runtime identityが不正です。" >&2; exit 1 ;;
+esac
+[ "${#HERDR_RUNTIME_ID}" -eq 64 ] \
+  || { echo "❌ Herdr runtime identityの長さが不正です。" >&2; exit 1; }
+EXPECTED_RUNNER_RUNTIME="$EXPECTED_RUNNER_RUNTIME:$HERDR_RUNTIME_ID"
 [ -d "$PROJECT" ] || { echo "❌ 作業ディレクトリがありません: $PROJECT" >&2; exit 1; }
 [ -f "$REPO_DIR/server.ts" ] || { echo "❌ server.ts がありません: $REPO_DIR" >&2; exit 1; }
 
@@ -97,7 +110,7 @@ if [ -f "$LOCK_FILE" ]; then
 fi
 
 if [ -n "$existing_bridge_pid" ]; then
-  echo "⚠️  ゼロくんのSlack gatewayは既に起動中です (PID $existing_bridge_pid)。" >&2
+  echo "⚠️  ZeroちゃんのSlack gatewayは既に起動中です (PID $existing_bridge_pid)。" >&2
   do_replace=0
   if [ "$AUTHORIZED_UPDATE_RESTART" = "1" ]; then
     do_replace=1
@@ -115,7 +128,7 @@ if [ -n "$existing_bridge_pid" ]; then
     case "$answer" in [yY]|[yY][eE][sS]) do_replace=1 ;; esac
   fi
   if [ "$do_replace" != "1" ]; then
-    echo "   → 起動を中止しました。既存のゼロくんは無傷です。" >&2
+    echo "   → 起動を中止しました。既存のZeroちゃんは無傷です。" >&2
     exit 1
   fi
   if [ "${ZEROKUN_DRY_RUN:-0}" = "1" ]; then
@@ -159,13 +172,17 @@ start_job_runner() {
     local existing_pid
     existing_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_PID" 2>/dev/null || true)"
     if process_command_is "$existing_pid" 'job-runner\.ts[[:space:]]+daemon'; then
-      # A current Codex runner notices the state App-ID change itself. Give it
-      # one poll window to release its verified lock; never signal an unknown
-      # process merely because its runtime marker differs.
-      for _ in {1..50}; do
-        process_command_is "$existing_pid" 'job-runner\.ts[[:space:]]+daemon' || break
-        sleep 0.1
-      done
+      lock_process_is "$JOB_RUNNER_PID" "$existing_pid" 'job-runner\.ts[[:space:]]+daemon' || {
+        echo "❌ 既存job runnerのgenerationを検証できません。自動停止しません。" >&2
+        exit 1
+      }
+      echo "   Herdr/Slack runtimeが変わったため、既存job runnerを安全に入れ替えます。" >&2
+      bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+        stop-owner-force "$JOB_RUNNER_PID" "$existing_pid" \
+        'job-runner\.ts\s+daemon' 10000 >/dev/null 2>&1 || {
+          echo "❌ 既存job runnerを同一generationのまま停止できません。" >&2
+          exit 1
+        }
     fi
     if process_command_is "$existing_pid" 'job-runner\.ts[[:space:]]+daemon'; then
       echo "❌ 旧版または不明なjob runnerが稼働中です (PID $existing_pid)。" >&2
@@ -182,15 +199,19 @@ start_job_runner() {
     echo "❌ runner launcherが未導入です。bash zerokun/setup.sh を再実行してください。" >&2
     exit 1
   }
-  local starter_pid
-  starter_pid="$(bun --config=/dev/null --no-env-file \
-    "$RUNNER_LAUNCHER" "$JOB_RUNNER" "$STATE_DIR" "$JOB_RUNNER_LOG")" \
-    || { echo "❌ Codex job runnerの分離起動に失敗しました。" >&2; exit 1; }
-  case "$starter_pid" in ''|*[!0-9]*)
-    echo "❌ runner launcherが不正なPIDを返しました。" >&2
-    exit 1
+  local starter_pid startup_attempts
+  startup_attempts="${ZEROKUN_RUNNER_STARTUP_ATTEMPTS:-300}"
+  case "$startup_attempts" in
+    ''|*[!0-9]*) echo "❌ ZEROKUN_RUNNER_STARTUP_ATTEMPTSが不正です。" >&2; exit 1 ;;
   esac
-  for _ in {1..50}; do
+  [ "$startup_attempts" -ge 1 ] && [ "$startup_attempts" -le 600 ] \
+    || { echo "❌ ZEROKUN_RUNNER_STARTUP_ATTEMPTSは1〜600で指定してください。" >&2; exit 1; }
+  bun --config=/dev/null --no-env-file \
+    "$RUNNER_LAUNCHER" "$JOB_RUNNER" "$STATE_DIR" "$JOB_RUNNER_LOG" \
+    "$JOB_RUNNER_STARTER_LOCK" \
+    >/dev/null &
+  starter_pid=$!
+  for ((attempt = 0; attempt < startup_attempts; attempt += 1)); do
     if job_runner_is_alive; then
       echo "   job-runner: started (PID $(tr -d '[:space:]' < "$JOB_RUNNER_PID"), FIFO=1)"
       return
@@ -198,6 +219,23 @@ start_job_runner() {
     kill -0 "$starter_pid" 2>/dev/null || break
     sleep 0.1
   done
+  if lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$starter_pid" 'runner-launcher\.ts'; then
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+      stop-owner-force "$JOB_RUNNER_STARTER_LOCK" "$starter_pid" \
+      'runner-launcher\.ts' 5000 >/dev/null 2>&1 || {
+        echo "❌ 起動失敗後のrunner launcherを安全に停止できません。次の起動は行いません。" >&2
+        exit 1
+      }
+  fi
+  for _ in {1..50}; do
+    lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$starter_pid" 'runner-launcher\.ts' || break
+    sleep 0.1
+  done
+  if lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$starter_pid" 'runner-launcher\.ts' \
+     || job_runner_is_alive; then
+    echo "❌ 起動失敗generationの停止を確認できません。次の起動は行いません。" >&2
+    exit 1
+  fi
   echo "❌ Codex job runnerの起動に失敗しました: $JOB_RUNNER_LOG" >&2
   exit 1
 }
@@ -208,11 +246,12 @@ if [ -n "${ZEROKUN_REPLACE_TOKEN:-}" ] && [ -s "$REPLACE_TOKEN_FILE" ] \
   rm -f "$REPLACE_TOKEN_FILE"
 fi
 cd "$PROJECT"
-echo "▶ Zero-kun for Codex"
+echo "▶ Zeroちゃん"
 echo "   gateway : $REPO_DIR/server.ts"
 echo "   project : $PROJECT"
 echo "   state   : $STATE_DIR"
-echo "   sandbox : HOME/state deny + job専用permission profile（writeAllowFromのみrepo/.git write + network）"
+echo "   runtime : verified Herdr pane + job単位のCodex"
+echo "   trust   : read/writeともrepository sandbox / advisorは固定broker"
 echo "   caffeinate: ON (Ctrl-Cでgatewayを停止)"
 
 exec caffeinate -dimsu bun --config=/dev/null --no-env-file "$REPO_DIR/server.ts"

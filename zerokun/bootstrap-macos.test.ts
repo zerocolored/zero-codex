@@ -15,6 +15,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { installGrokReviewer } from './install-grok-reviewer.ts'
 
 const root = join(import.meta.dir, '..')
 const bootstrap = join(import.meta.dir, 'bootstrap-macos.sh')
@@ -24,7 +25,17 @@ function setupTestPath(fakeHome: string, botAppId?: string): string {
   const localBin = join(fakeHome, '.local', 'bin')
   mkdirSync(fakeBin, { recursive: true })
   mkdirSync(localBin, { recursive: true })
-  writeFileSync(join(localBin, 'codex'), '#!/bin/bash\necho "codex-cli 0.149.1"\n', {
+  setupDoctorGrok(fakeHome)
+  installGrokReviewer(fakeHome)
+  writeFileSync(join(localBin, 'codex'), [
+    '#!/bin/bash',
+    'if [ "${1:-}" = login ] && [ "${2:-}" = status ]; then',
+    '  echo "Logged in using ChatGPT"',
+    '  exit 0',
+    'fi',
+    'echo "codex-cli 0.149.1"',
+    '',
+  ].join('\n'), {
     mode: 0o700,
   })
   const configuredAppId = join(fakeHome, '.zerokun-test-bot-app-id')
@@ -60,6 +71,47 @@ function setupTestPath(fakeHome: string, botAppId?: string): string {
     '',
   ].join('\n'), { mode: 0o700 })
   return `${fakeBin}:${process.env.PATH ?? '/usr/bin:/bin'}`
+}
+
+function setupDoctorGrok(fakeHome: string): void {
+  const grokRoot = join(fakeHome, '.grok')
+  const grokBin = join(grokRoot, 'bin')
+  mkdirSync(grokBin, { recursive: true, mode: 0o700 })
+  chmodSync(grokRoot, 0o700)
+  chmodSync(grokBin, 0o700)
+  const source = join(fakeHome, 'fixture-grok.c')
+  const executable = join(grokBin, 'grok-1.0.0')
+  writeFileSync(source, '#include <stdio.h>\nint main(void) { puts("grok 1.0.0"); return 0; }\n', {
+    mode: 0o600,
+  })
+  const compiled = Bun.spawnSync(['/usr/bin/cc', '-Os', '-o', executable, source], {
+    stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+  })
+  if (compiled.exitCode !== 0) throw new Error(compiled.stderr.toString())
+  rmSync(source, { force: true })
+  chmodSync(executable, 0o700)
+  symlinkSync('grok-1.0.0', join(grokBin, 'grok'))
+  writeFileSync(join(grokRoot, 'auth.json'), '{"fixture":true}\n', { mode: 0o600 })
+
+  const reviewerRoot = join(fakeHome, '.grok-reviewer')
+  const reviewerBin = join(reviewerRoot, 'bin')
+  mkdirSync(reviewerBin, { recursive: true, mode: 0o700 })
+  chmodSync(reviewerRoot, 0o700)
+  chmodSync(reviewerBin, 0o700)
+  writeFileSync(join(reviewerBin, 'grok'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+  writeFileSync(join(reviewerBin, 'reviewer-runtime.py'), '#!/usr/bin/python3\n', { mode: 0o700 })
+  writeFileSync(join(reviewerRoot, 'config.toml'), 'fixture = true\n', { mode: 0o600 })
+  writeFileSync(join(reviewerRoot, 'sandbox.toml'), 'fixture = true\n', { mode: 0o600 })
+  writeFileSync(join(reviewerRoot, 'requirements.toml'), [
+    '[grok_com_config]',
+    'disable_api_key_auth = true',
+    '',
+  ].join('\n'), { mode: 0o600 })
+}
+
+function treeSnapshot(root: string): string {
+  return Bun.spawnSync(['/usr/bin/find', root, '-mindepth', '1', '-print'])
+    .stdout.toString().split('\n').filter(Boolean).sort().join('\n')
 }
 
 function localRemoteGitTestPath(base: string, bare: string): string {
@@ -132,10 +184,107 @@ describe('macOS bootstrap', () => {
     expect(result.stdout.toString()).toContain('--slack-only')
   })
 
+  test('fresh既定workspaceはAGENTS.md初期commit付きで作成する', () => {
+    if (process.platform !== 'darwin') return
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-workspace-'))
+    const project = join(dir, 'workspace')
+    try {
+      const command = [
+        'bootstrap_path="$1"',
+        'repo="$2"',
+        'project="$3"',
+        'set --',
+        'source "$bootstrap_path"',
+        'REPO_DIR="$repo"',
+        'PROJECT_DIR="$project"',
+        'ensure_project_workspace',
+      ].join('; ')
+      const result = Bun.spawnSync([
+        '/bin/bash', '-c', command, 'bash', bootstrap, root, project,
+      ], { stdout: 'pipe', stderr: 'pipe' })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(readFileSync(join(project, 'AGENTS.md'), 'utf8')).toContain('Zeroちゃん workspace')
+      expect(Bun.spawnSync(['git', '-C', project, 'status', '--porcelain']).stdout.toString()).toBe('')
+      expect(Bun.spawnSync(['git', '-C', project, 'log', '-1', '--format=%s']).stdout.toString().trim())
+        .toBe('chore: initialize Zeroちゃん workspace instructions')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('既存commit済みprojectにAGENTS.mdがなければ黙って変更せず停止する', () => {
+    if (process.platform !== 'darwin') return
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-existing-project-'))
+    const project = join(dir, 'workspace')
+    try {
+      Bun.spawnSync(['git', 'init', '--initial-branch=main', project])
+      writeFileSync(join(project, 'README.md'), 'existing\n')
+      Bun.spawnSync(['git', '-C', project, 'add', 'README.md'])
+      Bun.spawnSync([
+        'git', '-C', project, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+        'commit', '-m', 'existing project',
+      ])
+      const before = Bun.spawnSync(['git', '-C', project, 'rev-parse', 'HEAD']).stdout.toString()
+      const command = [
+        'bootstrap_path="$1"',
+        'repo="$2"',
+        'project="$3"',
+        'set --',
+        'source "$bootstrap_path"',
+        'REPO_DIR="$repo"',
+        'PROJECT_DIR="$project"',
+        'ensure_project_workspace',
+      ].join('; ')
+      const result = Bun.spawnSync([
+        '/bin/bash', '-c', command, 'bash', bootstrap, root, project,
+      ], { stdout: 'pipe', stderr: 'pipe' })
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr.toString()).toContain('既存projectにAGENTS.mdがありません')
+      expect(existsSync(join(project, 'AGENTS.md'))).toBe(false)
+      expect(Bun.spawnSync(['git', '-C', project, 'rev-parse', 'HEAD']).stdout.toString()).toBe(before)
+      expect(Bun.spawnSync(['git', '-C', project, 'status', '--porcelain']).stdout.toString()).toBe('')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('既存の非Git・非空projectはgit initより前に停止して内容を変更しない', () => {
+    if (process.platform !== 'darwin') return
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-nongit-project-'))
+    const project = join(dir, 'workspace')
+    mkdirSync(project)
+    writeFileSync(join(project, 'existing.txt'), 'preserve\n')
+    try {
+      const before = treeSnapshot(project)
+      const command = [
+        'bootstrap_path="$1"',
+        'repo="$2"',
+        'project="$3"',
+        'set --',
+        'source "$bootstrap_path"',
+        'REPO_DIR="$repo"',
+        'PROJECT_DIR="$project"',
+        'ensure_project_workspace',
+      ].join('; ')
+      const result = Bun.spawnSync([
+        '/bin/bash', '-c', command, 'bash', bootstrap, root, project,
+      ], { stdout: 'pipe', stderr: 'pipe' })
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr.toString()).toContain('未初期化projectに既存file')
+      expect(existsSync(join(project, '.git'))).toBe(false)
+      expect(readFileSync(join(project, 'existing.txt'), 'utf8')).toBe('preserve\n')
+      expect(treeSnapshot(project)).toBe(before)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test('--doctor reports installed tool versions without changing HOME', () => {
     if (process.platform !== 'darwin') return
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-doctor-'))
     try {
+      setupDoctorGrok(fakeHome)
+      const before = treeSnapshot(fakeHome)
       const result = Bun.spawnSync([bootstrap, '--doctor'], {
         env: { ...process.env, HOME: fakeHome },
         stdout: 'pipe',
@@ -144,7 +293,7 @@ describe('macOS bootstrap', () => {
       expect(result.exitCode, result.stderr.toString()).toBe(0)
       expect(result.stdout.toString()).toContain('Command Line Tools:')
       expect(result.stdout.toString()).toContain('Codex CLI:')
-      expect(Bun.spawnSync(['/bin/ls', '-A', fakeHome]).stdout.toString()).toBe('')
+      expect(treeSnapshot(fakeHome)).toBe(before)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
@@ -202,7 +351,9 @@ describe('macOS bootstrap', () => {
     const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-tmpdirbin-'))
     const report = join(fakeBin, 'report.txt')
     try {
+      setupDoctorGrok(fakeHome)
       writeFileSync(join(fakeBin, 'codex'), codexHomeProbe(report), { mode: 0o755 })
+      const before = treeSnapshot(fakeHome)
       const result = Bun.spawnSync([bootstrap, '--doctor'], {
         env: {
           ...process.env,
@@ -218,13 +369,7 @@ describe('macOS bootstrap', () => {
       // TMPDIRがHOME配下を指していても、退避先はHOMEの外へ逃がす。
       expectOutsideHome(seen[0], fakeHome)
       expect(seen).toContain('dir=yes')
-      // HOME配下に存在してよいのは、このテストが用意した .tmp だけ。
-      const entries = Bun.spawnSync(['/usr/bin/find', fakeHome, '-mindepth', '1'])
-        .stdout.toString()
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-      expect(entries).toEqual([insideHome])
+      expect(treeSnapshot(fakeHome)).toBe(before)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
       rmSync(fakeBin, { recursive: true, force: true })
@@ -235,6 +380,8 @@ describe('macOS bootstrap', () => {
     if (process.platform !== 'darwin') return
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-fallback-'))
     try {
+      setupDoctorGrok(fakeHome)
+      const before = treeSnapshot(fakeHome)
       const result = Bun.spawnSync([bootstrap, '--doctor'], {
         env: { ...process.env, HOME: fakeHome, TMPDIR: '/nonexistent/zerokun-doctor' },
         stdout: 'pipe',
@@ -242,7 +389,7 @@ describe('macOS bootstrap', () => {
       })
       expect(result.exitCode).toBe(0)
       expect(result.stdout.toString()).toContain('Codex CLI:')
-      expect(Bun.spawnSync(['/bin/ls', '-A', fakeHome]).stdout.toString()).toBe('')
+      expect(treeSnapshot(fakeHome)).toBe(before)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
@@ -253,6 +400,7 @@ describe('macOS bootstrap', () => {
     const scratchParent = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-scratch-'))
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-home-'))
     try {
+      setupDoctorGrok(fakeHome)
       const result = Bun.spawnSync([bootstrap, '--doctor'], {
         env: { ...process.env, HOME: fakeHome, TMPDIR: scratchParent },
         stdout: 'pipe',
@@ -272,7 +420,9 @@ describe('macOS bootstrap', () => {
     const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-codexbin-'))
     const report = join(fakeBin, 'report.txt')
     try {
+      setupDoctorGrok(fakeHome)
       writeFileSync(join(fakeBin, 'codex'), codexHomeProbe(report), { mode: 0o755 })
+      const before = treeSnapshot(fakeHome)
       const result = Bun.spawnSync([bootstrap, '--doctor'], {
         env: { ...process.env, HOME: fakeHome, PATH: `${fakeBin}:${process.env.PATH}` },
         stdout: 'pipe',
@@ -283,7 +433,7 @@ describe('macOS bootstrap', () => {
       // 実在するディレクトリを渡す。存在しないパスだとcodex側の寛容さ頼みになる。
       expect(seen).toContain('dir=yes')
       expectOutsideHome(seen[0], fakeHome)
-      expect(Bun.spawnSync(['/bin/ls', '-A', fakeHome]).stdout.toString()).toBe('')
+      expect(treeSnapshot(fakeHome)).toBe(before)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
       rmSync(fakeBin, { recursive: true, force: true })
@@ -295,6 +445,8 @@ describe('macOS bootstrap', () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-broken-'))
     const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-brokenbin-'))
     try {
+      setupDoctorGrok(fakeHome)
+      const before = treeSnapshot(fakeHome)
       writeFileSync(join(fakeBin, 'codex'), '#!/bin/sh\necho "boom" >&2\nexit 3\n', { mode: 0o755 })
       const result = Bun.spawnSync([bootstrap, '--doctor'], {
         env: { ...process.env, HOME: fakeHome, PATH: `${fakeBin}:${process.env.PATH}` },
@@ -303,12 +455,109 @@ describe('macOS bootstrap', () => {
       })
       expect(result.exitCode).toBe(1)
       expect(result.stdout.toString()).toContain('実行失敗')
-      expect(Bun.spawnSync(['/bin/ls', '-A', fakeHome]).stdout.toString()).toBe('')
+      expect(treeSnapshot(fakeHome)).toBe(before)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
       rmSync(fakeBin, { recursive: true, force: true })
     }
   })
+
+  test('--doctorはHerdrの最低versionと必須tab/pane APIを検査する', () => {
+    if (process.platform !== 'darwin') return
+    for (const fixture of [
+      {
+        name: 'old-version',
+        script: '#!/bin/sh\n[ "${1:-}" != "--version" ] || { echo "herdr 0.8.1"; exit 0; }\necho "--current --workspace --cwd --label --no-focus --match --source --lines --timeout --pane --wait --until --timeout Usage: herdr workspace list Usage: herdr pane run Usage: herdr tab close Usage: herdr agent list Usage: herdr agent get"\n',
+      },
+      {
+        name: 'missing-api',
+        script: '#!/bin/sh\n[ "${1:-}" != "--version" ] || { echo "herdr 0.8.2"; exit 0; }\necho "unsupported"\n',
+      },
+      {
+        name: 'missing-agent-until',
+        script: '#!/bin/sh\n[ "${1:-}" != "--version" ] || { echo "herdr 0.8.2"; exit 0; }\necho "--current --workspace --cwd --label --no-focus --match --source --lines --timeout --pane --wait --timeout Usage: herdr workspace list Usage: herdr pane run Usage: herdr tab close Usage: herdr agent list Usage: herdr agent get"\n',
+      },
+    ]) {
+      const fakeHome = mkdtempSync(join(tmpdir(), `zerokun-bootstrap-herdr-${fixture.name}-`))
+      const fakeBin = mkdtempSync(join(tmpdir(), `zerokun-bootstrap-herdr-bin-${fixture.name}-`))
+      try {
+        setupDoctorGrok(fakeHome)
+        writeFileSync(join(fakeBin, 'herdr'), fixture.script, { mode: 0o755 })
+        const result = Bun.spawnSync([bootstrap, '--doctor'], {
+          env: {
+            ...process.env,
+            HOME: fakeHome,
+            PATH: `${fakeBin}:${process.env.PATH}`,
+            HERDR_BIN_PATH: join(fakeBin, 'herdr'),
+          },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        })
+        expect(result.exitCode).toBe(1)
+        expect(result.stdout.toString()).toContain('0.8.2以上とtab/pane APIが必要')
+      } finally {
+        rmSync(fakeHome, { recursive: true, force: true })
+        rmSync(fakeBin, { recursive: true, force: true })
+      }
+    }
+  })
+
+  test('--doctorはPATH上の互換Herdrより明示HERDR_BIN_PATHを正本にする', () => {
+    if (process.platform !== 'darwin') return
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-herdr-pin-'))
+    const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-herdr-pin-bin-'))
+    const explicit = join(fakeHome, 'explicit-old-herdr')
+    const capabilities = '--current --workspace --cwd --label --no-focus --match --source --lines --timeout --pane --wait --until --timeout Usage: herdr workspace list Usage: herdr pane run Usage: herdr tab close Usage: herdr agent list Usage: herdr agent get'
+    try {
+      setupDoctorGrok(fakeHome)
+      writeFileSync(join(fakeBin, 'herdr'), `#!/bin/sh\n[ "\${1:-}" != "--version" ] || { echo "herdr 0.8.2"; exit 0; }\necho ${JSON.stringify(capabilities)}\n`, { mode: 0o755 })
+      writeFileSync(explicit, '#!/bin/sh\necho "herdr 0.8.1"\n', { mode: 0o755 })
+      const result = Bun.spawnSync([bootstrap, '--doctor'], {
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          PATH: `${fakeBin}:${process.env.PATH}`,
+          HERDR_BIN_PATH: explicit,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(1)
+      expect(result.stdout.toString()).toContain('herdr 0.8.1')
+      expect(result.stdout.toString()).toContain('0.8.2以上とtab/pane APIが必要')
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeBin, { recursive: true, force: true })
+    }
+  })
+
+  test('--doctorは停止した明示Herdr probeを期限付きで拒否する', () => {
+    if (process.platform !== 'darwin') return
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-herdr-hang-'))
+    const fakeBin = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-herdr-hang-bin-'))
+    try {
+      setupDoctorGrok(fakeHome)
+      const herdr = join(fakeBin, 'herdr')
+      writeFileSync(herdr, '#!/bin/sh\nexec /bin/sleep 30\n', { mode: 0o755 })
+      const startedAt = Date.now()
+      const result = Bun.spawnSync([bootstrap, '--doctor'], {
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          PATH: `${fakeBin}:${process.env.PATH}`,
+          HERDR_BIN_PATH: herdr,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(1)
+      expect(Date.now() - startedAt).toBeLessThan(8_000)
+      expect(result.stdout.toString()).toContain('未導入または実行失敗')
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeBin, { recursive: true, force: true })
+    }
+  }, 10_000)
 
   test('--doctor refuses a scratch parent that other local users can write to', () => {
     if (process.platform !== 'darwin') return
@@ -317,6 +566,7 @@ describe('macOS bootstrap', () => {
     const sharedTmp = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-shared-'))
     const report = join(fakeBin, 'report.txt')
     try {
+      setupDoctorGrok(fakeHome)
       // 自分の持ち物でも、他人が書けてstickyでない場所は退避先に使わない。
       // mktempが作った直後にエントリごと差し替えられる余地があるため。
       chmodSync(sharedTmp, 0o777)
@@ -377,6 +627,7 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('xcode-select --install')
     expect(script).toContain('Homebrew/install/HEAD/install.sh')
     expect(script).toContain('isolated_network_command "$(command -v brew)" install tmux')
+    expect(script).toContain('isolated_network_command "$(command -v brew)" install herdr')
     expect(script).not.toContain('install --cask codex')
     expect(script).toContain('standalone_codex="$HOME/.local/bin/codex"')
     expect(script).toContain('secure_standalone_codex()')
@@ -385,8 +636,15 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('expected_header = b"\\xcf\\xfa\\xed\\xfe')
     expect(script).toContain('expected_keys = {"layoutVersion"')
     expect(script).toContain('https://chatgpt.com/codex/install.sh')
+    expect(script).toContain('https://x.ai/cli/install.sh')
     expect(script).not.toContain('claude auth login')
-    expect(script).toContain('"$standalone_codex" login')
+    expect(script).toContain('"$standalone_codex" login status')
+    expect(script).toContain('Logged in using ChatGPT')
+    expect(script).toContain('API key認証は使用しません')
+    expect(script).not.toContain('"$grok_executable" login')
+    expect(script).toContain('Zeroちゃんは認証操作を行いません')
+    expect(script).toContain('install-grok-reviewer.ts')
+    expect(script).toContain('install-fifth-advisor.ts')
     expect(script).not.toContain('gh auth login')
     expect(script).toContain('zerocolored/zero-codex')
     expect(script).toContain('ensure_repo zerocolored/zero-codex "$REPO_DIR" main')
@@ -404,15 +662,63 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('xoxb-[A-Za-z0-9._-]{10,}')
     expect(script).toContain('xapp-[A-Za-z0-9._-]{10,}')
     const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
+    expect(setup.indexOf('delegate-active "$SETUP_LOCK/pid" "$$"'))
+      .toBeLessThan(setup.indexOf('install-fifth-advisor.ts" verify'))
+    expect(script.indexOf('install_repositories'))
+      .toBeLessThan(script.indexOf('install-fifth-advisor.ts" install'))
     expect(setup.indexOf('RUNNER_PID="$(read_lock_pid'))
       .toBeLessThan(setup.indexOf('GATEWAY_PID="$(read_lock_pid'))
+  })
+
+  test('bootstrap login preflightはAPI key認証を拒否しChatGPT subscriptionだけを受け入れる', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-login-kind-'))
+    const fakeCodex = join(dir, 'codex')
+    try {
+      writeFileSync(fakeCodex, [
+        '#!/bin/sh',
+        'if [ "${LOGIN_KIND:-}" = chatgpt ]; then',
+        '  echo "Logged in using ChatGPT"',
+        'else',
+        '  echo "Logged in using an API key"',
+        'fi',
+        '',
+      ].join('\n'), { mode: 0o700 })
+      const command = [
+        'bootstrap_path="$1"',
+        'fake_codex="$2"',
+        'set --',
+        'source "$bootstrap_path"',
+        'secure_standalone_codex() { printf "%s\\n" "$fake_codex"; }',
+        'grok_build_executable() { return 0; }',
+        'grok_auth_ready() { return 0; }',
+        'verify_logins',
+      ].join('; ')
+      const api = Bun.spawnSync([
+        '/bin/bash', '-c', command, 'bash', bootstrap, fakeCodex,
+      ], {
+        env: { ...process.env, LOGIN_KIND: 'api-key' },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(api.exitCode).not.toBe(0)
+      expect(api.stderr.toString()).toContain('API key認証は使用しません')
+      const subscription = Bun.spawnSync([
+        '/bin/bash', '-c', command, 'bash', bootstrap, fakeCodex,
+      ], {
+        env: { ...process.env, LOGIN_KIND: 'chatgpt' },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(subscription.exitCode).toBe(0)
+      expect(subscription.stdout.toString()).toContain('Codex / Grok CLIは事前ログイン済みです')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test('Homebrew版が存在してもowner-onlyなCodex公式standaloneを配置する', () => {
     const source = readFileSync(bootstrap, 'utf8')
     const functions = source.slice(
       source.indexOf('secure_download()'),
-      source.indexOf('ensure_logins()'),
+      source.indexOf('verify_logins()'),
     )
     const base = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-codex-fallback-'))
     const fakeHome = join(base, 'home')
@@ -421,6 +727,16 @@ describe('macOS bootstrap', () => {
     mkdirSync(fakeBin)
     writeFileSync(join(fakeBin, 'codex'), '#!/bin/sh\necho "codex-cli 0.147.0"\n', { mode: 0o755 })
     writeFileSync(join(fakeBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    writeFileSync(join(fakeBin, 'herdr'), [
+      '#!/bin/sh',
+      'if [ "${1:-}" = "--version" ]; then echo "herdr 0.8.2"; exit 0; fi',
+      "echo 'Usage: herdr workspace list'",
+      "echo 'Usage: herdr pane run'",
+      "echo 'Usage: herdr tab close'",
+      "echo '--current --no-focus --workspace --cwd --label --match --source --lines --timeout --until --wait --pane'",
+      "echo 'Usage: herdr agent list Usage: herdr agent get'",
+      '',
+    ].join('\n'), { mode: 0o755 })
     writeFileSync(join(fakeBin, 'bun'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     writeFileSync(join(fakeBin, 'brew'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     const installerSource = join(base, 'official-installer.sh')
@@ -441,6 +757,7 @@ done
     writeFileSync(harness, `#!/bin/bash
 set -euo pipefail
 MIN_CODEX_VERSION=0.149.0
+MIN_HERDR_VERSION=0.8.2
 section() { :; }
 ok() { :; }
 warn() { :; }
@@ -459,8 +776,11 @@ version_at_least() {
   done
   return 0
 }
+herdr_compatible() { return 0; }
 ${functions.replaceAll('/usr/bin/curl', fakeCurl)}
 secure_standalone_codex() { [ -x "$HOME/.local/bin/codex" ]; }
+grok_build_executable() { printf '%s\\n' "$HOME/.grok/bin/grok"; }
+install_grok_build() { :; }
 install_cli_tools
 codex --version
 `)
@@ -1006,8 +1326,9 @@ codex --version
       'install_clt() { calls="$calls install_clt"; }',
       'install_homebrew() { calls="$calls install_homebrew"; }',
       'install_cli_tools() { calls="$calls install_cli_tools"; }',
-      'ensure_logins() { calls="$calls ensure_logins"; }',
+      'verify_logins() { calls="$calls verify_logins"; }',
       'install_repositories() { calls="$calls install_repositories"; }',
+      'install_grok_reviewer() { calls="$calls install_grok_reviewer"; }',
       'ensure_project_workspace() { calls="$calls ensure_project_workspace"; }',
       'run_setup() { calls="$calls run_setup"; }',
       'run_doctor() { calls="$calls run_doctor"; }',
@@ -1024,6 +1345,7 @@ codex --version
     const output = result.stdout.toString()
     expect(result.exitCode).toBe(0)
     expect(output).toContain('Codexを利用できます')
+    expect(output).toContain('install_repositories install_grok_reviewer ensure_project_workspace')
     expect(output).toContain('run_setup run_doctor')
     expect(output).not.toContain('CALLS: configure_slack')
     expect(output.split('CALLS:')[1]).not.toContain('configure_slack')
@@ -1039,8 +1361,9 @@ codex --version
       'install_clt() { calls="$calls install_clt"; }',
       'install_homebrew() { calls="$calls install_homebrew"; }',
       'install_cli_tools() { calls="$calls install_cli_tools"; }',
-      'ensure_logins() { calls="$calls ensure_logins"; }',
+      'verify_logins() { calls="$calls verify_logins"; }',
       'install_repositories() { calls="$calls install_repositories"; }',
+      'install_grok_reviewer() { calls="$calls install_grok_reviewer"; }',
       'ensure_project_workspace() { calls="$calls ensure_project_workspace"; }',
       'run_setup() { calls="$calls run_setup"; }',
       'run_doctor() { calls="$calls run_doctor"; }',
@@ -1055,7 +1378,7 @@ codex --version
     })
     const calls = result.stdout.toString().split('CALLS:')[1]
     expect(result.exitCode).toBe(0)
-    expect(calls).toContain('require_macos configure_slack')
+    expect(calls).toContain('require_macos install_grok_reviewer configure_slack')
     expect(calls).not.toContain('install_clt')
     expect(calls).toContain('configure_slack run_setup')
   })
@@ -1088,8 +1411,9 @@ codex --version
       'socket_mode_enabled: true',
       'messages_tab_enabled: true',
       'messages_tab_read_only_enabled: false',
-      'name: Zero-kun Custom',
-      'display_name: zerokun-custom',
+      'name: Zeroちゃん',
+      'display_name: zerochan',
+      'display_name: zerochan',
       '- app_mention',
       '- member_joined_channel',
       '- message.im',
@@ -1155,7 +1479,7 @@ codex --version
     expect(launcher).toContain('${ZEROKUN_PROJECT_DIR:-$REPO_DIR}')
     expect(launcher).not.toContain('/Users/zerocolored-macpro-suetsugu')
     expect(setup).toContain('${ZEROKUN_PROJECT_DIR:-$(dirname "$REPO_DIR")/zerokun-workspace}')
-    expect(setup).toContain('Slack作業projectはZero-kun本体と別directoryにしてください')
+    expect(setup).toContain('Slack作業projectはZeroちゃん本体と別directoryにしてください')
     expect(setup).toContain('/usr/bin/env -i')
     expect(setup).toContain('BUN_INSTALL_CACHE_DIR="$INSTALL_ENV_ROOT/bun-cache"')
     expect(readFileSync(bootstrap, 'utf8')).not.toContain('BellSalesAI')

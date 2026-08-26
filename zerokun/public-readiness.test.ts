@@ -17,6 +17,7 @@ import {
   writeGatewayReadiness,
 } from './readiness.ts'
 import {
+  completeSlackSideEffect,
   DEFAULT_SLACK_HTTP_TIMEOUT_MS,
   openDirectSlackDownload,
   postDirectSlackApi,
@@ -25,8 +26,98 @@ import {
   withSlackDeadline,
 } from './slack-http.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
+import { takeSlackTokensFromEnvironment } from './child-environment.ts'
 
 describe('public Codex defaults', () => {
+  test('公開手順はApp Server・live control・20 job session・無期限実行と一致する', () => {
+    const rootReadme = readFileSync(join(import.meta.dir, '..', 'README.md'), 'utf8')
+    const runtimeReadme = readFileSync(join(import.meta.dir, 'README.md'), 'utf8')
+    const broker = readFileSync(join(import.meta.dir, 'advisor-broker.ts'), 'utf8')
+    const claudeBoundary = readFileSync(join(import.meta.dir, 'claude-queue-boundary.ts'), 'utf8')
+    for (const guide of [rootReadme, runtimeReadme]) {
+      expect(guide).toContain('codex app-server --stdio')
+      expect(guide).toContain('turn/steer')
+      expect(guide).toContain('turn/interrupt')
+      expect(guide).toContain('20 job')
+      expect(guide).toContain('sender')
+      expect(guide).toContain('willRetry: true')
+    }
+    expect(rootReadme).toContain('job本体に最長時間は設けません')
+    expect(runtimeReadme).toContain('job本体に終了時間制限はありません')
+    expect(rootReadme).not.toContain('job本体はapp-serverで実行しません')
+    expect(runtimeReadme).not.toContain('read-only jobは合計5回の実行まで再開')
+    expect(broker).not.toContain('GROK_TIMEOUT_MS')
+    expect(broker).not.toContain('CLAUDE_TIMEOUT_MS')
+    expect(claudeBoundary).toContain('options.settleTimeoutMs === undefined')
+  })
+
+  test('公開CIはGrok認証を要求せずCodex設定だけを実機検証する', () => {
+    const workflow = readFileSync(join(import.meta.dir, '..', '.github/workflows/codex.yml'), 'utf8')
+    const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+    expect(workflow).toContain('codex-executor.ts verify-codex-config')
+    expect(workflow).not.toContain('codex-executor.ts verify-system-config')
+    expect(executor).toContain("command === 'verify-codex-config'")
+    expect(executor).toContain('resolveDedicatedGrokLauncher()\n  await verifyCodexConfig')
+  })
+
+  test('認証済みlive検証も本番と同じMCP隔離結果だけでApp Serverを起動する', () => {
+    const liveCheck = readFileSync(join(import.meta.dir, 'live-codex-permission-check.ts'), 'utf8')
+    const build = liveCheck.indexOf('const baseOverrides = buildCodexPermissionOverrides(')
+    const resolve = liveCheck.indexOf(
+      'const overrides = await resolveEffectiveCodexPermissionOverrides(',
+      build,
+    )
+    const revalidate = liveCheck.indexOf('verifyOfficialCodexSnapshot(codex)', resolve)
+    const spawn = liveCheck.indexOf('const proc = Bun.spawn([', revalidate)
+    const spawnOverrides = liveCheck.indexOf(
+      "...overrides.flatMap(override => ['-c', override])",
+      spawn,
+    )
+    expect(build).toBeGreaterThan(0)
+    expect(resolve).toBeGreaterThan(build)
+    expect(revalidate).toBeGreaterThan(resolve)
+    expect(spawn).toBeGreaterThan(revalidate)
+    expect(spawnOverrides).toBeGreaterThan(spawn)
+  })
+
+  test('本番App Serverは同じconnectionのeffective config検証後だけthreadを開く', () => {
+    const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+    const flow = executor.indexOf('await session.initialize()')
+    const guard = executor.indexOf('assertCurrentAppServerCodexPermissionConfig(', flow)
+    const resume = executor.indexOf('session.resumeThread(', guard)
+    const start = executor.indexOf('session.startThread(', guard)
+    expect(flow).toBeGreaterThan(0)
+    expect(guard).toBeGreaterThan(flow)
+    expect(resume).toBeGreaterThan(guard)
+    expect(start).toBeGreaterThan(guard)
+  })
+
+  test('Slack uploadはHTTP byte直前にintentを立て完了receiptまで追跡する', () => {
+    const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
+    const transport = readFileSync(join(import.meta.dir, 'slack-http.ts'), 'utf8')
+    const operation = runner.indexOf('await this.completeStartedSideEffect(async () => {')
+    const target = runner.indexOf('requestUploadTarget(', operation)
+    const abort = runner.indexOf('if (signal?.aborted)', target)
+    const bytes = runner.indexOf('this.uploadDependencies.uploadBytes(', abort)
+    const intent = runner.indexOf(
+      'this.store.beginArtifactDelivery(job.id, requested, target.fileId)',
+      bytes,
+    )
+    const receipt = runner.indexOf('this.store.markArtifactDelivered(job.id, requested)', bytes)
+    const request = transport.indexOf('const request = httpsRequest(')
+    const beforeWrite = transport.indexOf('beforeRequestWrite()', request)
+    const end = transport.indexOf('request.end(data)', beforeWrite)
+    expect(operation).toBeGreaterThan(0)
+    expect(target).toBeGreaterThan(operation)
+    expect(abort).toBeGreaterThan(target)
+    expect(bytes).toBeGreaterThan(abort)
+    expect(intent).toBeGreaterThan(bytes)
+    expect(receipt).toBeGreaterThan(bytes)
+    expect(request).toBeGreaterThan(0)
+    expect(beforeWrite).toBeGreaterThan(request)
+    expect(end).toBeGreaterThan(beforeWrite)
+  })
+
   test('repository未取得の新規Macにもmain branch bootstrapの取得手順がある', () => {
     const rootReadme = readFileSync(join(import.meta.dir, '..', 'README.md'), 'utf8')
     const runtimeReadme = readFileSync(join(import.meta.dir, 'README.md'), 'utf8')
@@ -42,12 +133,15 @@ describe('public Codex defaults', () => {
       expect(guide).toContain("--noproxy '*'")
       expect(guide).toContain('--output "$bootstrap_path"')
       expect(guide).toContain('--with-slack')
+      expect(guide).toContain('Herdr 0.8.2')
     }
     expect(codexVersion).not.toContain('curl -fsSL')
     expect(codexVersion).toContain('standalone-codex.ts" version')
     expect(codexVersion).not.toContain('"$codex_bin" --version')
     expect(codexVersion).not.toContain('${ZEROKUN_CODEX_BIN:-codex}')
     expect(codexVersion).toContain('bash zerokun/bootstrap-macos.sh --skip-slack')
+    expect(codexVersion).toContain('ZEROKUN_MIN_HERDR_VERSION="0.8.2"')
+    expect(codexVersion).toContain('zerokun_herdr_capabilities_ready')
     expect(rootReadme).toContain('新しいSlack App')
     expect(rootReadme).toContain('tokenをこのPCへコピーしないでください')
     expect(setupGuide).toContain('そのSlack Appやtokenも流用しません')
@@ -262,6 +356,86 @@ describe('public Codex defaults', () => {
       20,
       'test Slack request',
     )).rejects.toThrow('test Slack request timed out after 20ms')
+
+    const parent = new AbortController()
+    const startedAt = Date.now()
+    const interrupted = withSlackDeadline(
+      signal => new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('operation aborted')), { once: true })
+      }),
+      5_000,
+      'preemptible attachment',
+      parent.signal,
+    )
+    parent.abort()
+    await expect(interrupted).rejects.toThrow(/aborted/)
+    expect(Date.now() - startedAt).toBeLessThan(1_000)
+
+    const alreadyAborted = new AbortController()
+    alreadyAborted.abort()
+    let deadlineInvocations = 0
+    await expect(withSlackDeadline(async () => {
+      deadlineInvocations += 1
+    }, 5_000, 'pre-aborted request', alreadyAborted.signal)).rejects.toThrow(
+      'pre-aborted request aborted',
+    )
+    expect(deadlineInvocations).toBe(0)
+
+    const sideEffectAbort = new AbortController()
+    let releaseSideEffect!: () => void
+    const sideEffectFinished = new Promise<void>(resolve => { releaseSideEffect = resolve })
+    let sideEffectInvocations = 0
+    const nonCooperative = completeSlackSideEffect(async () => {
+      sideEffectInvocations += 1
+      await sideEffectFinished
+      return 'uploaded'
+    }, 'non-cooperative upload', sideEffectAbort.signal)
+    sideEffectAbort.abort()
+    let settled = false
+    void nonCooperative.finally(() => { settled = true })
+    await Bun.sleep(10)
+    expect(settled).toBe(false)
+    releaseSideEffect()
+    await expect(nonCooperative).resolves.toBe('uploaded')
+    expect(sideEffectInvocations).toBe(1)
+
+    let preAbortedSideEffectInvocations = 0
+    await expect(completeSlackSideEffect(async () => {
+      preAbortedSideEffectInvocations += 1
+    }, 'pre-aborted upload', alreadyAborted.signal)).rejects.toThrow(
+      'pre-aborted upload aborted before start',
+    )
+    expect(preAbortedSideEffectInvocations).toBe(0)
+  })
+
+  test('Slack tokenは起動時に継承可能な環境から取り除きchildへ渡さない', () => {
+    const environment: Record<string, string | undefined> = {
+      PATH: '/usr/bin:/bin',
+      SAFE_SENTINEL: 'visible',
+      SLACK_BOT_TOKEN: 'xoxb-child-probe-secret',
+      SLACK_APP_TOKEN: 'xapp-child-probe-secret',
+    }
+    expect(takeSlackTokensFromEnvironment(environment)).toEqual({
+      SLACK_BOT_TOKEN: 'xoxb-child-probe-secret',
+      SLACK_APP_TOKEN: 'xapp-child-probe-secret',
+    })
+    const childEnvironment = Object.fromEntries(
+      Object.entries(environment).filter((entry): entry is [string, string] => (
+        entry[1] !== undefined
+      )),
+    )
+    const child = Bun.spawnSync(['/usr/bin/env'], {
+      env: childEnvironment,
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(child.exitCode, child.stderr.toString()).toBe(0)
+    const output = child.stdout.toString()
+    expect(output).toContain('SAFE_SENTINEL=visible')
+    expect(output).not.toContain('SLACK_BOT_TOKEN')
+    expect(output).not.toContain('SLACK_APP_TOKEN')
+    expect(output).not.toContain('child-probe-secret')
   })
 
   test('Slack bearer通信はproxy非使用のdirect HTTPSだけを許可する', async () => {
@@ -278,7 +452,7 @@ describe('public Codex defaults', () => {
     const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
     expect(server).toContain('openDirectSlackDownload(file.url_private_download')
     expect(server).not.toContain('fetch(file.url_private_download')
-    expect(runner).toContain("postDirectSlackApi(\n        'chat.postMessage'")
+    expect(runner).toContain("postDirectSlackApi('chat.postMessage'")
     expect(runner).not.toContain("fetch(\n        'https://slack.com/api/chat.postMessage'")
   })
 

@@ -63,6 +63,11 @@ import {
   signalProcessGroupIfLeaderLive,
   signalProcessIfLive,
 } from './process-generation.ts'
+import {
+  environmentForPinnedHerdrRuntime,
+  readPinnedHerdrRuntime,
+  verifyHerdrRuntimeIdentityAsync,
+} from './herdr-runtime.ts'
 
 interface Repository {
   label: string
@@ -1542,16 +1547,18 @@ async function requireEffectiveCodexPermissionPreflight(
   profile: string,
   environment: Record<string, string>,
   processGroupLease: ProcessGroupLeaseCoordinator,
+  stateDir: string,
   signal?: AbortSignal,
 ): Promise<void> {
   const specPath = join(isolatedHome, 'zerokun-effective-config-preflight.json')
   const trustedHelper = realpathSync(join(import.meta.dir, 'codex-executor.ts'))
   atomicWritePrivateFile(specPath, JSON.stringify({
-    version: 1,
+    version: 2,
     codexBin,
     cwd,
     overrides,
     profile,
+    stateDir,
   }) + '\n')
   try {
     await requireCommandAsync([
@@ -1632,6 +1639,7 @@ async function validateZero(
       profile,
       candidateEnvironment,
       processGroupLease,
+      stateDir,
       signal,
     )
   }
@@ -1763,7 +1771,7 @@ export function assertTmuxSessionAvailableOrOwned(options: {
     && processLockOwnerMatches(lockFile, gatewayPid, /server\.ts(?:\s|$)/)) return
   fail(
     `tmux session ${options.sessionName} は既に存在します。`
-    + ' Zero-kunの所有権を確認できないsessionを停止せず、更新を中断します',
+    + ' Zeroちゃんの所有権を確認できないsessionを停止せず、更新を中断します',
   )
 }
 
@@ -1868,6 +1876,66 @@ export async function startBotInTmux(options: {
   }
 }
 
+export async function startBotInHerdr(options: {
+  rootRepo: string
+  stateDir: string
+  projectDir: string
+  startupTimeoutMs?: number
+  replaceTokenFile?: string
+  legacyCutover?: boolean
+}): Promise<{ paneId: string; gatewayPid: number }> {
+  const runtime = readPinnedHerdrRuntime(options.stateDir)
+  const pinnedHerdrEnvironment = environmentForPinnedHerdrRuntime(runtime)
+  const timeoutMs = Math.max(1_000, options.startupTimeoutMs ?? 10_000)
+  const launcher = join(options.rootRepo, 'codex-channel.sh')
+  const replaceTokenFile = options.replaceTokenFile ?? join(options.stateDir, 'replace-token')
+  const replaceToken = randomUUID()
+  const release = command(['git', 'rev-parse', 'HEAD'], { cwd: options.rootRepo }).stdout || 'unknown'
+  ensureManagedDirectory(options.stateDir, dirname(replaceTokenFile))
+  atomicWritePrivateFile(replaceTokenFile, replaceToken)
+  const launchEnvironment = {
+    ...buildRuntimeServiceEnvironment(pinnedHerdrEnvironment),
+    ZEROKUN_JOB_DB: resolveZeroJobDatabasePath(options.stateDir),
+    ZEROKUN_REPLACE: '1',
+    ZEROKUN_UPDATE_RESTART: '1',
+    ZEROKUN_LEGACY_CUTOVER: (options.legacyCutover
+      ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1') ? '1' : '0',
+    ZEROKUN_STATE_DIR: options.stateDir,
+    ZEROKUN_PROJECT_DIR: options.projectDir,
+    ZEROKUN_REPLACE_TOKEN: replaceToken,
+    ZEROKUN_REPLACE_TOKEN_FILE: replaceTokenFile,
+    ZEROKUN_RELEASE_COMMIT: release,
+  }
+  await verifyHerdrRuntimeIdentityAsync(runtime, pinnedHerdrEnvironment)
+  requireCommand([
+    runtime.binary,
+    'pane',
+    'run',
+    runtime.paneId,
+    '/usr/bin/env',
+    '-i',
+    ...Object.entries(launchEnvironment).map(([key, value]) => `${key}=${value}`),
+    launcher,
+    options.projectDir,
+  ], { env: pinnedHerdrEnvironment })
+
+  const maxChecks = Math.ceil(timeoutMs / 100)
+  for (let check = 0; check < maxChecks; check += 1) {
+    const gatewayPid = readPid(join(options.stateDir, 'plugin.lock'))
+    if (gatewayPid && processLockOwnerMatches(
+      join(options.stateDir, 'plugin.lock'), gatewayPid, /server\.ts(?:\s|$)/,
+    )) {
+      const pinned = readPinnedHerdrRuntime(options.stateDir)
+      if (JSON.stringify(pinned) !== JSON.stringify(runtime)) {
+        fail('起動したjob runnerのHerdr runtime identityが更新元paneと一致しません')
+      }
+      return { paneId: runtime.paneId, gatewayPid }
+    }
+    await Bun.sleep(100)
+  }
+  fail(`ZeroちゃんのHerdr再起動を${timeoutMs / 1_000}秒以内に確認できませんでした`)
+}
+
 async function stopServices(
   stateDir: string,
   signal?: AbortSignal,
@@ -1894,19 +1962,17 @@ async function restartServices(
 
   if (signal?.aborted) fail('更新を中断しました')
   const logPath = join(stateDir, 'zerokun.log')
-  const sessionBase = (process.env.ZEROKUN_TMUX_SESSION ?? 'zerokun-slack')
-    .replace(/[^A-Za-z0-9_-]/g, '_')
-    .slice(0, 80) || 'zerokun-slack'
-  const sessionName = `${sessionBase}-${randomUUID().slice(0, 8)}`
-  const panePid = await startBotInTmux({
+  const started = await startBotInHerdr({
     rootRepo,
     stateDir,
     projectDir,
-    logPath,
+    startupTimeoutMs: Math.max(
+      1_000,
+      Number(process.env.ZEROKUN_UPDATE_STARTUP_TIMEOUT_MS) || 60_000,
+    ),
     replaceTokenFile: join(stateDir, 'replace-token'),
-    sessionName,
   })
-  output(`   terminal: tmux attach -t ${sessionName} (pane PID ${panePid})`)
+  output(`   Herdr pane: ${started.paneId} (gateway PID ${started.gatewayPid})`)
 
   await waitForStableHealth({
     requiredConsecutive: Number(process.env.ZEROKUN_HEALTH_CONSECUTIVE ?? 10),
@@ -2194,7 +2260,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       writeJournal(stateDir, journal)
       throwIfInterrupted()
       if (!noRestart) {
-        output('▶ ゼロくんとjob runnerを再起動')
+        output('▶ Zeroちゃんとjob runnerを再起動')
         await restartServices(rootRepo, stateDir, projectDir, controller.signal)
       }
       clearJournal(stateDir, journal)
