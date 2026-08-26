@@ -89,7 +89,7 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
   candidate_contract_test zerokun/job-runner.test.ts \
     '成果物単位のdelivery checkpointで再送時の重複uploadを防ぐ'
   candidate_contract_test zerokun/job-runner.test.ts \
-    '本文成功後の添付失敗は本文を再投稿せず5回で打ち切る'
+    'byte開始後の曖昧性だけをartifact単位で5回確認して打ち切る'
   candidate_contract_test zerokun/update.test.ts \
     'standalone Codexを絶対pathへ固定しcandidate PATHでも解決できる'
   candidate_contract_test zerokun/update.test.ts \

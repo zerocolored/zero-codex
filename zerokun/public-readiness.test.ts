@@ -60,6 +60,25 @@ describe('public Codex defaults', () => {
     expect(executor).toContain('resolveDedicatedGrokLauncher()\n  await verifyCodexConfig')
   })
 
+  test('candidate sandboxの絞り込みtest名は対象fileにexact 1件ずつ存在する', () => {
+    const root = join(import.meta.dir, '..')
+    const verify = readFileSync(join(import.meta.dir, 'verify.sh'), 'utf8')
+    const selectors = [...verify.matchAll(
+      /candidate_contract_test\s+(\S+)\s+\\\n\s+'([^']+)'/g,
+    )]
+    const callCount = (verify.match(/^\s*candidate_contract_test\s+/gm) ?? []).length
+    expect(selectors.length).toBeGreaterThan(0)
+    expect(selectors.length).toBe(callCount)
+    for (const [, relativePath, selector] of selectors) {
+      const target = readFileSync(join(root, relativePath!), 'utf8')
+      expect(selector!).not.toMatch(/[\\^$.*+?()[\]{}|]/)
+      expect(
+        target.split(`test('${selector!}',`).length - 1,
+        `${relativePath}: ${selector}`,
+      ).toBe(1)
+    }
+  })
+
   test('認証済みlive検証も本番と同じMCP隔離結果だけでApp Serverを起動する', () => {
     const liveCheck = readFileSync(join(import.meta.dir, 'live-codex-permission-check.ts'), 'utf8')
     const build = liveCheck.indexOf('const baseOverrides = buildCodexPermissionOverrides(')
