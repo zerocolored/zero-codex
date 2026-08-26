@@ -650,6 +650,7 @@ for await (const chunk of Bun.stdin.stream()) {
     const executable = join(root, 'fake-codex')
     const groupFile = join(root, 'groups')
     const spec = join(root, 'preflight.json')
+    const resultPath = join(root, 'zerokun-effective-config-preflight-result.json')
     const state = join(root, 'state')
     mkdirSync(repo)
     mkdirSync(state, { mode: 0o700 })
@@ -700,12 +701,13 @@ for line in sys.stdin:
 `)
     chmodSync(executable, 0o700)
     writeFileSync(spec, JSON.stringify({
-      version: 2,
+      version: 3,
       codexBin: executable,
       cwd: repo,
       overrides,
       profile,
       stateDir: state,
+      resultPath,
     }) + '\n', { mode: 0o600 })
     const leased = await runLeasedCommandForTests([
       process.execPath,
@@ -725,6 +727,17 @@ for line in sys.stdin:
     expect(groups).toHaveLength(3)
     for (const group of groups) expect(group).toBe(leased.groupId)
     expect(leased.groupId).not.toBe(process.pid)
+    expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toEqual({
+      version: 1,
+      overrides,
+    })
+    const helperSource = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+    const helper = helperSource.slice(
+      helperSource.indexOf('async function verifyEffectiveCodexConfigSpec('),
+      helperSource.indexOf('async function verifyCodexConfig('),
+    )
+    expect(helper.indexOf('removeSeatbeltFingerprint(spec.stateDir, fingerprint)'))
+      .toBeLessThan(helper.indexOf('atomicWritePrivateFile(spec.resultPath'))
     const source = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
     const appServer = source.slice(
       source.indexOf('async function readCodexAppServer('),

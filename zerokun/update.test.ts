@@ -22,6 +22,7 @@ import {
   activeJobCounts,
   activeJobCountsFromDatabase,
   assertPinnedRepositoryState,
+  buildCandidatePermissionOverrides,
   clearJournal,
   copySecureExecutableForTesting,
   createUpdaterTemporaryDirectory,
@@ -34,6 +35,7 @@ import {
   resolveUpdaterCodexBinary,
   setupTimeoutBudgetMs,
   stageVerifiedCandidateCodex,
+  validateResolvedCandidatePermissionOverrides,
   restoreRollbackDatabase,
   startBotInHerdr,
   startBotInTmux,
@@ -42,6 +44,10 @@ import {
   withUpdateTestPolicy,
   updaterTrustedToolPath,
 } from './update.ts'
+import {
+  assertCurrentAppServerCodexPermissionConfig,
+  mcpIsolationOverridesForConfig,
+} from './codex-executor.ts'
 import { tryAcquireProcessLock } from './process-lock.ts'
 import {
   captureTrackedProcesses,
@@ -520,16 +526,79 @@ describe('updater helpers', () => {
     }
   })
 
-  test('candidate sandboxはpreflightと同じrandom named permissionをdefaultにする', () => {
+  test('candidate sandboxはpreflightと同じrandom named permissionをdefaultにする', async () => {
+    const profile = 'zerokun_update_test'
+    const permissionOverrides = buildCandidatePermissionOverrides(
+      profile,
+      '"/repo"="write"',
+    )
+    expect(permissionOverrides).toContain(`default_permissions="${profile}"`)
+    expect(permissionOverrides.filter(value => value.startsWith('mcp_servers=')))
+      .toEqual(['mcp_servers={}'])
+    expect(permissionOverrides.some(value => value.startsWith('mcp_servers.'))).toBe(false)
+    expect(permissionOverrides).toContain('web_search="disabled"')
+    expect(permissionOverrides).toContain('features.goals=false')
+
+    const effective = Bun.TOML.parse(permissionOverrides.join('\n')) as Record<string, unknown>
+    const managedRequirementsSession = {
+      async request(method: string, _params: Record<string, unknown>) {
+        return {
+          requestId: 1,
+          result: method === 'configRequirements/read'
+            ? { requirements: {
+              allowedApprovalPolicies: ['never'],
+              allowedPermissionProfiles: { [profile]: true },
+              allowedSandboxModes: ['workspace-write'],
+              allowedWebSearchModes: ['disabled'],
+              featureRequirements: { goals: false },
+              network: { enabled: false },
+            } }
+            : { config: effective },
+        }
+      },
+    }
+    await expect(assertCurrentAppServerCodexPermissionConfig(
+      managedRequirementsSession,
+      '/repo',
+      permissionOverrides,
+      profile,
+    )).resolves.toBeUndefined()
+
+    const isolated = mcpIsolationOverridesForConfig({
+      mcp_servers: {
+        stdio: { command: '/tmp/untrusted-mcp', args: ['--serve'] },
+        http: { url: 'https://example.invalid/mcp' },
+      },
+    }, permissionOverrides)
+    const isolatedMcp = isolated.find(value => value.startsWith('mcp_servers='))!
+    expect(isolatedMcp).toContain('command="/usr/bin/false"')
+    expect(isolatedMcp).toContain('url="http://127.0.0.1:9"')
+    expect(isolatedMcp.match(/enabled=false/g)).toHaveLength(2)
+    expect(validateResolvedCandidatePermissionOverrides(permissionOverrides, isolated))
+      .toEqual(isolated)
+    for (const unsafe of [
+      'mcp_servers={evil={enabled=true,command="/tmp/evil"}}',
+      'mcp_servers={evil={enabled=false,command="/usr/bin/false",args=[],extra=true}}',
+      'mcp_servers={evil={enabled=false,url="https://example.invalid/mcp"}}',
+      'mcp_servers={broken=',
+      'mcp_servers={}\napproval_policy="on-request"',
+    ]) {
+      const changed = permissionOverrides.map(value => value.startsWith('mcp_servers=')
+        ? unsafe
+        : value)
+      expect(() => validateResolvedCandidatePermissionOverrides(permissionOverrides, changed))
+        .toThrow('MCP設定が不正')
+    }
+
     const source = readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')
     const candidate = source.slice(source.indexOf('async function validateZero('), source.indexOf('export async function stopLockedProcess('))
-    expect(candidate).toContain('`default_permissions=${JSON.stringify(profile)}`')
+    expect(candidate).toContain('buildCandidatePermissionOverrides(profile, filesystemToml)')
     expect(candidate).toContain("'-P', profile")
     expect(candidate).toContain("'--include-managed-config'")
     expect(candidate.indexOf('requireEffectiveCodexPermissionPreflight('))
       .toBeLessThan(candidate.indexOf("'sandbox'"))
     expect(candidate).toContain('const stagedCodexBin = stagedCodex.executable')
-    expect(candidate).toContain('requireEffectiveCodexPermissionPreflight(\n      stagedCodexBin,')
+    expect(candidate).toContain('permissionOverrides = await requireEffectiveCodexPermissionPreflight(\n      stagedCodexBin,')
     expect(candidate).toContain('await requireCommandAsync([\n    stagedCodexBin,')
   })
 

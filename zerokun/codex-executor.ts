@@ -5089,12 +5089,13 @@ export async function executeCodexJob(
 }
 
 interface EffectiveConfigPreflightSpec {
-  version: 2
+  version: 2 | 3
   codexBin: string
   cwd: string
   overrides: string[]
   profile: string
   stateDir: string
+  resultPath?: string
 }
 
 function readEffectiveConfigPreflightSpec(path: string): EffectiveConfigPreflightSpec {
@@ -5115,7 +5116,16 @@ function readEffectiveConfigPreflightSpec(path: string): EffectiveConfigPrefligh
   const physicalStateDir = typeof value.stateDir === 'string' && isAbsolute(value.stateDir)
     ? requireManagedStateRoot(value.stateDir)
     : ''
-  if (value.version !== 2 || typeof value.codexBin !== 'string'
+  const resultPath = value.version === 3 && typeof value.resultPath === 'string'
+    && isAbsolute(value.resultPath)
+    && realpathSync(dirname(value.resultPath)) === physicalHome
+    && value.resultPath === join(
+      dirname(value.resultPath),
+      'zerokun-effective-config-preflight-result.json',
+    )
+    ? join(physicalHome, 'zerokun-effective-config-preflight-result.json')
+    : undefined
+  if ((value.version !== 2 && value.version !== 3) || typeof value.codexBin !== 'string'
     || !isAbsolute(value.codexBin) || typeof value.cwd !== 'string'
     || physicalCwd.length === 0
     || !Array.isArray(value.overrides) || value.overrides.length === 0
@@ -5124,13 +5134,16 @@ function readEffectiveConfigPreflightSpec(path: string): EffectiveConfigPrefligh
       || item.length === 0 || item.length > 65_536 || item.includes('\0'))
     || typeof value.profile !== 'string'
     || !/^[A-Za-z0-9_-]{1,128}$/.test(value.profile)
-    || physicalStateDir.length === 0) {
+    || physicalStateDir.length === 0
+    || (value.version === 3 && resultPath === undefined)
+    || (value.version === 2 && value.resultPath !== undefined)) {
     throw new Error('Codex preflight spec is invalid')
   }
   return {
     ...value,
     cwd: physicalCwd,
     stateDir: physicalStateDir,
+    resultPath,
   } as EffectiveConfigPreflightSpec
 }
 
@@ -5146,8 +5159,9 @@ async function verifyEffectiveCodexConfigSpec(path: string): Promise<void> {
     'update-config',
     randomUUID().replaceAll('-', ''),
   )
+  let resolved: string[] | undefined
   try {
-    await resolveEffectiveCodexPermissionOverrides(
+    resolved = await resolveEffectiveCodexPermissionOverrides(
       spec.codexBin,
       spec.cwd,
       spec.overrides,
@@ -5167,6 +5181,13 @@ async function verifyEffectiveCodexConfigSpec(path: string): Promise<void> {
       excludePids: new Set([process.pid]),
     })
     removeSeatbeltFingerprint(spec.stateDir, fingerprint)
+  }
+  if (!resolved) throw new Error('Codex preflight did not resolve effective overrides')
+  if (spec.resultPath) {
+    atomicWritePrivateFile(spec.resultPath, JSON.stringify({
+      version: 1,
+      overrides: resolved,
+    }) + '\n')
   }
 }
 

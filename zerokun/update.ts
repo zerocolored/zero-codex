@@ -1549,16 +1549,18 @@ async function requireEffectiveCodexPermissionPreflight(
   processGroupLease: ProcessGroupLeaseCoordinator,
   stateDir: string,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<string[]> {
   const specPath = join(isolatedHome, 'zerokun-effective-config-preflight.json')
+  const resultPath = join(isolatedHome, 'zerokun-effective-config-preflight-result.json')
   const trustedHelper = realpathSync(join(import.meta.dir, 'codex-executor.ts'))
   atomicWritePrivateFile(specPath, JSON.stringify({
-    version: 2,
+    version: 3,
     codexBin,
     cwd,
     overrides,
     profile,
     stateDir,
+    resultPath,
   }) + '\n')
   try {
     await requireCommandAsync([
@@ -1579,9 +1581,115 @@ async function requireEffectiveCodexPermissionPreflight(
         DEFAULT_VERIFY_TIMEOUT_MS,
       ),
     })
+    const content = readOptionalPrivateFile(resultPath)
+    if (content === null || content.length > 8 * 1024 * 1024) {
+      fail('Codex config preflightの検証済み設定を取得できません')
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(content)
+    } catch {
+      fail('Codex config preflightの検証済み設定が不正です')
+    }
+    const resolved = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as { version?: unknown; overrides?: unknown }).overrides
+      : undefined
+    if ((parsed as { version?: unknown } | null)?.version !== 1
+      || !Array.isArray(resolved)
+      || resolved.length !== overrides.length
+      || resolved.some(value => typeof value !== 'string'
+        || value.length === 0 || value.length > 65_536 || value.includes('\0'))) {
+      fail('Codex config preflightの検証済み設定が不正です')
+    }
+    return validateResolvedCandidatePermissionOverrides(overrides, resolved as string[])
   } finally {
     rmSync(specPath, { force: true })
+    rmSync(resultPath, { force: true })
   }
+}
+
+export function validateResolvedCandidatePermissionOverrides(
+  overrides: string[],
+  resolved: string[],
+): string[] {
+  const originalMcp = overrides.findIndex(value => value.startsWith('mcp_servers='))
+  const resolvedMcp = resolved.findIndex(value => value.startsWith('mcp_servers='))
+  if (originalMcp < 0 || overrides[originalMcp] !== 'mcp_servers={}'
+    || resolvedMcp !== originalMcp
+    || overrides.filter(value => value.startsWith('mcp_servers=')).length !== 1
+    || resolved.filter(value => value.startsWith('mcp_servers=')).length !== 1
+    || resolved.some((value, index) => index !== originalMcp && value !== overrides[index])) {
+    fail('Codex config preflightが許可外の設定を変更しました')
+  }
+  let document: Record<string, unknown>
+  try {
+    document = Bun.TOML.parse(resolved[resolvedMcp]!) as Record<string, unknown>
+  } catch {
+    fail('Codex config preflightのMCP設定が不正です')
+  }
+  if (Object.keys(document).length !== 1 || !Object.hasOwn(document, 'mcp_servers')) {
+    fail('Codex config preflightのMCP設定が不正です')
+  }
+  const table = document.mcp_servers
+  if (table === null || typeof table !== 'object' || Array.isArray(table)
+    || Object.keys(table).length > 128) {
+    fail('Codex config preflightのMCP設定が不正です')
+  }
+  for (const server of Object.values(table as Record<string, unknown>)) {
+    if (server === null || typeof server !== 'object' || Array.isArray(server)) {
+      fail('Codex config preflightのMCP設定が不正です')
+    }
+    const record = server as Record<string, unknown>
+    const keys = Object.keys(record).sort()
+    const stdio = record.enabled === false
+      && record.command === '/usr/bin/false'
+      && Array.isArray(record.args) && record.args.length === 0
+      && JSON.stringify(keys) === JSON.stringify(['args', 'command', 'enabled'])
+    const http = record.enabled === false
+      && record.url === 'http://127.0.0.1:9'
+      && JSON.stringify(keys) === JSON.stringify(['enabled', 'url'])
+    if (stdio === http) fail('Codex config preflightのMCP設定が不正です')
+  }
+  return resolved
+}
+
+export function buildCandidatePermissionOverrides(
+  profile: string,
+  filesystemToml: string,
+): string[] {
+  return [
+    `permissions.${profile}.filesystem={${filesystemToml}}`,
+    `permissions.${profile}.network.enabled=true`,
+    `permissions.${profile}.network.domains={"*"="allow"}`,
+    `default_permissions=${JSON.stringify(profile)}`,
+    'approval_policy="never"',
+    'notify=[]',
+    'model_provider="openai"',
+    'model_providers={}',
+    'web_search="disabled"',
+    'tools.web_search=false',
+    'apps._default.enabled=false',
+    'apps._default.default_tools_enabled=false',
+    'apps._default.open_world_enabled=false',
+    'apps._default.destructive_enabled=false',
+    'features.network_proxy=true',
+    'features.apps=false',
+    'features.plugins=false',
+    'features.remote_plugin=false',
+    'features.hooks=false',
+    'features.goals=false',
+    'features.browser_use=false',
+    'features.browser_use_external=false',
+    'features.browser_use_full_cdp_access=false',
+    'features.computer_use=false',
+    'features.in_app_browser=false',
+    'features.multi_agent=false',
+    'features.skill_mcp_dependency_install=false',
+    'shell_environment_policy.inherit="core"',
+    'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","*PROXY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
+    'mcp_servers={}',
+    'hooks={}',
+  ]
 }
 
 async function validateZero(
@@ -1615,23 +1723,9 @@ async function validateZero(
     .join(',')
   const candidateEnvironment = buildCandidateEnvironment(isolatedHome)
   candidateEnvironment.PATH = updaterTrustedToolPath(trustedToolDirectory)
-  const permissionOverrides = [
-    `permissions.${profile}.filesystem={${filesystemToml}}`,
-    `permissions.${profile}.network.enabled=true`,
-    `permissions.${profile}.network.domains={"*"="allow"}`,
-    `default_permissions=${JSON.stringify(profile)}`,
-    'approval_policy="never"',
-    'notify=[]',
-    'model_provider="openai"',
-    'model_providers={}',
-    'features.network_proxy=true',
-    'features.apps=false',
-    'features.plugins=false',
-    'shell_environment_policy.inherit="core"',
-    'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","*PROXY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
-  ]
+  let permissionOverrides = buildCandidatePermissionOverrides(profile, filesystemToml)
   if (!executionPolicy.skipCodexPermissionPreflight) {
-    await requireEffectiveCodexPermissionPreflight(
+    permissionOverrides = await requireEffectiveCodexPermissionPreflight(
       stagedCodexBin,
       rootRepo,
       isolatedHome,
