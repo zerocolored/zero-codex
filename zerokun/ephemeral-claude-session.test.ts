@@ -613,7 +613,7 @@ describe('ephemeral Claude lifecycle state', () => {
     expect(readFileSync(outside, 'utf8')).toBe('do not delete')
   })
 
-  test('durable closed receiptはhelperなしで回収し、workspace receiptだけならexact closeする', async () => {
+  test('closed receiptもlive absenceを再close確認し、workspace receiptだけならexact closeする', async () => {
     const state = fixtureState()
     const projectRoot = dirname(state)
     const closed = request(state)
@@ -658,24 +658,12 @@ describe('ephemeral Claude lifecycle state', () => {
       },
     })
     expect(result).toEqual({ closed: 2, discardedBeforeOpen: 0 })
-    expect(commands).toEqual(['close:design'])
+    expect(commands.sort()).toEqual([
+      'close:investigation',
+      'close:design',
+    ].sort())
     expect(runtimeChecks).toBe(4)
     expect(advisorAttemptMayHaveBeenDelivered(state, 'job-123')).toBe(true)
-    expect(existsSync(join(state, EPHEMERAL_CLAUDE_STATE_ROOT))).toBe(false)
-  })
-
-  test('helper releaseが更新済みでもdurable closed receiptから回収できる', async () => {
-    const state = fixtureState()
-    const projectRoot = dirname(state)
-    const closed = request(state)
-    writeLifecycleRecords(closed, projectRoot, true)
-    const result = await reconcileEphemeralClaudeSessions({ stateDir: state, runtime }, {
-      resolveHelper: () => { throw new Error('fifth-advisor helper integrity mismatch') },
-      resolveClaudeLookup: () => '/usr/local/bin/claude',
-      verifyRuntime: async () => {},
-      runHelper: async () => { throw new Error('helper must not run') },
-    })
-    expect(result).toEqual({ closed: 1, discardedBeforeOpen: 0 })
     expect(existsSync(join(state, EPHEMERAL_CLAUDE_STATE_ROOT))).toBe(false)
   })
 

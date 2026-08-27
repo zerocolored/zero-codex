@@ -21,6 +21,13 @@ import { dirname, join } from 'path'
 
 const MAX_HELPER_BYTES = 1024 * 1024
 
+export class FifthAdvisorHelperIntegrityMismatchError extends Error {
+  constructor(path: string) {
+    super(`fifth-advisor helper integrity mismatch: ${path}`)
+    this.name = 'FifthAdvisorHelperIntegrityMismatchError'
+  }
+}
+
 function owned(metadata: Stats): boolean {
   return typeof process.getuid !== 'function' || metadata.uid === process.getuid()
 }
@@ -130,8 +137,24 @@ export function resolveFifthAdvisorHelper(homeInput = homedir()): string {
   const installed = join(runtimeDirectory, 'fifth-advisor.py')
   const expected = sourceHelper().content
   const actual = readStableOwnedFile(installed, 0o700)
-  if (!actual.equals(expected)) throw new Error(`fifth-advisor helper integrity mismatch: ${installed}`)
+  if (!actual.equals(expected)) throw new FifthAdvisorHelperIntegrityMismatchError(installed)
   return realpathSync(installed)
+}
+
+/**
+ * A stopped runner may need to finish an owned cleanup after the repository
+ * advanced but before setup atomically replaces the shared runtime helper.
+ * Only a safe content-version mismatch may use the equally verified bundled
+ * helper; unsafe installed files remain fatal.
+ */
+export function resolveFifthAdvisorRecoveryHelper(homeInput = homedir()): string {
+  try {
+    return resolveFifthAdvisorHelper(homeInput)
+  } catch (error) {
+    if (!(error instanceof FifthAdvisorHelperIntegrityMismatchError)) throw error
+    const bundled = sourceHelper()
+    return realpathSync(bundled.path)
+  }
 }
 
 if (import.meta.main) {

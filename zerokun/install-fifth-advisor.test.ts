@@ -17,6 +17,7 @@ import { join } from 'path'
 import {
   installFifthAdvisorHelper,
   resolveFifthAdvisorHelper,
+  resolveFifthAdvisorRecoveryHelper,
 } from './install-fifth-advisor.ts'
 
 const roots: string[] = []
@@ -303,6 +304,21 @@ describe('fifth-advisor helper installer', () => {
     mkdirSync(outside)
     symlinkSync(outside, join(third, '.zerokun/runtime'))
     expect(() => installFifthAdvisorHelper(third)).toThrow('unsafe fifth-advisor directory')
+  })
+
+  test('停止runnerの回収だけは安全なrelease差をbundled helperで継続する', () => {
+    const versionMismatch = fixture()
+    const installed = installFifthAdvisorHelper(versionMismatch)
+    writeFileSync(installed, '# previous safe release\n', { mode: 0o700 })
+    expect(() => resolveFifthAdvisorHelper(versionMismatch)).toThrow('integrity mismatch')
+    expect(resolveFifthAdvisorRecoveryHelper(versionMismatch))
+      .toBe(realpathSync(join(import.meta.dir, 'fifth-advisor.py')))
+
+    const unsafe = fixture()
+    const linked = installFifthAdvisorHelper(unsafe)
+    linkSync(linked, join(unsafe, 'helper-hardlink'))
+    expect(() => resolveFifthAdvisorRecoveryHelper(unsafe))
+      .toThrow('unsafe fifth-advisor file')
   })
 
   test('host共有helperを変更せずZero専用namespaceだけへ配置する', () => {

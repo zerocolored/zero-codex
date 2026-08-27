@@ -24,7 +24,7 @@ import {
   verifyHerdrRuntimeIdentityAsync,
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
-import { resolveFifthAdvisorHelper } from './install-fifth-advisor.ts'
+import { resolveFifthAdvisorRecoveryHelper } from './install-fifth-advisor.ts'
 import { resolveCodexExecutableDetails } from './standalone-codex.ts'
 import {
   ensureManagedDirectory,
@@ -908,7 +908,7 @@ export async function reconcileEphemeralClaudeSessions(options: {
     projectRoot: string,
     requestDir: string,
   ): ReturnType<typeof runHelper> => {
-    const helper = (dependencies.resolveHelper ?? resolveFifthAdvisorHelper)()
+    const helper = (dependencies.resolveHelper ?? resolveFifthAdvisorRecoveryHelper)()
     return (dependencies.runHelper ?? runHelper)(
       helper, command, projectRoot, requestDir, helperEnvironment(),
     )
@@ -944,16 +944,13 @@ export async function reconcileEphemeralClaudeSessions(options: {
               retainProvisionalAbsenceGuard = provisional.status
                 === 'provisional-workspace-not-created'
             } else {
-              const closedReceipt = join(requestDir, EPHEMERAL_CLAUDE_CLOSED_RECEIPT)
-              if (!existsSync(closedReceipt)) {
-                const close = await run('close', projectRoot, requestDir)
-                if (close.exitCode !== 0) {
-                  throw new EphemeralClaudeCleanupPendingError(
-                    `ephemeral Claude cleanup is pending: ${close.stderr.trim().slice(-2_000)}`,
-                  )
-                }
-                parseEphemeralClaudeClose(close.stdout, target)
+              const close = await run('close', projectRoot, requestDir)
+              if (close.exitCode !== 0) {
+                throw new EphemeralClaudeCleanupPendingError(
+                  `ephemeral Claude cleanup is pending: ${close.stderr.trim().slice(-2_000)}`,
+                )
               }
+              parseEphemeralClaudeClose(close.stdout, target)
               readEphemeralClaudeCleanupReceipt(requestDir, target)
             }
             persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir)
