@@ -25,7 +25,9 @@ export type NativeAdvisorRoundEvidence = {
 
 const THREAD_ID = /^[A-Za-z0-9._:-]{1,256}$/
 const ATTEMPT_NONCE = /^[0-9a-f]{32}$/
-const SUBAGENT_ACTIVITY_KINDS = new Set(['started', 'interacted', 'interrupted'])
+const SUBAGENT_ACTIVITY_KINDS = new Set([
+  'started', 'interacted', 'interrupted', 'completed',
+])
 
 export function nativeAdvisorMarker(
   attemptNonce: string,

@@ -126,7 +126,7 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
   {
     relativePath: 'v2/SubAgentActivityKind.ts',
     required: [
-      /export type SubAgentActivityKind = "started" \| "interacted" \| "interrupted";/,
+      /export type SubAgentActivityKind = "started" \| "interacted" \| "interrupted" \| "completed";/,
     ],
   },
   {

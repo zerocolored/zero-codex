@@ -284,14 +284,21 @@ describe('native Codex advisor host evidence', () => {
       thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
     }
     parent.thread.turns[0]!.items[0]!.kind = 'interacted'
-    parent.thread.turns[0]!.items[1]!.kind = 'interrupted'
+    parent.thread.turns[0]!.items[1]!.kind = 'completed'
     expect(() => assertNativeAdvisorEvidence(accepted.options)).not.toThrow()
+
+    const interrupted = fixture()
+    const interruptedParent = interrupted.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    interruptedParent.thread.turns[0]!.items[0]!.kind = 'interrupted'
+    expect(() => assertNativeAdvisorEvidence(interrupted.options)).not.toThrow()
 
     const rejected = fixture()
     const rejectedParent = rejected.options.parentResponse as {
       thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
     }
-    rejectedParent.thread.turns[0]!.items[0]!.kind = 'completed'
+    rejectedParent.thread.turns[0]!.items[0]!.kind = 'futureActivity'
     expect(() => assertNativeAdvisorEvidence(rejected.options)).toThrow(
       'invalid subagent activity',
     )

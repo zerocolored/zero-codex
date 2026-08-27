@@ -92,7 +92,7 @@ function fixture(): string {
       'agentThreadId: string',
     ].join('\n'),
     'MessagePhase.ts': '"commentary" | "final_answer"',
-    'v2/SubAgentActivityKind.ts': 'export type SubAgentActivityKind = "started" | "interacted" | "interrupted";',
+    'v2/SubAgentActivityKind.ts': 'export type SubAgentActivityKind = "started" | "interacted" | "interrupted" | "completed";',
     'v2/ThreadTurnsListParams.ts': [
       'threadId: string',
       'cursor?: string | null',
@@ -182,8 +182,11 @@ describe('Codex App Server capability gate', () => {
 
   test('遅延subagent照合に必要なactivity kindを欠くreleaseをfail-closeする', () => {
     const root = fixture()
-    writeFileSync(join(root, 'v2/SubAgentActivityKind.ts'), '"started" | "interacted"')
-    expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('interrupted')
+    writeFileSync(
+      join(root, 'v2/SubAgentActivityKind.ts'),
+      'export type SubAgentActivityKind = "started" | "interacted" | "interrupted";',
+    )
+    expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('completed')
   })
 
   test('direct-child全列挙に必要なsource kind集合の増減をfail-closeする', () => {
