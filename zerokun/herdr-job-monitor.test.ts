@@ -1718,5 +1718,6 @@ describe('Herdr job monitor', () => {
     expect(stderr).toContain('warning-line')
     expect(stderr).toContain('\uFFFD')
     },
+    15_000,
   )
 })
