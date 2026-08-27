@@ -691,6 +691,32 @@ print('review complete')
     ), marker)).toBeNull()
   })
 
+  test('Claude 2.1.247の更新案内付き固定footerを二行のterminal chromeとして採択する', () => {
+    const marker = 'REQUEST_MARKER=FEDCBA9876543210FEDCBA9876543210'
+    const response = '独立したレビュー結果です。'
+    const updateFooter = `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents${' '.repeat(24)}✔ Update installed · Restart to update`
+    const envelope = (...footer: string[]) => [
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      response,
+      marker,
+      '✻ Crunched for 18s · done 7:18',
+      '────────────────',
+      '❯',
+      '────────────────',
+      ...footer,
+    ].join('\n')
+
+    expect(extractCompleteClaudeResponse(envelope(updateFooter, '/rc'), marker)).toBe(response)
+    expect(extractCompleteClaudeResponse(envelope(updateFooter), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope(updateFooter, '/clear'), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope(
+      updateFooter.replace('Restart to update', 'Click to update'),
+      '/rc',
+    ), marker)).toBeNull()
+  })
+
   test('Claude 2.1.247の実測狭幅prompt echoだけを固定envelopeとして採択する', () => {
     const marker = 'REQUEST_MARKER=3CC556E85A172CDBDF0101C7C293A2F6'
     const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'

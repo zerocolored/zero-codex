@@ -115,6 +115,8 @@ const CLAUDE_DONE_ACTIVITY_CHROME = new RegExp(
 // Exact narrow-pane rendering observed from Claude Code 2.1.247 in Herdr.
 const CLAUDE_NARROW_BYPASS_FOOTER_CHROME =
   `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u00B7`
+const CLAUDE_UPDATE_READY_FOOTER_CHROME =
+  /^⏵⏵ bypass permissions on \(shift\+tab to cycle\) · ← for agents {1,256}✔ Update installed · Restart to update$/u
 
 function isClaudeTerminalChrome(line: string): boolean {
   const value = line.trim()
@@ -125,6 +127,19 @@ function isClaudeTerminalChrome(line: string): boolean {
     || CLAUDE_DONE_ACTIVITY_CHROME.test(value)
     || value === CLAUDE_NARROW_BYPASS_FOOTER_CHROME
     || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · (?:\/rc|← for agents {1,256}\/rc))?$/.test(value)
+}
+
+function isCompleteClaudeTerminalChrome(lines: string[]): boolean {
+  for (let index = 0; index < lines.length; index += 1) {
+    const value = lines[index]!.trim()
+    if (CLAUDE_UPDATE_READY_FOOTER_CHROME.test(value)
+      && lines[index + 1]?.trim() === '/rc') {
+      index += 1
+      continue
+    }
+    if (!isClaudeTerminalChrome(value)) return false
+  }
+  return true
 }
 
 export function extractCompleteClaudeResponse(transcript: string, marker: string): string | null {
@@ -163,7 +178,7 @@ export function extractCompleteClaudeResponse(transcript: string, marker: string
   } else return null
 
   if (responseMarker <= promptEnd + 1) return null
-  if (!lines.slice(responseMarker + 1).every(isClaudeTerminalChrome)) return null
+  if (!isCompleteClaudeTerminalChrome(lines.slice(responseMarker + 1))) return null
   const response = lines.slice(promptEnd + 1, responseMarker).join('\n').trim()
   return response || null
 }
@@ -1087,6 +1102,10 @@ async function main(): Promise<void> {
           }
           if (response) break
           reason = 'Claude reached a terminal prompt but its complete marked response was unavailable'
+          // The same terminal state and sequence were revalidated after every
+          // bounded transcript read. No later output can complete this turn,
+          // so record the advisor as unavailable instead of waiting an hour.
+          break
         }
         if (!response && Date.now() >= acquisitionDeadline) {
           reason = 'required ephemeral Claude response exceeded the one-hour acquisition deadline'
