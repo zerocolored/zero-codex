@@ -100,6 +100,9 @@ const CLAUDE_DONE_ACTIVITY_CHROME = new RegExp(
   `^[✻✳✽✶✢] (?:Baked|Brewed|Churned|Cogitated|Cooked|Crunched|Sautéed|Worked) for ${CLAUDE_DURATION} · done (?:[01]?[0-9]|2[0-3]):[0-5][0-9]$`,
   'u',
 )
+// Exact narrow-pane rendering observed from Claude Code 2.1.247 in Herdr.
+const CLAUDE_NARROW_BYPASS_FOOTER_CHROME =
+  `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u00B7`
 
 function isClaudeTerminalChrome(line: string): boolean {
   const value = line.trim()
@@ -108,6 +111,7 @@ function isClaudeTerminalChrome(line: string): boolean {
     || /^─+$/.test(value)
     || CLAUDE_LEGACY_ACTIVITY_CHROME.test(value)
     || CLAUDE_DONE_ACTIVITY_CHROME.test(value)
+    || value === CLAUDE_NARROW_BYPASS_FOOTER_CHROME
     || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · (?:\/rc|← for agents {1,256}\/rc))?$/.test(value)
 }
 

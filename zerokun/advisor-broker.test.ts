@@ -643,6 +643,54 @@ print('review complete')
     ), marker)).toBeNull()
   })
 
+  test('Claude 2.1.247の狭幅固定bypass footerだけを既知chromeとして採択する', () => {
+    const marker = 'REQUEST_MARKER=ABCDEF0123456789ABCDEF0123456789'
+    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
+    const response = '独立したレビュー結果です。'
+    const clippedFooter = `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u00B7`
+    const envelope = (...chrome: string[]) => [
+      '依頼本文',
+      instruction,
+      marker,
+      response,
+      marker,
+      ...chrome,
+    ].join('\n')
+
+    expect(extractCompleteClaudeResponse(envelope(
+      '✻ Churned for 22s · done 14:22',
+      '────────────────',
+      '❯',
+      '────────────────',
+      `${clippedFooter}   `,
+    ), marker)).toBe(response)
+
+    for (const footer of [
+      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(4)}\u00B7`,
+      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(6)}\u00B7`,
+      '\u23F5\u23F5 bypass permissions on (shift+tab to\t\t\u00B7',
+      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u00A0'.repeat(5)}\u00B7`,
+      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u2022`,
+      '\u23F5\u23F5 bypass permissions on (shift+tab to',
+      `\u23F5\u23F5 bypass permissions on (shift+tab${'\u0020'.repeat(5)}\u00B7`,
+      `\u23F5\u23F5 bypass permissions on (shift+tab to cycle)${'\u0020'.repeat(5)}\u00B7`,
+      `${clippedFooter} /rc`,
+      `${clippedFooter} marker後にも回答を続けます。`,
+      `\u23F5\u23F5 bypass permissions off (shift+tab to${'\u0020'.repeat(5)}\u00B7`,
+    ]) {
+      expect(extractCompleteClaudeResponse(envelope(footer), marker)).toBeNull()
+    }
+
+    expect(extractCompleteClaudeResponse(envelope(
+      clippedFooter,
+      'marker後にも回答を続けます。',
+    ), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope(
+      'marker後にも回答を続けます。',
+      clippedFooter,
+    ), marker)).toBeNull()
+  })
+
   test('Claude 2.1.247の固定done clockだけをactivity chromeとして採択する', () => {
     const marker = 'REQUEST_MARKER=FEDCBA9876543210FEDCBA9876543210'
     const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
