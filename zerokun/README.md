@@ -133,8 +133,11 @@ codex <trust-args> -C <repo> \
   実装・公開しません。phaseごとの`prepared → dispatching → acknowledged → observed` receiptと最終sealで、
   process間の入力変更・中止・未処理inboundをfail-closeにします。
 - `turn/completed`までに届いた最後の`agentMessage`だけをbounded projectionへ残し、長いturnの
-  `item/completed`を全件保持しません。最終messageが欠けた場合と、終端競合したsteerの受領確認が
-  必要な場合だけ`thread/turns/list` → `thread/read` → `thread/items/list`の公式経路を走査します。
+  `item/completed`を全件保持しません。terminal本文は公開根拠にせず、完了turnは毎回
+  `thread/items/list`を正本として全page走査します。一度成功したjournalのfinal欠落や後続`-32601`を
+  terminal／snapshotで補完しません。最初のrequestが同一methodの数値`-32601`だったreleaseだけ、
+  full指定の`thread/turns/list`と`thread/read`を両方読み、最大4 snapshot内でselected turnが
+  2回連続完全一致した場合に限って代用します。片endpointの失敗や不一致はfail-closeします。
 - job本体に終了時間制限はありません。App Serverの`error` notificationはterminalではなく、
   `willRetry: true`ではrate-limitを含む同一turnの内部retryを待ちます。host側で同じpromptを
   再投入しません。`willRetry: false`の構造化rate-limitはSQLiteへ待刻を保存し、read-only jobは
@@ -197,10 +200,14 @@ reviewer/helperが通常終了後の子process回収にbounded forceを必要と
 runnerは各必須roundのowner-only journalを検査し、Grok solution/riskが別PIDで完了していない、
 response digestがない、fresh Claudeの採択response・snapshot不変・exact cleanup receiptが揃わない場合は、最終本文が完成していても
 Slackへ成功結果を公開しません。
-native Codex 2件はさらに公式App Server履歴を全page照合し、現在の親turnから直接spawnされた一意な
-`solution_analyst`/`risk_reviewer`、子の単一completed turn、round固有marker、host計算digest、孫agentなしが
-すべて一致した場合だけ採択します。setupは公式Codex自身が生成するexperimental protocol型を検査し、
-必要な履歴APIが変わったreleaseを起動前に拒否します。
+native Codex 2件はさらに、最初のturn前に親direct-child baselineを固定し、全source kindの`thread/list`と
+公式turn履歴を全page照合します。`thread/items/list`未対応を同一methodの最初の数値`-32601`でだけ判定し、
+その場合はfull指定の`thread/turns/list`と`thread/read`を両方使い、最大4 snapshot内で連続する2回が
+完全一致する固定点として照合します。現在の親turnから直接spawn
+された一意な`solution_analyst`/`risk_reviewer`、baseline以外の余分な子なし、子の単一completed full turn、
+round固有marker、host計算digest、各advisorのlisted childなしがすべて一致した場合だけ採択します。setupは
+公式Codex自身が生成するexperimental protocol型のsource/activity kindをexact検査し、必要な履歴APIが
+変わったreleaseを起動前に拒否します。
 
 Zeroちゃん本体のrepositoryはhost runtimeの信頼境界なので、そこへのwrite jobは許可者であっても
 拒否します。bootstrapは本体と別の`zerokun-workspace`を、最小安全指示の`AGENTS.md`初期commit付き

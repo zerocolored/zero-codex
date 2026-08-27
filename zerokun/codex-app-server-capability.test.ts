@@ -69,6 +69,12 @@ function fixture(): string {
       'sourceKinds?: Array<ThreadSourceKind> | null',
       'parentThreadId?: string | null',
     ].join('\n'),
+    'v2/ThreadSourceKind.ts': 'export type ThreadSourceKind = "cli" | "vscode" | "exec" | "appServer" | "subAgent" | "subAgentReview" | "subAgentCompact" | "subAgentThreadSpawn" | "subAgentOther" | "unknown";',
+    'v2/ThreadListResponse.ts': [
+      'data: Array<Thread>',
+      'nextCursor: string | null',
+      'backwardsCursor: string | null',
+    ].join('\n'),
     'v2/ThreadItem.ts': [
       '"type": "userMessage"',
       'clientId: string | null',
@@ -86,7 +92,14 @@ function fixture(): string {
       'agentThreadId: string',
     ].join('\n'),
     'MessagePhase.ts': '"commentary" | "final_answer"',
-    'v2/SubAgentActivityKind.ts': '"started" | "interacted" | "interrupted"',
+    'v2/SubAgentActivityKind.ts': 'export type SubAgentActivityKind = "started" | "interacted" | "interrupted";',
+    'v2/ThreadTurnsListParams.ts': [
+      'threadId: string',
+      'cursor?: string | null',
+      'limit?: number | null',
+      'sortDirection?: SortDirection | null',
+      'itemsView?: TurnItemsView | null',
+    ].join('\n'),
     'v2/ThreadTurnsListResponse.ts': 'data: Array<Turn>, nextCursor: string | null',
     'v2/ThreadItemsListResponse.ts': 'data: Array<ThreadItemEntry>, nextCursor: string | null',
     'v2/ThreadItemsListParams.ts': [
@@ -171,6 +184,15 @@ describe('Codex App Server capability gate', () => {
     const root = fixture()
     writeFileSync(join(root, 'v2/SubAgentActivityKind.ts'), '"started" | "interacted"')
     expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('interrupted')
+  })
+
+  test('direct-child全列挙に必要なsource kind集合の増減をfail-closeする', () => {
+    const root = fixture()
+    writeFileSync(
+      join(root, 'v2/ThreadSourceKind.ts'),
+      'export type ThreadSourceKind = "cli" | "vscode" | "exec" | "appServer" | "subAgent" | "subAgentReview" | "subAgentCompact" | "subAgentThreadSpawn" | "subAgentOther" | "futureSubAgent" | "unknown";',
+    )
+    expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('ThreadSourceKind')
   })
 
   test('userMessage clientIdを履歴へ残さないreleaseをfail-closeする', () => {

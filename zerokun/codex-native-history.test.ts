@@ -27,6 +27,7 @@ function fixture(
     | 'solution-partial-same-id' | 'solution-stale-same-id'
     | 'solution-conflicting-id' | 'solution-null-phase' | 'solution-omitted-phase'
     | 'solution-commentary-only' | 'solution-commentary-then-final'
+    | 'solution-legacy-agent-message'
     | 'solution-delegated' | 'solution-long' | null = null,
   itemsListSupported = true,
   fullThreadRead: 'fail' | 'omit-parent-list' | 'omit-parent-everywhere'
@@ -77,7 +78,8 @@ function fixture(
     [parentThreadId, [{
       id: parentTurnId, status: 'completed', itemsView: 'full', error: null,
       items: children.map(child => ({
-        type: 'subAgentActivity', kind: 'started', agentThreadId: child.id,
+        type: 'subAgentActivity', id: `${child.id}-activity`,
+        kind: 'started', agentThreadId: child.id,
       })),
     }]],
     ...children.map(child => [child.id, [{
@@ -102,6 +104,10 @@ function fixture(
             type: 'agentMessage', id: `${child.id}-commentary`,
             phase: 'commentary', text: 'checking',
           }, final]
+        }
+        if (child.perspective === 'solution'
+          && delayedThread === 'solution-legacy-agent-message') {
+          final.type = 'agent_message'
         }
         return [final]
       })(),
@@ -207,8 +213,11 @@ function fixture(
         nextCursor: null,
       }
     }
+    const requestedParent = String(params.parentThreadId ?? '')
     return {
-      data: children.map(child => ({ id: child.id, parentThreadId })),
+      data: requestedParent === parentThreadId
+        ? children.map(child => ({ id: child.id, parentThreadId }))
+        : [],
       nextCursor: null,
     }
   }
@@ -222,6 +231,7 @@ function fixture(
       attemptNonce,
       parentThreadId,
       parentSource: 'appServer' as const,
+      parentChildBaseline: [],
       parentTurnIds: [parentTurnId],
       rounds,
       readForTesting: read,
@@ -279,6 +289,12 @@ describe('native advisor App Server history', () => {
     }
   })
 
+  test('supported item journalでもlegacy agent_messageを受理する', async () => {
+    const value = fixture(true, 'solution-legacy-agent-message')
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+    expect(value.itemsListCalls()).toBe(3)
+  })
+
   test('native履歴のcommentaryだけは拒否しfinal併存時はfinalだけを採択する', async () => {
     const rejected = fixture(true, 'solution-commentary-only')
     await expect(assertNativeAdvisorHistory(rejected.options)).rejects.toThrow(
@@ -302,11 +318,9 @@ describe('native advisor App Server history', () => {
     expect(value.itemsListCalls()).toBe(3)
   })
 
-  test('異なるitem IDの複数final responseは引き続き拒否する', async () => {
+  test('supported item journalを古いturn projectionより優先する', async () => {
     const value = fixture(true, 'solution-conflicting-id')
-    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
-      'one final response',
-    )
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
     expect(value.itemsListCalls()).toBe(3)
   })
 
@@ -331,12 +345,12 @@ describe('native advisor App Server history', () => {
     }
   })
 
-  test('items証拠も不足する場合は補助thread/read失敗を隠さない', async () => {
+  test('supported item journalの不足を補助thread/readで推測しない', async () => {
     const value = fixture(true, 'solution-commentary-only', true, 'fail')
     await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
-      'fixture full thread read failed',
+      'does not contain one final response',
     )
-    expect(value.fullThreadReadCalls()).toBe(1)
+    expect(value.fullThreadReadCalls()).toBe(0)
   })
 
   test('turns/listから欠落したparent turnをthread/readから復元する', async () => {
@@ -349,7 +363,7 @@ describe('native advisor App Server history', () => {
   test('全履歴から欠落したparent turnは明示的に拒否する', async () => {
     const value = fixture(true, null, true, 'omit-parent-everywhere')
     await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
-      'omitted selected turn parent-turn',
+      'omitted completed turn parent-turn',
     )
   })
 
@@ -383,10 +397,706 @@ describe('native advisor App Server history', () => {
     expect(value.itemsListCalls()).toBe(3)
   })
 
-  test('items/list未対応ならnegative evidenceを推測せずfail-closeする', async () => {
+  test('items/list未対応なら両方のfull履歴viewを固定点照合する', async () => {
     const value = fixture(true, null, false)
-    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow('unsupported')
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
     expect(value.itemsListCalls()).toBe(1)
+    expect(value.fullThreadReadCalls()).toBe(6)
+  })
+
+  test('未対応fallbackはturns/listとthread/readの両方にcompleted fullを要求する', async () => {
+    for (const weakenedMethod of ['thread/turns/list', 'thread/read'] as const) {
+      const value = fixture(true, null, false)
+      const original = value.options.readForTesting!
+      value.options.readForTesting = async (method, params) => {
+        const response = await original(method, params)
+        const parent = method === weakenedMethod
+          && String(params.threadId ?? '') === value.options.parentThreadId
+          && (method !== 'thread/read' || params.includeTurns === true)
+        if (!parent) return response
+        if (method === 'thread/turns/list') {
+          return {
+            ...response,
+            data: (response.data as Array<Record<string, unknown>>).map(turn => ({
+              ...turn, itemsView: 'summary',
+            })),
+          }
+        }
+        const thread = response.thread as Record<string, unknown>
+        return {
+          ...response,
+          thread: {
+            ...thread,
+            turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+              ...turn, itemsView: 'summary',
+            })),
+          },
+        }
+      }
+      await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
+        'not a completed full projection',
+      )
+    }
+  })
+
+  test('文字列-32601または別methodのerrorをitems/list未対応へ誤分類しない', async () => {
+    for (const error of [
+      new AppServerProtocolError(
+        'string code', 'thread/items/list', 10, { code: '-32601' },
+      ),
+      new AppServerProtocolError('wrong method', 'thread/read', 10, { code: -32601 }),
+      new AppServerProtocolError('invalid params', 'thread/items/list', 10, { code: -32602 }),
+      new AppServerProtocolError('server error', 'thread/items/list', 10, { code: -32000 }),
+    ]) {
+      const value = fixture(true)
+      const original = value.options.readForTesting!
+      value.options.readForTesting = async (method, params) => {
+        if (method === 'thread/items/list') throw error
+        return original(method, params)
+      }
+      await expect(assertNativeAdvisorHistory(value.options)).rejects.toBe(error)
+    }
+  })
+
+  test('items/list成功後または2page目の-32601はfallbackせず失敗する', async () => {
+    const value = fixture(true)
+    const original = value.options.readForTesting!
+    value.options.readForTesting = async (method, params) => {
+      if (method !== 'thread/items/list') return original(method, params)
+      if (params.cursor === 'page-2') {
+        throw new AppServerProtocolError(
+          'late unsupported', 'thread/items/list', 11, { code: -32601 },
+        )
+      }
+      const response = await original(method, params)
+      return { ...response, nextCursor: 'page-2' }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow('late unsupported')
+  })
+
+  test('fallbackは一時的な不完全snapshotから連続する同一valid snapshotへ収束する', async () => {
+    const value = fixture(true, null, false)
+    const original = value.options.readForTesting!
+    let parentMetadataReads = 0
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === value.options.parentThreadId) parentMetadataReads += 1
+      const response = await original(method, params)
+      const firstSnapshot = parentMetadataReads === 1
+      const parentFullView = params.threadId === value.options.parentThreadId
+        && (method === 'thread/turns/list'
+          || (method === 'thread/read' && params.includeTurns === true))
+      if (!firstSnapshot || !parentFullView) return response
+      if (method === 'thread/turns/list') {
+        return {
+          ...response,
+          data: (response.data as Array<Record<string, unknown>>).map(turn => ({
+            ...turn,
+            items: (turn.items as unknown[]).slice(0, 1),
+          })),
+        }
+      }
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+            ...turn,
+            items: (turn.items as unknown[]).slice(0, 1),
+          })),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+    expect(value.fullThreadReadCalls()).toBe(9)
+  })
+
+  test('fallbackが上限内に固定点へ到達しなければ拒否する', async () => {
+    const value = fixture(true, null, false)
+    const original = value.options.readForTesting!
+    let metadataReads = 0
+    value.options.readForTesting = async (method, params) => {
+      const response = await original(method, params)
+      if (method !== 'thread/read' || params.includeTurns === true) return response
+      metadataReads += 1
+      return {
+        ...response,
+        thread: {
+          ...(response.thread as Record<string, unknown>),
+          historyEpoch: Math.ceil(metadataReads / 3),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
+      'did not reach a fixed point after 4 snapshots',
+    )
+  })
+
+  test('同一item IDのimmutable typeまたはagent thread衝突を拒否する', async () => {
+    const typeConflict = fixture(true, null, false)
+    const typeOriginal = typeConflict.options.readForTesting!
+    typeConflict.options.readForTesting = async (method, params) => {
+      const response = await typeOriginal(method, params)
+      if (method !== 'thread/read' || params.includeTurns !== true
+        || params.threadId !== 'solution-thread') return response
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+            ...turn,
+            items: (turn.items as Array<Record<string, unknown>>).map(item => ({
+              ...item, type: 'commandExecution', status: 'completed',
+            })),
+          })),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(typeConflict.options)).rejects.toThrow(
+      'changed immutable type',
+    )
+
+    const threadConflict = fixture(true, null, false)
+    const threadOriginal = threadConflict.options.readForTesting!
+    threadConflict.options.readForTesting = async (method, params) => {
+      const response = await threadOriginal(method, params)
+      if (method !== 'thread/read' || params.includeTurns !== true
+        || params.threadId !== 'parent-thread') return response
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+            ...turn,
+            items: (turn.items as Array<Record<string, unknown>>).map((item, index) => (
+              index === 0 ? { ...item, agentThreadId: 'unexpected-thread' } : item
+            )),
+          })),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(threadConflict.options)).rejects.toThrow(
+      'changed immutable agent thread',
+    )
+
+    const missingIdentity = fixture(true, null, false)
+    const missingOriginal = missingIdentity.options.readForTesting!
+    missingIdentity.options.readForTesting = async (method, params) => {
+      const response = await missingOriginal(method, params)
+      if (method !== 'thread/read' || params.includeTurns !== true
+        || params.threadId !== 'parent-thread') return response
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+            ...turn,
+            items: (turn.items as Array<Record<string, unknown>>).map((item, index) => {
+              if (index !== 0) return item
+              const changed = { ...item }
+              delete changed.agentThreadId
+              return changed
+            }),
+          })),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(missingIdentity.options)).rejects.toThrow(
+      'changed immutable agent thread',
+    )
+  })
+
+  test('fallbackは両endpoint viewが個別に固定するまで採択しない', async () => {
+    const value = fixture(true, null, false)
+    const original = value.options.readForTesting!
+    let snapshot = 0
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === 'parent-thread') snapshot += 1
+      const response = await original(method, params)
+      const solutionFullView = params.threadId === 'solution-thread'
+        && (method === 'thread/turns/list'
+          || (method === 'thread/read' && params.includeTurns === true))
+      if (!solutionFullView) return response
+      const keepItems = snapshot % 2 === 1
+        ? method === 'thread/turns/list'
+        : method === 'thread/read'
+      if (method === 'thread/turns/list') {
+        return {
+          ...response,
+          data: (response.data as Array<Record<string, unknown>>).map(turn => ({
+            ...turn, items: keepItems ? turn.items : [],
+          })),
+        }
+      }
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+            ...turn, items: keepItems ? turn.items : [],
+          })),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
+      'fallback endpoints disagree on selected evidence',
+    )
+  })
+
+  test('fallbackは両endpointの相補的なadvisor証拠を合成しない', async () => {
+    const value = fixture(true, null, false)
+    const original = value.options.readForTesting!
+    value.options.readForTesting = async (method, params) => {
+      const response = await original(method, params)
+      const parentFullView = params.threadId === 'parent-thread'
+        && (method === 'thread/turns/list'
+          || (method === 'thread/read' && params.includeTurns === true))
+      if (!parentFullView) return response
+      const keepThreadId = method === 'thread/turns/list'
+        ? 'solution-thread'
+        : 'risk-thread'
+      const split = (turn: Record<string, unknown>): Record<string, unknown> => ({
+        ...turn,
+        items: (turn.items as Array<Record<string, unknown>>).filter(item => (
+          item.agentThreadId === keepThreadId
+        )),
+      })
+      if (method === 'thread/turns/list') {
+        return {
+          ...response,
+          data: (response.data as Array<Record<string, unknown>>).map(split),
+        }
+      }
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(split),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
+      'fallback endpoints disagree on selected evidence',
+    )
+  })
+
+  test('fallbackはsnapshotをまたぐstable item identity変更を拒否する', async () => {
+    const activityConflict = fixture(true, null, false)
+    const activityOriginal = activityConflict.options.readForTesting!
+    let activitySnapshot = 0
+    activityConflict.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === 'parent-thread') activitySnapshot += 1
+      const response = await activityOriginal(method, params)
+      const parentFullView = params.threadId === 'parent-thread'
+        && (method === 'thread/turns/list'
+          || (method === 'thread/read' && params.includeTurns === true))
+      if (!parentFullView || activitySnapshot < 2) return response
+      const swap = (turn: Record<string, unknown>): Record<string, unknown> => ({
+        ...turn,
+        items: (turn.items as Array<Record<string, unknown>>).map(item => ({
+          ...item,
+          agentThreadId: item.agentThreadId === 'solution-thread'
+            ? 'risk-thread'
+            : item.agentThreadId === 'risk-thread'
+              ? 'solution-thread'
+              : item.agentThreadId,
+        })),
+      })
+      if (method === 'thread/turns/list') {
+        return { ...response, data: (response.data as Array<Record<string, unknown>>).map(swap) }
+      }
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: { ...thread, turns: (thread.turns as Array<Record<string, unknown>>).map(swap) },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(activityConflict.options)).rejects.toThrow(
+      'changed immutable agent thread',
+    )
+
+    const typeConflict = fixture(true, null, false)
+    const typeOriginal = typeConflict.options.readForTesting!
+    let typeSnapshot = 0
+    typeConflict.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === 'parent-thread') typeSnapshot += 1
+      const response = await typeOriginal(method, params)
+      const solutionFullView = params.threadId === 'solution-thread'
+        && (method === 'thread/turns/list'
+          || (method === 'thread/read' && params.includeTurns === true))
+      if (!solutionFullView) return response
+      const appendChangingItem = (turn: Record<string, unknown>): Record<string, unknown> => ({
+        ...turn,
+        items: [
+          ...(turn.items as unknown[]),
+          {
+            type: typeSnapshot < 2 ? 'commandExecution' : 'userMessage',
+            id: 'stable-unknown-item',
+          },
+        ],
+      })
+      if (method === 'thread/turns/list') {
+        return {
+          ...response,
+          data: (response.data as Array<Record<string, unknown>>).map(appendChangingItem),
+        }
+      }
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(appendChangingItem),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(typeConflict.options)).rejects.toThrow(
+      'changed immutable type',
+    )
+  })
+
+  test('fallbackはagent message raw aliasをimmutable identityとして扱う', async () => {
+    const switchAcrossSnapshots = fixture(true, null, false)
+    const switchOriginal = switchAcrossSnapshots.options.readForTesting!
+    let snapshot = 0
+    switchAcrossSnapshots.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === 'parent-thread') snapshot += 1
+      const response = await switchOriginal(method, params)
+      const selectedView = snapshot >= 2 && params.threadId === 'solution-thread'
+        && (method === 'thread/turns/list'
+          || (method === 'thread/read' && params.includeTurns === true))
+      if (!selectedView) return response
+      const useLegacyAlias = (turn: Record<string, unknown>) => ({
+        ...turn,
+        items: (turn.items as Array<Record<string, unknown>>).map(item => ({
+          ...item, type: item.type === 'agentMessage' ? 'agent_message' : item.type,
+        })),
+      })
+      if (method === 'thread/turns/list') {
+        return {
+          ...response,
+          data: (response.data as Array<Record<string, unknown>>).map(useLegacyAlias),
+        }
+      }
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(useLegacyAlias),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(switchAcrossSnapshots.options)).rejects.toThrow(
+      'changed immutable type',
+    )
+
+    const endpointMismatch = fixture(true, null, false)
+    const mismatchOriginal = endpointMismatch.options.readForTesting!
+    endpointMismatch.options.readForTesting = async (method, params) => {
+      const response = await mismatchOriginal(method, params)
+      if (method !== 'thread/read' || params.includeTurns !== true
+        || params.threadId !== 'solution-thread') return response
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+            ...turn,
+            items: (turn.items as Array<Record<string, unknown>>).map(item => ({
+              ...item, type: item.type === 'agentMessage' ? 'agent_message' : item.type,
+            })),
+          })),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(endpointMismatch.options)).rejects.toThrow(
+      'changed immutable type',
+    )
+
+    const consistentLegacy = fixture(true, null, false)
+    const legacyOriginal = consistentLegacy.options.readForTesting!
+    consistentLegacy.options.readForTesting = async (method, params) => {
+      const response = await legacyOriginal(method, params)
+      const selectedView = params.threadId === 'solution-thread'
+        && (method === 'thread/turns/list'
+          || (method === 'thread/read' && params.includeTurns === true))
+      if (!selectedView) return response
+      const useLegacyAlias = (turn: Record<string, unknown>) => ({
+        ...turn,
+        items: (turn.items as Array<Record<string, unknown>>).map(item => ({
+          ...item, type: item.type === 'agentMessage' ? 'agent_message' : item.type,
+        })),
+      })
+      if (method === 'thread/turns/list') {
+        return {
+          ...response,
+          data: (response.data as Array<Record<string, unknown>>).map(useLegacyAlias),
+        }
+      }
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(useLegacyAlias),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(consistentLegacy.options)).resolves.toBeUndefined()
+  })
+
+  test('fallbackは同一agent item IDのtext materialization後に固定点へ収束する', async () => {
+    const value = fixture(true, null, false)
+    const original = value.options.readForTesting!
+    let snapshot = 0
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === 'parent-thread') snapshot += 1
+      const response = await original(method, params)
+      const solutionFullView = params.threadId === 'solution-thread'
+        && (method === 'thread/turns/list'
+          || (method === 'thread/read' && params.includeTurns === true))
+      if (!solutionFullView || snapshot > 1) return response
+      const clearText = (turn: Record<string, unknown>): Record<string, unknown> => ({
+        ...turn,
+        items: (turn.items as Array<Record<string, unknown>>).map(item => ({
+          ...item, text: '',
+        })),
+      })
+      if (method === 'thread/turns/list') {
+        return { ...response, data: (response.data as Array<Record<string, unknown>>).map(clearText) }
+      }
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: { ...thread, turns: (thread.turns as Array<Record<string, unknown>>).map(clearText) },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+    expect(value.fullThreadReadCalls()).toBe(9)
+  })
+
+  test('fallback full viewのraw item shapeと件数上限を強制する', async () => {
+    const malformed = fixture(true, null, false)
+    const malformedOriginal = malformed.options.readForTesting!
+    malformed.options.readForTesting = async (method, params) => {
+      const response = await malformedOriginal(method, params)
+      if (method !== 'thread/turns/list' || params.threadId !== 'solution-thread') {
+        return response
+      }
+      return {
+        ...response,
+        data: (response.data as Array<Record<string, unknown>>).map(turn => ({
+          ...turn, items: [...(turn.items as unknown[]), null],
+        })),
+      }
+    }
+    await expect(assertNativeAdvisorHistory(malformed.options)).rejects.toThrow(
+      'contains an invalid raw item',
+    )
+
+    const oversized = fixture(true, null, false)
+    const oversizedOriginal = oversized.options.readForTesting!
+    oversized.options.readForTesting = async (method, params) => {
+      const response = await oversizedOriginal(method, params)
+      if (method !== 'thread/turns/list' || params.threadId !== 'solution-thread') {
+        return response
+      }
+      return {
+        ...response,
+        data: (response.data as Array<Record<string, unknown>>).map(turn => ({
+          ...turn,
+          items: Array.from({ length: 65_537 }, (_, index) => ({
+            type: 'commandExecution', id: `irrelevant-${index}`, status: 'completed',
+          })),
+        })),
+      }
+    }
+    await expect(assertNativeAdvisorHistory(oversized.options)).rejects.toThrow(
+      'full item view exceeds the managed raw bound',
+    )
+  })
+
+  test('fallbackは同一item IDのfinalからcommentaryへの後段変更を隠さない', async () => {
+    const value = fixture(true, null, false)
+    const original = value.options.readForTesting!
+    value.options.readForTesting = async (method, params) => {
+      const response = await original(method, params)
+      if (method !== 'thread/read' || params.includeTurns !== true
+        || params.threadId !== 'solution-thread') return response
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+            ...turn,
+            items: (turn.items as Array<Record<string, unknown>>).map(item => ({
+              ...item, phase: 'commentary',
+            })),
+          })),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
+      'fallback endpoints disagree on selected evidence',
+    )
+  })
+
+  test('fallbackはduplicate turn ID・full-read identity drift・複数finalを拒否する', async () => {
+    const duplicate = fixture(true, null, false)
+    const duplicateOriginal = duplicate.options.readForTesting!
+    duplicate.options.readForTesting = async (method, params) => {
+      const response = await duplicateOriginal(method, params)
+      if (method !== 'thread/turns/list' || params.threadId !== 'solution-thread') {
+        return response
+      }
+      return { ...response, data: [...(response.data as unknown[]), response.data![0]] }
+    }
+    await expect(assertNativeAdvisorHistory(duplicate.options)).rejects.toThrow(
+      'invalid or duplicated',
+    )
+
+    const identity = fixture(true, null, false)
+    const identityOriginal = identity.options.readForTesting!
+    identity.options.readForTesting = async (method, params) => {
+      const response = await identityOriginal(method, params)
+      if (method !== 'thread/read' || params.includeTurns !== true
+        || params.threadId !== 'solution-thread') return response
+      return {
+        ...response,
+        thread: { ...(response.thread as Record<string, unknown>), agentRole: 'risk_reviewer' },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(identity.options)).rejects.toThrow(
+      'full read changed identity',
+    )
+
+    const finals = fixture(true, null, false)
+    const finalsOriginal = finals.options.readForTesting!
+    finals.options.readForTesting = async (method, params) => {
+      const response = await finalsOriginal(method, params)
+      if (method !== 'thread/read' || params.includeTurns !== true
+        || params.threadId !== 'solution-thread') return response
+      const thread = response.thread as Record<string, unknown>
+      return {
+        ...response,
+        thread: {
+          ...thread,
+          turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+            ...turn,
+            items: [
+              ...(turn.items as unknown[]),
+              { type: 'agentMessage', id: 'other-final', phase: 'final_answer', text: 'other' },
+            ],
+          })),
+        },
+      }
+    }
+    await expect(assertNativeAdvisorHistory(finals.options)).rejects.toThrow(
+      'fallback endpoints disagree on selected evidence',
+    )
+  })
+
+  test('item paginationの反復cursorと過長cursorを拒否する', async () => {
+    const repeated = fixture(true)
+    const repeatedOriginal = repeated.options.readForTesting!
+    repeated.options.readForTesting = async (method, params) => {
+      const response = await repeatedOriginal(method, params)
+      if (method !== 'thread/items/list') return response
+      return { ...response, nextCursor: 'same-page' }
+    }
+    await expect(assertNativeAdvisorHistory(repeated.options)).rejects.toThrow(
+      'did not advance',
+    )
+
+    const oversized = fixture(true)
+    const oversizedOriginal = oversized.options.readForTesting!
+    oversized.options.readForTesting = async (method, params) => {
+      const response = await oversizedOriginal(method, params)
+      if (method !== 'thread/items/list') return response
+      return { ...response, nextCursor: 'x'.repeat(8_193) }
+    }
+    await expect(assertNativeAdvisorHistory(oversized.options)).rejects.toThrow(
+      'cursor is invalid',
+    )
+  })
+
+  test('advisor直下のlisted grandchildはitem projectionになくても拒否する', async () => {
+    const value = fixture(true)
+    const original = value.options.readForTesting!
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/list' && params.parentThreadId === 'solution-thread') {
+        return {
+          data: [{ id: 'hidden-grandchild', parentThreadId: 'solution-thread' }],
+          nextCursor: null,
+        }
+      }
+      return original(method, params)
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
+      'delegated to another subagent',
+    )
+  })
+
+  test('再開前から存在するdirect childはbaselineに限って保持する', async () => {
+    const value = fixture(true)
+    value.options.parentChildBaseline = ['historical-child']
+    const original = value.options.readForTesting!
+    value.options.readForTesting = async (method, params) => {
+      const response = await original(method, params)
+      if (method !== 'thread/list' || params.parentThreadId !== 'parent-thread') return response
+      return {
+        ...response,
+        data: [
+          { id: 'historical-child', parentThreadId: 'parent-thread' },
+          ...(response.data as unknown[]),
+        ],
+      }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+  })
+
+  test('全source kind指定と空pageのpagination拒否を維持する', async () => {
+    const value = fixture(true)
+    const original = value.options.readForTesting!
+    let checked = 0
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/list') {
+        expect(params.sourceKinds).toEqual([
+          'cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
+          'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown',
+        ])
+        checked += 1
+      }
+      return original(method, params)
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+    expect(checked).toBe(3)
+
+    const stalled = fixture(true)
+    const stalledOriginal = stalled.options.readForTesting!
+    stalled.options.readForTesting = async (method, params) => {
+      if (method === 'thread/list' && params.parentThreadId === 'parent-thread') {
+        return { data: [], nextCursor: 'never-advances' }
+      }
+      return stalledOriginal(method, params)
+    }
+    await expect(assertNativeAdvisorHistory(stalled.options)).rejects.toThrow(
+      'pagination did not advance',
+    )
   })
 
   test('turns/list未対応時はthread/readへ弱めず公開をfail-closeする', async () => {

@@ -91,7 +91,7 @@ import {
   AppServerProtocolError,
   CodexAppServerSession,
   appServerFinalMessage,
-  isFinalAppServerAgentMessage,
+  isAppServerMethodUnsupported,
   sameAppServerSessionSource,
   type AppServerSessionSource,
   type AppServerTurn,
@@ -1718,6 +1718,93 @@ export function assertRequiredAdvisorRounds(
   })
 }
 
+type NativeHistoryMethod =
+  | 'thread/read' | 'thread/list' | 'thread/turns/list' | 'thread/items/list'
+type NativeHistoryReader = (
+  method: NativeHistoryMethod,
+  params: Record<string, unknown>,
+) => Promise<Record<string, unknown>>
+
+const CODEX_THREAD_SOURCE_KINDS = [
+  'cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
+  'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown',
+] as const
+const MAX_NATIVE_HISTORY_PAGES = 128
+const MAX_NATIVE_HISTORY_TURNS = 4_096
+const MAX_NATIVE_HISTORY_RAW_ITEMS = 65_536
+const MAX_NATIVE_HISTORY_EVIDENCE_ITEMS = 4_096
+const MAX_NATIVE_HISTORY_CHILDREN = 4_096
+
+function nativeHistoryRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} is invalid`)
+  }
+  return value as Record<string, unknown>
+}
+
+function nativeHistoryCursor(value: unknown, label: string): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string' || value.length < 1 || value.length > 8_192) {
+    throw new Error(`${label} cursor is invalid`)
+  }
+  return value
+}
+
+async function readDirectChildThreads(
+  read: NativeHistoryReader,
+  parentThreadId: string,
+  label: string,
+): Promise<Array<Record<string, unknown>>> {
+  const children: Array<Record<string, unknown>> = []
+  const childIds = new Set<string>()
+  const seenCursors = new Set<string>()
+  let cursor: string | null = null
+  for (let pageIndex = 0; pageIndex < MAX_NATIVE_HISTORY_PAGES; pageIndex += 1) {
+    const page = await read('thread/list', {
+      parentThreadId,
+      sourceKinds: [...CODEX_THREAD_SOURCE_KINDS],
+      limit: 100,
+      sortDirection: 'asc',
+      cursor,
+    })
+    if (!Array.isArray(page.data)) throw new Error(`${label} page is invalid`)
+    for (const [index, rawChild] of page.data.entries()) {
+      const child = nativeHistoryRecord(rawChild, `${label} child ${index}`)
+      if (typeof child.id !== 'string' || child.id.length < 1 || child.id.length > 256
+        || child.parentThreadId !== parentThreadId || childIds.has(child.id)) {
+        throw new Error(`${label} contains an invalid or duplicate child`)
+      }
+      childIds.add(child.id)
+      children.push(child)
+      if (children.length > MAX_NATIVE_HISTORY_CHILDREN) {
+        throw new Error(`${label} exceeds the managed bound`)
+      }
+    }
+    const nextCursor = nativeHistoryCursor(page.nextCursor, label)
+    if (nextCursor === null) return children
+    if (page.data.length === 0 || seenCursors.has(nextCursor)) {
+      throw new Error(`${label} pagination did not advance`)
+    }
+    seenCursors.add(nextCursor)
+    cursor = nextCursor
+  }
+  throw new Error(`${label} page count exceeds the managed bound`)
+}
+
+async function captureNativeAdvisorParentChildBaseline(
+  session: CodexAppServerSession,
+  parentThreadId: string,
+): Promise<string[]> {
+  const children = await readDirectChildThreads(
+    async (method, params) => (await session.request(method, params, {
+      timeoutMs: 15_000,
+    })).result,
+    parentThreadId,
+    'native advisor pre-turn child baseline',
+  )
+  return children.map(child => String(child.id))
+}
+
 export async function assertNativeAdvisorHistory(options: {
   codexBin: string
   repoPath: string
@@ -1725,16 +1812,14 @@ export async function assertNativeAdvisorHistory(options: {
   attemptNonce: string
   parentThreadId: string
   parentSource: AppServerSessionSource
+  parentChildBaseline: string[]
   parentTurnIds: string[]
   rounds: NativeAdvisorRoundEvidence[]
   seatbeltFingerprint?: SeatbeltFingerprint
   seatbeltStateDir?: string
   signal?: AbortSignal
   revalidate?: () => void
-  readForTesting?: (
-    method: 'thread/read' | 'thread/list' | 'thread/turns/list' | 'thread/items/list',
-    params: Record<string, unknown>,
-  ) => Promise<Record<string, unknown>>
+  readForTesting?: NativeHistoryReader
 }): Promise<void> {
   const historyPermissionOverrides = nativeAdvisorHistoryPermissionOverrides(
     options.permissionOverrides,
@@ -1762,8 +1847,8 @@ export async function assertNativeAdvisorHistory(options: {
     )
     options.revalidate?.()
   }
-  const read = options.readForTesting ?? (async (
-    method: 'thread/read' | 'thread/list' | 'thread/turns/list' | 'thread/items/list',
+  const read: NativeHistoryReader = options.readForTesting ?? (async (
+    method: NativeHistoryMethod,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> => {
     if (!options.seatbeltFingerprint || !options.seatbeltStateDir) {
@@ -1786,34 +1871,168 @@ export async function assertNativeAdvisorHistory(options: {
     )
   })
 
+  let itemsListState: 'unknown' | 'supported' | 'unsupported' = 'unknown'
+  const itemListingUnsupported = (): boolean => itemsListState === 'unsupported'
+
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical)
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, canonical(child)]))
+    }
+    return value
+  }
+  const parseTurns = (value: unknown, label: string): Array<Record<string, unknown>> => {
+    if (!Array.isArray(value) || value.length > MAX_NATIVE_HISTORY_TURNS) {
+      throw new Error(`${label} is invalid`)
+    }
+    const seen = new Set<string>()
+    return value.map((rawTurn, index) => {
+      const turn = nativeHistoryRecord(rawTurn, `${label} turn ${index}`)
+      if (typeof turn.id !== 'string' || turn.id.length < 1 || turn.id.length > 256
+        || seen.has(turn.id)) {
+        throw new Error(`${label} turn ${index} is invalid or duplicated`)
+      }
+      seen.add(turn.id)
+      return turn
+    })
+  }
+  const stableItemRegistry = new Map<
+    string,
+    { type: string; agentThreadId: string | null }
+  >()
+  const evidenceItems = (
+    itemScope: string,
+    ...sources: unknown[]
+  ): Array<Record<string, unknown>> => {
+    const projected = new Map<string, Record<string, unknown>>()
+    for (const source of sources) {
+      if (!Array.isArray(source)) continue
+      if (source.length > MAX_NATIVE_HISTORY_RAW_ITEMS) {
+        throw new Error('native advisor full item view exceeds the managed raw bound')
+      }
+      for (const rawItem of source) {
+        if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
+          throw new Error('native advisor full item view contains an invalid raw item')
+        }
+        const item = rawItem as Record<string, unknown>
+        const normalizedType = item.type === 'agentMessage' || item.type === 'agent_message'
+          ? 'agentMessage'
+          : item.type === 'subAgentActivity'
+            ? 'subAgentActivity'
+            : null
+        const stableId = typeof item.id === 'string' && item.id.length > 0
+          ? item.id
+          : null
+        if (stableId !== null) {
+          // Projection accepts the generated camelCase spelling and the
+          // legacy snake_case spelling, but an existing item ID may never
+          // switch its raw protocol discriminator between endpoints or
+          // snapshots. Normalizing here would hide that identity collision.
+          const stableType = typeof item.type === 'string'
+            ? item.type
+            : `non-string:${typeof item.type}`
+          const stableKey = `${itemScope}\u0000${stableId}`
+          const stableIdentity = {
+            type: stableType,
+            agentThreadId: stableType === 'subAgentActivity'
+              && typeof item.agentThreadId === 'string'
+              && item.agentThreadId.length > 0
+              ? item.agentThreadId
+              : null,
+          }
+          const previousIdentity = stableItemRegistry.get(stableKey)
+          if (previousIdentity && previousIdentity.type !== stableIdentity.type) {
+            throw new Error(`native advisor item item-id:${stableId} changed immutable type`)
+          }
+          if (previousIdentity && stableType === 'subAgentActivity'
+            && previousIdentity.agentThreadId !== stableIdentity.agentThreadId) {
+            throw new Error(
+              `native advisor item item-id:${stableId} changed immutable agent thread`,
+            )
+          }
+          stableItemRegistry.set(stableKey, stableIdentity)
+          if (stableItemRegistry.size > MAX_NATIVE_HISTORY_RAW_ITEMS * 4) {
+            throw new Error('native advisor stable item registry exceeds the managed bound')
+          }
+        }
+        let key: string | null = null
+        if (normalizedType === 'agentMessage') {
+          key = stableId !== null
+            ? `item-id:${stableId}`
+            : `agent:${String(item.phase)}:${String(item.text)}`
+        } else if (normalizedType === 'subAgentActivity') {
+          key = stableId !== null
+            ? `item-id:${stableId}`
+            : `subagent:${String(item.kind)}:${String(item.agentThreadId)}`
+        }
+        if (key !== null) {
+          const previous = projected.get(key)
+          if (previous) {
+            const previousType = previous.type === 'agentMessage'
+              || previous.type === 'agent_message'
+              ? 'agentMessage'
+              : previous.type === 'subAgentActivity'
+                ? 'subAgentActivity'
+                : null
+            if (previousType !== normalizedType) {
+              throw new Error(`native advisor item ${key} changed immutable type`)
+            }
+            if (normalizedType === 'subAgentActivity'
+              && (typeof previous.agentThreadId !== 'string'
+                || previous.agentThreadId.length < 1
+                || typeof item.agentThreadId !== 'string'
+                || item.agentThreadId.length < 1
+                || previous.agentThreadId !== item.agentThreadId)) {
+              throw new Error(`native advisor item ${key} changed immutable agent thread`)
+            }
+          }
+          projected.set(key, item)
+        }
+        if (projected.size > MAX_NATIVE_HISTORY_EVIDENCE_ITEMS) {
+          throw new Error('native advisor item evidence exceeds the managed bound')
+        }
+      }
+    }
+    return [...projected.values()]
+  }
+  const completedFullTurn = (turn: Record<string, unknown>, label: string): void => {
+    if (turn.status !== 'completed' || turn.itemsView !== 'full'
+      || !Array.isArray(turn.items)) {
+      throw new Error(`${label} is not a completed full projection`)
+    }
+  }
+
+  type ThreadEvidenceRead = {
+    response: Record<string, unknown>
+    fallbackViewDigests: { turnsList: string; threadRead: string } | null
+    fallbackViewsAgree: boolean | null
+  }
   const readThreadEvidence = async (
     threadId: string,
-    selection: {
-      requireOneTurn?: boolean
-      turnIds?: string[]
-      expectedStartedAgentIds?: string[]
-    },
-  ) => {
+    selection: { requireOneTurn?: boolean; turnIds?: string[] },
+  ): Promise<ThreadEvidenceRead> => {
     const metadataResponse = await read('thread/read', { threadId, includeTurns: false })
-    const metadata = metadataResponse.thread
-    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
-      throw new Error(`native advisor thread ${threadId} metadata is invalid`)
+    const metadata = nativeHistoryRecord(
+      metadataResponse.thread,
+      `native advisor thread ${threadId} metadata`,
+    )
+    if (metadata.id !== threadId) {
+      throw new Error(`native advisor thread ${threadId} metadata identity is invalid`)
     }
-    const parseTurns = (value: unknown, label: string): Array<Record<string, unknown>> => {
-      if (!Array.isArray(value)) throw new Error(`${label} is invalid`)
-      return value.map((rawTurn, index) => {
-        if (!rawTurn || typeof rawTurn !== 'object' || Array.isArray(rawTurn)
-          || typeof (rawTurn as Record<string, unknown>).id !== 'string') {
-          throw new Error(`${label} turn ${index} is invalid`)
-        }
-        return rawTurn as Record<string, unknown>
-      })
-    }
-    let listedTurns: Array<Record<string, unknown>> = []
-    let readTurns: Array<Record<string, unknown>> | null = null
-    let turnCursor: string | null = null
+    const metadataIdentity = canonical({
+      id: metadata.id,
+      parentThreadId: metadata.parentThreadId,
+      cwd: metadata.cwd,
+      source: metadata.source,
+      agentRole: metadata.agentRole,
+    })
+    const listedTurns: Array<Record<string, unknown>> = []
+    const listedTurnIds = new Set<string>()
     const seenTurnCursors = new Set<string>()
-    do {
+    let turnCursor: string | null = null
+    for (let pageIndex = 0; pageIndex < MAX_NATIVE_HISTORY_PAGES; pageIndex += 1) {
       const page = await read('thread/turns/list', {
         threadId,
         cursor: turnCursor,
@@ -1821,238 +2040,326 @@ export async function assertNativeAdvisorHistory(options: {
         sortDirection: 'asc',
         itemsView: 'full',
       })
-      if (!(page.nextCursor === null || typeof page.nextCursor === 'string')) {
-        throw new Error(`native advisor thread ${threadId} turn listing is invalid`)
-      }
-      listedTurns.push(...parseTurns(
+      const pageTurns = parseTurns(
         page.data,
+        `native advisor thread ${threadId} turn listing page ${pageIndex}`,
+      )
+      for (const turn of pageTurns) {
+        if (listedTurnIds.has(String(turn.id))) {
+          throw new Error(`native advisor thread ${threadId} turn listing contains duplicates`)
+        }
+        listedTurnIds.add(String(turn.id))
+        listedTurns.push(turn)
+        if (listedTurns.length > MAX_NATIVE_HISTORY_TURNS) {
+          throw new Error(`native advisor thread ${threadId} turn listing exceeds the managed bound`)
+        }
+      }
+      const nextCursor = nativeHistoryCursor(
+        page.nextCursor,
         `native advisor thread ${threadId} turn listing`,
-      ))
-      if (listedTurns.length > 4_096) {
-        throw new Error(`native advisor thread ${threadId} turn listing exceeds the managed bound`)
+      )
+      if (nextCursor === null) break
+      if (pageTurns.length === 0 || seenTurnCursors.has(nextCursor)) {
+        throw new Error(`native advisor thread ${threadId} turn listing did not advance`)
       }
-      turnCursor = page.nextCursor
-      if (turnCursor !== null && seenTurnCursors.has(turnCursor)) {
-        throw new Error(`native advisor thread ${threadId} turn listing cursor repeated`)
+      seenTurnCursors.add(nextCursor)
+      turnCursor = nextCursor
+      if (pageIndex === MAX_NATIVE_HISTORY_PAGES - 1) {
+        throw new Error(`native advisor thread ${threadId} turn page count exceeds the managed bound`)
       }
-      if (turnCursor !== null) seenTurnCursors.add(turnCursor)
-    } while (turnCursor !== null)
+    }
+    let readTurns: Array<Record<string, unknown>> | null = null
     const fullReadTurns = async (): Promise<Array<Record<string, unknown>>> => {
-      if (readTurns) return readTurns
+      if (readTurns !== null) return readTurns
       const response = await read('thread/read', { threadId, includeTurns: true })
-      const thread = response.thread
-      if (!thread || typeof thread !== 'object' || Array.isArray(thread)
-        || (thread as Record<string, unknown>).id !== threadId) {
-        throw new Error(`native advisor thread ${threadId} read fallback is invalid`)
+      const fullThread = nativeHistoryRecord(
+        response.thread,
+        `native advisor thread ${threadId} full read`,
+      )
+      const fullIdentity = canonical({
+        id: fullThread.id,
+        parentThreadId: fullThread.parentThreadId,
+        cwd: fullThread.cwd,
+        source: fullThread.source,
+        agentRole: fullThread.agentRole,
+      })
+      if (JSON.stringify(fullIdentity) !== JSON.stringify(metadataIdentity)) {
+        throw new Error(`native advisor thread ${threadId} full read changed identity`)
       }
       readTurns = parseTurns(
-        (thread as Record<string, unknown>).turns,
-        `native advisor thread ${threadId} read fallback`,
+        fullThread.turns,
+        `native advisor thread ${threadId} full read`,
       )
       return readTurns
     }
     if (selection.requireOneTurn && listedTurns.length > 1) {
       throw new Error(`native advisor thread ${threadId} must contain exactly one turn`)
     }
-    if (selection.requireOneTurn && listedTurns.length === 0) {
-      const recovered = await fullReadTurns()
-      if (recovered.length !== 1) {
-        throw new Error(`native advisor thread ${threadId} must contain exactly one turn`)
-      }
-      listedTurns = recovered
+    let requestedTurnIds = selection.turnIds
+    if (!requestedTurnIds) {
+      if (listedTurns.length === 0) {
+        const recovered = await fullReadTurns()
+        if (recovered.length !== 1) {
+          throw new Error(`native advisor thread ${threadId} must contain exactly one turn`)
+        }
+        requestedTurnIds = [String(recovered[0]!.id)]
+      } else requestedTurnIds = listedTurns.map(turn => String(turn.id))
     }
-    const requestedTurnIds = selection.turnIds ?? listedTurns.map(turn => String(turn.id))
-    if (requestedTurnIds.length < 1 || new Set(requestedTurnIds).size !== requestedTurnIds.length) {
+    if (requestedTurnIds.length < 1
+      || new Set(requestedTurnIds).size !== requestedTurnIds.length
+      || requestedTurnIds.some(id => typeof id !== 'string' || id.length < 1 || id.length > 256)) {
       throw new Error(`native advisor thread ${threadId} turn selection is invalid`)
     }
-    const byId = new Map(listedTurns.map(turn => [String(turn.id), turn]))
-    const hasRequiredEvidenceItems = (turn: Record<string, unknown>): boolean => {
-      if (turn.itemsView !== 'full' || !Array.isArray(turn.items)) return false
-      if (!selection.requireOneTurn) return turn.items.length > 0
-      return turn.items.some(rawItem => {
-        if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) return false
-        const item = rawItem as Record<string, unknown>
-        return isFinalAppServerAgentMessage(item)
-      })
-    }
-    const evidenceItems = (
-      ...sources: Array<unknown>
-    ): Array<Record<string, unknown>> => {
-      const projected = new Map<string, Record<string, unknown>>()
-      for (const source of sources) {
-        if (!Array.isArray(source)) continue
-        for (const rawItem of source) {
-          if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) continue
-          const item = rawItem as Record<string, unknown>
-          let key: string | null = null
-          if (isFinalAppServerAgentMessage(item)) {
-            key = typeof item.id === 'string'
-              ? `agent-id:${item.id}`
-              : `agent-text:${item.text}`
-          } else if (item.type === 'subAgentActivity' && item.kind === 'started'
-            && typeof item.agentThreadId === 'string') {
-            key = `subagent:${item.agentThreadId}`
-          }
-          // Sources are ordered from the earliest materialized projection to
-          // the latest persisted view. Official item IDs are stable, so a
-          // later item with the same ID supersedes an empty or stale earlier
-          // projection. Distinct IDs remain distinct and are still rejected
-          // below when they claim multiple final responses.
-          if (key !== null) projected.set(key, item)
-        }
-      }
-      return [...projected.values()]
-    }
-    const startedAgentIds = (
-      candidates: Array<Record<string, unknown>>,
-    ): Set<string> => new Set(candidates.flatMap(turn => evidenceItems(turn.items).flatMap(item => (
-      item.type === 'subAgentActivity' && item.kind === 'started'
-        && typeof item.agentThreadId === 'string' ? [item.agentThreadId] : []
-    ))))
-    const expectedStartedAgentIds = selection.expectedStartedAgentIds ?? []
-    if (new Set(expectedStartedAgentIds).size !== expectedStartedAgentIds.length) {
-      throw new Error(`native advisor thread ${threadId} expected child selection is invalid`)
-    }
-    const turns: Array<Record<string, unknown>> = []
-    for (const turnId of requestedTurnIds) {
-      let selectedTurn = byId.get(turnId)
-      if (!selectedTurn) {
-        const readTurn = (await fullReadTurns()).find(value => value.id === turnId)
-        if (!readTurn) {
-          throw new Error(`native advisor thread ${threadId} omitted selected turn ${turnId}`)
-        }
-        selectedTurn = readTurn
-      }
-      // Native publication requires negative evidence too: every parent
-      // activity must be journaled and a child advisor must not have delegated
-      // again. A `full` turn can precede persisted item materialization, so
-      // every selected terminal turn is reconciled with the complete item
-      // listing before it is accepted.
-      const items: unknown[] = []
-      let itemCursor: string | null = null
+    const listedById = new Map(listedTurns.map(turn => [String(turn.id), turn]))
+    const itemJournals = new Map<string, Array<Record<string, unknown>> | null>()
+    const loadItemJournal = async (
+      turnId: string,
+    ): Promise<Array<Record<string, unknown>> | null> => {
+      if (itemsListState === 'unsupported') return null
+      const rawItems: Array<Record<string, unknown>> = []
       const seenItemCursors = new Set<string>()
-      do {
-        const page = await read('thread/items/list', {
-          threadId,
-          turnId,
-          cursor: itemCursor,
-          limit: 100,
-          sortDirection: 'asc',
-        })
-        if (!Array.isArray(page.data)
-          || !(page.nextCursor === null || typeof page.nextCursor === 'string')) {
+      let itemCursor: string | null = null
+      for (let pageIndex = 0; pageIndex < MAX_NATIVE_HISTORY_PAGES; pageIndex += 1) {
+        let page: Record<string, unknown>
+        try {
+          page = await read('thread/items/list', {
+            threadId,
+            turnId,
+            cursor: itemCursor,
+            limit: 100,
+            sortDirection: 'asc',
+          })
+        } catch (error) {
+          if (itemsListState === 'unknown' && itemCursor === null
+            && isAppServerMethodUnsupported(error, 'thread/items/list')) {
+            itemsListState = 'unsupported'
+            return null
+          }
+          throw error
+        }
+        if (itemsListState === 'unknown') itemsListState = 'supported'
+        if (!Array.isArray(page.data)) {
           throw new Error(`native advisor thread ${threadId} item listing is invalid`)
         }
-        for (const rawEntry of page.data) {
-          if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)
-            || (rawEntry as Record<string, unknown>).turnId !== turnId) {
-            throw new Error(`native advisor thread ${threadId} item entry is invalid`)
+        for (const [index, rawEntry] of page.data.entries()) {
+          const entry = nativeHistoryRecord(
+            rawEntry,
+            `native advisor thread ${threadId} item entry ${index}`,
+          )
+          if (entry.turnId !== turnId) {
+            throw new Error(`native advisor thread ${threadId} item entry belongs to another turn`)
           }
-          const item = (rawEntry as Record<string, unknown>).item
-          if (item && typeof item === 'object' && !Array.isArray(item)) {
-            const evidenceItem = item as Record<string, unknown>
-            if (isFinalAppServerAgentMessage(evidenceItem)
-              || (evidenceItem.type === 'subAgentActivity'
-                && evidenceItem.kind === 'started')) {
-              items.push(evidenceItem)
-            }
+          rawItems.push(nativeHistoryRecord(
+            entry.item,
+            `native advisor thread ${threadId} item entry ${index} payload`,
+          ))
+          if (rawItems.length > MAX_NATIVE_HISTORY_RAW_ITEMS) {
+            throw new Error(`native advisor thread ${threadId} item journal exceeds the managed bound`)
           }
         }
-        if (items.length > 4_096) {
-          throw new Error(`native advisor thread ${threadId} item listing exceeds the managed bound`)
+        const nextCursor = nativeHistoryCursor(
+          page.nextCursor,
+          `native advisor thread ${threadId} item listing`,
+        )
+        if (nextCursor === null) return evidenceItems(
+          `${threadId}\u0000${turnId}`,
+          rawItems,
+        )
+        if (page.data.length === 0 || seenItemCursors.has(nextCursor)) {
+          throw new Error(`native advisor thread ${threadId} item listing did not advance`)
         }
-        itemCursor = page.nextCursor
-        if (itemCursor !== null && seenItemCursors.has(itemCursor)) {
-          throw new Error(`native advisor thread ${threadId} item listing cursor repeated`)
-        }
-        if (itemCursor !== null) seenItemCursors.add(itemCursor)
-      } while (itemCursor !== null)
-      turns.push({
-        ...selectedTurn,
-        items: evidenceItems(selectedTurn.items, items),
-        itemsView: 'full',
-      })
+        seenItemCursors.add(nextCursor)
+        itemCursor = nextCursor
+      }
+      throw new Error(`native advisor thread ${threadId} item page count exceeds the managed bound`)
     }
-    // `thread/items/list` is the required complete journal and is consulted
-    // for every selected turn before the broader thread projection. Only use
-    // `thread/read` as an enrichment fallback when that journal still lacks
-    // the expected final answer or direct-child activity. This prevents a
-    // transient optional-view failure from blocking otherwise complete item
-    // evidence while preserving fail-close behavior when evidence is absent.
-    const childNeedsFallback = selection.requireOneTurn === true
-      && !hasRequiredEvidenceItems(turns[0]!)
-    const observedStarted = startedAgentIds(turns)
-    const parentNeedsFallback = expectedStartedAgentIds.some(
-      agentId => !observedStarted.has(agentId),
-    )
-    if (childNeedsFallback || parentNeedsFallback) {
-      const readById = new Map((await fullReadTurns()).map(turn => [String(turn.id), turn]))
-      for (let index = 0; index < turns.length; index += 1) {
-        const selectedTurn = turns[index]!
-        const readTurn = readById.get(String(selectedTurn.id))
-        if (!readTurn) continue
-        turns[index] = {
-          ...readTurn,
-          itemsView: 'full',
-          items: evidenceItems(selectedTurn.items, readTurn.items),
+    for (const turnId of requestedTurnIds) {
+      itemJournals.set(turnId, await loadItemJournal(turnId))
+    }
+
+    const turns: Array<Record<string, unknown>> = []
+    let fallbackViewDigests: ThreadEvidenceRead['fallbackViewDigests'] = null
+    let fallbackViewsAgree: ThreadEvidenceRead['fallbackViewsAgree'] = null
+    if (itemsListState === 'unsupported') {
+      const completeReadTurns = await fullReadTurns()
+      if (selection.requireOneTurn
+        && (listedTurns.length !== 1 || completeReadTurns.length !== 1)) {
+        throw new Error(`native advisor thread ${threadId} fallback must contain one full turn`)
+      }
+      const readById = new Map(completeReadTurns.map(turn => [String(turn.id), turn]))
+      const selectedListedTurns: Array<Record<string, unknown>> = []
+      const selectedReadTurns: Array<Record<string, unknown>> = []
+      fallbackViewsAgree = true
+      for (const turnId of requestedTurnIds) {
+        const listed = listedById.get(turnId)
+        const fullyRead = readById.get(turnId)
+        if (!listed || !fullyRead) {
+          throw new Error(`native advisor thread ${threadId} fallback omitted turn ${turnId}`)
         }
+        completedFullTurn(listed, `native advisor thread ${threadId} listed turn ${turnId}`)
+        completedFullTurn(fullyRead, `native advisor thread ${threadId} read turn ${turnId}`)
+        selectedListedTurns.push(listed)
+        selectedReadTurns.push(fullyRead)
+        const itemScope = `${threadId}\u0000${turnId}`
+        const listedEvidence = evidenceItems(itemScope, listed.items)
+        const readEvidence = evidenceItems(itemScope, fullyRead.items)
+        if (JSON.stringify(canonical(listedEvidence))
+          !== JSON.stringify(canonical(readEvidence))) {
+          fallbackViewsAgree = false
+        }
+        turns.push({
+          ...fullyRead,
+          itemsView: 'full',
+          items: evidenceItems(
+            itemScope,
+            listed.items,
+            fullyRead.items,
+          ),
+        })
+      }
+      fallbackViewDigests = {
+        turnsList: createHash('sha256')
+          .update(JSON.stringify(canonical(selectedListedTurns)))
+          .digest('hex'),
+        threadRead: createHash('sha256')
+          .update(JSON.stringify(canonical(selectedReadTurns)))
+          .digest('hex'),
+      }
+    } else {
+      for (const turnId of requestedTurnIds) {
+        let selected = listedById.get(turnId)
+        if (!selected) {
+          selected = (await fullReadTurns()).find(turn => turn.id === turnId)
+        }
+        if (!selected || selected.status !== 'completed') {
+          throw new Error(`native advisor thread ${threadId} omitted completed turn ${turnId}`)
+        }
+        const journal = itemJournals.get(turnId)
+        if (!journal) {
+          throw new Error(`native advisor thread ${threadId} item journal is unavailable`)
+        }
+        turns.push({ ...selected, itemsView: 'full', items: journal })
       }
     }
-    return { thread: { ...(metadata as Record<string, unknown>), turns } }
+    return {
+      response: { thread: { ...metadata, turns } },
+      fallbackViewDigests,
+      fallbackViewsAgree,
+    }
   }
 
-  const parentResponse = await readThreadEvidence(options.parentThreadId, {
-    turnIds: options.parentTurnIds,
-    expectedStartedAgentIds: [...new Set(
-      options.rounds.flatMap(round => round.native.map(entry => entry.agentId)),
-    )],
-  })
-  const listedChildren: unknown[] = []
-  let cursor: string | null = null
-  const seenChildCursors = new Set<string>()
-  do {
-    const page = await read('thread/list', {
-      parentThreadId: options.parentThreadId,
-      sourceKinds: [
-        'subAgent', 'subAgentReview', 'subAgentCompact',
-        'subAgentThreadSpawn', 'subAgentOther',
-      ],
-      limit: 100,
-      sortDirection: 'asc',
-      cursor,
-    })
-    if (!Array.isArray(page.data)
-      || !(page.nextCursor === null || typeof page.nextCursor === 'string')) {
-      throw new Error('native advisor child listing page is invalid')
-    }
-    listedChildren.push(...page.data)
-    if (listedChildren.length > 4_096) {
-      throw new Error('native advisor child listing exceeds the managed bound')
-    }
-    cursor = page.nextCursor
-    if (cursor !== null && seenChildCursors.has(cursor)) {
-      throw new Error('native advisor child listing cursor repeated')
-    }
-    if (cursor !== null) seenChildCursors.add(cursor)
-  } while (cursor !== null)
-  const childrenListResponse = { data: listedChildren, nextCursor: null }
-  const childResponses = new Map<string, unknown>()
-  for (const entry of options.rounds.flatMap(round => round.native)) {
-    if (childResponses.has(entry.agentId)) continue
-    childResponses.set(entry.agentId, await readThreadEvidence(entry.agentId, {
-      requireOneTurn: true,
-    }))
+  type HistorySnapshot = {
+    parentResponse: Record<string, unknown>
+    childrenListResponse: Record<string, unknown>
+    childResponses: Map<string, Record<string, unknown>>
+    childChildrenListResponses: Map<string, Record<string, unknown>>
+    fallbackViewDigests: Map<string, NonNullable<ThreadEvidenceRead['fallbackViewDigests']>>
+    fallbackViewsAgree: boolean
   }
-  assertNativeAdvisorEvidence({
-    attemptNonce: options.attemptNonce,
-    parentThreadId: options.parentThreadId,
-    expectedParentSource: options.parentSource,
-    repoPath: options.repoPath,
-    rounds: options.rounds,
-    parentResponse,
-    childrenListResponse,
-    childResponses,
+  const claimedIds = [...new Set(
+    options.rounds.flatMap(round => round.native.map(entry => entry.agentId)),
+  )]
+  const collectSnapshot = async (): Promise<HistorySnapshot> => {
+    const parentEvidence = await readThreadEvidence(options.parentThreadId, {
+      turnIds: options.parentTurnIds,
+    })
+    const children = await readDirectChildThreads(
+      read,
+      options.parentThreadId,
+      'native advisor child listing',
+    )
+    const childResponses = new Map<string, Record<string, unknown>>()
+    const childChildrenListResponses = new Map<string, Record<string, unknown>>()
+    const fallbackViewDigests = new Map<
+      string,
+      NonNullable<ThreadEvidenceRead['fallbackViewDigests']>
+    >()
+    let fallbackViewsAgree = parentEvidence.fallbackViewsAgree !== false
+    if (parentEvidence.fallbackViewDigests) {
+      fallbackViewDigests.set(options.parentThreadId, parentEvidence.fallbackViewDigests)
+    }
+    for (const agentId of claimedIds) {
+      const childEvidence = await readThreadEvidence(agentId, {
+        requireOneTurn: true,
+      })
+      childResponses.set(agentId, childEvidence.response)
+      if (childEvidence.fallbackViewDigests) {
+        fallbackViewDigests.set(agentId, childEvidence.fallbackViewDigests)
+      }
+      if (childEvidence.fallbackViewsAgree === false) fallbackViewsAgree = false
+      const descendants = await readDirectChildThreads(
+        read,
+        agentId,
+        `native advisor ${agentId} descendant listing`,
+      )
+      childChildrenListResponses.set(agentId, { data: descendants, nextCursor: null })
+    }
+    return {
+      parentResponse: parentEvidence.response,
+      childrenListResponse: { data: children, nextCursor: null },
+      childResponses,
+      childChildrenListResponses,
+      fallbackViewDigests,
+      fallbackViewsAgree,
+    }
+  }
+  const validateSnapshot = (snapshot: HistorySnapshot): void => {
+    if (!snapshot.fallbackViewsAgree) {
+      throw new Error('native advisor fallback endpoints disagree on selected evidence')
+    }
+    assertNativeAdvisorEvidence({
+      attemptNonce: options.attemptNonce,
+      parentThreadId: options.parentThreadId,
+      expectedParentSource: options.parentSource,
+      repoPath: options.repoPath,
+      rounds: options.rounds,
+      parentResponse: snapshot.parentResponse,
+      childrenListResponse: snapshot.childrenListResponse,
+      parentChildBaseline: options.parentChildBaseline,
+      childResponses: snapshot.childResponses,
+      childChildrenListResponses: snapshot.childChildrenListResponses,
+    })
+  }
+  const snapshotProjection = (snapshot: HistorySnapshot): unknown => canonical({
+    parentResponse: snapshot.parentResponse,
+    childrenListResponse: snapshot.childrenListResponse,
+    childResponses: [...snapshot.childResponses.entries()].sort(([left], [right]) => (
+      left.localeCompare(right)
+    )),
+    childChildrenListResponses: [...snapshot.childChildrenListResponses.entries()]
+      .sort(([left], [right]) => left.localeCompare(right)),
+    fallbackViewDigests: [...snapshot.fallbackViewDigests.entries()]
+      .sort(([left], [right]) => left.localeCompare(right)),
+    fallbackViewsAgree: snapshot.fallbackViewsAgree,
   })
+  const first = await collectSnapshot()
+  if (!itemListingUnsupported()) {
+    validateSnapshot(first)
+    return
+  }
+
+  const maxFallbackSnapshots = 4
+  let snapshot = first
+  let previousValidProjection: string | null = null
+  let lastValidationError: unknown = null
+  for (let attempt = 0; attempt < maxFallbackSnapshots; attempt += 1) {
+    if (attempt > 0) snapshot = await collectSnapshot()
+    const projection = JSON.stringify(snapshotProjection(snapshot))
+    try {
+      validateSnapshot(snapshot)
+      lastValidationError = null
+      if (previousValidProjection === projection) return
+      previousValidProjection = projection
+    } catch (error) {
+      lastValidationError = error
+      previousValidProjection = null
+    }
+    if (attempt < maxFallbackSnapshots - 1) await Bun.sleep(25)
+  }
+  if (lastValidationError !== null) throw lastValidationError
+  throw new Error(
+    `native advisor fallback history did not reach a fixed point after ${maxFallbackSnapshots} snapshots`,
+  )
 }
 
 export function buildCodexDeveloperInstructions(
@@ -3144,6 +3451,7 @@ export async function executeCodexJob(
     /** Explicit fixture injection. Production callers must use the official standalone install. */
     codexBinForTesting?: string
     model?: string
+    /** Legacy exec-fixture wall clock. Production App Server jobs do not use it. */
     timeoutMs?: number
     logDir: string
     stateDir?: string
@@ -3225,9 +3533,6 @@ export async function executeCodexJob(
     }
   }
   const model = options.model ?? process.env.ZEROKUN_JOB_MODEL
-  // Legacy fixture-only exec path retains an explicit bounded timeout. The
-  // production App Server path below has no whole-job wall clock.
-  const timeoutMs = positiveInteger(options.timeoutMs, 6 * 60 * 60 * 1000)
   const stateDir = options.stateDir ?? dirname(options.logDir)
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const managedStateDir = requireManagedStateRoot(stateDir)
@@ -3405,6 +3710,7 @@ export async function executeCodexJob(
     phaseSequence = 0,
     reviewRound: 1 | 2 | 3 = 1,
     boundInput?: AdvisorInputSnapshot,
+    parentChildBaselineInput: string[] | null = null,
   ) => {
     if (options.signal?.aborted) throw new CodexInterruptedError('Codex job was interrupted')
     if (options.liveControls?.cancellationRequested()) throw new CodexUserCancelledError()
@@ -3727,7 +4033,6 @@ export async function executeCodexJob(
       requirePresent: true,
       label: 'cancelled Codex App Server',
     })
-    let timedOut = false
     let cleanupTimer: ReturnType<typeof setTimeout> | undefined
     let requestForcedCleanup: (() => void) | undefined
     let parentForceClaimed = false
@@ -3815,6 +4120,9 @@ export async function executeCodexJob(
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null
       let currentThreadSource: AppServerSessionSource | null = null
+      let parentChildBaseline = parentChildBaselineInput === null
+        ? null
+        : [...parentChildBaselineInput]
       let currentTurnId: string | null = null
       let cancellationTerminalDeadline: number | null = null
       const rejectedSteerState: { current: {
@@ -4046,6 +4354,11 @@ export async function executeCodexJob(
         }
         options.onSessionId?.(currentThreadId)
         observedSessionId = currentThreadId
+        if (parentChildBaseline === null) {
+          parentChildBaseline = localAdvisorAccess
+            ? await captureNativeAdvisorParentChildBaseline(session, currentThreadId)
+            : []
+        }
         if (controls.cancellationRequested()) {
           userCancelled = true
           throw new CodexUserCancelledError()
@@ -4288,12 +4601,11 @@ export async function executeCodexJob(
               )
             }
             const acceptCompletedTurn = async (): Promise<void> => {
-              let acceptedTurn = reconciledTurn
-              let message = appServerFinalMessage(acceptedTurn)
-              if (!message) {
-                acceptedTurn = await session.loadFullTurn(currentThreadId!, acceptedTurn)
-                message = appServerFinalMessage(acceptedTurn)
-              }
+              // A streamed/full terminal is only a liveness signal. Always
+              // reload the official journal before publishing, even when the
+              // notification already contains a plausible final message.
+              const acceptedTurn = await session.loadFullTurn(currentThreadId!, reconciledTurn)
+              const message = appServerFinalMessage(acceptedTurn)
               if (!message) {
                 throw new AppServerProtocolError('completed App Server turn omitted final message')
               }
@@ -4574,6 +4886,7 @@ export async function executeCodexJob(
         inputChangedBeforeDispatch,
         finalTurn,
         parentTurnIds,
+        parentChildBaseline: parentChildBaseline ?? [],
         parentSource: currentThreadSource,
         stage,
         phaseSequence,
@@ -4581,6 +4894,10 @@ export async function executeCodexJob(
         inputSnapshot: advisorAttempt.inputSnapshot,
       }
     }
+    // Everything below is the legacy `codex exec` fixture path. Production
+    // returned from the App Server branch above without arming a job clock.
+    const legacyExecTimeoutMs = positiveInteger(options.timeoutMs, 6 * 60 * 60 * 1000)
+    let timedOut = false
     type StopCause = 'none' | 'logical-complete' | 'timeout' | 'abort'
       | 'process-persistence' | 'session-persistence'
     let stopCause: StopCause = 'none'
@@ -4726,7 +5043,7 @@ export async function executeCodexJob(
         timedOut = true
         terminate()
       }
-    }, timeoutMs)
+    }, legacyExecTimeoutMs)
     let abortedBeforeProcessExit = false
     let processBoundarySealed = false
     let runtimeIdentityError: unknown
@@ -4887,6 +5204,7 @@ export async function executeCodexJob(
       retireCompletedRegistration,
       retireCancelledRegistration,
       parentTurnIds: [] as string[],
+      parentChildBaseline: parentChildBaselineInput ?? [],
       parentSource: null as AppServerSessionSource | null,
     }
   }
@@ -4907,6 +5225,7 @@ export async function executeCodexJob(
     let preparedInput: AdvisorInputSnapshot | null = null
     let implementedInputDigest: string | null = null
     let parentSource: AppServerSessionSource | null = null
+    let parentChildBaseline: string[] | null = null
     const parentTurnIds: string[] = []
     let nextStage: 'prepare' | 'implementation' | 'review' = 'prepare'
 
@@ -4922,6 +5241,14 @@ export async function executeCodexJob(
         throw new Error('Codex App Server thread source changed across permission phases')
       }
       parentSource ??= source
+      if (!Array.isArray(execution.parentChildBaseline)) {
+        throw new Error('Codex App Server omitted the pre-turn child baseline')
+      }
+      if (parentChildBaseline === null) {
+        parentChildBaseline = [...execution.parentChildBaseline]
+      } else if (JSON.stringify(parentChildBaseline) !== JSON.stringify(execution.parentChildBaseline)) {
+        throw new Error('Codex App Server changed the pre-turn child baseline across phases')
+      }
       for (const turnId of execution.parentTurnIds) {
         if (parentTurnIds.includes(turnId)) {
           throw new Error(`Codex App Server reused parent turn ${turnId} across phases`)
@@ -4942,7 +5269,7 @@ export async function executeCodexJob(
       execution: Awaited<ReturnType<typeof runAttempt>>
     } | { kind: 'input-changed' }> => {
       const execution = await runAttempt(
-        sessionId, resumed, stage, phaseSequence, round, boundInput,
+        sessionId, resumed, stage, phaseSequence, round, boundInput, parentChildBaseline,
       )
       if ('userCancelled' in execution && execution.userCancelled === true) {
         await execution.retireCancelledRegistration()
@@ -5033,6 +5360,9 @@ export async function executeCodexJob(
               attemptNonce: execution.advisorAttemptNonce,
               parentThreadId: sessionId!,
               parentSource: parentSource!,
+              parentChildBaseline: parentChildBaseline ?? (() => {
+                throw new Error('Codex App Server omitted the pre-turn child baseline')
+              })(),
               parentTurnIds,
               rounds,
               seatbeltFingerprint: execution.seatbeltFingerprint,
@@ -5162,6 +5492,9 @@ export async function executeCodexJob(
             attemptNonce: execution.advisorAttemptNonce,
             parentThreadId: sessionId!,
             parentSource: parentSource!,
+            parentChildBaseline: parentChildBaseline ?? (() => {
+              throw new Error('Codex App Server omitted the pre-turn child baseline')
+            })(),
             parentTurnIds,
             rounds,
             seatbeltFingerprint: execution.seatbeltFingerprint,
@@ -5272,6 +5605,7 @@ export async function executeCodexJob(
             parentSource: execution.parentSource ?? (() => {
               throw new Error('Codex App Server omitted the parent thread source binding')
             })(),
+            parentChildBaseline: execution.parentChildBaseline,
             parentTurnIds: execution.parentTurnIds,
             rounds: advisorRounds,
             seatbeltFingerprint: execution.seatbeltFingerprint,
@@ -5298,7 +5632,11 @@ export async function executeCodexJob(
     // Retire its fingerprint before requeue, retry, or error publication so a
     // detached helper can never overlap the next FIFO job.
     await execution.retireCompletedRegistration()
-    if (disposition === 'timed-out') throw new Error(`Codex timed out after ${timeoutMs}ms`)
+    if (disposition === 'timed-out') {
+      throw new Error(
+        `Codex timed out after ${positiveInteger(options.timeoutMs, 6 * 60 * 60 * 1000)}ms`,
+      )
+    }
     if (disposition === 'interrupted') {
       throw new CodexInterruptedError('Codex job was interrupted')
     }

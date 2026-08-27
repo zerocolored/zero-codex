@@ -4,11 +4,29 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   AppServerAmbiguousRequestError,
+  AppServerProtocolError,
   CodexAppServerSession,
   appServerFinalMessage,
   parseAppServerSessionSource,
+  isAppServerMethodUnsupported,
   sameAppServerSessionSource,
 } from './codex-app-server-session.ts'
+
+test('method unsupported判定は同一methodの数値-32601だけを受理する', () => {
+  expect(isAppServerMethodUnsupported(
+    new AppServerProtocolError('unsupported', 'thread/items/list', 1, { code: -32601 }),
+    'thread/items/list',
+  )).toBe(true)
+  expect(isAppServerMethodUnsupported(
+    new AppServerProtocolError('unsupported', 'thread/items/list', 1, { code: '-32601' }),
+    'thread/items/list',
+  )).toBe(false)
+  expect(isAppServerMethodUnsupported(
+    new AppServerProtocolError('unsupported', 'thread/read', 1, { code: -32601 }),
+    'thread/items/list',
+  )).toBe(false)
+  expect(isAppServerMethodUnsupported(new Error('unsupported'), 'thread/items/list')).toBe(false)
+})
 
 function mockTransport(
   onRequest?: (request: Record<string, unknown>, emit: (value: unknown) => void) => void,
@@ -320,27 +338,34 @@ describe('Codex App Server session', () => {
 
   test('summary terminalを公式turn paginationから必要な回答だけ復元する', async () => {
     const transport = mockTransport((request, emit) => {
-      if (request.method === 'thread/items/list' || request.method === 'thread/read') {
+      if (request.method === 'thread/items/list') {
         emit({ id: request.id, error: { code: -32601, message: 'unsupported' } })
         return
       }
-      if (request.method !== 'thread/turns/list') return
-      const params = request.params as Record<string, unknown>
-      if (params.cursor === null) {
-        emit({ id: request.id, result: {
-          data: [{
-            id: 'turn-other', status: 'completed', itemsView: 'full', items: [], error: null,
-          }],
-          nextCursor: 'page-2', backwardsCursor: null,
-        } })
-      } else {
-        emit({ id: request.id, result: {
-          data: [{
-            id: 'turn-summary', status: 'completed', itemsView: 'full', error: null,
-            items: [{ type: 'agentMessage', id: 'item-agent', text: '復元した回答' }],
-          }],
-          nextCursor: null, backwardsCursor: null,
-        } })
+      const selected = {
+        id: 'turn-summary', status: 'completed', itemsView: 'full', error: null,
+        items: [{ type: 'agentMessage', id: 'item-agent', text: '復元した回答' }],
+      }
+      if (request.method === 'thread/turns/list') {
+        const params = request.params as Record<string, unknown>
+        if (params.cursor === null) {
+          emit({ id: request.id, result: {
+            data: [{
+              id: 'turn-other', status: 'completed', itemsView: 'full', items: [], error: null,
+            }],
+            nextCursor: 'page-2', backwardsCursor: null,
+          } })
+        } else {
+          emit({ id: request.id, result: {
+            data: [selected], nextCursor: null, backwardsCursor: null,
+          } })
+        }
+        return
+      }
+      if (request.method === 'thread/read') {
+        emit({ id: request.id, result: { thread: {
+          id: 'thread-1', turns: [selected],
+        } } })
       }
     })
     const session = new CodexAppServerSession(transport.input, transport.stream)
@@ -370,12 +395,13 @@ describe('Codex App Server session', () => {
     expect(appServerFinalMessage(full)).toBe('復元した回答')
     expect(transport.sent.map(value => value.method)).toEqual([
       'thread/items/list', 'thread/turns/list', 'thread/turns/list', 'thread/read',
+      'thread/turns/list', 'thread/turns/list', 'thread/read',
     ])
     session.closeInput()
     await session.waitForReader()
   })
 
-  test('final message未反映のfull terminalも公式履歴から回答を復元する', async () => {
+  test('supported item journalにfinalが無ければsnapshotで補完しない', async () => {
     const transport = mockTransport((request, emit) => {
       if (request.method === 'thread/turns/list') {
         emit({ id: request.id, result: {
@@ -414,13 +440,10 @@ describe('Codex App Server session', () => {
       }
     })
     const session = new CodexAppServerSession(transport.input, transport.stream)
-    const full = await session.loadFullTurn('thread-early-full', {
+    await expect(session.loadFullTurn('thread-early-full', {
       id: 'turn-early-full', status: 'completed', itemsView: 'full', items: [], error: null,
-    })
-    expect(appServerFinalMessage(full)).toBe('永続履歴の最終回答')
-    expect(transport.sent.map(value => value.method)).toEqual([
-      'thread/items/list', 'thread/turns/list', 'thread/read',
-    ])
+    })).rejects.toThrow('item journal did not provide a final persisted answer')
+    expect(transport.sent.map(value => value.method)).toEqual(['thread/items/list'])
     session.closeInput()
     await session.waitForReader()
   })
@@ -457,7 +480,8 @@ describe('Codex App Server session', () => {
     const session = new CodexAppServerSession(transport.input, transport.stream)
     await expect(session.loadFullTurn('thread-commentary', {
       id: 'turn-commentary', status: 'completed', itemsView: 'summary', items: [], error: null,
-    })).rejects.toThrow('did not provide full persisted turn history')
+    })).rejects.toThrow('item journal did not provide a final persisted answer')
+    expect(transport.sent.map(value => value.method)).toEqual(['thread/items/list'])
     session.closeInput()
     await session.waitForReader()
   })
@@ -649,14 +673,12 @@ describe('Codex App Server session', () => {
     }, { clientUserMessageId: 'slack-reply' })).rejects.toThrow(
       'persisted the rejected steer without a following final response',
     )
-    expect(transport.sent.map(value => value.method)).toEqual([
-      'thread/items/list', 'thread/turns/list', 'thread/read',
-    ])
+    expect(transport.sent.map(value => value.method)).toEqual(['thread/items/list'])
     session.closeInput()
     await session.waitForReader()
   })
 
-  test('turn snapshotで確認したclient IDも後続の古いthread snapshotで打ち消さない', async () => {
+  test('supported item journalにclient IDが無ければsnapshotで存在へ昇格しない', async () => {
     const oldAgent = { type: 'agentMessage', id: 'agent-before-steer', text: '追記前の回答' }
     const matchingUser = {
       type: 'userMessage', id: 'user-steer', clientId: 'slack-reply', content: [],
@@ -690,15 +712,12 @@ describe('Codex App Server session', () => {
       }
     })
     const session = new CodexAppServerSession(transport.input, transport.stream)
-    await expect(session.loadFullTurn('thread-steer-turn-evidence', {
+    const full = await session.loadFullTurn('thread-steer-turn-evidence', {
       id: 'turn-steer-turn-evidence', status: 'completed', itemsView: 'full', error: null,
       items: [{ type: 'agentMessage', id: 'terminal-old', text: 'terminal旧回答' }],
-    }, { clientUserMessageId: 'slack-reply' })).rejects.toThrow(
-      'persisted the rejected steer without a following final response',
-    )
-    expect(transport.sent.map(value => value.method)).toEqual([
-      'thread/items/list', 'thread/turns/list', 'thread/read',
-    ])
+    }, { clientUserMessageId: 'slack-reply' })
+    expect(full.items).toEqual([])
+    expect(transport.sent.map(value => value.method)).toEqual(['thread/items/list'])
     session.closeInput()
     await session.waitForReader()
   })
@@ -744,7 +763,54 @@ describe('Codex App Server session', () => {
     await session.waitForReader()
   })
 
+  test('item journal成功後の後続page -32601をfallbackで隠さない', async () => {
+    const transport = mockTransport((request, emit) => {
+      if (request.method === 'thread/items/list') {
+        const params = request.params as Record<string, unknown>
+        if (params.cursor === null) {
+          emit({ id: request.id, result: {
+            data: [{ turnId: 'turn-late-unsupported', item: {
+              type: 'agentMessage', id: 'partial-agent', phase: 'commentary',
+              text: 'partial',
+            } }],
+            nextCursor: 'page-2',
+          } })
+          return
+        }
+        emit({ id: request.id, error: { code: -32601, message: 'late unsupported' } })
+        return
+      }
+      if (request.method === 'thread/turns/list') {
+        emit({ id: request.id, result: {
+          data: [{
+            id: 'turn-late-unsupported', status: 'completed', itemsView: 'full',
+            items: [{ type: 'agentMessage', id: 'stale-agent', text: 'stale answer' }],
+            error: null,
+          }],
+          nextCursor: null,
+        } })
+      }
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    await expect(session.loadFullTurn('thread-late-unsupported', {
+      id: 'turn-late-unsupported', status: 'completed', itemsView: 'summary',
+      items: [], error: null,
+    })).rejects.toThrow('late unsupported')
+    expect(transport.sent.map(value => value.method)).toEqual([
+      'thread/items/list', 'thread/items/list',
+    ])
+    session.closeInput()
+    await session.waitForReader()
+  })
+
   test('item pagination未対応時だけturn paginationからclient IDを照合する', async () => {
+    const selected = {
+      id: 'turn-steer-fallback', status: 'completed', itemsView: 'full', error: null,
+      items: [
+        { type: 'userMessage', id: 'user-steer', clientId: 'slack-reply', content: [] },
+        { type: 'agentMessage', id: 'agent-steer', text: 'fallbackで照合' },
+      ],
+    }
     const transport = mockTransport((request, emit) => {
       if (request.method === 'thread/items/list') {
         emit({ id: request.id, error: { code: -32601, message: 'not supported yet' } })
@@ -752,15 +818,14 @@ describe('Codex App Server session', () => {
       }
       if (request.method === 'thread/turns/list') {
         emit({ id: request.id, result: {
-          data: [{
-            id: 'turn-steer-fallback', status: 'completed', itemsView: 'full', error: null,
-            items: [
-              { type: 'userMessage', id: 'user-steer', clientId: 'slack-reply', content: [] },
-              { type: 'agentMessage', id: 'agent-steer', text: 'fallbackで照合' },
-            ],
-          }],
-          nextCursor: null,
+          data: [selected], nextCursor: null,
         } })
+        return
+      }
+      if (request.method === 'thread/read') {
+        emit({ id: request.id, result: { thread: {
+          id: 'thread-steer-fallback', turns: [selected],
+        } } })
       }
     })
     const session = new CodexAppServerSession(transport.input, transport.stream)
@@ -770,13 +835,14 @@ describe('Codex App Server session', () => {
     }, { clientUserMessageId: 'slack-reply' })
     expect(full.items[0]).toMatchObject({ type: 'userMessage', clientId: 'slack-reply' })
     expect(transport.sent.map(value => value.method)).toEqual([
-      'thread/items/list', 'thread/turns/list',
+      'thread/items/list', 'thread/turns/list', 'thread/read',
+      'thread/turns/list', 'thread/read',
     ])
     session.closeInput()
     await session.waitForReader()
   })
 
-  test('turn paginationがfullでもclient ID未反映ならthread/readまで照合する', async () => {
+  test('supported item journalのclient ID後にfinalが無ければsnapshotへ降りない', async () => {
     const transport = mockTransport((request, emit) => {
       if (request.method === 'thread/items/list') {
         emit({ id: request.id, result: {
@@ -814,16 +880,140 @@ describe('Codex App Server session', () => {
       }
     })
     const session = new CodexAppServerSession(transport.input, transport.stream)
-    const full = await session.loadFullTurn('thread-steer-read', {
+    await expect(session.loadFullTurn('thread-steer-read', {
       id: 'turn-steer-read', status: 'completed', itemsView: 'full', error: null,
       items: [{ type: 'agentMessage', id: 'terminal-agent', text: 'terminal fallback' }],
-    }, { clientUserMessageId: 'slack-reply' })
-    expect(full.items).toEqual([
-      { type: 'userMessage', clientId: 'slack-reply' },
-      { type: 'agentMessage', id: 'agent-current', text: 'thread/readで照合' },
-    ])
+    }, { clientUserMessageId: 'slack-reply' })).rejects.toThrow(
+      'persisted the rejected steer without a following final response',
+    )
+    expect(transport.sent.map(value => value.method)).toEqual(['thread/items/list'])
+    session.closeInput()
+    await session.waitForReader()
+  })
+
+  test('items/list未対応fallbackはturns/listとthread/readの両方を必須にする', async () => {
+    const selected = {
+      id: 'turn-dual-required', status: 'completed', itemsView: 'full', error: null,
+      items: [{ type: 'agentMessage', id: 'answer', text: '片側だけの回答' }],
+    }
+    const transport = mockTransport((request, emit) => {
+      if (request.method === 'thread/items/list') {
+        emit({ id: request.id, error: { code: -32601, message: 'unsupported' } })
+        return
+      }
+      if (request.method === 'thread/turns/list') {
+        emit({ id: request.id, result: { data: [selected], nextCursor: null } })
+        return
+      }
+      if (request.method === 'thread/read') {
+        emit({ id: request.id, error: { code: -32601, message: 'unsupported' } })
+      }
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    await expect(session.loadFullTurn('thread-dual-required', {
+      id: 'turn-dual-required', status: 'completed', itemsView: 'summary',
+      items: [], error: null,
+    })).rejects.toThrow('Codex thread/read failed')
     expect(transport.sent.map(value => value.method)).toEqual([
       'thread/items/list', 'thread/turns/list', 'thread/read',
+    ])
+    session.closeInput()
+    await session.waitForReader()
+  })
+
+  test('fallbackの両snapshotが安定して不一致なら4回でfail-closeする', async () => {
+    const selected = (text: string) => ({
+      id: 'turn-disagree', status: 'completed', itemsView: 'full', error: null,
+      items: [{ type: 'agentMessage', id: 'answer', text }],
+    })
+    const transport = mockTransport((request, emit) => {
+      if (request.method === 'thread/items/list') {
+        emit({ id: request.id, error: { code: -32601, message: 'unsupported' } })
+        return
+      }
+      if (request.method === 'thread/turns/list') {
+        emit({ id: request.id, result: { data: [selected('turns回答')], nextCursor: null } })
+        return
+      }
+      if (request.method === 'thread/read') {
+        emit({ id: request.id, result: { thread: {
+          id: 'thread-disagree', turns: [selected('read回答')],
+        } } })
+      }
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    await expect(session.loadFullTurn('thread-disagree', {
+      id: 'turn-disagree', status: 'completed', itemsView: 'summary', items: [], error: null,
+    })).rejects.toThrow('persisted turn history did not converge')
+    expect(transport.sent.map(value => value.method)).toEqual([
+      'thread/items/list',
+      'thread/turns/list', 'thread/read',
+      'thread/turns/list', 'thread/read',
+      'thread/turns/list', 'thread/read',
+      'thread/turns/list', 'thread/read',
+    ])
+    session.closeInput()
+    await session.waitForReader()
+  })
+
+  test('fallback endpoint間で同じitem IDのraw typeが変われば拒否する', async () => {
+    const selected = (type: string) => ({
+      id: 'turn-type-alias', status: 'completed', itemsView: 'full', error: null,
+      items: [{ type, id: 'answer', text: '回答' }],
+    })
+    const transport = mockTransport((request, emit) => {
+      if (request.method === 'thread/items/list') {
+        emit({ id: request.id, error: { code: -32601, message: 'unsupported' } })
+        return
+      }
+      if (request.method === 'thread/turns/list') {
+        emit({ id: request.id, result: {
+          data: [selected('agentMessage')], nextCursor: null,
+        } })
+        return
+      }
+      if (request.method === 'thread/read') {
+        emit({ id: request.id, result: { thread: {
+          id: 'thread-type-alias', turns: [selected('agent_message')],
+        } } })
+      }
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    await expect(session.loadFullTurn('thread-type-alias', {
+      id: 'turn-type-alias', status: 'completed', itemsView: 'summary', items: [], error: null,
+    })).rejects.toThrow('changed immutable type')
+    expect(transport.sent.map(value => value.method)).toEqual([
+      'thread/items/list', 'thread/turns/list', 'thread/read',
+    ])
+    session.closeInput()
+    await session.waitForReader()
+  })
+
+  test('items/list成功後の別turn -32601をunsupported fallbackへ降格しない', async () => {
+    let itemCalls = 0
+    const transport = mockTransport((request, emit) => {
+      if (request.method !== 'thread/items/list') return
+      itemCalls += 1
+      if (itemCalls === 1) {
+        emit({ id: request.id, result: {
+          data: [{ turnId: 'turn-supported-first', item: {
+            type: 'agentMessage', id: 'answer-first', text: '最初の回答',
+          } }],
+          nextCursor: null,
+        } })
+        return
+      }
+      emit({ id: request.id, error: { code: -32601, message: 'late unsupported' } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    await expect(session.loadFullTurn('thread-supported', {
+      id: 'turn-supported-first', status: 'completed', itemsView: 'full', items: [], error: null,
+    })).resolves.toMatchObject({ itemsView: 'full' })
+    await expect(session.loadFullTurn('thread-supported', {
+      id: 'turn-supported-second', status: 'completed', itemsView: 'full', items: [], error: null,
+    })).rejects.toThrow('late unsupported')
+    expect(transport.sent.map(value => value.method)).toEqual([
+      'thread/items/list', 'thread/items/list',
     ])
     session.closeInput()
     await session.waitForReader()
@@ -944,6 +1134,86 @@ describe('Codex App Server session', () => {
     expect(appServerFinalMessage(full)).toBe('ページ復元した回答')
     session.closeInput()
     await session.waitForReader()
+  })
+
+  test('回答履歴のraw item件数はmanaged上限を超えたらfail-closeする', async () => {
+    const oversizedItems = Array.from({ length: 65_537 }, (_, index) => ({
+      type: 'commandExecution', id: `oversized-${index}`, status: 'completed',
+    }))
+    const itemTransport = mockTransport((request, emit) => {
+      if (request.method !== 'thread/items/list') return
+      emit({ id: request.id, result: {
+        data: oversizedItems.map(item => ({ turnId: 'turn-item-raw-bound', item })),
+        nextCursor: null,
+      } })
+    })
+    const itemSession = new CodexAppServerSession(itemTransport.input, itemTransport.stream)
+    await expect(itemSession.loadFullTurn('thread-item-raw-bound', {
+      id: 'turn-item-raw-bound', status: 'completed', itemsView: 'summary',
+      items: [], error: null,
+    })).rejects.toThrow('item history exceeded its bound')
+    itemSession.closeInput()
+    await itemSession.waitForReader()
+
+    const turnTransport = mockTransport((request, emit) => {
+      if (request.method === 'thread/items/list') {
+        emit({ id: request.id, error: { code: -32601, message: 'unsupported' } })
+        return
+      }
+      if (request.method === 'thread/turns/list') {
+        emit({ id: request.id, result: { data: [{
+          id: 'turn-fallback-raw-bound', status: 'completed', itemsView: 'full',
+          items: oversizedItems, error: null,
+        }], nextCursor: null } })
+      }
+    })
+    const turnSession = new CodexAppServerSession(turnTransport.input, turnTransport.stream)
+    await expect(turnSession.loadFullTurn('thread-fallback-raw-bound', {
+      id: 'turn-fallback-raw-bound', status: 'completed', itemsView: 'summary',
+      items: [], error: null,
+    })).rejects.toThrow('item history exceeded its bound')
+    turnSession.closeInput()
+    await turnSession.waitForReader()
+  })
+
+  test('回答履歴のitem/turn paginationは一意cursorでも固定上限でfail-closeする', async () => {
+    let itemPages = 0
+    const itemTransport = mockTransport((request, emit) => {
+      if (request.method !== 'thread/items/list') return
+      itemPages += 1
+      emit({ id: request.id, result: {
+        data: [],
+        nextCursor: `item-page-${itemPages}`,
+      } })
+    })
+    const itemSession = new CodexAppServerSession(itemTransport.input, itemTransport.stream)
+    await expect(itemSession.loadFullTurn('thread-item-bound', {
+      id: 'turn-item-bound', status: 'completed', itemsView: 'summary', items: [], error: null,
+    })).rejects.toThrow('thread/items/list pagination exceeded its bound')
+    expect(itemPages).toBe(128)
+    itemSession.closeInput()
+    await itemSession.waitForReader()
+
+    let turnPages = 0
+    const turnTransport = mockTransport((request, emit) => {
+      if (request.method === 'thread/items/list') {
+        emit({ id: request.id, error: { code: -32601, message: 'unsupported' } })
+        return
+      }
+      if (request.method !== 'thread/turns/list') return
+      turnPages += 1
+      emit({ id: request.id, result: {
+        data: [],
+        nextCursor: `turn-page-${turnPages}`,
+      } })
+    })
+    const turnSession = new CodexAppServerSession(turnTransport.input, turnTransport.stream)
+    await expect(turnSession.loadFullTurn('thread-turn-bound', {
+      id: 'turn-turn-bound', status: 'completed', itemsView: 'summary', items: [], error: null,
+    })).rejects.toThrow('thread/turns/list pagination exceeded its bound')
+    expect(turnPages).toBe(128)
+    turnSession.closeInput()
+    await turnSession.waitForReader()
   })
 
   test('streamとterminalの非対称permission evidenceを保守的に統合する', async () => {
@@ -1286,6 +1556,42 @@ describe('Codex App Server session', () => {
     expect(appServerFinalMessage(terminal!.turn)).toBe('確定した回答')
   })
 
+  test('permission item journalは初回未対応だけnullにし成功page後はfail-closeする', async () => {
+    const unsupportedTransport = mockTransport((request, emit) => {
+      if (request.method === 'thread/items/list') {
+        emit({ id: request.id, error: { code: -32601, message: 'unsupported' } })
+      }
+    })
+    const unsupportedSession = new CodexAppServerSession(
+      unsupportedTransport.input,
+      unsupportedTransport.stream,
+    )
+    await expect(unsupportedSession.loadPermissionProbeEvidence(
+      'thread-unsupported', 'turn-unsupported',
+    )).resolves.toBeNull()
+    unsupportedSession.closeInput()
+    await unsupportedSession.waitForReader()
+
+    const lateTransport = mockTransport((request, emit) => {
+      if (request.method !== 'thread/items/list') return
+      const params = request.params as Record<string, unknown>
+      if (params.cursor === null) {
+        emit({ id: request.id, result: {
+          data: [{ turnId: 'turn-late', item: { type: 'reasoning', id: 'reason-1' } }],
+          nextCursor: 'page-2',
+        } })
+        return
+      }
+      emit({ id: request.id, error: { code: -32601, message: 'late unsupported' } })
+    })
+    const lateSession = new CodexAppServerSession(lateTransport.input, lateTransport.stream)
+    await expect(lateSession.loadPermissionProbeEvidence(
+      'thread-late', 'turn-late',
+    )).rejects.toThrow('late unsupported')
+    lateSession.closeInput()
+    await lateSession.waitForReader()
+  })
+
   test('4200件超の公式履歴からpermission evidenceだけをbounded集計する', async () => {
     let pages = 0
     const transport = mockTransport((request, emit) => {
@@ -1338,6 +1644,25 @@ describe('Codex App Server session', () => {
     await session.waitForReader()
   })
 
+  test('permission item paginationは一意cursorでも固定上限でfail-closeする', async () => {
+    let pages = 0
+    const transport = mockTransport((request, emit) => {
+      if (request.method !== 'thread/items/list') return
+      pages += 1
+      emit({ id: request.id, result: {
+        data: [],
+        nextCursor: `permission-page-${pages}`,
+      } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    await expect(session.loadPermissionProbeEvidence(
+      'thread-permission-bound', 'turn-permission-bound',
+    )).rejects.toThrow('thread/items/list pagination exceeded its bound')
+    expect(pages).toBe(128)
+    session.closeInput()
+    await session.waitForReader()
+  })
+
   test('permission evidenceは複数commandと未知itemを飽和集計する', async () => {
     const transport = mockTransport((request, emit) => {
       if (request.method !== 'thread/items/list') return
@@ -1360,6 +1685,7 @@ describe('Codex App Server session', () => {
     const evidence = await session.loadPermissionProbeEvidence(
       'thread-multiple', 'turn-multiple',
     )
+    if (evidence === null) throw new Error('permission item journal unexpectedly unsupported')
     expect(evidence.commandCount).toBe(2)
     expect(evidence.firstCommand?.command).toBe('/tmp/first')
     expect(evidence.unexpectedItemSeen).toBe(true)

@@ -57,6 +57,7 @@ function fixture(): {
       },
       turns: [{
         status: 'completed',
+        itemsView: 'full',
         items: [{ type: 'agentMessage', phase: 'final_answer', text: response(perspective) }],
       }],
     },
@@ -96,6 +97,7 @@ function fixture(): {
           cwd: repo,
           turns: [{
             status: 'completed',
+            itemsView: 'full',
             items: [
               {
                 type: 'subAgentActivity', kind: 'started', agentThreadId: solutionId,
@@ -114,9 +116,14 @@ function fixture(): {
         ],
         nextCursor: null,
       },
+      parentChildBaseline: [],
       childResponses: new Map([
         [solutionId, child(solutionId, 'solution', 'solution_analyst')],
         [riskId, child(riskId, 'risk', 'risk_reviewer')],
+      ]),
+      childChildrenListResponses: new Map([
+        [solutionId, { data: [], nextCursor: null }],
+        [riskId, { data: [], nextCursor: null }],
       ]),
     },
   }
@@ -229,7 +236,106 @@ describe('native Codex advisor host evidence', () => {
     ;(options.childrenListResponse as { data: unknown[] }).data.unshift({
       id: 'old-child', parentThreadId: options.parentThreadId,
     })
+    options.parentChildBaseline.push('old-child')
     expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
+  })
+
+  test('baselineにないhistorical childとbaseline再利用を拒否する', () => {
+    const extra = fixture()
+    ;(extra.options.childrenListResponse as { data: unknown[] }).data.unshift({
+      id: 'unexpected-old-child', parentThreadId: extra.options.parentThreadId,
+    })
+    expect(() => assertNativeAdvisorEvidence(extra.options)).toThrow(
+      'unjournaled or missing',
+    )
+
+    const reused = fixture()
+    reused.options.parentChildBaseline.push(reused.solutionId)
+    expect(() => assertNativeAdvisorEvidence(reused.options)).toThrow(
+      'already present before this job attempt',
+    )
+  })
+
+  test('parent listingのmissing・duplicateとactivity欠落を拒否する', () => {
+    const missing = fixture()
+    ;(missing.options.childrenListResponse as { data: unknown[] }).data.pop()
+    expect(() => assertNativeAdvisorEvidence(missing.options)).toThrow(
+      'unjournaled or missing',
+    )
+
+    const duplicate = fixture()
+    const listing = (duplicate.options.childrenListResponse as { data: unknown[] }).data
+    listing.push(listing[0])
+    expect(() => assertNativeAdvisorEvidence(duplicate.options)).toThrow('duplicates')
+
+    const activity = fixture()
+    const parent = activity.options.parentResponse as {
+      thread: { turns: Array<{ items: unknown[] }> }
+    }
+    parent.thread.turns[0]!.items.pop()
+    expect(() => assertNativeAdvisorEvidence(activity.options)).toThrow(
+      'unjournaled or missing',
+    )
+  })
+
+  test('全既知subAgentActivity kindを観測し未知kindは拒否する', () => {
+    const accepted = fixture()
+    const parent = accepted.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    parent.thread.turns[0]!.items[0]!.kind = 'interacted'
+    parent.thread.turns[0]!.items[1]!.kind = 'interrupted'
+    expect(() => assertNativeAdvisorEvidence(accepted.options)).not.toThrow()
+
+    const rejected = fixture()
+    const rejectedParent = rejected.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    rejectedParent.thread.turns[0]!.items[0]!.kind = 'completed'
+    expect(() => assertNativeAdvisorEvidence(rejected.options)).toThrow(
+      'invalid subagent activity',
+    )
+  })
+
+  test('parent/childのsummary projectionとadvisorのlisted descendantを拒否する', () => {
+    const summaryParent = fixture()
+    const parent = summaryParent.options.parentResponse as {
+      thread: { turns: Array<{ itemsView: string }> }
+    }
+    parent.thread.turns[0]!.itemsView = 'summary'
+    expect(() => assertNativeAdvisorEvidence(summaryParent.options)).toThrow('not terminal')
+
+    const summaryChild = fixture()
+    const child = summaryChild.options.childResponses.get(summaryChild.solutionId) as {
+      thread: { turns: Array<{ itemsView: string }> }
+    }
+    child.thread.turns[0]!.itemsView = 'summary'
+    expect(() => assertNativeAdvisorEvidence(summaryChild.options)).toThrow(
+      'turn is not completed',
+    )
+
+    const descendant = fixture()
+    descendant.options.childChildrenListResponses.set(descendant.solutionId, {
+      data: [{ id: 'hidden-grandchild', parentThreadId: descendant.solutionId }],
+      nextCursor: null,
+    })
+    expect(() => assertNativeAdvisorEvidence(descendant.options)).toThrow('delegated')
+  })
+
+  test('未claimのchild responseまたはdescendant listingを拒否する', () => {
+    const response = fixture()
+    response.options.childResponses.set('extra-child', { thread: {} })
+    expect(() => assertNativeAdvisorEvidence(response.options)).toThrow(
+      'unclaimed child response',
+    )
+
+    const listing = fixture()
+    listing.options.childChildrenListResponses.set('extra-child', {
+      data: [], nextCursor: null,
+    })
+    expect(() => assertNativeAdvisorEvidence(listing.options)).toThrow(
+      'unclaimed child response',
+    )
   })
 
   test('同じattemptの複数turn・複数入力revisionの全childをjournalへ結合する', () => {
@@ -265,6 +371,7 @@ describe('native Codex advisor host evidence', () => {
         } } },
         turns: [{
           status: 'completed',
+          itemsView: 'full',
           items: [{ type: 'agentMessage', phase: 'final_answer', text: response(perspective) }],
         }],
       },
@@ -292,6 +399,7 @@ describe('native Codex advisor host evidence', () => {
     }
     parent.thread.turns.push({
       status: 'completed',
+      itemsView: 'full',
       items: [
         { type: 'subAgentActivity', kind: 'started', agentThreadId: solutionId },
         { type: 'subAgentActivity', kind: 'started', agentThreadId: riskId },
@@ -303,6 +411,8 @@ describe('native Codex advisor host evidence', () => {
     )
     options.childResponses.set(solutionId, child(solutionId, 'solution', 'solution_analyst'))
     options.childResponses.set(riskId, child(riskId, 'risk', 'risk_reviewer'))
+    options.childChildrenListResponses.set(solutionId, { data: [], nextCursor: null })
+    options.childChildrenListResponses.set(riskId, { data: [], nextCursor: null })
     expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
   })
 

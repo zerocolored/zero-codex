@@ -66,20 +66,29 @@ Slack bot
   再送せず、同じmarkerを追跡します。
   reviewer/helperが通常終了後の子process回収にbounded forceを必要とした場合、その回答は採択・公開しません。
   どちらもprocess argvへ本文を載せません。秘密・credential・個人情報をSlack依頼へ貼り付けないでください。
-- native Codex advisorはmodelの自己申告IDだけを信用しません。親App Server turn終了後、公式履歴APIの
-  `thread/read`・`thread/list`・`thread/turns/list`・`thread/items/list`を全page照合し、現在turnが直接
-  作成した`solution_analyst`/`risk_reviewer`各1件、完了turn、round固有markerとhost計算digest、孫への
-  再委任なしを確認してからjournalを採択します。
+- native Codex advisorはmodelの自己申告IDだけを信用しません。最初のturnより前に親のdirect-child
+  baselineを固定し、親App Server turn終了後、全source kindを指定した`thread/list`と公式turn履歴を
+  全page照合します。`thread/items/list`が使えるreleaseではそのjournalを正本にし、最初のrequestが
+  同一methodの数値`-32601`を返した場合だけ、`thread/turns/list(itemsView:"full")`と
+  `thread/read(includeTurns:true)`の両方を使い、最大4 snapshot内で連続する2回が完全一致する
+  固定点読取りで代用します。現在turnが直接作成した
+  `solution_analyst`/`risk_reviewer`各1件、baseline以外の余分な子なし、完了turn、round固有markerと
+  host計算digest、各advisor直下のlisted childなしを確認してからjournalを採択します。
 - Socket Mode 停止中の DM・メンションと、採用済みスレッドの未メンション返信を履歴から回収します。
 
 Codex CLI 連携は`codex app-server --stdio`を使います。`thread/start` / `thread/resume`で
 threadとpermission handshakeを固定し、`turn/start`、`turn/steer`、`turn/interrupt`を同じ順序付き
 JSON-RPC sessionで処理します。長いturnの`item/completed`通知は全件保持せず最終回答候補だけを投影し、
-`turn/completed`後に公式の全page履歴と照合して最終回答を決定します。job本体に最長時間は設けません。`willRetry: true`の
+`turn/completed`はliveness signalとしてだけ扱い、本文がfullでも必ず公式の全page履歴と照合して最終回答を
+決定します。`thread/items/list`が成功するreleaseではそのjournalだけが公開根拠です。最初のrequestが
+同一methodの数値`-32601`だった場合だけ、`thread/turns/list(itemsView:"full")`と
+`thread/read(includeTurns:true)`の両方を最大4 snapshot読み、同じselected turnが2回連続で完全一致してから
+代用します。片側の失敗、不一致、final欠落をterminal本文で補完しません。job本体に最長時間は設けません。`willRetry: true`の
 rate-limitはApp Serverの同一turn内retryを待ち、host側で同じpromptを再投入しません。起動前の
 managed/MDMを含む実効permission検査には`app-server config/read`と`configRequirements/read`を使います。
-setupとCIはインストール済み公式Codex自身にprotocol型を生成させ、上記の履歴method・field・pagination
-shapeも起動前に確認します。互換性が崩れたreleaseではjob受付前に停止します。
+setupとCIはインストール済み公式Codex自身にprotocol型を生成させ、上記の履歴method・field・pagination、
+全`ThreadSourceKind`、`SubAgentActivityKind`のexact shapeも起動前に確認します。互換性が崩れたreleaseでは
+job受付前に停止します。
 
 write実装中またはreview中に同じSlackスレッドから返信が来た場合も、そのactive turnへ即時に
 `turn/steer`します。ただし新しい内容を未設計のままwrite processで実装せず、現在phaseを区切って

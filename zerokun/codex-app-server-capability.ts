@@ -87,6 +87,20 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
     ],
   },
   {
+    relativePath: 'v2/ThreadSourceKind.ts',
+    required: [
+      /export type ThreadSourceKind = "cli" \| "vscode" \| "exec" \| "appServer" \| "subAgent" \| "subAgentReview" \| "subAgentCompact" \| "subAgentThreadSpawn" \| "subAgentOther" \| "unknown";/,
+    ],
+  },
+  {
+    relativePath: 'v2/ThreadListResponse.ts',
+    required: [
+      /data:\s*Array<Thread>/,
+      /nextCursor:\s*string \| null/,
+      /backwardsCursor:\s*string \| null/,
+    ],
+  },
+  {
     relativePath: 'v2/ThreadItem.ts',
     required: [
       /"type": "userMessage"/,
@@ -111,7 +125,19 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
   },
   {
     relativePath: 'v2/SubAgentActivityKind.ts',
-    required: [/"started"/, /"interacted"/, /"interrupted"/],
+    required: [
+      /export type SubAgentActivityKind = "started" \| "interacted" \| "interrupted";/,
+    ],
+  },
+  {
+    relativePath: 'v2/ThreadTurnsListParams.ts',
+    required: [
+      /threadId:\s*string/,
+      /cursor\?:\s*string \| null/,
+      /limit\?:\s*number \| null/,
+      /sortDirection\?:\s*SortDirection \| null/,
+      /itemsView\?:\s*TurnItemsView \| null/,
+    ],
   },
   {
     relativePath: 'v2/ThreadTurnsListResponse.ts',

@@ -1,3 +1,4 @@
+import { createHash } from 'crypto'
 import { lstatSync, realpathSync } from 'fs'
 import { isAbsolute, join } from 'path'
 
@@ -8,6 +9,10 @@ const MAX_CONTROL_NOTIFICATION_HISTORY = 4_096
 const MAX_ACTIVE_TURN_PROJECTIONS = 16
 const MAX_COMPLETED_TURN_PROJECTIONS = 64
 const MAX_PENDING_LATE_SUBAGENT_ACTIVITIES = 4_096
+const MAX_APP_SERVER_HISTORY_PAGES = 128
+const MAX_APP_SERVER_HISTORY_TURNS = 4_096
+const MAX_APP_SERVER_HISTORY_RAW_ITEMS = 65_536
+const MAX_APP_SERVER_FALLBACK_SNAPSHOTS = 4
 
 export type AppServerTurnStatus = 'completed' | 'interrupted' | 'failed' | 'inProgress'
 
@@ -114,6 +119,15 @@ export class AppServerProtocolError extends Error {
     super(message)
     this.name = 'AppServerProtocolError'
   }
+}
+
+export function isAppServerMethodUnsupported(
+  error: unknown,
+  method: string,
+): error is AppServerProtocolError {
+  return error instanceof AppServerProtocolError
+    && error.method === method
+    && error.rpcError?.code === -32601
 }
 
 /** The JSON line may have reached App Server; callers must never resend it automatically. */
@@ -442,6 +456,22 @@ function turnProjectionKey(threadId: string, turnId: string): string {
   return `${threadId}\u0000${turnId}`
 }
 
+function canonicalAppServerHistory(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalAppServerHistory)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, canonicalAppServerHistory(child)]))
+  }
+  return value
+}
+
+function appServerHistoryDigest(value: unknown): string {
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalAppServerHistory(value)))
+    .digest('hex')
+}
+
 function knownSubAgentActivityKind(value: unknown): boolean {
   // 0.149.x exposes the first three values; current App Server also exposes
   // `completed` for successful children whose item/completed may follow the
@@ -472,6 +502,7 @@ export class CodexAppServerSession {
   private readerFailure: unknown
   private readerClosed = false
   private inputClosed = false
+  private itemsListState: 'unknown' | 'supported' | 'unsupported' = 'unknown'
   private readonly reader: ReadableStreamDefaultReader<Uint8Array>
   private readonly readerTask: Promise<void>
 
@@ -1079,13 +1110,9 @@ export class CodexAppServerSession {
       && (!clientUserMessageId || clientUserMessageId.length > 8_192)) {
       throw new AppServerProtocolError('turn evidence client user message id is invalid')
     }
-    const observedItems = turn.items
-    const observedFallbackItems = clientUserMessageId === undefined
-      ? observedItems
-      : []
     const completeProjection = (official: AppServerTurn): AppServerTurn => ({
       ...(clientUserMessageId === undefined
-        ? mergeTurnItems(official, observedFallbackItems)
+        ? mergeTurnItems(official, [])
         : projectClientTurnHistory(official, clientUserMessageId)),
       itemsView: 'full',
     })
@@ -1098,31 +1125,65 @@ export class CodexAppServerSession {
               || item.client_id === clientUserMessageId)
           )).length
     )
-    let matchingClientEvidenceSeen = false
-    const rememberMatchingClientUsers = (candidate: AppServerTurn): number => {
-      const matching = matchingClientUsers(candidate)
-      if (matching > 0) matchingClientEvidenceSeen = true
-      return matching
-    }
-    const isSufficientProjection = (candidate: AppServerTurn): boolean => {
-      if (clientUserMessageId === undefined) {
-        return appServerFinalMessage(candidate) !== null
+    const stableItemRegistry = new Map<
+      string,
+      { type: string; agentThreadId: string | null }
+    >()
+    const observeStableItems = (
+      source: string,
+      items: readonly Record<string, unknown>[],
+    ): void => {
+      if (items.length > MAX_APP_SERVER_HISTORY_RAW_ITEMS) {
+        throw new AppServerProtocolError(`${source} item history exceeded its bound`)
       }
-      const matching = rememberMatchingClientUsers(candidate)
-      return matching > 1
-        || (matching === 1 && appServerFinalMessage(candidate) !== null)
+      for (const item of items) {
+        const itemId = typeof item.id === 'string'
+          && item.id.length > 0
+          ? item.id
+          : null
+        if (itemId === null) continue
+        const rawType = typeof item.type === 'string'
+          ? item.type
+          : `non-string:${typeof item.type}`
+        const identity = {
+          type: rawType,
+          agentThreadId: rawType === 'subAgentActivity'
+            && typeof item.agentThreadId === 'string'
+            && item.agentThreadId.length > 0
+            ? item.agentThreadId
+            : null,
+        }
+        const key = `${turn.id}\u0000${itemId}`
+        const previous = stableItemRegistry.get(key)
+        if (previous && previous.type !== identity.type) {
+          throw new AppServerProtocolError(
+            `${source} item ${itemId} changed immutable type`,
+          )
+        }
+        if (previous && rawType === 'subAgentActivity'
+          && previous.agentThreadId !== identity.agentThreadId) {
+          throw new AppServerProtocolError(
+            `${source} item ${itemId} changed immutable agent thread`,
+          )
+        }
+        stableItemRegistry.set(key, identity)
+        if (stableItemRegistry.size > MAX_APP_SERVER_HISTORY_RAW_ITEMS * 4) {
+          throw new AppServerProtocolError('App Server stable item registry exceeded its bound')
+        }
+      }
     }
-    const unsupported = (error: unknown, method: string): boolean => (
-      error instanceof AppServerProtocolError
-      && error.method === method
-      && error.rpcError?.code === -32601
-    )
     const loadItemHistory = async (): Promise<AppServerTurn | null> => {
-      let items: Array<Record<string, unknown>> = []
+      if (this.itemsListState === 'unsupported') return null
+      const items: Array<Record<string, unknown>> = []
       const seenCursors = new Set<string>()
       let cursor: string | null = null
+      let pageCount = 0
       try {
         while (true) {
+          if (pageCount >= MAX_APP_SERVER_HISTORY_PAGES) {
+            throw new AppServerProtocolError('thread/items/list pagination exceeded its bound')
+          }
+          pageCount += 1
           const response = await this.request('thread/items/list', {
             threadId,
             turnId: turn.id,
@@ -1130,6 +1191,7 @@ export class CodexAppServerSession {
             limit: 100,
             sortDirection: 'asc',
           }, { timeoutMs })
+          this.itemsListState = 'supported'
           const data = response.result.data
           if (!Array.isArray(data)) {
             throw new AppServerProtocolError('thread/items/list data is invalid')
@@ -1142,14 +1204,11 @@ export class CodexAppServerSession {
             }
             pageItems.push(record(entry.item, `thread/items/list item ${index}`))
           }
-          const combined: AppServerTurn = {
-            ...turn,
-            itemsView: 'full',
-            items: [...items, ...pageItems],
+          if (items.length + pageItems.length > MAX_APP_SERVER_HISTORY_RAW_ITEMS) {
+            throw new AppServerProtocolError('thread/items/list item history exceeded its bound')
           }
-          items = clientUserMessageId === undefined
-            ? mergeTurnItems(combined, []).items
-            : projectClientTurnHistory(combined, clientUserMessageId).items
+          observeStableItems('thread/items/list', pageItems)
+          items.push(...pageItems)
           const nextCursor = response.result.nextCursor
           if (nextCursor === null) {
             return completeProjection({ ...turn, itemsView: 'full', items })
@@ -1162,26 +1221,49 @@ export class CodexAppServerSession {
           cursor = nextCursor
         }
       } catch (error) {
-        if (unsupported(error, 'thread/items/list')) return null
+        if (this.itemsListState === 'unknown' && cursor === null
+          && isAppServerMethodUnsupported(error, 'thread/items/list')) {
+          this.itemsListState = 'unsupported'
+          return null
+        }
         throw error
       }
     }
-    if (clientUserMessageId === undefined && turn.itemsView === 'full') {
-      const projected = completeProjection(turn)
-      if (isSufficientProjection(projected)) return projected
-    }
     // `thread/items/list` is the complete ordered journal. Consult it before
-    // broader snapshots for normal completion and rejected-steer
-    // reconciliation. A real item-journal failure must not be hidden by a
-    // stale turn projection.
+    // broader snapshots. Once supported, this journal is the sole publication
+    // authority: terminal notifications and stale turn snapshots may never
+    // supplement a missing final answer or rejected-steer item.
     const itemHistory = await loadItemHistory()
-    if (itemHistory && isSufficientProjection(itemHistory)) return itemHistory
-    let persistedFallback: AppServerTurn | null = null
-    try {
+    if (itemHistory !== null) {
+      if (clientUserMessageId === undefined) {
+        if (appServerFinalMessage(itemHistory) === null) {
+          throw new AppServerProtocolError(
+            'App Server item journal did not provide a final persisted answer',
+          )
+        }
+        return itemHistory
+      }
+      const matching = matchingClientUsers(itemHistory)
+      if (matching === 0 || matching > 1 || appServerFinalMessage(itemHistory) !== null) {
+        return itemHistory
+      }
+      throw new AppServerProtocolError(
+        'App Server persisted the rejected steer without a following final response',
+      )
+    }
+
+    const readTurnsList = async (): Promise<AppServerTurn> => {
       const seenCursors = new Set<string>()
+      const seenTurnIds = new Set<string>()
       let cursor: string | null = null
-      let targetNeedsFallback = false
+      let pageCount = 0
+      let turnCount = 0
+      let selected: AppServerTurn | null = null
       while (true) {
+        if (pageCount >= MAX_APP_SERVER_HISTORY_PAGES) {
+          throw new AppServerProtocolError('thread/turns/list pagination exceeded its bound')
+        }
+        pageCount += 1
         const response = await this.request('thread/turns/list', {
           threadId,
           cursor,
@@ -1195,27 +1277,24 @@ export class CodexAppServerSession {
         }
         for (let index = 0; index < data.length; index += 1) {
           const candidate = parseTurn(data[index])
+          turnCount += 1
+          if (turnCount > MAX_APP_SERVER_HISTORY_TURNS) {
+            throw new AppServerProtocolError('thread/turns/list turn history exceeded its bound')
+          }
+          if (seenTurnIds.has(candidate.id)) {
+            throw new AppServerProtocolError('thread/turns/list returned a duplicated turn id')
+          }
+          seenTurnIds.add(candidate.id)
           if (candidate.id === turn.id) {
-            if (candidate.itemsView === 'full') {
-              const projected = completeProjection(candidate)
-              if (clientUserMessageId !== undefined && isSufficientProjection(projected)) {
-                return projected
-              }
-              if (clientUserMessageId === undefined && isSufficientProjection(projected)) {
-                persistedFallback = projected
-              }
-              // Some App Server versions materialize a turn as `full` before
-              // its client-ID-bearing user item or final agent message appears
-              // there. Reconcile once more through the remaining official
-              // history views instead of resending or dropping an answer.
-              targetNeedsFallback = true
-              break
+            if (candidate.status !== 'completed' || candidate.itemsView !== 'full') {
+              throw new AppServerProtocolError(
+                'thread/turns/list selected turn is not completed with full items',
+              )
             }
-            targetNeedsFallback = true
-            break
+            observeStableItems('thread/turns/list', candidate.items)
+            selected = candidate
           }
         }
-        if (targetNeedsFallback) break
         const nextCursor = response.result.nextCursor
         if (nextCursor === null) break
         if (typeof nextCursor !== 'string' || !nextCursor || nextCursor.length > 8_192
@@ -1225,10 +1304,13 @@ export class CodexAppServerSession {
         seenCursors.add(nextCursor)
         cursor = nextCursor
       }
-    } catch (error) {
-      if (!unsupported(error, 'thread/turns/list')) throw error
+      if (selected === null) {
+        throw new AppServerProtocolError('thread/turns/list omitted the selected turn')
+      }
+      return selected
     }
-    try {
+
+    const readThread = async (): Promise<AppServerTurn> => {
       const response = await this.request('thread/read', {
         threadId,
         includeTurns: true,
@@ -1240,65 +1322,125 @@ export class CodexAppServerSession {
       if (!Array.isArray(thread.turns)) {
         throw new AppServerProtocolError('thread/read turns are invalid')
       }
-      const candidate = thread.turns.map(parseTurn).find(value => value.id === turn.id)
-      if (candidate?.itemsView === 'full') {
-        const projected = completeProjection(candidate)
-        // thread/read is the final authoritative view after the bounded item
-        // and turn paginations. For a rejected steer, a full turn with no
-        // matching client ID is a definite absence (the caller may safely
-        // defer it once); a matching ID is the definite applied case.
-        if (clientUserMessageId !== undefined) {
-          const matching = rememberMatchingClientUsers(projected)
-          if (matching === 0 && matchingClientEvidenceSeen) {
+      if (thread.turns.length > MAX_APP_SERVER_HISTORY_TURNS) {
+        throw new AppServerProtocolError('thread/read turn history exceeded its bound')
+      }
+      const seenTurnIds = new Set<string>()
+      let selected: AppServerTurn | null = null
+      for (let index = 0; index < thread.turns.length; index += 1) {
+        const candidate = parseTurn(thread.turns[index])
+        if (seenTurnIds.has(candidate.id)) {
+          throw new AppServerProtocolError('thread/read returned a duplicated turn id')
+        }
+        seenTurnIds.add(candidate.id)
+        if (candidate.id === turn.id) {
+          if (candidate.status !== 'completed' || candidate.itemsView !== 'full') {
             throw new AppServerProtocolError(
-              'App Server persisted the rejected steer without a following final response',
+              'thread/read selected turn is not completed with full items',
             )
           }
-          if (matching === 0 || matching > 1 || appServerFinalMessage(projected) !== null) {
-            return projected
+          observeStableItems('thread/read', candidate.items)
+          selected = candidate
+        }
+      }
+      if (selected === null) {
+        throw new AppServerProtocolError('thread/read omitted the selected turn')
+      }
+      return selected
+    }
+
+    let previousSnapshotKey: string | null = null
+    let lastInvalidReason = 'official history views did not agree'
+    for (let snapshot = 0; snapshot < MAX_APP_SERVER_FALLBACK_SNAPSHOTS; snapshot += 1) {
+      const turnsListTurn = await readTurnsList()
+      const threadReadTurn = await readThread()
+      const turnsProjection = completeProjection(turnsListTurn)
+      const readProjection = completeProjection(threadReadTurn)
+      const projectionsAgree = appServerHistoryDigest(turnsProjection)
+        === appServerHistoryDigest(readProjection)
+      if (!projectionsAgree) {
+        previousSnapshotKey = null
+        lastInvalidReason = 'official history views returned different selected-turn evidence'
+      } else {
+        const snapshotKey = appServerHistoryDigest({
+          turnsList: turnsListTurn,
+          threadRead: threadReadTurn,
+          projection: turnsProjection,
+        })
+        if (snapshotKey === previousSnapshotKey) {
+          if (clientUserMessageId === undefined) {
+            if (appServerFinalMessage(turnsProjection) === null) {
+              throw new AppServerProtocolError(
+                'App Server did not provide a final answer in stable persisted turn history',
+              )
+            }
+            return turnsProjection
+          }
+          const matching = matchingClientUsers(turnsProjection)
+          if (matching === 0 || matching > 1 || appServerFinalMessage(turnsProjection) !== null) {
+            return turnsProjection
           }
           throw new AppServerProtocolError(
             'App Server persisted the rejected steer without a following final response',
           )
         }
-        if (isSufficientProjection(projected)) {
-          return projected
-        }
-        return persistedFallback ?? projected
+        previousSnapshotKey = snapshotKey
+        lastInvalidReason = 'official history snapshot did not repeat consecutively'
       }
-    } catch (error) {
-      if (!unsupported(error, 'thread/read')) throw error
+      if (snapshot + 1 < MAX_APP_SERVER_FALLBACK_SNAPSHOTS) {
+        await new Promise<void>(resolve => setTimeout(resolve, 25))
+      }
     }
-    if (clientUserMessageId === undefined && persistedFallback) return persistedFallback
-    if (clientUserMessageId !== undefined && matchingClientEvidenceSeen) {
-      throw new AppServerProtocolError(
-        'App Server persisted the rejected steer without a following final response',
-      )
-    }
-    throw new AppServerProtocolError('App Server did not provide full persisted turn history')
+    throw new AppServerProtocolError(
+      `App Server persisted turn history did not converge: ${lastInvalidReason}`,
+    )
   }
 
   async loadPermissionProbeEvidence(
     threadIdInput: string,
     turnIdInput: string,
     timeoutMs = 30_000,
-  ): Promise<AppServerPermissionProbeEvidence> {
+  ): Promise<AppServerPermissionProbeEvidence | null> {
     const threadId = identifier(threadIdInput, 'thread/items/list thread id')
     const turnId = identifier(turnIdInput, 'thread/items/list turn id')
+    if (this.itemsListState === 'unsupported') return null
     const evidence = emptyPermissionProbeEvidence()
     const seenCursors = new Set<string>()
     let cursor: string | null = null
+    let pageCount = 0
+    let itemCount = 0
     while (true) {
-      const response = await this.request('thread/items/list', {
-        threadId,
-        turnId,
-        cursor,
-        limit: 100,
-        sortDirection: 'asc',
-      }, { timeoutMs })
+      if (pageCount >= MAX_APP_SERVER_HISTORY_PAGES) {
+        throw new AppServerProtocolError('thread/items/list pagination exceeded its bound')
+      }
+      pageCount += 1
+      const response = await (async (): Promise<AppServerRequestReceipt | null> => {
+        try {
+          return await this.request('thread/items/list', {
+            threadId,
+            turnId,
+            cursor,
+            limit: 100,
+            sortDirection: 'asc',
+          }, { timeoutMs })
+        } catch (error) {
+          if (this.itemsListState === 'unknown' && cursor === null
+            && isAppServerMethodUnsupported(error, 'thread/items/list')) {
+            this.itemsListState = 'unsupported'
+            return null
+          }
+          throw error
+        }
+      })()
+      if (response === null) return null
+      this.itemsListState = 'supported'
       const data = response.result.data
       if (!Array.isArray(data)) {
         throw new AppServerProtocolError('thread/items/list data is invalid')
+      }
+      itemCount += data.length
+      if (itemCount > MAX_APP_SERVER_HISTORY_RAW_ITEMS) {
+        throw new AppServerProtocolError('thread/items/list item history exceeded its bound')
       }
       for (let index = 0; index < data.length; index += 1) {
         const entry = record(data[index], `thread/items/list entry ${index}`)

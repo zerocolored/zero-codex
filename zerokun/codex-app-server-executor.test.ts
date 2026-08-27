@@ -100,12 +100,36 @@ requested_thread = None
 handshake_cwd = ""
 permission_profile = ""
 steer_client_id = None
+persisted_items = {}
+
+def observe_emission(value):
+    method = value.get("method")
+    params = value.get("params", {})
+    if method == "turn/started":
+        observed_turn = params.get("turn", {})
+        observed_turn_id = observed_turn.get("id")
+        if observed_turn_id:
+            persisted_items[observed_turn_id] = []
+    elif method == "item/completed":
+        observed_turn_id = params.get("turnId")
+        observed_item = params.get("item")
+        if observed_turn_id and isinstance(observed_item, dict):
+            persisted_items.setdefault(observed_turn_id, []).append(observed_item)
+    elif method == "turn/completed":
+        observed_turn = params.get("turn", {})
+        observed_turn_id = observed_turn.get("id")
+        terminal_items = observed_turn.get("items", [])
+        if observed_turn_id and terminal_items:
+            persisted_items[observed_turn_id] = list(terminal_items)
 
 def emit(value):
+    observe_emission(value)
     sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\\n")
     sys.stdout.flush()
 
 def emit_batch(values):
+    for value in values:
+        observe_emission(value)
     sys.stdout.write("".join(json.dumps(value, ensure_ascii=False) + "\\n" for value in values))
     sys.stdout.flush()
 
@@ -196,7 +220,7 @@ for line in sys.stdin:
             hold_for_steer = mode == "phased-steer" and stage == "implementation" and control_log and not os.path.exists(control_log)
             if not hold_for_steer:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": message}], "error": None}}})
-        elif mode in ("normal", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger"):
+        elif mode in ("normal", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
             if mode == "slow":
                 time.sleep(0.1)
             if mode == "large-ledger":
@@ -232,7 +256,7 @@ for line in sys.stdin:
         elif mode == "summary-stream-no-history":
             emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "text": "履歴不要で完了"}}})
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "summary", "items": [], "error": None}}})
-    elif method == "thread/items/list" and mode in ("defer", "terminal-race", "terminal-race-accepted", "terminal-race-accepted-history", "terminal-race-duplicate", "terminal-race-stale-after-user"):
+    elif method == "thread/items/list" and mode in ("defer", "terminal-race", "terminal-race-accepted", "terminal-race-accepted-history", "terminal-race-duplicate", "terminal-race-stale-after-user") and value.get("params", {}).get("turnId") == "turn-app-server-1":
         matching = 1 if mode in ("terminal-race-accepted", "terminal-race-accepted-history") else (2 if mode == "terminal-race-duplicate" else 0)
         agent_text = "永続履歴の追記を反映しました" if mode == "terminal-race-accepted-history" else "元ターン完了"
         if mode == "terminal-race-stale-after-user":
@@ -244,6 +268,22 @@ for line in sys.stdin:
         emit({"id": request_id, "result": {"data": [
             *[{"turnId": turn_id, "item": {"type": "userMessage", "id": "history-user-" + str(index), "clientId": steer_client_id, "content": []}} for index in range(matching)],
             {"turnId": turn_id, "item": {"type": "agentMessage", "id": "history-agent", "text": agent_text}},
+        ], "nextCursor": None}})
+    elif method == "thread/items/list" and mode == "history-authority":
+        emit({"id": request_id, "result": {"data": [{
+            "turnId": value.get("params", {}).get("turnId"),
+            "item": {"type": "agentMessage", "id": "history-authority", "text": "公式journal回答"},
+        }], "nextCursor": None}})
+    elif method == "thread/items/list" and mode == "history-missing-final":
+        emit({"id": request_id, "result": {"data": [{
+            "turnId": value.get("params", {}).get("turnId"),
+            "item": {"type": "agentMessage", "id": "history-commentary", "phase": "commentary", "text": "確認中"},
+        }], "nextCursor": None}})
+    elif method == "thread/items/list":
+        requested_turn_id = value.get("params", {}).get("turnId")
+        emit({"id": request_id, "result": {"data": [
+            {"turnId": requested_turn_id, "item": item}
+            for item in persisted_items.get(requested_turn_id, [])
         ], "nextCursor": None}})
     elif method == "thread/turns/list" and mode in ("defer", "terminal-race", "terminal-race-stale-after-user"):
         turn_items = [{"type": "agentMessage", "id": "turn-agent", "text": "元ターン完了"}]
@@ -262,7 +302,7 @@ for line in sys.stdin:
                 "error": None,
             }],
         }}})
-    elif method in ("thread/turns/list", "thread/read", "thread/items/list") and mode == "summary-stream-no-history":
+    elif method in ("thread/turns/list", "thread/read") and mode == "summary-stream-no-history":
         emit({"id": request_id, "error": {"code": -32000, "message": "history must not be requested"}})
     elif method == "turn/steer":
         if mode == "phased-steer":
@@ -315,7 +355,8 @@ function fixture(
     | 'phased-late-inbound' | 'summary-stream-no-history' | 'logical-stop-required'
     | 'late-error-after-complete' | 'late-error-coalesced'
     | 'errors-before-terminal-coalesced' | 'terminal-cancel-race'
-    | 'large-ledger' | 'hang-initialize' | 'hang-turn-start',
+    | 'large-ledger' | 'hang-initialize' | 'hang-turn-start'
+    | 'history-authority' | 'history-missing-final',
   writeEnabled = false,
 ) {
   const root = secureRoot()
@@ -959,7 +1000,7 @@ describe('production App Server executor', () => {
     value.store.close()
   })
 
-  test('summary terminalでもstream済み最終回答があれば履歴RPCへ依存しない', async () => {
+  test('summary terminalのstream済み最終回答も公式item journalで照合する', async () => {
     const value = fixture('summary-stream-no-history')
     const rpcLog = join(value.root, 'summary-stream-rpc.log')
     const result = await executeCodexJob(value.job, {
@@ -975,7 +1016,48 @@ describe('production App Server executor', () => {
     })
     expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '履歴不要で完了' })
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-    expect(rpc.map(value => value.method)).toEqual(['turn/start'])
+    expect(rpc.map(value => value.method)).toEqual(['turn/start', 'thread/items/list'])
+    value.store.close()
+  })
+
+  test('terminal本文ではなくsupported item journal本文だけを公開する', async () => {
+    const value = fixture('history-authority')
+    const rpcLog = join(value.root, 'history-authority-rpc.log')
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'history-authority',
+        ZERO_RPC_LOG: rpcLog,
+      },
+      liveControls: value.hooks,
+    })
+    expect(result).toEqual({
+      sessionId: 'thread-app-server-1', result: '公式journal回答',
+    })
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(rpc.map(value => value.method)).toEqual(['turn/start', 'thread/items/list'])
+    value.store.close()
+  })
+
+  test('terminalにfinalがあってもsupported item journalのfinal欠落は公開しない', async () => {
+    const value = fixture('history-missing-final')
+    const rpcLog = join(value.root, 'history-missing-final-rpc.log')
+    await expect(executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'history-missing-final',
+        ZERO_RPC_LOG: rpcLog,
+      },
+      liveControls: value.hooks,
+    })).rejects.toThrow('item journal did not provide a final persisted answer')
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(rpc.map(value => value.method)).toEqual(['turn/start', 'thread/items/list'])
     value.store.close()
   })
 
@@ -1327,10 +1409,10 @@ describe('production App Server executor', () => {
     })
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(rpc.map(value => value.method)).toEqual([
-      'turn/start', 'turn/steer', 'thread/items/list', 'thread/turns/list',
-      'thread/read', 'turn/start',
+      'turn/start', 'turn/steer', 'thread/items/list', 'turn/start',
+      'thread/items/list',
     ])
-    expect(rpc[1].clientUserMessageId).toBe(rpc[5].clientUserMessageId)
+    expect(rpc[1].clientUserMessageId).toBe(rpc[3].clientUserMessageId)
     expect(rpc[1].expectedTurnId).toBe('turn-app-server-1')
     value.store.close()
   }, 30_000)
@@ -1351,7 +1433,7 @@ describe('production App Server executor', () => {
     expect(result.result).toBe('元ターン完了')
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(rpc.map(value => value.method)).toEqual([
-      'turn/start', 'turn/steer', 'thread/items/list',
+      'turn/start', 'turn/steer', 'thread/items/list', 'thread/items/list',
     ])
     expect(value.store.listJobControls(value.job.id)).toHaveLength(1)
     expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({
@@ -1376,7 +1458,7 @@ describe('production App Server executor', () => {
     expect(result.result).toBe('永続履歴の追記を反映しました')
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(rpc.map(value => value.method)).toEqual([
-      'turn/start', 'turn/steer', 'thread/items/list',
+      'turn/start', 'turn/steer', 'thread/items/list', 'thread/items/list',
     ])
     expect(value.store.listJobControls(value.job.id)).toHaveLength(1)
     expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({
@@ -1421,7 +1503,7 @@ describe('production App Server executor', () => {
     })).rejects.toThrow('without a following final response')
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(rpc.map(value => value.method)).toEqual([
-      'turn/start', 'turn/steer', 'thread/items/list', 'thread/turns/list', 'thread/read',
+      'turn/start', 'turn/steer', 'thread/items/list',
     ])
     expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({ status: 'ambiguous' })
     value.store.close()

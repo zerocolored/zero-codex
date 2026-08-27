@@ -68,15 +68,35 @@ describe('live Codex permission evidence', () => {
       permissionEvidence: evidence,
     }
     const session = {
-      loadPermissionProbeEvidence: async () => {
-        throw new AppServerProtocolError(
-          'unsupported', 'thread/items/list', 1,
-          { code: -32601, message: 'not supported yet' },
-        )
-      },
+      loadPermissionProbeEvidence: async () => null,
     } as unknown as CodexAppServerSession
     await expect(loadPermissionProbeEvidenceForTerminal(session, terminal))
       .resolves.toEqual(evidence)
+  })
+
+  test('初回未対応null以外の-32601 errorをterminal evidenceへ弱めない', async () => {
+    const terminal: AppServerTurnTerminal = {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'completed', itemsView: 'full', items: [], error: null },
+      permissionEvidence: {
+        commandCount: 0, firstCommand: null,
+        unexpectedItemSeen: false, unexpectedItemType: null,
+      },
+    }
+    for (const error of [
+      new AppServerProtocolError(
+        'late unsupported', 'thread/items/list', 1, { code: -32601 },
+      ),
+      new AppServerProtocolError(
+        'unsupported', 'thread/items/list', 1, { code: '-32601' },
+      ),
+      new AppServerProtocolError('unsupported', 'thread/read', 1, { code: -32601 }),
+    ]) {
+      const session = {
+        loadPermissionProbeEvidence: async () => { throw error },
+      } as unknown as CodexAppServerSession
+      await expect(loadPermissionProbeEvidenceForTerminal(session, terminal)).rejects.toBe(error)
+    }
   })
 
   test('公式履歴が成功してもstream側の複数実行と未知toolを捨てない', async () => {

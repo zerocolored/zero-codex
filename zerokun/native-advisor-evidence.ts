@@ -25,6 +25,7 @@ export type NativeAdvisorRoundEvidence = {
 
 const THREAD_ID = /^[A-Za-z0-9._:-]{1,256}$/
 const ATTEMPT_NONCE = /^[0-9a-f]{32}$/
+const SUBAGENT_ACTIVITY_KINDS = new Set(['started', 'interacted', 'interrupted'])
 
 export function nativeAdvisorMarker(
   attemptNonce: string,
@@ -95,7 +96,8 @@ function completedFinalResponse(thread: Record<string, unknown>, label: string):
     throw new Error(`${label} must contain exactly one fresh turn`)
   }
   const turn = record(thread.turns[0], `${label}.turn`)
-  if (turn.status !== 'completed' || !Array.isArray(turn.items)) {
+  if (turn.status !== 'completed' || turn.itemsView !== 'full'
+    || !Array.isArray(turn.items)) {
     throw new Error(`${label} turn is not completed`)
   }
   const messages = turn.items.flatMap(item => {
@@ -106,20 +108,50 @@ function completedFinalResponse(thread: Record<string, unknown>, label: string):
   if (messages.length !== 1 || !messages[0]) {
     throw new Error(`${label} does not contain one final response`)
   }
-  if (turn.items.some(item => item && typeof item === 'object' && !Array.isArray(item)
-    && (item as Record<string, unknown>).type === 'subAgentActivity'
-    && (item as Record<string, unknown>).kind === 'started')) {
+  for (const rawItem of turn.items) {
+    if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) continue
+    const item = rawItem as Record<string, unknown>
+    if (item.type !== 'subAgentActivity') continue
+    if (typeof item.kind !== 'string' || !SUBAGENT_ACTIVITY_KINDS.has(item.kind)
+      || typeof item.agentThreadId !== 'string' || !THREAD_ID.test(item.agentThreadId)) {
+      throw new Error(`${label} contains invalid subagent activity`)
+    }
     throw new Error(`${label} delegated to another subagent`)
   }
   return messages[0]
+}
+
+function listedDirectChildren(
+  value: unknown,
+  parentThreadId: string,
+  label: string,
+): string[] {
+  const listing = record(value, label)
+  if (!Array.isArray(listing.data) || listing.nextCursor !== null) {
+    throw new Error(`${label} is incomplete`)
+  }
+  const ids = listing.data.map((rawChild, index) => {
+    const child = record(rawChild, `${label} child ${index}`)
+    if (typeof child.id !== 'string' || !THREAD_ID.test(child.id)
+      || child.parentThreadId !== parentThreadId) {
+      throw new Error(`${label} contains an unrelated thread`)
+    }
+    return child.id
+  })
+  if (new Set(ids).size !== ids.length) {
+    throw new Error(`${label} contains duplicates`)
+  }
+  return ids
 }
 
 /**
  * Validate the model's native-advisor journal against Codex-owned App Server
  * history. The caller supplies only responses read from the official local
  * Codex binary after the parent App Server/exec thread has reached its terminal
- * turn. Every child created by this job attempt must have a durable journal;
- * this also binds children from earlier input revisions and earlier turns.
+ * turn. The pre-turn child baseline separates historical children from this
+ * job attempt; every newly listed direct child must have a durable journal,
+ * and every claimed advisor must have an empty direct-child listing. This also
+ * binds children from earlier input revisions and earlier turns in this job.
  */
 export function assertNativeAdvisorEvidence(options: {
   attemptNonce: string
@@ -129,7 +161,9 @@ export function assertNativeAdvisorEvidence(options: {
   rounds: NativeAdvisorRoundEvidence[]
   parentResponse: unknown
   childrenListResponse: unknown
+  parentChildBaseline: string[]
   childResponses: Map<string, unknown>
+  childChildrenListResponses: Map<string, unknown>
 }): void {
   if (!ATTEMPT_NONCE.test(options.attemptNonce)
     || !THREAD_ID.test(options.parentThreadId)) {
@@ -149,33 +183,33 @@ export function assertNativeAdvisorEvidence(options: {
   if (!Array.isArray(parent.turns) || parent.turns.length < 1) {
     throw new Error('native advisor parent thread is not terminal')
   }
-  const startedChildren = new Set<string>()
+  const observedChildren = new Set<string>()
   for (const [turnIndex, rawTurn] of parent.turns.entries()) {
     const turn = record(rawTurn, `native advisor parent turn ${turnIndex}`)
-    if (turn.status !== 'completed' || !Array.isArray(turn.items)) {
+    if (turn.status !== 'completed' || turn.itemsView !== 'full'
+      || !Array.isArray(turn.items)) {
       throw new Error('native advisor parent thread is not terminal')
     }
     for (const rawItem of turn.items) {
       if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) continue
       const item = rawItem as Record<string, unknown>
-      if (item.type === 'subAgentActivity' && item.kind === 'started'
-        && typeof item.agentThreadId === 'string') startedChildren.add(item.agentThreadId)
+      if (item.type !== 'subAgentActivity') continue
+      if (typeof item.kind !== 'string' || !SUBAGENT_ACTIVITY_KINDS.has(item.kind)
+        || typeof item.agentThreadId !== 'string' || !THREAD_ID.test(item.agentThreadId)) {
+        throw new Error('native advisor parent contains invalid subagent activity')
+      }
+      observedChildren.add(item.agentThreadId)
     }
   }
-  const listing = record(options.childrenListResponse, 'native advisor child listing')
-  if (!Array.isArray(listing.data) || listing.nextCursor !== null) {
-    throw new Error('native advisor child listing is incomplete')
-  }
-  const listedIds = listing.data.map((value, index) => {
-    const child = record(value, `native advisor listed child ${index}`)
-    if (typeof child.id !== 'string' || !THREAD_ID.test(child.id)
-      || child.parentThreadId !== options.parentThreadId) {
-      throw new Error('native advisor child listing contains an unrelated thread')
-    }
-    return child.id
-  })
-  if (new Set(listedIds).size !== listedIds.length) {
-    throw new Error('native advisor child listing contains duplicates')
+  const listedIds = listedDirectChildren(
+    options.childrenListResponse,
+    options.parentThreadId,
+    'native advisor child listing',
+  )
+  if (!Array.isArray(options.parentChildBaseline)
+    || new Set(options.parentChildBaseline).size !== options.parentChildBaseline.length
+    || options.parentChildBaseline.some(id => !THREAD_ID.test(id))) {
+    throw new Error('native advisor parent child baseline is invalid')
   }
 
   const claimed = new Set<string>()
@@ -204,6 +238,17 @@ export function assertNativeAdvisorEvidence(options: {
         throw new Error(`native advisor ${entry.agentId} identity or role is invalid`)
       }
       const finalResponse = completedFinalResponse(child, `native advisor ${entry.agentId}`)
+      const descendants = options.childChildrenListResponses.get(entry.agentId)
+      if (!descendants) {
+        throw new Error(`native advisor ${entry.agentId} descendant listing is missing`)
+      }
+      if (listedDirectChildren(
+        descendants,
+        entry.agentId,
+        `native advisor ${entry.agentId} descendant listing`,
+      ).length !== 0) {
+        throw new Error(`native advisor ${entry.agentId} delegated to another subagent`)
+      }
       const marker = nativeAdvisorMarker(
         options.attemptNonce, evidence.inputRevision, evidence.inputDigest,
         evidence.phase, evidence.round, entry.perspective,
@@ -214,9 +259,21 @@ export function assertNativeAdvisorEvidence(options: {
       }
     }
   }
-  if (claimed.size !== startedChildren.size
-    || [...startedChildren].some(id => !claimed.has(id))
-    || [...claimed].some(id => !listedIds.includes(id))) {
+  if (options.childResponses.size !== claimed.size
+    || [...options.childResponses.keys()].some(id => !claimed.has(id))
+    || options.childChildrenListResponses.size !== claimed.size
+    || [...options.childChildrenListResponses.keys()].some(id => !claimed.has(id))) {
+    throw new Error('native advisor history contains an unclaimed child response')
+  }
+  const baseline = new Set(options.parentChildBaseline)
+  if ([...claimed].some(id => baseline.has(id))) {
+    throw new Error('native advisor identity was already present before this job attempt')
+  }
+  const expectedListed = new Set([...baseline, ...claimed])
+  if (claimed.size !== observedChildren.size
+    || [...observedChildren].some(id => !claimed.has(id))
+    || listedIds.length !== expectedListed.size
+    || listedIds.some(id => !expectedListed.has(id))) {
     throw new Error('Codex job attempt spawned unjournaled or missing native advisors')
   }
 }

@@ -36,7 +36,6 @@ import {
 } from './codex-executor.ts'
 import { verifyCodexAppServerCapabilities } from './codex-app-server-capability.ts'
 import {
-  AppServerProtocolError,
   CodexAppServerSession,
   mergeAppServerPermissionProbeEvidence,
   sameAppServerSessionSource,
@@ -166,18 +165,12 @@ export async function loadPermissionProbeEvidenceForTerminal(
   session: CodexAppServerSession,
   terminal: AppServerTurnTerminal,
 ): Promise<AppServerPermissionProbeEvidence> {
-  try {
-    const official = await session.loadPermissionProbeEvidence(
-      terminal.threadId,
-      terminal.turn.id,
-    )
-    return mergeAppServerPermissionProbeEvidence(terminal.permissionEvidence, official)
-  } catch (error) {
-    if (!(error instanceof AppServerProtocolError)
-      || error.method !== 'thread/items/list'
-      || error.rpcError?.code !== -32601) throw error
-    return terminal.permissionEvidence
-  }
+  const official = await session.loadPermissionProbeEvidence(
+    terminal.threadId,
+    terminal.turn.id,
+  )
+  if (official === null) return terminal.permissionEvidence
+  return mergeAppServerPermissionProbeEvidence(terminal.permissionEvidence, official)
 }
 
 function job(repoPath: string, id: string, writeEnabled: boolean, sessionId: string | null): JobRecord {
