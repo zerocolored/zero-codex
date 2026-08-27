@@ -93,13 +93,22 @@ export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOu
 const CLAUDE_MARKER_INSTRUCTION =
   '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
 
+const CLAUDE_DURATION =
+  '(?:[1-9][0-9]*d (?:0|[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m|(?:[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])s)'
+const CLAUDE_LEGACY_ACTIVITY_CHROME = /^✻ Churned for 23s$/u
+const CLAUDE_DONE_ACTIVITY_CHROME = new RegExp(
+  `^[✻✳✽✶✢] (?:Baked|Brewed|Churned|Cogitated|Cooked|Crunched|Sautéed|Worked) for ${CLAUDE_DURATION} · done (?:[01]?[0-9]|2[0-3]):[0-5][0-9]$`,
+  'u',
+)
+
 function isClaudeTerminalChrome(line: string): boolean {
   const value = line.trim()
   return value === ''
     || value === '❯'
     || /^─+$/.test(value)
-    || /^[✻✳✽✶✢] [A-Za-z][A-Za-z -]{0,48} for (?:(?:[1-9][0-9]*h )?(?:[1-9][0-9]*m )?)?[1-9][0-9]*s$/u.test(value)
-    || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · .+)?$/.test(value)
+    || CLAUDE_LEGACY_ACTIVITY_CHROME.test(value)
+    || CLAUDE_DONE_ACTIVITY_CHROME.test(value)
+    || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · (?:\/rc|← for agents {1,256}\/rc))?$/.test(value)
 }
 
 export function extractCompleteClaudeResponse(transcript: string, marker: string): string | null {

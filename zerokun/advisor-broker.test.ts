@@ -625,6 +625,7 @@ print('review complete')
       '⏵⏵ bypass permissions on (shift+tab to cycle) /rc',
       '⏵⏵ bypass permissions on (shift+tab to cycle) extra',
       '⏵⏵ bypass permissions off (shift+tab to cycle) · /rc',
+      '⏵⏵ bypass permissions on · marker後にも回答を続けます。',
       'Allow this action',
       'Do you want to proceed',
       '/rc',
@@ -639,6 +640,87 @@ print('review complete')
     expect(extractCompleteClaudeResponse(envelope(
       'marker後にも回答を続けます。',
       '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
+    ), marker)).toBeNull()
+  })
+
+  test('Claude 2.1.247の固定done clockだけをactivity chromeとして採択する', () => {
+    const marker = 'REQUEST_MARKER=FEDCBA9876543210FEDCBA9876543210'
+    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
+    const response = '独立したレビュー結果です。'
+    const envelope = (...chrome: string[]) => [
+      '依頼本文',
+      instruction,
+      marker,
+      response,
+      marker,
+      ...chrome,
+      '────────────────',
+      '❯',
+      '────────────────',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
+    ].join('\n')
+
+    for (const activity of [
+      '✻ Churned for 23s',
+      '✻ Churned for 23s · done 12:26',
+      '✻ Worked for 1m 5s · done 09:05',
+      '✻ Worked for 3m 0s · done 12:40',
+      '✻ Worked for 1h 2m 3s · done 9:05',
+      '✻ Worked for 1h 0m 0s · done 12:40',
+      '✻ Baked for 1d 0h 0m · done 13:27',
+      '✻ Brewed for 1s · done 13:27',
+      '✻ Cogitated for 1s · done 13:27',
+      '✻ Cooked for 1s · done 13:27',
+      '✻ Crunched for 1s · done 13:27',
+      '✻ Sautéed for 5m 45s · done 13:27',
+      '✳ Worked for 1s · done 0:00',
+      '✢ Worked for 1s · done 23:59',
+    ]) {
+      expect(extractCompleteClaudeResponse(envelope(activity), marker)).toBe(response)
+    }
+
+    for (const activity of [
+      '✻ Churned for 23s · esc to interrupt',
+      '✻ Churned for 23s · done',
+      '✻ Churned for 23s · Done 12:26',
+      '✻ Churned for 23s · done 24:00',
+      '✻ Churned for 23s · done 12:60',
+      '✻ Churned for 23s · done 12:6',
+      '✻ Churned for 23s · done 12:26:00',
+      '✻ Churned for 23s · done 12:26 PM',
+      '✻ Churned for 23s · done 12:26 extra',
+      '✻ Churned for 0s · done 12:26',
+      '✻ Worked for 0m 5s · done 12:26',
+      '✻ Worked for 1m 00s · done 12:26',
+      '✻ Worked for 3m 60s · done 12:26',
+      '✻ Worked for 1h 60m 0s · done 12:26',
+      '✻ Worked for 1h 00m 0s · done 12:26',
+      '✻ Worked for 60s · done 12:26',
+      '✻ Worked for 60m 0s · done 12:26',
+      '✻ Worked for 1h 5s · done 12:26',
+      '✻ Worked for 24h 0m 0s · done 12:26',
+      '✻ Worked for 1d 24h 0m · done 12:26',
+      '✻ Worked for 1d 0h 60m · done 12:26',
+      '✻ Worked for 1d 0h 0m 0s · done 12:26',
+      '✻ continuation for 1s · done 12:26',
+      '✻ Wait for 5s · done 12:26',
+      '✻ Churning for 23s · done 12:26',
+      '✻ Braised for 1s · done 12:26',
+      '✻ continuation for 1s',
+      '✻ Wait for 5s',
+      '✻ Churning for 23s',
+      '✻ Worked for 1s',
+      '✳ Churned for 23s',
+      '✻ Churned for 24s',
+      '✔ Churned for 23s · done 12:26',
+      '· done 12:26',
+    ]) {
+      expect(extractCompleteClaudeResponse(envelope(activity), marker)).toBeNull()
+    }
+
+    expect(extractCompleteClaudeResponse(envelope(
+      '✻ Churned for 23s · done 12:26',
+      'marker後にも回答を続けます。',
     ), marker)).toBeNull()
   })
 

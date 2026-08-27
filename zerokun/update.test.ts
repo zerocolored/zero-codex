@@ -105,7 +105,7 @@ function installedNativeCodex(): string {
 
 function candidateGitDiffFunction(): string {
   const source = readFileSync(join(import.meta.dir, 'verify.sh'), 'utf8')
-  const start = source.indexOf('candidate_git_diff_check() {')
+  const start = source.indexOf('candidate_git_directory_metadata_safe() {')
   const end = source.indexOf('\n}\n\nROOT=', start)
   if (start < 0 || end < 0) throw new Error('candidate Git diff function is missing')
   return source.slice(start, end + 2)
@@ -626,6 +626,16 @@ describe('updater helpers', () => {
       'GIT_PAGER=cat',
       'GIT_OPTIONAL_LOCKS=0',
       'TERM=dumb',
+      'local -a checked_paths',
+      '"/Library/Developer"',
+      '"/Applications/$selected_app/Contents"',
+      'for checked_path in "${checked_paths[@]}"',
+      "LANG=C LC_ALL=C /usr/bin/stat -f '%HT:%u:%g:%Mp%Lp'",
+      'candidate_git_directory_metadata_safe',
+      '(8#$mode & 0022) == 0',
+      '"$checked_path" == "/Applications"',
+      '"$owner" == "0" && "$group" == "80"',
+      '8#$mode == 8#775',
       '"$candidate_git" --no-pager -c core.fsmonitor=false',
       'diff --cached --check --no-ext-diff --no-textconv --no-color HEAD --',
       'diff --check --no-ext-diff --no-textconv --no-color --',
@@ -635,6 +645,7 @@ describe('updater helpers', () => {
     }
     expect(candidateCheck.match(/"\$owner" != "0" && "\$owner" != "\$EUID"/g))
       .toHaveLength(2)
+    expect(candidateCheck).not.toContain('stat -L')
     expect(candidateCheck).not.toContain('/usr/bin/xcrun')
     expect(source).toContain([
       'if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then',
@@ -643,6 +654,42 @@ describe('updater helpers', () => {
       '  git diff --check',
       'fi',
     ].join('\n'))
+  })
+
+  test('candidate Git directory metadataはstock Applicationsだけを例外にする', () => {
+    const dir = fixtureDir()
+    const script = join(dir, 'candidate-git-directory-policy.sh')
+    writeFileSync(script, [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      candidateGitDiffFunction(),
+      'check() {',
+      '  local expected="$1" actual',
+      '  shift',
+      '  if candidate_git_directory_metadata_safe "$@"; then actual=allow; else actual=deny; fi',
+      '  [[ "$actual" == "$expected" ]] || { echo "unexpected policy result: $*" >&2; return 1; }',
+      '}',
+      'check allow /Applications Directory 0 80 775',
+      'check allow /Applications Directory 0 80 0775',
+      'check allow /Applications Directory 0 80 755',
+      'check deny /Applications Directory 0 80 1775',
+      'check deny /Applications Directory 0 80 2775',
+      'check deny /Applications Directory 0 80 777',
+      'check deny /Applications Directory 0 0 775',
+      'check deny /Applications "Symbolic Link" 0 80 775',
+      'check deny /Applications/Xcode.app Directory 0 80 775',
+      'check deny /Library/Developer Directory 0 80 775',
+      'check allow /Library/Developer Directory 0 80 755',
+      'check deny /Applications/Xcode.app/Contents/Developer/usr "Symbolic Link" 0 0 755',
+      'check deny /Applications/Xcode.app/Contents/Developer/usr Directory 0 0 775',
+      'check deny /Applications/Xcode.app/Contents/Developer/usr/bin "Regular File" 0 0 755',
+      'check allow /custom-xcode Directory "$EUID" 20 700',
+      '',
+    ].join('\n'))
+    const result = Bun.spawnSync(['/bin/bash', script], {
+      stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
   })
 
   test('rollback用SQLite snapshotをsidecarごと原子的に復元する', () => {

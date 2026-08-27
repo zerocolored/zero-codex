@@ -13,9 +13,30 @@ elif [[ $# -ne 0 ]]; then
   exit 2
 fi
 
+candidate_git_directory_metadata_safe() {
+  local checked_path="$1" file_type="$2" owner="$3" group="$4" mode="$5"
+
+  if [[ "$file_type" != "Directory"
+    || ! "$owner" =~ ^[0-9]+$ || ! "$group" =~ ^[0-9]+$
+    || ! "$mode" =~ ^[0-7]{3,4}$
+    || ( "$owner" != "0" && "$owner" != "$EUID" ) ]]; then
+    return 1
+  fi
+  if (( (8#$mode & 0022) == 0 )); then
+    return 0
+  fi
+  if [[ "$checked_path" == "/Applications"
+    && "$owner" == "0" && "$group" == "80" ]] \
+    && (( 8#$mode == 8#775 )); then
+    return 0
+  fi
+  return 1
+}
+
 candidate_git_diff_check() {
   local developer_dir physical_developer_dir selected_app candidate_git
-  local metadata owner mode checked_path
+  local metadata file_type owner group mode checked_path
+  local -a checked_paths
 
   developer_dir="$(
     /usr/bin/env -i \
@@ -46,7 +67,13 @@ candidate_git_diff_check() {
     return 1
   fi
   case "$physical_developer_dir" in
-    /Library/Developer/CommandLineTools) ;;
+    /Library/Developer/CommandLineTools)
+      checked_paths=(
+        "/"
+        "/Library"
+        "/Library/Developer"
+      )
+      ;;
     /Applications/*/Contents/Developer)
       selected_app="${physical_developer_dir#/Applications/}"
       selected_app="${selected_app%/Contents/Developer}"
@@ -54,6 +81,12 @@ candidate_git_diff_check() {
         echo 'error: candidate検証用の開発者directoryが許可範囲外です' >&2
         return 1
       fi
+      checked_paths=(
+        "/"
+        "/Applications"
+        "/Applications/$selected_app"
+        "/Applications/$selected_app/Contents"
+      )
       ;;
     *)
       echo 'error: candidate検証用の開発者directoryが許可範囲外です' >&2
@@ -61,27 +94,27 @@ candidate_git_diff_check() {
       ;;
   esac
 
-  for checked_path in \
-    "$physical_developer_dir" \
-    "$physical_developer_dir/usr" \
+  checked_paths+=(
+    "$physical_developer_dir"
+    "$physical_developer_dir/usr"
     "$physical_developer_dir/usr/bin"
-  do
-    metadata="$(/usr/bin/stat -f '%u:%Lp' "$checked_path" 2>/dev/null)" || {
+  )
+  for checked_path in "${checked_paths[@]}"; do
+    metadata="$(LANG=C LC_ALL=C /usr/bin/stat -f '%HT:%u:%g:%Mp%Lp' "$checked_path" 2>/dev/null)" || {
       echo 'error: candidate検証用Gitのdirectoryを検証できません' >&2
       return 1
     }
-    if [[ ! "$metadata" =~ ^([0-9]+):([0-7]{3,4})$ ]]; then
+    if [[ ! "$metadata" =~ ^([^:]+):([0-9]+):([0-9]+):([0-7]{4})$ ]]; then
       echo 'error: candidate検証用Gitのdirectory metadataが不正です' >&2
       return 1
     fi
-    owner="${BASH_REMATCH[1]}"
-    mode="${BASH_REMATCH[2]}"
-    if [[ "$owner" != "0" && "$owner" != "$EUID" ]]; then
-      echo 'error: candidate検証用Gitのdirectory ownerが不正です' >&2
-      return 1
-    fi
-    if (( (8#$mode & 0002) != 0 )); then
-      echo 'error: candidate検証用Gitのdirectoryがworld-writableです' >&2
+    file_type="${BASH_REMATCH[1]}"
+    owner="${BASH_REMATCH[2]}"
+    group="${BASH_REMATCH[3]}"
+    mode="${BASH_REMATCH[4]}"
+    if ! candidate_git_directory_metadata_safe \
+      "$checked_path" "$file_type" "$owner" "$group" "$mode"; then
+      echo 'error: candidate検証用Gitのdirectoryが安全ではありません' >&2
       return 1
     fi
   done
@@ -216,6 +249,8 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     'candidate sandboxはpreflightと同じrandom named permissionをdefaultにする'
   candidate_contract_test zerokun/update.test.ts \
     'candidate sandboxのwhitespace checkはselected Gitをpagerなしで固定する'
+  candidate_contract_test zerokun/update.test.ts \
+    'candidate Git directory metadataはstock Applicationsだけを例外にする'
   candidate_contract_test zerokun/update.test.ts \
     'rollback用SQLite snapshotをsidecarごと原子的に復元する'
   candidate_contract_test zerokun/update.test.ts \
