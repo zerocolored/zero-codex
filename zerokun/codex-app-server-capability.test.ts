@@ -180,13 +180,30 @@ describe('Codex App Server capability gate', () => {
     expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('nextCursor')
   })
 
-  test('遅延subagent照合に必要なactivity kindを欠くreleaseをfail-closeする', () => {
+  test('0.149系とcurrentの既知activity kind集合だけを受理する', () => {
+    const legacy = fixture()
+    writeFileSync(
+      join(legacy, 'v2/SubAgentActivityKind.ts'),
+      'export type SubAgentActivityKind = "started" | "interacted" | "interrupted";',
+    )
+    expect(() => assertCodexAppServerGeneratedCapabilities(legacy)).not.toThrow()
+
+    const future = fixture()
+    writeFileSync(
+      join(future, 'v2/SubAgentActivityKind.ts'),
+      'export type SubAgentActivityKind = "started" | "interacted" | "interrupted" | "completed" | "futureActivity";',
+    )
+    expect(() => assertCodexAppServerGeneratedCapabilities(future))
+      .toThrow('SubAgentActivityKind')
+  })
+
+  test('遅延subagent照合に必要なinterrupted kindを欠くreleaseをfail-closeする', () => {
     const root = fixture()
     writeFileSync(
       join(root, 'v2/SubAgentActivityKind.ts'),
-      'export type SubAgentActivityKind = "started" | "interacted" | "interrupted";',
+      'export type SubAgentActivityKind = "started" | "interacted";',
     )
-    expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('completed')
+    expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('interrupted')
   })
 
   test('direct-child全列挙に必要なsource kind集合の増減をfail-closeする', () => {
