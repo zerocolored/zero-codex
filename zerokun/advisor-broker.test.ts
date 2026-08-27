@@ -691,6 +691,93 @@ print('review complete')
     ), marker)).toBeNull()
   })
 
+  test('Claude 2.1.247の実測狭幅prompt echoだけを固定envelopeとして採択する', () => {
+    const marker = 'REQUEST_MARKER=3CC556E85A172CDBDF0101C7C293A2F6'
+    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
+    const instructionHead = '応答の最後の独立行に、次のrequest'
+    const instructionTail = 'markerをそのまま記載してください。'
+    const markerHead = marker.slice(0, -1)
+    const markerTail = marker.slice(-1)
+    const response = '独立したレビュー結果です。\n二行目です。'
+    const clippedFooter = `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u00B7`
+    const chrome = [
+      '✻ Baked for 25s · done 15:05',
+      '────────────────',
+      '❯',
+      '────────────────',
+      clippedFooter,
+    ]
+    const wrappedPrompt = [instructionHead, instructionTail, markerHead, markerTail]
+    const envelope = ({
+      prompt = wrappedPrompt,
+      body = response.split('\n'),
+      final = [marker],
+      tail = chrome,
+    }: {
+      prompt?: string[]
+      body?: string[]
+      final?: string[]
+      tail?: string[]
+    } = {}) => ['依頼本文', ...prompt, ...body, ...final, ...tail].join('\n')
+
+    expect(`${instructionHead} ${instructionTail}`).toBe(instruction)
+    expect(markerHead.length).toBe(marker.length - 1)
+    expect(markerTail.length).toBe(1)
+    expect(extractCompleteClaudeResponse(envelope(), marker)).toBe(response)
+    expect(extractCompleteClaudeResponse(envelope().replaceAll('\n', '\r\n'), marker))
+      .toBe(response)
+
+    for (const prompt of [
+      [instructionHead, instructionTail, marker.slice(0, -2), marker.slice(-2)],
+      [instructionHead, instructionTail, marker.slice(0, 20), marker.slice(20)],
+      [instructionHead, instructionTail, markerHead, '', markerTail],
+      [instructionHead, instructionTail, `${markerHead}X`, markerTail],
+      [instructionHead, instructionTail, markerHead, `${markerTail}X`],
+      [`${instructionHead}X`, instructionTail, markerHead, markerTail],
+      [instructionHead, `${instructionTail}X`, markerHead, markerTail],
+      [instructionTail, instructionHead, markerHead, markerTail],
+    ]) {
+      expect(extractCompleteClaudeResponse(envelope({ prompt }), marker)).toBeNull()
+    }
+
+    expect(extractCompleteClaudeResponse(envelope({
+      prompt: [instructionHead, instructionTail, marker],
+    }), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope({
+      prompt: [instruction, markerHead, markerTail],
+    }), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope({
+      final: [markerHead, markerTail],
+    }), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope({ body: [] }), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope({
+      body: [response, markerHead, markerTail],
+    }), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope({
+      body: [`本文中に ${marker} を含めます。`],
+    }), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope({
+      prompt: [...wrappedPrompt, ...wrappedPrompt],
+    }), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope({ tail: ['marker後にも回答を続けます。'] }), marker))
+      .toBeNull()
+    expect(extractCompleteClaudeResponse([
+      '依頼本文', instruction, marker, response, markerHead, markerTail, marker, ...chrome,
+    ].join('\n'), marker)).toBeNull()
+
+    const nonProductionMarker = 'NOT_A_PRODUCTION_MARKER'
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      instructionHead,
+      instructionTail,
+      nonProductionMarker.slice(0, -1),
+      nonProductionMarker.slice(-1),
+      response,
+      nonProductionMarker,
+      ...chrome,
+    ].join('\n'), nonProductionMarker)).toBeNull()
+  })
+
   test('Claude 2.1.247の固定done clockだけをactivity chromeとして採択する', () => {
     const marker = 'REQUEST_MARKER=FEDCBA9876543210FEDCBA9876543210'
     const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'

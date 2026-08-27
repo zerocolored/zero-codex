@@ -92,6 +92,11 @@ export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOu
 
 const CLAUDE_MARKER_INSTRUCTION =
   '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
+const CLAUDE_NARROW_MARKER_INSTRUCTION_HEAD =
+  '応答の最後の独立行に、次のrequest'
+const CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL =
+  'markerをそのまま記載してください。'
+const CLAUDE_REQUEST_MARKER = /^REQUEST_MARKER=[0-9A-F]{32}$/
 
 const CLAUDE_DURATION =
   '(?:[1-9][0-9]*d (?:0|[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m|(?:[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])s)'
@@ -118,16 +123,41 @@ function isClaudeTerminalChrome(line: string): boolean {
 export function extractCompleteClaudeResponse(transcript: string, marker: string): string | null {
   if (!marker || marker.includes('\n') || marker.includes('\r')) return null
   const lines = transcript.replaceAll('\r\n', '\n').split('\n')
-  const markerLines = lines.flatMap((line, index) => line.trim() === marker ? [index] : [])
-  if (markerLines.length !== 2) return null
+  const values = lines.map(line => line.trim())
+  const markerLines = values.flatMap((line, index) => line === marker ? [index] : [])
   const exactOccurrences = transcript.split(marker).length - 1
-  if (exactOccurrences !== 2) return null
-  const [promptMarker, responseMarker] = markerLines
-  if (promptMarker < 1
-    || lines[promptMarker - 1]!.trim() !== CLAUDE_MARKER_INSTRUCTION
-    || responseMarker <= promptMarker + 1) return null
+  const wrappedMarkerPairs = CLAUDE_REQUEST_MARKER.test(marker)
+    ? values.flatMap((line, index) => (
+        line === marker.slice(0, -1) && values[index + 1] === marker.slice(-1)
+          ? [index]
+          : []
+      ))
+    : []
+
+  let promptEnd: number
+  let responseMarker: number
+  if (markerLines.length === 2
+    && exactOccurrences === 2
+    && wrappedMarkerPairs.length === 0) {
+    const promptMarker = markerLines[0]!
+    responseMarker = markerLines[1]!
+    if (promptMarker < 1
+      || values[promptMarker - 1] !== CLAUDE_MARKER_INSTRUCTION) return null
+    promptEnd = promptMarker
+  } else if (markerLines.length === 1
+    && exactOccurrences === 1
+    && wrappedMarkerPairs.length === 1) {
+    const wrappedMarker = wrappedMarkerPairs[0]!
+    responseMarker = markerLines[0]!
+    if (wrappedMarker < 2
+      || values[wrappedMarker - 2] !== CLAUDE_NARROW_MARKER_INSTRUCTION_HEAD
+      || values[wrappedMarker - 1] !== CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL) return null
+    promptEnd = wrappedMarker + 1
+  } else return null
+
+  if (responseMarker <= promptEnd + 1) return null
   if (!lines.slice(responseMarker + 1).every(isClaudeTerminalChrome)) return null
-  const response = lines.slice(promptMarker + 1, responseMarker).join('\n').trim()
+  const response = lines.slice(promptEnd + 1, responseMarker).join('\n').trim()
   return response || null
 }
 
