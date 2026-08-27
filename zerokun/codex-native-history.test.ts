@@ -33,6 +33,7 @@ function fixture(
   fullThreadRead: 'fail' | 'omit-parent-list' | 'omit-parent-everywhere'
     | 'omit-solution-list' | 'omit-solution-everywhere'
     | 'duplicate-solution-read' | null = null,
+  identityMode: 'same' | 'logical-labels-with-uuid-threads' = 'same',
 ) {
   const repo = mkdtempSync(join(tmpdir(), 'zero-native-history-'))
   roots.push(repo)
@@ -40,10 +41,23 @@ function fixture(
   const inputDigest = 'a'.repeat(64)
   const parentThreadId = 'parent-thread'
   const parentTurnId = 'parent-turn'
-  const children = [
-    { id: 'solution-thread', perspective: 'solution' as const, role: 'solution_analyst' },
-    { id: 'risk-thread', perspective: 'risk' as const, role: 'risk_reviewer' },
-  ]
+  const children = identityMode === 'logical-labels-with-uuid-threads'
+    ? [
+      {
+        id: '01a04329-fa9b-7562-bbfe-1258a97e9071',
+        perspective: 'solution' as const,
+        role: 'solution_analyst',
+      },
+      {
+        id: '01a0432a-1683-7142-b2a0-22726fdfa8b7',
+        perspective: 'risk' as const,
+        role: 'risk_reviewer',
+      },
+    ]
+    : [
+      { id: 'solution-thread', perspective: 'solution' as const, role: 'solution_analyst' },
+      { id: 'risk-thread', perspective: 'risk' as const, role: 'risk_reviewer' },
+    ]
   const response = (perspective: 'solution' | 'risk') => (
     `${perspective} response\n${nativeAdvisorMarker(
       attemptNonce, 1, inputDigest, 'investigation', 1, perspective,
@@ -54,9 +68,11 @@ function fixture(
     inputDigest,
     phase: 'investigation',
     round: 1,
-    native: children.map(child => ({
+    native: children.map((child, index) => ({
       perspective: child.perspective,
-      agentId: child.id,
+      agentId: identityMode === 'logical-labels-with-uuid-threads'
+        ? ['investigation_solution', 'investigation_risk'][index]!
+        : child.id,
       responseDigest: nativeAdvisorResponseDigest(response(child.perspective)),
     })),
   }]
@@ -115,6 +131,7 @@ function fixture(
   ])
   let itemsListCalls = 0
   let fullThreadReadCalls = 0
+  const threadReadIds: string[] = []
   const delayedThreadId = delayedThread === 'parent' || delayedThread === 'parent-partial'
     ? parentThreadId
     : delayedThread?.startsWith('solution-') || delayedThread === 'solution'
@@ -152,6 +169,7 @@ function fixture(
   ): Promise<Record<string, unknown>> => {
     const threadId = String(params.threadId ?? '')
     if (method === 'thread/read') {
+      threadReadIds.push(threadId)
       const thread = metadata.get(threadId)
       if (!thread) throw new Error(`unknown thread ${threadId}`)
       if (params.includeTurns === true) {
@@ -224,6 +242,7 @@ function fixture(
   return {
     itemsListCalls: () => itemsListCalls,
     fullThreadReadCalls: () => fullThreadReadCalls,
+    threadReadIds: () => [...threadReadIds],
     options: {
       codexBin: '/unused',
       repoPath: repo,
@@ -402,6 +421,23 @@ describe('native advisor App Server history', () => {
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
     expect(value.itemsListCalls()).toBe(1)
     expect(value.fullThreadReadCalls()).toBe(6)
+  })
+
+  test('journalの論理agent名をRPC thread IDに使わず公式child UUIDへ解決する', async () => {
+    const value = fixture(
+      true,
+      null,
+      false,
+      null,
+      'logical-labels-with-uuid-threads',
+    )
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+    expect(value.itemsListCalls()).toBe(1)
+    expect(value.fullThreadReadCalls()).toBe(6)
+    expect(value.threadReadIds()).toContain('01a04329-fa9b-7562-bbfe-1258a97e9071')
+    expect(value.threadReadIds()).toContain('01a0432a-1683-7142-b2a0-22726fdfa8b7')
+    expect(value.threadReadIds()).not.toContain('investigation_solution')
+    expect(value.threadReadIds()).not.toContain('investigation_risk')
   })
 
   test('未対応fallbackはturns/listとthread/readの両方にcompleted fullを要求する', async () => {

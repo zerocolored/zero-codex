@@ -215,8 +215,8 @@ async function brokerFixture(): Promise<BrokerFixture> {
             inputDigest: selectedInput.digest,
             primaryEvidence: 'bounded primary evidence',
             nativeAdvisors: [
-              { perspective: 'solution', agentId: 'native-solution', response: responseFor('solution') },
-              { perspective: 'risk', agentId: 'native-risk', response: responseFor('risk') },
+              { perspective: 'solution', agentId: '/root/native-solution', response: responseFor('solution') },
+              { perspective: 'risk', agentId: '/root/native-risk', response: responseFor('risk') },
             ],
           },
         })

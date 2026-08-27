@@ -6,6 +6,7 @@ import {
   assertNativeAdvisorEvidence,
   nativeAdvisorMarker,
   nativeAdvisorResponseDigest,
+  resolveNativeAdvisorThreadIds,
   type NativeAdvisorPerspective,
   type NativeAdvisorRoundEvidence,
 } from './native-advisor-evidence.ts'
@@ -130,6 +131,63 @@ function fixture(): {
 }
 
 describe('native Codex advisor host evidence', () => {
+  test('論理agent名をrole・marker・digestで物理thread IDへ一意解決する', () => {
+    const { options, solutionId, riskId } = fixture()
+    options.rounds[0]!.native[0]!.agentId = 'investigation_solution'
+    options.rounds[0]!.native[1]!.agentId = 'investigation_risk'
+    const resolved = resolveNativeAdvisorThreadIds({
+      attemptNonce: options.attemptNonce,
+      parentThreadId: options.parentThreadId,
+      repoPath: options.repoPath,
+      rounds: options.rounds,
+      childResponses: options.childResponses,
+    })
+    expect(resolved[0]!.native.map(entry => entry.agentId)).toEqual([solutionId, riskId])
+  })
+
+  test('物理thread対応が不一致・曖昧・余剰ならfail-closeする', () => {
+    const unmatched = fixture()
+    unmatched.options.rounds[0]!.native[0]!.agentId = 'investigation_solution'
+    unmatched.options.rounds[0]!.native[0]!.responseDigest = '0'.repeat(64)
+    expect(() => resolveNativeAdvisorThreadIds({
+      attemptNonce: unmatched.options.attemptNonce,
+      parentThreadId: unmatched.options.parentThreadId,
+      repoPath: unmatched.options.repoPath,
+      rounds: unmatched.options.rounds,
+      childResponses: unmatched.options.childResponses,
+    })).toThrow('exactly one physical thread')
+
+    const ambiguous = fixture()
+    ambiguous.options.rounds[0]!.native[0]!.agentId = 'investigation_solution'
+    const duplicate = structuredClone(
+      ambiguous.options.childResponses.get(ambiguous.solutionId),
+    ) as { thread: { id: string } }
+    duplicate.thread.id = 'duplicate-solution-thread'
+    ambiguous.options.childResponses.set('duplicate-solution-thread', duplicate)
+    expect(() => resolveNativeAdvisorThreadIds({
+      attemptNonce: ambiguous.options.attemptNonce,
+      parentThreadId: ambiguous.options.parentThreadId,
+      repoPath: ambiguous.options.repoPath,
+      rounds: ambiguous.options.rounds,
+      childResponses: ambiguous.options.childResponses,
+    })).toThrow('exactly one physical thread')
+
+    const extra = fixture()
+    const unrelated = structuredClone(
+      extra.options.childResponses.get(extra.solutionId),
+    ) as { thread: { id: string; turns: Array<{ items: Array<{ text: string }> }> } }
+    unrelated.thread.id = 'unrelated-solution-thread'
+    unrelated.thread.turns[0]!.items[0]!.text = 'unrelated final response'
+    extra.options.childResponses.set('unrelated-solution-thread', unrelated)
+    expect(() => resolveNativeAdvisorThreadIds({
+      attemptNonce: extra.options.attemptNonce,
+      parentThreadId: extra.options.parentThreadId,
+      repoPath: extra.options.repoPath,
+      rounds: extra.options.rounds,
+      childResponses: extra.options.childResponses,
+    })).toThrow('unjournaled physical child thread')
+  })
+
   test('parent sourceは起動handshakeで観測した値と完全一致が必要', () => {
     const { options } = fixture()
     options.expectedParentSource = 'exec'

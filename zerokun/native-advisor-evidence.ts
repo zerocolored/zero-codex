@@ -29,6 +29,14 @@ const SUBAGENT_ACTIVITY_KINDS = new Set([
   'started', 'interacted', 'interrupted', 'completed',
 ])
 
+export function isNativeAdvisorAgentLabel(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 256
+    || !/^\/?[A-Za-z0-9._:-]+(?:\/[A-Za-z0-9._:-]+)*$/.test(value)) {
+    return false
+  }
+  return value.split('/').every(segment => segment !== '.' && segment !== '..')
+}
+
 export function nativeAdvisorMarker(
   attemptNonce: string,
   inputRevision: number,
@@ -47,6 +55,98 @@ export function nativeAdvisorMarker(
 
 export function nativeAdvisorResponseDigest(response: string): string {
   return createHash('sha256').update(response).digest('hex')
+}
+
+/**
+ * Resolve the model-visible collaboration agent labels recorded by the broker
+ * to the physical App Server child thread IDs that own the durable responses.
+ *
+ * Codex exposes a canonical task path (for example
+ * `/root/investigation_solution`) to the parent model, while its App Server history
+ * endpoints accept the separate UUID-like `agentThreadId`.  The label is
+ * therefore only a journal identity; it must never be sent to `thread/read`.
+ * Every new direct child is instead matched exactly once by its official role,
+ * round marker, and response digest.  Extra, missing, or ambiguous children
+ * fail closed.
+ */
+export function resolveNativeAdvisorThreadIds(options: {
+  attemptNonce: string
+  parentThreadId: string
+  repoPath: string
+  rounds: NativeAdvisorRoundEvidence[]
+  childResponses: Map<string, unknown>
+}): NativeAdvisorRoundEvidence[] {
+  const repo = realpathSync(options.repoPath)
+  const candidates: Array<{
+    threadId: string
+    perspective: NativeAdvisorPerspective
+    finalResponse: string
+  }> = []
+  for (const [threadId, response] of options.childResponses) {
+    if (!THREAD_ID.test(threadId)) {
+      throw new Error('native advisor physical thread identity is invalid')
+    }
+    const child = threadFromResponse(response, `native advisor physical thread ${threadId}`)
+    const role = childRole(child)
+    const perspective = role === 'solution_analyst'
+      ? 'solution'
+      : role === 'risk_reviewer'
+        ? 'risk'
+        : null
+    if (child.id !== threadId || child.parentThreadId !== options.parentThreadId
+      || childSourceParent(child) !== options.parentThreadId
+      || perspective === null
+      || physicalCwd(child.cwd, `native advisor physical thread ${threadId}`) !== repo) {
+      throw new Error(`native advisor physical thread ${threadId} identity or role is invalid`)
+    }
+    candidates.push({
+      threadId,
+      perspective,
+      finalResponse: completedFinalResponse(
+        child,
+        `native advisor physical thread ${threadId}`,
+      ),
+    })
+  }
+
+  const logicalAgentIds = new Set<string>()
+  const matchedThreadIds = new Set<string>()
+  const resolved = options.rounds.map(evidence => ({
+    ...evidence,
+    native: evidence.native.map(entry => {
+      if (!isNativeAdvisorAgentLabel(entry.agentId) || logicalAgentIds.has(entry.agentId)
+        || !/^[0-9a-f]{64}$/.test(entry.responseDigest)) {
+        throw new Error('native advisor journal identities are not fresh and unique')
+      }
+      logicalAgentIds.add(entry.agentId)
+      const marker = nativeAdvisorMarker(
+        options.attemptNonce,
+        evidence.inputRevision,
+        evidence.inputDigest,
+        evidence.phase,
+        evidence.round,
+        entry.perspective,
+      )
+      const matches = candidates.filter(candidate => (
+        !matchedThreadIds.has(candidate.threadId)
+        && candidate.perspective === entry.perspective
+        && candidate.finalResponse.endsWith(marker)
+        && nativeAdvisorResponseDigest(candidate.finalResponse) === entry.responseDigest
+      ))
+      if (matches.length !== 1) {
+        throw new Error(
+          `native advisor ${entry.agentId} did not resolve to exactly one physical thread`,
+        )
+      }
+      const threadId = matches[0]!.threadId
+      matchedThreadIds.add(threadId)
+      return { ...entry, agentId: threadId }
+    }),
+  }))
+  if (matchedThreadIds.size !== candidates.length) {
+    throw new Error('native advisor history contains an unjournaled physical child thread')
+  }
+  return resolved
 }
 
 function record(value: unknown, label: string): Record<string, unknown> {

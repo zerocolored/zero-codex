@@ -73,6 +73,8 @@ import {
 } from './advisor-snapshot.ts'
 import {
   assertNativeAdvisorEvidence,
+  isNativeAdvisorAgentLabel,
+  resolveNativeAdvisorThreadIds,
   type NativeAdvisorJournalEntry,
   type NativeAdvisorRoundEvidence,
 } from './native-advisor-evidence.ts'
@@ -1211,8 +1213,7 @@ function parseNativeAdvisorJournalEntries(
     }
     const reviewer = entry as Record<string, unknown>
     if (!['solution', 'risk'].includes(String(reviewer.perspective))
-      || typeof reviewer.agentId !== 'string'
-      || !/^[A-Za-z0-9._:-]{1,128}$/.test(reviewer.agentId)
+      || !isNativeAdvisorAgentLabel(reviewer.agentId)
       || !validSha256(reviewer.responseDigest)) {
       throw new Error('advisor journal contains an incomplete native Codex advisor')
     }
@@ -2256,9 +2257,6 @@ export async function assertNativeAdvisorHistory(options: {
     fallbackViewDigests: Map<string, NonNullable<ThreadEvidenceRead['fallbackViewDigests']>>
     fallbackViewsAgree: boolean
   }
-  const claimedIds = [...new Set(
-    options.rounds.flatMap(round => round.native.map(entry => entry.agentId)),
-  )]
   const collectSnapshot = async (): Promise<HistorySnapshot> => {
     const parentEvidence = await readThreadEvidence(options.parentThreadId, {
       turnIds: options.parentTurnIds,
@@ -2278,21 +2276,27 @@ export async function assertNativeAdvisorHistory(options: {
     if (parentEvidence.fallbackViewDigests) {
       fallbackViewDigests.set(options.parentThreadId, parentEvidence.fallbackViewDigests)
     }
-    for (const agentId of claimedIds) {
-      const childEvidence = await readThreadEvidence(agentId, {
+    const baseline = new Set(options.parentChildBaseline)
+    for (const child of children) {
+      const childThreadId = String(child.id)
+      if (baseline.has(childThreadId)) continue
+      const childEvidence = await readThreadEvidence(childThreadId, {
         requireOneTurn: true,
       })
-      childResponses.set(agentId, childEvidence.response)
+      childResponses.set(childThreadId, childEvidence.response)
       if (childEvidence.fallbackViewDigests) {
-        fallbackViewDigests.set(agentId, childEvidence.fallbackViewDigests)
+        fallbackViewDigests.set(childThreadId, childEvidence.fallbackViewDigests)
       }
       if (childEvidence.fallbackViewsAgree === false) fallbackViewsAgree = false
       const descendants = await readDirectChildThreads(
         read,
-        agentId,
-        `native advisor ${agentId} descendant listing`,
+        childThreadId,
+        `native advisor ${childThreadId} descendant listing`,
       )
-      childChildrenListResponses.set(agentId, { data: descendants, nextCursor: null })
+      childChildrenListResponses.set(
+        childThreadId,
+        { data: descendants, nextCursor: null },
+      )
     }
     return {
       parentResponse: parentEvidence.response,
@@ -2307,12 +2311,19 @@ export async function assertNativeAdvisorHistory(options: {
     if (!snapshot.fallbackViewsAgree) {
       throw new Error('native advisor fallback endpoints disagree on selected evidence')
     }
+    const resolvedRounds = resolveNativeAdvisorThreadIds({
+      attemptNonce: options.attemptNonce,
+      parentThreadId: options.parentThreadId,
+      repoPath: options.repoPath,
+      rounds: options.rounds,
+      childResponses: snapshot.childResponses,
+    })
     assertNativeAdvisorEvidence({
       attemptNonce: options.attemptNonce,
       parentThreadId: options.parentThreadId,
       expectedParentSource: options.parentSource,
       repoPath: options.repoPath,
-      rounds: options.rounds,
+      rounds: resolvedRounds,
       parentResponse: snapshot.parentResponse,
       childrenListResponse: snapshot.childrenListResponse,
       parentChildBaseline: options.parentChildBaseline,

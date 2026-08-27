@@ -61,6 +61,7 @@ import {
 import { resolveFifthAdvisorHelper } from './install-fifth-advisor.ts'
 import { resolveCodexExecutableDetails } from './standalone-codex.ts'
 import {
+  isNativeAdvisorAgentLabel,
   nativeAdvisorMarker,
   nativeAdvisorResponseDigest,
 } from './native-advisor-evidence.ts'
@@ -1204,7 +1205,7 @@ async function main(): Promise<void> {
     primaryEvidence: z.string().min(1).max(MAX_INPUT_CHARS),
     nativeAdvisors: z.array(z.object({
       perspective: z.enum(['solution', 'risk']),
-      agentId: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/),
+      agentId: z.string().refine(isNativeAdvisorAgentLabel),
       response: z.string().min(1).max(MAX_INPUT_CHARS),
     })).length(2),
   }
