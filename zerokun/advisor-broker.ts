@@ -99,7 +99,7 @@ function isClaudeTerminalChrome(line: string): boolean {
     || value === '❯'
     || /^─+$/.test(value)
     || /^[✻✳✽✶✢] [A-Za-z][A-Za-z -]{0,48} for (?:(?:[1-9][0-9]*h )?(?:[1-9][0-9]*m )?)?[1-9][0-9]*s$/u.test(value)
-    || /^⏵⏵ bypass permissions on(?: · .+)?$/.test(value)
+    || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · .+)?$/.test(value)
 }
 
 export function extractCompleteClaudeResponse(transcript: string, marker: string): string | null {

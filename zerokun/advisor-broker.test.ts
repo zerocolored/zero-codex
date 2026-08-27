@@ -593,6 +593,55 @@ print('review complete')
     }
   })
 
+  test('Claude 2.1.246以降の固定bypass footerだけを既知chromeとして採択する', () => {
+    const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
+    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
+    const response = '独立したレビュー結果です。'
+    const envelope = (...footer: string[]) => [
+      '依頼本文',
+      instruction,
+      marker,
+      response,
+      marker,
+      '❯',
+      ...footer,
+    ].join('\n')
+
+    for (const footer of [
+      '⏵⏵ bypass permissions on',
+      '⏵⏵ bypass permissions on · /rc',
+      '⏵⏵ bypass permissions on (shift+tab to cycle)',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
+      `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents${' '.repeat(96)}/rc`,
+    ]) {
+      expect(extractCompleteClaudeResponse(envelope(footer), marker)).toBe(response)
+    }
+
+    for (const footer of [
+      '⏵⏵ bypass permissions on (shift+tab to toggle) · /rc',
+      '⏵⏵ bypass permissions on (shift＋tab to cycle) · /rc',
+      '⏵⏵ bypass permissions on (shift+tab to cycle · /rc',
+      '⏵⏵ bypass permissions on [shift+tab to cycle] · /rc',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) /rc',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) extra',
+      '⏵⏵ bypass permissions off (shift+tab to cycle) · /rc',
+      'Allow this action',
+      'Do you want to proceed',
+      '/rc',
+    ]) {
+      expect(extractCompleteClaudeResponse(envelope(footer), marker)).toBeNull()
+    }
+
+    expect(extractCompleteClaudeResponse(envelope(
+      '⏵⏵ bypass permissions on (shift+tab to cycle) ·',
+      '/rc',
+    ), marker)).toBeNull()
+    expect(extractCompleteClaudeResponse(envelope(
+      'marker後にも回答を続けます。',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
+    ), marker)).toBeNull()
+  })
+
   test('同一roundのexclusive claimは重複作成できずidentity一致時だけ解放する', () => {
     const dir = fixtureDir()
     const path = join(dir, 'active.lock')
