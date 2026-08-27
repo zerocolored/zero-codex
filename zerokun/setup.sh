@@ -305,16 +305,19 @@ if [ "$LEGACY_CUTOVER_INITIAL" = "1" ]; then
   done < <(pgrep -f 'claude.*dangerously-load-development-channels.*server:slack-channel' 2>/dev/null || true)
 fi
 
-legacy_running_count() {
+legacy_running_state() {
   local db="$CH/jobs.sqlite3"
-  [ -f "$db" ] || { printf '0\n'; return; }
+  [ -f "$db" ] || return 0
   ZEROKUN_CUTOVER_DB="$db" bun --config=/dev/null --no-env-file -e '
     import { Database } from "bun:sqlite";
     const db = new Database(process.env.ZEROKUN_CUTOVER_DB!, { readonly: true });
+    let count = -1;
     try {
       const row = db.query("SELECT COUNT(*) AS count FROM jobs WHERE status = ?").get("running") as { count: number };
-      console.log(row.count);
+      count = row.count;
     } finally { db.close(); }
+    if (!Number.isSafeInteger(count) || count < 0) process.exit(70);
+    process.exit(count > 0 ? 10 : 0);
   '
 }
 
@@ -338,7 +341,16 @@ if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$
       || { echo "❌ job runner lock identityの移行に失敗しました。" >&2; exit 1; }
   fi
   drain_deadline=$(( $(date +%s) + SETUP_DRAIN_SECONDS ))
-  while [ "$(legacy_running_count)" -gt 0 ]; do
+  while :; do
+    if legacy_running_state; then
+      break
+    else
+      running_state=$?
+      [ "$running_state" -eq 10 ] || {
+        echo "❌ 実行中job件数を安全に確認できません。旧runnerは停止していません。" >&2
+        exit 1
+      }
+    fi
     [ "$(date +%s)" -lt "$drain_deadline" ] || {
       echo "❌ 実行中jobのdrain待ちがtimeoutしました。旧runnerは停止していません。" >&2
       exit 1
