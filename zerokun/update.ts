@@ -1203,8 +1203,11 @@ async function waitForRunningJobs(
     }
     if (!runnerAlive) {
       output(`   queue: 停止したrunnerの実行中job ${counts.running}件を安全に回収します`)
+      const runtime = readPinnedHerdrRuntime(stateDir)
+      const pinnedHerdrEnvironment = environmentForPinnedHerdrRuntime(runtime)
+      await verifyHerdrRuntimeIdentityAsync(runtime, pinnedHerdrEnvironment)
       requireCommand([process.execPath, jobRunnerFile, 'recover-interrupted'], {
-        env: { ...process.env, ZEROKUN_STATE_DIR: stateDir },
+        env: { ...pinnedHerdrEnvironment, ZEROKUN_STATE_DIR: stateDir },
       })
       continue
     }

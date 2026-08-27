@@ -135,10 +135,23 @@ function makeRepo(base: string) {
   ].join('\n')
   writeFileSync(join(seed, 'zerokun', 'fixture-lock.ts'), lockSource)
   writeFileSync(join(seed, 'zerokun', 'job-runner.ts'), [
+    "import { Database } from 'bun:sqlite'",
     "import { writeFileSync } from 'fs'",
     "import { join } from 'path'",
     "import { acquire } from './fixture-lock.ts'",
     'const state = process.env.ZEROKUN_STATE_DIR!',
+    "if (process.argv[2] === 'recover-interrupted') {",
+    "  writeFileSync(join(state, 'recovery-herdr.json'), JSON.stringify({",
+    "    paneId: process.env.HERDR_PANE_ID,",
+    "    tabId: process.env.HERDR_TAB_ID,",
+    "    terminalId: process.env.HERDR_TERMINAL_ID,",
+    "    workspaceId: process.env.HERDR_WORKSPACE_ID,",
+    "  }))",
+    "  const database = new Database(join(state, 'jobs.sqlite3'))",
+    "  database.query(\"UPDATE jobs SET status = 'failed' WHERE status = 'running'\").run()",
+    '  database.close()',
+    '  process.exit(0)',
+    '}',
     "acquire(join(state, 'job-runner.lock', 'pid'))",
     "writeFileSync(join(state, 'job-runner.lock', 'runtime'), 'zerokun-codex-runner-v1\\n')",
     "process.on('SIGTERM', () => process.exit(0))",
@@ -936,6 +949,42 @@ describe('updater helpers', () => {
     expect(activeJobCounts(JSON.stringify([
       { status: 'running' },
     ]))).toEqual({ running: 1, queued: 0 })
+  })
+
+  test('別paneからの停止job回収は保存済みHerdr runtimeを使う', () => {
+    const fixture = updaterFixture()
+    const serviceEnvironment = serviceUpdaterEnvironment(fixture, `zerokun-update-${Date.now()}`)
+    const database = new Database(join(fixture.state, 'jobs.sqlite3'), { create: true })
+    try {
+      database.exec('CREATE TABLE jobs (status TEXT NOT NULL, runtime TEXT NOT NULL)')
+      database.query("INSERT INTO jobs (status, runtime) VALUES ('running', 'codex')").run()
+    } finally {
+      database.close()
+    }
+
+    const result = runUpdater(fixture, ['--skip-tests', '--no-restart'], {
+      ...serviceEnvironment,
+      HERDR_PANE_ID: 'wCaller:p9',
+      HERDR_TAB_ID: 'wCaller:t9',
+      HERDR_TERMINAL_ID: 'term_deadbeef',
+      HERDR_WORKSPACE_ID: 'wCaller',
+    })
+
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(JSON.parse(readFileSync(join(fixture.state, 'recovery-herdr.json'), 'utf8')))
+      .toEqual({
+        paneId: 'wT:p1',
+        tabId: 'wT:t1',
+        terminalId: 'term_abcdef012345',
+        workspaceId: 'wT',
+      })
+    const recovered = new Database(join(fixture.state, 'jobs.sqlite3'), { readonly: true })
+    try {
+      expect(recovered.query<{ status: string }, []>('SELECT status FROM jobs').get()?.status)
+        .toBe('failed')
+    } finally {
+      recovered.close()
+    }
   })
 
   test('100件を超える履歴の末尾にあるactive jobもDB集計で見落とさない', () => {
