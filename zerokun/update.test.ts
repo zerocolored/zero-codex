@@ -103,6 +103,14 @@ function installedNativeCodex(): string {
   return resolveOfficialStandaloneCodex().physical
 }
 
+function candidateGitDiffFunction(): string {
+  const source = readFileSync(join(import.meta.dir, 'verify.sh'), 'utf8')
+  const start = source.indexOf('candidate_git_diff_check() {')
+  const end = source.indexOf('\n}\n\nROOT=', start)
+  if (start < 0 || end < 0) throw new Error('candidate Git diff function is missing')
+  return source.slice(start, end + 2)
+}
+
 function makeRepo(base: string) {
   const bare = join(base, 'remote.git')
   const seed = join(base, 'seed')
@@ -600,6 +608,41 @@ describe('updater helpers', () => {
     expect(candidate).toContain('const stagedCodexBin = stagedCodex.executable')
     expect(candidate).toContain('permissionOverrides = await requireEffectiveCodexPermissionPreflight(\n      stagedCodexBin,')
     expect(candidate).toContain('await requireCommandAsync([\n    stagedCodexBin,')
+  })
+
+  test('candidate sandboxのwhitespace checkはselected Gitをpagerなしで固定する', () => {
+    const source = readFileSync(join(import.meta.dir, 'verify.sh'), 'utf8')
+    const candidateCheck = candidateGitDiffFunction()
+    for (const contract of [
+      '/usr/bin/xcode-select -p',
+      '/usr/bin/env -i',
+      'GIT_CONFIG_NOSYSTEM=1',
+      'GIT_CONFIG_GLOBAL=/dev/null',
+      'XDG_CONFIG_HOME=/var/empty',
+      'GIT_ATTR_NOSYSTEM=1',
+      'GIT_TERMINAL_PROMPT=0',
+      'GIT_ASKPASS=/usr/bin/false',
+      'SSH_ASKPASS=/usr/bin/false',
+      'GIT_PAGER=cat',
+      'GIT_OPTIONAL_LOCKS=0',
+      'TERM=dumb',
+      '"$candidate_git" --no-pager -c core.fsmonitor=false',
+      'diff --cached --check --no-ext-diff --no-textconv --no-color HEAD --',
+      'diff --check --no-ext-diff --no-textconv --no-color --',
+      '"$@" </dev/null',
+    ]) {
+      expect(candidateCheck).toContain(contract)
+    }
+    expect(candidateCheck.match(/"\$owner" != "0" && "\$owner" != "\$EUID"/g))
+      .toHaveLength(2)
+    expect(candidateCheck).not.toContain('/usr/bin/xcrun')
+    expect(source).toContain([
+      'if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then',
+      '  candidate_git_diff_check',
+      'else',
+      '  git diff --check',
+      'fi',
+    ].join('\n'))
   })
 
   test('rollback用SQLite snapshotをsidecarごと原子的に復元する', () => {
@@ -1534,6 +1577,85 @@ describe('Codex branch self update', () => {
     const result = runUpdater(fixture, ['--no-restart'])
     expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0)
   }, 15_000)
+
+  test.skipIf(process.platform !== 'darwin')('candidate sandboxのselected Git検証はclean checkoutを通す', () => {
+    const fixture = updaterFixture()
+    const verifyDir = join(fixture.repo.seed, 'zerokun')
+    mkdirSync(verifyDir, { recursive: true })
+    writeFileSync(join(verifyDir, 'verify.sh'), [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      candidateGitDiffFunction(),
+      'candidate_git_diff_check',
+      '',
+    ].join('\n'))
+    must(['git', 'add', '.'], fixture.repo.seed)
+    must(['git', 'commit', '-m', 'candidate selected Git clean verification'], fixture.repo.seed)
+    must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+
+    const result = runUpdater(fixture, ['--no-restart'])
+    const output = `${result.stderr}\n${result.stdout}`
+    expect(result.exitCode, output).toBe(0)
+    expect(output).not.toContain('xcrun')
+    expect(output).not.toContain('Press RETURN')
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v2\n')
+  }, 30_000)
+
+  test.skipIf(process.platform !== 'darwin')('candidate sandboxのselected Git検証はunstaged末尾空白を更新前に拒否する', () => {
+    const fixture = updaterFixture()
+    const verifyDir = join(fixture.repo.seed, 'zerokun')
+    mkdirSync(verifyDir, { recursive: true })
+    writeFileSync(join(verifyDir, 'verify.sh'), [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      candidateGitDiffFunction(),
+      "printf 'dirty \\n' >> version.txt",
+      'candidate_git_diff_check',
+      '',
+    ].join('\n'))
+    must(['git', 'add', '.'], fixture.repo.seed)
+    must(['git', 'commit', '-m', 'candidate selected Git dirty verification'], fixture.repo.seed)
+    must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+
+    const result = runUpdater(fixture, ['--no-restart'])
+    const output = `${result.stderr}\n${result.stdout}`
+    expect(result.exitCode, output).not.toBe(0)
+    expect(output).toContain('trailing whitespace')
+    expect(output).not.toContain('Press RETURN')
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
+    expect(existsSync(fixture.setupMarker)).toBe(false)
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
+  }, 30_000)
+
+  test.skipIf(process.platform !== 'darwin')('candidate sandboxのselected Git検証はstaged-only末尾空白も更新前に拒否する', () => {
+    const fixture = updaterFixture()
+    const verifyDir = join(fixture.repo.seed, 'zerokun')
+    mkdirSync(verifyDir, { recursive: true })
+    writeFileSync(join(verifyDir, 'verify.sh'), [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      candidateGitDiffFunction(),
+      "printf 'staged-dirty \\n' >> version.txt",
+      'developer_dir="$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LANG=C LC_ALL=C /usr/bin/xcode-select -p </dev/null)"',
+      '/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty TMPDIR=/var/empty LANG=C LC_ALL=C TERM=dumb GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false GIT_PAGER=cat GIT_OPTIONAL_LOCKS=0 "$developer_dir/usr/bin/git" --no-pager -c core.fsmonitor=false add -- version.txt </dev/null',
+      '/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty TMPDIR=/var/empty LANG=C LC_ALL=C TERM=dumb GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false GIT_PAGER=cat GIT_OPTIONAL_LOCKS=0 "$developer_dir/usr/bin/git" --no-pager -c core.fsmonitor=false diff --quiet --no-ext-diff -- version.txt </dev/null',
+      'if /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty TMPDIR=/var/empty LANG=C LC_ALL=C TERM=dumb GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false GIT_PAGER=cat GIT_OPTIONAL_LOCKS=0 "$developer_dir/usr/bin/git" --no-pager -c core.fsmonitor=false diff --cached --quiet --no-ext-diff HEAD -- version.txt </dev/null; then echo "error: staged-only fixture is not staged" >&2; exit 43; fi',
+      'candidate_git_diff_check',
+      '',
+    ].join('\n'))
+    must(['git', 'add', '.'], fixture.repo.seed)
+    must(['git', 'commit', '-m', 'candidate selected Git staged verification'], fixture.repo.seed)
+    must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+
+    const result = runUpdater(fixture, ['--no-restart'])
+    const output = `${result.stderr}\n${result.stdout}`
+    expect(result.exitCode, output).not.toBe(0)
+    expect(output).toContain('trailing whitespace')
+    expect(output).not.toContain('Press RETURN')
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
+    expect(existsSync(fixture.setupMarker)).toBe(false)
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
+  }, 30_000)
 
   test('候補verifyがhangしてもdeadlineで停止しlive HEADを変更しない', () => {
     const fixture = updaterFixture()

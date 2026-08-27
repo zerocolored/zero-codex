@@ -13,6 +13,128 @@ elif [[ $# -ne 0 ]]; then
   exit 2
 fi
 
+candidate_git_diff_check() {
+  local developer_dir physical_developer_dir selected_app candidate_git
+  local metadata owner mode checked_path
+
+  developer_dir="$(
+    /usr/bin/env -i \
+      PATH=/usr/bin:/bin \
+      HOME=/var/empty \
+      LANG=C \
+      LC_ALL=C \
+      /usr/bin/xcode-select -p </dev/null
+  )" || {
+    echo 'error: candidate検証用の開発者directoryを解決できません' >&2
+    return 1
+  }
+  developer_dir="${developer_dir%/}"
+  if [[ -z "$developer_dir" || "$developer_dir" == "/" \
+    || "$developer_dir" != /* || ${#developer_dir} -gt 1024 \
+    || "$developer_dir" == *$'\n'* || "$developer_dir" =~ [[:cntrl:]] ]]; then
+    echo 'error: candidate検証用の開発者directoryが不正です' >&2
+    return 1
+  fi
+  physical_developer_dir="$(
+    cd -P -- "$developer_dir" 2>/dev/null && pwd -P
+  )" || {
+    echo 'error: candidate検証用の開発者directoryを検証できません' >&2
+    return 1
+  }
+  if [[ "$physical_developer_dir" != "$developer_dir" ]]; then
+    echo 'error: candidate検証用の開発者directoryが物理pathではありません' >&2
+    return 1
+  fi
+  case "$physical_developer_dir" in
+    /Library/Developer/CommandLineTools) ;;
+    /Applications/*/Contents/Developer)
+      selected_app="${physical_developer_dir#/Applications/}"
+      selected_app="${selected_app%/Contents/Developer}"
+      if [[ "$selected_app" == */* || "$selected_app" != Xcode*.app ]]; then
+        echo 'error: candidate検証用の開発者directoryが許可範囲外です' >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo 'error: candidate検証用の開発者directoryが許可範囲外です' >&2
+      return 1
+      ;;
+  esac
+
+  for checked_path in \
+    "$physical_developer_dir" \
+    "$physical_developer_dir/usr" \
+    "$physical_developer_dir/usr/bin"
+  do
+    metadata="$(/usr/bin/stat -f '%u:%Lp' "$checked_path" 2>/dev/null)" || {
+      echo 'error: candidate検証用Gitのdirectoryを検証できません' >&2
+      return 1
+    }
+    if [[ ! "$metadata" =~ ^([0-9]+):([0-7]{3,4})$ ]]; then
+      echo 'error: candidate検証用Gitのdirectory metadataが不正です' >&2
+      return 1
+    fi
+    owner="${BASH_REMATCH[1]}"
+    mode="${BASH_REMATCH[2]}"
+    if [[ "$owner" != "0" && "$owner" != "$EUID" ]]; then
+      echo 'error: candidate検証用Gitのdirectory ownerが不正です' >&2
+      return 1
+    fi
+    if (( (8#$mode & 0002) != 0 )); then
+      echo 'error: candidate検証用Gitのdirectoryがworld-writableです' >&2
+      return 1
+    fi
+  done
+
+  candidate_git="$physical_developer_dir/usr/bin/git"
+  if [[ ! -f "$candidate_git" || -L "$candidate_git" || ! -x "$candidate_git" ]]; then
+    echo 'error: candidate検証用Gitが安全な実行fileではありません' >&2
+    return 1
+  fi
+  metadata="$(/usr/bin/stat -f '%u:%l:%Lp' "$candidate_git" 2>/dev/null)" || {
+    echo 'error: candidate検証用Gitを検証できません' >&2
+    return 1
+  }
+  if [[ ! "$metadata" =~ ^([0-9]+):1:([0-7]{3,4})$ ]]; then
+    echo 'error: candidate検証用Gitのmetadataが不正です' >&2
+    return 1
+  fi
+  owner="${BASH_REMATCH[1]}"
+  mode="${BASH_REMATCH[2]}"
+  if [[ "$owner" != "0" && "$owner" != "$EUID" ]]; then
+    echo 'error: candidate検証用Gitのownerが不正です' >&2
+    return 1
+  fi
+  if (( (8#$mode & 0022) != 0 )); then
+    echo 'error: candidate検証用Gitがgroup/world-writableです' >&2
+    return 1
+  fi
+
+  candidate_selected_git() {
+    /usr/bin/env -i \
+      PATH=/usr/bin:/bin \
+      HOME=/var/empty \
+      TMPDIR=/var/empty \
+      XDG_CONFIG_HOME=/var/empty \
+      LANG=C \
+      LC_ALL=C \
+      TERM=dumb \
+      GIT_CONFIG_NOSYSTEM=1 \
+      GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_ATTR_NOSYSTEM=1 \
+      GIT_TERMINAL_PROMPT=0 \
+      GIT_ASKPASS=/usr/bin/false \
+      SSH_ASKPASS=/usr/bin/false \
+      GIT_PAGER=cat \
+      GIT_OPTIONAL_LOCKS=0 \
+      "$candidate_git" --no-pager -c core.fsmonitor=false "$@" </dev/null
+  }
+  candidate_selected_git \
+    diff --cached --check --no-ext-diff --no-textconv --no-color HEAD -- || return 1
+  candidate_selected_git \
+    diff --check --no-ext-diff --no-textconv --no-color --
+}
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zerokun-verify.XXXXXX")"
 cleanup_verify() { rm -rf "$BUILD_DIR"; }
@@ -93,6 +215,8 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
   candidate_contract_test zerokun/update.test.ts \
     'candidate sandboxはpreflightと同じrandom named permissionをdefaultにする'
   candidate_contract_test zerokun/update.test.ts \
+    'candidate sandboxのwhitespace checkはselected Gitをpagerなしで固定する'
+  candidate_contract_test zerokun/update.test.ts \
     'rollback用SQLite snapshotをsidecarごと原子的に復元する'
   candidate_contract_test zerokun/update.test.ts \
     'rollbackはGitを戻してからSQLiteを復元し旧setupを実行する'
@@ -141,4 +265,8 @@ bash -n \
   zerokun/bootstrap-macos.sh \
   zerokun/watchdog.sh \
   zerokun/state-dir.sh
-git diff --check
+if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
+  candidate_git_diff_check
+else
+  git diff --check
+fi
