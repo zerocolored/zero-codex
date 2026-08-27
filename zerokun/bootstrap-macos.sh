@@ -1312,22 +1312,23 @@ ensure_project_workspace() {
   [ -f "$agents_template" ] && [ ! -L "$agents_template" ] \
     || fail "既定AGENTS.md templateがありません: $agents_template"
   if [ ! -e "$agents_path" ] && [ ! -L "$agents_path" ]; then
-    if safe_git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
-      fail "既存projectにAGENTS.mdがありません。project固有の指示を追加してから再実行してください: $agents_path"
+    if ! safe_git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+      entries="$(/bin/ls -A "$PROJECT_DIR" | /usr/bin/grep -v '^\.git$' || true)"
+      [ -z "$entries" ] \
+        || fail "未初期化projectに既存fileがあります。内容を確認してAGENTS.mdを用意してください: $PROJECT_DIR"
+      /bin/cp "$agents_template" "$agents_path"
+      /bin/chmod 0644 "$agents_path"
+      safe_git -C "$PROJECT_DIR" add -- AGENTS.md
+      safe_git -C "$PROJECT_DIR" \
+        -c user.name='Zeroちゃん Bootstrap' \
+        -c user.email='zerochan-bootstrap@users.noreply.github.com' \
+        commit -m 'chore: initialize Zeroちゃん workspace instructions' >/dev/null
     fi
-    entries="$(/bin/ls -A "$PROJECT_DIR" | /usr/bin/grep -v '^\.git$' || true)"
-    [ -z "$entries" ] \
-      || fail "未初期化projectに既存fileがあります。内容を確認してAGENTS.mdを用意してください: $PROJECT_DIR"
-    /bin/cp "$agents_template" "$agents_path"
-    /bin/chmod 0644 "$agents_path"
-    safe_git -C "$PROJECT_DIR" add -- AGENTS.md
-    safe_git -C "$PROJECT_DIR" \
-      -c user.name='Zeroちゃん Bootstrap' \
-      -c user.email='zerochan-bootstrap@users.noreply.github.com' \
-      commit -m 'chore: initialize Zeroちゃん workspace instructions' >/dev/null
   fi
-  bootstrap_owned_regular_file "$agents_path" \
-    || fail "AGENTS.mdはowner一致・hardlinkなしのregular fileにしてください: $agents_path"
+  if [ -e "$agents_path" ] || [ -L "$agents_path" ]; then
+    bootstrap_owned_regular_file "$agents_path" \
+      || fail "AGENTS.mdはowner一致・hardlinkなしのregular fileにしてください: $agents_path"
+  fi
   ok "Slack作業repository: $PROJECT_DIR"
 }
 

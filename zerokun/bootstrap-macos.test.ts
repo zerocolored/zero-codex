@@ -229,7 +229,7 @@ describe('macOS bootstrap', () => {
     }
   })
 
-  test('既存commit済みprojectにAGENTS.mdがなければ黙って変更せず停止する', () => {
+  test('既存commit済みprojectはAGENTS.mdがなくても変更せず採用する', () => {
     if (process.platform !== 'darwin') return
     const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-existing-project-'))
     const project = join(dir, 'workspace')
@@ -255,8 +255,7 @@ describe('macOS bootstrap', () => {
       const result = Bun.spawnSync([
         '/bin/bash', '-c', command, 'bash', bootstrap, root, project,
       ], { stdout: 'pipe', stderr: 'pipe' })
-      expect(result.exitCode).not.toBe(0)
-      expect(result.stderr.toString()).toContain('既存projectにAGENTS.mdがありません')
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
       expect(existsSync(join(project, 'AGENTS.md'))).toBe(false)
       expect(Bun.spawnSync(['git', '-C', project, 'rev-parse', 'HEAD']).stdout.toString()).toBe(before)
       expect(Bun.spawnSync(['git', '-C', project, 'status', '--porcelain']).stdout.toString()).toBe('')

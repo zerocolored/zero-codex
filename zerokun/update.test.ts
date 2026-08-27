@@ -33,6 +33,7 @@ import {
   processStateIsAlive,
   resolveSetupTimeoutMs,
   resolveUpdaterCodexBinary,
+  selectUpdateProjectDirectory,
   setupTimeoutBudgetMs,
   stageVerifiedCandidateCodex,
   validateResolvedCandidatePermissionOverrides,
@@ -150,7 +151,7 @@ function makeRepo(base: string) {
     "import { acquire } from './zerokun/fixture-lock.ts'",
     'const state = process.env.ZEROKUN_STATE_DIR!',
     "acquire(join(state, 'plugin.lock'))",
-    "writeFileSync(join(state, 'gateway-ready.json'), JSON.stringify({ runtime: 'codex', pid: process.pid, release: process.env.ZEROKUN_RELEASE_COMMIT, connectedAt: Date.now() }))",
+    "writeFileSync(join(state, 'gateway-ready.json'), JSON.stringify({ runtime: 'codex', pid: process.pid, release: process.env.ZEROKUN_RELEASE_COMMIT, connectedAt: Date.now(), projectDir: process.env.ZEROKUN_PROJECT_DIR }))",
     "process.on('SIGTERM', () => process.exit(0))",
     'await Bun.sleep(60_000)',
     '',
@@ -183,6 +184,7 @@ function updaterFixture() {
   const project = join(base, 'project')
   const setup = join(base, 'setup.sh')
   const setupMarker = join(base, 'setup-ran')
+  const setupProjectMarker = join(base, 'setup-project')
   mkdirSync(state, { mode: 0o700 })
   chmodSync(state, 0o700)
   mkdirSync(project)
@@ -190,10 +192,11 @@ function updaterFixture() {
     '#!/bin/bash',
     '[ -z "${ZEROKUN_CODEX_BIN+x}" ] || { echo "updater-only Codex override leaked" >&2; exit 79; }',
     `touch ${JSON.stringify(setupMarker)}`,
+    `printf '%s' "$ZEROKUN_PROJECT_DIR" > ${JSON.stringify(setupProjectMarker)}`,
     '',
   ].join('\n'))
   chmodSync(setup, 0o700)
-  return { base, repo, state, project, setup, setupMarker }
+  return { base, repo, state, project, setup, setupMarker, setupProjectMarker }
 }
 
 function updaterEnvironment(fixture: ReturnType<typeof updaterFixture>) {
@@ -948,6 +951,22 @@ describe('updater helpers', () => {
     expect(activeJobCountsFromDatabase(dbPath)).toEqual({ queued: 1, running: 1 })
   })
 
+  test('更新時の作業directoryはpending journal、稼働gateway、明示値の順で保持する', () => {
+    const base = fixtureDir()
+    const pending = join(base, 'pending-project')
+    const explicit = join(base, 'explicit-project')
+    const running = join(base, 'running-project')
+    mkdirSync(pending)
+    mkdirSync(explicit)
+    mkdirSync(running)
+    expect(selectUpdateProjectDirectory(pending, explicit, running)).toBe(realpathSync(pending))
+    expect(selectUpdateProjectDirectory(undefined, explicit, running)).toBe(realpathSync(running))
+    expect(selectUpdateProjectDirectory(undefined, explicit, undefined)).toBe(realpathSync(explicit))
+    expect(selectUpdateProjectDirectory(undefined, undefined, running)).toBe(realpathSync(running))
+    expect(() => selectUpdateProjectDirectory(undefined, undefined, undefined))
+      .toThrow('更新対象の作業ディレクトリを確認できません')
+  })
+
   test('Codex gatewayはClaudeの確認画面なしでdetached tmuxへ起動できる', async () => {
     const tmux = Bun.spawnSync(['/usr/bin/which', 'tmux'], { stdout: 'pipe' })
     expect(tmux.exitCode).toBe(0)
@@ -1401,6 +1420,8 @@ describe('Codex branch self update', () => {
     const head = must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)
     const readiness = JSON.parse(readFileSync(join(fixture.state, 'gateway-ready.json'), 'utf8'))
     expect(readiness.release).toBe(head)
+    expect(readiness.projectDir).toBe(realpathSync(fixture.project))
+    expect(readFileSync(fixture.setupProjectMarker, 'utf8')).toBe(realpathSync(fixture.project))
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v2\n')
   }, 20_000)
 

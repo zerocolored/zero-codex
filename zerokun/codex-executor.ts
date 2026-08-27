@@ -4895,6 +4895,8 @@ export async function executeCodexJob(
         phaseSequence,
         reviewRound,
         inputSnapshot: advisorAttempt.inputSnapshot,
+        stdoutPath,
+        stderrPath,
       }
     }
     // Everything below is the legacy `codex exec` fixture path. Production
@@ -5209,6 +5211,8 @@ export async function executeCodexJob(
       parentTurnIds: [] as string[],
       parentChildBaseline: parentChildBaselineInput ?? [],
       parentSource: null as AppServerSessionSource | null,
+      stdoutPath,
+      stderrPath,
     }
   }
 
@@ -5559,8 +5563,6 @@ export async function executeCodexJob(
   }
   while (true) {
     const execution = await runAttempt(sessionId, resumed)
-    const stdoutPath = join(options.logDir, `${job.id}.stdout.log`)
-    const stderrPath = join(options.logDir, `${job.id}.stderr.log`)
     if ('userCancelled' in execution && execution.userCancelled === true) {
       await execution.retireCancelledRegistration()
       throw new CodexUserCancelledError()
@@ -5649,7 +5651,7 @@ export async function executeCodexJob(
       execution.exitCode,
       execution.stdout,
       execution.stderr,
-      stdoutPath,
+      execution.stdoutPath,
     )
     if (rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
       throw new CodexRateLimitError(

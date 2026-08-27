@@ -20,6 +20,7 @@ import {
 } from './process-generation.ts'
 import { prepareManagedStateRoot, ensureManagedDirectory } from './managed-path.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
+import { subprocessExitCode } from './process-exit-code.ts'
 
 const temporaryRoots: string[] = []
 const liveSupervisors: ProcessIdentity[] = []
@@ -39,6 +40,13 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<voi
 }
 
 describe('Codex stable supervisor gate', () => {
+  test('Bunが返すsignal名を数値のshell exit codeへ正規化する', () => {
+    expect(subprocessExitCode(null, 'SIGTERM')).toBe(143)
+    expect(subprocessExitCode(null, 'SIGINT')).toBe(130)
+    expect(subprocessExitCode(null, 'UNKNOWN')).toBe(1)
+    expect(subprocessExitCode(0, 'SIGTERM')).toBe(0)
+  })
+
   test.skipIf(process.platform !== 'darwin')(
     '独立process group leaderでなければregistration作成前に停止する',
     async () => {

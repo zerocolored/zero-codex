@@ -1964,6 +1964,8 @@ try {
   writeGatewayReadiness(
     READY_FILE,
     process.env.ZEROKUN_RELEASE_COMMIT ?? 'manual',
+    process.pid,
+    realpathSync(process.cwd()),
   )
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 

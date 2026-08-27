@@ -1414,6 +1414,14 @@ function readJournal(
     (value.databasePath === null && value.databaseBackup === null)
     || (value.databasePath === databasePath && value.databaseBackup === backupPath)
   )
+  let projectDirectoryMatches = false
+  if (typeof value.projectDir === 'string') {
+    try {
+      const physicalProject = realpathSync(value.projectDir)
+      projectDirectoryMatches = lstatSync(physicalProject).isDirectory()
+        && physicalProject === expected.projectDir
+    } catch {}
+  }
   if (value.version !== 1 || typeof value.id !== 'string'
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.id)
     || ![
@@ -1422,11 +1430,11 @@ function readJournal(
     || value.repoPath !== expected.repoPath || typeof value.branch !== 'string'
     || !/^[0-9a-f]{40,64}$/.test(value.originalHead ?? '')
     || !/^[0-9a-f]{40,64}$/.test(value.targetHead ?? '')
-    || value.projectDir !== expected.projectDir || value.setupScript !== expected.setupScript
+    || !projectDirectoryMatches || value.setupScript !== expected.setupScript
     || typeof value.noRestart !== 'boolean' || !databasePairIsValid) {
     fail(`更新transaction journalが不正です: ${path}`)
   }
-  return value as UpdateJournal
+  return { ...value, projectDir: expected.projectDir } as UpdateJournal
 }
 
 function snapshotDatabase(stateDir: string, id: string): {
@@ -2114,7 +2122,8 @@ async function restartServices(
       )) && Boolean(newBridgePid && processLockOwnerMatches(
         join(stateDir, 'plugin.lock'), newBridgePid, /server\.ts(?:\s|$)/,
       )) && Boolean(readiness && readiness.pid === newBridgePid
-        && readiness.release === expectedRelease)
+        && readiness.release === expectedRelease
+        && readiness.projectDir === projectDir)
     },
   }).catch(error => {
     fail(`${error instanceof Error ? error.message : String(error)}。ログ: ${logPath}`)
@@ -2171,6 +2180,7 @@ async function rollbackUpdate(
     env: {
       ...buildSetupEnvironment(),
       ZEROKUN_STATE_DIR: stateDir,
+      ZEROKUN_PROJECT_DIR: journal.projectDir,
       ZEROKUN_UPDATE_IN_PROGRESS: '1',
     },
     timeoutMs: resolveSetupTimeoutMs(process.env, options.testing),
@@ -2253,6 +2263,7 @@ async function recoverForwardUpdate(
     env: {
       ...buildSetupEnvironment(),
       ZEROKUN_STATE_DIR: stateDir,
+      ZEROKUN_PROJECT_DIR: forwardJournal.projectDir,
       ZEROKUN_UPDATE_IN_PROGRESS: '1',
     },
     signal: options.signal,
@@ -2326,6 +2337,47 @@ async function superviseStandaloneSetup(testing = false): Promise<void> {
   }
 }
 
+export function selectUpdateProjectDirectory(
+  pendingProjectDir: string | undefined,
+  explicitProjectDir: string | undefined,
+  runningProjectDir: string | undefined,
+): string {
+  const candidate = [pendingProjectDir, runningProjectDir, explicitProjectDir]
+    .find(value => typeof value === 'string' && value.trim())
+  if (!candidate) {
+    fail('更新対象の作業ディレクトリを確認できません。稼働中のZeroちゃんから実行するか、ZEROKUN_PROJECT_DIRを指定してください')
+  }
+  let physical: string
+  try {
+    physical = realpathSync(candidate)
+    if (!lstatSync(physical).isDirectory()) throw new Error('not a directory')
+  } catch {
+    fail(`作業ディレクトリを確認できません: ${candidate}`)
+  }
+  return physical
+}
+
+function pendingUpdateProjectDirectory(stateDir: string): string | undefined {
+  const content = readOptionalPrivateFile(journalPath(stateDir))
+  if (content === null) return undefined
+  try {
+    const value = JSON.parse(content) as { projectDir?: unknown }
+    return typeof value.projectDir === 'string' ? value.projectDir : undefined
+  } catch {
+    fail(`更新transaction journalが不正です: ${journalPath(stateDir)}`)
+  }
+}
+
+function runningGatewayProjectDirectory(stateDir: string): string | undefined {
+  const readiness = readGatewayReadiness(join(stateDir, 'gateway-ready.json'))
+  const gatewayPid = readPid(join(stateDir, 'plugin.lock'))
+  if (!readiness || gatewayPid !== readiness.pid) return undefined
+  if (!processLockOwnerMatches(
+    join(stateDir, 'plugin.lock'), gatewayPid, /server\.ts(?:\s|$)/,
+  )) return undefined
+  return readiness.projectDir
+}
+
 async function main(testing = false, argv = process.argv.slice(2)): Promise<void> {
   const args = new Set(argv)
   const skipTests = args.has('--skip-tests')
@@ -2342,8 +2394,11 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
   // Use one physical state identity for journals, DB snapshots, candidate
   // setup, restart, and crash recovery even when an ancestor is a symlink.
   const stateDir = prepareManagedStateRoot(resolveZeroStateDir())
-  const projectDir = process.env.ZEROKUN_PROJECT_DIR
-    ?? rootRepo
+  const projectDir = selectUpdateProjectDirectory(
+    pendingUpdateProjectDirectory(stateDir),
+    process.env.ZEROKUN_PROJECT_DIR,
+    runningGatewayProjectDirectory(stateDir),
+  )
   const setupScript = process.env.ZEROKUN_SETUP_SCRIPT ?? join(rootRepo, 'zerokun', 'setup.sh')
   const waitSeconds = Number(process.env.ZEROKUN_UPDATE_WAIT_SECONDS ?? 21_600)
   if (!Number.isFinite(waitSeconds) || waitSeconds < 0) fail('ZEROKUN_UPDATE_WAIT_SECONDSが不正です')
@@ -2474,6 +2529,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
         env: {
           ...buildSetupEnvironment(),
           ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_UPDATE_IN_PROGRESS: '1',
         },
         signal: controller.signal,

@@ -202,6 +202,16 @@ function physicalInstructionFile(value: unknown, label: string): string {
   }
 }
 
+function optionalPhysicalInstructionFile(path: string, label: string): string | null {
+  try {
+    lstatSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw new AppServerProtocolError(`${label} cannot be verified`)
+  }
+  return physicalInstructionFile(path, label)
+}
+
 /** Parse the official v2 SessionSource union used by thread/start and thread/read. */
 export function parseAppServerSessionSource(
   value: unknown,
@@ -503,6 +513,7 @@ export class CodexAppServerSession {
   private readerClosed = false
   private inputClosed = false
   private itemsListState: 'unknown' | 'supported' | 'unsupported' = 'unknown'
+  private codexHome: string | null = null
   private readonly reader: ReadableStreamDefaultReader<Uint8Array>
   private readonly readerTask: Promise<void>
 
@@ -863,6 +874,7 @@ export class CodexAppServerSession {
     if (typeof result.codexHome !== 'string' || !isAbsolute(result.codexHome)) {
       throw new AppServerProtocolError('initialize codexHome is invalid')
     }
+    this.codexHome = result.codexHome
     this.notify('initialized', {})
   }
 
@@ -919,19 +931,31 @@ export class CodexAppServerSession {
       throw new AppServerProtocolError(`${method} returned invalid instruction sources`)
     }
     const instructionSources = result.instructionSources as string[]
-    const expectedAgents = physicalInstructionFile(
-      join(expectedCwd, 'AGENTS.md'),
-      `${method} requested project AGENTS.md`,
-    )
-    const loadedExpectedAgents = instructionSources.some(path => {
-      try {
-        return physicalInstructionFile(path, `${method} instruction source`) === expectedAgents
-      } catch {
-        return false
-      }
+    const requiredInstructionFiles = [
+      ...(this.codexHome === null ? [] : [{
+        path: join(this.codexHome, 'AGENTS.md'),
+        label: 'global AGENTS.md',
+      }]),
+      { path: join(expectedCwd, 'AGENTS.md'), label: 'project AGENTS.md' },
+    ].flatMap(candidate => {
+      const physical = optionalPhysicalInstructionFile(
+        candidate.path,
+        `${method} requested ${candidate.label}`,
+      )
+      return physical === null ? [] : [{ ...candidate, physical }]
     })
-    if (!loadedExpectedAgents) {
-      throw new AppServerProtocolError(`${method} did not load the requested project AGENTS.md`)
+    const loadedInstructionFiles = new Set(instructionSources.flatMap(path => {
+      try {
+        return [physicalInstructionFile(path, `${method} instruction source`)]
+      } catch {
+        return []
+      }
+    }))
+    const missingInstruction = requiredInstructionFiles.find(
+      candidate => !loadedInstructionFiles.has(candidate.physical),
+    )
+    if (missingInstruction) {
+      throw new AppServerProtocolError(`${method} did not load the requested ${missingInstruction.label}`)
     }
     return { threadId, instructionSources, model, modelProvider, source }
   }

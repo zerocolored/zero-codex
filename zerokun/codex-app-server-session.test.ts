@@ -69,14 +69,16 @@ describe('Codex App Server session', () => {
 
   test('initializeからturn/steerとterminal結果まで1本のordered writerで扱う', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'zero-app-server-session-'))
+    const codexHome = mkdtempSync(join(tmpdir(), 'zero-app-server-home-'))
     writeFileSync(join(repo, 'AGENTS.md'), '# fixture\n')
+    writeFileSync(join(codexHome, 'AGENTS.md'), '# global fixture\n')
     const beforeWrites: number[] = []
     const transport = mockTransport((request, emit) => {
       if (request.method === 'initialized') return
       const id = request.id as number
       if (request.method === 'initialize') emit({ id, result: {
         userAgent: 'test',
-        codexHome: '/tmp/codex-home',
+        codexHome,
         platformFamily: 'unix',
         platformOs: 'macos',
       } })
@@ -91,7 +93,7 @@ describe('Codex App Server session', () => {
           cwd: repo,
           approvalPolicy: 'never',
           activePermissionProfile: { id: 'profile-1', extends: null },
-          instructionSources: [join(repo, 'AGENTS.md')],
+          instructionSources: [join(codexHome, 'AGENTS.md'), join(repo, 'AGENTS.md')],
         } })
       }
       if (request.method === 'turn/start') {
@@ -147,6 +149,7 @@ describe('Codex App Server session', () => {
       await session.waitForReader()
     } finally {
       rmSync(repo, { recursive: true, force: true })
+      rmSync(codexHome, { recursive: true, force: true })
     }
   })
 
@@ -233,6 +236,73 @@ describe('Codex App Server session', () => {
     } finally {
       rmSync(repo, { recursive: true, force: true })
       rmSync(unrelated, { recursive: true, force: true })
+    }
+  })
+
+  test('project AGENTS.mdがない場合は読み込んだglobal AGENTS.mdだけで開始する', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'zero-app-server-no-project-agents-'))
+    const codexHome = mkdtempSync(join(tmpdir(), 'zero-app-server-global-agents-'))
+    const globalAgents = join(codexHome, 'AGENTS.md')
+    writeFileSync(globalAgents, '# global instructions\n')
+    const transport = mockTransport((request, emit) => {
+      if (request.method === 'initialize') emit({ id: request.id, result: {
+        userAgent: 'test', codexHome, platformFamily: 'unix', platformOs: 'macos',
+      } })
+      if (request.method === 'thread/start') emit({ id: request.id, result: {
+        thread: {
+          id: 'thread-global-agents', cwd: repo, source: 'unknown', modelProvider: 'openai',
+          status: { type: 'idle' }, canAcceptDirectInput: true,
+        },
+        model: 'gpt-test', modelProvider: 'openai', cwd: repo,
+        approvalPolicy: 'never',
+        activePermissionProfile: { id: 'profile-1', extends: null },
+        instructionSources: [globalAgents],
+      } })
+    })
+    try {
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      await session.initialize()
+      await expect(session.startThread({
+        cwd: repo, permissions: 'profile-1', approvalPolicy: 'never', model: 'gpt-test',
+      }, 50)).resolves.toMatchObject({ threadId: 'thread-global-agents' })
+      session.closeInput()
+      await session.waitForReader()
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+      rmSync(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  test('存在するglobal AGENTS.mdがinstructionSourcesから欠けたら拒否する', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'zero-app-server-missing-global-'))
+    const codexHome = mkdtempSync(join(tmpdir(), 'zero-app-server-required-global-'))
+    writeFileSync(join(codexHome, 'AGENTS.md'), '# global instructions\n')
+    const transport = mockTransport((request, emit) => {
+      if (request.method === 'initialize') emit({ id: request.id, result: {
+        userAgent: 'test', codexHome, platformFamily: 'unix', platformOs: 'macos',
+      } })
+      if (request.method === 'thread/start') emit({ id: request.id, result: {
+        thread: {
+          id: 'thread-missing-global', cwd: repo, source: 'unknown', modelProvider: 'openai',
+          status: { type: 'idle' }, canAcceptDirectInput: true,
+        },
+        model: 'gpt-test', modelProvider: 'openai', cwd: repo,
+        approvalPolicy: 'never',
+        activePermissionProfile: { id: 'profile-1', extends: null },
+        instructionSources: [],
+      } })
+    })
+    try {
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      await session.initialize()
+      await expect(session.startThread({
+        cwd: repo, permissions: 'profile-1', approvalPolicy: 'never', model: 'gpt-test',
+      }, 50)).rejects.toThrow('did not load the requested global AGENTS.md')
+      session.closeInput()
+      await session.waitForReader()
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+      rmSync(codexHome, { recursive: true, force: true })
     }
   })
 

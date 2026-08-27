@@ -33,6 +33,7 @@ import {
 } from './process-generation.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { verifyEncodedOfficialCodexSnapshot } from './standalone-codex.ts'
+import { subprocessExitCode } from './process-exit-code.ts'
 import {
   readSeatbeltFingerprint,
   reapSeatbeltFingerprint,
@@ -277,7 +278,7 @@ async function main(): Promise<void> {
           rejectDirectExit(error)
           return
         }
-        resolveDirectExit(exitCode ?? (signalCode === null ? 1 : 128 + signalCode))
+        resolveDirectExit(subprocessExitCode(exitCode, signalCode))
       },
     })
     childStarted = true

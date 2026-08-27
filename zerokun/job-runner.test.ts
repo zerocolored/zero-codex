@@ -6823,6 +6823,38 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     }
   })
 
+  test('Codex起動失敗は実際に作成したstage log pathを案内する', async () => {
+    const dir = fixtureDir()
+    const repo = join(dir, 'repo')
+    const logs = join(dir, 'state/job-logs')
+    const fakeCodex = join(dir, 'fake-codex')
+    mkdirSync(repo)
+    writeFileSync(fakeCodex, '#!/bin/sh\necho fixture-failure >&2\nexit 7\n', { mode: 0o755 })
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      let message = ''
+      try {
+        await executeCodexJob(job, {
+          codexBinForTesting: fakeCodex,
+          skipEffectiveConfigCheck: true,
+          stateDir: join(dir, 'state'),
+          logDir: logs,
+          timeoutMs: 5_000,
+        })
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error)
+      }
+      const expectedLog = join(logs, `${job.id}.new.stdout.log`)
+      expect(message).toContain(`全文ログ: ${expectedLog}`)
+      expect(existsSync(expectedLog)).toBe(true)
+      expect(message).not.toContain(`${job.id}.stdout.log`)
+    } finally {
+      store.close()
+    }
+  }, 10_000)
+
   test('permission profileはHOME/stateを閉じ、repo・当該添付・outboxだけを再許可する', () => {
     const dir = fixtureDir()
     const state = join(dir, 'state')

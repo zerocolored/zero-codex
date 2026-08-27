@@ -494,17 +494,23 @@ describe('public Codex defaults', () => {
     const dir = mkdtempSync(join(tmpdir(), 'zerokun-readiness-'))
     const path = join(dir, 'gateway-ready.json')
     try {
-      writeGatewayReadiness(path, 'abc123', 4321)
+      writeGatewayReadiness(path, 'abc123', 4321, dir)
       expect(readGatewayReadiness(path)).toMatchObject({
         runtime: 'codex',
         pid: 4321,
         release: 'abc123',
+        projectDir: dir,
       })
       expect(JSON.parse(readFileSync(path, 'utf8')).connectedAt).toBeGreaterThan(0)
       clearGatewayReadiness(path, 9999)
       expect(existsSync(path)).toBe(true)
       clearGatewayReadiness(path, 4321)
       expect(existsSync(path)).toBe(false)
+      writeFileSync(path, JSON.stringify({
+        runtime: 'codex', pid: 4321, release: 'old', connectedAt: Date.now(),
+      }))
+      expect(readGatewayReadiness(path)).toBeNull()
+      clearGatewayReadiness(path, 4321)
       mkdirSync(join(dir, 'nested'))
     } finally {
       rmSync(dir, { recursive: true, force: true })

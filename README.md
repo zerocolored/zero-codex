@@ -43,8 +43,9 @@ Slack bot
   表示した証拠を失ったjobとdurable monitor faultを保持してFIFOを止めるため、監視tabを手動で閉じないで
   ください。Slackへの通知配送だけはFIFOと独立して再試行します。
 - `project_doc_max_bytes=262144`をruntime側で固定し、global→projectの`AGENTS.md`をjobごとに読み直します。
-  App Server handshakeで対象repository直下のowner-owned regular `AGENTS.md`が実際の
+  App Server handshakeで存在するglobal／projectのowner-owned regular `AGENTS.md`が実際の
   `instructionSources`に含まれることを物理pathで照合し、同名の無関係fileでは代替しません。
+  project側の`AGENTS.md`は任意です。
   公開前の決定的な最低契約として、read jobはread-only processでinvestigationを行います。write jobは
   同じCodex threadを、read-only準備（investigation/design）→write実装→read-only reviewのfresh processへ
   順番にresumeします。各processを子processごと完全回収してから次を起動し、write processではadvisor MCPと
@@ -163,8 +164,8 @@ bash "$bootstrap_path" --with-slack
 `git switch main` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使えます。
 
 bootstrapはZeroちゃん本体とは別の`zerokun-workspace` Git repositoryを、最小安全指示の`AGENTS.md`
-初期commit付きで既定projectとして作ります。既存projectを使う場合はproject固有の`AGENTS.md`を用意し、
-`--project-dir /absolute/path/to/project`を指定してください。
+初期commit付きで既定projectとして作ります。既存projectを使う場合はproject固有の`AGENTS.md`は任意で、
+`--project-dir /absolute/path/to/project`を指定できます。
 Zeroちゃん本体はhost runtimeなので、そこを対象にしたSlack write jobは常に拒否されます。
 
 依存関係だけ診断する場合は `--doctor`、導入済み環境で Slack 設定だけ再開する場合は
@@ -300,6 +301,8 @@ serviceを起動せずoffline bootstrapで復旧してください。
 ```
 
 DM は launcher に渡した project directory、チャンネルは route の directoryを使います。
+稼働中のgatewayはその物理project directoryをreadinessへ記録し、`zerokun-update`は再起動後も
+同じdirectoryを引き継ぎます。gateway停止中に更新する場合は`ZEROKUN_PROJECT_DIR`を明示してください。
 一度採用した Slack thread の route は SQLite に固定され、途中で設定を変えても別 repository
 へ飛びません。
 
@@ -321,6 +324,9 @@ DM は launcher に渡した project directory、チャンネルは route の di
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、
   endpoint/provider差替え、legacy sandbox、named permissionの変更を拒否します。安全規則は
   `developerInstructions`、未信頼のSlack本文はJSON-RPC inputへ分離し、子環境はallowlistです。
+- Codexが返す`instructionSources`を照合し、存在するglobal `AGENTS.md`とproject
+  `AGENTS.md`が読み込まれたことを確認します。project側の`AGENTS.md`は任意で、存在しないだけでは
+  jobを停止しません。
 - `thread/start`は`ephemeral:false`なので、Codex/provider側のnative履歴はZeroちゃんのSQLiteとは別に
   残り得ます。Grok/Claude側にも各serviceの保持方針が適用されます。Claudeはroundごとにfresh sessionを
   起動してworkspaceを閉じますが、provider側の履歴削除を保証するものではありません。

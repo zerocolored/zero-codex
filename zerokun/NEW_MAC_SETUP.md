@@ -29,7 +29,7 @@ bash "$bootstrap_path" --with-slack
 - Codex / Grok CLI / Claude Code（Zeroちゃん自身はlogin操作をしない）
 - zero-codex repository の `main` branch（既定 `~/Desktop/Project/zero-codex`）
 - Zeroちゃん本体とは分離し、最小安全指示の`AGENTS.md`を初期commitした既定
-  `zerokun-workspace` repository（`AGENTS.md`のある既存projectも指定可能）
+  `zerokun-workspace` repository（project側`AGENTS.md`がない既存projectも指定可能）
 - Zeroちゃん runtime、管理 CLI、watchdog
 - Slack manifest の生成、token 入力、access 初期設定
 
