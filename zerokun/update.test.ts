@@ -1773,6 +1773,155 @@ describe('Codex branch self update', () => {
     expect(existsSync(fixture.setupMarker)).toBe(true)
   }, 20_000)
 
+  test('旧targetのcleanなpushed descendantはrecover-onlyでforward recoveryを再試行する', () => {
+    const fixture = updaterFixture()
+    const allowSetup = join(fixture.base, 'allow-forward-setup')
+    const forwardAttempt = join(fixture.base, 'forward-db-attempt')
+    const forwardObserved = join(fixture.base, 'forward-db-observed')
+    const forwardHelper = join(fixture.base, 'forward-db-helper.ts')
+    const databasePath = join(fixture.state, 'jobs.sqlite3')
+    const database = new Database(databasePath, { create: true })
+    database.exec('CREATE TABLE jobs (status TEXT NOT NULL, runtime TEXT NOT NULL)')
+    database.exec('CREATE TABLE marker (value TEXT NOT NULL)')
+    database.run('INSERT INTO marker (value) VALUES (?)', ['before-forward'])
+    database.close()
+    writeFileSync(forwardHelper, [
+      "import { Database } from 'bun:sqlite'",
+      "import { existsSync, writeFileSync } from 'fs'",
+      `const database = new Database(${JSON.stringify(databasePath)})`,
+      "const value = database.query('SELECT value FROM marker').get()?.value",
+      `if (!existsSync(${JSON.stringify(forwardAttempt)})) {`,
+      "  if (value !== 'before-forward') process.exit(81)",
+      "  database.run('UPDATE marker SET value = ?', ['partial-forward'])",
+      '  database.close()',
+      `  writeFileSync(${JSON.stringify(forwardAttempt)}, 'attempted\\n')`,
+      '  process.exit(42)',
+      '}',
+      'database.close()',
+      `writeFileSync(${JSON.stringify(forwardObserved)}, String(value) + '\\n')`,
+      "if (value !== 'before-forward') process.exit(82)",
+      '',
+    ].join('\n'))
+    writeFileSync(fixture.setup, [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      `if [ ! -f ${JSON.stringify(allowSetup)} ]; then exit 42; fi`,
+      `${JSON.stringify(process.execPath)} --no-env-file ${JSON.stringify(forwardHelper)}`,
+      `touch ${JSON.stringify(fixture.setupMarker)}`,
+      '',
+    ].join('\n'))
+
+    const failed = runUpdater(fixture)
+    expect(failed.exitCode).not.toBe(0)
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(true)
+
+    writeFileSync(join(fixture.repo.seed, 'version.txt'), 'v3-forward-fix\n')
+    must(['git', 'add', '.'], fixture.repo.seed)
+    must(['git', 'commit', '-m', 'v3 forward fix'], fixture.repo.seed)
+    must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+    must(['git', 'fetch', 'origin'], fixture.repo.local)
+    must(['git', 'merge', '--ff-only', 'origin/codex'], fixture.repo.local)
+
+    writeFileSync(allowSetup, 'ready\n')
+    const firstRecovery = runUpdater(fixture, ['--skip-tests', '--recover-only'])
+    expect(
+      firstRecovery.exitCode,
+      firstRecovery.stdout.toString() + firstRecovery.stderr.toString(),
+    ).not.toBe(0)
+    const pending = JSON.parse(readFileSync(
+      join(fixture.state, 'update-transaction.json'), 'utf8',
+    )) as { phase?: unknown; targetHead?: unknown }
+    expect(pending.phase).toBe('rolling-forward')
+    expect(pending.targetHead).toBe(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local))
+    const partial = new Database(databasePath)
+    expect(partial.query<{ value: string }, []>('SELECT value FROM marker').get()?.value)
+      .toBe('partial-forward')
+    partial.close()
+
+    const accidentalNormalUpdate = runUpdater(fixture)
+    expect(accidentalNormalUpdate.exitCode).not.toBe(0)
+    expect(accidentalNormalUpdate.stderr.toString()).toContain(
+      'zerokun-update --recover-only',
+    )
+    expect(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)).toBe(pending.targetHead)
+    const stillPending = JSON.parse(readFileSync(
+      join(fixture.state, 'update-transaction.json'), 'utf8',
+    )) as { phase?: unknown; targetHead?: unknown }
+    expect(stillPending).toEqual(pending)
+    expect(existsSync(forwardObserved)).toBe(false)
+
+    writeFileSync(join(fixture.repo.seed, 'version.txt'), 'v4-after-forward-intent\n')
+    must(['git', 'add', '.'], fixture.repo.seed)
+    must(['git', 'commit', '-m', 'v4 after forward intent'], fixture.repo.seed)
+    must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+
+    const recovered = runUpdater(fixture, ['--skip-tests', '--recover-only'])
+    expect(recovered.exitCode, recovered.stderr.toString()).toBe(0)
+    expect(recovered.stdout.toString()).toContain('forward recovery完了')
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8'))
+      .toBe('v3-forward-fix\n')
+    expect(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)).toBe(pending.targetHead)
+    expect(must(['git', 'rev-parse', 'origin/codex'], fixture.repo.local))
+      .not.toBe(pending.targetHead)
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
+    expect(existsSync(fixture.setupMarker)).toBe(true)
+    expect(readFileSync(forwardObserved, 'utf8')).toBe('before-forward\n')
+  })
+
+  test('forward setupがtracked差分を残せばjournalとユーザー差分を保持する', () => {
+    const fixture = updaterFixture()
+    const allowSetup = join(fixture.base, 'allow-dirty-forward-setup')
+    writeFileSync(fixture.setup, [
+      '#!/bin/bash',
+      `if [ ! -f ${JSON.stringify(allowSetup)} ]; then exit 42; fi`,
+      `printf 'dirty forward setup\\n' > ${JSON.stringify(join(fixture.repo.local, 'version.txt'))}`,
+      '',
+    ].join('\n'))
+    expect(runUpdater(fixture).exitCode).not.toBe(0)
+
+    writeFileSync(join(fixture.repo.seed, 'version.txt'), 'v3-dirty-guard\n')
+    must(['git', 'add', '.'], fixture.repo.seed)
+    must(['git', 'commit', '-m', 'v3 dirty guard'], fixture.repo.seed)
+    must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+    must(['git', 'fetch', 'origin'], fixture.repo.local)
+    must(['git', 'merge', '--ff-only', 'origin/codex'], fixture.repo.local)
+    writeFileSync(allowSetup, 'ready\n')
+
+    const recovery = runUpdater(fixture, ['--skip-tests', '--recover-only'])
+    expect(recovery.exitCode).not.toBe(0)
+    expect(recovery.stderr.toString()).toContain('未コミット変更')
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(true)
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8'))
+      .toBe('dirty forward setup\n')
+  })
+
+  test('originへ未反映のdescendantはforward recoveryせずjournalを保持する', () => {
+    const fixture = updaterFixture()
+    const allowSetup = join(fixture.base, 'must-not-run-forward-setup')
+    writeFileSync(fixture.setup, [
+      '#!/bin/bash',
+      `if [ ! -f ${JSON.stringify(allowSetup)} ]; then exit 42; fi`,
+      `touch ${JSON.stringify(fixture.setupMarker)}`,
+      '',
+    ].join('\n'))
+    expect(runUpdater(fixture).exitCode).not.toBe(0)
+
+    must(['git', 'fetch', 'origin'], fixture.repo.local)
+    must(['git', 'merge', '--ff-only', 'origin/codex'], fixture.repo.local)
+    must(['git', 'config', 'user.email', 'test@example.com'], fixture.repo.local)
+    must(['git', 'config', 'user.name', 'test'], fixture.repo.local)
+    writeFileSync(join(fixture.repo.local, 'version.txt'), 'unpublished-forward-fix\n')
+    must(['git', 'add', '.'], fixture.repo.local)
+    must(['git', 'commit', '-m', 'unpublished forward fix'], fixture.repo.local)
+    writeFileSync(allowSetup, 'would-run-if-unsafe\n')
+
+    const recovery = runUpdater(fixture, ['--skip-tests', '--recover-only'])
+    expect(recovery.exitCode).not.toBe(0)
+    expect(recovery.stderr.toString()).toContain('origin/codexへ未反映')
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(true)
+    expect(existsSync(fixture.setupMarker)).toBe(false)
+  })
+
   test('検証中にorigin/codexが進んでも検証済みSHAだけを適用する', async () => {
     const fixture = updaterFixture()
     writeFileSync(join(fixture.repo.seed, 'version.txt'), 'v3-verified\n')

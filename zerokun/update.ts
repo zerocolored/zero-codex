@@ -469,7 +469,12 @@ export function stageVerifiedCandidateCodex(
   return { directory, executable }
 }
 
-type UpdatePhase = 'prepared' | 'fast-forwarded' | 'setup-applied' | 'rolling-back'
+type UpdatePhase =
+  | 'prepared'
+  | 'fast-forwarded'
+  | 'setup-applied'
+  | 'rolling-back'
+  | 'rolling-forward'
 
 export interface UpdateJournal {
   version: 1
@@ -1411,7 +1416,9 @@ function readJournal(
   )
   if (value.version !== 1 || typeof value.id !== 'string'
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.id)
-    || !['prepared', 'fast-forwarded', 'setup-applied', 'rolling-back'].includes(value.phase ?? '')
+    || ![
+      'prepared', 'fast-forwarded', 'setup-applied', 'rolling-back', 'rolling-forward',
+    ].includes(value.phase ?? '')
     || value.repoPath !== expected.repoPath || typeof value.branch !== 'string'
     || !/^[0-9a-f]{40,64}$/.test(value.originalHead ?? '')
     || !/^[0-9a-f]{40,64}$/.test(value.targetHead ?? '')
@@ -2175,6 +2182,88 @@ async function rollbackUpdate(
   output('✅ 旧Codex版へのロールバック完了')
 }
 
+async function recoverForwardUpdate(
+  stateDir: string,
+  journal: UpdateJournal,
+  options: {
+    testing: boolean
+    skipTests: boolean
+    updateLock: UpdateLockCoordinator
+    signal: AbortSignal
+  },
+): Promise<boolean> {
+  const repo: Repository = {
+    label: 'zero-codex',
+    path: journal.repoPath,
+    branch: journal.branch,
+  }
+  options.updateLock.assertExclusive()
+  const currentHead = requireCommand(['git', 'rev-parse', 'HEAD'], { cwd: journal.repoPath })
+  if (journal.phase === 'rolling-forward') {
+    if (currentHead !== journal.targetHead) {
+      fail(
+        `forward recovery開始後に別commitが作成されています (${currentHead.slice(0, 12)})。`
+        + ' 未完了journalを保持したまま停止します',
+      )
+    }
+  } else {
+    if (currentHead === journal.originalHead || currentHead === journal.targetHead) return false
+    if (!isAncestor(repo, journal.targetHead, currentHead)) {
+      fail(
+        `rollback対象と無関係なcommitが作成されています (${currentHead.slice(0, 12)})。`
+        + ' 未完了journalを保持したまま停止します',
+      )
+    }
+  }
+
+  const [pinned] = await preflightRepositories(
+    [repo], options.signal, options.updateLock,
+  )
+  if (!pinned || pinned.originalHead !== currentHead
+    || (journal.phase !== 'rolling-forward' && pinned.targetHead !== currentHead)) {
+    fail(
+      'forward recoveryにはcleanな現行commitとoriginの完全一致が必要です。'
+      + ' 未完了journalを保持したまま停止します',
+    )
+  }
+  const recoveryPinned: PinnedRepository = journal.phase === 'rolling-forward'
+    ? { ...pinned, targetHead: currentHead }
+    : pinned
+  if (!options.skipTests) {
+    output('▶ forward recovery候補を一時worktreeで検証')
+    await validateRemoteTargets(
+      [recoveryPinned], stateDir, options.updateLock, options.signal,
+    )
+  }
+  assertPinnedRepositoryState(recoveryPinned)
+
+  const forwardJournal: UpdateJournal = {
+    ...journal,
+    phase: 'rolling-forward',
+    targetHead: currentHead,
+  }
+  writeJournal(stateDir, forwardJournal)
+  output(`▶ 検証済みcommit ${currentHead.slice(0, 12)} で更新transactionをforward recovery`)
+  await stopServices(stateDir, options.signal)
+  assertPinnedRepositoryState(recoveryPinned)
+  restoreRollbackDatabase(forwardJournal)
+  await requireSetupCommandAsync(forwardJournal.setupScript, options.updateLock, {
+    cwd: forwardJournal.repoPath,
+    inherit: !options.testing,
+    env: {
+      ...buildSetupEnvironment(),
+      ZEROKUN_STATE_DIR: stateDir,
+      ZEROKUN_UPDATE_IN_PROGRESS: '1',
+    },
+    signal: options.signal,
+    timeoutMs: resolveSetupTimeoutMs(process.env, options.testing),
+  })
+  assertPinnedRepositoryState(recoveryPinned)
+  clearJournal(stateDir, forwardJournal)
+  output('✅ 検証済み現行Codex版へのforward recovery完了')
+  return true
+}
+
 async function superviseStandaloneSetup(testing = false): Promise<void> {
   if (!['', '0'].includes(process.env.ZEROKUN_UPDATE_IN_PROGRESS ?? '')) {
     fail('updater配下からstandalone setup supervisorは起動できません')
@@ -2279,6 +2368,18 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
     if (interrupted) {
       if (realpathSync(interrupted.repoPath) !== rootRepo) {
         fail(`別repositoryの未完了更新があります: ${interrupted.repoPath}`)
+      }
+      if (recoverOnly && await recoverForwardUpdate(stateDir, interrupted, {
+        testing,
+        skipTests,
+        updateLock,
+        signal: controller.signal,
+      })) return
+      if (interrupted.phase === 'rolling-forward') {
+        fail(
+          'forward recoveryが未完了です。現行commitとjournalを保持しました。'
+          + ' zerokun-update --recover-only を再実行してください',
+        )
       }
       const restartInterrupted = !recoverOnly && !interrupted.noRestart
       if (restartInterrupted) await assertPinnedHerdrRestartReady(stateDir, true)
