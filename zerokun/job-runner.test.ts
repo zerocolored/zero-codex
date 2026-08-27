@@ -102,7 +102,10 @@ import {
   signalProcessGroupIfLeaderLive,
   signalProcessIfLive,
 } from './process-generation.ts'
-import { EphemeralClaudeCleanupPendingError } from './ephemeral-claude-session.ts'
+import {
+  EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
+  EphemeralClaudeCleanupPendingError,
+} from './ephemeral-claude-session.ts'
 import { HerdrJobMonitorPendingError } from './herdr-job-monitor.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 import { readAdvisorInputSnapshot } from './advisor-input.ts'
@@ -5870,6 +5873,66 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
     )).not.toThrow()
 
+    const attemptRoot = dirname(root)
+    const deliveryPath = join(attemptRoot, EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE)
+    const delivery = {
+      version: 1,
+      status: 'delivery-possible',
+      jobId: job.id,
+      attemptNonce,
+      receiptDigest: '7'.repeat(64),
+    }
+    writeFileSync(deliveryPath, `${JSON.stringify(delivery)}\n`, { mode: 0o600 })
+    expect(assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toHaveLength(1)
+
+    writeFileSync(deliveryPath, `${JSON.stringify({ ...delivery, extra: true })}\n`)
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('invalid ephemeral delivery evidence')
+    writeFileSync(deliveryPath, `${JSON.stringify(delivery)}\n`)
+    chmodSync(deliveryPath, 0o644)
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('invalid ephemeral delivery evidence')
+    chmodSync(deliveryPath, 0o600)
+
+    rmSync(deliveryPath)
+    const linkedDelivery = join(state, 'linked-delivery.json')
+    writeFileSync(linkedDelivery, `${JSON.stringify(delivery)}\n`, { mode: 0o600 })
+    symlinkSync(linkedDelivery, deliveryPath)
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('unsafe ephemeral delivery evidence')
+    rmSync(deliveryPath)
+    linkSync(linkedDelivery, deliveryPath)
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('invalid ephemeral delivery evidence')
+    rmSync(deliveryPath)
+    rmSync(linkedDelivery)
+    mkdirSync(deliveryPath)
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('unsafe ephemeral delivery evidence')
+    rmSync(deliveryPath, { recursive: true })
+    writeFileSync(deliveryPath, `${JSON.stringify(delivery)}\n`, { mode: 0o600 })
+
+    const unknown = join(attemptRoot, 'ephemeral-delivery.json.tmp')
+    writeFileSync(unknown, 'unsafe', { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('unsafe attempt entry')
+    rmSync(unknown)
+
+    const activeLock = join(attemptRoot, 'active-round.lock')
+    writeFileSync(activeLock, 'active', { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('active round claim')
+    rmSync(activeLock)
+
     journal.claude.cleanupVerified = false
     writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
     expect(() => assertRequiredAdvisorRounds(
@@ -6000,7 +6063,15 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     const job = { id: 'write-advisor-job', writeEnabled: true }
     const attemptNonce = 'f'.repeat(32)
     const advisorInput = { revision: 1, digest: '6'.repeat(64) }
-    mkdirSync(join(state, 'advisor-journal', job.id, attemptNonce), { recursive: true, mode: 0o700 })
+    const attemptRoot = join(state, 'advisor-journal', job.id, attemptNonce)
+    mkdirSync(attemptRoot, { recursive: true, mode: 0o700 })
+    writeFileSync(join(attemptRoot, EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE), `${JSON.stringify({
+      version: 1,
+      status: 'delivery-possible',
+      jobId: job.id,
+      attemptNonce,
+      receiptDigest: '7'.repeat(64),
+    })}\n`, { mode: 0o600 })
     expect(() => assertRequiredAdvisorRounds(
       job, state, 'a'.repeat(64), attemptNonce, advisorInput,
       '9'.repeat(64), '9'.repeat(64),
@@ -6302,6 +6373,60 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     } finally {
       if (previous === undefined) delete process.env.CALLS_FILE
       else process.env.CALLS_FILE = previous
+      store.close()
+    }
+  }, 15_000)
+
+  test('resume失敗時にadvisor送達可能性があれば新規execへfallbackしない', async () => {
+    const dir = fixtureDir()
+    const repo = join(dir, 'repo')
+    const calls = join(dir, 'calls.jsonl')
+    const stateDir = join(dir, 'state')
+    const fakeCodex = join(dir, 'fake-codex')
+    mkdirSync(repo)
+    writeFileSync(fakeCodex, `#!/usr/bin/env bun
+import { appendFileSync, mkdirSync, readdirSync, writeFileSync } from 'fs'
+import { join } from 'path'
+const args = process.argv.slice(2)
+appendFileSync(process.env.CALLS_FILE!, JSON.stringify(args) + '\\n')
+const contextRoot = join(process.env.STATE_DIR!, 'advisor-context', process.env.JOB_ID!)
+const context = readdirSync(contextRoot).find(name => /^[0-9a-f]{32}\\.json$/.test(name))
+if (!context) throw new Error('attempt context missing')
+const nonce = context.slice(0, -'.json'.length)
+const attemptRoot = join(
+  process.env.STATE_DIR!, 'advisor-journal', process.env.JOB_ID!, nonce,
+)
+mkdirSync(attemptRoot, { recursive: true, mode: 0o700 })
+writeFileSync(join(attemptRoot, 'ephemeral-delivery.json'), 'delivery may have occurred', {
+  mode: 0o600,
+})
+console.error('no rollout found for thread id missing-thread')
+process.exit(1)
+`)
+    chmodSync(fakeCodex, 0o755)
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo }))
+    const first = store.claimNext('serial-worker')!
+    store.complete(first.id, 'missing-thread', 'old')
+    store.enqueue(input({ repoPath: repo, messageId: 'follow-up-with-advisor-delivery' }))
+    const job = store.claimNext('serial-worker')!
+    const resets: number[] = []
+    try {
+      await expect(executeCodexJob(job, {
+        codexBinForTesting: fakeCodex,
+        skipEffectiveConfigCheck: true,
+        stateDir,
+        logDir: join(stateDir, 'job-logs'),
+        extraEnvironment: {
+          CALLS_FILE: calls,
+          STATE_DIR: stateDir,
+          JOB_ID: job.id,
+        },
+        onSessionReset: () => resets.push(1),
+      })).rejects.toThrow('automatic fallback is blocked')
+      expect(readFileSync(calls, 'utf8').trim().split('\n')).toHaveLength(1)
+      expect(resets).toEqual([])
+    } finally {
       store.close()
     }
   }, 15_000)

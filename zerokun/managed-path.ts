@@ -1,6 +1,16 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
-import { chmodSync, lstatSync, mkdirSync, realpathSync } from 'fs'
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+} from 'fs'
 import { relative, resolve, sep } from 'path'
 
 type FileMetadata = NonNullable<ReturnType<typeof lstatSync>>
@@ -18,6 +28,23 @@ function requirePrivateDirectory(path: string): void {
   const metadata = lstatSync(path) as FileMetadata
   if ((Number(metadata.mode) & 0o077) !== 0) {
     throw new Error(`managed directory is not private: ${path}`)
+  }
+}
+
+function synchronizeOwnedDirectory(path: string): void {
+  const descriptor = openSync(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  )
+  try {
+    const metadata = fstatSync(descriptor)
+    const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
+    if (!metadata.isDirectory() || !ownerMatches) {
+      throw new Error(`unsafe managed directory: ${path}`)
+    }
+    fsyncSync(descriptor)
+  } finally {
+    closeSync(descriptor)
   }
 }
 
@@ -41,7 +68,8 @@ function walkManagedDirectory(root: string, candidate: string, create: boolean):
   requirePrivateDirectory(base)
   let current = base
   for (const component of relative(base, path).split(sep).filter(Boolean)) {
-    current = resolve(current, component)
+    const parent = current
+    current = resolve(parent, component)
     if (create) {
       try { mkdirSync(current, { mode: 0o700 }) }
       catch (error) {
@@ -49,6 +77,10 @@ function walkManagedDirectory(root: string, candidate: string, create: boolean):
       }
     }
     requireOwnedDirectory(current)
+    // A retry must also make a previously-created but not-yet-durable dirent
+    // durable. Synchronizing every traversed parent avoids relying on whether
+    // this particular call won mkdir(2).
+    if (create) synchronizeOwnedDirectory(parent)
   }
   return path
 }

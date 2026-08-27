@@ -1,8 +1,10 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'crypto'
+import * as fs from 'fs'
 import {
   chmodSync,
   existsSync,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -18,14 +20,17 @@ import { dirname, join } from 'path'
 import type { HerdrRuntimeIdentity } from './herdr-runtime.ts'
 import {
   EPHEMERAL_CLAUDE_CLOSED_RECEIPT,
+  EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
   EPHEMERAL_CLAUDE_STATE_ROOT,
   EPHEMERAL_CLAUDE_TRASH_ROOT,
   EphemeralClaudeCleanupPendingError,
+  advisorAttemptMayHaveBeenDeliveredForResume,
   createEphemeralClaudeRequestDirectory,
   ephemeralClaudeAgentMatches,
   parseEphemeralClaudeClose,
   parseEphemeralClaudeOpen,
   parseEphemeralClaudeProvisionalRecovery,
+  parseEphemeralClaudeDeliveryEvidence,
   persistEphemeralClaudeDeliveryEvidence,
   readEphemeralClaudeCleanupReceipt,
   readEphemeralClaudeProvisionalCleanupReceipt,
@@ -283,6 +288,30 @@ describe('ephemeral Claude lifecycle state', () => {
     persistEphemeralClaudeDeliveryEvidence(state, delivered)
     persistEphemeralClaudeDeliveryEvidence(state, delivered)
     expect(advisorAttemptMayHaveBeenDelivered(state, 'job-123')).toBe(true)
+    const evidencePath = join(
+      state, 'advisor-journal', 'job-123', 'a'.repeat(32),
+      EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
+    )
+    const firstEvidence = readFileSync(evidencePath, 'utf8')
+    const firstEvidenceMetadata = lstatSync(evidencePath)
+    expect(readdirSync(dirname(evidencePath))).toEqual([
+      EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
+    ])
+
+    const laterRound = request(state, { phase: 'design' })
+    privateFile(join(laterRound, 'ephemeral-session-intent.json'), `${JSON.stringify(
+      intentReceipt(projectRoot),
+    )}\n`)
+    privateFile(join(laterRound, 'ephemeral-send-receipt.json'), `${JSON.stringify({
+      version: 2,
+      nonce: lifecycleNonce,
+      target: target.target,
+      marker: `REQUEST_MARKER=${'B'.repeat(32)}`,
+      status: 'delivery-possible',
+    })}\n`)
+    persistEphemeralClaudeDeliveryEvidence(state, laterRound)
+    expect(readFileSync(evidencePath, 'utf8')).toBe(firstEvidence)
+    expect(lstatSync(evidencePath).ino).toBe(firstEvidenceMetadata.ino)
 
     const invalid = request(state, { jobId: 'job-invalid' })
     privateFile(join(invalid, 'ephemeral-session-intent.json'), `${JSON.stringify(
@@ -298,6 +327,222 @@ describe('ephemeral Claude lifecycle state', () => {
     expect(() => persistEphemeralClaudeDeliveryEvidence(state, invalid))
       .toThrow(EphemeralClaudeCleanupPendingError)
     expect(advisorAttemptMayHaveBeenDelivered(state, 'job-invalid')).toBe(false)
+  })
+
+  test('初回file fsync失敗後のretryは既存latchのfileと親directoryを再同期する', () => {
+    const state = fixtureState()
+    const projectRoot = dirname(state)
+    const requestDir = request(state, { jobId: 'job-file-sync-retry' })
+    privateFile(join(requestDir, 'ephemeral-session-intent.json'), `${JSON.stringify(
+      intentReceipt(projectRoot),
+    )}\n`)
+    privateFile(join(requestDir, 'ephemeral-send-receipt.json'), `${JSON.stringify({
+      version: 2,
+      nonce: lifecycleNonce,
+      target: target.target,
+      marker: `REQUEST_MARKER=${'D'.repeat(32)}`,
+      status: 'delivery-possible',
+    })}\n`)
+    const evidencePath = join(
+      state, 'advisor-journal', 'job-file-sync-retry', 'a'.repeat(32),
+      EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
+    )
+    const original = fs.fsyncSync
+    let failed = false
+    const firstSync = spyOn(fs, 'fsyncSync').mockImplementation(descriptor => {
+      if (!failed && fstatSync(descriptor).isFile()) {
+        failed = true
+        throw new Error('injected file fsync failure')
+      }
+      original(descriptor)
+    })
+    try {
+      expect(() => persistEphemeralClaudeDeliveryEvidence(state, requestDir))
+        .toThrow(EphemeralClaudeCleanupPendingError)
+    } finally {
+      firstSync.mockRestore()
+    }
+    expect(failed).toBe(true)
+    expect(existsSync(evidencePath)).toBe(true)
+    expect(existsSync(requestDir)).toBe(true)
+
+    let fileSyncs = 0
+    let directorySyncs = 0
+    const retrySync = spyOn(fs, 'fsyncSync').mockImplementation(descriptor => {
+      const metadata = fstatSync(descriptor)
+      if (metadata.isFile()) fileSyncs += 1
+      if (metadata.isDirectory()) directorySyncs += 1
+      original(descriptor)
+    })
+    try {
+      persistEphemeralClaudeDeliveryEvidence(state, requestDir)
+    } finally {
+      retrySync.mockRestore()
+    }
+    expect(fileSyncs).toBeGreaterThanOrEqual(1)
+    expect(directorySyncs).toBeGreaterThanOrEqual(1)
+    expect(parseEphemeralClaudeDeliveryEvidence(
+      readFileSync(evidencePath, 'utf8'), 'job-file-sync-retry', 'a'.repeat(32),
+    ).status).toBe('delivery-possible')
+  })
+
+  test('初回parent fsync失敗後のretryは既存latchをdurableにする', () => {
+    const state = fixtureState()
+    const projectRoot = dirname(state)
+    const requestDir = request(state, { jobId: 'job-parent-sync-retry' })
+    privateFile(join(requestDir, 'ephemeral-session-intent.json'), `${JSON.stringify(
+      intentReceipt(projectRoot),
+    )}\n`)
+    privateFile(join(requestDir, 'ephemeral-send-receipt.json'), `${JSON.stringify({
+      version: 2,
+      nonce: lifecycleNonce,
+      target: target.target,
+      marker: `REQUEST_MARKER=${'E'.repeat(32)}`,
+      status: 'delivery-possible',
+    })}\n`)
+    const original = fs.fsyncSync
+    let fileWasSynchronized = false
+    let failed = false
+    const firstSync = spyOn(fs, 'fsyncSync').mockImplementation(descriptor => {
+      const metadata = fstatSync(descriptor)
+      if (metadata.isFile()) fileWasSynchronized = true
+      if (fileWasSynchronized && metadata.isDirectory() && !failed) {
+        failed = true
+        throw new Error('injected parent fsync failure')
+      }
+      original(descriptor)
+    })
+    try {
+      expect(() => persistEphemeralClaudeDeliveryEvidence(state, requestDir))
+        .toThrow(EphemeralClaudeCleanupPendingError)
+    } finally {
+      firstSync.mockRestore()
+    }
+    expect(failed).toBe(true)
+    expect(existsSync(requestDir)).toBe(true)
+    expect(() => persistEphemeralClaudeDeliveryEvidence(state, requestDir)).not.toThrow()
+  })
+
+  test('既存valid latchでも非private attempt rootは保持してfail closedにする', () => {
+    const state = fixtureState()
+    const projectRoot = dirname(state)
+    const first = request(state, { jobId: 'job-unsafe-attempt-root' })
+    privateFile(join(first, 'ephemeral-session-intent.json'), `${JSON.stringify(
+      intentReceipt(projectRoot),
+    )}\n`)
+    privateFile(join(first, 'ephemeral-send-receipt.json'), `${JSON.stringify({
+      version: 2,
+      nonce: lifecycleNonce,
+      target: target.target,
+      marker: `REQUEST_MARKER=${'F'.repeat(32)}`,
+      status: 'delivery-possible',
+    })}\n`)
+    persistEphemeralClaudeDeliveryEvidence(state, first)
+    const evidencePath = join(
+      state, 'advisor-journal', 'job-unsafe-attempt-root', 'a'.repeat(32),
+      EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
+    )
+    const before = lstatSync(evidencePath)
+    chmodSync(dirname(evidencePath), 0o755)
+
+    const retry = request(state, { jobId: 'job-unsafe-attempt-root', phase: 'design' })
+    privateFile(join(retry, 'ephemeral-session-intent.json'), `${JSON.stringify(
+      intentReceipt(projectRoot),
+    )}\n`)
+    privateFile(join(retry, 'ephemeral-send-receipt.json'), `${JSON.stringify({
+      version: 2,
+      nonce: lifecycleNonce,
+      target: target.target,
+      marker: `REQUEST_MARKER=${'0'.repeat(32)}`,
+      status: 'delivery-possible',
+    })}\n`)
+    expect(() => persistEphemeralClaudeDeliveryEvidence(state, retry))
+      .toThrow(EphemeralClaudeCleanupPendingError)
+    expect(lstatSync(evidencePath).ino).toBe(before.ino)
+    expect(existsSync(retry)).toBe(true)
+    chmodSync(dirname(evidencePath), 0o700)
+  })
+
+  test('既存のinvalid delivery latchは上書き修復せずrequestを保持する', () => {
+    const state = fixtureState()
+    const projectRoot = dirname(state)
+    const requestDir = request(state, { jobId: 'job-conflict' })
+    privateFile(join(requestDir, 'ephemeral-session-intent.json'), `${JSON.stringify(
+      intentReceipt(projectRoot),
+    )}\n`)
+    privateFile(join(requestDir, 'ephemeral-send-receipt.json'), `${JSON.stringify({
+      version: 2,
+      nonce: lifecycleNonce,
+      target: target.target,
+      marker: `REQUEST_MARKER=${'C'.repeat(32)}`,
+      status: 'delivery-possible',
+    })}\n`)
+    const evidencePath = join(
+      state, 'advisor-journal', 'job-conflict', 'a'.repeat(32),
+      EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
+    )
+    mkdirSync(dirname(evidencePath), { recursive: true, mode: 0o700 })
+    privateFile(evidencePath, 'invalid')
+    const before = lstatSync(evidencePath)
+    expect(() => persistEphemeralClaudeDeliveryEvidence(state, requestDir))
+      .toThrow(EphemeralClaudeCleanupPendingError)
+    expect(readFileSync(evidencePath, 'utf8')).toBe('invalid')
+    expect(lstatSync(evidencePath).ino).toBe(before.ino)
+    expect(existsSync(requestDir)).toBe(true)
+  })
+
+  test('delivery evidence parserはexact canonical v1 bindingだけを受理する', () => {
+    const jobId = 'job-123'
+    const attemptNonce = 'a'.repeat(32)
+    const valid = {
+      version: 1,
+      status: 'delivery-possible',
+      jobId,
+      attemptNonce,
+      receiptDigest: 'b'.repeat(64),
+    } as const
+    const canonical = `${JSON.stringify(valid)}\n`
+    expect(parseEphemeralClaudeDeliveryEvidence(canonical, jobId, attemptNonce)).toEqual(valid)
+
+    const invalid = [
+      JSON.stringify(valid),
+      `${JSON.stringify({ ...valid, extra: true })}\n`,
+      `${JSON.stringify({ ...valid, version: '1' })}\n`,
+      `${JSON.stringify({ ...valid, status: 'delivered' })}\n`,
+      `${JSON.stringify({ ...valid, jobId: 'other-job' })}\n`,
+      `${JSON.stringify({ ...valid, attemptNonce: 'c'.repeat(32) })}\n`,
+      `${JSON.stringify({ ...valid, receiptDigest: 'B'.repeat(64) })}\n`,
+      `${JSON.stringify(valid, null, 2)}\n`,
+      `{"version":2,"version":1,"status":"delivery-possible","jobId":"${jobId}",`
+        + `"attemptNonce":"${attemptNonce}","receiptDigest":"${'b'.repeat(64)}"}\n`,
+      'x'.repeat(4 * 1024 + 1),
+    ]
+    for (const raw of invalid) {
+      expect(() => parseEphemeralClaudeDeliveryEvidence(raw, jobId, attemptNonce)).toThrow()
+    }
+  })
+
+  test('resume guardはjournalまたは未回収ephemeral stateがあれば保守的に停止する', () => {
+    const empty = fixtureState()
+    expect(advisorAttemptMayHaveBeenDeliveredForResume(
+      empty, 'job-123', 'a'.repeat(32),
+    )).toBe(false)
+
+    const withEphemeral = fixtureState()
+    request(withEphemeral)
+    expect(advisorAttemptMayHaveBeenDeliveredForResume(
+      withEphemeral, 'job-123', 'a'.repeat(32),
+    )).toBe(true)
+
+    const withJournal = fixtureState()
+    const attemptRoot = join(
+      withJournal, 'advisor-journal', 'job-123', 'a'.repeat(32),
+    )
+    mkdirSync(attemptRoot, { recursive: true, mode: 0o700 })
+    privateFile(join(attemptRoot, EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE), 'invalid')
+    expect(advisorAttemptMayHaveBeenDeliveredForResume(
+      withJournal, 'job-123', 'a'.repeat(32),
+    )).toBe(true)
   })
 
   test('verified requestはatomic tombstone経由で消し、unexpected/symlink/hardlinkを保持する', () => {

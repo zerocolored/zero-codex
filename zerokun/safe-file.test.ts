@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import * as fs from 'fs'
 import {
-  chmodSync, closeSync, constants, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync,
+  chmodSync, closeSync, constants, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync,
   readFileSync, realpathSync, readdirSync, rmSync, statSync,
   symlinkSync, writeFileSync,
 } from 'fs'
@@ -10,6 +11,7 @@ import {
   assertDescriptorStillNamesPath,
   atomicWritePrivateFile,
   openSafeLog,
+  readOptionalBoundedOwnerOnlyRegularFile,
   readOptionalOwnedRegularFile,
   readOptionalOwnerOnlyRegularFile,
   readOptionalPrivateFile,
@@ -41,6 +43,42 @@ describe('managed private files', () => {
     expect(() => readOptionalOwnerOnlyRegularFile(publicConfig)).toThrow('not owner-only')
     chmodSync(publicConfig, 0o600)
     expect(readOptionalOwnerOnlyRegularFile(publicConfig)).toBe('export SAFE=1\n')
+  })
+
+  test('bounded owner-only readerは内容を読む前にsize上限を強制する', () => {
+    const dir = fixture()
+    const receipt = join(dir, 'receipt.json')
+    writeFileSync(receipt, '12345', { mode: 0o600 })
+    expect(readOptionalBoundedOwnerOnlyRegularFile(receipt, 5)).toBe('12345')
+    expect(() => readOptionalBoundedOwnerOnlyRegularFile(receipt, 4))
+      .toThrow('exceeds size bound')
+    expect(() => readOptionalBoundedOwnerOnlyRegularFile(receipt, -1))
+      .toThrow('invalid managed file size bound')
+  })
+
+  test('bounded owner-only readerはFIFOをblockせず拒否する', () => {
+    const fifo = join(fixture(), 'receipt.pipe')
+    const created = Bun.spawnSync(['/usr/bin/mkfifo', fifo])
+    expect(created.exitCode).toBe(0)
+    expect(() => readOptionalBoundedOwnerOnlyRegularFile(fifo, 4_096))
+      .toThrow('unsafe managed file')
+  })
+
+  test('managed directory作成はretry時も各direntの親を同期する', () => {
+    const root = fixture()
+    const original = fs.fsyncSync
+    const synchronizedDirectoryDescriptors: number[] = []
+    const sync = spyOn(fs, 'fsyncSync').mockImplementation(descriptor => {
+      if (fstatSync(descriptor).isDirectory()) synchronizedDirectoryDescriptors.push(descriptor)
+      original(descriptor)
+    })
+    try {
+      ensureManagedDirectory(root, join(root, 'advisor-journal', 'job-123'))
+      ensureManagedDirectory(root, join(root, 'advisor-journal', 'job-123'))
+    } finally {
+      sync.mockRestore()
+    }
+    expect(synchronizedDirectoryDescriptors).toHaveLength(4)
   })
 
   test('state rootはgroup/world accessを拒否し、owner確認後のprepareだけが0700へ直す', () => {

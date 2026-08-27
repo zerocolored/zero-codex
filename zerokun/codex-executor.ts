@@ -40,7 +40,18 @@ import {
   signalProcessIfLive,
   type ProcessIdentity,
 } from './process-generation.ts'
-import { atomicWritePrivateFile, openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
+import {
+  atomicWritePrivateFile,
+  openSafeLog,
+  readOptionalBoundedOwnerOnlyRegularFile,
+  readOptionalPrivateFile,
+} from './safe-file.ts'
+import {
+  advisorAttemptMayHaveBeenDeliveredForResume,
+  EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
+  MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES,
+  parseEphemeralClaudeDeliveryEvidence,
+} from './ephemeral-claude-session.ts'
 import {
   encodeOfficialCodexSnapshot,
   resolveCodexExecutable,
@@ -1321,6 +1332,7 @@ function parseCompletedAdvisorJournal(
 function collectNativeAdvisorJournalEvidence(options: {
   stateDir: string
   journalRoot: string
+  jobId: string
   contextDigest: string
   attemptNonce: string
 }): NativeAdvisorRoundEvidence[] {
@@ -1330,6 +1342,23 @@ function collectNativeAdvisorJournalEvidence(options: {
   for (const revisionEntry of revisionEntries) {
     if (revisionEntry.name === 'active-round.lock') {
       throw new Error('advisor journal still has an active round claim')
+    }
+    if (revisionEntry.name === EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE) {
+      if (!revisionEntry.isFile() || revisionEntry.isSymbolicLink()) {
+        throw new Error('advisor journal contains unsafe ephemeral delivery evidence')
+      }
+      try {
+        const raw = readOptionalBoundedOwnerOnlyRegularFile(
+          join(options.journalRoot, EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE),
+          MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES,
+        )
+        if (raw === null) throw new Error('evidence disappeared while being collected')
+        parseEphemeralClaudeDeliveryEvidence(raw, options.jobId, options.attemptNonce)
+      } catch {
+        throw new Error('advisor journal contains invalid ephemeral delivery evidence')
+      }
+      // Delivery possibility is a retry-safety latch, never an advisor round.
+      continue
     }
     const revisionMatch = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/.exec(revisionEntry.name)
     if (!revisionMatch || !revisionEntry.isDirectory() || revisionEntry.isSymbolicLink()) {
@@ -1528,6 +1557,7 @@ export function assertRequiredAdvisorPreparationRounds(
   const allEvidence = collectNativeAdvisorJournalEvidence({
     stateDir,
     journalRoot,
+    jobId: job.id.replace(/[^A-Za-z0-9._-]/g, '_'),
     contextDigest: expectedContextDigest,
     attemptNonce,
   })
@@ -1625,6 +1655,7 @@ export function assertRequiredAdvisorRounds(
     return collectNativeAdvisorJournalEvidence({
       stateDir,
       journalRoot,
+      jobId: job.id.replace(/[^A-Za-z0-9._-]/g, '_'),
       contextDigest: expectedContextDigest,
       attemptNonce,
     })
@@ -1681,6 +1712,7 @@ export function assertRequiredAdvisorRounds(
   return collectNativeAdvisorJournalEvidence({
     stateDir,
     journalRoot,
+    jobId: job.id.replace(/[^A-Za-z0-9._-]/g, '_'),
     contextDigest: expectedContextDigest,
     attemptNonce,
   })
@@ -5292,18 +5324,11 @@ export async function executeCodexJob(
     const missingSession = /(?:no rollout found for (?:thread|session|conversation)(?: id)?|(?:thread|session|conversation)[^\n]*(?:not found|missing|does not exist|unknown)|(?:not found|missing|does not exist|unknown)[^\n]*(?:thread|session|conversation))/i
       .test(`${execution.stderr}\n${structuredFailures}`)
     if (resumed && !resumeFallbackAttempted && missingSession) {
-      const attemptJournalRoot = join(
+      const advisorMayHaveBeenDelivered = advisorAttemptMayHaveBeenDeliveredForResume(
         managedStateDir,
-        'advisor-journal',
-        job.id.replace(/[^A-Za-z0-9._-]/g, '_'),
+        job.id,
         execution.advisorAttemptNonce,
       )
-      const advisorMayHaveBeenDelivered = localAdvisorAccess && existsSync(attemptJournalRoot)
-        && readdirSync(attemptJournalRoot).filter(name => (
-          /^revision-[1-9][0-9]*-[0-9a-f]{16}$/.test(name)
-        )).some(name => readdirSync(join(attemptJournalRoot, name)).some(file => (
-          /^(?:investigation|design|review)-[123]\.json$/.test(file)
-        )))
       if (advisorMayHaveBeenDelivered) {
         throw new Error(
           'Codex resume failed after an advisor round may have been delivered; automatic fallback is blocked',

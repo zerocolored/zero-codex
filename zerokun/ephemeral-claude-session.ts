@@ -4,15 +4,18 @@ import {
   closeSync,
   constants,
   existsSync,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
+  readSync,
   readdirSync,
   renameSync,
   rmdirSync,
   unlinkSync,
+  writeSync,
 } from 'fs'
 import { homedir } from 'os'
 import { dirname, isAbsolute, join, relative, sep } from 'path'
@@ -28,11 +31,17 @@ import {
   requireManagedDirectory,
   requireManagedStateRoot,
 } from './managed-path.ts'
-import { atomicWritePrivateFile, readOptionalOwnerOnlyRegularFile } from './safe-file.ts'
+import {
+  assertDescriptorStillNamesPath,
+  readOptionalBoundedOwnerOnlyRegularFile,
+  readOptionalOwnerOnlyRegularFile,
+} from './safe-file.ts'
 
 export const EPHEMERAL_CLAUDE_STATE_ROOT = 'advisor-ephemeral' as const
 export const EPHEMERAL_CLAUDE_TRASH_ROOT = 'advisor-ephemeral-closed' as const
 export const EPHEMERAL_CLAUDE_CLOSED_RECEIPT = 'ephemeral-session-closed.json' as const
+export const EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE = 'ephemeral-delivery.json' as const
+export const MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES = 4 * 1024
 const EPHEMERAL_CLAUDE_INTENT = 'ephemeral-session-intent.json'
 const EPHEMERAL_CLAUDE_WORKSPACE_RECEIPT = 'ephemeral-workspace-receipt.json'
 const EPHEMERAL_CLAUDE_ATOMIC_RECORDS = [
@@ -71,6 +80,192 @@ const WORKSPACE_ID = /^w[0-9A-Za-z]+$/
 const PANE_ID = /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/
 const TAB_ID = /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/
 const TERMINAL_ID = /^term_[0-9a-f]+$/
+
+export type EphemeralClaudeDeliveryEvidence = {
+  version: 1
+  status: 'delivery-possible'
+  jobId: string
+  attemptNonce: string
+  receiptDigest: string
+}
+
+function encodeEphemeralClaudeDeliveryEvidence(
+  evidence: EphemeralClaudeDeliveryEvidence,
+): string {
+  return `${JSON.stringify({
+    version: evidence.version,
+    status: evidence.status,
+    jobId: evidence.jobId,
+    attemptNonce: evidence.attemptNonce,
+    receiptDigest: evidence.receiptDigest,
+  })}\n`
+}
+
+function createEphemeralClaudeDeliveryEvidenceExclusive(
+  attemptRoot: string,
+  evidencePath: string,
+  evidence: string,
+): boolean {
+  let descriptor: number
+  try {
+    descriptor = openSync(
+      evidencePath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    )
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false
+    throw error
+  }
+  let failure: unknown
+  try {
+    fchmodSync(descriptor, 0o600)
+    const metadata = fstatSync(descriptor)
+    const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
+    if (!metadata.isFile() || metadata.nlink !== 1 || !ownerMatches
+      || (metadata.mode & 0o077) !== 0) {
+      throw new Error('ephemeral Claude delivery evidence file is unsafe')
+    }
+    const content = Buffer.from(evidence, 'utf8')
+    let offset = 0
+    while (offset < content.length) {
+      const count = writeSync(descriptor, content, offset, content.length - offset)
+      if (count <= 0) throw new Error('ephemeral Claude delivery evidence write stalled')
+      offset += count
+    }
+    fsyncSync(descriptor)
+  } catch (error) {
+    failure = error
+  } finally {
+    closeSync(descriptor)
+  }
+  try {
+    // Persist either the complete latch or a fail-closed partial sentinel. The
+    // latter is never repaired automatically after an ambiguous delivery.
+    syncOwnedDirectory(attemptRoot)
+  } catch (error) {
+    failure ??= error
+  }
+  if (failure) throw failure
+  return true
+}
+
+function synchronizeExistingEphemeralClaudeDeliveryEvidence(
+  attemptRoot: string,
+  evidencePath: string,
+  expectedJobId: string,
+  expectedAttemptNonce: string,
+): void {
+  const descriptor = openSync(
+    evidencePath,
+    constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  )
+  try {
+    const before = fstatSync(descriptor)
+    const ownerMatches = typeof process.getuid !== 'function' || before.uid === process.getuid()
+    if (!before.isFile() || before.nlink !== 1 || !ownerMatches
+      || (before.mode & 0o777) !== 0o600
+      || before.size > MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES) {
+      throw new Error('existing ephemeral Claude delivery evidence is unsafe')
+    }
+    const content = Buffer.alloc(MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES + 1)
+    let offset = 0
+    while (offset < content.length) {
+      const count = readSync(descriptor, content, offset, content.length - offset, null)
+      if (count === 0) break
+      offset += count
+    }
+    if (offset > MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES) {
+      throw new Error('existing ephemeral Claude delivery evidence is too large')
+    }
+    parseEphemeralClaudeDeliveryEvidence(
+      content.subarray(0, offset).toString('utf8'),
+      expectedJobId,
+      expectedAttemptNonce,
+    )
+    fsyncSync(descriptor)
+    const after = fstatSync(descriptor)
+    for (const key of [
+      'dev', 'ino', 'mode', 'uid', 'gid', 'nlink', 'size', 'mtimeMs', 'ctimeMs',
+    ] as const) {
+      if (before[key] !== after[key]) {
+        throw new Error('existing ephemeral Claude delivery evidence changed while syncing')
+      }
+    }
+    assertDescriptorStillNamesPath(descriptor, evidencePath)
+  } finally {
+    closeSync(descriptor)
+  }
+  syncOwnedDirectory(attemptRoot)
+}
+
+export function parseEphemeralClaudeDeliveryEvidence(
+  raw: string,
+  expectedJobId: string,
+  expectedAttemptNonce: string,
+): EphemeralClaudeDeliveryEvidence {
+  if (Buffer.byteLength(raw) > MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES) {
+    throw new Error('ephemeral Claude delivery evidence is too large')
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch {
+    throw new Error('ephemeral Claude delivery evidence is invalid JSON')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('ephemeral Claude delivery evidence is invalid')
+  }
+  const record = parsed as Record<string, unknown>
+  if (Object.keys(record).sort().join(',')
+      !== 'attemptNonce,jobId,receiptDigest,status,version'
+    || record.version !== 1
+    || record.status !== 'delivery-possible'
+    || record.jobId !== expectedJobId
+    || record.attemptNonce !== expectedAttemptNonce
+    || typeof record.receiptDigest !== 'string'
+    || !/^[0-9a-f]{64}$/.test(record.receiptDigest)) {
+    throw new Error('ephemeral Claude delivery evidence binding is invalid')
+  }
+  const evidence: EphemeralClaudeDeliveryEvidence = {
+    version: 1,
+    status: 'delivery-possible',
+    jobId: expectedJobId,
+    attemptNonce: expectedAttemptNonce,
+    receiptDigest: record.receiptDigest,
+  }
+  if (raw !== encodeEphemeralClaudeDeliveryEvidence(evidence)) {
+    throw new Error('ephemeral Claude delivery evidence is not canonical')
+  }
+  return evidence
+}
+
+/**
+ * Only a provably absent or empty attempt may restart with a fresh Codex session.
+ * Any journal or still-owned ephemeral lifecycle state means Claude delivery may
+ * already have crossed the process boundary, even before the sidecar was copied.
+ */
+export function advisorAttemptMayHaveBeenDeliveredForResume(
+  stateDirInput: string,
+  jobId: string,
+  attemptNonce: string,
+): boolean {
+  try {
+    const stateDir = requireManagedStateRoot(stateDirInput)
+    if (!ATTEMPT_COMPONENT.test(attemptNonce)) return true
+    const jobComponent = jobId.replace(/[^A-Za-z0-9._-]/g, '_')
+    for (const rootName of ['advisor-journal', EPHEMERAL_CLAUDE_STATE_ROOT]) {
+      const attemptRoot = join(stateDir, rootName, jobComponent, attemptNonce)
+      try {
+        const root = requireManagedDirectory(stateDir, attemptRoot)
+        if (readdirSync(root).length > 0) return true
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return true
+      }
+    }
+    return false
+  } catch {
+    return true
+  }
+}
 
 export type EphemeralClaudeTarget = {
   target: string
@@ -432,19 +627,55 @@ export function persistEphemeralClaudeDeliveryEvidence(
   }
   const jobRoot = ensureManagedDirectory(stateDir, join(stateDir, 'advisor-journal', components[0]!))
   const attemptRoot = ensureManagedDirectory(stateDir, join(jobRoot, components[1]!))
-  const evidencePath = join(attemptRoot, 'ephemeral-delivery.json')
-  const evidence = `${JSON.stringify({
+  const evidencePath = join(attemptRoot, EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE)
+  const evidence = encodeEphemeralClaudeDeliveryEvidence({
     version: 1,
     status: 'delivery-possible',
-    jobId: components[0],
-    attemptNonce: components[1],
+    jobId: components[0]!,
+    attemptNonce: components[1]!,
     receiptDigest: createHash('sha256').update(sendReceipt).digest('hex'),
-  })}\n`
-  const existing = readOptionalOwnerOnlyRegularFile(evidencePath)
-  if (existing !== null && existing !== evidence) {
-    throw new EphemeralClaudeCleanupPendingError('ephemeral Claude delivery evidence conflicts')
+  })
+  let created: boolean
+  try {
+    created = createEphemeralClaudeDeliveryEvidenceExclusive(
+      attemptRoot,
+      evidencePath,
+      evidence,
+    )
+  } catch (error) {
+    throw new EphemeralClaudeCleanupPendingError(
+      `ephemeral Claude delivery evidence could not be persisted: ${error}`,
+    )
   }
-  if (existing === null) atomicWritePrivateFile(evidencePath, evidence)
+  if (!created) {
+    try {
+      synchronizeExistingEphemeralClaudeDeliveryEvidence(
+        attemptRoot,
+        evidencePath,
+        components[0]!,
+        components[1]!,
+      )
+    } catch (error) {
+      throw new EphemeralClaudeCleanupPendingError(
+        `ephemeral Claude delivery evidence conflicts: ${error}`,
+      )
+    }
+    // This is an attempt-level may-have-delivered latch. Later fresh rounds
+    // intentionally keep the first valid receipt digest instead of conflicting.
+    return
+  }
+  try {
+    const persisted = readOptionalBoundedOwnerOnlyRegularFile(
+      evidencePath,
+      MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES,
+    )
+    if (persisted === null) throw new Error('evidence disappeared after persistence')
+    parseEphemeralClaudeDeliveryEvidence(persisted, components[0]!, components[1]!)
+  } catch (error) {
+    throw new EphemeralClaudeCleanupPendingError(
+      `ephemeral Claude delivery evidence could not be verified: ${error}`,
+    )
+  }
 }
 
 function readEphemeralClaudeIntent(requestDir: string): EphemeralClaudeIntent {

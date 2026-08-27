@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto'
 import {
   closeSync, constants, fchmodSync, fstatSync, fsyncSync, ftruncateSync, openSync, readFileSync,
-  lstatSync, renameSync, unlinkSync, writeFileSync,
+  lstatSync, readSync, renameSync, unlinkSync, writeFileSync,
 } from 'fs'
 import { dirname } from 'path'
 
@@ -41,7 +41,10 @@ export function assertDescriptorStillNamesPath(descriptor: number, path: string)
 export function readOptionalPrivateFile(path: string): string | null {
   let descriptor: number
   try {
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    descriptor = openSync(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    )
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw error
@@ -49,26 +52,55 @@ export function readOptionalPrivateFile(path: string): string | null {
   try {
     requireSafeDescriptor(descriptor, path)
     fchmodSync(descriptor, 0o600)
-    return readFileSync(descriptor, 'utf8')
+    const content = readFileSync(descriptor, 'utf8')
+    assertDescriptorStillNamesPath(descriptor, path)
+    return content
   } finally {
     closeSync(descriptor)
   }
 }
 
-function readOptionalOwnedFile(path: string, requireOwnerOnly: boolean): string | null {
+function readOptionalOwnedFile(
+  path: string,
+  requireOwnerOnly: boolean,
+  maxBytes?: number,
+): string | null {
+  if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
+    throw new Error(`invalid managed file size bound: ${path}`)
+  }
   let descriptor: number
   try {
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    descriptor = openSync(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    )
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw error
   }
   try {
     requireSafeDescriptor(descriptor, path)
-    if (requireOwnerOnly && (fstatSync(descriptor).mode & 0o077) !== 0) {
+    const metadata = fstatSync(descriptor)
+    if (requireOwnerOnly && (metadata.mode & 0o077) !== 0) {
       throw new Error(`managed file is not owner-only: ${path}`)
     }
-    return readFileSync(descriptor, 'utf8')
+    if (maxBytes === undefined) {
+      const content = readFileSync(descriptor, 'utf8')
+      assertDescriptorStillNamesPath(descriptor, path)
+      return content
+    }
+    if (metadata.size > maxBytes) throw new Error(`managed file exceeds size bound: ${path}`)
+    const content = Buffer.alloc(maxBytes + 1)
+    let offset = 0
+    while (offset < content.length) {
+      const count = readSync(descriptor, content, offset, content.length - offset, null)
+      if (count === 0) break
+      offset += count
+    }
+    if (offset > maxBytes) throw new Error(`managed file exceeds size bound: ${path}`)
+    const result = content.subarray(0, offset).toString('utf8')
+    assertDescriptorStillNamesPath(descriptor, path)
+    return result
   } finally {
     closeSync(descriptor)
   }
@@ -82,6 +114,14 @@ export function readOptionalOwnedRegularFile(path: string): string | null {
 /** Read an owner-only, single-link regular file without changing its mode. */
 export function readOptionalOwnerOnlyRegularFile(path: string): string | null {
   return readOptionalOwnedFile(path, true)
+}
+
+/** Read a bounded owner-only, single-link regular file without changing its mode. */
+export function readOptionalBoundedOwnerOnlyRegularFile(
+  path: string,
+  maxBytes: number,
+): string | null {
+  return readOptionalOwnedFile(path, true, maxBytes)
 }
 
 export function openSafeLog(path: string, mode: 'truncate' | 'append'): number {
