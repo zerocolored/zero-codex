@@ -194,33 +194,48 @@ function childSourceParent(thread: Record<string, unknown>): string | null {
 }
 
 function completedFinalResponse(thread: Record<string, unknown>, label: string): string {
-  if (!Array.isArray(thread.turns) || thread.turns.length !== 1) {
-    throw new Error(`${label} must contain exactly one fresh turn`)
+  if (!Array.isArray(thread.turns) || thread.turns.length < 1
+    || thread.turns.length > 2) {
+    throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
   }
-  const turn = record(thread.turns[0], `${label}.turn`)
-  if (turn.status !== 'completed' || turn.itemsView !== 'full'
-    || !Array.isArray(turn.items)) {
-    throw new Error(`${label} turn is not completed`)
+  let finalResponse: string | null = null
+  for (const [turnIndex, rawTurn] of thread.turns.entries()) {
+    const turn = record(rawTurn, `${label}.turn ${turnIndex}`)
+    if ((turn.status !== 'completed' && turn.status !== 'interrupted')
+      || turn.itemsView !== 'full' || !Array.isArray(turn.items)) {
+      throw new Error(`${label} turn is not completed or interrupted with full evidence`)
+    }
+    const messages = turn.items.flatMap(item => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+      const entry = item as Record<string, unknown>
+      return isFinalAppServerAgentMessage(entry) ? [entry.text] : []
+    })
+    for (const rawItem of turn.items) {
+      if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) continue
+      const item = rawItem as Record<string, unknown>
+      if (item.type !== 'subAgentActivity') continue
+      if (typeof item.kind !== 'string' || !SUBAGENT_ACTIVITY_KINDS.has(item.kind)
+        || typeof item.agentThreadId !== 'string' || !THREAD_ID.test(item.agentThreadId)) {
+        throw new Error(`${label} contains invalid subagent activity`)
+      }
+      throw new Error(`${label} delegated to another subagent`)
+    }
+    if (turn.status === 'interrupted') {
+      if (turnIndex !== 0 || messages.length !== 0 || finalResponse !== null) {
+        throw new Error(`${label} interrupted precursor contains a final response`)
+      }
+      continue
+    }
+    if (turnIndex !== thread.turns.length - 1 || messages.length !== 1
+      || !messages[0] || finalResponse !== null) {
+      throw new Error(`${label} does not contain one final response`)
+    }
+    finalResponse = messages[0]
   }
-  const messages = turn.items.flatMap(item => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
-    const entry = item as Record<string, unknown>
-    return isFinalAppServerAgentMessage(entry) ? [entry.text] : []
-  })
-  if (messages.length !== 1 || !messages[0]) {
+  if (finalResponse === null) {
     throw new Error(`${label} does not contain one final response`)
   }
-  for (const rawItem of turn.items) {
-    if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) continue
-    const item = rawItem as Record<string, unknown>
-    if (item.type !== 'subAgentActivity') continue
-    if (typeof item.kind !== 'string' || !SUBAGENT_ACTIVITY_KINDS.has(item.kind)
-      || typeof item.agentThreadId !== 'string' || !THREAD_ID.test(item.agentThreadId)) {
-      throw new Error(`${label} contains invalid subagent activity`)
-    }
-    throw new Error(`${label} delegated to another subagent`)
-  }
-  return messages[0]
+  return finalResponse
 }
 
 function listedDirectChildren(

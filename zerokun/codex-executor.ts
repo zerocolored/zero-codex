@@ -2012,7 +2012,7 @@ export async function assertNativeAdvisorHistory(options: {
   }
   const readThreadEvidence = async (
     threadId: string,
-    selection: { requireOneTurn?: boolean; turnIds?: string[] },
+    selection: { completeChildHistory?: boolean; turnIds?: string[] },
   ): Promise<ThreadEvidenceRead> => {
     const metadataResponse = await read('thread/read', { threadId, includeTurns: false })
     const metadata = nativeHistoryRecord(
@@ -2093,17 +2093,14 @@ export async function assertNativeAdvisorHistory(options: {
       )
       return readTurns
     }
-    if (selection.requireOneTurn && listedTurns.length > 1) {
-      throw new Error(`native advisor thread ${threadId} must contain exactly one turn`)
-    }
     let requestedTurnIds = selection.turnIds
     if (!requestedTurnIds) {
       if (listedTurns.length === 0) {
         const recovered = await fullReadTurns()
-        if (recovered.length !== 1) {
-          throw new Error(`native advisor thread ${threadId} must contain exactly one turn`)
+        if (recovered.length < 1) {
+          throw new Error(`native advisor thread ${threadId} contains no turns`)
         }
-        requestedTurnIds = [String(recovered[0]!.id)]
+        requestedTurnIds = recovered.map(turn => String(turn.id))
       } else requestedTurnIds = listedTurns.map(turn => String(turn.id))
     }
     if (requestedTurnIds.length < 1
@@ -2183,9 +2180,14 @@ export async function assertNativeAdvisorHistory(options: {
     let fallbackViewsAgree: ThreadEvidenceRead['fallbackViewsAgree'] = null
     if (itemsListState === 'unsupported') {
       const completeReadTurns = await fullReadTurns()
-      if (selection.requireOneTurn
-        && (listedTurns.length !== 1 || completeReadTurns.length !== 1)) {
-        throw new Error(`native advisor thread ${threadId} fallback must contain one full turn`)
+      if (selection.completeChildHistory) {
+        const readTurnIds = completeReadTurns.map(turn => String(turn.id))
+        if (listedTurns.length < 1 || readTurnIds.length !== listedTurnIds.size
+          || readTurnIds.some(id => !listedTurnIds.has(id))) {
+          throw new Error(
+            `native advisor thread ${threadId} fallback child turn sets disagree`,
+          )
+        }
       }
       const readById = new Map(completeReadTurns.map(turn => [String(turn.id), turn]))
       const selectedListedTurns: Array<Record<string, unknown>> = []
@@ -2197,8 +2199,20 @@ export async function assertNativeAdvisorHistory(options: {
         if (!listed || !fullyRead) {
           throw new Error(`native advisor thread ${threadId} fallback omitted turn ${turnId}`)
         }
-        completedFullTurn(listed, `native advisor thread ${threadId} listed turn ${turnId}`)
-        completedFullTurn(fullyRead, `native advisor thread ${threadId} read turn ${turnId}`)
+        if (selection.completeChildHistory) {
+          if (!['completed', 'interrupted'].includes(String(listed.status))
+            || listed.itemsView !== 'full' || !Array.isArray(listed.items)
+            || !['completed', 'interrupted'].includes(String(fullyRead.status))
+            || fullyRead.itemsView !== 'full' || !Array.isArray(fullyRead.items)
+            || listed.status !== fullyRead.status) {
+            throw new Error(
+              `native advisor thread ${threadId} child turn ${turnId} is not terminal and full`,
+            )
+          }
+        } else {
+          completedFullTurn(listed, `native advisor thread ${threadId} listed turn ${turnId}`)
+          completedFullTurn(fullyRead, `native advisor thread ${threadId} read turn ${turnId}`)
+        }
         selectedListedTurns.push(listed)
         selectedReadTurns.push(fullyRead)
         const itemScope = `${threadId}\u0000${turnId}`
@@ -2232,8 +2246,11 @@ export async function assertNativeAdvisorHistory(options: {
         if (!selected) {
           selected = (await fullReadTurns()).find(turn => turn.id === turnId)
         }
-        if (!selected || selected.status !== 'completed') {
-          throw new Error(`native advisor thread ${threadId} omitted completed turn ${turnId}`)
+        if (!selected || (selection.completeChildHistory
+          ? !['completed', 'interrupted'].includes(String(selected.status))
+          : selected.status !== 'completed')) {
+          const expected = selection.completeChildHistory ? 'terminal' : 'completed'
+          throw new Error(`native advisor thread ${threadId} omitted ${expected} turn ${turnId}`)
         }
         const journal = itemJournals.get(turnId)
         if (!journal) {
@@ -2281,7 +2298,7 @@ export async function assertNativeAdvisorHistory(options: {
       const childThreadId = String(child.id)
       if (baseline.has(childThreadId)) continue
       const childEvidence = await readThreadEvidence(childThreadId, {
-        requireOneTurn: true,
+        completeChildHistory: true,
       })
       childResponses.set(childThreadId, childEvidence.response)
       if (childEvidence.fallbackViewDigests) {

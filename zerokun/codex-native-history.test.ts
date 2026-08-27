@@ -393,12 +393,79 @@ describe('native advisor App Server history', () => {
     expect(value.itemsListCalls()).toBe(3)
   })
 
-  test('child turnが全viewで欠落または複数なら拒否する', async () => {
-    for (const mode of ['omit-solution-everywhere', 'duplicate-solution-read'] as const) {
-      const value = fixture(true, null, true, mode)
-      await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
-        'must contain exactly one turn',
+  test('child turnが全viewで欠落またはcompleted finalが複数なら拒否する', async () => {
+    const missing = fixture(true, null, true, 'omit-solution-everywhere')
+    await expect(assertNativeAdvisorHistory(missing.options)).rejects.toThrow(
+      'contains no turns',
+    )
+
+    const duplicate = fixture(true, null, true, 'duplicate-solution-read')
+    await expect(assertNativeAdvisorHistory(duplicate.options)).rejects.toThrow(
+      'does not contain one final response',
+    )
+  })
+
+  test('childのinterrupted precursorとcompleted finalを全履歴viewで照合する', async () => {
+    for (const itemsListSupported of [true, false]) {
+      const value = fixture(
+        true,
+        null,
+        itemsListSupported,
+        null,
+        'logical-labels-with-uuid-threads',
       )
+      const original = value.options.readForTesting!
+      const childIds = [
+        '01a04329-fa9b-7562-bbfe-1258a97e9071',
+        '01a0432a-1683-7142-b2a0-22726fdfa8b7',
+      ]
+      const precursorFor = (threadId: string) => ({
+        id: `${threadId}-precursor`,
+        status: 'interrupted',
+        itemsView: 'full',
+        error: null,
+        items: [
+          { type: 'userMessage', id: `${threadId}-user`, text: 'initial advisor task' },
+          {
+            type: 'agentMessage', id: `${threadId}-commentary`,
+            phase: 'commentary', text: 'checking evidence',
+          },
+        ],
+      })
+      value.options.readForTesting = async (method, params) => {
+        const threadId = String(params.threadId ?? '')
+        if (method === 'thread/items/list' && childIds.includes(threadId)
+          && params.turnId === `${threadId}-precursor`) {
+          if (!itemsListSupported) {
+            return original(method, params)
+          }
+          const precursor = precursorFor(threadId)
+          return {
+            data: precursor.items.map(item => ({ turnId: precursor.id, item })),
+            nextCursor: null,
+          }
+        }
+        const response = await original(method, params)
+        if (!childIds.includes(threadId)) return response
+        if (method === 'thread/turns/list') {
+          return {
+            ...response,
+            data: [precursorFor(threadId), ...(response.data as unknown[])],
+          }
+        }
+        if (method === 'thread/read' && params.includeTurns === true) {
+          const thread = response.thread as Record<string, unknown>
+          return {
+            ...response,
+            thread: {
+              ...thread,
+              turns: [precursorFor(threadId), ...(thread.turns as unknown[])],
+            },
+          }
+        }
+        return response
+      }
+      await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
     }
   })
 

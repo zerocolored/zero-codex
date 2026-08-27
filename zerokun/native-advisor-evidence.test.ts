@@ -145,6 +145,62 @@ describe('native Codex advisor host evidence', () => {
     expect(resolved[0]!.native.map(entry => entry.agentId)).toEqual([solutionId, riskId])
   })
 
+  test('最終回答のないinterrupted precursor後のcompleted turnを一意採択する', () => {
+    const { options, solutionId } = fixture()
+    const solution = options.childResponses.get(solutionId) as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    solution.thread.turns.unshift({
+      status: 'interrupted',
+      itemsView: 'full',
+      items: [
+        { type: 'userMessage', text: 'initial native advisor request' },
+        { type: 'agentMessage', phase: 'commentary', text: 'checking evidence' },
+      ],
+    })
+    expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
+  })
+
+  test('interrupted precursorのfinal・再委任・複数precursorを拒否する', () => {
+    const interruptedFinal = fixture()
+    const finalChild = interruptedFinal.options.childResponses.get(
+      interruptedFinal.solutionId,
+    ) as { thread: { turns: Array<Record<string, unknown>> } }
+    finalChild.thread.turns.unshift({
+      status: 'interrupted', itemsView: 'full',
+      items: [{ type: 'agentMessage', phase: 'final_answer', text: 'stale final' }],
+    })
+    expect(() => assertNativeAdvisorEvidence(interruptedFinal.options)).toThrow(
+      'interrupted precursor contains a final response',
+    )
+
+    const delegated = fixture()
+    const delegatedChild = delegated.options.childResponses.get(
+      delegated.solutionId,
+    ) as { thread: { turns: Array<Record<string, unknown>> } }
+    delegatedChild.thread.turns.unshift({
+      status: 'interrupted', itemsView: 'full',
+      items: [{
+        type: 'subAgentActivity', kind: 'started', agentThreadId: 'grandchild-thread',
+      }],
+    })
+    expect(() => assertNativeAdvisorEvidence(delegated.options)).toThrow(
+      'delegated to another subagent',
+    )
+
+    const excessive = fixture()
+    const excessiveChild = excessive.options.childResponses.get(
+      excessive.solutionId,
+    ) as { thread: { turns: Array<Record<string, unknown>> } }
+    excessiveChild.thread.turns.unshift(
+      { status: 'interrupted', itemsView: 'full', items: [] },
+      { status: 'interrupted', itemsView: 'full', items: [] },
+    )
+    expect(() => assertNativeAdvisorEvidence(excessive.options)).toThrow(
+      'at most one interrupted precursor',
+    )
+  })
+
   test('物理thread対応が不一致・曖昧・余剰ならfail-closeする', () => {
     const unmatched = fixture()
     unmatched.options.rounds[0]!.native[0]!.agentId = 'investigation_solution'
