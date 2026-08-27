@@ -644,7 +644,9 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('xcode-select --install')
     expect(script).toContain('Homebrew/install/HEAD/install.sh')
     expect(script).toContain('isolated_network_command "$(command -v brew)" install tmux')
-    expect(script).toContain('isolated_network_command "$(command -v brew)" install herdr')
+    expect(script).toContain('https://herdr.dev/install.sh')
+    expect(script).toContain('HERDR_INSTALL_DIR="$HOME/.local/bin"')
+    expect(script).not.toContain('"$(command -v brew)" install herdr')
     expect(script).not.toContain('install --cask codex')
     expect(script).toContain('standalone_codex="$HOME/.local/bin/codex"')
     expect(script).toContain('secure_standalone_codex()')
@@ -692,6 +694,83 @@ describe('macOS bootstrap', () => {
       .toBeLessThan(setup.indexOf('install-fifth-advisor.ts" install'))
     expect(setup.indexOf('install-fifth-advisor.ts" install'))
       .toBeLessThan(setup.indexOf('job-runner.ts" prepare-storage'))
+  })
+
+  test('古いHomebrew Herdrを公式stable installerのstandaloneへ置換する', () => {
+    const source = readFileSync(bootstrap, 'utf8')
+    const versionFunctions = source.slice(
+      source.indexOf('version_at_least()'),
+      source.indexOf('usage()'),
+    )
+    const installFunctions = source.slice(
+      source.indexOf('secure_download()'),
+      source.indexOf('verify_logins()'),
+    )
+    const base = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-herdr-fallback-'))
+    const fakeHome = join(base, 'home')
+    const fakeBin = join(base, 'bin')
+    mkdirSync(fakeHome)
+    mkdirSync(fakeBin)
+    writeFileSync(join(fakeBin, 'herdr'), [
+      '#!/bin/sh',
+      'if [ "${1:-}" = "--version" ]; then echo "herdr 0.7.1"; exit 0; fi',
+      `echo ${JSON.stringify(completeHerdrCapabilities)}`,
+      '',
+    ].join('\n'), { mode: 0o755 })
+    for (const command of ['tmux', 'bun']) {
+      writeFileSync(join(fakeBin, command), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    }
+    writeFileSync(join(fakeBin, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    writeFileSync(join(fakeBin, 'brew'), '#!/bin/sh\nexit 99\n', { mode: 0o755 })
+    const installerSource = join(base, 'herdr-installer.sh')
+    writeFileSync(installerSource, `#!/bin/sh
+set -eu
+/bin/mkdir -p "$HERDR_INSTALL_DIR"
+/usr/bin/printf '%s\\n' '#!/bin/sh' \\
+  'if [ "\${1:-}" = "--version" ]; then echo "herdr 0.8.2"; exit 0; fi' \\
+  'echo ${JSON.stringify(completeHerdrCapabilities)}' \\
+  > "$HERDR_INSTALL_DIR/herdr"
+/bin/chmod 0755 "$HERDR_INSTALL_DIR/herdr"
+`)
+    const fakeCurl = join(fakeBin, 'curl')
+    writeFileSync(fakeCurl, `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then shift; output="$1"; fi
+  shift
+done
+/bin/cp ${JSON.stringify(installerSource)} "$output"
+`, { mode: 0o755 })
+    const harness = join(base, 'harness.sh')
+    writeFileSync(harness, `#!/bin/bash
+set -euo pipefail
+MIN_CODEX_VERSION=0.149.0
+MIN_HERDR_VERSION=0.8.2
+section() { :; }
+ok() { :; }
+warn() { :; }
+fail() { echo "$1" >&2; exit 1; }
+append_profile_block() { :; }
+${versionFunctions}
+${installFunctions.replaceAll('/usr/bin/curl', fakeCurl)}
+secure_standalone_codex() { return 0; }
+grok_build_executable() { printf '%s\\n' "$HOME/.grok/bin/grok"; }
+install_grok_build() { :; }
+install_cli_tools
+command -v herdr
+herdr --version
+`, { mode: 0o700 })
+    try {
+      const result = Bun.spawnSync([harness], {
+        env: { HOME: fakeHome, PATH: `${fakeBin}:/usr/bin:/bin` },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(result.stdout.toString()).toContain(join(fakeHome, '.local/bin/herdr'))
+      expect(result.stdout.toString()).toContain('herdr 0.8.2')
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
   })
 
   test('bootstrap login preflightはAPI key認証を拒否しChatGPT subscriptionだけを受け入れる', () => {

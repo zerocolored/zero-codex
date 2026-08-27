@@ -24,10 +24,20 @@ jobs:
           bun-version: 1.4.0
       - name: Install test runtime
         run: |
-          brew install tmux herdr
+          brew install tmux
           export PATH="$HOME/.local/bin:$PATH"
+          herdr_installer="$(/usr/bin/mktemp "${RUNNER_TEMP}/herdr-install.XXXXXX")"
+          herdr_home="$(/usr/bin/mktemp -d "${RUNNER_TEMP}/herdr-home.XXXXXX")"
           installer="$(/usr/bin/mktemp "${RUNNER_TEMP}/codex-install.XXXXXX")"
-          trap '/bin/rm -f "$installer"' EXIT
+          trap '/bin/rm -f "$herdr_installer" "$installer"; /bin/rm -rf "$herdr_home"' EXIT
+          /usr/bin/env -i PATH=/usr/bin:/bin HOME="$herdr_home" \
+            /usr/bin/curl -q --fail --location --proto '=https' \
+              --proto-redir '=https' --tlsv1.2 --noproxy '*' \
+              --output "$herdr_installer" https://herdr.dev/install.sh
+          /bin/chmod 0700 "$herdr_installer"
+          /usr/bin/env -i PATH=/usr/bin:/bin HOME="$herdr_home" \
+            TMPDIR="$RUNNER_TEMP" HERDR_INSTALL_DIR="$HOME/.local/bin" \
+            /bin/sh "$herdr_installer"
           /usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" \
             /usr/bin/curl -q --fail --location --proto '=https' \
               --proto-redir '=https' --tlsv1.2 --noproxy '*' \
@@ -36,6 +46,7 @@ jobs:
             CODEX_NON_INTERACTIVE=1 \
             /bin/sh "$installer" --release '${{ matrix.codex-version }}'
           "$HOME/.local/bin/codex" --version
+          "$HOME/.local/bin/herdr" --version
           bun --config=/dev/null --no-env-file zerokun/standalone-codex.ts version
           . ./zerokun/codex-version.sh
           zerokun_require_herdr_version

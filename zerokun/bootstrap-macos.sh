@@ -1046,6 +1046,30 @@ install_codex_standalone() {
   append_profile_block '# zerokun bootstrap: Codex CLI' 'export PATH="$HOME/.local/bin:$PATH"'
 }
 
+install_herdr_standalone() {
+  local installer
+  [ -z "${HERDR_BIN_PATH:-}" ] \
+    || fail "明示HERDR_BIN_PATHがHerdr ${MIN_HERDR_VERSION}以上の要件を満たしていません"
+  installer="$(/usr/bin/mktemp /tmp/zerokun-herdr-installer.XXXXXX)" \
+    || fail "Herdr公式installer用一時fileを作成できません"
+  if ! secure_download "$installer" https://herdr.dev/install.sh; then
+    /bin/rm -f "$installer"
+    fail "Herdr公式installerを取得できませんでした"
+  fi
+  /bin/chmod 0700 "$installer"
+  if ! isolated_network_command HERDR_INSTALL_DIR="$HOME/.local/bin" \
+    /bin/sh "$installer"; then
+    /bin/rm -f "$installer"
+    fail "Herdr公式installerの実行に失敗しました"
+  fi
+  /bin/rm -f "$installer"
+  export PATH="$HOME/.local/bin:$PATH"
+  hash -r
+  herdr_compatible \
+    || fail "Herdr ${MIN_HERDR_VERSION}以上と必要なworkspace/tab/pane/agent APIを確認できません"
+  append_profile_block '# zerokun bootstrap: Herdr' 'export PATH="$HOME/.local/bin:$PATH"'
+}
+
 install_grok_build() {
   local installer logical="$HOME/.grok/bin/grok"
   if grok_build_executable >/dev/null; then
@@ -1077,15 +1101,7 @@ install_cli_tools() {
   if ! command -v tmux >/dev/null 2>&1; then
     isolated_network_command "$(command -v brew)" install tmux
   fi
-  if ! command -v herdr >/dev/null 2>&1; then
-    isolated_network_command "$(command -v brew)" install herdr
-  elif ! herdr_compatible; then
-    if "$(command -v brew)" list --versions herdr >/dev/null 2>&1; then
-      isolated_network_command "$(command -v brew)" upgrade herdr
-    else
-      isolated_network_command "$(command -v brew)" install herdr
-    fi
-  fi
+  herdr_compatible || install_herdr_standalone
   hash -r
   herdr_compatible \
     || fail "Herdr ${MIN_HERDR_VERSION}以上と必要なworkspace/tab/pane/agent APIを確認できません"
