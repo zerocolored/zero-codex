@@ -5,6 +5,8 @@ import {
 } from 'fs'
 import { dirname } from 'path'
 
+const ATOMIC_OWNED_READ_ATTEMPTS = 4
+
 function requireSafeDescriptor(descriptor: number, path: string): void {
   const metadata = fstatSync(descriptor)
   const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
@@ -122,6 +124,58 @@ export function readOptionalBoundedOwnerOnlyRegularFile(
   maxBytes: number,
 ): string | null {
   return readOptionalOwnedFile(path, true, maxBytes)
+}
+
+/**
+ * Read a bounded owner-owned file that is published with atomic rename.
+ *
+ * If rename wins after open but before fstat, the opened old inode is a
+ * regular, owner-owned file with nlink=0. That is an expected detached
+ * snapshot, not a hardlink. Close it without consuming the bytes and reopen
+ * the current pathname a bounded number of times. Every other safety failure
+ * remains fail-closed.
+ */
+export function readOptionalBoundedAtomicOwnedFile(
+  path: string,
+  maxBytes: number,
+  label = 'atomic managed file',
+): Buffer | null {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new Error(`invalid ${label} size bound: ${path}`)
+  }
+  for (let attempt = 0; attempt < ATOMIC_OWNED_READ_ATTEMPTS; attempt += 1) {
+    let descriptor: number
+    try {
+      descriptor = openSync(
+        path,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      )
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
+    try {
+      const metadata = fstatSync(descriptor)
+      const ownerMatches = typeof process.getuid !== 'function'
+        || metadata.uid === process.getuid()
+      if (!metadata.isFile() || !ownerMatches || metadata.size > maxBytes) {
+        throw new Error(`unsafe ${label}: ${path}`)
+      }
+      if (metadata.nlink === 0) continue
+      if (metadata.nlink !== 1) throw new Error(`unsafe ${label}: ${path}`)
+      const bytes = Buffer.alloc(metadata.size)
+      let offset = 0
+      while (offset < bytes.length) {
+        const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset)
+        if (count === 0) throw new Error(`${label} changed while reading: ${path}`)
+        offset += count
+      }
+      return bytes
+    } finally {
+      closeSync(descriptor)
+    }
+  }
+  throw new Error(`${label} was repeatedly replaced while reading: ${path}`)
 }
 
 export function openSafeLog(path: string, mode: 'truncate' | 'append'): number {

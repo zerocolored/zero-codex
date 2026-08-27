@@ -11,6 +11,7 @@ import {
   assertDescriptorStillNamesPath,
   atomicWritePrivateFile,
   openSafeLog,
+  readOptionalBoundedAtomicOwnedFile,
   readOptionalBoundedOwnerOnlyRegularFile,
   readOptionalOwnedRegularFile,
   readOptionalOwnerOnlyRegularFile,
@@ -62,6 +63,40 @@ describe('managed private files', () => {
     expect(created.exitCode).toBe(0)
     expect(() => readOptionalBoundedOwnerOnlyRegularFile(fifo, 4_096))
       .toThrow('unsafe managed file')
+  })
+
+  test('atomic readerはopen直後にdetachされた旧inodeを捨てて現在pathを再読込する', () => {
+    const path = join(fixture(), 'progress.json')
+    writeFileSync(path, '{"revision":0}\n', { mode: 0o600 })
+    const original = fs.fstatSync
+    let replaced = false
+    const stat = spyOn(fs, 'fstatSync').mockImplementation(descriptor => {
+      if (!replaced) {
+        replaced = true
+        atomicWritePrivateFile(path, '{"revision":1}\n')
+      }
+      return original(descriptor)
+    })
+    try {
+      expect(readOptionalBoundedAtomicOwnedFile(path, 1_024, 'monitor progress')?.toString())
+        .toBe('{"revision":1}\n')
+    } finally {
+      stat.mockRestore()
+    }
+  })
+
+  test('atomic readerもhardlinkとsymlinkは再試行せず拒否する', () => {
+    const dir = fixture()
+    const external = join(dir, 'external.json')
+    writeFileSync(external, '{}\n', { mode: 0o600 })
+    const hardlink = join(dir, 'hardlink.json')
+    const symlink = join(dir, 'symlink.json')
+    linkSync(external, hardlink)
+    symlinkSync(external, symlink)
+    expect(() => readOptionalBoundedAtomicOwnedFile(hardlink, 1_024, 'monitor progress'))
+      .toThrow('unsafe monitor progress')
+    expect(() => readOptionalBoundedAtomicOwnedFile(symlink, 1_024, 'monitor progress'))
+      .toThrow()
   })
 
   test('managed directory作成はretry時も各direntの親を同期する', () => {

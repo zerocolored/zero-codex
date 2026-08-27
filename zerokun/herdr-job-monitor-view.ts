@@ -11,7 +11,7 @@ import {
 } from 'fs'
 import { join } from 'path'
 import { readProcessIdentity } from './process-generation.ts'
-import { atomicWritePrivateFile } from './safe-file.ts'
+import { atomicWritePrivateFile, readOptionalBoundedAtomicOwnedFile } from './safe-file.ts'
 import { stripTerminalControls } from './herdr-job-monitor.ts'
 
 const MAX_STATE_FILE_BYTES = 64 * 1024
@@ -35,26 +35,7 @@ type Epoch = {
 }
 
 function readOwned(path: string, maxBytes = MAX_STATE_FILE_BYTES): Buffer | null {
-  let descriptor: number
-  try { descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW) } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
-  }
-  try {
-    const metadata = fstatSync(descriptor)
-    const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
-    if (!metadata.isFile() || metadata.nlink !== 1 || !ownerMatches || metadata.size > maxBytes) {
-      throw new Error(`unsafe monitor file: ${path}`)
-    }
-    const value = Buffer.alloc(metadata.size)
-    let offset = 0
-    while (offset < value.length) {
-      const count = readSync(descriptor, value, offset, value.length - offset, offset)
-      if (count === 0) throw new Error(`monitor file changed while reading: ${path}`)
-      offset += count
-    }
-    return value
-  } finally { closeSync(descriptor) }
+  return readOptionalBoundedAtomicOwnedFile(path, maxBytes, 'monitor file')
 }
 
 function readManifest(directory: string): Manifest {

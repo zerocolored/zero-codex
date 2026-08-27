@@ -30,7 +30,11 @@ import {
   sameProcessGeneration,
   type ProcessIdentity,
 } from './process-generation.ts'
-import { atomicWritePrivateFile, openSafeLog } from './safe-file.ts'
+import {
+  atomicWritePrivateFile,
+  openSafeLog,
+  readOptionalBoundedAtomicOwnedFile,
+} from './safe-file.ts'
 import {
   environmentForPinnedHerdrRuntime,
   herdrControlPlaneFingerprint,
@@ -245,31 +249,8 @@ function requireProcessIdentity(value: unknown): ProcessIdentity {
 }
 
 function readSmallOwnedFile(path: string, label: string): string | null {
-  let descriptor: number
-  try {
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
-  }
-  try {
-    const metadata = fstatSync(descriptor)
-    const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
-    if (!metadata.isFile() || metadata.nlink !== 1 || !ownerMatches
-      || metadata.size > MAX_STATE_FILE_BYTES) {
-      throw new Error(`unsafe ${label}: ${path}`)
-    }
-    const bytes = Buffer.alloc(metadata.size)
-    let offset = 0
-    while (offset < bytes.length) {
-      const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset)
-      if (count === 0) throw new Error(`${label} changed while reading: ${path}`)
-      offset += count
-    }
-    return bytes.toString('utf8')
-  } finally {
-    closeSync(descriptor)
-  }
+  return readOptionalBoundedAtomicOwnedFile(path, MAX_STATE_FILE_BYTES, label)?.toString('utf8')
+    ?? null
 }
 
 function readOwnedFileTail(
