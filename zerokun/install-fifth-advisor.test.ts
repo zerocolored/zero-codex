@@ -66,6 +66,7 @@ function fakeLifecycle(home: string, project: string): {
     owned: true,
     agent: true,
     process: true,
+    process_changed: false,
     project,
     nonce: lifecycleNonce,
   })}\n`, { mode: 0o600 })
@@ -108,8 +109,10 @@ if args == ["pane", "list", "--workspace", workspace]:
 if args == ["pane", "process-info", "--pane", pane]:
     if not state["owned"]:
         missing("pane_not_found")
-    processes = [{"pid": 999992, "argv": ["claude", "--dangerously-skip-permissions", "--safe-mode", "--no-chrome", "--disable-slash-commands"], "argv0": "claude"}] if state["process"] else []
-    success({"process_info": {"pane_id": pane, "shell_pid": 999991, "foreground_process_group_id": 999993, "foreground_processes": processes}})
+    claude_pid = 999994 if state.get("process_changed") else 999992
+    process_group_id = 999995 if state.get("process_changed") else 999993
+    processes = [{"pid": claude_pid, "argv": ["claude", "--dangerously-skip-permissions", "--safe-mode", "--no-chrome", "--disable-slash-commands"], "argv0": "claude"}] if state["process"] else []
+    success({"process_info": {"pane_id": pane, "shell_pid": 999991, "foreground_process_group_id": process_group_id, "foreground_processes": processes}})
 if args == ["agent", "get", agent_name]:
     if not state["owned"] or not state["agent"]:
         missing("agent_not_found")
@@ -692,6 +695,45 @@ describe('fifth-advisor helper installer', () => {
     ], { env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe' })
     expect(repeated.exitCode, repeated.stderr.toString()).toBe(0)
     expect(repeated.stdout.toString()).toContain('ephemeral-workspace-already-closed')
+  })
+
+  test('exact workspaceのprocess identity変化は全process消失後にcleanup成功へ収束する', () => {
+    const home = fixture()
+    const { project, request } = gitProject(home)
+    const helper = installFifthAdvisorHelper(home)
+    const lifecycle = fakeLifecycle(home, project)
+    const snapshot = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'snapshot',
+      '--project-root', project, '--request-dir', request,
+    ], { env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(snapshot.exitCode, snapshot.stderr.toString()).toBe(0)
+    writeLifecycleIntent(request, project)
+    writeLifecycleWorkspace(request, project, lifecycle.environment.ZEROKUN_CLAUDE_BIN_PATH!)
+    const state = JSON.parse(readFileSync(lifecycle.state, 'utf8')) as Record<string, unknown>
+    state.process_changed = true
+    writeFileSync(lifecycle.state, `${JSON.stringify(state)}\n`, { mode: 0o600 })
+
+    const closed = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'close',
+      '--project-root', project, '--request-dir', request,
+    ], { env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe' })
+
+    expect(closed.exitCode, closed.stderr.toString()).toBe(0)
+    expect(closed.stdout.toString()).toContain('ephemeral-workspace-closed')
+    expect(JSON.parse(closed.stdout.toString())).toMatchObject({
+      process_identity_warning: true,
+    })
+    expect(JSON.parse(readFileSync(
+      join(request, 'ephemeral-session-closed.json'),
+      'utf8',
+    ))).toMatchObject({
+      status: 'closed-and-verified',
+      workspace_absent: true,
+      pane_absent: true,
+      agent_absent: true,
+      processes_exited: true,
+    })
+    expect(JSON.parse(readFileSync(lifecycle.state, 'utf8')).owned).toBe(false)
   })
 
   test('workspace receipt後・agent start前のcrashを存在時も既消失時も冪等回収する', () => {

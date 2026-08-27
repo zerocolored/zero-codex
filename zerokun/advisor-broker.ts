@@ -1158,11 +1158,16 @@ async function main(): Promise<void> {
               || close.outputTruncated || close.exitCode !== 0) {
               throw new Error(`ephemeral Claude close failed (${close.exitCode}): ${close.stderr}`)
             }
-            parseEphemeralClaudeClose(close.stdout, receiptTarget)
+            const closeOutcome = parseEphemeralClaudeClose(close.stdout, receiptTarget)
             const cleanup = readEphemeralClaudeCleanupReceipt(requestDir, receiptTarget)
             cleanupVerified = true
             cleanupReceiptDigest = cleanup.digest
             cleanupStatus = cleanup.status
+            if (closeOutcome.processIdentityWarning) {
+              response = undefined
+              reason = 'ephemeral Claude process identity changed before cleanup; '
+                + 'the exact owned workspace and all recorded processes were still closed'
+            }
           } else {
             const recovered = await runBounded(fingerprintedCommand([
               python, helper, 'recover', ...helperArgs,

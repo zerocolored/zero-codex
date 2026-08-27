@@ -3949,6 +3949,7 @@ def _close_command_noninterruptible(args: argparse.Namespace) -> int:
                     "workspace_id": workspace["workspace_id"],
                     "pane_id": workspace["pane_id"],
                     "agent_name": workspace["agent_name"],
+                    "process_identity_warning": False,
                 },
                 sort_keys=True,
             ),
@@ -4039,11 +4040,12 @@ def _close_command_noninterruptible(args: argparse.Namespace) -> int:
             no_process_started=no_process_started,
             project_path_verified=project_path_verified,
         )
-        if process_identity_error is not None and not already_absent:
-            raise UnsafeRequest(
-                "ephemeral Claude process identity changed, but the owned workspace "
-                "was closed"
-            ) from process_identity_error
+        # A process-identity drift is an advisor diagnostic, not unfinished
+        # cleanup, once the exact owned workspace has been closed and
+        # _close_owned_workspace has proved every recorded/observed PID and
+        # process group gone.  Keeping this as a fatal result strands the FIFO
+        # even though the durable closed-and-verified receipt proves there is
+        # no live owned Claude process left to contain.
         print(
             json.dumps(
                 {
@@ -4055,6 +4057,7 @@ def _close_command_noninterruptible(args: argparse.Namespace) -> int:
                     "workspace_id": workspace["workspace_id"],
                     "pane_id": workspace["pane_id"],
                     "agent_name": workspace["agent_name"],
+                    "process_identity_warning": process_identity_error is not None,
                 },
                 sort_keys=True,
             ),

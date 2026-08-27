@@ -350,7 +350,7 @@ export function ephemeralClaudeAgentMatches(
 export function parseEphemeralClaudeClose(
   stdout: string,
   target: EphemeralClaudeTarget,
-): void {
+): { processIdentityWarning: boolean } {
   const matches = jsonRecords(stdout).filter(record => (
     record.status === 'ephemeral-workspace-closed'
     || record.status === 'ephemeral-workspace-already-closed'
@@ -358,9 +358,12 @@ export function parseEphemeralClaudeClose(
   if (matches.length !== 1) throw new Error('helper did not confirm ephemeral workspace cleanup')
   const record = matches[0]!
   if (record.workspace_id !== target.workspaceId || record.pane_id !== target.paneId
-    || record.agent_name !== target.target) {
+    || record.agent_name !== target.target
+    || (record.process_identity_warning !== undefined
+      && typeof record.process_identity_warning !== 'boolean')) {
     throw new Error('helper cleanup receipt does not match the owned ephemeral workspace')
   }
+  return { processIdentityWarning: record.process_identity_warning === true }
 }
 
 export function readEphemeralClaudeCleanupReceipt(
