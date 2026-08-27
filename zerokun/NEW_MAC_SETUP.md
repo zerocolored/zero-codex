@@ -36,7 +36,8 @@ bash "$bootstrap_path" --with-slack
 専用Grok reviewerとClaude Code第五advisorは必須です。Claudeはあらかじめsubscription login済みにし、
 Zeroちゃんは各round専用のfresh Herdr workspaceへ起動して、回答後にそのworkspaceだけを閉じます。
 既存Claude paneは利用しません。read jobではinvestigation、write jobでは編集前designと編集後reviewの
-必須5者とcleanup receiptが揃わない限り、Slackへ成功回答を公開しません。
+5枠を各roundで試行し、Grok/Claudeの安全に終了した利用不能はjournalへ記録して処理を続けます。
+native Codex証跡、receipt、入力・repository不変、起動済みClaude workspaceのexact cleanupが揃わない場合は、Slackへ成功回答を公開しません。
 
 ## 人が操作する箇所
 

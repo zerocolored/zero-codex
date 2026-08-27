@@ -110,24 +110,10 @@ export function resolveDedicatedGrokLauncher(home = homedir()): string {
       Buffer.from(reviewerRequirements()),
       { private: true },
     )
-    const verification = Bun.spawnSync([
-      '/usr/bin/python3', '-I', runtime, 'verify-install',
-      reviewerRoot,
-      homePhysical,
-      join(homePhysical, '.grok', 'bin', 'grok'),
-      join(homePhysical, '.grok', 'auth.json'),
-    ], {
-      env: {
-        HOME: '/var/empty',
-        PATH: '/usr/bin:/bin',
-        TMPDIR: '/tmp',
-      },
-      stdout: 'ignore',
-      stderr: 'ignore',
-    })
-    if (verification.exitCode !== 0) {
-      throw new Error('dedicated Grok reviewer runtime verification failed')
-    }
+    // Login availability is intentionally not a service-start prerequisite.
+    // The launcher revalidates and copies auth for each isolated attempt; a
+    // missing/expired subscription is journaled as an unavailable advisor.
+    resolveCodexExecutableDetails(join(homePhysical, '.grok', 'bin', 'grok'))
     return launcher
   } catch {
     throw new Error(

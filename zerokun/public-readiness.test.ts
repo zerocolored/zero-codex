@@ -63,7 +63,9 @@ describe('public Codex defaults', () => {
     expect(workflow).not.toContain('brew install tmux herdr')
     expect(workflow).toContain("codex-version: ['0.149.0', 'latest']")
     expect(executor).toContain("command === 'verify-codex-config'")
-    expect(executor).toContain('resolveDedicatedGrokLauncher()\n  await verifyCodexConfig')
+    expect(executor).not.toContain('resolveDedicatedGrokLauncher()\n  await verifyCodexConfig')
+    expect(executor).toContain('External advisor availability is checked inside each isolated round')
+    expect(executor).toContain('validTerminalGrokAttempts')
   })
 
   test('candidate sandboxの絞り込みtest名は対象fileにexact 1件ずつ存在する', () => {
@@ -170,10 +172,8 @@ describe('public Codex defaults', () => {
     expect(codexVersion).toContain('ZEROKUN_MIN_HERDR_VERSION="0.8.2"')
     expect(codexVersion).toContain('zerokun_herdr_capabilities_ready')
     expect(codexVersion).toContain('zerokun_claude_subscription_ready')
-    expect(codexChannel).toContain('zerokun_claude_subscription_ready')
-    expect(codexChannel.indexOf('zerokun_claude_subscription_ready')).toBeLessThan(
-      codexChannel.indexOf('start_job_runner() {'),
-    )
+    expect(codexChannel).not.toContain('zerokun_claude_subscription_ready')
+    expect(codexChannel).toContain('External advisor login can expire')
     expect(bootstrap).toContain('claude_subscription_ready')
     expect(bootstrap).not.toContain('claude auth login')
     expect(rootReadme).toContain('新しいSlack App')

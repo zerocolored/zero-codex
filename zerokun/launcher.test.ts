@@ -236,12 +236,12 @@ describe('codex-channel.sh replacement guard', () => {
     expect(result.output).not.toContain('0.149.0 以上が必要')
   })
 
-  test('Claude subscription loginが無効ならjob受付前に停止する', async () => {
+  test('Claude subscription login切れはjob受付を止めずround内で欠員記録する', async () => {
     const state = fixture()
     writeFileSync(join(state, 'fake-claude-auth-fail'), '1\n', { mode: 0o600 })
     const result = await runLauncher(state, { ZEROKUN_DRY_RUN: '1' })
-    expect(result.exitCode).toBe(1)
-    expect(result.output).toContain('Claude Codeはsubscription login済みである必要があります')
+    expect(result.exitCode).toBe(0)
+    expect(result.output).not.toContain('Claude Codeはsubscription login済みである必要があります')
   })
 
   test('Herdr 0.8.2未満をjob受付前に拒否する', async () => {

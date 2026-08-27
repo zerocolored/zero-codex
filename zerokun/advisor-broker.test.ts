@@ -464,7 +464,7 @@ print('review complete')
       )
       const journal = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
       expect(journal).toMatchObject({
-        version: 5,
+        version: 6,
         status: 'stale-input',
         inputRevision: fixture.revisionOne.revision,
         inputDigest: fixture.revisionOne.digest,

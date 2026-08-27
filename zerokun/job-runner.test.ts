@@ -5754,6 +5754,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('Poll advisor_round_poll')
     expect(instructions).toContain('exact receipt')
     expect(instructions).toContain('round-owned fresh ephemeral Claude Code workspace')
+    expect(instructions).toContain('safely-contained bounded attempt')
+    expect(instructions).toContain('Do not retry, authenticate')
+    expect(instructions).toContain('Native solution/risk')
     expect(instructions).toMatch(/Never\s+access Herdr/)
     expect(instructions).toContain('native close_agent capability exists')
     expect(instructions).not.toContain(nonce)
@@ -5806,7 +5809,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     ])
   })
 
-  test('advisor publication gateは別PIDのGrok 2件とfresh Claude cleanupを要求する', () => {
+  test('advisor publication gateは旧version 5の全採択証跡を後方互換で検証する', () => {
     const state = fixtureDir()
     const job = { id: 'advisor-job', writeEnabled: false }
     const contextDigest = 'a'.repeat(64)
@@ -5937,7 +5940,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
     expect(() => assertRequiredAdvisorRounds(
       job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
-    )).toThrow('incomplete')
+    )).toThrow('invalid or uncontained external advisor outcomes')
     journal.claude.cleanupVerified = true
 
     journal.status = 'reviewers-completed'
@@ -5952,7 +5955,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(() => assertRequiredAdvisorRounds(
       job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
     ))
-      .toThrow('not independent')
+      .toThrow('invalid or uncontained external advisor outcomes')
 
     journal.grok[1]!.processId = 202
     journal.attemptNonce = '0'.repeat(32)
@@ -5967,6 +5970,79 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(() => assertRequiredAdvisorRounds(
       job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
     )).toThrow('not independent')
+  })
+
+  test('advisor publication gateは安全に終了した外部欠員をversion 6で受理する', () => {
+    const state = fixtureDir()
+    const job = { id: 'advisor-best-effort-job', writeEnabled: false }
+    const contextDigest = 'a'.repeat(64)
+    const attemptNonce = 'f'.repeat(32)
+    const advisorInput = { revision: 1, digest: '6'.repeat(64) }
+    const repositoryDigest = '9'.repeat(64)
+    const root = join(
+      state, 'advisor-journal', job.id, attemptNonce,
+      `revision-${advisorInput.revision}-${advisorInput.digest.slice(0, 16)}`,
+    )
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    const journal = {
+      version: 6,
+      status: 'completed',
+      phase: 'investigation',
+      round: 1,
+      attemptNonce,
+      contextDigest,
+      inputRevision: advisorInput.revision,
+      inputDigest: advisorInput.digest,
+      repositoryDigest,
+      repositoryDigestBefore: repositoryDigest,
+      repositoryDigestAfter: repositoryDigest,
+      brokerProcessId: 101,
+      primaryEvidenceDigest: 'b'.repeat(64),
+      startedAt: 1,
+      finishedAt: 2,
+      receiptIssuedAt: 3,
+      receiptDigest: 'f'.repeat(64),
+      pollObservedAt: 4,
+      native: [
+        { perspective: 'solution', agentId: 'native-solution', responseDigest: '1'.repeat(64) },
+        { perspective: 'risk', agentId: 'native-risk', responseDigest: '2'.repeat(64) },
+      ],
+      grok: [
+        {
+          attempted: true, adopted: false, perspective: 'solution',
+          containmentVerified: true, reasonDigest: '3'.repeat(64),
+        },
+        {
+          attempted: true, adopted: false, perspective: 'risk',
+          containmentVerified: true, reasonDigest: '4'.repeat(64),
+        },
+      ],
+      claude: {
+        attempted: true,
+        required: true,
+        lifecycle: 'ephemeral-v2',
+        adopted: false,
+        workspaceCreationAttempted: false,
+        freshEphemeral: false,
+        cleanupVerified: false,
+        containmentVerified: true,
+        promptMayHaveBeenDelivered: false,
+        reasonDigest: '5'.repeat(64),
+      },
+    }
+    const path = join(root, 'investigation-1.json')
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    const evidence = assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )
+    expect(evidence).toHaveLength(1)
+    expect(evidence[0]!.native).toHaveLength(2)
+
+    journal.grok[0]!.containmentVerified = false
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('uncontained external advisor outcomes')
   })
 
   test('publication gateは最終入力revisionを必須にし旧stale native証跡も全件監査する', () => {

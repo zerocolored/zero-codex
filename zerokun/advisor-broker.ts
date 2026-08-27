@@ -71,10 +71,16 @@ import {
   type AdvisorInputSnapshot,
 } from './advisor-input.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
+import {
+  validTerminalClaudeAttempt,
+  validTerminalGrokAttempts,
+} from './advisor-journal.ts'
 
 export type FifthAdvisorSendOutcome =
   | { kind: 'unconfirmed' }
   | { kind: 'possibly-delivered'; marker: string }
+
+export class AdvisorContainmentError extends Error {}
 
 export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOutcome {
   const records = stdout.split(/\r?\n/).flatMap(line => {
@@ -403,12 +409,14 @@ export async function runBounded(
   try {
     rootIdentity = seedTrackedProcess(child.pid, tracked)
     if (process.platform !== 'win32' && rootIdentity.pgid !== rootIdentity.pid) {
-      throw new Error('advisor subprocess process group is not isolated')
+      throw new AdvisorContainmentError('advisor subprocess process group is not isolated')
     }
   } catch (error) {
     try { child.kill('SIGKILL') } catch {}
     await Promise.race([exit.catch(() => 1), Bun.sleep(1_000)])
-    throw error
+    throw error instanceof AdvisorContainmentError
+      ? error
+      : new AdvisorContainmentError(`advisor subprocess identity could not be tracked: ${error}`)
   }
   let tracking = true
   let trackingError: unknown
@@ -450,16 +458,23 @@ export async function runBounded(
   await tracker
   if (outcome.kind === 'timeout') {
     timedOut = true
-    const remaining = await reapTrackedProcesses({
-      rootPids: [child.pid],
-      groupId: child.pid,
-      tracked,
-      termGraceMs: options.terminationGraceMs ?? 5_000,
-      killWaitMs: 1_000,
-      onForce: () => { forcedCleanup = true },
-    })
+    let remaining: number[]
+    try {
+      remaining = await reapTrackedProcesses({
+        rootPids: [child.pid],
+        groupId: child.pid,
+        tracked,
+        termGraceMs: options.terminationGraceMs ?? 5_000,
+        killWaitMs: 1_000,
+        onForce: () => { forcedCleanup = true },
+      })
+    } catch (error) {
+      throw new AdvisorContainmentError(`advisor subprocess cleanup failed: ${error}`)
+    }
     if (remaining.length > 0) {
-      throw new Error(`advisor subprocess cleanup is incomplete: ${remaining.join(', ')}`)
+      throw new AdvisorContainmentError(
+        `advisor subprocess cleanup is incomplete: ${remaining.join(', ')}`,
+      )
     }
     const killed = await Promise.race([
       exit.then(exitCode => ({ kind: 'exit' as const, exitCode })),
@@ -467,18 +482,27 @@ export async function runBounded(
     ])
     outcome = killed.kind === 'exit' ? killed : { kind: 'exit', exitCode: 137 }
   }
-  const remaining = await reapTrackedProcesses({
-    rootPids: [child.pid],
-    groupId: child.pid,
-    tracked,
-    termGraceMs: options.terminationGraceMs ?? 5_000,
-    killWaitMs: 1_000,
-    onForce: () => { forcedCleanup = true },
-  })
-  if (remaining.length > 0) {
-    throw new Error(`advisor subprocess descendants remain: ${remaining.join(', ')}`)
+  let remaining: number[]
+  try {
+    remaining = await reapTrackedProcesses({
+      rootPids: [child.pid],
+      groupId: child.pid,
+      tracked,
+      termGraceMs: options.terminationGraceMs ?? 5_000,
+      killWaitMs: 1_000,
+      onForce: () => { forcedCleanup = true },
+    })
+  } catch (error) {
+    throw new AdvisorContainmentError(`advisor subprocess cleanup failed: ${error}`)
   }
-  if (trackingError) throw trackingError
+  if (remaining.length > 0) {
+    throw new AdvisorContainmentError(
+      `advisor subprocess descendants remain: ${remaining.join(', ')}`,
+    )
+  }
+  if (trackingError) {
+    throw new AdvisorContainmentError(`advisor subprocess tracking failed: ${trackingError}`)
+  }
   const relays = Promise.all([stdout.promise, stderr.promise])
   let relayOutput = await Promise.race([
     relays.then(value => ({ kind: 'done' as const, value })),
@@ -814,7 +838,7 @@ async function main(): Promise<void> {
     if (raw === null || Buffer.byteLength(raw) > 64 * 1024) return null
     try {
       const value = JSON.parse(raw) as Record<string, unknown>
-      if (value.version !== 5 || value.status !== status || value.phase !== phase
+      if (value.version !== 6 || value.status !== status || value.phase !== phase
         || value.round !== round || value.attemptNonce !== context.attemptNonce
         || value.contextDigest !== contextDigest
         || value.inputRevision !== input.revision || value.inputDigest !== input.digest
@@ -838,27 +862,12 @@ async function main(): Promise<void> {
         || !Array.isArray(value.grok) || value.grok.length !== 2
         || !value.claude || typeof value.claude !== 'object') return null
       const native = value.native as Array<Record<string, unknown>>
-      const grok = value.grok as Array<Record<string, unknown>>
-      const claude = value.claude as Record<string, unknown>
       const valid = new Set(native.map(entry => entry.perspective)).size === 2
         && new Set(native.map(entry => entry.agentId)).size === 2
         && native.every(entry => typeof entry.responseDigest === 'string'
           && /^[0-9a-f]{64}$/.test(entry.responseDigest))
-        && new Set(grok.map(entry => entry.perspective)).size === 2
-        && new Set(grok.map(entry => entry.processId)).size === 2
-        && grok.every(entry => entry.adopted === true
-          && typeof entry.responseDigest === 'string'
-          && /^[0-9a-f]{64}$/.test(entry.responseDigest))
-        && claude.attempted === true
-        && claude.required === true
-        && claude.lifecycle === 'ephemeral-v2'
-        && claude.adopted === true
-        && claude.freshEphemeral === true
-        && claude.cleanupVerified === true
-        && typeof claude.responseDigest === 'string'
-        && /^[0-9a-f]{64}$/.test(claude.responseDigest)
-        && typeof claude.cleanupReceiptDigest === 'string'
-        && /^[0-9a-f]{64}$/.test(claude.cleanupReceiptDigest)
+        && validTerminalGrokAttempts(value.grok)
+        && validTerminalClaudeAttempt(value.claude)
       return valid ? value : null
     } catch {
       return null
@@ -928,14 +937,22 @@ async function main(): Promise<void> {
         throw new Error(`Grok reviewer failed (${result.exitCode}): ${result.stderr.slice(-2_000)}`)
       }
       return {
+        attempted: true,
         adopted: true,
         perspective,
         processId: result.pid,
+        containmentVerified: true,
         durationMs: Date.now() - startedAt,
         response: result.stdout.trim(),
       }
     } catch (error) {
-      return { adopted: false, perspective, reason: String(error) }
+      return {
+        attempted: true,
+        adopted: false,
+        perspective,
+        containmentVerified: !(error instanceof AdvisorContainmentError),
+        reason: String(error),
+      }
     }
   }
 
@@ -952,6 +969,8 @@ async function main(): Promise<void> {
     let response: string | undefined
     let stateChangeSeqAfter: number | undefined
     let reason = 'Claude advisor was not sent'
+    let workspaceCreationAttempted = false
+    let helperContainmentVerified = true
     let cleanupVerified = false
     let cleanupReceiptDigest: string | undefined
     let cleanupStatus: string | undefined
@@ -960,10 +979,15 @@ async function main(): Promise<void> {
     try {
       if (!projectLayout.gitRoot) {
         return {
+          attempted: true,
           adopted: false,
           required: true,
           lifecycle: 'ephemeral-v2',
+          workspaceCreationAttempted: false,
+          freshEphemeral: false,
           cleanupVerified: false,
+          containmentVerified: true,
+          promptMayHaveBeenDelivered: false,
           reason: 'non-Git project cannot use the required ephemeral Claude advisor',
         }
       }
@@ -995,6 +1019,7 @@ async function main(): Promise<void> {
         throw new Error(`helper snapshot failed: ${snapshot.stderr}`)
       }
 
+      workspaceCreationAttempted = true
       const opened = await runBounded(fingerprintedCommand(
         [python, helper, 'open', ...helperArgs], jobFingerprint,
       ), {
@@ -1068,6 +1093,7 @@ async function main(): Promise<void> {
         }
       }
     } catch (error) {
+      if (error instanceof AdvisorContainmentError) helperContainmentVerified = false
       reason = String(error)
     } finally {
       if (requestDir && beforeSnapshot) {
@@ -1150,6 +1176,7 @@ async function main(): Promise<void> {
             requestRemovalReady = true
           }
         } catch (error) {
+          if (error instanceof AdvisorContainmentError) helperContainmentVerified = false
           response = undefined
           reason = `ephemeral Claude cleanup verification failed: ${error}`
         }
@@ -1167,15 +1194,18 @@ async function main(): Promise<void> {
     }
     if (response && cleanupVerified && cleanupReceiptDigest && target) {
       return {
+        attempted: true,
         adopted: true,
         required: true,
         lifecycle: 'ephemeral-v2',
         phase,
         round,
+        workspaceCreationAttempted: true,
         freshEphemeral: true,
         cleanupVerified: true,
         cleanupStatus,
         cleanupReceiptDigest,
+        containmentVerified: true,
         promptMayHaveBeenDelivered: true,
         stateChangeSeqBefore: target.stateChangeSeq,
         stateChangeSeqAfter,
@@ -1183,13 +1213,17 @@ async function main(): Promise<void> {
       }
     }
     return {
+      attempted: true,
       adopted: false,
       required: true,
       lifecycle: 'ephemeral-v2',
+      workspaceCreationAttempted,
       freshEphemeral: Boolean(target),
       cleanupVerified,
       cleanupStatus,
       cleanupReceiptDigest,
+      containmentVerified: helperContainmentVerified
+        && (!workspaceCreationAttempted || cleanupVerified),
       promptMayHaveBeenDelivered: Boolean(marker),
       reason,
     }
@@ -1234,7 +1268,7 @@ async function main(): Promise<void> {
   }
 
   server.registerTool('advisor_round', {
-    description: 'Durably start one ordered Five-Advisor round. The model reviewers continue without a wall-clock deadline; call advisor_round_poll until the same binding reaches a terminal result.',
+    description: 'Durably start one ordered Five-Advisor attempt round. External unavailable outcomes are safely contained and journaled; call advisor_round_poll until the same binding reaches a terminal receipt.',
     inputSchema: advisorRoundInputSchema,
   }, async ({ phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors }) => {
     if (phaseScope === 'prepare' && phase === 'review') {
@@ -1407,7 +1441,7 @@ async function main(): Promise<void> {
       const staleJournalPath = join(staleJournalRoot, `${phase}-${round}.json`)
       const now = Date.now()
       if (!createExclusivePrivateFile(staleJournalPath, `${JSON.stringify({
-        version: 5,
+        version: 6,
         status: 'stale-input',
         phase,
         round,
@@ -1456,7 +1490,7 @@ async function main(): Promise<void> {
     const journalPath = join(currentJournalRoot, `${phase}-${round}.json`)
     const startedAt = Date.now()
     if (!createExclusivePrivateFile(journalPath, `${JSON.stringify({
-      version: 5,
+      version: 6,
       status: 'requested',
       phase,
       round,
@@ -1483,31 +1517,50 @@ async function main(): Promise<void> {
     ])
     const claudePromise = runClaude(input, phase, round as 1 | 2 | 3, evidence)
     const [grok, claude] = await Promise.all([grokPromise, claudePromise])
-    const grokProcessIds = grok.flatMap(result => (
-      result.adopted === true && typeof result.processId === 'number'
-        ? [result.processId]
-        : []
-    ))
     const afterSnapshot = snapshotAdvisorRepository(projectLayout)
     const repositoryUnchanged = advisorRepositoryDigest(afterSnapshot) === repositoryDigest
     let finalInput: AdvisorInputSnapshot | null = null
     try { finalInput = readAdvisorInputSnapshot(stateDir, context.jobId) } catch {}
     const inputUnchanged = finalInput?.revision === input.revision
       && finalInput.digest === input.digest
+    const grokJournal = grok.map(result => ({
+      attempted: true,
+      adopted: result.adopted === true,
+      perspective: result.perspective,
+      containmentVerified: result.containmentVerified === true,
+      processId: result.adopted === true ? result.processId : undefined,
+      responseDigest: result.adopted === true && typeof result.response === 'string'
+        ? createHash('sha256').update(result.response).digest('hex')
+        : undefined,
+      reasonDigest: result.adopted !== true
+        ? createHash('sha256').update(String(result.reason ?? 'unavailable')).digest('hex')
+        : undefined,
+    }))
+    const claudeJournal = {
+      attempted: true,
+      required: true,
+      lifecycle: 'ephemeral-v2',
+      adopted: claude.adopted === true,
+      workspaceCreationAttempted: claude.workspaceCreationAttempted === true,
+      freshEphemeral: claude.freshEphemeral === true,
+      cleanupVerified: claude.cleanupVerified === true,
+      cleanupStatus: claude.cleanupStatus,
+      cleanupReceiptDigest: claude.cleanupReceiptDigest,
+      containmentVerified: claude.containmentVerified === true,
+      promptMayHaveBeenDelivered: claude.promptMayHaveBeenDelivered === true,
+      responseDigest: claude.adopted === true && typeof claude.response === 'string'
+        ? createHash('sha256').update(claude.response).digest('hex')
+        : undefined,
+      reasonDigest: claude.adopted !== true
+        ? createHash('sha256').update(String(claude.reason ?? 'unavailable')).digest('hex')
+        : undefined,
+    }
     const complete = inputUnchanged && repositoryUnchanged
-      && grok.every(result => result.adopted === true)
-      && grokProcessIds.length === 2
-      && new Set(grokProcessIds).size === 2
-      && claude.adopted === true
-      && claude.required === true
-      && claude.lifecycle === 'ephemeral-v2'
-      && claude.freshEphemeral === true
-      && claude.cleanupVerified === true
-      && typeof claude.cleanupReceiptDigest === 'string'
-      && /^[0-9a-f]{64}$/.test(claude.cleanupReceiptDigest)
+      && validTerminalGrokAttempts(grokJournal)
+      && validTerminalClaudeAttempt(claudeJournal)
     const finishedAt = Date.now()
     atomicWritePrivateFile(journalPath, `${JSON.stringify({
-      version: 5,
+      version: 6,
       status: complete
         ? 'reviewers-completed'
         : inputUnchanged ? 'required-reviewer-failed' : 'stale-input',
@@ -1525,31 +1578,8 @@ async function main(): Promise<void> {
       native: nativeEvidence,
       startedAt,
       finishedAt,
-      grok: grok.map(result => ({
-        adopted: result.adopted,
-        perspective: result.perspective,
-        processId: result.processId,
-        responseDigest: typeof result.response === 'string'
-          ? createHash('sha256').update(result.response).digest('hex')
-          : undefined,
-      })),
-      claude: {
-        attempted: true,
-        required: true,
-        lifecycle: 'ephemeral-v2',
-        adopted: claude.adopted,
-        freshEphemeral: claude.freshEphemeral === true,
-        cleanupVerified: claude.cleanupVerified === true,
-        cleanupStatus: claude.cleanupStatus,
-        cleanupReceiptDigest: claude.cleanupReceiptDigest,
-        promptMayHaveBeenDelivered: claude.promptMayHaveBeenDelivered === true,
-        responseDigest: typeof claude.response === 'string'
-          ? createHash('sha256').update(claude.response).digest('hex')
-          : undefined,
-        reasonDigest: claude.adopted !== true
-          ? createHash('sha256').update(String(claude.reason ?? 'unspecified skip')).digest('hex')
-          : undefined,
-      },
+      grok: grokJournal,
+      claude: claudeJournal,
     })}\n`)
     return toolText({
       complete,
@@ -1562,6 +1592,7 @@ async function main(): Promise<void> {
       round,
       durationMs: finishedAt - startedAt,
       repositoryUnchanged,
+      allAdopted: grok.every(result => result.adopted === true) && claude.adopted === true,
       grok,
       claude,
     }, !complete)
@@ -1587,7 +1618,7 @@ async function main(): Promise<void> {
   })
 
   server.registerTool('advisor_round_poll', {
-    description: 'Poll a previously started Five-Advisor round. Pending polls are unlimited and never cancel or restart the underlying reviewers.',
+    description: 'Poll a previously started Five-Advisor attempt round. Pending polls are unlimited and never cancel, authenticate, or restart the underlying reviewers.',
     inputSchema: {
       phase: z.enum(['investigation', 'design', 'review']),
       round: z.number().int().min(1).max(3),

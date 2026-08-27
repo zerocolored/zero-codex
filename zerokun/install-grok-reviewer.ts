@@ -175,22 +175,11 @@ disable_api_key_auth = true
 export function installGrokReviewer(homeInput = homedir()): string {
   const home = realpathSync(homeInput)
   const grok = join(home, '.grok', 'bin', 'grok')
-  const auth = join(home, '.grok', 'auth.json')
-  // Do not read either file. The installed launcher/runtime revalidates their
-  // owner, type, link count, mode and bounds immediately before each review.
+  // Do not read the executable. The installed launcher/runtime revalidates it
+  // immediately before each review.
   // The official installer exposes `grok` through a versioned or downloads
   // symlink, so use the hardened executable resolver for supported layouts.
   resolveCodexExecutableDetails(grok)
-  for (const [path, executable] of [[auth, false]] as const) {
-    const metadata = lstatSync(path)
-    const owned = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
-    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || !owned
-      || (metadata.mode & 0o077) !== 0 || metadata.size <= 0 || metadata.size > 1024 * 1024
-      || (metadata.mode & 0o400) === 0
-      || (executable && (metadata.mode & 0o111) === 0)) {
-      throw new Error(`official Grok Build prerequisite is unsafe or unavailable: ${path}`)
-    }
-  }
 
   const reviewerRoot = ensurePrivateDirectory(join(home, '.grok-reviewer'))
   const bin = ensurePrivateDirectory(join(reviewerRoot, 'bin'))

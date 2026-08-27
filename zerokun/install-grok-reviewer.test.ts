@@ -401,13 +401,13 @@ describe('dedicated Grok reviewer installer', () => {
     expect(readdirSync(reviewerRoot).filter(name => name.startsWith('run.'))).toEqual([])
   }, 10_000)
 
-  test('owner-onlyでないauthとhardlink authを拒否する', () => {
+  test('login authが利用不能でもbest-effort reviewer bundleを導入する', () => {
     const first = fixture()
     chmodSync(first.auth, 0o640)
-    expect(() => installGrokReviewer(first.home)).toThrow('official Grok Build prerequisite')
+    expect(() => installGrokReviewer(first.home)).not.toThrow()
 
     const second = fixture()
     linkSync(second.auth, join(second.home, 'auth-hardlink'))
-    expect(() => installGrokReviewer(second.home)).toThrow('official Grok Build prerequisite')
+    expect(() => installGrokReviewer(second.home)).not.toThrow()
   })
 })

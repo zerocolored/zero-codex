@@ -64,7 +64,12 @@ import {
   readPinnedHerdrRuntime,
   verifyHerdrRuntimeIdentityAsync,
 } from './herdr-runtime.ts'
-import { resolveDedicatedGrokLauncher } from './advisor-prerequisites.ts'
+import {
+  validLegacyAdoptedClaude,
+  validLegacyAdoptedGrok,
+  validTerminalClaudeAttempt,
+  validTerminalGrokAttempts,
+} from './advisor-journal.ts'
 import {
   advisorRepositoryDigest,
   resolveAdvisorProjectLayout,
@@ -1256,7 +1261,7 @@ function parseCompletedAdvisorJournal(
     throw new Error('advisor journal must be an object')
   }
   const journal = parsed as Record<string, unknown>
-  if (journal.version !== 5 || journal.status !== 'completed'
+  if ((journal.version !== 5 && journal.version !== 6) || journal.status !== 'completed'
     || journal.phase !== requirement.phase || journal.round !== requirement.round
     || journal.contextDigest !== expectedContextDigest
     || journal.attemptNonce !== expectedAttemptNonce
@@ -1283,44 +1288,11 @@ function parseCompletedAdvisorJournal(
   }
   const native = parseNativeAdvisorJournalEntries(journal)
 
-  if (!Array.isArray(journal.grok) || journal.grok.length !== 2) {
-    throw new Error('advisor journal does not contain exactly two Grok reviewers')
-  }
-  const perspectives = new Set<string>()
-  const processIds = new Set<number>()
-  for (const entry of journal.grok) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-      throw new Error('advisor journal contains an invalid Grok reviewer')
-    }
-    const reviewer = entry as Record<string, unknown>
-    if (reviewer.adopted !== true
-      || !['solution', 'risk'].includes(String(reviewer.perspective))
-      || !validPositiveInteger(reviewer.processId)
-      || !validSha256(reviewer.responseDigest)) {
-      throw new Error('advisor journal contains an incomplete Grok reviewer')
-    }
-    perspectives.add(String(reviewer.perspective))
-    processIds.add(Number(reviewer.processId))
-  }
-  if (perspectives.size !== 2 || !perspectives.has('solution') || !perspectives.has('risk')
-    || processIds.size !== 2) {
-    throw new Error('advisor journal Grok reviewers are not independent solution/risk processes')
-  }
-
-  if (!journal.claude || typeof journal.claude !== 'object' || Array.isArray(journal.claude)) {
-    throw new Error('advisor journal omitted the required ephemeral Claude advisor')
-  }
-  const claude = journal.claude as Record<string, unknown>
-  if (claude.attempted !== true
-    || claude.required !== true
-    || claude.lifecycle !== 'ephemeral-v2'
-    || claude.adopted !== true
-    || claude.freshEphemeral !== true
-    || claude.cleanupVerified !== true
-    || claude.cleanupStatus !== 'closed-and-verified'
-    || !validSha256(claude.responseDigest)
-    || !validSha256(claude.cleanupReceiptDigest)) {
-    throw new Error('advisor journal has an incomplete required ephemeral Claude result')
+  const externalValid = journal.version === 5
+    ? validLegacyAdoptedGrok(journal.grok) && validLegacyAdoptedClaude(journal.claude)
+    : validTerminalGrokAttempts(journal.grok) && validTerminalClaudeAttempt(journal.claude)
+  if (!externalValid) {
+    throw new Error('advisor journal has invalid or uncontained external advisor outcomes')
   }
   return {
     startedAt: Number(journal.startedAt),
@@ -1394,7 +1366,7 @@ function collectNativeAdvisorJournalEvidence(options: {
       const journal = parsed as Record<string, unknown>
       const phase = journalMatch[1] as NativeAdvisorRoundEvidence['phase']
       const round = Number(journalMatch[2]) as NativeAdvisorRoundEvidence['round']
-      if (journal.version !== 5
+      if ((journal.version !== 5 && journal.version !== 6)
         || !['requested', 'completed', 'required-reviewer-failed', 'stale-input']
           .includes(String(journal.status))
         || journal.phase !== phase || journal.round !== round
@@ -2436,13 +2408,15 @@ export function buildCodexDeveloperInstructions(
       'full response and returned thread ID; do not summarize or invent IDs. The host validates',
       'the official App Server parent/child history, completed turns, exact markers, response',
       'digests, and the complete direct-child set before accepting a phase.',
-      'The broker is a narrow read-only transport for two isolated Grok reviewers and exactly one',
+      'The broker is a narrow read-only transport for two isolated Grok reviewer attempts and exactly one',
       'round-owned fresh ephemeral Claude Code workspace. The host creates it for the round and',
       'closes that exact workspace afterward; existing panes are never reused or cleared. Never',
       'access Herdr, reviewer files, sockets, secrets, or credentials directly. Never start,',
       'restore, attach, focus, or repurpose an agent or pane. Advisors must not delegate. If a',
-      'required advisor is unavailable, preserve the exact blocker instead of weakening the',
-      'sandbox. Close completed native subagents only when',
+      'Grok or Claude slot is unavailable after a safely-contained bounded attempt, the broker',
+      'records that outcome and may still complete the receipt. Do not retry, authenticate, weaken',
+      'the sandbox, or stop the primary task for that external absence. Native solution/risk',
+      'advisors and the broker receipt remain required. Close completed native subagents only when',
       'the native close_agent capability exists; otherwise the host retires the whole generation.',
       'Review rounds are contiguous and limited to 1 through 3. Do not change repository or Git',
       'state after a publish review. Only regular files directly under the artifact directory',
@@ -2466,8 +2440,10 @@ export function buildCodexDeveloperInstructions(
     'and real child thread IDs; do not summarize or invent them. Advisors must not delegate.',
     'The broker creates one fresh round-owned Claude workspace and closes it afterward; it never',
     'reuses or clears an existing pane. Never access Herdr, reviewer files, sockets, secrets, or',
-    'credentials directly, and never start, restore, attach, focus, or repurpose an agent or pane. Preserve an',
-    'exact unavailable-advisor blocker instead of weakening the sandbox. Do not create or modify',
+    'credentials directly, and never start, restore, attach, focus, or repurpose an agent or pane.',
+    'A safely-contained unavailable Grok or Claude slot is a terminal best-effort outcome: do not',
+    'retry, authenticate, weaken the sandbox, or stop the primary answer once its receipt completes.',
+    'The two native solution/risk advisors and the broker receipt remain required. Do not create or modify',
     'a Codex goal. Only regular files directly under the current host artifact directory may be',
     'returned. If a change is requested, report the exact access command supplied by the host.',
   ].join('\n')
@@ -3611,7 +3587,6 @@ export async function executeCodexJob(
   const herdrRuntime = testCodexBin === undefined ? readPinnedHerdrRuntime(stateDir) : undefined
   if (herdrRuntime) {
     await verifyHerdrRuntimeIdentityAsync(herdrRuntime)
-    resolveDedicatedGrokLauncher()
   }
   const brokerPath = realpathSync(join(import.meta.dir, 'advisor-broker.ts'))
   const brokerMetadata = lstatSync(brokerPath)
@@ -5903,8 +5878,9 @@ async function verifyCodexConfig(inheritProcessGroup = false): Promise<void> {
 }
 
 async function verifySystemCodexConfig(inheritProcessGroup = false): Promise<void> {
-  // Production readiness includes the mandatory subscription-backed reviewer.
-  resolveDedicatedGrokLauncher()
+  // External advisor availability is checked inside each isolated round and
+  // journaled as best-effort. System readiness covers the mandatory Codex
+  // runtime and permission boundary only.
   await verifyCodexConfig(inheritProcessGroup)
 }
 

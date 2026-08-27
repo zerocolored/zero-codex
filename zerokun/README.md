@@ -196,10 +196,12 @@ Slack本文はGrok launcherのstdinから渡し、Claude本文はowner-only prom
 timeout/stalledは曖昧送達として再送しません。2本のGrok launcherは
 startup lock内でstale回収・run directory作成・owner receiptを一体化し、並行起動や電源断残骸で相互破壊しません。Codex shellへGrok auth、
 Herdr socket、account HOMEは公開せず、read/writeともrepository限定sandboxを維持します。
-reviewer/helperが通常終了後の子process回収にbounded forceを必要とした場合、その回答は採択・公開しません。
-runnerは各必須roundのowner-only journalを検査し、Grok solution/riskが別PIDで完了していない、
-response digestがない、fresh Claudeの採択response・snapshot不変・exact cleanup receiptが揃わない場合は、最終本文が完成していても
-Slackへ成功結果を公開しません。
+Grok/Claudeは各roundで必ず1回ずつ試行します。認証切れ、rate limit、起動不能、回答不成立は
+安全に終了した利用不能結果としてreason digestと共にjournalへ残し、利用可能なadvisor証拠で処理を続けます。
+Zeroちゃん自身はloginやOAuth操作を行いません。Grok processを回収できない、作成済みClaude workspaceの
+exact cleanupが成立しない、repository/inputが変化した場合はterminal結果にせず、Slackへの成功公開を拒否します。
+runnerは各roundのowner-only journalとreceiptを検査し、成功した外部advisorにはPID/response digestまたは
+fresh Claude response/cleanup receiptを、利用不能枠には安全なcontainment evidenceを要求します。
 native Codex 2件はさらに、最初のturn前に親direct-child baselineを固定し、全source kindの`thread/list`と
 公式turn履歴を全page照合します。`thread/items/list`未対応を同一methodの最初の数値`-32601`でだけ判定し、
 その場合はfull指定の`thread/turns/list`と`thread/read`を両方使い、最大4 snapshot内で連続する2回が

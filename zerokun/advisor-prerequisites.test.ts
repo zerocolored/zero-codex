@@ -76,7 +76,7 @@ describe('dedicated Grok prerequisite', () => {
     expect(() => resolveDedicatedGrokLauncher(writableHome)).toThrow('未導入または安全ではありません')
   })
 
-  test('bundle改変とowner-onlyでないlogin authを拒否する', () => {
+  test('bundle改変は拒否しlogin authの可用性はservice gateにしない', () => {
     const configHome = fixtureHome()
     installFixture(configHome)
     writeFileSync(join(configHome, '.grok-reviewer', 'config.toml'), 'tampered = true\n', { mode: 0o600 })
@@ -85,13 +85,12 @@ describe('dedicated Grok prerequisite', () => {
     const authHome = fixtureHome()
     installFixture(authHome)
     chmodSync(join(authHome, '.grok', 'auth.json'), 0o640)
-    expect(() => resolveDedicatedGrokLauncher(authHome)).toThrow('未導入または安全ではありません')
+    expect(() => resolveDedicatedGrokLauncher(authHome)).not.toThrow()
 
     const unreadableAuthHome = fixtureHome()
     installFixture(unreadableAuthHome)
-    chmodSync(join(unreadableAuthHome, '.grok', 'auth.json'), 0o000)
-    expect(() => resolveDedicatedGrokLauncher(unreadableAuthHome))
-      .toThrow('未導入または安全ではありません')
+    rmSync(join(unreadableAuthHome, '.grok', 'auth.json'))
+    expect(() => resolveDedicatedGrokLauncher(unreadableAuthHome)).not.toThrow()
   })
 
   test('launcher/runtimeのleaf symlinkとowner実行不能modeを拒否する', () => {
