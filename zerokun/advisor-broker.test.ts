@@ -18,6 +18,8 @@ import { readProcessIdentity } from './process-tree.ts'
 import { signalProcessIfLive } from './process-generation.ts'
 import {
   advanceAdvisorReceipt,
+  advisorReceiptAlreadyObserved,
+  advisorReceiptChallenge,
   assertClaudeSubscriptionLogin,
   brokerEnvironment,
   claudeSubscriptionStatusIsReady,
@@ -423,7 +425,7 @@ print('review complete')
     expect(Buffer.byteLength(result.stdout)).toBe(256 * 1024)
   })
 
-  test('terminal reviewer結果は受信receiptを次pollで返すまでcompletedにならない', () => {
+  test('terminal reviewer結果はexact receiptまたは同一bindingの次pollでcompletedになる', () => {
     const token = 'a'.repeat(64)
     const base = { status: 'reviewers-completed', finishedAt: 100 }
     const issued = advanceAdvisorReceipt(base, undefined, 101, () => token)
@@ -436,11 +438,71 @@ print('review complete')
     const completed = advanceAdvisorReceipt(issued.journal, token, 102)
     expect(completed).toMatchObject({
       kind: 'completed', pollObservedAt: 102,
-      journal: { status: 'completed', receiptIssuedAt: 101, pollObservedAt: 102 },
+      journal: {
+        status: 'completed',
+        receiptIssuedAt: 101,
+        receiptAcknowledgement: 'exact-echo',
+        pollObservedAt: 102,
+      },
     })
     if (completed.kind !== 'completed') throw new Error('receipt was not acknowledged')
     expect(completed.journal.receipt).toBeUndefined()
     expect(completed.journal.receiptDigest).toMatch(/^[0-9a-f]{64}$/)
+    const duplicatePoll = advanceAdvisorReceipt(issued.journal, undefined, 103)
+    expect(duplicatePoll).toMatchObject({
+      kind: 'completed',
+      journal: {
+        status: 'completed',
+        receiptAcknowledgement: 'bound-repoll',
+        pollObservedAt: 103,
+      },
+    })
+  })
+
+  test('receipt challengeは大型advisor回答を再掲せず単発ackを指示する', () => {
+    const challenge = advisorReceiptChallenge({
+      phase: 'investigation',
+      round: 1,
+      inputRevision: 2,
+      inputDigest: 'd'.repeat(64),
+      receipt: 'e'.repeat(64),
+    })
+    expect(challenge).toEqual({
+      complete: false,
+      receiptRequired: true,
+      phase: 'investigation',
+      round: 1,
+      inputRevision: 2,
+      inputDigest: 'd'.repeat(64),
+      receipt: 'e'.repeat(64),
+      nextAction: 'Call advisor_round_poll exactly once with this receipt and the same binding; do not batch or parallelize polls.',
+    })
+    expect(challenge.grok).toBeUndefined()
+    expect(challenge.claude).toBeUndefined()
+    expect(challenge.allAdopted).toBeUndefined()
+    expect(Buffer.byteLength(JSON.stringify(challenge))).toBeLessThan(1024)
+  })
+
+  test('completed後の重複pollは大型advisor回答を再掲しない', () => {
+    const observed = advisorReceiptAlreadyObserved({
+      phase: 'investigation',
+      round: 1,
+      inputRevision: 2,
+      inputDigest: 'f'.repeat(64),
+      pollObservedAt: 123,
+    })
+    expect(observed).toEqual({
+      complete: true,
+      alreadyObserved: true,
+      phase: 'investigation',
+      round: 1,
+      inputRevision: 2,
+      inputDigest: 'f'.repeat(64),
+      pollObservedAt: 123,
+    })
+    expect(observed.grok).toBeUndefined()
+    expect(observed.claude).toBeUndefined()
+    expect(Buffer.byteLength(JSON.stringify(observed))).toBeLessThan(1024)
   })
 
   test('別ユーザーの同一thread追記で旧revisionになったnative調査をstale journalへ固定する', async () => {

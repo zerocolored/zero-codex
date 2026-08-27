@@ -757,7 +757,38 @@ export function advanceAdvisorReceipt(
   | { kind: 'invalid' } {
   const finishedAt = Number(journal.finishedAt)
   if (!Number.isSafeInteger(observedAt) || observedAt < finishedAt) return { kind: 'invalid' }
+  const completeReceipt = (
+    acknowledgedReceipt: string,
+    acknowledgement: 'exact-echo' | 'bound-repoll',
+  ):
+    | { kind: 'completed', journal: Record<string, unknown>, pollObservedAt: number }
+    | { kind: 'invalid' } => {
+    const receiptIssuedAt = Number(journal.receiptIssuedAt)
+    if (!Number.isSafeInteger(receiptIssuedAt) || receiptIssuedAt < finishedAt
+      || observedAt < receiptIssuedAt) return { kind: 'invalid' }
+    const receiptDigest = createHash('sha256').update(acknowledgedReceipt).digest('hex')
+    const { receipt: _issuedReceipt, ...durableJournal } = journal
+    return {
+      kind: 'completed',
+      pollObservedAt: observedAt,
+      journal: {
+        ...durableJournal,
+        status: 'completed',
+        receiptDigest,
+        receiptAcknowledgement: acknowledgement,
+        pollObservedAt: observedAt,
+      },
+    }
+  }
   if (suppliedReceipt === undefined) {
+    if (typeof journal.receipt === 'string' && /^[0-9a-f]{64}$/.test(journal.receipt)
+      && Number.isSafeInteger(journal.receiptIssuedAt)
+      && Number(journal.receiptIssuedAt) >= finishedAt) {
+      // A second same-binding poll is a bounded fallback for clients that
+      // pre-queued polls before seeing the compact receipt challenge. The
+      // caller still receives the terminal payload on this exact poll.
+      return completeReceipt(journal.receipt, 'bound-repoll')
+    }
     const issuedReceipt = typeof journal.receipt === 'string'
       && /^[0-9a-f]{64}$/.test(journal.receipt)
       ? journal.receipt
@@ -781,17 +812,46 @@ export function advanceAdvisorReceipt(
       Buffer.from(suppliedReceipt, 'hex'),
       Buffer.from(journal.receipt, 'hex'),
     )) return { kind: 'invalid' }
-  const receiptDigest = createHash('sha256').update(suppliedReceipt).digest('hex')
-  const { receipt: _issuedReceipt, ...durableJournal } = journal
+  return completeReceipt(suppliedReceipt, 'exact-echo')
+}
+
+export function advisorReceiptChallenge(input: {
+  phase: 'investigation' | 'design' | 'review'
+  round: number
+  inputRevision: number
+  inputDigest: string
+  receipt: string
+}): Record<string, unknown> {
   return {
-    kind: 'completed',
-    pollObservedAt: observedAt,
-    journal: {
-      ...durableJournal,
-      status: 'completed',
-      receiptDigest,
-      pollObservedAt: observedAt,
-    },
+    complete: false,
+    receiptRequired: true,
+    phase: input.phase,
+    round: input.round,
+    inputRevision: input.inputRevision,
+    inputDigest: input.inputDigest,
+    receipt: input.receipt,
+    nextAction: [
+      'Call advisor_round_poll exactly once with this receipt and the same binding;',
+      'do not batch or parallelize polls.',
+    ].join(' '),
+  }
+}
+
+export function advisorReceiptAlreadyObserved(input: {
+  phase: 'investigation' | 'design' | 'review'
+  round: number
+  inputRevision: number
+  inputDigest: string
+  pollObservedAt: number
+}): Record<string, unknown> {
+  return {
+    complete: true,
+    alreadyObserved: true,
+    phase: input.phase,
+    round: input.round,
+    inputRevision: input.inputRevision,
+    inputDigest: input.inputDigest,
+    pollObservedAt: input.pollObservedAt,
   }
 }
 
@@ -1642,13 +1702,15 @@ async function main(): Promise<void> {
   })
 
   server.registerTool('advisor_round_poll', {
-    description: 'Poll a previously started Five-Advisor attempt round. Pending polls are unlimited and never cancel, authenticate, or restart the underlying reviewers.',
+    description: 'Poll a previously started Five-Advisor attempt round. Keep exactly one poll outstanding and wait for its result; never batch, parallelize, or pre-queue duplicate polls. Pending polls are unlimited and never cancel, authenticate, or restart reviewers. When receiptRequired is returned, make exactly one next call with that exact receipt and the same binding.',
     inputSchema: {
       phase: z.enum(['investigation', 'design', 'review']),
       round: z.number().int().min(1).max(3),
       inputRevision: z.number().int().min(1),
       inputDigest: z.string().regex(/^[0-9a-f]{64}$/),
-      receipt: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+      receipt: z.string().regex(/^[0-9a-f]{64}$/).optional().describe(
+        'Exact receipt returned by the immediately preceding receiptRequired poll; omit before then.',
+      ),
     },
   }, async ({ phase, round, inputRevision, inputDigest, receipt }) => {
     const boundRound = round as 1 | 2 | 3
@@ -1687,7 +1749,13 @@ async function main(): Promise<void> {
     try {
       const alreadyObserved = readCompletedJournal(binding, phase, boundRound)
       if (alreadyObserved) {
-        return toolText({ ...payload, pollObservedAt: alreadyObserved.pollObservedAt })
+        return toolText(advisorReceiptAlreadyObserved({
+          phase,
+          round,
+          inputRevision,
+          inputDigest,
+          pollObservedAt: Number(alreadyObserved.pollObservedAt),
+        }))
       }
       const journal = readTerminalJournal(binding, phase, boundRound, 'reviewers-completed')
       if (!journal) {
@@ -1716,19 +1784,27 @@ async function main(): Promise<void> {
       const receiptAdvance = advanceAdvisorReceipt(journal, receipt, observedAt)
       if (receiptAdvance.kind === 'issued') {
         atomicWritePrivateFile(journalPath, `${JSON.stringify(receiptAdvance.journal)}\n`)
-        return toolText({
-          ...payload,
-          complete: false,
-          receiptRequired: true,
+        return toolText(advisorReceiptChallenge({
+          phase,
+          round,
+          inputRevision,
+          inputDigest,
           receipt: receiptAdvance.receipt,
-        })
+        }))
       }
       if (receiptAdvance.kind === 'invalid') {
         return toolText({
-          ...payload,
           complete: false,
           receiptRequired: true,
+          phase,
+          round,
+          inputRevision,
+          inputDigest,
           reason: 'the reviewer receipt is missing or does not match the delivered result',
+          nextAction: [
+            'Call advisor_round_poll once with the exact receipt from the immediately preceding',
+            'challenge and the same binding; do not batch or parallelize polls.',
+          ].join(' '),
         }, true)
       }
       atomicWritePrivateFile(journalPath, `${JSON.stringify(receiptAdvance.journal)}\n`)
