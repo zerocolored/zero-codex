@@ -944,13 +944,16 @@ export async function reconcileEphemeralClaudeSessions(options: {
               retainProvisionalAbsenceGuard = provisional.status
                 === 'provisional-workspace-not-created'
             } else {
-              const close = await run('close', projectRoot, requestDir)
-              if (close.exitCode !== 0) {
-                throw new EphemeralClaudeCleanupPendingError(
-                  `ephemeral Claude cleanup is pending: ${close.stderr.trim().slice(-2_000)}`,
-                )
+              const closedReceipt = join(requestDir, EPHEMERAL_CLAUDE_CLOSED_RECEIPT)
+              if (!existsSync(closedReceipt)) {
+                const close = await run('close', projectRoot, requestDir)
+                if (close.exitCode !== 0) {
+                  throw new EphemeralClaudeCleanupPendingError(
+                    `ephemeral Claude cleanup is pending: ${close.stderr.trim().slice(-2_000)}`,
+                  )
+                }
+                parseEphemeralClaudeClose(close.stdout, target)
               }
-              parseEphemeralClaudeClose(close.stdout, target)
               readEphemeralClaudeCleanupReceipt(requestDir, target)
             }
             persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir)
