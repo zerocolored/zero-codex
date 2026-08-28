@@ -14,6 +14,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   lastConnectedProjectPath,
+  projectGitExecutable,
   readLastConnectedProject,
   validateLaunchProject,
   writeLastConnectedProject,
@@ -43,6 +44,17 @@ function fixture(): { root: string; home: string; runtime: string; state: string
 }
 
 describe('zerochan project selection', () => {
+  test('candidate Git overrideはverified sandbox markerなしでは拒否する', () => {
+    expect(projectGitExecutable({})).toBe('/usr/bin/git')
+    expect(() => projectGitExecutable({
+      ZERO_CODEX_CANDIDATE_GIT: '/usr/bin/git',
+    })).toThrow('verified Codex sandbox')
+    expect(() => projectGitExecutable({
+      ZERO_CODEX_CANDIDATE_SANDBOX: '1',
+      CODEX_SANDBOX: 'seatbelt',
+    })).toThrow('verified Codex sandbox')
+  })
+
   test('validates and returns the physical Git project path', () => {
     const value = fixture()
     const alias = join(value.root, 'project-alias')

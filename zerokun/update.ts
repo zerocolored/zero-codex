@@ -1954,7 +1954,9 @@ async function validateZero(
     '--include-managed-config',
     '--allow-unix-socket', candidateSocketRoot,
     '--',
-    '/usr/bin/env', 'ZERO_CODEX_CANDIDATE_SANDBOX=1',
+    '/usr/bin/env',
+    'ZERO_CODEX_CANDIDATE_SANDBOX=1',
+    `ZERO_CODEX_CANDIDATE_GIT=${stagedCodex.gitExecutable}`,
     '/bin/bash', verifyScript, '--candidate-sandbox',
   ], {
     cwd: rootRepo,
