@@ -154,9 +154,18 @@ interface SecureExecutableSnapshot {
   metadata: BigIntStats
 }
 
-function secureExecutableSnapshot(candidate: string): SecureExecutableSnapshot | null {
+function isSelectedXcodeGitPath(path: string): boolean {
+  return path === '/Library/Developer/CommandLineTools/usr/bin/git'
+    || /^\/Applications\/Xcode[^/]*\.app\/Contents\/Developer\/usr\/bin\/git$/.test(path)
+}
+
+function secureExecutableSnapshot(
+  candidate: string,
+  allowSelectedXcodeGit = false,
+): SecureExecutableSnapshot | null {
   try {
     const physical = realpathSync(candidate)
+    const selectedXcodeGit = allowSelectedXcodeGit && isSelectedXcodeGitPath(physical)
     const root = parse(physical).root
     let current = root
     for (const component of relative(root, dirname(physical)).split(sep).filter(Boolean)) {
@@ -165,8 +174,13 @@ function secureExecutableSnapshot(candidate: string): SecureExecutableSnapshot |
       const parentOwnerAllowed = typeof process.getuid !== 'function'
         || parent.uid === process.getuid()
         || parent.uid === 0
+      const stockApplicationsDirectory = selectedXcodeGit
+        && current === '/Applications'
+        && parent.uid === 0
+        && parent.gid === 80
+        && (parent.mode & 0o7777) === 0o775
       if (!parent.isDirectory() || parent.isSymbolicLink() || !parentOwnerAllowed
-        || (parent.mode & 0o022) !== 0) return null
+        || ((parent.mode & 0o022) !== 0 && !stockApplicationsDirectory)) return null
     }
     const metadata = lstatSync(physical, { bigint: true })
     const ownerAllowed = typeof process.getuid !== 'function'
@@ -212,8 +226,9 @@ function copySecureExecutable(
   destination: string,
   beforeOpen: () => void = () => {},
   requireNative = false,
+  allowSelectedXcodeGit = false,
 ): void {
-  const snapshot = secureExecutableSnapshot(candidate)
+  const snapshot = secureExecutableSnapshot(candidate, allowSelectedXcodeGit)
   if (!snapshot) fail(`実行fileを安全に読めません: ${candidate}`)
   const { physical, metadata: before } = snapshot
   let source = -1
@@ -426,6 +441,54 @@ export function updaterTrustedToolPath(trustedCodexDirectory: string): string {
   return [...new Set([trustedCodexDirectory, ...TRUSTED_TOOL_PATH.split(':')])].join(':')
 }
 
+function resolveSelectedDeveloperGit(): string {
+  if (process.platform !== 'darwin') {
+    const physical = secureExecutable('/usr/bin/git')
+    if (!physical) fail('candidate検証用Gitを安全に解決できません')
+    return physical
+  }
+  const selected = Bun.spawnSync(['/usr/bin/xcode-select', '-p'], {
+    env: {
+      PATH: '/usr/bin:/bin',
+      HOME: '/var/empty',
+      LANG: 'C',
+      LC_ALL: 'C',
+    },
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    timeout: 10_000,
+    killSignal: 'SIGKILL',
+    maxBuffer: 64 * 1024,
+  })
+  if (selected.exitCode !== 0) fail('candidate検証用の開発者directoryを解決できません')
+  const developerDirectory = selected.stdout.toString().trim()
+  if (!developerDirectory || developerDirectory === '/'
+    || developerDirectory.length > 1_024 || !developerDirectory.startsWith('/')
+    || /[\r\n\0]/.test(developerDirectory)) {
+    fail('candidate検証用の開発者directoryが不正です')
+  }
+  let physicalDeveloperDirectory: string
+  try {
+    physicalDeveloperDirectory = realpathSync(developerDirectory)
+  } catch {
+    fail('candidate検証用の開発者directoryを検証できません')
+  }
+  if (physicalDeveloperDirectory !== developerDirectory
+    || (physicalDeveloperDirectory !== '/Library/Developer/CommandLineTools'
+      && !/^\/Applications\/Xcode[^/]*\.app\/Contents\/Developer$/.test(
+        physicalDeveloperDirectory,
+      ))) {
+    fail('candidate検証用の開発者directoryが許可範囲外です')
+  }
+  const git = join(physicalDeveloperDirectory, 'usr', 'bin', 'git')
+  const snapshot = secureExecutableSnapshot(git, true)
+  if (!snapshot || snapshot.physical !== git) {
+    fail('candidate検証用Gitを安全に解決できません')
+  }
+  return git
+}
+
 function candidateCodexExecutable(codexBin: string): string {
   if (!codexBin.endsWith('.js')) return codexBin
   const packageRoot = dirname(dirname(codexBin))
@@ -463,7 +526,7 @@ export function stageVerifiedCandidateCodex(
   parent: string,
   codexBin: string,
   source: Record<string, string | undefined> = process.env,
-): { directory: string; executable: string } {
+): { directory: string; executable: string; gitExecutable: string } {
   const directory = join(parent, 'trusted-bin')
   mkdirSync(directory, { mode: 0o700 })
   const executable = join(directory, 'codex')
@@ -471,9 +534,30 @@ export function stageVerifiedCandidateCodex(
   if (!stagedCodexVersionIsSupported(executable, source)) {
     fail('stagingしたCodex CLIが0.149.0以上ではありません')
   }
+  const gitExecutable = join(directory, 'git')
+  copySecureExecutable(resolveSelectedDeveloperGit(), gitExecutable, () => {}, false, true)
+  const gitVersion = Bun.spawnSync([gitExecutable, '--version'], {
+    env: {
+      PATH: directory,
+      HOME: source.HOME ?? '/var/empty',
+      LANG: source.LANG ?? 'C',
+      LC_ALL: source.LC_ALL ?? 'C',
+    },
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    timeout: 10_000,
+    killSignal: 'SIGKILL',
+    maxBuffer: 64 * 1024,
+  })
+  if (gitVersion.exitCode !== 0
+    || !/^git version \d+\.\d+(?:\.\d+)?(?:\s|$)/.test(gitVersion.stdout.toString())) {
+    fail('stagingしたcandidate検証用Gitを実行できません')
+  }
   chmodSync(executable, 0o500)
+  chmodSync(gitExecutable, 0o500)
   chmodSync(directory, 0o500)
-  return { directory, executable }
+  return { directory, executable, gitExecutable }
 }
 
 type UpdatePhase =

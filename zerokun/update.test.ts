@@ -405,6 +405,14 @@ describe('updater helpers', () => {
       expect(result.exitCode).toBe(0)
       expect(result.stdout.toString().trim()).toBe(before.stdout.toString().trim())
       expect(staged.executable).not.toBe(realpathSync(original))
+      const git = Bun.spawnSync(['git', '--version'], {
+        env: { PATH: staged.directory, HOME: root, TMPDIR: root },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(git.exitCode, git.stderr.toString()).toBe(0)
+      expect(git.stdout.toString()).toMatch(/^git version /)
+      expect(git.stderr.toString()).not.toContain('xcrun_db')
+      expect(staged.gitExecutable).toBe(join(staged.directory, 'git'))
     } finally {
       chmodSync(staged.directory, 0o700)
     }
@@ -1731,6 +1739,7 @@ describe('Codex branch self update', () => {
     writeFileSync(join(verifyDir, 'verify.sh'), [
       '#!/bin/bash',
       'set -euo pipefail',
+      'git init -q "$TMPDIR/candidate-git-probe"',
       `bun --no-env-file -e ${JSON.stringify(bunProgram)}`,
       '',
     ].join('\n'))
@@ -1739,7 +1748,9 @@ describe('Codex branch self update', () => {
     must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
 
     const result = runUpdater(fixture, ['--no-restart'])
-    expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0)
+    const output = `${result.stderr}\n${result.stdout}`
+    expect(result.exitCode, output).toBe(0)
+    expect(output).not.toContain('xcrun_db')
   }, 15_000)
 
   test.skipIf(process.platform !== 'darwin')('candidate sandboxのselected Git検証はclean checkoutを通す', () => {
