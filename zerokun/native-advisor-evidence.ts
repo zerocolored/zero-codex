@@ -74,13 +74,14 @@ export function resolveNativeAdvisorThreadIds(options: {
   parentThreadId: string
   repoPath: string
   rounds: NativeAdvisorRoundEvidence[]
+  parentResponse: unknown
   childResponses: Map<string, unknown>
 }): NativeAdvisorRoundEvidence[] {
   const repo = realpathSync(options.repoPath)
-  const candidates: Array<{
+  const childThreads: Array<{
     threadId: string
     perspective: NativeAdvisorPerspective
-    finalResponse: string
+    thread: Record<string, unknown>
   }> = []
   for (const [threadId, response] of options.childResponses) {
     if (!THREAD_ID.test(threadId)) {
@@ -99,15 +100,31 @@ export function resolveNativeAdvisorThreadIds(options: {
       || physicalCwd(child.cwd, `native advisor physical thread ${threadId}`) !== repo) {
       throw new Error(`native advisor physical thread ${threadId} identity or role is invalid`)
     }
-    candidates.push({
+    childThreads.push({
       threadId,
       perspective,
-      finalResponse: completedFinalResponse(
-        child,
-        `native advisor physical thread ${threadId}`,
-      ),
+      thread: child,
     })
   }
+  const directChildIds = new Set(childThreads.map(child => child.threadId))
+  const parentActivityTimeline = parentSubagentActivityTimeline(
+    options.parentResponse,
+    options.parentThreadId,
+  )
+  const candidates = childThreads.map(child => ({
+    threadId: child.threadId,
+    perspective: child.perspective,
+    finalResponse: completedFinalResponse(
+      child.thread,
+      `native advisor physical thread ${child.threadId}`,
+      directChildIds,
+      inheritedParentActivitiesForChild(
+        parentActivityTimeline,
+        child.threadId,
+        directChildIds,
+      ),
+    ),
+  }))
 
   const logicalAgentIds = new Set<string>()
   const matchedThreadIds = new Set<string>()
@@ -193,7 +210,82 @@ function childSourceParent(thread: Record<string, unknown>): string | null {
   return typeof parent === 'string' && depth === 1 ? parent : null
 }
 
-function completedFinalResponse(thread: Record<string, unknown>, label: string): string {
+function subagentActivityFingerprint(item: Record<string, unknown>): string | null {
+  if (typeof item.id !== 'string' || !THREAD_ID.test(item.id)
+    || typeof item.kind !== 'string' || !SUBAGENT_ACTIVITY_KINDS.has(item.kind)
+    || typeof item.agentThreadId !== 'string' || !THREAD_ID.test(item.agentThreadId)) {
+    return null
+  }
+  return JSON.stringify([item.id, item.kind, item.agentThreadId])
+}
+
+type ParentSubagentActivity = {
+  fingerprint: string
+  kind: string
+  agentThreadId: string
+  ordinal: number
+}
+
+function parentSubagentActivityTimeline(
+  response: unknown,
+  parentThreadId: string,
+): ParentSubagentActivity[] {
+  const parent = threadFromResponse(response, 'native advisor parent activity source')
+  if (parent.id !== parentThreadId || !Array.isArray(parent.turns)) {
+    throw new Error('native advisor parent activity source is invalid')
+  }
+  const timeline: ParentSubagentActivity[] = []
+  const itemIds = new Set<string>()
+  let ordinal = 0
+  for (const rawTurn of parent.turns) {
+    if (!rawTurn || typeof rawTurn !== 'object' || Array.isArray(rawTurn)) continue
+    const turn = rawTurn as Record<string, unknown>
+    if (!Array.isArray(turn.items)) continue
+    for (const rawItem of turn.items) {
+      if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) continue
+      const item = rawItem as Record<string, unknown>
+      if (item.type !== 'subAgentActivity') continue
+      const fingerprint = subagentActivityFingerprint(item)
+      if (fingerprint === null) continue
+      if (itemIds.has(item.id as string)) {
+        throw new Error('native advisor parent activity item identity is duplicated')
+      }
+      itemIds.add(item.id as string)
+      timeline.push({
+        fingerprint,
+        kind: item.kind as string,
+        agentThreadId: item.agentThreadId as string,
+        ordinal,
+      })
+      ordinal += 1
+    }
+  }
+  return timeline
+}
+
+function inheritedParentActivitiesForChild(
+  timeline: readonly ParentSubagentActivity[],
+  currentThreadId: string,
+  directChildIds: ReadonlySet<string>,
+): Set<string> {
+  const currentStarts = timeline.filter(activity => (
+    activity.kind === 'started' && activity.agentThreadId === currentThreadId
+  ))
+  if (currentStarts.length !== 1) return new Set()
+  const currentStartOrdinal = currentStarts[0]!.ordinal
+  return new Set(timeline.filter(activity => (
+    activity.ordinal < currentStartOrdinal
+    && activity.agentThreadId !== currentThreadId
+    && directChildIds.has(activity.agentThreadId)
+  )).map(activity => activity.fingerprint))
+}
+
+function completedFinalResponse(
+  thread: Record<string, unknown>,
+  label: string,
+  directChildIds: ReadonlySet<string> = new Set(),
+  inheritedParentActivities: ReadonlySet<string> = new Set(),
+): string {
   if (!Array.isArray(thread.turns) || thread.turns.length < 1
     || thread.turns.length > 2) {
     throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
@@ -217,6 +309,17 @@ function completedFinalResponse(thread: Record<string, unknown>, label: string):
       if (typeof item.kind !== 'string' || !SUBAGENT_ACTIVITY_KINDS.has(item.kind)
         || typeof item.agentThreadId !== 'string' || !THREAD_ID.test(item.agentThreadId)) {
         throw new Error(`${label} contains invalid subagent activity`)
+      }
+      const fingerprint = subagentActivityFingerprint(item)
+      if (turn.status === 'interrupted' && item.agentThreadId !== thread.id
+        && directChildIds.has(item.agentThreadId) && fingerprint !== null
+        && inheritedParentActivities.has(fingerprint)) {
+        // Codex forks a child from the parent's current turn. App Server can
+        // therefore project an already-recorded sibling activity into the
+        // child's single interrupted precursor. It is inherited history, not
+        // a delegation by this advisor. Exact parent item identity plus the
+        // direct-sibling lineage distinguishes it from a real grandchild.
+        continue
       }
       throw new Error(`${label} delegated to another subagent`)
     }
@@ -288,6 +391,11 @@ export function assertNativeAdvisorEvidence(options: {
   }
   const repo = realpathSync(options.repoPath)
   const parent = threadFromResponse(options.parentResponse, 'native advisor parent response')
+  const directChildIds = new Set(options.childResponses.keys())
+  const parentActivityTimeline = parentSubagentActivityTimeline(
+    options.parentResponse,
+    options.parentThreadId,
+  )
   const parentSource = parseAppServerSessionSource(
     parent.source,
     'native advisor parent source',
@@ -354,7 +462,16 @@ export function assertNativeAdvisorEvidence(options: {
         || physicalCwd(child.cwd, `native advisor ${entry.agentId}`) !== repo) {
         throw new Error(`native advisor ${entry.agentId} identity or role is invalid`)
       }
-      const finalResponse = completedFinalResponse(child, `native advisor ${entry.agentId}`)
+      const finalResponse = completedFinalResponse(
+        child,
+        `native advisor ${entry.agentId}`,
+        directChildIds,
+        inheritedParentActivitiesForChild(
+          parentActivityTimeline,
+          entry.agentId,
+          directChildIds,
+        ),
+      )
       const descendants = options.childChildrenListResponses.get(entry.agentId)
       if (!descendants) {
         throw new Error(`native advisor ${entry.agentId} descendant listing is missing`)

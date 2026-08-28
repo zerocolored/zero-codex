@@ -140,6 +140,7 @@ describe('native Codex advisor host evidence', () => {
       parentThreadId: options.parentThreadId,
       repoPath: options.repoPath,
       rounds: options.rounds,
+      parentResponse: options.parentResponse,
       childResponses: options.childResponses,
     })
     expect(resolved[0]!.native.map(entry => entry.agentId)).toEqual([solutionId, riskId])
@@ -159,6 +160,95 @@ describe('native Codex advisor host evidence', () => {
       ],
     })
     expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
+  })
+
+  test('fork時に親から継承した別direct advisorのactivityだけを許容する', () => {
+    const accepted = fixture()
+    const parent = accepted.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    const inherited = {
+      type: 'subAgentActivity', id: 'solution-spawn-item',
+      kind: 'started', agentThreadId: accepted.solutionId,
+    }
+    parent.thread.turns[0]!.items[0] = inherited
+    parent.thread.turns[0]!.items[1] = {
+      type: 'subAgentActivity', id: 'risk-spawn-item',
+      kind: 'started', agentThreadId: accepted.riskId,
+    }
+    const risk = accepted.options.childResponses.get(accepted.riskId) as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    risk.thread.turns.unshift({
+      status: 'interrupted', itemsView: 'full', items: [{ ...inherited }],
+    })
+    expect(() => resolveNativeAdvisorThreadIds({
+      attemptNonce: accepted.options.attemptNonce,
+      parentThreadId: accepted.options.parentThreadId,
+      repoPath: accepted.options.repoPath,
+      rounds: accepted.options.rounds,
+      parentResponse: accepted.options.parentResponse,
+      childResponses: accepted.options.childResponses,
+    })).not.toThrow()
+    expect(() => assertNativeAdvisorEvidence(accepted.options)).not.toThrow()
+
+    const forged = fixture()
+    const forgedParent = forged.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    forgedParent.thread.turns[0]!.items[0] = inherited
+    forgedParent.thread.turns[0]!.items[1] = {
+      type: 'subAgentActivity', id: 'risk-spawn-item',
+      kind: 'started', agentThreadId: forged.riskId,
+    }
+    const forgedRisk = forged.options.childResponses.get(forged.riskId) as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    forgedRisk.thread.turns.unshift({
+      status: 'interrupted', itemsView: 'full',
+      items: [{ ...inherited, id: 'different-spawn-item' }],
+    })
+    expect(() => assertNativeAdvisorEvidence(forged.options)).toThrow(
+      'delegated to another subagent',
+    )
+
+    const outOfOrder = fixture()
+    const outOfOrderParent = outOfOrder.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    outOfOrderParent.thread.turns[0]!.items = [
+      {
+        type: 'subAgentActivity', id: 'risk-spawn-item',
+        kind: 'started', agentThreadId: outOfOrder.riskId,
+      },
+      { ...inherited },
+    ]
+    const outOfOrderRisk = outOfOrder.options.childResponses.get(outOfOrder.riskId) as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    outOfOrderRisk.thread.turns.unshift({
+      status: 'interrupted', itemsView: 'full', items: [{ ...inherited }],
+    })
+    expect(() => assertNativeAdvisorEvidence(outOfOrder.options)).toThrow(
+      'delegated to another subagent',
+    )
+
+    const completed = fixture()
+    const completedParent = completed.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    completedParent.thread.turns[0]!.items[0] = inherited
+    completedParent.thread.turns[0]!.items[1] = {
+      type: 'subAgentActivity', id: 'risk-spawn-item',
+      kind: 'started', agentThreadId: completed.riskId,
+    }
+    const completedRisk = completed.options.childResponses.get(completed.riskId) as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    completedRisk.thread.turns[0]!.items.unshift({ ...inherited })
+    expect(() => assertNativeAdvisorEvidence(completed.options)).toThrow(
+      'delegated to another subagent',
+    )
   })
 
   test('interrupted precursorのfinal・再委任・複数precursorを拒否する', () => {
@@ -210,6 +300,7 @@ describe('native Codex advisor host evidence', () => {
       parentThreadId: unmatched.options.parentThreadId,
       repoPath: unmatched.options.repoPath,
       rounds: unmatched.options.rounds,
+      parentResponse: unmatched.options.parentResponse,
       childResponses: unmatched.options.childResponses,
     })).toThrow('exactly one physical thread')
 
@@ -225,6 +316,7 @@ describe('native Codex advisor host evidence', () => {
       parentThreadId: ambiguous.options.parentThreadId,
       repoPath: ambiguous.options.repoPath,
       rounds: ambiguous.options.rounds,
+      parentResponse: ambiguous.options.parentResponse,
       childResponses: ambiguous.options.childResponses,
     })).toThrow('exactly one physical thread')
 
@@ -240,6 +332,7 @@ describe('native Codex advisor host evidence', () => {
       parentThreadId: extra.options.parentThreadId,
       repoPath: extra.options.repoPath,
       rounds: extra.options.rounds,
+      parentResponse: extra.options.parentResponse,
       childResponses: extra.options.childResponses,
     })).toThrow('unjournaled physical child thread')
   })

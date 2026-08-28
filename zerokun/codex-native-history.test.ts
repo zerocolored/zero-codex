@@ -469,6 +469,56 @@ describe('native advisor App Server history', () => {
     }
   })
 
+  test('fork時に親から継承されたsibling activityを全履歴viewで識別する', async () => {
+    for (const itemsListSupported of [true, false]) {
+      const value = fixture(
+        true,
+        null,
+        itemsListSupported,
+        null,
+        'logical-labels-with-uuid-threads',
+      )
+      const original = value.options.readForTesting!
+      const solutionId = '01a04329-fa9b-7562-bbfe-1258a97e9071'
+      const riskId = '01a0432a-1683-7142-b2a0-22726fdfa8b7'
+      const precursor = {
+        id: `${riskId}-inherited-precursor`,
+        status: 'interrupted',
+        itemsView: 'full',
+        error: null,
+        items: [{
+          type: 'subAgentActivity', id: `${solutionId}-activity`,
+          kind: 'started', agentThreadId: solutionId,
+        }],
+      }
+      value.options.readForTesting = async (method, params) => {
+        const threadId = String(params.threadId ?? '')
+        if (method === 'thread/items/list' && threadId === riskId
+          && params.turnId === precursor.id) {
+          if (!itemsListSupported) return original(method, params)
+          return {
+            data: precursor.items.map(item => ({ turnId: precursor.id, item })),
+            nextCursor: null,
+          }
+        }
+        const response = await original(method, params)
+        if (threadId !== riskId) return response
+        if (method === 'thread/turns/list') {
+          return { ...response, data: [precursor, ...(response.data as unknown[])] }
+        }
+        if (method === 'thread/read' && params.includeTurns === true) {
+          const thread = response.thread as Record<string, unknown>
+          return {
+            ...response,
+            thread: { ...thread, turns: [precursor, ...(thread.turns as unknown[])] },
+          }
+        }
+        return response
+      }
+      await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+    }
+  })
+
   test('child fullに未反映の再委任activityもitems/listから検出する', async () => {
     const value = fixture(true, 'solution-delegated')
     await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(

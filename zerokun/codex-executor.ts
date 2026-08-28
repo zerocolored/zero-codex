@@ -2305,6 +2305,7 @@ export async function assertNativeAdvisorHistory(options: {
       parentThreadId: options.parentThreadId,
       repoPath: options.repoPath,
       rounds: options.rounds,
+      parentResponse: snapshot.parentResponse,
       childResponses: snapshot.childResponses,
     })
     assertNativeAdvisorEvidence({
