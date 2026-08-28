@@ -6376,6 +6376,53 @@ export function sanitizeExecutionTextForSlack(
     sanitized = sanitized.split(value).join('（内部情報を省略）')
   }
 
+  // A commit SHA is useful completion evidence, but a bare hex token is also
+  // indistinguishable from Zero's runtime IDs. Preserve it only when the
+  // answer labels it as a commit and Git confirms that it names a commit in
+  // the repository handled by this job.
+  const gitBinary = Bun.which('git', {
+    PATH: '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin',
+  })
+  const verifiedGitCommits = new Map<string, boolean>()
+  const isVerifiedGitCommit = (value: string): boolean => {
+    const normalized = value.toLowerCase()
+    const cached = verifiedGitCommits.get(normalized)
+    if (cached != null) return cached
+    let verified = false
+    if (gitBinary && /^[0-9a-f]{7,64}$/i.test(value)) {
+      try {
+        const result = Bun.spawnSync([
+          gitBinary, '-C', job.repoPath, 'cat-file', '-e', `${value}^{commit}`,
+        ], {
+          env: {
+            PATH: '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin',
+            GIT_CONFIG_GLOBAL: '/dev/null',
+            GIT_CONFIG_NOSYSTEM: '1',
+            LC_ALL: 'C',
+            LANG: 'C',
+          },
+          stdout: 'ignore',
+          stderr: 'ignore',
+        })
+        verified = result.exitCode === 0
+      } catch {}
+    }
+    verifiedGitCommits.set(normalized, verified)
+    return verified
+  }
+  const protectedGitCommits: string[] = []
+  const gitCommitPlaceholderNonce = [...randomUUID().replaceAll('-', '')]
+    .map(character => String.fromCharCode(71 + Number.parseInt(character, 16)))
+    .join('')
+  sanitized = sanitized.replace(
+    /(?<![A-Za-z0-9_])((?:commit(?:[ \t]*(?:id|sha|hash))?|コミット(?:[ \t]*(?:ID|SHA|ハッシュ))?)[ \t]*[:：#]?[ \t]*`?)([0-9a-f]{7,64})(`?)(?![0-9a-f])/gi,
+    (match, prefix: string, value: string, suffix: string) => {
+      if (!isVerifiedGitCommit(value)) return match
+      const index = protectedGitCommits.push(value) - 1
+      return `${prefix}\uE004${gitCommitPlaceholderNonce}_${index}\uE005${suffix}`
+    },
+  )
+
   // Strip path and runtime-identity shapes before replacing their component
   // implementation names. Otherwise `~/.codex/...` could become a partially
   // redacted path that still reveals the host layout.
@@ -6510,6 +6557,15 @@ export function sanitizeExecutionTextForSlack(
   // detector, never in the visible text. Internal/local schemes and URLs that
   // embed a local root or credential path are removed as a whole, closing
   // host, triple-slash and percent-encoded variants without leaking suffixes.
+  const protectedMimeTypes: string[] = []
+  const mimePlaceholderNonce = randomUUID().replaceAll('-', '')
+  sanitized = sanitized.replace(
+    /\b(?:application|audio|font|image|message|model|multipart|text|video)\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,127}(?![A-Za-z0-9!#$&^_.+\\/%-])/gi,
+    value => {
+      const index = protectedMimeTypes.push(value) - 1
+      return `\uE006${mimePlaceholderNonce}_${index}\uE007`
+    },
+  )
   const protectedPublicUrls: string[] = []
   const urlPlaceholderNonce = randomUUID().replaceAll('-', '')
   const isLocalHostname = (input: string): boolean => {
@@ -6720,6 +6776,9 @@ export function sanitizeExecutionTextForSlack(
   )
   protectedPublicUrls.forEach((url, index) => {
     sanitized = sanitized.replaceAll(`\uE000${urlPlaceholderNonce}_${index}\uE001`, url)
+  })
+  protectedMimeTypes.forEach((mimeType, index) => {
+    sanitized = sanitized.replaceAll(`\uE006${mimePlaceholderNonce}_${index}\uE007`, mimeType)
   })
 
   // Credentials are never safe to echo into a shared Slack thread, even when
@@ -7010,6 +7069,11 @@ export function sanitizeExecutionTextForSlack(
     /\b[UCBWD][A-Z0-9]{8,}\b/g,
     value => userText.includes(value) ? value : '（内部IDを省略）',
   )
+  protectedGitCommits.forEach((commit, index) => {
+    sanitized = sanitized.replaceAll(
+      `\uE004${gitCommitPlaceholderNonce}_${index}\uE005`, commit,
+    )
+  })
   return sanitized.trim()
 }
 

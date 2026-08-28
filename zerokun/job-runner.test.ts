@@ -8350,6 +8350,47 @@ describe('Slack output guard', () => {
     }
   })
 
+  test('Gitで検証できたcommit IDと標準MIME typeをSlack完了報告へ保持する', () => {
+    const state = fixtureDir()
+    const repo = join(state, 'repo-completion-evidence')
+    mkdirSync(repo)
+    git(['init', '-q'], repo)
+    git(['config', 'user.email', 'test@example.com'], repo)
+    git(['config', 'user.name', 'test'], repo)
+    writeFileSync(join(repo, 'index.html'), '<h1>Hello</h1>\n')
+    git(['add', 'index.html'], repo)
+    git(['commit', '-m', 'initial'], repo)
+    const commit = git(['rev-parse', 'HEAD'], repo)
+    const shortCommit = commit.slice(0, 12)
+    const unverified = '0123456789abcdef0123456789abcdef01234567'
+
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({
+      repoPath: repo,
+      task: 'HTTPのMIME typeとcommit IDを報告してください',
+    }))
+    const job = store.claimNext('serial-worker')!
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'completion-evidence-answer',
+      result: [
+        'HTTP: 200, text/html; charset=utf-8',
+        'API: application/json',
+        `Commit: ${commit}`,
+        `コミットID: ${shortCommit}`,
+        `Commit: ${unverified}`,
+        'not-mime: text/html/../../Users/alice/secret',
+      ].join('\n'),
+    }, state)
+
+    expect(finalized.result).toContain('HTTP: 200, text/html; charset=utf-8')
+    expect(finalized.result).toContain('API: application/json')
+    expect(finalized.result).toContain(`Commit: ${commit}`)
+    expect(finalized.result).toContain(`コミットID: ${shortCommit}`)
+    expect(finalized.result).not.toContain(unverified)
+    expect(finalized.result).not.toContain('/Users/alice/secret')
+    store.close()
+  })
+
   test('公開URLは保持しlocal URI・多重encode・Windows pathだけを落とす', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
