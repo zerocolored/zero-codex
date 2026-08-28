@@ -2636,7 +2636,7 @@ export function buildCodexWorkerPrompt(
   if (!job.writeEnabled) {
     control.push(
       'Host mode: read-only investigation.',
-      `Write access command for this sender: zerokun-access write allow ${job.userId}`,
+      `Write access command for this sender: zerochan-access write allow ${job.userId}`,
     )
     if (host.advisorEnabled) {
       control.push(
@@ -2846,7 +2846,7 @@ export function buildCodexLiveControlPrompt(
       )
     } else if (stage === 'complete' && job && !job.writeEnabled) {
       prompt.push(
-        `Write access command for this sender: zerokun-access write allow ${control.userId}`,
+        `Write access command for this sender: zerochan-access write allow ${control.userId}`,
         `Each fresh native advisor response for this input must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${control.inputRevision}:${control.inputDigest}:investigation:1:<solution|risk>] after replacing only the final perspective placeholder.`,
       )
     }

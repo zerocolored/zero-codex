@@ -264,13 +264,12 @@ Codex queueへ引き継ぎ、停止後もrunningだった不確実なjobは二�
 ## State
 
 既定は常に `~/.codex/zerokun` です。旧版の`~/.claude/channels/slack`は自動選択せず、
-別PCのClaude版のtoken・access・queue・routesを暗黙に流用しません。比較時はこのPC専用の
+別PCのClaude版のtoken・access・queueを暗黙に流用しません。比較時はこのPC専用の
 新しいSlack Appを作成します。同一PCのin-place cutoverだけcutoverフラグと旧stateを明示します。
 
 ```text
 .env
 access.json
-routes.json
 jobs.sqlite3
 job-logs/
 job-monitors/<job-id>/
@@ -304,9 +303,13 @@ zerochan --restart  # 前回Slackへ接続できたprojectで再起動
 zerokun             # 互換alias。現在directoryで起動
 zerokun-status
 zerokun-jobs status
-zerokun-access status
+zerochan-access status
 zerokun-update
 ```
+
+チャンネルはZeroちゃんを招待するだけで利用できます。新しい依頼はメンション、同じthreadの
+続きはメンション不要です。DMとchannelの新しいthreadはいずれも、`zerochan`を実行した現在の
+projectへ固定されるため、channel登録や`routes.json`の編集は不要です。
 
 log:
 

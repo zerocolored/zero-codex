@@ -1248,35 +1248,34 @@ codex --version
     }
   })
 
-  test('許可channelの初期routeを追加し、既存routeは保持する', () => {
-    const state = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-routes-'))
-    const project = join(state, 'project')
-    mkdirSync(project)
-    writeFileSync(join(state, 'access.json'), JSON.stringify({
-      channels: { CNEW123: {}, CKEEP123: {} },
-    }))
-    writeFileSync(join(state, 'routes.json'), JSON.stringify({
-      CKEEP123: { repo_path: '/existing/repo', label: 'Existing' },
-    }))
+  test('channel・利用者・routeの入力なしでaccess設定を完了する', () => {
+    const state = mkdtempSync(join(tmpdir(), 'zerochan-bootstrap-access-'))
+    const accessPath = join(state, 'access.json')
+    const obsoleteRoutes = join(state, 'routes.json')
+    writeFileSync(accessPath, JSON.stringify({
+      dmPolicy: 'pairing',
+      allowFrom: [],
+      writeAllowFrom: [],
+      channels: {},
+      pending: {},
+    }), { mode: 0o600 })
+    writeFileSync(obsoleteRoutes, 'legacy route must stay untouched\n', { mode: 0o600 })
     try {
       const command = [
         'bootstrap_path="$1"',
         'target_state="$2"',
-        'target_project="$3"',
         'set --',
         'source "$bootstrap_path"',
         'STATE_DIR="$target_state"',
-        'PROJECT_DIR="$target_project"',
-        'configure_routes_from_access',
+        'configure_access',
       ].join('; ')
       const result = Bun.spawnSync([
-        '/bin/bash', '-c', command, 'bash', bootstrap, state, project,
+        '/bin/bash', '-c', command, 'bash', bootstrap, state,
       ], { stdout: 'pipe', stderr: 'pipe' })
       expect(result.exitCode, result.stderr.toString()).toBe(0)
-      const routes = JSON.parse(readFileSync(join(state, 'routes.json'), 'utf8'))
-      expect(routes.CKEEP123.repo_path).toBe('/existing/repo')
-      expect(routes.CNEW123.repo_path).toBe(realpathSync(project))
-      expect(statSync(join(state, 'routes.json')).mode & 0o777).toBe(0o600)
+      expect(result.stdout.toString()).toContain('チャンネルはZeroちゃんを招待すると自動で利用できます')
+      expect(result.stdout.toString()).toContain('zerochan-access pair <code>')
+      expect(readFileSync(obsoleteRoutes, 'utf8')).toBe('legacy route must stay untouched\n')
     } finally {
       rmSync(state, { recursive: true, force: true })
     }
@@ -1644,6 +1643,11 @@ codex --version
     const projectDir = join(fakeHome, 'Work/BellSalesAI custom')
     const tokenFile = join(stateDir, '.env')
     try {
+      const testPath = setupTestPath(fakeHome)
+      symlinkSync(
+        join(root, 'zerokun/access.ts'),
+        join(fakeHome, '.local/bin/zerokun-access'),
+      )
       mkdirSync(join(stateDir, 'owner/claude-config/.git'), { recursive: true })
       mkdirSync(join(stateDir, 'owner/claude-skills/.git'), { recursive: true })
       mkdirSync(projectDir, { recursive: true })
@@ -1662,7 +1666,7 @@ codex --version
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
-          PATH: setupTestPath(fakeHome),
+          PATH: testPath,
         },
         stdout: 'pipe',
         stderr: 'pipe',
@@ -1680,6 +1684,8 @@ codex --version
       expect(zshrc).toContain("alias zerokun-restart='zerochan --restart'")
       expect(existsSync(join(fakeHome, '.local/bin/zerochan'))).toBe(true)
       expect(existsSync(join(fakeHome, '.local/bin/zerokun'))).toBe(true)
+      expect(existsSync(join(fakeHome, '.local/bin/zerochan-access'))).toBe(true)
+      expect(existsSync(join(fakeHome, '.local/bin/zerokun-access'))).toBe(false)
       expect(statSync(join(fakeHome, '.zshrc')).mode & 0o777).toBe(0o644)
       expect(readFileSync(
         join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),

@@ -116,8 +116,8 @@ bootstrap完了後、HerdrにZeroちゃん専用paneを用意して、そのpane
 ```bash
 codex login status
 # `Logged in using ChatGPT` 以外（API key認証を含む）ではZeroちゃんは起動しません
-zerokun-access status
-zerokun
+zerochan-access status
+zerochan
 ```
 
 別 terminal で確認:
@@ -130,7 +130,7 @@ zerokun-jobs status
 Slack で DM し、返された code を端末で承認します。
 
 ```bash
-zerokun-access pair <6桁code>
+zerochan-access pair <6桁code>
 ```
 
 認可後の依頼が実行段階へ入ると、同じHerdr workspaceに`Zeroちゃん #<待ち順>`という監視tabが
@@ -146,14 +146,15 @@ Slack deliveryだけはFIFOと独立に再試行します。
 変更依頼も許可する利用者だけ write access を追加します。
 
 ```bash
-zerokun-access write allow <Slack user ID>
+zerochan-access write allow <Slack user ID>
 ```
 
 write access を付けない利用者は、HOME/stateをdenyして対象repositoryと当該添付だけを読む
 job専用permission profileで調査・説明だけを利用できます。
 
-Zeroちゃん本体repositoryへのwrite jobはhost runtime保護のため拒否されます。変更対象は必ず別の
-`--project-dir`/`routes.json`へ割り当ててください。Codex shellはHOME credentialを継承しないため、
+Zeroちゃん本体repositoryへのwrite jobはhost runtime保護のため拒否されます。変更対象projectへ
+`cd`して`zerochan`を起動してください。新しいDM/channel threadはそのprojectへ固定されます。
+Codex shellはHOME credentialを継承しないため、
 commit identityは対象repositoryのlocal configへ設定し、認証pushは別の安全なHOME外方式を用意します。
 
 ## 再実行

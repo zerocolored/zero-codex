@@ -165,7 +165,7 @@ describe('Zero-kun Codex wiring', () => {
       'job-runner.ts',
       'codex-executor.ts',
       'update-runtime.ts',
-      'zerokun-access',
+      'zerochan-access',
       'codex-channel',
       'zerokun-update',
       'watchdog.sh',
@@ -181,6 +181,11 @@ describe('Zero-kun Codex wiring', () => {
       'slack-http.ts',
       'slack-app-identity.ts',
     ]) expect(runtime).toContain(`'${companion}'`)
+    expect(setup).toContain('ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerochan-access"')
+    expect(setup).not.toContain('ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerokun-access"')
+    expect(setup).toContain(
+      'remove_owned_legacy_link "$HOME/.local/bin/zerokun-access" "$REPO_DIR/zerokun/access.ts"',
+    )
     expect(setup).not.toContain('command -v claude')
     expect(setup).not.toContain('claude-config')
     expect(setup).not.toContain('claude-skills')

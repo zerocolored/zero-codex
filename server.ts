@@ -2,7 +2,7 @@
 /**
  * Standalone Slack gateway for Codex.
  *
- * Self-contained gateway with pairing, allowlists, per-channel policies,
+ * Self-contained gateway with DM pairing, membership-based channel access,
  * durable FIFO hand-off, and thread catch-up. Installations use
  * ~/.codex/zerokun/ unless ZEROKUN_STATE_DIR explicitly selects another state.
  */
@@ -27,9 +27,10 @@ import {
   advanceReadCursor,
   retreatReadCursor,
   isTerminalSlackHistoryError,
+  isSlackBotAuthored,
   slackReplyScanFailureDisposition,
   validateLegacyThreadMap,
-  type ChannelPolicy,
+  SLACK_USER_ID_RE,
 } from './gate.ts'
 import { requestUpdate, resumePendingUpdateWorker } from './zerokun/update-request.ts'
 import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
@@ -63,6 +64,7 @@ import {
   AccessLockReleaseError,
   mutateAccess,
   readAccess,
+  rememberChannel,
   type AccessConfig,
 } from './zerokun/access.ts'
 import { readOptionalPrivateFile } from './zerokun/safe-file.ts'
@@ -92,7 +94,6 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const LOCK_FILE = join(STATE_DIR, 'plugin.lock')
 const THREADS_FILE = join(STATE_DIR, 'threads.json')
-const ROUTES_FILE = join(STATE_DIR, 'routes.json')
 const UPDATE_JOURNAL_FILE = join(STATE_DIR, 'update-transaction.json')
 const UPDATE_LOCK_DIR = join(STATE_DIR, 'update.lock')
 const UPDATE_REQUEST_FILE = process.env.ZEROKUN_UPDATE_REQUEST ?? join(STATE_DIR, 'update-request.ts')
@@ -260,49 +261,58 @@ async function gate(
   isBot: boolean = false,
   activeThreadAuthority = false,
 ): Promise<GateResult> {
+  const isDM = channelType === 'im'
+  if (isBot || !SLACK_USER_ID_RE.test(senderId)) return { action: 'drop' }
+  if (!isDM) {
+    const access = loadAccess()
+    const decision = decideChannelPolicy(
+      access.channels[channelId], senderId, isMention, isBot, activeThreadAuthority,
+    )
+    if (decision === 'drop') return { action: 'drop' }
+    try {
+      rememberChannel(channelId, ACCESS_FILE)
+      return { action: 'deliver', access: loadAccess() }
+    } catch (error) {
+      if (error instanceof AccessLockReleaseError) {
+        process.stderr.write(`slack channel: fatal access lock release failure: ${error.message}\n`)
+        shutdown()
+      }
+      throw error
+    }
+  }
   try {
     return mutateAccess((access): GateResult => {
       pruneExpired(access)
-      const isDM = channelType === 'im'
 
-      if (access.dmPolicy === 'disabled' && isDM) return { action: 'drop' }
-      if (isBotDMBlocked(isDM ? 'im' : 'channel', isBot)) return { action: 'drop' }
+      if (access.dmPolicy === 'disabled') return { action: 'drop' }
+      if (isBotDMBlocked('im', isBot)) return { action: 'drop' }
 
-      if (isDM) {
-        if (activeThreadAuthority && !isBot) {
-          return { action: 'deliver', access }
-        }
-        // Being on any opted-in channel's allowFrom carries into DMs.
-        if (effectiveDmAllowFrom(access).includes(senderId)) {
-          return { action: 'deliver', access }
-        }
-        if (access.dmPolicy === 'allowlist') return { action: 'drop' }
-
-        for (const [code, pending] of Object.entries(access.pending)) {
-          if (pending.senderId !== senderId) continue
-          if ((pending.replies ?? 1) >= 2) return { action: 'drop' }
-          pending.replies = (pending.replies ?? 1) + 1
-          return { action: 'pair', code, isResend: true }
-        }
-        if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
-
-        const code = randomBytes(3).toString('hex')
-        const now = Date.now()
-        access.pending[code] = {
-          senderId,
-          chatId: channelId,
-          createdAt: now,
-          expiresAt: now + 60 * 60 * 1000,
-          replies: 1,
-        }
-        return { action: 'pair', code, isResend: false }
+      if (activeThreadAuthority && !isBot) {
+        return { action: 'deliver', access }
       }
+      if (effectiveDmAllowFrom(access).includes(senderId)) {
+        return { action: 'deliver', access }
+      }
+      if (access.dmPolicy === 'allowlist') return { action: 'drop' }
 
-      const decision = decideChannelPolicy(
-        access.channels[channelId], senderId, isMention, isBot, activeThreadAuthority,
-      )
-      if (decision === 'drop') return { action: 'drop' }
-      return { action: 'deliver', access }
+      for (const [code, pending] of Object.entries(access.pending)) {
+        if (pending.senderId !== senderId) continue
+        if ((pending.replies ?? 1) >= 2) return { action: 'drop' }
+        pending.replies = (pending.replies ?? 1) + 1
+        return { action: 'pair', code, isResend: true }
+      }
+      if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
+
+      const code = randomBytes(3).toString('hex')
+      const now = Date.now()
+      access.pending[code] = {
+        senderId,
+        chatId: channelId,
+        createdAt: now,
+        expiresAt: now + 60 * 60 * 1000,
+        replies: 1,
+      }
+      return { action: 'pair', code, isResend: false }
     }, ACCESS_FILE)
   } catch (error) {
     if (error instanceof AccessLockReleaseError) {
@@ -432,28 +442,16 @@ function rememberDelivered(key: string): void {
   }
 }
 
-type RouteEntry = { repo_path?: unknown; label?: unknown }
-
-function configuredRepoPath(chatId: string): string | undefined {
-  if (!chatId.startsWith('D')) {
-    try {
-      const content = readOptionalPrivateFile(ROUTES_FILE)
-      const routes = content === null ? {} : JSON.parse(content) as Record<string, RouteEntry>
-      const value = routes[chatId]?.repo_path
-      if (typeof value === 'string' && value.trim()) return value
-    } catch {}
-  }
-  return undefined
-}
-
-function resolveRepoPath(chatId: string, threadTs: string): string {
-  const adopted = jobStore.getThread(chatId, threadTs)
-  if (adopted) return realpathSync(adopted.repoPath)
-
-  const configured = configuredRepoPath(chatId)
-  const repoPath = realpathSync(requireRepoRoute(chatId, configured, process.cwd()))
+function resolveRepoPath(chatId: string, threadTs: string, adoptedFromTs: string): string {
+  const repoPath = realpathSync(requireRepoRoute(chatId, undefined, process.cwd()))
   if (!statSync(repoPath).isDirectory()) throw new Error(`route is not a directory: ${repoPath}`)
-  return repoPath
+  const pinned = jobStore.resolveOrAdoptThread({
+    chatId,
+    threadTs,
+    repoPath,
+    adoptedFromTs,
+  })
+  return realpathSync(pinned.repoPath)
 }
 
 async function downloadInboundFiles(
@@ -811,9 +809,9 @@ function deliver(
   const handOver = (async () => {
     const access = loadAccess()
     const writeEnabled = access.writeAllowFrom.includes(userId)
-    // Resolve before the detached-update branch too: an allow-list entry does
-    // not authorize an otherwise unrouted channel to execute host operations.
-    const repoPath = resolveRepoPath(chatId, resolvedThreadTs)
+    // Pin before detached update or attachment I/O so a concurrent zerochan
+    // project switch cannot split one Slack thread across repositories.
+    const repoPath = resolveRepoPath(chatId, resolvedThreadTs, messageTs)
     if (writeEnabled && isExplicitUpdateRequest(text)) {
       if (!jobStore.hasUpdateRequest(key)) {
         // The request file is the recoverable pre-launch state. Record the
@@ -869,12 +867,11 @@ function deliver(
 // Handle @mentions in channels
 slackApp.event('app_mention', async ({ event }) => {
   if (updateTransactionPending(UPDATE_JOURNAL_FILE)) return
-  // Symmetric with the message handler: bot posts that @mention this app
-  // are routed through the same allowFrom-based opt-in. In practice bots
-  // rarely @mention apps (forwarder/digest workflows are the main cases),
-  // but keeping the rule consistent avoids a hidden second policy.
+  // Symmetric with the message handler: bot posts that @mention this app are
+  // rejected by the same membership-based gate instead of gaining an implicit
+  // automation-to-automation control path.
   const ev = event as any
-  const isBot = !!ev.bot_id
+  const isBot = isSlackBotAuthored(ev)
   const senderId: string | undefined = isBot ? ev.bot_id : ev.user
   if (!senderId) return
   const channelId = event.channel
@@ -923,13 +920,12 @@ slackApp.event('message', async ({ event }) => {
   // silently never reached the worker ("画像のとき発火しない"). The downstream
   // code already extracts msg.files and forwards file_ids, so letting
   // file_share through is sufficient.
-  const isBot = !!msg.bot_id
+  const isBot = isSlackBotAuthored(msg)
   if (msg.subtype && msg.subtype !== 'bot_message' && msg.subtype !== 'file_share') return
   if (msg.user === botUserId) return
 
   // For bots, identify by bot_id (B-prefix) since msg.user may be unset on
-  // classic incoming-webhook posts. Operators allowlist bot ids in a channel's
-  // allowFrom to opt them in.
+  // classic incoming-webhook posts. The gate rejects every bot sender.
   const senderId = isBot ? (msg.bot_id as string) : (msg.user as string)
   if (!senderId) return
   const channelId = msg.channel as string
@@ -941,12 +937,12 @@ slackApp.event('message', async ({ event }) => {
   const normalizedText = normalizeSlackInboundText(text, botUserId, isDM)
   // A DM needs no mention — the DM *is* the address. In a channel the mention
   // has to be real for a new root message. Once Zeroちゃん owns a thread, its
-  // allowlisted replies are live input and must not wait for the 60-second
+  // human replies are live input and must not wait for the 60-second
   // catch-up poller; exact cancellation in particular cannot survive that lag.
   const ownedThread = typeof threadTs === 'string'
     && jobStore.getThread(channelId, threadTs) !== null
   if (ownedThread && !isDM
-    && loadAccess().channels[channelId]?.requireMention
+    && (loadAccess().channels[channelId]?.requireMention ?? true)
     && classifyThreadReply(text, botUserId) === 'others') return
   const isMention = resolveIsMention(isDM, text, botUserId) || ownedThread
   const threadAuthorityTarget = activeThreadAuthorityTarget(
@@ -971,7 +967,7 @@ slackApp.event('message', async ({ event }) => {
     try {
       await slackApp!.client.chat.postMessage({
         channel: channelId,
-        text: `${lead}。ターミナルで次を実行してください。\n\n\`zerokun-access pair ${result.code}\``,
+        text: `${lead}。ターミナルで次を実行してください。\n\n\`zerochan-access pair ${result.code}\``,
       })
     } catch (err) {
       process.stderr.write(`slack channel: failed to send pairing code: ${err}\n`)
@@ -995,36 +991,31 @@ slackApp.event('message', async ({ event }) => {
   await acknowledgeSlackDelivery(channelId, msg.ts, result.access)
 })
 
-// Handle being added to a channel — host-side routing is deliberately not delegated to Codex.
+// Channel membership is the host-side access grant. Record it for restart
+// catch-up, then explain the only remaining interaction rule: mention the bot
+// for a new root.
 slackApp.event('member_joined_channel', async ({ event }) => {
   if (event.user !== botUserId) return
 
   const channelId = event.channel
-
-  let isRouted = false
   try {
-    const content = readOptionalPrivateFile(ROUTES_FILE)
-    const routes = content === null ? {} : JSON.parse(content)
-    isRouted = channelId in routes
-  } catch {}
-  if (isRouted) return
-
-  try {
+    const firstObservation = rememberChannel(channelId, ACCESS_FILE)
+    if (!firstObservation) return
     await slackApp!.client.chat.postMessage({
       channel: channelId,
       text: [
-        `:wave: *Zeroちゃん*です。このチャンネルはまだ接続先が設定されていません。`,
+        `:wave: *Zeroちゃん*です。このチャンネルから利用できます。`,
         ``,
-        `Macの管理者がターミナルでこのチャンネルを登録してください:`,
-        ``,
-        `> \`zerokun-access channel add ${channelId}\``,
-        ``,
-        `続けて、このチャンネルの接続先をMacの管理者に登録してもらってください。`,
-        `詳しい手順はZeroちゃんのセットアップガイドにあります。`,
-        `接続先がないチャンネルのメッセージには応答しません。`,
+        `新しい依頼は \`@Zeroちゃん\` とメンションしてください。`,
+        `同じスレッドの続きは、再メンションなしで受け取ります。`,
       ].join('\n'),
     })
   } catch (err) {
+    if (err instanceof AccessLockReleaseError) {
+      process.stderr.write(`slack channel: fatal access lock release failure: ${err.message}\n`)
+      shutdown()
+      return
+    }
     process.stderr.write(`slack channel: failed to send onboarding greeting to ${channelId}: ${err}\n`)
   }
 })
@@ -1383,7 +1374,7 @@ async function processPendingReplyScanPages(
     candidateCount += plan.length
 
     for (const message of plan) {
-      const isBot = !!message.bot_id
+      const isBot = isSlackBotAuthored(message)
       const senderId = isBot ? message.bot_id : message.user
       if (!senderId || !message.ts) continue
       const text = message.text ?? ''
@@ -1414,7 +1405,7 @@ async function processPendingReplyScanPages(
         try {
           await slackApp.client.chat.postMessage({
             channel: scan.channelId,
-            text: `${lead}。ターミナルで次を実行してください。\n\n\`zerokun-access pair ${result.code}\``,
+            text: `${lead}。ターミナルで次を実行してください。\n\n\`zerochan-access pair ${result.code}\``,
           })
           outstanding.delete(message.ts)
           if (candidateTimestamps.has(message.ts)) {
@@ -1478,6 +1469,9 @@ async function catchupSweep(): Promise<void> {
   const oldestMs = Date.now() - windowHours * 60 * 60 * 1000
   const access = loadAccess()
   const channelIds = new Set(Object.keys(access.channels))
+  for (const thread of jobStore.listThreads()) {
+    if (!thread.chatId.startsWith('D')) channelIds.add(thread.chatId)
+  }
   const dmChannels = new Set<string>()
 
   try {
@@ -1567,7 +1561,7 @@ async function catchupSweep(): Promise<void> {
     candidateCount += plan.length
 
     for (const message of plan) {
-      const isBot = !!message.bot_id
+      const isBot = isSlackBotAuthored(message)
       const senderId = isBot ? message.bot_id : message.user
       if (!senderId || !message.ts) continue
       const text = message.text ?? ''
@@ -1602,7 +1596,7 @@ async function catchupSweep(): Promise<void> {
         try {
           await slackApp.client.chat.postMessage({
             channel: channelId,
-            text: `${lead}。ターミナルで次を実行してください。\n\n\`zerokun-access pair ${result.code}\``,
+            text: `${lead}。ターミナルで次を実行してください。\n\n\`zerochan-access pair ${result.code}\``,
           })
           outstandingScanReplies.delete(message.ts)
           outstandingRecentMessages.delete(message.ts)
@@ -1717,7 +1711,7 @@ function importLegacyThreads(): void {
         requireLegacyThreadRepoRoute(
           entry.channel_id,
           entry.repo_path,
-          configuredRepoPath(entry.channel_id),
+          undefined,
           process.cwd(),
         ),
       )
@@ -1813,7 +1807,7 @@ async function pollThreads(): Promise<void> {
 
       const policyExists = channelId.startsWith('D')
         ? access.dmPolicy !== 'disabled'
-        : access.channels[channelId] !== undefined
+        : true
       const promotedAuthorities = new Map<string, LiveControlTarget>()
       const promoted = planned.skipped.filter(({ reply, reason }) => {
         if (reason !== 'policy' || !policyExists || !reply.ts) return false
@@ -1904,6 +1898,9 @@ process.on('SIGINT', shutdown)
 
 // Start the Slack app
 try {
+  // Import legacy ownership before Socket Mode can deliver a competing event.
+  // The first durable thread row must win independently of startup timing.
+  importLegacyThreads()
   // Verify both credentials belong to the same Slack App before opening the
   // Socket Mode connection. A mixed old/new pair must never receive events
   // from one App while posting as another bot.

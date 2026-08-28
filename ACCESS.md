@@ -1,28 +1,25 @@
 # Access Control Reference
 
 Zeroちゃんは「メッセージを受け取れる人」と「repository を変更できる人」を分離します。
-pairing や channel opt-in だけでは書込み権限は付きません。
+DM pairingやchannel参加だけでは書込み権限は付きません。
 
 設定ファイルは既定で `~/.codex/zerokun/access.json` にあります。旧版の
 `~/.claude/channels/slack` は自動選択しません。別PCのClaude版と比較する場合は新しい
-Slack AppとCodex stateを使い、旧token・access・routesをコピーしないでください。
+Slack AppとCodex stateを使い、旧token・accessをコピーしないでください。
 同一PCのin-place cutover時だけ`ZEROKUN_LEGACY_CUTOVER=1`と
 `ZEROKUN_STATE_DIR`の両方で旧stateを明示します。
 
 ## 管理コマンド
 
 ```text
-zerokun-access status
-zerokun-access pair <code>
-zerokun-access allow|deny <user-id>
-zerokun-access write allow|deny <user-id>
-zerokun-access policy pairing|allowlist|disabled
-zerokun-access channel add|rm <channel-id>
-zerokun-access channel allow|deny <channel-id> <user-or-bot-id>
+zerochan-access status
+zerochan-access pair <code>
+zerochan-access allow|deny <user-id>
+zerochan-access write allow|deny <user-id>
+zerochan-access policy pairing|allowlist|disabled
 ```
 
-Slack の ID は display name ではなく `U...` / `W...`（人）、`B...`（bot）、
-`C...` / `G...`（channel）を指定します。
+Slack user IDはdisplay nameではなく `U...` / `W...` を指定します。
 
 ## DM policy
 
@@ -31,7 +28,7 @@ Slack の ID は display name ではなく `U...` / `W...`（人）、`B...`（b
 未登録の人が DM すると、6桁の pairing code を1件発行します。端末で完全な code を指定します。
 
 ```bash
-zerokun-access pair a1b2c3
+zerochan-access pair a1b2c3
 ```
 
 - code は1時間で失効します。
@@ -42,35 +39,33 @@ zerokun-access pair a1b2c3
 
 ### `allowlist`
 
-`allowFrom` または channel の `allowFrom` にいる人だけ DM を利用できます。新しい pairing
-code は発行しません。
+`allowFrom` にいる人だけDMを利用できます。新しいpairing codeは発行しません。
 
 ### `disabled`
 
-すべての DM を拒否します。channel の opt-in は影響を受けません。
+すべてのDMを拒否します。channelでの利用には影響しません。
 
 ```bash
-zerokun-access policy pairing
-zerokun-access policy allowlist
-zerokun-access policy disabled
+zerochan-access policy pairing
+zerochan-access policy allowlist
+zerochan-access policy disabled
 ```
 
 ## DM の受信許可
 
 ```bash
-zerokun-access allow U0123456789
-zerokun-access deny U0123456789
+zerochan-access allow U0123456789
+zerochan-access deny U0123456789
 ```
 
-channel の `allowFrom` にいる人も DM の受信許可集合へ入ります。つまり channel で信頼した人を
-別の DM list に二重登録する必要はありません。空の channel allowlist は「その channel の人を
-全員 DM 許可する」という意味にはなりません。bot ID は DM 許可集合から常に除外します。
+旧版のchannel allowlistにいた人は、移行時にDMの`allowFrom`へ一度だけ引き継ぎます。
+以後のchannel参加者はDM許可へ自動追加されず、DMはpairingまたはこのコマンドで管理します。
 
 ## Repository write
 
 ```bash
-zerokun-access write allow U0123456789
-zerokun-access write deny U0123456789
+zerochan-access write allow U0123456789
+zerochan-access write deny U0123456789
 ```
 
 - `writeAllowFrom` にいない sender: minimal runtimeから組み立てたnamed profileでrepository readと
@@ -92,34 +87,14 @@ zerokun-access write deny U0123456789
 
 ## Channel policy
 
-```bash
-zerokun-access channel add C0123456789
-zerokun-access channel rm C0123456789
-zerokun-access channel allow C0123456789 U0123456789
-zerokun-access channel deny C0123456789 U0123456789
-```
+Zeroちゃんをchannelへ招待すれば、そのchannelの人は誰でも利用できます。手動登録やallowlistは
+ありません。bot投稿とSlack user IDでないsenderは常に無視します。
 
-channel を `add` すると次の既定値になります。
-
-```json
-{
-  "requireMention": true,
-  "allowFrom": []
-}
-```
-
-- `requireMention: true`: 新しい channel message は bot の `@mention` が必要です。いったん
-  Zeroちゃんが採用した thread の未メンション follow-up は、Socket Mode受信時に即時回収し、
-  取りこぼしはpollerが回収します。実行中の同じthreadはsenderにかかわらずそのactive jobへの
-  操作委任として扱い、別threadとして再解釈しません。別threadの新規依頼だけsenderの現在の
-  受信・write許可を確認します。
-- 人の `allowFrom: []`: opt-in 済み channel 内の人を許可します。
-- 人の populated `allowFrom`: listed user だけを許可します。
-- bot は default-deny です。投稿を受ける bot ID を明示的に `channel allow` してください。
-- channel の追加と repository route の追加は別です。`routes.json` も設定してください。
-
-`requireMention` の切替は現在 CLI にないため、端末で `access.json` を編集します。gateway は
-各イベント時に再読込するため再起動は不要です。
+- 新しいchannel依頼は `@Zeroちゃん` のメンションが必要です。
+- いったんZeroちゃんが採用したthreadの人による返信は、senderが変わってもメンション不要です。
+- 実行中の同じthreadへの返信はlive inputとして割り込み、別threadは独立したFIFO jobになります。
+- 招待・最初のlive mentionでchannelを内部記録し、再起動後の履歴回収に使います。
+- 新しいthreadは、その時点で`zerochan`を起動しているprojectへ固定されます。`routes.json`は不要です。
 
 ## 設定 schema
 
@@ -130,8 +105,7 @@ channel を `add` すると次の既定値になります。
   "writeAllowFrom": [],
   "channels": {
     "C0123456789": {
-      "requireMention": true,
-      "allowFrom": ["U0123456789"]
+      "requireMention": true
     }
   },
   "pending": {},

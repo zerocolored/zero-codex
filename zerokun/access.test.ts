@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { approvePairing, mutateAccess, readAccess, writeAccess } from './access.ts'
+import { approvePairing, mutateAccess, readAccess, rememberChannel, writeAccess } from './access.ts'
 
 const directories: string[] = []
 
@@ -11,12 +11,66 @@ afterEach(() => {
 })
 
 function fixture(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'zerokun-access-'))
+  const dir = mkdtempSync(join(tmpdir(), 'zerochan-access-'))
   directories.push(dir)
   return dir
 }
 
-describe('zerokun-access', () => {
+describe('zerochan-access', () => {
+  test('legacy channel usersをDM許可へ移し、botとchannel制限を破棄する', () => {
+    const dir = fixture()
+    const path = join(dir, 'access.json')
+    writeFileSync(path, JSON.stringify({
+      dmPolicy: 'pairing',
+      allowFrom: ['U000GLOBAL'],
+      writeAllowFrom: [],
+      channels: {
+        C012CHANNEL: {
+          requireMention: false,
+          allowFrom: ['U111CHANNEL', 'W222GRID', 'B333BOT'],
+        },
+      },
+      pending: {},
+    }), { mode: 0o600 })
+
+    expect(readAccess(path)).toMatchObject({
+      allowFrom: ['U000GLOBAL', 'U111CHANNEL', 'W222GRID'],
+      channels: { C012CHANNEL: { requireMention: true } },
+    })
+    mutateAccess(access => { access.dmPolicy = 'allowlist' }, path)
+    const saved = JSON.parse(readFileSync(path, 'utf8'))
+    expect(saved.channels).toEqual({ C012CHANNEL: { requireMention: true } })
+    expect(saved.allowFrom).not.toContain('B333BOT')
+  })
+
+  test('observed channelを一度だけ内部registryへ記録する', () => {
+    const dir = fixture()
+    const path = join(dir, 'access.json')
+    expect(rememberChannel('c012channel', path)).toBe(true)
+    expect(rememberChannel('C012CHANNEL', path)).toBe(false)
+    expect(readAccess(path).channels).toEqual({ C012CHANNEL: { requireMention: true } })
+  })
+
+  test('管理CLIはzerochan-accessだけを案内しchannel allowlist操作を公開しない', () => {
+    const dir = fixture()
+    const result = Bun.spawnSync([
+      process.execPath,
+      join(import.meta.dir, 'access.ts'),
+      'channel',
+      'add',
+      'C012CHANNEL',
+    ], {
+      env: { ...process.env, ZEROKUN_STATE_DIR: dir },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(1)
+    const error = result.stderr.toString()
+    expect(error).toContain('zerochan-access status')
+    expect(error).not.toContain('zerochan-access channel')
+    expect(error).not.toContain('zerokun-access')
+  })
+
   test('pairingは指定codeだけを承認し、write権限を暗黙付与しない', () => {
     const dir = fixture()
     const path = join(dir, 'access.json')

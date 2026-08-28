@@ -1,32 +1,33 @@
 /**
  * Select the repository for an inbound Slack conversation.
  *
- * DMs intentionally use the launcher repository. Public/private channels must
- * be explicitly routed so that an access-list entry alone can never make a
- * request run in whichever directory happened to launch the gateway.
+ * Every new Slack thread uses the physical Git project selected by the most
+ * recent `zerochan` launch. `configuredRepo` remains in the function shape so
+ * older migration callers can be upgraded without reading routes.json, but it
+ * intentionally has no effect on new work.
  */
 export function requireRepoRoute(
-  chatId: string,
-  configuredRepo: string | undefined,
-  dmDefaultRepo: string,
+  _chatId: string,
+  _configuredRepo: string | undefined,
+  activeProjectRepo: string,
 ): string {
-  if (chatId.startsWith('D')) return dmDefaultRepo
-  const configured = configuredRepo?.trim()
-  if (!configured) throw new Error(`channel ${chatId} has no configured repo_path`)
-  return configured
+  const active = activeProjectRepo.trim()
+  if (!active) throw new Error('active zerochan project is unavailable')
+  return active
 }
 
 /**
  * A legacy thread already owns the repository captured when it was adopted.
- * Preserve that ownership across the Claude-to-Codex migration, including for
- * DMs; only rows from before repo_path existed may use today's route/default.
+ * Preserve that ownership across the Claude-to-Codex migration. Only rows
+ * from before repo_path existed may use today's active zerochan project; old
+ * routes.json values no longer redirect new or legacy-unpinned work.
  */
 export function requireLegacyThreadRepoRoute(
   chatId: string,
   savedRepo: string | undefined,
-  configuredRepo: string | undefined,
-  dmDefaultRepo: string,
+  _configuredRepo: string | undefined,
+  activeProjectRepo: string,
 ): string {
   const saved = savedRepo?.trim()
-  return saved || requireRepoRoute(chatId, configuredRepo, dmDefaultRepo)
+  return saved || requireRepoRoute(chatId, undefined, activeProjectRepo)
 }

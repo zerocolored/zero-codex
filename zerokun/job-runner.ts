@@ -3949,6 +3949,61 @@ export class JobStore {
     } : null
   }
 
+  /**
+   * Pin a Slack thread to the first accepted repository before attachment I/O
+   * or enqueueing begins. The immediate transaction makes concurrent gateway
+   * generations converge on the row that won the first insert, so a project
+   * switch cannot split one Slack thread across repositories.
+   */
+  resolveOrAdoptThread(input: {
+    chatId: string
+    threadTs: string
+    repoPath: string
+    adoptedFromTs: string
+    lastActivityMs?: number
+  }): {
+    chatId: string
+    threadTs: string
+    repoPath: string
+    adoptedFromTs: string
+    lastActivityMs: number
+  } {
+    const chatId = requireText(input.chatId, 'chatId')
+    const threadTs = requireText(input.threadTs, 'threadTs')
+    const repoPath = requireText(input.repoPath, 'repoPath')
+    const adoptedFromTs = requireText(input.adoptedFromTs, 'adoptedFromTs')
+    const lastActivityMs = input.lastActivityMs ?? Date.now()
+    if (!Number.isSafeInteger(lastActivityMs) || lastActivityMs <= 0) {
+      throw new Error('thread activity timestamp is invalid')
+    }
+    const pin = this.db.transaction(() => {
+      this.db.run(
+        `INSERT OR IGNORE INTO slack_threads (
+           chat_id, thread_ts, repo_path, adopted_from_ts, last_activity_ms
+         ) VALUES (?, ?, ?, ?, ?)`,
+        [chatId, threadTs, repoPath, adoptedFromTs, lastActivityMs],
+      )
+      const row = this.db.query<{
+        chat_id: string
+        thread_ts: string
+        repo_path: string
+        adopted_from_ts: string
+        last_activity_ms: number
+      }, [string, string]>(
+        'SELECT * FROM slack_threads WHERE chat_id = ? AND thread_ts = ?',
+      ).get(chatId, threadTs)
+      if (!row) throw new Error('failed to pin Slack thread repository')
+      return {
+        chatId: row.chat_id,
+        threadTs: row.thread_ts,
+        repoPath: row.repo_path,
+        adoptedFromTs: row.adopted_from_ts,
+        lastActivityMs: row.last_activity_ms,
+      }
+    })
+    return retrySqlite(() => pin.immediate())
+  }
+
   listThreads(): Array<{
     chatId: string
     threadTs: string
@@ -4828,9 +4883,9 @@ export class JobStore {
         this.db.run('DELETE FROM job_initial_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM jobs WHERE id = ?', [row.id])
       }
-      // Thread ownership is a security boundary: changing routes.json later
-      // must never retarget an already-adopted Slack thread. Keep these compact
-      // rows even after job/result GC instead of silently re-resolving a route.
+      // Thread ownership is a security boundary: restarting zerochan from a
+      // different project must never retarget an already-adopted Slack thread.
+      // Keep these compact rows after job/result GC instead of re-resolving it.
       const threads = 0
       const tombstones = this.db.run(
         'DELETE FROM delivery_tombstones WHERE completed_at < ?',

@@ -9,6 +9,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -39,6 +40,7 @@ import {
   updateRestartTokenDigest,
   validateResolvedCandidatePermissionOverrides,
   restoreRollbackDatabase,
+  restoreManagedLaunchers,
   startBotInHerdr,
   startBotInTmux,
   stopLockedProcess,
@@ -375,6 +377,41 @@ function spawnStandaloneSetup(
 }
 
 describe('updater helpers', () => {
+  test('access command renameのrollbackはzerochan-accessを消し旧owned linkだけを復元する', () => {
+    const dir = fixtureDir()
+    const repo = join(dir, 'repo')
+    const bin = join(dir, 'bin')
+    const accessTarget = join(repo, 'zerokun', 'access.ts')
+    const launcherTarget = join(repo, 'codex-channel.sh')
+    mkdirSync(dirname(accessTarget), { recursive: true })
+    mkdirSync(bin)
+    writeFileSync(accessTarget, '#!/usr/bin/env bun\n')
+    writeFileSync(launcherTarget, '#!/bin/sh\n')
+    const paths = {
+      zerochan: join(bin, 'zerochan'),
+      zerokun: join(bin, 'zerokun'),
+      zerochanAccess: join(bin, 'zerochan-access'),
+      zerokunAccess: join(bin, 'zerokun-access'),
+    }
+    const snapshot = {
+      zerochan: { kind: 'missing' },
+      zerokun: { kind: 'missing' },
+      zerochanAccess: { kind: 'missing' },
+      zerokunAccess: { kind: 'symlink', target: accessTarget },
+    } as const
+
+    symlinkSync(launcherTarget, paths.zerochan)
+    symlinkSync(launcherTarget, paths.zerokun)
+    symlinkSync(accessTarget, paths.zerochanAccess)
+    restoreManagedLaunchers(snapshot, repo, paths)
+
+    expect(existsSync(paths.zerochan)).toBe(false)
+    expect(existsSync(paths.zerokun)).toBe(false)
+    expect(existsSync(paths.zerochanAccess)).toBe(false)
+    expect(lstatSync(paths.zerokunAccess).isSymbolicLink()).toBe(true)
+    expect(readlinkSync(paths.zerokunAccess)).toBe(accessTarget)
+  })
+
   test('restart tokenはUUID v4を非可逆digestへ固定する', () => {
     expect(updateRestartTokenDigest('12345678-1234-4abc-8def-123456789abc'))
       .toBe('18f443da50efc9b4678c160f4fc63e6d303daf8c919e60baa97875a2b1332fc6')

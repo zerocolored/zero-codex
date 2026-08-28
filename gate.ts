@@ -7,7 +7,8 @@
 
 export type ChannelPolicy = {
   requireMention: boolean
-  allowFrom: string[]
+  /** Legacy state only; ignored by channel authorization. */
+  allowFrom?: string[]
 }
 
 export type LegacyThreadEntry = {
@@ -62,19 +63,11 @@ export function validateLegacyThreadMap(value: unknown): {
 }
 
 /**
- * Decide whether a channel message passes the channel-level access policy.
- *
- * Two senders are distinguished:
- *
- *   - Humans (Slack user ids, "U…") are default-allow. An empty `allowFrom`
- *     permits any sender; a populated `allowFrom` restricts to listed ids.
- *
- *   - Bots (Slack bot ids, "B…") are default-deny. The bot's id must be
- *     explicitly listed in `allowFrom` for delivery. Empty `allowFrom`
- *     blocks all bots, populated `allowFrom` blocks any bot whose id is
- *     not on the list.
- *
- * Both senders still respect `requireMention`.
+ * Channel access is intentionally membership-based: Slack only delivers
+ * channel events to an app that is present in that conversation, every human
+ * participant is accepted, and bot-authored/unknown-sender events are always
+ * rejected. New roots still need a real mention; an already adopted live
+ * thread is the address for later human replies.
  */
 export function decideChannelPolicy(
   policy: ChannelPolicy | undefined,
@@ -83,15 +76,9 @@ export function decideChannelPolicy(
   isBot: boolean,
   activeHumanThreadAuthority = false,
 ): 'deliver' | 'drop' {
-  if (!policy) return 'drop'
-  const allowFrom = policy.allowFrom ?? []
-  if (isBot) {
-    if (!allowFrom.includes(senderId)) return 'drop'
-  } else if (!activeHumanThreadAuthority
-    && allowFrom.length > 0 && !allowFrom.includes(senderId)) {
-    return 'drop'
-  }
-  if (policy.requireMention && !isMention && !activeHumanThreadAuthority) return 'drop'
+  if (isBot || !SLACK_USER_ID_RE.test(senderId)) return 'drop'
+  const requireMention = policy?.requireMention ?? true
+  if (requireMention && !isMention && !activeHumanThreadAuthority) return 'drop'
   return 'deliver'
 }
 
@@ -117,30 +104,22 @@ export function canUseActiveThreadAuthority(options: {
 }
 
 /**
- * Bots may only reach the bot through opted-in channels. Bot DMs are
- * unconditionally dropped; the access skill cannot opt a bot into DMs.
+ * Bot DMs are unconditionally dropped. Channel bot posts are rejected by
+ * `decideChannelPolicy`, independently of any legacy access state.
  */
 export function isBotDMBlocked(channelType: 'im' | 'channel', isBot: boolean): boolean {
   return isBot && channelType === 'im'
 }
 
 // Slack user ids are "U…", or "W…" on Enterprise Grid. Bot ids are "B…".
-const SLACK_USER_ID_RE = /^[UW][A-Z0-9]+$/
+export const SLACK_USER_ID_RE = /^[UW][A-Z0-9]+$/
 
 /**
  * Who may reach the bot through a DM.
  *
- * Channel opt-in IS DM opt-in: the global `allowFrom` and every channel's
- * `allowFrom` are one list. Keeping them separate only created bookkeeping —
- * somebody added to a channel would be dropped in DMs, and would silently never
- * receive a permission prompt, because those are delivered by DM. There is no
- * threat the split defended against: a user trusted to drive the bot from an
- * opted-in channel can already say the same thing there.
- *
- * Only user ids survive the union. A channel's `allowFrom` doubles as its bot
- * opt-in list ("B…"), and a bot must never reach the DM surface — `gate()`
- * stops bot DMs via isBotDMBlocked, but the permission-relay recipients and the
- * permission button check read this list directly and have no such guard.
+ * Legacy channel allowlists are migrated into the global list by access.ts.
+ * Runtime checks therefore consult only `allowFrom`; channel participation no
+ * longer grants or revokes DM access implicitly.
  *
  * `dmPolicy` still outranks this list: 'disabled' turns DMs off wholesale
  * before it is consulted, and under 'pairing' it is the set that skips pairing
@@ -148,18 +127,10 @@ const SLACK_USER_ID_RE = /^[UW][A-Z0-9]+$/
  */
 export function effectiveDmAllowFrom(access: {
   allowFrom?: string[]
-  channels?: Record<string, ChannelPolicy | undefined>
 }): string[] {
-  // Insertion order keeps the global list first, so the permission relay still
-  // DMs the long-standing operators before anyone gained via a channel.
   const allowed = new Set<string>()
   for (const id of access.allowFrom ?? []) {
     if (SLACK_USER_ID_RE.test(id)) allowed.add(id)
-  }
-  for (const policy of Object.values(access.channels ?? {})) {
-    for (const id of policy?.allowFrom ?? []) {
-      if (SLACK_USER_ID_RE.test(id)) allowed.add(id)
-    }
   }
   return [...allowed]
 }
@@ -184,9 +155,19 @@ export type SlackReply = {
   latest_reply?: string
   user?: string
   bot_id?: string
+  bot_profile?: unknown
   subtype?: string
   text?: string
   files?: { id: string }[]
+}
+
+/** Slack can identify bot-authored history with any of these three shapes. */
+export function isSlackBotAuthored(message: SlackReply): boolean {
+  return Boolean(
+    message.bot_id
+    || message.bot_profile
+    || message.subtype === 'bot_message',
+  )
 }
 
 /**
@@ -404,15 +385,15 @@ export function planCatchupSweep(
     }
     if (botUserId && message.user === botUserId) return false
 
-    const isBot = !!message.bot_id
+    const isBot = isSlackBotAuthored(message)
     const senderId = isBot ? message.bot_id : message.user
     if (!senderId) return false
     if (isBotDMBlocked(policy.channelType, isBot)) return false
     if (policy.channelType === 'im') return true
 
     // Child replies are re-checked by the runtime gate because an active Zero
-    // thread may temporarily authorize a human outside the channel allowlist.
-    // Root messages still need the ordinary policy here.
+    // thread may accept unmentioned human input. Root messages still need the
+    // ordinary mention rule here.
     if (!isBot && message.thread_ts && message.thread_ts !== message.ts) return true
     const isMention = resolveIsMention(false, message.text ?? '', botUserId)
     return decideChannelPolicy(policy.channelPolicy, senderId, isMention, isBot) === 'deliver'
@@ -423,8 +404,8 @@ export function planCatchupSweep(
 
 /**
  * The poller's per-reply verdict, split out so the wiring — not just the
- * classifier — is covered by tests. `drop-others` is the noise rule; the
- * allowlist is checked first so an unknown channel reports the real reason.
+ * classifier — is covered by tests. `drop-others` is the noise rule; sender
+ * validity is checked first so bot/system replies retain a policy verdict.
  *
  * The noise rule only applies where `requireMention` is on. A channel with it
  * off has explicitly asked Codex to read everything, and the live path obeys
@@ -437,7 +418,7 @@ export function decideThreadReplyDelivery(
   botUserId: string | undefined,
 ): 'deliver' | 'drop-policy' | 'drop-others' {
   if (decideChannelPolicy(policy, reply.user!, true, false) !== 'deliver') return 'drop-policy'
-  if (!policy?.requireMention) return 'deliver'
+  if ((policy?.requireMention ?? true) === false) return 'deliver'
   return classifyThreadReply(reply.text ?? '', botUserId) === 'others' ? 'drop-others' : 'deliver'
 }
 
@@ -580,8 +561,8 @@ export function selectNewReplies(
     .filter((r) => {
       if (!r.ts) return false
       if (parseFloat(r.ts) <= cursor) return false
-      if (r.bot_id) return false
-      if (!r.user) return false
+      if (isSlackBotAuthored(r)) return false
+      if (!r.user || !SLACK_USER_ID_RE.test(r.user)) return false
       if (botUserId && r.user === botUserId) return false
       if (r.subtype && r.subtype !== 'file_share') return false
       return true

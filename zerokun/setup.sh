@@ -115,6 +115,7 @@ require_safe_launcher_parent() {
 require_safe_launcher_parent
 require_installable_launcher_link "$HOME/.local/bin/zerochan" "$REPO_DIR/codex-channel.sh"
 require_installable_launcher_link "$HOME/.local/bin/zerokun" "$REPO_DIR/codex-channel.sh"
+require_installable_launcher_link "$HOME/.local/bin/zerochan-access" "$REPO_DIR/zerokun/access.ts"
 
 case "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" in
   0|1) ;;
@@ -476,7 +477,7 @@ else
   fi
 fi
 ln -sfn "$REPO_DIR/zerokun/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
-ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerokun-access"
+ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerochan-access"
 ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"
 ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/codex-channel"
 [ -L "$HOME/.local/bin/zerochan" ] \
@@ -490,6 +491,7 @@ remove_owned_legacy_link() {
     rm -f "$legacy_path"
   fi
 }
+remove_owned_legacy_link "$HOME/.local/bin/zerokun-access" "$REPO_DIR/zerokun/access.ts"
 if [ "$LEGACY_CUTOVER" = "1" ]; then
   remove_owned_legacy_link "$HOME/.local/bin/claude-channel" "$REPO_DIR/claude-channel.sh"
   remove_owned_legacy_link "$HOME/.claude/skills/threads" "$REPO_DIR/skills/threads"
@@ -545,11 +547,10 @@ else
   echo "✅ 配線完了。残りの手動ステップ:"
   echo "  1. Slack アプリをこのマシン用に新規作成し(1台=1アプリ=1ボット名)、"
   echo "     トークン2つを $CH/.env に貼る (xoxb- / xapp-。作成手順はリポ直下 README.md)"
-  echo "  2. $CH/access.json に許可する Slack ユーザーID/チャンネルIDを入れる"
-  echo "  3. codex login status が Logged in using ChatGPT と返すことを確認"
-  echo "  4. Herdrの専用paneで対象projectへ cd して: zerochan"
+  echo "  2. codex login status が Logged in using ChatGPT と返すことを確認"
+  echo "  3. Herdrの専用paneで対象projectへ cd して: zerochan"
   echo "     再起動: zerochan --restart (前回接続したprojectを使用)"
   echo "     queue確認: zerokun-jobs status"
   echo "     Codex版更新: zerokun-update"
-  echo "     書込み許可: zerokun-access write allow <SlackユーザーID>"
+  echo "     書込み許可: zerochan-access write allow <SlackユーザーID>"
 fi

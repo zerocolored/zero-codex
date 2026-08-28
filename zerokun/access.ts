@@ -21,7 +21,8 @@ type PendingEntry = {
   replies?: number
 }
 
-type ChannelPolicy = { requireMention: boolean; allowFrom: string[] }
+type ChannelPolicy = { requireMention: true }
+type LegacyChannelPolicy = { requireMention?: unknown; allowFrom?: unknown }
 
 export type AccessConfig = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
@@ -55,14 +56,38 @@ export function readAccess(path = join(accessStateDir(), 'access.json')): Access
   try {
     const content = readOptionalPrivateFile(path)
     if (content === null) return defaults()
-    const raw = JSON.parse(content) as Partial<AccessConfig>
+    const raw = JSON.parse(content) as Partial<AccessConfig> & {
+      channels?: Record<string, LegacyChannelPolicy | undefined>
+    }
+    const allowFrom = new Set(
+      Array.isArray(raw.allowFrom)
+        ? raw.allowFrom.filter(value => typeof value === 'string' && /^[UW][A-Z0-9]+$/i.test(value))
+        : [],
+    )
+    const channels: Record<string, ChannelPolicy> = {}
+    if (raw.channels && typeof raw.channels === 'object' && !Array.isArray(raw.channels)) {
+      for (const [channelId, policy] of Object.entries(raw.channels)) {
+        if (!/^[CG][A-Z0-9]+$/i.test(channelId)) continue
+        channels[channelId.toUpperCase()] = { requireMention: true }
+        if (!policy || !Array.isArray(policy.allowFrom)) continue
+        // A listed channel user could DM without pairing in the previous
+        // release. Preserve that DM permission once while discarding bot ids
+        // and the channel restriction itself.
+        for (const candidate of policy.allowFrom) {
+          if (typeof candidate === 'string' && /^[UW][A-Z0-9]+$/i.test(candidate)) {
+            allowFrom.add(candidate.toUpperCase())
+          }
+        }
+      }
+    }
     return {
       ...defaults(),
       ...raw,
-      allowFrom: raw.allowFrom ?? [],
-      writeAllowFrom: raw.writeAllowFrom ?? [],
-      channels: raw.channels ?? {},
-      pending: raw.pending ?? {},
+      allowFrom: [...allowFrom],
+      writeAllowFrom: Array.isArray(raw.writeAllowFrom) ? raw.writeAllowFrom : [],
+      channels,
+      pending: raw.pending && typeof raw.pending === 'object' && !Array.isArray(raw.pending)
+        ? raw.pending : {},
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return defaults()
@@ -122,9 +147,10 @@ export function writeAccess(
   withAccessLock(path, () => writeAccessUnlocked(access, path))
 }
 
-function requireId(value: string | undefined, kind: 'user' | 'channel'): string {
-  const pattern = kind === 'user' ? /^[UW][A-Z0-9]+$/i : /^[CG][A-Z0-9]+$/i
-  if (!value || !pattern.test(value)) throw new Error(`invalid Slack ${kind} ID: ${value ?? ''}`)
+function requireUserId(value: string | undefined): string {
+  if (!value || !/^[UW][A-Z0-9]+$/i.test(value)) {
+    throw new Error(`invalid Slack user ID: ${value ?? ''}`)
+  }
   return value.toUpperCase()
 }
 
@@ -158,23 +184,38 @@ export function approvePairing(
   return { senderId: result.senderId, chatId: result.chatId }
 }
 
+/** Record channel membership for restart catch-up without exposing a policy. */
+export function rememberChannel(
+  channelIdInput: string,
+  path = join(accessStateDir(), 'access.json'),
+): boolean {
+  if (!/^[CG][A-Z0-9]+$/i.test(channelIdInput)) {
+    throw new Error(`invalid Slack channel ID: ${channelIdInput}`)
+  }
+  const channelId = channelIdInput.toUpperCase()
+  if (readAccess(path).channels[channelId]) return false
+  return mutateAccess(access => {
+    if (access.channels[channelId]) return false
+    access.channels[channelId] = { requireMention: true }
+    return true
+  }, path)
+}
+
 function usage(): string {
   return [
     'usage:',
-    '  zerokun-access status',
-    '  zerokun-access pair <code>',
-    '  zerokun-access allow|deny <user-id>',
-    '  zerokun-access write allow|deny <user-id>',
-    '  zerokun-access policy pairing|allowlist|disabled',
-    '  zerokun-access channel add|rm <channel-id>',
-    '  zerokun-access channel allow|deny <channel-id> <user-or-bot-id>',
+    '  zerochan-access status',
+    '  zerochan-access pair <code>',
+    '  zerochan-access allow|deny <user-id>',
+    '  zerochan-access write allow|deny <user-id>',
+    '  zerochan-access policy pairing|allowlist|disabled',
   ].join('\n')
 }
 
 async function runCli(args = process.argv.slice(2)): Promise<void> {
   const dir = accessStateDir()
   const path = join(dir, 'access.json')
-  const [command = 'status', subcommand, first, second] = args
+  const [command = 'status', subcommand, first] = args
 
   if (command === 'status') {
     const access = readAccess(path)
@@ -182,7 +223,7 @@ async function runCli(args = process.argv.slice(2)): Promise<void> {
       dmPolicy: access.dmPolicy,
       allowFrom: access.allowFrom,
       writeAllowFrom: access.writeAllowFrom,
-      channels: access.channels,
+      knownChannels: Object.keys(access.channels).sort(),
       pendingCodes: Object.keys(access.pending),
     }, null, 2)}\n`)
     return
@@ -193,7 +234,7 @@ async function runCli(args = process.argv.slice(2)): Promise<void> {
     return
   }
   if (command === 'allow' || command === 'deny') {
-    const userId = requireId(subcommand, 'user')
+    const userId = requireUserId(subcommand)
     mutateAccess(access => {
       access.allowFrom = command === 'allow'
         ? [...new Set([...access.allowFrom, userId])]
@@ -203,7 +244,7 @@ async function runCli(args = process.argv.slice(2)): Promise<void> {
     return
   }
   if (command === 'write' && (subcommand === 'allow' || subcommand === 'deny')) {
-    const userId = requireId(first, 'user')
+    const userId = requireUserId(first)
     mutateAccess(access => {
       access.writeAllowFrom = subcommand === 'allow'
         ? [...new Set([...access.writeAllowFrom, userId])]
@@ -219,32 +260,6 @@ async function runCli(args = process.argv.slice(2)): Promise<void> {
     const policy = subcommand as AccessConfig['dmPolicy']
     mutateAccess(access => { access.dmPolicy = policy }, path)
     process.stdout.write(`dm policy: ${policy}\n`)
-    return
-  }
-  if (command === 'channel' && (subcommand === 'add' || subcommand === 'rm')) {
-    const channelId = requireId(first, 'channel')
-    mutateAccess(access => {
-      if (subcommand === 'add') {
-        access.channels[channelId] ??= { requireMention: true, allowFrom: [] }
-      } else delete access.channels[channelId]
-    }, path)
-    process.stdout.write(`channel ${subcommand}: ${channelId}\n`)
-    return
-  }
-  if (command === 'channel' && (subcommand === 'allow' || subcommand === 'deny')) {
-    const channelId = requireId(first, 'channel')
-    const actorId = second?.toUpperCase()
-    if (!actorId || !/^[UBW][A-Z0-9]+$/i.test(actorId)) {
-      throw new Error(`invalid Slack user or bot ID: ${second ?? ''}`)
-    }
-    mutateAccess(access => {
-      const policy = access.channels[channelId]
-      if (!policy) throw new Error(`channel is not configured: ${channelId}`)
-      policy.allowFrom = subcommand === 'allow'
-        ? [...new Set([...policy.allowFrom, actorId])]
-        : policy.allowFrom.filter(value => value !== actorId)
-    }, path)
-    process.stdout.write(`channel ${subcommand}: ${channelId} ${actorId}\n`)
     return
   }
   throw new Error(usage())

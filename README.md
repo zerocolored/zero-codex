@@ -203,7 +203,7 @@ SLACK_APP_TOKEN=xapp-...
 ```
 
 既定stateは常に `~/.codex/zerokun` です。旧版の`~/.claude/channels/slack`は
-自動選択せず、token・access・queue・routesを暗黙に流用しません。in-place cutover時だけ
+自動選択せず、token・access・queueを暗黙に流用しません。in-place cutover時だけ
 `ZEROKUN_LEGACY_CUTOVER=1`と`ZEROKUN_STATE_DIR`の両方で旧stateを明示してください。
 
 ## Access 設定
@@ -212,22 +212,18 @@ DM の初回メッセージには pairing code が返ります。表示された
 code の省略や自動承認はできません。
 
 ```bash
-zerokun-access pair abc123
-zerokun-access status
+zerochan-access pair abc123
+zerochan-access status
 ```
 
-チャンネルを有効にする例:
-
-```bash
-zerokun-access channel add C0123456789
-zerokun-access channel allow C0123456789 U0123456789
-```
+チャンネルはZeroちゃんを招待した時点で利用できます。参加者は全員利用でき、bot投稿は無視します。
+新しい依頼は `@Zeroちゃん` へのメンションが必要ですが、同じスレッドの続きはメンション不要です。
 
 受信を許可しても repository write は許可されません。書込みが必要な利用者だけ別に付与します。
 
 ```bash
-zerokun-access write allow U0123456789
-zerokun-access write deny U0123456789
+zerochan-access write allow U0123456789
+zerochan-access write deny U0123456789
 ```
 
 全コマンドと設定項目は [`ACCESS.md`](ACCESS.md) にあります。
@@ -303,26 +299,16 @@ serviceを起動せずoffline bootstrapで復旧してください。
 
 ## Routing
 
-チャンネルごとの作業 repository は state dir の `routes.json` で固定します。
-
-```json
-{
-  "C0123456789": {
-    "repo_path": "/Users/me/Desktop/Project/example",
-    "label": "example"
-  }
-}
-```
-
-DM は`zerochan`を実行した物理project directory、チャンネルは route の directoryを使います。
-稼働中のgatewayはその物理project directoryをreadinessへ記録し、`zerokun-update`は再起動後も
+DM・チャンネルとも、新しいSlackスレッドは`zerochan`を実行した物理project directoryを使います。
+`routes.json`の手動設定は不要です。稼働中のgatewayはその物理project directoryをreadinessへ記録し、
+`zerokun-update`は再起動後も
 同じdirectoryを引き継ぎます。gateway停止中も、最後に接続できたprojectの安全な記録を使います。
-一度採用した Slack thread の route は SQLite に固定され、途中で設定を変えても別 repository
-へ飛びません。
+一度採用したSlack threadのprojectは最初の受理時にSQLiteへ固定され、別directoryから再起動しても
+別repositoryへ飛びません。
 
 ## セキュリティ境界
 
-- 未登録 channel、未許可 DM、bot DM は受け取りません。
+- Zeroちゃんが参加していないchannel、未許可DM、bot投稿は受け取りません。
 - pairing は1時間で失効し、同時 pending は3件までです。
 - Codex 0.149.0+ の named permission profile を使います。minimal runtimeから始め、
   対象repository、当該jobの添付、scratch、outboxだけを許可します。HOME・state・共用tempはdenyします。

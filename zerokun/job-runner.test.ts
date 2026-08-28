@@ -1132,6 +1132,41 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('最初の受理時にthreadをprojectへ固定し、後続の起動cwdでは上書きしない', () => {
+    const state = fixtureDir()
+    const dbPath = join(state, 'jobs.sqlite3')
+    const first = new JobStore(dbPath)
+    const pinned = first.resolveOrAdoptThread({
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000100',
+      repoPath: '/tmp/project-a',
+      adoptedFromTs: '1800000000.000100',
+      lastActivityMs: 1_800_000_000_000,
+    })
+    expect(pinned).toMatchObject({
+      repoPath: '/tmp/project-a',
+      adoptedFromTs: '1800000000.000100',
+    })
+    first.close()
+
+    const restarted = new JobStore(dbPath)
+    const resolved = restarted.resolveOrAdoptThread({
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000100',
+      repoPath: '/tmp/project-b',
+      adoptedFromTs: '1800000000.000200',
+      lastActivityMs: 1_800_000_001_000,
+    })
+    expect(resolved).toMatchObject({
+      repoPath: '/tmp/project-a',
+      adoptedFromTs: '1800000000.000100',
+      lastActivityMs: 1_800_000_000_000,
+    })
+    expect(restarted.getThread('C0123456789', '1800000000.000100')?.repoPath)
+      .toBe('/tmp/project-a')
+    restarted.close()
+  })
+
   test('settled GCは通知済みjobだけを削除し、tombstoneでSlack再配送を抑止する', () => {
     const state = fixtureDir()
     const dbPath = join(state, 'jobs.sqlite3')
@@ -5727,7 +5762,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).not.toContain('/tmp/job-outbox')
     expect(resumedInstructions).toBe(instructions)
     expect(prompt).toContain(job.task)
-    expect(prompt).toContain(`zerokun-access write allow ${job.userId}`)
+    expect(prompt).toContain(`zerochan-access write allow ${job.userId}`)
     expect(prompt).toContain(`Logical attempt nonce: ${nonce}`)
     expect(prompt).toContain('/tmp/job-outbox')
     expect(prompt).toContain('high-trust local advisor route is unavailable')

@@ -228,17 +228,36 @@ describe('Slack bridge resilience wiring', () => {
     expect(server).toContain('if (!jobStore.hasUpdateRequest(key))')
   })
 
-  test('未route channelでは実行不能なonboard mentionではなく端末手順を案内する', () => {
-    expect(server).toContain('zerokun-access channel add ${channelId}')
-    expect(server).toContain('接続先がないチャンネルのメッセージには応答しません。')
-    expect(server).not.toContain('<@${botUserId}> onboard')
-    expect(server).toContain('requireRepoRoute(chatId, configured, process.cwd())')
-    expect(server).not.toContain('realpathSync(configured ?? process.cwd())')
+  test('参加channelを自動記録し、zerochan起動cwdへ最初のthreadを原子的に固定する', () => {
+    expect(server).toContain('rememberChannel(channelId, ACCESS_FILE)')
+    expect(server).toContain('(loadAccess().channels[channelId]?.requireMention ?? true)')
+    expect(server).toContain('このチャンネルから利用できます。')
+    expect(server).toContain('新しい依頼は \\`@Zeroちゃん\\` とメンションしてください。')
+    expect(server).not.toContain('zerokun-access')
+    expect(server).not.toContain('ROUTES_FILE')
+    expect(server).not.toContain('configuredRepoPath(')
+    expect(server).toContain('requireRepoRoute(chatId, undefined, process.cwd())')
+    expect(server).toContain('jobStore.resolveOrAdoptThread({')
 
-    const resolveBeforeUpdate = server.indexOf('const repoPath = resolveRepoPath(chatId, resolvedThreadTs)')
+    const resolveBeforeUpdate = server.indexOf(
+      'const repoPath = resolveRepoPath(chatId, resolvedThreadTs, messageTs)',
+    )
     const detachedUpdate = server.indexOf('if (writeEnabled && isExplicitUpdateRequest(text))')
     expect(resolveBeforeUpdate).toBeGreaterThan(-1)
     expect(resolveBeforeUpdate).toBeLessThan(detachedUpdate)
+    const importLegacy = server.lastIndexOf('importLegacyThreads()', server.indexOf('await slackApp.start()'))
+    expect(importLegacy).toBeGreaterThan(-1)
+    expect(importLegacy).toBeLessThan(server.indexOf('await slackApp.start()'))
+  })
+
+  test('channel自動記録でもaccess lock解放失敗はgatewayを停止する', () => {
+    const joinedHandler = server.slice(
+      server.indexOf("slackApp.event('member_joined_channel'"),
+      server.indexOf('// Lifecycle — clean shutdown'),
+    )
+    expect(joinedHandler).toContain('err instanceof AccessLockReleaseError')
+    expect(joinedHandler).toContain('fatal access lock release failure')
+    expect(joinedHandler).toContain('shutdown()')
   })
 
   test('Slack添付はarrayBufferへ全量展開せずstream中にも50MB上限を強制する', () => {

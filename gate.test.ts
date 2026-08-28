@@ -126,9 +126,9 @@ describe('validateLegacyThreadMap', () => {
   })
 })
 
-describe('decideChannelPolicy — humans (default-allow)', () => {
-  test('drops when channel has no policy at all', () => {
-    expect(decideChannelPolicy(undefined, HUMAN, true, false)).toBe('drop')
+describe('decideChannelPolicy — every human channel participant', () => {
+  test('accepts a mentioned human even before the channel registry is persisted', () => {
+    expect(decideChannelPolicy(undefined, HUMAN, true, false)).toBe('deliver')
   })
 
   test('delivers with empty allowFrom (default-allow humans)', () => {
@@ -139,14 +139,14 @@ describe('decideChannelPolicy — humans (default-allow)', () => {
     expect(decideChannelPolicy(policy({ allowFrom: [HUMAN] }), HUMAN, true, false)).toBe('deliver')
   })
 
-  test('drops human not on a populated allowFrom', () => {
-    expect(decideChannelPolicy(policy({ allowFrom: [OTHER_USER] }), HUMAN, true, false)).toBe('drop')
+  test('legacy populated allowFrom no longer restricts humans', () => {
+    expect(decideChannelPolicy(policy({ allowFrom: [OTHER_USER] }), HUMAN, true, false)).toBe('deliver')
   })
 
   test('active thread authorityだけは別humanのallowlistとmentionを上書きする', () => {
     const restricted = policy({ requireMention: true, allowFrom: [OTHER_USER] })
     expect(decideChannelPolicy(restricted, HUMAN, false, false, true)).toBe('deliver')
-    expect(decideChannelPolicy(undefined, HUMAN, false, false, true)).toBe('drop')
+    expect(decideChannelPolicy(undefined, HUMAN, false, false, true)).toBe('deliver')
     expect(decideChannelPolicy(restricted, BOT, false, true, true)).toBe('drop')
   })
 
@@ -159,7 +159,7 @@ describe('decideChannelPolicy — humans (default-allow)', () => {
   })
 })
 
-describe('decideChannelPolicy — bots (default-deny)', () => {
+describe('decideChannelPolicy — bots are always denied', () => {
   test('drops bot when channel has no policy', () => {
     expect(decideChannelPolicy(undefined, BOT, false, true)).toBe('drop')
   })
@@ -172,33 +172,28 @@ describe('decideChannelPolicy — bots (default-deny)', () => {
     expect(decideChannelPolicy(policy({ allowFrom: [HUMAN, OTHER_BOT] }), BOT, false, true)).toBe('drop')
   })
 
-  test('delivers bot when its id is explicitly listed in allowFrom', () => {
-    expect(decideChannelPolicy(policy({ allowFrom: [BOT] }), BOT, false, true)).toBe('deliver')
+  test('drops bot even when its id is explicitly listed in legacy allowFrom', () => {
+    expect(decideChannelPolicy(policy({ allowFrom: [BOT] }), BOT, false, true)).toBe('drop')
   })
 
-  test('delivers bot listed alongside humans in allowFrom', () => {
-    expect(decideChannelPolicy(policy({ allowFrom: [HUMAN, BOT] }), BOT, false, true)).toBe('deliver')
+  test('drops bot listed alongside humans in legacy allowFrom', () => {
+    expect(decideChannelPolicy(policy({ allowFrom: [HUMAN, BOT] }), BOT, false, true)).toBe('drop')
   })
 
   test('drops listed bot when requireMention=true and isMention=false', () => {
     expect(decideChannelPolicy(policy({ requireMention: true, allowFrom: [BOT] }), BOT, false, true)).toBe('drop')
   })
 
-  test('delivers listed bot when requireMention=true and isMention=true', () => {
-    expect(decideChannelPolicy(policy({ requireMention: true, allowFrom: [BOT] }), BOT, true, true)).toBe('deliver')
+  test('drops listed bot even when requireMention=true and isMention=true', () => {
+    expect(decideChannelPolicy(policy({ requireMention: true, allowFrom: [BOT] }), BOT, true, true)).toBe('drop')
   })
 
   test('a populated allowFrom containing only humans does not implicitly admit any bot', () => {
     expect(decideChannelPolicy(policy({ allowFrom: [HUMAN] }), BOT, false, true)).toBe('drop')
   })
 
-  test('drops humans not on a populated allowFrom even when the list contains only bot ids', () => {
-    // A populated allowFrom narrows humans to its listed ids — regardless of
-    // whether those ids are users or bots. Consequence: if you opt a bot in
-    // via allowFrom, you must also list every human you want to keep able to
-    // trigger Claude in that channel. (Same rule as upstream's pre-patch
-    // human allowlist; surfaced here because the bot path makes it new.)
-    expect(decideChannelPolicy(policy({ allowFrom: [BOT] }), HUMAN, true, false)).toBe('drop')
+  test('legacy bot-only allowFrom cannot exclude a human participant', () => {
+    expect(decideChannelPolicy(policy({ allowFrom: [BOT] }), HUMAN, true, false)).toBe('deliver')
   })
 })
 
@@ -280,8 +275,12 @@ describe('selectNewReplies — thread catch-up poller', () => {
     expect(out.map((r) => r.user)).toEqual([HUMAN])
   })
 
-  test('drops other bots (handled by the live app_mention path, not the poller)', () => {
-    const replies = [reply({ ts: '1712345690.000000', bot_id: 'B123', user: undefined })]
+  test('drops every Slack bot history shape', () => {
+    const replies = [
+      reply({ ts: '1712345690.000000', bot_id: 'B123', user: undefined }),
+      reply({ ts: '1712345691.000000', bot_profile: { id: 'B234' }, user: 'U0BOT234' }),
+      reply({ ts: '1712345692.000000', subtype: 'bot_message', user: 'U0BOT345' }),
+    ]
     expect(selectNewReplies(replies, '1712345680.000000', BOT_USER)).toEqual([])
   })
 
@@ -472,11 +471,15 @@ describe('decideThreadReplyDelivery — the poller wiring', () => {
     expect(decideThreadReplyDelivery(open, reply({ text: `<@${ALICE}> お願いします` }), BOT_USER)).toBe('drop-others')
   })
 
-  test('the allowlist still wins, and reports itself as the reason', () => {
+  test('legacy allowlist does not exclude a human reply', () => {
     const closed = policy({ requireMention: true, allowFrom: [OTHER_USER] })
-    expect(decideThreadReplyDelivery(closed, reply(), BOT_USER)).toBe('drop-policy')
-    // Unknown channel (e.g. a DM thread in threads.json) — policy, not noise.
-    expect(decideThreadReplyDelivery(undefined, reply({ text: `<@${ALICE}> hi` }), BOT_USER)).toBe('drop-policy')
+    expect(decideThreadReplyDelivery(closed, reply(), BOT_USER)).toBe('deliver')
+  })
+
+  test('missing registry defaults to the mention/noise rule for an owned thread', () => {
+    expect(decideThreadReplyDelivery(undefined, reply(), BOT_USER)).toBe('deliver')
+    expect(decideThreadReplyDelivery(undefined, reply({ text: `<@${ALICE}> hi` }), BOT_USER))
+      .toBe('drop-others')
   })
 
   test('an attachment with no text is ours', () => {
@@ -640,6 +643,8 @@ describe('planCatchupSweep — startup recovery', () => {
     const plan = planCatchupSweep([
       message(-20_000, { text: '止まっている間のDM' }),
       message(-10_000, { user: undefined, bot_id: OTHER_BOT, text: 'bot DM' }),
+      message(-9_000, { user: 'U0BOT234', bot_profile: { id: 'B234' }, text: 'profile bot DM' }),
+      message(-8_000, { user: 'U0BOT345', subtype: 'bot_message', text: 'legacy bot DM' }),
     ], [], {
       channelId: 'D123',
       channelType: 'im',
@@ -805,10 +810,11 @@ describe('planThreadPoll — one page of a thread, end to end', () => {
     expect(plan.cursor).toBe(CURSOR)
   })
 
-  test('a sender off the allowlist is reported as policy, not as noise', () => {
+  test('legacy allowlist cannot exclude a human participant', () => {
     const closed = policy({ requireMention: true, allowFrom: [OTHER_USER] })
     const plan = planThreadPoll([reply('1786325100.000000')], CURSOR, closed, BOT_USER)
-    expect(plan.skipped.map((s) => s.reason)).toEqual(['policy'])
+    expect(plan.deliver).toHaveLength(1)
+    expect(plan.skipped).toEqual([])
     expect(plan.cursor).toBe('1786325100.000000')
   })
 
@@ -855,7 +861,7 @@ describe('isBotDMBlocked', () => {
   })
 })
 
-describe('effectiveDmAllowFrom — channel opt-in is DM opt-in', () => {
+describe('effectiveDmAllowFrom — DM permission is independent from channels', () => {
   test('empty access yields nobody', () => {
     expect(effectiveDmAllowFrom({})).toEqual([])
     expect(effectiveDmAllowFrom({ allowFrom: [], channels: {} })).toEqual([])
@@ -865,12 +871,12 @@ describe('effectiveDmAllowFrom — channel opt-in is DM opt-in', () => {
     expect(effectiveDmAllowFrom({ allowFrom: [HUMAN], channels: {} })).toEqual([HUMAN])
   })
 
-  test('a user allowed in a channel may DM without being on the global list', () => {
+  test('legacy channel membership does not grant DM at runtime', () => {
     const access = { allowFrom: [], channels: { C1: policy({ allowFrom: [OTHER_USER] }) } }
-    expect(effectiveDmAllowFrom(access)).toEqual([OTHER_USER])
+    expect(effectiveDmAllowFrom(access)).toEqual([])
   })
 
-  test('unions across every channel, global first, without duplicates', () => {
+  test('ignores every legacy channel list and keeps only the global list', () => {
     const access = {
       allowFrom: [HUMAN],
       channels: {
@@ -878,7 +884,7 @@ describe('effectiveDmAllowFrom — channel opt-in is DM opt-in', () => {
         C2: policy({ allowFrom: ['U333THIRD'] }),
       },
     }
-    expect(effectiveDmAllowFrom(access)).toEqual([HUMAN, OTHER_USER, 'U333THIRD'])
+    expect(effectiveDmAllowFrom(access)).toEqual([HUMAN])
   })
 
   test('an open channel (empty allowFrom) grants DM access to nobody', () => {
@@ -888,7 +894,7 @@ describe('effectiveDmAllowFrom — channel opt-in is DM opt-in', () => {
 
   test('bot ids opted into a channel never reach the DM list', () => {
     const access = { allowFrom: [], channels: { C1: policy({ allowFrom: [BOT, OTHER_BOT, HUMAN] }) } }
-    expect(effectiveDmAllowFrom(access)).toEqual([HUMAN])
+    expect(effectiveDmAllowFrom(access)).toEqual([])
   })
 
   test('a bot id sitting in the global list is ignored too', () => {

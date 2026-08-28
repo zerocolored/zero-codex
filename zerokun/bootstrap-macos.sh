@@ -1387,60 +1387,20 @@ EOF
 
 configure_access() {
   local access_file="$STATE_DIR/access.json"
-  local existing_access=""
   if [ -e "$access_file" ] || [ -L "$access_file" ]; then
-    existing_access="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$access_file")" \
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" \
+      validate-owned-regular "$access_file" \
       || fail "access.jsonが安全な通常fileではありません"
+  else
+    /bin/cp "$REPO_DIR/zerokun/templates/access.json.example" "$access_file" \
+      || fail "access.jsonを作成できませんでした"
+    /bin/chmod 600 "$access_file"
   fi
-  if [ -n "$existing_access" ] && ! printf '%s\n' "$existing_access" \
-    | /usr/bin/grep -q 'U_あなたのSlackユーザーID'; then
-    configure_routes_from_access
-    ok "access.jsonは設定済みです"
-    return
-  fi
-  local user_id channel_id
-  printf '   あなたのSlackユーザーID（UまたはWで始まる。後で設定するならEnter）: '
-  IFS= read -r user_id
-  [ -n "$user_id" ] || { warn "access.jsonは後で設定してください"; return; }
-  case "$user_id" in U?*|W?*) ;; *) fail "SlackユーザーIDの形式が不正です" ;; esac
-  case "$user_id" in *[!A-Z0-9]*) fail "SlackユーザーIDの形式が不正です" ;; esac
-  printf '   許可するSlackチャンネルID（CまたはGで始まる。後で設定するならEnter）: '
-  IFS= read -r channel_id
-  [ -n "$channel_id" ] || { warn "チャンネルは後で追加してください"; return; }
-  case "$channel_id" in C?*|G?*) ;; *) fail "SlackチャンネルIDの形式が不正です" ;; esac
-  case "$channel_id" in *[!A-Z0-9]*) fail "SlackチャンネルIDの形式が不正です" ;; esac
-  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/access.ts" policy allowlist >/dev/null
-  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/access.ts" allow "$user_id" >/dev/null
-  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/access.ts" channel add "$channel_id" >/dev/null
-  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/access.ts" channel allow "$channel_id" "$user_id" >/dev/null
-  configure_routes_from_access
-  ok "Slack allowlistを設定しました"
-}
-
-configure_routes_from_access() {
-  local access_file="$STATE_DIR/access.json"
-  local routes_file="$STATE_DIR/routes.json"
-  [ -f "$access_file" ] || return 0
-  [ -d "$PROJECT_DIR" ] || fail "初期route先がありません: $PROJECT_DIR"
-  ZEROKUN_ACCESS_FILE="$access_file" ZEROKUN_ROUTES_FILE="$routes_file" \
-    ZEROKUN_SAFE_FILE="$REPO_DIR/zerokun/safe-file.ts" \
-    ZEROKUN_ROUTE_PROJECT="$PROJECT_DIR" bun --config=/dev/null --no-env-file -e '
-      import { realpathSync } from "fs";
-      const { atomicWritePrivateFile, readOptionalPrivateFile } = await import(process.env.ZEROKUN_SAFE_FILE!);
-      const access = JSON.parse((readOptionalPrivateFile(process.env.ZEROKUN_ACCESS_FILE!) ?? "{}"));
-      const routePath = process.env.ZEROKUN_ROUTES_FILE!;
-      const existingRoutes = readOptionalPrivateFile(routePath);
-      const routes = existingRoutes === null ? {} : JSON.parse(existingRoutes);
-      if (!routes || Array.isArray(routes) || typeof routes !== "object") {
-        throw new Error("routes.json must be an object");
-      }
-      const project = realpathSync(process.env.ZEROKUN_ROUTE_PROJECT!);
-      for (const channel of Object.keys(access.channels ?? {})) {
-        if (!routes[channel]) routes[channel] = { repo_path: project, label: "Default project" };
-      }
-      atomicWritePrivateFile(routePath, JSON.stringify(routes, null, 2) + "\n");
-    ' || fail "routes.jsonを安全に生成できませんでした"
-  ok "許可チャンネルの初期routeを設定しました: $PROJECT_DIR"
+  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/access.ts" status >/dev/null \
+    || fail "access.jsonを読み取れませんでした"
+  ok "チャンネルはZeroちゃんを招待すると自動で利用できます（新規依頼はメンション）"
+  echo "   DMは初回メッセージで表示されるcodeを zerochan-access pair <code> へ渡します。"
 }
 
 validate_slack_names() {
@@ -1538,7 +1498,7 @@ configure_slack() {
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare-root "$STATE_DIR" >/dev/null \
     || fail "state directoryを安全に準備できませんでした: $STATE_DIR"
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-existing \
-    "$STATE_DIR/.env" "$STATE_DIR/access.json" "$STATE_DIR/routes.json" \
+    "$STATE_DIR/.env" "$STATE_DIR/access.json" \
     || fail "既存のSlack設定fileが安全ではありません"
   section "Slack App"
   if [ "$SKIP_SLACK" = "1" ]; then

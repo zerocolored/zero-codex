@@ -591,6 +591,10 @@ type LauncherPathSnapshot =
 export interface ManagedLauncherSnapshot {
   zerochan: LauncherPathSnapshot
   zerokun: LauncherPathSnapshot
+  /** Added after the command was renamed; absent in older durable journals. */
+  zerochanAccess?: LauncherPathSnapshot
+  /** Captures the owned legacy link that setup removes during the rename. */
+  zerokunAccess?: LauncherPathSnapshot
 }
 
 const decoder = new TextDecoder()
@@ -1484,9 +1488,19 @@ function journalPath(stateDir: string): string {
   return join(stateDir, 'update-transaction.json')
 }
 
-function launcherPaths(): { zerochan: string; zerokun: string } {
+function launcherPaths(): {
+  zerochan: string
+  zerokun: string
+  zerochanAccess: string
+  zerokunAccess: string
+} {
   const bin = join(homedir(), '.local', 'bin')
-  return { zerochan: join(bin, 'zerochan'), zerokun: join(bin, 'zerokun') }
+  return {
+    zerochan: join(bin, 'zerochan'),
+    zerokun: join(bin, 'zerokun'),
+    zerochanAccess: join(bin, 'zerochan-access'),
+    zerokunAccess: join(bin, 'zerokun-access'),
+  }
 }
 
 function snapshotLauncherPath(path: string): LauncherPathSnapshot {
@@ -1506,6 +1520,8 @@ export function snapshotManagedLaunchers(): ManagedLauncherSnapshot {
   return {
     zerochan: snapshotLauncherPath(paths.zerochan),
     zerokun: snapshotLauncherPath(paths.zerokun),
+    zerochanAccess: snapshotLauncherPath(paths.zerochanAccess),
+    zerokunAccess: snapshotLauncherPath(paths.zerokunAccess),
   }
 }
 
@@ -1525,17 +1541,39 @@ function validLauncherPathSnapshot(value: unknown): value is LauncherPathSnapsho
 function validManagedLauncherSnapshot(value: unknown): value is ManagedLauncherSnapshot {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const snapshot = value as Record<string, unknown>
-  return Object.keys(snapshot).length === 2
+  const keys = Object.keys(snapshot).sort()
+  const legacy = keys.length === 2
+    && keys[0] === 'zerochan' && keys[1] === 'zerokun'
+  const current = keys.length === 4
+    && keys[0] === 'zerochan' && keys[1] === 'zerochanAccess'
+    && keys[2] === 'zerokun' && keys[3] === 'zerokunAccess'
+  return (legacy || current)
     && validLauncherPathSnapshot(snapshot.zerochan)
     && validLauncherPathSnapshot(snapshot.zerokun)
+    && (!current || (
+      validLauncherPathSnapshot(snapshot.zerochanAccess)
+      && validLauncherPathSnapshot(snapshot.zerokunAccess)
+    ))
 }
 
-function restoreManagedLaunchers(snapshot: ManagedLauncherSnapshot, repoPath: string): void {
-  const paths = launcherPaths()
-  const candidateTarget = join(repoPath, 'codex-channel.sh')
-  for (const name of ['zerochan', 'zerokun'] as const) {
+export function restoreManagedLaunchers(
+  snapshot: ManagedLauncherSnapshot,
+  repoPath: string,
+  paths = launcherPaths(),
+): void {
+  const candidateTargets = {
+    zerochan: join(repoPath, 'codex-channel.sh'),
+    zerokun: join(repoPath, 'codex-channel.sh'),
+    zerochanAccess: join(repoPath, 'zerokun', 'access.ts'),
+    zerokunAccess: join(repoPath, 'zerokun', 'access.ts'),
+  }
+  const names = (snapshot.zerochanAccess && snapshot.zerokunAccess)
+    ? ['zerochan', 'zerokun', 'zerochanAccess', 'zerokunAccess'] as const
+    : ['zerochan', 'zerokun'] as const
+  for (const name of names) {
     const path = paths[name]
-    const before = snapshot[name]
+    const before = snapshot[name]!
+    const candidateTarget = candidateTargets[name]
     let current: LauncherPathSnapshot
     current = snapshotLauncherPath(path)
     if (before.kind === 'other') {
