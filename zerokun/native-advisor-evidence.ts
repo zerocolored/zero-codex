@@ -78,6 +78,10 @@ export function resolveNativeAdvisorThreadIds(options: {
   childResponses: Map<string, unknown>
 }): NativeAdvisorRoundEvidence[] {
   const repo = realpathSync(options.repoPath)
+  const inheritedParentTurns = parentTurnOrder(
+    options.parentResponse,
+    options.parentThreadId,
+  )
   const childThreads: Array<{
     threadId: string
     perspective: NativeAdvisorPerspective
@@ -123,6 +127,7 @@ export function resolveNativeAdvisorThreadIds(options: {
         child.threadId,
         directChildIds,
       ),
+      inheritedParentTurns,
     ),
   }))
 
@@ -263,6 +268,29 @@ function parentSubagentActivityTimeline(
   return timeline
 }
 
+function parentTurnOrder(
+  response: unknown,
+  parentThreadId: string,
+): ReadonlyMap<string, number> {
+  const parent = threadFromResponse(response, 'native advisor parent turn source')
+  if (parent.id !== parentThreadId || !Array.isArray(parent.turns)) {
+    throw new Error('native advisor parent turn source is invalid')
+  }
+  const order = new Map<string, number>()
+  for (const [index, rawTurn] of parent.turns.entries()) {
+    if (!rawTurn || typeof rawTurn !== 'object' || Array.isArray(rawTurn)) continue
+    const id = (rawTurn as Record<string, unknown>).id
+    // Older App Server projections and focused unit fixtures can omit turn IDs.
+    // Those inputs retain the legacy one-precursor validation below.
+    if (id === undefined || id === null) continue
+    if (typeof id !== 'string' || !THREAD_ID.test(id) || order.has(id)) {
+      throw new Error('native advisor parent turn identity is invalid or duplicated')
+    }
+    order.set(id, index)
+  }
+  return order
+}
+
 function inheritedParentActivitiesForChild(
   timeline: readonly ParentSubagentActivity[],
   currentThreadId: string,
@@ -285,13 +313,41 @@ function completedFinalResponse(
   label: string,
   directChildIds: ReadonlySet<string> = new Set(),
   inheritedParentActivities: ReadonlySet<string> = new Set(),
+  inheritedParentTurns: ReadonlyMap<string, number> = new Map(),
 ): string {
-  if (!Array.isArray(thread.turns) || thread.turns.length < 1
-    || thread.turns.length > 2) {
+  if (!Array.isArray(thread.turns) || thread.turns.length < 1) {
+    throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
+  }
+  const ownedTurns: unknown[] = []
+  let lastInheritedOrdinal = -1
+  let observedOwnedTurn = false
+  for (const [turnIndex, rawTurn] of thread.turns.entries()) {
+    const turn = record(rawTurn, `${label}.turn ${turnIndex}`)
+    const inheritedOrdinal = typeof turn.id === 'string'
+      ? inheritedParentTurns.get(turn.id)
+      : undefined
+    if (inheritedOrdinal === undefined) {
+      observedOwnedTurn = true
+      ownedTurns.push(rawTurn)
+      continue
+    }
+    if (observedOwnedTurn || inheritedOrdinal <= lastInheritedOrdinal
+      || (turn.status !== 'completed' && turn.status !== 'interrupted')
+      || turn.itemsView !== 'full' || !Array.isArray(turn.items)) {
+      throw new Error(`${label} inherited parent turn history is invalid`)
+    }
+    // App Server forks a native advisor from the complete parent history. A
+    // long-running Zeroちゃん job can therefore project several completed
+    // parent turns plus the current interrupted parent turn before the one
+    // advisor-owned response. Their stable parent turn IDs and chronological
+    // order distinguish that inherited prefix from repeated advisor prompts.
+    lastInheritedOrdinal = inheritedOrdinal
+  }
+  if (ownedTurns.length < 1 || ownedTurns.length > 2) {
     throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
   }
   let finalResponse: string | null = null
-  for (const [turnIndex, rawTurn] of thread.turns.entries()) {
+  for (const [turnIndex, rawTurn] of ownedTurns.entries()) {
     const turn = record(rawTurn, `${label}.turn ${turnIndex}`)
     if ((turn.status !== 'completed' && turn.status !== 'interrupted')
       || turn.itemsView !== 'full' || !Array.isArray(turn.items)) {
@@ -329,7 +385,7 @@ function completedFinalResponse(
       }
       continue
     }
-    if (turnIndex !== thread.turns.length - 1 || messages.length !== 1
+    if (turnIndex !== ownedTurns.length - 1 || messages.length !== 1
       || !messages[0] || finalResponse !== null) {
       throw new Error(`${label} does not contain one final response`)
     }
@@ -393,6 +449,10 @@ export function assertNativeAdvisorEvidence(options: {
   const parent = threadFromResponse(options.parentResponse, 'native advisor parent response')
   const directChildIds = new Set(options.childResponses.keys())
   const parentActivityTimeline = parentSubagentActivityTimeline(
+    options.parentResponse,
+    options.parentThreadId,
+  )
+  const inheritedParentTurns = parentTurnOrder(
     options.parentResponse,
     options.parentThreadId,
   )
@@ -471,6 +531,7 @@ export function assertNativeAdvisorEvidence(options: {
           entry.agentId,
           directChildIds,
         ),
+        inheritedParentTurns,
       )
       const descendants = options.childChildrenListResponses.get(entry.agentId)
       if (!descendants) {

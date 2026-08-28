@@ -950,6 +950,13 @@ function assertEffectiveCodexPermissionSnapshot(
   if (effectiveNetwork?.enabled !== expectedNetworkEnabled) {
     throw new Error(`Codex managed config changed ${profile}.network.enabled`)
   }
+  const localBindingKey = `permissions.${profile}.network.allow_local_binding`
+  if (overrides.some(value => value.startsWith(`${localBindingKey}=`))) {
+    const expectedLocalBinding = overrideValue(overrides, localBindingKey)
+    if (effectiveNetwork?.allow_local_binding !== expectedLocalBinding) {
+      throw new Error(`Codex managed config changed ${profile}.network.allow_local_binding`)
+    }
+  }
   const domainsKey = `permissions.${profile}.network.domains`
   if (overrides.some(value => value.startsWith(`${domainsKey}=`))) {
     const expectedDomains = overrideValue(overrides, domainsKey)
@@ -2494,6 +2501,7 @@ export function buildCodexDeveloperInstructions(
   _advisorAttemptNonce?: string,
   _stage: 'complete' | 'prepare' | 'implementation' | 'review' = 'complete',
   _reviewRound: 1 | 2 | 3 = 1,
+  _browserEnabled = false,
 ): string {
   if (job.writeEnabled) {
     const authority = [
@@ -2525,6 +2533,12 @@ export function buildCodexDeveloperInstructions(
       'implement, test, commit and push as required, and complete review only after those changes.',
       'Use the exact current-input advisor markers supplied by the host block and do not mutate',
       'anything after the accepted review.',
+      '',
+      'When the trusted host phase block exposes zerokun_browser.verify_local_page for a',
+      'write-authorized web workflow, start the application on an explicit localhost port, call',
+      'that tool with the exact URL and one expected visible text value, and preserve its HTTP,',
+      'rendered-DOM, screenshot, blocked-request, and cleanup result as test evidence. Do not use',
+      'another browser, browser profile, browser MCP, remote URL, or arbitrary CDP.',
       '',
       'For every required read-only round, wait for both native advisors, then call advisor_round',
       'once. Poll advisor_round_poll with the exact same binding without a poll-count or total-',
@@ -2589,6 +2603,7 @@ export type CodexWorkerPromptContext = {
   attemptNonce: string
   artifactDir: string
   advisorEnabled: boolean
+  browserEnabled?: boolean
 }
 
 export function buildCodexWorkerPrompt(
@@ -2641,6 +2656,13 @@ export function buildCodexWorkerPrompt(
       'push as required, and finally run read-only review without further repository mutation.',
       `Native advisor markers must use [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|design|review>:<round>:<solution|risk>].`,
     )
+    if (host.browserEnabled) {
+      control.push(
+        'Local browser verifier: for browser-visible behavior, start the localhost application',
+        'and call zerokun_browser.verify_local_page before completion. Use its screenshot and',
+        'rendered-DOM result as evidence; never use an operator browser or a remote URL.',
+      )
+    }
   }
   control.push('--- end Zero host control ---')
   return [base, ...control].join('\n')
@@ -2653,6 +2675,7 @@ export function buildCodexPhasePrompt(
   reviewRound: 1 | 2 | 3 = 1,
   attemptNonce?: string,
   artifactDir?: string,
+  browserEnabled = false,
 ): string {
   if (!/^[0-9a-f]{32}$/.test(attemptNonce ?? '')) {
     throw new Error('host phase prompt requires the logical attempt nonce')
@@ -2691,8 +2714,13 @@ export function buildCodexPhasePrompt(
       'The root request is write-authorized. Under the active-thread delegation contract, every',
       'same-thread follow-up in the transcript belongs to this fixed-permission job even when its',
       'sender would be read-only in a new thread. Implement, test, commit, and push this exact',
-      'prepared combined input. Review runs later in a',
-      `separate read-only process. The final line must be exactly [ZERO_IMPLEMENTATION_READY:${attemptNonce}:r${input.revision}:${input.digest}].`,
+      'prepared combined input. Review runs later in a separate read-only process.',
+      ...(browserEnabled ? [
+        'For browser-visible behavior, start the application on localhost and call',
+        'zerokun_browser.verify_local_page with the exact URL and expected visible text. Preserve',
+        'the returned screenshot and rendered-DOM evidence for the later review.',
+      ] : []),
+      `The final line must be exactly [ZERO_IMPLEMENTATION_READY:${attemptNonce}:r${input.revision}:${input.digest}].`,
       '--- end Zero host phase control ---',
     ].join('\n')
   }
@@ -2700,6 +2728,11 @@ export function buildCodexPhasePrompt(
     base,
     ...host,
     `Host phase: read-only review round ${reviewRound}.`,
+    ...(browserEnabled ? [
+      'For browser-visible behavior, you may start the unchanged application on localhost and call',
+      'zerokun_browser.verify_local_page to independently confirm its rendered output. Do not use',
+      'another browser, operator profile, remote URL, or arbitrary CDP.',
+    ] : []),
     'Review the unchanged repository for this exact implemented input. Each native advisor',
     `response must end with [ZERO_NATIVE_ADVISOR:${attemptNonce}:r${input.revision}:${input.digest}:review:${reviewRound}:<solution|risk>] after replacing only the final perspective placeholder.`,
     `The first final-response line must be exactly [ZERO_REVIEW_PUBLISH:${attemptNonce}:round-${reviewRound}] or [ZERO_REVIEW_FIX_REQUIRED:${attemptNonce}:round-${reviewRound}].`,
@@ -2989,8 +3022,10 @@ export function buildCodexPermissionOverrides(
     gitRoot?: string | null
     profile?: string
     advisorMcp?: { command: string; args: string[] }
+    browserMcp?: { command: string; args: string[] }
     seatbeltFingerprintAllowPath?: string
     executionWriteEnabled?: boolean
+    localVerificationEnabled?: boolean
     multiAgentEnabled?: boolean
   },
 ): string[] {
@@ -3008,6 +3043,8 @@ export function buildCodexPermissionOverrides(
     ? requireManagedDirectory(options.stateDir, options.liveInputDir)
     : null
   const executionWriteEnabled = options.executionWriteEnabled ?? job.writeEnabled
+  const localVerificationEnabled = options.localVerificationEnabled ?? false
+  const networkEnabled = executionWriteEnabled || localVerificationEnabled
   const multiAgentEnabled = options.multiAgentEnabled ?? true
   if (pathContains(repo, home)) {
     throw new Error(`repository must not contain HOME: ${repo}`)
@@ -3063,14 +3100,26 @@ export function buildCodexPermissionOverrides(
     '"NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S"=""',
     '"NODE_REPL_TRUSTED_CODE_PATHS"=""',
   ].join(',')
-  const mcpServers = options.advisorMcp
-    ? `{zerokun_advisors={command=${tomlString(options.advisorMcp.command)},args=[${options.advisorMcp.args.map(tomlString).join(',')}],enabled=true,required=true,enabled_tools=["advisor_round","advisor_round_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"}}}}`
-    : '{}'
+  const mcpEntries: string[] = []
+  if (options.advisorMcp) {
+    mcpEntries.push(
+      `zerokun_advisors={command=${tomlString(options.advisorMcp.command)},args=[${options.advisorMcp.args.map(tomlString).join(',')}],enabled=true,required=true,enabled_tools=["advisor_round","advisor_round_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"}}}`,
+    )
+  }
+  if (options.browserMcp) {
+    mcpEntries.push(
+      `zerokun_browser={command=${tomlString(options.browserMcp.command)},args=[${options.browserMcp.args.map(tomlString).join(',')}],enabled=true,required=true,enabled_tools=["verify_local_page"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=180,tools={verify_local_page={approval_mode="approve"}}}`,
+    )
+  }
+  const mcpServers = `{${mcpEntries.join(',')}}`
   return [
     `permissions.${profile}.filesystem={${filesystem}}`,
-    `permissions.${profile}.network.enabled=${executionWriteEnabled ? 'true' : 'false'}`,
+    `permissions.${profile}.network.enabled=${networkEnabled ? 'true' : 'false'}`,
+    `permissions.${profile}.network.allow_local_binding=${networkEnabled ? 'true' : 'false'}`,
     ...(executionWriteEnabled ? [
       `permissions.${profile}.network.domains={"*"="allow","slack.com"="deny","**.slack.com"="deny","slack-edge.com"="deny","**.slack-edge.com"="deny","slack-msgs.com"="deny","**.slack-msgs.com"="deny"}`,
+    ] : localVerificationEnabled ? [
+      `permissions.${profile}.network.domains={"127.0.0.1"="allow","localhost"="allow"}`,
     ] : []),
     `default_permissions=${tomlString(profile)}`,
     'approval_policy="never"',
@@ -3098,7 +3147,7 @@ export function buildCodexPermissionOverrides(
     'features.computer_use=false',
     'features.in_app_browser=false',
     `features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}`,
-    `features.network_proxy=${executionWriteEnabled ? 'true' : 'false'}`,
+    `features.network_proxy=${networkEnabled ? 'true' : 'false'}`,
     'features.skill_mcp_dependency_install=false',
     `mcp_servers=${mcpServers}`,
     'hooks={}',
@@ -3746,13 +3795,18 @@ export async function executeCodexJob(
   if (herdrRuntime) {
     await verifyHerdrRuntimeIdentityAsync(herdrRuntime)
   }
-  const brokerPath = realpathSync(join(import.meta.dir, 'advisor-broker.ts'))
-  const brokerMetadata = lstatSync(brokerPath)
-  const brokerOwned = typeof process.getuid !== 'function' || brokerMetadata.uid === process.getuid()
-  if (!brokerMetadata.isFile() || brokerMetadata.isSymbolicLink() || brokerMetadata.nlink !== 1
-    || !brokerOwned || (brokerMetadata.mode & 0o022) !== 0) {
-    throw new Error(`advisor broker is unsafe: ${brokerPath}`)
+  const requireSafeBroker = (basename: string): string => {
+    const path = realpathSync(join(import.meta.dir, basename))
+    const metadata = lstatSync(path)
+    const owned = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1
+      || !owned || (metadata.mode & 0o022) !== 0) {
+      throw new Error(`managed broker is unsafe: ${path}`)
+    }
+    return path
   }
+  const brokerPath = requireSafeBroker('advisor-broker.ts')
+  const browserBrokerPath = requireSafeBroker('browser-verification-broker.ts')
   const localAdvisorAccess = herdrRuntime !== undefined
   type ExecutionStage = 'complete' | 'prepare' | 'implementation' | 'review'
   const phasedWrite = job.writeEnabled && options.liveControls !== undefined
@@ -3819,6 +3873,17 @@ export async function executeCodexJob(
           stage === 'prepare' ? 'prepare' : (stage === 'review' ? 'review' : 'complete'),
         ],
       } : undefined
+      const browserMcp = testCodexBin === undefined && job.writeEnabled
+        && process.platform === 'darwin' && stage !== 'prepare'
+        ? {
+            command: realpathSync(process.execPath),
+            args: [
+              '--config=/dev/null', '--no-env-file', browserBrokerPath,
+              logicalAttempt.contextPath, managedStateDir, artifactDir, scratchDir,
+              stage,
+            ],
+          }
+        : undefined
       const permissionProfile = `zerokun_job_${randomUUID().replaceAll('-', '')}`
       const executionWriteEnabled = stage === 'complete'
         ? job.writeEnabled
@@ -3831,8 +3896,10 @@ export async function executeCodexJob(
         gitRoot: advisorProjectLayout.gitRoot,
         profile: permissionProfile,
         advisorMcp,
+        browserMcp,
         seatbeltFingerprintAllowPath: seatbeltFingerprint.allow.path,
         executionWriteEnabled,
+        localVerificationEnabled: browserMcp !== undefined,
         multiAgentEnabled: stage !== 'implementation',
       })
       return {
@@ -3843,6 +3910,7 @@ export async function executeCodexJob(
         stage,
         reviewRound,
         advisorEnabled: advisorMcp !== undefined,
+        browserEnabled: browserMcp !== undefined,
         permissionProfile,
         permissionOverrides,
         seatbeltFingerprint,
@@ -3856,6 +3924,7 @@ export async function executeCodexJob(
             : undefined,
           stage,
           reviewRound,
+          browserMcp !== undefined,
         ),
       }
     } catch (error) {
@@ -4721,6 +4790,7 @@ export async function executeCodexJob(
                 attemptNonce: advisorAttempt.attemptNonce,
                 artifactDir,
                 advisorEnabled: advisorAttempt.advisorEnabled,
+                browserEnabled: advisorAttempt.browserEnabled,
               })
               : buildCodexPhasePrompt(
                 job,
@@ -4729,6 +4799,7 @@ export async function executeCodexJob(
                 reviewRound,
                 advisorAttempt.attemptNonce,
                 artifactDir,
+                advisorAttempt.browserEnabled,
               ),
             phaseClientUserMessageId ?? job.idempotencyKey,
             {
@@ -5274,6 +5345,7 @@ export async function executeCodexJob(
         attemptNonce: advisorAttempt.attemptNonce,
         artifactDir,
         advisorEnabled: advisorAttempt.advisorEnabled,
+        browserEnabled: advisorAttempt.browserEnabled,
       }))
     }
     proc.stdin.end()

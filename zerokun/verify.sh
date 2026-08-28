@@ -247,7 +247,7 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
   candidate_contract_test zerokun/codex-config-preflight.test.ts \
     'MCP transportが欠落またはstdio/HTTP併存ならfail closedする'
   candidate_contract_test zerokun/codex-config-preflight.test.ts \
-    'Zeroちゃんbrokerだけをenabledのまま保持する'
+    'Zeroちゃんの用途固定brokerだけをenabledのまま保持する'
   candidate_contract_test zerokun/update.test.ts \
     'candidate sandboxはpreflightと同じrandom named permissionをdefaultにする'
   candidate_contract_test zerokun/update.test.ts \

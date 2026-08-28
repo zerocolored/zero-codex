@@ -162,6 +162,75 @@ describe('native Codex advisor host evidence', () => {
     expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
   })
 
+  test('複数の親turnを継承したreview advisorは自分のcompleted turnだけを採択する', () => {
+    const { options, solutionId, riskId } = fixture()
+    const parent = options.parentResponse as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    parent.thread.turns = [
+      {
+        id: 'parent-prepare-turn',
+        status: 'completed',
+        itemsView: 'full',
+        items: [
+          { type: 'subAgentActivity', id: 'solution-start', kind: 'started', agentThreadId: solutionId },
+          { type: 'subAgentActivity', id: 'risk-start', kind: 'started', agentThreadId: riskId },
+        ],
+      },
+      {
+        id: 'parent-implementation-turn',
+        status: 'completed',
+        itemsView: 'full',
+        items: [{ type: 'agentMessage', phase: 'final_answer', text: 'implementation marker' }],
+      },
+      {
+        id: 'parent-review-turn',
+        status: 'completed',
+        itemsView: 'full',
+        items: [],
+      },
+    ]
+    for (const childId of [solutionId, riskId]) {
+      const child = options.childResponses.get(childId) as {
+        thread: { turns: Array<Record<string, unknown>> }
+      }
+      child.thread.turns.unshift(
+        {
+          id: 'parent-prepare-turn',
+          status: 'completed',
+          itemsView: 'full',
+          items: parent.thread.turns[0]!.items,
+        },
+        {
+          id: 'parent-implementation-turn',
+          status: 'completed',
+          itemsView: 'full',
+          items: parent.thread.turns[1]!.items,
+        },
+        {
+          id: 'parent-review-turn',
+          status: 'interrupted',
+          itemsView: 'full',
+          items: [{ type: 'agentMessage', phase: 'commentary', text: 'reviewing' }],
+        },
+      )
+    }
+    expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
+
+    const forged = options.childResponses.get(solutionId) as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    forged.thread.turns.push({
+      id: 'second-owned-turn',
+      status: 'completed',
+      itemsView: 'full',
+      items: [{ type: 'agentMessage', phase: 'final_answer', text: 'second response' }],
+    })
+    expect(() => assertNativeAdvisorEvidence(options)).toThrow(
+      'does not contain one final response',
+    )
+  })
+
   test('fork時に親から継承した別direct advisorのactivityだけを許容する', () => {
     const accepted = fixture()
     const parent = accepted.options.parentResponse as {

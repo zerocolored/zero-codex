@@ -93,11 +93,24 @@ describe('Zero-kun Codex wiring', () => {
   test('read and write authorization map to separate Codex sandboxes', () => {
     const server = readFileSync(join(root, 'server.ts'), 'utf8')
     const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+    const browserBroker = readFileSync(
+      join(import.meta.dir, 'browser-verification-broker.ts'), 'utf8',
+    )
     expect(server).toContain('writeAllowFrom')
     expect(server).toContain('writeEnabled')
     expect(executor).toContain("[':minimal', 'read']")
     expect(executor).not.toContain("extends=${tomlString(job.writeEnabled")
     expect(executor).toContain('permissions.${profile}.network.enabled=')
+    expect(executor).toContain('permissions.${profile}.network.allow_local_binding=')
+    expect(executor).toContain('localVerificationEnabled')
+    expect(executor).toContain('zerokun_browser=')
+    expect(executor).toContain('enabled_tools=["verify_local_page"]')
+    expect(browserBroker).toContain("server.registerTool('verify_local_page'")
+    expect(browserBroker).toContain("['127.0.0.1', 'localhost']")
+    expect(browserBroker).toContain(
+      '`--proxy-bypass-list=<-loopback>;${input.address.url.hostname}:${input.address.port}`',
+    )
+    expect(browserBroker).toContain('blockedCrossOriginRequestCount')
     expect(executor).toContain('default_permissions=')
     expect(executor).not.toContain("'-s'")
     expect(executor).toContain('Never post to Slack yourself')

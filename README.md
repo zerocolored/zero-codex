@@ -60,6 +60,10 @@ Slack bot
   既存のClaude paneは列挙しても入力・再利用・`/clear`・closeしません。
 - 受信許可と書込み許可は別です。既定profileはrepository readとjob outbox writeだけです。`writeAllowFrom` を
   明示した利用者だけrepository・`.git` writeとネットワークを使えますが、Mac全体のsandboxは解除しません。
+- write許可されたWebタスクでは、implementation/review processだけに`verify_local_page`を公開します。
+  既存Chrome session・拡張・個人profileは使わず、署名済みGoogle Chromeをowner-onlyの一時profileで起動し、
+  明示したlocalhost origin以外のHTTP/WebSocketをdeny-by-default proxyで遮断します。HTTP 2xx、描画後DOMの
+  期待文字列、1280×720 PNG、遮断request数、Chrome子processと一時profileの回収をまとめて返します。
 - Grok/Claude連携は、Codex shellへcredentialやHerdr socketを渡さない用途固定のhost-side MCP brokerが
   read-onlyで代行します。brokerが公開するtoolは開始用`advisor_round`と状態照会用`advisor_round_poll`だけで、対象repository・pane・実行fileを
   Slack本文やmodel側から指定できません。各必須roundについて、startup receiptを排他作成して
@@ -390,6 +394,7 @@ DM は`zerochan`を実行した物理project directory、チャンネルは rout
 - `zerokun/job-runner.ts`: SQLite queue、session/thread 所有権、Slack 完了通知
 - `zerokun/runner-launcher.ts`: runnerの独立process group起動、安全なlog接続
 - `zerokun/codex-executor.ts`: Codex App Server実行、turn/control処理、sandbox分離
+- `zerokun/browser-verification-broker.ts`: localhost限定のChrome描画・PNG検証
 - `zerokun/access.ts`: pairing・受信権限・書込み権限の管理 CLI
 - `codex-channel.sh`: standalone gateway と runner の launcher
 - `zerokun/update.ts`: `main` ブランチ用の安全な自己更新

@@ -53,6 +53,7 @@ zerochan
 | `herdr-job-monitor.ts` | job専用Herdr監視tabの永続state、出力mirror、再起動reconcile、自動close |
 | `herdr-job-monitor-view.ts` | tokenを持たずrolling feedだけをterminalへ安全に表示するviewer |
 | `codex-executor.ts` | sandboxを選び、App Server thread/turn/controlを検証 |
+| `browser-verification-broker.ts` | fresh Chrome profileでlocalhostだけを描画・PNG検証 |
 | `access.ts` | pairing、DM/channel、write 許可の端末 CLI |
 | `update.ts` | `origin/main` から安全に fast-forward 更新 |
 | `update-request.ts` | Slack 自己更新を FIFO 外の detached worker へ渡す |
@@ -181,10 +182,11 @@ codex <trust-args> -C <repo> \
 受信可否と repository write は別です。
 
 - 通常: minimal runtime + repository read + 当該添付read + job outbox/scratch write
-- `writeAllowFrom` の sender: minimal runtime + repository/`.git` write + network
+- `writeAllowFrom` の sender: minimal runtime + repository/`.git` write + network + localhost bind
 - 全read job: `investigation-1`、全write job: `design-1`と`review-1`を最低契約とし、native subagentは
   read-onlyの準備・review processだけで起動します。write implementation processではnative multi-agentと
-  brokerを無効化します。専用Grok launcherとround専用fresh Claudeの起動・cleanupはhost-side brokerの
+  advisor brokerを無効化し、localhost限定browser verifierだけを有効化します。review processでは
+  repositoryをread-onlyのままlocalhost bindと同じverifierを使えます。専用Grok launcherとround専用fresh Claudeの起動・cleanupはhost-side brokerの
   `advisor_round`（durable開始）と`advisor_round_poll`（短い状態照会）だけがread-onlyで代行。
   Grok reviewer本体とCodex jobは壁時計上限なしで継続し、pollの回数・合計時間にも上限を設けない。
   Claude第五advisorのacquisitionはroundごとに最大1時間。terminal結果は

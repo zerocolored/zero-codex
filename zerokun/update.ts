@@ -1781,6 +1781,7 @@ export function buildCandidatePermissionOverrides(
   return [
     `permissions.${profile}.filesystem={${filesystemToml}}`,
     `permissions.${profile}.network.enabled=true`,
+    `permissions.${profile}.network.allow_local_binding=true`,
     `permissions.${profile}.network.domains={"*"="allow"}`,
     `default_permissions=${JSON.stringify(profile)}`,
     'approval_policy="never"',

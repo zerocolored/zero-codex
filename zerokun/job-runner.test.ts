@@ -5768,6 +5768,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('official App Server parent/child history')
     expect(instructions).toContain('Do not create, set, resume, or')
     expect(instructions).toContain('modify a Codex goal')
+    expect(instructions).toContain('zerokun_browser.verify_local_page')
     const prepare = buildCodexPhasePrompt(
       job,
       'prepare',
@@ -5783,6 +5784,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       1,
       nonce,
       '/tmp/job-outbox',
+      true,
     )
     const review = buildCodexPhasePrompt(
       job,
@@ -5791,6 +5793,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       1,
       nonce,
       '/tmp/job-outbox',
+      true,
     )
     expect(prepare).toContain(
       `[ZERO_PRE_EDIT_READY:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
@@ -5798,8 +5801,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(implementation).toContain(
       `[ZERO_IMPLEMENTATION_READY:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
     )
+    expect(implementation).toContain('zerokun_browser.verify_local_page')
     expect(review).toContain(`[ZERO_REVIEW_PUBLISH:${nonce}:round-1]`)
     expect(review).toContain(`[ZERO_REVIEW_FIX_REQUIRED:${nonce}:round-1]`)
+    expect(review).toContain('zerokun_browser.verify_local_page')
     store.close()
   })
 
@@ -6889,6 +6894,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
           command: '/usr/bin/true',
           args: ['/runtime/advisor-broker.ts', '/state/context.json'],
         },
+        browserMcp: {
+          command: '/usr/bin/true',
+          args: ['/runtime/browser-verification-broker.ts', '/state/context.json'],
+        },
+        localVerificationEnabled: true,
       }).join('\n')
       expect(overrides).toContain('":minimal"="read"')
       expect(overrides).not.toContain('extends=')
@@ -6900,6 +6910,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
       expect(overrides).toContain('"*PROXY*"')
       expect(overrides).toContain('network.enabled=true')
+      expect(overrides).toContain('network.allow_local_binding=true')
       expect(overrides).toContain('features.network_proxy=true')
       for (const slackDomain of [
         'slack.com', '**.slack.com',
@@ -6910,7 +6921,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('features.plugins=false')
       expect(overrides).toContain('features.goals=false')
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
+      expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain('enabled_tools=["advisor_round","advisor_round_poll"]')
+      expect(overrides).toContain('enabled_tools=["verify_local_page"]')
+      expect(overrides).toContain('tool_timeout_sec=180')
       expect(overrides).toContain('tool_timeout_sec=30')
       expect(overrides).toContain('required=true')
       expect(overrides).not.toContain('.grok/auth.json')
@@ -6925,19 +6939,48 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(preEditOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="read"`)
       expect(preEditOverrides).toContain(`${JSON.stringify(realpathSync(join(repo, '.git')))}="read"`)
       expect(preEditOverrides).toContain('network.enabled=false')
+      expect(preEditOverrides).toContain('network.allow_local_binding=false')
       expect(preEditOverrides).toContain('web_search="disabled"')
       expect(preEditOverrides).toContain('features.network_proxy=false')
       const implementationOverrides = buildCodexPermissionOverrides(job, {
         stateDir: state,
         artifactDir: outbox,
         scratchDir: scratch,
+        browserMcp: {
+          command: '/usr/bin/true',
+          args: ['/runtime/browser-verification-broker.ts', '/state/context.json'],
+        },
         executionWriteEnabled: true,
+        localVerificationEnabled: true,
         multiAgentEnabled: false,
       }).join('\n')
       expect(implementationOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
       expect(implementationOverrides).toContain('features.multi_agent=false')
       expect(implementationOverrides).toContain('features.goals=false')
       expect(implementationOverrides).toContain('network.enabled=true')
+      expect(implementationOverrides).toContain('network.allow_local_binding=true')
+      expect(implementationOverrides).toContain('zerokun_browser=')
+      const reviewOverrides = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        browserMcp: {
+          command: '/usr/bin/true',
+          args: ['/runtime/browser-verification-broker.ts', '/state/context.json'],
+        },
+        executionWriteEnabled: false,
+        localVerificationEnabled: true,
+        multiAgentEnabled: true,
+      }).join('\n')
+      expect(reviewOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="read"`)
+      expect(reviewOverrides).toContain('network.enabled=true')
+      expect(reviewOverrides).toContain('network.allow_local_binding=true')
+      expect(reviewOverrides).toContain('web_search="disabled"')
+      expect(reviewOverrides).toContain('features.network_proxy=true')
+      expect(reviewOverrides).not.toContain('network.domains={"*"="allow"')
+      expect(reviewOverrides).toContain(
+        'network.domains={"127.0.0.1"="allow","localhost"="allow"}',
+      )
       expect(() => buildCodexPermissionOverrides(
         { ...job, repoPath: homedir() },
         { stateDir: state, artifactDir: outbox, scratchDir: scratch },

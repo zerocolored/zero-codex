@@ -405,11 +405,12 @@ describe('Codex app-server config preflight', () => {
     }, ['mcp_servers={}'])).toThrow('ambiguous transport')
   })
 
-  test('Zeroちゃんbrokerだけをenabledのまま保持する', () => {
-    const broker = '{zerokun_advisors={command="/safe/broker",args=[],enabled=true}}'
+  test('Zeroちゃんの用途固定brokerだけをenabledのまま保持する', () => {
+    const broker = '{zerokun_advisors={command="/safe/advisors",args=[],enabled=true},zerokun_browser={command="/safe/browser",args=[],enabled=true}}'
     const isolated = mcpIsolationOverridesForConfig({
       mcp_servers: {
-        zerokun_advisors: { command: '/safe/broker', args: [], enabled: true },
+        zerokun_advisors: { command: '/safe/advisors', args: [], enabled: true },
+        zerokun_browser: { command: '/safe/browser', args: [], enabled: true },
         host: { command: '/unsafe/host', enabled: true },
       },
     }, [`mcp_servers=${broker}`])
@@ -417,13 +418,18 @@ describe('Codex app-server config preflight', () => {
       value: Record<string, Record<string, unknown>>
     }
     expect(parsed.value.zerokun_advisors).toEqual({
-      command: '/safe/broker',
+      command: '/safe/advisors',
+      args: [],
+      enabled: true,
+    })
+    expect(parsed.value.zerokun_browser).toEqual({
+      command: '/safe/browser',
       args: [],
       enabled: true,
     })
     expect(parsed.value.host?.enabled).toBe(false)
     expect(Object.entries(parsed.value).filter(([, server]) => server.enabled === true)
-      .map(([name]) => name)).toEqual(['zerokun_advisors'])
+      .map(([name]) => name).sort()).toEqual(['zerokun_advisors', 'zerokun_browser'])
   })
 
   test('ambient MCPを発見して無効transportへ固定してから再検証する', async () => {

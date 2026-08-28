@@ -33,6 +33,9 @@ describe('public Codex defaults', () => {
     const rootReadme = readFileSync(join(import.meta.dir, '..', 'README.md'), 'utf8')
     const runtimeReadme = readFileSync(join(import.meta.dir, 'README.md'), 'utf8')
     const broker = readFileSync(join(import.meta.dir, 'advisor-broker.ts'), 'utf8')
+    const browserBroker = readFileSync(
+      join(import.meta.dir, 'browser-verification-broker.ts'), 'utf8',
+    )
     const fifthHelper = readFileSync(join(import.meta.dir, 'fifth-advisor.py'), 'utf8')
     for (const guide of [rootReadme, runtimeReadme]) {
       expect(guide).toContain('codex app-server --stdio')
@@ -51,6 +54,10 @@ describe('public Codex defaults', () => {
     expect(fifthHelper).toContain('CLAUDE_START_TIMEOUT_MS = 300_000')
     expect(fifthHelper).toContain('["workspace", "close", workspace_id]')
     expect(broker).toContain('Date.now() + 60 * 60 * 1_000')
+    expect(browserBroker).toContain("server.registerTool('verify_local_page'")
+    expect(browserBroker).toContain("const CHROME_APPLICATION = '/Applications/Google Chrome.app'")
+    expect(browserBroker).toContain('`--proxy-bypass-list=<-loopback>;${input.address.url.hostname}:${input.address.port}`')
+    expect(browserBroker).toContain('blockedCrossOriginRequestCount')
   })
 
   test('公開CIはGrok認証を要求せずCodex設定だけを実機検証する', () => {
