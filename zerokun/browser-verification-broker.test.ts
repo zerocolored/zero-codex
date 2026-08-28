@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  buildLaunchServicesChromeCommand,
+  isExpectedLaunchServicesChromeCommand,
   parseLocalPageAddress,
   parsePngDimensions,
 } from './browser-verification-broker.ts'
@@ -49,5 +51,57 @@ describe('local browser screenshot evidence', () => {
     png.writeUInt32BE(0, 16)
     png.writeUInt32BE(720, 20)
     expect(() => parsePngDimensions(png)).toThrow()
+  })
+})
+
+describe('macOS LaunchServices browser isolation', () => {
+  const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+  const profile = '/private/tmp/zero browser/profile'
+  const screenshot = '/private/tmp/zero browser/screenshot.png'
+
+  test('launches a fresh app without the blocking wait/background modes', () => {
+    const command = buildLaunchServicesChromeCommand({
+      browserHome: '/Users/example',
+      runRoot: '/private/tmp/zero browser',
+      profile,
+      stdoutPath: '/private/tmp/zero browser/browser.stdout',
+      stderrPath: '/private/tmp/zero browser/browser.stderr',
+      screenshotPath: screenshot,
+      proxyPort: 45678,
+      address: parseLocalPageAddress('http://127.0.0.1:8765/hello'),
+    })
+    expect(command.slice(0, 5)).toEqual([
+      '/usr/bin/open', '-n', '-a', '/Applications/Google Chrome.app', '-i',
+    ])
+    expect(command).not.toContain('-W')
+    expect(command).not.toContain('-g')
+    expect(command).toContain('HOME=/Users/example')
+    expect(command).toContain('TMPDIR=/private/tmp/zero browser')
+    expect(command).toContain('--headless')
+    expect(command).not.toContain('--headless=new')
+    expect(command).toContain('--timeout=5000')
+    expect(command).toContain(`--user-data-dir=${profile}`)
+    expect(command).toContain(`--screenshot=${screenshot}`)
+    expect(command).toContain('--proxy-server=http://127.0.0.1:45678')
+    expect(command).toContain('--proxy-bypass-list=<-loopback>;127.0.0.1:8765')
+    expect(command.at(-1)).toBe('http://127.0.0.1:8765/hello')
+  })
+
+  test('recognizes only the exact isolated Chrome root command', () => {
+    const root = `${chrome} --headless --user-data-dir=${profile} --screenshot=${screenshot} http://127.0.0.1:8765/`
+    expect(isExpectedLaunchServicesChromeCommand({
+      command: root, chrome, profile, screenshot,
+    })).toBe(true)
+    for (const command of [
+      `${root} --type=renderer`,
+      root.replace('--headless ', '--headless=new '),
+      root.replace(chrome, '/tmp/Google Chrome'),
+      root.replace(profile, `${profile}-other`),
+      root.replace(screenshot, `${screenshot}.other`),
+    ]) {
+      expect(isExpectedLaunchServicesChromeCommand({
+        command, chrome, profile, screenshot,
+      })).toBe(false)
+    }
   })
 })

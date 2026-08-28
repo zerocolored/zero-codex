@@ -20,6 +20,7 @@ import {
   type IncomingHttpHeaders,
   type Server,
 } from 'http'
+import { homedir } from 'os'
 import { isAbsolute, join, relative, resolve, sep } from 'path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -29,7 +30,13 @@ import {
   requireManagedDirectory,
   requireManagedStateRoot,
 } from './managed-path.ts'
-import { captureTrackedProcesses, reapTrackedProcesses, seedTrackedProcess } from './process-tree.ts'
+import {
+  captureTrackedProcesses,
+  reapTrackedProcesses,
+  readProcessTable,
+  seedTrackedProcess,
+  type ProcessIdentity,
+} from './process-tree.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 
@@ -44,8 +51,8 @@ const MAX_SCREENSHOT_BYTES = 16 * 1024 * 1024
 const SCREENSHOT_WIDTH = 1280
 const SCREENSHOT_HEIGHT = 720
 const SCREENSHOT_DEADLINE_MS = 30_000
-const EXITED_SCREENSHOT_GRACE_MS = 2_000
-const STREAM_FLUSH_GRACE_MS = 5_000
+const CHROME_DISCOVERY_DEADLINE_MS = 10_000
+const MAX_PROCESS_COMMAND_BYTES = 64 * 1024
 
 type BrowserContext = {
   version: 3
@@ -349,33 +356,158 @@ async function closeServer(server: Server): Promise<void> {
   })
 }
 
-async function collectStream(stream: ReadableStream<Uint8Array>, maximum: number): Promise<{
-  text: string
-  truncated: boolean
-}> {
-  const reader = stream.getReader()
-  const chunks: Buffer[] = []
-  let total = 0
-  let truncated = false
-  try {
-    while (true) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      const bytes = Buffer.from(chunk.value)
-      if (total + bytes.length > maximum) {
-        const remaining = Math.max(0, maximum - total)
-        if (remaining > 0) chunks.push(bytes.subarray(0, remaining))
-        total = maximum
-        truncated = true
-      } else {
-        chunks.push(bytes)
-        total += bytes.length
-      }
-    }
-  } finally {
-    reader.releaseLock()
+function createPrivateOutputFile(path: string): void {
+  const descriptor = openSync(
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  )
+  closeSync(descriptor)
+}
+
+function commandHasArgument(command: string, argument: string): boolean {
+  return command === argument
+    || command.startsWith(`${argument} `)
+    || command.endsWith(` ${argument}`)
+    || command.includes(` ${argument} `)
+}
+
+export function isExpectedLaunchServicesChromeCommand(input: {
+  command: string
+  chrome: string
+  profile: string
+  screenshot: string
+}): boolean {
+  const prefix = `${input.chrome} `
+  if (!input.command.startsWith(prefix) || input.command.includes(' --type=')) return false
+  return commandHasArgument(input.command, '--headless')
+    && !commandHasArgument(input.command, '--headless=new')
+    && commandHasArgument(input.command, `--user-data-dir=${input.profile}`)
+    && commandHasArgument(input.command, `--screenshot=${input.screenshot}`)
+}
+
+function processCommand(pid: number): string | undefined {
+  const result = Bun.spawnSync([
+    '/bin/ps', '-ww', '-o', 'command=', '-p', String(pid),
+  ], {
+    env: { PATH: '/usr/bin:/bin', LC_ALL: 'C', LANG: 'C' },
+    stdin: 'ignore', stdout: 'pipe', stderr: 'ignore', timeout: 2_000,
+    killSignal: 'SIGKILL',
+  })
+  if (result.exitCode !== 0 || result.stdout.byteLength > MAX_PROCESS_COMMAND_BYTES) return undefined
+  const command = result.stdout.toString().trimEnd()
+  return command && !/[\0\r\n]/.test(command) ? command : undefined
+}
+
+function findLaunchServicesChromeRoot(input: {
+  baseline: ReadonlyMap<number, string>
+  chrome: string
+  profile: string
+  screenshot: string
+}): ProcessIdentity | undefined {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : undefined
+  const matches = readProcessTable().filter(identity => {
+    if (identity.ppid !== 1 || identity.pgid !== identity.pid
+      || (uid !== undefined && identity.uid !== uid)
+      || input.baseline.get(identity.pid) === identity.started) return false
+    const command = processCommand(identity.pid)
+    return command !== undefined && isExpectedLaunchServicesChromeCommand({
+      command,
+      chrome: input.chrome,
+      profile: input.profile,
+      screenshot: input.screenshot,
+    })
+  })
+  if (matches.length > 1) throw new Error('multiple isolated local browser roots were discovered')
+  return matches[0]
+}
+
+function findIsolatedProfileProcesses(input: {
+  baseline: ReadonlyMap<number, string>
+  profile: string
+}): ProcessIdentity[] {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : undefined
+  return readProcessTable().filter(identity => {
+    if ((uid !== undefined && identity.uid !== uid)
+      || input.baseline.get(identity.pid) === identity.started) return false
+    const command = processCommand(identity.pid)
+    return command !== undefined
+      && commandHasArgument(command, `--user-data-dir=${input.profile}`)
+  })
+}
+
+async function reapIsolatedProfileProcesses(input: {
+  baseline: ReadonlyMap<number, string>
+  profile: string
+  onForce: () => void
+}): Promise<number[]> {
+  const matches = findIsolatedProfileProcesses(input)
+  if (matches.length === 0) return []
+  const tracked = new Map(matches.map(identity => [identity.pid, identity.started]))
+  const groupLeader = matches.find(identity => identity.pgid === identity.pid)
+  const remaining = await reapTrackedProcesses({
+    rootPids: matches.map(identity => identity.pid),
+    groupId: groupLeader?.pid ?? matches[0]!.pgid,
+    tracked,
+    signalGroup: groupLeader !== undefined,
+    termGraceMs: 2_000,
+    killWaitMs: 1_000,
+    onForce: input.onForce,
+  })
+  const after = findIsolatedProfileProcesses(input).map(identity => identity.pid)
+  return [...new Set([...remaining, ...after])]
+}
+
+async function discoverLaunchServicesChromeRoot(input: {
+  baseline: ReadonlyMap<number, string>
+  chrome: string
+  profile: string
+  screenshot: string
+}): Promise<ProcessIdentity> {
+  const deadline = Date.now() + CHROME_DISCOVERY_DEADLINE_MS
+  while (Date.now() < deadline) {
+    const match = findLaunchServicesChromeRoot(input)
+    if (match) return match
+    await Bun.sleep(25)
   }
-  return { text: Buffer.concat(chunks).toString('utf8'), truncated }
+  throw new Error('isolated local browser root was not discovered')
+}
+
+export function buildLaunchServicesChromeCommand(input: {
+  browserHome: string
+  runRoot: string
+  profile: string
+  stdoutPath: string
+  stderrPath: string
+  screenshotPath: string
+  proxyPort: number
+  address: LocalPageAddress
+}): string[] {
+  return [
+    '/usr/bin/open', '-n', '-a', CHROME_APPLICATION,
+    '-i', '/dev/null', '-o', input.stdoutPath, '--stderr', input.stderrPath,
+    '--env', 'PATH=/usr/bin:/bin',
+    '--env', `HOME=${input.browserHome}`,
+    '--env', `TMPDIR=${input.runRoot}`,
+    '--env', 'LANG=en_US.UTF-8',
+    '--args',
+    '--headless', '--disable-gpu', '--no-sandbox', '--disable-background-networking',
+    '--disable-component-update', '--disable-default-apps', '--disable-extensions', '--disable-sync',
+    '--hide-scrollbars', '--metrics-recording-only', '--mute-audio', '--no-first-run',
+    '--safebrowsing-disable-auto-update', '--force-device-scale-factor=1',
+    `--user-data-dir=${input.profile}`,
+    `--window-size=${SCREENSHOT_WIDTH},${SCREENSHOT_HEIGHT}`,
+    '--timeout=5000',
+    '--dump-dom',
+    `--screenshot=${input.screenshotPath}`,
+    `--proxy-server=http://127.0.0.1:${input.proxyPort}`,
+    // Keep the exact verified origin direct. Chrome's implicit loopback
+    // bypass is first removed, then restored only for this host and port;
+    // every external origin and every other loopback port still reaches
+    // the deny-by-default proxy.
+    `--proxy-bypass-list=<-loopback>;${input.address.url.hostname}:${input.address.port}`,
+    input.address.url.toString(),
+  ]
 }
 
 async function captureChromeScreenshot(input: {
@@ -403,61 +535,131 @@ async function captureChromeScreenshot(input: {
   const runMetadata = lstatSync(runRoot)
   const profile = ensureManagedDirectory(input.stateDir, join(runRoot, 'profile'))
   const temporaryScreenshot = join(runRoot, 'screenshot.png')
+  const browserStdoutPath = join(runRoot, 'browser.stdout')
+  const browserStderrPath = join(runRoot, 'browser.stderr')
+  createPrivateOutputFile(browserStdoutPath)
+  createPrivateOutputFile(browserStderrPath)
   const proxy = await startSameOriginProxy(input.address)
   let browserForcedCleanup = false
+  let runtimeCleanupConfirmed = true
   try {
     let resolveExit!: (value: number) => void
     const exited = new Promise<number>(resolvePromise => { resolveExit = resolvePromise })
-    const child = Bun.spawn([
-      input.chrome,
-      '--headless=new', '--disable-gpu', '--no-sandbox', '--disable-background-networking',
-      '--disable-component-update', '--disable-default-apps', '--disable-extensions', '--disable-sync',
-      '--hide-scrollbars', '--metrics-recording-only', '--mute-audio', '--no-first-run',
-      '--safebrowsing-disable-auto-update', '--force-device-scale-factor=1',
-      `--user-data-dir=${profile}`,
-      `--window-size=${SCREENSHOT_WIDTH},${SCREENSHOT_HEIGHT}`,
-      '--dump-dom',
-      `--screenshot=${temporaryScreenshot}`,
-      `--proxy-server=http://127.0.0.1:${proxy.port}`,
-      // Keep the exact verified origin direct. Chrome's implicit loopback
-      // bypass is first removed, then restored only for this host and port;
-      // every external origin and every other loopback port still reaches
-      // the deny-by-default proxy.
-      `--proxy-bypass-list=<-loopback>;${input.address.url.hostname}:${input.address.port}`,
-      input.address.url.toString(),
-    ], {
+    const baseline = new Map(readProcessTable().map(identity => [identity.pid, identity.started]))
+    const browserHome = realpathSync(homedir())
+    const child = Bun.spawn(buildLaunchServicesChromeCommand({
+      browserHome,
+      runRoot,
+      profile,
+      stdoutPath: browserStdoutPath,
+      stderrPath: browserStderrPath,
+      screenshotPath: temporaryScreenshot,
+      proxyPort: proxy.port,
+      address: input.address,
+    }), {
       cwd: input.repoPath,
       env: {
         PATH: '/usr/bin:/bin',
-        HOME: runRoot,
+        HOME: browserHome,
         TMPDIR: runRoot,
         LANG: 'en_US.UTF-8',
       },
-      stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+      stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
       detached: process.platform !== 'win32',
       onExit(_process, exitCode, signalCode) {
         resolveExit(exitCode ?? (signalCode ? 128 : 1))
       },
     })
-    const tracked = new Map<number, string>()
+    runtimeCleanupConfirmed = false
+    const launcherTracked = new Map<number, string>()
+    let launcherTrackingError: unknown
     try {
-      const rootIdentity = seedTrackedProcess(child.pid, tracked)
-      if (process.platform !== 'win32' && rootIdentity.pgid !== rootIdentity.pid) {
-        throw new Error('local browser process group is not isolated')
+      const launcherIdentity = seedTrackedProcess(child.pid, launcherTracked)
+      if (process.platform !== 'win32' && launcherIdentity.pgid !== launcherIdentity.pid) {
+        throw new Error('local browser launcher process group is not isolated')
       }
     } catch (error) {
-      try { child.kill('SIGKILL') } catch {}
-      await Promise.race([exited.catch(() => 1), Bun.sleep(1_000)])
+      launcherTrackingError = error
+    }
+    let cleanupAttempted = false
+    const cleanupOwnedProcesses = async () => {
+      if (cleanupAttempted) return
+      cleanupAttempted = true
+      const cleanupFailures: string[] = []
+      try {
+        const remaining = await reapIsolatedProfileProcesses({
+          baseline,
+          profile,
+          onForce: () => { browserForcedCleanup = true },
+        })
+        if (remaining.length > 0) {
+          cleanupFailures.push(`browser processes remain: ${remaining.join(', ')}`)
+        }
+      } catch (error) {
+        cleanupFailures.push(`browser cleanup failed: ${error}`)
+      }
+      if (launcherTracked.size > 0) {
+        try {
+          const remaining = await reapTrackedProcesses({
+            rootPids: [child.pid],
+            groupId: child.pid,
+            tracked: launcherTracked,
+            termGraceMs: 1_000,
+            killWaitMs: 1_000,
+            onForce: () => { browserForcedCleanup = true },
+          })
+          if (remaining.length > 0) {
+            cleanupFailures.push(`launcher remains: ${remaining.join(', ')}`)
+          }
+        } catch (error) {
+          cleanupFailures.push(`launcher cleanup failed: ${error}`)
+        }
+      } else {
+        const outcome = await Promise.race([
+          exited.then(() => 'exited' as const).catch(() => 'exited' as const),
+          Bun.sleep(1_000).then(() => 'running' as const),
+        ])
+        if (outcome === 'running') {
+          cleanupFailures.push(`launcher generation was unavailable and it did not exit: ${launcherTrackingError}`)
+        }
+      }
+      if (cleanupFailures.length > 0) {
+        throw new Error(`local browser cleanup failed: ${cleanupFailures.join('; ')}`)
+      }
+      runtimeCleanupConfirmed = true
+    }
+    let browserRoot: ProcessIdentity
+    try {
+      browserRoot = await discoverLaunchServicesChromeRoot({
+        baseline,
+        chrome: input.chrome,
+        profile,
+        screenshot: temporaryScreenshot,
+      })
+    } catch (error) {
+      await cleanupOwnedProcesses()
       throw error
     }
-    const stdout = collectStream(child.stdout, MAX_BROWSER_OUTPUT_BYTES)
-    const stderr = collectStream(child.stderr, MAX_BROWSER_OUTPUT_BYTES)
+    const tracked = new Map<number, string>([[browserRoot.pid, browserRoot.started]])
+    try {
+      const seededRoot = seedTrackedProcess(browserRoot.pid, tracked)
+      if (seededRoot.started !== browserRoot.started || seededRoot.ppid !== 1
+        || seededRoot.pgid !== seededRoot.pid) {
+        throw new Error('isolated local browser root changed during discovery')
+      }
+    } catch (error) {
+      await cleanupOwnedProcesses()
+      throw error
+    }
     let tracking = true
     let trackingError: unknown
     const tracker = (async () => {
       try {
         while (tracking) {
-          captureTrackedProcesses([child.pid], child.pid, tracked)
+          captureTrackedProcesses([browserRoot.pid], browserRoot.pid, tracked)
+          if (launcherTracked.size > 0) {
+            captureTrackedProcesses([child.pid], child.pid, launcherTracked)
+          }
           await Bun.sleep(25)
         }
       } catch (error) {
@@ -468,8 +670,9 @@ async function captureChromeScreenshot(input: {
     let screenshotReady = false
     let stableSize = -1
     let stableObservations = 0
-    let rootExitObservedAt: number | undefined
-    let rootExitCode: number | undefined
+    let stdoutStableSize = -1
+    let stdoutStableObservations = 0
+    let launcherExitCode: number | undefined
     let monitorError: unknown
     try {
       while (Date.now() < deadline) {
@@ -484,78 +687,66 @@ async function captureChromeScreenshot(input: {
             }
             if (stableObservations >= 3) {
               screenshotReady = true
-              break
             }
           }
         }
-        if (rootExitObservedAt === undefined) {
+        if (existsSync(browserStdoutPath)) {
+          const metadata = lstatSync(browserStdoutPath)
+          const owned = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
+          if (metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 1 && owned
+            && (metadata.mode & 0o077) === 0
+            && metadata.size > 0 && metadata.size <= MAX_BROWSER_OUTPUT_BYTES) {
+            if (metadata.size === stdoutStableSize) stdoutStableObservations += 1
+            else {
+              stdoutStableSize = metadata.size
+              stdoutStableObservations = 1
+            }
+          }
+        }
+        if (screenshotReady && stdoutStableObservations >= 3) break
+        if (launcherExitCode === undefined) {
           const outcome = await Promise.race([
             exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
             Bun.sleep(100).then(() => ({ kind: 'wait' as const })),
           ])
-          if (outcome.kind === 'exit') {
-            rootExitObservedAt = Date.now()
-            rootExitCode = outcome.exitCode
-          }
+          if (outcome.kind === 'exit') launcherExitCode = outcome.exitCode
         } else {
-          // On macOS the root process can finish before a tracked helper has
-          // completed the asynchronous screenshot write. Preserve a bounded
-          // grace period before reaping the exact isolated process group.
-          if (Date.now() - rootExitObservedAt >= EXITED_SCREENSHOT_GRACE_MS) break
           await Bun.sleep(100)
         }
-      }
-      // Chrome writes the PNG atomically before its --dump-dom stdout has
-      // necessarily drained. Prefer a natural exit and keep a bounded flush
-      // window before terminating an otherwise long-lived helper group.
-      if (screenshotReady) {
-        await Promise.race([exited.catch(() => 1), Bun.sleep(STREAM_FLUSH_GRACE_MS)])
       }
     } catch (error) {
       monitorError = error
     } finally {
       tracking = false
       await tracker
-      const remaining = await reapTrackedProcesses({
-        rootPids: [child.pid],
-        groupId: child.pid,
-        tracked,
-        termGraceMs: 2_000,
-        killWaitMs: 1_000,
-        onForce: () => { browserForcedCleanup = true },
-      })
-      if (remaining.length > 0) {
-        throw new Error(`local browser descendants remain: ${remaining.join(', ')}`)
-      }
+      await cleanupOwnedProcesses()
     }
     if (trackingError) throw new Error(`local browser tracking failed: ${trackingError}`)
     if (monitorError) throw monitorError
-    const [stdoutResult, stderrResult] = await Promise.all([stdout, stderr])
+    const stdoutText = readBoundedPrivateFile(browserStdoutPath, MAX_BROWSER_OUTPUT_BYTES)
+    const stderrText = readBoundedPrivateFile(browserStderrPath, MAX_BROWSER_OUTPUT_BYTES)
     if (!screenshotReady) {
-      const diagnosticSource = `${stdoutResult.text}\n${stderrResult.text}`
+      const diagnosticSource = `${stdoutText}\n${stderrText}`
       const diagnostics = [
         'ERR_PROXY_CONNECTION_FAILED', 'ERR_NAME_NOT_RESOLVED', 'ERR_CONNECTION_REFUSED',
         'profile in use', 'ProcessSingleton', 'Trace/breakpoint trap',
       ].filter(marker => diagnosticSource.includes(marker)).join(',') || 'none'
       throw new BrowserScreenshotTimeoutError(
         'local browser did not produce a screenshot before timeout '
-        + `(exit=${rootExitCode ?? 'running'}, diagnostics=${diagnostics})`,
+        + `(launcher-exit=${launcherExitCode ?? 'running'}, diagnostics=${diagnostics})`,
       )
     }
-    if (stdoutResult.truncated || stderrResult.truncated) {
-      throw new Error('local browser output exceeded the size limit')
-    }
-    if (containsCredentialMaterial(stdoutResult.text)) {
+    if (containsCredentialMaterial(stdoutText)) {
       throw new Error('local browser rendered DOM contains protected credential material')
     }
-    if (!stdoutResult.text.includes(input.expectedText)) {
+    if (!stdoutText.includes(input.expectedText)) {
       const diagnostics = [
         'ERR_PROXY_CONNECTION_FAILED', 'ERR_NAME_NOT_RESOLVED', 'ERR_CONNECTION_REFUSED',
         'chrome://new-tab-page', 'about:blank',
-      ].filter(marker => stdoutResult.text.includes(marker)).join(',') || 'none'
+      ].filter(marker => stdoutText.includes(marker)).join(',') || 'none'
       throw new Error(
         'local browser rendered DOM did not contain the expected text '
-        + `(stdout-bytes=${Buffer.byteLength(stdoutResult.text)}, blocked=${proxy.stats().blocked}, diagnostics=${diagnostics})`,
+        + `(stdout-bytes=${Buffer.byteLength(stdoutText)}, blocked=${proxy.stats().blocked}, diagnostics=${diagnostics})`,
       )
     }
     const proxyStats = proxy.stats()
@@ -584,6 +775,9 @@ async function captureChromeScreenshot(input: {
   } finally {
     let closeError: unknown
     try { await closeServer(proxy.server) } catch (error) { closeError = error }
+    if (!runtimeCleanupConfirmed) {
+      throw new Error('local browser runtime retained because process cleanup was not confirmed')
+    }
     try {
       const current = lstatSync(runRoot)
       if (!current.isDirectory() || current.isSymbolicLink()
