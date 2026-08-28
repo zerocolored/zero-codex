@@ -367,7 +367,7 @@ else:
         since = dt.datetime.fromtimestamp(down_since).strftime("%H:%M")
         alert = (
             f"🚨 Zeroちゃんが停止しています。{since}から応答できていません。"
-            "復旧するには、端末で zerokun-restart を実行してください。"
+            "復旧するには、Macの端末で zerochan --restart を実行してください。"
         )
         last_alert = now
     next_state = {

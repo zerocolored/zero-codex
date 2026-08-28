@@ -36,8 +36,9 @@ bash "$bootstrap_path" --with-slack
 bash zerokun/bootstrap-macos.sh --with-slack
 codex login status
 # `Logged in using ChatGPT` と表示されることを確認
-# Herdrの専用pane内で実行
-zerokun
+# Herdrの専用pane内で対象projectへ移動して実行
+cd /absolute/path/to/project
+zerochan
 ```
 
 ## Runtime 構成
@@ -247,6 +248,11 @@ Codex stdout/stderr logはfileごとに20MB、解析用memoryは1MB tailへ制�
 - DM follow-up は現在の DM allowlist を再確認
 - senderが変わっても同threadならactive jobへ即時steerし、そのjobの固定済み権限を引き継ぐ
 - Socket Modeと履歴回収のどちらもdurable handoff後に同じ`eyes`リアクションを付ける
+- 長時間jobは10分、30分、60分、その後60分ごとに同じactive Codex turnへ状況を問い合わせ、
+  markerで束縛した本人の`commentary`だけをdurable通知として同じthreadへ投稿する
+- 正常完了時はterminal本文・成果物の配送後に元メッセージへ`white_check_mark`を付け、reactionだけ
+  失敗した場合は本文を再投稿せず同じ永続台帳から再試行する
+- Slack本文はZeroちゃんとして簡潔で温かい日本語と自然な絵文字1〜2個を使い、内部engine名を出さない
 - live event と poll の重複を `(chat_id, message_ts)` で排除
 
 旧stateを`ZEROKUN_LEGACY_CUTOVER=1`と`ZEROKUN_STATE_DIR`で明示したin-place cutoverでは、旧 `threads.json` をSQLiteへ
@@ -290,7 +296,10 @@ token、access、queue、lock が別物になります。
 ## 運用コマンド
 
 ```bash
-zerokun
+cd /absolute/path/to/project
+zerochan
+zerochan --restart  # 前回Slackへ接続できたprojectで再起動
+zerokun             # 互換alias。現在directoryで起動
 zerokun-status
 zerokun-jobs status
 zerokun-access status

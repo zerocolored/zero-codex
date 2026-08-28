@@ -192,6 +192,9 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     zerokun/inbound-attachment-cache.test.ts \
     zerokun/ephemeral-claude-session.test.ts \
     zerokun/public-readiness.test.ts \
+    zerokun/project-selection.test.ts \
+    zerokun/codex-progress.test.ts \
+    zerokun/lifecycle-notifications.test.ts \
     zerokun/queue-contract.test.ts \
     zerokun/slack-app-identity.test.ts \
     zerokun/process-generation.test.ts \
@@ -283,6 +286,7 @@ for entry in \
   zerokun/herdr-job-monitor-view.ts \
   zerokun/standalone-codex.ts \
   zerokun/codex-executor.ts \
+  zerokun/project-selection.ts \
   zerokun/codex-supervisor.ts \
   zerokun/live-codex-permission-check.ts \
   zerokun/access.ts \

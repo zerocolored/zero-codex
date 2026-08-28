@@ -1627,7 +1627,8 @@ codex --version
   test('launcher and setup use portable paths and keep the default workspace outside the runtime repo', () => {
     const launcher = readFileSync(join(root, 'codex-channel.sh'), 'utf8')
     const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
-    expect(launcher).toContain('${ZEROKUN_PROJECT_DIR:-$REPO_DIR}')
+    expect(launcher).toContain('PROJECT="$(pwd -P)"')
+    expect(launcher).toContain('project-selection.ts" read-last')
     expect(launcher).not.toContain('/Users/zerocolored-macpro-suetsugu')
     expect(setup).toContain('${ZEROKUN_PROJECT_DIR:-$(dirname "$REPO_DIR")/zerokun-workspace}')
     expect(setup).toContain('Slack作業projectはZeroちゃん本体と別directoryにしてください')
@@ -1670,12 +1671,15 @@ codex --version
       expect(result.exitCode, `${result.stdout.toString()}\n${result.stderr.toString()}`).toBe(0)
       expect(result.stderr.toString()).not.toContain('No such file or directory')
       const zshrc = readFileSync(join(fakeHome, '.zshrc'), 'utf8')
-      expect(zshrc).toContain(`export ZEROKUN_PROJECT_DIR=${projectDir.replace(' ', '\\ ')}`)
+      expect(zshrc).not.toContain('export ZEROKUN_PROJECT_DIR=')
       expect(zshrc).toContain(
         `export ZEROKUN_STATE_DIR=${realpathSync(stateDir).replaceAll(' ', '\\ ')}`,
       )
       expect(zshrc).toContain('export ZEROKUN_LEGACY_CUTOVER=0')
-      expect(zshrc).toContain('codex-channel "$ZEROKUN_PROJECT_DIR"')
+      expect(zshrc).toContain("alias zerokun='zerochan'")
+      expect(zshrc).toContain("alias zerokun-restart='zerochan --restart'")
+      expect(existsSync(join(fakeHome, '.local/bin/zerochan'))).toBe(true)
+      expect(existsSync(join(fakeHome, '.local/bin/zerokun'))).toBe(true)
       expect(statSync(join(fakeHome, '.zshrc')).mode & 0o777).toBe(0o644)
       expect(readFileSync(
         join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),
@@ -1703,6 +1707,62 @@ codex --version
       expect(copiedWorker.stderr.toString()).not.toContain('Cannot find module')
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('setupは既存の無関係なzerochan commandを変更開始前に拒否する', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-existing-zerochan-'))
+    const command = join(fakeHome, '.local/bin/zerochan')
+    try {
+      mkdirSync(join(fakeHome, '.local/bin'), { recursive: true })
+      writeFileSync(command, '#!/bin/sh\necho unrelated\n', { mode: 0o700 })
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_STATE_DIR: join(fakeHome, 'state-that-must-not-be-created'),
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          PATH: setupTestPath(fakeHome),
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(1)
+      expect(result.stderr.toString()).toContain('既存の無関係なcommandを上書きしません')
+      expect(readFileSync(command, 'utf8')).toBe('#!/bin/sh\necho unrelated\n')
+      expect(existsSync(join(fakeHome, 'state-that-must-not-be-created'))).toBe(false)
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('setupはsymlinkされたlauncher directoryの外へcommandを作らない', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-linked-bin-'))
+    const external = mkdtempSync(join(tmpdir(), 'zerokun-setup-external-bin-'))
+    try {
+      mkdirSync(join(fakeHome, '.local'), { recursive: true })
+      symlinkSync(external, join(fakeHome, '.local/bin'))
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_STATE_DIR: join(fakeHome, 'state-that-must-not-be-created'),
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          PATH: setupTestPath(fakeHome),
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(1)
+      expect(result.stderr.toString()).toContain('launcher directoryは実directory')
+      expect(existsSync(join(external, 'zerochan'))).toBe(false)
+      expect(existsSync(join(external, 'zerokun'))).toBe(false)
+      expect(existsSync(join(fakeHome, 'state-that-must-not-be-created'))).toBe(false)
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(external, { recursive: true, force: true })
     }
   })
 

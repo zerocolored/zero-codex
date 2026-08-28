@@ -7319,6 +7319,10 @@ describe('Slack output guard', () => {
       `Project root: ${repo}`,
       `Artifact directory: ${outbox}`,
       '--- end Zero host control ---',
+      '--- Zero host progress check ---',
+      `Job ID: ${job.id}`,
+      `Project root: ${repo}`,
+      '--- end Zero host progress check ---',
       'Codex worker job 123 finished through Herdr App Server and Grok.',
       'Claude advisor と MCP broker / JSON-RPC / Seatbelt / subagent を使用しました。',
       'クロードコードのアドバイザーとブローカーが確認しました。',
@@ -7358,6 +7362,31 @@ describe('Slack output guard', () => {
     expect(finalized.result).not.toContain('.claude/session')
     expect(finalized.result).not.toContain('file:///opt/homebrew')
     expect(finalized.result).not.toMatch(/processId|stateChangeSeq|durationMs/i)
+    store.close()
+  })
+
+  test('進捗がhost blockだけでもSlackへ空送信せず安全な継続文を返す', async () => {
+    const store = makeStore()
+    const job = store.enqueue(input({ messageId: 'progress-host-block-only' })).job
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+
+    await notifier.progress(
+      job,
+      [
+        '--- Zero host progress check ---',
+        `Job ID: ${job.id}`,
+        `Project root: ${job.repoPath}`,
+        '--- end Zero host progress check ---',
+      ].join('\n'),
+      'progress-safe-fallback',
+    )
+
+    expect(posted).toEqual(['少し時間がかかっていますが、まだ作業を続けています 🔍'])
+    expect(posted[0]).not.toContain(job.id)
+    expect(posted[0]).not.toContain(job.repoPath)
     store.close()
   })
 
@@ -8927,6 +8956,7 @@ describe('durable terminal notifications', () => {
     store.markTerminalNotificationBodyDelivered(notification.id)
     const observedNames: string[] = []
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      addReaction: async () => {},
       requestUploadTarget: async filename => {
         observedNames.push(filename)
         return { uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FSAFE' }
@@ -8965,6 +8995,7 @@ describe('durable terminal notifications', () => {
     store.markTerminalNotificationBodyDelivered(notification.id)
     const observedNames: string[] = []
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      addReaction: async () => {},
       requestUploadTarget: async filename => {
         observedNames.push(filename)
         return { uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FSAFE' }
@@ -9007,6 +9038,7 @@ describe('durable terminal notifications', () => {
     const uploaded: Buffer[] = []
     const posted: Array<{ text: string; clientMessageId?: string }> = []
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      addReaction: async () => {},
       postMessage: async input => {
         posted.push({ text: input.text, clientMessageId: input.clientMessageId })
       },
@@ -9037,6 +9069,7 @@ describe('durable terminal notifications', () => {
     const value = productionArtifactFixture('artifact-pre-abort')
     let targetRequests = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      addReaction: async () => {},
       requestUploadTarget: async () => {
         targetRequests += 1
         return { uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FTEST' }
@@ -9064,6 +9097,7 @@ describe('durable terminal notifications', () => {
     let announceFirstTarget!: () => void
     const firstTargetStarted = new Promise<void>(resolve => { announceFirstTarget = resolve })
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      addReaction: async () => {},
       requestUploadTarget: async () => {
         targetRequests += 1
         if (targetRequests === 1) {
@@ -9104,6 +9138,7 @@ describe('durable terminal notifications', () => {
     let byteUploads = 0
     let completions = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      addReaction: async () => {},
       requestUploadTarget: async () => {
         targetRequests += 1
         if (targetRequests === 1) throw new Error('getUploadURLExternal rejected')
@@ -9135,6 +9170,7 @@ describe('durable terminal notifications', () => {
     let uploadAttempts = 0
     let completions = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      addReaction: async () => {},
       requestUploadTarget: async () => ({
         uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FBOUNDARY',
       }),
@@ -9161,6 +9197,7 @@ describe('durable terminal notifications', () => {
     let targetRequests = 0
     let byteUploads = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      addReaction: async () => {},
       requestUploadTarget: async () => {
         targetRequests += 1
         return { uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FTEST' }
@@ -9193,6 +9230,7 @@ describe('durable terminal notifications', () => {
     let byteUploads = 0
     let inspections = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      addReaction: async () => {},
       requestUploadTarget: async () => ({
         uploadUrl: 'https://files.slack.com/upload/v1/test',
         fileId: 'FRECONCILE',
@@ -9269,6 +9307,7 @@ describe('durable terminal notifications', () => {
     expect(store.beginArtifactDelivery(running.id, sealedFirst!, 'FALREADY')).toBe('started')
     let byteUploads = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      addReaction: async () => {},
       requestUploadTarget: async () => ({
         uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FSECOND',
       }),
@@ -9296,6 +9335,7 @@ describe('durable terminal notifications', () => {
     const uploadFinished = new Promise<void>(resolve => { releaseUpload = resolve })
     let completions = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      addReaction: async () => {},
       requestUploadTarget: async () => ({
         uploadUrl: 'https://files.slack.com/upload/v1/test',
         fileId: 'FTEST',
@@ -9508,6 +9548,7 @@ describe('durable terminal notifications', () => {
     let targetRequests = 0
     let byteUploads = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      addReaction: async () => {},
       requestUploadTarget: async () => {
         targetRequests += 1
         if (targetRequests <= 6) throw new Error('getUploadURLExternal unavailable')

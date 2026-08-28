@@ -308,7 +308,7 @@ Options:
   --slack-app-name NAME Slack上で表示するApp名（35文字以内）
   --slack-bot-name NAME bot username（英小文字・数字・-・_・.のみ）
   --repo-dir PATH       zeroリポの配置先
-  --project-dir PATH    Slack DMで扱う既定repository
+  --project-dir PATH    初期workspace／初期channel routeに使うrepository
   -h, --help            このヘルプを表示
 
 通常実行はCodexを使える状態まで完了して終了します。Slack設定は後から
@@ -1616,7 +1616,7 @@ main() {
     # any runner/gateway tied to the previous Codex Slack App on this PC.
     run_setup
     section "Slack設定完了"
-    echo "   Herdrの専用paneで実行: zerokun"
+    echo "   Herdrの専用paneで対象projectへ cd して実行: zerochan"
     return
   fi
 
@@ -1647,7 +1647,7 @@ main() {
   if [ "$WITH_SLACK" = "1" ]; then
     configure_slack
     section "Slack設定完了"
-    echo "   Slack Appを対象チャンネルへ招待後、Herdrの専用paneで実行: zerokun"
+    echo "   Slack Appを対象チャンネルへ招待後、Herdrの専用paneで対象projectへ cd して実行: zerochan"
   else
     warn "Slack設定は後回しにしました。Codexの利用には不要です"
     echo "   後からSlack設定だけ行う:"

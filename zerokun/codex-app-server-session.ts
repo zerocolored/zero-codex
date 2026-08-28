@@ -13,6 +13,7 @@ const MAX_APP_SERVER_HISTORY_PAGES = 128
 const MAX_APP_SERVER_HISTORY_TURNS = 4_096
 const MAX_APP_SERVER_HISTORY_RAW_ITEMS = 65_536
 const MAX_APP_SERVER_FALLBACK_SNAPSHOTS = 4
+const MAX_LATE_REQUEST_RESPONSE_TOMBSTONES = 4_096
 
 export type AppServerTurnStatus = 'completed' | 'interrupted' | 'failed' | 'inProgress'
 
@@ -498,6 +499,8 @@ function knownSubAgentActivityKind(value: unknown): boolean {
 export class CodexAppServerSession {
   private nextRequestId = 1
   private readonly pending = new Map<number, PendingRequest>()
+  private readonly lateResponseTombstones = new Set<number>()
+  private readonly lateResponseTombstoneOrder: number[] = []
   private readonly notifications: AppServerNotification[] = []
   private readonly controlledThreadIds = new Set<string>()
   private readonly turnProjections = new Map<string, ObservedTurnProjection>()
@@ -544,6 +547,16 @@ export class CodexAppServerSession {
       ))
     }
     this.pending.clear()
+  }
+
+  private rememberLateResponseTombstone(requestId: number): void {
+    if (this.lateResponseTombstones.has(requestId)) return
+    this.lateResponseTombstones.add(requestId)
+    this.lateResponseTombstoneOrder.push(requestId)
+    while (this.lateResponseTombstoneOrder.length > MAX_LATE_REQUEST_RESPONSE_TOMBSTONES) {
+      const expired = this.lateResponseTombstoneOrder.shift()
+      if (expired !== undefined) this.lateResponseTombstones.delete(expired)
+    }
   }
 
   private beginTurnProjection(params: Record<string, unknown>): void {
@@ -696,6 +709,7 @@ export class CodexAppServerSession {
     if (typeof parsed.id === 'number') {
       const pending = this.pending.get(parsed.id)
       if (!pending) {
+        if (this.lateResponseTombstones.delete(parsed.id)) return
         throw new AppServerProtocolError(`App Server returned unknown request id ${parsed.id}`)
       }
       let rpcError: Record<string, unknown> | null = null
@@ -823,6 +837,7 @@ export class CodexAppServerSession {
         }
         pending.timer = setTimeout(() => {
           if (!this.pending.delete(requestId)) return
+          this.rememberLateResponseTombstone(requestId)
           reject(new AppServerAmbiguousRequestError(
             `Codex ${method} response was not observed within ${timeoutMs}ms`,
             method,
@@ -845,7 +860,7 @@ export class CodexAppServerSession {
     } catch (error) {
       const pending = this.pending.get(requestId)
       if (pending?.timer) clearTimeout(pending.timer)
-      this.pending.delete(requestId)
+      if (this.pending.delete(requestId)) this.rememberLateResponseTombstone(requestId)
       throw new AppServerAmbiguousRequestError(
         `Codex ${method} write is ambiguous: ${error}`,
         method,
@@ -1058,6 +1073,18 @@ export class CodexAppServerSession {
       timeoutMs: options.timeoutMs ?? 15_000,
       beforeWrite: options.beforeWrite,
     })
+  }
+
+  hasNextTurnActivity(threadId: string, turnId: string): boolean {
+    for (const notification of this.notifications) {
+      if (notification.method === 'error') return true
+      if (notification.method !== 'turn/completed') continue
+      const params = notification.params
+      if (params.threadId !== threadId) continue
+      const turn = parseTurn(params.turn)
+      if (turn.id === turnId && turn.status !== 'inProgress') return true
+    }
+    return false
   }
 
   takeTurnTerminal(threadId: string, turnId: string): AppServerTurnTerminal | null {

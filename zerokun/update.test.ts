@@ -201,6 +201,7 @@ function updaterFixture() {
   mkdirSync(state, { mode: 0o700 })
   chmodSync(state, 0o700)
   mkdirSync(project)
+  must(['git', 'init', '-q', project])
   writeFileSync(setup, [
     '#!/bin/bash',
     '[ -z "${ZEROKUN_CODEX_BIN+x}" ] || { echo "updater-only Codex override leaked" >&2; exit 79; }',
@@ -837,6 +838,36 @@ describe('updater helpers', () => {
     expect(existsSync(join(fixture.state, 'update.lock/pid'))).toBe(false)
   })
 
+  test('standalone setupは停止前の稼働gateway projectを保存してsetupへ引き継ぐ', async () => {
+    const fixture = updaterFixture()
+    const differentProject = join(fixture.base, 'different-project')
+    mkdirSync(differentProject)
+    must(['git', 'init', '-q', differentProject])
+    const environment = serviceUpdaterEnvironment(
+      fixture,
+      `zerokun-standalone-project-${process.pid}-${Date.now()}`,
+    )
+    await startBotInHerdr({
+      rootRepo: fixture.repo.local,
+      stateDir: fixture.state,
+      projectDir: realpathSync(fixture.project),
+      startupTimeoutMs: 3_000,
+    })
+    rememberFixtureServices(fixture.state)
+
+    const result = runStandaloneSetup(fixture, {
+      ...environment,
+      ZEROKUN_PROJECT_DIR: differentProject,
+    })
+
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(readFileSync(fixture.setupProjectMarker, 'utf8')).toBe(realpathSync(fixture.project))
+    const lastConnected = JSON.parse(
+      readFileSync(join(fixture.state, 'last-connected-project.json'), 'utf8'),
+    ) as { projectDir?: unknown }
+    expect(lastConnected.projectDir).toBe(realpathSync(fixture.project))
+  }, 10_000)
+
   test('全detached commandはlease登録後に開始しreaper後にだけ解除する', () => {
     const source = readFileSync(join(import.meta.dir, 'update.ts'), 'utf8')
     const commandRunner = source.slice(
@@ -1000,16 +1031,19 @@ describe('updater helpers', () => {
     expect(activeJobCountsFromDatabase(dbPath)).toEqual({ queued: 1, running: 1 })
   })
 
-  test('更新時の作業directoryはpending journal、稼働gateway、明示値の順で保持する', () => {
+  test('更新時の作業directoryはpending、稼働gateway、最終接続、明示値の順で保持する', () => {
     const base = fixtureDir()
     const pending = join(base, 'pending-project')
     const explicit = join(base, 'explicit-project')
     const running = join(base, 'running-project')
+    const last = join(base, 'last-project')
     mkdirSync(pending)
     mkdirSync(explicit)
     mkdirSync(running)
-    expect(selectUpdateProjectDirectory(pending, explicit, running)).toBe(realpathSync(pending))
-    expect(selectUpdateProjectDirectory(undefined, explicit, running)).toBe(realpathSync(running))
+    mkdirSync(last)
+    expect(selectUpdateProjectDirectory(pending, explicit, running, last)).toBe(realpathSync(pending))
+    expect(selectUpdateProjectDirectory(undefined, explicit, running, last)).toBe(realpathSync(running))
+    expect(selectUpdateProjectDirectory(undefined, explicit, undefined, last)).toBe(realpathSync(last))
     expect(selectUpdateProjectDirectory(undefined, explicit, undefined)).toBe(realpathSync(explicit))
     expect(selectUpdateProjectDirectory(undefined, undefined, running)).toBe(realpathSync(running))
     expect(() => selectUpdateProjectDirectory(undefined, undefined, undefined))
@@ -1573,6 +1607,11 @@ describe('Codex branch self update', () => {
 
   test('setup失敗時はGitとSQLiteを旧版へ自動rollbackしてjournalを消す', () => {
     const fixture = updaterFixture()
+    const fixtureHome = join(fixture.base, 'home')
+    const launcherBin = join(fixtureHome, '.local', 'bin')
+    const zerochanLauncher = join(launcherBin, 'zerochan')
+    const zerokunLauncher = join(launcherBin, 'zerokun')
+    mkdirSync(fixtureHome, { mode: 0o700 })
     const databasePath = join(fixture.state, 'jobs.sqlite3')
     const database = new Database(databasePath, { create: true })
     database.exec('CREATE TABLE marker (value TEXT NOT NULL)')
@@ -1584,6 +1623,9 @@ describe('Codex branch self update', () => {
     writeFileSync(fixture.setup, [
       '#!/bin/bash',
       `if [ ! -f '${failedOnce}' ]; then`,
+      `  mkdir -p '${launcherBin}'`,
+      `  ln -s '${join(realpathSync(fixture.repo.local), 'codex-channel.sh')}' '${zerochanLauncher}'`,
+      `  ln -s '${join(realpathSync(fixture.repo.local), 'codex-channel.sh')}' '${zerokunLauncher}'`,
       `  touch '${failedOnce}'`,
       `  printf 'candidate-garbage' >> '${databasePath}'`,
       '  exit 42',
@@ -1592,11 +1634,16 @@ describe('Codex branch self update', () => {
       '',
     ].join('\n'))
 
-    const result = runUpdater(fixture)
+    const result = runUpdater(fixture, ['--skip-tests', '--no-restart'], {
+      ...updaterEnvironment(fixture),
+      HOME: fixtureHome,
+    })
     expect(result.exitCode).toBe(1)
     expect(result.stderr.toString()).toContain('自動ロールバックしました')
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
     expect(existsSync(rollbackSetup)).toBe(true)
+    expect(existsSync(zerochanLauncher)).toBe(false)
+    expect(existsSync(zerokunLauncher)).toBe(false)
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
     const restored = new Database(databasePath)
     expect(restored.query<{ value: string }, []>('SELECT value FROM marker').get()?.value)

@@ -516,4 +516,16 @@ describe('public Codex defaults', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  test('最後に接続したprojectはSlack接続成功後かつreadiness公開前にだけ記録する', () => {
+    const server = readFileSync(join(import.meta.dir, '..', 'server.ts'), 'utf8')
+    const start = server.indexOf('await slackApp.start()')
+    const remember = server.indexOf('writeLastConnectedProject(STATE_DIR, connectedProjectDir)')
+    const ready = server.indexOf('writeGatewayReadiness(\n    READY_FILE,', remember)
+    expect(start).toBeGreaterThan(-1)
+    expect(remember).toBeGreaterThan(start)
+    expect(ready).toBeGreaterThan(remember)
+    expect(server.match(/writeLastConnectedProject\(/g)).toHaveLength(1)
+    expect(server).not.toContain('clearLastConnectedProject')
+  })
 })

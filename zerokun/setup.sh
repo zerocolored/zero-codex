@@ -5,7 +5,7 @@
 set -euo pipefail
 unset BUN_OPTIONS BUN_CONFIG_PRELOAD NODE_OPTIONS
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$(CDPATH='' cd -P "$(dirname "$0")/.." && pwd -P)"
 . "$REPO_DIR/zerokun/state-dir.sh"
 CH="$(zerokun_resolve_state_dir)"
 CH="$(zerokun_normalize_path "$CH")"
@@ -86,6 +86,35 @@ fi
 
 # 0. 依存確認
 command -v bun >/dev/null 2>&1 || { echo "❌ bun がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
+
+# Public launcher names belong to this checkout only. Check before the update
+# coordinator can reach any process-stop boundary so an unrelated user command
+# is never overwritten after services have already been interrupted.
+require_installable_launcher_link() {
+  local path="$1" target="$2" current
+  if [ -L "$path" ]; then
+    current="$(readlink "$path")"
+    [ "$current" = "$target" ] || {
+      echo "❌ 既存の無関係なcommandを上書きしません: $path -> $current" >&2
+      exit 1
+    }
+  elif [ -e "$path" ]; then
+    echo "❌ 既存の無関係なcommandを上書きしません: $path" >&2
+    exit 1
+  fi
+}
+require_safe_launcher_parent() {
+  local path
+  for path in "$HOME/.local" "$HOME/.local/bin"; do
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+      echo "❌ launcher directoryは実directoryである必要があります: $path" >&2
+      exit 1
+    fi
+  done
+}
+require_safe_launcher_parent
+require_installable_launcher_link "$HOME/.local/bin/zerochan" "$REPO_DIR/codex-channel.sh"
+require_installable_launcher_link "$HOME/.local/bin/zerokun" "$REPO_DIR/codex-channel.sh"
 
 case "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" in
   0|1) ;;
@@ -450,6 +479,10 @@ ln -sfn "$REPO_DIR/zerokun/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
 ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerokun-access"
 ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"
 ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/codex-channel"
+[ -L "$HOME/.local/bin/zerochan" ] \
+  || ln -s "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/zerochan"
+[ -L "$HOME/.local/bin/zerokun" ] \
+  || ln -s "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/zerokun"
 # Remove only dangling Claude-era links that this same Zeroちゃん checkout owned.
 remove_owned_legacy_link() {
   local legacy_path="$1" legacy_target="$2"
@@ -490,14 +523,13 @@ fi
 # SlackからZeroちゃんを動かすボット — zerokun/setup.sh が管理
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 EOF
-    printf 'export ZEROKUN_PROJECT_DIR=%q\n' "$PROJECT_DIR"
     printf 'export ZEROKUN_STATE_DIR=%q\n' "$CH"
     printf 'export ZEROKUN_LEGACY_CUTOVER=%q\n' "$LEGACY_CUTOVER"
     cat <<'EOF'
-alias zerokun='codex-channel "$ZEROKUN_PROJECT_DIR"'
+alias zerokun='zerochan'
 # 稼働中を止めて入れ替えるかは端末の y/N プロンプトで都度確認する。
 # ZEROKUN_REPLACE=1 は自己更新のワンタイムトークン無しでは停止権限にならない。
-alias zerokun-restart='codex-channel "$ZEROKUN_PROJECT_DIR"'
+alias zerokun-restart='zerochan --restart'
 alias zerokun-status='pid=$(cat "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/plugin.lock" 2>/dev/null); [ -n "$pid" ] && ps -p "$pid" -o pid=,command= || echo "Zeroちゃんは停止中"'
 # <<< zerokun setup <<<
 EOF
@@ -515,8 +547,8 @@ else
   echo "     トークン2つを $CH/.env に貼る (xoxb- / xapp-。作成手順はリポ直下 README.md)"
   echo "  2. $CH/access.json に許可する Slack ユーザーID/チャンネルIDを入れる"
   echo "  3. codex login status が Logged in using ChatGPT と返すことを確認"
-  echo "  4. 必要なら --project-dir でSlack DMの既定作業リポを指定"
-  echo "  5. Herdrの専用paneで: zerokun"
+  echo "  4. Herdrの専用paneで対象projectへ cd して: zerochan"
+  echo "     再起動: zerochan --restart (前回接続したprojectを使用)"
   echo "     queue確認: zerokun-jobs status"
   echo "     Codex版更新: zerokun-update"
   echo "     書込み許可: zerokun-access write allow <SlackユーザーID>"

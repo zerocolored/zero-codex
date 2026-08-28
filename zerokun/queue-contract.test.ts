@@ -11,7 +11,13 @@ describe('Zero-kun Codex wiring', () => {
     expect(server).toContain('updateIsRunning,')
     expect(server).toContain('updateTransactionPending,')
     expect(server).toContain("} from './zerokun/job-runner.ts'")
-    expect(server).toContain('const result = jobStore.enqueue({')
+    expect(server).toContain('jobStore.enqueue({')
+    expect(server.indexOf('jobStore.enqueue({')).toBeLessThan(
+      server.indexOf(
+        'jobStore.completeInboundDelivery(inbound.idempotencyKey)',
+        server.indexOf('jobStore.enqueue({'),
+      ),
+    )
     expect(server).toContain('rememberDelivered(key)')
     expect(server.indexOf('jobStore.enqueue({')).toBeLessThan(
       server.indexOf('rememberDelivered(key)', server.indexOf('jobStore.enqueue({')),
@@ -224,13 +230,13 @@ describe('Zero-kun Codex wiring', () => {
     const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
     const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
     expect(server).toContain('Zeroちゃん')
-    expect(server).toContain('🙌 受け付けました（待ち順')
+    expect(runner).toContain('🙌 受け付けました（待ち順')
     expect(server).not.toContain('Codexで受け付けました')
     expect(server).not.toContain('Say hi to Codex')
     expect(server).not.toContain('request ${request.id.slice')
     expect(server).not.toContain('実行中jobの完了後')
-    expect(runner).toContain('処理が完了しました。')
-    expect(runner).toContain('Zeroちゃんが確認を始めました。')
+    expect(runner).toContain('🔍 確認を始めますね。')
+    expect(runner).toContain('できました ✅')
     expect(runner).not.toContain(' worker=${job.workerId}')
     expect(runner).not.toContain('Zeroちゃんの job ${job.id.slice')
     expect(runner).not.toContain('Codexの処理が完了しました。')

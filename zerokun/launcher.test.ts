@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
-  chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync,
+  chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync,
+  rmSync, symlinkSync, writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
@@ -17,14 +18,22 @@ afterEach(() => {
 })
 
 function fixture(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'zerokun-codex-launcher-'))
-  temporaryDirs.push(dir)
-  writeFileSync(join(dir, '.env'), [
+  const base = mkdtempSync(join(tmpdir(), 'zerokun-codex-launcher-'))
+  temporaryDirs.push(base)
+  const state = join(base, 'state')
+  const project = join(base, 'project')
+  mkdirSync(state)
+  mkdirSync(project)
+  const initialized = Bun.spawnSync(['git', 'init', '-q', project], {
+    stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+  })
+  expect(initialized.exitCode, initialized.stderr.toString()).toBe(0)
+  writeFileSync(join(state, '.env'), [
     'SLACK_BOT_TOKEN=xoxb-launcher-test-token-12345',
     'SLACK_APP_TOKEN=xapp-1-A0123456789-launcher-test-token-12345',
     '',
   ].join('\n'), { mode: 0o600 })
-  return dir
+  return state
 }
 
 function startGateway(state: string): Bun.Subprocess {
@@ -61,6 +70,7 @@ async function runLauncher(
   state: string,
   env: Record<string, string>,
   beforeConfirm?: () => void | Promise<void>,
+  launch: { invokedAs?: 'zerochan' | 'zerokun'; cwd?: string; args?: string[] } = {},
 ) {
   // The launcher intentionally prepends $HOME/.local/bin before Homebrew.
   // Put the fixture shims there so tests do not depend on whether the host
@@ -130,6 +140,9 @@ async function runLauncher(
       '  fi',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
+      'if [[ "$*" == *project-selection.ts* ]]; then',
+      `  exec ${JSON.stringify(process.execPath)} "$@"`,
+      'fi',
       'if [[ "$*" == *runner-launcher.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} --config=/dev/null --no-env-file ${JSON.stringify(fakeRunnerLauncher)} 2>/dev/null`,
       'fi',
@@ -182,7 +195,15 @@ async function runLauncher(
     "echo 'Usage: herdr agent list Usage: herdr agent get Usage: herdr agent send-keys'",
     '',
   ].join('\n'), { mode: 0o700 })
-  const child = Bun.spawn(['/bin/bash', LAUNCHER, state], {
+  let launcherPath = LAUNCHER
+  if (launch.invokedAs) {
+    launcherPath = join(state, launch.invokedAs)
+    symlinkSync(LAUNCHER, launcherPath)
+  }
+  const child = Bun.spawn([
+    '/bin/bash', launcherPath,
+    ...(launch.args ?? (launch.invokedAs ? [] : [join(dirname(state), 'project')])),
+  ], {
     env: {
       ...processEnvWithout('ZEROKUN_REPLACE_TOKEN'),
       HOME: state,
@@ -193,6 +214,7 @@ async function runLauncher(
       FAKE_RUNNER_RUNTIME: `zerokun-codex-runner-v1:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}`,
       ...env,
     },
+    cwd: launch.cwd,
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
   })
   if (beforeConfirm) {
@@ -216,6 +238,69 @@ function processEnvWithout(key: string): Record<string, string> {
 }
 
 describe('codex-channel.sh replacement guard', () => {
+  test('zerochanはstale exportを無視して実行した物理Git directoryを選ぶ', async () => {
+    const state = fixture()
+    const project = join(dirname(state), 'project')
+    const projectAlias = join(dirname(state), 'project-alias')
+    const stale = join(dirname(state), 'stale-project')
+    mkdirSync(stale)
+    Bun.spawnSync(['git', 'init', '-q', stale])
+    symlinkSync(project, projectAlias)
+    const result = await runLauncher(state, {
+      ZEROKUN_PROJECT_DIR: stale,
+      ZEROKUN_DRY_RUN: '1',
+    }, undefined, { invokedAs: 'zerochan', cwd: projectAlias })
+    expect(result.exitCode, result.output).toBe(0)
+    expect(result.output).toContain(`対象project: ${realpathSync(project)}`)
+    expect(result.output).not.toContain(`対象project: ${realpathSync(stale)}`)
+  })
+
+  test('zerochan --restartは最後に接続できたprojectを使う', async () => {
+    const state = fixture()
+    const project = realpathSync(join(dirname(state), 'project'))
+    writeFileSync(join(state, 'last-connected-project.json'), JSON.stringify({
+      version: 1, projectDir: project, connectedAt: 1234,
+    }), { mode: 0o600 })
+    const result = await runLauncher(state, {
+      ZEROKUN_DRY_RUN: '1',
+    }, undefined, { invokedAs: 'zerochan', cwd: state, args: ['--restart'] })
+    expect(result.exitCode, result.output).toBe(0)
+    expect(result.output).toContain(`対象project: ${project}`)
+  })
+
+  test('legacy zerokunはlast recordがない初回も現在のGit directoryで起動できる', async () => {
+    const state = fixture()
+    const project = realpathSync(join(dirname(state), 'project'))
+    const result = await runLauncher(state, {
+      ZEROKUN_DRY_RUN: '1',
+    }, undefined, { invokedAs: 'zerokun', cwd: project })
+    expect(result.exitCode, result.output).toBe(0)
+    expect(result.output).toContain(`対象project: ${project}`)
+    expect(result.output).not.toContain('前回接続したprojectを確認できません')
+  })
+
+  test('不正cwdはtoken消費・journal recovery・gateway停止より前に拒否する', async () => {
+    const state = fixture()
+    const gateway = startGateway(state)
+    const invalid = join(dirname(state), 'not-a-git-project')
+    const tokenFile = join(state, 'replace-token')
+    const bunLog = join(state, 'bun.log')
+    mkdirSync(invalid)
+    writeFileSync(tokenFile, 'keep-me')
+    writeFileSync(join(state, 'update-transaction.json'), '{}')
+    const result = await runLauncher(state, {
+      ZEROKUN_UPDATE_RESTART: '1',
+      ZEROKUN_REPLACE_TOKEN: 'keep-me',
+      ZEROKUN_REPLACE_TOKEN_FILE: tokenFile,
+      FAKE_BUN_LOG: bunLog,
+    }, undefined, { invokedAs: 'zerochan', cwd: invalid })
+    expect(result.exitCode).toBe(1)
+    expect(result.output).toContain('Git worktree')
+    expect(readFileSync(tokenFile, 'utf8')).toBe('keep-me')
+    expect(readFileSync(bunLog, 'utf8')).not.toContain('update.ts --recover-only')
+    expect(() => process.kill(gateway.pid, 0)).not.toThrow()
+  })
+
   test('Codex 0.149.0未満をjob受付前に拒否する', async () => {
     const state = fixture()
     const result = await runLauncher(state, {

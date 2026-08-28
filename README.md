@@ -30,6 +30,11 @@ Slack bot
   実行中に限ってそのスレッド自体を操作権限の境界とするため、返信者個人がread-onlyでもactive write
   jobへ追加入力できます。write権限を共有したくない相手は同じ実行中スレッドへ参加させないでください。
   最終入力barrier後の通常返信は次のFIFO入力として保持し、その後に`中止`が届いても削除しません。
+- 長時間jobでは開始から10分後、30分後、1時間後、その後は1時間ごとに、実行中の同じCodex turnへ
+  状況を問い合わせます。固定stage文や推測の進捗率ではなく、その時点で本人が返した短い日本語の
+  `commentary`だけを同じSlack threadへ再送し、terminal・中止・user返信を常に優先します。
+  受付には`eyes`、正常完了時には元メッセージへ`white_check_mark` reactionを付けます。本文は
+  Zeroちゃんとして簡潔で温かい日本語と自然な絵文字1〜2個を使い、内部engine名は表示しません。
 - Codex 子プロセスには Slack token や任意の親process環境を渡しません。Slack 投稿は gateway/runner の bot 経路だけです。
 - 起動時のHerdr socket・pane・terminal・workspaceを固定し、job開始前に同じidentityを再検証します。
   staleなHerdr環境ではCodexを起動しません。
@@ -164,8 +169,9 @@ bash "$bootstrap_path" --with-slack
 `git switch main` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使えます。
 
 bootstrapはZeroちゃん本体とは別の`zerokun-workspace` Git repositoryを、最小安全指示の`AGENTS.md`
-初期commit付きで既定projectとして作ります。既存projectを使う場合はproject固有の`AGENTS.md`は任意で、
-`--project-dir /absolute/path/to/project`を指定できます。
+初期commit付きで作ります。既存projectを初期workspace／初期channel routeに使う場合は、
+`--project-dir /absolute/path/to/project`を指定できます。DMの新規threadは、起動時に
+`zerochan`を実行した物理directoryを使います。
 Zeroちゃん本体はhost runtimeなので、そこを対象にしたSlack write jobは常に拒否されます。
 
 依存関係だけ診断する場合は `--doctor`、導入済み環境で Slack 設定だけ再開する場合は
@@ -225,15 +231,19 @@ zerokun-access write deny U0123456789
 ## 起動と運用
 
 ```bash
-# setup後、Herdrの専用paneで
-zerokun
+# setup後、Herdrの専用paneで対象projectへ移動して起動
+cd /absolute/path/to/project
+zerochan
 
 # 別terminalから
 zerokun-status
 zerokun-jobs status
 ```
 
-`zerokun` はHerdr外からの起動を拒否します。Herdrの専用paneで、永続 job runner を独立process groupへ
+`zerochan` はHerdr外からの起動を拒否します。引数やexportは不要で、実行した物理directoryを
+新しいDM threadのprojectとして使います。互換alias `zerokun` も現在directoryを使い、
+`zerochan --restart`（互換alias `zerokun-restart`）は前回Slackへ接続できたprojectを使います。
+Herdrの専用paneで、永続 job runner を独立process groupへ
 起動してから Slack gateway を前景で起動します。gateway は
 `Ctrl-C` で停止しますが、runner はそのsignalを受けず未処理 queue のため常駐します。macOS の watchdog が
 60秒ごとに両方を確認します。
@@ -300,9 +310,9 @@ serviceを起動せずoffline bootstrapで復旧してください。
 }
 ```
 
-DM は launcher に渡した project directory、チャンネルは route の directoryを使います。
+DM は`zerochan`を実行した物理project directory、チャンネルは route の directoryを使います。
 稼働中のgatewayはその物理project directoryをreadinessへ記録し、`zerokun-update`は再起動後も
-同じdirectoryを引き継ぎます。gateway停止中に更新する場合は`ZEROKUN_PROJECT_DIR`を明示してください。
+同じdirectoryを引き継ぎます。gateway停止中も、最後に接続できたprojectの安全な記録を使います。
 一度採用した Slack thread の route は SQLite に固定され、途中で設定を変えても別 repository
 へ飛びません。
 

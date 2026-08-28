@@ -234,6 +234,7 @@ export interface EnqueueInput {
   task: string
   attachments?: string[]
   writeEnabled?: boolean
+  notifyAccepted?: boolean
 }
 
 export interface InboundDeliveryInput {
@@ -265,6 +266,7 @@ export interface LiveControlInput {
   task: string
   attachments?: string[]
   kind: JobControlKind
+  notifyAccepted?: boolean
 }
 
 export interface InboundDeliveryRecord extends InboundDeliveryInput {
@@ -471,11 +473,63 @@ CREATE TABLE IF NOT EXISTS terminal_notifications (
   last_error TEXT,
   created_at INTEGER NOT NULL,
   body_delivered_at INTEGER,
+  reaction_delivered_at INTEGER,
   delivered_at INTEGER,
   FOREIGN KEY (job_id) REFERENCES jobs(id)
 );
 CREATE INDEX IF NOT EXISTS idx_terminal_notifications_pending
   ON terminal_notifications(delivered_at, not_before, created_at);
+CREATE TABLE IF NOT EXISTS lifecycle_notifications (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('started', 'progress')),
+  slot INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  not_before INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  delivered_at INTEGER,
+  superseded_at INTEGER,
+  UNIQUE (job_id, attempt, kind, slot),
+  FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_notifications_pending
+  ON lifecycle_notifications(delivered_at, superseded_at, not_before, created_at);
+CREATE TABLE IF NOT EXISTS status_notifications (
+  id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  job_id TEXT,
+  chat_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN (
+    'accepted', 'interrupt-accepted', 'closed-control',
+    'inactive-interrupt', 'attachment-control-failed', 'rate-limited'
+  )),
+  payload TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  not_before INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  delivered_at INTEGER,
+  superseded_at INTEGER,
+  FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_status_notifications_pending
+  ON status_notifications(delivered_at, superseded_at, not_before, created_at);
+CREATE TABLE IF NOT EXISTS progress_probes (
+  job_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  slot INTEGER NOT NULL,
+  client_message_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  reported_at INTEGER,
+  superseded_at INTEGER,
+  superseded_by_slot INTEGER,
+  PRIMARY KEY (job_id, attempt, slot),
+  FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
 CREATE TABLE IF NOT EXISTS monitor_failures (
   job_id TEXT PRIMARY KEY,
   reason_digest TEXT NOT NULL,
@@ -1025,6 +1079,16 @@ function ensureJobSchemaMigrations(db: Database): void {
       if (!migrated.some(column => column.name === 'body_delivered_at')) throw error
     }
   }
+  if (!notificationColumns.some(column => column.name === 'reaction_delivered_at')) {
+    try {
+      db.exec('ALTER TABLE terminal_notifications ADD COLUMN reaction_delivered_at INTEGER')
+    } catch (error) {
+      const migrated = db.query<{ name: string }, []>(
+        'PRAGMA table_info(terminal_notifications)',
+      ).all()
+      if (!migrated.some(column => column.name === 'reaction_delivered_at')) throw error
+    }
+  }
   const artifactColumns = db.query<{ name: string }, []>(
     'PRAGMA table_info(artifact_deliveries)',
   ).all()
@@ -1305,6 +1369,71 @@ export class JobStore {
       chmodSync(`${dbPath}-wal`, 0o600)
       chmodSync(`${dbPath}-shm`, 0o600)
     } catch {}
+  }
+
+  private supersedeLifecycleNotifications(jobId: string, now = Date.now()): void {
+    this.db.run(
+      `UPDATE lifecycle_notifications SET superseded_at = COALESCE(superseded_at, ?)
+       WHERE job_id = ? AND delivered_at IS NULL AND superseded_at IS NULL`,
+      [now, jobId],
+    )
+    this.db.run(
+      `UPDATE progress_probes SET superseded_at = COALESCE(superseded_at, ?)
+       WHERE job_id = ? AND reported_at IS NULL AND superseded_at IS NULL`,
+      [now, jobId],
+    )
+    this.db.run(
+      `UPDATE status_notifications SET superseded_at = COALESCE(superseded_at, ?)
+       WHERE job_id = ? AND kind = 'rate-limited'
+         AND delivered_at IS NULL AND superseded_at IS NULL`,
+      [now, jobId],
+    )
+  }
+
+  private stageStatusNotificationRow(input: {
+    idempotencyKey: string
+    jobId: string | null
+    chatId: string
+    threadTs: string
+    kind: StatusNotificationKind
+    payload: string
+    createdAt: number
+  }): void {
+    const id = randomUUID()
+    const inserted = this.db.run(
+      `INSERT OR IGNORE INTO status_notifications (
+         id, idempotency_key, job_id, chat_id, thread_ts, kind, payload, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        input.idempotencyKey,
+        input.jobId,
+        input.chatId,
+        input.threadTs,
+        input.kind,
+        input.payload,
+        input.createdAt,
+      ],
+    )
+    if (inserted.changes === 1) return
+    const existing = this.db.query<{
+      job_id: string | null
+      chat_id: string
+      thread_ts: string
+      kind: StatusNotificationKind
+      payload: string
+    }, [string]>(
+      `SELECT job_id, chat_id, thread_ts, kind, payload
+       FROM status_notifications WHERE idempotency_key = ?`,
+    ).get(input.idempotencyKey)
+    if (!existing
+      || existing.job_id !== input.jobId
+      || existing.chat_id !== input.chatId
+      || existing.thread_ts !== input.threadTs
+      || existing.kind !== input.kind
+      || existing.payload !== input.payload) {
+      throw new Error(`status notification identity collision: ${input.idempotencyKey}`)
+    }
   }
 
   private recordCodexSessionUse(sessionId: string, jobId: string, recordedAt: number): void {
@@ -1926,9 +2055,23 @@ export class JobStore {
     ))
   }
 
-  tombstoneInboundDelivery(idempotencyKey: string): void {
+  tombstoneInboundDelivery(
+    idempotencyKey: string,
+    status?: {
+      kind: 'closed-control' | 'inactive-interrupt' | 'attachment-control-failed'
+      payload: string
+    },
+  ): void {
     const key = requireText(idempotencyKey, 'idempotencyKey')
+    const payload = status ? requireText(status.payload, 'status notification payload') : null
     const consume = this.db.transaction(() => {
+      const inbound = this.db.query<{
+        chat_id: string
+        thread_ts: string
+      }, [string]>(
+        `SELECT chat_id, thread_ts FROM inbound_deliveries
+         WHERE idempotency_key = ? AND status = 'processing'`,
+      ).get(key)
       const inserted = this.db.run(
         `INSERT INTO delivery_tombstones (idempotency_key, write_enabled, completed_at)
          SELECT idempotency_key, write_enabled, ? FROM inbound_deliveries
@@ -1941,6 +2084,17 @@ export class JobStore {
           'SELECT 1 AS present FROM delivery_tombstones WHERE idempotency_key = ?',
         ).get(key)
         if (!retained) throw new Error(`inbound delivery is no longer processing: ${key}`)
+      }
+      if (status && payload && inbound) {
+        this.stageStatusNotificationRow({
+          idempotencyKey: `${status.kind}:${key}`,
+          jobId: null,
+          chatId: inbound.chat_id,
+          threadTs: inbound.thread_ts,
+          kind: status.kind,
+          payload,
+          createdAt: Date.now(),
+        })
       }
       this.db.run('DELETE FROM inbound_deliveries WHERE idempotency_key = ?', [key])
     })
@@ -2146,6 +2300,29 @@ export class JobStore {
         [snapshot.digest, controlId],
       )
       if (digested.changes !== 1) throw new Error(`control input digest was not fixed: ${controlId}`)
+      if (input.kind === 'interrupt' && input.notifyAccepted) {
+        this.stageStatusNotificationRow({
+          idempotencyKey: `interrupt-accepted:${key}`,
+          jobId,
+          chatId,
+          threadTs,
+          kind: 'interrupt-accepted',
+          payload: '中止を受け付けました。安全な後処理を開始します。',
+          createdAt: now,
+        })
+      }
+      this.db.run(
+        `UPDATE lifecycle_notifications SET superseded_at = COALESCE(superseded_at, ?)
+         WHERE job_id = ? AND attempt = (SELECT attempts FROM jobs WHERE id = ?)
+           AND kind = 'progress' AND delivered_at IS NULL AND superseded_at IS NULL`,
+        [now, jobId, jobId],
+      )
+      this.db.run(
+        `UPDATE progress_probes SET superseded_at = COALESCE(superseded_at, ?)
+         WHERE job_id = ? AND attempt = (SELECT attempts FROM jobs WHERE id = ?)
+           AND reported_at IS NULL AND superseded_at IS NULL`,
+        [now, jobId, jobId],
+      )
       return 'staged'
     })
     return retrySqlite(() => stage.immediate())
@@ -3201,6 +3378,18 @@ export class JobStore {
          WHERE runtime = 'codex' AND status = 'queued' AND seq <= ?`,
       ).get(row.seq)?.position ?? 0
 
+      if (result.changes === 1 && input.notifyAccepted) {
+        this.stageStatusNotificationRow({
+          idempotencyKey: `accepted:${idempotencyKey}`,
+          jobId: row.id,
+          chatId,
+          threadTs,
+          kind: 'accepted',
+          payload: `🙌 受け付けました（待ち順 ${position}）。`,
+          createdAt: Date.now(),
+        })
+      }
+
       return {
         job: mapRow(row),
         duplicate: result.changes === 0,
@@ -3432,6 +3621,7 @@ export class JobStore {
         [persistedSessionId, result, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer running: ' + id)
+      this.supersedeLifecycleNotifications(id, finishedAt)
       this.db.run(
         `INSERT INTO terminal_notifications (
            id, job_id, kind, payload, created_at
@@ -3439,7 +3629,8 @@ export class JobStore {
          ON CONFLICT(job_id) DO UPDATE SET
            kind = excluded.kind, payload = excluded.payload,
            attempts = 0, not_before = NULL, last_error = NULL,
-           created_at = excluded.created_at, body_delivered_at = NULL, delivered_at = NULL`,
+           created_at = excluded.created_at, body_delivered_at = NULL,
+           reaction_delivered_at = NULL, delivered_at = NULL`,
         [randomUUID(), id, result, finishedAt],
       )
       for (const artifactPath of extractArtifactPaths(result).files) {
@@ -3810,6 +4001,7 @@ export class JobStore {
         [error, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer running: ' + id)
+      this.supersedeLifecycleNotifications(id, finishedAt)
       this.db.run(
         `INSERT INTO terminal_notifications (
            id, job_id, kind, payload, created_at
@@ -3817,7 +4009,8 @@ export class JobStore {
          ON CONFLICT(job_id) DO UPDATE SET
            kind = excluded.kind, payload = excluded.payload,
            attempts = 0, not_before = NULL, last_error = NULL,
-           created_at = excluded.created_at, body_delivered_at = NULL, delivered_at = NULL`,
+           created_at = excluded.created_at, body_delivered_at = NULL,
+           reaction_delivered_at = NULL, delivered_at = NULL`,
         [randomUUID(), id, error, finishedAt],
       )
     })
@@ -3840,6 +4033,7 @@ export class JobStore {
         [message, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer cancellable: ' + id)
+      this.supersedeLifecycleNotifications(id, finishedAt)
       // `finishAppServerTurn` is the sole authority that can move an
       // acknowledged interrupt to observed after a matching terminal.  A
       // terminal cancellation must not fabricate that audit evidence for a
@@ -3881,7 +4075,8 @@ export class JobStore {
          ON CONFLICT(job_id) DO UPDATE SET
            kind = excluded.kind, payload = excluded.payload,
            attempts = 0, not_before = NULL, last_error = NULL,
-           created_at = excluded.created_at, body_delivered_at = NULL, delivered_at = NULL`,
+           created_at = excluded.created_at, body_delivered_at = NULL,
+           reaction_delivered_at = NULL, delivered_at = NULL`,
         [randomUUID(), id, message, finishedAt],
       )
     })
@@ -3904,6 +4099,7 @@ export class JobStore {
         [error, finishedAt, id],
       )
       if (updated.changes === 0) return false
+      this.supersedeLifecycleNotifications(id, finishedAt)
       this.db.run(
         `INSERT INTO terminal_notifications (
            id, job_id, kind, payload, created_at
@@ -3911,12 +4107,399 @@ export class JobStore {
          ON CONFLICT(job_id) DO UPDATE SET
            kind = excluded.kind, payload = excluded.payload,
            attempts = 0, not_before = NULL, last_error = NULL,
-           created_at = excluded.created_at, body_delivered_at = NULL, delivered_at = NULL`,
+           created_at = excluded.created_at, body_delivered_at = NULL,
+           reaction_delivered_at = NULL, delivered_at = NULL`,
         [randomUUID(), id, error, finishedAt],
       )
       return true
     })
     return retrySqlite(() => fail.immediate())
+  }
+
+  activateJobLifecycle(
+    jobIdInput: string,
+    attemptInput: number,
+    now = Date.now(),
+  ): number {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const attempt = Math.floor(attemptInput)
+    if (!Number.isSafeInteger(attempt) || attempt < 1
+      || !Number.isSafeInteger(now) || now <= 0) {
+      throw new Error('job lifecycle activation is invalid')
+    }
+    const activate = this.db.transaction(() => {
+      const job = this.db.query<{
+        status: JobStatus
+        attempts: number
+        cancel_requested_at: number | null
+      }, [string]>(
+        'SELECT status, attempts, cancel_requested_at FROM jobs WHERE id = ?',
+      ).get(jobId)
+      if (job && job.cancel_requested_at !== null) {
+        throw new CodexUserCancelledError()
+      }
+      if (!job || job.status !== 'running' || job.attempts !== attempt) {
+        throw new Error(`job is not eligible for lifecycle activation: ${jobId}`)
+      }
+      const existing = this.db.query<{ created_at: number }, [string, number]>(
+        `SELECT created_at FROM lifecycle_notifications
+         WHERE job_id = ? AND attempt = ? AND kind = 'started' AND slot = -1
+           AND superseded_at IS NULL`,
+      ).get(jobId, attempt)
+      if (existing) return existing.created_at
+      this.db.run(
+        `INSERT INTO lifecycle_notifications (
+           id, job_id, attempt, kind, slot, payload, created_at
+         ) VALUES (?, ?, ?, 'started', -1, '', ?)
+         ON CONFLICT(job_id, attempt, kind, slot) DO UPDATE SET
+           id = excluded.id, payload = '', attempts = 0, not_before = NULL,
+           last_error = NULL, created_at = excluded.created_at,
+           delivered_at = NULL, superseded_at = NULL`,
+        [randomUUID(), jobId, attempt, now],
+      )
+      return now
+    })
+    return retrySqlite(() => activate.immediate())
+  }
+
+  stageProgressProbe(
+    jobIdInput: string,
+    attemptInput: number,
+    slotInput: number,
+    clientMessageIdInput: string,
+    now = Date.now(),
+  ): 'staged' | 'duplicate' | 'closed' {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const attempt = Math.floor(attemptInput)
+    const slot = Math.floor(slotInput)
+    const clientMessageId = requireText(clientMessageIdInput, 'progress client message id')
+    if (!Number.isSafeInteger(attempt) || attempt < 1
+      || !Number.isSafeInteger(slot) || slot < 0
+      || !/^[0-9a-f]{64}$/.test(clientMessageId)
+      || !Number.isSafeInteger(now) || now <= 0) {
+      throw new Error('progress probe is invalid')
+    }
+    const stage = this.db.transaction((): 'staged' | 'duplicate' | 'closed' => {
+      const job = this.db.query<{
+        status: JobStatus
+        attempts: number
+        cancel_requested_at: number | null
+      }, [string]>(
+        'SELECT status, attempts, cancel_requested_at FROM jobs WHERE id = ?',
+      ).get(jobId)
+      if (!job || job.status !== 'running' || job.attempts !== attempt
+        || job.cancel_requested_at !== null) return 'closed'
+      const existing = this.db.query<{
+        client_message_id: string
+        superseded_at: number | null
+      }, [string, number, number]>(
+        `SELECT client_message_id, superseded_at FROM progress_probes
+         WHERE job_id = ? AND attempt = ? AND slot = ?`,
+      ).get(jobId, attempt, slot)
+      if (existing) {
+        if (existing.client_message_id !== clientMessageId) {
+          throw new Error(`progress probe identity changed: ${jobId}:${attempt}:${slot}`)
+        }
+        return existing.superseded_at === null ? 'duplicate' : 'closed'
+      }
+      this.db.run(
+        `INSERT INTO progress_probes (
+           job_id, attempt, slot, client_message_id, created_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+        [jobId, attempt, slot, clientMessageId, now],
+      )
+      return 'staged'
+    })
+    return retrySqlite(() => stage.immediate())
+  }
+
+  supersedeProgressProbe(
+    jobIdInput: string,
+    attemptInput: number,
+    slotInput: number,
+    supersededBySlotInput: number | null,
+    now = Date.now(),
+  ): void {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const attempt = Math.floor(attemptInput)
+    const slot = Math.floor(slotInput)
+    const supersededBySlot = supersededBySlotInput === null
+      ? null
+      : Math.floor(supersededBySlotInput)
+    if (!Number.isSafeInteger(attempt) || attempt < 1
+      || !Number.isSafeInteger(slot) || slot < 0
+      || (supersededBySlot !== null
+        && (!Number.isSafeInteger(supersededBySlot) || supersededBySlot <= slot))
+      || !Number.isSafeInteger(now) || now <= 0) {
+      throw new Error('progress probe supersession is invalid')
+    }
+    retrySqlite(() => this.db.run(
+      `UPDATE progress_probes
+       SET superseded_at = COALESCE(superseded_at, ?),
+           superseded_by_slot = COALESCE(superseded_by_slot, ?)
+       WHERE job_id = ? AND attempt = ? AND slot = ?
+         AND reported_at IS NULL AND superseded_at IS NULL`,
+      [now, supersededBySlot, jobId, attempt, slot],
+    ))
+  }
+
+  stageProgressNotification(
+    jobIdInput: string,
+    attemptInput: number,
+    slotInput: number,
+    payloadInput: string,
+    now = Date.now(),
+  ): 'staged' | 'duplicate' | 'closed' {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const attempt = Math.floor(attemptInput)
+    const slot = Math.floor(slotInput)
+    const payload = payloadInput.trim()
+    if (!Number.isSafeInteger(attempt) || attempt < 1
+      || !Number.isSafeInteger(slot) || slot < 0
+      || !payload || payload.length > 4_000
+      || !Number.isSafeInteger(now) || now <= 0) {
+      throw new Error('progress notification is invalid')
+    }
+    const stage = this.db.transaction((): 'staged' | 'duplicate' | 'closed' => {
+      const job = this.db.query<{
+        status: JobStatus
+        attempts: number
+        control_epoch: number
+        cancel_requested_at: number | null
+      }, [string]>(
+        'SELECT status, attempts, control_epoch, cancel_requested_at FROM jobs WHERE id = ?',
+      ).get(jobId)
+      if (!job || job.status !== 'running' || job.attempts !== attempt
+        || job.cancel_requested_at !== null) return 'closed'
+      if (this.db.query<{ present: number }, [string, number]>(
+        `SELECT 1 AS present FROM job_controls
+         WHERE job_id = ? AND control_epoch = ? AND status IN ('ready', 'dispatching')
+         LIMIT 1`,
+      ).get(jobId, job.control_epoch)) return 'closed'
+      const probe = this.db.query<{
+        reported_at: number | null
+        superseded_at: number | null
+      }, [string, number, number]>(
+        `SELECT reported_at, superseded_at FROM progress_probes
+         WHERE job_id = ? AND attempt = ? AND slot = ?`,
+      ).get(jobId, attempt, slot)
+      if (!probe || probe.superseded_at !== null) return 'closed'
+      const activated = this.db.query<{ present: number }, [string, number]>(
+        `SELECT 1 AS present FROM lifecycle_notifications
+         WHERE job_id = ? AND attempt = ? AND kind = 'started' AND slot = -1`,
+      ).get(jobId, attempt)
+      if (!activated) throw new Error(`job lifecycle is not active: ${jobId}`)
+      const duplicate = this.db.query<{ present: number }, [string, number, number]>(
+        `SELECT 1 AS present FROM lifecycle_notifications
+         WHERE job_id = ? AND attempt = ? AND kind = 'progress' AND slot = ?
+           AND superseded_at IS NULL`,
+      ).get(jobId, attempt, slot)
+      if (duplicate) {
+        this.db.run(
+          `UPDATE progress_probes SET reported_at = COALESCE(reported_at, ?)
+           WHERE job_id = ? AND attempt = ? AND slot = ?`,
+          [now, jobId, attempt, slot],
+        )
+        return 'duplicate'
+      }
+      this.db.run(
+        `UPDATE lifecycle_notifications SET superseded_at = ?
+         WHERE job_id = ? AND attempt = ?
+           AND delivered_at IS NULL AND superseded_at IS NULL
+           AND (kind = 'started' OR (kind = 'progress' AND slot < ?))`,
+        [now, jobId, attempt, slot],
+      )
+      this.db.run(
+        `INSERT INTO lifecycle_notifications (
+           id, job_id, attempt, kind, slot, payload, created_at
+         ) VALUES (?, ?, ?, 'progress', ?, ?, ?)
+         ON CONFLICT(job_id, attempt, kind, slot) DO UPDATE SET
+           id = excluded.id, payload = excluded.payload, attempts = 0,
+           not_before = NULL, last_error = NULL, created_at = excluded.created_at,
+           delivered_at = NULL, superseded_at = NULL`,
+        [randomUUID(), jobId, attempt, slot, payload, now],
+      )
+      this.db.run(
+        `UPDATE progress_probes SET reported_at = COALESCE(reported_at, ?)
+         WHERE job_id = ? AND attempt = ? AND slot = ?
+           AND superseded_at IS NULL`,
+        [now, jobId, attempt, slot],
+      )
+      return 'staged'
+    })
+    return retrySqlite(() => stage.immediate())
+  }
+
+  pendingLifecycleNotifications(now = Date.now(), limit = 20): LifecycleNotification[] {
+    const rows = this.db.query<{
+      id: string
+      job_id: string
+      attempt: number
+      kind: 'started' | 'progress'
+      slot: number
+      payload: string
+      attempts: number
+    }, [number, number]>(
+      `SELECT n.id, n.job_id, n.attempt, n.kind, n.slot, n.payload, n.attempts
+       FROM lifecycle_notifications AS n
+       JOIN jobs AS j ON j.id = n.job_id
+       WHERE n.delivered_at IS NULL AND n.superseded_at IS NULL
+         AND (n.not_before IS NULL OR n.not_before <= ?)
+         AND j.status = 'running' AND j.cancel_requested_at IS NULL
+         AND j.attempts = n.attempt
+         AND NOT EXISTS (
+           SELECT 1 FROM job_controls AS c
+           WHERE c.job_id = j.id AND c.control_epoch = j.control_epoch
+             AND c.status IN ('ready', 'dispatching')
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM terminal_notifications AS t
+           JOIN jobs AS prior ON prior.id = t.job_id
+           WHERE t.delivered_at IS NULL
+             AND prior.chat_id = j.chat_id AND prior.thread_ts = j.thread_ts
+             AND prior.seq < j.seq
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM status_notifications AS s
+           WHERE s.job_id = j.id AND s.delivered_at IS NULL AND s.superseded_at IS NULL
+         )
+       ORDER BY n.created_at ASC LIMIT ?`,
+    ).all(now, limit)
+    return rows.flatMap(row => {
+      const job = this.get(row.job_id)
+      return job ? [{ ...row, jobId: row.job_id, job }] : []
+    })
+  }
+
+  lifecycleNotificationDeliverable(idInput: string): boolean {
+    const id = requireText(idInput, 'notificationId')
+    return retrySqlite(() => this.db.query<{ present: number }, [string]>(
+      `SELECT 1 AS present
+       FROM lifecycle_notifications AS n
+       JOIN jobs AS j ON j.id = n.job_id
+       WHERE n.id = ? AND n.delivered_at IS NULL AND n.superseded_at IS NULL
+         AND j.status = 'running' AND j.cancel_requested_at IS NULL
+         AND j.attempts = n.attempt
+         AND NOT EXISTS (
+           SELECT 1 FROM job_controls AS c
+           WHERE c.job_id = j.id AND c.control_epoch = j.control_epoch
+             AND c.status IN ('ready', 'dispatching')
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM terminal_notifications AS t
+           JOIN jobs AS prior ON prior.id = t.job_id
+           WHERE t.delivered_at IS NULL
+             AND prior.chat_id = j.chat_id AND prior.thread_ts = j.thread_ts
+             AND prior.seq < j.seq
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM status_notifications AS s
+           WHERE s.job_id = j.id AND s.delivered_at IS NULL AND s.superseded_at IS NULL
+         )`,
+    ).get(id) !== null)
+  }
+
+  markLifecycleNotificationDelivered(idInput: string): void {
+    const id = requireText(idInput, 'notificationId')
+    this.db.run(
+      `UPDATE lifecycle_notifications
+       SET delivered_at = ?, not_before = NULL, last_error = NULL
+       WHERE id = ? AND delivered_at IS NULL AND superseded_at IS NULL`,
+      [Date.now(), id],
+    )
+  }
+
+  deferLifecycleNotification(
+    idInput: string,
+    errorInput: string,
+    now = Date.now(),
+    retryMs = 30_000,
+  ): void {
+    const id = requireText(idInput, 'notificationId')
+    const error = requireText(errorInput, 'notificationError').slice(0, 4_000)
+    this.db.run(
+      `UPDATE lifecycle_notifications
+       SET attempts = attempts + 1, not_before = ?, last_error = ?
+       WHERE id = ? AND delivered_at IS NULL AND superseded_at IS NULL`,
+      [now + Math.max(1, retryMs), error, id],
+    )
+  }
+
+  lifecycleNotificationCount(): number {
+    return this.db.query<{ count: number }, []>(
+      `SELECT COUNT(*) AS count FROM lifecycle_notifications
+       WHERE delivered_at IS NULL AND superseded_at IS NULL`,
+    ).get()?.count ?? 0
+  }
+
+  pendingStatusNotifications(now = Date.now(), limit = 20): StatusNotification[] {
+    const rows = this.db.query<{
+      id: string
+      idempotency_key: string
+      job_id: string | null
+      chat_id: string
+      thread_ts: string
+      kind: StatusNotificationKind
+      payload: string
+      attempts: number
+    }, [number, number]>(
+      `SELECT id, idempotency_key, job_id, chat_id, thread_ts, kind, payload, attempts
+       FROM status_notifications
+       WHERE delivered_at IS NULL AND superseded_at IS NULL
+         AND (not_before IS NULL OR not_before <= ?)
+       ORDER BY created_at ASC LIMIT ?`,
+    ).all(now, limit)
+    return rows.map(row => ({
+      id: row.id,
+      idempotencyKey: row.idempotency_key,
+      jobId: row.job_id,
+      chatId: row.chat_id,
+      threadTs: row.thread_ts,
+      kind: row.kind,
+      payload: row.payload,
+      attempts: row.attempts,
+    }))
+  }
+
+  statusNotificationDeliverable(idInput: string): boolean {
+    return retrySqlite(() => this.db.query<{ present: number }, [string]>(
+      `SELECT 1 AS present FROM status_notifications
+       WHERE id = ? AND delivered_at IS NULL AND superseded_at IS NULL`,
+    ).get(requireText(idInput, 'notificationId')) !== null)
+  }
+
+  markStatusNotificationDelivered(idInput: string): void {
+    this.db.run(
+      `UPDATE status_notifications
+       SET delivered_at = ?, not_before = NULL, last_error = NULL
+       WHERE id = ? AND delivered_at IS NULL AND superseded_at IS NULL`,
+      [Date.now(), requireText(idInput, 'notificationId')],
+    )
+  }
+
+  deferStatusNotification(
+    idInput: string,
+    errorInput: string,
+    now = Date.now(),
+    retryMs = 30_000,
+  ): void {
+    this.db.run(
+      `UPDATE status_notifications
+       SET attempts = attempts + 1, not_before = ?, last_error = ?
+       WHERE id = ? AND delivered_at IS NULL AND superseded_at IS NULL`,
+      [
+        now + Math.max(1, retryMs),
+        requireText(errorInput, 'notificationError').slice(0, 4_000),
+        requireText(idInput, 'notificationId'),
+      ],
+    )
+  }
+
+  statusNotificationCount(): number {
+    return this.db.query<{ count: number }, []>(
+      `SELECT COUNT(*) AS count FROM status_notifications
+       WHERE delivered_at IS NULL AND superseded_at IS NULL`,
+    ).get()?.count ?? 0
   }
 
   pendingTerminalNotifications(now = Date.now(), limit = 20): TerminalNotification[] {
@@ -3929,9 +4512,15 @@ export class JobStore {
       not_before: number | null
     }, [number, number]>(
       `SELECT id, job_id, kind, payload, attempts, not_before
-       FROM terminal_notifications
-       WHERE delivered_at IS NULL AND (not_before IS NULL OR not_before <= ?)
-       ORDER BY created_at ASC LIMIT ?`,
+       FROM terminal_notifications AS terminal
+       WHERE terminal.delivered_at IS NULL
+         AND (terminal.not_before IS NULL OR terminal.not_before <= ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM status_notifications AS status
+           WHERE status.job_id = terminal.job_id
+             AND status.delivered_at IS NULL AND status.superseded_at IS NULL
+         )
+       ORDER BY terminal.created_at ASC LIMIT ?`,
     ).all(now, limit)
     return rows.flatMap(row => {
       const job = this.get(row.job_id)
@@ -3962,6 +4551,25 @@ export class JobStore {
       [Date.now(), id],
     )
     if (updated.changes !== 1 && !this.terminalNotificationBodyDelivered(id)) {
+      throw new Error(`terminal notification is missing: ${id}`)
+    }
+  }
+
+  terminalNotificationReactionDelivered(id: string): boolean {
+    return this.db.query<{ delivered: number }, [string]>(
+      `SELECT reaction_delivered_at IS NOT NULL AS delivered
+       FROM terminal_notifications WHERE id = ?`,
+    ).get(id)?.delivered === 1
+  }
+
+  markTerminalNotificationReactionDelivered(id: string): void {
+    const updated = this.db.run(
+      `UPDATE terminal_notifications
+       SET reaction_delivered_at = COALESCE(reaction_delivered_at, ?)
+       WHERE id = ? AND delivered_at IS NULL`,
+      [Date.now(), id],
+    )
+    if (updated.changes !== 1 && !this.terminalNotificationReactionDelivered(id)) {
       throw new Error(`terminal notification is missing: ${id}`)
     }
   }
@@ -4166,6 +4774,14 @@ export class JobStore {
              WHERE n.job_id = j.id AND n.delivered_at IS NULL
            )
            AND NOT EXISTS (
+             SELECT 1 FROM lifecycle_notifications AS n
+             WHERE n.job_id = j.id AND n.delivered_at IS NULL AND n.superseded_at IS NULL
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM status_notifications AS n
+             WHERE n.job_id = j.id AND n.delivered_at IS NULL AND n.superseded_at IS NULL
+           )
+           AND NOT EXISTS (
              SELECT 1 FROM artifact_deliveries AS a
              WHERE a.job_id = j.id AND a.delivered_at IS NULL AND a.abandoned_at IS NULL
            )`,
@@ -4180,6 +4796,9 @@ export class JobStore {
           [row.idempotency_key, row.write_enabled, row.finished_at],
         )
         this.db.run('DELETE FROM artifact_deliveries WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM progress_probes WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM lifecycle_notifications WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM status_notifications WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM terminal_notifications WHERE job_id = ?', [row.id])
         const controls = this.db.query<{
           idempotency_key: string
@@ -4281,23 +4900,27 @@ export class JobStore {
   }
 
   requeue(id: string, reason: string): void {
-    const updated = retrySqlite(() => this.db.run(
-      `UPDATE jobs
-       SET status = 'queued', worker_id = NULL, started_at = NULL,
-           executor_pid = NULL, pending_session_id = NULL, pending_result = NULL,
-           not_before = NULL, finished_at = NULL, last_error = ?,
-           accepts_control = CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END,
-           executor_nonce = NULL,
-           active_thread_id = NULL, active_turn_id = NULL
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'
-         AND EXISTS (
-           SELECT 1 FROM job_initial_dispatches receipts
-           WHERE receipts.job_id = jobs.id AND receipts.attempt = jobs.attempts
-             AND receipts.status IN ('prepared', 'rejected')
-         )`,
-      [reason, id],
-    ))
-    if (updated.changes !== 1) {
+    const requeue = this.db.transaction(() => {
+      const updated = this.db.run(
+        `UPDATE jobs
+         SET status = 'queued', worker_id = NULL, started_at = NULL,
+             executor_pid = NULL, pending_session_id = NULL, pending_result = NULL,
+             not_before = NULL, finished_at = NULL, last_error = ?,
+             accepts_control = CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END,
+             executor_nonce = NULL,
+             active_thread_id = NULL, active_turn_id = NULL
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND EXISTS (
+             SELECT 1 FROM job_initial_dispatches receipts
+             WHERE receipts.job_id = jobs.id AND receipts.attempt = jobs.attempts
+               AND receipts.status IN ('prepared', 'rejected')
+           )`,
+        [reason, id],
+      )
+      if (updated.changes === 1) this.supersedeLifecycleNotifications(id)
+      return updated.changes
+    })
+    if (retrySqlite(() => requeue.immediate()) !== 1) {
       throw new Error(`job ${id} cannot be safely requeued after initial App Server delivery`)
     }
   }
@@ -4316,7 +4939,7 @@ export class JobStore {
         [id, job.attempts],
       )
       if (deleted.changes !== 1) return false
-      return this.db.run(
+      const updated = this.db.run(
         `UPDATE jobs
          SET status = 'queued',
              worker_id = NULL,
@@ -4336,7 +4959,23 @@ export class JobStore {
          WHERE id = ? AND runtime = 'codex' AND status = 'running'
            AND worker_id = ? AND executor_pid IS NULL AND attempts = ?`,
         [reason, id, workerId, job.attempts],
-      ).changes === 1
+      )
+      if (updated.changes === 1) {
+        this.db.run(
+          `UPDATE lifecycle_notifications
+           SET superseded_at = COALESCE(superseded_at, ?)
+           WHERE job_id = ? AND attempt = ?
+             AND delivered_at IS NULL AND superseded_at IS NULL`,
+          [Date.now(), id, job.attempts],
+        )
+        this.db.run(
+          `UPDATE progress_probes SET superseded_at = COALESCE(superseded_at, ?)
+           WHERE job_id = ? AND attempt = ?
+             AND reported_at IS NULL AND superseded_at IS NULL`,
+          [Date.now(), id, job.attempts],
+        )
+      }
+      return updated.changes === 1
     })
     return retrySqlite(() => release.immediate())
   }
@@ -4365,6 +5004,26 @@ export class JobStore {
            )`,
         [persistedSessionId ?? null, notBefore, reason, id],
       )
+      if (updated.changes === 1) {
+        this.supersedeLifecycleNotifications(id)
+        const job = this.db.query<{
+          attempts: number
+          chat_id: string
+          thread_ts: string
+        }, [string]>(
+          'SELECT attempts, chat_id, thread_ts FROM jobs WHERE id = ?',
+        ).get(id)
+        if (!job) throw new Error(`rate-limited job disappeared: ${id}`)
+        this.stageStatusNotificationRow({
+          idempotencyKey: `rate-limited:${id}:${job.attempts}:${notBefore}`,
+          jobId: id,
+          chatId: job.chat_id,
+          threadTs: job.thread_ts,
+          kind: 'rate-limited',
+          payload: slackRateLimitMessage(notBefore),
+          createdAt: Date.now(),
+        })
+      }
       return updated.changes
     })
     const changes = retrySqlite(() => requeue.immediate())
@@ -4442,17 +5101,55 @@ export interface TerminalNotification {
   job: JobRecord
 }
 
+export interface LifecycleNotification {
+  id: string
+  jobId: string
+  attempt: number
+  kind: 'started' | 'progress'
+  slot: number
+  payload: string
+  attempts: number
+  job: JobRecord
+}
+
+export type StatusNotificationKind =
+  | 'accepted' | 'interrupt-accepted' | 'closed-control'
+  | 'inactive-interrupt' | 'attachment-control-failed' | 'rate-limited'
+
+export interface StatusNotification {
+  id: string
+  idempotencyKey: string
+  jobId: string | null
+  chatId: string
+  threadTs: string
+  kind: StatusNotificationKind
+  payload: string
+  attempts: number
+}
+
+export interface JobExecutionContext {
+  progressActivatedAtMs: number
+  beginProgressProbe(probe: { slot: number; clientMessageId: string }): boolean
+  supersedeProgressProbe(slot: number, supersededBySlot: number | null): void
+  reportProgress(report: { slot: number; elapsedMs: number; text: string }): boolean
+}
+
 export type JobExecutor = (
   job: JobRecord,
   signal?: AbortSignal,
+  context?: JobExecutionContext,
 ) => Promise<JobExecutionResult>
 
 export interface JobNotifier {
-  started?(job: JobRecord, signal?: AbortSignal): Promise<void>
+  started?(job: JobRecord, notificationId?: string, signal?: AbortSignal): Promise<void>
+  progress?(job: JobRecord, text: string, notificationId?: string, signal?: AbortSignal): Promise<void>
   completed?(job: JobRecord, result: string, notificationId?: string, signal?: AbortSignal): Promise<void>
+  completionReaction?(job: JobRecord, notificationId?: string, signal?: AbortSignal): Promise<void>
   failed?(job: JobRecord, error: string, notificationId?: string, signal?: AbortSignal): Promise<void>
   artifactsAbandoned?(job: JobRecord, error: string, notificationId?: string, signal?: AbortSignal): Promise<void>
-  rateLimited?(job: JobRecord, resumeAt: number, reason: string, signal?: AbortSignal): Promise<void>
+  status?(notification: StatusNotification, signal?: AbortSignal): Promise<void>
+  /** Wait until already-started lifecycle posts have either completed or reached their deadline. */
+  settleLifecycleSideEffects?(): Promise<void>
   /** Wait until already-started, non-cancellable side effects have durable receipts. */
   settleStartedSideEffects?(): Promise<void>
 }
@@ -4535,18 +5232,6 @@ async function runExternalContextBoundary(
   }
 }
 
-async function notifySafely(
-  action: (() => Promise<void>) | undefined,
-  log: (message: string) => void,
-): Promise<void> {
-  if (!action) return
-  try {
-    await action()
-  } catch (error) {
-    log(`notification failed: ${error instanceof Error ? error.message : String(error)}`)
-  }
-}
-
 async function updateMonitorRequired(
   action: (() => Promise<void> | void) | undefined,
   recordFailure: ((error: unknown) => Promise<void> | void) | undefined,
@@ -4563,6 +5248,73 @@ async function updateMonitorRequired(
     }
     if (error instanceof HerdrJobMonitorPendingError) throw error
     throw new HerdrJobMonitorPendingError(`monitor status update is pending: ${message}`)
+  }
+}
+
+export async function flushLifecycleNotifications(
+  store: JobStore,
+  notifier: JobNotifier | undefined,
+  log: (message: string) => void,
+  retryMs = 30_000,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!notifier) return
+  for (const notification of store.pendingLifecycleNotifications()) {
+    if (signal?.aborted) return
+    if (!store.lifecycleNotificationDeliverable(notification.id)) continue
+    try {
+      if (notification.kind === 'started') {
+        if (!notifier.started) continue
+        await notifier.started(notification.job, notification.id, signal)
+      } else {
+        if (!notifier.progress) continue
+        await notifier.progress(
+          notification.job,
+          notification.payload,
+          notification.id,
+          signal,
+        )
+      }
+      if (signal?.aborted) return
+      store.markLifecycleNotificationDelivered(notification.id)
+    } catch (error) {
+      if (signal?.aborted) return
+      const message = error instanceof Error ? error.message : String(error)
+      const backoff = Math.min(
+        retryMs * (2 ** Math.min(notification.attempts, 10)),
+        6 * 60 * 60 * 1000,
+      )
+      store.deferLifecycleNotification(notification.id, message, Date.now(), backoff)
+      log(`lifecycle notification ${notification.id} deferred: ${message}`)
+    }
+  }
+}
+
+export async function flushStatusNotifications(
+  store: JobStore,
+  notifier: JobNotifier | undefined,
+  log: (message: string) => void,
+  retryMs = 30_000,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!notifier?.status) return
+  for (const notification of store.pendingStatusNotifications()) {
+    if (signal?.aborted) return
+    if (!store.statusNotificationDeliverable(notification.id)) continue
+    try {
+      await notifier.status(notification, signal)
+      if (signal?.aborted) return
+      store.markStatusNotificationDelivered(notification.id)
+    } catch (error) {
+      if (signal?.aborted) return
+      const message = error instanceof Error ? error.message : String(error)
+      const backoff = Math.min(
+        retryMs * (2 ** Math.min(notification.attempts, 10)),
+        6 * 60 * 60 * 1000,
+      )
+      store.deferStatusNotification(notification.id, message, Date.now(), backoff)
+      log(`status notification ${notification.id} deferred: ${message}`)
+    }
   }
 }
 
@@ -4596,6 +5348,10 @@ export async function flushTerminalNotifications(
         )
         if (signal?.aborted) return
       }
+      if (notification.kind === 'completed' && notifier.completionReaction) {
+        await notifier.completionReaction(notification.job, notification.id, signal)
+        if (signal?.aborted) return
+      }
       store.markTerminalNotificationDelivered(notification.id)
     } catch (error) {
       if (signal?.aborted) return
@@ -4615,6 +5371,10 @@ export async function flushTerminalNotifications(
             try {
               await notifier.artifactsAbandoned(
                 notification.job, message, notification.id, signal,
+              )
+              if (signal?.aborted) return
+              await notifier.completionReaction?.(
+                notification.job, notification.id, signal,
               )
               if (signal?.aborted) return
               store.markTerminalNotificationDelivered(notification.id)
@@ -4661,17 +5421,51 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
   const notificationController = new AbortController()
   const stopNotifications = () => notificationController.abort()
   options.signal?.addEventListener('abort', stopNotifications, { once: true })
-  let terminalFlush: Promise<void> | null = null
-  const scheduleTerminalFlush = () => {
-    if (terminalFlush) return
-    terminalFlush = flushTerminalNotifications(
-      options.store,
-      options.notifier,
-      log,
-      notificationRetryMs,
-      notificationController.signal,
-    ).finally(() => { terminalFlush = null })
+  let notificationFlush: Promise<void> | null = null
+  let lifecycleFlush: Promise<void> | null = null
+  let lifecycleSchedulingOpen = false
+  const scheduleNotificationFlush = () => {
+    if (notificationFlush) return
+    notificationFlush = (async () => {
+      // One lane keeps durable state replies and terminal results ahead of
+      // lifecycle chatter. Per-thread SQL eligibility prevents a later job's
+      // started/progress message from overtaking an older terminal result.
+      await flushStatusNotifications(
+        options.store,
+        options.notifier,
+        log,
+        notificationRetryMs,
+        notificationController.signal,
+      )
+      await flushTerminalNotifications(
+        options.store,
+        options.notifier,
+        log,
+        notificationRetryMs,
+        notificationController.signal,
+      )
+      if (lifecycleSchedulingOpen) {
+        const pendingLifecycleFlush = flushLifecycleNotifications(
+          options.store,
+          options.notifier,
+          log,
+          notificationRetryMs,
+          notificationController.signal,
+        )
+        lifecycleFlush = pendingLifecycleFlush
+        try {
+          await pendingLifecycleFlush
+        } finally {
+          if (lifecycleFlush === pendingLifecycleFlush) lifecycleFlush = null
+        }
+      }
+    })().finally(() => { notificationFlush = null })
   }
+  const notificationPump = setInterval(
+    scheduleNotificationFlush,
+    Math.max(25, Math.min(notificationRetryMs, 1_000)),
+  )
+  notificationPump.unref()
   const updateMonitor = (job: JobRecord, message: string): Promise<void> => (
     updateMonitorRequired(
       options.updateJobMonitor ? () => options.updateJobMonitor!(job, message) : undefined,
@@ -4689,7 +5483,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         await Bun.sleep(pollMs)
         continue
       }
-      scheduleTerminalFlush()
+      scheduleNotificationFlush()
 
       if (options.store.countClaimable() > 0) await options.beforeClaim?.()
 
@@ -4714,9 +5508,19 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
     }
 
     let executionStarted = false
+    let progressReportsOpen = false
+    let progressActivatedAtMs = 0
     let unstartedMonitorClaimReleased = false
     let skipMonitorClose = false
+    const quiesceLifecycleBeforeStateChange = async (): Promise<void> => {
+      progressReportsOpen = false
+      lifecycleSchedulingOpen = false
+      if (lifecycleFlush) await lifecycleFlush
+      await options.notifier?.settleLifecycleSideEffects?.()
+      await options.notifier?.settleStartedSideEffects?.()
+    }
     const quiesceMonitorBeforeTerminal = async (): Promise<void> => {
+      await quiesceLifecycleBeforeStateChange()
       await options.quiesceJobMonitor?.(job)
       options.assertJobMonitorHealthy?.(job)
     }
@@ -4727,7 +5531,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           options.store.cancel(job.id)
           stats.failed += 1
           log(`${workerId} cancelled fresh queued job ${job.id} without opening a monitor`)
-          scheduleTerminalFlush()
+          scheduleNotificationFlush()
           continue
         }
         await updateMonitor(job, '待機中のタスクに届いた中止要求を反映します')
@@ -4744,7 +5548,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         options.store.cancel(job.id)
         stats.failed += 1
         log(`${workerId} cancelled queued job ${job.id} without starting Codex`)
-        scheduleTerminalFlush()
+        scheduleNotificationFlush()
         continue
       }
       try {
@@ -4771,7 +5575,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           options.store.cancel(job.id)
           stats.failed += 1
           log(`${workerId} cancelled ${job.id} while preparing its advisor context`)
-          scheduleTerminalFlush()
+          scheduleNotificationFlush()
           continue
         }
         if (error instanceof HerdrJobMonitorPendingError
@@ -4790,15 +5594,51 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         throw error
       }
       log(`${workerId} claimed ${job.id}`)
-      await notifySafely(
-        options.notifier?.started ? () => options.notifier!.started!(job, options.signal) : undefined,
-        log,
-      )
+      if (options.store.get(job.id)?.cancelRequestedAt !== null) {
+        throw new CodexUserCancelledError()
+      }
+      progressActivatedAtMs = options.store.activateJobLifecycle(job.id, job.attempts)
+      progressReportsOpen = true
+      lifecycleSchedulingOpen = true
+      scheduleNotificationFlush()
       options.assertJobMonitorHealthy?.(job)
       let execution: JobExecutionResult
       try {
         executionStarted = true
-        execution = await options.executor(job, options.signal)
+        execution = await options.executor(job, options.signal, {
+          progressActivatedAtMs,
+          beginProgressProbe: probe => {
+            if (!progressReportsOpen) return false
+            const disposition = options.store.stageProgressProbe(
+              job.id,
+              job.attempts,
+              probe.slot,
+              probe.clientMessageId,
+            )
+            return disposition === 'staged' || disposition === 'duplicate'
+          },
+          supersedeProgressProbe: (slot, supersededBySlot) => {
+            options.store.supersedeProgressProbe(
+              job.id,
+              job.attempts,
+              slot,
+              supersededBySlot,
+            )
+          },
+          reportProgress: report => {
+            if (!progressReportsOpen) return false
+            const disposition = options.store.stageProgressNotification(
+              job.id,
+              job.attempts,
+              report.slot,
+              report.text,
+            )
+            if (disposition === 'staged') scheduleNotificationFlush()
+            return disposition === 'staged' || disposition === 'duplicate'
+          },
+        })
+        progressReportsOpen = false
+        await quiesceLifecycleBeforeStateChange()
         options.assertJobMonitorHealthy?.(job)
       } catch (error) {
         // A supervisor cleanup failure means Codex/advisor descendants are not
@@ -4857,11 +5697,15 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         )
       }
       stats.completed += 1
-      scheduleTerminalFlush()
+      scheduleNotificationFlush()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (error instanceof HerdrJobMonitorPendingError
         && !executionStarted && !unstartedMonitorClaimReleased) {
+        // A lifecycle delivery may already be in flight if the monitor failed
+        // after activation but before the executor started. Close the scheduler
+        // and drain that delivery before the claim becomes queueable again.
+        await quiesceLifecycleBeforeStateChange()
         await runExternalContextBoundary(
           options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
           `advisor cleanup is pending for job ${job.id}`,
@@ -4882,12 +5726,22 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         || error instanceof CodexResultPersistencePendingError
         || error instanceof HerdrJobMonitorPendingError) throw error
       if (error instanceof CodexUserCancelledError) {
+        if (!executionStarted) {
+          await runExternalContextBoundary(
+            options.cancelExternalContext
+              ? () => options.cancelExternalContext!(job)
+              : options.settleExternalContext
+                ? () => options.settleExternalContext!(job)
+                : undefined,
+            `advisor cancellation cleanup is pending for job ${job.id}`,
+          )
+        }
         await updateMonitor(job, '中止要求を反映し、安全な後処理を完了しました')
         await quiesceMonitorBeforeTerminal()
         options.store.cancel(job.id)
         stats.failed += 1
         log(`${workerId} cancelled ${job.id}`)
-        scheduleTerminalFlush()
+        scheduleNotificationFlush()
         continue
       }
       if (error instanceof CodexInterruptedError || options.signal?.aborted) {
@@ -4910,9 +5764,10 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           options.store.fail(job.id, uncertain)
           stats.failed += 1
           log(`${workerId} failed interrupted uncertain job ${job.id}: ${message}`)
-          scheduleTerminalFlush()
+          scheduleNotificationFlush()
         } else {
           await updateMonitor(job, '中断されたため、同じ監視タブで再開を待ちます')
+          await quiesceLifecycleBeforeStateChange()
           options.store.requeue(job.id, message || 'worker interrupted')
           log(`${workerId} requeued ${job.id}: ${message}`)
         }
@@ -4935,7 +5790,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         options.store.fail(job.id, uncertain)
         stats.failed += 1
         log(`${workerId} failed rate-limited write job ${job.id}: ${message}`)
-        scheduleTerminalFlush()
+        scheduleNotificationFlush()
         continue
       }
       if (error instanceof CodexRateLimitError && options.advisorStateDir
@@ -4951,7 +5806,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         options.store.fail(job.id, uncertain)
         stats.failed += 1
         log(`${workerId} failed rate-limited advisor job ${job.id}: ${message}`)
-        scheduleTerminalFlush()
+        scheduleNotificationFlush()
         continue
       }
       if (error instanceof CodexRateLimitError) {
@@ -4960,14 +5815,10 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           job,
           `利用上限のため ${new Date(resumeAt).toISOString()} まで待機します`,
         )
+        await quiesceLifecycleBeforeStateChange()
         options.store.requeueAt(job.id, resumeAt, message, error.sessionId)
         log(`${workerId} deferred ${job.id} until ${new Date(resumeAt).toISOString()}: ${message}`)
-        await notifySafely(
-          options.notifier?.rateLimited
-            ? () => options.notifier!.rateLimited!(job, resumeAt, message, options.signal)
-            : undefined,
-          log,
-        )
+        scheduleNotificationFlush()
         continue
       }
       const failure = job.writeEnabled && options.store.writePhaseMayHaveBeenDelivered(job.id)
@@ -4979,7 +5830,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       await quiesceMonitorBeforeTerminal()
       options.store.fail(job.id, failure)
       stats.failed += 1
-      scheduleTerminalFlush()
+      scheduleNotificationFlush()
     } finally {
       const settled = options.store.get(job.id)
       if (!skipMonitorClose && settled
@@ -4990,10 +5841,19 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
     }
     return stats
   } finally {
+    lifecycleSchedulingOpen = false
+    clearInterval(notificationPump)
+    // On a normal run-until-idle exit, let already-started durable deliveries
+    // commit their receipts before aborting the notification signal. An
+    // external shutdown still aborts immediately, and arbitrary notifiers
+    // remain bounded by the existing one-second drain.
+    if (!options.signal?.aborted) {
+      if (notificationFlush) await Promise.race([notificationFlush, Bun.sleep(1_000)])
+    }
     notificationController.abort()
     options.signal?.removeEventListener('abort', stopNotifications)
-    if (terminalFlush) {
-      await Promise.race([terminalFlush, Bun.sleep(1_000)])
+    if (notificationFlush) {
+      await Promise.race([notificationFlush, Bun.sleep(1_000)])
     }
     // Arbitrary notifier failures must not block the FIFO forever, but the
     // production Slack uploader must finish any side effect it already began
@@ -5400,7 +6260,7 @@ export function sanitizeExecutionTextForSlack(
   let insideHostBlock = false
   for (const line of text.split(/\r?\n/)) {
     const normalized = line.trim().replace(/^>\s*/, '')
-    if (/^--- Zero host (?:control|phase control|follow-up binding|write-phase preemption)\b/i.test(normalized)) {
+    if (/^--- Zero host (?:control|phase control|follow-up binding|write-phase preemption|progress check)\b/i.test(normalized)) {
       insideHostBlock = true
       continue
     }
@@ -6466,6 +7326,11 @@ export interface SlackUploadDependencies {
     chatId: string
     threadTs: string
   }): Promise<boolean>
+  addReaction(input: {
+    chatId: string
+    messageId: string
+    name: string
+  }, signal?: AbortSignal): Promise<void>
 }
 
 export function slackFileIsSharedInThread(
@@ -6488,6 +7353,7 @@ export function slackFileIsSharedInThread(
 
 export class SlackNotifier implements JobNotifier {
   private readonly client: WebClient
+  private readonly lifecycleSideEffects = new Set<Promise<unknown>>()
   private readonly startedSideEffects = new Set<Promise<unknown>>()
   private readonly uploadDependencies: SlackUploadDependencies
 
@@ -6537,6 +7403,16 @@ export class SlackNotifier implements JobNotifier {
         if (response.ok !== true) throw new Error('Slack files.info failed')
         return slackFileIsSharedInThread(response.file, input.chatId, input.threadTs)
       }),
+      addReaction: dependencies.addReaction ?? (async (input, signal) => {
+        const result = await postDirectSlackApi('reactions.add', this.token, {
+          channel: input.chatId,
+          timestamp: input.messageId,
+          name: input.name,
+        }, signal)
+        if (!result.ok && result.error !== 'already_reacted') {
+          throw new Error(result.error ?? 'Slack reactions.add failed')
+        }
+      }),
     }
   }
 
@@ -6560,6 +7436,22 @@ export class SlackNotifier implements JobNotifier {
     }
   }
 
+  private trackLifecycleSideEffect<T>(operation: () => Promise<T>): Promise<T> {
+    const pending = operation()
+    this.lifecycleSideEffects.add(pending)
+    void pending.then(
+      () => { this.lifecycleSideEffects.delete(pending) },
+      () => { this.lifecycleSideEffects.delete(pending) },
+    )
+    return pending
+  }
+
+  async settleLifecycleSideEffects(): Promise<void> {
+    while (this.lifecycleSideEffects.size > 0) {
+      await Promise.allSettled([...this.lifecycleSideEffects])
+    }
+  }
+
   private async post(
     job: JobRecord,
     text: string,
@@ -6580,13 +7472,53 @@ export class SlackNotifier implements JobNotifier {
     }
   }
 
-  async started(job: JobRecord, signal?: AbortSignal): Promise<void> {
-    await this.post(
-      job,
-      'Zeroちゃんが確認を始めました。',
-      undefined,
-      signal,
+  async started(
+    job: JobRecord,
+    notificationId?: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.trackLifecycleSideEffect(
+      () => this.post(
+        job,
+        '🔍 確認を始めますね。時間がかかる場合は、途中経過もこのスレッドでお知らせします。',
+        notificationId,
+        signal,
+      ),
     )
+  }
+
+  async progress(
+    job: JobRecord,
+    text: string,
+    notificationId?: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const safeText = sanitizeExecutionTextForSlack(
+      job,
+      job.sessionId ?? '',
+      text,
+      dirname(this.store.dbPath),
+    )
+    await this.trackLifecycleSideEffect(
+      () => this.post(
+        job,
+        safeText || '少し時間がかかっていますが、まだ作業を続けています 🔍',
+        notificationId,
+        signal,
+      ),
+    )
+  }
+
+  async status(notification: StatusNotification, signal?: AbortSignal): Promise<void> {
+    const chunks = splitSlackChunks(notification.payload)
+    for (let index = 0; index < chunks.length; index += 1) {
+      await withSlackDeadline(childSignal => this.uploadDependencies.postMessage({
+        chatId: notification.chatId,
+        threadTs: notification.threadTs,
+        text: chunks[index]!,
+        clientMessageId: slackClientMessageId(notification.id, index),
+      }, childSignal), undefined, 'Slack status chat.postMessage', signal)
+    }
   }
 
   async completed(
@@ -6603,7 +7535,7 @@ export class SlackNotifier implements JobNotifier {
       dirname(this.store.dbPath),
     )
     if (!notificationId || !this.store.terminalNotificationBodyDelivered(notificationId)) {
-      await this.post(job, safeText || '処理が完了しました。', notificationId, signal)
+      await this.post(job, safeText || 'できました ✅', notificationId, signal)
       if (signal?.aborted) return
       if (notificationId) this.store.markTerminalNotificationBodyDelivered(notificationId)
     }
@@ -6705,6 +7637,26 @@ export class SlackNotifier implements JobNotifier {
     }
   }
 
+  async completionReaction(
+    job: JobRecord,
+    notificationId?: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!notificationId || !this.store.terminalNotificationReactionDelivered(notificationId)) {
+      await this.completeStartedSideEffect(
+        () => this.uploadDependencies.addReaction({
+          chatId: job.chatId,
+          messageId: job.messageId,
+          name: 'white_check_mark',
+        }, signal),
+        'Slack completion reaction',
+        signal,
+      )
+      if (signal?.aborted) return
+      if (notificationId) this.store.markTerminalNotificationReactionDelivered(notificationId)
+    }
+  }
+
   async failed(job: JobRecord, error: string, notificationId?: string, signal?: AbortSignal): Promise<void> {
     const cancelled = job.terminalOutcome === 'cancelled'
     this.log(`job ${job.id} ${cancelled ? 'cancelled' : 'failed'}: ${error}`)
@@ -6712,8 +7664,8 @@ export class SlackNotifier implements JobNotifier {
       await this.post(
         job,
         cancelled
-          ? '中止しました。すでに完了した変更は自動では戻していません。'
-          : 'Zeroちゃんの処理に失敗しました。'
+          ? '🛑 中止しました。すでに完了した変更は自動では戻していません。'
+          : '🙇 うまく完了できませんでした。'
             + '\n詳細はこのMacの管理ログを確認してください。',
         notificationId,
         signal,
@@ -6738,14 +7690,6 @@ export class SlackNotifier implements JobNotifier {
     )
   }
 
-  async rateLimited(job: JobRecord, resumeAt: number, _reason: string, signal?: AbortSignal): Promise<void> {
-    await this.post(
-      job,
-      slackRateLimitMessage(resumeAt),
-      undefined,
-      signal,
-    )
-  }
 }
 
 function validateEnqueueInput(raw: unknown): EnqueueInput {
@@ -8018,7 +8962,8 @@ async function runCli(): Promise<void> {
       signal: controller.signal,
       notifier,
       executorStagesResult: true,
-      executor: async (job, signal) => {
+      executor: async (job, signal, executionContext) => {
+        if (!executionContext) throw new Error('job execution context is unavailable')
         const executionController = new AbortController()
         const guard = assertMonitorGuard(job.id)
         guard.executionController = executionController
@@ -8040,6 +8985,12 @@ async function runCli(): Promise<void> {
             onProcessId: processId => store.saveExecutorPid(job.id, processId),
             onSessionId: sessionId => store.saveSession(job.id, sessionId),
             onSessionReset: () => store.clearSession(job.id),
+            progressActivatedAtMs: executionContext.progressActivatedAtMs,
+            onProgressProbeStarted: probe => executionContext.beginProgressProbe(probe),
+            onProgressProbeSuperseded: (slot, supersededBySlot) => (
+              executionContext.supersedeProgressProbe(slot, supersededBySlot)
+            ),
+            onProgressReport: report => executionContext.reportProgress(report),
             liveControls: {
               next: () => store.nextReadyControl(job.id, job.controlEpoch),
               bindTurn: (executorNonce, threadId, turnId) => store.bindAppServerTurn(

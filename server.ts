@@ -54,6 +54,7 @@ import {
   clearGatewayReadiness,
   writeGatewayReadiness,
 } from './zerokun/readiness.ts'
+import { writeLastConnectedProject } from './zerokun/project-selection.ts'
 import {
   ensureManagedDirectory,
   requireManagedStateRoot,
@@ -695,19 +696,9 @@ async function drainInboundDeliveries(): Promise<void> {
             task: interrupt ? '中止' : taskFor(),
             attachments: controlAttachments,
             kind: interrupt ? 'interrupt' : 'steer',
+            notifyAccepted: interrupt,
           })
           if (staged !== 'closed') {
-            if (staged === 'staged' && interrupt) {
-              await slackApp!.client.chat.postMessage({
-                channel: inbound.chatId,
-                thread_ts: inbound.threadTs,
-                text: '中止を受け付けました。安全な後処理を開始します。',
-              }).catch(err => {
-                process.stderr.write(
-                  `slack channel: interrupt acceptance reply failed for ${inbound.idempotencyKey}: ${err}\n`,
-                )
-              })
-            }
             jobStore.completeInboundDelivery(inbound.idempotencyKey)
             continue
           }
@@ -723,15 +714,9 @@ async function drainInboundDeliveries(): Promise<void> {
         // exact job/epoch persisted with it. Never reinterpret it as a sibling
         // FIFO job after cancellation or another terminal race.
         if (inbound.expectedControlJobId !== null) {
-          jobStore.tombstoneInboundDelivery(inbound.idempotencyKey)
-          await slackApp!.client.chat.postMessage({
-            channel: inbound.chatId,
-            thread_ts: inbound.threadTs,
-            text: 'この返信を反映する前に現在の処理が終了しました。必要なら新しい依頼として送ってください。',
-          }).catch(err => {
-            process.stderr.write(
-              `slack channel: closed live-control notice failed for ${inbound.idempotencyKey}: ${err}\n`,
-            )
+          jobStore.tombstoneInboundDelivery(inbound.idempotencyKey, {
+            kind: 'closed-control',
+            payload: 'この返信を反映する前に現在の処理が終了しました。必要なら新しい依頼として送ってください。',
           })
           continue
         }
@@ -740,19 +725,13 @@ async function drainInboundDeliveries(): Promise<void> {
         // active), consume it as a deterministic no-op instead of enqueueing
         // a new Codex job whose task text happens to be "中止".
         if (isSlackInterruptCommand(inbound.text)) {
-          jobStore.tombstoneInboundDelivery(inbound.idempotencyKey)
-          await slackApp!.client.chat.postMessage({
-            channel: inbound.chatId,
-            thread_ts: inbound.threadTs,
-            text: '現在このスレッドで実行中のタスクはありません。',
-          }).catch(err => {
-            process.stderr.write(
-              `slack channel: inactive interrupt reply failed for ${inbound.idempotencyKey}: ${err}\n`,
-            )
+          jobStore.tombstoneInboundDelivery(inbound.idempotencyKey, {
+            kind: 'inactive-interrupt',
+            payload: '現在このスレッドで実行中のタスクはありません。',
           })
           continue
         }
-        const result = jobStore.enqueue({
+        jobStore.enqueue({
           chatId: inbound.chatId,
           threadTs: inbound.threadTs,
           messageId: inbound.messageId,
@@ -761,18 +740,8 @@ async function drainInboundDeliveries(): Promise<void> {
           task,
           attachments,
           writeEnabled: inbound.writeEnabled,
+          notifyAccepted: true,
         })
-        if (!result.duplicate) {
-          await slackApp!.client.chat.postMessage({
-            channel: inbound.chatId,
-            thread_ts: inbound.threadTs,
-            text: `🙌 受け付けました（待ち順 ${result.queuePosition}）。`,
-          }).catch(err => {
-            process.stderr.write(
-              `slack channel: acceptance reply failed for ${inbound.idempotencyKey}: ${err}\n`,
-            )
-          })
-        }
         jobStore.completeInboundDelivery(inbound.idempotencyKey)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -784,27 +753,14 @@ async function drainInboundDeliveries(): Promise<void> {
         }
         if (inbound.attempts + 1 >= INBOUND_MAX_ATTEMPTS) {
           if (inbound.expectedControlJobId !== null) {
-            try {
-              await slackApp!.client.chat.postMessage({
-                channel: inbound.chatId,
-                thread_ts: inbound.threadTs,
-                text: '添付ファイルを取得できなかったため、この返信は現在の処理へ反映できませんでした。もう一度送ってください。',
-              })
-              jobStore.tombstoneInboundDelivery(inbound.idempotencyKey)
-              process.stderr.write(
-                `slack channel: live-control inbound ${inbound.idempotencyKey} abandoned after attachment retries\n`,
-              )
-              continue
-            } catch (noticeError) {
-              const notice = noticeError instanceof Error ? noticeError.message : String(noticeError)
-              jobStore.deferInboundDelivery(
-                inbound.idempotencyKey,
-                `attachment failed and notice is pending: ${notice}`,
-                Date.now() + INBOUND_RETRY_MS,
-              )
-              scheduleInboundDrain(INBOUND_RETRY_MS)
-              return
-            }
+            jobStore.tombstoneInboundDelivery(inbound.idempotencyKey, {
+              kind: 'attachment-control-failed',
+              payload: '添付ファイルを取得できなかったため、この返信は現在の処理へ反映できませんでした。もう一度送ってください。',
+            })
+            process.stderr.write(
+              `slack channel: live-control inbound ${inbound.idempotencyKey} abandoned after attachment retries\n`,
+            )
+            continue
           }
           jobStore.failInboundDelivery(
             inbound.idempotencyKey,
@@ -1961,11 +1917,13 @@ try {
   botUserId = identity.botUserId
   await slackApp.start()
   setInterval(checkApprovals, 5_000).unref()
+  const connectedProjectDir = realpathSync(process.cwd())
+  writeLastConnectedProject(STATE_DIR, connectedProjectDir)
   writeGatewayReadiness(
     READY_FILE,
     process.env.ZEROKUN_RELEASE_COMMIT ?? 'manual',
     process.pid,
-    realpathSync(process.cwd()),
+    connectedProjectDir,
   )
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 

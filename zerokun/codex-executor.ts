@@ -100,6 +100,7 @@ import {
   appServerFinalMessage,
   isAppServerMethodUnsupported,
   sameAppServerSessionSource,
+  type AppServerNotification,
   type AppServerSessionSource,
   type AppServerTurn,
 } from './codex-app-server-session.ts'
@@ -1107,7 +1108,8 @@ export const CODEX_WORKER_SAFETY_PROMPT = [
   'Never post to Slack yourself and never call a Slack API, connector, Slack MCP server, CLI,',
   'webhook, or another process to do so. Zeroちゃん publishes your final response using the',
   'bot identity after this process exits. Slack IDs below are context, not destinations.',
-  'In the user-facing answer, speak as Zeroちゃん. Do not expose or mention the internal use',
+  'In the user-facing answer, speak warmly and concisely as Zeroちゃん, using one or two',
+  'natural emoji when appropriate. Accuracy matters more than decoration. Do not expose or mention the internal use',
   'of Codex, Claude Code, Grok, Herdr, App Server, advisor panels, queues, or process names.',
   '',
   'First read every applicable AGENTS.md. If this repository has only CLAUDE.md, read it',
@@ -1120,6 +1122,128 @@ export const CODEX_WORKER_SAFETY_PROMPT = [
   '<zerokun_files> JSON array of absolute local paths </zerokun_files>. Do not include state,',
   'credential, or token files. Omit this tag when there are no artifacts.',
 ].join('\n')
+
+export interface CodexProgressSchedule {
+  firstMs: number
+  secondMs: number
+  thirdMs: number
+  repeatMs: number
+}
+
+export const DEFAULT_CODEX_PROGRESS_SCHEDULE: CodexProgressSchedule = {
+  firstMs: 10 * 60 * 1000,
+  secondMs: 30 * 60 * 1000,
+  thirdMs: 60 * 60 * 1000,
+  repeatMs: 60 * 60 * 1000,
+}
+
+export interface CodexProgressReport {
+  slot: number
+  elapsedMs: number
+  text: string
+}
+
+function validProgressSchedule(
+  value: CodexProgressSchedule | undefined,
+): CodexProgressSchedule {
+  const schedule = value ?? DEFAULT_CODEX_PROGRESS_SCHEDULE
+  if (![schedule.firstMs, schedule.secondMs, schedule.thirdMs, schedule.repeatMs]
+    .every(item => Number.isSafeInteger(item) && item > 0)
+    || schedule.firstMs >= schedule.secondMs
+    || schedule.secondMs >= schedule.thirdMs) {
+    throw new Error('Codex progress schedule is invalid')
+  }
+  return schedule
+}
+
+export function codexProgressOffsetForSlot(
+  slot: number,
+  scheduleInput?: CodexProgressSchedule,
+): number {
+  if (!Number.isSafeInteger(slot) || slot < 0) throw new Error('progress slot is invalid')
+  const schedule = validProgressSchedule(scheduleInput)
+  if (slot === 0) return schedule.firstMs
+  if (slot === 1) return schedule.secondMs
+  return schedule.thirdMs + (slot - 2) * schedule.repeatMs
+}
+
+export function codexProgressClientMessageId(
+  jobId: string,
+  attempt: number,
+  slot: number,
+): string {
+  if (!jobId || !Number.isSafeInteger(attempt) || attempt < 1
+    || !Number.isSafeInteger(slot) || slot < 0) {
+    throw new Error('progress client message identity is invalid')
+  }
+  return createHash('sha256')
+    .update(`zerochan-progress\0${jobId}\0${attempt}\0${slot}`)
+    .digest('hex')
+}
+
+export function latestDueCodexProgressSlot(
+  activatedAtMs: number,
+  nowMs: number,
+  nextSlot: number,
+  scheduleInput?: CodexProgressSchedule,
+): number | null {
+  if (!Number.isSafeInteger(activatedAtMs) || activatedAtMs <= 0
+    || !Number.isSafeInteger(nowMs) || nowMs < activatedAtMs
+    || !Number.isSafeInteger(nextSlot) || nextSlot < 0) return null
+  const schedule = validProgressSchedule(scheduleInput)
+  const elapsed = nowMs - activatedAtMs
+  let latest: number
+  if (elapsed < schedule.firstMs) return null
+  if (elapsed < schedule.secondMs) latest = 0
+  else if (elapsed < schedule.thirdMs) latest = 1
+  else latest = 2 + Math.floor((elapsed - schedule.thirdMs) / schedule.repeatMs)
+  return latest >= nextSlot ? latest : null
+}
+
+export function buildCodexProgressPrompt(marker: string): string {
+  if (!/^[A-F0-9]{24,64}$/.test(marker)) throw new Error('progress marker is invalid')
+  const begin = `[ZERO_PROGRESS_BEGIN:${marker}]`
+  const end = `[ZERO_PROGRESS_END:${marker}]`
+  return [
+    '--- Zero host progress check ---',
+    'This is a status check from the trusted host, not a new Slack request and not a change',
+    'to the task. Do not finish or pause the original work. Briefly inspect what you are',
+    'actually doing now, what has been established so far, and what you will do next.',
+    'Reply immediately with exactly one commentary agent message in natural Japanese as',
+    'Zeroちゃん, in one to three short sentences with one or two natural emoji.',
+    'Do not invent a percentage or fixed stage. Do not mention internal engines, agents,',
+    'queues, process names, raw logs, credentials, identifiers, or this control message.',
+    `Put only the public status between these exact marker lines:\n${begin}\n...\n${end}`,
+    'After that commentary message, continue the original task.',
+    '--- end Zero host progress check ---',
+  ].join('\n')
+}
+
+export function parseCodexProgressCommentary(text: string, marker: string): string | null {
+  if (!/^[A-F0-9]{24,64}$/.test(marker) || text.length > 4_096 || text.includes('\0')) return null
+  const begin = `[ZERO_PROGRESS_BEGIN:${marker}]`
+  const end = `[ZERO_PROGRESS_END:${marker}]`
+  const trimmed = text.trim()
+  if (!trimmed.startsWith(`${begin}\n`) || !trimmed.endsWith(`\n${end}`)) return null
+  const body = trimmed.slice(begin.length + 1, -(end.length + 1)).trim()
+  if (!body || body.length > 2_000 || body.includes(begin) || body.includes(end)) return null
+  return body
+}
+
+export function progressCommentaryFromNotification(
+  notification: AppServerNotification,
+  probe: { threadId: string; turnId: string; marker: string },
+): string | null {
+  if (notification.method !== 'item/completed'
+    || notification.params.threadId !== probe.threadId
+    || notification.params.turnId !== probe.turnId) return null
+  const item = notification.params.item
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+  const record = item as Record<string, unknown>
+  if (!['agentMessage', 'agent_message'].includes(String(record.type))
+    || record.phase !== 'commentary' || typeof record.text !== 'string') return null
+  return parseCodexProgressCommentary(record.text, probe.marker)
+}
 
 export function artifactDirForJob(stateDir: string, jobId: string): string {
   const safeId = jobId.replace(/[^A-Za-z0-9._-]/g, '_')
@@ -3483,6 +3607,21 @@ export async function executeCodexJob(
     onProcessExit?(exitCode: number): void
     onStdoutChunk?(value: Uint8Array): void
     onStderrChunk?(value: Uint8Array): void
+    /** Persist a `(job, attempt, slot)` probe before its App Server write. */
+    onProgressProbeStarted?(probe: { slot: number; clientMessageId: string }): boolean
+    /** Persist an explicit probe supersession before advancing the cadence. */
+    onProgressProbeSuperseded?(slot: number, supersededBySlot: number | null): void
+    /** User-safe status captured from the same active App Server turn. */
+    onProgressReport?(report: CodexProgressReport): boolean
+    /** Executor activation boundary persisted by the queue owner. */
+    progressActivatedAtMs?: number
+    /** Deterministic fixture override; production uses 10m/30m/60m/hourly. */
+    progressScheduleForTesting?: CodexProgressSchedule
+    /** Fixture-only timeout used to exercise late progress ACK handling. */
+    progressSteerTimeoutMsForTesting?: number
+    /** Fixture-only retry delays for correlated probe/staging failures. */
+    progressProbeRetryMsForTesting?: number
+    progressPublishRetryMsForTesting?: number
     onSuccessfulResult?(execution: JobExecutionResult): JobExecutionResult
     supervisorCleanupGraceMs?: number
     /** Grace after an acknowledged user cancel; this is not a whole-job timeout. */
@@ -3545,6 +3684,17 @@ export async function executeCodexJob(
     }
   }
   const model = options.model ?? process.env.ZEROKUN_JOB_MODEL
+  const progressSchedule = validProgressSchedule(options.progressScheduleForTesting)
+  const progressProbeRetryMs = positiveInteger(options.progressProbeRetryMsForTesting, 30_000)
+  const progressPublishRetryMs = positiveInteger(options.progressPublishRetryMsForTesting, 1_000)
+  const progressActivatedAtMs = options.onProgressReport
+    ? (options.progressActivatedAtMs ?? Date.now())
+    : null
+  if (progressActivatedAtMs !== null
+    && (!Number.isSafeInteger(progressActivatedAtMs) || progressActivatedAtMs <= 0)) {
+    throw new Error('Codex progress activation time is invalid')
+  }
+  let nextProgressSlot = 0
   const stateDir = options.stateDir ?? dirname(options.logDir)
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const managedStateDir = requireManagedStateRoot(stateDir)
@@ -4084,6 +4234,16 @@ export async function executeCodexJob(
       let stdoutBytes = 0
       let stdoutTail = ''
       const stdoutDecoder = new TextDecoder('utf-8', { fatal: true })
+      let activeProgressProbe: {
+        slot: number
+        marker: string
+        threadId: string
+        turnId: string
+        clientMessageId: string
+      } | null = null
+      let capturedProgress: CodexProgressReport | null = null
+      let progressProbeRetryAtMs = 0
+      let progressPublishRetryAtMs = 0
       const session = new CodexAppServerSession(proc.stdin, proc.stdout, {
         onOutputChunk: value => {
           if (stdoutBytes < MAX_LOG_FILE_BYTES) {
@@ -4094,6 +4254,23 @@ export async function executeCodexJob(
           options.onStdoutChunk?.(value)
           stdoutTail = (stdoutTail + stdoutDecoder.decode(value, { stream: true }))
             .slice(-MAX_LOG_TAIL_CHARS)
+        },
+        onNotification: notification => {
+          // Keep the reader callback memory-only and non-throwing. Durable
+          // staging happens in the single owner loop below.
+          try {
+            const probe = activeProgressProbe
+            if (!probe || capturedProgress) return
+            const text = progressCommentaryFromNotification(notification, probe)
+            if (!text) return
+            capturedProgress = {
+              slot: probe.slot,
+              elapsedMs: progressActivatedAtMs === null
+                ? 0
+                : Math.max(0, Date.now() - progressActivatedAtMs),
+              text,
+            }
+          } catch {}
         },
       })
       const stderrPromise = collectStreamTailToLog(
@@ -4260,6 +4437,13 @@ export async function executeCodexJob(
         turnId: string,
         control: JobControlRecord,
       ): Promise<void> => {
+        const supersededProbe = activeProgressProbe
+        if (supersededProbe) {
+          options.onProgressProbeSuperseded?.(supersededProbe.slot, null)
+          nextProgressSlot = Math.max(nextProgressSlot, supersededProbe.slot + 1)
+        }
+        activeProgressProbe = null
+        capturedProgress = null
         let requestId: number | null = null
         try {
           const response = control.kind === 'interrupt'
@@ -4330,6 +4514,139 @@ export async function executeCodexJob(
           if (requestId !== null) markAmbiguous(control, error)
           throw error
         }
+      }
+
+      const progressPriorityIsPending = (threadId: string, turnId: string): boolean => (
+        session.hasNextTurnActivity(threadId, turnId)
+        || controls.next() !== null
+        || userCancelled
+        || controls.cancellationRequested()
+      )
+
+      const publishCapturedProgress = (threadId: string, turnId: string): boolean => {
+        const report = capturedProgress
+        if (!report) return false
+        if (Date.now() < progressPublishRetryAtMs) return false
+        if (progressPriorityIsPending(threadId, turnId)) return false
+        const laterDueSlot = progressActivatedAtMs === null
+          ? null
+          : latestDueCodexProgressSlot(
+            progressActivatedAtMs,
+            Date.now(),
+            nextProgressSlot,
+            progressSchedule,
+          )
+        if (laterDueSlot !== null && laterDueSlot > report.slot) {
+          // A captured answer that sat behind user controls until a later
+          // cadence boundary must not be posted immediately before a newer
+          // report. Drop it and let the newest due slot replace it.
+          options.onProgressProbeSuperseded?.(report.slot, laterDueSlot)
+          nextProgressSlot = laterDueSlot
+          capturedProgress = null
+          activeProgressProbe = null
+          return false
+        }
+        // Re-read durable controls immediately before the synchronous host
+        // handoff. The first check and cadence calculation are deliberately
+        // not treated as an atomic priority decision.
+        if (progressPriorityIsPending(threadId, turnId)) return false
+        try {
+          if (options.onProgressReport?.(report) !== true) {
+            progressPublishRetryAtMs = Date.now() + progressPublishRetryMs
+            return false
+          }
+        } catch (error) {
+          progressPublishRetryAtMs = Date.now() + progressPublishRetryMs
+          process.stderr.write(
+            `zerochan: progress report could not be staged: ${error instanceof Error ? error.message : String(error)}\n`,
+          )
+          return false
+        }
+        nextProgressSlot = Math.max(nextProgressSlot, report.slot + 1)
+        progressPublishRetryAtMs = 0
+        capturedProgress = null
+        activeProgressProbe = null
+        return true
+      }
+
+      const dispatchDueProgress = (
+        threadId: string,
+        turnId: string,
+      ): boolean => {
+        if (!options.onProgressReport || progressActivatedAtMs === null
+          || userCancelled || controls.cancellationRequested()) return false
+        if (session.hasNextTurnActivity(threadId, turnId) || controls.next() !== null) {
+          return true
+        }
+        let slot = latestDueCodexProgressSlot(
+          progressActivatedAtMs,
+          Date.now(),
+          nextProgressSlot,
+          progressSchedule,
+        )
+        if (slot === null) return false
+        if (activeProgressProbe) {
+          if (slot <= activeProgressProbe.slot) return false
+          options.onProgressProbeSuperseded?.(activeProgressProbe.slot, slot)
+          nextProgressSlot = slot
+          activeProgressProbe = null
+          capturedProgress = null
+        }
+        if (Date.now() < progressProbeRetryAtMs) return false
+        if (session.hasNextTurnActivity(threadId, turnId)
+          || controls.next() !== null
+          || userCancelled
+          || controls.cancellationRequested()) return true
+
+        // A later cadence boundary explicitly supersedes an unanswered probe.
+        // The durable slot is not advanced until its public report is staged.
+        const marker = randomUUID().replaceAll('-', '').toUpperCase()
+        const clientUserMessageId = codexProgressClientMessageId(job.id, job.attempts, slot)
+        try {
+          if (options.onProgressProbeStarted?.({ slot, clientMessageId: clientUserMessageId }) === false) {
+            progressProbeRetryAtMs = Date.now() + progressPublishRetryMs
+            return false
+          }
+        } catch (error) {
+          progressProbeRetryAtMs = Date.now() + progressPublishRetryMs
+          process.stderr.write(
+            `zerochan: progress probe could not be persisted: ${error instanceof Error ? error.message : String(error)}\n`,
+          )
+          return false
+        }
+        const probe = { slot, marker, threadId, turnId, clientMessageId: clientUserMessageId }
+        activeProgressProbe = probe
+        progressProbeRetryAtMs = 0
+        // Progress is advisory. Once its JSON-RPC write is started, keep the
+        // owner loop free to process terminal, cancellation, and real Slack
+        // input instead of waiting up to the request timeout for an ACK.
+        void session.steer(
+          threadId,
+          turnId,
+          buildCodexProgressPrompt(marker),
+          clientUserMessageId,
+          options.progressSteerTimeoutMsForTesting === undefined
+            ? {}
+            : { timeoutMs: options.progressSteerTimeoutMsForTesting },
+        ).catch(error => {
+          if (error instanceof AppServerAmbiguousRequestError) {
+            // The write may have been accepted. Keep the same durable probe
+            // correlated so a late commentary/ACK cannot poison or duplicate
+            // the active task.
+            return
+          }
+          if (activeProgressProbe === probe) {
+            activeProgressProbe = null
+            capturedProgress = null
+            progressProbeRetryAtMs = Date.now() + progressProbeRetryMs
+          }
+          if (!(error instanceof AppServerProtocolError && error.method === 'turn/steer')) {
+            process.stderr.write(
+              `zerochan: progress query ended without acknowledgement: ${error instanceof Error ? error.message : String(error)}\n`,
+            )
+          }
+        })
+        return true
       }
 
       try {
@@ -4521,6 +4838,20 @@ export async function executeCodexJob(
           }
           const terminal = activity?.kind === 'terminal' ? activity.terminal : null
           if (terminal) {
+            // The probe is assigned by the nested cadence dispatcher, which
+            // TypeScript's local control-flow analysis cannot observe here.
+            const terminalProgressProbe = activeProgressProbe as {
+              slot: number
+              marker: string
+              threadId: string
+              turnId: string
+              clientMessageId: string
+            } | null
+            if (terminalProgressProbe) {
+              options.onProgressProbeSuperseded?.(terminalProgressProbe.slot, null)
+            }
+            activeProgressProbe = null
+            capturedProgress = null
             let reconciledTurn = terminal.turn
             finalTurn = reconciledTurn
             const rejectedSteer = rejectedSteerState.current
@@ -4620,6 +4951,12 @@ export async function executeCodexJob(
               if (!message) {
                 throw new AppServerProtocolError('completed App Server turn omitted final message')
               }
+              if (terminalProgressProbe
+                && parseCodexProgressCommentary(message, terminalProgressProbe.marker) !== null) {
+                throw new AppServerProtocolError(
+                  'progress status check terminated the active task turn instead of continuing it',
+                )
+              }
               finalTurn = acceptedTurn
               finalMessage = message
               protocolCompleted = true
@@ -4699,8 +5036,14 @@ export async function executeCodexJob(
             continue
           }
           const control = controls.next()
-          if (control) await dispatchControl(currentThreadId, currentTurnId, control)
-          else await waitForProtocolActivity()
+          if (control) {
+            await dispatchControl(currentThreadId, currentTurnId, control)
+          } else if (capturedProgress
+            && publishCapturedProgress(currentThreadId, currentTurnId)) {
+            // The exact same-turn commentary was durably handed to the host.
+          } else if (!dispatchDueProgress(currentThreadId, currentTurnId)) {
+            await waitForProtocolActivity()
+          }
         }
       } catch (error) {
         protocolError = error

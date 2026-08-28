@@ -14,10 +14,12 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  readlinkSync,
   readSync,
   realpathSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeSync,
   writeFileSync,
   type BigIntStats,
@@ -42,6 +44,11 @@ import {
 } from './process-lock.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
 import { readGatewayReadiness } from './readiness.ts'
+import {
+  readLastConnectedProject,
+  validateLaunchProject,
+  writeLastConnectedProject,
+} from './project-selection.ts'
 import {
   buildCandidateEnvironment,
   buildRuntimeServiceEnvironment,
@@ -489,6 +496,17 @@ export interface UpdateJournal {
   databasePath: string | null
   databaseBackup: string | null
   noRestart: boolean
+  launcherSnapshot?: ManagedLauncherSnapshot
+}
+
+type LauncherPathSnapshot =
+  | { kind: 'missing' }
+  | { kind: 'symlink'; target: string }
+  | { kind: 'other' }
+
+export interface ManagedLauncherSnapshot {
+  zerochan: LauncherPathSnapshot
+  zerokun: LauncherPathSnapshot
 }
 
 const decoder = new TextDecoder()
@@ -1382,6 +1400,89 @@ function journalPath(stateDir: string): string {
   return join(stateDir, 'update-transaction.json')
 }
 
+function launcherPaths(): { zerochan: string; zerokun: string } {
+  const bin = join(homedir(), '.local', 'bin')
+  return { zerochan: join(bin, 'zerochan'), zerokun: join(bin, 'zerokun') }
+}
+
+function snapshotLauncherPath(path: string): LauncherPathSnapshot {
+  try {
+    const metadata = lstatSync(path)
+    return metadata.isSymbolicLink()
+      ? { kind: 'symlink', target: readlinkSync(path) }
+      : { kind: 'other' }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'missing' }
+    throw error
+  }
+}
+
+export function snapshotManagedLaunchers(): ManagedLauncherSnapshot {
+  const paths = launcherPaths()
+  return {
+    zerochan: snapshotLauncherPath(paths.zerochan),
+    zerokun: snapshotLauncherPath(paths.zerokun),
+  }
+}
+
+function validLauncherPathSnapshot(value: unknown): value is LauncherPathSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const snapshot = value as Record<string, unknown>
+  if (snapshot.kind === 'missing' || snapshot.kind === 'other') {
+    return Object.keys(snapshot).length === 1
+  }
+  return snapshot.kind === 'symlink'
+    && typeof snapshot.target === 'string'
+    && snapshot.target.length > 0
+    && snapshot.target.length <= 4_096
+    && Object.keys(snapshot).length === 2
+}
+
+function validManagedLauncherSnapshot(value: unknown): value is ManagedLauncherSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const snapshot = value as Record<string, unknown>
+  return Object.keys(snapshot).length === 2
+    && validLauncherPathSnapshot(snapshot.zerochan)
+    && validLauncherPathSnapshot(snapshot.zerokun)
+}
+
+function restoreManagedLaunchers(snapshot: ManagedLauncherSnapshot, repoPath: string): void {
+  const paths = launcherPaths()
+  const candidateTarget = join(repoPath, 'codex-channel.sh')
+  for (const name of ['zerochan', 'zerokun'] as const) {
+    const path = paths[name]
+    const before = snapshot[name]
+    let current: LauncherPathSnapshot
+    current = snapshotLauncherPath(path)
+    if (before.kind === 'other') {
+      if (current.kind !== 'other') {
+        fail(`rollback中に既存commandの種類が変わりました: ${path}`)
+      }
+      continue
+    }
+    if (before.kind === 'missing') {
+      if (current.kind === 'missing') continue
+      if (current.kind !== 'symlink' || current.target !== candidateTarget) {
+        fail(`rollback中に無関係なcommandを検出しました: ${path}`)
+      }
+      rmSync(path)
+      continue
+    }
+    if (current.kind === 'symlink' && current.target === before.target) continue
+    if (current.kind !== 'missing'
+      && (current.kind !== 'symlink' || current.target !== candidateTarget)) {
+      fail(`rollback中に無関係なcommandを検出しました: ${path}`)
+    }
+    const temporary = `${path}.rollback-${process.pid}-${randomUUID()}`
+    try {
+      symlinkSync(before.target, temporary)
+      renameSync(temporary, path)
+    } finally {
+      rmSync(temporary, { force: true })
+    }
+  }
+}
+
 function writeJournal(stateDir: string, journal: UpdateJournal): void {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const path = journalPath(stateDir)
@@ -1434,7 +1535,9 @@ function readJournal(
     || !/^[0-9a-f]{40,64}$/.test(value.originalHead ?? '')
     || !/^[0-9a-f]{40,64}$/.test(value.targetHead ?? '')
     || !projectDirectoryMatches || value.setupScript !== expected.setupScript
-    || typeof value.noRestart !== 'boolean' || !databasePairIsValid) {
+    || typeof value.noRestart !== 'boolean' || !databasePairIsValid
+    || (value.launcherSnapshot !== undefined
+      && !validManagedLauncherSnapshot(value.launcherSnapshot))) {
     fail(`更新transaction journalが不正です: ${path}`)
   }
   return { ...value, projectDir: expected.projectDir } as UpdateJournal
@@ -2174,6 +2277,9 @@ async function rollbackUpdate(
   writeJournal(stateDir, { ...journal, phase: 'rolling-back' })
   output(`▶ 更新を ${journal.originalHead.slice(0, 12)} へロールバック`)
   await stopServices(stateDir)
+  if (journal.launcherSnapshot) {
+    restoreManagedLaunchers(journal.launcherSnapshot, journal.repoPath)
+  }
   assertRollbackState()
   requireCommand(['git', 'reset', '--hard', journal.originalHead], { cwd: journal.repoPath })
   restoreRollbackDatabase(journal)
@@ -2188,6 +2294,9 @@ async function rollbackUpdate(
     },
     timeoutMs: resolveSetupTimeoutMs(process.env, options.testing),
   })
+  if (journal.launcherSnapshot) {
+    restoreManagedLaunchers(journal.launcherSnapshot, journal.repoPath)
+  }
   if (options.restart) {
     await restartServices(journal.repoPath, stateDir, journal.projectDir)
   }
@@ -2288,6 +2397,14 @@ async function superviseStandaloneSetup(testing = false): Promise<void> {
   // the update lock; the bootstrap installs the official standalone binary.
   if (!testing) resolveUpdaterCodexBinary()
   const stateDir = prepareManagedStateRoot(resolveZeroStateDir())
+  const runningProject = runningGatewayProjectDirectory(stateDir)
+  const preservedProject = runningProject
+    ? validateLaunchProject(runningProject, {
+        runtimeRepo: rootRepo,
+        stateDir,
+      })
+    : undefined
+  if (preservedProject) writeLastConnectedProject(stateDir, preservedProject)
   const setupScript = process.env.ZEROKUN_SETUP_SCRIPT ?? join(rootRepo, 'zerokun', 'setup.sh')
   if (!existsSync(setupScript)) fail(`setup.shがありません: ${setupScript}`)
   const updateLock = acquireUpdateLock(stateDir)
@@ -2325,6 +2442,7 @@ async function superviseStandaloneSetup(testing = false): Promise<void> {
       env: {
         ...setupEnvironment,
         ZEROKUN_STATE_DIR: stateDir,
+        ...(preservedProject ? { ZEROKUN_PROJECT_DIR: preservedProject } : {}),
         ZEROKUN_UPDATE_IN_PROGRESS: '1',
       },
       signal: controller.signal,
@@ -2344,11 +2462,17 @@ export function selectUpdateProjectDirectory(
   pendingProjectDir: string | undefined,
   explicitProjectDir: string | undefined,
   runningProjectDir: string | undefined,
+  lastConnectedProjectDir?: string,
 ): string {
-  const candidate = [pendingProjectDir, runningProjectDir, explicitProjectDir]
+  const candidate = [
+    pendingProjectDir,
+    runningProjectDir,
+    lastConnectedProjectDir,
+    explicitProjectDir,
+  ]
     .find(value => typeof value === 'string' && value.trim())
   if (!candidate) {
-    fail('更新対象の作業ディレクトリを確認できません。稼働中のZeroちゃんから実行するか、ZEROKUN_PROJECT_DIRを指定してください')
+    fail('更新対象の作業ディレクトリを確認できません。対象projectへ cd して zerochan を起動してください')
   }
   let physical: string
   try {
@@ -2397,11 +2521,16 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
   // Use one physical state identity for journals, DB snapshots, candidate
   // setup, restart, and crash recovery even when an ancestor is a symlink.
   const stateDir = prepareManagedStateRoot(resolveZeroStateDir())
-  const projectDir = selectUpdateProjectDirectory(
+  const selectedProjectDir = selectUpdateProjectDirectory(
     pendingUpdateProjectDirectory(stateDir),
     process.env.ZEROKUN_PROJECT_DIR,
     runningGatewayProjectDirectory(stateDir),
+    readLastConnectedProject(stateDir)?.projectDir,
   )
+  const projectDir = validateLaunchProject(selectedProjectDir, {
+    runtimeRepo: rootRepo,
+    stateDir,
+  })
   const setupScript = process.env.ZEROKUN_SETUP_SCRIPT ?? join(rootRepo, 'zerokun', 'setup.sh')
   const waitSeconds = Number(process.env.ZEROKUN_UPDATE_WAIT_SECONDS ?? 21_600)
   if (!Number.isFinite(waitSeconds) || waitSeconds < 0) fail('ZEROKUN_UPDATE_WAIT_SECONDSが不正です')
@@ -2511,6 +2640,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       databasePath: null,
       databaseBackup: null,
       noRestart,
+      launcherSnapshot: snapshotManagedLaunchers(),
     }
     writeJournal(stateDir, journal)
     try {

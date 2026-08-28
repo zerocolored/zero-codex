@@ -69,6 +69,18 @@ async function waitForPath(path: string, timeoutMs = 5_000): Promise<void> {
   if (!existsSync(path)) throw new Error(`test path did not appear: ${path}`)
 }
 
+async function waitForRpcMethod(path: string, method: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      const rows = readFileSync(path, 'utf8').split('\n').filter(Boolean)
+      if (rows.some(line => JSON.parse(line).method === method)) return
+    }
+    await Bun.sleep(10)
+  }
+  throw new Error(`RPC method did not appear: ${method}`)
+}
+
 function fakeCodex(root: string): string {
   const executable = join(root, 'codex-fixture')
   writeFileSync(executable, `#!/usr/bin/python3
@@ -100,6 +112,7 @@ requested_thread = None
 handshake_cwd = ""
 permission_profile = ""
 steer_client_id = None
+progress_probe_count = 0
 persisted_items = {}
 
 def observe_emission(value):
@@ -305,7 +318,84 @@ for line in sys.stdin:
     elif method in ("thread/turns/list", "thread/read") and mode == "summary-stream-no-history":
         emit({"id": request_id, "error": {"code": -32000, "message": "history must not be requested"}})
     elif method == "turn/steer":
-        if mode == "phased-steer":
+        if mode == "progress-collapse":
+            progress_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
+            marker = re.search(r"\\[ZERO_PROGRESS_BEGIN:([A-F0-9]{24,64})\\]", progress_text)
+            if not marker:
+                time.sleep(0.15)
+                emit({"id": request_id, "result": {"turnId": value["params"]["expectedTurnId"]}})
+                continue
+            progress_probe_count += 1
+            token = marker.group(1)
+            status = "古い進捗です" if progress_probe_count == 1 else "最新の状況を確認しています 🔎"
+            commentary = {
+                "type": "agentMessage",
+                "id": "progress-collapse-" + str(progress_probe_count),
+                "phase": "commentary",
+                "text": "[ZERO_PROGRESS_BEGIN:" + token + "]\\n" + status + "\\n[ZERO_PROGRESS_END:" + token + "]",
+            }
+            emit({"id": request_id, "result": {"turnId": value["params"]["expectedTurnId"]}})
+            if progress_probe_count == 1:
+                time.sleep(0.05)
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": commentary}})
+                continue
+            emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": commentary}})
+            time.sleep(0.2)
+            final_item = {"type": "agentMessage", "id": "progress-collapse-final", "phase": "final_answer", "text": "完了しました ✅"}
+            emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": final_item}})
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [commentary, final_item], "error": None}}})
+        elif mode == "progress-no-ack":
+            continue
+        elif mode == "progress-reject-once":
+            progress_probe_count += 1
+            if progress_probe_count == 1:
+                emit({"id": request_id, "error": {"code": -32000, "message": "temporary progress rejection"}})
+                continue
+            progress_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
+            marker = re.search(r"\\[ZERO_PROGRESS_BEGIN:([A-F0-9]{24,64})\\]", progress_text)
+            token = marker.group(1) if marker else "MISSINGPROGRESSMARKER000000"
+            commentary = {"type": "agentMessage", "id": "progress-retry", "phase": "commentary", "text": "[ZERO_PROGRESS_BEGIN:" + token + "]\\n再試行後も作業を続けています 🛠️\\n[ZERO_PROGRESS_END:" + token + "]"}
+            final_item = {"type": "agentMessage", "id": "progress-retry-final", "phase": "final_answer", "text": "進捗再試行後に完了しました ✅"}
+            emit({"id": request_id, "result": {"turnId": value["params"]["expectedTurnId"]}})
+            emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": commentary}})
+            emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": final_item}})
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [commentary, final_item], "error": None}}})
+        elif mode in ("progress-late-ack", "progress-final-answer"):
+            progress_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
+            marker = re.search(r"\\[ZERO_PROGRESS_BEGIN:([A-F0-9]{24,64})\\]", progress_text)
+            token = marker.group(1) if marker else "MISSINGPROGRESSMARKER000000"
+            marker_text = "[ZERO_PROGRESS_BEGIN:" + token + "]\\n遅い応答でも作業を続けています 🔎\\n[ZERO_PROGRESS_END:" + token + "]"
+            if mode == "progress-late-ack":
+                time.sleep(0.08)
+            emit({"id": request_id, "result": {"turnId": value["params"]["expectedTurnId"]}})
+            phase = "final_answer" if mode == "progress-final-answer" else "commentary"
+            progress_item = {"type": "agentMessage", "id": mode, "phase": phase, "text": marker_text}
+            emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": progress_item}})
+            if mode == "progress-late-ack":
+                time.sleep(0.1)
+                final_item = {"type": "agentMessage", "id": "progress-late-final", "phase": "final_answer", "text": "遅いACKの後も完了しました ✅"}
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": final_item}})
+                items = [progress_item, final_item]
+            else:
+                items = [progress_item]
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": items, "error": None}}})
+        elif mode == "progress":
+            progress_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
+            marker = re.search(r"\\[ZERO_PROGRESS_BEGIN:([A-F0-9]{24,64})\\]", progress_text)
+            token = marker.group(1) if marker else "MISSINGPROGRESSMARKER000000"
+            commentary = {
+                "type": "agentMessage",
+                "id": "progress-commentary",
+                "phase": "commentary",
+                "text": "[ZERO_PROGRESS_BEGIN:" + token + "]\\n画面を組み立てて、動作確認へ進んでいます 🛠️\\n[ZERO_PROGRESS_END:" + token + "]",
+            }
+            emit({"id": request_id, "result": {"turnId": value["params"]["expectedTurnId"]}})
+            emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": commentary}})
+            time.sleep(0.2)
+            final_item = {"type": "agentMessage", "id": "progress-final", "phase": "final_answer", "text": "Hello Worldアプリを作成しました ✅"}
+            emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": final_item}})
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [commentary, final_item], "error": None}}})
+        elif mode == "phased-steer":
             control_log = os.environ.get("ZERO_CONTROL_LOG")
             if control_log:
                 with open(control_log, "a", encoding="utf-8") as stream:
@@ -356,7 +446,9 @@ function fixture(
     | 'late-error-after-complete' | 'late-error-coalesced'
     | 'errors-before-terminal-coalesced' | 'terminal-cancel-race'
     | 'large-ledger' | 'hang-initialize' | 'hang-turn-start'
-    | 'history-authority' | 'history-missing-final',
+    | 'history-authority' | 'history-missing-final' | 'progress' | 'progress-no-ack'
+    | 'progress-collapse' | 'progress-late-ack' | 'progress-final-answer'
+    | 'progress-reject-once',
   writeEnabled = false,
 ) {
   const root = secureRoot()
@@ -1103,6 +1195,261 @@ describe('production App Server executor', () => {
     })
     value.store.close()
   })
+
+  test('定期進捗を新turnではなく同じactive turnへsteerしてcommentaryから公開する', async () => {
+    const value = fixture('progress')
+    const rpcLog = join(value.root, 'progress-rpc.log')
+    const reports: Array<{ slot: number; elapsedMs: number; text: string }> = []
+    const activatedAtMs = Date.now()
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'progress',
+        ZERO_RPC_LOG: rpcLog,
+      },
+      progressActivatedAtMs: activatedAtMs,
+      progressScheduleForTesting: {
+        firstMs: 10,
+        secondMs: 1_000,
+        thirdMs: 2_000,
+        repeatMs: 1_000,
+      },
+      onProgressProbeStarted: () => true,
+      onProgressProbeSuperseded: () => {},
+      onProgressReport: report => { reports.push(report); return true },
+      liveControls: value.hooks,
+    })
+
+    expect(result).toEqual({
+      sessionId: 'thread-app-server-1',
+      result: 'Hello Worldアプリを作成しました ✅',
+    })
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({
+      slot: 0,
+      text: '画面を組み立てて、動作確認へ進んでいます 🛠️',
+    })
+    expect(reports[0]!.elapsedMs).toBeGreaterThanOrEqual(10)
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(rpc.map(value => value.method)).toEqual([
+      'turn/start', 'turn/steer', 'thread/items/list',
+    ])
+    expect(rpc.filter(value => value.method === 'turn/start')).toHaveLength(1)
+    expect(rpc.filter(value => value.method === 'turn/steer')).toHaveLength(1)
+    expect(rpc[1]).toMatchObject({
+      method: 'turn/steer',
+      expectedTurnId: 'turn-app-server-1',
+    })
+    value.store.close()
+  }, 15_000)
+
+  test('進捗ACKがtimeout後に届いても本体turnは正常完了する', async () => {
+    const value = fixture('progress-late-ack')
+    const reports: string[] = []
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-late-ack' },
+      progressActivatedAtMs: Date.now(),
+      progressScheduleForTesting: {
+        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+      },
+      progressSteerTimeoutMsForTesting: 20,
+      onProgressProbeStarted: () => true,
+      onProgressProbeSuperseded: () => {},
+      onProgressReport: report => { reports.push(report.text); return true },
+      liveControls: value.hooks,
+    })
+    expect(result.result).toBe('遅いACKの後も完了しました ✅')
+    expect(reports).toEqual(['遅い応答でも作業を続けています 🔎'])
+    value.store.close()
+  }, 15_000)
+
+  test('相関済み進捗rejectは同じdurable slotとclient idで再試行する', async () => {
+    const value = fixture('progress-reject-once')
+    const rpcLog = join(value.root, 'progress-reject-rpc.log')
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'progress-reject-once',
+        ZERO_RPC_LOG: rpcLog,
+      },
+      progressActivatedAtMs: Date.now(),
+      progressScheduleForTesting: {
+        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+      },
+      progressProbeRetryMsForTesting: 10,
+      onProgressProbeStarted: () => true,
+      onProgressProbeSuperseded: () => {},
+      onProgressReport: () => true,
+      liveControls: value.hooks,
+    })
+    expect(result.result).toBe('進捗再試行後に完了しました ✅')
+    const steers = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line))
+      .filter(row => row.method === 'turn/steer')
+    expect(steers).toHaveLength(2)
+    expect(steers[0].clientUserMessageId).toBe(steers[1].clientUserMessageId)
+    value.store.close()
+  }, 15_000)
+
+  test('進捗outbox staging失敗ではslotを進めず同じreportを再試行する', async () => {
+    const value = fixture('progress')
+    let stagingCalls = 0
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'progress' },
+      progressActivatedAtMs: Date.now(),
+      progressScheduleForTesting: {
+        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+      },
+      progressPublishRetryMsForTesting: 10,
+      onProgressProbeStarted: () => true,
+      onProgressProbeSuperseded: () => {},
+      onProgressReport: () => {
+        stagingCalls += 1
+        if (stagingCalls === 1) throw new Error('fixture sqlite busy')
+        return true
+      },
+      liveControls: value.hooks,
+    })
+    expect(result.result).toBe('Hello Worldアプリを作成しました ✅')
+    expect(stagingCalls).toBe(2)
+    value.store.close()
+  }, 15_000)
+
+  test('進捗確認がfinal answerでturnを閉じた場合は完了として公開しない', async () => {
+    const value = fixture('progress-final-answer')
+    await expect(executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-final-answer' },
+      progressActivatedAtMs: Date.now(),
+      progressScheduleForTesting: {
+        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+      },
+      onProgressProbeStarted: () => true,
+      onProgressProbeSuperseded: () => {},
+      onProgressReport: () => true,
+      liveControls: value.hooks,
+    })).rejects.toThrow('progress status check terminated the active task turn')
+    value.store.close()
+  }, 15_000)
+
+  test('進捗steerのACK待ち中でも同じthreadの中止を即時処理する', async () => {
+    const value = fixture('progress-no-ack')
+    const rpcLog = join(value.root, 'progress-no-ack-rpc.log')
+    const startedAt = Date.now()
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'progress-no-ack',
+        ZERO_RPC_LOG: rpcLog,
+      },
+      progressActivatedAtMs: startedAt,
+      progressScheduleForTesting: {
+        firstMs: 10,
+        secondMs: 1_000,
+        thirdMs: 2_000,
+        repeatMs: 1_000,
+      },
+      onProgressProbeStarted: () => true,
+      onProgressProbeSuperseded: () => {},
+      onProgressReport: () => true,
+      liveControls: value.hooks,
+    })
+    await waitForRpcMethod(rpcLog, 'turn/steer')
+    const target = value.store.interruptControlTarget(value.job.chatId, value.job.threadTs)
+    expect(target).not.toBeNull()
+    expect(value.store.stageLiveControl(target!, {
+      chatId: value.job.chatId,
+      threadTs: value.job.threadTs,
+      messageId: 'progress-cancel',
+      userId: 'UOTHER',
+      task: '中止',
+      kind: 'interrupt',
+    })).toBe('staged')
+    await expect(execution).rejects.toBeInstanceOf(CodexUserCancelledError)
+    expect(Date.now() - startedAt).toBeLessThan(3_000)
+    expect(readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line).method))
+      .toEqual(['turn/start', 'turn/steer', 'turn/interrupt'])
+    value.store.cancel(value.job.id)
+    value.store.close()
+  }, 15_000)
+
+  test('user返信の後に古い進捗を連投せず最新cadenceだけを公開する', async () => {
+    const value = fixture('progress-collapse')
+    const rpcLog = join(value.root, 'progress-collapse-rpc.log')
+    const reports: Array<{ slot: number; elapsedMs: number; text: string }> = []
+    // Keep activation in the near future so process startup cannot skip the
+    // first synthetic cadence boundary on a slower CI host.
+    const activatedAtMs = Date.now() + 3_000
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'progress-collapse',
+        ZERO_RPC_LOG: rpcLog,
+      },
+      progressActivatedAtMs: activatedAtMs,
+      progressScheduleForTesting: {
+        firstMs: 10,
+        secondMs: 150,
+        thirdMs: 5_000,
+        repeatMs: 1_000,
+      },
+      onProgressProbeStarted: () => true,
+      onProgressProbeSuperseded: () => {},
+      onProgressReport: report => { reports.push(report); return true },
+      liveControls: value.hooks,
+    })
+    await waitForRpcMethod(rpcLog, 'turn/steer')
+    const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
+    expect(target).not.toBeNull()
+    expect(value.store.stageLiveControl(target!, {
+      chatId: value.job.chatId,
+      threadTs: value.job.threadTs,
+      messageId: 'progress-user-steer',
+      userId: 'UOTHER',
+      task: 'そのまま続けて',
+      kind: 'steer',
+    })).toBe('staged')
+    await expect(execution).resolves.toEqual({
+      sessionId: 'thread-app-server-1',
+      result: '完了しました ✅',
+    })
+    expect(reports.map(report => ({ slot: report.slot, text: report.text }))).toEqual([{
+      slot: 1,
+      text: '最新の状況を確認しています 🔎',
+    }])
+    expect(reports[0]!.elapsedMs).toBeGreaterThanOrEqual(150)
+    expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({
+      kind: 'steer', status: 'observed', userId: 'UOTHER',
+    })
+    const methods = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line).method)
+    expect(methods.filter(method => method === 'turn/start')).toHaveLength(1)
+    expect(methods.filter(method => method === 'turn/steer')).toHaveLength(3)
+    value.store.close()
+  }, 15_000)
 
   test('同じthreadの中止をturn/interruptへ送りinterrupted terminalを要求する', async () => {
     const value = fixture('interrupt')

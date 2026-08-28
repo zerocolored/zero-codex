@@ -56,9 +56,15 @@ describe('Zero-kun watchdog', () => {
       watchdogSource.indexOf('with open(next_path', start),
     )
     expect(alertProgram).toContain('Zeroちゃんが停止しています')
+    expect(alertProgram).toContain('zerochan --restart')
+    expect(alertProgram).not.toContain('zerokun-restart')
     expect(alertProgram).not.toContain('bridge:')
     expect(alertProgram).not.toContain('job-runner:')
     expect(alertProgram).not.toContain('Codex')
+    expect(alertProgram).not.toContain('Claude')
+    expect(alertProgram).not.toContain('Grok')
+    expect(alertProgram).not.toContain('Herdr')
+    expect(alertProgram).not.toContain('App Server')
     expect(alertProgram).not.toContain('worker')
   })
 

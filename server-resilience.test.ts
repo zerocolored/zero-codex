@@ -128,10 +128,15 @@ describe('Slack bridge resilience wiring', () => {
   })
 
   test('delivery成功はSQLite commit後にだけ記録する', () => {
-    const enqueue = server.indexOf('const result = jobStore.enqueue({')
+    const enqueue = server.indexOf('jobStore.enqueue({')
+    const committed = server.indexOf(
+      'jobStore.completeInboundDelivery(inbound.idempotencyKey)',
+      enqueue,
+    )
     const delivered = server.indexOf('rememberDelivered(key)', enqueue)
     expect(enqueue).toBeGreaterThan(-1)
-    expect(delivered).toBeGreaterThan(enqueue)
+    expect(committed).toBeGreaterThan(enqueue)
+    expect(delivered).toBeGreaterThan(committed)
   })
 
   test('再起動後のdedupは独立JSONを信頼せずSQLiteへ再stage可能にする', () => {
