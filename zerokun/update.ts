@@ -2268,11 +2268,10 @@ export async function startBotInHerdr(options: {
     ZEROKUN_RELEASE_COMMIT: release,
   }
   await verifyHerdrRuntimeIdentityAsync(runtime, pinnedHerdrEnvironment)
-  requireCommand([
-    runtime.binary,
-    'pane',
-    'run',
-    runtime.paneId,
+  // Herdr 0.8.2 joins COMMAND argv with spaces before typing it into the
+  // pane. Preserve every boundary (including the bash -c trampoline) by
+  // giving Herdr one fully shell-quoted command string.
+  const paneCommand = [
     '/usr/bin/env',
     '-i',
     ...Object.entries(launchEnvironment).map(([key, value]) => `${key}=${value}`),
@@ -2283,6 +2282,13 @@ export async function startBotInHerdr(options: {
       launcher,
       projectDir: options.projectDir,
     }),
+  ].map(shellQuote).join(' ')
+  requireCommand([
+    runtime.binary,
+    'pane',
+    'run',
+    runtime.paneId,
+    paneCommand,
   ], { env: pinnedHerdrEnvironment })
 
   const maxChecks = Math.ceil(timeoutMs / 100)

@@ -266,7 +266,11 @@ function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, s
     `    printf '%s' 'tampered' > ${JSON.stringify(join(fixture.state, 'replace-token'))}`,
     '  fi',
     '  shift 3',
-    '  /usr/bin/nohup "$@" >/dev/null 2>&1 &',
+    // Herdr 0.8.2 joins COMMAND argv with spaces and lets the pane shell
+    // parse that one command line. The fixture must model that lossy API or
+    // a multi-line bash -c argv falsely appears safe in tests.
+    '  command_line="$*"',
+    '  /usr/bin/nohup /bin/bash --noprofile --norc -c "$command_line" >/dev/null 2>&1 &',
     '  exit 0',
     'fi',
     'exit 64',
