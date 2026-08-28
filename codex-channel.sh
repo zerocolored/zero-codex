@@ -25,6 +25,11 @@ unset ZEROKUN_UPDATE_TESTING ZEROKUN_SLACK_IDENTITY_TEST_APP_ID \
   ZEROKUN_SETUP_TEST_STOP_PROBE
 command -v bun >/dev/null 2>&1 || { echo "❌ bun が見つかりません。" >&2; exit 1; }
 STATE_DIR="$(zerokun_resolve_state_dir)"
+# The updater may hand this value to the launcher through an internal
+# trampoline. Capture it as a non-exported shell value before the first Bun
+# helper so Slack, advisor, runner, and gateway children never inherit it.
+REPLACE_TOKEN_VALUE="${ZEROKUN_REPLACE_TOKEN:-}"
+unset ZEROKUN_REPLACE_TOKEN
 
 case "$INVOKED_AS" in
   zerochan)
@@ -88,8 +93,8 @@ export ZEROKUN_PROJECT_DIR="$PROJECT"
 AUTHORIZED_UPDATE_RESTART=0
 if [ "${ZEROKUN_UPDATE_RESTART:-0}" = "1" ] \
    && [ -s "$REPLACE_TOKEN_FILE" ] \
-   && [ -n "${ZEROKUN_REPLACE_TOKEN:-}" ] \
-   && [ "$ZEROKUN_REPLACE_TOKEN" = "$(cat "$REPLACE_TOKEN_FILE" 2>/dev/null)" ]; then
+   && [ -n "$REPLACE_TOKEN_VALUE" ] \
+   && [ "$REPLACE_TOKEN_VALUE" = "$(cat "$REPLACE_TOKEN_FILE" 2>/dev/null)" ]; then
   AUTHORIZED_UPDATE_RESTART=1
   rm -f "$REPLACE_TOKEN_FILE"
   echo "   自己更新restartのワンタイムトークンを確認しました。" >&2
@@ -163,8 +168,8 @@ if [ -n "$existing_bridge_pid" ]; then
   if [ "$AUTHORIZED_UPDATE_RESTART" = "1" ]; then
     do_replace=1
   elif [ "${ZEROKUN_REPLACE:-0}" = "1" ] && [ -s "$REPLACE_TOKEN_FILE" ] \
-     && [ -n "${ZEROKUN_REPLACE_TOKEN:-}" ] \
-     && [ "$ZEROKUN_REPLACE_TOKEN" = "$(cat "$REPLACE_TOKEN_FILE" 2>/dev/null)" ]; then
+     && [ -n "$REPLACE_TOKEN_VALUE" ] \
+     && [ "$REPLACE_TOKEN_VALUE" = "$(cat "$REPLACE_TOKEN_FILE" 2>/dev/null)" ]; then
     do_replace=1
     rm -f "$REPLACE_TOKEN_FILE"
     echo "   自己更新のワンタイムトークンを確認しました。" >&2
@@ -288,11 +293,12 @@ start_job_runner() {
   exit 1
 }
 
-start_job_runner
-if [ -n "${ZEROKUN_REPLACE_TOKEN:-}" ] && [ -s "$REPLACE_TOKEN_FILE" ] \
-   && [ "$ZEROKUN_REPLACE_TOKEN" = "$(cat "$REPLACE_TOKEN_FILE" 2>/dev/null)" ]; then
+if [ -n "$REPLACE_TOKEN_VALUE" ] && [ -s "$REPLACE_TOKEN_FILE" ] \
+   && [ "$REPLACE_TOKEN_VALUE" = "$(cat "$REPLACE_TOKEN_FILE" 2>/dev/null)" ]; then
   rm -f "$REPLACE_TOKEN_FILE"
 fi
+REPLACE_TOKEN_VALUE=''
+start_job_runner
 cd "$PROJECT"
 echo "▶ Zeroちゃん"
 echo "   gateway : $REPO_DIR/server.ts"

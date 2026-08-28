@@ -24,7 +24,7 @@ import {
   writeFileSync,
   type BigIntStats,
 } from 'fs'
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { homedir } from 'os'
 import { dirname, join, parse, relative, resolve, sep } from 'path'
 import {
@@ -2046,6 +2046,60 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`
 }
 
+const UPDATE_RESTART_TRAMPOLINE = [
+  'set -euo pipefail',
+  '[ "$#" -eq 5 ] || { echo "restart handoff arguments are invalid" >&2; exit 64; }',
+  'replace_token_file="$1"',
+  'replace_token_digest="$2"',
+  'safe_file_helper="$3"',
+  'launcher="$4"',
+  'project="$5"',
+  '[[ "$replace_token_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "restart handoff digest is invalid" >&2; exit 65; }',
+  '[ "$(/usr/bin/stat -f %Lp "$replace_token_file" 2>/dev/null)" = 600 ] || { echo "restart handoff token mode is unsafe" >&2; exit 66; }',
+  'if ! replace_token_with_sentinel="$(bun --config=/dev/null --no-env-file "$safe_file_helper" read-owned-regular "$replace_token_file" 2>/dev/null; status=$?; [ "$status" -eq 0 ] || exit "$status"; /usr/bin/printf .)"; then',
+  '  echo "restart handoff token is unavailable or unsafe" >&2',
+  '  exit 67',
+  'fi',
+  'replace_token="${replace_token_with_sentinel%.}"',
+  'unset replace_token_with_sentinel',
+  '[[ "$replace_token" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || { echo "restart handoff token is invalid" >&2; exit 68; }',
+  'replace_token_actual_digest="$(/usr/bin/printf %s "$replace_token" | /usr/bin/shasum -a 256)" || { echo "restart handoff digest failed" >&2; exit 69; }',
+  'replace_token_actual_digest="${replace_token_actual_digest%% *}"',
+  '[ "$replace_token_actual_digest" = "$replace_token_digest" ] || { echo "restart handoff token changed" >&2; exit 70; }',
+  'export ZEROKUN_REPLACE_TOKEN="$replace_token"',
+  'unset replace_token replace_token_actual_digest replace_token_digest',
+  'exec "$launcher" "$project"',
+].join('\n')
+
+export function updateRestartTokenDigest(token: string): string {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(token)) {
+    throw new Error('update restart token is invalid')
+  }
+  return createHash('sha256').update(token).digest('hex')
+}
+
+function updateRestartTrampolineArguments(options: {
+  rootRepo: string
+  replaceTokenFile: string
+  replaceToken: string
+  launcher: string
+  projectDir: string
+}): string[] {
+  return [
+    '/bin/bash',
+    '--noprofile',
+    '--norc',
+    '-c',
+    UPDATE_RESTART_TRAMPOLINE,
+    'zerokun-update-restart',
+    options.replaceTokenFile,
+    updateRestartTokenDigest(options.replaceToken),
+    join(options.rootRepo, 'zerokun', 'safe-file.ts'),
+    options.launcher,
+    options.projectDir,
+  ]
+}
+
 function resolveTmuxPath(): string {
   const configured = process.env.ZEROKUN_TMUX_PATH
   if (configured && existsSync(configured)) return configured
@@ -2112,15 +2166,19 @@ export async function startBotInTmux(options: {
       ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1') ? '1' : '0',
     ZEROKUN_STATE_DIR: stateDir,
     ZEROKUN_PROJECT_DIR: options.projectDir,
-    ZEROKUN_REPLACE_TOKEN: replaceToken,
     ZEROKUN_REPLACE_TOKEN_FILE: replaceTokenFile,
     ZEROKUN_RELEASE_COMMIT: release,
   }
   const launchCommand = [
     'exec /usr/bin/env -i',
     ...Object.entries(launchEnvironment).map(([key, value]) => `${key}=${shellQuote(value)}`),
-    shellQuote(launcher),
-    shellQuote(options.projectDir),
+    ...updateRestartTrampolineArguments({
+      rootRepo: options.rootRepo,
+      replaceTokenFile,
+      replaceToken,
+      launcher,
+      projectDir: options.projectDir,
+    }).map(shellQuote),
   ].join(' ')
 
   requireCommand([
@@ -2206,7 +2264,6 @@ export async function startBotInHerdr(options: {
       ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1') ? '1' : '0',
     ZEROKUN_STATE_DIR: options.stateDir,
     ZEROKUN_PROJECT_DIR: options.projectDir,
-    ZEROKUN_REPLACE_TOKEN: replaceToken,
     ZEROKUN_REPLACE_TOKEN_FILE: replaceTokenFile,
     ZEROKUN_RELEASE_COMMIT: release,
   }
@@ -2219,8 +2276,13 @@ export async function startBotInHerdr(options: {
     '/usr/bin/env',
     '-i',
     ...Object.entries(launchEnvironment).map(([key, value]) => `${key}=${value}`),
-    launcher,
-    options.projectDir,
+    ...updateRestartTrampolineArguments({
+      rootRepo: options.rootRepo,
+      replaceTokenFile,
+      replaceToken,
+      launcher,
+      projectDir: options.projectDir,
+    }),
   ], { env: pinnedHerdrEnvironment })
 
   const maxChecks = Math.ceil(timeoutMs / 100)

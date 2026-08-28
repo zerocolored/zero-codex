@@ -36,6 +36,7 @@ import {
   selectUpdateProjectDirectory,
   setupTimeoutBudgetMs,
   stageVerifiedCandidateCodex,
+  updateRestartTokenDigest,
   validateResolvedCandidatePermissionOverrides,
   restoreRollbackDatabase,
   startBotInHerdr,
@@ -121,6 +122,7 @@ function makeRepo(base: string) {
   must(['git', 'config', 'user.email', 'test@example.com'], seed)
   must(['git', 'config', 'user.name', 'test'], seed)
   mkdirSync(join(seed, 'zerokun'))
+  copyFileSync(join(import.meta.dir, 'safe-file.ts'), join(seed, 'zerokun', 'safe-file.ts'))
   const lockSource = [
     "import { mkdirSync, writeFileSync } from 'fs'",
     "import { dirname } from 'path'",
@@ -259,6 +261,10 @@ function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, s
     '  exit 0',
     'fi',
     'if [ "$1" = pane ] && [ "$2" = run ]; then',
+    `  printf '%s\\n' "$@" > ${JSON.stringify(join(fixture.base, 'herdr-pane-run.argv'))}`,
+    `  if [ -f ${JSON.stringify(join(fixture.base, 'tamper-restart-token'))} ]; then`,
+    `    printf '%s' 'tampered' > ${JSON.stringify(join(fixture.state, 'replace-token'))}`,
+    '  fi',
     '  shift 3',
     '  /usr/bin/nohup "$@" >/dev/null 2>&1 &',
     '  exit 0',
@@ -365,6 +371,12 @@ function spawnStandaloneSetup(
 }
 
 describe('updater helpers', () => {
+  test('restart tokenはUUID v4を非可逆digestへ固定する', () => {
+    expect(updateRestartTokenDigest('12345678-1234-4abc-8def-123456789abc'))
+      .toBe('18f443da50efc9b4678c160f4fc63e6d303daf8c919e60baa97875a2b1332fc6')
+    expect(() => updateRestartTokenDigest('not-a-token')).toThrow('invalid')
+  })
+
   test('security-sensitive stagingはcaller TMPDIRを無視してroot-owned sticky parentを使う', () => {
     const hostile = fixtureDir()
     chmodSync(hostile, 0o777)
@@ -1068,7 +1080,9 @@ describe('updater helpers', () => {
     const observedEnvironment = join(base, 'launch-environment-observed')
     const launcher = join(root, 'codex-channel.sh')
     mkdirSync(root)
+    mkdirSync(join(root, 'zerokun'))
     mkdirSync(project)
+    copyFileSync(join(import.meta.dir, 'safe-file.ts'), join(root, 'zerokun', 'safe-file.ts'))
     writeFileSync(
       launcher,
       '#!/bin/bash\nprintf \'%s|%s|%s|%s\\n\' "$ZEROKUN_LEGACY_CUTOVER" "${ZEROKUN_JOB_DB:-}" "${ZEROKUN_SETUP_SCRIPT:-}" "${SLACK_BOT_TOKEN:-}" > "$ZEROKUN_STATE_DIR/launch-environment-observed"\necho gateway-started\nsleep 30\n',
@@ -1084,6 +1098,7 @@ describe('updater helpers', () => {
     process.env.ZEROKUN_SETUP_SCRIPT = '/stale/setup.sh'
     process.env.SLACK_BOT_TOKEN = 'xoxb-stale-not-real'
     try {
+      const replaceTokenFile = join(base, 'replace-token')
       const panePid = await startBotInTmux({
         rootRepo: root,
         projectDir: project,
@@ -1091,11 +1106,17 @@ describe('updater helpers', () => {
         sessionName: session,
         startupTimeoutMs: 2_000,
         tmuxPath: tmux.stdout.toString().trim(),
-        replaceTokenFile: join(base, 'replace-token'),
+        replaceTokenFile,
         legacyCutover: true,
       })
       expect(panePid).toBeGreaterThan(0)
       expect(Bun.spawnSync([tmux.stdout.toString().trim(), 'has-session', '-t', session]).exitCode).toBe(0)
+      const replaceToken = readFileSync(replaceTokenFile, 'utf8')
+      const paneCommand = must([
+        tmux.stdout.toString().trim(), 'list-panes', '-t', session, '-F', '#{pane_start_command}',
+      ])
+      expect(paneCommand).not.toContain(replaceToken)
+      expect(paneCommand).toContain(updateRestartTokenDigest(replaceToken))
       for (let attempt = 0; attempt < 100 && !existsSync(observedEnvironment); attempt += 1) {
         await Bun.sleep(20)
       }
@@ -1135,7 +1156,42 @@ describe('updater helpers', () => {
       ) as { paneId?: unknown; terminalId?: unknown }
       expect(marker.paneId).toBe('wT:p1')
       expect(marker.terminalId).toBe('term_abcdef012345')
+      const replaceToken = readFileSync(join(fixture.state, 'replace-token'), 'utf8')
+      const paneRunArguments = readFileSync(join(fixture.base, 'herdr-pane-run.argv'), 'utf8')
+      expect(paneRunArguments).not.toContain(replaceToken)
+      expect(paneRunArguments.split('\n').some(line => line.startsWith('ZEROKUN_REPLACE_TOKEN=')))
+        .toBe(false)
+      expect(paneRunArguments).toContain(updateRestartTokenDigest(replaceToken))
       rememberFixtureServices(fixture.state)
+    } finally {
+      for (const key of herdrKeys) {
+        const value = previous[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  test('Herdr restart tokenが起動直前に変わればdigest不一致でgatewayを起動しない', async () => {
+    const fixture = updaterFixture()
+    chmodSync(fixture.state, 0o700)
+    const environment = serviceUpdaterEnvironment(fixture, 'unused-fixture-session')
+    writeFileSync(join(fixture.base, 'tamper-restart-token'), '1')
+    const herdrKeys = [
+      'HERDR_ENV', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'HERDR_PANE_ID',
+      'HERDR_TAB_ID', 'HERDR_TERMINAL_ID', 'HERDR_WORKSPACE_ID',
+    ] as const
+    const previous = Object.fromEntries(herdrKeys.map(key => [key, process.env[key]]))
+    for (const key of herdrKeys) process.env[key] = environment[key]
+    try {
+      await expect(startBotInHerdr({
+        rootRepo: fixture.repo.local,
+        stateDir: fixture.state,
+        projectDir: fixture.project,
+        startupTimeoutMs: 1_000,
+      })).rejects.toThrow('Herdr再起動')
+      expect(existsSync(join(fixture.state, 'plugin.lock'))).toBe(false)
+      expect(readFileSync(join(fixture.state, 'replace-token'), 'utf8')).toBe('tampered')
     } finally {
       for (const key of herdrKeys) {
         const value = previous[key]

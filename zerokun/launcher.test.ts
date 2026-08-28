@@ -205,7 +205,6 @@ async function runLauncher(
     ...(launch.args ?? (launch.invokedAs ? [] : [join(dirname(state), 'project')])),
   ], {
     env: {
-      ...processEnvWithout('ZEROKUN_REPLACE_TOKEN'),
       HOME: state,
       PATH: `${fakeBin}:/usr/bin:/bin`,
       HERDR_BIN_PATH: herdr,
@@ -227,14 +226,6 @@ async function runLauncher(
     child.exited,
   ])
   return { exitCode, output: `${stdout}\n${stderr}` }
-}
-
-function processEnvWithout(key: string): Record<string, string> {
-  const environment: Record<string, string> = {}
-  for (const [name, value] of Object.entries(process.env)) {
-    if (name !== key && value !== undefined) environment[name] = value
-  }
-  return environment
 }
 
 describe('codex-channel.sh replacement guard', () => {
@@ -271,11 +262,26 @@ describe('codex-channel.sh replacement guard', () => {
   test('legacy zerokunはlast recordがない初回も現在のGit directoryで起動できる', async () => {
     const state = fixture()
     const project = realpathSync(join(dirname(state), 'project'))
-    const result = await runLauncher(state, {
-      ZEROKUN_DRY_RUN: '1',
-    }, undefined, { invokedAs: 'zerokun', cwd: project })
+    const ambientProject = join(dirname(state), 'ambient-project')
+    mkdirSync(ambientProject)
+    const initialized = Bun.spawnSync(['git', 'init', '-q', ambientProject], {
+      stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(initialized.exitCode, initialized.stderr.toString()).toBe(0)
+    const previousProject = process.env.ZEROKUN_PROJECT_DIR
+    process.env.ZEROKUN_PROJECT_DIR = ambientProject
+    let result: Awaited<ReturnType<typeof runLauncher>>
+    try {
+      result = await runLauncher(state, {
+        ZEROKUN_DRY_RUN: '1',
+      }, undefined, { invokedAs: 'zerokun', cwd: project })
+    } finally {
+      if (previousProject === undefined) delete process.env.ZEROKUN_PROJECT_DIR
+      else process.env.ZEROKUN_PROJECT_DIR = previousProject
+    }
     expect(result.exitCode, result.output).toBe(0)
     expect(result.output).toContain(`対象project: ${project}`)
+    expect(result.output).not.toContain(`対象project: ${realpathSync(ambientProject)}`)
     expect(result.output).not.toContain('前回接続したprojectを確認できません')
   })
 
@@ -519,6 +525,7 @@ describe('codex-channel.sh replacement guard', () => {
     const state = fixture()
     const tokenFile = join(state, 'replace-token')
     const bunLog = join(state, 'bun.log')
+    const environmentLog = join(state, 'environment.log')
     writeFileSync(join(state, 'update-transaction.json'), '{}')
     writeFileSync(tokenFile, 'restart-once')
     const result = await runLauncher(state, {
@@ -527,11 +534,14 @@ describe('codex-channel.sh replacement guard', () => {
       ZEROKUN_REPLACE_TOKEN_FILE: tokenFile,
       ZEROKUN_DRY_RUN: '1',
       FAKE_BUN_LOG: bunLog,
+      FAKE_ENV_LOG: environmentLog,
     })
     expect(result.exitCode).toBe(0)
     expect(result.output).toContain('自己更新restartのワンタイムトークンを確認しました')
     expect(existsSync(tokenFile)).toBe(false)
     expect(readFileSync(bunLog, 'utf8')).not.toContain('recover-only')
+    expect(readFileSync(environmentLog, 'utf8'))
+      .not.toContain('ZEROKUN_REPLACE_TOKEN=restart-once')
   })
 
   test('tokenなしではjournalを無視できずrecover-onlyを呼ぶ', async () => {
