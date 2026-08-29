@@ -308,7 +308,7 @@ Options:
   --slack-app-name NAME Slack上で表示するApp名（35文字以内）
   --slack-bot-name NAME bot username（英小文字・数字・-・_・.のみ）
   --repo-dir PATH       zeroリポの配置先
-  --project-dir PATH    初期workspace／初期channel routeに使うrepository
+  --project-dir PATH    初期workspace／DMのdefault projectに使うrepository
   -h, --help            このヘルプを表示
 
 通常実行はCodexを使える状態まで完了して終了します。Slack設定は後から
@@ -1399,7 +1399,7 @@ configure_access() {
   ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file \
     "$REPO_DIR/zerokun/access.ts" status >/dev/null \
     || fail "access.jsonを読み取れませんでした"
-  ok "チャンネルはZeroちゃんを招待すると自動で利用できます（新規依頼はメンション）"
+  ok "チャンネルは招待後、対象projectの zerochan set slack-channel <ID> で紐付けます"
   echo "   DMは初回メッセージで表示されるcodeを zerochan-access pair <code> へ渡します。"
 }
 
@@ -1576,7 +1576,7 @@ main() {
     # any runner/gateway tied to the previous Codex Slack App on this PC.
     run_setup
     section "Slack設定完了"
-    echo "   Herdrの専用paneで対象projectへ cd して実行: zerochan"
+    echo "   対象projectへ cd して zerochan set slack-channel <ID>、Herdrの専用paneで zerochan"
     return
   fi
 
@@ -1607,7 +1607,7 @@ main() {
   if [ "$WITH_SLACK" = "1" ]; then
     configure_slack
     section "Slack設定完了"
-    echo "   Slack Appを対象チャンネルへ招待後、Herdrの専用paneで対象projectへ cd して実行: zerochan"
+    echo "   Slack Appを招待後、対象projectで zerochan set slack-channel <ID>、Herdrの専用paneで zerochan"
   else
     warn "Slack設定は後回しにしました。Codexの利用には不要です"
     echo "   後からSlack設定だけ行う:"

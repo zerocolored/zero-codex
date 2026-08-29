@@ -54,6 +54,31 @@ function startGateway(state: string): Bun.Subprocess {
   return process
 }
 
+function startRunner(state: string): Bun.Subprocess {
+  const runner = join(state, 'job-runner.ts')
+  writeFileSync(runner, '#!/bin/bash\nsleep 30\n')
+  chmodSync(runner, 0o700)
+  const process = Bun.spawn(['/bin/bash', runner, 'daemon'], {
+    stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+  })
+  processes.push(process)
+  const lockDir = join(state, 'job-runner.lock')
+  mkdirSync(lockDir, { mode: 0o700 })
+  const lock = join(lockDir, 'pid')
+  writeFileSync(lock, `${process.pid}\n`)
+  const started = Bun.spawnSync(['/bin/ps', '-o', 'lstart=', '-p', String(process.pid)], {
+    stdout: 'pipe',
+  }).stdout.toString().trim()
+  writeFileSync(`${lock}.identity`, JSON.stringify({
+    pid: process.pid, started, nonce: 'abcdefab-cdef-4abc-8def-abcdefabcdef',
+  }))
+  writeFileSync(
+    join(lockDir, 'runtime'),
+    `zerokun-codex-runner-v1:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}\n`,
+  )
+  return process
+}
+
 async function stopFixturePid(path: string): Promise<void> {
   if (!existsSync(path)) return
   const pid = Number(readFileSync(path, 'utf8').trim())
@@ -127,7 +152,7 @@ async function runLauncher(
       '  exit 0',
       'fi',
       'if [[ "$*" == *herdr-runtime.ts*runtime-id* ]]; then',
-      '  printf "%064d\\n" 0',
+      '  echo "${FAKE_HERDR_RUNTIME_ID:-' + '0'.repeat(64) + '}"',
       '  exit 0',
       'fi',
       'if [[ "$*" == *process-identity-check.ts* ]]; then',
@@ -141,6 +166,12 @@ async function runLauncher(
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
       'if [[ "$*" == *project-selection.ts* ]]; then',
+      `  exec ${JSON.stringify(process.execPath)} "$@"`,
+      'fi',
+      'if [[ "$*" == *project-channel-config.ts* ]]; then',
+      `  exec ${JSON.stringify(process.execPath)} "$@"`,
+      'fi',
+      'if [[ "$*" == *readiness.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
       'if [[ "$*" == *runner-launcher.ts* ]]; then',
@@ -198,7 +229,7 @@ async function runLauncher(
   let launcherPath = LAUNCHER
   if (launch.invokedAs) {
     launcherPath = join(state, launch.invokedAs)
-    symlinkSync(LAUNCHER, launcherPath)
+    if (!existsSync(launcherPath)) symlinkSync(LAUNCHER, launcherPath)
   }
   const child = Bun.spawn([
     '/bin/bash', launcherPath,
@@ -229,6 +260,87 @@ async function runLauncher(
 }
 
 describe('codex-channel.sh replacement guard', () => {
+  test('zerochan set/unset/statusはcurrent projectのlocal channel設定を操作する', async () => {
+    const state = fixture()
+    const project = realpathSync(join(dirname(state), 'project'))
+    const bunLog = join(state, 'management-bun.log')
+    const set = await runLauncher(state, { FAKE_BUN_LOG: bunLog }, undefined, {
+      invokedAs: 'zerochan', cwd: project,
+      args: ['set', 'slack-channel', 'c0123456789'],
+    })
+    expect(set.exitCode, set.output).toBe(0)
+    expect(set.output).toContain('設定しました: C0123456789')
+    expect(JSON.parse(readFileSync(join(project, '.zerochan', 'config.json'), 'utf8')))
+      .toEqual({ version: 1, slackChannels: ['C0123456789'] })
+    const managementCalls = readFileSync(bunLog, 'utf8')
+    expect(managementCalls).not.toContain('verify-file')
+    expect(managementCalls).not.toContain('codex-executor.ts verify-system-config')
+    expect(managementCalls).not.toContain('herdr-runtime.ts runtime-id')
+
+    const status = await runLauncher(state, {}, undefined, {
+      invokedAs: 'zerochan', cwd: project, args: ['status'],
+    })
+    expect(status.exitCode, status.output).toBe(0)
+    expect(status.output).toContain('Slackチャンネル: C0123456789')
+
+    const unset = await runLauncher(state, {}, undefined, {
+      invokedAs: 'zerochan', cwd: project,
+      args: ['unset', 'slack-channel', 'C0123456789'],
+    })
+    expect(unset.exitCode, unset.output).toBe(0)
+    expect(unset.output).toContain('解除しました: C0123456789')
+    expect(JSON.parse(readFileSync(join(project, '.zerochan', 'config.json'), 'utf8')))
+      .toEqual({ version: 1, slackChannels: [] })
+  })
+
+  test('旧gateway稼働中はchannel設定を変更せずrestartを案内する', async () => {
+    const state = fixture()
+    const project = realpathSync(join(dirname(state), 'project'))
+    const gateway = startGateway(state)
+    const bunLog = join(state, 'management-old-gateway.log')
+    await Bun.sleep(100)
+
+    const result = await runLauncher(state, { FAKE_BUN_LOG: bunLog }, undefined, {
+      invokedAs: 'zerochan', cwd: project,
+      args: ['set', 'slack-channel', 'C0123456789'],
+    })
+
+    expect(result.exitCode, result.output).toBe(1)
+    expect(result.output).toContain('Slackチャンネル紐付けに未対応')
+    expect(result.output).toContain('zerochan --restart')
+    expect(existsSync(join(project, '.zerochan', 'config.json'))).toBe(false)
+    expect(readFileSync(bunLog, 'utf8')).not.toContain('project-channel-config.ts set')
+    expect(() => process.kill(gateway.pid, 0)).not.toThrow()
+  })
+
+  test('2つ目のzerochanは互換gateway/runnerを停止せず共有登録して終了する', async () => {
+    const state = fixture()
+    const project = realpathSync(join(dirname(state), 'project'))
+    const gateway = startGateway(state)
+    const runner = startRunner(state)
+    writeFileSync(join(state, 'gateway-ready.json'), JSON.stringify({
+      runtime: 'codex',
+      pid: gateway.pid,
+      connectedAt: Date.now(),
+      release: 'fixture',
+      projectDir: project,
+      channelRoutingVersion: 1,
+      slackAppId: 'A0123456789',
+    }), { mode: 0o600 })
+    await Bun.sleep(100)
+
+    const result = await runLauncher(state, {
+      FAKE_HERDR_RUNTIME_ID: '1'.repeat(64),
+    }, undefined, {
+      invokedAs: 'zerochan', cwd: project,
+    })
+    expect(result.exitCode, result.output).toBe(0)
+    expect(result.output).toContain('既存のZeroちゃんを共用します')
+    expect(result.output).toContain(`gateway: PID ${gateway.pid} / runner: PID ${runner.pid}`)
+    expect(() => process.kill(gateway.pid, 0)).not.toThrow()
+    expect(() => process.kill(runner.pid, 0)).not.toThrow()
+  })
+
   test('zerochanはstale exportを無視して実行した物理Git directoryを選ぶ', async () => {
     const state = fixture()
     const project = join(dirname(state), 'project')
@@ -528,20 +640,27 @@ describe('codex-channel.sh replacement guard', () => {
     const environmentLog = join(state, 'environment.log')
     writeFileSync(join(state, 'update-transaction.json'), '{}')
     writeFileSync(tokenFile, 'restart-once')
-    const result = await runLauncher(state, {
-      ZEROKUN_UPDATE_RESTART: '1',
-      ZEROKUN_REPLACE_TOKEN: 'restart-once',
-      ZEROKUN_REPLACE_TOKEN_FILE: tokenFile,
-      ZEROKUN_DRY_RUN: '1',
-      FAKE_BUN_LOG: bunLog,
-      FAKE_ENV_LOG: environmentLog,
-    })
-    expect(result.exitCode).toBe(0)
-    expect(result.output).toContain('自己更新restartのワンタイムトークンを確認しました')
-    expect(existsSync(tokenFile)).toBe(false)
-    expect(readFileSync(bunLog, 'utf8')).not.toContain('recover-only')
-    expect(readFileSync(environmentLog, 'utf8'))
-      .not.toContain('ZEROKUN_REPLACE_TOKEN=restart-once')
+    try {
+      const result = await runLauncher(state, {
+        ZEROKUN_UPDATE_RESTART: '1',
+        ZEROKUN_REPLACE_TOKEN: 'restart-once',
+        ZEROKUN_REPLACE_TOKEN_FILE: tokenFile,
+        ZEROKUN_RUNNER_STARTUP_ATTEMPTS: '80',
+        FAKE_BUN_LOG: bunLog,
+        FAKE_ENV_LOG: environmentLog,
+      })
+      expect(result.exitCode, result.output).toBe(0)
+      expect(result.output).toContain('自己更新restartのワンタイムトークンを確認しました')
+      expect(existsSync(tokenFile)).toBe(false)
+      const calls = readFileSync(bunLog, 'utf8')
+      expect(calls).not.toContain('recover-only')
+      expect(calls).not.toContain('project-channel-config.ts sync')
+      expect(readFileSync(environmentLog, 'utf8'))
+        .not.toContain('ZEROKUN_REPLACE_TOKEN=restart-once')
+    } finally {
+      await stopFixturePid(join(state, 'fake-starter-pid'))
+      await stopFixturePid(join(state, 'fake-runner-pid'))
+    }
   })
 
   test('tokenなしではjournalを無視できずrecover-onlyを呼ぶ', async () => {

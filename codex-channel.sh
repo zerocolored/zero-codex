@@ -30,19 +30,33 @@ STATE_DIR="$(zerokun_resolve_state_dir)"
 # helper so Slack, advisor, runner, and gateway children never inherit it.
 REPLACE_TOKEN_VALUE="${ZEROKUN_REPLACE_TOKEN:-}"
 unset ZEROKUN_REPLACE_TOKEN
+LAUNCH_MODE="start"
+CHANNEL_ID=""
 
 case "$INVOKED_AS" in
   zerochan)
     if [ "$#" -eq 0 ]; then
       PROJECT="$(pwd -P)"
     elif [ "$#" -eq 1 ] && [ "$1" = "--restart" ]; then
+      LAUNCH_MODE="restart"
       PROJECT="$(bun --config=/dev/null --no-env-file \
         "$REPO_DIR/zerokun/project-selection.ts" read-last "$STATE_DIR")" || {
         echo "❌ 前回接続したprojectを確認できません。対象projectへ cd して zerochan を実行してください。" >&2
         exit 1
       }
+    elif [ "$#" -eq 3 ] && [ "$1" = "set" ] && [ "$2" = "slack-channel" ]; then
+      LAUNCH_MODE="set-channel"
+      CHANNEL_ID="$3"
+      PROJECT="$(pwd -P)"
+    elif [ "$#" -eq 3 ] && [ "$1" = "unset" ] && [ "$2" = "slack-channel" ]; then
+      LAUNCH_MODE="unset-channel"
+      CHANNEL_ID="$3"
+      PROJECT="$(pwd -P)"
+    elif [ "$#" -eq 1 ] && [ "$1" = "status" ]; then
+      LAUNCH_MODE="status"
+      PROJECT="$(pwd -P)"
     else
-      echo "使い方: zerochan または zerochan --restart" >&2
+      echo "使い方: zerochan | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel <channel-id> | zerochan status" >&2
       exit 2
     fi
     ;;
@@ -80,6 +94,8 @@ LOCK_FILE="$STATE_DIR/plugin.lock"
 REPLACE_TOKEN_FILE="${ZEROKUN_REPLACE_TOKEN_FILE:-$STATE_DIR/replace-token}"
 JOB_RUNNER="$REPO_DIR/zerokun/job-runner.ts"
 RUNNER_LAUNCHER="$REPO_DIR/zerokun/runner-launcher.ts"
+CHANNEL_CONFIG="$REPO_DIR/zerokun/project-channel-config.ts"
+READY_FILE="$STATE_DIR/gateway-ready.json"
 JOB_RUNNER_PID="$STATE_DIR/job-runner.lock/pid"
 JOB_RUNNER_RUNTIME="$STATE_DIR/job-runner.lock/runtime"
 JOB_RUNNER_LOG="$STATE_DIR/job-runner.log"
@@ -89,6 +105,61 @@ EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1"
 export ZEROKUN_STATE_DIR="$STATE_DIR"
 export ZEROKUN_JOB_DB="$JOB_DB"
 export ZEROKUN_PROJECT_DIR="$PROJECT"
+
+RUNNER_RUNTIME_ID="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-identity.ts" runtime-id-file "$STATE_DIR/.env")" \
+  || { echo "❌ Slack token pair identityを確定できませんでした。既存processは停止しません。" >&2; exit 1; }
+SLACK_APP_ID="${RUNNER_RUNTIME_ID%%:*}"
+case "$SLACK_APP_ID" in
+  A*[!A-Z0-9]*|A) echo "❌ Slack App identityが不正です。" >&2; exit 1 ;;
+  A*) ;;
+  *) echo "❌ Slack App identityが不正です。" >&2; exit 1 ;;
+esac
+
+process_command_is() {
+  local pid="$1" pattern="$2"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+    && ps -o command= -p "$pid" 2>/dev/null | grep -Eq "$pattern"
+}
+
+lock_process_is() {
+  local lock_file="$1" pid="$2" pattern="$3"
+  process_command_is "$pid" "$pattern" || return 1
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-identity-check.ts" "$lock_file" "$pid" "$pattern"
+}
+
+require_route_capable_gateway_if_running() {
+  local gateway_pid=""
+  [ -f "$LOCK_FILE" ] || return 0
+  gateway_pid="$(tr -d '[:space:]' < "$LOCK_FILE" 2>/dev/null || true)"
+  process_command_is "$gateway_pid" 'server\.ts' || return 0
+  lock_process_is "$LOCK_FILE" "$gateway_pid" 'server\.ts' || {
+    echo "❌ 稼働中gatewayのlock identityを検証できません。設定は変更しません。" >&2
+    return 1
+  }
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/readiness.ts" \
+    can-share "$READY_FILE" "$gateway_pid" "$SLACK_APP_ID" || {
+    echo "❌ 稼働中のZeroちゃんはSlackチャンネル紐付けに未対応です。設定は変更しません。" >&2
+    echo "   zerochan --restart でZeroちゃんを更新してから、もう一度実行してください。" >&2
+    return 1
+  }
+}
+
+case "$LAUNCH_MODE" in
+  set-channel)
+    require_route_capable_gateway_if_running || exit 1
+    exec bun --config=/dev/null --no-env-file "$CHANNEL_CONFIG" \
+      set "$PROJECT" "$STATE_DIR" "$SLACK_APP_ID" "$CHANNEL_ID"
+    ;;
+  unset-channel)
+    require_route_capable_gateway_if_running || exit 1
+    exec bun --config=/dev/null --no-env-file "$CHANNEL_CONFIG" \
+      unset "$PROJECT" "$STATE_DIR" "$SLACK_APP_ID" "$CHANNEL_ID"
+    ;;
+  status)
+    exec bun --config=/dev/null --no-env-file "$CHANNEL_CONFIG" \
+      status "$PROJECT" "$STATE_DIR" "$SLACK_APP_ID"
+    ;;
+esac
 
 AUTHORIZED_UPDATE_RESTART=0
 if [ "${ZEROKUN_UPDATE_RESTART:-0}" = "1" ] \
@@ -105,8 +176,6 @@ fi
 # launcher use that did not pass through bootstrap's interactive Slack setup.
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-identity.ts" verify-file "$STATE_DIR/.env" \
   || { echo "❌ Slack Bot/App token identityを検証できませんでした。既存processは停止しません。" >&2; exit 1; }
-RUNNER_RUNTIME_ID="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-identity.ts" runtime-id-file "$STATE_DIR/.env")" \
-  || { echo "❌ Slack token pair identityを確定できませんでした。既存processは停止しません。" >&2; exit 1; }
 EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1:$RUNNER_RUNTIME_ID"
 
 if [ -f "$STATE_DIR/update-transaction.json" ] && [ "$AUTHORIZED_UPDATE_RESTART" != "1" ]; then
@@ -137,17 +206,10 @@ EXPECTED_RUNNER_RUNTIME="$EXPECTED_RUNNER_RUNTIME:$HERDR_RUNTIME_ID"
 [ -d "$PROJECT" ] || { echo "❌ 作業ディレクトリがありません: $PROJECT" >&2; exit 1; }
 [ -f "$REPO_DIR/server.ts" ] || { echo "❌ server.ts がありません: $REPO_DIR" >&2; exit 1; }
 
-process_command_is() {
-  local pid="$1" pattern="$2"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
-    && ps -o command= -p "$pid" 2>/dev/null | grep -Eq "$pattern"
-}
-
-lock_process_is() {
-  local lock_file="$1" pid="$2" pattern="$3"
-  process_command_is "$pid" "$pattern" || return 1
-  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-identity-check.ts" "$lock_file" "$pid" "$pattern"
-}
+if [ "${ZEROKUN_DRY_RUN:-0}" != "1" ] && [ "$AUTHORIZED_UPDATE_RESTART" != "1" ]; then
+  bun --config=/dev/null --no-env-file "$CHANNEL_CONFIG" \
+    sync "$PROJECT" "$STATE_DIR" "$SLACK_APP_ID" || exit 1
+fi
 
 existing_bridge_pid=""
 if [ -f "$LOCK_FILE" ]; then
@@ -163,6 +225,36 @@ if [ -f "$LOCK_FILE" ]; then
 fi
 
 if [ -n "$existing_bridge_pid" ]; then
+  existing_runner_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_PID" 2>/dev/null || true)"
+  existing_runner_runtime="$(tr -d '[:space:]' < "$JOB_RUNNER_RUNTIME" 2>/dev/null || true)"
+  shared_runner_runtime=0
+  case "$existing_runner_runtime" in
+    "zerokun-codex-runner-v1:$RUNNER_RUNTIME_ID:"*) shared_runner_runtime=1 ;;
+  esac
+  if [ "$LAUNCH_MODE" = "start" ] && [ "$INVOKED_AS" = "zerochan" ] \
+     && bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/readiness.ts" \
+       can-share "$READY_FILE" "$existing_bridge_pid" "$SLACK_APP_ID" \
+     && bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/herdr-runtime.ts" \
+       verify-control-plane "$STATE_DIR" >/dev/null \
+     && lock_process_is "$JOB_RUNNER_PID" "$existing_runner_pid" 'job-runner\.ts[[:space:]]+daemon' \
+     && [ "$shared_runner_runtime" = "1" ]; then
+    # Re-check the exact generations after the config transaction. If either
+    # daemon changed, continue through the ordinary safe replacement path.
+    joined_bridge_pid="$(tr -d '[:space:]' < "$LOCK_FILE" 2>/dev/null || true)"
+    joined_runner_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_PID" 2>/dev/null || true)"
+    if [ "$joined_bridge_pid" = "$existing_bridge_pid" ] \
+       && [ "$joined_runner_pid" = "$existing_runner_pid" ] \
+       && [ "$(tr -d '[:space:]' < "$JOB_RUNNER_RUNTIME" 2>/dev/null)" = "$existing_runner_runtime" ] \
+       && lock_process_is "$LOCK_FILE" "$joined_bridge_pid" 'server\.ts' \
+       && lock_process_is "$JOB_RUNNER_PID" "$joined_runner_pid" 'job-runner\.ts[[:space:]]+daemon' \
+       && bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/readiness.ts" \
+         can-share "$READY_FILE" "$joined_bridge_pid" "$SLACK_APP_ID"; then
+      echo "✅ 既存のZeroちゃんを共用します。" >&2
+      echo "   project: $PROJECT" >&2
+      echo "   gateway: PID $joined_bridge_pid / runner: PID $joined_runner_pid" >&2
+      exit 0
+    fi
+  fi
   echo "⚠️  ZeroちゃんのSlack gatewayは既に起動中です (PID $existing_bridge_pid)。" >&2
   do_replace=0
   if [ "$AUTHORIZED_UPDATE_RESTART" = "1" ]; then

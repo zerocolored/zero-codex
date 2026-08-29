@@ -117,6 +117,8 @@ bootstrap完了後、HerdrにZeroちゃん専用paneを用意して、そのpane
 codex login status
 # `Logged in using ChatGPT` 以外（API key認証を含む）ではZeroちゃんは起動しません
 zerochan-access status
+cd /absolute/path/to/project
+zerochan set slack-channel C0123456789
 zerochan
 ```
 
@@ -155,7 +157,8 @@ write access を付けない利用者は、HOME/stateをdenyして対象reposito
 job専用permission profileで調査・説明だけを利用できます。
 
 Zeroちゃん本体repositoryへのwrite jobはhost runtime保護のため拒否されます。変更対象projectへ
-`cd`して`zerochan`を起動してください。新しいDM/channel threadはそのprojectへ固定されます。
+`cd`し、`zerochan set slack-channel C...`でSlackチャンネルを紐付けてから`zerochan`を
+起動してください。新しいchannel threadはその設定先、DMはgatewayを起動したprojectへ固定されます。
 Codex shellはHOME credentialを継承しないため、
 commit identityは対象repositoryのlocal configへ設定し、認証pushは別の安全なHOME外方式を用意します。
 

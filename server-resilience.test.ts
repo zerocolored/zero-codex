@@ -221,14 +221,16 @@ describe('Slack bridge resilience wiring', () => {
   })
 
   test('detached更新は回復可能なrequest file作成後にだけ永続ledgerへ確定する', () => {
-    const request = server.indexOf('await enqueueUpdate(chatId, resolvedThreadTs, messageTs, userId)')
+    const request = server.indexOf(
+      'await enqueueUpdate(chatId, resolvedThreadTs, messageTs, userId)',
+    )
     const ledger = server.indexOf('jobStore.reserveUpdateRequest(key)', request)
     expect(request).toBeGreaterThan(-1)
     expect(ledger).toBeGreaterThan(request)
     expect(server).toContain('if (!jobStore.hasUpdateRequest(key))')
   })
 
-  test('参加channelを自動記録し、zerochan起動cwdへ最初のthreadを原子的に固定する', () => {
+  test('参加channelを自動記録し、channel routeへ最初のthreadを原子的に固定する', () => {
     expect(server).toContain('rememberChannel(channelId, ACCESS_FILE)')
     expect(server).toContain('(loadAccess().channels[channelId]?.requireMention ?? true)')
     expect(server).toContain('このチャンネルから利用できます。')
@@ -236,8 +238,10 @@ describe('Slack bridge resilience wiring', () => {
     expect(server).not.toContain('zerokun-access')
     expect(server).not.toContain('ROUTES_FILE')
     expect(server).not.toContain('configuredRepoPath(')
-    expect(server).toContain('requireRepoRoute(chatId, undefined, process.cwd())')
-    expect(server).toContain('jobStore.resolveOrAdoptThread({')
+    expect(server).toContain('jobStore.resolveOrAdoptSlackThreadRoute({')
+    expect(server).toContain('defaultRepoPath: process.cwd()')
+    expect(server).toContain('projectDir: process.cwd()')
+    expect(server).toContain('err instanceof SlackProjectUnavailableError')
 
     const resolveBeforeUpdate = server.indexOf(
       'const repoPath = resolveRepoPath(chatId, resolvedThreadTs, messageTs)',

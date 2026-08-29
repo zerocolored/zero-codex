@@ -175,7 +175,7 @@ bash "$bootstrap_path" --with-slack
 `git switch main` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使えます。
 
 bootstrapはZeroちゃん本体とは別の`zerokun-workspace` Git repositoryを、最小安全指示の`AGENTS.md`
-初期commit付きで作ります。既存projectを初期workspace／初期channel routeに使う場合は、
+初期commit付きで作ります。既存projectを初期workspace／DMのdefault projectに使う場合は、
 `--project-dir /absolute/path/to/project`を指定できます。DMの新規threadは、起動時に
 `zerochan`を実行した物理directoryを使います。
 Zeroちゃん本体はhost runtimeなので、そこを対象にしたSlack write jobは常に拒否されます。
@@ -218,8 +218,9 @@ zerochan-access pair abc123
 zerochan-access status
 ```
 
-チャンネルはZeroちゃんを招待した時点で利用できます。参加者は全員利用でき、bot投稿は無視します。
-新しい依頼は `@Zeroちゃん` へのメンションが必要ですが、同じスレッドの続きはメンション不要です。
+チャンネルはZeroちゃんを招待し、対象projectで `zerochan set slack-channel <channel-id>` を
+実行すると利用できます。参加者は全員利用でき、bot投稿は無視します。新しい依頼は
+`@Zeroちゃん` へのメンションが必要ですが、同じスレッドの続きはメンション不要です。
 
 受信を許可しても repository write は許可されません。書込みが必要な利用者だけ別に付与します。
 
@@ -235,15 +236,21 @@ zerochan-access write deny U0123456789
 ```bash
 # setup後、Herdrの専用paneで対象projectへ移動して起動
 cd /absolute/path/to/project
+zerochan set slack-channel C0123456789
 zerochan
+
+# 設定・解除・確認
+zerochan status
+zerochan unset slack-channel C0123456789
 
 # 別terminalから
 zerokun-status
 zerokun-jobs status
 ```
 
-`zerochan` はHerdr外からの起動を拒否します。引数やexportは不要で、実行した物理directoryを
-新しいDM threadのprojectとして使います。互換alias `zerokun` も現在directoryを使い、
+`zerochan` はHerdr外からの起動を拒否します。引数やexportは不要です。最初の起動だけが共有gatewayと
+runnerを開始し、別projectからの2つ目以降の起動はそのprojectのlocal設定を共有gatewayへ同期して
+終了します。実行した物理directoryは新しいDM threadのprojectとして使います。互換alias `zerokun` も現在directoryを使い、
 `zerochan --restart`（互換alias `zerokun-restart`）は前回Slackへ接続できたprojectを使います。
 Herdrの専用paneで、永続 job runner を独立process groupへ
 起動してから Slack gateway を前景で起動します。gateway は
@@ -301,12 +308,16 @@ serviceを起動せずoffline bootstrapで復旧してください。
 
 ## Routing
 
-DM・チャンネルとも、新しいSlackスレッドは`zerochan`を実行した物理project directoryを使います。
-`routes.json`の手動設定は不要です。稼働中のgatewayはその物理project directoryをreadinessへ記録し、
-`zerokun-update`は再起動後も
-同じdirectoryを引き継ぎます。gateway停止中も、最後に接続できたprojectの安全な記録を使います。
-一度採用したSlack threadのprojectは最初の受理時にSQLiteへ固定され、別directoryから再起動しても
-別repositoryへ飛びません。
+project directoryで `zerochan set slack-channel C...` を実行すると、設定はlocal-onlyの
+`.zerochan/config.json`へ保存され、稼働中gatewayへ即時反映されます。`routes.json`の手動編集や
+利用者allowlistは不要です。同じSlackチャンネルを別projectへ同時登録することはできません。
+
+明示routeをまだ一度も設定していない移行直後だけ、従来どおり新しいchannel threadはgatewayを
+起動したprojectへ入ります。一度設定した後の未設定channelでは、全routeを解除した場合もproject
+設定コマンドを案内し、別projectへ推測配送しません。
+DMはgatewayを起動したprojectを使います。一度採用したSlack threadのprojectは最初の受理時にSQLiteへ
+固定され、route解除・再登録や別directoryからの再起動後も別repositoryへ飛びません。Slackからの
+自己更新後もgatewayの起動projectを維持し、DMのdefaultや既存threadの固定先を変更しません。
 
 ## セキュリティ境界
 

@@ -504,6 +504,9 @@ describe('Slack update request', () => {
         idFactory: () => 'request-detached',
       })
       expect(result.accepted).toBe(true)
+      expect(result.request.projectDir).toBe(projectDir)
+      expect(JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8')).projectDir)
+        .toBe(projectDir)
       for (let attempt = 0; attempt < 40 && !existsSync(join(stateDir, 'worker-started')); attempt += 1) {
         await Bun.sleep(25)
       }

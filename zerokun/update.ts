@@ -1080,6 +1080,38 @@ type UpdateLockCoordinator = ProcessGroupLeaseCoordinator & {
   release: () => void
 }
 
+function acquireChannelRouteMutationLock(stateDir: string): {
+  release: () => void
+} {
+  const path = join(stateDir, 'channel-route.lock')
+  const deadline = Date.now() + 5_000
+  let lease: ProcessLockLease | undefined
+  while (!lease) {
+    const attempt = tryAcquireProcessLock(path)
+    if (attempt.acquired) {
+      lease = attempt.lease
+      break
+    }
+    if (attempt.kind === 'owner-unavailable') {
+      fail('Slackチャンネル設定lockの所有者を確認できません')
+    }
+    if (Date.now() >= deadline) {
+      fail(`Slackチャンネル設定が実行中です (PID ${attempt.heldPid})`)
+    }
+    Bun.sleepSync(50)
+  }
+  let held = true
+  return {
+    release: () => {
+      if (!held) return
+      held = false
+      if (!releaseProcessLock(path, lease!)) {
+        fail('Slackチャンネル設定lockを安全に解放できません')
+      }
+    },
+  }
+}
+
 function acquireUpdateLock(stateDir: string): UpdateLockCoordinator {
   prepareManagedStateRoot(stateDir)
   const lockPath = join(stateDir, 'update.lock')
@@ -2601,6 +2633,13 @@ async function superviseStandaloneSetup(testing = false): Promise<void> {
   const setupScript = process.env.ZEROKUN_SETUP_SCRIPT ?? join(rootRepo, 'zerokun', 'setup.sh')
   if (!existsSync(setupScript)) fail(`setup.shがありません: ${setupScript}`)
   const updateLock = acquireUpdateLock(stateDir)
+  let channelRouteLock: ReturnType<typeof acquireChannelRouteMutationLock>
+  try {
+    channelRouteLock = acquireChannelRouteMutationLock(stateDir)
+  } catch (error) {
+    updateLock.release()
+    throw error
+  }
   const controller = new AbortController()
   const interrupt = () => controller.abort()
   process.on('SIGINT', interrupt)
@@ -2643,10 +2682,14 @@ async function superviseStandaloneSetup(testing = false): Promise<void> {
     })
   } finally {
     try {
-      updateLock.release()
+      channelRouteLock.release()
     } finally {
-      process.off('SIGINT', interrupt)
-      process.off('SIGTERM', interrupt)
+      try {
+        updateLock.release()
+      } finally {
+        process.off('SIGINT', interrupt)
+        process.off('SIGTERM', interrupt)
+      }
     }
   }
 }
@@ -2734,12 +2777,25 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
   const repositories: Repository[] = [{ label: 'zero-codex', path: rootRepo, branch }]
 
   const updateLock = acquireUpdateLock(stateDir)
+  let channelRouteLock: ReturnType<typeof acquireChannelRouteMutationLock>
+  try {
+    channelRouteLock = acquireChannelRouteMutationLock(stateDir)
+  } catch (error) {
+    updateLock.release()
+    throw error
+  }
   const controller = new AbortController()
   const interrupt = () => controller.abort()
   const throwIfInterrupted = () => {
     if (controller.signal.aborted) fail('更新を中断しました')
   }
-  const cleanup = () => updateLock.release()
+  const cleanup = () => {
+    try {
+      channelRouteLock.release()
+    } finally {
+      updateLock.release()
+    }
+  }
   process.on('SIGINT', interrupt)
   process.on('SIGTERM', interrupt)
   try {

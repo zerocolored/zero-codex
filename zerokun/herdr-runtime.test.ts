@@ -11,6 +11,7 @@ import {
   requireHerdrRuntime,
   verifyHerdrRuntimeIdentity,
   verifyHerdrRuntimeIdentityAsync,
+  verifyPinnedHerdrControlPlane,
   writePinnedHerdrRuntime,
 } from './herdr-runtime.ts'
 
@@ -107,6 +108,14 @@ describe('Herdr runtime binding', () => {
       expect(herdrControlPlaneFingerprint(pinned)).toHaveLength(64)
       expect(decodeHerdrRuntimeIdentity(encodeHerdrRuntimeIdentity(identity))).toEqual(identity)
       expect(() => verifyHerdrRuntimeIdentity(pinned, value.environment)).not.toThrow()
+      writePinnedHerdrRuntime(state, {
+        ...identity,
+        paneId: 'wOTHER:p9',
+        tabId: 'wOTHER:t9',
+        terminalId: 'term_abcdef012345',
+        workspaceId: 'wOTHER',
+      })
+      expect(() => verifyPinnedHerdrControlPlane(state, value.environment)).not.toThrow()
     } finally {
       value.stop()
     }

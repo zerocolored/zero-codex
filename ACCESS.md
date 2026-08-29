@@ -87,14 +87,17 @@ zerochan-access write deny U0123456789
 
 ## Channel policy
 
-Zeroちゃんをchannelへ招待すれば、そのchannelの人は誰でも利用できます。手動登録やallowlistは
-ありません。bot投稿とSlack user IDでないsenderは常に無視します。
+Zeroちゃんをchannelへ招待し、対象projectで
+`zerochan set slack-channel <channel-id>`を実行すると、そのchannelの人は誰でも利用できます。
+利用者allowlistはありません。bot投稿とSlack user IDでないsenderは常に無視します。
 
 - 新しいchannel依頼は `@Zeroちゃん` のメンションが必要です。
 - いったんZeroちゃんが採用したthreadの人による返信は、senderが変わってもメンション不要です。
 - 実行中の同じthreadへの返信はlive inputとして割り込み、別threadは独立したFIFO jobになります。
 - 招待・最初のlive mentionでchannelを内部記録し、再起動後の履歴回収に使います。
-- 新しいthreadは、その時点で`zerochan`を起動しているprojectへ固定されます。`routes.json`は不要です。
+- 新しいthreadはproject-localの`.zerochan/config.json`で紐付けたprojectへ固定されます。
+  `zerochan unset slack-channel <channel-id>`で解除でき、同じchannelを2つのprojectへ重複登録は
+  できません。既存threadの固定先は解除後も変わらず、`routes.json`は不要です。
 
 ## 設定 schema
 

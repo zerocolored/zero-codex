@@ -36,6 +36,7 @@ import { requestUpdate, resumePendingUpdateWorker } from './zerokun/update-reque
 import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
 import {
   JobStore,
+  SlackChannelRouteRequiredError,
   liveControlAcceptsInput,
   updateIsRunning,
   updateTransactionPending,
@@ -43,7 +44,7 @@ import {
   type InboundDeliveryRecord,
   type LiveControlTarget,
 } from './zerokun/job-runner.ts'
-import { requireLegacyThreadRepoRoute, requireRepoRoute } from './zerokun/routing.ts'
+import { requireLegacyThreadRepoRoute } from './zerokun/routing.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './zerokun/state-dir.ts'
 import {
   slackHttpTimeoutMs,
@@ -415,6 +416,14 @@ slackApp = new App({
 })
 
 let botUserId: string | undefined
+let slackAppId: string | undefined
+
+class SlackProjectUnavailableError extends Error {
+  constructor(readonly chatId: string) {
+    super(`Slack project is unavailable for ${chatId}`)
+    this.name = 'SlackProjectUnavailableError'
+  }
+}
 
 // Dedup of delivered messages, keyed by `${chatId}:${messageTs}`. A single
 // Slack message can reach us more than once: an @mention fires BOTH
@@ -443,15 +452,21 @@ function rememberDelivered(key: string): void {
 }
 
 function resolveRepoPath(chatId: string, threadTs: string, adoptedFromTs: string): string {
-  const repoPath = realpathSync(requireRepoRoute(chatId, undefined, process.cwd()))
-  if (!statSync(repoPath).isDirectory()) throw new Error(`route is not a directory: ${repoPath}`)
-  const pinned = jobStore.resolveOrAdoptThread({
+  if (!slackAppId) throw new Error('Slack app identity is unavailable')
+  const pinned = jobStore.resolveOrAdoptSlackThreadRoute({
+    appId: slackAppId,
     chatId,
     threadTs,
-    repoPath,
+    defaultRepoPath: process.cwd(),
     adoptedFromTs,
   })
-  return realpathSync(pinned.repoPath)
+  try {
+    const repoPath = realpathSync(pinned.repoPath)
+    if (!statSync(repoPath).isDirectory()) throw new Error('not a directory')
+    return repoPath
+  } catch {
+    throw new SlackProjectUnavailableError(chatId)
+  }
 }
 
 async function downloadInboundFiles(
@@ -572,6 +587,10 @@ async function enqueueUpdate(
     {
       stateDir: STATE_DIR,
       workerFile: UPDATE_REQUEST_FILE,
+      // A self-update must preserve the shared gateway's bootstrap/default
+      // project. The Slack thread's project remains pinned independently in
+      // SQLite and must not become the new DM/default destination.
+      projectDir: process.cwd(),
       onAccepted: async _request => {
         await slackApp!.client.chat.postMessage({
           channel: chatId,
@@ -855,7 +874,30 @@ function deliver(
     }
     rememberDelivered(key)
     return true
-  })().catch(err => {
+  })().catch(async err => {
+    if (err instanceof SlackChannelRouteRequiredError
+      || err instanceof SlackProjectUnavailableError) {
+      try {
+        await slackApp!.client.chat.postMessage({
+          channel: chatId,
+          thread_ts: resolvedThreadTs,
+          text: err instanceof SlackChannelRouteRequiredError
+            ? `🔗 このチャンネルはプロジェクト未設定です。対象projectで \`zerochan set slack-channel ${err.channelId}\` を実行してください。`
+            : '📁 このスレッドのprojectが見つかりません。PC側でprojectを復旧し、もう一度メッセージを送ってください。',
+        })
+        jobStore.recordDeliveryTombstone(key)
+        rememberDelivered(key)
+        // The event is durably handled, but no task was accepted. Returning
+        // false suppresses the eyes acknowledgement; catch-up observes the
+        // tombstone on its next bounded sweep and advances without reposting.
+        return false
+      } catch (noticeError) {
+        process.stderr.write(
+          `slack channel: failed to report missing route for ${key}: ${noticeError}\n`,
+        )
+        return false
+      }
+    }
     process.stderr.write(`slack channel: failed to persist ${key} for Codex: ${err}\n`)
     return false
   }).finally(() => inFlight.delete(key))
@@ -1001,14 +1043,22 @@ slackApp.event('member_joined_channel', async ({ event }) => {
   try {
     const firstObservation = rememberChannel(channelId, ACCESS_FILE)
     if (!firstObservation) return
+    const routeReady = slackAppId
+      && (jobStore.resolveSlackChannelRoute(slackAppId, channelId) !== null
+        || !jobStore.slackChannelRoutingIsExplicit(slackAppId))
     await slackApp!.client.chat.postMessage({
       channel: channelId,
-      text: [
-        `:wave: *Zeroちゃん*です。このチャンネルから利用できます。`,
-        ``,
-        `新しい依頼は \`@Zeroちゃん\` とメンションしてください。`,
-        `同じスレッドの続きは、再メンションなしで受け取ります。`,
-      ].join('\n'),
+      text: routeReady
+        ? [
+          `:wave: *Zeroちゃん*です。このチャンネルから利用できます。`,
+          ``,
+          `新しい依頼は \`@Zeroちゃん\` とメンションしてください。`,
+          `同じスレッドの続きは、再メンションなしで受け取ります。`,
+        ].join('\n')
+        : [
+          `:wave: *Zeroちゃん*です。`,
+          `対象projectで \`zerochan set slack-channel ${channelId}\` を実行すると、このチャンネルから利用できます。`,
+        ].join('\n'),
     })
   } catch (err) {
     if (err instanceof AccessLockReleaseError) {
@@ -1912,6 +1962,7 @@ try {
     },
   })
   botUserId = identity.botUserId
+  slackAppId = identity.appId
   await slackApp.start()
   setInterval(checkApprovals, 5_000).unref()
   const connectedProjectDir = realpathSync(process.cwd())
@@ -1921,6 +1972,7 @@ try {
     process.env.ZEROKUN_RELEASE_COMMIT ?? 'manual',
     process.pid,
     connectedProjectDir,
+    identity.appId,
   )
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 

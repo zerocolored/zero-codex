@@ -1273,7 +1273,8 @@ codex --version
         '/bin/bash', '-c', command, 'bash', bootstrap, state,
       ], { stdout: 'pipe', stderr: 'pipe' })
       expect(result.exitCode, result.stderr.toString()).toBe(0)
-      expect(result.stdout.toString()).toContain('チャンネルはZeroちゃんを招待すると自動で利用できます')
+      expect(result.stdout.toString())
+        .toContain('対象projectの zerochan set slack-channel <ID> で紐付けます')
       expect(result.stdout.toString()).toContain('zerochan-access pair <code>')
       expect(readFileSync(obsoleteRoutes, 'utf8')).toBe('legacy route must stay untouched\n')
     } finally {

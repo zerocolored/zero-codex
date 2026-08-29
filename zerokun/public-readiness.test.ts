@@ -501,12 +501,14 @@ describe('public Codex defaults', () => {
     const dir = mkdtempSync(join(tmpdir(), 'zerokun-readiness-'))
     const path = join(dir, 'gateway-ready.json')
     try {
-      writeGatewayReadiness(path, 'abc123', 4321, dir)
+      writeGatewayReadiness(path, 'abc123', 4321, dir, 'A0123456789')
       expect(readGatewayReadiness(path)).toMatchObject({
         runtime: 'codex',
         pid: 4321,
         release: 'abc123',
         projectDir: dir,
+        channelRoutingVersion: 1,
+        slackAppId: 'A0123456789',
       })
       expect(JSON.parse(readFileSync(path, 'utf8')).connectedAt).toBeGreaterThan(0)
       clearGatewayReadiness(path, 9999)

@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from 'fs'
 import { homedir } from 'os'
-import { dirname, join } from 'path'
+import { dirname, isAbsolute, join } from 'path'
 import { fileURLToPath } from 'url'
 import { buildUpdaterEnvironment, parseStateSlackTokens } from './child-environment.ts'
 import { atomicWritePrivateFile, openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
@@ -70,6 +70,7 @@ export interface UpdateRequestInput {
 export interface UpdateRequest extends UpdateRequestInput {
   id: string
   requestedAt: number
+  projectDir?: string
   gate?: ProcessIdentity
   outcome?: {
     success: boolean
@@ -207,6 +208,9 @@ function readRequest(dir: string): UpdateRequest | undefined {
       messageId: requireText(parsed.messageId, 'messageId'),
       userId: requireText(parsed.userId, 'userId'),
       requestedAt,
+      ...(typeof parsed.projectDir === 'string' && isAbsolute(parsed.projectDir)
+        ? { projectDir: requireText(parsed.projectDir, 'projectDir') }
+        : {}),
       ...(validGate ? { gate: gate as ProcessIdentity } : {}),
       ...(parsed.outcome && typeof parsed.outcome.text === 'string'
         ? {
@@ -320,7 +324,7 @@ export function launchDetachedUpdateWorker(
   if (tmuxSessionExists(tmux, session)) throw new Error('別のZeroちゃん更新workerが実行中です')
   const legacyCutover = options.legacyCutover
     ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
-  const projectDir = options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
+  const projectDir = request.projectDir ?? options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
   const launchEnvironment = {
     ...buildUpdaterEnvironment(),
     ZEROKUN_JOB_DB: resolveZeroJobDatabasePath(dir),
@@ -433,6 +437,7 @@ export async function requestUpdate(
     ...input,
     id: options.idFactory?.() ?? randomUUID(),
     requestedAt: now(),
+    ...(options.projectDir ? { projectDir: options.projectDir } : {}),
   }
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   try {
@@ -480,7 +485,7 @@ export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean
     launchDetachedUpdateWorker(value, {
       stateDir: dir,
       legacyCutover: options.legacyCutover,
-      projectDir: options.projectDir,
+      projectDir: value.projectDir ?? options.projectDir,
       workerFile: options.workerFile,
       updaterPath: options.updaterPath,
       tmuxPath: options.tmuxPath,
@@ -889,7 +894,7 @@ export async function runUpdateWorker(
   const updaterPath = options.updaterPath ?? join(homedir(), '.local', 'bin', 'zerokun-update')
   const legacyCutover = options.legacyCutover
     ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
-  const projectDir = options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
+  const projectDir = request.projectDir ?? options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
   const updaterEnvironment = {
     ...buildUpdaterEnvironment(),
     ZEROKUN_JOB_DB: resolveZeroJobDatabasePath(dir),

@@ -3063,6 +3063,10 @@ export function buildCodexPermissionOverrides(
     [artifactDir, 'write'],
     [scratchDir, 'write'],
   ])
+  // Project-local Slack routing is mutated only by the host-side `zerochan`
+  // command. Jobs never need it, and a write-enabled task must not be able to
+  // republish a forged channel claim on the next launcher sync.
+  rules.set(join(repo, '.zerochan'), 'deny')
   if (liveInputRoot) rules.set(liveInputRoot, 'read')
   if (gitRoot && gitRoot !== repo) rules.set(gitRoot, 'read')
   const codexHome = process.env.CODEX_HOME

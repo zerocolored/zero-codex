@@ -118,6 +118,17 @@ export function herdrControlPlaneFingerprint(identity: HerdrRuntimeIdentity): st
   })).digest('hex')
 }
 
+export function verifyPinnedHerdrControlPlane(
+  stateDir: string,
+  source: Record<string, string | undefined> = process.env,
+): void {
+  const pinned = readPinnedHerdrRuntime(stateDir)
+  const current = requireHerdrRuntime(source)
+  if (herdrControlPlaneFingerprint(pinned) !== herdrControlPlaneFingerprint(current)) {
+    throw new Error('Herdr control plane changed after Zeroちゃん startup')
+  }
+}
+
 /** Pass a verified launch identity to the daemon without mutating shared state first. */
 export function encodeHerdrRuntimeIdentity(identity: HerdrRuntimeIdentity): string {
   return Buffer.from(JSON.stringify(parseHerdrRuntimeIdentity(identity)), 'utf8').toString('base64url')
@@ -417,6 +428,12 @@ if (import.meta.main) {
       process.stdout.write(`${herdrRuntimeFingerprint(identity)}\n`)
     } else if (command === 'runtime-id') {
       process.stdout.write(`${herdrRuntimeFingerprint(requireHerdrRuntime())}\n`)
+    } else if (command === 'control-plane-id') {
+      process.stdout.write(`${herdrControlPlaneFingerprint(requireHerdrRuntime())}\n`)
+    } else if (command === 'verify-control-plane') {
+      if (!stateDir) throw new Error('usage: herdr-runtime.ts verify-control-plane STATE_DIR')
+      verifyPinnedHerdrControlPlane(stateDir)
+      process.stdout.write(`${herdrControlPlaneFingerprint(requireHerdrRuntime())}\n`)
     } else if (command) {
       throw new Error(`unknown command: ${command}`)
     } else {

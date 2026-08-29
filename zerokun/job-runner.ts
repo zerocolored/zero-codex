@@ -105,6 +105,13 @@ import {
   writePinnedHerdrRuntime,
 } from './herdr-runtime.ts'
 import { isSlackInterruptCommand } from './live-control.ts'
+
+export class SlackChannelRouteRequiredError extends Error {
+  constructor(readonly channelId: string) {
+    super(`Slack channel is not connected to a Zeroちゃん project: ${channelId}`)
+    this.name = 'SlackChannelRouteRequiredError'
+  }
+}
 import {
   EphemeralClaudeCleanupPendingError,
   reconcileEphemeralClaudeSessions,
@@ -461,6 +468,20 @@ CREATE TABLE IF NOT EXISTS slack_threads (
   adopted_from_ts TEXT NOT NULL,
   last_activity_ms INTEGER NOT NULL,
   PRIMARY KEY (chat_id, thread_ts)
+);
+CREATE TABLE IF NOT EXISTS slack_channel_routes (
+  app_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  configured_at INTEGER NOT NULL,
+  PRIMARY KEY (app_id, channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_slack_channel_routes_repo
+  ON slack_channel_routes(app_id, repo_path, channel_id);
+CREATE TABLE IF NOT EXISTS slack_channel_route_state (
+  app_id TEXT PRIMARY KEY,
+  explicit_mode INTEGER NOT NULL DEFAULT 1 CHECK (explicit_mode = 1),
+  activated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS terminal_notifications (
   id TEXT PRIMARY KEY,
@@ -1282,6 +1303,27 @@ function requireText(value: string, field: string): string {
   return normalized
 }
 
+function requireSlackAppId(value: string): string {
+  const normalized = requireText(value, 'Slack app ID').toUpperCase()
+  if (!/^A[A-Z0-9]+$/.test(normalized)) throw new Error(`invalid Slack app ID: ${value}`)
+  return normalized
+}
+
+function requireSlackChannelId(value: string): string {
+  const normalized = requireText(value, 'Slack channel ID').toUpperCase()
+  if (!/^[CG][A-Z0-9]+$/.test(normalized)) {
+    throw new Error(`invalid Slack channel ID: ${value}`)
+  }
+  return normalized
+}
+
+function normalizeSlackChannelIds(values: string[]): string[] {
+  if (!Array.isArray(values) || values.length > 128) {
+    throw new Error('Slack channel route limit is 128 per project')
+  }
+  return [...new Set(values.map(requireSlackChannelId))].sort()
+}
+
 function positiveInteger(value: string | number | undefined, fallback: number): number {
   const parsed = Math.floor(Number(value))
   return Number.isFinite(parsed) && parsed >= 1 ? parsed : fallback
@@ -1481,6 +1523,250 @@ export class JobStore {
 
   close(): void {
     this.db.close()
+  }
+
+  listSlackChannelRoutes(appIdInput: string): Array<{
+    appId: string
+    channelId: string
+    repoPath: string
+    configuredAt: number
+  }> {
+    const appId = requireSlackAppId(appIdInput)
+    return this.db.query<{
+      app_id: string
+      channel_id: string
+      repo_path: string
+      configured_at: number
+    }, [string]>(
+      `SELECT app_id, channel_id, repo_path, configured_at
+       FROM slack_channel_routes WHERE app_id = ?
+       ORDER BY channel_id`,
+    ).all(appId).map(row => ({
+      appId: row.app_id,
+      channelId: row.channel_id,
+      repoPath: row.repo_path,
+      configuredAt: row.configured_at,
+    }))
+  }
+
+  resolveSlackChannelRoute(appIdInput: string, channelIdInput: string): string | null {
+    const appId = requireSlackAppId(appIdInput)
+    const channelId = requireSlackChannelId(channelIdInput)
+    return this.db.query<{ repo_path: string }, [string, string]>(
+      `SELECT repo_path FROM slack_channel_routes
+       WHERE app_id = ? AND channel_id = ?`,
+    ).get(appId, channelId)?.repo_path ?? null
+  }
+
+  countSlackChannelRoutes(appIdInput: string): number {
+    const appId = requireSlackAppId(appIdInput)
+    return this.db.query<{ count: number }, [string]>(
+      'SELECT COUNT(*) AS count FROM slack_channel_routes WHERE app_id = ?',
+    ).get(appId)?.count ?? 0
+  }
+
+  slackChannelRoutingIsExplicit(appIdInput: string): boolean {
+    const appId = requireSlackAppId(appIdInput)
+    return this.db.query<{ present: number }, [string]>(
+      'SELECT 1 AS present FROM slack_channel_route_state WHERE app_id = ?',
+    ).get(appId) !== null
+  }
+
+  assertSlackChannelRoutesAvailable(
+    appIdInput: string,
+    repoPathInput: string,
+    channelIdsInput: string[],
+  ): void {
+    const appId = requireSlackAppId(appIdInput)
+    const repoPath = requireText(repoPathInput, 'repoPath')
+    const channelIds = normalizeSlackChannelIds(channelIdsInput)
+    for (const channelId of channelIds) {
+      const existing = this.db.query<{ repo_path: string }, [string, string]>(
+        `SELECT repo_path FROM slack_channel_routes
+         WHERE app_id = ? AND channel_id = ?`,
+      ).get(appId, channelId)
+      if (existing && existing.repo_path !== repoPath) {
+        throw new Error(
+          `Slack channel ${channelId} is already connected to ${existing.repo_path}`,
+        )
+      }
+    }
+  }
+
+  /**
+   * Replace one project's derived channel index in a single immediate
+   * transaction. The project-local config is the durable user declaration;
+   * this table is the live daemon snapshot. A channel can never be silently
+   * stolen by a different project.
+   */
+  syncSlackChannelRoutes(input: {
+    appId: string
+    repoPath: string
+    channelIds: string[]
+    configuredAt?: number
+  }): { added: number; removed: number; unchanged: number } {
+    const appId = requireSlackAppId(input.appId)
+    const repoPath = requireText(input.repoPath, 'repoPath')
+    const channelIds = normalizeSlackChannelIds(input.channelIds)
+    const configuredAt = input.configuredAt ?? Date.now()
+    if (!Number.isSafeInteger(configuredAt) || configuredAt <= 0) {
+      throw new Error('channel route timestamp is invalid')
+    }
+    const desired = new Set(channelIds)
+    const sync = this.db.transaction(() => {
+      for (const channelId of channelIds) {
+        const existing = this.db.query<{ repo_path: string }, [string, string]>(
+          `SELECT repo_path FROM slack_channel_routes
+           WHERE app_id = ? AND channel_id = ?`,
+        ).get(appId, channelId)
+        if (existing && existing.repo_path !== repoPath) {
+          throw new Error(
+            `Slack channel ${channelId} is already connected to ${existing.repo_path}`,
+          )
+        }
+      }
+
+      const owned = this.db.query<{ channel_id: string }, [string, string]>(
+        `SELECT channel_id FROM slack_channel_routes
+         WHERE app_id = ? AND repo_path = ?`,
+      ).all(appId, repoPath).map(row => row.channel_id)
+      let removed = 0
+      for (const channelId of owned) {
+        if (desired.has(channelId)) continue
+        removed += this.db.run(
+          `DELETE FROM slack_channel_routes
+           WHERE app_id = ? AND channel_id = ? AND repo_path = ?`,
+          [appId, channelId, repoPath],
+        ).changes
+      }
+
+      let added = 0
+      for (const channelId of channelIds) {
+        added += this.db.run(
+          `INSERT OR IGNORE INTO slack_channel_routes (
+             app_id, channel_id, repo_path, configured_at
+           ) VALUES (?, ?, ?, ?)`,
+          [appId, channelId, repoPath, configuredAt],
+        ).changes
+      }
+      if (channelIds.length > 0) {
+        this.db.run(
+          `INSERT OR IGNORE INTO slack_channel_route_state (
+             app_id, explicit_mode, activated_at
+           ) VALUES (?, 1, ?)`,
+          [appId, configuredAt],
+        )
+      }
+      return { added, removed, unchanged: channelIds.length - added }
+    })
+    return retrySqlite(() => sync.immediate())
+  }
+
+  /**
+   * Existing Slack thread ownership wins before the current channel mapping.
+   * New DMs retain the gateway bootstrap project. Channels retain the legacy
+   * bootstrap fallback only until the first explicit channel route exists.
+   */
+  resolveOrAdoptSlackThreadRoute(input: {
+    appId: string
+    chatId: string
+    threadTs: string
+    defaultRepoPath: string
+    adoptedFromTs: string
+    lastActivityMs?: number
+  }): {
+    chatId: string
+    threadTs: string
+    repoPath: string
+    adoptedFromTs: string
+    lastActivityMs: number
+  } {
+    const appId = requireSlackAppId(input.appId)
+    const chatId = requireText(input.chatId, 'chatId').toUpperCase()
+    const threadTs = requireText(input.threadTs, 'threadTs')
+    const defaultRepoPath = requireText(input.defaultRepoPath, 'defaultRepoPath')
+    const adoptedFromTs = requireText(input.adoptedFromTs, 'adoptedFromTs')
+    const lastActivityMs = input.lastActivityMs ?? Date.now()
+    if (!Number.isSafeInteger(lastActivityMs) || lastActivityMs <= 0) {
+      throw new Error('thread activity timestamp is invalid')
+    }
+
+    const select = this.db.transaction(() => {
+      const existing = this.db.query<{
+        chat_id: string
+        thread_ts: string
+        repo_path: string
+        adopted_from_ts: string
+        last_activity_ms: number
+      }, [string, string]>(
+        'SELECT * FROM slack_threads WHERE chat_id = ? AND thread_ts = ?',
+      ).get(chatId, threadTs)
+      if (existing) {
+        return {
+          chatId: existing.chat_id,
+          threadTs: existing.thread_ts,
+          repoPath: existing.repo_path,
+          adoptedFromTs: existing.adopted_from_ts,
+          lastActivityMs: existing.last_activity_ms,
+        }
+      }
+
+      let repoPath = defaultRepoPath
+      if (/^[CG][A-Z0-9]+$/.test(chatId)) {
+        const explicit = this.db.query<{ repo_path: string }, [string, string]>(
+          `SELECT repo_path FROM slack_channel_routes
+           WHERE app_id = ? AND channel_id = ?`,
+        ).get(appId, chatId)
+        if (explicit) {
+          repoPath = explicit.repo_path
+        } else {
+          const explicitMode = this.db.query<{ present: number }, [string]>(
+            'SELECT 1 AS present FROM slack_channel_route_state WHERE app_id = ?',
+          ).get(appId) !== null
+          if (explicitMode) throw new SlackChannelRouteRequiredError(chatId)
+        }
+      } else if (!/^D[A-Z0-9]+$/.test(chatId)) {
+        throw new Error(`invalid Slack conversation ID: ${chatId}`)
+      }
+
+      this.db.run(
+        `INSERT OR IGNORE INTO slack_threads (
+           chat_id, thread_ts, repo_path, adopted_from_ts, last_activity_ms
+         ) VALUES (?, ?, ?, ?, ?)`,
+        [chatId, threadTs, repoPath, adoptedFromTs, lastActivityMs],
+      )
+      const pinned = this.db.query<{
+        chat_id: string
+        thread_ts: string
+        repo_path: string
+        adopted_from_ts: string
+        last_activity_ms: number
+      }, [string, string]>(
+        'SELECT * FROM slack_threads WHERE chat_id = ? AND thread_ts = ?',
+      ).get(chatId, threadTs)
+      if (!pinned) throw new Error('failed to pin Slack thread repository')
+      return {
+        chatId: pinned.chat_id,
+        threadTs: pinned.thread_ts,
+        repoPath: pinned.repo_path,
+        adoptedFromTs: pinned.adopted_from_ts,
+        lastActivityMs: pinned.last_activity_ms,
+      }
+    })
+    return retrySqlite(() => select.immediate())
+  }
+
+  recordDeliveryTombstone(idempotencyKey: string, completedAt = Date.now()): void {
+    const key = requireText(idempotencyKey, 'idempotencyKey')
+    if (!Number.isSafeInteger(completedAt) || completedAt <= 0) {
+      throw new Error('delivery tombstone timestamp is invalid')
+    }
+    retrySqlite(() => this.db.run(
+      `INSERT OR IGNORE INTO delivery_tombstones (
+         idempotency_key, write_enabled, completed_at
+       ) VALUES (?, 0, ?)`,
+      [key, completedAt],
+    ))
   }
 
   stageInboundDelivery(input: InboundDeliveryInput): boolean {

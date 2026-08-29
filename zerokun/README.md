@@ -38,6 +38,7 @@ codex login status
 # `Logged in using ChatGPT` と表示されることを確認
 # Herdrの専用pane内で対象projectへ移動して実行
 cd /absolute/path/to/project
+zerochan set slack-channel C0123456789
 zerochan
 ```
 
@@ -55,6 +56,7 @@ zerochan
 | `codex-executor.ts` | sandboxを選び、App Server thread/turn/controlを検証 |
 | `browser-verification-broker.ts` | fresh Chrome profileでlocalhostだけを描画・PNG検証 |
 | `access.ts` | pairing、DM/channel、write 許可の端末 CLI |
+| `project-channel-config.ts` | project-local channel設定と共有SQLite routeの同期 |
 | `update.ts` | `origin/main` から安全に fast-forward 更新 |
 | `update-request.ts` | Slack 自己更新を FIFO 外の detached worker へ渡す |
 | `process-generation.ts` | macOS libprocによるmicrosecond process世代IDとsignal前再検証 |
@@ -299,8 +301,11 @@ token、access、queue、lock が別物になります。
 
 ```bash
 cd /absolute/path/to/project
+zerochan set slack-channel C0123456789
 zerochan
 zerochan --restart  # 前回Slackへ接続できたprojectで再起動
+zerochan status
+zerochan unset slack-channel C0123456789
 zerokun             # 互換alias。現在directoryで起動
 zerokun-status
 zerokun-jobs status
@@ -308,9 +313,11 @@ zerochan-access status
 zerokun-update
 ```
 
-チャンネルはZeroちゃんを招待するだけで利用できます。新しい依頼はメンション、同じthreadの
-続きはメンション不要です。DMとchannelの新しいthreadはいずれも、`zerochan`を実行した現在の
-projectへ固定されるため、channel登録や`routes.json`の編集は不要です。
+チャンネルはZeroちゃんを招待し、対象projectで `zerochan set slack-channel C...` を実行すると
+利用できます。新しい依頼はメンション、同じthreadの続きはメンション不要です。設定はGitに
+含まれない `.zerochan/config.json` に保存され、`routes.json`の編集は不要です。最初の
+`zerochan`だけが共有gateway/runnerを起動し、別projectからの起動は同じserviceへ参加して終了します。
+既存threadは最初のprojectへ固定されたままです。DMは共有gatewayを起動したprojectを使います。
 
 log:
 
