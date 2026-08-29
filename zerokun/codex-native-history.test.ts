@@ -28,7 +28,7 @@ function fixture(
     | 'solution-conflicting-id' | 'solution-null-phase' | 'solution-omitted-phase'
     | 'solution-commentary-only' | 'solution-commentary-then-final'
     | 'solution-legacy-agent-message'
-    | 'solution-delegated' | 'solution-long' | null = null,
+    | 'solution-delegated' | 'solution-long' | 'solution-parent-interacted' | null = null,
   itemsListSupported = true,
   fullThreadRead: 'fail' | 'omit-parent-list' | 'omit-parent-everywhere'
     | 'omit-solution-list' | 'omit-solution-everywhere'
@@ -125,6 +125,13 @@ function fixture(
           && delayedThread === 'solution-legacy-agent-message') {
           final.type = 'agent_message'
         }
+        if (child.perspective === 'solution'
+          && delayedThread === 'solution-parent-interacted') {
+          return [{
+            type: 'subAgentActivity', id: 'call_parent_root_interaction',
+            kind: 'interacted', agentThreadId: parentThreadId, agentPath: '/root',
+          }, final]
+        }
         return [final]
       })(),
     }]] as const),
@@ -134,7 +141,8 @@ function fixture(
   const threadReadIds: string[] = []
   const delayedThreadId = delayedThread === 'parent' || delayedThread === 'parent-partial'
     ? parentThreadId
-    : delayedThread?.startsWith('solution-') || delayedThread === 'solution'
+    : (delayedThread?.startsWith('solution-')
+        && delayedThread !== 'solution-parent-interacted') || delayedThread === 'solution'
       ? children[0]!.id
       : null
   const visibleTurns = (threadId: string): Array<Record<string, unknown>> | undefined => {
@@ -525,6 +533,14 @@ describe('native advisor App Server history', () => {
       'delegated to another subagent',
     )
     expect(value.itemsListCalls()).toBe(3)
+  })
+
+  test('親rootへのinteractedをitems/listとfallbackの両履歴経路で受理する', async () => {
+    const itemsList = fixture(true, 'solution-parent-interacted')
+    await expect(assertNativeAdvisorHistory(itemsList.options)).resolves.toBeUndefined()
+
+    const fallback = fixture(true, 'solution-parent-interacted', false)
+    await expect(assertNativeAdvisorHistory(fallback.options)).resolves.toBeUndefined()
   })
 
   test('4096件超の無関係item後にあるchild final responseを投影する', async () => {

@@ -188,6 +188,7 @@ export function resolveNativeAdvisorThreadIds(options: {
     finalResponse: completedFinalResponse(
       child.thread,
       `native advisor physical thread ${child.threadId}`,
+      options.parentThreadId,
       directChildIds,
       inheritedParentActivitiesForChild(
         parentActivityTimeline,
@@ -386,10 +387,15 @@ function inheritedParentActivitiesForChild(
 function completedFinalResponse(
   thread: Record<string, unknown>,
   label: string,
+  expectedParentThreadId: string,
   directChildIds: ReadonlySet<string> = new Set(),
   inheritedParentActivities: ReadonlySet<string> = new Set(),
   inheritedParentTurns: ReadonlyMap<string, number> = new Map(),
 ): string {
+  if (!THREAD_ID.test(expectedParentThreadId)
+    || thread.parentThreadId !== expectedParentThreadId) {
+    throw new Error(`${label} parent binding is invalid`)
+  }
   if (!Array.isArray(thread.turns) || thread.turns.length < 1) {
     throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
   }
@@ -422,6 +428,7 @@ function completedFinalResponse(
     throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
   }
   let finalResponse: string | null = null
+  let parentInteractionCount = 0
   for (const [turnIndex, rawTurn] of ownedTurns.entries()) {
     const turn = record(rawTurn, `${label}.turn ${turnIndex}`)
     if ((turn.status !== 'completed' && turn.status !== 'interrupted')
@@ -450,6 +457,20 @@ function completedFinalResponse(
         // child's single interrupted precursor. It is inherited history, not
         // a delegation by this advisor. Exact parent item identity plus the
         // direct-sibling lineage distinguishes it from a real grandchild.
+        continue
+      }
+      if (turn.status === 'completed' && parentInteractionCount === 0
+        && item.kind === 'interacted' && fingerprint !== null
+        && item.agentThreadId === expectedParentThreadId
+        && item.agentThreadId !== thread.id
+        && !directChildIds.has(item.agentThreadId)
+        && item.agentPath === '/root') {
+        // A native advisor can send one progress/result interaction back to
+        // the primary root during its final turn.  The target is the already
+        // verified parent, not a newly delegated descendant.  Keep this
+        // observed shape exact; listed child threads remain the independent
+        // backstop for real recursive delegation.
+        parentInteractionCount += 1
         continue
       }
       throw new Error(`${label} delegated to another subagent`)
@@ -602,6 +623,7 @@ export function assertNativeAdvisorEvidence(options: {
       const finalResponse = completedFinalResponse(
         child,
         `native advisor ${entry.agentId}`,
+        options.parentThreadId,
         directChildIds,
         inheritedParentActivitiesForChild(
           parentActivityTimeline,

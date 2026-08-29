@@ -232,6 +232,113 @@ describe('native Codex advisor host evidence', () => {
     expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
   })
 
+  test('completed advisorから親rootへのinteracted 1件だけを再委任とみなさない', () => {
+    const accepted = fixture()
+    const acceptedSolution = accepted.options.childResponses.get(accepted.solutionId) as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    acceptedSolution.thread.turns[0]!.items.unshift({
+      type: 'subAgentActivity',
+      id: 'call_parent_root_interaction',
+      kind: 'interacted',
+      agentThreadId: accepted.options.parentThreadId,
+      agentPath: '/root',
+    })
+    expect(() => resolveNativeAdvisorThreadIds({
+      attemptNonce: accepted.options.attemptNonce,
+      parentThreadId: accepted.options.parentThreadId,
+      repoPath: accepted.options.repoPath,
+      rounds: accepted.options.rounds,
+      parentResponse: accepted.options.parentResponse,
+      childResponses: accepted.options.childResponses,
+    })).not.toThrow()
+    expect(() => assertNativeAdvisorEvidence(accepted.options)).not.toThrow()
+
+    const rejectedActivities: Array<Record<string, unknown>> = [
+      {
+        type: 'subAgentActivity', id: 'wrong-kind', kind: 'started',
+        agentThreadId: 'parent-thread', agentPath: '/root',
+      },
+      {
+        type: 'subAgentActivity', id: 'wrong-target', kind: 'interacted',
+        agentThreadId: 'foreign-thread', agentPath: '/root',
+      },
+      {
+        type: 'subAgentActivity', id: 'wrong-path', kind: 'interacted',
+        agentThreadId: 'parent-thread', agentPath: '/root/child',
+      },
+      {
+        type: 'subAgentActivity', kind: 'interacted',
+        agentThreadId: 'parent-thread', agentPath: '/root',
+      },
+    ]
+    for (const activity of rejectedActivities) {
+      const rejected = fixture()
+      const solution = rejected.options.childResponses.get(rejected.solutionId) as {
+        thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+      }
+      solution.thread.turns[0]!.items.unshift(activity)
+      expect(() => resolveNativeAdvisorThreadIds({
+        attemptNonce: rejected.options.attemptNonce,
+        parentThreadId: rejected.options.parentThreadId,
+        repoPath: rejected.options.repoPath,
+        rounds: rejected.options.rounds,
+        parentResponse: rejected.options.parentResponse,
+        childResponses: rejected.options.childResponses,
+      })).toThrow('delegated to another subagent')
+    }
+
+    const interrupted = fixture()
+    const interruptedSolution = interrupted.options.childResponses.get(interrupted.solutionId) as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    interruptedSolution.thread.turns.unshift({
+      status: 'interrupted',
+      itemsView: 'full',
+      items: [{
+        type: 'subAgentActivity', id: 'interrupted-parent-interaction', kind: 'interacted',
+        agentThreadId: interrupted.options.parentThreadId, agentPath: '/root',
+      }],
+    })
+    expect(() => assertNativeAdvisorEvidence(interrupted.options)).toThrow(
+      'delegated to another subagent',
+    )
+
+    const repeated = fixture()
+    const repeatedSolution = repeated.options.childResponses.get(repeated.solutionId) as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    repeatedSolution.thread.turns[0]!.items.unshift(
+      {
+        type: 'subAgentActivity', id: 'parent-interaction-one', kind: 'interacted',
+        agentThreadId: repeated.options.parentThreadId, agentPath: '/root',
+      },
+      {
+        type: 'subAgentActivity', id: 'parent-interaction-two', kind: 'interacted',
+        agentThreadId: repeated.options.parentThreadId, agentPath: '/root',
+      },
+    )
+    expect(() => assertNativeAdvisorEvidence(repeated.options)).toThrow(
+      'delegated to another subagent',
+    )
+
+    const descendant = fixture()
+    const descendantSolution = descendant.options.childResponses.get(descendant.solutionId) as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    descendantSolution.thread.turns[0]!.items.unshift({
+      type: 'subAgentActivity', id: 'parent-interaction-with-descendant', kind: 'interacted',
+      agentThreadId: descendant.options.parentThreadId, agentPath: '/root',
+    })
+    descendant.options.childChildrenListResponses.set(descendant.solutionId, {
+      data: [{ id: 'hidden-grandchild', parentThreadId: descendant.solutionId }],
+      nextCursor: null,
+    })
+    expect(() => assertNativeAdvisorEvidence(descendant.options)).toThrow(
+      'delegated to another subagent',
+    )
+  })
+
   test('複数の親turnを継承したreview advisorは自分のcompleted turnだけを採択する', () => {
     const { options, solutionId, riskId } = fixture()
     const parent = options.parentResponse as {
