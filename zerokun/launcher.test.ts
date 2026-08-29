@@ -79,6 +79,38 @@ function startRunner(state: string): Bun.Subprocess {
   return process
 }
 
+async function startOrphanedRunnerLauncher(state: string): Promise<Bun.Subprocess> {
+  const script = join(state, 'orphaned-runner-launcher.ts')
+  const ready = join(state, 'orphaned-runner-launcher.ready')
+  writeFileSync(script, [
+    `import { releaseProcessLock, tryAcquireProcessLock } from ${JSON.stringify(join(import.meta.dir, 'process-lock.ts'))}`,
+    `const lock = ${JSON.stringify(join(state, 'job-runner-starter.lock'))}`,
+    'const acquired = tryAcquireProcessLock(lock, process.pid)',
+    "if (!acquired.acquired) throw new Error('fixture starter lock unavailable')",
+    `await Bun.write(${JSON.stringify(ready)}, String(process.pid))`,
+    'let stopping = false',
+    'const stop = () => {',
+    '  if (stopping) return',
+    '  stopping = true',
+    '  releaseProcessLock(lock, acquired.lease)',
+    '  process.exit(0)',
+    '}',
+    "process.on('SIGTERM', stop)",
+    "process.on('SIGINT', stop)",
+    'await Bun.sleep(30_000)',
+    '',
+  ].join('\n'), { mode: 0o700 })
+  const launcher = Bun.spawn([process.execPath, script], {
+    stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+  })
+  processes.push(launcher)
+  for (let attempt = 0; attempt < 100 && !existsSync(ready); attempt += 1) {
+    await Bun.sleep(20)
+  }
+  expect(existsSync(ready)).toBe(true)
+  return launcher
+}
+
 async function stopFixturePid(path: string): Promise<void> {
   if (!existsSync(path)) return
   const pid = Number(readFileSync(path, 'utf8').trim())
@@ -706,6 +738,26 @@ describe('codex-channel.sh replacement guard', () => {
       await stopFixturePid(join(state, 'fake-runner-pid'))
     }
   }, 12_000)
+
+  test('runner本体終了後に残ったlauncherをexact lockで回収して再起動する', async () => {
+    const state = fixture()
+    const orphanedLauncher = await startOrphanedRunnerLauncher(state)
+    try {
+      const result = await runLauncher(state, {
+        ZEROKUN_RUNNER_STARTUP_ATTEMPTS: '2',
+      })
+      expect(result.exitCode, result.output).toBe(0)
+      expect(result.output).toContain('終了済みrunnerを待ち続けているlauncherを安全に回収します')
+      expect(result.output).toContain('job-runner: started')
+      expect(await Promise.race([
+        orphanedLauncher.exited.then(() => true),
+        Bun.sleep(2_000).then(() => false),
+      ])).toBe(true)
+    } finally {
+      await stopFixturePid(join(state, 'fake-starter-pid'))
+      await stopFixturePid(join(state, 'fake-runner-pid'))
+    }
+  }, 10_000)
 
   test('job runner起動期限切れはstarterを強制停止しrunnerを残さない', async () => {
     const state = fixture()

@@ -224,7 +224,10 @@ if [ -f "$LOCK_FILE" ]; then
 fi
 
 if [ -n "$existing_bridge_pid" ]; then
-  existing_runner_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_PID" 2>/dev/null || true)"
+  existing_runner_pid=""
+  if [ -f "$JOB_RUNNER_PID" ]; then
+    existing_runner_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_PID" 2>/dev/null || true)"
+  fi
   existing_runner_runtime="$(tr -d '[:space:]' < "$JOB_RUNNER_RUNTIME" 2>/dev/null || true)"
   shared_runner_runtime=0
   case "$existing_runner_runtime" in
@@ -308,6 +311,13 @@ job_runner_is_alive() {
 }
 
 start_job_runner() {
+  local startup_attempts
+  startup_attempts="${ZEROKUN_RUNNER_STARTUP_ATTEMPTS:-300}"
+  case "$startup_attempts" in
+    ''|*[!0-9]*) echo "❌ ZEROKUN_RUNNER_STARTUP_ATTEMPTSが不正です。" >&2; exit 1 ;;
+  esac
+  [ "$startup_attempts" -ge 1 ] && [ "$startup_attempts" -le 600 ] \
+    || { echo "❌ ZEROKUN_RUNNER_STARTUP_ATTEMPTSは1〜600で指定してください。" >&2; exit 1; }
   if job_runner_is_alive; then
     echo "   job-runner: running (PID $(tr -d '[:space:]' < "$JOB_RUNNER_PID"), FIFO=1)"
     return
@@ -334,6 +344,76 @@ start_job_runner() {
       exit 1
     fi
   fi
+  if [ -f "$JOB_RUNNER_STARTER_LOCK" ]; then
+    local existing_starter_pid
+    existing_starter_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_STARTER_LOCK" 2>/dev/null || true)"
+    if process_command_is "$existing_starter_pid" 'runner-launcher\.ts'; then
+      lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$existing_starter_pid" 'runner-launcher\.ts' || {
+        echo "❌ 既存runner launcherのgenerationを検証できません。自動停止しません。" >&2
+        exit 1
+      }
+      # A concurrent launcher may still be between its starter lease and the
+      # daemon lock. Give it the same bounded startup window before classifying
+      # it as an orphan. The exact starter lease is rechecked on every pass.
+      for ((attempt = 0; attempt < startup_attempts; attempt += 1)); do
+        if job_runner_is_alive; then
+          echo "   job-runner: running (PID $(tr -d '[:space:]' < "$JOB_RUNNER_PID"), FIFO=1)"
+          return
+        fi
+        lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$existing_starter_pid" \
+          'runner-launcher\.ts' || break
+        sleep 0.1
+      done
+      if job_runner_is_alive; then
+        echo "   job-runner: running (PID $(tr -d '[:space:]' < "$JOB_RUNNER_PID"), FIFO=1)"
+        return
+      fi
+      if lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$existing_starter_pid" \
+        'runner-launcher\.ts'; then
+        echo "   終了済みrunnerを待ち続けているlauncherを安全に回収します。" >&2
+        bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+          stop-owner-force "$JOB_RUNNER_STARTER_LOCK" "$existing_starter_pid" \
+          'runner-launcher\.ts' 5000 >/dev/null 2>&1 || {
+            echo "❌ 既存runner launcherを同一generationのまま停止できません。" >&2
+            exit 1
+          }
+      fi
+      for _ in {1..50}; do
+        lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$existing_starter_pid" \
+          'runner-launcher\.ts' || break
+        sleep 0.1
+      done
+      if lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$existing_starter_pid" \
+        'runner-launcher\.ts'; then
+        echo "❌ 既存runner launcherの停止を確認できません。次の起動は行いません。" >&2
+        exit 1
+      fi
+    fi
+  fi
+  # The old launcher may have published its daemon after the first check but
+  # before it was stopped. Re-run the exact daemon replacement guard so a
+  # mismatched or retained generation cannot overlap the new FIFO worker.
+  if job_runner_is_alive; then
+    echo "   job-runner: running (PID $(tr -d '[:space:]' < "$JOB_RUNNER_PID"), FIFO=1)"
+    return
+  fi
+  if [ -f "$JOB_RUNNER_PID" ]; then
+    local late_runner_pid
+    late_runner_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_PID" 2>/dev/null || true)"
+    if process_command_is "$late_runner_pid" 'job-runner\.ts[[:space:]]+daemon'; then
+      lock_process_is "$JOB_RUNNER_PID" "$late_runner_pid" \
+        'job-runner\.ts[[:space:]]+daemon' || {
+          echo "❌ 遅れて起動したjob runnerのgenerationを検証できません。自動停止しません。" >&2
+          exit 1
+        }
+      bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+        stop-owner-force "$JOB_RUNNER_PID" "$late_runner_pid" \
+        'job-runner\.ts\s+daemon' 10000 >/dev/null 2>&1 || {
+          echo "❌ 遅れて起動したjob runnerを同一generationのまま停止できません。" >&2
+          exit 1
+        }
+    fi
+  fi
   [ -f "$JOB_RUNNER" ] || {
     echo "❌ Codex job runnerが未導入です。bash zerokun/setup.sh を再実行してください。" >&2
     exit 1
@@ -343,13 +423,7 @@ start_job_runner() {
     echo "❌ runner launcherが未導入です。bash zerokun/setup.sh を再実行してください。" >&2
     exit 1
   }
-  local starter_pid startup_attempts
-  startup_attempts="${ZEROKUN_RUNNER_STARTUP_ATTEMPTS:-300}"
-  case "$startup_attempts" in
-    ''|*[!0-9]*) echo "❌ ZEROKUN_RUNNER_STARTUP_ATTEMPTSが不正です。" >&2; exit 1 ;;
-  esac
-  [ "$startup_attempts" -ge 1 ] && [ "$startup_attempts" -le 600 ] \
-    || { echo "❌ ZEROKUN_RUNNER_STARTUP_ATTEMPTSは1〜600で指定してください。" >&2; exit 1; }
+  local starter_pid
   bun --config=/dev/null --no-env-file \
     "$RUNNER_LAUNCHER" "$JOB_RUNNER" "$STATE_DIR" "$JOB_RUNNER_LOG" \
     "$JOB_RUNNER_STARTER_LOCK" \
