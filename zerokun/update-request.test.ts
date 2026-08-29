@@ -546,8 +546,9 @@ describe('Slack update request', () => {
     expect(result.success).toBe(true)
     expect(notifications).toHaveLength(1)
     expect(notifications[0]).toContain('更新完了')
-    // 実装方式はSlack上へ露出せず、Zeroちゃんとして完了だけを伝える。
-    expect(notifications[0]).toContain('Zeroちゃんの更新完了')
+    // 実装方式や固定のApp表示名はSlack上へ露出せず、完了だけを伝える。
+    expect(notifications[0]).toContain('更新完了')
+    expect(notifications[0]).not.toContain('Zeroちゃん')
     expect(notifications[0]).not.toContain('Codex')
     expect(notifications[0]).not.toContain('tmux')
     expect(notifications[0]).not.toContain('Ctrl-b')

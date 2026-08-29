@@ -1,8 +1,8 @@
 # Zeroちゃん
 
 Slack の DM・メンションを、Herdr上で動くローカルのCodexへ安全に渡すmacOS向けゲートウェイです。
-Slack上には実装名を出さず、アプリ名と通知名は `Zeroちゃん` に統一します。既存のClaude版Slack Appを
-停止・変更・再利用せず、このPC専用の別Slack Appとstateを使います。
+Slack Appの表示名はセットアップ時に自由に設定できます。Slackへ投稿する本文は一人称で、表示名を
+固定しません。ローカルの監視tabや管理ログでは、runtime名として `Zeroちゃん` を使います。
 
 ## 仕組み
 
@@ -34,7 +34,8 @@ Slack bot
   状況を問い合わせます。固定stage文や推測の進捗率ではなく、その時点で本人が返した短い日本語の
   `commentary`だけを同じSlack threadへ再送し、terminal・中止・user返信を常に優先します。
   受付には`eyes`、正常完了時には元メッセージへ`white_check_mark` reactionを付けます。本文は
-  Zeroちゃんとして簡潔で温かい日本語と自然な絵文字1〜2個を使い、内部engine名は表示しません。
+  Slackアシスタントとして一人称の簡潔で温かい日本語と自然な絵文字1〜2個を使い、固定の表示名や
+  内部engine名は表示しません。
 - Codex 子プロセスには Slack token や任意の親process環境を渡しません。Slack 投稿は gateway/runner の bot 経路だけです。
 - 起動時のHerdr socket・pane・terminal・workspaceを固定し、job開始前に同じidentityを再検証します。
   staleなHerdr環境ではCodexを起動しません。
@@ -114,7 +115,7 @@ write実装中またはreview中に同じSlackスレッドから返信が来た�
 - macOS
 - Git、Bun、tmux、Herdr 0.8.2 以上（必要なworkspace/tab/pane/agent APIを含む）
 - Codex CLI 0.149.0 以上（`codex login status`が`Logged in using ChatGPT`と返すこと）
-- App を作成できる Slack workspace
+- Slack workspaceと、既存Appのtokenを管理できる権限（新規Appを使う場合はApp作成・install権限）
 - このMacでsubscription login済みのGrok CLIとClaude Code（Zeroちゃん稼働中にAPI key認証は行いません）
 
 通常jobのためにClaude channel/MCPや既存Claude paneは不要です。各必須roundでZeroちゃんが
@@ -127,25 +128,98 @@ prompt送達後に中断しても同じpromptは再送せず、owner-only receip
 
 ## セットアップ
 
-`zero-codex` を既に clone 済みなら:
+### 別のMacで使うときの選び方
+
+最初に、旧PCを止めて移行するのか、複数PCを同時に動かすのかを決めます。
+
+| 利用方法 | Slack Appとtoken |
+| --- | --- |
+| 旧PCのgatewayを停止して新PCへ移行 | 既存Slack Appの`xapp-...`と`xoxb-...`を再利用できます。新しいAppの作成・installは不要です。 |
+| 複数PCを同時に稼働 | 稼働するPCごとに別のSlack Appとtokenを用意します。表示名はPCごとに変えられます。 |
+
+同じSlack AppのSocket Mode接続を複数PCで同時に開くと、各payloadはどれか1接続へ送られ、
+分配先は保証されません。そのため、同じApp/tokenを同時利用するとPCごとのqueue・thread・project状態が
+分断されます。詳しくは[SlackのSocket Modeドキュメント](https://docs.slack.dev/apis/events-api/using-socket-mode/)
+を参照してください。
+
+### 1. 本体を導入する
+
+新PCでrepositoryをcloneし、基本セットアップを実行します。
+
+```bash
+git clone https://github.com/zerocolored/zero-codex.git
+cd zero-codex
+git switch main
+bash zerokun/bootstrap-macos.sh --skip-slack
+```
+
+bootstrapがCodex／Grok CLI／Claude Codeの未ログインを検出して停止した場合だけ、Herdr上で
+`codex login`、`grok login`、Claude Codeのsubscription loginを人が完了し、同じcommandを
+再実行します。稼働中のシステムがAPI keyを要求したり、認証画面を操作したりすることはありません。
+
+既にclone済みなら、次だけで構いません。
 
 ```bash
 git switch main
-bash zerokun/bootstrap-macos.sh
+bash zerokun/bootstrap-macos.sh --skip-slack
 ```
 
 bootstrapは公式standalone Codexをaccount-owned領域へ導入してからsetupを実行します。
 Homebrew/npm版だけを使った直接`setup.sh`は、後日の安全な自己更新と同じ信頼条件を満たさないため公開手順では使いません。
-初回MacでCodex/Grok/Claude Codeが未導入・未ログインなら、必要なCLIを用意したあと安全に停止します。
-その時だけHerdr上で`codex login`、`grok login`、Claude Codeのsubscription loginを人が実行し、
-同じbootstrap commandを再実行してください。
-以後Zeroちゃんはdaemon起動時と各job attemptのApp Server起動直前に既存のsubscription loginを再検証して
-使うだけで、API key取得・API課金・認証画面操作は行いません。
 
-別PCのClaude版と比較する場合は、旧PCと既存Slack Appをそのまま残し、このPCでは
-`zero-codex`、`~/.codex/zerokun`、新しいSlack Appを使います。旧Appの`xapp-`/`xoxb-`
-tokenをこのPCへコピーしないでください。同一PCでClaude版とCodex版を同時稼働させる構成は
-サポートしません。
+### 2A. 旧PCを止めて移行する
+
+移行中は新しい依頼を投稿しないでください。新PCのgatewayが起動するまで、この短い
+静止区間を作ることで、旧PCと新PCのどちらにも同じ依頼を処理させません。
+
+1. 旧PCで`zerokun-jobs status`を確認し、実行中・待機中jobがなくなるまで待ちます。
+2. `SLACK_APP_TOKEN`と`SLACK_BOT_TOKEN`の2値だけを、AirDropや暗号化されたpassword managerなどの
+   安全な経路で新PCへ移します。tokenをGit、Slack投稿、issue、通常ログへ貼らないでください。
+3. 新PCの`~/.codex/zerokun/.env`へ2値を保存し、`chmod 600 ~/.codex/zerokun/.env`を実行します。
+4. 新PCで`bash zerokun/bootstrap-macos.sh --slack-only`を実行します。既存Appのtoken identityを検証し、
+   App IDに結び付いた履歴下限を保存します。このcommandだけではSocket Mode gatewayを起動しません。
+5. 旧PCで`touch "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/watchdog-off"`を実行し、停止警報を無効にします。
+6. 旧PCの`zerochan`を起動したpaneで`Ctrl-C`を押し、`zerochan status`でgateway停止を確認します。
+7. 下の「3. projectとSlackチャンネルを設定して起動する」を新PCで終えてから、Slackへの依頼を再開します。
+
+`jobs.sqlite3`、process lock、監視tab、inbox/outboxなどのruntime stateはコピーしません。channel紐付け、
+DM pairing、repository write許可は新PCで設定し直します。履歴下限より前の旧依頼は新しい空DBでも
+再実行されず、下限より後に届いた依頼は通常の履歴回収とdurable dedupの対象です。旧PCのgatewayを再び起動する場合は、先に
+新PC側を停止するか、そのPC用の別Slack Appへ切り替えてください。`Ctrl-C`後も旧PCのidle runnerは
+未処理queue保護のため残りますが、Socket Mode接続はgatewayとともに停止しています。
+
+### 2B. 複数PCを同時に動かす
+
+PCごとに新しいSlack Appを作ります。例えば、このPCの表示名を「ベルミちゃん」にする場合:
+
+```bash
+bash zerokun/bootstrap-macos.sh --slack-only \
+  --slack-app-name "ベルミちゃん" \
+  --slack-bot-name bellmi
+```
+
+基本セットアップとSlack設定を最初から続けて行う場合は、`--slack-only`を`--with-slack`へ
+置き換えます。
+
+生成されたmanifestでAppを作成・installし、そのApp自身の`xapp-...`と`xoxb-...`を入力します。
+別PCのtokenは使いません。同じSlackチャンネルへ複数のAppを招待しても構いませんが、新規依頼では
+処理させたいAppをメンションしてください。
+
+### 3. projectとSlackチャンネルを設定して起動する
+
+対象projectを新PCへcloneし、Herdrの専用paneで次を実行します。複数repositoryをまとめた親folderも
+対象にできます。
+
+```bash
+cd /absolute/path/to/project
+zerochan set slack-channel C0123456789
+zerochan
+```
+
+複数channelを同じprojectへ紐付ける場合は、channel IDを変えて`zerochan set slack-channel`を繰り返します。
+Appを各channelへ招待したうえで、新しい依頼はそのAppをメンションします。同じthreadの続きは
+再メンション不要です。DMは最初に表示されるcodeを`zerochan-access pair <code>`で承認し、
+repositoryの変更を許可する利用者だけ`zerochan-access write allow <Slack user ID>`を実行します。
 
 同一PCのClaude版を完全に置き換える場合だけ、旧 `zero` cloneを残したまま`zero-codex`を
 別directoryへcloneし、旧stateを明示してsetupします。
@@ -158,7 +232,7 @@ bash zerokun/bootstrap-macos.sh
 
 この明示的なcutoverでは旧runnerをdrainして停止し、待機jobをCodex queueへ引き継ぎます。
 
-新しい Mac へ一式入れる場合:
+repositoryを手動cloneせず、公開bootstrapを先に取得して一式を導入することもできます:
 
 ```bash
 bootstrap_dir="$(/usr/bin/mktemp -d /tmp/zerokun-bootstrap.XXXXXX)"
@@ -168,13 +242,13 @@ bootstrap_path="$bootstrap_dir/bootstrap-macos.sh"
   /usr/bin/curl -q --fail --location --proto '=https' --proto-redir '=https' \
     --tlsv1.2 --noproxy '*' --output "$bootstrap_path" \
     https://raw.githubusercontent.com/zerocolored/zero-codex/main/zerokun/bootstrap-macos.sh
-bash "$bootstrap_path" --with-slack
+bash "$bootstrap_path" --skip-slack
 /bin/rm -f "$bootstrap_path"
 /bin/rmdir "$bootstrap_dir"
 ```
 
-先にファイルを保存するため、実行前に内容を確認できます。既に `zero-codex` をclone済みなら、その repository で
-`git switch main` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使えます。
+先にファイルを保存するため、実行前に内容を確認できます。このあと
+`cd ~/Desktop/Project/zero-codex`を実行し、上の「2A」または「2B」のSlack設定へ進みます。
 
 bootstrapはZeroちゃん本体とは別の`zerokun-workspace` Git repositoryを、最小安全指示の`AGENTS.md`
 初期commit付きで作ります。既存projectを初期workspace／DMのdefault projectに使う場合は、
@@ -190,8 +264,10 @@ Zeroちゃん本体はhost runtimeなので、そこを対象にしたSlack writ
 
 ### Slack App
 
-このPCのZeroちゃん専用に新しいSlack Appを作ります。manifestの既定表示名は `Zeroちゃん`、
-Slack bot usernameはSlackの文字制約に合わせて `zerochan` です。
+新規Appを作る場合、manifestの既定表示名は `Zeroちゃん`、Slack bot usernameはSlackの文字制約に
+合わせて `zerochan` です。`--slack-app-name`と`--slack-bot-name`で変更できます。Slackへ投稿する本文は
+一人称なので、「ベルミちゃん」など別の表示名でもコード変更は不要です。旧PCのgatewayを停止する移行では、
+既存Appのtokenを新PCへ安全に移して`--slack-only`を使うため、この作成手順は不要です。
 [`zerokun/templates/slack-app-manifest.yaml`](zerokun/templates/slack-app-manifest.yaml)
 を Slack の **Create New App → From a manifest** へ貼り、その後:
 
@@ -222,9 +298,9 @@ zerochan-access pair abc123
 zerochan-access status
 ```
 
-チャンネルはZeroちゃんを招待し、対象projectで `zerochan set slack-channel <channel-id>` を
+チャンネルは利用するSlack Appを招待し、対象projectで `zerochan set slack-channel <channel-id>` を
 実行すると利用できます。参加者は全員利用でき、bot投稿は無視します。新しい依頼は
-`@Zeroちゃん` へのメンションが必要ですが、同じスレッドの続きはメンション不要です。
+そのSlack Appへのメンションが必要ですが、同じスレッドの続きはメンション不要です。
 
 受信を許可しても repository write は許可されません。書込みが必要な利用者だけ別に付与します。
 
@@ -274,7 +350,7 @@ zerokun-update
 ```
 
 更新対象は `origin/main` の fast-forward のみです。未コミット変更や未 push の local commit
-がある場合は停止します。書込み許可済みの利用者は Slack で「Zeroちゃんを更新して」と依頼でき、
+がある場合は停止します。書込み許可済みの利用者は Slack で「このアプリを更新してください」と依頼でき、
 通常 FIFO の外にある detached updater が自己デッドロックを避けて実行します。
 remoteの候補commitは隔離cloneをCodex sandbox内でsandbox-safe contract test・型検査・build・shell検査してから
 live branchをfast-forwardします。macOSはsandboxの入れ子を拒否するため、実Codex sandbox・tmux・process制御を

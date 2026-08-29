@@ -717,6 +717,8 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('Slack bot username')
     expect(script).toContain('xoxb-[A-Za-z0-9._-]{10,}')
     expect(script).toContain('xapp-[A-Za-z0-9._-]{10,}')
+    expect(script).toContain('initialize_slack_catchup_floor()')
+    expect(script).toContain('initialize-slack-catchup-floor')
     const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
     expect(setup.indexOf('delegate-active "$SETUP_LOCK/pid" "$$"'))
       .toBeLessThan(setup.indexOf('install-fifth-advisor.ts" verify'))
@@ -726,6 +728,8 @@ describe('macOS bootstrap', () => {
       .toBeLessThan(setup.indexOf('install-fifth-advisor.ts" install'))
     expect(setup.indexOf('install-fifth-advisor.ts" install'))
       .toBeLessThan(setup.indexOf('job-runner.ts" prepare-storage'))
+    expect(setup.indexOf('job-runner.ts" prepare-storage'))
+      .toBeLessThan(setup.indexOf('initialize-slack-catchup-floor'))
   })
 
   test('古いHomebrew Herdrを公式stable installerのstandaloneへ置換する', () => {
@@ -1596,6 +1600,7 @@ codex --version
       'messages_tab_enabled: true',
       'messages_tab_read_only_enabled: false',
       'name: Zeroちゃん',
+      'description: ローカルで動くSlackアシスタントとやり取りするためのアプリ',
       'display_name: zerochan',
       'display_name: zerochan',
       '- app_mention',
@@ -1608,6 +1613,7 @@ codex --version
       '- reactions:write',
     ]) expect(manifest).toContain(expected)
     expect(manifest).not.toContain('display_name: ゼロくん')
+    expect(manifest).not.toContain('description: ローカルで動くZeroちゃん')
   })
 
   test('Slack manifest renderer applies a custom app name and valid bot username', () => {

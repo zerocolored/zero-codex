@@ -380,8 +380,8 @@ export function isExplicitUpdateRequest(text: string): boolean {
     .toLowerCase()
     .replace(/[。．.!！]+$/g, '')
     .replace(/\s+/g, ' ')
-  const japanese = /^(?:Zeroちゃん|ゼロちゃん|ゼロくん|zero-?kun|zerokun)(?:を|の)?(?:最新版(?:へ|に)?|本体(?:を)?|コード(?:を)?)?(?:更新|アップデート)(?:して|してください|して下さい|をお願い|お願い|お願いします|をお願いします|を実行して|を実行してください)$/i
-  const english = /^(?:please )?(?:(?:update|upgrade) (?:zero[ -]?kun|zerokun)|(?:zero[ -]?kun|zerokun) (?:update|upgrade))(?: now)?$/i
+  const japanese = /^(?:Zeroちゃん|ゼロちゃん|ゼロくん|zero-?kun|zerokun|このアプリ|あなた自身)(?:を|の)?(?:最新版(?:へ|に)?|本体(?:を)?|コード(?:を)?)?(?:更新|アップデート)(?:して|してください|して下さい|をお願い|お願い|お願いします|をお願いします|を実行して|を実行してください)$/i
+  const english = /^(?:please )?(?:(?:update|upgrade) (?:zero[ -]?kun|zerokun|this app|yourself)|(?:zero[ -]?kun|zerokun|this app) (?:update|upgrade))(?: now)?$/i
   return japanese.test(normalized) || english.test(normalized)
 }
 
@@ -391,6 +391,18 @@ export type CatchupSweepPolicy = {
   channelPolicy?: ChannelPolicy
   oldestMs: number
   limit?: number
+}
+
+/** Combine the rolling recovery window with durable App/route cutover floors. */
+export function resolveCatchupOldestMs(
+  windowOldestMs: number,
+  ...floors: Array<number | null | undefined>
+): number {
+  const values = [windowOldestMs, ...floors.filter((value): value is number => value != null)]
+  if (values.some(value => !Number.isSafeInteger(value) || value < 0)) {
+    throw new Error('catch-up lower bound is invalid')
+  }
+  return Math.max(...values)
 }
 
 /**

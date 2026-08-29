@@ -249,11 +249,15 @@ describe('Zero-kun Codex wiring', () => {
     expect(helperOpen).toBeGreaterThan(requestCreate)
   })
 
-  test('Slack上のsystem文面はZeroちゃん名義で実装名を露出しない', () => {
+  test('Slack上のsystem文面は表示名を固定せず実装名も露出しない', () => {
     const server = readFileSync(join(root, 'server.ts'), 'utf8')
     const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
     const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
-    expect(server).toContain('Zeroちゃん')
+    expect(server).toContain('ペアリングが完了しました。私に話しかけてください。')
+    expect(server).toContain('🔄 更新依頼を受け付けました。')
+    expect(server).not.toContain('Zeroちゃんに話しかけてください')
+    expect(server).not.toContain('Zeroちゃんの更新を受け付けました')
+    expect(server).not.toContain('Zeroちゃんとのペアリング')
     expect(runner).toContain('🙌 受け付けました（待ち順')
     expect(server).not.toContain('Codexで受け付けました')
     expect(server).not.toContain('Say hi to Codex')
@@ -267,6 +271,8 @@ describe('Zero-kun Codex wiring', () => {
     expect(runner).not.toContain('Zeroちゃんの job ${job.id.slice')
     expect(runner).not.toContain('Codexの処理が完了しました。')
     expect(executor).toContain('処理は完了しましたが、返答本文を取得できませんでした。')
+    expect(executor).toContain('Do not introduce or repeat a')
+    expect(executor).not.toContain('speak warmly and concisely as Zeroちゃん')
     expect(executor).not.toContain('(Codex returned no final text output)')
   })
 

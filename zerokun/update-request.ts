@@ -940,8 +940,8 @@ export async function runUpdateWorker(
       errorText = error instanceof Error ? error.message : String(error)
     }
     const text = success
-      ? '✅ Zeroちゃんの更新完了\n更新・テスト・setup・再起動が完了しました。'
-      : '❌ Zeroちゃんの更新失敗\n詳細はこのMacの管理ログを確認してください。'
+      ? '✅ 更新完了\n更新・テスト・setup・再起動が完了しました。'
+      : '❌ 更新失敗\n詳細はこのMacの管理ログを確認してください。'
     outcome = { success, exitCode, text, completedAt: Date.now() }
     persistRequest(dir, { ...request, outcome })
   }

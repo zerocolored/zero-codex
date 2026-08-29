@@ -263,8 +263,9 @@ Codex stdout/stderr logはfileごとに20MB、解析用memoryは1MB tailへ制�
   markerで束縛した本人の`commentary`だけをdurable通知として同じthreadへ投稿する
 - 正常完了時はterminal本文・成果物の配送後に元メッセージへ`white_check_mark`を付け、reactionだけ
   失敗した場合は本文を再投稿せず同じ永続台帳から再試行する
-- Slack本文はZeroちゃんとして簡潔で温かい日本語と自然な絵文字1〜2個を使い、内部engine名を出さない
+- Slack本文はアシスタントの一人称で簡潔で温かい日本語と自然な絵文字1〜2個を使い、固定の表示名や内部engine名を出さない
 - live event と poll の重複を `(chat_id, message_ts)` で排除
+- fresh stateでは検証済みSlack App IDごとの履歴下限を保存し、別PCへtokenだけを移した際の旧依頼再実行を防止
 
 旧stateを`ZEROKUN_LEGACY_CUTOVER=1`と`ZEROKUN_STATE_DIR`で明示したin-place cutoverでは、旧 `threads.json` をSQLiteへ
 importし、旧runnerをdrain/停止してから入れ替えます。旧待機jobはClaude sessionを破棄して
@@ -273,8 +274,11 @@ Codex queueへ引き継ぎ、停止後もrunningだった不確実なjobは二�
 ## State
 
 既定は常に `~/.codex/zerokun` です。旧版の`~/.claude/channels/slack`は自動選択せず、
-別PCのClaude版のtoken・access・queueを暗黙に流用しません。比較時はこのPC専用の
-新しいSlack Appを作成します。同一PCのin-place cutoverだけcutoverフラグと旧stateを明示します。
+access・queue・process stateを暗黙に流用しません。旧PCのgatewayを停止する移行では既存Slack Appのtokenを
+新stateへ安全に移して再利用できます。bootstrapがApp別の履歴下限をfresh DBへ固定するため、旧依頼は
+再実行されません。移行中は新gatewayの起動までSlackへ新しい依頼を投稿しません。複数PCを同時稼働する場合は
+PCごとに別のSlack Appを作成します。
+同一PCのin-place cutoverだけcutoverフラグと旧stateを明示します。
 
 ```text
 .env
@@ -319,7 +323,7 @@ zerochan-access status
 zerokun-update
 ```
 
-チャンネルはZeroちゃんを招待し、対象projectで `zerochan set slack-channel C...` を実行すると
+チャンネルは利用するSlack Appを招待し、対象projectで `zerochan set slack-channel C...` を実行すると
 利用できます。新しい依頼はメンション、同じthreadの続きはメンション不要です。設定はGitに
 含まれない `.zerochan/config.json` に保存され、`routes.json`の編集は不要です。最初の
 `zerochan`だけが共有gateway/runnerを起動し、別projectからの起動は同じserviceへ参加して終了します。

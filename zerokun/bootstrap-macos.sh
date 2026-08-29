@@ -1367,6 +1367,11 @@ verify_slack_app_identity() {
     "$bun_bin" --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-identity.ts" verify-file "$STATE_DIR/.env"
 }
 
+initialize_slack_catchup_floor() {
+  ZEROKUN_STATE_DIR="$STATE_DIR" bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/job-runner.ts" initialize-slack-catchup-floor >/dev/null
+}
+
 save_slack_tokens() {
   local bot_token="$1"
   local app_token="$2"
@@ -1517,6 +1522,8 @@ configure_slack() {
   fi
   if slack_tokens_ready; then
     if verify_slack_app_identity; then
+      initialize_slack_catchup_floor \
+        || fail "Slack履歴の安全な開始時刻を保存できませんでした"
       ok "同じSlack Appのトークン2つを確認しました"
       configure_access
       return
@@ -1553,9 +1560,10 @@ configure_slack() {
       → connections:write を追加し、xapp-をコピー
    2. OAuth & Permissions → Install to Workspace
       → Bot User OAuth Tokenのxoxb-をコピー
-   このCodex版用に新しいAppを作成してください。別PCで稼働中のClaude版Appの
-   xapp-/xoxb-トークンは使用しません。同じCodex stateでの再設定時だけ、
-   そのCodex版Appの既存トークンを再利用できます。
+   複数PCを同時に稼働する場合は、このPC専用の新しいAppを作成してください。
+   旧PCのgatewayを停止して移行する場合は、新しいAppを作らず、既存Appの
+   xapp-/xoxb-トークンを新PCの安全なstateへ移して再利用できます。
+   同じAppのトークンを複数PCで同時に使用しないでください。
 EOF
   local bot_token app_token
   read_slack_token xapp 'App-Level Token（xapp-）' SLACK_APP_TOKEN
@@ -1565,6 +1573,8 @@ EOF
   save_slack_tokens "$bot_token" "$app_token"
   verify_slack_app_identity \
     || fail "Bot TokenとApp-Level Tokenが同じSlack Appか確認できませんでした"
+  initialize_slack_catchup_floor \
+    || fail "Slack履歴の安全な開始時刻を保存できませんでした"
   ok "同じSlack Appのトークン2つを権限600で保存しました"
   configure_access
 }

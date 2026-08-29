@@ -21,6 +21,7 @@ import {
   pruneDeliveredKeys, planCatchupSweep, msToSlackTs,
   effectiveDmAllowFrom, isExplicitUpdateRequest, catchupThreadParents,
   slackThreadKey, slackTsToMs,
+  resolveCatchupOldestMs,
   singleFlightAsync,
   roundRobinAfter,
   isInvalidSlackCursor,
@@ -392,7 +393,7 @@ function checkApprovals(): void {
       try {
         await slackApp!.client.chat.postMessage({
           channel: dmChannelId,
-          text: "ペアリングが完了しました。Zeroちゃんに話しかけてください。リポジトリへの書込みは、管理者が明示的に許可するまで無効です。",
+          text: "ペアリングが完了しました。私に話しかけてください。リポジトリへの書込みは、管理者が明示的に許可するまで無効です。",
         })
         rmSync(file, { force: true })
       } catch (err) {
@@ -624,14 +625,14 @@ async function enqueueUpdate(
         await slackApp!.client.chat.postMessage({
           channel: chatId,
           thread_ts: threadTs,
-          text: '🔄 Zeroちゃんの更新を受け付けました。現在の処理が終わり次第更新し、このスレッドへ結果を通知します。',
+          text: '🔄 更新依頼を受け付けました。現在の処理が終わり次第更新し、このスレッドへ結果を通知します。',
         })
       },
       onDuplicate: async _request => {
         await slackApp!.client.chat.postMessage({
           channel: chatId,
           thread_ts: threadTs,
-          text: '🔄 Zeroちゃんの更新はすでに待機中または実行中です。',
+          text: '🔄 更新依頼はすでに待機中または実行中です。',
         })
       },
     },
@@ -1034,8 +1035,8 @@ slackApp.event('message', async ({ event }) => {
 
   if (result.action === 'pair') {
     const lead = result.isResend
-      ? 'Zeroちゃんとのペアリング待ちです'
-      : 'Zeroちゃんとのペアリングが必要です'
+      ? 'ペアリングの承認待ちです'
+      : '私とのペアリングが必要です'
     try {
       await slackApp!.client.chat.postMessage({
         channel: channelId,
@@ -1080,14 +1081,14 @@ slackApp.event('member_joined_channel', async ({ event }) => {
       channel: channelId,
       text: routeReady
         ? [
-          `:wave: *Zeroちゃん*です。このチャンネルから利用できます。`,
+          `:wave: このチャンネルで私を利用できます。`,
           ``,
-          `新しい依頼は \`@Zeroちゃん\` とメンションしてください。`,
+          `新しい依頼は私をメンションしてください。`,
           `同じスレッドの続きは、再メンションなしで受け取ります。`,
         ].join('\n')
         : [
-          `:wave: *Zeroちゃん*です。`,
-          `対象projectで \`zerochan set slack-channel ${channelId}\` を実行すると、このチャンネルから利用できます。`,
+          `:wave: 利用するにはproject設定が必要です。`,
+          `対象projectで \`zerochan set slack-channel ${channelId}\` を実行すると、このチャンネルで私を利用できます。`,
         ].join('\n'),
     })
   } catch (err) {
@@ -1486,8 +1487,8 @@ async function processPendingReplyScanPages(
       }
       if (result.action === 'pair') {
         const lead = result.isResend
-          ? 'Zeroちゃんとのペアリング待ちです'
-          : 'Zeroちゃんとのペアリングが必要です'
+          ? 'ペアリングの承認待ちです'
+          : '私とのペアリングが必要です'
         try {
           await slackApp.client.chat.postMessage({
             channel: scan.channelId,
@@ -1552,15 +1553,20 @@ async function catchupSweep(): Promise<void> {
   if (updateTransactionPending(UPDATE_JOURNAL_FILE)) return
   const windowHours = positiveInteger(process.env.ZEROKUN_CATCHUP_WINDOW_H, 48)
   const configuredLimit = process.env.ZEROKUN_CATCHUP_LIMIT
-  const oldestMs = Date.now() - windowHours * 60 * 60 * 1000
+  const appId = currentSlackAppId()
+  const oldestMs = resolveCatchupOldestMs(
+    Date.now() - windowHours * 60 * 60 * 1000,
+    jobStore.slackCatchupFloor(appId),
+  )
+  const routeFloors = new Map(
+    jobStore.listSlackChannelRoutes(appId).map(route => [route.channelId, route.configuredAt]),
+  )
   const access = loadAccess()
   const channelIds = new Set(Object.keys(access.channels))
   for (const thread of jobStore.listThreads()) {
     if (!thread.chatId.startsWith('D')) channelIds.add(thread.chatId)
   }
   const dmChannels = new Set<string>()
-  const appId = currentSlackAppId()
-
   try {
     await stageDirectMessageChannelPages()
   } catch (err) {
@@ -1583,9 +1589,14 @@ async function catchupSweep(): Promise<void> {
   for (const channelId of scheduledChannels) {
     if (processedChannels >= channelBudget) break
     const isDM = dmChannels.has(channelId)
+    const channelOldestMs = resolveCatchupOldestMs(oldestMs, routeFloors.get(channelId))
     let catchup: Awaited<ReturnType<typeof channelCatchupMessages>>
     try {
-      catchup = await channelCatchupMessages(channelId, msToSlackTs(oldestMs), oldestMs)
+      catchup = await channelCatchupMessages(
+        channelId,
+        msToSlackTs(channelOldestMs),
+        channelOldestMs,
+      )
     } catch (err) {
       if (isSlackBudgetError(err)) break
       if (isDM && slackDirectMessageFailureDisposition(channelId, err) === 'backoff') {
@@ -1681,8 +1692,8 @@ async function catchupSweep(): Promise<void> {
       }
       if (result.action === 'pair') {
         const lead = result.isResend
-          ? 'Zeroちゃんとのペアリング待ちです'
-          : 'Zeroちゃんとのペアリングが必要です'
+          ? 'ペアリングの承認待ちです'
+          : '私とのペアリングが必要です'
         try {
           await slackApp.client.chat.postMessage({
             channel: channelId,

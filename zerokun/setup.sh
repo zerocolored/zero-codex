@@ -438,6 +438,11 @@ bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/install-fifth-advisor.ts
 # move to Codex; uncertain running rows fail closed and require an explicit resend.
 # Opening JobStore for status/server startup is deliberately non-destructive.
 ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/job-runner.ts" prepare-storage
+if [ "$VERIFY_SLACK_IDENTITY" = "1" ]; then
+  ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/job-runner.ts" initialize-slack-catchup-floor >/dev/null \
+    || { echo "❌ Slack履歴の安全な開始時刻を保存できません" >&2; exit 1; }
+fi
 if [ "$LEGACY_CUTOVER" = "1" ]; then
   ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/job-runner.ts" migrate-legacy
 fi
@@ -549,8 +554,9 @@ if [ "${ZEROKUN_BOOTSTRAP:-0}" = "1" ]; then
   echo "✅ 配線完了。bootstrapのSlack設定へ続きます。"
 else
   echo "✅ 配線完了。残りの手動ステップ:"
-  echo "  1. Slack アプリをこのマシン用に新規作成し(1台=1アプリ=1ボット名)、"
-  echo "     トークン2つを $CH/.env に貼る (xoxb- / xapp-。作成手順はリポ直下 README.md)"
+  echo "  1. 複数PCを同時稼働する場合は、このMac用のSlack Appを新規作成します。"
+  echo "     旧PCのgatewayを止めて移行する場合は、既存Appのトークン2つを再利用できます。"
+  echo "     $CH/.env に xoxb- / xapp- を保存します (作成・移行手順はリポ直下 README.md)"
   echo "  2. codex login status が Logged in using ChatGPT と返すことを確認"
   echo "  3. 対象projectへ cd して: zerochan set slack-channel <SlackチャンネルID>"
   echo "     Herdrの専用paneで起動: zerochan"

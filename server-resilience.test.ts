@@ -28,6 +28,9 @@ describe('Slack bridge resilience wiring', () => {
     expect(server).toContain('CATCHUP_SWEEP_INTERVAL_MS')
     expect(server).toContain('async function channelHistory(')
     expect(server).toContain('async function channelCatchupMessages(')
+    expect(server).toContain('jobStore.slackCatchupFloor(appId)')
+    expect(server).toContain('jobStore.listSlackChannelRoutes(appId).map(route => [route.channelId, route.configuredAt])')
+    expect(server).toContain('const channelOldestMs = resolveCatchupOldestMs(oldestMs, routeFloors.get(channelId))')
     expect(server).toContain('const historyScan = await channelHistory(channel, oldest)')
     expect(server).not.toContain("join(STATE_DIR, 'catchup-parent-scan.json')")
     expect(server).not.toContain("join(STATE_DIR, 'poll-state.json')")
@@ -209,13 +212,14 @@ describe('Slack bridge resilience wiring', () => {
     expect(message).toContain('? { target: threadAuthorityTarget }')
   })
 
-  test('catch-upもZeroちゃん日本語pairingとdurable handoff後のeyes経路を使う', () => {
+  test('catch-upも表示名に依存しないpairing文とdurable handoff後のeyes経路を使う', () => {
     const catchup = server.slice(
       server.indexOf('async function catchupSweep()'),
       server.indexOf('async function pollThreads()'),
     )
-    expect(catchup).toContain('Zeroちゃんとのペアリング待ちです')
-    expect(catchup).toContain('Zeroちゃんとのペアリングが必要です')
+    expect(catchup).toContain('ペアリングの承認待ちです')
+    expect(catchup).toContain('私とのペアリングが必要です')
+    expect(catchup).not.toContain('Zeroちゃんとのペアリング')
     expect(catchup).not.toContain('Still pending')
     expect(catchup).not.toContain('Pairing required')
     expect(catchup).toContain('activeThreadAuthorityTarget(')
@@ -262,8 +266,9 @@ describe('Slack bridge resilience wiring', () => {
   test('参加channelを自動記録し、channel routeへ最初のthreadを原子的に固定する', () => {
     expect(server).toContain('rememberChannel(channelId, ACCESS_FILE)')
     expect(server).toContain('(loadAccess().channels[channelId]?.requireMention ?? true)')
-    expect(server).toContain('このチャンネルから利用できます。')
-    expect(server).toContain('新しい依頼は \\`@Zeroちゃん\\` とメンションしてください。')
+    expect(server).toContain('このチャンネルで私を利用できます。')
+    expect(server).toContain('新しい依頼は私をメンションしてください。')
+    expect(server).not.toContain('@Zeroちゃん')
     expect(server).not.toContain('zerokun-access')
     expect(server).not.toContain('ROUTES_FILE')
     expect(server).not.toContain('configuredRepoPath(')

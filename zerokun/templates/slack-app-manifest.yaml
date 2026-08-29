@@ -3,7 +3,7 @@ _metadata:
 display_information:
   # bootstrap実行時に入力した表示名へ置換される。直接使う場合もこの名前は変更可能。
   name: Zeroちゃん
-  description: ローカルで動くZeroちゃんとSlackでやり取りするためのアプリ
+  description: ローカルで動くSlackアシスタントとやり取りするためのアプリ
 features:
   app_home:
     home_tab_enabled: false

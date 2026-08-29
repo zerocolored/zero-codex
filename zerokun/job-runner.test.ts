@@ -983,6 +983,37 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('fresh stateだけにApp別catch-up floorを一度だけ固定する', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    expect(store.initializeSlackCatchupFloorIfPristine('A0123456789', 1_000)).toEqual({
+      created: true,
+      floorMs: 1_000,
+    })
+    expect(store.initializeSlackCatchupFloorIfPristine('A0123456789', 2_000)).toEqual({
+      created: false,
+      floorMs: 1_000,
+    })
+    expect(store.slackCatchupFloor('A0123456789')).toBe(1_000)
+    store.close()
+
+    store = new JobStore(path)
+    expect(store.slackCatchupFloor('A0123456789')).toBe(1_000)
+    store.close()
+  })
+
+  test('既存ledgerへupgradeしてもcatch-up floorを現在時刻へ動かさない', () => {
+    const store = makeStore()
+    store.enqueue(input({ messageId: 'existing-before-floor' }))
+    expect(store.initializeSlackCatchupFloorIfPristine('A0123456789', 5_000)).toEqual({
+      created: false,
+      floorMs: null,
+    })
+    expect(store.slackCatchupFloor('A0123456789')).toBeNull()
+    store.close()
+  })
+
   test('完了したold-parent scanを同一gateway周期で先頭から再armする', () => {
     const store = makeStore()
     expect(store.commitSlackReadCursorIfDurable(
@@ -7685,9 +7716,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
 })
 
 describe('Slack output guard', () => {
-  test('rate-limit通知はZeroちゃん名義だけで内部job識別子を含めない', () => {
+  test('rate-limit通知は表示名を固定せず内部job識別子を含めない', () => {
     const message = slackRateLimitMessage(Date.UTC(2026, 0, 2, 3, 4))
-    expect(message).toContain('Zeroちゃん')
+    expect(message).not.toContain('Zeroちゃん')
+    expect(message).toContain('一時停止しています')
     expect(message).toContain('自動再開します')
     expect(message).not.toMatch(/Codex|\bjob\b|\bworker\b|\brequest\b/i)
     expect(message).not.toMatch(/[0-9a-f]{8}-[0-9a-f-]{27,}/i)

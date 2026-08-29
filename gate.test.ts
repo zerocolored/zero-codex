@@ -20,6 +20,7 @@ import {
   decideThreadReplyDelivery,
   effectiveDmAllowFrom,
   isExplicitUpdateRequest,
+  resolveCatchupOldestMs,
   slackThreadKey,
   singleFlightAsync,
   validateLegacyThreadMap,
@@ -600,6 +601,10 @@ describe('isExplicitUpdateRequest — privileged detached route', () => {
     expect(isExplicitUpdateRequest('please update zero-kun now')).toBe(true)
     expect(isExplicitUpdateRequest('zerokun update')).toBe(true)
     expect(isExplicitUpdateRequest('<@U0123456789> ゼロくんを更新してください')).toBe(true)
+    expect(isExplicitUpdateRequest('このアプリを更新してください')).toBe(true)
+    expect(isExplicitUpdateRequest('あなた自身をアップデートして')).toBe(true)
+    expect(isExplicitUpdateRequest('please update this app')).toBe(true)
+    expect(isExplicitUpdateRequest('update yourself now')).toBe(true)
   })
 
   test('質問・説明・否定は通常jobに残す', () => {
@@ -607,6 +612,8 @@ describe('isExplicitUpdateRequest — privileged detached route', () => {
     expect(isExplicitUpdateRequest('ゼロくんを更新できますか？')).toBe(false)
     expect(isExplicitUpdateRequest('ゼロくんを更新しないで')).toBe(false)
     expect(isExplicitUpdateRequest('update zero-kun の仕組み')).toBe(false)
+    expect(isExplicitUpdateRequest('このアプリは更新できますか？')).toBe(false)
+    expect(isExplicitUpdateRequest('あなた自身を更新しないで')).toBe(false)
   })
 })
 
@@ -666,6 +673,30 @@ describe('planCatchupSweep — startup recovery', () => {
     }, BOT_USER)
 
     expect(plan.map(item => item.ts)).toEqual([ts(-50_000), ts(-20_000)])
+  })
+
+  test('fresh stateのApp floorと新規channel設定時刻より古い依頼を再実行しない', () => {
+    const appFloor = NOW - 40_000
+    const routeFloor = NOW - 20_000
+    const oldestMs = resolveCatchupOldestMs(NOW - 48 * 60 * 60 * 1_000, appFloor, routeFloor)
+    expect(oldestMs).toBe(routeFloor)
+    const plan = planCatchupSweep([
+      message(-60_000, { text: `<@${BOT_USER}> 完了済みの更新` }),
+      message(-30_000, { text: `<@${BOT_USER}> App設定前の依頼` }),
+      message(-10_000, { text: `<@${BOT_USER}> 設定後の依頼` }),
+    ], [], {
+      channelId: 'C123',
+      channelType: 'channel',
+      channelPolicy: policy({ requireMention: true }),
+      oldestMs,
+      limit: 20,
+    }, BOT_USER)
+    expect(plan.map(item => item.text)).toEqual([`<@${BOT_USER}> 設定後の依頼`])
+  })
+
+  test('catch-up lower boundは不正値を拒否する', () => {
+    expect(() => resolveCatchupOldestMs(NOW, -1)).toThrow('catch-up lower bound is invalid')
+    expect(() => resolveCatchupOldestMs(Number.NaN)).toThrow('catch-up lower bound is invalid')
   })
 
   test('DMはメンション不要だがbot DMは除外する', () => {

@@ -68,6 +68,7 @@ import {
   withSlackDeadline,
 } from './slack-http.ts'
 import {
+  appIdFromAppToken,
   slackTokenPairRuntimeIdentity,
   verifySlackAppTokenPair,
 } from './slack-app-identity.ts'
@@ -486,6 +487,11 @@ CREATE TABLE IF NOT EXISTS slack_channel_route_state (
   app_id TEXT PRIMARY KEY,
   explicit_mode INTEGER NOT NULL DEFAULT 1 CHECK (explicit_mode = 1),
   activated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS slack_catchup_floors (
+  app_id TEXT PRIMARY KEY,
+  oldest_ms INTEGER NOT NULL CHECK (oldest_ms > 0),
+  created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS terminal_notifications (
   id TEXT PRIMARY KEY,
@@ -1593,6 +1599,61 @@ export class JobStore {
     return this.db.query<{ present: number }, [string]>(
       'SELECT 1 AS present FROM slack_channel_route_state WHERE app_id = ?',
     ).get(appId) !== null
+  }
+
+  /**
+   * A fresh state has no durable idempotency ledger. Pin its first Slack
+   * history read to the time the verified App was configured so reusing that
+   * App on another Mac cannot replay requests completed by the old gateway.
+   * Existing installations without this table row retain their established
+   * cursors instead of silently moving the lower bound during an upgrade.
+   */
+  initializeSlackCatchupFloorIfPristine(
+    appIdInput: string,
+    now = Date.now(),
+  ): { created: boolean; floorMs: number | null } {
+    const appId = requireSlackAppId(appIdInput)
+    if (!Number.isSafeInteger(now) || now <= 0) throw new Error('catch-up floor timestamp is invalid')
+    const initialize = this.db.transaction(() => {
+      const existing = this.db.query<{ oldest_ms: number }, [string]>(
+        'SELECT oldest_ms FROM slack_catchup_floors WHERE app_id = ?',
+      ).get(appId)
+      if (existing) return { created: false, floorMs: existing.oldest_ms }
+
+      const state = this.db.query<{ present: number }, []>(
+        `SELECT (
+          EXISTS(SELECT 1 FROM jobs)
+          OR EXISTS(SELECT 1 FROM inbound_deliveries)
+          OR EXISTS(SELECT 1 FROM job_controls)
+          OR EXISTS(SELECT 1 FROM delivery_tombstones)
+          OR EXISTS(SELECT 1 FROM update_request_ledger)
+          OR EXISTS(SELECT 1 FROM slack_threads)
+          OR EXISTS(SELECT 1 FROM slack_channel_routes)
+          OR EXISTS(SELECT 1 FROM slack_channel_route_state)
+          OR EXISTS(SELECT 1 FROM slack_read_cursors)
+        ) AS present`,
+      ).get()
+      if (state?.present === 1) return { created: false, floorMs: null }
+
+      this.db.run(
+        `INSERT INTO slack_catchup_floors (app_id, oldest_ms, created_at)
+         VALUES (?, ?, ?)`,
+        [appId, now, now],
+      )
+      return { created: true, floorMs: now }
+    })
+    return retrySqlite(() => initialize.immediate())
+  }
+
+  slackCatchupFloor(appIdInput: string): number | null {
+    const appId = requireSlackAppId(appIdInput)
+    const floor = this.db.query<{ oldest_ms: number }, [string]>(
+      'SELECT oldest_ms FROM slack_catchup_floors WHERE app_id = ?',
+    ).get(appId)?.oldest_ms ?? null
+    if (floor !== null && (!Number.isSafeInteger(floor) || floor <= 0)) {
+      throw new Error('stored catch-up floor is invalid')
+    }
+    return floor
   }
 
   assertSlackChannelRoutesAvailable(
@@ -7880,7 +7941,7 @@ export function slackRateLimitMessage(resumeAt: number): string {
     minute: '2-digit',
     hour12: false,
   }).format(new Date(resumeAt))
-  return `⏸ 使用量上限のため、Zeroちゃんは一時停止しています。${time} に自動再開します。`
+  return `⏸ 使用量上限のため、一時停止しています。${time} に自動再開します。`
 }
 
 export function slackArtifactsAbandonedMessage(): string {
@@ -9131,6 +9192,18 @@ async function runCli(): Promise<void> {
     try {
       store.enableIncrementalVacuum()
       process.stdout.write(`${JSON.stringify({ autoVacuum: 'incremental' })}\n`)
+    } finally { store.close() }
+    return
+  }
+
+  if (command === 'initialize-slack-catchup-floor') {
+    try {
+      const tokens = parseStateSlackTokens(readOptionalPrivateFile(join(dir, '.env')) ?? '')
+      if (!tokens.SLACK_APP_TOKEN) throw new Error('Slack App token is missing')
+      const result = store.initializeSlackCatchupFloorIfPristine(
+        appIdFromAppToken(tokens.SLACK_APP_TOKEN),
+      )
+      process.stdout.write(`${JSON.stringify(result)}\n`)
     } finally { store.close() }
     return
   }

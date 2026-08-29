@@ -13,13 +13,52 @@ bootstrap_path="$bootstrap_dir/bootstrap-macos.sh"
   /usr/bin/curl -q --fail --location --proto '=https' --proto-redir '=https' \
     --tlsv1.2 --noproxy '*' --output "$bootstrap_path" \
     https://raw.githubusercontent.com/zerocolored/zero-codex/main/zerokun/bootstrap-macos.sh
-bash "$bootstrap_path" --with-slack
+bash "$bootstrap_path" --skip-slack
 /bin/rm -f "$bootstrap_path"
 /bin/rmdir "$bootstrap_dir"
 ```
 
 実行前に保存したスクリプトの内容を確認できます。既に `zero-codex` をclone済みなら、その repository で
-`git switch main` を実行してから `bash zerokun/bootstrap-macos.sh --with-slack` を使います。
+`git switch main` を実行してから `bash zerokun/bootstrap-macos.sh --skip-slack` を使います。
+
+## Slack Appを移行するか、新しく作るか
+
+| 利用方法 | Slack設定 |
+| --- | --- |
+| 旧PCのgatewayを停止して新PCへ移行 | 既存Appの`xapp-...`と`xoxb-...`を再利用できます。新しいApp作成・installは不要です。 |
+| 旧PCと新PCを同時に稼働 | PCごとに別のSlack Appとtokenが必要です。 |
+
+同じSlack AppのSocket Mode接続を2台から同時に開くと、payloadはどちらか一方へ配信され、分配先は
+保証されません。各PCのqueue・thread・project状態を混ぜないため、同時稼働では必ずAppを分けます。
+
+移行中は、新PCのgatewayが起動するまでSlackへ新しい依頼を投稿しません。まず旧PCのqueueが空に
+なったことを`zerokun-jobs status`で確認します。新PCへtokenの2値だけを安全な経路で移し、
+`~/.codex/zerokun/.env`へ保存してmode 0600にしたあと、次を実行します。
+
+```bash
+bash zerokun/bootstrap-macos.sh --slack-only
+```
+
+このcommandはApp IDに結び付いた履歴下限を保存しますが、Socket Mode gatewayは起動しません。
+その後、旧PCのwatchdogを
+`touch "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/watchdog-off"`で無効化し、`zerochan`を
+起動したpaneで`Ctrl-C`を押します。`zerochan status`が停止中になってから新PCのgatewayを起動し、
+Slackへの依頼を再開します。
+
+`jobs.sqlite3`、lock、監視tab、inbox/outboxなどのruntime stateはコピーしません。channel紐付け、
+DM pairing、write許可は新PCで設定し直します。`Ctrl-C`後もidle runnerは残りますが、Socket Mode接続は
+gatewayとともに停止しています。履歴下限より前の旧依頼はfresh DBでも再実行されません。旧PCでは
+gatewayを再起動しないでください。
+
+同時稼働で新しいAppを作る場合は、表示名をPCごとに変えられます。
+
+```bash
+bash zerokun/bootstrap-macos.sh --slack-only \
+  --slack-app-name "ベルミちゃん" \
+  --slack-bot-name bellmi
+```
+
+各Appを利用するSlackチャンネルへ招待し、それぞれ固有のtokenを入力してください。
 
 スクリプトが扱うもの:
 
@@ -45,7 +84,7 @@ macOS や外部サービスの確認画面だけは自動化しません。
 
 1. Command Line Tools の install dialog
 2. Codex / Grok CLI / Claude Code のlogin
-3. Slack App 作成・Workspace install
+3. 同時稼働の場合のSlack App作成・Workspace install（gateway停止移行では既存Appを再利用）
 4. App-Level Token（`xapp-...`）と Bot Token（`xoxb-...`）の貼付け
 5. Slack user/channel ID の選択
 
@@ -71,6 +110,8 @@ bash zerokun/bootstrap-macos.sh --skip-slack
 ```bash
 bash zerokun/bootstrap-macos.sh --slack-only
 ```
+
+旧PCのgatewayを停止する移行では既存Appのtokenを、同時稼働では新しく作成したAppのtokenを入力します。
 
 bootstrapはログイン画面を自動操作しません。新しいMacでは最初の実行でCLIを導入し、未ログインなら
 安全に停止します。そのあとHerdr上で次を実行し、同じbootstrap commandをもう一度実行してください。
@@ -168,8 +209,8 @@ commit identityは対象repositoryのlocal configへ設定し、認証pushは別
 ## 再実行
 
 `setup.sh` と bootstrap はCodex state内の既存 `.env` / `access.json` を上書きしません。
-別PCのClaude版は停止せず、そのSlack Appやtokenも流用しません。途中で停止した場合は
-同じcommandを再実行できます。自己更新は次を使います。
+途中で停止した場合は同じcommandを再実行できます。旧PCと同時に稼働する場合はSlack App/tokenを
+分け、旧PCのgatewayを停止して移行する場合だけ既存App/tokenを再利用します。自己更新は次を使います。
 
 ```bash
 zerokun-update
@@ -186,8 +227,8 @@ zerokun-update
 ~/.codex/zerokun
 ```
 
-旧版の`~/.claude/channels/slack`は存在しても自動選択しません。新しいMacでは
-新しいSlack App、token、DB、access、routesをCodex stateへ作成します。別の場所を使う場合、
+旧版の`~/.claude/channels/slack`は存在しても自動選択しません。新しいMacでは新しいDB、access、
+routesをCodex stateへ作成します。Slack App/tokenは停止移行なら再利用でき、同時稼働なら新規作成します。別の場所を使う場合、
 または同一PCでin-place cutoverする場合だけ、最初のsetupより前に明示します。
 
 ```bash
@@ -195,5 +236,5 @@ export ZEROKUN_LEGACY_CUTOVER=1
 export ZEROKUN_STATE_DIR="$HOME/.claude/channels/slack"
 ```
 
-setupはlaunchdにも同じ場所とcutoverフラグを設定します。別PC比較ではこの2つを使わず、既定の
+setupはlaunchdにも同じ場所とcutoverフラグを設定します。通常の別PC導入ではこの2つを使わず、既定の
 `~/.codex/zerokun`を使ってください。

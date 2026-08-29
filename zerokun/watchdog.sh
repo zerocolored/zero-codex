@@ -350,7 +350,7 @@ except Exception:
 alert = None
 if bridge_up and runner_up:
     if state.get("status") == "down":
-        alert = "✅ Zeroちゃんが復旧しました。"
+        alert = "✅ 応答できる状態に復旧しました。"
     next_state = default.copy()
 else:
     consecutive = int(state.get("consecutiveDownChecks") or 0) + 1
@@ -366,7 +366,7 @@ else:
     if should_alert:
         since = dt.datetime.fromtimestamp(down_since).strftime("%H:%M")
         alert = (
-            f"🚨 Zeroちゃんが停止しています。{since}から応答できていません。"
+            f"🚨 現在、応答できない状態です。{since}から応答できていません。"
             "復旧するには、Macの端末で zerochan --restart を実行してください。"
         )
         last_alert = now
@@ -499,7 +499,7 @@ selftest() {
   rm -f "$test_dir/plugin.lock"
   ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH" >/dev/null
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
-  [[ "$output" == *'🚨 Zeroちゃんが停止しています'* ]] || selftest_fail 'second down did not alert' || return 1
+  [[ "$output" == *'🚨 現在、応答できない状態です'* ]] || selftest_fail 'second down did not alert' || return 1
   printf 'ok: second down sends alert\n'
 
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
@@ -516,12 +516,12 @@ with open(path, "w", encoding="utf-8") as handle:
     json.dump(state, handle)
 PY
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
-  [[ "$output" == *'🚨 Zeroちゃんが停止しています'* ]] || selftest_fail 'late reminder missing' || return 1
+  [[ "$output" == *'🚨 現在、応答できない状態です'* ]] || selftest_fail 'late reminder missing' || return 1
   printf 'ok: reminder is sent after interval\n'
 
   printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
-  [[ "$output" == *'✅ Zeroちゃんが復旧しました。'* ]] || selftest_fail 'recovery missing' || return 1
+  [[ "$output" == *'✅ 応答できる状態に復旧しました。'* ]] || selftest_fail 'recovery missing' || return 1
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'duplicate recovery' || return 1
   printf 'ok: recovery sends once\n'
@@ -551,7 +551,7 @@ if [ "${1:-}" = "--test-notification" ]; then
   STATE_DIR="$(resolve_state_dir)" || exit 1
   prepare_state_dir || exit 1
   load_state_env
-  if send_notification '🧪 Zeroちゃんwatchdog通知テスト（実装確認のための1通です）'; then
+  if send_notification '🧪 監視通知のテストです（確認用の1通です）'; then
     printf 'zerokun watchdog: test notification sent\n'
     exit 0
   fi

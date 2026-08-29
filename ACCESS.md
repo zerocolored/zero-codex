@@ -4,8 +4,10 @@ Zeroちゃんは「メッセージを受け取れる人」と「repository を�
 DM pairingやchannel参加だけでは書込み権限は付きません。
 
 設定ファイルは既定で `~/.codex/zerokun/access.json` にあります。旧版の
-`~/.claude/channels/slack` は自動選択しません。別PCのClaude版と比較する場合は新しい
-Slack AppとCodex stateを使い、旧token・accessをコピーしないでください。
+`~/.claude/channels/slack` は自動選択しません。旧PCのgatewayを停止する移行では既存Slack Appのtokenだけを
+新stateへ安全に移せますが、access・queueはコピーせず新PCで設定し直します。複数PCを同時稼働する場合は
+PCごとに別のSlack AppとCodex stateを使います。fresh stateにはApp別の履歴下限が保存され、移行前の
+Slack依頼を空のdedup ledgerで再実行しないようにします。
 同一PCのin-place cutover時だけ`ZEROKUN_LEGACY_CUTOVER=1`と
 `ZEROKUN_STATE_DIR`の両方で旧stateを明示します。
 
@@ -87,12 +89,12 @@ zerochan-access write deny U0123456789
 
 ## Channel policy
 
-Zeroちゃんをchannelへ招待し、対象projectで
+利用するSlack Appをchannelへ招待し、対象projectで
 `zerochan set slack-channel <channel-id>`を実行すると、そのchannelの人は誰でも利用できます。
 利用者allowlistはありません。bot投稿とSlack user IDでないsenderは常に無視します。
 
-- 新しいchannel依頼は `@Zeroちゃん` のメンションが必要です。
-- いったんZeroちゃんが採用したthreadの人による返信は、senderが変わってもメンション不要です。
+- 新しいchannel依頼は、そのSlack Appへのメンションが必要です。
+- いったんそのAppが採用したthreadの人による返信は、senderが変わってもメンション不要です。
 - 実行中の同じthreadへの返信はlive inputとして割り込み、別threadは独立したFIFO jobになります。
 - 招待・最初のlive mentionでchannelを内部記録し、再起動後の履歴回収に使います。
 - 新しいthreadはproject-localの`.zerochan/config.json`で紐付けたprojectへ固定されます。

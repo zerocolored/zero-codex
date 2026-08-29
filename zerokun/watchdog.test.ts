@@ -49,13 +49,14 @@ describe('Zero-kun watchdog', () => {
     expect(watchdogSource).not.toContain(': > "$LOG_FILE"')
   })
 
-  test('Slack alertはZeroちゃん名義だけで内部component名を出さない', () => {
-    const start = watchdogSource.indexOf('alert = "✅ Zeroちゃんが復旧しました。"')
+  test('Slack alertは表示名を固定せず内部component名を出さない', () => {
+    const start = watchdogSource.indexOf('alert = "✅ 応答できる状態に復旧しました。"')
     const alertProgram = watchdogSource.slice(
       start,
       watchdogSource.indexOf('with open(next_path', start),
     )
-    expect(alertProgram).toContain('Zeroちゃんが停止しています')
+    expect(alertProgram).toContain('現在、応答できない状態です')
+    expect(alertProgram).not.toContain('Zeroちゃん')
     expect(alertProgram).toContain('zerochan --restart')
     expect(alertProgram).not.toContain('zerokun-restart')
     expect(alertProgram).not.toContain('bridge:')
