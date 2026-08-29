@@ -137,6 +137,8 @@ export const SERIAL_WORKER_COUNT = 1 as const
 export const JOB_RUNNER_HANDSHAKE = 'zerokun-codex-runner-v1' as const
 export const DEFAULT_MAX_JOBS_PER_SESSION = 20 as const
 export const CODEX_SESSION_PROTOCOL_VERSION = 2 as const
+const SLACK_DM_HISTORY_RETRY_BASE_MS = 24 * 60 * 60 * 1_000
+const SLACK_DM_HISTORY_RETRY_MAX_MS = 7 * 24 * 60 * 60 * 1_000
 const MONITOR_LOSS_RECOVERY_MESSAGE =
   '監視タブが失われたため、安全に処理状態を復旧できませんでした。'
   + '実行プロセスの停止を確認して、この依頼を失敗として終了しました。'
@@ -700,6 +702,17 @@ CREATE TABLE IF NOT EXISTS slack_pending_dm_channels (
   channel_id TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS slack_dm_history_retries (
+  app_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  failure_count INTEGER NOT NULL CHECK (failure_count >= 1),
+  error_code TEXT NOT NULL,
+  next_attempt_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (app_id, channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_slack_dm_history_retries_due
+  ON slack_dm_history_retries(app_id, next_attempt_at, channel_id);
 CREATE TABLE IF NOT EXISTS slack_reply_scans (
   scan_key TEXT PRIMARY KEY,
   channel_id TEXT NOT NULL,
@@ -1314,6 +1327,14 @@ function requireSlackChannelId(value: string): string {
   const normalized = requireText(value, 'Slack channel ID').toUpperCase()
   if (!/^[CG][A-Z0-9]+$/.test(normalized)) {
     throw new Error(`invalid Slack channel ID: ${value}`)
+  }
+  return normalized
+}
+
+function requireSlackDirectMessageId(value: string): string {
+  const normalized = requireText(value, 'Slack direct-message ID').toUpperCase()
+  if (!/^D[A-Z0-9]+$/.test(normalized)) {
+    throw new Error(`invalid Slack direct-message ID: ${value}`)
   }
   return normalized
 }
@@ -2042,10 +2063,97 @@ export class JobStore {
     retrySqlite(() => stage.immediate())
   }
 
-  listPendingDirectMessageChannels(): string[] {
-    return retrySqlite(() => this.db.query<{ channel_id: string }, []>(
-      'SELECT channel_id FROM slack_pending_dm_channels ORDER BY channel_id',
-    ).all().map(row => row.channel_id))
+  listPendingDirectMessageChannels(appIdInput?: string, now = Date.now()): string[] {
+    if (appIdInput === undefined) {
+      return retrySqlite(() => this.db.query<{ channel_id: string }, []>(
+        'SELECT channel_id FROM slack_pending_dm_channels ORDER BY channel_id',
+      ).all().map(row => row.channel_id))
+    }
+    const appId = requireSlackAppId(appIdInput)
+    return retrySqlite(() => this.db.query<{ channel_id: string }, [string, number]>(
+      `SELECT pending.channel_id
+       FROM slack_pending_dm_channels AS pending
+       WHERE NOT EXISTS (
+         SELECT 1 FROM slack_dm_history_retries AS retry
+         WHERE retry.app_id = ?
+           AND retry.channel_id = pending.channel_id
+           AND retry.next_attempt_at > ?
+       )
+       ORDER BY pending.channel_id`,
+    ).all(appId, now).map(row => row.channel_id))
+  }
+
+  recordSlackDirectMessageHistoryFailure(
+    appIdInput: string,
+    channelIdInput: string,
+    now = Date.now(),
+  ): { firstFailure: boolean; failureCount: number; nextAttemptAt: number } {
+    const appId = requireSlackAppId(appIdInput)
+    const channelId = requireSlackDirectMessageId(channelIdInput)
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error('invalid retry timestamp')
+    const record = this.db.transaction(() => {
+      const existing = this.db.query<{
+        failure_count: number
+        next_attempt_at: number
+      }, [string, string]>(
+        `SELECT failure_count, next_attempt_at FROM slack_dm_history_retries
+         WHERE app_id = ? AND channel_id = ?`,
+      ).get(appId, channelId)
+      // catch-up and owned-thread polling may have the same request in flight.
+      // One observed outage must create one schedule, not advance once per caller.
+      if (existing && existing.next_attempt_at > now) {
+        return {
+          firstFailure: false,
+          failureCount: existing.failure_count,
+          nextAttemptAt: existing.next_attempt_at,
+        }
+      }
+      const failureCount = Math.min((existing?.failure_count ?? 0) + 1, 31)
+      const delay = Math.min(
+        SLACK_DM_HISTORY_RETRY_BASE_MS * (2 ** Math.min(failureCount - 1, 3)),
+        SLACK_DM_HISTORY_RETRY_MAX_MS,
+      )
+      const nextAttemptAt = now + delay
+      this.db.run(
+        `INSERT INTO slack_dm_history_retries (
+           app_id, channel_id, failure_count, error_code, next_attempt_at, updated_at
+         ) VALUES (?, ?, ?, 'channel_not_found', ?, ?)
+         ON CONFLICT(app_id, channel_id) DO UPDATE SET
+           failure_count = excluded.failure_count,
+           error_code = excluded.error_code,
+           next_attempt_at = excluded.next_attempt_at,
+           updated_at = excluded.updated_at`,
+        [appId, channelId, failureCount, nextAttemptAt, now],
+      )
+      return {
+        firstFailure: existing === null,
+        failureCount,
+        nextAttemptAt,
+      }
+    })
+    return retrySqlite(() => record.immediate())
+  }
+
+  clearSlackDirectMessageHistoryFailure(appIdInput: string, channelIdInput: string): boolean {
+    const appId = requireSlackAppId(appIdInput)
+    const channelId = requireSlackDirectMessageId(channelIdInput)
+    return retrySqlite(() => this.db.run(
+      'DELETE FROM slack_dm_history_retries WHERE app_id = ? AND channel_id = ?',
+      [appId, channelId],
+    ).changes === 1)
+  }
+
+  slackDirectMessageHistoryIsDeferred(
+    appIdInput: string,
+    channelIdInput: string,
+    now = Date.now(),
+  ): boolean {
+    const appId = requireSlackAppId(appIdInput)
+    const channelId = requireSlackDirectMessageId(channelIdInput)
+    return retrySqlite(() => this.db.query<{ present: number }, [string, string, number]>(
+      `SELECT 1 AS present FROM slack_dm_history_retries
+       WHERE app_id = ? AND channel_id = ? AND next_attempt_at > ?`,
+    ).get(appId, channelId, now) !== null)
   }
 
   completePendingDirectMessageChannel(channelId: string): boolean {
@@ -2093,6 +2201,35 @@ export class JobStore {
       `SELECT scan_key, channel_id, thread_ts, oldest_ts, cursor
        FROM slack_reply_scans ORDER BY updated_at, scan_key LIMIT ?`,
     ).all(bounded).map(row => ({
+      scanKey: row.scan_key,
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      oldestTs: row.oldest_ts,
+      cursor: row.cursor,
+    })))
+  }
+
+  listDueSlackReplyScans(appIdInput: string, limit = 20, now = Date.now()): SlackReplyScan[] {
+    const appId = requireSlackAppId(appIdInput)
+    const bounded = positiveInteger(limit, 20)
+    return retrySqlite(() => this.db.query<{
+      scan_key: string
+      channel_id: string
+      thread_ts: string
+      oldest_ts: string
+      cursor: string | null
+    }, [string, number, number]>(
+      `SELECT scan.scan_key, scan.channel_id, scan.thread_ts, scan.oldest_ts, scan.cursor
+       FROM slack_reply_scans AS scan
+       WHERE substr(scan.channel_id, 1, 1) <> 'D'
+          OR NOT EXISTS (
+            SELECT 1 FROM slack_dm_history_retries AS retry
+            WHERE retry.app_id = ?
+              AND retry.channel_id = scan.channel_id
+              AND retry.next_attempt_at > ?
+          )
+       ORDER BY scan.updated_at, scan.scan_key LIMIT ?`,
+    ).all(appId, now, bounded).map(row => ({
       scanKey: row.scan_key,
       channelId: row.channel_id,
       threadTs: row.thread_ts,

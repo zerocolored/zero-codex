@@ -26,8 +26,9 @@ import {
   isInvalidSlackCursor,
   advanceReadCursor,
   retreatReadCursor,
-  isTerminalSlackHistoryError,
   isSlackBotAuthored,
+  refreshSlackDirectMessageAvailability,
+  slackDirectMessageFailureDisposition,
   slackReplyScanFailureDisposition,
   validateLegacyThreadMap,
   SLACK_USER_ID_RE,
@@ -417,6 +418,34 @@ slackApp = new App({
 
 let botUserId: string | undefined
 let slackAppId: string | undefined
+
+function currentSlackAppId(): string {
+  if (!slackAppId) throw new Error('Slack app identity is not ready')
+  return slackAppId
+}
+
+function deferUnavailableDirectMessage(channelId: string): void {
+  const retry = jobStore.recordSlackDirectMessageHistoryFailure(
+    currentSlackAppId(), channelId,
+  )
+  if (retry.firstFailure) {
+    process.stderr.write(
+      'Slack: 取得できない過去のDMは24時間後に再確認します'
+      + '（設定チャンネルには影響しません）\n',
+    )
+  }
+}
+
+function restoreAvailableDirectMessage(channelId: string): void {
+  const result = refreshSlackDirectMessageAvailability(() => (
+    jobStore.clearSlackDirectMessageHistoryFailure(currentSlackAppId(), channelId)
+  ))
+  if (result === 'restored') {
+    process.stderr.write('Slack: 過去のDMを再び確認できる状態になりました\n')
+  } else if (result === 'retry') {
+    process.stderr.write('Slack: DMの再確認状態は次回更新します（受信処理は継続します）\n')
+  }
+}
 
 class SlackProjectUnavailableError extends Error {
   constructor(readonly chatId: string) {
@@ -975,6 +1004,7 @@ slackApp.event('message', async ({ event }) => {
   const threadTs = msg.thread_ts
 
   const isDM = channelType === 'im'
+  if (isDM) restoreAvailableDirectMessage(channelId)
   const text = msg.text as string ?? ''
   const normalizedText = normalizeSlackInboundText(text, botUserId, isDM)
   // A DM needs no mention — the DM *is* the address. In a channel the mention
@@ -1358,12 +1388,13 @@ async function processPendingReplyScanPages(
 ): Promise<{ delivered: number; candidates: number }> {
   if (!slackApp) return { delivered: 0, candidates: 0 }
   const pageBudget = positiveInteger(process.env.ZEROKUN_CATCHUP_REPLY_PAGES_PER_SWEEP, 20)
+  const appId = currentSlackAppId()
   const blocked = new Set<string>()
   let deliveredCount = 0
   let candidateCount = 0
 
   for (let page = 0; page < pageBudget; page += 1) {
-    const scan = jobStore.listSlackReplyScans(pageBudget + blocked.size)
+    const scan = jobStore.listDueSlackReplyScans(appId, pageBudget + blocked.size)
       .find(candidate => !blocked.has(candidate.scanKey))
     if (!scan) break
     let response: Awaited<ReturnType<typeof channelThreadReplyPage>>
@@ -1373,20 +1404,25 @@ async function processPendingReplyScanPages(
       )
     } catch (error) {
       if (isSlackBudgetError(error)) break
-      process.stderr.write(`slack channel: reply scan failed for ${scan.channelId}/${scan.threadTs}: ${error}\n`)
-      if (slackReplyScanFailureDisposition(error) === 'discard') {
-        jobStore.discardSlackReplyScan(scan.scanKey)
-        if (scan.channelId.startsWith('D')) {
-          jobStore.completePendingDirectMessageChannel(scan.channelId)
-        }
+      if (slackDirectMessageFailureDisposition(scan.channelId, error) === 'backoff') {
+        deferUnavailableDirectMessage(scan.channelId)
+        jobStore.deferSlackReplyScan(scan.scanKey)
+        blocked.add(scan.scanKey)
         continue
       }
+      if (slackReplyScanFailureDisposition(error) === 'discard') {
+        process.stderr.write('Slack: 終了済みのスレッド確認を整理しました\n')
+        jobStore.discardSlackReplyScan(scan.scanKey)
+        continue
+      }
+      process.stderr.write(`slack channel: reply scan failed for ${scan.channelId}/${scan.threadTs}: ${error}\n`)
       jobStore.deferSlackReplyScan(scan.scanKey)
       blocked.add(scan.scanKey)
       continue
     }
 
     const isDM = scan.channelId.startsWith('D')
+    if (isDM) restoreAvailableDirectMessage(scan.channelId)
     const sweepPolicy = {
       channelId: scan.channelId,
       channelType: isDM ? 'im' : 'channel',
@@ -1523,13 +1559,14 @@ async function catchupSweep(): Promise<void> {
     if (!thread.chatId.startsWith('D')) channelIds.add(thread.chatId)
   }
   const dmChannels = new Set<string>()
+  const appId = currentSlackAppId()
 
   try {
     await stageDirectMessageChannelPages()
   } catch (err) {
     process.stderr.write(`slack channel: catch-up DM list failed: ${err}\n`)
   }
-  for (const channelId of jobStore.listPendingDirectMessageChannels()) {
+  for (const channelId of jobStore.listPendingDirectMessageChannels(appId)) {
     dmChannels.add(channelId)
     channelIds.add(channelId)
   }
@@ -1550,15 +1587,18 @@ async function catchupSweep(): Promise<void> {
     try {
       catchup = await channelCatchupMessages(channelId, msToSlackTs(oldestMs), oldestMs)
     } catch (err) {
-      process.stderr.write(`slack channel: catch-up history failed for ${channelId}: ${err}\n`)
       if (isSlackBudgetError(err)) break
-      if (isDM && isTerminalSlackHistoryError(err)) {
-        jobStore.completePendingDirectMessageChannel(channelId)
+      if (isDM && slackDirectMessageFailureDisposition(channelId, err) === 'backoff') {
+        deferUnavailableDirectMessage(channelId)
+      } else {
+        process.stderr.write(`slack channel: catch-up history failed for ${channelId}: ${err}\n`)
       }
       advanceSchedulerCursor('catchup-channels', channelId)
       processedChannels += 1
       continue
     }
+
+    if (isDM) restoreAvailableDirectMessage(channelId)
 
     const sweepPolicy = {
       channelId,
@@ -1704,10 +1744,12 @@ async function catchupSweep(): Promise<void> {
   deliveredCount += replyScan.delivered
   candidateCount += replyScan.candidates
 
-  process.stderr.write(
-    `slack channel: catch-up sweep delivered=${deliveredCount}`
-    + ` candidates=${candidateCount} channels=${channelIds.size} window=${windowHours}h\n`,
-  )
+  if (candidateCount > 0 || deliveredCount > 0) {
+    process.stderr.write(
+      `Slack: 未受信メッセージを確認しました`
+      + `（候補${candidateCount}件、処理${deliveredCount}件）\n`,
+    )
+  }
 }
 
 const scheduleCatchupSweep = singleFlightAsync(catchupSweep, error => {
@@ -1808,6 +1850,7 @@ async function pollThreads(): Promise<void> {
         .localeCompare(slackThreadKey(right.channel_id, right.thread_ts))
     ))
     const access = loadAccess()
+    const appId = currentSlackAppId()
     const now = Date.now()
     const livePollKeys = new Set(threads.map(entry => (
       slackThreadKey(entry.channel_id, entry.thread_ts)
@@ -1828,6 +1871,11 @@ async function pollThreads(): Promise<void> {
         advanceSchedulerCursor('owned-threads', pollKey)
         continue
       }
+      if (channelId.startsWith('D')
+        && jobStore.slackDirectMessageHistoryIsDeferred(appId, channelId, now)) {
+        advanceSchedulerCursor('owned-threads', pollKey)
+        continue
+      }
 
       const storedCursor = jobStore.readSlackReadCursor('owned-thread', pollKey)
       const cursorTs = threadPollCursor(
@@ -1840,11 +1888,18 @@ async function pollThreads(): Promise<void> {
           channelId, threadTs, cursorTs, 'owned',
         )).messages
       } catch (err) {
-        process.stderr.write(`slack channel: poll replies failed for ${threadTs}: ${err}\n`)
         if (isSlackBudgetError(err)) break
+        if (slackDirectMessageFailureDisposition(channelId, err) === 'backoff') {
+          deferUnavailableDirectMessage(channelId)
+          advanceSchedulerCursor('owned-threads', pollKey)
+          continue
+        }
+        process.stderr.write(`slack channel: poll replies failed for ${threadTs}: ${err}\n`)
         advanceSchedulerCursor('owned-threads', pollKey)
         continue
       }
+
+      if (channelId.startsWith('D')) restoreAvailableDirectMessage(channelId)
 
       const planned = channelId.startsWith('D')
         ? planDirectMessageThreadPoll(

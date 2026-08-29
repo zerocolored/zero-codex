@@ -26,8 +26,11 @@ import {
   roundRobinAfter,
   isInvalidSlackCursor,
   slackApiErrorCode,
+  structuredSlackApiErrorCode,
   isTerminalSlackHistoryError,
   isTerminalSlackReplyScanError,
+  refreshSlackDirectMessageAvailability,
+  slackDirectMessageFailureDisposition,
   slackReplyScanFailureDisposition,
   type ChannelPolicy,
   type SlackReply,
@@ -62,7 +65,12 @@ describe('Slack cursor recovery', () => {
     expect(isInvalidSlackCursor(new Error('Slack API error: invalid_cursor'))).toBe(true)
     expect(isInvalidSlackCursor({ data: { error: 'channel_not_found' } })).toBe(false)
     expect(slackApiErrorCode({ data: { error: 'channel_not_found' } })).toBe('channel_not_found')
+    expect(structuredSlackApiErrorCode({
+      code: 'slack_webapi_platform_error',
+      data: { ok: false, error: 'channel_not_found' },
+    })).toBe('channel_not_found')
     expect(isTerminalSlackHistoryError({ data: { error: 'channel_not_found' } })).toBe(true)
+    expect(isTerminalSlackHistoryError(new Error('Slack: channel_not_found'))).toBe(false)
     expect(isTerminalSlackHistoryError({ data: { error: 'not_in_channel' } })).toBe(false)
     expect(isTerminalSlackHistoryError(new Error('Slack: is_archived'))).toBe(false)
 
@@ -71,8 +79,29 @@ describe('Slack cursor recovery', () => {
     expect(isTerminalSlackReplyScanError({ data: { error: 'not_in_channel' } })).toBe(false)
     expect(isTerminalSlackReplyScanError(new Error('Slack: is_archived'))).toBe(false)
     expect(isTerminalSlackReplyScanError({ data: { error: 'ratelimited' } })).toBe(false)
+    expect(isTerminalSlackReplyScanError(new Error('Slack: thread_not_found'))).toBe(false)
     expect(slackReplyScanFailureDisposition({ data: { error: 'not_in_channel' } })).toBe('defer')
     expect(slackReplyScanFailureDisposition({ data: { error: 'thread_not_found' } })).toBe('discard')
+    expect(slackDirectMessageFailureDisposition(
+      'D012ABC', { data: { error: 'channel_not_found' } },
+    )).toBe('backoff')
+    expect(slackDirectMessageFailureDisposition(
+      'C012ABC', { data: { error: 'channel_not_found' } },
+    )).toBe('defer')
+    expect(slackDirectMessageFailureDisposition(
+      'D012ABC', new Error('Slack: channel_not_found'),
+    )).toBe('defer')
+    expect(slackDirectMessageFailureDisposition(
+      'D012ABC', { data: { error: 'not_in_channel' } },
+    )).toBe('defer')
+  })
+
+  test('DM復旧stateの更新失敗はlive受信処理へ例外を伝播しない', () => {
+    expect(refreshSlackDirectMessageAvailability(() => true)).toBe('restored')
+    expect(refreshSlackDirectMessageAvailability(() => false)).toBe('unchanged')
+    expect(refreshSlackDirectMessageAvailability(() => {
+      throw new Error('temporary database lock')
+    })).toBe('retry')
   })
 
   test('historyはopaque cursorでなくoldest timestampへ後退して再開する', () => {

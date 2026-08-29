@@ -227,16 +227,25 @@ export function roundRobinAfter<T>(items: T[], lastCompleted: T | null): T[] {
     : [...items.slice(index + 1), ...items.slice(0, index + 1)]
 }
 
-/** Slack SDK PlatformError keeps the Web API code in `data.error`. */
-export function slackApiErrorCode(error: unknown): string | null {
+/** Slack SDK PlatformError keeps the authoritative Web API code in `data.error`. */
+export function structuredSlackApiErrorCode(error: unknown): string | null {
   if (error && typeof error === 'object') {
     const data = (error as { data?: unknown }).data
     if (data && typeof data === 'object'
       && typeof (data as { error?: unknown }).error === 'string') {
-      return (data as { error: string }).error
+      return (data as { error: string }).error.toLowerCase()
     }
+  }
+  return null
+}
+
+/** Best-effort diagnostic code; destructive/durable decisions use the structured variant. */
+export function slackApiErrorCode(error: unknown): string | null {
+  const structured = structuredSlackApiErrorCode(error)
+  if (structured) return structured
+  if (error && typeof error === 'object') {
     if (typeof (error as { code?: unknown }).code === 'string') {
-      return (error as { code: string }).code
+      return (error as { code: string }).code.toLowerCase()
     }
   }
   const message = error instanceof Error ? error.message : String(error)
@@ -250,18 +259,40 @@ export function isInvalidSlackCursor(error: unknown): boolean {
 
 /** A missing DM/channel identifier cannot recover without discovering a new ID. */
 export function isTerminalSlackHistoryError(error: unknown): boolean {
-  return slackApiErrorCode(error) === 'channel_not_found'
+  return structuredSlackApiErrorCode(error) === 'channel_not_found'
 }
 
 /** A missing channel or thread makes this exact durable reply-scan key unusable. */
 export function isTerminalSlackReplyScanError(error: unknown): boolean {
   return ['channel_not_found', 'thread_not_found'].includes(
-    slackApiErrorCode(error) ?? '',
+    structuredSlackApiErrorCode(error) ?? '',
   )
 }
 
 export function slackReplyScanFailureDisposition(error: unknown): 'discard' | 'defer' {
   return isTerminalSlackReplyScanError(error) ? 'discard' : 'defer'
+}
+
+/** Only a real Slack PlatformError for a DM may alter its durable retry schedule. */
+export function slackDirectMessageFailureDisposition(
+  channelId: string,
+  error: unknown,
+): 'backoff' | 'defer' {
+  return /^D[A-Z0-9]+$/.test(channelId)
+    && structuredSlackApiErrorCode(error) === 'channel_not_found'
+    ? 'backoff'
+    : 'defer'
+}
+
+/** Availability bookkeeping must never suppress an already-arrived Slack event. */
+export function refreshSlackDirectMessageAvailability(
+  clear: () => boolean,
+): 'restored' | 'unchanged' | 'retry' {
+  try {
+    return clear() ? 'restored' : 'unchanged'
+  } catch {
+    return 'retry'
+  }
 }
 
 // Slack renders an addressed mention as a token, never as plain text:

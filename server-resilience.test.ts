@@ -74,13 +74,30 @@ describe('Slack bridge resilience wiring', () => {
     expect(server).toContain("takeSlackMethodBudget('replies', lane)")
     expect(server).toContain("`${method}:${lane}`")
     expect(server).toContain('stageSlackDirectMessagePage(channels, nextCursor')
-    expect(server).toContain('listPendingDirectMessageChannels()')
+    expect(server).toContain('listPendingDirectMessageChannels(appId)')
     expect(server).toContain('completePendingDirectMessageChannel(channelId)')
-    expect(server).toContain('listSlackReplyScans(pageBudget + blocked.size)')
+    expect(server).toContain('listDueSlackReplyScans(appId, pageBudget + blocked.size)')
     expect(server).toContain('commitSlackReplyScanPageIfDurable(')
     expect(server).toContain('ZEROKUN_CATCHUP_REPLY_PAGES_PER_SWEEP, 20')
     expect(server).toContain("schedulerCursor('catchup-channels')")
     expect(server).toContain("schedulerCursor('owned-threads')")
+  })
+
+  test('取得不能DMだけをdurable backoffし、復旧可能性と人間向けログを保つ', () => {
+    expect(server).toContain('recordSlackDirectMessageHistoryFailure(')
+    expect(server).toContain('slackDirectMessageHistoryIsDeferred(appId, channelId, now)')
+    expect(server).toContain('clearSlackDirectMessageHistoryFailure(currentSlackAppId(), channelId)')
+    expect(server).toContain("slackDirectMessageFailureDisposition(channelId, err) === 'backoff'")
+    expect(server).toContain('取得できない過去のDMは24時間後に再確認します')
+    expect(server).toContain('設定チャンネルには影響しません')
+    expect(server).toContain('refreshSlackDirectMessageAvailability(() => (')
+    expect(server).toContain('受信処理は継続します')
+    expect(server).not.toContain('catch-up sweep delivered=${deliveredCount}')
+    const replyScan = server.slice(
+      server.indexOf('async function processPendingReplyScanPages('),
+      server.indexOf('/** Socket Mode停止中'),
+    )
+    expect(replyScan).not.toContain('completePendingDirectMessageChannel(scan.channelId)')
   })
 
   test('plugin lockはPIDだけでなくserver.tsのprocess identityを照合する', () => {

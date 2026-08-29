@@ -1026,6 +1026,74 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('取得不能DMはApp単位のdurable backoffに入り、期限・live成功で復帰する', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    const now = 1_800_000_000_000
+    const day = 24 * 60 * 60 * 1_000
+    let store = new JobStore(path)
+    store.stageSlackDirectMessagePage(['DSTALE', 'DLIVE'], null, true)
+    store.stageSlackReplyScans([
+      { channelId: 'DSTALE', threadTs: '100.000000', oldestTs: '90.000000' },
+      { channelId: 'DLIVE', threadTs: '101.000000', oldestTs: '90.000000' },
+      { channelId: 'CCHANNEL', threadTs: '102.000000', oldestTs: '90.000000' },
+    ])
+
+    const first = store.recordSlackDirectMessageHistoryFailure('A111', 'DSTALE', now)
+    expect(first).toEqual({
+      firstFailure: true,
+      failureCount: 1,
+      nextAttemptAt: now + day,
+    })
+    const concurrentStore = new JobStore(path)
+    expect(concurrentStore.recordSlackDirectMessageHistoryFailure('A111', 'DSTALE', now + 1))
+      .toEqual({ ...first, firstFailure: false })
+    concurrentStore.close()
+    expect(store.slackDirectMessageHistoryIsDeferred('A111', 'DSTALE', now + 1)).toBe(true)
+    expect(store.listPendingDirectMessageChannels('A111', now + 1)).toEqual(['DLIVE'])
+    expect(store.listPendingDirectMessageChannels('A222', now + 1)).toEqual(['DLIVE', 'DSTALE'])
+    expect(store.listDueSlackReplyScans('A111', 10, now + 1).map(scan => scan.channelId))
+      .toEqual(['CCHANNEL', 'DLIVE'])
+    expect(store.listDueSlackReplyScans('A222', 10, now + 1).map(scan => scan.channelId))
+      .toEqual(['CCHANNEL', 'DLIVE', 'DSTALE'])
+
+    store.stageSlackDirectMessagePage(['DSTALE'], null, true)
+    expect(store.listPendingDirectMessageChannels('A111', now + 1)).toEqual(['DLIVE'])
+    store.close()
+
+    store = new JobStore(path)
+    expect(store.listPendingDirectMessageChannels('A111', now + 1)).toEqual(['DLIVE'])
+    expect(store.listPendingDirectMessageChannels('A111', first.nextAttemptAt))
+      .toEqual(['DLIVE', 'DSTALE'])
+    const second = store.recordSlackDirectMessageHistoryFailure(
+      'A111', 'DSTALE', first.nextAttemptAt,
+    )
+    expect(second).toEqual({
+      firstFailure: false,
+      failureCount: 2,
+      nextAttemptAt: first.nextAttemptAt + (2 * day),
+    })
+    const third = store.recordSlackDirectMessageHistoryFailure(
+      'A111', 'DSTALE', second.nextAttemptAt,
+    )
+    const fourth = store.recordSlackDirectMessageHistoryFailure(
+      'A111', 'DSTALE', third.nextAttemptAt,
+    )
+    const fifth = store.recordSlackDirectMessageHistoryFailure(
+      'A111', 'DSTALE', fourth.nextAttemptAt,
+    )
+    expect(third.nextAttemptAt).toBe(second.nextAttemptAt + (4 * day))
+    expect(fourth.nextAttemptAt).toBe(third.nextAttemptAt + (7 * day))
+    expect(fifth.nextAttemptAt).toBe(fourth.nextAttemptAt + (7 * day))
+    expect(store.clearSlackDirectMessageHistoryFailure('A111', 'DSTALE')).toBe(true)
+    expect(store.slackDirectMessageHistoryIsDeferred('A111', 'DSTALE', now + 1)).toBe(false)
+    expect(store.listPendingDirectMessageChannels('A111', now + 1))
+      .toEqual(['DLIVE', 'DSTALE'])
+    expect(store.listDueSlackReplyScans('A111', 10, now + 1).map(scan => scan.channelId))
+      .toEqual(['CCHANNEL', 'DLIVE', 'DSTALE'])
+    store.close()
+  })
+
   test('reply scanはdurable eventよりcursorを先行させず再起動後も次pageから再開する', () => {
     const dir = fixtureDir()
     const path = join(dir, 'jobs.sqlite3')
