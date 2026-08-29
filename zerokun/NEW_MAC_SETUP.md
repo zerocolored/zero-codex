@@ -159,6 +159,9 @@ job専用permission profileで調査・説明だけを利用できます。
 Zeroちゃん本体repositoryへのwrite jobはhost runtime保護のため拒否されます。変更対象projectへ
 `cd`し、`zerochan set slack-channel C...`でSlackチャンネルを紐付けてから`zerochan`を
 起動してください。新しいchannel threadはその設定先、DMはgatewayを起動したprojectへ固定されます。
+対象folder自身がGit repositoryでなくても、直下に通常cloneが2件以上あれば同じ手順で
+multi-repository workspaceとして利用できます。検出したmemberは`.zerochan/workspace.json`へ
+固定され、各repositoryを個別にtest・commit・pushします。
 Codex shellはHOME credentialを継承しないため、
 commit identityは対象repositoryのlocal configへ設定し、認証pushは別の安全なHOME外方式を用意します。
 

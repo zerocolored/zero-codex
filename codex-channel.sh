@@ -84,7 +84,7 @@ esac
 PROJECT="$(bun --config=/dev/null --no-env-file \
   "$REPO_DIR/zerokun/project-selection.ts" validate-launch \
   "$PROJECT" "$REPO_DIR" "$STATE_DIR" "$HOME")" || {
-  echo "❌ 対象projectを選択できません。Git projectへ cd して zerochan を実行してください。" >&2
+  echo "❌ 対象projectを選択できません。Git repository、または複数repositoryを直下に含むprojectへ cd して zerochan を実行してください。" >&2
   exit 1
 }
 echo "📁 Zeroちゃんの対象project: $PROJECT" >&2

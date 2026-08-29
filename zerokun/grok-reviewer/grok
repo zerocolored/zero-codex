@@ -101,7 +101,23 @@ if [ -z "${ZEROKUN_GROK_REVIEW_ROOT:-}" ]; then
   echo "ZEROKUN_GROK_REVIEW_ROOT is required." >&2
   exit 64
 fi
-if [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_ALLOW:-}" ] || \
+if [ -n "${ZEROKUN_GROK_REVIEW_SCOPE_FILE:-}" ]; then
+  case "$ZEROKUN_GROK_REVIEW_SCOPE_FILE" in /*) ;; *) exit 126 ;; esac
+  if [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_ALLOW:-}" ] || \
+     [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_DENY:-}" ]; then
+    [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_ALLOW:-}" ] && \
+      [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_DENY:-}" ] || exit 126
+    "$reviewer_python" -I "$reviewer_runtime" prepare-run-home-scope \
+      "$reviewer_root" "$reviewer_run_root" "$ZEROKUN_GROK_REVIEW_ROOT" \
+      "$ZEROKUN_GROK_REVIEW_SCOPE_FILE" \
+      "$ZEROKUN_SEATBELT_FINGERPRINT_ALLOW" \
+      "$ZEROKUN_SEATBELT_FINGERPRINT_DENY"
+  else
+    "$reviewer_python" -I "$reviewer_runtime" prepare-run-home-scope \
+      "$reviewer_root" "$reviewer_run_root" "$ZEROKUN_GROK_REVIEW_ROOT" \
+      "$ZEROKUN_GROK_REVIEW_SCOPE_FILE"
+  fi
+elif [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_ALLOW:-}" ] || \
    [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_DENY:-}" ]; then
   [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_ALLOW:-}" ] && \
     [ -n "${ZEROKUN_SEATBELT_FINGERPRINT_DENY:-}" ] || exit 126

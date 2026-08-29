@@ -27,6 +27,10 @@ import {
 } from './safe-file.ts'
 import { readGatewayReadiness } from './readiness.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
+import {
+  ensureWorkspacePin,
+  resolveProjectLayout,
+} from './project-layout.ts'
 
 const CONFIG_VERSION = 1 as const
 const JOURNAL_VERSION = 1 as const
@@ -111,6 +115,8 @@ function sameDirectory(path: string, expected: { dev: number; ino: number }): vo
 }
 
 function trackedZerochanFiles(repoPath: string): string[] {
+  const layout = resolveProjectLayout(repoPath)
+  if (layout.kind === 'multi-repo-workspace') return []
   const result = Bun.spawnSync([
     '/usr/bin/git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
     '-C', repoPath, 'ls-files', '--', '.zerochan',
@@ -131,6 +137,8 @@ function trackedZerochanFiles(repoPath: string): string[] {
 }
 
 function ensureLocalConfigDirectory(repoPath: string): { dev: number; ino: number } {
+  const layout = resolveProjectLayout(repoPath)
+  ensureWorkspacePin(layout)
   const dir = configDirectory(repoPath)
   const tracked = trackedZerochanFiles(repoPath)
   if (tracked.length > 0) {
@@ -334,6 +342,8 @@ export function mutateProjectChannelConfig(input: {
     store = new JobStore(resolveZeroJobDatabasePath(stateDir))
     assertUpdateIdle(stateDir)
     recoverJournal(stateDir, store)
+    const layout = resolveProjectLayout(repoPath)
+    if (layout.kind === 'multi-repo-workspace') ensureLocalConfigDirectory(repoPath)
     const before = readProjectChannelConfig(repoPath)
     const requested = input.channelId === undefined
       ? undefined
@@ -417,6 +427,7 @@ export function projectChannelStatus(input: {
     assertUpdateIdle(stateDir)
     recoverJournal(stateDir, store)
     const config = readProjectChannelConfig(repoPath)
+    const layout = resolveProjectLayout(repoPath)
     const routes = store.listSlackChannelRoutes(appId)
     const explicitMode = store.slackChannelRoutingIsExplicit(appId)
     const owned = routes.filter(route => route.repoPath === repoPath)
@@ -426,6 +437,9 @@ export function projectChannelStatus(input: {
       && readiness.channelRoutingVersion === 1 && readiness.slackAppId === appId
     const lines = [
       `📁 project: ${repoPath}`,
+      ...(layout.kind === 'multi-repo-workspace'
+        ? [`🧩 repositories: ${layout.memberNames.join(', ')}`]
+        : []),
       `▶ Zeroちゃん: ${shared ? `稼働中 (PID ${gateway.pid})` : '停止中'}`,
       config.slackChannels.length > 0
         ? `🔗 Slackチャンネル: ${config.slackChannels.join(', ')}`

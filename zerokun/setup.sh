@@ -276,10 +276,14 @@ fi
 mkdir -p "$PROJECT_DIR"
 [ "$(cd "$PROJECT_DIR" && pwd -P)" != "$(cd "$REPO_DIR" && pwd -P)" ] \
   || { echo "❌ Slack作業projectはZeroちゃん本体と別directoryにしてください" >&2; exit 1; }
-if [ ! -e "$PROJECT_DIR/.git" ]; then
+PROJECT_LAYOUT_KIND="$(bun --config=/dev/null --no-env-file \
+  "$REPO_DIR/zerokun/project-layout.ts" kind "$(cd "$PROJECT_DIR" && pwd -P)")" \
+  || { echo "❌ Slack作業projectの構成を確認できません" >&2; exit 1; }
+if [ "$PROJECT_LAYOUT_KIND" = "non-git" ] && [ ! -e "$PROJECT_DIR/.git" ]; then
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
     git -c core.hooksPath=/dev/null init --initial-branch=main "$PROJECT_DIR" >/dev/null
 fi
+unset PROJECT_LAYOUT_KIND
 
 # 1. 残りの設定ディレクトリをlock保持中に準備する。
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare-directories \

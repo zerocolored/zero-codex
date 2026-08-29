@@ -105,6 +105,7 @@ import {
   writePinnedHerdrRuntime,
 } from './herdr-runtime.ts'
 import { isSlackInterruptCommand } from './live-control.ts'
+import { resolveAdvisorProjectLayout } from './advisor-snapshot.ts'
 
 export class SlackChannelRouteRequiredError extends Error {
   constructor(readonly channelId: string) {
@@ -6665,32 +6666,45 @@ export function sanitizeExecutionTextForSlack(
   // indistinguishable from Zero's runtime IDs. Preserve it only when the
   // answer labels it as a commit and Git confirms that it names a commit in
   // the repository handled by this job.
-  const gitBinary = Bun.which('git', {
-    PATH: '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin',
-  })
+  const gitBinary = '/usr/bin/git'
+  let commitVerificationRoots: string[] = []
+  try {
+    const layout = resolveAdvisorProjectLayout(job.repoPath)
+    commitVerificationRoots = layout.gitRoots.length > 0
+      ? layout.gitRoots
+      : [job.repoPath]
+  } catch {}
   const verifiedGitCommits = new Map<string, boolean>()
   const isVerifiedGitCommit = (value: string): boolean => {
     const normalized = value.toLowerCase()
     const cached = verifiedGitCommits.get(normalized)
     if (cached != null) return cached
     let verified = false
-    if (gitBinary && /^[0-9a-f]{7,64}$/i.test(value)) {
-      try {
+    if (/^[0-9a-f]{7,64}$/i.test(value)) {
+      let matches = 0
+      for (const root of commitVerificationRoots) try {
         const result = Bun.spawnSync([
-          gitBinary, '-C', job.repoPath, 'cat-file', '-e', `${value}^{commit}`,
+          gitBinary, '-C', root, 'cat-file', '-e', `${value}^{commit}`,
         ], {
           env: {
-            PATH: '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin',
+            PATH: '/usr/bin:/bin',
+            HOME: '/',
             GIT_CONFIG_GLOBAL: '/dev/null',
             GIT_CONFIG_NOSYSTEM: '1',
+            GIT_TERMINAL_PROMPT: '0',
+            GIT_ASKPASS: '/usr/bin/false',
+            GIT_OPTIONAL_LOCKS: '0',
             LC_ALL: 'C',
             LANG: 'C',
           },
-          stdout: 'ignore',
-          stderr: 'ignore',
+          stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
         })
-        verified = result.exitCode === 0
+        if (result.exitCode === 0) matches += 1
       } catch {}
+      // A short SHA that names commits in multiple independent repositories
+      // is ambiguous in a project-wide Slack answer. Full object IDs remain
+      // useful even when identical content happens to exist in two members.
+      verified = matches === 1 || (matches > 0 && value.length >= 40)
     }
     verifiedGitCommits.set(normalized, verified)
     return verified

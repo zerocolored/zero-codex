@@ -160,11 +160,12 @@ async function brokerFixture(): Promise<BrokerFixture> {
   const layout = resolveAdvisorProjectLayout(repo)
   const contextPath = join(state, 'context.json')
   writeFileSync(contextPath, `${JSON.stringify({
-    version: 3,
+    version: 4,
     jobId: job.id,
     attemptNonce: nonce,
     repoPath: realpathSync(repo),
     gitRoot: layout.gitRoot,
+    gitRoots: layout.gitRoots,
     writeEnabled: false,
     initialRepositoryDigest: advisorRepositoryDigest(snapshotAdvisorRepository(layout)),
   })}\n`, { mode: 0o600 })

@@ -295,6 +295,39 @@ describe('macOS bootstrap', () => {
     }
   })
 
+  test('既存のmulti-repo親projectをGit初期化せずそのまま採用する', () => {
+    if (process.platform !== 'darwin') return
+    const dir = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-multi-project-'))
+    const project = join(dir, 'workspace')
+    mkdirSync(project)
+    Bun.spawnSync(['git', 'init', '-q', join(project, 'backend')])
+    Bun.spawnSync(['git', 'init', '-q', join(project, 'frontend')])
+    writeFileSync(join(project, 'notes.txt'), 'workspace note\n')
+    try {
+      const before = treeSnapshot(project)
+      const command = [
+        'bootstrap_path="$1"',
+        'repo="$2"',
+        'project="$3"',
+        'set --',
+        'source "$bootstrap_path"',
+        'REPO_DIR="$repo"',
+        'PROJECT_DIR="$project"',
+        'ensure_project_workspace',
+      ].join('; ')
+      const result = Bun.spawnSync([
+        '/bin/bash', '-c', command, 'bash', bootstrap, root, project,
+      ], { stdout: 'pipe', stderr: 'pipe' })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(existsSync(join(project, '.git'))).toBe(false)
+      expect(existsSync(join(project, 'AGENTS.md'))).toBe(false)
+      expect(readFileSync(join(project, 'notes.txt'), 'utf8')).toBe('workspace note\n')
+      expect(treeSnapshot(project)).toBe(before)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test('--doctor reports installed tool versions without changing HOME', () => {
     if (process.platform !== 'darwin') return
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-doctor-'))

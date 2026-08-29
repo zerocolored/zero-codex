@@ -157,7 +157,7 @@ export function reviewerSandbox(home: string): string {
   return `[profiles.reviewer]
 extends = "strict"
 restrict_network = true
-read_only = [__ZEROKUN_REVIEW_ROOT_JSON____ZEROKUN_FINGERPRINT_ALLOW_JSON____ZEROKUN_PROMPT_ROOT_JSON__]
+read_only = [__ZEROKUN_REVIEW_ROOTS____ZEROKUN_FINGERPRINT_ALLOW_JSON____ZEROKUN_PROMPT_ROOT_JSON__]
 deny = [
 ${denied.map(value => `  ${toml(value)},`).join('\n')}
 __ZEROKUN_FINGERPRINT_DENY_JSON__

@@ -616,6 +616,50 @@ def _fingerprint_paths(
     return os.fspath(allow_path.parent), os.fspath(deny_path)
 
 
+def _workspace_review_roots(input_path: Path | None, review_root: Path) -> list[str]:
+    if input_path is None:
+        return [os.fspath(review_root)]
+    if not input_path.is_absolute():
+        raise OSError("workspace review scope file must be absolute")
+    _safe_owned_directory(input_path.parent, private=True)
+    raw = _read_safe_regular(input_path, private=True, maximum=64 * 1024)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise OSError("workspace review scope file is invalid") from error
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "reviewRoot", "members"}
+        or value.get("version") != 2
+        or value.get("reviewRoot") != os.fspath(review_root)
+        or not isinstance(value.get("members"), list)
+        or len(value["members"]) < 2
+        or len(value["members"]) > 16
+    ):
+        raise OSError("workspace review scope contract is invalid")
+    members: list[str] = []
+    for candidate in value["members"]:
+        if (
+            not isinstance(candidate, str)
+            or not candidate.startswith("/")
+            or candidate != os.path.normpath(candidate)
+            or Path(candidate).parent != review_root
+            or Path(candidate).name in ("", ".", "..")
+            or any(character in candidate for character in "*?[\x00\r\n")
+        ):
+            raise OSError("workspace review member path is invalid")
+        member = Path(candidate)
+        physical = member.resolve(strict=True)
+        if physical != member:
+            raise OSError("workspace review member must be a physical direct child")
+        _safe_owned_directory(member)
+        _safe_owned_directory(member / ".git")
+        members.append(candidate)
+    if value["members"] != sorted(set(value["members"])):
+        raise OSError("workspace review member paths must be sorted and unique")
+    return members
+
+
 def _prepare_run_home(
     reviewer_root: Path,
     run_root: Path,
@@ -623,6 +667,7 @@ def _prepare_run_home(
     prompt_input: Path | None = None,
     allow_path: Path | None = None,
     deny_path: Path | None = None,
+    workspace_scope_input: Path | None = None,
 ) -> int:
     try:
         reviewer_root = reviewer_root.resolve(strict=True)
@@ -652,7 +697,7 @@ def _prepare_run_home(
         template = _read_safe_regular(
             reviewer_root / "sandbox.toml", private=True
         ).decode("utf-8")
-        root_placeholder = "__ZEROKUN_REVIEW_ROOT_JSON__"
+        root_placeholder = "__ZEROKUN_REVIEW_ROOTS__"
         fingerprint_placeholder = "__ZEROKUN_FINGERPRINT_ALLOW_JSON__"
         fingerprint_deny_placeholder = "__ZEROKUN_FINGERPRINT_DENY_JSON__"
         prompt_placeholder = "__ZEROKUN_PROMPT_ROOT_JSON__"
@@ -706,8 +751,11 @@ def _prepare_run_home(
             "/private/tmp/**",
             "/var/tmp/**",
         ]
+        review_roots = _workspace_review_roots(workspace_scope_input, review_root)
         deny_lines = "\n".join(f"  {json.dumps(path)}," for path in protected)
-        sandbox = template.replace(root_placeholder, json.dumps(review_text)).replace(
+        sandbox = template.replace(
+            root_placeholder, ", ".join(json.dumps(path) for path in review_roots)
+        ).replace(
             fingerprint_placeholder,
             "" if fingerprint is None else f", {json.dumps(fingerprint[0])}",
         ).replace(
@@ -895,6 +943,12 @@ def main() -> int:
         values = [Path(value) for value in sys.argv[2:]]
         return _prepare_run_home(
             values[0], values[1], values[2], values[3], *values[4:]
+        )
+    if len(sys.argv) in (6, 8) and sys.argv[1] == "prepare-run-home-scope":
+        values = [Path(value) for value in sys.argv[2:]]
+        return _prepare_run_home(
+            values[0], values[1], values[2], None, *values[4:],
+            workspace_scope_input=values[3],
         )
     if len(sys.argv) == 6 and sys.argv[1] == "verify-install":
         return _verify_install(*(Path(value) for value in sys.argv[2:]))

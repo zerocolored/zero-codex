@@ -1289,14 +1289,20 @@ install_grok_reviewer() {
 
 ensure_project_workspace() {
   section "Slack作業repository"
+  local project_kind
   if [ -e "$PROJECT_DIR" ] && [ ! -d "$PROJECT_DIR" ]; then
     fail "--project-dirはdirectoryを指定してください: $PROJECT_DIR"
   fi
   if [ -d "$PROJECT_DIR" ] && [ ! -e "$PROJECT_DIR/.git" ]; then
-    local existing_entries
-    existing_entries="$(/bin/ls -A "$PROJECT_DIR" 2>/dev/null || true)"
-    [ -z "$existing_entries" ] \
-      || fail "未初期化projectに既存fileがあります。内容を確認してAGENTS.mdを用意してください: $PROJECT_DIR"
+    project_kind="$(bun --config=/dev/null --no-env-file \
+      "$REPO_DIR/zerokun/project-layout.ts" kind "$(resolve_dir "$PROJECT_DIR")")" \
+      || fail "Slack作業projectの構成を確認できません: $PROJECT_DIR"
+    if [ "$project_kind" != "multi-repo-workspace" ]; then
+      local existing_entries
+      existing_entries="$(/bin/ls -A "$PROJECT_DIR" 2>/dev/null || true)"
+      [ -z "$existing_entries" ] \
+        || fail "未初期化projectに既存fileがあります。内容を確認してAGENTS.mdを用意してください: $PROJECT_DIR"
+    fi
   fi
   /bin/mkdir -p "$PROJECT_DIR"
   local repo_real project_real agents_template agents_path entries
@@ -1304,14 +1310,18 @@ ensure_project_workspace() {
   project_real="$(resolve_dir "$PROJECT_DIR")" || fail "project directoryを解決できません: $PROJECT_DIR"
   [ "$repo_real" != "$project_real" ] \
     || fail "Slackのwrite jobからruntimeを守るため、--project-dirはzero repositoryと別にしてください"
-  if [ ! -e "$PROJECT_DIR/.git" ]; then
+  project_kind="$(bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/project-layout.ts" kind "$project_real")" \
+    || fail "Slack作業projectの構成を確認できません: $PROJECT_DIR"
+  if [ "$project_kind" = "non-git" ] && [ ! -e "$PROJECT_DIR/.git" ]; then
     safe_git init --initial-branch=main "$PROJECT_DIR" >/dev/null
   fi
   agents_template="$REPO_DIR/zerokun/templates/AGENTS.md"
   agents_path="$PROJECT_DIR/AGENTS.md"
   [ -f "$agents_template" ] && [ ! -L "$agents_template" ] \
     || fail "既定AGENTS.md templateがありません: $agents_template"
-  if [ ! -e "$agents_path" ] && [ ! -L "$agents_path" ]; then
+  if [ "$project_kind" != "multi-repo-workspace" ] \
+    && [ ! -e "$agents_path" ] && [ ! -L "$agents_path" ]; then
     if ! safe_git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
       entries="$(/bin/ls -A "$PROJECT_DIR" | /usr/bin/grep -v '^\.git$' || true)"
       [ -z "$entries" ] \

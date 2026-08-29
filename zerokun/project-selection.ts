@@ -4,6 +4,7 @@ import { homedir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { lstatSync, realpathSync } from 'fs'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
+import { resolveProjectLayout } from './project-layout.ts'
 
 export const LAST_CONNECTED_PROJECT_FILE = 'last-connected-project.json'
 const LAST_PROJECT_VERSION = 1 as const
@@ -137,12 +138,17 @@ export function validateLaunchProject(
     throw new Error(`Slack project must be separate from Zero managed state: ${projectDir}`)
   }
 
-  const worktree = gitOutput(projectDir, 'rev-parse', '--is-inside-work-tree')
-  if (worktree !== 'true') {
-    throw new Error(`Slack project must be inside a Git worktree: ${projectDir}`)
+  const layout = resolveProjectLayout(projectDir, { gitExecutable: projectGitExecutable() })
+  if (layout.kind === 'non-git') {
+    throw new Error(
+      `Slack project must be inside a Git worktree or contain at least two direct-child Git repositories: ${projectDir}`,
+    )
   }
-  if (gitCommonDirectory(projectDir) === gitCommonDirectory(runtimeRepo)) {
-    throw new Error(`Slack project cannot share Git metadata with the Zero runtime: ${projectDir}`)
+  const runtimeCommonDirectory = gitCommonDirectory(runtimeRepo)
+  for (const gitRoot of layout.gitRoots) {
+    if (gitCommonDirectory(gitRoot) === runtimeCommonDirectory) {
+      throw new Error(`Slack project cannot share Git metadata with the Zero runtime: ${gitRoot}`)
+    }
   }
   return projectDir
 }

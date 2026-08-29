@@ -90,6 +90,31 @@ describe('project-local Slack channel routes', () => {
     expect(gitStatus(projectA)).toBe('')
   })
 
+  test('multi-repo workspaceは親のlocal設定へ保存し、子repositoryをdirtyにしない', () => {
+    const { root, state } = fixture()
+    const workspace = join(root, 'workspace')
+    mkdirSync(workspace)
+    const members = ['backend', 'frontend', 'meeting-app'].map(name => {
+      const repository = join(workspace, name)
+      mkdirSync(repository)
+      const result = Bun.spawnSync(['/usr/bin/git', 'init', '-q', repository], {
+        stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      return repository
+    })
+    const config = mutateProjectChannelConfig({
+      operation: 'set', repoPath: workspace, stateDir: state, appId: APP_ID,
+      channelId: 'C0123456789',
+    })
+    expect(config.slackChannels).toEqual(['C0123456789'])
+    expect(existsSync(join(workspace, '.zerochan', 'workspace.json'))).toBe(true)
+    expect(readProjectChannelConfig(workspace).slackChannels).toEqual(['C0123456789'])
+    for (const member of members) expect(gitStatus(member)).toBe('')
+    const status = projectChannelStatus({ repoPath: workspace, stateDir: state, appId: APP_ID })
+    expect(status).toContain('repositories: backend, frontend, meeting-app')
+  })
+
   test('同じchannelの別project claimとforeign unsetを拒否する', () => {
     const { state, projectA, projectB } = fixture()
     mutateProjectChannelConfig({

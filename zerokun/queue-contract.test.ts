@@ -219,7 +219,7 @@ describe('Zero-kun Codex wiring', () => {
     expect(broker.match(/server\.registerTool\(/g)).toHaveLength(2)
     expect(broker).toContain("server.registerTool('advisor_round'")
     expect(broker).toContain("server.registerTool('advisor_round_poll'")
-    expect(broker).toContain('version: 3')
+    expect(broker).toContain('version: 4')
     expect(broker).toContain('nativeAdvisors')
     expect(broker).toContain('response: z.string().min(1).max(MAX_INPUT_CHARS)')
     expect(broker).toContain('nativeAdvisorResponseDigest(response)')

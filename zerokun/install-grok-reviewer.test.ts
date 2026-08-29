@@ -196,6 +196,50 @@ describe('dedicated Grok reviewer installer', () => {
       .toEqual([])
   })
 
+  test('multi-repo workspaceはinner sandboxのread rootをmemberだけに絞る', () => {
+    const { home, reviewRoot } = fixture()
+    const launcher = installGrokReviewer(home)
+    const members = ['backend', 'frontend'].map(name => {
+      const member = join(reviewRoot, name)
+      mkdirSync(join(member, '.git'), { recursive: true })
+      return realpathSync(member)
+    }).sort()
+    const contract = join(home, 'workspace-review-scope.json')
+    const fingerprintRoot = join(home, 'workspace-fingerprint')
+    mkdirSync(fingerprintRoot, { mode: 0o700 })
+    const allow = join(fingerprintRoot, 'allow')
+    const deny = join(fingerprintRoot, 'deny')
+    writeFileSync(allow, 'allow\n', { mode: 0o600 })
+    writeFileSync(deny, 'deny\n', { mode: 0o600 })
+    writeFileSync(contract, `${JSON.stringify({
+      version: 2,
+      reviewRoot: realpathSync(reviewRoot),
+      members,
+    })}\n`, { mode: 0o600 })
+
+    const result = reviewSync(launcher, 'independent workspace review', {
+      HOME: home,
+      PATH: '/usr/bin:/bin',
+      ZEROKUN_GROK_REVIEW_ROOT: reviewRoot,
+      ZEROKUN_GROK_REVIEW_SCOPE_FILE: contract,
+      ...(process.platform === 'darwin' ? {
+        ZEROKUN_SEATBELT_FINGERPRINT_ALLOW: realpathSync(allow),
+        ZEROKUN_SEATBELT_FINGERPRINT_DENY: realpathSync(deny),
+      } : {}),
+    })
+    const output = result.stdout.toString()
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(output).toContain(
+      `read_only = [${members.map(value => JSON.stringify(value)).join(', ')}, `,
+    )
+    expect(output).not.toContain(`read_only = [${JSON.stringify(realpathSync(reviewRoot))}, `)
+    if (process.platform === 'darwin') {
+      expect(output).toContain(`  ${JSON.stringify(realpathSync(deny))},`)
+    }
+    expect(readdirSync(join(home, '.grok-reviewer')).filter(name => name.startsWith('run.')))
+      .toEqual([])
+  })
+
   test('通常fileへ差し替えたGrok wrapperを公式launcherとして採択しない', () => {
     const { home } = fixture()
     const logical = join(home, '.grok', 'bin', 'grok')

@@ -42,6 +42,9 @@ zerochan set slack-channel C0123456789
 zerochan
 ```
 
+対象folder直下にfrontend／backend／appなどの通常cloneが2件以上ある場合は、対象folder自身が
+Git repositoryでなくてもmulti-repository workspaceとして起動できます。
+
 ## Runtime 構成
 
 | ファイル | 役割 |
@@ -318,6 +321,10 @@ zerokun-update
 含まれない `.zerochan/config.json` に保存され、`routes.json`の編集は不要です。最初の
 `zerochan`だけが共有gateway/runnerを起動し、別projectからの起動は同じserviceへ参加して終了します。
 既存threadは最初のprojectへ固定されたままです。DMは共有gatewayを起動したprojectを使います。
+multi-repository workspaceのmemberは初回設定時に`.zerochan/workspace.json`へ固定されます。
+隠しfolder、symlink、Gitではない直下項目は作業対象外で、変更した各memberは個別に
+test・commit・pushされます。直下repositoryの追加・削除時は、意図しない対象拡大を防ぐため
+設定を自動更新せず起動を停止します。
 
 log:
 

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
   chmodSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -76,6 +77,89 @@ describe('advisor repository snapshot', () => {
     writeFileSync(join(project, 'plain.txt'), 'two\n')
     const after = snapshotAdvisorRepository(layout)
     expect(advisorRepositoryDigest(after)).not.toBe(advisorRepositoryDigest(before))
+  })
+
+  test('multi-repo workspaceは各memberのHEADとdirty stateを合成しhidden repoを除外する', () => {
+    const project = fixtureDir()
+    const members = ['backend', 'frontend', 'meeting-app'].map(name => {
+      const repository = join(project, name)
+      mkdirSync(repository)
+      git(repository, ['init', '-q'])
+      git(repository, ['config', 'user.name', 'Zero Test'])
+      git(repository, ['config', 'user.email', 'zero@example.invalid'])
+      writeFileSync(join(repository, 'tracked.txt'), `${name}\n`)
+      git(repository, ['add', '.'])
+      git(repository, ['commit', '-qm', 'initial'])
+      return repository
+    })
+    const hidden = join(project, '.wt-hidden')
+    mkdirSync(hidden)
+    git(hidden, ['init', '-q'])
+
+    const layout = resolveAdvisorProjectLayout(project)
+    expect(layout.kind).toBe('multi-repo-workspace')
+    expect(layout.gitRoots).toEqual(members.map(realpathSync))
+    const before = snapshotAdvisorRepository(layout)
+    expect(before.repositories).toHaveLength(3)
+    writeFileSync(join(members[1]!, 'tracked.txt'), 'changed\n')
+    const after = snapshotAdvisorRepository(layout)
+    expect(after.dirty['frontend/tracked.txt']).toStartWith('sha256:')
+    expect(advisorRepositoryDigest(after)).not.toBe(advisorRepositoryDigest(before))
+
+    writeFileSync(join(hidden, 'ignored.txt'), 'ignored\n')
+    expect(advisorRepositoryDigest(snapshotAdvisorRepository(layout)))
+      .toBe(advisorRepositoryDigest(after))
+  })
+
+  test('multi-repo workspaceの安全なroot instruction変更をdigestへ反映する', () => {
+    const project = fixtureDir()
+    for (const name of ['backend', 'frontend']) {
+      const repository = join(project, name)
+      mkdirSync(repository)
+      git(repository, ['init', '-q'])
+      git(repository, ['config', 'user.name', 'Zero Test'])
+      git(repository, ['config', 'user.email', 'zero@example.invalid'])
+      writeFileSync(join(repository, 'tracked.txt'), `${name}\n`)
+      git(repository, ['add', '.'])
+      git(repository, ['commit', '-qm', 'initial'])
+    }
+    const instructions = join(project, 'AGENTS.md')
+    writeFileSync(instructions, 'before\n', { mode: 0o600 })
+    const layout = resolveAdvisorProjectLayout(project)
+    const before = snapshotAdvisorRepository(layout)
+    expect(before.rootInstructions['AGENTS.md']).toStartWith('sha256:')
+    writeFileSync(instructions, 'after\n', { mode: 0o600 })
+    const after = snapshotAdvisorRepository(layout)
+    expect(advisorRepositoryDigest(after)).not.toBe(advisorRepositoryDigest(before))
+  })
+
+  test('member外aliasを持つdirty hardlinkを拒否し、同一member内の全aliasはmetadata監査する', () => {
+    const project = fixtureDir()
+    for (const name of ['backend', 'frontend']) {
+      const repository = join(project, name)
+      mkdirSync(repository)
+      git(repository, ['init', '-q'])
+      git(repository, ['config', 'user.name', 'Zero Test'])
+      git(repository, ['config', 'user.email', 'zero@example.invalid'])
+      writeFileSync(join(repository, 'tracked.txt'), `${name}\n`)
+      git(repository, ['add', '.'])
+      git(repository, ['commit', '-qm', 'initial'])
+    }
+    const layout = resolveAdvisorProjectLayout(project)
+    const outside = join(project, 'outside.txt')
+    writeFileSync(outside, 'outside\n')
+    linkSync(outside, join(project, 'backend', 'leak.txt'))
+    expect(() => snapshotAdvisorRepository(layout)).toThrow('aliases outside')
+
+    rmSync(join(project, 'backend', 'leak.txt'))
+    rmSync(outside)
+    const first = join(project, 'backend', 'generated-a')
+    const second = join(project, 'backend', 'generated-b')
+    writeFileSync(first, 'generated\n')
+    linkSync(first, second)
+    const snapshot = snapshotAdvisorRepository(layout)
+    expect(snapshot.dirty['backend/generated-a']).toStartWith('metadata:')
+    expect(snapshot.dirty['backend/generated-b']).toStartWith('metadata:')
   })
 
   test('unsafe hardlinked non-Git fileを拒否する', () => {

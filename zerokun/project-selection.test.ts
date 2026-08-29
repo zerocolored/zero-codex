@@ -66,6 +66,25 @@ describe('zerochan project selection', () => {
     })).toBe(realpathSync(value.project))
   })
 
+  test('accepts a non-Git parent with multiple visible direct-child repositories', () => {
+    const value = fixture()
+    const workspace = join(value.root, 'workspace')
+    mkdirSync(workspace)
+    for (const name of ['backend', 'frontend', 'meeting-app', '.wt-hidden']) {
+      const repository = join(workspace, name)
+      mkdirSync(repository)
+      const result = Bun.spawnSync(['/usr/bin/git', 'init', '-q', repository], {
+        stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+    }
+    expect(validateLaunchProject(workspace, {
+      runtimeRepo: value.runtime,
+      stateDir: value.state,
+      homeDir: value.home,
+    })).toBe(realpathSync(workspace))
+  })
+
   test('rejects non-Git, runtime, state, home, and filesystem-root targets', () => {
     const value = fixture()
     const plain = join(value.root, 'plain')

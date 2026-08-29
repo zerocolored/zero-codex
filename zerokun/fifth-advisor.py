@@ -55,10 +55,14 @@ MAX_SOCKET_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_SOCKET_RESPONSE_BYTES = 1024 * 1024
 MAX_SNAPSHOT_BYTES = 1_048_576
 MAX_WALK_DEPTH = 64
-PROTECTED_SNAPSHOT_VERSION = 4
-PROTECTED_POLICY = "protected-components-v1"
+PROTECTED_SNAPSHOT_VERSION = 6
+PROTECTED_POLICY = "protected-components-v3-workspace-root-instructions"
 PROTECTED_DIGEST_ALGORITHM = "sha256"
-PROTECTED_DIGEST_DOMAIN = b"herdr-fifth-advisor-protected-metadata-v4\0"
+PROTECTED_DIGEST_DOMAIN = b"herdr-fifth-advisor-protected-metadata-v6\0"
+MAX_WORKSPACE_PIN_BYTES = 16 * 1024
+MAX_WORKSPACE_MEMBERS = 16
+MAX_ROOT_INSTRUCTION_BYTES = 1024 * 1024
+ROOT_INSTRUCTION_NAMES = frozenset({"AGENTS.md", "CLAUDE.md"})
 EPHEMERAL_SESSION_VERSION = 2
 PROCESS_MISMATCH_VERSION = 2
 PROCESS_MISMATCH_POLICY = "claude-process-identity-mismatch-v2"
@@ -405,16 +409,113 @@ def _run_git(root: Path, arguments: List[str]) -> bytes:
     return result.stdout
 
 
+def _workspace_members(root_descriptor: int, root: Path) -> Optional[Tuple[str, ...]]:
+    zerochan_descriptor: Optional[int] = None
+    pin_descriptor: Optional[int] = None
+    try:
+        try:
+            zerochan_descriptor = os.open(
+                ".zerochan", _directory_flags(), dir_fd=root_descriptor
+            )
+        except FileNotFoundError:
+            return None
+        metadata = os.fstat(zerochan_descriptor)
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise UnsafeRequest("workspace configuration directory is unsafe")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+        try:
+            pin_descriptor = os.open(
+                "workspace.json", flags, dir_fd=zerochan_descriptor
+            )
+        except FileNotFoundError:
+            return None
+        before = os.fstat(pin_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or not 1 <= before.st_size <= MAX_WORKSPACE_PIN_BYTES
+        ):
+            raise UnsafeRequest("workspace configuration file is unsafe")
+        raw = os.read(pin_descriptor, MAX_WORKSPACE_PIN_BYTES + 1)
+        after = os.fstat(pin_descriptor)
+        if len(raw) != before.st_size or _metadata(before) != _metadata(after):
+            raise UnsafeRequest("workspace configuration changed while reading")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise UnsafeRequest("workspace configuration is invalid") from error
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"version", "kind", "members"}
+            or value.get("version") != 1
+            or value.get("kind") != "multi-repo-workspace"
+            or not isinstance(value.get("members"), list)
+        ):
+            raise UnsafeRequest("workspace configuration is invalid")
+        members = value["members"]
+        if (
+            not 2 <= len(members) <= MAX_WORKSPACE_MEMBERS
+            or any(
+                not isinstance(name, str)
+                or not name
+                or name.startswith(".")
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+                or "\x00" in name
+                for name in members
+            )
+            or members != sorted(set(members))
+        ):
+            raise UnsafeRequest("workspace member list is invalid")
+        for name in members:
+            child_descriptor: Optional[int] = None
+            try:
+                child_descriptor = os.open(name, _directory_flags(), dir_fd=root_descriptor)
+                child_metadata = os.fstat(child_descriptor)
+                child = (root / name).resolve(strict=True)
+                if child.parent != root or child_metadata.st_uid != os.geteuid():
+                    raise UnsafeRequest("workspace member identity is invalid")
+                dot_git = os.stat(".git", dir_fd=child_descriptor, follow_symlinks=False)
+                if not stat.S_ISDIR(dot_git.st_mode) or stat.S_ISLNK(dot_git.st_mode):
+                    raise UnsafeRequest("workspace member must be an ordinary Git clone")
+                reported = Path(
+                    os.fsdecode(_run_git(child, ["rev-parse", "--show-toplevel"]).rstrip(b"\r\n"))
+                ).resolve(strict=True)
+                if reported != child:
+                    raise UnsafeRequest("workspace member is not a Git worktree root")
+            except OSError as error:
+                raise UnsafeRequest("workspace member cannot be opened safely") from error
+            finally:
+                if child_descriptor is not None:
+                    os.close(child_descriptor)
+        return tuple(members)
+    finally:
+        if pin_descriptor is not None:
+            os.close(pin_descriptor)
+        if zerochan_descriptor is not None:
+            os.close(zerochan_descriptor)
+
+
 def _physical_git_root(path_text: str) -> Tuple[int, Path]:
     descriptor, physical = _open_physical_directory(Path(path_text))
     try:
-        raw_root = _run_git(physical, ["rev-parse", "--show-toplevel"])
+        try:
+            raw_root = _run_git(physical, ["rev-parse", "--show-toplevel"])
+        except UnsafeRequest:
+            if _workspace_members(descriptor, physical) is None:
+                raise UnsafeRequest("project is not a Git worktree or pinned workspace")
+            return descriptor, physical
         decoded = os.fsdecode(raw_root.rstrip(b"\r\n"))
         if not decoded:
             raise UnsafeRequest("project is not a Git worktree")
         reported = Path(decoded).resolve(strict=True)
         if reported != physical:
             raise UnsafeRequest("project root must be the physical Git worktree root")
+        if _workspace_members(descriptor, physical) is not None:
+            raise UnsafeRequest("a pinned workspace parent must not also be a Git worktree")
         return descriptor, physical
     except BaseException:
         os.close(descriptor)
@@ -497,6 +598,47 @@ def _update_protected_digest(
     digest.update(record)
 
 
+def _update_root_instruction_content_digest(
+    digest: "hashlib._Hash", descriptor: int, name: str,
+    relative: str, expected: os.stat_result,
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    file_descriptor = os.open(name, flags, dir_fd=descriptor)
+    try:
+        opened = os.fstat(file_descriptor)
+        if _metadata(expected) != _metadata(opened):
+            raise UnsafeRequest("workspace root instruction changed while opening")
+        chunks: List[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                file_descriptor,
+                min(65_536, MAX_ROOT_INSTRUCTION_BYTES - total + 1),
+            )
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_ROOT_INSTRUCTION_BYTES:
+                raise UnsafeRequest("workspace root instruction is too large")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        if len(raw) != opened.st_size or len(raw) > MAX_ROOT_INSTRUCTION_BYTES:
+            raise UnsafeRequest("workspace root instruction is too large or changed")
+        observed = os.fstat(file_descriptor)
+        if _metadata(opened) != _metadata(observed):
+            raise UnsafeRequest("workspace root instruction changed while reading")
+        record = json.dumps(
+            {"content_sha256": hashlib.sha256(raw).hexdigest(), "path": relative},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        digest.update(len(record).to_bytes(8, "big"))
+        digest.update(record)
+    finally:
+        os.close(file_descriptor)
+
+
 def _same_directory_metadata(
     expected: os.stat_result,
     observed: os.stat_result,
@@ -507,10 +649,11 @@ def _same_directory_metadata(
     )
 
 
-def _filesystem_protected_digest(root_descriptor: int) -> Tuple[int, str]:
+def _filesystem_protected_digest(root_descriptor: int, root: Path) -> Tuple[int, str]:
     digest = hashlib.sha256()
     digest.update(PROTECTED_DIGEST_DOMAIN)
     protected_count = 0
+    workspace_members = _workspace_members(root_descriptor, root)
 
     def visit(
         descriptor: int,
@@ -529,7 +672,21 @@ def _filesystem_protected_digest(root_descriptor: int) -> Tuple[int, str]:
         except OSError as error:
             raise UnsafeRequest("worktree metadata inventory failed") from error
         for name in names:
-            if not prefix and name == ".git":
+            root_instruction = (
+                workspace_members is not None
+                and not prefix
+                and name in ROOT_INSTRUCTION_NAMES
+            )
+            if (
+                workspace_members is not None
+                and not prefix
+                and name not in workspace_members
+                and not root_instruction
+            ):
+                continue
+            if (not prefix and name == ".git") or (
+                workspace_members is not None and len(prefix) == 1 and name == ".git"
+            ):
                 continue
             parts = (*prefix, name)
             try:
@@ -540,7 +697,16 @@ def _filesystem_protected_digest(root_descriptor: int) -> Tuple[int, str]:
                 )
             except OSError as error:
                 raise UnsafeRequest("worktree metadata inventory raced") from error
-            protected = protected_ancestor or _is_protected_component(
+            if root_instruction and (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+                or metadata.st_size > MAX_ROOT_INSTRUCTION_BYTES
+            ):
+                raise UnsafeRequest("workspace root instruction is unsafe")
+            protected = root_instruction or protected_ancestor or _is_protected_component(
                 name.casefold()
             )
             if protected:
@@ -551,6 +717,10 @@ def _filesystem_protected_digest(root_descriptor: int) -> Tuple[int, str]:
                     protected_metadata,
                 )
                 protected_count += 1
+                if root_instruction:
+                    _update_root_instruction_content_digest(
+                        digest, descriptor, name, "/".join(parts), metadata
+                    )
             if not stat.S_ISDIR(metadata.st_mode):
                 if protected:
                     try:
@@ -607,7 +777,7 @@ def _filesystem_protected_digest(root_descriptor: int) -> Tuple[int, str]:
 
 def _protected_snapshot(root_descriptor: int, root: Path) -> Dict[str, object]:
     root_metadata = os.fstat(root_descriptor)
-    protected_count, protected_digest = _filesystem_protected_digest(root_descriptor)
+    protected_count, protected_digest = _filesystem_protected_digest(root_descriptor, root)
     return {
         "version": PROTECTED_SNAPSHOT_VERSION,
         "policy": PROTECTED_POLICY,

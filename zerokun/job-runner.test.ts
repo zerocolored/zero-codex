@@ -110,6 +110,7 @@ import { HerdrJobMonitorPendingError } from './herdr-job-monitor.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 import { readAdvisorInputSnapshot } from './advisor-input.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
+import { CodexAppServerSession } from './codex-app-server-session.ts'
 
 const temporaryDirs: string[] = []
 
@@ -5731,8 +5732,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
   })
 
   test('read-only senderには変更禁止と許可コマンドを明示する', () => {
+    const repo = fixtureDir('zerokun-instructions-read-')
+    git(['init', '-q'], repo)
     const store = makeStore()
-    store.enqueue(input())
+    store.enqueue(input({ repoPath: repo }))
     const job = store.claimNext('serial-worker')!
     const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
     const nonce = 'e'.repeat(32)
@@ -5771,8 +5774,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
   })
 
   test('read/write共通のbroker付きjobにはFive-Advisor経路を明示する', () => {
+    const repo = fixtureDir('zerokun-instructions-write-')
+    git(['init', '-q'], repo)
     const store = makeStore()
-    store.enqueue(input({ writeEnabled: true }))
+    store.enqueue(input({ repoPath: repo, writeEnabled: true }))
     const job = store.claimNext('serial-worker')!
     const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
     const nonce = 'f'.repeat(32)
@@ -7064,6 +7069,185 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       store.close()
     }
   })
+
+  test('multi-repo workspaceは親をdenyし、pin済みmemberだけをwriteする', () => {
+    const dir = fixtureDir()
+    const workspace = join(dir, 'workspace')
+    const state = join(dir, 'state')
+    const outbox = join(state, 'outbox/job')
+    const scratch = join(state, 'tmp/job')
+    mkdirSync(workspace)
+    const members = ['backend', 'frontend', 'meeting-app'].map(name => {
+      const repository = join(workspace, name)
+      git(['init', '-q', repository])
+      return realpathSync(repository)
+    })
+    const hidden = join(workspace, '.wt-hidden')
+    git(['init', '-q', hidden])
+    const instructions = join(workspace, 'AGENTS.md')
+    writeFileSync(instructions, '# workspace instructions\n', { mode: 0o600 })
+    mkdirSync(outbox, { recursive: true })
+    chmodSync(state, 0o700)
+    mkdirSync(scratch, { recursive: true })
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: workspace, writeEnabled: true }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      const overrides = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        gitRoots: members,
+      }).join('\n')
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(workspace))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(instructions))}="read"`)
+      for (const member of members) {
+        expect(overrides).toContain(`${JSON.stringify(member)}="write"`)
+        expect(overrides).toContain(`${JSON.stringify(join(member, '.git'))}="write"`)
+        expect(overrides).toContain(`${JSON.stringify(join(member, '.zerochan'))}="deny"`)
+      }
+      expect(overrides).toContain(`${JSON.stringify(join(realpathSync(workspace), '.zerochan'))}="deny"`)
+    } finally {
+      store.close()
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('実Codex App Serverは非Gitのmulti-repo親directoryでthreadを開始する', async () => {
+    const codex = resolveOfficialStandaloneCodex().physical
+    const dir = fixtureDir('zerokun-multi-app-server-')
+    const workspace = join(dir, 'workspace')
+    const state = join(dir, 'state')
+    const outbox = join(state, 'outbox/job')
+    const scratch = join(state, 'tmp/job')
+    mkdirSync(workspace)
+    for (const name of ['backend', 'frontend']) git(['init', '-q', join(workspace, name)])
+    writeFileSync(join(workspace, 'AGENTS.md'), '# workspace instructions\n', { mode: 0o600 })
+    mkdirSync(outbox, { recursive: true })
+    chmodSync(state, 0o700)
+    mkdirSync(scratch, { recursive: true })
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: workspace, writeEnabled: false }))
+    const job = store.claimNext('serial-worker')!
+    const profile = 'zerokun_job'
+    const overrides = buildCodexPermissionOverrides(job, {
+      stateDir: state,
+      artifactDir: outbox,
+      scratchDir: scratch,
+      profile,
+      multiAgentEnabled: false,
+    })
+    const proc = Bun.spawn([
+      codex, '-a', 'never', '-C', workspace,
+      ...overrides.flatMap(value => ['-c', value]),
+      'app-server', '--stdio',
+    ], {
+      cwd: workspace,
+      env: { ...process.env },
+      stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+    })
+    const stderr = new Response(proc.stderr).text()
+    const session = new CodexAppServerSession(proc.stdin, proc.stdout)
+    try {
+      await session.initialize()
+      const handshake = await session.startThread({
+        cwd: workspace,
+        approvalPolicy: 'never',
+        permissions: profile,
+        developerInstructions: 'Read-only multi-repository workspace handshake test.',
+        ephemeral: true,
+      })
+      expect(handshake.threadId).not.toBe('')
+      expect(handshake.modelProvider).toBe('openai')
+    } finally {
+      session.closeInput()
+      const exited = await Promise.race([
+        proc.exited.then(() => true),
+        Bun.sleep(2_000).then(() => false),
+      ])
+      if (!exited) proc.kill('SIGTERM')
+      await proc.exited
+      await session.waitForReader()
+      const diagnostics = await stderr
+      expect(proc.exitCode, diagnostics.slice(-2_000)).toBe(0)
+      store.close()
+    }
+  }, 30_000)
+
+  test.skipIf(process.platform !== 'darwin')('実Codex sandboxはmulti-repo memberだけを変更・commitできる', () => {
+    const codex = resolveOfficialStandaloneCodex().physical
+    const dir = fixtureDir('zerokun-multi-sandbox-')
+    const workspace = join(dir, 'workspace')
+    const state = join(dir, 'state')
+    const outbox = join(state, 'outbox/job')
+    const scratch = join(state, 'tmp/job')
+    mkdirSync(workspace)
+    for (const name of ['backend', 'frontend']) git(['init', '-q', join(workspace, name)])
+    const hidden = join(workspace, '.wt-hidden')
+    const artifacts = join(workspace, 'artifacts')
+    mkdirSync(hidden)
+    mkdirSync(artifacts)
+    writeFileSync(join(hidden, 'private.txt'), 'hidden sibling\n')
+    writeFileSync(join(artifacts, 'private.txt'), 'non-repository sibling\n')
+    mkdirSync(outbox, { recursive: true })
+    chmodSync(state, 0o700)
+    mkdirSync(scratch, { recursive: true })
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    try {
+      store.enqueue(input({ repoPath: workspace, writeEnabled: true }))
+      const job = store.claimNext('serial-worker')!
+      const overrides = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        multiAgentEnabled: false,
+      })
+      const lateSibling = join(workspace, 'late-secret')
+      const fakeInstructions = join(workspace, 'AGENTS.md')
+      mkdirSync(lateSibling)
+      writeFileSync(join(lateSibling, 'private.txt'), 'created after permission profile\n')
+      symlinkSync(join(hidden, 'private.txt'), fakeInstructions)
+      const result = Bun.spawnSync([
+        codex, 'sandbox', '-C', workspace,
+        ...overrides.flatMap(value => ['-c', value]),
+        '-P', 'zerokun_job', '--', '/bin/zsh', '-c', [
+          'set -e',
+          'if /bin/cat "$1" >/dev/null 2>&1; then exit 41; fi',
+          'if /bin/cat "$2" >/dev/null 2>&1; then exit 42; fi',
+          'if /bin/cat "$3" >/dev/null 2>&1; then exit 43; fi',
+          'if /bin/cat "$4" >/dev/null 2>&1; then exit 44; fi',
+          'if /usr/bin/touch parent-write.txt 2>/dev/null; then exit 45; fi',
+          "printf 'backend change\\n' > backend/result.txt",
+          "printf 'frontend change\\n' > frontend/result.txt",
+          "git -C backend add result.txt && git -C backend -c user.name=test -c user.email=test@example.com commit -m 'backend workspace commit' >/dev/null",
+          "git -C frontend add result.txt && git -C frontend -c user.name=test -c user.email=test@example.com commit -m 'frontend workspace commit' >/dev/null",
+        ].join('; '),
+        'zerochan-multi-sandbox',
+        join(hidden, 'private.txt'),
+        join(artifacts, 'private.txt'),
+        join(lateSibling, 'private.txt'),
+        fakeInstructions,
+      ], {
+        env: {
+          ...process.env,
+          HOME: scratch,
+          TMPDIR: scratch,
+          XDG_CONFIG_HOME: join(scratch, '.config'),
+          XDG_CACHE_HOME: join(scratch, '.cache'),
+          GIT_CONFIG_GLOBAL: '/dev/null',
+          GIT_CONFIG_NOSYSTEM: '1',
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(existsSync(join(workspace, 'parent-write.txt'))).toBe(false)
+      expect(git(['log', '-1', '--format=%s'], join(workspace, 'backend')))
+        .toBe('backend workspace commit')
+      expect(git(['log', '-1', '--format=%s'], join(workspace, 'frontend')))
+        .toBe('frontend workspace commit')
+    } finally {
+      store.close()
+    }
+  }, 30_000)
 
   test('偽の.git pointerは外部Git metadataを許可しない', () => {
     const dir = fixtureDir()
@@ -8389,6 +8573,33 @@ describe('Slack output guard', () => {
     expect(finalized.result).toContain(`コミットID: ${shortCommit}`)
     expect(finalized.result).not.toContain(unverified)
     expect(finalized.result).not.toContain('/Users/alice/secret')
+    store.close()
+  })
+
+  test('multi-repo workspaceの子repository commit IDをSlack完了報告へ保持する', () => {
+    const state = fixtureDir()
+    const workspace = join(state, 'workspace')
+    mkdirSync(workspace)
+    let expectedCommit = ''
+    for (const name of ['backend', 'frontend', 'meeting-app']) {
+      const repository = join(workspace, name)
+      mkdirSync(repository)
+      git(['init', '-q'], repository)
+      git(['config', 'user.email', 'test@example.com'], repository)
+      git(['config', 'user.name', 'test'], repository)
+      writeFileSync(join(repository, 'tracked.txt'), `${name}\n`)
+      git(['add', 'tracked.txt'], repository)
+      git(['commit', '-m', 'initial'], repository)
+      if (name === 'meeting-app') expectedCommit = git(['rev-parse', 'HEAD'], repository)
+    }
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: workspace, task: 'commit IDを報告してください' }))
+    const job = store.claimNext('serial-worker')!
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'multi-repo-commit-evidence',
+      result: `Commit: ${expectedCommit}`,
+    }, state)
+    expect(finalized.result).toContain(expectedCommit)
     store.close()
   })
 

@@ -46,6 +46,29 @@ function gitProject(home: string): { project: string; request: string } {
   return { project: realpathSync(project), request: realpathSync(request) }
 }
 
+function multiRepoProject(home: string): { project: string; request: string } {
+  const project = join(home, 'workspace')
+  const request = join(home, 'request')
+  mkdirSync(project, { mode: 0o700 })
+  mkdirSync(request, { mode: 0o700 })
+  for (const name of ['backend', 'frontend', 'meeting-app']) {
+    const member = join(project, name)
+    mkdirSync(member, { mode: 0o700 })
+    const initialized = Bun.spawnSync(['/usr/bin/git', 'init', '-q', member], {
+      env: { PATH: '/usr/bin:/bin', HOME: home }, stdout: 'pipe', stderr: 'pipe',
+    })
+    if (initialized.exitCode !== 0) throw new Error(initialized.stderr.toString())
+  }
+  mkdirSync(join(project, '.zerochan'), { mode: 0o700 })
+  writeFileSync(join(project, '.zerochan', 'workspace.json'), `${JSON.stringify({
+    version: 1,
+    kind: 'multi-repo-workspace',
+    members: ['backend', 'frontend', 'meeting-app'],
+  })}\n`, { mode: 0o600 })
+  writeFileSync(join(request, 'prompt'), 'Read-only workspace review\n', { mode: 0o600 })
+  return { project: realpathSync(project), request: realpathSync(request) }
+}
+
 const lifecycleNonce = '0123456789abcdef0123456789abcdef'
 const claudeArguments = [
   '--dangerously-skip-permissions',
@@ -362,6 +385,58 @@ describe('fifth-advisor helper installer', () => {
     expect(verify.stdout.toString()).toContain('snapshot-unchanged')
 
     mkdirSync(join(project, '.credentials'), { mode: 0o700 })
+    const changed = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'verify',
+      '--project-root', project, '--request-dir', request,
+    ], { env: environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(changed.exitCode).toBe(4)
+    expect(changed.stdout.toString()).toContain('protected-metadata-changed')
+  })
+
+  test('multi-repo snapshotはpin済みmemberだけを監査し親のhidden siblingを対象外にする', () => {
+    const home = fixture()
+    const { project, request } = multiRepoProject(home)
+    const helper = installFifthAdvisorHelper(home)
+    const environment = { HOME: home, PATH: '/usr/bin:/bin' }
+    mkdirSync(join(project, '.wt-hidden'), { mode: 0o700 })
+    const snapshot = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'snapshot',
+      '--project-root', project, '--request-dir', request,
+    ], { env: environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(snapshot.exitCode, snapshot.stderr.toString()).toBe(0)
+    expect(snapshot.stdout.toString()).toContain('snapshot-recorded')
+
+    mkdirSync(join(project, '.wt-hidden', '.credentials'), { mode: 0o700 })
+    const hiddenChanged = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'verify',
+      '--project-root', project, '--request-dir', request,
+    ], { env: environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(hiddenChanged.exitCode, hiddenChanged.stderr.toString()).toBe(0)
+    expect(hiddenChanged.stdout.toString()).toContain('snapshot-unchanged')
+
+    mkdirSync(join(project, 'backend', '.credentials'), { mode: 0o700 })
+    const memberChanged = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'verify',
+      '--project-root', project, '--request-dir', request,
+    ], { env: environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(memberChanged.exitCode).toBe(4)
+    expect(memberChanged.stdout.toString()).toContain('protected-metadata-changed')
+  })
+
+  test('multi-repo snapshotは安全な親AGENTS.mdの内容変更を検出する', () => {
+    const home = fixture()
+    const { project, request } = multiRepoProject(home)
+    const instructions = join(project, 'AGENTS.md')
+    writeFileSync(instructions, 'before\n', { mode: 0o600 })
+    const helper = installFifthAdvisorHelper(home)
+    const environment = { HOME: home, PATH: '/usr/bin:/bin' }
+    const snapshot = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'snapshot',
+      '--project-root', project, '--request-dir', request,
+    ], { env: environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(snapshot.exitCode, snapshot.stderr.toString()).toBe(0)
+
+    writeFileSync(instructions, 'after!\n', { mode: 0o600 })
     const changed = Bun.spawnSync([
       '/usr/bin/python3', helper, 'verify',
       '--project-root', project, '--request-dir', request,

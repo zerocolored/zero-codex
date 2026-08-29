@@ -39,6 +39,7 @@ import {
 } from './process-tree.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
+import { resolveAdvisorProjectLayout } from './advisor-snapshot.ts'
 
 const CHROME_APPLICATION = '/Applications/Google Chrome.app'
 const CHROME_EXECUTABLE = `${CHROME_APPLICATION}/Contents/MacOS/Google Chrome`
@@ -55,10 +56,11 @@ const CHROME_DISCOVERY_DEADLINE_MS = 10_000
 const MAX_PROCESS_COMMAND_BYTES = 64 * 1024
 
 type BrowserContext = {
-  version: 3
+  version: 4
   jobId: string
   attemptNonce: string
   repoPath: string
+  gitRoots: string[]
   writeEnabled: boolean
 }
 
@@ -104,17 +106,24 @@ function parseContext(pathInput: string, stateDir: string): BrowserContext {
     throw new Error('browser context must be an object')
   }
   const record = value as Record<string, unknown>
-  if (record.version !== 3 || typeof record.jobId !== 'string' || record.jobId.length < 1
+  if (record.version !== 4 || typeof record.jobId !== 'string' || record.jobId.length < 1
     || typeof record.attemptNonce !== 'string' || !/^[0-9a-f]{32}$/.test(record.attemptNonce)
     || typeof record.repoPath !== 'string' || !isAbsolute(record.repoPath)
+    || !Array.isArray(record.gitRoots)
+    || record.gitRoots.some(root => typeof root !== 'string' || !isAbsolute(root))
     || typeof record.writeEnabled !== 'boolean') {
     throw new Error('browser context fields are invalid')
   }
+  const layout = resolveAdvisorProjectLayout(record.repoPath)
+  if (JSON.stringify(layout.gitRoots) !== JSON.stringify(record.gitRoots)) {
+    throw new Error('browser context project layout changed')
+  }
   return {
-    version: 3,
+    version: 4,
     jobId: record.jobId,
     attemptNonce: record.attemptNonce,
     repoPath: realpathSync(record.repoPath),
+    gitRoots: layout.gitRoots,
     writeEnabled: record.writeEnabled,
   }
 }

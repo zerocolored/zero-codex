@@ -179,6 +179,8 @@ bootstrapはZeroちゃん本体とは別の`zerokun-workspace` Git repositoryを
 `--project-dir /absolute/path/to/project`を指定できます。DMの新規threadは、起動時に
 `zerochan`を実行した物理directoryを使います。
 Zeroちゃん本体はhost runtimeなので、そこを対象にしたSlack write jobは常に拒否されます。
+対象directory自体がGit repositoryでなくても、直下に通常cloneされたGit repositoryが2件以上
+ある場合はmulti-repository workspaceとして利用できます。
 
 依存関係だけ診断する場合は `--doctor`、導入済み環境で Slack 設定だけ再開する場合は
 `--slack-only` を使います。詳しくは
@@ -248,6 +250,11 @@ zerokun-status
 zerokun-jobs status
 ```
 
+frontend／backend／appのような複数repositoryを1つの親folderに置いている場合は、その親folderで
+同じコマンドを実行します。初回設定時に検出した直下repository一覧を
+`.zerochan/workspace.json`へ固定し、各repositoryを個別にtest・commit・pushします。隠しfolder、
+symlink、Gitではない直下項目は作業対象に含めません。
+
 `zerochan` はHerdr外からの起動を拒否します。引数やexportは不要です。最初の起動だけが共有gatewayと
 runnerを開始し、別projectからの2つ目以降の起動はそのprojectのlocal設定を共有gatewayへ同期して
 終了します。実行した物理directoryは新しいDM threadのprojectとして使います。互換alias `zerokun` も現在directoryを使い、
@@ -311,6 +318,9 @@ serviceを起動せずoffline bootstrapで復旧してください。
 project directoryで `zerochan set slack-channel C...` を実行すると、設定はlocal-onlyの
 `.zerochan/config.json`へ保存され、稼働中gatewayへ即時反映されます。`routes.json`の手動編集や
 利用者allowlistは不要です。同じSlackチャンネルを別projectへ同時登録することはできません。
+multi-repository workspaceでは同じ`.zerochan` directoryに、固定member一覧の
+`workspace.json`も保存されます。repositoryの追加・削除を検出した場合は、意図しない対象拡大を
+避けるため自動採用せず起動を停止します。
 
 明示routeをまだ一度も設定していない移行直後だけ、従来どおり新しいchannel threadはgatewayを
 起動したprojectへ入ります。一度設定した後の未設定channelでは、全routeを解除した場合もproject
