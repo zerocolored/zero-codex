@@ -20,6 +20,7 @@ import {
   appendHerdrJobMonitorStatus,
   buildHerdrMonitorControlEnvironment,
   closeHerdrJobMonitor,
+  formatHerdrMonitorLine,
   HERDR_MONITOR_DRAIN_TEXT,
   HERDR_MONITOR_READY_TEXT,
   openHerdrJobMonitor,
@@ -37,6 +38,15 @@ import { processStartKey, type ProcessIdentity } from './process-generation.ts'
 import { completeUtf8PrefixLength } from './herdr-job-monitor-view.ts'
 
 const directories: string[] = []
+
+test('monitor行は秒までのJST時刻をprefixにする', () => {
+  expect(formatHerdrMonitorLine('確認しています', Date.parse('2026-08-29T15:04:05.000Z')))
+    .toBe('[00:04:05 JST] 確認しています\n')
+  expect(formatHerdrMonitorLine('日付境界の直前', Date.parse('2026-08-29T14:59:59.999Z')))
+    .toBe('[23:59:59 JST] 日付境界の直前\n')
+  expect(formatHerdrMonitorLine('日付境界', Date.parse('2026-08-29T15:00:00.000Z')))
+    .toBe('[00:00:00 JST] 日付境界\n')
+})
 
 afterEach(() => {
   for (const directory of directories.splice(0)) {
@@ -647,6 +657,10 @@ describe('Herdr job monitor', () => {
     expect(status).toContain('依頼内容を受け取りました')
     expect(status).not.toContain(record.task)
     expect(status).toContain('処理中')
+    expect(status).not.toContain('[Zeroちゃん]')
+    expect(status.trimEnd().split('\n').every(line => (
+      /^\[(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d JST\] /.test(line)
+    ))).toBe(true)
     expect(status).toContain('詳細を安全のため省略しました')
     expect(status).not.toContain('/Users/example/project')
     expect(status).not.toContain('abcdefghijklmnop')
@@ -1442,6 +1456,13 @@ describe('Herdr job monitor', () => {
     expect(epoch.droppedBytes).toBeGreaterThan(0)
     expect(statSync(join(directory, `stdout.${epoch.generation}.feed`)).size)
       .toBeLessThanOrEqual(20 * 1024 * 1024)
+    const rotatedPrefix = readFileSync(
+      join(directory, `stdout.${epoch.generation}.feed`),
+    ).subarray(0, 160).toString('utf8')
+    expect(rotatedPrefix).toMatch(
+      /^\n\[(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d JST\] stdout の表示上限に達したため古い出力を省略しました\n/,
+    )
+    expect(rotatedPrefix).not.toContain('[Zeroちゃん')
     // Keep the acknowledged old path until the viewer has observed the new
     // epoch; this closes the epoch-read/feed-open race.
     expect(existsSync(join(directory, 'stdout.0.feed'))).toBe(true)
@@ -1678,7 +1699,43 @@ describe('Herdr job monitor', () => {
     await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
     const directory = join(state, 'job-monitors', record.id)
     const legacyMarker = '表示を終了します'
-    appendHerdrJobMonitorStatus(state, record.id, legacyMarker)
+    appendFileSync(join(directory, 'status.0.feed'), `[Zeroちゃん] ${legacyMarker}\n`)
+    const epochPath = join(directory, 'status.epoch.json')
+    const epoch = JSON.parse(readFileSync(epochPath, 'utf8')) as Record<string, unknown>
+    writeFileSync(epochPath, `${JSON.stringify({ ...epoch, sealed: true })}\n`, { mode: 0o600 })
+    control.drainDirectory(directory)
+
+    const result = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ status: 'failed', terminalOutcome: 'failed' }),
+      publicFailureReason: () => '内部処理でエラーが発生しました。',
+      control,
+    })
+
+    expect(result).toEqual({ retained: 1, closed: 0, retainedJobIds: [] })
+    expect(control.closeCalls).toBe(0)
+    const manifest = JSON.parse(readFileSync(
+      join(directory, 'manifest.json'),
+      'utf8',
+    )) as { phase: string }
+    expect(manifest.phase).toBe('retained-failure')
+  })
+
+  test('旧prefixと現行final markerからの再起動も失敗tab保持へ収束する', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({
+      id: 'legacy-prefix-current-marker',
+      status: 'failed',
+      terminalOutcome: 'failed',
+    })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    const directory = join(state, 'job-monitors', record.id)
+    appendFileSync(
+      join(directory, 'status.0.feed'),
+      `[Zeroちゃん] ${HERDR_MONITOR_DRAIN_TEXT}\n`,
+    )
     const epochPath = join(directory, 'status.epoch.json')
     const epoch = JSON.parse(readFileSync(epochPath, 'utf8')) as Record<string, unknown>
     writeFileSync(epochPath, `${JSON.stringify({ ...epoch, sealed: true })}\n`, { mode: 0o600 })
@@ -1899,7 +1956,10 @@ describe('Herdr job monitor', () => {
         )) as { streams: { stderr: { offset: number } } }
         return progress.streams.stderr.offset === Buffer.byteLength(stderrValue) + 2
       })
-      appendFileSync(join(directory, 'status.0.feed'), `[Zeroちゃん] ${HERDR_MONITOR_DRAIN_TEXT}\n`)
+      appendFileSync(
+        join(directory, 'status.0.feed'),
+        formatHerdrMonitorLine(HERDR_MONITOR_DRAIN_TEXT, Date.parse('2026-08-29T15:04:05.000Z')),
+      )
       for (const kind of ['stdout', 'status']) {
         const path = join(directory, `${kind}.epoch.json`)
         const epoch = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
@@ -1924,7 +1984,10 @@ describe('Herdr job monitor', () => {
       await output
     }
     expect(stdout.startsWith('\x1b[3J\x1b[2J\x1b[H')).toBe(true)
-    expect(stdout).toContain(`[Zeroちゃん] ${HERDR_MONITOR_READY_TEXT}`)
+    expect(stdout).toMatch(
+      new RegExp(`\\[(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d JST\\] ${HERDR_MONITOR_READY_TEXT}`),
+    )
+    expect(stdout).not.toContain('[Zeroちゃん]')
     expect(stdout).not.toContain(operationId)
     expect(stdout).not.toContain('ZEROCHAN_MONITOR_')
     expect(stdout).toContain('あ')

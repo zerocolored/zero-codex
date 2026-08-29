@@ -62,6 +62,15 @@ const FEED_KINDS = ['stdout', 'stderr', 'status'] as const
 export const HERDR_MONITOR_READY_TEXT = '監視を開始しました'
 export const HERDR_MONITOR_DRAIN_TEXT = '表示内容を確定しました'
 const HERDR_MONITOR_LEGACY_DRAIN_TEXT = '表示を終了します'
+const JST_OFFSET_MS = 9 * 60 * 60 * 1_000
+
+export function formatHerdrMonitorLine(text: string, timestamp = Date.now()): string {
+  const jst = new Date(timestamp + JST_OFFSET_MS)
+  const hours = String(jst.getUTCHours()).padStart(2, '0')
+  const minutes = String(jst.getUTCMinutes()).padStart(2, '0')
+  const seconds = String(jst.getUTCSeconds()).padStart(2, '0')
+  return `[${hours}:${minutes}:${seconds} JST] ${text}\n`
+}
 
 export type HerdrMonitorFeedKind = typeof FEED_KINDS[number]
 export type HerdrMonitorPhase =
@@ -958,7 +967,7 @@ function appendFeed(
       )
     }
     const marker = Buffer.from(
-      `\n[Zeroちゃん: ${kind} の表示上限に達したため古い出力を省略しました]\n`,
+      `\n${formatHerdrMonitorLine(`${kind} の表示上限に達したため古い出力を省略しました`)}`,
       'utf8',
     )
     if (marker.byteLength + carry.byteLength + value.byteLength > limit) {
@@ -1030,7 +1039,7 @@ export function appendHerdrJobMonitorStatus(
   const rawText = stripTerminalControls(message).trim()
   if (!rawText) return
   const text = sanitizeMonitorText(rawText, 2_000) ?? '詳細を安全のため省略しました'
-  appendFeed(directory, 'status', Buffer.from(`[Zeroちゃん] ${text}\n`, 'utf8'), manifest)
+  appendFeed(directory, 'status', Buffer.from(formatHerdrMonitorLine(text), 'utf8'), manifest)
 }
 
 function shellQuote(value: string): string {
@@ -1528,7 +1537,7 @@ async function activateViewer(
     appendFeed(
       directory,
       'status',
-      Buffer.from('[Zeroちゃん] 開始表示は画面履歴から取得できませんでした\n', 'utf8'),
+      Buffer.from(formatHerdrMonitorLine('開始表示は画面履歴から取得できませんでした'), 'utf8'),
       manifest,
     )
   }
@@ -1723,22 +1732,33 @@ function requireDurableFinalDrainMarker(
   if (!statusEpoch.sealed) {
     throw new Error(`dead monitor viewer lacks a sealed final marker for job ${manifest.jobId}`)
   }
-  const expectedMarkers = finalDrainMarkers(manifest).map(marker => ({
-    marker,
-    bytes: Buffer.from(`[Zeroちゃん] ${marker}\n`, 'utf8'),
-  }))
-  const tailBytes = Math.max(...expectedMarkers.map(expected => expected.bytes.byteLength))
+  const expectedMarkers = finalDrainMarkers(manifest)
+  const tailBytes = Math.max(...expectedMarkers.map(marker => (
+    Buffer.byteLength(marker, 'utf8') + 64
+  )))
   const statusTail = readOwnedFileTail(
     feedPath(directory, 'status', statusEpoch.generation),
     STATUS_LIMIT_BYTES,
     tailBytes,
     'monitor status feed',
   )
-  for (const expected of expectedMarkers) {
-    if (statusTail.byteLength >= expected.bytes.byteLength
-      && statusTail.subarray(statusTail.byteLength - expected.bytes.byteLength).equals(expected.bytes)) {
-      return expected.marker
+  const tailText = statusTail.toString('utf8')
+  if (!tailText.endsWith('\n')) {
+    throw new Error(`dead monitor viewer lacks a durable final marker for job ${manifest.jobId}`)
+  }
+  const previousNewline = tailText.lastIndexOf('\n', tailText.length - 2)
+  const finalLine = tailText.slice(previousNewline + 1, -1)
+  for (const marker of expectedMarkers) {
+    const timestamped = finalLine.match(/^\[(\d{2}):(\d{2}):(\d{2}) JST\] (.*)$/)
+    if (timestamped
+      && Number(timestamped[1]) <= 23
+      && Number(timestamped[2]) <= 59
+      && Number(timestamped[3]) <= 59
+      && timestamped[4] === marker) {
+      return marker
     }
+    // Accept feeds sealed by releases that used the app name as their prefix.
+    if (finalLine === `[Zeroちゃん] ${marker}`) return marker
   }
   throw new Error(`dead monitor viewer lacks a durable final marker for job ${manifest.jobId}`)
 }
@@ -1786,7 +1806,7 @@ async function confirmLiveViewerDrain(
     appendFeed(
       directory,
       'status',
-      Buffer.from(`[Zeroちゃん] ${finalDrainMarker(manifest)}\n`, 'utf8'),
+      Buffer.from(formatHerdrMonitorLine(finalDrainMarker(manifest)), 'utf8'),
       manifest,
     )
     sealFeed(directory, 'status')

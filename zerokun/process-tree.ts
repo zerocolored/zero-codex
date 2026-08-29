@@ -19,6 +19,8 @@ export {
 export const MAX_TRACKED_PROCESSES = 4_096
 export const MAX_EXECUTOR_REGISTRATION_BYTES = 512 * 1024
 
+type ProcessGenerationObserver = typeof observeProcessGeneration
+
 /**
  * Keep the durable recovery ledger aligned with the exact generations that
  * remain pinned by the live tracker. Confirmed-dead non-root generations no
@@ -66,9 +68,17 @@ export function captureTrackedProcesses(
   groupId: number,
   tracked: Map<number, string>,
   excludePids: ReadonlySet<number> = new Set(),
+  generationObserver: ProcessGenerationObserver = observeProcessGeneration,
 ): ProcessIdentity[] {
   const table = readProcessTable()
-  updateTrackedProcesses(table, rootPids, groupId, tracked, excludePids)
+  updateTrackedProcesses(
+    table,
+    rootPids,
+    groupId,
+    tracked,
+    excludePids,
+    generationObserver,
+  )
   return table
 }
 
@@ -78,6 +88,7 @@ export function updateTrackedProcesses(
   groupId: number,
   tracked: Map<number, string>,
   excludePids: ReadonlySet<number> = new Set(),
+  generationObserver: ProcessGenerationObserver = observeProcessGeneration,
 ): void {
   const current = new Map(table.map(entry => [entry.pid, entry]))
   const requestedRoots = new Set(rootPids)
@@ -94,9 +105,14 @@ export function updateTrackedProcesses(
     }
     const expected = expectedIdentity(pid, started)
     if (!expected) throw new Error(`process ${pid}のgenerationが不正です`)
-    const direct = observeProcessGeneration(expected)
+    const direct = generationObserver(expected)
     if (direct.status === 'unknown') {
-      throw new Error(`process ${pid}のgenerationを確認できません`)
+      // A short-lived child can disappear between the process-table scan and
+      // its direct generation probe. Keep the exact pinned generation so the
+      // next live scan can decide it, but do not use an unverified PID as a
+      // discovery root. Strict cleanup re-probes every retained identity and
+      // still fails closed if the generation remains unknown.
+      continue
     }
     if (direct.status === 'alive') {
       observed.set(pid, direct.identity)
@@ -159,13 +175,14 @@ function expectedIdentity(pid: number, started: string): ProcessIdentity | undef
 function liveTrackedIdentities(
   tracked: ReadonlyMap<number, string>,
   excludePids: ReadonlySet<number>,
+  generationObserver: ProcessGenerationObserver = observeProcessGeneration,
 ): ProcessIdentity[] {
   const live: ProcessIdentity[] = []
   for (const [pid, started] of tracked) {
     if (excludePids.has(pid) || !started) continue
     const expected = expectedIdentity(pid, started)
     if (!expected) throw new Error(`process ${pid}のgenerationが不正です`)
-    const observation = observeProcessGeneration(expected)
+    const observation = generationObserver(expected)
     if (observation.status === 'unknown') {
       throw new Error(`process ${pid}のgenerationを確認できません`)
     }
@@ -177,9 +194,10 @@ function liveTrackedIdentities(
 function signalGroupLeader(
   expectedLeader: ProcessIdentity | undefined,
   signal: NodeJS.Signals,
+  generationObserver: ProcessGenerationObserver = observeProcessGeneration,
 ): boolean {
   if (!expectedLeader) return false
-  const observation = observeProcessGeneration(expectedLeader)
+  const observation = generationObserver(expectedLeader)
   if (observation.status === 'unknown') {
     throw new Error(`process group ${expectedLeader.pid}のgenerationを確認できません`)
   }
@@ -192,10 +210,11 @@ function signalGroupLeader(
 function signalIdentities(
   identities: Iterable<ProcessIdentity>,
   signal: NodeJS.Signals,
+  generationObserver: ProcessGenerationObserver = observeProcessGeneration,
 ): void {
   for (const identity of identities) {
     if (signalProcessIfLive(identity, signal)) continue
-    const observation = observeProcessGeneration(identity)
+    const observation = generationObserver(identity)
     if (observation.status === 'unknown') {
       throw new Error(`process ${identity.pid}のgenerationを確認できません`)
     }
@@ -214,36 +233,56 @@ export async function reapTrackedProcesses(options: {
   waitForForce?: () => boolean
   /** Records that live exact generations reached the bounded KILL phase. */
   onForce?: () => void
+  /** Deterministic process-generation probe used only by contract tests. */
+  generationObserver?: ProcessGenerationObserver
 }): Promise<number[]> {
   const exclude = options.excludePids ?? new Set<number>()
+  const generationObserver = options.generationObserver ?? observeProcessGeneration
   const initialTable = captureTrackedProcesses(
-    options.rootPids, options.groupId, options.tracked, exclude,
+    options.rootPids,
+    options.groupId,
+    options.tracked,
+    exclude,
+    generationObserver,
   )
   const groupStarted = options.tracked.get(options.groupId)
   const groupLeader = groupStarted
     ? initialTable.find(entry => entry.pid === options.groupId && entry.started === groupStarted)
     : undefined
   const termGroupSignaled = options.signalGroup !== false
-    && signalGroupLeader(groupLeader, 'SIGTERM')
+    && signalGroupLeader(groupLeader, 'SIGTERM', generationObserver)
   signalIdentities(
-    liveTrackedIdentities(options.tracked, exclude)
+    liveTrackedIdentities(options.tracked, exclude, generationObserver)
       .filter(identity => !termGroupSignaled || identity.pgid !== options.groupId),
     'SIGTERM',
+    generationObserver,
   )
 
-  let live = liveTrackedIdentities(options.tracked, exclude)
+  let live = liveTrackedIdentities(options.tracked, exclude, generationObserver)
   if (options.waitForForce) {
     while (live.length > 0 && !options.waitForForce()) {
       await Bun.sleep(25)
-      captureTrackedProcesses(options.rootPids, options.groupId, options.tracked, exclude)
-      live = liveTrackedIdentities(options.tracked, exclude)
+      captureTrackedProcesses(
+        options.rootPids,
+        options.groupId,
+        options.tracked,
+        exclude,
+        generationObserver,
+      )
+      live = liveTrackedIdentities(options.tracked, exclude, generationObserver)
     }
   } else {
     const termDeadline = Date.now() + (options.termGraceMs ?? 1_000)
     while (live.length > 0 && Date.now() < termDeadline) {
       await Bun.sleep(25)
-      captureTrackedProcesses(options.rootPids, options.groupId, options.tracked, exclude)
-      live = liveTrackedIdentities(options.tracked, exclude)
+      captureTrackedProcesses(
+        options.rootPids,
+        options.groupId,
+        options.tracked,
+        exclude,
+        generationObserver,
+      )
+      live = liveTrackedIdentities(options.tracked, exclude, generationObserver)
     }
   }
   if (live.length === 0) return []
@@ -252,16 +291,23 @@ export async function reapTrackedProcesses(options: {
   // TERM-time observations are never reused for delayed KILL. Both helpers
   // perform a fresh microsecond-generation read immediately before signaling.
   const killGroupSignaled = options.signalGroup !== false
-    && signalGroupLeader(groupLeader, 'SIGKILL')
+    && signalGroupLeader(groupLeader, 'SIGKILL', generationObserver)
   signalIdentities(
     live.filter(identity => !killGroupSignaled || identity.pgid !== options.groupId),
     'SIGKILL',
+    generationObserver,
   )
   const killDeadline = Date.now() + (options.killWaitMs ?? 1_000)
   while (live.length > 0 && Date.now() < killDeadline) {
     await Bun.sleep(25)
-    captureTrackedProcesses(options.rootPids, options.groupId, options.tracked, exclude)
-    live = liveTrackedIdentities(options.tracked, exclude)
+    captureTrackedProcesses(
+      options.rootPids,
+      options.groupId,
+      options.tracked,
+      exclude,
+      generationObserver,
+    )
+    live = liveTrackedIdentities(options.tracked, exclude, generationObserver)
   }
   return live.map(identity => identity.pid)
 }

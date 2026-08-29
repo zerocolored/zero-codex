@@ -13,6 +13,7 @@ import { join } from 'path'
 import { readProcessIdentity } from './process-generation.ts'
 import { atomicWritePrivateFile, readOptionalBoundedAtomicOwnedFile } from './safe-file.ts'
 import {
+  formatHerdrMonitorLine,
   HERDR_MONITOR_READY_TEXT,
   stripTerminalControls,
 } from './herdr-job-monitor.ts'
@@ -125,7 +126,7 @@ async function main(): Promise<void> {
   // command paths and the managed monitor directory never remain visible.
   await writeTerminal(process.stdout, '\x1b[3J\x1b[2J\x1b[H')
   await writeTerminal(process.stdout, `Zeroちゃん / キュー #${manifest.seq}\n`)
-  await writeTerminal(process.stdout, `[Zeroちゃん] ${HERDR_MONITOR_READY_TEXT}\n`)
+  await writeTerminal(process.stdout, formatHerdrMonitorLine(HERDR_MONITOR_READY_TEXT))
 
   const states = new Map<typeof FEED_KINDS[number], {
     generation: number
@@ -150,7 +151,9 @@ async function main(): Promise<void> {
         if (state.generation >= 0) {
           await writeTerminal(
             process.stdout,
-            `[Zeroちゃん] ${kind} の古い表示を省略しました（累計 ${epoch.droppedBytes} bytes）\n`,
+            formatHerdrMonitorLine(
+              `${kind} の古い表示を省略しました（累計 ${epoch.droppedBytes} bytes）`,
+            ),
           )
         }
         state.generation = epoch.generation
@@ -236,7 +239,7 @@ export function completeUtf8PrefixLength(bytes: Uint8Array): number {
 
 if (import.meta.main) {
   main().catch(() => {
-    process.stderr.write('[Zeroちゃん] 監視表示を継続できません\n')
+    process.stderr.write(formatHerdrMonitorLine('監視表示を継続できません'))
     process.exitCode = 1
   })
 }

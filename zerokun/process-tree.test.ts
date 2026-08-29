@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   MAX_TRACKED_PROCESSES,
   readProcessIdentity,
+  reapTrackedProcesses,
   synchronizeTrackedProcessLedger,
   updateTrackedProcesses,
   type ProcessIdentity,
@@ -56,6 +57,122 @@ describe('process tree identity tracking', () => {
       .toThrow('追跡root process 100のgenerationを取得できません')
     expect(tracked.size).toBe(0)
   })
+
+  test('一時unknownの既知generationを保持し探索rootにはせずalive復帰を待つ', () => {
+    const root = processIdentity(100, 1, 100, 'root-transient')
+    const child = processIdentity(101, 100, 100, 'child-transient')
+    const grandchild = processIdentity(102, 101, 102, 'grandchild-transient')
+    const tracked = new Map<number, string>([
+      [root.pid, root.started],
+      [child.pid, child.started],
+    ])
+
+    updateTrackedProcesses(
+      [root, grandchild],
+      [root.pid],
+      root.pid,
+      tracked,
+      new Set(),
+      expected => expected.pid === child.pid
+        ? { status: 'unknown' }
+        : { status: 'alive', identity: root },
+    )
+    expect([...tracked]).toEqual([
+      [root.pid, root.started],
+      [child.pid, child.started],
+    ])
+
+    updateTrackedProcesses(
+      [root, grandchild],
+      [root.pid],
+      root.pid,
+      tracked,
+      new Set(),
+      expected => expected.pid === child.pid
+        ? { status: 'alive', identity: child }
+        : { status: 'alive', identity: root },
+    )
+    expect([...tracked]).toEqual([
+      [root.pid, root.started],
+      [child.pid, child.started],
+      [grandchild.pid, grandchild.started],
+    ])
+  })
+
+  test('一時unknown後にdeadと確定した非rootを除去し再利用PIDの子を採らない', () => {
+    const root = processIdentity(100, 1, 100, 'root-prune')
+    const child = processIdentity(101, 100, 100, 'child-prune')
+    const unrelated = processIdentity(102, 101, 102, 'unrelated-after-prune')
+    const tracked = new Map<number, string>([
+      [root.pid, root.started],
+      [child.pid, child.started],
+    ])
+
+    updateTrackedProcesses(
+      [root, unrelated],
+      [root.pid],
+      root.pid,
+      tracked,
+      new Set(),
+      () => ({ status: 'unknown' }),
+    )
+    updateTrackedProcesses(
+      [root, unrelated],
+      [root.pid],
+      root.pid,
+      tracked,
+      new Set(),
+      () => ({ status: 'dead', reason: 'reused' }),
+    )
+
+    expect([...tracked]).toEqual([[root.pid, root.started]])
+  })
+
+  test('group leaderの一時unknown中は数値PGIDを探索に使わずalive復帰後だけ再開する', () => {
+    const root = processIdentity(100, 1, 100, 'root-group-transient')
+    const groupMember = processIdentity(101, 1, 100, 'group-member-transient')
+    const tracked = new Map([[root.pid, root.started]])
+
+    updateTrackedProcesses(
+      [groupMember],
+      [root.pid],
+      root.pid,
+      tracked,
+      new Set(),
+      () => ({ status: 'unknown' }),
+    )
+    expect([...tracked]).toEqual([[root.pid, root.started]])
+
+    updateTrackedProcesses(
+      [groupMember],
+      [root.pid],
+      root.pid,
+      tracked,
+      new Set(),
+      () => ({ status: 'alive', identity: root }),
+    )
+    expect([...tracked]).toEqual([
+      [root.pid, root.started],
+      [groupMember.pid, groupMember.started],
+    ])
+  })
+
+  test.skipIf(process.platform !== 'darwin')(
+    'cleanupはpersistent unknownを許容せずsignal前にfail closedする',
+    async () => {
+      const pid = 1_000_000
+      const started = generation('cleanup-unknown')
+      const tracked = new Map([[pid, started]])
+
+      await expect(reapTrackedProcesses({
+        rootPids: [pid],
+        groupId: pid,
+        tracked,
+        generationObserver: () => ({ status: 'unknown' }),
+      })).rejects.toThrow(`process ${pid}のgenerationを確認できません`)
+      expect(tracked.get(pid)).toBe(started)
+    },
+  )
 
   test('生存中のgroup leaderとその子孫だけを追跡する', () => {
     const tracked = new Map<number, string>()
