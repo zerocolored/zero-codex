@@ -1340,6 +1340,7 @@ function validPositiveInteger(value: unknown): value is number {
 function parseNativeAdvisorJournalEntries(
   journal: Record<string, unknown>,
 ): NativeAdvisorJournalEntry[] {
+  const journalVersion = Number(journal.version)
   if (!Array.isArray(journal.native) || journal.native.length !== 2) {
     throw new Error('advisor journal does not contain exactly two native Codex advisors')
   }
@@ -1353,7 +1354,8 @@ function parseNativeAdvisorJournalEntries(
     const reviewer = entry as Record<string, unknown>
     if (!['solution', 'risk'].includes(String(reviewer.perspective))
       || !isNativeAdvisorAgentLabel(reviewer.agentId)
-      || !validSha256(reviewer.responseDigest)) {
+      || !validSha256(reviewer.responseDigest)
+      || (journalVersion === 7 && !validSha256(reviewer.responseTransportDigest))) {
       throw new Error('advisor journal contains an incomplete native Codex advisor')
     }
     nativePerspectives.add(String(reviewer.perspective))
@@ -1362,6 +1364,9 @@ function parseNativeAdvisorJournalEntries(
       perspective: reviewer.perspective as NativeAdvisorJournalEntry['perspective'],
       agentId: reviewer.agentId,
       responseDigest: reviewer.responseDigest,
+      ...(journalVersion === 7
+        ? { responseTransportDigest: reviewer.responseTransportDigest as string }
+        : {}),
     })
   }
   if (nativePerspectives.size !== 2 || nativeAgentIds.size !== 2) {
@@ -1395,7 +1400,8 @@ function parseCompletedAdvisorJournal(
     throw new Error('advisor journal must be an object')
   }
   const journal = parsed as Record<string, unknown>
-  if ((journal.version !== 5 && journal.version !== 6) || journal.status !== 'completed'
+  if ((journal.version !== 5 && journal.version !== 6 && journal.version !== 7)
+    || journal.status !== 'completed'
     || journal.phase !== requirement.phase || journal.round !== requirement.round
     || journal.contextDigest !== expectedContextDigest
     || journal.attemptNonce !== expectedAttemptNonce
@@ -1500,7 +1506,7 @@ function collectNativeAdvisorJournalEvidence(options: {
       const journal = parsed as Record<string, unknown>
       const phase = journalMatch[1] as NativeAdvisorRoundEvidence['phase']
       const round = Number(journalMatch[2]) as NativeAdvisorRoundEvidence['round']
-      if ((journal.version !== 5 && journal.version !== 6)
+      if ((journal.version !== 5 && journal.version !== 6 && journal.version !== 7)
         || !['requested', 'completed', 'required-reviewer-failed', 'stale-input']
           .includes(String(journal.status))
         || journal.phase !== phase || journal.round !== round
@@ -2657,7 +2663,7 @@ export function buildCodexWorkerPrompt(
     if (host.advisorEnabled) {
       control.push(
         'Complete investigation round 1 using the local advisor route before answering.',
-        `Each native advisor response must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:investigation:1:<solution|risk>] after replacing only the final perspective placeholder.`,
+        `Each native advisor response must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:investigation:1:<solution|risk>] after replacing only the final perspective placeholder. Put that marker exactly once, on a line by itself as the final line, with no output after it.`,
       )
     } else {
       control.push(
@@ -2670,7 +2676,7 @@ export function buildCodexWorkerPrompt(
       'Host phase: complete compatibility mode for a write-authorized request.',
       'Complete investigation and design before editing, then implement and test, commit and',
       'push as required, and finally run read-only review without further repository mutation.',
-      `Native advisor markers must use [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|design|review>:<round>:<solution|risk>].`,
+      `Native advisor markers must use [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|design|review>:<round>:<solution|risk>]. Put each marker exactly once, on a line by itself as the final response line, with no output after it.`,
     )
     if (host.browserEnabled) {
       control.push(
@@ -2717,7 +2723,7 @@ export function buildCodexPhasePrompt(
       ...host,
       'Host phase: read-only preparation.',
       'Complete investigation round 1 and design round 1 for this exact input. Each native',
-      `advisor response must end with [ZERO_NATIVE_ADVISOR:${attemptNonce}:r${input.revision}:${input.digest}:<investigation|design>:1:<solution|risk>] after replacing only the final phase and perspective placeholders.`,
+      `advisor response must end with [ZERO_NATIVE_ADVISOR:${attemptNonce}:r${input.revision}:${input.digest}:<investigation|design>:1:<solution|risk>] after replacing only the final phase and perspective placeholders. Put that marker exactly once, on a line by itself as the final line, with no output after it.`,
       `The final line must be exactly [ZERO_PRE_EDIT_READY:${attemptNonce}:r${input.revision}:${input.digest}].`,
       '--- end Zero host phase control ---',
     ].join('\n')
@@ -2750,7 +2756,7 @@ export function buildCodexPhasePrompt(
       'another browser, operator profile, remote URL, or arbitrary CDP.',
     ] : []),
     'Review the unchanged repository for this exact implemented input. Each native advisor',
-    `response must end with [ZERO_NATIVE_ADVISOR:${attemptNonce}:r${input.revision}:${input.digest}:review:${reviewRound}:<solution|risk>] after replacing only the final perspective placeholder.`,
+    `response must end with [ZERO_NATIVE_ADVISOR:${attemptNonce}:r${input.revision}:${input.digest}:review:${reviewRound}:<solution|risk>] after replacing only the final perspective placeholder. Put that marker exactly once, on a line by itself as the final line, with no output after it.`,
     `The first final-response line must be exactly [ZERO_REVIEW_PUBLISH:${attemptNonce}:round-${reviewRound}] or [ZERO_REVIEW_FIX_REQUIRED:${attemptNonce}:round-${reviewRound}].`,
     'Use PUBLISH only when no required fix remains. Put a complete user-facing Slack answer on',
     'following lines. Use FIX_REQUIRED when changes remain and list precise fixes after it.',
@@ -2863,7 +2869,7 @@ export function buildCodexLiveControlPrompt(
     } else if (stage === 'complete' && job && !job.writeEnabled) {
       prompt.push(
         `Write access command for this sender: zerochan-access write allow ${control.userId}`,
-        `Each fresh native advisor response for this input must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${control.inputRevision}:${control.inputDigest}:investigation:1:<solution|risk>] after replacing only the final perspective placeholder.`,
+        `Each fresh native advisor response for this input must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${control.inputRevision}:${control.inputDigest}:investigation:1:<solution|risk>] after replacing only the final perspective placeholder. Put that marker exactly once, on a line by itself as the final line, with no output after it.`,
       )
     }
     prompt.push('--- end Zero host follow-up binding ---')

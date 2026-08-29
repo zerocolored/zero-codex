@@ -527,13 +527,17 @@ print('review complete')
       )
       const journal = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
       expect(journal).toMatchObject({
-        version: 6,
+        version: 7,
         status: 'stale-input',
         inputRevision: fixture.revisionOne.revision,
         inputDigest: fixture.revisionOne.digest,
       })
       expect(journal.grok).toEqual([])
       expect(journal.claude).toMatchObject({ attempted: false, adopted: false })
+      expect((journal.native as Array<Record<string, unknown>>).every(entry => (
+        typeof entry.responseTransportDigest === 'string'
+        && /^[0-9a-f]{64}$/.test(entry.responseTransportDigest)
+      ))).toBe(true)
     } finally {
       await fixture.close()
     }

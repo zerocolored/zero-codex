@@ -68,7 +68,11 @@ function readEpoch(directory: string, kind: typeof FEED_KINDS[number]): Epoch {
   return value as unknown as Epoch
 }
 
-function readFeedChunk(path: string, offset: number): { bytes: Buffer; nextOffset: number } {
+function readFeedChunk(path: string, offset: number): {
+  bytes: Buffer
+  nextOffset: number
+  size: number
+} {
   const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
     const metadata = fstatSync(descriptor)
@@ -81,7 +85,7 @@ function readFeedChunk(path: string, offset: number): { bytes: Buffer; nextOffse
     const bytes = Buffer.alloc(length)
     let count = 0
     if (length > 0) count = readSync(descriptor, bytes, 0, length, start)
-    return { bytes: bytes.subarray(0, count), nextOffset: start + count }
+    return { bytes: bytes.subarray(0, count), nextOffset: start + count, size: metadata.size }
   } finally { closeSync(descriptor) }
 }
 
@@ -134,9 +138,13 @@ async function main(): Promise<void> {
   while (true) {
     let wrote = false
     let progressed = false
+    let allSealedAndDrained = true
     for (const kind of FEED_KINDS) {
       const epoch = readEpoch(lexicalDirectory, kind)
-      if (epoch.rotating) continue
+      if (epoch.rotating) {
+        allSealedAndDrained = false
+        continue
+      }
       const state = states.get(kind)!
       if (state.generation !== epoch.generation) {
         if (state.generation >= 0) {
@@ -153,7 +161,10 @@ async function main(): Promise<void> {
         join(lexicalDirectory, `${kind}.${epoch.generation}.feed`),
         state.offset,
       )
-      if (chunk.bytes.length === 0) continue
+      if (chunk.bytes.length === 0) {
+        if (!epoch.sealed || state.offset !== chunk.size) allSealedAndDrained = false
+        continue
+      }
       // ACK only a complete UTF-8 prefix. TextDecoder's streaming API hides
       // trailing carry bytes, so advancing to chunk.nextOffset would claim
       // bytes that have not reached the terminal and allow rotation to drop
@@ -161,7 +172,10 @@ async function main(): Promise<void> {
       const completeLength = epoch.sealed
         ? chunk.bytes.byteLength
         : completeUtf8PrefixLength(chunk.bytes)
-      if (completeLength === 0) continue
+      if (completeLength === 0) {
+        allSealedAndDrained = false
+        continue
+      }
       const text = stripTerminalControls(
         new TextDecoder().decode(chunk.bytes.subarray(0, completeLength)),
       )
@@ -169,6 +183,9 @@ async function main(): Promise<void> {
       state.offset += completeLength
       progressed = true
       if (text) wrote = true
+      if (!epoch.sealed || state.offset !== chunk.size) {
+        allSealedAndDrained = false
+      }
     }
     const now = Date.now()
     if ((progressed || now - lastProgressAt >= 1_000)
@@ -186,6 +203,13 @@ async function main(): Promise<void> {
         updatedAt: now,
       })}\n`)
       lastProgressAt = now
+    }
+    if (allSealedAndDrained
+      && FEED_KINDS.every(kind => states.get(kind)!.generation >= 0)) {
+      // Keep the exact viewer generation alive so the retained tab cannot
+      // fall back to an interactive shell, but stop polling and heartbeat
+      // writes once every sealed byte is on screen.
+      while (true) await Bun.sleep(60_000)
     }
     await Bun.sleep(wrote ? 20 : 100)
   }

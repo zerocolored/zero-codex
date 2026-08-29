@@ -6,6 +6,8 @@ import {
   assertNativeAdvisorEvidence,
   nativeAdvisorMarker,
   nativeAdvisorResponseDigest,
+  nativeAdvisorResponseHasExactMarker,
+  nativeAdvisorResponseTransportDigest,
   resolveNativeAdvisorThreadIds,
   type NativeAdvisorPerspective,
   type NativeAdvisorRoundEvidence,
@@ -131,6 +133,74 @@ function fixture(): {
 }
 
 describe('native Codex advisor host evidence', () => {
+  test('Markdown hard-breakの転送差だけを補助digestで照合する', () => {
+    const { options, solutionId } = fixture()
+    const marker = nativeAdvisorMarker(
+      options.attemptNonce,
+      options.rounds[0]!.inputRevision,
+      options.rounds[0]!.inputDigest,
+      options.rounds[0]!.phase,
+      options.rounds[0]!.round,
+      'solution',
+    )
+    const logical = `見出し\n調査結果\n修正案\n検証項目\n${marker}`
+    const physical = `見出し  \n調査結果  \n修正案  \n検証項目  \n${marker}`
+    const solution = options.childResponses.get(solutionId) as {
+      thread: { turns: Array<{ items: Array<{ text: string }> }> }
+    }
+    solution.thread.turns[0]!.items[0]!.text = physical
+    options.rounds[0]!.native[0]!.responseDigest = nativeAdvisorResponseDigest(logical)
+    options.rounds[0]!.native[0]!.responseTransportDigest =
+      nativeAdvisorResponseTransportDigest(logical)
+
+    expect(nativeAdvisorResponseDigest(physical)).not.toBe(nativeAdvisorResponseDigest(logical))
+    expect(nativeAdvisorResponseTransportDigest(physical)).toBe(
+      nativeAdvisorResponseTransportDigest(logical),
+    )
+    expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
+  })
+
+  test('補助digestはコード・別空白・改行・本文改変を同一視しない', () => {
+    const marker = '[ZERO_NATIVE_ADVISOR:test]'
+    const baseline = nativeAdvisorResponseTransportDigest(`本文\n${marker}`)
+    const variants = [
+      `本文 \n${marker}`,
+      `本文   \n${marker}`,
+      `本文\t\n${marker}`,
+      `本文\u00a0\n${marker}`,
+      `本文  \r\n${marker}`,
+      `別本文\n${marker}`,
+      `本文\n\n${marker}`,
+      `\`\`\`text\n本文  \n\`\`\`\n${marker}`,
+      `    本文  \n${marker}`,
+    ]
+    for (const variant of variants) {
+      expect(nativeAdvisorResponseTransportDigest(variant)).not.toBe(baseline)
+    }
+    expect(nativeAdvisorResponseTransportDigest(`\`\`\`text\n本文  \n\`\`\`\n${marker}`))
+      .not.toBe(nativeAdvisorResponseTransportDigest(`\`\`\`text\n本文\n\`\`\`\n${marker}`))
+    expect(nativeAdvisorResponseTransportDigest(`    本文  \n${marker}`))
+      .not.toBe(nativeAdvisorResponseTransportDigest(`    本文\n${marker}`))
+    expect(nativeAdvisorResponseTransportDigest(`+追加行  \n${marker}`))
+      .not.toBe(nativeAdvisorResponseTransportDigest(`+追加行\n${marker}`))
+    expect(nativeAdvisorResponseTransportDigest(`\u00a0  \n${marker}`))
+      .not.toBe(nativeAdvisorResponseTransportDigest(`\u00a0\n${marker}`))
+    expect(nativeAdvisorResponseTransportDigest(`  本文  \n${marker}`))
+      .not.toBe(nativeAdvisorResponseTransportDigest(`  本文\n${marker}`))
+    expect(nativeAdvisorResponseTransportDigest(`> 本文  \n${marker}`))
+      .not.toBe(nativeAdvisorResponseTransportDigest(`> 本文\n${marker}`))
+    expect(nativeAdvisorResponseTransportDigest(`> \`\`\`text\n> 本文  \n> \`\`\`\n${marker}`))
+      .not.toBe(nativeAdvisorResponseTransportDigest(`> \`\`\`text\n> 本文\n> \`\`\`\n${marker}`))
+    expect(nativeAdvisorResponseTransportDigest(`- 箇条書き  \n${marker}`))
+      .toBe(nativeAdvisorResponseTransportDigest(`- 箇条書き\n${marker}`))
+    expect(nativeAdvisorResponseTransportDigest(`+ 箇条書き  \n${marker}`))
+      .toBe(nativeAdvisorResponseTransportDigest(`+ 箇条書き\n${marker}`))
+    expect(nativeAdvisorResponseHasExactMarker(`本文\n${marker}`, marker)).toBe(true)
+    expect(nativeAdvisorResponseHasExactMarker(`本文${marker}`, marker)).toBe(false)
+    expect(nativeAdvisorResponseHasExactMarker(`${marker}\n本文\n${marker}`, marker)).toBe(false)
+    expect(nativeAdvisorResponseHasExactMarker(`本文\n${marker}\n`, marker)).toBe(false)
+  })
+
   test('論理agent名をrole・marker・digestで物理thread IDへ一意解決する', () => {
     const { options, solutionId, riskId } = fixture()
     options.rounds[0]!.native[0]!.agentId = 'investigation_solution'

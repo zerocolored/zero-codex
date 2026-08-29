@@ -83,12 +83,15 @@ state dir の `jobs.sqlite3` に、認可済み Slack event を transaction で�
    handshakeを検証した時点でthread IDをDBへ保存する。
 7. 正常終了/失敗とterminal通知を同じtransactionで保存し、Slack投稿成功後に通知済みにする。
 8. Codexとround専用advisorの停止・exact workspace cleanup、結果checkpoint、SQLite terminal化のすべてが確定してから
-   viewerのterminal write/drainとbindingを再確認し、監視tabをexact IDで閉じる。rate-limit再開では
+   viewerのterminal write/drainとbindingを再確認する。正常完了と中止は監視tabをexact IDで閉じる。
+   通常失敗は公開可能な固定分類の原因を表示し、全feedをseal/drainしてviewerを待機状態へ固定したうえで
+   tabを確認用に残す。monitor obligationだけをretireするため、失敗tabは後続FIFOを止めない。rate-limit再開では
    同じtabとhealth監視を保持する。viewer・tab・heartbeatを証明できなくなった場合はCodexを停止し、
    後続jobを開始せず再起動reconcileへ渡す。
-9. 監視tabを人が閉じた場合、tracked executorは回収しても、最終出力の実表示を後から証明できない。
+9. 実行中の監視tabを人が閉じた場合、tracked executorは回収しても、最終出力の実表示を後から証明できない。
    次回起動や`recover-interrupted`は当該jobを自動failed化せず、監視tab再作成も行わず、
-   durable monitor obligationを保持してFIFOを止める。Slack deliveryだけはFIFOと独立に再試行する。
+   durable monitor obligationを保持してFIFOを止める。失敗確定後に確認用として残ったtabは閉じてよく、
+   次回reconcileが残存stateだけを回収する。Slack deliveryだけはFIFOと独立に再試行する。
 10. runner 停止中のread-only `running` jobは次回起動時に`queued`へ戻してresumeする。write jobは外部副作用が不確実なためfailedにし、状態確認後の手動再送を求める。
 
 sessionはSlack thread・repository・write modeが同じ場合に最大20 jobまで再利用し、senderは

@@ -13,6 +13,7 @@ export type NativeAdvisorJournalEntry = {
   perspective: NativeAdvisorPerspective
   agentId: string
   responseDigest: string
+  responseTransportDigest?: string
 }
 
 export type NativeAdvisorRoundEvidence = {
@@ -55,6 +56,72 @@ export function nativeAdvisorMarker(
 
 export function nativeAdvisorResponseDigest(response: string): string {
   return createHash('sha256').update(response).digest('hex')
+}
+
+/**
+ * Hash the only transport rewrite observed between collaboration output and
+ * App Server history: Markdown hard-break spaces can be removed before LF.
+ * Keep every other byte significant, including code blocks, indented code,
+ * tabs, Unicode whitespace, CRLF, and one/three-or-more trailing spaces.
+ */
+export function nativeAdvisorResponseTransportDigest(response: string): string {
+  return createHash('sha256').update(canonicalNativeAdvisorTransport(response)).digest('hex')
+}
+
+function canonicalNativeAdvisorTransport(response: string): string {
+  const lines = response.match(/[^\n]*\n|[^\n]+$/g) ?? []
+  let fence: { character: '`' | '~'; length: number } | null = null
+  return lines.map(line => {
+    const hasLf = line.endsWith('\n')
+    const body = hasLf ? line.slice(0, -1) : line
+    const fenceMatch = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(body)
+    const wasInFence = fence !== null
+    let nextFence = fence
+    if (fenceMatch) {
+      const sequence = fenceMatch[1]!
+      const character = sequence[0] as '`' | '~'
+      if (!fence) {
+        nextFence = { character, length: sequence.length }
+      } else if (character === fence.character && sequence.length >= fence.length
+        && /^ *$/.test(fenceMatch[2]!)) {
+        nextFence = null
+      }
+    }
+    // Nested Markdown containers can contain fenced or indented code whose
+    // trailing spaces are data.  Do not try to parse those containers here;
+    // fail closed by limiting the rewrite to column-zero prose.  A plain
+    // Markdown list item remains prose, while an unspaced +/- line keeps the
+    // conservative patch protection used by existing journals.
+    const nestedOrIndented = /^\s/u.test(body) || /^ {0,3}>/.test(body)
+    const patchLine = /^(?:diff --git |index |@@ |--- |\+\+\+ |[+-](?! ))/.test(body)
+    const normalized = hasLf && !wasInFence && !fenceMatch
+      && !nestedOrIndented && !patchLine && /\S {2}$/u.test(body)
+      ? body.slice(0, -2)
+      : body
+    fence = nextFence
+    return normalized + (hasLf ? '\n' : '')
+  }).join('')
+}
+
+export function nativeAdvisorResponseHasExactMarker(response: string, marker: string): boolean {
+  const first = response.indexOf(marker)
+  return first >= 0
+    && first === response.lastIndexOf(marker)
+    && (response === marker || response.endsWith(`\n${marker}`))
+}
+
+function nativeAdvisorResponseMatches(
+  response: string,
+  marker: string,
+  entry: NativeAdvisorJournalEntry,
+): 'raw' | 'transport' | null {
+  if (!nativeAdvisorResponseHasExactMarker(response, marker)) return null
+  if (nativeAdvisorResponseDigest(response) === entry.responseDigest) return 'raw'
+  if (entry.responseTransportDigest
+    && nativeAdvisorResponseTransportDigest(response) === entry.responseTransportDigest) {
+    return 'transport'
+  }
+  return null
 }
 
 /**
@@ -137,7 +204,9 @@ export function resolveNativeAdvisorThreadIds(options: {
     ...evidence,
     native: evidence.native.map(entry => {
       if (!isNativeAdvisorAgentLabel(entry.agentId) || logicalAgentIds.has(entry.agentId)
-        || !/^[0-9a-f]{64}$/.test(entry.responseDigest)) {
+        || !/^[0-9a-f]{64}$/.test(entry.responseDigest)
+        || (entry.responseTransportDigest !== undefined
+          && !/^[0-9a-f]{64}$/.test(entry.responseTransportDigest))) {
         throw new Error('native advisor journal identities are not fresh and unique')
       }
       logicalAgentIds.add(entry.agentId)
@@ -149,12 +218,18 @@ export function resolveNativeAdvisorThreadIds(options: {
         evidence.round,
         entry.perspective,
       )
-      const matches = candidates.filter(candidate => (
+      const eligible = candidates.filter(candidate => (
         !matchedThreadIds.has(candidate.threadId)
         && candidate.perspective === entry.perspective
-        && candidate.finalResponse.endsWith(marker)
-        && nativeAdvisorResponseDigest(candidate.finalResponse) === entry.responseDigest
       ))
+      const rawMatches = eligible.filter(candidate => (
+        nativeAdvisorResponseMatches(candidate.finalResponse, marker, entry) === 'raw'
+      ))
+      const matches = rawMatches.length > 0
+        ? rawMatches
+        : eligible.filter(candidate => (
+            nativeAdvisorResponseMatches(candidate.finalResponse, marker, entry) === 'transport'
+          ))
       if (matches.length !== 1) {
         throw new Error(
           `native advisor ${entry.agentId} did not resolve to exactly one physical thread`,
@@ -508,7 +583,9 @@ export function assertNativeAdvisorEvidence(options: {
     }
     for (const entry of evidence.native) {
       if (!THREAD_ID.test(entry.agentId) || claimed.has(entry.agentId)
-        || !/^[0-9a-f]{64}$/.test(entry.responseDigest)) {
+        || !/^[0-9a-f]{64}$/.test(entry.responseDigest)
+        || (entry.responseTransportDigest !== undefined
+          && !/^[0-9a-f]{64}$/.test(entry.responseTransportDigest))) {
         throw new Error('native advisor identities are not fresh and unique')
       }
       claimed.add(entry.agentId)
@@ -548,8 +625,7 @@ export function assertNativeAdvisorEvidence(options: {
         options.attemptNonce, evidence.inputRevision, evidence.inputDigest,
         evidence.phase, evidence.round, entry.perspective,
       )
-      if (!finalResponse.endsWith(marker)
-        || nativeAdvisorResponseDigest(finalResponse) !== entry.responseDigest) {
+      if (nativeAdvisorResponseMatches(finalResponse, marker, entry) === null) {
         throw new Error(`native advisor ${entry.agentId} response is not bound to this round`)
       }
     }

@@ -64,6 +64,8 @@ import {
   isNativeAdvisorAgentLabel,
   nativeAdvisorMarker,
   nativeAdvisorResponseDigest,
+  nativeAdvisorResponseHasExactMarker,
+  nativeAdvisorResponseTransportDigest,
 } from './native-advisor-evidence.ts'
 import { readSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 import {
@@ -939,7 +941,8 @@ async function main(): Promise<void> {
     if (raw === null || Buffer.byteLength(raw) > 64 * 1024) return null
     try {
       const value = JSON.parse(raw) as Record<string, unknown>
-      if (value.version !== 6 || value.status !== status || value.phase !== phase
+      if ((value.version !== 6 && value.version !== 7)
+        || value.status !== status || value.phase !== phase
         || value.round !== round || value.attemptNonce !== context.attemptNonce
         || value.contextDigest !== contextDigest
         || value.inputRevision !== input.revision || value.inputDigest !== input.digest
@@ -966,7 +969,10 @@ async function main(): Promise<void> {
       const valid = new Set(native.map(entry => entry.perspective)).size === 2
         && new Set(native.map(entry => entry.agentId)).size === 2
         && native.every(entry => typeof entry.responseDigest === 'string'
-          && /^[0-9a-f]{64}$/.test(entry.responseDigest))
+          && /^[0-9a-f]{64}$/.test(entry.responseDigest)
+          && (value.version !== 7
+            || (typeof entry.responseTransportDigest === 'string'
+              && /^[0-9a-f]{64}$/.test(entry.responseTransportDigest))))
         && validTerminalGrokAttempts(value.grok)
         && validTerminalClaudeAttempt(value.claude)
       return valid ? value : null
@@ -1408,19 +1414,23 @@ async function main(): Promise<void> {
       perspective: 'solution' | 'risk'
       agentId: string
       responseDigest: string
+      responseTransportDigest: string
     }> => nativeAdvisors.map(advisor => {
         const response = safeInput(advisor.response, `${advisor.perspective} native advisor response`)
         const marker = nativeAdvisorMarker(
           context.attemptNonce, boundInput.revision, boundInput.digest,
           phase, round as 1 | 2 | 3, advisor.perspective,
         )
-        if (!response.endsWith(marker)) {
-          throw new Error(`${advisor.perspective} native advisor response omitted its round marker`)
+        if (!nativeAdvisorResponseHasExactMarker(response, marker)) {
+          throw new Error(
+            `${advisor.perspective} native advisor response omitted or misplaced its round marker`,
+          )
         }
         return {
           perspective: advisor.perspective,
           agentId: advisor.agentId,
           responseDigest: nativeAdvisorResponseDigest(response),
+          responseTransportDigest: nativeAdvisorResponseTransportDigest(response),
         }
       })
     let boundInput = input
@@ -1557,7 +1567,7 @@ async function main(): Promise<void> {
       const staleJournalPath = join(staleJournalRoot, `${phase}-${round}.json`)
       const now = Date.now()
       if (!createExclusivePrivateFile(staleJournalPath, `${JSON.stringify({
-        version: 6,
+        version: 7,
         status: 'stale-input',
         phase,
         round,
@@ -1606,7 +1616,7 @@ async function main(): Promise<void> {
     const journalPath = join(currentJournalRoot, `${phase}-${round}.json`)
     const startedAt = Date.now()
     if (!createExclusivePrivateFile(journalPath, `${JSON.stringify({
-      version: 6,
+      version: 7,
       status: 'requested',
       phase,
       round,
@@ -1676,7 +1686,7 @@ async function main(): Promise<void> {
       && validTerminalClaudeAttempt(claudeJournal)
     const finishedAt = Date.now()
     atomicWritePrivateFile(journalPath, `${JSON.stringify({
-      version: 6,
+      version: 7,
       status: complete
         ? 'reviewers-completed'
         : inputUnchanged ? 'required-reviewer-failed' : 'stale-input',

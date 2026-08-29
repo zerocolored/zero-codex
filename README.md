@@ -42,7 +42,9 @@ Slack bot
   開始・調査・テスト・レビュー・完了を人が読める日本語タイムラインで表示します。生のJSON-RPC、コマンド全文、
   絶対path、内部ID、認証情報は表示せず、診断用stdout/stderrだけをowner-onlyの`job-logs`へ保存します。監視tab内でCodexを
   再起動することはなく、rate-limit再開中は
-  同じtabを保持します。Codex・round専用advisorの終了・SQLite terminal確定後だけ自動で閉じます。
+  同じtabを保持します。正常完了と中止ではCodex・round専用advisorの終了・SQLite terminal確定後に
+  自動で閉じます。通常失敗では、安全な固定分類の原因と最終出力を表示してtabを確認用に残します。
+  失敗tabは次のFIFO jobを妨げず、確認後に利用者が閉じると管理stateも次回照合時に回収されます。
   viewerのprocess世代・argv・cwd・heartbeatを実行前からclose直前まで監視し、terminalへの最終出力の
   drain完了も確認します。create/run/closeの応答や監視状態が曖昧な場合はIDを推測・操作せず、
   後続jobを開始しないfail-closed動作になります。実行中の監視tabを人が閉じた場合も同様に停止し、

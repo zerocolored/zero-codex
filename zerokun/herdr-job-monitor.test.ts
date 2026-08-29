@@ -25,6 +25,7 @@ import {
   openHerdrJobMonitor,
   readBoundedHerdrOutput,
   reconcileHerdrJobMonitors,
+  retainFailedHerdrJobMonitor,
   stripTerminalControls,
   watchHerdrJobMonitor,
   type HerdrJobMonitorControl,
@@ -297,7 +298,7 @@ class FakeControl implements HerdrJobMonitorControl {
       this.waitFailures -= 1
       throw new Error('wait output unavailable')
     }
-    if (marker === HERDR_MONITOR_DRAIN_TEXT) {
+    if (marker === HERDR_MONITOR_DRAIN_TEXT || marker === '表示を終了します') {
       if (this.suppressDrainMarker) return false
       if (this.autoDrain && this.generationStatus === 'alive') this.drainCurrentViewer()
       const pane = this.panes.find(value => value.paneId === _paneId)
@@ -821,7 +822,7 @@ describe('Herdr job monitor', () => {
     expect(control.runCalls).toBe(1)
   })
 
-  test('rate-limit相当のqueued jobはtabを保持しterminal jobだけreconcileで閉じる', async () => {
+  test('rate-limit相当のqueued jobはtabを保持し中止確定後だけreconcileで閉じる', async () => {
     const state = fixtureDirectory()
     const control = new FakeControl()
     const record = job()
@@ -842,7 +843,7 @@ describe('Herdr job monitor', () => {
     const closed = await reconcileHerdrJobMonitors({
       stateDir: state,
       runtime: runtime(),
-      getJob: () => ({ status: 'failed' }),
+      getJob: () => ({ status: 'failed', terminalOutcome: 'cancelled' }),
       control,
     })
     expect(closed).toEqual({ retained: 0, closed: 1, retainedJobIds: [] })
@@ -1597,6 +1598,175 @@ describe('Herdr job monitor', () => {
     })).rejects.toThrow('unfinished legacy rotation')
   })
 
+  test('失敗monitorはdrain後にtabを残し、次queue用obligationだけをretireする', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'failed', terminalOutcome: 'failed', lastError: 'private detail' })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    const retired: string[] = []
+
+    const disposition = await retainFailedHerdrJobMonitor({
+      stateDir: state,
+      runtime: runtime(),
+      jobId: record.id,
+      publicReason: '補助レビューの回答と保存履歴を照合できませんでした。',
+      onMonitorRetired: id => { retired.push(id) },
+      control,
+    })
+
+    expect(disposition).toBe('retained')
+    expect(control.closeCalls).toBe(0)
+    expect(control.tabs).toHaveLength(1)
+    expect(retired).toEqual([record.id])
+    const directory = join(state, 'job-monitors', record.id)
+    const manifest = JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')) as {
+      phase: string
+    }
+    expect(manifest.phase).toBe('retained-failure')
+    const statusEpoch = JSON.parse(
+      readFileSync(join(directory, 'status.epoch.json'), 'utf8'),
+    ) as { generation: number; sealed: boolean }
+    const status = readFileSync(
+      join(directory, `status.${statusEpoch.generation}.feed`),
+      'utf8',
+    )
+    expect(statusEpoch.sealed).toBe(true)
+    expect(status).toContain('補助レビューの回答と保存履歴を照合できませんでした。')
+    expect(status).toContain('確認用にこのタブを残します')
+    expect(status).not.toContain('private detail')
+
+    const restarted = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ status: 'failed' }),
+      control,
+    })
+    expect(restarted).toEqual({ retained: 1, closed: 0, retainedJobIds: [] })
+    expect(control.closeCalls).toBe(0)
+  })
+
+  test('DB失敗確定直後の再起動はactive monitorをretained failureへ収束する', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'failed', terminalOutcome: 'failed' })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    let retired = 0
+
+    const result = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ status: 'failed', terminalOutcome: 'failed' }),
+      publicFailureReason: () => '補助レビューの回答と保存履歴を照合できませんでした。',
+      onMonitorRetired: () => { retired += 1 },
+      control,
+    })
+
+    expect(result).toEqual({ retained: 1, closed: 0, retainedJobIds: [] })
+    expect(retired).toBe(1)
+    expect(control.closeCalls).toBe(0)
+    const manifest = JSON.parse(readFileSync(
+      join(state, 'job-monitors', record.id, 'manifest.json'),
+      'utf8',
+    )) as { phase: string }
+    expect(manifest.phase).toBe('retained-failure')
+  })
+
+  test('旧版がsealしたfinal markerからの再起動も失敗tab保持へ収束する', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'failed', terminalOutcome: 'failed' })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    const directory = join(state, 'job-monitors', record.id)
+    const legacyMarker = '表示を終了します'
+    appendHerdrJobMonitorStatus(state, record.id, legacyMarker)
+    const epochPath = join(directory, 'status.epoch.json')
+    const epoch = JSON.parse(readFileSync(epochPath, 'utf8')) as Record<string, unknown>
+    writeFileSync(epochPath, `${JSON.stringify({ ...epoch, sealed: true })}\n`, { mode: 0o600 })
+    control.drainDirectory(directory)
+
+    const result = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ status: 'failed', terminalOutcome: 'failed' }),
+      publicFailureReason: () => '内部処理でエラーが発生しました。',
+      control,
+    })
+
+    expect(result).toEqual({ retained: 1, closed: 0, retainedJobIds: [] })
+    expect(control.closeCalls).toBe(0)
+    const manifest = JSON.parse(readFileSync(
+      join(directory, 'manifest.json'),
+      'utf8',
+    )) as { phase: string }
+    expect(manifest.phase).toBe('retained-failure')
+  })
+
+  test('確認済みの失敗tabを利用者が閉じたらstateだけを回収する', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'failed', terminalOutcome: 'failed' })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    await retainFailedHerdrJobMonitor({
+      stateDir: state,
+      runtime: runtime(),
+      jobId: record.id,
+      publicReason: '内部処理でエラーが発生しました。',
+      control,
+    })
+    control.tabs.splice(0)
+    control.panes.splice(0)
+    control.generationStatus = 'dead'
+    if (control.process) control.process.foregroundProcesses = []
+    let retired = 0
+
+    const result = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ status: 'failed' }),
+      onMonitorRetired: () => { retired += 1 },
+      control,
+    })
+
+    expect(result).toEqual({ retained: 0, closed: 1, retainedJobIds: [] })
+    expect(retired).toBe(1)
+    expect(existsSync(join(state, 'job-monitors', record.id))).toBe(false)
+  })
+
+  test('確認済み失敗tabのviewer停止後はtabを操作せずstateだけを回収する', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'failed', terminalOutcome: 'failed' })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    await retainFailedHerdrJobMonitor({
+      stateDir: state,
+      runtime: runtime(),
+      jobId: record.id,
+      publicReason: '内部処理でエラーが発生しました。',
+      control,
+    })
+    control.generationStatus = 'dead'
+    control.process!.foregroundProcesses = [{
+      pid: 9001,
+      argv: ['/bin/zsh'],
+      cwd: control.panes[0]!.cwd,
+    }]
+    let retired = 0
+
+    const result = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ status: 'failed' }),
+      onMonitorRetired: () => { retired += 1 },
+      control,
+    })
+
+    expect(result).toEqual({ retained: 0, closed: 1, retainedJobIds: [] })
+    expect(retired).toBe(1)
+    expect(control.closeCalls).toBe(0)
+    expect(control.tabs).toHaveLength(1)
+    expect(existsSync(join(state, 'job-monitors', record.id))).toBe(false)
+  })
+
   test('terminal injectionとbidi制御文字を表示前に除去する', () => {
     expect(stripTerminalControls(
       'a\u001b]0;title\u0007b\u001b[31mc\u001b[0m\u061C\u200E\u200F\u202Ed\u0001',
@@ -1729,6 +1899,25 @@ describe('Herdr job monitor', () => {
         )) as { streams: { stderr: { offset: number } } }
         return progress.streams.stderr.offset === Buffer.byteLength(stderrValue) + 2
       })
+      appendFileSync(join(directory, 'status.0.feed'), `[Zeroちゃん] ${HERDR_MONITOR_DRAIN_TEXT}\n`)
+      for (const kind of ['stdout', 'status']) {
+        const path = join(directory, `${kind}.epoch.json`)
+        const epoch = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+        epoch.sealed = true
+        writeFileSync(path, `${JSON.stringify(epoch)}\n`, { mode: 0o600 })
+      }
+      await waitUntil(() => {
+        const progress = JSON.parse(readFileSync(
+          join(directory, 'progress.json'),
+          'utf8',
+        )) as { streams: Record<string, { offset: number }> }
+        return ['stdout', 'stderr', 'status'].every(kind => (
+          progress.streams[kind]!.offset === statSync(join(directory, `${kind}.0.feed`)).size
+        ))
+      })
+      const frozenProgress = readFileSync(join(directory, 'progress.json'), 'utf8')
+      await Bun.sleep(1_200)
+      expect(readFileSync(join(directory, 'progress.json'), 'utf8')).toBe(frozenProgress)
     } finally {
       child.kill('SIGTERM')
       await child.exited

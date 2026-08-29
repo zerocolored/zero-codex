@@ -34,6 +34,7 @@ import {
   flushTerminalNotifications,
   finalizeSuccessfulExecution,
   persistExecutionResultJournal,
+  publicJobFailureSummary,
   readUploadableArtifact,
   recoverExecutionCheckpointBeforeAdvisorCleanup,
   recoverExecutionResultJournals,
@@ -2746,6 +2747,41 @@ describe('single FIFO worker', () => {
     expect(order).toEqual([
       'claude-reserved', 'monitor-open', 'executor', 'claude-cleared', 'monitor-close',
     ])
+    store.close()
+  })
+
+  test('通常失敗だけ監視tabを保持し、次のFIFO jobは続行する', async () => {
+    const store = makeStore()
+    const first = store.enqueue(input({ messageId: 'monitor-retain-failed-1' })).job
+    const second = store.enqueue(input({ messageId: 'monitor-retain-failed-2' })).job
+    const executed: string[] = []
+    const retained: string[] = []
+    const closed: string[] = []
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      openJobMonitor: async () => {},
+      executor: async current => {
+        executed.push(current.id)
+        if (current.id === first.id) {
+          throw new Error(
+            'native advisor /root/design_solution_r1 did not resolve to exactly one physical thread',
+          )
+        }
+        return { sessionId: 'monitor-next-session', result: 'done' }
+      },
+      retainFailedJobMonitor: async current => { retained.push(current.id) },
+      closeJobMonitor: async current => { closed.push(current.id) },
+    })
+
+    expect(stats).toEqual({ completed: 1, failed: 1, workersStarted: 1 })
+    expect(executed).toEqual([first.id, second.id])
+    expect(retained).toEqual([first.id])
+    expect(closed).toEqual([second.id])
+    expect(store.get(first.id)).toMatchObject({ status: 'failed', terminalOutcome: 'failed' })
+    expect(store.get(second.id)?.status).toBe('completed')
     store.close()
   })
 
@@ -6156,6 +6192,22 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(evidence).toHaveLength(1)
     expect(evidence[0]!.native).toHaveLength(2)
 
+    journal.version = 7
+    for (const [index, native] of journal.native.entries()) {
+      Object.assign(native, { responseTransportDigest: String(index + 7).repeat(64) })
+    }
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    const versionSeven = assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )
+    expect(versionSeven[0]!.native[0]!.responseTransportDigest).toBe('7'.repeat(64))
+    delete (journal.native[0] as Record<string, unknown>).responseTransportDigest
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('incomplete native')
+    Object.assign(journal.native[0]!, { responseTransportDigest: '7'.repeat(64) })
+
     journal.grok[0]!.containmentVerified = false
     writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
     expect(() => assertRequiredAdvisorRounds(
@@ -7718,6 +7770,31 @@ describe('Slack output guard', () => {
     expect(posted).toEqual(['少し時間がかかっていますが、まだ作業を続けています 🔍'])
     expect(posted[0]).not.toContain(job.id)
     expect(posted[0]).not.toContain(job.repoPath)
+    store.close()
+  })
+
+  test('失敗通知は固定分類とqueue番号だけを出しraw内部情報を漏らさない', async () => {
+    const store = makeStore()
+    const job = store.enqueue(input({ messageId: 'safe-failure-summary' })).job
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+    const raw = 'native advisor /root/design_solution_r1 did not resolve; '
+      + 'path=/Users/private/project token=xoxb-raw-secret Codex'
+
+    expect(publicJobFailureSummary(raw)).toBe(
+      '補助レビューの回答と保存履歴を照合できませんでした。',
+    )
+    await notifier.failed(job, raw)
+
+    expect(posted).toEqual([
+      '🙇 うまく完了できませんでした。'
+        + '\n原因: 補助レビューの回答と保存履歴を照合できませんでした。'
+        + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
+    ])
+    expect(posted[0]).not.toContain('監視タブを確認用に残しました')
+    expect(posted[0]).not.toMatch(/Codex|xoxb|\/Users\/|design_solution/)
     store.close()
   })
 

@@ -55,7 +55,7 @@ describe('Zero-kun Codex wiring', () => {
     expect(executor).toContain('session.loadFullTurn(')
   })
 
-  test('jobごとのHerdr monitorは安全な進捗だけを表示しterminal後に閉じる', () => {
+  test('jobごとのHerdr monitorは安全な進捗を表示し失敗時だけ確認用に残す', () => {
     const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
     const monitor = readFileSync(join(import.meta.dir, 'herdr-job-monitor.ts'), 'utf8')
     const viewer = readFileSync(join(import.meta.dir, 'herdr-job-monitor-view.ts'), 'utf8')
@@ -64,6 +64,7 @@ describe('Zero-kun Codex wiring', () => {
     expect(runner).not.toContain('onStdoutChunk: value => mirrorChunk(')
     expect(runner).not.toContain('onStderrChunk: value => mirrorChunk(')
     expect(runner).toContain('closeHerdrJobMonitor({')
+    expect(runner).toContain('retainFailedHerdrJobMonitor({')
     expect(runner).toContain('watchHerdrJobMonitor({')
     expect(runner).toContain('for (const jobId of startupRetainedMonitorJobIds) ensureMonitorGuard(jobId)')
     expect(runner).toContain('assertJobMonitorHealthy:')
@@ -84,12 +85,14 @@ describe('Zero-kun Codex wiring', () => {
     expect(monitor).toContain("'tab', 'create'")
     expect(monitor).toContain("'--no-focus'")
     expect(monitor).toContain("'tab', 'close'")
+    expect(monitor).toContain("phase: 'retained-failure'")
     expect(monitor).toContain('exec /usr/bin/env -i PATH=/usr/bin:/bin TERM=dumb')
     expect(monitor).not.toContain("'codex', 'exec'")
     expect(monitor).toContain('monitor loss recovery did not terminalize non-terminal job')
     expect(viewer).toContain('HERDR_MONITOR_READY_TEXT')
     expect(viewer).not.toContain('ZEROCHAN_MONITOR_READY:')
     expect(viewer).toContain("'progress.json'")
+    expect(viewer).toContain('while (true) await Bun.sleep(60_000)')
     expect(viewer).not.toContain('Bun.spawn(')
   })
 

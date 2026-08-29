@@ -60,7 +60,8 @@ const VIEWER_PROGRESS_STALE_MS = 5_000
 const FEED_KINDS = ['stdout', 'stderr', 'status'] as const
 
 export const HERDR_MONITOR_READY_TEXT = '監視を開始しました'
-export const HERDR_MONITOR_DRAIN_TEXT = '表示を終了します'
+export const HERDR_MONITOR_DRAIN_TEXT = '表示内容を確定しました'
+const HERDR_MONITOR_LEGACY_DRAIN_TEXT = '表示を終了します'
 
 export type HerdrMonitorFeedKind = typeof FEED_KINDS[number]
 export type HerdrMonitorPhase =
@@ -68,6 +69,7 @@ export type HerdrMonitorPhase =
   | 'tab-created'
   | 'run-intent'
   | 'active'
+  | 'retained-failure'
   | 'close-intent'
 
 export interface HerdrMonitorTab {
@@ -305,7 +307,9 @@ function parseManifest(raw: string): MonitorManifest {
   }
   const record = value as Record<string, unknown>
   const phase = record.phase
-  if (!['create-intent', 'tab-created', 'run-intent', 'active', 'close-intent'].includes(
+  if (![
+    'create-intent', 'tab-created', 'run-intent', 'active', 'retained-failure', 'close-intent',
+  ].includes(
     typeof phase === 'string' ? phase : '',
   )) throw new Error('monitor manifest has invalid phase')
   const nullableId = (input: unknown, pattern: RegExp, label: string): string | null => (
@@ -346,9 +350,9 @@ function parseManifest(raw: string): MonitorManifest {
   if ((manifest.phase === 'create-intent') !== !hasBinding) {
     throw new Error('monitor manifest binding does not match phase')
   }
-  if (manifest.phase === 'active'
+  if ((manifest.phase === 'active' || manifest.phase === 'retained-failure')
     && (!manifest.viewerProcess || !manifest.viewerArgvDigest)) {
-    throw new Error('active monitor lacks viewer identity')
+    throw new Error('live or retained monitor lacks viewer identity')
   }
   if (manifest.viewerProcess === null !== (manifest.viewerArgvDigest === null)) {
     throw new Error('monitor viewer identity is incomplete')
@@ -1691,12 +1695,20 @@ function finalDrainMarker(_manifest: MonitorManifest): string {
   return HERDR_MONITOR_DRAIN_TEXT
 }
 
+function finalDrainMarkers(_manifest: MonitorManifest): readonly string[] {
+  // The previous release could seal this marker immediately before a daemon
+  // restart.  Accept only these two exact terminal lines; new writes always
+  // use the current wording.
+  return [HERDR_MONITOR_DRAIN_TEXT, HERDR_MONITOR_LEGACY_DRAIN_TEXT]
+}
+
 async function requireFinalDrainObserved(
   manifest: MonitorManifest,
   control: HerdrJobMonitorControl,
+  marker = finalDrainMarker(manifest),
 ): Promise<void> {
   if (!manifest.paneId
-    || !await control.waitOutput(manifest.paneId, finalDrainMarker(manifest), DRAIN_TIMEOUT_MS)) {
+    || !await control.waitOutput(manifest.paneId, marker, DRAIN_TIMEOUT_MS)) {
     throw new Error(`Herdr did not observe final monitor output for job ${manifest.jobId}`)
   }
 }
@@ -1704,23 +1716,31 @@ async function requireFinalDrainObserved(
 function requireDurableFinalDrainMarker(
   manifest: MonitorManifest,
   directory: string,
-): void {
+): string {
   const statusEpoch = parseEpoch(
     readSmallOwnedFile(epochPath(directory, 'status'), 'monitor status feed epoch'),
   )
   if (!statusEpoch.sealed) {
     throw new Error(`dead monitor viewer lacks a sealed final marker for job ${manifest.jobId}`)
   }
-  const expected = Buffer.from(`[Zeroちゃん] ${finalDrainMarker(manifest)}\n`, 'utf8')
+  const expectedMarkers = finalDrainMarkers(manifest).map(marker => ({
+    marker,
+    bytes: Buffer.from(`[Zeroちゃん] ${marker}\n`, 'utf8'),
+  }))
+  const tailBytes = Math.max(...expectedMarkers.map(expected => expected.bytes.byteLength))
   const statusTail = readOwnedFileTail(
     feedPath(directory, 'status', statusEpoch.generation),
     STATUS_LIMIT_BYTES,
-    expected.byteLength,
+    tailBytes,
     'monitor status feed',
   )
-  if (!statusTail.equals(expected)) {
-    throw new Error(`dead monitor viewer lacks a durable final marker for job ${manifest.jobId}`)
+  for (const expected of expectedMarkers) {
+    if (statusTail.byteLength >= expected.bytes.byteLength
+      && statusTail.subarray(statusTail.byteLength - expected.bytes.byteLength).equals(expected.bytes)) {
+      return expected.marker
+    }
   }
+  throw new Error(`dead monitor viewer lacks a durable final marker for job ${manifest.jobId}`)
 }
 
 async function confirmDeadViewerDrain(
@@ -1730,14 +1750,14 @@ async function confirmDeadViewerDrain(
   control: HerdrJobMonitorControl,
   recovered = false,
 ): Promise<void> {
-  requireDurableFinalDrainMarker(manifest, directory)
+  const marker = requireDurableFinalDrainMarker(manifest, directory)
   const targets = snapshotFeedTargets(directory)
   if (!viewerProgressCovers(manifest, readViewerProgress(directory), targets)) {
     throw new Error(
       `${recovered ? 'dead recovered' : 'dead'} monitor viewer had undrained output for job ${manifest.jobId}`,
     )
   }
-  await requireFinalDrainObserved(manifest, control)
+  await requireFinalDrainObserved(manifest, control, marker)
   const info = await control.processInfo(paneId)
   if (info.paneId !== paneId || info.foregroundProcesses.length !== 0) {
     throw new Error(
@@ -1761,6 +1781,7 @@ async function confirmLiveViewerDrain(
   const statusEpoch = parseEpoch(
     readSmallOwnedFile(epochPath(directory, 'status'), 'monitor status feed epoch'),
   )
+  let marker = finalDrainMarker(manifest)
   if (!statusEpoch.sealed) {
     appendFeed(
       directory,
@@ -1769,9 +1790,11 @@ async function confirmLiveViewerDrain(
       manifest,
     )
     sealFeed(directory, 'status')
+  } else {
+    marker = requireDurableFinalDrainMarker(manifest, directory)
   }
   await waitForViewerDrain(manifest, directory, control, snapshotFeedTargets(directory))
-  await requireFinalDrainObserved(manifest, control)
+  await requireFinalDrainObserved(manifest, control, marker)
   await findOrVerifyBinding(manifest, directory, runtime, control)
   const finalViewer = await verifyViewer(manifest, directory, control, viewerArguments())
   if (finalViewer.digest !== manifest.viewerArgvDigest
@@ -1807,6 +1830,108 @@ async function verifyExactCloseTarget(
   }
 }
 
+async function retireFailedMonitorWithoutViewer(
+  stateDir: string,
+  directory: string,
+  manifest: MonitorManifest,
+  control: HerdrJobMonitorControl,
+  onMonitorRetired?: (jobId: string) => Promise<void> | void,
+): Promise<'closed'> {
+  // A retained tab belongs to the operator once its monitor obligation is
+  // retired.  If the viewer later stops, never infer that its shell/pane is
+  // still safe to close; only forget our state after proving our process is
+  // gone.  This also prevents a reused retained tab from blocking the FIFO.
+  await waitForViewerStopped(manifest.viewerProcess, control)
+  await onMonitorRetired?.(manifest.jobId)
+  removeClosedMonitorDirectory(stateDir, directory)
+  return 'closed'
+}
+
+/**
+ * Freeze a failed job's fully drained viewer and leave its exact Herdr tab in
+ * place for inspection. The DB obligation is retired only after the durable
+ * retained phase is written, so the next FIFO job does not wait on this tab.
+ */
+export async function retainFailedHerdrJobMonitor(input: {
+  stateDir: string
+  runtime: HerdrRuntimeIdentity
+  jobId: string
+  publicReason: string
+  onMonitorRetired?: (jobId: string) => Promise<void> | void
+  control?: HerdrJobMonitorControl
+}): Promise<'retained' | 'closed'> {
+  const stateDir = requireManagedStateRoot(input.stateDir)
+  const control = input.control ?? createProductionHerdrJobMonitorControl(input.runtime)
+  await control.verifyRuntime()
+  const directory = monitorDirectory(stateDir, input.jobId)
+  let manifest = readMonitorManifest(stateDir, input.jobId)
+  if (!manifest) throw new Error(`monitor manifest is missing for job ${input.jobId}`)
+  if (manifest.phase !== 'active' && manifest.phase !== 'retained-failure') {
+    throw new HerdrJobMonitorPendingError(
+      `failed monitor is not ready for retention for job ${input.jobId}`,
+    )
+  }
+  initializeFeeds(directory, manifest)
+  const tabs = await control.listTabs(manifest.workspaceId)
+  if (!manifestBindingPresent(manifest, tabs)) {
+    await proveManifestBindingAbsent(manifest, directory, control)
+    await waitForViewerStopped(manifest.viewerProcess, control)
+    await input.onMonitorRetired?.(manifest.jobId)
+    removeClosedMonitorDirectory(stateDir, directory)
+    return 'closed'
+  }
+  const binding = await findOrVerifyBinding(manifest, directory, input.runtime, control)
+  manifest = {
+    ...manifest,
+    tabId: binding.tab.tabId,
+    paneId: binding.pane.paneId,
+    terminalId: binding.pane.terminalId,
+  }
+  const processStatus = control.processGenerationStatus(manifest.viewerProcess!)
+  if (processStatus === 'unknown') {
+    throw new HerdrJobMonitorPendingError(
+      `failed monitor viewer state is unknown for job ${input.jobId}`,
+    )
+  }
+  if (processStatus === 'dead') {
+    if (manifest.phase !== 'retained-failure') {
+      throw new HerdrJobMonitorPendingError(
+        `failed monitor viewer stopped before its final output was retained for job ${input.jobId}`,
+      )
+    }
+    return retireFailedMonitorWithoutViewer(
+      stateDir,
+      directory,
+      manifest,
+      control,
+      input.onMonitorRetired,
+    )
+  }
+  const viewer = await verifyViewer(manifest, directory, control, viewerArguments())
+  if (viewer.digest !== manifest.viewerArgvDigest
+    || !sameProcessGeneration(viewer.process, manifest.viewerProcess!)) {
+    throw new Error(`failed monitor viewer changed for job ${input.jobId}`)
+  }
+  if (manifest.phase === 'active') {
+    const statusEpoch = parseEpoch(
+      readSmallOwnedFile(epochPath(directory, 'status'), 'monitor status feed epoch'),
+    )
+    if (!statusEpoch.sealed) {
+      appendHerdrJobMonitorStatus(stateDir, input.jobId, `原因: ${input.publicReason}`)
+      appendHerdrJobMonitorStatus(
+        stateDir,
+        input.jobId,
+        '確認用にこのタブを残します。確認後は閉じてかまいません。',
+      )
+      appendHerdrJobMonitorStatus(stateDir, input.jobId, 'タスク処理は失敗として終了しました')
+    }
+    await confirmLiveViewerDrain(manifest, directory, input.runtime, control)
+    manifest = writeManifest(directory, { ...manifest, phase: 'retained-failure' })
+  }
+  await input.onMonitorRetired?.(manifest.jobId)
+  return 'retained'
+}
+
 export async function closeHerdrJobMonitor(input: {
   stateDir: string
   runtime: HerdrRuntimeIdentity
@@ -1839,7 +1964,8 @@ export async function closeHerdrJobMonitor(input: {
     && tabs.filter(tab => tab.label === manifest.label).length === 1
   if (!manifestBindingPresent(manifest, tabs) && !canDiscoverCreateIntent) {
     await proveManifestBindingAbsent(manifest, directory, control)
-    if (manifest.phase !== 'close-intent' && manifest.phase !== 'create-intent') {
+    if (manifest.phase !== 'close-intent' && manifest.phase !== 'create-intent'
+      && manifest.phase !== 'retained-failure') {
       throw new HerdrJobMonitorPendingError(
         `monitor binding disappeared before a durable close intent for job ${input.jobId}`,
       )
@@ -1856,7 +1982,7 @@ export async function closeHerdrJobMonitor(input: {
     paneId: binding.pane.paneId,
     terminalId: binding.pane.terminalId,
   }
-  if (manifest.phase === 'active'
+  if (manifest.phase === 'active' || manifest.phase === 'retained-failure'
     || (manifest.phase === 'close-intent' && manifest.viewerProcess !== null)) {
     const processStatus = control.processGenerationStatus(manifest.viewerProcess!)
     if (processStatus === 'alive') {
@@ -1960,7 +2086,10 @@ export async function closeHerdrJobMonitor(input: {
 export async function reconcileHerdrJobMonitors(input: {
   stateDir: string
   runtime: HerdrRuntimeIdentity
-  getJob(jobId: string): Pick<JobRecord, 'status'> | null
+  getJob(jobId: string): {
+    status: JobStatus
+    terminalOutcome?: JobRecord['terminalOutcome']
+  } | null
   listMonitorObligations?: () => Array<{
     id: string
     status: JobStatus
@@ -1972,6 +2101,7 @@ export async function reconcileHerdrJobMonitors(input: {
     state: 'preparing' | 'required' | 'lost-staged',
   ) => 'terminalized' | 'unarmed' | 'staged-result'
   onMonitorRetired?: (jobId: string) => Promise<void> | void
+  publicFailureReason?: (jobId: string) => string
   progressGraceMs?: number
   control?: HerdrJobMonitorControl
 }): Promise<{ retained: number; closed: number; retainedJobIds: string[] }> {
@@ -2101,6 +2231,41 @@ export async function reconcileHerdrJobMonitors(input: {
     const job = input.getJob(name)
     const status: JobStatus | 'missing' = job?.status ?? 'missing'
     const obligation = obligations().get(name)
+    if (manifest.phase === 'retained-failure') {
+      if ((status !== 'failed' && status !== 'missing')
+        || job?.terminalOutcome === 'cancelled') {
+        throw new HerdrJobMonitorPendingError(
+          `retained failed monitor is bound to non-failed job ${name}`,
+        )
+      }
+      const disposition = await retainFailedHerdrJobMonitor({
+        stateDir,
+        runtime: input.runtime,
+        jobId: name,
+        publicReason: input.publicFailureReason?.(name)
+          ?? '内部処理でエラーが発生しました。',
+        onMonitorRetired: input.onMonitorRetired,
+        control,
+      })
+      if (disposition === 'retained') retained += 1
+      else closed += 1
+      continue
+    }
+    if (status === 'failed' && job?.terminalOutcome === 'failed'
+      && manifest.phase === 'active') {
+      const disposition = await retainFailedHerdrJobMonitor({
+        stateDir,
+        runtime: input.runtime,
+        jobId: name,
+        publicReason: input.publicFailureReason?.(name)
+          ?? '内部処理でエラーが発生しました。',
+        onMonitorRetired: input.onMonitorRetired,
+        control,
+      })
+      if (disposition === 'retained') retained += 1
+      else closed += 1
+      continue
+    }
     if (input.recoverMissingBindingAfterExecutorsStopped) {
       const localTabs = await control.listTabs(manifest.workspaceId)
       const bindingCouldExist = manifestBindingPresent(manifest, localTabs)
@@ -2152,12 +2317,24 @@ export async function reconcileHerdrJobMonitors(input: {
         `lost-staged monitor unexpectedly has a Herdr binding for ${name}`,
       )
     }
-    if (status === 'completed' || status === 'failed' || status === 'missing') {
+    if (status === 'failed') {
       await closeHerdrJobMonitor({
         stateDir,
         runtime: input.runtime,
         jobId: name,
-        outcome: status === 'failed' ? 'failed' : 'completed',
+        outcome: 'failed',
+        onMonitorRetired: input.onMonitorRetired,
+        control,
+      })
+      closed += 1
+      continue
+    }
+    if (status === 'completed' || status === 'missing') {
+      await closeHerdrJobMonitor({
+        stateDir,
+        runtime: input.runtime,
+        jobId: name,
+        outcome: 'completed',
         onMonitorRetired: input.onMonitorRetired,
         control,
       })

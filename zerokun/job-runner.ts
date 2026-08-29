@@ -123,6 +123,7 @@ import {
   HerdrJobMonitorPendingError,
   openHerdrJobMonitor,
   reconcileHerdrJobMonitors,
+  retainFailedHerdrJobMonitor,
   watchHerdrJobMonitor,
 } from './herdr-job-monitor.ts'
 import {
@@ -5658,6 +5659,7 @@ export interface RunQueuedJobsOptions {
   updateJobMonitor?: (job: JobRecord, message: string) => Promise<void> | void
   recordJobMonitorFailure?: (job: JobRecord, error: unknown) => Promise<void> | void
   closeJobMonitor?: (job: JobRecord) => Promise<void>
+  retainFailedJobMonitor?: (job: JobRecord) => Promise<void>
   executorStagesResult?: boolean
   signal?: AbortSignal
   onLog?: (message: string) => void
@@ -5683,6 +5685,22 @@ export class ArtifactDeliveryAmbiguousError extends Error {
     this.name = 'ArtifactDeliveryAmbiguousError'
     this.artifactPaths = [...new Set(artifactPaths)]
   }
+}
+
+export function publicJobFailureSummary(error: string): string {
+  if (error.includes('write-enabled')
+    && (error.includes('effects are uncertain') || error.includes('may already have changed'))) {
+    return '変更処理の途中で失敗したため、一部の変更が残っている可能性があります。再送前に確認してください。'
+  }
+  if (error.includes('native advisor')
+    || error.includes('native Codex advisor')
+    || error.includes('advisor journal')) {
+    return '補助レビューの回答と保存履歴を照合できませんでした。'
+  }
+  if (error.includes('Herdr monitor') || error.includes('monitor viewer')) {
+    return '進捗表示との接続を維持できませんでした。'
+  }
+  return '内部処理でエラーが発生しました。'
 }
 
 export class CodexResultPersistencePendingError extends Error {
@@ -6313,7 +6331,12 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       const settled = options.store.get(job.id)
       if (!skipMonitorClose && settled
         && (settled.status === 'completed' || settled.status === 'failed')) {
-        await options.closeJobMonitor?.(settled)
+        if (settled.status === 'failed' && settled.terminalOutcome === 'failed'
+          && options.retainFailedJobMonitor) {
+          await options.retainFailedJobMonitor(settled)
+        } else {
+          await options.closeJobMonitor?.(settled)
+        }
       }
     }
     }
@@ -8221,7 +8244,8 @@ export class SlackNotifier implements JobNotifier {
         cancelled
           ? '🛑 中止しました。すでに完了した変更は自動では戻していません。'
           : '🙇 うまく完了できませんでした。'
-            + '\n詳細はこのMacの管理ログを確認してください。',
+            + `\n原因: ${publicJobFailureSummary(error)}`
+            + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
         notificationId,
         signal,
       )
@@ -9147,6 +9171,9 @@ async function runCli(): Promise<void> {
             listMonitorObligations: () => store.monitorObligations(),
             recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
             onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
+            publicFailureReason: jobId => publicJobFailureSummary(
+              store.get(jobId)?.lastError ?? '',
+            ),
           }),
           async () => { await reconcileEphemeralClaudeSessions({
             stateDir: dir,
@@ -9165,6 +9192,9 @@ async function runCli(): Promise<void> {
         listMonitorObligations: () => store.monitorObligations(),
         recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
         onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
+        publicFailureReason: jobId => publicJobFailureSummary(
+          store.get(jobId)?.lastError ?? '',
+        ),
       })
       if (monitors.closed > 0 || monitors.retained > 0) {
         log(`reconciled Herdr job monitors: ${JSON.stringify(monitors)}`)
@@ -9298,6 +9328,9 @@ async function runCli(): Promise<void> {
           listMonitorObligations: () => store.monitorObligations(),
           recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
           onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
+          publicFailureReason: jobId => publicJobFailureSummary(
+            store.get(jobId)?.lastError ?? '',
+          ),
         }),
         async () => { await reconcileEphemeralClaudeSessions({
           stateDir: dir,
@@ -9325,6 +9358,9 @@ async function runCli(): Promise<void> {
       listMonitorObligations: () => store.monitorObligations(),
       recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
       onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
+      publicFailureReason: jobId => publicJobFailureSummary(
+        store.get(jobId)?.lastError ?? '',
+      ),
     })
     startupRetainedMonitorJobIds = monitors.retainedJobIds
     if (monitors.closed > 0 || monitors.retained > 0) {
@@ -9511,6 +9547,17 @@ async function runCli(): Promise<void> {
           outcome: job.terminalOutcome === 'cancelled'
             ? 'cancelled'
             : job.status === 'failed' ? 'failed' : 'completed',
+          onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
+        })
+      },
+      retainFailedJobMonitor: async job => {
+        const guardFailure = await stopMonitorGuard(job.id)
+        if (guardFailure) throw guardFailure
+        await retainFailedHerdrJobMonitor({
+          stateDir: dir,
+          runtime: pinnedHerdrRuntime,
+          jobId: job.id,
+          publicReason: publicJobFailureSummary(job.lastError ?? ''),
           onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
         })
       },
