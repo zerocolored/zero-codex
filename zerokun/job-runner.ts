@@ -4450,6 +4450,25 @@ export class JobStore {
     }))
   }
 
+  suspendUnavailableSlackThreadPoll(input: {
+    chatId: string
+    threadTs: string
+    observedLastActivityMs: number
+  }): boolean {
+    const chatId = requireText(input.chatId, 'chatId')
+    const threadTs = requireText(input.threadTs, 'threadTs')
+    const observedLastActivityMs = input.observedLastActivityMs
+    if (!Number.isSafeInteger(observedLastActivityMs) || observedLastActivityMs <= 1) {
+      return false
+    }
+    return retrySqlite(() => this.db.run(
+      `UPDATE slack_threads
+       SET last_activity_ms = 1
+       WHERE chat_id = ? AND thread_ts = ? AND last_activity_ms = ?`,
+      [chatId, threadTs, observedLastActivityMs],
+    ).changes === 1)
+  }
+
   adoptThread(input: {
     chatId: string
     threadTs: string

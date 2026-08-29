@@ -1894,6 +1894,20 @@ async function pollThreads(): Promise<void> {
           advanceSchedulerCursor('owned-threads', pollKey)
           continue
         }
+        if (slackReplyScanFailureDisposition(err) === 'discard') {
+          const suspended = jobStore.suspendUnavailableSlackThreadPoll({
+            chatId: channelId,
+            threadTs,
+            observedLastActivityMs: lastActivity,
+          })
+          if (suspended) {
+            process.stderr.write(
+              'slack channel: unavailable thread polling paused until new activity\n',
+            )
+          }
+          advanceSchedulerCursor('owned-threads', pollKey)
+          continue
+        }
         process.stderr.write(`slack channel: poll replies failed for ${threadTs}: ${err}\n`)
         advanceSchedulerCursor('owned-threads', pollKey)
         continue

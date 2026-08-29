@@ -1168,6 +1168,48 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('取得不能owned threadは新しいactivityまでpollを休止し競合更新を失わない', async () => {
+    const store = makeStore()
+    const first = input({
+      chatId: 'C-OWNED',
+      threadTs: '100.000000',
+      messageId: '100.000001',
+    })
+    store.enqueue(first)
+    const observed = store.listThreads()[0]!
+
+    await Bun.sleep(2)
+    store.enqueue(input({
+      chatId: first.chatId,
+      threadTs: first.threadTs,
+      messageId: '100.000002',
+    }))
+    const refreshed = store.listThreads()[0]!
+    expect(refreshed.lastActivityMs).toBeGreaterThan(observed.lastActivityMs)
+    expect(store.suspendUnavailableSlackThreadPoll({
+      chatId: first.chatId,
+      threadTs: first.threadTs,
+      observedLastActivityMs: observed.lastActivityMs,
+    })).toBe(false)
+    expect(store.listThreads()[0]!.lastActivityMs).toBe(refreshed.lastActivityMs)
+
+    expect(store.suspendUnavailableSlackThreadPoll({
+      chatId: first.chatId,
+      threadTs: first.threadTs,
+      observedLastActivityMs: refreshed.lastActivityMs,
+    })).toBe(true)
+    expect(store.listThreads()[0]!.lastActivityMs).toBe(1)
+
+    await Bun.sleep(2)
+    store.enqueue(input({
+      chatId: first.chatId,
+      threadTs: first.threadTs,
+      messageId: '100.000003',
+    }))
+    expect(store.listThreads()[0]!.lastActivityMs).toBeGreaterThan(1)
+    store.close()
+  })
+
   test('同じhistory pageで重複stageされた41 parentは一意なdurable workになる', () => {
     const store = makeStore()
     const parents = Array.from({ length: 41 }, (_, index) => ({

@@ -100,6 +100,18 @@ describe('Slack bridge resilience wiring', () => {
     expect(replyScan).not.toContain('completePendingDirectMessageChannel(scan.channelId)')
   })
 
+  test('取得不能owned threadは新しいactivityまでpollを休止する', () => {
+    const pollerStart = server.indexOf('async function pollThreads()')
+    const poller = server.slice(
+      pollerStart,
+      server.indexOf('  void pollThreads()', pollerStart),
+    )
+    expect(poller).toContain("slackReplyScanFailureDisposition(err) === 'discard'")
+    expect(poller).toContain('suspendUnavailableSlackThreadPoll({')
+    expect(poller).toContain('observedLastActivityMs: lastActivity')
+    expect(poller).toContain('unavailable thread polling paused until new activity')
+  })
+
   test('plugin lockはPIDだけでなくserver.tsのprocess identityを照合する', () => {
     expect(server).toContain("from './plugin-lock.ts'")
     expect(server).toContain('claimPluginLock(LOCK_FILE, STATE_DIR)')
