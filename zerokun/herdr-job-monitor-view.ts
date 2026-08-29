@@ -115,6 +115,11 @@ async function main(): Promise<void> {
     operationId: manifest.operationId,
     process: identity,
   })}\n`)
+  // Herdr runs the viewer through the pane's interactive shell, which echoes
+  // the launch command and prompt before this process starts. Clear both the
+  // visible screen and scrollback before presenting the user-safe timeline so
+  // command paths and the managed monitor directory never remain visible.
+  await writeTerminal(process.stdout, '\x1b[3J\x1b[2J\x1b[H')
   await writeTerminal(process.stdout, `Zeroちゃん / キュー #${manifest.seq}\n`)
   await writeTerminal(process.stdout, `[Zeroちゃん] ${HERDR_MONITOR_READY_TEXT}\n`)
 

@@ -1734,6 +1734,7 @@ describe('Herdr job monitor', () => {
       await child.exited
       await output
     }
+    expect(stdout.startsWith('\x1b[3J\x1b[2J\x1b[H')).toBe(true)
     expect(stdout).toContain(`[Zeroちゃん] ${HERDR_MONITOR_READY_TEXT}`)
     expect(stdout).not.toContain(operationId)
     expect(stdout).not.toContain('ZEROCHAN_MONITOR_')
