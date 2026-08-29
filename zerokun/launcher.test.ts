@@ -285,10 +285,10 @@ describe('codex-channel.sh replacement guard', () => {
 
     const unset = await runLauncher(state, {}, undefined, {
       invokedAs: 'zerochan', cwd: project,
-      args: ['unset', 'slack-channel', 'C0123456789'],
+      args: ['unset', 'slack-channel'],
     })
     expect(unset.exitCode, unset.output).toBe(0)
-    expect(unset.output).toContain('解除しました: C0123456789')
+    expect(unset.output).toContain('Slackチャンネルの紐付けをすべて解除しました')
     expect(JSON.parse(readFileSync(join(project, '.zerochan', 'config.json'), 'utf8')))
       .toEqual({ version: 1, slackChannels: [] })
   })

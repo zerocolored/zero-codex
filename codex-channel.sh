@@ -48,15 +48,14 @@ case "$INVOKED_AS" in
       LAUNCH_MODE="set-channel"
       CHANNEL_ID="$3"
       PROJECT="$(pwd -P)"
-    elif [ "$#" -eq 3 ] && [ "$1" = "unset" ] && [ "$2" = "slack-channel" ]; then
+    elif [ "$#" -eq 2 ] && [ "$1" = "unset" ] && [ "$2" = "slack-channel" ]; then
       LAUNCH_MODE="unset-channel"
-      CHANNEL_ID="$3"
       PROJECT="$(pwd -P)"
     elif [ "$#" -eq 1 ] && [ "$1" = "status" ]; then
       LAUNCH_MODE="status"
       PROJECT="$(pwd -P)"
     else
-      echo "使い方: zerochan | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel <channel-id> | zerochan status" >&2
+      echo "使い方: zerochan | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
       exit 2
     fi
     ;;
@@ -153,7 +152,7 @@ case "$LAUNCH_MODE" in
   unset-channel)
     require_route_capable_gateway_if_running || exit 1
     exec bun --config=/dev/null --no-env-file "$CHANNEL_CONFIG" \
-      unset "$PROJECT" "$STATE_DIR" "$SLACK_APP_ID" "$CHANNEL_ID"
+      unset "$PROJECT" "$STATE_DIR" "$SLACK_APP_ID"
     ;;
   status)
     exec bun --config=/dev/null --no-env-file "$CHANNEL_CONFIG" \

@@ -308,7 +308,7 @@ zerochan set slack-channel C0123456789
 zerochan
 zerochan --restart  # 前回Slackへ接続できたprojectで再起動
 zerochan status
-zerochan unset slack-channel C0123456789
+zerochan unset slack-channel
 zerokun             # 互換alias。現在directoryで起動
 zerokun-status
 zerokun-jobs status

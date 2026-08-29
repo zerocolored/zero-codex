@@ -351,7 +351,9 @@ export function mutateProjectChannelConfig(input: {
     const afterChannels = input.operation === 'set'
       ? normalizeChannels([...before.slackChannels, requested!])
       : input.operation === 'unset'
-        ? before.slackChannels.filter(channel => channel !== requested)
+        ? requested === undefined
+          ? []
+          : before.slackChannels.filter(channel => channel !== requested)
         : before.slackChannels
 
     if (input.operation === 'unset' && requested) {
@@ -466,8 +468,8 @@ export function projectChannelStatus(input: {
 
 function usage(): never {
   throw new Error(
-    'usage: project-channel-config.ts set|unset <repo> <state> <app-id> <channel-id>'
-    + ' | sync|status <repo> <state> <app-id>',
+    'usage: project-channel-config.ts set <repo> <state> <app-id> <channel-id>'
+    + ' | unset|sync|status <repo> <state> <app-id>',
   )
 }
 
@@ -475,15 +477,22 @@ if (import.meta.main) {
   try {
     const [command, repoPath, stateDir, appId, channelId, ...extra] = process.argv.slice(2)
     if (!repoPath || !stateDir || !appId || extra.length > 0) usage()
-    if ((command === 'set' || command === 'unset') && channelId) {
+    if (command === 'set' && channelId) {
       const config = mutateProjectChannelConfig({
-        operation: command,
+        operation: 'set',
         repoPath,
         stateDir,
         appId,
         channelId,
       })
-      process.stdout.write(`${command === 'set' ? '🔗 設定しました' : '🔓 解除しました'}: ${normalizeSlackChannelId(channelId)}\n`)
+      process.stdout.write(`🔗 設定しました: ${normalizeSlackChannelId(channelId)}\n`)
+      process.stdout.write(`   project: ${repoPath}\n`)
+      process.stdout.write(`   channels: ${config.slackChannels.join(', ') || 'なし'}\n`)
+    } else if (command === 'unset' && channelId === undefined) {
+      const config = mutateProjectChannelConfig({
+        operation: 'unset', repoPath, stateDir, appId,
+      })
+      process.stdout.write('🔓 Slackチャンネルの紐付けをすべて解除しました\n')
       process.stdout.write(`   project: ${repoPath}\n`)
       process.stdout.write(`   channels: ${config.slackChannels.join(', ') || 'なし'}\n`)
     } else if (command === 'sync' && channelId === undefined) {

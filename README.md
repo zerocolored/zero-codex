@@ -243,7 +243,7 @@ zerochan
 
 # 設定・解除・確認
 zerochan status
-zerochan unset slack-channel C0123456789
+zerochan unset slack-channel
 
 # 別terminalから
 zerokun-status

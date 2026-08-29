@@ -90,6 +90,29 @@ describe('project-local Slack channel routes', () => {
     expect(gitStatus(projectA)).toBe('')
   })
 
+  test('unsetはchannel IDなしでprojectの紐付けをすべて解除する', () => {
+    const { state, projectA } = fixture()
+    for (const channelId of ['CBBBBBBBBBB', 'CAAAAAAAAAA']) {
+      mutateProjectChannelConfig({
+        operation: 'set', repoPath: projectA, stateDir: state, appId: APP_ID, channelId,
+      })
+    }
+
+    const config = mutateProjectChannelConfig({
+      operation: 'unset', repoPath: projectA, stateDir: state, appId: APP_ID,
+    })
+
+    expect(config.slackChannels).toEqual([])
+    expect(readProjectChannelConfig(projectA).slackChannels).toEqual([])
+    const store = new JobStore(resolveZeroJobDatabasePath(state))
+    try {
+      expect(store.resolveSlackChannelRoute(APP_ID, 'CAAAAAAAAAA')).toBeNull()
+      expect(store.resolveSlackChannelRoute(APP_ID, 'CBBBBBBBBBB')).toBeNull()
+    } finally {
+      store.close()
+    }
+  })
+
   test('multi-repo workspaceは親のlocal設定へ保存し、子repositoryをdirtyにしない', () => {
     const { root, state } = fixture()
     const workspace = join(root, 'workspace')
