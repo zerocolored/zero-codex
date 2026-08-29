@@ -12,7 +12,7 @@ Slack Socket Mode
 server.ts（添付をローカル保存し、SQLiteへcommit）
   ↓ jobs.sqlite3 / 1本のFIFO
 job-runner.ts
-  ├→ task専用Herdr監視tab（stdout/stderrのread-only表示）
+  ├→ task専用Herdr監視tab（安全な日本語タイムライン）
   ↓ verified Herdr context / codex app-server --stdio
 Codex App Server（read jobはRO、write jobはRO準備→RW実装→ROレビューの別process）
   └→ 各advisor round専用のfresh Claude workspace（回答取得後にexact close）
@@ -39,7 +39,9 @@ Slack bot
 - 起動時のHerdr socket・pane・terminal・workspaceを固定し、job開始前に同じidentityを再検証します。
   staleなHerdr環境ではCodexを起動しません。
 - job開始時に同じHerdr workspaceへ非フォーカスの`Zeroちゃん #<queue>`監視tabを1つ作り、実行中の
-  stdout/stderrとqueue状態を表示します。監視tab内でCodexを再起動することはなく、rate-limit再開中は
+  開始・調査・テスト・レビュー・完了を人が読める日本語タイムラインで表示します。生のJSON-RPC、コマンド全文、
+  絶対path、内部ID、認証情報は表示せず、診断用stdout/stderrだけをowner-onlyの`job-logs`へ保存します。監視tab内でCodexを
+  再起動することはなく、rate-limit再開中は
   同じtabを保持します。Codex・round専用advisorの終了・SQLite terminal確定後だけ自動で閉じます。
   viewerのprocess世代・argv・cwd・heartbeatを実行前からclose直前まで監視し、terminalへの最終出力の
   drain完了も確認します。create/run/closeの応答や監視状態が曖昧な場合はIDを推測・操作せず、

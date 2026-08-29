@@ -104,6 +104,7 @@ import {
   type AppServerSessionSource,
   type AppServerTurn,
 } from './codex-app-server-session.ts'
+import { CodexMonitorDisplay } from './codex-monitor-display.ts'
 import {
   createSeatbeltFingerprint,
   recoverOrphanSeatbeltFingerprints,
@@ -123,6 +124,7 @@ const MAX_EVENT_LINE_CHARS = 1024 * 1024
 const MAX_FINAL_MESSAGE_BYTES = 1024 * 1024
 const MAX_APP_SERVER_LINE_CHARS = 32 * 1024 * 1024
 const MAX_APP_SERVER_STDERR_CHARS = 64 * 1024
+const MAX_PENDING_MONITOR_MESSAGES = 256
 const LOGICAL_CLEANUP_EXIT_CODE = 86
 const SYSTEM_CODEX_CONFIGS = ['/etc/codex/config.toml', '/etc/codex/managed_config.toml']
 const DISABLED_STDIO_MCP_COMMAND = '/usr/bin/false'
@@ -3656,6 +3658,8 @@ export async function executeCodexJob(
     onProcessExit?(exitCode: number): void
     onStdoutChunk?(value: Uint8Array): void
     onStderrChunk?(value: Uint8Array): void
+    /** Bounded, user-safe status projected from validated root-thread notifications. */
+    onMonitorMessage?(message: string): void
     /** Persist a `(job, attempt, slot)` probe before its App Server write. */
     onProgressProbeStarted?(probe: { slot: number; clientMessageId: string }): boolean
     /** Persist an explicit probe supersession before advancing the cadence. */
@@ -4313,6 +4317,27 @@ export async function executeCodexJob(
       let capturedProgress: CodexProgressReport | null = null
       let progressProbeRetryAtMs = 0
       let progressPublishRetryAtMs = 0
+      const monitorDisplay = new CodexMonitorDisplay()
+      let monitorParentThreadId: string | null = null
+      const pendingMonitorMessages: string[] = []
+      let monitorMessagesDropped = false
+      const enqueueMonitorMessage = (message: string): void => {
+        if (pendingMonitorMessages.length >= MAX_PENDING_MONITOR_MESSAGES) {
+          monitorMessagesDropped = true
+          return
+        }
+        pendingMonitorMessages.push(message)
+      }
+      const flushMonitorMessages = (): void => {
+        const messages = pendingMonitorMessages.splice(0)
+        if (monitorMessagesDropped) {
+          messages.push('… 頻繁な更新の一部を省略しました')
+          monitorMessagesDropped = false
+        }
+        for (const message of messages) {
+          try { options.onMonitorMessage?.(message) } catch {}
+        }
+      }
       const session = new CodexAppServerSession(proc.stdin, proc.stdout, {
         onOutputChunk: value => {
           if (stdoutBytes < MAX_LOG_FILE_BYTES) {
@@ -4327,6 +4352,11 @@ export async function executeCodexJob(
         onNotification: notification => {
           // Keep the reader callback memory-only and non-throwing. Durable
           // staging happens in the single owner loop below.
+          try {
+            for (const message of monitorDisplay.observe(notification, monitorParentThreadId)) {
+              enqueueMonitorMessage(message)
+            }
+          } catch {}
           try {
             const probe = activeProgressProbe
             if (!probe || capturedProgress) return
@@ -4745,6 +4775,7 @@ export async function executeCodexJob(
           ? await session.resumeThread({ threadId: sessionId, ...threadParams })
           : await session.startThread({ ...threadParams, ephemeral: false })
         currentThreadId = threadHandshake.threadId
+        monitorParentThreadId = currentThreadId
         currentThreadSource = threadHandshake.source
         if (resumed && sessionId && currentThreadId !== sessionId) {
           throw new AppServerProtocolError('thread/resume returned a different thread id')
@@ -4873,6 +4904,7 @@ export async function executeCodexJob(
         }
 
         while (true) {
+          flushMonitorMessages()
           if (abortedBeforeProcessExit) throw new CodexInterruptedError('Codex job was interrupted')
           const activity = session.takeNextTurnActivity(currentThreadId, currentTurnId)
           if (activity?.kind === 'error') {
@@ -5116,8 +5148,10 @@ export async function executeCodexJob(
             await waitForProtocolActivity()
           }
         }
+        flushMonitorMessages()
       } catch (error) {
         protocolError = error
+        flushMonitorMessages()
         if (error instanceof CodexInputChangedBeforeDispatchError) {
           inputChangedBeforeDispatch = true
         }
@@ -5257,6 +5291,7 @@ export async function executeCodexJob(
       options.onProcessExit?.(exitCode)
       let readerError: unknown
       try { await session.waitForReader() } catch (error) { readerError = error }
+      flushMonitorMessages()
       let lateProtocolError: unknown
       const lateAppServerError = session.takeError()
       if (lateAppServerError) {

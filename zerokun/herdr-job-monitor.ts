@@ -42,6 +42,7 @@ import {
   verifyHerdrRuntimeIdentityAsync,
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
+import { sanitizeMonitorText } from './codex-monitor-display.ts'
 
 const MONITOR_ROOT = 'job-monitors'
 const CLOSED_MONITOR_ROOT = 'job-monitors-closed'
@@ -57,6 +58,9 @@ const DRAIN_TIMEOUT_MS = 10_000
 const VIEWER_STOP_TIMEOUT_MS = 5_000
 const VIEWER_PROGRESS_STALE_MS = 5_000
 const FEED_KINDS = ['stdout', 'stderr', 'status'] as const
+
+export const HERDR_MONITOR_READY_TEXT = '監視を開始しました'
+export const HERDR_MONITOR_DRAIN_TEXT = '表示を終了します'
 
 export type HerdrMonitorFeedKind = typeof FEED_KINDS[number]
 export type HerdrMonitorPhase =
@@ -323,7 +327,7 @@ function parseManifest(raw: string): MonitorManifest {
     ),
     phase: phase as HerdrMonitorPhase,
     workspaceId: requireIdentifier(record.workspaceId, /^w[0-9A-Za-z]+$/, 'workspace ID'),
-    label: requireIdentifier(record.label, /^Zeroちゃん #[1-9]\d* \[[0-9a-f]{8}\]$/, 'monitor label'),
+    label: requireIdentifier(record.label, /^Zeroちゃん #[1-9]\d*$/, 'monitor label'),
     tabId: nullableId(record.tabId, /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/, 'tab ID'),
     paneId: nullableId(record.paneId, /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/, 'pane ID'),
     terminalId: nullableId(record.terminalId, /^term_[0-9a-f]+$/, 'terminal ID'),
@@ -1019,8 +1023,9 @@ export function appendHerdrJobMonitorStatus(
   if (!manifest || !['create-intent', 'tab-created', 'run-intent', 'active'].includes(
     manifest.phase,
   )) throw new Error(`monitor is not accepting status for job ${jobId}`)
-  const text = stripTerminalControls(message).trim().slice(0, 2_000)
-  if (!text) return
+  const rawText = stripTerminalControls(message).trim()
+  if (!rawText) return
+  const text = sanitizeMonitorText(rawText, 2_000) ?? '詳細を安全のため省略しました'
   appendFeed(directory, 'status', Buffer.from(`[Zeroちゃん] ${text}\n`, 'utf8'), manifest)
 }
 
@@ -1497,7 +1502,7 @@ async function activateViewer(
   if (manifest.phase !== 'run-intent') {
     throw new Error(`monitor is not ready to activate for job ${manifest.jobId}`)
   }
-  const marker = `ZEROCHAN_MONITOR_READY:${manifest.operationId}`
+  const marker = HERDR_MONITOR_READY_TEXT
   const markerSeen = await control.waitOutput(manifest.paneId!, marker, READY_TIMEOUT_MS)
   const args = viewerArguments()
   let viewer: { process: ProcessIdentity; digest: string }
@@ -1512,14 +1517,14 @@ async function activateViewer(
     }
     throw error
   }
-  // The terminal marker is useful operational evidence, but it is ephemeral.
+  // The terminal start line is useful operational evidence, but it is ephemeral.
   // A durable receipt plus exact live process/argv/cwd binding is authoritative
   // after restart or scrollback truncation.
   if (!markerSeen) {
     appendFeed(
       directory,
       'status',
-      Buffer.from('[Zeroちゃん] 起動markerは画面履歴から取得できませんでした\n', 'utf8'),
+      Buffer.from('[Zeroちゃん] 開始表示は画面履歴から取得できませんでした\n', 'utf8'),
       manifest,
     )
   }
@@ -1585,7 +1590,7 @@ export async function openHerdrJobMonitor(input: {
       controlPlaneFingerprint: herdrControlPlaneFingerprint(input.runtime),
       phase: 'create-intent',
       workspaceId: input.runtime.workspaceId,
-      label: `Zeroちゃん #${input.job.seq} [${nonce.slice(0, 8)}]`,
+      label: `Zeroちゃん #${input.job.seq}`,
       tabId: null,
       paneId: null,
       terminalId: null,
@@ -1599,7 +1604,7 @@ export async function openHerdrJobMonitor(input: {
     appendHerdrJobMonitorStatus(
       stateDir,
       input.job.id,
-      `依頼: ${stripTerminalControls(input.job.task).replace(/\s+/g, ' ').slice(0, 500)}`,
+      '依頼内容を受け取りました',
     )
   } else {
     if (manifest.seq !== input.job.seq
@@ -1682,8 +1687,8 @@ function removeClosedMonitorDirectory(stateDir: string, directory: string): void
   retireMonitorDirectory(stateDir, directory)
 }
 
-function finalDrainMarker(manifest: MonitorManifest): string {
-  return `ZEROCHAN_MONITOR_DRAINED:${manifest.operationId}`
+function finalDrainMarker(_manifest: MonitorManifest): string {
+  return HERDR_MONITOR_DRAIN_TEXT
 }
 
 async function requireFinalDrainObserved(

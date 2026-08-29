@@ -50,7 +50,7 @@ zerochan
 | `job-runner.ts` | SQLite FIFO、thread/session 所有権、Slack 通知 |
 | `runner-launcher.ts` | runnerの独立process group起動、安全なlog接続 |
 | `herdr-runtime.ts` | Herdr socket・pane・terminal・workspaceの起動前/各job再検証 |
-| `herdr-job-monitor.ts` | job専用Herdr監視tabの永続state、出力mirror、再起動reconcile、自動close |
+| `herdr-job-monitor.ts` | job専用Herdr監視tabの永続state、安全な日本語タイムライン、再起動reconcile、自動close |
 | `herdr-job-monitor-view.ts` | tokenを持たずrolling feedだけをterminalへ安全に表示するviewer |
 | `codex-executor.ts` | sandboxを選び、App Server thread/turn/controlを検証 |
 | `browser-verification-broker.ts` | fresh Chrome profileでlocalhostだけを描画・PNG検証 |

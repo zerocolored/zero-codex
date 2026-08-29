@@ -134,8 +134,10 @@ zerochan-access pair <6桁code>
 ```
 
 認可後の依頼が実行段階へ入ると、同じHerdr workspaceに`Zeroちゃん #<待ち順>`という監視tabが
-フォーカスを奪わず自動作成されます。このtabは実際の1本のCodex processの出力を表示するだけで、
-別のCodexを起動しません。rate-limit待機中は残り、Codex・round専用advisor cleanup・結果確定が
+フォーカスを奪わず自動作成されます。このtabは実際の1本のCodex processから投影した、開始・調査・
+テスト・レビュー・完了の短い日本語タイムラインだけを表示し、生JSON、コマンド全文、絶対path、内部ID、
+認証情報は表示しません。診断用の生stdout/stderrはowner-only logへ分離して保存します。監視tabが
+別のCodexを起動することはありません。rate-limit待機中は残り、Codex・round専用advisor cleanup・結果確定が
 すべて終わり、terminalへの最終出力が表示済みだと確認できると自動で閉じます。viewerのPID世代・
 argv・cwd・heartbeatやtab identityが実行中に失われた場合は、実行を止めて後続queueを開始しません。
 監視tabを誤って閉じると、最終出力の実表示を後から証明できないため、`zerokun`の再起動や

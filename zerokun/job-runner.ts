@@ -110,7 +110,6 @@ import {
   reconcileEphemeralClaudeSessions,
 } from './ephemeral-claude-session.ts'
 import {
-  appendHerdrJobMonitorChunk,
   appendHerdrJobMonitorStatus,
   closeHerdrJobMonitor,
   HerdrJobMonitorPendingError,
@@ -5881,7 +5880,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           + 'services before a later phase failed. Review those effects, then resend only if '
           + `needed. Underlying failure: ${message}`
         : message
-      await updateMonitor(job, `失敗として確定します: ${failure.slice(0, 500)}`)
+      await updateMonitor(job, '失敗として確定します')
       await quiesceMonitorBeforeTerminal()
       options.store.fail(job.id, failure)
       stats.failed += 1
@@ -7599,7 +7598,7 @@ export class SlackNotifier implements JobNotifier {
     await this.trackLifecycleSideEffect(
       () => this.post(
         job,
-        '🔍 確認を始めますね。時間がかかる場合は、途中経過もこのスレッドでお知らせします。',
+        '確認します 👀',
         notificationId,
         signal,
       ),
@@ -9090,9 +9089,9 @@ async function runCli(): Promise<void> {
         if (signal?.aborted) forwardAbort()
         else signal?.addEventListener('abort', forwardAbort, { once: true })
         if (guard.failure) executionController.abort()
-        const mirrorChunk = (kind: 'stdout' | 'stderr', value: Uint8Array): void => {
+        const mirrorMonitorMessage = (message: string): void => {
           if (guard.failure) return
-          try { appendHerdrJobMonitorChunk(dir, job.id, kind, value) } catch (error) {
+          try { appendHerdrJobMonitorStatus(dir, job.id, message) } catch (error) {
             failMonitorGuard(job.id, guard, error)
           }
         }
@@ -9282,8 +9281,7 @@ async function runCli(): Promise<void> {
               ),
               cancellationRequested: () => store.get(job.id)?.cancelRequestedAt != null,
             },
-            onStdoutChunk: value => mirrorChunk('stdout', value),
-            onStderrChunk: value => mirrorChunk('stderr', value),
+            onMonitorMessage: message => mirrorMonitorMessage(message),
             onSuccessfulResult: rawExecution => {
               try {
                 const finalized = finalizeSuccessfulExecution(

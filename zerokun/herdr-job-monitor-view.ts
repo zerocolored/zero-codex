@@ -12,7 +12,10 @@ import {
 import { join } from 'path'
 import { readProcessIdentity } from './process-generation.ts'
 import { atomicWritePrivateFile, readOptionalBoundedAtomicOwnedFile } from './safe-file.ts'
-import { stripTerminalControls } from './herdr-job-monitor.ts'
+import {
+  HERDR_MONITOR_READY_TEXT,
+  stripTerminalControls,
+} from './herdr-job-monitor.ts'
 
 const MAX_STATE_FILE_BYTES = 64 * 1024
 const MAX_READ_BYTES = 256 * 1024
@@ -113,7 +116,7 @@ async function main(): Promise<void> {
     process: identity,
   })}\n`)
   await writeTerminal(process.stdout, `Zeroちゃん / キュー #${manifest.seq}\n`)
-  await writeTerminal(process.stdout, `ZEROCHAN_MONITOR_READY:${manifest.operationId}\n`)
+  await writeTerminal(process.stdout, `[Zeroちゃん] ${HERDR_MONITOR_READY_TEXT}\n`)
 
   const states = new Map<typeof FEED_KINDS[number], {
     generation: number
@@ -203,10 +206,8 @@ export function completeUtf8PrefixLength(bytes: Uint8Array): number {
 }
 
 if (import.meta.main) {
-  main().catch(error => {
-    process.stderr.write(`[Zeroちゃん] 監視表示を継続できません: ${
-      error instanceof Error ? error.message : String(error)
-    }\n`)
+  main().catch(() => {
+    process.stderr.write('[Zeroちゃん] 監視表示を継続できません\n')
     process.exitCode = 1
   })
 }

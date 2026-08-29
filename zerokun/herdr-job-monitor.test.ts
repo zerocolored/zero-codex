@@ -20,6 +20,8 @@ import {
   appendHerdrJobMonitorStatus,
   buildHerdrMonitorControlEnvironment,
   closeHerdrJobMonitor,
+  HERDR_MONITOR_DRAIN_TEXT,
+  HERDR_MONITOR_READY_TEXT,
   openHerdrJobMonitor,
   readBoundedHerdrOutput,
   reconcileHerdrJobMonitors,
@@ -115,10 +117,7 @@ async function sealAndObserveFinalMarker(
   control: FakeControl,
 ): Promise<string> {
   const directory = join(state, 'job-monitors', jobId)
-  const manifest = JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')) as {
-    operationId: string
-  }
-  const marker = `ZEROCHAN_MONITOR_DRAINED:${manifest.operationId}`
+  const marker = HERDR_MONITOR_DRAIN_TEXT
   appendHerdrJobMonitorStatus(state, jobId, marker)
   const epochPath = join(directory, 'status.epoch.json')
   const epoch = JSON.parse(readFileSync(epochPath, 'utf8')) as Record<string, unknown>
@@ -235,7 +234,7 @@ class FakeControl implements HerdrJobMonitorControl {
       jobId: string
       operationId: string
     }
-    this.marker = `ZEROCHAN_MONITOR_READY:${manifest.operationId}`
+    this.marker = HERDR_MONITOR_READY_TEXT
     if (!this.suppressReady) {
       writeFileSync(join(pane.cwd, 'ready.json'), `${JSON.stringify({
         version: 1,
@@ -298,7 +297,7 @@ class FakeControl implements HerdrJobMonitorControl {
       this.waitFailures -= 1
       throw new Error('wait output unavailable')
     }
-    if (marker.startsWith('ZEROCHAN_MONITOR_DRAINED:')) {
+    if (marker === HERDR_MONITOR_DRAIN_TEXT) {
       if (this.suppressDrainMarker) return false
       if (this.autoDrain && this.generationStatus === 'alive') this.drainCurrentViewer()
       const pane = this.panes.find(value => value.paneId === _paneId)
@@ -623,7 +622,7 @@ describe('Herdr job monitor', () => {
     expect(control.runCalls).toBe(1)
     expect(control.command).toContain('exec /usr/bin/env -i PATH=/usr/bin:/bin TERM=dumb')
     expect(control.command).not.toContain(record.task)
-    expect(control.tabs[0]?.label).toMatch(/^Zeroちゃん #7 \[[0-9a-f]{8}\]$/)
+    expect(control.tabs[0]?.label).toBe('Zeroちゃん #7')
     expect(control.tabs[0]?.tabId).not.toBe(runtime().tabId)
 
     appendHerdrJobMonitorChunk(
@@ -633,8 +632,35 @@ describe('Herdr job monitor', () => {
       Buffer.from('visible\u001b[31mred\u001b[0m\n'),
     )
     appendHerdrJobMonitorStatus(state, record.id, '処理中')
+    appendHerdrJobMonitorStatus(
+      state,
+      record.id,
+      '確認先 /Users/example/project Authorization: Bearer abcdefghijklmnop',
+    )
     expect(readFileSync(join(state, 'job-monitors', record.id, 'stdout.0.feed'), 'utf8'))
       .toContain('visible')
+    const status = readFileSync(
+      join(state, 'job-monitors', record.id, 'status.0.feed'),
+      'utf8',
+    )
+    expect(status).toContain('依頼内容を受け取りました')
+    expect(status).not.toContain(record.task)
+    expect(status).toContain('処理中')
+    expect(status).toContain('詳細を安全のため省略しました')
+    expect(status).not.toContain('/Users/example/project')
+    expect(status).not.toContain('abcdefghijklmnop')
+    appendHerdrJobMonitorStatus(
+      state,
+      record.id,
+      '失敗として確定します: {"jsonrpc":"2.0","turnId":"internal"}',
+    )
+    const statusAfterJson = readFileSync(
+      join(state, 'job-monitors', record.id, 'status.0.feed'),
+      'utf8',
+    )
+    expect(statusAfterJson).toContain('詳細を安全のため省略しました')
+    expect(statusAfterJson).not.toContain('jsonrpc')
+    expect(statusAfterJson).not.toContain('turnId')
 
     await closeHerdrJobMonitor({
       stateDir: state,
@@ -1145,10 +1171,7 @@ describe('Herdr job monitor', () => {
     const record = job()
     await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
     const directory = join(state, 'job-monitors', record.id)
-    const manifest = JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')) as {
-      operationId: string
-    }
-    const marker = `ZEROCHAN_MONITOR_DRAINED:${manifest.operationId}`
+    const marker = HERDR_MONITOR_DRAIN_TEXT
     appendHerdrJobMonitorStatus(state, record.id, marker)
     const epochPath = join(directory, 'status.epoch.json')
     const epoch = JSON.parse(readFileSync(epochPath, 'utf8')) as Record<string, unknown>
@@ -1185,7 +1208,7 @@ describe('Herdr job monitor', () => {
     const record = job()
     await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
     const directory = join(state, 'job-monitors', record.id)
-    const filler = 'x'.repeat(1_900)
+    const filler = 'あ '.repeat(900)
     for (let index = 0; index < 40; index += 1) {
       appendHerdrJobMonitorStatus(state, record.id, `${index}:${filler}`)
     }
@@ -1711,7 +1734,9 @@ describe('Herdr job monitor', () => {
       await child.exited
       await output
     }
-    expect(stdout).toContain(`ZEROCHAN_MONITOR_READY:${operationId}`)
+    expect(stdout).toContain(`[Zeroちゃん] ${HERDR_MONITOR_READY_TEXT}`)
+    expect(stdout).not.toContain(operationId)
+    expect(stdout).not.toContain('ZEROCHAN_MONITOR_')
     expect(stdout).toContain('あ')
     expect(stdout).toContain('visible-red')
     expect(stdout).not.toContain('\u001b[31m')

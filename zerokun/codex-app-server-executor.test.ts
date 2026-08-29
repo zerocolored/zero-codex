@@ -254,7 +254,7 @@ for line in sys.stdin:
                 emit(late_error)
         elif mode in ("defer", "terminal-race") and turn_id == "turn-app-server-2":
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "次ターンで追加入力を反映しました"}], "error": None}}})
-        elif mode == "failed-steer":
+        elif mode in ("failed-steer", "failed-turn"):
             if turn_id == "turn-app-server-1":
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [], "error": {"message": "fixture failure"}}}})
             else:
@@ -440,7 +440,7 @@ function fixture(
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
-    | 'failed-steer'
+    | 'failed-steer' | 'failed-turn'
     | 'error-steer' | 'rate-error' | 'rate-retrying' | 'phased' | 'phased-steer'
     | 'phased-late-inbound' | 'summary-stream-no-history' | 'logical-stop-required'
     | 'late-error-after-complete' | 'late-error-coalesced'
@@ -667,6 +667,7 @@ describe('production App Server executor', () => {
   test('accepted terminal後は論理終了signalでApp Serverを閉じる', async () => {
     const value = fixture('logical-stop-required')
     const marker = join(value.root, 'logical-stop.marker')
+    const monitorMessages: string[] = []
     const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
@@ -676,9 +677,11 @@ describe('production App Server executor', () => {
         ZERO_FIXTURE_MODE: 'logical-stop-required',
         ZERO_LOGICAL_STOP_MARKER: marker,
       },
+      onMonitorMessage: message => { monitorMessages.push(message) },
       liveControls: value.hooks,
     })
     expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
+    expect(monitorMessages).toEqual(['● 作業を開始しました'])
     expect(readFileSync(marker, 'utf8')).toBe('term')
     value.store.close()
   }, 15_000)
@@ -693,6 +696,27 @@ describe('production App Server executor', () => {
       extraEnvironment: { ZERO_FIXTURE_MODE: 'late-error-after-complete' },
       liveControls: value.hooks,
     })).rejects.toThrow('after the accepted terminal')
+    value.store.close()
+  }, 15_000)
+
+  test('failed turnの安全な監視表示を例外経路でもflushする', async () => {
+    const value = fixture('failed-turn')
+    const monitorMessages: string[] = []
+    await expect(executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'failed-turn' },
+      onMonitorMessage: message => { monitorMessages.push(message) },
+      liveControls: value.hooks,
+    })).rejects.toThrow('fixture failure')
+    expect(monitorMessages).toEqual([
+      '● 作業を開始しました',
+      '⚠ この段階の処理で問題が発生しました',
+    ])
+    expect(monitorMessages.join('\n')).not.toContain('fixture failure')
+    expect(monitorMessages.join('\n')).not.toContain('jsonrpc')
     value.store.close()
   }, 15_000)
 
