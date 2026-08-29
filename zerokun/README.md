@@ -216,7 +216,8 @@ round固有marker、host計算digest、各advisorのlisted childなしがすべ�
 
 Zeroちゃん本体のrepositoryはhost runtimeの信頼境界なので、そこへのwrite jobは許可者であっても
 拒否します。bootstrapは本体と別の`zerokun-workspace`を、最小安全指示の`AGENTS.md`初期commit付き
-既定projectとして初期化します。既存projectではproject固有の`AGENTS.md`を必須にします。
+既定projectとして初期化します。既存projectのproject固有`AGENTS.md`は任意で、存在する場合だけ
+global `AGENTS.md`の後に読み込みとinstruction sourceを検証します。
 
 両profileともHOME、state全体、共用tempを先にdenyし、必要なpathだけをより具体的なruleで
 再許可します。Codex CLI 0.149.0以上を必須とし、古いCLIはjob受付前に拒否します。
