@@ -309,7 +309,7 @@ token、access、queue、lock が別物になります。
 cd /absolute/path/to/project
 zerochan set slack-channel C0123456789
 zerochan
-zerochan --restart  # 前回Slackへ接続できたprojectで再起動
+zerochan --restart  # 前回接続したprojectのgatewayを確認promptなしで安全に再起動
 zerochan status
 zerochan unset slack-channel
 zerokun             # 互換alias。現在directoryで起動

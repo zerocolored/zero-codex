@@ -261,6 +261,12 @@ if [ -n "$existing_bridge_pid" ]; then
   do_replace=0
   if [ "$AUTHORIZED_UPDATE_RESTART" = "1" ]; then
     do_replace=1
+  elif [ "$LAUNCH_MODE" = "restart" ] && [ "$INVOKED_AS" = "zerochan" ]; then
+    # --restart is an explicit, invocation-local replacement request. Unlike
+    # ZEROKUN_REPLACE it cannot leak into a child through the environment, so
+    # it does not need the updater's one-time token.
+    do_replace=1
+    echo "   --restart 指定のため、既存gatewayを安全に入れ替えます。" >&2
   elif [ "${ZEROKUN_REPLACE:-0}" = "1" ] && [ -s "$REPLACE_TOKEN_FILE" ] \
      && [ -n "$REPLACE_TOKEN_VALUE" ] \
      && [ "$REPLACE_TOKEN_VALUE" = "$(cat "$REPLACE_TOKEN_FILE" 2>/dev/null)" ]; then
@@ -282,19 +288,30 @@ if [ -n "$existing_bridge_pid" ]; then
     echo "   (dry-run: 実際には停止・起動しません)" >&2
     exit 0
   fi
-  if kill -0 "$existing_bridge_pid" 2>/dev/null; then
-    lock_process_is "$LOCK_FILE" "$existing_bridge_pid" 'server\.ts' || {
-      echo "❌ gateway identityが確認待ちの間に変化したためsignalしません。" >&2
+  lock_process_is "$LOCK_FILE" "$existing_bridge_pid" 'server\.ts' || {
+    echo "❌ gateway identityが確認待ちの間に変化したためsignalしません。" >&2
+    exit 1
+  }
+  # Signal and wait against the exact lock-bound process generation. A
+  # non-responsive gateway is force-stopped only after the bounded graceful
+  # window, and a replacement is never started while any live gateway still
+  # owns the singleton lock.
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+    stop-owner-force "$LOCK_FILE" "$existing_bridge_pid" \
+    'server\.ts(?:\s|$)' 5000 >/dev/null 2>&1 || {
+      echo "❌ 既存gatewayを同一generationのまま停止できません。新しいgatewayは起動しません。" >&2
       exit 1
     }
-    kill "$existing_bridge_pid" \
-      || { kill -0 "$existing_bridge_pid" 2>/dev/null \
-        && { echo "❌ 既存gatewayへsignalできません。" >&2; exit 1; }; }
+  replacement_bridge_pid="$(tr -d '[:space:]' < "$LOCK_FILE" 2>/dev/null || true)"
+  if [ "$replacement_bridge_pid" != "$existing_bridge_pid" ] \
+     && process_command_is "$replacement_bridge_pid" 'server\.ts'; then
+    echo "❌ 別のgatewayが先に起動したため、重複起動しません。" >&2
+    exit 1
   fi
-  for _ in {1..50}; do
-    kill -0 "$existing_bridge_pid" 2>/dev/null || break
-    sleep 0.1
-  done
+  if process_command_is "$existing_bridge_pid" 'server\.ts'; then
+    echo "❌ 既存gatewayの停止を確認できません。新しいgatewayは起動しません。" >&2
+    exit 1
+  fi
 fi
 
 if [ "${ZEROKUN_DRY_RUN:-0}" = "1" ]; then

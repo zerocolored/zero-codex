@@ -36,9 +36,14 @@ function fixture(): string {
   return state
 }
 
-function startGateway(state: string): Bun.Subprocess {
+function startGateway(
+  state: string,
+  options: { ignoreTerm?: boolean } = {},
+): Bun.Subprocess {
   const server = join(state, 'server.ts')
-  writeFileSync(server, '#!/bin/bash\nsleep 30\n')
+  writeFileSync(server, options.ignoreTerm
+    ? "#!/bin/bash\ntrap '' TERM\nwhile :; do read -r -t 1 _ || :; done\n"
+    : '#!/bin/bash\nsleep 30\n')
   chmodSync(server, 0o700)
   const process = Bun.spawn(['/bin/bash', server], {
     stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
@@ -196,6 +201,9 @@ async function runLauncher(
       '    [ "${FAKE_DELAY_SECOND_IDENTITY:-0}" != "1" ] || [ "$count" != "2" ] || sleep 1',
       '  fi',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
+      'fi',
+      'if [[ "$*" == *process-lock.ts*stop-owner* ]] && [ "${FAKE_PROCESS_LOCK_STOP_FAIL:-0}" = "1" ]; then',
+      '  exit 3',
       'fi',
       'if [[ "$*" == *project-selection.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
@@ -401,6 +409,72 @@ describe('codex-channel.sh replacement guard', () => {
     }, undefined, { invokedAs: 'zerochan', cwd: state, args: ['--restart'] })
     expect(result.exitCode, result.output).toBe(0)
     expect(result.output).toContain(`対象project: ${project}`)
+  })
+
+  test('zerochan --restartは非TTYでも既存gatewayを置換し互換runnerを維持する', async () => {
+    const state = fixture()
+    const project = realpathSync(join(dirname(state), 'project'))
+    const gateway = startGateway(state)
+    const runner = startRunner(state)
+    writeFileSync(join(state, 'last-connected-project.json'), JSON.stringify({
+      version: 1, projectDir: project, connectedAt: 1234,
+    }), { mode: 0o600 })
+    await Bun.sleep(100)
+
+    const result = await runLauncher(state, {}, undefined, {
+      invokedAs: 'zerochan', cwd: state, args: ['--restart'],
+    })
+
+    expect(result.exitCode, result.output).toBe(0)
+    expect(result.output).toContain('--restart 指定のため、既存gatewayを安全に入れ替えます')
+    expect(result.output).toContain(`job-runner: running (PID ${runner.pid}, FIFO=1)`)
+    expect(result.output).not.toContain('起動を中止しました')
+    expect(() => process.kill(gateway.pid, 0)).toThrow()
+    expect(() => process.kill(runner.pid, 0)).not.toThrow()
+  })
+
+  test('zerochan --restartはSIGTERMを無視するgatewayもexact generationで回収する', async () => {
+    const state = fixture()
+    const project = realpathSync(join(dirname(state), 'project'))
+    const gateway = startGateway(state, { ignoreTerm: true })
+    writeFileSync(join(state, 'last-connected-project.json'), JSON.stringify({
+      version: 1, projectDir: project, connectedAt: 1234,
+    }), { mode: 0o600 })
+    await Bun.sleep(100)
+    try {
+      const result = await runLauncher(state, {
+        ZEROKUN_RUNNER_STARTUP_ATTEMPTS: '80',
+      }, undefined, {
+        invokedAs: 'zerochan', cwd: state, args: ['--restart'],
+      })
+      expect(result.exitCode, result.output).toBe(0)
+      expect(result.output).not.toContain('起動を中止しました')
+      expect(() => process.kill(gateway.pid, 0)).toThrow()
+    } finally {
+      await stopFixturePid(join(state, 'fake-starter-pid'))
+      await stopFixturePid(join(state, 'fake-runner-pid'))
+    }
+  }, 15_000)
+
+  test('zerochan --restartはexact generation停止helper失敗時に新gatewayを起動しない', async () => {
+    const state = fixture()
+    const project = realpathSync(join(dirname(state), 'project'))
+    const gateway = startGateway(state)
+    writeFileSync(join(state, 'last-connected-project.json'), JSON.stringify({
+      version: 1, projectDir: project, connectedAt: 1234,
+    }), { mode: 0o600 })
+    await Bun.sleep(100)
+
+    const result = await runLauncher(state, {
+      FAKE_PROCESS_LOCK_STOP_FAIL: '1',
+    }, undefined, {
+      invokedAs: 'zerochan', cwd: state, args: ['--restart'],
+    })
+
+    expect(result.exitCode).toBe(1)
+    expect(result.output).toContain('同一generationのまま停止できません')
+    expect(result.output).not.toContain('▶ Zeroちゃん')
+    expect(() => process.kill(gateway.pid, 0)).not.toThrow()
   })
 
   test('legacy zerokunはlast recordがない初回も現在のGit directoryで起動できる', async () => {

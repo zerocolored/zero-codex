@@ -533,7 +533,7 @@ EOF
     printf 'export ZEROKUN_LEGACY_CUTOVER=%q\n' "$LEGACY_CUTOVER"
     cat <<'EOF'
 alias zerokun='zerochan'
-# 稼働中を止めて入れ替えるかは端末の y/N プロンプトで都度確認する。
+# --restart は明示指定そのものを確認として、既存gatewayを非対話で安全に入れ替える。
 # ZEROKUN_REPLACE=1 は自己更新のワンタイムトークン無しでは停止権限にならない。
 alias zerokun-restart='zerochan --restart'
 alias zerokun-status='pid=$(cat "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/plugin.lock" 2>/dev/null); [ -n "$pid" ] && ps -p "$pid" -o pid=,command= || echo "Zeroちゃんは停止中"'

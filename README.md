@@ -260,7 +260,8 @@ symlink、Gitではない直下項目は作業対象に含めません。
 `zerochan` はHerdr外からの起動を拒否します。引数やexportは不要です。最初の起動だけが共有gatewayと
 runnerを開始し、別projectからの2つ目以降の起動はそのprojectのlocal設定を共有gatewayへ同期して
 終了します。実行した物理directoryは新しいDM threadのprojectとして使います。互換alias `zerokun` も現在directoryを使い、
-`zerochan --restart`（互換alias `zerokun-restart`）は前回Slackへ接続できたprojectを使います。
+`zerochan --restart`（互換alias `zerokun-restart`）は前回Slackへ接続できたprojectを使い、
+確認promptなしで既存gatewayを安全に入れ替えます。互換runnerは長時間taskを守るため継続利用します。
 Herdrの専用paneで、永続 job runner を独立process groupへ
 起動してから Slack gateway を前景で起動します。gateway は
 `Ctrl-C` で停止しますが、runner はそのsignalを受けず未処理 queue のため常駐します。macOS の watchdog が
