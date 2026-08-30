@@ -14,6 +14,13 @@ import {
   inspectProcessLock,
   processLockOwnerMatches,
 } from './process-lock.ts'
+import {
+  observeProcessGeneration,
+  processIdentityIsStopped,
+  readProcessIdentity,
+  signalProcessIfLive,
+  type ProcessIdentity,
+} from './process-generation.ts'
 import { readGatewayReadiness } from './readiness.ts'
 import { requireManagedStateRoot } from './managed-path.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
@@ -227,7 +234,13 @@ async function pauseAndStopCurrentRunner(
     }
     runner = inspectManagedProcess(runner.lockFile, runner.label, runner.pattern)
     if (runner.pid && !serviceControlPauseAcknowledged(stateDir, request)) {
-      fail('job runnerが停止barrierを確認できなかったため、serviceは停止していません')
+      // A runner that was already alive when this release was installed does
+      // not have the service-control acknowledgement hook. Freeze that exact
+      // process generation first, then inspect SQLite while it cannot claim a
+      // job. SIGTERM is queued while stopped and SIGCONT only releases it to
+      // handle that pending termination, so there is no claim window between
+      // the final zero-running observation and shutdown.
+      return await stopRunnerAtFrozenBoundary(stateDir, runner, sleep)
     }
     const counts = activeCounts(stateDir)
     if (counts.running > 0) {
@@ -244,6 +257,79 @@ async function pauseAndStopCurrentRunner(
     return runner.pid
   } finally {
     clearServiceControlPauseRequest(stateDir, request)
+  }
+}
+
+async function waitForProcessState(
+  identity: ProcessIdentity,
+  expected: 'stopped' | 'dead',
+  sleep: (milliseconds: number) => Promise<void>,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() <= deadline) {
+    const observed = observeProcessGeneration(identity)
+    if (expected === 'dead' && observed.status === 'dead') return true
+    if (expected === 'stopped' && observed.status === 'alive'
+      && processIdentityIsStopped(observed.identity)) return true
+    if (observed.status === 'unknown'
+      || (expected === 'stopped' && observed.status === 'dead')) return false
+    await sleep(25)
+  }
+  return false
+}
+
+async function stopRunnerAtFrozenBoundary(
+  stateDir: string,
+  runner: ManagedProcess,
+  sleep: (milliseconds: number) => Promise<void>,
+): Promise<number> {
+  if (!runner.pid || !processLockOwnerMatches(runner.lockFile, runner.pid, runner.pattern)) {
+    fail('job runnerの停止generationを固定できません')
+  }
+  const identity = readProcessIdentity(runner.pid)
+  if (!identity || !processLockOwnerMatches(runner.lockFile, runner.pid, runner.pattern)) {
+    fail('job runnerの停止generation identityを確認できません')
+  }
+
+  let suspended = false
+  let terminationQueued = false
+  try {
+    if (!signalProcessIfLive(identity, 'SIGSTOP')) {
+      fail('job runnerを安全な停止境界で一時停止できません')
+    }
+    suspended = true
+    if (!await waitForProcessState(identity, 'stopped', sleep, 2_000)
+      || !processLockOwnerMatches(runner.lockFile, runner.pid, runner.pattern)) {
+      fail('job runnerの一時停止generationを再確認できません')
+    }
+    const counts = activeCounts(stateDir)
+    if (counts.running > 0) {
+      fail(`実行中のタスクが${counts.running}件あるため停止しませんでした。完了後に zerochan stop を再実行してください`)
+    }
+
+    // Queue termination before releasing SIGSTOP. The runner therefore never
+    // returns to its claim loop after the authoritative SQLite observation.
+    if (!signalProcessIfLive(identity, 'SIGTERM')) {
+      fail('一時停止したjob runnerへ終了signalを送れません')
+    }
+    terminationQueued = true
+    if (!signalProcessIfLive(identity, 'SIGCONT')) {
+      fail('一時停止したjob runnerを終了処理へ移せません')
+    }
+    suspended = false
+    if (!await waitForProcessState(identity, 'dead', sleep, 5_000)) {
+      if (!signalProcessIfLive(identity, 'SIGKILL')
+        || !await waitForProcessState(identity, 'dead', sleep, 2_000)) {
+        fail('一時停止したjob runnerの終了を確認できません')
+      }
+    }
+    return runner.pid
+  } finally {
+    // Before SIGTERM is queued, every failure must restore the exact runner so
+    // a refused stop cannot leave the service silently frozen. Once queued,
+    // resuming is part of completing the requested stop rather than rollback.
+    if (suspended && !terminationQueued) signalProcessIfLive(identity, 'SIGCONT')
   }
 }
 

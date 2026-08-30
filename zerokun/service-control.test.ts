@@ -232,17 +232,23 @@ describe('zerochan stop/start', () => {
     expect(intentionalServiceStopIsSet(state)).toBe(false)
   })
 
-  test('stopはrunnerが停止barrierをackしなければgatewayを停止しない', async () => {
+  test('stopは更新前runnerがack非対応でも凍結境界で安全に停止する', async () => {
     const { base, state } = fixture()
-    createJobDatabase(state)
+    createJobDatabase(state, [{ status: 'queued' }])
     const services = await spawnManagedServices(state, base, { acknowledgePause: false })
-    await expect(stopManagedService(dirname(import.meta.dir), state, {
+    const result = await stopManagedService(dirname(import.meta.dir), state, {
       ...testHooks,
       pauseTimeoutMs: 100,
-    })).rejects.toThrow('停止barrier')
-    expect(services.gateway.exitCode).toBeNull()
-    expect(services.runner.exitCode).toBeNull()
-    expect(intentionalServiceStopIsSet(state)).toBe(false)
+    })
+    expect(result.status).toBe('stopped')
+    expect(await services.gateway.exited).toBe(0)
+    expect(await services.runner.exited).toBe(0)
+    const database = new Database(join(state, 'jobs.sqlite3'), { readonly: true })
+    expect(database.query<{ count: number }, []>(
+      "SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'",
+    ).get()?.count).toBe(1)
+    database.close()
+    expect(intentionalServiceStopIsSet(state)).toBe(true)
   })
 
   test('startは回収不能な旧runtime tabを上書きせず新規起動しない', async () => {
