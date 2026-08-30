@@ -2025,6 +2025,7 @@ async function validateZero(
     '--allow-unix-socket', candidateSocketRoot,
     '--',
     '/usr/bin/env',
+    `TMPDIR=${candidateSocketRoot}`,
     'ZERO_CODEX_CANDIDATE_SANDBOX=1',
     `ZERO_CODEX_CANDIDATE_GIT=${stagedCodex.gitExecutable}`,
     '/bin/bash', verifyScript, '--candidate-sandbox',

@@ -686,6 +686,7 @@ describe('updater helpers', () => {
     expect(candidate).toContain('const stagedCodexBin = stagedCodex.executable')
     expect(candidate).toContain('permissionOverrides = await requireEffectiveCodexPermissionPreflight(\n      stagedCodexBin,')
     expect(candidate).toContain('await requireCommandAsync([\n    stagedCodexBin,')
+    expect(candidate).toContain('`TMPDIR=${candidateSocketRoot}`')
   })
 
   test('candidate sandboxのwhitespace checkはselected Gitをpagerなしで固定する', () => {
