@@ -26,6 +26,7 @@ import {
   classifyFallbackProcessState,
   CodexResultPersistencePendingError,
   configuredMaxJobsPerSession,
+  createExecutorPidLifecycle,
   DEFAULT_MAX_JOBS_PER_SESSION,
   JobStore,
   liveControlAcceptsInput,
@@ -67,6 +68,7 @@ import {
   CODEX_WORKER_SAFETY_PROMPT,
   CodexCleanupPendingError,
   CodexInterruptedError,
+  CodexRepositoryChangedBeforeImplementationError,
   CodexUserCancelledError,
   codexAttemptDisposition,
   codexRateLimitResumeAt,
@@ -83,6 +85,7 @@ import {
   codexThreadIdFromEvent,
   executeCodexJob,
   extractCodexRateLimit,
+  assertRequiredAdvisorPreparationRounds,
   assertRequiredAdvisorRounds,
   parseCodexResult,
   parseCodexReviewDecision,
@@ -176,6 +179,36 @@ function input(overrides: Partial<EnqueueInput> = {}): EnqueueInput {
 
 function makeStore(): JobStore {
   return new JobStore(join(fixtureDir(), 'jobs.sqlite3'))
+}
+
+function recordCompletedInitialPreparePhase(
+  store: JobStore,
+  job: JobRecord,
+  messageId: string,
+): JobRecord {
+  store.saveSession(job.id, `session-${messageId}`)
+  const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+  store.beginInitialTurnDispatch({
+    jobId: job.id, attempt: job.attempts, epoch: job.controlEpoch,
+    executorNonce: `nonce-${messageId}`, threadId: `thread-${messageId}`, requestId: 1,
+    inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+  })
+  store.acknowledgeInitialTurnDispatch({
+    jobId: job.id, workerId: job.workerId!, attempt: job.attempts,
+    epoch: job.controlEpoch, executorNonce: `nonce-${messageId}`,
+    threadId: `thread-${messageId}`, turnId: `initial-${messageId}`, requestId: 1,
+  })
+  store.finishAppServerTurn({
+    jobId: job.id, epoch: job.controlEpoch, executorNonce: `nonce-${messageId}`,
+    threadId: `thread-${messageId}`, turnId: `initial-${messageId}`, retainInput: true,
+  })
+  return store.get(job.id)!
+}
+
+function completedPreparePhase(store: JobStore, messageId: string): JobRecord {
+  store.enqueue(input({ messageId, writeEnabled: true }))
+  const job = store.claimNext('repository-drift-worker')!
+  return recordCompletedInitialPreparePhase(store, job, messageId)
 }
 
 function git(args: string[], cwd?: string): string {
@@ -345,6 +378,370 @@ describe('Codex job store', () => {
     expect(configuredMaxJobsPerSession('20')).toBe(20)
     expect(configuredMaxJobsPerSession('21')).toBe(20)
     expect(configuredMaxJobsPerSession('invalid')).toBe(20)
+  })
+
+  test('受付表示は実際に先行するjobだけを待ち順へ数える', () => {
+    const idle = makeStore()
+    const first = idle.enqueue(input({ messageId: 'accepted-idle', notifyAccepted: true }))
+    expect(first.queuePosition).toBe(1)
+    expect(idle.pendingStatusNotifications().map(value => value.payload))
+      .toEqual(['🙌 受け付けました。'])
+    const duplicate = idle.enqueue(input({ messageId: 'accepted-idle', notifyAccepted: true }))
+    expect(duplicate.duplicate).toBe(true)
+    expect(idle.pendingStatusNotifications()).toHaveLength(1)
+    idle.close()
+
+    const behindRunning = makeStore()
+    behindRunning.enqueue(input({ messageId: 'accepted-running-root' }))
+    behindRunning.claimNext('accepted-running-worker')
+    behindRunning.enqueue(input({
+      messageId: 'accepted-running-next', notifyAccepted: true,
+      threadTs: '1800000000.000101',
+    }))
+    expect(behindRunning.pendingStatusNotifications().map(value => value.payload))
+      .toEqual(['🙌 受け付けました（待ち順 1）。'])
+    behindRunning.close()
+
+    const behindQueued = makeStore()
+    behindQueued.enqueue(input({ messageId: 'accepted-queued-root' }))
+    behindQueued.enqueue(input({
+      messageId: 'accepted-queued-next', notifyAccepted: true,
+      threadTs: '1800000000.000102',
+    }))
+    expect(behindQueued.pendingStatusNotifications().map(value => value.payload))
+      .toEqual(['🙌 受け付けました（待ち順 2）。'])
+    behindQueued.close()
+
+    const afterFailure = makeStore()
+    afterFailure.enqueue(input({ messageId: 'accepted-failed-root' }))
+    const failed = afterFailure.claimNext('accepted-failed-worker')!
+    afterFailure.fail(failed.id, 'fixture failure')
+    afterFailure.enqueue(input({
+      messageId: 'accepted-after-failure', notifyAccepted: true,
+      threadTs: '1800000000.000103',
+    }))
+    expect(afterFailure.pendingStatusNotifications().map(value => value.payload))
+      .toEqual(['🙌 受け付けました。'])
+    afterFailure.close()
+  })
+
+  test('承認待ちとinbound待ちの非実行jobは受付の待ち順へ数えない', () => {
+    const parkedStore = makeStore()
+    const parked = completedPreparePhase(parkedStore, 'accepted-parked-root')
+    const parkedSnapshot = readAdvisorInputSnapshot(dirname(parkedStore.dbPath), parked.id)
+    parkedStore.parkForUiApproval({
+      jobId: parked.id,
+      sessionId: parked.sessionId!,
+      inputRevision: parkedSnapshot.revision,
+      inputDigest: parkedSnapshot.digest,
+      repositoryDigest: 'a'.repeat(64),
+      proposalText: 'fixture proposal',
+      beforePath: '/private/sealed/Before.png',
+      afterPath: '/private/sealed/After.png',
+    })
+    parkedStore.enqueue(input({
+      threadTs: '1800000000.000200', messageId: 'accepted-after-parked',
+      notifyAccepted: true,
+    }))
+    expect(parkedStore.pendingStatusNotifications().map(value => value.payload))
+      .toEqual(['🙌 受け付けました。'])
+    parkedStore.close()
+
+    const inboundStore = makeStore()
+    const blocked = inboundStore.enqueue(input({ messageId: 'accepted-inbound-root' })).job
+    inboundStore.stageInboundDelivery({
+      chatId: blocked.chatId, threadTs: blocked.threadTs,
+      messageId: 'accepted-inbound-delivery', userId: 'UOTHER',
+      repoPath: blocked.repoPath, text: '追加入力', writeEnabled: false,
+    })
+    inboundStore.enqueue(input({
+      threadTs: '1800000000.000201', messageId: 'accepted-after-inbound',
+      notifyAccepted: true,
+    }))
+    expect(inboundStore.pendingStatusNotifications().map(value => value.payload))
+      .toEqual(['🙌 受け付けました。'])
+    inboundStore.close()
+  })
+
+  test('実装前repository driftだけをdurable上限付きでfresh attemptへ戻す', () => {
+    const directory = fixtureDir('zero-repository-drift-')
+    const dbPath = join(directory, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const prepared = completedPreparePhase(store, 'repository-drift-safe')
+    expect(store.preparePreImplementationRepositoryDriftRetry(
+      prepared.id,
+      'repository changed before implementation; fresh preparation is required',
+      1,
+    )).toBe('prepared')
+    expect(store.requeueAfterPreImplementationRepositoryDrift(
+      prepared.id,
+      1,
+    )).toBe('requeued')
+    expect(store.get(prepared.id)).toMatchObject({
+      status: 'queued', repositoryDriftRetries: 1, attempts: 1,
+      activeThreadId: null, activeTurnId: null,
+    })
+    store.close()
+
+    store = new JobStore(dbPath)
+    const retried = store.claimNext('repository-drift-restart-worker')!
+    expect(retried).toMatchObject({
+      id: prepared.id, attempts: 2, repositoryDriftRetries: 1,
+      resumed: true, sessionId: prepared.sessionId,
+    })
+    recordCompletedInitialPreparePhase(store, retried, 'repository-drift-retry')
+    expect(store.preparePreImplementationRepositoryDriftRetry(
+      retried.id,
+      'repository changed before implementation; fresh preparation is required',
+      1,
+    )).toBe('exhausted')
+    store.close()
+  })
+
+  test('未送達のimplementation prepared receiptはrepository drift再試行を妨げない', () => {
+    const store = makeStore()
+    const prepared = completedPreparePhase(store, 'repository-drift-prepared-implementation')
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), prepared.id)
+    store.prepareAppServerPhaseDispatch({
+      jobId: prepared.id, attempt: prepared.attempts, epoch: prepared.controlEpoch,
+      phaseSequence: 1, stage: 'implementation', logicalNonce: prepared.executorNonce!,
+      threadId: prepared.activeThreadId!, inputRevision: snapshot.revision,
+      inputDigest: snapshot.digest,
+    })
+    expect(store.preparePreImplementationRepositoryDriftRetry(
+      prepared.id,
+      'repository changed before implementation; fresh preparation is required',
+    )).toBe('prepared')
+    expect(store.requeueAfterPreImplementationRepositoryDrift(prepared.id)).toBe('requeued')
+    store.close()
+  })
+
+  test('implementation送達開始後はrepository driftを自動再送しない', () => {
+    const store = makeStore()
+    const prepared = completedPreparePhase(store, 'repository-drift-unsafe')
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), prepared.id)
+    store.prepareAppServerPhaseDispatch({
+      jobId: prepared.id, attempt: prepared.attempts, epoch: prepared.controlEpoch,
+      phaseSequence: 1, stage: 'implementation', logicalNonce: prepared.executorNonce!,
+      threadId: prepared.activeThreadId!, inputRevision: snapshot.revision,
+      inputDigest: snapshot.digest,
+    })
+    store.beginAppServerPhaseDispatch({
+      jobId: prepared.id, attempt: prepared.attempts, epoch: prepared.controlEpoch,
+      phaseSequence: 1, logicalNonce: prepared.executorNonce!,
+      threadId: prepared.activeThreadId!, requestId: 2,
+      inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+    })
+    expect(store.preparePreImplementationRepositoryDriftRetry(
+      prepared.id,
+      'repository changed before implementation; fresh preparation is required',
+    )).toBe('unsafe')
+    expect(store.get(prepared.id)?.status).toBe('running')
+    store.close()
+  })
+
+  test('以前のattemptにimplementation phaseがあればfresh retryを自動再送しない', () => {
+    const store = makeStore()
+    const prepared = completedPreparePhase(store, 'repository-drift-prior-implementation')
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), prepared.id)
+    store.prepareAppServerPhaseDispatch({
+      jobId: prepared.id, attempt: prepared.attempts, epoch: prepared.controlEpoch,
+      phaseSequence: 1, stage: 'implementation', logicalNonce: prepared.executorNonce!,
+      threadId: prepared.activeThreadId!, inputRevision: snapshot.revision,
+      inputDigest: snapshot.digest,
+    })
+    store.beginAppServerPhaseDispatch({
+      jobId: prepared.id, attempt: prepared.attempts, epoch: prepared.controlEpoch,
+      phaseSequence: 1, logicalNonce: prepared.executorNonce!,
+      threadId: prepared.activeThreadId!, requestId: 2,
+      inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+    })
+    store.requeueAt(prepared.id, Date.now() - 1, 'fixture retry')
+    const retried = store.claimNext('repository-drift-prior-worker')!
+    recordCompletedInitialPreparePhase(store, retried, 'repository-drift-prior-retry')
+
+    expect(store.preparePreImplementationRepositoryDriftRetry(
+      retried.id,
+      'repository changed before implementation; fresh preparation is required',
+    )).toBe('unsafe')
+    expect(store.get(retried.id)?.status).toBe('running')
+    store.close()
+  })
+
+  test('完了済みprepare後のrequeue直前crashは再起動時に安全にfresh retryへ戻す', () => {
+    const directory = fixtureDir('zero-repository-drift-crash-')
+    const dbPath = join(directory, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const prepared = completedPreparePhase(store, 'repository-drift-crash')
+    expect(store.preparePreImplementationRepositoryDriftRetry(
+      prepared.id,
+      'repository changed before implementation; fresh preparation is required',
+    )).toBe('prepared')
+    store.close()
+
+    store = new JobStore(dbPath)
+    expect(store.recoverInterrupted()).toEqual({
+      requeued: 1, failedWrites: 0, failedUncertain: 0,
+    })
+    expect(store.get(prepared.id)).toMatchObject({
+      status: 'queued', attempts: 1, repositoryDriftRetries: 1,
+    })
+    expect(store.claimNext('repository-drift-crash-restart')).toMatchObject({
+      id: prepared.id, attempts: 2, repositoryDriftRetries: 1,
+      resumed: true, sessionId: prepared.sessionId,
+    })
+    store.close()
+
+    const unsafeDirectory = fixtureDir('zero-repository-drift-generic-crash-')
+    const unsafeDbPath = join(unsafeDirectory, 'jobs.sqlite3')
+    store = new JobStore(unsafeDbPath)
+    const noIntent = completedPreparePhase(store, 'repository-drift-generic-crash')
+    store.close()
+    store = new JobStore(unsafeDbPath)
+    expect(store.recoverInterrupted()).toEqual({
+      requeued: 0, failedWrites: 1, failedUncertain: 0,
+    })
+    expect(store.get(noIntent.id)?.status).toBe('failed')
+    store.close()
+  })
+
+  test('cleanupまたはmonitorが不確実ならrepository driftをfail-closedにする', () => {
+    const executorStore = makeStore()
+    const withExecutor = completedPreparePhase(executorStore, 'repository-drift-executor')
+    executorStore.beginMonitorPreparation(withExecutor.id, withExecutor.workerId!)
+    executorStore.commitMonitorRequired(withExecutor.id, withExecutor.workerId!)
+    executorStore.saveExecutorPid(withExecutor.id, process.pid)
+    expect(executorStore.preparePreImplementationRepositoryDriftRetry(
+      withExecutor.id,
+      'repository changed before implementation; fresh preparation is required',
+    )).toBe('unsafe')
+    executorStore.close()
+
+    const monitorStore = makeStore()
+    const withMonitorFailure = completedPreparePhase(
+      monitorStore,
+      'repository-drift-monitor-failure',
+    )
+    monitorStore.beginMonitorPreparation(withMonitorFailure.id, withMonitorFailure.workerId!)
+    monitorStore.commitMonitorRequired(withMonitorFailure.id, withMonitorFailure.workerId!)
+    monitorStore.recordMonitorFailure(withMonitorFailure.id, 'fixture monitor failure')
+    expect(monitorStore.preparePreImplementationRepositoryDriftRetry(
+      withMonitorFailure.id,
+      'repository changed before implementation; fresh preparation is required',
+    )).toBe('unsafe')
+    monitorStore.close()
+  })
+
+  test('本番PID lifecycleはprocess終了をCAS反映してrepository drift再試行を開く', () => {
+    const store = makeStore()
+    const prepared = completedPreparePhase(store, 'repository-drift-process-exit')
+    store.beginMonitorPreparation(prepared.id, prepared.workerId!)
+    store.commitMonitorRequired(prepared.id, prepared.workerId!)
+    const lifecycle = createExecutorPidLifecycle(store, prepared.id)
+    lifecycle.onProcessId(process.pid)
+    expect(store.get(prepared.id)?.executorPid).toBe(process.pid)
+    lifecycle.onProcessExit(0)
+    expect(store.get(prepared.id)?.executorPid).toBeNull()
+
+    expect(store.preparePreImplementationRepositoryDriftRetry(
+      prepared.id,
+      'repository changed before implementation; fresh preparation is required',
+    )).toBe('prepared')
+    expect(store.requeueAfterPreImplementationRepositoryDrift(prepared.id)).toBe('requeued')
+    store.close()
+  })
+
+  test('runnerは実装前repository driftを終端失敗にせずfresh attemptで完了する', async () => {
+    const store = makeStore()
+    const root = store.enqueue(input({
+      messageId: 'repository-drift-runner', writeEnabled: true,
+    })).job
+    let executions = 0
+    const stats = await runQueuedJobs({
+      store,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async current => {
+        executions += 1
+        if (executions === 1) {
+          recordCompletedInitialPreparePhase(store, current, 'repository-drift-runner-session')
+          throw new CodexRepositoryChangedBeforeImplementationError()
+        }
+        expect(current).toMatchObject({
+          attempts: 2,
+          repositoryDriftRetries: 1,
+          resumed: true,
+          sessionId: 'session-repository-drift-runner-session',
+        })
+        return {
+          sessionId: 'session-repository-drift-runner-session',
+          result: '完了しました',
+        }
+      },
+    })
+
+    expect(stats).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
+    expect(executions).toBe(2)
+    expect(store.get(root.id)).toMatchObject({
+      status: 'completed', attempts: 2, repositoryDriftRetries: 1,
+      result: '完了しました', lastError: null,
+    })
+    expect(store.pendingTerminalNotifications()).toHaveLength(1)
+    expect(store.pendingTerminalNotifications()[0]?.kind).toBe('completed')
+    store.close()
+  })
+
+  test('implementation観測後のrepository driftは変更残存の可能性を通知する', async () => {
+    const store = makeStore()
+    const root = store.enqueue(input({
+      messageId: 'repository-drift-after-implementation', writeEnabled: true,
+    })).job
+    const stats = await runQueuedJobs({
+      store,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async current => {
+        const prepared = recordCompletedInitialPreparePhase(
+          store,
+          current,
+          'repository-drift-after-implementation',
+        )
+        const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), prepared.id)
+        store.prepareAppServerPhaseDispatch({
+          jobId: prepared.id, attempt: prepared.attempts, epoch: prepared.controlEpoch,
+          phaseSequence: 1, stage: 'implementation', logicalNonce: prepared.executorNonce!,
+          threadId: prepared.activeThreadId!, inputRevision: snapshot.revision,
+          inputDigest: snapshot.digest,
+        })
+        store.beginAppServerPhaseDispatch({
+          jobId: prepared.id, attempt: prepared.attempts, epoch: prepared.controlEpoch,
+          phaseSequence: 1, logicalNonce: prepared.executorNonce!,
+          threadId: prepared.activeThreadId!, requestId: 2,
+          inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+        })
+        store.acknowledgeAppServerPhaseDispatch({
+          jobId: prepared.id, workerId: prepared.workerId!, attempt: prepared.attempts,
+          epoch: prepared.controlEpoch, phaseSequence: 1,
+          logicalNonce: prepared.executorNonce!, threadId: prepared.activeThreadId!,
+          turnId: 'implementation-turn', requestId: 2,
+        })
+        store.finishAppServerTurn({
+          jobId: prepared.id, epoch: prepared.controlEpoch,
+          executorNonce: prepared.executorNonce!, threadId: prepared.activeThreadId!,
+          turnId: 'implementation-turn', retainInput: true,
+        })
+        throw new CodexRepositoryChangedBeforeImplementationError()
+      },
+    })
+
+    expect(stats).toEqual({ completed: 0, failed: 1, workersStarted: 1 })
+    expect(store.get(root.id)?.lastError).toContain(
+      'write-enabled implementation may already have changed',
+    )
+    expect(publicJobFailureSummary(store.get(root.id)!.lastError!)).toBe(
+      '変更処理の途中で失敗したため、一部の変更が残っている可能性があります。再送前に確認してください。',
+    )
+    store.close()
   })
 
   test('別DB connectionから同時claimしてもrunning Codexは常に1件だけ', () => {
@@ -6703,6 +7100,145 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     )).toThrow('uncontained external advisor outcomes')
   })
 
+  test('実装前の正当なrepository driftだけをtyped retryへ分類する', () => {
+    const state = fixtureDir()
+    const job = { id: 'advisor-preparation-drift' }
+    const contextDigest = 'a'.repeat(64)
+    const attemptNonce = 'f'.repeat(32)
+    const advisorInput = { revision: 1, digest: '6'.repeat(64) }
+    const initialDigest = '9'.repeat(64)
+    const currentDigest = '8'.repeat(64)
+    const root = join(
+      state, 'advisor-journal', job.id, attemptNonce,
+      `revision-${advisorInput.revision}-${advisorInput.digest.slice(0, 16)}`,
+    )
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    const journal = {
+      version: 6,
+      status: 'completed',
+      phase: 'investigation',
+      round: 1,
+      attemptNonce,
+      contextDigest,
+      inputRevision: advisorInput.revision,
+      inputDigest: advisorInput.digest,
+      repositoryDigest: initialDigest,
+      repositoryDigestBefore: initialDigest,
+      repositoryDigestAfter: initialDigest,
+      brokerProcessId: 101,
+      primaryEvidenceDigest: 'b'.repeat(64),
+      startedAt: 1,
+      finishedAt: 2,
+      receiptIssuedAt: 3,
+      receiptDigest: 'f'.repeat(64),
+      pollObservedAt: 4,
+      native: [
+        { perspective: 'solution', agentId: 'native-solution', responseDigest: '1'.repeat(64) },
+        { perspective: 'risk', agentId: 'native-risk', responseDigest: '2'.repeat(64) },
+      ],
+      grok: [
+        {
+          attempted: true, adopted: false, perspective: 'solution',
+          containmentVerified: true, reasonDigest: '3'.repeat(64),
+        },
+        {
+          attempted: true, adopted: false, perspective: 'risk',
+          containmentVerified: true, reasonDigest: '4'.repeat(64),
+        },
+      ],
+      claude: {
+        attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
+        workspaceCreationAttempted: false, freshEphemeral: false,
+        cleanupVerified: false, containmentVerified: true,
+        promptMayHaveBeenDelivered: false, reasonDigest: '5'.repeat(64),
+      },
+    }
+    const path = join(root, 'investigation-1.json')
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    expect(() => assertRequiredAdvisorPreparationRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, initialDigest, currentDigest,
+    )).toThrow(CodexRepositoryChangedBeforeImplementationError)
+
+    journal.grok[0]!.containmentVerified = false
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    try {
+      assertRequiredAdvisorPreparationRounds(
+        job, state, contextDigest, attemptNonce, advisorInput, initialDigest, currentDigest,
+      )
+      throw new Error('malformed advisor evidence was accepted')
+    } catch (error) {
+      expect(error).not.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
+      expect(String(error)).toContain('uncontained external advisor outcomes')
+    }
+
+    journal.grok[0]!.containmentVerified = true
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    const malformedDesign = {
+      ...journal,
+      phase: 'design',
+      startedAt: 5,
+      finishedAt: 6,
+      receiptIssuedAt: 7,
+      pollObservedAt: 8,
+      grok: journal.grok.map((entry, index) => ({
+        ...entry,
+        containmentVerified: index === 0 ? false : entry.containmentVerified,
+      })),
+    }
+    const designPath = join(root, 'design-1.json')
+    writeFileSync(designPath, `${JSON.stringify(malformedDesign)}\n`, { mode: 0o600 })
+    try {
+      assertRequiredAdvisorPreparationRounds(
+        job, state, contextDigest, attemptNonce, advisorInput, initialDigest, currentDigest,
+      )
+      throw new Error('later malformed advisor evidence was masked by repository drift')
+    } catch (error) {
+      expect(error).not.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
+      expect(String(error)).toContain('uncontained external advisor outcomes')
+    }
+    rmSync(designPath)
+
+    journal.repositoryDigest = currentDigest
+    journal.repositoryDigestBefore = currentDigest
+    journal.repositoryDigestAfter = currentDigest
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    try {
+      assertRequiredAdvisorPreparationRounds(
+        job, state, contextDigest, attemptNonce, advisorInput, initialDigest, initialDigest,
+      )
+      throw new Error('stale journal was misclassified without actual repository drift')
+    } catch (error) {
+      expect(error).not.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
+      expect(String(error)).toContain('is stale')
+    }
+
+    rmSync(path)
+    try {
+      assertRequiredAdvisorPreparationRounds(
+        job, state, contextDigest, attemptNonce, advisorInput, initialDigest, currentDigest,
+      )
+      throw new Error('missing advisor evidence was misclassified as repository drift')
+    } catch (error) {
+      expect(error).not.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
+      expect(String(error)).toContain('investigation-1')
+    }
+
+    journal.repositoryDigest = initialDigest
+    journal.repositoryDigestBefore = initialDigest
+    journal.repositoryDigestAfter = initialDigest
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    try {
+      assertRequiredAdvisorRounds(
+        { ...job, writeEnabled: false }, state, contextDigest, attemptNonce,
+        advisorInput, initialDigest, currentDigest,
+      )
+      throw new Error('stale publication evidence was accepted')
+    } catch (error) {
+      expect(error).not.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
+      expect(String(error)).toContain('publication state')
+    }
+  })
+
   test('publication gateは最終入力revisionを必須にし旧stale native証跡も全件監査する', () => {
     const state = fixtureDir()
     const job = { id: 'advisor-input-revision-job', writeEnabled: false }
@@ -8262,6 +8798,21 @@ describe('Slack output guard', () => {
     store.close()
   })
 
+  test('commentary識別子は内部payloadに残しSlack本文の先頭からだけ外す', async () => {
+    const store = makeStore()
+    const job = store.enqueue(input({ messageId: 'progress-commentary-prefix' })).job
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+
+    await notifier.progress(job, '💬 原因を確認しています 🔎', 'commentary-prefix')
+    await notifier.progress(job, '通常の進捗です 🧪', 'ordinary-progress')
+
+    expect(posted).toEqual(['原因を確認しています 🔎', '通常の進捗です 🧪'])
+    store.close()
+  })
+
   test('失敗通知は固定分類とqueue番号だけを出しraw内部情報を漏らさない', async () => {
     const store = makeStore()
     const job = store.enqueue(input({ messageId: 'safe-failure-summary' })).job
@@ -8284,6 +8835,11 @@ describe('Slack output guard', () => {
     ])
     expect(posted[0]).not.toContain('監視タブを確認用に残しました')
     expect(posted[0]).not.toMatch(/Codex|xoxb|\/Users\/|design_solution/)
+    expect(publicJobFailureSummary(
+      'repository changed repeatedly before implementation; retry limit reached',
+    )).toBe(
+      '作業中に対象projectが別の変更で更新されたため、最新状態で安全に続行できませんでした。',
+    )
     store.close()
   })
 

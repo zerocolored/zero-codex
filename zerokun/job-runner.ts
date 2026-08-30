@@ -26,6 +26,7 @@ import {
   CodexCleanupPendingError,
   CodexInterruptedError,
   CodexRateLimitError,
+  CodexRepositoryChangedBeforeImplementationError,
   CodexUserCancelledError,
   codexRateLimitResumeAt,
   executeCodexJob,
@@ -165,6 +166,25 @@ export const SERIAL_WORKER_COUNT = 1 as const
 export const JOB_RUNNER_HANDSHAKE = 'zerokun-codex-runner-v1' as const
 export const DEFAULT_MAX_JOBS_PER_SESSION = 20 as const
 export const CODEX_SESSION_PROTOCOL_VERSION = 2 as const
+export const DEFAULT_MAX_REPOSITORY_DRIFT_RETRIES = 3 as const
+const CLAIMABLE_CODEX_JOB_PREDICATE = `
+  jobs.runtime = 'codex'
+  AND jobs.status = 'queued'
+  AND jobs.ui_approval_request_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM inbound_deliveries AS inbound
+    WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM jobs AS approval_wait
+    WHERE approval_wait.runtime = 'codex'
+      AND approval_wait.chat_id = jobs.chat_id
+      AND approval_wait.thread_ts = jobs.thread_ts
+      AND approval_wait.status = 'queued'
+      AND approval_wait.ui_approval_request_id IS NOT NULL
+      AND approval_wait.seq < jobs.seq
+  )
+`
 const SLACK_DM_HISTORY_RETRY_BASE_MS = 24 * 60 * 60 * 1_000
 const SLACK_DM_HISTORY_RETRY_MAX_MS = 7 * 24 * 60 * 60 * 1_000
 const MONITOR_LOSS_RECOVERY_MESSAGE =
@@ -439,6 +459,7 @@ export interface JobRecord {
   executorPid: number | null
   monitorState: 'none' | 'preparing' | 'required' | 'lost-staged'
   attempts: number
+  repositoryDriftRetries: number
   notBefore: number | null
   result: string | null
   lastError: string | null
@@ -476,6 +497,7 @@ type JobRow = {
   executor_pid: number | null
   monitor_state: number
   attempts: number
+  repository_drift_retries: number
   not_before: number | null
   result: string | null
   pending_session_id: string | null
@@ -543,6 +565,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   executor_pid INTEGER,
   monitor_state INTEGER NOT NULL DEFAULT 0 CHECK (monitor_state IN (0, 1, 2, 3)),
   attempts INTEGER NOT NULL DEFAULT 0,
+  repository_drift_retries INTEGER NOT NULL DEFAULT 0
+    CHECK (repository_drift_retries >= 0),
+  repository_drift_intent_attempt INTEGER,
+  repository_drift_intent_reason TEXT,
   not_before INTEGER,
   result TEXT,
   pending_session_id TEXT,
@@ -1001,6 +1027,12 @@ function ensureJobSchemaMigrations(db: Database): void {
   for (const [name, definition] of [
     ['pending_session_id', 'TEXT'],
     ['pending_result', 'TEXT'],
+    [
+      'repository_drift_retries',
+      'INTEGER NOT NULL DEFAULT 0 CHECK (repository_drift_retries >= 0)',
+    ],
+    ['repository_drift_intent_attempt', 'INTEGER'],
+    ['repository_drift_intent_reason', 'TEXT'],
     ['input_revision', 'INTEGER NOT NULL DEFAULT 1'],
     ['control_epoch', 'INTEGER NOT NULL DEFAULT 0'],
     ['accepts_control', 'INTEGER NOT NULL DEFAULT 0 CHECK (accepts_control IN (0, 1))'],
@@ -1525,6 +1557,7 @@ function mapRow(row: JobRow): JobRecord {
     executorPid: row.executor_pid,
     monitorState,
     attempts: row.attempts,
+    repositoryDriftRetries: row.repository_drift_retries,
     notBefore: row.not_before,
     result: row.result,
     lastError: row.last_error,
@@ -4196,7 +4229,6 @@ export class JobStore {
     return retrySqlite(() => this.db.query<{ present: number }, [string]>(
       `SELECT 1 AS present
        FROM job_phase_dispatches receipts
-       JOIN jobs ON jobs.id = receipts.job_id AND jobs.attempts = receipts.attempt
        WHERE receipts.job_id = ? AND receipts.stage = 'implementation'
          AND receipts.status IN ('dispatching', 'acknowledged', 'observed', 'ambiguous')`,
     ).get(jobId) !== null)
@@ -5357,17 +5389,23 @@ export class JobStore {
       const position = this.db.query<{ position: number }, [number]>(
         `SELECT COUNT(*) AS position
          FROM jobs
-         WHERE runtime = 'codex' AND status = 'queued' AND seq <= ?`,
+         WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE} AND jobs.seq <= ?`,
       ).get(row.seq)?.position ?? 0
+      const hasRunning = this.db.query<{ present: number }, []>(
+        "SELECT 1 AS present FROM jobs WHERE runtime = 'codex' AND status = 'running' LIMIT 1",
+      ).get() !== null
 
       if (result.changes === 1 && input.notifyAccepted) {
+        const waitingPosition = Math.max(1, position)
         this.stageStatusNotificationRow({
           idempotencyKey: `accepted:${idempotencyKey}`,
           jobId: row.id,
           chatId,
           threadTs,
           kind: 'accepted',
-          payload: `🙌 受け付けました（待ち順 ${position}）。`,
+          payload: hasRunning || waitingPosition > 1
+            ? `🙌 受け付けました（待ち順 ${waitingPosition}）。`
+            : '🙌 受け付けました。',
           createdAt: Date.now(),
         })
       }
@@ -5437,20 +5475,7 @@ export class JobStore {
       cancel_requested_at: number | null
     }, []>(
       `SELECT not_before, cancel_requested_at FROM jobs
-       WHERE runtime = 'codex' AND status = 'queued' AND ui_approval_request_id IS NULL
-         AND NOT EXISTS (
-           SELECT 1 FROM inbound_deliveries AS inbound
-           WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM jobs AS approval_wait
-           WHERE approval_wait.runtime = 'codex'
-             AND approval_wait.chat_id = jobs.chat_id
-             AND approval_wait.thread_ts = jobs.thread_ts
-             AND approval_wait.status = 'queued'
-             AND approval_wait.ui_approval_request_id IS NOT NULL
-             AND approval_wait.seq < jobs.seq
-         )
+       WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}
        ORDER BY seq ASC LIMIT 1`,
     ).get()
     return head && (head.cancel_requested_at !== null
@@ -5464,20 +5489,7 @@ export class JobStore {
       cancel_requested_at: number | null
     }, []>(
       `SELECT id, not_before, cancel_requested_at FROM jobs
-       WHERE runtime = 'codex' AND status = 'queued' AND ui_approval_request_id IS NULL
-         AND NOT EXISTS (
-           SELECT 1 FROM inbound_deliveries AS inbound
-           WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM jobs AS approval_wait
-           WHERE approval_wait.runtime = 'codex'
-             AND approval_wait.chat_id = jobs.chat_id
-             AND approval_wait.thread_ts = jobs.thread_ts
-             AND approval_wait.status = 'queued'
-             AND approval_wait.ui_approval_request_id IS NOT NULL
-             AND approval_wait.seq < jobs.seq
-         )
+       WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}
        ORDER BY seq ASC LIMIT 1`,
     ).get()
     return head && (head.cancel_requested_at !== null
@@ -5500,22 +5512,7 @@ export class JobStore {
       if (active) return null
       const row = this.db.query<JobRow, []>(
         `SELECT * FROM jobs
-         WHERE runtime = 'codex'
-           AND status = 'queued'
-           AND ui_approval_request_id IS NULL
-           AND NOT EXISTS (
-             SELECT 1 FROM inbound_deliveries AS inbound
-             WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM jobs AS approval_wait
-             WHERE approval_wait.runtime = 'codex'
-               AND approval_wait.chat_id = jobs.chat_id
-               AND approval_wait.thread_ts = jobs.thread_ts
-               AND approval_wait.status = 'queued'
-               AND approval_wait.ui_approval_request_id IS NOT NULL
-               AND approval_wait.seq < jobs.seq
-           )
+         WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}
          ORDER BY seq ASC
          LIMIT 1`,
       ).get()
@@ -5962,6 +5959,17 @@ export class JobStore {
        WHERE id = ? AND runtime = 'codex' AND status = 'running' AND executor_pid = ?`,
       [id, executorPid],
     ))
+  }
+
+  clearExecutorPidAfterExit(id: string, executorPid: number): void {
+    const updated = retrySqlite(() => this.db.run(
+      `UPDATE jobs SET executor_pid = NULL
+       WHERE id = ? AND runtime = 'codex' AND status = 'running' AND executor_pid = ?`,
+      [id, executorPid],
+    ))
+    if (updated.changes !== 1) {
+      throw new Error(`executor PID exit binding changed for job ${id}`)
+    }
   }
 
   clearSession(id: string): void {
@@ -8013,6 +8021,200 @@ export class JobStore {
     this.requeue(id, 'new same-thread input arrived before UI/UX approval waiting began')
   }
 
+  preparePreImplementationRepositoryDriftRetry(
+    idInput: string,
+    reasonInput: string,
+    maxRetries = DEFAULT_MAX_REPOSITORY_DRIFT_RETRIES,
+  ): 'prepared' | 'exhausted' | 'cancelled' | 'unsafe' {
+    const id = requireText(idInput, 'jobId')
+    const reason = requireText(reasonInput, 'repository drift reason').slice(0, 4_000)
+    const retryLimit = positiveInteger(maxRetries, DEFAULT_MAX_REPOSITORY_DRIFT_RETRIES)
+    const prepare = this.db.transaction(() => {
+      const job = this.db.query<{
+        attempts: number
+        repository_drift_retries: number
+        cancel_requested_at: number | null
+        executor_pid: number | null
+        active_turn_id: string | null
+        pending_session_id: string | null
+        pending_result: string | null
+        ui_approval_request_id: string | null
+      }, [string]>(
+        `SELECT attempts, repository_drift_retries, cancel_requested_at,
+                executor_pid, active_turn_id, pending_session_id, pending_result,
+                ui_approval_request_id
+         FROM jobs
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+      ).get(id)
+      if (!job) return 'unsafe' as const
+      if (job.cancel_requested_at !== null) return 'cancelled' as const
+      if (job.executor_pid !== null || job.active_turn_id !== null
+        || job.pending_session_id !== null || job.pending_result !== null
+        || job.ui_approval_request_id !== null) return 'unsafe' as const
+      const implementation = this.db.query<{ present: number }, [string]>(
+        `SELECT 1 AS present FROM job_phase_dispatches
+         WHERE job_id = ? AND stage = 'implementation'
+           AND status IN ('dispatching', 'acknowledged', 'observed', 'ambiguous')
+         LIMIT 1`,
+      ).get(id)
+      if (implementation) return 'unsafe' as const
+      const monitorFailure = this.db.query<{ present: number }, [string]>(
+        'SELECT 1 AS present FROM monitor_failures WHERE job_id = ? LIMIT 1',
+      ).get(id)
+      if (monitorFailure) return 'unsafe' as const
+      const completedPreparation = this.db.query<
+        { present: number }, [string, number, string, number]
+      >(
+        `SELECT 1 AS present
+         WHERE EXISTS (
+           SELECT 1 FROM job_initial_dispatches AS initial
+           WHERE initial.job_id = ? AND initial.attempt = ? AND initial.status = 'observed'
+         ) OR EXISTS (
+           SELECT 1 FROM job_phase_dispatches AS phase
+           WHERE phase.job_id = ? AND phase.attempt = ?
+             AND phase.stage = 'prepare' AND phase.status = 'observed'
+         )`,
+      ).get(id, job.attempts, id, job.attempts)
+      if (!completedPreparation) return 'unsafe' as const
+      if (job.repository_drift_retries >= retryLimit) return 'exhausted' as const
+      const updated = this.db.run(
+        `UPDATE jobs
+         SET repository_drift_intent_attempt = attempts,
+             repository_drift_intent_reason = ?
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND cancel_requested_at IS NULL
+           AND repository_drift_retries < ?
+           AND executor_pid IS NULL AND active_turn_id IS NULL
+           AND pending_session_id IS NULL AND pending_result IS NULL
+           AND ui_approval_request_id IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM job_phase_dispatches AS phase
+             WHERE phase.job_id = jobs.id AND phase.stage = 'implementation'
+               AND phase.status IN ('dispatching', 'acknowledged', 'observed', 'ambiguous')
+           )
+           AND (
+             EXISTS (
+               SELECT 1 FROM job_initial_dispatches AS initial
+               WHERE initial.job_id = jobs.id AND initial.attempt = jobs.attempts
+                 AND initial.status = 'observed'
+             ) OR EXISTS (
+               SELECT 1 FROM job_phase_dispatches AS phase
+               WHERE phase.job_id = jobs.id AND phase.attempt = jobs.attempts
+                 AND phase.stage = 'prepare' AND phase.status = 'observed'
+             )
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM monitor_failures WHERE monitor_failures.job_id = jobs.id
+           )`,
+        [reason, id, retryLimit],
+      )
+      if (updated.changes !== 1) return 'unsafe' as const
+      return 'prepared' as const
+    })
+    return retrySqlite(() => prepare.immediate())
+  }
+
+  requeueAfterPreImplementationRepositoryDrift(
+    idInput: string,
+    maxRetries = DEFAULT_MAX_REPOSITORY_DRIFT_RETRIES,
+  ): 'requeued' | 'exhausted' | 'cancelled' | 'unsafe' {
+    const id = requireText(idInput, 'jobId')
+    const retryLimit = positiveInteger(maxRetries, DEFAULT_MAX_REPOSITORY_DRIFT_RETRIES)
+    const requeue = this.db.transaction(() => {
+      const job = this.db.query<{
+        attempts: number
+        repository_drift_retries: number
+        repository_drift_intent_attempt: number | null
+        repository_drift_intent_reason: string | null
+        cancel_requested_at: number | null
+        executor_pid: number | null
+        active_turn_id: string | null
+        pending_session_id: string | null
+        pending_result: string | null
+        ui_approval_request_id: string | null
+      }, [string]>(
+        `SELECT attempts, repository_drift_retries,
+                repository_drift_intent_attempt, repository_drift_intent_reason,
+                cancel_requested_at, executor_pid, active_turn_id,
+                pending_session_id, pending_result, ui_approval_request_id
+         FROM jobs
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+      ).get(id)
+      if (!job) return 'unsafe' as const
+      if (job.cancel_requested_at !== null) return 'cancelled' as const
+      if (job.repository_drift_intent_attempt !== job.attempts
+        || !job.repository_drift_intent_reason) return 'unsafe' as const
+      if (job.executor_pid !== null || job.active_turn_id !== null
+        || job.pending_session_id !== null || job.pending_result !== null
+        || job.ui_approval_request_id !== null) return 'unsafe' as const
+      if (this.writePhaseMayHaveBeenDelivered(id)) return 'unsafe' as const
+      if (this.db.query<{ present: number }, [string]>(
+        'SELECT 1 AS present FROM monitor_failures WHERE job_id = ? LIMIT 1',
+      ).get(id)) return 'unsafe' as const
+      const completedPreparation = this.db.query<
+        { present: number }, [string, number, string, number]
+      >(
+        `SELECT 1 AS present
+         WHERE EXISTS (
+           SELECT 1 FROM job_initial_dispatches AS initial
+           WHERE initial.job_id = ? AND initial.attempt = ? AND initial.status = 'observed'
+         ) OR EXISTS (
+           SELECT 1 FROM job_phase_dispatches AS phase
+           WHERE phase.job_id = ? AND phase.attempt = ?
+             AND phase.stage = 'prepare' AND phase.status = 'observed'
+         )`,
+      ).get(id, job.attempts, id, job.attempts)
+      if (!completedPreparation) return 'unsafe' as const
+      if (job.repository_drift_retries >= retryLimit) return 'exhausted' as const
+      const now = Date.now()
+      const updated = this.db.run(
+        `UPDATE jobs
+         SET status = 'queued', worker_id = NULL, started_at = NULL,
+             executor_pid = NULL, pending_session_id = NULL, pending_result = NULL,
+             not_before = NULL, finished_at = NULL,
+             last_error = repository_drift_intent_reason,
+             repository_drift_retries = repository_drift_retries + 1,
+             repository_drift_intent_attempt = NULL,
+             repository_drift_intent_reason = NULL,
+             accepts_control = 1, executor_nonce = NULL,
+             active_thread_id = NULL, active_turn_id = NULL,
+             terminal_outcome = NULL
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND cancel_requested_at IS NULL
+           AND repository_drift_retries < ?
+           AND repository_drift_intent_attempt = attempts
+           AND repository_drift_intent_reason IS NOT NULL
+           AND executor_pid IS NULL AND active_turn_id IS NULL
+           AND pending_session_id IS NULL AND pending_result IS NULL
+           AND ui_approval_request_id IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM job_phase_dispatches AS phase
+             WHERE phase.job_id = jobs.id AND phase.stage = 'implementation'
+               AND phase.status IN ('dispatching', 'acknowledged', 'observed', 'ambiguous')
+           )
+           AND (
+             EXISTS (
+               SELECT 1 FROM job_initial_dispatches AS initial
+               WHERE initial.job_id = jobs.id AND initial.attempt = jobs.attempts
+                 AND initial.status = 'observed'
+             ) OR EXISTS (
+               SELECT 1 FROM job_phase_dispatches AS phase
+               WHERE phase.job_id = jobs.id AND phase.attempt = jobs.attempts
+                 AND phase.stage = 'prepare' AND phase.status = 'observed'
+             )
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM monitor_failures WHERE monitor_failures.job_id = jobs.id
+           )`,
+        [id, retryLimit],
+      )
+      if (updated.changes !== 1) return 'unsafe' as const
+      this.supersedeLifecycleNotifications(id, now)
+      return 'requeued' as const
+    })
+    return retrySqlite(() => requeue.immediate())
+  }
+
   releaseUnstartedClaim(id: string, workerId: string, reason: string): boolean {
     const release = this.db.transaction(() => {
       const job = this.db.query<{ attempts: number }, [string, string]>(
@@ -8174,6 +8376,13 @@ export class JobStore {
         this.cancel(job.id)
         failedUncertain += 1
       } else if (job.writeEnabled) {
+        const disposition = this.requeueAfterPreImplementationRepositoryDrift(
+          job.id,
+        )
+        if (disposition === 'requeued') {
+          requeued += 1
+          continue
+        }
         this.fail(
           job.id,
           'write-enabled job was interrupted after execution began; its external effects are uncertain. Review the repository and external services, then resend only if needed.',
@@ -8213,6 +8422,32 @@ export class JobStore {
       }
     }
     return { requeued, failedWrites, failedUncertain }
+  }
+}
+
+export function createExecutorPidLifecycle(
+  store: Pick<JobStore, 'saveExecutorPid' | 'clearExecutorPidAfterExit'>,
+  jobIdInput: string,
+): {
+  onProcessId(processId: number): void
+  onProcessExit(exitCode: number): void
+} {
+  const jobId = requireText(jobIdInput, 'jobId')
+  let activeProcessId: number | null = null
+  return {
+    onProcessId(processId: number): void {
+      if (activeProcessId !== null) {
+        throw new Error(`executor PID ${activeProcessId} is still active for job ${jobId}`)
+      }
+      store.saveExecutorPid(jobId, processId)
+      activeProcessId = processId
+    },
+    onProcessExit(_exitCode: number): void {
+      if (activeProcessId === null) return
+      const processId = activeProcessId
+      store.clearExecutorPidAfterExit(jobId, processId)
+      activeProcessId = null
+    },
   }
 }
 
@@ -8401,6 +8636,10 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  if (error.includes('repository changed before implementation')
+    || error.includes('repository changed repeatedly before implementation')) {
+    return '作業中に対象projectが別の変更で更新されたため、最新状態で安全に続行できませんでした。'
+  }
   if (error.includes('write-enabled')
     && (error.includes('effects are uncertain') || error.includes('may already have changed'))) {
     return '変更処理の途中で失敗したため、一部の変更が残っている可能性があります。再送前に確認してください。'
@@ -9197,6 +9436,52 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         options.store.cancel(job.id)
         stats.failed += 1
         log(`${workerId} cancelled ${job.id}`)
+        scheduleNotificationFlush()
+        continue
+      }
+      if (error instanceof CodexRepositoryChangedBeforeImplementationError) {
+        await updateMonitor(job, '対象projectが更新されたため、最新状態で調査をやり直します')
+        await quiesceLifecycleBeforeStateChange()
+        const prepared = options.store.preparePreImplementationRepositoryDriftRetry(
+          job.id,
+          error.message,
+        )
+        const disposition = prepared === 'prepared'
+          ? options.store.requeueAfterPreImplementationRepositoryDrift(job.id)
+          : prepared
+        if (disposition === 'requeued') {
+          log(`${workerId} requeued ${job.id} after pre-implementation repository drift`)
+          continue
+        }
+        if (disposition === 'cancelled') {
+          await updateMonitor(job, '中止要求を反映し、安全な後処理を完了しました')
+          await quiesceMonitorBeforeTerminal()
+          options.store.cancel(job.id)
+          stats.failed += 1
+          log(`${workerId} cancelled ${job.id} while recovering repository drift`)
+          scheduleNotificationFlush()
+          continue
+        }
+        const implementationMayHaveChanged = options.store.writePhaseMayHaveBeenDelivered(job.id)
+        const failure = implementationMayHaveChanged
+          ? 'write-enabled implementation may already have changed the repository or external '
+            + 'services before later repository drift was detected. Review those effects, then '
+            + 'resend only if needed.'
+          : disposition === 'exhausted'
+            ? 'repository changed repeatedly before implementation; '
+              + 'automatic fresh preparation retry limit was reached'
+            : 'repository changed before implementation, but safe automatic fresh preparation '
+              + 'could not be proven'
+        await updateMonitor(
+          job,
+          implementationMayHaveChanged
+            ? '一部の変更が残っている可能性があるため失敗として確定します'
+            : '最新状態での安全な再調査ができないため失敗として確定します',
+        )
+        await quiesceMonitorBeforeTerminal()
+        options.store.fail(job.id, failure)
+        stats.failed += 1
+        log(`${workerId} failed repository drift recovery for ${job.id}: ${failure}`)
         scheduleNotificationFlush()
         continue
       }
@@ -11176,10 +11461,13 @@ export class SlackNotifier implements JobNotifier {
       text,
       dirname(this.store.dbPath),
     )
+    const slackText = safeText.startsWith('💬 ')
+      ? safeText.slice('💬 '.length)
+      : safeText
     await this.trackLifecycleSideEffect(
       () => this.post(
         job,
-        safeText || '少し時間がかかっていますが、まだ作業を続けています 🔍',
+        slackText || '少し時間がかかっていますが、まだ作業を続けています 🔍',
         notificationId,
         signal,
       ),
@@ -12880,12 +13168,13 @@ async function runCli(): Promise<void> {
           }
         }
         try {
+          const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
           const execution = await executeCodexJob(job, {
             signal: executionController.signal,
             stateDir: dir,
             logDir: join(dir, 'job-logs'),
             uiApproval: store.latestUiApprovalContext(job.id),
-            onProcessId: processId => store.saveExecutorPid(job.id, processId),
+            ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId),
             onSessionReset: () => store.clearSession(job.id),
             liveControls: {

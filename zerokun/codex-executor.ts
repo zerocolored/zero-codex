@@ -1418,6 +1418,13 @@ function parseNativeAdvisorJournalEntries(
   return native
 }
 
+class AdvisorJournalRepositoryDigestMismatchError extends Error {
+  constructor(phase: RequiredAdvisorRound['phase'], round: RequiredAdvisorRound['round']) {
+    super(`advisor journal ${phase}-${round} is stale`)
+    this.name = 'AdvisorJournalRepositoryDigestMismatchError'
+  }
+}
+
 function parseCompletedAdvisorJournal(
   raw: string,
   requirement: RequiredAdvisorRound,
@@ -1466,10 +1473,6 @@ function parseCompletedAdvisorJournal(
     || !validSha256(journal.receiptDigest)) {
     throw new Error(`advisor journal ${requirement.phase}-${requirement.round} is incomplete`)
   }
-  if (expectedRepositoryDigest !== undefined
-    && journal.repositoryDigest !== expectedRepositoryDigest) {
-    throw new Error(`advisor journal ${requirement.phase}-${requirement.round} is stale`)
-  }
   const native = parseNativeAdvisorJournalEntries(journal)
 
   const externalValid = journal.version === 5
@@ -1477,6 +1480,13 @@ function parseCompletedAdvisorJournal(
     : validTerminalGrokAttempts(journal.grok) && validTerminalClaudeAttempt(journal.claude)
   if (!externalValid) {
     throw new Error('advisor journal has invalid or uncontained external advisor outcomes')
+  }
+  if (expectedRepositoryDigest !== undefined
+    && journal.repositoryDigest !== expectedRepositoryDigest) {
+    throw new AdvisorJournalRepositoryDigestMismatchError(
+      requirement.phase,
+      requirement.round,
+    )
   }
   return {
     startedAt: Number(journal.startedAt),
@@ -1666,41 +1676,54 @@ export function assertRequiredAdvisorPreparationRounds(
     beforeRevision: expectedInput.revision,
     initialRepositoryDigest,
   })
-  if (currentRepositoryDigest !== initialRepositoryDigest && earlierInitialPair === null) {
-    throw new Error('repository changed before any verified initial read-only preparation')
-  }
+  const repositoryChangedWithoutEarlierPreparation =
+    currentRepositoryDigest !== initialRepositoryDigest && earlierInitialPair === null
   const requirements: RequiredAdvisorRound[] = [
     { phase: 'investigation', round: 1 },
     { phase: 'design', round: 1 },
   ]
   let priorFinishedAt = earlierInitialPair?.finishedAt ?? 0
-  const evidence: NativeAdvisorRoundEvidence[] = []
+  let repositoryDigestMismatch = false
+  const missing: RequiredAdvisorRound[] = []
   for (const requirement of requirements) {
     const raw = readOptionalPrivateFile(
       advisorJournalPath(stateDir, job.id, attemptNonce, expectedInput, requirement),
     )
     if (raw === null) {
-      throw new Error(`required pre-edit Five-Advisor round is missing: ${requirement.phase}-1`)
+      missing.push(requirement)
+      continue
     }
-    const completed = parseCompletedAdvisorJournal(
-      raw,
-      requirement,
-      expectedContextDigest,
-      attemptNonce,
-      expectedInput,
-      initialRepositoryDigest,
-      currentRepositoryDigest,
-    )
+    let completed: ReturnType<typeof parseCompletedAdvisorJournal>
+    try {
+      completed = parseCompletedAdvisorJournal(
+        raw,
+        requirement,
+        expectedContextDigest,
+        attemptNonce,
+        expectedInput,
+        initialRepositoryDigest,
+        currentRepositoryDigest,
+      )
+    } catch (error) {
+      if (error instanceof AdvisorJournalRepositoryDigestMismatchError
+        && currentRepositoryDigest !== initialRepositoryDigest) {
+        repositoryDigestMismatch = true
+        completed = parseCompletedAdvisorJournal(
+          raw,
+          requirement,
+          expectedContextDigest,
+          attemptNonce,
+          expectedInput,
+          initialRepositoryDigest,
+        )
+      } else {
+        throw error
+      }
+    }
     if (completed.startedAt < priorFinishedAt) {
       throw new Error('pre-edit advisor phases overlap or are out of order')
     }
     priorFinishedAt = completed.finishedAt
-    evidence.push({
-      inputRevision: expectedInput.revision,
-      inputDigest: expectedInput.digest,
-      ...requirement,
-      native: completed.native,
-    })
   }
   const reviewPath = advisorJournalPath(
     stateDir,
@@ -1711,6 +1734,17 @@ export function assertRequiredAdvisorPreparationRounds(
   )
   if (readOptionalPrivateFile(reviewPath) !== null) {
     throw new Error('review was started inside the pre-edit process')
+  }
+  if (missing.length > 0) {
+    if (missing[0]!.phase === 'design' && repositoryDigestMismatch) {
+      throw new CodexRepositoryChangedBeforeImplementationError()
+    }
+    throw new Error(
+      `required pre-edit Five-Advisor round is missing: ${missing[0]!.phase}-1`,
+    )
+  }
+  if (repositoryDigestMismatch || repositoryChangedWithoutEarlierPreparation) {
+    throw new CodexRepositoryChangedBeforeImplementationError()
   }
   const allEvidence = collectNativeAdvisorJournalEvidence({
     stateDir,
@@ -3910,6 +3944,14 @@ export class CodexRateLimitError extends Error {
 
 export class CodexInterruptedError extends Error {}
 export class CodexCleanupPendingError extends Error {}
+export class CodexRepositoryChangedBeforeImplementationError extends Error {
+  constructor(
+    message = 'repository changed before implementation; fresh preparation is required',
+  ) {
+    super(message)
+    this.name = 'CodexRepositoryChangedBeforeImplementationError'
+  }
+}
 export class CodexInputChangedBeforeDispatchError extends Error {
   constructor(message = 'Slack input changed before the initial App Server request was written') {
     super(message)
@@ -7378,7 +7420,8 @@ async function verifyCodexConfig(inheritProcessGroup = false): Promise<void> {
           userId: 'UPROBE', repoPath: repo, task: 'config probe', inputRevision: 1,
           attachments: [], runtime: 'codex',
           writeEnabled, status: 'running', sessionId: null, resumed: false,
-          workerId: 'config-probe', executorPid: null, monitorState: 'required', attempts: 1, notBefore: null,
+          workerId: 'config-probe', executorPid: null, monitorState: 'required', attempts: 1,
+          repositoryDriftRetries: 0, notBefore: null,
           result: null, lastError: null, createdAt: Date.now(), startedAt: Date.now(), finishedAt: null,
           controlEpoch: 1, acceptsControl: true, executorNonce: null,
           activeThreadId: null, activeTurnId: null, cancelRequestedAt: null,

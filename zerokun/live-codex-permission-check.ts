@@ -195,6 +195,7 @@ function job(repoPath: string, id: string, writeEnabled: boolean, sessionId: str
     executorPid: null,
     monitorState: 'required',
     attempts: 1,
+    repositoryDriftRetries: 0,
     notBefore: null,
     result: null,
     lastError: null,
