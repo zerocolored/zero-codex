@@ -14,7 +14,7 @@ import {
   rmSync,
   writeSync,
 } from 'fs'
-import { createHash, randomUUID } from 'crypto'
+import { createHash, randomBytes, randomUUID } from 'crypto'
 import { homedir, tmpdir } from 'os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import type {
@@ -121,6 +121,13 @@ import {
   type AppServerTurn,
 } from './codex-app-server-session.ts'
 import { CodexMonitorDisplay } from './codex-monitor-display.ts'
+import {
+  CodexUiApprovalRequiredError,
+  assertUiApprovalReadyMayProceed,
+  parseCodexPreparationDecision,
+  verifyUiApprovalBrowserReceipts,
+  type UiApprovalResumeContext,
+} from './ui-approval.ts'
 import {
   createSeatbeltFingerprint,
   recoverOrphanSeatbeltFingerprints,
@@ -2904,6 +2911,8 @@ export function buildCodexPhasePrompt(
   attemptNonce?: string,
   artifactDir?: string,
   browserEnabled = false,
+  uiApproval?: UiApprovalResumeContext,
+  repositoryChangedSinceProposal = false,
 ): string {
   if (!/^[0-9a-f]{32}$/.test(attemptNonce ?? '')) {
     throw new Error('host phase prompt requires the logical attempt nonce')
@@ -2924,6 +2933,27 @@ export function buildCodexPhasePrompt(
     `Artifact directory: ${artifactDir}`,
   ]
   if (stage === 'prepare') {
+    const approvalContext = uiApproval ? [
+      'A prior material UI/UX proposal was posted by the host as two Slack image attachments.',
+      `Approval request ID: ${uiApproval.requestId}`,
+      `Proposal input revision: ${uiApproval.requestInputRevision}`,
+      `Proposal input digest: ${uiApproval.requestInputDigest}`,
+      `Same-thread response message: ${uiApproval.responseMessageId}`,
+      `The host classified that response as ${uiApproval.explicitApproval ? 'an explicit unconditional approval' : 'feedback, a question, rejection, or a conditional answer'}.`,
+      ...(repositoryChangedSinceProposal ? [
+        'The repository changed after the proposal was posted, so the prior approval cannot',
+        'authorize implementation. Produce a fresh Before/After proposal and wait again.',
+      ] : uiApproval.explicitApproval ? [
+        'If the approved proposal still matches this exact input and repository, the ready marker',
+        'may be returned after the required advisor rounds. Do not silently change its material UX.',
+      ] : [
+        'Do not return the ready marker. Address the response in a revised proposal, capture a',
+        'fresh matching Before and After, and require another same-thread answer.',
+      ]),
+    ] : [
+      'Classify the requested product change before implementation. If it has no material UI/UX',
+      'effect, the ready marker may be returned after the required advisor rounds.',
+    ]
     return [
       base,
       ...host,
@@ -2932,7 +2962,24 @@ export function buildCodexPhasePrompt(
       `advisor response must end with [ZERO_NATIVE_ADVISOR:${attemptNonce}:r${input.revision}:${input.digest}:<investigation|design>:1:<solution|risk>] after replacing only the final phase and perspective placeholders. Put that marker exactly once, on a line by itself as the final line, with no output after it.`,
       'For a bounded unavailable native attempt, submit attempted=true, adopted=false, and its',
       'concise reason to the broker; do not stop preparation or invent a response.',
-      `The final line must be exactly [ZERO_PRE_EDIT_READY:${attemptNonce}:r${input.revision}:${input.digest}].`,
+      ...approvalContext,
+      ...(browserEnabled ? [
+        'For a material visual UI/UX change, do not edit the product repository. Capture the actual',
+        'current representative state as Before, create a frontend-only proposal in the writable',
+        'scratch directory, and use zerokun_browser.verify_local_page with role=before and',
+        'role=after respectively for both fixed 1280x720 PNGs.',
+        'Use synthetic/test data in both states. Never render credentials, secrets, local paths,',
+        'browser/session data, production data, or personal/private information into either image.',
+        'Return the following exact structure, with no output after the host-only image envelope:',
+        `[ZERO_UI_APPROVAL_REQUIRED:${attemptNonce}:r${input.revision}:${input.digest}]`,
+        '<short Japanese proposal explaining the visible change and asking whether to proceed>',
+        '<zerokun_ui_approval>{"before":"<absolute Before PNG path>","after":"<absolute After PNG path>"}</zerokun_ui_approval>',
+        'Never print either local path in the proposal text. The host uploads both images as Slack',
+        'files and pauses the job; you must not implement the proposal in this phase.',
+      ] : []),
+      'For a material UI/UX change, the ready marker is forbidden until the host supplies a prior',
+      'same-thread response classified above as explicit approval and the repository is unchanged.',
+      `Otherwise the final line must be exactly [ZERO_PRE_EDIT_READY:${attemptNonce}:r${input.revision}:${input.digest}].`,
       '--- end Zero host phase control ---',
     ].join('\n')
   }
@@ -2994,9 +3041,7 @@ export function assertCodexPreparationReady(
   attemptNonce: string,
   input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
 ): void {
-  const normalized = value.replace(/\r\n/g, '\n').trim()
-  const expected = `[ZERO_PRE_EDIT_READY:${attemptNonce}:r${input.revision}:${input.digest}]`
-  if (normalized.split('\n').at(-1) !== expected) {
+  if (parseCodexPreparationDecision(value, attemptNonce, input).kind !== 'ready') {
     throw new Error('Codex preparation omitted its exact current-input ready marker')
   }
 }
@@ -4082,6 +4127,8 @@ export async function executeCodexJob(
     cancellationTerminalGraceMs?: number
     /** Production App Server control plane. Omit only for legacy executor fixtures. */
     liveControls?: CodexLiveControlHooks
+    /** Trusted durable response to the most recently presented UI/UX proposal. */
+    uiApproval?: UiApprovalResumeContext
   },
 ): Promise<JobExecutionResult> {
   assertCompatibleSystemCodexConfig()
@@ -4282,14 +4329,22 @@ export async function executeCodexJob(
           processNonce,
         ],
       } : undefined
-      const browserMcp = testCodexBin === undefined && job.writeEnabled
-        && process.platform === 'darwin' && stage !== 'prepare' && stage !== 'interjection'
+      const browserEnabled = testCodexBin === undefined && job.writeEnabled
+        && process.platform === 'darwin' && stage !== 'interjection'
+      const browserReceiptKey = browserEnabled ? randomBytes(32).toString('hex') : undefined
+      const browserReceiptKeyPath = browserEnabled
+        ? join(runtimeDir, 'browser-receipt-key')
+        : undefined
+      if (browserReceiptKeyPath && browserReceiptKey) {
+        atomicWritePrivateFile(browserReceiptKeyPath, `${browserReceiptKey}\n`)
+      }
+      const browserMcp = browserEnabled
         ? {
             command: realpathSync(process.execPath),
             args: [
               '--config=/dev/null', '--no-env-file', browserBrokerPath,
               logicalAttempt.contextPath, managedStateDir, artifactDir, scratchDir,
-              stage,
+              stage, browserReceiptKeyPath!,
             ],
           }
         : undefined
@@ -4321,6 +4376,8 @@ export async function executeCodexJob(
         reviewRound,
         advisorEnabled: advisorMcp !== undefined,
         browserEnabled: browserMcp !== undefined,
+        browserReceiptKey,
+        browserReceiptKeyPath,
         permissionProfile,
         permissionOverrides,
         seatbeltFingerprint,
@@ -4339,6 +4396,8 @@ export async function executeCodexJob(
         ),
       }
     } catch (error) {
+      const runtimeDir = advisorRuntimeDirForJob(stateDir, job.id, processNonce)
+      rmSync(join(runtimeDir, 'browser-receipt-key'), { force: true })
       removeSeatbeltFingerprint(managedStateDir, seatbeltFingerprint)
       throw error
     }
@@ -4366,6 +4425,14 @@ export async function executeCodexJob(
     } else options.subscriptionLoginCheckForTesting?.()
     if (herdrRuntime) await verifyHerdrRuntimeIdentityAsync(herdrRuntime)
     const advisorAttempt = prepareProcessAttempt(stage, reviewRound, boundInput)
+    const retireBrowserReceiptKey = (): void => {
+      const path = advisorAttempt.browserReceiptKeyPath
+      if (!path) return
+      rmSync(path, { force: true })
+      if (existsSync(path)) {
+        throw new CodexCleanupPendingError('browser receipt key could not be retired')
+      }
+    }
     const retireUnregisteredAttempt = async (label: string): Promise<void> => {
       try {
         await reapSeatbeltFingerprint({
@@ -4374,6 +4441,7 @@ export async function executeCodexJob(
           earliest: advisorAttempt.fingerprintEarliest,
           excludePids: new Set([process.pid]),
         })
+        retireBrowserReceiptKey()
         removeSeatbeltFingerprint(managedStateDir, advisorAttempt.seatbeltFingerprint)
       } catch (cleanupError) {
         throw new CodexCleanupPendingError(`${label} cleanup is unconfirmed: ${cleanupError}`)
@@ -4693,6 +4761,7 @@ export async function executeCodexJob(
       if (existsSync(registrationPath)) {
         throw new CodexCleanupPendingError('Codex executor登録を消去できません')
       }
+      retireBrowserReceiptKey()
       removeSeatbeltFingerprint(managedStateDir, advisorAttempt.seatbeltFingerprint)
     }
     const retireCompletedRegistration = async (): Promise<void> => {
@@ -5379,6 +5448,10 @@ export async function executeCodexJob(
                 advisorAttempt.attemptNonce,
                 artifactDir,
                 advisorAttempt.browserEnabled,
+                options.uiApproval,
+                Boolean(options.uiApproval
+                  && options.uiApproval.repositoryDigest
+                    !== advisorAttempt.initialRepositoryDigest),
               ),
             phaseClientUserMessageId ?? job.idempotencyKey,
             {
@@ -5983,6 +6056,8 @@ export async function executeCodexJob(
         advisorContextDigest: advisorAttempt.contextDigest,
         initialRepositoryDigest: advisorAttempt.initialRepositoryDigest,
         advisorPermissionOverrides: advisorAttempt.permissionOverrides,
+        browserReceiptKey: advisorAttempt.browserReceiptKey,
+        browserReceiptKeyPath: advisorAttempt.browserReceiptKeyPath,
         seatbeltFingerprint: advisorAttempt.seatbeltFingerprint,
         retireCompletedRegistration,
         retireCancelledRegistration,
@@ -6308,6 +6383,8 @@ export async function executeCodexJob(
       advisorContextDigest: advisorAttempt.contextDigest,
       initialRepositoryDigest: advisorAttempt.initialRepositoryDigest,
       advisorPermissionOverrides: advisorAttempt.permissionOverrides,
+      browserReceiptKey: advisorAttempt.browserReceiptKey,
+      browserReceiptKeyPath: advisorAttempt.browserReceiptKeyPath,
       seatbeltFingerprint: advisorAttempt.seatbeltFingerprint,
       retireCompletedRegistration,
       retireCancelledRegistration,
@@ -6562,13 +6639,30 @@ export async function executeCodexJob(
         recordPhaseIdentity(execution)
         let finalInput = readAdvisorInputSnapshot(managedStateDir, job.id)
         let preparationError: unknown
+        let preparationDecision: ReturnType<typeof parseCodexPreparationDecision> | undefined
+        let currentRepositoryDigest: string | undefined
         try {
-          assertCodexPreparationReady(
+          preparationDecision = parseCodexPreparationDecision(
             execution.finalMessage,
             execution.advisorAttemptNonce,
             finalInput,
           )
-          const currentRepositoryDigest = advisorRepositoryDigest(
+          if (preparationDecision.kind === 'approval-required') {
+            if (!execution.browserReceiptKey) {
+              throw new Error(
+                'UI/UX approval proposal omitted authenticated browser capture receipts',
+              )
+            }
+            verifyUiApprovalBrowserReceipts({
+              key: execution.browserReceiptKey,
+              jobId: job.id,
+              attemptNonce: execution.advisorAttemptNonce,
+              outbox: artifactDir,
+              beforePath: preparationDecision.proposal.beforePath,
+              afterPath: preparationDecision.proposal.afterPath,
+            })
+          }
+          currentRepositoryDigest = advisorRepositoryDigest(
             snapshotAdvisorRepository(advisorProjectLayout),
           )
           if (options.phaseGateForTesting) {
@@ -6605,6 +6699,13 @@ export async function executeCodexJob(
               revalidate: revalidateCodexExecutable,
             })
           }
+          if (preparationDecision.kind === 'ready' && options.uiApproval) {
+            assertUiApprovalReadyMayProceed({
+              context: options.uiApproval,
+              currentInputRevision: finalInput.revision,
+              currentRepositoryDigest,
+            })
+          }
         } catch (error) {
           preparationError = error
         } finally {
@@ -6620,6 +6721,18 @@ export async function executeCodexJob(
           continue
         }
         if (preparationError) throw preparationError
+        if (!preparationDecision || !currentRepositoryDigest) {
+          throw new Error('Codex preparation decision is unavailable')
+        }
+        if (preparationDecision.kind === 'approval-required') {
+          throw new CodexUiApprovalRequiredError({
+            ...preparationDecision.proposal,
+            sessionId: sessionId!,
+            inputRevision: finalInput.revision,
+            inputDigest: finalInput.digest,
+            repositoryDigest: currentRepositoryDigest,
+          })
+        }
         preparedInput = finalInput
         phaseSequence += 1
         nextStage = implementedInputDigest === activeWriteInputDigest(finalInput)
@@ -7269,6 +7382,7 @@ async function verifyCodexConfig(inheritProcessGroup = false): Promise<void> {
           result: null, lastError: null, createdAt: Date.now(), startedAt: Date.now(), finishedAt: null,
           controlEpoch: 1, acceptsControl: true, executorNonce: null,
           activeThreadId: null, activeTurnId: null, cancelRequestedAt: null,
+          uiApprovalRequestId: null,
           terminalOutcome: null,
         }
         const artifactDir = ensureManagedDirectory(stateDir, artifactDirForJob(stateDir, probe.id))

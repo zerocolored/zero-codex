@@ -106,6 +106,12 @@ import {
   writePinnedHerdrRuntime,
 } from './herdr-runtime.ts'
 import { isSlackInterruptCommand } from './live-control.ts'
+import {
+  CodexUiApprovalRequiredError,
+  isExplicitUiApprovalResponse,
+  reencodeUiApprovalImages,
+  type UiApprovalResumeContext,
+} from './ui-approval.ts'
 import { resolveAdvisorProjectLayout } from './advisor-snapshot.ts'
 import { acknowledgeServiceControlPauseIfRequested } from './service-control-state.ts'
 
@@ -218,6 +224,7 @@ export interface LiveControlTarget {
   epoch: number
   repoPath: string
   writeEnabled: boolean
+  awaitingUiApproval?: boolean
 }
 
 /** An active Slack thread is the live-control authority, including replies from other senders. */
@@ -445,6 +452,7 @@ export interface JobRecord {
   activeTurnId: string | null
   cancelRequestedAt: number | null
   terminalOutcome: JobTerminalOutcome | null
+  uiApprovalRequestId: string | null
 }
 
 type JobRow = {
@@ -483,6 +491,32 @@ type JobRow = {
   active_turn_id: string | null
   cancel_requested_at: number | null
   terminal_outcome: JobTerminalOutcome | null
+  ui_approval_request_id: string | null
+}
+
+type UiApprovalRequestRow = {
+  id: string
+  job_id: string
+  round: number
+  input_revision: number
+  input_digest: string
+  repository_digest: string
+  session_id: string
+  proposal_text: string
+  before_path: string
+  after_path: string
+  status: UiApprovalRequestRecord['status']
+  response_message_id: string | null
+  response_user_id: string | null
+  response_text: string | null
+  response_input_revision: number | null
+  response_explicit_approval: number | null
+  prompt_client_message_id: string
+  prompt_delivery_started_at: number | null
+  prompt_message_id: string | null
+  prompt_delivered_at: number | null
+  attempts: number
+  not_before: number | null
 }
 
 const JOB_SCHEMA = `
@@ -524,6 +558,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   ,active_turn_id TEXT
   ,cancel_requested_at INTEGER
   ,terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'failed', 'cancelled'))
+  ,ui_approval_request_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status_seq ON jobs(status, seq);
 CREATE INDEX IF NOT EXISTS idx_jobs_thread_seq ON jobs(chat_id, thread_ts, seq);
@@ -675,6 +710,37 @@ CREATE TABLE IF NOT EXISTS artifact_deliveries (
   PRIMARY KEY (job_id, artifact_path),
   FOREIGN KEY (job_id) REFERENCES jobs(id)
 );
+CREATE TABLE IF NOT EXISTS ui_approval_requests (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  round INTEGER NOT NULL CHECK (round > 0),
+  input_revision INTEGER NOT NULL CHECK (input_revision > 0),
+  input_digest TEXT NOT NULL,
+  repository_digest TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  proposal_text TEXT NOT NULL,
+  before_path TEXT NOT NULL,
+  after_path TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('publishing', 'awaiting', 'responded', 'superseded', 'cancelled')),
+  response_message_id TEXT,
+  response_user_id TEXT,
+  response_text TEXT,
+  response_input_revision INTEGER,
+  response_explicit_approval INTEGER CHECK (response_explicit_approval IS NULL OR response_explicit_approval IN (0, 1)),
+  prompt_client_message_id TEXT NOT NULL,
+  prompt_delivery_started_at INTEGER,
+  prompt_message_id TEXT,
+  prompt_delivered_at INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  not_before INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  responded_at INTEGER,
+  UNIQUE (job_id, round),
+  FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_ui_approval_requests_pending
+  ON ui_approval_requests(status, not_before, created_at);
 CREATE TABLE IF NOT EXISTS update_request_ledger (
   idempotency_key TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL
@@ -946,6 +1012,7 @@ function ensureJobSchemaMigrations(db: Database): void {
       'terminal_outcome',
       "TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'failed', 'cancelled'))",
     ],
+    ['ui_approval_request_id', 'TEXT'],
   ] as const) {
     const current = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
     if (current.some(column => column.name === name)) continue
@@ -956,6 +1023,44 @@ function ensureJobSchemaMigrations(db: Database): void {
       if (!migrated.some(column => column.name === name)) throw error
     }
   }
+  for (const [name, definition] of [
+    ['prompt_client_message_id', "TEXT NOT NULL DEFAULT ''"],
+    ['prompt_delivery_started_at', 'INTEGER'],
+    ['prompt_message_id', 'TEXT'],
+  ] as const) {
+    const current = db.query<{ name: string }, []>(
+      'PRAGMA table_info(ui_approval_requests)',
+    ).all()
+    if (current.some(column => column.name === name)) continue
+    try {
+      db.exec(`ALTER TABLE ui_approval_requests ADD COLUMN ${name} ${definition}`)
+    } catch (error) {
+      const migrated = db.query<{ name: string }, []>(
+        'PRAGMA table_info(ui_approval_requests)',
+      ).all()
+      if (!migrated.some(column => column.name === name)) throw error
+    }
+  }
+  const legacyUiApprovalPrompts = db.query<{ id: string }, []>(
+    "SELECT id FROM ui_approval_requests WHERE prompt_client_message_id = ''",
+  ).all()
+  for (const row of legacyUiApprovalPrompts) {
+    db.run(
+      'UPDATE ui_approval_requests SET prompt_client_message_id = ? WHERE id = ?',
+      [slackClientMessageId(`ui-approval:${row.id}`, 0), row.id],
+    )
+  }
+  // Older versions persisted only a local delivery timestamp. Re-enter the
+  // publish reconciliation path so the stable client_msg_id can be located in
+  // Slack before any response is treated as explicit approval.
+  db.run(
+    `UPDATE ui_approval_requests
+     SET status = 'publishing', prompt_delivered_at = NULL,
+         response_explicit_approval = CASE
+           WHEN response_message_id IS NULL THEN NULL ELSE 0
+         END
+     WHERE prompt_message_id IS NULL AND status IN ('awaiting', 'responded')`,
+  )
   const migrateCodexSessionUsageLedger = db.transaction(() => {
     if (db.query<{ present: number }, []>(
       "SELECT 1 AS present FROM migration_ledger WHERE name = 'codex-session-usage-ledger-v1'",
@@ -1433,6 +1538,36 @@ function mapRow(row: JobRow): JobRecord {
     activeTurnId: row.active_turn_id,
     cancelRequestedAt: row.cancel_requested_at,
     terminalOutcome: row.terminal_outcome,
+    uiApprovalRequestId: row.ui_approval_request_id,
+  }
+}
+
+function mapUiApprovalRequest(row: UiApprovalRequestRow): UiApprovalRequestRecord {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    round: row.round,
+    inputRevision: row.input_revision,
+    inputDigest: row.input_digest,
+    repositoryDigest: row.repository_digest,
+    sessionId: row.session_id,
+    proposalText: row.proposal_text,
+    beforePath: row.before_path,
+    afterPath: row.after_path,
+    status: row.status,
+    responseMessageId: row.response_message_id,
+    responseUserId: row.response_user_id,
+    responseText: row.response_text,
+    responseInputRevision: row.response_input_revision,
+    responseExplicitApproval: row.response_explicit_approval === null
+      ? null
+      : row.response_explicit_approval === 1,
+    promptClientMessageId: row.prompt_client_message_id,
+    promptDeliveryStartedAt: row.prompt_delivery_started_at,
+    promptMessageId: row.prompt_message_id,
+    promptDeliveredAt: row.prompt_delivered_at,
+    attempts: row.attempts,
+    notBefore: row.not_before,
   }
 }
 
@@ -3262,12 +3397,17 @@ export class JobStore {
       control_epoch: number
       repo_path: string
       write_enabled: number
+      ui_approval_request_id: string | null
     }, [string, string]>(
-      `SELECT id, control_epoch, repo_path, write_enabled FROM jobs
+      `SELECT id, control_epoch, repo_path, write_enabled, ui_approval_request_id FROM jobs
        WHERE runtime = 'codex' AND chat_id = ? AND thread_ts = ?
          AND accepts_control = 1 AND control_epoch > 0
          AND status IN ('running', 'queued')
-       ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, seq ASC
+       ORDER BY CASE
+         WHEN ui_approval_request_id IS NOT NULL THEN 0
+         WHEN status = 'running' THEN 1
+         ELSE 2
+       END, seq ASC
        LIMIT 1`,
     ).get(chatId, threadTs))
     return row ? {
@@ -3275,6 +3415,7 @@ export class JobStore {
       epoch: row.control_epoch,
       repoPath: row.repo_path,
       writeEnabled: row.write_enabled === 1,
+      ...(row.ui_approval_request_id !== null ? { awaitingUiApproval: true } : {}),
     } : null
   }
 
@@ -3293,12 +3434,17 @@ export class JobStore {
       control_epoch: number
       repo_path: string
       write_enabled: number
+      ui_approval_request_id: string | null
     }, [string, string]>(
-      `SELECT id, control_epoch, repo_path, write_enabled FROM jobs
+      `SELECT id, control_epoch, repo_path, write_enabled, ui_approval_request_id FROM jobs
        WHERE runtime = 'codex' AND chat_id = ? AND thread_ts = ?
          AND control_epoch > 0 AND cancel_requested_at IS NULL
          AND status IN ('running', 'queued')
-       ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, seq ASC
+       ORDER BY CASE
+         WHEN ui_approval_request_id IS NOT NULL THEN 0
+         WHEN status = 'running' THEN 1
+         ELSE 2
+       END, seq ASC
        LIMIT 1`,
     ).get(chatId, threadTs))
     return row ? {
@@ -3306,6 +3452,7 @@ export class JobStore {
       epoch: row.control_epoch,
       repoPath: row.repo_path,
       writeEnabled: row.write_enabled === 1,
+      ...(row.ui_approval_request_id !== null ? { awaitingUiApproval: true } : {}),
     } : null
   }
 
@@ -3345,9 +3492,11 @@ export class JobStore {
         repo_path: string
         write_enabled: number
         cancel_requested_at: number | null
+        ui_approval_request_id: string | null
       }, [string]>(
         `SELECT accepts_control, control_epoch, input_revision, chat_id, thread_ts, status, started_at,
-                monitor_state, repo_path, write_enabled, cancel_requested_at
+                monitor_state, repo_path, write_enabled, cancel_requested_at,
+                ui_approval_request_id
          FROM jobs WHERE id = ? AND runtime = 'codex'`,
       ).get(jobId)
       if (!target || target.control_epoch !== epoch
@@ -3399,13 +3548,25 @@ export class JobStore {
           [jobId, epoch],
         )
         const closed = this.db.run(
-          `UPDATE jobs SET accepts_control = 0,
+          `UPDATE jobs SET accepts_control = 0, ui_approval_request_id = NULL,
              cancel_requested_at = COALESCE(cancel_requested_at, ?)
            WHERE id = ? AND control_epoch = ? AND cancel_requested_at IS NULL
              AND status IN ('running', 'queued')`,
           [now, jobId, epoch],
         )
         if (closed.changes !== 1) return 'closed'
+        if (target.ui_approval_request_id) {
+          this.db.run(
+            `UPDATE ui_approval_requests SET status = 'cancelled', responded_at = COALESCE(responded_at, ?)
+             WHERE id = ? AND job_id = ? AND status IN ('publishing', 'awaiting')`,
+            [now, target.ui_approval_request_id, jobId],
+          )
+          this.settleUiApprovalArtifactsForTerminal(
+            jobId,
+            now,
+            'UI/UX approval publication was cancelled by a Slack interrupt',
+          )
+        }
       } else {
         const advanced = this.db.run(
           `UPDATE jobs SET input_revision = input_revision + 1
@@ -3468,6 +3629,53 @@ export class JobStore {
              AND status IN ('ready', 'paused', 'answer-prepared')`,
           [snapshot.revision, snapshot.digest, jobId, epoch],
         )
+        if (target.ui_approval_request_id) {
+          const prompt = this.db.query<{
+            prompt_message_id: string | null
+          }, [string, string]>(
+            `SELECT prompt_message_id FROM ui_approval_requests
+             WHERE id = ? AND job_id = ? AND status IN ('publishing', 'awaiting')`,
+          ).get(target.ui_approval_request_id, jobId)
+          if (!prompt) {
+            throw new Error('UI/UX approval request disappeared before its response was staged')
+          }
+          const explicitApproval = isExplicitUiApprovalResponse(
+            task,
+            attachments.length > 0,
+          ) && prompt.prompt_message_id !== null
+            && slackMessageIsAfter(messageId, prompt.prompt_message_id)
+          // While the prompt is still being published, more than one Slack
+          // reply can be durably drained before the remote prompt receipt is
+          // recorded. Keep the latest reply instead of binding this update to
+          // the proposal's original input revision and discarding later input.
+          const responded = this.db.run(
+            `UPDATE ui_approval_requests
+             SET response_message_id = ?, response_user_id = ?, response_text = ?,
+                 response_input_revision = ?,
+                 response_explicit_approval = CASE
+                   WHEN prompt_message_id IS NULL THEN 0 ELSE ?
+                 END,
+                 responded_at = ?,
+                 status = CASE WHEN prompt_message_id IS NULL THEN 'publishing' ELSE 'responded' END
+             WHERE id = ? AND job_id = ? AND status IN ('publishing', 'awaiting')`,
+            [
+              messageId, userId, task, snapshot.revision, explicitApproval ? 1 : 0, now,
+              target.ui_approval_request_id, jobId,
+            ],
+          )
+          if (responded.changes !== 1) {
+            throw new Error('UI/UX approval response no longer matches the active proposal')
+          }
+          this.db.run(
+            `UPDATE jobs SET ui_approval_request_id = NULL
+             WHERE id = ? AND ui_approval_request_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM ui_approval_requests
+                 WHERE id = ? AND status = 'responded'
+               )`,
+            [jobId, target.ui_approval_request_id, target.ui_approval_request_id],
+          )
+        }
       }
       if (input.kind === 'interrupt' && input.notifyAccepted) {
         this.stageStatusNotificationRow({
@@ -3532,16 +3740,18 @@ export class JobStore {
         write_enabled: number
         task: string
         attachments_json: string
+        ui_approval_request_id: string | null
       }, [string]>(
         `SELECT accepts_control, control_epoch, input_revision, chat_id, thread_ts,
                 status, cancel_requested_at, id, message_id, user_id, write_enabled,
-                task, attachments_json
+                task, attachments_json, ui_approval_request_id
          FROM jobs WHERE id = ? AND runtime = 'codex'`,
       ).get(jobId)
       if (!target || target.control_epoch !== epoch
         || target.chat_id !== chatId || target.thread_ts !== threadTs
         || !(target.status === 'running' || target.status === 'queued')
         || target.accepts_control !== 1 || target.cancel_requested_at !== null) return 'closed'
+      if (target.ui_approval_request_id !== null) return 'closed'
       const snapshotControls = this.db.query<{
         input_revision: number
         message_id: string
@@ -3587,6 +3797,25 @@ export class JobStore {
       return 'staged'
     })
     return retrySqlite(() => stage.immediate())
+  }
+
+  /** Route a human same-thread reply through the current durable wait state. */
+  stageThreadReply(
+    expected: LiveControlTarget,
+    input: Omit<LiveControlInput, 'kind'>,
+  ): 'staged' | 'duplicate' | 'closed' {
+    let target: LiveControlTarget | null = expected
+    for (let attempt = 0; attempt < 2 && target; attempt += 1) {
+      const disposition = target.awaitingUiApproval
+        ? this.stageLiveControl(target, { ...input, kind: 'steer' })
+        : this.stageLiveInterjection(target, input)
+      if (disposition !== 'closed') return disposition
+      const refreshed = this.liveControlTarget(input.chatId, input.threadTs)
+      if (!refreshed || refreshed.jobId !== expected.jobId || refreshed.epoch !== expected.epoch
+        || refreshed.awaitingUiApproval === target.awaitingUiApproval) return 'closed'
+      target = refreshed
+    }
+    return 'closed'
   }
 
   listJobInterjections(jobIdInput: string): JobInterjectionRecord[] {
@@ -5208,7 +5437,20 @@ export class JobStore {
       cancel_requested_at: number | null
     }, []>(
       `SELECT not_before, cancel_requested_at FROM jobs
-       WHERE runtime = 'codex' AND status = 'queued'
+       WHERE runtime = 'codex' AND status = 'queued' AND ui_approval_request_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM inbound_deliveries AS inbound
+           WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM jobs AS approval_wait
+           WHERE approval_wait.runtime = 'codex'
+             AND approval_wait.chat_id = jobs.chat_id
+             AND approval_wait.thread_ts = jobs.thread_ts
+             AND approval_wait.status = 'queued'
+             AND approval_wait.ui_approval_request_id IS NOT NULL
+             AND approval_wait.seq < jobs.seq
+         )
        ORDER BY seq ASC LIMIT 1`,
     ).get()
     return head && (head.cancel_requested_at !== null
@@ -5222,7 +5464,20 @@ export class JobStore {
       cancel_requested_at: number | null
     }, []>(
       `SELECT id, not_before, cancel_requested_at FROM jobs
-       WHERE runtime = 'codex' AND status = 'queued'
+       WHERE runtime = 'codex' AND status = 'queued' AND ui_approval_request_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM inbound_deliveries AS inbound
+           WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM jobs AS approval_wait
+           WHERE approval_wait.runtime = 'codex'
+             AND approval_wait.chat_id = jobs.chat_id
+             AND approval_wait.thread_ts = jobs.thread_ts
+             AND approval_wait.status = 'queued'
+             AND approval_wait.ui_approval_request_id IS NOT NULL
+             AND approval_wait.seq < jobs.seq
+         )
        ORDER BY seq ASC LIMIT 1`,
     ).get()
     return head && (head.cancel_requested_at !== null
@@ -5247,6 +5502,20 @@ export class JobStore {
         `SELECT * FROM jobs
          WHERE runtime = 'codex'
            AND status = 'queued'
+           AND ui_approval_request_id IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM inbound_deliveries AS inbound
+             WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM jobs AS approval_wait
+             WHERE approval_wait.runtime = 'codex'
+               AND approval_wait.chat_id = jobs.chat_id
+               AND approval_wait.thread_ts = jobs.thread_ts
+               AND approval_wait.status = 'queued'
+               AND approval_wait.ui_approval_request_id IS NOT NULL
+               AND approval_wait.seq < jobs.seq
+           )
          ORDER BY seq ASC
          LIMIT 1`,
       ).get()
@@ -5328,7 +5597,7 @@ export class JobStore {
              active_thread_id = NULL,
              active_turn_id = NULL,
              terminal_outcome = NULL
-         WHERE id = ? AND status = 'queued'`,
+         WHERE id = ? AND status = 'queued' AND ui_approval_request_id IS NULL`,
         [sessionId, resumed ? 1 : 0, claimingWorkerId, claimAt, row.id],
       )
       if (update.changes !== 1) return null
@@ -5364,6 +5633,7 @@ export class JobStore {
              not_before = NULL, executor_pid = NULL,
              accepts_control = 0, executor_nonce = NULL,
              active_thread_id = NULL, active_turn_id = NULL,
+             ui_approval_request_id = NULL,
              terminal_outcome = 'completed',
              finished_at = ?
          WHERE id = ? AND runtime = 'codex' AND status = 'running'
@@ -5383,6 +5653,11 @@ export class JobStore {
         [persistedSessionId, result, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer running: ' + id)
+      this.db.run(
+        `UPDATE ui_approval_requests SET status = 'superseded'
+         WHERE job_id = ? AND status IN ('publishing', 'awaiting', 'responded')`,
+        [id],
+      )
       this.supersedeLifecycleNotifications(id, finishedAt)
       this.db.run(
         `INSERT INTO terminal_notifications (
@@ -5566,7 +5841,9 @@ export class JobStore {
   retireMonitorObligation(id: string): void {
     retrySqlite(() => this.db.run(
       `UPDATE jobs SET monitor_state = 0
-       WHERE id = ? AND runtime = 'codex' AND status IN ('completed', 'failed')`,
+       WHERE id = ? AND runtime = 'codex'
+         AND (status IN ('completed', 'failed')
+           OR (status = 'queued' AND ui_approval_request_id IS NOT NULL))`,
       [id],
     ))
   }
@@ -5879,6 +6156,24 @@ export class JobStore {
     void now
   }
 
+  private settleUiApprovalArtifactsForTerminal(
+    jobId: string,
+    now: number,
+    reason: string,
+  ): number {
+    return this.db.run(
+      `UPDATE artifact_deliveries
+       SET abandoned_at = COALESCE(abandoned_at, ?), last_error = COALESCE(last_error, ?)
+       WHERE job_id = ? AND delivered_at IS NULL AND abandoned_at IS NULL
+         AND artifact_path IN (
+           SELECT before_path FROM ui_approval_requests WHERE job_id = ?
+           UNION
+           SELECT after_path FROM ui_approval_requests WHERE job_id = ?
+         )`,
+      [now, reason.slice(0, 4_000), jobId, jobId, jobId],
+    ).changes
+  }
+
   fail(id: string, error: string): void {
     const fail = this.db.transaction(() => {
       const finishedAt = Date.now()
@@ -5888,12 +6183,23 @@ export class JobStore {
              pending_session_id = NULL, pending_result = NULL,
              accepts_control = 0, executor_nonce = NULL,
              active_thread_id = NULL, active_turn_id = NULL,
+             ui_approval_request_id = NULL,
              terminal_outcome = 'failed',
              last_error = ?, finished_at = ?
          WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
         [error, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer running: ' + id)
+      this.db.run(
+        `UPDATE ui_approval_requests SET status = 'superseded'
+         WHERE job_id = ? AND status IN ('publishing', 'awaiting', 'responded')`,
+        [id],
+      )
+      this.settleUiApprovalArtifactsForTerminal(
+        id,
+        finishedAt,
+        'UI/UX approval publication was superseded by job failure',
+      )
       this.supersedeLifecycleNotifications(id, finishedAt)
       this.settleInterjectionsForTerminal(id, 'failed', finishedAt)
       this.db.run(
@@ -5920,6 +6226,7 @@ export class JobStore {
              pending_session_id = NULL, pending_result = NULL,
              accepts_control = 0, executor_nonce = NULL,
              active_thread_id = NULL, active_turn_id = NULL,
+             ui_approval_request_id = NULL,
              terminal_outcome = 'cancelled',
              last_error = ?, finished_at = ?
          WHERE id = ? AND runtime = 'codex' AND status = 'running'
@@ -5927,6 +6234,16 @@ export class JobStore {
         [message, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer cancellable: ' + id)
+      this.db.run(
+        `UPDATE ui_approval_requests SET status = 'cancelled'
+         WHERE job_id = ? AND status IN ('publishing', 'awaiting', 'responded')`,
+        [id],
+      )
+      this.settleUiApprovalArtifactsForTerminal(
+        id,
+        finishedAt,
+        'UI/UX approval publication was cancelled',
+      )
       this.supersedeLifecycleNotifications(id, finishedAt)
       this.settleInterjectionsForTerminal(id, 'cancelled', finishedAt)
       // `finishAppServerTurn` is the sole authority that can move an
@@ -5988,12 +6305,23 @@ export class JobStore {
              pending_session_id = NULL, pending_result = NULL,
              accepts_control = 0, executor_nonce = NULL,
              active_thread_id = NULL, active_turn_id = NULL,
+             ui_approval_request_id = NULL,
              terminal_outcome = 'failed',
              last_error = ?, finished_at = ?
          WHERE id = ? AND runtime = 'codex' AND status IN ('queued', 'running')`,
         [error, finishedAt, id],
       )
       if (updated.changes === 0) return false
+      this.db.run(
+        `UPDATE ui_approval_requests SET status = 'superseded'
+         WHERE job_id = ? AND status IN ('publishing', 'awaiting', 'responded')`,
+        [id],
+      )
+      this.settleUiApprovalArtifactsForTerminal(
+        id,
+        finishedAt,
+        'UI/UX approval publication was superseded after monitor loss',
+      )
       this.supersedeLifecycleNotifications(id, finishedAt)
       this.settleInterjectionsForTerminal(id, 'failed', finishedAt)
       this.db.run(
@@ -7150,6 +7478,7 @@ export class JobStore {
              completed_at = MAX(completed_at, excluded.completed_at)`,
           [row.idempotency_key, row.write_enabled, row.finished_at],
         )
+        this.db.run('DELETE FROM ui_approval_requests WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM artifact_deliveries WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM progress_probes WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM lifecycle_notifications WHERE job_id = ?', [row.id])
@@ -7289,6 +7618,355 @@ export class JobStore {
     }
   }
 
+  uiApprovalRequest(idInput: string): UiApprovalRequestRecord | null {
+    const row = this.db.query<UiApprovalRequestRow, [string]>(
+      `SELECT id, job_id, round, input_revision, input_digest, repository_digest,
+              session_id, proposal_text, before_path, after_path, status,
+              response_message_id, response_user_id, response_text,
+              response_input_revision, response_explicit_approval,
+              prompt_client_message_id, prompt_delivery_started_at, prompt_message_id,
+              prompt_delivered_at, attempts, not_before
+       FROM ui_approval_requests WHERE id = ?`,
+    ).get(requireText(idInput, 'UI approval request ID'))
+    return row ? mapUiApprovalRequest(row) : null
+  }
+
+  latestUiApprovalContext(jobIdInput: string): UiApprovalResumeContext | undefined {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const row = this.db.query<UiApprovalRequestRow, [string]>(
+      `SELECT id, job_id, round, input_revision, input_digest, repository_digest,
+              session_id, proposal_text, before_path, after_path, status,
+              response_message_id, response_user_id, response_text,
+              response_input_revision, response_explicit_approval,
+              prompt_client_message_id, prompt_delivery_started_at, prompt_message_id,
+              prompt_delivered_at, attempts, not_before
+       FROM ui_approval_requests
+       WHERE job_id = ? AND status = 'responded'
+         AND response_message_id IS NOT NULL AND response_text IS NOT NULL
+         AND response_input_revision IS NOT NULL AND response_explicit_approval IS NOT NULL
+       ORDER BY round DESC LIMIT 1`,
+    ).get(jobId)
+    if (!row || row.response_message_id === null || row.response_text === null
+      || row.response_input_revision === null || row.response_explicit_approval === null) {
+      return undefined
+    }
+    return {
+      requestId: row.id,
+      requestInputRevision: row.input_revision,
+      requestInputDigest: row.input_digest,
+      responseInputRevision: row.response_input_revision,
+      responseMessageId: row.response_message_id,
+      responseText: row.response_text,
+      explicitApproval: row.response_explicit_approval === 1,
+      repositoryDigest: row.repository_digest,
+    }
+  }
+
+  parkForUiApproval(input: {
+    jobId: string
+    sessionId: string
+    inputRevision: number
+    inputDigest: string
+    repositoryDigest: string
+    proposalText: string
+    beforePath: string
+    afterPath: string
+  }): string {
+    const jobId = requireText(input.jobId, 'jobId')
+    const sessionId = requireText(input.sessionId, 'sessionId')
+    const proposalText = requireText(input.proposalText, 'UI approval proposal')
+      .slice(0, SLACK_CHUNK_CHARS - 160)
+    if (!Number.isSafeInteger(input.inputRevision) || input.inputRevision < 1
+      || !/^[0-9a-f]{64}$/.test(input.inputDigest)
+      || !/^[0-9a-f]{64}$/.test(input.repositoryDigest)
+      || !isAbsolute(input.beforePath) || !isAbsolute(input.afterPath)
+      || input.beforePath === input.afterPath) {
+      throw new Error('UI approval request binding is invalid')
+    }
+    const park = this.db.transaction(() => {
+      const job = this.db.query<{
+        input_revision: number
+        session_id: string | null
+        ui_approval_request_id: string | null
+        chat_id: string
+        thread_ts: string
+        status: JobStatus
+        cancel_requested_at: number | null
+      }, [string]>(
+        `SELECT input_revision, session_id, ui_approval_request_id, chat_id, thread_ts,
+                status, cancel_requested_at
+         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+      ).get(jobId)
+      if (!job) {
+        throw new Error('job disappeared before its UI/UX proposal could be parked')
+      }
+      if (job.cancel_requested_at !== null) {
+        throw new UiApprovalParkingRaceError('cancelled')
+      }
+      if (job.status !== 'running' || job.input_revision !== input.inputRevision) {
+        throw new UiApprovalParkingRaceError('input-changed')
+      }
+      if (job.session_id !== sessionId || job.ui_approval_request_id !== null) {
+        throw new Error('job changed before its UI/UX proposal could be parked')
+      }
+      if (this.writePhaseMayHaveBeenDelivered(jobId)) {
+        throw new Error('UI/UX approval cannot be requested after implementation may have started')
+      }
+      const pending = this.db.query<{ present: number }, [string, string, string]>(
+        `SELECT 1 AS present FROM inbound_deliveries
+         WHERE chat_id = ? AND thread_ts = ?
+         UNION ALL
+         SELECT 1 FROM job_interjections
+         WHERE job_id = ? AND status NOT IN ('promoted', 'superseded')
+         LIMIT 1`,
+      ).get(job.chat_id, job.thread_ts, jobId)
+      if (pending) throw new UiApprovalParkingRaceError('input-changed')
+      const round = (this.db.query<{ round: number }, [string]>(
+        'SELECT COALESCE(MAX(round), 0) + 1 AS round FROM ui_approval_requests WHERE job_id = ?',
+      ).get(jobId)?.round ?? 1)
+      const requestId = randomUUID()
+      const now = Date.now()
+      this.db.run(
+        `UPDATE ui_approval_requests SET status = 'superseded'
+         WHERE job_id = ? AND status = 'responded'`,
+        [jobId],
+      )
+      this.db.run(
+        `INSERT INTO ui_approval_requests (
+           id, job_id, round, input_revision, input_digest, repository_digest,
+           session_id, proposal_text, before_path, after_path, status,
+           prompt_client_message_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publishing', ?, ?)`,
+        [
+          requestId, jobId, round, input.inputRevision, input.inputDigest,
+          input.repositoryDigest, sessionId, proposalText,
+          input.beforePath, input.afterPath,
+          slackClientMessageId(`ui-approval:${requestId}`, 0), now,
+        ],
+      )
+      for (const path of [input.beforePath, input.afterPath]) {
+        this.db.run(
+          `INSERT INTO artifact_deliveries (job_id, artifact_path)
+           VALUES (?, ?) ON CONFLICT(job_id, artifact_path) DO NOTHING`,
+          [jobId, path],
+        )
+      }
+      const updated = this.db.run(
+        `UPDATE jobs
+         SET status = 'queued', worker_id = NULL, started_at = NULL,
+             executor_pid = NULL, pending_session_id = NULL, pending_result = NULL,
+             not_before = NULL, finished_at = NULL, last_error = NULL,
+             accepts_control = 1, executor_nonce = NULL,
+             active_thread_id = NULL, active_turn_id = NULL,
+             ui_approval_request_id = ?
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND input_revision = ? AND session_id = ? AND cancel_requested_at IS NULL`,
+        [requestId, jobId, input.inputRevision, sessionId],
+      )
+      if (updated.changes !== 1) throw new Error('job could not enter UI/UX approval wait')
+      this.supersedeLifecycleNotifications(jobId, now)
+      return requestId
+    })
+    return retrySqlite(() => park.immediate())
+  }
+
+  pendingUiApprovalNotifications(now = Date.now(), limit = 20): UiApprovalNotification[] {
+    const rows = this.db.query<UiApprovalRequestRow, [number, number]>(
+      `SELECT id, job_id, round, input_revision, input_digest, repository_digest,
+              session_id, proposal_text, before_path, after_path, status,
+              response_message_id, response_user_id, response_text,
+              response_input_revision, response_explicit_approval,
+              prompt_client_message_id, prompt_delivery_started_at, prompt_message_id,
+              prompt_delivered_at, attempts, not_before
+       FROM ui_approval_requests
+       WHERE status = 'publishing' AND (not_before IS NULL OR not_before <= ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM commentary_notifications AS commentary
+           WHERE commentary.job_id = ui_approval_requests.job_id
+             AND commentary.delivered_at IS NULL
+         )
+       ORDER BY created_at ASC LIMIT ?`,
+    ).all(now, limit)
+    return rows.flatMap(row => {
+      const job = this.get(row.job_id)
+      return job ? [{ id: row.id, jobId: row.job_id, job, request: mapUiApprovalRequest(row) }] : []
+    })
+  }
+
+  uiApprovalNotificationDeliverable(idInput: string): boolean {
+    return this.db.query<{ present: number }, [string]>(
+      `SELECT 1 AS present FROM ui_approval_requests
+       WHERE id = ? AND status = 'publishing'`,
+    ).get(requireText(idInput, 'UI approval request ID')) !== null
+  }
+
+  beginUiApprovalPromptDelivery(idInput: string): {
+    clientMessageId: string
+    messageId: string | null
+  } {
+    const id = requireText(idInput, 'UI approval request ID')
+    const begin = this.db.transaction(() => {
+      const now = Date.now()
+      const updated = this.db.run(
+        `UPDATE ui_approval_requests
+         SET prompt_delivery_started_at = COALESCE(prompt_delivery_started_at, ?)
+         WHERE id = ? AND status = 'publishing'`,
+        [now, id],
+      )
+      const row = this.db.query<{
+        prompt_client_message_id: string
+        prompt_message_id: string | null
+        status: UiApprovalRequestRecord['status']
+      }, [string]>(
+        `SELECT prompt_client_message_id, prompt_message_id, status
+         FROM ui_approval_requests WHERE id = ?`,
+      ).get(id)
+      if (!row || (!updated.changes && row.status !== 'publishing')) {
+        throw new Error(`UI approval prompt is no longer publishable: ${id}`)
+      }
+      if (!/^[0-9a-f-]{36}$/.test(row.prompt_client_message_id)) {
+        throw new Error(`UI approval prompt client message ID is invalid: ${id}`)
+      }
+      return {
+        clientMessageId: row.prompt_client_message_id,
+        messageId: row.prompt_message_id,
+      }
+    })
+    return retrySqlite(() => begin.immediate())
+  }
+
+  recordUiApprovalPromptDelivered(idInput: string, messageIdInput: string): void {
+    const id = requireText(idInput, 'UI approval request ID')
+    const messageId = requireText(messageIdInput, 'Slack UI approval prompt timestamp')
+    if (slackMessageOrdinal(messageId) === null) {
+      throw new Error('Slack UI approval prompt timestamp is invalid')
+    }
+    const record = this.db.transaction(() => {
+      const updated = this.db.run(
+        `UPDATE ui_approval_requests
+         SET prompt_message_id = ?, last_error = NULL
+         WHERE id = ? AND status = 'publishing'
+           AND prompt_delivery_started_at IS NOT NULL
+           AND (prompt_message_id IS NULL OR prompt_message_id = ?)`,
+        [messageId, id, messageId],
+      )
+      if (updated.changes === 1) return
+      const row = this.db.query<{ prompt_message_id: string | null }, [string]>(
+        'SELECT prompt_message_id FROM ui_approval_requests WHERE id = ?',
+      ).get(id)
+      if (row?.prompt_message_id !== messageId) {
+        throw new Error(`UI approval prompt receipt changed before persistence: ${id}`)
+      }
+    })
+    retrySqlite(() => record.immediate())
+  }
+
+  markUiApprovalPresented(idInput: string): void {
+    const id = requireText(idInput, 'UI approval request ID')
+    const present = this.db.transaction(() => {
+      const now = Date.now()
+      const updated = this.db.run(
+        `UPDATE ui_approval_requests
+         SET prompt_delivered_at = COALESCE(prompt_delivered_at, ?),
+             status = CASE WHEN response_message_id IS NULL THEN 'awaiting' ELSE 'responded' END,
+             not_before = NULL, last_error = NULL
+         WHERE id = ? AND status = 'publishing' AND prompt_message_id IS NOT NULL`,
+        [now, id],
+      )
+      if (updated.changes !== 1) {
+        const row = this.uiApprovalRequest(id)
+        if (row?.status === 'awaiting' || row?.status === 'responded') return
+        throw new Error(`UI approval request is no longer publishable: ${id}`)
+      }
+      this.db.run(
+        `UPDATE jobs SET ui_approval_request_id = NULL
+         WHERE ui_approval_request_id = ?
+           AND EXISTS (SELECT 1 FROM ui_approval_requests WHERE id = ? AND status = 'responded')`,
+        [id, id],
+      )
+    })
+    retrySqlite(() => present.immediate())
+  }
+
+  deferUiApprovalNotification(
+    idInput: string,
+    errorInput: string,
+    now = Date.now(),
+    retryMs = 30_000,
+  ): void {
+    this.db.run(
+      `UPDATE ui_approval_requests
+       SET attempts = attempts + 1, not_before = ?, last_error = ?
+       WHERE id = ? AND status = 'publishing'`,
+      [
+        now + Math.max(1, retryMs),
+        requireText(errorInput, 'UI approval notification error').slice(0, 4_000),
+        requireText(idInput, 'UI approval request ID'),
+      ],
+    )
+  }
+
+  failUiApprovalWait(idInput: string, errorInput: string): boolean {
+    const id = requireText(idInput, 'UI approval request ID')
+    const error = requireText(errorInput, 'UI approval terminal error').slice(0, 4_000)
+    const fail = this.db.transaction(() => {
+      const request = this.db.query<{ job_id: string }, [string]>(
+        `SELECT job_id FROM ui_approval_requests
+         WHERE id = ? AND status = 'publishing'`,
+      ).get(id)
+      if (!request) return false
+      const finishedAt = Date.now()
+      const updated = this.db.run(
+        `UPDATE jobs
+         SET status = 'failed', worker_id = NULL, not_before = NULL,
+             executor_pid = NULL, monitor_state = 0,
+             pending_session_id = NULL, pending_result = NULL,
+             accepts_control = 0, executor_nonce = NULL,
+             active_thread_id = NULL, active_turn_id = NULL,
+             ui_approval_request_id = NULL, terminal_outcome = 'failed',
+             last_error = ?, finished_at = ?
+         WHERE id = ? AND runtime = 'codex' AND status = 'queued'
+           AND ui_approval_request_id = ?`,
+        [error, finishedAt, request.job_id, id],
+      )
+      if (updated.changes !== 1) return false
+      this.db.run(
+        `UPDATE ui_approval_requests
+         SET status = 'cancelled', responded_at = COALESCE(responded_at, ?),
+             last_error = ?
+         WHERE id = ? AND status = 'publishing'`,
+        [finishedAt, error, id],
+      )
+      this.settleUiApprovalArtifactsForTerminal(
+        request.job_id,
+        finishedAt,
+        'UI/UX approval upload could not be confirmed within its retry budget',
+      )
+      this.supersedeLifecycleNotifications(request.job_id, finishedAt)
+      this.settleInterjectionsForTerminal(request.job_id, 'failed', finishedAt)
+      this.db.run(
+        `INSERT INTO terminal_notifications (
+           id, job_id, kind, payload, created_at
+         ) VALUES (?, ?, 'failed', ?, ?)
+         ON CONFLICT(job_id) DO UPDATE SET
+           kind = excluded.kind, payload = excluded.payload,
+           attempts = 0, not_before = NULL, last_error = NULL,
+           created_at = excluded.created_at, body_delivered_at = NULL,
+           reaction_delivered_at = NULL, delivered_at = NULL`,
+        [randomUUID(), request.job_id, error, finishedAt],
+      )
+      return true
+    })
+    return retrySqlite(() => fail.immediate())
+  }
+
+  uiApprovalIsWaiting(jobIdInput: string): boolean {
+    return this.db.query<{ present: number }, [string]>(
+      `SELECT 1 AS present FROM jobs
+       WHERE id = ? AND status = 'queued' AND ui_approval_request_id IS NOT NULL`,
+    ).get(requireText(jobIdInput, 'jobId')) !== null
+  }
+
   runningJobs(): JobRecord[] {
     return this.db.query<JobRow, []>(
       `SELECT * FROM jobs
@@ -7321,6 +7999,18 @@ export class JobStore {
     if (retrySqlite(() => requeue.immediate()) !== 1) {
       throw new Error(`job ${id} cannot be safely requeued after initial App Server delivery`)
     }
+  }
+
+  requeueAfterUiApprovalRace(id: string): void {
+    if (this.writePhaseMayHaveBeenDelivered(id)) {
+      throw new Error('UI/UX approval race occurred after implementation may have started')
+    }
+    const job = this.get(id)
+    if (!job || job.status !== 'running' || job.cancelRequestedAt !== null
+      || job.uiApprovalRequestId !== null || this.hasStagedExecution(id)) {
+      throw new Error(`job ${id} is not safely requeueable after UI/UX approval parking`)
+    }
+    this.requeue(id, 'new same-thread input arrived before UI/UX approval waiting began')
   }
 
   releaseUnstartedClaim(id: string, workerId: string, reason: string): boolean {
@@ -7531,6 +8221,38 @@ export interface JobExecutionResult {
   result: string
 }
 
+export interface UiApprovalRequestRecord {
+  id: string
+  jobId: string
+  round: number
+  inputRevision: number
+  inputDigest: string
+  repositoryDigest: string
+  sessionId: string
+  proposalText: string
+  beforePath: string
+  afterPath: string
+  status: 'publishing' | 'awaiting' | 'responded' | 'superseded' | 'cancelled'
+  responseMessageId: string | null
+  responseUserId: string | null
+  responseText: string | null
+  responseInputRevision: number | null
+  responseExplicitApproval: boolean | null
+  promptClientMessageId: string
+  promptDeliveryStartedAt: number | null
+  promptMessageId: string | null
+  promptDeliveredAt: number | null
+  attempts: number
+  notBefore: number | null
+}
+
+export interface UiApprovalNotification {
+  id: string
+  jobId: string
+  job: JobRecord
+  request: UiApprovalRequestRecord
+}
+
 export interface TerminalNotification {
   id: string
   jobId: string
@@ -7605,6 +8327,7 @@ export interface JobNotifier {
   completionReaction?(job: JobRecord, notificationId?: string, signal?: AbortSignal): Promise<void>
   failed?(job: JobRecord, error: string, notificationId?: string, signal?: AbortSignal): Promise<void>
   artifactsAbandoned?(job: JobRecord, error: string, notificationId?: string, signal?: AbortSignal): Promise<void>
+  uiApproval?(notification: UiApprovalNotification, signal?: AbortSignal): Promise<void>
   status?(notification: StatusNotification, signal?: AbortSignal): Promise<void>
   /** Wait until already-started lifecycle posts have either completed or reached their deadline. */
   settleLifecycleSideEffects?(): Promise<void>
@@ -7666,6 +8389,17 @@ export class ArtifactDeliveryAmbiguousError extends Error {
   }
 }
 
+export class UiApprovalParkingRaceError extends Error {
+  constructor(readonly disposition: 'input-changed' | 'cancelled') {
+    super(
+      disposition === 'cancelled'
+        ? 'UI/UX approval parking was overtaken by cancellation'
+        : 'UI/UX approval parking was overtaken by newer same-thread input',
+    )
+    this.name = 'UiApprovalParkingRaceError'
+  }
+}
+
 export function publicJobFailureSummary(error: string): string {
   if (error.includes('write-enabled')
     && (error.includes('effects are uncertain') || error.includes('may already have changed'))) {
@@ -7678,6 +8412,9 @@ export function publicJobFailureSummary(error: string): string {
   }
   if (error.includes('Herdr monitor') || error.includes('monitor viewer')) {
     return '進捗表示との接続を維持できませんでした。'
+  }
+  if (error.includes('UI/UX approval') || error.includes('承認用画像')) {
+    return 'Before／After画像をSlackへ確実に提示できませんでした。再度依頼してください。'
   }
   return '内部処理でエラーが発生しました。'
 }
@@ -7961,6 +8698,50 @@ export async function flushTerminalNotifications(
   }
 }
 
+export async function flushUiApprovalNotifications(
+  store: JobStore,
+  notifier: JobNotifier | undefined,
+  log: (message: string) => void,
+  retryMs = 30_000,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!notifier?.uiApproval) return
+  for (const notification of store.pendingUiApprovalNotifications()) {
+    if (signal?.aborted) return
+    if (!store.uiApprovalNotificationDeliverable(notification.id)) continue
+    try {
+      await notifier.uiApproval(notification, signal)
+      if (signal?.aborted) return
+      store.markUiApprovalPresented(notification.id)
+    } catch (error) {
+      if (signal?.aborted) return
+      const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof ArtifactDeliveryAmbiguousError) {
+        const exhausted = error.artifactPaths.filter(path => (
+          store.recordArtifactAmbiguityCheck(notification.job.id, path, message)
+            >= MAX_ARTIFACT_DELIVERY_ATTEMPTS
+        ))
+        if (exhausted.length > 0) {
+          const terminalError = 'UI/UX approval images could not be confirmed in Slack '
+            + `after ${MAX_ARTIFACT_DELIVERY_ATTEMPTS} checks`
+          store.failUiApprovalWait(notification.id, terminalError)
+          log(
+            `UI approval notification ${notification.id}: `
+            + `${exhausted.length} ambiguous attachment(s) exhausted and the wait was failed`,
+          )
+          continue
+        }
+      }
+      const backoff = Math.min(
+        retryMs * (2 ** Math.min(notification.request.attempts, 10)),
+        6 * 60 * 60 * 1000,
+      )
+      store.deferUiApprovalNotification(notification.id, message, Date.now(), backoff)
+      log(`UI approval notification ${notification.id} deferred: ${message}`)
+    }
+  }
+}
+
 export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunStats> {
   const pollMs = positiveInteger(options.pollMs, 1000)
   const maxJobsPerSession = positiveInteger(
@@ -7999,6 +8780,13 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           notificationController.signal,
         )
         await flushInterjectionNotifications(
+          options.store,
+          options.notifier,
+          log,
+          notificationRetryMs,
+          notificationController.signal,
+        )
+        await flushUiApprovalNotifications(
           options.store,
           options.notifier,
           log,
@@ -8112,6 +8900,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
     let progressActivatedAtMs = 0
     let unstartedMonitorClaimReleased = false
     let skipMonitorClose = false
+    let closeRequeuedUiApprovalMonitor = false
     const quiesceLifecycleBeforeStateChange = async (): Promise<void> => {
       progressReportsOpen = false
       // Commentary is synchronously staged by the executor before it returns,
@@ -8317,6 +9106,56 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       scheduleNotificationFlush()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof CodexUiApprovalRequiredError) {
+        try {
+          const current = options.store.get(job.id)
+          if (!current) throw new Error(`UI/UX approval job disappeared: ${job.id}`)
+          const parked = prepareUiApprovalForParking(
+            current,
+            error,
+            options.advisorStateDir ?? dirname(options.store.dbPath),
+          )
+          await updateMonitor(job, 'Before／AfterをSlackへ提示し、回答待ちに移ります')
+          await quiesceMonitorBeforeTerminal()
+          const requestId = options.store.parkForUiApproval({ jobId: job.id, ...parked })
+          log(`${workerId} parked ${job.id} for UI/UX approval request ${requestId}`)
+          scheduleNotificationFlush()
+          continue
+        } catch (approvalError) {
+          const approvalMessage = approvalError instanceof Error
+            ? approvalError.message
+            : String(approvalError)
+          if (approvalError instanceof UiApprovalParkingRaceError) {
+            const current = options.store.get(job.id)
+            if (approvalError.disposition === 'cancelled'
+              || current?.cancelRequestedAt != null) {
+              await runExternalContextBoundary(
+                options.cancelExternalContext
+                  ? () => options.cancelExternalContext!(job)
+                  : options.settleExternalContext
+                    ? () => options.settleExternalContext!(job)
+                    : undefined,
+                `advisor cancellation cleanup is pending for job ${job.id}`,
+              )
+              options.store.cancel(job.id)
+              stats.failed += 1
+              log(`${workerId} cancelled ${job.id} while entering UI/UX approval wait`)
+              scheduleNotificationFlush()
+              continue
+            }
+            options.store.requeueAfterUiApprovalRace(job.id)
+            closeRequeuedUiApprovalMonitor = true
+            log(`${workerId} requeued ${job.id} after UI/UX proposal input changed`)
+            continue
+          }
+          await updateMonitor(job, 'Before／Afterを安全に提示できないため失敗として確定します')
+          await quiesceMonitorBeforeTerminal()
+          options.store.fail(job.id, approvalMessage)
+          stats.failed += 1
+          scheduleNotificationFlush()
+          continue
+        }
+      }
       if (error instanceof HerdrJobMonitorPendingError
         && !executionStarted && !unstartedMonitorClaimReleased) {
         // A lifecycle delivery may already be in flight if the monitor failed
@@ -8451,7 +9290,9 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
     } finally {
       const settled = options.store.get(job.id)
       if (!skipMonitorClose && settled
-        && (settled.status === 'completed' || settled.status === 'failed')) {
+        && (settled.status === 'completed' || settled.status === 'failed'
+          || (settled.status === 'queued'
+            && (settled.uiApprovalRequestId !== null || closeRequeuedUiApprovalMonitor)))) {
         if (settled.status === 'failed' && settled.terminalOutcome === 'failed'
           && options.retainFailedJobMonitor) {
           await options.retainFailedJobMonitor(settled)
@@ -9815,6 +10656,59 @@ export function finalizeSuccessfulExecution(
   }
 }
 
+export function prepareUiApprovalForParking(
+  job: JobRecord,
+  error: CodexUiApprovalRequiredError,
+  dir: string,
+): {
+  sessionId: string
+  inputRevision: number
+  inputDigest: string
+  repositoryDigest: string
+  proposalText: string
+  beforePath: string
+  afterPath: string
+} {
+  const outbox = artifactDirForJob(dir, job.id)
+  const images = reencodeUiApprovalImages({
+    outbox,
+    beforePath: error.approval.beforePath,
+    afterPath: error.approval.afterPath,
+  })
+  const sealed = sealArtifactResult(
+    job,
+    `<zerokun_files>${JSON.stringify([images.beforePath, images.afterPath])}</zerokun_files>`,
+    dir,
+  )
+  const paths = extractArtifactPaths(sealed).files
+  if (paths.length !== 2 || paths[0] === paths[1]) {
+    throw new Error('UI/UX approval images could not be sealed as an exact Before/After pair')
+  }
+  const proposalText = sanitizeExecutionTextForSlack(
+    job,
+    error.approval.sessionId,
+    error.approval.text,
+    dir,
+    [
+      error.approval.beforePath,
+      error.approval.afterPath,
+      images.beforePath,
+      images.afterPath,
+      ...paths,
+    ],
+  )
+  if (!proposalText) throw new Error('UI/UX approval proposal is empty after sanitization')
+  return {
+    sessionId: error.approval.sessionId,
+    inputRevision: error.approval.inputRevision,
+    inputDigest: error.approval.inputDigest,
+    repositoryDigest: error.approval.repositoryDigest,
+    proposalText,
+    beforePath: paths[0]!,
+    afterPath: paths[1]!,
+  }
+}
+
 function normalizePersistedExecutionResult(
   job: JobRecord,
   sessionId: string,
@@ -10006,6 +10900,24 @@ function slackClientMessageId(notificationId: string, chunk: number): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20)}`
 }
 
+function slackMessageOrdinal(value: string): bigint | null {
+  const match = /^(\d{1,20})\.(\d{1,9})$/.exec(value)
+  if (!match) return null
+  try {
+    return BigInt(match[1]!) * 1_000_000_000n
+      + BigInt(match[2]!.padEnd(9, '0'))
+  } catch {
+    return null
+  }
+}
+
+export function slackMessageIsAfter(candidate: string, boundary: string): boolean {
+  const candidateOrdinal = slackMessageOrdinal(candidate)
+  const boundaryOrdinal = slackMessageOrdinal(boundary)
+  return candidateOrdinal !== null && boundaryOrdinal !== null
+    && candidateOrdinal > boundaryOrdinal
+}
+
 export function slackRateLimitMessage(resumeAt: number): string {
   const time = new Intl.DateTimeFormat('ja-JP', {
     hour: '2-digit',
@@ -10038,7 +10950,12 @@ export interface SlackUploadDependencies {
     threadTs: string
     text: string
     clientMessageId?: string
-  }, signal?: AbortSignal): Promise<void>
+  }, signal?: AbortSignal): Promise<{ messageId: string } | void>
+  inspectPostedMessage(input: {
+    chatId: string
+    threadTs: string
+    clientMessageId: string
+  }): Promise<string | null>
   requestUploadTarget(filename: string, length: number): Promise<{
     uploadUrl: string
     fileId: string
@@ -10102,6 +11019,37 @@ export class SlackNotifier implements JobNotifier {
           ...(input.clientMessageId ? { client_msg_id: input.clientMessageId } : {}),
         }, signal)
         if (!result.ok) throw new Error(result.error ?? 'Slack chat.postMessage failed')
+        if (typeof result.ts !== 'string' || slackMessageOrdinal(result.ts) === null) {
+          throw new Error('Slack chat.postMessage omitted its message timestamp')
+        }
+        return { messageId: result.ts }
+      }),
+      inspectPostedMessage: dependencies.inspectPostedMessage ?? (async input => {
+        let cursor: string | undefined
+        for (let page = 0; page < 100; page += 1) {
+          const response = await this.client.conversations.replies({
+            channel: input.chatId,
+            ts: input.threadTs,
+            limit: 100,
+            ...(cursor ? { cursor } : {}),
+          })
+          if (response.ok !== true) throw new Error('Slack conversations.replies failed')
+          for (const value of response.messages ?? []) {
+            if (!value || typeof value !== 'object') continue
+            const message = value as Record<string, unknown>
+            if (message.client_msg_id !== input.clientMessageId) continue
+            if (message.thread_ts !== input.threadTs
+              || typeof message.ts !== 'string'
+              || slackMessageOrdinal(message.ts) === null) {
+              throw new Error('Slack approval prompt receipt has an invalid thread binding')
+            }
+            return message.ts
+          }
+          const next = response.response_metadata?.next_cursor?.trim()
+          if (!next) return null
+          cursor = next
+        }
+        throw new Error('Slack approval prompt reconciliation exceeded its page bound')
       }),
       requestUploadTarget: dependencies.requestUploadTarget ?? (async (filename, length) => {
         const response = await this.client.files.getUploadURLExternal({ filename, length })
@@ -10269,6 +11217,121 @@ export class SlackNotifier implements JobNotifier {
         clientMessageId: slackClientMessageId(notification.id, index),
       }, childSignal), undefined, 'Slack status chat.postMessage', signal)
     }
+  }
+
+  private async deliverSealedArtifact(
+    job: JobRecord,
+    requested: string,
+    filename: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const deliveryState = this.store.artifactDeliveryState(job.id, requested)
+    if (deliveryState === 'delivered') return
+    if (deliveryState === 'abandoned') {
+      throw new Error(`required Slack attachment was abandoned: ${filename}`)
+    }
+    if (deliveryState === 'ambiguous') {
+      const fileId = this.store.artifactRemoteFileId(job.id, requested)
+      if (fileId && await this.uploadDependencies.inspectUpload({
+        fileId,
+        chatId: job.chatId,
+        threadTs: job.threadTs,
+      })) {
+        this.store.markArtifactDelivered(job.id, requested)
+        return
+      }
+      throw new ArtifactDeliveryAmbiguousError([requested])
+    }
+    const file = readUploadableArtifact(job, requested, dirname(this.store.dbPath))
+    await this.completeStartedSideEffect(async () => {
+      const target = await this.uploadDependencies.requestUploadTarget(
+        filename,
+        file.data.byteLength,
+      )
+      const uploadUrl = requireSlackUploadUrl(target.uploadUrl)
+      if (!target.fileId) throw new Error('Slack upload target omitted file id')
+      if (signal?.aborted) throw new Error('Slack attachment upload aborted before byte transfer')
+      let transferCommitted = false
+      try {
+        await this.uploadDependencies.uploadBytes(uploadUrl, file.data, () => {
+          const delivery = this.store.beginArtifactDelivery(job.id, requested, target.fileId)
+          if (delivery === 'delivered' || delivery === 'abandoned') {
+            throw new ArtifactDeliverySuppressedError(delivery)
+          }
+          if (delivery === 'ambiguous') {
+            throw new ArtifactDeliveryAmbiguousError([requested])
+          }
+          transferCommitted = true
+        })
+        if (!transferCommitted) {
+          throw new Error('Slack upload transport skipped the durable transfer boundary')
+        }
+        await this.uploadDependencies.completeUpload({
+          fileId: target.fileId,
+          filename,
+          chatId: job.chatId,
+          threadTs: job.threadTs,
+        })
+        this.store.markArtifactDelivered(job.id, requested)
+      } catch (error) {
+        if (error instanceof ArtifactDeliverySuppressedError) return
+        if (error instanceof ArtifactDeliveryAmbiguousError) throw error
+        if (!transferCommitted) throw error
+        throw new ArtifactDeliveryAmbiguousError([requested], error)
+      }
+    }, `Slack ${filename} delivery`, signal)
+  }
+
+  async uiApproval(notification: UiApprovalNotification, signal?: AbortSignal): Promise<void> {
+    const { job, request } = notification
+    if (!this.store.uiApprovalNotificationDeliverable(notification.id)) return
+    await this.deliverSealedArtifact(job, request.beforePath, 'Before.png', signal)
+    if (signal?.aborted) return
+    if (!this.store.uiApprovalNotificationDeliverable(notification.id)) return
+    await this.deliverSealedArtifact(job, request.afterPath, 'After.png', signal)
+    if (signal?.aborted) return
+    if (!this.store.uiApprovalNotificationDeliverable(notification.id)) return
+    const safeText = sanitizeExecutionTextForSlack(
+      job,
+      request.sessionId,
+      request.proposalText,
+      dirname(this.store.dbPath),
+      [request.beforePath, request.afterPath, request.id],
+    )
+    if (!safeText) throw new Error('UI/UX approval proposal became empty after sanitization')
+    const promptText = `${safeText}\n\nこの方向で実装してよいですか？`
+    if (promptText.length > SLACK_CHUNK_CHARS) {
+      throw new Error('UI/UX approval proposal exceeds one durable Slack message')
+    }
+    const delivery = this.store.beginUiApprovalPromptDelivery(notification.id)
+    let messageId = delivery.messageId
+    if (messageId === null) {
+      messageId = await withSlackDeadline(
+        () => this.uploadDependencies.inspectPostedMessage({
+          chatId: job.chatId,
+          threadTs: job.threadTs,
+          clientMessageId: delivery.clientMessageId,
+        }),
+        undefined,
+        'Slack approval prompt reconciliation',
+        signal,
+      )
+    }
+    if (messageId === null) {
+      const posted = await withSlackDeadline(childSignal => (
+        this.uploadDependencies.postMessage({
+          chatId: job.chatId,
+          threadTs: job.threadTs,
+          text: promptText,
+          clientMessageId: delivery.clientMessageId,
+        }, childSignal)
+      ), undefined, 'Slack UI approval chat.postMessage', signal)
+      if (!posted?.messageId) {
+        throw new Error('Slack UI approval post omitted its durable message receipt')
+      }
+      messageId = posted.messageId
+    }
+    this.store.recordUiApprovalPromptDelivered(notification.id, messageId)
   }
 
   async completed(
@@ -11357,6 +12420,11 @@ async function runCli(): Promise<void> {
           log(`preserved staged result for ${jobId} after proving its Herdr monitor was lost`)
           return 'staged-result'
         }
+        if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
+          store.retireMonitorObligation(jobId)
+          log(`retired ${jobId} monitor after entering UI/UX approval wait`)
+          return 'terminalized'
+        }
         if ((status === 'queued' || status === 'running')
           && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE)) {
           log(`failed ${jobId} after proving its Herdr monitor was lost and executors stopped`)
@@ -11518,6 +12586,11 @@ async function runCli(): Promise<void> {
         }
         log(`preserved staged result for ${jobId} after proving its Herdr monitor was lost`)
         return 'staged-result'
+      }
+      if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
+        store.retireMonitorObligation(jobId)
+        log(`retired ${jobId} monitor after entering UI/UX approval wait`)
+        return 'terminalized'
       }
       if ((status === 'queued' || status === 'running')
         && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE)) {
@@ -11771,7 +12844,9 @@ async function runCli(): Promise<void> {
           jobId: job.id,
           outcome: job.terminalOutcome === 'cancelled'
             ? 'cancelled'
-            : job.status === 'failed' ? 'failed' : 'completed',
+            : job.status === 'failed'
+              ? 'failed'
+              : job.uiApprovalRequestId !== null ? 'waiting' : 'completed',
           onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
         })
       },
@@ -11809,6 +12884,7 @@ async function runCli(): Promise<void> {
             signal: executionController.signal,
             stateDir: dir,
             logDir: join(dir, 'job-logs'),
+            uiApproval: store.latestUiApprovalContext(job.id),
             onProcessId: processId => store.saveExecutorPid(job.id, processId),
             onSessionId: sessionId => store.saveSession(job.id, sessionId),
             onSessionReset: () => store.clearSession(job.id),

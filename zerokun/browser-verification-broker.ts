@@ -1,6 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import {
   chmodSync,
   closeSync,
@@ -40,6 +40,10 @@ import {
 import { containsCredentialMaterial } from './public-output-guard.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { resolveAdvisorProjectLayout } from './advisor-snapshot.ts'
+import {
+  createUiApprovalBrowserReceipt,
+  uiApprovalBrowserReceiptPath,
+} from './ui-approval.ts'
 
 const CHROME_APPLICATION = '/Applications/Google Chrome.app'
 const CHROME_EXECUTABLE = `${CHROME_APPLICATION}/Contents/MacOS/Google Chrome`
@@ -864,15 +868,29 @@ function toolText(payload: unknown, isError = false) {
 }
 
 async function main(): Promise<void> {
-  const [contextInput, stateInput, artifactInput, scratchInput, phaseInput] = process.argv.slice(2)
+  const [
+    contextInput,
+    stateInput,
+    artifactInput,
+    scratchInput,
+    phaseInput,
+    receiptKeyInput,
+  ] = process.argv.slice(2)
   if (!contextInput || !stateInput || !artifactInput || !scratchInput
-    || !['implementation', 'review', 'complete'].includes(phaseInput ?? '')) {
+    || !receiptKeyInput
+    || !['prepare', 'implementation', 'review', 'complete'].includes(phaseInput ?? '')) {
     throw new Error(
-      'usage: browser-verification-broker.ts CONTEXT STATE_DIR ARTIFACT_DIR SCRATCH_DIR [implementation|review|complete]',
+      'usage: browser-verification-broker.ts CONTEXT STATE_DIR ARTIFACT_DIR SCRATCH_DIR [prepare|implementation|review|complete] RECEIPT_KEY',
     )
   }
   const stateDir = requireManagedStateRoot(stateInput)
   const context = parseContext(contextInput, stateDir)
+  const receiptKeyPath = resolve(receiptKeyInput)
+  if (!contained(stateDir, receiptKeyPath)) {
+    throw new Error('browser receipt key is outside managed state')
+  }
+  const receiptKey = readBoundedPrivateFile(receiptKeyPath, 128).trim()
+  if (!/^[0-9a-f]{64}$/.test(receiptKey)) throw new Error('browser receipt key is invalid')
   if (!context.writeEnabled) throw new Error('local browser verification requires a write-authorized job')
   const safeId = context.jobId.replace(/[^A-Za-z0-9._-]/g, '_')
   const artifactDir = requireManagedDirectory(stateDir, artifactInput)
@@ -887,17 +905,44 @@ async function main(): Promise<void> {
     inputSchema: {
       url: z.string().max(2_048).describe('Exact http://127.0.0.1:<port>/ or http://localhost:<port>/ URL.'),
       expectedText: z.string().min(1).max(512).describe('Text that must appear in both the HTTP response and Chrome-rendered DOM.'),
+      role: z.enum(['before', 'after', 'verification']).optional().describe(
+        'Use before/after during prepare UI proposals; use verification in later phases.',
+      ),
     },
-  }, async ({ url, expectedText }) => {
+  }, async ({ url, expectedText, role }) => {
     try {
-      return toolText(await verifyLocalPage({
+      if (phaseInput === 'prepare' && role !== 'before' && role !== 'after') {
+        throw new Error('prepare browser capture requires an explicit before or after role')
+      }
+      if (phaseInput !== 'prepare' && role && role !== 'verification') {
+        throw new Error('non-prepare browser capture may only use the verification role')
+      }
+      const result = await verifyLocalPage({
         repoPath: context.repoPath,
         stateDir,
         scratchDir,
         artifactDir,
         url,
         expectedText,
-      }))
+      })
+      if (phaseInput === 'prepare') {
+        const selectedRole = role as 'before' | 'after'
+        const imageDigest = createHash('sha256')
+          .update(readFileSync(result.screenshotPath))
+          .digest('hex')
+        const receiptPath = uiApprovalBrowserReceiptPath(result.screenshotPath)
+        atomicWritePrivateFile(receiptPath, createUiApprovalBrowserReceipt({
+          key: receiptKey,
+          jobId: context.jobId,
+          attemptNonce: context.attemptNonce,
+          role: selectedRole,
+          imagePath: result.screenshotPath,
+          imageDigest,
+        }))
+        chmodSync(receiptPath, 0o600)
+        return toolText({ ...result, receiptPath, receiptRole: selectedRole })
+      }
+      return toolText(result)
     } catch (error) {
       return toolText({ complete: false, reason: String(error) }, true)
     }

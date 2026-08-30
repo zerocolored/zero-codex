@@ -207,6 +207,7 @@ function job(repoPath: string, id: string, writeEnabled: boolean, sessionId: str
     activeThreadId: null,
     activeTurnId: null,
     cancelRequestedAt: null,
+    uiApprovalRequestId: null,
     terminalOutcome: null,
   }
 }

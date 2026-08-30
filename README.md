@@ -21,7 +21,7 @@ Slack bot
 ```
 
 - Slack 受信と Codex 実行を別プロセスに分離しています。Codex が長時間動いても受信を続けます。
-- job は SQLite に先に保存し、常に1件ずつ FIFO で処理します。再起動時、read-only job は再開し、write job は外部副作用の二重実行を避けるため failed にして確認・再送を求めます。
+- job は SQLite に先に保存し、常に1件ずつ FIFO で処理します。再起動時、read-only job は再開し、write job は外部副作用の二重実行を避けるため failed にして確認・再送を求めます。ただし、実装を一度も開始していないUI/UX承認待ちは専用状態で安全に待機を継続します。
 - 同じ Slack スレッド・repository・write mode では、senderが変わっても Codex の thread ID を最大20 jobまで再利用します。旧 Claude Code の
   待機jobはsession IDを破棄してCodexへ移行し、完了済み履歴のsession IDはCodexへ渡しません。利用回数は
   job本体とは別の永続台帳で数えるため、30日GCで古いjobが消えても20件上限は戻りません。
@@ -32,6 +32,13 @@ Slack bot
   実行中に限ってそのスレッド自体を操作権限の境界とするため、返信者個人がread-onlyでもactive write
   jobへ追加入力できます。write権限を共有したくない相手は同じ実行中スレッドへ参加させないでください。
   最終入力barrier後の通常返信は次のFIFO入力として保持し、その後に`中止`が届いても削除しません。
+- 重要なUI/UX変更はread-only準備で止まり、現在状態の`Before.png`と隔離proposalの`After.png`を
+  ローカルpathではなく実ファイルとして元のSlack threadへ添付します。2枚の共有と承認依頼本文が
+  完了するまで実装phaseへ進まず、完了後も同じthreadの人間の返信をSQLiteへ永続化して待ちます。
+  `はい`や`この方向で進めてください`のような無条件の明示承認だけが、同じ入力・同じrepositoryの
+  実装を解放します。質問、却下、条件付き回答、添付付き回答、repository変更は承認にせず、回答内容を
+  取り込んだ新しいBefore／After提案へ戻ります。待機中はworkerと監視tabを解放し、別threadのjobは
+  続行できますが、同じthreadの後続jobは承認対象を追い越しません。`中止`は待機中も利用できます。
 - 長時間jobでは、Codex本人が監視tabへ出した短い日本語の`💬 commentary`を、その発生ごとに
   同じSlack threadへFIFOで投稿します。固定時刻の問い合わせ、固定stage文、推測の進捗率は使いません。
   配送はSQLiteへ先に保存して再試行し、terminalは未配送のcommentaryを追い越しません。
@@ -67,10 +74,12 @@ Slack bot
   既存のClaude paneは列挙しても入力・再利用・`/clear`・closeしません。
 - 受信許可と書込み許可は別です。既定profileはrepository readとjob outbox writeだけです。`writeAllowFrom` を
   明示した利用者だけrepository・`.git` writeとネットワークを使えますが、Mac全体のsandboxは解除しません。
-- write許可されたWebタスクでは、implementation/review processだけに`verify_local_page`を公開します。
+- write許可されたWebタスクでは、read-only準備とimplementation/review processに`verify_local_page`を公開します。
   既存Chrome session・拡張・個人profileは使わず、署名済みGoogle Chromeをowner-onlyの一時profileで起動し、
   明示したlocalhost origin以外のHTTP/WebSocketをdeny-by-default proxyで遮断します。HTTP 2xx、描画後DOMの
   期待文字列、1280×720 PNG、遮断request数、Chrome子processと一時profileの回収をまとめて返します。
+  準備phaseでは製品repositoryを書き換えず、現在画面とscratch内だけの提案画面を撮影します。画像は
+  完全decode後にpixel-bearing chunkだけへ再封印し、metadataとローカルpathをSlackへ持ち出しません。
 - Grok/Claude連携は、Codex shellへcredentialやHerdr socketを渡さない用途固定のhost-side MCP brokerが
   read-onlyで代行します。brokerが公開するtoolは開始用`advisor_round`と状態照会用`advisor_round_poll`だけで、対象repository・pane・実行fileを
   Slack本文やmodel側から指定できません。各必須roundについて、startup receiptを排他作成して

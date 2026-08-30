@@ -844,6 +844,8 @@ async function drainInboundDeliveries(): Promise<void> {
               epoch: inbound.expectedControlEpoch,
               repoPath: inbound.repoPath,
               writeEnabled: inbound.writeEnabled,
+              awaitingUiApproval: (jobStore.get(inbound.expectedControlJobId)
+                ?.uiApprovalRequestId ?? null) !== null,
             }
           : interrupt
             ? jobStore.interruptControlTarget(inbound.chatId, inbound.threadTs)
@@ -873,7 +875,7 @@ async function drainInboundDeliveries(): Promise<void> {
           }
           const staged = interrupt
             ? jobStore.stageLiveControl(target, { ...liveInput, kind: 'interrupt' })
-            : jobStore.stageLiveInterjection(target, liveInput)
+            : jobStore.stageThreadReply(target, liveInput)
           if (staged !== 'closed') {
             jobStore.completeInboundDelivery(inbound.idempotencyKey)
             continue

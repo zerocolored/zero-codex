@@ -113,7 +113,12 @@ export async function postDirectSlackApi(
   botToken: string,
   body: Record<string, unknown>,
   signal?: AbortSignal,
-): Promise<{ ok?: boolean; error?: string }> {
+): Promise<{
+  ok?: boolean
+  error?: string
+  ts?: string
+  response_metadata?: { next_cursor?: string }
+}> {
   if (!/^[a-z][a-zA-Z.]+$/.test(method)) throw new Error(`invalid Slack API method: ${method}`)
   const payload = Buffer.from(JSON.stringify(body))
   const response = await new Promise<IncomingMessage>((resolve, reject) => {
@@ -145,7 +150,12 @@ export async function postDirectSlackApi(
     }
     chunks.push(chunk)
   }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as { ok?: boolean; error?: string }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+    ok?: boolean
+    error?: string
+    ts?: string
+    response_metadata?: { next_cursor?: string }
+  }
 }
 
 export async function withSlackDeadline<T>(

@@ -689,6 +689,28 @@ describe('Herdr job monitor', () => {
     expect(existsSync(join(state, 'job-monitors', record.id))).toBe(false)
   })
 
+  test('UI/UX承認待ちへparkしたqueued jobはwaiting表示を確定して監視tabを閉じる', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job()
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+
+    const reconciled = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({
+        status: 'queued',
+        uiApprovalRequestId: 'approval-request-id',
+      }),
+      control,
+    })
+
+    expect(reconciled).toEqual({ retained: 0, closed: 1, retainedJobIds: [] })
+    expect(control.closeCalls).toBe(1)
+    expect(control.tabs).toHaveLength(0)
+    expect(existsSync(join(state, 'job-monitors', record.id))).toBe(false)
+  })
+
   test('create/runの応答喪失後はexact bindingとreceiptで採択し再送しない', async () => {
     const state = fixtureDirectory()
     const control = new FakeControl()

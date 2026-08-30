@@ -1956,7 +1956,7 @@ export async function closeHerdrJobMonitor(input: {
   stateDir: string
   runtime: HerdrRuntimeIdentity
   jobId: string
-  outcome?: 'completed' | 'failed' | 'cancelled'
+  outcome?: 'completed' | 'failed' | 'cancelled' | 'waiting'
   onMonitorRetired?: (jobId: string) => Promise<void> | void
   control?: HerdrJobMonitorControl
 }): Promise<void> {
@@ -2036,6 +2036,8 @@ export async function closeHerdrJobMonitor(input: {
             ? 'タスク処理は失敗として終了しました'
             : input.outcome === 'cancelled'
               ? 'タスク処理は中止されました'
+              : input.outcome === 'waiting'
+                ? 'Before／AfterをSlackへ提示し、回答待ちに移りました'
               : 'タスク処理が完了しました',
         )
       }
@@ -2109,6 +2111,7 @@ export async function reconcileHerdrJobMonitors(input: {
   getJob(jobId: string): {
     status: JobStatus
     terminalOutcome?: JobRecord['terminalOutcome']
+    uiApprovalRequestId?: string | null
   } | null
   listMonitorObligations?: () => Array<{
     id: string
@@ -2303,7 +2306,9 @@ export async function reconcileHerdrJobMonitors(input: {
             stateDir,
             runtime: input.runtime,
             jobId: name,
-            outcome: status === 'failed' ? 'failed' : 'completed',
+            outcome: status === 'failed'
+              ? 'failed'
+              : job?.uiApprovalRequestId ? 'waiting' : 'completed',
             onMonitorRetired: input.onMonitorRetired,
             control,
           })
@@ -2343,6 +2348,18 @@ export async function reconcileHerdrJobMonitors(input: {
         runtime: input.runtime,
         jobId: name,
         outcome: 'failed',
+        onMonitorRetired: input.onMonitorRetired,
+        control,
+      })
+      closed += 1
+      continue
+    }
+    if (status === 'queued' && job?.uiApprovalRequestId) {
+      await closeHerdrJobMonitor({
+        stateDir,
+        runtime: input.runtime,
+        jobId: name,
+        outcome: 'waiting',
         onMonitorRetired: input.onMonitorRetired,
         control,
       })

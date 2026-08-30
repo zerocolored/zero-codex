@@ -32,6 +32,7 @@ import {
   SERIAL_WORKER_COUNT,
   createSlackIdentityPauseGuard,
   extractArtifactPaths,
+  flushUiApprovalNotifications,
   flushTerminalNotifications,
   finalizeSuccessfulExecution,
   persistExecutionResultJournal,
@@ -43,10 +44,12 @@ import {
   reconcileAdvisorsWithMonitorHealthBarrier,
   runQueuedJobs,
   sealArtifactResult,
+  sealedArtifactDirForJob,
   SlackNotifier,
   slackArtifactPublicationBlockedMessage,
   slackArtifactsAbandonedMessage,
   slackFileIsSharedInThread,
+  slackMessageIsAfter,
   SlackChannelRouteChangedError,
   slackRateLimitMessage,
   stateSlackTokenPairMatches,
@@ -120,6 +123,7 @@ import {
 } from './advisor-snapshot.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { CodexAppServerSession } from './codex-app-server-session.ts'
+import { CodexUiApprovalRequiredError } from './ui-approval.ts'
 
 const temporaryDirs: string[] = []
 
@@ -6371,6 +6375,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       1,
       nonce,
       '/tmp/job-outbox',
+      true,
     )
     const implementation = buildCodexPhasePrompt(
       job,
@@ -6393,6 +6398,14 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(prepare).toContain(
       `[ZERO_PRE_EDIT_READY:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
     )
+    expect(prepare).toContain(
+      `[ZERO_UI_APPROVAL_REQUIRED:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
+    )
+    expect(prepare).toContain('zerokun_browser.verify_local_page')
+    expect(prepare).toContain('role=before')
+    expect(prepare).toContain('role=after')
+    expect(prepare).toContain('synthetic/test data')
+    expect(prepare).toContain('host uploads both images as Slack')
     expect(implementation).toContain(
       `[ZERO_IMPLEMENTATION_READY:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
     )
@@ -10555,6 +10568,607 @@ describe('durable terminal notifications', () => {
     expect(abandonmentNotices).toBe(1)
     expect(store.artifactDeliveryState(job.id, artifact)).toBe('abandoned')
     expect(store.terminalNotificationCount()).toBe(0)
+    store.close()
+  })
+})
+
+function parkUiApprovalFixture(store: JobStore, overrides: Partial<EnqueueInput> = {}) {
+  const root = store.enqueue(input({
+    messageId: 'ui-approval-root',
+    task: '画面を改善してください',
+    writeEnabled: true,
+    ...overrides,
+  })).job
+  const running = store.claimNext('ui-approval-worker')!
+  store.saveSession(running.id, 'ui-approval-session')
+  const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), running.id)
+  const requestId = store.parkForUiApproval({
+    jobId: running.id,
+    sessionId: 'ui-approval-session',
+    inputRevision: snapshot.revision,
+    inputDigest: snapshot.digest,
+    repositoryDigest: 'b'.repeat(64),
+    proposalText: '現在の情報階層を整理した案です。',
+    beforePath: '/private/sealed/Before.png',
+    afterPath: '/private/sealed/After.png',
+  })
+  return { root, requestId }
+}
+
+function markUiApprovalPromptDelivered(
+  store: JobStore,
+  requestId: string,
+  messageId = '1800000000.000101',
+): void {
+  store.beginUiApprovalPromptDelivery(requestId)
+  store.recordUiApprovalPromptDelivered(requestId, messageId)
+  store.markUiApprovalPresented(requestId)
+}
+
+function writeSolidTestPng(
+  directory: string,
+  basename: string,
+  red: number,
+): string {
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  const ppm = join(directory, `${basename}.ppm`)
+  const png = join(directory, `${basename}.png`)
+  const pixels = Buffer.alloc(1280 * 720 * 3)
+  for (let offset = 0; offset < pixels.byteLength; offset += 3) pixels[offset] = red
+  writeFileSync(ppm, Buffer.concat([Buffer.from('P6\n1280 720\n255\n'), pixels]))
+  const converted = Bun.spawnSync(
+    ['/usr/bin/sips', '-s', 'format', 'png', ppm, '--out', png],
+    { stdout: 'ignore', stderr: 'pipe' },
+  )
+  if (converted.exitCode !== 0) throw new Error(converted.stderr.toString())
+  return png
+}
+
+describe('durable UI/UX approval wait', () => {
+  test('runnerは提案を永続化した時点で停止し、implementationを一度もdispatchしない', async () => {
+    const directory = fixtureDir('zero-ui-runner-')
+    const store = new JobStore(join(directory, 'jobs.sqlite3'))
+    const root = store.enqueue(input({
+      messageId: 'ui-approval-runner-root',
+      task: '画面を改善してください',
+      writeEnabled: true,
+    })).job
+    let executions = 0
+    let monitorCloses = 0
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      openJobMonitor: async () => {},
+      closeJobMonitor: async () => { monitorCloses += 1 },
+      executor: async current => {
+        executions += 1
+        store.saveSession(current.id, 'ui-runner-session')
+        const snapshot = readAdvisorInputSnapshot(directory, current.id)
+        const outbox = artifactDirForJob(directory, current.id)
+        mkdirSync(outbox, { recursive: true, mode: 0o700 })
+        const makeImage = (basename: string, red: number): string => {
+          const ppm = join(outbox, `${basename}.ppm`)
+          const png = join(outbox, `${basename}.png`)
+          const pixels = Buffer.alloc(1280 * 720 * 3)
+          for (let offset = 0; offset < pixels.byteLength; offset += 3) pixels[offset] = red
+          writeFileSync(ppm, Buffer.concat([Buffer.from('P6\n1280 720\n255\n'), pixels]))
+          const converted = Bun.spawnSync(
+            ['/usr/bin/sips', '-s', 'format', 'png', ppm, '--out', png],
+            { stdout: 'ignore', stderr: 'pipe' },
+          )
+          if (converted.exitCode !== 0) throw new Error(converted.stderr.toString())
+          return png
+        }
+        throw new CodexUiApprovalRequiredError({
+          sessionId: 'ui-runner-session',
+          inputRevision: snapshot.revision,
+          inputDigest: snapshot.digest,
+          repositoryDigest: 'd'.repeat(64),
+          text: '情報の優先順位を整理した案です。',
+          beforePath: makeImage('before', 20),
+          afterPath: makeImage('after', 80),
+        })
+      },
+    })
+
+    expect(store.get(root.id)?.lastError).toBeNull()
+    expect(stats).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+    expect(executions).toBe(1)
+    expect(monitorCloses).toBe(1)
+    expect(store.get(root.id)).toMatchObject({
+      status: 'queued',
+      uiApprovalRequestId: expect.any(String),
+      result: null,
+      terminalOutcome: null,
+    })
+    expect(store.claimNext('must-not-implement')).toBeNull()
+
+    const second = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async () => {
+        executions += 1
+        return { sessionId: 'must-not-run', result: 'must-not-run' }
+      },
+    })
+    expect(second).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+    expect(executions).toBe(1)
+    store.close()
+  })
+
+  test('restart後も待機し、別threadだけを進め、同じthreadの明示承認で元jobを再開する', () => {
+    const directory = fixtureDir('zero-ui-wait-')
+    const dbPath = join(directory, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const { root, requestId } = parkUiApprovalFixture(store)
+    const sameThread = store.enqueue(input({
+      messageId: 'ui-approval-same-thread-successor',
+      task: '同じスレッドの後続依頼',
+    })).job
+    const otherThread = store.enqueue(input({
+      threadTs: '1800000000.999901',
+      messageId: '1800000000.999901',
+      task: '別スレッドの依頼',
+    })).job
+
+    expect(store.get(root.id)).toMatchObject({
+      status: 'queued',
+      uiApprovalRequestId: requestId,
+    })
+    expect(store.claimNext('other-thread-worker')?.id).toBe(otherThread.id)
+    store.fail(otherThread.id, 'fixture complete')
+    expect(store.claimNext('same-thread-must-wait')).toBeNull()
+    store.close()
+
+    store = new JobStore(dbPath)
+    expect(store.get(root.id)).toMatchObject({
+      status: 'queued',
+      uiApprovalRequestId: requestId,
+    })
+    expect(store.uiApprovalRequest(requestId)?.status).toBe('publishing')
+    markUiApprovalPromptDelivered(store, requestId)
+    const target = store.liveControlTarget(root.chatId, root.threadTs)!
+    expect(target).toMatchObject({ jobId: root.id, awaitingUiApproval: true })
+    expect(store.stageThreadReply(target, {
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      messageId: '1800000000.000102',
+      userId: 'UOTHERTEAMMEMBER',
+      task: 'はい',
+      writeEnabled: true,
+      attachments: [],
+    })).toBe('staged')
+
+    expect(store.uiApprovalRequest(requestId)).toMatchObject({
+      status: 'responded',
+      responseExplicitApproval: true,
+      responseInputRevision: 2,
+    })
+    expect(store.latestUiApprovalContext(root.id)).toMatchObject({
+      requestId,
+      explicitApproval: true,
+      responseInputRevision: 2,
+      repositoryDigest: 'b'.repeat(64),
+    })
+    expect(store.claimNext('approved-worker')?.id).toBe(root.id)
+    expect(store.get(sameThread.id)?.status).toBe('queued')
+    store.close()
+  })
+
+  test('提示完了前の返信は「はい」でも承認にせず、提示完了までは再開しない', () => {
+    const store = makeStore()
+    const { root, requestId } = parkUiApprovalFixture(store, {
+      messageId: 'ui-approval-early-response',
+    })
+    const target = store.liveControlTarget(root.chatId, root.threadTs)!
+    expect(store.stageThreadReply(target, {
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      messageId: '1800000000.000202',
+      userId: 'USECOND',
+      task: 'はい',
+      writeEnabled: true,
+      attachments: [],
+    })).toBe('staged')
+    expect(store.uiApprovalRequest(requestId)).toMatchObject({
+      status: 'publishing',
+      responseExplicitApproval: false,
+    })
+    expect(store.get(root.id)?.uiApprovalRequestId).toBe(requestId)
+    expect(store.claimNext('too-early')).toBeNull()
+
+    markUiApprovalPromptDelivered(store, requestId, '1800000000.000201')
+    expect(store.uiApprovalRequest(requestId)?.status).toBe('responded')
+    expect(store.get(root.id)?.uiApprovalRequestId).toBeNull()
+    expect(store.latestUiApprovalContext(root.id)?.explicitApproval).toBe(false)
+    expect(store.claimNext('reproposal-worker')?.id).toBe(root.id)
+    expect(store.liveControlTarget('COTHERTHREAD', root.threadTs)).toBeNull()
+    store.close()
+  })
+
+  test('BeforeとAfterを同じSlack threadへ実添付してからだけ回答待ちへ移る', async () => {
+    const directory = fixtureDir('zero-ui-slack-')
+    const store = new JobStore(join(directory, 'jobs.sqlite3'))
+    const root = store.enqueue(input({
+      messageId: 'ui-approval-slack-root',
+      task: '画面を改善してください',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('ui-slack-worker')!
+    store.saveSession(running.id, 'ui-slack-session')
+    const snapshot = readAdvisorInputSnapshot(directory, running.id)
+    const sealedRoot = sealedArtifactDirForJob(directory, running.id)
+    mkdirSync(sealedRoot, { recursive: true, mode: 0o700 })
+    const before = join(sealedRoot, 'before-sealed.png')
+    const after = join(sealedRoot, 'after-sealed.png')
+    writeFileSync(before, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1]))
+    writeFileSync(after, Buffer.from([0x89, 0x50, 0x4e, 0x47, 2]))
+    const requestId = store.parkForUiApproval({
+      jobId: running.id,
+      sessionId: 'ui-slack-session',
+      inputRevision: snapshot.revision,
+      inputDigest: snapshot.digest,
+      repositoryDigest: 'c'.repeat(64),
+      proposalText: '余白と情報階層を整理した案です。',
+      beforePath: before,
+      afterPath: after,
+    })
+
+    const targetNames: string[] = []
+    const completed: Array<{ filename: string; chatId: string; threadTs: string }> = []
+    const uploaded: Buffer[] = []
+    const posted: Array<{ text: string; chatId: string; threadTs: string; clientMessageId?: string }> = []
+    let nextFile = 0
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      requestUploadTarget: async filename => {
+        targetNames.push(filename)
+        nextFile += 1
+        return {
+          uploadUrl: `https://files.slack.com/upload/v1/ui-${nextFile}`,
+          fileId: `FUI${nextFile}`,
+        }
+      },
+      uploadBytes: async (_url, data, beforeRequestWrite) => {
+        beforeRequestWrite()
+        uploaded.push(Buffer.from(data))
+      },
+      completeUpload: async value => { completed.push(value) },
+      postMessage: async value => {
+        posted.push(value)
+        return { messageId: '1800000000.000301' }
+      },
+      inspectPostedMessage: async () => null,
+      inspectUpload: async () => false,
+    })
+
+    await flushUiApprovalNotifications(store, notifier, () => {}, 1)
+    expect(targetNames).toEqual(['Before.png', 'After.png'])
+    expect(completed.map(value => value.filename)).toEqual(['Before.png', 'After.png'])
+    expect(completed.every(value => (
+      value.chatId === root.chatId && value.threadTs === root.threadTs
+    ))).toBe(true)
+    expect(uploaded).toEqual([readFileSync(before), readFileSync(after)])
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toMatchObject({ chatId: root.chatId, threadTs: root.threadTs })
+    expect(posted[0]?.text).toContain('この方向で実装してよいですか？')
+    expect(posted[0]?.text).not.toContain(directory)
+    expect(posted[0]?.clientMessageId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(store.uiApprovalRequest(requestId)).toMatchObject({
+      status: 'awaiting',
+      promptDeliveredAt: expect.any(Number),
+    })
+    expect(store.get(root.id)?.uiApprovalRequestId).toBe(requestId)
+
+    await flushUiApprovalNotifications(store, notifier, () => {}, 1)
+    expect(targetNames).toHaveLength(2)
+    expect(posted).toHaveLength(1)
+    store.close()
+
+    const restarted = new JobStore(join(directory, 'jobs.sqlite3'))
+    expect(restarted.uiApprovalRequest(requestId)?.status).toBe('awaiting')
+    expect(restarted.get(root.id)?.uiApprovalRequestId).toBe(requestId)
+    expect(restarted.claimNext('restart-must-wait')).toBeNull()
+    restarted.close()
+  })
+
+  test('promptより古いSlack返信は明示承認として扱わない', () => {
+    const store = makeStore()
+    const { root, requestId } = parkUiApprovalFixture(store, {
+      messageId: 'ui-approval-old-reply',
+    })
+    markUiApprovalPromptDelivered(store, requestId, '1800000000.000500')
+    const target = store.liveControlTarget(root.chatId, root.threadTs)!
+    expect(store.stageThreadReply(target, {
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      messageId: '1800000000.000499',
+      userId: 'UOTHERTEAMMEMBER',
+      task: 'はい',
+      writeEnabled: true,
+      attachments: [],
+    })).toBe('staged')
+    expect(slackMessageIsAfter('1800000000.000499', '1800000000.000500')).toBe(false)
+    expect(slackMessageIsAfter('1800000000.000501', '1800000000.000500')).toBe(true)
+    expect(store.uiApprovalRequest(requestId)).toMatchObject({
+      status: 'responded',
+      responseMessageId: '1800000000.000499',
+      responseExplicitApproval: false,
+    })
+    expect(store.latestUiApprovalContext(root.id)?.explicitApproval).toBe(false)
+    expect(store.claimNext('old-reply-reproposal')?.id).toBe(root.id)
+    store.close()
+  })
+
+  test('旧DBのremote prompt receiptなし承認はmigrationで再承認不可にする', () => {
+    const directory = fixtureDir('zero-ui-legacy-prompt-')
+    const dbPath = join(directory, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const { requestId } = parkUiApprovalFixture(store, {
+      messageId: 'ui-approval-legacy-prompt',
+    })
+    store.close()
+    const legacy = new Database(dbPath)
+    legacy.run(
+      `UPDATE ui_approval_requests
+       SET status = 'responded', response_message_id = '1800000000.000550',
+           response_user_id = 'ULEGACY', response_text = 'はい',
+           response_input_revision = 2, response_explicit_approval = 1,
+           prompt_delivered_at = 1, prompt_message_id = NULL
+       WHERE id = ?`,
+      [requestId],
+    )
+    legacy.close()
+
+    store = new JobStore(dbPath)
+    expect(store.uiApprovalRequest(requestId)).toMatchObject({
+      status: 'publishing',
+      responseMessageId: '1800000000.000550',
+      responseExplicitApproval: false,
+      promptMessageId: null,
+      promptDeliveredAt: null,
+    })
+    store.close()
+  })
+
+  test('prompt公開中の複数返信は捨てずに最後の返信へ更新する', () => {
+    const store = makeStore()
+    const { root, requestId } = parkUiApprovalFixture(store, {
+      messageId: 'ui-approval-multiple-publishing-replies',
+    })
+    let target = store.liveControlTarget(root.chatId, root.threadTs)!
+    expect(store.stageThreadReply(target, {
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      messageId: '1800000000.000601',
+      userId: 'UFIRST',
+      task: '最初の質問です',
+      writeEnabled: true,
+      attachments: [],
+    })).toBe('staged')
+    target = store.liveControlTarget(root.chatId, root.threadTs)!
+    expect(store.stageThreadReply(target, {
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      messageId: '1800000000.000602',
+      userId: 'USECOND',
+      task: 'こちらを最新の回答にしてください',
+      writeEnabled: true,
+      attachments: [],
+    })).toBe('staged')
+    expect(store.uiApprovalRequest(requestId)).toMatchObject({
+      status: 'publishing',
+      responseMessageId: '1800000000.000602',
+      responseUserId: 'USECOND',
+      responseText: 'こちらを最新の回答にしてください',
+      responseInputRevision: 3,
+      responseExplicitApproval: false,
+    })
+    markUiApprovalPromptDelivered(store, requestId, '1800000000.000603')
+    expect(store.uiApprovalRequest(requestId)?.status).toBe('responded')
+    expect(store.latestUiApprovalContext(root.id)).toMatchObject({
+      responseMessageId: '1800000000.000602',
+      responseInputRevision: 3,
+      explicitApproval: false,
+    })
+    expect(store.claimNext('multiple-reply-reproposal')?.id).toBe(root.id)
+    store.close()
+  })
+
+  test('prompt投稿の応答消失後はremote receiptを照合して二重投稿しない', async () => {
+    const directory = fixtureDir('zero-ui-prompt-reconcile-')
+    const store = new JobStore(join(directory, 'jobs.sqlite3'))
+    const root = store.enqueue(input({
+      messageId: 'ui-approval-prompt-reconcile',
+      task: '画面を改善してください',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('ui-prompt-reconcile-worker')!
+    store.saveSession(running.id, 'ui-prompt-reconcile-session')
+    const snapshot = readAdvisorInputSnapshot(directory, running.id)
+    const sealedRoot = sealedArtifactDirForJob(directory, running.id)
+    mkdirSync(sealedRoot, { recursive: true, mode: 0o700 })
+    const before = join(sealedRoot, 'before-reconcile.png')
+    const after = join(sealedRoot, 'after-reconcile.png')
+    writeFileSync(before, Buffer.from([0x89, 0x50, 0x4e, 0x47, 11]))
+    writeFileSync(after, Buffer.from([0x89, 0x50, 0x4e, 0x47, 12]))
+    const requestId = store.parkForUiApproval({
+      jobId: running.id,
+      sessionId: 'ui-prompt-reconcile-session',
+      inputRevision: snapshot.revision,
+      inputDigest: snapshot.digest,
+      repositoryDigest: 'e'.repeat(64),
+      proposalText: '再起動しても同じ提案を二重投稿しません。',
+      beforePath: before,
+      afterPath: after,
+    })
+    let nextFile = 0
+    let postCalls = 0
+    let inspectCalls = 0
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      requestUploadTarget: async () => {
+        nextFile += 1
+        return {
+          uploadUrl: `https://files.slack.com/upload/v1/reconcile-${nextFile}`,
+          fileId: `FRECONCILE${nextFile}`,
+        }
+      },
+      uploadBytes: async (_url, _data, beforeRequestWrite) => { beforeRequestWrite() },
+      completeUpload: async () => {},
+      inspectUpload: async () => false,
+      inspectPostedMessage: async () => {
+        inspectCalls += 1
+        return postCalls > 0 ? '1800000000.000701' : null
+      },
+      postMessage: async () => {
+        postCalls += 1
+        // Slack accepted the message, but the local HTTP response disappeared.
+        return undefined
+      },
+    })
+
+    await flushUiApprovalNotifications(store, notifier, () => {}, 1)
+    expect(postCalls).toBe(1)
+    expect(store.uiApprovalRequest(requestId)).toMatchObject({
+      status: 'publishing',
+      promptDeliveryStartedAt: expect.any(Number),
+      promptMessageId: null,
+    })
+    await Bun.sleep(4)
+    await flushUiApprovalNotifications(store, notifier, () => {}, 1)
+    expect(postCalls).toBe(1)
+    expect(inspectCalls).toBeGreaterThanOrEqual(2)
+    expect(store.uiApprovalRequest(requestId)).toMatchObject({
+      status: 'awaiting',
+      promptMessageId: '1800000000.000701',
+      promptDeliveredAt: expect.any(Number),
+    })
+    expect(store.get(root.id)?.uiApprovalRequestId).toBe(requestId)
+    store.close()
+  })
+
+  test('曖昧なUI画像uploadは5回で失敗確定し全artifactをsettleする', async () => {
+    const store = makeStore()
+    const { root, requestId } = parkUiApprovalFixture(store, {
+      messageId: 'ui-approval-ambiguous-upload',
+    })
+    const request = store.uiApprovalRequest(requestId)!
+    expect(store.beginArtifactDelivery(root.id, request.beforePath, 'FUIAMBIGUOUS')).toBe('started')
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      inspectUpload: async () => false,
+    })
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await flushUiApprovalNotifications(store, notifier, () => {}, 1)
+      await Bun.sleep(2 ** (attempt + 1) + 2)
+    }
+    expect(store.get(root.id)).toMatchObject({
+      status: 'failed',
+      terminalOutcome: 'failed',
+      uiApprovalRequestId: null,
+    })
+    expect(store.uiApprovalRequest(requestId)?.status).toBe('cancelled')
+    expect(store.unsettledArtifactCount(root.id)).toBe(0)
+    expect(store.abandonedArtifactCount(root.id)).toBe(2)
+    expect(store.terminalNotificationCount()).toBe(1)
+    store.close()
+  })
+
+  test('回答待ちの中止は画像deliveryをsettleし、通知後にGCできる', () => {
+    const directory = fixtureDir('zero-ui-cancel-gc-')
+    const store = new JobStore(join(directory, 'jobs.sqlite3'))
+    const { root, requestId } = parkUiApprovalFixture(store, {
+      messageId: 'ui-approval-cancel-gc',
+    })
+    const target = store.interruptControlTarget(root.chatId, root.threadTs)!
+    expect(store.stageLiveControl(target, {
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      messageId: '1800000000.000801',
+      userId: 'UANYMEMBER',
+      task: 'やっぱりやめて',
+      kind: 'interrupt',
+    })).toBe('staged')
+    const claimed = store.claimNext('ui-cancel-worker')!
+    expect(claimed.id).toBe(root.id)
+    store.cancel(root.id)
+    expect(store.uiApprovalRequest(requestId)?.status).toBe('cancelled')
+    expect(store.unsettledArtifactCount(root.id)).toBe(0)
+    expect(store.abandonedArtifactCount(root.id)).toBe(2)
+    const notification = store.pendingTerminalNotifications()[0]!
+    store.markTerminalNotificationDelivered(notification.id)
+    expect(store.pruneSettled({
+      stateDir: directory,
+      now: Date.now() + 10_000,
+      retentionMs: 1,
+      tombstoneRetentionMs: 60_000,
+    }).jobs).toBe(1)
+    expect(store.get(root.id)).toBeNull()
+    store.close()
+  })
+
+  test('park直前の同thread返信は失敗にせず再queueしmonitorを閉じる', async () => {
+    const directory = fixtureDir('zero-ui-park-race-')
+    const store = new JobStore(join(directory, 'jobs.sqlite3'))
+    const root = store.enqueue(input({
+      messageId: 'ui-approval-park-race',
+      task: '画面を改善してください',
+      writeEnabled: true,
+    })).job
+    const controller = new AbortController()
+    let monitorCloses = 0
+    let stagedRace = false
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      signal: controller.signal,
+      closeJobMonitor: async () => { monitorCloses += 1 },
+      quiesceJobMonitor: async current => {
+        if (stagedRace) return
+        stagedRace = true
+        const target = store.liveControlTarget(current.chatId, current.threadTs)!
+        expect(store.stageThreadReply(target, {
+          chatId: current.chatId,
+          threadTs: current.threadTs,
+          messageId: '1800000000.000901',
+          userId: 'UOTHERTEAMMEMBER',
+          task: 'この条件も加えてください',
+          writeEnabled: true,
+          attachments: [],
+        })).toBe('staged')
+        controller.abort()
+      },
+      executor: async current => {
+        store.saveSession(current.id, 'ui-park-race-session')
+        const snapshot = readAdvisorInputSnapshot(directory, current.id)
+        const outbox = artifactDirForJob(directory, current.id)
+        throw new CodexUiApprovalRequiredError({
+          sessionId: 'ui-park-race-session',
+          inputRevision: snapshot.revision,
+          inputDigest: snapshot.digest,
+          repositoryDigest: 'f'.repeat(64),
+          text: '入力競合を検証する提案です。',
+          beforePath: writeSolidTestPng(outbox, 'before-race', 30),
+          afterPath: writeSolidTestPng(outbox, 'after-race', 90),
+        })
+      },
+    })
+    expect(stats).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+    expect(store.get(root.id)).toMatchObject({
+      status: 'queued',
+      terminalOutcome: null,
+      uiApprovalRequestId: null,
+      lastError: 'new same-thread input arrived before UI/UX approval waiting began',
+    })
+    expect(store.listJobInterjections(root.id)).toEqual([
+      expect.objectContaining({ status: 'ready', task: 'この条件も加えてください' }),
+    ])
+    expect(store.terminalNotificationCount()).toBe(0)
+    expect(monitorCloses).toBe(1)
     store.close()
   })
 })
