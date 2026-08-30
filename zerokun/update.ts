@@ -1120,7 +1120,7 @@ function acquireChannelRouteMutationLock(stateDir: string): {
   }
 }
 
-function acquireUpdateLock(stateDir: string): UpdateLockCoordinator {
+export function acquireUpdateLock(stateDir: string): UpdateLockCoordinator {
   prepareManagedStateRoot(stateDir)
   const lockPath = join(stateDir, 'update.lock')
   const pidPath = join(lockPath, 'pid')
@@ -2327,8 +2327,15 @@ type HerdrPaneRecord = {
   tab_id?: unknown
   terminal_id?: unknown
   workspace_id?: unknown
+  cwd?: unknown
+  foreground_cwd?: unknown
   agent?: unknown
   agent_session?: unknown
+}
+
+type HerdrServiceTabRecord = {
+  runtime: HerdrRuntimeIdentity
+  projectDir: string | null
 }
 
 function requireHerdrIdentifier(value: unknown, label: string, pattern: RegExp): string {
@@ -2399,7 +2406,7 @@ function serviceTabRecordPath(stateDir: string): string {
   return join(stateDir, HERDR_SERVICE_TAB_FILE)
 }
 
-function readHerdrServiceTabRecord(stateDir: string): HerdrRuntimeIdentity | null {
+function readHerdrServiceTabRecord(stateDir: string): HerdrServiceTabRecord | null {
   const raw = readOptionalBoundedOwnerOnlyRegularFile(serviceTabRecordPath(stateDir), 32 * 1024)
   if (raw === null) return null
   let value: unknown
@@ -2408,11 +2415,19 @@ function readHerdrServiceTabRecord(stateDir: string): HerdrRuntimeIdentity | nul
     fail('Zeroちゃんruntime tab記録が不正です')
   }
   const record = value as Record<string, unknown>
-  if (Object.keys(record).sort().join('\n') !== 'runtime\nversion'
-    || record.version !== 1 || typeof record.runtime !== 'string') {
+  const versionOne = Object.keys(record).sort().join('\n') === 'runtime\nversion'
+    && record.version === 1
+  const versionTwo = Object.keys(record).sort().join('\n') === 'projectDir\nruntime\nversion'
+    && record.version === 2 && typeof record.projectDir === 'string'
+  if ((!versionOne && !versionTwo) || typeof record.runtime !== 'string') {
     fail('Zeroちゃんruntime tab記録のfieldが不正です')
   }
-  try { return decodeHerdrRuntimeIdentity(record.runtime) } catch {
+  try {
+    return {
+      runtime: decodeHerdrRuntimeIdentity(record.runtime),
+      projectDir: versionTwo ? realpathSync(record.projectDir as string) : null,
+    }
+  } catch {
     fail('Zeroちゃんruntime tab記録のidentityが不正です')
   }
 }
@@ -2420,17 +2435,37 @@ function readHerdrServiceTabRecord(stateDir: string): HerdrRuntimeIdentity | nul
 function writeHerdrServiceTabRecord(
   stateDir: string,
   runtime: HerdrRuntimeIdentity,
+  projectDir: string,
 ): void {
   atomicWritePrivateFile(serviceTabRecordPath(stateDir), `${JSON.stringify({
-    version: 1,
+    version: 2,
     runtime: encodeHerdrRuntimeIdentity(runtime),
+    projectDir: realpathSync(projectDir),
   })}\n`)
 }
 
 function requireOwnedHerdrServiceTab(
   control: HerdrRuntimeIdentity,
   runtime: HerdrRuntimeIdentity,
+  expectedProjectDir?: string,
 ): void {
+  const tabEnvelope = parseHerdrJson(
+    runHerdrCommand(control, ['tab', 'get', runtime.tabId], runtime),
+    'tab get',
+  )
+  const tabResult = tabEnvelope.result
+  const tab = tabResult && typeof tabResult === 'object' && !Array.isArray(tabResult)
+    ? (tabResult as Record<string, unknown>).tab
+    : undefined
+  if (!tab || typeof tab !== 'object' || Array.isArray(tab)) {
+    fail('Herdr tab getにtab情報がありません')
+  }
+  const tabRecord = tab as Record<string, unknown>
+  if (tabRecord.tab_id !== runtime.tabId || tabRecord.workspace_id !== runtime.workspaceId
+    || tabRecord.pane_count !== 1 || tabRecord.label !== 'Zeroちゃん runtime') {
+    fail('Zeroちゃんruntime tabのidentityまたはlabelが変わりました')
+  }
+
   const getEnvelope = parseHerdrJson(
     runHerdrCommand(control, ['pane', 'get', runtime.paneId], runtime),
     'pane get',
@@ -2446,6 +2481,16 @@ function requireOwnedHerdrServiceTab(
   requireAgentlessHerdrPane(pane as HerdrPaneRecord)
   if (!sameHerdrRuntime(herdrRuntimeFromPane(control, pane as HerdrPaneRecord), runtime)) {
     fail('Zeroちゃんruntime tabのpane identityが変わりました')
+  }
+  if (expectedProjectDir) {
+    const expected = realpathSync(expectedProjectDir)
+    const candidate = (pane as HerdrPaneRecord).cwd
+    const foreground = (pane as HerdrPaneRecord).foreground_cwd
+    if (typeof candidate !== 'string' || realpathSync(candidate) !== expected
+      || (foreground !== undefined
+        && (typeof foreground !== 'string' || realpathSync(foreground) !== expected))) {
+      fail('Zeroちゃんruntime tabの作業projectが変わりました')
+    }
   }
 
   const listEnvelope = parseHerdrJson(
@@ -2499,7 +2544,7 @@ async function createHerdrServiceTab(
   }
   try {
     await verifyHerdrRuntimeIdentityAsync(runtime, environmentForPinnedHerdrRuntime(runtime))
-    requireOwnedHerdrServiceTab(control, runtime)
+    requireOwnedHerdrServiceTab(control, runtime, projectDir)
     return runtime
   } catch (error) {
     let cleanupFailure: string | undefined
@@ -2514,9 +2559,108 @@ async function createHerdrServiceTab(
 function closeOwnedHerdrServiceTab(
   control: HerdrRuntimeIdentity,
   runtime: HerdrRuntimeIdentity,
+  expectedProjectDir?: string,
 ): void {
-  requireOwnedHerdrServiceTab(control, runtime)
+  requireOwnedHerdrServiceTab(control, runtime, expectedProjectDir)
   runHerdrCommand(control, ['tab', 'close', runtime.tabId], runtime)
+}
+
+function requireIdleHerdrServiceTab(
+  control: HerdrRuntimeIdentity,
+  runtime: HerdrRuntimeIdentity,
+  expectedProjectDir: string,
+): void {
+  requireOwnedHerdrServiceTab(control, runtime, expectedProjectDir)
+  const envelope = parseHerdrJson(
+    runHerdrCommand(control, ['pane', 'process-info', '--pane', runtime.paneId], runtime),
+    'pane process-info',
+  )
+  const result = envelope.result
+  const info = result && typeof result === 'object' && !Array.isArray(result)
+    ? (result as Record<string, unknown>).process_info
+    : undefined
+  if (!info || typeof info !== 'object' || Array.isArray(info)) {
+    fail('Herdr pane process-infoにprocess情報がありません')
+  }
+  const record = info as Record<string, unknown>
+  const shellPid = record.shell_pid
+  const foreground = record.foreground_processes
+  if (typeof shellPid !== 'number' || !Number.isSafeInteger(shellPid) || shellPid <= 1
+    || !Array.isArray(foreground) || foreground.length !== 1) {
+    fail('Zeroちゃんruntime tabにforeground processが残っています')
+  }
+  const processRecord = foreground[0]
+  if (!processRecord || typeof processRecord !== 'object' || Array.isArray(processRecord)) {
+    fail('Zeroちゃんruntime tabのforeground processが不正です')
+  }
+  const processInfo = processRecord as Record<string, unknown>
+  const shell = typeof processInfo.argv0 === 'string' ? processInfo.argv0.replace(/^-/, '') : ''
+  if (processInfo.pid !== shellPid || !['bash', 'zsh', 'fish', 'sh'].includes(shell)
+    || typeof processInfo.cwd !== 'string'
+    || realpathSync(processInfo.cwd) !== realpathSync(expectedProjectDir)) {
+    fail('Zeroちゃんruntime tabがidle shellではありません')
+  }
+}
+
+export async function closeRecordedHerdrServiceTab(options: {
+  stateDir: string
+  controlRuntime: HerdrRuntimeIdentity
+  projectDir?: string
+  idleTimeoutMs?: number
+}): Promise<'none' | 'closed' | 'missing' | 'current-tab'> {
+  const recorded = readHerdrServiceTabRecord(options.stateDir)
+  if (!recorded) return 'none'
+  const runtime = recorded.runtime
+  if (runtime.tabId === options.controlRuntime.tabId) return 'current-tab'
+  const expectedProjectDir = recorded.projectDir ?? options.projectDir
+  if (!expectedProjectDir) fail('Zeroちゃんruntime tabのproject記録がありません')
+
+  try {
+    await verifyHerdrRuntimeIdentityAsync(
+      runtime,
+      environmentForPinnedHerdrRuntime(runtime),
+    )
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    if (/pane_not_found|tab_not_found|not found/i.test(reason)) {
+      rmSync(serviceTabRecordPath(options.stateDir), { force: true })
+      return 'missing'
+    }
+    throw error
+  }
+
+  const deadline = Date.now() + Math.max(100, options.idleTimeoutMs ?? 10_000)
+  let lastError: unknown
+  while (Date.now() <= deadline) {
+    try {
+      requireIdleHerdrServiceTab(
+        options.controlRuntime,
+        runtime,
+        expectedProjectDir,
+      )
+      // Herdr 0.8.2 has no conditional tab-close primitive. Repeat the full
+      // process-info/ownership check immediately before the exact close to
+      // narrow the remaining TOCTOU window without ever closing on stale data.
+      requireIdleHerdrServiceTab(
+        options.controlRuntime,
+        runtime,
+        expectedProjectDir,
+      )
+      runHerdrCommand(
+        options.controlRuntime,
+        ['tab', 'close', runtime.tabId],
+        runtime,
+      )
+      rmSync(serviceTabRecordPath(options.stateDir), { force: true })
+      return 'closed'
+    } catch (error) {
+      lastError = error
+      await Bun.sleep(100)
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Zeroちゃんruntime tabを安全に閉じられません')
 }
 
 export async function startBotInHerdr(options: {
@@ -2526,8 +2670,11 @@ export async function startBotInHerdr(options: {
   startupTimeoutMs?: number
   replaceTokenFile?: string
   legacyCutover?: boolean
-}): Promise<{ paneId: string; gatewayPid: number }> {
-  const controlRuntime = readPinnedHerdrRuntime(options.stateDir)
+  controlRuntime?: HerdrRuntimeIdentity
+  reuseRecordedTab?: boolean
+  onRuntimeSelected?: (runtime: HerdrRuntimeIdentity) => void
+}): Promise<{ paneId: string; gatewayPid: number; runtime: HerdrRuntimeIdentity }> {
+  const controlRuntime = options.controlRuntime ?? readPinnedHerdrRuntime(options.stateDir)
   const pinnedHerdrEnvironment = environmentForPinnedHerdrRuntime(controlRuntime)
   const timeoutMs = Math.max(1_000, options.startupTimeoutMs ?? 10_000)
   const stateDir = realpathSync(options.stateDir)
@@ -2550,10 +2697,11 @@ export async function startBotInHerdr(options: {
   const recorded = readHerdrServiceTabRecord(options.stateDir)
   let runtime: HerdrRuntimeIdentity
   let createdRuntimeTab = false
-  if (recorded && sameHerdrRuntime(recorded, controlRuntime)) {
+  if (options.reuseRecordedTab !== false
+    && recorded && sameHerdrRuntime(recorded.runtime, controlRuntime)) {
     try {
-      requireOwnedHerdrServiceTab(controlRuntime, recorded)
-      runtime = recorded
+      requireOwnedHerdrServiceTab(controlRuntime, recorded.runtime, options.projectDir)
+      runtime = recorded.runtime
     } catch {
       runtime = await createHerdrServiceTab(controlRuntime, options.projectDir)
       createdRuntimeTab = true
@@ -2562,6 +2710,7 @@ export async function startBotInHerdr(options: {
     runtime = await createHerdrServiceTab(controlRuntime, options.projectDir)
     createdRuntimeTab = true
   }
+  options.onRuntimeSelected?.(runtime)
 
   const restartRequestFile = join(options.stateDir, HERDR_RESTART_REQUEST_FILE)
   atomicWritePrivateFile(restartRequestFile, `${JSON.stringify({
@@ -2600,9 +2749,9 @@ export async function startBotInHerdr(options: {
         if (!sameHerdrRuntime(pinned, runtime)) {
           fail('起動したjob runnerのHerdr runtime identityが専用paneと一致しません')
         }
-        writeHerdrServiceTabRecord(options.stateDir, runtime)
+        writeHerdrServiceTabRecord(options.stateDir, runtime, options.projectDir)
         rmSync(restartRequestFile, { force: true })
-        return { paneId: runtime.paneId, gatewayPid }
+        return { paneId: runtime.paneId, gatewayPid, runtime }
       }
       await Bun.sleep(100)
     }
@@ -2624,7 +2773,7 @@ export async function startBotInHerdr(options: {
       }
     }
     if (retainRuntimeTab) {
-      try { writeHerdrServiceTabRecord(options.stateDir, runtime) } catch (recordError) {
+      try { writeHerdrServiceTabRecord(options.stateDir, runtime, options.projectDir) } catch (recordError) {
         cleanupFailure = recordError instanceof Error ? recordError.message : String(recordError)
       }
     } else {

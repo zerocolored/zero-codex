@@ -37,6 +37,12 @@ case "$INVOKED_AS" in
   zerochan)
     if [ "$#" -eq 0 ]; then
       PROJECT="$(pwd -P)"
+    elif [ "$#" -eq 1 ] && [ "$1" = "start" ]; then
+      LAUNCH_MODE="managed-start"
+      PROJECT="$(pwd -P)"
+    elif [ "$#" -eq 1 ] && [ "$1" = "stop" ]; then
+      LAUNCH_MODE="managed-stop"
+      PROJECT=""
     elif [ "$#" -eq 1 ] && [ "$1" = "--restart" ]; then
       LAUNCH_MODE="restart"
       PROJECT="$(bun --config=/dev/null --no-env-file \
@@ -55,7 +61,7 @@ case "$INVOKED_AS" in
       LAUNCH_MODE="status"
       PROJECT="$(pwd -P)"
     else
-      echo "使い方: zerochan | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
+      echo "使い方: zerochan | zerochan start | zerochan stop | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
       exit 2
     fi
     ;;
@@ -75,6 +81,14 @@ case "$INVOKED_AS" in
     fi
     ;;
 esac
+
+# stop is global to this installed Slack App and intentionally does not select,
+# sync, or mutate a project route. The service controller still verifies the
+# current Herdr control plane before signalling any exact process generation.
+if [ "$LAUNCH_MODE" = "managed-stop" ]; then
+  exec bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/service-control.ts" stop "$REPO_DIR" "$STATE_DIR"
+fi
 
 # Resolve and validate the selected project before consuming a restart token,
 # recovering an update journal, checking Slack credentials, or signalling any
@@ -210,6 +224,14 @@ bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-identity.ts" v
   || { echo "❌ Slack Bot/App token identityを検証できませんでした。既存processは停止しません。" >&2; exit 1; }
 EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1:$RUNNER_RUNTIME_ID"
 
+# A normal/legacy launcher must not race a managed stop/start or updater. The
+# authorized updater restart already owns this same lock and is the sole
+# internal exception. Managed start acquires the lock inside service-control.
+if [ "$AUTHORIZED_UPDATE_RESTART" != "1" ] && [ "$LAUNCH_MODE" != "managed-start" ]; then
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/service-control.ts" \
+    assert-idle "$STATE_DIR" || exit 1
+fi
+
 if [ -f "$STATE_DIR/update-transaction.json" ] && [ "$AUTHORIZED_UPDATE_RESTART" != "1" ]; then
   echo "⚠️  未完了の自己更新を検出しました。旧版へ復旧します。" >&2
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/update.ts" --recover-only
@@ -249,6 +271,12 @@ EXPECTED_RUNNER_RUNTIME="$EXPECTED_RUNNER_RUNTIME:$HERDR_RUNTIME_ID"
 if [ "${ZEROKUN_DRY_RUN:-0}" != "1" ] && [ "$AUTHORIZED_UPDATE_RESTART" != "1" ]; then
   bun --config=/dev/null --no-env-file "$CHANNEL_CONFIG" \
     sync "$PROJECT" "$STATE_DIR" "$SLACK_APP_ID" || exit 1
+fi
+
+if [ "$LAUNCH_MODE" = "managed-start" ]; then
+  exec bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/service-control.ts" start \
+    "$REPO_DIR" "$STATE_DIR" "$PROJECT" "$SLACK_APP_ID"
 fi
 
 existing_bridge_pid=""

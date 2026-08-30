@@ -24,6 +24,7 @@ describe('Zero-kun watchdog', () => {
     expect(stdout).toContain('ok: stale update maintenance resumes down alert')
     expect(stdout).toContain('ok: active restart maintenance suppresses down alert')
     expect(stdout).toContain('ok: stale restart maintenance resumes down alert')
+    expect(stdout).toContain('ok: intentional stop suppresses down alert')
     expect(stdout).toContain('ok: transient down sends nothing')
     expect(stdout).toContain('ok: second down sends alert')
     expect(stdout).toContain('ok: down reminder is suppressed')
@@ -60,8 +61,9 @@ describe('Zero-kun watchdog', () => {
       watchdogSource.indexOf('with open(next_path', start),
     )
     expect(alertProgram).toContain('現在、応答できない状態です')
+    expect(alertProgram).toContain('zerochan stop → zerochan start')
     expect(alertProgram).not.toContain('Zeroちゃん')
-    expect(alertProgram).toContain('zerochan --restart')
+    expect(alertProgram).toContain('zerochan start')
     expect(alertProgram).not.toContain('zerokun-restart')
     expect(alertProgram).not.toContain('bridge:')
     expect(alertProgram).not.toContain('job-runner:')

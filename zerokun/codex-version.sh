@@ -129,6 +129,8 @@ zerokun_herdr_capabilities_ready() {
   case "$help" in *'--pane'*) ;; *) return 1 ;; esac
   help="$(zerokun_herdr_probe "$binary" pane get --help 2>&1)" || return 1
   case "$help" in *'Usage: herdr pane get'*) ;; *) return 1 ;; esac
+  help="$(zerokun_herdr_probe "$binary" tab get --help 2>&1)" || return 1
+  case "$help" in *'Usage: herdr tab get'*) ;; *) return 1 ;; esac
   help="$(zerokun_herdr_probe "$binary" tab close --help 2>&1)" || return 1
   case "$help" in *'Usage: herdr tab close'*) ;; *) return 1 ;; esac
   help="$(zerokun_herdr_probe "$binary" agent list --help 2>&1)" || return 1

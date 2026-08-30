@@ -107,6 +107,7 @@ import {
 } from './herdr-runtime.ts'
 import { isSlackInterruptCommand } from './live-control.ts'
 import { resolveAdvisorProjectLayout } from './advisor-snapshot.ts'
+import { acknowledgeServiceControlPauseIfRequested } from './service-control-state.ts'
 
 export class SlackChannelRouteRequiredError extends Error {
   constructor(readonly channelId: string) {
@@ -11144,9 +11145,23 @@ async function runCli(): Promise<void> {
   }
   const herdrIdentityTimer = setInterval(checkHerdrIdentity, 5_000)
   herdrIdentityTimer.unref()
+  let serviceControlPauseWarning = ''
   const shouldPause = (): boolean => {
     if (slackIdentityChanged() || herdrIdentityInvalid) return true
-    return updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
+    const paused = updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
+    if (paused) {
+      try {
+        acknowledgeServiceControlPauseIfRequested(dir)
+        serviceControlPauseWarning = ''
+      } catch (error) {
+        const warning = error instanceof Error ? error.message : String(error)
+        if (warning !== serviceControlPauseWarning) {
+          log(`service control pause acknowledgement failed: ${warning}`)
+          serviceControlPauseWarning = warning
+        }
+      }
+    }
+    return paused
   }
 
   type MonitorGuard = {

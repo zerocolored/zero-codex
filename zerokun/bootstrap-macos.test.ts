@@ -23,7 +23,7 @@ const completeHerdrCapabilities = [
   '--current --workspace --cwd --label --no-focus --match --source --lines',
   '--kind --pane --wait --until --timeout',
   'Usage: herdr workspace list Usage: herdr workspace get Usage: herdr workspace close',
-  'Usage: herdr pane run Usage: herdr pane get Usage: herdr tab close',
+  'Usage: herdr pane run Usage: herdr pane get Usage: herdr tab get Usage: herdr tab close',
   'Usage: herdr agent list Usage: herdr agent get Usage: herdr agent send-keys',
 ].join(' ')
 const herdrCapabilitiesWithoutUntil = completeHerdrCapabilities.replace(' --until', '')
@@ -919,7 +919,7 @@ herdr --version
       "echo 'Usage: herdr workspace close'",
       "echo 'Usage: herdr pane run'",
       "echo 'Usage: herdr pane get'",
-      "echo 'Usage: herdr tab close'",
+      "echo 'Usage: herdr tab get Usage: herdr tab close'",
       "echo '--current --no-focus --workspace --cwd --label --match --source --lines --timeout --until --wait --pane --kind'",
       "echo 'Usage: herdr agent list Usage: herdr agent get Usage: herdr agent send-keys'",
       '',

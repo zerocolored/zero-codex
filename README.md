@@ -182,14 +182,13 @@ Homebrew/npm版だけを使った直接`setup.sh`は、後日の安全な自己�
 4. 新PCで`bash zerokun/bootstrap-macos.sh --slack-only`を実行します。既存Appのtoken identityを検証し、
    App IDに結び付いた履歴下限を保存します。このcommandだけではSocket Mode gatewayを起動しません。
 5. 旧PCで`touch "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/watchdog-off"`を実行し、停止警報を無効にします。
-6. 旧PCの`zerochan`を起動したpaneで`Ctrl-C`を押し、`zerochan status`でgateway停止を確認します。
+6. 旧PCで`zerochan stop`を実行し、`zerochan status`でgateway停止を確認します。
 7. 下の「3. projectとSlackチャンネルを設定して起動する」を新PCで終えてから、Slackへの依頼を再開します。
 
 `jobs.sqlite3`、process lock、監視tab、inbox/outboxなどのruntime stateはコピーしません。channel紐付け、
 DM pairing、repository write許可は新PCで設定し直します。履歴下限より前の旧依頼は新しい空DBでも
 再実行されず、下限より後に届いた依頼は通常の履歴回収とdurable dedupの対象です。旧PCのgatewayを再び起動する場合は、先に
-新PC側を停止するか、そのPC用の別Slack Appへ切り替えてください。`Ctrl-C`後も旧PCのidle runnerは
-未処理queue保護のため残りますが、Socket Mode接続はgatewayとともに停止しています。
+新PC側を`zerochan stop`で停止するか、そのPC用の別Slack Appへ切り替えてください。
 
 ### 2B. 複数PCを同時に動かす
 
@@ -216,7 +215,7 @@ bash zerokun/bootstrap-macos.sh --slack-only \
 ```bash
 cd /absolute/path/to/project
 zerochan set slack-channel C0123456789
-zerochan
+zerochan start
 ```
 
 複数channelを同じprojectへ紐付ける場合は、channel IDを変えて`zerochan set slack-channel`を繰り返します。
@@ -320,7 +319,11 @@ zerochan-access write deny U0123456789
 # setup後、Herdrの専用paneで対象projectへ移動して起動
 cd /absolute/path/to/project
 zerochan set slack-channel C0123456789
-zerochan
+zerochan start
+
+# runtime log tabごと安全に停止・再作成
+zerochan stop
+zerochan start
 
 # 設定・解除・確認
 zerochan status
@@ -336,15 +339,15 @@ frontend／backend／appのような複数repositoryを1つの親folderに置い
 `.zerochan/workspace.json`へ固定し、各repositoryを個別にtest・commit・pushします。隠しfolder、
 symlink、Gitではない直下項目は作業対象に含めません。
 
-`zerochan` はHerdr外からの起動を拒否します。引数やexportは不要です。最初の起動だけが共有gatewayと
-runnerを開始し、別projectからの2つ目以降の起動はそのprojectのlocal設定を共有gatewayへ同期して
-終了します。実行した物理directoryは新しいDM threadのprojectとして使います。互換alias `zerokun` も現在directoryを使い、
-`zerochan --restart`（互換alias `zerokun-restart`）は前回Slackへ接続できたprojectを使い、
-確認promptなしで既存gatewayを安全に入れ替えます。互換runnerは長時間taskを守るため継続利用します。
-Herdrの専用paneで、永続 job runner を独立process groupへ
-起動してから Slack gateway を前景で起動します。gateway は
-`Ctrl-C` で停止しますが、runner はそのsignalを受けず未処理 queue のため常駐します。macOS の watchdog が
-60秒ごとに両方を確認します。
+`zerochan start` はHerdr外からの起動を拒否します。引数やexportは不要です。実行した物理directoryを
+対象projectとして、現在のHerdr workspaceへ新しい `Zeroちゃん runtime` tabを作り、gatewayとrunnerの
+安定起動を確認して元のterminalへ戻ります。既に正常稼働中なら何も入れ替えません。
+
+runtime log tabを作り直す場合は `zerochan stop` → `zerochan start` を使います。`stop`はrunnerの
+新規job取得を止めてから実行中jobが0件であることを再確認し、実行中ならprocessへsignalせず拒否します。
+待機中jobとSlack channel設定は保持されます。停止に成功するとgateway、runner、所有確認できたruntime tabを
+終了し、意図的停止中のwatchdog警報を抑止します。裸の`zerochan`、`zerokun`、`zerochan --restart`は
+従来運用との互換用に残ります。通常運用では`start`/`stop`を使用してください。
 
 更新:
 

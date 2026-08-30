@@ -76,6 +76,7 @@ import {
   takeSlackTokensFromEnvironment,
 } from './zerokun/child-environment.ts'
 import { verifySlackAppTokenPair } from './zerokun/slack-app-identity.ts'
+import { clearIntentionalServiceStop } from './zerokun/service-control-state.ts'
 import {
   copyLiveControlAttachments,
   isSlackInterruptCommand,
@@ -2056,6 +2057,10 @@ try {
     connectedProjectDir,
     identity.appId,
   )
+  // Every successful startup path (managed start, updater restart, and the
+  // legacy launcher) re-enables crash alerts only after Socket Mode and the
+  // generation-bound readiness record are both established.
+  clearIntentionalServiceStop(STATE_DIR)
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 
   // Sweep once on startup for new mentions/DMs, and recover replies in owned threads.

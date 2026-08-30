@@ -25,6 +25,7 @@ import {
   assertPinnedRepositoryState,
   buildCandidatePermissionOverrides,
   clearJournal,
+  closeRecordedHerdrServiceTab,
   copySecureExecutableForTesting,
   createUpdaterTemporaryDirectory,
   fastForwardRepositories,
@@ -267,6 +268,24 @@ function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, s
   if (socketIdentity) serviceIdentities.push(socketIdentity)
 
   const herdr = join(fixture.base, 'herdr-fixture')
+  const runtimePane = {
+    agent_status: 'unknown',
+    cwd: realpathSync(fixture.project),
+    foreground_cwd: realpathSync(fixture.project),
+    pane_id: 'wT:pR',
+    tab_id: 'wT:tR',
+    terminal_id: 'term_feedface012345',
+    workspace_id: 'wT',
+  }
+  const runtimeTab = {
+    agent_status: 'unknown',
+    focused: false,
+    label: 'Zeroちゃん runtime',
+    number: 2,
+    pane_count: 1,
+    tab_id: 'wT:tR',
+    workspace_id: 'wT',
+  }
   writeFileSync(herdr, [
     '#!/bin/sh',
     'set -eu',
@@ -277,12 +296,16 @@ function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, s
     'if [ "$1" = tab ] && [ "$2" = create ]; then',
     `  : > ${JSON.stringify(join(fixture.base, 'herdr-runtime-tab-created'))}`,
     `  printf '%s\\n' "$@" > ${JSON.stringify(join(fixture.base, 'herdr-tab-create.argv'))}`,
-    "  printf '%s\\n' '{\"result\":{\"root_pane\":{\"agent_status\":\"unknown\",\"pane_id\":\"wT:pR\",\"tab_id\":\"wT:tR\",\"terminal_id\":\"term_feedface012345\",\"workspace_id\":\"wT\"},\"tab\":{\"label\":\"Zeroちゃん runtime\",\"pane_count\":1,\"tab_id\":\"wT:tR\",\"workspace_id\":\"wT\"}},\"type\":\"tab_created\"}'",
+    `  printf '%s\\n' ${JSON.stringify(JSON.stringify({ result: { root_pane: runtimePane, tab: runtimeTab }, type: 'tab_created' }))}`,
+    '  exit 0',
+    'fi',
+    'if [ "$1" = tab ] && [ "$2" = get ] && [ "$3" = wT:tR ] && [ -f ' + JSON.stringify(join(fixture.base, 'herdr-runtime-tab-created')) + ' ]; then',
+    `  printf '%s\\n' ${JSON.stringify(JSON.stringify({ result: { tab: runtimeTab }, type: 'tab_info' }))}`,
     '  exit 0',
     'fi',
     'if [ "$1" = pane ] && [ "$2" = get ]; then',
     '  if [ "$3" = wT:pR ] && [ -f ' + JSON.stringify(join(fixture.base, 'herdr-runtime-tab-created')) + ' ]; then',
-    "    printf '%s\\n' '{\"result\":{\"pane\":{\"agent_status\":\"unknown\",\"pane_id\":\"wT:pR\",\"tab_id\":\"wT:tR\",\"terminal_id\":\"term_feedface012345\",\"workspace_id\":\"wT\"}},\"type\":\"pane_info\"}'",
+    `    printf '%s\\n' ${JSON.stringify(JSON.stringify({ result: { pane: runtimePane }, type: 'pane_info' }))}`,
     '    exit 0',
     '  fi',
     '  if [ "$3" = wT:p1 ]; then',
@@ -293,9 +316,18 @@ function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, s
     'fi',
     'if [ "$1" = pane ] && [ "$2" = list ]; then',
     '  if [ -f ' + JSON.stringify(join(fixture.base, 'herdr-runtime-tab-created')) + ' ]; then',
-    "    printf '%s\\n' '{\"result\":{\"panes\":[{\"agent\":\"codex\",\"agent_session\":{\"agent\":\"codex\"},\"pane_id\":\"wT:p1\",\"tab_id\":\"wT:t1\",\"terminal_id\":\"term_abcdef012345\",\"workspace_id\":\"wT\"},{\"agent_status\":\"unknown\",\"pane_id\":\"wT:pR\",\"tab_id\":\"wT:tR\",\"terminal_id\":\"term_feedface012345\",\"workspace_id\":\"wT\"}]},\"type\":\"pane_list\"}'",
+    `    printf '%s\\n' ${JSON.stringify(JSON.stringify({ result: { panes: [{ agent: 'codex', agent_session: { agent: 'codex' }, pane_id: 'wT:p1', tab_id: 'wT:t1', terminal_id: 'term_abcdef012345', workspace_id: 'wT' }, runtimePane] }, type: 'pane_list' }))}`,
     '  else',
     "    printf '%s\\n' '{\"result\":{\"panes\":[{\"agent\":\"codex\",\"agent_session\":{\"agent\":\"codex\"},\"pane_id\":\"wT:p1\",\"tab_id\":\"wT:t1\",\"terminal_id\":\"term_abcdef012345\",\"workspace_id\":\"wT\"}]},\"type\":\"pane_list\"}'",
+    '  fi',
+    '  exit 0',
+    'fi',
+    'if [ "$1" = pane ] && [ "$2" = process-info ] && [ "$3" = --pane ] && [ "$4" = wT:pR ]; then',
+    `  printf '%s\\n' "$@" >> ${JSON.stringify(join(fixture.base, 'herdr-process-info.argv'))}`,
+    `  if [ -f ${JSON.stringify(join(fixture.base, 'herdr-runtime-busy'))} ]; then`,
+    `    printf '%s\\n' ${JSON.stringify(JSON.stringify({ result: { process_info: { shell_pid: 4321, foreground_processes: [{ pid: 9999, argv0: 'bun', cwd: realpathSync(fixture.project) }] } }, type: 'pane_process_info' }))}`,
+    '  else',
+    `    printf '%s\\n' ${JSON.stringify(JSON.stringify({ result: { process_info: { shell_pid: 4321, foreground_processes: [{ pid: 4321, argv0: 'zsh', cwd: realpathSync(fixture.project) }] } }, type: 'pane_process_info' }))}`,
     '  fi',
     '  exit 0',
     'fi',
@@ -884,6 +916,13 @@ describe('updater helpers', () => {
     expect(setup).not.toContain('delegate-parent')
   })
 
+  test('setup完了案内は可視log tabを再生成するstop/start導線を示す', () => {
+    const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
+    expect(setup).toContain('Herdr内で起動: zerochan start')
+    expect(setup).toContain('ログtabごと起動し直す: zerochan stop → zerochan start')
+    expect(setup).not.toContain('Herdrの専用paneで起動: zerochan')
+  })
+
   test('旧updaterからのsetupはstate作成より前にoffline bootstrapを案内して停止する', () => {
     const root = fixtureDir()
     const home = join(root, 'home')
@@ -1395,6 +1434,68 @@ describe('updater helpers', () => {
         else process.env[key] = value
       }
     }
+  })
+
+  test('停止済み専用runtime tabは実Herdr 0.8.2形のidle shellを2回確認して閉じる', async () => {
+    const fixture = updaterFixture()
+    chmodSync(fixture.state, 0o700)
+    const environment = serviceUpdaterEnvironment(fixture, 'unused-fixture-session')
+    const control = requireHerdrRuntime(environment)
+    const runtime = {
+      ...control,
+      paneId: 'wT:pR',
+      tabId: 'wT:tR',
+      terminalId: 'term_feedface012345',
+    }
+    writeFileSync(join(fixture.base, 'herdr-runtime-tab-created'), '')
+    writeFileSync(join(fixture.state, 'herdr-service-tab.json'), `${JSON.stringify({
+      version: 2,
+      runtime: encodeHerdrRuntimeIdentity(runtime),
+      projectDir: realpathSync(fixture.project),
+    })}\n`, { mode: 0o600 })
+
+    expect(await closeRecordedHerdrServiceTab({
+      stateDir: fixture.state,
+      controlRuntime: control,
+      projectDir: fixture.project,
+      idleTimeoutMs: 500,
+    })).toBe('closed')
+    expect(existsSync(join(fixture.state, 'herdr-service-tab.json'))).toBe(false)
+    expect(existsSync(join(fixture.base, 'herdr-runtime-tab-created'))).toBe(false)
+    const probes = readFileSync(join(fixture.base, 'herdr-process-info.argv'), 'utf8')
+    expect(probes.match(/process-info/g)).toHaveLength(2)
+    expect(readFileSync(join(fixture.base, 'herdr-tab-close.argv'), 'utf8'))
+      .toContain('tab\nclose\nwT:tR')
+  })
+
+  test('専用runtime tabにshell以外が残れば閉じず記録を保持する', async () => {
+    const fixture = updaterFixture()
+    chmodSync(fixture.state, 0o700)
+    const environment = serviceUpdaterEnvironment(fixture, 'unused-fixture-session')
+    const control = requireHerdrRuntime(environment)
+    const runtime = {
+      ...control,
+      paneId: 'wT:pR',
+      tabId: 'wT:tR',
+      terminalId: 'term_feedface012345',
+    }
+    writeFileSync(join(fixture.base, 'herdr-runtime-tab-created'), '')
+    writeFileSync(join(fixture.base, 'herdr-runtime-busy'), '')
+    writeFileSync(join(fixture.state, 'herdr-service-tab.json'), `${JSON.stringify({
+      version: 2,
+      runtime: encodeHerdrRuntimeIdentity(runtime),
+      projectDir: realpathSync(fixture.project),
+    })}\n`, { mode: 0o600 })
+
+    await expect(closeRecordedHerdrServiceTab({
+      stateDir: fixture.state,
+      controlRuntime: control,
+      projectDir: fixture.project,
+      idleTimeoutMs: 100,
+    })).rejects.toThrow('idle shell')
+    expect(existsSync(join(fixture.state, 'herdr-service-tab.json'))).toBe(true)
+    expect(existsSync(join(fixture.base, 'herdr-runtime-tab-created'))).toBe(true)
+    expect(existsSync(join(fixture.base, 'herdr-tab-close.argv'))).toBe(false)
   })
 
   test('同名の無関係tmux sessionを停止せずfail-closedにする', async () => {

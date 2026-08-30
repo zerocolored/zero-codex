@@ -166,8 +166,16 @@ maintenance_active() {
   # A transaction journal by itself is not maintenance: after a crashed
   # updater the orphaned services must still alert. Suppress only while the
   # exact local update/restart owner is visibly alive.
+  if private_regular_file "$STATE_DIR/service-stopped.json" \
+      && [ "$(/bin/cat "$STATE_DIR/service-stopped.json" 2>/dev/null)" \
+        = '{"version":1,"status":"stopped"}' ]; then
+    return 0
+  fi
   if private_regular_file "$STATE_DIR/update-transaction.json" \
-      && process_matches "$STATE_DIR/update.lock/pid" '(update\.ts|zerokun-update|setup\.sh)'; then
+      && process_matches "$STATE_DIR/update.lock/pid" '(update\.ts|zerokun-update|setup\.sh|service-control\.ts)'; then
+    return 0
+  fi
+  if process_matches "$STATE_DIR/update.lock/pid" 'service-control\.ts'; then
     return 0
   fi
   process_matches "$STATE_DIR/restart.lock/pid" 'codex-channel\.sh'
@@ -391,7 +399,7 @@ else:
         since = dt.datetime.fromtimestamp(down_since).strftime("%H:%M")
         alert = (
             f"🚨 現在、応答できない状態です。{since}から応答できていません。"
-            "復旧するには、Macの端末で zerochan --restart を実行してください。"
+            "復旧するには、Macの端末で zerochan stop → zerochan start を実行してください。"
         )
         last_alert = now
     next_state = {
@@ -570,6 +578,17 @@ selftest() {
   printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
   ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH" >/dev/null
   rm -f "$test_dir/restart.lock/pid" "$test_dir/watchdog-state.json"
+
+  printf '%s\n' '{"version":1,"status":"stopped"}' > "$test_dir/service-stopped.json"
+  chmod 600 "$test_dir/service-stopped.json"
+  rm -f "$test_dir/plugin.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$output$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$output$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* && "$output" == *'maintenance=active'* ]] \
+    || selftest_fail 'intentional stop alert' || return 1
+  printf 'ok: intentional stop suppresses down alert\n'
+  rm -f "$test_dir/service-stopped.json" "$test_dir/watchdog-state.json"
 
   rm -f "$test_dir/plugin.lock"
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"

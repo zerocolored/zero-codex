@@ -39,7 +39,7 @@ codex login status
 # Herdrの専用pane内で対象projectへ移動して実行
 cd /absolute/path/to/project
 zerochan set slack-channel C0123456789
-zerochan
+zerochan start
 ```
 
 対象folder直下にfrontend／backend／appなどの通常cloneが2件以上ある場合は、対象folder自身が
@@ -49,7 +49,8 @@ Git repositoryでなくてもmulti-repository workspaceとして起動できま�
 
 | ファイル | 役割 |
 |---|---|
-| `../codex-channel.sh` | runner を常駐起動し、gateway を前景起動 |
+| `../codex-channel.sh` | `zerochan start/stop`の検証とservice controllerへの委譲 |
+| `service-control.ts` | job保護付き停止、専用runtime tab作成、安定起動確認 |
 | `../server.ts` | Slack Socket Mode、access gate、添付取得、durable enqueue、catch-up |
 | `job-runner.ts` | SQLite FIFO、thread/session 所有権、Slack 通知 |
 | `runner-launcher.ts` | runnerの独立process group起動、安全なlog接続 |
@@ -315,8 +316,10 @@ token、access、queue、lock が別物になります。
 ```bash
 cd /absolute/path/to/project
 zerochan set slack-channel C0123456789
-zerochan
-zerochan --restart  # 前回接続したprojectのgatewayを確認promptなしで安全に再起動
+zerochan start
+zerochan stop       # 実行中jobがある場合は何も停止せず拒否
+zerochan start      # 新しい「Zeroちゃん runtime」tabを作って再開
+zerochan --restart  # 従来互換。通常は stop → start を使用
 zerochan status
 zerochan unset slack-channel
 zerokun             # 互換alias。現在directoryで起動
@@ -329,7 +332,7 @@ zerokun-update
 チャンネルは利用するSlack Appを招待し、対象projectで `zerochan set slack-channel C...` を実行すると
 利用できます。新しい依頼はメンション、同じthreadの続きはメンション不要です。設定はGitに
 含まれない `.zerochan/config.json` に保存され、`routes.json`の編集は不要です。最初の
-`zerochan`だけが共有gateway/runnerを起動し、別projectからの起動は同じserviceへ参加して終了します。
+`zerochan start`だけが共有gateway/runnerを起動し、別projectからの起動は同じserviceへ参加して終了します。
 既存threadは最初のprojectへ固定されたままです。DMは共有gatewayを起動したprojectを使います。
 multi-repository workspaceのmemberは初回設定時に`.zerochan/workspace.json`へ固定されます。
 隠しfolder、symlink、Gitではない直下項目は作業対象外で、変更した各memberは個別に

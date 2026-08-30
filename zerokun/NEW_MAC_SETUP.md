@@ -41,13 +41,12 @@ bash zerokun/bootstrap-macos.sh --slack-only
 
 このcommandはApp IDに結び付いた履歴下限を保存しますが、Socket Mode gatewayは起動しません。
 その後、旧PCのwatchdogを
-`touch "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/watchdog-off"`で無効化し、`zerochan`を
-起動したpaneで`Ctrl-C`を押します。`zerochan status`が停止中になってから新PCのgatewayを起動し、
+`touch "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/watchdog-off"`で無効化し、`zerochan stop`を
+実行します。`zerochan status`が停止中になってから新PCのgatewayを起動し、
 Slackへの依頼を再開します。
 
 `jobs.sqlite3`、lock、監視tab、inbox/outboxなどのruntime stateはコピーしません。channel紐付け、
-DM pairing、write許可は新PCで設定し直します。`Ctrl-C`後もidle runnerは残りますが、Socket Mode接続は
-gatewayとともに停止しています。履歴下限より前の旧依頼はfresh DBでも再実行されません。旧PCでは
+DM pairing、write許可は新PCで設定し直します。履歴下限より前の旧依頼はfresh DBでも再実行されません。旧PCでは
 gatewayを再起動しないでください。
 
 同時稼働で新しいAppを作る場合は、表示名をPCごとに変えられます。
@@ -160,7 +159,7 @@ codex login status
 zerochan-access status
 cd /absolute/path/to/project
 zerochan set slack-channel C0123456789
-zerochan
+zerochan start
 ```
 
 別 terminal で確認:
@@ -198,7 +197,7 @@ write access を付けない利用者は、HOME/stateをdenyして対象reposito
 job専用permission profileで調査・説明だけを利用できます。
 
 Zeroちゃん本体repositoryへのwrite jobはhost runtime保護のため拒否されます。変更対象projectへ
-`cd`し、`zerochan set slack-channel C...`でSlackチャンネルを紐付けてから`zerochan`を
+`cd`し、`zerochan set slack-channel C...`でSlackチャンネルを紐付けてから`zerochan start`を
 起動してください。新しいchannel threadはその設定先、DMはgatewayを起動したprojectへ固定されます。
 対象folder自身がGit repositoryでなくても、直下に通常cloneが2件以上あれば同じ手順で
 multi-repository workspaceとして利用できます。検出したmemberは`.zerochan/workspace.json`へ

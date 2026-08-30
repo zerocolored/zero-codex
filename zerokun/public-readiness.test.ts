@@ -542,4 +542,15 @@ describe('public Codex defaults', () => {
     expect(server.match(/writeLastConnectedProject\(/g)).toHaveLength(1)
     expect(server).not.toContain('clearLastConnectedProject')
   })
+
+  test('全起動経路はSlack接続とreadiness公開後に意図的停止markerを解除する', () => {
+    const server = readFileSync(join(import.meta.dir, '..', 'server.ts'), 'utf8')
+    const start = server.indexOf('await slackApp.start()')
+    const ready = server.indexOf('writeGatewayReadiness(\n    READY_FILE,', start)
+    const clear = server.indexOf('clearIntentionalServiceStop(STATE_DIR)', ready)
+    expect(start).toBeGreaterThan(-1)
+    expect(ready).toBeGreaterThan(start)
+    expect(clear).toBeGreaterThan(ready)
+    expect(server.match(/clearIntentionalServiceStop\(STATE_DIR\)/g)).toHaveLength(1)
+  })
 })

@@ -257,7 +257,7 @@ async function runLauncher(
     "echo 'Usage: herdr workspace close'",
     "echo 'Usage: herdr pane run'",
     "echo 'Usage: herdr pane get'",
-    "echo 'Usage: herdr tab close'",
+    "echo 'Usage: herdr tab get Usage: herdr tab close'",
     'if [ "${FAKE_HERDR_MISSING_UNTIL:-0}" = "1" ]; then',
     "  echo '--current --workspace --cwd --label --no-focus --match --source --lines --kind --pane --wait --timeout'",
     'else',
@@ -300,6 +300,45 @@ async function runLauncher(
 }
 
 describe('codex-channel.sh replacement guard', () => {
+  test('zerochan start/stopは専用service controllerへ正しいscopeで委譲する', async () => {
+    const state = fixture()
+    const project = join(dirname(state), 'project')
+    const startLog = join(state, 'start-bun.log')
+    const start = await runLauncher(state, { FAKE_BUN_LOG: startLog }, undefined, {
+      invokedAs: 'zerochan', cwd: project, args: ['start'],
+    })
+    expect(start.exitCode, start.output).toBe(0)
+    const startCalls = readFileSync(startLog, 'utf8')
+    expect(startCalls).toContain(
+      `service-control.ts start ${dirname(import.meta.dir)} ${state} ${realpathSync(project)} A0123456789`,
+    )
+
+    const stopLog = join(state, 'stop-bun.log')
+    const stop = await runLauncher(state, { FAKE_BUN_LOG: stopLog }, undefined, {
+      invokedAs: 'zerochan', cwd: project, args: ['stop'],
+    })
+    expect(stop.exitCode, stop.output).toBe(0)
+    const stopCalls = readFileSync(stopLog, 'utf8')
+    expect(stopCalls).toContain(`service-control.ts stop ${dirname(import.meta.dir)} ${state}`)
+    expect(stopCalls).not.toContain('slack-app-identity.ts')
+    expect(stopCalls).not.toContain('project-selection.ts')
+  })
+
+  test('legacy startはmanaged service/update lockとの競合検査を先に通す', async () => {
+    const state = fixture()
+    const project = join(dirname(state), 'project')
+    const log = join(state, 'legacy-start-bun.log')
+    const result = await runLauncher(state, { FAKE_BUN_LOG: log }, undefined, {
+      invokedAs: 'zerochan', cwd: project,
+    })
+    expect(result.exitCode, result.output).toBe(0)
+    const calls = readFileSync(log, 'utf8')
+    const assertion = calls.indexOf(`service-control.ts assert-idle ${state}`)
+    const runtimeProbe = calls.indexOf('herdr-runtime.ts runtime-id')
+    expect(assertion).toBeGreaterThan(-1)
+    expect(runtimeProbe).toBeGreaterThan(assertion)
+  })
+
   test('zerochan set/unset/statusはcurrent projectのlocal channel設定を操作する', async () => {
     const state = fixture()
     const project = realpathSync(join(dirname(state), 'project'))

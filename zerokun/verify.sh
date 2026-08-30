@@ -292,6 +292,8 @@ for entry in \
   zerokun/codex-supervisor.ts \
   zerokun/live-codex-permission-check.ts \
   zerokun/access.ts \
+  zerokun/service-control-state.ts \
+  zerokun/service-control.ts \
   zerokun/update.ts \
   zerokun/update-restart.ts \
   zerokun/update-request.ts \
