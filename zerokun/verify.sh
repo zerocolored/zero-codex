@@ -293,6 +293,7 @@ for entry in \
   zerokun/live-codex-permission-check.ts \
   zerokun/access.ts \
   zerokun/update.ts \
+  zerokun/update-restart.ts \
   zerokun/update-request.ts \
   zerokun/update-runtime.ts
 do

@@ -61,7 +61,11 @@ import {
 } from './process-tree.ts'
 import { signalProcessIfLive } from './process-generation.ts'
 import { resolveOfficialStandaloneCodex } from './standalone-codex.ts'
-import { requireHerdrRuntime, writePinnedHerdrRuntime } from './herdr-runtime.ts'
+import {
+  encodeHerdrRuntimeIdentity,
+  requireHerdrRuntime,
+  writePinnedHerdrRuntime,
+} from './herdr-runtime.ts'
 
 const directories: string[] = []
 const tmuxSessions: string[] = []
@@ -140,7 +144,7 @@ function makeRepo(base: string) {
   writeFileSync(join(seed, 'zerokun', 'fixture-lock.ts'), lockSource)
   writeFileSync(join(seed, 'zerokun', 'job-runner.ts'), [
     "import { Database } from 'bun:sqlite'",
-    "import { writeFileSync } from 'fs'",
+    "import { readFileSync, writeFileSync } from 'fs'",
     "import { join } from 'path'",
     "import { acquire } from './fixture-lock.ts'",
     'const state = process.env.ZEROKUN_STATE_DIR!',
@@ -157,6 +161,13 @@ function makeRepo(base: string) {
     '  process.exit(0)',
     '}',
     "acquire(join(state, 'job-runner.lock', 'pid'))",
+    "const runtimePath = join(state, 'herdr-runtime.json')",
+    "const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))",
+    "runtime.paneId = process.env.HERDR_PANE_ID",
+    "runtime.tabId = process.env.HERDR_TAB_ID",
+    "runtime.terminalId = process.env.HERDR_TERMINAL_ID",
+    "runtime.workspaceId = process.env.HERDR_WORKSPACE_ID",
+    "writeFileSync(runtimePath, JSON.stringify(runtime), { mode: 0o600 })",
     "writeFileSync(join(state, 'job-runner.lock', 'runtime'), 'zerokun-codex-runner-v1\\n')",
     "process.on('SIGTERM', () => process.exit(0))",
     'await Bun.sleep(60_000)',
@@ -259,7 +270,38 @@ function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, s
     '#!/bin/sh',
     'set -eu',
     'if [ "$1" = pane ] && [ "$2" = current ] && [ "$3" = --current ]; then',
-    "  printf '%s\\n' '{\"result\":{\"pane\":{\"pane_id\":\"wT:p1\",\"tab_id\":\"wT:t1\",\"terminal_id\":\"term_abcdef012345\",\"workspace_id\":\"wT\"}}}'",
+    '  printf \'{\"result\":{\"pane\":{\"pane_id\":\"%s\",\"tab_id\":\"%s\",\"terminal_id\":\"%s\",\"workspace_id\":\"%s\"}}}\\n\' "$HERDR_PANE_ID" "$HERDR_TAB_ID" "$HERDR_TERMINAL_ID" "$HERDR_WORKSPACE_ID"',
+    '  exit 0',
+    'fi',
+    'if [ "$1" = tab ] && [ "$2" = create ]; then',
+    `  : > ${JSON.stringify(join(fixture.base, 'herdr-runtime-tab-created'))}`,
+    `  printf '%s\\n' "$@" > ${JSON.stringify(join(fixture.base, 'herdr-tab-create.argv'))}`,
+    "  printf '%s\\n' '{\"result\":{\"root_pane\":{\"agent_status\":\"unknown\",\"pane_id\":\"wT:pR\",\"tab_id\":\"wT:tR\",\"terminal_id\":\"term_feedface012345\",\"workspace_id\":\"wT\"},\"tab\":{\"label\":\"Zeroちゃん runtime\",\"pane_count\":1,\"tab_id\":\"wT:tR\",\"workspace_id\":\"wT\"}},\"type\":\"tab_created\"}'",
+    '  exit 0',
+    'fi',
+    'if [ "$1" = pane ] && [ "$2" = get ]; then',
+    '  if [ "$3" = wT:pR ] && [ -f ' + JSON.stringify(join(fixture.base, 'herdr-runtime-tab-created')) + ' ]; then',
+    "    printf '%s\\n' '{\"result\":{\"pane\":{\"agent_status\":\"unknown\",\"pane_id\":\"wT:pR\",\"tab_id\":\"wT:tR\",\"terminal_id\":\"term_feedface012345\",\"workspace_id\":\"wT\"}},\"type\":\"pane_info\"}'",
+    '    exit 0',
+    '  fi',
+    '  if [ "$3" = wT:p1 ]; then',
+    "    printf '%s\\n' '{\"result\":{\"pane\":{\"agent\":\"codex\",\"agent_session\":{\"agent\":\"codex\"},\"agent_status\":\"working\",\"pane_id\":\"wT:p1\",\"tab_id\":\"wT:t1\",\"terminal_id\":\"term_abcdef012345\",\"workspace_id\":\"wT\"}},\"type\":\"pane_info\"}'",
+    '    exit 0',
+    '  fi',
+    '  exit 66',
+    'fi',
+    'if [ "$1" = pane ] && [ "$2" = list ]; then',
+    '  if [ -f ' + JSON.stringify(join(fixture.base, 'herdr-runtime-tab-created')) + ' ]; then',
+    "    printf '%s\\n' '{\"result\":{\"panes\":[{\"agent\":\"codex\",\"agent_session\":{\"agent\":\"codex\"},\"pane_id\":\"wT:p1\",\"tab_id\":\"wT:t1\",\"terminal_id\":\"term_abcdef012345\",\"workspace_id\":\"wT\"},{\"agent_status\":\"unknown\",\"pane_id\":\"wT:pR\",\"tab_id\":\"wT:tR\",\"terminal_id\":\"term_feedface012345\",\"workspace_id\":\"wT\"}]},\"type\":\"pane_list\"}'",
+    '  else',
+    "    printf '%s\\n' '{\"result\":{\"panes\":[{\"agent\":\"codex\",\"agent_session\":{\"agent\":\"codex\"},\"pane_id\":\"wT:p1\",\"tab_id\":\"wT:t1\",\"terminal_id\":\"term_abcdef012345\",\"workspace_id\":\"wT\"}]},\"type\":\"pane_list\"}'",
+    '  fi',
+    '  exit 0',
+    'fi',
+    'if [ "$1" = tab ] && [ "$2" = close ] && [ "$3" = wT:tR ]; then',
+    `  printf '%s\\n' "$@" > ${JSON.stringify(join(fixture.base, 'herdr-tab-close.argv'))}`,
+    `  rm -f ${JSON.stringify(join(fixture.base, 'herdr-runtime-tab-created'))}`,
+    "  printf '%s\\n' '{\"result\":{\"type\":\"ok\"}}'",
     '  exit 0',
     'fi',
     'if [ "$1" = pane ] && [ "$2" = run ]; then',
@@ -268,11 +310,8 @@ function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, s
     `    printf '%s' 'tampered' > ${JSON.stringify(join(fixture.state, 'replace-token'))}`,
     '  fi',
     '  shift 3',
-    // Herdr 0.8.2 joins COMMAND argv with spaces and lets the pane shell
-    // parse that one command line. The fixture must model that lossy API or
-    // a multi-line bash -c argv falsely appears safe in tests.
     '  command_line="$*"',
-    '  /usr/bin/nohup /bin/bash --noprofile --norc -c "$command_line" >/dev/null 2>&1 &',
+    `  /usr/bin/nohup /bin/bash --noprofile --norc -c "$command_line" >${JSON.stringify(join(fixture.base, 'herdr-pane-command.log'))} 2>&1 &`,
     '  exit 0',
     'fi',
     'exit 64',
@@ -1185,25 +1224,38 @@ describe('updater helpers', () => {
     const previous = Object.fromEntries(herdrKeys.map(key => [key, process.env[key]]))
     for (const key of herdrKeys) process.env[key] = environment[key]
     try {
-      const started = await startBotInHerdr({
-        rootRepo: fixture.repo.local,
-        stateDir: fixture.state,
-        projectDir: fixture.project,
-        startupTimeoutMs: 3_000,
-      })
-      expect(started.paneId).toBe('wT:p1')
+      let started: Awaited<ReturnType<typeof startBotInHerdr>>
+      try {
+        started = await startBotInHerdr({
+          rootRepo: fixture.repo.local,
+          stateDir: fixture.state,
+          projectDir: fixture.project,
+          startupTimeoutMs: 3_000,
+        })
+      } catch (error) {
+        const runtimeLog = join(fixture.base, 'herdr-pane-command.log')
+        if (existsSync(runtimeLog)) process.stderr.write(readFileSync(runtimeLog, 'utf8'))
+        throw error
+      }
+      expect(started.paneId).toBe('wT:pR')
       expect(started.gatewayPid).toBeGreaterThan(0)
       const marker = JSON.parse(
         readFileSync(join(fixture.state, 'herdr-runtime.json'), 'utf8'),
       ) as { paneId?: unknown; terminalId?: unknown }
-      expect(marker.paneId).toBe('wT:p1')
-      expect(marker.terminalId).toBe('term_abcdef012345')
+      expect(marker.paneId).toBe('wT:pR')
+      expect(marker.terminalId).toBe('term_feedface012345')
       const replaceToken = readFileSync(join(fixture.state, 'replace-token'), 'utf8')
       const paneRunArguments = readFileSync(join(fixture.base, 'herdr-pane-run.argv'), 'utf8')
       expect(paneRunArguments).not.toContain(replaceToken)
-      expect(paneRunArguments.split('\n').some(line => line.startsWith('ZEROKUN_REPLACE_TOKEN=')))
-        .toBe(false)
-      expect(paneRunArguments).toContain(updateRestartTokenDigest(replaceToken))
+      expect(paneRunArguments).not.toContain(updateRestartTokenDigest(replaceToken))
+      expect(paneRunArguments).not.toContain('ZEROKUN_REPLACE_TOKEN=')
+      expect(paneRunArguments).not.toContain('set -euo pipefail')
+      expect(paneRunArguments).toContain('update-restart.ts')
+      expect(paneRunArguments.length).toBeLessThan(1_024)
+      const tabCreateArguments = readFileSync(join(fixture.base, 'herdr-tab-create.argv'), 'utf8')
+      expect(tabCreateArguments).toContain('--label\nZeroちゃん runtime\n--no-focus')
+      expect(tabCreateArguments).toContain(`--cwd\n${fixture.project}`)
+      expect(existsSync(join(fixture.state, 'herdr-service-tab.json'))).toBe(true)
       rememberFixtureServices(fixture.state)
     } finally {
       for (const key of herdrKeys) {
@@ -1234,6 +1286,55 @@ describe('updater helpers', () => {
       })).rejects.toThrow('Herdr再起動')
       expect(existsSync(join(fixture.state, 'plugin.lock'))).toBe(false)
       expect(readFileSync(join(fixture.state, 'replace-token'), 'utf8')).toBe('tampered')
+      expect(readFileSync(join(fixture.base, 'herdr-tab-close.argv'), 'utf8'))
+        .toContain('tab\nclose\nwT:tR')
+      expect(existsSync(join(fixture.base, 'herdr-runtime-tab-created'))).toBe(false)
+    } finally {
+      for (const key of herdrKeys) {
+        const value = previous[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  test('updater所有の専用runtime tabだけを次回再起動で再利用する', async () => {
+    const fixture = updaterFixture()
+    chmodSync(fixture.state, 0o700)
+    const environment = serviceUpdaterEnvironment(fixture, 'unused-fixture-session')
+    const pinned = JSON.parse(
+      readFileSync(join(fixture.state, 'herdr-runtime.json'), 'utf8'),
+    )
+    const serviceRuntime = {
+      ...pinned,
+      paneId: 'wT:pR',
+      tabId: 'wT:tR',
+      terminalId: 'term_feedface012345',
+    }
+    writePinnedHerdrRuntime(fixture.state, serviceRuntime)
+    writeFileSync(join(fixture.state, 'herdr-service-tab.json'), `${JSON.stringify({
+      version: 1,
+      runtime: encodeHerdrRuntimeIdentity(serviceRuntime),
+    })}\n`, { mode: 0o600 })
+    writeFileSync(join(fixture.base, 'herdr-runtime-tab-created'), '')
+    const herdrKeys = [
+      'HERDR_ENV', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'HERDR_PANE_ID',
+      'HERDR_TAB_ID', 'HERDR_TERMINAL_ID', 'HERDR_WORKSPACE_ID',
+    ] as const
+    const previous = Object.fromEntries(herdrKeys.map(key => [key, process.env[key]]))
+    for (const key of herdrKeys) process.env[key] = environment[key]
+    try {
+      const started = await startBotInHerdr({
+        rootRepo: fixture.repo.local,
+        stateDir: fixture.state,
+        projectDir: fixture.project,
+        startupTimeoutMs: 3_000,
+      })
+      expect(started.paneId).toBe('wT:pR')
+      expect(existsSync(join(fixture.base, 'herdr-tab-create.argv'))).toBe(false)
+      expect(readFileSync(join(fixture.base, 'herdr-pane-run.argv'), 'utf8'))
+        .toContain('pane\nrun\nwT:pR')
+      rememberFixtureServices(fixture.state)
     } finally {
       for (const key of herdrKeys) {
         const value = previous[key]
@@ -1414,8 +1515,8 @@ describe('Codex branch self update', () => {
     expect(Bun.spawnSync([tmux, 'has-session', '-t', session]).exitCode).toBe(0)
     expect(() => process.kill(sentinelPid, 0)).not.toThrow()
     const marker = JSON.parse(readFileSync(join(fixture.state, 'herdr-runtime.json'), 'utf8'))
-    expect(marker.paneId).toBe('wT:p1')
-    expect(marker.terminalId).toBe('term_abcdef012345')
+    expect(marker.paneId).toBe('wT:pR')
+    expect(marker.terminalId).toBe('term_feedface012345')
   }, 20_000)
 
   test('commit済みjournalをbackupより先に消し、後処理失敗後も復旧を妨げない', () => {
