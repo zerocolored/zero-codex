@@ -273,6 +273,59 @@ export function slackReplyScanFailureDisposition(error: unknown): 'discard' | 'd
   return isTerminalSlackReplyScanError(error) ? 'discard' : 'defer'
 }
 
+const PERMANENT_INITIAL_CONTEXT_SLACK_ERRORS = new Set([
+  'account_inactive',
+  'channel_not_found',
+  'invalid_auth',
+  'is_archived',
+  'missing_scope',
+  'no_permission',
+  'not_authed',
+  'not_in_channel',
+  'thread_not_found',
+  'token_revoked',
+])
+
+const TRANSIENT_INITIAL_CONTEXT_SLACK_ERRORS = new Set([
+  'fatal_error',
+  'internal_error',
+  'ratelimited',
+  'request_timeout',
+  'service_unavailable',
+  'temporarily_unavailable',
+])
+
+/**
+ * Classify the initial root→mention read without interpreting user-authored
+ * text. Known permanent platform errors fail that one inbound row; known
+ * backpressure/transport errors keep its finite attempt budget intact.
+ */
+export function slackInitialThreadContextFailureDisposition(
+  error: unknown,
+): 'fail' | 'defer' | 'retry' {
+  const structured = structuredSlackApiErrorCode(error)
+  if (structured && PERMANENT_INITIAL_CONTEXT_SLACK_ERRORS.has(structured)) return 'fail'
+  if (structured && TRANSIENT_INITIAL_CONTEXT_SLACK_ERRORS.has(structured)) return 'defer'
+
+  if (error && typeof error === 'object') {
+    const candidate = error as { code?: unknown; statusCode?: unknown; status?: unknown }
+    const code = typeof candidate.code === 'string' ? candidate.code.toUpperCase() : ''
+    if (['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETDOWN', 'ENETUNREACH']
+      .includes(code)) return 'defer'
+    const status = typeof candidate.statusCode === 'number'
+      ? candidate.statusCode
+      : typeof candidate.status === 'number'
+        ? candidate.status
+        : null
+    if (status === 429 || (status !== null && status >= 500 && status <= 599)) return 'defer'
+  }
+  const message = error instanceof Error ? error.message : ''
+  if (/\b(?:timed out|timeout|socket hang up|HTTP 429|status.?429)\b/i.test(message)) {
+    return 'defer'
+  }
+  return 'retry'
+}
+
 /** Only a real Slack PlatformError for a DM may alter its durable retry schedule. */
 export function slackDirectMessageFailureDisposition(
   channelId: string,
@@ -423,7 +476,10 @@ export function planCatchupSweep(
     const messageMs = slackTsToMs(message.ts)
     if (!Number.isFinite(messageMs) || messageMs < policy.oldestMs) return false
     if (delivered.has(`${policy.channelId}:${message.ts}`)) return false
-    if (message.subtype && message.subtype !== 'bot_message' && message.subtype !== 'file_share') {
+    if (message.subtype
+      && message.subtype !== 'bot_message'
+      && message.subtype !== 'file_share'
+      && message.subtype !== 'thread_broadcast') {
       return false
     }
     if (botUserId && message.user === botUserId) return false
@@ -590,8 +646,9 @@ export function pruneDeliveredKeys(keys: Iterable<string>, limit: number): strin
  * From every reply in a thread, pick the ones the poller should deliver:
  * strictly newer than `cursorTs`, authored by a human (not the bot itself and
  * not another bot — bots reach the bridge through the live app_mention path),
- * and not a system subtype (channel_join, message_changed, …). `file_share` is
- * kept so image/file uploads in a followed thread still come through. Returned
+ * and not a system subtype (channel_join, message_changed, …). `file_share`
+ * and human `thread_broadcast` are kept so uploads and “also send to channel”
+ * replies in a followed thread still come through exactly once. Returned
  * oldest-first so delivery preserves chronological order.
  */
 export function selectNewReplies(
@@ -607,7 +664,7 @@ export function selectNewReplies(
       if (isSlackBotAuthored(r)) return false
       if (!r.user || !SLACK_USER_ID_RE.test(r.user)) return false
       if (botUserId && r.user === botUserId) return false
-      if (r.subtype && r.subtype !== 'file_share') return false
+      if (r.subtype && r.subtype !== 'file_share' && r.subtype !== 'thread_broadcast') return false
       return true
     })
     .sort((a, b) => parseFloat(a.ts!) - parseFloat(b.ts!))

@@ -220,7 +220,10 @@ zerochan start
 
 複数channelを同じprojectへ紐付ける場合は、channel IDを変えて`zerochan set slack-channel`を繰り返します。
 Appを各channelへ招待したうえで、新しい依頼はそのAppをメンションします。同じthreadの続きは
-再メンション不要です。DMは最初に表示されるcodeを`zerochan-access pair <code>`で承認し、
+再メンション不要です。メンションなしで始まったthreadでも、途中の返信でAppをメンションすると、
+先頭コメントからその返信までのhuman投稿と添付を時系列の1タスクとして受け付けます。
+別の参加者がメンションしても利用できます。DMは最初に表示されるcodeを
+`zerochan-access pair <code>`で承認し、
 repositoryの変更を許可する利用者だけ`zerochan-access write allow <Slack user ID>`を実行します。
 
 同一PCのClaude版を完全に置き換える場合だけ、旧 `zero` cloneを残したまま`zero-codex`を

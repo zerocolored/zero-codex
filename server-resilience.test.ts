@@ -273,16 +273,21 @@ describe('Slack bridge resilience wiring', () => {
     expect(server).not.toContain('ROUTES_FILE')
     expect(server).not.toContain('configuredRepoPath(')
     expect(server).toContain('jobStore.resolveOrAdoptSlackThreadRoute({')
+    expect(server).toContain('jobStore.resolveSlackThreadRoute({')
+    expect(server).toContain('jobStore.stageInboundDeliveryAndAdoptSlackThread(inbound, {')
     expect(server).toContain('defaultRepoPath: process.cwd()')
     expect(server).toContain('projectDir: process.cwd()')
     expect(server).toContain('err instanceof SlackProjectUnavailableError')
 
-    const resolveBeforeUpdate = server.indexOf(
-      'const repoPath = resolveRepoPath(chatId, resolvedThreadTs, messageTs)',
-    )
     const detachedUpdate = server.indexOf('if (writeEnabled && isExplicitUpdateRequest(text))')
-    expect(resolveBeforeUpdate).toBeGreaterThan(-1)
-    expect(resolveBeforeUpdate).toBeLessThan(detachedUpdate)
+    const updatePin = server.indexOf(
+      'resolveRepoPath(chatId, resolvedThreadTs, messageTs)', detachedUpdate,
+    )
+    expect(updatePin).toBeGreaterThan(detachedUpdate)
+    expect(server.indexOf(
+      'repoPath = resolveUnclaimedRepoPath(chatId, resolvedThreadTs)',
+      detachedUpdate,
+    )).toBeGreaterThan(updatePin)
     const importLegacy = server.lastIndexOf('importLegacyThreads()', server.indexOf('await slackApp.start()'))
     expect(importLegacy).toBeGreaterThan(-1)
     expect(importLegacy).toBeLessThan(server.indexOf('await slackApp.start()'))
@@ -316,8 +321,8 @@ describe('Slack bridge resilience wiring', () => {
     expect(deliverBody.indexOf('const inbound: InboundDeliveryInput = {'))
       .toBeLessThan(deliverBody.indexOf('scheduleInboundDrain()'))
     expect(server).toContain('jobStore.stageInboundDeliveryForControl(')
-    expect(server).toContain('jobStore.stageInboundDelivery(inbound)')
-    expect(server).toContain('const inbound = jobStore.claimNextInboundDelivery()')
+    expect(server).toContain('jobStore.stageInboundDeliveryAndAdoptSlackThread(inbound, {')
+    expect(server).toContain('const claimedInbound = jobStore.claimNextInboundDelivery()')
     expect(server).toContain('jobStore.deferInboundDelivery(')
     expect(server).toContain('jobStore.releaseInboundDelivery(')
     expect(server).toContain('preemptInboundDownloadForLiveControl(inbound)')
@@ -329,6 +334,28 @@ describe('Slack bridge resilience wiring', () => {
     const startup = server.indexOf('const recoveredInbound = jobStore.recoverInboundDeliveries()')
     expect(startup).toBeGreaterThan(server.indexOf('const jobStore = new JobStore('))
     expect(startup).toBeLessThan(server.indexOf('scheduleInboundDrain()'))
+  })
+
+  test('未所有threadの途中mentionはrootからdurableにhydrateしlive/catch-upで同じ条件を使う', () => {
+    expect(server).toContain('inbound = await hydrateInitialThreadContext(')
+    expect(server).toContain('channel: inbound.chatId')
+    expect(server).toContain('ts: inbound.threadTs')
+    expect(server).toContain('latest: inbound.messageId')
+    expect(server).toContain('inclusive: true')
+    expect(server).toContain('jobStore.finalizeInboundThreadBootstrap(')
+    expect(server).toContain('planInitialSlackThreadContext({')
+    expect(server).toContain('slackInitialThreadContextFailureDisposition(error)')
+    expect(server).toContain('appId: slackAppId!')
+    expect(server).toContain('expectedRepoPath,')
+    expect(server).toContain('jobStore.deferInboundDeliveryWithoutAttempt(')
+    expect(server).toContain('error instanceof SlackInitialThreadContextTransientError')
+    expect(server).toContain('will retry initial context read')
+    expect(server).toContain('Boolean(event.thread_ts) && mentionsBot(event.text ?? \'\', botUserId)')
+    expect(server).toContain("!isDM && typeof threadTs === 'string' && mentionsBot(text, botUserId)")
+    expect(server.match(/resolvedThreadTs !== message\.ts && mentionsBot\(text, botUserId\)/g))
+      .toHaveLength(2)
+    expect(server.match(/resolveIsMention\(isDM, text, botUserId\) \|\| ownedThread/g))
+      .toHaveLength(3)
   })
 
   test('破損legacy threadsはmigration完了扱いせず修復後の再起動で再試行できる', () => {

@@ -33,6 +33,7 @@ import {
   refreshSlackDirectMessageAvailability,
   slackDirectMessageFailureDisposition,
   slackReplyScanFailureDisposition,
+  slackInitialThreadContextFailureDisposition,
   type ChannelPolicy,
   type SlackReply,
 } from './gate.ts'
@@ -95,6 +96,25 @@ describe('Slack cursor recovery', () => {
     expect(slackDirectMessageFailureDisposition(
       'D012ABC', { data: { error: 'not_in_channel' } },
     )).toBe('defer')
+  })
+
+  test('初期thread文脈の永久error・backpressure・未知failureを分離する', () => {
+    expect(slackInitialThreadContextFailureDisposition({
+      data: { error: 'thread_not_found' },
+    })).toBe('fail')
+    expect(slackInitialThreadContextFailureDisposition({
+      data: { error: 'missing_scope' },
+    })).toBe('fail')
+    expect(slackInitialThreadContextFailureDisposition({
+      data: { error: 'ratelimited' },
+    })).toBe('defer')
+    expect(slackInitialThreadContextFailureDisposition(Object.assign(
+      new Error('socket reset'), { code: 'ECONNRESET' },
+    ))).toBe('defer')
+    expect(slackInitialThreadContextFailureDisposition(new Error('unknown SDK failure'))).toBe('retry')
+    expect(slackInitialThreadContextFailureDisposition(
+      new Error('調査対象は thread_not_found の原因です'),
+    )).toBe('retry')
   })
 
   test('DM復旧stateの更新失敗はlive受信処理へ例外を伝播しない', () => {
@@ -314,14 +334,15 @@ describe('selectNewReplies — thread catch-up poller', () => {
     expect(selectNewReplies(replies, '1712345680.000000', BOT_USER)).toEqual([])
   })
 
-  test('drops system subtypes but keeps file_share', () => {
+  test('drops system subtypes but keeps file_share and human thread_broadcast', () => {
     const replies = [
       reply({ ts: '1712345690.000000', subtype: 'channel_join' }),
       reply({ ts: '1712345691.000000', subtype: 'message_changed' }),
       reply({ ts: '1712345692.000000', subtype: 'file_share', files: [{ id: 'F1' }] }),
+      reply({ ts: '1712345693.000000', subtype: 'thread_broadcast', files: [{ id: 'F2' }] }),
     ]
     const out = selectNewReplies(replies, '1712345680.000000', BOT_USER)
-    expect(out.map((r) => r.ts)).toEqual(['1712345692.000000'])
+    expect(out.map((r) => r.ts)).toEqual(['1712345692.000000', '1712345693.000000'])
   })
 
   test('drops replies with no user', () => {

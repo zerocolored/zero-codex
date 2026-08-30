@@ -115,6 +115,20 @@ export class SlackChannelRouteRequiredError extends Error {
     this.name = 'SlackChannelRouteRequiredError'
   }
 }
+
+export class SlackChannelRouteChangedError extends Error {
+  constructor(readonly channelId: string) {
+    super(`Slack channel route changed while accepting an event: ${channelId}`)
+    this.name = 'SlackChannelRouteChangedError'
+  }
+}
+
+export class InboundInitialContextConflictError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'InboundInitialContextConflictError'
+  }
+}
 import {
   EphemeralClaudeCleanupPendingError,
   reconcileEphemeralClaudeSessions,
@@ -314,12 +328,23 @@ export interface InboundDeliveryInput {
   isInterrupt?: boolean
 }
 
+export type InboundInitialContextState = 'none' | 'pending' | 'hydrated'
+
 export interface InboundDownloadedFile {
   fileId: string
   ordinal: number
   path: string
   size: number
   digest: string
+}
+
+export interface InboundBootstrapEvent {
+  messageId: string
+  userId: string
+  text: string
+  fileIds: string[]
+  writeEnabled: boolean
+  isInterrupt: boolean
 }
 
 export interface LiveControlInput {
@@ -345,6 +370,7 @@ export interface InboundDeliveryRecord extends InboundDeliveryInput {
   expectedControlJobId: string | null
   expectedControlEpoch: number | null
   downloadedFiles: InboundDownloadedFile[]
+  initialContextState: InboundInitialContextState
 }
 
 export type SlackReadCursorScope = 'owned-thread' | 'catchup-recent' | 'catchup-parent' | 'scheduler'
@@ -382,6 +408,7 @@ type InboundDeliveryRow = {
   expected_control_job_id: string | null
   expected_control_epoch: number | null
   downloaded_files_json: string
+  initial_context_state: InboundInitialContextState
 }
 
 export interface JobRecord {
@@ -681,7 +708,9 @@ CREATE TABLE IF NOT EXISTS inbound_deliveries (
   created_at INTEGER NOT NULL,
   expected_control_job_id TEXT,
   expected_control_epoch INTEGER,
-  downloaded_files_json TEXT NOT NULL DEFAULT '[]'
+  downloaded_files_json TEXT NOT NULL DEFAULT '[]',
+  initial_context_state TEXT NOT NULL DEFAULT 'none'
+    CHECK (initial_context_state IN ('none', 'pending', 'hydrated'))
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_deliveries_seq
   ON inbound_deliveries(status, seq);
@@ -1003,6 +1032,10 @@ function ensureJobSchemaMigrations(db: Database): void {
     ['expected_control_job_id', 'TEXT'],
     ['expected_control_epoch', 'INTEGER'],
     ['downloaded_files_json', "TEXT NOT NULL DEFAULT '[]'"],
+    [
+      'initial_context_state',
+      "TEXT NOT NULL DEFAULT 'none' CHECK (initial_context_state IN ('none', 'pending', 'hydrated'))",
+    ],
   ] as const) {
     const current = db.query<{ name: string }, []>(
       'PRAGMA table_info(inbound_deliveries)',
@@ -1329,6 +1362,31 @@ function parseInboundDownloadedFiles(value: string): InboundDownloadedFile[] {
     })
   }
   return files.sort((left, right) => left.ordinal - right.ordinal)
+}
+
+function mapInboundDeliveryRow(row: InboundDeliveryRow): InboundDeliveryRecord {
+  if (!['none', 'pending', 'hydrated'].includes(row.initial_context_state)) {
+    throw new Error(`invalid initial context state for ${row.idempotency_key}`)
+  }
+  return {
+    seq: row.seq,
+    idempotencyKey: row.idempotency_key,
+    chatId: row.chat_id,
+    threadTs: row.thread_ts,
+    messageId: row.message_id,
+    userId: row.user_id,
+    repoPath: row.repo_path,
+    text: row.text,
+    fileIds: parseAttachments(row.file_ids_json),
+    writeEnabled: row.write_enabled === 1,
+    isInterrupt: row.is_interrupt === 1,
+    attempts: row.attempts,
+    notBefore: row.not_before,
+    expectedControlJobId: row.expected_control_job_id,
+    expectedControlEpoch: row.expected_control_epoch,
+    downloadedFiles: parseInboundDownloadedFiles(row.downloaded_files_json),
+    initialContextState: row.initial_context_state,
+  }
 }
 
 function mapRow(row: JobRow): JobRecord {
@@ -2032,6 +2090,37 @@ export class JobStore {
     return retrySqlite(() => select.immediate())
   }
 
+  /** Resolve the current route without claiming the Slack thread. */
+  resolveSlackThreadRoute(input: {
+    appId: string
+    chatId: string
+    threadTs: string
+    defaultRepoPath: string
+  }): { repoPath: string; owned: boolean } {
+    const appId = requireSlackAppId(input.appId)
+    const chatId = requireText(input.chatId, 'chatId').toUpperCase()
+    const threadTs = requireText(input.threadTs, 'threadTs')
+    const defaultRepoPath = requireText(input.defaultRepoPath, 'defaultRepoPath')
+    const existing = retrySqlite(() => this.db.query<{ repo_path: string }, [string, string]>(
+      'SELECT repo_path FROM slack_threads WHERE chat_id = ? AND thread_ts = ?',
+    ).get(chatId, threadTs))
+    if (existing) return { repoPath: existing.repo_path, owned: true }
+    if (/^[CG][A-Z0-9]+$/.test(chatId)) {
+      const explicit = retrySqlite(() => this.db.query<{ repo_path: string }, [string, string]>(
+        `SELECT repo_path FROM slack_channel_routes
+         WHERE app_id = ? AND channel_id = ?`,
+      ).get(appId, chatId))
+      if (explicit) return { repoPath: explicit.repo_path, owned: false }
+      const explicitMode = retrySqlite(() => this.db.query<{ present: number }, [string]>(
+        'SELECT 1 AS present FROM slack_channel_route_state WHERE app_id = ?',
+      ).get(appId)) !== null
+      if (explicitMode) throw new SlackChannelRouteRequiredError(chatId)
+      return { repoPath: defaultRepoPath, owned: false }
+    }
+    if (/^D[A-Z0-9]+$/.test(chatId)) return { repoPath: defaultRepoPath, owned: false }
+    throw new Error(`invalid Slack conversation ID: ${chatId}`)
+  }
+
   recordDeliveryTombstone(idempotencyKey: string, completedAt = Date.now()): void {
     const key = requireText(idempotencyKey, 'idempotencyKey')
     if (!Number.isSafeInteger(completedAt) || completedAt <= 0) {
@@ -2047,6 +2136,134 @@ export class JobStore {
 
   stageInboundDelivery(input: InboundDeliveryInput): boolean {
     return this.stageInboundDeliveryInternal(input, null, false) === 'staged'
+  }
+
+  /**
+   * Claim a previously unowned Slack thread and persist its first inbound row
+   * in one IMMEDIATE transaction. The first eligible child mention alone gets
+   * a pending initial-context hydration; concurrent later mentions see the
+   * owned thread and retain ordinary FIFO semantics.
+   */
+  stageInboundDeliveryAndAdoptSlackThread(
+    input: InboundDeliveryInput,
+    options: {
+      initialContextEligible: boolean
+      appId?: string
+      expectedRepoPath?: string | null
+      lastActivityMs?: number
+    },
+  ): {
+    outcome: 'staged' | 'duplicate'
+    repoPath: string
+    initialContextRequired: boolean
+  } {
+    const chatId = requireText(input.chatId, 'chatId').toUpperCase()
+    const threadTs = requireText(input.threadTs, 'threadTs')
+    const messageId = requireText(input.messageId, 'messageId')
+    const userId = requireText(input.userId, 'userId')
+    const candidateRepoPath = requireText(input.repoPath, 'repoPath')
+    const fileIds = [...new Set(
+      (input.fileIds ?? []).map(id => requireText(id, 'fileId')),
+    )]
+    const idempotencyKey = `${chatId}:${messageId}`
+    const lastActivityMs = options.lastActivityMs ?? Date.now()
+    if (!Number.isSafeInteger(lastActivityMs) || lastActivityMs <= 0) {
+      throw new Error('thread activity timestamp is invalid')
+    }
+
+    const stage = this.db.transaction(() => {
+      const existingThread = this.db.query<{ repo_path: string }, [string, string]>(
+        'SELECT repo_path FROM slack_threads WHERE chat_id = ? AND thread_ts = ?',
+      ).get(chatId, threadTs)
+      let repoPath = existingThread?.repo_path ?? candidateRepoPath
+      if (!existingThread && /^[CG][A-Z0-9]+$/.test(chatId)) {
+        const appId = requireSlackAppId(options.appId ?? '')
+        const explicit = this.db.query<{ repo_path: string }, [string, string]>(
+          `SELECT repo_path FROM slack_channel_routes
+           WHERE app_id = ? AND channel_id = ?`,
+        ).get(appId, chatId)
+        if (explicit) {
+          repoPath = explicit.repo_path
+        } else {
+          const explicitMode = this.db.query<{ present: number }, [string]>(
+            'SELECT 1 AS present FROM slack_channel_route_state WHERE app_id = ?',
+          ).get(appId) !== null
+          if (explicitMode) throw new SlackChannelRouteRequiredError(chatId)
+        }
+      } else if (!existingThread && !/^D[A-Z0-9]+$/.test(chatId)) {
+        throw new Error(`invalid Slack conversation ID: ${chatId}`)
+      }
+      if (options.expectedRepoPath !== undefined) {
+        if (options.expectedRepoPath === null
+          || repoPath !== requireText(options.expectedRepoPath, 'expectedRepoPath')) {
+          throw new SlackChannelRouteChangedError(chatId)
+        }
+      }
+      const retained = this.db.query<{ present: number }, [string]>(
+        'SELECT 1 AS present FROM delivery_tombstones WHERE idempotency_key = ?',
+      ).get(idempotencyKey)
+      const completedHandoff = this.db.query<{ present: number }, [string, string, string, string]>(
+        `SELECT 1 AS present FROM jobs WHERE idempotency_key = ?
+         UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = ?
+         UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
+         UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = ?
+         LIMIT 1`,
+      ).get(idempotencyKey, idempotencyKey, idempotencyKey, idempotencyKey)
+      if (retained || completedHandoff) {
+        return { outcome: 'duplicate' as const, repoPath, initialContextRequired: false }
+      }
+
+      const pendingBootstrap = !existingThread
+        ? this.db.query<{ present: number }, [string, string]>(
+            `SELECT 1 AS present FROM inbound_deliveries
+             WHERE chat_id = ? AND thread_ts = ? AND initial_context_state = 'pending'
+             LIMIT 1`,
+          ).get(chatId, threadTs) !== null
+        : false
+      const initialContextRequired = !existingThread
+        && !pendingBootstrap
+        && options.initialContextEligible
+        && /^[CG][A-Z0-9]+$/.test(chatId)
+        && threadTs !== messageId
+        && !input.isInterrupt
+      const inserted = this.db.run(
+        `INSERT OR IGNORE INTO inbound_deliveries (
+           idempotency_key, chat_id, thread_ts, message_id, user_id,
+           repo_path, text, file_ids_json, write_enabled, is_interrupt, created_at,
+           initial_context_state
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          idempotencyKey,
+          chatId,
+          threadTs,
+          messageId,
+          userId,
+          repoPath,
+          input.text,
+          JSON.stringify(fileIds),
+          input.writeEnabled ? 1 : 0,
+          input.isInterrupt ? 1 : 0,
+          Date.now(),
+          initialContextRequired ? 'pending' : 'none',
+        ],
+      ).changes
+      if (inserted !== 1) {
+        return { outcome: 'duplicate' as const, repoPath, initialContextRequired: false }
+      }
+      // A bootstrap candidate is only a pending claim. Publishing ordinary
+      // thread ownership before its bounded root→mention snapshot succeeds
+      // would let catch-up reinterpret failed context posts as new jobs.
+      if (!existingThread && !initialContextRequired && !pendingBootstrap) {
+        this.db.run(
+          `INSERT INTO slack_threads (
+             chat_id, thread_ts, repo_path, adopted_from_ts, last_activity_ms
+           ) VALUES (?, ?, ?, ?, ?)`,
+          [chatId, threadTs, repoPath, messageId, lastActivityMs],
+        )
+      }
+      return { outcome: 'staged' as const, repoPath, initialContextRequired }
+    })
+    return retrySqlite(() => stage.immediate())
   }
 
   /**
@@ -2602,32 +2819,283 @@ export class JobStore {
         [row.seq],
       )
       if (updated.changes !== 1) return null
-      return {
-        seq: row.seq,
-        idempotencyKey: row.idempotency_key,
-        chatId: row.chat_id,
-        threadTs: row.thread_ts,
-        messageId: row.message_id,
-        userId: row.user_id,
-        repoPath: row.repo_path,
-        text: row.text,
-        fileIds: parseAttachments(row.file_ids_json),
-        writeEnabled: row.write_enabled === 1,
-        isInterrupt: row.is_interrupt === 1,
-        attempts: row.attempts,
-        notBefore: row.not_before,
-        expectedControlJobId: row.expected_control_job_id,
-        expectedControlEpoch: row.expected_control_epoch,
-        downloadedFiles: parseInboundDownloadedFiles(row.downloaded_files_json),
-      }
+      return mapInboundDeliveryRow(row)
     })
     return retrySqlite(() => claim.immediate())
+  }
+
+  /**
+   * Publish a pending thread adoption only after Slack chronology has selected
+   * the canonical first mention. The claimed row is rebased to that event,
+   * context posts are tombstoned, and any later replies are staged in order in
+   * the same transaction. A root that already addressed the App uses `none`
+   * and is restored as an ordinary independent request instead of being merged.
+   */
+  finalizeInboundThreadBootstrap(
+    idempotencyKey: string,
+    input: {
+      mode: 'context' | 'independent'
+      canonical: InboundBootstrapEvent
+      text: string
+      fileIds: string[]
+      consumedMessageTs: string[]
+      followups: InboundBootstrapEvent[]
+      lastActivityMs?: number
+    },
+  ): InboundDeliveryRecord {
+    const key = requireText(idempotencyKey, 'idempotencyKey')
+    if (typeof input.text !== 'string') throw new Error('initial context text is invalid')
+    const text = input.text
+    const fileIds = [...new Set(input.fileIds.map(id => requireText(id, 'fileId')))]
+    if (fileIds.some(id => !/^F[A-Z0-9]+$/.test(id))) {
+      throw new Error('initial context has an invalid Slack file ID')
+    }
+    const consumedMessageTs = [...new Set(
+      input.consumedMessageTs.map(ts => requireText(ts, 'consumed message ts')),
+    )]
+    if (consumedMessageTs.some(ts => !/^\d+\.\d+$/.test(ts))) {
+      throw new Error('initial context has an invalid Slack message timestamp')
+    }
+
+    const normalizeEvent = (event: InboundBootstrapEvent): InboundBootstrapEvent => {
+      const messageId = requireText(event.messageId, 'bootstrap messageId')
+      if (!/^\d+\.\d+$/.test(messageId)) throw new Error('bootstrap message timestamp is invalid')
+      const eventFileIds = [...new Set(event.fileIds.map(id => requireText(id, 'fileId')))]
+      if (eventFileIds.some(id => !/^F[A-Z0-9]+$/.test(id))) {
+        throw new Error('bootstrap event has an invalid Slack file ID')
+      }
+      if (typeof event.text !== 'string') throw new Error('bootstrap event text is invalid')
+      return {
+        messageId,
+        userId: requireText(event.userId, 'bootstrap userId'),
+        text: event.text,
+        fileIds: eventFileIds,
+        writeEnabled: Boolean(event.writeEnabled),
+        isInterrupt: Boolean(event.isInterrupt),
+      }
+    }
+    const canonical = normalizeEvent(input.canonical)
+    const followups = input.followups.map(normalizeEvent)
+    const lastActivityMs = input.lastActivityMs ?? Date.now()
+    if (!Number.isSafeInteger(lastActivityMs) || lastActivityMs <= 0) {
+      throw new Error('thread activity timestamp is invalid')
+    }
+
+    const hydrate = this.db.transaction(() => {
+      const row = this.db.query<InboundDeliveryRow, [string]>(
+        `SELECT * FROM inbound_deliveries
+         WHERE idempotency_key = ? AND status = 'processing'`,
+      ).get(key)
+      if (!row) throw new Error(`inbound delivery is no longer processing: ${key}`)
+      if (row.initial_context_state === 'hydrated') return mapInboundDeliveryRow(row)
+      if (row.initial_context_state !== 'pending') {
+        throw new Error(`inbound delivery does not require initial context: ${key}`)
+      }
+
+      const canonicalNumber = Number(canonical.messageId)
+      const originalNumber = Number(row.message_id)
+      const threadNumber = Number(row.thread_ts)
+      if (canonicalNumber < threadNumber || canonicalNumber > originalNumber) {
+        throw new Error('canonical bootstrap event is outside the observed thread range')
+      }
+      let previous = canonicalNumber
+      const replayKeys = new Set<string>()
+      for (const followup of followups) {
+        const timestamp = Number(followup.messageId)
+        if (timestamp <= previous || timestamp > originalNumber) {
+          throw new Error('bootstrap followups are not in strict Slack order')
+        }
+        previous = timestamp
+        const followupKey = `${row.chat_id}:${followup.messageId}`
+        if (replayKeys.has(followupKey)) throw new Error('bootstrap followup is duplicated')
+        replayKeys.add(followupKey)
+      }
+
+      const completedOutsideInbound = (eventKey: string): boolean => (
+        this.db.query<{ present: number }, [string, string, string, string, string]>(
+          `SELECT 1 AS present FROM delivery_tombstones WHERE idempotency_key = ?
+           UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = ?
+           UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = ?
+           UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
+           UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = ?
+           LIMIT 1`,
+        ).get(eventKey, eventKey, eventKey, eventKey, eventKey) !== null
+      )
+
+      const canonicalKey = `${row.chat_id}:${canonical.messageId}`
+      if (canonicalKey !== key) {
+        if (completedOutsideInbound(canonicalKey)) {
+          throw new InboundInitialContextConflictError(
+            `Slackスレッドの最初の依頼 ${canonical.messageId} はすでに別の処理へ渡されています`,
+          )
+        }
+        const canonicalInbound = this.db.query<
+          { status: 'pending' | 'processing' }, [string]
+        >(
+          'SELECT status FROM inbound_deliveries WHERE idempotency_key = ?',
+        ).get(canonicalKey)
+        if (canonicalInbound?.status === 'processing') {
+          throw new InboundInitialContextConflictError(
+            `Slackスレッドの最初の依頼 ${canonical.messageId} はすでに処理中です`,
+          )
+        }
+        if (canonicalInbound) {
+          this.db.run(
+            `DELETE FROM inbound_deliveries
+             WHERE idempotency_key = ? AND status = 'pending'`,
+            [canonicalKey],
+          )
+        }
+      }
+
+      for (const messageTs of consumedMessageTs) {
+        const consumedKey = `${row.chat_id}:${messageTs}`
+        if (consumedKey === key || consumedKey === canonicalKey) {
+          throw new Error('initial context cannot consume its canonical trigger')
+        }
+        if (replayKeys.has(consumedKey)) {
+          throw new Error('initial context cannot both consume and replay a message')
+        }
+        if (completedOutsideInbound(consumedKey)) {
+          throw new InboundInitialContextConflictError(
+            `Slackスレッドの投稿 ${messageTs} はすでに別の処理へ渡されています`,
+          )
+        }
+        const otherInbound = this.db.query<
+          { status: 'pending' | 'processing' }, [string]
+        >(
+          'SELECT status FROM inbound_deliveries WHERE idempotency_key = ?',
+        ).get(consumedKey)
+        if (otherInbound?.status === 'processing') {
+          throw new InboundInitialContextConflictError(
+            `Slackスレッドの投稿 ${messageTs} はすでに処理中です`,
+          )
+        }
+        if (otherInbound) {
+          this.db.run(
+            `DELETE FROM inbound_deliveries
+             WHERE idempotency_key = ? AND status = 'pending'`,
+            [consumedKey],
+          )
+        }
+        this.db.run(
+          `INSERT INTO delivery_tombstones (
+             idempotency_key, write_enabled, completed_at
+           ) VALUES (?, 0, ?)
+           ON CONFLICT(idempotency_key) DO NOTHING`,
+          [consumedKey, Date.now()],
+        )
+      }
+
+      const updated = this.db.run(
+        `UPDATE inbound_deliveries
+         SET idempotency_key = ?, message_id = ?, user_id = ?, text = ?,
+             file_ids_json = ?, write_enabled = ?, is_interrupt = ?,
+             downloaded_files_json = '[]', not_before = NULL, last_error = NULL,
+             initial_context_state = ?
+         WHERE idempotency_key = ? AND status = 'processing'
+           AND initial_context_state = 'pending'`,
+        [
+          canonicalKey,
+          canonical.messageId,
+          canonical.userId,
+          text,
+          JSON.stringify(fileIds),
+          canonical.writeEnabled ? 1 : 0,
+          canonical.isInterrupt ? 1 : 0,
+          input.mode === 'context' ? 'hydrated' : 'none',
+          key,
+        ],
+      )
+      if (updated.changes !== 1) {
+        throw new Error(`initial context state changed while hydrating: ${key}`)
+      }
+
+      for (const followup of followups) {
+        const followupKey = `${row.chat_id}:${followup.messageId}`
+        if (completedOutsideInbound(followupKey)) continue
+        const existing = this.db.query<
+          { status: 'pending' | 'processing' }, [string]
+        >(
+          'SELECT status FROM inbound_deliveries WHERE idempotency_key = ?',
+        ).get(followupKey)
+        if (existing?.status === 'processing') {
+          throw new InboundInitialContextConflictError(
+            `Slackスレッドの返信 ${followup.messageId} はすでに処理中です`,
+          )
+        }
+        if (existing) {
+          this.db.run(
+            `DELETE FROM inbound_deliveries
+             WHERE idempotency_key = ? AND status = 'pending'`,
+            [followupKey],
+          )
+        }
+        this.db.run(
+          `INSERT INTO inbound_deliveries (
+             idempotency_key, chat_id, thread_ts, message_id, user_id,
+             repo_path, text, file_ids_json, write_enabled, is_interrupt,
+             status, attempts, created_at, initial_context_state
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, 'none')`,
+          [
+            followupKey,
+            row.chat_id,
+            row.thread_ts,
+            followup.messageId,
+            followup.userId,
+            row.repo_path,
+            followup.text,
+            JSON.stringify(followup.fileIds),
+            followup.writeEnabled ? 1 : 0,
+            followup.isInterrupt ? 1 : 0,
+            Date.now(),
+          ],
+        )
+      }
+
+      const existingThread = this.db.query<{ repo_path: string }, [string, string]>(
+        'SELECT repo_path FROM slack_threads WHERE chat_id = ? AND thread_ts = ?',
+      ).get(row.chat_id, row.thread_ts)
+      if (existingThread && existingThread.repo_path !== row.repo_path) {
+        throw new InboundInitialContextConflictError(
+          'Slackスレッドのprojectが初期文脈の確定中に変更されました',
+        )
+      }
+      this.db.run(
+        `INSERT INTO slack_threads (
+           chat_id, thread_ts, repo_path, adopted_from_ts, last_activity_ms
+         ) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(chat_id, thread_ts) DO UPDATE SET
+           last_activity_ms = MAX(last_activity_ms, excluded.last_activity_ms)`,
+        [row.chat_id, row.thread_ts, row.repo_path, canonical.messageId, lastActivityMs],
+      )
+      const hydrated = this.db.query<InboundDeliveryRow, [string]>(
+        'SELECT * FROM inbound_deliveries WHERE idempotency_key = ?',
+      ).get(canonicalKey)
+      if (!hydrated) throw new Error(`hydrated inbound delivery disappeared: ${canonicalKey}`)
+      return mapInboundDeliveryRow(hydrated)
+    })
+    return retrySqlite(() => hydrate.immediate())
   }
 
   deferInboundDelivery(idempotencyKey: string, error: string, notBefore: number): void {
     retrySqlite(() => this.db.run(
       `UPDATE inbound_deliveries
        SET status = 'pending', attempts = attempts + 1, not_before = ?, last_error = ?
+       WHERE idempotency_key = ? AND status = 'processing'`,
+      [notBefore, error, requireText(idempotencyKey, 'idempotencyKey')],
+    ))
+  }
+
+  /** Backpressure is not a failed attempt; retain the same retry budget. */
+  deferInboundDeliveryWithoutAttempt(
+    idempotencyKey: string,
+    error: string,
+    notBefore: number,
+  ): void {
+    retrySqlite(() => this.db.run(
+      `UPDATE inbound_deliveries
+       SET status = 'pending', not_before = ?, last_error = ?
        WHERE idempotency_key = ? AND status = 'processing'`,
       [notBefore, error, requireText(idempotencyKey, 'idempotencyKey')],
     ))
@@ -2710,14 +3178,18 @@ export class JobStore {
           row.attempts + 1, error, row.created_at, now,
         ],
       )
-      this.db.run(
-        `INSERT INTO slack_threads (
-           chat_id, thread_ts, repo_path, adopted_from_ts, last_activity_ms
-         ) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(chat_id, thread_ts) DO UPDATE SET
-           last_activity_ms = excluded.last_activity_ms`,
-        [row.chat_id, row.thread_ts, row.repo_path, row.message_id, now],
-      )
+      // A failed pending bootstrap never owned the thread. Publishing it here
+      // would let catch-up replay root/intervening context as independent jobs.
+      if (row.initial_context_state !== 'pending') {
+        this.db.run(
+          `INSERT INTO slack_threads (
+             chat_id, thread_ts, repo_path, adopted_from_ts, last_activity_ms
+           ) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(chat_id, thread_ts) DO UPDATE SET
+             last_activity_ms = excluded.last_activity_ms`,
+          [row.chat_id, row.thread_ts, row.repo_path, row.message_id, now],
+        )
+      }
       this.db.run(
         `INSERT INTO terminal_notifications (id, job_id, kind, payload, created_at)
          VALUES (?, ?, 'failed', ?, ?)`,

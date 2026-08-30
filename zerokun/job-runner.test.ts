@@ -47,6 +47,7 @@ import {
   slackArtifactPublicationBlockedMessage,
   slackArtifactsAbandonedMessage,
   slackFileIsSharedInThread,
+  SlackChannelRouteChangedError,
   slackRateLimitMessage,
   stateSlackTokenPairMatches,
   synchronizeExecutorRecoveryLedger,
@@ -481,6 +482,256 @@ describe('Codex job store', () => {
     expect(retried.text).toBe('slow A')
     store.completeInboundDelivery(retried.idempotencyKey)
     expect(store.claimNextInboundDelivery(2_000)?.text).toBe('fast B')
+    store.close()
+  })
+
+  test('未所有threadの途中メンションは所有権を公開せずpending文脈を保存する', () => {
+    const store = makeStore()
+    const rootTs = '1800000000.000100'
+    const triggerTs = '1800000003.000100'
+    const staged = store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: 'C0123456789',
+      threadTs: rootTs,
+      messageId: triggerTs,
+      userId: 'U0TRIGGER',
+      repoPath: '/tmp/project',
+      text: '確認して',
+      fileIds: ['FTRIGGER1'],
+      writeEnabled: true,
+    }, { initialContextEligible: true, appId: 'A0123456789', lastActivityMs: 1234 })
+    expect(staged).toEqual({
+      outcome: 'staged',
+      repoPath: '/tmp/project',
+      initialContextRequired: true,
+    })
+    expect(store.getThread('C0123456789', rootTs)).toBeNull()
+    const claimed = store.claimNextInboundDelivery()!
+    expect(claimed).toMatchObject({
+      messageId: triggerTs,
+      userId: 'U0TRIGGER',
+      writeEnabled: true,
+      initialContextState: 'pending',
+    })
+    store.close()
+  })
+
+  test('初期文脈の確定は先行投稿を吸収し、再起動後も再取得しない', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    const rootTs = '1800000000.000100'
+    const middleTs = '1800000002.000100'
+    const triggerTs = '1800000003.000100'
+    let store = new JobStore(path)
+    store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: 'C0123456789', threadTs: rootTs, messageId: triggerTs,
+      userId: 'U0TRIGGER', repoPath: '/tmp/project', text: '確認して',
+      writeEnabled: false,
+    }, { initialContextEligible: true, appId: 'A0123456789' })
+    // A concurrently replayed earlier reply is absorbed into the initial
+    // context rather than becoming a second FIFO job.
+    expect(store.stageInboundDelivery({
+      chatId: 'C0123456789', threadTs: rootTs, messageId: middleTs,
+      userId: 'U0OTHER', repoPath: '/tmp/project', text: '補足',
+    })).toBe(true)
+    const claimed = store.claimNextInboundDelivery()!
+    const hydrated = store.finalizeInboundThreadBootstrap(claimed.idempotencyKey, {
+      mode: 'context',
+      canonical: {
+        messageId: triggerTs, userId: 'U0TRIGGER', text: '確認して',
+        fileIds: [], writeEnabled: false, isInterrupt: false,
+      },
+      text: 'root\n補足\n確認して',
+      fileIds: ['FROOT1', 'FMIDDLE1'],
+      consumedMessageTs: [rootTs, middleTs],
+      followups: [],
+    })
+    expect(hydrated).toMatchObject({
+      text: 'root\n補足\n確認して',
+      fileIds: ['FROOT1', 'FMIDDLE1'],
+      initialContextState: 'hydrated',
+    })
+    expect(store.hasDurableEvent(`C0123456789:${rootTs}`)).toBe(true)
+    expect(store.hasDurableEvent(`C0123456789:${middleTs}`)).toBe(true)
+    store.close()
+
+    store = new JobStore(path)
+    expect(store.recoverInboundDeliveries()).toBe(1)
+    const recovered = store.claimNextInboundDelivery()!
+    expect(recovered.initialContextState).toBe('hydrated')
+    expect(recovered.fileIds).toEqual(['FROOT1', 'FMIDDLE1'])
+    store.completeInboundDelivery(recovered.idempotencyKey)
+    expect(store.claimNextInboundDelivery()).toBeNull()
+    store.close()
+  })
+
+  test('同じ未所有threadへの別mentionは最初の1件だけ初期文脈を要求する', () => {
+    const store = makeStore()
+    const common = {
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000100',
+      userId: 'U0TRIGGER',
+      repoPath: '/tmp/project',
+      text: '確認して',
+    }
+    expect(store.stageInboundDeliveryAndAdoptSlackThread({
+      ...common, messageId: '1800000001.000100',
+    }, { initialContextEligible: true, appId: 'A0123456789' }).initialContextRequired).toBe(true)
+    expect(store.stageInboundDeliveryAndAdoptSlackThread({
+      ...common, messageId: '1800000002.000100',
+    }, { initialContextEligible: true, appId: 'A0123456789' }).initialContextRequired).toBe(false)
+    expect(store.claimNextInboundDelivery()?.initialContextState).toBe('pending')
+    store.recoverInboundDeliveries()
+    const first = store.claimNextInboundDelivery()!
+    store.finalizeInboundThreadBootstrap(first.idempotencyKey, {
+      mode: 'context',
+      canonical: {
+        messageId: '1800000001.000100', userId: 'U0TRIGGER', text: '確認して',
+        fileIds: [], writeEnabled: false, isInterrupt: false,
+      },
+      text: 'context', fileIds: [], consumedMessageTs: [], followups: [],
+    })
+    store.completeInboundDelivery(first.idempotencyKey)
+    expect(store.claimNextInboundDelivery()?.initialContextState).toBe('none')
+    store.close()
+  })
+
+  test('Slack時系列の先行mentionへ採用点を戻し、後続返信を順番どおり再配置する', () => {
+    const store = makeStore()
+    const channel = 'C0123456789'
+    const rootTs = '1800000100.000100'
+    const firstMentionTs = '1800000101.000100'
+    const middleTs = '1800000102.000100'
+    const observedTs = '1800000103.000100'
+    store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: channel, threadTs: rootTs, messageId: observedTs,
+      userId: 'U0LATER', repoPath: '/tmp/project', text: 'あとから到着',
+    }, { initialContextEligible: true, appId: 'A0123456789' })
+    store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: channel, threadTs: rootTs, messageId: firstMentionTs,
+      userId: 'U0FIRST', repoPath: '/tmp/project', text: '先のメンション',
+    }, { initialContextEligible: true, appId: 'A0123456789' })
+
+    const claimed = store.claimNextInboundDelivery()!
+    expect(claimed.messageId).toBe(observedTs)
+    const canonical = store.finalizeInboundThreadBootstrap(claimed.idempotencyKey, {
+      mode: 'context',
+      canonical: {
+        messageId: firstMentionTs, userId: 'U0FIRST', text: '先のメンション',
+        fileIds: [], writeEnabled: false, isInterrupt: false,
+      },
+      text: 'root\n先のメンション',
+      fileIds: ['FROOT1'],
+      consumedMessageTs: [rootTs],
+      followups: [
+        {
+          messageId: middleTs, userId: 'U0MIDDLE', text: '補足',
+          fileIds: [], writeEnabled: false, isInterrupt: false,
+        },
+        {
+          messageId: observedTs, userId: 'U0LATER', text: 'あとから到着',
+          fileIds: ['FLATER1'], writeEnabled: true, isInterrupt: false,
+        },
+      ],
+    })
+    expect(canonical).toMatchObject({
+      messageId: firstMentionTs,
+      userId: 'U0FIRST',
+      initialContextState: 'hydrated',
+    })
+    expect(store.getThread(channel, rootTs)?.adoptedFromTs).toBe(firstMentionTs)
+    expect(store.hasDurableEvent(`${channel}:${rootTs}`)).toBe(true)
+    store.completeInboundDelivery(canonical.idempotencyKey)
+    const middle = store.claimNextInboundDelivery()!
+    expect(middle.messageId).toBe(middleTs)
+    store.completeInboundDelivery(middle.idempotencyKey)
+    const later = store.claimNextInboundDelivery()!
+    expect(later).toMatchObject({ messageId: observedTs, fileIds: ['FLATER1'], writeEnabled: true })
+    store.close()
+  })
+
+  test('先頭がすでにmention済みなら混ぜずに先頭依頼と返信を復元する', () => {
+    const store = makeStore()
+    const channel = 'C0123456789'
+    const rootTs = '1800000200.000100'
+    const observedTs = '1800000202.000100'
+    store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: channel, threadTs: rootTs, messageId: observedTs,
+      userId: 'U0LATER', repoPath: '/tmp/project', text: '再メンション',
+    }, { initialContextEligible: true, appId: 'A0123456789' })
+    const claimed = store.claimNextInboundDelivery()!
+    const root = store.finalizeInboundThreadBootstrap(claimed.idempotencyKey, {
+      mode: 'independent',
+      canonical: {
+        messageId: rootTs, userId: 'U0ROOT', text: '先頭の独立依頼',
+        fileIds: ['FROOT1'], writeEnabled: true, isInterrupt: false,
+      },
+      text: '先頭の独立依頼',
+      fileIds: ['FROOT1'],
+      consumedMessageTs: [],
+      followups: [{
+        messageId: observedTs, userId: 'U0LATER', text: '再メンション',
+        fileIds: [], writeEnabled: false, isInterrupt: false,
+      }],
+    })
+    expect(root).toMatchObject({
+      messageId: rootTs,
+      text: '先頭の独立依頼',
+      initialContextState: 'none',
+    })
+    expect(store.getThread(channel, rootTs)?.adoptedFromTs).toBe(rootTs)
+    store.completeInboundDelivery(root.idempotencyKey)
+    expect(store.claimNextInboundDelivery()?.messageId).toBe(observedTs)
+    store.close()
+  })
+
+  test('初期文脈の確定失敗はthread所有権を公開せず後続FIFOを解放する', () => {
+    const store = makeStore()
+    const channel = 'C0123456789'
+    const rootTs = '1800000300.000100'
+    const triggerTs = '1800000301.000100'
+    store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: channel, threadTs: rootTs, messageId: triggerTs,
+      userId: 'U0FIRST', repoPath: '/tmp/project', text: '確認して',
+    }, { initialContextEligible: true, appId: 'A0123456789' })
+    const failed = store.claimNextInboundDelivery()!
+    store.failInboundDelivery(failed.idempotencyKey, 'thread_not_found')
+    expect(store.getThread(channel, rootTs)).toBeNull()
+    expect(store.claimNextInboundDelivery()).toBeNull()
+
+    const secondTs = '1800000302.000100'
+    expect(store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: channel, threadTs: rootTs, messageId: secondTs,
+      userId: 'U0SECOND', repoPath: '/tmp/project', text: 'もう一度',
+    }, { initialContextEligible: true, appId: 'A0123456789' }).initialContextRequired).toBe(true)
+    expect(store.claimNextInboundDelivery()?.messageId).toBe(secondTs)
+    store.close()
+  })
+
+  test('channel routeが事前確認後に変わった場合は旧projectで採用しない', () => {
+    const store = makeStore()
+    expect(() => store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: 'C0123456789', threadTs: '1800000400.000100',
+      messageId: '1800000401.000100', userId: 'U0FIRST',
+      repoPath: '/tmp/project', text: '確認して',
+    }, {
+      initialContextEligible: true,
+      appId: 'A0123456789',
+      expectedRepoPath: '/tmp/changed',
+    })).toThrow(SlackChannelRouteChangedError)
+    expect(store.inboundDeliveryCount()).toBe(0)
+    store.close()
+  })
+
+  test('Slack rate limit待ちはinbound attemptを消費しない', () => {
+    const store = makeStore()
+    store.stageInboundDelivery({
+      ...input({ messageId: '1800000000.000200' }), text: 'retry me',
+    })
+    const first = store.claimNextInboundDelivery(100)!
+    expect(first.attempts).toBe(0)
+    store.deferInboundDeliveryWithoutAttempt(first.idempotencyKey, '429', 200)
+    expect(store.claimNextInboundDelivery(199)).toBeNull()
+    expect(store.claimNextInboundDelivery(200)?.attempts).toBe(0)
     store.close()
   })
 

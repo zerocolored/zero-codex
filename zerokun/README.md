@@ -257,6 +257,9 @@ Codex stdout/stderr logはfileごとに20MB、解析用memoryは1MB tailへ制�
 `slack_threads` は `(chat_id, thread_ts)` ごとに repository を固定します。gateway は:
 
 - 起動時に直近の DM と channel mention を履歴から回収
+- 未採用threadの途中でAppが初めてメンションされた場合、先頭からそのメンションまでのhuman投稿と
+  添付を時系列の1タスクへまとめる。取得前にSQLiteへ保存するため、一時的なSlack読取失敗や再起動でも
+  再試行でき、既に採用済みのthreadは再構築しない
 - 48時間以内に活動した採用済み thread を60秒ごとに poll
 - Socket Modeで受信した採用済みthreadの返信は60秒を待たず、現在turnのlive controlとして優先回収
 - human 向け mention だけの雑談は channel policy に従って除外
