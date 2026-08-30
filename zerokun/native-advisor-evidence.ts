@@ -11,9 +11,26 @@ export type NativeAdvisorPerspective = 'solution' | 'risk'
 
 export type NativeAdvisorJournalEntry = {
   perspective: NativeAdvisorPerspective
-  agentId: string
-  responseDigest: string
+  /** Omitted on legacy v5-v7 evidence, where every native slot was adopted. */
+  attempted?: boolean
+  /** Omitted on legacy v5-v7 evidence, where every native slot was adopted. */
+  adopted?: boolean
+  agentId?: string
+  responseDigest?: string
   responseTransportDigest?: string
+  reasonDigest?: string
+}
+
+function nativeAdvisorEntryAdopted(entry: NativeAdvisorJournalEntry): boolean {
+  return entry.adopted !== false
+}
+
+export class NativeAdvisorFinalMaterializationPending extends Error {}
+
+export function retryableNativeAdvisorHistoryMaterialization(
+  error: unknown,
+): boolean {
+  return error instanceof NativeAdvisorFinalMaterializationPending
 }
 
 export type NativeAdvisorRoundEvidence = {
@@ -182,30 +199,76 @@ export function resolveNativeAdvisorThreadIds(options: {
     options.parentResponse,
     options.parentThreadId,
   )
-  const candidates = childThreads.map(child => ({
-    threadId: child.threadId,
-    perspective: child.perspective,
-    finalResponse: completedFinalResponse(
+  const unavailableSlots = new Map<NativeAdvisorPerspective, number>([
+    ['solution', 0],
+    ['risk', 0],
+  ])
+  for (const evidence of options.rounds) {
+    for (const entry of evidence.native) {
+      if (!nativeAdvisorEntryAdopted(entry)) {
+        unavailableSlots.set(entry.perspective, (unavailableSlots.get(entry.perspective) ?? 0) + 1)
+      }
+    }
+  }
+  const candidates = childThreads.map(child => {
+    const label = `native advisor physical thread ${child.threadId}`
+    const abandonedGeneration = abandonedPauseGeneration(
       child.thread,
-      `native advisor physical thread ${child.threadId}`,
+      label,
       options.parentThreadId,
       directChildIds,
-      inheritedParentActivitiesForChild(
-        parentActivityTimeline,
-        child.threadId,
-        directChildIds,
-      ),
+      parentActivityTimeline,
       inheritedParentTurns,
-    ),
-  }))
+    )
+    let finalResponse: string | null = null
+    try {
+      finalResponse = completedFinalResponse(
+        child.thread,
+        label,
+        options.parentThreadId,
+        directChildIds,
+        inheritedParentActivitiesForChild(
+          parentActivityTimeline,
+          child.threadId,
+          directChildIds,
+        ),
+        inheritedParentTurns,
+      )
+    } catch (error) {
+      if (abandonedGeneration === null && !terminalUnavailableAdvisor(
+        child.thread,
+        label,
+        options.parentThreadId,
+        directChildIds,
+        parentActivityTimeline,
+        inheritedParentTurns,
+      )) throw error
+    }
+    return {
+      threadId: child.threadId,
+      perspective: child.perspective,
+      finalResponse,
+      abandonedGeneration,
+    }
+  })
 
   const logicalAgentIds = new Set<string>()
   const matchedThreadIds = new Set<string>()
   const resolved = options.rounds.map(evidence => ({
     ...evidence,
     native: evidence.native.map(entry => {
+      if (!nativeAdvisorEntryAdopted(entry)) {
+        if (entry.attempted !== true || entry.adopted !== false
+          || !/^[0-9a-f]{64}$/.test(String(entry.reasonDigest))
+          || entry.responseDigest !== undefined
+          || entry.responseTransportDigest !== undefined
+          || entry.agentId !== undefined) {
+          throw new Error('native advisor unavailable outcome is invalid')
+        }
+        return entry
+      }
       if (!isNativeAdvisorAgentLabel(entry.agentId) || logicalAgentIds.has(entry.agentId)
-        || !/^[0-9a-f]{64}$/.test(entry.responseDigest)
+        || !/^[0-9a-f]{64}$/.test(String(entry.responseDigest))
         || (entry.responseTransportDigest !== undefined
           && !/^[0-9a-f]{64}$/.test(entry.responseTransportDigest))) {
         throw new Error('native advisor journal identities are not fresh and unique')
@@ -222,15 +285,20 @@ export function resolveNativeAdvisorThreadIds(options: {
       const eligible = candidates.filter(candidate => (
         !matchedThreadIds.has(candidate.threadId)
         && candidate.perspective === entry.perspective
+        && candidate.finalResponse !== null
       ))
       const rawMatches = eligible.filter(candidate => (
-        nativeAdvisorResponseMatches(candidate.finalResponse, marker, entry) === 'raw'
+        nativeAdvisorResponseMatches(candidate.finalResponse!, marker, entry) === 'raw'
       ))
-      const matches = rawMatches.length > 0
+      let matches = rawMatches.length > 0
         ? rawMatches
         : eligible.filter(candidate => (
-            nativeAdvisorResponseMatches(candidate.finalResponse, marker, entry) === 'transport'
+            nativeAdvisorResponseMatches(candidate.finalResponse!, marker, entry) === 'transport'
           ))
+      const activeGenerationMatches = matches.filter(candidate => (
+        candidate.abandonedGeneration === null
+      ))
+      if (activeGenerationMatches.length > 0) matches = activeGenerationMatches
       if (matches.length !== 1) {
         throw new Error(
           `native advisor ${entry.agentId} did not resolve to exactly one physical thread`,
@@ -241,7 +309,29 @@ export function resolveNativeAdvisorThreadIds(options: {
       return { ...entry, agentId: threadId }
     }),
   }))
-  if (matchedThreadIds.size !== candidates.length) {
+  const abandonedSlots = new Set<string>()
+  const consumedUnavailable = new Map<NativeAdvisorPerspective, number>([
+    ['solution', 0],
+    ['risk', 0],
+  ])
+  for (const candidate of candidates) {
+    if (matchedThreadIds.has(candidate.threadId)) continue
+    if (candidate.abandonedGeneration !== null) {
+      const slot = `${candidate.abandonedGeneration}\0${candidate.perspective}`
+      if (abandonedSlots.has(slot)) {
+        throw new Error('native advisor paused generation spawned duplicate perspective children')
+      }
+      abandonedSlots.add(slot)
+      continue
+    }
+    if (candidate.finalResponse === null) {
+      const consumed = consumedUnavailable.get(candidate.perspective) ?? 0
+      const available = unavailableSlots.get(candidate.perspective) ?? 0
+      if (consumed < available) {
+        consumedUnavailable.set(candidate.perspective, consumed + 1)
+        continue
+      }
+    }
     throw new Error('native advisor history contains an unjournaled physical child thread')
   }
   return resolved
@@ -305,6 +395,24 @@ type ParentSubagentActivity = {
   kind: string
   agentThreadId: string
   ordinal: number
+  parentTurnKey: string
+  parentTurnPaused: boolean
+}
+
+function interjectionPauseGeneration(turn: Record<string, unknown>): string | null {
+  if (turn.status !== 'completed' || turn.itemsView !== 'full' || !Array.isArray(turn.items)) {
+    return null
+  }
+  const finals = turn.items.flatMap(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const entry = item as Record<string, unknown>
+    return isFinalAppServerAgentMessage(entry) ? [entry.text.replace(/\r\n/g, '\n').trim()] : []
+  })
+  if (finals.length !== 1) return null
+  const markers = finals[0]!.match(/\[ZERO_INTERJECTION_PAUSED:[A-Za-z0-9._:-]{1,256}\]/g) ?? []
+  return markers.length === 1 && finals[0]!.split('\n').at(-1)?.trim() === markers[0]
+    ? markers[0]!
+    : null
 }
 
 function parentSubagentActivityTimeline(
@@ -317,11 +425,26 @@ function parentSubagentActivityTimeline(
   }
   const timeline: ParentSubagentActivity[] = []
   const itemIds = new Set<string>()
+  const pauseGenerations = new Set<string>()
   let ordinal = 0
-  for (const rawTurn of parent.turns) {
+  for (const [turnIndex, rawTurn] of parent.turns.entries()) {
     if (!rawTurn || typeof rawTurn !== 'object' || Array.isArray(rawTurn)) continue
     const turn = rawTurn as Record<string, unknown>
     if (!Array.isArray(turn.items)) continue
+    const rawTurnId = turn.id
+    if (rawTurnId !== undefined && (typeof rawTurnId !== 'string' || !THREAD_ID.test(rawTurnId))) {
+      throw new Error('native advisor parent activity turn identity is invalid')
+    }
+    const pauseGeneration = interjectionPauseGeneration(turn)
+    if (pauseGeneration !== null) {
+      if (pauseGenerations.has(pauseGeneration)) {
+        throw new Error('native advisor parent pause generation is duplicated')
+      }
+      pauseGenerations.add(pauseGeneration)
+    }
+    const parentTurnKey = pauseGeneration
+      ?? (typeof rawTurnId === 'string' ? rawTurnId : `projection-${turnIndex}`)
+    const parentTurnPaused = pauseGeneration !== null
     for (const rawItem of turn.items) {
       if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) continue
       const item = rawItem as Record<string, unknown>
@@ -337,6 +460,8 @@ function parentSubagentActivityTimeline(
         kind: item.kind as string,
         agentThreadId: item.agentThreadId as string,
         ordinal,
+        parentTurnKey,
+        parentTurnPaused,
       })
       ordinal += 1
     }
@@ -384,14 +509,12 @@ function inheritedParentActivitiesForChild(
   )).map(activity => activity.fingerprint))
 }
 
-function completedFinalResponse(
+function ownedAdvisorTurns(
   thread: Record<string, unknown>,
   label: string,
   expectedParentThreadId: string,
-  directChildIds: ReadonlySet<string> = new Set(),
-  inheritedParentActivities: ReadonlySet<string> = new Set(),
-  inheritedParentTurns: ReadonlyMap<string, number> = new Map(),
-): string {
+  inheritedParentTurns: ReadonlyMap<string, number>,
+): Array<Record<string, unknown>> {
   if (!THREAD_ID.test(expectedParentThreadId)
     || thread.parentThreadId !== expectedParentThreadId) {
     throw new Error(`${label} parent binding is invalid`)
@@ -399,7 +522,7 @@ function completedFinalResponse(
   if (!Array.isArray(thread.turns) || thread.turns.length < 1) {
     throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
   }
-  const ownedTurns: unknown[] = []
+  const ownedTurns: Array<Record<string, unknown>> = []
   let lastInheritedOrdinal = -1
   let observedOwnedTurn = false
   for (const [turnIndex, rawTurn] of thread.turns.entries()) {
@@ -409,7 +532,7 @@ function completedFinalResponse(
       : undefined
     if (inheritedOrdinal === undefined) {
       observedOwnedTurn = true
-      ownedTurns.push(rawTurn)
+      ownedTurns.push(turn)
       continue
     }
     if (observedOwnedTurn || inheritedOrdinal <= lastInheritedOrdinal
@@ -424,6 +547,150 @@ function completedFinalResponse(
     // order distinguish that inherited prefix from repeated advisor prompts.
     lastInheritedOrdinal = inheritedOrdinal
   }
+  return ownedTurns
+}
+
+/**
+ * A same-thread interjection can interrupt the current root turn after its
+ * native advisors were spawned. App Server keeps those owned child threads in
+ * the durable child listing even though a resumed root turn launches a fresh,
+ * journaled pair. Treat only the exact terminal/no-answer/no-descendant shape
+ * as an unavailable advisor attempt; every completed, active, delegated, or
+ * ambiguously bound extra child remains a hard evidence failure.
+ */
+function terminalUnavailableAdvisor(
+  thread: Record<string, unknown>,
+  label: string,
+  expectedParentThreadId: string,
+  directChildIds: ReadonlySet<string>,
+  parentActivityTimeline: readonly ParentSubagentActivity[],
+  inheritedParentTurns: ReadonlyMap<string, number>,
+): boolean {
+  try {
+    const ownedTurns = ownedAdvisorTurns(
+      thread,
+      label,
+      expectedParentThreadId,
+      inheritedParentTurns,
+    )
+    if (ownedTurns.length !== 1) return false
+    const turn = ownedTurns[0]!
+    if (!['interrupted', 'failed'].includes(String(turn.status)) || turn.itemsView !== 'full'
+      || !Array.isArray(turn.items)) return false
+    for (const rawItem of turn.items) {
+      if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) continue
+      const item = rawItem as Record<string, unknown>
+      if (isFinalAppServerAgentMessage(item)) return false
+      if (item.type === 'subAgentActivity') {
+        if (typeof item.kind !== 'string' || !SUBAGENT_ACTIVITY_KINDS.has(item.kind)
+          || typeof item.agentThreadId !== 'string' || !THREAD_ID.test(item.agentThreadId)) {
+          return false
+        }
+        // An interrupted fork can project an earlier sibling activity from
+        // the parent. Reuse the exact stable-item proof used for adopted
+        // advisors; all other activity is a real delegation/interaction.
+        const fingerprint = subagentActivityFingerprint(item)
+        const inherited = fingerprint !== null
+          && item.agentThreadId !== thread.id
+          && directChildIds.has(item.agentThreadId)
+          && inheritedParentActivitiesForChild(
+            parentActivityTimeline,
+            String(thread.id),
+            directChildIds,
+          ).has(fingerprint)
+        if (!inherited) return false
+      }
+    }
+    const lifecycle = parentActivityTimeline.filter(activity => (
+      activity.agentThreadId === thread.id
+    ))
+    if (lifecycle.length < 1 || lifecycle[0]!.kind !== 'started'
+      || lifecycle.filter(activity => activity.kind === 'started').length !== 1
+      || lifecycle.some(activity => activity.kind === 'completed')) return false
+    // Current App Server history records only `started` on the parent for a
+    // child whose owned turn later becomes interrupted. Accept that observed
+    // terminal shape. Some versions may additionally project one explicit
+    // interrupted event. Any interaction or completion is stronger evidence
+    // than the observed abandoned fork and remains a hard failure.
+    return lifecycle.length === 1
+      || (lifecycle.length === 2 && lifecycle[1]!.kind === 'interrupted')
+  } catch {
+    return false
+  }
+}
+
+function abandonedPauseGeneration(
+  thread: Record<string, unknown>,
+  label: string,
+  expectedParentThreadId: string,
+  directChildIds: ReadonlySet<string>,
+  parentActivityTimeline: readonly ParentSubagentActivity[],
+  inheritedParentTurns: ReadonlyMap<string, number>,
+): string | null {
+  try {
+    const lifecycle = parentActivityTimeline.filter(activity => (
+      activity.agentThreadId === thread.id
+    ))
+    if (lifecycle.length < 1 || lifecycle[0]!.kind !== 'started'
+      || !lifecycle[0]!.parentTurnPaused
+      || lifecycle.filter(activity => activity.kind === 'started').length !== 1
+      || lifecycle.some(activity => activity.parentTurnKey !== lifecycle[0]!.parentTurnKey
+        || activity.kind === 'interacted')) return null
+    const ownedTurns = ownedAdvisorTurns(
+      thread,
+      label,
+      expectedParentThreadId,
+      inheritedParentTurns,
+    )
+    if (ownedTurns.length !== 1) return null
+    const turn = ownedTurns[0]!
+    if (!['completed', 'interrupted', 'failed'].includes(String(turn.status))
+      || turn.itemsView !== 'full' || !Array.isArray(turn.items)) return null
+    if (turn.status === 'completed') {
+      completedFinalResponse(
+        thread,
+        label,
+        expectedParentThreadId,
+        directChildIds,
+        inheritedParentActivitiesForChild(
+          parentActivityTimeline,
+          String(thread.id),
+          directChildIds,
+        ),
+        inheritedParentTurns,
+      )
+    } else if (!terminalUnavailableAdvisor(
+      thread,
+      label,
+      expectedParentThreadId,
+      directChildIds,
+      parentActivityTimeline,
+      inheritedParentTurns,
+    )) return null
+    if (turn.status === 'completed'
+      && lifecycle.some(activity => !['started', 'completed'].includes(activity.kind))) return null
+    if (turn.status !== 'completed'
+      && lifecycle.some(activity => !['started', 'interrupted'].includes(activity.kind))) return null
+    return lifecycle[0]!.parentTurnKey
+  } catch {
+    return null
+  }
+}
+
+function completedFinalResponse(
+  thread: Record<string, unknown>,
+  label: string,
+  expectedParentThreadId: string,
+  directChildIds: ReadonlySet<string> = new Set(),
+  inheritedParentActivities: ReadonlySet<string> = new Set(),
+  inheritedParentTurns: ReadonlyMap<string, number> = new Map(),
+): string {
+  const ownedTurns = ownedAdvisorTurns(
+    thread,
+    label,
+    expectedParentThreadId,
+    inheritedParentTurns,
+  )
   if (ownedTurns.length < 1 || ownedTurns.length > 2) {
     throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
   }
@@ -481,10 +748,16 @@ function completedFinalResponse(
       }
       continue
     }
-    if (turnIndex !== ownedTurns.length - 1 || messages.length !== 1
-      || !messages[0] || finalResponse !== null) {
+    if (turnIndex !== ownedTurns.length - 1 || messages.length > 1
+      || finalResponse !== null) {
       throw new Error(`${label} does not contain one final response`)
     }
+    if (messages.length === 0) {
+      throw new NativeAdvisorFinalMaterializationPending(
+        `${label} does not contain one final response; final response is not materialized yet`,
+      )
+    }
+    if (!messages[0]) throw new Error(`${label} does not contain one final response`)
     finalResponse = messages[0]
   }
   if (finalResponse === null) {
@@ -594,6 +867,10 @@ export function assertNativeAdvisorEvidence(options: {
   }
 
   const claimed = new Set<string>()
+  const unavailableSlots = new Map<NativeAdvisorPerspective, number>([
+    ['solution', 0],
+    ['risk', 0],
+  ])
   for (const evidence of options.rounds) {
     if (!Array.isArray(evidence.native) || evidence.native.length !== 2) {
       throw new Error(`native advisor ${evidence.phase}-${evidence.round} count is invalid`)
@@ -603,8 +880,20 @@ export function assertNativeAdvisorEvidence(options: {
       throw new Error(`native advisor ${evidence.phase}-${evidence.round} roles are invalid`)
     }
     for (const entry of evidence.native) {
-      if (!THREAD_ID.test(entry.agentId) || claimed.has(entry.agentId)
-        || !/^[0-9a-f]{64}$/.test(entry.responseDigest)
+      if (!nativeAdvisorEntryAdopted(entry)) {
+        if (entry.attempted !== true || entry.adopted !== false
+          || !/^[0-9a-f]{64}$/.test(String(entry.reasonDigest))
+          || entry.responseDigest !== undefined
+          || entry.responseTransportDigest !== undefined
+          || entry.agentId !== undefined) {
+          throw new Error('native advisor unavailable outcome is invalid')
+        }
+        unavailableSlots.set(entry.perspective, (unavailableSlots.get(entry.perspective) ?? 0) + 1)
+        continue
+      }
+      if (typeof entry.agentId !== 'string' || !THREAD_ID.test(entry.agentId)
+        || claimed.has(entry.agentId)
+        || !/^[0-9a-f]{64}$/.test(String(entry.responseDigest))
         || (entry.responseTransportDigest !== undefined
           && !/^[0-9a-f]{64}$/.test(entry.responseTransportDigest))) {
         throw new Error('native advisor identities are not fresh and unique')
@@ -652,19 +941,83 @@ export function assertNativeAdvisorEvidence(options: {
       }
     }
   }
-  if (options.childResponses.size !== claimed.size
-    || [...options.childResponses.keys()].some(id => !claimed.has(id))
-    || options.childChildrenListResponses.size !== claimed.size
-    || [...options.childChildrenListResponses.keys()].some(id => !claimed.has(id))) {
+  const safelyAccounted = new Set<string>()
+  const abandonedSlots = new Set<string>()
+  const consumedUnavailable = new Map<NativeAdvisorPerspective, number>([
+    ['solution', 0],
+    ['risk', 0],
+  ])
+  for (const [threadId, response] of options.childResponses) {
+    if (claimed.has(threadId)) continue
+    const label = `native advisor unclaimed thread ${threadId}`
+    const child = threadFromResponse(response, label)
+    const descendants = options.childChildrenListResponses.get(threadId)
+    const role = childRole(child)
+    const perspective: NativeAdvisorPerspective | null = role === 'solution_analyst'
+      ? 'solution'
+      : role === 'risk_reviewer'
+        ? 'risk'
+        : null
+    if (child.id !== threadId || child.parentThreadId !== options.parentThreadId
+      || childSourceParent(child) !== options.parentThreadId
+      || perspective === null
+      || physicalCwd(child.cwd, label) !== repo
+      || !descendants || listedDirectChildren(
+      descendants,
+      threadId,
+      `${label} descendant listing`,
+    ).length !== 0) {
+      throw new Error('native advisor history contains an unclaimed child response')
+    }
+    const generation = abandonedPauseGeneration(
+      child,
+      label,
+      options.parentThreadId,
+      directChildIds,
+      parentActivityTimeline,
+      inheritedParentTurns,
+    )
+    if (generation !== null) {
+      const slot = `${generation}\0${perspective}`
+      if (abandonedSlots.has(slot)) {
+        throw new Error('native advisor paused generation spawned duplicate perspective children')
+      }
+      abandonedSlots.add(slot)
+      safelyAccounted.add(threadId)
+      continue
+    }
+    if (terminalUnavailableAdvisor(
+      child,
+      label,
+      options.parentThreadId,
+      directChildIds,
+      parentActivityTimeline,
+      inheritedParentTurns,
+    )) {
+      const consumed = consumedUnavailable.get(perspective) ?? 0
+      const available = unavailableSlots.get(perspective) ?? 0
+      if (consumed < available) {
+        consumedUnavailable.set(perspective, consumed + 1)
+        safelyAccounted.add(threadId)
+        continue
+      }
+    }
+    throw new Error('native advisor history contains an unclaimed child response')
+  }
+  const accounted = new Set([...claimed, ...safelyAccounted])
+  if (options.childResponses.size !== accounted.size
+    || [...options.childResponses.keys()].some(id => !accounted.has(id))
+    || options.childChildrenListResponses.size !== accounted.size
+    || [...options.childChildrenListResponses.keys()].some(id => !accounted.has(id))) {
     throw new Error('native advisor history contains an unclaimed child response')
   }
   const baseline = new Set(options.parentChildBaseline)
-  if ([...claimed].some(id => baseline.has(id))) {
+  if ([...accounted].some(id => baseline.has(id))) {
     throw new Error('native advisor identity was already present before this job attempt')
   }
-  const expectedListed = new Set([...baseline, ...claimed])
-  if (claimed.size !== observedChildren.size
-    || [...observedChildren].some(id => !claimed.has(id))
+  const expectedListed = new Set([...baseline, ...accounted])
+  if (accounted.size !== observedChildren.size
+    || [...observedChildren].some(id => !accounted.has(id))
     || listedIds.length !== expectedListed.size
     || listedIds.some(id => !expectedListed.has(id))) {
     throw new Error('Codex job attempt spawned unjournaled or missing native advisors')

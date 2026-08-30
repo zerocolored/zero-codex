@@ -119,6 +119,11 @@ import {
   reconcileEphemeralClaudeSessions,
 } from './ephemeral-claude-session.ts'
 import {
+  finalizeRetiredAdvisorRounds,
+  persistAdvisorClaudeCleanupOutcome,
+  recordAdvisorExecutorRetirementForJob,
+} from './advisor-round-recovery.ts'
+import {
   appendHerdrJobMonitorStatus,
   closeHerdrJobMonitor,
   HerdrJobMonitorPendingError,
@@ -9393,6 +9398,34 @@ export async function reconcileAdvisorsWithMonitorHealthBarrier(
   await verify()
 }
 
+export async function reconcileEphemeralAndRetiredAdvisorRounds(options: {
+  stateDir: string
+  runtime: ReturnType<typeof readPinnedHerdrRuntime>
+  log?: (message: string) => void
+}): Promise<void> {
+  await reconcileEphemeralClaudeSessions({
+    stateDir: options.stateDir,
+    runtime: options.runtime,
+    log: options.log,
+    onReconciledRound: outcome => {
+      const input = readAdvisorInputSnapshot(
+        options.stateDir, outcome.jobId, outcome.inputRevision,
+      )
+      if (!input.digest.startsWith(outcome.inputDigestPrefix)) {
+        throw new Error('reconciled Claude round input digest changed')
+      }
+      persistAdvisorClaudeCleanupOutcome(options.stateDir, {
+        ...outcome,
+        inputDigest: input.digest,
+      })
+    },
+  })
+  const result = finalizeRetiredAdvisorRounds(options.stateDir)
+  if (result.finalized > 0) {
+    options.log?.(`finalized ${result.finalized} interrupted advisor round(s)`)
+  }
+}
+
 function readBoundedArtifact(descriptor: number, file: string): Buffer {
   const chunks: Buffer[] = []
   let total = 0
@@ -10562,6 +10595,23 @@ export async function terminateTrackedExecutors(
   const removeRegistrationArtifacts = (
     registration: (typeof registrations extends Map<number, infer T> ? T : never),
   ): void => {
+    if (registration.fingerprint && registration.started && registration.bootSession
+      && registration.startSec !== undefined && registration.startUsec !== undefined
+      && registration.pgid !== undefined) {
+      recordAdvisorExecutorRetirementForJob({
+        stateDir: stateDirectory,
+        jobId: registration.jobId,
+        fingerprint: registration.fingerprint,
+        supervisor: {
+          pid: registration.pgid,
+          pgid: registration.pgid,
+          started: registration.started,
+          bootSession: registration.bootSession,
+          startSec: registration.startSec,
+          startUsec: registration.startUsec,
+        },
+      })
+    }
     if (registration.path) rmSync(registration.path, { force: true })
     if (registration.fingerprint) {
       removeSeatbeltFingerprint(stateDirectory, registration.fingerprint)
@@ -10858,7 +10908,7 @@ async function runCli(): Promise<void> {
               store.get(jobId)?.lastError ?? '',
             ),
           }),
-          async () => { await reconcileEphemeralClaudeSessions({
+          async () => { await reconcileEphemeralAndRetiredAdvisorRounds({
             stateDir: dir,
             runtime,
             log,
@@ -11020,7 +11070,7 @@ async function runCli(): Promise<void> {
             store.get(jobId)?.lastError ?? '',
           ),
         }),
-        async () => { await reconcileEphemeralClaudeSessions({
+        async () => { await reconcileEphemeralAndRetiredAdvisorRounds({
           stateDir: dir,
           runtime: pinnedHerdrRuntime,
           log,
@@ -11180,17 +11230,17 @@ async function runCli(): Promise<void> {
       stopWhenIdle: command === 'run-until-idle',
       shouldPause,
       advisorStateDir: dir,
-      beforeClaim: async () => { await reconcileEphemeralClaudeSessions({
+      beforeClaim: async () => { await reconcileEphemeralAndRetiredAdvisorRounds({
         stateDir: dir,
         runtime: pinnedHerdrRuntime,
         log,
       }) },
-      settleExternalContext: async () => { await reconcileEphemeralClaudeSessions({
+      settleExternalContext: async () => { await reconcileEphemeralAndRetiredAdvisorRounds({
         stateDir: dir,
         runtime: pinnedHerdrRuntime,
         log,
       }) },
-      cancelExternalContext: async () => { await reconcileEphemeralClaudeSessions({
+      cancelExternalContext: async () => { await reconcileEphemeralAndRetiredAdvisorRounds({
         stateDir: dir,
         runtime: pinnedHerdrRuntime,
         log,

@@ -299,27 +299,27 @@ describe('native advisor App Server history', () => {
   test('items/listを全selected turnで完走して親子履歴を照合する', async () => {
     const value = fixture(true)
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('childの空full履歴はitems/listのfinal responseまで復元する', async () => {
     const value = fixture(true, 'solution')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('native履歴でもlegacyのnullまたは省略phaseを受理する', async () => {
     for (const mode of ['solution-null-phase', 'solution-omitted-phase'] as const) {
       const value = fixture(true, mode)
       await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-      expect(value.itemsListCalls()).toBe(3)
+      expect(value.itemsListCalls()).toBe(6)
     }
   })
 
   test('supported item journalでもlegacy agent_messageを受理する', async () => {
     const value = fixture(true, 'solution-legacy-agent-message')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('native履歴のcommentaryだけは拒否しfinal併存時はfinalだけを採択する', async () => {
@@ -330,44 +330,214 @@ describe('native advisor App Server history', () => {
 
     const accepted = fixture(true, 'solution-commentary-then-final')
     await expect(assertNativeAdvisorHistory(accepted.options)).resolves.toBeUndefined()
-    expect(accepted.itemsListCalls()).toBe(3)
+    expect(accepted.itemsListCalls()).toBe(6)
+  })
+
+  test('supported items/listのfinal反映遅延をbounded再取得で回収する', async () => {
+    const value = fixture(true)
+    const original = value.options.readForTesting!
+    let parentSnapshots = 0
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === value.options.parentThreadId) parentSnapshots += 1
+      const response = await original(method, params)
+      if (parentSnapshots !== 1 || method !== 'thread/items/list'
+        || params.threadId !== 'solution-thread') return response
+      return {
+        ...response,
+        data: (response.data as Array<Record<string, unknown>>).map(entry => ({
+          ...entry,
+          item: {
+            ...(entry.item as Record<string, unknown>),
+            phase: 'commentary',
+            text: 'final is still materializing',
+          },
+        })),
+      }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+    expect(value.itemsListCalls()).toBe(9)
+  })
+
+  test('supported snapshot収集中のchild turn欠落を再取得し2連続validへ収束する', async () => {
+    const value = fixture(true)
+    const original = value.options.readForTesting!
+    let parentSnapshots = 0
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === value.options.parentThreadId) parentSnapshots += 1
+      const response = await original(method, params)
+      if (parentSnapshots !== 1 || params.threadId !== 'solution-thread') return response
+      if (method === 'thread/turns/list') return { ...response, data: [] }
+      if (method === 'thread/read' && params.includeTurns === true) {
+        return {
+          ...response,
+          thread: { ...(response.thread as Record<string, unknown>), turns: [] },
+        }
+      }
+      return response
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+    expect(value.itemsListCalls()).toBe(8)
+    expect(value.fullThreadReadCalls()).toBe(1)
+  })
+
+  test('先頭childのfinal遅延中に後続childで観測したunsafe itemを再取得で隠さない', async () => {
+    const value = fixture(true)
+    const original = value.options.readForTesting!
+    let parentSnapshots = 0
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === value.options.parentThreadId) parentSnapshots += 1
+      const response = await original(method, params)
+      if (parentSnapshots !== 1 || method !== 'thread/items/list') return response
+      if (params.threadId === 'solution-thread') {
+        return {
+          ...response,
+          data: (response.data as Array<Record<string, unknown>>).map(entry => ({
+            ...entry,
+            item: {
+              ...(entry.item as Record<string, unknown>),
+              phase: 'commentary',
+              text: 'final is still materializing',
+            },
+          })),
+        }
+      }
+      if (params.threadId === 'risk-thread') {
+        return {
+          ...response,
+          data: [
+            ...(response.data as Array<Record<string, unknown>>),
+            {
+              turnId: 'risk-thread-turn',
+              item: {
+                type: 'subAgentActivity',
+                id: 'risk-late-unsafe-child',
+                kind: 'started',
+                agentThreadId: 'risk-hidden-grandchild',
+              },
+            },
+          ],
+        }
+      }
+      return response
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
+      'removed observed item evidence',
+    )
+  })
+
+  test('supported items/listの初回valid後に現れたdelegationを固定点採択で隠さない', async () => {
+    const value = fixture(true)
+    const original = value.options.readForTesting!
+    let parentSnapshots = 0
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/read' && params.includeTurns === false
+        && params.threadId === value.options.parentThreadId) parentSnapshots += 1
+      const response = await original(method, params)
+      if (parentSnapshots !== 2 || method !== 'thread/items/list'
+        || params.threadId !== 'solution-thread') return response
+      return {
+        ...response,
+        data: [
+          ...(response.data as unknown[]),
+          {
+            turnId: 'solution-thread-turn',
+            item: {
+              type: 'subAgentActivity', id: 'transient-grandchild',
+              kind: 'started', agentThreadId: 'transient-grandchild-thread',
+            },
+          },
+        ],
+      }
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
+      'delegated to another subagent',
+    )
+    expect(value.itemsListCalls()).toBe(6)
+  })
+
+  test('native採択数0のterminal journalを空の物理child履歴と照合する', async () => {
+    const value = fixture(true)
+    value.options.rounds[0]!.native = [
+      {
+        perspective: 'solution', attempted: true, adopted: false,
+        reasonDigest: '1'.repeat(64),
+      },
+      {
+        perspective: 'risk', attempted: true, adopted: false,
+        reasonDigest: '2'.repeat(64),
+      },
+    ]
+    const original = value.options.readForTesting!
+    value.options.readForTesting = async (method, params) => {
+      if (method === 'thread/list' && params.parentThreadId === value.options.parentThreadId) {
+        return { data: [], nextCursor: null }
+      }
+      const response = await original(method, params)
+      if (params.threadId !== value.options.parentThreadId) return response
+      if (method === 'thread/items/list') return { data: [], nextCursor: null }
+      if (method === 'thread/turns/list') {
+        return {
+          ...response,
+          data: (response.data as Array<Record<string, unknown>>).map(turn => ({
+            ...turn, items: [],
+          })),
+        }
+      }
+      if (method === 'thread/read' && params.includeTurns === true) {
+        const thread = response.thread as Record<string, unknown>
+        return {
+          ...response,
+          thread: {
+            ...thread,
+            turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
+              ...turn, items: [],
+            })),
+          },
+        }
+      }
+      return response
+    }
+    await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
   })
 
   test('同一item IDの空projectionをitems/listの完成回答で更新する', async () => {
     const value = fixture(true, 'solution-partial-same-id')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('同一item IDの古いprojectionをitems/listの確定回答で更新する', async () => {
     const value = fixture(true, 'solution-stale-same-id')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('supported item journalを古いturn projectionより優先する', async () => {
     const value = fixture(true, 'solution-conflicting-id')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('parentの空full履歴はitems/listのadvisor activityまで復元する', async () => {
     const value = fixture(true, 'parent')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('parentの部分full履歴も期待advisor IDが揃うまでitems/listへ降りる', async () => {
     const value = fixture(true, 'parent-partial')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('完全items履歴があれば補助thread/read失敗へ依存しない', async () => {
     for (const mode of ['parent-partial', 'solution'] as const) {
       const value = fixture(true, mode, true, 'fail')
       await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-      expect(value.itemsListCalls()).toBe(3)
+      expect(value.itemsListCalls()).toBe(6)
       expect(value.fullThreadReadCalls()).toBe(0)
     }
   })
@@ -383,8 +553,8 @@ describe('native advisor App Server history', () => {
   test('turns/listから欠落したparent turnをthread/readから復元する', async () => {
     const value = fixture(true, null, true, 'omit-parent-list')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.fullThreadReadCalls()).toBe(1)
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.fullThreadReadCalls()).toBe(2)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('全履歴から欠落したparent turnは明示的に拒否する', async () => {
@@ -397,14 +567,14 @@ describe('native advisor App Server history', () => {
   test('turns/listから欠落したchild turnをthread/readから1件だけ復元する', async () => {
     const value = fixture(true, null, true, 'omit-solution-list')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.fullThreadReadCalls()).toBe(1)
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.fullThreadReadCalls()).toBe(2)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('child turnが全viewで欠落またはcompleted finalが複数なら拒否する', async () => {
     const missing = fixture(true, null, true, 'omit-solution-everywhere')
     await expect(assertNativeAdvisorHistory(missing.options)).rejects.toThrow(
-      'contains no turns',
+      'contains no materialized turns yet',
     )
 
     const duplicate = fixture(true, null, true, 'duplicate-solution-read')
@@ -469,6 +639,113 @@ describe('native advisor App Server history', () => {
               ...thread,
               turns: [precursorFor(threadId), ...(thread.turns as unknown[])],
             },
+          }
+        }
+        return response
+      }
+      await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+    }
+  })
+
+  test('割り込み前の旧interrupted childと再開後の採択pairを両履歴経路で照合する', async () => {
+    for (const itemsListSupported of [true, false]) {
+      const value = fixture(true, null, itemsListSupported)
+      const original = value.options.readForTesting!
+      const interruptedId = 'interrupted-old-solution'
+      const pauseTurn = {
+        id: 'paused-parent-turn',
+        status: 'completed',
+        itemsView: 'full',
+        error: null,
+        items: [
+          {
+            type: 'subAgentActivity', id: 'interrupted-old-start',
+            kind: 'started', agentThreadId: interruptedId,
+          },
+          {
+            type: 'agentMessage', id: 'pause-final', phase: 'final_answer',
+            text: 'interjection accepted\n[ZERO_INTERJECTION_PAUSED:interjection-1]',
+          },
+        ],
+      }
+      value.options.parentTurnIds = [pauseTurn.id, ...value.options.parentTurnIds]
+      const interruptedTurn = {
+        id: 'interrupted-old-turn',
+        status: 'interrupted',
+        itemsView: 'full',
+        error: null,
+        items: [{
+          type: 'agentMessage', id: 'interrupted-old-commentary',
+          phase: 'commentary', text: 'checking before the interjection',
+        }],
+      }
+      const interruptedMetadata = {
+        id: interruptedId,
+        parentThreadId: value.options.parentThreadId,
+        cwd: value.options.repoPath,
+        agentRole: 'solution_analyst',
+        source: { subAgent: { thread_spawn: {
+          parent_thread_id: value.options.parentThreadId,
+          depth: 1,
+          agent_role: 'solution_analyst',
+        } } },
+      }
+      value.options.readForTesting = async (method, params) => {
+        const threadId = String(params.threadId ?? '')
+        if (method === 'thread/read' && threadId === interruptedId) {
+          return {
+            thread: params.includeTurns === true
+              ? { ...interruptedMetadata, turns: [interruptedTurn] }
+              : interruptedMetadata,
+          }
+        }
+        if (method === 'thread/turns/list' && threadId === interruptedId) {
+          return { data: [interruptedTurn], nextCursor: null }
+        }
+        if (method === 'thread/items/list' && threadId === interruptedId) {
+          if (!itemsListSupported) return original(method, params)
+          return {
+            data: interruptedTurn.items.map(item => ({ turnId: interruptedTurn.id, item })),
+            nextCursor: null,
+          }
+        }
+        if (method === 'thread/list') {
+          const response = await original(method, params)
+          if (params.parentThreadId !== value.options.parentThreadId) return response
+          return {
+            ...response,
+            data: [
+              ...(response.data as unknown[]),
+              { id: interruptedId, parentThreadId: value.options.parentThreadId },
+            ],
+          }
+        }
+        const response = await original(method, params)
+        const parentFull = threadId === value.options.parentThreadId
+          && ((method === 'thread/read' && params.includeTurns === true)
+            || method === 'thread/turns/list')
+        if (parentFull) {
+          if (method === 'thread/turns/list') {
+            return {
+              ...response,
+              data: [pauseTurn, ...(response.data as unknown[])],
+            }
+          }
+          const thread = response.thread as Record<string, unknown>
+          return {
+            ...response,
+            thread: {
+              ...thread,
+              turns: [pauseTurn, ...(thread.turns as unknown[])],
+            },
+          }
+        }
+        if (itemsListSupported && method === 'thread/items/list'
+          && threadId === value.options.parentThreadId
+          && params.turnId === pauseTurn.id) {
+          return {
+            data: pauseTurn.items.map(item => ({ turnId: pauseTurn.id, item })),
+            nextCursor: null,
           }
         }
         return response
@@ -546,7 +823,7 @@ describe('native advisor App Server history', () => {
   test('4096件超の無関係item後にあるchild final responseを投影する', async () => {
     const value = fixture(true, 'solution-long')
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(value.itemsListCalls()).toBe(3)
+    expect(value.itemsListCalls()).toBe(6)
   })
 
   test('items/list未対応なら両方のfull履歴viewを固定点照合する', async () => {
@@ -652,17 +929,17 @@ describe('native advisor App Server history', () => {
         && params.threadId === value.options.parentThreadId) parentMetadataReads += 1
       const response = await original(method, params)
       const firstSnapshot = parentMetadataReads === 1
-      const parentFullView = params.threadId === value.options.parentThreadId
+      const solutionFullView = params.threadId === 'solution-thread'
         && (method === 'thread/turns/list'
           || (method === 'thread/read' && params.includeTurns === true))
-      if (!firstSnapshot || !parentFullView) return response
+      if (!firstSnapshot || !solutionFullView) return response
+      const makePending = (turn: Record<string, unknown>): Record<string, unknown> => ({
+        ...turn, status: 'inProgress', items: [],
+      })
       if (method === 'thread/turns/list') {
         return {
           ...response,
-          data: (response.data as Array<Record<string, unknown>>).map(turn => ({
-            ...turn,
-            items: (turn.items as unknown[]).slice(0, 1),
-          })),
+          data: (response.data as Array<Record<string, unknown>>).map(makePending),
         }
       }
       const thread = response.thread as Record<string, unknown>
@@ -670,10 +947,7 @@ describe('native advisor App Server history', () => {
         ...response,
         thread: {
           ...thread,
-          turns: (thread.turns as Array<Record<string, unknown>>).map(turn => ({
-            ...turn,
-            items: (turn.items as unknown[]).slice(0, 1),
-          })),
+          turns: (thread.turns as Array<Record<string, unknown>>).map(makePending),
         },
       }
     }
@@ -1120,7 +1394,7 @@ describe('native advisor App Server history', () => {
       }
     }
     await expect(assertNativeAdvisorHistory(value.options)).rejects.toThrow(
-      'fallback endpoints disagree on selected evidence',
+      'changed immutable phase',
     )
   })
 
@@ -1253,7 +1527,7 @@ describe('native advisor App Server history', () => {
       return original(method, params)
     }
     await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
-    expect(checked).toBe(3)
+    expect(checked).toBe(6)
 
     const stalled = fixture(true)
     const stalledOriginal = stalled.options.readForTesting!

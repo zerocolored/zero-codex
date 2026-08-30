@@ -76,7 +76,9 @@ import { containsCredentialMaterial } from './public-output-guard.ts'
 import {
   validTerminalClaudeAttempt,
   validTerminalGrokAttempts,
+  validTerminalNativeAttempts,
 } from './advisor-journal.ts'
+import { persistAdvisorClaudeCleanupOutcome } from './advisor-round-recovery.ts'
 
 export type FifthAdvisorSendOutcome =
   | { kind: 'unconfirmed' }
@@ -870,20 +872,34 @@ export function advisorReceiptAlreadyObserved(input: {
   }
 }
 
+export function allAdvisorAttemptsAdopted(
+  native: ReadonlyArray<{ adopted?: boolean }>,
+  grok: ReadonlyArray<{ adopted?: boolean }>,
+  claude: { adopted?: boolean },
+): boolean {
+  return native.every(result => result.adopted !== false)
+    && grok.every(result => result.adopted === true)
+    && claude.adopted === true
+}
+
 async function main(): Promise<void> {
   const [
     contextInput, stateInput, runtimeInput, fingerprintAllow, fingerprintDeny,
-    phaseScopeInput = 'complete',
+    phaseScopeInput = 'complete', processNonceInput,
   ] = process.argv.slice(2)
   if (!contextInput || !stateInput || !runtimeInput || !fingerprintAllow || !fingerprintDeny) {
     throw new Error(
-      'usage: advisor-broker.ts CONTEXT STATE_DIR ADVISOR_RUNTIME_DIR FINGERPRINT_ALLOW FINGERPRINT_DENY [prepare|review|complete]',
+      'usage: advisor-broker.ts CONTEXT STATE_DIR ADVISOR_RUNTIME_DIR FINGERPRINT_ALLOW FINGERPRINT_DENY [prepare|review|complete] PROCESS_NONCE',
     )
   }
   if (!['prepare', 'review', 'complete'].includes(phaseScopeInput)) {
     throw new Error('advisor broker phase scope is invalid')
   }
   const phaseScope = phaseScopeInput as 'prepare' | 'review' | 'complete'
+  if (!processNonceInput || !/^[0-9a-f]{32}$/.test(processNonceInput)) {
+    throw new Error('advisor broker process nonce is invalid')
+  }
+  const processNonce = processNonceInput
   const stateDir = requireManagedStateRoot(stateInput)
   const advisorRuntimeDir = requireManagedDirectory(stateDir, runtimeInput)
   const context = parseContext(contextInput, stateDir)
@@ -941,7 +957,7 @@ async function main(): Promise<void> {
     if (raw === null || Buffer.byteLength(raw) > 64 * 1024) return null
     try {
       const value = JSON.parse(raw) as Record<string, unknown>
-      if ((value.version !== 6 && value.version !== 7)
+      if ((value.version !== 6 && value.version !== 7 && value.version !== 8)
         || value.status !== status || value.phase !== phase
         || value.round !== round || value.attemptNonce !== context.attemptNonce
         || value.contextDigest !== contextDigest
@@ -966,13 +982,16 @@ async function main(): Promise<void> {
         || !Array.isArray(value.grok) || value.grok.length !== 2
         || !value.claude || typeof value.claude !== 'object') return null
       const native = value.native as Array<Record<string, unknown>>
-      const valid = new Set(native.map(entry => entry.perspective)).size === 2
-        && new Set(native.map(entry => entry.agentId)).size === 2
-        && native.every(entry => typeof entry.responseDigest === 'string'
-          && /^[0-9a-f]{64}$/.test(entry.responseDigest)
-          && (value.version !== 7
-            || (typeof entry.responseTransportDigest === 'string'
-              && /^[0-9a-f]{64}$/.test(entry.responseTransportDigest))))
+      const validNative = value.version === 8
+        ? validTerminalNativeAttempts(native)
+        : new Set(native.map(entry => entry.perspective)).size === 2
+          && new Set(native.map(entry => entry.agentId)).size === 2
+          && native.every(entry => typeof entry.responseDigest === 'string'
+            && /^[0-9a-f]{64}$/.test(entry.responseDigest)
+            && (value.version !== 7
+              || (typeof entry.responseTransportDigest === 'string'
+                && /^[0-9a-f]{64}$/.test(entry.responseTransportDigest))))
+      const valid = validNative
         && validTerminalGrokAttempts(value.grok)
         && validTerminalClaudeAttempt(value.claude)
       return valid ? value : null
@@ -1303,10 +1322,27 @@ async function main(): Promise<void> {
           reason = `ephemeral Claude cleanup verification failed: ${error}`
         }
       }
-      if (requestDir && cleanupVerified && requestRemovalReady
-        && cleanupStatus !== 'provisional-workspace-not-created') {
+      if (requestDir && cleanupVerified && requestRemovalReady) {
         try {
-          removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
+          persistAdvisorClaudeCleanupOutcome(stateDir, {
+            jobId: context.jobId,
+            attemptNonce: context.attemptNonce,
+            inputRevision: input.revision,
+            inputDigest: input.digest,
+            inputDigestPrefix: input.digest.slice(0, 16),
+            phase,
+            round,
+            workspaceCreationAttempted,
+            freshEphemeral: Boolean(target)
+              || cleanupStatus === 'provisional-workspace-closed',
+            cleanupVerified,
+            cleanupStatus,
+            cleanupReceiptDigest,
+            promptMayHaveBeenDelivered: Boolean(marker),
+          })
+          if (cleanupStatus !== 'provisional-workspace-not-created') {
+            removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
+          }
         } catch (error) {
           cleanupVerified = false
           response = undefined
@@ -1340,7 +1376,8 @@ async function main(): Promise<void> {
       required: true,
       lifecycle: 'ephemeral-v2',
       workspaceCreationAttempted,
-      freshEphemeral: Boolean(target),
+      freshEphemeral: Boolean(target)
+        || cleanupStatus === 'provisional-workspace-closed',
       cleanupVerified,
       cleanupStatus,
       cleanupReceiptDigest,
@@ -1353,17 +1390,28 @@ async function main(): Promise<void> {
 
   const roundTasks = new Map<string, Promise<ReturnType<typeof toolText>>>()
   const activeRoundKeys = new Set<string>()
+  const nativeAdvisorAttemptSchema = z.union([
+    z.object({
+      perspective: z.enum(['solution', 'risk']),
+      attempted: z.literal(true).optional(),
+      adopted: z.literal(true).optional(),
+      agentId: z.string().refine(isNativeAdvisorAgentLabel),
+      response: z.string().min(1).max(MAX_INPUT_CHARS),
+    }),
+    z.object({
+      perspective: z.enum(['solution', 'risk']),
+      attempted: z.literal(true),
+      adopted: z.literal(false),
+      reason: z.string().min(1).max(2_000),
+    }),
+  ])
   const advisorRoundInputSchema = {
     phase: z.enum(['investigation', 'design', 'review']),
     round: z.number().int().min(1).max(3),
     inputRevision: z.number().int().min(1),
     inputDigest: z.string().regex(/^[0-9a-f]{64}$/),
     primaryEvidence: z.string().min(1).max(MAX_INPUT_CHARS),
-    nativeAdvisors: z.array(z.object({
-      perspective: z.enum(['solution', 'risk']),
-      agentId: z.string().refine(isNativeAdvisorAgentLabel),
-      response: z.string().min(1).max(MAX_INPUT_CHARS),
-    })).length(2),
+    nativeAdvisors: z.array(nativeAdvisorAttemptSchema).length(2),
   }
   const roundTaskKey = (
     phase: 'investigation' | 'design' | 'review',
@@ -1388,6 +1436,66 @@ async function main(): Promise<void> {
       return null
     }
   }
+  const recoveredRoundResult = (
+    input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
+    phase: 'investigation' | 'design' | 'review',
+    round: 1 | 2 | 3,
+  ): ReturnType<typeof toolText> | null => {
+    const journal = readTerminalJournal(input, phase, round, 'reviewers-completed')
+    if (!journal || journal.recoveredAfterInterruption !== true
+      || typeof journal.recoveryId !== 'string' || !/^[0-9a-f]{64}$/.test(journal.recoveryId)) {
+      return null
+    }
+    if (readOptionalPrivateFile(join(journalRoot, 'active-round.lock')) !== null
+      || typeof journal.processNonce !== 'string' || !/^[0-9a-f]{32}$/.test(journal.processNonce)) {
+      return null
+    }
+    const retirementRaw = readOptionalPrivateFile(join(
+      stateDir, 'advisor-retirement',
+      context.jobId.replace(/[^A-Za-z0-9._-]/g, '_'),
+      context.attemptNonce,
+      `${journal.processNonce}.json`,
+    ))
+    const terminalRaw = readOptionalPrivateFile(roundJournalPath(input, phase, round))
+    if (retirementRaw === null || terminalRaw === null) return null
+    let retirement: Record<string, unknown>
+    try { retirement = JSON.parse(retirementRaw) as Record<string, unknown> } catch { return null }
+    if (retirement.version !== 1 || retirement.status !== 'round-finalized'
+      || retirement.recoveryId !== journal.recoveryId
+      || retirement.jobId !== context.jobId
+      || retirement.attemptNonce !== context.attemptNonce
+      || retirement.processNonce !== journal.processNonce
+      || retirement.terminalJournalDigest
+        !== createHash('sha256').update(terminalRaw).digest('hex')) return null
+    return toolText({
+      complete: true,
+      recoveredAfterInterruption: true,
+      inputRevision: input.revision,
+      inputDigest: input.digest,
+      inputUnchanged: true,
+      currentInputRevision: input.revision,
+      currentInputDigest: input.digest,
+      phase,
+      round,
+      durationMs: Number(journal.finishedAt) - Number(journal.startedAt),
+      repositoryUnchanged: true,
+      allAdopted: false,
+      grok: [
+        { attempted: true, adopted: false, perspective: 'solution', containmentVerified: true,
+          reason: 'reviewer process ended at the verified interjection boundary' },
+        { attempted: true, adopted: false, perspective: 'risk', containmentVerified: true,
+          reason: 'reviewer process ended at the verified interjection boundary' },
+      ],
+      claude: {
+        attempted: true,
+        adopted: false,
+        required: true,
+        lifecycle: 'ephemeral-v2',
+        containmentVerified: true,
+        reason: 'ephemeral reviewer was closed at the verified interjection boundary',
+      },
+    })
+  }
 
   server.registerTool('advisor_round', {
     description: 'Durably start one ordered Five-Advisor attempt round. External unavailable outcomes are safely contained and journaled; call advisor_round_poll until the same binding reaches a terminal receipt.',
@@ -1406,16 +1514,31 @@ async function main(): Promise<void> {
       return toolText({ complete: false, reason: `durable input is unavailable: ${error}` }, true)
     }
     const nativePerspectives = new Set(nativeAdvisors.map(value => value.perspective))
-    const nativeAgentIds = new Set(nativeAdvisors.map(value => value.agentId))
-    if (nativePerspectives.size !== 2 || nativeAgentIds.size !== 2) {
-      return toolText({ complete: false, reason: 'two distinct native solution/risk advisors are required' }, true)
+    const providedNativeAgentIds = nativeAdvisors.flatMap(value => (
+      'agentId' in value ? [value.agentId] : []
+    ))
+    if (nativePerspectives.size !== 2
+      || new Set(providedNativeAgentIds).size !== providedNativeAgentIds.length) {
+      return toolText({ complete: false, reason: 'two distinct native solution/risk attempt outcomes are required' }, true)
     }
     const nativeEvidenceFor = (boundInput: AdvisorInputSnapshot): Array<{
       perspective: 'solution' | 'risk'
-      agentId: string
-      responseDigest: string
-      responseTransportDigest: string
+      attempted: true
+      adopted: boolean
+      agentId?: string
+      responseDigest?: string
+      responseTransportDigest?: string
+      reasonDigest?: string
     }> => nativeAdvisors.map(advisor => {
+        if (advisor.adopted === false) {
+          const reason = safeInput(advisor.reason, `${advisor.perspective} native advisor reason`)
+          return {
+            perspective: advisor.perspective,
+            attempted: true,
+            adopted: false,
+            reasonDigest: createHash('sha256').update(reason).digest('hex'),
+          }
+        }
         const response = safeInput(advisor.response, `${advisor.perspective} native advisor response`)
         const marker = nativeAdvisorMarker(
           context.attemptNonce, boundInput.revision, boundInput.digest,
@@ -1428,6 +1551,8 @@ async function main(): Promise<void> {
         }
         return {
           perspective: advisor.perspective,
+          attempted: true,
+          adopted: true,
           agentId: advisor.agentId,
           responseDigest: nativeAdvisorResponseDigest(response),
           responseTransportDigest: nativeAdvisorResponseTransportDigest(response),
@@ -1458,6 +1583,34 @@ async function main(): Promise<void> {
       return toolText({ complete: false, reason: String(error) }, true)
     }
     const taskKey = roundTaskKey(phase, round, inputRevision, inputDigest)
+    const recovered = recoveredRoundResult(
+      { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3,
+    )
+    if (recovered) {
+      roundTasks.set(taskKey, Promise.resolve(recovered))
+      return toolText({
+        complete: false,
+        pending: true,
+        alreadyStarted: true,
+        recoveredAfterInterruption: true,
+        phase,
+        round,
+        inputRevision,
+        inputDigest,
+      })
+    }
+    const alreadyObserved = readCompletedJournal(
+      { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3,
+    )
+    if (alreadyObserved) {
+      return toolText(advisorReceiptAlreadyObserved({
+        phase,
+        round,
+        inputRevision,
+        inputDigest,
+        pollObservedAt: Number(alreadyObserved.pollObservedAt),
+      }))
+    }
     if (roundTasks.has(taskKey)) {
       return toolText({
         complete: false,
@@ -1478,7 +1631,11 @@ async function main(): Promise<void> {
     }
     const activeClaimPath = join(journalRoot, 'active-round.lock')
     const activeClaim = createExclusivePrivateFile(activeClaimPath, `${JSON.stringify({
-      version: 1,
+      version: 2,
+      jobId: context.jobId,
+      attemptNonce: context.attemptNonce,
+      contextDigest,
+      processNonce,
       phase,
       round,
       inputRevision: boundInput.revision,
@@ -1567,7 +1724,7 @@ async function main(): Promise<void> {
       const staleJournalPath = join(staleJournalRoot, `${phase}-${round}.json`)
       const now = Date.now()
       if (!createExclusivePrivateFile(staleJournalPath, `${JSON.stringify({
-        version: 7,
+        version: 8,
         status: 'stale-input',
         phase,
         round,
@@ -1616,12 +1773,14 @@ async function main(): Promise<void> {
     const journalPath = join(currentJournalRoot, `${phase}-${round}.json`)
     const startedAt = Date.now()
     if (!createExclusivePrivateFile(journalPath, `${JSON.stringify({
-      version: 7,
+      version: 8,
       status: 'requested',
+      jobId: context.jobId,
       phase,
       round,
       attemptNonce: context.attemptNonce,
       contextDigest,
+      processNonce,
       inputRevision: input.revision,
       inputDigest: input.digest,
       repositoryDigest,
@@ -1682,11 +1841,12 @@ async function main(): Promise<void> {
         : undefined,
     }
     const complete = inputUnchanged && repositoryUnchanged
+      && validTerminalNativeAttempts(nativeEvidence)
       && validTerminalGrokAttempts(grokJournal)
       && validTerminalClaudeAttempt(claudeJournal)
     const finishedAt = Date.now()
     atomicWritePrivateFile(journalPath, `${JSON.stringify({
-      version: 7,
+      version: 8,
       status: complete
         ? 'reviewers-completed'
         : inputUnchanged ? 'required-reviewer-failed' : 'stale-input',
@@ -1718,7 +1878,7 @@ async function main(): Promise<void> {
       round,
       durationMs: finishedAt - startedAt,
       repositoryUnchanged,
-      allAdopted: grok.every(result => result.adopted === true) && claude.adopted === true,
+      allAdopted: allAdvisorAttemptsAdopted(nativeAdvisors, grok, claude),
       grok,
       claude,
     }, !complete)
@@ -1757,13 +1917,29 @@ async function main(): Promise<void> {
   }, async ({ phase, round, inputRevision, inputDigest, receipt }) => {
     const boundRound = round as 1 | 2 | 3
     const taskKey = roundTaskKey(phase, round, inputRevision, inputDigest)
-    const task = roundTasks.get(taskKey)
+    let task = roundTasks.get(taskKey)
     if (!task) {
-      return toolText({
-        complete: false,
-        uncertain: true,
-        reason: 'the bound advisor round is not registered in this broker generation',
-      }, true)
+      const binding = { revision: inputRevision, digest: inputDigest }
+      const completed = readCompletedJournal(binding, phase, boundRound)
+      if (completed) {
+        return toolText(advisorReceiptAlreadyObserved({
+          phase,
+          round,
+          inputRevision,
+          inputDigest,
+          pollObservedAt: Number(completed.pollObservedAt),
+        }))
+      }
+      const recovered = recoveredRoundResult(binding, phase, boundRound)
+      if (!recovered) {
+        return toolText({
+          complete: false,
+          uncertain: true,
+          reason: 'the bound advisor round is not registered in this broker generation',
+        }, true)
+      }
+      task = Promise.resolve(recovered)
+      roundTasks.set(taskKey, task)
     }
     const outcome = await Promise.race([
       task.then(result => ({ kind: 'complete' as const, result })),

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'crypto'
 import {
   chmodSync,
   existsSync,
@@ -18,6 +19,7 @@ import { readProcessIdentity } from './process-tree.ts'
 import { signalProcessIfLive } from './process-generation.ts'
 import {
   advanceAdvisorReceipt,
+  allAdvisorAttemptsAdopted,
   advisorReceiptAlreadyObserved,
   advisorReceiptChallenge,
   assertClaudeSubscriptionLogin,
@@ -42,6 +44,11 @@ import {
 import { nativeAdvisorMarker } from './native-advisor-evidence.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 import { requireHerdrRuntime, writePinnedHerdrRuntime } from './herdr-runtime.ts'
+import {
+  finalizeRetiredAdvisorRounds,
+  persistAdvisorClaudeCleanupOutcome,
+  recordAdvisorExecutorRetirement,
+} from './advisor-round-recovery.ts'
 
 const temporaryDirs: string[] = []
 
@@ -78,9 +85,12 @@ type BrokerFixture = {
   revisionOne: AdvisorInputSnapshot
   revisionTwo: AdvisorInputSnapshot
   journalRoot: string
+  contextDigest: string
+  fingerprint: ReturnType<typeof createSeatbeltFingerprint>
   call(
     phase?: 'investigation' | 'design',
     binding?: 'revision-one' | 'revision-two',
+    nativeMode?: 'adopted' | 'unavailable',
   ): Promise<{
     result: Awaited<ReturnType<Client['callTool']>>
     payload: Record<string, unknown>
@@ -158,8 +168,7 @@ async function brokerFixture(): Promise<BrokerFixture> {
 
   const nonce = 'a'.repeat(32)
   const layout = resolveAdvisorProjectLayout(repo)
-  const contextPath = join(state, 'context.json')
-  writeFileSync(contextPath, `${JSON.stringify({
+  const context = {
     version: 4,
     jobId: job.id,
     attemptNonce: nonce,
@@ -168,13 +177,19 @@ async function brokerFixture(): Promise<BrokerFixture> {
     gitRoots: layout.gitRoots,
     writeEnabled: false,
     initialRepositoryDigest: advisorRepositoryDigest(snapshotAdvisorRepository(layout)),
-  })}\n`, { mode: 0o600 })
+  }
+  const contextRoot = join(state, 'advisor-context', job.id)
+  mkdirSync(contextRoot, { recursive: true, mode: 0o700 })
+  const contextPath = join(contextRoot, `${nonce}.json`)
+  writeFileSync(contextPath, `${JSON.stringify(context)}\n`, { mode: 0o600 })
+  const contextDigest = createHash('sha256').update(JSON.stringify(context)).digest('hex')
   const fingerprint = createSeatbeltFingerprint(state, job.id, nonce)
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [
       '--config=/dev/null', '--no-env-file', realpathSync(join(import.meta.dir, 'advisor-broker.ts')),
       contextPath, state, runtimeDir, fingerprint.allow.path, fingerprint.deny.path,
+      'complete', nonce,
     ],
     cwd: repo,
     env: environment,
@@ -199,7 +214,13 @@ async function brokerFixture(): Promise<BrokerFixture> {
     revisionOne,
     revisionTwo,
     journalRoot,
-    async call(phase = 'investigation', binding = 'revision-one') {
+    contextDigest,
+    fingerprint,
+    async call(
+      phase = 'investigation',
+      binding = 'revision-one',
+      nativeMode: 'adopted' | 'unavailable' = 'adopted',
+    ) {
       const selectedInput = binding === 'revision-one' ? revisionOne : revisionTwo
       const responseFor = (perspective: 'solution' | 'risk') => [
         `${perspective} response`,
@@ -217,10 +238,21 @@ async function brokerFixture(): Promise<BrokerFixture> {
             inputRevision: selectedInput.revision,
             inputDigest: selectedInput.digest,
             primaryEvidence: 'bounded primary evidence',
-            nativeAdvisors: [
-              { perspective: 'solution', agentId: '/root/native-solution', response: responseFor('solution') },
-              { perspective: 'risk', agentId: '/root/native-risk', response: responseFor('risk') },
-            ],
+            nativeAdvisors: nativeMode === 'adopted'
+              ? [
+                { perspective: 'solution', agentId: '/root/native-solution', response: responseFor('solution') },
+                { perspective: 'risk', agentId: '/root/native-risk', response: responseFor('risk') },
+              ]
+              : [
+                {
+                  perspective: 'solution', attempted: true, adopted: false,
+                  reason: 'native solution slot could not start',
+                },
+                {
+                  perspective: 'risk', attempted: true, adopted: false,
+                  reason: 'native risk slot could not start',
+                },
+              ],
           },
         })
       } catch (error) {
@@ -253,6 +285,98 @@ async function brokerFixture(): Promise<BrokerFixture> {
       }
     },
   }
+}
+
+function armRetiredRequestedRound(
+  fixture: BrokerFixture,
+  input: AdvisorInputSnapshot,
+  options: { persistClaudeOutcome?: boolean } = {},
+): { journalPath: string; lockPath: string } {
+  const revisionRoot = join(
+    fixture.journalRoot,
+    `revision-${input.revision}-${input.digest.slice(0, 16)}`,
+  )
+  mkdirSync(revisionRoot, { recursive: true, mode: 0o700 })
+  const repositoryDigest = advisorRepositoryDigest(
+    snapshotAdvisorRepository(resolveAdvisorProjectLayout(fixture.repo)),
+  )
+  const startedAt = Date.now() - 10
+  const brokerProcessId = 4242
+  const journalPath = join(revisionRoot, 'investigation-1.json')
+  const lockPath = join(fixture.journalRoot, 'active-round.lock')
+  writeFileSync(journalPath, `${JSON.stringify({
+    version: 8,
+    status: 'requested',
+    jobId: fixture.jobId,
+    phase: 'investigation',
+    round: 1,
+    attemptNonce: fixture.nonce,
+    contextDigest: fixture.contextDigest,
+    processNonce: fixture.nonce,
+    inputRevision: input.revision,
+    inputDigest: input.digest,
+    repositoryDigest,
+    repositoryDigestBefore: repositoryDigest,
+    brokerProcessId,
+    primaryEvidenceDigest: '5'.repeat(64),
+    native: [
+      {
+        perspective: 'solution', attempted: true, adopted: true,
+        agentId: '/root/native-solution', responseDigest: '1'.repeat(64),
+        responseTransportDigest: '2'.repeat(64),
+      },
+      {
+        perspective: 'risk', attempted: true, adopted: true,
+        agentId: '/root/native-risk', responseDigest: '3'.repeat(64),
+        responseTransportDigest: '4'.repeat(64),
+      },
+    ],
+    startedAt,
+  })}\n`, { mode: 0o600 })
+  writeFileSync(lockPath, `${JSON.stringify({
+    version: 2,
+    jobId: fixture.jobId,
+    attemptNonce: fixture.nonce,
+    contextDigest: fixture.contextDigest,
+    processNonce: fixture.nonce,
+    phase: 'investigation',
+    round: 1,
+    inputRevision: input.revision,
+    inputDigest: input.digest,
+    brokerProcessId,
+    startedAt,
+  })}\n`, { mode: 0o600 })
+  if (options.persistClaudeOutcome !== false) {
+    persistAdvisorClaudeCleanupOutcome(fixture.state, {
+      jobId: fixture.jobId,
+      attemptNonce: fixture.nonce,
+      inputRevision: input.revision,
+      inputDigest: input.digest,
+      inputDigestPrefix: input.digest.slice(0, 16),
+      phase: 'investigation',
+      round: 1,
+      workspaceCreationAttempted: false,
+      freshEphemeral: false,
+      cleanupVerified: false,
+      promptMayHaveBeenDelivered: false,
+    })
+  }
+  recordAdvisorExecutorRetirement({
+    stateDir: fixture.state,
+    jobId: fixture.jobId,
+    attemptNonce: fixture.nonce,
+    contextDigest: fixture.contextDigest,
+    fingerprint: fixture.fingerprint,
+    supervisor: {
+      pid: 9876,
+      pgid: 9876,
+      started: 'fixture-generation',
+      bootSession: 'fixture-boot',
+      startSec: 1,
+      startUsec: 0,
+    },
+  })
+  return { journalPath, lockPath }
 }
 
 describe('advisor broker boundaries', () => {
@@ -506,6 +630,55 @@ print('review complete')
     expect(Buffer.byteLength(JSON.stringify(observed))).toBeLessThan(1024)
   })
 
+  test('allAdoptedはnative採択数0・1・2を含む全5slotを数える', () => {
+    const grok = [{ adopted: true }, { adopted: true }]
+    const claude = { adopted: true }
+    expect(allAdvisorAttemptsAdopted(
+      [{ adopted: true }, { adopted: true }], grok, claude,
+    )).toBe(true)
+    expect(allAdvisorAttemptsAdopted(
+      [{ adopted: true }, { adopted: false }], grok, claude,
+    )).toBe(false)
+    expect(allAdvisorAttemptsAdopted(
+      [{ adopted: false }, { adopted: false }], grok, claude,
+    )).toBe(false)
+    expect(allAdvisorAttemptsAdopted(
+      [{ adopted: true }, { adopted: true }], [{ adopted: false }, { adopted: true }], claude,
+    )).toBe(false)
+  })
+
+  test('Claude cleanup receiptはcallerのproperty挿入順によらず再送可能', () => {
+    const state = fixtureDir()
+    chmodSync(state, 0o700)
+    const common = {
+      jobId: 'job-order-fixture',
+      attemptNonce: 'a'.repeat(32),
+      inputRevision: 1,
+      inputDigest: 'b'.repeat(64),
+      inputDigestPrefix: 'b'.repeat(16),
+      phase: 'investigation' as const,
+      round: 1 as const,
+    }
+    persistAdvisorClaudeCleanupOutcome(state, {
+      ...common,
+      workspaceCreationAttempted: true,
+      freshEphemeral: true,
+      cleanupVerified: true,
+      cleanupStatus: 'closed-and-verified',
+      cleanupReceiptDigest: 'c'.repeat(64),
+      promptMayHaveBeenDelivered: true,
+    })
+    expect(() => persistAdvisorClaudeCleanupOutcome(state, {
+      promptMayHaveBeenDelivered: true,
+      cleanupReceiptDigest: 'c'.repeat(64),
+      cleanupStatus: 'closed-and-verified',
+      cleanupVerified: true,
+      freshEphemeral: true,
+      workspaceCreationAttempted: true,
+      ...common,
+    })).not.toThrow()
+  })
+
   test('別ユーザーの同一thread追記で旧revisionになったnative調査をstale journalへ固定する', async () => {
     const fixture = await brokerFixture()
     try {
@@ -527,7 +700,7 @@ print('review complete')
       )
       const journal = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
       expect(journal).toMatchObject({
-        version: 7,
+        version: 8,
         status: 'stale-input',
         inputRevision: fixture.revisionOne.revision,
         inputDigest: fixture.revisionOne.digest,
@@ -537,6 +710,36 @@ print('review complete')
       expect((journal.native as Array<Record<string, unknown>>).every(entry => (
         typeof entry.responseTransportDigest === 'string'
         && /^[0-9a-f]{64}$/.test(entry.responseTransportDigest)
+      ))).toBe(true)
+    } finally {
+      await fixture.close()
+    }
+  }, 15_000)
+
+  test('native成功数0でも両slotのattempted unavailableをversion 8へ固定する', async () => {
+    const fixture = await brokerFixture()
+    try {
+      const { payload } = await fixture.call('investigation', 'revision-one', 'unavailable')
+      expect(payload).toMatchObject({
+        complete: false,
+        staleInput: true,
+        journaledStaleInput: true,
+      })
+      const path = join(
+        fixture.journalRoot,
+        `revision-${fixture.revisionOne.revision}-${fixture.revisionOne.digest.slice(0, 16)}`,
+        'investigation-1.json',
+      )
+      const journal = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+      expect(journal.version).toBe(8)
+      expect(journal.native).toEqual([
+        expect.objectContaining({ perspective: 'solution', attempted: true, adopted: false }),
+        expect.objectContaining({ perspective: 'risk', attempted: true, adopted: false }),
+      ])
+      expect((journal.native as Array<Record<string, unknown>>).every(entry => (
+        typeof entry.reasonDigest === 'string'
+        && /^[0-9a-f]{64}$/.test(entry.reasonDigest)
+        && entry.responseDigest === undefined
       ))).toBe(true)
     } finally {
       await fixture.close()
@@ -582,6 +785,199 @@ print('review complete')
         reason: 'another advisor round is already active for this attempt',
       })
       expect(readdirSync(fixture.journalRoot)).toEqual(['active-round.lock'])
+    } finally {
+      await fixture.close()
+    }
+  }, 15_000)
+
+  test('verified executor retirement後はrequested roundをterminal化して新broker memoryなしでpollできる', async () => {
+    const fixture = await brokerFixture()
+    try {
+      const input = fixture.revisionTwo
+      const revisionRoot = join(
+        fixture.journalRoot,
+        `revision-${input.revision}-${input.digest.slice(0, 16)}`,
+      )
+      mkdirSync(revisionRoot, { recursive: true, mode: 0o700 })
+      const repositoryDigest = advisorRepositoryDigest(
+        snapshotAdvisorRepository(resolveAdvisorProjectLayout(fixture.repo)),
+      )
+      const startedAt = Date.now() - 10
+      const brokerProcessId = 4242
+      const native = [
+        {
+          perspective: 'solution', attempted: true, adopted: true,
+          agentId: '/root/native-solution', responseDigest: '1'.repeat(64),
+          responseTransportDigest: '2'.repeat(64),
+        },
+        {
+          perspective: 'risk', attempted: true, adopted: true,
+          agentId: '/root/native-risk', responseDigest: '3'.repeat(64),
+          responseTransportDigest: '4'.repeat(64),
+        },
+      ]
+      writeFileSync(join(revisionRoot, 'investigation-1.json'), `${JSON.stringify({
+        version: 8,
+        status: 'requested',
+        jobId: fixture.jobId,
+        phase: 'investigation',
+        round: 1,
+        attemptNonce: fixture.nonce,
+        contextDigest: fixture.contextDigest,
+        processNonce: fixture.nonce,
+        inputRevision: input.revision,
+        inputDigest: input.digest,
+        repositoryDigest,
+        repositoryDigestBefore: repositoryDigest,
+        brokerProcessId,
+        primaryEvidenceDigest: '5'.repeat(64),
+        native,
+        startedAt,
+      })}\n`, { mode: 0o600 })
+      writeFileSync(join(fixture.journalRoot, 'active-round.lock'), `${JSON.stringify({
+        version: 2,
+        jobId: fixture.jobId,
+        attemptNonce: fixture.nonce,
+        contextDigest: fixture.contextDigest,
+        processNonce: fixture.nonce,
+        phase: 'investigation',
+        round: 1,
+        inputRevision: input.revision,
+        inputDigest: input.digest,
+        brokerProcessId,
+        startedAt,
+      })}\n`, { mode: 0o600 })
+      persistAdvisorClaudeCleanupOutcome(fixture.state, {
+        jobId: fixture.jobId,
+        attemptNonce: fixture.nonce,
+        inputRevision: input.revision,
+        inputDigest: input.digest,
+        inputDigestPrefix: input.digest.slice(0, 16),
+        phase: 'investigation',
+        round: 1,
+        workspaceCreationAttempted: false,
+        freshEphemeral: false,
+        cleanupVerified: false,
+        promptMayHaveBeenDelivered: false,
+      })
+      expect(recordAdvisorExecutorRetirement({
+        stateDir: fixture.state,
+        jobId: fixture.jobId,
+        attemptNonce: fixture.nonce,
+        contextDigest: fixture.contextDigest,
+        fingerprint: fixture.fingerprint,
+        supervisor: {
+          pid: 9876,
+          pgid: 9876,
+          started: 'fixture-generation',
+          bootSession: 'fixture-boot',
+          startSec: 1,
+          startUsec: 0,
+        },
+      })).toMatchObject({ recorded: true, processNonce: fixture.nonce })
+      expect(finalizeRetiredAdvisorRounds(fixture.state)).toEqual({ finalized: 1 })
+      expect(existsSync(join(fixture.journalRoot, 'active-round.lock'))).toBe(false)
+      let journal = JSON.parse(
+        readFileSync(join(revisionRoot, 'investigation-1.json'), 'utf8'),
+      ) as Record<string, unknown>
+      expect(journal).toMatchObject({
+        status: 'reviewers-completed',
+        recoveredAfterInterruption: true,
+        inputUnchanged: true,
+      })
+      expect((journal.grok as Array<Record<string, unknown>>).every(value => (
+        value.adopted === false && value.containmentVerified === true
+      ))).toBe(true)
+      expect(journal.claude).toMatchObject({
+        adopted: false,
+        workspaceCreationAttempted: false,
+        containmentVerified: true,
+      })
+
+      const { result, payload } = await fixture.call('investigation', 'revision-two')
+      expect(result.isError).not.toBe(true)
+      expect(payload).toMatchObject({ complete: true, recoveredAfterInterruption: true })
+      journal = JSON.parse(
+        readFileSync(join(revisionRoot, 'investigation-1.json'), 'utf8'),
+      ) as Record<string, unknown>
+      expect(journal.status).toBe('completed')
+      expect(journal.receiptAcknowledgement).toBe('exact-echo')
+    } finally {
+      await fixture.close()
+    }
+  }, 15_000)
+
+  test('retired roundの入力が更新済みならstale-inputへ閉じて次roundのlock取得を妨げない', async () => {
+    const fixture = await brokerFixture()
+    try {
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionOne)
+      expect(finalizeRetiredAdvisorRounds(fixture.state)).toEqual({ finalized: 1 })
+      expect(existsSync(armed.lockPath)).toBe(false)
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8')) as Record<string, unknown>
+      expect(journal).toMatchObject({
+        status: 'stale-input',
+        recoveredAfterInterruption: true,
+        inputUnchanged: false,
+      })
+
+      writeFileSync(join(fixture.repo, 'README.md'), 'changed after stale recovery\n', { mode: 0o600 })
+      const { payload } = await fixture.call('investigation', 'revision-two')
+      expect(payload.reason).toBe(
+        'the first investigation/design pair must complete before repository changes',
+      )
+      expect(payload.reason).not.toContain('already active')
+      expect(existsSync(armed.lockPath)).toBe(false)
+    } finally {
+      await fixture.close()
+    }
+  }, 15_000)
+
+  test('retirement receipt後にactive lockのinodeが置換されたら削除せずfail closedにする', async () => {
+    const fixture = await brokerFixture()
+    try {
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo)
+      const content = readFileSync(armed.lockPath, 'utf8')
+      rmSync(armed.lockPath)
+      writeFileSync(armed.lockPath, content, { mode: 0o600 })
+      expect(() => finalizeRetiredAdvisorRounds(fixture.state)).toThrow(
+        'advisor active claim changed before recovered release',
+      )
+      expect(existsSync(armed.lockPath)).toBe(true)
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8')) as Record<string, unknown>
+      expect(journal).toMatchObject({
+        status: 'reviewers-completed',
+        recoveredAfterInterruption: true,
+      })
+      const { payload } = await fixture.call('investigation', 'revision-two')
+      expect(payload).toMatchObject({
+        complete: false,
+        uncertain: true,
+        reason: 'another advisor round is already active for this attempt',
+      })
+    } finally {
+      await fixture.close()
+    }
+  }, 15_000)
+
+  test('Claude request directoryが未回収ならterminal journalもlockも確定しない', async () => {
+    const fixture = await brokerFixture()
+    try {
+      const armed = armRetiredRequestedRound(
+        fixture, fixture.revisionTwo, { persistClaudeOutcome: false },
+      )
+      const requestDir = join(
+        fixture.state, 'advisor-ephemeral', fixture.jobId, fixture.nonce,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`,
+        'investigation-1',
+      )
+      mkdirSync(requestDir, { recursive: true, mode: 0o700 })
+      expect(() => finalizeRetiredAdvisorRounds(fixture.state)).toThrow(
+        'retired advisor Claude workspace cleanup is still pending',
+      )
+      expect(existsSync(requestDir)).toBe(true)
+      expect(existsSync(armed.lockPath)).toBe(true)
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8')) as Record<string, unknown>
+      expect(journal.status).toBe('requested')
     } finally {
       await fixture.close()
     }

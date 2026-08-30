@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
+import { createHash } from 'crypto'
 import {
   appendFileSync,
   chmodSync,
@@ -38,6 +39,7 @@ import {
   readUploadableArtifact,
   recoverExecutionCheckpointBeforeAdvisorCleanup,
   recoverExecutionResultJournals,
+  reconcileEphemeralAndRetiredAdvisorRounds,
   reconcileAdvisorsWithMonitorHealthBarrier,
   runQueuedJobs,
   sealArtifactResult,
@@ -110,6 +112,11 @@ import {
 import { HerdrJobMonitorPendingError } from './herdr-job-monitor.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 import { readAdvisorInputSnapshot } from './advisor-input.ts'
+import {
+  advisorRepositoryDigest,
+  resolveAdvisorProjectLayout,
+  snapshotAdvisorRepository,
+} from './advisor-snapshot.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { CodexAppServerSession } from './codex-app-server-session.ts'
 
@@ -4318,9 +4325,94 @@ describe('single FIFO worker', () => {
     async () => {
       const dir = fixtureDir('zerokun-v4-seatbelt-recovery-')
       const store = new JobStore(join(dir, 'jobs.sqlite3'))
-      const job = store.enqueue(input({ messageId: 'v4-seatbelt-recovery' })).job
+      const project = join(dir, 'project')
+      mkdirSync(project, { mode: 0o700 })
+      git(['init', '-q'], project)
+      writeFileSync(join(project, 'README.md'), 'fixture\n')
+      git(['add', 'README.md'], project)
+      git(['-c', 'user.name=Zero Test', '-c', 'user.email=zero@example.invalid',
+        'commit', '-qm', 'fixture'], project)
+      const job = store.enqueue(input({
+        messageId: 'v4-seatbelt-recovery',
+        repoPath: project,
+      })).job
       const claimed = store.claimNext('serial-worker')!
-      const fingerprint = createSeatbeltFingerprint(dir, job.id, 'e'.repeat(32))
+      const processNonce = 'e'.repeat(32)
+      const attemptNonce = 'a'.repeat(32)
+      const fingerprint = createSeatbeltFingerprint(dir, job.id, processNonce)
+      const advisorInput = readAdvisorInputSnapshot(dir, job.id)
+      const layout = resolveAdvisorProjectLayout(project)
+      const repositoryDigest = advisorRepositoryDigest(snapshotAdvisorRepository(layout))
+      const context = {
+        version: 4,
+        jobId: job.id,
+        attemptNonce,
+        repoPath: project,
+        layoutKind: layout.kind,
+        gitRoot: layout.gitRoot,
+        gitRoots: layout.gitRoots,
+        writeEnabled: false,
+        initialRepositoryDigest: repositoryDigest,
+      }
+      const contextDigest = createHash('sha256')
+        .update(JSON.stringify(context)).digest('hex')
+      const contextRoot = join(dir, 'advisor-context', job.id)
+      mkdirSync(contextRoot, { recursive: true, mode: 0o700 })
+      writeFileSync(
+        join(contextRoot, `${attemptNonce}.json`),
+        `${JSON.stringify(context)}\n`,
+        { mode: 0o600 },
+      )
+      const attemptRoot = join(dir, 'advisor-journal', job.id, attemptNonce)
+      const revisionRoot = join(
+        attemptRoot,
+        `revision-${advisorInput.revision}-${advisorInput.digest.slice(0, 16)}`,
+      )
+      mkdirSync(revisionRoot, { recursive: true, mode: 0o700 })
+      const startedAt = Date.now()
+      const brokerProcessId = 4242
+      const journalPath = join(revisionRoot, 'investigation-1.json')
+      const activeLockPath = join(attemptRoot, 'active-round.lock')
+      writeFileSync(journalPath, `${JSON.stringify({
+        version: 8,
+        status: 'requested',
+        jobId: job.id,
+        phase: 'investigation',
+        round: 1,
+        attemptNonce,
+        contextDigest,
+        processNonce,
+        inputRevision: advisorInput.revision,
+        inputDigest: advisorInput.digest,
+        repositoryDigest,
+        repositoryDigestBefore: repositoryDigest,
+        brokerProcessId,
+        primaryEvidenceDigest: '5'.repeat(64),
+        native: [
+          {
+            perspective: 'solution', attempted: true, adopted: false,
+            reasonDigest: '1'.repeat(64),
+          },
+          {
+            perspective: 'risk', attempted: true, adopted: false,
+            reasonDigest: '2'.repeat(64),
+          },
+        ],
+        startedAt,
+      })}\n`, { mode: 0o600 })
+      writeFileSync(activeLockPath, `${JSON.stringify({
+        version: 2,
+        jobId: job.id,
+        attemptNonce,
+        contextDigest,
+        processNonce,
+        phase: 'investigation',
+        round: 1,
+        inputRevision: advisorInput.revision,
+        inputDigest: advisorInput.digest,
+        brokerProcessId,
+        startedAt,
+      })}\n`, { mode: 0o600 })
       const escapedPidPath = join(dir, 'escaped.pid')
       const code = [
         'import os,sys,time',
@@ -4380,6 +4472,41 @@ describe('single FIFO worker', () => {
         expect(existsSync(registration)).toBe(false)
         expect(existsSync(fingerprint.allow.path)).toBe(false)
         expect(store.get(job.id)?.executorPid).toBeNull()
+        const retirementPath = join(
+          dir, 'advisor-retirement', job.id, attemptNonce, `${processNonce}.json`,
+        )
+        expect(JSON.parse(readFileSync(retirementPath, 'utf8'))).toMatchObject({
+          version: 1,
+          status: 'supervisor-retired',
+          jobId: job.id,
+          attemptNonce,
+          processNonce,
+          seatbeltCleanupVerified: true,
+        })
+        expect(JSON.parse(readFileSync(journalPath, 'utf8')).status).toBe('requested')
+        expect(existsSync(activeLockPath)).toBe(true)
+
+        await reconcileEphemeralAndRetiredAdvisorRounds({
+          stateDir: dir,
+          runtime: {
+            binary: '/fixture/herdr', binaryDevice: 1, binaryInode: 2,
+            binaryMode: 0o100700, binarySize: 3, binaryModifiedMs: 4,
+            binaryChangedMs: 5, socketPath: '/fixture/herdr.sock',
+            socketDevice: 6, socketInode: 7, paneId: 'wCALLER:p1',
+            tabId: 'wCALLER:t1', terminalId: 'term_012345abcdef',
+            workspaceId: 'wCALLER',
+          },
+        })
+        expect(JSON.parse(readFileSync(journalPath, 'utf8'))).toMatchObject({
+          version: 8,
+          status: 'reviewers-completed',
+          recoveredAfterInterruption: true,
+          inputUnchanged: true,
+        })
+        expect(existsSync(activeLockPath)).toBe(false)
+        expect(JSON.parse(readFileSync(retirementPath, 'utf8'))).toMatchObject({
+          status: 'round-finalized',
+        })
       } finally {
         signalProcessIfLive(escapedIdentity, 'SIGKILL')
         store.close()
@@ -6280,6 +6407,30 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
     )).toThrow('incomplete native')
     Object.assign(journal.native[0]!, { responseTransportDigest: '7'.repeat(64) })
+
+    journal.version = 8
+    journal.native = [
+      {
+        perspective: 'solution', attempted: true, adopted: false,
+        reasonDigest: 'a'.repeat(64),
+      },
+      {
+        perspective: 'risk', attempted: true, adopted: false,
+        reasonDigest: 'b'.repeat(64),
+      },
+    ] as typeof journal.native
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    const versionEight = assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )
+    expect(versionEight[0]!.native.map(entry => entry.adopted)).toEqual([false, false])
+
+    ;(journal.native[0] as Record<string, unknown>).reasonDigest = undefined
+    writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
+    )).toThrow('terminal outcomes')
+    ;(journal.native[0] as Record<string, unknown>).reasonDigest = 'a'.repeat(64)
 
     journal.grok[0]!.containmentVerified = false
     writeFileSync(path, `${JSON.stringify(journal)}\n`, { mode: 0o600 })

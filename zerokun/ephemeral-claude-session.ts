@@ -882,10 +882,26 @@ export type EphemeralClaudeReconcileDependencies = {
   verifyRuntime?: typeof verifyHerdrRuntimeIdentityAsync
 }
 
+export type ReconciledEphemeralClaudeRound = {
+  jobId: string
+  attemptNonce: string
+  inputRevision: number
+  inputDigestPrefix: string
+  phase: 'investigation' | 'design' | 'review'
+  round: 1 | 2 | 3
+  workspaceCreationAttempted: boolean
+  freshEphemeral: boolean
+  cleanupVerified: boolean
+  cleanupStatus?: string
+  cleanupReceiptDigest?: string
+  promptMayHaveBeenDelivered: boolean
+}
+
 export async function reconcileEphemeralClaudeSessions(options: {
   stateDir: string
   runtime: HerdrRuntimeIdentity
   log?: (message: string) => void
+  onReconciledRound?: (outcome: ReconciledEphemeralClaudeRound) => void
 }, dependencies: EphemeralClaudeReconcileDependencies = {}): Promise<{
   closed: number
   discardedBeforeOpen: number
@@ -923,14 +939,42 @@ export async function reconcileEphemeralClaudeSessions(options: {
           try {
             let retainProvisionalAbsenceGuard = false
             discardStagedEphemeralClaudeRecords(requestDir)
+            const relativeComponents = relative(root, requestDir).split(sep)
+            const revisionMatch = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/
+              .exec(relativeComponents[2] ?? '')
+            const roundMatch = /^(investigation|design|review)-([123])$/
+              .exec(relativeComponents[3] ?? '')
+            if (relativeComponents.length !== 4 || !revisionMatch || !roundMatch) {
+              throw new EphemeralClaudeCleanupPendingError(
+                'ephemeral Claude reconciliation binding is invalid',
+              )
+            }
+            const binding = {
+              jobId: relativeComponents[0]!,
+              attemptNonce: relativeComponents[1]!,
+              inputRevision: Number(revisionMatch[1]),
+              inputDigestPrefix: revisionMatch[2]!,
+              phase: roundMatch[1] as 'investigation' | 'design' | 'review',
+              round: Number(roundMatch[2]) as 1 | 2 | 3,
+            }
             const projectRoot = boundedIntentProjectRoot(requestDir)
             if (projectRoot === null) {
+              options.onReconciledRound?.({
+                ...binding,
+                workspaceCreationAttempted: false,
+                freshEphemeral: false,
+                cleanupVerified: false,
+                promptMayHaveBeenDelivered: false,
+              })
               removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
               discardedBeforeOpen += 1
               continue
             }
             const target = readEphemeralClaudeWorkspaceTarget(requestDir, projectRoot)
             const cleanupEnvironment = helperEnvironment()
+            let cleanupStatus: string
+            let cleanupReceiptDigest: string
+            let freshEphemeral: boolean
             await verifyRuntime(options.runtime, cleanupEnvironment)
             if (target === null) {
               const recovered = await run('recover', projectRoot, requestDir)
@@ -941,6 +985,9 @@ export async function reconcileEphemeralClaudeSessions(options: {
               }
               parseEphemeralClaudeProvisionalRecovery(recovered.stdout)
               const provisional = readEphemeralClaudeProvisionalCleanupReceipt(requestDir)
+              cleanupStatus = provisional.status
+              cleanupReceiptDigest = provisional.digest
+              freshEphemeral = provisional.status === 'provisional-workspace-closed'
               retainProvisionalAbsenceGuard = provisional.status
                 === 'provisional-workspace-not-created'
             } else {
@@ -951,10 +998,24 @@ export async function reconcileEphemeralClaudeSessions(options: {
                 )
               }
               parseEphemeralClaudeClose(close.stdout, target)
-              readEphemeralClaudeCleanupReceipt(requestDir, target)
+              const cleanup = readEphemeralClaudeCleanupReceipt(requestDir, target)
+              cleanupStatus = cleanup.status
+              cleanupReceiptDigest = cleanup.digest
+              freshEphemeral = true
             }
             persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir)
             await verifyRuntime(options.runtime, cleanupEnvironment)
+            options.onReconciledRound?.({
+              ...binding,
+              workspaceCreationAttempted: true,
+              freshEphemeral,
+              cleanupVerified: true,
+              cleanupStatus,
+              cleanupReceiptDigest,
+              promptMayHaveBeenDelivered: readOptionalOwnerOnlyRegularFile(
+                join(requestDir, 'ephemeral-send-receipt.json'),
+              ) !== null,
+            })
             if (!retainProvisionalAbsenceGuard) {
               removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
             }

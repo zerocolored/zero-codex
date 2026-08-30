@@ -14,6 +14,47 @@ function positiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) > 0
 }
 
+function nativeAgentId(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 256
+    && /^\/?[A-Za-z0-9._:-]+(?:\/[A-Za-z0-9._:-]+)*$/.test(value)
+    && value.split('/').every(segment => segment !== '.' && segment !== '..')
+}
+
+/**
+ * Version 8 gives both native Codex slots the same best-effort terminal model
+ * as the external reviewers. A missing model response is publishable only
+ * when the primary records a bounded attempted/unavailable outcome; it is
+ * never presented as an adopted review.
+ */
+export function validTerminalNativeAttempts(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length !== 2) return false
+  const entries = value.map(record)
+  if (entries.some(entry => entry === null)) return false
+  const attempts = entries as JournalRecord[]
+  const perspectives = new Set(attempts.map(entry => entry.perspective))
+  if (perspectives.size !== 2 || !perspectives.has('solution') || !perspectives.has('risk')) {
+    return false
+  }
+  const agentIds = attempts.flatMap(attempt => (
+    attempt.agentId === undefined ? [] : [attempt.agentId]
+  ))
+  if (agentIds.some(value => !nativeAgentId(value))
+    || new Set(agentIds).size !== agentIds.length) return false
+  for (const attempt of attempts) {
+    if (attempt.attempted !== true || typeof attempt.adopted !== 'boolean') return false
+    if (attempt.adopted) {
+      if (!nativeAgentId(attempt.agentId)
+        || !sha256(attempt.responseDigest)
+        || !sha256(attempt.responseTransportDigest)
+        || attempt.reasonDigest !== undefined) return false
+    } else if (attempt.agentId !== undefined
+      || !sha256(attempt.reasonDigest)
+      || attempt.responseDigest !== undefined
+      || attempt.responseTransportDigest !== undefined) return false
+  }
+  return true
+}
+
 /**
  * Version 6 records every isolated Grok slot as either an adopted response or
  * a safely-contained unavailable outcome. Availability is best-effort; an
@@ -69,7 +110,8 @@ export function validTerminalClaudeAttempt(value: unknown): boolean {
   if (attempt.workspaceCreationAttempted) {
     if (!attempt.cleanupVerified || !sha256(attempt.cleanupReceiptDigest)) return false
     return attempt.freshEphemeral
-      ? attempt.cleanupStatus === 'closed-and-verified'
+      ? ['closed-and-verified', 'provisional-workspace-closed']
+        .includes(String(attempt.cleanupStatus))
       : attempt.cleanupStatus === 'provisional-workspace-not-created'
   }
   return attempt.freshEphemeral === false

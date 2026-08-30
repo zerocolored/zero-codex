@@ -216,6 +216,329 @@ describe('native Codex advisor host evidence', () => {
     expect(resolved[0]!.native.map(entry => entry.agentId)).toEqual([solutionId, riskId])
   })
 
+  test('同一thread割り込みで終了した旧advisorを利用不能として分離する', () => {
+    const { options, solutionId, riskId } = fixture()
+    const interruptedId = 'interrupted-old-solution'
+    const parent = options.parentResponse as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    parent.thread.turns[0]!.id = 'resumed-parent-turn'
+    parent.thread.turns.unshift({
+      id: 'paused-parent-turn',
+      status: 'completed',
+      itemsView: 'full',
+      items: [
+        {
+          type: 'subAgentActivity', id: 'interrupted-old-start',
+          kind: 'started', agentThreadId: interruptedId,
+        },
+        {
+          type: 'agentMessage', id: 'pause-final', phase: 'final_answer',
+          text: 'interjection accepted\n[ZERO_INTERJECTION_PAUSED:interjection-1]',
+        },
+      ],
+    })
+    options.childrenListResponse = {
+      data: [
+        { id: solutionId, parentThreadId: options.parentThreadId },
+        { id: riskId, parentThreadId: options.parentThreadId },
+        { id: interruptedId, parentThreadId: options.parentThreadId },
+      ],
+      nextCursor: null,
+    }
+    options.childResponses.set(interruptedId, {
+      thread: {
+        id: interruptedId,
+        parentThreadId: options.parentThreadId,
+        cwd: options.repoPath,
+        agentRole: 'solution_analyst',
+        source: { subAgent: { thread_spawn: {
+          parent_thread_id: options.parentThreadId,
+          depth: 1,
+          agent_role: 'solution_analyst',
+        } } },
+        turns: [{
+          id: 'interrupted-old-turn',
+          status: 'interrupted',
+          itemsView: 'full',
+          items: [{
+            type: 'agentMessage', id: 'interrupted-old-commentary',
+            phase: 'commentary', text: 'still checking',
+          }],
+        }],
+      },
+    })
+    options.childChildrenListResponses.set(interruptedId, { data: [], nextCursor: null })
+
+    const resolved = resolveNativeAdvisorThreadIds({
+      attemptNonce: options.attemptNonce,
+      parentThreadId: options.parentThreadId,
+      repoPath: options.repoPath,
+      rounds: options.rounds,
+      parentResponse: options.parentResponse,
+      childResponses: options.childResponses,
+    })
+    expect(resolved[0]!.native.map(entry => entry.agentId)).toEqual([solutionId, riskId])
+    expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
+
+    ;(parent.thread.turns[1]!.items as Array<Record<string, unknown>>).push({
+      type: 'subAgentActivity', id: 'interrupted-old-interaction',
+      kind: 'interacted', agentThreadId: interruptedId, agentPath: '/root/interrupted',
+    })
+    expect(() => assertNativeAdvisorEvidence(options)).toThrow(
+      'unclaimed child response',
+    )
+    ;(parent.thread.turns[1]!.items as Array<Record<string, unknown>>).pop()
+
+    options.childChildrenListResponses.set(interruptedId, {
+      data: [{ id: 'forbidden-descendant', parentThreadId: interruptedId }],
+      nextCursor: null,
+    })
+    expect(() => assertNativeAdvisorEvidence(options)).toThrow(
+      'unclaimed child response',
+    )
+  })
+
+  test('pause markerに束縛した旧completed/interrupted pairだけを再開後pairから分離する', () => {
+    const accepted = fixture()
+    const parent = accepted.options.parentResponse as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    parent.thread.turns[0]!.id = 'resumed-parent-turn'
+    const oldSolutionId = 'paused-old-solution'
+    const oldRiskId = 'paused-old-risk'
+    parent.thread.turns.unshift({
+      id: 'paused-parent-turn', status: 'completed', itemsView: 'full',
+      items: [
+        {
+          type: 'subAgentActivity', id: 'paused-old-solution-start',
+          kind: 'started', agentThreadId: oldSolutionId,
+        },
+        {
+          type: 'subAgentActivity', id: 'paused-old-solution-completed',
+          kind: 'completed', agentThreadId: oldSolutionId,
+        },
+        {
+          type: 'subAgentActivity', id: 'paused-old-risk-start',
+          kind: 'started', agentThreadId: oldRiskId,
+        },
+        {
+          type: 'agentMessage', id: 'paused-parent-final', phase: 'final_answer',
+          text: 'interjection accepted\n[ZERO_INTERJECTION_PAUSED:interjection-2]',
+        },
+      ],
+    })
+    const oldSolution = structuredClone(
+      accepted.options.childResponses.get(accepted.solutionId),
+    ) as { thread: { id: string } }
+    oldSolution.thread.id = oldSolutionId
+    const oldRisk = structuredClone(
+      accepted.options.childResponses.get(accepted.riskId),
+    ) as { thread: { id: string; turns: Array<Record<string, unknown>> } }
+    oldRisk.thread.id = oldRiskId
+    oldRisk.thread.turns = [{
+      id: 'paused-old-risk-turn', status: 'interrupted', itemsView: 'full',
+      items: [{
+        type: 'agentMessage', id: 'paused-old-risk-commentary',
+        phase: 'commentary', text: 'interrupted by the parent',
+      }],
+    }]
+    ;(accepted.options.childrenListResponse as { data: unknown[] }).data.push(
+      { id: oldSolutionId, parentThreadId: accepted.options.parentThreadId },
+      { id: oldRiskId, parentThreadId: accepted.options.parentThreadId },
+    )
+    accepted.options.childResponses.set(oldSolutionId, oldSolution)
+    accepted.options.childResponses.set(oldRiskId, oldRisk)
+    accepted.options.childChildrenListResponses.set(oldSolutionId, { data: [], nextCursor: null })
+    accepted.options.childChildrenListResponses.set(oldRiskId, { data: [], nextCursor: null })
+
+    const resolved = resolveNativeAdvisorThreadIds({
+      attemptNonce: accepted.options.attemptNonce,
+      parentThreadId: accepted.options.parentThreadId,
+      repoPath: accepted.options.repoPath,
+      rounds: accepted.options.rounds,
+      parentResponse: accepted.options.parentResponse,
+      childResponses: accepted.options.childResponses,
+    })
+    expect(resolved[0]!.native.map(entry => entry.agentId)).toEqual([
+      accepted.solutionId, accepted.riskId,
+    ])
+    expect(() => assertNativeAdvisorEvidence(accepted.options)).not.toThrow()
+
+    const duplicateId = 'paused-duplicate-solution'
+    const duplicate = structuredClone(oldSolution) as { thread: { id: string } }
+    duplicate.thread.id = duplicateId
+    const pauseItems = parent.thread.turns[0]!.items as Array<Record<string, unknown>>
+    pauseItems.splice(-1, 0, {
+      type: 'subAgentActivity', id: 'paused-duplicate-solution-start',
+      kind: 'started', agentThreadId: duplicateId,
+    })
+    ;(accepted.options.childrenListResponse as { data: unknown[] }).data.push({
+      id: duplicateId, parentThreadId: accepted.options.parentThreadId,
+    })
+    accepted.options.childResponses.set(duplicateId, duplicate)
+    accepted.options.childChildrenListResponses.set(duplicateId, { data: [], nextCursor: null })
+    expect(() => assertNativeAdvisorEvidence(accepted.options)).toThrow(
+      'paused generation spawned duplicate perspective children',
+    )
+  })
+
+  test('pause markerのないcompleted extra childを旧generationとして許容しない', () => {
+    const value = fixture()
+    const extraId = 'nonpause-completed-solution'
+    const extra = structuredClone(
+      value.options.childResponses.get(value.solutionId),
+    ) as { thread: { id: string; turns: Array<{ items: Array<{ text: string }> }> } }
+    extra.thread.id = extraId
+    extra.thread.turns[0]!.items[0]!.text = 'unrelated completed answer'
+    const parent = value.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    parent.thread.turns[0]!.items.push({
+      type: 'subAgentActivity', id: 'nonpause-completed-solution-start',
+      kind: 'started', agentThreadId: extraId,
+    })
+    ;(value.options.childrenListResponse as { data: unknown[] }).data.push({
+      id: extraId, parentThreadId: value.options.parentThreadId,
+    })
+    value.options.childResponses.set(extraId, extra)
+    value.options.childChildrenListResponses.set(extraId, { data: [], nextCursor: null })
+    expect(() => resolveNativeAdvisorThreadIds({
+      attemptNonce: value.options.attemptNonce,
+      parentThreadId: value.options.parentThreadId,
+      repoPath: value.options.repoPath,
+      rounds: value.options.rounds,
+      parentResponse: value.options.parentResponse,
+      childResponses: value.options.childResponses,
+    })).toThrow('unjournaled physical child thread')
+    expect(() => assertNativeAdvisorEvidence(value.options)).toThrow(
+      'unclaimed child response',
+    )
+  })
+
+  test('failed terminal childは対応するunavailable slotだけへ束縛する', () => {
+    const value = fixture()
+    value.options.rounds[0]!.native[0] = {
+      perspective: 'solution', attempted: true, adopted: false,
+      reasonDigest: '4'.repeat(64),
+    }
+    const failed = value.options.childResponses.get(value.solutionId) as {
+      thread: { turns: Array<Record<string, unknown>> }
+    }
+    const parent = value.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    const solutionStart = parent.thread.turns[0]!.items.find(item => (
+      item.agentThreadId === value.solutionId
+    ))!
+    solutionStart.id = 'failed-solution-start'
+    failed.thread.turns = [{
+      id: 'failed-solution-turn', status: 'failed', itemsView: 'full',
+      items: [{
+        type: 'agentMessage', id: 'failed-solution-commentary',
+        phase: 'commentary', text: 'failed before a final response',
+      }],
+    }]
+    const resolved = resolveNativeAdvisorThreadIds({
+      attemptNonce: value.options.attemptNonce,
+      parentThreadId: value.options.parentThreadId,
+      repoPath: value.options.repoPath,
+      rounds: value.options.rounds,
+      parentResponse: value.options.parentResponse,
+      childResponses: value.options.childResponses,
+    })
+    expect(resolved[0]!.native[0]).toEqual(value.options.rounds[0]!.native[0])
+    expect(resolved[0]!.native[1]!.agentId).toBe(value.riskId)
+    expect(() => assertNativeAdvisorEvidence({
+      ...value.options, rounds: resolved,
+    })).not.toThrow()
+  })
+
+  test('unavailable outcomeのagentId付与と採択threadとの衝突を拒否する', () => {
+    const value = fixture()
+    value.options.rounds[0]!.native[0] = {
+      perspective: 'solution', attempted: true, adopted: false,
+      agentId: value.riskId,
+      reasonDigest: '5'.repeat(64),
+    }
+    expect(() => resolveNativeAdvisorThreadIds({
+      attemptNonce: value.options.attemptNonce,
+      parentThreadId: value.options.parentThreadId,
+      repoPath: value.options.repoPath,
+      rounds: value.options.rounds,
+      parentResponse: value.options.parentResponse,
+      childResponses: value.options.childResponses,
+    })).toThrow('unavailable outcome is invalid')
+    expect(() => assertNativeAdvisorEvidence(value.options)).toThrow(
+      'unavailable outcome is invalid',
+    )
+  })
+
+  test('native採択数0件と1件のterminal outcomeを履歴へ正しく結合する', () => {
+    const zero = fixture()
+    zero.options.rounds[0]!.native = [
+      {
+        perspective: 'solution', attempted: true, adopted: false,
+        reasonDigest: '1'.repeat(64),
+      },
+      {
+        perspective: 'risk', attempted: true, adopted: false,
+        reasonDigest: '2'.repeat(64),
+      },
+    ]
+    const zeroParent = zero.options.parentResponse as {
+      thread: { turns: Array<{ items: unknown[] }> }
+    }
+    zeroParent.thread.turns[0]!.items = []
+    zero.options.childrenListResponse = { data: [], nextCursor: null }
+    zero.options.childResponses.clear()
+    zero.options.childChildrenListResponses.clear()
+    const zeroResolved = resolveNativeAdvisorThreadIds({
+      attemptNonce: zero.options.attemptNonce,
+      parentThreadId: zero.options.parentThreadId,
+      repoPath: zero.options.repoPath,
+      rounds: zero.options.rounds,
+      parentResponse: zero.options.parentResponse,
+      childResponses: zero.options.childResponses,
+    })
+    expect(zeroResolved[0]!.native.map(entry => entry.adopted)).toEqual([false, false])
+    expect(() => assertNativeAdvisorEvidence({
+      ...zero.options,
+      rounds: zeroResolved,
+    })).not.toThrow()
+
+    const one = fixture()
+    one.options.rounds[0]!.native[1] = {
+      perspective: 'risk', attempted: true, adopted: false,
+      reasonDigest: '3'.repeat(64),
+    }
+    const oneParent = one.options.parentResponse as {
+      thread: { turns: Array<{ items: Array<Record<string, unknown>> }> }
+    }
+    oneParent.thread.turns[0]!.items = oneParent.thread.turns[0]!.items.filter(item => (
+      item.agentThreadId !== one.riskId
+    ))
+    one.options.childrenListResponse = {
+      data: [{ id: one.solutionId, parentThreadId: one.options.parentThreadId }],
+      nextCursor: null,
+    }
+    one.options.childResponses.delete(one.riskId)
+    one.options.childChildrenListResponses.delete(one.riskId)
+    const oneResolved = resolveNativeAdvisorThreadIds({
+      attemptNonce: one.options.attemptNonce,
+      parentThreadId: one.options.parentThreadId,
+      repoPath: one.options.repoPath,
+      rounds: one.options.rounds,
+      parentResponse: one.options.parentResponse,
+      childResponses: one.options.childResponses,
+    })
+    expect(oneResolved[0]!.native.map(entry => entry.adopted)).toEqual([undefined, false])
+    expect(() => assertNativeAdvisorEvidence({
+      ...one.options,
+      rounds: oneResolved,
+    })).not.toThrow()
+  })
+
   test('最終回答のないinterrupted precursor後のcompleted turnを一意採択する', () => {
     const { options, solutionId } = fixture()
     const solution = options.childResponses.get(solutionId) as {

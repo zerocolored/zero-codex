@@ -4,11 +4,39 @@ import {
   validLegacyAdoptedGrok,
   validTerminalClaudeAttempt,
   validTerminalGrokAttempts,
+  validTerminalNativeAttempts,
 } from './advisor-journal.ts'
 
 const digest = (character: string) => character.repeat(64)
 
 describe('best-effort external advisor journal', () => {
+  test('native Codex欠員もsolution/risk各slotのterminal outcomeとして受理する', () => {
+    const unavailable = ['solution', 'risk'].map((perspective, index) => ({
+      attempted: true,
+      adopted: false,
+      perspective,
+      reasonDigest: digest(String(index + 1)),
+    }))
+    expect(validTerminalNativeAttempts(unavailable)).toBe(true)
+    expect(validTerminalNativeAttempts([
+      {
+        attempted: true,
+        adopted: true,
+        perspective: 'solution',
+        agentId: 'solution_agent',
+        responseDigest: digest('a'),
+        responseTransportDigest: digest('b'),
+      },
+      unavailable[1],
+    ])).toBe(true)
+    expect(validTerminalNativeAttempts([
+      { ...unavailable[0], attempted: false }, unavailable[1],
+    ])).toBe(false)
+    expect(validTerminalNativeAttempts([
+      { ...unavailable[0], responseDigest: digest('c') }, unavailable[1],
+    ])).toBe(false)
+  })
+
   test('安全に終了したGrok欠員を成功数0でもterminalとして受理する', () => {
     const unavailable = ['solution', 'risk'].map((perspective, index) => ({
       attempted: true,
