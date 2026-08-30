@@ -167,7 +167,7 @@ maintenance_active() {
   # updater the orphaned services must still alert. Suppress only while the
   # exact local update/restart owner is visibly alive.
   if private_regular_file "$STATE_DIR/update-transaction.json" \
-      && process_matches "$STATE_DIR/update.lock/pid" '(update\.ts|setup\.sh)'; then
+      && process_matches "$STATE_DIR/update.lock/pid" '(update\.ts|zerokun-update|setup\.sh)'; then
     return 0
   fi
   process_matches "$STATE_DIR/restart.lock/pid" 'codex-channel\.sh'
@@ -503,8 +503,9 @@ selftest() {
   test_dir="$(mktemp -d "${TMPDIR:-/tmp}/zerokun-watchdog.XXXXXX")" || return 1
   fake_server="$test_dir/server.ts"
   fake_runner="$test_dir/job-runner.ts"
-  fake_update="$test_dir/update.ts"
+  fake_update="$test_dir/.local/bin/zerokun-update"
   fake_restart="$test_dir/codex-channel.sh"
+  mkdir -p "$(dirname "$fake_update")"
   printf '#!/bin/bash\nexec -a "$0" sleep 30\n' > "$fake_server"
   printf '#!/bin/bash\nexec -a "$0 $1" sleep 30\n' > "$fake_runner"
   printf '#!/bin/bash\nexec -a "$0" sleep 30\n' > "$fake_update"
