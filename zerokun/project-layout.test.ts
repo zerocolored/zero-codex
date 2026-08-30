@@ -16,6 +16,7 @@ import {
   ensureWorkspacePin,
   resolveProjectLayout,
 } from './project-layout.ts'
+import { projectGitExecutable } from './project-git.ts'
 
 const roots: string[] = []
 
@@ -25,7 +26,7 @@ afterEach(() => {
 
 function gitInit(path: string): void {
   mkdirSync(path, { recursive: true })
-  const result = Bun.spawnSync(['/usr/bin/git', 'init', '-q', path], {
+  const result = Bun.spawnSync([projectGitExecutable(), 'init', '-q', path], {
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
   })
   expect(result.exitCode, result.stderr.toString()).toBe(0)
@@ -107,7 +108,7 @@ describe('multi-repository project layout', () => {
   test('pin済みworkspace parentがGit化されたら単一repoへ黙って切り替えない', () => {
     const { workspace } = workspaceFixture()
     ensureWorkspacePin(resolveProjectLayout(workspace))
-    const initialized = Bun.spawnSync(['/usr/bin/git', 'init', '-q', workspace], {
+    const initialized = Bun.spawnSync([projectGitExecutable(), 'init', '-q', workspace], {
       stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
     })
     expect(initialized.exitCode, initialized.stderr.toString()).toBe(0)

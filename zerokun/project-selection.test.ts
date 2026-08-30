@@ -73,7 +73,7 @@ describe('zerochan project selection', () => {
     for (const name of ['backend', 'frontend', 'meeting-app', '.wt-hidden']) {
       const repository = join(workspace, name)
       mkdirSync(repository)
-      const result = Bun.spawnSync(['/usr/bin/git', 'init', '-q', repository], {
+      const result = Bun.spawnSync([projectGitExecutable(), 'init', '-q', repository], {
         stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
       })
       expect(result.exitCode, result.stderr.toString()).toBe(0)

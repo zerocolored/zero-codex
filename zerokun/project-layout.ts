@@ -17,6 +17,7 @@ import {
   atomicWritePrivateFile,
   readOptionalBoundedOwnerOnlyRegularFile,
 } from './safe-file.ts'
+import { projectGitExecutable } from './project-git.ts'
 
 const MAX_DIRECT_ENTRIES = 1_024
 const MAX_WORKSPACE_REPOSITORIES = 16
@@ -82,7 +83,7 @@ function physicalDirectory(pathInput: string): string {
 function gitResult(
   projectPath: string,
   args: string[],
-  gitExecutable = '/usr/bin/git',
+  gitExecutable = projectGitExecutable(),
 ): ReturnType<typeof Bun.spawnSync> {
   return Bun.spawnSync([
     gitExecutable,
@@ -270,7 +271,7 @@ export function resolveProjectLayout(
   options: { gitExecutable?: string; ignorePin?: boolean } = {},
 ): ProjectLayout {
   const projectPath = physicalDirectory(pathInput)
-  const gitExecutable = options.gitExecutable ?? '/usr/bin/git'
+  const gitExecutable = options.gitExecutable ?? projectGitExecutable()
   const topLevelResult = gitResult(projectPath, ['rev-parse', '--show-toplevel'], gitExecutable)
   if (topLevelResult.exitCode === 0) {
     const topLevelText = topLevelResult.stdout?.toString().trim() ?? ''
