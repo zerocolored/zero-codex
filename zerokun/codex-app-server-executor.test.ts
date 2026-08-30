@@ -11,7 +11,7 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
-import { JobStore, type JobControlRecord } from './job-runner.ts'
+import { JobStore } from './job-runner.ts'
 import {
   CodexCleanupPendingError,
   CodexRateLimitError,
@@ -79,6 +79,19 @@ async function waitForRpcMethod(path: string, method: string, timeoutMs = 5_000)
     await Bun.sleep(10)
   }
   throw new Error(`RPC method did not appear: ${method}`)
+}
+
+async function waitForInterjectionNotification(
+  store: JobStore,
+  timeoutMs = 5_000,
+) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const notification = store.pendingInterjectionNotifications()[0]
+    if (notification) return notification
+    await Bun.sleep(10)
+  }
+  throw new Error('interjection notification did not become pending')
 }
 
 function fakeCodex(root: string): string {
@@ -188,7 +201,13 @@ for line in sys.stdin:
         turn_count += 1
         prompt_items = turn_params.get("input", [])
         phase_prompt = prompt_items[0].get("text", "") if prompt_items else ""
-        if "Host phase: read-only preparation." in phase_prompt:
+        client_user_message_id = turn_params.get("clientUserMessageId") or ""
+        is_legacy_continuation = ":phase:" in client_user_message_id and mode in (
+            "defer", "terminal-race",
+        )
+        if "Zero host interjection response control" in phase_prompt:
+            stage = "interjection"
+        elif "Host phase: read-only preparation." in phase_prompt:
             stage = "prepare"
         elif "Host phase: write implementation." in phase_prompt:
             stage = "implementation"
@@ -206,7 +225,8 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if mode in ("phased", "phased-steer", "phased-late-inbound") else str(turn_count))
+        unique_turn = mode in ("phased", "phased-steer", "phased-late-inbound", "phased-interjection-update", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
             emit_batch([
@@ -217,7 +237,28 @@ for line in sys.stdin:
             continue
         emit({"id": request_id, "result": {"turn": active_turn}})
         emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
-        if mode in ("phased", "phased-steer", "phased-late-inbound"):
+        fixture_state = os.environ.get("ZERO_INTERJECTION_FIXTURE_STATE")
+        if is_legacy_continuation:
+            continuation_answers = {
+                "defer": "次ターンで追加入力を反映しました",
+                "terminal-race": "次ターンで追加入力を反映しました",
+            }
+            emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "continued-final", "text": continuation_answers[mode]}], "error": None}}})
+        elif mode in ("interjection-answer", "interjection-update", "interjection-late-answer", "phased-interjection-update") and stage == "interjection":
+            disposition = "answer-only" if mode in ("interjection-answer", "interjection-late-answer") else "task-update"
+            marker = re.search(r"\\[ZERO_THREAD_REPLY_BEGIN:([^:\\]]+):<answer-only\\|task-update>\\]", phase_prompt)
+            interjection_id = marker.group(1) if marker else "missing"
+            answer = "PDF処理はそのまま続いています 🔎" if disposition == "answer-only" else "追加条件を取り込んで続けます 🛠️"
+            message = "[ZERO_THREAD_REPLY_BEGIN:" + interjection_id + ":" + disposition + "]\\n" + answer + "\\n[ZERO_THREAD_REPLY_END:" + interjection_id + "]"
+            if fixture_state:
+                with open(fixture_state, "w", encoding="utf-8") as stream:
+                    stream.write(disposition)
+            emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "interjection-answer", "text": message}], "error": None}}})
+        elif mode in ("interjection-answer", "interjection-update"):
+            if fixture_state and os.path.exists(fixture_state):
+                final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
+                emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
+        elif mode in ("phased", "phased-steer", "phased-late-inbound", "phased-interjection-update"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "準備完了\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
@@ -231,9 +272,10 @@ for line in sys.stdin:
                 message = "unexpected phase"
             control_log = os.environ.get("ZERO_CONTROL_LOG")
             hold_for_steer = mode == "phased-steer" and stage == "implementation" and control_log and not os.path.exists(control_log)
-            if not hold_for_steer:
+            hold_for_interjection = mode == "phased-interjection-update" and stage == "implementation" and (not fixture_state or not os.path.exists(fixture_state))
+            if not hold_for_steer and not hold_for_interjection:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": message}], "error": None}}})
-        elif mode in ("normal", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
+        elif mode in ("normal", "commentary", "interjection-late-answer", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
             if mode == "slow":
                 time.sleep(0.1)
             if mode == "large-ledger":
@@ -243,6 +285,9 @@ for line in sys.stdin:
             terminal = {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "通常完了"}], "error": None}}}
             progress_error = {"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "fixture progress", "codexErrorInfo": None, "additionalDetails": None}}}
             late_error = {"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": {"message": "late fixture failure", "codexErrorInfo": None, "additionalDetails": None}}}
+            if mode == "commentary":
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-shared", "phase": "commentary", "text": "原因を確認しています 🔎"}}})
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-shared", "phase": "commentary", "text": "修正内容を検証しています 🧪"}}})
             if mode == "late-error-coalesced":
                 emit_batch([terminal, late_error])
             elif mode == "errors-before-terminal-coalesced":
@@ -318,7 +363,13 @@ for line in sys.stdin:
     elif method in ("thread/turns/list", "thread/read") and mode == "summary-stream-no-history":
         emit({"id": request_id, "error": {"code": -32000, "message": "history must not be requested"}})
     elif method == "turn/steer":
-        if mode == "progress-collapse":
+        if mode in ("interjection-answer", "interjection-update", "interjection-late-answer", "phased-interjection-update"):
+            pause_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
+            marker = re.search(r"\\[ZERO_INTERJECTION_PAUSED:[^\\]]+\\]", pause_text)
+            emit({"id": request_id, "result": {"turnId": value["params"]["expectedTurnId"]}})
+            message = "安全な境界で一時停止しました\\n" + (marker.group(0) if marker else "[ZERO_INTERJECTION_PAUSED:missing]")
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "pause-final", "text": message}], "error": None}}})
+        elif mode == "progress-collapse":
             progress_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
             marker = re.search(r"\\[ZERO_PROGRESS_BEGIN:([A-F0-9]{24,64})\\]", progress_text)
             if not marker:
@@ -437,11 +488,13 @@ if mode == "logical-stop-required":
 
 function fixture(
   mode: 'normal' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
+    | 'interjection-answer' | 'interjection-update' | 'interjection-late-answer'
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
     | 'failed-steer' | 'failed-turn'
     | 'error-steer' | 'rate-error' | 'rate-retrying' | 'phased' | 'phased-steer'
+    | 'phased-interjection-update'
     | 'phased-late-inbound' | 'summary-stream-no-history' | 'logical-stop-required'
     | 'late-error-after-complete' | 'late-error-coalesced'
     | 'errors-before-terminal-coalesced' | 'terminal-cancel-race'
@@ -472,6 +525,7 @@ function fixture(
   let staged = false
   const stageRequestedControl = () => {
     if (staged || ![
+      'interjection-answer', 'interjection-update',
       'steer', 'interrupt', 'interrupt-no-terminal', 'interrupt-no-terminal-forced',
       'defer', 'terminal-race', 'terminal-race-accepted',
       'terminal-race-accepted-history', 'terminal-race-duplicate',
@@ -482,6 +536,18 @@ function fixture(
     staged = true
     const target = store.liveControlTarget(job.chatId, job.threadTs)
     if (!target) throw new Error('live control target disappeared')
+    if (mode === 'interjection-answer' || mode === 'interjection-update') {
+      store.stageLiveInterjection(target, {
+        chatId: job.chatId,
+        threadTs: job.threadTs,
+        messageId: '1800000000.000200',
+        userId: 'UOTHER',
+        task: mode === 'interjection-answer'
+          ? '今はどこまで進んでいますか？'
+          : '追加で上限を120秒に変えてください',
+      })
+      return
+    }
     store.stageLiveControl(target, {
       chatId: job.chatId,
       threadTs: job.threadTs,
@@ -500,7 +566,8 @@ function fixture(
     })
   }
   const hooks: CodexLiveControlHooks = {
-    next: () => store.nextReadyControl(job.id, job.controlEpoch),
+    next: () => store.nextReadyLiveInput(job.id, job.controlEpoch),
+    nextInterjection: () => store.nextPendingInterjection(job.id, job.controlEpoch),
     bindTurn: (executorNonce, threadId, turnId) => {
       store.bindAppServerTurn(
         job.id, job.workerId!, job.controlEpoch, executorNonce, threadId, turnId,
@@ -613,6 +680,19 @@ function fixture(
       })
     ),
     beginDispatch: ({ control, executorNonce, threadId, turnId, requestId }) => {
+      if (control.kind === 'interjection') {
+        if (!turnId) throw new Error('interjection pause omitted its active turn')
+        store.beginInterjectionPause({
+          interjectionId: control.id,
+          jobId: job.id,
+          epoch: job.controlEpoch,
+          executorNonce,
+          threadId,
+          turnId,
+          requestId,
+        })
+        return
+      }
       store.beginControlDispatch({
         controlId: control.id,
         jobId: job.id,
@@ -623,19 +703,38 @@ function fixture(
         requestId,
       })
     },
-    acknowledge: (control: JobControlRecord, requestId: number, turnId: string) => {
+    acknowledge: (control, requestId: number, turnId: string) => {
+      if (control.kind === 'interjection') {
+        store.acknowledgeInterjectionPause(control.id, requestId, turnId)
+        return
+      }
       store.acknowledgeControl(control.id, requestId, turnId)
     },
-    ambiguous: (control, error) => store.markControlAmbiguous(control.id, error),
+    ambiguous: (control, error) => {
+      if (control.kind === 'interjection') {
+        store.markInterjectionAmbiguous(control.id, error)
+        return
+      }
+      store.markControlAmbiguous(control.id, error)
+    },
     deferToNextTurn: (control, requestId, executorNonce, threadId, turnId, error) => (
-      store.deferControlToNextTurn({
-        controlId: control.id,
-        requestId,
-        executorNonce,
-        threadId,
-        turnId,
-        error,
-      })
+      control.kind === 'interjection'
+        ? store.deferInterjectionPause({
+          interjectionId: control.id,
+          requestId,
+          executorNonce,
+          threadId,
+          turnId,
+          error,
+        })
+        : store.deferControlToNextTurn({
+          controlId: control.id,
+          requestId,
+          executorNonce,
+          threadId,
+          turnId,
+          error,
+        })
     ),
     finishTurn: ({
       executorNonce, threadId, turnId, retainInput, rateLimitResumeAt,
@@ -658,12 +757,95 @@ function fixture(
         resumeAt,
       })
     ),
+    prepareInterjectionAnswer: ({ interjection, logicalNonce, threadId }) => (
+      store.prepareInterjectionAnswer({
+        interjectionId: interjection.id,
+        jobId: job.id,
+        epoch: job.controlEpoch,
+        logicalNonce,
+        threadId,
+      })
+    ),
+    beginInterjectionAnswer: ({ interjection, logicalNonce, threadId, requestId }) => (
+      store.beginInterjectionAnswer({
+        interjectionId: interjection.id,
+        jobId: job.id,
+        epoch: job.controlEpoch,
+        logicalNonce,
+        threadId,
+        requestId,
+      })
+    ),
+    acknowledgeInterjectionAnswer: ({
+      interjection, logicalNonce, threadId, turnId, requestId,
+    }) => store.acknowledgeInterjectionAnswer({
+      interjectionId: interjection.id,
+      jobId: job.id,
+      workerId: job.workerId!,
+      epoch: job.controlEpoch,
+      logicalNonce,
+      threadId,
+      turnId,
+      requestId,
+    }),
+    rejectInterjectionAnswer: ({
+      interjection, logicalNonce, threadId, requestId, error,
+    }) => store.rejectInterjectionAnswer({
+      interjectionId: interjection.id,
+      logicalNonce,
+      threadId,
+      requestId,
+      error,
+    }),
+    stageInterjectionAnswer: ({
+      interjection, logicalNonce, threadId, turnId, disposition, answer,
+    }) => store.stageInterjectionAnswer({
+        interjectionId: interjection.id,
+        jobId: job.id,
+        epoch: job.controlEpoch,
+        logicalNonce,
+        threadId,
+        turnId,
+        disposition,
+        answer,
+      }),
+    interjectionDelivered: interjection => store.interjectionIsDelivered(interjection.id),
+    promoteInterjection: interjection => store.promoteDeliveredInterjection(interjection.id),
     cancellationRequested: () => store.get(job.id)?.cancelRequestedAt != null,
   }
   return { root, repo, state, logDir, store, job, hooks, executable: fakeCodex(root) }
 }
 
 describe('production App Server executor', () => {
+  test('root commentaryを監視表示とdurable Slack handoffへ同じ順序で渡す', async () => {
+    const value = fixture('commentary')
+    const monitorMessages: string[] = []
+    const commentary: Array<{ sourceKey: string; text: string }> = []
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'commentary' },
+      onMonitorMessage: message => { monitorMessages.push(message) },
+      onCommentaryMessage: event => { commentary.push(event) },
+      liveControls: value.hooks,
+    })
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
+    expect(commentary.map(event => event.text)).toEqual([
+      '💬 原因を確認しています 🔎',
+      '💬 修正内容を検証しています 🧪',
+    ])
+    expect(commentary.every(event => /^[0-9a-f]{64}$/.test(event.sourceKey))).toBe(true)
+    expect(new Set(commentary.map(event => event.sourceKey)).size).toBe(2)
+    expect(monitorMessages).toEqual([
+      '● 作業を開始しました',
+      '💬 原因を確認しています 🔎',
+      '💬 修正内容を検証しています 🧪',
+    ])
+    value.store.close()
+  }, 15_000)
+
   test('accepted terminal後は論理終了signalでApp Serverを閉じる', async () => {
     const value = fixture('logical-stop-required')
     const marker = join(value.root, 'logical-stop.marker')
@@ -1016,6 +1198,113 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('write phaseを退役してread-onlyで回答後に配送済み更新だけをfresh準備から再開する', async () => {
+    const value = fixture('phased-interjection-update', true)
+    const phaseLog = join(value.root, 'interjection-write-phases.log')
+    const promptLog = join(value.root, 'interjection-write-prompts.log')
+    const fixtureState = join(value.root, 'interjection-write.state')
+    const processIds: number[] = []
+    const gates: string[] = []
+    let staged = false
+    const acknowledgePhase = value.hooks.acknowledgePhaseDispatch!
+    value.hooks.acknowledgePhaseDispatch = options => {
+      acknowledgePhase(options)
+      if (staged || options.phaseSequence !== 1) return
+      staged = true
+      const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
+      if (!target) throw new Error('write interjection target disappeared')
+      expect(value.store.stageLiveInterjection(target, {
+        chatId: value.job.chatId,
+        threadTs: value.job.threadTs,
+        messageId: '1800000000.000910',
+        userId: 'UOTHER',
+        writeEnabled: false,
+        task: '追加で上限を120秒に変えてください',
+      })).toBe('staged')
+    }
+    const promoteAnswer = value.hooks.promoteInterjection!
+    value.hooks.promoteInterjection = interjection => {
+      expect(value.store.interjectionIsDelivered(interjection.id)).toBe(true)
+      return promoteAnswer(interjection)
+    }
+
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-interjection-update',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_PROMPT_LOG: promptLog,
+        ZERO_INTERJECTION_FIXTURE_STATE: fixtureState,
+      },
+      phaseGateForTesting: {
+        validatePreparation: input => {
+          gates.push(`prepare-r${input.revision}`)
+          if (input.revision === 2) {
+            expect(input.transcript).toContain('追加で上限を120秒に変えてください')
+          }
+        },
+        validateReview: (input, _digest, round) => {
+          gates.push(`review-r${input.revision}-${round}`)
+          expect(input.transcript).toContain('追加で上限を120秒に変えてください')
+        },
+      },
+      onProcessId: processId => { processIds.push(processId) },
+      liveControls: value.hooks,
+    })
+
+    const notification = await waitForInterjectionNotification(value.store)
+    expect(value.store.get(value.job.id)?.inputRevision).toBe(1)
+    expect(value.store.listJobControls(value.job.id)).toHaveLength(0)
+    expect(value.store.listJobInterjections(value.job.id)[0]).toMatchObject({
+      status: 'answered',
+      disposition: 'task-update',
+    })
+    value.store.markInterjectionNotificationDelivered(notification.id)
+    const result = await execution
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(gates).toEqual(['prepare-r1', 'prepare-r2', 'review-r2-1'])
+    expect(processIds).toHaveLength(6)
+    expect(new Set(processIds).size).toBe(6)
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual([
+      'prepare', 'implementation', 'interjection',
+      'prepare', 'implementation', 'review',
+    ])
+    expect(phases.map(row => row[2])).toEqual(Array(6).fill('thread-app-server-1'))
+    expect(phases.map(row => row[3])).toEqual([
+      'thread/start', 'thread/resume', 'thread/resume',
+      'thread/resume', 'thread/resume', 'thread/resume',
+    ])
+    expect(phases.map(row => row[4])).toEqual([
+      'read', 'write', 'read', 'read', 'write', 'read',
+    ])
+    const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string, text: string })
+    const implementations = prompts.filter(prompt => prompt.stage === 'implementation')
+    expect(implementations).toHaveLength(2)
+    expect(implementations[0]!.text).not.toContain('追加で上限を120秒に変えてください')
+    expect(implementations[1]!.text).toContain('追加で上限を120秒に変えてください')
+    expect(prompts.find(prompt => prompt.stage === 'interjection')?.text)
+      .toContain('追加で上限を120秒に変えてください')
+    expect(value.store.get(value.job.id)?.inputRevision).toBe(2)
+    expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({
+      kind: 'steer',
+      status: 'observed',
+      inputRevision: 2,
+      task: '追加で上限を120秒に変えてください',
+    })
+    expect(value.store.listJobInterjections(value.job.id)[0]).toMatchObject({
+      status: 'promoted',
+      disposition: 'task-update',
+    })
+    value.store.close()
+  }, 30_000)
+
   test('write terminal境界の未処理Slack返信をdrain後にfresh RO準備から再開する', async () => {
     const value = fixture('phased-late-inbound', true)
     const phaseLog = join(value.root, 'late-inbound-phase-processes.log')
@@ -1204,21 +1493,474 @@ describe('production App Server executor', () => {
 
   test('同じthreadの別user返信をactive turnへsteerする', async () => {
     const value = fixture('steer')
+    const processIds: number[] = []
     const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
       stateDir: value.state,
       skipEffectiveConfigCheck: true,
       extraEnvironment: { ZERO_FIXTURE_MODE: 'steer' },
+      onProcessId: processId => { processIds.push(processId) },
       liveControls: value.hooks,
     })
     expect(result.result).toBe('追加入力を反映しました')
+    expect(processIds).toHaveLength(1)
     expect(value.store.listJobControls(value.job.id)).toHaveLength(1)
     expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({
       userId: 'UOTHER', kind: 'steer', status: 'observed',
     })
     value.store.close()
   })
+
+  test('同じthreadの質問へ先に回答してから元のtaskを同じCodex threadで再開する', async () => {
+    const value = fixture('interjection-answer')
+    const fixtureState = join(value.root, 'interjection-answer.state')
+    const promptLog = join(value.root, 'interjection-answer-prompts.log')
+    const phaseLog = join(value.root, 'interjection-answer-phases.log')
+    const rpcLog = join(value.root, 'interjection-answer-rpc.log')
+    const deliveryTrace: string[] = []
+    const stageAnswer = value.hooks.stageInterjectionAnswer!
+    const answerDelivered = value.hooks.interjectionDelivered!
+    const promoteAnswer = value.hooks.promoteInterjection!
+    value.hooks.stageInterjectionAnswer = options => {
+      const disposition = stageAnswer(options)
+      if (disposition === 'staged') deliveryTrace.push('staged')
+      return disposition
+    }
+    value.hooks.interjectionDelivered = interjection => {
+      const delivered = answerDelivered(interjection)
+      if (delivered && !deliveryTrace.includes('delivered')) deliveryTrace.push('delivered')
+      return delivered
+    }
+    value.hooks.promoteInterjection = interjection => {
+      expect(answerDelivered(interjection)).toBe(true)
+      deliveryTrace.push('promoted')
+      return promoteAnswer(interjection)
+    }
+
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'interjection-answer',
+        ZERO_INTERJECTION_FIXTURE_STATE: fixtureState,
+        ZERO_PROMPT_LOG: promptLog,
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_RPC_LOG: rpcLog,
+      },
+      liveControls: value.hooks,
+    })
+
+    const notification = await waitForInterjectionNotification(value.store)
+    expect(value.store.get(value.job.id)?.inputRevision).toBe(1)
+    expect(value.store.listJobControls(value.job.id)).toHaveLength(0)
+    expect(value.store.listJobInterjections(value.job.id)[0]).toMatchObject({
+      status: 'answered',
+      disposition: 'answer-only',
+    })
+    deliveryTrace.push('delivered')
+    value.store.markInterjectionNotificationDelivered(notification.id)
+    const result = await execution
+
+    expect(result).toEqual({
+      sessionId: 'thread-app-server-1',
+      result: '元の作業を完了しました',
+    })
+    expect(readFileSync(fixtureState, 'utf8')).toBe('answer-only')
+    expect(value.store.get(value.job.id)?.inputRevision).toBe(1)
+    expect(value.store.listJobControls(value.job.id)).toHaveLength(0)
+    expect(value.store.listJobInterjections(value.job.id)).toHaveLength(1)
+    expect(value.store.listJobInterjections(value.job.id)[0]).toMatchObject({
+      userId: 'UOTHER',
+      task: '今はどこまで進んでいますか？',
+      disposition: 'answer-only',
+      answer: 'PDF処理はそのまま続いています 🔎',
+      status: 'promoted',
+    })
+    expect(deliveryTrace).toEqual(['staged', 'delivered', 'promoted'])
+    const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string, text: string })
+    expect(prompts.map(prompt => prompt.stage)).toEqual([
+      'complete', 'interjection', 'complete',
+    ])
+    expect(prompts[0]!.text).not.toContain('今はどこまで進んでいますか？')
+    expect(prompts[1]!.text).toContain('今はどこまで進んでいますか？')
+    expect(prompts[2]!.text).not.toContain('今はどこまで進んでいますか？')
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual(['complete', 'interjection', 'complete'])
+    expect(phases.map(row => row[3])).toEqual(['thread/start', 'thread/resume', 'thread/resume'])
+    expect(new Set(phases.map(row => row[2])).size).toBe(1)
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { method: string })
+    expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(3)
+    expect(rpc.filter(row => row.method === 'turn/steer')).toHaveLength(1)
+    value.store.close()
+  }, 30_000)
+
+  test('同じthreadの連続質問をSlack配送順に回答してから元taskを一度だけ再開する', async () => {
+    const value = fixture('interjection-answer')
+    const fixtureState = join(value.root, 'interjection-fifo.state')
+    const promptLog = join(value.root, 'interjection-fifo-prompts.log')
+    const phaseLog = join(value.root, 'interjection-fifo-phases.log')
+    const rpcLog = join(value.root, 'interjection-fifo-rpc.log')
+    const processIds: number[] = []
+
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'interjection-answer',
+        ZERO_INTERJECTION_FIXTURE_STATE: fixtureState,
+        ZERO_PROMPT_LOG: promptLog,
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_RPC_LOG: rpcLog,
+      },
+      onProcessId: processId => { processIds.push(processId) },
+      liveControls: value.hooks,
+    })
+
+    const firstNotification = await waitForInterjectionNotification(value.store)
+    const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
+    if (!target) throw new Error('second interjection target disappeared')
+    expect(value.store.stageLiveInterjection(target, {
+      chatId: value.job.chatId,
+      threadTs: value.job.threadTs,
+      messageId: '1800000000.000201',
+      userId: 'UANOTHER',
+      task: '続けて、完了までの見込みも教えてください',
+    })).toBe('staged')
+    expect(value.store.pendingInterjectionNotifications().map(row => row.id))
+      .toEqual([firstNotification.id])
+
+    value.store.markInterjectionNotificationDelivered(firstNotification.id)
+    const secondNotification = await waitForInterjectionNotification(value.store)
+    expect(secondNotification.id).not.toBe(firstNotification.id)
+    expect(secondNotification.interjection.messageId).toBe('1800000000.000201')
+    value.store.markInterjectionNotificationDelivered(secondNotification.id)
+
+    const result = await execution
+    expect(result).toEqual({
+      sessionId: 'thread-app-server-1',
+      result: '元の作業を完了しました',
+    })
+    expect(processIds).toHaveLength(4)
+    expect(new Set(processIds).size).toBe(4)
+    expect(value.store.get(value.job.id)?.inputRevision).toBe(1)
+    expect(value.store.listJobControls(value.job.id)).toHaveLength(0)
+    expect(value.store.listJobInterjections(value.job.id)).toMatchObject([
+      { messageId: '1800000000.000200', status: 'promoted', disposition: 'answer-only' },
+      { messageId: '1800000000.000201', status: 'promoted', disposition: 'answer-only' },
+    ])
+    const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string, text: string })
+    expect(prompts.map(prompt => prompt.stage)).toEqual([
+      'complete', 'interjection', 'interjection', 'complete',
+    ])
+    expect(prompts[1]!.text).toContain('今はどこまで進んでいますか？')
+    expect(prompts[1]!.text).not.toContain('完了までの見込み')
+    expect(prompts[2]!.text).toContain('完了までの見込み')
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual([
+      'complete', 'interjection', 'interjection', 'complete',
+    ])
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { method: string })
+    expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(4)
+    expect(rpc.filter(row => row.method === 'turn/steer')).toHaveLength(1)
+    value.store.close()
+  }, 30_000)
+
+  test('pause terminal時に受信処理中の次質問があってもdrain後にFIFO回答して元taskを再開する', async () => {
+    const value = fixture('interjection-answer')
+    const fixtureState = join(value.root, 'interjection-inbound-race.state')
+    const phaseLog = join(value.root, 'interjection-inbound-race-phases.log')
+    const finishTurn = value.hooks.finishTurn
+    let stagedInbound = false
+    value.hooks.finishTurn = options => {
+      if (!finishTurn) throw new Error('finishTurn fixture hook is missing')
+      if (stagedInbound) return finishTurn(options)
+      stagedInbound = true
+      expect(value.store.stageInboundDelivery({
+        chatId: value.job.chatId,
+        threadTs: value.job.threadTs,
+        messageId: '1800000000.000201',
+        userId: 'UANOTHER',
+        repoPath: value.job.repoPath,
+        text: '続けて、完了までの見込みも教えてください',
+        writeEnabled: false,
+      })).toBe(true)
+      const barrier = finishTurn(options)
+      expect(barrier).toMatchObject({ pendingInbound: 1 })
+      expect(value.store.get(value.job.id)?.activeTurnId).toBe(options.turnId)
+
+      const inbound = value.store.claimNextInboundDelivery()
+      if (!inbound) throw new Error('fixture inbound delivery was not claimed')
+      const target = value.store.liveControlTarget(inbound.chatId, inbound.threadTs)
+      if (!target) throw new Error('fixture live target disappeared')
+      expect(value.store.stageLiveInterjection(target, {
+        chatId: inbound.chatId,
+        threadTs: inbound.threadTs,
+        messageId: inbound.messageId,
+        userId: inbound.userId,
+        task: inbound.text,
+      })).toBe('staged')
+      value.store.completeInboundDelivery(inbound.idempotencyKey)
+      return barrier
+    }
+
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'interjection-answer',
+        ZERO_INTERJECTION_FIXTURE_STATE: fixtureState,
+        ZERO_PHASE_LOG: phaseLog,
+      },
+      liveControls: value.hooks,
+    })
+
+    const first = await waitForInterjectionNotification(value.store)
+    expect(first.interjection.messageId).toBe('1800000000.000200')
+    value.store.markInterjectionNotificationDelivered(first.id)
+    const second = await waitForInterjectionNotification(value.store)
+    expect(second.interjection.messageId).toBe('1800000000.000201')
+    value.store.markInterjectionNotificationDelivered(second.id)
+
+    expect(await execution).toEqual({
+      sessionId: 'thread-app-server-1',
+      result: '元の作業を完了しました',
+    })
+    expect(value.store.listJobInterjections(value.job.id)).toMatchObject([
+      { messageId: '1800000000.000200', status: 'promoted', disposition: 'answer-only' },
+      { messageId: '1800000000.000201', status: 'promoted', disposition: 'answer-only' },
+    ])
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual([
+      'complete', 'interjection', 'interjection', 'complete',
+    ])
+    value.store.close()
+  }, 30_000)
+
+  test('同じthreadの更新依頼は回答をSlackへ届けた後だけtaskへ昇格して再開する', async () => {
+    const value = fixture('interjection-update')
+    const fixtureState = join(value.root, 'interjection-update.state')
+    const promptLog = join(value.root, 'interjection-update-prompts.log')
+    const phaseLog = join(value.root, 'interjection-update-phases.log')
+    const rpcLog = join(value.root, 'interjection-update-rpc.log')
+    const deliveryTrace: string[] = []
+    const stageAnswer = value.hooks.stageInterjectionAnswer!
+    const answerDelivered = value.hooks.interjectionDelivered!
+    const promoteAnswer = value.hooks.promoteInterjection!
+    value.hooks.stageInterjectionAnswer = options => {
+      const disposition = stageAnswer(options)
+      if (disposition === 'staged') deliveryTrace.push('staged')
+      return disposition
+    }
+    value.hooks.interjectionDelivered = interjection => {
+      const delivered = answerDelivered(interjection)
+      if (delivered && !deliveryTrace.includes('delivered')) deliveryTrace.push('delivered')
+      return delivered
+    }
+    value.hooks.promoteInterjection = interjection => {
+      expect(answerDelivered(interjection)).toBe(true)
+      deliveryTrace.push('promoted')
+      return promoteAnswer(interjection)
+    }
+
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'interjection-update',
+        ZERO_INTERJECTION_FIXTURE_STATE: fixtureState,
+        ZERO_PROMPT_LOG: promptLog,
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_RPC_LOG: rpcLog,
+      },
+      liveControls: value.hooks,
+    })
+
+    const notification = await waitForInterjectionNotification(value.store)
+    expect(value.store.get(value.job.id)?.inputRevision).toBe(1)
+    expect(value.store.listJobControls(value.job.id)).toHaveLength(0)
+    expect(value.store.listJobInterjections(value.job.id)[0]).toMatchObject({
+      status: 'answered',
+      disposition: 'task-update',
+    })
+    deliveryTrace.push('delivered')
+    value.store.markInterjectionNotificationDelivered(notification.id)
+    const result = await execution
+
+    expect(result).toEqual({
+      sessionId: 'thread-app-server-1',
+      result: '追加条件を反映して完了しました',
+    })
+    expect(readFileSync(fixtureState, 'utf8')).toBe('task-update')
+    expect(value.store.get(value.job.id)?.inputRevision).toBe(2)
+    expect(value.store.listJobControls(value.job.id)).toHaveLength(1)
+    expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({
+      userId: 'UOTHER',
+      task: '追加で上限を120秒に変えてください',
+      kind: 'steer',
+      status: 'observed',
+      inputRevision: 2,
+    })
+    expect(value.store.listJobInterjections(value.job.id)[0]).toMatchObject({
+      disposition: 'task-update',
+      answer: '追加条件を取り込んで続けます 🛠️',
+      status: 'promoted',
+    })
+    expect(deliveryTrace).toEqual(['staged', 'delivered', 'promoted'])
+    const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string, text: string })
+    expect(prompts.map(prompt => prompt.stage)).toEqual([
+      'complete', 'interjection', 'complete',
+    ])
+    expect(prompts[0]!.text).not.toContain('追加で上限を120秒に変えてください')
+    expect(prompts[1]!.text).toContain('追加で上限を120秒に変えてください')
+    expect(prompts[2]!.text).toContain('追加で上限を120秒に変えてください')
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual(['complete', 'interjection', 'complete'])
+    expect(phases.map(row => row[3])).toEqual(['thread/start', 'thread/resume', 'thread/resume'])
+    expect(new Set(phases.map(row => row[2])).size).toBe(1)
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { method: string })
+    expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(3)
+    expect(rpc.filter(row => row.method === 'turn/steer')).toHaveLength(1)
+    value.store.close()
+  }, 30_000)
+
+  test('task-update回答の配送直後にexact中止されたら通常failureではなくcancelとして終了する', async () => {
+    const value = fixture('interjection-update')
+    const fixtureState = join(value.root, 'interjection-cancel-race.state')
+    const promoteAnswer = value.hooks.promoteInterjection!
+    let cancelledBeforePromotion = false
+    value.hooks.promoteInterjection = interjection => {
+      if (!cancelledBeforePromotion) {
+        cancelledBeforePromotion = true
+        const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
+        if (!target) throw new Error('interjection cancellation target disappeared')
+        expect(value.store.stageLiveControl(target, {
+          chatId: value.job.chatId,
+          threadTs: value.job.threadTs,
+          messageId: '1800000000.000299',
+          userId: 'UANOTHER',
+          task: '中止',
+          kind: 'interrupt',
+        })).toBe('staged')
+      }
+      return promoteAnswer(interjection)
+    }
+
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'interjection-update',
+        ZERO_INTERJECTION_FIXTURE_STATE: fixtureState,
+      },
+      liveControls: value.hooks,
+    })
+
+    const notification = await waitForInterjectionNotification(value.store)
+    value.store.markInterjectionNotificationDelivered(notification.id)
+    await expect(execution).rejects.toBeInstanceOf(CodexUserCancelledError)
+    expect(cancelledBeforePromotion).toBe(true)
+    expect(value.store.get(value.job.id)?.cancelRequestedAt).not.toBeNull()
+    value.store.close()
+  }, 30_000)
+
+  test('元turnがterminal済みのlate質問へ回答して完了済みtaskを再実行しない', async () => {
+    const value = fixture('interjection-late-answer')
+    const phaseLog = join(value.root, 'late-interjection-phases.log')
+    const rpcLog = join(value.root, 'late-interjection-rpc.log')
+    const processIds: number[] = []
+    let staged = false
+    const finishTurn = value.hooks.finishTurn!
+    value.hooks.finishTurn = options => {
+      if (!staged) {
+        staged = true
+        expect(value.store.stageInboundDelivery({
+          chatId: value.job.chatId,
+          threadTs: value.job.threadTs,
+          messageId: '1800000000.000920',
+          userId: 'UOTHER',
+          repoPath: value.job.repoPath,
+          text: '完了した内容を一言で教えてください',
+          writeEnabled: false,
+        })).toBe(true)
+        const inbound = value.store.claimNextInboundDelivery()
+        if (!inbound) throw new Error('late interjection inbound was not claimed')
+        const target = value.store.liveControlTarget(inbound.chatId, inbound.threadTs)
+        if (!target) throw new Error('late interjection target disappeared')
+        expect(value.store.stageLiveInterjection(target, {
+          chatId: inbound.chatId,
+          threadTs: inbound.threadTs,
+          messageId: inbound.messageId,
+          userId: inbound.userId,
+          task: inbound.text,
+        })).toBe('staged')
+        const barrier = finishTurn(options)
+        expect(barrier).toMatchObject({ pendingInbound: 1 })
+        expect(value.store.get(value.job.id)?.activeTurnId).toBe(options.turnId)
+        value.store.completeInboundDelivery(inbound.idempotencyKey)
+        return barrier
+      }
+      return finishTurn(options)
+    }
+
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'interjection-late-answer',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_RPC_LOG: rpcLog,
+      },
+      onProcessId: processId => { processIds.push(processId) },
+      liveControls: value.hooks,
+    })
+
+    const notification = await waitForInterjectionNotification(value.store)
+    expect(value.store.listJobInterjections(value.job.id)[0]).toMatchObject({
+      status: 'answered',
+      disposition: 'answer-only',
+    })
+    value.store.markInterjectionNotificationDelivered(notification.id)
+    const result = await execution
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
+    expect(processIds).toHaveLength(2)
+    expect(new Set(processIds).size).toBe(2)
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual(['complete', 'interjection'])
+    expect(phases.map(row => row[3])).toEqual(['thread/start', 'thread/resume'])
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { method: string })
+    expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(2)
+    expect(rpc.filter(row => row.method === 'turn/steer')).toHaveLength(0)
+    expect(value.store.get(value.job.id)?.inputRevision).toBe(1)
+    expect(value.store.listJobControls(value.job.id)).toHaveLength(0)
+    expect(value.store.listJobInterjections(value.job.id)[0]?.status).toBe('promoted')
+    value.store.close()
+  }, 30_000)
 
   test('定期進捗を新turnではなく同じactive turnへsteerしてcommentaryから公開する', async () => {
     const value = fixture('progress')
@@ -1923,6 +2665,7 @@ describe('production App Server executor', () => {
 
   test('turn失敗と競合した同thread返信を孤立させず次turnで処理する', async () => {
     const value = fixture('failed-steer')
+    const processIds: number[] = []
     const finishTurn = value.hooks.finishTurn
     let staged = false
     value.hooks.finishTurn = options => {
@@ -1946,9 +2689,11 @@ describe('production App Server executor', () => {
       stateDir: value.state,
       skipEffectiveConfigCheck: true,
       extraEnvironment: { ZERO_FIXTURE_MODE: 'failed-steer' },
+      onProcessId: processId => { processIds.push(processId) },
       liveControls: value.hooks,
     })
     expect(result.result).toBe('失敗後の追加入力を反映しました')
+    expect(processIds).toHaveLength(1)
     expect(value.store.listJobControls(value.job.id)).toHaveLength(1)
     expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({
       userId: 'UOTHER', kind: 'steer', status: 'observed',

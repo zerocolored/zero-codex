@@ -96,8 +96,8 @@ state dir の `jobs.sqlite3` に、認可済み Slack event を transaction で�
 
 sessionはSlack thread・repository・write modeが同じ場合に最大20 jobまで再利用し、senderは
 session keyに含めません。利用回数はjob retentionとは独立したappend-only台帳で記録し、古いjobをGCしても
-20件上限を再利用しません。実行中jobへの同thread返信はsenderを問わずlive steerとして扱い、active
-jobの固定済み権限で処理します。つまりactive write jobでは同threadのread-only senderにも操作を
+20件上限を再利用しません。実行中jobへの同thread返信はsenderを問わず会話割り込みとして扱い、active
+turnを安全な境界で一時停止してfresh read-only turnから先に回答します。active jobの固定済み権限で処理するため、active write jobでは同threadのread-only senderにも操作を
 委任します。別threadは独立FIFOであり、完了後に作る新jobの権限はそのsenderから改めて判定します。
 
 Claude第五advisorは各roundで`fifth-advisor-<nonce>` workspaceをfresh作成し、そこに一意なClaudeを
@@ -106,8 +106,10 @@ Claude第五advisorは各roundで`fifth-advisor-<nonce>` workspaceをfresh作成
 compare-and-sendの原子的APIはないため、送達後の曖昧な結果では同じpromptを再送しません。
 
 並列 worker はありません。別threadのrequestは全て1本のFIFOです。ただし実行中の同じthreadへの
-認可済み返信は、別userからでも現在turnへ`turn/steer`し、新規jobにしません。完全一致の
-`中止`（mention除去・NFKC正規化後）は先行する未送信steerをdurableに取り消して
+認可済み返信は、別userからでも現在turnを一時停止し、同じCodex threadのfresh read-only turnで
+先に回答するため、新規jobにしません。単なる質問は元taskをそのまま再開し、更新依頼は回答のSlack
+配送後だけdurable inputへ昇格します。完全一致の`中止`（mention除去・NFKC正規化後）は
+先行する未送信controlをdurableに取り消して
 `turn/interrupt`します。App Serverの最終入力barrierが閉じた後も、round専用advisor cleanupとDB terminal確定が
 終わるまでは同threadの完全一致`中止`だけを元jobへdurableに束縛します。barrier後の通常返信は次の
 FIFO入力として保持し、後から`中止`が届いても元jobに束縛されていない返信を削除しません。後発の別threadは現在taskと
@@ -136,10 +138,11 @@ codex <trust-args> -C <repo> \
 - 新規sessionは`thread/start`、継続sessionは`thread/resume`を使います。session IDをZeroちゃん側で
   推測・採番せず、responseのthread ID、物理cwd、OpenAI provider、model、`approvalPolicy: never`、
   named permission profile、AGENTS instruction sourceが全て一致した場合だけ保存します。
-- 実行中の同thread返信は`turn/steer`、完全一致の`中止`は`turn/interrupt`です。各controlは
-  SQLite receiptをJSON writeより先に固定し、曖昧な送達を自動再送しません。
-- write実装またはread-only review中に返信をsteerした場合は、その入力を同じthreadへ記録したうえで
-  現phaseを終了し、fresh read-only準備から再開します。新しい内容を編集前のinvestigation/designなしで
+- 実行中の同thread返信には`turn/steer`で安全な停止markerだけを送り、返信本文は別のfresh read-only
+  `turn/start`へ渡します。完全一致の`中止`は`turn/interrupt`です。各controlはSQLite receiptを
+  JSON writeより先に固定し、曖昧な送達を自動再送しません。
+- write実装またはread-only review中の更新依頼は、回答のSlack配送を確認した後に入力へ昇格し、
+  現phaseを終了してfresh read-only準備から再開します。新しい内容を編集前のinvestigation/designなしで
   実装・公開しません。phaseごとの`prepared → dispatching → acknowledged → observed` receiptと最終sealで、
   process間の入力変更・中止・未処理inboundをfail-closeにします。
 - `turn/completed`までに届いた最後の`agentMessage`だけをbounded projectionへ残し、長いturnの
@@ -257,10 +260,10 @@ Codex stdout/stderr logはfileごとに20MB、解析用memoryは1MB tailへ制�
 - Socket Modeで受信した採用済みthreadの返信は60秒を待たず、現在turnのlive controlとして優先回収
 - human 向け mention だけの雑談は channel policy に従って除外
 - DM follow-up は現在の DM allowlist を再確認
-- senderが変わっても同threadならactive jobへ即時steerし、そのjobの固定済み権限を引き継ぐ
+- senderが変わっても同threadならactive jobを安全に一時停止して先に回答し、そのjobの固定済み権限を引き継ぐ
 - Socket Modeと履歴回収のどちらもdurable handoff後に同じ`eyes`リアクションを付ける
-- 長時間jobは10分、30分、60分、その後60分ごとに同じactive Codex turnへ状況を問い合わせ、
-  markerで束縛した本人の`commentary`だけをdurable通知として同じthreadへ投稿する
+- 監視tabへ投影された本人の`💬 commentary`を発生ごとにdurable通知として同じthreadへ投稿し、
+  固定時刻の状況問い合わせは行わない。未配送commentaryをterminalが追い越すこともない
 - 正常完了時はterminal本文・成果物の配送後に元メッセージへ`white_check_mark`を付け、reactionだけ
   失敗した場合は本文を再投稿せず同じ永続台帳から再試行する
 - Slack本文はアシスタントの一人称で簡潔で温かい日本語と自然な絵文字1〜2個を使い、固定の表示名や内部engine名を出さない

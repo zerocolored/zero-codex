@@ -734,7 +734,7 @@ async function drainInboundDeliveries(): Promise<void> {
               messageId: inbound.messageId,
               attachments,
             })
-          const staged = jobStore.stageLiveControl(target, {
+          const liveInput = {
             chatId: inbound.chatId,
             threadTs: inbound.threadTs,
             messageId: inbound.messageId,
@@ -742,9 +742,11 @@ async function drainInboundDeliveries(): Promise<void> {
             writeEnabled: inbound.writeEnabled,
             task: interrupt ? '中止' : taskFor(),
             attachments: controlAttachments,
-            kind: interrupt ? 'interrupt' : 'steer',
             notifyAccepted: interrupt,
-          })
+          }
+          const staged = interrupt
+            ? jobStore.stageLiveControl(target, { ...liveInput, kind: 'interrupt' })
+            : jobStore.stageLiveInterjection(target, liveInput)
           if (staged !== 'closed') {
             jobStore.completeInboundDelivery(inbound.idempotencyKey)
             continue
@@ -753,7 +755,7 @@ async function drainInboundDeliveries(): Promise<void> {
         // A crash after staging an interrupt closes its target epoch before
         // the inbound row is deleted. On recovery, do not reinterpret that
         // already-durable control as an inactive cancellation or a new FIFO job.
-        if (jobStore.hasJobControl(inbound.idempotencyKey)) {
+        if (jobStore.hasLiveInput(inbound.idempotencyKey)) {
           jobStore.completeInboundDelivery(inbound.idempotencyKey)
           continue
         }

@@ -5,6 +5,8 @@ import { join } from 'path'
 import {
   JobStore,
   SlackNotifier,
+  flushCommentaryNotifications,
+  flushInterjectionNotifications,
   flushLifecycleNotifications,
   flushStatusNotifications,
   flushTerminalNotifications,
@@ -34,7 +36,521 @@ function runningJob(): { root: string; store: JobStore; job: NonNullable<ReturnT
   return { root, store, job }
 }
 
+function stageAnsweredInterjection(
+  store: JobStore,
+  job: NonNullable<ReturnType<JobStore['claimNext']>>,
+  disposition: 'answer-only' | 'task-update',
+) {
+  const target = store.liveControlTarget(job.chatId, job.threadTs)
+  if (!target || !job.workerId) throw new Error('fixture live target is unavailable')
+  expect(store.stageLiveInterjection(target, {
+    chatId: job.chatId,
+    threadTs: job.threadTs,
+    messageId: '1.1',
+    userId: 'U2',
+    task: disposition === 'answer-only' ? '今どこですか？' : '追加条件を反映してください',
+  })).toBe('staged')
+  const interjection = store.listJobInterjections(job.id)[0]!
+  const logicalNonce = 'a'.repeat(32)
+  const threadId = 'thread-1'
+  const originalTurnId = 'turn-original'
+  store.bindAppServerTurn(
+    job.id, job.workerId, job.controlEpoch, logicalNonce, threadId, originalTurnId,
+  )
+  store.beginInterjectionPause({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    executorNonce: logicalNonce,
+    threadId,
+    turnId: originalTurnId,
+    requestId: 10,
+  })
+  store.acknowledgeInterjectionPause(interjection.id, 10, originalTurnId)
+  store.finishAppServerTurn({
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    executorNonce: logicalNonce,
+    threadId,
+    turnId: originalTurnId,
+    retainInput: true,
+  })
+  expect(store.prepareInterjectionAnswer({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    logicalNonce,
+    threadId,
+  })).toBe(`${interjection.id}:answer`)
+  expect(store.beginInterjectionAnswer({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    logicalNonce,
+    threadId,
+    requestId: 11,
+  })).toBe('dispatching')
+  store.acknowledgeInterjectionAnswer({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    workerId: job.workerId,
+    epoch: job.controlEpoch,
+    logicalNonce,
+    threadId,
+    turnId: 'turn-answer',
+    requestId: 11,
+  })
+  expect(store.stageInterjectionAnswer({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    logicalNonce,
+    threadId,
+    turnId: 'turn-answer',
+    disposition,
+    answer: disposition === 'answer-only' ? '確認中です 🔎' : '反映して続けます 🛠️',
+  })).toBe('staged')
+  return store.listJobInterjections(job.id)[0]!
+}
+
+function stageRecoverableInterjection(
+  store: JobStore,
+  job: NonNullable<ReturnType<JobStore['claimNext']>>,
+  targetState: 'answer-prepared' | 'answering' | 'answered' | 'delivered',
+) {
+  const target = store.liveControlTarget(job.chatId, job.threadTs)
+  if (!target || !job.workerId) throw new Error('fixture live target is unavailable')
+  expect(store.stageLiveInterjection(target, {
+    chatId: job.chatId,
+    threadTs: job.threadTs,
+    messageId: '1.9',
+    userId: 'U9',
+    task: 'この追加条件も反映してください',
+  })).toBe('staged')
+  const interjection = store.listJobInterjections(job.id)[0]!
+  const logicalNonce = 'b'.repeat(32)
+  const threadId = 'thread-recovery'
+  const originalTurnId = 'turn-recovery-original'
+  store.bindAppServerTurn(
+    job.id, job.workerId, job.controlEpoch, logicalNonce, threadId, originalTurnId,
+  )
+  store.beginInterjectionPause({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    executorNonce: logicalNonce,
+    threadId,
+    turnId: originalTurnId,
+    requestId: 90,
+  })
+  store.acknowledgeInterjectionPause(interjection.id, 90, originalTurnId)
+  store.finishAppServerTurn({
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    executorNonce: logicalNonce,
+    threadId,
+    turnId: originalTurnId,
+    retainInput: true,
+  })
+  expect(store.prepareInterjectionAnswer({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    logicalNonce,
+    threadId,
+  })).toBe(`${interjection.id}:answer`)
+  if (targetState === 'answer-prepared') return interjection
+
+  expect(store.beginInterjectionAnswer({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    logicalNonce,
+    threadId,
+    requestId: 91,
+  })).toBe('dispatching')
+  if (targetState === 'answering') return interjection
+
+  const answerTurnId = 'turn-recovery-answer'
+  store.acknowledgeInterjectionAnswer({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    workerId: job.workerId,
+    epoch: job.controlEpoch,
+    logicalNonce,
+    threadId,
+    turnId: answerTurnId,
+    requestId: 91,
+  })
+  expect(store.stageInterjectionAnswer({
+    interjectionId: interjection.id,
+    jobId: job.id,
+    epoch: job.controlEpoch,
+    logicalNonce,
+    threadId,
+    turnId: answerTurnId,
+    disposition: 'task-update',
+    answer: '追加条件を反映して続けます 🛠️',
+  })).toBe('staged')
+  if (targetState === 'answered') return interjection
+
+  const notification = store.pendingInterjectionNotifications()[0]
+  if (!notification) throw new Error('fixture interjection notification is unavailable')
+  store.markInterjectionNotificationDelivered(notification.id)
+  return interjection
+}
+
 describe('durable lifecycle notifications', () => {
+  test('interjection回答は同じIDで再送しSlack配送後だけtask-updateへ昇格する', async () => {
+    const { store, job } = runningJob()
+    const interjection = stageAnsweredInterjection(store, job, 'task-update')
+    expect(store.get(job.id)?.inputRevision).toBe(1)
+    expect(store.listJobControls(job.id)).toHaveLength(0)
+    const notificationId = store.pendingInterjectionNotifications()[0]!.id
+    const attempts: string[] = []
+    let first = true
+    const notifier = {
+      status: async (notification: { id: string }) => {
+        attempts.push(notification.id)
+        if (first) {
+          first = false
+          throw new Error('temporary Slack failure')
+        }
+      },
+    }
+    await flushInterjectionNotifications(store, notifier, () => {}, 1)
+    expect(store.get(job.id)?.inputRevision).toBe(1)
+    expect(store.listJobControls(job.id)).toHaveLength(0)
+    expect(store.listJobInterjections(job.id)[0]?.status).toBe('answered')
+    await Bun.sleep(2)
+    await flushInterjectionNotifications(store, notifier, () => {}, 1)
+    expect(attempts).toEqual([notificationId, notificationId])
+    expect(store.listJobInterjections(job.id)[0]?.status).toBe('delivered')
+    expect(store.get(job.id)?.inputRevision).toBe(1)
+    expect(store.promoteDeliveredInterjection(interjection.id)).toBe('task-update')
+    expect(store.get(job.id)?.inputRevision).toBe(2)
+    expect(store.listJobControls(job.id)).toHaveLength(1)
+    expect(store.listJobControls(job.id)[0]).toMatchObject({
+      status: 'observed',
+      inputRevision: 2,
+      task: '追加条件を反映してください',
+    })
+    store.close()
+  })
+
+  test('失敗したjobの未配送interjection回答は投稿せずsupersedeする', () => {
+    const { store, job } = runningJob()
+    stageAnsweredInterjection(store, job, 'task-update')
+    expect(store.pendingInterjectionNotifications()).toHaveLength(1)
+    store.fail(job.id, 'fixture failure')
+    expect(store.pendingInterjectionNotifications()).toEqual([])
+    expect(store.listJobInterjections(job.id)[0]).toMatchObject({
+      status: 'superseded',
+      disposition: 'task-update',
+    })
+    expect(store.pendingTerminalNotifications()).toHaveLength(1)
+    store.close()
+  })
+
+  test('daemon再起動後も生成済みanswer-only回答を同じIDで届けてからfailureを通知する', async () => {
+    const { root, store, job } = runningJob()
+    stageAnsweredInterjection(store, job, 'answer-only')
+    const notificationId = store.pendingInterjectionNotifications()[0]!.id
+    store.close()
+
+    const restarted = new JobStore(join(root, 'state', 'jobs.sqlite3'))
+    expect(restarted.reconcileInterjectionsBeforeRecovery()).toEqual({
+      preparedReset: 0,
+      promoted: 0,
+      blocked: 0,
+    })
+    expect(restarted.recoverInterrupted()).toEqual({
+      requeued: 0,
+      failedWrites: 1,
+      failedUncertain: 0,
+    })
+    expect(restarted.get(job.id)?.status).toBe('failed')
+    expect(restarted.pendingInterjectionNotifications().map(row => row.id))
+      .toEqual([notificationId])
+    expect(restarted.pendingTerminalNotifications()).toEqual([])
+
+    const attempts: string[] = []
+    let first = true
+    const notifier = {
+      status: async (notification: { id: string }) => {
+        attempts.push(notification.id)
+        if (first) {
+          first = false
+          throw new Error('temporary Slack failure')
+        }
+      },
+    }
+    await flushInterjectionNotifications(restarted, notifier, () => {}, 1)
+    expect(restarted.listJobInterjections(job.id)[0]?.status).toBe('answered')
+    expect(restarted.pendingTerminalNotifications()).toEqual([])
+    await Bun.sleep(2)
+    await flushInterjectionNotifications(restarted, notifier, () => {}, 1)
+
+    expect(attempts).toEqual([notificationId, notificationId])
+    expect(restarted.listJobInterjections(job.id)[0]).toMatchObject({
+      status: 'promoted',
+      disposition: 'answer-only',
+    })
+    expect(restarted.pendingTerminalNotifications()).toHaveLength(1)
+    restarted.close()
+  })
+
+  test('exact中止は生成済みだが未配送のinterjection回答を同じtransactionでsupersedeする', () => {
+    const { store, job } = runningJob()
+    stageAnsweredInterjection(store, job, 'answer-only')
+    const notificationId = store.pendingInterjectionNotifications()[0]!.id
+    const target = store.liveControlTarget(job.chatId, job.threadTs)
+    if (!target) throw new Error('fixture live target is unavailable')
+
+    expect(store.stageLiveControl(target, {
+      chatId: job.chatId,
+      threadTs: job.threadTs,
+      messageId: '1.2',
+      userId: 'U3',
+      task: '中止',
+      kind: 'interrupt',
+    })).toBe('staged')
+
+    expect(store.get(job.id)?.cancelRequestedAt).not.toBeNull()
+    expect(store.interjectionNotificationDeliverable(notificationId)).toBe(false)
+    expect(store.pendingInterjectionNotifications()).toEqual([])
+    expect(store.listJobInterjections(job.id)[0]?.status).toBe('superseded')
+    store.close()
+  })
+
+  test('同じthreadの2件目は1件目のSlack配送とpromoteが終わるまで回答を開始しない', () => {
+    const { store, job } = runningJob()
+    const first = stageAnsweredInterjection(store, job, 'answer-only')
+    const target = store.liveControlTarget(job.chatId, job.threadTs)
+    if (!target) throw new Error('fixture live target is unavailable')
+    expect(store.stageLiveInterjection(target, {
+      chatId: job.chatId,
+      threadTs: job.threadTs,
+      messageId: '1.2',
+      userId: 'U3',
+      task: '続けて、あと何分ぐらいですか？',
+    })).toBe('staged')
+
+    const interjections = store.listJobInterjections(job.id)
+    expect(interjections.map(item => item.status)).toEqual(['answered', 'ready'])
+    expect(store.nextReadyLiveInput(job.id, job.controlEpoch)).toBeNull()
+    expect(store.nextPendingInterjection(job.id, job.controlEpoch)).toBeNull()
+    expect(() => store.prepareInterjectionAnswer({
+      interjectionId: interjections[1]!.id,
+      jobId: job.id,
+      epoch: job.controlEpoch,
+      logicalNonce: 'a'.repeat(32),
+      threadId: 'thread-1',
+    })).toThrow('interjection is not ready for an answer')
+
+    const notification = store.pendingInterjectionNotifications()[0]!
+    store.deferInterjectionNotification(notification.id, 'temporary Slack failure', 1_000, 1)
+    expect(store.pendingInterjectionNotifications(1_000)).toEqual([])
+    expect(store.pendingInterjectionNotifications(1_001).map(row => row.id))
+      .toEqual([notification.id])
+    expect(store.nextPendingInterjection(job.id, job.controlEpoch)).toBeNull()
+    store.markInterjectionNotificationDelivered(notification.id)
+    expect(store.nextPendingInterjection(job.id, job.controlEpoch)).toBeNull()
+    expect(store.pendingInterjectionNotifications()).toEqual([])
+    expect(store.promoteDeliveredInterjection(first.id)).toBe('answer-only')
+    expect(store.nextPendingInterjection(job.id, job.controlEpoch)?.messageId).toBe('1.2')
+    store.close()
+  })
+
+  for (const scenario of [
+    { state: 'answer-prepared', reset: 1, promoted: 0, final: 'superseded', revision: 1 },
+    { state: 'answering', reset: 0, promoted: 0, final: 'ambiguous', revision: 1 },
+    { state: 'answered', reset: 0, promoted: 0, final: 'superseded', revision: 1 },
+    { state: 'delivered', reset: 0, promoted: 1, final: 'promoted', revision: 2 },
+  ] as const) {
+    test(`daemon再起動時の${scenario.state} interjectionを重複実行せず安全に閉じる`, () => {
+      const { store, job } = runningJob()
+      stageRecoverableInterjection(store, job, scenario.state)
+      expect(store.listJobInterjections(job.id)[0]?.status).toBe(scenario.state)
+
+      expect(store.reconcileInterjectionsBeforeRecovery()).toEqual({
+        preparedReset: scenario.reset,
+        promoted: scenario.promoted,
+        blocked: 0,
+      })
+      expect(store.recoverInterrupted()).toEqual({
+        requeued: 0,
+        failedWrites: 1,
+        failedUncertain: 0,
+      })
+      expect(store.get(job.id)).toMatchObject({
+        status: 'failed',
+        inputRevision: scenario.revision,
+      })
+      expect(store.listJobInterjections(job.id)[0]?.status).toBe(scenario.final)
+      expect(store.pendingInterjectionNotifications()).toEqual([])
+      expect(store.pendingTerminalNotifications()).toHaveLength(1)
+      if (scenario.state === 'delivered') {
+        expect(store.listJobControls(job.id)).toHaveLength(1)
+      } else {
+        expect(store.listJobControls(job.id)).toHaveLength(0)
+      }
+      store.close()
+    })
+  }
+
+  test('commentaryをFIFOでdurable配送しterminalを追い越さない', async () => {
+    const { store, job } = runningJob()
+    store.activateJobLifecycle(job.id, job.attempts, 1_000)
+    expect(store.stageCommentaryNotification(
+      job.id, job.attempts, 'a'.repeat(64), '💬 原因を確認しています 🔎', 1_100,
+    )).toBe('staged')
+    expect(store.stageCommentaryNotification(
+      job.id, job.attempts, 'b'.repeat(64), '💬 修正内容を検証しています 🧪', 1_200,
+    )).toBe('staged')
+    expect(store.stageCommentaryNotification(
+      job.id, job.attempts, 'a'.repeat(64), '💬 原因を確認しています 🔎', 1_300,
+    )).toBe('duplicate')
+    expect(() => store.stageCommentaryNotification(
+      job.id, job.attempts, 'a'.repeat(64), '💬 別の内容', 1_400,
+    )).toThrow('source identity changed')
+
+    // 開始通知を追い越さず、先頭commentaryだけが配送候補になる。
+    expect(store.pendingCommentaryNotifications(2_000)).toEqual([])
+    const started = store.pendingLifecycleNotifications(2_000)[0]!
+    store.markLifecycleNotificationDelivered(started.id)
+    const firstId = store.pendingCommentaryNotifications(2_000)[0]?.id
+    expect(firstId).toBeTruthy()
+    store.complete(job.id, 'commentary-session', 'done')
+    expect(store.pendingTerminalNotifications(2_000)).toEqual([])
+
+    const delivered: Array<{ id: string; text: string }> = []
+    let attempts = 0
+    const notifier = {
+      progress: async (_job: unknown, text: string, id?: string) => {
+        delivered.push({ id: id ?? '', text })
+        attempts += 1
+        if (attempts === 1) throw new Error('temporary commentary failure')
+      },
+    }
+    await flushCommentaryNotifications(store, notifier, () => {}, 1)
+    expect(store.commentaryNotificationCount()).toBe(2)
+    expect(store.pendingTerminalNotifications()).toEqual([])
+    await Bun.sleep(2)
+    await flushCommentaryNotifications(store, notifier, () => {}, 1)
+    expect(delivered.map(item => item.text)).toEqual([
+      '💬 原因を確認しています 🔎',
+      '💬 原因を確認しています 🔎',
+      '💬 修正内容を検証しています 🧪',
+    ])
+    expect(delivered[0]?.id).toBe(firstId)
+    expect(delivered[1]?.id).toBe(firstId)
+    expect(store.commentaryNotificationCount()).toBe(0)
+    expect(store.pendingTerminalNotifications()).toHaveLength(1)
+    store.close()
+  })
+
+  test('一度のflushでburst commentaryをFIFOのまま全件drainする', async () => {
+    const { store, job } = runningJob()
+    store.activateJobLifecycle(job.id, job.attempts, 1_000)
+    store.markLifecycleNotificationDelivered(
+      store.pendingLifecycleNotifications(1_000)[0]!.id,
+    )
+    const expected = Array.from({ length: 5 }, (_value, index) => (
+      `💬 状況 ${index + 1} を確認しています`
+    ))
+    for (const [index, text] of expected.entries()) {
+      expect(store.stageCommentaryNotification(
+        job.id,
+        job.attempts,
+        String(index + 1).repeat(64),
+        text,
+        1_100 + index,
+      )).toBe('staged')
+    }
+    const delivered: string[] = []
+    await flushCommentaryNotifications(store, {
+      progress: async (_job, text) => { delivered.push(text) },
+    }, () => {})
+    expect(delivered).toEqual(expected)
+    expect(store.commentaryNotificationCount()).toBe(0)
+    store.close()
+  })
+
+  test('大量commentaryは優先通知へ制御を返して次passでFIFOを継続する', async () => {
+    const { store, job } = runningJob()
+    store.activateJobLifecycle(job.id, job.attempts, 1_000)
+    store.markLifecycleNotificationDelivered(
+      store.pendingLifecycleNotifications(1_000)[0]!.id,
+    )
+    const expected = Array.from({ length: 60 }, (_value, index) => (
+      `💬 大量状況 ${index + 1}`
+    ))
+    for (const [index, text] of expected.entries()) {
+      expect(store.stageCommentaryNotification(
+        job.id,
+        job.attempts,
+        (index + 1).toString(16).padStart(64, '0'),
+        text,
+        1_100 + index,
+      )).toBe('staged')
+    }
+    const delivered: string[] = []
+    const notifier = {
+      progress: async (_job: unknown, text: string) => { delivered.push(text) },
+    }
+    expect(await flushCommentaryNotifications(store, notifier, () => {})).toBe(true)
+    expect(delivered).toHaveLength(50)
+    expect(store.commentaryNotificationCount()).toBe(10)
+    expect(await flushCommentaryNotifications(store, notifier, () => {})).toBe(false)
+    expect(delivered).toEqual(expected)
+    expect(store.commentaryNotificationCount()).toBe(0)
+    store.close()
+  })
+
+  test('runnerは投影されたcommentaryを完了報告より前にすべて送る', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerochan-commentary-runner-'))
+    roots.push(root)
+    const repo = join(root, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(root, 'state', 'jobs.sqlite3'))
+    store.enqueue({
+      chatId: 'D1', threadTs: '1.5', messageId: '1.5', userId: 'U1',
+      repoPath: repo, task: 'commentary task', writeEnabled: false,
+    })
+    const events: string[] = []
+    const stats = await runQueuedJobs({
+      store,
+      stopWhenIdle: true,
+      pollMs: 5,
+      notificationRetryMs: 5,
+      notifier: {
+        started: async () => { events.push('started') },
+        progress: async (_job, text) => { events.push(text) },
+        completed: async () => { events.push('completed') },
+      },
+      executor: async (_job, _signal, context) => {
+        expect(context?.reportCommentary({
+          sourceKey: 'c'.repeat(64), text: '💬 一つ目の状況です 🔎',
+        })).toBe(true)
+        expect(context?.reportCommentary({
+          sourceKey: 'd'.repeat(64), text: '💬 二つ目の状況です 🧪',
+        })).toBe(true)
+        return { sessionId: 'commentary-runner-session', result: 'done' }
+      },
+    })
+    expect(stats.completed).toBe(1)
+    expect(events).toEqual([
+      'started',
+      '💬 一つ目の状況です 🔎',
+      '💬 二つ目の状況です 🧪',
+      'completed',
+    ])
+    expect(store.commentaryNotificationCount()).toBe(0)
+    expect(store.terminalNotificationCount()).toBe(0)
+    store.close()
+  })
+
   test('stages start, supersedes stale start/progress, and closes on terminal', () => {
     const { store, job } = runningJob()
     const activatedAt = store.activateJobLifecycle(job.id, job.attempts, 1_000)

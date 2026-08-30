@@ -76,9 +76,10 @@ zerochan-access write deny U0123456789
   write、request に必要な network accessを許可します。
 - job の権限は enqueue 時点で固定します。queue 待ちの途中で設定を変えても、既存 job の権限は
   変わりません。
-- 実行中の同じSlack threadへの返信はsenderが変わってもlive inputです。active jobの権限は途中で
-  変更せず、そのthreadへの参加をactive jobの操作委任とみなすため、read-only senderの返信も
-  write jobへ即時にsteerします。別threadは独立FIFOで、新jobの権限をsenderから判定します。
+- 実行中の同じSlack threadへの返信はsenderが変わっても会話割り込みです。active jobの権限は途中で
+  変更せず、そのthreadへの参加をactive jobの操作委任とみなします。現在turnを安全な境界で一時停止し、
+  fresh read-only turnで先に回答した後、更新依頼だけをSlack配送確認後にactive write jobへ反映します。
+  別threadは独立FIFOで、新jobの権限をsenderから判定します。
   完全一致の`中止`も同じthread-scoped操作として受け付けます。
 - commit、push、deploy、PR は write 許可だけでは自動実行されず、Slack request が求めた範囲に
   限られます。
@@ -95,7 +96,7 @@ zerochan-access write deny U0123456789
 
 - 新しいchannel依頼は、そのSlack Appへのメンションが必要です。
 - いったんそのAppが採用したthreadの人による返信は、senderが変わってもメンション不要です。
-- 実行中の同じthreadへの返信はlive inputとして割り込み、別threadは独立したFIFO jobになります。
+- 実行中の同じthreadへの返信は安全に一時停止して先に回答し、別threadは独立したFIFO jobになります。
 - 招待・最初のlive mentionでchannelを内部記録し、再起動後の履歴回収に使います。
 - 新しいthreadはproject-localの`.zerochan/config.json`で紐付けたprojectへ固定されます。
   `zerochan unset slack-channel <channel-id>`で解除でき、同じchannelを2つのprojectへ重複登録は

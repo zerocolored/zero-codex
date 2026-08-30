@@ -25,14 +25,16 @@ Slack bot
 - 同じ Slack スレッド・repository・write mode では、senderが変わっても Codex の thread ID を最大20 jobまで再利用します。旧 Claude Code の
   待機jobはsession IDを破棄してCodexへ移行し、完了済み履歴のsession IDはCodexへ渡しません。利用回数は
   job本体とは別の永続台帳で数えるため、30日GCで古いjobが消えても20件上限は戻りません。
-- 実行中の同じSlackスレッドへの返信は、別userからでも現在turnへ即時に`turn/steer`します。
+- 実行中の同じSlackスレッドへの返信は、別userからでも現在turnを安全な境界で一時停止し、同じ
+  Codex threadのfresh read-only turnで先に回答してから元のtaskを再開します。回答が単なる質問なら
+  元入力は変えず、更新依頼なら回答がSlackへ届いたことを確認した後だけtask入力へ昇格します。
   完全一致の`中止`（mentionと全角空白は正規化）は`turn/interrupt`です。別スレッドはFIFOのままで、
   実行中に限ってそのスレッド自体を操作権限の境界とするため、返信者個人がread-onlyでもactive write
   jobへ追加入力できます。write権限を共有したくない相手は同じ実行中スレッドへ参加させないでください。
   最終入力barrier後の通常返信は次のFIFO入力として保持し、その後に`中止`が届いても削除しません。
-- 長時間jobでは開始から10分後、30分後、1時間後、その後は1時間ごとに、実行中の同じCodex turnへ
-  状況を問い合わせます。固定stage文や推測の進捗率ではなく、その時点で本人が返した短い日本語の
-  `commentary`だけを同じSlack threadへ再送し、terminal・中止・user返信を常に優先します。
+- 長時間jobでは、Codex本人が監視tabへ出した短い日本語の`💬 commentary`を、その発生ごとに
+  同じSlack threadへFIFOで投稿します。固定時刻の問い合わせ、固定stage文、推測の進捗率は使いません。
+  配送はSQLiteへ先に保存して再試行し、terminalは未配送のcommentaryを追い越しません。
   受付には`eyes`、正常完了時には元メッセージへ`white_check_mark` reactionを付けます。本文は
   Slackアシスタントとして一人称の簡潔で温かい日本語と自然な絵文字1〜2個を使い、固定の表示名や
   内部engine名は表示しません。
@@ -105,9 +107,10 @@ setupとCIはインストール済み公式Codex自身にprotocol型を生成さ
 全`ThreadSourceKind`、`SubAgentActivityKind`のexact shapeも起動前に確認します。互換性が崩れたreleaseでは
 job受付前に停止します。
 
-write実装中またはreview中に同じSlackスレッドから返信が来た場合も、そのactive turnへ即時に
-`turn/steer`します。ただし新しい内容を未設計のままwrite processで実装せず、現在phaseを区切って
-同じCodex threadをfresh read-only準備から再開します。phase開始のJSON write前、応答受領後、最終公開直前の
+write実装中またはreview中に同じSlackスレッドから返信が来た場合も、現在phaseを安全な境界で
+一時停止し、fresh read-only turnでその返信へ先に回答します。更新依頼と判定し、かつ回答をSlackへ
+届けた後だけ入力へ昇格し、新しい内容を未設計のままwrite processで実装せず、同じCodex threadを
+fresh read-only準備から再開します。phase開始のJSON write前、応答受領後、最終公開直前の
 各境界はSQLite receiptへ固定し、入力revision・中止・未処理inboundをtransaction内で再確認します。
 
 ## 必要なもの

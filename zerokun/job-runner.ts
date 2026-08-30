@@ -236,6 +236,54 @@ export interface JobControlRecord {
   observedAt: number | null
 }
 
+export type JobInterjectionStatus =
+  | 'ready' | 'pausing' | 'paused' | 'answer-prepared' | 'answering'
+  | 'answered' | 'delivered' | 'promoted' | 'superseded' | 'ambiguous'
+
+export type JobInterjectionDisposition = 'answer-only' | 'task-update'
+
+/**
+ * A same-thread message is first handled as a conversational interjection.
+ * It is deliberately kept out of the durable task transcript until Codex,
+ * running read-only, classifies it as a task update.
+ */
+export interface JobInterjectionRecord {
+  seq: number
+  id: string
+  idempotencyKey: string
+  jobId: string
+  epoch: number
+  inputRevision: number
+  inputDigest: string
+  kind: 'interjection'
+  chatId: string
+  threadTs: string
+  messageId: string
+  userId: string
+  writeEnabled: boolean
+  task: string
+  attachments: string[]
+  status: JobInterjectionStatus
+  pauseRequestId: number | null
+  pauseExecutorNonce: string | null
+  pauseThreadId: string | null
+  pauseTurnId: string | null
+  answerRequestId: number | null
+  answerLogicalNonce: string | null
+  answerThreadId: string | null
+  answerTurnId: string | null
+  disposition: JobInterjectionDisposition | null
+  answer: string | null
+  notificationId: string | null
+  lastError: string | null
+  createdAt: number
+  pausedAt: number | null
+  answeredAt: number | null
+  deliveredAt: number | null
+}
+
+export type JobLiveInputRecord = JobControlRecord | JobInterjectionRecord
+
 export interface EnqueueInput {
   chatId: string
   threadTs: string
@@ -527,6 +575,22 @@ CREATE TABLE IF NOT EXISTS lifecycle_notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_notifications_pending
   ON lifecycle_notifications(delivered_at, superseded_at, not_before, created_at);
+CREATE TABLE IF NOT EXISTS commentary_notifications (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  source_key TEXT NOT NULL UNIQUE,
+  job_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  not_before INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  delivered_at INTEGER,
+  FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_commentary_notifications_pending
+  ON commentary_notifications(delivered_at, not_before, seq);
 CREATE TABLE IF NOT EXISTS status_notifications (
   id TEXT PRIMARY KEY,
   idempotency_key TEXT NOT NULL UNIQUE,
@@ -646,6 +710,54 @@ CREATE TABLE IF NOT EXISTS job_controls (
 );
 CREATE INDEX IF NOT EXISTS idx_job_controls_ready
   ON job_controls(job_id, control_epoch, status, seq);
+CREATE TABLE IF NOT EXISTS job_interjections (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  job_id TEXT NOT NULL,
+  control_epoch INTEGER NOT NULL,
+  input_revision INTEGER NOT NULL,
+  input_digest TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  write_enabled INTEGER NOT NULL DEFAULT 0 CHECK (write_enabled IN (0, 1)),
+  task TEXT NOT NULL,
+  attachments_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN (
+    'ready', 'pausing', 'paused', 'answer-prepared', 'answering',
+    'answered', 'delivered', 'promoted', 'superseded', 'ambiguous'
+  )),
+  pause_request_id INTEGER,
+  pause_executor_nonce TEXT,
+  pause_thread_id TEXT,
+  pause_turn_id TEXT,
+  answer_request_id INTEGER,
+  answer_logical_nonce TEXT,
+  answer_thread_id TEXT,
+  answer_turn_id TEXT,
+  disposition TEXT CHECK (disposition IS NULL OR disposition IN ('answer-only', 'task-update')),
+  answer_payload TEXT,
+  notification_id TEXT UNIQUE,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  not_before INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  pause_dispatched_at INTEGER,
+  pause_acknowledged_at INTEGER,
+  paused_at INTEGER,
+  answer_prepared_at INTEGER,
+  answer_dispatched_at INTEGER,
+  answer_acknowledged_at INTEGER,
+  answered_at INTEGER,
+  delivered_at INTEGER,
+  FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_job_interjections_ready
+  ON job_interjections(job_id, control_epoch, status, seq);
+CREATE INDEX IF NOT EXISTS idx_job_interjections_notifications
+  ON job_interjections(delivered_at, not_before, answered_at);
 CREATE TABLE IF NOT EXISTS job_initial_dispatches (
   job_id TEXT NOT NULL,
   attempt INTEGER NOT NULL,
@@ -1288,6 +1400,42 @@ type JobControlRow = {
   observed_at: number | null
 }
 
+type JobInterjectionRow = {
+  seq: number
+  id: string
+  idempotency_key: string
+  job_id: string
+  control_epoch: number
+  input_revision: number
+  input_digest: string
+  chat_id: string
+  thread_ts: string
+  message_id: string
+  user_id: string
+  write_enabled: number
+  task: string
+  attachments_json: string
+  status: JobInterjectionStatus
+  pause_request_id: number | null
+  pause_executor_nonce: string | null
+  pause_thread_id: string | null
+  pause_turn_id: string | null
+  answer_request_id: number | null
+  answer_logical_nonce: string | null
+  answer_thread_id: string | null
+  answer_turn_id: string | null
+  disposition: JobInterjectionDisposition | null
+  answer_payload: string | null
+  notification_id: string | null
+  attempts: number
+  not_before: number | null
+  last_error: string | null
+  created_at: number
+  paused_at: number | null
+  answered_at: number | null
+  delivered_at: number | null
+}
+
 function mapControlRow(row: JobControlRow): JobControlRecord {
   return {
     seq: row.seq,
@@ -1315,6 +1463,43 @@ function mapControlRow(row: JobControlRow): JobControlRecord {
     dispatchedAt: row.dispatched_at,
     acknowledgedAt: row.acknowledged_at,
     observedAt: row.observed_at,
+  }
+}
+
+function mapInterjectionRow(row: JobInterjectionRow): JobInterjectionRecord {
+  return {
+    seq: row.seq,
+    id: row.id,
+    idempotencyKey: row.idempotency_key,
+    jobId: row.job_id,
+    epoch: row.control_epoch,
+    inputRevision: row.input_revision,
+    inputDigest: row.input_digest,
+    kind: 'interjection',
+    chatId: row.chat_id,
+    threadTs: row.thread_ts,
+    messageId: row.message_id,
+    userId: row.user_id,
+    writeEnabled: row.write_enabled === 1,
+    task: row.task,
+    attachments: parseAttachments(row.attachments_json),
+    status: row.status,
+    pauseRequestId: row.pause_request_id,
+    pauseExecutorNonce: row.pause_executor_nonce,
+    pauseThreadId: row.pause_thread_id,
+    pauseTurnId: row.pause_turn_id,
+    answerRequestId: row.answer_request_id,
+    answerLogicalNonce: row.answer_logical_nonce,
+    answerThreadId: row.answer_thread_id,
+    answerTurnId: row.answer_turn_id,
+    disposition: row.disposition,
+    answer: row.answer_payload,
+    notificationId: row.notification_id,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    pausedAt: row.paused_at,
+    answeredAt: row.answered_at,
+    deliveredAt: row.delivered_at,
   }
 }
 
@@ -1625,6 +1810,7 @@ export class JobStore {
           EXISTS(SELECT 1 FROM jobs)
           OR EXISTS(SELECT 1 FROM inbound_deliveries)
           OR EXISTS(SELECT 1 FROM job_controls)
+          OR EXISTS(SELECT 1 FROM job_interjections)
           OR EXISTS(SELECT 1 FROM delivery_tombstones)
           OR EXISTS(SELECT 1 FROM update_request_ledger)
           OR EXISTS(SELECT 1 FROM slack_threads)
@@ -1889,11 +2075,12 @@ export class JobStore {
         'SELECT 1 AS present FROM delivery_tombstones WHERE idempotency_key = ?',
       ).get(idempotencyKey)
       if (retained) return 'duplicate' as const
-      const completedHandoff = this.db.query<{ present: number }, [string, string]>(
+      const completedHandoff = this.db.query<{ present: number }, [string, string, string]>(
         `SELECT 1 AS present FROM jobs WHERE idempotency_key = ?
          UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = ?
+         UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
          LIMIT 1`,
-      ).get(idempotencyKey, idempotencyKey)
+      ).get(idempotencyKey, idempotencyKey, idempotencyKey)
       if (completedHandoff) return 'duplicate' as const
 
       let boundJobId: string | null = null
@@ -1960,15 +2147,16 @@ export class JobStore {
   hasDurableEvent(idempotencyKey: string): boolean {
     const key = requireText(idempotencyKey, 'idempotencyKey')
     return retrySqlite(() => this.db.query<
-      { present: number }, [string, string, string, string, string]
+      { present: number }, [string, string, string, string, string, string]
     >(
       `SELECT 1 AS present FROM inbound_deliveries WHERE idempotency_key = ?
        UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = ?
        UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = ?
+       UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
        UNION ALL SELECT 1 FROM delivery_tombstones WHERE idempotency_key = ?
        UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = ?
        LIMIT 1`,
-    ).get(key, key, key, key, key) !== null)
+    ).get(key, key, key, key, key, key) !== null)
   }
 
   readSlackReadCursor(scope: SlackReadCursorScope, cursorKey: string): SlackReadCursor | null {
@@ -2011,15 +2199,16 @@ export class JobStore {
     const commit = this.db.transaction(() => {
       for (const eventKey of eventKeys) {
         const durable = this.db.query<
-          { present: number }, [string, string, string, string, string]
+          { present: number }, [string, string, string, string, string, string]
         >(
           `SELECT 1 AS present FROM inbound_deliveries WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = ?
+           UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM delivery_tombstones WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = ?
            LIMIT 1`,
-        ).get(eventKey, eventKey, eventKey, eventKey, eventKey)
+        ).get(eventKey, eventKey, eventKey, eventKey, eventKey, eventKey)
         if (!durable) return false
       }
       this.db.run(
@@ -2313,15 +2502,16 @@ export class JobStore {
     const commit = this.db.transaction(() => {
       for (const eventKey of eventKeys) {
         if (!this.db.query<
-          { present: number }, [string, string, string, string, string]
+          { present: number }, [string, string, string, string, string, string]
         >(
           `SELECT 1 AS present FROM inbound_deliveries WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = ?
+           UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM delivery_tombstones WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = ?
            LIMIT 1`,
-        ).get(eventKey, eventKey, eventKey, eventKey, eventKey)) return false
+        ).get(eventKey, eventKey, eventKey, eventKey, eventKey, eventKey)) return false
       }
       if (nextCursor === null) {
         return this.db.run('DELETE FROM slack_reply_scans WHERE scan_key = ?', [key]).changes === 1
@@ -2659,11 +2849,12 @@ export class JobStore {
       // The same Slack delivery can be observed again after the inbound row
       // was handed off to `jobs` but before that row was deleted. Never let
       // the already-running root request re-enter its own thread as a steer.
-      if (this.db.query<{ present: number }, [string, string]>(
+      if (this.db.query<{ present: number }, [string, string, string]>(
         `SELECT 1 AS present FROM job_controls WHERE idempotency_key = ?
+         UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
          UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = ?
          LIMIT 1`,
-      ).get(key, key)) return 'duplicate'
+      ).get(key, key, key)) return 'duplicate'
       const target = this.db.query<{
         accepts_control: number
         control_epoch: number
@@ -2720,6 +2911,13 @@ export class JobStore {
           `UPDATE job_controls SET status = 'superseded',
              last_error = 'superseded by a later Slack interrupt'
            WHERE job_id = ? AND control_epoch = ? AND kind = 'steer' AND status = 'ready'`,
+          [jobId, epoch],
+        )
+        this.db.run(
+          `UPDATE job_interjections SET status = 'superseded',
+             last_error = 'superseded by a later Slack interrupt'
+           WHERE job_id = ? AND control_epoch = ?
+             AND status IN ('ready', 'paused', 'answer-prepared', 'answered')`,
           [jobId, epoch],
         )
         const closed = this.db.run(
@@ -2785,6 +2983,14 @@ export class JobStore {
         [snapshot.digest, controlId],
       )
       if (digested.changes !== 1) throw new Error(`control input digest was not fixed: ${controlId}`)
+      if (input.kind === 'steer') {
+        this.db.run(
+          `UPDATE job_interjections SET input_revision = ?, input_digest = ?
+           WHERE job_id = ? AND control_epoch = ?
+             AND status IN ('ready', 'paused', 'answer-prepared')`,
+          [snapshot.revision, snapshot.digest, jobId, epoch],
+        )
+      }
       if (input.kind === 'interrupt' && input.notifyAccepted) {
         this.stageStatusNotificationRow({
           idempotencyKey: `interrupt-accepted:${key}`,
@@ -2813,6 +3019,105 @@ export class JobStore {
     return retrySqlite(() => stage.immediate())
   }
 
+  stageLiveInterjection(
+    expected: LiveControlTarget,
+    input: Omit<LiveControlInput, 'kind'>,
+  ): 'staged' | 'duplicate' | 'closed' {
+    const jobId = requireText(expected.jobId, 'jobId')
+    const epoch = Math.floor(expected.epoch)
+    if (!Number.isSafeInteger(epoch) || epoch < 1) throw new Error('control epoch is invalid')
+    const chatId = requireText(input.chatId, 'chatId')
+    const threadTs = requireText(input.threadTs, 'threadTs')
+    const messageId = requireText(input.messageId, 'messageId')
+    const userId = requireText(input.userId, 'userId')
+    const task = requireText(input.task, 'task')
+    const attachments = (input.attachments ?? []).map(path => requireText(path, 'attachment'))
+    const key = `${chatId}:${messageId}`
+    const stage = this.db.transaction((): 'staged' | 'duplicate' | 'closed' => {
+      if (this.db.query<{ present: number }, [string, string, string]>(
+        `SELECT 1 AS present FROM job_controls WHERE idempotency_key = ?
+         UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
+         UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = ?
+         LIMIT 1`,
+      ).get(key, key, key)) return 'duplicate'
+      const target = this.db.query<{
+        accepts_control: number
+        control_epoch: number
+        input_revision: number
+        chat_id: string
+        thread_ts: string
+        status: JobStatus
+        cancel_requested_at: number | null
+        id: string
+        message_id: string
+        user_id: string
+        write_enabled: number
+        task: string
+        attachments_json: string
+      }, [string]>(
+        `SELECT accepts_control, control_epoch, input_revision, chat_id, thread_ts,
+                status, cancel_requested_at, id, message_id, user_id, write_enabled,
+                task, attachments_json
+         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+      ).get(jobId)
+      if (!target || target.control_epoch !== epoch
+        || target.chat_id !== chatId || target.thread_ts !== threadTs
+        || !(target.status === 'running' || target.status === 'queued')
+        || target.accepts_control !== 1 || target.cancel_requested_at !== null) return 'closed'
+      const snapshotControls = this.db.query<{
+        input_revision: number
+        message_id: string
+        user_id: string
+        write_enabled: number
+        task: string
+        attachments_json: string
+      }, [string]>(
+        `SELECT input_revision, message_id, user_id, write_enabled, task, attachments_json
+         FROM job_controls WHERE job_id = ? AND kind = 'steer'
+         ORDER BY input_revision ASC, seq ASC`,
+      ).all(jobId)
+      const snapshot = createAdvisorInputSnapshot(target, snapshotControls)
+      if (snapshot.revision !== target.input_revision) {
+        throw new Error(`interjection input revision changed for ${jobId}`)
+      }
+      const now = Date.now()
+      const inserted = this.db.run(
+        `INSERT OR IGNORE INTO job_interjections (
+           id, idempotency_key, job_id, control_epoch, input_revision, input_digest,
+           chat_id, thread_ts, message_id, user_id, write_enabled, task,
+           attachments_json, status, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)`,
+        [
+          randomUUID(), key, jobId, epoch, snapshot.revision, snapshot.digest,
+          chatId, threadTs, messageId, userId, input.writeEnabled ? 1 : 0,
+          task, JSON.stringify(attachments), now,
+        ],
+      )
+      if (inserted.changes !== 1) return 'duplicate'
+      this.db.run(
+        `UPDATE lifecycle_notifications SET superseded_at = COALESCE(superseded_at, ?)
+         WHERE job_id = ? AND attempt = (SELECT attempts FROM jobs WHERE id = ?)
+           AND kind = 'progress' AND delivered_at IS NULL AND superseded_at IS NULL`,
+        [now, jobId, jobId],
+      )
+      this.db.run(
+        `UPDATE progress_probes SET superseded_at = COALESCE(superseded_at, ?)
+         WHERE job_id = ? AND attempt = (SELECT attempts FROM jobs WHERE id = ?)
+           AND reported_at IS NULL AND superseded_at IS NULL`,
+        [now, jobId, jobId],
+      )
+      return 'staged'
+    })
+    return retrySqlite(() => stage.immediate())
+  }
+
+  listJobInterjections(jobIdInput: string): JobInterjectionRecord[] {
+    const jobId = requireText(jobIdInput, 'jobId')
+    return retrySqlite(() => this.db.query<JobInterjectionRow, [string]>(
+      'SELECT * FROM job_interjections WHERE job_id = ? ORDER BY seq ASC',
+    ).all(jobId).map(mapInterjectionRow))
+  }
+
   listJobControls(jobIdInput: string): JobControlRecord[] {
     const jobId = requireText(jobIdInput, 'jobId')
     return retrySqlite(() => this.db.query<JobControlRow, [string]>(
@@ -2826,12 +3131,28 @@ export class JobStore {
     ).get(requireText(idempotencyKeyInput, 'idempotencyKey')) !== null)
   }
 
+  hasLiveInput(idempotencyKeyInput: string): boolean {
+    const key = requireText(idempotencyKeyInput, 'idempotencyKey')
+    return retrySqlite(() => this.db.query<{ present: number }, [string, string]>(
+      `SELECT 1 AS present FROM job_controls WHERE idempotency_key = ?
+       UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
+       LIMIT 1`,
+    ).get(key, key) !== null)
+  }
+
   controlMayHaveBeenDelivered(jobIdInput: string): boolean {
-    return retrySqlite(() => this.db.query<{ present: number }, [string]>(
+    const jobId = requireText(jobIdInput, 'jobId')
+    return retrySqlite(() => this.db.query<{ present: number }, [string, string]>(
       `SELECT 1 AS present FROM job_controls
        WHERE job_id = ? AND status IN ('dispatching', 'acknowledged', 'observed', 'ambiguous')
+       UNION ALL
+       SELECT 1 AS present FROM job_interjections
+       WHERE job_id = ? AND status IN (
+         'pausing', 'paused', 'answer-prepared', 'answering',
+         'answered', 'delivered', 'promoted', 'ambiguous'
+       )
        LIMIT 1`,
-    ).get(requireText(jobIdInput, 'jobId')) !== null)
+    ).get(jobId, jobId) !== null)
   }
 
   nextReadyControl(jobIdInput: string, epochInput: number): JobControlRecord | null {
@@ -2848,6 +3169,70 @@ export class JobStore {
                 controls.seq ASC LIMIT 1`,
     ).get(jobId, epoch))
     return row ? mapControlRow(row) : null
+  }
+
+  nextReadyLiveInput(jobIdInput: string, epochInput: number): JobLiveInputRecord | null {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const epoch = Math.floor(epochInput)
+    const interrupt = retrySqlite(() => this.db.query<JobControlRow, [string, number]>(
+      `SELECT controls.* FROM job_controls controls
+       JOIN jobs ON jobs.id = controls.job_id
+       WHERE controls.job_id = ? AND controls.control_epoch = ?
+         AND controls.kind = 'interrupt' AND controls.status = 'ready'
+         AND (controls.turn_id IS NULL OR jobs.active_turn_id IS NULL
+           OR controls.turn_id <> jobs.active_turn_id)
+       ORDER BY controls.seq ASC LIMIT 1`,
+    ).get(jobId, epoch))
+    if (interrupt) return mapControlRow(interrupt)
+    const [control, interjection] = retrySqlite(() => [
+      this.db.query<JobControlRow, [string, number]>(
+        `SELECT controls.* FROM job_controls controls
+         JOIN jobs ON jobs.id = controls.job_id
+         WHERE controls.job_id = ? AND controls.control_epoch = ?
+           AND controls.kind = 'steer' AND controls.status = 'ready'
+           AND (controls.turn_id IS NULL OR jobs.active_turn_id IS NULL
+             OR controls.turn_id <> jobs.active_turn_id)
+         ORDER BY controls.created_at ASC, controls.seq ASC LIMIT 1`,
+      ).get(jobId, epoch),
+      this.db.query<JobInterjectionRow, [string, number]>(
+        `SELECT current.* FROM job_interjections AS current
+         WHERE current.job_id = ? AND current.control_epoch = ? AND current.status = 'ready'
+           AND NOT EXISTS (
+             SELECT 1 FROM job_interjections AS prior
+             WHERE prior.job_id = current.job_id
+               AND prior.control_epoch = current.control_epoch
+               AND prior.seq < current.seq
+               AND prior.status NOT IN ('promoted', 'superseded')
+           )
+         ORDER BY created_at ASC, seq ASC LIMIT 1`,
+      ).get(jobId, epoch),
+    ])
+    if (!control) return interjection ? mapInterjectionRow(interjection) : null
+    if (!interjection) return mapControlRow(control)
+    if (interjection.created_at < control.created_at
+      || (interjection.created_at === control.created_at && interjection.id < control.id)) {
+      return mapInterjectionRow(interjection)
+    }
+    return mapControlRow(control)
+  }
+
+  nextPendingInterjection(jobIdInput: string, epochInput: number): JobInterjectionRecord | null {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const epoch = Math.floor(epochInput)
+    const row = retrySqlite(() => this.db.query<JobInterjectionRow, [string, number]>(
+      `SELECT current.* FROM job_interjections AS current
+       WHERE current.job_id = ? AND current.control_epoch = ?
+         AND current.status IN ('ready', 'paused')
+         AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS prior
+           WHERE prior.job_id = current.job_id
+             AND prior.control_epoch = current.control_epoch
+             AND prior.seq < current.seq
+             AND prior.status NOT IN ('promoted', 'superseded')
+         )
+       ORDER BY current.seq ASC LIMIT 1`,
+    ).get(jobId, epoch))
+    return row ? mapInterjectionRow(row) : null
   }
 
   bindAppServerTurn(
@@ -3138,7 +3523,7 @@ export class JobStore {
         `SELECT executor_nonce, active_thread_id, active_turn_id, cancel_requested_at,
                 input_revision
          FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
-           AND attempts = ? AND control_epoch = ? AND write_enabled = 1`,
+           AND attempts = ? AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.attempt), Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.logicalNonce
         || job.active_thread_id !== options.threadId || job.active_turn_id !== null) {
@@ -3208,7 +3593,7 @@ export class JobStore {
                 cancel_requested_at, chat_id, thread_ts, executor_nonce,
                 active_thread_id, active_turn_id
          FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
-           AND attempts = ? AND control_epoch = ? AND write_enabled = 1`,
+           AND attempts = ? AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.attempt), Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.logicalNonce
         || job.active_thread_id !== options.threadId || job.active_turn_id !== null) {
@@ -3220,6 +3605,12 @@ export class JobStore {
          WHERE chat_id = ? AND thread_ts = ?`,
       ).get(job.chat_id, job.thread_ts)?.count ?? 0
       if (pendingInbound > 0) return 'pending-inbound' as const
+      const pendingInterjections = this.db.query<{ count: number }, [string, number]>(
+        `SELECT COUNT(*) AS count FROM job_interjections
+         WHERE job_id = ? AND control_epoch = ?
+           AND status NOT IN ('promoted', 'superseded')`,
+      ).get(options.jobId, Math.floor(options.epoch))?.count ?? 0
+      if (pendingInterjections > 0) return 'pending-inbound' as const
       const controls = this.db.query<{
         input_revision: number
         message_id: string
@@ -3470,6 +3861,357 @@ export class JobStore {
     }
   }
 
+  beginInterjectionPause(options: {
+    interjectionId: string
+    jobId: string
+    epoch: number
+    executorNonce: string
+    threadId: string
+    turnId: string
+    requestId: number
+  }): void {
+    if (!Number.isSafeInteger(options.requestId) || options.requestId < 1) {
+      throw new Error('App Server request id is invalid')
+    }
+    const dispatch = this.db.transaction(() => {
+      const binding = this.db.query<{
+        executor_nonce: string | null
+        active_thread_id: string | null
+        active_turn_id: string | null
+        cancel_requested_at: number | null
+      }, [string, number]>(
+        `SELECT executor_nonce, active_thread_id, active_turn_id, cancel_requested_at
+         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND control_epoch = ?`,
+      ).get(options.jobId, Math.floor(options.epoch))
+      if (!binding || binding.cancel_requested_at !== null
+        || binding.executor_nonce !== options.executorNonce
+        || binding.active_thread_id !== options.threadId
+        || binding.active_turn_id !== options.turnId) return false
+      return this.db.run(
+        `UPDATE job_interjections SET status = 'pausing', pause_request_id = ?,
+           pause_executor_nonce = ?, pause_thread_id = ?, pause_turn_id = ?,
+           pause_dispatched_at = ?, last_error = NULL
+         WHERE id = ? AND job_id = ? AND control_epoch = ? AND status = 'ready'`,
+        [
+          options.requestId, options.executorNonce, options.threadId, options.turnId,
+          Date.now(), options.interjectionId, options.jobId, Math.floor(options.epoch),
+        ],
+      ).changes === 1
+    })
+    if (!retrySqlite(() => dispatch.immediate())) {
+      throw new Error(`interjection pause binding changed for ${options.interjectionId}`)
+    }
+  }
+
+  acknowledgeInterjectionPause(
+    interjectionIdInput: string,
+    requestId: number,
+    turnIdInput: string,
+  ): void {
+    const updated = retrySqlite(() => this.db.run(
+      `UPDATE job_interjections SET pause_turn_id = ?, pause_acknowledged_at = ?
+       WHERE id = ? AND status = 'pausing' AND pause_request_id = ?`,
+      [
+        requireText(turnIdInput, 'turnId'), Date.now(),
+        requireText(interjectionIdInput, 'interjectionId'), requestId,
+      ],
+    ))
+    if (updated.changes !== 1) {
+      throw new Error(`interjection pause acknowledgement changed for ${interjectionIdInput}`)
+    }
+  }
+
+  markInterjectionAmbiguous(interjectionIdInput: string, error: string): void {
+    const id = requireText(interjectionIdInput, 'interjectionId')
+    const updated = retrySqlite(() => this.db.run(
+      `UPDATE job_interjections SET status = 'ambiguous', last_error = ?
+       WHERE id = ? AND status IN ('pausing', 'answering')`,
+      [requireText(error, 'interjectionError').slice(0, 4_000), id],
+    ))
+    if (updated.changes !== 1) {
+      const current = this.db.query<{ status: JobInterjectionStatus }, [string]>(
+        'SELECT status FROM job_interjections WHERE id = ?',
+      ).get(id)
+      if (current?.status !== 'ambiguous') {
+        throw new Error(`interjection ambiguity could not be persisted for ${id}`)
+      }
+    }
+  }
+
+  rejectInterjectionAnswer(options: {
+    interjectionId: string
+    requestId: number
+    logicalNonce: string
+    threadId: string
+    error: string
+  }): void {
+    const updated = retrySqlite(() => this.db.run(
+      `UPDATE job_interjections
+       SET status = CASE WHEN paused_at IS NULL THEN 'ready' ELSE 'paused' END,
+           answer_request_id = NULL, answer_logical_nonce = NULL,
+           answer_thread_id = NULL, answer_turn_id = NULL,
+           answer_prepared_at = NULL, answer_dispatched_at = NULL,
+           answer_acknowledged_at = NULL, last_error = ?
+       WHERE id = ? AND status = 'answering' AND answer_request_id = ?
+         AND answer_logical_nonce = ? AND answer_thread_id = ?
+         AND answer_turn_id IS NULL`,
+      [
+        requireText(options.error, 'interjectionError').slice(0, 4_000),
+        requireText(options.interjectionId, 'interjectionId'),
+        options.requestId,
+        requireText(options.logicalNonce, 'logicalNonce'),
+        requireText(options.threadId, 'threadId'),
+      ],
+    ))
+    if (updated.changes !== 1) {
+      throw new Error(`interjection answer rejection changed for ${options.interjectionId}`)
+    }
+  }
+
+  deferInterjectionPause(options: {
+    interjectionId: string
+    requestId: number
+    executorNonce: string
+    threadId: string
+    turnId: string
+    error: string
+  }): void {
+    const updated = retrySqlite(() => this.db.run(
+      `UPDATE job_interjections SET status = 'ready', last_error = ?,
+         pause_request_id = NULL, pause_executor_nonce = NULL,
+         pause_thread_id = NULL, pause_turn_id = NULL,
+         pause_dispatched_at = NULL, pause_acknowledged_at = NULL
+       WHERE id = ? AND status = 'pausing' AND pause_request_id = ?
+         AND pause_executor_nonce = ? AND pause_thread_id = ? AND pause_turn_id = ?`,
+      [
+        requireText(options.error, 'interjectionError').slice(0, 4_000),
+        requireText(options.interjectionId, 'interjectionId'), options.requestId,
+        requireText(options.executorNonce, 'executorNonce'),
+        requireText(options.threadId, 'threadId'), requireText(options.turnId, 'turnId'),
+      ],
+    ))
+    if (updated.changes !== 1) {
+      throw new Error(`interjection pause deferral changed for ${options.interjectionId}`)
+    }
+  }
+
+  prepareInterjectionAnswer(options: {
+    interjectionId: string
+    jobId: string
+    epoch: number
+    logicalNonce: string
+    threadId: string
+  }): string | 'cancelled' | 'input-changed' {
+    const clientUserMessageId = `${requireText(options.interjectionId, 'interjectionId')}:answer`
+    const prepare = this.db.transaction(() => {
+      const job = this.db.query<{
+        input_revision: number
+        cancel_requested_at: number | null
+        executor_nonce: string | null
+        active_thread_id: string | null
+        active_turn_id: string | null
+      }, [string, number]>(
+        `SELECT input_revision, cancel_requested_at, executor_nonce,
+                active_thread_id, active_turn_id
+         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND control_epoch = ?`,
+      ).get(options.jobId, Math.floor(options.epoch))
+      if (!job || job.executor_nonce !== options.logicalNonce
+        || job.active_thread_id !== options.threadId || job.active_turn_id !== null) {
+        throw new Error(`interjection answer boundary changed for ${options.interjectionId}`)
+      }
+      if (job.cancel_requested_at !== null) return 'cancelled' as const
+      const row = this.db.query<JobInterjectionRow, [string, string, number]>(
+        `SELECT current.* FROM job_interjections AS current
+         WHERE current.id = ? AND current.job_id = ? AND current.control_epoch = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM job_interjections AS prior
+             WHERE prior.job_id = current.job_id
+               AND prior.control_epoch = current.control_epoch
+               AND prior.seq < current.seq
+               AND prior.status NOT IN ('promoted', 'superseded')
+           )`,
+      ).get(options.interjectionId, options.jobId, Math.floor(options.epoch))
+      if (!row || !['ready', 'paused'].includes(row.status)) {
+        throw new Error(`interjection is not ready for an answer: ${options.interjectionId}`)
+      }
+      if (row.input_revision !== job.input_revision) return 'input-changed' as const
+      const updated = this.db.run(
+        `UPDATE job_interjections SET status = 'answer-prepared',
+           answer_logical_nonce = ?, answer_thread_id = ?, answer_prepared_at = ?,
+           answer_request_id = NULL, answer_turn_id = NULL, last_error = NULL
+         WHERE id = ? AND status IN ('ready', 'paused')`,
+        [options.logicalNonce, options.threadId, Date.now(), options.interjectionId],
+      )
+      if (updated.changes !== 1) {
+        throw new Error(`interjection answer receipt was not prepared: ${options.interjectionId}`)
+      }
+      return 'prepared' as const
+    })
+    const result = retrySqlite(() => prepare.immediate())
+    return result === 'prepared' ? clientUserMessageId : result
+  }
+
+  beginInterjectionAnswer(options: {
+    interjectionId: string
+    jobId: string
+    epoch: number
+    logicalNonce: string
+    threadId: string
+    requestId: number
+  }): 'dispatching' | 'cancelled' | 'input-changed' {
+    const begin = this.db.transaction(() => {
+      const job = this.db.query<{
+        input_revision: number
+        cancel_requested_at: number | null
+        executor_nonce: string | null
+        active_thread_id: string | null
+        active_turn_id: string | null
+      }, [string, number]>(
+        `SELECT input_revision, cancel_requested_at, executor_nonce,
+                active_thread_id, active_turn_id
+         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND control_epoch = ?`,
+      ).get(options.jobId, Math.floor(options.epoch))
+      if (!job || job.executor_nonce !== options.logicalNonce
+        || job.active_thread_id !== options.threadId || job.active_turn_id !== null) {
+        throw new Error(`interjection answer dispatch boundary changed for ${options.interjectionId}`)
+      }
+      if (job.cancel_requested_at !== null) return 'cancelled' as const
+      const row = this.db.query<{ input_revision: number }, [string, string, string]>(
+        `SELECT input_revision FROM job_interjections
+         WHERE id = ? AND status = 'answer-prepared' AND answer_logical_nonce = ?
+           AND answer_thread_id = ?`,
+      ).get(options.interjectionId, options.logicalNonce, options.threadId)
+      if (!row) throw new Error(`interjection answer receipt changed: ${options.interjectionId}`)
+      if (row.input_revision !== job.input_revision) return 'input-changed' as const
+      const updated = this.db.run(
+        `UPDATE job_interjections SET status = 'answering', answer_request_id = ?,
+           answer_dispatched_at = ?
+         WHERE id = ? AND status = 'answer-prepared'`,
+        [options.requestId, Date.now(), options.interjectionId],
+      )
+      if (updated.changes !== 1) {
+        throw new Error(`interjection answer dispatch changed: ${options.interjectionId}`)
+      }
+      return 'dispatching' as const
+    })
+    return retrySqlite(() => begin.immediate())
+  }
+
+  acknowledgeInterjectionAnswer(options: {
+    interjectionId: string
+    jobId: string
+    workerId: string
+    epoch: number
+    logicalNonce: string
+    threadId: string
+    turnId: string
+    requestId: number
+  }): void {
+    const acknowledge = this.db.transaction(() => {
+      const now = Date.now()
+      const receipt = this.db.run(
+        `UPDATE job_interjections SET answer_turn_id = ?, answer_acknowledged_at = ?
+         WHERE id = ? AND job_id = ? AND control_epoch = ? AND status = 'answering'
+           AND answer_request_id = ? AND answer_logical_nonce = ? AND answer_thread_id = ?`,
+        [
+          options.turnId, now, options.interjectionId, options.jobId,
+          Math.floor(options.epoch), options.requestId, options.logicalNonce, options.threadId,
+        ],
+      )
+      if (receipt.changes !== 1) {
+        throw new Error(`interjection answer acknowledgement changed: ${options.interjectionId}`)
+      }
+      const binding = this.db.run(
+        `UPDATE jobs SET active_turn_id = ?
+         WHERE id = ? AND runtime = 'codex' AND status = 'running' AND worker_id = ?
+           AND control_epoch = ? AND executor_nonce = ? AND active_thread_id = ?
+           AND active_turn_id IS NULL`,
+        [
+          options.turnId, options.jobId, requireText(options.workerId, 'workerId'),
+          Math.floor(options.epoch), options.logicalNonce, options.threadId,
+        ],
+      )
+      if (binding.changes !== 1) {
+        throw new Error(`interjection answer turn binding changed: ${options.interjectionId}`)
+      }
+    })
+    retrySqlite(() => acknowledge.immediate())
+  }
+
+  stageInterjectionAnswer(options: {
+    interjectionId: string
+    jobId: string
+    epoch: number
+    logicalNonce: string
+    threadId: string
+    turnId: string
+    disposition: JobInterjectionDisposition
+    answer: string
+  }): 'staged' | 'duplicate' | 'cancelled' {
+    const answer = requireText(options.answer, 'interjectionAnswer')
+    if (answer.length > 12_000) throw new Error('interjection answer is too long')
+    const stage = this.db.transaction(() => {
+      const job = this.db.query<{
+        cancel_requested_at: number | null
+        executor_nonce: string | null
+        active_thread_id: string | null
+        active_turn_id: string | null
+      }, [string, number]>(
+        `SELECT cancel_requested_at, executor_nonce, active_thread_id, active_turn_id
+         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND control_epoch = ?`,
+      ).get(options.jobId, Math.floor(options.epoch))
+      if (!job || job.executor_nonce !== options.logicalNonce
+        || job.active_thread_id !== options.threadId || job.active_turn_id !== options.turnId) {
+        throw new Error(`interjection answer terminal binding changed: ${options.interjectionId}`)
+      }
+      const existing = this.db.query<JobInterjectionRow, [string]>(
+        'SELECT * FROM job_interjections WHERE id = ?',
+      ).get(options.interjectionId)
+      if (existing?.status === 'answered' || existing?.status === 'delivered'
+        || existing?.status === 'promoted') {
+        if (existing.disposition !== options.disposition || existing.answer_payload !== answer) {
+          throw new Error(`interjection answer changed after staging: ${options.interjectionId}`)
+        }
+        return 'duplicate' as const
+      }
+      if (!existing || existing.status !== 'answering'
+        || existing.answer_logical_nonce !== options.logicalNonce
+        || existing.answer_thread_id !== options.threadId
+        || existing.answer_turn_id !== options.turnId) {
+        throw new Error(`interjection answer receipt changed: ${options.interjectionId}`)
+      }
+      if (job.cancel_requested_at !== null) return 'cancelled' as const
+      const notificationId = existing.notification_id ?? randomUUID()
+      const now = Date.now()
+      const updated = this.db.run(
+        `UPDATE job_interjections SET status = 'answered', disposition = ?,
+           answer_payload = ?, notification_id = ?, answered_at = ?,
+           attempts = 0, not_before = NULL, last_error = NULL
+         WHERE id = ? AND status = 'answering'`,
+        [options.disposition, answer, notificationId, now, options.interjectionId],
+      )
+      if (updated.changes !== 1) {
+        throw new Error(`interjection answer was not staged: ${options.interjectionId}`)
+      }
+      const released = this.db.run(
+        `UPDATE jobs SET active_turn_id = NULL
+         WHERE id = ? AND control_epoch = ? AND executor_nonce = ?
+           AND active_thread_id = ? AND active_turn_id = ?`,
+        [options.jobId, Math.floor(options.epoch), options.logicalNonce,
+          options.threadId, options.turnId],
+      )
+      if (released.changes !== 1) {
+        throw new Error(`interjection answer turn was not released: ${options.interjectionId}`)
+      }
+      return 'staged' as const
+    })
+    return retrySqlite(() => stage.immediate())
+  }
+
   finishAppServerTurn(options: {
     jobId: string
     epoch: number
@@ -3564,10 +4306,24 @@ export class JobStore {
           options.threadId, options.turnId,
         ],
       )
-      const pending = this.db.query<{ count: number }, [string, number]>(
+      this.db.run(
+        `UPDATE job_interjections SET status = 'paused', paused_at = ?
+         WHERE job_id = ? AND control_epoch = ? AND status = 'pausing'
+           AND pause_executor_nonce = ? AND pause_thread_id = ? AND pause_turn_id = ?`,
+        [
+          now, options.jobId, Math.floor(options.epoch), options.executorNonce,
+          options.threadId, options.turnId,
+        ],
+      )
+      const pendingControls = this.db.query<{ count: number }, [string, number]>(
         `SELECT COUNT(*) AS count FROM job_controls
          WHERE job_id = ? AND control_epoch = ? AND status = 'ready'`,
       ).get(options.jobId, Math.floor(options.epoch))?.count ?? 0
+      const pendingInterjections = this.db.query<{ count: number }, [string, number]>(
+        `SELECT COUNT(*) AS count FROM job_interjections
+         WHERE job_id = ? AND control_epoch = ? AND status IN ('ready', 'paused')`,
+      ).get(options.jobId, Math.floor(options.epoch))?.count ?? 0
+      const pending = pendingControls + pendingInterjections
       const pendingInbound = this.db.query<{ count: number }, [string, string]>(
         `SELECT COUNT(*) AS count FROM inbound_deliveries
          WHERE chat_id = ? AND thread_ts = ?`,
@@ -3642,6 +4398,12 @@ export class JobStore {
          WHERE chat_id = ? AND thread_ts = ?`,
       ).get(job.chat_id, job.thread_ts)?.count ?? 0
       if (pendingInbound > 0) return 'pending-inbound' as const
+      const pendingInterjections = this.db.query<{ count: number }, [string, number]>(
+        `SELECT COUNT(*) AS count FROM job_interjections
+         WHERE job_id = ? AND control_epoch = ?
+           AND status NOT IN ('promoted', 'superseded')`,
+      ).get(options.jobId, Math.floor(options.epoch))?.count ?? 0
+      if (pendingInterjections > 0) return 'pending-inbound' as const
       const ready = this.db.query<{ count: number }, [string, number]>(
         `SELECT COUNT(*) AS count FROM job_controls
          WHERE job_id = ? AND control_epoch = ? AND status = 'ready'`,
@@ -3731,6 +4493,34 @@ export class JobStore {
            AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?`,
         [
           Date.now(), options.jobId, Math.floor(options.epoch), options.executorNonce,
+          options.threadId, options.turnId,
+        ],
+      )
+      this.db.run(
+        `UPDATE job_interjections
+         SET status = 'ready', pause_request_id = NULL,
+             pause_executor_nonce = NULL, pause_thread_id = NULL, pause_turn_id = NULL,
+             pause_dispatched_at = NULL, pause_acknowledged_at = NULL,
+             last_error = 'pause turn reached an authoritative rate-limit terminal and may retry'
+         WHERE job_id = ? AND control_epoch = ? AND status = 'pausing'
+           AND pause_executor_nonce = ? AND pause_thread_id = ? AND pause_turn_id = ?`,
+        [
+          options.jobId, Math.floor(options.epoch), options.executorNonce,
+          options.threadId, options.turnId,
+        ],
+      )
+      this.db.run(
+        `UPDATE job_interjections
+         SET status = CASE WHEN paused_at IS NULL THEN 'ready' ELSE 'paused' END,
+             answer_request_id = NULL, answer_logical_nonce = NULL,
+             answer_thread_id = NULL, answer_turn_id = NULL,
+             answer_prepared_at = NULL, answer_dispatched_at = NULL,
+             answer_acknowledged_at = NULL,
+             last_error = 'answer turn reached an authoritative rate-limit terminal and may retry'
+         WHERE job_id = ? AND control_epoch = ? AND status = 'answering'
+           AND answer_logical_nonce = ? AND answer_thread_id = ? AND answer_turn_id = ?`,
+        [
+          options.jobId, Math.floor(options.epoch), options.executorNonce,
           options.threadId, options.turnId,
         ],
       )
@@ -4102,7 +4892,16 @@ export class JobStore {
            AND cancel_requested_at IS NULL
            AND monitor_state != 3
            AND (executor_nonce IS NULL OR (accepts_control = 0 AND active_turn_id IS NULL))
-           AND NOT EXISTS (SELECT 1 FROM monitor_failures WHERE job_id = jobs.id)`,
+           AND NOT EXISTS (SELECT 1 FROM monitor_failures WHERE job_id = jobs.id)
+           AND NOT EXISTS (
+             SELECT 1 FROM inbound_deliveries AS inbound
+             WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM job_interjections AS interjection
+             WHERE interjection.job_id = jobs.id
+               AND interjection.status NOT IN ('promoted', 'superseded')
+           )`,
         [persistedSessionId, result, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer running: ' + id)
@@ -4208,6 +5007,15 @@ export class JobStore {
        WHERE runtime = 'codex' AND status = 'running'
          AND pending_session_id IS NOT NULL AND pending_result IS NOT NULL
          AND cancel_requested_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM inbound_deliveries AS inbound
+           WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS interjection
+           WHERE interjection.job_id = jobs.id
+             AND interjection.status NOT IN ('promoted', 'superseded')
+         )
        ORDER BY seq ASC`,
     ).all()
     for (const row of rows) this.completeStagedExecution(row.id)
@@ -4545,6 +5353,54 @@ export class JobStore {
     )
   }
 
+  private settleInterjectionsForTerminal(
+    jobId: string,
+    kind: 'failed' | 'cancelled',
+    now: number,
+  ): void {
+    if (kind === 'cancelled') {
+      this.db.run(
+        `UPDATE job_interjections SET status = 'superseded',
+           last_error = 'superseded by terminal Slack cancellation'
+         WHERE job_id = ? AND status NOT IN ('promoted', 'superseded')`,
+        [jobId],
+      )
+      return
+    }
+    this.db.run(
+      `UPDATE job_interjections SET status = 'superseded',
+         last_error = 'job failed before this interjection could be answered'
+       WHERE job_id = ? AND status IN ('ready', 'paused', 'answer-prepared')`,
+      [jobId],
+    )
+    this.db.run(
+      `UPDATE job_interjections SET status = 'ambiguous',
+         last_error = 'job failed while an interjection request might have been delivered'
+       WHERE job_id = ? AND status IN ('pausing', 'answering')`,
+      [jobId],
+    )
+    this.db.run(
+      `UPDATE job_interjections SET status = 'superseded',
+         last_error = 'job failed before the staged interjection answer could be delivered'
+       WHERE job_id = ? AND status = 'answered' AND delivered_at IS NULL
+         AND disposition = 'task-update'`,
+      [jobId],
+    )
+    this.db.run(
+      `UPDATE job_interjections SET status = 'promoted',
+         last_error = COALESCE(last_error, 'answer-only interjection was delivered before job failure')
+       WHERE job_id = ? AND status = 'delivered' AND disposition = 'answer-only'`,
+      [jobId],
+    )
+    this.db.run(
+      `UPDATE job_interjections SET status = 'superseded',
+         last_error = 'task update answer was delivered but the job failed before promotion'
+       WHERE job_id = ? AND status = 'delivered' AND disposition = 'task-update'`,
+      [jobId],
+    )
+    void now
+  }
+
   fail(id: string, error: string): void {
     const fail = this.db.transaction(() => {
       const finishedAt = Date.now()
@@ -4561,6 +5417,7 @@ export class JobStore {
       )
       if (updated.changes !== 1) throw new Error('job is no longer running: ' + id)
       this.supersedeLifecycleNotifications(id, finishedAt)
+      this.settleInterjectionsForTerminal(id, 'failed', finishedAt)
       this.db.run(
         `INSERT INTO terminal_notifications (
            id, job_id, kind, payload, created_at
@@ -4593,6 +5450,7 @@ export class JobStore {
       )
       if (updated.changes !== 1) throw new Error('job is no longer cancellable: ' + id)
       this.supersedeLifecycleNotifications(id, finishedAt)
+      this.settleInterjectionsForTerminal(id, 'cancelled', finishedAt)
       // `finishAppServerTurn` is the sole authority that can move an
       // acknowledged interrupt to observed after a matching terminal.  A
       // terminal cancellation must not fabricate that audit evidence for a
@@ -4659,6 +5517,7 @@ export class JobStore {
       )
       if (updated.changes === 0) return false
       this.supersedeLifecycleNotifications(id, finishedAt)
+      this.settleInterjectionsForTerminal(id, 'failed', finishedAt)
       this.db.run(
         `INSERT INTO terminal_notifications (
            id, job_id, kind, payload, created_at
@@ -4835,6 +5694,12 @@ export class JobStore {
          WHERE job_id = ? AND control_epoch = ? AND status IN ('ready', 'dispatching')
          LIMIT 1`,
       ).get(jobId, job.control_epoch)) return 'closed'
+      if (this.db.query<{ present: number }, [string, number]>(
+        `SELECT 1 AS present FROM job_interjections
+         WHERE job_id = ? AND control_epoch = ?
+           AND status IN ('ready', 'pausing', 'paused', 'answer-prepared', 'answering', 'answered')
+         LIMIT 1`,
+      ).get(jobId, job.control_epoch)) return 'closed'
       const probe = this.db.query<{
         reported_at: number | null
         superseded_at: number | null
@@ -4912,6 +5777,11 @@ export class JobStore {
              AND c.status IN ('ready', 'dispatching')
          )
          AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS i
+           WHERE i.job_id = j.id AND i.control_epoch = j.control_epoch
+             AND i.status IN ('ready', 'pausing', 'paused', 'answer-prepared', 'answering', 'answered')
+         )
+         AND NOT EXISTS (
            SELECT 1 FROM terminal_notifications AS t
            JOIN jobs AS prior ON prior.id = t.job_id
            WHERE t.delivered_at IS NULL
@@ -4943,6 +5813,11 @@ export class JobStore {
            SELECT 1 FROM job_controls AS c
            WHERE c.job_id = j.id AND c.control_epoch = j.control_epoch
              AND c.status IN ('ready', 'dispatching')
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS i
+           WHERE i.job_id = j.id AND i.control_epoch = j.control_epoch
+             AND i.status IN ('ready', 'pausing', 'paused', 'answer-prepared', 'answering', 'answered')
          )
          AND NOT EXISTS (
            SELECT 1 FROM terminal_notifications AS t
@@ -4989,6 +5864,429 @@ export class JobStore {
       `SELECT COUNT(*) AS count FROM lifecycle_notifications
        WHERE delivered_at IS NULL AND superseded_at IS NULL`,
     ).get()?.count ?? 0
+  }
+
+  stageCommentaryNotification(
+    jobIdInput: string,
+    attemptInput: number,
+    sourceKeyInput: string,
+    payloadInput: string,
+    now = Date.now(),
+  ): 'staged' | 'duplicate' | 'closed' {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const attempt = Math.floor(attemptInput)
+    const sourceKey = requireText(sourceKeyInput, 'commentary source key')
+    const payload = normalizePublicGuardText(payloadInput).trim()
+    if (!Number.isSafeInteger(attempt) || attempt < 1
+      || !/^[0-9a-f]{64}$/.test(sourceKey)
+      || !payload.startsWith('💬 ') || payload.length > 700
+      || containsCredentialMaterial(payload)
+      || !Number.isSafeInteger(now) || now <= 0) {
+      throw new Error('commentary notification is invalid')
+    }
+    const stage = this.db.transaction((): 'staged' | 'duplicate' | 'closed' => {
+      const existing = this.db.query<{
+        job_id: string
+        attempt: number
+        payload: string
+      }, [string]>(
+        `SELECT job_id, attempt, payload FROM commentary_notifications
+         WHERE source_key = ?`,
+      ).get(sourceKey)
+      if (existing) {
+        if (existing.job_id !== jobId || existing.attempt !== attempt
+          || existing.payload !== payload) {
+          throw new Error(`commentary source identity changed: ${sourceKey}`)
+        }
+        return 'duplicate'
+      }
+      const job = this.db.query<{
+        status: JobStatus
+        attempts: number
+      }, [string]>(
+        'SELECT status, attempts FROM jobs WHERE id = ?',
+      ).get(jobId)
+      if (!job || job.status !== 'running' || job.attempts !== attempt) return 'closed'
+      this.db.run(
+        `INSERT INTO commentary_notifications (
+           id, source_key, job_id, attempt, payload, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+        [randomUUID(), sourceKey, jobId, attempt, payload, now],
+      )
+      return 'staged'
+    })
+    return retrySqlite(() => stage.immediate())
+  }
+
+  pendingCommentaryNotifications(
+    now = Date.now(),
+    limit = 20,
+  ): CommentaryNotification[] {
+    const rows = this.db.query<{
+      seq: number
+      id: string
+      source_key: string
+      job_id: string
+      attempt: number
+      payload: string
+      attempts: number
+    }, [number, number]>(
+      `SELECT c.seq, c.id, c.source_key, c.job_id, c.attempt, c.payload, c.attempts
+       FROM commentary_notifications AS c
+       JOIN jobs AS j ON j.id = c.job_id
+       WHERE c.delivered_at IS NULL
+         AND (c.not_before IS NULL OR c.not_before <= ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM commentary_notifications AS prior
+           WHERE prior.job_id = c.job_id AND prior.seq < c.seq
+             AND prior.delivered_at IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM lifecycle_notifications AS started
+           WHERE started.job_id = c.job_id AND started.attempt = c.attempt
+             AND started.kind = 'started' AND started.delivered_at IS NULL
+             AND started.superseded_at IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM status_notifications AS status
+           WHERE status.job_id = c.job_id AND status.delivered_at IS NULL
+             AND status.superseded_at IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS interjection
+           WHERE interjection.job_id = c.job_id
+             AND interjection.status = 'answered'
+             AND interjection.delivered_at IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM terminal_notifications AS terminal
+           JOIN jobs AS prior_job ON prior_job.id = terminal.job_id
+           WHERE terminal.delivered_at IS NULL
+             AND prior_job.chat_id = j.chat_id AND prior_job.thread_ts = j.thread_ts
+             AND prior_job.seq < j.seq
+         )
+       ORDER BY c.seq ASC LIMIT ?`,
+    ).all(now, limit)
+    return rows.flatMap(row => {
+      const job = this.get(row.job_id)
+      return job ? [{
+        id: row.id,
+        sourceKey: row.source_key,
+        jobId: row.job_id,
+        attempt: row.attempt,
+        payload: row.payload,
+        attempts: row.attempts,
+        job,
+      }] : []
+    })
+  }
+
+  commentaryNotificationDeliverable(idInput: string): boolean {
+    const id = requireText(idInput, 'notificationId')
+    return retrySqlite(() => this.db.query<{ present: number }, [string]>(
+      `SELECT 1 AS present
+       FROM commentary_notifications AS c
+       JOIN jobs AS j ON j.id = c.job_id
+       WHERE c.id = ? AND c.delivered_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM commentary_notifications AS prior
+           WHERE prior.job_id = c.job_id AND prior.seq < c.seq
+             AND prior.delivered_at IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM lifecycle_notifications AS started
+           WHERE started.job_id = c.job_id AND started.attempt = c.attempt
+             AND started.kind = 'started' AND started.delivered_at IS NULL
+             AND started.superseded_at IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM status_notifications AS status
+           WHERE status.job_id = c.job_id AND status.delivered_at IS NULL
+             AND status.superseded_at IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS interjection
+           WHERE interjection.job_id = c.job_id
+             AND interjection.status = 'answered'
+             AND interjection.delivered_at IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM terminal_notifications AS terminal
+           JOIN jobs AS prior_job ON prior_job.id = terminal.job_id
+           WHERE terminal.delivered_at IS NULL
+             AND prior_job.chat_id = j.chat_id AND prior_job.thread_ts = j.thread_ts
+             AND prior_job.seq < j.seq
+         )`,
+    ).get(id) !== null)
+  }
+
+  markCommentaryNotificationDelivered(idInput: string): void {
+    this.db.run(
+      `UPDATE commentary_notifications
+       SET delivered_at = ?, not_before = NULL, last_error = NULL
+       WHERE id = ? AND delivered_at IS NULL`,
+      [Date.now(), requireText(idInput, 'notificationId')],
+    )
+  }
+
+  deferCommentaryNotification(
+    idInput: string,
+    errorInput: string,
+    now = Date.now(),
+    retryMs = 30_000,
+  ): void {
+    this.db.run(
+      `UPDATE commentary_notifications
+       SET attempts = attempts + 1, not_before = ?, last_error = ?
+       WHERE id = ? AND delivered_at IS NULL`,
+      [
+        now + Math.max(1, retryMs),
+        requireText(errorInput, 'notificationError').slice(0, 4_000),
+        requireText(idInput, 'notificationId'),
+      ],
+    )
+  }
+
+  commentaryNotificationCount(): number {
+    return this.db.query<{ count: number }, []>(
+      'SELECT COUNT(*) AS count FROM commentary_notifications WHERE delivered_at IS NULL',
+    ).get()?.count ?? 0
+  }
+
+  pendingInterjectionNotifications(now = Date.now(), limit = 20): InterjectionNotification[] {
+    const rows = this.db.query<JobInterjectionRow, [number, number]>(
+      `SELECT i.* FROM job_interjections AS i
+       JOIN jobs AS j ON j.id = i.job_id
+       WHERE i.status = 'answered' AND i.delivered_at IS NULL
+         AND i.notification_id IS NOT NULL AND i.answer_payload IS NOT NULL
+         AND (i.not_before IS NULL OR i.not_before <= ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS prior
+           WHERE prior.job_id = i.job_id AND prior.control_epoch = i.control_epoch
+             AND prior.seq < i.seq
+             AND prior.status NOT IN ('promoted', 'superseded')
+         )
+       ORDER BY i.answered_at ASC, i.seq ASC LIMIT ?`,
+    ).all(now, limit)
+    return rows.flatMap(row => {
+      const job = this.get(row.job_id)
+      if (!job || !row.notification_id || !row.answer_payload) return []
+      const interjection = mapInterjectionRow(row)
+      return [{
+        id: row.notification_id,
+        idempotencyKey: `interjection-answer:${row.idempotency_key}`,
+        jobId: row.job_id,
+        chatId: row.chat_id,
+        threadTs: row.thread_ts,
+        kind: 'interjection-answer' as const,
+        payload: row.answer_payload,
+        attempts: row.attempts,
+        job,
+        interjection,
+      }]
+    })
+  }
+
+  interjectionNotificationDeliverable(notificationIdInput: string): boolean {
+    return retrySqlite(() => this.db.query<{ present: number }, [string]>(
+      `SELECT 1 AS present FROM job_interjections AS current
+       WHERE current.notification_id = ? AND current.status = 'answered'
+         AND current.delivered_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS prior
+           WHERE prior.job_id = current.job_id
+             AND prior.control_epoch = current.control_epoch
+             AND prior.seq < current.seq
+             AND prior.status NOT IN ('promoted', 'superseded')
+         )`,
+    ).get(requireText(notificationIdInput, 'notificationId')) !== null)
+  }
+
+  markInterjectionNotificationDelivered(notificationIdInput: string): void {
+    const updated = this.db.run(
+      `UPDATE job_interjections SET
+         status = CASE
+           WHEN disposition = 'answer-only' AND EXISTS (
+             SELECT 1 FROM jobs
+             WHERE jobs.id = job_interjections.job_id
+               AND jobs.status IN ('completed', 'failed')
+           ) THEN 'promoted'
+           ELSE 'delivered'
+         END,
+         delivered_at = ?,
+         not_before = NULL, last_error = NULL
+       WHERE notification_id = ? AND status = 'answered' AND delivered_at IS NULL`,
+      [Date.now(), requireText(notificationIdInput, 'notificationId')],
+    )
+    if (updated.changes !== 1) {
+      const existing = this.db.query<{ delivered_at: number | null }, [string]>(
+        'SELECT delivered_at FROM job_interjections WHERE notification_id = ?',
+      ).get(notificationIdInput)
+      if (existing?.delivered_at === null || existing === null) {
+        throw new Error(`interjection notification delivery changed: ${notificationIdInput}`)
+      }
+    }
+  }
+
+  deferInterjectionNotification(
+    notificationIdInput: string,
+    errorInput: string,
+    now = Date.now(),
+    retryMs = 30_000,
+  ): void {
+    this.db.run(
+      `UPDATE job_interjections SET attempts = attempts + 1, not_before = ?, last_error = ?
+       WHERE notification_id = ? AND status = 'answered' AND delivered_at IS NULL`,
+      [
+        now + Math.max(1, retryMs), requireText(errorInput, 'notificationError').slice(0, 4_000),
+        requireText(notificationIdInput, 'notificationId'),
+      ],
+    )
+  }
+
+  interjectionIsDelivered(interjectionIdInput: string): boolean {
+    return retrySqlite(() => this.db.query<{ delivered_at: number | null }, [string]>(
+      `SELECT delivered_at FROM job_interjections
+       WHERE id = ? AND status IN ('delivered', 'promoted')`,
+    ).get(requireText(interjectionIdInput, 'interjectionId'))?.delivered_at != null)
+  }
+
+  promoteDeliveredInterjection(
+    interjectionIdInput: string,
+  ): JobInterjectionDisposition {
+    const interjectionId = requireText(interjectionIdInput, 'interjectionId')
+    const promote = this.db.transaction((): JobInterjectionDisposition => {
+      const row = this.db.query<JobInterjectionRow, [string]>(
+        'SELECT * FROM job_interjections WHERE id = ?',
+      ).get(interjectionId)
+      if (!row || row.delivered_at === null || row.disposition === null) {
+        throw new Error(`interjection is not delivered: ${interjectionId}`)
+      }
+      const earlier = this.db.query<{ present: number }, [string, number, number]>(
+        `SELECT 1 AS present FROM job_interjections
+         WHERE job_id = ? AND control_epoch = ? AND seq < ?
+           AND status NOT IN ('promoted', 'superseded') LIMIT 1`,
+      ).get(row.job_id, row.control_epoch, row.seq)
+      if (earlier) {
+        throw new Error(`an earlier interjection must finish before ${interjectionId}`)
+      }
+      if (row.disposition === 'answer-only') {
+        if (row.status === 'delivered') {
+          const completed = this.db.run(
+            `UPDATE job_interjections SET status = 'promoted'
+             WHERE id = ? AND status = 'delivered'`,
+            [interjectionId],
+          )
+          if (completed.changes !== 1) {
+            throw new Error(`interjection completion was not recorded: ${interjectionId}`)
+          }
+        } else if (row.status !== 'promoted') {
+          throw new Error(`interjection completion state changed: ${interjectionId}`)
+        }
+        return 'answer-only'
+      }
+      if (row.status === 'promoted') return 'task-update'
+      if (row.status !== 'delivered') {
+        throw new Error(`interjection promotion state changed: ${interjectionId}`)
+      }
+      const job = this.db.query<{
+        id: string
+        message_id: string
+        user_id: string
+        write_enabled: number
+        task: string
+        attachments_json: string
+        input_revision: number
+        control_epoch: number
+        cancel_requested_at: number | null
+        status: JobStatus
+      }, [string]>(
+        `SELECT id, message_id, user_id, write_enabled, task, attachments_json,
+                input_revision, control_epoch, cancel_requested_at, status
+         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+      ).get(row.job_id)
+      if (!job || job.status !== 'running' || job.cancel_requested_at !== null
+        || job.control_epoch !== row.control_epoch) {
+        throw new Error(`interjection target is no longer active: ${interjectionId}`)
+      }
+      const currentControls = this.db.query<{
+        input_revision: number
+        message_id: string
+        user_id: string
+        write_enabled: number
+        task: string
+        attachments_json: string
+      }, [string]>(
+        `SELECT input_revision, message_id, user_id, write_enabled, task, attachments_json
+         FROM job_controls WHERE job_id = ? AND kind = 'steer'
+         ORDER BY input_revision ASC, seq ASC`,
+      ).all(row.job_id)
+      const currentSnapshot = createAdvisorInputSnapshot(job, currentControls)
+      if (currentSnapshot.revision !== row.input_revision
+        || currentSnapshot.digest !== row.input_digest
+        || currentSnapshot.revision !== job.input_revision) {
+        throw new Error(`interjection input binding changed before promotion: ${interjectionId}`)
+      }
+      const nextRevision = job.input_revision + 1
+      const advanced = this.db.run(
+        `UPDATE jobs SET input_revision = ?
+         WHERE id = ? AND control_epoch = ? AND input_revision = ?
+           AND status = 'running' AND cancel_requested_at IS NULL`,
+        [nextRevision, row.job_id, row.control_epoch, job.input_revision],
+      )
+      if (advanced.changes !== 1) {
+        throw new Error(`interjection input revision could not advance: ${interjectionId}`)
+      }
+      const promotedControlId = randomUUID()
+      const now = Date.now()
+      this.db.run(
+        `INSERT INTO job_controls (
+           id, idempotency_key, job_id, control_epoch, input_revision, input_digest,
+           kind, chat_id, thread_ts, message_id, user_id, write_enabled, task,
+           attachments_json, status, created_at, observed_at, last_error
+         ) VALUES (?, ?, ?, ?, ?, '', 'steer', ?, ?, ?, ?, ?, ?, ?, 'observed', ?, ?, ?)`,
+        [
+          promotedControlId, row.idempotency_key, row.job_id, row.control_epoch,
+          nextRevision, row.chat_id, row.thread_ts, row.message_id, row.user_id,
+          row.write_enabled, row.task, row.attachments_json, row.created_at, now,
+          'promoted from a delivered conversational interjection',
+        ],
+      )
+      const nextJob = { ...job, input_revision: nextRevision }
+      const nextControls = [...currentControls, {
+        input_revision: nextRevision,
+        message_id: row.message_id,
+        user_id: row.user_id,
+        write_enabled: row.write_enabled,
+        task: row.task,
+        attachments_json: row.attachments_json,
+      }]
+      const nextSnapshot = createAdvisorInputSnapshot(nextJob, nextControls)
+      const digested = this.db.run(
+        `UPDATE job_controls SET input_digest = ?
+         WHERE id = ? AND input_digest = ''`,
+        [nextSnapshot.digest, promotedControlId],
+      )
+      if (digested.changes !== 1) {
+        throw new Error(`promoted interjection digest was not fixed: ${interjectionId}`)
+      }
+      const completed = this.db.run(
+        `UPDATE job_interjections SET status = 'promoted'
+         WHERE id = ? AND status = 'delivered'`,
+        [interjectionId],
+      )
+      if (completed.changes !== 1) {
+        throw new Error(`interjection promotion was not recorded: ${interjectionId}`)
+      }
+      this.db.run(
+        `UPDATE job_interjections SET input_revision = ?, input_digest = ?
+         WHERE job_id = ? AND control_epoch = ?
+           AND status IN ('ready', 'paused', 'answer-prepared')`,
+        [nextRevision, nextSnapshot.digest, row.job_id, row.control_epoch],
+      )
+      return 'task-update'
+    })
+    return retrySqlite(() => promote.immediate())
   }
 
   pendingStatusNotifications(now = Date.now(), limit = 20): StatusNotification[] {
@@ -5075,9 +6373,20 @@ export class JobStore {
        WHERE terminal.delivered_at IS NULL
          AND (terminal.not_before IS NULL OR terminal.not_before <= ?)
          AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS interjection
+           WHERE interjection.job_id = terminal.job_id
+             AND interjection.status = 'answered'
+             AND interjection.delivered_at IS NULL
+         )
+         AND NOT EXISTS (
            SELECT 1 FROM status_notifications AS status
            WHERE status.job_id = terminal.job_id
              AND status.delivered_at IS NULL AND status.superseded_at IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM commentary_notifications AS commentary
+           WHERE commentary.job_id = terminal.job_id
+             AND commentary.delivered_at IS NULL
          )
        ORDER BY terminal.created_at ASC LIMIT ?`,
     ).all(now, limit)
@@ -5337,14 +6646,23 @@ export class JobStore {
              WHERE n.job_id = j.id AND n.delivered_at IS NULL AND n.superseded_at IS NULL
            )
            AND NOT EXISTS (
+             SELECT 1 FROM commentary_notifications AS n
+             WHERE n.job_id = j.id AND n.delivered_at IS NULL
+           )
+           AND NOT EXISTS (
              SELECT 1 FROM status_notifications AS n
              WHERE n.job_id = j.id AND n.delivered_at IS NULL AND n.superseded_at IS NULL
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM job_interjections AS i
+             WHERE i.job_id = j.id AND i.status = 'answered' AND i.delivered_at IS NULL
            )
            AND NOT EXISTS (
              SELECT 1 FROM artifact_deliveries AS a
              WHERE a.job_id = j.id AND a.delivered_at IS NULL AND a.abandoned_at IS NULL
            )`,
       ).all(cutoff)
+      const prunedInterjectionAttachments: string[] = []
       for (const row of candidates) {
         this.db.run(
           `INSERT INTO delivery_tombstones (idempotency_key, write_enabled, completed_at)
@@ -5357,6 +6675,7 @@ export class JobStore {
         this.db.run('DELETE FROM artifact_deliveries WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM progress_probes WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM lifecycle_notifications WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM commentary_notifications WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM status_notifications WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM terminal_notifications WHERE job_id = ?', [row.id])
         const controls = this.db.query<{
@@ -5382,6 +6701,38 @@ export class JobStore {
             ],
           )
         }
+        const interjections = this.db.query<{
+          idempotency_key: string
+          write_enabled: number
+          delivered_at: number | null
+          answered_at: number | null
+          paused_at: number | null
+          created_at: number
+          attachments_json: string
+        }, [string]>(
+          `SELECT idempotency_key, write_enabled, delivered_at, answered_at,
+                  paused_at, created_at, attachments_json
+           FROM job_interjections WHERE job_id = ?`,
+        ).all(row.id)
+        for (const interjection of interjections) {
+          this.db.run(
+            `INSERT INTO delivery_tombstones (idempotency_key, write_enabled, completed_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(idempotency_key) DO UPDATE SET
+               write_enabled = MAX(write_enabled, excluded.write_enabled),
+               completed_at = MAX(completed_at, excluded.completed_at)`,
+            [
+              interjection.idempotency_key,
+              interjection.write_enabled,
+              interjection.delivered_at ?? interjection.answered_at
+                ?? interjection.paused_at ?? interjection.created_at,
+            ],
+          )
+          prunedInterjectionAttachments.push(
+            ...parseAttachments(interjection.attachments_json),
+          )
+        }
+        this.db.run('DELETE FROM job_interjections WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_controls WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_phase_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_initial_dispatches WHERE job_id = ?', [row.id])
@@ -5401,18 +6752,28 @@ export class JobStore {
       const liveJobs = this.db.query<{ id: string; attachments_json: string }, []>(
         'SELECT id, attachments_json FROM jobs',
       ).all()
+      const liveInterjections = this.db.query<{ attachments_json: string }, []>(
+        'SELECT attachments_json FROM job_interjections',
+      ).all()
       return {
         candidates,
+        prunedInterjectionAttachments,
         threads,
         tombstones,
         liveJobIds: new Set(liveJobs.map(row => row.id)),
         liveAttachments: new Set(
-          liveJobs.flatMap(row => parseAttachments(row.attachments_json)).map(path => resolve(path)),
+          [
+            ...liveJobs.flatMap(row => parseAttachments(row.attachments_json)),
+            ...liveInterjections.flatMap(row => parseAttachments(row.attachments_json)),
+          ].map(path => resolve(path)),
         ),
       }
     })
     const result = retrySqlite(() => prune.immediate())
-    const attachmentPaths = result.candidates.flatMap(row => parseAttachments(row.attachments_json))
+    const attachmentPaths = [
+      ...result.candidates.flatMap(row => parseAttachments(row.attachments_json)),
+      ...result.prunedInterjectionAttachments,
+    ]
     let files = removeSettledJobState({
       stateDir: options.stateDir,
       jobIds: result.candidates.map(row => row.id),
@@ -5591,6 +6952,47 @@ export class JobStore {
     }
   }
 
+  reconcileInterjectionsBeforeRecovery(): {
+    preparedReset: number
+    promoted: number
+    blocked: number
+  } {
+    const preparedReset = retrySqlite(() => this.db.run(
+      `UPDATE job_interjections
+       SET status = CASE WHEN paused_at IS NULL THEN 'ready' ELSE 'paused' END,
+           answer_request_id = NULL, answer_logical_nonce = NULL,
+           answer_thread_id = NULL, answer_turn_id = NULL,
+           answer_prepared_at = NULL, answer_dispatched_at = NULL,
+           answer_acknowledged_at = NULL,
+           last_error = 'daemon restarted before the answer request was written; safe to retry'
+       WHERE status = 'answer-prepared'
+         AND job_id IN (SELECT id FROM jobs WHERE status = 'running')`,
+    ).changes)
+    const delivered = retrySqlite(() => this.db.query<{ id: string }, []>(
+      `SELECT i.id FROM job_interjections AS i
+       JOIN jobs AS j ON j.id = i.job_id
+       WHERE i.status = 'delivered' AND i.delivered_at IS NOT NULL
+         AND j.status = 'running' AND j.cancel_requested_at IS NULL
+       ORDER BY i.job_id ASC, i.seq ASC`,
+    ).all())
+    let promoted = 0
+    let blocked = 0
+    for (const row of delivered) {
+      try {
+        this.promoteDeliveredInterjection(row.id)
+        promoted += 1
+      } catch (error) {
+        blocked += 1
+        this.db.run(
+          `UPDATE job_interjections SET last_error = ?
+           WHERE id = ? AND status = 'delivered'`,
+          [`startup promotion was blocked: ${String(error)}`.slice(0, 4_000), row.id],
+        )
+      }
+    }
+    return { preparedReset, promoted, blocked }
+  }
+
   recoverInterrupted(advisorStateDir?: string): {
     requeued: number
     failedWrites: number
@@ -5671,9 +7073,20 @@ export interface LifecycleNotification {
   job: JobRecord
 }
 
+export interface CommentaryNotification {
+  id: string
+  sourceKey: string
+  jobId: string
+  attempt: number
+  payload: string
+  attempts: number
+  job: JobRecord
+}
+
 export type StatusNotificationKind =
   | 'accepted' | 'interrupt-accepted' | 'closed-control'
   | 'inactive-interrupt' | 'attachment-control-failed' | 'rate-limited'
+  | 'interjection-answer'
 
 export interface StatusNotification {
   id: string
@@ -5686,11 +7099,19 @@ export interface StatusNotification {
   attempts: number
 }
 
+export interface InterjectionNotification extends StatusNotification {
+  kind: 'interjection-answer'
+  jobId: string
+  job: JobRecord
+  interjection: JobInterjectionRecord
+}
+
 export interface JobExecutionContext {
   progressActivatedAtMs: number
   beginProgressProbe(probe: { slot: number; clientMessageId: string }): boolean
   supersedeProgressProbe(slot: number, supersededBySlot: number | null): void
   reportProgress(report: { slot: number; elapsedMs: number; text: string }): boolean
+  reportCommentary(event: { sourceKey: string; text: string }): boolean
 }
 
 export type JobExecutor = (
@@ -5866,6 +7287,57 @@ export async function flushLifecycleNotifications(
   }
 }
 
+export async function flushCommentaryNotifications(
+  store: JobStore,
+  notifier: JobNotifier | undefined,
+  log: (message: string) => void,
+  retryMs = 30_000,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!notifier?.progress) return false
+  const maxDeliveriesPerPass = 50
+  let deliveredCount = 0
+  while (!signal?.aborted) {
+    const pending = store.pendingCommentaryNotifications()
+    if (pending.length === 0) return false
+    let delivered = false
+    for (const notification of pending) {
+      if (signal?.aborted) return false
+      if (!store.commentaryNotificationDeliverable(notification.id)) continue
+      try {
+        await notifier.progress(
+          notification.job,
+          notification.payload,
+          notification.id,
+          signal,
+        )
+        if (signal?.aborted) return false
+        store.markCommentaryNotificationDelivered(notification.id)
+        delivered = true
+        deliveredCount += 1
+      } catch (error) {
+        if (signal?.aborted) return false
+        const message = error instanceof Error ? error.message : String(error)
+        const backoff = Math.min(
+          retryMs * (2 ** Math.min(notification.attempts, 10)),
+          6 * 60 * 60 * 1000,
+        )
+        store.deferCommentaryNotification(notification.id, message, Date.now(), backoff)
+        log(`commentary notification ${notification.id} deferred: ${message}`)
+      }
+    }
+    // A deferred head row blocks later commentary for that job until its
+    // durable retry time. Stop instead of polling the same blocked queue.
+    if (!delivered) return false
+    // Yield to status/interjection/terminal traffic after a bounded burst.
+    // A ready remainder asks the notification owner to begin another pass.
+    if (deliveredCount >= maxDeliveriesPerPass) {
+      return store.pendingCommentaryNotifications().length > 0
+    }
+  }
+  return false
+}
+
 export async function flushStatusNotifications(
   store: JobStore,
   notifier: JobNotifier | undefined,
@@ -5890,6 +7362,34 @@ export async function flushStatusNotifications(
       )
       store.deferStatusNotification(notification.id, message, Date.now(), backoff)
       log(`status notification ${notification.id} deferred: ${message}`)
+    }
+  }
+}
+
+export async function flushInterjectionNotifications(
+  store: JobStore,
+  notifier: JobNotifier | undefined,
+  log: (message: string) => void,
+  retryMs = 30_000,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!notifier?.status) return
+  for (const notification of store.pendingInterjectionNotifications()) {
+    if (signal?.aborted) return
+    if (!store.interjectionNotificationDeliverable(notification.id)) continue
+    try {
+      await notifier.status(notification, signal)
+      if (signal?.aborted) return
+      store.markInterjectionNotificationDelivered(notification.id)
+    } catch (error) {
+      if (signal?.aborted) return
+      const message = error instanceof Error ? error.message : String(error)
+      const backoff = Math.min(
+        retryMs * (2 ** Math.min(notification.attempts, 10)),
+        6 * 60 * 60 * 1000,
+      )
+      store.deferInterjectionNotification(notification.id, message, Date.now(), backoff)
+      log(`interjection notification ${notification.id} deferred: ${message}`)
     }
   }
 }
@@ -5998,47 +7498,93 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
   const stopNotifications = () => notificationController.abort()
   options.signal?.addEventListener('abort', stopNotifications, { once: true })
   let notificationFlush: Promise<void> | null = null
+  let notificationFlushRequested = false
   let lifecycleFlush: Promise<void> | null = null
+  let lifecycleFlushRequested = false
   let lifecycleSchedulingOpen = false
   const scheduleNotificationFlush = () => {
+    notificationFlushRequested = true
     if (notificationFlush) return
     notificationFlush = (async () => {
-      // One lane keeps durable state replies and terminal results ahead of
-      // lifecycle chatter. Per-thread SQL eligibility prevents a later job's
-      // started/progress message from overtaking an older terminal result.
-      await flushStatusNotifications(
-        options.store,
-        options.notifier,
-        log,
-        notificationRetryMs,
-        notificationController.signal,
-      )
-      await flushTerminalNotifications(
-        options.store,
-        options.notifier,
-        log,
-        notificationRetryMs,
-        notificationController.signal,
-      )
-      if (lifecycleSchedulingOpen) {
-        const pendingLifecycleFlush = flushLifecycleNotifications(
+      while (notificationFlushRequested && !notificationController.signal.aborted) {
+        notificationFlushRequested = false
+        // Durable state replies, interjection answers, commentary, and terminal
+        // results share a lane. SQL eligibility holds a terminal result until
+        // every already-observed commentary item is delivered. Lifecycle
+        // start/progress uses a separate lane below so an unrelated hanging
+        // terminal post cannot prevent a newly claimed job from executing.
+        await flushStatusNotifications(
           options.store,
           options.notifier,
           log,
           notificationRetryMs,
           notificationController.signal,
         )
-        lifecycleFlush = pendingLifecycleFlush
-        try {
-          await pendingLifecycleFlush
-        } finally {
-          if (lifecycleFlush === pendingLifecycleFlush) lifecycleFlush = null
-        }
+        await flushInterjectionNotifications(
+          options.store,
+          options.notifier,
+          log,
+          notificationRetryMs,
+          notificationController.signal,
+        )
+        await flushTerminalNotifications(
+          options.store,
+          options.notifier,
+          log,
+          notificationRetryMs,
+          notificationController.signal,
+        )
+        const commentaryReady = await flushCommentaryNotifications(
+          options.store,
+          options.notifier,
+          log,
+          notificationRetryMs,
+          notificationController.signal,
+        )
+        if (commentaryReady) notificationFlushRequested = true
       }
-    })().finally(() => { notificationFlush = null })
+    })().finally(() => {
+      notificationFlush = null
+      if (notificationFlushRequested && !notificationController.signal.aborted) {
+        scheduleNotificationFlush()
+      }
+    })
+  }
+  const scheduleLifecycleFlush = () => {
+    if (!lifecycleSchedulingOpen || notificationController.signal.aborted) return
+    lifecycleFlushRequested = true
+    if (lifecycleFlush) return
+    lifecycleFlush = (async () => {
+      while (lifecycleFlushRequested
+        && lifecycleSchedulingOpen
+        && !notificationController.signal.aborted) {
+        lifecycleFlushRequested = false
+        await flushLifecycleNotifications(
+          options.store,
+          options.notifier,
+          log,
+          notificationRetryMs,
+          notificationController.signal,
+        )
+      }
+    })().finally(() => {
+      lifecycleFlush = null
+      // A delivered lifecycle start/progress row can make the next durable
+      // commentary row eligible immediately. Wake that lane without waiting
+      // for the periodic retry tick.
+      if (!notificationController.signal.aborted) scheduleNotificationFlush()
+      if (lifecycleFlushRequested
+        && lifecycleSchedulingOpen
+        && !notificationController.signal.aborted) {
+        scheduleLifecycleFlush()
+      }
+    })
   }
   const notificationPump = setInterval(
-    scheduleNotificationFlush,
+    () => {
+      scheduleNotificationFlush()
+      scheduleLifecycleFlush()
+    },
     Math.max(25, Math.min(notificationRetryMs, 1_000)),
   )
   notificationPump.unref()
@@ -6090,8 +7636,14 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
     let skipMonitorClose = false
     const quiesceLifecycleBeforeStateChange = async (): Promise<void> => {
       progressReportsOpen = false
-      lifecycleSchedulingOpen = false
+      // Commentary is synchronously staged by the executor before it returns,
+      // and terminal eligibility is blocked by every undelivered commentary
+      // row. Do not await the shared Slack lane here: an unrelated hanging
+      // terminal post must never stop the serial worker from claiming and
+      // executing the next job.
+      scheduleLifecycleFlush()
       if (lifecycleFlush) await lifecycleFlush
+      lifecycleSchedulingOpen = false
       await options.notifier?.settleLifecycleSideEffects?.()
       await options.notifier?.settleStartedSideEffects?.()
     }
@@ -6176,7 +7728,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       progressActivatedAtMs = options.store.activateJobLifecycle(job.id, job.attempts)
       progressReportsOpen = true
       lifecycleSchedulingOpen = true
-      scheduleNotificationFlush()
+      scheduleLifecycleFlush()
       options.assertJobMonitorHealthy?.(job)
       let execution: JobExecutionResult
       try {
@@ -6208,6 +7760,17 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
               job.attempts,
               report.slot,
               report.text,
+            )
+            if (disposition === 'staged') scheduleLifecycleFlush()
+            return disposition === 'staged' || disposition === 'duplicate'
+          },
+          reportCommentary: event => {
+            if (!progressReportsOpen) return false
+            const disposition = options.store.stageCommentaryNotification(
+              job.id,
+              job.attempts,
+              event.sourceKey,
+              event.text,
             )
             if (disposition === 'staged') scheduleNotificationFlush()
             return disposition === 'staged' || disposition === 'duplicate'
@@ -6826,6 +8389,7 @@ export function sanitizeExecutionTextForSlack(
   sessionId: string,
   text: string,
   dir: string,
+  additionalSensitiveValues: readonly string[] = [],
 ): string {
   const normalizeGuardText = normalizePublicGuardText
   const slackAuthoredTask = (task: string, attachments: readonly string[]): string => {
@@ -6895,6 +8459,7 @@ export function sanitizeExecutionTextForSlack(
     job.chatId,
     job.userId,
     job.executorNonce,
+    ...additionalSensitiveValues,
   ].filter((value): value is string => typeof value === 'string' && value.length >= 4)
     .map(normalizeGuardText)
     .sort((left, right) => right.length - left.length)
@@ -8168,7 +9733,28 @@ export class SlackNotifier implements JobNotifier {
   }
 
   async status(notification: StatusNotification, signal?: AbortSignal): Promise<void> {
-    const chunks = splitSlackChunks(notification.payload)
+    let payload = notification.payload
+    if (notification.kind === 'interjection-answer' && notification.jobId) {
+      const job = this.store.get(notification.jobId)
+      const interjection = (notification as Partial<InterjectionNotification>).interjection
+      if (!job || !interjection) {
+        throw new Error('interjection notification lost its durable job binding')
+      }
+      payload = sanitizeExecutionTextForSlack(
+        job,
+        job.sessionId ?? '',
+        payload,
+        dirname(this.store.dbPath),
+        [
+          ...interjection.attachments,
+          interjection.messageId,
+          interjection.userId,
+          interjection.id,
+          interjection.idempotencyKey,
+        ],
+      ) || '確認した内容を元の作業へ反映して続けます。'
+    }
+    const chunks = splitSlackChunks(payload)
     for (let index = 0; index < chunks.length; index += 1) {
       await withSlackDeadline(childSignal => this.uploadDependencies.postMessage({
         chatId: notification.chatId,
@@ -9220,6 +10806,11 @@ async function runCli(): Promise<void> {
       const runtime = readPinnedHerdrRuntime(dir)
       await verifyHerdrRuntimeIdentityAsync(runtime)
       await terminateTrackedExecutors(store, log, 15_000, dir)
+      const interjections = store.reconcileInterjectionsBeforeRecovery()
+      if (interjections.preparedReset > 0 || interjections.promoted > 0
+        || interjections.blocked > 0) {
+        log(`reconciled conversational interjections: ${JSON.stringify(interjections)}`)
+      }
       const recoverMissingMonitor = (
         jobId: string,
         status: JobStatus | 'missing',
@@ -9377,6 +10968,11 @@ async function runCli(): Promise<void> {
   let startupRetainedMonitorJobIds: string[] = []
   if (!updateTransactionPending(updateJournal)) {
     await terminateTrackedExecutors(store, log, 15_000, dir)
+    const interjections = store.reconcileInterjectionsBeforeRecovery()
+    if (interjections.preparedReset > 0 || interjections.promoted > 0
+      || interjections.blocked > 0) {
+      log(`reconciled conversational interjections: ${JSON.stringify(interjections)}`)
+    }
     const recoverMissingMonitor = (
       jobId: string,
       status: JobStatus | 'missing',
@@ -9679,14 +11275,9 @@ async function runCli(): Promise<void> {
             onProcessId: processId => store.saveExecutorPid(job.id, processId),
             onSessionId: sessionId => store.saveSession(job.id, sessionId),
             onSessionReset: () => store.clearSession(job.id),
-            progressActivatedAtMs: executionContext.progressActivatedAtMs,
-            onProgressProbeStarted: probe => executionContext.beginProgressProbe(probe),
-            onProgressProbeSuperseded: (slot, supersededBySlot) => (
-              executionContext.supersedeProgressProbe(slot, supersededBySlot)
-            ),
-            onProgressReport: report => executionContext.reportProgress(report),
             liveControls: {
-              next: () => store.nextReadyControl(job.id, job.controlEpoch),
+              next: () => store.nextReadyLiveInput(job.id, job.controlEpoch),
+              nextInterjection: () => store.nextPendingInterjection(job.id, job.controlEpoch),
               bindTurn: (executorNonce, threadId, turnId) => store.bindAppServerTurn(
                 job.id,
                 job.workerId!,
@@ -9807,24 +11398,58 @@ async function runCli(): Promise<void> {
               ),
               beginDispatch: ({
                 control, executorNonce, threadId, turnId, requestId,
-              }) => store.beginControlDispatch({
-                controlId: control.id,
-                jobId: job.id,
-                epoch: job.controlEpoch,
-                executorNonce,
-                threadId,
-                turnId,
-                requestId,
-              }),
-              acknowledge: (control, requestId, turnId) => store.acknowledgeControl(
-                control.id,
-                requestId,
-                turnId,
-              ),
-              ambiguous: (control, error) => store.markControlAmbiguous(control.id, error),
+              }) => {
+                if (control.kind === 'interjection') {
+                  if (!turnId) throw new Error('interjection pause omitted its active turn')
+                  store.beginInterjectionPause({
+                    interjectionId: control.id,
+                    jobId: job.id,
+                    epoch: job.controlEpoch,
+                    executorNonce,
+                    threadId,
+                    turnId,
+                    requestId,
+                  })
+                  return
+                }
+                store.beginControlDispatch({
+                  controlId: control.id,
+                  jobId: job.id,
+                  epoch: job.controlEpoch,
+                  executorNonce,
+                  threadId,
+                  turnId,
+                  requestId,
+                })
+              },
+              acknowledge: (control, requestId, turnId) => {
+                if (control.kind === 'interjection') {
+                  store.acknowledgeInterjectionPause(control.id, requestId, turnId)
+                  return
+                }
+                store.acknowledgeControl(control.id, requestId, turnId)
+              },
+              ambiguous: (control, error) => {
+                if (control.kind === 'interjection') {
+                  store.markInterjectionAmbiguous(control.id, error)
+                  return
+                }
+                store.markControlAmbiguous(control.id, error)
+              },
               deferToNextTurn: (
                 control, requestId, executorNonce, threadId, turnId, error,
-              ) => (
+              ) => {
+                if (control.kind === 'interjection') {
+                  store.deferInterjectionPause({
+                    interjectionId: control.id,
+                    requestId,
+                    executorNonce,
+                    threadId,
+                    turnId,
+                    error,
+                  })
+                  return
+                }
                 store.deferControlToNextTurn({
                   controlId: control.id,
                   requestId,
@@ -9833,7 +11458,7 @@ async function runCli(): Promise<void> {
                   turnId,
                   error,
                 })
-              ),
+              },
               finishTurn: ({
                 executorNonce, threadId, turnId, retainInput, rateLimitResumeAt,
               }) => store.finishAppServerTurn({
@@ -9855,9 +11480,72 @@ async function runCli(): Promise<void> {
                   resumeAt,
                 })
               ),
+              prepareInterjectionAnswer: ({ interjection, logicalNonce, threadId }) => (
+                store.prepareInterjectionAnswer({
+                  interjectionId: interjection.id,
+                  jobId: job.id,
+                  epoch: job.controlEpoch,
+                  logicalNonce,
+                  threadId,
+                })
+              ),
+              beginInterjectionAnswer: ({
+                interjection, logicalNonce, threadId, requestId,
+              }) => store.beginInterjectionAnswer({
+                interjectionId: interjection.id,
+                jobId: job.id,
+                epoch: job.controlEpoch,
+                logicalNonce,
+                threadId,
+                requestId,
+              }),
+              acknowledgeInterjectionAnswer: ({
+                interjection, logicalNonce, threadId, turnId, requestId,
+              }) => store.acknowledgeInterjectionAnswer({
+                interjectionId: interjection.id,
+                jobId: job.id,
+                workerId: job.workerId!,
+                epoch: job.controlEpoch,
+                logicalNonce,
+                threadId,
+                turnId,
+                requestId,
+              }),
+              rejectInterjectionAnswer: ({
+                interjection, logicalNonce, threadId, requestId, error,
+              }) => store.rejectInterjectionAnswer({
+                interjectionId: interjection.id,
+                logicalNonce,
+                threadId,
+                requestId,
+                error,
+              }),
+              stageInterjectionAnswer: ({
+                interjection, logicalNonce, threadId, turnId, disposition, answer,
+              }) => store.stageInterjectionAnswer({
+                interjectionId: interjection.id,
+                jobId: job.id,
+                epoch: job.controlEpoch,
+                logicalNonce,
+                threadId,
+                turnId,
+                disposition,
+                answer,
+              }),
+              interjectionDelivered: interjection => (
+                store.interjectionIsDelivered(interjection.id)
+              ),
+              promoteInterjection: interjection => (
+                store.promoteDeliveredInterjection(interjection.id)
+              ),
               cancellationRequested: () => store.get(job.id)?.cancelRequestedAt != null,
             },
             onMonitorMessage: message => mirrorMonitorMessage(message),
+            onCommentaryMessage: event => {
+              if (executionContext.reportCommentary(event) !== true) {
+                throw new Error('Codex commentary could not be staged for Slack delivery')
+              }
+            },
             onSuccessfulResult: rawExecution => {
               try {
                 const finalized = finalizeSuccessfulExecution(
