@@ -162,6 +162,17 @@ process_matches() {
   [[ "$command" =~ $expected ]]
 }
 
+maintenance_active() {
+  # A transaction journal by itself is not maintenance: after a crashed
+  # updater the orphaned services must still alert. Suppress only while the
+  # exact local update/restart owner is visibly alive.
+  if private_regular_file "$STATE_DIR/update-transaction.json" \
+      && process_matches "$STATE_DIR/update.lock/pid" '(update\.ts|setup\.sh)'; then
+    return 0
+  fi
+  process_matches "$STATE_DIR/restart.lock/pid" 'codex-channel\.sh'
+}
+
 prepare_state_dir() {
   if [ -L "$STATE_DIR" ]; then
     printf 'zerokun watchdog: unsafe state directory symlink: %s\n' "$STATE_DIR" >&2
@@ -329,7 +340,7 @@ send_notification() {
 prepare_state_transition() {
   /usr/bin/python3 - \
     "$STATE_FILE" "$NEXT_STATE_FILE" "$ALERT_FILE" \
-    "$bridge_up" "$runner_up" "$now_epoch" "$REALERT_MIN" <<'PY'
+    "$bridge_up" "$runner_up" "$maintenance" "$now_epoch" "$REALERT_MIN" <<'PY'
 import datetime as dt
 import json
 import os
@@ -338,8 +349,9 @@ import sys
 state_path, next_path, alert_path = sys.argv[1:4]
 bridge_up = sys.argv[4] == "1"
 runner_up = sys.argv[5] == "1"
-now = int(sys.argv[6])
-realert_seconds = int(sys.argv[7]) * 60
+maintenance = sys.argv[6] == "1"
+now = int(sys.argv[7])
+realert_seconds = int(sys.argv[8]) * 60
 default = {"status": "up", "downSince": None, "lastAlertAt": None, "consecutiveDownChecks": 0}
 try:
     with open(state_path, encoding="utf-8") as handle:
@@ -352,6 +364,18 @@ if bridge_up and runner_up:
     if state.get("status") == "down":
         alert = "✅ 応答できる状態に復旧しました。"
     next_state = default.copy()
+elif maintenance:
+    if state.get("status") == "down":
+        next_state = {
+            "status": "down",
+            "downSince": int(state.get("downSince") or now),
+            "lastAlertAt": state.get("lastAlertAt"),
+            "consecutiveDownChecks": max(2, int(state.get("consecutiveDownChecks") or 0)),
+        }
+    else:
+        # Planned downtime never creates a down incident or a later recovery
+        # notification. A pre-existing incident is preserved above.
+        next_state = default.copy()
 else:
     consecutive = int(state.get("consecutiveDownChecks") or 0) + 1
     down_since = int(state.get("downSince") or now)
@@ -414,11 +438,15 @@ run_watchdog() {
 
   bridge_up=0
   runner_up=0
+  maintenance=0
   process_matches "$STATE_DIR/plugin.lock" 'server\.ts' && bridge_up=1
   process_matches "$STATE_DIR/job-runner.lock/pid" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)' && runner_up=1
+  if [ "$bridge_up" != "1" ] || [ "$runner_up" != "1" ]; then
+    maintenance_active && maintenance=1
+  fi
   now_epoch="$(date +%s)"
   export STATE_DIR STATE_FILE NEXT_STATE_FILE ALERT_FILE REALERT_MIN
-  export bridge_up runner_up now_epoch
+  export bridge_up runner_up maintenance now_epoch
 
   if ! prepare_state_transition; then
     printf 'zerokun watchdog: state transition failed\n' >&2
@@ -440,10 +468,11 @@ run_watchdog() {
   fi
   rm -f "$ALERT_FILE"
 
-  printf '%s zerokun watchdog: bridge=%s runner=%s\n' \
+  printf '%s zerokun watchdog: bridge=%s runner=%s maintenance=%s\n' \
     "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
     "$([ "$bridge_up" = "1" ] && printf up || printf down)" \
-    "$([ "$runner_up" = "1" ] && printf up || printf down)"
+    "$([ "$runner_up" = "1" ] && printf up || printf down)" \
+    "$([ "$maintenance" = "1" ] && printf active || printf inactive)"
   return 0
 }
 
@@ -470,15 +499,19 @@ selftest_environment() {
 }
 
 selftest() {
-  local test_dir fake_server fake_runner server_pid runner_pid output
+  local test_dir fake_server fake_runner fake_update fake_restart server_pid runner_pid update_pid restart_pid output
   test_dir="$(mktemp -d "${TMPDIR:-/tmp}/zerokun-watchdog.XXXXXX")" || return 1
   fake_server="$test_dir/server.ts"
   fake_runner="$test_dir/job-runner.ts"
+  fake_update="$test_dir/update.ts"
+  fake_restart="$test_dir/codex-channel.sh"
   printf '#!/bin/bash\nexec -a "$0" sleep 30\n' > "$fake_server"
   printf '#!/bin/bash\nexec -a "$0 $1" sleep 30\n' > "$fake_runner"
+  printf '#!/bin/bash\nexec -a "$0" sleep 30\n' > "$fake_update"
+  printf '#!/bin/bash\nexec -a "$0 --restart" sleep 30\n' > "$fake_restart"
   /bin/bash "$fake_server" & server_pid=$!
   /bin/bash "$fake_runner" daemon & runner_pid=$!
-  trap "kill $server_pid $runner_pid 2>/dev/null || true; wait $server_pid $runner_pid 2>/dev/null || true; rm -rf '$test_dir'" EXIT
+  trap "kill $server_pid $runner_pid \${update_pid:-} \${restart_pid:-} 2>/dev/null || true; wait $server_pid $runner_pid \${update_pid:-} \${restart_pid:-} 2>/dev/null || true; rm -rf '$test_dir'" EXIT
   sleep 0.05
   mkdir -p "$test_dir/job-runner.lock"
   printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
@@ -487,6 +520,55 @@ selftest() {
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'healthy alert' || return 1
   printf 'ok: healthy sends nothing\n'
+
+  /bin/bash "$fake_update" & update_pid=$!
+  mkdir -p "$test_dir/update.lock"
+  printf '{}\n' > "$test_dir/update-transaction.json"
+  printf '%s\n' "$update_pid" > "$test_dir/update.lock/pid"
+  rm -f "$test_dir/plugin.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$output$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$output$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* && "$output" == *'maintenance=active'* ]] \
+    || selftest_fail 'active update maintenance alert' || return 1
+  printf 'ok: active update maintenance suppresses down alert\n'
+
+  kill "$update_pid" 2>/dev/null || true
+  wait "$update_pid" 2>/dev/null || true
+  update_pid=""
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'stale update first alert' || return 1
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" == *'🚨 現在、応答できない状態です'* ]] \
+    || selftest_fail 'stale update did not resume alerting' || return 1
+  printf 'ok: stale update maintenance resumes down alert\n'
+  printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
+  ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH" >/dev/null
+  rm -f "$test_dir/update-transaction.json" "$test_dir/update.lock/pid" \
+    "$test_dir/watchdog-state.json"
+
+  /bin/bash "$fake_restart" & restart_pid=$!
+  mkdir -p "$test_dir/restart.lock"
+  printf '%s\n' "$restart_pid" > "$test_dir/restart.lock/pid"
+  rm -f "$test_dir/plugin.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$output$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  output="$output$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* && "$output" == *'maintenance=active'* ]] \
+    || selftest_fail 'active restart maintenance alert' || return 1
+  printf 'ok: active restart maintenance suppresses down alert\n'
+  kill "$restart_pid" 2>/dev/null || true
+  wait "$restart_pid" 2>/dev/null || true
+  restart_pid=""
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'stale restart first alert' || return 1
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" == *'🚨 現在、応答できない状態です'* ]] \
+    || selftest_fail 'stale restart did not resume alerting' || return 1
+  printf 'ok: stale restart maintenance resumes down alert\n'
+  printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
+  ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH" >/dev/null
+  rm -f "$test_dir/restart.lock/pid" "$test_dir/watchdog-state.json"
 
   rm -f "$test_dir/plugin.lock"
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"

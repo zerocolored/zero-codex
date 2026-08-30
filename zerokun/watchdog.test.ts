@@ -20,6 +20,10 @@ describe('Zero-kun watchdog', () => {
 
     expect(result.exitCode, stderr).toBe(0)
     expect(stdout).toContain('ok: healthy sends nothing')
+    expect(stdout).toContain('ok: active update maintenance suppresses down alert')
+    expect(stdout).toContain('ok: stale update maintenance resumes down alert')
+    expect(stdout).toContain('ok: active restart maintenance suppresses down alert')
+    expect(stdout).toContain('ok: stale restart maintenance resumes down alert')
     expect(stdout).toContain('ok: transient down sends nothing')
     expect(stdout).toContain('ok: second down sends alert')
     expect(stdout).toContain('ok: down reminder is suppressed')

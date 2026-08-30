@@ -431,6 +431,7 @@ describe('codex-channel.sh replacement guard', () => {
     expect(result.output).not.toContain('起動を中止しました')
     expect(() => process.kill(gateway.pid, 0)).toThrow()
     expect(() => process.kill(runner.pid, 0)).not.toThrow()
+    expect(existsSync(join(state, 'restart.lock', 'pid'))).toBe(false)
   })
 
   test('zerochan --restartはSIGTERMを無視するgatewayもexact generationで回収する', async () => {
@@ -475,6 +476,7 @@ describe('codex-channel.sh replacement guard', () => {
     expect(result.output).toContain('同一generationのまま停止できません')
     expect(result.output).not.toContain('▶ Zeroちゃん')
     expect(() => process.kill(gateway.pid, 0)).not.toThrow()
+    expect(existsSync(join(state, 'restart.lock', 'pid'))).toBe(false)
   })
 
   test('legacy zerokunはlast recordがない初回も現在のGit directoryで起動できる', async () => {

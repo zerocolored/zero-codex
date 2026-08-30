@@ -174,10 +174,11 @@ function makeRepo(base: string) {
     '',
   ].join('\n'))
   writeFileSync(join(seed, 'server.ts'), [
-    "import { writeFileSync } from 'fs'",
+    "import { existsSync, writeFileSync } from 'fs'",
     "import { join } from 'path'",
     "import { acquire } from './zerokun/fixture-lock.ts'",
     'const state = process.env.ZEROKUN_STATE_DIR!',
+    "if (existsSync(join(state, 'fixture-gateway-fail'))) process.exit(79)",
     "acquire(join(state, 'plugin.lock'))",
     "writeFileSync(join(state, 'gateway-ready.json'), JSON.stringify({ runtime: 'codex', pid: process.pid, release: process.env.ZEROKUN_RELEASE_COMMIT, connectedAt: Date.now(), projectDir: process.env.ZEROKUN_PROJECT_DIR }))",
     "process.on('SIGTERM', () => process.exit(0))",
@@ -1250,6 +1251,12 @@ describe('updater helpers', () => {
       expect(paneRunArguments).not.toContain(updateRestartTokenDigest(replaceToken))
       expect(paneRunArguments).not.toContain('ZEROKUN_REPLACE_TOKEN=')
       expect(paneRunArguments).not.toContain('set -euo pipefail')
+      // The service child must return to the dedicated tab's shell when it
+      // stops. Replacing that shell with `exec` destroys the tab and leaves
+      // the next self-update pointing at a pane that no longer exists.
+      const paneCommand = paneRunArguments.split('\n').slice(3).join(' ').trimStart()
+      expect(paneCommand.startsWith("'exec' ")).toBe(false)
+      expect(paneCommand.startsWith("'/usr/bin/env' ")).toBe(true)
       expect(paneRunArguments).toContain('update-restart.ts')
       expect(paneRunArguments.length).toBeLessThan(1_024)
       const tabCreateArguments = readFileSync(join(fixture.base, 'herdr-tab-create.argv'), 'utf8')
@@ -1289,6 +1296,52 @@ describe('updater helpers', () => {
       expect(readFileSync(join(fixture.base, 'herdr-tab-close.argv'), 'utf8'))
         .toContain('tab\nclose\nwT:tR')
       expect(existsSync(join(fixture.base, 'herdr-runtime-tab-created'))).toBe(false)
+    } finally {
+      for (const key of herdrKeys) {
+        const value = previous[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  test('gateway readiness前に新runtimeがpublishされた失敗はtabを保持して再起動できる', async () => {
+    const fixture = updaterFixture()
+    chmodSync(fixture.state, 0o700)
+    const environment = serviceUpdaterEnvironment(fixture, 'unused-fixture-session')
+    writeFileSync(join(fixture.state, 'fixture-gateway-fail'), '1\n', { mode: 0o600 })
+    const herdrKeys = [
+      'HERDR_ENV', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'HERDR_PANE_ID',
+      'HERDR_TAB_ID', 'HERDR_TERMINAL_ID', 'HERDR_WORKSPACE_ID',
+    ] as const
+    const previous = Object.fromEntries(herdrKeys.map(key => [key, process.env[key]]))
+    for (const key of herdrKeys) process.env[key] = environment[key]
+    try {
+      await expect(startBotInHerdr({
+        rootRepo: fixture.repo.local,
+        stateDir: fixture.state,
+        projectDir: fixture.project,
+        startupTimeoutMs: 1_000,
+      })).rejects.toThrow('Herdr再起動')
+      expect(existsSync(join(fixture.base, 'herdr-runtime-tab-created'))).toBe(true)
+      expect(existsSync(join(fixture.state, 'herdr-service-tab.json'))).toBe(true)
+      expect(existsSync(join(fixture.base, 'herdr-tab-close.argv'))).toBe(false)
+      const pinned = JSON.parse(readFileSync(
+        join(fixture.state, 'herdr-runtime.json'), 'utf8',
+      )) as { paneId?: unknown; tabId?: unknown }
+      expect(pinned.paneId).toBe('wT:pR')
+      expect(pinned.tabId).toBe('wT:tR')
+
+      rmSync(join(fixture.state, 'fixture-gateway-fail'))
+      const started = await startBotInHerdr({
+        rootRepo: fixture.repo.local,
+        stateDir: fixture.state,
+        projectDir: fixture.project,
+        startupTimeoutMs: 3_000,
+      })
+      expect(started.paneId).toBe('wT:pR')
+      expect(existsSync(join(fixture.base, 'herdr-tab-close.argv'))).toBe(false)
+      rememberFixtureServices(fixture.state)
     } finally {
       for (const key of herdrKeys) {
         const value = previous[key]

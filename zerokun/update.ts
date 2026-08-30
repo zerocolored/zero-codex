@@ -2549,15 +2549,18 @@ export async function startBotInHerdr(options: {
 
   const recorded = readHerdrServiceTabRecord(options.stateDir)
   let runtime: HerdrRuntimeIdentity
+  let createdRuntimeTab = false
   if (recorded && sameHerdrRuntime(recorded, controlRuntime)) {
     try {
       requireOwnedHerdrServiceTab(controlRuntime, recorded)
       runtime = recorded
     } catch {
       runtime = await createHerdrServiceTab(controlRuntime, options.projectDir)
+      createdRuntimeTab = true
     }
   } else {
     runtime = await createHerdrServiceTab(controlRuntime, options.projectDir)
+    createdRuntimeTab = true
   }
 
   const restartRequestFile = join(options.stateDir, HERDR_RESTART_REQUEST_FILE)
@@ -2574,7 +2577,6 @@ export async function startBotInHerdr(options: {
     environment: requestEnvironment,
   })}\n`)
   const paneCommand = [
-    'exec',
     '/usr/bin/env',
     '-u', 'BUN_OPTIONS',
     '-u', 'BUN_CONFIG_PRELOAD',
@@ -2608,14 +2610,33 @@ export async function startBotInHerdr(options: {
   } catch (error) {
     rmSync(restartRequestFile, { force: true })
     let cleanupFailure: string | undefined
-    try {
-      closeOwnedHerdrServiceTab(controlRuntime, runtime)
-      rmSync(serviceTabRecordPath(options.stateDir), { force: true })
-    } catch (cleanupError) {
-      cleanupFailure = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+    let retainRuntimeTab = !createdRuntimeTab
+    if (createdRuntimeTab) {
+      try {
+        // The runner publishes the new pane before the gateway readiness file.
+        // If startup then fails, rollback must reuse that exact pane instead of
+        // deleting its own control plane and immediately hitting pane_not_found.
+        retainRuntimeTab = sameHerdrRuntime(readPinnedHerdrRuntime(options.stateDir), runtime)
+      } catch {
+        // An uncertain publication is safer to retain for transaction recovery
+        // than to close based on stale control-plane evidence.
+        retainRuntimeTab = true
+      }
+    }
+    if (retainRuntimeTab) {
+      try { writeHerdrServiceTabRecord(options.stateDir, runtime) } catch (recordError) {
+        cleanupFailure = recordError instanceof Error ? recordError.message : String(recordError)
+      }
+    } else {
+      try {
+        closeOwnedHerdrServiceTab(controlRuntime, runtime)
+        rmSync(serviceTabRecordPath(options.stateDir), { force: true })
+      } catch (cleanupError) {
+        cleanupFailure = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+      }
     }
     const reason = error instanceof Error ? error.message : String(error)
-    fail(`${reason}${cleanupFailure ? `\n専用runtime tabの回収失敗: ${cleanupFailure}` : ''}`)
+    fail(`${reason}${cleanupFailure ? `\n専用runtime tabの保持・回収失敗: ${cleanupFailure}` : ''}`)
   }
 }
 

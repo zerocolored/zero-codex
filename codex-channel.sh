@@ -99,6 +99,9 @@ JOB_RUNNER_PID="$STATE_DIR/job-runner.lock/pid"
 JOB_RUNNER_RUNTIME="$STATE_DIR/job-runner.lock/runtime"
 JOB_RUNNER_LOG="$STATE_DIR/job-runner.log"
 JOB_RUNNER_STARTER_LOCK="$STATE_DIR/job-runner-starter.lock"
+RESTART_MAINTENANCE_DIR="$STATE_DIR/restart.lock"
+RESTART_MAINTENANCE_LOCK="$RESTART_MAINTENANCE_DIR/pid"
+RESTART_MAINTENANCE_LEASE=""
 EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1"
 
 export ZEROKUN_STATE_DIR="$STATE_DIR"
@@ -124,6 +127,36 @@ lock_process_is() {
   local lock_file="$1" pid="$2" pattern="$3"
   process_command_is "$pid" "$pattern" || return 1
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-identity-check.ts" "$lock_file" "$pid" "$pattern"
+}
+
+release_restart_maintenance() {
+  [ -n "$RESTART_MAINTENANCE_LEASE" ] || return 0
+  if bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+    release "$RESTART_MAINTENANCE_LOCK" "$RESTART_MAINTENANCE_LEASE"; then
+    RESTART_MAINTENANCE_LEASE=""
+    return 0
+  fi
+  echo "❌ 再起動maintenance lockを安全に解放できません。" >&2
+  return 1
+}
+
+acquire_restart_maintenance() {
+  if [ -e "$RESTART_MAINTENANCE_DIR" ]; then
+    [ -d "$RESTART_MAINTENANCE_DIR" ] && [ ! -L "$RESTART_MAINTENANCE_DIR" ] \
+      || { echo "❌ 再起動maintenance directoryが安全ではありません。" >&2; return 1; }
+  else
+    mkdir -m 0700 "$RESTART_MAINTENANCE_DIR" \
+      || { echo "❌ 再起動maintenance directoryを作成できません。" >&2; return 1; }
+  fi
+  [ "$(/usr/bin/stat -f '%u:%Lp' "$RESTART_MAINTENANCE_DIR" 2>/dev/null)" \
+      = "$(/usr/bin/id -u):700" ] \
+    || { echo "❌ 再起動maintenance directoryの所有権または権限が不正です。" >&2; return 1; }
+  RESTART_MAINTENANCE_LEASE="$(bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/process-lock.ts" acquire "$RESTART_MAINTENANCE_LOCK" "$$")" \
+    || { echo "❌ 別の再起動処理が実行中です。" >&2; return 1; }
+  [ -n "$RESTART_MAINTENANCE_LEASE" ] \
+    || { echo "❌ 再起動maintenance lockを取得できません。" >&2; return 1; }
+  trap 'release_restart_maintenance || true' EXIT
 }
 
 require_route_capable_gateway_if_running() {
@@ -180,6 +213,14 @@ EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1:$RUNNER_RUNTIME_ID"
 if [ -f "$STATE_DIR/update-transaction.json" ] && [ "$AUTHORIZED_UPDATE_RESTART" != "1" ]; then
   echo "⚠️  未完了の自己更新を検出しました。旧版へ復旧します。" >&2
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/update.ts" --recover-only
+fi
+
+# A user-requested replacement is planned downtime, not a service failure.
+# Keep a generation-bound lease only while this launcher is responsible for
+# the gap; it is released before the final gateway exec so later real failures
+# can still alert normally.
+if [ "$LAUNCH_MODE" = "restart" ] && [ "$INVOKED_AS" = "zerochan" ]; then
+  acquire_restart_maintenance || exit 1
 fi
 
 # candidateへfast-forwardした直後にcrashした場合でも、候補版の最小Codex versionや
@@ -490,4 +531,6 @@ echo "   runtime : verified Herdr pane + job単位のCodex"
 echo "   trust   : read/writeともrepository sandbox / advisorは固定broker"
 echo "   caffeinate: ON (Ctrl-Cでgatewayを停止)"
 
+release_restart_maintenance || exit 1
+trap - EXIT
 exec caffeinate -dimsu bun --config=/dev/null --no-env-file "$REPO_DIR/server.ts"
