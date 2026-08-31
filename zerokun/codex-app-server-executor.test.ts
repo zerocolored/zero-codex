@@ -20,6 +20,11 @@ import {
   type CodexLiveControlHooks,
 } from './codex-executor.ts'
 import {
+  nativeAdvisorMarker,
+  nativeAdvisorResponseDigest,
+  type NativeAdvisorRoundEvidence,
+} from './native-advisor-evidence.ts'
+import {
   createDurableThreadHistorySnapshot,
   createThreadHistoryArchive,
 } from './thread-history.ts'
@@ -169,7 +174,7 @@ for line in sys.stdin:
     request_id = value.get("id")
     rpc_log = os.environ.get("ZERO_RPC_LOG")
     log_handshakes = os.environ.get("ZERO_LOG_HANDSHAKES") == "1"
-    if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list") or (log_handshakes and method in ("thread/start", "thread/resume"))):
+    if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
             stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId")}, ensure_ascii=False) + "\\n")
@@ -233,7 +238,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-native-history-resume", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -266,7 +271,7 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased", "phased-native-history-resume", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "準備完了\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
@@ -370,12 +375,20 @@ for line in sys.stdin:
         }}})
     elif method in ("thread/turns/list", "thread/read") and mode == "summary-stream-no-history":
         emit({"id": request_id, "error": {"code": -32000, "message": "history must not be requested"}})
+    elif method == "thread/turns/list" and mode == "phased-native-history-resume":
+        emit({"id": request_id, "result": {"data": [{
+            "id": "historical-parent-turn", "status": "completed",
+            "itemsView": "full", "items": [], "error": None,
+        }], "nextCursor": None}})
     elif method == "thread/turns/list":
         emit({"id": request_id, "result": {"data": [], "nextCursor": None}})
     elif method == "thread/read":
         emit({"id": request_id, "result": {"thread": {"id": requested_thread or thread_id, "turns": []}}})
     elif method == "thread/list":
-        emit({"id": request_id, "result": {"data": [], "nextCursor": None}})
+        children = [{
+            "id": "historical-child", "parentThreadId": requested_thread or thread_id,
+        }] if mode == "phased-native-history-resume" else []
+        emit({"id": request_id, "result": {"data": children, "nextCursor": None}})
     elif method == "turn/steer":
         if mode in ("interjection-answer", "interjection-update", "interjection-late-answer", "phased-interjection-update"):
             pause_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
@@ -507,7 +520,8 @@ function fixture(
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
     | 'failed-steer' | 'failed-turn'
-    | 'error-steer' | 'rate-error' | 'rate-retrying' | 'phased' | 'phased-steer'
+    | 'error-steer' | 'rate-error' | 'rate-retrying' | 'phased'
+    | 'phased-native-history-resume' | 'phased-steer'
     | 'phased-interjection-update' | 'missing-session-resume'
     | 'phased-late-inbound' | 'summary-stream-no-history' | 'logical-stop-required'
     | 'late-error-after-complete' | 'late-error-coalesced'
@@ -535,7 +549,21 @@ function fixture(
     task: '最初の依頼',
     writeEnabled,
   })
-  const job = store.claimNext('serial-worker')!
+  const initialJob = store.claimNext('serial-worker')!
+  let job = initialJob
+  if (mode === 'phased-native-history-resume') {
+    store.complete(initialJob.id, 'thread-app-server-1', '過去ジョブ完了')
+    store.enqueue({
+      chatId: initialJob.chatId,
+      threadTs: initialJob.threadTs,
+      messageId: '1800000000.000200',
+      userId: 'UROOT',
+      repoPath: repo,
+      task: '同じSlackスレッドから再開する依頼',
+      writeEnabled,
+    })
+    job = store.claimNext('serial-worker')!
+  }
   let staged = false
   const stageRequestedControl = () => {
     if (staged || ![
@@ -1125,6 +1153,239 @@ describe('production App Server executor', () => {
     expect(new Set(phaseRows.map(row => row[6])).size).toBe(1)
     expect(heldPhaseCounts).toEqual([1, 2, 3])
     expect(value.store.get(value.job.id)?.acceptsControl).toBe(false)
+    value.store.close()
+  }, 30_000)
+
+  test('同じSlack threadの再開jobは過去親turnを継承してnative履歴gateを通す', async () => {
+    const value = fixture('phased-native-history-resume', true)
+    const rpcLog = join(value.root, 'native-history-resume-rpc.log')
+    const gateStages: string[] = []
+    expect(value.job).toMatchObject({
+      seq: 2,
+      sessionId: 'thread-app-server-1',
+      resumed: true,
+    })
+
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-native-history-resume',
+        ZERO_RPC_LOG: rpcLog,
+        ZERO_LOG_HANDSHAKES: '1',
+      },
+      phaseGateForTesting: {},
+      nativeAdvisorHistoryFixtureForTesting: async evidence => {
+        gateStages.push(evidence.stage)
+        expect(evidence.parentThreadId).toBe('thread-app-server-1')
+        expect(evidence.parentChildBaseline).toEqual(['historical-child'])
+        expect(evidence.parentTurnBaseline).toEqual([{
+          id: 'historical-parent-turn', status: 'completed',
+        }])
+        expect(evidence.parentTurnIds).toHaveLength(evidence.stage === 'prepare' ? 1 : 3)
+
+        const phase = evidence.stage === 'prepare' ? 'investigation' : 'review'
+        const childSpecs = (['solution', 'risk'] as const).map(perspective => ({
+          id: `${evidence.stage}-${perspective}-child`,
+          perspective,
+          role: perspective === 'solution' ? 'solution_analyst' : 'risk_reviewer',
+        }))
+        const response = (perspective: 'solution' | 'risk') => (
+          `${perspective} ${evidence.stage} response\n${nativeAdvisorMarker(
+            evidence.attemptNonce,
+            evidence.input.revision,
+            evidence.input.digest,
+            phase,
+            evidence.reviewRound,
+            perspective,
+          )}`
+        )
+        const rounds: NativeAdvisorRoundEvidence[] = [{
+          inputRevision: evidence.input.revision,
+          inputDigest: evidence.input.digest,
+          phase,
+          round: evidence.reviewRound,
+          native: childSpecs.map(child => ({
+            perspective: child.perspective,
+            agentId: child.id,
+            responseDigest: nativeAdvisorResponseDigest(response(child.perspective)),
+          })),
+        }]
+        const parentTurns = [
+          {
+            id: 'historical-parent-turn', status: 'completed',
+            itemsView: 'full', items: [], error: null,
+          },
+          ...evidence.parentTurnIds.map((id, index) => ({
+            id,
+            status: 'completed',
+            itemsView: 'full',
+            items: index === evidence.parentTurnIds.length - 1
+              ? childSpecs.map(child => ({
+                type: 'subAgentActivity',
+                id: `${child.id}-activity`,
+                kind: 'started',
+                agentThreadId: child.id,
+              }))
+              : [],
+            error: null,
+          })),
+        ]
+        const metadata = new Map<string, Record<string, unknown>>([
+          [evidence.parentThreadId, {
+            id: evidence.parentThreadId,
+            parentThreadId: null,
+            cwd: evidence.repoPath,
+            source: evidence.parentSource,
+          }],
+          ['historical-child', {
+            id: 'historical-child',
+            parentThreadId: evidence.parentThreadId,
+            cwd: evidence.repoPath,
+            source: { subAgent: { thread_spawn: {
+              parent_thread_id: evidence.parentThreadId,
+              depth: 1,
+              agent_role: 'solution_analyst',
+            } } },
+            agentRole: 'solution_analyst',
+          }],
+          ...childSpecs.map(child => [child.id, {
+            id: child.id,
+            parentThreadId: evidence.parentThreadId,
+            cwd: evidence.repoPath,
+            source: { subAgent: { thread_spawn: {
+              parent_thread_id: evidence.parentThreadId,
+              depth: 1,
+              agent_role: child.role,
+            } } },
+            agentRole: child.role,
+          }] as [string, Record<string, unknown>]),
+        ])
+        const turns = new Map<string, Array<Record<string, unknown>>>([
+          [evidence.parentThreadId, parentTurns],
+          ['historical-child', []],
+          ...childSpecs.map(child => [child.id, [
+            ...parentTurns.map(turn => ({ ...turn, items: [] })),
+            {
+              id: `${child.id}-owned-turn`,
+              status: 'completed',
+              itemsView: 'full',
+              items: [{
+                type: 'agentMessage',
+                id: `${child.id}-final`,
+                phase: 'final_answer',
+                text: response(child.perspective),
+              }],
+              error: null,
+            },
+          ]] as [string, Array<Record<string, unknown>>]),
+        ])
+        const directChildren = [
+          { id: 'historical-child', parentThreadId: evidence.parentThreadId },
+          ...childSpecs.map(child => ({
+            id: child.id, parentThreadId: evidence.parentThreadId,
+          })),
+        ]
+        const readForTesting = async (
+          method: 'thread/read' | 'thread/list' | 'thread/turns/list' | 'thread/items/list',
+          params: Record<string, unknown>,
+        ): Promise<Record<string, unknown>> => {
+          const threadId = String(params.threadId ?? '')
+          if (method === 'thread/list') {
+            return {
+              data: params.parentThreadId === evidence.parentThreadId ? directChildren : [],
+              nextCursor: null,
+            }
+          }
+          const thread = metadata.get(threadId)
+          if (!thread) throw new Error(`fixture omitted native thread ${threadId}`)
+          const threadTurns = turns.get(threadId) ?? []
+          if (method === 'thread/read') {
+            return {
+              thread: params.includeTurns === true
+                ? { ...thread, turns: threadTurns }
+                : thread,
+            }
+          }
+          if (method === 'thread/turns/list') {
+            return { data: threadTurns, nextCursor: null }
+          }
+          const selected = threadTurns.find(turn => turn.id === params.turnId)
+          const items = Array.isArray(selected?.items) ? selected.items : []
+          return {
+            data: items.map(item => ({ turnId: params.turnId, item })),
+            nextCursor: null,
+          }
+        }
+
+        return { rounds, readForTesting }
+      },
+      liveControls: value.hooks,
+    })
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(gateStages).toEqual(['prepare', 'review'])
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    const firstTurnStart = rpc.findIndex(entry => entry.method === 'turn/start')
+    const turnBaseline = rpc.findIndex(entry => entry.method === 'thread/turns/list')
+    expect(firstTurnStart).toBeGreaterThan(turnBaseline)
+    expect(turnBaseline).toBeGreaterThanOrEqual(0)
+    expect(rpc.filter(entry => entry.method === 'thread/turns/list')).toHaveLength(1)
+    expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(3)
+    value.store.complete(value.job.id, result.sessionId, result.result)
+    expect(value.store.get(value.job.id)?.status).toBe('completed')
+    value.store.close()
+  }, 30_000)
+
+  test('native履歴fixtureはproduction executorの検証を置換できない', async () => {
+    const value = fixture('phased-native-history-resume', true)
+    await expect(executeCodexJob(value.job, {
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      nativeAdvisorHistoryFixtureForTesting: async () => {
+        throw new Error('fixture callback must not run')
+      },
+      liveControls: value.hooks,
+    })).rejects.toThrow(
+      'nativeAdvisorHistoryFixtureForTesting cannot replace production advisor verification',
+    )
+    value.store.close()
+  })
+
+  test('再開jobのnative履歴不一致はpublication前にexecutorを失敗させる', async () => {
+    const value = fixture('phased-native-history-resume', true)
+    let gateCalls = 0
+    await expect(executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'phased-native-history-resume' },
+      phaseGateForTesting: {},
+      nativeAdvisorHistoryFixtureForTesting: async evidence => {
+        gateCalls += 1
+        return {
+          rounds: [],
+          readForTesting: async method => (
+            method === 'thread/read'
+              ? { thread: {
+                id: evidence.parentThreadId,
+                parentThreadId: null,
+                cwd: evidence.repoPath,
+                source: evidence.parentSource,
+                turns: [],
+              } }
+              : { data: [], nextCursor: null }
+          ),
+        }
+      },
+      liveControls: value.hooks,
+    })).rejects.toThrow('omitted completed turn')
+    expect(gateCalls).toBe(1)
+    expect(value.store.get(value.job.id)?.status).toBe('running')
     value.store.close()
   }, 30_000)
 

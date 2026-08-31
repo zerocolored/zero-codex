@@ -1942,6 +1942,26 @@ type NativeAdvisorParentTurnBaselineEntry = {
 }
 type NativeAdvisorParentTurnBaseline = NativeAdvisorParentTurnBaselineEntry[]
 
+type NativeAdvisorHistoryFixtureEvidence = {
+  stage: 'complete' | 'prepare' | 'review'
+  reviewRound: 1 | 2 | 3
+  input: AdvisorInputSnapshot
+  codexBin: string
+  repoPath: string
+  permissionOverrides: string[]
+  attemptNonce: string
+  parentThreadId: string
+  parentSource: AppServerSessionSource
+  parentChildBaseline: string[]
+  parentTurnBaseline: NativeAdvisorParentTurnBaseline
+  parentTurnIds: string[]
+}
+
+type NativeAdvisorHistoryFixture = {
+  rounds: NativeAdvisorRoundEvidence[]
+  readForTesting: NativeHistoryReader
+}
+
 function nativeHistoryRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} is invalid`)
@@ -4304,6 +4324,14 @@ export async function executeCodexJob(
       validatePreparation?(input: AdvisorInputSnapshot, repositoryDigest: string): void | Promise<void>
       validateReview?(input: AdvisorInputSnapshot, repositoryDigest: string, round: 1 | 2 | 3): void | Promise<void>
     }
+    /**
+     * Fixture-only publication gate which receives the exact native-history
+     * binding assembled by the production executor. Tests may pass it to the
+     * real `assertNativeAdvisorHistory(..., readForTesting)` implementation.
+     */
+    nativeAdvisorHistoryFixtureForTesting?(
+      evidence: NativeAdvisorHistoryFixtureEvidence,
+    ): NativeAdvisorHistoryFixture | Promise<NativeAdvisorHistoryFixture>
     onProcessId?(processId: number): void
     onSessionId?(sessionId: string): void
     onSessionReset?(): void
@@ -4378,6 +4406,11 @@ export async function executeCodexJob(
   const testCodexBin = options.codexBinForTesting
   if (testCodexBin === undefined && options.phaseGateForTesting) {
     throw new Error('phaseGateForTesting cannot replace production advisor verification')
+  }
+  if (testCodexBin === undefined && options.nativeAdvisorHistoryFixtureForTesting) {
+    throw new Error(
+      'nativeAdvisorHistoryFixtureForTesting cannot replace production advisor verification',
+    )
   }
   if (testCodexBin === undefined && process.env.ZEROKUN_CODEX_BIN !== undefined) {
     throw new Error(
@@ -4482,9 +4515,43 @@ export async function executeCodexJob(
   const brokerPath = requireSafeBroker('advisor-broker.ts')
   const browserBrokerPath = requireSafeBroker('browser-verification-broker.ts')
   const localAdvisorAccess = herdrRuntime !== undefined
+  const nativeAdvisorHistoryEnabled = localAdvisorAccess
+    || options.nativeAdvisorHistoryFixtureForTesting !== undefined
+  const verifyNativeAdvisorHistoryForPublication = async (
+    evidence: NativeAdvisorHistoryFixtureEvidence & {
+      seatbeltFingerprint?: SeatbeltFingerprint
+    },
+    productionRounds?: NativeAdvisorRoundEvidence[],
+  ): Promise<void> => {
+    let rounds = productionRounds
+    let readForTesting: NativeHistoryReader | undefined
+    if (options.nativeAdvisorHistoryFixtureForTesting) {
+      const fixture = await options.nativeAdvisorHistoryFixtureForTesting(evidence)
+      rounds = fixture.rounds
+      readForTesting = fixture.readForTesting
+    }
+    if (!rounds) throw new Error('native advisor history verification omitted its rounds')
+    await assertNativeAdvisorHistory({
+      codexBin: evidence.codexBin,
+      repoPath: evidence.repoPath,
+      permissionOverrides: evidence.permissionOverrides,
+      attemptNonce: evidence.attemptNonce,
+      parentThreadId: evidence.parentThreadId,
+      parentSource: evidence.parentSource,
+      parentChildBaseline: evidence.parentChildBaseline,
+      parentTurnBaseline: evidence.parentTurnBaseline,
+      parentTurnIds: evidence.parentTurnIds,
+      rounds,
+      seatbeltFingerprint: evidence.seatbeltFingerprint,
+      seatbeltStateDir: managedStateDir,
+      signal: options.signal,
+      revalidate: revalidateCodexExecutable,
+      readForTesting,
+    })
+  }
   type ExecutionStage = 'complete' | 'prepare' | 'implementation' | 'review' | 'interjection'
   const phasedWrite = job.writeEnabled && options.liveControls !== undefined
-    && (localAdvisorAccess || options.phaseGateForTesting !== undefined)
+    && (nativeAdvisorHistoryEnabled || options.phaseGateForTesting !== undefined)
 
   const prepareLogicalAttempt = () => {
     const attemptNonce = randomUUID().replaceAll('-', '')
@@ -5606,12 +5673,12 @@ export async function executeCodexJob(
         options.onSessionId?.(currentThreadId)
         observedSessionId = currentThreadId
         if (parentChildBaseline === null) {
-          parentChildBaseline = localAdvisorAccess
+          parentChildBaseline = nativeAdvisorHistoryEnabled
             ? await captureNativeAdvisorParentChildBaseline(session, currentThreadId)
             : []
         }
         if (parentTurnBaseline === null) {
-          parentTurnBaseline = localAdvisorAccess
+          parentTurnBaseline = nativeAdvisorHistoryEnabled
             ? await captureNativeAdvisorParentTurnBaseline(session, currentThreadId)
             : []
         }
@@ -6956,6 +7023,7 @@ export async function executeCodexJob(
           currentRepositoryDigest = advisorRepositoryDigest(
             snapshotAdvisorRepository(advisorProjectLayout),
           )
+          let preparationRounds: NativeAdvisorRoundEvidence[] | undefined
           if (options.phaseGateForTesting) {
             await options.phaseGateForTesting.validatePreparation?.(
               finalInput,
@@ -6963,7 +7031,7 @@ export async function executeCodexJob(
             )
           } else {
             if (herdrRuntime) await verifyHerdrRuntimeIdentityAsync(herdrRuntime)
-            const rounds = assertRequiredAdvisorPreparationRounds(
+            preparationRounds = assertRequiredAdvisorPreparationRounds(
               job,
               managedStateDir,
               execution.advisorContextDigest,
@@ -6972,7 +7040,12 @@ export async function executeCodexJob(
               execution.initialRepositoryDigest,
               currentRepositoryDigest,
             )
-            await assertNativeAdvisorHistory({
+          }
+          if (nativeAdvisorHistoryEnabled) {
+            await verifyNativeAdvisorHistoryForPublication({
+              stage: 'prepare',
+              reviewRound: 1,
+              input: finalInput,
               codexBin,
               repoPath: job.repoPath,
               permissionOverrides: execution.advisorPermissionOverrides,
@@ -6985,13 +7058,9 @@ export async function executeCodexJob(
               parentTurnBaseline: parentTurnBaseline ?? (() => {
                 throw new Error('Codex App Server omitted the pre-turn parent history')
               })(),
-              parentTurnIds,
-              rounds,
+              parentTurnIds: [...parentTurnIds],
               seatbeltFingerprint: execution.seatbeltFingerprint,
-              seatbeltStateDir: managedStateDir,
-              signal: options.signal,
-              revalidate: revalidateCodexExecutable,
-            })
+            }, preparationRounds)
           }
           if (preparationDecision.kind === 'ready' && options.uiApproval) {
             assertUiApprovalReadyMayProceed({
@@ -7109,6 +7178,7 @@ export async function executeCodexJob(
         const currentRepositoryDigest = advisorRepositoryDigest(
           snapshotAdvisorRepository(advisorProjectLayout),
         )
+        let advisorRounds: NativeAdvisorRoundEvidence[] | undefined
         if (options.phaseGateForTesting) {
           await options.phaseGateForTesting.validateReview?.(
             finalInput,
@@ -7117,7 +7187,7 @@ export async function executeCodexJob(
           )
         } else {
           if (herdrRuntime) await verifyHerdrRuntimeIdentityAsync(herdrRuntime)
-          const rounds = assertRequiredAdvisorRounds(
+          advisorRounds = assertRequiredAdvisorRounds(
             job,
             managedStateDir,
             execution.advisorContextDigest,
@@ -7126,7 +7196,12 @@ export async function executeCodexJob(
             execution.initialRepositoryDigest,
             currentRepositoryDigest,
           )
-          await assertNativeAdvisorHistory({
+        }
+        if (nativeAdvisorHistoryEnabled) {
+          await verifyNativeAdvisorHistoryForPublication({
+            stage: 'review',
+            reviewRound,
+            input: finalInput,
             codexBin,
             repoPath: job.repoPath,
             permissionOverrides: execution.advisorPermissionOverrides,
@@ -7139,13 +7214,9 @@ export async function executeCodexJob(
             parentTurnBaseline: parentTurnBaseline ?? (() => {
               throw new Error('Codex App Server omitted the pre-turn parent history')
             })(),
-            parentTurnIds,
-            rounds,
+            parentTurnIds: [...parentTurnIds],
             seatbeltFingerprint: execution.seatbeltFingerprint,
-            seatbeltStateDir: managedStateDir,
-            signal: options.signal,
-            revalidate: revalidateCodexExecutable,
-          })
+          }, advisorRounds)
         }
         decision = parseCodexReviewDecision(
           execution.finalMessage,
@@ -7412,9 +7483,10 @@ export async function executeCodexJob(
         // not necessarily the input represented by the accepted final answer.
         // Once the turn barrier closes input, the durable ledger is stable and
         // is the authoritative binding for publication.
-        finalInput = completeControls || localAdvisorAccess
+        finalInput = completeControls || nativeAdvisorHistoryEnabled
           ? readAdvisorInputSnapshot(managedStateDir, job.id)
           : null
+        let completeAdvisorRounds: NativeAdvisorRoundEvidence[] | undefined
         if (localAdvisorAccess) {
           if (!finalInput) {
             throw new Error('managed Codex execution omitted its durable final input')
@@ -7423,7 +7495,7 @@ export async function executeCodexJob(
           const currentRepositoryDigest = advisorRepositoryDigest(
             snapshotAdvisorRepository(advisorProjectLayout),
           )
-          const advisorRounds = assertRequiredAdvisorRounds(
+          completeAdvisorRounds = assertRequiredAdvisorRounds(
             job,
             managedStateDir,
             execution.advisorContextDigest,
@@ -7432,7 +7504,15 @@ export async function executeCodexJob(
             execution.initialRepositoryDigest,
             currentRepositoryDigest,
           )
-          await assertNativeAdvisorHistory({
+        }
+        if (nativeAdvisorHistoryEnabled) {
+          if (!finalInput) {
+            throw new Error('native advisor history omitted its durable final input')
+          }
+          await verifyNativeAdvisorHistoryForPublication({
+            stage: 'complete',
+            reviewRound: 1,
+            input: finalInput,
             codexBin,
             repoPath: job.repoPath,
             permissionOverrides: execution.advisorPermissionOverrides,
@@ -7443,13 +7523,9 @@ export async function executeCodexJob(
             })(),
             parentChildBaseline: completeParentChildBaseline ?? execution.parentChildBaseline,
             parentTurnBaseline: completeParentTurnBaseline ?? execution.parentTurnBaseline,
-            parentTurnIds: completeParentTurnIds,
-            rounds: advisorRounds,
+            parentTurnIds: [...completeParentTurnIds],
             seatbeltFingerprint: execution.seatbeltFingerprint,
-            seatbeltStateDir: managedStateDir,
-            signal: options.signal,
-            revalidate: revalidateCodexExecutable,
-          })
+          }, completeAdvisorRounds)
         }
         result = {
           sessionId: resolvedSessionId,
