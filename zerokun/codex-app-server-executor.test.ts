@@ -30,6 +30,13 @@ import {
   createThreadHistoryArchive,
 } from './thread-history.ts'
 import { prepareManagedStateRoot } from './managed-path.ts'
+import { readAdvisorInputSnapshot } from './advisor-input.ts'
+import {
+  advisorRepositoryDigest,
+  advisorRepositoryScopeDigest,
+  resolveAdvisorProjectLayout,
+  snapshotAdvisorRepository,
+} from './advisor-snapshot.ts'
 
 const roots: string[] = []
 afterEach(() => {
@@ -41,6 +48,17 @@ function secureRoot(): string {
   chmodSync(root, 0o700)
   roots.push(root)
   return root
+}
+
+function git(cwd: string, args: string[]): void {
+  const result = Bun.spawnSync(['/usr/bin/git', '-C', cwd, ...args], {
+    stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    env: {
+      PATH: '/usr/bin:/bin', HOME: '/', GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
+    },
+  })
+  if (result.exitCode !== 0) throw new Error(result.stderr.toString())
 }
 
 function cleanupGatePaths(stateDir: string, supervisorPid: number): {
@@ -239,7 +257,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -272,10 +290,15 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "準備完了\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
+                if mode == "phased-ui-approved":
+                    envelope = re.search(r"<zerokun_ui_response_decision>([^\\n]+)</zerokun_ui_response_decision>", phase_prompt)
+                    if envelope:
+                        semantic = envelope.group(0).replace("<approve|revise|question|reject>", "approve").replace("<unchanged|compatible|conflict>", "unchanged")
+                        message = semantic + "\\n" + message
             elif stage == "implementation":
                 marker = re.search(r"\\[ZERO_IMPLEMENTATION_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "実装完了\\n" + (marker.group(0) if marker else "[ZERO_IMPLEMENTATION_READY:missing:r1:missing]")
@@ -557,7 +580,8 @@ function fixture(
     | 'failed-steer' | 'failed-turn'
     | 'error-steer' | 'rate-error' | 'rate-retrying' | 'capacity-error'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
-    | 'capacity-started-command' | 'phased' | 'phased-capacity-review-once'
+    | 'capacity-started-command' | 'phased' | 'phased-ui-approved'
+    | 'phased-capacity-review-once'
     | 'phased-capacity-implementation-once'
     | 'phased-native-history-fresh' | 'phased-native-history-resume'
     | 'phased-native-history-resume-unmaterialized' | 'phased-steer'
@@ -1289,6 +1313,146 @@ describe('production App Server executor', () => {
     expect(value.store.writePhaseMayHaveBeenDelivered(value.job.id)).toBe(false)
     value.store.close()
   }, 15_000)
+
+  test('UI承認済みmulti-repo jobは対象外repoの同時更新でprepareへ戻らない', async () => {
+    const value = fixture('phased-ui-approved', true)
+    const makeRepository = (name: string): string => {
+      const repository = join(value.repo, name)
+      mkdirSync(repository)
+      git(repository, ['init', '-q'])
+      git(repository, ['config', 'user.name', 'Zero Test'])
+      git(repository, ['config', 'user.email', 'zero@example.invalid'])
+      writeFileSync(join(repository, 'tracked.txt'), `${name}\n`, { mode: 0o600 })
+      git(repository, ['add', '.'])
+      git(repository, ['commit', '-qm', 'initial'])
+      return repository
+    }
+    const backend = makeRepository('backend')
+    makeRepository('frontend')
+    const layout = resolveAdvisorProjectLayout(value.repo)
+    const proposalSnapshot = snapshotAdvisorRepository(layout)
+    const inputSnapshot = readAdvisorInputSnapshot(value.state, value.job.id)
+    const phaseLog = join(value.root, 'scoped-ui-phases.log')
+    let processExits = 0
+
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-ui-approved',
+        ZERO_PHASE_LOG: phaseLog,
+      },
+      phaseGateForTesting: {},
+      uiApproval: {
+        requestId: 'ui-scope-request',
+        requestInputRevision: inputSnapshot.revision,
+        requestInputDigest: inputSnapshot.digest,
+        responseInputRevision: inputSnapshot.revision,
+        responseInputDigest: inputSnapshot.digest,
+        responseMessageId: '1800000000.000200',
+        responseText: '承認する',
+        responseAfterPrompt: true,
+        repositoryDigest: advisorRepositoryDigest(proposalSnapshot),
+        repositorySnapshot: proposalSnapshot,
+        repositoryScope: ['frontend'],
+        repositoryScopeDigest: advisorRepositoryScopeDigest(
+          proposalSnapshot,
+          ['frontend'],
+        ),
+        proposalText: 'frontendの待機画面を更新します。',
+      },
+      onProcessExit: () => {
+        processExits += 1
+        if (processExits === 1) {
+          writeFileSync(join(backend, 'tracked.txt'), 'concurrent backend change\n', {
+            mode: 0o600,
+          })
+        } else if (processExits === 3) {
+          writeFileSync(join(backend, 'tracked.txt'), 'backend changed during review\n', {
+            mode: 0o600,
+          })
+        }
+      },
+      liveControls: value.hooks,
+    })
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])
+    expect(stages).toEqual(['prepare', 'implementation', 'review'])
+    expect(stages.filter(stage => stage === 'prepare')).toHaveLength(1)
+    expect(processExits).toBe(3)
+    value.store.close()
+  }, 30_000)
+
+  test('UI承認済みmulti-repo jobは対象repoの同時更新をimplementation前に止める', async () => {
+    const value = fixture('phased-ui-approved', true)
+    const makeRepository = (name: string): string => {
+      const repository = join(value.repo, name)
+      mkdirSync(repository)
+      git(repository, ['init', '-q'])
+      git(repository, ['config', 'user.name', 'Zero Test'])
+      git(repository, ['config', 'user.email', 'zero@example.invalid'])
+      writeFileSync(join(repository, 'tracked.txt'), `${name}\n`, { mode: 0o600 })
+      git(repository, ['add', '.'])
+      git(repository, ['commit', '-qm', 'initial'])
+      return repository
+    }
+    makeRepository('backend')
+    const frontend = makeRepository('frontend')
+    const layout = resolveAdvisorProjectLayout(value.repo)
+    const proposalSnapshot = snapshotAdvisorRepository(layout)
+    const inputSnapshot = readAdvisorInputSnapshot(value.state, value.job.id)
+    const phaseLog = join(value.root, 'scoped-ui-target-drift-phases.log')
+    let processExits = 0
+
+    await expect(executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-ui-approved',
+        ZERO_PHASE_LOG: phaseLog,
+      },
+      phaseGateForTesting: {},
+      uiApproval: {
+        requestId: 'ui-target-drift-request',
+        requestInputRevision: inputSnapshot.revision,
+        requestInputDigest: inputSnapshot.digest,
+        responseInputRevision: inputSnapshot.revision,
+        responseInputDigest: inputSnapshot.digest,
+        responseMessageId: '1800000000.000201',
+        responseText: '承認する',
+        responseAfterPrompt: true,
+        repositoryDigest: advisorRepositoryDigest(proposalSnapshot),
+        repositorySnapshot: proposalSnapshot,
+        repositoryScope: ['frontend'],
+        repositoryScopeDigest: advisorRepositoryScopeDigest(
+          proposalSnapshot,
+          ['frontend'],
+        ),
+        proposalText: 'frontendの待機画面を更新します。',
+      },
+      onProcessExit: () => {
+        processExits += 1
+        if (processExits === 1) {
+          writeFileSync(join(frontend, 'tracked.txt'), 'concurrent frontend change\n', {
+            mode: 0o600,
+          })
+        }
+      },
+      liveControls: value.hooks,
+    })).rejects.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
+
+    const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])
+    expect(stages).toEqual(['prepare'])
+    expect(value.store.writePhaseMayHaveBeenDelivered(value.job.id)).toBe(false)
+    value.store.close()
+  }, 30_000)
 
   test('fresh Slack jobは未materialize履歴APIを呼ばず空baselineでpublication gateを通す', async () => {
     const value = fixture('phased-native-history-fresh', true)

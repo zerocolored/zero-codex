@@ -105,6 +105,8 @@ describe('Codex UI/UX approval decision contract', () => {
     responseAfterPrompt: true,
     repositoryDigest: 'b'.repeat(64),
     repositorySnapshot: snapshot,
+    repositoryScope: null,
+    repositoryScopeDigest: null,
     proposalText: '承認待ちの提案です。',
   })
   const semanticDecision = (
@@ -122,7 +124,7 @@ describe('Codex UI/UX approval decision contract', () => {
     responseInputDigest: approval.responseInputDigest,
     responseMessageId: approval.responseMessageId,
     responseAfterPrompt: approval.responseAfterPrompt,
-    proposalRepositoryDigest: approval.repositoryDigest,
+    proposalRepositoryDigest: approval.repositoryScopeDigest ?? approval.repositoryDigest,
     currentRepositoryDigest,
     intent,
     repositoryState,
@@ -141,7 +143,7 @@ describe('Codex UI/UX approval decision contract', () => {
     const decision = parseCodexPreparationDecision([
       `[ZERO_UI_APPROVAL_REQUIRED:${nonce}:r3:${input.digest}]`,
       '情報階層を整理した案です。この方向で進めてよいですか？',
-      '<zerokun_ui_approval>{"before":"/private/outbox/before.png","after":"/private/outbox/after.png"}</zerokun_ui_approval>',
+      '<zerokun_ui_approval>{"before":"/private/outbox/before.png","after":"/private/outbox/after.png","repositories":["."]}</zerokun_ui_approval>',
     ].join('\n'), nonce, input)
     expect(decision).toEqual({
       kind: 'approval-required',
@@ -149,6 +151,7 @@ describe('Codex UI/UX approval decision contract', () => {
         text: '情報階層を整理した案です。この方向で進めてよいですか？',
         beforePath: '/private/outbox/before.png',
         afterPath: '/private/outbox/after.png',
+        repositoryScope: ['.'],
       },
     })
   })
@@ -158,17 +161,17 @@ describe('Codex UI/UX approval decision contract', () => {
     expect(() => parseCodexPreparationDecision([
       marker,
       '提案です /private/outbox/before.png',
-      '<zerokun_ui_approval>{"before":"/private/outbox/before.png","after":"/private/outbox/after.png"}</zerokun_ui_approval>',
+      '<zerokun_ui_approval>{"before":"/private/outbox/before.png","after":"/private/outbox/after.png","repositories":["."]}</zerokun_ui_approval>',
     ].join('\n'), nonce, input)).toThrow('must not expose')
     expect(() => parseCodexPreparationDecision([
       marker,
       '提案です',
-      '<zerokun_ui_approval>{"before":"/private/outbox/same.png","after":"/private/outbox/same.png"}</zerokun_ui_approval>',
+      '<zerokun_ui_approval>{"before":"/private/outbox/same.png","after":"/private/outbox/same.png","repositories":["."]}</zerokun_ui_approval>',
     ].join('\n'), nonce, input)).toThrow('must be distinct')
     expect(() => parseCodexPreparationDecision([
       marker,
       '提案です',
-      '<zerokun_ui_approval>{"before":"/private/outbox/before.png","after":"/private/outbox/after.png"}</zerokun_ui_approval>',
+      '<zerokun_ui_approval>{"before":"/private/outbox/before.png","after":"/private/outbox/after.png","repositories":["."]}</zerokun_ui_approval>',
       'trailing',
     ].join('\n'), nonce, input)).toThrow('omitted its exact')
   })
@@ -193,6 +196,46 @@ describe('Codex UI/UX approval decision contract', () => {
     })
     expect(template).toContain('"intent":"<approve|revise|question|reject>"')
     expect(template).toContain('"repositoryState":"<unchanged|compatible|conflict>"')
+  })
+
+  test('proposal repository scope is exact and the semantic decision binds its scoped digest', () => {
+    const proposal = [
+      `[ZERO_UI_APPROVAL_REQUIRED:${nonce}:r3:${input.digest}]`,
+      '対象画面だけを更新する提案です。',
+      '<zerokun_ui_approval>{"before":"/private/outbox/before.png","after":"/private/outbox/after.png","repositories":["frontend"]}</zerokun_ui_approval>',
+    ].join('\n')
+    expect(parseCodexPreparationDecision(
+      proposal,
+      nonce,
+      input,
+      undefined,
+      ['backend', 'frontend'],
+    )).toMatchObject({
+      kind: 'approval-required',
+      proposal: { repositoryScope: ['frontend'] },
+    })
+    expect(() => parseCodexPreparationDecision(
+      proposal.replace('["frontend"]', '["unknown"]'),
+      nonce,
+      input,
+      undefined,
+      ['backend', 'frontend'],
+    )).toThrow('repository scope')
+
+    const approval = {
+      ...context(),
+      repositoryScope: ['frontend'],
+      repositoryScopeDigest: 'e'.repeat(64),
+    }
+    const decision = semanticDecision(approval, 'f'.repeat(64))
+    expect(decision.proposalRepositoryDigest).toBe(approval.repositoryScopeDigest)
+    expect(parseCodexPreparationDecision([
+      semanticEnvelope(decision),
+      `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
+    ].join('\n'), nonce, input, {
+      context: approval,
+      currentRepositoryDigest: decision.currentRepositoryDigest,
+    })).toMatchObject({ kind: 'ready' })
   })
 
   test('host gate accepts a compatible repository change and rejects stale or conflicting meaning', () => {

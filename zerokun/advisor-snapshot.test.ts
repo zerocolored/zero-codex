@@ -13,6 +13,8 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   advisorRepositoryDigest,
+  advisorRepositoryIdentifiers,
+  advisorRepositoryScopeDigest,
   parseAdvisorRepositorySnapshot,
   resolveAdvisorProjectLayout,
   serializeAdvisorRepositorySnapshot,
@@ -112,6 +114,44 @@ describe('advisor repository snapshot', () => {
     writeFileSync(join(hidden, 'ignored.txt'), 'ignored\n')
     expect(advisorRepositoryDigest(snapshotAdvisorRepository(layout)))
       .toBe(advisorRepositoryDigest(after))
+  })
+
+  test('対象member scopeは兄弟repoを無視しroot instructionと対象repoだけを監視する', () => {
+    const project = fixtureDir()
+    const repositories = ['backend', 'frontend'].map(name => {
+      const repository = join(project, name)
+      mkdirSync(repository)
+      git(repository, ['init', '-q'])
+      git(repository, ['config', 'user.name', 'Zero Test'])
+      git(repository, ['config', 'user.email', 'zero@example.invalid'])
+      writeFileSync(join(repository, 'tracked.txt'), `${name}\n`)
+      git(repository, ['add', '.'])
+      git(repository, ['commit', '-qm', 'initial'])
+      return repository
+    })
+    writeFileSync(join(project, 'AGENTS.md'), 'before\n', { mode: 0o600 })
+    const layout = resolveAdvisorProjectLayout(project)
+    const baseline = snapshotAdvisorRepository(layout)
+    expect(advisorRepositoryIdentifiers(baseline)).toEqual(['backend', 'frontend'])
+    const scoped = advisorRepositoryScopeDigest(baseline, ['frontend'])
+
+    writeFileSync(join(repositories[0]!, 'tracked.txt'), 'unrelated\n')
+    const siblingChanged = snapshotAdvisorRepository(layout)
+    expect(advisorRepositoryDigest(siblingChanged)).not.toBe(advisorRepositoryDigest(baseline))
+    expect(advisorRepositoryScopeDigest(siblingChanged, ['frontend'])).toBe(scoped)
+
+    writeFileSync(join(repositories[1]!, 'tracked.txt'), 'target changed\n')
+    expect(advisorRepositoryScopeDigest(
+      snapshotAdvisorRepository(layout),
+      ['frontend'],
+    )).not.toBe(scoped)
+
+    git(repositories[1]!, ['checkout', '--', 'tracked.txt'])
+    writeFileSync(join(project, 'AGENTS.md'), 'after\n', { mode: 0o600 })
+    expect(advisorRepositoryScopeDigest(
+      snapshotAdvisorRepository(layout),
+      ['frontend'],
+    )).not.toBe(scoped)
   })
 
   test('multi-repo workspaceの安全なroot instruction変更をdigestへ反映する', () => {

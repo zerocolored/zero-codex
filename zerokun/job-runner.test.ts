@@ -7018,6 +7018,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       nonce,
       '/tmp/job-outbox',
       true,
+      undefined,
+      undefined,
+      undefined,
+      ['backend', 'frontend'],
+      ['frontend'],
     )
     const review = buildCodexPhasePrompt(
       job,
@@ -7027,6 +7032,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       nonce,
       '/tmp/job-outbox',
       true,
+      undefined,
+      undefined,
+      undefined,
+      ['backend', 'frontend'],
+      ['frontend'],
     )
     expect(prepare).toContain(
       `[ZERO_PRE_EDIT_READY:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
@@ -7043,9 +7053,28 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       `[ZERO_IMPLEMENTATION_READY:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
     )
     expect(implementation).toContain('zerokun_browser.verify_local_page')
+    expect(implementation).toContain(
+      'Host-approved implementation repository scope: ["frontend"]',
+    )
+    expect(implementation).toContain('do not edit them')
     expect(review).toContain(`[ZERO_REVIEW_PUBLISH:${nonce}:round-1]`)
     expect(review).toContain(`[ZERO_REVIEW_FIX_REQUIRED:${nonce}:round-1]`)
     expect(review).toContain('zerokun_browser.verify_local_page')
+    expect(review).toContain('do not request fixes for them in review')
+    expect(() => buildCodexPhasePrompt(
+      job,
+      'implementation',
+      snapshot,
+      1,
+      nonce,
+      '/tmp/job-outbox',
+      true,
+      undefined,
+      undefined,
+      undefined,
+      ['backend', 'frontend'],
+      ['unknown'],
+    )).toThrow('host phase prompt repository scope is invalid')
     store.close()
   })
 
@@ -8487,6 +8516,50 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         expect(overrides).toContain(`${JSON.stringify(join(member, '.zerochan'))}="deny"`)
       }
       expect(overrides).toContain(`${JSON.stringify(join(realpathSync(workspace), '.zerochan'))}="deny"`)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('multi-repo implementationは承認scopeだけをwriteし兄弟repoをreadに固定する', () => {
+    const dir = fixtureDir()
+    const workspace = join(dir, 'workspace')
+    const state = join(dir, 'state')
+    const outbox = join(state, 'outbox/job')
+    const scratch = join(state, 'tmp/job')
+    mkdirSync(workspace)
+    const members = ['backend', 'frontend'].map(name => {
+      const repository = join(workspace, name)
+      git(['init', '-q', repository])
+      return realpathSync(repository)
+    })
+    mkdirSync(outbox, { recursive: true })
+    chmodSync(state, 0o700)
+    mkdirSync(scratch, { recursive: true })
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: workspace, writeEnabled: true }))
+    const job = store.claimNext('serial-worker')!
+    try {
+      const overrides = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        gitRoots: members,
+        writeGitRoots: [members[1]!],
+        executionWriteEnabled: true,
+      }).join('\n')
+      expect(overrides).toContain(`${JSON.stringify(members[0]!)}="read"`)
+      expect(overrides).toContain(`${JSON.stringify(join(members[0]!, '.git'))}="read"`)
+      expect(overrides).toContain(`${JSON.stringify(members[1]!)}="write"`)
+      expect(overrides).toContain(`${JSON.stringify(join(members[1]!, '.git'))}="write"`)
+      expect(() => buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        gitRoots: members,
+        writeGitRoots: [join(workspace, 'unknown')],
+        executionWriteEnabled: true,
+      })).toThrow()
     } finally {
       store.close()
     }
@@ -11469,6 +11542,8 @@ describe('durable UI/UX approval wait', () => {
           inputDigest: snapshot.digest,
           repositoryDigest: advisorRepositoryDigest(repositorySnapshot),
           repositorySnapshot,
+          repositoryScope: ['.'],
+          repositoryScopeDigest: advisorRepositoryDigest(repositorySnapshot),
           text: '情報の優先順位を整理した案です。',
           beforePath: makeImage('before', 20),
           afterPath: makeImage('after', 80),
@@ -11556,6 +11631,8 @@ describe('durable UI/UX approval wait', () => {
       responseInputRevision: 2,
       responseAfterPrompt: true,
       repositoryDigest,
+      repositoryScope: ['.'],
+      repositoryScopeDigest: repositoryDigest,
     })
     expect(store.claimNext('approved-worker')?.id).toBe(root.id)
     expect(store.get(sameThread.id)?.status).toBe('queued')
@@ -11959,6 +12036,8 @@ describe('durable UI/UX approval wait', () => {
           inputDigest: snapshot.digest,
           repositoryDigest: advisorRepositoryDigest(repositorySnapshot),
           repositorySnapshot,
+          repositoryScope: ['.'],
+          repositoryScopeDigest: advisorRepositoryDigest(repositorySnapshot),
           text: '入力競合を検証する提案です。',
           beforePath: writeSolidTestPng(outbox, 'before-race', 30),
           afterPath: writeSolidTestPng(outbox, 'after-race', 90),

@@ -86,7 +86,10 @@ import {
 } from './advisor-journal.ts'
 import {
   advisorRepositoryDigest,
+  advisorRepositoryIdentifiers,
+  advisorRepositoryScopeDigest,
   resolveAdvisorProjectLayout,
+  scopeAdvisorRepositorySnapshot,
   snapshotAdvisorRepository,
   summarizeAdvisorRepositoryChanges,
   type AdvisorProjectLayout,
@@ -3141,11 +3144,22 @@ export function buildCodexPhasePrompt(
   uiApproval?: UiApprovalResumeContext,
   repositoryChange?: AdvisorRepositoryChangeSummary,
   threadHistory?: DurableThreadHistorySnapshot,
+  repositoryIdentifiers: readonly string[] = ['.'],
+  implementationRepositoryScope?: readonly string[],
 ): string {
   if (!/^[0-9a-f]{32}$/.test(attemptNonce ?? '')) {
     throw new Error('host phase prompt requires the logical attempt nonce')
   }
   if (!artifactDir) throw new Error('host phase prompt requires the artifact directory')
+  if (implementationRepositoryScope && (
+    implementationRepositoryScope.length === 0
+    || JSON.stringify(implementationRepositoryScope)
+      !== JSON.stringify([...implementationRepositoryScope].sort())
+    || new Set(implementationRepositoryScope).size !== implementationRepositoryScope.length
+    || implementationRepositoryScope.some(value => !repositoryIdentifiers.includes(value))
+  )) {
+    throw new Error('host phase prompt repository scope is invalid')
+  }
   const phaseInput = stage === 'implementation'
     ? writeAuthorizedImplementationInput(input)
     : input
@@ -3160,6 +3174,14 @@ export function buildCodexPhasePrompt(
     `Project root: ${job.repoPath}`,
     `Artifact directory: ${artifactDir}`,
   ]
+  if (implementationRepositoryScope) {
+    host.push(
+      `Host-approved implementation repository scope: ${JSON.stringify(implementationRepositoryScope)}`,
+      'Only repositories in that exact scope belong to this implementation and review.',
+      'Treat changes in every repository outside that scope as concurrent unrelated user work:',
+      'preserve them, do not edit them, and do not request fixes for them in review.',
+    )
+  }
   if (threadHistory) {
     host.push(
       `Thread history version: ${threadHistory.version}`,
@@ -3230,9 +3252,13 @@ export function buildCodexPhasePrompt(
         'Use synthetic/test data in both states. Never render credentials, secrets, local paths,',
         'browser/session data, production data, or personal/private information into either image.',
         'Return the following exact structure, with no output after the host-only image envelope:',
+        `Valid implementation repository IDs: ${JSON.stringify(repositoryIdentifiers)}`,
+        'Choose every repository that implementation may modify. Use only the exact IDs above,',
+        'sorted lexicographically with no duplicates. Include all members when the change spans',
+        'multiple repositories; this scope is persisted and enforced after approval.',
         `[ZERO_UI_APPROVAL_REQUIRED:${attemptNonce}:r${input.revision}:${input.digest}]`,
         '<short Japanese proposal explaining the visible change and asking whether to proceed>',
-        '<zerokun_ui_approval>{"before":"<absolute Before PNG path>","after":"<absolute After PNG path>"}</zerokun_ui_approval>',
+        '<zerokun_ui_approval>{"before":"<absolute Before PNG path>","after":"<absolute After PNG path>","repositories":["<implementation repository ID>"]}</zerokun_ui_approval>',
         'Never print either local path in the proposal text. The host uploads both images as Slack',
         'files and pauses the job; you must not implement the proposal in this phase.',
       ] : []),
@@ -3666,6 +3692,7 @@ export function buildCodexPermissionOverrides(
     liveInputDir?: string
     gitRoot?: string | null
     gitRoots?: readonly string[]
+    writeGitRoots?: readonly string[]
     profile?: string
     advisorMcp?: { command: string; args: string[] }
     browserMcp?: { command: string; args: string[] }
@@ -3682,6 +3709,7 @@ export function buildCodexPermissionOverrides(
   const projectLayout = resolveAdvisorProjectLayout(repo)
   const gitRoots = (options.gitRoots ?? (gitRoot ? [gitRoot] : projectLayout.gitRoots))
     .map(root => realpathSync(root))
+  const writeGitRoots = (options.writeGitRoots ?? gitRoots).map(root => realpathSync(root))
   const workspace = projectLayout.kind === 'multi-repo-workspace'
   if (!workspace && gitRoot && !pathContains(gitRoot, repo)) {
     throw new Error(`repository route is outside its Git worktree: ${repo}`)
@@ -3690,6 +3718,16 @@ export function buildCodexPermissionOverrides(
     || gitRoots.some(root => !pathContains(repo, root) || root === repo))) {
     throw new Error(`workspace repository layout does not match the project route: ${repo}`)
   }
+  const gitRootSet = new Set(gitRoots)
+  if (new Set(writeGitRoots).size !== writeGitRoots.length
+    || writeGitRoots.some(root => !gitRootSet.has(root))) {
+    throw new Error('writable repository scope is not a subset of the project layout')
+  }
+  if (!workspace && options.writeGitRoots !== undefined
+    && JSON.stringify(writeGitRoots) !== JSON.stringify(gitRoots)) {
+    throw new Error('single-repository writable scope must match its project layout')
+  }
+  const writableGitRootSet = new Set(writeGitRoots)
   const home = realpathSync(homedir())
   const artifactDir = requireManagedDirectory(options.stateDir, options.artifactDir)
   const scratchDir = requireManagedDirectory(options.stateDir, options.scratchDir)
@@ -3727,7 +3765,10 @@ export function buildCodexPermissionOverrides(
       rules.set(instruction, 'read')
     }
     for (const member of gitRoots) {
-      rules.set(member, executionWriteEnabled ? 'write' : 'read')
+      rules.set(
+        member,
+        executionWriteEnabled && writableGitRootSet.has(member) ? 'write' : 'read',
+      )
       rules.set(join(member, '.zerochan'), 'deny')
     }
   }
@@ -3743,15 +3784,23 @@ export function buildCodexPermissionOverrides(
     }
     rules.set(allowPath, 'read')
   }
-  const gitLayouts = gitRoots.length > 0
-    ? gitRoots.map(root => resolveGitLayoutForProject(root))
-    : [resolveGitLayoutForProject(gitRoot ?? repo)]
-  for (const gitLayout of gitLayouts) {
+  const gitLayouts: Array<{ root: string | null; layout: GitLayout | null }> = gitRoots.length > 0
+    ? gitRoots.map(root => ({ root, layout: resolveGitLayoutForProject(root) }))
+    : [{ root: gitRoot ?? null, layout: resolveGitLayoutForProject(gitRoot ?? repo) }]
+  const gitMetadataRules = new Map<string, 'read' | 'write'>()
+  for (const { root, layout: gitLayout } of gitLayouts) {
+    const access = executionWriteEnabled
+      && (!workspace || (root !== null && writableGitRootSet.has(root)))
+      ? 'write'
+      : 'read'
     for (const gitPath of gitLayout ? [gitLayout.gitDir, gitLayout.commonDir] : []) {
-      rules.set(gitPath, executionWriteEnabled ? 'write' : 'read')
+      if (access === 'write' || gitMetadataRules.get(gitPath) !== 'write') {
+        gitMetadataRules.set(gitPath, access)
+      }
     }
     if (gitLayout?.pointerFile) rules.set(gitLayout.pointerFile, 'read')
   }
+  for (const [gitPath, access] of gitMetadataRules) rules.set(gitPath, access)
   for (const attachment of job.attachments) {
     if (existsSync(attachment)) rules.set(realpathSync(attachment), 'read')
   }
@@ -4653,8 +4702,7 @@ export async function executeCodexJob(
     } catch (error) {
       if (error instanceof CodexCleanupPendingError
         || error instanceof CodexInterruptedError
-        || error instanceof CodexUserCancelledError
-        || error instanceof CodexRepositoryChangedBeforeImplementationError) throw error
+        || error instanceof CodexUserCancelledError) throw error
       reportAdvisorVerificationWarning(stage, error)
       return undefined
     }
@@ -4704,10 +4752,23 @@ export async function executeCodexJob(
         !== options.uiApproval.repositoryDigest) {
       throw new Error('stored UI/UX proposal repository snapshot has an invalid digest')
     }
+    if (options.uiApproval?.repositoryScope) {
+      if (!options.uiApproval.repositorySnapshot
+        || !options.uiApproval.repositoryScopeDigest
+        || advisorRepositoryScopeDigest(
+          options.uiApproval.repositorySnapshot,
+          options.uiApproval.repositoryScope,
+        ) !== options.uiApproval.repositoryScopeDigest) {
+        throw new Error('stored UI/UX proposal repository scope has an invalid digest')
+      }
+    } else if (options.uiApproval?.repositoryScopeDigest) {
+      throw new Error('stored UI/UX proposal repository scope binding is incomplete')
+    }
     const uiApprovalRepositoryChange = options.uiApproval
       ? summarizeAdvisorRepositoryChanges(
           options.uiApproval.repositorySnapshot,
           initialRepositorySnapshot,
+          options.uiApproval.repositoryScope ?? undefined,
         )
       : undefined
     const context: AdvisorContextRecord = {
@@ -4738,6 +4799,7 @@ export async function executeCodexJob(
     stage: ExecutionStage,
     reviewRound: 1 | 2 | 3 = 1,
     boundInput?: AdvisorInputSnapshot,
+    repositoryScope?: readonly string[],
   ) => {
     const fingerprintEarliest = readProcessIdentity(process.pid)
     if (!fingerprintEarliest) {
@@ -4798,6 +4860,12 @@ export async function executeCodexJob(
       const executionWriteEnabled = stage === 'complete'
         ? job.writeEnabled
         : stage === 'implementation'
+      const writeGitRoots = stage === 'implementation' && repositoryScope
+        ? scopeAdvisorRepositorySnapshot(
+            logicalAttempt.initialRepositorySnapshot,
+            repositoryScope,
+          ).gitRoots
+        : undefined
       const permissionOverrides = buildCodexPermissionOverrides(job, {
         stateDir,
         artifactDir,
@@ -4805,6 +4873,7 @@ export async function executeCodexJob(
         liveInputDir: liveInputRoot,
         gitRoot: advisorProjectLayout.gitRoot,
         gitRoots: advisorProjectLayout.gitRoots,
+        writeGitRoots,
         profile: permissionProfile,
         advisorMcp,
         browserMcp,
@@ -4860,6 +4929,7 @@ export async function executeCodexJob(
     parentTurnBaselineInput: NativeAdvisorParentTurnBaseline | null = null,
     boundInterjection?: JobInterjectionRecord,
     expectedRepositoryDigest?: string,
+    expectedRepositoryScope?: readonly string[],
   ) => {
     if (stage === 'interjection' && !boundInterjection) {
       throw new Error('interjection execution omitted its durable input binding')
@@ -4872,7 +4942,12 @@ export async function executeCodexJob(
       revalidateCodexExecutable()
     } else options.subscriptionLoginCheckForTesting?.()
     if (herdrRuntime) await verifyHerdrRuntimeIdentityAsync(herdrRuntime)
-    const advisorAttempt = prepareProcessAttempt(stage, reviewRound, boundInput)
+    const advisorAttempt = prepareProcessAttempt(
+      stage,
+      reviewRound,
+      boundInput,
+      expectedRepositoryScope,
+    )
     const retireBrowserReceiptKey = (): void => {
       const path = advisorAttempt.browserReceiptKeyPath
       if (!path) return
@@ -4896,9 +4971,10 @@ export async function executeCodexJob(
       }
     }
     if (stage === 'implementation' && expectedRepositoryDigest) {
-      const observedRepositoryDigest = advisorRepositoryDigest(
-        snapshotAdvisorRepository(advisorProjectLayout),
-      )
+      const observedRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
+      const observedRepositoryDigest = expectedRepositoryScope
+        ? advisorRepositoryScopeDigest(observedRepositorySnapshot, expectedRepositoryScope)
+        : advisorRepositoryDigest(observedRepositorySnapshot)
       if (observedRepositoryDigest !== expectedRepositoryDigest) {
         await retireUnregisteredAttempt('pre-implementation repository drift')
         throw new CodexRepositoryChangedBeforeImplementationError()
@@ -5938,6 +6014,10 @@ export async function executeCodexJob(
                 options.uiApproval,
                 logicalAttempt.uiApprovalRepositoryChange,
                 threadHistoryForPhysicalSession(options.threadHistory, resumed),
+                advisorRepositoryIdentifiers(logicalAttempt.initialRepositorySnapshot),
+                stage === 'prepare'
+                  ? undefined
+                  : expectedRepositoryScope ?? options.uiApproval?.repositoryScope ?? undefined,
               ),
             phaseClientUserMessageId ?? job.idempotencyKey,
             {
@@ -5947,9 +6027,13 @@ export async function executeCodexJob(
               ...(model ? { model } : {}),
               beforeWrite: requestId => {
                 if (stage === 'implementation' && expectedRepositoryDigest) {
-                  const observedRepositoryDigest = advisorRepositoryDigest(
-                    snapshotAdvisorRepository(advisorProjectLayout),
-                  )
+                  const observedRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
+                  const observedRepositoryDigest = expectedRepositoryScope
+                    ? advisorRepositoryScopeDigest(
+                        observedRepositorySnapshot,
+                        expectedRepositoryScope,
+                      )
+                    : advisorRepositoryDigest(observedRepositorySnapshot)
                   if (observedRepositoryDigest !== expectedRepositoryDigest) {
                     throw new CodexRepositoryChangedBeforeImplementationError()
                   }
@@ -6935,6 +7019,7 @@ export async function executeCodexJob(
     let reviewedInputRevision: number | null = null
     let preparedInput: AdvisorInputSnapshot | null = null
     let preparedRepositoryDigest: string | null = null
+    let preparedRepositoryScope: string[] | null = null
     let implementedInputDigest: string | null = null
     let parentSource: AppServerSessionSource | null = null
     let parentChildBaseline: string[] | null = null
@@ -7135,6 +7220,7 @@ export async function executeCodexJob(
       round: 1 | 2 | 3,
       boundInput?: AdvisorInputSnapshot,
       expectedRepositoryDigest?: string,
+      expectedRepositoryScope?: readonly string[],
     ): Promise<{
       kind: 'success'
       execution: Awaited<ReturnType<typeof runAttempt>>
@@ -7153,7 +7239,8 @@ export async function executeCodexJob(
 
         const execution = await runAttempt(
           sessionId, resumed, stage, phaseSequence, round, boundInput,
-          parentChildBaseline, parentTurnBaseline, undefined, expectedRepositoryDigest,
+          parentChildBaseline, parentTurnBaseline, undefined,
+          expectedRepositoryDigest, expectedRepositoryScope,
         )
         if ('userCancelled' in execution && execution.userCancelled === true) {
           await execution.retireCancelledRegistration()
@@ -7304,24 +7391,50 @@ export async function executeCodexJob(
         let preparationError: unknown
         let preparationDecision: ReturnType<typeof parseCodexPreparationDecision> | undefined
         let currentRepositoryDigest: string | undefined
+        let currentRepositoryFullDigest: string | undefined
+        let currentRepositoryScope: string[] | null = null
         let currentRepositorySnapshot: AdvisorRepositorySnapshot | undefined
         try {
           const observedRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
-          const observedRepositoryDigest = advisorRepositoryDigest(observedRepositorySnapshot)
-          currentRepositorySnapshot = observedRepositorySnapshot
-          currentRepositoryDigest = observedRepositoryDigest
-          if (observedRepositoryDigest !== execution.initialRepositoryDigest) {
+          const observedRepositoryFullDigest = advisorRepositoryDigest(observedRepositorySnapshot)
+          const approvalScope = options.uiApproval?.repositoryScope ?? null
+          const semanticRepositoryDigest = approvalScope
+            ? advisorRepositoryScopeDigest(observedRepositorySnapshot, approvalScope)
+            : observedRepositoryFullDigest
+          if (approvalScope
+            && semanticRepositoryDigest !== advisorRepositoryScopeDigest(
+              logicalAttempt.initialRepositorySnapshot,
+              approvalScope,
+            )) {
             throw new CodexRepositoryChangedBeforeImplementationError()
           }
+          currentRepositorySnapshot = observedRepositorySnapshot
+          currentRepositoryFullDigest = observedRepositoryFullDigest
           preparationDecision = parseCodexPreparationDecision(
             execution.finalMessage,
             execution.advisorAttemptNonce,
             finalInput,
             options.uiApproval ? {
               context: options.uiApproval,
-              currentRepositoryDigest: observedRepositoryDigest,
+              currentRepositoryDigest: semanticRepositoryDigest,
             } : undefined,
+            advisorRepositoryIdentifiers(observedRepositorySnapshot),
           )
+          currentRepositoryScope = preparationDecision.kind === 'approval-required'
+            ? preparationDecision.proposal.repositoryScope
+            : approvalScope
+          currentRepositoryDigest = currentRepositoryScope
+            ? advisorRepositoryScopeDigest(observedRepositorySnapshot, currentRepositoryScope)
+            : observedRepositoryFullDigest
+          const initialPreparedRepositoryDigest = currentRepositoryScope
+            ? advisorRepositoryScopeDigest(
+                logicalAttempt.initialRepositorySnapshot,
+                currentRepositoryScope,
+              )
+            : execution.initialRepositoryDigest
+          if (currentRepositoryDigest !== initialPreparedRepositoryDigest) {
+            throw new CodexRepositoryChangedBeforeImplementationError()
+          }
           if (preparationDecision.kind === 'approval-required') {
             if (!execution.browserReceiptKey) {
               throw new Error(
@@ -7341,7 +7454,7 @@ export async function executeCodexJob(
           if (options.phaseGateForTesting) {
             await options.phaseGateForTesting.validatePreparation?.(
               finalInput,
-              observedRepositoryDigest,
+              observedRepositoryFullDigest,
             )
           } else {
             if (herdrRuntime) await verifyHerdrRuntimeIdentityAsync(herdrRuntime)
@@ -7354,7 +7467,7 @@ export async function executeCodexJob(
                 execution.advisorAttemptNonce,
                 finalInput,
                 execution.initialRepositoryDigest,
-                observedRepositoryDigest,
+                observedRepositoryFullDigest,
               ),
             )
           }
@@ -7388,7 +7501,7 @@ export async function executeCodexJob(
               decision: preparationDecision.approvalDecision,
               currentInputRevision: finalInput.revision,
               currentInputDigest: finalInput.digest,
-              currentRepositoryDigest: observedRepositoryDigest,
+              currentRepositoryDigest: semanticRepositoryDigest,
             })
           }
         } catch (error) {
@@ -7404,25 +7517,33 @@ export async function executeCodexJob(
           phaseSequence += 1
           preparedInput = null
           preparedRepositoryDigest = null
+          preparedRepositoryScope = null
           nextStage = 'prepare'
           continue
         }
         if (preparationError) throw preparationError
-        if (!preparationDecision || !currentRepositoryDigest || !currentRepositorySnapshot) {
+        if (!preparationDecision || !currentRepositoryDigest
+          || !currentRepositoryFullDigest || !currentRepositorySnapshot) {
           throw new Error('Codex preparation decision is unavailable')
         }
         if (preparationDecision.kind === 'approval-required') {
+          if (!currentRepositoryScope) {
+            throw new Error('Codex UI/UX proposal omitted its implementation repository scope')
+          }
           throw new CodexUiApprovalRequiredError({
             ...preparationDecision.proposal,
             sessionId: sessionId!,
             inputRevision: finalInput.revision,
             inputDigest: finalInput.digest,
-            repositoryDigest: currentRepositoryDigest,
+            repositoryDigest: currentRepositoryFullDigest,
             repositorySnapshot: currentRepositorySnapshot,
+            repositoryScope: currentRepositoryScope,
+            repositoryScopeDigest: currentRepositoryDigest,
           })
         }
         preparedInput = finalInput
         preparedRepositoryDigest = currentRepositoryDigest
+        preparedRepositoryScope = currentRepositoryScope
         phaseSequence += 1
         nextStage = implementedInputDigest === activeWriteInputDigest(finalInput)
           ? 'review'
@@ -7435,18 +7556,26 @@ export async function executeCodexJob(
         if (!preparedRepositoryDigest) {
           throw new Error('write implementation omitted its prepared repository binding')
         }
-        const repositoryBeforeImplementation = advisorRepositoryDigest(
-          snapshotAdvisorRepository(advisorProjectLayout),
+        const repositoryBeforeImplementationSnapshot = snapshotAdvisorRepository(
+          advisorProjectLayout,
         )
+        const repositoryBeforeImplementation = preparedRepositoryScope
+          ? advisorRepositoryScopeDigest(
+              repositoryBeforeImplementationSnapshot,
+              preparedRepositoryScope,
+            )
+          : advisorRepositoryDigest(repositoryBeforeImplementationSnapshot)
         if (repositoryBeforeImplementation !== preparedRepositoryDigest) {
           throw new CodexRepositoryChangedBeforeImplementationError()
         }
         const outcome = await runPhase(
-          'implementation', reviewRound, preparedInput, preparedRepositoryDigest,
+          'implementation', reviewRound, preparedInput,
+          preparedRepositoryDigest, preparedRepositoryScope ?? undefined,
         )
         if (outcome.kind === 'input-changed') {
           preparedInput = null
           preparedRepositoryDigest = null
+          preparedRepositoryScope = null
           nextStage = 'prepare'
           continue
         }
@@ -7481,6 +7610,7 @@ export async function executeCodexJob(
           reviewedInputRevision = null
           preparedInput = null
           preparedRepositoryDigest = null
+          preparedRepositoryScope = null
           nextStage = 'prepare'
           continue
         }
@@ -7496,10 +7626,21 @@ export async function executeCodexJob(
       }
 
       if (!preparedInput) throw new Error('read-only review omitted its prepared input binding')
-      const outcome = await runPhase('review', reviewRound, preparedInput)
+      const repositoryBeforeReviewSnapshot = snapshotAdvisorRepository(advisorProjectLayout)
+      const repositoryBeforeReview = preparedRepositoryScope
+        ? advisorRepositoryScopeDigest(
+            repositoryBeforeReviewSnapshot,
+            preparedRepositoryScope,
+          )
+        : advisorRepositoryDigest(repositoryBeforeReviewSnapshot)
+      const outcome = await runPhase(
+        'review', reviewRound, preparedInput,
+        undefined, preparedRepositoryScope ?? undefined,
+      )
       if (outcome.kind === 'input-changed') {
         preparedInput = null
         preparedRepositoryDigest = null
+        preparedRepositoryScope = null
         nextStage = 'prepare'
         continue
       }
@@ -7518,6 +7659,7 @@ export async function executeCodexJob(
         reviewedInputRevision = null
         preparedInput = null
         preparedRepositoryDigest = null
+        preparedRepositoryScope = null
         nextStage = 'prepare'
         continue
       }
@@ -7525,10 +7667,15 @@ export async function executeCodexJob(
       let reviewError: unknown
       let reviewedRepositoryDigest: string | undefined
       try {
-        const currentRepositoryDigest = advisorRepositoryDigest(
-          snapshotAdvisorRepository(advisorProjectLayout),
-        )
-        reviewedRepositoryDigest = currentRepositoryDigest
+        const currentRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
+        const currentRepositoryDigest = advisorRepositoryDigest(currentRepositorySnapshot)
+        const currentReviewRepositoryDigest = preparedRepositoryScope
+          ? advisorRepositoryScopeDigest(currentRepositorySnapshot, preparedRepositoryScope)
+          : currentRepositoryDigest
+        if (currentReviewRepositoryDigest !== repositoryBeforeReview) {
+          throw new CodexRepositoryChangedBeforePublicationError()
+        }
+        reviewedRepositoryDigest = currentReviewRepositoryDigest
         let advisorRounds: NativeAdvisorRoundEvidence[] | undefined
         if (options.phaseGateForTesting) {
           await options.phaseGateForTesting.validateReview?.(
@@ -7601,6 +7748,7 @@ export async function executeCodexJob(
         reviewedInputRevision = null
         preparedInput = null
         preparedRepositoryDigest = null
+        preparedRepositoryScope = null
         nextStage = 'prepare'
         continue
       }
@@ -7621,6 +7769,23 @@ export async function executeCodexJob(
         nextStage = 'implementation'
         continue
       }
+      const repositoryBeforePublicationSnapshot = snapshotAdvisorRepository(advisorProjectLayout)
+      const repositoryBeforePublication = preparedRepositoryScope
+        ? advisorRepositoryScopeDigest(
+            repositoryBeforePublicationSnapshot,
+            preparedRepositoryScope,
+          )
+        : advisorRepositoryDigest(repositoryBeforePublicationSnapshot)
+      if (repositoryBeforePublication !== repositoryBeforeReview) {
+        phaseSequence += 1
+        reviewRound = 1
+        reviewedInputRevision = null
+        preparedInput = null
+        preparedRepositoryDigest = null
+        preparedRepositoryScope = null
+        nextStage = 'prepare'
+        continue
+      }
       const seal = controls.sealPhaseResult({
         logicalNonce: execution.advisorAttemptNonce,
         threadId: sessionId!,
@@ -7633,6 +7798,7 @@ export async function executeCodexJob(
         reviewRound = 1
         reviewedInputRevision = null
         preparedRepositoryDigest = null
+        preparedRepositoryScope = null
         nextStage = 'prepare'
         continue
       }

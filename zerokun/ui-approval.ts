@@ -171,6 +171,7 @@ export type UiApprovalProposal = {
   text: string
   beforePath: string
   afterPath: string
+  repositoryScope: string[]
 }
 
 export type CodexPreparationDecision =
@@ -211,6 +212,8 @@ export type UiApprovalResumeContext = {
   responseAfterPrompt: boolean
   repositoryDigest: string
   repositorySnapshot: AdvisorRepositorySnapshot | null
+  repositoryScope: string[] | null
+  repositoryScopeDigest: string | null
   proposalText: string
 }
 
@@ -220,6 +223,8 @@ export type CodexUiApprovalPending = UiApprovalProposal & {
   inputDigest: string
   repositoryDigest: string
   repositorySnapshot: AdvisorRepositorySnapshot
+  repositoryScope: string[]
+  repositoryScopeDigest: string
 }
 
 export class CodexUiApprovalRequiredError extends Error {
@@ -238,6 +243,7 @@ export function buildUiApprovalSemanticDecisionTemplate(input: {
     || !/^[0-9a-f]{64}$/.test(input.currentRepositoryDigest)) {
     throw new Error('UI/UX semantic decision template binding is invalid')
   }
+  const proposalRepositoryDigest = uiApprovalBoundRepositoryDigest(input.context)
   return `<${UI_RESPONSE_DECISION_MARKER}>${JSON.stringify({
     version: 1,
     attemptNonce: input.attemptNonce,
@@ -248,7 +254,7 @@ export function buildUiApprovalSemanticDecisionTemplate(input: {
     responseInputDigest: input.context.responseInputDigest,
     responseMessageId: input.context.responseMessageId,
     responseAfterPrompt: input.context.responseAfterPrompt,
-    proposalRepositoryDigest: input.context.repositoryDigest,
+    proposalRepositoryDigest,
     currentRepositoryDigest: input.currentRepositoryDigest,
     intent: '<approve|revise|question|reject>',
     repositoryState: '<unchanged|compatible|conflict>',
@@ -259,6 +265,7 @@ function exactProposalEnvelope(
   value: string,
   attemptNonce: string,
   input: { revision: number; digest: string },
+  availableRepositories: readonly string[],
 ): UiApprovalProposal | null {
   const normalized = value.replace(/\r\n/g, '\n').trim()
   const first = `[ZERO_UI_APPROVAL_REQUIRED:${attemptNonce}:r${input.revision}:${input.digest}]`
@@ -283,10 +290,21 @@ function exactProposalEnvelope(
     throw new Error('Codex UI/UX proposal image envelope must be an object')
   }
   const record = parsed as Record<string, unknown>
-  if (Object.keys(record).sort().join(',') !== 'after,before'
+  if (Object.keys(record).sort().join(',') !== 'after,before,repositories'
     || typeof record.before !== 'string' || typeof record.after !== 'string'
-    || !isAbsolute(record.before) || !isAbsolute(record.after)) {
-    throw new Error('Codex UI/UX proposal must declare exactly two absolute image paths')
+    || !isAbsolute(record.before) || !isAbsolute(record.after)
+    || !Array.isArray(record.repositories) || record.repositories.length === 0
+    || record.repositories.some(value => typeof value !== 'string' || !value
+      || value.length > 32_768 || isAbsolute(value))) {
+    throw new Error(
+      'Codex UI/UX proposal must declare two absolute image paths and repository scope',
+    )
+  }
+  const repositoryScope = record.repositories as string[]
+  if (JSON.stringify(repositoryScope) !== JSON.stringify([...repositoryScope].sort())
+    || new Set(repositoryScope).size !== repositoryScope.length
+    || repositoryScope.some(value => !availableRepositories.includes(value))) {
+    throw new Error('Codex UI/UX proposal repository scope is invalid')
   }
   const beforePath = resolve(record.before)
   const afterPath = resolve(record.after)
@@ -296,7 +314,16 @@ function exactProposalEnvelope(
   if (text.includes(record.before) || text.includes(record.after)) {
     throw new Error('Codex UI/UX proposal text must not expose local image paths')
   }
-  return { text, beforePath, afterPath }
+  return { text, beforePath, afterPath, repositoryScope }
+}
+
+function uiApprovalBoundRepositoryDigest(context: UiApprovalResumeContext): string {
+  const hasScope = Array.isArray(context.repositoryScope)
+  const hasScopeDigest = typeof context.repositoryScopeDigest === 'string'
+  if (hasScope !== hasScopeDigest) {
+    throw new Error('UI/UX approval repository scope binding is incomplete')
+  }
+  return hasScopeDigest ? context.repositoryScopeDigest! : context.repositoryDigest
 }
 
 export function parseCodexPreparationDecision(
@@ -307,6 +334,7 @@ export function parseCodexPreparationDecision(
     context: UiApprovalResumeContext
     currentRepositoryDigest: string
   },
+  availableRepositories: readonly string[] = ['.'],
 ): CodexPreparationDecision {
   let normalized = value.replace(/\r\n/g, '\n').trim()
   let approvalDecision: UiApprovalSemanticDecision | undefined
@@ -349,7 +377,7 @@ export function parseCodexPreparationDecision(
       || record.responseInputDigest !== context.responseInputDigest
       || record.responseMessageId !== context.responseMessageId
       || record.responseAfterPrompt !== context.responseAfterPrompt
-      || record.proposalRepositoryDigest !== context.repositoryDigest
+      || record.proposalRepositoryDigest !== uiApprovalBoundRepositoryDigest(context)
       || record.currentRepositoryDigest !== approval.currentRepositoryDigest
       || !['approve', 'revise', 'question', 'reject'].includes(String(record.intent))
       || !['unchanged', 'compatible', 'conflict'].includes(String(record.repositoryState))) {
@@ -379,7 +407,12 @@ export function parseCodexPreparationDecision(
     }
     return { kind: 'ready', ...(approvalDecision ? { approvalDecision } : {}) }
   }
-  const proposal = exactProposalEnvelope(normalized, attemptNonce, input)
+  const proposal = exactProposalEnvelope(
+    normalized,
+    attemptNonce,
+    input,
+    availableRepositories,
+  )
   if (!proposal) {
     throw new Error('Codex preparation omitted its exact current-input decision envelope')
   }
@@ -420,7 +453,7 @@ export function assertUiApprovalReadyMayProceed(input: {
   }
   if (input.decision.requestId !== input.context.requestId
     || input.decision.responseMessageId !== input.context.responseMessageId
-    || input.decision.proposalRepositoryDigest !== input.context.repositoryDigest
+    || input.decision.proposalRepositoryDigest !== uiApprovalBoundRepositoryDigest(input.context)
     || input.decision.currentRepositoryDigest !== input.currentRepositoryDigest) {
     throw new Error('Codex attempted to reuse a stale UI/UX semantic decision')
   }

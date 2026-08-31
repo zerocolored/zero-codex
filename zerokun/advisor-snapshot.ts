@@ -72,6 +72,8 @@ export type AdvisorRepositoryChangeSummary = {
   omittedRootInstructionPaths: number
 }
 
+export type AdvisorRepositoryScope = string[]
+
 const MAX_SNAPSHOT_JSON_BYTES = 16 * 1024 * 1024
 const MAX_SNAPSHOT_REPOSITORIES = 128
 const MAX_SNAPSHOT_DIRTY_PATHS = 50_000
@@ -201,7 +203,14 @@ function changedIdentityPaths(
 export function summarizeAdvisorRepositoryChanges(
   baseline: AdvisorRepositorySnapshot | null,
   current: AdvisorRepositorySnapshot,
+  repositoryScope?: readonly string[],
 ): AdvisorRepositoryChangeSummary {
+  if (repositoryScope) {
+    return summarizeAdvisorRepositoryChanges(
+      baseline ? scopeAdvisorRepositorySnapshot(baseline, repositoryScope) : null,
+      scopeAdvisorRepositorySnapshot(current, repositoryScope),
+    )
+  }
   const currentDigest = advisorRepositoryDigest(current)
   if (!baseline) {
     return {
@@ -273,6 +282,97 @@ export function summarizeAdvisorRepositoryChanges(
     rootInstructionPaths: rootChanges.paths,
     omittedRootInstructionPaths: rootChanges.omitted,
   }
+}
+
+function repositoryIdentifier(snapshot: AdvisorRepositorySnapshot, gitRoot: string): string {
+  const lexical = relative(snapshot.projectPath, gitRoot)
+  return lexical === '' ? '.' : lexical
+}
+
+export function advisorRepositoryIdentifiers(
+  snapshot: AdvisorRepositorySnapshot,
+): AdvisorRepositoryScope {
+  if (snapshot.kind === 'non-git') return ['.']
+  return snapshot.repositories.map(repository => repositoryIdentifier(snapshot, repository.gitRoot))
+}
+
+export function normalizeAdvisorRepositoryScope(
+  snapshot: AdvisorRepositorySnapshot,
+  repositoryScope: readonly string[],
+): AdvisorRepositoryScope {
+  if (!Array.isArray(repositoryScope) || repositoryScope.length === 0
+    || repositoryScope.length > MAX_SNAPSHOT_REPOSITORIES
+    || repositoryScope.some(value => typeof value !== 'string' || value.length === 0
+      || value.length > 32_768 || value.includes('\0') || isAbsolute(value))) {
+    throw new Error('advisor repository scope is invalid')
+  }
+  const normalized = [...repositoryScope]
+  const sorted = [...normalized].sort()
+  if (JSON.stringify(normalized) !== JSON.stringify(sorted)
+    || new Set(normalized).size !== normalized.length) {
+    throw new Error('advisor repository scope must be sorted and unique')
+  }
+  const available = new Set(advisorRepositoryIdentifiers(snapshot))
+  if (normalized.some(value => !available.has(value))) {
+    throw new Error('advisor repository scope contains an unknown repository')
+  }
+  return normalized
+}
+
+export function parseAdvisorRepositoryScope(
+  snapshot: AdvisorRepositorySnapshot,
+  value: string,
+): AdvisorRepositoryScope {
+  if (Buffer.byteLength(value) < 2 || Buffer.byteLength(value) > 64 * 1024) {
+    throw new Error('advisor repository scope JSON is not bounded')
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(value) } catch {
+    throw new Error('advisor repository scope JSON is invalid')
+  }
+  if (!Array.isArray(parsed)) throw new Error('advisor repository scope JSON is not an array')
+  return normalizeAdvisorRepositoryScope(snapshot, parsed as string[])
+}
+
+export function serializeAdvisorRepositoryScope(
+  snapshot: AdvisorRepositorySnapshot,
+  repositoryScope: readonly string[],
+): string {
+  const scope = normalizeAdvisorRepositoryScope(snapshot, repositoryScope)
+  return JSON.stringify(scope)
+}
+
+export function scopeAdvisorRepositorySnapshot(
+  snapshot: AdvisorRepositorySnapshot,
+  repositoryScope: readonly string[],
+): AdvisorRepositorySnapshot {
+  const scope = normalizeAdvisorRepositoryScope(snapshot, repositoryScope)
+  if (snapshot.kind !== 'multi-repo-workspace') return snapshot
+  const byIdentifier = new Map(snapshot.repositories.map(repository => [
+    repositoryIdentifier(snapshot, repository.gitRoot),
+    repository,
+  ]))
+  const repositories = scope.map(identifier => byIdentifier.get(identifier)!)
+  const dirty: Record<string, string> = {}
+  for (const [index, repository] of repositories.entries()) {
+    const namespace = scope[index]!
+    for (const [path, identity] of Object.entries(repository.dirty)) {
+      dirty[`${namespace}/${path}`] = identity
+    }
+  }
+  return {
+    ...snapshot,
+    gitRoots: repositories.map(repository => repository.gitRoot),
+    dirty,
+    repositories,
+  }
+}
+
+export function advisorRepositoryScopeDigest(
+  snapshot: AdvisorRepositorySnapshot,
+  repositoryScope: readonly string[],
+): string {
+  return advisorRepositoryDigest(scopeAdvisorRepositorySnapshot(snapshot, repositoryScope))
 }
 
 function contained(root: string, candidate: string): boolean {

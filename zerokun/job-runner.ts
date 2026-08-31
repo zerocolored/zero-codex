@@ -114,8 +114,13 @@ import {
 } from './ui-approval.ts'
 import {
   advisorRepositoryDigest,
+  advisorRepositoryIdentifiers,
+  advisorRepositoryScopeDigest,
+  normalizeAdvisorRepositoryScope,
+  parseAdvisorRepositoryScope,
   parseAdvisorRepositorySnapshot,
   resolveAdvisorProjectLayout,
+  serializeAdvisorRepositoryScope,
   serializeAdvisorRepositorySnapshot,
   type AdvisorRepositorySnapshot,
 } from './advisor-snapshot.ts'
@@ -540,6 +545,8 @@ type UiApprovalRequestRow = {
   input_digest: string
   repository_digest: string
   repository_snapshot_json: string | null
+  repository_scope_json: string | null
+  repository_scope_digest: string | null
   session_id: string
   proposal_text: string
   before_path: string
@@ -840,6 +847,8 @@ CREATE TABLE IF NOT EXISTS ui_approval_requests (
   input_digest TEXT NOT NULL,
   repository_digest TEXT NOT NULL,
   repository_snapshot_json TEXT,
+  repository_scope_json TEXT,
+  repository_scope_digest TEXT,
   session_id TEXT NOT NULL,
   proposal_text TEXT NOT NULL,
   before_path TEXT NOT NULL,
@@ -1604,6 +1613,8 @@ function ensureJobSchemaMigrations(db: Database): void {
     ['prompt_delivery_started_at', 'INTEGER'],
     ['prompt_message_id', 'TEXT'],
     ['repository_snapshot_json', 'TEXT'],
+    ['repository_scope_json', 'TEXT'],
+    ['repository_scope_digest', 'TEXT'],
     ['response_input_digest', 'TEXT'],
   ] as const) {
     const current = db.query<{ name: string }, []>(
@@ -2158,6 +2169,22 @@ function mapUiApprovalRequest(row: UiApprovalRequestRow): UiApprovalRequestRecor
     && advisorRepositoryDigest(repositorySnapshot) !== row.repository_digest) {
     throw new Error(`UI/UX approval repository snapshot digest changed: ${row.id}`)
   }
+  if ((row.repository_scope_json === null) !== (row.repository_scope_digest === null)) {
+    throw new Error(`UI/UX approval repository scope binding is incomplete: ${row.id}`)
+  }
+  const repositoryScope = row.repository_scope_json === null
+    ? null
+    : repositorySnapshot
+      ? parseAdvisorRepositoryScope(repositorySnapshot, row.repository_scope_json)
+      : (() => {
+          throw new Error(`UI/UX approval repository scope has no snapshot: ${row.id}`)
+        })()
+  if (repositorySnapshot && repositoryScope && advisorRepositoryScopeDigest(
+    repositorySnapshot,
+    repositoryScope,
+  ) !== row.repository_scope_digest) {
+    throw new Error(`UI/UX approval repository scope digest changed: ${row.id}`)
+  }
   return {
     id: row.id,
     jobId: row.job_id,
@@ -2166,6 +2193,8 @@ function mapUiApprovalRequest(row: UiApprovalRequestRow): UiApprovalRequestRecor
     inputDigest: row.input_digest,
     repositoryDigest: row.repository_digest,
     repositorySnapshot,
+    repositoryScope,
+    repositoryScopeDigest: row.repository_scope_digest,
     sessionId: row.session_id,
     proposalText: row.proposal_text,
     beforePath: row.before_path,
@@ -8248,7 +8277,7 @@ export class JobStore {
   uiApprovalRequest(idInput: string): UiApprovalRequestRecord | null {
     const row = this.db.query<UiApprovalRequestRow, [string]>(
       `SELECT id, job_id, round, input_revision, input_digest, repository_digest,
-              repository_snapshot_json,
+              repository_snapshot_json, repository_scope_json, repository_scope_digest,
               session_id, proposal_text, before_path, after_path, status,
               response_message_id, response_user_id, response_text,
               response_input_revision, response_input_digest, response_explicit_approval,
@@ -8263,7 +8292,7 @@ export class JobStore {
     const jobId = requireText(jobIdInput, 'jobId')
     const row = this.db.query<UiApprovalRequestRow, [string]>(
       `SELECT id, job_id, round, input_revision, input_digest, repository_digest,
-              repository_snapshot_json,
+              repository_snapshot_json, repository_scope_json, repository_scope_digest,
               session_id, proposal_text, before_path, after_path, status,
               response_message_id, response_user_id, response_text,
               response_input_revision, response_input_digest, response_explicit_approval,
@@ -8294,6 +8323,8 @@ export class JobStore {
       responseAfterPrompt: row.response_explicit_approval === 1,
       repositoryDigest: row.repository_digest,
       repositorySnapshot: mapped.repositorySnapshot,
+      repositoryScope: mapped.repositoryScope,
+      repositoryScopeDigest: mapped.repositoryScopeDigest,
       proposalText: row.proposal_text,
     }
   }
@@ -8305,6 +8336,8 @@ export class JobStore {
     inputDigest: string
     repositoryDigest: string
     repositorySnapshot: AdvisorRepositorySnapshot
+    repositoryScope?: string[]
+    repositoryScopeDigest?: string
     proposalText: string
     beforePath: string
     afterPath: string
@@ -8316,13 +8349,29 @@ export class JobStore {
     if (!Number.isSafeInteger(input.inputRevision) || input.inputRevision < 1
       || !/^[0-9a-f]{64}$/.test(input.inputDigest)
       || !/^[0-9a-f]{64}$/.test(input.repositoryDigest)
+      || (input.repositoryScopeDigest !== undefined
+        && !/^[0-9a-f]{64}$/.test(input.repositoryScopeDigest))
       || !isAbsolute(input.beforePath) || !isAbsolute(input.afterPath)
       || input.beforePath === input.afterPath) {
       throw new Error('UI approval request binding is invalid')
     }
     const repositorySnapshotJson = serializeAdvisorRepositorySnapshot(input.repositorySnapshot)
+    const repositoryScope = normalizeAdvisorRepositoryScope(
+      input.repositorySnapshot,
+      input.repositoryScope ?? advisorRepositoryIdentifiers(input.repositorySnapshot),
+    )
+    const repositoryScopeDigest = input.repositoryScopeDigest
+      ?? advisorRepositoryScopeDigest(input.repositorySnapshot, repositoryScope)
+    const repositoryScopeJson = serializeAdvisorRepositoryScope(
+      input.repositorySnapshot,
+      repositoryScope,
+    )
     if (advisorRepositoryDigest(input.repositorySnapshot) !== input.repositoryDigest) {
       throw new Error('UI approval repository snapshot does not match its digest')
+    }
+    if (advisorRepositoryScopeDigest(input.repositorySnapshot, repositoryScope)
+      !== repositoryScopeDigest) {
+      throw new Error('UI approval repository scope does not match its digest')
     }
     const park = this.db.transaction(() => {
       const job = this.db.query<{
@@ -8375,13 +8424,14 @@ export class JobStore {
       this.db.run(
         `INSERT INTO ui_approval_requests (
            id, job_id, round, input_revision, input_digest, repository_digest,
-           repository_snapshot_json,
+           repository_snapshot_json, repository_scope_json, repository_scope_digest,
            session_id, proposal_text, before_path, after_path, status,
            prompt_client_message_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publishing', ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publishing', ?, ?)`,
         [
           requestId, jobId, round, input.inputRevision, input.inputDigest,
-          input.repositoryDigest, repositorySnapshotJson, sessionId, proposalText,
+          input.repositoryDigest, repositorySnapshotJson,
+          repositoryScopeJson, repositoryScopeDigest, sessionId, proposalText,
           input.beforePath, input.afterPath,
           slackClientMessageId(`ui-approval:${requestId}`, 0), now,
         ],
@@ -8415,7 +8465,7 @@ export class JobStore {
   pendingUiApprovalNotifications(now = Date.now(), limit = 20): UiApprovalNotification[] {
     const rows = this.db.query<UiApprovalRequestRow, [number, number]>(
       `SELECT id, job_id, round, input_revision, input_digest, repository_digest,
-              repository_snapshot_json,
+              repository_snapshot_json, repository_scope_json, repository_scope_digest,
               session_id, proposal_text, before_path, after_path, status,
               response_message_id, response_user_id, response_text,
               response_input_revision, response_input_digest, response_explicit_approval,
@@ -9111,6 +9161,8 @@ export interface UiApprovalRequestRecord {
   inputDigest: string
   repositoryDigest: string
   repositorySnapshot: AdvisorRepositorySnapshot | null
+  repositoryScope: string[] | null
+  repositoryScopeDigest: string | null
   sessionId: string
   proposalText: string
   beforePath: string
@@ -11621,6 +11673,8 @@ export function prepareUiApprovalForParking(
   inputDigest: string
   repositoryDigest: string
   repositorySnapshot: AdvisorRepositorySnapshot
+  repositoryScope: string[]
+  repositoryScopeDigest: string
   proposalText: string
   beforePath: string
   afterPath: string
@@ -11660,6 +11714,8 @@ export function prepareUiApprovalForParking(
     inputDigest: error.approval.inputDigest,
     repositoryDigest: error.approval.repositoryDigest,
     repositorySnapshot: error.approval.repositorySnapshot,
+    repositoryScope: error.approval.repositoryScope,
+    repositoryScopeDigest: error.approval.repositoryScopeDigest,
     proposalText,
     beforePath: paths[0]!,
     afterPath: paths[1]!,
