@@ -136,6 +136,17 @@ import {
   type ThreadHistoryArchive,
   type ThreadHistoryEvent,
 } from './thread-history.ts'
+import {
+  assertHostGitHubPublicationLogin,
+  createHostGitHubPublicationCommands,
+  GitHubPublicationError,
+  MAX_GITHUB_PUBLICATION_REPOSITORIES,
+  publishGitHubPlan,
+  type GitHubPublicationCommands,
+  type GitHubPublicationPlan,
+  type GitHubPublicationReceipt,
+  type GitHubPublicationSet,
+} from './github-publication.ts'
 
 export class SlackChannelRouteRequiredError extends Error {
   constructor(readonly channelId: string) {
@@ -839,6 +850,54 @@ CREATE TABLE IF NOT EXISTS artifact_deliveries (
   PRIMARY KEY (job_id, artifact_path),
   FOREIGN KEY (job_id) REFERENCES jobs(id)
 );
+CREATE TABLE IF NOT EXISTS github_publication_sets (
+  job_id TEXT PRIMARY KEY,
+  version INTEGER NOT NULL CHECK (version = 1),
+  job_attempt INTEGER NOT NULL CHECK (job_attempt > 0),
+  logical_nonce TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  result_digest TEXT NOT NULL,
+  input_revision INTEGER NOT NULL CHECK (input_revision > 0),
+  input_digest TEXT NOT NULL,
+  review_round INTEGER NOT NULL CHECK (review_round IN (1, 2, 3)),
+  reviewed_repository_digest TEXT NOT NULL,
+  baseline_digest TEXT NOT NULL,
+  plan_count INTEGER NOT NULL CHECK (plan_count >= 0),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS github_publications (
+  job_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  version INTEGER NOT NULL CHECK (version = 1),
+  git_root TEXT NOT NULL,
+  repository_slug TEXT NOT NULL,
+  canonical_url TEXT NOT NULL,
+  base_branch TEXT NOT NULL,
+  head_branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL,
+  initial_head TEXT NOT NULL,
+  status_digest TEXT NOT NULL,
+  local_config_digest TEXT NOT NULL,
+  origin_url_digest TEXT NOT NULL,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  not_before INTEGER,
+  last_error_category TEXT,
+  pull_request_number INTEGER,
+  pull_request_url TEXT,
+  completed_at INTEGER,
+  PRIMARY KEY (job_id, ordinal),
+  UNIQUE (job_id, git_root),
+  FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_github_publications_pending
+  ON github_publications(status, not_before, job_id, ordinal);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_github_publications_repository
+  ON github_publications(job_id, repository_slug COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS ui_approval_requests (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL,
@@ -2383,6 +2442,110 @@ function normalizeSlackChannelIds(values: string[]): string[] {
 function positiveInteger(value: string | number | undefined, fallback: number): number {
   const parsed = Math.floor(Number(value))
   return Number.isFinite(parsed) && parsed >= 1 ? parsed : fallback
+}
+
+const GITHUB_PUBLICATION_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+const GITHUB_PUBLICATION_DIGEST = /^[0-9a-f]{64}$/
+
+function validateStoredGitHubPublicationSet(value: GitHubPublicationSet): void {
+  if (!value || value.version !== 1 || typeof value.jobId !== 'string' || !value.jobId
+    || !Number.isSafeInteger(value.jobAttempt) || value.jobAttempt < 1
+    || !/^[0-9a-f]{32}$/.test(value.logicalNonce)
+    || !Number.isSafeInteger(value.inputRevision)
+    || value.inputRevision < 1 || !GITHUB_PUBLICATION_DIGEST.test(value.inputDigest)
+    || ![1, 2, 3].includes(value.reviewRound)
+    || !GITHUB_PUBLICATION_DIGEST.test(value.reviewedRepositoryDigest)
+    || !GITHUB_PUBLICATION_DIGEST.test(value.baselineDigest)
+    || !Array.isArray(value.plans)
+    || value.plans.length > MAX_GITHUB_PUBLICATION_REPOSITORIES) {
+    throw new Error('GitHub publication set is invalid')
+  }
+  const roots = new Set<string>()
+  const repositories = new Set<string>()
+  for (const plan of value.plans) {
+    const repository = plan.repositorySlug.toLowerCase()
+    if (!plan || plan.version !== 1 || !isAbsolute(plan.gitRoot)
+      || roots.has(plan.gitRoot) || repositories.has(repository)
+      || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(plan.repositorySlug)
+      || plan.canonicalUrl !== `https://github.com/${plan.repositorySlug}.git`
+      || !GITHUB_PUBLICATION_SHA.test(plan.commitSha)
+      || !GITHUB_PUBLICATION_SHA.test(plan.initialHead)
+      || !GITHUB_PUBLICATION_DIGEST.test(plan.statusDigest)
+      || !GITHUB_PUBLICATION_DIGEST.test(plan.localConfigDigest)
+      || !GITHUB_PUBLICATION_DIGEST.test(plan.originUrlDigest)
+      || !plan.baseBranch || !plan.headBranch || plan.baseBranch === plan.headBranch
+      || [plan.baseBranch, plan.headBranch, plan.title].some(item => /[\0\r\n]/.test(item))
+      || Buffer.byteLength(plan.baseBranch) > 255 || Buffer.byteLength(plan.headBranch) > 255
+      || plan.title.length < 1 || plan.title.length > 200) {
+      throw new Error('GitHub publication plan is invalid')
+    }
+    roots.add(plan.gitRoot)
+    repositories.add(repository)
+  }
+}
+
+function appendGitHubPublicationSummary(
+  result: string,
+  receipts: readonly GitHubPublicationReceipt[],
+): string {
+  if (receipts.length === 0) return result
+  const lines = receipts.map(receipt => (
+    `- ${receipt.repositorySlug}: ${receipt.headBranch} (${receipt.commitSha.slice(0, 12)})\n`
+    + `  PR: ${receipt.pullRequestUrl}`
+  ))
+  return `${result.trimEnd()}\n\n📦 GitHubへの公開が完了しました。\n${lines.join('\n')}`
+}
+
+function executionResultDigest(sessionId: string, result: string): string {
+  return createHash('sha256').update(JSON.stringify({ sessionId, result })).digest('hex')
+}
+
+type GitHubPublicationRow = {
+  job_id: string
+  ordinal: number
+  version: number
+  git_root: string
+  repository_slug: string
+  canonical_url: string
+  base_branch: string
+  head_branch: string
+  commit_sha: string
+  initial_head: string
+  status_digest: string
+  local_config_digest: string
+  origin_url_digest: string
+  title: string
+  status: 'pending' | 'completed'
+  attempts: number
+  not_before: number | null
+  last_error_category: string | null
+  pull_request_number: number | null
+  pull_request_url: string | null
+  completed_at: number | null
+}
+
+function publicationPlanFromRow(row: GitHubPublicationRow): GitHubPublicationPlan {
+  return {
+    version: 1,
+    gitRoot: row.git_root,
+    repositorySlug: row.repository_slug,
+    canonicalUrl: row.canonical_url,
+    baseBranch: row.base_branch,
+    headBranch: row.head_branch,
+    commitSha: row.commit_sha,
+    initialHead: row.initial_head,
+    statusDigest: row.status_digest,
+    localConfigDigest: row.local_config_digest,
+    originUrlDigest: row.origin_url_digest,
+    title: row.title,
+  }
+}
+
+export interface PendingGitHubPublication {
+  plan: GitHubPublicationPlan
+  attempts: number
+  notBefore: number | null
+  lastErrorCategory: GitHubPublicationError['category'] | null
 }
 
 /** Operator tuning may shorten a session, but never exceed the public 20-job contract. */
@@ -5768,6 +5931,7 @@ export class JobStore {
     threadId: string
     inputRevision: number
     inputDigest: string
+    execution?: JobExecutionResult
   }): 'sealed' | 'input-changed' | 'cancelled' | 'pending-inbound' {
     const seal = this.db.transaction(() => {
       const job = this.db.query<{
@@ -5827,6 +5991,14 @@ export class JobStore {
       const snapshot = createAdvisorInputSnapshot(job, controls)
       if (snapshot.revision !== options.inputRevision
         || snapshot.digest !== options.inputDigest) return 'input-changed' as const
+      if (options.execution) {
+        this.ensureExecutionResultStagedInternal(
+          options.jobId,
+          options.execution.sessionId,
+          options.execution.result,
+          options.execution.publication,
+        )
+      }
       const updated = this.db.run(
         `UPDATE jobs SET accepts_control = 0
          WHERE id = ? AND runtime = 'codex' AND status = 'running'
@@ -6293,6 +6465,12 @@ export class JobStore {
              SELECT 1 FROM job_interjections AS interjection
              WHERE interjection.job_id = jobs.id
                AND interjection.status NOT IN ('promoted', 'superseded')
+           )
+           AND (
+             jobs.write_enabled = 0 OR EXISTS (
+               SELECT 1 FROM github_publication_sets AS publication
+               WHERE publication.job_id = jobs.id AND publication.status = 'completed'
+             )
            )`,
         [persistedSessionId, result, finishedAt, id],
       )
@@ -6336,22 +6514,131 @@ export class JobStore {
     if (updated.changes !== 1) throw new Error(`could not stage execution result for job ${id}`)
   }
 
-  ensureExecutionResultStaged(id: string, sessionId: string, result: string): boolean {
-    const persist = this.db.transaction(() => {
+  private ensureExecutionResultStagedInternal(
+    id: string,
+    sessionId: string,
+    result: string,
+    publication?: GitHubPublicationSet,
+  ): boolean {
+    if (publication) validateStoredGitHubPublicationSet(publication)
       const row = this.db.query<{
         status: JobStatus
+        attempts: number
+        input_revision: number
+        write_enabled: number
         pending_session_id: string | null
         pending_result: string | null
       }, [string]>(
-        `SELECT status, pending_session_id, pending_result FROM jobs
+        `SELECT status, attempts, input_revision, write_enabled,
+                pending_session_id, pending_result FROM jobs
          WHERE id = ? AND runtime = 'codex'`,
       ).get(id)
       if (!row || row.status !== 'running') {
         throw new Error(`job is no longer running: ${id}`)
       }
+      if (row.write_enabled === 1 && !publication) {
+        throw new Error(`write result omitted its reviewed GitHub publication set for job ${id}`)
+      }
       const persistedSession = requireText(sessionId, 'sessionId')
+      const resultDigest = executionResultDigest(persistedSession, result)
+      let expectedPersistedResult = result
+      if (publication) {
+        if (publication.jobId !== id || publication.jobAttempt !== row.attempts
+          || publication.inputRevision !== row.input_revision || row.write_enabled !== 1) {
+          throw new Error(`GitHub publication binding conflicts for job ${id}`)
+        }
+        const existingSet = this.db.query<{
+          version: number
+          job_attempt: number
+          logical_nonce: string
+          session_id: string
+          result_digest: string
+          input_revision: number
+          input_digest: string
+          review_round: number
+          reviewed_repository_digest: string
+          baseline_digest: string
+          plan_count: number
+          status: 'pending' | 'completed'
+        }, [string]>(
+          `SELECT version, job_attempt, logical_nonce, session_id, result_digest,
+                  input_revision, input_digest, review_round,
+                  reviewed_repository_digest, baseline_digest, plan_count, status
+           FROM github_publication_sets WHERE job_id = ?`,
+        ).get(id)
+        if (!existingSet) {
+          const now = Date.now()
+          this.db.run(
+            `INSERT INTO github_publication_sets (
+               job_id, version, job_attempt, logical_nonce, session_id, result_digest,
+               input_revision, input_digest, review_round, reviewed_repository_digest,
+               baseline_digest, plan_count, status, created_at, completed_at
+             ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              id, publication.jobAttempt, publication.logicalNonce, persistedSession,
+              resultDigest, publication.inputRevision, publication.inputDigest,
+              publication.reviewRound, publication.reviewedRepositoryDigest,
+              publication.baselineDigest, publication.plans.length,
+              publication.plans.length === 0 ? 'completed' : 'pending', now,
+              publication.plans.length === 0 ? now : null,
+            ],
+          )
+          for (const [ordinal, plan] of publication.plans.entries()) {
+            this.db.run(
+              `INSERT INTO github_publications (
+                 job_id, ordinal, version, git_root, repository_slug, canonical_url,
+                 base_branch, head_branch, commit_sha, initial_head, status_digest,
+                 local_config_digest, origin_url_digest, title, status
+               ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+              [
+                id, ordinal, plan.gitRoot, plan.repositorySlug, plan.canonicalUrl,
+                plan.baseBranch, plan.headBranch, plan.commitSha, plan.initialHead,
+                plan.statusDigest, plan.localConfigDigest, plan.originUrlDigest, plan.title,
+              ],
+            )
+          }
+        } else {
+          if (existingSet.version !== 1 || existingSet.job_attempt !== publication.jobAttempt
+            || existingSet.logical_nonce !== publication.logicalNonce
+            || existingSet.session_id !== persistedSession
+            || existingSet.result_digest !== resultDigest
+            || existingSet.input_revision !== publication.inputRevision
+            || existingSet.input_digest !== publication.inputDigest
+            || existingSet.review_round !== publication.reviewRound
+            || existingSet.reviewed_repository_digest !== publication.reviewedRepositoryDigest
+            || existingSet.baseline_digest !== publication.baselineDigest
+            || existingSet.plan_count !== publication.plans.length) {
+            throw new Error(`GitHub publication checkpoint conflicts for job ${id}`)
+          }
+          const rows = this.db.query<GitHubPublicationRow, [string]>(
+            'SELECT * FROM github_publications WHERE job_id = ? ORDER BY ordinal',
+          ).all(id)
+          if (JSON.stringify(rows.map(publicationPlanFromRow))
+            !== JSON.stringify(publication.plans)) {
+            throw new Error(`GitHub publication plans conflict for job ${id}`)
+          }
+          if (existingSet.status === 'completed') {
+            const receipts = rows.map(entry => {
+              if (entry.status !== 'completed' || entry.pull_request_number === null
+                || entry.pull_request_url === null) {
+                throw new Error(`GitHub publication receipt is incomplete for job ${id}`)
+              }
+              return {
+                repositorySlug: entry.repository_slug,
+                baseBranch: entry.base_branch,
+                headBranch: entry.head_branch,
+                commitSha: entry.commit_sha,
+                pullRequestNumber: entry.pull_request_number,
+                pullRequestUrl: entry.pull_request_url,
+              } satisfies GitHubPublicationReceipt
+            })
+            expectedPersistedResult = appendGitHubPublicationSummary(result, receipts)
+          }
+        }
+      }
       if (row.pending_session_id !== null || row.pending_result !== null) {
-        if (row.pending_session_id === persistedSession && row.pending_result === result) return false
+        if (row.pending_session_id === persistedSession
+          && row.pending_result === expectedPersistedResult) return false
         throw new Error(`job has a conflicting staged execution result: ${id}`)
       }
       const updated = this.db.run(
@@ -6362,11 +6649,26 @@ export class JobStore {
       )
       if (updated.changes !== 1) throw new Error(`could not stage execution result for job ${id}`)
       return true
+  }
+
+  ensureExecutionResultStaged(
+    id: string,
+    sessionId: string,
+    result: string,
+    publication?: GitHubPublicationSet,
+  ): boolean {
+    const persist = this.db.transaction(() => {
+      return this.ensureExecutionResultStagedInternal(id, sessionId, result, publication)
     })
     return retrySqlite(() => persist.immediate())
   }
 
-  assertExecutionResultStaged(id: string, sessionId: string, result: string): void {
+  assertExecutionResultStaged(
+    id: string,
+    sessionId: string,
+    result: string,
+    publication?: GitHubPublicationSet,
+  ): void {
     const row = this.db.query<{
       pending_session_id: string | null
       pending_result: string | null
@@ -6374,21 +6676,185 @@ export class JobStore {
       `SELECT pending_session_id, pending_result FROM jobs
        WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
     ).get(id)
-    if (row?.pending_session_id !== sessionId || row.pending_result !== result) {
+    let expected = result
+    if (publication) {
+      validateStoredGitHubPublicationSet(publication)
+      const set = this.db.query<{ status: 'pending' | 'completed' }, [string]>(
+        'SELECT status FROM github_publication_sets WHERE job_id = ?',
+      ).get(id)
+      if (!set) throw new Error(`executor omitted its publication checkpoint for job ${id}`)
+      if (set.status === 'completed') {
+        expected = appendGitHubPublicationSummary(result, this.githubPublicationReceipts(id))
+      }
+    }
+    if (row?.pending_session_id !== sessionId || row.pending_result !== expected) {
       throw new Error(`executor returned before staging its result for job ${id}`)
     }
   }
 
+  pendingGitHubPublicationJobIds(): string[] {
+    return this.db.query<{ job_id: string }, []>(
+      `SELECT sets.job_id FROM github_publication_sets AS sets
+       JOIN jobs ON jobs.id = sets.job_id
+       WHERE sets.status = 'pending' AND jobs.runtime = 'codex'
+         AND jobs.status = 'running' AND jobs.pending_result IS NOT NULL
+       ORDER BY jobs.seq`,
+    ).all().map(row => row.job_id)
+  }
+
+  hasGitHubPublicationCheckpoint(jobId: string): boolean {
+    return Boolean(this.db.query<{ job_id: string }, [string]>(
+      `SELECT sets.job_id FROM github_publication_sets AS sets
+       JOIN jobs ON jobs.id = sets.job_id
+       WHERE sets.job_id = ? AND jobs.runtime = 'codex'
+         AND jobs.status = 'running' AND jobs.pending_result IS NOT NULL`,
+    ).get(jobId))
+  }
+
+  pendingGitHubPublications(jobId: string): PendingGitHubPublication[] {
+    return this.db.query<GitHubPublicationRow, [string]>(
+      `SELECT * FROM github_publications
+       WHERE job_id = ? AND status = 'pending' ORDER BY ordinal`,
+    ).all(jobId).map(row => ({
+      plan: publicationPlanFromRow(row),
+      attempts: row.attempts,
+      notBefore: row.not_before,
+      lastErrorCategory: row.last_error_category as GitHubPublicationError['category'] | null,
+    }))
+  }
+
+  recordGitHubPublicationFailure(
+    jobId: string,
+    plan: GitHubPublicationPlan,
+    category: GitHubPublicationError['category'],
+    notBefore: number,
+  ): void {
+    const updated = retrySqlite(() => this.db.run(
+      `UPDATE github_publications
+       SET attempts = attempts + 1, not_before = ?, last_error_category = ?
+       WHERE job_id = ? AND git_root = ? AND commit_sha = ? AND status = 'pending'`,
+      [notBefore, category, jobId, plan.gitRoot, plan.commitSha],
+    ))
+    if (updated.changes !== 1) {
+      throw new Error(`GitHub publication failure checkpoint conflicts for job ${jobId}`)
+    }
+  }
+
+  recordGitHubPublicationReceipt(
+    jobId: string,
+    plan: GitHubPublicationPlan,
+    receipt: GitHubPublicationReceipt,
+  ): void {
+    if (receipt.repositorySlug !== plan.repositorySlug
+      || receipt.baseBranch !== plan.baseBranch || receipt.headBranch !== plan.headBranch
+      || receipt.commitSha !== plan.commitSha || !Number.isSafeInteger(receipt.pullRequestNumber)
+      || receipt.pullRequestNumber <= 0
+      || receipt.pullRequestUrl.toLowerCase()
+        !== `https://github.com/${plan.repositorySlug}/pull/${receipt.pullRequestNumber}`.toLowerCase()) {
+      throw new Error(`GitHub publication receipt conflicts for job ${jobId}`)
+    }
+    const updated = retrySqlite(() => this.db.run(
+      `UPDATE github_publications
+       SET status = 'completed', attempts = attempts + 1, not_before = NULL,
+           last_error_category = NULL, pull_request_number = ?, pull_request_url = ?,
+           completed_at = ?
+       WHERE job_id = ? AND git_root = ? AND commit_sha = ? AND status = 'pending'`,
+      [
+        receipt.pullRequestNumber, receipt.pullRequestUrl, Date.now(),
+        jobId, plan.gitRoot, plan.commitSha,
+      ],
+    ))
+    if (updated.changes !== 1) {
+      const existing = this.db.query<GitHubPublicationRow, [string, string]>(
+        'SELECT * FROM github_publications WHERE job_id = ? AND git_root = ?',
+      ).get(jobId, plan.gitRoot)
+      if (existing?.status === 'completed'
+        && existing.commit_sha === receipt.commitSha
+        && existing.pull_request_number === receipt.pullRequestNumber
+        && existing.pull_request_url === receipt.pullRequestUrl) return
+      throw new Error(`GitHub publication receipt checkpoint conflicts for job ${jobId}`)
+    }
+  }
+
+  githubPublicationReceipts(jobId: string): GitHubPublicationReceipt[] {
+    return this.db.query<GitHubPublicationRow, [string]>(
+      'SELECT * FROM github_publications WHERE job_id = ? ORDER BY ordinal',
+    ).all(jobId).map(row => {
+      if (row.status !== 'completed' || row.pull_request_number === null
+        || row.pull_request_url === null) {
+        throw new Error(`GitHub publication is incomplete for job ${jobId}`)
+      }
+      return {
+        repositorySlug: row.repository_slug,
+        baseBranch: row.base_branch,
+        headBranch: row.head_branch,
+        commitSha: row.commit_sha,
+        pullRequestNumber: row.pull_request_number,
+        pullRequestUrl: row.pull_request_url,
+      }
+    })
+  }
+
+  completeGitHubPublicationSet(jobId: string): boolean {
+    const complete = this.db.transaction(() => {
+      const set = this.db.query<{
+        status: 'pending' | 'completed'
+        plan_count: number
+      }, [string]>(
+        'SELECT status, plan_count FROM github_publication_sets WHERE job_id = ?',
+      ).get(jobId)
+      if (!set) return false
+      if (set.status === 'completed') return false
+      const pending = this.db.query<{ count: number }, [string]>(
+        "SELECT COUNT(*) AS count FROM github_publications WHERE job_id = ? AND status != 'completed'",
+      ).get(jobId)?.count ?? 0
+      if (pending !== 0) throw new Error(`GitHub publication is still pending for job ${jobId}`)
+      const receipts = this.githubPublicationReceipts(jobId)
+      if (receipts.length !== set.plan_count) {
+        throw new Error(`GitHub publication receipt count conflicts for job ${jobId}`)
+      }
+      const job = this.db.query<{ pending_result: string | null }, [string]>(
+        `SELECT pending_result FROM jobs
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+      ).get(jobId)
+      if (!job || job.pending_result === null) {
+        throw new Error(`GitHub publication has no staged result for job ${jobId}`)
+      }
+      const updated = this.db.run(
+        `UPDATE jobs SET pending_result = ?
+         WHERE id = ? AND pending_result = ? AND status = 'running'`,
+        [appendGitHubPublicationSummary(job.pending_result, receipts), jobId, job.pending_result],
+      )
+      if (updated.changes !== 1) {
+        throw new Error(`GitHub publication result checkpoint conflicts for job ${jobId}`)
+      }
+      this.db.run(
+        `UPDATE github_publication_sets SET status = 'completed', completed_at = ?
+         WHERE job_id = ? AND status = 'pending'`,
+        [Date.now(), jobId],
+      )
+      return true
+    })
+    return retrySqlite(() => complete.immediate())
+  }
+
   completeStagedExecution(id: string): void {
     const row = this.db.query<{
+      write_enabled: number
       pending_session_id: string | null
       pending_result: string | null
     }, [string]>(
-      `SELECT pending_session_id, pending_result FROM jobs
+      `SELECT write_enabled, pending_session_id, pending_result FROM jobs
        WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
     ).get(id)
     if (!row?.pending_session_id || row.pending_result === null) {
       throw new Error(`job has no staged execution result: ${id}`)
+    }
+    const publication = this.db.query<{ status: 'pending' | 'completed' }, [string]>(
+      'SELECT status FROM github_publication_sets WHERE job_id = ?',
+    ).get(id)
+    if (row.write_enabled === 1 && publication?.status !== 'completed') {
+      throw new Error(`GitHub publication is still pending for job ${id}`)
     }
     this.complete(id, row.pending_session_id, row.pending_result)
   }
@@ -6403,6 +6869,12 @@ export class JobStore {
       `SELECT id FROM jobs
        WHERE runtime = 'codex' AND status = 'running'
          AND pending_session_id IS NOT NULL AND pending_result IS NOT NULL
+         AND (
+           jobs.write_enabled = 0 OR EXISTS (
+             SELECT 1 FROM github_publication_sets AS publication
+             WHERE publication.job_id = jobs.id AND publication.status = 'completed'
+           )
+         )
          AND cancel_requested_at IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM inbound_deliveries AS inbound
@@ -9068,11 +9540,21 @@ export class JobStore {
     let requeued = 0
     let failedWrites = 0
     let failedUncertain = 0
+    const publicationCheckpoints = new Set(
+      this.runningJobs()
+        .filter(job => this.hasGitHubPublicationCheckpoint(job.id))
+        .map(job => job.id),
+    )
     for (const job of this.runningJobs()) {
       if (job.cancelRequestedAt !== null) {
         this.cancel(job.id)
         failedUncertain += 1
       } else if (job.writeEnabled) {
+        // A reviewed result with a durable host-publication checkpoint has
+        // known effects: the exact commit/branch/PR receipt is either pending
+        // or already recorded. Never downgrade it to the generic uncertain-
+        // write failure during restart recovery.
+        if (publicationCheckpoints.has(job.id)) continue
         const disposition = this.requeueAfterPreImplementationRepositoryDrift(
           job.id,
         )
@@ -9151,6 +9633,8 @@ export function createExecutorPidLifecycle(
 export interface JobExecutionResult {
   sessionId: string
   result: string
+  /** Present only after a write job passed final review and input sealing. */
+  publication?: GitHubPublicationSet
 }
 
 export interface UiApprovalRequestRecord {
@@ -9298,6 +9782,9 @@ export interface RunQueuedJobsOptions {
   closeJobMonitor?: (job: JobRecord) => Promise<void>
   retainFailedJobMonitor?: (job: JobRecord) => Promise<void>
   executorStagesResult?: boolean
+  /** Fixture-only host transport; production resolves the authenticated gh CLI itself. */
+  githubPublicationCommandsForTesting?: GitHubPublicationCommands
+  githubPublicationRetryMsForTesting?: number
   signal?: AbortSignal
   onLog?: (message: string) => void
 }
@@ -9362,6 +9849,129 @@ export class CodexResultPersistencePendingError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'CodexResultPersistencePendingError'
+  }
+}
+
+export async function publishStagedGitHubPublication(
+  store: JobStore,
+  jobId: string,
+  options: {
+    commands?: GitHubPublicationCommands
+    retryMsForTesting?: number
+    signal?: AbortSignal
+    onStatus?: (message: string) => Promise<void> | void
+  } = {},
+): Promise<void> {
+  const announced = new Set<string>()
+  while (true) {
+    if (options.signal?.aborted) {
+      throw new CodexResultPersistencePendingError(
+        `GitHub publication remains staged for job ${jobId} after shutdown interruption`,
+      )
+    }
+    let pending: PendingGitHubPublication[]
+    try {
+      pending = store.pendingGitHubPublications(jobId)
+    } catch (error) {
+      throw new CodexResultPersistencePendingError(
+        `GitHub publication checkpoint is temporarily unavailable for job ${jobId}: ${error}`,
+      )
+    }
+    if (pending.length === 0) {
+      try {
+        store.completeGitHubPublicationSet(jobId)
+      } catch (error) {
+        throw new CodexResultPersistencePendingError(
+          `GitHub publication receipts remain staged for job ${jobId}: ${error}`,
+        )
+      }
+      return
+    }
+    const work = pending[0]!
+    if (work.lastErrorCategory === 'cleanup') {
+      throw new CodexResultPersistencePendingError(
+        `GitHub publication process cleanup remains unconfirmed for job ${jobId}; `
+        + 'automatic external retries are suspended',
+      )
+    }
+    const now = Date.now()
+    if (work.notBefore !== null && work.notBefore > now) {
+      await Bun.sleep(Math.min(1_000, Math.max(1, work.notBefore - now)))
+      continue
+    }
+    let receipt: GitHubPublicationReceipt
+    try {
+      const commands = options.commands ?? createHostGitHubPublicationCommands()
+      receipt = await publishGitHubPlan(work.plan, commands, options.signal)
+    } catch (error) {
+      if (options.signal?.aborted) {
+        throw new CodexResultPersistencePendingError(
+          `GitHub publication remains staged for job ${jobId} after shutdown interruption`,
+        )
+      }
+      const category = error instanceof GitHubPublicationError ? error.category : 'remote'
+      if (category === 'cleanup') {
+        try {
+          store.recordGitHubPublicationFailure(jobId, work.plan, category, Date.now())
+        } catch (checkpointError) {
+          throw new CodexResultPersistencePendingError(
+            `GitHub publication cleanup quarantine remains unstaged for job ${jobId}: `
+            + checkpointError,
+          )
+        }
+        throw new CodexResultPersistencePendingError(
+          `GitHub publication process cleanup remains unconfirmed for job ${jobId}; `
+          + 'automatic external retries are suspended',
+        )
+      }
+      const baseRetryMs = options.retryMsForTesting === undefined
+        ? (category === 'configuration' || category === 'conflict' ? 60_000 : 5_000)
+        : positiveInteger(options.retryMsForTesting, 1)
+      const retryMs = Math.min(baseRetryMs * (2 ** Math.min(work.attempts, 6)), 5 * 60_000)
+      try {
+        store.recordGitHubPublicationFailure(jobId, work.plan, category, Date.now() + retryMs)
+      } catch (checkpointError) {
+        throw new CodexResultPersistencePendingError(
+          `GitHub publication retry remains staged for job ${jobId}: ${checkpointError}`,
+        )
+      }
+      if (!announced.has(category)) {
+        announced.add(category)
+        const reason = category === 'authentication'
+          ? 'このMacのGitHub認証またはrepository権限を確認しています'
+          : category === 'network'
+            ? 'GitHubとの通信回復を待っています'
+            : category === 'conflict'
+              ? 'remote branchの競合解消を待っています'
+              : category === 'configuration'
+                ? 'review済みrepository状態への復帰を待っています'
+                : 'GitHubの確定receiptを再照合しています'
+        try {
+          await options.onStatus?.(`GitHub公開は未確定です。${reason}。自動で再試行します。`)
+        } catch {
+          // updateMonitorRequired records its own durable failure barrier.
+        }
+      }
+      continue
+    }
+    try {
+      store.recordGitHubPublicationReceipt(jobId, work.plan, receipt)
+    } catch (error) {
+      // The remote operation may already be complete. Never classify a local
+      // receipt persistence failure as a task failure or resend blindly; the
+      // next recovery pass reconciles the exact branch/PR first.
+      throw new CodexResultPersistencePendingError(
+        `GitHub publication receipt remains staged for job ${jobId}: ${error}`,
+      )
+    }
+    try {
+      await options.onStatus?.(
+        `GitHub公開を確認しました: ${receipt.repositorySlug} #${receipt.pullRequestNumber}`,
+      )
+    } catch {
+      // The publication receipt is already durable. Monitor health is checked
+      // separately by the runner and must not turn a confirmed push into a retry.
+    }
   }
 }
 
@@ -10006,13 +10616,23 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       }
       if (options.executorStagesResult) {
         try {
-          options.store.assertExecutionResultStaged(job.id, execution.sessionId, execution.result)
+          options.store.assertExecutionResultStaged(
+            job.id,
+            execution.sessionId,
+            execution.result,
+            execution.publication,
+          )
         } catch (error) {
           throw new CodexResultPersistencePendingError(
             `executor result checkpoint is unconfirmed for job ${job.id}: ${error}`,
           )
         }
       } else {
+        if (execution.publication) {
+          throw new CodexResultPersistencePendingError(
+            `GitHub publication requires an atomic executor checkpoint for job ${job.id}`,
+          )
+        }
         options.store.stageExecutionResult(job.id, execution.sessionId, execution.result)
       }
       options.assertJobMonitorHealthy?.(job)
@@ -10026,6 +10646,17 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       }
       options.assertJobMonitorHealthy?.(job)
       await updateMonitor(job, '一時的な補助セッションを終了しました')
+      if (execution.publication) {
+        await updateMonitor(job, 'review済みcommitをGitHubへ公開します')
+        await publishStagedGitHubPublication(options.store, job.id, {
+          commands: options.githubPublicationCommandsForTesting,
+          retryMsForTesting: options.githubPublicationRetryMsForTesting,
+          signal: options.signal,
+          onStatus: message => updateMonitor(job, message),
+        })
+        options.assertJobMonitorHealthy?.(job)
+        await updateMonitor(job, 'GitHubへのpushとPR作成を確認しました')
+      }
       await updateMonitor(job, 'キューの結果を確定します')
       // Stop and await the in-flight async Herdr probe, then synchronously
       // assert and commit in the same JS turn. A mere failure-flag read cannot
@@ -10432,7 +11063,7 @@ function safeJobId(jobId: string): string {
   return jobId.replace(/[^A-Za-z0-9._-]/g, '_')
 }
 
-type ExecutionResultJournal = {
+type ExecutionResultJournalV1 = {
   version: 1
   jobId: string
   sessionId: string
@@ -10440,7 +11071,20 @@ type ExecutionResultJournal = {
   createdAt: number
 }
 
-const MAX_EXECUTION_RESULT_JOURNAL_BYTES = 256 * 1024
+type ExecutionResultJournalV2 = {
+  version: 2
+  jobId: string
+  attempt: number
+  sessionId: string
+  result: string
+  resultDigest: string
+  publication: GitHubPublicationSet | null
+  createdAt: number
+}
+
+type ExecutionResultJournal = ExecutionResultJournalV1 | ExecutionResultJournalV2
+
+const MAX_EXECUTION_RESULT_JOURNAL_BYTES = 512 * 1024
 const MAX_PERSISTED_RESULT_TEXT_CHARS = 12_000
 
 function executionResultJournalPath(dirInput: string, jobId: string): string {
@@ -10460,12 +11104,38 @@ function parseExecutionResultJournal(raw: string, expectedJobId: string): Execut
     throw new Error('execution result journal must be an object')
   }
   const record = value as Record<string, unknown>
-  if (record.version !== 1 || record.jobId !== expectedJobId
-    || typeof record.sessionId !== 'string' || !record.sessionId
-    || typeof record.result !== 'string'
+  if (record.jobId !== expectedJobId || typeof record.sessionId !== 'string'
+    || !record.sessionId || typeof record.result !== 'string'
     || !Number.isSafeInteger(record.createdAt) || Number(record.createdAt) < 0) {
     throw new Error('execution result journal has invalid fields')
   }
+  if (record.version === 2) {
+    if (!Number.isSafeInteger(record.attempt) || Number(record.attempt) < 1
+      || typeof record.resultDigest !== 'string'
+      || record.resultDigest !== executionResultDigest(record.sessionId, record.result)) {
+      throw new Error('execution result journal has invalid v2 binding')
+    }
+    let publication: GitHubPublicationSet | null = null
+    if (record.publication !== null) {
+      publication = record.publication as GitHubPublicationSet
+      validateStoredGitHubPublicationSet(publication)
+      if (publication.jobId !== expectedJobId
+        || publication.jobAttempt !== Number(record.attempt)) {
+        throw new Error('execution result journal publication binding is invalid')
+      }
+    }
+    return {
+      version: 2,
+      jobId: expectedJobId,
+      attempt: Number(record.attempt),
+      sessionId: record.sessionId,
+      result: record.result,
+      resultDigest: record.resultDigest,
+      publication,
+      createdAt: Number(record.createdAt),
+    }
+  }
+  if (record.version !== 1) throw new Error('execution result journal version is unsupported')
   return {
     version: 1,
     jobId: expectedJobId,
@@ -10480,22 +11150,33 @@ export function persistExecutionResultJournal(
   job: JobRecord,
   execution: JobExecutionResult,
 ): void {
+  if (job.writeEnabled && !execution.publication) {
+    throw new Error(`write result omitted its reviewed GitHub publication set for job ${job.id}`)
+  }
   const path = executionResultJournalPath(dir, job.id)
   const existing = readOptionalPrivateFile(path)
   if (existing !== null) {
     const journal = parseExecutionResultJournal(existing, job.id)
-    if (journal.sessionId !== execution.sessionId || journal.result !== execution.result) {
+    const samePublication = journal.version === 2
+      ? JSON.stringify(journal.publication) === JSON.stringify(execution.publication ?? null)
+        && journal.attempt === job.attempts
+      : execution.publication === undefined
+    if (journal.sessionId !== execution.sessionId || journal.result !== execution.result
+      || !samePublication) {
       throw new Error(`execution result journal conflicts for job ${job.id}`)
     }
     return
   }
   const serialized = `${JSON.stringify({
-    version: 1,
+    version: 2,
     jobId: job.id,
+    attempt: job.attempts,
     sessionId: requireText(execution.sessionId, 'sessionId'),
     result: execution.result,
+    resultDigest: executionResultDigest(execution.sessionId, execution.result),
+    publication: execution.publication ?? null,
     createdAt: Date.now(),
-  } satisfies ExecutionResultJournal)}\n`
+  } satisfies ExecutionResultJournalV2)}\n`
   if (Buffer.byteLength(serialized) > MAX_EXECUTION_RESULT_JOURNAL_BYTES) {
     throw new Error('execution result journal is too large')
   }
@@ -10508,7 +11189,16 @@ export function recoverExecutionResultJournals(store: JobStore, dir: string): nu
     const raw = readOptionalPrivateFile(executionResultJournalPath(dir, job.id))
     if (raw === null) continue
     const journal = parseExecutionResultJournal(raw, job.id)
-    if (store.ensureExecutionResultStaged(job.id, journal.sessionId, journal.result)) recovered += 1
+    if (journal.version === 1 && job.writeEnabled) continue
+    if (journal.version === 2 && journal.attempt !== job.attempts) {
+      throw new Error(`execution result journal attempt conflicts for job ${job.id}`)
+    }
+    if (store.ensureExecutionResultStaged(
+      job.id,
+      journal.sessionId,
+      journal.result,
+      journal.version === 2 ? journal.publication ?? undefined : undefined,
+    )) recovered += 1
   }
   return recovered
 }
@@ -11745,12 +12435,18 @@ export async function recoverExecutionCheckpointBeforeAdvisorCleanup(
   store: JobStore,
   dir: string,
   reconcileAdvisors: () => Promise<void>,
+  publishStaged?: (jobId: string) => Promise<void>,
 ): Promise<{ journaled: number; completed: number }> {
   // A result journal is the process-exit checkpoint, but its SQLite stage must
   // exist before recovery may close a round-owned ephemeral advisor workspace.
   // Keep this order identical for daemon startup and explicit recovery.
   const journaled = recoverExecutionResultJournals(store, dir)
   await reconcileAdvisors()
+  if (publishStaged) {
+    for (const jobId of store.pendingGitHubPublicationJobIds()) {
+      await publishStaged(jobId)
+    }
+  }
   const completed = store.recoverStagedExecutions()
   return { journaled, completed }
 }
@@ -13421,6 +14117,10 @@ async function runCli(): Promise<void> {
       throw new Error('job runner is still running; refuse interrupted-job recovery')
     }
     const log = (message: string) => process.stderr.write(`${message}\n`)
+    const recoveryController = new AbortController()
+    const abortRecovery = () => recoveryController.abort()
+    process.on('SIGINT', abortRecovery)
+    process.on('SIGTERM', abortRecovery)
     try {
       const runtime = readPinnedHerdrRuntime(dir)
       await verifyHerdrRuntimeIdentityAsync(runtime)
@@ -13488,6 +14188,16 @@ async function runCli(): Promise<void> {
             log,
           }) },
         ),
+        async jobId => {
+          await publishStagedGitHubPublication(store, jobId, {
+            signal: recoveryController.signal,
+            onStatus: message => {
+              try { appendHerdrJobMonitorStatus(dir, jobId, message) } catch (error) {
+                log(`GitHub publication monitor update failed for ${jobId}: ${String(error)}`)
+              }
+            },
+          })
+        },
       )
       if (journaled > 0) log(`recovered ${journaled} durable execution result journal(s)`)
       if (completed > 0) log(`completed ${completed} staged execution(s) after advisor recovery`)
@@ -13508,6 +14218,8 @@ async function runCli(): Promise<void> {
       }
       process.stdout.write(`${JSON.stringify(recovered)}\n`)
     } finally {
+      process.off('SIGINT', abortRecovery)
+      process.off('SIGTERM', abortRecovery)
       store.close()
       releaseDaemonLock(lockDir, lease)
     }
@@ -13547,6 +14259,7 @@ async function runCli(): Promise<void> {
     verifyOfficialCodexSnapshot(loginCodex)
     assertCodexChatGptSubscriptionLogin(loginCodex.physical)
     verifyOfficialCodexSnapshot(loginCodex)
+    await assertHostGitHubPublicationLogin()
   } catch (error) {
     store.close()
     throw error
@@ -13587,6 +14300,13 @@ async function runCli(): Promise<void> {
   // Publish only after winning the daemon lease. A concurrent losing launcher
   // can no longer replace the live runner's pane identity.
   if (launchHerdrRuntime) writePinnedHerdrRuntime(dir, launchHerdrRuntime)
+
+  const controller = new AbortController()
+  const stop = () => controller.abort()
+  const ignoreInterrupt = () => {}
+  if (command === 'daemon') process.on('SIGINT', ignoreInterrupt)
+  else process.on('SIGINT', stop)
+  process.on('SIGTERM', stop)
 
   const updateJournal = join(dir, 'update-transaction.json')
   let startupRetainedMonitorJobIds: string[] = []
@@ -13655,6 +14375,16 @@ async function runCli(): Promise<void> {
           log,
         }) },
       ),
+      async jobId => {
+        await publishStagedGitHubPublication(store, jobId, {
+          signal: controller.signal,
+          onStatus: message => {
+            try { appendHerdrJobMonitorStatus(dir, jobId, message) } catch (error) {
+              log(`GitHub publication monitor update failed for ${jobId}: ${String(error)}`)
+            }
+          },
+        })
+      },
     )
     if (journaled > 0) log(`recovered ${journaled} durable execution result journal(s)`)
     if (staged > 0) log(`completed ${staged} staged execution(s) after advisor recovery`)
@@ -13690,12 +14420,6 @@ async function runCli(): Promise<void> {
     const initialMaintenance = maintainState(store, dir)
     log(`state maintenance: ${JSON.stringify(initialMaintenance)}`)
   }
-  const controller = new AbortController()
-  const stop = () => controller.abort()
-  const ignoreInterrupt = () => {}
-  if (command === 'daemon') process.on('SIGINT', ignoreInterrupt)
-  else process.on('SIGINT', stop)
-  process.on('SIGTERM', stop)
   const maintenanceTimer = setInterval(() => {
     if (updateTransactionPending(updateJournal)) return
     try {
@@ -14034,7 +14758,9 @@ async function runCli(): Promise<void> {
                   error,
                 })
               ),
-              sealPhaseResult: ({ logicalNonce, threadId, inputRevision, inputDigest }) => (
+              sealPhaseResult: ({
+                logicalNonce, threadId, inputRevision, inputDigest, execution,
+              }) => (
                 store.sealAppServerPhaseResult({
                   jobId: job.id,
                   epoch: job.controlEpoch,
@@ -14042,6 +14768,7 @@ async function runCli(): Promise<void> {
                   threadId,
                   inputRevision,
                   inputDigest,
+                  execution,
                 })
               ),
               beginDispatch: ({
@@ -14194,30 +14921,47 @@ async function runCli(): Promise<void> {
                 throw new Error('Codex commentary could not be staged for Slack delivery')
               }
             },
-            onSuccessfulResult: rawExecution => {
+            finalizeSuccessfulResult: rawExecution => {
               try {
-                const finalized = finalizeSuccessfulExecution(
+                return finalizeSuccessfulExecution(
                   store.get(job.id) ?? job,
                   rawExecution,
                   dir,
                   log,
                 )
-                persistExecutionResultJournal(dir, job, finalized)
-                store.ensureExecutionResultStaged(job.id, finalized.sessionId, finalized.result)
-                if (guard.failure) {
-                  throw new CodexResultPersistencePendingError(
-                    `Codex result is durable but its Herdr monitor failed: ${guard.failure.message}`,
-                  )
-                }
-                return finalized
               } catch (error) {
                 if (error instanceof CodexResultPersistencePendingError) throw error
                 throw new CodexResultPersistencePendingError(
-                  `Codex completed but its durable result checkpoint is pending: ${error}`,
+                  `Codex completed but its result finalization is pending: ${error}`,
                 )
               }
             },
+            onSuccessfulResult: rawExecution => finalizeSuccessfulExecution(
+              store.get(job.id) ?? job,
+              rawExecution,
+              dir,
+              log,
+            ),
           })
+          // Phased write results are already sealed and staged atomically.
+          // Compatibility/read results are staged here before the executor
+          // callback returns to the serial queue. The journal is an extra
+          // recovery copy, never the only durable publication checkpoint.
+          try {
+            persistExecutionResultJournal(dir, job, execution)
+          } catch (error) {
+            // The SQLite phase seal above is the authoritative durable
+            // checkpoint. A best-effort filesystem journal failure must not
+            // turn a reviewed result into a failed job or cause Codex to run
+            // the implementation again.
+            log(`result journal: SQLite checkpoint retained (${String(error)})`)
+          }
+          store.ensureExecutionResultStaged(
+            job.id,
+            execution.sessionId,
+            execution.result,
+            execution.publication,
+          )
           if (guard.failure) {
             throw new CodexResultPersistencePendingError(
               `Codex result is staged but its Herdr monitor failed: ${guard.failure.message}`,

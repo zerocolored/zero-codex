@@ -63,6 +63,7 @@ import {
   type JobControlRecord,
   type JobRecord,
 } from './job-runner.ts'
+import type { GitHubPublicationSet } from './github-publication.ts'
 
 import {
   CODEX_WORKER_SAFETY_PROMPT,
@@ -129,6 +130,55 @@ import {
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { CodexAppServerSession } from './codex-app-server-session.ts'
 import { CodexUiApprovalRequiredError } from './ui-approval.ts'
+
+function emptyFixturePublication(
+  store: JobStore,
+  job: JobRecord,
+): GitHubPublicationSet {
+  const input = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+  return {
+    version: 1,
+    jobId: job.id,
+    jobAttempt: job.attempts,
+    logicalNonce: '0'.repeat(32),
+    inputRevision: input.revision,
+    inputDigest: input.digest,
+    reviewRound: 1,
+    reviewedRepositoryDigest: createHash('sha256').update('fixture-review').digest('hex'),
+    baselineDigest: createHash('sha256').update('fixture-baseline').digest('hex'),
+    plans: [],
+  }
+}
+
+function completeFixtureJob(
+  store: JobStore,
+  job: JobRecord,
+  sessionId: string,
+  result: string,
+): void {
+  if (!job.writeEnabled) {
+    store.complete(job.id, sessionId, result)
+    return
+  }
+  store.ensureExecutionResultStaged(
+    job.id,
+    sessionId,
+    result,
+    emptyFixturePublication(store, job),
+  )
+  store.completeStagedExecution(job.id)
+}
+
+function stageFixtureExecution(
+  store: JobStore,
+  job: JobRecord,
+  sessionId: string,
+  result: string,
+): { sessionId: string; result: string; publication: GitHubPublicationSet } {
+  const publication = emptyFixturePublication(store, job)
+  store.ensureExecutionResultStaged(job.id, sessionId, result, publication)
+  return { sessionId, result, publication }
+}
 
 const temporaryDirs: string[] = []
 
@@ -683,6 +733,7 @@ describe('Codex job store', () => {
       store,
       pollMs: 1,
       stopWhenIdle: true,
+      executorStagesResult: true,
       executor: async current => {
         executions += 1
         if (executions === 1) {
@@ -695,10 +746,12 @@ describe('Codex job store', () => {
           resumed: true,
           sessionId: 'session-repository-drift-runner-session',
         })
-        return {
-          sessionId: 'session-repository-drift-runner-session',
-          result: '完了しました',
-        }
+        return stageFixtureExecution(
+          store,
+          current,
+          'session-repository-drift-runner-session',
+          '完了しました',
+        )
       },
     })
 
@@ -2370,7 +2423,7 @@ describe('Codex job store', () => {
     const store = makeStore()
     store.enqueue(input({ writeEnabled: true }))
     const writable = store.claimNext('serial-worker')!
-    store.complete(writable.id, 'codex-thread-write', 'done')
+    completeFixtureJob(store, writable, 'codex-thread-write', 'done')
     store.enqueue(input({ messageId: '2', writeEnabled: false }))
 
     expect(store.claimNext('serial-worker')?.sessionId).toBeNull()
@@ -4061,9 +4114,10 @@ describe('single FIFO worker', () => {
       maxJobsPerSession: 20,
       pollMs: 1,
       stopWhenIdle: true,
-      executor: async () => {
+      executorStagesResult: true,
+      executor: async current => {
         calls += 1
-        return { sessionId: 'thread-write-safe-retry', result: 'done' }
+        return stageFixtureExecution(store, current, 'thread-write-safe-retry', 'done')
       },
     })
     expect(calls).toBe(2)
@@ -5659,11 +5713,17 @@ describe('single FIFO worker', () => {
       store,
       maxJobsPerSession: 5,
       pollMs: 5,
+      executorStagesResult: true,
       shouldPause: () => updateTransactionPending(journal),
       signal: controller.signal,
-      executor: async () => {
+      executor: async current => {
         executions += 1
-        return { sessionId: '01941f65-7e97-7f41-8968-c2e676dd68b8', result: 'done' }
+        return stageFixtureExecution(
+          store,
+          current,
+          '01941f65-7e97-7f41-8968-c2e676dd68b8',
+          'done',
+        )
       },
     })
     await Bun.sleep(30)

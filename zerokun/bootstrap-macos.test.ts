@@ -676,6 +676,7 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('xcode-select --install')
     expect(script).toContain('Homebrew/install/HEAD/install.sh')
     expect(script).toContain('isolated_network_command "$(command -v brew)" install tmux')
+    expect(script).toContain('isolated_network_command "$(command -v brew)" install gh')
     expect(script).toContain('https://herdr.dev/install.sh')
     expect(script).toContain('HERDR_INSTALL_DIR="$HOME/.local/bin"')
     expect(script).not.toContain('"$(command -v brew)" install herdr')
@@ -701,7 +702,8 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('Zeroちゃんは認証操作を行いません')
     expect(script).toContain('install-grok-reviewer.ts')
     expect(script).not.toContain('install-fifth-advisor.ts" install')
-    expect(script).not.toContain('gh auth login')
+    expect(script).toContain('gh auth status --hostname github.com')
+    expect(script).not.toContain('\n  gh auth login')
     expect(script).toContain('zerocolored/zero-codex')
     expect(script).toContain('ensure_repo zerocolored/zero-codex "$REPO_DIR" main')
     expect(script).toContain('clone直後のGit設定またはoriginを独立検証できません')
@@ -756,6 +758,7 @@ describe('macOS bootstrap', () => {
     for (const command of ['tmux', 'bun']) {
       writeFileSync(join(fakeBin, command), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     }
+    writeFileSync(join(fakeBin, 'gh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     writeFileSync(join(fakeBin, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     writeFileSync(join(fakeBin, 'brew'), '#!/bin/sh\nexit 99\n', { mode: 0o755 })
     const installerSource = join(base, 'herdr-installer.sh')
@@ -831,6 +834,7 @@ herdr --version
         'grok_build_executable() { return 0; }',
         'grok_auth_ready() { return 0; }',
         'claude_subscription_ready() { return 0; }',
+        'gh() { [ "$1 $2 $3 $4" = "auth status --hostname github.com" ]; }',
         'verify_logins',
       ].join('; ')
       const api = Bun.spawnSync([
@@ -848,7 +852,7 @@ herdr --version
         stdout: 'pipe', stderr: 'pipe',
       })
       expect(subscription.exitCode).toBe(0)
-      expect(subscription.stdout.toString()).toContain('Codex / Grok CLI / Claude Codeは事前ログイン済みです')
+      expect(subscription.stdout.toString()).toContain('Codex / Grok CLI / Claude Code / GitHub CLIは事前ログイン済みです')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -925,6 +929,7 @@ herdr --version
       '',
     ].join('\n'), { mode: 0o755 })
     writeFileSync(join(fakeBin, 'bun'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    writeFileSync(join(fakeBin, 'gh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     writeFileSync(join(fakeBin, 'brew'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     const installerSource = join(base, 'official-installer.sh')
     writeFileSync(installerSource, `#!/bin/sh

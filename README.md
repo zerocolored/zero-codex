@@ -137,6 +137,7 @@ fresh read-only準備から再開します。phase開始のJSON write前、応�
 - macOS
 - Git、Bun、tmux、Herdr 0.8.2 以上（必要なworkspace/tab/pane/agent APIを含む）
 - Codex CLI 0.149.0 以上（`codex login status`が`Logged in using ChatGPT`と返すこと）
+- GitHub CLI (`gh`) と、対象repositoryへbranch push・PR作成できるlogin済みGitHub account
 - Slack workspaceと、既存Appのtokenを管理できる権限（新規Appを使う場合はApp作成・install権限）
 - このMacでsubscription login済みのGrok CLIとClaude Code（Zeroちゃん稼働中にAPI key認証は行いません）
 
@@ -178,6 +179,19 @@ bash zerokun/bootstrap-macos.sh --skip-slack
 bootstrapがCodex／Grok CLI／Claude Codeの未ログインを検出して停止した場合だけ、Herdr上で
 `codex login`、`grok login`、Claude Codeのsubscription loginを人が完了し、同じcommandを
 再実行します。稼働中のシステムがAPI keyを要求したり、認証画面を操作したりすることはありません。
+
+GitHubへの公開も、Zeroちゃんを起動する前に人が一度だけ認証します。既に`gh auth status`が
+成功するMacでは再認証不要です。
+
+```bash
+gh auth login --hostname github.com --git-protocol https --web
+gh auth status --hostname github.com
+```
+
+Zeroちゃんは認証画面を開かず、tokenやSSH keyをCodexへ渡しません。実装processはlocal commitまでを
+担当し、最終read-only reviewと入力seal後に、host runtimeがその完全一致SHAを非強制pushしてPRを作成します。
+pushまたはPRのreceiptをSQLiteへ保存できるまで成功通知は出さず、再起動後もCodexを再実行せず公開だけを再開します。
+実装processはcommit後かつread-only review前にcheckoutを元のcleanなbase branchへ戻し、reviewは固定feature branchのcommit差分を確認します。認証を持つhost publisherはcheckoutを変更しないため、次の依頼を前のPRへ積み重ねず、local filter等をhost権限で起動しません。
 
 既にclone済みなら、次だけで構いません。
 
@@ -358,8 +372,13 @@ zerokun-jobs status
 
 frontend／backend／appのような複数repositoryを1つの親folderに置いている場合は、その親folderで
 同じコマンドを実行します。初回設定時に検出した直下repository一覧を
-`.zerochan/workspace.json`へ固定し、各repositoryを個別にtest・commit・pushします。隠しfolder、
+`.zerochan/workspace.json`へ固定し、各repositoryを個別にtest・commitし、最終review後にhostが
+push・PR作成します。隠しfolder、
 symlink、Gitではない直下項目は作業対象に含めません。
+
+実装前のread-only準備で、Codexは変更が必要なrepositoryだけを宣言します。hostはその最小scopeを
+permission、review、publicationへ同じまま結び付けるため、対象外の兄弟repositoryのbranchやremote設定に
+影響されません。途中の同thread依頼でscopeが広がる場合も、新しいrepositoryを編集する前にbaselineへ追加します。
 
 `zerochan start` はHerdr外からの起動を拒否します。引数やexportは不要です。実行した物理directoryを
 対象projectとして、現在のHerdr workspaceへ新しい `Zeroちゃん runtime` tabを作り、gatewayとrunnerの
@@ -445,11 +464,12 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - read senderはrepository readのみ、write senderだけrepository・`.git` writeとnetworkを許可し、
   どちらも `-a never` で対話的な権限昇格を行いません。
 - host runtimeをSlack経由で書き換えられないよう、Zeroちゃん自身のrepositoryへのwrite jobは拒否します。
-  Codex shellのHOME/TMPDIRはjob scratchへ隔離されるため、commit identityはprojectのlocal
-  `.git/config`へ設定してください。HOMEのcredentialを使うpushは既定ではできません。
+  Codex shellのHOME/TMPDIRはjob scratchへ隔離し、commitには固定の中立identityを使います。
+  CodexへHOME credentialを公開せず、Codex自身によるpush・PR作成も許可しません。
 - 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
   linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。HOMEのglobal
-  Git/GitHub credentialは公開しないため、remote操作は安全なHOME外認証がない環境では利用できません。
+  Git/GitHub credentialはmodelへ公開しません。review済みSHAの公開だけはhost runtimeがlogin済み`gh`を
+  credential helperとして使い、canonical `github.com` origin、非強制の単一branch、tag・submoduleなしに固定します。
 - App Serverは認証済み`CODEX_HOME`を使うためuser configも読みます。そのため起動直前の
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、
   endpoint/provider差替え、legacy sandbox、named permissionの変更を拒否します。安全規則は

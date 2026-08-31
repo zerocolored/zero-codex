@@ -138,7 +138,7 @@ describe('Codex UI/UX approval decision contract', () => {
       `調査済みです\n[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
       nonce,
       input,
-    )).toEqual({ kind: 'ready' })
+    )).toEqual({ kind: 'ready', repositoryScope: ['.'] })
 
     const decision = parseCodexPreparationDecision([
       `[ZERO_UI_APPROVAL_REQUIRED:${nonce}:r3:${input.digest}]`,
@@ -186,7 +186,11 @@ describe('Codex UI/UX approval decision contract', () => {
       ].join('\n'), nonce, input, {
         context: approval,
         currentRepositoryDigest: decision.currentRepositoryDigest,
-      })).toEqual({ kind: 'ready', approvalDecision: decision })
+      })).toEqual({
+        kind: 'ready',
+        repositoryScope: ['.'],
+        approvalDecision: decision,
+      })
     }
 
     const template = buildUiApprovalSemanticDecisionTemplate({
@@ -231,11 +235,57 @@ describe('Codex UI/UX approval decision contract', () => {
     expect(decision.proposalRepositoryDigest).toBe(approval.repositoryScopeDigest)
     expect(parseCodexPreparationDecision([
       semanticEnvelope(decision),
+      '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
       `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
     ].join('\n'), nonce, input, {
       context: approval,
       currentRepositoryDigest: decision.currentRepositoryDigest,
-    })).toMatchObject({ kind: 'ready' })
+    }, ['backend', 'frontend'])).toMatchObject({ kind: 'ready' })
+
+    expect(parseCodexPreparationDecision([
+      semanticEnvelope(decision),
+      '<zerokun_repository_scope>{"repositories":["backend","frontend"]}</zerokun_repository_scope>',
+      `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
+    ].join('\n'), nonce, input, {
+      context: approval,
+      currentRepositoryDigest: decision.currentRepositoryDigest,
+    }, ['backend', 'frontend'])).toMatchObject({
+      kind: 'ready',
+      repositoryScope: ['backend', 'frontend'],
+    })
+
+    const expandedApproval = {
+      ...approval,
+      repositoryScope: ['backend', 'frontend'],
+    }
+    const expandedDecision = semanticDecision(expandedApproval, 'f'.repeat(64))
+    expect(() => parseCodexPreparationDecision([
+      semanticEnvelope(expandedDecision),
+      '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
+      `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
+    ].join('\n'), nonce, input, {
+      context: expandedApproval,
+      currentRepositoryDigest: expandedDecision.currentRepositoryDigest,
+    }, ['backend', 'frontend'])).toThrow('removed a repository')
+  })
+
+  test('multi-repository ready decision requires one exact minimal scope', () => {
+    const ready = `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`
+    expect(() => parseCodexPreparationDecision(
+      `準備完了\n${ready}`,
+      nonce,
+      input,
+      undefined,
+      ['backend', 'frontend'],
+    )).toThrow('repository scope envelope')
+    expect(parseCodexPreparationDecision([
+      '準備完了',
+      '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
+      ready,
+    ].join('\n'), nonce, input, undefined, ['backend', 'frontend'])).toMatchObject({
+      kind: 'ready',
+      repositoryScope: ['frontend'],
+    })
   })
 
   test('host gate accepts a compatible repository change and rejects stale or conflicting meaning', () => {

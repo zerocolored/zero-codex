@@ -565,6 +565,7 @@ else
   echo "     旧PCのgatewayを止めて移行する場合は、既存Appのトークン2つを再利用できます。"
   echo "     $CH/.env に xoxb- / xapp- を保存します (作成・移行手順はリポ直下 README.md)"
   echo "  2. codex login status が Logged in using ChatGPT と返すことを確認"
+  echo "     gh auth status --hostname github.com が成功することも確認"
   echo "  3. 対象projectへ cd して: zerochan set slack-channel <SlackチャンネルID>"
   echo "     Herdr内で起動: zerochan start"
   echo "     ログtabごと起動し直す: zerochan stop → zerochan start"

@@ -11,8 +11,14 @@ read jobのinvestigation、write jobの編集前design・編集後reviewでnativ
 ## 導入
 
 Codex CLI 0.149.0以上、Herdr 0.8.2以上（必要なworkspace/tab/pane/agent APIを含む）、
-`codex login`と`grok login`済みのsubscription認証が必要です。Codexはdaemon起動時と各job attempt直前に
+`codex login`と`grok login`済みのsubscription認証、GitHub CLIと`gh auth status --hostname github.com`が
+成功するGitHub認証が必要です。Codexはdaemon起動時と各job attempt直前に
 `Logged in using ChatGPT`を再検証します。Zeroちゃん自身はAPI keyを要求せず、認証画面も操作しません。
+
+GitHub未認証のMacでは起動前に人が`gh auth login --hostname github.com --git-protocol https --web`を
+一度実行します。稼働中のZeroちゃんはloginを行わず、CodexへGitHub credentialを渡しません。Codexは
+review対象のlocal commitまでを作り、host runtimeが入力seal後に完全一致SHAだけをpushしてPR receiptを保存します。
+実装processはcommit後かつread-only review前にcheckoutを元のcleanなbase branchへ戻します。reviewは固定feature branchのcommit差分を確認し、認証を持つhost publisherはcheckoutを変更しないため、次の依頼が前のPRへ連鎖しません。
 
 ```bash
 bootstrap_dir="$(/usr/bin/mktemp -d /tmp/zerokun-bootstrap.XXXXXX)"
@@ -252,10 +258,11 @@ global `AGENTS.md`の後に読み込みとinstruction sourceを検証します�
 再許可します。Codex CLI 0.149.0以上を必須とし、古いCLIはjob受付前に拒否します。
 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
 linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。またHOMEのglobal
-Git/GitHub credentialは公開しないため、remote操作にはHOME外の安全な認証が別途必要です。
+Git/GitHub credentialはmodelへ公開しません。review済みcommitの公開だけはhost runtimeがlogin済み`gh`を
+使い、canonical `github.com`、単一branch、非強制、tag・submoduleなしのpushとPR作成に限定します。
 Codex shell HOMEはread/writeともjob scratchへ分離します。専用Grok launcherが必要とするaccount HOMEは
-brokerの固定子processだけが使い、model shellへは渡しません。commitするprojectでは
-`user.name`/`user.email`をrepository local configへ設定してください。
+brokerの固定子processだけが使い、model shellへは渡しません。commit identityはZeroちゃんが中立の固定値を
+子processへ設定するため、repository localの`user.name`/`user.email`は必須ではありません。
 
 Codex から Slack tool/API を呼ばせません。最終文は runner が bot token で投稿します。成果物を
 返す場合は最終文末の `<zerokun_files>["/absolute/path"]</zerokun_files>` を runner が解釈します。
@@ -356,7 +363,8 @@ zerokun-update
 既存threadは最初のprojectへ固定されたままです。DMは共有gatewayを起動したprojectを使います。
 multi-repository workspaceのmemberは初回設定時に`.zerochan/workspace.json`へ固定されます。
 隠しfolder、symlink、Gitではない直下項目は作業対象外で、変更した各memberは個別に
-test・commit・pushされます。直下repositoryの追加・削除時は、意図しない対象拡大を防ぐため
+test・commitされ、最終review後にhostが個別にpush・PR作成します。read-only準備で選ばれた最小の
+repository scopeだけがwrite permissionとpublication対象になります。直下repositoryの追加・削除時は、意図しない対象拡大を防ぐため
 設定を自動更新せず起動を停止します。
 
 log:

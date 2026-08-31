@@ -63,8 +63,8 @@ bash zerokun/bootstrap-macos.sh --slack-only \
 
 - Apple Command Line Tools
 - Homebrew
-- Git / Bun / tmux / Herdr 0.8.2以上（必要なworkspace/tab/pane/agent APIを含む） / Codex CLI 0.149.0以上
-- Codex / Grok CLI / Claude Code（Zeroちゃん自身はlogin操作をしない）
+- Git / GitHub CLI / Bun / tmux / Herdr 0.8.2以上（必要なworkspace/tab/pane/agent APIを含む） / Codex CLI 0.149.0以上
+- Codex / Grok CLI / Claude Code / GitHub CLI（Zeroちゃん自身はlogin操作をしない）
 - zero-codex repository の `main` branch（既定 `~/Desktop/Project/zero-codex`）
 - Zeroちゃん本体とは分離し、最小安全指示の`AGENTS.md`を初期commitした既定
   `zerokun-workspace` repository（project側`AGENTS.md`がない既存projectも指定可能）
@@ -82,7 +82,7 @@ native Codex証跡、receipt、入力・repository不変、起動済みClaude wo
 macOS や外部サービスの確認画面だけは自動化しません。
 
 1. Command Line Tools の install dialog
-2. Codex / Grok CLI / Claude Code のlogin
+2. Codex / Grok CLI / Claude Code / GitHub CLI のlogin
 3. 同時稼働の場合のSlack App作成・Workspace install（gateway停止移行では既存Appを再利用）
 4. App-Level Token（`xapp-...`）と Bot Token（`xoxb-...`）の貼付け
 5. Slack user/channel ID の選択
@@ -121,6 +121,8 @@ grok login
 # Herdrの一時paneで `claude` を起動し、subscription loginを完了して終了
 codex login status
 # `Logged in using ChatGPT` と表示されることを確認
+gh auth login --hostname github.com --git-protocol https --web
+gh auth status --hostname github.com
 ```
 
 これは初回だけの人による認証です。稼働中のZeroちゃんは既存のsubscription loginを利用し、API keyの
@@ -156,6 +158,8 @@ bootstrap完了後、HerdrにZeroちゃん専用paneを用意して、そのpane
 ```bash
 codex login status
 # `Logged in using ChatGPT` 以外（API key認証を含む）ではZeroちゃんは起動しません
+gh auth status --hostname github.com
+# GitHub未認証では、先に上記のgh auth loginを人が実行します
 zerochan-access status
 cd /absolute/path/to/project
 zerochan set slack-channel C0123456789

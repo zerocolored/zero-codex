@@ -16,6 +16,7 @@ import type { AdvisorRepositorySnapshot } from './advisor-snapshot.ts'
 
 const UI_APPROVAL_MARKER = 'zerokun_ui_approval'
 const UI_RESPONSE_DECISION_MARKER = 'zerokun_ui_response_decision'
+const PREPARATION_SCOPE_MARKER = 'zerokun_repository_scope'
 const MAX_UI_APPROVAL_TEXT_CHARS = 4_000
 const MAX_UI_APPROVAL_PNG_BYTES = 16 * 1024 * 1024
 const SCREENSHOT_WIDTH = 1280
@@ -175,7 +176,11 @@ export type UiApprovalProposal = {
 }
 
 export type CodexPreparationDecision =
-  | { kind: 'ready'; approvalDecision?: UiApprovalSemanticDecision }
+  | {
+      kind: 'ready'
+      repositoryScope: string[]
+      approvalDecision?: UiApprovalSemanticDecision
+    }
   | {
       kind: 'approval-required'
       proposal: UiApprovalProposal
@@ -326,6 +331,48 @@ function uiApprovalBoundRepositoryDigest(context: UiApprovalResumeContext): stri
   return hasScopeDigest ? context.repositoryScopeDigest! : context.repositoryDigest
 }
 
+function exactReadyRepositoryScope(
+  value: string,
+  availableRepositories: readonly string[],
+): { text: string; repositoryScope: string[] } {
+  const pattern = new RegExp(
+    `<${PREPARATION_SCOPE_MARKER}>([^\n]+)<\/${PREPARATION_SCOPE_MARKER}>\n?$`,
+  )
+  const match = pattern.exec(value)
+  if (!match) {
+    // A one-repository project has no ambiguous publication target. Retain
+    // compatibility with already-running sessions while requiring an exact
+    // declaration for every multi-repository workspace.
+    if (availableRepositories.length === 1) {
+      return { text: value.trim(), repositoryScope: [availableRepositories[0]!] }
+    }
+    throw new Error('Codex preparation omitted its exact repository scope envelope')
+  }
+  if (new RegExp(`<${PREPARATION_SCOPE_MARKER}>`, 'g').test(value.slice(0, match.index))) {
+    throw new Error('Codex preparation duplicated its repository scope envelope')
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(match[1]!) } catch {
+    throw new Error('Codex preparation repository scope is invalid JSON')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Codex preparation repository scope must be an object')
+  }
+  const record = parsed as Record<string, unknown>
+  if (Object.keys(record).join(',') !== 'repositories'
+    || !Array.isArray(record.repositories) || record.repositories.length === 0
+    || record.repositories.some(repository => typeof repository !== 'string')) {
+    throw new Error('Codex preparation repository scope is invalid')
+  }
+  const repositoryScope = record.repositories as string[]
+  if (JSON.stringify(repositoryScope) !== JSON.stringify([...repositoryScope].sort())
+    || new Set(repositoryScope).size !== repositoryScope.length
+    || repositoryScope.some(repository => !availableRepositories.includes(repository))) {
+    throw new Error('Codex preparation repository scope is invalid')
+  }
+  return { text: value.slice(0, match.index).trim(), repositoryScope }
+}
+
 export function parseCodexPreparationDecision(
   value: string,
   attemptNonce: string,
@@ -405,7 +452,19 @@ export function parseCodexPreparationDecision(
       || approvalDecision.repositoryState === 'conflict')) {
       throw new Error('Codex UI/UX semantic decision does not authorize implementation')
     }
-    return { kind: 'ready', ...(approvalDecision ? { approvalDecision } : {}) }
+    const beforeReady = normalized.slice(0, normalized.length - ready.length).trimEnd()
+    const scoped = exactReadyRepositoryScope(beforeReady, availableRepositories)
+    if (approval?.context.repositoryScope) {
+      const readyScope = new Set(scoped.repositoryScope)
+      if (approval.context.repositoryScope.some(repository => !readyScope.has(repository))) {
+        throw new Error('Codex preparation removed a repository from the approved scope')
+      }
+    }
+    return {
+      kind: 'ready',
+      repositoryScope: scoped.repositoryScope,
+      ...(approvalDecision ? { approvalDecision } : {}),
+    }
   }
   const proposal = exactProposalEnvelope(
     normalized,
