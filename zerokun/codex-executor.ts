@@ -4466,6 +4466,8 @@ export async function executeCodexJob(
     /** Fixture-only retry delays for correlated probe/staging failures. */
     progressProbeRetryMsForTesting?: number
     progressPublishRetryMsForTesting?: number
+    /** Fixture-only delay for an internally resumed transient model failure. */
+    transientRetryDelayMsForTesting?: number
     onSuccessfulResult?(execution: JobExecutionResult): JobExecutionResult
     supervisorCleanupGraceMs?: number
     /** Grace after an acknowledged user cancel; this is not a whole-job timeout. */
@@ -6940,6 +6942,46 @@ export async function executeCodexJob(
     const parentTurnIds: string[] = []
     let nextStage: 'prepare' | 'implementation' | 'review' = 'prepare'
 
+    const waitForTransientModelRecovery = async (input: {
+      reason: 'rate-limit' | 'capacity'
+      resetsAtMs: number
+      stage: 'prepare' | 'implementation' | 'review' | 'interjection'
+      phaseSequence: number
+      partialImplementation: boolean
+    }): Promise<void> => {
+      const resumeAt = options.transientRetryDelayMsForTesting === undefined
+        ? codexRateLimitResumeAt(input.resetsAtMs)
+        : Date.now() + positiveInteger(options.transientRetryDelayMsForTesting, 1)
+      const message = input.reason === 'capacity'
+        ? input.partialImplementation
+          ? '⏸ 利用中のモデルが混雑しました。現在の変更を保持し、再開後は確認工程から続けます。'
+          : '⏸ 利用中のモデルが混雑しています。作業内容を保持したまま自動再開します。'
+        : input.partialImplementation
+          ? '⏸ 一時的な利用制限です。現在の変更を保持し、再開後は確認工程から続けます。'
+          : '⏸ 一時的な利用制限です。作業内容を保持したまま自動再開します。'
+      try {
+        options.onMonitorMessage?.(message)
+      } catch {
+        // Operator-only monitor output is not part of task correctness.
+      }
+      try {
+        options.onCommentaryMessage?.({
+          sourceKey: `host-transient:${input.stage}:${input.phaseSequence}`,
+          text: message,
+        })
+      } catch {
+        // This status is advisory. Losing it must not turn a recoverable model
+        // congestion event into a terminal job failure.
+      }
+      while (Date.now() < resumeAt) {
+        if (controls.cancellationRequested()) throw new CodexUserCancelledError()
+        if (options.signal?.aborted) {
+          throw new CodexInterruptedError('Codex job was interrupted while waiting to resume')
+        }
+        await Bun.sleep(Math.min(1_000, Math.max(1, resumeAt - Date.now())))
+      }
+    }
+
     const recordPhaseIdentity = (execution: Awaited<ReturnType<typeof runAttempt>>): string => {
       const resolved = execution.observedSessionId
       if (!resolved) throw new Error('Codex App Server omitted the durable thread id')
@@ -7031,6 +7073,7 @@ export async function executeCodexJob(
         )
         const rateLimit = extractCodexRateLimit(execution.stdout)
         if (rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
+          recordPhaseIdentity(execution)
           throw new CodexRateLimitError(
             failure,
             rateLimit.resetsAtMs,
@@ -7064,6 +7107,29 @@ export async function executeCodexJob(
       }
     }
 
+    const answerInterjectionWithRetry = async (
+      interjection: JobInterjectionRecord,
+      round: 1 | 2 | 3,
+      boundInput?: AdvisorInputSnapshot,
+    ): Promise<JobInterjectionDisposition | 'input-changed'> => {
+      while (true) {
+        try {
+          return await answerInterjection(interjection, round, boundInput)
+        } catch (error) {
+          if (!(error instanceof CodexRateLimitError)) throw error
+          const failedPhaseSequence = phaseSequence
+          phaseSequence += 1
+          await waitForTransientModelRecovery({
+            reason: error.reason,
+            resetsAtMs: error.resetsAtMs,
+            stage: 'interjection',
+            phaseSequence: failedPhaseSequence,
+            partialImplementation: false,
+          })
+        }
+      }
+    }
+
     const runPhase = async (
       stage: 'prepare' | 'implementation' | 'review',
       round: 1 | 2 | 3,
@@ -7072,11 +7138,15 @@ export async function executeCodexJob(
     ): Promise<{
       kind: 'success'
       execution: Awaited<ReturnType<typeof runAttempt>>
-    } | { kind: 'input-changed' }> => {
+    } | { kind: 'input-changed' } | { kind: 'partial-implementation' }> => {
       while (true) {
         const pendingInterjection = sessionId ? controls.nextInterjection() : null
         if (pendingInterjection) {
-          const response = await answerInterjection(pendingInterjection, round, boundInput)
+          const response = await answerInterjectionWithRetry(
+            pendingInterjection,
+            round,
+            boundInput,
+          )
           if (response !== 'answer-only') return { kind: 'input-changed' }
           continue
         }
@@ -7121,7 +7191,7 @@ export async function executeCodexJob(
             await execution.retireCompletedRegistration()
           }
           phaseSequence += 1
-          const response = await answerInterjection(
+          const response = await answerInterjectionWithRetry(
             terminalInterjection,
             round,
             boundInput,
@@ -7144,8 +7214,8 @@ export async function executeCodexJob(
           continue
         }
         if (disposition === 'success') return { kind: 'success', execution }
-        await execution.retireCompletedRegistration()
         if (disposition === 'interrupted') {
+          await execution.retireCompletedRegistration()
           throw new CodexInterruptedError('Codex job was interrupted')
         }
         const rateLimit = extractCodexRateLimit(execution.stdout)
@@ -7160,16 +7230,26 @@ export async function executeCodexJob(
           ),
         )
         if (rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
-          throw new CodexRateLimitError(
-            failure,
-            rateLimit.resetsAtMs,
-            execution.observedSessionId ?? undefined,
-            rateLimit.reason ?? 'rate-limit',
-            execution.transientFailureSafeToRetry,
+          try {
+            recordPhaseIdentity(execution)
+          } finally {
+            await execution.retireCompletedRegistration()
+          }
+          const failedPhaseSequence = phaseSequence
+          phaseSequence += 1
+          const partialImplementation = stage === 'implementation'
+            && !execution.transientFailureSafeToRetry
+          await waitForTransientModelRecovery({
+            reason: rateLimit.reason ?? 'rate-limit',
+            resetsAtMs: rateLimit.resetsAtMs,
             stage,
-            phaseSequence,
-          )
+            phaseSequence: failedPhaseSequence,
+            partialImplementation,
+          })
+          if (partialImplementation) return { kind: 'partial-implementation' }
+          continue
         }
+        await execution.retireCompletedRegistration()
         const safeInitialPrepareFallback = stage === 'prepare'
           && phaseSequence === 0
           && resumed
@@ -7215,6 +7295,9 @@ export async function executeCodexJob(
       if (nextStage === 'prepare') {
         const outcome = await runPhase('prepare', 1)
         if (outcome.kind === 'input-changed') continue
+        if (outcome.kind === 'partial-implementation') {
+          throw new Error('read-only preparation returned an implementation-only recovery state')
+        }
         const execution = outcome.execution
         recordPhaseIdentity(execution)
         let finalInput = readAdvisorInputSnapshot(managedStateDir, job.id)
@@ -7367,6 +7450,11 @@ export async function executeCodexJob(
           nextStage = 'prepare'
           continue
         }
+        if (outcome.kind === 'partial-implementation') {
+          implementedInputDigest = activeWriteInputDigest(preparedInput)
+          nextStage = 'review'
+          continue
+        }
         const execution = outcome.execution
         recordPhaseIdentity(execution)
         let implementationError: unknown
@@ -7414,6 +7502,9 @@ export async function executeCodexJob(
         preparedRepositoryDigest = null
         nextStage = 'prepare'
         continue
+      }
+      if (outcome.kind === 'partial-implementation') {
+        throw new Error('read-only review returned an implementation-only recovery state')
       }
       const execution = outcome.execution
       recordPhaseIdentity(execution)

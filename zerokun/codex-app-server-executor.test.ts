@@ -239,7 +239,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -272,7 +272,7 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "準備完了\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
@@ -287,7 +287,23 @@ for line in sys.stdin:
             control_log = os.environ.get("ZERO_CONTROL_LOG")
             hold_for_steer = mode == "phased-steer" and stage == "implementation" and control_log and not os.path.exists(control_log)
             hold_for_interjection = mode == "phased-interjection-update" and stage == "implementation" and (not fixture_state or not os.path.exists(fixture_state))
-            if not hold_for_steer and not hold_for_interjection:
+            capacity_state = os.environ.get("ZERO_CAPACITY_FIXTURE_STATE")
+            fail_capacity = capacity_state and not os.path.exists(capacity_state) and (
+                (mode == "phased-capacity-review-once" and stage == "review") or
+                (mode == "phased-capacity-implementation-once" and stage == "implementation")
+            )
+            if fail_capacity:
+                with open(capacity_state, "w", encoding="utf-8") as stream:
+                    stream.write(stage)
+                failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None, "additionalDetails": None}
+                items = []
+                if stage == "implementation":
+                    command = {"type": "commandExecution", "id": "capacity-partial-command", "command": "echo changed", "status": "completed", "exitCode": 0}
+                    emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": command}})
+                    items = [command]
+                emit({"method": "error", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
+                emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": items, "error": failure}}})
+            elif not hold_for_steer and not hold_for_interjection:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": message}], "error": None}}})
         elif mode in ("normal", "commentary", "interjection-late-answer", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
             if mode == "slow":
@@ -541,7 +557,8 @@ function fixture(
     | 'failed-steer' | 'failed-turn'
     | 'error-steer' | 'rate-error' | 'rate-retrying' | 'capacity-error'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
-    | 'capacity-started-command' | 'phased'
+    | 'capacity-started-command' | 'phased' | 'phased-capacity-review-once'
+    | 'phased-capacity-implementation-once'
     | 'phased-native-history-fresh' | 'phased-native-history-resume'
     | 'phased-native-history-resume-unmaterialized' | 'phased-steer'
     | 'phased-interjection-update' | 'missing-session-resume'
@@ -1176,6 +1193,75 @@ describe('production App Server executor', () => {
     expect(new Set(phaseRows.map(row => row[6])).size).toBe(1)
     expect(heldPhaseCounts).toEqual([1, 2, 3])
     expect(value.store.get(value.job.id)?.acceptsControl).toBe(false)
+    value.store.close()
+  }, 30_000)
+
+  test('実装後reviewのmodel capacityは実装を繰り返さず同じ工程から自動再開する', async () => {
+    const value = fixture('phased-capacity-review-once', true)
+    const phaseLog = join(value.root, 'capacity-review-phases.log')
+    const capacityState = join(value.root, 'capacity-review-once.state')
+    const commentary: string[] = []
+
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-capacity-review-once',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_CAPACITY_FIXTURE_STATE: capacityState,
+      },
+      phaseGateForTesting: {},
+      transientRetryDelayMsForTesting: 1,
+      onMonitorMessage: () => { throw new Error('monitor output unavailable') },
+      onCommentaryMessage: event => { commentary.push(event.text) },
+      liveControls: value.hooks,
+    })
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])
+    expect(stages).toEqual(['prepare', 'implementation', 'review', 'review'])
+    expect(stages.filter(stage => stage === 'implementation')).toHaveLength(1)
+    expect(commentary).toContain(
+      '⏸ 利用中のモデルが混雑しています。作業内容を保持したまま自動再開します。',
+    )
+    expect(readFileSync(capacityState, 'utf8')).toBe('review')
+    value.store.close()
+  }, 30_000)
+
+  test('implementation中のmodel capacityは既存変更を保持してreviewへ進みwriteを再送しない', async () => {
+    const value = fixture('phased-capacity-implementation-once', true)
+    const phaseLog = join(value.root, 'capacity-implementation-phases.log')
+    const capacityState = join(value.root, 'capacity-implementation-once.state')
+    const commentary: string[] = []
+
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-capacity-implementation-once',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_CAPACITY_FIXTURE_STATE: capacityState,
+      },
+      phaseGateForTesting: {},
+      transientRetryDelayMsForTesting: 1,
+      onCommentaryMessage: event => { commentary.push(event.text) },
+      liveControls: value.hooks,
+    })
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])
+    expect(stages).toEqual(['prepare', 'implementation', 'review'])
+    expect(stages.filter(stage => stage === 'implementation')).toHaveLength(1)
+    expect(commentary).toContain(
+      '⏸ 利用中のモデルが混雑しました。現在の変更を保持し、再開後は確認工程から続けます。',
+    )
+    expect(readFileSync(capacityState, 'utf8')).toBe('implementation')
     value.store.close()
   }, 30_000)
 
