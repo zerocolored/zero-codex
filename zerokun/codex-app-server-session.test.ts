@@ -1164,6 +1164,39 @@ describe('Codex App Server session', () => {
     expect(terminal?.permissionEvidence.firstCommand?.command).toBe('/tmp/probe')
   })
 
+  test('item/startedだけ観測したcommandも副作用候補として保持する', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    transport.emit({
+      method: 'turn/started',
+      params: { threadId: 'thread-started-command', turn: {
+        id: 'turn-started-command', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } },
+    })
+    transport.emit({
+      method: 'item/started',
+      params: { threadId: 'thread-started-command', turnId: 'turn-started-command', item: {
+        type: 'commandExecution', id: 'command-started-only', command: '/tmp/write',
+        cwd: '/tmp', source: 'agent', status: 'inProgress', exitCode: null,
+      } },
+    })
+    transport.emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-started-command', turn: {
+        id: 'turn-started-command', status: 'failed', itemsView: 'full', items: [],
+        error: { message: 'Selected model is at capacity' },
+      } },
+    })
+    session.closeInput()
+    await session.waitForReader()
+    const terminal = session.takeTurnTerminal(
+      'thread-started-command',
+      'turn-started-command',
+    )
+    expect(terminal?.permissionEvidence.commandCount).toBe(1)
+    expect(terminal?.permissionEvidence.firstCommand?.itemId).toBe('command-started-only')
+  })
+
   test('4096件を超える公式item paginationを上限エラーなしで投影する', async () => {
     let itemPages = 0
     const transport = mockTransport((request, emit) => {

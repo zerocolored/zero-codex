@@ -91,8 +91,6 @@ export function mergeAppServerPermissionProbeEvidence(
       && leftCommand.command === rightCommand.command
       && leftCommand.cwd === rightCommand.cwd
       && leftCommand.source === rightCommand.source
-      && leftCommand.status === rightCommand.status
-      && leftCommand.exitCode === rightCommand.exitCode
     commandCount = sameCommand ? 1 : 2
   }
   return {
@@ -409,6 +407,7 @@ function projectClientTurnHistory(
 type ObservedTurnProjection = {
   lastAgentMessage: Record<string, unknown> | null
   permissionEvidence: AppServerPermissionProbeEvidence
+  permissionItemIds: Set<string>
   pendingSubAgentActivityIds: Set<string>
 }
 
@@ -424,6 +423,7 @@ function emptyPermissionProbeEvidence(): AppServerPermissionProbeEvidence {
 function observePermissionProbeItem(
   evidence: AppServerPermissionProbeEvidence,
   item: Record<string, unknown>,
+  observedItemIds?: Set<string>,
 ): void {
   const allowedItemTypes = new Set([
     'userMessage', 'agentMessage', 'plan', 'reasoning', 'commandExecution',
@@ -438,6 +438,10 @@ function observePermissionProbeItem(
     return
   }
   if (itemType !== 'commandExecution') return
+  if (typeof item.id === 'string' && observedItemIds) {
+    if (observedItemIds.has(item.id)) return
+    observedItemIds.add(item.id)
+  }
   evidence.commandCount = evidence.commandCount === 0 ? 1 : 2
   if (evidence.firstCommand !== null) return
   const boundedString = (value: unknown): string | null => (
@@ -459,7 +463,8 @@ function permissionProbeEvidenceFromItems(
   items: readonly Record<string, unknown>[],
 ): AppServerPermissionProbeEvidence {
   const evidence = emptyPermissionProbeEvidence()
-  for (const item of items) observePermissionProbeItem(evidence, item)
+  const observedItemIds = new Set<string>()
+  for (const item of items) observePermissionProbeItem(evidence, item, observedItemIds)
   return evidence
 }
 
@@ -575,6 +580,7 @@ export class CodexAppServerSession {
     this.turnProjections.set(key, {
       lastAgentMessage: null,
       permissionEvidence: emptyPermissionProbeEvidence(),
+      permissionItemIds: new Set(),
       pendingSubAgentActivityIds: new Set(),
     })
   }
@@ -605,6 +611,11 @@ export class CodexAppServerSession {
       throw new AppServerProtocolError('App Server started an item before turn/started')
     }
     const item = record(params.item, 'item/started item')
+    observePermissionProbeItem(
+      projection.permissionEvidence,
+      item,
+      projection.permissionItemIds,
+    )
     if (item.type !== 'subAgentActivity') return
     const itemId = identifier(item.id, 'item/started subAgentActivity id')
     if (projection.pendingSubAgentActivityIds.has(itemId)) {
@@ -646,7 +657,11 @@ export class CodexAppServerSession {
         this.pendingSubAgentActivityCount -= 1
       }
     }
-    observePermissionProbeItem(projection.permissionEvidence, item)
+    observePermissionProbeItem(
+      projection.permissionEvidence,
+      item,
+      projection.permissionItemIds,
+    )
     if (item.type === 'agentMessage' || item.type === 'agent_message') {
       if (isFinalAppServerAgentMessage(item)) projection.lastAgentMessage = item
       return
@@ -669,6 +684,7 @@ export class CodexAppServerSession {
     const projection = this.turnProjections.get(key) ?? {
       lastAgentMessage: null,
       permissionEvidence: emptyPermissionProbeEvidence(),
+      permissionItemIds: new Set<string>(),
       pendingSubAgentActivityIds: new Set<string>(),
     }
     this.turnProjections.delete(key)

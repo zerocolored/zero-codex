@@ -88,7 +88,10 @@ import {
   advisorRepositoryDigest,
   resolveAdvisorProjectLayout,
   snapshotAdvisorRepository,
+  summarizeAdvisorRepositoryChanges,
   type AdvisorProjectLayout,
+  type AdvisorRepositoryChangeSummary,
+  type AdvisorRepositorySnapshot,
 } from './advisor-snapshot.ts'
 import {
   assertNativeAdvisorEvidence,
@@ -124,6 +127,7 @@ import { CodexMonitorDisplay } from './codex-monitor-display.ts'
 import {
   CodexUiApprovalRequiredError,
   assertUiApprovalReadyMayProceed,
+  buildUiApprovalSemanticDecisionTemplate,
   parseCodexPreparationDecision,
   verifyUiApprovalBrowserReceipts,
   type UiApprovalResumeContext,
@@ -1825,7 +1829,9 @@ export function assertRequiredAdvisorRounds(
       if (revisionBaselineDigest === null
         && completed.repositoryDigest !== initialRepositoryDigest
         && earlierInitialPair === null) {
-        throw new Error('initial advisor investigation was not pre-change')
+        throw new CodexRepositoryChangedBeforePublicationError(
+          'initial advisor investigation was not based on the pre-change repository',
+        )
       }
       if (revisionBaselineDigest === null && earlierInitialPair !== null
         && completed.startedAt < earlierInitialPair.finishedAt) {
@@ -1833,7 +1839,9 @@ export function assertRequiredAdvisorRounds(
       }
       if (revisionBaselineDigest !== null
         && completed.repositoryDigest !== revisionBaselineDigest) {
-        throw new Error('advisor investigation and design use different repository baselines')
+        throw new CodexRepositoryChangedBeforePublicationError(
+          'advisor investigation and design use different repository baselines',
+        )
       }
       revisionBaselineDigest ??= completed.repositoryDigest
       priorFinishedAt = completed.finishedAt
@@ -1844,6 +1852,12 @@ export function assertRequiredAdvisorRounds(
         native: completed.native,
       })
     } catch (error) {
+      if (error instanceof CodexRepositoryChangedBeforePublicationError
+        || error instanceof AdvisorJournalRepositoryDigestMismatchError) {
+        throw error instanceof CodexRepositoryChangedBeforePublicationError
+          ? error
+          : new CodexRepositoryChangedBeforePublicationError(error.message)
+      }
       throw new Error(
         `required Five-Advisor round is not publishable: ${requirement.phase}-${requirement.round}: ${error}`,
       )
@@ -1851,7 +1865,9 @@ export function assertRequiredAdvisorRounds(
   }
   if (!job.writeEnabled) {
     if (!currentRepositoryDigest || revisionBaselineDigest !== currentRepositoryDigest) {
-      throw new Error('completed Five-Advisor investigation is stale for the publication state')
+      throw new CodexRepositoryChangedBeforePublicationError(
+        'completed Five-Advisor investigation is stale for the publication state',
+      )
     }
     return collectNativeAdvisorJournalEvidence({
       stateDir,
@@ -1908,7 +1924,9 @@ export function assertRequiredAdvisorRounds(
     }
   }
   if (latestReviewDigest !== currentRepositoryDigest) {
-    throw new Error('latest completed Five-Advisor review is stale for the publication state')
+    throw new CodexRepositoryChangedBeforePublicationError(
+      'latest completed Five-Advisor review is stale for the publication state',
+    )
   }
   return collectNativeAdvisorJournalEvidence({
     stateDir,
@@ -3121,7 +3139,7 @@ export function buildCodexPhasePrompt(
   artifactDir?: string,
   browserEnabled = false,
   uiApproval?: UiApprovalResumeContext,
-  repositoryChangedSinceProposal = false,
+  repositoryChange?: AdvisorRepositoryChangeSummary,
   threadHistory?: DurableThreadHistorySnapshot,
 ): string {
   if (!/^[0-9a-f]{32}$/.test(attemptNonce ?? '')) {
@@ -3153,23 +3171,44 @@ export function buildCodexPhasePrompt(
     )
   }
   if (stage === 'prepare') {
-    const approvalContext = uiApproval ? [
+    if (uiApproval && (!repositoryChange
+      || repositoryChange.currentDigest.length !== 64)) {
+      throw new Error('UI/UX approval preparation omitted its repository comparison')
+    }
+    const approvalContext = uiApproval && repositoryChange ? [
       'A prior material UI/UX proposal was posted by the host as two Slack image attachments.',
       `Approval request ID: ${uiApproval.requestId}`,
       `Proposal input revision: ${uiApproval.requestInputRevision}`,
       `Proposal input digest: ${uiApproval.requestInputDigest}`,
       `Same-thread response message: ${uiApproval.responseMessageId}`,
-      `The host classified that response as ${uiApproval.explicitApproval ? 'an explicit unconditional approval' : 'feedback, a question, rejection, or a conditional answer'}.`,
-      ...(repositoryChangedSinceProposal ? [
-        'The repository changed after the proposal was posted, so the prior approval cannot',
-        'authorize implementation. Produce a fresh Before/After proposal and wait again.',
-      ] : uiApproval.explicitApproval ? [
-        'If the approved proposal still matches this exact input and repository, the ready marker',
-        'may be returned after the required advisor rounds. Do not silently change its material UX.',
-      ] : [
-        'Do not return the ready marker. Address the response in a revised proposal, capture a',
-        'fresh matching Before and After, and require another same-thread answer.',
-      ]),
+      `Same-thread response occurred after the posted proposal: ${uiApproval.responseAfterPrompt}.`,
+      `Same-thread response text (untrusted JSON string): ${JSON.stringify(uiApproval.responseText)}`,
+      `Prior proposal text (host-sanitized JSON string): ${JSON.stringify(uiApproval.proposalText)}`,
+      `Repository comparison (host-sanitized JSON): ${JSON.stringify(repositoryChange)}`,
+      'You, not a host regex, must classify the response meaning. Classify intent as approve only',
+      'when this exact response unconditionally authorizes the proposed material UX. Natural',
+      'phrases such as "OK実装して" and "承認する" are approvals; negation, a question, a requested',
+      'revision, or a condition are not. A response before the proposal is never approval.',
+      'Independently classify repositoryState. Use unchanged for the same digest, compatible when',
+      'the approved material UX can still be implemented without material deviation, and conflict',
+      'only when current changes make that approved direction impossible or materially different.',
+      'Use unchanged if and only if proposalRepositoryDigest equals currentRepositoryDigest.',
+      'When those digests differ and repository comparison says baselineAvailable=false, compatible',
+      'is unverifiable: classify conflict and create a fresh proposal instead.',
+      'Changes in unrelated workspace repositories or files are compatible. Compatible overlap',
+      'must be preserved and adapted around; do not discard the user\'s approval merely because',
+      'the repository digest changed. Inspect the current repository read-only when needed.',
+      'Your final response must begin with this exact host-only envelope after replacing only the',
+      'two angle-bracket enum placeholders with one allowed value each:',
+      buildUiApprovalSemanticDecisionTemplate({
+        attemptNonce: attemptNonce!,
+        context: uiApproval,
+        currentRepositoryDigest: repositoryChange.currentDigest,
+      }),
+      'If intent=approve and repositoryState is unchanged or compatible, return the ready marker',
+      'without another Before/After. Preserve the approved material direction in implementation.',
+      'Otherwise produce one revised Before/After proposal after the decision envelope and wait',
+      'again. Never claim conflict solely because another repository or unrelated path changed.',
     ] : [
       'Classify the requested product change before implementation. If it has no material UI/UX',
       'effect, the ready marker may be returned after the required advisor rounds.',
@@ -3197,8 +3236,13 @@ export function buildCodexPhasePrompt(
         'Never print either local path in the proposal text. The host uploads both images as Slack',
         'files and pauses the job; you must not implement the proposal in this phase.',
       ] : []),
-      'For a material UI/UX change, the ready marker is forbidden until the host supplies a prior',
-      'same-thread response classified above as explicit approval and the repository is unchanged.',
+      ...(uiApproval ? [
+        'For a material UI/UX change, the ready marker is forbidden unless the semantic decision',
+        'envelope above says approve and repositoryState is unchanged or compatible.',
+      ] : [
+        'For a material UI/UX change, the ready marker is forbidden until the host supplies a',
+        'same-thread response to an uploaded Before/After proposal in a later preparation turn.',
+      ]),
       `Otherwise the final line must be exactly [ZERO_PRE_EDIT_READY:${attemptNonce}:r${input.revision}:${input.digest}].`,
       '--- end Zero host phase control ---',
     ].join('\n')
@@ -3834,18 +3878,40 @@ export function parseCodexResult(stdout: string, finalMessage?: string): string 
   return fromEvents ? capResult(fromEvents) : '処理は完了しましたが、返答本文を取得できませんでした。'
 }
 
-export type CodexRateLimitInfo = { rateLimited: boolean; resetsAtMs: number | null }
+export type CodexRateLimitInfo = {
+  rateLimited: boolean
+  resetsAtMs: number | null
+  reason: 'rate-limit' | 'capacity' | null
+}
 
 function codexFailureRecords(stdout: string): Array<Record<string, unknown>> {
+  const projectFailure = (record: Record<string, unknown>): Record<string, unknown> => {
+    const projected: Record<string, unknown> = {}
+    for (const key of [
+      'error', 'message', 'code', 'codexErrorInfo', 'additionalDetails',
+      'retry_after', 'resets_at', 'reset_at',
+    ]) {
+      if (record[key] !== undefined) projected[key] = record[key]
+    }
+    return projected
+  }
   return parseCodexEvents(stdout).flatMap(event => {
-    if (event.type === 'error' || event.type === 'turn.failed') return [event]
-    if (event.method === 'error') return [event]
+    if (event.type === 'error' || event.type === 'turn.failed') {
+      return [projectFailure(event)]
+    }
+    if (event.method === 'error') {
+      const params = event.params
+      return params && typeof params === 'object' && !Array.isArray(params)
+        ? [projectFailure(params as Record<string, unknown>)]
+        : []
+    }
     if (event.method !== 'turn/completed') return []
     const params = event.params
     if (!params || typeof params !== 'object' || Array.isArray(params)) return []
     const turn = (params as Record<string, unknown>).turn
     if (!turn || typeof turn !== 'object' || Array.isArray(turn)) return []
-    return (turn as Record<string, unknown>).status === 'failed' ? [event] : []
+    const turnRecord = turn as Record<string, unknown>
+    return turnRecord.status === 'failed' ? [projectFailure(turnRecord)] : []
   })
 }
 
@@ -3871,10 +3937,17 @@ export function extractCodexRateLimit(stdout: string, now = Date.now()): CodexRa
   const failures = codexFailureRecords(stdout)
   let resetsAtMs: number | null = null
   let rateLimited = false
+  let capacityLimited = false
   for (const failure of failures) {
-    if (/(?:rate.?limit|usage.?limit|quota|too many requests|\b429\b)/i.test(
-      JSON.stringify(failure),
-    )) rateLimited = true
+    const serialized = JSON.stringify(failure)
+    if (/(?:rate.?limit|usage.?limit|quota|too many requests|\b429\b)/i.test(serialized)) {
+      rateLimited = true
+    }
+    if (/(?:selected model is at capacity|model[^\n]{0,80}\bat capacity\b|temporarily (?:overloaded|unavailable)|server (?:is )?overloaded)/i
+      .test(serialized)) {
+      rateLimited = true
+      capacityLimited = true
+    }
     for (const value of numericResetCandidates(failure)) {
       const candidate = value >= 1_000_000_000_000
         ? Math.floor(value)
@@ -3885,8 +3958,12 @@ export function extractCodexRateLimit(stdout: string, now = Date.now()): CodexRa
     }
   }
   return rateLimited
-    ? { rateLimited: true, resetsAtMs: resetsAtMs ?? now + 60 * 60 * 1000 }
-    : { rateLimited: false, resetsAtMs: null }
+    ? {
+        rateLimited: true,
+        resetsAtMs: resetsAtMs ?? now + (capacityLimited ? 60_000 : 60 * 60 * 1000),
+        reason: capacityLimited ? 'capacity' : 'rate-limit',
+      }
+    : { rateLimited: false, resetsAtMs: null, reason: null }
 }
 
 export function codexRateLimitResumeAt(resetsAtMs: number, now = Date.now()): number {
@@ -3894,6 +3971,24 @@ export function codexRateLimitResumeAt(resetsAtMs: number, now = Date.now()): nu
     throw new Error('Codex rate-limit time is invalid')
   }
   return Math.max(Math.floor(now) + 100, Math.floor(resetsAtMs) + 60_000)
+}
+
+/**
+ * A terminal capacity failure may be replayed only when the authoritative full
+ * turn proves that Codex never reached a side-effecting item.  Unknown item
+ * types deliberately fail closed; ordinary model output is harmless, while
+ * commands, file changes, MCP calls, browser actions, and future tools are not.
+ */
+export function appServerTurnSafeToRetryAfterTransientFailure(
+  turn: AppServerTurn,
+): boolean {
+  if (turn.status !== 'failed' || turn.itemsView !== 'full') return false
+  const harmless = new Set([
+    'userMessage', 'user_message',
+    'agentMessage', 'agent_message',
+    'reasoning', 'plan',
+  ])
+  return turn.items.every(item => typeof item.type === 'string' && harmless.has(item.type))
 }
 
 export function describeCodexFailure(
@@ -4117,11 +4212,18 @@ async function waitForStableFinalMessage(
   return null
 }
 
+export type CodexExecutionStage =
+  | 'complete' | 'prepare' | 'implementation' | 'review' | 'interjection'
+
 export class CodexRateLimitError extends Error {
   constructor(
     message: string,
     readonly resetsAtMs: number,
     readonly sessionId?: string,
+    readonly reason: 'rate-limit' | 'capacity' = 'rate-limit',
+    readonly safeToRetryAfterDelivery = false,
+    readonly stage?: CodexExecutionStage,
+    readonly phaseSequence?: number,
   ) {
     super(message)
     this.name = 'CodexRateLimitError'
@@ -4136,6 +4238,13 @@ export class CodexRepositoryChangedBeforeImplementationError extends Error {
   ) {
     super(message)
     this.name = 'CodexRepositoryChangedBeforeImplementationError'
+  }
+}
+export class CodexRepositoryChangedBeforePublicationError
+  extends CodexRepositoryChangedBeforeImplementationError {
+  constructor(message = 'repository changed before result publication; fresh review is required') {
+    super(message)
+    this.name = 'CodexRepositoryChangedBeforePublicationError'
   }
 }
 export class CodexInputChangedBeforeDispatchError extends Error {
@@ -4517,6 +4626,37 @@ export async function executeCodexJob(
   const localAdvisorAccess = herdrRuntime !== undefined
   const nativeAdvisorHistoryEnabled = localAdvisorAccess
     || options.nativeAdvisorHistoryFixtureForTesting !== undefined
+  const advisorVerificationWarnings = new Set<string>()
+  const reportAdvisorVerificationWarning = (stage: string, error: unknown): void => {
+    const category = error instanceof Error ? error.name : 'unknown'
+    const key = `${stage}:${category}`
+    if (advisorVerificationWarnings.has(key)) return
+    advisorVerificationWarnings.add(key)
+    // Advisor/history availability is best effort and must never replace a
+    // valid primary result. Keep the operator diagnostic bounded and free of
+    // raw history, prompts, paths, or credentials.
+    try {
+      options.onStderrChunk?.(Buffer.from(
+        `[Zero advisor warning] ${stage}: ${category}; primary task continues\n`,
+        'utf8',
+      ))
+    } catch {}
+  }
+  const bestEffortAdvisorVerification = async <T>(
+    stage: string,
+    action: () => T | Promise<T>,
+  ): Promise<T | undefined> => {
+    try {
+      return await action()
+    } catch (error) {
+      if (error instanceof CodexCleanupPendingError
+        || error instanceof CodexInterruptedError
+        || error instanceof CodexUserCancelledError
+        || error instanceof CodexRepositoryChangedBeforeImplementationError) throw error
+      reportAdvisorVerificationWarning(stage, error)
+      return undefined
+    }
+  }
   const verifyNativeAdvisorHistoryForPublication = async (
     evidence: NativeAdvisorHistoryFixtureEvidence & {
       seatbeltFingerprint?: SeatbeltFingerprint
@@ -4549,15 +4689,25 @@ export async function executeCodexJob(
       readForTesting,
     })
   }
-  type ExecutionStage = 'complete' | 'prepare' | 'implementation' | 'review' | 'interjection'
+  type ExecutionStage = CodexExecutionStage
   const phasedWrite = job.writeEnabled && options.liveControls !== undefined
     && (nativeAdvisorHistoryEnabled || options.phaseGateForTesting !== undefined)
 
   const prepareLogicalAttempt = () => {
     const attemptNonce = randomUUID().replaceAll('-', '')
-    const initialRepositoryDigest = advisorRepositoryDigest(
-      snapshotAdvisorRepository(advisorProjectLayout),
-    )
+    const initialRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
+    const initialRepositoryDigest = advisorRepositoryDigest(initialRepositorySnapshot)
+    if (options.uiApproval?.repositorySnapshot
+      && advisorRepositoryDigest(options.uiApproval.repositorySnapshot)
+        !== options.uiApproval.repositoryDigest) {
+      throw new Error('stored UI/UX proposal repository snapshot has an invalid digest')
+    }
+    const uiApprovalRepositoryChange = options.uiApproval
+      ? summarizeAdvisorRepositoryChanges(
+          options.uiApproval.repositorySnapshot,
+          initialRepositorySnapshot,
+        )
+      : undefined
     const context: AdvisorContextRecord = {
       version: 4,
       jobId: job.id,
@@ -4571,7 +4721,14 @@ export async function executeCodexJob(
     const contextDigest = advisorContextDigest(context)
     const contextPath = join(advisorContextDir, `${attemptNonce}.json`)
     atomicWritePrivateFile(contextPath, `${JSON.stringify(context)}\n`)
-    return { attemptNonce, initialRepositoryDigest, contextDigest, contextPath }
+    return {
+      attemptNonce,
+      initialRepositoryDigest,
+      initialRepositorySnapshot,
+      uiApprovalRepositoryChange,
+      contextDigest,
+      contextPath,
+    }
   }
   const logicalAttempt = prepareLogicalAttempt()
 
@@ -4700,6 +4857,7 @@ export async function executeCodexJob(
     parentChildBaselineInput: string[] | null = null,
     parentTurnBaselineInput: NativeAdvisorParentTurnBaseline | null = null,
     boundInterjection?: JobInterjectionRecord,
+    expectedRepositoryDigest?: string,
   ) => {
     if (stage === 'interjection' && !boundInterjection) {
       throw new Error('interjection execution omitted its durable input binding')
@@ -4733,6 +4891,15 @@ export async function executeCodexJob(
         removeSeatbeltFingerprint(managedStateDir, advisorAttempt.seatbeltFingerprint)
       } catch (cleanupError) {
         throw new CodexCleanupPendingError(`${label} cleanup is unconfirmed: ${cleanupError}`)
+      }
+    }
+    if (stage === 'implementation' && expectedRepositoryDigest) {
+      const observedRepositoryDigest = advisorRepositoryDigest(
+        snapshotAdvisorRepository(advisorProjectLayout),
+      )
+      if (observedRepositoryDigest !== expectedRepositoryDigest) {
+        await retireUnregisteredAttempt('pre-implementation repository drift')
+        throw new CodexRepositoryChangedBeforeImplementationError()
       }
     }
     if (!options.skipEffectiveConfigCheck) {
@@ -5031,19 +5198,26 @@ export async function executeCodexJob(
           onReconciledRound: outcome => {
             if (outcome.jobId !== job.id
               || outcome.attemptNonce !== advisorAttempt.attemptNonce) return
-            const input = readAdvisorInputSnapshot(
-              managedStateDir, job.id, outcome.inputRevision,
-            )
-            if (!input.digest.startsWith(outcome.inputDigestPrefix)) {
-              throw new Error('reconciled Claude round input digest changed')
+            try {
+              const input = readAdvisorInputSnapshot(
+                managedStateDir, job.id, outcome.inputRevision,
+              )
+              if (!input.digest.startsWith(outcome.inputDigestPrefix)) {
+                throw new Error('reconciled Claude round input digest changed')
+              }
+              persistAdvisorClaudeCleanupOutcome(managedStateDir, {
+                ...outcome,
+                inputDigest: input.digest,
+              })
+            } catch (error) {
+              reportAdvisorVerificationWarning('claude-round-history', error)
             }
-            persistAdvisorClaudeCleanupOutcome(managedStateDir, {
-              ...outcome,
-              inputDigest: input.digest,
-            })
           },
         })
-        finalizeRetiredAdvisorRounds(managedStateDir)
+        await bestEffortAdvisorVerification(
+          'retired-round-history',
+          () => finalizeRetiredAdvisorRounds(managedStateDir),
+        )
       }
       rmSync(registrationPath, { force: true })
       if (existsSync(registrationPath)) {
@@ -5259,6 +5433,7 @@ export async function executeCodexJob(
       herdrIdentityTimer?.unref()
 
       let protocolError: unknown = processPersistenceError
+      let transientFailureSafeToRetry = false
       let protocolCompleted = false
       let userCancelled = false
       let inputChangedBeforeDispatch = false
@@ -5274,6 +5449,7 @@ export async function executeCodexJob(
         ? null
         : parentTurnBaselineInput.map(entry => ({ ...entry }))
       let currentTurnId: string | null = null
+      let activeTurnTransientFailure: CodexRateLimitInfo | null = null
       let pausedInterjection: JobInterjectionRecord | null = null
       let cancellationTerminalDeadline: number | null = null
       const rejectedSteerState: { current: {
@@ -5675,14 +5851,24 @@ export async function executeCodexJob(
         options.onSessionId?.(currentThreadId)
         observedSessionId = currentThreadId
         if (parentChildBaseline === null) {
-          parentChildBaseline = nativeAdvisorHistoryEnabled && !startedFreshThread
-            ? await captureNativeAdvisorParentChildBaseline(session, currentThreadId)
-            : []
+          if (nativeAdvisorHistoryEnabled && !startedFreshThread) {
+            parentChildBaseline = await bestEffortAdvisorVerification(
+              'parent-child-baseline',
+              () => captureNativeAdvisorParentChildBaseline(session, currentThreadId!),
+            ) ?? []
+          } else {
+            parentChildBaseline = []
+          }
         }
         if (parentTurnBaseline === null) {
-          parentTurnBaseline = nativeAdvisorHistoryEnabled && !startedFreshThread
-            ? await captureNativeAdvisorParentTurnBaseline(session, currentThreadId)
-            : []
+          if (nativeAdvisorHistoryEnabled && !startedFreshThread) {
+            parentTurnBaseline = await bestEffortAdvisorVerification(
+              'parent-turn-baseline',
+              () => captureNativeAdvisorParentTurnBaseline(session, currentThreadId!),
+            ) ?? []
+          } else {
+            parentTurnBaseline = []
+          }
         }
         if (controls.cancellationRequested()) {
           userCancelled = true
@@ -5723,6 +5909,7 @@ export async function executeCodexJob(
         }
         let initialRequestId: number | null = null
         try {
+          activeTurnTransientFailure = null
           currentTurnId = await session.startTurn(
             currentThreadId,
             isInterjectionStage
@@ -5747,9 +5934,7 @@ export async function executeCodexJob(
                 artifactDir,
                 advisorAttempt.browserEnabled,
                 options.uiApproval,
-                Boolean(options.uiApproval
-                  && options.uiApproval.repositoryDigest
-                    !== advisorAttempt.initialRepositoryDigest),
+                logicalAttempt.uiApprovalRepositoryChange,
                 threadHistoryForPhysicalSession(options.threadHistory, resumed),
               ),
             phaseClientUserMessageId ?? job.idempotencyKey,
@@ -5759,6 +5944,14 @@ export async function executeCodexJob(
               approvalPolicy: 'never',
               ...(model ? { model } : {}),
               beforeWrite: requestId => {
+                if (stage === 'implementation' && expectedRepositoryDigest) {
+                  const observedRepositoryDigest = advisorRepositoryDigest(
+                    snapshotAdvisorRepository(advisorProjectLayout),
+                  )
+                  if (observedRepositoryDigest !== expectedRepositoryDigest) {
+                    throw new CodexRepositoryChangedBeforeImplementationError()
+                  }
+                }
                 initialRequestId = requestId
                 const disposition = isInterjectionStage
                   ? controls.beginInterjectionAnswer({
@@ -5868,17 +6061,16 @@ export async function executeCodexJob(
             const rateLimit = extractCodexRateLimit(JSON.stringify({
               method: 'error', params: appServerError,
             }))
+            if (rateLimit.rateLimited) activeTurnTransientFailure = rateLimit
             if (!appServerError.willRetry
-              && rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
+              && rateLimit.rateLimited
+              && rateLimit.resetsAtMs !== null) {
               controls.recordRateLimit({
                 executorNonce: advisorAttempt.attemptNonce,
                 threadId: currentThreadId,
                 turnId: currentTurnId,
                 resumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs),
               })
-              throw new AppServerProtocolError(
-                `App Server rate-limit notification: ${JSON.stringify(appServerError)}`,
-              )
             }
             // Official `error` is a turn-scoped progress notification; the
             // authoritative terminal remains `turn/completed`. Treating it as
@@ -5959,12 +6151,28 @@ export async function executeCodexJob(
               finalTurn = reconciledTurn
               rejectedSteerState.current = null
             }
-            const rateLimit = terminal.turn.status === 'failed'
+            const terminalRateLimit = terminal.turn.status === 'failed'
               ? extractCodexRateLimit(JSON.stringify({
                 method: 'turn/completed',
                 params: { threadId: currentThreadId, turn: terminal.turn },
               }))
-              : { rateLimited: false, resetsAtMs: null }
+              : { rateLimited: false, resetsAtMs: null, reason: null }
+            const rateLimit = terminalRateLimit.rateLimited
+              ? terminalRateLimit
+              : terminal.turn.status === 'failed' && activeTurnTransientFailure?.rateLimited
+                ? activeTurnTransientFailure
+                : terminalRateLimit
+            if (rateLimit.rateLimited && terminal.turn.status === 'failed') {
+              // A terminal marked `full` is the bounded official item view for
+              // this failed turn. The session projection intentionally strips
+              // tool items from publishable history, so pair it with the
+              // independently accumulated permission evidence. Unknown or
+              // command-bearing turns fail closed.
+              transientFailureSafeToRetry =
+                terminal.permissionEvidence.commandCount === 0
+                && !terminal.permissionEvidence.unexpectedItemSeen
+                && appServerTurnSafeToRetryAfterTransientFailure(reconciledTurn)
+            }
             if (stage === 'interjection'
               && terminal.turn.status === 'completed'
               && !controls.cancellationRequested()) {
@@ -6374,6 +6582,7 @@ export async function executeCodexJob(
         stdoutPath,
         stderrPath,
         pausedInterjection,
+        transientFailureSafeToRetry,
       }
     }
     // Everything below is the legacy `codex exec` fixture path. Production
@@ -6695,6 +6904,7 @@ export async function executeCodexJob(
       stdoutPath,
       stderrPath,
       pausedInterjection: null as JobInterjectionRecord | null,
+      transientFailureSafeToRetry: false,
     }
   }
 
@@ -6722,6 +6932,7 @@ export async function executeCodexJob(
     let reviewRound: 1 | 2 | 3 = 1
     let reviewedInputRevision: number | null = null
     let preparedInput: AdvisorInputSnapshot | null = null
+    let preparedRepositoryDigest: string | null = null
     let implementedInputDigest: string | null = null
     let parentSource: AppServerSessionSource | null = null
     let parentChildBaseline: string[] | null = null
@@ -6824,6 +7035,10 @@ export async function executeCodexJob(
             failure,
             rateLimit.resetsAtMs,
             execution.observedSessionId ?? undefined,
+            rateLimit.reason ?? 'rate-limit',
+            execution.transientFailureSafeToRetry,
+            'interjection',
+            phaseSequence,
           )
         }
         throw new Error(failure)
@@ -6853,6 +7068,7 @@ export async function executeCodexJob(
       stage: 'prepare' | 'implementation' | 'review',
       round: 1 | 2 | 3,
       boundInput?: AdvisorInputSnapshot,
+      expectedRepositoryDigest?: string,
     ): Promise<{
       kind: 'success'
       execution: Awaited<ReturnType<typeof runAttempt>>
@@ -6867,7 +7083,7 @@ export async function executeCodexJob(
 
         const execution = await runAttempt(
           sessionId, resumed, stage, phaseSequence, round, boundInput,
-          parentChildBaseline, parentTurnBaseline,
+          parentChildBaseline, parentTurnBaseline, undefined, expectedRepositoryDigest,
         )
         if ('userCancelled' in execution && execution.userCancelled === true) {
           await execution.retireCancelledRegistration()
@@ -6948,6 +7164,10 @@ export async function executeCodexJob(
             failure,
             rateLimit.resetsAtMs,
             execution.observedSessionId ?? undefined,
+            rateLimit.reason ?? 'rate-limit',
+            execution.transientFailureSafeToRetry,
+            stage,
+            phaseSequence,
           )
         }
         const safeInitialPrepareFallback = stage === 'prepare'
@@ -7001,11 +7221,23 @@ export async function executeCodexJob(
         let preparationError: unknown
         let preparationDecision: ReturnType<typeof parseCodexPreparationDecision> | undefined
         let currentRepositoryDigest: string | undefined
+        let currentRepositorySnapshot: AdvisorRepositorySnapshot | undefined
         try {
+          const observedRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
+          const observedRepositoryDigest = advisorRepositoryDigest(observedRepositorySnapshot)
+          currentRepositorySnapshot = observedRepositorySnapshot
+          currentRepositoryDigest = observedRepositoryDigest
+          if (observedRepositoryDigest !== execution.initialRepositoryDigest) {
+            throw new CodexRepositoryChangedBeforeImplementationError()
+          }
           preparationDecision = parseCodexPreparationDecision(
             execution.finalMessage,
             execution.advisorAttemptNonce,
             finalInput,
+            options.uiApproval ? {
+              context: options.uiApproval,
+              currentRepositoryDigest: observedRepositoryDigest,
+            } : undefined,
           )
           if (preparationDecision.kind === 'approval-required') {
             if (!execution.browserReceiptKey) {
@@ -7022,53 +7254,58 @@ export async function executeCodexJob(
               afterPath: preparationDecision.proposal.afterPath,
             })
           }
-          currentRepositoryDigest = advisorRepositoryDigest(
-            snapshotAdvisorRepository(advisorProjectLayout),
-          )
           let preparationRounds: NativeAdvisorRoundEvidence[] | undefined
           if (options.phaseGateForTesting) {
             await options.phaseGateForTesting.validatePreparation?.(
               finalInput,
-              currentRepositoryDigest,
+              observedRepositoryDigest,
             )
           } else {
             if (herdrRuntime) await verifyHerdrRuntimeIdentityAsync(herdrRuntime)
-            preparationRounds = assertRequiredAdvisorPreparationRounds(
-              job,
-              managedStateDir,
-              execution.advisorContextDigest,
-              execution.advisorAttemptNonce,
-              finalInput,
-              execution.initialRepositoryDigest,
-              currentRepositoryDigest,
+            preparationRounds = await bestEffortAdvisorVerification(
+              'preparation-journal',
+              () => assertRequiredAdvisorPreparationRounds(
+                job,
+                managedStateDir,
+                execution.advisorContextDigest,
+                execution.advisorAttemptNonce,
+                finalInput,
+                execution.initialRepositoryDigest,
+                observedRepositoryDigest,
+              ),
             )
           }
           if (nativeAdvisorHistoryEnabled) {
-            await verifyNativeAdvisorHistoryForPublication({
-              stage: 'prepare',
-              reviewRound: 1,
-              input: finalInput,
-              codexBin,
-              repoPath: job.repoPath,
-              permissionOverrides: execution.advisorPermissionOverrides,
-              attemptNonce: execution.advisorAttemptNonce,
-              parentThreadId: sessionId!,
-              parentSource: parentSource!,
-              parentChildBaseline: parentChildBaseline ?? (() => {
-                throw new Error('Codex App Server omitted the pre-turn child baseline')
-              })(),
-              parentTurnBaseline: parentTurnBaseline ?? (() => {
-                throw new Error('Codex App Server omitted the pre-turn parent history')
-              })(),
-              parentTurnIds: [...parentTurnIds],
-              seatbeltFingerprint: execution.seatbeltFingerprint,
-            }, preparationRounds)
+            await bestEffortAdvisorVerification(
+              'preparation-history',
+              () => verifyNativeAdvisorHistoryForPublication({
+                stage: 'prepare',
+                reviewRound: 1,
+                input: finalInput,
+                codexBin,
+                repoPath: job.repoPath,
+                permissionOverrides: execution.advisorPermissionOverrides,
+                attemptNonce: execution.advisorAttemptNonce,
+                parentThreadId: sessionId!,
+                parentSource: parentSource!,
+                parentChildBaseline: parentChildBaseline ?? (() => {
+                  throw new Error('Codex App Server omitted the pre-turn child baseline')
+                })(),
+                parentTurnBaseline: parentTurnBaseline ?? (() => {
+                  throw new Error('Codex App Server omitted the pre-turn parent history')
+                })(),
+                parentTurnIds: [...parentTurnIds],
+                seatbeltFingerprint: execution.seatbeltFingerprint,
+              }, preparationRounds),
+            )
           }
           if (preparationDecision.kind === 'ready' && options.uiApproval) {
             assertUiApprovalReadyMayProceed({
               context: options.uiApproval,
+              decision: preparationDecision.approvalDecision,
               currentInputRevision: finalInput.revision,
-              currentRepositoryDigest,
+              currentInputDigest: finalInput.digest,
+              currentRepositoryDigest: observedRepositoryDigest,
             })
           }
         } catch (error) {
@@ -7082,11 +7319,13 @@ export async function executeCodexJob(
           || (preparationError
             && finalInput.revision > (execution.inputSnapshot?.revision ?? finalInput.revision))) {
           phaseSequence += 1
+          preparedInput = null
+          preparedRepositoryDigest = null
           nextStage = 'prepare'
           continue
         }
         if (preparationError) throw preparationError
-        if (!preparationDecision || !currentRepositoryDigest) {
+        if (!preparationDecision || !currentRepositoryDigest || !currentRepositorySnapshot) {
           throw new Error('Codex preparation decision is unavailable')
         }
         if (preparationDecision.kind === 'approval-required') {
@@ -7096,9 +7335,11 @@ export async function executeCodexJob(
             inputRevision: finalInput.revision,
             inputDigest: finalInput.digest,
             repositoryDigest: currentRepositoryDigest,
+            repositorySnapshot: currentRepositorySnapshot,
           })
         }
         preparedInput = finalInput
+        preparedRepositoryDigest = currentRepositoryDigest
         phaseSequence += 1
         nextStage = implementedInputDigest === activeWriteInputDigest(finalInput)
           ? 'review'
@@ -7108,9 +7349,21 @@ export async function executeCodexJob(
 
       if (nextStage === 'implementation') {
         if (!preparedInput) throw new Error('write implementation omitted its prepared input binding')
-        const outcome = await runPhase('implementation', reviewRound, preparedInput)
+        if (!preparedRepositoryDigest) {
+          throw new Error('write implementation omitted its prepared repository binding')
+        }
+        const repositoryBeforeImplementation = advisorRepositoryDigest(
+          snapshotAdvisorRepository(advisorProjectLayout),
+        )
+        if (repositoryBeforeImplementation !== preparedRepositoryDigest) {
+          throw new CodexRepositoryChangedBeforeImplementationError()
+        }
+        const outcome = await runPhase(
+          'implementation', reviewRound, preparedInput, preparedRepositoryDigest,
+        )
         if (outcome.kind === 'input-changed') {
           preparedInput = null
+          preparedRepositoryDigest = null
           nextStage = 'prepare'
           continue
         }
@@ -7139,6 +7392,7 @@ export async function executeCodexJob(
           reviewRound = 1
           reviewedInputRevision = null
           preparedInput = null
+          preparedRepositoryDigest = null
           nextStage = 'prepare'
           continue
         }
@@ -7157,6 +7411,7 @@ export async function executeCodexJob(
       const outcome = await runPhase('review', reviewRound, preparedInput)
       if (outcome.kind === 'input-changed') {
         preparedInput = null
+        preparedRepositoryDigest = null
         nextStage = 'prepare'
         continue
       }
@@ -7171,15 +7426,18 @@ export async function executeCodexJob(
         reviewRound = 1
         reviewedInputRevision = null
         preparedInput = null
+        preparedRepositoryDigest = null
         nextStage = 'prepare'
         continue
       }
       let decision: ReturnType<typeof parseCodexReviewDecision> | undefined
       let reviewError: unknown
+      let reviewedRepositoryDigest: string | undefined
       try {
         const currentRepositoryDigest = advisorRepositoryDigest(
           snapshotAdvisorRepository(advisorProjectLayout),
         )
+        reviewedRepositoryDigest = currentRepositoryDigest
         let advisorRounds: NativeAdvisorRoundEvidence[] | undefined
         if (options.phaseGateForTesting) {
           await options.phaseGateForTesting.validateReview?.(
@@ -7189,36 +7447,42 @@ export async function executeCodexJob(
           )
         } else {
           if (herdrRuntime) await verifyHerdrRuntimeIdentityAsync(herdrRuntime)
-          advisorRounds = assertRequiredAdvisorRounds(
-            job,
-            managedStateDir,
-            execution.advisorContextDigest,
-            execution.advisorAttemptNonce,
-            finalInput,
-            execution.initialRepositoryDigest,
-            currentRepositoryDigest,
+          advisorRounds = await bestEffortAdvisorVerification(
+            'review-journal',
+            () => assertRequiredAdvisorRounds(
+              job,
+              managedStateDir,
+              execution.advisorContextDigest,
+              execution.advisorAttemptNonce,
+              finalInput,
+              execution.initialRepositoryDigest,
+              currentRepositoryDigest,
+            ),
           )
         }
         if (nativeAdvisorHistoryEnabled) {
-          await verifyNativeAdvisorHistoryForPublication({
-            stage: 'review',
-            reviewRound,
-            input: finalInput,
-            codexBin,
-            repoPath: job.repoPath,
-            permissionOverrides: execution.advisorPermissionOverrides,
-            attemptNonce: execution.advisorAttemptNonce,
-            parentThreadId: sessionId!,
-            parentSource: parentSource!,
-            parentChildBaseline: parentChildBaseline ?? (() => {
-              throw new Error('Codex App Server omitted the pre-turn child baseline')
-            })(),
-            parentTurnBaseline: parentTurnBaseline ?? (() => {
-              throw new Error('Codex App Server omitted the pre-turn parent history')
-            })(),
-            parentTurnIds: [...parentTurnIds],
-            seatbeltFingerprint: execution.seatbeltFingerprint,
-          }, advisorRounds)
+          await bestEffortAdvisorVerification(
+            'review-history',
+            () => verifyNativeAdvisorHistoryForPublication({
+              stage: 'review',
+              reviewRound,
+              input: finalInput,
+              codexBin,
+              repoPath: job.repoPath,
+              permissionOverrides: execution.advisorPermissionOverrides,
+              attemptNonce: execution.advisorAttemptNonce,
+              parentThreadId: sessionId!,
+              parentSource: parentSource!,
+              parentChildBaseline: parentChildBaseline ?? (() => {
+                throw new Error('Codex App Server omitted the pre-turn child baseline')
+              })(),
+              parentTurnBaseline: parentTurnBaseline ?? (() => {
+                throw new Error('Codex App Server omitted the pre-turn parent history')
+              })(),
+              parentTurnIds: [...parentTurnIds],
+              seatbeltFingerprint: execution.seatbeltFingerprint,
+            }, advisorRounds),
+          )
         }
         decision = parseCodexReviewDecision(
           execution.finalMessage,
@@ -7240,6 +7504,15 @@ export async function executeCodexJob(
         nextStage = 'prepare'
         continue
       }
+      if (reviewError instanceof CodexRepositoryChangedBeforePublicationError) {
+        phaseSequence += 1
+        reviewRound = 1
+        reviewedInputRevision = null
+        preparedInput = null
+        preparedRepositoryDigest = null
+        nextStage = 'prepare'
+        continue
+      }
       if (reviewError) throw reviewError
       if (!decision) throw new Error('Codex review decision is unavailable')
       if (decision.decision === 'fix') {
@@ -7249,6 +7522,10 @@ export async function executeCodexJob(
         phaseSequence += 1
         reviewedInputRevision = finalInput.revision
         implementedInputDigest = null
+        if (!reviewedRepositoryDigest) {
+          throw new Error('review omitted the repository digest required for its fixes')
+        }
+        preparedRepositoryDigest = reviewedRepositoryDigest
         reviewRound = (reviewRound + 1) as 2 | 3
         nextStage = 'implementation'
         continue
@@ -7264,6 +7541,7 @@ export async function executeCodexJob(
         phaseSequence += 1
         reviewRound = 1
         reviewedInputRevision = null
+        preparedRepositoryDigest = null
         nextStage = 'prepare'
         continue
       }
@@ -7380,6 +7658,10 @@ export async function executeCodexJob(
           failure,
           rateLimit.resetsAtMs,
           execution.observedSessionId ?? undefined,
+          rateLimit.reason ?? 'rate-limit',
+          execution.transientFailureSafeToRetry,
+          'interjection',
+          completePhaseSequence,
         )
       }
       throw new Error(failure)
@@ -7497,37 +7779,43 @@ export async function executeCodexJob(
           const currentRepositoryDigest = advisorRepositoryDigest(
             snapshotAdvisorRepository(advisorProjectLayout),
           )
-          completeAdvisorRounds = assertRequiredAdvisorRounds(
-            job,
-            managedStateDir,
-            execution.advisorContextDigest,
-            execution.advisorAttemptNonce,
-            finalInput,
-            execution.initialRepositoryDigest,
-            currentRepositoryDigest,
+          completeAdvisorRounds = await bestEffortAdvisorVerification(
+            'completion-journal',
+            () => assertRequiredAdvisorRounds(
+              job,
+              managedStateDir,
+              execution.advisorContextDigest,
+              execution.advisorAttemptNonce,
+              finalInput!,
+              execution.initialRepositoryDigest,
+              currentRepositoryDigest,
+            ),
           )
         }
         if (nativeAdvisorHistoryEnabled) {
           if (!finalInput) {
             throw new Error('native advisor history omitted its durable final input')
           }
-          await verifyNativeAdvisorHistoryForPublication({
-            stage: 'complete',
-            reviewRound: 1,
-            input: finalInput,
-            codexBin,
-            repoPath: job.repoPath,
-            permissionOverrides: execution.advisorPermissionOverrides,
-            attemptNonce: execution.advisorAttemptNonce,
-            parentThreadId: resolvedSessionId,
-            parentSource: completeParentSource ?? execution.parentSource ?? (() => {
-              throw new Error('Codex App Server omitted the parent thread source binding')
-            })(),
-            parentChildBaseline: completeParentChildBaseline ?? execution.parentChildBaseline,
-            parentTurnBaseline: completeParentTurnBaseline ?? execution.parentTurnBaseline,
-            parentTurnIds: [...completeParentTurnIds],
-            seatbeltFingerprint: execution.seatbeltFingerprint,
-          }, completeAdvisorRounds)
+          await bestEffortAdvisorVerification(
+            'completion-history',
+            () => verifyNativeAdvisorHistoryForPublication({
+              stage: 'complete',
+              reviewRound: 1,
+              input: finalInput!,
+              codexBin,
+              repoPath: job.repoPath,
+              permissionOverrides: execution.advisorPermissionOverrides,
+              attemptNonce: execution.advisorAttemptNonce,
+              parentThreadId: resolvedSessionId,
+              parentSource: completeParentSource ?? execution.parentSource ?? (() => {
+                throw new Error('Codex App Server omitted the parent thread source binding')
+              })(),
+              parentChildBaseline: completeParentChildBaseline ?? execution.parentChildBaseline,
+              parentTurnBaseline: completeParentTurnBaseline ?? execution.parentTurnBaseline,
+              parentTurnIds: [...completeParentTurnIds],
+              seatbeltFingerprint: execution.seatbeltFingerprint,
+            }, completeAdvisorRounds),
+          )
         }
         result = {
           sessionId: resolvedSessionId,
@@ -7581,6 +7869,10 @@ export async function executeCodexJob(
         failure,
         rateLimit.resetsAtMs,
         execution.observedSessionId ?? undefined,
+        rateLimit.reason ?? 'rate-limit',
+        execution.transientFailureSafeToRetry,
+        'complete',
+        completePhaseSequence,
       )
     }
     if (resumed && !resumeFallbackAttempted && executionReportsMissingSession(execution)) {

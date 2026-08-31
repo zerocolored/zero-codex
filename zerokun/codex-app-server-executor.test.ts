@@ -15,6 +15,7 @@ import { JobStore } from './job-runner.ts'
 import {
   CodexCleanupPendingError,
   CodexRateLimitError,
+  CodexRepositoryChangedBeforeImplementationError,
   CodexUserCancelledError,
   executeCodexJob,
   type CodexLiveControlHooks,
@@ -318,7 +319,19 @@ for line in sys.stdin:
             else:
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "失敗後の追加入力を反映しました"}], "error": None}}})
         elif mode == "rate-error":
-            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
+            failure = {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}
+            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [], "error": failure}}})
+        elif mode in ("capacity-error", "capacity-after-command", "capacity-error-generic-terminal", "capacity-started-command"):
+            failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None, "additionalDetails": None}
+            items = [] if mode == "capacity-error" else [{"type": "commandExecution", "id": "capacity-command", "command": "echo changed", "status": "completed", "exitCode": 0}]
+            if mode in ("capacity-error-generic-terminal", "capacity-started-command"):
+                items = []
+            if mode == "capacity-started-command":
+                emit({"method": "item/started", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "commandExecution", "id": "capacity-started-command", "command": "echo changed", "status": "inProgress", "exitCode": None}}})
+            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
+            terminal_failure = {"message": "turn failed", "codexErrorInfo": None, "additionalDetails": None} if mode in ("capacity-error-generic-terminal", "capacity-started-command") else failure
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": items, "error": terminal_failure}}})
         elif mode == "rate-retrying":
             emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "内部retry後に完了"}], "error": None}}})
@@ -526,7 +539,9 @@ function fixture(
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
     | 'failed-steer' | 'failed-turn'
-    | 'error-steer' | 'rate-error' | 'rate-retrying' | 'phased'
+    | 'error-steer' | 'rate-error' | 'rate-retrying' | 'capacity-error'
+    | 'capacity-after-command' | 'capacity-error-generic-terminal'
+    | 'capacity-started-command' | 'phased'
     | 'phased-native-history-fresh' | 'phased-native-history-resume'
     | 'phased-native-history-resume-unmaterialized' | 'phased-steer'
     | 'phased-interjection-update' | 'missing-session-resume'
@@ -1164,6 +1179,31 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('prepare応答後にrepositoryが変わったらsemantic parse前に再準備を要求する', async () => {
+    const value = fixture('phased', true)
+    const processIds: number[] = []
+    let processExits = 0
+    await expect(executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'phased' },
+      phaseGateForTesting: {},
+      onProcessId: processId => { processIds.push(processId) },
+      onProcessExit: () => {
+        processExits += 1
+        if (processExits === 1) {
+          writeFileSync(join(value.repo, 'concurrent-change.txt'), 'changed\n', { mode: 0o600 })
+        }
+      },
+      liveControls: value.hooks,
+    })).rejects.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
+    expect(processIds).toHaveLength(1)
+    expect(value.store.writePhaseMayHaveBeenDelivered(value.job.id)).toBe(false)
+    value.store.close()
+  }, 15_000)
+
   test('fresh Slack jobは未materialize履歴APIを呼ばず空baselineでpublication gateを通す', async () => {
     const value = fixture('phased-native-history-fresh', true)
     const rpcLog = join(value.root, 'native-history-fresh-rpc.log')
@@ -1421,11 +1461,12 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test('resume threadの未materialize応答を空baselineへ弱めずpublication前に拒否する', async () => {
+  test('resume threadの未materialize履歴はwarningへ弱めてprimary結果を公開する', async () => {
     const value = fixture('phased-native-history-resume-unmaterialized', true)
     const rpcLog = join(value.root, 'native-history-resume-unmaterialized-rpc.log')
     let gateCalls = 0
-    await expect(executeCodexJob(value.job, {
+    const warnings: string[] = []
+    const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
       stateDir: value.state,
@@ -1440,13 +1481,19 @@ describe('production App Server executor', () => {
         gateCalls += 1
         throw new Error('publication gate must not run')
       },
+      onStderrChunk: value => warnings.push(Buffer.from(value).toString('utf8')),
       liveControls: value.hooks,
-    })).rejects.toThrow('not materialized yet')
-    expect(gateCalls).toBe(0)
+    })
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(gateCalls).toBe(2)
+    expect(warnings.join('')).toContain('[Zero advisor warning] parent-turn-baseline')
+    expect(warnings.join('')).toContain('[Zero advisor warning] preparation-history')
+    expect(warnings.join('')).toContain('[Zero advisor warning] review-history')
+    expect(warnings.join('')).not.toContain('publication gate must not run')
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-    expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(1)
+    expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(3)
     expect(rpc.filter(entry => entry.method === 'thread/turns/list')).toHaveLength(1)
-    expect(rpc.filter(entry => entry.method === 'turn/start')).toHaveLength(0)
+    expect(rpc.filter(entry => entry.method === 'turn/start')).toHaveLength(3)
     expect(value.store.get(value.job.id)?.status).toBe('running')
     value.store.close()
   }, 30_000)
@@ -1467,10 +1514,11 @@ describe('production App Server executor', () => {
     value.store.close()
   })
 
-  test('再開jobのnative履歴不一致はpublication前にexecutorを失敗させる', async () => {
+  test('再開jobのnative履歴不一致はwarningに閉じてprimary結果を公開する', async () => {
     const value = fixture('phased-native-history-resume', true)
     let gateCalls = 0
-    await expect(executeCodexJob(value.job, {
+    const warnings: string[] = []
+    const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
       stateDir: value.state,
@@ -1494,12 +1542,39 @@ describe('production App Server executor', () => {
           ),
         }
       },
+      onStderrChunk: value => warnings.push(Buffer.from(value).toString('utf8')),
       liveControls: value.hooks,
-    })).rejects.toThrow('omitted completed turn')
-    expect(gateCalls).toBe(1)
+    })
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(gateCalls).toBe(2)
+    expect(warnings.join('')).toContain('[Zero advisor warning] preparation-history')
+    expect(warnings.join('')).toContain('[Zero advisor warning] review-history')
+    expect(warnings.join('')).not.toContain('omitted completed turn')
     expect(value.store.get(value.job.id)?.status).toBe('running')
     value.store.close()
   }, 30_000)
+
+  test('read-only質問は補助レビュー履歴を照合できなくてもprimary回答を返す', async () => {
+    const value = fixture('normal', false)
+    const warnings: string[] = []
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'normal' },
+      nativeAdvisorHistoryFixtureForTesting: async () => {
+        throw new Error('saved advisor history is unavailable')
+      },
+      onStderrChunk: value => warnings.push(Buffer.from(value).toString('utf8')),
+      liveControls: value.hooks,
+    })
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
+    expect(warnings.join('')).toContain('[Zero advisor warning] completion-history')
+    expect(warnings.join('')).not.toContain('saved advisor history is unavailable')
+    expect(value.store.get(value.job.id)?.status).toBe('running')
+    value.store.close()
+  }, 15_000)
 
   test('write jobの消失resume先は初回prepare未送達ならcold startして履歴を一度だけ注入する', async () => {
     const value = fixture('missing-session-resume', true)
@@ -3268,4 +3343,36 @@ describe('production App Server executor', () => {
     })
     value.store.close()
   })
+
+  test('model capacity terminalは副作用のないfull turnだけ同じsessionで再開可能にする', async () => {
+    for (const [mode, safe] of [
+      ['capacity-error', true],
+      ['capacity-after-command', false],
+      ['capacity-error-generic-terminal', true],
+      ['capacity-started-command', false],
+    ] as const) {
+      const value = fixture(mode, true)
+      let caught: unknown
+      try {
+        await executeCodexJob(value.job, {
+          codexBinForTesting: value.executable,
+          logDir: value.logDir,
+          stateDir: value.state,
+          skipEffectiveConfigCheck: true,
+          extraEnvironment: { ZERO_FIXTURE_MODE: mode },
+          liveControls: value.hooks,
+        })
+      } catch (error) {
+        caught = error
+      }
+      expect(caught).toBeInstanceOf(CodexRateLimitError)
+      const rateLimitError = caught as CodexRateLimitError
+      expect(rateLimitError.reason).toBe('capacity')
+      expect(rateLimitError.safeToRetryAfterDelivery).toBe(safe)
+      expect(rateLimitError.sessionId).toBe('thread-app-server-1')
+      expect(rateLimitError.stage).toBe('complete')
+      expect(rateLimitError.phaseSequence).toBe(0)
+      value.store.close()
+    }
+  }, 30_000)
 })

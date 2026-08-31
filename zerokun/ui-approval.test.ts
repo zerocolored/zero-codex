@@ -6,13 +6,15 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import {
   assertUiApprovalReadyMayProceed,
+  buildUiApprovalSemanticDecisionTemplate,
   createUiApprovalBrowserReceipt,
-  isExplicitUiApprovalResponse,
   parseCodexPreparationDecision,
   reencodeUiApprovalImages,
   stripUiApprovalPngMetadata,
   uiApprovalBrowserReceiptPath,
   verifyUiApprovalBrowserReceipts,
+  type UiApprovalResumeContext,
+  type UiApprovalSemanticDecision,
 } from './ui-approval.ts'
 
 const temporaryDirectories: string[] = []
@@ -77,6 +79,57 @@ function screenshotPng(red: number, withMetadata = true): Buffer {
 describe('Codex UI/UX approval decision contract', () => {
   const nonce = '0123456789abcdef0123456789abcdef'
   const input = { revision: 3, digest: 'a'.repeat(64) }
+  const repositorySnapshot: NonNullable<UiApprovalResumeContext['repositorySnapshot']> = {
+    version: 2,
+    projectPath: '/project',
+    kind: 'non-git',
+    gitRoot: null,
+    gitRoots: [],
+    head: null,
+    status: '',
+    dirty: {},
+    repositories: [],
+    rootInstructions: {},
+  }
+  const context = (
+    responseText = 'OK実装して',
+    snapshot: UiApprovalResumeContext['repositorySnapshot'] = repositorySnapshot,
+  ): UiApprovalResumeContext => ({
+    requestId: 'approval-request',
+    requestInputRevision: 1,
+    requestInputDigest: '1'.repeat(64),
+    responseInputRevision: 3,
+    responseInputDigest: input.digest,
+    responseMessageId: '1800000000.000002',
+    responseText,
+    responseAfterPrompt: true,
+    repositoryDigest: 'b'.repeat(64),
+    repositorySnapshot: snapshot,
+    proposalText: '承認待ちの提案です。',
+  })
+  const semanticDecision = (
+    approval: UiApprovalResumeContext,
+    currentRepositoryDigest = 'c'.repeat(64),
+    intent: UiApprovalSemanticDecision['intent'] = 'approve',
+    repositoryState: UiApprovalSemanticDecision['repositoryState'] = 'compatible',
+  ): UiApprovalSemanticDecision => ({
+    version: 1,
+    attemptNonce: nonce,
+    requestId: approval.requestId,
+    proposalInputRevision: approval.requestInputRevision,
+    proposalInputDigest: approval.requestInputDigest,
+    responseInputRevision: approval.responseInputRevision,
+    responseInputDigest: approval.responseInputDigest,
+    responseMessageId: approval.responseMessageId,
+    responseAfterPrompt: approval.responseAfterPrompt,
+    proposalRepositoryDigest: approval.repositoryDigest,
+    currentRepositoryDigest,
+    intent,
+    repositoryState,
+  })
+  const semanticEnvelope = (decision: UiApprovalSemanticDecision): string => (
+    `<zerokun_ui_response_decision>${JSON.stringify(decision)}</zerokun_ui_response_decision>`
+  )
 
   test('accepts either the exact ready marker or one exact Before/After envelope', () => {
     expect(parseCodexPreparationDecision(
@@ -120,45 +173,102 @@ describe('Codex UI/UX approval decision contract', () => {
     ].join('\n'), nonce, input)).toThrow('omitted its exact')
   })
 
-  test('only an unconditional same-message answer is classified as explicit approval', () => {
-    expect(isExplicitUiApprovalResponse('はい')).toBe(true)
-    expect(isExplicitUiApprovalResponse('<@U0123456789> この方向で進めてください。')).toBe(true)
-    expect(isExplicitUiApprovalResponse('はい、ただし色は変えて')).toBe(false)
-    expect(isExplicitUiApprovalResponse('これで大丈夫？')).toBe(false)
-    expect(isExplicitUiApprovalResponse('OK', true)).toBe(false)
+  test('natural-language meaning comes from one exactly bound Codex decision envelope', () => {
+    for (const responseText of ['OK実装して', '承認する']) {
+      const approval = context(responseText)
+      const decision = semanticDecision(approval)
+      expect(parseCodexPreparationDecision([
+        semanticEnvelope(decision),
+        `調査済みです\n[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
+      ].join('\n'), nonce, input, {
+        context: approval,
+        currentRepositoryDigest: decision.currentRepositoryDigest,
+      })).toEqual({ kind: 'ready', approvalDecision: decision })
+    }
+
+    const template = buildUiApprovalSemanticDecisionTemplate({
+      attemptNonce: nonce,
+      context: context(),
+      currentRepositoryDigest: 'c'.repeat(64),
+    })
+    expect(template).toContain('"intent":"<approve|revise|question|reject>"')
+    expect(template).toContain('"repositoryState":"<unchanged|compatible|conflict>"')
   })
 
-  test('host gate requires the current explicit response and unchanged repository', () => {
-    const context = {
-      requestId: 'approval-request',
-      requestInputRevision: 1,
-      requestInputDigest: 'a'.repeat(64),
-      responseInputRevision: 2,
-      responseMessageId: '1800000000.000002',
-      responseText: 'はい',
-      explicitApproval: true,
-      repositoryDigest: 'b'.repeat(64),
-    }
+  test('host gate accepts a compatible repository change and rejects stale or conflicting meaning', () => {
+    const approval = context()
+    const decision = semanticDecision(approval)
     expect(() => assertUiApprovalReadyMayProceed({
-      context,
-      currentInputRevision: 2,
-      currentRepositoryDigest: 'b'.repeat(64),
+      context: approval,
+      decision,
+      currentInputRevision: 3,
+      currentInputDigest: input.digest,
+      currentRepositoryDigest: decision.currentRepositoryDigest,
     })).not.toThrow()
     expect(() => assertUiApprovalReadyMayProceed({
-      context: { ...context, explicitApproval: false },
-      currentInputRevision: 2,
-      currentRepositoryDigest: 'b'.repeat(64),
-    })).toThrow('without an explicit')
-    expect(() => assertUiApprovalReadyMayProceed({
-      context,
+      context: approval,
+      decision: semanticDecision(approval, decision.currentRepositoryDigest, 'question'),
       currentInputRevision: 3,
-      currentRepositoryDigest: 'b'.repeat(64),
-    })).toThrow('current-input')
+      currentInputDigest: input.digest,
+      currentRepositoryDigest: decision.currentRepositoryDigest,
+    })).toThrow('without a bound semantic')
     expect(() => assertUiApprovalReadyMayProceed({
-      context,
-      currentInputRevision: 2,
-      currentRepositoryDigest: 'c'.repeat(64),
-    })).toThrow('repository changed')
+      context: approval,
+      decision: semanticDecision(approval, decision.currentRepositoryDigest, 'approve', 'conflict'),
+      currentInputRevision: 3,
+      currentInputDigest: input.digest,
+      currentRepositoryDigest: decision.currentRepositoryDigest,
+    })).toThrow('without a bound semantic')
+    expect(() => assertUiApprovalReadyMayProceed({
+      context: approval,
+      decision,
+      currentInputRevision: 3,
+      currentInputDigest: 'd'.repeat(64),
+      currentRepositoryDigest: decision.currentRepositoryDigest,
+    })).toThrow('current approved Slack input')
+    expect(() => assertUiApprovalReadyMayProceed({
+      context: approval,
+      decision,
+      currentInputRevision: 3,
+      currentInputDigest: input.digest,
+      currentRepositoryDigest: 'd'.repeat(64),
+    })).toThrow('stale')
+  })
+
+  test('repository state must match digests and legacy baselines cannot authorize compatibility', () => {
+    const approval = context()
+    const ready = (decision: UiApprovalSemanticDecision): string => [
+      semanticEnvelope(decision),
+      `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
+    ].join('\n')
+    expect(() => parseCodexPreparationDecision(
+      ready(semanticDecision(approval, 'c'.repeat(64), 'approve', 'unchanged')),
+      nonce,
+      input,
+      { context: approval, currentRepositoryDigest: 'c'.repeat(64) },
+    )).toThrow('repository decision')
+    expect(() => parseCodexPreparationDecision(
+      ready(semanticDecision(approval, approval.repositoryDigest, 'approve', 'compatible')),
+      nonce,
+      input,
+      { context: approval, currentRepositoryDigest: approval.repositoryDigest },
+    )).toThrow('repository decision')
+
+    const legacy = context('承認する', null)
+    const legacyDecision = semanticDecision(legacy)
+    expect(() => parseCodexPreparationDecision(
+      ready(legacyDecision),
+      nonce,
+      input,
+      { context: legacy, currentRepositoryDigest: legacyDecision.currentRepositoryDigest },
+    )).toThrow('repository decision')
+    expect(() => assertUiApprovalReadyMayProceed({
+      context: legacy,
+      decision: legacyDecision,
+      currentInputRevision: input.revision,
+      currentInputDigest: input.digest,
+      currentRepositoryDigest: legacyDecision.currentRepositoryDigest,
+    })).toThrow('unverifiable')
   })
 })
 

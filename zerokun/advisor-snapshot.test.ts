@@ -13,8 +13,11 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   advisorRepositoryDigest,
+  parseAdvisorRepositorySnapshot,
   resolveAdvisorProjectLayout,
+  serializeAdvisorRepositorySnapshot,
   snapshotAdvisorRepository,
+  summarizeAdvisorRepositoryChanges,
 } from './advisor-snapshot.ts'
 
 const temporaryDirs: string[] = []
@@ -131,6 +134,53 @@ describe('advisor repository snapshot', () => {
     writeFileSync(instructions, 'after\n', { mode: 0o600 })
     const after = snapshotAdvisorRepository(layout)
     expect(advisorRepositoryDigest(after)).not.toBe(advisorRepositoryDigest(before))
+  })
+
+  test('承認時snapshotを厳格に往復し、承認後の変更箇所だけをbounded要約する', () => {
+    const project = fixtureDir()
+    for (const name of ['backend', 'frontend']) {
+      const member = join(project, name)
+      mkdirSync(member)
+      git(member, ['init', '-q'])
+      git(member, ['config', 'user.name', 'Zero Test'])
+      git(member, ['config', 'user.email', 'zero@example.invalid'])
+      writeFileSync(join(member, 'tracked.txt'), 'before\n')
+      git(member, ['add', '.'])
+      git(member, ['commit', '-qm', 'initial'])
+    }
+    const repository = join(project, 'frontend')
+    writeFileSync(join(project, 'AGENTS.md'), 'before\n', { mode: 0o600 })
+
+    const layout = resolveAdvisorProjectLayout(project)
+    const baseline = snapshotAdvisorRepository(layout)
+    const restored = parseAdvisorRepositorySnapshot(
+      serializeAdvisorRepositorySnapshot(baseline),
+    )
+    expect(advisorRepositoryDigest(restored)).toBe(advisorRepositoryDigest(baseline))
+
+    writeFileSync(join(repository, 'tracked.txt'), 'after\n')
+    writeFileSync(join(project, 'AGENTS.md'), 'after\n', { mode: 0o600 })
+    const current = snapshotAdvisorRepository(layout)
+    expect(summarizeAdvisorRepositoryChanges(restored, current)).toMatchObject({
+      baselineAvailable: true,
+      changed: true,
+      layoutChanged: false,
+      repositories: [{
+        repository: 'frontend',
+        kind: 'changed',
+        statusChanged: true,
+        changedPaths: ['tracked.txt'],
+        omittedChangedPaths: 0,
+      }],
+      rootInstructionPaths: ['AGENTS.md'],
+      omittedRootInstructionPaths: 0,
+    })
+    expect(summarizeAdvisorRepositoryChanges(null, current)).toMatchObject({
+      baselineAvailable: false,
+      changed: true,
+      baselineDigest: null,
+      repositories: [],
+    })
   })
 
   test('member外aliasを持つdirty hardlinkを拒否し、同一member内の全aliasはmetadata監査する', () => {

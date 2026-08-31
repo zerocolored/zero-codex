@@ -109,11 +109,16 @@ import {
 import { isSlackInterruptCommand } from './live-control.ts'
 import {
   CodexUiApprovalRequiredError,
-  isExplicitUiApprovalResponse,
   reencodeUiApprovalImages,
   type UiApprovalResumeContext,
 } from './ui-approval.ts'
-import { resolveAdvisorProjectLayout } from './advisor-snapshot.ts'
+import {
+  advisorRepositoryDigest,
+  parseAdvisorRepositorySnapshot,
+  resolveAdvisorProjectLayout,
+  serializeAdvisorRepositorySnapshot,
+  type AdvisorRepositorySnapshot,
+} from './advisor-snapshot.ts'
 import { acknowledgeServiceControlPauseIfRequested } from './service-control-state.ts'
 import {
   assertDurableThreadHistorySnapshot,
@@ -534,6 +539,7 @@ type UiApprovalRequestRow = {
   input_revision: number
   input_digest: string
   repository_digest: string
+  repository_snapshot_json: string | null
   session_id: string
   proposal_text: string
   before_path: string
@@ -543,6 +549,7 @@ type UiApprovalRequestRow = {
   response_user_id: string | null
   response_text: string | null
   response_input_revision: number | null
+  response_input_digest: string | null
   response_explicit_approval: number | null
   prompt_client_message_id: string
   prompt_delivery_started_at: number | null
@@ -832,6 +839,7 @@ CREATE TABLE IF NOT EXISTS ui_approval_requests (
   input_revision INTEGER NOT NULL CHECK (input_revision > 0),
   input_digest TEXT NOT NULL,
   repository_digest TEXT NOT NULL,
+  repository_snapshot_json TEXT,
   session_id TEXT NOT NULL,
   proposal_text TEXT NOT NULL,
   before_path TEXT NOT NULL,
@@ -841,6 +849,7 @@ CREATE TABLE IF NOT EXISTS ui_approval_requests (
   response_user_id TEXT,
   response_text TEXT,
   response_input_revision INTEGER,
+  response_input_digest TEXT,
   response_explicit_approval INTEGER CHECK (response_explicit_approval IS NULL OR response_explicit_approval IN (0, 1)),
   prompt_client_message_id TEXT NOT NULL,
   prompt_delivery_started_at INTEGER,
@@ -1594,6 +1603,8 @@ function ensureJobSchemaMigrations(db: Database): void {
     ['prompt_client_message_id', "TEXT NOT NULL DEFAULT ''"],
     ['prompt_delivery_started_at', 'INTEGER'],
     ['prompt_message_id', 'TEXT'],
+    ['repository_snapshot_json', 'TEXT'],
+    ['response_input_digest', 'TEXT'],
   ] as const) {
     const current = db.query<{ name: string }, []>(
       'PRAGMA table_info(ui_approval_requests)',
@@ -1617,9 +1628,34 @@ function ensureJobSchemaMigrations(db: Database): void {
       [slackClientMessageId(`ui-approval:${row.id}`, 0), row.id],
     )
   }
+  const controlColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_controls)').all()
+  for (const [name, definition] of [
+    ['input_revision', 'INTEGER NOT NULL DEFAULT 1'],
+    ['input_digest', "TEXT NOT NULL DEFAULT ''"],
+    ['write_enabled', 'INTEGER NOT NULL DEFAULT 0 CHECK (write_enabled IN (0, 1))'],
+  ] as const) {
+    if (controlColumns.some(column => column.name === name)) continue
+    try {
+      db.exec(`ALTER TABLE job_controls ADD COLUMN ${name} ${definition}`)
+    } catch (error) {
+      const migrated = db.query<{ name: string }, []>('PRAGMA table_info(job_controls)').all()
+      if (!migrated.some(column => column.name === name)) throw error
+    }
+  }
+  db.run(
+    `UPDATE ui_approval_requests
+     SET response_input_digest = (
+       SELECT controls.input_digest FROM job_controls AS controls
+       WHERE controls.job_id = ui_approval_requests.job_id
+         AND controls.input_revision = ui_approval_requests.response_input_revision
+         AND controls.kind = 'steer' AND controls.input_digest <> ''
+       ORDER BY controls.seq DESC LIMIT 1
+     )
+     WHERE response_input_digest IS NULL AND response_input_revision IS NOT NULL`,
+  )
   // Older versions persisted only a local delivery timestamp. Re-enter the
   // publish reconciliation path so the stable client_msg_id can be located in
-  // Slack before any response is treated as explicit approval.
+  // Slack before any response is treated as occurring after the proposal.
   db.run(
     `UPDATE ui_approval_requests
      SET status = 'publishing', prompt_delivered_at = NULL,
@@ -1668,20 +1704,6 @@ function ensureJobSchemaMigrations(db: Database): void {
         'PRAGMA table_info(job_initial_dispatches)',
       ).all()
       if (!migrated.some(column => column.name === 'input_digest')) throw error
-    }
-  }
-  const controlColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_controls)').all()
-  for (const [name, definition] of [
-    ['input_revision', 'INTEGER NOT NULL DEFAULT 1'],
-    ['input_digest', "TEXT NOT NULL DEFAULT ''"],
-    ['write_enabled', 'INTEGER NOT NULL DEFAULT 0 CHECK (write_enabled IN (0, 1))'],
-  ] as const) {
-    if (controlColumns.some(column => column.name === name)) continue
-    try {
-      db.exec(`ALTER TABLE job_controls ADD COLUMN ${name} ${definition}`)
-    } catch (error) {
-      const migrated = db.query<{ name: string }, []>('PRAGMA table_info(job_controls)').all()
-      if (!migrated.some(column => column.name === name)) throw error
     }
   }
   const inboundColumns = db.query<{ name: string }, []>(
@@ -2129,6 +2151,13 @@ function mapRow(row: JobRow): JobRecord {
 }
 
 function mapUiApprovalRequest(row: UiApprovalRequestRow): UiApprovalRequestRecord {
+  const repositorySnapshot = row.repository_snapshot_json === null
+    ? null
+    : parseAdvisorRepositorySnapshot(row.repository_snapshot_json)
+  if (repositorySnapshot
+    && advisorRepositoryDigest(repositorySnapshot) !== row.repository_digest) {
+    throw new Error(`UI/UX approval repository snapshot digest changed: ${row.id}`)
+  }
   return {
     id: row.id,
     jobId: row.job_id,
@@ -2136,6 +2165,7 @@ function mapUiApprovalRequest(row: UiApprovalRequestRow): UiApprovalRequestRecor
     inputRevision: row.input_revision,
     inputDigest: row.input_digest,
     repositoryDigest: row.repository_digest,
+    repositorySnapshot,
     sessionId: row.session_id,
     proposalText: row.proposal_text,
     beforePath: row.before_path,
@@ -2145,9 +2175,7 @@ function mapUiApprovalRequest(row: UiApprovalRequestRow): UiApprovalRequestRecor
     responseUserId: row.response_user_id,
     responseText: row.response_text,
     responseInputRevision: row.response_input_revision,
-    responseExplicitApproval: row.response_explicit_approval === null
-      ? null
-      : row.response_explicit_approval === 1,
+    responseInputDigest: row.response_input_digest,
     promptClientMessageId: row.prompt_client_message_id,
     promptDeliveryStartedAt: row.prompt_delivery_started_at,
     promptMessageId: row.prompt_message_id,
@@ -4225,10 +4253,7 @@ export class JobStore {
           if (!prompt) {
             throw new Error('UI/UX approval request disappeared before its response was staged')
           }
-          const explicitApproval = isExplicitUiApprovalResponse(
-            task,
-            attachments.length > 0,
-          ) && prompt.prompt_message_id !== null
+          const responseAfterPrompt = prompt.prompt_message_id !== null
             && slackMessageIsAfter(messageId, prompt.prompt_message_id)
           // While the prompt is still being published, more than one Slack
           // reply can be durably drained before the remote prompt receipt is
@@ -4237,15 +4262,14 @@ export class JobStore {
           const responded = this.db.run(
             `UPDATE ui_approval_requests
              SET response_message_id = ?, response_user_id = ?, response_text = ?,
-                 response_input_revision = ?,
-                 response_explicit_approval = CASE
-                   WHEN prompt_message_id IS NULL THEN 0 ELSE ?
-                 END,
+                 response_input_revision = ?, response_input_digest = ?,
+                 response_explicit_approval = ?,
                  responded_at = ?,
                  status = CASE WHEN prompt_message_id IS NULL THEN 'publishing' ELSE 'responded' END
              WHERE id = ? AND job_id = ? AND status IN ('publishing', 'awaiting')`,
             [
-              messageId, userId, task, snapshot.revision, explicitApproval ? 1 : 0, now,
+              messageId, userId, task, snapshot.revision, snapshot.digest,
+              responseAfterPrompt ? 1 : 0, now,
               target.ui_approval_request_id, jobId,
             ],
           )
@@ -4785,6 +4809,33 @@ export class JobStore {
        WHERE receipts.job_id = ? AND receipts.stage = 'implementation'
          AND receipts.status IN ('dispatching', 'acknowledged', 'observed', 'ambiguous')`,
     ).get(jobId) !== null)
+  }
+
+  writeTransientFailureCanRetry(
+    jobIdInput: string,
+    attemptInput: number,
+    stage?: 'complete' | 'prepare' | 'implementation' | 'review' | 'interjection',
+    phaseSequence?: number,
+  ): boolean {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const attempt = Math.floor(attemptInput)
+    const delivered = retrySqlite(() => this.db.query<{
+      attempt: number
+      phase_sequence: number
+      status: string
+    }, [string]>(
+      `SELECT attempt, phase_sequence, status
+       FROM job_phase_dispatches
+       WHERE job_id = ? AND stage = 'implementation'
+         AND status IN ('dispatching', 'acknowledged', 'observed', 'ambiguous')
+       ORDER BY attempt ASC, phase_sequence ASC`,
+    ).all(jobId))
+    if (delivered.length === 0) return true
+    if (stage !== 'implementation' || !Number.isSafeInteger(phaseSequence)) return false
+    return delivered.length === 1
+      && delivered[0]!.attempt === attempt
+      && delivered[0]!.phase_sequence === phaseSequence
+      && delivered[0]!.status === 'observed'
   }
 
   prepareAppServerPhaseDispatch(options: {
@@ -5598,15 +5649,46 @@ export class JobStore {
           options.threadId, options.turnId,
         ],
       )
-      this.db.run(
-        `UPDATE job_interjections SET status = 'paused', paused_at = ?
-         WHERE job_id = ? AND control_epoch = ? AND status = 'pausing'
-           AND pause_executor_nonce = ? AND pause_thread_id = ? AND pause_turn_id = ?`,
-        [
-          now, options.jobId, Math.floor(options.epoch), options.executorNonce,
-          options.threadId, options.turnId,
-        ],
-      )
+      if (options.rateLimitResumeAt === undefined) {
+        this.db.run(
+          `UPDATE job_interjections SET status = 'paused', paused_at = ?
+           WHERE job_id = ? AND control_epoch = ? AND status = 'pausing'
+             AND pause_executor_nonce = ? AND pause_thread_id = ? AND pause_turn_id = ?`,
+          [
+            now, options.jobId, Math.floor(options.epoch), options.executorNonce,
+            options.threadId, options.turnId,
+          ],
+        )
+      } else {
+        this.db.run(
+          `UPDATE job_interjections
+           SET status = 'ready', pause_request_id = NULL,
+               pause_executor_nonce = NULL, pause_thread_id = NULL, pause_turn_id = NULL,
+               pause_dispatched_at = NULL, pause_acknowledged_at = NULL,
+               last_error = 'pause turn reached a rate-limit terminal and may retry'
+           WHERE job_id = ? AND control_epoch = ? AND status = 'pausing'
+             AND pause_executor_nonce = ? AND pause_thread_id = ? AND pause_turn_id = ?`,
+          [
+            options.jobId, Math.floor(options.epoch), options.executorNonce,
+            options.threadId, options.turnId,
+          ],
+        )
+        this.db.run(
+          `UPDATE job_interjections
+           SET status = CASE WHEN paused_at IS NULL THEN 'ready' ELSE 'paused' END,
+               answer_request_id = NULL, answer_logical_nonce = NULL,
+               answer_thread_id = NULL, answer_turn_id = NULL,
+               answer_prepared_at = NULL, answer_dispatched_at = NULL,
+               answer_acknowledged_at = NULL,
+               last_error = 'answer turn reached a rate-limit terminal and may retry'
+           WHERE job_id = ? AND control_epoch = ? AND status = 'answering'
+             AND answer_logical_nonce = ? AND answer_thread_id = ? AND answer_turn_id = ?`,
+          [
+            options.jobId, Math.floor(options.epoch), options.executorNonce,
+            options.threadId, options.turnId,
+          ],
+        )
+      }
       const pendingControls = this.db.query<{ count: number }, [string, number]>(
         `SELECT COUNT(*) AS count FROM job_controls
          WHERE job_id = ? AND control_epoch = ? AND status = 'ready'`,
@@ -5743,13 +5825,11 @@ export class JobStore {
     const recordRateLimit = this.db.transaction(() => {
       const recordedAt = Date.now()
       const job = this.db.query<{
-        attempts: number
         executor_nonce: string | null
         active_thread_id: string | null
         active_turn_id: string | null
-        cancel_requested_at: number | null
       }, [string, number]>(
-        `SELECT attempts, executor_nonce, active_thread_id, active_turn_id, cancel_requested_at
+        `SELECT executor_nonce, active_thread_id, active_turn_id
          FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
            AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.epoch))
@@ -5758,68 +5838,12 @@ export class JobStore {
         throw new Error(`App Server rate-limit binding changed for ${options.jobId}`)
       }
       this.recordCodexSessionUse(options.threadId, options.jobId, recordedAt)
-      const receipt = this.db.query<{ status: string; turn_id: string | null }, [string, number]>(
-        `SELECT status, turn_id FROM job_initial_dispatches
-         WHERE job_id = ? AND attempt = ?`,
-      ).get(options.jobId, job.attempts)
-      if (!receipt) throw new Error(`initial App Server receipt is missing for ${options.jobId}`)
-      if (receipt.turn_id === options.turnId && receipt.status === 'acknowledged') {
-        const observed = this.db.run(
-          `UPDATE job_initial_dispatches SET status = 'observed', observed_at = ?
-           WHERE job_id = ? AND attempt = ? AND status = 'acknowledged'
-             AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?`,
-          [
-            Date.now(), options.jobId, job.attempts, options.executorNonce,
-            options.threadId, options.turnId,
-          ],
-        )
-        if (observed.changes !== 1) {
-          throw new Error(`initial App Server rate-limit receipt changed for ${options.jobId}`)
-        }
-      } else if (receipt.status !== 'observed') {
-        throw new Error(`initial App Server rate-limit receipt is unsafe for ${options.jobId}`)
-      }
-      this.db.run(
-        `UPDATE job_controls SET status = 'observed', observed_at = ?
-         WHERE job_id = ? AND control_epoch = ? AND status = 'acknowledged'
-           AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?`,
-        [
-          Date.now(), options.jobId, Math.floor(options.epoch), options.executorNonce,
-          options.threadId, options.turnId,
-        ],
-      )
-      this.db.run(
-        `UPDATE job_interjections
-         SET status = 'ready', pause_request_id = NULL,
-             pause_executor_nonce = NULL, pause_thread_id = NULL, pause_turn_id = NULL,
-             pause_dispatched_at = NULL, pause_acknowledged_at = NULL,
-             last_error = 'pause turn reached an authoritative rate-limit terminal and may retry'
-         WHERE job_id = ? AND control_epoch = ? AND status = 'pausing'
-           AND pause_executor_nonce = ? AND pause_thread_id = ? AND pause_turn_id = ?`,
-        [
-          options.jobId, Math.floor(options.epoch), options.executorNonce,
-          options.threadId, options.turnId,
-        ],
-      )
-      this.db.run(
-        `UPDATE job_interjections
-         SET status = CASE WHEN paused_at IS NULL THEN 'ready' ELSE 'paused' END,
-             answer_request_id = NULL, answer_logical_nonce = NULL,
-             answer_thread_id = NULL, answer_turn_id = NULL,
-             answer_prepared_at = NULL, answer_dispatched_at = NULL,
-             answer_acknowledged_at = NULL,
-             last_error = 'answer turn reached an authoritative rate-limit terminal and may retry'
-         WHERE job_id = ? AND control_epoch = ? AND status = 'answering'
-           AND answer_logical_nonce = ? AND answer_thread_id = ? AND answer_turn_id = ?`,
-        [
-          options.jobId, Math.floor(options.epoch), options.executorNonce,
-          options.threadId, options.turnId,
-        ],
-      )
+      // `error` is a turn-scoped progress notification, not the terminal.
+      // Persist only its retry hint for crash recovery. Delivery receipts and
+      // the active turn remain bound until authoritative `turn/completed`.
       const updated = this.db.run(
         `UPDATE jobs SET not_before = ?, session_id = ?,
-           accepts_control = CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END,
-           active_turn_id = NULL
+           accepts_control = CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END
          WHERE id = ? AND runtime = 'codex' AND status = 'running'
            AND control_epoch = ?`,
         [options.resumeAt, options.threadId, options.jobId, Math.floor(options.epoch)],
@@ -8224,9 +8248,10 @@ export class JobStore {
   uiApprovalRequest(idInput: string): UiApprovalRequestRecord | null {
     const row = this.db.query<UiApprovalRequestRow, [string]>(
       `SELECT id, job_id, round, input_revision, input_digest, repository_digest,
+              repository_snapshot_json,
               session_id, proposal_text, before_path, after_path, status,
               response_message_id, response_user_id, response_text,
-              response_input_revision, response_explicit_approval,
+              response_input_revision, response_input_digest, response_explicit_approval,
               prompt_client_message_id, prompt_delivery_started_at, prompt_message_id,
               prompt_delivered_at, attempts, not_before
        FROM ui_approval_requests WHERE id = ?`,
@@ -8238,30 +8263,38 @@ export class JobStore {
     const jobId = requireText(jobIdInput, 'jobId')
     const row = this.db.query<UiApprovalRequestRow, [string]>(
       `SELECT id, job_id, round, input_revision, input_digest, repository_digest,
+              repository_snapshot_json,
               session_id, proposal_text, before_path, after_path, status,
               response_message_id, response_user_id, response_text,
-              response_input_revision, response_explicit_approval,
+              response_input_revision, response_input_digest, response_explicit_approval,
               prompt_client_message_id, prompt_delivery_started_at, prompt_message_id,
               prompt_delivered_at, attempts, not_before
        FROM ui_approval_requests
        WHERE job_id = ? AND status = 'responded'
          AND response_message_id IS NOT NULL AND response_text IS NOT NULL
-         AND response_input_revision IS NOT NULL AND response_explicit_approval IS NOT NULL
+         AND response_input_revision IS NOT NULL AND response_input_digest IS NOT NULL
        ORDER BY round DESC LIMIT 1`,
     ).get(jobId)
     if (!row || row.response_message_id === null || row.response_text === null
-      || row.response_input_revision === null || row.response_explicit_approval === null) {
+      || row.response_input_revision === null || row.response_input_digest === null) {
       return undefined
     }
+    const mapped = mapUiApprovalRequest(row)
     return {
       requestId: row.id,
       requestInputRevision: row.input_revision,
       requestInputDigest: row.input_digest,
       responseInputRevision: row.response_input_revision,
+      responseInputDigest: row.response_input_digest,
       responseMessageId: row.response_message_id,
       responseText: row.response_text,
-      explicitApproval: row.response_explicit_approval === 1,
+      // This legacy-named column is now only the host chronology latch.  The
+      // model owns natural-language intent; no regex/boolean here means
+      // approval. A reply observed before remote prompt delivery stays false.
+      responseAfterPrompt: row.response_explicit_approval === 1,
       repositoryDigest: row.repository_digest,
+      repositorySnapshot: mapped.repositorySnapshot,
+      proposalText: row.proposal_text,
     }
   }
 
@@ -8271,6 +8304,7 @@ export class JobStore {
     inputRevision: number
     inputDigest: string
     repositoryDigest: string
+    repositorySnapshot: AdvisorRepositorySnapshot
     proposalText: string
     beforePath: string
     afterPath: string
@@ -8285,6 +8319,10 @@ export class JobStore {
       || !isAbsolute(input.beforePath) || !isAbsolute(input.afterPath)
       || input.beforePath === input.afterPath) {
       throw new Error('UI approval request binding is invalid')
+    }
+    const repositorySnapshotJson = serializeAdvisorRepositorySnapshot(input.repositorySnapshot)
+    if (advisorRepositoryDigest(input.repositorySnapshot) !== input.repositoryDigest) {
+      throw new Error('UI approval repository snapshot does not match its digest')
     }
     const park = this.db.transaction(() => {
       const job = this.db.query<{
@@ -8337,12 +8375,13 @@ export class JobStore {
       this.db.run(
         `INSERT INTO ui_approval_requests (
            id, job_id, round, input_revision, input_digest, repository_digest,
+           repository_snapshot_json,
            session_id, proposal_text, before_path, after_path, status,
            prompt_client_message_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publishing', ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publishing', ?, ?)`,
         [
           requestId, jobId, round, input.inputRevision, input.inputDigest,
-          input.repositoryDigest, sessionId, proposalText,
+          input.repositoryDigest, repositorySnapshotJson, sessionId, proposalText,
           input.beforePath, input.afterPath,
           slackClientMessageId(`ui-approval:${requestId}`, 0), now,
         ],
@@ -8376,9 +8415,10 @@ export class JobStore {
   pendingUiApprovalNotifications(now = Date.now(), limit = 20): UiApprovalNotification[] {
     const rows = this.db.query<UiApprovalRequestRow, [number, number]>(
       `SELECT id, job_id, round, input_revision, input_digest, repository_digest,
+              repository_snapshot_json,
               session_id, proposal_text, before_path, after_path, status,
               response_message_id, response_user_id, response_text,
-              response_input_revision, response_explicit_approval,
+              response_input_revision, response_input_digest, response_explicit_approval,
               prompt_client_message_id, prompt_delivery_started_at, prompt_message_id,
               prompt_delivered_at, attempts, not_before
        FROM ui_approval_requests
@@ -8869,7 +8909,13 @@ export class JobStore {
     return retrySqlite(() => release.immediate())
   }
 
-  requeueAt(id: string, notBefore: number, reason: string, sessionId?: string): void {
+  requeueAt(
+    id: string,
+    notBefore: number,
+    reason: string,
+    sessionId?: string,
+    transientReason: 'rate-limit' | 'capacity' = 'rate-limit',
+  ): void {
     const persistedSessionId = sessionId === undefined
       ? undefined
       : requireText(sessionId, 'sessionId')
@@ -8889,7 +8935,9 @@ export class JobStore {
            AND EXISTS (
              SELECT 1 FROM job_initial_dispatches receipts
              WHERE receipts.job_id = jobs.id AND receipts.attempt = jobs.attempts
-               AND receipts.status IN ('prepared', 'rejected', 'observed')
+               AND (receipts.status IN ('prepared', 'rejected', 'observed')
+                 OR (jobs.write_enabled = 0 AND jobs.not_before IS NOT NULL
+                   AND receipts.status = 'acknowledged'))
            )`,
         [persistedSessionId ?? null, notBefore, reason, id],
       )
@@ -8909,7 +8957,7 @@ export class JobStore {
           chatId: job.chat_id,
           threadTs: job.thread_ts,
           kind: 'rate-limited',
-          payload: slackRateLimitMessage(notBefore),
+          payload: slackRateLimitMessage(notBefore, transientReason),
           createdAt: Date.now(),
         })
       }
@@ -9062,6 +9110,7 @@ export interface UiApprovalRequestRecord {
   inputRevision: number
   inputDigest: string
   repositoryDigest: string
+  repositorySnapshot: AdvisorRepositorySnapshot | null
   sessionId: string
   proposalText: string
   beforePath: string
@@ -9071,7 +9120,7 @@ export interface UiApprovalRequestRecord {
   responseUserId: string | null
   responseText: string | null
   responseInputRevision: number | null
-  responseExplicitApproval: boolean | null
+  responseInputDigest: string | null
   promptClientMessageId: string
   promptDeliveryStartedAt: number | null
   promptMessageId: string | null
@@ -10116,8 +10165,18 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       const rateLimitSafeBeforeInitialDelivery = error instanceof CodexRateLimitError
         && options.store.initialTurnDispatchIsSafeToRetry(job.id)
         && !options.store.controlMayHaveBeenDelivered(job.id)
+      const transientFailureSafeAfterDelivery = error instanceof CodexRateLimitError
+        && error.safeToRetryAfterDelivery
+        && (!job.writeEnabled || options.store.writeTransientFailureCanRetry(
+          job.id,
+          job.attempts,
+          error.stage,
+          error.phaseSequence,
+        ))
+      const rateLimitSafeToRetry = rateLimitSafeBeforeInitialDelivery
+        || transientFailureSafeAfterDelivery
       if (error instanceof CodexRateLimitError && job.writeEnabled
-        && !rateLimitSafeBeforeInitialDelivery) {
+        && !rateLimitSafeToRetry) {
         const uncertain = 'write-enabled job hit a rate limit after execution began; '
           + 'its external effects are uncertain. Review the repository and external services, '
           + 'then resend only if needed.'
@@ -10134,6 +10193,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         continue
       }
       if (error instanceof CodexRateLimitError && options.advisorStateDir
+        && !rateLimitSafeToRetry
         && advisorAttemptMayHaveBeenDelivered(options.advisorStateDir, job.id)) {
         const uncertain = 'read-only job hit a rate limit after an advisor request may have been '
           + 'delivered; it will not be resent automatically. Send a new request if needed.'
@@ -10153,10 +10213,18 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         const resumeAt = codexRateLimitResumeAt(error.resetsAtMs)
         await updateMonitor(
           job,
-          `利用上限のため ${new Date(resumeAt).toISOString()} まで待機します`,
+          error.reason === 'capacity'
+            ? `モデルが一時的に混雑しています。${new Date(resumeAt).toISOString()} 以降に同じセッションで再開します`
+            : `利用上限のため ${new Date(resumeAt).toISOString()} まで待機します`,
         )
         await quiesceLifecycleBeforeStateChange()
-        options.store.requeueAt(job.id, resumeAt, message, error.sessionId)
+        options.store.requeueAt(
+          job.id,
+          resumeAt,
+          message,
+          error.sessionId,
+          error.reason,
+        )
         log(`${workerId} deferred ${job.id} until ${new Date(resumeAt).toISOString()}: ${message}`)
         scheduleNotificationFlush()
         continue
@@ -11552,6 +11620,7 @@ export function prepareUiApprovalForParking(
   inputRevision: number
   inputDigest: string
   repositoryDigest: string
+  repositorySnapshot: AdvisorRepositorySnapshot
   proposalText: string
   beforePath: string
   afterPath: string
@@ -11590,6 +11659,7 @@ export function prepareUiApprovalForParking(
     inputRevision: error.approval.inputRevision,
     inputDigest: error.approval.inputDigest,
     repositoryDigest: error.approval.repositoryDigest,
+    repositorySnapshot: error.approval.repositorySnapshot,
     proposalText,
     beforePath: paths[0]!,
     afterPath: paths[1]!,
@@ -11662,21 +11732,33 @@ export async function reconcileEphemeralAndRetiredAdvisorRounds(options: {
     runtime: options.runtime,
     log: options.log,
     onReconciledRound: outcome => {
-      const input = readAdvisorInputSnapshot(
-        options.stateDir, outcome.jobId, outcome.inputRevision,
-      )
-      if (!input.digest.startsWith(outcome.inputDigestPrefix)) {
-        throw new Error('reconciled Claude round input digest changed')
+      try {
+        const input = readAdvisorInputSnapshot(
+          options.stateDir, outcome.jobId, outcome.inputRevision,
+        )
+        if (!input.digest.startsWith(outcome.inputDigestPrefix)) {
+          throw new Error('reconciled Claude round input digest changed')
+        }
+        persistAdvisorClaudeCleanupOutcome(options.stateDir, {
+          ...outcome,
+          inputDigest: input.digest,
+        })
+      } catch (error) {
+        options.log?.(`advisor history warning; primary queue remains available: ${
+          error instanceof Error ? error.name : 'unknown'
+        }`)
       }
-      persistAdvisorClaudeCleanupOutcome(options.stateDir, {
-        ...outcome,
-        inputDigest: input.digest,
-      })
     },
   })
-  const result = finalizeRetiredAdvisorRounds(options.stateDir)
-  if (result.finalized > 0) {
-    options.log?.(`finalized ${result.finalized} interrupted advisor round(s)`)
+  try {
+    const result = finalizeRetiredAdvisorRounds(options.stateDir)
+    if (result.finalized > 0) {
+      options.log?.(`finalized ${result.finalized} interrupted advisor round(s)`)
+    }
+  } catch (error) {
+    options.log?.(`advisor retirement history warning; queue startup continues: ${
+      error instanceof Error ? error.name : 'unknown'
+    }`)
   }
 }
 
@@ -11805,13 +11887,18 @@ export function slackMessageIsAfter(candidate: string, boundary: string): boolea
     && candidateOrdinal > boundaryOrdinal
 }
 
-export function slackRateLimitMessage(resumeAt: number): string {
+export function slackRateLimitMessage(
+  resumeAt: number,
+  reason: 'rate-limit' | 'capacity' = 'rate-limit',
+): string {
   const time = new Intl.DateTimeFormat('ja-JP', {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
   }).format(new Date(resumeAt))
-  return `⏸ 使用量上限のため、一時停止しています。${time} に自動再開します。`
+  return reason === 'capacity'
+    ? `⏸ 利用中のモデルが混雑しているため、一時停止しています。${time} に自動再開します。`
+    : `⏸ 使用量上限のため、一時停止しています。${time} に自動再開します。`
 }
 
 export function slackArtifactsAbandonedMessage(): string {

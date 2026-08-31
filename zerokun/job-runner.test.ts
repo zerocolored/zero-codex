@@ -69,6 +69,7 @@ import {
   CodexCleanupPendingError,
   CodexInterruptedError,
   CodexRepositoryChangedBeforeImplementationError,
+  CodexRepositoryChangedBeforePublicationError,
   CodexUserCancelledError,
   codexAttemptDisposition,
   codexRateLimitResumeAt,
@@ -123,6 +124,7 @@ import {
   advisorRepositoryDigest,
   resolveAdvisorProjectLayout,
   snapshotAdvisorRepository,
+  type AdvisorRepositorySnapshot,
 } from './advisor-snapshot.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { CodexAppServerSession } from './codex-app-server-session.ts'
@@ -174,6 +176,24 @@ function input(overrides: Partial<EnqueueInput> = {}): EnqueueInput {
     task: '調べてください',
     writeEnabled: false,
     ...overrides,
+  }
+}
+
+function uiApprovalRepositorySnapshot(
+  projectPath = '/tmp/project',
+  identity = 'fixture',
+): AdvisorRepositorySnapshot {
+  return {
+    version: 2,
+    projectPath,
+    kind: 'non-git',
+    gitRoot: null,
+    gitRoots: [],
+    head: null,
+    status: '',
+    dirty: {},
+    repositories: [],
+    rootInstructions: { 'AGENTS.md': identity },
   }
 }
 
@@ -429,12 +449,14 @@ describe('Codex job store', () => {
     const parkedStore = makeStore()
     const parked = completedPreparePhase(parkedStore, 'accepted-parked-root')
     const parkedSnapshot = readAdvisorInputSnapshot(dirname(parkedStore.dbPath), parked.id)
+    const repositorySnapshot = uiApprovalRepositorySnapshot(parked.repoPath, 'accepted-parked')
     parkedStore.parkForUiApproval({
       jobId: parked.id,
       sessionId: parked.sessionId!,
       inputRevision: parkedSnapshot.revision,
       inputDigest: parkedSnapshot.digest,
-      repositoryDigest: 'a'.repeat(64),
+      repositoryDigest: advisorRepositoryDigest(repositorySnapshot),
+      repositorySnapshot,
       proposalText: 'fixture proposal',
       beforePath: '/private/sealed/Before.png',
       afterPath: '/private/sealed/After.png',
@@ -4314,7 +4336,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('advisor journal作成後のread rate limitは自動再送せずfailedにする', async () => {
+  test('primary未送達ならadvisor journal後のread rate limitも再キューする', async () => {
     const dir = fixtureDir()
     const state = join(dir, 'state')
     mkdirSync(state, { mode: 0o700 })
@@ -4339,9 +4361,11 @@ describe('single FIFO worker', () => {
         throw new CodexRateLimitError('rate limited after advisor delivery', Date.now() + 60_000)
       },
     })
-    expect(stats).toEqual({ completed: 0, failed: 1, workersStarted: 1 })
-    expect(store.get(queued.id)).toMatchObject({ status: 'failed' })
-    expect(store.get(queued.id)?.lastError).toContain('will not be resent automatically')
+    expect(stats).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+    expect(store.get(queued.id)).toMatchObject({
+      status: 'queued', terminalOutcome: null, notBefore: expect.any(Number),
+    })
+    expect(store.terminalNotificationCount()).toBe(0)
     store.close()
   })
 
@@ -4387,6 +4411,181 @@ describe('single FIFO worker', () => {
       writeEnabled: true,
     })
     expect(store.terminalNotificationCount()).toBe(1)
+    expect(store.claimNext('serial-worker')).toBeNull()
+    store.close()
+  })
+
+  test('副作用のないmodel capacity失敗はwrite jobでも同じsessionへ再キューする', async () => {
+    const store = makeStore()
+    const queued = store.enqueue(input({ writeEnabled: true })).job
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async job => {
+        const boundInput = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+        const nonce = 'e'.repeat(32)
+        expect(store.beginInitialTurnDispatch({
+          jobId: job.id,
+          attempt: job.attempts,
+          epoch: job.controlEpoch,
+          executorNonce: nonce,
+          threadId: 'thread-capacity-safe',
+          requestId: 42,
+          inputRevision: boundInput.revision,
+          inputDigest: boundInput.digest,
+        })).toBe('dispatching')
+        store.acknowledgeInitialTurnDispatch({
+          jobId: job.id,
+          workerId: job.workerId!,
+          attempt: job.attempts,
+          epoch: job.controlEpoch,
+          executorNonce: nonce,
+          threadId: 'thread-capacity-safe',
+          turnId: 'turn-capacity-safe',
+          requestId: 42,
+        })
+        store.finishAppServerTurn({
+          jobId: job.id,
+          epoch: job.controlEpoch,
+          executorNonce: nonce,
+          threadId: 'thread-capacity-safe',
+          turnId: 'turn-capacity-safe',
+          retainInput: true,
+          rateLimitResumeAt: Date.now() + 60_000,
+        })
+        throw new CodexRateLimitError(
+          'Selected model is at capacity',
+          Date.now() + 60_000,
+          'thread-capacity-safe',
+          'capacity',
+          true,
+        )
+      },
+    })
+    expect(stats).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+    expect(store.get(queued.id)).toMatchObject({
+      status: 'queued',
+      sessionId: 'thread-capacity-safe',
+      terminalOutcome: null,
+      writeEnabled: true,
+      notBefore: expect.any(Number),
+    })
+    expect(store.terminalNotificationCount()).toBe(0)
+    expect(store.pendingStatusNotifications().map(notification => notification.payload))
+      .toContainEqual(expect.stringContaining('モデルが混雑'))
+    store.close()
+  })
+
+  test('実装phase完了後のcapacityはjob全体を自動再実行しない', async () => {
+    const store = makeStore()
+    const queued = store.enqueue(input({
+      messageId: 'capacity-after-implementation', writeEnabled: true,
+    })).job
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async job => {
+        const boundInput = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+        const nonce = 'f'.repeat(32)
+        const threadId = 'thread-capacity-after-implementation'
+        expect(store.beginInitialTurnDispatch({
+          jobId: job.id,
+          attempt: job.attempts,
+          epoch: job.controlEpoch,
+          executorNonce: nonce,
+          threadId,
+          requestId: 51,
+          inputRevision: boundInput.revision,
+          inputDigest: boundInput.digest,
+        })).toBe('dispatching')
+        store.acknowledgeInitialTurnDispatch({
+          jobId: job.id,
+          workerId: job.workerId!,
+          attempt: job.attempts,
+          epoch: job.controlEpoch,
+          executorNonce: nonce,
+          threadId,
+          turnId: 'turn-capacity-prepare',
+          requestId: 51,
+        })
+        store.finishAppServerTurn({
+          jobId: job.id,
+          epoch: job.controlEpoch,
+          executorNonce: nonce,
+          threadId,
+          turnId: 'turn-capacity-prepare',
+          retainInput: true,
+        })
+        expect(store.prepareAppServerPhaseDispatch({
+          jobId: job.id,
+          attempt: job.attempts,
+          epoch: job.controlEpoch,
+          phaseSequence: 1,
+          stage: 'implementation',
+          logicalNonce: nonce,
+          threadId,
+          inputRevision: boundInput.revision,
+          inputDigest: boundInput.digest,
+        })).toContain(':phase:1')
+        expect(store.beginAppServerPhaseDispatch({
+          jobId: job.id,
+          attempt: job.attempts,
+          epoch: job.controlEpoch,
+          phaseSequence: 1,
+          logicalNonce: nonce,
+          threadId,
+          requestId: 52,
+          inputRevision: boundInput.revision,
+          inputDigest: boundInput.digest,
+        })).toBe('dispatching')
+        store.acknowledgeAppServerPhaseDispatch({
+          jobId: job.id,
+          workerId: job.workerId!,
+          attempt: job.attempts,
+          epoch: job.controlEpoch,
+          phaseSequence: 1,
+          logicalNonce: nonce,
+          threadId,
+          turnId: 'turn-capacity-implementation',
+          requestId: 52,
+        })
+        store.finishAppServerTurn({
+          jobId: job.id,
+          epoch: job.controlEpoch,
+          executorNonce: nonce,
+          threadId,
+          turnId: 'turn-capacity-implementation',
+          retainInput: true,
+        })
+        expect(store.writeTransientFailureCanRetry(
+          job.id,
+          job.attempts,
+          'implementation',
+          1,
+        )).toBe(true)
+        expect(store.writeTransientFailureCanRetry(
+          job.id,
+          job.attempts,
+          'review',
+          2,
+        )).toBe(false)
+        throw new CodexRateLimitError(
+          'Selected model is at capacity',
+          Date.now() + 60_000,
+          threadId,
+          'capacity',
+          true,
+          'review',
+          2,
+        )
+      },
+    })
+    expect(stats).toEqual({ completed: 0, failed: 1, workersStarted: 1 })
+    expect(store.get(queued.id)).toMatchObject({ status: 'failed', writeEnabled: true })
     expect(store.claimNext('serial-worker')).toBeNull()
     store.close()
   })
@@ -5695,6 +5894,7 @@ describe('Codex JSONL contract', () => {
     expect(extractCodexRateLimit(failure, 1_000)).toEqual({
       rateLimited: true,
       resetsAtMs: 121_000,
+      reason: 'rate-limit',
     })
     const appServerFailure = JSON.stringify({
       method: 'turn/completed',
@@ -5711,6 +5911,42 @@ describe('Codex JSONL contract', () => {
     expect(extractCodexRateLimit(appServerFailure, 1_000)).toEqual({
       rateLimited: true,
       resetsAtMs: 46_000,
+      reason: 'rate-limit',
+    })
+
+    const capacity = JSON.stringify({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-capacity',
+        turn: {
+          id: 'turn-capacity', status: 'failed', items: [],
+          error: { message: 'Selected model is at capacity. Please try a different model.' },
+        },
+      },
+    })
+    expect(extractCodexRateLimit(capacity, 1_000)).toEqual({
+      rateLimited: true,
+      resetsAtMs: 61_000,
+      reason: 'capacity',
+    })
+    const quotedCapacity = JSON.stringify({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-quoted-capacity',
+        turn: {
+          id: 'turn-quoted-capacity', status: 'failed',
+          items: [{
+            type: 'userMessage',
+            text: 'Selected model is at capacity. Please try a different model. とは何？',
+          }],
+          error: { message: 'unrelated internal failure' },
+        },
+      },
+    })
+    expect(extractCodexRateLimit(quotedCapacity, 1_000)).toEqual({
+      rateLimited: false,
+      resetsAtMs: null,
+      reason: null,
     })
   })
 
@@ -7234,7 +7470,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       )
       throw new Error('stale publication evidence was accepted')
     } catch (error) {
-      expect(error).not.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
+      expect(error).toBeInstanceOf(CodexRepositoryChangedBeforePublicationError)
       expect(String(error)).toContain('publication state')
     }
   })
@@ -8674,6 +8910,12 @@ describe('Slack output guard', () => {
     expect(message).toContain('自動再開します')
     expect(message).not.toMatch(/Codex|\bjob\b|\bworker\b|\brequest\b/i)
     expect(message).not.toMatch(/[0-9a-f]{8}-[0-9a-f-]{27,}/i)
+    const capacity = slackRateLimitMessage(
+      Date.UTC(2026, 0, 2, 3, 4),
+      'capacity',
+    )
+    expect(capacity).toContain('モデルが混雑')
+    expect(capacity).not.toContain('使用量上限')
   })
 
   test('最終文のartifact markerを分離する', () => {
@@ -11138,17 +11380,20 @@ function parkUiApprovalFixture(store: JobStore, overrides: Partial<EnqueueInput>
   const running = store.claimNext('ui-approval-worker')!
   store.saveSession(running.id, 'ui-approval-session')
   const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), running.id)
+  const repositorySnapshot = uiApprovalRepositorySnapshot(root.repoPath, root.id)
+  const repositoryDigest = advisorRepositoryDigest(repositorySnapshot)
   const requestId = store.parkForUiApproval({
     jobId: running.id,
     sessionId: 'ui-approval-session',
     inputRevision: snapshot.revision,
     inputDigest: snapshot.digest,
-    repositoryDigest: 'b'.repeat(64),
+    repositoryDigest,
+    repositorySnapshot,
     proposalText: '現在の情報階層を整理した案です。',
     beforePath: '/private/sealed/Before.png',
     afterPath: '/private/sealed/After.png',
   })
-  return { root, requestId }
+  return { root, requestId, repositoryDigest }
 }
 
 function markUiApprovalPromptDelivered(
@@ -11202,6 +11447,7 @@ describe('durable UI/UX approval wait', () => {
         executions += 1
         store.saveSession(current.id, 'ui-runner-session')
         const snapshot = readAdvisorInputSnapshot(directory, current.id)
+        const repositorySnapshot = uiApprovalRepositorySnapshot(current.repoPath, current.id)
         const outbox = artifactDirForJob(directory, current.id)
         mkdirSync(outbox, { recursive: true, mode: 0o700 })
         const makeImage = (basename: string, red: number): string => {
@@ -11221,7 +11467,8 @@ describe('durable UI/UX approval wait', () => {
           sessionId: 'ui-runner-session',
           inputRevision: snapshot.revision,
           inputDigest: snapshot.digest,
-          repositoryDigest: 'd'.repeat(64),
+          repositoryDigest: advisorRepositoryDigest(repositorySnapshot),
+          repositorySnapshot,
           text: '情報の優先順位を整理した案です。',
           beforePath: makeImage('before', 20),
           afterPath: makeImage('after', 80),
@@ -11260,7 +11507,7 @@ describe('durable UI/UX approval wait', () => {
     const directory = fixtureDir('zero-ui-wait-')
     const dbPath = join(directory, 'jobs.sqlite3')
     let store = new JobStore(dbPath)
-    const { root, requestId } = parkUiApprovalFixture(store)
+    const { root, requestId, repositoryDigest } = parkUiApprovalFixture(store)
     const sameThread = store.enqueue(input({
       messageId: 'ui-approval-same-thread-successor',
       task: '同じスレッドの後続依頼',
@@ -11301,14 +11548,14 @@ describe('durable UI/UX approval wait', () => {
 
     expect(store.uiApprovalRequest(requestId)).toMatchObject({
       status: 'responded',
-      responseExplicitApproval: true,
       responseInputRevision: 2,
+      responseInputDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
     })
     expect(store.latestUiApprovalContext(root.id)).toMatchObject({
       requestId,
-      explicitApproval: true,
       responseInputRevision: 2,
-      repositoryDigest: 'b'.repeat(64),
+      responseAfterPrompt: true,
+      repositoryDigest,
     })
     expect(store.claimNext('approved-worker')?.id).toBe(root.id)
     expect(store.get(sameThread.id)?.status).toBe('queued')
@@ -11332,7 +11579,7 @@ describe('durable UI/UX approval wait', () => {
     })).toBe('staged')
     expect(store.uiApprovalRequest(requestId)).toMatchObject({
       status: 'publishing',
-      responseExplicitApproval: false,
+      responseInputDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
     })
     expect(store.get(root.id)?.uiApprovalRequestId).toBe(requestId)
     expect(store.claimNext('too-early')).toBeNull()
@@ -11340,7 +11587,7 @@ describe('durable UI/UX approval wait', () => {
     markUiApprovalPromptDelivered(store, requestId, '1800000000.000201')
     expect(store.uiApprovalRequest(requestId)?.status).toBe('responded')
     expect(store.get(root.id)?.uiApprovalRequestId).toBeNull()
-    expect(store.latestUiApprovalContext(root.id)?.explicitApproval).toBe(false)
+    expect(store.latestUiApprovalContext(root.id)?.responseAfterPrompt).toBe(false)
     expect(store.claimNext('reproposal-worker')?.id).toBe(root.id)
     expect(store.liveControlTarget('COTHERTHREAD', root.threadTs)).toBeNull()
     store.close()
@@ -11363,12 +11610,14 @@ describe('durable UI/UX approval wait', () => {
     const after = join(sealedRoot, 'after-sealed.png')
     writeFileSync(before, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1]))
     writeFileSync(after, Buffer.from([0x89, 0x50, 0x4e, 0x47, 2]))
+    const repositorySnapshot = uiApprovalRepositorySnapshot(root.repoPath, root.id)
     const requestId = store.parkForUiApproval({
       jobId: running.id,
       sessionId: 'ui-slack-session',
       inputRevision: snapshot.revision,
       inputDigest: snapshot.digest,
-      repositoryDigest: 'c'.repeat(64),
+      repositoryDigest: advisorRepositoryDigest(repositorySnapshot),
+      repositorySnapshot,
       proposalText: '余白と情報階層を整理した案です。',
       beforePath: before,
       afterPath: after,
@@ -11452,9 +11701,9 @@ describe('durable UI/UX approval wait', () => {
     expect(store.uiApprovalRequest(requestId)).toMatchObject({
       status: 'responded',
       responseMessageId: '1800000000.000499',
-      responseExplicitApproval: false,
+      responseInputDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
     })
-    expect(store.latestUiApprovalContext(root.id)?.explicitApproval).toBe(false)
+    expect(store.latestUiApprovalContext(root.id)?.responseAfterPrompt).toBe(false)
     expect(store.claimNext('old-reply-reproposal')?.id).toBe(root.id)
     store.close()
   })
@@ -11483,7 +11732,6 @@ describe('durable UI/UX approval wait', () => {
     expect(store.uiApprovalRequest(requestId)).toMatchObject({
       status: 'publishing',
       responseMessageId: '1800000000.000550',
-      responseExplicitApproval: false,
       promptMessageId: null,
       promptDeliveredAt: null,
     })
@@ -11521,14 +11769,14 @@ describe('durable UI/UX approval wait', () => {
       responseUserId: 'USECOND',
       responseText: 'こちらを最新の回答にしてください',
       responseInputRevision: 3,
-      responseExplicitApproval: false,
+      responseInputDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
     })
     markUiApprovalPromptDelivered(store, requestId, '1800000000.000603')
     expect(store.uiApprovalRequest(requestId)?.status).toBe('responded')
     expect(store.latestUiApprovalContext(root.id)).toMatchObject({
       responseMessageId: '1800000000.000602',
       responseInputRevision: 3,
-      explicitApproval: false,
+      responseAfterPrompt: false,
     })
     expect(store.claimNext('multiple-reply-reproposal')?.id).toBe(root.id)
     store.close()
@@ -11551,12 +11799,14 @@ describe('durable UI/UX approval wait', () => {
     const after = join(sealedRoot, 'after-reconcile.png')
     writeFileSync(before, Buffer.from([0x89, 0x50, 0x4e, 0x47, 11]))
     writeFileSync(after, Buffer.from([0x89, 0x50, 0x4e, 0x47, 12]))
+    const repositorySnapshot = uiApprovalRepositorySnapshot(root.repoPath, root.id)
     const requestId = store.parkForUiApproval({
       jobId: running.id,
       sessionId: 'ui-prompt-reconcile-session',
       inputRevision: snapshot.revision,
       inputDigest: snapshot.digest,
-      repositoryDigest: 'e'.repeat(64),
+      repositoryDigest: advisorRepositoryDigest(repositorySnapshot),
+      repositorySnapshot,
       proposalText: '再起動しても同じ提案を二重投稿しません。',
       beforePath: before,
       afterPath: after,
@@ -11702,11 +11952,13 @@ describe('durable UI/UX approval wait', () => {
         store.saveSession(current.id, 'ui-park-race-session')
         const snapshot = readAdvisorInputSnapshot(directory, current.id)
         const outbox = artifactDirForJob(directory, current.id)
+        const repositorySnapshot = uiApprovalRepositorySnapshot(current.repoPath, current.id)
         throw new CodexUiApprovalRequiredError({
           sessionId: 'ui-park-race-session',
           inputRevision: snapshot.revision,
           inputDigest: snapshot.digest,
-          repositoryDigest: 'f'.repeat(64),
+          repositoryDigest: advisorRepositoryDigest(repositorySnapshot),
+          repositorySnapshot,
           text: '入力競合を検証する提案です。',
           beforePath: writeSolidTestPng(outbox, 'before-race', 30),
           afterPath: writeSolidTestPng(outbox, 'after-race', 90),

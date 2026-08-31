@@ -12,8 +12,10 @@ import {
   writeFileSync,
 } from 'fs'
 import { dirname, isAbsolute, join, resolve } from 'path'
+import type { AdvisorRepositorySnapshot } from './advisor-snapshot.ts'
 
 const UI_APPROVAL_MARKER = 'zerokun_ui_approval'
+const UI_RESPONSE_DECISION_MARKER = 'zerokun_ui_response_decision'
 const MAX_UI_APPROVAL_TEXT_CHARS = 4_000
 const MAX_UI_APPROVAL_PNG_BYTES = 16 * 1024 * 1024
 const SCREENSHOT_WIDTH = 1280
@@ -172,18 +174,44 @@ export type UiApprovalProposal = {
 }
 
 export type CodexPreparationDecision =
-  | { kind: 'ready' }
-  | { kind: 'approval-required'; proposal: UiApprovalProposal }
+  | { kind: 'ready'; approvalDecision?: UiApprovalSemanticDecision }
+  | {
+      kind: 'approval-required'
+      proposal: UiApprovalProposal
+      approvalDecision?: UiApprovalSemanticDecision
+    }
+
+export type UiApprovalResponseIntent = 'approve' | 'revise' | 'question' | 'reject'
+export type UiApprovalRepositoryState = 'unchanged' | 'compatible' | 'conflict'
+
+export type UiApprovalSemanticDecision = {
+  version: 1
+  attemptNonce: string
+  requestId: string
+  proposalInputRevision: number
+  proposalInputDigest: string
+  responseInputRevision: number
+  responseInputDigest: string
+  responseMessageId: string
+  responseAfterPrompt: boolean
+  proposalRepositoryDigest: string
+  currentRepositoryDigest: string
+  intent: UiApprovalResponseIntent
+  repositoryState: UiApprovalRepositoryState
+}
 
 export type UiApprovalResumeContext = {
   requestId: string
   requestInputRevision: number
   requestInputDigest: string
   responseInputRevision: number
+  responseInputDigest: string
   responseMessageId: string
   responseText: string
-  explicitApproval: boolean
+  responseAfterPrompt: boolean
   repositoryDigest: string
+  repositorySnapshot: AdvisorRepositorySnapshot | null
+  proposalText: string
 }
 
 export type CodexUiApprovalPending = UiApprovalProposal & {
@@ -191,6 +219,7 @@ export type CodexUiApprovalPending = UiApprovalProposal & {
   inputRevision: number
   inputDigest: string
   repositoryDigest: string
+  repositorySnapshot: AdvisorRepositorySnapshot
 }
 
 export class CodexUiApprovalRequiredError extends Error {
@@ -198,6 +227,32 @@ export class CodexUiApprovalRequiredError extends Error {
     super('UI/UX proposal is ready and requires a same-thread Slack response')
     this.name = 'CodexUiApprovalRequiredError'
   }
+}
+
+export function buildUiApprovalSemanticDecisionTemplate(input: {
+  attemptNonce: string
+  context: UiApprovalResumeContext
+  currentRepositoryDigest: string
+}): string {
+  if (!/^[0-9a-f]{32}$/.test(input.attemptNonce)
+    || !/^[0-9a-f]{64}$/.test(input.currentRepositoryDigest)) {
+    throw new Error('UI/UX semantic decision template binding is invalid')
+  }
+  return `<${UI_RESPONSE_DECISION_MARKER}>${JSON.stringify({
+    version: 1,
+    attemptNonce: input.attemptNonce,
+    requestId: input.context.requestId,
+    proposalInputRevision: input.context.requestInputRevision,
+    proposalInputDigest: input.context.requestInputDigest,
+    responseInputRevision: input.context.responseInputRevision,
+    responseInputDigest: input.context.responseInputDigest,
+    responseMessageId: input.context.responseMessageId,
+    responseAfterPrompt: input.context.responseAfterPrompt,
+    proposalRepositoryDigest: input.context.repositoryDigest,
+    currentRepositoryDigest: input.currentRepositoryDigest,
+    intent: '<approve|revise|question|reject>',
+    repositoryState: '<unchanged|compatible|conflict>',
+  })}</${UI_RESPONSE_DECISION_MARKER}>`
 }
 
 function exactProposalEnvelope(
@@ -248,61 +303,133 @@ export function parseCodexPreparationDecision(
   value: string,
   attemptNonce: string,
   input: { revision: number; digest: string },
+  approval?: {
+    context: UiApprovalResumeContext
+    currentRepositoryDigest: string
+  },
 ): CodexPreparationDecision {
-  const normalized = value.replace(/\r\n/g, '\n').trim()
+  let normalized = value.replace(/\r\n/g, '\n').trim()
+  let approvalDecision: UiApprovalSemanticDecision | undefined
+  const decisionPattern = new RegExp(
+    `^<${UI_RESPONSE_DECISION_MARKER}>([^\n]+)<\/${UI_RESPONSE_DECISION_MARKER}>\n`,
+  )
+  const decisionMatch = decisionPattern.exec(normalized)
+  if (approval) {
+    if (!decisionMatch) {
+      throw new Error('Codex UI/UX response omitted its exact semantic decision envelope')
+    }
+    if (new RegExp(`<${UI_RESPONSE_DECISION_MARKER}>`, 'g').test(
+      normalized.slice(decisionMatch[0].length),
+    )) {
+      throw new Error('Codex UI/UX response duplicated its semantic decision envelope')
+    }
+    let parsed: unknown
+    try { parsed = JSON.parse(decisionMatch[1]!) } catch {
+      throw new Error('Codex UI/UX semantic decision envelope is invalid JSON')
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Codex UI/UX semantic decision envelope must be an object')
+    }
+    const record = parsed as Record<string, unknown>
+    const expectedKeys = [
+      'version', 'attemptNonce', 'requestId', 'proposalInputRevision',
+      'proposalInputDigest', 'responseInputRevision', 'responseInputDigest',
+      'responseMessageId', 'responseAfterPrompt', 'proposalRepositoryDigest', 'currentRepositoryDigest',
+      'intent', 'repositoryState',
+    ]
+    if (Object.keys(record).sort().join(',') !== expectedKeys.sort().join(',')) {
+      throw new Error('Codex UI/UX semantic decision fields are invalid')
+    }
+    const context = approval.context
+    if (record.version !== 1 || record.attemptNonce !== attemptNonce
+      || record.requestId !== context.requestId
+      || record.proposalInputRevision !== context.requestInputRevision
+      || record.proposalInputDigest !== context.requestInputDigest
+      || record.responseInputRevision !== context.responseInputRevision
+      || record.responseInputDigest !== context.responseInputDigest
+      || record.responseMessageId !== context.responseMessageId
+      || record.responseAfterPrompt !== context.responseAfterPrompt
+      || record.proposalRepositoryDigest !== context.repositoryDigest
+      || record.currentRepositoryDigest !== approval.currentRepositoryDigest
+      || !['approve', 'revise', 'question', 'reject'].includes(String(record.intent))
+      || !['unchanged', 'compatible', 'conflict'].includes(String(record.repositoryState))) {
+      throw new Error('Codex UI/UX semantic decision binding is invalid')
+    }
+    const repositoryUnchanged = record.proposalRepositoryDigest
+      === record.currentRepositoryDigest
+    if ((record.repositoryState === 'unchanged') !== repositoryUnchanged
+      || (!repositoryUnchanged && context.repositorySnapshot === null
+        && record.repositoryState !== 'conflict')) {
+      throw new Error('Codex UI/UX semantic repository decision is invalid')
+    }
+    approvalDecision = record as UiApprovalSemanticDecision
+    normalized = normalized.slice(decisionMatch[0].length).trim()
+  } else if (decisionMatch || new RegExp(`<${UI_RESPONSE_DECISION_MARKER}>`).test(normalized)) {
+    throw new Error('Codex emitted an unexpected UI/UX semantic decision envelope')
+  }
   const ready = `[ZERO_PRE_EDIT_READY:${attemptNonce}:r${input.revision}:${input.digest}]`
   if (normalized.split('\n').at(-1) === ready) {
     if (normalized.includes(`[ZERO_UI_APPROVAL_REQUIRED:${attemptNonce}:`)
       || new RegExp(`<${UI_APPROVAL_MARKER}>`, 'i').test(normalized)) {
       throw new Error('Codex preparation mixed ready and UI/UX approval envelopes')
     }
-    return { kind: 'ready' }
+    if (approvalDecision && (approvalDecision.intent !== 'approve'
+      || approvalDecision.repositoryState === 'conflict')) {
+      throw new Error('Codex UI/UX semantic decision does not authorize implementation')
+    }
+    return { kind: 'ready', ...(approvalDecision ? { approvalDecision } : {}) }
   }
-  const proposal = exactProposalEnvelope(value, attemptNonce, input)
+  const proposal = exactProposalEnvelope(normalized, attemptNonce, input)
   if (!proposal) {
     throw new Error('Codex preparation omitted its exact current-input decision envelope')
   }
-  return { kind: 'approval-required', proposal }
-}
-
-/**
- * A natural but unambiguous answer may unlock a previously presented design.
- * Conditions, questions, negation, attachments, and additional instructions
- * deliberately fall through to a fresh proposal instead of being guessed.
- */
-export function isExplicitUiApprovalResponse(text: string, hasAttachments = false): boolean {
-  if (hasAttachments) return false
-  const normalized = text
-    .normalize('NFKC')
-    .trim()
-    .replace(/^(?:<@[UW][A-Z0-9]+(?:\|[^>]+)?>\s*)+/i, '')
-    .replace(/[。．.!！]+$/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase()
-  if (!normalized || /[?？]/.test(normalized)
-    || /(?:ただし|けど|しかし|でも|変更|修正|以外|除いて|条件|待って|やめ|not|but|except|if\b)/i.test(normalized)) {
-    return false
+  if (approvalDecision && approvalDecision.intent === 'approve'
+    && approvalDecision.repositoryState !== 'conflict') {
+    throw new Error('Codex requested another UI/UX approval despite an implementable approval')
   }
-  return /^(?:はい|ok|okay|承認|承認します|これで(?:ok|お願いします)|この方向で(?:ok|お願いします|進めて(?:ください)?|実装して(?:ください)?)|その方向で(?:ok|お願いします|進めて(?:ください)?|実装して(?:ください)?)|それで(?:ok|お願いします|進めて(?:ください)?|実装して(?:ください)?)|進めて(?:ください)?|実装して(?:ください)?|approved?|looks good|go ahead|ship it)$/i.test(normalized)
+  return {
+    kind: 'approval-required',
+    proposal,
+    ...(approvalDecision ? { approvalDecision } : {}),
+  }
 }
 
-/** Host-side implementation gate; model wording can never override this binding. */
+/** The model decides meaning; the host still enforces exact message/input/repository bindings. */
 export function assertUiApprovalReadyMayProceed(input: {
   context?: UiApprovalResumeContext
+  decision?: UiApprovalSemanticDecision
   currentInputRevision: number
+  currentInputDigest: string
   currentRepositoryDigest: string
 }): void {
   if (!input.context) return
-  if (!input.context.explicitApproval
-    || input.context.responseInputRevision !== input.currentInputRevision) {
+  if (!input.decision || input.decision.intent !== 'approve'
+    || input.decision.repositoryState === 'conflict'
+    || !input.context.responseAfterPrompt || !input.decision.responseAfterPrompt) {
     throw new Error(
-      'Codex attempted to implement without an explicit current-input UI/UX approval',
+      'Codex attempted to implement without a bound semantic UI/UX approval',
     )
   }
-  if (input.context.repositoryDigest !== input.currentRepositoryDigest) {
+  if (input.context.responseInputRevision !== input.currentInputRevision
+    || input.context.responseInputDigest !== input.currentInputDigest
+    || input.decision.responseInputRevision !== input.currentInputRevision
+    || input.decision.responseInputDigest !== input.currentInputDigest) {
     throw new Error(
-      'Codex attempted to reuse a UI/UX approval after the repository changed',
+      'Codex attempted to implement without the current approved Slack input',
+    )
+  }
+  if (input.decision.requestId !== input.context.requestId
+    || input.decision.responseMessageId !== input.context.responseMessageId
+    || input.decision.proposalRepositoryDigest !== input.context.repositoryDigest
+    || input.decision.currentRepositoryDigest !== input.currentRepositoryDigest) {
+    throw new Error('Codex attempted to reuse a stale UI/UX semantic decision')
+  }
+  const repositoryUnchanged = input.decision.proposalRepositoryDigest
+    === input.decision.currentRepositoryDigest
+  if ((input.decision.repositoryState === 'unchanged') !== repositoryUnchanged
+    || (!repositoryUnchanged && input.context.repositorySnapshot === null)) {
+    throw new Error(
+      'Codex attempted to implement from an unverifiable UI/UX repository decision',
     )
   }
 }
