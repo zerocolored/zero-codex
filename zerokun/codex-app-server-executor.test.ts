@@ -19,6 +19,10 @@ import {
   executeCodexJob,
   type CodexLiveControlHooks,
 } from './codex-executor.ts'
+import {
+  createDurableThreadHistorySnapshot,
+  createThreadHistoryArchive,
+} from './thread-history.ts'
 import { prepareManagedStateRoot } from './managed-path.ts'
 
 const roots: string[] = []
@@ -164,7 +168,8 @@ for line in sys.stdin:
     method = value.get("method")
     request_id = value.get("id")
     rpc_log = os.environ.get("ZERO_RPC_LOG")
-    if rpc_log and method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list"):
+    log_handshakes = os.environ.get("ZERO_LOG_HANDSHAKES") == "1"
+    if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list") or (log_handshakes and method in ("thread/start", "thread/resume"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
             stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId")}, ensure_ascii=False) + "\\n")
@@ -179,6 +184,9 @@ for line in sys.stdin:
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
     elif method in ("thread/start", "thread/resume"):
         params = value.get("params", {})
+        if mode == "missing-session-resume" and method == "thread/resume" and params.get("threadId") == "thread-provider-missing":
+            emit({"id": request_id, "error": {"code": -32001, "message": "thread not found"}})
+            continue
         requested = params.get("threadId")
         cwd = params.get("cwd")
         model = params.get("model") or "gpt-test"
@@ -225,7 +233,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-steer", "phased-late-inbound", "phased-interjection-update", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -258,7 +266,7 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-steer", "phased-late-inbound", "phased-interjection-update"):
+        elif mode in ("phased", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "準備完了\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
@@ -282,7 +290,7 @@ for line in sys.stdin:
                 for _index in range(96):
                     subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 time.sleep(0.5)
-            terminal = {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "通常完了"}], "error": None}}}
+            terminal = {"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "通常完了"}], "error": None}}}
             progress_error = {"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "fixture progress", "codexErrorInfo": None, "additionalDetails": None}}}
             late_error = {"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": {"message": "late fixture failure", "codexErrorInfo": None, "additionalDetails": None}}}
             if mode == "commentary":
@@ -362,6 +370,12 @@ for line in sys.stdin:
         }}})
     elif method in ("thread/turns/list", "thread/read") and mode == "summary-stream-no-history":
         emit({"id": request_id, "error": {"code": -32000, "message": "history must not be requested"}})
+    elif method == "thread/turns/list":
+        emit({"id": request_id, "result": {"data": [], "nextCursor": None}})
+    elif method == "thread/read":
+        emit({"id": request_id, "result": {"thread": {"id": requested_thread or thread_id, "turns": []}}})
+    elif method == "thread/list":
+        emit({"id": request_id, "result": {"data": [], "nextCursor": None}})
     elif method == "turn/steer":
         if mode in ("interjection-answer", "interjection-update", "interjection-late-answer", "phased-interjection-update"):
             pause_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
@@ -494,7 +508,7 @@ function fixture(
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
     | 'failed-steer' | 'failed-turn'
     | 'error-steer' | 'rate-error' | 'rate-retrying' | 'phased' | 'phased-steer'
-    | 'phased-interjection-update'
+    | 'phased-interjection-update' | 'missing-session-resume'
     | 'phased-late-inbound' | 'summary-stream-no-history' | 'logical-stop-required'
     | 'late-error-after-complete' | 'late-error-coalesced'
     | 'errors-before-terminal-coalesced' | 'terminal-cancel-race'
@@ -817,6 +831,55 @@ function fixture(
 }
 
 describe('production App Server executor', () => {
+  for (const shouldResume of [false, true]) {
+    test(`${shouldResume ? 'native resume' : 'fresh physical session'}の履歴注入を一意にする`, async () => {
+      const value = fixture('normal')
+      const promptLog = join(value.root, `history-${shouldResume ? 'resume' : 'fresh'}.log`)
+      const job = {
+        ...value.job,
+        seq: 2,
+        sessionId: shouldResume ? 'thread-existing' : null,
+        resumed: shouldResume,
+      }
+      const threadHistory = createDurableThreadHistorySnapshot({
+        jobId: job.id,
+        attempt: job.attempts,
+        chatId: job.chatId,
+        threadTs: job.threadTs,
+        repoPath: job.repoPath,
+        currentJobSeq: job.seq,
+        createdAt: Date.now(),
+        archives: [createThreadHistoryArchive({
+          jobId: 'prior-job',
+          jobSeq: 1,
+          chatId: job.chatId,
+          threadTs: job.threadTs,
+          repoPath: job.repoPath,
+          outcome: 'completed',
+          finishedAt: Date.now() - 1,
+          events: [{ order: 0, kind: 'result', text: '再利用する論理履歴' }],
+        })],
+      })
+      const result = await executeCodexJob(job, {
+        codexBinForTesting: value.executable,
+        logDir: value.logDir,
+        stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: {
+          ZERO_FIXTURE_MODE: 'normal',
+          ZERO_PROMPT_LOG: promptLog,
+        },
+        liveControls: value.hooks,
+        threadHistory,
+      })
+      expect(result.sessionId).toBe(shouldResume ? 'thread-existing' : 'thread-app-server-1')
+      const prompt = (JSON.parse(readFileSync(promptLog, 'utf8').trim()) as { text: string }).text
+      expect(prompt.includes('Prior Slack thread history')).toBe(!shouldResume)
+      expect(prompt.includes('再利用する論理履歴')).toBe(!shouldResume)
+      value.store.close()
+    }, 30_000)
+  }
+
   test('root commentaryを監視表示とdurable Slack handoffへ同じ順序で渡す', async () => {
     const value = fixture('commentary')
     const monitorMessages: string[] = []
@@ -1062,6 +1125,71 @@ describe('production App Server executor', () => {
     expect(new Set(phaseRows.map(row => row[6])).size).toBe(1)
     expect(heldPhaseCounts).toEqual([1, 2, 3])
     expect(value.store.get(value.job.id)?.acceptsControl).toBe(false)
+    value.store.close()
+  }, 30_000)
+
+  test('write jobの消失resume先は初回prepare未送達ならcold startして履歴を一度だけ注入する', async () => {
+    const value = fixture('missing-session-resume', true)
+    const rpcLog = join(value.root, 'missing-session-rpc.log')
+    const promptLog = join(value.root, 'missing-session-prompts.log')
+    const resumedJob = {
+      ...value.job,
+      seq: 2,
+      sessionId: 'thread-provider-missing',
+      resumed: true,
+    }
+    const threadHistory = createDurableThreadHistorySnapshot({
+      jobId: resumedJob.id,
+      attempt: resumedJob.attempts,
+      chatId: resumedJob.chatId,
+      threadTs: resumedJob.threadTs,
+      repoPath: resumedJob.repoPath,
+      currentJobSeq: resumedJob.seq,
+      createdAt: Date.now(),
+      archives: [createThreadHistoryArchive({
+        jobId: 'prior-write-job',
+        jobSeq: 1,
+        chatId: resumedJob.chatId,
+        threadTs: resumedJob.threadTs,
+        repoPath: resumedJob.repoPath,
+        outcome: 'completed',
+        finishedAt: Date.now() - 1,
+        events: [{ order: 0, kind: 'result', text: '前回の実装結果を引き継ぐ' }],
+      })],
+    })
+    let resets = 0
+    const result = await executeCodexJob(resumedJob, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'missing-session-resume',
+        ZERO_RPC_LOG: rpcLog,
+        ZERO_PROMPT_LOG: promptLog,
+        ZERO_LOG_HANDSHAKES: '1',
+      },
+      phaseGateForTesting: {},
+      onSessionReset: () => { resets += 1 },
+      liveControls: value.hooks,
+      threadHistory,
+    })
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(resets).toBe(1)
+    const methods = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line).method)
+      .filter(method => method === 'thread/start' || method === 'thread/resume')
+    expect(methods).toEqual([
+      'thread/resume', 'thread/start', 'thread/resume', 'thread/resume',
+    ])
+    const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string, text: string })
+    expect(prompts.map(prompt => prompt.stage)).toEqual(['prepare', 'implementation', 'review'])
+    expect(prompts[0]!.text).toContain('Prior Slack thread history')
+    expect(prompts[0]!.text).toContain('前回の実装結果を引き継ぐ')
+    expect(prompts.slice(1).every(prompt => !prompt.text.includes('Prior Slack thread history')))
+      .toBe(true)
     value.store.close()
   }, 30_000)
 

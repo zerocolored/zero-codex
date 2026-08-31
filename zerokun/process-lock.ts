@@ -1368,7 +1368,8 @@ if (import.meta.main) {
   const [command, lockFile, owner, participant, timeoutValue] = process.argv.slice(2)
   const validCommand = command === 'acquire' || command === 'release'
     || command === 'delegate' || command === 'undelegate' || command === 'delegate-active'
-    || command === 'quiescent' || command === 'stop-owner' || command === 'stop-owner-force'
+    || command === 'quiescent' || command === 'discard'
+    || command === 'stop-owner' || command === 'stop-owner-force'
   if (!lockFile || !owner || !validCommand) {
     process.stderr.write(
       'usage: process-lock.ts acquire <lock-file> <pid>\n'
@@ -1377,6 +1378,7 @@ if (import.meta.main) {
       + '  | undelegate <lock-file> <delegate-token>\n'
       + '  | delegate-active <lock-file> <pid>\n'
       + '  | quiescent <lock-file> <delegate-token>\n'
+      + '  | discard <lock-file> <pid>\n'
       + '  | stop-owner <lock-file> <pid> <command-pattern> [timeout-ms]\n'
       + '  | stop-owner-force <lock-file> <pid> <command-pattern> [term-timeout-ms]\n',
     )
@@ -1413,6 +1415,10 @@ if (import.meta.main) {
       const pid = Number(owner)
       if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`invalid PID: ${owner}`)
       if (!processLockDelegateMatches(lockFile, pid)) process.exitCode = 3
+    } else if (command === 'discard') {
+      const pid = Number(owner)
+      if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`invalid PID: ${owner}`)
+      if (!discardProcessLock(lockFile, pid)) process.exitCode = 3
     } else if (command === 'stop-owner' || command === 'stop-owner-force') {
       const pid = Number(owner)
       const timeoutMs = timeoutValue === undefined ? 30_000 : Number(timeoutValue)

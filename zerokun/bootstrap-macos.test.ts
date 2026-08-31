@@ -2309,6 +2309,7 @@ codex --version
       expect(setup.exitCode, setup.stderr.toString()).toBe(0)
       expect(setup.stdout.toString()).toContain('▶ Codex版standalone setup')
       expect(await legacyRunner.exited).toBe(0)
+      expect(existsSync(join(stateDir, 'job-runner.lock/pid'))).toBe(false)
     } finally {
       if (legacyRunner) {
         try { legacyRunner.kill() } catch {}

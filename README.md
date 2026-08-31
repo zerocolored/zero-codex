@@ -25,6 +25,16 @@ Slack bot
 - 同じ Slack スレッド・repository・write mode では、senderが変わっても Codex の thread ID を最大20 jobまで再利用します。旧 Claude Code の
   待機jobはsession IDを破棄してCodexへ移行し、完了済み履歴のsession IDはCodexへ渡しません。利用回数は
   job本体とは別の永続台帳で数えるため、30日GCで古いjobが消えても20件上限は戻りません。
+- この20件はCodexのcontext windowや自動compactの上限ではなく、Zeroちゃんが物理Codex threadを安全に
+  更新するためのlocal上限です。会話そのものは別のsanitized論理履歴としてSQLiteへjob単位で保存し、
+  失敗・完了・daemon再起動・write mode変更・物理thread更新・30日job GCの後も、同じchannel・Slack
+  thread・repositoryの次のfresh Codex threadへ引き継ぎます。native resume時は同じ内容を二重注入しません。
+  senderは履歴scopeに含めないため、同じthread内なら別userの返信も同じ会話として扱います。
+- 論理履歴の永続archive自体をscopeごとの直近64 jobに圧縮し、省略件数だけを台帳へ残します。
+  各実行snapshotも直近64 job blockかつ128 Ki文字／256 KiBまでです。現在の依頼とhost権限が常に優先され、
+  過去の回答は参考情報として再確認されます。credential、local path、内部ID、成果物pathは保存前に除去し、
+  添付は件数だけ残すため、後から実ファイルが必要な場合は再添付してください。導入前にすでに30日GCされた
+  jobは復元できません。
 - 実行中の同じSlackスレッドへの返信は、別userからでも現在turnを安全な境界で一時停止し、同じ
   Codex threadのfresh read-only turnで先に回答してから元のtaskを再開します。回答が単なる質問なら
   元入力は変えず、更新依頼なら回答がSlackへ届いたことを確認した後だけtask入力へ昇格します。

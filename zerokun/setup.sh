@@ -397,6 +397,13 @@ if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$
       stop-owner "$CH/job-runner.lock/pid" "$RUNNER_PID" \
       'job-runner\.ts\s+daemon(?:\s|$)' 30000 \
       || { echo "❌ 旧runnerを世代検証付きで停止できません。" >&2; exit 1; }
+  elif [ -e "$CH/job-runner.lock/pid" ]; then
+    # The legacy runner can finish the last job and exit between the drain
+    # query and this stop boundary. Reclaim only the exact, proven-dead lock;
+    # never unlink a PID file directly because the PID may already be reused.
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+      discard "$CH/job-runner.lock/pid" "$RUNNER_PID" \
+      || { echo "❌ 自然終了した旧runnerのlockを安全に回収できません。" >&2; exit 1; }
   fi
   echo "   旧job runnerを安全に停止しました"
 fi

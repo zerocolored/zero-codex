@@ -115,6 +115,17 @@ import {
 } from './ui-approval.ts'
 import { resolveAdvisorProjectLayout } from './advisor-snapshot.ts'
 import { acknowledgeServiceControlPauseIfRequested } from './service-control-state.ts'
+import {
+  assertDurableThreadHistorySnapshot,
+  assertThreadHistoryArchive,
+  createDurableThreadHistorySnapshot,
+  createThreadHistoryArchive,
+  MAX_THREAD_HISTORY_JOBS,
+  THREAD_HISTORY_VERSION,
+  type DurableThreadHistorySnapshot,
+  type ThreadHistoryArchive,
+  type ThreadHistoryEvent,
+} from './thread-history.ts'
 
 export class SlackChannelRouteRequiredError extends Error {
   constructor(readonly channelId: string) {
@@ -541,6 +552,41 @@ type UiApprovalRequestRow = {
   not_before: number | null
 }
 
+type ThreadHistoryArchiveRow = {
+  job_id: string
+  job_seq: number
+  chat_id: string
+  thread_ts: string
+  repo_path: string
+  version: number
+  outcome: ThreadHistoryArchive['outcome']
+  event_count: number
+  omitted_event_count: number
+  transcript: string
+  digest: string
+  finished_at: number
+}
+
+type ThreadHistorySnapshotRow = {
+  job_id: string
+  attempt: number
+  version: number
+  chat_id: string
+  thread_ts: string
+  repo_path: string
+  through_job_seq: number
+  source_count: number
+  omitted_count: number
+  transcript: string
+  digest: string
+  created_at: number
+}
+
+type ThreadHistoryScopeRow = {
+  omitted_job_count: number
+  pruned_through_job_seq: number
+}
+
 const JOB_SCHEMA = `
 CREATE TABLE IF NOT EXISTS jobs (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -615,6 +661,49 @@ CREATE TABLE IF NOT EXISTS slack_threads (
   adopted_from_ts TEXT NOT NULL,
   last_activity_ms INTEGER NOT NULL,
   PRIMARY KEY (chat_id, thread_ts)
+);
+CREATE TABLE IF NOT EXISTS slack_thread_job_history (
+  job_id TEXT PRIMARY KEY,
+  job_seq INTEGER NOT NULL,
+  chat_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version = 1),
+  outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'failed', 'cancelled')),
+  event_count INTEGER NOT NULL CHECK (event_count >= 0),
+  omitted_event_count INTEGER NOT NULL CHECK (omitted_event_count >= 0),
+  transcript TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  finished_at INTEGER NOT NULL,
+  archived_at INTEGER NOT NULL,
+  UNIQUE (chat_id, thread_ts, repo_path, job_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_slack_thread_job_history_scope
+  ON slack_thread_job_history(chat_id, thread_ts, repo_path, job_seq);
+CREATE TABLE IF NOT EXISTS slack_thread_history_scopes (
+  chat_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  omitted_job_count INTEGER NOT NULL DEFAULT 0 CHECK (omitted_job_count >= 0),
+  pruned_through_job_seq INTEGER NOT NULL DEFAULT 0 CHECK (pruned_through_job_seq >= 0),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, thread_ts, repo_path)
+);
+CREATE TABLE IF NOT EXISTS job_thread_history_snapshots (
+  job_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL CHECK (attempt > 0),
+  version INTEGER NOT NULL CHECK (version = 1),
+  chat_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  through_job_seq INTEGER NOT NULL CHECK (through_job_seq >= 0),
+  source_count INTEGER NOT NULL CHECK (source_count >= 0),
+  omitted_count INTEGER NOT NULL CHECK (omitted_count >= 0),
+  transcript TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (job_id, attempt),
+  FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS slack_channel_routes (
   app_id TEXT NOT NULL,
@@ -970,6 +1059,452 @@ CREATE TABLE IF NOT EXISTS slack_reply_scans (
 CREATE INDEX IF NOT EXISTS idx_slack_reply_scans_updated
   ON slack_reply_scans(updated_at, scan_key);
 `
+
+function mapThreadHistoryArchiveRow(row: ThreadHistoryArchiveRow): ThreadHistoryArchive {
+  return {
+    version: row.version as typeof THREAD_HISTORY_VERSION,
+    jobId: row.job_id,
+    jobSeq: row.job_seq,
+    chatId: row.chat_id,
+    threadTs: row.thread_ts,
+    repoPath: row.repo_path,
+    outcome: row.outcome,
+    eventCount: row.event_count,
+    omittedEventCount: row.omitted_event_count,
+    transcript: row.transcript,
+    digest: row.digest,
+    finishedAt: row.finished_at,
+  }
+}
+
+function mapThreadHistorySnapshotRow(row: ThreadHistorySnapshotRow): DurableThreadHistorySnapshot {
+  return {
+    version: row.version as typeof THREAD_HISTORY_VERSION,
+    jobId: row.job_id,
+    attempt: row.attempt,
+    chatId: row.chat_id,
+    threadTs: row.thread_ts,
+    repoPath: row.repo_path,
+    throughJobSeq: row.through_job_seq,
+    sourceCount: row.source_count,
+    omittedCount: row.omitted_count,
+    transcript: row.transcript,
+    digest: row.digest,
+    createdAt: row.created_at,
+  }
+}
+
+function threadHistoryScopeState(
+  db: Database,
+  chatId: string,
+  threadTs: string,
+  repoPath: string,
+): ThreadHistoryScopeRow {
+  return db.query<ThreadHistoryScopeRow, [string, string, string]>(
+    `SELECT omitted_job_count, pruned_through_job_seq
+     FROM slack_thread_history_scopes
+     WHERE chat_id = ? AND thread_ts = ? AND repo_path = ?`,
+  ).get(chatId, threadTs, repoPath) ?? {
+    omitted_job_count: 0,
+    pruned_through_job_seq: 0,
+  }
+}
+
+/** Keep payload storage bounded per Slack-thread/repository scope. */
+function compactThreadHistoryScope(db: Database, archive: ThreadHistoryArchive): void {
+  const rows = db.query<{ job_seq: number }, [string, string, string, number]>(
+    `SELECT job_seq FROM slack_thread_job_history
+     WHERE chat_id = ? AND thread_ts = ? AND repo_path = ?
+     ORDER BY job_seq DESC LIMIT -1 OFFSET ?`,
+  ).all(archive.chatId, archive.threadTs, archive.repoPath, MAX_THREAD_HISTORY_JOBS)
+  if (rows.length === 0) return
+  const cutoff = Math.max(...rows.map(row => row.job_seq))
+  const deleted = db.run(
+    `DELETE FROM slack_thread_job_history
+     WHERE chat_id = ? AND thread_ts = ? AND repo_path = ? AND job_seq <= ?`,
+    [archive.chatId, archive.threadTs, archive.repoPath, cutoff],
+  ).changes
+  if (deleted !== rows.length) {
+    throw new Error('thread history compaction changed concurrently')
+  }
+  db.run(
+    `INSERT INTO slack_thread_history_scopes (
+       chat_id, thread_ts, repo_path, omitted_job_count,
+       pruned_through_job_seq, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(chat_id, thread_ts, repo_path) DO UPDATE SET
+       omitted_job_count = slack_thread_history_scopes.omitted_job_count
+         + excluded.omitted_job_count,
+       pruned_through_job_seq = MAX(
+         slack_thread_history_scopes.pruned_through_job_seq,
+         excluded.pruned_through_job_seq
+       ),
+       updated_at = excluded.updated_at`,
+    [archive.chatId, archive.threadTs, archive.repoPath, deleted, cutoff, Date.now()],
+  )
+}
+
+function threadHistoryEventsForSettledJob(db: Database, job: JobRow): ThreadHistoryEvent[] {
+  type OrderedEvent = {
+    at: number
+    tie: number
+    event: Omit<ThreadHistoryEvent, 'order'>
+  }
+  const ordered: OrderedEvent[] = [{
+    at: job.created_at,
+    tie: 0,
+    event: {
+      kind: 'request',
+      text: job.task,
+      attachmentCount: parseAttachments(job.attachments_json).length,
+    },
+  }]
+  const controls = db.query<{
+    seq: number
+    message_id: string
+    task: string
+    attachments_json: string
+    created_at: number
+  }, [string]>(
+    `SELECT seq, message_id, task, attachments_json, created_at
+     FROM job_controls WHERE job_id = ? AND kind = 'steer'
+     ORDER BY created_at, seq`,
+  ).all(job.id)
+  const promotedMessages = new Set(controls.map(control => control.message_id))
+  for (const control of controls) {
+    ordered.push({
+      at: control.created_at,
+      tie: 10_000 + control.seq,
+      event: {
+        kind: 'update',
+        text: control.task,
+        attachmentCount: parseAttachments(control.attachments_json).length,
+      },
+    })
+  }
+  const interjections = db.query<{
+    seq: number
+    message_id: string
+    task: string
+    attachments_json: string
+    answer_payload: string | null
+    created_at: number
+    answered_at: number | null
+    delivered_at: number | null
+  }, [string]>(
+    `SELECT seq, message_id, task, attachments_json, answer_payload,
+            created_at, answered_at, delivered_at
+     FROM job_interjections WHERE job_id = ?
+     ORDER BY created_at, seq`,
+  ).all(job.id)
+  for (const interjection of interjections) {
+    if (!promotedMessages.has(interjection.message_id)) {
+      ordered.push({
+        at: interjection.created_at,
+        tie: 20_000 + interjection.seq,
+        event: {
+          kind: 'question',
+          text: interjection.task,
+          attachmentCount: parseAttachments(interjection.attachments_json).length,
+        },
+      })
+    }
+    if (interjection.answer_payload) {
+      ordered.push({
+        at: interjection.answered_at ?? interjection.created_at,
+        tie: 30_000 + interjection.seq,
+        event: {
+          kind: 'answer',
+          text: interjection.answer_payload,
+          delivery: interjection.delivered_at === null ? 'unconfirmed' : 'confirmed',
+        },
+      })
+    }
+  }
+  const commentaries = db.query<{
+    seq: number
+    payload: string
+    created_at: number
+    delivered_at: number | null
+  }, [string]>(
+    `SELECT seq, payload, created_at, delivered_at
+     FROM commentary_notifications WHERE job_id = ? ORDER BY created_at, seq`,
+  ).all(job.id)
+  for (const commentary of commentaries) {
+    ordered.push({
+      at: commentary.created_at,
+      tie: 40_000 + commentary.seq,
+      event: {
+        kind: 'progress',
+        text: commentary.payload.replace(/^💬\s*/u, ''),
+        delivery: commentary.delivered_at === null ? 'unconfirmed' : 'confirmed',
+      },
+    })
+  }
+  const terminal = db.query<{ kind: 'completed' | 'failed'; payload: string }, [string]>(
+    'SELECT kind, payload FROM terminal_notifications WHERE job_id = ?',
+  ).get(job.id)
+  const outcome = job.terminal_outcome === 'cancelled'
+    ? 'cancelled'
+    : job.status === 'completed' ? 'completed' : 'failed'
+  if (outcome === 'completed') {
+    const persisted = job.result ?? (terminal?.kind === 'completed' ? terminal.payload : '')
+    let result = persisted
+    try { result = extractArtifactPaths(persisted).text } catch {}
+    ordered.push({
+      at: Number.MAX_SAFE_INTEGER,
+      tie: Number.MAX_SAFE_INTEGER - 1,
+      event: {
+        kind: result.trim() ? 'result' : 'outcome',
+        text: result.trim() || 'The prior job completed.',
+      },
+    })
+  } else {
+    const failure = job.last_error ?? (terminal?.kind === 'failed' ? terminal.payload : '')
+    ordered.push({
+      at: Number.MAX_SAFE_INTEGER,
+      tie: Number.MAX_SAFE_INTEGER - 1,
+      event: {
+        kind: 'outcome',
+        text: outcome === 'cancelled'
+          ? 'The prior job was cancelled by a same-thread request.'
+          : `The prior job did not complete: ${publicJobFailureSummary(failure)}`,
+      },
+    })
+  }
+  return ordered
+    .sort((left, right) => left.at - right.at || left.tie - right.tie)
+    .map((value, order) => ({ ...value.event, order }))
+}
+
+function createSettledThreadHistoryArchive(db: Database, job: JobRow): ThreadHistoryArchive {
+  if ((job.status !== 'completed' && job.status !== 'failed') || job.finished_at === null) {
+    throw new Error(`thread history source job is not settled: ${job.id}`)
+  }
+  return createThreadHistoryArchive({
+    jobId: job.id,
+    jobSeq: job.seq,
+    chatId: job.chat_id,
+    threadTs: job.thread_ts,
+    repoPath: job.repo_path,
+    outcome: job.terminal_outcome === 'cancelled'
+      ? 'cancelled'
+      : job.status,
+    finishedAt: job.finished_at,
+    events: threadHistoryEventsForSettledJob(db, job),
+  })
+}
+
+function materializeSettledThreadHistoryJob(
+  db: Database,
+  jobId: string,
+): ThreadHistoryArchive | null {
+  const job = db.query<JobRow, [string]>(
+    `SELECT * FROM jobs
+     WHERE id = ? AND runtime = 'codex' AND status IN ('completed', 'failed')
+       AND finished_at IS NOT NULL`,
+  ).get(jobId)
+  if (!job) throw new Error(`settled thread history source is unavailable: ${jobId}`)
+  const existingRow = db.query<ThreadHistoryArchiveRow, [string]>(
+    'SELECT * FROM slack_thread_job_history WHERE job_id = ?',
+  ).get(jobId)
+  if (existingRow) {
+    const existing = mapThreadHistoryArchiveRow(existingRow)
+    assertThreadHistoryArchive(existing)
+    const outcome = job.terminal_outcome === 'cancelled'
+      ? 'cancelled'
+      : job.status as ThreadHistoryArchive['outcome']
+    if (existing.jobSeq !== job.seq || existing.chatId !== job.chat_id
+      || existing.threadTs !== job.thread_ts || existing.repoPath !== job.repo_path
+      || existing.outcome !== outcome) {
+      throw new Error(`thread history archive binding changed after persistence: ${jobId}`)
+    }
+    // The archive records the original terminal instant as part of its own
+    // digest. Retention tooling may age the live job row independently; that
+    // must not rewrite or invalidate an already sealed conversation record.
+    return existing
+  }
+  const scope = threadHistoryScopeState(db, job.chat_id, job.thread_ts, job.repo_path)
+  if (job.seq <= scope.pruned_through_job_seq) return null
+  const archive = createSettledThreadHistoryArchive(db, job)
+  db.run(
+    `INSERT INTO slack_thread_job_history (
+       job_id, job_seq, chat_id, thread_ts, repo_path, version, outcome,
+       event_count, omitted_event_count, transcript, digest, finished_at, archived_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      archive.jobId, archive.jobSeq, archive.chatId, archive.threadTs, archive.repoPath,
+      archive.version, archive.outcome, archive.eventCount, archive.omittedEventCount,
+      archive.transcript, archive.digest, archive.finishedAt, Date.now(),
+    ],
+  )
+  compactThreadHistoryScope(db, archive)
+  return archive
+}
+
+function priorAttemptThreadHistoryEvents(
+  db: Database,
+  job: JobRow,
+  nextAttempt: number,
+  snapshotAt: number,
+): ThreadHistoryEvent[] {
+  if (nextAttempt <= 1) return []
+  type OrderedEvent = {
+    at: number
+    tie: number
+    event: Omit<ThreadHistoryEvent, 'order'>
+  }
+  const events: OrderedEvent[] = db.query<{
+    seq: number
+    payload: string
+    created_at: number
+    delivered_at: number | null
+  }, [string, number, number]>(
+    `SELECT seq, payload, created_at, delivered_at FROM commentary_notifications
+     WHERE job_id = ? AND attempt < ? AND created_at <= ? ORDER BY seq`,
+  ).all(job.id, nextAttempt, snapshotAt).map(row => ({
+    at: row.created_at,
+    tie: row.seq,
+    event: {
+      kind: 'progress',
+      text: row.payload.replace(/^💬\s*/u, ''),
+      delivery: row.delivered_at === null ? 'unconfirmed' : 'confirmed',
+    },
+  }))
+  const interjections = db.query<{
+    seq: number
+    task: string
+    attachments_json: string
+    status: JobInterjectionStatus
+    disposition: JobInterjectionDisposition | null
+    answer_payload: string
+    created_at: number
+    answered_at: number
+    delivered_at: number | null
+  }, [string, number]>(
+    `SELECT seq, task, attachments_json, status, disposition, answer_payload,
+            created_at, answered_at, delivered_at
+     FROM job_interjections
+     WHERE job_id = ? AND answer_payload IS NOT NULL AND answered_at IS NOT NULL
+       AND answered_at <= ?
+       AND (status IN ('answered', 'delivered', 'promoted') OR delivered_at IS NOT NULL)
+     ORDER BY created_at, seq`,
+  ).all(job.id, snapshotAt)
+  for (const interjection of interjections) {
+    // A promoted task update is already present in the current durable input.
+    // Keep its public answer, but do not duplicate the user request.
+    if (!(interjection.disposition === 'task-update' && interjection.status === 'promoted')) {
+      events.push({
+        at: interjection.created_at,
+        tie: 1_000_000 + interjection.seq,
+        event: {
+          kind: 'question',
+          text: interjection.task,
+          attachmentCount: parseAttachments(interjection.attachments_json).length,
+        },
+      })
+    }
+    events.push({
+      at: interjection.answered_at,
+      tie: 2_000_000 + interjection.seq,
+      event: {
+        kind: 'answer',
+        text: interjection.answer_payload,
+        delivery: interjection.delivered_at === null ? 'unconfirmed' : 'confirmed',
+      },
+    })
+  }
+  if (job.last_error) {
+    events.push({
+      at: Number.MAX_SAFE_INTEGER,
+      tie: Number.MAX_SAFE_INTEGER,
+      event: {
+        kind: 'outcome',
+        text: `The earlier attempt did not complete: ${publicJobFailureSummary(job.last_error)}`,
+      },
+    })
+  }
+  return events
+    .sort((left, right) => left.at - right.at || left.tie - right.tie)
+    .map((value, order) => ({ ...value.event, order }))
+}
+
+function persistThreadHistorySnapshot(
+  db: Database,
+  job: JobRow,
+  attempt: number,
+  createdAt: number,
+): DurableThreadHistorySnapshot {
+  const existingRow = db.query<ThreadHistorySnapshotRow, [string, number]>(
+    'SELECT * FROM job_thread_history_snapshots WHERE job_id = ? AND attempt = ?',
+  ).get(job.id, attempt)
+  if (existingRow) {
+    const existing = mapThreadHistorySnapshotRow(existingRow)
+    assertDurableThreadHistorySnapshot(existing, {
+      jobId: job.id,
+      attempt,
+      chatId: job.chat_id,
+      threadTs: job.thread_ts,
+      repoPath: job.repo_path,
+      currentJobSeq: job.seq,
+    })
+    return existing
+  }
+  const priorJobs = db.query<{ id: string }, [string, string, string, number]>(
+    `SELECT id FROM jobs
+     WHERE runtime = 'codex' AND chat_id = ? AND thread_ts = ? AND repo_path = ?
+       AND seq < ? AND status IN ('completed', 'failed') AND finished_at IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM slack_thread_job_history AS history WHERE history.job_id = jobs.id
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM slack_thread_history_scopes AS scope
+         WHERE scope.chat_id = jobs.chat_id AND scope.thread_ts = jobs.thread_ts
+           AND scope.repo_path = jobs.repo_path
+           AND scope.pruned_through_job_seq >= jobs.seq
+       )
+     ORDER BY seq`,
+  ).all(job.chat_id, job.thread_ts, job.repo_path, job.seq)
+  for (const prior of priorJobs) materializeSettledThreadHistoryJob(db, prior.id)
+  const scope = threadHistoryScopeState(db, job.chat_id, job.thread_ts, job.repo_path)
+  const total = db.query<{ count: number }, [string, string, string, number]>(
+    `SELECT COUNT(*) AS count FROM slack_thread_job_history
+     WHERE chat_id = ? AND thread_ts = ? AND repo_path = ? AND job_seq < ?`,
+  ).get(job.chat_id, job.thread_ts, job.repo_path, job.seq)?.count ?? 0
+  const archiveRows = db.query<ThreadHistoryArchiveRow, [string, string, string, number, number]>(
+    `SELECT job_id, job_seq, chat_id, thread_ts, repo_path, version, outcome,
+            event_count, omitted_event_count, transcript, digest, finished_at
+     FROM slack_thread_job_history
+     WHERE chat_id = ? AND thread_ts = ? AND repo_path = ? AND job_seq < ?
+     ORDER BY job_seq DESC LIMIT ?`,
+  ).all(job.chat_id, job.thread_ts, job.repo_path, job.seq, MAX_THREAD_HISTORY_JOBS)
+  const archives = archiveRows.map(mapThreadHistoryArchiveRow)
+  const snapshot = createDurableThreadHistorySnapshot({
+    jobId: job.id,
+    attempt,
+    chatId: job.chat_id,
+    threadTs: job.thread_ts,
+    repoPath: job.repo_path,
+    currentJobSeq: job.seq,
+    archives,
+    priorAttemptEvents: priorAttemptThreadHistoryEvents(db, job, attempt, createdAt),
+    preOmittedCount: scope.omitted_job_count + Math.max(0, total - archives.length),
+    createdAt,
+  })
+  db.run(
+    `INSERT INTO job_thread_history_snapshots (
+       job_id, attempt, version, chat_id, thread_ts, repo_path, through_job_seq,
+       source_count, omitted_count, transcript, digest, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      snapshot.jobId, snapshot.attempt, snapshot.version, snapshot.chatId,
+      snapshot.threadTs, snapshot.repoPath, snapshot.throughJobSeq,
+      snapshot.sourceCount, snapshot.omittedCount, snapshot.transcript,
+      snapshot.digest, snapshot.createdAt,
+    ],
+  )
+  return snapshot
+}
 
 function ensureJobSchemaMigrations(db: Database): void {
   const columns = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
@@ -1439,6 +1974,24 @@ function ensureJobSchemaMigrations(db: Database): void {
   db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_ready_seq ON jobs(status, not_before, seq)')
   db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_runtime_ready_seq ON jobs(runtime, status, not_before, seq)")
   db.exec('CREATE INDEX IF NOT EXISTS idx_job_controls_ready ON job_controls(job_id, control_epoch, status, seq)')
+  const migrateSlackThreadHistory = db.transaction(() => {
+    if (db.query<{ present: number }, []>(
+      "SELECT 1 AS present FROM migration_ledger WHERE name = 'slack-thread-history-v1'",
+    ).get()) return
+    const jobs = db.query<{ id: string }, []>(
+      `SELECT id FROM jobs
+       WHERE runtime = 'codex' AND status IN ('completed', 'failed')
+         AND finished_at IS NOT NULL
+       ORDER BY seq`,
+    ).all()
+    for (const job of jobs) materializeSettledThreadHistoryJob(db, job.id)
+    db.run(
+      `INSERT INTO migration_ledger (name, completed_at)
+       VALUES ('slack-thread-history-v1', ?)`,
+      [Date.now()],
+    )
+  })
+  migrateSlackThreadHistory.immediate()
   const runningCodex = db.query<{ count: number }, []>(
     "SELECT COUNT(*) AS count FROM jobs WHERE runtime = 'codex' AND status = 'running'",
   ).get()?.count ?? 0
@@ -5456,6 +6009,46 @@ export class JobStore {
     return row ? mapRow(row) : null
   }
 
+  threadHistorySnapshot(
+    jobIdInput: string,
+    attemptInput?: number,
+  ): DurableThreadHistorySnapshot {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const job = this.db.query<JobRow, [string]>(
+      "SELECT * FROM jobs WHERE id = ? AND runtime = 'codex'",
+    ).get(jobId)
+    if (!job) throw new Error(`thread history job is unavailable: ${jobId}`)
+    const attempt = attemptInput ?? job.attempts
+    if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > job.attempts) {
+      throw new Error(`thread history attempt is unavailable: ${jobId}`)
+    }
+    const row = this.db.query<ThreadHistorySnapshotRow, [string, number]>(
+      'SELECT * FROM job_thread_history_snapshots WHERE job_id = ? AND attempt = ?',
+    ).get(jobId, attempt)
+    if (!row) throw new Error(`thread history snapshot is unavailable: ${jobId}/${attempt}`)
+    const snapshot = mapThreadHistorySnapshotRow(row)
+    assertDurableThreadHistorySnapshot(snapshot, {
+      jobId,
+      attempt,
+      chatId: job.chat_id,
+      threadTs: job.thread_ts,
+      repoPath: job.repo_path,
+      currentJobSeq: job.seq,
+    })
+    return snapshot
+  }
+
+  threadHistoryArchiveCount(chatId: string, threadTs: string, repoPath: string): number {
+    return this.db.query<{ count: number }, [string, string, string]>(
+      `SELECT COUNT(*) AS count FROM slack_thread_job_history
+       WHERE chat_id = ? AND thread_ts = ? AND repo_path = ?`,
+    ).get(chatId, threadTs, repoPath)?.count ?? 0
+  }
+
+  threadHistoryOmittedCount(chatId: string, threadTs: string, repoPath: string): number {
+    return threadHistoryScopeState(this.db, chatId, threadTs, repoPath).omitted_job_count
+  }
+
   list(limit = 100): JobRecord[] {
     return this.db.query<JobRow, [number]>(
       'SELECT * FROM jobs ORDER BY seq ASC LIMIT ?',
@@ -5598,6 +6191,7 @@ export class JobStore {
         [sessionId, resumed ? 1 : 0, claimingWorkerId, claimAt, row.id],
       )
       if (update.changes !== 1) return null
+      persistThreadHistorySnapshot(this.db, row, row.attempts + 1, claimAt)
       this.db.run(
         `INSERT INTO job_initial_dispatches (
            job_id, attempt, control_epoch, input_revision,
@@ -7478,6 +8072,7 @@ export class JobStore {
       ).all(cutoff)
       const prunedInterjectionAttachments: string[] = []
       for (const row of candidates) {
+        materializeSettledThreadHistoryJob(this.db, row.id)
         this.db.run(
           `INSERT INTO delivery_tombstones (idempotency_key, write_enabled, completed_at)
            VALUES (?, ?, ?)
@@ -8251,6 +8846,10 @@ export class JobStore {
         [reason, id, workerId, job.attempts],
       )
       if (updated.changes === 1) {
+        this.db.run(
+          'DELETE FROM job_thread_history_snapshots WHERE job_id = ? AND attempt = ?',
+          [id, job.attempts],
+        )
         this.db.run(
           `UPDATE lifecycle_notifications
            SET superseded_at = COALESCE(superseded_at, ?)
@@ -10120,7 +10719,10 @@ export function sanitizeExecutionTextForSlack(
   }
   const protectedGitCommits: string[] = []
   const gitCommitPlaceholderNonce = [...randomUUID().replaceAll('-', '')]
-    .map(character => String.fromCharCode(71 + Number.parseInt(character, 16)))
+    // Use only lowercase non-hex letters. Uppercase placeholders can
+    // accidentally resemble Slack IDs (for example UXXXXXXXX), while a hex
+    // nonce can be consumed by the generic internal-ID guard before restore.
+    .map(character => String.fromCharCode(103 + Number.parseInt(character, 16)))
     .join('')
   sanitized = sanitized.replace(
     /(?<![A-Za-z0-9_])((?:commit(?:[ \t]*(?:id|sha|hash))?|コミット(?:[ \t]*(?:ID|SHA|ハッシュ))?)[ \t]*[:：#]?[ \t]*`?)([0-9a-f]{7,64})(`?)(?![0-9a-f])/gi,
@@ -13174,6 +13776,7 @@ async function runCli(): Promise<void> {
             stateDir: dir,
             logDir: join(dir, 'job-logs'),
             uiApproval: store.latestUiApprovalContext(job.id),
+            threadHistory: store.threadHistorySnapshot(job.id, job.attempts),
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId),
             onSessionReset: () => store.clearSession(job.id),

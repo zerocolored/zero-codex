@@ -101,6 +101,23 @@ session keyに含めません。利用回数はjob retentionとは独立したap
 turnを安全な境界で一時停止してfresh read-only turnから先に回答します。active jobの固定済み権限で処理するため、active write jobでは同threadのread-only senderにも操作を
 委任します。別threadは独立FIFOであり、完了後に作る新jobの権限はそのsenderから改めて判定します。
 
+20 jobはCodex側のcontext window／自動compact制限ではなく、Zeroちゃんがnative physical threadを
+更新するlocal safety policyです。これとは別に、terminal jobのrequest、同thread follow-up、公開済み
+commentary／回答、最終結果または公開用失敗分類を`slack_thread_job_history`へsanitized blockとして永続化します。
+次jobをclaimするtransaction内で、完全一致する`chat_id + thread_ts + repo_path`のimmutable snapshotを
+`job_thread_history_snapshots`へ固定します。native resumeはprovider側の会話を使って二重注入せず、fresh
+threadだけがsnapshotをcurrent requestより前のuntrusted referenceとして受け取ります。write mode／senderは
+snapshot scopeではないため、権限を継承せずに同じ会話だけを継続できます。failed／completed job、daemon再起動、
+20 job rotation、protocol変更、job retention GCをまたいでもarchiveは残ります。
+
+永続archive自体をscopeごとの直近64 jobへ圧縮し、省略済みjob数とcutoffだけを別台帳へ残します。
+snapshotも直近64 job block、128 Ki文字／256 KiBを上限とし、UTF-8 block境界で古いものから省略します。
+各archiveはevent数・文字数・byte数も制限します。credential、URL、machine-local path、Slack／内部ID、
+`<zerokun_files>`成果物path、host control風markerは保存前に除去し、履歴本文はhost authority、write許可、
+UI/UX承認、phase、repository、sandboxを変更できません。添付は件数だけ保持し、binaryは保持しません。
+upgrade前にすでにretention GCされたjobはbackfillできないため、その範囲だけはSlack本文または再添付から
+改めて確認します。
+
 Claude第五advisorは各roundで`fifth-advisor-<nonce>` workspaceをfresh作成し、そこに一意なClaudeを
 起動します。完全なmarker付き回答、repository/protected snapshot不変、exact workspace消失の3条件が
 揃った場合だけ必須第五枠を採択します。既存workspace/paneは入力・focus・closeしません。Herdrに
