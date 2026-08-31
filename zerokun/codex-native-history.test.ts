@@ -347,6 +347,25 @@ describe('native advisor App Server history', () => {
     }
   })
 
+  test('未materialize応答をbaseline helper単体では空履歴へ弱めない', async () => {
+    const error = new AppServerProtocolError(
+      'Codex thread/turns/list failed',
+      'thread/turns/list',
+      7,
+      {
+        code: -32600,
+        message: 'thread parent-thread is not materialized yet; thread/turns/list is unavailable before first user message',
+      },
+    )
+    const session = {
+      request: async () => { throw error },
+    } as unknown as CodexAppServerSession
+    await expect(captureNativeAdvisorParentTurnBaseline(
+      session,
+      'parent-thread',
+    )).rejects.toBe(error)
+  })
+
   test('history readerは単一MCP tableでbrokerを含む全transportを無効化する', () => {
     const overrides = nativeAdvisorHistoryPermissionOverrides([
       'mcp_servers={zerokun_advisors={command="/safe/broker",args=[],enabled=true},host_http={url="http://127.0.0.1:9",enabled=false},host_stdio={command="/usr/bin/false",args=[],enabled=false}}',

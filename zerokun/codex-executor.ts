@@ -5661,24 +5661,26 @@ export async function executeCodexJob(
           developerInstructions: advisorAttempt.developerInstructions,
           ...(model ? { model } : {}),
         }
-        const threadHandshake = resumed && sessionId
-          ? await session.resumeThread({ threadId: sessionId, ...threadParams })
+        const resumeThreadId = resumed && sessionId ? sessionId : null
+        const startedFreshThread = resumeThreadId === null
+        const threadHandshake = resumeThreadId
+          ? await session.resumeThread({ threadId: resumeThreadId, ...threadParams })
           : await session.startThread({ ...threadParams, ephemeral: false })
         currentThreadId = threadHandshake.threadId
         monitorParentThreadId = currentThreadId
         currentThreadSource = threadHandshake.source
-        if (resumed && sessionId && currentThreadId !== sessionId) {
+        if (resumeThreadId && currentThreadId !== resumeThreadId) {
           throw new AppServerProtocolError('thread/resume returned a different thread id')
         }
         options.onSessionId?.(currentThreadId)
         observedSessionId = currentThreadId
         if (parentChildBaseline === null) {
-          parentChildBaseline = nativeAdvisorHistoryEnabled
+          parentChildBaseline = nativeAdvisorHistoryEnabled && !startedFreshThread
             ? await captureNativeAdvisorParentChildBaseline(session, currentThreadId)
             : []
         }
         if (parentTurnBaseline === null) {
-          parentTurnBaseline = nativeAdvisorHistoryEnabled
+          parentTurnBaseline = nativeAdvisorHistoryEnabled && !startedFreshThread
             ? await captureNativeAdvisorParentTurnBaseline(session, currentThreadId)
             : []
         }
