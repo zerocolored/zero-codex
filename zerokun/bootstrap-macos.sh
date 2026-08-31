@@ -1099,9 +1099,12 @@ install_grok_build() {
 
 install_cli_tools() {
   local standalone_codex="$HOME/.local/bin/codex"
-  section "tmux / Herdr / Codex CLI / Grok Build / Claude Code / Bun"
+  section "tmux / Herdr / Codex CLI / Grok Build / Claude Code / GitHub CLI / Bun"
   if ! command -v tmux >/dev/null 2>&1; then
     isolated_network_command "$(command -v brew)" install tmux
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    isolated_network_command "$(command -v brew)" install gh
   fi
   herdr_compatible || install_herdr_standalone
   hash -r
@@ -1135,7 +1138,7 @@ install_cli_tools() {
   hash -r
   append_profile_block '# zerokun bootstrap: Bun' 'export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"'
-  for required in git tmux herdr bun; do
+  for required in git tmux herdr gh bun; do
     command -v "$required" >/dev/null 2>&1 || fail "$required の導入を確認できません"
   done
   secure_standalone_codex >/dev/null \
@@ -1164,7 +1167,9 @@ verify_logins() {
     || fail "Grok CLIが未ログインまたはauthがunsafeです。先にgrok loginを完了してください。Zeroちゃんは認証操作を行いません"
   claude_subscription_ready \
     || fail "Claude Codeはsubscription login済みである必要があります。Herdrで先にloginしてください。Zeroちゃんは認証操作を行いません"
-  ok "Codex / Grok CLI / Claude Codeは事前ログイン済みです"
+  gh auth status --hostname github.com >/dev/null 2>&1 \
+    || fail "GitHub CLIが未ログインです。先にgh auth login --hostname github.com --git-protocol https --webを完了してください。Zeroちゃんは認証操作を行いません"
+  ok "Codex / Grok CLI / Claude Code / GitHub CLIは事前ログイン済みです"
 }
 
 repo_is_clean() {

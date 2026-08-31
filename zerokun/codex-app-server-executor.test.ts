@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'crypto'
 import {
   chmodSync,
   existsSync,
@@ -10,8 +11,17 @@ import {
   writeFileSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
-import { JobStore } from './job-runner.ts'
+import { dirname, join } from 'path'
+import {
+  JobStore,
+  publishStagedGitHubPublication,
+  type JobRecord,
+} from './job-runner.ts'
+import {
+  captureGitHubPublicationBaseline,
+  type GitHubPublicationCommands,
+  type PublicationCommandResult,
+} from './github-publication.ts'
 import {
   CodexCleanupPendingError,
   CodexRateLimitError,
@@ -50,7 +60,7 @@ function secureRoot(): string {
   return root
 }
 
-function git(cwd: string, args: string[]): void {
+function git(cwd: string, args: string[]): string {
   const result = Bun.spawnSync(['/usr/bin/git', '-C', cwd, ...args], {
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
     env: {
@@ -59,6 +69,43 @@ function git(cwd: string, args: string[]): void {
     },
   })
   if (result.exitCode !== 0) throw new Error(result.stderr.toString())
+  return result.stdout.toString().trim()
+}
+
+function publicationCommandResult(
+  exitCode: number,
+  stdout = '',
+  stderr = '',
+): PublicationCommandResult {
+  return { exitCode, stdout, stderr }
+}
+
+function completeFixtureJob(
+  store: JobStore,
+  job: JobRecord,
+  sessionId: string,
+  result: string,
+): void {
+  if (!job.writeEnabled) {
+    store.complete(job.id, sessionId, result)
+    return
+  }
+  if (!store.hasStagedExecution(job.id)) {
+    const input = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+    store.ensureExecutionResultStaged(job.id, sessionId, result, {
+      version: 1,
+      jobId: job.id,
+      jobAttempt: job.attempts,
+      logicalNonce: '0'.repeat(32),
+      inputRevision: input.revision,
+      inputDigest: input.digest,
+      reviewRound: 1,
+      reviewedRepositoryDigest: createHash('sha256').update('fixture-review').digest('hex'),
+      baselineDigest: createHash('sha256').update('fixture-baseline').digest('hex'),
+      plans: [],
+    })
+  }
+  store.completeStagedExecution(job.id)
 }
 
 function cleanupGatePaths(stateDir: string, supervisorPid: number): {
@@ -257,7 +304,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-publication", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -290,16 +337,28 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased", "phased-publication", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "準備完了\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
                 if mode == "phased-ui-approved":
+                    message = "準備完了\\n" + '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>\\n' + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
                     envelope = re.search(r"<zerokun_ui_response_decision>([^\\n]+)</zerokun_ui_response_decision>", phase_prompt)
                     if envelope:
                         semantic = envelope.group(0).replace("<approve|revise|question|reject>", "approve").replace("<unchanged|compatible|conflict>", "unchanged")
                         message = semantic + "\\n" + message
             elif stage == "implementation":
+                if mode == "phased-publication":
+                    branch_match = re.search(r"feature branch based on the prepared branch: (zerochan/[0-9a-f]{20})", phase_prompt)
+                    if not branch_match:
+                        raise RuntimeError("publication branch missing from implementation prompt")
+                    branch = branch_match.group(1)
+                    subprocess.run(["/usr/bin/git", "-C", handshake_cwd, "switch", "-c", branch], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    with open(os.path.join(handshake_cwd, "published.txt"), "w", encoding="utf-8") as stream:
+                        stream.write("reviewed publication\\n")
+                    subprocess.run(["/usr/bin/git", "-C", handshake_cwd, "add", "published.txt"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["/usr/bin/git", "-C", handshake_cwd, "commit", "-m", "fix: publish exact reviewed commit"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["/usr/bin/git", "-C", handshake_cwd, "switch", "main"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 marker = re.search(r"\\[ZERO_IMPLEMENTATION_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "実装完了\\n" + (marker.group(0) if marker else "[ZERO_IMPLEMENTATION_READY:missing:r1:missing]")
             elif stage == "review":
@@ -580,7 +639,7 @@ function fixture(
     | 'failed-steer' | 'failed-turn'
     | 'error-steer' | 'rate-error' | 'rate-retrying' | 'capacity-error'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
-    | 'capacity-started-command' | 'phased' | 'phased-ui-approved'
+    | 'capacity-started-command' | 'phased' | 'phased-publication' | 'phased-ui-approved'
     | 'phased-capacity-review-once'
     | 'phased-capacity-implementation-once'
     | 'phased-native-history-fresh' | 'phased-native-history-resume'
@@ -616,7 +675,7 @@ function fixture(
   let job = initialJob
   if (mode === 'phased-native-history-resume'
     || mode === 'phased-native-history-resume-unmaterialized') {
-    store.complete(initialJob.id, 'thread-app-server-1', '過去ジョブ完了')
+    completeFixtureJob(store, initialJob, 'thread-app-server-1', '過去ジョブ完了')
     store.enqueue({
       chatId: initialJob.chatId,
       threadTs: initialJob.threadTs,
@@ -775,7 +834,7 @@ function fixture(
         error,
       })
     ),
-    sealPhaseResult: ({ logicalNonce, threadId, inputRevision, inputDigest }) => (
+    sealPhaseResult: ({ logicalNonce, threadId, inputRevision, inputDigest, execution }) => (
       store.sealAppServerPhaseResult({
         jobId: job.id,
         epoch: job.controlEpoch,
@@ -783,6 +842,7 @@ function fixture(
         threadId,
         inputRevision,
         inputDigest,
+        execution,
       })
     ),
     beginDispatch: ({ control, executorNonce, threadId, turnId, requestId }) => {
@@ -1190,7 +1250,15 @@ describe('production App Server executor', () => {
     }
     const result = await execution
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result.publication).toMatchObject({
+      jobId: value.job.id,
+      jobAttempt: value.job.attempts,
+      inputRevision: 1,
+      plans: [],
+    })
+    expect(value.store.hasGitHubPublicationCheckpoint(value.job.id)).toBe(true)
+    expect(value.store.hasStagedExecution(value.job.id)).toBe(true)
     expect(gates).toEqual(['prepare', 'review-1'])
     expect(processIds).toHaveLength(3)
     expect(new Set(processIds).size).toBe(3)
@@ -1220,6 +1288,91 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('非空review済みcommitをatomic sealからhost push・PR receipt・terminal完了まで通す', async () => {
+    const value = fixture('phased-publication', true)
+    git(value.repo, ['init', '--initial-branch=main'])
+    git(value.repo, ['config', 'user.email', 'zero@example.invalid'])
+    git(value.repo, ['config', 'user.name', 'Zero Test'])
+    git(value.repo, ['config', 'remote.origin.url', 'https://github.com/example/integration.git'])
+    git(value.repo, ['add', 'AGENTS.md'])
+    git(value.repo, ['commit', '-m', 'chore: initial'])
+    const baseline = captureGitHubPublicationBaseline(value.repo, [value.repo])
+    const execution = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'phased-publication' },
+      phaseGateForTesting: {},
+      liveControls: value.hooks,
+      publicationBaselineForTesting: baseline,
+    })
+    expect(execution.publication?.plans).toHaveLength(1)
+    const plan = execution.publication!.plans[0]!
+    expect(git(value.repo, ['branch', '--show-current'])).toBe('main')
+    expect(git(value.repo, ['rev-parse', `refs/heads/${plan.headBranch}`])).toBe(plan.commitSha)
+    expect(value.store.hasStagedExecution(value.job.id)).toBe(true)
+
+    let remoteHead: string | null = null
+    let pullRequestExists = false
+    let pushes = 0
+    let creates = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repository, args) {
+        if (args[0] === 'ls-remote') {
+          const ref = args.at(-1)
+          if (ref === `refs/heads/${plan.baseBranch}`) {
+            return publicationCommandResult(0, `${plan.initialHead}\t${ref}\n`)
+          }
+          return publicationCommandResult(
+            0,
+            remoteHead ? `${remoteHead}\trefs/heads/${plan.headBranch}\n` : '',
+          )
+        }
+        if (args[0] === 'push') {
+          pushes += 1
+          remoteHead = plan.commitSha
+          return publicationCommandResult(0, 'ok')
+        }
+        throw new Error(`unexpected Git command: ${args.join(' ')}`)
+      },
+      async runGh(args) {
+        if (args.includes('GET')) {
+          return publicationCommandResult(0, pullRequestExists ? JSON.stringify([{
+            number: 61,
+            html_url: 'https://github.com/example/integration/pull/61',
+            state: 'open',
+            merged_at: null,
+            head: {
+              ref: plan.headBranch,
+              sha: plan.commitSha,
+              repo: { full_name: plan.repositorySlug },
+            },
+            base: { ref: plan.baseBranch, repo: { full_name: plan.repositorySlug } },
+          }]) : '[]')
+        }
+        if (args.includes('POST')) {
+          creates += 1
+          pullRequestExists = true
+          return publicationCommandResult(0, '{}')
+        }
+        throw new Error(`unexpected gh command: ${args.join(' ')}`)
+      },
+    }
+    await publishStagedGitHubPublication(value.store, value.job.id, {
+      commands,
+      retryMsForTesting: 1,
+    })
+    value.store.completeStagedExecution(value.job.id)
+    expect(value.store.get(value.job.id)).toMatchObject({ status: 'completed' })
+    expect(value.store.get(value.job.id)?.result).toContain(
+      'https://github.com/example/integration/pull/61',
+    )
+    expect(pushes).toBe(1)
+    expect(creates).toBe(1)
+    value.store.close()
+  }, 30_000)
+
   test('実装後reviewのmodel capacityは実装を繰り返さず同じ工程から自動再開する', async () => {
     const value = fixture('phased-capacity-review-once', true)
     const phaseLog = join(value.root, 'capacity-review-phases.log')
@@ -1243,7 +1396,7 @@ describe('production App Server executor', () => {
       liveControls: value.hooks,
     })
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
       .map(line => line.split('\t')[0])
     expect(stages).toEqual(['prepare', 'implementation', 'review', 'review'])
@@ -1277,7 +1430,7 @@ describe('production App Server executor', () => {
       liveControls: value.hooks,
     })
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
       .map(line => line.split('\t')[0])
     expect(stages).toEqual(['prepare', 'implementation', 'review'])
@@ -1378,7 +1531,7 @@ describe('production App Server executor', () => {
       liveControls: value.hooks,
     })
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
       .map(line => line.split('\t')[0])
     expect(stages).toEqual(['prepare', 'implementation', 'review'])
@@ -1515,7 +1668,7 @@ describe('production App Server executor', () => {
       liveControls: value.hooks,
     })
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     expect(gateStages).toEqual(['prepare', 'review'])
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(rpc.filter(entry => entry.method === 'thread/start')).toHaveLength(1)
@@ -1523,7 +1676,7 @@ describe('production App Server executor', () => {
     expect(rpc.filter(entry => entry.method === 'turn/start')).toHaveLength(3)
     expect(rpc.filter(entry => entry.method === 'thread/list')).toHaveLength(0)
     expect(rpc.filter(entry => entry.method === 'thread/turns/list')).toHaveLength(0)
-    value.store.complete(value.job.id, result.sessionId, result.result)
+    completeFixtureJob(value.store, value.job, result.sessionId, result.result)
     expect(value.store.get(value.job.id)?.status).toBe('completed')
     value.store.close()
   }, 30_000)
@@ -1697,7 +1850,7 @@ describe('production App Server executor', () => {
       liveControls: value.hooks,
     })
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     expect(gateStages).toEqual(['prepare', 'review'])
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     const firstTurnStart = rpc.findIndex(entry => entry.method === 'turn/start')
@@ -1706,7 +1859,7 @@ describe('production App Server executor', () => {
     expect(turnBaseline).toBeGreaterThanOrEqual(0)
     expect(rpc.filter(entry => entry.method === 'thread/turns/list')).toHaveLength(1)
     expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(3)
-    value.store.complete(value.job.id, result.sessionId, result.result)
+    completeFixtureJob(value.store, value.job, result.sessionId, result.result)
     expect(value.store.get(value.job.id)?.status).toBe('completed')
     value.store.close()
   }, 30_000)
@@ -1734,7 +1887,7 @@ describe('production App Server executor', () => {
       onStderrChunk: value => warnings.push(Buffer.from(value).toString('utf8')),
       liveControls: value.hooks,
     })
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     expect(gateCalls).toBe(2)
     expect(warnings.join('')).toContain('[Zero advisor warning] parent-turn-baseline')
     expect(warnings.join('')).toContain('[Zero advisor warning] preparation-history')
@@ -1795,7 +1948,7 @@ describe('production App Server executor', () => {
       onStderrChunk: value => warnings.push(Buffer.from(value).toString('utf8')),
       liveControls: value.hooks,
     })
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     expect(gateCalls).toBe(2)
     expect(warnings.join('')).toContain('[Zero advisor warning] preparation-history')
     expect(warnings.join('')).toContain('[Zero advisor warning] review-history')
@@ -1873,7 +2026,7 @@ describe('production App Server executor', () => {
       threadHistory,
     })
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     expect(resets).toBe(1)
     const methods = readFileSync(rpcLog, 'utf8').trim().split('\n')
       .map(line => JSON.parse(line).method)
@@ -1986,7 +2139,7 @@ describe('production App Server executor', () => {
       liveControls: value.hooks,
     })
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     expect(gates).toEqual(['prepare-r1', 'prepare-r2', 'review-r2-1'])
     expect(processIds).toHaveLength(5)
     expect(new Set(processIds).size).toBe(5)
@@ -2091,7 +2244,7 @@ describe('production App Server executor', () => {
     value.store.markInterjectionNotificationDelivered(notification.id)
     const result = await execution
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     expect(gates).toEqual(['prepare-r1', 'prepare-r2', 'review-r2-1'])
     expect(processIds).toHaveLength(6)
     expect(new Set(processIds).size).toBe(6)
@@ -2200,7 +2353,7 @@ describe('production App Server executor', () => {
       liveControls: value.hooks,
     })
 
-    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     expect(stagedAtTerminal).toBe(true)
     expect(gates).toEqual(['prepare-r1', 'prepare-r2', 'review-r2-1'])
     expect(processIds).toHaveLength(5)

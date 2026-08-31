@@ -148,6 +148,15 @@ import {
   renderColdStartThreadHistory,
   type DurableThreadHistorySnapshot,
 } from './thread-history.ts'
+import {
+  assertGitHubPublicationSet,
+  captureGitHubPublicationBaseline,
+  extendGitHubPublicationBaseline,
+  gitHubPublicationBaselineDigest,
+  prepareGitHubPublicationPlans,
+  type GitHubPublicationBaseline,
+  type GitHubPublicationSet,
+} from './github-publication.ts'
 
 export { resolveCodexExecutable } from './standalone-codex.ts'
 
@@ -2919,8 +2928,9 @@ export function buildCodexDeveloperInstructions(
         'only a grouping directory; do not initialize Git there and do not modify files outside',
         'the repository members listed below. Work across members only when the Slack request',
         'requires it. Before inspecting or editing a member, read that member\'s applicable',
-        'AGENTS.md; if it has no AGENTS.md, read CLAUDE.md as legacy guidance. Commit, test, and',
-        'push each changed repository independently. Preserve untouched members.',
+        'AGENTS.md; if it has no AGENTS.md, read CLAUDE.md as legacy guidance. Implement, test,',
+        'and commit each changed repository independently. The trusted host publishes reviewed',
+        'commits afterward; do not push or create a PR. Preserve untouched members.',
         ...projectLayout.gitRoots.map(root => `Workspace repository member: ${root}`),
       ].join('\n')
     : ''
@@ -2943,8 +2953,9 @@ export function buildCodexDeveloperInstructions(
       'exactly one fresh solution_analyst and one fresh risk_reviewer per round, then use the',
       'zerokun_advisors broker exactly as directed by the host block. Do not implement, test with',
       'writes, commit, push, deploy, create a PR, run review, or write the Slack answer.',
-      'In implementation: implement and test only the prepared durable input, commit and push as',
-      'required, then stop. Do not spawn subagents, call advisor tools, review, or write the',
+      'In implementation: implement and test only the prepared durable input, then commit and',
+      'stop. Do not push, create a PR, or access credentials; the trusted host publishes only the',
+      'reviewed commit after input sealing. Do not spawn subagents, call advisor tools, review, or write the',
       'Slack answer. If a follow-up arrives, stop further mutation and let the host restart',
       'read-only preparation for the combined input.',
       'In review: remain read-only; complete only the host-selected review round with exactly one',
@@ -2954,7 +2965,8 @@ export function buildCodexDeveloperInstructions(
       'the host-bound same-thread message, classify whether it changes the task, and return the',
       'exact reply envelope from the host block. Never mutate files, Git, or external services.',
       'In complete compatibility mode: perform investigation and design before editing, then',
-      'implement, test, commit and push as required, and complete review only after those changes.',
+      'implement, test, and commit as required, and complete review only after those changes.',
+      'Do not push or create a PR; trusted host publication occurs after the accepted review.',
       'Use the exact current-input advisor markers supplied by the host block and do not mutate',
       'anything after the accepted review.',
       '',
@@ -3117,8 +3129,9 @@ export function buildCodexWorkerPrompt(
   } else {
     control.push(
       'Host phase: complete compatibility mode for a write-authorized request.',
-      'Complete investigation and design before editing, then implement and test, commit and',
-      'push as required, and finally run read-only review without further repository mutation.',
+      'Complete investigation and design before editing, then implement, test, and commit, and',
+      'finally run read-only review without further repository mutation. Do not push or create a',
+      'PR; the trusted host publishes only after the accepted review and durable input seal.',
       `Native advisor markers must use [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|design|review>:<round>:<solution|risk>]. Put each marker exactly once, on a line by itself as the final response line, with no output after it.`,
     )
     if (host.browserEnabled) {
@@ -3244,6 +3257,11 @@ export function buildCodexPhasePrompt(
       'For a bounded unavailable native attempt, submit attempted=true, adopted=false, and its',
       'concise reason to the broker; do not stop preparation or invent a response.',
       ...approvalContext,
+      `Valid implementation repository IDs: ${JSON.stringify(repositoryIdentifiers)}`,
+      'Choose the smallest complete set of repositories that implementation may modify.',
+      'For every ready decision, put this exact JSON envelope immediately before the final',
+      'ready marker, using only the exact IDs above in sorted order with no duplicates:',
+      '<zerokun_repository_scope>{"repositories":["<implementation repository ID>"]}</zerokun_repository_scope>',
       ...(browserEnabled ? [
         'For a material visual UI/UX change, do not edit the product repository. Capture the actual',
         'current representative state as Before, create a frontend-only proposal in the writable',
@@ -3252,7 +3270,6 @@ export function buildCodexPhasePrompt(
         'Use synthetic/test data in both states. Never render credentials, secrets, local paths,',
         'browser/session data, production data, or personal/private information into either image.',
         'Return the following exact structure, with no output after the host-only image envelope:',
-        `Valid implementation repository IDs: ${JSON.stringify(repositoryIdentifiers)}`,
         'Choose every repository that implementation may modify. Use only the exact IDs above,',
         'sorted lexicographically with no duplicates. Include all members when the change spans',
         'multiple repositories; this scope is persisted and enforced after approval.',
@@ -3274,14 +3291,28 @@ export function buildCodexPhasePrompt(
     ].join('\n')
   }
   if (stage === 'implementation') {
+    const publicationBranch = `zerochan/${createHash('sha256')
+      .update(JSON.stringify({ jobId: job.id, attempt: job.attempts }))
+      .digest('hex')
+      .slice(0, 20)}`
     return [
       base,
       ...host,
       'Host phase: write implementation.',
       'The root request is write-authorized. Under the active-thread delegation contract, every',
       'same-thread follow-up in the transcript belongs to this fixed-permission job even when its',
-      'sender would be read-only in a new thread. Implement, test, commit, and push this exact',
-      'prepared combined input. Review runs later in a separate read-only process.',
+      'sender would be read-only in a new thread. Implement, test, and commit this exact prepared',
+      'combined input. Do not push, create a PR, or access credentials. Review runs later in a',
+      'separate read-only process, and the trusted host publishes its accepted commit afterward.',
+      'Before the first edit in every selected repository, create or switch to this exact local',
+      `feature branch based on the prepared branch: ${publicationBranch}`,
+      'Use the same exact branch for later implementation-fix rounds. Never commit directly to',
+      'the prepared base branch or choose a different publication branch.',
+      'Do not modify Git remotes, local Git config, hooks, or credential settings. Include every',
+      'task-owned change in a commit. After the commit, switch every selected repository back to',
+      'the exact prepared base branch and commit it had before implementation, leaving the exact',
+      'feature branch ref at the committed result. The worktree must be clean. Never claim that',
+      'push or PR creation already happened.',
       ...(browserEnabled ? [
         'For browser-visible behavior, start the application on localhost and call',
         'zerokun_browser.verify_local_page with the exact URL and expected visible text. Preserve',
@@ -3301,6 +3332,8 @@ export function buildCodexPhasePrompt(
       'another browser, operator profile, remote URL, or arbitrary CDP.',
     ] : []),
     'Review the unchanged repository for this exact implemented input. Each native advisor',
+    'must review the committed diff on the host-assigned zerochan feature branch; the worktree is',
+    'intentionally back on its clean prepared base so a later task cannot stack on this change.',
     `response must end with [ZERO_NATIVE_ADVISOR:${attemptNonce}:r${input.revision}:${input.digest}:review:${reviewRound}:<solution|risk>] after replacing only the final perspective placeholder. Put that marker exactly once, on a line by itself as the final line, with no output after it.`,
     'For a bounded unavailable native attempt, submit attempted=true, adopted=false, and its',
     'concise reason to the broker; do not stop review or invent a response.',
@@ -3799,6 +3832,21 @@ export function buildCodexPermissionOverrides(
       }
     }
     if (gitLayout?.pointerFile) rules.set(gitLayout.pointerFile, 'read')
+    if (gitLayout) {
+      // The implementation worker may create commits, but publication identity
+      // is host-owned. Keep local remotes/config and commit hooks immutable so
+      // a reviewed SHA cannot redirect the later host publication or execute a
+      // newly planted hook before the host performs its independent checks.
+      for (const configPath of [
+        join(gitLayout.commonDir, 'config'),
+        join(gitLayout.commonDir, 'config.worktree'),
+        join(gitLayout.gitDir, 'config.worktree'),
+      ]) {
+        rules.set(configPath, 'read')
+      }
+      const hooksPath = join(gitLayout.commonDir, 'hooks')
+      rules.set(hooksPath, 'read')
+    }
   }
   for (const [gitPath, access] of gitMetadataRules) rules.set(gitPath, access)
   for (const attachment of job.attachments) {
@@ -3816,6 +3864,15 @@ export function buildCodexPermissionOverrides(
     '"GIT_CONFIG_GLOBAL"="/dev/null"',
     '"GIT_CONFIG_NOSYSTEM"="1"',
     '"GIT_TERMINAL_PROMPT"="0"',
+    ...(executionWriteEnabled ? [
+      // The sandbox intentionally hides operator HOME/global Git config. A
+      // neutral host-owned identity keeps ordinary clones committable without
+      // exposing a personal email or letting the model rewrite remote config.
+      '"GIT_AUTHOR_NAME"="Zero Project Assistant"',
+      '"GIT_AUTHOR_EMAIL"="zero-project-assistant@users.noreply.github.com"',
+      '"GIT_COMMITTER_NAME"="Zero Project Assistant"',
+      '"GIT_COMMITTER_EMAIL"="zero-project-assistant@users.noreply.github.com"',
+    ] : []),
     // Desktop Codex may materialize browser/repl trust defaults into the
     // effective set map. Override them to inert values so a Slack job cannot
     // inherit the operator's browser bridge or trusted local code paths.
@@ -4376,6 +4433,7 @@ export interface CodexLiveControlHooks {
     threadId: string
     inputRevision: number
     inputDigest: string
+    execution: JobExecutionResult
   }): 'sealed' | 'input-changed' | 'cancelled' | 'pending-inbound'
   beginDispatch(options: {
     control: JobLiveInputRecord
@@ -4517,6 +4575,10 @@ export async function executeCodexJob(
     progressPublishRetryMsForTesting?: number
     /** Fixture-only delay for an internally resumed transient model failure. */
     transientRetryDelayMsForTesting?: number
+    /** Fixture-only baseline. Production captures every repository before implementation. */
+    publicationBaselineForTesting?: GitHubPublicationBaseline | null
+    /** Finalize artifacts before the host atomically seals and stages a phased result. */
+    finalizeSuccessfulResult?(execution: JobExecutionResult): JobExecutionResult
     onSuccessfulResult?(execution: JobExecutionResult): JobExecutionResult
     supervisorCleanupGraceMs?: number
     /** Grace after an acknowledged user cancel; this is not a whole-job timeout. */
@@ -7021,6 +7083,12 @@ export async function executeCodexJob(
     let preparedRepositoryDigest: string | null = null
     let preparedRepositoryScope: string[] | null = null
     let implementedInputDigest: string | null = null
+    let publicationBaseline: GitHubPublicationBaseline | null = null
+    const publicationRepositoryScope = new Set<string>()
+    const publicationBranch = `zerochan/${createHash('sha256')
+      .update(JSON.stringify({ jobId: job.id, attempt: job.attempts }))
+      .digest('hex')
+      .slice(0, 20)}`
     let parentSource: AppServerSessionSource | null = null
     let parentChildBaseline: string[] | null = null
     let parentTurnBaseline: NativeAdvisorParentTurnBaseline | null = null
@@ -7422,7 +7490,13 @@ export async function executeCodexJob(
           )
           currentRepositoryScope = preparationDecision.kind === 'approval-required'
             ? preparationDecision.proposal.repositoryScope
-            : approvalScope
+            : preparationDecision.repositoryScope
+          for (const repository of publicationRepositoryScope) {
+            if (!currentRepositoryScope.includes(repository)) {
+              currentRepositoryScope.push(repository)
+            }
+          }
+          currentRepositoryScope.sort()
           currentRepositoryDigest = currentRepositoryScope
             ? advisorRepositoryScopeDigest(observedRepositorySnapshot, currentRepositoryScope)
             : observedRepositoryFullDigest
@@ -7568,6 +7642,20 @@ export async function executeCodexJob(
         if (repositoryBeforeImplementation !== preparedRepositoryDigest) {
           throw new CodexRepositoryChangedBeforeImplementationError()
         }
+        const implementationScope = preparedRepositoryScope
+          ?? advisorRepositoryIdentifiers(repositoryBeforeImplementationSnapshot)
+        for (const repository of implementationScope) publicationRepositoryScope.add(repository)
+        const implementationGitRoots = scopeAdvisorRepositorySnapshot(
+          repositoryBeforeImplementationSnapshot,
+          [...publicationRepositoryScope].sort(),
+        ).gitRoots
+        if (testCodexBin === undefined) {
+          publicationBaseline = publicationBaseline === null
+            ? captureGitHubPublicationBaseline(jobRepo, implementationGitRoots)
+            : extendGitHubPublicationBaseline(publicationBaseline, implementationGitRoots)
+        } else if (publicationBaseline === null) {
+          publicationBaseline = options.publicationBaselineForTesting ?? null
+        }
         const outcome = await runPhase(
           'implementation', reviewRound, preparedInput,
           preparedRepositoryDigest, preparedRepositoryScope ?? undefined,
@@ -7626,6 +7714,14 @@ export async function executeCodexJob(
       }
 
       if (!preparedInput) throw new Error('read-only review omitted its prepared input binding')
+      const publicationPlansBeforeReview = publicationBaseline
+        ? prepareGitHubPublicationPlans(
+            publicationBaseline,
+            preparedRepositoryScope ?? undefined,
+            undefined,
+            publicationBranch,
+          )
+        : null
       const repositoryBeforeReviewSnapshot = snapshotAdvisorRepository(advisorProjectLayout)
       const repositoryBeforeReview = preparedRepositoryScope
         ? advisorRepositoryScopeDigest(
@@ -7786,11 +7882,56 @@ export async function executeCodexJob(
         nextStage = 'prepare'
         continue
       }
+      const publication: GitHubPublicationSet | undefined = publicationBaseline
+        ? {
+            version: 1,
+            jobId: job.id,
+            jobAttempt: job.attempts,
+            logicalNonce: execution.advisorAttemptNonce,
+            inputRevision: finalInput.revision,
+            inputDigest: finalInput.digest,
+            reviewRound,
+            reviewedRepositoryDigest: repositoryBeforePublication,
+            baselineDigest: gitHubPublicationBaselineDigest(publicationBaseline),
+            plans: prepareGitHubPublicationPlans(
+              publicationBaseline,
+              preparedRepositoryScope ?? undefined,
+              publicationPlansBeforeReview?.map(plan => ({
+                gitRoot: plan.gitRoot,
+                head: plan.commitSha,
+              })),
+              publicationBranch,
+            ),
+          }
+        : testCodexBin !== undefined ? {
+            version: 1,
+            jobId: job.id,
+            jobAttempt: job.attempts,
+            logicalNonce: execution.advisorAttemptNonce,
+            inputRevision: finalInput.revision,
+            inputDigest: finalInput.digest,
+            reviewRound,
+            reviewedRepositoryDigest: repositoryBeforePublication,
+            baselineDigest: createHash('sha256')
+              .update('fixture-only-empty-publication')
+              .digest('hex'),
+            plans: [],
+          } : undefined
+      if (publication) assertGitHubPublicationSet(publication)
+      const rawResult = {
+        sessionId: sessionId!,
+        result: capResult(decision.body),
+        ...(publication ? { publication } : {}),
+      }
+      const result = options.finalizeSuccessfulResult
+        ? options.finalizeSuccessfulResult(rawResult)
+        : rawResult
       const seal = controls.sealPhaseResult({
         logicalNonce: execution.advisorAttemptNonce,
         threadId: sessionId!,
         inputRevision: finalInput.revision,
         inputDigest: finalInput.digest,
+        execution: result,
       })
       if (seal === 'cancelled') throw new CodexUserCancelledError()
       if (seal !== 'sealed') {
@@ -7802,8 +7943,7 @@ export async function executeCodexJob(
         nextStage = 'prepare'
         continue
       }
-      const result = { sessionId: sessionId!, result: capResult(decision.body) }
-      return options.onSuccessfulResult ? options.onSuccessfulResult(result) : result
+      return result
     }
   }
   const completeControls = options.liveControls
@@ -8085,12 +8225,16 @@ export async function executeCodexJob(
         // any descendants are gone, then retire the whole attempt atomically.
         await execution.retireCompletedRegistration()
       }
+      const finalizedResult = options.finalizeSuccessfulResult
+        ? options.finalizeSuccessfulResult(result)
+        : result
       if (completeControls?.sealPhaseResult && finalInput) {
         const seal = completeControls.sealPhaseResult({
           logicalNonce: execution.advisorAttemptNonce,
-          threadId: result.sessionId,
+          threadId: finalizedResult.sessionId,
           inputRevision: finalInput.revision,
           inputDigest: finalInput.digest,
+          execution: finalizedResult,
         })
         if (seal === 'cancelled') throw new CodexUserCancelledError()
         if (seal !== 'sealed') {
@@ -8098,7 +8242,9 @@ export async function executeCodexJob(
           continue
         }
       }
-      return options.onSuccessfulResult ? options.onSuccessfulResult(result) : result
+      return completeControls?.sealPhaseResult
+        ? finalizedResult
+        : options.onSuccessfulResult ? options.onSuccessfulResult(result) : result
     }
 
     // Every ordinary non-success path has a self-confirmed supervisor receipt.

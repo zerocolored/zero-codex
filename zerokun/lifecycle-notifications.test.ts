@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import {
   JobStore,
   SlackNotifier,
@@ -14,6 +14,7 @@ import {
   sealArtifactResult,
 } from './job-runner.ts'
 import { artifactDirForJob, CodexInterruptedError } from './codex-executor.ts'
+import { readAdvisorInputSnapshot } from './advisor-input.ts'
 
 const roots: string[] = []
 
@@ -34,6 +35,28 @@ function runningJob(): { root: string; store: JobStore; job: NonNullable<ReturnT
   const job = store.claimNext('worker-1')
   if (!job) throw new Error('fixture job was not claimed')
   return { root, store, job }
+}
+
+function completeWriteFixture(
+  store: JobStore,
+  job: NonNullable<ReturnType<JobStore['claimNext']>>,
+  sessionId: string,
+  result: string,
+): void {
+  const input = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+  store.ensureExecutionResultStaged(job.id, sessionId, result, {
+    version: 1,
+    jobId: job.id,
+    jobAttempt: job.attempts,
+    logicalNonce: '0'.repeat(32),
+    inputRevision: input.revision,
+    inputDigest: input.digest,
+    reviewRound: 1,
+    reviewedRepositoryDigest: '1'.repeat(64),
+    baselineDigest: '2'.repeat(64),
+    plans: [],
+  })
+  store.completeStagedExecution(job.id)
 }
 
 function stageAnsweredInterjection(
@@ -421,7 +444,7 @@ describe('durable lifecycle notifications', () => {
     store.markLifecycleNotificationDelivered(started.id)
     const firstId = store.pendingCommentaryNotifications(2_000)[0]?.id
     expect(firstId).toBeTruthy()
-    store.complete(job.id, 'commentary-session', 'done')
+    completeWriteFixture(store, job, 'commentary-session', 'done')
     expect(store.pendingTerminalNotifications(2_000)).toEqual([])
 
     const delivered: Array<{ id: string; text: string }> = []
@@ -858,7 +881,7 @@ describe('durable lifecycle notifications', () => {
 
   test('completion body is not reposted when the check reaction needs retry', async () => {
     const { store, job } = runningJob()
-    store.complete(job.id, 'session-1', 'できました。')
+    completeWriteFixture(store, job, 'session-1', 'できました。')
     const posts: string[] = []
     let reactionAttempts = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
@@ -889,11 +912,7 @@ describe('durable lifecycle notifications', () => {
       `できました。\n<zerokun_files>${JSON.stringify([artifact])}</zerokun_files>`,
       state,
     )
-    store.complete(
-      job.id,
-      'session-artifact',
-      result,
-    )
+    completeWriteFixture(store, job, 'session-artifact', result)
     const posts: string[] = []
     let reactions = 0
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
