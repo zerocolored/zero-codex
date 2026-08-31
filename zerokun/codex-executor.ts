@@ -1936,6 +1936,12 @@ const MAX_NATIVE_HISTORY_RAW_ITEMS = 65_536
 const MAX_NATIVE_HISTORY_EVIDENCE_ITEMS = 4_096
 const MAX_NATIVE_HISTORY_CHILDREN = 4_096
 
+type NativeAdvisorParentTurnBaselineEntry = {
+  id: string
+  status: 'completed' | 'interrupted' | 'failed'
+}
+type NativeAdvisorParentTurnBaseline = NativeAdvisorParentTurnBaselineEntry[]
+
 function nativeHistoryRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} is invalid`)
@@ -2006,6 +2012,58 @@ async function captureNativeAdvisorParentChildBaseline(
   return children.map(child => String(child.id))
 }
 
+/** @internal Exported so the pre-turn App Server snapshot contract can be tested directly. */
+export async function captureNativeAdvisorParentTurnBaseline(
+  session: CodexAppServerSession,
+  parentThreadId: string,
+): Promise<NativeAdvisorParentTurnBaseline> {
+  const turns: NativeAdvisorParentTurnBaseline = []
+  const turnIds = new Set<string>()
+  const seenCursors = new Set<string>()
+  let cursor: string | null = null
+  for (let pageIndex = 0; pageIndex < MAX_NATIVE_HISTORY_PAGES; pageIndex += 1) {
+    const page = (await session.request('thread/turns/list', {
+      threadId: parentThreadId,
+      cursor,
+      limit: 100,
+      sortDirection: 'asc',
+      itemsView: 'full',
+    }, { timeoutMs: 15_000 })).result
+    if (!Array.isArray(page.data)) {
+      throw new Error('native advisor pre-turn parent history page is invalid')
+    }
+    for (const rawTurn of page.data) {
+      const turn = nativeHistoryRecord(
+        rawTurn,
+        'native advisor pre-turn parent history entry',
+      )
+      const id = turn.id
+      const status = turn.status
+      if (typeof id !== 'string' || id.length < 1 || id.length > 256
+        || turnIds.has(id)
+        || (status !== 'completed' && status !== 'interrupted' && status !== 'failed')) {
+        throw new Error('native advisor pre-turn parent history is invalid')
+      }
+      turnIds.add(id)
+      turns.push({ id, status })
+      if (turns.length > MAX_NATIVE_HISTORY_TURNS) {
+        throw new Error('native advisor pre-turn parent history exceeds the managed bound')
+      }
+    }
+    const nextCursor = nativeHistoryCursor(
+      page.nextCursor,
+      'native advisor pre-turn parent history',
+    )
+    if (nextCursor === null) return turns
+    if (page.data.length === 0 || seenCursors.has(nextCursor)) {
+      throw new Error('native advisor pre-turn parent history pagination did not advance')
+    }
+    seenCursors.add(nextCursor)
+    cursor = nextCursor
+  }
+  throw new Error('native advisor pre-turn parent history page count exceeds the managed bound')
+}
+
 export async function assertNativeAdvisorHistory(options: {
   codexBin: string
   repoPath: string
@@ -2014,6 +2072,7 @@ export async function assertNativeAdvisorHistory(options: {
   parentThreadId: string
   parentSource: AppServerSessionSource
   parentChildBaseline: string[]
+  parentTurnBaseline: NativeAdvisorParentTurnBaseline
   parentTurnIds: string[]
   rounds: NativeAdvisorRoundEvidence[]
   seatbeltFingerprint?: SeatbeltFingerprint
@@ -2223,6 +2282,7 @@ export async function assertNativeAdvisorHistory(options: {
 
   type ThreadEvidenceRead = {
     response: Record<string, unknown>
+    turnCatalogue: Array<{ id: string; status: string }>
     fallbackViewDigests: { turnsList: string; threadRead: string } | null
     fallbackViewsAgree: boolean | null
   }
@@ -2545,8 +2605,23 @@ export async function assertNativeAdvisorHistory(options: {
         ...membership,
       ]))
     }
+    const catalogueTurns = listedTurns.length > 0
+      ? listedTurns
+      : await fullReadTurns()
+    const turnCatalogue = catalogueTurns.map((turn, index) => {
+      const id = turn.id
+      const status = turn.status
+      if (typeof id !== 'string' || id.length < 1 || id.length > 256
+        || typeof status !== 'string' || status.length < 1 || status.length > 64) {
+        throw new Error(
+          `native advisor thread ${threadId} turn catalogue entry ${index} is invalid`,
+        )
+      }
+      return { id, status }
+    })
     return {
       response: { thread: { ...metadata, turns } },
+      turnCatalogue,
       fallbackViewDigests,
       fallbackViewsAgree,
     }
@@ -2554,6 +2629,7 @@ export async function assertNativeAdvisorHistory(options: {
 
   type HistorySnapshot = {
     parentResponse: Record<string, unknown>
+    parentTurnCatalogue: Array<{ id: string; status: string }>
     childrenListResponse: Record<string, unknown>
     childResponses: Map<string, Record<string, unknown>>
     childChildrenListResponses: Map<string, Record<string, unknown>>
@@ -2565,6 +2641,41 @@ export async function assertNativeAdvisorHistory(options: {
     const parentEvidence = await readThreadEvidence(options.parentThreadId, {
       turnIds: options.parentTurnIds,
     })
+    if (!Array.isArray(options.parentTurnBaseline)
+      || options.parentTurnBaseline.length > MAX_NATIVE_HISTORY_TURNS) {
+      throw new Error('native advisor pre-turn parent history is invalid')
+    }
+    const baselineIds = new Set<string>()
+    for (const entry of options.parentTurnBaseline) {
+      if (!entry || typeof entry !== 'object'
+        || typeof entry.id !== 'string' || entry.id.length < 1 || entry.id.length > 256
+        || baselineIds.has(entry.id)
+        || (entry.status !== 'completed'
+          && entry.status !== 'interrupted' && entry.status !== 'failed')) {
+        throw new Error('native advisor pre-turn parent history is invalid')
+      }
+      baselineIds.add(entry.id)
+    }
+    if (!Array.isArray(options.parentTurnIds)
+      || options.parentTurnIds.length < 1
+      || options.parentTurnIds.length > MAX_NATIVE_HISTORY_TURNS
+      || new Set(options.parentTurnIds).size !== options.parentTurnIds.length
+      || options.parentTurnIds.some(id => (
+        typeof id !== 'string' || id.length < 1 || id.length > 256 || baselineIds.has(id)
+      ))) {
+      throw new Error('native advisor current parent turn history is invalid')
+    }
+    const expectedCatalogue = [
+      ...options.parentTurnBaseline,
+      ...options.parentTurnIds.map(id => ({ id, status: 'completed' as const })),
+    ]
+    if (parentEvidence.turnCatalogue.length !== expectedCatalogue.length
+      || parentEvidence.turnCatalogue.some((entry, index) => (
+        entry.id !== expectedCatalogue[index]!.id
+        || entry.status !== expectedCatalogue[index]!.status
+      ))) {
+      throw new Error('native advisor parent turn catalogue changed across this job')
+    }
     const children = await readDirectChildThreads(
       read,
       options.parentThreadId,
@@ -2619,6 +2730,7 @@ export async function assertNativeAdvisorHistory(options: {
     if (pendingMaterialization !== null) throw pendingMaterialization
     return {
       parentResponse: parentEvidence.response,
+      parentTurnCatalogue: parentEvidence.turnCatalogue,
       childrenListResponse: { data: children, nextCursor: null },
       childResponses,
       childChildrenListResponses,
@@ -2636,6 +2748,7 @@ export async function assertNativeAdvisorHistory(options: {
       repoPath: options.repoPath,
       rounds: options.rounds,
       parentResponse: snapshot.parentResponse,
+      inheritedParentTurnIds: snapshot.parentTurnCatalogue.map(turn => turn.id),
       childResponses: snapshot.childResponses,
     })
     assertNativeAdvisorEvidence({
@@ -2645,6 +2758,7 @@ export async function assertNativeAdvisorHistory(options: {
       repoPath: options.repoPath,
       rounds: resolvedRounds,
       parentResponse: snapshot.parentResponse,
+      inheritedParentTurnIds: snapshot.parentTurnCatalogue.map(turn => turn.id),
       childrenListResponse: snapshot.childrenListResponse,
       parentChildBaseline: options.parentChildBaseline,
       childResponses: snapshot.childResponses,
@@ -2653,6 +2767,7 @@ export async function assertNativeAdvisorHistory(options: {
   }
   const snapshotProjection = (snapshot: HistorySnapshot): unknown => canonical({
     parentResponse: snapshot.parentResponse,
+    parentTurnCatalogue: snapshot.parentTurnCatalogue,
     childrenListResponse: snapshot.childrenListResponse,
     childResponses: [...snapshot.childResponses.entries()].sort(([left], [right]) => (
       left.localeCompare(right)
@@ -4516,6 +4631,7 @@ export async function executeCodexJob(
     reviewRound: 1 | 2 | 3 = 1,
     boundInput?: AdvisorInputSnapshot,
     parentChildBaselineInput: string[] | null = null,
+    parentTurnBaselineInput: NativeAdvisorParentTurnBaseline | null = null,
     boundInterjection?: JobInterjectionRecord,
   ) => {
     if (stage === 'interjection' && !boundInterjection) {
@@ -5087,6 +5203,9 @@ export async function executeCodexJob(
       let parentChildBaseline = parentChildBaselineInput === null
         ? null
         : [...parentChildBaselineInput]
+      let parentTurnBaseline = parentTurnBaselineInput === null
+        ? null
+        : parentTurnBaselineInput.map(entry => ({ ...entry }))
       let currentTurnId: string | null = null
       let pausedInterjection: JobInterjectionRecord | null = null
       let cancellationTerminalDeadline: number | null = null
@@ -5489,6 +5608,11 @@ export async function executeCodexJob(
         if (parentChildBaseline === null) {
           parentChildBaseline = localAdvisorAccess
             ? await captureNativeAdvisorParentChildBaseline(session, currentThreadId)
+            : []
+        }
+        if (parentTurnBaseline === null) {
+          parentTurnBaseline = localAdvisorAccess
+            ? await captureNativeAdvisorParentTurnBaseline(session, currentThreadId)
             : []
         }
         if (controls.cancellationRequested()) {
@@ -6172,6 +6296,7 @@ export async function executeCodexJob(
         finalTurn,
         parentTurnIds,
         parentChildBaseline: parentChildBaseline ?? [],
+        parentTurnBaseline: parentTurnBaseline ?? [],
         parentSource: currentThreadSource,
         stage,
         phaseSequence,
@@ -6496,6 +6621,7 @@ export async function executeCodexJob(
       retireCancelledRegistration,
       parentTurnIds: [] as string[],
       parentChildBaseline: parentChildBaselineInput ?? [],
+      parentTurnBaseline: parentTurnBaselineInput ?? [],
       parentSource: null as AppServerSessionSource | null,
       stdoutPath,
       stderrPath,
@@ -6530,6 +6656,7 @@ export async function executeCodexJob(
     let implementedInputDigest: string | null = null
     let parentSource: AppServerSessionSource | null = null
     let parentChildBaseline: string[] | null = null
+    let parentTurnBaseline: NativeAdvisorParentTurnBaseline | null = null
     const parentTurnIds: string[] = []
     let nextStage: 'prepare' | 'implementation' | 'review' = 'prepare'
 
@@ -6552,6 +6679,15 @@ export async function executeCodexJob(
         parentChildBaseline = [...execution.parentChildBaseline]
       } else if (JSON.stringify(parentChildBaseline) !== JSON.stringify(execution.parentChildBaseline)) {
         throw new Error('Codex App Server changed the pre-turn child baseline across phases')
+      }
+      if (!Array.isArray(execution.parentTurnBaseline)) {
+        throw new Error('Codex App Server omitted the pre-turn parent history')
+      }
+      if (parentTurnBaseline === null) {
+        parentTurnBaseline = execution.parentTurnBaseline.map(entry => ({ ...entry }))
+      } else if (JSON.stringify(parentTurnBaseline)
+        !== JSON.stringify(execution.parentTurnBaseline)) {
+        throw new Error('Codex App Server changed the pre-turn parent history across phases')
       }
       for (const turnId of execution.parentTurnIds) {
         if (parentTurnIds.includes(turnId)) {
@@ -6578,6 +6714,7 @@ export async function executeCodexJob(
         round,
         boundInput,
         parentChildBaseline,
+        parentTurnBaseline,
         interjection,
       )
       if ('userCancelled' in execution && execution.userCancelled === true) {
@@ -6660,7 +6797,8 @@ export async function executeCodexJob(
         }
 
         const execution = await runAttempt(
-          sessionId, resumed, stage, phaseSequence, round, boundInput, parentChildBaseline,
+          sessionId, resumed, stage, phaseSequence, round, boundInput,
+          parentChildBaseline, parentTurnBaseline,
         )
         if ('userCancelled' in execution && execution.userCancelled === true) {
           await execution.retireCancelledRegistration()
@@ -6776,6 +6914,7 @@ export async function executeCodexJob(
           resumed = false
           parentSource = null
           parentChildBaseline = null
+          parentTurnBaseline = null
           parentTurnIds.length = 0
           continue
         }
@@ -6842,6 +6981,9 @@ export async function executeCodexJob(
               parentSource: parentSource!,
               parentChildBaseline: parentChildBaseline ?? (() => {
                 throw new Error('Codex App Server omitted the pre-turn child baseline')
+              })(),
+              parentTurnBaseline: parentTurnBaseline ?? (() => {
+                throw new Error('Codex App Server omitted the pre-turn parent history')
               })(),
               parentTurnIds,
               rounds,
@@ -6994,6 +7136,9 @@ export async function executeCodexJob(
             parentChildBaseline: parentChildBaseline ?? (() => {
               throw new Error('Codex App Server omitted the pre-turn child baseline')
             })(),
+            parentTurnBaseline: parentTurnBaseline ?? (() => {
+              throw new Error('Codex App Server omitted the pre-turn parent history')
+            })(),
             parentTurnIds,
             rounds,
             seatbeltFingerprint: execution.seatbeltFingerprint,
@@ -7058,6 +7203,7 @@ export async function executeCodexJob(
   let completeThreadReady = false
   let completeParentSource: AppServerSessionSource | null = null
   let completeParentChildBaseline: string[] | null = null
+  let completeParentTurnBaseline: NativeAdvisorParentTurnBaseline | null = null
   const completeParentTurnIds: string[] = []
 
   const recordCompleteIdentity = (
@@ -7079,6 +7225,15 @@ export async function executeCodexJob(
     } else if (JSON.stringify(completeParentChildBaseline)
       !== JSON.stringify(execution.parentChildBaseline)) {
       throw new Error('Codex App Server changed the child baseline across continuations')
+    }
+    if (!Array.isArray(execution.parentTurnBaseline)) {
+      throw new Error('Codex App Server omitted the pre-turn parent history')
+    }
+    if (completeParentTurnBaseline === null) {
+      completeParentTurnBaseline = execution.parentTurnBaseline.map(entry => ({ ...entry }))
+    } else if (JSON.stringify(completeParentTurnBaseline)
+      !== JSON.stringify(execution.parentTurnBaseline)) {
+      throw new Error('Codex App Server changed the pre-turn parent history across continuations')
     }
     for (const turnId of execution.parentTurnIds) {
       if (completeParentTurnIds.includes(turnId)) {
@@ -7111,6 +7266,7 @@ export async function executeCodexJob(
       1,
       undefined,
       completeParentChildBaseline,
+      completeParentTurnBaseline,
       interjection,
     )
     if ('userCancelled' in execution && execution.userCancelled === true) {
@@ -7192,6 +7348,7 @@ export async function executeCodexJob(
       1,
       undefined,
       completeParentChildBaseline,
+      completeParentTurnBaseline,
     )
     if ('userCancelled' in execution && execution.userCancelled === true) {
       await execution.retireCancelledRegistration()
@@ -7285,6 +7442,7 @@ export async function executeCodexJob(
               throw new Error('Codex App Server omitted the parent thread source binding')
             })(),
             parentChildBaseline: completeParentChildBaseline ?? execution.parentChildBaseline,
+            parentTurnBaseline: completeParentTurnBaseline ?? execution.parentTurnBaseline,
             parentTurnIds: completeParentTurnIds,
             rounds: advisorRounds,
             seatbeltFingerprint: execution.seatbeltFingerprint,

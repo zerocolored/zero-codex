@@ -4,9 +4,11 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   AppServerProtocolError,
+  CodexAppServerSession,
 } from './codex-app-server-session.ts'
 import {
   assertNativeAdvisorHistory,
+  captureNativeAdvisorParentTurnBaseline,
   nativeAdvisorHistoryPermissionOverrides,
 } from './codex-executor.ts'
 import {
@@ -259,6 +261,7 @@ function fixture(
       parentThreadId,
       parentSource: 'appServer' as const,
       parentChildBaseline: [],
+      parentTurnBaseline: [],
       parentTurnIds: [parentTurnId],
       rounds,
       readForTesting: read,
@@ -267,6 +270,83 @@ function fixture(
 }
 
 describe('native advisor App Server history', () => {
+  test('turn開始前の親履歴を全page・順序・terminal状態つきで固定する', async () => {
+    const calls: Array<Record<string, unknown>> = []
+    const session = {
+      request: async (method: string, params: Record<string, unknown>) => {
+        expect(method).toBe('thread/turns/list')
+        calls.push(params)
+        return params.cursor === null
+          ? {
+              result: {
+                data: [{ id: 'old-completed', status: 'completed' }],
+                nextCursor: 'page-2',
+              },
+            }
+          : {
+              result: {
+                data: [
+                  { id: 'old-interrupted', status: 'interrupted' },
+                  { id: 'old-failed', status: 'failed' },
+                ],
+                nextCursor: null,
+              },
+            }
+      },
+    } as unknown as CodexAppServerSession
+    await expect(captureNativeAdvisorParentTurnBaseline(
+      session,
+      'parent-thread',
+    )).resolves.toEqual([
+      { id: 'old-completed', status: 'completed' },
+      { id: 'old-interrupted', status: 'interrupted' },
+      { id: 'old-failed', status: 'failed' },
+    ])
+    expect(calls).toEqual([
+      {
+        threadId: 'parent-thread', cursor: null, limit: 100,
+        sortDirection: 'asc', itemsView: 'full',
+      },
+      {
+        threadId: 'parent-thread', cursor: 'page-2', limit: 100,
+        sortDirection: 'asc', itemsView: 'full',
+      },
+    ])
+  })
+
+  test('turn開始前の親履歴はduplicate・active状態・停止paginationを拒否する', async () => {
+    for (const result of [
+      {
+        data: [
+          { id: 'duplicate-turn', status: 'completed' },
+          { id: 'duplicate-turn', status: 'completed' },
+        ],
+        nextCursor: null,
+      },
+      {
+        data: [{ id: 'active-turn', status: 'inProgress' }],
+        nextCursor: null,
+      },
+      {
+        data: [{ id: 'terminal-turn', status: 'completed' }],
+        nextCursor: 'same-cursor',
+      },
+    ]) {
+      let calls = 0
+      const session = {
+        request: async () => {
+          calls += 1
+          if (calls === 1) return { result }
+          return { result: { data: [], nextCursor: 'same-cursor' } }
+        },
+      } as unknown as CodexAppServerSession
+      await expect(captureNativeAdvisorParentTurnBaseline(
+        session,
+        'parent-thread',
+      )).rejects.toThrow()
+    }
+  })
+
   test('history readerは単一MCP tableでbrokerを含む全transportを無効化する', () => {
     const overrides = nativeAdvisorHistoryPermissionOverrides([
       'mcp_servers={zerokun_advisors={command="/safe/broker",args=[],enabled=true},host_http={url="http://127.0.0.1:9",enabled=false},host_stdio={command="/usr/bin/false",args=[],enabled=false}}',
@@ -645,6 +725,123 @@ describe('native advisor App Server history', () => {
       }
       await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
     }
+  })
+
+  test('再開sessionの開始前親履歴をchildの継承prefixとして厳密に照合する', async () => {
+    for (const historicalStatus of ['completed', 'interrupted', 'failed'] as const) {
+      for (const itemsListSupported of [true, false]) {
+      const value = fixture(true, null, itemsListSupported)
+      const original = value.options.readForTesting!
+      const historicalTurn = {
+        id: 'historical-parent-turn',
+        status: historicalStatus,
+        itemsView: 'full',
+        error: null,
+        items: [],
+      }
+      const currentParentTurn = {
+        id: 'parent-turn',
+        status: 'completed',
+        itemsView: 'full',
+        error: null,
+        items: [],
+      }
+      value.options.parentTurnBaseline = [{
+        id: historicalTurn.id,
+        status: historicalStatus,
+      }]
+      value.options.readForTesting = async (method, params) => {
+        const threadId = String(params.threadId ?? '')
+        const isParent = threadId === value.options.parentThreadId
+        const isChild = threadId === 'solution-thread' || threadId === 'risk-thread'
+        if (method === 'thread/items/list' && isChild
+          && (params.turnId === historicalTurn.id || params.turnId === currentParentTurn.id)
+          && itemsListSupported) {
+          return { data: [], nextCursor: null }
+        }
+        if (method === 'thread/items/list' && isParent
+          && params.turnId === historicalTurn.id && itemsListSupported) {
+          return { data: [], nextCursor: null }
+        }
+        const response = await original(method, params)
+        if (method === 'thread/turns/list' && isParent) {
+          return {
+            ...response,
+            data: [historicalTurn, ...(response.data as unknown[])],
+          }
+        }
+        if (method === 'thread/turns/list' && isChild) {
+          return {
+            ...response,
+            data: [historicalTurn, currentParentTurn, ...(response.data as unknown[])],
+          }
+        }
+        if (method === 'thread/read' && params.includeTurns === true && isParent) {
+          const thread = response.thread as Record<string, unknown>
+          return {
+            ...response,
+            thread: {
+              ...thread,
+              turns: [historicalTurn, ...(thread.turns as unknown[])],
+            },
+          }
+        }
+        if (method === 'thread/read' && params.includeTurns === true && isChild) {
+          const thread = response.thread as Record<string, unknown>
+          return {
+            ...response,
+            thread: {
+              ...thread,
+              turns: [historicalTurn, currentParentTurn, ...(thread.turns as unknown[])],
+            },
+          }
+        }
+        return response
+      }
+      await expect(assertNativeAdvisorHistory(value.options)).resolves.toBeUndefined()
+      }
+    }
+  })
+
+  test('開始前親履歴の欠落・状態差・未知turnをfail closedで拒否する', async () => {
+    const missing = fixture(true)
+    missing.options.parentTurnBaseline = [{ id: 'unknown-parent-turn', status: 'completed' }]
+    await expect(assertNativeAdvisorHistory(missing.options)).rejects.toThrow(
+      'parent turn catalogue changed across this job',
+    )
+
+    const statusChanged = fixture(true)
+    const historicalTurn = {
+      id: 'historical-status-turn', status: 'completed', itemsView: 'full',
+      error: null, items: [],
+    }
+    statusChanged.options.parentTurnBaseline = [{
+      id: historicalTurn.id, status: 'failed',
+    }]
+    const original = statusChanged.options.readForTesting!
+    statusChanged.options.readForTesting = async (method, params) => {
+      if (method === 'thread/items/list'
+        && params.threadId === statusChanged.options.parentThreadId
+        && params.turnId === historicalTurn.id) {
+        return { data: [], nextCursor: null }
+      }
+      const response = await original(method, params)
+      if (params.threadId !== statusChanged.options.parentThreadId) return response
+      if (method === 'thread/turns/list') {
+        return { ...response, data: [historicalTurn, ...(response.data as unknown[])] }
+      }
+      if (method === 'thread/read' && params.includeTurns === true) {
+        const thread = response.thread as Record<string, unknown>
+        return {
+          ...response,
+          thread: { ...thread, turns: [historicalTurn, ...(thread.turns as unknown[])] },
+        }
+      }
+      return response
+    }
+    await expect(assertNativeAdvisorHistory(statusChanged.options)).rejects.toThrow(
+      'parent turn catalogue changed across this job',
+    )
   })
 
   test('割り込み前の旧interrupted childと再開後の採択pairを両履歴経路で照合する', async () => {

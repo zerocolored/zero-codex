@@ -159,12 +159,14 @@ export function resolveNativeAdvisorThreadIds(options: {
   repoPath: string
   rounds: NativeAdvisorRoundEvidence[]
   parentResponse: unknown
+  inheritedParentTurnIds?: string[]
   childResponses: Map<string, unknown>
 }): NativeAdvisorRoundEvidence[] {
   const repo = realpathSync(options.repoPath)
-  const inheritedParentTurns = parentTurnOrder(
+  const inheritedParentTurns = inheritedParentTurnOrder(
     options.parentResponse,
     options.parentThreadId,
+    options.inheritedParentTurnIds,
   )
   const childThreads: Array<{
     threadId: string
@@ -492,6 +494,31 @@ function parentTurnOrder(
   return order
 }
 
+function inheritedParentTurnOrder(
+  response: unknown,
+  parentThreadId: string,
+  inheritedParentTurnIds?: readonly string[],
+): ReadonlyMap<string, number> {
+  const projected = parentTurnOrder(response, parentThreadId)
+  if (inheritedParentTurnIds === undefined) return projected
+  if (inheritedParentTurnIds.length < projected.size
+    || inheritedParentTurnIds.length > 4096
+    || new Set(inheritedParentTurnIds).size !== inheritedParentTurnIds.length
+    || inheritedParentTurnIds.some(id => !THREAD_ID.test(id))) {
+    throw new Error('native advisor inherited parent turn catalogue is invalid')
+  }
+  const complete = new Map(inheritedParentTurnIds.map((id, index) => [id, index]))
+  let previousOrdinal = -1
+  for (const turnId of projected.keys()) {
+    const ordinal = complete.get(turnId)
+    if (ordinal === undefined || ordinal <= previousOrdinal) {
+      throw new Error('native advisor inherited parent turn catalogue is inconsistent')
+    }
+    previousOrdinal = ordinal
+  }
+  return complete
+}
+
 function inheritedParentActivitiesForChild(
   timeline: readonly ParentSubagentActivity[],
   currentThreadId: string,
@@ -536,7 +563,8 @@ function ownedAdvisorTurns(
       continue
     }
     if (observedOwnedTurn || inheritedOrdinal <= lastInheritedOrdinal
-      || (turn.status !== 'completed' && turn.status !== 'interrupted')
+      || (turn.status !== 'completed' && turn.status !== 'interrupted'
+        && turn.status !== 'failed')
       || turn.itemsView !== 'full' || !Array.isArray(turn.items)) {
       throw new Error(`${label} inherited parent turn history is invalid`)
     }
@@ -794,9 +822,11 @@ function listedDirectChildren(
  * history. The caller supplies only responses read from the official local
  * Codex binary after the parent App Server/exec thread has reached its terminal
  * turn. The pre-turn child baseline separates historical children from this
- * job attempt; every newly listed direct child must have a durable journal,
- * and every claimed advisor must have an empty direct-child listing. This also
- * binds children from earlier input revisions and earlier turns in this job.
+ * job attempt, while the separately verified parent-turn catalogue identifies
+ * the inherited prefix projected into each new child. Every newly listed
+ * direct child must have a durable journal, and every claimed advisor must
+ * have an empty direct-child listing. This also binds children from earlier
+ * input revisions and earlier turns in this job.
  */
 export function assertNativeAdvisorEvidence(options: {
   attemptNonce: string
@@ -805,6 +835,7 @@ export function assertNativeAdvisorEvidence(options: {
   repoPath: string
   rounds: NativeAdvisorRoundEvidence[]
   parentResponse: unknown
+  inheritedParentTurnIds?: string[]
   childrenListResponse: unknown
   parentChildBaseline: string[]
   childResponses: Map<string, unknown>
@@ -821,9 +852,10 @@ export function assertNativeAdvisorEvidence(options: {
     options.parentResponse,
     options.parentThreadId,
   )
-  const inheritedParentTurns = parentTurnOrder(
+  const inheritedParentTurns = inheritedParentTurnOrder(
     options.parentResponse,
     options.parentThreadId,
+    options.inheritedParentTurnIds,
   )
   const parentSource = parseAppServerSessionSource(
     parent.source,
