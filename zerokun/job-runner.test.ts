@@ -7358,6 +7358,23 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       ['backend', 'frontend'],
       ['frontend'],
     )
+    const noChangeReview = buildCodexPhasePrompt(
+      job,
+      'review',
+      snapshot,
+      1,
+      nonce,
+      '/tmp/job-outbox',
+      true,
+      undefined,
+      undefined,
+      undefined,
+      ['backend', 'frontend'],
+      [],
+      undefined,
+      undefined,
+      'no-change',
+    )
     expect(prepare).toContain(
       `[ZERO_PRE_EDIT_READY:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
     )
@@ -7381,6 +7398,25 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(review).toContain(`[ZERO_REVIEW_FIX_REQUIRED:${nonce}:round-1]`)
     expect(review).toContain('zerokun_browser.verify_local_page')
     expect(review).toContain('do not request fixes for them in review')
+    expect(noChangeReview).toContain('Host-confirmed repository write scope: none.')
+    expect(noChangeReview).toContain('Review the prepared no-change decision')
+    expect(prepare).toContain(
+      '<zerokun_repository_scope>{"repositories":[]}</zerokun_repository_scope>',
+    )
+    expect(() => buildCodexPhasePrompt(
+      job,
+      'implementation',
+      snapshot,
+      1,
+      nonce,
+      '/tmp/job-outbox',
+      true,
+      undefined,
+      undefined,
+      undefined,
+      ['backend', 'frontend'],
+      [],
+    )).toThrow('host phase prompt repository scope is invalid')
     expect(() => buildCodexPhasePrompt(
       job,
       'implementation',

@@ -306,7 +306,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -347,7 +347,7 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"main","mergePullRequest":false,"followupBaseBranch":null}]}</zerokun_work_action>'
@@ -355,9 +355,12 @@ for line in sys.stdin:
                     action = '<zerokun_work_action>{"kind":"no-change"}</zerokun_work_action>'
                 if mode == "phased-publication-targeted":
                     action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main","waitForChecks":false,"integrationPullRequestBody":"## Summary","followupPullRequestBody":"## Summary","closePullRequestNumbers":[]}]}</zerokun_work_action>'
-                if mode == "phased-no-change":
+                if mode in ("phased-no-change", "phased-no-change-empty-scope"):
                     action = '<zerokun_work_action>{"kind":"no-change"}</zerokun_work_action>'
                 message = "準備完了\\n" + action + "\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
+                if mode == "phased-no-change-empty-scope":
+                    scope = '<zerokun_repository_scope>{"repositories":[]}</zerokun_repository_scope>'
+                    message = "調査回答は完成しています\\n" + action + "\\n" + scope + "\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
                 if mode in ("phased-promotion", "phased-promotion-history-failed"):
                     if mode == "phased-promotion-history-failed":
                         required_history = (
@@ -721,7 +724,7 @@ function fixture(
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
     | 'capacity-started-command' | 'phased' | 'phased-publication'
     | 'phased-publication-targeted' | 'phased-promotion'
-    | 'phased-no-change'
+    | 'phased-no-change' | 'phased-no-change-empty-scope'
     | 'phased-ui-approved'
     | 'phased-capacity-review-once'
     | 'phased-capacity-implementation-once'
@@ -2026,6 +2029,61 @@ describe('production App Server executor', () => {
     const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
       .map(line => line.split('\t')[0])
     expect(phases).toEqual(['prepare', 'review'])
+    value.store.completeStagedExecution(value.job.id)
+    expect(value.store.get(value.job.id)?.result).toBe('公開できます')
+    value.store.close()
+  }, 30_000)
+
+  test('multi-repoの調査専用jobは空scopeでprepareからreviewまで完走する', async () => {
+    const value = fixture('phased-no-change-empty-scope', true)
+    const phaseLog = join(value.root, 'no-change-empty-scope-phases.log')
+    const promptLog = join(value.root, 'no-change-empty-scope-prompts.log')
+    const repositories = ['backend', 'frontend'].map(name => {
+      const repository = join(value.repo, name)
+      mkdirSync(repository, { mode: 0o700 })
+      writeFileSync(join(repository, 'README.md'), `# ${name}\n`, { mode: 0o600 })
+      git(repository, ['init', '--initial-branch=main'])
+      git(repository, ['config', 'user.email', 'zero@example.invalid'])
+      git(repository, ['config', 'user.name', 'Zero Test'])
+      git(repository, ['add', 'README.md'])
+      git(repository, ['commit', '-m', 'chore: initial'])
+      return repository
+    })
+    const before = repositories.map(repository => ({
+      head: git(repository, ['rev-parse', 'HEAD']),
+      status: git(repository, ['status', '--short']),
+    }))
+
+    const execution = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-no-change-empty-scope',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_PROMPT_LOG: promptLog,
+      },
+      phaseGateForTesting: {},
+      liveControls: value.hooks,
+    })
+
+    expect(execution).toMatchObject({
+      sessionId: 'thread-app-server-1',
+      result: '公開できます',
+      publication: { plans: [] },
+    })
+    expect(readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])).toEqual(['prepare', 'review'])
+    const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string, text: string })
+    expect(prompts.find(prompt => prompt.stage === 'review')?.text).toContain(
+      'Host-confirmed repository write scope: none.',
+    )
+    expect(repositories.map(repository => ({
+      head: git(repository, ['rev-parse', 'HEAD']),
+      status: git(repository, ['status', '--short']),
+    }))).toEqual(before)
     value.store.completeStagedExecution(value.job.id)
     expect(value.store.get(value.job.id)?.result).toBe('公開できます')
     value.store.close()

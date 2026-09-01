@@ -323,6 +323,35 @@ describe('Codex UI/UX approval decision contract', () => {
     })
   })
 
+  test('read-only no-changeだけが空のrepository scopeを使える', () => {
+    const ready = `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`
+    expect(parseCodexPreparationDecision([
+      '調査回答は完成しています',
+      workAction('no-change'),
+      '<zerokun_repository_scope>{"repositories":[]}</zerokun_repository_scope>',
+      ready,
+    ].join('\n'), nonce, input, undefined, ['backend', 'frontend'])).toEqual({
+      kind: 'ready',
+      repositoryScope: [],
+      workAction: 'no-change',
+    })
+
+    expect(() => parseCodexPreparationDecision([
+      '<zerokun_work_action>{"kind":"implement","targets":[]}</zerokun_work_action>',
+      '<zerokun_repository_scope>{"repositories":[]}</zerokun_repository_scope>',
+      ready,
+    ].join('\n'), nonce, input, undefined, ['backend', 'frontend'])).toThrow(
+      'empty repository scope only for no-change',
+    )
+    expect(() => parseCodexPreparationDecision([
+      workAction('promote-current-head'),
+      '<zerokun_repository_scope>{"repositories":[]}</zerokun_repository_scope>',
+      ready,
+    ].join('\n'), nonce, input, undefined, ['backend', 'frontend'])).toThrow(
+      'empty repository scope only for no-change',
+    )
+  })
+
   test('publication-only promotionは全対象repositoryと連続branch操作をexact envelopeへ固定する', () => {
     const ready = `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`
     const promotion = '<zerokun_publication>{"promotions":['

@@ -3298,8 +3298,11 @@ export function buildCodexPhasePrompt(
     throw new Error('host phase prompt requires the logical attempt nonce')
   }
   if (!artifactDir) throw new Error('host phase prompt requires the artifact directory')
+  const emptyNoChangeReviewScope = stage === 'review'
+    && reviewWorkAction === 'no-change'
+    && implementationRepositoryScope?.length === 0
   if (implementationRepositoryScope && (
-    implementationRepositoryScope.length === 0
+    (implementationRepositoryScope.length === 0 && !emptyNoChangeReviewScope)
     || JSON.stringify(implementationRepositoryScope)
       !== JSON.stringify([...implementationRepositoryScope].sort())
     || new Set(implementationRepositoryScope).size !== implementationRepositoryScope.length
@@ -3346,12 +3349,18 @@ export function buildCodexPhasePrompt(
     `Project root: ${job.repoPath}`,
     `Artifact directory: ${artifactDir}`,
   ]
-  if (implementationRepositoryScope) {
+  if (implementationRepositoryScope && implementationRepositoryScope.length > 0) {
     host.push(
       `Host-approved implementation repository scope: ${JSON.stringify(implementationRepositoryScope)}`,
       'Only repositories in that exact scope belong to this implementation and review.',
       'Treat changes in every repository outside that scope as concurrent unrelated user work:',
       'preserve them, do not edit them, and do not request fixes for them in review.',
+    )
+  } else if (emptyNoChangeReviewScope) {
+    host.push(
+      'Host-confirmed repository write scope: none.',
+      'This is a read-only answer review. Inspect the project only as needed to verify the answer;',
+      'do not edit repositories, Git state, or GitHub state.',
     )
   }
   if (implementationBindings) {
@@ -3494,7 +3503,9 @@ export function buildCodexPhasePrompt(
       '<zerokun_work_action>{"kind":"no-change"}</zerokun_work_action>',
       '<zerokun_work_action>{"kind":"promote-current-head"}</zerokun_work_action>',
       'Use no-change only when the request is fully answered without any repository or GitHub',
-      'write. Use promote-current-head only with the exact publication envelope below.',
+      'write; in that case the repository-scope envelope must use {"repositories":[]}.',
+      'Implement and promote-current-head must use a non-empty repository scope. Use',
+      'promote-current-head only with the exact publication envelope below.',
       'For implement, targets must bind every selected repository exactly once in sorted order.',
       'Codex selects each integration base from the actual request and repository conventions, not',
       'from the branch currently checked out by another session. Set mergePullRequest=true and a',
@@ -3508,6 +3519,7 @@ export function buildCodexPhasePrompt(
       'For every ready decision, put this exact JSON envelope immediately before the final',
       'ready marker, using only the exact IDs above in sorted order with no duplicates:',
       '<zerokun_repository_scope>{"repositories":["<implementation repository ID>"]}</zerokun_repository_scope>',
+      'For no-change, use exactly <zerokun_repository_scope>{"repositories":[]}</zerokun_repository_scope>.',
       'When and only when the exact request is publication-only for already committed current',
       'checkouts, and asks to apply each current HEAD through a PR and then create a second branch',
       'PR, put this host-only envelope immediately before the repository-scope envelope:',
@@ -7941,7 +7953,7 @@ export async function executeCodexJob(
             }
           }
           currentRepositoryScope.sort()
-          currentRepositoryDigest = currentRepositoryScope
+          currentRepositoryDigest = currentRepositoryScope.length > 0
             ? advisorRepositoryScopeDigest(observedRepositorySnapshot, currentRepositoryScope)
             : observedRepositoryFullDigest
           if (preparationDecision.kind === 'approval-required') {
@@ -8188,7 +8200,7 @@ export async function executeCodexJob(
           }
           implementedInputDigest = activeWriteInputDigest(finalInput)
         } else if (preparedWorkAction === 'no-change') {
-          if (!preparedRepositoryScope || preparedRepositoryScope.length === 0) {
+          if (!preparedRepositoryScope) {
             throw new Error('no-change preparation omitted its repository scope')
           }
           // Codex has already decided that this request needs no repository or
@@ -8391,6 +8403,7 @@ export async function executeCodexJob(
         const currentRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
         const currentRepositoryDigest = advisorRepositoryDigest(currentRepositorySnapshot)
         const currentReviewRepositoryDigest = preparedRepositoryScope
+          && preparedRepositoryScope.length > 0
           ? advisorRepositoryScopeDigest(currentRepositorySnapshot, preparedRepositoryScope)
           : currentRepositoryDigest
         reviewedRepositoryDigest = currentReviewRepositoryDigest

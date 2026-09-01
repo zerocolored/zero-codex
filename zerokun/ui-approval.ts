@@ -411,7 +411,7 @@ function exactReadyRepositoryScope(
   }
   const record = parsed as Record<string, unknown>
   if (Object.keys(record).join(',') !== 'repositories'
-    || !Array.isArray(record.repositories) || record.repositories.length === 0
+    || !Array.isArray(record.repositories)
     || record.repositories.some(repository => typeof repository !== 'string')) {
     throw new Error('Codex preparation repository scope is invalid')
   }
@@ -675,6 +675,11 @@ export function parseCodexPreparationDecision(
     const scoped = exactReadyRepositoryScope(beforeReady, availableRepositories)
     const publication = exactReadyPublicationIntents(scoped.text, scoped.repositoryScope)
     const work = exactReadyWorkAction(publication.text, scoped.repositoryScope)
+    if (scoped.repositoryScope.length === 0 && work.workAction !== 'no-change') {
+      throw new Error(
+        'Codex preparation may use an empty repository scope only for no-change work',
+      )
+    }
     if ((work.workAction === 'promote-current-head')
       !== (publication.publicationIntents.length > 0)) {
       throw new Error('Codex preparation work action conflicts with its publication intent')
