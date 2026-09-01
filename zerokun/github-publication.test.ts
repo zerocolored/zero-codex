@@ -5,8 +5,10 @@ import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import {
+  assertGitHubPublicationPlan,
   assertHostGitHubPublicationLogin,
   captureGitHubPublicationBaseline,
+  captureGitHubPublicationBaselineForBranches,
   gitHubPublicationBaselineDigest,
   GitHubPublicationError,
   prepareGitHubPublicationPlans,
@@ -87,6 +89,85 @@ function publicationFixture(slug = 'example/demo'): {
     repo: physicalRepo,
     plan: plans[0]!,
     baselineDigest: gitHubPublicationBaselineDigest(baseline),
+  }
+}
+
+function implementedPromotionFixture(slug = 'example/implemented-promotion'): {
+  repo: string
+  plan: GitHubPublicationPlan
+  baseline: ReturnType<typeof captureGitHubPublicationBaselineForBranches>
+  developHead: string
+  mainHead: string
+  unrelatedBranch: string
+  unrelatedHead: string
+} {
+  const root = fixtureDir()
+  const repo = join(root, 'repo')
+  const implementationWorktree = join(root, 'implementation-worktree')
+  mkdirSync(repo)
+  git(repo, 'init', '--initial-branch=main')
+  git(repo, 'config', 'user.email', 'zero@example.invalid')
+  git(repo, 'config', 'user.name', 'Zero Test')
+  git(repo, 'config', 'remote.origin.url', `https://github.com/${slug}.git`)
+  writeFileSync(join(repo, 'README.md'), 'initial\n')
+  git(repo, 'add', 'README.md')
+  git(repo, 'commit', '-m', 'chore: initial')
+  const mainHead = git(repo, 'rev-parse', 'HEAD')
+
+  git(repo, 'switch', '-c', 'develop')
+  writeFileSync(join(repo, 'develop.txt'), 'develop base\n')
+  git(repo, 'add', 'develop.txt')
+  git(repo, 'commit', '-m', 'chore: prepare develop')
+  const developHead = git(repo, 'rev-parse', 'HEAD')
+  git(repo, 'update-ref', 'refs/remotes/origin/main', mainHead)
+  git(repo, 'update-ref', 'refs/remotes/origin/develop', developHead)
+
+  const unrelatedBranch = 'feature/unrelated-shared-checkout'
+  git(repo, 'switch', 'main')
+  git(repo, 'switch', '-c', unrelatedBranch)
+  writeFileSync(join(repo, 'unrelated.txt'), 'concurrent unrelated work\n')
+  git(repo, 'add', 'unrelated.txt')
+  git(repo, 'commit', '-m', 'docs: unrelated shared checkout')
+  const unrelatedHead = git(repo, 'rev-parse', 'HEAD')
+
+  const physicalRepo = realpathSync(repo)
+  const baseline = captureGitHubPublicationBaselineForBranches(repo, [{
+    gitRoot: physicalRepo,
+    baseBranch: 'develop',
+  }])
+  const headBranch = 'zerochan/implemented0123456789'
+  git(repo, 'worktree', 'add', '-b', headBranch, implementationWorktree, developHead)
+  writeFileSync(join(implementationWorktree, 'implemented.txt'), 'reviewed implementation\n')
+  git(implementationWorktree, 'add', 'implemented.txt')
+  git(implementationWorktree, 'commit', '-m', 'feat: implement reviewed change')
+  const implementationHead = git(implementationWorktree, 'rev-parse', 'HEAD')
+  git(repo, 'worktree', 'remove', implementationWorktree)
+
+  const [ordinaryPlan] = prepareGitHubPublicationPlans(
+    baseline,
+    ['.'],
+    [{ gitRoot: physicalRepo, head: implementationHead }],
+    headBranch,
+  )
+  if (!ordinaryPlan) throw new Error('implemented publication fixture omitted its plan')
+  const plan: GitHubPublicationPlan = {
+    ...ordinaryPlan,
+    promotion: {
+      version: 1,
+      sourceBranch: headBranch,
+      sourceHead: implementationHead,
+      followupBaseBranch: 'main',
+      followupInitialHead: mainHead,
+    },
+  }
+  return {
+    repo: physicalRepo,
+    plan,
+    baseline,
+    developHead,
+    mainHead,
+    unrelatedBranch,
+    unrelatedHead,
   }
 }
 
@@ -200,7 +281,7 @@ describe('host GitHub publication', () => {
         },
       }],
     }, ['.'], undefined, plan.headBranch)).toThrow(
-      'repository config, origin, or uncommitted state changed',
+      'repository config or origin changed outside the reviewed commit',
     )
   })
 
@@ -518,6 +599,182 @@ describe('host GitHub publication', () => {
     )).rejects.toMatchObject({ name: 'CodexUserCancelledError' })
     expect(externalCalls).toBe(0)
     cancelledStore.close()
+  })
+
+  test('実装promotionは共有checkoutを動かさずfeatureをdevelopへmergeしてmain PRを作る', async () => {
+    const value = implementedPromotionFixture()
+    const { plan } = value
+    expect(plan).toMatchObject({
+      baseBranch: 'develop',
+      initialHead: value.developHead,
+      promotion: {
+        sourceBranch: plan.headBranch,
+        sourceHead: plan.commitSha,
+        followupBaseBranch: 'main',
+        followupInitialHead: value.mainHead,
+      },
+    })
+    expect(git(value.repo, 'branch', '--show-current')).toBe(value.unrelatedBranch)
+    expect(git(value.repo, 'rev-parse', 'HEAD')).toBe(value.unrelatedHead)
+
+    // Concurrent user work in the active shared checkout is unrelated to the
+    // exact reviewed feature ref and must neither be discarded nor become the
+    // publication base.
+    writeFileSync(join(value.repo, 'operator-notes.txt'), 'keep this worktree change\n')
+    assertGitHubPublicationPlan(plan)
+
+    const integrationMergeHead = 'd'.repeat(40)
+    const remoteHeads = new Map<string, string | null>([
+      [plan.headBranch, null],
+      ['develop', value.developHead],
+      ['main', value.mainHead],
+    ])
+    let integrationExists = false
+    let integrationMerged = false
+    let followupExists = false
+    let integrationCreates = 0
+    let integrationMerges = 0
+    let followupCreates = 0
+    const followupPlan = (): GitHubPublicationPlan => ({
+      ...plan,
+      baseBranch: 'main',
+      headBranch: 'develop',
+      commitSha: integrationMergeHead,
+      initialHead: value.mainHead,
+      promotion: undefined,
+    })
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repository, args) {
+        if (args[0] === 'ls-remote') {
+          const ref = String(args.at(-1))
+          const branch = ref.replace(/^refs\/heads\//, '')
+          const head = remoteHeads.get(branch) ?? null
+          return result(0, head ? `${head}\t${ref}\n` : '')
+        }
+        if (args[0] === 'push') {
+          remoteHeads.set(plan.headBranch, plan.commitSha)
+          return result(0, 'ok')
+        }
+        throw new Error(`unexpected implemented-promotion Git command: ${args.join(' ')}`)
+      },
+      async runGh(args, stdin) {
+        const command = args.join(' ')
+        if (command.includes('/compare/')) {
+          const prepared = /\/compare\/([0-9a-f]+)\.\.\./.exec(command)?.[1]
+          if (!prepared) throw new Error(`invalid compare request: ${command}`)
+          return result(0, JSON.stringify({
+            status: 'ahead', ahead_by: 1, behind_by: 0,
+            base_commit: { sha: prepared }, merge_base_commit: { sha: prepared },
+          }))
+        }
+        if (args.includes('GET') && command.endsWith('repos/example/implemented-promotion')) {
+          return result(0, JSON.stringify({
+            allow_merge_commit: true,
+            allow_squash_merge: true,
+            allow_rebase_merge: true,
+          }))
+        }
+        if (args.includes('GET')
+          && command.endsWith('repos/example/implemented-promotion/pulls/301')) {
+          const record = JSON.parse(exactPullRequestJson({
+            plan,
+            number: 301,
+          }))[0] as Record<string, unknown>
+          return result(0, JSON.stringify({
+            ...record,
+            draft: false,
+            mergeable: true,
+            mergeable_state: 'clean',
+          }))
+        }
+        if (args.includes('GET') && command.includes('/pulls?')) {
+          if (command.includes('base=develop')) {
+            return result(0, integrationExists ? exactPullRequestJson({
+              plan,
+              number: 301,
+              state: integrationMerged ? 'closed' : 'open',
+              mergedAt: integrationMerged ? '2026-09-01T00:00:00Z' : null,
+              mergeCommitSha: integrationMerged ? integrationMergeHead : null,
+            }) : '[]')
+          }
+          if (command.includes('base=main')) {
+            return result(0, followupExists ? exactPullRequestJson({
+              plan: followupPlan(),
+              number: 302,
+            }) : '[]')
+          }
+        }
+        if (args.includes('POST') && command.includes('/pulls')) {
+          const request = JSON.parse(stdin ?? '{}') as Record<string, string>
+          if (request.base === 'develop') {
+            integrationCreates += 1
+            expect(request.head).toBe(plan.headBranch)
+            integrationExists = true
+          } else if (request.base === 'main') {
+            followupCreates += 1
+            expect(integrationMerged).toBe(true)
+            expect(request.head).toBe('develop')
+            followupExists = true
+          } else {
+            throw new Error(`unexpected implemented-promotion PR base: ${request.base}`)
+          }
+          return result(0, '{}')
+        }
+        if (args.includes('PUT') && command.includes('/pulls/301/merge')) {
+          integrationMerges += 1
+          expect(JSON.parse(stdin ?? '{}')).toMatchObject({
+            sha: plan.commitSha,
+            merge_method: 'merge',
+          })
+          integrationMerged = true
+          remoteHeads.set('develop', integrationMergeHead)
+          return result(0, '{}')
+        }
+        throw new Error(`unexpected implemented-promotion gh command: ${command}`)
+      },
+    }
+
+    await expect(publishGitHubPlan(plan, commands)).resolves.toMatchObject({
+      pullRequestNumber: 301,
+      pullRequestUrl: 'https://github.com/example/implemented-promotion/pull/301',
+      followupPullRequestNumber: 302,
+      followupPullRequestUrl: 'https://github.com/example/implemented-promotion/pull/302',
+    })
+    expect({ integrationCreates, integrationMerges, followupCreates }).toEqual({
+      integrationCreates: 1,
+      integrationMerges: 1,
+      followupCreates: 1,
+    })
+    expect(git(value.repo, 'branch', '--show-current')).toBe(value.unrelatedBranch)
+    expect(git(value.repo, 'rev-parse', 'HEAD')).toBe(value.unrelatedHead)
+    expect(git(value.repo, 'status', '--porcelain')).toContain('operator-notes.txt')
+  })
+
+  test('実装feature refはCodexが選んだintegration baseの子孫でなければならない', () => {
+    const value = implementedPromotionFixture('example/implemented-ancestry')
+    const unrelatedPublicationBranch = 'zerochan/not-from-develop'
+    git(value.repo, 'branch', unrelatedPublicationBranch, value.unrelatedHead)
+
+    expect(() => prepareGitHubPublicationPlans(
+      value.baseline,
+      ['.'],
+      [{ gitRoot: value.repo, head: value.unrelatedHead }],
+      unrelatedPublicationBranch,
+    )).toThrow('not descended from the prepared base commit')
+    expect(git(value.repo, 'branch', '--show-current')).toBe(value.unrelatedBranch)
+    expect(git(value.repo, 'rev-parse', 'HEAD')).toBe(value.unrelatedHead)
+  })
+
+  test('review済み実装promotionのsource refが別SHAへ動いた場合は公開を拒否する', () => {
+    const value = implementedPromotionFixture('example/implemented-ref-drift')
+    assertGitHubPublicationPlan(value.plan)
+    git(value.repo, 'branch', '-f', value.plan.headBranch, value.unrelatedHead)
+
+    expect(() => assertGitHubPublicationPlan(value.plan)).toThrow(
+      'publication plan no longer matches the repository',
+    )
+    expect(git(value.repo, 'branch', '--show-current')).toBe(value.unrelatedBranch)
+    expect(git(value.repo, 'rev-parse', 'HEAD')).toBe(value.unrelatedHead)
   })
 
   test('remote mutation中のcancelは確定receiptを保存してから停止する', async () => {

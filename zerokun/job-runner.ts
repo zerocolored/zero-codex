@@ -27,7 +27,6 @@ import {
   CodexInterruptedError,
   CodexPublicationPreflightRetryError,
   CodexRateLimitError,
-  CodexRepositoryChangedBeforeImplementationError,
   CodexUserCancelledError,
   codexRateLimitResumeAt,
   executeCodexJob,
@@ -11134,52 +11133,6 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         options.store.cancel(job.id)
         stats.failed += 1
         log(`${workerId} cancelled ${job.id}`)
-        scheduleNotificationFlush()
-        continue
-      }
-      if (error instanceof CodexRepositoryChangedBeforeImplementationError) {
-        await updateMonitor(job, '対象projectが更新されたため、最新状態で調査をやり直します')
-        await quiesceLifecycleBeforeStateChange()
-        const prepared = options.store.preparePreImplementationRepositoryDriftRetry(
-          job.id,
-          error.message,
-        )
-        const disposition = prepared === 'prepared'
-          ? options.store.requeueAfterPreImplementationRepositoryDrift(job.id)
-          : prepared
-        if (disposition === 'requeued') {
-          log(`${workerId} requeued ${job.id} after pre-implementation repository drift`)
-          continue
-        }
-        if (disposition === 'cancelled') {
-          await updateMonitor(job, '中止要求を反映し、安全な後処理を完了しました')
-          await quiesceMonitorBeforeTerminal()
-          options.store.cancel(job.id)
-          stats.failed += 1
-          log(`${workerId} cancelled ${job.id} while recovering repository drift`)
-          scheduleNotificationFlush()
-          continue
-        }
-        const implementationMayHaveChanged = options.store.writePhaseMayHaveBeenDelivered(job.id)
-        const failure = implementationMayHaveChanged
-          ? 'write-enabled implementation may already have changed the repository or external '
-            + 'services before later repository drift was detected. Review those effects, then '
-            + 'resend only if needed.'
-          : disposition === 'exhausted'
-            ? 'repository changed repeatedly before implementation; '
-              + 'automatic fresh preparation retry limit was reached'
-            : 'repository changed before implementation, but safe automatic fresh preparation '
-              + 'could not be proven'
-        await updateMonitor(
-          job,
-          implementationMayHaveChanged
-            ? '一部の変更が残っている可能性があるため失敗として確定します'
-            : '最新状態での安全な再調査ができないため失敗として確定します',
-        )
-        await quiesceMonitorBeforeTerminal()
-        options.store.fail(job.id, failure)
-        stats.failed += 1
-        log(`${workerId} failed repository drift recovery for ${job.id}: ${failure}`)
         scheduleNotificationFlush()
         continue
       }

@@ -132,16 +132,37 @@ describe('Codex UI/UX approval decision contract', () => {
   const semanticEnvelope = (decision: UiApprovalSemanticDecision): string => (
     `<zerokun_ui_response_decision>${JSON.stringify(decision)}</zerokun_ui_response_decision>`
   )
-  const workAction = (kind: 'implement' | 'no-change' | 'promote-current-head' = 'implement') => (
-    `<zerokun_work_action>{"kind":"${kind}"}</zerokun_work_action>`
-  )
+  const workAction = (
+    kind: 'implement' | 'no-change' | 'promote-current-head' = 'implement',
+    repositories: string[] = ['.'],
+  ) => kind === 'implement'
+    ? '<zerokun_work_action>' + JSON.stringify({
+        kind,
+        targets: repositories.map(repository => ({
+          repository,
+          baseBranch: 'main',
+          mergePullRequest: false,
+          followupBaseBranch: null,
+        })),
+      }) + '</zerokun_work_action>'
+    : `<zerokun_work_action>{"kind":"${kind}"}</zerokun_work_action>`
 
   test('accepts either the exact ready marker or one exact Before/After envelope', () => {
     expect(parseCodexPreparationDecision(
       `調査済みです\n${workAction()}\n[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
       nonce,
       input,
-    )).toEqual({ kind: 'ready', repositoryScope: ['.'], workAction: 'implement' })
+    )).toEqual({
+      kind: 'ready',
+      repositoryScope: ['.'],
+      workAction: 'implement',
+      implementationIntents: [{
+        repository: '.',
+        baseBranch: 'main',
+        mergePullRequest: false,
+        followupBaseBranch: null,
+      }],
+    })
 
     const decision = parseCodexPreparationDecision([
       `[ZERO_UI_APPROVAL_REQUIRED:${nonce}:r3:${input.digest}]`,
@@ -193,6 +214,12 @@ describe('Codex UI/UX approval decision contract', () => {
         kind: 'ready',
         repositoryScope: ['.'],
         workAction: 'implement',
+        implementationIntents: [{
+          repository: '.',
+          baseBranch: 'main',
+          mergePullRequest: false,
+          followupBaseBranch: null,
+        }],
         approvalDecision: decision,
       })
     }
@@ -239,7 +266,7 @@ describe('Codex UI/UX approval decision contract', () => {
     expect(decision.proposalRepositoryDigest).toBe(approval.repositoryScopeDigest)
     expect(parseCodexPreparationDecision([
       semanticEnvelope(decision),
-      workAction(),
+      workAction('implement', ['frontend']),
       '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
       `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
     ].join('\n'), nonce, input, {
@@ -249,7 +276,7 @@ describe('Codex UI/UX approval decision contract', () => {
 
     expect(parseCodexPreparationDecision([
       semanticEnvelope(decision),
-      workAction(),
+      workAction('implement', ['backend', 'frontend']),
       '<zerokun_repository_scope>{"repositories":["backend","frontend"]}</zerokun_repository_scope>',
       `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
     ].join('\n'), nonce, input, {
@@ -267,7 +294,7 @@ describe('Codex UI/UX approval decision contract', () => {
     const expandedDecision = semanticDecision(expandedApproval, 'f'.repeat(64))
     expect(() => parseCodexPreparationDecision([
       semanticEnvelope(expandedDecision),
-      workAction(),
+      workAction('implement', ['frontend']),
       '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
       `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
     ].join('\n'), nonce, input, {
@@ -287,7 +314,7 @@ describe('Codex UI/UX approval decision contract', () => {
     )).toThrow('repository scope envelope')
     expect(parseCodexPreparationDecision([
       '準備完了',
-      workAction(),
+      workAction('implement', ['frontend']),
       '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
       ready,
     ].join('\n'), nonce, input, undefined, ['backend', 'frontend'])).toMatchObject({

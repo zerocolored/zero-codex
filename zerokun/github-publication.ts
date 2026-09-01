@@ -37,6 +37,11 @@ export type GitHubPublicationBaseline = {
   repositories: GitHubPublicationBaselineRepository[]
 }
 
+export type GitHubPublicationBaseBinding = {
+  gitRoot: string
+  baseBranch: string
+}
+
 export type GitHubPublicationPlan = {
   version: 1
   gitRoot: string
@@ -326,6 +331,60 @@ export function captureGitHubPublicationBaseline(
   return { version: 1, projectPath, repositories }
 }
 
+/**
+ * Bind implementation to the integration branches selected by Codex without
+ * depending on whichever unrelated branch happens to be checked out in the
+ * shared worktree. The implementation worker receives each exact base SHA and
+ * creates the host-assigned feature ref from it in an isolated worktree.
+ */
+export function captureGitHubPublicationBaselineForBranches(
+  projectPathInput: string,
+  bindings: readonly GitHubPublicationBaseBinding[],
+): GitHubPublicationBaseline {
+  const projectPath = realpathSync(projectPathInput)
+  const repositories = bindings.map(binding => {
+    const state = repositoryState(binding.gitRoot)
+    const baseBranch = validBranch(state.gitRoot, binding.baseBranch)
+    const remoteTrackingHead = gitSync(
+      state.gitRoot,
+      ['rev-parse', '--verify', `refs/remotes/origin/${baseBranch}^{commit}`],
+      true,
+    ).trim()
+    const localHead = gitSync(
+      state.gitRoot,
+      ['rev-parse', '--verify', `refs/heads/${baseBranch}^{commit}`],
+      true,
+    ).trim()
+    const initialHead = remoteTrackingHead || localHead
+    if (!SHA_PATTERN.test(initialHead)) {
+      throw new GitHubPublicationError(
+        'configuration',
+        `Codex-selected publication base branch is unavailable: ${baseBranch}`,
+      )
+    }
+    return {
+      gitRoot: state.gitRoot,
+      initialHead,
+      baseBranch,
+      statusDigest: state.statusDigest,
+      localConfigDigest: state.config.digest,
+      originUrlDigest: state.config.originDigest,
+      remote: state.config.origin,
+    }
+  })
+  if (new Set(repositories.map(value => value.gitRoot)).size !== repositories.length
+    || repositories.length === 0
+    || repositories.length > MAX_GITHUB_PUBLICATION_REPOSITORIES
+    || new Set(repositories.map(value => value.remote.slug.toLowerCase())).size
+      !== repositories.length) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'Codex-selected publication base bindings are invalid or not unique',
+    )
+  }
+  return { version: 1, projectPath, repositories }
+}
+
 export function extendGitHubPublicationBaseline(
   baseline: GitHubPublicationBaseline,
   gitRoots: readonly string[],
@@ -405,17 +464,10 @@ export function prepareGitHubPublicationPlans(
     const current = repositoryState(initial.gitRoot)
     if (current.config.digest !== initial.localConfigDigest
       || current.config.originDigest !== initial.originUrlDigest
-      || current.config.origin.slug.toLowerCase() !== initial.remote.slug.toLowerCase()
-      || current.statusDigest !== initial.statusDigest) {
+      || current.config.origin.slug.toLowerCase() !== initial.remote.slug.toLowerCase()) {
       throw new GitHubPublicationError(
         'configuration',
-        'repository config, origin, or uncommitted state changed outside the reviewed commit',
-      )
-    }
-    if (current.head !== initial.initialHead || current.branch !== initial.baseBranch) {
-      throw new GitHubPublicationError(
-        'configuration',
-        'implementation must return the clean checkout to its prepared base before publication',
+        'repository config or origin changed outside the reviewed commit',
       )
     }
     if (requiredHeadBranch === undefined) {
@@ -679,7 +731,8 @@ export function assertGitHubPromotionCheckpoint(
 export function assertGitHubPublicationPlan(value: GitHubPublicationPlan): void {
   assertGitHubPublicationPlanShape(value)
   const state = repositoryState(value.gitRoot)
-  if (value.promotion) {
+  const implementedPromotion = value.promotion?.sourceBranch === value.headBranch
+  if (value.promotion && !implementedPromotion) {
     if (state.head !== value.promotion.sourceHead
       || state.branch !== value.promotion.sourceBranch
       || state.statusDigest !== value.statusDigest
@@ -698,9 +751,7 @@ export function assertGitHubPublicationPlan(value: GitHubPublicationPlan): void 
     ['rev-parse', '--verify', `refs/heads/${value.headBranch}^{commit}`],
     true,
   ).trim()
-  if (state.head !== value.initialHead || state.branch !== value.baseBranch
-    || featureHead !== value.commitSha
-    || state.statusDigest !== value.statusDigest
+  if (featureHead !== value.commitSha
     || state.config.digest !== value.localConfigDigest
     || state.config.originDigest !== value.originUrlDigest
     || state.config.origin.slug.toLowerCase() !== value.repositorySlug.toLowerCase()
@@ -726,7 +777,7 @@ function assertGitHubPublicationSource(value: GitHubPublicationPlan): void {
   if (commit !== value.commitSha) {
     throw new GitHubPublicationError('configuration', 'reviewed publication commit is unavailable')
   }
-  if (value.promotion) return
+  if (value.promotion && value.promotion.sourceBranch !== value.headBranch) return
   const ancestor = Bun.spawnSync([
     '/usr/bin/git', '-C', gitRoot,
     'merge-base', '--is-ancestor', value.initialHead, value.commitSha,

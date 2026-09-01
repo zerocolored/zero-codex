@@ -19,6 +19,8 @@ import {
 } from './job-runner.ts'
 import {
   captureGitHubPublicationBaseline,
+  captureGitHubPublicationBaselineForBranches,
+  publishGitHubPlan,
   type GitHubPublicationCommands,
   type PublicationCommandResult,
 } from './github-publication.ts'
@@ -26,7 +28,6 @@ import {
   CodexCleanupPendingError,
   CodexPublicationPreflightRetryError,
   CodexRateLimitError,
-  CodexRepositoryChangedBeforeImplementationError,
   CodexUserCancelledError,
   executeCodexJob,
   type CodexLiveControlHooks,
@@ -305,7 +306,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-publication", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -317,6 +318,14 @@ for line in sys.stdin:
             continue
         emit({"id": request_id, "result": {"turn": active_turn}})
         emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
+        turn_latch_stage = os.environ.get("ZERO_TURN_LATCH_STAGE")
+        if turn_latch_stage == stage:
+            turn_latch_ready = os.environ["ZERO_TURN_LATCH_READY"]
+            turn_latch_release = os.environ["ZERO_TURN_LATCH_RELEASE"]
+            with open(turn_latch_ready, "x", encoding="utf-8") as stream:
+                stream.write(stage)
+            while not os.path.exists(turn_latch_release):
+                time.sleep(0.01)
         fixture_state = os.environ.get("ZERO_INTERJECTION_FIXTURE_STATE")
         if is_legacy_continuation:
             continuation_answers = {
@@ -338,10 +347,12 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-publication", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
-                action = '<zerokun_work_action>{"kind":"implement"}</zerokun_work_action>'
+                action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"main","mergePullRequest":false,"followupBaseBranch":null}]}</zerokun_work_action>'
+                if mode == "phased-publication-targeted":
+                    action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main"}]}</zerokun_work_action>'
                 if mode == "phased-no-change":
                     action = '<zerokun_work_action>{"kind":"no-change"}</zerokun_work_action>'
                 message = "準備完了\\n" + action + "\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
@@ -359,6 +370,7 @@ for line in sys.stdin:
                     action = '<zerokun_work_action>{"kind":"promote-current-head"}</zerokun_work_action>'
                     message = "公開準備完了\\n" + action + "\\n" + publication + "\\n" + scope + "\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
                 if mode == "phased-ui-approved":
+                    action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":"frontend","baseBranch":"main","mergePullRequest":false,"followupBaseBranch":null}]}</zerokun_work_action>'
                     message = "準備完了\\n" + action + "\\n" + '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>\\n' + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
                     envelope = re.search(r"<zerokun_ui_response_decision>([^\\n]+)</zerokun_ui_response_decision>", phase_prompt)
                     if envelope:
@@ -366,7 +378,7 @@ for line in sys.stdin:
                         message = semantic + "\\n" + message
             elif stage == "implementation":
                 if mode == "phased-publication":
-                    branch_match = re.search(r"feature branch based on the prepared branch: (zerochan/[0-9a-f]{20})", phase_prompt)
+                    branch_match = re.search(r"Host-assigned feature branch: (zerochan/[0-9a-f]{20})", phase_prompt)
                     if not branch_match:
                         raise RuntimeError("publication branch missing from implementation prompt")
                     branch = branch_match.group(1)
@@ -376,6 +388,34 @@ for line in sys.stdin:
                     subprocess.run(["/usr/bin/git", "-C", handshake_cwd, "add", "published.txt"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     subprocess.run(["/usr/bin/git", "-C", handshake_cwd, "commit", "-m", "fix: publish exact reviewed commit"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     subprocess.run(["/usr/bin/git", "-C", handshake_cwd, "switch", "main"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if mode == "phased-publication-targeted":
+                    binding_lines = [
+                        line for line in phase_prompt.splitlines()
+                        if line.startswith('{"repository":"."')
+                        and '"baseCommit":' in line
+                        and '"headBranch":' in line
+                    ]
+                    if len(binding_lines) != 1:
+                        raise RuntimeError("targeted implementation binding missing")
+                    binding = json.loads(binding_lines[0])
+                    if (
+                        binding.get("baseBranch") != "develop"
+                        or binding.get("mergePullRequest") is not True
+                        or binding.get("followupBaseBranch") != "main"
+                    ):
+                        raise RuntimeError("targeted implementation binding is invalid")
+                    worktree = os.environ["ZERO_ISOLATED_WORKTREE"]
+                    subprocess.run([
+                        "/usr/bin/git", "-C", handshake_cwd, "worktree", "add", "-b",
+                        binding["headBranch"], worktree, binding["baseCommit"],
+                    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    try:
+                        with open(os.path.join(worktree, "targeted.txt"), "w", encoding="utf-8") as stream:
+                            stream.write("reviewed targeted publication\\n")
+                        subprocess.run(["/usr/bin/git", "-C", worktree, "add", "targeted.txt"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.run(["/usr/bin/git", "-C", worktree, "commit", "-m", "fix: publish from selected develop base"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    finally:
+                        subprocess.run(["/usr/bin/git", "-C", handshake_cwd, "worktree", "remove", "--force", worktree], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 marker = re.search(r"\\[ZERO_IMPLEMENTATION_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "実装完了\\n" + (marker.group(0) if marker else "[ZERO_IMPLEMENTATION_READY:missing:r1:missing]")
             elif stage == "review":
@@ -658,7 +698,8 @@ function fixture(
     | 'failed-steer' | 'failed-turn'
     | 'error-steer' | 'rate-error' | 'rate-retrying' | 'capacity-error'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
-    | 'capacity-started-command' | 'phased' | 'phased-publication' | 'phased-promotion'
+    | 'capacity-started-command' | 'phased' | 'phased-publication'
+    | 'phased-publication-targeted' | 'phased-promotion'
     | 'phased-no-change'
     | 'phased-ui-approved'
     | 'phased-capacity-review-once'
@@ -1411,6 +1452,202 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('Codex選択develop baseを無関係な共有checkoutから隔離実装しmain向けPRまで公開する', async () => {
+    const value = fixture(
+      'phased-publication-targeted',
+      true,
+      'developを起点に実装し、developへ適用後にmain向けPRを作成してください',
+    )
+    const phaseLog = join(value.root, 'targeted-publication-phases.log')
+    const isolatedWorktree = join(value.root, 'targeted-publication-worktree')
+    git(value.repo, ['init', '--initial-branch=main'])
+    git(value.repo, ['config', 'user.email', 'zero@example.invalid'])
+    git(value.repo, ['config', 'user.name', 'Zero Test'])
+    git(value.repo, [
+      'config', 'remote.origin.url', 'https://github.com/example/targeted-publication.git',
+    ])
+    git(value.repo, ['add', 'AGENTS.md'])
+    git(value.repo, ['commit', '-m', 'chore: initial'])
+    const mainHead = git(value.repo, ['rev-parse', 'HEAD'])
+    git(value.repo, ['switch', '-c', 'develop'])
+    writeFileSync(join(value.repo, 'develop.txt'), 'selected implementation base\n')
+    git(value.repo, ['add', 'develop.txt'])
+    git(value.repo, ['commit', '-m', 'chore: prepare develop'])
+    const developHead = git(value.repo, ['rev-parse', 'HEAD'])
+    git(value.repo, ['update-ref', 'refs/remotes/origin/main', mainHead])
+    git(value.repo, ['update-ref', 'refs/remotes/origin/develop', developHead])
+    git(value.repo, ['switch', '-c', 'feat/unrelated-shared-checkout'])
+    writeFileSync(join(value.repo, 'unrelated.txt'), 'keep unrelated checkout\n')
+    git(value.repo, ['add', 'unrelated.txt'])
+    git(value.repo, ['commit', '-m', 'feat: unrelated concurrent work'])
+    const unrelatedHead = git(value.repo, ['rev-parse', 'HEAD'])
+    const baseline = captureGitHubPublicationBaselineForBranches(value.repo, [{
+      gitRoot: value.repo,
+      baseBranch: 'develop',
+    }])
+
+    const execution = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-publication-targeted',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_ISOLATED_WORKTREE: isolatedWorktree,
+      },
+      phaseGateForTesting: {},
+      liveControls: value.hooks,
+      publicationBaselineForTesting: baseline,
+    })
+
+    expect(readFileSync(phaseLog, 'utf8').trim().split('\n').map(line => line.split('\t')[0]))
+      .toEqual(['prepare', 'implementation', 'review'])
+    expect(git(value.repo, ['branch', '--show-current']))
+      .toBe('feat/unrelated-shared-checkout')
+    expect(git(value.repo, ['rev-parse', 'HEAD'])).toBe(unrelatedHead)
+    expect(git(value.repo, ['status', '--porcelain'])).toBe('')
+    expect(existsSync(isolatedWorktree)).toBe(false)
+    expect(execution.publication?.plans).toHaveLength(1)
+    const plan = execution.publication!.plans[0]!
+    expect(plan).toMatchObject({
+      baseBranch: 'develop',
+      initialHead: developHead,
+      promotion: {
+        sourceBranch: plan.headBranch,
+        sourceHead: plan.commitSha,
+        followupBaseBranch: 'main',
+        followupInitialHead: mainHead,
+      },
+    })
+    expect(git(value.repo, ['merge-base', unrelatedHead, plan.commitSha])).toBe(developHead)
+    expect(git(value.repo, ['merge-base', '--is-ancestor', developHead, plan.commitSha])).toBe('')
+
+    const integrationMergeHead = 'c'.repeat(40)
+    const remoteHeads = new Map<string, string | null>([
+      [plan.headBranch, null],
+      ['develop', developHead],
+      ['main', mainHead],
+    ])
+    let integrationExists = false
+    let integrationMerged = false
+    let releaseExists = false
+    let integrationMergeRequests = 0
+    let releaseMergeRequests = 0
+    const prRecord = (
+      number: number,
+      headBranch: string,
+      headSha: string,
+      baseBranch: string,
+      merged = false,
+    ) => ({
+      number,
+      html_url: `https://github.com/${plan.repositorySlug}/pull/${number}`,
+      state: merged ? 'closed' : 'open',
+      merged_at: merged ? '2026-09-01T00:00:00Z' : null,
+      merge_commit_sha: merged ? integrationMergeHead : null,
+      head: {
+        ref: headBranch,
+        sha: headSha,
+        repo: { full_name: plan.repositorySlug },
+      },
+      base: { ref: baseBranch, repo: { full_name: plan.repositorySlug } },
+    })
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repository, args) {
+        if (args[0] === 'ls-remote') {
+          const ref = String(args.at(-1))
+          const branch = ref.replace(/^refs\/heads\//, '')
+          const head = remoteHeads.get(branch) ?? null
+          return publicationCommandResult(0, head ? `${head}\t${ref}\n` : '')
+        }
+        if (args[0] === 'push') {
+          remoteHeads.set(plan.headBranch, plan.commitSha)
+          return publicationCommandResult(0, 'ok')
+        }
+        throw new Error(`unexpected targeted publication Git command: ${args.join(' ')}`)
+      },
+      async runGh(args, stdin) {
+        const command = args.join(' ')
+        if (command.includes('/compare/')) {
+          const prepared = /\/compare\/([0-9a-f]+)\.\.\./.exec(command)?.[1]
+          return publicationCommandResult(0, JSON.stringify({
+            status: 'ahead',
+            ahead_by: 1,
+            behind_by: 0,
+            base_commit: { sha: prepared },
+            merge_base_commit: { sha: prepared },
+          }))
+        }
+        if (args.includes('GET') && command.endsWith(`repos/${plan.repositorySlug}`)) {
+          return publicationCommandResult(0, JSON.stringify({
+            allow_merge_commit: true,
+            allow_squash_merge: true,
+            allow_rebase_merge: true,
+          }))
+        }
+        if (args.includes('GET')
+          && command.endsWith(`repos/${plan.repositorySlug}/pulls/91`)) {
+          return publicationCommandResult(0, JSON.stringify({
+            ...prRecord(
+              91, plan.headBranch, plan.commitSha, 'develop', integrationMerged,
+            ),
+            draft: false,
+            mergeable: true,
+            mergeable_state: 'clean',
+          }))
+        }
+        if (args.includes('GET') && command.includes('/pulls?')) {
+          if (command.includes('base=develop')) {
+            return publicationCommandResult(0, JSON.stringify(integrationExists
+              ? [prRecord(91, plan.headBranch, plan.commitSha, 'develop', integrationMerged)]
+              : []))
+          }
+          if (command.includes('base=main')) {
+            return publicationCommandResult(0, JSON.stringify(releaseExists
+              ? [prRecord(92, 'develop', integrationMergeHead, 'main')]
+              : []))
+          }
+        }
+        if (args.includes('POST') && command.includes('/pulls')) {
+          const request = JSON.parse(stdin ?? '{}') as { base?: string, head?: string }
+          if (request.base === 'develop') {
+            expect(request.head).toBe(plan.headBranch)
+            integrationExists = true
+          } else if (request.base === 'main') {
+            expect(request.head).toBe('develop')
+            releaseExists = true
+          } else {
+            throw new Error(`unexpected targeted publication PR base: ${request.base}`)
+          }
+          return publicationCommandResult(0, '{}')
+        }
+        if (args.includes('PUT') && command.includes('/pulls/91/merge')) {
+          integrationMergeRequests += 1
+          integrationMerged = true
+          remoteHeads.set('develop', integrationMergeHead)
+          return publicationCommandResult(0, '{}')
+        }
+        if (args.includes('PUT') && command.includes('/pulls/92/merge')) {
+          releaseMergeRequests += 1
+          return publicationCommandResult(0, '{}')
+        }
+        throw new Error(`unexpected targeted publication gh command: ${command}`)
+      },
+    }
+    const receipt = await publishGitHubPlan(plan, commands)
+    expect(receipt).toMatchObject({
+      pullRequestUrl: `https://github.com/${plan.repositorySlug}/pull/91`,
+      followupPullRequestUrl: `https://github.com/${plan.repositorySlug}/pull/92`,
+    })
+    expect(integrationMergeRequests).toBe(1)
+    expect(releaseMergeRequests).toBe(0)
+    expect(git(value.repo, ['branch', '--show-current']))
+      .toBe('feat/unrelated-shared-checkout')
+    expect(git(value.repo, ['rev-parse', 'HEAD'])).toBe(unrelatedHead)
+    value.store.close()
+  }, 30_000)
+
   test('既存commitのbranch promotionはwrite phaseを再実行せずprepareからreviewへ直接固定する', async () => {
     const value = fixture(
       'phased-promotion',
@@ -1836,28 +2073,63 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test('prepare応答後にrepositoryが変わったらsemantic parse前に再準備を要求する', async () => {
-    const value = fixture('phased', true)
+  test('prepare turn中に共有repositoryのclean HEADが進んでもCodex判断を破棄せず公開へ進む', async () => {
+    const value = fixture('phased-publication', true)
+    git(value.repo, ['init', '--initial-branch=main'])
+    git(value.repo, ['config', 'user.email', 'zero@example.invalid'])
+    git(value.repo, ['config', 'user.name', 'Zero Test'])
+    git(value.repo, [
+      'config', 'remote.origin.url', 'https://github.com/example/concurrent-prepare.git',
+    ])
+    git(value.repo, ['add', 'AGENTS.md'])
+    git(value.repo, ['commit', '-m', 'chore: initial'])
+    const initialHead = git(value.repo, ['rev-parse', 'HEAD'])
+    const baseline = captureGitHubPublicationBaseline(value.repo, [value.repo])
     const processIds: number[] = []
-    let processExits = 0
-    await expect(executeCodexJob(value.job, {
+    const phaseLog = join(value.root, 'concurrent-repository-phases.log')
+    const concurrentPath = join(value.repo, 'concurrent-change.txt')
+    const turnReady = join(value.root, 'prepare-turn.ready')
+    const turnRelease = join(value.root, 'prepare-turn.release')
+    const execution = executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
       stateDir: value.state,
       skipEffectiveConfigCheck: true,
-      extraEnvironment: { ZERO_FIXTURE_MODE: 'phased' },
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-publication',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_TURN_LATCH_STAGE: 'prepare',
+        ZERO_TURN_LATCH_READY: turnReady,
+        ZERO_TURN_LATCH_RELEASE: turnRelease,
+      },
       phaseGateForTesting: {},
       onProcessId: processId => { processIds.push(processId) },
-      onProcessExit: () => {
-        processExits += 1
-        if (processExits === 1) {
-          writeFileSync(join(value.repo, 'concurrent-change.txt'), 'changed\n', { mode: 0o600 })
-        }
-      },
       liveControls: value.hooks,
-    })).rejects.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
-    expect(processIds).toHaveLength(1)
-    expect(value.store.writePhaseMayHaveBeenDelivered(value.job.id)).toBe(false)
+      publicationBaselineForTesting: baseline,
+    })
+    await waitForPath(turnReady)
+    writeFileSync(concurrentPath, 'changed while prepare was running\n', { mode: 0o600 })
+    git(value.repo, ['add', 'concurrent-change.txt'])
+    git(value.repo, ['commit', '-m', 'chore: concurrent local work'])
+    const concurrentHead = git(value.repo, ['rev-parse', 'HEAD'])
+    expect(concurrentHead).not.toBe(initialHead)
+    expect(git(value.repo, ['status', '--porcelain'])).toBe('')
+    Object.assign(baseline, captureGitHubPublicationBaseline(value.repo, [value.repo]))
+    writeFileSync(turnRelease, '', { mode: 0o600, flag: 'wx' })
+    const result = await execution
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    expect(readFileSync(concurrentPath, 'utf8')).toBe('changed while prepare was running\n')
+    expect(readFileSync(phaseLog, 'utf8').trim().split('\n').map(line => line.split('\t')[0]))
+      .toEqual(['prepare', 'implementation', 'review'])
+    expect(processIds).toHaveLength(3)
+    expect(value.store.get(value.job.id)?.attempts).toBe(1)
+    expect(value.store.get(value.job.id)?.repositoryDriftRetries).toBe(0)
+    expect(value.store.writePhaseMayHaveBeenDelivered(value.job.id)).toBe(true)
+    const plan = result.publication?.plans[0]
+    expect(plan?.initialHead).toBe(concurrentHead)
+    expect(git(value.repo, [
+      'merge-base', '--is-ancestor', concurrentHead, plan!.commitSha,
+    ])).toBe('')
     value.store.close()
   }, 15_000)
 
@@ -1934,7 +2206,7 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test('UI承認済みmulti-repo jobは対象repoの同時更新をimplementation前に止める', async () => {
+  test('UI承認済みjobもprepare後の対象repo更新をCodexへ委ね同じturnを継続する', async () => {
     const value = fixture('phased-ui-approved', true)
     const makeRepository = (name: string): string => {
       const repository = join(value.repo, name)
@@ -1955,7 +2227,7 @@ describe('production App Server executor', () => {
     const phaseLog = join(value.root, 'scoped-ui-target-drift-phases.log')
     let processExits = 0
 
-    await expect(executeCodexJob(value.job, {
+    const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
       stateDir: value.state,
@@ -1992,12 +2264,17 @@ describe('production App Server executor', () => {
         }
       },
       liveControls: value.hooks,
-    })).rejects.toBeInstanceOf(CodexRepositoryChangedBeforeImplementationError)
+    })
 
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
       .map(line => line.split('\t')[0])
-    expect(stages).toEqual(['prepare'])
-    expect(value.store.writePhaseMayHaveBeenDelivered(value.job.id)).toBe(false)
+    expect(stages).toEqual(['prepare', 'implementation', 'review'])
+    expect(stages.filter(stage => stage === 'prepare')).toHaveLength(1)
+    expect(readFileSync(join(frontend, 'tracked.txt'), 'utf8'))
+      .toBe('concurrent frontend change\n')
+    expect(value.store.get(value.job.id)?.attempts).toBe(1)
+    expect(value.store.writePhaseMayHaveBeenDelivered(value.job.id)).toBe(true)
     value.store.close()
   }, 30_000)
 

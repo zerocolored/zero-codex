@@ -132,6 +132,7 @@ import {
   buildUiApprovalSemanticDecisionTemplate,
   parseCodexPreparationDecision,
   verifyUiApprovalBrowserReceipts,
+  type CodexImplementationIntent,
   type CodexPublicationIntent,
   type CodexPreparationWorkAction,
   type UiApprovalResumeContext,
@@ -153,6 +154,7 @@ import {
   assertGitHubPublicationSet,
   assertGitHubPublicationPlan,
   captureGitHubPublicationBaseline,
+  captureGitHubPublicationBaselineForBranches,
   createHostGitHubPublicationCommands,
   extendGitHubPublicationBaseline,
   gitHubPublicationBaselineDigest,
@@ -164,6 +166,92 @@ import {
   type GitHubPublicationPlan,
   type GitHubPublicationSet,
 } from './github-publication.ts'
+
+type BoundCodexImplementationIntent = CodexImplementationIntent & {
+  gitRoot: string
+  baseCommit: string
+  headBranch: string
+  followupInitialHead: string | null
+}
+
+function prepareBoundImplementationPublicationPlans(
+  baseline: GitHubPublicationBaseline,
+  repositoryScope: readonly string[],
+  bindings: readonly BoundCodexImplementationIntent[],
+  reviewedRepositories?: readonly { gitRoot: string; head: string }[],
+): GitHubPublicationPlan[] {
+  if (bindings.length === 0 || bindings.length !== repositoryScope.length) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'implementation publication omitted its Codex-selected base bindings',
+    )
+  }
+  const byRoot = new Map(bindings.map(binding => [binding.gitRoot, binding]))
+  if (byRoot.size !== bindings.length) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'implementation publication base bindings are not unique',
+    )
+  }
+  const headBranches = new Set(bindings.map(binding => binding.headBranch))
+  if (headBranches.size !== 1) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'implementation publication branches are inconsistent',
+    )
+  }
+  const plans = prepareGitHubPublicationPlans(
+    baseline,
+    repositoryScope,
+    reviewedRepositories,
+    bindings[0]!.headBranch,
+  ).map(plan => {
+    const binding = byRoot.get(plan.gitRoot)
+    if (!binding || plan.baseBranch !== binding.baseBranch
+      || plan.initialHead !== binding.baseCommit
+      || plan.headBranch !== binding.headBranch) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'reviewed implementation does not match its Codex-selected publication target',
+      )
+    }
+    if (!binding.mergePullRequest) {
+      if (binding.followupBaseBranch !== null || binding.followupInitialHead !== null) {
+        throw new GitHubPublicationError(
+          'configuration',
+          'ordinary implementation publication unexpectedly has a follow-up branch',
+        )
+      }
+      assertGitHubPublicationPlan(plan)
+      return plan
+    }
+    if (!binding.followupBaseBranch || !binding.followupInitialHead) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'implementation promotion omitted its follow-up branch binding',
+      )
+    }
+    const promoted: GitHubPublicationPlan = {
+      ...plan,
+      promotion: {
+        version: 1,
+        sourceBranch: plan.headBranch,
+        sourceHead: plan.commitSha,
+        followupBaseBranch: binding.followupBaseBranch,
+        followupInitialHead: binding.followupInitialHead,
+      },
+    }
+    assertGitHubPublicationPlan(promoted)
+    return promoted
+  })
+  if (plans.length === 0) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'implementation produced no reviewed commit; preparation did not authorize no-change',
+    )
+  }
+  return plans
+}
 
 export { resolveCodexExecutable } from './standalone-codex.ts'
 
@@ -3173,8 +3261,10 @@ export function buildCodexPhasePrompt(
   threadHistory?: DurableThreadHistorySnapshot,
   repositoryIdentifiers: readonly string[] = ['.'],
   implementationRepositoryScope?: readonly string[],
+  implementationBindings?: readonly BoundCodexImplementationIntent[],
   publicationOnlyPlans?: readonly GitHubPublicationPlan[],
   reviewWorkAction?: CodexPreparationWorkAction,
+  implementationReviewPlans?: readonly GitHubPublicationPlan[],
 ): string {
   if (!/^[0-9a-f]{32}$/.test(attemptNonce ?? '')) {
     throw new Error('host phase prompt requires the logical attempt nonce')
@@ -3188,6 +3278,31 @@ export function buildCodexPhasePrompt(
     || implementationRepositoryScope.some(value => !repositoryIdentifiers.includes(value))
   )) {
     throw new Error('host phase prompt repository scope is invalid')
+  }
+  if (implementationBindings && (
+    stage === 'prepare'
+    || !implementationRepositoryScope
+    || implementationBindings.length !== implementationRepositoryScope.length
+    || JSON.stringify(implementationBindings.map(value => value.repository))
+      !== JSON.stringify(implementationRepositoryScope)
+  )) {
+    throw new Error('host phase implementation base binding is invalid')
+  }
+  if (implementationReviewPlans && (
+    stage !== 'review'
+    || !implementationBindings
+    || reviewWorkAction !== 'implement'
+    || publicationOnlyPlans !== undefined
+    || implementationReviewPlans.length === 0
+    || implementationReviewPlans.length > implementationBindings.length
+    || implementationReviewPlans.some(plan => !implementationBindings.some(binding => (
+      binding.gitRoot === plan.gitRoot
+      && binding.baseBranch === plan.baseBranch
+      && binding.baseCommit === plan.initialHead
+      && binding.headBranch === plan.headBranch
+    )))
+  )) {
+    throw new Error('host phase implementation review plan is invalid')
   }
   const phaseInput = stage === 'implementation'
     ? writeAuthorizedImplementationInput(input)
@@ -3209,6 +3324,35 @@ export function buildCodexPhasePrompt(
       'Only repositories in that exact scope belong to this implementation and review.',
       'Treat changes in every repository outside that scope as concurrent unrelated user work:',
       'preserve them, do not edit them, and do not request fixes for them in review.',
+    )
+  }
+  if (implementationBindings) {
+    host.push(
+      'Codex-selected implementation and publication targets (host-bound JSON):',
+      ...implementationBindings.map(binding => JSON.stringify(binding)),
+      'Each baseCommit is the exact starting commit for the assigned feature branch.',
+      'The host will publish the reviewed feature ref to baseBranch. When mergePullRequest is true,',
+      'it will merge only that integration PR and then create, but never merge, the follow-up PR.',
+    )
+    if (stage === 'implementation') {
+      host.push(
+        'Keep the shared checkout unchanged. Create or attach an isolated linked worktree under',
+        '$HOME for each selected repository, commit there, remove only that linked worktree, and',
+        'leave the assigned feature ref intact for the read-only review and host publication.',
+      )
+    } else {
+      host.push(
+        'This is a read-only review. Inspect the exact assigned feature refs without switching the',
+        'shared checkout and without creating, removing, resetting, or editing any worktree or ref.',
+      )
+    }
+  }
+  if (implementationReviewPlans) {
+    host.push(
+      'Exact implementation publication plans to review (host-bound JSON):',
+      ...implementationReviewPlans.map(plan => JSON.stringify(plan)),
+      'Review these exact feature commits, integration bases, and optional ordered follow-up PRs.',
+      'Do not substitute the branch currently checked out by another session for any bound branch.',
     )
   }
   if (publicationOnlyPlans) {
@@ -3242,6 +3386,10 @@ export function buildCodexPhasePrompt(
   if (stage === 'review' && reviewWorkAction !== undefined
     && reviewWorkAction !== 'promote-current-head' && publicationOnlyPlans) {
     throw new Error('publication-only review conflicts with its prepared work action')
+  }
+  if (stage === 'review' && reviewWorkAction === 'implement'
+    && implementationBindings && !implementationReviewPlans) {
+    throw new Error('implementation review omitted its exact publication plans')
   }
   if (threadHistory) {
     host.push(
@@ -3301,6 +3449,9 @@ export function buildCodexPhasePrompt(
       base,
       ...host,
       'Host phase: read-only preparation.',
+      'Treat concurrent shared-checkout movement as ordinary context. Inspect the current state,',
+      'preserve unrelated work, and decide compatibility yourself; do not ask the host to restart',
+      'the phase merely because HEAD, status, or an unrelated repository changed.',
       'Complete investigation round 1 and design round 1 for this exact input. Each native',
       `advisor response must end with [ZERO_NATIVE_ADVISOR:${attemptNonce}:r${input.revision}:${input.digest}:<investigation|design>:1:<solution|risk>] after replacing only the final phase and perspective placeholders. Put that marker exactly once, on a line by itself as the final line, with no output after it.`,
       'For a bounded unavailable native attempt, submit attempted=true, adopted=false, and its',
@@ -3310,11 +3461,16 @@ export function buildCodexPhasePrompt(
       'Choose the smallest complete set of repositories that implementation may modify.',
       'For every ready decision, put exactly one of these host-only work-action envelopes',
       'immediately before the optional publication envelope and repository-scope envelope:',
-      '<zerokun_work_action>{"kind":"implement"}</zerokun_work_action>',
+      '<zerokun_work_action>{"kind":"implement","targets":[{"repository":"<repository ID>","baseBranch":"<integration branch>","mergePullRequest":false,"followupBaseBranch":null}]}</zerokun_work_action>',
       '<zerokun_work_action>{"kind":"no-change"}</zerokun_work_action>',
       '<zerokun_work_action>{"kind":"promote-current-head"}</zerokun_work_action>',
       'Use no-change only when the request is fully answered without any repository or GitHub',
       'write. Use promote-current-head only with the exact publication envelope below.',
+      'For implement, targets must bind every selected repository exactly once in sorted order.',
+      'Codex selects each integration base from the actual request and repository conventions, not',
+      'from the branch currently checked out by another session. Set mergePullRequest=true and a',
+      'non-null followupBaseBranch only when the request explicitly asks to merge the integration',
+      'PR and then create the next branch PR; otherwise use false and null.',
       'For every ready decision, put this exact JSON envelope immediately before the final',
       'ready marker, using only the exact IDs above in sorted order with no duplicates:',
       '<zerokun_repository_scope>{"repositories":["<implementation repository ID>"]}</zerokun_repository_scope>',
@@ -3368,14 +3524,23 @@ export function buildCodexPhasePrompt(
       'sender would be read-only in a new thread. Implement, test, and commit this exact prepared',
       'combined input. Do not push, create a PR, or access credentials. Review runs later in a',
       'separate read-only process, and the trusted host publishes its accepted commit afterward.',
-      'Before the first edit in every selected repository, create or switch to this exact local',
-      `feature branch based on the prepared branch: ${publicationBranch}`,
-      'Use the same exact branch for later implementation-fix rounds. Never commit directly to',
-      'the prepared base branch or choose a different publication branch.',
+      'This is a shared local checkout and another Codex session may have moved a branch or added',
+      'unrelated work after preparation. Re-read the live Git state now, preserve every unrelated',
+      'change, and adapt using an isolated worktree when useful. Do not abandon or restart the',
+      'request merely because the shared checkout changed; decide compatibility yourself.',
+      `Host-assigned feature branch: ${publicationBranch}`,
+      ...(reviewRound === 1 ? [
+        'Before the first edit in every selected repository, create this exact branch at the bound',
+        'baseCommit inside the host-described isolated linked worktree.',
+      ] : [
+        'This is an implementation-fix round. Attach an isolated linked worktree to the existing',
+        'assigned feature ref and continue from it. Never reset, delete, or recreate it at baseCommit.',
+      ]),
+      'Never commit directly to the selected base branch or choose a different publication branch.',
       'Do not modify Git remotes, local Git config, hooks, or credential settings. Include every',
-      'task-owned change in a commit. After the commit, switch every selected repository back to',
-      'the exact prepared base branch and commit it had before implementation, leaving the exact',
-      'feature branch ref at the committed result. The worktree must be clean. Never claim that',
+      'task-owned change in a commit. After the commit, remove only the isolated linked worktree,',
+      'leaving the shared checkout branch, HEAD, and files untouched and the exact feature branch',
+      'ref at the committed result. Never claim that',
       'push or PR creation already happened.',
       ...(browserEnabled ? [
         'For browser-visible behavior, start the application on localhost and call',
@@ -3390,6 +3555,8 @@ export function buildCodexPhasePrompt(
     base,
     ...host,
     `Host phase: read-only review round ${reviewRound}.`,
+    'Re-read the live Git state. Review the task-owned commit and bound publication target even if',
+    'another local session moved the shared checkout; preserve and ignore unrelated work.',
     ...(browserEnabled ? [
       'For browser-visible behavior, you may start the unchanged application on localhost and call',
       'zerokun_browser.verify_local_page to independently confirm its rendered output. Do not use',
@@ -3433,6 +3600,7 @@ export function parseCodexReviewDecision(
 export function assertPreparedWorkPublication(
   workAction: CodexPreparationWorkAction,
   plans: readonly GitHubPublicationPlan[],
+  implementationBindings: readonly BoundCodexImplementationIntent[] = [],
 ): void {
   if (workAction === 'implement' && plans.length === 0) {
     throw new GitHubPublicationError(
@@ -3453,10 +3621,46 @@ export function assertPreparedWorkPublication(
       'publication-only preparation omitted its exact promotion plan',
     )
   }
-  if (workAction !== 'promote-current-head' && plans.some(plan => plan.promotion)) {
+  if (workAction === 'implement') {
+    const byRoot = new Map(implementationBindings.map(binding => [binding.gitRoot, binding]))
+    if (implementationBindings.length === 0
+      || byRoot.size !== implementationBindings.length) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'implementation publication does not match its prepared repository targets',
+      )
+    }
+    for (const plan of plans) {
+      const binding = byRoot.get(plan.gitRoot)
+      const promotion = plan.promotion
+      if (!binding || plan.baseBranch !== binding.baseBranch
+        || plan.initialHead !== binding.baseCommit
+        || plan.headBranch !== binding.headBranch
+        || (binding.mergePullRequest && (
+          !promotion
+          || promotion.sourceBranch !== plan.headBranch
+          || promotion.sourceHead !== plan.commitSha
+          || promotion.followupBaseBranch !== binding.followupBaseBranch
+          || promotion.followupInitialHead !== binding.followupInitialHead
+        ))
+        || (!binding.mergePullRequest && promotion !== undefined)) {
+        throw new GitHubPublicationError(
+          'configuration',
+          'implementation publication conflicts with the Codex-selected target',
+        )
+      }
+    }
+  }
+  if (workAction === 'no-change' && implementationBindings.length !== 0) {
     throw new GitHubPublicationError(
       'configuration',
-      'publication promotion conflicts with the prepared work action',
+      'no-change preparation unexpectedly retained implementation bindings',
+    )
+  }
+  if (workAction === 'promote-current-head' && implementationBindings.length !== 0) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'publication-only preparation unexpectedly retained implementation bindings',
     )
   }
 }
@@ -5104,10 +5308,11 @@ export async function executeCodexJob(
     parentChildBaselineInput: string[] | null = null,
     parentTurnBaselineInput: NativeAdvisorParentTurnBaseline | null = null,
     boundInterjection?: JobInterjectionRecord,
-    expectedRepositoryDigest?: string,
     expectedRepositoryScope?: readonly string[],
+    implementationBindings?: readonly BoundCodexImplementationIntent[],
     publicationOnlyPlans?: readonly GitHubPublicationPlan[],
     reviewWorkAction?: CodexPreparationWorkAction,
+    implementationReviewPlans?: readonly GitHubPublicationPlan[],
   ) => {
     if (stage === 'interjection' && !boundInterjection) {
       throw new Error('interjection execution omitted its durable input binding')
@@ -5148,16 +5353,11 @@ export async function executeCodexJob(
         throw new CodexCleanupPendingError(`${label} cleanup is unconfirmed: ${cleanupError}`)
       }
     }
-    if (stage === 'implementation' && expectedRepositoryDigest) {
-      const observedRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
-      const observedRepositoryDigest = expectedRepositoryScope
-        ? advisorRepositoryScopeDigest(observedRepositorySnapshot, expectedRepositoryScope)
-        : advisorRepositoryDigest(observedRepositorySnapshot)
-      if (observedRepositoryDigest !== expectedRepositoryDigest) {
-        await retireUnregisteredAttempt('pre-implementation repository drift')
-        throw new CodexRepositoryChangedBeforeImplementationError()
-      }
-    }
+    // The repository is shared with other local Codex sessions. A digest change
+    // between preparation and implementation is context for the primary Codex,
+    // not a host-level reason to discard its completed reasoning and rerun the
+    // whole turn. Exact repository/commit validation still happens when the
+    // reviewed publication plan is staged and published.
     if (!options.skipEffectiveConfigCheck) {
       revalidateCodexExecutable()
       try {
@@ -6196,8 +6396,10 @@ export async function executeCodexJob(
                 stage === 'prepare'
                   ? undefined
                   : expectedRepositoryScope ?? options.uiApproval?.repositoryScope ?? undefined,
+                implementationBindings,
                 publicationOnlyPlans,
                 reviewWorkAction,
+                implementationReviewPlans,
               ),
             phaseClientUserMessageId ?? job.idempotencyKey,
             {
@@ -6206,18 +6408,6 @@ export async function executeCodexJob(
               approvalPolicy: 'never',
               ...(model ? { model } : {}),
               beforeWrite: requestId => {
-                if (stage === 'implementation' && expectedRepositoryDigest) {
-                  const observedRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
-                  const observedRepositoryDigest = expectedRepositoryScope
-                    ? advisorRepositoryScopeDigest(
-                        observedRepositorySnapshot,
-                        expectedRepositoryScope,
-                      )
-                    : advisorRepositoryDigest(observedRepositorySnapshot)
-                  if (observedRepositoryDigest !== expectedRepositoryDigest) {
-                    throw new CodexRepositoryChangedBeforeImplementationError()
-                  }
-                }
                 initialRequestId = requestId
                 const disposition = isInterjectionStage
                   ? controls.beginInterjectionAnswer({
@@ -7202,6 +7392,7 @@ export async function executeCodexJob(
     let preparedRepositoryScope: string[] | null = null
     let preparedWorkAction: CodexPreparationWorkAction | null = null
     let preparedPublicationIntents: CodexPublicationIntent[] = []
+    let preparedImplementationBindings: BoundCodexImplementationIntent[] = []
     let implementedInputDigest: string | null = null
     let publicationBaseline: GitHubPublicationBaseline | null = null
     let publicationOnlyPlans: GitHubPublicationPlan[] | null = null
@@ -7408,10 +7599,11 @@ export async function executeCodexJob(
       stage: 'prepare' | 'implementation' | 'review',
       round: 1 | 2 | 3,
       boundInput?: AdvisorInputSnapshot,
-      expectedRepositoryDigest?: string,
       expectedRepositoryScope?: readonly string[],
+      implementationBindings?: readonly BoundCodexImplementationIntent[],
       publicationOnlyPlans?: readonly GitHubPublicationPlan[],
       reviewWorkAction?: CodexPreparationWorkAction,
+      implementationReviewPlans?: readonly GitHubPublicationPlan[],
     ): Promise<{
       kind: 'success'
       execution: Awaited<ReturnType<typeof runAttempt>>
@@ -7431,8 +7623,8 @@ export async function executeCodexJob(
         const execution = await runAttempt(
           sessionId, resumed, stage, phaseSequence, round, boundInput,
           parentChildBaseline, parentTurnBaseline, undefined,
-          expectedRepositoryDigest, expectedRepositoryScope, publicationOnlyPlans,
-          reviewWorkAction,
+          expectedRepositoryScope, implementationBindings, publicationOnlyPlans,
+          reviewWorkAction, implementationReviewPlans,
         )
         if ('userCancelled' in execution && execution.userCancelled === true) {
           await execution.retireCancelledRegistration()
@@ -7538,14 +7730,6 @@ export async function executeCodexJob(
           && execution.parentTurnIds.length === 0
           && executionReportsMissingSession(execution)
         if (safeInitialPrepareFallback) {
-          const afterFailedAttemptDigest = advisorRepositoryDigest(
-            snapshotAdvisorRepository(advisorProjectLayout),
-          )
-          if (afterFailedAttemptDigest !== execution.initialRepositoryDigest) {
-            throw new Error(
-              'Codex resume failed after the repository changed; automatic fallback is blocked',
-            )
-          }
           options.onSessionReset?.()
           resumeFallbackAttempted = true
           sessionId = null
@@ -7579,17 +7763,6 @@ export async function executeCodexJob(
         try {
           const observedRepositorySnapshot = snapshotAdvisorRepository(advisorProjectLayout)
           const observedRepositoryFullDigest = advisorRepositoryDigest(observedRepositorySnapshot)
-          const approvalScope = options.uiApproval?.repositoryScope ?? null
-          const semanticRepositoryDigest = approvalScope
-            ? advisorRepositoryScopeDigest(observedRepositorySnapshot, approvalScope)
-            : observedRepositoryFullDigest
-          if (approvalScope
-            && semanticRepositoryDigest !== advisorRepositoryScopeDigest(
-              logicalAttempt.initialRepositorySnapshot,
-              approvalScope,
-            )) {
-            throw new CodexRepositoryChangedBeforeImplementationError()
-          }
           currentRepositorySnapshot = observedRepositorySnapshot
           currentRepositoryFullDigest = observedRepositoryFullDigest
           preparationDecision = parseCodexPreparationDecision(
@@ -7598,7 +7771,12 @@ export async function executeCodexJob(
             finalInput,
             options.uiApproval ? {
               context: options.uiApproval,
-              currentRepositoryDigest: semanticRepositoryDigest,
+              // Bind the semantic envelope to the snapshot that was actually
+              // shown to Codex in this turn. A later shared-checkout change is
+              // handled by the next live Codex phase, not reinterpreted by the
+              // host after the answer has completed.
+              currentRepositoryDigest:
+                logicalAttempt.uiApprovalRepositoryChange!.currentDigest,
             } : undefined,
             advisorRepositoryIdentifiers(observedRepositorySnapshot),
           )
@@ -7614,15 +7792,6 @@ export async function executeCodexJob(
           currentRepositoryDigest = currentRepositoryScope
             ? advisorRepositoryScopeDigest(observedRepositorySnapshot, currentRepositoryScope)
             : observedRepositoryFullDigest
-          const initialPreparedRepositoryDigest = currentRepositoryScope
-            ? advisorRepositoryScopeDigest(
-                logicalAttempt.initialRepositorySnapshot,
-                currentRepositoryScope,
-              )
-            : execution.initialRepositoryDigest
-          if (currentRepositoryDigest !== initialPreparedRepositoryDigest) {
-            throw new CodexRepositoryChangedBeforeImplementationError()
-          }
           if (preparationDecision.kind === 'approval-required') {
             if (!execution.browserReceiptKey) {
               throw new Error(
@@ -7689,7 +7858,8 @@ export async function executeCodexJob(
               decision: preparationDecision.approvalDecision,
               currentInputRevision: finalInput.revision,
               currentInputDigest: finalInput.digest,
-              currentRepositoryDigest: semanticRepositoryDigest,
+              currentRepositoryDigest:
+                logicalAttempt.uiApprovalRepositoryChange!.currentDigest,
             })
           }
         } catch (error) {
@@ -7708,6 +7878,7 @@ export async function executeCodexJob(
           preparedRepositoryScope = null
           preparedWorkAction = null
           preparedPublicationIntents = []
+          preparedImplementationBindings = []
           publicationOnlyPlans = null
           publicationBaseline = null
           nextStage = 'prepare'
@@ -7738,7 +7909,65 @@ export async function executeCodexJob(
         preparedRepositoryScope = currentRepositoryScope
         preparedWorkAction = preparationDecision.workAction
         preparedPublicationIntents = [...(preparationDecision.publicationIntents ?? [])]
+        const implementationIntents = [...(preparationDecision.implementationIntents ?? [])]
+        preparedImplementationBindings = []
         publicationOnlyPlans = null
+        if (preparedWorkAction === 'implement') {
+          if (!preparedRepositoryScope
+            || implementationIntents.length !== preparedRepositoryScope.length) {
+            throw new Error('implementation preparation omitted its exact base branch bindings')
+          }
+          const bindsPublication = testCodexBin === undefined
+            || options.publicationBaselineForTesting != null
+          if (bindsPublication) {
+            const scopedSnapshot = scopeAdvisorRepositorySnapshot(
+              currentRepositorySnapshot,
+              preparedRepositoryScope,
+            )
+            const identifiers = advisorRepositoryIdentifiers(scopedSnapshot)
+            const rootsByIdentifier = new Map(identifiers.map((identifier, index) => [
+              identifier,
+              scopedSnapshot.repositories[index]?.gitRoot,
+            ]))
+            if (rootsByIdentifier.size !== preparedRepositoryScope.length
+              || [...rootsByIdentifier.values()].some(value => !value)) {
+              throw new Error('implementation repository scope is not backed by Git worktrees')
+            }
+            publicationBaseline = testCodexBin === undefined
+              ? captureGitHubPublicationBaselineForBranches(
+                  jobRepo,
+                  implementationIntents.map(intent => ({
+                    gitRoot: rootsByIdentifier.get(intent.repository)!,
+                    baseBranch: intent.baseBranch,
+                  })),
+                )
+              : options.publicationBaselineForTesting!
+            const baselineByRoot = new Map(publicationBaseline.repositories.map(repository => [
+              repository.gitRoot,
+              repository,
+            ]))
+            preparedImplementationBindings = implementationIntents.map(intent => {
+              const gitRoot = rootsByIdentifier.get(intent.repository)!
+              const baseline = baselineByRoot.get(gitRoot)
+              if (!baseline || baseline.baseBranch !== intent.baseBranch) {
+                throw new Error('implementation base branch is not bound by the host baseline')
+              }
+              const followupInitialHead = intent.followupBaseBranch === null
+                ? null
+                : captureGitHubPublicationBaselineForBranches(jobRepo, [{
+                    gitRoot,
+                    baseBranch: intent.followupBaseBranch,
+                  }]).repositories[0]!.initialHead
+              return {
+                ...intent,
+                gitRoot,
+                baseCommit: baseline.initialHead,
+                headBranch: publicationBranch,
+                followupInitialHead,
+              }
+            })
+          }
+        }
         if (preparedPublicationIntents.length > 0) {
           if (!preparedRepositoryScope || preparedRepositoryScope.length === 0) {
             throw new Error('publication-only preparation omitted its repository scope')
@@ -7798,12 +8027,12 @@ export async function executeCodexJob(
           if (!preparedRepositoryScope || preparedRepositoryScope.length === 0) {
             throw new Error('no-change preparation omitted its repository scope')
           }
-          const scopedSnapshot = scopeAdvisorRepositorySnapshot(
-            currentRepositorySnapshot,
-            preparedRepositoryScope,
-          )
+          // Codex has already decided that this request needs no repository or
+          // GitHub write. A concurrent dirty/shared checkout is therefore not
+          // a host-level reason to reject the answer. Test fixtures may still
+          // provide an empty publication baseline to exercise the staged set.
           publicationBaseline = testCodexBin === undefined
-            ? captureGitHubPublicationBaseline(jobRepo, scopedSnapshot.gitRoots)
+            ? null
             : options.publicationBaselineForTesting ?? null
           for (const repository of preparedRepositoryScope) {
             publicationRepositoryScope.add(repository)
@@ -7833,9 +8062,11 @@ export async function executeCodexJob(
               preparedRepositoryScope,
             )
           : advisorRepositoryDigest(repositoryBeforeImplementationSnapshot)
-        if (repositoryBeforeImplementation !== preparedRepositoryDigest) {
-          throw new CodexRepositoryChangedBeforeImplementationError()
-        }
+        // Bind implementation to what is actually present now. Shared
+        // checkout movement is deliberately left to Codex to reconcile (for
+        // example by using an isolated worktree) instead of restarting the
+        // completed preparation turn.
+        preparedRepositoryDigest = repositoryBeforeImplementation
         const implementationScope = preparedRepositoryScope
           ?? advisorRepositoryIdentifiers(repositoryBeforeImplementationSnapshot)
         for (const repository of implementationScope) publicationRepositoryScope.add(repository)
@@ -7844,15 +8075,24 @@ export async function executeCodexJob(
           [...publicationRepositoryScope].sort(),
         ).gitRoots
         if (testCodexBin === undefined) {
-          publicationBaseline = publicationBaseline === null
-            ? captureGitHubPublicationBaseline(jobRepo, implementationGitRoots)
-            : extendGitHubPublicationBaseline(publicationBaseline, implementationGitRoots)
+          if (preparedImplementationBindings.length > 0) {
+            if (!publicationBaseline) {
+              throw new Error('implementation omitted its Codex-selected Git baseline')
+            }
+          } else {
+            publicationBaseline = publicationBaseline === null
+              ? captureGitHubPublicationBaseline(jobRepo, implementationGitRoots)
+              : extendGitHubPublicationBaseline(publicationBaseline, implementationGitRoots)
+          }
         } else if (publicationBaseline === null) {
           publicationBaseline = options.publicationBaselineForTesting ?? null
         }
         const outcome = await runPhase(
           'implementation', reviewRound, preparedInput,
-          preparedRepositoryDigest, preparedRepositoryScope ?? undefined,
+          preparedRepositoryScope ?? undefined,
+          preparedImplementationBindings.length > 0
+            ? preparedImplementationBindings
+            : undefined,
         )
         if (outcome.kind === 'input-changed') {
           preparedInput = null
@@ -7860,6 +8100,7 @@ export async function executeCodexJob(
           preparedRepositoryScope = null
           preparedWorkAction = null
           preparedPublicationIntents = []
+          preparedImplementationBindings = []
           publicationOnlyPlans = null
           publicationBaseline = null
           nextStage = 'prepare'
@@ -7899,6 +8140,7 @@ export async function executeCodexJob(
           preparedRepositoryScope = null
           preparedWorkAction = null
           preparedPublicationIntents = []
+          preparedImplementationBindings = []
           publicationOnlyPlans = null
           publicationBaseline = null
           nextStage = 'prepare'
@@ -7917,25 +8159,30 @@ export async function executeCodexJob(
 
       if (!preparedInput) throw new Error('read-only review omitted its prepared input binding')
       const publicationPlansBeforeReview = publicationOnlyPlans ?? (publicationBaseline
-        ? prepareGitHubPublicationPlans(
-            publicationBaseline,
-            preparedRepositoryScope ?? undefined,
-            undefined,
-            publicationBranch,
-          )
+        ? preparedImplementationBindings.length > 0 && preparedRepositoryScope
+          ? prepareBoundImplementationPublicationPlans(
+              publicationBaseline,
+              preparedRepositoryScope,
+              preparedImplementationBindings,
+            )
+          : prepareGitHubPublicationPlans(
+              publicationBaseline,
+              preparedRepositoryScope ?? undefined,
+              undefined,
+              publicationBranch,
+            )
         : null)
-      const repositoryBeforeReviewSnapshot = snapshotAdvisorRepository(advisorProjectLayout)
-      const repositoryBeforeReview = preparedRepositoryScope
-        ? advisorRepositoryScopeDigest(
-            repositoryBeforeReviewSnapshot,
-            preparedRepositoryScope,
-          )
-        : advisorRepositoryDigest(repositoryBeforeReviewSnapshot)
       const outcome = await runPhase(
         'review', reviewRound, preparedInput,
-        undefined, preparedRepositoryScope ?? undefined,
+        preparedRepositoryScope ?? undefined,
+        preparedImplementationBindings.length > 0
+          ? preparedImplementationBindings
+          : undefined,
         publicationOnlyPlans ?? undefined,
         preparedWorkAction ?? undefined,
+        preparedWorkAction === 'implement' && publicationPlansBeforeReview
+          ? publicationPlansBeforeReview
+          : undefined,
       )
       if (outcome.kind === 'input-changed') {
         preparedInput = null
@@ -7943,6 +8190,7 @@ export async function executeCodexJob(
         preparedRepositoryScope = null
         preparedWorkAction = null
         preparedPublicationIntents = []
+        preparedImplementationBindings = []
         publicationOnlyPlans = null
         publicationBaseline = null
         nextStage = 'prepare'
@@ -7966,6 +8214,7 @@ export async function executeCodexJob(
         preparedRepositoryScope = null
         preparedWorkAction = null
         preparedPublicationIntents = []
+        preparedImplementationBindings = []
         publicationOnlyPlans = null
         publicationBaseline = null
         nextStage = 'prepare'
@@ -7980,9 +8229,6 @@ export async function executeCodexJob(
         const currentReviewRepositoryDigest = preparedRepositoryScope
           ? advisorRepositoryScopeDigest(currentRepositorySnapshot, preparedRepositoryScope)
           : currentRepositoryDigest
-        if (currentReviewRepositoryDigest !== repositoryBeforeReview) {
-          throw new CodexRepositoryChangedBeforePublicationError()
-        }
         reviewedRepositoryDigest = currentReviewRepositoryDigest
         let advisorRounds: NativeAdvisorRoundEvidence[] | undefined
         if (options.phaseGateForTesting) {
@@ -8049,20 +8295,7 @@ export async function executeCodexJob(
         preparedInput = null
         preparedWorkAction = null
         preparedPublicationIntents = []
-        publicationOnlyPlans = null
-        publicationBaseline = null
-        nextStage = 'prepare'
-        continue
-      }
-      if (reviewError instanceof CodexRepositoryChangedBeforePublicationError) {
-        phaseSequence += 1
-        reviewRound = 1
-        reviewedInputRevision = null
-        preparedInput = null
-        preparedRepositoryDigest = null
-        preparedRepositoryScope = null
-        preparedWorkAction = null
-        preparedPublicationIntents = []
+        preparedImplementationBindings = []
         publicationOnlyPlans = null
         publicationBaseline = null
         nextStage = 'prepare'
@@ -8091,29 +8324,11 @@ export async function executeCodexJob(
         nextStage = 'implementation'
         continue
       }
-      const repositoryBeforePublicationSnapshot = snapshotAdvisorRepository(advisorProjectLayout)
-      const repositoryBeforePublication = preparedRepositoryScope
-        ? advisorRepositoryScopeDigest(
-            repositoryBeforePublicationSnapshot,
-            preparedRepositoryScope,
-          )
-        : advisorRepositoryDigest(repositoryBeforePublicationSnapshot)
-      if (repositoryBeforePublication !== repositoryBeforeReview) {
-        phaseSequence += 1
-        reviewRound = 1
-        reviewedInputRevision = null
-        preparedInput = null
-        preparedRepositoryDigest = null
-        preparedRepositoryScope = null
-        preparedWorkAction = null
-        preparedPublicationIntents = []
-        publicationOnlyPlans = null
-        publicationBaseline = null
-        nextStage = 'prepare'
-        continue
-      }
       if (!preparedWorkAction) {
         throw new Error('review omitted its prepared work action binding')
+      }
+      if (!reviewedRepositoryDigest) {
+        throw new Error('review omitted its observed repository digest')
       }
       const finalizedPublicationPlans = publicationBaseline
         ? publicationOnlyPlans
@@ -8121,15 +8336,25 @@ export async function executeCodexJob(
               assertGitHubPublicationPlan(plan)
               return plan
             })
-          : prepareGitHubPublicationPlans(
-              publicationBaseline,
-              preparedRepositoryScope ?? undefined,
-              publicationPlansBeforeReview?.map(plan => ({
-                gitRoot: plan.gitRoot,
-                head: plan.commitSha,
-              })),
-              publicationBranch,
-            )
+          : preparedImplementationBindings.length > 0 && preparedRepositoryScope
+            ? prepareBoundImplementationPublicationPlans(
+                publicationBaseline,
+                preparedRepositoryScope,
+                preparedImplementationBindings,
+                publicationPlansBeforeReview?.map(plan => ({
+                  gitRoot: plan.gitRoot,
+                  head: plan.commitSha,
+                })),
+              )
+            : prepareGitHubPublicationPlans(
+                publicationBaseline,
+                preparedRepositoryScope ?? undefined,
+                publicationPlansBeforeReview?.map(plan => ({
+                  gitRoot: plan.gitRoot,
+                  head: plan.commitSha,
+                })),
+                publicationBranch,
+              )
         : []
       // Production always has a host-captured Git baseline before a write phase.
       // A small set of protocol-only App Server fixtures intentionally uses a
@@ -8138,7 +8363,11 @@ export async function executeCodexJob(
       // fixture that supplies a real baseline exercises the exact production
       // contract and must still produce a reviewed commit (or explicit no-change).
       if (publicationBaseline || testCodexBin === undefined) {
-        assertPreparedWorkPublication(preparedWorkAction, finalizedPublicationPlans)
+        assertPreparedWorkPublication(
+          preparedWorkAction,
+          finalizedPublicationPlans,
+          preparedImplementationBindings,
+        )
       }
       const publication: GitHubPublicationSet | undefined = publicationBaseline
         ? {
@@ -8149,7 +8378,7 @@ export async function executeCodexJob(
             inputRevision: finalInput.revision,
             inputDigest: finalInput.digest,
             reviewRound,
-            reviewedRepositoryDigest: repositoryBeforePublication,
+            reviewedRepositoryDigest,
             baselineDigest: gitHubPublicationBaselineDigest(publicationBaseline),
             plans: finalizedPublicationPlans,
           }
@@ -8161,7 +8390,7 @@ export async function executeCodexJob(
             inputRevision: finalInput.revision,
             inputDigest: finalInput.digest,
             reviewRound,
-            reviewedRepositoryDigest: repositoryBeforePublication,
+            reviewedRepositoryDigest,
             baselineDigest: createHash('sha256')
               .update('fixture-only-empty-publication')
               .digest('hex'),
@@ -8192,6 +8421,7 @@ export async function executeCodexJob(
         preparedRepositoryScope = null
         preparedWorkAction = null
         preparedPublicationIntents = []
+        preparedImplementationBindings = []
         publicationOnlyPlans = null
         publicationBaseline = null
         nextStage = 'prepare'
@@ -8533,14 +8763,6 @@ export async function executeCodexJob(
       )
     }
     if (resumed && !resumeFallbackAttempted && executionReportsMissingSession(execution)) {
-      const afterFailedAttemptDigest = advisorRepositoryDigest(
-        snapshotAdvisorRepository(advisorProjectLayout),
-      )
-      if (afterFailedAttemptDigest !== execution.initialRepositoryDigest) {
-        throw new Error(
-          'Codex resume failed after the repository changed; automatic fallback is blocked',
-        )
-      }
       options.onSessionReset?.()
       resumeFallbackAttempted = true
       sessionId = null

@@ -185,6 +185,13 @@ export type CodexPublicationIntent = {
   followupBaseBranch: string
 }
 
+export type CodexImplementationIntent = {
+  repository: string
+  baseBranch: string
+  mergePullRequest: boolean
+  followupBaseBranch: string | null
+}
+
 export type CodexPreparationWorkAction = 'implement' | 'no-change' | 'promote-current-head'
 
 export type CodexPreparationDecision =
@@ -192,6 +199,7 @@ export type CodexPreparationDecision =
       kind: 'ready'
       repositoryScope: string[]
       workAction: CodexPreparationWorkAction
+      implementationIntents?: CodexImplementationIntent[]
       publicationIntents?: CodexPublicationIntent[]
       approvalDecision?: UiApprovalSemanticDecision
     }
@@ -453,9 +461,10 @@ function exactReadyPublicationIntents(
   }
 }
 
-function exactReadyWorkAction(value: string): {
+function exactReadyWorkAction(value: string, repositoryScope: readonly string[]): {
   text: string
   workAction: CodexPreparationWorkAction
+  implementationIntents: CodexImplementationIntent[]
 } {
   const pattern = new RegExp(
     `<${PREPARATION_WORK_ACTION_MARKER}>([^\n]+)<\/${PREPARATION_WORK_ACTION_MARKER}>\n?$`,
@@ -477,13 +486,59 @@ function exactReadyWorkAction(value: string): {
     throw new Error('Codex preparation work action must be an object')
   }
   const record = parsed as Record<string, unknown>
-  if (Object.keys(record).join(',') !== 'kind'
-    || !['implement', 'no-change', 'promote-current-head'].includes(String(record.kind))) {
+  if (!['implement', 'no-change', 'promote-current-head'].includes(String(record.kind))) {
     throw new Error('Codex preparation work action is invalid')
+  }
+  const workAction = record.kind as CodexPreparationWorkAction
+  if (workAction !== 'implement') {
+    if (Object.keys(record).join(',') !== 'kind') {
+      throw new Error('Codex preparation work action fields are invalid')
+    }
+    return {
+      text: value.slice(0, match.index).trim(),
+      workAction,
+      implementationIntents: [],
+    }
+  }
+  if (Object.keys(record).join(',') !== 'kind,targets' || !Array.isArray(record.targets)) {
+    throw new Error('Codex implementation targets are invalid')
+  }
+  const implementationIntents = record.targets.map(target => {
+    if (!target || typeof target !== 'object' || Array.isArray(target)) {
+      throw new Error('Codex implementation target must be an object')
+    }
+    const intent = target as Record<string, unknown>
+    if (Object.keys(intent).sort().join(',')
+        !== 'baseBranch,followupBaseBranch,mergePullRequest,repository'
+      || typeof intent.repository !== 'string'
+      || typeof intent.baseBranch !== 'string'
+      || typeof intent.mergePullRequest !== 'boolean'
+      || (intent.followupBaseBranch !== null
+        && typeof intent.followupBaseBranch !== 'string')
+      || !repositoryScope.includes(intent.repository)
+      || !intent.baseBranch || Buffer.byteLength(intent.baseBranch) > 255
+      || /[\0\r\n]/.test(intent.baseBranch)
+      || (intent.followupBaseBranch !== null && (
+        !intent.followupBaseBranch
+        || Buffer.byteLength(intent.followupBaseBranch) > 255
+        || /[\0\r\n]/.test(intent.followupBaseBranch)
+        || intent.followupBaseBranch === intent.baseBranch
+      ))
+      || intent.mergePullRequest !== (intent.followupBaseBranch !== null)) {
+      throw new Error('Codex implementation target is invalid')
+    }
+    return intent as CodexImplementationIntent
+  })
+  const repositories = implementationIntents.map(intent => intent.repository)
+  if (new Set(repositories).size !== repositories.length
+    || JSON.stringify(repositories) !== JSON.stringify([...repositories].sort())
+    || JSON.stringify(repositories) !== JSON.stringify([...repositoryScope])) {
+    throw new Error('Codex implementation targets must bind every selected repository exactly once')
   }
   return {
     text: value.slice(0, match.index).trim(),
-    workAction: record.kind as CodexPreparationWorkAction,
+    workAction,
+    implementationIntents,
   }
 }
 
@@ -569,7 +624,7 @@ export function parseCodexPreparationDecision(
     const beforeReady = normalized.slice(0, normalized.length - ready.length).trimEnd()
     const scoped = exactReadyRepositoryScope(beforeReady, availableRepositories)
     const publication = exactReadyPublicationIntents(scoped.text, scoped.repositoryScope)
-    const work = exactReadyWorkAction(publication.text)
+    const work = exactReadyWorkAction(publication.text, scoped.repositoryScope)
     if ((work.workAction === 'promote-current-head')
       !== (publication.publicationIntents.length > 0)) {
       throw new Error('Codex preparation work action conflicts with its publication intent')
@@ -584,6 +639,9 @@ export function parseCodexPreparationDecision(
       kind: 'ready',
       repositoryScope: scoped.repositoryScope,
       workAction: work.workAction,
+      ...(work.implementationIntents.length > 0
+        ? { implementationIntents: work.implementationIntents }
+        : {}),
       ...(publication.publicationIntents.length > 0
         ? { publicationIntents: publication.publicationIntents }
         : {}),

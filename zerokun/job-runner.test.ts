@@ -725,7 +725,7 @@ describe('Codex job store', () => {
     store.close()
   })
 
-  test('runnerは実装前repository driftを終端失敗にせずfresh attemptで完了する', async () => {
+  test('legacy repository drift errorでもhostはCodex turnを自動再試行しない', async () => {
     const store = makeStore()
     const root = store.enqueue(input({
       messageId: 'repository-drift-runner', writeEnabled: true,
@@ -738,37 +738,23 @@ describe('Codex job store', () => {
       executorStagesResult: true,
       executor: async current => {
         executions += 1
-        if (executions === 1) {
-          recordCompletedInitialPreparePhase(store, current, 'repository-drift-runner-session')
-          throw new CodexRepositoryChangedBeforeImplementationError()
-        }
-        expect(current).toMatchObject({
-          attempts: 2,
-          repositoryDriftRetries: 1,
-          resumed: true,
-          sessionId: 'session-repository-drift-runner-session',
-        })
-        return stageFixtureExecution(
-          store,
-          current,
-          'session-repository-drift-runner-session',
-          '完了しました',
-        )
+        recordCompletedInitialPreparePhase(store, current, 'repository-drift-runner-session')
+        throw new CodexRepositoryChangedBeforeImplementationError()
       },
     })
 
-    expect(stats).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
-    expect(executions).toBe(2)
+    expect(stats).toEqual({ completed: 0, failed: 1, workersStarted: 1 })
+    expect(executions).toBe(1)
     expect(store.get(root.id)).toMatchObject({
-      status: 'completed', attempts: 2, repositoryDriftRetries: 1,
-      result: '完了しました', lastError: null,
+      status: 'failed', attempts: 1, repositoryDriftRetries: 0,
+      lastError: 'repository changed before implementation; fresh preparation is required',
     })
     expect(store.pendingTerminalNotifications()).toHaveLength(1)
-    expect(store.pendingTerminalNotifications()[0]?.kind).toBe('completed')
+    expect(store.pendingTerminalNotifications()[0]?.kind).toBe('failed')
     store.close()
   })
 
-  test('implementation観測後のrepository driftは変更残存の可能性を通知する', async () => {
+  test('implementation観測後のlegacy drift errorもhost独自再試行へ戻さない', async () => {
     const store = makeStore()
     const root = store.enqueue(input({
       messageId: 'repository-drift-after-implementation', writeEnabled: true,
@@ -812,11 +798,17 @@ describe('Codex job store', () => {
     })
 
     expect(stats).toEqual({ completed: 0, failed: 1, workersStarted: 1 })
+    expect(store.get(root.id)).toMatchObject({
+      status: 'failed', attempts: 1, repositoryDriftRetries: 0,
+    })
     expect(store.get(root.id)?.lastError).toContain(
-      'write-enabled implementation may already have changed',
+      'write-enabled implementation may already have changed the repository',
+    )
+    expect(store.get(root.id)?.lastError).toContain(
+      'Underlying failure: repository changed before implementation',
     )
     expect(publicJobFailureSummary(store.get(root.id)!.lastError!)).toBe(
-      '変更処理の途中で失敗したため、一部の変更が残っている可能性があります。再送前に確認してください。',
+      '作業中に対象projectが別の変更で更新されたため、最新状態で安全に続行できませんでした。',
     )
     store.close()
   })
