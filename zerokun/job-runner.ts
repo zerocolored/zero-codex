@@ -172,7 +172,7 @@ export class InboundInitialContextConflictError extends Error {
   }
 }
 import {
-  EphemeralClaudeCleanupPendingError,
+  EphemeralClaudeOwnedProcessStillLiveError,
   reconcileEphemeralClaudeSessions,
 } from './ephemeral-claude-session.ts'
 import {
@@ -226,46 +226,6 @@ const MONITOR_LOSS_RECOVERY_MESSAGE =
   '監視タブが失われたため、安全に処理状態を復旧できませんでした。'
   + '実行プロセスの停止を確認して、この依頼を失敗として終了しました。'
   + '必要なら再送してください。'
-
-export function advisorAttemptMayHaveBeenDelivered(
-  stateDirInput: string,
-  jobId: string,
-): boolean {
-  try {
-    const stateDir = requireManagedStateRoot(stateDirInput)
-    const safeId = jobId.replace(/[^A-Za-z0-9._-]/g, '_')
-    const jobRoot = join(stateDir, 'advisor-journal', safeId)
-    let nonceNames: string[]
-    try {
-      requireManagedDirectory(stateDir, jobRoot)
-      nonceNames = readdirSync(jobRoot)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-      return true
-    }
-    for (const nonce of nonceNames) {
-      if (!/^[0-9a-f]{32}$/.test(nonce)) return true
-      const nonceDir = join(jobRoot, nonce)
-      try {
-        requireManagedDirectory(stateDir, nonceDir)
-        for (const name of readdirSync(nonceDir)) {
-          if (!/^(?:investigation-1|design-1|review-[123])\.json$/.test(name)) return true
-          const metadata = lstatSync(join(nonceDir, name))
-          const owned = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
-          if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || !owned) {
-            return true
-          }
-          return true
-        }
-      } catch {
-        return true
-      }
-    }
-    return false
-  } catch {
-    return true
-  }
-}
 
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed'
 export type JobTerminalOutcome = 'completed' | 'failed' | 'cancelled'
@@ -9875,7 +9835,7 @@ export class JobStore {
     return { preparedReset, promoted, blocked }
   }
 
-  recoverInterrupted(advisorStateDir?: string): {
+  recoverInterrupted(_advisorStateDir?: string): {
     requeued: number
     failedWrites: number
     failedUncertain: number
@@ -9911,29 +9871,19 @@ export class JobStore {
         )
         failedWrites += 1
       } else if (job.notBefore !== null) {
-        if (advisorStateDir && advisorAttemptMayHaveBeenDelivered(advisorStateDir, job.id)) {
-          this.fail(
-            job.id,
-            'read-only job was interrupted after an advisor request may have been delivered; '
-            + 'it will not be resent automatically. Send a new request if needed.',
-          )
-          failedUncertain += 1
-        } else {
-          this.requeueAt(
-            job.id,
-            job.notBefore,
-            'daemon restarted after a durable Codex rate-limit receipt',
-            job.sessionId ?? undefined,
-          )
-          requeued += 1
-        }
+        this.requeueAt(
+          job.id,
+          job.notBefore,
+          'daemon restarted after a durable Codex rate-limit receipt',
+          job.sessionId ?? undefined,
+        )
+        requeued += 1
       } else if (this.initialTurnMayHaveBeenDelivered(job.id)
         || !this.initialTurnDispatchIsSafeToRetry(job.id)
-        || this.controlMayHaveBeenDelivered(job.id)
-        || (advisorStateDir && advisorAttemptMayHaveBeenDelivered(advisorStateDir, job.id))) {
+        || this.controlMayHaveBeenDelivered(job.id)) {
         this.fail(
           job.id,
-          'read-only job was interrupted after an App Server, live control, or advisor request '
+          'read-only job was interrupted after an App Server or live control request '
           + 'may have been delivered; '
           + 'it will not be resent automatically. Send a new request if needed.',
         )
@@ -10195,6 +10145,15 @@ export function publicJobFailureSummary(error: string): string {
   if (error.includes('local Git config contains a setting that is unsafe for host publication')) {
     return 'GitHub公開前の安全確認で、リポジトリ設定を受理できませんでした。公開処理は行われていません。'
   }
+  if (error.includes('branch promotion direction is not explicitly authorized')
+    || error.includes('branch promotion is not explicitly authorized')
+    || error.includes('branch promotion is not rooted in a write-authorized Slack request')) {
+    return '旧バージョンの独自公開判定で停止しました。GitHub操作は開始していません。同じスレッドで再開すると、Codexが履歴を読んで判断します。'
+  }
+  if (error.includes('branch promotion was explicitly denied')
+    || error.includes('branch promotion was explicitly cancelled')) {
+    return '旧バージョンの独自公開判定で停止しました。GitHub操作は開始していません。同じスレッドで再開すると、Codexが履歴を読んで判断します。'
+  }
   if (/GitHub|publication|promotion/i.test(error)) {
     if (/(?:\bauth(?:entication)?\b|credential|permission|401|403|\blogin\b)/i.test(error)) {
       return 'GitHub認証またはrepository権限を確認できませんでした。公開処理の確定状況を再照合してください。'
@@ -10381,13 +10340,18 @@ async function runExternalContextBoundary(
   try {
     await action()
   } catch (error) {
-    if (error instanceof EphemeralClaudeCleanupPendingError
+    if (error instanceof EphemeralClaudeOwnedProcessStillLiveError
       || error instanceof CodexCleanupPendingError
       || error instanceof CodexInterruptedError
       || error instanceof CodexUserCancelledError
       || error instanceof CodexResultPersistencePendingError
       || error instanceof HerdrJobMonitorPendingError) throw error
-    throw new EphemeralClaudeCleanupPendingError(`${label}: ${error}`)
+    const category = error instanceof Error ? error.name : 'unknown'
+    try {
+      process.stderr.write(
+        `[Zero advisor warning] ${label}: ${category}; primary task continues\n`,
+      )
+    } catch {}
   }
 }
 
@@ -10820,7 +10784,12 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       }
       scheduleNotificationFlush()
 
-      if (options.store.countClaimable() > 0) await options.beforeClaim?.()
+      if (options.store.countClaimable() > 0) {
+        await runExternalContextBoundary(
+          options.beforeClaim,
+          'advisor pre-claim reconciliation is unavailable',
+        )
+      }
 
     const job = options.store.claimNext(workerId, maxJobsPerSession)
     if (!job) {
@@ -11146,7 +11115,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         unstartedMonitorClaimReleased = true
       }
       if (error instanceof CodexCleanupPendingError
-        || error instanceof EphemeralClaudeCleanupPendingError
+        || error instanceof EphemeralClaudeOwnedProcessStillLiveError
         || error instanceof CodexResultPersistencePendingError
         || error instanceof HerdrJobMonitorPendingError) throw error
       if (error instanceof CodexUserCancelledError) {
@@ -11237,15 +11206,12 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         const appServerUncertain = options.store.initialTurnMayHaveBeenDelivered(job.id)
           || !options.store.initialTurnDispatchIsSafeToRetry(job.id)
           || options.store.controlMayHaveBeenDelivered(job.id)
-        const advisorUncertain = !job.writeEnabled && options.advisorStateDir
-          ? advisorAttemptMayHaveBeenDelivered(options.advisorStateDir, job.id)
-          : false
-        if (job.writeEnabled || appServerUncertain || advisorUncertain) {
+        if (job.writeEnabled || appServerUncertain) {
           const uncertain = job.writeEnabled
             ? 'write-enabled job was interrupted after execution began; '
               + 'its external effects are uncertain. Review the repository and external services, '
               + 'then resend only if needed.'
-            : 'read-only job was interrupted after an App Server, live control, or advisor '
+            : 'read-only job was interrupted after an App Server or live control '
               + 'request may have been delivered; '
               + 'it will not be resent automatically. Send a new request if needed.'
           await updateMonitor(job, '中断後の副作用が不確実なため失敗として確定します')
@@ -11289,23 +11255,6 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         options.store.fail(job.id, uncertain)
         stats.failed += 1
         log(`${workerId} failed rate-limited write job ${job.id}: ${message}`)
-        scheduleNotificationFlush()
-        continue
-      }
-      if (error instanceof CodexRateLimitError && options.advisorStateDir
-        && !rateLimitSafeToRetry
-        && advisorAttemptMayHaveBeenDelivered(options.advisorStateDir, job.id)) {
-        const uncertain = 'read-only job hit a rate limit after an advisor request may have been '
-          + 'delivered; it will not be resent automatically. Send a new request if needed.'
-        await runExternalContextBoundary(
-          options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
-          `advisor cleanup is pending for rate-limited advisor job ${job.id}`,
-        )
-        await updateMonitor(job, 'advisor 送信後の利用上限により失敗として確定します')
-        await quiesceMonitorBeforeTerminal()
-        options.store.fail(job.id, uncertain)
-        stats.failed += 1
-        log(`${workerId} failed rate-limited advisor job ${job.id}: ${message}`)
         scheduleNotificationFlush()
         continue
       }
@@ -12909,29 +12858,36 @@ export async function reconcileEphemeralAndRetiredAdvisorRounds(options: {
   runtime: ReturnType<typeof readPinnedHerdrRuntime>
   log?: (message: string) => void
 }): Promise<void> {
-  await reconcileEphemeralClaudeSessions({
-    stateDir: options.stateDir,
-    runtime: options.runtime,
-    log: options.log,
-    onReconciledRound: outcome => {
-      try {
-        const input = readAdvisorInputSnapshot(
-          options.stateDir, outcome.jobId, outcome.inputRevision,
-        )
-        if (!input.digest.startsWith(outcome.inputDigestPrefix)) {
-          throw new Error('reconciled Claude round input digest changed')
+  try {
+    await reconcileEphemeralClaudeSessions({
+      stateDir: options.stateDir,
+      runtime: options.runtime,
+      log: options.log,
+      onReconciledRound: outcome => {
+        try {
+          const input = readAdvisorInputSnapshot(
+            options.stateDir, outcome.jobId, outcome.inputRevision,
+          )
+          if (!input.digest.startsWith(outcome.inputDigestPrefix)) {
+            throw new Error('reconciled Claude round input digest changed')
+          }
+          persistAdvisorClaudeCleanupOutcome(options.stateDir, {
+            ...outcome,
+            inputDigest: input.digest,
+          })
+        } catch (error) {
+          options.log?.(`advisor history warning; primary queue remains available: ${
+            error instanceof Error ? error.name : 'unknown'
+          }`)
         }
-        persistAdvisorClaudeCleanupOutcome(options.stateDir, {
-          ...outcome,
-          inputDigest: input.digest,
-        })
-      } catch (error) {
-        options.log?.(`advisor history warning; primary queue remains available: ${
-          error instanceof Error ? error.name : 'unknown'
-        }`)
-      }
-    },
-  })
+      },
+    })
+  } catch (error) {
+    if (error instanceof EphemeralClaudeOwnedProcessStillLiveError) throw error
+    options.log?.(`advisor cleanup warning; primary queue remains available: ${
+      error instanceof Error ? error.name : 'unknown'
+    }`)
+  }
   try {
     const result = finalizeRetiredAdvisorRounds(options.stateDir)
     if (result.finalized > 0) {

@@ -24,7 +24,7 @@ import {
   EPHEMERAL_CLAUDE_STATE_ROOT,
   EPHEMERAL_CLAUDE_TRASH_ROOT,
   EphemeralClaudeCleanupPendingError,
-  advisorAttemptMayHaveBeenDeliveredForResume,
+  EphemeralClaudeOwnedProcessStillLiveError,
   createEphemeralClaudeRequestDirectory,
   ephemeralClaudeAgentMatches,
   parseEphemeralClaudeClose,
@@ -39,7 +39,6 @@ import {
   removeVerifiedEphemeralClaudeRequestDirectory,
   type EphemeralClaudeTarget,
 } from './ephemeral-claude-session.ts'
-import { advisorAttemptMayHaveBeenDelivered } from './job-runner.ts'
 
 const directories: string[] = []
 
@@ -287,7 +286,6 @@ describe('ephemeral Claude lifecycle state', () => {
     })}\n`)
     persistEphemeralClaudeDeliveryEvidence(state, delivered)
     persistEphemeralClaudeDeliveryEvidence(state, delivered)
-    expect(advisorAttemptMayHaveBeenDelivered(state, 'job-123')).toBe(true)
     const evidencePath = join(
       state, 'advisor-journal', 'job-123', 'a'.repeat(32),
       EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
@@ -326,7 +324,6 @@ describe('ephemeral Claude lifecycle state', () => {
     })}\n`)
     expect(() => persistEphemeralClaudeDeliveryEvidence(state, invalid))
       .toThrow(EphemeralClaudeCleanupPendingError)
-    expect(advisorAttemptMayHaveBeenDelivered(state, 'job-invalid')).toBe(false)
   })
 
   test('初回file fsync失敗後のretryは既存latchのfileと親directoryを再同期する', () => {
@@ -522,29 +519,6 @@ describe('ephemeral Claude lifecycle state', () => {
     }
   })
 
-  test('resume guardはjournalまたは未回収ephemeral stateがあれば保守的に停止する', () => {
-    const empty = fixtureState()
-    expect(advisorAttemptMayHaveBeenDeliveredForResume(
-      empty, 'job-123', 'a'.repeat(32),
-    )).toBe(false)
-
-    const withEphemeral = fixtureState()
-    request(withEphemeral)
-    expect(advisorAttemptMayHaveBeenDeliveredForResume(
-      withEphemeral, 'job-123', 'a'.repeat(32),
-    )).toBe(true)
-
-    const withJournal = fixtureState()
-    const attemptRoot = join(
-      withJournal, 'advisor-journal', 'job-123', 'a'.repeat(32),
-    )
-    mkdirSync(attemptRoot, { recursive: true, mode: 0o700 })
-    privateFile(join(attemptRoot, EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE), 'invalid')
-    expect(advisorAttemptMayHaveBeenDeliveredForResume(
-      withJournal, 'job-123', 'a'.repeat(32),
-    )).toBe(true)
-  })
-
   test('verified requestはatomic tombstone経由で消し、unexpected/symlink/hardlinkを保持する', () => {
     const state = fixtureState()
     const clean = request(state)
@@ -663,7 +637,6 @@ describe('ephemeral Claude lifecycle state', () => {
       'close:design',
     ].sort())
     expect(runtimeChecks).toBe(4)
-    expect(advisorAttemptMayHaveBeenDelivered(state, 'job-123')).toBe(true)
     expect(existsSync(join(state, EPHEMERAL_CLAUDE_STATE_ROOT))).toBe(false)
   })
 
@@ -679,6 +652,24 @@ describe('ephemeral Claude lifecycle state', () => {
       runHelper: async () => ({ exitCode: 3, stdout: '', stderr: 'not closed' }),
     })).rejects.toThrow(EphemeralClaudeCleanupPendingError)
     expect(existsSync(closePending)).toBe(true)
+  })
+
+  test('owned Claude processの生存が明示された場合だけ専用例外に分類する', async () => {
+    const state = fixtureState()
+    const projectRoot = dirname(state)
+    const live = request(state)
+    writeLifecycleRecords(live, projectRoot, false)
+    await expect(reconcileEphemeralClaudeSessions({ stateDir: state, runtime }, {
+      resolveHelper: () => '/fixture/helper',
+      resolveClaudeLookup: () => '/usr/local/bin/claude',
+      verifyRuntime: async () => {},
+      runHelper: async () => ({
+        exitCode: 3,
+        stdout: '',
+        stderr: 'ephemeral Claude process survived workspace cleanup',
+      }),
+    })).rejects.toBeInstanceOf(EphemeralClaudeOwnedProcessStillLiveError)
+    expect(existsSync(live)).toBe(true)
   })
 
   test('cleanup後もdelivery evidenceが不正ならrequestを消さない', async () => {

@@ -28,7 +28,6 @@ import {
   CodexRateLimitError,
   CodexRepositoryChangedBeforeImplementationError,
   CodexUserCancelledError,
-  assertUserAuthorizedPublicationIntents,
   executeCodexJob,
   type CodexLiveControlHooks,
 } from './codex-executor.ts'
@@ -306,7 +305,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-publication", "phased-promotion", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-publication", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -339,14 +338,22 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-publication", "phased-promotion", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased", "phased-publication", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 action = '<zerokun_work_action>{"kind":"implement"}</zerokun_work_action>'
                 if mode == "phased-no-change":
                     action = '<zerokun_work_action>{"kind":"no-change"}</zerokun_work_action>'
                 message = "準備完了\\n" + action + "\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
-                if mode == "phased-promotion":
+                if mode in ("phased-promotion", "phased-promotion-history-failed"):
+                    if mode == "phased-promotion-history-failed":
+                        required_history = (
+                            "--- Prior Slack thread history " in phase_prompt
+                            and "develop適用できますか?developからmainへのPRも作っておいて、URLをください。" in phase_prompt
+                            and "こちら続きを進めて" in phase_prompt
+                        )
+                        if not required_history:
+                            raise RuntimeError("failed publication continuation history missing")
                     publication = '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":".","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main"}]}</zerokun_publication>'
                     scope = '<zerokun_repository_scope>{"repositories":["."]}</zerokun_repository_scope>'
                     action = '<zerokun_work_action>{"kind":"promote-current-head"}</zerokun_work_action>'
@@ -372,7 +379,7 @@ for line in sys.stdin:
                 marker = re.search(r"\\[ZERO_IMPLEMENTATION_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 message = "実装完了\\n" + (marker.group(0) if marker else "[ZERO_IMPLEMENTATION_READY:missing:r1:missing]")
             elif stage == "review":
-                if mode == "phased-promotion" and "Host-bound publication-only workflow" not in phase_prompt:
+                if mode in ("phased-promotion", "phased-promotion-history-failed") and "Host-bound publication-only workflow" not in phase_prompt:
                     raise RuntimeError("publication-only review binding missing")
                 marker = re.search(r"\\[ZERO_REVIEW_PUBLISH:[0-9a-f]{32}:round-[123]\\]", phase_prompt)
                 message = (marker.group(0) if marker else "[ZERO_REVIEW_PUBLISH:missing:round-1]") + "\\n公開できます"
@@ -658,6 +665,7 @@ function fixture(
     | 'phased-capacity-implementation-once'
     | 'phased-native-history-fresh' | 'phased-native-history-resume'
     | 'phased-native-history-resume-unmaterialized' | 'phased-steer'
+    | 'phased-promotion-history-failed'
     | 'phased-interjection-update' | 'missing-session-resume'
     | 'phased-late-inbound' | 'summary-stream-no-history' | 'logical-stop-required'
     | 'late-error-after-complete' | 'late-error-coalesced'
@@ -689,15 +697,22 @@ function fixture(
   const initialJob = store.claimNext('serial-worker')!
   let job = initialJob
   if (mode === 'phased-native-history-resume'
-    || mode === 'phased-native-history-resume-unmaterialized') {
-    completeFixtureJob(store, initialJob, 'thread-app-server-1', '過去ジョブ完了')
+    || mode === 'phased-native-history-resume-unmaterialized'
+    || mode === 'phased-promotion-history-failed') {
+    if (mode === 'phased-promotion-history-failed') {
+      store.fail(initialJob.id, 'local Git config contains a setting that is unsafe for host publication')
+    } else {
+      completeFixtureJob(store, initialJob, 'thread-app-server-1', '過去ジョブ完了')
+    }
     store.enqueue({
       chatId: initialJob.chatId,
       threadTs: initialJob.threadTs,
       messageId: '1800000000.000200',
       userId: 'UROOT',
       repoPath: repo,
-      task: '同じSlackスレッドから再開する依頼',
+      task: mode === 'phased-promotion-history-failed'
+        ? 'こちら続きを進めて'
+        : '同じSlackスレッドから再開する依頼',
       writeEnabled,
     })
     job = store.claimNext('serial-worker')!
@@ -1397,33 +1412,6 @@ describe('production App Server executor', () => {
   }, 30_000)
 
   test('既存commitのbranch promotionはwrite phaseを再実行せずprepareからreviewへ直接固定する', async () => {
-    const intent = [{
-      kind: 'promote-current-head' as const,
-      repository: '.',
-      baseBranch: 'develop',
-      mergePullRequest: true as const,
-      followupBaseBranch: 'main',
-    }]
-    expect(() => assertUserAuthorizedPublicationIntents(
-      '待機画面を確認してください',
-      intent,
-    )).toThrow('not explicitly authorized')
-    expect(() => assertUserAuthorizedPublicationIntents(
-      '現在のcommitをdevelopへ適用し、developからmainへのPRを作成してください',
-      intent,
-    )).not.toThrow()
-    expect(() => assertUserAuthorizedPublicationIntents(
-      'develop適用できますか？develop から main への PR も作っておいて、URLをください。',
-      intent,
-    )).not.toThrow()
-    expect(() => assertUserAuthorizedPublicationIntents(
-      'developには適用しないでください。developからmainへのPRも作らないでください。',
-      intent,
-    )).toThrow('explicitly denied')
-    expect(() => assertUserAuthorizedPublicationIntents(
-      'READMEにdevelopの説明を反映し、main.ts更新のPRを作って',
-      intent,
-    )).toThrow('direction is not explicitly authorized')
     const value = fixture(
       'phased-promotion',
       true,
@@ -1653,6 +1641,72 @@ describe('production App Server executor', () => {
     }))
     expect(value.store.get(value.job.id)?.status).toBe('running')
     expect(value.store.hasStagedExecution(value.job.id)).toBe(false)
+    value.store.close()
+  }, 30_000)
+
+  test('失敗済み公開依頼を同一threadの履歴からCodexが再開する', async () => {
+    const value = fixture(
+      'phased-promotion-history-failed',
+      true,
+      'develop適用できますか？developからmainへのPRも作っておいて、URLをください。',
+    )
+    git(value.repo, ['init', '--initial-branch=main'])
+    git(value.repo, ['config', 'user.email', 'zero@example.invalid'])
+    git(value.repo, ['config', 'user.name', 'Zero Test'])
+    git(value.repo, ['config', 'remote.origin.url', 'https://github.com/example/resumed-promotion.git'])
+    git(value.repo, ['add', 'AGENTS.md'])
+    git(value.repo, ['commit', '-m', 'chore: initial'])
+    git(value.repo, ['switch', '-c', 'feature/resumed-publication'])
+    writeFileSync(join(value.repo, 'resumed.txt'), 'reviewed before the first failure\n')
+    git(value.repo, ['add', 'resumed.txt'])
+    git(value.repo, ['commit', '-m', 'feat: resumable publication'])
+    const sourceHead = git(value.repo, ['rev-parse', 'HEAD'])
+    const baseline = captureGitHubPublicationBaseline(value.repo, [value.repo])
+    const developHead = 'd'.repeat(40)
+    const mainHead = 'e'.repeat(40)
+    expect(value.job.task).toBe('こちら続きを進めて')
+    expect(value.job.resumed).toBe(false)
+    expect(value.store.threadHistorySnapshot(value.job.id).transcript).toContain(
+      'develop適用できますか?developからmainへのPRも作っておいて、URLをください。',
+    )
+    const execution = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'phased-promotion-history-failed' },
+      phaseGateForTesting: {},
+      liveControls: value.hooks,
+      threadHistory: value.store.threadHistorySnapshot(value.job.id),
+      publicationBaselineForTesting: baseline,
+      publicationCommandsForTesting: {
+        async runGit(_repository, args) {
+          const ref = String(args.at(-1))
+          if (ref === 'refs/heads/develop') {
+            return publicationCommandResult(0, `${developHead}\t${ref}\n`)
+          }
+          if (ref === 'refs/heads/main') {
+            return publicationCommandResult(0, `${mainHead}\t${ref}\n`)
+          }
+          throw new Error(`unexpected resumed promotion ref: ${ref}`)
+        },
+        async runGh() {
+          throw new Error('resumed promotion must not mutate GitHub before review')
+        },
+      },
+    })
+    expect(execution.publication?.plans[0]).toMatchObject({
+      baseBranch: 'develop',
+      commitSha: sourceHead,
+      promotion: {
+        sourceBranch: 'feature/resumed-publication',
+        sourceHead,
+        followupBaseBranch: 'main',
+        followupInitialHead: mainHead,
+      },
+    })
+    expect(value.store.hasGitHubPublicationCheckpoint(value.job.id)).toBe(true)
+    expect(value.store.hasStagedExecution(value.job.id)).toBe(true)
     value.store.close()
   }, 30_000)
 

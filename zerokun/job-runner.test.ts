@@ -118,6 +118,7 @@ import {
 import {
   EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
   EphemeralClaudeCleanupPendingError,
+  EphemeralClaudeOwnedProcessStillLiveError,
 } from './ephemeral-claude-session.ts'
 import { HerdrJobMonitorPendingError } from './herdr-job-monitor.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
@@ -3077,34 +3078,59 @@ describe('Codex job store', () => {
 })
 
 describe('single FIFO worker', () => {
-  test('claim直前のadvisor cleanup検証失敗ならworkerを起動しない', async () => {
+  test('claim直前のadvisor bookkeeping失敗でもprimary workerを続行する', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'blocked-before-claim' })).job
     let executions = 0
-    await expect(runQueuedJobs({
+    const stats = await runQueuedJobs({
       store,
       maxJobsPerSession: 5,
       pollMs: 1,
-      stopWhenIdle: false,
+      stopWhenIdle: true,
       beforeClaim: async () => {
         throw new EphemeralClaudeCleanupPendingError('advisor receipt changed')
       },
       executor: async () => {
         executions += 1
+        return { sessionId: 'primary-session', result: 'primary completed' }
+      },
+    })
+    expect(stats).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
+    expect(executions).toBe(1)
+    expect(store.get(queued.id)).toMatchObject({
+      status: 'completed', result: 'primary completed',
+    })
+    store.close()
+  })
+
+  test('exact owned Claude processの生存だけはclaim前に停止する', async () => {
+    const store = makeStore()
+    const queued = store.enqueue(input({ messageId: 'live-owned-before-claim' })).job
+    let executions = 0
+    await expect(runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      beforeClaim: async () => {
+        throw new EphemeralClaudeOwnedProcessStillLiveError('owned Claude is still live')
+      },
+      executor: async () => {
+        executions += 1
         return { sessionId: 'must-not-run', result: 'must-not-run' }
       },
-    })).rejects.toBeInstanceOf(EphemeralClaudeCleanupPendingError)
+    })).rejects.toBeInstanceOf(EphemeralClaudeOwnedProcessStillLiveError)
     expect(executions).toBe(0)
     expect(store.get(queued.id)).toMatchObject({ status: 'queued', attempts: 0 })
     store.close()
   })
 
-  test('Codex成功結果をclear前にstageし、crash recovery後も完成回答を失わない', async () => {
+  test('Codex成功結果はadvisor cleanup記録失敗に左右されず確定する', async () => {
     const dir = fixtureDir()
     const path = join(dir, 'jobs.sqlite3')
-    let store = new JobStore(path)
+    const store = new JobStore(path)
     const queued = store.enqueue(input({ messageId: 'staged-before-clear' })).job
-    await expect(runQueuedJobs({
+    const stats = await runQueuedJobs({
       store,
       maxJobsPerSession: 5,
       pollMs: 1,
@@ -3113,12 +3139,8 @@ describe('single FIFO worker', () => {
       settleExternalContext: async () => {
         throw new EphemeralClaudeCleanupPendingError('simulated crash boundary')
       },
-    })).rejects.toBeInstanceOf(EphemeralClaudeCleanupPendingError)
-    expect(store.get(queued.id)?.status).toBe('running')
-    store.close()
-
-    store = new JobStore(path)
-    expect(store.recoverStagedExecutions()).toBe(1)
+    })
+    expect(stats).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
     expect(store.get(queued.id)).toMatchObject({
       status: 'completed', sessionId: 'staged-session', result: 'staged result',
     })
@@ -3338,19 +3360,18 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('plain external settle errorもcompleted結果を消さずrunningでfail-closedする', async () => {
+  test('plain external advisor errorもprimaryのcompleted結果を確定する', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'plain-boundary-error' })).job
-    await expect(runQueuedJobs({
+    const stats = await runQueuedJobs({
       store,
       maxJobsPerSession: 5,
       pollMs: 1,
       stopWhenIdle: true,
       executor: async () => ({ sessionId: 'plain-session', result: 'plain result' }),
       settleExternalContext: async () => { throw new Error('malformed boundary') },
-    })).rejects.toBeInstanceOf(EphemeralClaudeCleanupPendingError)
-    expect(store.get(queued.id)?.status).toBe('running')
-    expect(store.recoverStagedExecutions()).toBe(1)
+    })
+    expect(stats).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
     expect(store.get(queued.id)).toMatchObject({
       status: 'completed', sessionId: 'plain-session', result: 'plain result',
     })
@@ -3598,7 +3619,7 @@ describe('single FIFO worker', () => {
       const store = makeStore()
       const queued = store.enqueue(input({ messageId: `monitor-pending-${pending}` })).job
       let closes = 0
-      await expect(runQueuedJobs({
+      const run = runQueuedJobs({
         store,
         maxJobsPerSession: 5,
         pollMs: 1,
@@ -3614,13 +3635,16 @@ describe('single FIFO worker', () => {
         settleExternalContext: async () => {
           throw new EphemeralClaudeCleanupPendingError('cleanup pending')
         },
-      })).rejects.toBeInstanceOf(
-        pending === 'result'
-          ? CodexResultPersistencePendingError
-          : EphemeralClaudeCleanupPendingError,
-      )
-      expect(store.get(queued.id)?.status).toBe('running')
-      expect(closes).toBe(0)
+      })
+      if (pending === 'result') {
+        await expect(run).rejects.toBeInstanceOf(CodexResultPersistencePendingError)
+        expect(store.get(queued.id)?.status).toBe('running')
+        expect(closes).toBe(0)
+      } else {
+        await expect(run).resolves.toEqual({ completed: 1, failed: 0, workersStarted: 1 })
+        expect(store.get(queued.id)?.status).toBe('completed')
+        expect(closes).toBe(1)
+      }
       store.close()
     }
   })
@@ -4017,7 +4041,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('crash recoveryはadvisor journalありread jobを再送せず、空nonceだけならrequeueする', () => {
+  test('crash recoveryはadvisor journalの有無にかかわらず未送達read jobをrequeueする', () => {
     const deliveredDir = fixtureDir()
     const deliveredState = join(deliveredDir, 'state')
     mkdirSync(deliveredState, { mode: 0o700 })
@@ -4034,11 +4058,11 @@ describe('single FIFO worker', () => {
     mkdirSync(dirname(journal), { recursive: true, mode: 0o700 })
     writeFileSync(journal, '{"status":"requested"}\n', { mode: 0o600 })
     expect(deliveredStore.recoverInterrupted(deliveredState)).toEqual({
-      requeued: 0,
+      requeued: 1,
       failedWrites: 0,
-      failedUncertain: 1,
+      failedUncertain: 0,
     })
-    expect(deliveredStore.get(deliveredJob.id)?.status).toBe('failed')
+    expect(deliveredStore.get(deliveredJob.id)?.status).toBe('queued')
     deliveredStore.close()
 
     const emptyDir = fixtureDir()
@@ -8007,7 +8031,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     }
   }, 15_000)
 
-  test('resume失敗時にadvisor送達可能性があれば新規execへfallbackしない', async () => {
+  test('resume失敗時もadvisor journalだけでは新規execへのfallbackを止めない', async () => {
     const dir = fixtureDir()
     const repo = join(dir, 'repo')
     const calls = join(dir, 'calls.jsonl')
@@ -8023,15 +8047,24 @@ const contextRoot = join(process.env.STATE_DIR!, 'advisor-context', process.env.
 const context = readdirSync(contextRoot).find(name => /^[0-9a-f]{32}\\.json$/.test(name))
 if (!context) throw new Error('attempt context missing')
 const nonce = context.slice(0, -'.json'.length)
-const attemptRoot = join(
-  process.env.STATE_DIR!, 'advisor-journal', process.env.JOB_ID!, nonce,
-)
-mkdirSync(attemptRoot, { recursive: true, mode: 0o700 })
-writeFileSync(join(attemptRoot, 'ephemeral-delivery.json'), 'delivery may have occurred', {
-  mode: 0o600,
-})
-console.error('no rollout found for thread id missing-thread')
-process.exit(1)
+if (args.includes('resume')) {
+  const attemptRoot = join(
+    process.env.STATE_DIR!, 'advisor-journal', process.env.JOB_ID!, nonce,
+  )
+  mkdirSync(attemptRoot, { recursive: true, mode: 0o700 })
+  writeFileSync(join(attemptRoot, 'ephemeral-delivery.json'), 'delivery may have occurred', {
+    mode: 0o600,
+  })
+  console.error('no rollout found for thread id missing-thread')
+  process.exit(1)
+}
+writeFileSync(args[args.indexOf('--output-last-message') + 1], 'recovered')
+console.log(JSON.stringify({ type: 'thread.started', thread_id: 'replacement-thread' }))
+console.log(JSON.stringify({ type: 'turn.started' }))
+console.log(JSON.stringify({ type: 'item.completed', item: {
+  type: 'agent_message', text: 'recovered',
+} }))
+console.log(JSON.stringify({ type: 'turn.completed' }))
 `)
     chmodSync(fakeCodex, 0o755)
     const store = new JobStore(join(dir, 'jobs.sqlite3'))
@@ -8042,7 +8075,7 @@ process.exit(1)
     const job = store.claimNext('serial-worker')!
     const resets: number[] = []
     try {
-      await expect(executeCodexJob(job, {
+      const result = await executeCodexJob(job, {
         codexBinForTesting: fakeCodex,
         skipEffectiveConfigCheck: true,
         stateDir,
@@ -8053,9 +8086,14 @@ process.exit(1)
           JOB_ID: job.id,
         },
         onSessionReset: () => resets.push(1),
-      })).rejects.toThrow('automatic fallback is blocked')
-      expect(readFileSync(calls, 'utf8').trim().split('\n')).toHaveLength(1)
-      expect(resets).toEqual([])
+      })
+      const invocations = readFileSync(calls, 'utf8').trim().split('\n')
+        .map(line => JSON.parse(line)) as string[][]
+      expect(invocations).toHaveLength(2)
+      expect(invocations[0]).toContain('resume')
+      expect(invocations[1]).not.toContain('resume')
+      expect(resets).toEqual([1])
+      expect(result.sessionId).toBe('replacement-thread')
     } finally {
       store.close()
     }
@@ -9258,7 +9296,12 @@ describe('Slack output guard', () => {
     expect(publicJobFailureSummary(
       'branch promotion is not explicitly authorized by the Slack request',
     )).toBe(
-      'GitHub公開に必要なbranchまたはrepository状態が依頼内容と一致しませんでした。',
+      '旧バージョンの独自公開判定で停止しました。GitHub操作は開始していません。同じスレッドで再開すると、Codexが履歴を読んで判断します。',
+    )
+    expect(publicJobFailureSummary(
+      'branch promotion direction is not explicitly authorized by one Slack message',
+    )).toBe(
+      '旧バージョンの独自公開判定で停止しました。GitHub操作は開始していません。同じスレッドで再開すると、Codexが履歴を読んで判断します。',
     )
     expect(publicJobFailureSummary(
       'GitHub promotion base lookup could not reach GitHub',

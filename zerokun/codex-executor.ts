@@ -54,7 +54,6 @@ import {
   readOptionalPrivateFile,
 } from './safe-file.ts'
 import {
-  advisorAttemptMayHaveBeenDeliveredForResume,
   EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
   MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES,
   parseEphemeralClaudeDeliveryEvidence,
@@ -112,7 +111,6 @@ import {
   readAdvisorInputSnapshot,
   writeAuthorizedImplementationInput,
   activeWriteInputDigest,
-  type AdvisorInputEntry,
   type AdvisorInputSnapshot,
 } from './advisor-input.ts'
 import {
@@ -3460,81 +3458,6 @@ export function assertPreparedWorkPublication(
       'configuration',
       'publication promotion conflicts with the prepared work action',
     )
-  }
-}
-
-export function assertUserAuthorizedPublicationIntents(
-  source: string | readonly AdvisorInputEntry[],
-  intents: readonly CodexPublicationIntent[],
-): void {
-  const tasks = (typeof source === 'string' ? [source] : source.map(entry => entry.task))
-    .map(task => task.normalize('NFKC'))
-  const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const prTerm = '(?:\\bPR\\b|pull[ -]?request|プルリク)'
-  const actionTerm = '(?:適用|反映|統合|merge|マージ)'
-  const negatedPublication = (task: string): boolean => (
-    new RegExp(`${actionTerm}\\s*(?:を|は)?\\s*(?:し)?\\s*`
-      + '(?:ない|ません|ず|不要|禁止|中止|やめ)', 'i').test(task)
-    || new RegExp(`${prTerm}[^\\n。！？!?]{0,32}`
-      + '(?:作らない|作成しない|開かない|不要|なし|禁止|中止|やめ)', 'i').test(task)
-    || /\b(?:do\s+not|don't|dont|never)\b[^\n.!?]{0,48}\b(?:merge|integrate|apply|create|open)\b/i
-      .test(task)
-    || new RegExp(`\\b(?:no|without)\\s+(?:a\\s+)?${prTerm}\\b`, 'i').test(task)
-  )
-  const latestTask = tasks.at(-1)?.trim() ?? ''
-  if (/^(?:やっぱり\s*)?(?:やめて|中止(?:して)?|stop|cancel)[。.!！]?$/i.test(latestTask)) {
-    throw new GitHubPublicationError(
-      'configuration',
-      'branch promotion was explicitly cancelled by the Slack request',
-    )
-  }
-  for (const intent of intents) {
-    const base = escapeRegex(intent.baseBranch.normalize('NFKC'))
-    const followup = escapeRegex(intent.followupBaseBranch.normalize('NFKC'))
-    const integration = new RegExp(
-      `(?:${base}\\s*(?:へ|に|を)?\\s*${actionTerm}`
-      + `|${actionTerm}\\s*(?:先|対象)?\\s*(?:は|を|へ|に|into|to)?\\s*${base})`,
-      'i',
-    )
-    const direction = new RegExp(
-      `${base}\\s*(?:から|→|->|=>|to)\\s*${followup}`,
-      'i',
-    )
-    let authorized = false
-    for (let index = tasks.length - 1; index >= 0; index -= 1) {
-      const task = tasks[index]!
-      const mentionsBothBranches = new RegExp(base, 'i').test(task)
-        && new RegExp(followup, 'i').test(task)
-      const mentionsPublication = new RegExp(`${prTerm}|${actionTerm}`, 'i').test(task)
-      if (!mentionsBothBranches || !mentionsPublication) continue
-      if (negatedPublication(task)) {
-        throw new GitHubPublicationError(
-          'configuration',
-          'branch promotion was explicitly denied by the Slack request',
-        )
-      }
-      const clauses = task.split(/[\n。！？!?]+/).filter(Boolean)
-      const hasIntegration = clauses.some(clause => integration.test(clause))
-      const hasFollowupPullRequest = clauses.some(clause => (
-        direction.test(clause) && new RegExp(prTerm, 'i').test(clause)
-      ))
-      const repositoryLabel = intent.repository.normalize('NFKC')
-        .split(/[\\/]/).filter(part => part && part !== '.').at(-1)
-      const repositoryBound = intents.length === 1
-        || (repositoryLabel !== undefined && task.includes(repositoryLabel))
-      if (hasIntegration && hasFollowupPullRequest && repositoryBound) {
-        authorized = true
-      }
-      // The newest message that names both promotion targets is authoritative;
-      // do not combine unrelated keywords from older Slack messages.
-      break
-    }
-    if (!authorized) {
-      throw new GitHubPublicationError(
-        'configuration',
-        'branch promotion direction is not explicitly authorized by one Slack message',
-      )
-    }
   }
 }
 
@@ -7615,16 +7538,6 @@ export async function executeCodexJob(
           && execution.parentTurnIds.length === 0
           && executionReportsMissingSession(execution)
         if (safeInitialPrepareFallback) {
-          const advisorMayHaveBeenDelivered = advisorAttemptMayHaveBeenDeliveredForResume(
-            managedStateDir,
-            job.id,
-            execution.advisorAttemptNonce,
-          )
-          if (advisorMayHaveBeenDelivered) {
-            throw new Error(
-              'Codex resume failed after an advisor round may have been delivered; automatic fallback is blocked',
-            )
-          }
           const afterFailedAttemptDigest = advisorRepositoryDigest(
             snapshotAdvisorRepository(advisorProjectLayout),
           )
@@ -7827,10 +7740,6 @@ export async function executeCodexJob(
         preparedPublicationIntents = [...(preparationDecision.publicationIntents ?? [])]
         publicationOnlyPlans = null
         if (preparedPublicationIntents.length > 0) {
-          assertUserAuthorizedPublicationIntents(
-            finalInput.entries,
-            preparedPublicationIntents,
-          )
           if (!preparedRepositoryScope || preparedRepositoryScope.length === 0) {
             throw new Error('publication-only preparation omitted its repository scope')
           }
@@ -8624,16 +8533,6 @@ export async function executeCodexJob(
       )
     }
     if (resumed && !resumeFallbackAttempted && executionReportsMissingSession(execution)) {
-      const advisorMayHaveBeenDelivered = advisorAttemptMayHaveBeenDeliveredForResume(
-        managedStateDir,
-        job.id,
-        execution.advisorAttemptNonce,
-      )
-      if (advisorMayHaveBeenDelivered) {
-        throw new Error(
-          'Codex resume failed after an advisor round may have been delivered; automatic fallback is blocked',
-        )
-      }
       const afterFailedAttemptDigest = advisorRepositoryDigest(
         snapshotAdvisorRepository(advisorProjectLayout),
       )

@@ -116,6 +116,10 @@ threadだけがsnapshotをcurrent requestより前のuntrusted referenceとし�
 snapshot scopeではないため、権限を継承せずに同じ会話だけを継続できます。failed／completed job、daemon再起動、
 20 job rotation、protocol変更、job retention GCをまたいでもarchiveは残ります。
 
+公開、継続、中止、branch方向などSlack本文の意味は、このdurable historyとcurrent requestを受け取った
+Codexが判断します。hostは同じ本文を独自regexや別の承認snapshotで再分類せず、Codexの構造化結果を
+対象repository・固定commit SHA・非強制push・idempotent receiptへ機械的に束縛して実行します。
+
 永続archive自体をscopeごとの直近64 jobへ圧縮し、省略済みjob数とcutoffだけを別台帳へ残します。
 snapshotも直近64 job block、128 Ki文字／256 KiBを上限とし、UTF-8 block境界で古いものから省略します。
 各archiveはevent数・文字数・byte数も制限します。credential、URL、machine-local path、Slack／内部ID、

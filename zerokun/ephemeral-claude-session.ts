@@ -238,35 +238,6 @@ export function parseEphemeralClaudeDeliveryEvidence(
   return evidence
 }
 
-/**
- * Only a provably absent or empty attempt may restart with a fresh Codex session.
- * Any journal or still-owned ephemeral lifecycle state means Claude delivery may
- * already have crossed the process boundary, even before the sidecar was copied.
- */
-export function advisorAttemptMayHaveBeenDeliveredForResume(
-  stateDirInput: string,
-  jobId: string,
-  attemptNonce: string,
-): boolean {
-  try {
-    const stateDir = requireManagedStateRoot(stateDirInput)
-    if (!ATTEMPT_COMPONENT.test(attemptNonce)) return true
-    const jobComponent = jobId.replace(/[^A-Za-z0-9._-]/g, '_')
-    for (const rootName of ['advisor-journal', EPHEMERAL_CLAUDE_STATE_ROOT]) {
-      const attemptRoot = join(stateDir, rootName, jobComponent, attemptNonce)
-      try {
-        const root = requireManagedDirectory(stateDir, attemptRoot)
-        if (readdirSync(root).length > 0) return true
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return true
-      }
-    }
-    return false
-  } catch {
-    return true
-  }
-}
-
 export type EphemeralClaudeTarget = {
   target: string
   workspaceId: string
@@ -277,6 +248,14 @@ export type EphemeralClaudeTarget = {
 }
 
 export class EphemeralClaudeCleanupPendingError extends Error {}
+export class EphemeralClaudeOwnedProcessStillLiveError
+  extends EphemeralClaudeCleanupPendingError {}
+
+function cleanupDiagnosticConfirmsOwnedProcessStillLive(stderr: string): boolean {
+  return stderr.includes('ephemeral Claude process survived workspace cleanup')
+    || stderr.includes('ephemeral owned workspace still exists')
+    || stderr.includes('provisional owned workspace still exists')
+}
 
 type EphemeralClaudeIntent = {
   nonce: string
@@ -979,6 +958,11 @@ export async function reconcileEphemeralClaudeSessions(options: {
             if (target === null) {
               const recovered = await run('recover', projectRoot, requestDir)
               if (recovered.exitCode !== 0) {
+                if (cleanupDiagnosticConfirmsOwnedProcessStillLive(recovered.stderr)) {
+                  throw new EphemeralClaudeOwnedProcessStillLiveError(
+                    'owned ephemeral Claude process remains live after provisional cleanup',
+                  )
+                }
                 throw new EphemeralClaudeCleanupPendingError(
                   `ephemeral Claude provisional cleanup is pending: ${recovered.stderr.trim().slice(-2_000)}`,
                 )
@@ -993,6 +977,11 @@ export async function reconcileEphemeralClaudeSessions(options: {
             } else {
               const close = await run('close', projectRoot, requestDir)
               if (close.exitCode !== 0) {
+                if (cleanupDiagnosticConfirmsOwnedProcessStillLive(close.stderr)) {
+                  throw new EphemeralClaudeOwnedProcessStillLiveError(
+                    'owned ephemeral Claude process remains live after workspace cleanup',
+                  )
+                }
                 throw new EphemeralClaudeCleanupPendingError(
                   `ephemeral Claude cleanup is pending: ${close.stderr.trim().slice(-2_000)}`,
                 )

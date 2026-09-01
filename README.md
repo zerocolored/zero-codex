@@ -190,6 +190,10 @@ gh auth status --hostname github.com
 
 Zeroちゃんは認証画面を開かず、tokenやSSH keyをCodexへ渡しません。実装processはlocal commitまでを
 担当し、最終read-only reviewと入力seal後に、host runtimeがその完全一致SHAを非強制pushしてPRを作成します。
+依頼が公開・継続・中止のどれを意味するか、どのbranchへ進めるかは、同じSlackスレッドの履歴を読んだ
+Codexが判断します。host runtimeはSlack本文をregex等で再解釈してCodexの判断を却下しません。
+host側に残すのは、write jobの実行権限、対象repositoryとcommit SHAの固定、非強制push、receiptによる
+重複送信防止といった機械的な実行境界だけです。
 pushまたはPRのreceiptをSQLiteへ保存できるまで成功通知は出さず、再起動後もCodexを再実行せず公開だけを再開します。
 実装processはcommit後かつread-only review前にcheckoutを元のcleanなbase branchへ戻し、reviewは固定feature branchのcommit差分を確認します。認証を持つhost publisherはcheckoutを変更しないため、次の依頼を前のPRへ積み重ねず、local filter等をhost権限で起動しません。
 
