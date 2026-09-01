@@ -11,6 +11,8 @@ import { homedir } from 'os'
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 const BRANCH_MAX_BYTES = 255
 export const MAX_GITHUB_PUBLICATION_REPOSITORIES = 128
+const MAX_PULL_REQUEST_BODY_BYTES = 60_000
+const MAX_CLOSE_PULL_REQUESTS = 32
 const COMMAND_OUTPUT_LIMIT = 2 * 1024 * 1024
 const COMMAND_TIMEOUT_MS = 2 * 60 * 1_000
 
@@ -64,12 +66,20 @@ export type GitHubPublicationPromotion = {
   sourceHead: string
   followupBaseBranch: string
   followupInitialHead: string
+  waitForChecks?: boolean
+  integrationPullRequestBody?: string
+  followupPullRequestBody?: string
+  closePullRequestNumbers?: number[]
 }
 
 export type GitHubPromotionBinding = {
   gitRoot: string
   baseBranch: string
   followupBaseBranch: string
+  waitForChecks?: boolean
+  integrationPullRequestBody?: string
+  followupPullRequestBody?: string
+  closePullRequestNumbers?: number[]
 }
 
 export type GitHubPublicationSet = {
@@ -94,6 +104,7 @@ export type GitHubPublicationReceipt = {
   pullRequestUrl: string
   followupPullRequestNumber?: number
   followupPullRequestUrl?: string
+  closedPullRequestNumbers?: number[]
 }
 
 /**
@@ -144,7 +155,7 @@ export interface GitHubPublicationCommands {
 export class GitHubPublicationError extends Error {
   constructor(
     readonly category: 'authentication' | 'network' | 'conflict' | 'configuration' | 'remote'
-      | 'cleanup' | 'waiting',
+      | 'cleanup' | 'waiting' | 'checks',
     message: string,
   ) {
     super(message)
@@ -202,6 +213,42 @@ function validBranch(repo: string, value: string): string {
     throw new GitHubPublicationError('configuration', `Git branch binding is invalid for ${repo}`)
   }
   return branch
+}
+
+function hasDelegatedPromotionDetails(promotion: GitHubPublicationPromotion): boolean {
+  return promotion.waitForChecks !== undefined
+    || promotion.integrationPullRequestBody !== undefined
+    || promotion.followupPullRequestBody !== undefined
+    || promotion.closePullRequestNumbers !== undefined
+}
+
+function assertDelegatedPromotionDetails(promotion: GitHubPublicationPromotion): void {
+  if (!hasDelegatedPromotionDetails(promotion)) return
+  const closeNumbers = promotion.closePullRequestNumbers
+  if (typeof promotion.waitForChecks !== 'boolean'
+    || typeof promotion.integrationPullRequestBody !== 'string'
+    || typeof promotion.followupPullRequestBody !== 'string'
+    || !Array.isArray(closeNumbers)
+    || !promotion.integrationPullRequestBody.trim()
+    || !promotion.followupPullRequestBody.trim()
+    || Buffer.byteLength(promotion.integrationPullRequestBody) > MAX_PULL_REQUEST_BODY_BYTES
+    || Buffer.byteLength(promotion.followupPullRequestBody) > MAX_PULL_REQUEST_BODY_BYTES
+    || /\0/.test(promotion.integrationPullRequestBody)
+    || /\0/.test(promotion.followupPullRequestBody)
+    || closeNumbers.length > MAX_CLOSE_PULL_REQUESTS
+    || closeNumbers.some(value => !Number.isSafeInteger(value) || value <= 0)
+    || new Set(closeNumbers).size !== closeNumbers.length
+    || JSON.stringify(closeNumbers) !== JSON.stringify([...closeNumbers].sort((a, b) => a - b))) {
+    throw new GitHubPublicationError('configuration', 'delegated GitHub promotion details are invalid')
+  }
+}
+
+function renderPullRequestBody(template: string, plan: GitHubPublicationPlan): string {
+  const body = template.replaceAll('{{COMMIT_SHA}}', plan.commitSha)
+  if (!body.trim() || Buffer.byteLength(body) > MAX_PULL_REQUEST_BODY_BYTES || /\0/.test(body)) {
+    throw new GitHubPublicationError('configuration', 'delegated GitHub pull request body is invalid')
+  }
+  return body
 }
 
 function parseGitHubRemote(value: string): GitHubRepositoryIdentity {
@@ -619,6 +666,12 @@ export async function prepareGitHubPromotionPlans(
         sourceHead: current.head,
         followupBaseBranch,
         followupInitialHead: initialFollowupHead,
+        ...(binding.waitForChecks !== undefined ? {
+          waitForChecks: binding.waitForChecks,
+          integrationPullRequestBody: binding.integrationPullRequestBody,
+          followupPullRequestBody: binding.followupPullRequestBody,
+          closePullRequestNumbers: binding.closePullRequestNumbers,
+        } : {}),
       },
     })
   }
@@ -662,6 +715,7 @@ function assertGitHubPublicationPlanShape(value: GitHubPublicationPlan): void {
       || promotion.followupBaseBranch === value.headBranch) {
       throw new GitHubPublicationError('configuration', 'publication promotion is invalid')
     }
+    assertDelegatedPromotionDetails(promotion)
     validBranch(value.gitRoot, promotion.sourceBranch)
     validBranch(value.gitRoot, promotion.followupBaseBranch)
   }
@@ -1149,8 +1203,130 @@ type PullRequestApiRecord = {
   state: 'open' | 'closed'
   merged_at: string | null
   merge_commit_sha?: string | null
+  body?: string | null
   head: { ref: string; sha: string; repo: { full_name: string } }
   base: { ref: string; repo: { full_name: string } }
+}
+
+async function readExactPullRequest(
+  plan: GitHubPublicationPlan,
+  pullRequestNumber: number,
+  commands: GitHubPublicationCommands,
+  signal?: AbortSignal,
+): Promise<{ record: PullRequestApiRecord; detail: Record<string, unknown> }> {
+  const response = await commands.runGh([
+    'api', '--method', 'GET',
+    `repos/${plan.repositorySlug}/pulls/${pullRequestNumber}`,
+  ], undefined, signal)
+  if (response.exitCode !== 0) commandFailure(response, 'GitHub PR lookup')
+  let parsed: unknown
+  try { parsed = JSON.parse(response.stdout) } catch {
+    throw new GitHubPublicationError('remote', 'GitHub PR lookup returned invalid JSON')
+  }
+  const classified = classifiedPullRequestRecord(parsed, plan)
+  if (!classified || classified.record.number !== pullRequestNumber
+    || classified.kind !== 'valid') {
+    throw new GitHubPublicationError('remote', 'GitHub PR receipt is invalid')
+  }
+  return { record: classified.record, detail: parsed as Record<string, unknown> }
+}
+
+async function reconcilePullRequestBody(
+  plan: GitHubPublicationPlan,
+  pullRequest: PullRequestApiRecord,
+  bodyTemplate: string | undefined,
+  commands: GitHubPublicationCommands,
+  signal?: AbortSignal,
+): Promise<PullRequestApiRecord> {
+  if (bodyTemplate === undefined) return pullRequest
+  const expectedBody = renderPullRequestBody(bodyTemplate, plan)
+  if (pullRequest.body === expectedBody) return pullRequest
+  const update = await commands.runGh([
+    'api', '--method', 'PATCH',
+    `repos/${plan.repositorySlug}/pulls/${pullRequest.number}`, '--input', '-',
+  ], JSON.stringify({ body: expectedBody }), signal)
+  const verified = await readExactPullRequest(plan, pullRequest.number, commands, signal)
+  if (verified.record.body !== expectedBody) {
+    if (update.exitCode !== 0) commandFailure(update, 'GitHub PR body update')
+    throw new GitHubPublicationError('remote', 'GitHub did not retain the Codex-selected PR body')
+  }
+  return verified.record
+}
+
+async function assertPullRequestChecksReady(
+  plan: GitHubPublicationPlan,
+  commands: GitHubPublicationCommands,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (plan.promotion?.waitForChecks !== true) return
+  const checksResponse = await commands.runGh([
+    'api', '--method', 'GET',
+    `repos/${plan.repositorySlug}/commits/${plan.commitSha}/check-runs?filter=latest&per_page=100`,
+  ], undefined, signal)
+  if (checksResponse.exitCode !== 0) commandFailure(checksResponse, 'GitHub check-runs lookup')
+  const statusResponse = await commands.runGh([
+    'api', '--method', 'GET',
+    `repos/${plan.repositorySlug}/commits/${plan.commitSha}/status?per_page=100`,
+  ], undefined, signal)
+  if (statusResponse.exitCode !== 0) commandFailure(statusResponse, 'GitHub commit-status lookup')
+  let checksValue: unknown
+  let statusValue: unknown
+  try {
+    checksValue = JSON.parse(checksResponse.stdout)
+    statusValue = JSON.parse(statusResponse.stdout)
+  } catch {
+    throw new GitHubPublicationError('remote', 'GitHub checks returned invalid JSON')
+  }
+  const checksRecord = checksValue as Record<string, unknown> | null
+  const statusRecord = statusValue as Record<string, unknown> | null
+  if (!checksRecord || !Number.isSafeInteger(checksRecord.total_count)
+    || !Array.isArray(checksRecord.check_runs) || Number(checksRecord.total_count) < 0
+    || Number(checksRecord.total_count) !== checksRecord.check_runs.length
+    || !statusRecord || !Array.isArray(statusRecord.statuses)) {
+    throw new GitHubPublicationError('remote', 'GitHub checks receipt is incomplete')
+  }
+  const pending: string[] = []
+  const failed: string[] = []
+  for (const [index, value] of checksRecord.check_runs.entries()) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new GitHubPublicationError('remote', 'GitHub check-run receipt is invalid')
+    }
+    const check = value as Record<string, unknown>
+    const name = typeof check.name === 'string' && check.name ? check.name : `check-${index + 1}`
+    if (check.status !== 'completed') {
+      pending.push(name)
+    } else if (!['success', 'neutral', 'skipped'].includes(String(check.conclusion))) {
+      failed.push(name)
+    }
+  }
+  const latestStatuses = new Map<string, string>()
+  for (const [index, value] of statusRecord.statuses.entries()) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new GitHubPublicationError('remote', 'GitHub commit-status receipt is invalid')
+    }
+    const status = value as Record<string, unknown>
+    const context = typeof status.context === 'string' && status.context
+      ? status.context : `status-${index + 1}`
+    if (!latestStatuses.has(context)) latestStatuses.set(context, String(status.state))
+  }
+  for (const [context, state] of latestStatuses) {
+    if (state === 'pending') pending.push(context)
+    else if (state !== 'success') failed.push(context)
+  }
+  if (failed.length > 0) {
+    throw new GitHubPublicationError(
+      'checks',
+      `Codex-selected GitHub checks failed: ${failed.slice(0, 10).join(', ')}`,
+    )
+  }
+  if (pending.length > 0 || (checksRecord.check_runs.length === 0 && latestStatuses.size === 0)) {
+    throw new GitHubPublicationError(
+      'waiting',
+      pending.length > 0
+        ? `Codex-selected GitHub checks are still running: ${pending.slice(0, 10).join(', ')}`
+        : 'Codex-selected GitHub checks have not started yet',
+    )
+  }
 }
 
 async function readPullRequestForMerge(
@@ -1159,22 +1335,11 @@ async function readPullRequestForMerge(
   commands: GitHubPublicationCommands,
   signal?: AbortSignal,
 ): Promise<PullRequestApiRecord> {
-  const response = await commands.runGh([
-    'api', '--method', 'GET',
-    `repos/${plan.repositorySlug}/pulls/${pullRequestNumber}`,
-  ], undefined, signal)
-  if (response.exitCode !== 0) commandFailure(response, 'GitHub PR readiness lookup')
-  let parsed: unknown
-  try { parsed = JSON.parse(response.stdout) } catch {
-    throw new GitHubPublicationError('remote', 'GitHub PR readiness returned invalid JSON')
-  }
-  const classified = classifiedPullRequestRecord(parsed, plan)
-  if (!classified || classified.record.number !== pullRequestNumber
-    || classified.kind !== 'valid') {
-    throw new GitHubPublicationError('remote', 'GitHub PR readiness receipt is invalid')
-  }
-  if (classified.record.merged_at !== null) return classified.record
-  const detail = parsed as Record<string, unknown>
+  const { record, detail } = await readExactPullRequest(
+    plan, pullRequestNumber, commands, signal,
+  )
+  if (record.merged_at !== null) return record
+  await assertPullRequestChecksReady(plan, commands, signal)
   if (detail.mergeable_state === 'dirty') {
     throw new GitHubPublicationError(
       'conflict',
@@ -1188,7 +1353,7 @@ async function readPullRequestForMerge(
       'GitHub integration PR is waiting for required checks and review protections',
     )
   }
-  return classified.record
+  return record
 }
 
 function classifiedPullRequestRecord(
@@ -1250,6 +1415,87 @@ async function findPullRequest(
     )
   }
   return matches[0] ?? null
+}
+
+type RepositoryPullRequestRecord = {
+  number: number
+  html_url: string
+  state: 'open' | 'closed'
+  merged_at: string | null
+  head: { repo: { full_name: string } }
+  base: { repo: { full_name: string } }
+}
+
+async function readRepositoryPullRequest(
+  plan: GitHubPublicationPlan,
+  pullRequestNumber: number,
+  commands: GitHubPublicationCommands,
+  signal?: AbortSignal,
+): Promise<RepositoryPullRequestRecord> {
+  const response = await commands.runGh([
+    'api', '--method', 'GET',
+    `repos/${plan.repositorySlug}/pulls/${pullRequestNumber}`,
+  ], undefined, signal)
+  if (response.exitCode !== 0) commandFailure(response, 'GitHub obsolete PR lookup')
+  let value: unknown
+  try { value = JSON.parse(response.stdout) } catch {
+    throw new GitHubPublicationError('remote', 'GitHub obsolete PR lookup returned invalid JSON')
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new GitHubPublicationError('remote', 'GitHub obsolete PR receipt is invalid')
+  }
+  const row = value as Record<string, unknown>
+  const head = row.head as Record<string, unknown> | undefined
+  const base = row.base as Record<string, unknown> | undefined
+  const headRepo = head?.repo as Record<string, unknown> | undefined
+  const baseRepo = base?.repo as Record<string, unknown> | undefined
+  const expectedUrl = `https://github.com/${plan.repositorySlug}/pull/${pullRequestNumber}`
+  if (row.number !== pullRequestNumber || row.html_url !== expectedUrl
+    || (row.state !== 'open' && row.state !== 'closed')
+    || (row.merged_at !== null && typeof row.merged_at !== 'string')
+    || String(headRepo?.full_name ?? '').toLowerCase() !== plan.repositorySlug.toLowerCase()
+    || String(baseRepo?.full_name ?? '').toLowerCase() !== plan.repositorySlug.toLowerCase()) {
+    throw new GitHubPublicationError('remote', 'GitHub obsolete PR receipt is invalid')
+  }
+  return row as unknown as RepositoryPullRequestRecord
+}
+
+async function closeCodexSelectedPullRequests(
+  plan: GitHubPublicationPlan,
+  integrationPullRequestNumber: number,
+  commands: GitHubPublicationCommands,
+  signal?: AbortSignal,
+): Promise<number[]> {
+  const numbers = plan.promotion?.closePullRequestNumbers ?? []
+  if (numbers.includes(integrationPullRequestNumber)) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'Codex selected the active integration PR as obsolete',
+    )
+  }
+  const closed: number[] = []
+  for (const number of numbers) {
+    let pullRequest = await readRepositoryPullRequest(plan, number, commands, signal)
+    if (pullRequest.merged_at !== null) {
+      throw new GitHubPublicationError(
+        'conflict',
+        `Codex-selected obsolete PR #${number} is already merged`,
+      )
+    }
+    if (pullRequest.state === 'open') {
+      const update = await commands.runGh([
+        'api', '--method', 'PATCH',
+        `repos/${plan.repositorySlug}/pulls/${number}`, '--input', '-',
+      ], JSON.stringify({ state: 'closed' }), signal)
+      pullRequest = await readRepositoryPullRequest(plan, number, commands, signal)
+      if (pullRequest.state !== 'closed' || pullRequest.merged_at !== null) {
+        if (update.exitCode !== 0) commandFailure(update, 'GitHub obsolete PR closure')
+        throw new GitHubPublicationError('remote', `GitHub did not close obsolete PR #${number}`)
+      }
+    }
+    closed.push(number)
+  }
+  return closed
 }
 
 export async function publishGitHubPlan(
@@ -1328,11 +1574,14 @@ export async function publishGitHubPlan(
 
   let pullRequest = existing ?? await findPullRequest(plan, commands, signal)
   if (!pullRequest) {
+    const integrationBody = plan.promotion?.integrationPullRequestBody === undefined
+      ? 'This pull request contains the reviewed changes for an authorized project task.'
+      : renderPullRequestBody(plan.promotion.integrationPullRequestBody, plan)
     const request = JSON.stringify({
       title: plan.title,
       head: plan.headBranch,
       base: plan.baseBranch,
-      body: 'This pull request contains the reviewed changes for an authorized project task.',
+      body: integrationBody,
     })
     const create = await commands.runGh([
       'api', '--method', 'POST', `repos/${plan.repositorySlug}/pulls`, '--input', '-',
@@ -1345,12 +1594,25 @@ export async function publishGitHubPlan(
     }
   }
   if (plan.promotion) {
+    pullRequest = await reconcilePullRequestBody(
+      plan,
+      pullRequest,
+      plan.promotion.integrationPullRequestBody,
+      commands,
+      signal,
+    )
     await onPromotionCheckpoint?.({
       version: 1,
       kind: 'integration-pr',
       pullRequestNumber: pullRequest.number,
       pullRequestUrl: pullRequest.html_url,
     })
+    const closedPullRequestNumbers = await closeCodexSelectedPullRequests(
+      plan,
+      pullRequest.number,
+      commands,
+      signal,
+    )
     if (pullRequest.merged_at === null) {
       pullRequest = await readPullRequestForMerge(
         plan,
@@ -1482,13 +1744,16 @@ export async function publishGitHubPlan(
     )
     let followupPullRequest = await findPullRequest(followupPlan, commands, signal)
     if (!followupPullRequest) {
+      const followupBody = plan.promotion.followupPullRequestBody === undefined
+        ? 'The authorized integration branch is ready for release review. This PR is not auto-merged.'
+        : renderPullRequestBody(plan.promotion.followupPullRequestBody, followupPlan)
       const create = await commands.runGh([
         'api', '--method', 'POST', `repos/${plan.repositorySlug}/pulls`, '--input', '-',
       ], JSON.stringify({
         title: followupPlan.title,
         head: followupPlan.headBranch,
         base: followupPlan.baseBranch,
-        body: 'The authorized integration branch is ready for release review. This PR is not auto-merged.',
+        body: followupBody,
       }), signal)
       followupPullRequest = await findPullRequest(followupPlan, commands, signal)
       if (!followupPullRequest) {
@@ -1499,6 +1764,13 @@ export async function publishGitHubPlan(
         )
       }
     }
+    followupPullRequest = await reconcilePullRequestBody(
+      followupPlan,
+      followupPullRequest,
+      plan.promotion.followupPullRequestBody,
+      commands,
+      signal,
+    )
     await onPromotionCheckpoint?.({
       version: 1,
       kind: 'followup-pr',
@@ -1517,6 +1789,7 @@ export async function publishGitHubPlan(
       pullRequestUrl: pullRequest.html_url,
       followupPullRequestNumber: followupPullRequest.number,
       followupPullRequestUrl: followupPullRequest.html_url,
+      ...(closedPullRequestNumbers.length > 0 ? { closedPullRequestNumbers } : {}),
     }
   }
   return {

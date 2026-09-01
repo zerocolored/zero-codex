@@ -183,6 +183,10 @@ export type CodexPublicationIntent = {
   baseBranch: string
   mergePullRequest: true
   followupBaseBranch: string
+  waitForChecks?: boolean
+  integrationPullRequestBody?: string
+  followupPullRequestBody?: string
+  closePullRequestNumbers?: number[]
 }
 
 export type CodexImplementationIntent = {
@@ -190,6 +194,10 @@ export type CodexImplementationIntent = {
   baseBranch: string
   mergePullRequest: boolean
   followupBaseBranch: string | null
+  waitForChecks?: boolean
+  integrationPullRequestBody?: string
+  followupPullRequestBody?: string
+  closePullRequestNumbers?: number[]
 }
 
 export type CodexPreparationWorkAction = 'implement' | 'no-change' | 'promote-current-head'
@@ -242,6 +250,27 @@ export type UiApprovalResumeContext = {
   repositoryScope: string[] | null
   repositoryScopeDigest: string | null
   proposalText: string
+}
+
+const MAX_CODEX_PR_BODY_BYTES = 60_000
+const MAX_CODEX_CLOSE_PULL_REQUESTS = 32
+
+function validCodexPromotionDetails(record: Record<string, unknown>): boolean {
+  if (typeof record.waitForChecks !== 'boolean'
+    || typeof record.integrationPullRequestBody !== 'string'
+    || typeof record.followupPullRequestBody !== 'string'
+    || !Array.isArray(record.closePullRequestNumbers)
+    || !record.integrationPullRequestBody.trim()
+    || !record.followupPullRequestBody.trim()
+    || Buffer.byteLength(record.integrationPullRequestBody) > MAX_CODEX_PR_BODY_BYTES
+    || Buffer.byteLength(record.followupPullRequestBody) > MAX_CODEX_PR_BODY_BYTES
+    || /\0/.test(record.integrationPullRequestBody)
+    || /\0/.test(record.followupPullRequestBody)
+    || record.closePullRequestNumbers.length > MAX_CODEX_CLOSE_PULL_REQUESTS) return false
+  const numbers = record.closePullRequestNumbers
+  if (numbers.some(value => !Number.isSafeInteger(value) || Number(value) <= 0)) return false
+  return new Set(numbers).size === numbers.length
+    && JSON.stringify(numbers) === JSON.stringify([...numbers].sort((left, right) => Number(left) - Number(right)))
 }
 
 export type CodexUiApprovalPending = UiApprovalProposal & {
@@ -429,16 +458,24 @@ function exactReadyPublicationIntents(
       throw new Error('Codex publication promotion is invalid')
     }
     const promotion = value as Record<string, unknown>
-    const expectedKeys = [
+    const legacyKeys = [
       'baseBranch', 'followupBaseBranch', 'kind', 'mergePullRequest', 'repository',
     ]
-    if (Object.keys(promotion).sort().join(',') !== expectedKeys.sort().join(',')
+    const delegatedKeys = [
+      ...legacyKeys,
+      'waitForChecks', 'integrationPullRequestBody', 'followupPullRequestBody',
+      'closePullRequestNumbers',
+    ]
+    const keys = Object.keys(promotion).sort().join(',')
+    const hasDelegatedDetails = keys === delegatedKeys.sort().join(',')
+    if (!hasDelegatedDetails
       || promotion.kind !== 'promote-current-head'
       || typeof promotion.repository !== 'string'
       || !repositoryScope.includes(promotion.repository)
       || typeof promotion.baseBranch !== 'string'
       || typeof promotion.followupBaseBranch !== 'string'
       || promotion.mergePullRequest !== true
+      || (hasDelegatedDetails && !validCodexPromotionDetails(promotion))
       || promotion.baseBranch === promotion.followupBaseBranch
       || [promotion.baseBranch, promotion.followupBaseBranch].some(branch => (
         !branch || Buffer.byteLength(branch) > 255 || /[\0\r\n]/.test(branch)
@@ -508,8 +545,18 @@ function exactReadyWorkAction(value: string, repositoryScope: readonly string[])
       throw new Error('Codex implementation target must be an object')
     }
     const intent = target as Record<string, unknown>
-    if (Object.keys(intent).sort().join(',')
-        !== 'baseBranch,followupBaseBranch,mergePullRequest,repository'
+    const legacyKeys = [
+      'baseBranch', 'followupBaseBranch', 'mergePullRequest', 'repository',
+    ]
+    const delegatedKeys = [
+      ...legacyKeys,
+      'waitForChecks', 'integrationPullRequestBody', 'followupPullRequestBody',
+      'closePullRequestNumbers',
+    ]
+    const keys = Object.keys(intent).sort().join(',')
+    const hasDelegatedDetails = keys === delegatedKeys.sort().join(',')
+    if ((intent.mergePullRequest === true && !hasDelegatedDetails)
+      || (intent.mergePullRequest === false && keys !== legacyKeys.sort().join(','))
       || typeof intent.repository !== 'string'
       || typeof intent.baseBranch !== 'string'
       || typeof intent.mergePullRequest !== 'boolean'
@@ -518,6 +565,9 @@ function exactReadyWorkAction(value: string, repositoryScope: readonly string[])
       || !repositoryScope.includes(intent.repository)
       || !intent.baseBranch || Buffer.byteLength(intent.baseBranch) > 255
       || /[\0\r\n]/.test(intent.baseBranch)
+      || (hasDelegatedDetails && (
+        intent.mergePullRequest !== true || !validCodexPromotionDetails(intent)
+      ))
       || (intent.followupBaseBranch !== null && (
         !intent.followupBaseBranch
         || Buffer.byteLength(intent.followupBaseBranch) > 255

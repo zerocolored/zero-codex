@@ -239,6 +239,12 @@ function prepareBoundImplementationPublicationPlans(
         sourceHead: plan.commitSha,
         followupBaseBranch: binding.followupBaseBranch,
         followupInitialHead: binding.followupInitialHead,
+        ...(binding.waitForChecks !== undefined ? {
+          waitForChecks: binding.waitForChecks,
+          integrationPullRequestBody: binding.integrationPullRequestBody,
+          followupPullRequestBody: binding.followupPullRequestBody,
+          closePullRequestNumbers: binding.closePullRequestNumbers,
+        } : {}),
       },
     }
     assertGitHubPublicationPlan(promoted)
@@ -3470,18 +3476,24 @@ export function buildCodexPhasePrompt(
       'Codex selects each integration base from the actual request and repository conventions, not',
       'from the branch currently checked out by another session. Set mergePullRequest=true and a',
       'non-null followupBaseBranch only when the request explicitly asks to merge the integration',
-      'PR and then create the next branch PR; otherwise use false and null.',
+      'PR and then create the next branch PR; otherwise use false and null. For every true target,',
+      'also include waitForChecks, integrationPullRequestBody, followupPullRequestBody, and sorted',
+      'closePullRequestNumbers. You decide these values from the request and repository conventions.',
+      'Set waitForChecks=true when checks must pass before merge. Build both bodies from the actual',
+      'repository PR template and checks. Encode body newlines inside JSON and use {{COMMIT_SHA}}',
+      'where the reviewed commit SHA is needed. List only explicitly requested obsolete PRs to close.',
       'For every ready decision, put this exact JSON envelope immediately before the final',
       'ready marker, using only the exact IDs above in sorted order with no duplicates:',
       '<zerokun_repository_scope>{"repositories":["<implementation repository ID>"]}</zerokun_repository_scope>',
       'When and only when the exact request is publication-only for already committed current',
       'checkouts, and asks to apply each current HEAD through a PR and then create a second branch',
       'PR, put this host-only envelope immediately before the repository-scope envelope:',
-      '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":"<repository ID>","baseBranch":"<integration branch>","mergePullRequest":true,"followupBaseBranch":"<release base branch>"}]}</zerokun_publication>',
+      '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":"<repository ID>","baseBranch":"<integration branch>","mergePullRequest":true,"followupBaseBranch":"<release base branch>","waitForChecks":true,"integrationPullRequestBody":"<repository-template body>","followupPullRequestBody":"<repository-template body>","closePullRequestNumbers":[]}]}</zerokun_publication>',
       'Sort promotions by repository. Use this only if every selected repository is already clean',
       'and committed and no product edit is required. Never use it for a mixed implementation.',
-      'The host fixes exact source and remote target SHAs, performs the ordered PR operations after',
-      'read-only review, and never merges the follow-up release PR.',
+      'The host fixes exact source and remote target SHAs and executes your ordered PR decision after',
+      'read-only review. It applies your PR bodies, check-wait choice and obsolete-PR closures, and',
+      'never merges the follow-up release PR.',
       ...(browserEnabled ? [
         'For a material visual UI/UX change, do not edit the product repository. Capture the actual',
         'current representative state as Before, create a frontend-only proposal in the writable',
@@ -3642,6 +3654,11 @@ export function assertPreparedWorkPublication(
           || promotion.sourceHead !== plan.commitSha
           || promotion.followupBaseBranch !== binding.followupBaseBranch
           || promotion.followupInitialHead !== binding.followupInitialHead
+          || promotion.waitForChecks !== binding.waitForChecks
+          || promotion.integrationPullRequestBody !== binding.integrationPullRequestBody
+          || promotion.followupPullRequestBody !== binding.followupPullRequestBody
+          || JSON.stringify(promotion.closePullRequestNumbers)
+            !== JSON.stringify(binding.closePullRequestNumbers)
         ))
         || (!binding.mergePullRequest && promotion !== undefined)) {
         throw new GitHubPublicationError(
@@ -8003,6 +8020,12 @@ export async function executeCodexJob(
                 gitRoot: rootsByIdentifier.get(intent.repository)!,
                 baseBranch: intent.baseBranch,
                 followupBaseBranch: intent.followupBaseBranch,
+                ...(intent.waitForChecks !== undefined ? {
+                  waitForChecks: intent.waitForChecks,
+                  integrationPullRequestBody: intent.integrationPullRequestBody,
+                  followupPullRequestBody: intent.followupPullRequestBody,
+                  closePullRequestNumbers: intent.closePullRequestNumbers,
+                } : {}),
               })),
               publicationBranch,
               publicationCommands,

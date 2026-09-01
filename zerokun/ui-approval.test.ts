@@ -328,7 +328,10 @@ describe('Codex UI/UX approval decision contract', () => {
     const promotion = '<zerokun_publication>{"promotions":['
       + '{"kind":"promote-current-head","repository":"frontend",'
       + '"baseBranch":"develop","mergePullRequest":true,'
-      + '"followupBaseBranch":"main"}]}</zerokun_publication>'
+      + '"followupBaseBranch":"main","waitForChecks":false,'
+      + '"integrationPullRequestBody":"## Summary\\nreviewed {{COMMIT_SHA}}",'
+      + '"followupPullRequestBody":"## Summary\\nrelease {{COMMIT_SHA}}",'
+      + '"closePullRequestNumbers":[]}]}</zerokun_publication>'
     expect(parseCodexPreparationDecision([
       workAction('promote-current-head'),
       promotion,
@@ -344,6 +347,10 @@ describe('Codex UI/UX approval decision contract', () => {
         baseBranch: 'develop',
         mergePullRequest: true,
         followupBaseBranch: 'main',
+        waitForChecks: false,
+        integrationPullRequestBody: '## Summary\nreviewed {{COMMIT_SHA}}',
+        followupPullRequestBody: '## Summary\nrelease {{COMMIT_SHA}}',
+        closePullRequestNumbers: [],
       }],
     })
 
@@ -355,6 +362,61 @@ describe('Codex UI/UX approval decision contract', () => {
     ].join('\n'), nonce, input, undefined, ['backend', 'frontend'])).toThrow(
       'every selected repository',
     )
+  })
+
+  test('Codexがchecks待機・PR本文・obsolete PR closeをpromotionへ固定できる', () => {
+    const ready = `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`
+    const details = {
+      kind: 'promote-current-head',
+      repository: 'frontend',
+      baseBranch: 'develop',
+      mergePullRequest: true,
+      followupBaseBranch: 'main',
+      waitForChecks: true,
+      integrationPullRequestBody: '## Summary\nreviewed {{COMMIT_SHA}}',
+      followupPullRequestBody: '## Summary\nrelease reviewed {{COMMIT_SHA}}',
+      closePullRequestNumbers: [857],
+    }
+    const parse = (promotion: Record<string, unknown>) => parseCodexPreparationDecision([
+      workAction('promote-current-head'),
+      `<zerokun_publication>${JSON.stringify({ promotions: [promotion] })}</zerokun_publication>`,
+      '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
+      ready,
+    ].join('\n'), nonce, input, undefined, ['frontend'])
+    expect(parse(details)).toMatchObject({
+      kind: 'ready',
+      publicationIntents: [details],
+    })
+    expect(() => parse({ ...details, closePullRequestNumbers: [857, 857] })).toThrow(
+      'publication promotion is invalid',
+    )
+    expect(() => parse({ ...details, integrationPullRequestBody: '' })).toThrow(
+      'publication promotion is invalid',
+    )
+  })
+
+  test('実装targetにもCodex選択のGitHub公開詳細を保持する', () => {
+    const ready = `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`
+    const target = {
+      repository: 'frontend',
+      baseBranch: 'develop',
+      mergePullRequest: true,
+      followupBaseBranch: 'main',
+      waitForChecks: true,
+      integrationPullRequestBody: '## Summary\nimplementation {{COMMIT_SHA}}',
+      followupPullRequestBody: '## Summary\nrelease {{COMMIT_SHA}}',
+      closePullRequestNumbers: [857],
+    }
+    const decision = parseCodexPreparationDecision([
+      `<zerokun_work_action>${JSON.stringify({ kind: 'implement', targets: [target] })}</zerokun_work_action>`,
+      '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
+      ready,
+    ].join('\n'), nonce, input, undefined, ['frontend'])
+    expect(decision).toMatchObject({
+      kind: 'ready',
+      workAction: 'implement',
+      implementationIntents: [target],
+    })
   })
 
   test('host gate accepts a compatible repository change and rejects stale or conflicting meaning', () => {

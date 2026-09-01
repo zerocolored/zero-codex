@@ -2545,6 +2545,10 @@ function validateStoredGitHubPublicationSet(value: GitHubPublicationSet): void {
     }
     if (plan.promotion) {
       const promotion = plan.promotion
+      const delegated = promotion.waitForChecks !== undefined
+        || promotion.integrationPullRequestBody !== undefined
+        || promotion.followupPullRequestBody !== undefined
+        || promotion.closePullRequestNumbers !== undefined
       if (!promotion || typeof promotion !== 'object' || promotion.version !== 1
         || typeof promotion.sourceBranch !== 'string'
         || typeof promotion.sourceHead !== 'string'
@@ -2560,6 +2564,26 @@ function validateStoredGitHubPublicationSet(value: GitHubPublicationSet): void {
         || promotion.followupBaseBranch === plan.headBranch
         || [promotion.sourceBranch, promotion.followupBaseBranch].some(branch => (
           /[\0\r\n]/.test(branch) || Buffer.byteLength(branch) > 255
+        ))
+        || (delegated && (
+          typeof promotion.waitForChecks !== 'boolean'
+          || typeof promotion.integrationPullRequestBody !== 'string'
+          || typeof promotion.followupPullRequestBody !== 'string'
+          || !promotion.integrationPullRequestBody.trim()
+          || !promotion.followupPullRequestBody.trim()
+          || Buffer.byteLength(promotion.integrationPullRequestBody) > 60_000
+          || Buffer.byteLength(promotion.followupPullRequestBody) > 60_000
+          || /\0/.test(promotion.integrationPullRequestBody)
+          || /\0/.test(promotion.followupPullRequestBody)
+          || !Array.isArray(promotion.closePullRequestNumbers)
+          || promotion.closePullRequestNumbers.length > 32
+          || promotion.closePullRequestNumbers.some(number => (
+            !Number.isSafeInteger(number) || number <= 0
+          ))
+          || new Set(promotion.closePullRequestNumbers).size
+            !== promotion.closePullRequestNumbers.length
+          || JSON.stringify(promotion.closePullRequestNumbers)
+            !== JSON.stringify([...promotion.closePullRequestNumbers].sort((a, b) => a - b))
         ))) {
         throw new Error('GitHub publication promotion is invalid')
       }
@@ -2579,6 +2603,9 @@ function appendGitHubPublicationSummary(
     + `  PR: ${receipt.pullRequestUrl}`
     + (receipt.followupPullRequestUrl
       ? `\n  Release PR: ${receipt.followupPullRequestUrl}`
+      : '')
+    + (receipt.closedPullRequestNumbers?.length
+      ? `\n  Closed obsolete PRs: ${receipt.closedPullRequestNumbers.map(number => `#${number}`).join(', ')}`
       : '')
   ))
   return `${result.trimEnd()}\n\n📦 GitHubへの公開が完了しました。\n${lines.join('\n')}`
@@ -2664,13 +2691,21 @@ function publicationPlanFromRow(row: GitHubPublicationRow): GitHubPublicationPla
       throw new Error('stored GitHub publication promotion is invalid')
     }
     const record = parsed as Record<string, unknown>
-    if (Object.keys(record).sort().join('\n')
-        !== 'followupBaseBranch\nfollowupInitialHead\nsourceBranch\nsourceHead\nversion'
+    const keys = Object.keys(record).sort().join('\n')
+    const legacyKeys = 'followupBaseBranch\nfollowupInitialHead\nsourceBranch\nsourceHead\nversion'
+    const delegatedKeys = 'closePullRequestNumbers\nfollowupBaseBranch\nfollowupInitialHead\nfollowupPullRequestBody\nintegrationPullRequestBody\nsourceBranch\nsourceHead\nversion\nwaitForChecks'
+    if ((keys !== legacyKeys && keys !== delegatedKeys)
       || record.version !== 1
       || typeof record.sourceBranch !== 'string'
       || typeof record.sourceHead !== 'string'
       || typeof record.followupBaseBranch !== 'string'
-      || typeof record.followupInitialHead !== 'string') {
+      || typeof record.followupInitialHead !== 'string'
+      || (keys === delegatedKeys && (
+        typeof record.waitForChecks !== 'boolean'
+        || typeof record.integrationPullRequestBody !== 'string'
+        || typeof record.followupPullRequestBody !== 'string'
+        || !Array.isArray(record.closePullRequestNumbers)
+      ))) {
       throw new Error('stored GitHub publication promotion is invalid')
     }
     promotion = record as GitHubPublicationPlan['promotion']
@@ -6847,6 +6882,9 @@ export class JobStore {
                     followupPullRequestNumber: entry.followup_pull_request_number,
                     followupPullRequestUrl: entry.followup_pull_request_url,
                   } : {}),
+                ...(storedPlan.promotion?.closePullRequestNumbers?.length ? {
+                  closedPullRequestNumbers: [...storedPlan.promotion.closePullRequestNumbers],
+                } : {}),
               } satisfies GitHubPublicationReceipt
             })
             expectedPersistedResult = appendGitHubPublicationSummary(result, receipts)
@@ -7094,6 +7132,9 @@ export class JobStore {
             followupPullRequestNumber: row.followup_pull_request_number,
             followupPullRequestUrl: row.followup_pull_request_url,
           } : {}),
+        ...(plan.promotion?.closePullRequestNumbers?.length ? {
+          closedPullRequestNumbers: [...plan.promotion.closePullRequestNumbers],
+        } : {}),
       }
     })
   }
@@ -10141,6 +10182,9 @@ export function publicJobFailureSummary(error: string): string {
   if (error.includes('implementation produced no reviewed commit; preparation did not authorize no-change')) {
     return '公開可能なreview済みcommitを確認できませんでした。変更は自動公開していません。同じスレッドから再開できます。'
   }
+  if (error.includes('Codex-selected GitHub checks failed')) {
+    return 'Codexがmerge条件に指定したGitHubチェックが失敗したため、mergeせず停止しました。同じスレッドから原因修正を再開できます。'
+  }
   if (error.includes('local Git config contains a setting that is unsafe for host publication')) {
     return 'GitHub公開前の安全確認で、リポジトリ設定を受理できませんでした。公開処理は行われていません。'
   }
@@ -10275,6 +10319,16 @@ export async function publishStagedGitHubPublication(
           `GitHub publication process cleanup remains unconfirmed for job ${jobId}; `
           + 'automatic external retries are suspended',
         )
+      }
+      if (category === 'checks') {
+        try {
+          store.recordGitHubPublicationFailure(jobId, work.plan, category, Date.now())
+        } catch (checkpointError) {
+          throw new CodexResultPersistencePendingError(
+            `GitHub check failure receipt remains staged for job ${jobId}: ${checkpointError}`,
+          )
+        }
+        throw error
       }
       const baseRetryMs = options.retryMsForTesting === undefined
         ? (category === 'configuration' || category === 'conflict' ? 60_000

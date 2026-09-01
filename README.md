@@ -194,6 +194,10 @@ Zeroちゃんは認証画面を開かず、tokenやSSH keyをCodexへ渡しま�
 Codexが判断します。host runtimeはSlack本文をregex等で再解釈してCodexの判断を却下しません。
 host側に残すのは、write jobの実行権限、対象repositoryとcommit SHAの固定、非強制push、receiptによる
 重複送信防止といった機械的な実行境界だけです。
+統合PRをmergeするか、exact head SHAのGitHub checksを待つか、repository固有templateに沿ったPR本文、
+置き換え後にcloseする旧PRもCodexが構造化して決定します。host runtimeはその決定を永続化して順番どおり
+実行し、checks未開始・実行中なら待機、失敗ならmergeせず同じSlackスレッドから修正を再開できる状態で
+終了します。release向けfollow-up PRは依頼どおり作成だけを行い、自動mergeしません。
 共有checkoutのHEADやstatusが別セッションによって変わっても、完了済みのCodex turnをhostが破棄して
 prepareから自動再試行しません。Codexがlive Git状態を読み直し、他者変更を保持しながら隔離worktree等で
 継続方法を決めます。公開時のremote・branch・完全一致SHA検証は従来どおり維持します。

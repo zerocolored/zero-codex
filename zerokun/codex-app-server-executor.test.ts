@@ -352,7 +352,7 @@ for line in sys.stdin:
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"main","mergePullRequest":false,"followupBaseBranch":null}]}</zerokun_work_action>'
                 if mode == "phased-publication-targeted":
-                    action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main"}]}</zerokun_work_action>'
+                    action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main","waitForChecks":false,"integrationPullRequestBody":"## Summary","followupPullRequestBody":"## Summary","closePullRequestNumbers":[]}]}</zerokun_work_action>'
                 if mode == "phased-no-change":
                     action = '<zerokun_work_action>{"kind":"no-change"}</zerokun_work_action>'
                 message = "準備完了\\n" + action + "\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
@@ -365,7 +365,7 @@ for line in sys.stdin:
                         )
                         if not required_history:
                             raise RuntimeError("failed publication continuation history missing")
-                    publication = '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":".","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main"}]}</zerokun_publication>'
+                    publication = '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":".","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main","waitForChecks":false,"integrationPullRequestBody":"## Summary","followupPullRequestBody":"## Summary","closePullRequestNumbers":[]}]}</zerokun_publication>'
                     scope = '<zerokun_repository_scope>{"repositories":["."]}</zerokun_repository_scope>'
                     action = '<zerokun_work_action>{"kind":"promote-current-head"}</zerokun_work_action>'
                     message = "公開準備完了\\n" + action + "\\n" + publication + "\\n" + scope + "\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
@@ -1532,6 +1532,8 @@ describe('production App Server executor', () => {
     let integrationExists = false
     let integrationMerged = false
     let releaseExists = false
+    let integrationBody: string | null = null
+    let releaseBody: string | null = null
     let integrationMergeRequests = 0
     let releaseMergeRequests = 0
     const prRecord = (
@@ -1540,12 +1542,14 @@ describe('production App Server executor', () => {
       headSha: string,
       baseBranch: string,
       merged = false,
+      body: string | null = null,
     ) => ({
       number,
       html_url: `https://github.com/${plan.repositorySlug}/pull/${number}`,
       state: merged ? 'closed' : 'open',
       merged_at: merged ? '2026-09-01T00:00:00Z' : null,
       merge_commit_sha: merged ? integrationMergeHead : null,
+      body,
       head: {
         ref: headBranch,
         sha: headSha,
@@ -1591,6 +1595,7 @@ describe('production App Server executor', () => {
           return publicationCommandResult(0, JSON.stringify({
             ...prRecord(
               91, plan.headBranch, plan.commitSha, 'develop', integrationMerged,
+              integrationBody,
             ),
             draft: false,
             mergeable: true,
@@ -1600,23 +1605,32 @@ describe('production App Server executor', () => {
         if (args.includes('GET') && command.includes('/pulls?')) {
           if (command.includes('base=develop')) {
             return publicationCommandResult(0, JSON.stringify(integrationExists
-              ? [prRecord(91, plan.headBranch, plan.commitSha, 'develop', integrationMerged)]
+              ? [prRecord(
+                91, plan.headBranch, plan.commitSha, 'develop', integrationMerged,
+                integrationBody,
+              )]
               : []))
           }
           if (command.includes('base=main')) {
             return publicationCommandResult(0, JSON.stringify(releaseExists
-              ? [prRecord(92, 'develop', integrationMergeHead, 'main')]
+              ? [prRecord(92, 'develop', integrationMergeHead, 'main', false, releaseBody)]
               : []))
           }
         }
         if (args.includes('POST') && command.includes('/pulls')) {
-          const request = JSON.parse(stdin ?? '{}') as { base?: string, head?: string }
+          const request = JSON.parse(stdin ?? '{}') as {
+            base?: string
+            head?: string
+            body?: string
+          }
           if (request.base === 'develop') {
             expect(request.head).toBe(plan.headBranch)
             integrationExists = true
+            integrationBody = request.body ?? null
           } else if (request.base === 'main') {
             expect(request.head).toBe('develop')
             releaseExists = true
+            releaseBody = request.body ?? null
           } else {
             throw new Error(`unexpected targeted publication PR base: ${request.base}`)
           }
@@ -1730,6 +1744,8 @@ describe('production App Server executor', () => {
     let integrationExists = false
     let integrationMerged = false
     let releaseExists = false
+    let integrationBody: string | null = null
+    let releaseBody: string | null = null
     let integrationMergeRequests = 0
     let releaseMergeRequests = 0
     const prRecord = (
@@ -1738,12 +1754,14 @@ describe('production App Server executor', () => {
       headSha: string,
       baseBranch: string,
       merged = false,
+      body: string | null = null,
     ) => ({
       number,
       html_url: `https://github.com/${plan.repositorySlug}/pull/${number}`,
       state: merged ? 'closed' : 'open',
       merged_at: merged ? '2026-09-01T00:00:00Z' : null,
       merge_commit_sha: merged ? integrationMergeHead : null,
+      body,
       head: {
         ref: headBranch,
         sha: headSha,
@@ -1784,7 +1802,10 @@ describe('production App Server executor', () => {
         if (args.includes('GET')
           && command.endsWith(`repos/${plan.repositorySlug}/pulls/81`)) {
           return publicationCommandResult(0, JSON.stringify({
-            ...prRecord(81, plan.headBranch, plan.commitSha, 'develop'),
+            ...prRecord(
+              81, plan.headBranch, plan.commitSha, 'develop', integrationMerged,
+              integrationBody,
+            ),
             draft: false,
             mergeable: true,
             mergeable_state: 'clean',
@@ -1793,19 +1814,27 @@ describe('production App Server executor', () => {
         if (args.includes('GET') && command.includes('/pulls?')) {
           if (command.includes('base=develop')) {
             return publicationCommandResult(0, JSON.stringify(integrationExists
-              ? [prRecord(81, plan.headBranch, plan.commitSha, 'develop', integrationMerged)]
+              ? [prRecord(
+                81, plan.headBranch, plan.commitSha, 'develop', integrationMerged,
+                integrationBody,
+              )]
               : []))
           }
           if (command.includes('base=main')) {
             return publicationCommandResult(0, JSON.stringify(releaseExists
-              ? [prRecord(82, 'develop', integrationMergeHead, 'main')]
+              ? [prRecord(82, 'develop', integrationMergeHead, 'main', false, releaseBody)]
               : []))
           }
         }
         if (args.includes('POST') && command.includes('/pulls')) {
-          const request = JSON.parse(stdin ?? '{}') as { base?: string }
-          if (request.base === 'develop') integrationExists = true
-          else if (request.base === 'main') releaseExists = true
+          const request = JSON.parse(stdin ?? '{}') as { base?: string, body?: string }
+          if (request.base === 'develop') {
+            integrationExists = true
+            integrationBody = request.body ?? null
+          } else if (request.base === 'main') {
+            releaseExists = true
+            releaseBody = request.body ?? null
+          }
           else throw new Error(`unexpected publication PR base: ${request.base}`)
           return publicationCommandResult(0, '{}')
         }

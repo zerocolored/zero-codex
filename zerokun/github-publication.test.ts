@@ -217,6 +217,7 @@ function exactPullRequestJson(input: {
   state?: 'open' | 'closed'
   mergedAt?: string | null
   mergeCommitSha?: string | null
+  body?: string | null
 }): string {
   return JSON.stringify([{
     number: input.number,
@@ -224,6 +225,7 @@ function exactPullRequestJson(input: {
     state: input.state ?? 'open',
     merged_at: input.mergedAt ?? null,
     merge_commit_sha: input.mergeCommitSha ?? null,
+    ...(input.body !== undefined ? { body: input.body } : {}),
     head: {
       ref: input.plan.headBranch,
       sha: input.plan.commitSha,
@@ -603,7 +605,16 @@ describe('host GitHub publication', () => {
 
   test('実装promotionは共有checkoutを動かさずfeatureをdevelopへmergeしてmain PRを作る', async () => {
     const value = implementedPromotionFixture()
-    const { plan } = value
+    const plan: GitHubPublicationPlan = {
+      ...value.plan,
+      promotion: {
+        ...value.plan.promotion!,
+        waitForChecks: true,
+        integrationPullRequestBody: '## Summary\nreviewed {{COMMIT_SHA}}',
+        followupPullRequestBody: '## Summary\nrelease {{COMMIT_SHA}}',
+        closePullRequestNumbers: [857],
+      },
+    }
     expect(plan).toMatchObject({
       baseBranch: 'develop',
       initialHead: value.developHead,
@@ -635,6 +646,10 @@ describe('host GitHub publication', () => {
     let integrationCreates = 0
     let integrationMerges = 0
     let followupCreates = 0
+    let obsoleteOpen = true
+    let obsoleteCloses = 0
+    let integrationBody: string | null = null
+    let followupBody: string | null = null
     const followupPlan = (): GitHubPublicationPlan => ({
       ...plan,
       baseBranch: 'main',
@@ -679,6 +694,10 @@ describe('host GitHub publication', () => {
           const record = JSON.parse(exactPullRequestJson({
             plan,
             number: 301,
+            state: integrationMerged ? 'closed' : 'open',
+            mergedAt: integrationMerged ? '2026-09-01T00:00:00Z' : null,
+            mergeCommitSha: integrationMerged ? integrationMergeHead : null,
+            body: integrationBody,
           }))[0] as Record<string, unknown>
           return result(0, JSON.stringify({
             ...record,
@@ -686,6 +705,29 @@ describe('host GitHub publication', () => {
             mergeable: true,
             mergeable_state: 'clean',
           }))
+        }
+        if (args.includes('GET')
+          && command.endsWith('repos/example/implemented-promotion/pulls/857')) {
+          return result(0, JSON.stringify({
+            number: 857,
+            html_url: 'https://github.com/example/implemented-promotion/pull/857',
+            state: obsoleteOpen ? 'open' : 'closed',
+            merged_at: null,
+            head: { repo: { full_name: plan.repositorySlug } },
+            base: { repo: { full_name: plan.repositorySlug } },
+          }))
+        }
+        if (args.includes('GET') && command.includes(`/commits/${plan.commitSha}/check-runs`)) {
+          return result(0, JSON.stringify({
+            total_count: 2,
+            check_runs: [
+              { name: 'quality', status: 'completed', conclusion: 'success' },
+              { name: 'security', status: 'completed', conclusion: 'neutral' },
+            ],
+          }))
+        }
+        if (args.includes('GET') && command.includes(`/commits/${plan.commitSha}/status`)) {
+          return result(0, JSON.stringify({ statuses: [] }))
         }
         if (args.includes('GET') && command.includes('/pulls?')) {
           if (command.includes('base=develop')) {
@@ -695,12 +737,14 @@ describe('host GitHub publication', () => {
               state: integrationMerged ? 'closed' : 'open',
               mergedAt: integrationMerged ? '2026-09-01T00:00:00Z' : null,
               mergeCommitSha: integrationMerged ? integrationMergeHead : null,
+              body: integrationBody,
             }) : '[]')
           }
           if (command.includes('base=main')) {
             return result(0, followupExists ? exactPullRequestJson({
               plan: followupPlan(),
               number: 302,
+              body: followupBody,
             }) : '[]')
           }
         }
@@ -709,15 +753,23 @@ describe('host GitHub publication', () => {
           if (request.base === 'develop') {
             integrationCreates += 1
             expect(request.head).toBe(plan.headBranch)
+            integrationBody = request.body
             integrationExists = true
           } else if (request.base === 'main') {
             followupCreates += 1
             expect(integrationMerged).toBe(true)
             expect(request.head).toBe('develop')
+            followupBody = request.body
             followupExists = true
           } else {
             throw new Error(`unexpected implemented-promotion PR base: ${request.base}`)
           }
+          return result(0, '{}')
+        }
+        if (args.includes('PATCH') && command.endsWith('/pulls/857 --input -')) {
+          expect(JSON.parse(stdin ?? '{}')).toEqual({ state: 'closed' })
+          obsoleteCloses += 1
+          obsoleteOpen = false
           return result(0, '{}')
         }
         if (args.includes('PUT') && command.includes('/pulls/301/merge')) {
@@ -734,17 +786,23 @@ describe('host GitHub publication', () => {
       },
     }
 
-    await expect(publishGitHubPlan(plan, commands)).resolves.toMatchObject({
+    const expectedReceipt = {
       pullRequestNumber: 301,
       pullRequestUrl: 'https://github.com/example/implemented-promotion/pull/301',
       followupPullRequestNumber: 302,
       followupPullRequestUrl: 'https://github.com/example/implemented-promotion/pull/302',
-    })
+      closedPullRequestNumbers: [857],
+    }
+    await expect(publishGitHubPlan(plan, commands)).resolves.toMatchObject(expectedReceipt)
+    await expect(publishGitHubPlan(plan, commands)).resolves.toMatchObject(expectedReceipt)
     expect({ integrationCreates, integrationMerges, followupCreates }).toEqual({
       integrationCreates: 1,
       integrationMerges: 1,
       followupCreates: 1,
     })
+    expect({ obsoleteCloses, obsoleteOpen }).toEqual({ obsoleteCloses: 1, obsoleteOpen: false })
+    expect(integrationBody).toBe(`## Summary\nreviewed ${plan.commitSha}`)
+    expect(followupBody).toBe(`## Summary\nrelease ${integrationMergeHead}`)
     expect(git(value.repo, 'branch', '--show-current')).toBe(value.unrelatedBranch)
     expect(git(value.repo, 'rev-parse', 'HEAD')).toBe(value.unrelatedHead)
     expect(git(value.repo, 'status', '--porcelain')).toContain('operator-notes.txt')
@@ -763,6 +821,66 @@ describe('host GitHub publication', () => {
     )).toThrow('not descended from the prepared base commit')
     expect(git(value.repo, 'branch', '--show-current')).toBe(value.unrelatedBranch)
     expect(git(value.repo, 'rev-parse', 'HEAD')).toBe(value.unrelatedHead)
+  })
+
+  test('Codexがchecks待機を選んだPRはcheck登録前のclean表示でもmergeしない', async () => {
+    const value = implementedPromotionFixture('example/check-registration-race')
+    const plan: GitHubPublicationPlan = {
+      ...value.plan,
+      promotion: {
+        ...value.plan.promotion!,
+        waitForChecks: true,
+        integrationPullRequestBody: '## Summary\nwait {{COMMIT_SHA}}',
+        followupPullRequestBody: '## Summary\nrelease {{COMMIT_SHA}}',
+        closePullRequestNumbers: [],
+      },
+    }
+    const body = `## Summary\nwait ${plan.commitSha}`
+    let mergeCalls = 0
+    let checkRuns: Array<Record<string, unknown>> = []
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repo, args) {
+        if (args[0] !== 'ls-remote') throw new Error(`unexpected Git command: ${args.join(' ')}`)
+        const ref = String(args.at(-1))
+        if (ref.endsWith(`/${plan.headBranch}`)) return result(0, `${plan.commitSha}\t${ref}\n`)
+        if (ref.endsWith('/develop')) return result(0, `${value.developHead}\t${ref}\n`)
+        throw new Error(`unexpected remote ref: ${ref}`)
+      },
+      async runGh(args) {
+        const command = args.join(' ')
+        if (args.includes('GET') && command.includes('/pulls?')) {
+          return result(0, exactPullRequestJson({ plan, number: 401, body }))
+        }
+        if (args.includes('GET') && command.endsWith('/pulls/401')) {
+          const record = JSON.parse(exactPullRequestJson({ plan, number: 401, body }))[0]
+          return result(0, JSON.stringify({
+            ...record, draft: false, mergeable: true, mergeable_state: 'clean',
+          }))
+        }
+        if (args.includes('GET') && command.includes('/check-runs')) {
+          return result(0, JSON.stringify({
+            total_count: checkRuns.length,
+            check_runs: checkRuns,
+          }))
+        }
+        if (args.includes('GET') && command.includes('/status?')) {
+          return result(0, JSON.stringify({ statuses: [] }))
+        }
+        if (args.includes('PUT') && command.includes('/merge')) {
+          mergeCalls += 1
+          return result(0, '{}')
+        }
+        throw new Error(`unexpected gh command: ${command}`)
+      },
+    }
+    await expect(publishGitHubPlan(plan, commands)).rejects.toEqual(
+      expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'waiting' }),
+    )
+    checkRuns = [{ name: 'quality', status: 'completed', conclusion: 'failure' }]
+    await expect(publishGitHubPlan(plan, commands)).rejects.toEqual(
+      expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'checks' }),
+    )
+    expect(mergeCalls).toBe(0)
   })
 
   test('review済み実装promotionのsource refが別SHAへ動いた場合は公開を拒否する', () => {

@@ -9310,6 +9310,11 @@ describe('Slack output guard', () => {
     )).toBe(
       '公開可能なreview済みcommitを確認できませんでした。変更は自動公開していません。同じスレッドから再開できます。',
     )
+    expect(publicJobFailureSummary(
+      'Codex-selected GitHub checks failed: quality, screenshot evidence',
+    )).toBe(
+      'Codexがmerge条件に指定したGitHubチェックが失敗したため、mergeせず停止しました。同じスレッドから原因修正を再開できます。',
+    )
     store.close()
   })
 
