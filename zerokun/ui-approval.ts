@@ -17,6 +17,8 @@ import type { AdvisorRepositorySnapshot } from './advisor-snapshot.ts'
 const UI_APPROVAL_MARKER = 'zerokun_ui_approval'
 const UI_RESPONSE_DECISION_MARKER = 'zerokun_ui_response_decision'
 const PREPARATION_SCOPE_MARKER = 'zerokun_repository_scope'
+const PREPARATION_PUBLICATION_MARKER = 'zerokun_publication'
+const PREPARATION_WORK_ACTION_MARKER = 'zerokun_work_action'
 const MAX_UI_APPROVAL_TEXT_CHARS = 4_000
 const MAX_UI_APPROVAL_PNG_BYTES = 16 * 1024 * 1024
 const SCREENSHOT_WIDTH = 1280
@@ -175,10 +177,22 @@ export type UiApprovalProposal = {
   repositoryScope: string[]
 }
 
+export type CodexPublicationIntent = {
+  kind: 'promote-current-head'
+  repository: string
+  baseBranch: string
+  mergePullRequest: true
+  followupBaseBranch: string
+}
+
+export type CodexPreparationWorkAction = 'implement' | 'no-change' | 'promote-current-head'
+
 export type CodexPreparationDecision =
   | {
       kind: 'ready'
       repositoryScope: string[]
+      workAction: CodexPreparationWorkAction
+      publicationIntents?: CodexPublicationIntent[]
       approvalDecision?: UiApprovalSemanticDecision
     }
   | {
@@ -373,6 +387,106 @@ function exactReadyRepositoryScope(
   return { text: value.slice(0, match.index).trim(), repositoryScope }
 }
 
+function exactReadyPublicationIntents(
+  value: string,
+  repositoryScope: readonly string[],
+): { text: string; publicationIntents: CodexPublicationIntent[] } {
+  const pattern = new RegExp(
+    `<${PREPARATION_PUBLICATION_MARKER}>([^\n]+)<\/${PREPARATION_PUBLICATION_MARKER}>\n?$`,
+  )
+  const match = pattern.exec(value)
+  if (!match) {
+    if (new RegExp(`<${PREPARATION_PUBLICATION_MARKER}>`, 'i').test(value)) {
+      throw new Error('Codex publication intent envelope is malformed')
+    }
+    return { text: value.trim(), publicationIntents: [] }
+  }
+  if (new RegExp(`<${PREPARATION_PUBLICATION_MARKER}>`, 'g').test(value.slice(0, match.index))) {
+    throw new Error('Codex duplicated its publication intent envelope')
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(match[1]!) } catch {
+    throw new Error('Codex publication intent is invalid JSON')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Codex publication intent must be an object')
+  }
+  const record = parsed as Record<string, unknown>
+  if (Object.keys(record).join(',') !== 'promotions' || !Array.isArray(record.promotions)
+    || record.promotions.length === 0 || record.promotions.length > repositoryScope.length) {
+    throw new Error('Codex publication intent is invalid')
+  }
+  const publicationIntents = record.promotions.map(value => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('Codex publication promotion is invalid')
+    }
+    const promotion = value as Record<string, unknown>
+    const expectedKeys = [
+      'baseBranch', 'followupBaseBranch', 'kind', 'mergePullRequest', 'repository',
+    ]
+    if (Object.keys(promotion).sort().join(',') !== expectedKeys.sort().join(',')
+      || promotion.kind !== 'promote-current-head'
+      || typeof promotion.repository !== 'string'
+      || !repositoryScope.includes(promotion.repository)
+      || typeof promotion.baseBranch !== 'string'
+      || typeof promotion.followupBaseBranch !== 'string'
+      || promotion.mergePullRequest !== true
+      || promotion.baseBranch === promotion.followupBaseBranch
+      || [promotion.baseBranch, promotion.followupBaseBranch].some(branch => (
+        !branch || Buffer.byteLength(branch) > 255 || /[\0\r\n]/.test(branch)
+      ))) {
+      throw new Error('Codex publication promotion is invalid')
+    }
+    return promotion as CodexPublicationIntent
+  })
+  const repositories = publicationIntents.map(intent => intent.repository)
+  if (new Set(repositories).size !== repositories.length
+    || JSON.stringify(repositories) !== JSON.stringify([...repositories].sort())
+    || JSON.stringify(repositories) !== JSON.stringify([...repositoryScope])) {
+    throw new Error(
+      'publication-only promotion must bind every selected repository exactly once',
+    )
+  }
+  return {
+    text: value.slice(0, match.index).trim(),
+    publicationIntents,
+  }
+}
+
+function exactReadyWorkAction(value: string): {
+  text: string
+  workAction: CodexPreparationWorkAction
+} {
+  const pattern = new RegExp(
+    `<${PREPARATION_WORK_ACTION_MARKER}>([^\n]+)<\/${PREPARATION_WORK_ACTION_MARKER}>\n?$`,
+  )
+  const match = pattern.exec(value)
+  if (!match) {
+    throw new Error('Codex preparation omitted its exact work action envelope')
+  }
+  if (new RegExp(`<${PREPARATION_WORK_ACTION_MARKER}>`, 'g').test(
+    value.slice(0, match.index),
+  )) {
+    throw new Error('Codex preparation duplicated its work action envelope')
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(match[1]!) } catch {
+    throw new Error('Codex preparation work action is invalid JSON')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Codex preparation work action must be an object')
+  }
+  const record = parsed as Record<string, unknown>
+  if (Object.keys(record).join(',') !== 'kind'
+    || !['implement', 'no-change', 'promote-current-head'].includes(String(record.kind))) {
+    throw new Error('Codex preparation work action is invalid')
+  }
+  return {
+    text: value.slice(0, match.index).trim(),
+    workAction: record.kind as CodexPreparationWorkAction,
+  }
+}
+
 export function parseCodexPreparationDecision(
   value: string,
   attemptNonce: string,
@@ -454,6 +568,12 @@ export function parseCodexPreparationDecision(
     }
     const beforeReady = normalized.slice(0, normalized.length - ready.length).trimEnd()
     const scoped = exactReadyRepositoryScope(beforeReady, availableRepositories)
+    const publication = exactReadyPublicationIntents(scoped.text, scoped.repositoryScope)
+    const work = exactReadyWorkAction(publication.text)
+    if ((work.workAction === 'promote-current-head')
+      !== (publication.publicationIntents.length > 0)) {
+      throw new Error('Codex preparation work action conflicts with its publication intent')
+    }
     if (approval?.context.repositoryScope) {
       const readyScope = new Set(scoped.repositoryScope)
       if (approval.context.repositoryScope.some(repository => !readyScope.has(repository))) {
@@ -463,6 +583,10 @@ export function parseCodexPreparationDecision(
     return {
       kind: 'ready',
       repositoryScope: scoped.repositoryScope,
+      workAction: work.workAction,
+      ...(publication.publicationIntents.length > 0
+        ? { publicationIntents: publication.publicationIntents }
+        : {}),
       ...(approvalDecision ? { approvalDecision } : {}),
     }
   }

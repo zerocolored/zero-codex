@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { createHash } from 'crypto'
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -9,6 +10,7 @@ import {
   gitHubPublicationBaselineDigest,
   GitHubPublicationError,
   prepareGitHubPublicationPlans,
+  prepareGitHubPromotionPlans,
   publishGitHubPlan,
   type GitHubPublicationCommands,
   type GitHubPublicationPlan,
@@ -58,6 +60,10 @@ function publicationFixture(slug = 'example/demo'): {
   git(repo, 'config', 'user.email', 'zero@example.invalid')
   git(repo, 'config', 'user.name', 'Zero Test')
   git(repo, 'config', 'remote.origin.url', `https://github.com/${slug}.git`)
+  // Real projects commonly install Husky this way. Host publication disables
+  // hooks independently, so this repository-owned value must not block the
+  // baseline while still remaining pinned by the local-config digest.
+  git(repo, 'config', 'core.hooksPath', '.husky/_')
   writeFileSync(join(repo, 'README.md'), 'initial\n')
   git(repo, 'add', 'README.md')
   git(repo, 'commit', '-m', 'chore: initial')
@@ -124,6 +130,31 @@ function pullRequestJson(
   }])
 }
 
+function exactPullRequestJson(input: {
+  plan: GitHubPublicationPlan
+  number: number
+  state?: 'open' | 'closed'
+  mergedAt?: string | null
+  mergeCommitSha?: string | null
+}): string {
+  return JSON.stringify([{
+    number: input.number,
+    html_url: `https://github.com/${input.plan.repositorySlug}/pull/${input.number}`,
+    state: input.state ?? 'open',
+    merged_at: input.mergedAt ?? null,
+    merge_commit_sha: input.mergeCommitSha ?? null,
+    head: {
+      ref: input.plan.headBranch,
+      sha: input.plan.commitSha,
+      repo: { full_name: input.plan.repositorySlug },
+    },
+    base: {
+      ref: input.plan.baseBranch,
+      repo: { full_name: input.plan.repositorySlug },
+    },
+  }])
+}
+
 describe('host GitHub publication', () => {
   test('起動前login確認は既存gh認証だけを読み、認証操作を開始しない', async () => {
     const calls: string[][] = []
@@ -143,6 +174,34 @@ describe('host GitHub publication', () => {
     })).rejects.toEqual(expect.objectContaining<Partial<GitHubPublicationError>>({
       category: 'authentication',
     }))
+  })
+
+  test('HuskyのhooksPathは許容し、baseline後の値変更は公開計画を無効化する', () => {
+    const { repo, plan } = publicationFixture('example/husky')
+    expect(git(repo, 'config', '--local', 'core.hooksPath')).toBe('.husky/_')
+    expect(plan.repositorySlug).toBe('example/husky')
+
+    git(repo, 'config', 'core.hooksPath', '.config/husky/_')
+    expect(() => prepareGitHubPublicationPlans({
+      version: 1,
+      projectPath: repo,
+      repositories: [{
+        gitRoot: repo,
+        initialHead: plan.initialHead,
+        baseBranch: plan.baseBranch,
+        statusDigest: plan.statusDigest,
+        localConfigDigest: plan.localConfigDigest,
+        originUrlDigest: plan.originUrlDigest,
+        remote: {
+          owner: 'example',
+          repository: 'husky',
+          slug: 'example/husky',
+          canonicalUrl: 'https://github.com/example/husky.git',
+        },
+      }],
+    }, ['.'], undefined, plan.headBranch)).toThrow(
+      'repository config, origin, or uncommitted state changed',
+    )
   })
 
   test('review済みSHAとhost指定branchだけをclean repositoryから計画する', () => {
@@ -179,6 +238,509 @@ describe('host GitHub publication', () => {
     )).toThrow('host-assigned publication branch')
   })
 
+  test('既存commitをdevelopへ統合した後だけdevelopからmainへのrelease PRを冪等作成する', async () => {
+    const repo = join(fixtureDir(), 'promotion')
+    mkdirSync(repo)
+    git(repo, 'init', '--initial-branch=main')
+    git(repo, 'config', 'user.email', 'zero@example.invalid')
+    git(repo, 'config', 'user.name', 'Zero Test')
+    git(repo, 'config', 'remote.origin.url', 'https://github.com/example/promotion.git')
+    git(repo, 'config', 'core.hooksPath', '.husky/_')
+    writeFileSync(join(repo, 'README.md'), 'initial\n')
+    git(repo, 'add', 'README.md')
+    git(repo, 'commit', '-m', 'chore: initial')
+    git(repo, 'switch', '-c', 'feature/reviewed-ui')
+    writeFileSync(join(repo, 'README.md'), 'reviewed UI\n')
+    git(repo, 'commit', '-am', 'feat: reviewed UI')
+    const sourceHead = git(repo, 'rev-parse', 'HEAD')
+    const baseline = captureGitHubPublicationBaseline(repo, [repo])
+    const developInitial = 'a'.repeat(40)
+    const mainInitial = 'b'.repeat(40)
+    const promotedDevelop = 'c'.repeat(40)
+    const branch = 'zerochan/promotion0123456789'
+    const remoteHeads = new Map<string, string | null>([
+      [branch, null],
+      ['develop', developInitial],
+      ['main', mainInitial],
+    ])
+    let integrationExists = false
+    let integrationMerged = false
+    let releaseExists = false
+    let pushes = 0
+    let integrationCreates = 0
+    let mergeAttempts = 0
+    let releaseCreates = 0
+    let failReleaseLookupOnce = true
+    let readinessChecks = 0
+    const integrationPlan = (): GitHubPublicationPlan => plan
+    const releasePlan = (): GitHubPublicationPlan => ({
+      ...plan,
+      baseBranch: 'main',
+      headBranch: 'develop',
+      commitSha: remoteHeads.get('develop')!,
+      initialHead: mainInitial,
+      promotion: undefined,
+    })
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repository, args) {
+        if (args[0] === 'ls-remote') {
+          const ref = String(args.at(-1))
+          const branchName = ref.replace(/^refs\/heads\//, '')
+          const head = remoteHeads.get(branchName) ?? null
+          return result(0, head ? `${head}\t${ref}\n` : '')
+        }
+        if (args[0] === 'push') {
+          pushes += 1
+          expect(args).toContain('--no-verify')
+          remoteHeads.set(branch, sourceHead)
+          return result(1, '', 'connection reset after request', true)
+        }
+        throw new Error(`unexpected git command: ${args.join(' ')}`)
+      },
+      async runGh(args, stdin) {
+        const command = args.join(' ')
+        if (command.includes('/compare/')) {
+          const prepared = /\/compare\/([0-9a-f]+)\.\.\./.exec(command)?.[1]
+          if (!prepared) throw new Error(`invalid compare request: ${command}`)
+          return result(0, JSON.stringify({
+            status: 'ahead', ahead_by: 1, behind_by: 0,
+            base_commit: { sha: prepared },
+            merge_base_commit: { sha: prepared },
+          }))
+        }
+        if (args.includes('GET') && command.endsWith('repos/example/promotion')) {
+          return result(0, JSON.stringify({
+            allow_squash_merge: true,
+            allow_merge_commit: false,
+            allow_rebase_merge: false,
+          }))
+        }
+        if (args.includes('GET') && command.endsWith('repos/example/promotion/pulls/71')) {
+          readinessChecks += 1
+          const record = JSON.parse(exactPullRequestJson({
+            plan: integrationPlan(),
+            number: 71,
+          }))[0] as Record<string, unknown>
+          return result(0, JSON.stringify({
+            ...record,
+            draft: false,
+            mergeable: readinessChecks > 1,
+            mergeable_state: readinessChecks > 1 ? 'clean' : 'blocked',
+          }))
+        }
+        if (args.includes('GET') && command.includes('/pulls?')) {
+          if (command.includes('base=develop')) {
+            return result(0, integrationExists ? exactPullRequestJson({
+              plan: integrationPlan(),
+              number: 71,
+              state: integrationMerged ? 'closed' : 'open',
+              mergedAt: integrationMerged ? '2026-09-01T00:00:00Z' : null,
+              mergeCommitSha: integrationMerged ? promotedDevelop : null,
+            }) : '[]')
+          }
+          if (command.includes('base=main')) {
+            if (integrationMerged && failReleaseLookupOnce) {
+              failReleaseLookupOnce = false
+              return result(1, '', 'network is unreachable')
+            }
+            return result(0, releaseExists ? exactPullRequestJson({
+              plan: releasePlan(), number: 72,
+            }) : '[]')
+          }
+        }
+        if (args.includes('POST') && command.includes('/pulls')) {
+          const request = JSON.parse(stdin ?? '{}') as Record<string, string>
+          if (request.base === 'develop') {
+            integrationCreates += 1
+            expect(request.head).toBe(branch)
+            integrationExists = true
+          } else if (request.base === 'main') {
+            releaseCreates += 1
+            expect(integrationMerged).toBe(true)
+            expect(request.head).toBe('develop')
+            releaseExists = true
+          } else throw new Error(`unexpected PR base: ${request.base}`)
+          return result(1, '', 'timeout after request', true)
+        }
+        if (args.includes('PUT') && command.includes('/pulls/71/merge')) {
+          mergeAttempts += 1
+          expect(JSON.parse(stdin ?? '{}')).toMatchObject({
+            sha: sourceHead,
+            merge_method: 'squash',
+          })
+          integrationMerged = true
+          remoteHeads.set('develop', promotedDevelop)
+          return result(1, '', 'timeout after request', true)
+        }
+        throw new Error(`unexpected gh command: ${command}`)
+      },
+    }
+    const [plan] = await prepareGitHubPromotionPlans(
+      baseline,
+      [{ gitRoot: realpathSync(repo), baseBranch: 'develop', followupBaseBranch: 'main' }],
+      branch,
+      commands,
+    )
+    expect(plan).toMatchObject({
+      baseBranch: 'develop',
+      headBranch: branch,
+      commitSha: sourceHead,
+      promotion: {
+        sourceBranch: 'feature/reviewed-ui',
+        sourceHead,
+        followupBaseBranch: 'main',
+      },
+    })
+
+    await expect(publishGitHubPlan(plan!, commands)).rejects.toEqual(
+      expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'waiting' }),
+    )
+    expect(mergeAttempts).toBe(0)
+    await expect(publishGitHubPlan(plan!, commands)).rejects.toEqual(
+      expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'network' }),
+    )
+    const first = await publishGitHubPlan(plan!, commands)
+    expect(first).toMatchObject({
+      pullRequestNumber: 71,
+      pullRequestUrl: 'https://github.com/example/promotion/pull/71',
+      followupPullRequestNumber: 72,
+      followupPullRequestUrl: 'https://github.com/example/promotion/pull/72',
+    })
+    const second = await publishGitHubPlan(plan!, commands)
+    expect(second).toEqual(first)
+    remoteHeads.set('develop', 'd'.repeat(40))
+    const afterOrdinaryDevelopAdvance = await publishGitHubPlan(plan!, commands)
+    expect(afterOrdinaryDevelopAdvance).toEqual(first)
+    expect({ pushes, integrationCreates, mergeAttempts, releaseCreates }).toEqual({
+      pushes: 1,
+      integrationCreates: 1,
+      mergeAttempts: 1,
+      releaseCreates: 1,
+    })
+
+    const dbPath = join(fixtureDir(), 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const queued = store.enqueue({
+      chatId: 'C0123456789', threadTs: '1900000000.000150',
+      messageId: '1900000000.000150', userId: 'U0123456789',
+      repoPath: repo, task: 'developへ適用してmain向けPRを作成', writeEnabled: true,
+    }).job
+    const running = store.claimNext('promotion-publisher')!
+    const input = readAdvisorInputSnapshot(dirname(dbPath), running.id)
+    store.ensureExecutionResultStaged(
+      running.id,
+      'session-promotion',
+      'レビューが完了しました。',
+      {
+        version: 1,
+        jobId: running.id,
+        jobAttempt: running.attempts,
+        logicalNonce: 'c'.repeat(32),
+        inputRevision: input.revision,
+        inputDigest: input.digest,
+        reviewRound: 1,
+        reviewedRepositoryDigest: createHash('sha256').update('promotion-review').digest('hex'),
+        baselineDigest: gitHubPublicationBaselineDigest(baseline),
+        plans: [plan!],
+      },
+    )
+    store.close()
+    const legacy = new Database(dbPath)
+    legacy.exec(`
+      PRAGMA foreign_keys=ON;
+      INSERT INTO github_publications SELECT * FROM github_promotion_publications;
+      DELETE FROM github_promotion_publications;
+    `)
+    legacy.close()
+    store = new JobStore(dbPath)
+    expect(store.pendingGitHubPublications(queued.id)).toHaveLength(1)
+    store.recordGitHubPublicationReceipt(queued.id, plan!, first)
+    expect(store.completeGitHubPublicationSet(queued.id)).toBe(true)
+    store.completeStagedExecution(queued.id)
+    expect(store.get(queued.id)?.result).toContain(
+      'https://github.com/example/promotion/pull/71',
+    )
+    expect(store.get(queued.id)?.result).toContain(
+      'https://github.com/example/promotion/pull/72',
+    )
+    store.close()
+
+    const cancelledDb = join(fixtureDir(), 'jobs.sqlite3')
+    const cancelledStore = new JobStore(cancelledDb)
+    const cancelled = cancelledStore.enqueue({
+      chatId: 'C0123456789', threadTs: '1900000000.000250',
+      messageId: '1900000000.000250', userId: 'U0123456789',
+      repoPath: repo, task: '公開を中止できること', writeEnabled: true,
+    }).job
+    const cancelledRunning = cancelledStore.claimNext('promotion-cancel')!
+    const cancelledInput = readAdvisorInputSnapshot(dirname(cancelledDb), cancelledRunning.id)
+    cancelledStore.ensureExecutionResultStaged(
+      cancelledRunning.id,
+      'session-promotion-cancel',
+      '公開待機中です。',
+      {
+        version: 1,
+        jobId: cancelledRunning.id,
+        jobAttempt: cancelledRunning.attempts,
+        logicalNonce: 'd'.repeat(32),
+        inputRevision: cancelledInput.revision,
+        inputDigest: cancelledInput.digest,
+        reviewRound: 1,
+        reviewedRepositoryDigest: createHash('sha256').update('cancel-review').digest('hex'),
+        baselineDigest: gitHubPublicationBaselineDigest(baseline),
+        plans: [plan!],
+      },
+    )
+    const target = cancelledStore.liveControlTarget(
+      cancelledRunning.chatId,
+      cancelledRunning.threadTs,
+    )!
+    expect(cancelledStore.stageLiveControl(target, {
+      chatId: cancelledRunning.chatId,
+      threadTs: cancelledRunning.threadTs,
+      messageId: '1900000000.000251',
+      userId: 'U0123456789',
+      task: 'やめて',
+      kind: 'interrupt',
+    })).toBe('staged')
+    expect(cancelledStore.pendingGitHubPublicationJobIds()).toEqual([])
+    let externalCalls = 0
+    await expect(publishStagedGitHubPublication(
+      cancelledStore,
+      cancelled.id,
+      {
+        commands: {
+          async runGit() { externalCalls += 1; return result(0) },
+          async runGh() { externalCalls += 1; return result(0) },
+        },
+        retryMsForTesting: 1,
+      },
+    )).rejects.toMatchObject({ name: 'CodexUserCancelledError' })
+    expect(externalCalls).toBe(0)
+    cancelledStore.close()
+  })
+
+  test('remote mutation中のcancelは確定receiptを保存してから停止する', async () => {
+    const { repo, plan, baselineDigest } = publicationFixture('example/cancel-boundary')
+    const dbPath = join(fixtureDir(), 'jobs.sqlite3')
+    const store = new JobStore(dbPath)
+    const queued = store.enqueue({
+      chatId: 'C0123456789', threadTs: '1900000000.000350',
+      messageId: '1900000000.000350', userId: 'U0123456789',
+      repoPath: repo, task: '変更を公開して', writeEnabled: true,
+    }).job
+    const running = store.claimNext('cancel-boundary')!
+    const input = readAdvisorInputSnapshot(dirname(dbPath), running.id)
+    store.ensureExecutionResultStaged(running.id, 'cancel-boundary-session', '完了しました。', {
+      version: 1,
+      jobId: running.id,
+      jobAttempt: running.attempts,
+      logicalNonce: 'e'.repeat(32),
+      inputRevision: input.revision,
+      inputDigest: input.digest,
+      reviewRound: 1,
+      reviewedRepositoryDigest: createHash('sha256').update('cancel-boundary').digest('hex'),
+      baselineDigest,
+      plans: [plan],
+    })
+    const target = store.liveControlTarget(running.chatId, running.threadTs)!
+    let remoteHead: string | null = null
+    let pullRequestExists = false
+    let pushes = 0
+    let creates = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit(repository, args) {
+        if (args[0] === 'ls-remote') {
+          const ref = String(args.at(-1))
+          if (ref === `refs/heads/${plan.baseBranch}`) {
+            return result(0, `${plan.initialHead}\t${ref}\n`)
+          }
+          return result(0, remoteHead ? `${remoteHead}\t${ref}\n` : '')
+        }
+        if (args[0] === 'push') {
+          pushes += 1
+          remoteHead = plan.commitSha
+          return result(0)
+        }
+        return localGitCommand(repository, args)
+      },
+      async runGh(args) {
+        if (args.includes('GET')) {
+          return result(0, pullRequestExists ? pullRequestJson(plan, 81) : '[]')
+        }
+        if (args.includes('POST')) {
+          creates += 1
+          pullRequestExists = true
+          expect(store.stageLiveControl(target, {
+            chatId: running.chatId,
+            threadTs: running.threadTs,
+            messageId: '1900000000.000351',
+            userId: running.userId,
+            task: 'やめて',
+            kind: 'interrupt',
+          })).toBe('staged')
+          return result(1, '', 'timeout after request', true)
+        }
+        throw new Error(`unexpected gh command: ${args.join(' ')}`)
+      },
+    }
+
+    await expect(publishStagedGitHubPublication(store, queued.id, {
+      commands,
+      retryMsForTesting: 1,
+    })).rejects.toMatchObject({ name: 'CodexUserCancelledError' })
+    expect({ pushes, creates }).toEqual({ pushes: 1, creates: 1 })
+    expect(store.pendingGitHubPublications(queued.id)).toEqual([])
+    expect(store.githubPublicationReceipts(queued.id)).toEqual([
+      expect.objectContaining({ pullRequestNumber: 81 }),
+    ])
+    store.close()
+  })
+
+  test('promotion中のcancelはsubstep receiptを保存し次のremote mutation前に停止する', async () => {
+    const repo = join(fixtureDir(), 'promotion-cancel')
+    mkdirSync(repo)
+    git(repo, 'init', '--initial-branch=main')
+    git(repo, 'config', 'user.email', 'zero@example.invalid')
+    git(repo, 'config', 'user.name', 'Zero Test')
+    git(repo, 'config', 'remote.origin.url', 'https://github.com/example/promotion-cancel.git')
+    writeFileSync(join(repo, 'README.md'), 'initial\n')
+    git(repo, 'add', 'README.md')
+    git(repo, 'commit', '-m', 'chore: initial')
+    git(repo, 'switch', '-c', 'feature/reviewed')
+    writeFileSync(join(repo, 'README.md'), 'reviewed\n')
+    git(repo, 'commit', '-am', 'feat: reviewed')
+    const sourceHead = git(repo, 'rev-parse', 'HEAD')
+    const baseline = captureGitHubPublicationBaseline(repo, [repo])
+    const initial = baseline.repositories[0]!
+    const developInitial = 'a'.repeat(40)
+    const mainInitial = 'b'.repeat(40)
+    const headBranch = 'zerochan/cancel0123456789'
+    const plan: GitHubPublicationPlan = {
+      version: 1,
+      gitRoot: initial.gitRoot,
+      repositorySlug: initial.remote.slug,
+      canonicalUrl: initial.remote.canonicalUrl,
+      baseBranch: 'develop',
+      headBranch,
+      commitSha: sourceHead,
+      initialHead: developInitial,
+      statusDigest: initial.statusDigest,
+      localConfigDigest: initial.localConfigDigest,
+      originUrlDigest: initial.originUrlDigest,
+      title: 'feat: reviewed',
+      promotion: {
+        version: 1,
+        sourceBranch: 'feature/reviewed',
+        sourceHead,
+        followupBaseBranch: 'main',
+        followupInitialHead: mainInitial,
+      },
+    }
+    const dbPath = join(fixtureDir(), 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const queued = store.enqueue({
+      chatId: 'C0123456789', threadTs: '1900000000.000450',
+      messageId: '1900000000.000450', userId: 'U0123456789',
+      repoPath: repo, task: 'developへ適用しdevelopからmainへのPRを作って', writeEnabled: true,
+    }).job
+    const running = store.claimNext('promotion-cancel-boundary')!
+    const input = readAdvisorInputSnapshot(dirname(dbPath), running.id)
+    store.ensureExecutionResultStaged(running.id, 'promotion-cancel-session', '公開します。', {
+      version: 1,
+      jobId: running.id,
+      jobAttempt: running.attempts,
+      logicalNonce: 'f'.repeat(32),
+      inputRevision: input.revision,
+      inputDigest: input.digest,
+      reviewRound: 1,
+      reviewedRepositoryDigest: createHash('sha256').update('promotion-cancel').digest('hex'),
+      baselineDigest: gitHubPublicationBaselineDigest(baseline),
+      plans: [plan],
+    })
+    const target = store.liveControlTarget(running.chatId, running.threadTs)!
+    let remoteHead: string | null = null
+    let integrationExists = false
+    let pushes = 0
+    let integrationCreates = 0
+    let mergeAttempts = 0
+    let followupCreates = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repository, args) {
+        if (args[0] === 'ls-remote') {
+          const ref = String(args.at(-1))
+          if (ref === 'refs/heads/develop') return result(0, `${developInitial}\t${ref}\n`)
+          if (ref === 'refs/heads/main') return result(0, `${mainInitial}\t${ref}\n`)
+          return result(0, remoteHead ? `${remoteHead}\t${ref}\n` : '')
+        }
+        if (args[0] === 'push') {
+          pushes += 1
+          remoteHead = sourceHead
+          return result(1, '', 'connection reset after request', true)
+        }
+        throw new Error(`unexpected git command: ${args.join(' ')}`)
+      },
+      async runGh(args, stdin) {
+        const command = args.join(' ')
+        if (command.includes('/compare/')) {
+          const prepared = /\/compare\/([0-9a-f]+)\.\.\./.exec(command)?.[1]
+          return result(0, JSON.stringify({
+            status: 'ahead', ahead_by: 1, behind_by: 0,
+            base_commit: { sha: prepared }, merge_base_commit: { sha: prepared },
+          }))
+        }
+        if (args.includes('GET') && command.includes('/pulls?')) {
+          return result(0, integrationExists ? pullRequestJson(plan, 91) : '[]')
+        }
+        if (args.includes('POST') && command.includes('/pulls')) {
+          const request = JSON.parse(stdin ?? '{}') as Record<string, string>
+          if (request.base === 'develop') {
+            integrationCreates += 1
+            integrationExists = true
+            expect(store.stageLiveControl(target, {
+              chatId: running.chatId,
+              threadTs: running.threadTs,
+              messageId: '1900000000.000451',
+              userId: running.userId,
+              task: 'やめて',
+              kind: 'interrupt',
+            })).toBe('staged')
+            return result(1, '', 'timeout after request', true)
+          }
+          followupCreates += 1
+          return result(0)
+        }
+        if (args.includes('PUT') && command.includes('/merge')) {
+          mergeAttempts += 1
+          return result(0)
+        }
+        throw new Error(`unexpected gh command: ${command}`)
+      },
+    }
+
+    await expect(publishStagedGitHubPublication(store, queued.id, {
+      commands,
+      retryMsForTesting: 1,
+    })).rejects.toMatchObject({ name: 'CodexUserCancelledError' })
+    expect({ pushes, integrationCreates, mergeAttempts, followupCreates }).toEqual({
+      pushes: 1,
+      integrationCreates: 1,
+      mergeAttempts: 0,
+      followupCreates: 0,
+    })
+    expect(store.githubPromotionCheckpoint(queued.id, plan)).toEqual({
+      version: 1,
+      kind: 'integration-pr',
+      pullRequestNumber: 91,
+      pullRequestUrl: 'https://github.com/example/promotion-cancel/pull/91',
+    })
+    expect(store.pendingGitHubPublications(queued.id)).toHaveLength(1)
+    store.close()
+    store = new JobStore(dbPath)
+    expect(store.githubPromotionCheckpoint(queued.id, plan)?.kind).toBe('integration-pr')
+    store.close()
+  })
+
   test('push/PR作成の応答消失後もremote receiptを再照合して重複送信しない', async () => {
     const { plan } = publicationFixture()
     let remoteHead: string | null = null
@@ -196,6 +758,7 @@ describe('host GitHub publication', () => {
         }
         if (args[0] === 'push') {
           pushes += 1
+          expect(args).toContain('--no-verify')
           remoteHead = plan.commitSha
           return result(1, '', 'connection reset after request', true)
         }
@@ -442,6 +1005,96 @@ describe('host GitHub publication', () => {
       pullRequestNumber: 31,
     })
     expect(git(plan.gitRoot, 'branch', '--show-current')).toBe(plan.baseBranch)
+  })
+
+  test('base ancestry APIの通信失敗を競合へ誤分類しない', async () => {
+    const { plan } = publicationFixture('example/compare-network')
+    const remoteBase = 'd'.repeat(40)
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repository, args) {
+        const ref = String(args.at(-1))
+        if (ref === `refs/heads/${plan.baseBranch}`) {
+          return result(0, `${remoteBase}\t${ref}\n`)
+        }
+        return result(0, `${plan.commitSha}\t${ref}\n`)
+      },
+      async runGh(args) {
+        const command = args.join(' ')
+        if (command.includes('/pulls?')) return result(0, '[]')
+        if (command.includes('/compare/')) {
+          return result(1, '', 'network is unreachable', true)
+        }
+        throw new Error(`unexpected gh command: ${command}`)
+      },
+    }
+    await expect(publishGitHubPlan(plan, commands)).rejects.toEqual(
+      expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'network' }),
+    )
+  })
+
+  test('merge queue必須repositoryはauto queueへ登録して待機する', async () => {
+    const { plan: ordinary } = publicationFixture('example/merge-queue')
+    const plan: GitHubPublicationPlan = {
+      ...ordinary,
+      baseBranch: 'develop',
+      initialHead: 'a'.repeat(40),
+      promotion: {
+        version: 1,
+        sourceBranch: 'feature/reviewed',
+        sourceHead: ordinary.commitSha,
+        followupBaseBranch: 'main',
+        followupInitialHead: 'b'.repeat(40),
+      },
+    }
+    let queueEnrollments = 0
+    const integrationRecord = JSON.parse(exactPullRequestJson({
+      plan,
+      number: 91,
+    }))[0] as Record<string, unknown>
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repository, args) {
+        const ref = String(args.at(-1))
+        const sha = ref === `refs/heads/${plan.baseBranch}`
+          ? plan.initialHead
+          : plan.commitSha
+        return result(0, `${sha}\t${ref}\n`)
+      },
+      async runGh(args) {
+        const command = args.join(' ')
+        if (command.includes('/pulls?')) {
+          return result(0, JSON.stringify([integrationRecord]))
+        }
+        if (args.includes('GET') && command.endsWith('/pulls/91')) {
+          return result(0, JSON.stringify({
+            ...integrationRecord,
+            draft: false,
+            mergeable: true,
+            mergeable_state: 'clean',
+          }))
+        }
+        if (args.includes('GET') && command.endsWith('repos/example/merge-queue')) {
+          return result(0, JSON.stringify({
+            allow_merge_commit: true,
+            allow_squash_merge: true,
+            allow_rebase_merge: true,
+          }))
+        }
+        if (args.includes('PUT') && command.includes('/pulls/91/merge')) {
+          return result(1, '', 'base branch requires all merges through the merge queue')
+        }
+        if (args[0] === 'pr' && args[1] === 'merge') {
+          queueEnrollments += 1
+          expect(args).toContain('--auto')
+          expect(args).toContain('--match-head-commit')
+          return result(0, 'queued')
+        }
+        throw new Error(`unexpected gh command: ${command}`)
+      },
+    }
+    await expect(publishGitHubPlan(plan, commands)).rejects.toEqual(
+      expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'waiting' }),
+    )
+    expect(queueEnrollments).toBe(1)
   })
 
   test('merged PR receiptはhead branch削除後もlocal checkoutへ依存せず復元する', async () => {

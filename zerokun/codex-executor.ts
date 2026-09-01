@@ -112,6 +112,7 @@ import {
   readAdvisorInputSnapshot,
   writeAuthorizedImplementationInput,
   activeWriteInputDigest,
+  type AdvisorInputEntry,
   type AdvisorInputSnapshot,
 } from './advisor-input.ts'
 import {
@@ -133,6 +134,8 @@ import {
   buildUiApprovalSemanticDecisionTemplate,
   parseCodexPreparationDecision,
   verifyUiApprovalBrowserReceipts,
+  type CodexPublicationIntent,
+  type CodexPreparationWorkAction,
   type UiApprovalResumeContext,
 } from './ui-approval.ts'
 import {
@@ -150,11 +153,17 @@ import {
 } from './thread-history.ts'
 import {
   assertGitHubPublicationSet,
+  assertGitHubPublicationPlan,
   captureGitHubPublicationBaseline,
+  createHostGitHubPublicationCommands,
   extendGitHubPublicationBaseline,
   gitHubPublicationBaselineDigest,
+  GitHubPublicationError,
   prepareGitHubPublicationPlans,
+  prepareGitHubPromotionPlans,
+  type GitHubPublicationCommands,
   type GitHubPublicationBaseline,
+  type GitHubPublicationPlan,
   type GitHubPublicationSet,
 } from './github-publication.ts'
 
@@ -3058,6 +3067,12 @@ export function threadHistoryForPhysicalSession(
   return resumed ? undefined : snapshot
 }
 
+const SLACK_PUBLIC_PROSE_GUIDANCE = [
+  'In user-visible Slack prose, never print local absolute paths or narrate that a path was',
+  'redacted/omitted. Refer to the item by its semantic role instead, such as 対象画面、対象リポジトリ、',
+  '対象ファイル、or 関連設定. Relative repository names and public GitHub URLs may be shown.',
+].join(' ')
+
 export function buildCodexWorkerPrompt(
   job: JobRecord,
   input?: Pick<AdvisorInputSnapshot, 'revision' | 'digest' | 'transcript'>,
@@ -3142,6 +3157,7 @@ export function buildCodexWorkerPrompt(
       )
     }
   }
+  control.push(SLACK_PUBLIC_PROSE_GUIDANCE)
   control.push('--- end Zero host control ---')
   return [base, ...control].join('\n')
 }
@@ -3159,6 +3175,8 @@ export function buildCodexPhasePrompt(
   threadHistory?: DurableThreadHistorySnapshot,
   repositoryIdentifiers: readonly string[] = ['.'],
   implementationRepositoryScope?: readonly string[],
+  publicationOnlyPlans?: readonly GitHubPublicationPlan[],
+  reviewWorkAction?: CodexPreparationWorkAction,
 ): string {
   if (!/^[0-9a-f]{32}$/.test(attemptNonce ?? '')) {
     throw new Error('host phase prompt requires the logical attempt nonce')
@@ -3195,6 +3213,38 @@ export function buildCodexPhasePrompt(
       'preserve them, do not edit them, and do not request fixes for them in review.',
     )
   }
+  if (publicationOnlyPlans) {
+    if (stage !== 'review' || publicationOnlyPlans.length === 0
+      || publicationOnlyPlans.some(plan => !plan.promotion)) {
+      throw new Error('host phase publication-only review binding is invalid')
+    }
+    host.push(
+      'Host-bound publication-only workflow: no product implementation phase was required.',
+      'Review each exact current checkout commit and its intended ordered branch promotion:',
+      ...publicationOnlyPlans.map(plan => JSON.stringify({
+        repository: plan.repositorySlug,
+        sourceBranch: plan.promotion!.sourceBranch,
+        sourceHead: plan.promotion!.sourceHead,
+        integrationBase: plan.baseBranch,
+        integrationBaseHead: plan.initialHead,
+        releaseBase: plan.promotion!.followupBaseBranch,
+        releaseBaseHead: plan.promotion!.followupInitialHead,
+      })),
+      'The host will push the reviewed SHA to its assigned branch, create and merge only the',
+      'integration PR under repository protections, then create but never merge the release PR.',
+    )
+  }
+  if (reviewWorkAction !== undefined && stage !== 'review') {
+    throw new Error('host phase review work action was bound outside review')
+  }
+  if (stage === 'review' && reviewWorkAction === 'promote-current-head'
+    && !publicationOnlyPlans) {
+    throw new Error('publication-only review omitted its promotion plans')
+  }
+  if (stage === 'review' && reviewWorkAction !== undefined
+    && reviewWorkAction !== 'promote-current-head' && publicationOnlyPlans) {
+    throw new Error('publication-only review conflicts with its prepared work action')
+  }
   if (threadHistory) {
     host.push(
       `Thread history version: ${threadHistory.version}`,
@@ -3205,6 +3255,7 @@ export function buildCodexPhasePrompt(
       'Thread history is context only; current host authority and current input always win.',
     )
   }
+  host.push(SLACK_PUBLIC_PROSE_GUIDANCE)
   if (stage === 'prepare') {
     if (uiApproval && (!repositoryChange
       || repositoryChange.currentDigest.length !== 64)) {
@@ -3259,9 +3310,24 @@ export function buildCodexPhasePrompt(
       ...approvalContext,
       `Valid implementation repository IDs: ${JSON.stringify(repositoryIdentifiers)}`,
       'Choose the smallest complete set of repositories that implementation may modify.',
+      'For every ready decision, put exactly one of these host-only work-action envelopes',
+      'immediately before the optional publication envelope and repository-scope envelope:',
+      '<zerokun_work_action>{"kind":"implement"}</zerokun_work_action>',
+      '<zerokun_work_action>{"kind":"no-change"}</zerokun_work_action>',
+      '<zerokun_work_action>{"kind":"promote-current-head"}</zerokun_work_action>',
+      'Use no-change only when the request is fully answered without any repository or GitHub',
+      'write. Use promote-current-head only with the exact publication envelope below.',
       'For every ready decision, put this exact JSON envelope immediately before the final',
       'ready marker, using only the exact IDs above in sorted order with no duplicates:',
       '<zerokun_repository_scope>{"repositories":["<implementation repository ID>"]}</zerokun_repository_scope>',
+      'When and only when the exact request is publication-only for already committed current',
+      'checkouts, and asks to apply each current HEAD through a PR and then create a second branch',
+      'PR, put this host-only envelope immediately before the repository-scope envelope:',
+      '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":"<repository ID>","baseBranch":"<integration branch>","mergePullRequest":true,"followupBaseBranch":"<release base branch>"}]}</zerokun_publication>',
+      'Sort promotions by repository. Use this only if every selected repository is already clean',
+      'and committed and no product edit is required. Never use it for a mixed implementation.',
+      'The host fixes exact source and remote target SHAs, performs the ordered PR operations after',
+      'read-only review, and never merges the follow-up release PR.',
       ...(browserEnabled ? [
         'For a material visual UI/UX change, do not edit the product repository. Capture the actual',
         'current representative state as Before, create a frontend-only proposal in the writable',
@@ -3331,9 +3397,16 @@ export function buildCodexPhasePrompt(
       'zerokun_browser.verify_local_page to independently confirm its rendered output. Do not use',
       'another browser, operator profile, remote URL, or arbitrary CDP.',
     ] : []),
-    'Review the unchanged repository for this exact implemented input. Each native advisor',
-    'must review the committed diff on the host-assigned zerochan feature branch; the worktree is',
-    'intentionally back on its clean prepared base so a later task cannot stack on this change.',
+    publicationOnlyPlans
+      ? 'Review the unchanged, already-committed source checkout and the bound promotion plan.'
+      : reviewWorkAction === 'no-change'
+        ? 'Review the prepared no-change decision for this exact input. Confirm that no repository'
+          + ' or GitHub write is needed and that the user-facing answer fully resolves the request.'
+        : 'Review the unchanged repository for this exact implemented input. Each native advisor',
+    ...(publicationOnlyPlans || reviewWorkAction === 'no-change' ? [] : [
+      'must review the committed diff on the host-assigned zerochan feature branch; the worktree is',
+      'intentionally back on its clean prepared base so a later task cannot stack on this change.',
+    ]),
     `response must end with [ZERO_NATIVE_ADVISOR:${attemptNonce}:r${input.revision}:${input.digest}:review:${reviewRound}:<solution|risk>] after replacing only the final perspective placeholder. Put that marker exactly once, on a line by itself as the final line, with no output after it.`,
     'For a bounded unavailable native attempt, submit attempted=true, adopted=false, and its',
     'concise reason to the broker; do not stop review or invent a response.',
@@ -3357,6 +3430,112 @@ export function parseCodexReviewDecision(
   if (first === publish && body) return { decision: 'publish', body }
   if (first === fix && body) return { decision: 'fix', body }
   throw new Error(`Codex review round ${round} omitted its exact host decision envelope`)
+}
+
+export function assertPreparedWorkPublication(
+  workAction: CodexPreparationWorkAction,
+  plans: readonly GitHubPublicationPlan[],
+): void {
+  if (workAction === 'implement' && plans.length === 0) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'implementation produced no reviewed commit; preparation did not authorize no-change',
+    )
+  }
+  if (workAction === 'no-change' && plans.length !== 0) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'no-change preparation unexpectedly produced a publication commit',
+    )
+  }
+  if (workAction === 'promote-current-head'
+    && (plans.length === 0 || plans.some(plan => !plan.promotion))) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'publication-only preparation omitted its exact promotion plan',
+    )
+  }
+  if (workAction !== 'promote-current-head' && plans.some(plan => plan.promotion)) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'publication promotion conflicts with the prepared work action',
+    )
+  }
+}
+
+export function assertUserAuthorizedPublicationIntents(
+  source: string | readonly AdvisorInputEntry[],
+  intents: readonly CodexPublicationIntent[],
+): void {
+  const tasks = (typeof source === 'string' ? [source] : source.map(entry => entry.task))
+    .map(task => task.normalize('NFKC'))
+  const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const prTerm = '(?:\\bPR\\b|pull[ -]?request|プルリク)'
+  const actionTerm = '(?:適用|反映|統合|merge|マージ)'
+  const negatedPublication = (task: string): boolean => (
+    new RegExp(`${actionTerm}\\s*(?:を|は)?\\s*(?:し)?\\s*`
+      + '(?:ない|ません|ず|不要|禁止|中止|やめ)', 'i').test(task)
+    || new RegExp(`${prTerm}[^\\n。！？!?]{0,32}`
+      + '(?:作らない|作成しない|開かない|不要|なし|禁止|中止|やめ)', 'i').test(task)
+    || /\b(?:do\s+not|don't|dont|never)\b[^\n.!?]{0,48}\b(?:merge|integrate|apply|create|open)\b/i
+      .test(task)
+    || new RegExp(`\\b(?:no|without)\\s+(?:a\\s+)?${prTerm}\\b`, 'i').test(task)
+  )
+  const latestTask = tasks.at(-1)?.trim() ?? ''
+  if (/^(?:やっぱり\s*)?(?:やめて|中止(?:して)?|stop|cancel)[。.!！]?$/i.test(latestTask)) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'branch promotion was explicitly cancelled by the Slack request',
+    )
+  }
+  for (const intent of intents) {
+    const base = escapeRegex(intent.baseBranch.normalize('NFKC'))
+    const followup = escapeRegex(intent.followupBaseBranch.normalize('NFKC'))
+    const integration = new RegExp(
+      `(?:${base}\\s*(?:へ|に|を)?\\s*${actionTerm}`
+      + `|${actionTerm}\\s*(?:先|対象)?\\s*(?:は|を|へ|に|into|to)?\\s*${base})`,
+      'i',
+    )
+    const direction = new RegExp(
+      `${base}\\s*(?:から|→|->|=>|to)\\s*${followup}`,
+      'i',
+    )
+    let authorized = false
+    for (let index = tasks.length - 1; index >= 0; index -= 1) {
+      const task = tasks[index]!
+      const mentionsBothBranches = new RegExp(base, 'i').test(task)
+        && new RegExp(followup, 'i').test(task)
+      const mentionsPublication = new RegExp(`${prTerm}|${actionTerm}`, 'i').test(task)
+      if (!mentionsBothBranches || !mentionsPublication) continue
+      if (negatedPublication(task)) {
+        throw new GitHubPublicationError(
+          'configuration',
+          'branch promotion was explicitly denied by the Slack request',
+        )
+      }
+      const clauses = task.split(/[\n。！？!?]+/).filter(Boolean)
+      const hasIntegration = clauses.some(clause => integration.test(clause))
+      const hasFollowupPullRequest = clauses.some(clause => (
+        direction.test(clause) && new RegExp(prTerm, 'i').test(clause)
+      ))
+      const repositoryLabel = intent.repository.normalize('NFKC')
+        .split(/[\\/]/).filter(part => part && part !== '.').at(-1)
+      const repositoryBound = intents.length === 1
+        || (repositoryLabel !== undefined && task.includes(repositoryLabel))
+      if (hasIntegration && hasFollowupPullRequest && repositoryBound) {
+        authorized = true
+      }
+      // The newest message that names both promotion targets is authoritative;
+      // do not combine unrelated keywords from older Slack messages.
+      break
+    }
+    if (!authorized) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'branch promotion direction is not explicitly authorized by one Slack message',
+      )
+    }
+  }
 }
 
 export function assertCodexPreparationReady(
@@ -4338,6 +4517,16 @@ export class CodexRateLimitError extends Error {
 
 export class CodexInterruptedError extends Error {}
 export class CodexCleanupPendingError extends Error {}
+export class CodexPublicationPreflightRetryError extends Error {
+  constructor(
+    message: string,
+    readonly category: 'authentication' | 'network' | 'remote',
+    readonly sessionId?: string,
+  ) {
+    super(message)
+    this.name = 'CodexPublicationPreflightRetryError'
+  }
+}
 export class CodexRepositoryChangedBeforeImplementationError extends Error {
   constructor(
     message = 'repository changed before implementation; fresh preparation is required',
@@ -4577,6 +4766,8 @@ export async function executeCodexJob(
     transientRetryDelayMsForTesting?: number
     /** Fixture-only baseline. Production captures every repository before implementation. */
     publicationBaselineForTesting?: GitHubPublicationBaseline | null
+    /** Fixture-only authenticated host transport for publication-only promotion binding. */
+    publicationCommandsForTesting?: GitHubPublicationCommands
     /** Finalize artifacts before the host atomically seals and stages a phased result. */
     finalizeSuccessfulResult?(execution: JobExecutionResult): JobExecutionResult
     onSuccessfulResult?(execution: JobExecutionResult): JobExecutionResult
@@ -4992,6 +5183,8 @@ export async function executeCodexJob(
     boundInterjection?: JobInterjectionRecord,
     expectedRepositoryDigest?: string,
     expectedRepositoryScope?: readonly string[],
+    publicationOnlyPlans?: readonly GitHubPublicationPlan[],
+    reviewWorkAction?: CodexPreparationWorkAction,
   ) => {
     if (stage === 'interjection' && !boundInterjection) {
       throw new Error('interjection execution omitted its durable input binding')
@@ -6080,6 +6273,8 @@ export async function executeCodexJob(
                 stage === 'prepare'
                   ? undefined
                   : expectedRepositoryScope ?? options.uiApproval?.repositoryScope ?? undefined,
+                publicationOnlyPlans,
+                reviewWorkAction,
               ),
             phaseClientUserMessageId ?? job.idempotencyKey,
             {
@@ -7082,8 +7277,11 @@ export async function executeCodexJob(
     let preparedInput: AdvisorInputSnapshot | null = null
     let preparedRepositoryDigest: string | null = null
     let preparedRepositoryScope: string[] | null = null
+    let preparedWorkAction: CodexPreparationWorkAction | null = null
+    let preparedPublicationIntents: CodexPublicationIntent[] = []
     let implementedInputDigest: string | null = null
     let publicationBaseline: GitHubPublicationBaseline | null = null
+    let publicationOnlyPlans: GitHubPublicationPlan[] | null = null
     const publicationRepositoryScope = new Set<string>()
     const publicationBranch = `zerochan/${createHash('sha256')
       .update(JSON.stringify({ jobId: job.id, attempt: job.attempts }))
@@ -7289,6 +7487,8 @@ export async function executeCodexJob(
       boundInput?: AdvisorInputSnapshot,
       expectedRepositoryDigest?: string,
       expectedRepositoryScope?: readonly string[],
+      publicationOnlyPlans?: readonly GitHubPublicationPlan[],
+      reviewWorkAction?: CodexPreparationWorkAction,
     ): Promise<{
       kind: 'success'
       execution: Awaited<ReturnType<typeof runAttempt>>
@@ -7308,7 +7508,8 @@ export async function executeCodexJob(
         const execution = await runAttempt(
           sessionId, resumed, stage, phaseSequence, round, boundInput,
           parentChildBaseline, parentTurnBaseline, undefined,
-          expectedRepositoryDigest, expectedRepositoryScope,
+          expectedRepositoryDigest, expectedRepositoryScope, publicationOnlyPlans,
+          reviewWorkAction,
         )
         if ('userCancelled' in execution && execution.userCancelled === true) {
           await execution.retireCancelledRegistration()
@@ -7592,6 +7793,10 @@ export async function executeCodexJob(
           preparedInput = null
           preparedRepositoryDigest = null
           preparedRepositoryScope = null
+          preparedWorkAction = null
+          preparedPublicationIntents = []
+          publicationOnlyPlans = null
+          publicationBaseline = null
           nextStage = 'prepare'
           continue
         }
@@ -7618,8 +7823,88 @@ export async function executeCodexJob(
         preparedInput = finalInput
         preparedRepositoryDigest = currentRepositoryDigest
         preparedRepositoryScope = currentRepositoryScope
+        preparedWorkAction = preparationDecision.workAction
+        preparedPublicationIntents = [...(preparationDecision.publicationIntents ?? [])]
+        publicationOnlyPlans = null
+        if (preparedPublicationIntents.length > 0) {
+          assertUserAuthorizedPublicationIntents(
+            finalInput.entries,
+            preparedPublicationIntents,
+          )
+          if (!preparedRepositoryScope || preparedRepositoryScope.length === 0) {
+            throw new Error('publication-only preparation omitted its repository scope')
+          }
+          const scopedSnapshot = scopeAdvisorRepositorySnapshot(
+            currentRepositorySnapshot,
+            preparedRepositoryScope,
+          )
+          const identifiers = advisorRepositoryIdentifiers(scopedSnapshot)
+          const rootsByIdentifier = new Map(identifiers.map((identifier, index) => [
+            identifier,
+            scopedSnapshot.repositories[index]?.gitRoot,
+          ]))
+          if (rootsByIdentifier.size !== preparedRepositoryScope.length
+            || [...rootsByIdentifier.values()].some(value => !value)) {
+            throw new Error('publication-only repository scope is not backed by Git worktrees')
+          }
+          publicationBaseline = testCodexBin === undefined
+            ? captureGitHubPublicationBaseline(jobRepo, scopedSnapshot.gitRoots)
+            : options.publicationBaselineForTesting ?? (() => {
+                throw new Error('publication-only fixture omitted its GitHub baseline')
+              })()
+          const publicationCommands = options.publicationCommandsForTesting
+            ?? (testCodexBin === undefined
+              ? createHostGitHubPublicationCommands()
+              : (() => {
+                  throw new Error('publication-only fixture omitted its GitHub transport')
+                })())
+          try {
+            publicationOnlyPlans = await prepareGitHubPromotionPlans(
+              publicationBaseline,
+              preparedPublicationIntents.map(intent => ({
+                gitRoot: rootsByIdentifier.get(intent.repository)!,
+                baseBranch: intent.baseBranch,
+                followupBaseBranch: intent.followupBaseBranch,
+              })),
+              publicationBranch,
+              publicationCommands,
+              options.signal,
+            )
+          } catch (error) {
+            if (error instanceof GitHubPublicationError
+              && ['authentication', 'network', 'remote'].includes(error.category)) {
+              throw new CodexPublicationPreflightRetryError(
+                error.message,
+                error.category as 'authentication' | 'network' | 'remote',
+                sessionId ?? undefined,
+              )
+            }
+            throw error
+          }
+          for (const repository of preparedRepositoryScope) {
+            publicationRepositoryScope.add(repository)
+          }
+          implementedInputDigest = activeWriteInputDigest(finalInput)
+        } else if (preparedWorkAction === 'no-change') {
+          if (!preparedRepositoryScope || preparedRepositoryScope.length === 0) {
+            throw new Error('no-change preparation omitted its repository scope')
+          }
+          const scopedSnapshot = scopeAdvisorRepositorySnapshot(
+            currentRepositorySnapshot,
+            preparedRepositoryScope,
+          )
+          publicationBaseline = testCodexBin === undefined
+            ? captureGitHubPublicationBaseline(jobRepo, scopedSnapshot.gitRoots)
+            : options.publicationBaselineForTesting ?? null
+          for (const repository of preparedRepositoryScope) {
+            publicationRepositoryScope.add(repository)
+          }
+          implementedInputDigest = activeWriteInputDigest(finalInput)
+        }
         phaseSequence += 1
-        nextStage = implementedInputDigest === activeWriteInputDigest(finalInput)
+        nextStage = publicationOnlyPlans || preparedWorkAction === 'no-change'
+          ? 'review'
+          : implementedInputDigest === activeWriteInputDigest(finalInput)
           ? 'review'
           : 'implementation'
         continue
@@ -7664,6 +7949,10 @@ export async function executeCodexJob(
           preparedInput = null
           preparedRepositoryDigest = null
           preparedRepositoryScope = null
+          preparedWorkAction = null
+          preparedPublicationIntents = []
+          publicationOnlyPlans = null
+          publicationBaseline = null
           nextStage = 'prepare'
           continue
         }
@@ -7699,6 +7988,10 @@ export async function executeCodexJob(
           preparedInput = null
           preparedRepositoryDigest = null
           preparedRepositoryScope = null
+          preparedWorkAction = null
+          preparedPublicationIntents = []
+          publicationOnlyPlans = null
+          publicationBaseline = null
           nextStage = 'prepare'
           continue
         }
@@ -7714,14 +8007,14 @@ export async function executeCodexJob(
       }
 
       if (!preparedInput) throw new Error('read-only review omitted its prepared input binding')
-      const publicationPlansBeforeReview = publicationBaseline
+      const publicationPlansBeforeReview = publicationOnlyPlans ?? (publicationBaseline
         ? prepareGitHubPublicationPlans(
             publicationBaseline,
             preparedRepositoryScope ?? undefined,
             undefined,
             publicationBranch,
           )
-        : null
+        : null)
       const repositoryBeforeReviewSnapshot = snapshotAdvisorRepository(advisorProjectLayout)
       const repositoryBeforeReview = preparedRepositoryScope
         ? advisorRepositoryScopeDigest(
@@ -7732,11 +8025,17 @@ export async function executeCodexJob(
       const outcome = await runPhase(
         'review', reviewRound, preparedInput,
         undefined, preparedRepositoryScope ?? undefined,
+        publicationOnlyPlans ?? undefined,
+        preparedWorkAction ?? undefined,
       )
       if (outcome.kind === 'input-changed') {
         preparedInput = null
         preparedRepositoryDigest = null
         preparedRepositoryScope = null
+        preparedWorkAction = null
+        preparedPublicationIntents = []
+        publicationOnlyPlans = null
+        publicationBaseline = null
         nextStage = 'prepare'
         continue
       }
@@ -7756,6 +8055,10 @@ export async function executeCodexJob(
         preparedInput = null
         preparedRepositoryDigest = null
         preparedRepositoryScope = null
+        preparedWorkAction = null
+        preparedPublicationIntents = []
+        publicationOnlyPlans = null
+        publicationBaseline = null
         nextStage = 'prepare'
         continue
       }
@@ -7835,6 +8138,10 @@ export async function executeCodexJob(
         reviewRound = 1
         reviewedInputRevision = null
         preparedInput = null
+        preparedWorkAction = null
+        preparedPublicationIntents = []
+        publicationOnlyPlans = null
+        publicationBaseline = null
         nextStage = 'prepare'
         continue
       }
@@ -7845,12 +8152,22 @@ export async function executeCodexJob(
         preparedInput = null
         preparedRepositoryDigest = null
         preparedRepositoryScope = null
+        preparedWorkAction = null
+        preparedPublicationIntents = []
+        publicationOnlyPlans = null
+        publicationBaseline = null
         nextStage = 'prepare'
         continue
       }
       if (reviewError) throw reviewError
       if (!decision) throw new Error('Codex review decision is unavailable')
       if (decision.decision === 'fix') {
+        if (preparedWorkAction !== 'implement') {
+          throw new GitHubPublicationError(
+            'conflict',
+            'read-only publication review found a required source fix; no GitHub operation was sent',
+          )
+        }
         if (reviewRound === 3) {
           throw new Error('required fixes remain after the maximum three read-only review rounds')
         }
@@ -7879,8 +8196,40 @@ export async function executeCodexJob(
         preparedInput = null
         preparedRepositoryDigest = null
         preparedRepositoryScope = null
+        preparedWorkAction = null
+        preparedPublicationIntents = []
+        publicationOnlyPlans = null
+        publicationBaseline = null
         nextStage = 'prepare'
         continue
+      }
+      if (!preparedWorkAction) {
+        throw new Error('review omitted its prepared work action binding')
+      }
+      const finalizedPublicationPlans = publicationBaseline
+        ? publicationOnlyPlans
+          ? publicationOnlyPlans.map(plan => {
+              assertGitHubPublicationPlan(plan)
+              return plan
+            })
+          : prepareGitHubPublicationPlans(
+              publicationBaseline,
+              preparedRepositoryScope ?? undefined,
+              publicationPlansBeforeReview?.map(plan => ({
+                gitRoot: plan.gitRoot,
+                head: plan.commitSha,
+              })),
+              publicationBranch,
+            )
+        : []
+      // Production always has a host-captured Git baseline before a write phase.
+      // A small set of protocol-only App Server fixtures intentionally uses a
+      // non-Git directory and therefore has no publication baseline; keep that
+      // test harness isolated from the production no-commit success guard. Any
+      // fixture that supplies a real baseline exercises the exact production
+      // contract and must still produce a reviewed commit (or explicit no-change).
+      if (publicationBaseline || testCodexBin === undefined) {
+        assertPreparedWorkPublication(preparedWorkAction, finalizedPublicationPlans)
       }
       const publication: GitHubPublicationSet | undefined = publicationBaseline
         ? {
@@ -7893,15 +8242,7 @@ export async function executeCodexJob(
             reviewRound,
             reviewedRepositoryDigest: repositoryBeforePublication,
             baselineDigest: gitHubPublicationBaselineDigest(publicationBaseline),
-            plans: prepareGitHubPublicationPlans(
-              publicationBaseline,
-              preparedRepositoryScope ?? undefined,
-              publicationPlansBeforeReview?.map(plan => ({
-                gitRoot: plan.gitRoot,
-                head: plan.commitSha,
-              })),
-              publicationBranch,
-            ),
+            plans: finalizedPublicationPlans,
           }
         : testCodexBin !== undefined ? {
             version: 1,
@@ -7940,6 +8281,10 @@ export async function executeCodexJob(
         reviewedInputRevision = null
         preparedRepositoryDigest = null
         preparedRepositoryScope = null
+        preparedWorkAction = null
+        preparedPublicationIntents = []
+        publicationOnlyPlans = null
+        publicationBaseline = null
         nextStage = 'prepare'
         continue
       }

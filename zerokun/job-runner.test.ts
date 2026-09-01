@@ -69,6 +69,7 @@ import {
   CODEX_WORKER_SAFETY_PROMPT,
   CodexCleanupPendingError,
   CodexInterruptedError,
+  CodexPublicationPreflightRetryError,
   CodexRepositoryChangedBeforeImplementationError,
   CodexRepositoryChangedBeforePublicationError,
   CodexUserCancelledError,
@@ -3938,6 +3939,40 @@ describe('single FIFO worker', () => {
     expect(executions).toBe(2)
     expect(opens).toBe(2)
     expect(closes).toBe(1)
+    store.close()
+  })
+
+  test('GitHub publication preflightの通信失敗はwrite jobをterminal失敗にしない', async () => {
+    const store = makeStore()
+    const queued = store.enqueue(input({
+      messageId: 'publication-preflight-retry',
+      writeEnabled: true,
+    })).job
+    let closes = 0
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 1,
+      pollMs: 1,
+      stopWhenIdle: true,
+      openJobMonitor: async () => {},
+      closeJobMonitor: async () => { closes += 1 },
+      executor: async () => {
+        throw new CodexPublicationPreflightRetryError(
+          'GitHub promotion base lookup could not reach GitHub',
+          'network',
+          'preflight-resume-session',
+        )
+      },
+    })
+    expect(stats).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+    expect(store.get(queued.id)).toMatchObject({
+      status: 'queued',
+      sessionId: 'preflight-resume-session',
+      terminalOutcome: null,
+    })
+    expect(store.get(queued.id)?.notBefore).toEqual(expect.any(Number))
+    expect(closes).toBe(0)
+    expect(slackRateLimitMessage(Date.now(), 'github')).toContain('GitHubとの接続を再確認')
     store.close()
   })
 
@@ -9215,6 +9250,31 @@ describe('Slack output guard', () => {
     )).toBe(
       '作業中に対象projectが別の変更で更新されたため、最新状態で安全に続行できませんでした。',
     )
+    expect(publicJobFailureSummary(
+      'local Git config contains a setting that is unsafe for host publication',
+    )).toBe(
+      'GitHub公開前の安全確認で、リポジトリ設定を受理できませんでした。公開処理は行われていません。',
+    )
+    expect(publicJobFailureSummary(
+      'branch promotion is not explicitly authorized by the Slack request',
+    )).toBe(
+      'GitHub公開に必要なbranchまたはrepository状態が依頼内容と一致しませんでした。',
+    )
+    expect(publicJobFailureSummary(
+      'GitHub promotion base lookup could not reach GitHub',
+    )).toBe(
+      'GitHubとの通信を確認できませんでした。公開前であれば自動再試行されます。',
+    )
+    expect(publicJobFailureSummary(
+      'Codex preparation omitted its exact work action envelope',
+    )).toBe(
+      '処理手順の確認応答を正しく読み取れませんでした。変更・公開は確定していません。同じスレッドから再開できます。',
+    )
+    expect(publicJobFailureSummary(
+      'implementation produced no reviewed commit; preparation did not authorize no-change',
+    )).toBe(
+      '公開可能なreview済みcommitを確認できませんでした。変更は自動公開していません。同じスレッドから再開できます。',
+    )
     store.close()
   })
 
@@ -10350,7 +10410,8 @@ describe('Slack output guard', () => {
     expect(finalized.result).not.toMatch(/localhost:3000|127\.0\.0\.1:8765|10\.0\.0\.5:8080|buildbox:3000|\[::1\]:3000|server\.local:8080/i)
     expect(finalized.result).not.toMatch(/localhost[∶꞉]3000|10\.0\.0\.5∶8080|localhost∕admin|10\.0\.%30\.5|local%68ost|%6C%6F%63|%31%30%2e%30|%68%74%74%70/i)
     expect(finalized.result).not.toMatch(/⟋Users|⟍⟍server|%E2%9F%8[BD]/i)
-    expect(finalized.result).toContain('内部パスを省略')
+    expect(finalized.result).toContain('対象箇所')
+    expect(finalized.result).not.toContain('内部パスを省略')
     store.close()
   })
 

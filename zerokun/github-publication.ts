@@ -50,6 +50,21 @@ export type GitHubPublicationPlan = {
   localConfigDigest: string
   originUrlDigest: string
   title: string
+  promotion?: GitHubPublicationPromotion
+}
+
+export type GitHubPublicationPromotion = {
+  version: 1
+  sourceBranch: string
+  sourceHead: string
+  followupBaseBranch: string
+  followupInitialHead: string
+}
+
+export type GitHubPromotionBinding = {
+  gitRoot: string
+  baseBranch: string
+  followupBaseBranch: string
 }
 
 export type GitHubPublicationSet = {
@@ -72,7 +87,42 @@ export type GitHubPublicationReceipt = {
   commitSha: string
   pullRequestNumber: number
   pullRequestUrl: string
+  followupPullRequestNumber?: number
+  followupPullRequestUrl?: string
 }
+
+/**
+ * A remotely reconciled promotion boundary. The runner persists each boundary
+ * before allowing the next irreversible GitHub mutation to begin.
+ */
+export type GitHubPromotionCheckpoint =
+  | {
+      version: 1
+      kind: 'source-branch'
+      commitSha: string
+    }
+  | {
+      version: 1
+      kind: 'integration-pr' | 'integration-queued'
+      pullRequestNumber: number
+      pullRequestUrl: string
+    }
+  | {
+      version: 1
+      kind: 'integration-merged'
+      pullRequestNumber: number
+      pullRequestUrl: string
+      mergeCommitSha: string
+    }
+  | {
+      version: 1
+      kind: 'followup-pr'
+      pullRequestNumber: number
+      pullRequestUrl: string
+      mergeCommitSha: string
+      followupPullRequestNumber: number
+      followupPullRequestUrl: string
+    }
 
 export type PublicationCommandResult = {
   exitCode: number
@@ -89,7 +139,7 @@ export interface GitHubPublicationCommands {
 export class GitHubPublicationError extends Error {
   constructor(
     readonly category: 'authentication' | 'network' | 'conflict' | 'configuration' | 'remote'
-      | 'cleanup',
+      | 'cleanup' | 'waiting',
     message: string,
   ) {
     super(message)
@@ -185,11 +235,15 @@ function localConfig(repo: string): { digest: string; origin: GitHubRepositoryId
     }
     return { key: entry.slice(0, separator).toLowerCase(), value: entry.slice(separator + 1) }
   })
+  // core.hooksPath is intentionally not forbidden. Repositories commonly set
+  // it for Husky, while every host Git path that could publish is forced to
+  // core.hooksPath=/dev/null and push also uses --no-verify. The full local
+  // config is still digested below, so a value change invalidates the plan.
   const forbidden = entries.find(({ key }) => (
     key === 'include.path' || key.startsWith('includeif.')
     || key.startsWith('credential.') || key.startsWith('http.') || key.startsWith('url.')
     || key.startsWith('protocol.') || key === 'core.sshcommand' || key === 'core.gitproxy'
-    || key === 'core.hookspath' || key === 'core.alternaterefscommand'
+    || key === 'core.alternaterefscommand'
     || /^remote\.[^.]+\.(?:pushurl|proxy|receivepack|uploadpack|vcs)$/.test(key)
   ))
   if (forbidden) {
@@ -429,6 +483,102 @@ export function prepareGitHubPublicationPlans(
   return plans
 }
 
+/**
+ * Bind an already-committed current checkout to an ordered branch-promotion
+ * workflow. Remote target heads are read before review so later publication
+ * can reject unrelated rewrites while still tolerating ordinary fast-forwards.
+ */
+export async function prepareGitHubPromotionPlans(
+  baseline: GitHubPublicationBaseline,
+  bindings: readonly GitHubPromotionBinding[],
+  headBranch: string,
+  commands: GitHubPublicationCommands,
+  signal?: AbortSignal,
+): Promise<GitHubPublicationPlan[]> {
+  if (baseline.version !== 1 || realpathSync(baseline.projectPath) !== baseline.projectPath) {
+    throw new GitHubPublicationError('configuration', 'publication baseline is invalid')
+  }
+  const requiredHeadBranch = validBranch(baseline.projectPath, headBranch)
+  const byRoot = new Map(bindings.map(binding => [realpathSync(binding.gitRoot), binding]))
+  if (byRoot.size !== bindings.length || bindings.length === 0
+    || bindings.length > MAX_GITHUB_PUBLICATION_REPOSITORIES) {
+    throw new GitHubPublicationError('configuration', 'promotion bindings are invalid')
+  }
+  const plans: GitHubPublicationPlan[] = []
+  for (const initial of baseline.repositories) {
+    const binding = byRoot.get(initial.gitRoot)
+    if (!binding) continue
+    const baseBranch = validBranch(initial.gitRoot, binding.baseBranch)
+    const followupBaseBranch = validBranch(initial.gitRoot, binding.followupBaseBranch)
+    if (baseBranch === followupBaseBranch || baseBranch === requiredHeadBranch
+      || followupBaseBranch === requiredHeadBranch) {
+      throw new GitHubPublicationError('configuration', 'promotion branch binding is invalid')
+    }
+    const current = repositoryState(initial.gitRoot)
+    if (current.head !== initial.initialHead || current.branch !== initial.baseBranch
+      || current.statusDigest !== initial.statusDigest
+      || current.config.digest !== initial.localConfigDigest
+      || current.config.originDigest !== initial.originUrlDigest
+      || current.config.origin.slug.toLowerCase() !== initial.remote.slug.toLowerCase()) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'promotion source checkout changed after its read-only preparation',
+      )
+    }
+    if (current.branch === baseBranch || current.branch === followupBaseBranch) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'promotion source and target branches must be distinct',
+      )
+    }
+    const target = await commands.runGit(initial.gitRoot, [
+      'ls-remote', '--heads', initial.remote.canonicalUrl, `refs/heads/${baseBranch}`,
+    ], signal)
+    if (target.exitCode !== 0) commandFailure(target, 'GitHub promotion base lookup')
+    const initialTargetHead = parseRemoteHead(target.stdout, baseBranch)
+    if (initialTargetHead === null) {
+      throw new GitHubPublicationError('conflict', 'GitHub promotion base branch is unavailable')
+    }
+    const followup = await commands.runGit(initial.gitRoot, [
+      'ls-remote', '--heads', initial.remote.canonicalUrl,
+      `refs/heads/${followupBaseBranch}`,
+    ], signal)
+    if (followup.exitCode !== 0) commandFailure(followup, 'GitHub follow-up base lookup')
+    const initialFollowupHead = parseRemoteHead(followup.stdout, followupBaseBranch)
+    if (initialFollowupHead === null) {
+      throw new GitHubPublicationError('conflict', 'GitHub follow-up base branch is unavailable')
+    }
+    plans.push({
+      version: 1,
+      gitRoot: current.gitRoot,
+      repositorySlug: initial.remote.slug,
+      canonicalUrl: initial.remote.canonicalUrl,
+      baseBranch,
+      headBranch: requiredHeadBranch,
+      commitSha: current.head,
+      initialHead: initialTargetHead,
+      statusDigest: initial.statusDigest,
+      localConfigDigest: initial.localConfigDigest,
+      originUrlDigest: initial.originUrlDigest,
+      title: commitTitle(current.gitRoot, current.head),
+      promotion: {
+        version: 1,
+        sourceBranch: current.branch,
+        sourceHead: current.head,
+        followupBaseBranch,
+        followupInitialHead: initialFollowupHead,
+      },
+    })
+  }
+  if (plans.length !== bindings.length) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'promotion repository scope is not fully bound by the pre-write baseline',
+    )
+  }
+  return plans
+}
+
 function assertGitHubPublicationPlanShape(value: GitHubPublicationPlan): void {
   if (!value || value.version !== 1 || !SHA_PATTERN.test(value.commitSha)
     || !SHA_PATTERN.test(value.initialHead) || !/^[0-9a-f]{64}$/.test(value.statusDigest)
@@ -444,11 +594,105 @@ function assertGitHubPublicationPlanShape(value: GitHubPublicationPlan): void {
   }
   validBranch(value.gitRoot, value.baseBranch)
   validBranch(value.gitRoot, value.headBranch)
+  if (value.promotion) {
+    const promotion = value.promotion
+    if (!promotion || typeof promotion !== 'object' || promotion.version !== 1
+      || typeof promotion.sourceBranch !== 'string'
+      || typeof promotion.sourceHead !== 'string'
+      || typeof promotion.followupBaseBranch !== 'string'
+      || typeof promotion.followupInitialHead !== 'string'
+      || !SHA_PATTERN.test(promotion.sourceHead)
+      || promotion.sourceHead !== value.commitSha
+      || !SHA_PATTERN.test(promotion.followupInitialHead)
+      || promotion.sourceBranch === value.baseBranch
+      || promotion.sourceBranch === promotion.followupBaseBranch
+      || promotion.followupBaseBranch === value.baseBranch
+      || promotion.followupBaseBranch === value.headBranch) {
+      throw new GitHubPublicationError('configuration', 'publication promotion is invalid')
+    }
+    validBranch(value.gitRoot, promotion.sourceBranch)
+    validBranch(value.gitRoot, promotion.followupBaseBranch)
+  }
+}
+
+export function assertGitHubPromotionCheckpoint(
+  plan: GitHubPublicationPlan,
+  value: unknown,
+): asserts value is GitHubPromotionCheckpoint {
+  assertGitHubPublicationPlanShape(plan)
+  if (!plan.promotion || !value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new GitHubPublicationError('configuration', 'promotion checkpoint is invalid')
+  }
+  const record = value as Record<string, unknown>
+  if (record.version !== 1 || typeof record.kind !== 'string') {
+    throw new GitHubPublicationError('configuration', 'promotion checkpoint is invalid')
+  }
+  const integrationUrl = Number.isSafeInteger(record.pullRequestNumber)
+    && Number(record.pullRequestNumber) > 0
+    ? `https://github.com/${plan.repositorySlug}/pull/${record.pullRequestNumber}`
+    : null
+  const validIntegration = integrationUrl !== null
+    && typeof record.pullRequestUrl === 'string'
+    && record.pullRequestUrl.toLowerCase() === integrationUrl.toLowerCase()
+  if (record.kind === 'source-branch') {
+    if (Object.keys(record).sort().join('\n') !== 'commitSha\nkind\nversion'
+      || record.commitSha !== plan.commitSha) {
+      throw new GitHubPublicationError('configuration', 'promotion source checkpoint is invalid')
+    }
+    return
+  }
+  if (record.kind === 'integration-pr' || record.kind === 'integration-queued') {
+    if (Object.keys(record).sort().join('\n')
+        !== 'kind\npullRequestNumber\npullRequestUrl\nversion'
+      || !validIntegration) {
+      throw new GitHubPublicationError('configuration', 'promotion PR checkpoint is invalid')
+    }
+    return
+  }
+  if (record.kind === 'integration-merged') {
+    if (Object.keys(record).sort().join('\n')
+        !== 'kind\nmergeCommitSha\npullRequestNumber\npullRequestUrl\nversion'
+      || !validIntegration || typeof record.mergeCommitSha !== 'string'
+      || !SHA_PATTERN.test(record.mergeCommitSha)) {
+      throw new GitHubPublicationError('configuration', 'promotion merge checkpoint is invalid')
+    }
+    return
+  }
+  if (record.kind === 'followup-pr') {
+    const followupUrl = Number.isSafeInteger(record.followupPullRequestNumber)
+      && Number(record.followupPullRequestNumber) > 0
+      ? `https://github.com/${plan.repositorySlug}/pull/${record.followupPullRequestNumber}`
+      : null
+    if (Object.keys(record).sort().join('\n')
+        !== 'followupPullRequestNumber\nfollowupPullRequestUrl\nkind\nmergeCommitSha\npullRequestNumber\npullRequestUrl\nversion'
+      || !validIntegration || typeof record.mergeCommitSha !== 'string'
+      || !SHA_PATTERN.test(record.mergeCommitSha) || followupUrl === null
+      || typeof record.followupPullRequestUrl !== 'string'
+      || record.followupPullRequestUrl.toLowerCase() !== followupUrl.toLowerCase()) {
+      throw new GitHubPublicationError('configuration', 'promotion follow-up checkpoint is invalid')
+    }
+    return
+  }
+  throw new GitHubPublicationError('configuration', 'promotion checkpoint kind is invalid')
 }
 
 export function assertGitHubPublicationPlan(value: GitHubPublicationPlan): void {
   assertGitHubPublicationPlanShape(value)
   const state = repositoryState(value.gitRoot)
+  if (value.promotion) {
+    if (state.head !== value.promotion.sourceHead
+      || state.branch !== value.promotion.sourceBranch
+      || state.statusDigest !== value.statusDigest
+      || state.config.digest !== value.localConfigDigest
+      || state.config.originDigest !== value.originUrlDigest
+      || state.config.origin.slug.toLowerCase() !== value.repositorySlug.toLowerCase()) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'publication promotion no longer matches the reviewed source checkout',
+      )
+    }
+    return
+  }
   const featureHead = gitSync(
     state.gitRoot,
     ['rev-parse', '--verify', `refs/heads/${value.headBranch}^{commit}`],
@@ -482,6 +726,7 @@ function assertGitHubPublicationSource(value: GitHubPublicationPlan): void {
   if (commit !== value.commitSha) {
     throw new GitHubPublicationError('configuration', 'reviewed publication commit is unavailable')
   }
+  if (value.promotion) return
   const ancestor = Bun.spawnSync([
     '/usr/bin/git', '-C', gitRoot,
     'merge-base', '--is-ancestor', value.initialHead, value.commitSha,
@@ -798,12 +1043,7 @@ async function assertRemoteBaseDescendsFromPreparedBase(
     'api', '--method', 'GET',
     `repos/${plan.repositorySlug}/compare/${plan.initialHead}...${remoteBaseHead}`,
   ], undefined, signal)
-  if (response.exitCode !== 0) {
-    throw new GitHubPublicationError(
-      'conflict',
-      'prepared base commit is not verifiably present on the current GitHub base branch',
-    )
-  }
+  if (response.exitCode !== 0) commandFailure(response, 'GitHub base comparison')
   let parsed: unknown
   try { parsed = JSON.parse(response.stdout) } catch {
     throw new GitHubPublicationError('remote', 'GitHub base comparison returned invalid JSON')
@@ -857,8 +1097,47 @@ type PullRequestApiRecord = {
   html_url: string
   state: 'open' | 'closed'
   merged_at: string | null
+  merge_commit_sha?: string | null
   head: { ref: string; sha: string; repo: { full_name: string } }
   base: { ref: string; repo: { full_name: string } }
+}
+
+async function readPullRequestForMerge(
+  plan: GitHubPublicationPlan,
+  pullRequestNumber: number,
+  commands: GitHubPublicationCommands,
+  signal?: AbortSignal,
+): Promise<PullRequestApiRecord> {
+  const response = await commands.runGh([
+    'api', '--method', 'GET',
+    `repos/${plan.repositorySlug}/pulls/${pullRequestNumber}`,
+  ], undefined, signal)
+  if (response.exitCode !== 0) commandFailure(response, 'GitHub PR readiness lookup')
+  let parsed: unknown
+  try { parsed = JSON.parse(response.stdout) } catch {
+    throw new GitHubPublicationError('remote', 'GitHub PR readiness returned invalid JSON')
+  }
+  const classified = classifiedPullRequestRecord(parsed, plan)
+  if (!classified || classified.record.number !== pullRequestNumber
+    || classified.kind !== 'valid') {
+    throw new GitHubPublicationError('remote', 'GitHub PR readiness receipt is invalid')
+  }
+  if (classified.record.merged_at !== null) return classified.record
+  const detail = parsed as Record<string, unknown>
+  if (detail.mergeable_state === 'dirty') {
+    throw new GitHubPublicationError(
+      'conflict',
+      'GitHub integration PR has a merge conflict that requires a new reviewed commit',
+    )
+  }
+  if (detail.draft !== false || detail.mergeable !== true
+    || detail.mergeable_state !== 'clean') {
+    throw new GitHubPublicationError(
+      'waiting',
+      'GitHub integration PR is waiting for required checks and review protections',
+    )
+  }
+  return classified.record
 }
 
 function classifiedPullRequestRecord(
@@ -926,6 +1205,9 @@ export async function publishGitHubPlan(
   plan: GitHubPublicationPlan,
   commands: GitHubPublicationCommands,
   signal?: AbortSignal,
+  onPromotionCheckpoint?: (
+    checkpoint: GitHubPromotionCheckpoint,
+  ) => Promise<void> | void,
 ): Promise<GitHubPublicationReceipt> {
   assertGitHubPublicationPlanShape(plan)
   if (signal?.aborted) {
@@ -939,8 +1221,8 @@ export async function publishGitHubPlan(
   )
   if (remote.exitCode !== 0) commandFailure(remote, 'GitHub branch lookup')
   let remoteHead = parseRemoteHead(remote.stdout, plan.headBranch)
-  const existing = await findPullRequest(plan, commands, signal)
-  if (existing) {
+  let existing = await findPullRequest(plan, commands, signal)
+  if (existing && !plan.promotion) {
     return {
       repositorySlug: plan.repositorySlug,
       baseBranch: plan.baseBranch,
@@ -950,7 +1232,7 @@ export async function publishGitHubPlan(
       pullRequestUrl: existing.html_url,
     }
   }
-  if (remoteHead !== null && remoteHead !== plan.commitSha) {
+  if (!existing && remoteHead !== null && remoteHead !== plan.commitSha) {
     throw new GitHubPublicationError('conflict', 'GitHub publication branch already has another commit')
   }
   const baseRef = `refs/heads/${plan.baseBranch}`
@@ -965,7 +1247,7 @@ export async function publishGitHubPlan(
     throw new GitHubPublicationError('conflict', 'GitHub base branch is unavailable')
   }
   await assertRemoteBaseDescendsFromPreparedBase(plan, remoteBaseHead, commands, signal)
-  if (remoteHead !== plan.commitSha) {
+  if (!existing && remoteHead !== plan.commitSha) {
     assertGitHubPublicationSource(plan)
     const push = await commands.runGit(plan.gitRoot, [
       'push', '--no-verify', '--porcelain', '--no-follow-tags',
@@ -985,8 +1267,15 @@ export async function publishGitHubPlan(
       throw new GitHubPublicationError('remote', 'GitHub did not retain the reviewed commit')
     }
   }
+  if (plan.promotion && remoteHead === plan.commitSha) {
+    await onPromotionCheckpoint?.({
+      version: 1,
+      kind: 'source-branch',
+      commitSha: plan.commitSha,
+    })
+  }
 
-  let pullRequest = await findPullRequest(plan, commands, signal)
+  let pullRequest = existing ?? await findPullRequest(plan, commands, signal)
   if (!pullRequest) {
     const request = JSON.stringify({
       title: plan.title,
@@ -1002,6 +1291,181 @@ export async function publishGitHubPlan(
     if (!pullRequest) {
       if (create.exitCode !== 0) commandFailure(create, 'GitHub PR creation')
       throw new GitHubPublicationError('remote', 'GitHub PR creation has no verified receipt')
+    }
+  }
+  if (plan.promotion) {
+    await onPromotionCheckpoint?.({
+      version: 1,
+      kind: 'integration-pr',
+      pullRequestNumber: pullRequest.number,
+      pullRequestUrl: pullRequest.html_url,
+    })
+    if (pullRequest.merged_at === null) {
+      pullRequest = await readPullRequestForMerge(
+        plan,
+        pullRequest.number,
+        commands,
+        signal,
+      )
+    }
+    if (pullRequest.merged_at === null) {
+      const repository = await commands.runGh([
+        'api', '--method', 'GET', `repos/${plan.repositorySlug}`,
+      ], undefined, signal)
+      if (repository.exitCode !== 0) commandFailure(repository, 'GitHub merge policy lookup')
+      let repositoryPolicy: unknown
+      try { repositoryPolicy = JSON.parse(repository.stdout) } catch {
+        throw new GitHubPublicationError('remote', 'GitHub merge policy returned invalid JSON')
+      }
+      const policy = repositoryPolicy as Record<string, unknown> | null
+      // Preserve the reviewed commit graph when the repository permits it.
+      // Squash/rebase are bounded fallbacks for repositories that explicitly
+      // disable merge commits.
+      const mergeMethod = policy?.allow_merge_commit === true
+        ? 'merge'
+        : policy?.allow_squash_merge === true
+          ? 'squash'
+          : policy?.allow_rebase_merge === true
+            ? 'rebase'
+            : null
+      if (!mergeMethod) {
+        throw new GitHubPublicationError('conflict', 'GitHub repository has no allowed PR merge method')
+      }
+      const merge = await commands.runGh([
+        'api', '--method', 'PUT',
+        `repos/${plan.repositorySlug}/pulls/${pullRequest.number}/merge`, '--input', '-',
+      ], JSON.stringify({ sha: plan.commitSha, merge_method: mergeMethod }), signal)
+      const mergeDetail = `${merge.stdout}\n${merge.stderr}`
+      if (merge.exitCode !== 0 && /merge queue|queue is required|required.*queue/i.test(mergeDetail)) {
+        const queued = await commands.runGh([
+          'pr', 'merge', String(pullRequest.number), '--repo', plan.repositorySlug,
+          '--auto', `--${mergeMethod}`, '--match-head-commit', plan.commitSha,
+        ], undefined, signal)
+        if (queued.exitCode !== 0
+          && !/already.*(?:auto|queue)|auto-merge is enabled|already in.*queue/i.test(
+            `${queued.stdout}\n${queued.stderr}`,
+          )) {
+          commandFailure(queued, 'GitHub merge queue enrollment')
+        }
+      }
+      // The response may be lost after GitHub accepted the merge. Re-query the
+      // exact PR before classifying the operation or retrying it.
+      pullRequest = await findPullRequest(plan, commands, signal) ?? pullRequest
+      if (pullRequest.merged_at === null) {
+        if (merge.exitCode !== 0 && /merge queue|queue is required|required.*queue/i.test(mergeDetail)) {
+          await onPromotionCheckpoint?.({
+            version: 1,
+            kind: 'integration-queued',
+            pullRequestNumber: pullRequest.number,
+            pullRequestUrl: pullRequest.html_url,
+          })
+          throw new GitHubPublicationError(
+            'waiting',
+            'GitHub integration PR is enrolled in the required merge queue',
+          )
+        }
+        if (merge.exitCode !== 0) commandFailure(merge, 'GitHub PR merge')
+        throw new GitHubPublicationError('remote', 'GitHub PR merge has no verified receipt')
+      }
+    }
+    const integrationMergeHead = pullRequest.merge_commit_sha
+    if (typeof integrationMergeHead !== 'string' || !SHA_PATTERN.test(integrationMergeHead)) {
+      throw new GitHubPublicationError(
+        'remote',
+        'GitHub merged PR omitted its exact integration commit receipt',
+      )
+    }
+
+    const promoted = await commands.runGit(
+      plan.gitRoot,
+      ['ls-remote', '--heads', plan.canonicalUrl, `refs/heads/${plan.baseBranch}`],
+      signal,
+    )
+    if (promoted.exitCode !== 0) commandFailure(promoted, 'GitHub promoted branch lookup')
+    const promotedHead = parseRemoteHead(promoted.stdout, plan.baseBranch)
+    if (promotedHead === null) {
+      throw new GitHubPublicationError('remote', 'GitHub promoted branch receipt is unavailable')
+    }
+    if (promotedHead !== integrationMergeHead) {
+      await assertRemoteBaseDescendsFromPreparedBase({
+        ...plan,
+        initialHead: integrationMergeHead,
+      }, promotedHead, commands, signal)
+    }
+    await assertRemoteBaseDescendsFromPreparedBase(plan, promotedHead, commands, signal)
+    await onPromotionCheckpoint?.({
+      version: 1,
+      kind: 'integration-merged',
+      pullRequestNumber: pullRequest.number,
+      pullRequestUrl: pullRequest.html_url,
+      mergeCommitSha: integrationMergeHead,
+    })
+    const followupPlan: GitHubPublicationPlan = {
+      ...plan,
+      baseBranch: plan.promotion.followupBaseBranch,
+      headBranch: plan.baseBranch,
+      commitSha: promotedHead,
+      initialHead: plan.promotion.followupInitialHead,
+      title: `release: ${plan.baseBranch} to ${plan.promotion.followupBaseBranch}`,
+      promotion: undefined,
+    }
+    const followupBase = await commands.runGit(
+      plan.gitRoot,
+      ['ls-remote', '--heads', plan.canonicalUrl,
+        `refs/heads/${plan.promotion.followupBaseBranch}`],
+      signal,
+    )
+    if (followupBase.exitCode !== 0) commandFailure(followupBase, 'GitHub follow-up base lookup')
+    const followupBaseHead = parseRemoteHead(
+      followupBase.stdout,
+      plan.promotion.followupBaseBranch,
+    )
+    if (followupBaseHead === null) {
+      throw new GitHubPublicationError('conflict', 'GitHub follow-up base branch is unavailable')
+    }
+    await assertRemoteBaseDescendsFromPreparedBase(
+      followupPlan,
+      followupBaseHead,
+      commands,
+      signal,
+    )
+    let followupPullRequest = await findPullRequest(followupPlan, commands, signal)
+    if (!followupPullRequest) {
+      const create = await commands.runGh([
+        'api', '--method', 'POST', `repos/${plan.repositorySlug}/pulls`, '--input', '-',
+      ], JSON.stringify({
+        title: followupPlan.title,
+        head: followupPlan.headBranch,
+        base: followupPlan.baseBranch,
+        body: 'The authorized integration branch is ready for release review. This PR is not auto-merged.',
+      }), signal)
+      followupPullRequest = await findPullRequest(followupPlan, commands, signal)
+      if (!followupPullRequest) {
+        if (create.exitCode !== 0) commandFailure(create, 'GitHub follow-up PR creation')
+        throw new GitHubPublicationError(
+          'remote',
+          'GitHub follow-up PR creation has no verified receipt',
+        )
+      }
+    }
+    await onPromotionCheckpoint?.({
+      version: 1,
+      kind: 'followup-pr',
+      pullRequestNumber: pullRequest.number,
+      pullRequestUrl: pullRequest.html_url,
+      mergeCommitSha: integrationMergeHead,
+      followupPullRequestNumber: followupPullRequest.number,
+      followupPullRequestUrl: followupPullRequest.html_url,
+    })
+    return {
+      repositorySlug: plan.repositorySlug,
+      baseBranch: plan.baseBranch,
+      headBranch: plan.headBranch,
+      commitSha: plan.commitSha,
+      pullRequestNumber: pullRequest.number,
+      pullRequestUrl: pullRequest.html_url,
+      followupPullRequestNumber: followupPullRequest.number,
+      followupPullRequestUrl: followupPullRequest.html_url,
     }
   }
   return {

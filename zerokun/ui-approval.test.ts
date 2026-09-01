@@ -132,13 +132,16 @@ describe('Codex UI/UX approval decision contract', () => {
   const semanticEnvelope = (decision: UiApprovalSemanticDecision): string => (
     `<zerokun_ui_response_decision>${JSON.stringify(decision)}</zerokun_ui_response_decision>`
   )
+  const workAction = (kind: 'implement' | 'no-change' | 'promote-current-head' = 'implement') => (
+    `<zerokun_work_action>{"kind":"${kind}"}</zerokun_work_action>`
+  )
 
   test('accepts either the exact ready marker or one exact Before/After envelope', () => {
     expect(parseCodexPreparationDecision(
-      `調査済みです\n[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
+      `調査済みです\n${workAction()}\n[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
       nonce,
       input,
-    )).toEqual({ kind: 'ready', repositoryScope: ['.'] })
+    )).toEqual({ kind: 'ready', repositoryScope: ['.'], workAction: 'implement' })
 
     const decision = parseCodexPreparationDecision([
       `[ZERO_UI_APPROVAL_REQUIRED:${nonce}:r3:${input.digest}]`,
@@ -182,13 +185,14 @@ describe('Codex UI/UX approval decision contract', () => {
       const decision = semanticDecision(approval)
       expect(parseCodexPreparationDecision([
         semanticEnvelope(decision),
-        `調査済みです\n[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
+        `調査済みです\n${workAction()}\n[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
       ].join('\n'), nonce, input, {
         context: approval,
         currentRepositoryDigest: decision.currentRepositoryDigest,
       })).toEqual({
         kind: 'ready',
         repositoryScope: ['.'],
+        workAction: 'implement',
         approvalDecision: decision,
       })
     }
@@ -235,6 +239,7 @@ describe('Codex UI/UX approval decision contract', () => {
     expect(decision.proposalRepositoryDigest).toBe(approval.repositoryScopeDigest)
     expect(parseCodexPreparationDecision([
       semanticEnvelope(decision),
+      workAction(),
       '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
       `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
     ].join('\n'), nonce, input, {
@@ -244,6 +249,7 @@ describe('Codex UI/UX approval decision contract', () => {
 
     expect(parseCodexPreparationDecision([
       semanticEnvelope(decision),
+      workAction(),
       '<zerokun_repository_scope>{"repositories":["backend","frontend"]}</zerokun_repository_scope>',
       `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
     ].join('\n'), nonce, input, {
@@ -261,6 +267,7 @@ describe('Codex UI/UX approval decision contract', () => {
     const expandedDecision = semanticDecision(expandedApproval, 'f'.repeat(64))
     expect(() => parseCodexPreparationDecision([
       semanticEnvelope(expandedDecision),
+      workAction(),
       '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
       `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
     ].join('\n'), nonce, input, {
@@ -280,12 +287,47 @@ describe('Codex UI/UX approval decision contract', () => {
     )).toThrow('repository scope envelope')
     expect(parseCodexPreparationDecision([
       '準備完了',
+      workAction(),
       '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
       ready,
     ].join('\n'), nonce, input, undefined, ['backend', 'frontend'])).toMatchObject({
       kind: 'ready',
       repositoryScope: ['frontend'],
     })
+  })
+
+  test('publication-only promotionは全対象repositoryと連続branch操作をexact envelopeへ固定する', () => {
+    const ready = `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`
+    const promotion = '<zerokun_publication>{"promotions":['
+      + '{"kind":"promote-current-head","repository":"frontend",'
+      + '"baseBranch":"develop","mergePullRequest":true,'
+      + '"followupBaseBranch":"main"}]}</zerokun_publication>'
+    expect(parseCodexPreparationDecision([
+      workAction('promote-current-head'),
+      promotion,
+      '<zerokun_repository_scope>{"repositories":["frontend"]}</zerokun_repository_scope>',
+      ready,
+    ].join('\n'), nonce, input, undefined, ['backend', 'frontend'])).toMatchObject({
+      kind: 'ready',
+      repositoryScope: ['frontend'],
+      workAction: 'promote-current-head',
+      publicationIntents: [{
+        kind: 'promote-current-head',
+        repository: 'frontend',
+        baseBranch: 'develop',
+        mergePullRequest: true,
+        followupBaseBranch: 'main',
+      }],
+    })
+
+    expect(() => parseCodexPreparationDecision([
+      workAction('promote-current-head'),
+      promotion,
+      '<zerokun_repository_scope>{"repositories":["backend","frontend"]}</zerokun_repository_scope>',
+      ready,
+    ].join('\n'), nonce, input, undefined, ['backend', 'frontend'])).toThrow(
+      'every selected repository',
+    )
   })
 
   test('host gate accepts a compatible repository change and rejects stale or conflicting meaning', () => {
@@ -332,6 +374,7 @@ describe('Codex UI/UX approval decision contract', () => {
     const approval = context()
     const ready = (decision: UiApprovalSemanticDecision): string => [
       semanticEnvelope(decision),
+      workAction(),
       `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`,
     ].join('\n')
     expect(() => parseCodexPreparationDecision(

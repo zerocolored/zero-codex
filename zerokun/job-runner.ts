@@ -25,6 +25,7 @@ import {
   artifactDirForJob,
   CodexCleanupPendingError,
   CodexInterruptedError,
+  CodexPublicationPreflightRetryError,
   CodexRateLimitError,
   CodexRepositoryChangedBeforeImplementationError,
   CodexUserCancelledError,
@@ -137,6 +138,7 @@ import {
   type ThreadHistoryEvent,
 } from './thread-history.ts'
 import {
+  assertGitHubPromotionCheckpoint,
   assertHostGitHubPublicationLogin,
   createHostGitHubPublicationCommands,
   GitHubPublicationError,
@@ -146,6 +148,7 @@ import {
   type GitHubPublicationPlan,
   type GitHubPublicationReceipt,
   type GitHubPublicationSet,
+  type GitHubPromotionCheckpoint,
 } from './github-publication.ts'
 
 export class SlackChannelRouteRequiredError extends Error {
@@ -883,12 +886,15 @@ CREATE TABLE IF NOT EXISTS github_publications (
   local_config_digest TEXT NOT NULL,
   origin_url_digest TEXT NOT NULL,
   title TEXT NOT NULL,
+  promotion_json TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
   not_before INTEGER,
   last_error_category TEXT,
   pull_request_number INTEGER,
   pull_request_url TEXT,
+  followup_pull_request_number INTEGER,
+  followup_pull_request_url TEXT,
   completed_at INTEGER,
   PRIMARY KEY (job_id, ordinal),
   UNIQUE (job_id, git_root),
@@ -898,6 +904,59 @@ CREATE INDEX IF NOT EXISTS idx_github_publications_pending
   ON github_publications(status, not_before, job_id, ordinal);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_github_publications_repository
   ON github_publications(job_id, repository_slug COLLATE NOCASE);
+-- Ordered branch promotions live in a separate protocol table. A pre-promotion
+-- binary sees the pending set but no normal publication row, so it fails
+-- closed instead of silently treating develop integration as an ordinary PR.
+CREATE TABLE IF NOT EXISTS github_promotion_publications (
+  job_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  version INTEGER NOT NULL CHECK (version = 1),
+  git_root TEXT NOT NULL,
+  repository_slug TEXT NOT NULL,
+  canonical_url TEXT NOT NULL,
+  base_branch TEXT NOT NULL,
+  head_branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL,
+  initial_head TEXT NOT NULL,
+  status_digest TEXT NOT NULL,
+  local_config_digest TEXT NOT NULL,
+  origin_url_digest TEXT NOT NULL,
+  title TEXT NOT NULL,
+  promotion_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  not_before INTEGER,
+  last_error_category TEXT,
+  pull_request_number INTEGER,
+  pull_request_url TEXT,
+  followup_pull_request_number INTEGER,
+  followup_pull_request_url TEXT,
+  completed_at INTEGER,
+  PRIMARY KEY (job_id, ordinal),
+  UNIQUE (job_id, git_root),
+  FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_github_promotion_publications_pending
+  ON github_promotion_publications(status, not_before, job_id, ordinal);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_github_promotion_publications_repository
+  ON github_promotion_publications(job_id, repository_slug COLLATE NOCASE);
+-- Promotion consists of several irreversible remote mutations. Persist the
+-- last exactly reconciled substep so cancellation can stop before the next
+-- mutation without forgetting an accepted push, PR, queue enrollment, or merge.
+CREATE TABLE IF NOT EXISTS github_promotion_progress (
+  job_id TEXT NOT NULL,
+  git_root TEXT NOT NULL,
+  commit_sha TEXT NOT NULL,
+  checkpoint_kind TEXT NOT NULL
+    CHECK (checkpoint_kind IN (
+      'source-branch', 'integration-pr', 'integration-queued',
+      'integration-merged', 'followup-pr'
+    )),
+  checkpoint_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (job_id, git_root),
+  FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS ui_approval_requests (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL,
@@ -1698,6 +1757,49 @@ function ensureJobSchemaMigrations(db: Database): void {
       [slackClientMessageId(`ui-approval:${row.id}`, 0), row.id],
     )
   }
+  for (const [name, definition] of [
+    ['promotion_json', 'TEXT'],
+    ['followup_pull_request_number', 'INTEGER'],
+    ['followup_pull_request_url', 'TEXT'],
+  ] as const) {
+    const current = db.query<{ name: string }, []>(
+      'PRAGMA table_info(github_publications)',
+    ).all()
+    if (current.some(column => column.name === name)) continue
+    try {
+      db.exec(`ALTER TABLE github_publications ADD COLUMN ${name} ${definition}`)
+    } catch (error) {
+      const migrated = db.query<{ name: string }, []>(
+        'PRAGMA table_info(github_publications)',
+      ).all()
+      if (!migrated.some(column => column.name === name)) throw error
+    }
+  }
+  // A short-lived pre-release build stored promotion rows in the ordinary
+  // publication table. Move them atomically so updates, retries and receipts
+  // use the same protocol table after restart.
+  const migrateLegacyPromotions = db.transaction(() => {
+    db.exec(`
+      INSERT INTO github_promotion_publications (
+        job_id, ordinal, version, git_root, repository_slug, canonical_url,
+        base_branch, head_branch, commit_sha, initial_head, status_digest,
+        local_config_digest, origin_url_digest, title, promotion_json, status,
+        attempts, not_before, last_error_category, pull_request_number,
+        pull_request_url, followup_pull_request_number, followup_pull_request_url,
+        completed_at
+      )
+      SELECT
+        job_id, ordinal, version, git_root, repository_slug, canonical_url,
+        base_branch, head_branch, commit_sha, initial_head, status_digest,
+        local_config_digest, origin_url_digest, title, promotion_json, status,
+        attempts, not_before, last_error_category, pull_request_number,
+        pull_request_url, followup_pull_request_number, followup_pull_request_url,
+        completed_at
+      FROM github_publications WHERE promotion_json IS NOT NULL;
+      DELETE FROM github_publications WHERE promotion_json IS NOT NULL;
+    `)
+  })
+  migrateLegacyPromotions.immediate()
   const controlColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_controls)').all()
   for (const [name, definition] of [
     ['input_revision', 'INTEGER NOT NULL DEFAULT 1'],
@@ -2463,10 +2565,13 @@ function validateStoredGitHubPublicationSet(value: GitHubPublicationSet): void {
   const roots = new Set<string>()
   const repositories = new Set<string>()
   for (const plan of value.plans) {
+    if (!plan || plan.version !== 1 || typeof plan.repositorySlug !== 'string'
+      || !isAbsolute(plan.gitRoot)
+      || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(plan.repositorySlug)) {
+      throw new Error('GitHub publication plan is invalid')
+    }
     const repository = plan.repositorySlug.toLowerCase()
-    if (!plan || plan.version !== 1 || !isAbsolute(plan.gitRoot)
-      || roots.has(plan.gitRoot) || repositories.has(repository)
-      || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(plan.repositorySlug)
+    if (roots.has(plan.gitRoot) || repositories.has(repository)
       || plan.canonicalUrl !== `https://github.com/${plan.repositorySlug}.git`
       || !GITHUB_PUBLICATION_SHA.test(plan.commitSha)
       || !GITHUB_PUBLICATION_SHA.test(plan.initialHead)
@@ -2478,6 +2583,27 @@ function validateStoredGitHubPublicationSet(value: GitHubPublicationSet): void {
       || Buffer.byteLength(plan.baseBranch) > 255 || Buffer.byteLength(plan.headBranch) > 255
       || plan.title.length < 1 || plan.title.length > 200) {
       throw new Error('GitHub publication plan is invalid')
+    }
+    if (plan.promotion) {
+      const promotion = plan.promotion
+      if (!promotion || typeof promotion !== 'object' || promotion.version !== 1
+        || typeof promotion.sourceBranch !== 'string'
+        || typeof promotion.sourceHead !== 'string'
+        || typeof promotion.followupBaseBranch !== 'string'
+        || typeof promotion.followupInitialHead !== 'string'
+        || promotion.sourceHead !== plan.commitSha
+        || !GITHUB_PUBLICATION_SHA.test(promotion.sourceHead)
+        || !GITHUB_PUBLICATION_SHA.test(promotion.followupInitialHead)
+        || !promotion.sourceBranch || !promotion.followupBaseBranch
+        || promotion.sourceBranch === plan.baseBranch
+        || promotion.sourceBranch === promotion.followupBaseBranch
+        || promotion.followupBaseBranch === plan.baseBranch
+        || promotion.followupBaseBranch === plan.headBranch
+        || [promotion.sourceBranch, promotion.followupBaseBranch].some(branch => (
+          /[\0\r\n]/.test(branch) || Buffer.byteLength(branch) > 255
+        ))) {
+        throw new Error('GitHub publication promotion is invalid')
+      }
     }
     roots.add(plan.gitRoot)
     repositories.add(repository)
@@ -2492,6 +2618,9 @@ function appendGitHubPublicationSummary(
   const lines = receipts.map(receipt => (
     `- ${receipt.repositorySlug}: ${receipt.headBranch} (${receipt.commitSha.slice(0, 12)})\n`
     + `  PR: ${receipt.pullRequestUrl}`
+    + (receipt.followupPullRequestUrl
+      ? `\n  Release PR: ${receipt.followupPullRequestUrl}`
+      : '')
   ))
   return `${result.trimEnd()}\n\n📦 GitHubへの公開が完了しました。\n${lines.join('\n')}`
 }
@@ -2515,16 +2644,78 @@ type GitHubPublicationRow = {
   local_config_digest: string
   origin_url_digest: string
   title: string
+  promotion_json: string | null
   status: 'pending' | 'completed'
   attempts: number
   not_before: number | null
   last_error_category: string | null
   pull_request_number: number | null
   pull_request_url: string | null
+  followup_pull_request_number: number | null
+  followup_pull_request_url: string | null
   completed_at: number | null
 }
 
+const NORMAL_GITHUB_PUBLICATION_TABLE = 'github_publications' as const
+const PROMOTION_GITHUB_PUBLICATION_TABLE = 'github_promotion_publications' as const
+
+function githubPublicationTableForPlan(
+  plan: GitHubPublicationPlan,
+): typeof NORMAL_GITHUB_PUBLICATION_TABLE | typeof PROMOTION_GITHUB_PUBLICATION_TABLE {
+  return plan.promotion
+    ? PROMOTION_GITHUB_PUBLICATION_TABLE
+    : NORMAL_GITHUB_PUBLICATION_TABLE
+}
+
+function githubPublicationRows(db: Database, jobId: string): GitHubPublicationRow[] {
+  const rows = [
+    ...db.query<GitHubPublicationRow, [string]>(
+      'SELECT * FROM github_publications WHERE job_id = ?',
+    ).all(jobId),
+    ...db.query<GitHubPublicationRow, [string]>(
+      'SELECT * FROM github_promotion_publications WHERE job_id = ?',
+    ).all(jobId),
+  ].sort((left, right) => left.ordinal - right.ordinal)
+  const ordinals = new Set<number>()
+  const roots = new Set<string>()
+  const repositories = new Set<string>()
+  for (const row of rows) {
+    const repository = row.repository_slug.toLowerCase()
+    if (ordinals.has(row.ordinal) || roots.has(row.git_root) || repositories.has(repository)) {
+      throw new Error(`GitHub publication checkpoint has duplicate identities for job ${jobId}`)
+    }
+    ordinals.add(row.ordinal)
+    roots.add(row.git_root)
+    repositories.add(repository)
+  }
+  return rows
+}
+
 function publicationPlanFromRow(row: GitHubPublicationRow): GitHubPublicationPlan {
+  if (row.version !== 1) {
+    throw new Error('stored GitHub publication plan version is unsupported')
+  }
+  let promotion: GitHubPublicationPlan['promotion'] | undefined
+  if (row.promotion_json !== null) {
+    let parsed: unknown
+    try { parsed = JSON.parse(row.promotion_json) } catch {
+      throw new Error('stored GitHub publication promotion is invalid JSON')
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('stored GitHub publication promotion is invalid')
+    }
+    const record = parsed as Record<string, unknown>
+    if (Object.keys(record).sort().join('\n')
+        !== 'followupBaseBranch\nfollowupInitialHead\nsourceBranch\nsourceHead\nversion'
+      || record.version !== 1
+      || typeof record.sourceBranch !== 'string'
+      || typeof record.sourceHead !== 'string'
+      || typeof record.followupBaseBranch !== 'string'
+      || typeof record.followupInitialHead !== 'string') {
+      throw new Error('stored GitHub publication promotion is invalid')
+    }
+    promotion = record as GitHubPublicationPlan['promotion']
+  }
   return {
     version: 1,
     gitRoot: row.git_root,
@@ -2538,6 +2729,7 @@ function publicationPlanFromRow(row: GitHubPublicationRow): GitHubPublicationPla
     localConfigDigest: row.local_config_digest,
     originUrlDigest: row.origin_url_digest,
     title: row.title,
+    ...(promotion ? { promotion } : {}),
   }
 }
 
@@ -2546,6 +2738,58 @@ export interface PendingGitHubPublication {
   attempts: number
   notBefore: number | null
   lastErrorCategory: GitHubPublicationError['category'] | null
+}
+
+type GitHubPromotionProgressRow = {
+  commit_sha: string
+  checkpoint_kind: GitHubPromotionCheckpoint['kind']
+  checkpoint_json: string
+}
+
+const GITHUB_PROMOTION_CHECKPOINT_RANK: Record<GitHubPromotionCheckpoint['kind'], number> = {
+  'source-branch': 1,
+  'integration-pr': 2,
+  'integration-queued': 3,
+  'integration-merged': 4,
+  'followup-pr': 5,
+}
+
+function parseStoredGitHubPromotionCheckpoint(
+  plan: GitHubPublicationPlan,
+  row: GitHubPromotionProgressRow,
+): GitHubPromotionCheckpoint {
+  if (row.commit_sha !== plan.commitSha) {
+    throw new Error('stored GitHub promotion checkpoint commit conflicts')
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(row.checkpoint_json) } catch {
+    throw new Error('stored GitHub promotion checkpoint is invalid JSON')
+  }
+  assertGitHubPromotionCheckpoint(plan, parsed)
+  if (parsed.kind !== row.checkpoint_kind) {
+    throw new Error('stored GitHub promotion checkpoint kind conflicts')
+  }
+  return parsed
+}
+
+function assertPromotionCheckpointExtends(
+  previous: GitHubPromotionCheckpoint,
+  next: GitHubPromotionCheckpoint,
+): void {
+  if ('pullRequestNumber' in previous && 'pullRequestNumber' in next
+    && (previous.pullRequestNumber !== next.pullRequestNumber
+      || previous.pullRequestUrl !== next.pullRequestUrl)) {
+    throw new Error('GitHub promotion integration PR checkpoint conflicts')
+  }
+  if ('mergeCommitSha' in previous && 'mergeCommitSha' in next
+    && previous.mergeCommitSha !== next.mergeCommitSha) {
+    throw new Error('GitHub promotion merge checkpoint conflicts')
+  }
+  if (previous.kind === 'followup-pr' && next.kind === 'followup-pr'
+    && (previous.followupPullRequestNumber !== next.followupPullRequestNumber
+      || previous.followupPullRequestUrl !== next.followupPullRequestUrl)) {
+    throw new Error('GitHub promotion follow-up PR checkpoint conflicts')
+  }
 }
 
 /** Operator tuning may shorten a session, but never exceed the public 20-job contract. */
@@ -6584,18 +6828,23 @@ export class JobStore {
             ],
           )
           for (const [ordinal, plan] of publication.plans.entries()) {
+            const publicationTable = githubPublicationTableForPlan(plan)
             this.db.run(
-              `INSERT INTO github_publications (
+              `INSERT INTO ${publicationTable} (
                  job_id, ordinal, version, git_root, repository_slug, canonical_url,
                  base_branch, head_branch, commit_sha, initial_head, status_digest,
-                 local_config_digest, origin_url_digest, title, status
-               ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+                 local_config_digest, origin_url_digest, title, promotion_json, status
+               ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
               [
                 id, ordinal, plan.gitRoot, plan.repositorySlug, plan.canonicalUrl,
                 plan.baseBranch, plan.headBranch, plan.commitSha, plan.initialHead,
                 plan.statusDigest, plan.localConfigDigest, plan.originUrlDigest, plan.title,
+                plan.promotion ? JSON.stringify(plan.promotion) : null,
               ],
             )
+          }
+          if (publication.plans.length === 0) {
+            expectedPersistedResult = appendGitHubPublicationSummary(result, [])
           }
         } else {
           if (existingSet.version !== 1 || existingSet.job_attempt !== publication.jobAttempt
@@ -6610,17 +6859,21 @@ export class JobStore {
             || existingSet.plan_count !== publication.plans.length) {
             throw new Error(`GitHub publication checkpoint conflicts for job ${id}`)
           }
-          const rows = this.db.query<GitHubPublicationRow, [string]>(
-            'SELECT * FROM github_publications WHERE job_id = ? ORDER BY ordinal',
-          ).all(id)
+          const rows = githubPublicationRows(this.db, id)
           if (JSON.stringify(rows.map(publicationPlanFromRow))
             !== JSON.stringify(publication.plans)) {
             throw new Error(`GitHub publication plans conflict for job ${id}`)
           }
           if (existingSet.status === 'completed') {
             const receipts = rows.map(entry => {
+              const storedPlan = publicationPlanFromRow(entry)
               if (entry.status !== 'completed' || entry.pull_request_number === null
-                || entry.pull_request_url === null) {
+                || entry.pull_request_url === null
+                || (storedPlan.promotion
+                  ? entry.followup_pull_request_number === null
+                    || entry.followup_pull_request_url === null
+                  : entry.followup_pull_request_number !== null
+                    || entry.followup_pull_request_url !== null)) {
                 throw new Error(`GitHub publication receipt is incomplete for job ${id}`)
               }
               return {
@@ -6630,6 +6883,11 @@ export class JobStore {
                 commitSha: entry.commit_sha,
                 pullRequestNumber: entry.pull_request_number,
                 pullRequestUrl: entry.pull_request_url,
+                ...(entry.followup_pull_request_number !== null
+                  && entry.followup_pull_request_url !== null ? {
+                    followupPullRequestNumber: entry.followup_pull_request_number,
+                    followupPullRequestUrl: entry.followup_pull_request_url,
+                  } : {}),
               } satisfies GitHubPublicationReceipt
             })
             expectedPersistedResult = appendGitHubPublicationSummary(result, receipts)
@@ -6645,7 +6903,7 @@ export class JobStore {
         `UPDATE jobs SET pending_session_id = ?, pending_result = ?, executor_pid = NULL
          WHERE id = ? AND runtime = 'codex' AND status = 'running'
            AND pending_session_id IS NULL AND pending_result IS NULL`,
-        [persistedSession, result, id],
+        [persistedSession, expectedPersistedResult, id],
       )
       if (updated.changes !== 1) throw new Error(`could not stage execution result for job ${id}`)
       return true
@@ -6698,6 +6956,7 @@ export class JobStore {
        JOIN jobs ON jobs.id = sets.job_id
        WHERE sets.status = 'pending' AND jobs.runtime = 'codex'
          AND jobs.status = 'running' AND jobs.pending_result IS NOT NULL
+         AND jobs.cancel_requested_at IS NULL
        ORDER BY jobs.seq`,
     ).all().map(row => row.job_id)
   }
@@ -6712,15 +6971,79 @@ export class JobStore {
   }
 
   pendingGitHubPublications(jobId: string): PendingGitHubPublication[] {
-    return this.db.query<GitHubPublicationRow, [string]>(
-      `SELECT * FROM github_publications
-       WHERE job_id = ? AND status = 'pending' ORDER BY ordinal`,
-    ).all(jobId).map(row => ({
+    return githubPublicationRows(this.db, jobId).filter(row => row.status === 'pending').map(row => ({
       plan: publicationPlanFromRow(row),
       attempts: row.attempts,
       notBefore: row.not_before,
       lastErrorCategory: row.last_error_category as GitHubPublicationError['category'] | null,
     }))
+  }
+
+  recordGitHubPromotionCheckpoint(
+    jobId: string,
+    plan: GitHubPublicationPlan,
+    checkpoint: GitHubPromotionCheckpoint,
+  ): void {
+    if (!plan.promotion) throw new Error('GitHub promotion checkpoint requires a promotion plan')
+    assertGitHubPromotionCheckpoint(plan, checkpoint)
+    const serialized = JSON.stringify(checkpoint)
+    const persist = this.db.transaction(() => {
+      const publication = this.db.query<GitHubPublicationRow, [string, string]>(
+        'SELECT * FROM github_promotion_publications WHERE job_id = ? AND git_root = ?',
+      ).get(jobId, plan.gitRoot)
+      if (!publication
+        || JSON.stringify(publicationPlanFromRow(publication)) !== JSON.stringify(plan)) {
+        throw new Error(`GitHub promotion checkpoint plan conflicts for job ${jobId}`)
+      }
+      const existing = this.db.query<GitHubPromotionProgressRow, [string, string]>(
+        `SELECT commit_sha, checkpoint_kind, checkpoint_json
+         FROM github_promotion_progress WHERE job_id = ? AND git_root = ?`,
+      ).get(jobId, plan.gitRoot)
+      if (!existing) {
+        this.db.run(
+          `INSERT INTO github_promotion_progress (
+             job_id, git_root, commit_sha, checkpoint_kind, checkpoint_json, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
+          [jobId, plan.gitRoot, plan.commitSha, checkpoint.kind, serialized, Date.now()],
+        )
+        return
+      }
+      const previous = parseStoredGitHubPromotionCheckpoint(plan, existing)
+      const previousRank = GITHUB_PROMOTION_CHECKPOINT_RANK[previous.kind]
+      const nextRank = GITHUB_PROMOTION_CHECKPOINT_RANK[checkpoint.kind]
+      if (nextRank < previousRank) return
+      assertPromotionCheckpointExtends(previous, checkpoint)
+      if (nextRank === previousRank) {
+        if (existing.checkpoint_json === serialized) return
+        throw new Error(`GitHub promotion checkpoint conflicts for job ${jobId}`)
+      }
+      const updated = this.db.run(
+        `UPDATE github_promotion_progress
+         SET checkpoint_kind = ?, checkpoint_json = ?, updated_at = ?
+         WHERE job_id = ? AND git_root = ? AND commit_sha = ?
+           AND checkpoint_kind = ? AND checkpoint_json = ?`,
+        [
+          checkpoint.kind, serialized, Date.now(), jobId, plan.gitRoot, plan.commitSha,
+          existing.checkpoint_kind, existing.checkpoint_json,
+        ],
+      )
+      if (updated.changes !== 1) {
+        throw new Error(`GitHub promotion checkpoint raced for job ${jobId}`)
+      }
+    })
+    retrySqlite(() => persist.immediate())
+  }
+
+  githubPromotionCheckpoint(
+    jobId: string,
+    plan: GitHubPublicationPlan,
+  ): GitHubPromotionCheckpoint | null {
+    if (!plan.promotion) throw new Error('GitHub promotion checkpoint requires a promotion plan')
+    const row = this.db.query<GitHubPromotionProgressRow, [string, string]>(
+      `SELECT commit_sha, checkpoint_kind, checkpoint_json
+       FROM github_promotion_progress WHERE job_id = ? AND git_root = ?`,
+    ).get(jobId, plan.gitRoot)
+    return row ? parseStoredGitHubPromotionCheckpoint(plan, row) : null
   }
 
   recordGitHubPublicationFailure(
@@ -6729,8 +7052,9 @@ export class JobStore {
     category: GitHubPublicationError['category'],
     notBefore: number,
   ): void {
+    const publicationTable = githubPublicationTableForPlan(plan)
     const updated = retrySqlite(() => this.db.run(
-      `UPDATE github_publications
+      `UPDATE ${publicationTable}
        SET attempts = attempts + 1, not_before = ?, last_error_category = ?
        WHERE job_id = ? AND git_root = ? AND commit_sha = ? AND status = 'pending'`,
       [notBefore, category, jobId, plan.gitRoot, plan.commitSha],
@@ -6750,38 +7074,53 @@ export class JobStore {
       || receipt.commitSha !== plan.commitSha || !Number.isSafeInteger(receipt.pullRequestNumber)
       || receipt.pullRequestNumber <= 0
       || receipt.pullRequestUrl.toLowerCase()
-        !== `https://github.com/${plan.repositorySlug}/pull/${receipt.pullRequestNumber}`.toLowerCase()) {
+        !== `https://github.com/${plan.repositorySlug}/pull/${receipt.pullRequestNumber}`.toLowerCase()
+      || (plan.promotion
+        ? !Number.isSafeInteger(receipt.followupPullRequestNumber)
+          || receipt.followupPullRequestNumber! <= 0
+          || receipt.followupPullRequestUrl?.toLowerCase()
+            !== `https://github.com/${plan.repositorySlug}/pull/${receipt.followupPullRequestNumber}`.toLowerCase()
+        : receipt.followupPullRequestNumber !== undefined
+          || receipt.followupPullRequestUrl !== undefined)) {
       throw new Error(`GitHub publication receipt conflicts for job ${jobId}`)
     }
+    const publicationTable = githubPublicationTableForPlan(plan)
     const updated = retrySqlite(() => this.db.run(
-      `UPDATE github_publications
+      `UPDATE ${publicationTable}
        SET status = 'completed', attempts = attempts + 1, not_before = NULL,
            last_error_category = NULL, pull_request_number = ?, pull_request_url = ?,
+           followup_pull_request_number = ?, followup_pull_request_url = ?,
            completed_at = ?
        WHERE job_id = ? AND git_root = ? AND commit_sha = ? AND status = 'pending'`,
       [
-        receipt.pullRequestNumber, receipt.pullRequestUrl, Date.now(),
+        receipt.pullRequestNumber, receipt.pullRequestUrl,
+        receipt.followupPullRequestNumber ?? null, receipt.followupPullRequestUrl ?? null,
+        Date.now(),
         jobId, plan.gitRoot, plan.commitSha,
       ],
     ))
     if (updated.changes !== 1) {
       const existing = this.db.query<GitHubPublicationRow, [string, string]>(
-        'SELECT * FROM github_publications WHERE job_id = ? AND git_root = ?',
+        `SELECT * FROM ${publicationTable} WHERE job_id = ? AND git_root = ?`,
       ).get(jobId, plan.gitRoot)
       if (existing?.status === 'completed'
         && existing.commit_sha === receipt.commitSha
         && existing.pull_request_number === receipt.pullRequestNumber
-        && existing.pull_request_url === receipt.pullRequestUrl) return
+        && existing.pull_request_url === receipt.pullRequestUrl
+        && existing.followup_pull_request_number === (receipt.followupPullRequestNumber ?? null)
+        && existing.followup_pull_request_url === (receipt.followupPullRequestUrl ?? null)) return
       throw new Error(`GitHub publication receipt checkpoint conflicts for job ${jobId}`)
     }
   }
 
   githubPublicationReceipts(jobId: string): GitHubPublicationReceipt[] {
-    return this.db.query<GitHubPublicationRow, [string]>(
-      'SELECT * FROM github_publications WHERE job_id = ? ORDER BY ordinal',
-    ).all(jobId).map(row => {
+    return githubPublicationRows(this.db, jobId).map(row => {
+      const plan = publicationPlanFromRow(row)
       if (row.status !== 'completed' || row.pull_request_number === null
-        || row.pull_request_url === null) {
+        || row.pull_request_url === null
+        || (plan.promotion
+          ? row.followup_pull_request_number === null || row.followup_pull_request_url === null
+          : row.followup_pull_request_number !== null || row.followup_pull_request_url !== null)) {
         throw new Error(`GitHub publication is incomplete for job ${jobId}`)
       }
       return {
@@ -6791,6 +7130,11 @@ export class JobStore {
         commitSha: row.commit_sha,
         pullRequestNumber: row.pull_request_number,
         pullRequestUrl: row.pull_request_url,
+        ...(row.followup_pull_request_number !== null
+          && row.followup_pull_request_url !== null ? {
+            followupPullRequestNumber: row.followup_pull_request_number,
+            followupPullRequestUrl: row.followup_pull_request_url,
+          } : {}),
       }
     })
   }
@@ -6805,9 +7149,8 @@ export class JobStore {
       ).get(jobId)
       if (!set) return false
       if (set.status === 'completed') return false
-      const pending = this.db.query<{ count: number }, [string]>(
-        "SELECT COUNT(*) AS count FROM github_publications WHERE job_id = ? AND status != 'completed'",
-      ).get(jobId)?.count ?? 0
+      const pending = githubPublicationRows(this.db, jobId)
+        .filter(row => row.status !== 'completed').length
       if (pending !== 0) throw new Error(`GitHub publication is still pending for job ${jobId}`)
       const receipts = this.githubPublicationReceipts(jobId)
       if (receipts.length !== set.plan_count) {
@@ -9436,7 +9779,7 @@ export class JobStore {
     notBefore: number,
     reason: string,
     sessionId?: string,
-    transientReason: 'rate-limit' | 'capacity' = 'rate-limit',
+    transientReason: 'rate-limit' | 'capacity' | 'github' = 'rate-limit',
   ): void {
     const persistedSessionId = sessionId === undefined
       ? undefined
@@ -9842,6 +10185,28 @@ export function publicJobFailureSummary(error: string): string {
   if (error.includes('UI/UX approval') || error.includes('承認用画像')) {
     return 'Before／After画像をSlackへ確実に提示できませんでした。再度依頼してください。'
   }
+  if (/Codex (?:preparation|implementation|review).*?(?:envelope|marker|work action)/i.test(error)
+    || error.includes('review omitted its prepared work action binding')) {
+    return '処理手順の確認応答を正しく読み取れませんでした。変更・公開は確定していません。同じスレッドから再開できます。'
+  }
+  if (error.includes('implementation produced no reviewed commit; preparation did not authorize no-change')) {
+    return '公開可能なreview済みcommitを確認できませんでした。変更は自動公開していません。同じスレッドから再開できます。'
+  }
+  if (error.includes('local Git config contains a setting that is unsafe for host publication')) {
+    return 'GitHub公開前の安全確認で、リポジトリ設定を受理できませんでした。公開処理は行われていません。'
+  }
+  if (/GitHub|publication|promotion/i.test(error)) {
+    if (/(?:\bauth(?:entication)?\b|credential|permission|401|403|\blogin\b)/i.test(error)) {
+      return 'GitHub認証またはrepository権限を確認できませんでした。公開処理の確定状況を再照合してください。'
+    }
+    if (/network|reach|timeout|通信/i.test(error)) {
+      return 'GitHubとの通信を確認できませんでした。公開前であれば自動再試行されます。'
+    }
+    if (/conflict|branch|base|head|checkout|config|設定/i.test(error)) {
+      return 'GitHub公開に必要なbranchまたはrepository状態が依頼内容と一致しませんでした。'
+    }
+    return 'GitHub公開の確定状態を確認できませんでした。重複操作を避けるため自動照合を優先します。'
+  }
   return '内部処理でエラーが発生しました。'
 }
 
@@ -9863,7 +10228,13 @@ export async function publishStagedGitHubPublication(
   } = {},
 ): Promise<void> {
   const announced = new Set<string>()
+  const assertNotCancelled = (): void => {
+    if (store.get(jobId)?.cancelRequestedAt !== null) {
+      throw new CodexUserCancelledError()
+    }
+  }
   while (true) {
+    assertNotCancelled()
     if (options.signal?.aborted) {
       throw new CodexResultPersistencePendingError(
         `GitHub publication remains staged for job ${jobId} after shutdown interruption`,
@@ -9902,8 +10273,31 @@ export async function publishStagedGitHubPublication(
     let receipt: GitHubPublicationReceipt
     try {
       const commands = options.commands ?? createHostGitHubPublicationCommands()
-      receipt = await publishGitHubPlan(work.plan, commands, options.signal)
+      const checkpoint = work.plan.promotion
+        ? async (progress: GitHubPromotionCheckpoint): Promise<void> => {
+            try {
+              store.recordGitHubPromotionCheckpoint(jobId, work.plan, progress)
+            } catch (error) {
+              throw new CodexResultPersistencePendingError(
+                `GitHub promotion substep receipt remains staged for job ${jobId}: ${error}`,
+              )
+            }
+            if (options.signal?.aborted) {
+              throw new CodexResultPersistencePendingError(
+                `GitHub publication remains staged for job ${jobId} after shutdown interruption`,
+              )
+            }
+            // The final follow-up PR is the plan's terminal remote mutation. Let
+            // the caller persist the complete receipt before honoring cancel.
+            if (progress.kind !== 'followup-pr') assertNotCancelled()
+          }
+        : undefined
+      // Every mutation is reconciled first. Promotion substeps are then stored
+      // durably and cancellation is honored before the next mutation begins.
+      receipt = await publishGitHubPlan(work.plan, commands, options.signal, checkpoint)
     } catch (error) {
+      if (error instanceof CodexUserCancelledError) throw error
+      if (error instanceof CodexResultPersistencePendingError) throw error
       if (options.signal?.aborted) {
         throw new CodexResultPersistencePendingError(
           `GitHub publication remains staged for job ${jobId} after shutdown interruption`,
@@ -9925,7 +10319,8 @@ export async function publishStagedGitHubPublication(
         )
       }
       const baseRetryMs = options.retryMsForTesting === undefined
-        ? (category === 'configuration' || category === 'conflict' ? 60_000 : 5_000)
+        ? (category === 'configuration' || category === 'conflict' ? 60_000
+          : category === 'waiting' ? 30_000 : 5_000)
         : positiveInteger(options.retryMsForTesting, 1)
       const retryMs = Math.min(baseRetryMs * (2 ** Math.min(work.attempts, 6)), 5 * 60_000)
       try {
@@ -9941,6 +10336,8 @@ export async function publishStagedGitHubPublication(
           ? 'このMacのGitHub認証またはrepository権限を確認しています'
           : category === 'network'
             ? 'GitHubとの通信回復を待っています'
+            : category === 'waiting'
+              ? 'feature PRの必須チェック・reviewまたはmerge queueの完了を待っています'
             : category === 'conflict'
               ? 'remote branchの競合解消を待っています'
               : category === 'configuration'
@@ -9964,6 +10361,7 @@ export async function publishStagedGitHubPublication(
         `GitHub publication receipt remains staged for job ${jobId}: ${error}`,
       )
     }
+    assertNotCancelled()
     try {
       await options.onStatus?.(
         `GitHub公開を確認しました: ${receipt.repositorySlug} #${receipt.pullRequestNumber}`,
@@ -10816,6 +11214,25 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         scheduleNotificationFlush()
         continue
       }
+      if (error instanceof CodexPublicationPreflightRetryError) {
+        const resumeAt = Date.now() + 5_000
+        await updateMonitor(
+          job,
+          error.category === 'authentication'
+            ? 'GitHub認証またはrepository権限を再確認しています'
+            : 'GitHubとの通信を再確認しています',
+        )
+        await quiesceLifecycleBeforeStateChange()
+        options.store.requeueAt(
+          job.id,
+          resumeAt,
+          message,
+          error.sessionId,
+          'github',
+        )
+        log(`${workerId} deferred publication preflight ${job.id}: ${message}`)
+        continue
+      }
       if (error instanceof CodexInterruptedError || options.signal?.aborted) {
         const appServerUncertain = options.store.initialTurnMayHaveBeenDelivered(job.id)
           || !options.store.initialTurnDispatchIsSafeToRetry(job.id)
@@ -11395,6 +11812,19 @@ function containsConfusableInternalImplementationName(
     match => ' '.repeat(match.length),
   )
   return containsImplementationSkeleton(withoutExactNames, allowedIdentifierText)
+}
+
+/**
+ * Path redaction is a safety boundary, but its implementation marker is not
+ * useful conversation text. Keep the redaction while presenting it as a
+ * semantic placeholder, including for legacy monitor text that used ASCII
+ * parentheses and can re-enter a resumed thread.
+ */
+export function naturalizeSlackRedactions(value: string): string {
+  const pathMarker = /[（(]\s*内部パスを省略\s*[）)]/g
+  return value
+    .replace(pathMarker, '対象箇所')
+    .replace(/対象箇所(?:\s*[、,・／/]\s*対象箇所)+/g, '対象箇所')
 }
 
 export function sanitizeExecutionTextForSlack(
@@ -12194,7 +12624,7 @@ export function sanitizeExecutionTextForSlack(
       `\uE004${gitCommitPlaceholderNonce}_${index}\uE005`, commit,
     )
   })
-  return sanitized.trim()
+  return naturalizeSlackRedactions(sanitized).trim()
 }
 
 /**
@@ -12641,14 +13071,16 @@ export function slackMessageIsAfter(candidate: string, boundary: string): boolea
 
 export function slackRateLimitMessage(
   resumeAt: number,
-  reason: 'rate-limit' | 'capacity' = 'rate-limit',
+  reason: 'rate-limit' | 'capacity' | 'github' = 'rate-limit',
 ): string {
   const time = new Intl.DateTimeFormat('ja-JP', {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
   }).format(new Date(resumeAt))
-  return reason === 'capacity'
+  return reason === 'github'
+    ? `⏸ GitHubとの接続を再確認しています。${time} に自動再開します。`
+    : reason === 'capacity'
     ? `⏸ 利用中のモデルが混雑しているため、一時停止しています。${time} に自動再開します。`
     : `⏸ 使用量上限のため、一時停止しています。${time} に自動再開します。`
 }
