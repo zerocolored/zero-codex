@@ -52,9 +52,10 @@ describe('process tree identity tracking', () => {
   )
 
   test('初回tableでroot generationを読めなければ空sentinelで成功扱いしない', () => {
+    const missingPid = 2_147_483_647
     const tracked = new Map<number, string>()
-    expect(() => updateTrackedProcesses([], [100], 100, tracked))
-      .toThrow('追跡root process 100のgenerationを取得できません')
+    expect(() => updateTrackedProcesses([], [missingPid], missingPid, tracked))
+      .toThrow(`追跡root process ${missingPid}のgenerationを取得できません`)
     expect(tracked.size).toBe(0)
   })
 

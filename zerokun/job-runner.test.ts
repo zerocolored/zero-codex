@@ -372,7 +372,7 @@ describe('host-enforced App Server permission phases', () => {
       inputRevision: snapshot.revision,
       inputDigest: snapshot.digest,
     })
-    expect(clientId).toBe(`${job.id}:phase:1`)
+    expect(clientId).toBe(`${job.id}:attempt:1:phase:1`)
     expect(store.beginAppServerPhaseDispatch({
       jobId: job.id,
       attempt: job.attempts,
@@ -3113,6 +3113,52 @@ describe('Codex job store', () => {
     const running = store.claimNext('publication-worker')!
     store.saveSession(running.id, 'publication-session')
     const advisorInput = readAdvisorInputSnapshot(state, running.id)
+    const firstAttemptNonce = '9'.repeat(32)
+    expect(store.beginInitialTurnDispatch({
+      jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+      executorNonce: firstAttemptNonce, threadId: 'publication-session', requestId: 1,
+      inputRevision: advisorInput.revision, inputDigest: advisorInput.digest,
+    })).toBe('dispatching')
+    store.acknowledgeInitialTurnDispatch({
+      jobId: running.id, workerId: running.workerId!, attempt: running.attempts,
+      epoch: running.controlEpoch, executorNonce: firstAttemptNonce,
+      threadId: 'publication-session', turnId: 'publication-prepare-1', requestId: 1,
+    })
+    store.finishAppServerTurn({
+      jobId: running.id, epoch: running.controlEpoch, executorNonce: firstAttemptNonce,
+      threadId: 'publication-session', turnId: 'publication-prepare-1', retainInput: true,
+    })
+    const firstAttemptPhaseId = store.prepareAppServerPhaseDispatch({
+      jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+      phaseSequence: 1, stage: 'implementation', logicalNonce: firstAttemptNonce,
+      threadId: 'publication-session', inputRevision: advisorInput.revision,
+      inputDigest: advisorInput.digest,
+    })
+    expect(firstAttemptPhaseId).toBe(`${running.id}:attempt:1:phase:1`)
+    expect(store.beginAppServerPhaseDispatch({
+      jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+      phaseSequence: 1, logicalNonce: firstAttemptNonce,
+      threadId: 'publication-session', requestId: 2,
+      inputRevision: advisorInput.revision, inputDigest: advisorInput.digest,
+    })).toBe('dispatching')
+    store.acknowledgeAppServerPhaseDispatch({
+      jobId: running.id, workerId: running.workerId!, attempt: running.attempts,
+      epoch: running.controlEpoch, phaseSequence: 1, logicalNonce: firstAttemptNonce,
+      threadId: 'publication-session', turnId: 'publication-implementation-1', requestId: 2,
+    })
+    store.finishAppServerTurn({
+      jobId: running.id, epoch: running.controlEpoch, executorNonce: firstAttemptNonce,
+      threadId: 'publication-session', turnId: 'publication-implementation-1', retainInput: true,
+    })
+    // A deployed database may still contain the pre-fix client ID. A later
+    // attempt must coexist with that durable audit row without migration.
+    const legacyDb = new Database(store.dbPath)
+    legacyDb.run(
+      `UPDATE job_phase_dispatches SET client_user_message_id = ?
+       WHERE job_id = ? AND attempt = 1 AND phase_sequence = 1`,
+      [`${running.id}:phase:1`, running.id],
+    )
+    legacyDb.close()
     const plan = promotionFixturePlan(repo)
     const publication: GitHubPublicationSet = {
       version: 1,
@@ -3180,6 +3226,51 @@ describe('Codex job store', () => {
     expect(resumed).toMatchObject({
       id: queued.id,
       attempts: 2,
+      sessionId: 'publication-session',
+      resumed: true,
+    })
+    expect(store.writePhaseMayHaveBeenDelivered(resumed.id)).toBe(true)
+    expect(store.writePhaseMayHaveBeenDelivered(resumed.id, resumed.attempts)).toBe(false)
+    store.saveSession(resumed.id, 'publication-session')
+    const resumedInput = readAdvisorInputSnapshot(state, resumed.id)
+    const resumedNonce = '8'.repeat(32)
+    expect(store.beginInitialTurnDispatch({
+      jobId: resumed.id, attempt: resumed.attempts, epoch: resumed.controlEpoch,
+      executorNonce: resumedNonce, threadId: 'publication-session', requestId: 3,
+      inputRevision: resumedInput.revision, inputDigest: resumedInput.digest,
+    })).toBe('dispatching')
+    store.acknowledgeInitialTurnDispatch({
+      jobId: resumed.id, workerId: resumed.workerId!, attempt: resumed.attempts,
+      epoch: resumed.controlEpoch, executorNonce: resumedNonce,
+      threadId: 'publication-session', turnId: 'publication-prepare-2', requestId: 3,
+    })
+    store.finishAppServerTurn({
+      jobId: resumed.id, epoch: resumed.controlEpoch, executorNonce: resumedNonce,
+      threadId: 'publication-session', turnId: 'publication-prepare-2', retainInput: true,
+    })
+    const resumedPhaseId = store.prepareAppServerPhaseDispatch({
+      jobId: resumed.id, attempt: resumed.attempts, epoch: resumed.controlEpoch,
+      phaseSequence: 1, stage: 'implementation', logicalNonce: resumedNonce,
+      threadId: 'publication-session', inputRevision: resumedInput.revision,
+      inputDigest: resumedInput.digest,
+    })
+    expect(resumedPhaseId).toBe(`${resumed.id}:attempt:2:phase:1`)
+    expect(resumedPhaseId).not.toBe(firstAttemptPhaseId)
+    expect(store.recoverInterrupted()).toEqual({
+      requeued: 1,
+      failedWrites: 0,
+      failedUncertain: 0,
+    })
+    expect(store.get(resumed.id)).toMatchObject({
+      status: 'queued',
+      sessionId: 'publication-session',
+      attempts: 2,
+      resumed: true,
+    })
+    expect(store.terminalNotificationCount()).toBe(0)
+    expect(store.claimNext('publication-worker-3')).toMatchObject({
+      id: resumed.id,
+      attempts: 3,
       sessionId: 'publication-session',
       resumed: true,
     })
@@ -4878,7 +4969,7 @@ describe('single FIFO worker', () => {
           threadId: 'write-review-thread',
           inputRevision: snapshot.revision,
           inputDigest: snapshot.digest,
-        })).toBe(`${job.id}:phase:1`)
+        })).toBe(`${job.id}:attempt:1:phase:1`)
         expect(store.beginAppServerPhaseDispatch({
           jobId: job.id,
           attempt: job.attempts,
@@ -6010,7 +6101,7 @@ describe('single FIFO worker', () => {
         threadId: `phase-thread-${receiptStatus}`,
         inputRevision: snapshot.revision,
         inputDigest: snapshot.digest,
-      })).toBe(`${job.id}:phase:1`)
+      })).toBe(`${job.id}:attempt:1:phase:1`)
       expect(store.beginAppServerPhaseDispatch({
         jobId: job.id,
         attempt: job.attempts,

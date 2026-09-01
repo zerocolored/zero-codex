@@ -5371,14 +5371,22 @@ export class JobStore {
     ).get(jobId) !== null)
   }
 
-  writePhaseMayHaveBeenDelivered(jobIdInput: string): boolean {
+  writePhaseMayHaveBeenDelivered(jobIdInput: string, attemptInput?: number): boolean {
     const jobId = requireText(jobIdInput, 'jobId')
-    return retrySqlite(() => this.db.query<{ present: number }, [string]>(
+    const attempt = attemptInput === undefined ? null : Math.floor(attemptInput)
+    if (attempt !== null && (!Number.isSafeInteger(attempt) || attempt < 1)) {
+      throw new Error('App Server phase attempt is invalid')
+    }
+    return retrySqlite(() => this.db.query<
+      { present: number },
+      [string, number | null, number | null]
+    >(
       `SELECT 1 AS present
        FROM job_phase_dispatches receipts
        WHERE receipts.job_id = ? AND receipts.stage = 'implementation'
+         AND (? IS NULL OR receipts.attempt = ?)
          AND receipts.status IN ('dispatching', 'acknowledged', 'observed', 'ambiguous')`,
-    ).get(jobId) !== null)
+    ).get(jobId, attempt, attempt) !== null)
   }
 
   writeTransientFailureCanRetry(
@@ -5424,7 +5432,8 @@ export class JobStore {
       || !/^[0-9a-f]{64}$/.test(options.inputDigest)) {
       throw new Error('App Server phase dispatch binding is invalid')
     }
-    const clientUserMessageId = `${requireText(options.jobId, 'jobId')}:phase:${options.phaseSequence}`
+    const clientUserMessageId = `${requireText(options.jobId, 'jobId')}`
+      + `:attempt:${Math.floor(options.attempt)}:phase:${options.phaseSequence}`
     const prepare = this.db.transaction(() => {
       const job = this.db.query<{
         executor_nonce: string | null
@@ -7320,6 +7329,100 @@ export class JobStore {
       })
     })
     return retrySqlite(() => transition.immediate())
+  }
+
+  private requeueInterruptedGitHubPublicationRecovery(jobIdInput: string): boolean {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const requeue = this.db.transaction(() => {
+      const job = this.db.query<{
+        attempts: number
+        session_id: string | null
+        cancel_requested_at: number | null
+        executor_pid: number | null
+        active_turn_id: string | null
+        pending_session_id: string | null
+        pending_result: string | null
+        ui_approval_request_id: string | null
+      }, [string]>(
+        `SELECT attempts, session_id, cancel_requested_at, executor_pid,
+                active_turn_id, pending_session_id, pending_result,
+                ui_approval_request_id
+         FROM jobs
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND write_enabled = 1`,
+      ).get(jobId)
+      if (!job || job.cancel_requested_at !== null || job.executor_pid !== null
+        || job.active_turn_id !== null || job.pending_session_id !== null
+        || job.pending_result !== null || job.ui_approval_request_id !== null) return false
+      const recoveryRow = this.db.query<GitHubPublicationRecoveryRow, [string]>(
+        `SELECT source_attempt, session_id, recovery_json, recovery_digest, reason, created_at
+         FROM github_publication_recoveries WHERE job_id = ?
+         ORDER BY source_attempt DESC LIMIT 1`,
+      ).get(jobId)
+      if (!recoveryRow || recoveryRow.source_attempt >= job.attempts
+        || recoveryRow.session_id !== job.session_id) return false
+      // The archived publication attempt may contain an observed write phase;
+      // only the current recovery attempt must still be pre-implementation.
+      parseGitHubPublicationRecovery(jobId, recoveryRow)
+      const completedPreparation = this.db.query<
+        { present: number }, [string, number, string, number]
+      >(
+        `SELECT 1 AS present
+         WHERE EXISTS (
+           SELECT 1 FROM job_initial_dispatches AS initial
+           WHERE initial.job_id = ? AND initial.attempt = ? AND initial.status = 'observed'
+         ) OR EXISTS (
+           SELECT 1 FROM job_phase_dispatches AS phase
+           WHERE phase.job_id = ? AND phase.attempt = ?
+             AND phase.stage = 'prepare' AND phase.status = 'observed'
+         )`,
+      ).get(jobId, job.attempts, jobId, job.attempts)
+      if (!completedPreparation || this.writePhaseMayHaveBeenDelivered(jobId, job.attempts)) {
+        return false
+      }
+      const now = Date.now()
+      const updated = this.db.run(
+        `UPDATE jobs
+         SET status = 'queued', resumed = 1,
+             worker_id = NULL, started_at = NULL, executor_pid = NULL,
+             pending_session_id = NULL, pending_result = NULL,
+             not_before = NULL, finished_at = NULL,
+             last_error = 'daemon restarted while Codex was resolving a GitHub publication conflict; resuming the same Codex session',
+             repository_drift_intent_attempt = NULL,
+             repository_drift_intent_reason = NULL,
+             accepts_control = 1, executor_nonce = NULL,
+             active_thread_id = NULL, active_turn_id = NULL,
+             terminal_outcome = NULL
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND write_enabled = 1 AND attempts = ? AND session_id = ?
+           AND cancel_requested_at IS NULL AND executor_pid IS NULL
+           AND active_turn_id IS NULL AND pending_session_id IS NULL
+           AND pending_result IS NULL AND ui_approval_request_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM github_publication_recoveries AS recovery
+             WHERE recovery.job_id = jobs.id AND recovery.source_attempt < jobs.attempts
+               AND recovery.session_id = jobs.session_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM job_phase_dispatches AS phase
+             WHERE phase.job_id = jobs.id AND phase.attempt = jobs.attempts
+               AND phase.stage = 'implementation'
+               AND phase.status IN ('dispatching', 'acknowledged', 'observed', 'ambiguous')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM github_publication_sets AS publication
+             WHERE publication.job_id = jobs.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM monitor_failures WHERE monitor_failures.job_id = jobs.id
+           )`,
+        [jobId, job.attempts, job.session_id],
+      )
+      if (updated.changes !== 1) return false
+      this.supersedeLifecycleNotifications(jobId, now)
+      return true
+    })
+    return retrySqlite(() => requeue.immediate())
   }
 
   recordGitHubPublicationFailure(
@@ -10177,6 +10280,10 @@ export class JobStore {
         // or already recorded. Never downgrade it to the generic uncertain-
         // write failure during restart recovery.
         if (publicationCheckpoints.has(job.id)) continue
+        if (this.requeueInterruptedGitHubPublicationRecovery(job.id)) {
+          requeued += 1
+          continue
+        }
         const disposition = this.requeueAfterPreImplementationRepositoryDrift(
           job.id,
         )
@@ -11614,7 +11721,8 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         scheduleNotificationFlush()
         continue
       }
-      const failure = job.writeEnabled && options.store.writePhaseMayHaveBeenDelivered(job.id)
+      const failure = job.writeEnabled
+        && options.store.writePhaseMayHaveBeenDelivered(job.id, job.attempts)
         ? 'write-enabled implementation may already have changed the repository or external '
           + 'services before a later phase failed. Review those effects, then resend only if '
           + `needed. Underlying failure: ${message}`
