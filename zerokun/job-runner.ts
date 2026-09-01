@@ -7,6 +7,7 @@ import {
   closeSync,
   constants,
   fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -17,6 +18,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'fs'
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'path'
@@ -468,6 +470,31 @@ export interface JobRecord {
   cancelRequestedAt: number | null
   terminalOutcome: JobTerminalOutcome | null
   uiApprovalRequestId: string | null
+  /** Trusted host context injected only for a same-job publication recovery. */
+  githubPublicationRecovery?: GitHubPublicationRecoveryContext
+}
+
+export type GitHubPublicationRecoveryPlanContext = {
+  repositorySlug: string
+  baseBranch: string
+  headBranch: string
+  commitSha: string
+  status: 'pending' | 'completed'
+  pullRequestNumber: number | null
+  pullRequestUrl: string | null
+  followupPullRequestNumber: number | null
+  followupPullRequestUrl: string | null
+  selectedObsoletePullRequestNumbers: number[]
+  checkpoint: GitHubPromotionCheckpoint | null
+}
+
+export type GitHubPublicationRecoveryContext = {
+  version: 1
+  sourceAttempt: number
+  reason: string
+  priorResult: string
+  plans: GitHubPublicationRecoveryPlanContext[]
+  createdAt: number
 }
 
 type JobRow = {
@@ -914,6 +941,20 @@ CREATE TABLE IF NOT EXISTS github_promotion_progress (
   checkpoint_json TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (job_id, git_root),
+  FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
+-- A publication conflict is work for Codex, not a host retry condition. Keep
+-- the previous reviewed plan and observed remote effects so the same Slack
+-- job can resume without losing its publication history.
+CREATE TABLE IF NOT EXISTS github_publication_recoveries (
+  job_id TEXT NOT NULL,
+  source_attempt INTEGER NOT NULL CHECK (source_attempt > 0),
+  session_id TEXT NOT NULL,
+  recovery_json TEXT NOT NULL,
+  recovery_digest TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (job_id, source_attempt),
   FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS ui_approval_requests (
@@ -2740,6 +2781,33 @@ type GitHubPromotionProgressRow = {
   checkpoint_json: string
 }
 
+type GitHubPublicationRecoveryArchiveV1 = {
+  version: 1
+  sourceAttempt: number
+  sessionId: string
+  priorResult: string
+  plans: Array<{
+    plan: GitHubPublicationPlan
+    status: 'pending' | 'completed'
+    pullRequestNumber: number | null
+    pullRequestUrl: string | null
+    followupPullRequestNumber: number | null
+    followupPullRequestUrl: string | null
+    checkpoint: GitHubPromotionCheckpoint | null
+  }>
+  reason: string
+  createdAt: number
+}
+
+type GitHubPublicationRecoveryRow = {
+  source_attempt: number
+  session_id: string
+  recovery_json: string
+  recovery_digest: string
+  reason: string
+  created_at: number
+}
+
 const GITHUB_PROMOTION_CHECKPOINT_RANK: Record<GitHubPromotionCheckpoint['kind'], number> = {
   'source-branch': 1,
   'integration-pr': 2,
@@ -2783,6 +2851,78 @@ function assertPromotionCheckpointExtends(
     && (previous.followupPullRequestNumber !== next.followupPullRequestNumber
       || previous.followupPullRequestUrl !== next.followupPullRequestUrl)) {
     throw new Error('GitHub promotion follow-up PR checkpoint conflicts')
+  }
+}
+
+function parseGitHubPublicationRecovery(
+  jobId: string,
+  row: GitHubPublicationRecoveryRow,
+): GitHubPublicationRecoveryContext {
+  const digest = createHash('sha256').update(row.recovery_json).digest('hex')
+  if (digest !== row.recovery_digest) {
+    throw new Error(`GitHub publication recovery digest conflicts for job ${jobId}`)
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(row.recovery_json) } catch {
+    throw new Error(`GitHub publication recovery is invalid JSON for job ${jobId}`)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`GitHub publication recovery is invalid for job ${jobId}`)
+  }
+  const archive = parsed as GitHubPublicationRecoveryArchiveV1
+  if (archive.version !== 1 || archive.sourceAttempt !== row.source_attempt
+    || archive.sessionId !== row.session_id || archive.reason !== row.reason
+    || archive.createdAt !== row.created_at || !archive.sessionId
+    || typeof archive.priorResult !== 'string'
+    || archive.priorResult.length > MAX_PERSISTED_RESULT_TEXT_CHARS
+    || !Array.isArray(archive.plans) || archive.plans.length < 1
+    || archive.plans.length > MAX_GITHUB_PUBLICATION_REPOSITORIES) {
+    throw new Error(`GitHub publication recovery fields conflict for job ${jobId}`)
+  }
+  validateStoredGitHubPublicationSet({
+    version: 1,
+    jobId,
+    jobAttempt: archive.sourceAttempt,
+    logicalNonce: '0'.repeat(32),
+    inputRevision: 1,
+    inputDigest: '0'.repeat(64),
+    reviewRound: 1,
+    reviewedRepositoryDigest: '0'.repeat(64),
+    baselineDigest: '0'.repeat(64),
+    plans: archive.plans.map(value => value.plan),
+  })
+  for (const entry of archive.plans) {
+    if (entry.status !== 'pending' && entry.status !== 'completed') {
+      throw new Error(`GitHub publication recovery status is invalid for job ${jobId}`)
+    }
+    if (entry.checkpoint !== null) {
+      if (!entry.plan.promotion) {
+        throw new Error(`GitHub publication recovery checkpoint has no promotion for job ${jobId}`)
+      }
+      assertGitHubPromotionCheckpoint(entry.plan, entry.checkpoint)
+    }
+  }
+  return {
+    version: 1,
+    sourceAttempt: archive.sourceAttempt,
+    reason: archive.reason,
+    priorResult: archive.priorResult,
+    plans: archive.plans.map(entry => ({
+      repositorySlug: entry.plan.repositorySlug,
+      baseBranch: entry.plan.baseBranch,
+      headBranch: entry.plan.headBranch,
+      commitSha: entry.plan.commitSha,
+      status: entry.status,
+      pullRequestNumber: entry.pullRequestNumber,
+      pullRequestUrl: entry.pullRequestUrl,
+      followupPullRequestNumber: entry.followupPullRequestNumber,
+      followupPullRequestUrl: entry.followupPullRequestUrl,
+      selectedObsoletePullRequestNumbers: [
+        ...(entry.plan.promotion?.closePullRequestNumbers ?? []),
+      ],
+      checkpoint: entry.checkpoint,
+    })),
+    createdAt: archive.createdAt,
   }
 }
 
@@ -7043,6 +7183,145 @@ export class JobStore {
     return row ? parseStoredGitHubPromotionCheckpoint(plan, row) : null
   }
 
+  latestGitHubPublicationRecovery(jobId: string): GitHubPublicationRecoveryContext | undefined {
+    const row = this.db.query<GitHubPublicationRecoveryRow, [string]>(
+      `SELECT source_attempt, session_id, recovery_json, recovery_digest, reason, created_at
+       FROM github_publication_recoveries WHERE job_id = ?
+       ORDER BY source_attempt DESC LIMIT 1`,
+    ).get(jobId)
+    return row ? parseGitHubPublicationRecovery(jobId, row) : undefined
+  }
+
+  requeueGitHubPublicationConflictForCodex(
+    jobIdInput: string,
+    expectedPlan: GitHubPublicationPlan,
+    reasonInput: string,
+  ): GitHubPublicationRecoveryContext {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const reason = requireText(reasonInput, 'GitHub publication recovery reason').slice(0, 4_000)
+    const transition = this.db.transaction((): GitHubPublicationRecoveryContext => {
+      const job = this.db.query<{
+        status: JobStatus
+        write_enabled: number
+        attempts: number
+        session_id: string | null
+        pending_session_id: string | null
+        pending_result: string | null
+        cancel_requested_at: number | null
+      }, [string]>(
+        `SELECT status, write_enabled, attempts, session_id, pending_session_id,
+                pending_result, cancel_requested_at
+         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+      ).get(jobId)
+      if (!job) throw new Error(`GitHub publication recovery job disappeared: ${jobId}`)
+      if (job.status === 'queued') {
+        const existing = this.latestGitHubPublicationRecovery(jobId)
+        if (existing?.plans.some(plan => (
+          plan.repositorySlug === expectedPlan.repositorySlug
+          && plan.headBranch === expectedPlan.headBranch
+          && plan.commitSha === expectedPlan.commitSha
+        ))) return existing
+      }
+      if (job.status !== 'running' || job.write_enabled !== 1
+        || job.cancel_requested_at !== null || !job.pending_session_id
+        || job.pending_result === null || job.pending_result.length > MAX_PERSISTED_RESULT_TEXT_CHARS) {
+        throw new Error(`job ${jobId} cannot resume from its GitHub publication conflict`)
+      }
+      const set = this.db.query<{
+        job_attempt: number
+        session_id: string
+        status: 'pending' | 'completed'
+      }, [string]>(
+        `SELECT job_attempt, session_id, status FROM github_publication_sets WHERE job_id = ?`,
+      ).get(jobId)
+      if (!set || set.status !== 'pending' || set.job_attempt !== job.attempts
+        || set.session_id !== job.pending_session_id) {
+        throw new Error(`GitHub publication recovery binding conflicts for job ${jobId}`)
+      }
+      const rows = githubPublicationRows(this.db, jobId)
+      if (rows.length < 1) {
+        throw new Error(`GitHub publication recovery has no plans for job ${jobId}`)
+      }
+      const conflicted = rows.find(row => (
+        row.status === 'pending'
+        && JSON.stringify(publicationPlanFromRow(row)) === JSON.stringify(expectedPlan)
+      ))
+      if (!conflicted) {
+        throw new Error(`GitHub publication recovery plan conflicts for job ${jobId}`)
+      }
+      const createdAt = Date.now()
+      const archive: GitHubPublicationRecoveryArchiveV1 = {
+        version: 1,
+        sourceAttempt: job.attempts,
+        sessionId: job.pending_session_id,
+        priorResult: job.pending_result,
+        plans: rows.map(row => {
+          const plan = publicationPlanFromRow(row)
+          const progress = plan.promotion
+            ? this.db.query<GitHubPromotionProgressRow, [string, string]>(
+                `SELECT commit_sha, checkpoint_kind, checkpoint_json
+                 FROM github_promotion_progress WHERE job_id = ? AND git_root = ?`,
+              ).get(jobId, plan.gitRoot)
+            : null
+          return {
+            plan,
+            status: row.status,
+            pullRequestNumber: row.pull_request_number,
+            pullRequestUrl: row.pull_request_url,
+            followupPullRequestNumber: row.followup_pull_request_number,
+            followupPullRequestUrl: row.followup_pull_request_url,
+            checkpoint: progress ? parseStoredGitHubPromotionCheckpoint(plan, progress) : null,
+          }
+        }),
+        reason,
+        createdAt,
+      }
+      const serialized = JSON.stringify(archive)
+      const digest = createHash('sha256').update(serialized).digest('hex')
+      this.db.run(
+        `INSERT INTO github_publication_recoveries (
+           job_id, source_attempt, session_id, recovery_json, recovery_digest, reason, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [jobId, job.attempts, job.pending_session_id, serialized, digest, reason, createdAt],
+      )
+      this.db.run('DELETE FROM github_promotion_progress WHERE job_id = ?', [jobId])
+      this.db.run('DELETE FROM github_publications WHERE job_id = ?', [jobId])
+      this.db.run('DELETE FROM github_promotion_publications WHERE job_id = ?', [jobId])
+      this.db.run('DELETE FROM github_publication_sets WHERE job_id = ?', [jobId])
+      const updated = this.db.run(
+        `UPDATE jobs
+         SET status = 'queued', session_id = ?, resumed = 1,
+             worker_id = NULL, started_at = NULL, executor_pid = NULL,
+             pending_session_id = NULL, pending_result = NULL,
+             not_before = NULL, finished_at = NULL, last_error = ?,
+             accepts_control = 1, executor_nonce = NULL,
+             active_thread_id = NULL, active_turn_id = NULL,
+             terminal_outcome = NULL, ui_approval_request_id = NULL,
+             monitor_state = CASE WHEN monitor_state = 3 THEN 0 ELSE monitor_state END
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+           AND attempts = ? AND cancel_requested_at IS NULL
+           AND pending_session_id = ? AND pending_result = ?`,
+        [
+          job.pending_session_id, reason, jobId, job.attempts,
+          job.pending_session_id, job.pending_result,
+        ],
+      )
+      if (updated.changes !== 1) {
+        throw new Error(`GitHub publication recovery raced for job ${jobId}`)
+      }
+      this.supersedeLifecycleNotifications(jobId, createdAt)
+      return parseGitHubPublicationRecovery(jobId, {
+        source_attempt: job.attempts,
+        session_id: job.pending_session_id,
+        recovery_json: serialized,
+        recovery_digest: digest,
+        reason,
+        created_at: createdAt,
+      })
+    })
+    return retrySqlite(() => transition.immediate())
+  }
+
   recordGitHubPublicationFailure(
     jobId: string,
     plan: GitHubPublicationPlan,
@@ -10219,6 +10498,30 @@ export class CodexResultPersistencePendingError extends Error {
   }
 }
 
+export class CodexPublicationConflictRecoveryError extends Error {
+  constructor(
+    readonly jobId: string,
+    readonly plan: GitHubPublicationPlan,
+    readonly reason: string,
+  ) {
+    super(reason)
+    this.name = 'CodexPublicationConflictRecoveryError'
+  }
+}
+
+export function requeueGitHubPublicationConflictForCodex(
+  store: JobStore,
+  stateDir: string,
+  error: CodexPublicationConflictRecoveryError,
+): GitHubPublicationRecoveryContext {
+  discardExecutionResultJournalForPublicationRecovery(stateDir, error.jobId)
+  return store.requeueGitHubPublicationConflictForCodex(
+    error.jobId,
+    error.plan,
+    `GitHub publication needs a new Codex decision: ${error.reason}`,
+  )
+}
+
 export async function publishStagedGitHubPublication(
   store: JobStore,
   jobId: string,
@@ -10268,7 +10571,11 @@ export async function publishStagedGitHubPublication(
       )
     }
     const now = Date.now()
-    if (work.notBefore !== null && work.notBefore > now) {
+    // A stored conflict is re-reconciled immediately after an update/restart.
+    // If it still exists below, it is returned to Codex instead of entering
+    // the mechanical retry loop again.
+    if (work.lastErrorCategory !== 'conflict'
+      && work.notBefore !== null && work.notBefore > now) {
       await Bun.sleep(Math.min(1_000, Math.max(1, work.notBefore - now)))
       continue
     }
@@ -10306,6 +10613,13 @@ export async function publishStagedGitHubPublication(
         )
       }
       const category = error instanceof GitHubPublicationError ? error.category : 'remote'
+      if (category === 'conflict') {
+        throw new CodexPublicationConflictRecoveryError(
+          jobId,
+          work.plan,
+          error instanceof Error ? error.message : 'GitHub publication conflict requires Codex',
+        )
+      }
       if (category === 'cleanup') {
         try {
           store.recordGitHubPublicationFailure(jobId, work.plan, category, Date.now())
@@ -10331,7 +10645,7 @@ export async function publishStagedGitHubPublication(
         throw error
       }
       const baseRetryMs = options.retryMsForTesting === undefined
-        ? (category === 'configuration' || category === 'conflict' ? 60_000
+        ? (category === 'configuration' ? 60_000
           : category === 'waiting' ? 30_000 : 5_000)
         : positiveInteger(options.retryMsForTesting, 1)
       const retryMs = Math.min(baseRetryMs * (2 ** Math.min(work.attempts, 6)), 5 * 60_000)
@@ -10350,8 +10664,6 @@ export async function publishStagedGitHubPublication(
             ? 'GitHubとの通信回復を待っています'
             : category === 'waiting'
               ? 'feature PRの必須チェック・reviewまたはmerge queueの完了を待っています'
-            : category === 'conflict'
-              ? 'remote branchの競合解消を待っています'
               : category === 'configuration'
                 ? 'review済みrepository状態への復帰を待っています'
                 : 'GitHubの確定receiptを再照合しています'
@@ -11096,6 +11408,23 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       scheduleNotificationFlush()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof CodexPublicationConflictRecoveryError) {
+        await updateMonitor(
+          job,
+          'GitHub側の競合を同じ履歴へ戻し、Codexが解消方法を判断して続行します',
+        )
+        await quiesceLifecycleBeforeStateChange()
+        const recovery = requeueGitHubPublicationConflictForCodex(
+          options.store,
+          options.advisorStateDir ?? dirname(options.store.dbPath),
+          error,
+        )
+        log(
+          `${workerId} requeued ${job.id} for Codex publication recovery from attempt `
+          + `${recovery.sourceAttempt}`,
+        )
+        continue
+      }
       if (error instanceof CodexUiApprovalRequiredError) {
         try {
           const current = options.store.get(job.id)
@@ -11574,6 +11903,22 @@ export function recoverExecutionResultJournals(store: JobStore, dir: string): nu
     )) recovered += 1
   }
   return recovered
+}
+
+export function discardExecutionResultJournalForPublicationRecovery(
+  dir: string,
+  jobId: string,
+): boolean {
+  const path = executionResultJournalPath(dir, jobId)
+  const raw = readOptionalPrivateFile(path)
+  if (raw === null) return false
+  // Validate the exact owner-only journal before removing it. At this point
+  // the same result and publication set are already durable in SQLite.
+  parseExecutionResultJournal(raw, jobId)
+  unlinkSync(path)
+  const parent = openSync(dirname(path), constants.O_RDONLY)
+  try { fsyncSync(parent) } finally { closeSync(parent) }
+  return true
 }
 
 export function sealedArtifactDirForJob(dir: string, jobId: string): string {
@@ -14584,14 +14929,29 @@ async function runCli(): Promise<void> {
           }) },
         ),
         async jobId => {
-          await publishStagedGitHubPublication(store, jobId, {
-            signal: recoveryController.signal,
-            onStatus: message => {
-              try { appendHerdrJobMonitorStatus(dir, jobId, message) } catch (error) {
-                log(`GitHub publication monitor update failed for ${jobId}: ${String(error)}`)
-              }
-            },
-          })
+          try {
+            await publishStagedGitHubPublication(store, jobId, {
+              signal: recoveryController.signal,
+              onStatus: message => {
+                try { appendHerdrJobMonitorStatus(dir, jobId, message) } catch (error) {
+                  log(`GitHub publication monitor update failed for ${jobId}: ${String(error)}`)
+                }
+              },
+            })
+          } catch (error) {
+            if (!(error instanceof CodexPublicationConflictRecoveryError)) throw error
+            try {
+              appendHerdrJobMonitorStatus(
+                dir,
+                jobId,
+                'GitHub側の競合を同じ履歴へ戻し、Codexが解消方法を判断して続行します',
+              )
+            } catch (monitorError) {
+              log(`GitHub publication monitor update failed for ${jobId}: ${String(monitorError)}`)
+            }
+            requeueGitHubPublicationConflictForCodex(store, dir, error)
+            log(`requeued ${jobId} for Codex publication conflict recovery during startup`)
+          }
         },
       )
       if (journaled > 0) log(`recovered ${journaled} durable execution result journal(s)`)
@@ -14771,14 +15131,29 @@ async function runCli(): Promise<void> {
         }) },
       ),
       async jobId => {
-        await publishStagedGitHubPublication(store, jobId, {
-          signal: controller.signal,
-          onStatus: message => {
-            try { appendHerdrJobMonitorStatus(dir, jobId, message) } catch (error) {
-              log(`GitHub publication monitor update failed for ${jobId}: ${String(error)}`)
-            }
-          },
-        })
+        try {
+          await publishStagedGitHubPublication(store, jobId, {
+            signal: controller.signal,
+            onStatus: message => {
+              try { appendHerdrJobMonitorStatus(dir, jobId, message) } catch (error) {
+                log(`GitHub publication monitor update failed for ${jobId}: ${String(error)}`)
+              }
+            },
+          })
+        } catch (error) {
+          if (!(error instanceof CodexPublicationConflictRecoveryError)) throw error
+          try {
+            appendHerdrJobMonitorStatus(
+              dir,
+              jobId,
+              'GitHub側の競合を同じ履歴へ戻し、Codexが解消方法を判断して続行します',
+            )
+          } catch (monitorError) {
+            log(`GitHub publication monitor update failed for ${jobId}: ${String(monitorError)}`)
+          }
+          requeueGitHubPublicationConflictForCodex(store, dir, error)
+          log(`requeued ${jobId} for Codex publication conflict recovery during startup`)
+        }
       },
     )
     if (journaled > 0) log(`recovered ${journaled} durable execution result journal(s)`)
@@ -15033,7 +15408,10 @@ async function runCli(): Promise<void> {
         }
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
-          const execution = await executeCodexJob(job, {
+          const execution = await executeCodexJob({
+            ...job,
+            githubPublicationRecovery: store.latestGitHubPublicationRecovery(job.id),
+          }, {
             signal: executionController.signal,
             stateDir: dir,
             logDir: join(dir, 'job-logs'),

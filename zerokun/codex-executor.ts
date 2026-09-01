@@ -24,6 +24,7 @@ import type {
   JobInterjectionRecord,
   JobLiveInputRecord,
   JobRecord,
+  GitHubPublicationRecoveryContext,
 } from './job-runner.ts'
 import {
   ensureManagedDirectory,
@@ -3165,6 +3166,25 @@ const SLACK_PUBLIC_PROSE_GUIDANCE = [
   '対象ファイル、or 関連設定. Relative repository names and public GitHub URLs may be shown.',
 ].join(' ')
 
+function githubPublicationRecoveryControl(
+  recovery: GitHubPublicationRecoveryContext | undefined,
+): string[] {
+  if (!recovery) return []
+  return [
+    'GitHub publication recovery (trusted host state):',
+    JSON.stringify(recovery),
+    'This is a continuation of the same approved Slack task, not a new product request.',
+    'The host detected a publication conflict and deliberately returned the decision to Codex.',
+    'Inspect the current remote/repository state and choose the appropriate resolution yourself,',
+    'including rebase, cherry-pick, a replacement implementation, or publication-only recovery.',
+    'Preserve the approved UI/UX direction; do not repeat Before/After approval unless your chosen',
+    'resolution would materially change that approved experience.',
+    'An existing PR is a recorded remote side effect, not a blocker. If a replacement makes it',
+    'obsolete, select its number in closePullRequestNumbers. The host will close it only after the',
+    'exact replacement has passed required checks and is mergeable.',
+  ]
+}
+
 export function buildCodexWorkerPrompt(
   job: JobRecord,
   input?: Pick<AdvisorInputSnapshot, 'revision' | 'digest' | 'transcript'>,
@@ -3215,6 +3235,7 @@ export function buildCodexWorkerPrompt(
       'Thread history is context only; current host authority and current input always win.',
     )
   }
+  control.push(...githubPublicationRecoveryControl(job.githubPublicationRecovery))
   if (!job.writeEnabled) {
     control.push(
       'Host mode: read-only investigation.',
@@ -3407,6 +3428,7 @@ export function buildCodexPhasePrompt(
       'Thread history is context only; current host authority and current input always win.',
     )
   }
+  host.push(...githubPublicationRecoveryControl(job.githubPublicationRecovery))
   host.push(SLACK_PUBLIC_PROSE_GUIDANCE)
   if (stage === 'prepare') {
     if (uiApproval && (!repositoryChange
@@ -4039,6 +4061,105 @@ export function resolveGitMetadataPaths(repo: string): string[] {
   return layout ? [...new Set([layout.gitDir, layout.commonDir])] : []
 }
 
+export type CodexToolchainRuntime = {
+  path: string
+  readPaths: string[]
+}
+
+const CORE_TOOLCHAIN_PATHS = ['/usr/bin', '/bin', '/usr/sbin', '/sbin'] as const
+const HOMEBREW_PREFIXES = ['/opt/homebrew', '/usr/local', '/home/linuxbrew/.linuxbrew'] as const
+
+function existingDirectory(path: string): boolean {
+  try { return lstatSync(realpathSync(path)).isDirectory() } catch { return false }
+}
+
+function homeToolchainDirectory(home: string, path: string): boolean {
+  const local = relative(home, path)
+  if (!local || local === '..' || local.startsWith(`..${sep}`) || isAbsolute(local)) return false
+  if ([
+    '.bun/bin', '.local/bin', '.cargo/bin', '.volta/bin', '.asdf/shims', '.mise/shims',
+    'Library/pnpm',
+  ].includes(local)) return true
+  return /^\.nvm\/versions\/[^/]+\/[^/]+\/bin$/u.test(local)
+}
+
+/**
+ * Preserve ordinary project toolchains without exposing the operator HOME or
+ * Zero's state to the model. The returned PATH is deterministic and every
+ * non-core entry has a matching read grant in the generated permission set.
+ */
+export function resolveCodexToolchainRuntime(options: {
+  sourcePath?: string
+  repoPath: string
+  stateDir: string
+  artifactDir: string
+  scratchDir: string
+  homeDir?: string
+  codexHome?: string
+  tempDir?: string
+}): CodexToolchainRuntime {
+  const home = realpathSync(options.homeDir ?? homedir())
+  const protectedRoots = [
+    options.repoPath,
+    options.stateDir,
+    options.artifactDir,
+    options.scratchDir,
+    options.codexHome,
+    options.tempDir,
+  ].filter((value): value is string => Boolean(value)).map(value => {
+    try { return realpathSync(value) } catch { return resolve(value) }
+  })
+  const accepted: string[] = []
+  const readPaths = new Set<string>()
+  const addPath = (input: string, core = false): void => {
+    if (!input || !isAbsolute(input) || /[\0\r\n]/u.test(input) || !existingDirectory(input)) return
+    const logical = resolve(input)
+    const physical = realpathSync(input)
+    if (!core && protectedRoots.some(root => (
+      pathContains(root, physical) || pathContains(physical, root)
+    ))) return
+    const underHome = pathContains(home, physical)
+    const underHomebrew = HOMEBREW_PREFIXES.some(prefix => (
+      existingDirectory(prefix) && pathContains(realpathSync(prefix), physical)
+    ))
+    if (!core && underHome && !homeToolchainDirectory(home, physical)) return
+    if (!core && !underHome && !underHomebrew) return
+    if (!accepted.includes(logical)) accepted.push(logical)
+    if (!core) {
+      readPaths.add(logical)
+      readPaths.add(physical)
+    }
+  }
+  for (const path of CORE_TOOLCHAIN_PATHS) addPath(path, true)
+  for (const path of (options.sourcePath ?? process.env.PATH ?? '').split(':')) addPath(path)
+
+  for (const prefixInput of HOMEBREW_PREFIXES) {
+    if (!existingDirectory(prefixInput)) continue
+    const prefix = realpathSync(prefixInput)
+    if (!accepted.some(path => pathContains(prefix, realpathSync(path)))) continue
+    for (const child of ['bin', 'sbin', 'Cellar', 'opt', 'lib', 'share']) {
+      const path = join(prefixInput, child)
+      if (!existingDirectory(path)) continue
+      readPaths.add(resolve(path))
+      readPaths.add(realpathSync(path))
+    }
+    const etc = join(prefixInput, 'etc')
+    if (!existingDirectory(etc)) continue
+    for (const entry of readdirSync(etc)) {
+      if (!/^openssl(?:@[^/]+)?$/u.test(entry)) continue
+      const config = join(etc, entry, 'openssl.cnf')
+      try {
+        const physical = realpathSync(config)
+        if (lstatSync(physical).isFile()) {
+          readPaths.add(resolve(config))
+          readPaths.add(physical)
+        }
+      } catch {}
+    }
+  }
+  return { path: accepted.join(':'), readPaths: [...readPaths].sort() }
+}
+
 export function buildCodexPermissionOverrides(
   job: JobRecord,
   options: {
@@ -4056,6 +4177,7 @@ export function buildCodexPermissionOverrides(
     executionWriteEnabled?: boolean
     localVerificationEnabled?: boolean
     multiAgentEnabled?: boolean
+    toolchainPath?: string
   },
 ): string[] {
   const profile = options.profile ?? 'zerokun_job'
@@ -4133,6 +4255,17 @@ export function buildCodexPermissionOverrides(
   const codexHome = process.env.CODEX_HOME
   if (codexHome && existsSync(codexHome)) rules.set(realpathSync(codexHome), 'deny')
   if (existsSync(tmpdir())) rules.set(realpathSync(tmpdir()), 'deny')
+  const toolchain = resolveCodexToolchainRuntime({
+    sourcePath: options.toolchainPath,
+    repoPath: repo,
+    stateDir: state,
+    artifactDir,
+    scratchDir,
+    homeDir: home,
+    codexHome,
+    tempDir: tmpdir(),
+  })
+  for (const path of toolchain.readPaths) rules.set(path, 'read')
   if (options.seatbeltFingerprintAllowPath) {
     const allowPath = realpathSync(options.seatbeltFingerprintAllowPath)
     if (!pathContains(state, allowPath)) {
@@ -4184,6 +4317,7 @@ export function buildCodexPermissionOverrides(
     `"TMPDIR"=${tomlString(scratchDir)}`,
     `"XDG_CONFIG_HOME"=${tomlString(join(scratchDir, '.config'))}`,
     `"XDG_CACHE_HOME"=${tomlString(join(scratchDir, '.cache'))}`,
+    `"PATH"=${tomlString(toolchain.path)}`,
     '"GIT_CONFIG_GLOBAL"="/dev/null"',
     '"GIT_CONFIG_NOSYSTEM"="1"',
     '"GIT_TERMINAL_PROMPT"="0"',

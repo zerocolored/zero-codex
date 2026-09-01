@@ -24,6 +24,7 @@ import {
   ArtifactPublicationBlockedError,
   classifyExecutorCommandProbe,
   classifyFallbackProcessState,
+  CodexPublicationConflictRecoveryError,
   CodexResultPersistencePendingError,
   configuredMaxJobsPerSession,
   createExecutorPidLifecycle,
@@ -41,6 +42,7 @@ import {
   readUploadableArtifact,
   recoverExecutionCheckpointBeforeAdvisorCleanup,
   recoverExecutionResultJournals,
+  requeueGitHubPublicationConflictForCodex,
   reconcileEphemeralAndRetiredAdvisorRounds,
   reconcileAdvisorsWithMonitorHealthBarrier,
   runQueuedJobs,
@@ -63,7 +65,7 @@ import {
   type JobControlRecord,
   type JobRecord,
 } from './job-runner.ts'
-import type { GitHubPublicationSet } from './github-publication.ts'
+import type { GitHubPublicationPlan, GitHubPublicationSet } from './github-publication.ts'
 
 import {
   CODEX_WORKER_SAFETY_PROMPT,
@@ -93,6 +95,7 @@ import {
   parseCodexResult,
   parseCodexReviewDecision,
   requiredAdvisorRoundsForJob,
+  resolveCodexToolchainRuntime,
   resolveCodexExecutable,
   resolveGitMetadataPaths,
 } from './codex-executor.ts'
@@ -149,6 +152,35 @@ function emptyFixturePublication(
     reviewedRepositoryDigest: createHash('sha256').update('fixture-review').digest('hex'),
     baselineDigest: createHash('sha256').update('fixture-baseline').digest('hex'),
     plans: [],
+  }
+}
+
+function promotionFixturePlan(root: string): GitHubPublicationPlan {
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex')
+  return {
+    version: 1,
+    gitRoot: root,
+    repositorySlug: 'zerocolored/fixture',
+    canonicalUrl: 'https://github.com/zerocolored/fixture.git',
+    baseBranch: 'develop',
+    headBranch: 'zerochan/recovery',
+    commitSha: 'a'.repeat(40),
+    initialHead: 'b'.repeat(40),
+    statusDigest: digest('status'),
+    localConfigDigest: digest('config'),
+    originUrlDigest: digest('origin'),
+    title: 'feat: recovery fixture',
+    promotion: {
+      version: 1,
+      sourceBranch: 'zerochan/recovery',
+      sourceHead: 'a'.repeat(40),
+      followupBaseBranch: 'main',
+      followupInitialHead: 'c'.repeat(40),
+      waitForChecks: true,
+      integrationPullRequestBody: 'Integrate the reviewed fixture.',
+      followupPullRequestBody: 'Release the integrated fixture.',
+      closePullRequestNumbers: [860],
+    },
   }
 }
 
@@ -3065,6 +3097,92 @@ describe('Codex job store', () => {
     const queued = store.enqueue(input({ writeEnabled: true })).job
     expect(queued.writeEnabled).toBe(true)
     expect(store.claimNext('serial-worker')?.writeEnabled).toBe(true)
+    store.close()
+  })
+
+  test('GitHub競合は旧公開状態を保存し同じsessionのCodexへ戻す', () => {
+    const state = fixtureDir()
+    const repo = join(state, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const queued = store.enqueue(input({
+      repoPath: repo,
+      writeEnabled: true,
+      messageId: 'github-conflict-recovery',
+    })).job
+    const running = store.claimNext('publication-worker')!
+    store.saveSession(running.id, 'publication-session')
+    const advisorInput = readAdvisorInputSnapshot(state, running.id)
+    const plan = promotionFixturePlan(repo)
+    const publication: GitHubPublicationSet = {
+      version: 1,
+      jobId: running.id,
+      jobAttempt: running.attempts,
+      logicalNonce: '1'.repeat(32),
+      inputRevision: advisorInput.revision,
+      inputDigest: advisorInput.digest,
+      reviewRound: 1,
+      reviewedRepositoryDigest: createHash('sha256').update('review').digest('hex'),
+      baselineDigest: createHash('sha256').update('baseline').digest('hex'),
+      plans: [plan],
+    }
+    const execution = {
+      sessionId: 'publication-session',
+      result: '承認済みUIを実装し、review済みcommitを準備しました。',
+      publication,
+    }
+    persistExecutionResultJournal(state, running, execution)
+    store.ensureExecutionResultStaged(
+      running.id,
+      execution.sessionId,
+      execution.result,
+      publication,
+    )
+    store.recordGitHubPromotionCheckpoint(running.id, plan, {
+      version: 1,
+      kind: 'integration-pr',
+      pullRequestNumber: 860,
+      pullRequestUrl: 'https://github.com/zerocolored/fixture/pull/860',
+    })
+
+    const recovery = requeueGitHubPublicationConflictForCodex(
+      store,
+      state,
+      new CodexPublicationConflictRecoveryError(
+        running.id,
+        plan,
+        'GitHub integration PR has a merge conflict that requires a new reviewed commit',
+      ),
+    )
+    expect(recovery).toMatchObject({
+      sourceAttempt: 1,
+      priorResult: execution.result,
+      plans: [{
+        repositorySlug: 'zerocolored/fixture',
+        baseBranch: 'develop',
+        headBranch: 'zerochan/recovery',
+        commitSha: 'a'.repeat(40),
+        checkpoint: { kind: 'integration-pr', pullRequestNumber: 860 },
+      }],
+    })
+    expect(store.get(queued.id)).toMatchObject({
+      status: 'queued',
+      sessionId: 'publication-session',
+      attempts: 1,
+      acceptsControl: true,
+      result: null,
+    })
+    expect(store.hasGitHubPublicationCheckpoint(queued.id)).toBe(false)
+    expect(readdirSync(join(state, 'execution-results'))).toEqual([])
+    expect(store.latestGitHubPublicationRecovery(queued.id)).toEqual(recovery)
+
+    const resumed = store.claimNext('publication-worker-2')!
+    expect(resumed).toMatchObject({
+      id: queued.id,
+      attempts: 2,
+      sessionId: 'publication-session',
+      resumed: true,
+    })
     store.close()
   })
 })
@@ -7189,6 +7307,57 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     store.close()
   })
 
+  test('GitHub競合の旧PRと結果をtrusted継続contextとしてphaseへ渡す', () => {
+    const repo = fixtureDir('zerokun-publication-recovery-prompt-')
+    git(['init', '-q'], repo)
+    const store = makeStore()
+    store.enqueue(input({ repoPath: repo, writeEnabled: true }))
+    const claimed = store.claimNext('serial-worker')!
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), claimed.id)
+    const job: JobRecord = {
+      ...claimed,
+      githubPublicationRecovery: {
+        version: 1,
+        sourceAttempt: 1,
+        reason: 'GitHub publication needs a new Codex decision',
+        priorResult: '承認済みの画面実装とreviewは完了済みです。',
+        plans: [{
+          repositorySlug: 'zerocolored/fixture',
+          baseBranch: 'develop',
+          headBranch: 'zerochan/old',
+          commitSha: 'a'.repeat(40),
+          status: 'pending',
+          pullRequestNumber: null,
+          pullRequestUrl: null,
+          followupPullRequestNumber: null,
+          followupPullRequestUrl: null,
+          selectedObsoletePullRequestNumbers: [],
+          checkpoint: {
+            version: 1,
+            kind: 'integration-pr',
+            pullRequestNumber: 860,
+            pullRequestUrl: 'https://github.com/zerocolored/fixture/pull/860',
+          },
+        }],
+        createdAt: 1,
+      },
+    }
+    const prompt = buildCodexPhasePrompt(
+      job,
+      'prepare',
+      snapshot,
+      1,
+      'a'.repeat(32),
+      '/tmp/job-outbox',
+    )
+    expect(prompt).toContain('GitHub publication recovery (trusted host state)')
+    expect(prompt).toContain('https://github.com/zerocolored/fixture/pull/860')
+    expect(prompt).toContain('same approved Slack task')
+    expect(prompt).toContain('choose the appropriate resolution yourself')
+    expect(prompt).toContain('do not repeat Before/After approval')
+    store.close()
+  })
+
   test('advisor publication gateはreadにinvestigation、writeに全3phaseを要求する', () => {
     expect(requiredAdvisorRoundsForJob({ writeEnabled: false })).toEqual([
       { phase: 'investigation', round: 1 },
@@ -8439,6 +8608,38 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     }
   }, 10_000)
 
+  test('project toolchainのPATHだけを明示継承しrepo・state・相対entryを除外する', () => {
+    const dir = fixtureDir()
+    const home = join(dir, 'home')
+    const localBin = join(home, '.local', 'bin')
+    const repo = join(dir, 'repo')
+    const repoBin = join(repo, 'bin')
+    const state = join(dir, 'state')
+    const stateBin = join(state, 'bin')
+    const artifact = join(state, 'outbox')
+    const scratch = join(state, 'tmp')
+    const systemTmp = join(dir, 'system-tmp')
+    for (const path of [localBin, repoBin, stateBin, artifact, scratch, systemTmp]) {
+      mkdirSync(path, { recursive: true })
+    }
+    const runtime = resolveCodexToolchainRuntime({
+      sourcePath: `${localBin}:${repoBin}:relative:${stateBin}:${localBin}`,
+      repoPath: repo,
+      stateDir: state,
+      artifactDir: artifact,
+      scratchDir: scratch,
+      homeDir: home,
+      tempDir: systemTmp,
+    })
+    expect(runtime.path.split(':')).toEqual([
+      '/usr/bin', '/bin', '/usr/sbin', '/sbin', localBin,
+    ])
+    expect(runtime.readPaths).toContain(realpathSync(localBin))
+    expect(runtime.path).not.toContain(repoBin)
+    expect(runtime.path).not.toContain(stateBin)
+    expect(runtime.path).not.toContain('relative')
+  })
+
   test('permission profileはHOME/stateを閉じ、repo・当該添付・outboxだけを再許可する', () => {
     const dir = fixtureDir()
     const state = join(dir, 'state')
@@ -8483,6 +8684,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain(`${JSON.stringify(realpathSync(state))}="deny"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(codexHome))}="deny"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
+      expect(overrides).toContain('"PATH"="/usr/bin:/bin:/usr/sbin:/sbin')
+      if (existsSync('/opt/homebrew/Cellar')) {
+        expect(overrides).toContain(`${JSON.stringify(realpathSync('/opt/homebrew/Cellar'))}="read"`)
+      }
       expect(overrides).toContain('"*PROXY*"')
       expect(overrides).toContain('network.enabled=true')
       expect(overrides).toContain('network.allow_local_binding=true')

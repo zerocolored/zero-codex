@@ -41,7 +41,7 @@ describe('Zero-kun Codex wiring', () => {
     const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
     expect(server).toContain('? jobStore.interruptControlTarget(inbound.chatId, inbound.threadTs)')
     expect(server).toContain(': jobStore.liveControlTarget(inbound.chatId, inbound.threadTs)')
-    expect(runner).toContain('executeCodexJob(job')
+    expect(runner).toMatch(/executeCodexJob\((?:job|\{\s*\.\.\.job)/u)
     expect(runner).toContain('verifySlackAppTokenPair')
     expect(runner).toContain('liveControls: {')
     expect(executor).toContain('production Codex jobs require the App Server live-control transport')

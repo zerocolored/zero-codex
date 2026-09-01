@@ -1607,12 +1607,6 @@ export async function publishGitHubPlan(
       pullRequestNumber: pullRequest.number,
       pullRequestUrl: pullRequest.html_url,
     })
-    const closedPullRequestNumbers = await closeCodexSelectedPullRequests(
-      plan,
-      pullRequest.number,
-      commands,
-      signal,
-    )
     if (pullRequest.merged_at === null) {
       pullRequest = await readPullRequestForMerge(
         plan,
@@ -1621,6 +1615,15 @@ export async function publishGitHubPlan(
         signal,
       )
     }
+    // Codex may nominate obsolete PRs, but the host closes them only after the
+    // exact replacement is already merged or has passed checks and is clean.
+    // A conflicting or failing replacement must not remove the last usable PR.
+    const closedPullRequestNumbers = await closeCodexSelectedPullRequests(
+      plan,
+      pullRequest.number,
+      commands,
+      signal,
+    )
     if (pullRequest.merged_at === null) {
       const repository = await commands.runGh([
         'api', '--method', 'GET', `repos/${plan.repositorySlug}`,

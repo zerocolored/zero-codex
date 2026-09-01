@@ -832,11 +832,12 @@ describe('host GitHub publication', () => {
         waitForChecks: true,
         integrationPullRequestBody: '## Summary\nwait {{COMMIT_SHA}}',
         followupPullRequestBody: '## Summary\nrelease {{COMMIT_SHA}}',
-        closePullRequestNumbers: [],
+        closePullRequestNumbers: [857],
       },
     }
     const body = `## Summary\nwait ${plan.commitSha}`
     let mergeCalls = 0
+    let obsoleteCloseCalls = 0
     let checkRuns: Array<Record<string, unknown>> = []
     const commands: GitHubPublicationCommands = {
       async runGit(_repo, args) {
@@ -846,7 +847,7 @@ describe('host GitHub publication', () => {
         if (ref.endsWith('/develop')) return result(0, `${value.developHead}\t${ref}\n`)
         throw new Error(`unexpected remote ref: ${ref}`)
       },
-      async runGh(args) {
+      async runGh(args, stdin) {
         const command = args.join(' ')
         if (args.includes('GET') && command.includes('/pulls?')) {
           return result(0, exactPullRequestJson({ plan, number: 401, body }))
@@ -856,6 +857,21 @@ describe('host GitHub publication', () => {
           return result(0, JSON.stringify({
             ...record, draft: false, mergeable: true, mergeable_state: 'clean',
           }))
+        }
+        if (args.includes('GET') && command.endsWith('/pulls/857')) {
+          return result(0, JSON.stringify({
+            number: 857,
+            html_url: 'https://github.com/example/check-registration-race/pull/857',
+            state: 'open',
+            merged_at: null,
+            head: { repo: { full_name: plan.repositorySlug } },
+            base: { repo: { full_name: plan.repositorySlug } },
+          }))
+        }
+        if (args.includes('PATCH') && command.endsWith('/pulls/857 --input -')) {
+          expect(JSON.parse(stdin ?? '{}')).toEqual({ state: 'closed' })
+          obsoleteCloseCalls += 1
+          return result(0, '{}')
         }
         if (args.includes('GET') && command.includes('/check-runs')) {
           return result(0, JSON.stringify({
@@ -881,6 +897,7 @@ describe('host GitHub publication', () => {
       expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'checks' }),
     )
     expect(mergeCalls).toBe(0)
+    expect(obsoleteCloseCalls).toBe(0)
   })
 
   test('review済み実装promotionのsource refが別SHAへ動いた場合は公開を拒否する', () => {
