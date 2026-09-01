@@ -9,6 +9,7 @@ import {
   assertHostGitHubPublicationLogin,
   captureGitHubPublicationBaseline,
   captureGitHubPublicationBaselineForBranches,
+  captureFreshGitHubPublicationBaselineForBranches,
   gitHubPublicationBaselineDigest,
   GitHubPublicationError,
   prepareGitHubPublicationPlans,
@@ -285,6 +286,63 @@ describe('host GitHub publication', () => {
     }, ['.'], undefined, plan.headBranch)).toThrow(
       'repository config or origin changed outside the reviewed commit',
     )
+  })
+
+  test('Codexが選んだbase branchは共有checkoutの古いremote-tracking refではなくGitHub先端へ更新して固定する', async () => {
+    const repo = join(fixtureDir(), 'repo')
+    mkdirSync(repo)
+    git(repo, 'init', '--initial-branch=main')
+    git(repo, 'config', 'user.email', 'zero@example.invalid')
+    git(repo, 'config', 'user.name', 'Zero Test')
+    git(repo, 'config', 'remote.origin.url', 'https://github.com/example/fresh-base.git')
+    writeFileSync(join(repo, 'README.md'), 'initial\n')
+    git(repo, 'add', 'README.md')
+    git(repo, 'commit', '-m', 'chore: initial')
+    git(repo, 'switch', '-c', 'develop')
+    writeFileSync(join(repo, 'develop.txt'), 'old base\n')
+    git(repo, 'add', 'develop.txt')
+    git(repo, 'commit', '-m', 'chore: old develop')
+    const staleHead = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'update-ref', 'refs/remotes/origin/develop', staleHead)
+    writeFileSync(join(repo, 'develop.txt'), 'fresh GitHub base\n')
+    git(repo, 'add', 'develop.txt')
+    git(repo, 'commit', '-m', 'chore: advance remote develop')
+    const freshHead = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'switch', 'main')
+    git(repo, 'switch', '-c', 'feature/unrelated-shared-checkout')
+    const sharedHead = git(repo, 'rev-parse', 'HEAD')
+    const calls: string[][] = []
+    const commands: GitHubPublicationCommands = {
+      async runGit(commandRepo, args) {
+        calls.push([...args])
+        expect(realpathSync(commandRepo)).toBe(realpathSync(repo))
+        expect(args[0]).toBe('fetch')
+        git(repo, 'update-ref', 'refs/remotes/origin/develop', freshHead)
+        return result(0)
+      },
+      async runGh() {
+        throw new Error('gh is not used while refreshing a Git base')
+      },
+    }
+
+    const baseline = await captureFreshGitHubPublicationBaselineForBranches(repo, [{
+      gitRoot: repo,
+      baseBranch: 'develop',
+    }], commands)
+
+    expect(baseline.repositories[0]?.initialHead).toBe(freshHead)
+    expect(baseline.repositories[0]?.initialHead).not.toBe(staleHead)
+    expect(calls).toEqual([[
+      'fetch',
+      '--no-tags',
+      '--no-recurse-submodules',
+      '--force',
+      'https://github.com/example/fresh-base.git',
+      '+refs/heads/develop:refs/remotes/origin/develop',
+    ]])
+    expect(git(repo, 'branch', '--show-current')).toBe('feature/unrelated-shared-checkout')
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(sharedHead)
+    expect(git(repo, 'status', '--porcelain')).toBe('')
   })
 
   test('review済みSHAとhost指定branchだけをclean repositoryから計画する', () => {

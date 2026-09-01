@@ -156,6 +156,7 @@ import {
   assertGitHubPublicationPlan,
   captureGitHubPublicationBaseline,
   captureGitHubPublicationBaselineForBranches,
+  captureFreshGitHubPublicationBaselineForBranches,
   createHostGitHubPublicationCommands,
   extendGitHubPublicationBaseline,
   gitHubPublicationBaselineDigest,
@@ -8085,7 +8086,7 @@ export async function executeCodexJob(
               throw new Error('implementation repository scope is not backed by Git worktrees')
             }
             publicationBaseline = testCodexBin === undefined
-              ? captureGitHubPublicationBaselineForBranches(
+              ? await captureFreshGitHubPublicationBaselineForBranches(
                   jobRepo,
                   implementationIntents.map(intent => ({
                     gitRoot: rootsByIdentifier.get(intent.repository)!,
@@ -8097,7 +8098,8 @@ export async function executeCodexJob(
               repository.gitRoot,
               repository,
             ]))
-            preparedImplementationBindings = implementationIntents.map(intent => {
+            preparedImplementationBindings = []
+            for (const intent of implementationIntents) {
               const gitRoot = rootsByIdentifier.get(intent.repository)!
               const baseline = baselineByRoot.get(gitRoot)
               if (!baseline || baseline.baseBranch !== intent.baseBranch) {
@@ -8105,18 +8107,23 @@ export async function executeCodexJob(
               }
               const followupInitialHead = intent.followupBaseBranch === null
                 ? null
-                : captureGitHubPublicationBaselineForBranches(jobRepo, [{
+                : (testCodexBin === undefined
+                  ? await captureFreshGitHubPublicationBaselineForBranches(jobRepo, [{
+                      gitRoot,
+                      baseBranch: intent.followupBaseBranch,
+                    }])
+                  : captureGitHubPublicationBaselineForBranches(jobRepo, [{
                     gitRoot,
                     baseBranch: intent.followupBaseBranch,
-                  }]).repositories[0]!.initialHead
-              return {
+                  }])).repositories[0]!.initialHead
+              preparedImplementationBindings.push({
                 ...intent,
                 gitRoot,
                 baseCommit: baseline.initialHead,
                 headBranch: publicationBranch,
                 followupInitialHead,
-              }
-            })
+              })
+            }
           }
         }
         if (preparedPublicationIntents.length > 0) {
@@ -8462,13 +8469,24 @@ export async function executeCodexJob(
       if (!decision) throw new Error('Codex review decision is unavailable')
       if (decision.decision === 'fix') {
         if (preparedWorkAction !== 'implement') {
-          throw new GitHubPublicationError(
-            'conflict',
-            'read-only publication review found a required source fix; no GitHub operation was sent',
-          )
-        }
-        if (reviewRound === 3) {
-          throw new Error('required fixes remain after the maximum three read-only review rounds')
+          // A publication-only/no-change preparation cannot perform the
+          // source edit that Codex now says is required. Return to the same
+          // Codex thread's preparation phase so it can select an implementation
+          // action; do not turn that changed judgment into a host-side failure.
+          phaseSequence += 1
+          reviewRound = 1
+          reviewedInputRevision = finalInput.revision
+          implementedInputDigest = null
+          preparedInput = null
+          preparedRepositoryDigest = null
+          preparedRepositoryScope = null
+          preparedWorkAction = null
+          preparedPublicationIntents = []
+          preparedImplementationBindings = []
+          publicationOnlyPlans = null
+          publicationBaseline = null
+          nextStage = 'prepare'
+          continue
         }
         phaseSequence += 1
         reviewedInputRevision = finalInput.revision
@@ -8477,7 +8495,12 @@ export async function executeCodexJob(
           throw new Error('review omitted the repository digest required for its fixes')
         }
         preparedRepositoryDigest = reviewedRepositoryDigest
-        reviewRound = (reviewRound + 1) as 2 | 3
+        // The first three values preserve the existing advisor/evidence
+        // protocol. After that, keep using round 3 while the phase sequence
+        // continues to provide a unique durable identity. A Codex decision
+        // that more fixes are required must not be converted into an
+        // arbitrary host-side job failure.
+        reviewRound = reviewRound === 3 ? 3 : (reviewRound + 1) as 2 | 3
         nextStage = 'implementation'
         continue
       }

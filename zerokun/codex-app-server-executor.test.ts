@@ -306,7 +306,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -347,10 +347,12 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"main","mergePullRequest":false,"followupBaseBranch":null}]}</zerokun_work_action>'
+                if mode == "phased-reprepare-after-review-fix" and not os.path.exists(os.environ["ZERO_REVIEW_FIXTURE_STATE"]):
+                    action = '<zerokun_work_action>{"kind":"no-change"}</zerokun_work_action>'
                 if mode == "phased-publication-targeted":
                     action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main","waitForChecks":false,"integrationPullRequestBody":"## Summary","followupPullRequestBody":"## Summary","closePullRequestNumbers":[]}]}</zerokun_work_action>'
                 if mode == "phased-no-change":
@@ -421,8 +423,27 @@ for line in sys.stdin:
             elif stage == "review":
                 if mode in ("phased-promotion", "phased-promotion-history-failed") and "Host-bound publication-only workflow" not in phase_prompt:
                     raise RuntimeError("publication-only review binding missing")
-                marker = re.search(r"\\[ZERO_REVIEW_PUBLISH:[0-9a-f]{32}:round-[123]\\]", phase_prompt)
-                message = (marker.group(0) if marker else "[ZERO_REVIEW_PUBLISH:missing:round-1]") + "\\n公開できます"
+                review_fix_state = os.environ.get("ZERO_REVIEW_FIXTURE_STATE")
+                review_fix_count = 0
+                if mode in ("phased-review-fix-three-times", "phased-reprepare-after-review-fix"):
+                    if not review_fix_state:
+                        raise RuntimeError("review fix fixture state missing")
+                    if os.path.exists(review_fix_state):
+                        with open(review_fix_state, "r", encoding="utf-8") as stream:
+                            review_fix_count = int(stream.read())
+                    with open(review_fix_state, "w", encoding="utf-8") as stream:
+                        stream.write(str(review_fix_count + 1))
+                requires_fix = (
+                    mode == "phased-review-fix-three-times" and review_fix_count < 3
+                ) or (
+                    mode == "phased-reprepare-after-review-fix" and review_fix_count < 1
+                )
+                if requires_fix:
+                    marker = re.search(r"\\[ZERO_REVIEW_FIX_REQUIRED:[0-9a-f]{32}:round-[123]\\]", phase_prompt)
+                    message = (marker.group(0) if marker else "[ZERO_REVIEW_FIX_REQUIRED:missing:round-1]") + "\\n修正を続けます"
+                else:
+                    marker = re.search(r"\\[ZERO_REVIEW_PUBLISH:[0-9a-f]{32}:round-[123]\\]", phase_prompt)
+                    message = (marker.group(0) if marker else "[ZERO_REVIEW_PUBLISH:missing:round-1]") + "\\n公開できます"
             else:
                 message = "unexpected phase"
             control_log = os.environ.get("ZERO_CONTROL_LOG")
@@ -704,6 +725,8 @@ function fixture(
     | 'phased-ui-approved'
     | 'phased-capacity-review-once'
     | 'phased-capacity-implementation-once'
+    | 'phased-review-fix-three-times'
+    | 'phased-reprepare-after-review-fix'
     | 'phased-native-history-fresh' | 'phased-native-history-resume'
     | 'phased-native-history-resume-unmaterialized' | 'phased-steer'
     | 'phased-promotion-history-failed'
@@ -2099,6 +2122,73 @@ describe('production App Server executor', () => {
       '⏸ 利用中のモデルが混雑しました。現在の変更を保持し、再開後は確認工程から続けます。',
     )
     expect(readFileSync(capacityState, 'utf8')).toBe('implementation')
+    value.store.close()
+  }, 30_000)
+
+  test('Codexが3回必須修正を判断してもhost上限で止めず4回目のreviewまで継続する', async () => {
+    const value = fixture('phased-review-fix-three-times', true)
+    const phaseLog = join(value.root, 'unbounded-review-phases.log')
+    const promptLog = join(value.root, 'unbounded-review-prompts.log')
+    const reviewState = join(value.root, 'unbounded-review.state')
+
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-review-fix-three-times',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_PROMPT_LOG: promptLog,
+        ZERO_REVIEW_FIXTURE_STATE: reviewState,
+      },
+      phaseGateForTesting: {},
+      liveControls: value.hooks,
+    })
+
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])
+    expect(stages).toEqual([
+      'prepare',
+      'implementation', 'review',
+      'implementation', 'review',
+      'implementation', 'review',
+      'implementation', 'review',
+    ])
+    const reviewRounds = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string, text: string })
+      .filter(entry => entry.stage === 'review')
+      .map(entry => /Host phase: read-only review round ([0-9]+)\./.exec(entry.text)?.[1])
+    expect(reviewRounds).toEqual(['1', '2', '3', '3'])
+    expect(readFileSync(reviewState, 'utf8')).toBe('4')
+    value.store.close()
+  }, 45_000)
+
+  test('no-change reviewで修正が必要になったら失敗せずCodexのprepare判断へ戻る', async () => {
+    const value = fixture('phased-reprepare-after-review-fix', true)
+    const phaseLog = join(value.root, 'reprepare-after-review-phases.log')
+    const reviewState = join(value.root, 'reprepare-after-review.state')
+
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-reprepare-after-review-fix',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_REVIEW_FIXTURE_STATE: reviewState,
+      },
+      phaseGateForTesting: {},
+      liveControls: value.hooks,
+    })
+
+    expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
+    const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])
+    expect(stages).toEqual(['prepare', 'review', 'prepare', 'implementation', 'review'])
+    expect(readFileSync(reviewState, 'utf8')).toBe('2')
     value.store.close()
   }, 30_000)
 

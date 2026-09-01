@@ -432,6 +432,40 @@ export function captureGitHubPublicationBaselineForBranches(
   return { version: 1, projectPath, repositories }
 }
 
+/**
+ * Refresh the exact remote-tracking refs selected by Codex before binding an
+ * implementation. The shared checkout itself is left untouched; only Git's
+ * normal `refs/remotes/origin/*` metadata and fetched objects are updated.
+ *
+ * Without this step a long-running shared checkout can bind a replacement PR
+ * to an old `origin/<base>` commit even though GitHub has already advanced the
+ * branch, recreating the same conflict that the replacement was meant to fix.
+ */
+export async function captureFreshGitHubPublicationBaselineForBranches(
+  projectPathInput: string,
+  bindings: readonly GitHubPublicationBaseBinding[],
+  commands: GitHubPublicationCommands = createHostGitHubPublicationCommands(),
+  signal?: AbortSignal,
+): Promise<GitHubPublicationBaseline> {
+  for (const binding of bindings) {
+    const gitRoot = realpathSync(binding.gitRoot)
+    const state = repositoryState(gitRoot)
+    const baseBranch = validBranch(state.gitRoot, binding.baseBranch)
+    const fetched = await commands.runGit(state.gitRoot, [
+      'fetch',
+      '--no-tags',
+      '--no-recurse-submodules',
+      '--force',
+      state.config.origin.canonicalUrl,
+      `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`,
+    ], signal)
+    if (fetched.exitCode !== 0) {
+      commandFailure(fetched, `GitHub base branch refresh (${baseBranch})`)
+    }
+  }
+  return captureGitHubPublicationBaselineForBranches(projectPathInput, bindings)
+}
+
 export function extendGitHubPublicationBaseline(
   baseline: GitHubPublicationBaseline,
   gitRoots: readonly string[],
