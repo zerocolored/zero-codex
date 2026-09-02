@@ -74,6 +74,7 @@ export type GitHubPublicationPromotion = {
 
 export type GitHubPromotionBinding = {
   gitRoot: string
+  sourceBranch: string
   baseBranch: string
   followupBaseBranch: string
   waitForChecks?: boolean
@@ -289,14 +290,14 @@ function localConfig(repo: string): { digest: string; origin: GitHubRepositoryId
   })
   // core.hooksPath is intentionally not forbidden. Repositories commonly set
   // it for Husky, while every host Git path that could publish is forced to
-  // core.hooksPath=/dev/null and push also uses --no-verify. The full local
-  // config is still digested below, so a value change invalidates the plan.
+  // core.hooksPath=/dev/null and push also uses --no-verify. The digest is kept
+  // as audit metadata, not as a semantic repository-state gate: benign local
+  // configuration drift must not override Codex's reviewed publication choice.
   const forbidden = entries.find(({ key }) => (
     key === 'include.path' || key.startsWith('includeif.')
-    || key.startsWith('credential.') || key.startsWith('http.') || key.startsWith('url.')
-    || key.startsWith('protocol.') || key === 'core.sshcommand' || key === 'core.gitproxy'
+    || key.startsWith('http.') || key.startsWith('url.')
+    || (key.startsWith('protocol.') && key !== 'protocol.version')
     || key === 'core.alternaterefscommand'
-    || /^remote\.[^.]+\.(?:pushurl|proxy|receivepack|uploadpack|vcs)$/.test(key)
   ))
   if (forbidden) {
     throw new GitHubPublicationError(
@@ -312,11 +313,8 @@ function localConfig(repo: string): { digest: string; origin: GitHubRepositoryId
   return { digest: digest(raw), origin, originDigest: digest(originValues[0]!.value) }
 }
 
-function repositoryState(repoInput: string): {
+function repositoryIdentity(repoInput: string): {
   gitRoot: string
-  head: string
-  branch: string
-  statusDigest: string
   config: ReturnType<typeof localConfig>
 } {
   const gitRoot = realpathSync(repoInput)
@@ -324,6 +322,23 @@ function repositoryState(repoInput: string): {
   if (topLevel !== gitRoot) {
     throw new GitHubPublicationError('configuration', 'publication repository root changed')
   }
+  return { gitRoot, config: localConfig(gitRoot) }
+}
+
+function repositoryStatusDigest(gitRoot: string): string {
+  return digest(gitSync(gitRoot, [
+    'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none',
+  ]))
+}
+
+function repositoryState(repoInput: string): {
+  gitRoot: string
+  head: string
+  branch: string
+  statusDigest: string
+  config: ReturnType<typeof localConfig>
+} {
+  const { gitRoot, config } = repositoryIdentity(repoInput)
   const head = gitSync(gitRoot, ['rev-parse', '--verify', 'HEAD']).trim()
   if (!SHA_PATTERN.test(head)) {
     throw new GitHubPublicationError('configuration', 'publication commit binding is invalid')
@@ -332,10 +347,7 @@ function repositoryState(repoInput: string): {
     gitRoot,
     gitSync(gitRoot, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim(),
   )
-  const status = gitSync(gitRoot, [
-    'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none',
-  ])
-  return { gitRoot, head, branch, statusDigest: digest(status), config: localConfig(gitRoot) }
+  return { gitRoot, head, branch, statusDigest: repositoryStatusDigest(gitRoot), config }
 }
 
 export function captureGitHubPublicationBaseline(
@@ -345,12 +357,6 @@ export function captureGitHubPublicationBaseline(
   const projectPath = realpathSync(projectPathInput)
   const repositories = gitRoots.map(root => {
     const state = repositoryState(root)
-    if (state.statusDigest !== digest('')) {
-      throw new GitHubPublicationError(
-        'configuration',
-        'publication repository must be clean before implementation begins',
-      )
-    }
     return {
       gitRoot: state.gitRoot,
       initialHead: state.head,
@@ -384,13 +390,14 @@ export function captureGitHubPublicationBaseline(
  * shared worktree. The implementation worker receives each exact base SHA and
  * creates the host-assigned feature ref from it in an isolated worktree.
  */
-export function captureGitHubPublicationBaselineForBranches(
+function captureGitHubPublicationBaselineForBranchBindings(
   projectPathInput: string,
   bindings: readonly GitHubPublicationBaseBinding[],
+  headSource: 'remote-preferred' | 'local-only',
 ): GitHubPublicationBaseline {
   const projectPath = realpathSync(projectPathInput)
   const repositories = bindings.map(binding => {
-    const state = repositoryState(binding.gitRoot)
+    const state = repositoryIdentity(binding.gitRoot)
     const baseBranch = validBranch(state.gitRoot, binding.baseBranch)
     const remoteTrackingHead = gitSync(
       state.gitRoot,
@@ -402,7 +409,7 @@ export function captureGitHubPublicationBaselineForBranches(
       ['rev-parse', '--verify', `refs/heads/${baseBranch}^{commit}`],
       true,
     ).trim()
-    const initialHead = remoteTrackingHead || localHead
+    const initialHead = headSource === 'local-only' ? localHead : remoteTrackingHead || localHead
     if (!SHA_PATTERN.test(initialHead)) {
       throw new GitHubPublicationError(
         'configuration',
@@ -413,7 +420,7 @@ export function captureGitHubPublicationBaselineForBranches(
       gitRoot: state.gitRoot,
       initialHead,
       baseBranch,
-      statusDigest: state.statusDigest,
+      statusDigest: repositoryStatusDigest(state.gitRoot),
       localConfigDigest: state.config.digest,
       originUrlDigest: state.config.originDigest,
       remote: state.config.origin,
@@ -430,6 +437,33 @@ export function captureGitHubPublicationBaselineForBranches(
     )
   }
   return { version: 1, projectPath, repositories }
+}
+
+export function captureGitHubPublicationBaselineForBranches(
+  projectPathInput: string,
+  bindings: readonly GitHubPublicationBaseBinding[],
+): GitHubPublicationBaseline {
+  return captureGitHubPublicationBaselineForBranchBindings(
+    projectPathInput,
+    bindings,
+    'remote-preferred',
+  )
+}
+
+/**
+ * Bind a publication-only request to the exact local branch tip selected by
+ * Codex. Unlike implementation-base binding, an older origin tracking ref must
+ * never replace the already-reviewed local commit that is being published.
+ */
+export function captureGitHubPublicationBaselineForLocalBranches(
+  projectPathInput: string,
+  bindings: readonly GitHubPublicationBaseBinding[],
+): GitHubPublicationBaseline {
+  return captureGitHubPublicationBaselineForBranchBindings(
+    projectPathInput,
+    bindings,
+    'local-only',
+  )
 }
 
 /**
@@ -449,7 +483,7 @@ export async function captureFreshGitHubPublicationBaselineForBranches(
 ): Promise<GitHubPublicationBaseline> {
   for (const binding of bindings) {
     const gitRoot = realpathSync(binding.gitRoot)
-    const state = repositoryState(gitRoot)
+    const state = repositoryIdentity(gitRoot)
     const baseBranch = validBranch(state.gitRoot, binding.baseBranch)
     const fetched = await commands.runGit(state.gitRoot, [
       'fetch',
@@ -542,13 +576,11 @@ export function prepareGitHubPublicationPlans(
       throw new GitHubPublicationError('configuration', 'publication repository is outside the project root')
     }
     if (allowed && !allowed.has(relative)) continue
-    const current = repositoryState(initial.gitRoot)
-    if (current.config.digest !== initial.localConfigDigest
-      || current.config.originDigest !== initial.originUrlDigest
-      || current.config.origin.slug.toLowerCase() !== initial.remote.slug.toLowerCase()) {
+    const current = repositoryIdentity(initial.gitRoot)
+    if (current.config.origin.slug.toLowerCase() !== initial.remote.slug.toLowerCase()) {
       throw new GitHubPublicationError(
         'configuration',
-        'repository config or origin changed outside the reviewed commit',
+        'repository origin changed outside the reviewed publication target',
       )
     }
     if (requiredHeadBranch === undefined) {
@@ -641,24 +673,38 @@ export async function prepareGitHubPromotionPlans(
   for (const initial of baseline.repositories) {
     const binding = byRoot.get(initial.gitRoot)
     if (!binding) continue
+    const sourceBranch = validBranch(initial.gitRoot, binding.sourceBranch)
     const baseBranch = validBranch(initial.gitRoot, binding.baseBranch)
     const followupBaseBranch = validBranch(initial.gitRoot, binding.followupBaseBranch)
     if (baseBranch === followupBaseBranch || baseBranch === requiredHeadBranch
       || followupBaseBranch === requiredHeadBranch) {
       throw new GitHubPublicationError('configuration', 'promotion branch binding is invalid')
     }
-    const current = repositoryState(initial.gitRoot)
-    if (current.head !== initial.initialHead || current.branch !== initial.baseBranch
-      || current.statusDigest !== initial.statusDigest
-      || current.config.digest !== initial.localConfigDigest
-      || current.config.originDigest !== initial.originUrlDigest
-      || current.config.origin.slug.toLowerCase() !== initial.remote.slug.toLowerCase()) {
+    const current = repositoryIdentity(initial.gitRoot)
+    if (current.config.origin.slug.toLowerCase() !== initial.remote.slug.toLowerCase()) {
       throw new GitHubPublicationError(
         'configuration',
-        'promotion source checkout changed after its read-only preparation',
+        'promotion repository origin changed after its read-only preparation',
       )
     }
-    if (current.branch === baseBranch || current.branch === followupBaseBranch) {
+    if (initial.baseBranch !== sourceBranch) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'promotion source branch does not match its reviewed baseline',
+      )
+    }
+    const sourceHead = gitSync(
+      initial.gitRoot,
+      ['rev-parse', '--verify', `${initial.initialHead}^{commit}`],
+      true,
+    ).trim()
+    if (sourceHead !== initial.initialHead) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'reviewed promotion source commit is unavailable',
+      )
+    }
+    if (sourceBranch === baseBranch || sourceBranch === followupBaseBranch) {
       throw new GitHubPublicationError(
         'configuration',
         'promotion source and target branches must be distinct',
@@ -688,16 +734,16 @@ export async function prepareGitHubPromotionPlans(
       canonicalUrl: initial.remote.canonicalUrl,
       baseBranch,
       headBranch: requiredHeadBranch,
-      commitSha: current.head,
+      commitSha: sourceHead,
       initialHead: initialTargetHead,
       statusDigest: initial.statusDigest,
       localConfigDigest: initial.localConfigDigest,
       originUrlDigest: initial.originUrlDigest,
-      title: commitTitle(current.gitRoot, current.head),
+      title: commitTitle(current.gitRoot, sourceHead),
       promotion: {
         version: 1,
-        sourceBranch: current.branch,
-        sourceHead: current.head,
+        sourceBranch,
+        sourceHead,
         followupBaseBranch,
         followupInitialHead: initialFollowupHead,
         ...(binding.waitForChecks !== undefined ? {
@@ -818,18 +864,19 @@ export function assertGitHubPromotionCheckpoint(
 
 export function assertGitHubPublicationPlan(value: GitHubPublicationPlan): void {
   assertGitHubPublicationPlanShape(value)
-  const state = repositoryState(value.gitRoot)
+  const state = repositoryIdentity(value.gitRoot)
   const implementedPromotion = value.promotion?.sourceBranch === value.headBranch
   if (value.promotion && !implementedPromotion) {
-    if (state.head !== value.promotion.sourceHead
-      || state.branch !== value.promotion.sourceBranch
-      || state.statusDigest !== value.statusDigest
-      || state.config.digest !== value.localConfigDigest
-      || state.config.originDigest !== value.originUrlDigest
+    const source = gitSync(
+      state.gitRoot,
+      ['rev-parse', '--verify', `${value.commitSha}^{commit}`],
+      true,
+    ).trim()
+    if (source !== value.commitSha
       || state.config.origin.slug.toLowerCase() !== value.repositorySlug.toLowerCase()) {
       throw new GitHubPublicationError(
         'configuration',
-        'publication promotion no longer matches the reviewed source checkout',
+        'publication promotion no longer matches the reviewed source commit',
       )
     }
     return
@@ -840,8 +887,6 @@ export function assertGitHubPublicationPlan(value: GitHubPublicationPlan): void 
     true,
   ).trim()
   if (featureHead !== value.commitSha
-    || state.config.digest !== value.localConfigDigest
-    || state.config.originDigest !== value.originUrlDigest
     || state.config.origin.slug.toLowerCase() !== value.repositorySlug.toLowerCase()
     || value.baseBranch === value.headBranch) {
     throw new GitHubPublicationError('configuration', 'publication plan no longer matches the repository')
@@ -856,9 +901,7 @@ function assertGitHubPublicationSource(value: GitHubPublicationPlan): void {
     throw new GitHubPublicationError('configuration', 'publication repository root changed')
   }
   const config = localConfig(gitRoot)
-  if (config.digest !== value.localConfigDigest
-    || config.originDigest !== value.originUrlDigest
-    || config.origin.slug.toLowerCase() !== value.repositorySlug.toLowerCase()) {
+  if (config.origin.slug.toLowerCase() !== value.repositorySlug.toLowerCase()) {
     throw new GitHubPublicationError('configuration', 'publication repository identity changed')
   }
   const commit = gitSync(gitRoot, ['rev-parse', '--verify', `${value.commitSha}^{commit}`]).trim()

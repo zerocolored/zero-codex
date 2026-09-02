@@ -180,6 +180,7 @@ export type UiApprovalProposal = {
 export type CodexPublicationIntent = {
   kind: 'promote-current-head'
   repository: string
+  sourceBranch: string
   baseBranch: string
   mergePullRequest: true
   followupBaseBranch: string
@@ -460,6 +461,7 @@ function exactReadyPublicationIntents(
     const promotion = value as Record<string, unknown>
     const legacyKeys = [
       'baseBranch', 'followupBaseBranch', 'kind', 'mergePullRequest', 'repository',
+      'sourceBranch',
     ]
     const delegatedKeys = [
       ...legacyKeys,
@@ -472,12 +474,15 @@ function exactReadyPublicationIntents(
       || promotion.kind !== 'promote-current-head'
       || typeof promotion.repository !== 'string'
       || !repositoryScope.includes(promotion.repository)
+      || typeof promotion.sourceBranch !== 'string'
       || typeof promotion.baseBranch !== 'string'
       || typeof promotion.followupBaseBranch !== 'string'
       || promotion.mergePullRequest !== true
       || (hasDelegatedDetails && !validCodexPromotionDetails(promotion))
-      || promotion.baseBranch === promotion.followupBaseBranch
-      || [promotion.baseBranch, promotion.followupBaseBranch].some(branch => (
+      || new Set([
+        promotion.sourceBranch, promotion.baseBranch, promotion.followupBaseBranch,
+      ]).size !== 3
+      || [promotion.sourceBranch, promotion.baseBranch, promotion.followupBaseBranch].some(branch => (
         !branch || Buffer.byteLength(branch) > 255 || /[\0\r\n]/.test(branch)
       ))) {
       throw new Error('Codex publication promotion is invalid')

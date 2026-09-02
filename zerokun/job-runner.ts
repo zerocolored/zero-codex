@@ -140,7 +140,6 @@ import {
 } from './thread-history.ts'
 import {
   assertGitHubPromotionCheckpoint,
-  assertHostGitHubPublicationLogin,
   createHostGitHubPublicationCommands,
   GitHubPublicationError,
   MAX_GITHUB_PUBLICATION_REPOSITORIES,
@@ -10802,7 +10801,11 @@ export function createExecutorPidLifecycle(
 export interface JobExecutionResult {
   sessionId: string
   result: string
-  /** Present only after a write job passed final review and input sealing. */
+  /**
+   * Present after a write-authorized job passed final review and input sealing.
+   * A Codex-decided no-change result uses a durable empty plan set so write
+   * capability is never reinterpreted as a GitHub publication requirement.
+   */
   publication?: GitHubPublicationSet
 }
 
@@ -11014,9 +11017,6 @@ export function publicJobFailureSummary(error: string): string {
   if (/Codex (?:preparation|implementation|review).*?(?:envelope|marker|work action)/i.test(error)
     || error.includes('review omitted its prepared work action binding')) {
     return '処理手順の確認応答を正しく読み取れませんでした。変更・公開は確定していません。同じスレッドから再開できます。'
-  }
-  if (error.includes('implementation produced no reviewed commit; preparation did not authorize no-change')) {
-    return '公開可能なreview済みcommitを確認できませんでした。変更は自動公開していません。同じスレッドから再開できます。'
   }
   if (error.includes('Codex-selected GitHub checks failed')) {
     return 'Codexがmerge条件に指定したGitHubチェックが失敗したため、mergeせず停止しました。同じスレッドから原因修正を再開できます。'
@@ -11935,7 +11935,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       }
       options.assertJobMonitorHealthy?.(job)
       await updateMonitor(job, '一時的な補助セッションを終了しました')
-      if (execution.publication) {
+      if (execution.publication && execution.publication.plans.length > 0) {
         await updateMonitor(job, 'review済みcommitをGitHubへ公開します')
         await publishStagedGitHubPublication(options.store, job.id, {
           commands: options.githubPublicationCommandsForTesting,
@@ -15572,7 +15572,6 @@ async function runCli(): Promise<void> {
     verifyOfficialCodexSnapshot(loginCodex)
     assertCodexChatGptSubscriptionLogin(loginCodex.physical)
     verifyOfficialCodexSnapshot(loginCodex)
-    await assertHostGitHubPublicationLogin()
   } catch (error) {
     store.close()
     throw error

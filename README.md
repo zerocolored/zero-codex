@@ -396,6 +396,12 @@ symlink、Gitではない直下項目は作業対象に含めません。
 実装前のread-only準備で、Codexは変更が必要なrepositoryだけを宣言します。hostはその最小scopeを
 permission、review、publicationへ同じまま結び付けるため、対象外の兄弟repositoryのbranchやremote設定に
 影響されません。途中の同thread依頼でscopeが広がる場合も、新しいrepositoryを編集する前にbaselineへ追加します。
+利用者のwrite許可は能力の上限であり、GitHub公開が必要という判定ではありません。Codexが`no-change`を
+選んだ質問・調査は、公開計画0件の完了checkpointとして保存し、pushやPR作成を起動せずそのまま回答します。
+公開対象がある場合も、共有checkoutの未commit作業や無関係なbranch／通常のlocal Git設定変更では
+Codexのreview済み判断を破棄せず、固定commit SHA・repository identity・非強制pushだけをhostが機械確認します。
+既存commitの公開ではCodexがsource branchを明示し、hostは共有checkoutの現在位置や古いorigin追跡refではなく、
+そのlocal branch先端を固定します。したがってdetached／dirtyな共有checkoutもそのまま保持されます。
 
 `zerochan start` はHerdr外からの起動を拒否します。引数やexportは不要です。実行した物理directoryを
 対象projectとして、現在のHerdr workspaceへ新しい `Zeroちゃん runtime` tabを作り、gatewayとrunnerの

@@ -156,6 +156,7 @@ import {
   assertGitHubPublicationPlan,
   captureGitHubPublicationBaseline,
   captureGitHubPublicationBaselineForBranches,
+  captureGitHubPublicationBaselineForLocalBranches,
   captureFreshGitHubPublicationBaselineForBranches,
   createHostGitHubPublicationCommands,
   extendGitHubPublicationBaseline,
@@ -174,6 +175,22 @@ type BoundCodexImplementationIntent = CodexImplementationIntent & {
   baseCommit: string
   headBranch: string
   followupInitialHead: string | null
+}
+
+function noChangePublicationBaselineDigest(binding: {
+  jobId: string
+  jobAttempt: number
+  logicalNonce: string
+  inputRevision: number
+  inputDigest: string
+  reviewRound: number
+  reviewedRepositoryDigest: string
+}): string {
+  return createHash('sha256').update(JSON.stringify({
+    version: 1,
+    kind: 'reviewed-no-change',
+    ...binding,
+  })).digest('hex')
 }
 
 function prepareBoundImplementationPublicationPlans(
@@ -252,12 +269,6 @@ function prepareBoundImplementationPublicationPlans(
     assertGitHubPublicationPlan(promoted)
     return promoted
   })
-  if (plans.length === 0) {
-    throw new GitHubPublicationError(
-      'configuration',
-      'implementation produced no reviewed commit; preparation did not authorize no-change',
-    )
-  }
   return plans
 }
 
@@ -3324,7 +3335,6 @@ export function buildCodexPhasePrompt(
     || !implementationBindings
     || reviewWorkAction !== 'implement'
     || publicationOnlyPlans !== undefined
-    || implementationReviewPlans.length === 0
     || implementationReviewPlans.length > implementationBindings.length
     || implementationReviewPlans.some(plan => !implementationBindings.some(binding => (
       binding.gitRoot === plan.gitRoot
@@ -3385,12 +3395,21 @@ export function buildCodexPhasePrompt(
     }
   }
   if (implementationReviewPlans) {
-    host.push(
-      'Exact implementation publication plans to review (host-bound JSON):',
-      ...implementationReviewPlans.map(plan => JSON.stringify(plan)),
-      'Review these exact feature commits, integration bases, and optional ordered follow-up PRs.',
-      'Do not substitute the branch currently checked out by another session for any bound branch.',
-    )
+    if (implementationReviewPlans.length === 0) {
+      host.push(
+        'The implementation phase produced no publication commit for the bound repositories.',
+        'Review the live result directly. Use PUBLISH if the request is already satisfied and no',
+        'repository or GitHub write remains; the host will record an empty publication checkpoint.',
+        'Use FIX_REQUIRED only when an actual product change is still required.',
+      )
+    } else {
+      host.push(
+        'Exact implementation publication plans to review (host-bound JSON):',
+        ...implementationReviewPlans.map(plan => JSON.stringify(plan)),
+        'Review these exact feature commits, integration bases, and optional ordered follow-up PRs.',
+        'Do not substitute the branch currently checked out by another session for any bound branch.',
+      )
+    }
   }
   if (publicationOnlyPlans) {
     if (stage !== 'review' || publicationOnlyPlans.length === 0
@@ -3399,7 +3418,7 @@ export function buildCodexPhasePrompt(
     }
     host.push(
       'Host-bound publication-only workflow: no product implementation phase was required.',
-      'Review each exact current checkout commit and its intended ordered branch promotion:',
+      'Review each exact Codex-selected source branch commit and its ordered branch promotion:',
       ...publicationOnlyPlans.map(plan => JSON.stringify({
         repository: plan.repositorySlug,
         sourceBranch: plan.promotion!.sourceBranch,
@@ -3520,12 +3539,14 @@ export function buildCodexPhasePrompt(
       'ready marker, using only the exact IDs above in sorted order with no duplicates:',
       '<zerokun_repository_scope>{"repositories":["<implementation repository ID>"]}</zerokun_repository_scope>',
       'For no-change, use exactly <zerokun_repository_scope>{"repositories":[]}</zerokun_repository_scope>.',
-      'When and only when the exact request is publication-only for already committed current',
-      'checkouts, and asks to apply each current HEAD through a PR and then create a second branch',
+      'When and only when the exact request is publication-only for an already committed source',
+      'branch, and asks to apply that commit through a PR and then create a second branch',
       'PR, put this host-only envelope immediately before the repository-scope envelope:',
-      '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":"<repository ID>","baseBranch":"<integration branch>","mergePullRequest":true,"followupBaseBranch":"<release base branch>","waitForChecks":true,"integrationPullRequestBody":"<repository-template body>","followupPullRequestBody":"<repository-template body>","closePullRequestNumbers":[]}]}</zerokun_publication>',
-      'Sort promotions by repository. Use this only if every selected repository is already clean',
-      'and committed and no product edit is required. Never use it for a mixed implementation.',
+      '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":"<repository ID>","sourceBranch":"<already committed source branch>","baseBranch":"<integration branch>","mergePullRequest":true,"followupBaseBranch":"<release base branch>","waitForChecks":true,"integrationPullRequestBody":"<repository-template body>","followupPullRequestBody":"<repository-template body>","closePullRequestNumbers":[]}]}</zerokun_publication>',
+      'Sort promotions by repository. Use this only if the requested result is already committed',
+      'on the named source branch and no product edit is required. The shared checkout may be',
+      'dirty, detached, or on another branch; preserve unrelated work, inspect refs, and name the',
+      'intended source branch explicitly. Never use this for a mixed implementation.',
       'The host fixes exact source and remote target SHAs and executes your ordered PR decision after',
       'read-only review. It applies your PR bodies, check-wait choice and obsolete-PR closures, and',
       'never merges the follow-up release PR.',
@@ -3610,7 +3631,7 @@ export function buildCodexPhasePrompt(
       'another browser, operator profile, remote URL, or arbitrary CDP.',
     ] : []),
     publicationOnlyPlans
-      ? 'Review the unchanged, already-committed source checkout and the bound promotion plan.'
+      ? 'Review the exact already-committed source branch and the bound promotion plan.'
       : reviewWorkAction === 'no-change'
         ? 'Review the prepared no-change decision for this exact input. Confirm that no repository'
           + ' or GitHub write is needed and that the user-facing answer fully resolves the request.'
@@ -3649,12 +3670,6 @@ export function assertPreparedWorkPublication(
   plans: readonly GitHubPublicationPlan[],
   implementationBindings: readonly BoundCodexImplementationIntent[] = [],
 ): void {
-  if (workAction === 'implement' && plans.length === 0) {
-    throw new GitHubPublicationError(
-      'configuration',
-      'implementation produced no reviewed commit; preparation did not authorize no-change',
-    )
-  }
   if (workAction === 'no-change' && plans.length !== 0) {
     throw new GitHubPublicationError(
       'configuration',
@@ -4817,6 +4832,21 @@ export class CodexPublicationPreflightRetryError extends Error {
     super(message)
     this.name = 'CodexPublicationPreflightRetryError'
   }
+}
+
+function rethrowPublicationPreflight(
+  error: unknown,
+  sessionId?: string,
+): never {
+  if (error instanceof GitHubPublicationError
+    && ['authentication', 'network', 'remote'].includes(error.category)) {
+    throw new CodexPublicationPreflightRetryError(
+      error.message,
+      error.category as 'authentication' | 'network' | 'remote',
+      sessionId,
+    )
+  }
+  throw error
 }
 export class CodexRepositoryChangedBeforeImplementationError extends Error {
   constructor(
@@ -8097,44 +8127,48 @@ export async function executeCodexJob(
               || [...rootsByIdentifier.values()].some(value => !value)) {
               throw new Error('implementation repository scope is not backed by Git worktrees')
             }
-            publicationBaseline = testCodexBin === undefined
-              ? await captureFreshGitHubPublicationBaselineForBranches(
-                  jobRepo,
-                  implementationIntents.map(intent => ({
-                    gitRoot: rootsByIdentifier.get(intent.repository)!,
-                    baseBranch: intent.baseBranch,
-                  })),
-                )
-              : options.publicationBaselineForTesting!
-            const baselineByRoot = new Map(publicationBaseline.repositories.map(repository => [
-              repository.gitRoot,
-              repository,
-            ]))
-            preparedImplementationBindings = []
-            for (const intent of implementationIntents) {
-              const gitRoot = rootsByIdentifier.get(intent.repository)!
-              const baseline = baselineByRoot.get(gitRoot)
-              if (!baseline || baseline.baseBranch !== intent.baseBranch) {
-                throw new Error('implementation base branch is not bound by the host baseline')
-              }
-              const followupInitialHead = intent.followupBaseBranch === null
-                ? null
-                : (testCodexBin === undefined
-                  ? await captureFreshGitHubPublicationBaselineForBranches(jobRepo, [{
+            try {
+              publicationBaseline = testCodexBin === undefined
+                ? await captureFreshGitHubPublicationBaselineForBranches(
+                    jobRepo,
+                    implementationIntents.map(intent => ({
+                      gitRoot: rootsByIdentifier.get(intent.repository)!,
+                      baseBranch: intent.baseBranch,
+                    })),
+                  )
+                : options.publicationBaselineForTesting!
+              const baselineByRoot = new Map(publicationBaseline.repositories.map(repository => [
+                repository.gitRoot,
+                repository,
+              ]))
+              preparedImplementationBindings = []
+              for (const intent of implementationIntents) {
+                const gitRoot = rootsByIdentifier.get(intent.repository)!
+                const baseline = baselineByRoot.get(gitRoot)
+                if (!baseline || baseline.baseBranch !== intent.baseBranch) {
+                  throw new Error('implementation base branch is not bound by the host baseline')
+                }
+                const followupInitialHead = intent.followupBaseBranch === null
+                  ? null
+                  : (testCodexBin === undefined
+                    ? await captureFreshGitHubPublicationBaselineForBranches(jobRepo, [{
+                        gitRoot,
+                        baseBranch: intent.followupBaseBranch,
+                      }])
+                    : captureGitHubPublicationBaselineForBranches(jobRepo, [{
                       gitRoot,
                       baseBranch: intent.followupBaseBranch,
-                    }])
-                  : captureGitHubPublicationBaselineForBranches(jobRepo, [{
-                    gitRoot,
-                    baseBranch: intent.followupBaseBranch,
-                  }])).repositories[0]!.initialHead
-              preparedImplementationBindings.push({
-                ...intent,
-                gitRoot,
-                baseCommit: baseline.initialHead,
-                headBranch: publicationBranch,
-                followupInitialHead,
-              })
+                    }])).repositories[0]!.initialHead
+                preparedImplementationBindings.push({
+                  ...intent,
+                  gitRoot,
+                  baseCommit: baseline.initialHead,
+                  headBranch: publicationBranch,
+                  followupInitialHead,
+                })
+              }
+            } catch (error) {
+              rethrowPublicationPreflight(error, sessionId ?? undefined)
             }
           }
         }
@@ -8156,7 +8190,13 @@ export async function executeCodexJob(
             throw new Error('publication-only repository scope is not backed by Git worktrees')
           }
           publicationBaseline = testCodexBin === undefined
-            ? captureGitHubPublicationBaseline(jobRepo, scopedSnapshot.gitRoots)
+            ? captureGitHubPublicationBaselineForLocalBranches(
+                jobRepo,
+                preparedPublicationIntents.map(intent => ({
+                  gitRoot: rootsByIdentifier.get(intent.repository)!,
+                  baseBranch: intent.sourceBranch,
+                })),
+              )
             : options.publicationBaselineForTesting ?? (() => {
                 throw new Error('publication-only fixture omitted its GitHub baseline')
               })()
@@ -8171,6 +8211,7 @@ export async function executeCodexJob(
               publicationBaseline,
               preparedPublicationIntents.map(intent => ({
                 gitRoot: rootsByIdentifier.get(intent.repository)!,
+                sourceBranch: intent.sourceBranch,
                 baseBranch: intent.baseBranch,
                 followupBaseBranch: intent.followupBaseBranch,
                 ...(intent.waitForChecks !== undefined ? {
@@ -8185,15 +8226,7 @@ export async function executeCodexJob(
               options.signal,
             )
           } catch (error) {
-            if (error instanceof GitHubPublicationError
-              && ['authentication', 'network', 'remote'].includes(error.category)) {
-              throw new CodexPublicationPreflightRetryError(
-                error.message,
-                error.category as 'authentication' | 'network' | 'remote',
-                sessionId ?? undefined,
-              )
-            }
-            throw error
+            rethrowPublicationPreflight(error, sessionId ?? undefined)
           }
           for (const repository of preparedRepositoryScope) {
             publicationRepositoryScope.add(repository)
@@ -8562,6 +8595,15 @@ export async function executeCodexJob(
           preparedImplementationBindings,
         )
       }
+      const noChangePublicationBinding = preparedWorkAction === 'no-change' ? {
+        jobId: job.id,
+        jobAttempt: job.attempts,
+        logicalNonce: execution.advisorAttemptNonce,
+        inputRevision: finalInput.revision,
+        inputDigest: finalInput.digest,
+        reviewRound,
+        reviewedRepositoryDigest,
+      } : null
       const publication: GitHubPublicationSet | undefined = publicationBaseline
         ? {
             version: 1,
@@ -8574,6 +8616,12 @@ export async function executeCodexJob(
             reviewedRepositoryDigest,
             baselineDigest: gitHubPublicationBaselineDigest(publicationBaseline),
             plans: finalizedPublicationPlans,
+          }
+        : noChangePublicationBinding ? {
+            version: 1,
+            ...noChangePublicationBinding,
+            baselineDigest: noChangePublicationBaselineDigest(noChangePublicationBinding),
+            plans: [],
           }
         : testCodexBin !== undefined ? {
             version: 1,

@@ -65,7 +65,7 @@ function publicationFixture(slug = 'example/demo'): {
   git(repo, 'config', 'remote.origin.url', `https://github.com/${slug}.git`)
   // Real projects commonly install Husky this way. Host publication disables
   // hooks independently, so this repository-owned value must not block the
-  // baseline while still remaining pinned by the local-config digest.
+  // baseline or become a semantic state gate.
   git(repo, 'config', 'core.hooksPath', '.husky/_')
   writeFileSync(join(repo, 'README.md'), 'initial\n')
   git(repo, 'add', 'README.md')
@@ -260,13 +260,16 @@ describe('host GitHub publication', () => {
     }))
   })
 
-  test('HuskyのhooksPathは許容し、baseline後の値変更は公開計画を無効化する', () => {
+  test('benign local config driftはCodexの公開判断を破棄せずorigin変更だけ拒否する', () => {
     const { repo, plan } = publicationFixture('example/husky')
     expect(git(repo, 'config', '--local', 'core.hooksPath')).toBe('.husky/_')
     expect(plan.repositorySlug).toBe('example/husky')
 
     git(repo, 'config', 'core.hooksPath', '.config/husky/_')
-    expect(() => prepareGitHubPublicationPlans({
+    git(repo, 'config', 'protocol.version', '2')
+    git(repo, 'config', 'credential.useHttpPath', 'true')
+    git(repo, 'config', 'core.sshCommand', '/usr/bin/false')
+    const baseline = {
       version: 1,
       projectPath: repo,
       repositories: [{
@@ -283,8 +286,22 @@ describe('host GitHub publication', () => {
           canonicalUrl: 'https://github.com/example/husky.git',
         },
       }],
-    }, ['.'], undefined, plan.headBranch)).toThrow(
-      'repository config or origin changed outside the reviewed commit',
+    } as const
+    expect(prepareGitHubPublicationPlans(
+      baseline,
+      ['.'],
+      [{ gitRoot: repo, head: plan.commitSha }],
+      plan.headBranch,
+    )).toHaveLength(1)
+
+    git(repo, 'config', 'remote.origin.url', 'https://github.com/example/other.git')
+    expect(() => prepareGitHubPublicationPlans(
+      baseline,
+      ['.'],
+      [{ gitRoot: repo, head: plan.commitSha }],
+      plan.headBranch,
+    )).toThrow(
+      'repository origin changed outside the reviewed publication target',
     )
   })
 
@@ -309,8 +326,9 @@ describe('host GitHub publication', () => {
     git(repo, 'commit', '-m', 'chore: advance remote develop')
     const freshHead = git(repo, 'rev-parse', 'HEAD')
     git(repo, 'switch', 'main')
-    git(repo, 'switch', '-c', 'feature/unrelated-shared-checkout')
+    git(repo, 'switch', '--detach')
     const sharedHead = git(repo, 'rev-parse', 'HEAD')
+    writeFileSync(join(repo, 'operator-notes.txt'), 'preserve detached checkout work\n')
     const calls: string[][] = []
     const commands: GitHubPublicationCommands = {
       async runGit(commandRepo, args) {
@@ -340,12 +358,12 @@ describe('host GitHub publication', () => {
       'https://github.com/example/fresh-base.git',
       '+refs/heads/develop:refs/remotes/origin/develop',
     ]])
-    expect(git(repo, 'branch', '--show-current')).toBe('feature/unrelated-shared-checkout')
+    expect(git(repo, 'branch', '--show-current')).toBe('')
     expect(git(repo, 'rev-parse', 'HEAD')).toBe(sharedHead)
-    expect(git(repo, 'status', '--porcelain')).toBe('')
+    expect(git(repo, 'status', '--porcelain')).toContain('operator-notes.txt')
   })
 
-  test('review済みSHAとhost指定branchだけをclean repositoryから計画する', () => {
+  test('review済みSHAとhost指定feature refだけを公開計画へ束縛する', () => {
     const { plan } = publicationFixture()
     expect(plan).toMatchObject({
       repositorySlug: 'example/demo',
@@ -395,6 +413,8 @@ describe('host GitHub publication', () => {
     git(repo, 'commit', '-am', 'feat: reviewed UI')
     const sourceHead = git(repo, 'rev-parse', 'HEAD')
     const baseline = captureGitHubPublicationBaseline(repo, [repo])
+    git(repo, 'switch', '--detach')
+    writeFileSync(join(repo, 'operator-notes.txt'), 'preserve this concurrent work\n')
     const developInitial = 'a'.repeat(40)
     const mainInitial = 'b'.repeat(40)
     const promotedDevelop = 'c'.repeat(40)
@@ -518,7 +538,12 @@ describe('host GitHub publication', () => {
     }
     const [plan] = await prepareGitHubPromotionPlans(
       baseline,
-      [{ gitRoot: realpathSync(repo), baseBranch: 'develop', followupBaseBranch: 'main' }],
+      [{
+        gitRoot: realpathSync(repo),
+        sourceBranch: 'feature/reviewed-ui',
+        baseBranch: 'develop',
+        followupBaseBranch: 'main',
+      }],
       branch,
       commands,
     )
@@ -532,6 +557,8 @@ describe('host GitHub publication', () => {
         followupBaseBranch: 'main',
       },
     })
+    expect(git(repo, 'branch', '--show-current')).toBe('')
+    expect(git(repo, 'status', '--porcelain')).toContain('operator-notes.txt')
 
     await expect(publishGitHubPlan(plan!, commands)).rejects.toEqual(
       expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'waiting' }),
@@ -1588,7 +1615,7 @@ describe('host GitHub publication', () => {
     expect(git(plan.gitRoot, 'status', '--porcelain')).toContain('human-notes.txt')
   })
 
-  test('dirty baselineとbaseline外scopeを公開計画にしない', () => {
+  test('dirty shared checkoutを意味gateにせずbaseline外scopeだけ拒否する', () => {
     const repo = join(fixtureDir(), 'dirty')
     mkdirSync(repo)
     git(repo, 'init', '--initial-branch=main')
@@ -1599,10 +1626,10 @@ describe('host GitHub publication', () => {
     git(repo, 'add', 'README.md')
     git(repo, 'commit', '-m', 'initial')
     writeFileSync(join(repo, 'README.md'), 'uncommitted user work\n')
-    expect(() => captureGitHubPublicationBaseline(repo, [repo])).toThrow('must be clean')
-
-    git(repo, 'restore', 'README.md')
     const baseline = captureGitHubPublicationBaseline(repo, [repo])
+    expect(baseline.repositories[0]?.statusDigest).not.toBe(
+      createHash('sha256').update('').digest('hex'),
+    )
     expect(() => prepareGitHubPublicationPlans(baseline, ['missing'])).toThrow(
       'not fully bound',
     )
@@ -1689,5 +1716,27 @@ describe('host GitHub publication', () => {
     expect(() => captureGitHubPublicationBaseline(repo, [repo])).toThrow(
       'unsafe for host publication',
     )
+  })
+
+  test('canonical GitHub transportを迂回し得るlocal configは引き続き拒否する', () => {
+    for (const [index, [key, value]] of [
+      ['url.https://mirror.invalid/.insteadOf', 'https://github.com/'],
+      ['http.proxy', 'https://proxy.invalid/'],
+      ['include.path', '/tmp/untrusted-git-config'],
+    ].entries()) {
+      const repo = join(fixtureDir(), `hostile-config-${index}`)
+      mkdirSync(repo)
+      git(repo, 'init', '--initial-branch=main')
+      git(repo, 'config', 'user.email', 'zero@example.invalid')
+      git(repo, 'config', 'user.name', 'Zero Test')
+      git(repo, 'config', 'remote.origin.url', 'https://github.com/example/hostile.git')
+      writeFileSync(join(repo, 'README.md'), 'initial\n')
+      git(repo, 'add', 'README.md')
+      git(repo, 'commit', '-m', 'initial')
+      git(repo, 'config', key, value)
+      expect(() => captureGitHubPublicationBaseline(repo, [repo])).toThrow(
+        'unsafe for host publication',
+      )
+    }
   })
 })

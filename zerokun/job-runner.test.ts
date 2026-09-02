@@ -938,6 +938,18 @@ describe('Codex job store', () => {
     expect(controller.signal.aborted).toBe(false)
   })
 
+  test('runner起動はGitHub認証をglobal gateにせず必要なpublicationだけ遅延確認する', () => {
+    const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
+    const startupBegin = runner.indexOf('const loginCodex = resolveOfficialStandaloneCodex()')
+    const startupEnd = runner.indexOf('if (botToken || appToken)', startupBegin)
+    expect(startupBegin).toBeGreaterThanOrEqual(0)
+    expect(startupEnd).toBeGreaterThan(startupBegin)
+    const startupChecks = runner.slice(startupBegin, startupEnd)
+    expect(startupChecks).toContain('assertCodexChatGptSubscriptionLogin(loginCodex.physical)')
+    expect(startupChecks).not.toContain('assertHostGitHubPublicationLogin')
+    expect(runner).toContain('publishStagedGitHubPublication(store, jobId')
+  })
+
   test('既存auto_vacuum=NONE DBを停止中migrationでINCREMENTALへ変換する', () => {
     const dir = fixtureDir()
     const dbPath = join(dir, 'jobs.sqlite3')
@@ -3576,6 +3588,62 @@ describe('single FIFO worker', () => {
     expect(store.get(queued.id)).toMatchObject({
       status: 'completed', sessionId: 'plain-session', result: 'plain result',
     })
+    store.close()
+  })
+
+  test('write許可ユーザーへのno-change回答はGitHub公開を起動せず完了する', async () => {
+    const store = makeStore()
+    const queued = store.enqueue(input({
+      messageId: 'write-authorized-no-change',
+      task: '固定済み小区間とは何ですか？',
+      writeEnabled: true,
+    })).job
+    const monitorMessages: string[] = []
+    let githubCalls = 0
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executorStagesResult: true,
+      updateJobMonitor: async (_job, message) => { monitorMessages.push(message) },
+      githubPublicationCommandsForTesting: {
+        async runGit() { githubCalls += 1; return { exitCode: 0, stdout: '', stderr: '' } },
+        async runGh() { githubCalls += 1; return { exitCode: 0, stdout: '', stderr: '' } },
+      },
+      executor: async current => {
+        const execution = {
+          sessionId: 'write-authorized-no-change-session',
+          result: '句読点など、意味がまとまる区切りです。',
+          publication: emptyFixturePublication(store, current),
+        }
+        store.ensureExecutionResultStaged(
+          current.id,
+          execution.sessionId,
+          execution.result,
+          execution.publication,
+        )
+        return execution
+      },
+    })
+
+    expect(stats).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
+    expect(githubCalls).toBe(0)
+    expect(monitorMessages.some(message => /GitHub|push|PR/.test(message))).toBe(false)
+    expect(store.get(queued.id)).toMatchObject({
+      status: 'completed',
+      terminalOutcome: 'completed',
+      result: '句読点など、意味がまとまる区切りです。',
+    })
+    const publicationDb = new Database(store.dbPath, { readonly: true })
+    const storedPublication = publicationDb.query<{
+      plan_count: number
+      status: string
+    }, [string]>(
+      'SELECT plan_count, status FROM github_publication_sets WHERE job_id = ?',
+    ).get(queued.id)
+    expect(storedPublication).toEqual({ plan_count: 0, status: 'completed' })
+    publicationDb.close()
     store.close()
   })
 
@@ -9636,11 +9704,6 @@ describe('Slack output guard', () => {
       'Codex preparation omitted its exact work action envelope',
     )).toBe(
       '処理手順の確認応答を正しく読み取れませんでした。変更・公開は確定していません。同じスレッドから再開できます。',
-    )
-    expect(publicJobFailureSummary(
-      'implementation produced no reviewed commit; preparation did not authorize no-change',
-    )).toBe(
-      '公開可能なreview済みcommitを確認できませんでした。変更は自動公開していません。同じスレッドから再開できます。',
     )
     expect(publicJobFailureSummary(
       'Codex-selected GitHub checks failed: quality, screenshot evidence',

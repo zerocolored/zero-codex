@@ -356,7 +356,7 @@ describe('Codex UI/UX approval decision contract', () => {
     const ready = `[ZERO_PRE_EDIT_READY:${nonce}:r3:${input.digest}]`
     const promotion = '<zerokun_publication>{"promotions":['
       + '{"kind":"promote-current-head","repository":"frontend",'
-      + '"baseBranch":"develop","mergePullRequest":true,'
+      + '"sourceBranch":"feature/approved-ui","baseBranch":"develop","mergePullRequest":true,'
       + '"followupBaseBranch":"main","waitForChecks":false,'
       + '"integrationPullRequestBody":"## Summary\\nreviewed {{COMMIT_SHA}}",'
       + '"followupPullRequestBody":"## Summary\\nrelease {{COMMIT_SHA}}",'
@@ -373,6 +373,7 @@ describe('Codex UI/UX approval decision contract', () => {
       publicationIntents: [{
         kind: 'promote-current-head',
         repository: 'frontend',
+        sourceBranch: 'feature/approved-ui',
         baseBranch: 'develop',
         mergePullRequest: true,
         followupBaseBranch: 'main',
@@ -398,6 +399,7 @@ describe('Codex UI/UX approval decision contract', () => {
     const details = {
       kind: 'promote-current-head',
       repository: 'frontend',
+      sourceBranch: 'feature/approved-ui',
       baseBranch: 'develop',
       mergePullRequest: true,
       followupBaseBranch: 'main',

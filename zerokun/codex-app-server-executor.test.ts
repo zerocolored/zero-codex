@@ -20,6 +20,7 @@ import {
 import {
   captureGitHubPublicationBaseline,
   captureGitHubPublicationBaselineForBranches,
+  captureGitHubPublicationBaselineForLocalBranches,
   publishGitHubPlan,
   type GitHubPublicationCommands,
   type PublicationCommandResult,
@@ -370,7 +371,8 @@ for line in sys.stdin:
                         )
                         if not required_history:
                             raise RuntimeError("failed publication continuation history missing")
-                    publication = '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":".","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main","waitForChecks":false,"integrationPullRequestBody":"## Summary","followupPullRequestBody":"## Summary","closePullRequestNumbers":[]}]}</zerokun_publication>'
+                    source_branch = "feature/resumed-publication" if mode == "phased-promotion-history-failed" else "feature/approved-ui"
+                    publication = '<zerokun_publication>{"promotions":[{"kind":"promote-current-head","repository":".","sourceBranch":"' + source_branch + '","baseBranch":"develop","mergePullRequest":true,"followupBaseBranch":"main","waitForChecks":false,"integrationPullRequestBody":"## Summary","followupPullRequestBody":"## Summary","closePullRequestNumbers":[]}]}</zerokun_publication>'
                     scope = '<zerokun_repository_scope>{"repositories":["."]}</zerokun_repository_scope>'
                     action = '<zerokun_work_action>{"kind":"promote-current-head"}</zerokun_work_action>'
                     message = "公開準備完了\\n" + action + "\\n" + publication + "\\n" + scope + "\\n" + (marker.group(0) if marker else "[ZERO_PRE_EDIT_READY:missing:r1:missing]")
@@ -1688,7 +1690,7 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test('既存commitのbranch promotionはwrite phaseを再実行せずprepareからreviewへ直接固定する', async () => {
+  test('detachedかつdirtyな共有checkoutでもCodex指定branchのpromotionをreviewへ直接固定する', async () => {
     const value = fixture(
       'phased-promotion',
       true,
@@ -1702,12 +1704,22 @@ describe('production App Server executor', () => {
     git(value.repo, ['config', 'core.hooksPath', '.husky/_'])
     git(value.repo, ['add', 'AGENTS.md'])
     git(value.repo, ['commit', '-m', 'chore: initial'])
+    const staleRemoteSourceHead = git(value.repo, ['rev-parse', 'HEAD'])
     git(value.repo, ['switch', '-c', 'feature/approved-ui'])
     writeFileSync(join(value.repo, 'approved.txt'), 'already reviewed\n')
     git(value.repo, ['add', 'approved.txt'])
     git(value.repo, ['commit', '-m', 'feat: approved UI'])
     const sourceHead = git(value.repo, ['rev-parse', 'HEAD'])
-    const baseline = captureGitHubPublicationBaseline(value.repo, [value.repo])
+    git(value.repo, [
+      'update-ref', 'refs/remotes/origin/feature/approved-ui', staleRemoteSourceHead,
+    ])
+    git(value.repo, ['switch', '--detach', sourceHead])
+    writeFileSync(join(value.repo, 'parallel-untracked.txt'), 'preserve me\n')
+    const baseline = captureGitHubPublicationBaselineForLocalBranches(value.repo, [{
+      gitRoot: value.repo,
+      baseBranch: 'feature/approved-ui',
+    }])
+    expect(baseline.repositories[0]?.initialHead).toBe(sourceHead)
     const developHead = 'a'.repeat(40)
     const mainHead = 'b'.repeat(40)
     const commands: GitHubPublicationCommands = {
@@ -1756,8 +1768,9 @@ describe('production App Server executor', () => {
       .map(line => line.split('\t'))
     expect(phaseRows.map(row => row[0])).toEqual(['prepare', 'review'])
     expect(phaseRows.map(row => row[4])).toEqual(['read', 'read'])
-    expect(git(value.repo, ['branch', '--show-current'])).toBe('feature/approved-ui')
-    expect(git(value.repo, ['status', '--porcelain'])).toBe('')
+    expect(git(value.repo, ['branch', '--show-current'])).toBe('')
+    expect(git(value.repo, ['rev-parse', 'HEAD'])).toBe(sourceHead)
+    expect(git(value.repo, ['status', '--porcelain'])).toBe('?? parallel-untracked.txt')
     expect(value.store.hasGitHubPublicationCheckpoint(value.job.id)).toBe(true)
     expect(value.store.hasStagedExecution(value.job.id)).toBe(true)
     const plan = execution.publication!.plans[0]!
@@ -1907,8 +1920,11 @@ describe('production App Server executor', () => {
     git(value.repo, ['config', 'remote.origin.url', 'https://github.com/example/preflight.git'])
     git(value.repo, ['add', 'AGENTS.md'])
     git(value.repo, ['commit', '-m', 'chore: initial'])
-    git(value.repo, ['switch', '-c', 'feature/already-reviewed'])
-    const baseline = captureGitHubPublicationBaseline(value.repo, [value.repo])
+    git(value.repo, ['switch', '-c', 'feature/approved-ui'])
+    const baseline = captureGitHubPublicationBaselineForLocalBranches(value.repo, [{
+      gitRoot: value.repo,
+      baseBranch: 'feature/approved-ui',
+    }])
 
     await expect(executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
@@ -1953,7 +1969,10 @@ describe('production App Server executor', () => {
     git(value.repo, ['add', 'resumed.txt'])
     git(value.repo, ['commit', '-m', 'feat: resumable publication'])
     const sourceHead = git(value.repo, ['rev-parse', 'HEAD'])
-    const baseline = captureGitHubPublicationBaseline(value.repo, [value.repo])
+    const baseline = captureGitHubPublicationBaselineForLocalBranches(value.repo, [{
+      gitRoot: value.repo,
+      baseBranch: 'feature/resumed-publication',
+    }])
     const developHead = 'd'.repeat(40)
     const mainHead = 'e'.repeat(40)
     expect(value.job.task).toBe('こちら続きを進めて')
@@ -2073,6 +2092,9 @@ describe('production App Server executor', () => {
       result: '公開できます',
       publication: { plans: [] },
     })
+    expect(execution.publication?.baselineDigest).not.toBe(
+      createHash('sha256').update('fixture-only-empty-publication').digest('hex'),
+    )
     expect(readFileSync(phaseLog, 'utf8').trim().split('\n')
       .map(line => line.split('\t')[0])).toEqual(['prepare', 'review'])
     const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
@@ -2089,8 +2111,9 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test('implement宣言でreview済みcommitが0件ならno-changeへ黙って降格しない', async () => {
+  test('最終reviewが承認したcommit 0件の実装をhost独自判定で失敗させない', async () => {
     const value = fixture('phased', true)
+    const promptLog = join(value.root, 'empty-implementation-prompts.log')
     git(value.repo, ['init', '--initial-branch=main'])
     git(value.repo, ['config', 'user.email', 'zero@example.invalid'])
     git(value.repo, ['config', 'user.name', 'Zero Test'])
@@ -2098,19 +2121,35 @@ describe('production App Server executor', () => {
     git(value.repo, ['add', 'AGENTS.md'])
     git(value.repo, ['commit', '-m', 'chore: initial'])
     const baseline = captureGitHubPublicationBaseline(value.repo, [value.repo])
-    await expect(executeCodexJob(value.job, {
+    const execution = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
       stateDir: value.state,
       skipEffectiveConfigCheck: true,
-      extraEnvironment: { ZERO_FIXTURE_MODE: 'phased' },
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased',
+        ZERO_PROMPT_LOG: promptLog,
+      },
       phaseGateForTesting: {},
       liveControls: value.hooks,
       publicationBaselineForTesting: baseline,
-    })).rejects.toThrow(
-      'implementation produced no reviewed commit; preparation did not authorize no-change',
+    })
+    expect(execution).toMatchObject({
+      sessionId: 'thread-app-server-1',
+      result: '公開できます',
+      publication: { plans: [] },
+    })
+    const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string, text: string })
+    expect(prompts.find(prompt => prompt.stage === 'review')?.text).toContain(
+      'The implementation phase produced no publication commit',
     )
-    expect(value.store.hasStagedExecution(value.job.id)).toBe(false)
+    expect(value.store.hasStagedExecution(value.job.id)).toBe(true)
+    value.store.completeStagedExecution(value.job.id)
+    expect(value.store.get(value.job.id)).toMatchObject({
+      status: 'completed',
+      result: '公開できます',
+    })
     value.store.close()
   }, 30_000)
 
