@@ -494,6 +494,7 @@ else
 fi
 ln -sfn "$REPO_DIR/zerokun/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
 ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerochan-access"
+ln -sfn "$REPO_DIR/zerokun/status.ts" "$HOME/.local/bin/zerokun-status"
 ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"
 ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/codex-channel"
 [ -L "$HOME/.local/bin/zerochan" ] \
@@ -548,7 +549,6 @@ alias zerokun='zerochan'
 # --restart は明示指定そのものを確認として、既存gatewayを非対話で安全に入れ替える。
 # ZEROKUN_REPLACE=1 は自己更新のワンタイムトークン無しでは停止権限にならない。
 alias zerokun-restart='zerochan --restart'
-alias zerokun-status='pid=$(cat "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/plugin.lock" 2>/dev/null); [ -n "$pid" ] && ps -p "$pid" -o pid=,command= || echo "Zeroちゃんは停止中"'
 # <<< zerokun setup <<<
 EOF
   } >> "$ZSHRC_TMP"
@@ -563,7 +563,7 @@ else
   echo "✅ 配線完了。残りの手動ステップ:"
   echo "  1. 複数PCを同時稼働する場合は、このMac用のSlack Appを新規作成します。"
   echo "     旧PCのgatewayを止めて移行する場合は、既存Appのトークン2つを再利用できます。"
-  echo "     $CH/.env に xoxb- / xapp- を保存します (作成・移行手順はリポ直下 README.md)"
+  echo "     $CH/.env に xoxb- / xapp- を保存します (作成・移行手順はリポ直下 SETUP.md)"
   echo "  2. codex login status が Logged in using ChatGPT と返すことを確認"
   echo "     gh auth status --hostname github.com が成功することも確認"
   echo "  3. 対象projectへ cd して: zerochan set slack-channel <SlackチャンネルID>"

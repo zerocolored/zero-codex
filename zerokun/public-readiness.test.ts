@@ -155,12 +155,13 @@ describe('public Codex defaults', () => {
   test('repository未取得の新規Macにもmain branch bootstrapの取得手順がある', () => {
     const rootReadme = readFileSync(join(import.meta.dir, '..', 'README.md'), 'utf8')
     const runtimeReadme = readFileSync(join(import.meta.dir, 'README.md'), 'utf8')
-    const setupGuide = readFileSync(join(import.meta.dir, 'NEW_MAC_SETUP.md'), 'utf8')
+    const setupGuide = readFileSync(join(import.meta.dir, '..', 'SETUP.md'), 'utf8')
+    const compatibilityGuide = readFileSync(join(import.meta.dir, 'NEW_MAC_SETUP.md'), 'utf8')
     const bootstrap = readFileSync(join(import.meta.dir, 'bootstrap-macos.sh'), 'utf8')
     const codexVersion = readFileSync(join(import.meta.dir, 'codex-version.sh'), 'utf8')
     const codexChannel = readFileSync(join(import.meta.dir, '..', 'codex-channel.sh'), 'utf8')
     const rawBootstrap = 'https://raw.githubusercontent.com/zerocolored/zero-codex/main/zerokun/bootstrap-macos.sh'
-    for (const guide of [rootReadme, runtimeReadme, setupGuide]) {
+    for (const guide of [rootReadme, runtimeReadme]) {
       expect(guide).toContain(rawBootstrap)
       expect(guide).toContain('/usr/bin/mktemp -d /tmp/zerokun-bootstrap.XXXXXX')
       expect(guide).toContain('/usr/bin/env -i PATH=/usr/bin:/bin TMPDIR=/tmp')
@@ -190,9 +191,61 @@ describe('public Codex defaults', () => {
     expect(rootReadme).toContain('移行中は新しい依頼を投稿しない')
     expect(rootReadme).toContain('--slack-app-name "ベルミちゃん"')
     expect(setupGuide).toContain('旧PCのgatewayを停止して新PCへ移行')
-    expect(setupGuide).toContain('PCごとに別のSlack Appとtoken')
+    expect(setupGuide).toContain('PCごとに新しいSlack Appを作る')
+    expect(compatibilityGuide).toContain('[`SETUP.md`](../SETUP.md)')
     expect(bootstrap).toContain('旧PCのgatewayを停止して移行する場合')
     expect(bootstrap).toContain('同じAppのトークンを複数PCで同時に使用しないでください')
+  })
+
+  test('clone後の一言セットアップ契約がrootのAGENTSとSETUPへ固定されている', () => {
+    const agents = readFileSync(join(import.meta.dir, '..', 'AGENTS.md'), 'utf8')
+    const setup = readFileSync(join(import.meta.dir, '..', 'SETUP.md'), 'utf8')
+    const rootReadme = readFileSync(join(import.meta.dir, '..', 'README.md'), 'utf8')
+    const setupScript = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
+
+    for (const expected of [
+      '「セットアップして」',
+      'SETUP.md',
+      'interactive-bootstrap.sh --with-slack',
+      'そのMac専用の新しいSlack App',
+      'Slack上の実応答まで確認',
+      'zerokun-status',
+    ]) expect(agents).toContain(expected)
+
+    for (const expected of [
+      'Codexには次のように依頼します',
+      'https://learn.chatgpt.com/docs/agent-configuration/agents-md',
+      'zerokun/interactive-bootstrap.sh',
+      '別の可視Terminal',
+      'Anthropic公式native Claude Code',
+      'PCごとに新しいSlack Appを作る',
+      'From a manifest',
+      'connections:write',
+      'Install to Workspace',
+      'Bot User OAuth Token',
+      '表示されないpromptへ',
+      'zerochan set slack-channel',
+      'zerochan start',
+      'Slackの実メンションまたはDMにZeroちゃんが返信した',
+    ]) expect(setup).toContain(expected)
+
+    expect(rootReadme).toContain('[`SETUP.md`](SETUP.md)')
+    expect(setupScript).toContain('作成・移行手順はリポ直下 SETUP.md')
+    expect(setupScript).toContain(
+      'ln -sfn "$REPO_DIR/zerokun/status.ts" "$HOME/.local/bin/zerokun-status"',
+    )
+    expect(setupScript).not.toContain('alias zerokun-status=')
+    expect(rootReadme).not.toContain('SLACK_BOT_TOKEN=xoxb-...')
+    expect(rootReadme).not.toContain('SLACK_APP_TOKEN=xapp-...')
+    expect(rootReadme).not.toContain('新PCの`~/.codex/zerokun/.env`へ2値を保存')
+    expect(agents).toContain('interactive-bootstrap.sh')
+    expect(agents).toContain('Herdr workspaceを作って')
+    expect(readFileSync(join(import.meta.dir, '..', 'codex-channel.sh'), 'utf8'))
+      .toContain('"$REPO_DIR/zerokun/herdr-start.ts" "$REPO_DIR" "$STATE_DIR" "$PROJECT"')
+    expect(setup).toContain('`zerochan status`は、このprojectに保存されたchannel紐付け')
+    expect(setup).toContain('`zerokun-status`が停止中になったことを確認')
+    expect(setup).not.toContain('`zerochan status`でgateway停止')
+    expect(agents).not.toContain('tokenをchatで送って')
   })
 
   test('legacy stateや互換envを暗黙採用せずCodex stateを既定にする', () => {

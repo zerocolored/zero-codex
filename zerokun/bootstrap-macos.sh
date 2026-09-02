@@ -1072,6 +1072,27 @@ install_herdr_standalone() {
   append_profile_block '# zerokun bootstrap: Herdr' 'export PATH="$HOME/.local/bin:$PATH"'
 }
 
+install_claude_code() {
+  local installer
+  installer="$(/usr/bin/mktemp /tmp/zerokun-claude-installer.XXXXXX)" \
+    || fail "Claude Code公式installer用一時fileを作成できません"
+  if ! secure_download "$installer" https://claude.ai/install.sh; then
+    /bin/rm -f "$installer"
+    fail "Claude Code公式installerを取得できませんでした"
+  fi
+  /bin/chmod 0700 "$installer"
+  if ! isolated_network_command /bin/bash "$installer" stable; then
+    /bin/rm -f "$installer"
+    fail "Claude Code公式installerの実行に失敗しました"
+  fi
+  /bin/rm -f "$installer"
+  export PATH="$HOME/.local/bin:$PATH"
+  hash -r
+  resolve_claude_binary >/dev/null \
+    || fail "Claude Code公式CLIのowner・path・executable検証に失敗しました"
+  append_profile_block '# zerokun bootstrap: Claude Code' 'export PATH="$HOME/.local/bin:$PATH"'
+}
+
 install_grok_build() {
   local installer logical="$HOME/.grok/bin/grok"
   if grok_build_executable >/dev/null; then
@@ -1145,8 +1166,9 @@ export PATH="$BUN_INSTALL/bin:$PATH"'
     || fail "Codex公式standaloneの安全性を確認できませんでした"
   grok_build_executable >/dev/null \
     || fail "Grok Build公式CLIの安全性を確認できませんでした"
+  resolve_claude_binary >/dev/null || install_claude_code
   resolve_claude_binary >/dev/null \
-    || fail "Claude Codeがありません。公式Claude Codeを導入してから同じbootstrapを再実行してください"
+    || fail "Claude Code公式CLIを導入できませんでした"
   ok "必要なCLIを導入しました"
 }
 

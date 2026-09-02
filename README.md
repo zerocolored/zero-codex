@@ -156,6 +156,12 @@ prompt送達後に中断しても同じpromptは再送せず、owner-only receip
 
 ## セットアップ
 
+新しいMacでは、repositoryをcloneしてCodexへ**「セットアップして」**と依頼できます。
+Codexが読む正本、Slack Appの作り方、人にしか行えないlogin、project/channel設定、起動、
+Slack実応答までの完了条件は[`SETUP.md`](SETUP.md)に一本化しています。
+
+以下は運用上の補足です。新規導入は先に`SETUP.md`を使用してください。
+
 ### 別のMacで使うときの選び方
 
 最初に、旧PCを止めて移行するのか、複数PCを同時に動かすのかを決めます。
@@ -227,11 +233,12 @@ Homebrew/npm版だけを使った直接`setup.sh`は、後日の安全な自己�
 1. 旧PCで`zerokun-jobs status`を確認し、実行中・待機中jobがなくなるまで待ちます。
 2. `SLACK_APP_TOKEN`と`SLACK_BOT_TOKEN`の2値だけを、AirDropや暗号化されたpassword managerなどの
    安全な経路で新PCへ移します。tokenをGit、Slack投稿、issue、通常ログへ貼らないでください。
-3. 新PCの`~/.codex/zerokun/.env`へ2値を保存し、`chmod 600 ~/.codex/zerokun/.env`を実行します。
-4. 新PCで`bash zerokun/bootstrap-macos.sh --slack-only`を実行します。既存Appのtoken identityを検証し、
-   App IDに結び付いた履歴下限を保存します。このcommandだけではSocket Mode gatewayを起動しません。
+3. 新PCで`bash zerokun/interactive-bootstrap.sh --slack-only`を
+   実行し、開いた可視Terminalの表示されないpromptへ2値を貼ります。`.env`を手書きしません。
+4. bootstrapが既存Appのtoken identityを検証し、App IDに結び付いた履歴下限を保存します。
+   このcommandだけではSocket Mode gatewayを起動しません。
 5. 旧PCで`touch "${ZEROKUN_STATE_DIR:-$HOME/.codex/zerokun}/watchdog-off"`を実行し、停止警報を無効にします。
-6. 旧PCで`zerochan stop`を実行し、`zerochan status`でgateway停止を確認します。
+6. 旧PCで`zerochan stop`を実行し、`zerokun-status`でgateway停止を確認します。
 7. 下の「3. projectとSlackチャンネルを設定して起動する」を新PCで終えてから、Slackへの依頼を再開します。
 
 `jobs.sqlite3`、process lock、監視tab、inbox/outboxなどのruntime stateはコピーしません。channel紐付け、
@@ -244,7 +251,8 @@ DM pairing、repository write許可は新PCで設定し直します。履歴下�
 PCごとに新しいSlack Appを作ります。例えば、このPCの表示名を「ベルミちゃん」にする場合:
 
 ```bash
-bash zerokun/bootstrap-macos.sh --slack-only \
+bash zerokun/interactive-bootstrap.sh \
+  --slack-only \
   --slack-app-name "ベルミちゃん" \
   --slack-bot-name bellmi
 ```
@@ -258,8 +266,8 @@ bash zerokun/bootstrap-macos.sh --slack-only \
 
 ### 3. projectとSlackチャンネルを設定して起動する
 
-対象projectを新PCへcloneし、Herdrの専用paneで次を実行します。複数repositoryをまとめた親folderも
-対象にできます。
+対象projectを新PCへcloneし、通常TerminalまたはHerdrで次を実行します。Herdr外なら専用workspaceが
+自動作成されます。複数repositoryをまとめた親folderも対象にできます。
 
 ```bash
 cd /absolute/path/to/project
@@ -314,8 +322,8 @@ Zeroちゃん本体はhost runtimeなので、そこを対象にしたSlack writ
 ある場合はmulti-repository workspaceとして利用できます。
 
 依存関係だけ診断する場合は `--doctor`、導入済み環境で Slack 設定だけ再開する場合は
-`--slack-only` を使います。詳しくは
-[`zerokun/NEW_MAC_SETUP.md`](zerokun/NEW_MAC_SETUP.md) を参照してください。
+`--slack-only` を使います。導入の正本は[`SETUP.md`](SETUP.md)です。旧リンク
+[`zerokun/NEW_MAC_SETUP.md`](zerokun/NEW_MAC_SETUP.md)からも同じ正本へ案内します。
 
 ### Slack App
 
@@ -328,16 +336,10 @@ Zeroちゃん本体はhost runtimeなので、そこを対象にしたSlack writ
 
 1. App-Level Token に `connections:write` を付け、`xapp-...` を取得する。
 2. Workspace へ Install し、Bot User OAuth Token `xoxb-...` を取得する。
-3. 次のファイルへ保存する（既存ファイルは setup が上書きしません）。
+3. Codexが`interactive-bootstrap.sh --with-slack`で開いた可視Terminalへ戻り、内容が表示されない
+   promptへ`xapp-...`、`xoxb-...`の順で貼る。tokenをchat、command引数、手書き`.env`へ載せません。
 
-```bash
-~/.codex/zerokun/.env
-```
-
-```dotenv
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...
-```
+新しいMacの完全な手順とSlack画面上の操作は[`SETUP.md`](SETUP.md)を正本にします。
 
 既定stateは常に `~/.codex/zerokun` です。旧版の`~/.claude/channels/slack`は
 自動選択せず、token・access・queueを暗黙に流用しません。in-place cutover時だけ
@@ -369,7 +371,7 @@ zerochan-access write deny U0123456789
 ## 起動と運用
 
 ```bash
-# setup後、Herdrの専用paneで対象projectへ移動して起動
+# setup後、対象projectへ移動して起動（Herdr外なら専用workspaceを自動作成）
 cd /absolute/path/to/project
 zerochan set slack-channel C0123456789
 zerochan start

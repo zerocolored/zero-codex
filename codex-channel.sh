@@ -254,6 +254,13 @@ zerokun_require_herdr_version || exit 1
 # records a safely-contained unavailable Claude/Grok slot and continues; Zero
 # never performs authentication on the user's behalf.
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/codex-executor.ts" verify-system-config || exit 1
+# A setup started from ordinary Codex/Terminal has no Herdr pane identity yet.
+# Run all ordinary release/config checks first, then create one fresh project
+# workspace and let its inner HERDR_ENV=1 invocation use managed-start.
+if [ "$LAUNCH_MODE" = "managed-start" ] && [ "${HERDR_ENV:-0}" != "1" ]; then
+  exec bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/herdr-start.ts" "$REPO_DIR" "$STATE_DIR" "$PROJECT"
+fi
 HERDR_RUNTIME_ID="$(bun --config=/dev/null --no-env-file \
   "$REPO_DIR/zerokun/herdr-runtime.ts" runtime-id)" || {
   echo "❌ ZeroちゃんはHerdr内の専用paneから起動してください。" >&2

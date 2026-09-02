@@ -304,7 +304,7 @@ describe('codex-channel.sh replacement guard', () => {
     const state = fixture()
     const project = join(dirname(state), 'project')
     const startLog = join(state, 'start-bun.log')
-    const start = await runLauncher(state, { FAKE_BUN_LOG: startLog }, undefined, {
+    const start = await runLauncher(state, { FAKE_BUN_LOG: startLog, HERDR_ENV: '1' }, undefined, {
       invokedAs: 'zerochan', cwd: project, args: ['start'],
     })
     expect(start.exitCode, start.output).toBe(0)
@@ -322,6 +322,21 @@ describe('codex-channel.sh replacement guard', () => {
     expect(stopCalls).toContain(`service-control.ts stop ${dirname(import.meta.dir)} ${state}`)
     expect(stopCalls).not.toContain('slack-app-identity.ts')
     expect(stopCalls).not.toContain('project-selection.ts')
+  })
+
+  test('Herdr外のzerochan startは可視workspace作成helperへ委譲する', async () => {
+    const state = fixture()
+    const project = join(dirname(state), 'project')
+    const startLog = join(state, 'outside-herdr-start-bun.log')
+    const start = await runLauncher(state, { FAKE_BUN_LOG: startLog }, undefined, {
+      invokedAs: 'zerochan', cwd: project, args: ['start'],
+    })
+    expect(start.exitCode, start.output).toBe(0)
+    const startCalls = readFileSync(startLog, 'utf8')
+    expect(startCalls).toContain(
+      `herdr-start.ts ${dirname(import.meta.dir)} ${state} ${realpathSync(project)}`,
+    )
+    expect(startCalls).not.toContain('service-control.ts start')
   })
 
   test('legacy startはmanaged service/update lockとの競合検査を先に通す', async () => {

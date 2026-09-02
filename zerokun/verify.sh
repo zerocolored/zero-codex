@@ -274,7 +274,10 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
   candidate_contract_test zerokun/install-fifth-advisor.test.ts \
     'host共有helperを変更せずZero専用namespaceだけへ配置する'
 else
-  bun test
+  # Process-heavy fixtures intentionally exercise detached children and
+  # generation-safe cleanup. Keep each file's globals/handles isolated and
+  # make the test runner reap only its own descendants when it exits.
+  bun test --isolate --no-orphans
 fi
 bun run typecheck
 
@@ -294,6 +297,8 @@ for entry in \
   zerokun/access.ts \
   zerokun/service-control-state.ts \
   zerokun/service-control.ts \
+  zerokun/status.ts \
+  zerokun/herdr-start.ts \
   zerokun/update.ts \
   zerokun/update-restart.ts \
   zerokun/update-request.ts \
@@ -307,6 +312,7 @@ bash -n \
   codex-channel.sh \
   zerokun/setup.sh \
   zerokun/bootstrap-macos.sh \
+  zerokun/interactive-bootstrap.sh \
   zerokun/watchdog.sh \
   zerokun/state-dir.sh
 if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then

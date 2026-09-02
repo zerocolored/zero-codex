@@ -11,7 +11,11 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
-import { startManagedService, stopManagedService } from './service-control.ts'
+import {
+  inspectManagedServiceStatus,
+  startManagedService,
+  stopManagedService,
+} from './service-control.ts'
 import {
   acknowledgeServiceControlPauseIfRequested,
   clearIntentionalServiceStop,
@@ -204,6 +208,26 @@ describe('zerochan service control state', () => {
 })
 
 describe('zerochan stop/start', () => {
+  test('statusは停止・稼働・部分起動をprocess generationで区別する', async () => {
+    const { base, state } = fixture()
+    expect(inspectManagedServiceStatus(state)).toEqual({ status: 'stopped' })
+
+    const services = await spawnManagedServices(state, base)
+    expect(inspectManagedServiceStatus(state)).toEqual({
+      status: 'running',
+      gatewayPid: services.gateway.pid,
+      runnerPid: services.runner.pid,
+    })
+
+    services.runner.kill('SIGTERM')
+    expect(await services.runner.exited).toBe(0)
+    expect(inspectManagedServiceStatus(state)).toEqual({
+      status: 'partial',
+      gatewayPid: services.gateway.pid,
+      runnerPid: undefined,
+    })
+  })
+
   test('stopはidle ack後だけ停止しqueued jobと意図的停止状態を保持する', async () => {
     const { base, state } = fixture()
     createJobDatabase(state, [{ status: 'queued' }])

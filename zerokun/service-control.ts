@@ -70,6 +70,12 @@ export type ServiceControlResult = {
   tabCleanup?: 'none' | 'closed' | 'missing' | 'current-tab' | 'retained'
 }
 
+export type ManagedServiceStatus = {
+  status: 'running' | 'stopped' | 'partial'
+  gatewayPid?: number
+  runnerPid?: number
+}
+
 function fail(message: string): never {
   throw new Error(message)
 }
@@ -112,6 +118,24 @@ function serviceProcesses(stateDir: string): {
       'job runner',
       /job-runner\.ts\s+daemon(?:\s|$)/,
     ),
+  }
+}
+
+export function inspectManagedServiceStatus(stateDirInput: string): ManagedServiceStatus {
+  const stateDir = requireManagedStateRoot(stateDirInput)
+  const services = serviceProcesses(stateDir)
+  if (services.gateway.pid && services.runner.pid) {
+    return {
+      status: 'running',
+      gatewayPid: services.gateway.pid,
+      runnerPid: services.runner.pid,
+    }
+  }
+  if (!services.gateway.pid && !services.runner.pid) return { status: 'stopped' }
+  return {
+    status: 'partial',
+    gatewayPid: services.gateway.pid ?? undefined,
+    runnerPid: services.runner.pid ?? undefined,
   }
 }
 
