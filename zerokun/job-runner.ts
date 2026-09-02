@@ -201,6 +201,21 @@ export const SERIAL_WORKER_COUNT = 1 as const
 export const JOB_RUNNER_HANDSHAKE = 'zerokun-codex-runner-v1' as const
 export const DEFAULT_MAX_JOBS_PER_SESSION = 20 as const
 export const CODEX_SESSION_PROTOCOL_VERSION = 2 as const
+export const SLACK_QUEUE_WAIT_MESSAGE = '🙇 別件の作業中のため、しばらくお待ちください。' as const
+export const SLACK_RATE_LIMIT_WAIT_MESSAGE = '⏸ レートリミットのため待機中です。自動で再開します。' as const
+const RATE_LIMIT_WAIT_NOTIFICATION_PREFIX = 'rate-limit-waiting:' as const
+
+function rateLimitWaitNotificationKey(
+  jobId: string,
+  attempt: number,
+  threadId: string,
+  turnId: string,
+): string {
+  const digest = createHash('sha256')
+    .update(JSON.stringify([jobId, attempt, threadId, turnId]))
+    .digest('hex')
+  return `${RATE_LIMIT_WAIT_NOTIFICATION_PREFIX}${digest}`
+}
 export const DEFAULT_MAX_REPOSITORY_DRIFT_RETRIES = 3 as const
 const CLAIMABLE_CODEX_JOB_PREDICATE = `
   jobs.runtime = 'codex'
@@ -219,6 +234,10 @@ const CLAIMABLE_CODEX_JOB_PREDICATE = `
       AND approval_wait.ui_approval_request_id IS NOT NULL
       AND approval_wait.seq < jobs.seq
   )
+`
+const PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE = `
+  (jobs.runtime = 'codex' AND jobs.status = 'running')
+  OR (${CLAIMABLE_CODEX_JOB_PREDICATE})
 `
 const SLACK_DM_HISTORY_RETRY_BASE_MS = 24 * 60 * 60 * 1_000
 const SLACK_DM_HISTORY_RETRY_MAX_MS = 7 * 24 * 60 * 60 * 1_000
@@ -806,6 +825,7 @@ CREATE TABLE IF NOT EXISTS commentary_notifications (
   last_error TEXT,
   created_at INTEGER NOT NULL,
   delivered_at INTEGER,
+  suppressed_at INTEGER,
   FOREIGN KEY (job_id) REFERENCES jobs(id)
 );
 CREATE INDEX IF NOT EXISTS idx_commentary_notifications_pending
@@ -1408,7 +1428,9 @@ function threadHistoryEventsForSettledJob(db: Database, job: JobRow): ThreadHist
     delivered_at: number | null
   }, [string]>(
     `SELECT seq, payload, created_at, delivered_at
-     FROM commentary_notifications WHERE job_id = ? ORDER BY created_at, seq`,
+     FROM commentary_notifications
+     WHERE job_id = ? AND suppressed_at IS NULL
+     ORDER BY created_at, seq`,
   ).all(job.id)
   for (const commentary of commentaries) {
     ordered.push({
@@ -1541,7 +1563,9 @@ function priorAttemptThreadHistoryEvents(
     delivered_at: number | null
   }, [string, number, number]>(
     `SELECT seq, payload, created_at, delivered_at FROM commentary_notifications
-     WHERE job_id = ? AND attempt < ? AND created_at <= ? ORDER BY seq`,
+     WHERE job_id = ? AND attempt < ? AND created_at <= ?
+       AND suppressed_at IS NULL
+     ORDER BY seq`,
   ).all(job.id, nextAttempt, snapshotAt).map(row => ({
     at: row.created_at,
     tie: row.seq,
@@ -1996,6 +2020,65 @@ function ensureJobSchemaMigrations(db: Database): void {
     )
   })
   migrateInboundInterruptClassification.immediate()
+  const commentaryColumns = db.query<{ name: string }, []>(
+    'PRAGMA table_info(commentary_notifications)',
+  ).all()
+  if (!commentaryColumns.some(column => column.name === 'suppressed_at')) {
+    try {
+      db.exec('ALTER TABLE commentary_notifications ADD COLUMN suppressed_at INTEGER')
+    } catch (error) {
+      const migrated = db.query<{ name: string }, []>(
+        'PRAGMA table_info(commentary_notifications)',
+      ).all()
+      if (!migrated.some(column => column.name === 'suppressed_at')) throw error
+    }
+  }
+  const retireLegacyNondisclosureProgress = db.transaction(() => {
+    if (db.query<{ present: number }, []>(
+      "SELECT 1 AS present FROM migration_ledger WHERE name = 'progress-nondisclosure-tombstones-v1'",
+    ).get()) return
+    const migratedAt = Date.now()
+    // Old releases converted every progress update for a self-inspection job
+    // into this fixed sentence. Suppress any unsent copies at upgrade time so
+    // a restart cannot continue the already-observed Slack flood.
+    db.run(
+      `UPDATE commentary_notifications
+       SET suppressed_at = COALESCE(suppressed_at, ?)
+       WHERE delivered_at IS NULL AND suppressed_at IS NULL
+         AND TRIM(payload) IN (?, ?)`,
+      [
+        migratedAt,
+        SELF_IMPLEMENTATION_NON_DISCLOSURE,
+        `💬 ${SELF_IMPLEMENTATION_NON_DISCLOSURE}`,
+      ],
+    )
+    db.run(
+      `INSERT INTO migration_ledger (name, completed_at)
+       VALUES ('progress-nondisclosure-tombstones-v1', ?)`,
+      [migratedAt],
+    )
+  })
+  retireLegacyNondisclosureProgress.immediate()
+  const retireLegacyAcceptanceMessages = db.transaction(() => {
+    if (db.query<{ present: number }, []>(
+      "SELECT 1 AS present FROM migration_ledger WHERE name = 'queue-wait-notifications-v1'",
+    ).get()) return
+    const migratedAt = Date.now()
+    // Previous releases staged an acceptance body for every inbound job.
+    // Retire any unsent rows so a restart cannot publish obsolete UX.
+    db.run(
+      `UPDATE status_notifications
+       SET superseded_at = COALESCE(superseded_at, ?)
+       WHERE kind = 'accepted' AND delivered_at IS NULL AND superseded_at IS NULL`,
+      [migratedAt],
+    )
+    db.run(
+      `INSERT INTO migration_ledger (name, completed_at)
+       VALUES ('queue-wait-notifications-v1', ?)`,
+      [migratedAt],
+    )
+  })
+  retireLegacyAcceptanceMessages.immediate()
   const migrateAdvisorInputLedger = db.transaction(() => {
     if (db.query<{ present: number }, []>(
       "SELECT 1 AS present FROM migration_ledger WHERE name = 'advisor-input-ledger-v1'",
@@ -3180,6 +3263,60 @@ export class JobStore {
       || existing.payload !== input.payload) {
       throw new Error(`status notification identity collision: ${input.idempotencyKey}`)
     }
+  }
+
+  stageAppServerRateLimitWaitNotification(
+    jobIdInput: string,
+    attemptInput: number,
+    threadIdInput: string,
+    turnIdInput: string,
+    now = Date.now(),
+  ): 'staged' | 'duplicate' | 'closed' {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const attempt = Math.floor(attemptInput)
+    const threadId = requireText(threadIdInput, 'threadId')
+    const turnId = requireText(turnIdInput, 'turnId')
+    if (!Number.isSafeInteger(attempt) || attempt < 1
+      || !Number.isSafeInteger(now) || now <= 0) {
+      throw new Error('App Server rate-limit wait notification is invalid')
+    }
+    const idempotencyKey = rateLimitWaitNotificationKey(jobId, attempt, threadId, turnId)
+    const stage = this.db.transaction((): 'staged' | 'duplicate' | 'closed' => {
+      const job = this.db.query<{
+        status: JobStatus
+        attempts: number
+        chat_id: string
+        thread_ts: string
+        active_thread_id: string | null
+        active_turn_id: string | null
+        cancel_requested_at: number | null
+      }, [string]>(
+        `SELECT status, attempts, chat_id, thread_ts, active_thread_id, active_turn_id,
+                cancel_requested_at
+         FROM jobs WHERE id = ?`,
+      ).get(jobId)
+      if (!job || job.status !== 'running' || job.attempts !== attempt
+        || job.active_thread_id !== threadId || job.active_turn_id !== turnId
+        || job.cancel_requested_at !== null) return 'closed'
+      const existing = this.db.query<{
+        superseded_at: number | null
+      }, [string]>(
+        `SELECT superseded_at FROM status_notifications
+         WHERE idempotency_key = ?`,
+      ).get(idempotencyKey)
+      if (existing) return existing.superseded_at === null ? 'duplicate' : 'closed'
+      this.stageStatusNotificationRow({
+        idempotencyKey,
+        jobId,
+        chatId: job.chat_id,
+        threadTs: job.thread_ts,
+        kind: 'rate-limited',
+        payload: SLACK_RATE_LIMIT_WAIT_MESSAGE,
+        createdAt: now,
+      })
+      return 'staged'
+    })
+    return retrySqlite(() => stage.immediate())
   }
 
   private recordCodexSessionUse(sessionId: string, jobId: string, recordedAt: number): void {
@@ -6736,6 +6873,22 @@ export class JobStore {
       // inbound ledger is empty the next call releases the terminal binding.
       const holdTerminalBinding = !cancelled && pendingInbound > 0
       this.db.run(
+        `UPDATE status_notifications
+         SET superseded_at = COALESCE(superseded_at, ?)
+         WHERE job_id = ? AND idempotency_key = ?
+           AND delivered_at IS NULL AND superseded_at IS NULL`,
+        [
+          now,
+          options.jobId,
+          rateLimitWaitNotificationKey(
+            options.jobId,
+            job.attempts,
+            options.threadId,
+            options.turnId,
+          ),
+        ],
+      )
+      this.db.run(
         `UPDATE jobs SET accepts_control = ?,
            active_turn_id = CASE WHEN ? THEN active_turn_id ELSE NULL END,
            not_before = COALESCE(?, not_before),
@@ -7001,21 +7154,28 @@ export class JobStore {
          FROM jobs
          WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE} AND jobs.seq <= ?`,
       ).get(row.seq)?.position ?? 0
-      const hasRunning = this.db.query<{ present: number }, []>(
-        "SELECT 1 AS present FROM jobs WHERE runtime = 'codex' AND status = 'running' LIMIT 1",
-      ).get() !== null
+      // The inbound row that is currently being converted into this job is
+      // still marked processing until the caller completes delivery.  That
+      // makes the new job intentionally fail CLAIMABLE_CODEX_JOB_PREDICATE,
+      // so deriving this decision from `position > 1` misses the common case
+      // of exactly one queued predecessor.  Compare only earlier rows instead;
+      // the new job can then never exclude its blocker by excluding itself.
+      const blockedByPriorJob = this.db.query<{ present: number }, [number]>(
+        `SELECT 1 AS present FROM jobs
+         WHERE jobs.seq < ?
+           AND (${PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE})
+         LIMIT 1`,
+      ).get(row.seq) !== null
+      const waitsBehindPriorJob = result.changes === 1 && blockedByPriorJob
 
-      if (result.changes === 1 && input.notifyAccepted) {
-        const waitingPosition = Math.max(1, position)
+      if (result.changes === 1 && input.notifyAccepted && waitsBehindPriorJob) {
         this.stageStatusNotificationRow({
           idempotencyKey: `accepted:${idempotencyKey}`,
           jobId: row.id,
           chatId,
           threadTs,
           kind: 'accepted',
-          payload: hasRunning || waitingPosition > 1
-            ? `🙌 受け付けました（待ち順 ${waitingPosition}）。`
-            : '🙌 受け付けました。',
+          payload: SLACK_QUEUE_WAIT_MESSAGE,
           createdAt: Date.now(),
         })
       }
@@ -7248,6 +7408,16 @@ export class JobStore {
         [sessionId, resumed ? 1 : 0, claimingWorkerId, claimAt, row.id],
       )
       if (update.changes !== 1) return null
+      // Queue and host-side rate-limit notices are useful only while this job
+      // is waiting. If delivery lagged behind the claim, retire them before
+      // execution can resume.
+      this.db.run(
+        `UPDATE status_notifications
+         SET superseded_at = COALESCE(superseded_at, ?)
+         WHERE job_id = ? AND kind IN ('accepted', 'rate-limited')
+           AND delivered_at IS NULL AND superseded_at IS NULL`,
+        [claimAt, row.id],
+      )
       persistThreadHistorySnapshot(this.db, row, row.attempts + 1, claimAt)
       this.db.run(
         `INSERT INTO job_initial_dispatches (
@@ -9010,6 +9180,22 @@ export class JobStore {
         'SELECT status, attempts FROM jobs WHERE id = ?',
       ).get(jobId)
       if (!job || job.status !== 'running' || job.attempts !== attempt) return 'closed'
+      const previous = this.db.query<{ payload: string }, [string, number]>(
+        `SELECT payload FROM commentary_notifications
+         WHERE job_id = ? AND attempt = ? ORDER BY seq DESC LIMIT 1`,
+      ).get(jobId, attempt)
+      if (previous?.payload === payload) {
+        // Persist the new source identity even when its public body is
+        // suppressed. Otherwise an App Server replay after an intervening
+        // message could resurrect this old commentary out of order.
+        this.db.run(
+          `INSERT INTO commentary_notifications (
+             id, source_key, job_id, attempt, payload, created_at, suppressed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [randomUUID(), sourceKey, jobId, attempt, payload, now, now],
+        )
+        return 'duplicate'
+      }
       this.db.run(
         `INSERT INTO commentary_notifications (
            id, source_key, job_id, attempt, payload, created_at
@@ -9037,12 +9223,12 @@ export class JobStore {
       `SELECT c.seq, c.id, c.source_key, c.job_id, c.attempt, c.payload, c.attempts
        FROM commentary_notifications AS c
        JOIN jobs AS j ON j.id = c.job_id
-       WHERE c.delivered_at IS NULL
+       WHERE c.delivered_at IS NULL AND c.suppressed_at IS NULL
          AND (c.not_before IS NULL OR c.not_before <= ?)
          AND NOT EXISTS (
            SELECT 1 FROM commentary_notifications AS prior
            WHERE prior.job_id = c.job_id AND prior.seq < c.seq
-             AND prior.delivered_at IS NULL
+             AND prior.delivered_at IS NULL AND prior.suppressed_at IS NULL
          )
          AND NOT EXISTS (
            SELECT 1 FROM lifecycle_notifications AS started
@@ -9090,11 +9276,11 @@ export class JobStore {
       `SELECT 1 AS present
        FROM commentary_notifications AS c
        JOIN jobs AS j ON j.id = c.job_id
-       WHERE c.id = ? AND c.delivered_at IS NULL
+       WHERE c.id = ? AND c.delivered_at IS NULL AND c.suppressed_at IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM commentary_notifications AS prior
            WHERE prior.job_id = c.job_id AND prior.seq < c.seq
-             AND prior.delivered_at IS NULL
+             AND prior.delivered_at IS NULL AND prior.suppressed_at IS NULL
          )
          AND NOT EXISTS (
            SELECT 1 FROM lifecycle_notifications AS started
@@ -9127,7 +9313,7 @@ export class JobStore {
     this.db.run(
       `UPDATE commentary_notifications
        SET delivered_at = ?, not_before = NULL, last_error = NULL
-       WHERE id = ? AND delivered_at IS NULL`,
+       WHERE id = ? AND delivered_at IS NULL AND suppressed_at IS NULL`,
       [Date.now(), requireText(idInput, 'notificationId')],
     )
   }
@@ -9141,7 +9327,7 @@ export class JobStore {
     this.db.run(
       `UPDATE commentary_notifications
        SET attempts = attempts + 1, not_before = ?, last_error = ?
-       WHERE id = ? AND delivered_at IS NULL`,
+       WHERE id = ? AND delivered_at IS NULL AND suppressed_at IS NULL`,
       [
         now + Math.max(1, retryMs),
         requireText(errorInput, 'notificationError').slice(0, 4_000),
@@ -9152,7 +9338,8 @@ export class JobStore {
 
   commentaryNotificationCount(): number {
     return this.db.query<{ count: number }, []>(
-      'SELECT COUNT(*) AS count FROM commentary_notifications WHERE delivered_at IS NULL',
+      `SELECT COUNT(*) AS count FROM commentary_notifications
+       WHERE delivered_at IS NULL AND suppressed_at IS NULL`,
     ).get()?.count ?? 0
   }
 
@@ -9422,10 +9609,65 @@ export class JobStore {
   }
 
   statusNotificationDeliverable(idInput: string): boolean {
-    return retrySqlite(() => this.db.query<{ present: number }, [string]>(
-      `SELECT 1 AS present FROM status_notifications
-       WHERE id = ? AND delivered_at IS NULL AND superseded_at IS NULL`,
-    ).get(requireText(idInput, 'notificationId')) !== null)
+    const id = requireText(idInput, 'notificationId')
+    const check = this.db.transaction(() => {
+      const row = this.db.query<{
+        idempotency_key: string
+        kind: StatusNotificationKind
+        job_id: string | null
+        job_status: JobStatus | null
+        job_attempts: number | null
+        job_seq: number | null
+        active_thread_id: string | null
+        active_turn_id: string | null
+        cancel_requested_at: number | null
+      }, [string]>(
+        `SELECT status.idempotency_key, status.kind, status.job_id,
+                jobs.status AS job_status, jobs.attempts AS job_attempts,
+                jobs.seq AS job_seq, jobs.active_thread_id, jobs.active_turn_id,
+                jobs.cancel_requested_at
+         FROM status_notifications AS status
+         LEFT JOIN jobs ON jobs.id = status.job_id
+         WHERE status.id = ?
+           AND status.delivered_at IS NULL AND status.superseded_at IS NULL`,
+      ).get(id)
+      if (!row) return false
+      let deliverable = true
+      if (row.kind === 'accepted') {
+        deliverable = row.job_id !== null
+          && row.job_status === 'queued'
+          && row.job_seq !== null
+          && this.db.query<{ present: number }, [number]>(
+            `SELECT 1 AS present FROM jobs
+             WHERE jobs.seq < ?
+               AND (${PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE})
+             LIMIT 1`,
+          ).get(row.job_seq) !== null
+      } else if (row.kind === 'rate-limited'
+        && row.idempotency_key.startsWith(RATE_LIMIT_WAIT_NOTIFICATION_PREFIX)) {
+        deliverable = row.job_id !== null
+          && row.job_status === 'running'
+          && row.cancel_requested_at === null
+          && row.job_attempts !== null
+          && row.active_thread_id !== null
+          && row.active_turn_id !== null
+          && row.idempotency_key === rateLimitWaitNotificationKey(
+            row.job_id,
+            row.job_attempts,
+            row.active_thread_id,
+            row.active_turn_id,
+          )
+      }
+      if (deliverable) return true
+      this.db.run(
+        `UPDATE status_notifications
+         SET superseded_at = COALESCE(superseded_at, ?)
+         WHERE id = ? AND delivered_at IS NULL AND superseded_at IS NULL`,
+        [Date.now(), id],
+      )
+      return false
+    })
+    return retrySqlite(() => check.immediate())
   }
 
   markStatusNotificationDelivered(idInput: string): void {
@@ -9490,6 +9732,7 @@ export class JobStore {
            SELECT 1 FROM commentary_notifications AS commentary
            WHERE commentary.job_id = terminal.job_id
              AND commentary.delivered_at IS NULL
+             AND commentary.suppressed_at IS NULL
          )
        ORDER BY terminal.created_at ASC LIMIT ?`,
     ).all(now, limit)
@@ -9751,6 +9994,7 @@ export class JobStore {
            AND NOT EXISTS (
              SELECT 1 FROM commentary_notifications AS n
              WHERE n.job_id = j.id AND n.delivered_at IS NULL
+               AND n.suppressed_at IS NULL
            )
            AND NOT EXISTS (
              SELECT 1 FROM status_notifications AS n
@@ -10123,6 +10367,7 @@ export class JobStore {
            SELECT 1 FROM commentary_notifications AS commentary
            WHERE commentary.job_id = ui_approval_requests.job_id
              AND commentary.delivered_at IS NULL
+             AND commentary.suppressed_at IS NULL
          )
        ORDER BY created_at ASC LIMIT ?`,
     ).all(now, limit)
@@ -10903,6 +11148,7 @@ export interface JobExecutionContext {
   supersedeProgressProbe(slot: number, supersededBySlot: number | null): void
   reportProgress(report: { slot: number; elapsedMs: number; text: string }): boolean
   reportCommentary(event: { sourceKey: string; text: string }): boolean
+  reportRateLimitWait(binding: { threadId: string; turnId: string }): boolean
 }
 
 export type JobExecutor = (
@@ -10922,6 +11168,8 @@ export interface JobNotifier {
   status?(notification: StatusNotification, signal?: AbortSignal): Promise<void>
   /** Wait until already-started lifecycle posts have either completed or reached their deadline. */
   settleLifecycleSideEffects?(): Promise<void>
+  /** Wait only for status posts already started for this job (or all jobs when omitted). */
+  settleStatusSideEffects?(jobId?: string): Promise<void>
   /** Wait until already-started, non-cancellable side effects have durable receipts. */
   settleStartedSideEffects?(): Promise<void>
 }
@@ -11713,6 +11961,16 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         )
       }
 
+      const claimableHeadId = options.store.claimableHeadId()
+      if (claimableHeadId) {
+        // If this exact job's queue/rate-limit notice already crossed the
+        // Slack request boundary, finish that bounded delivery before the
+        // synchronous claim retires the notice. Unrelated notification lanes
+        // remain non-blocking.
+        scheduleNotificationFlush()
+        await options.notifier?.settleStatusSideEffects?.(claimableHeadId)
+      }
+
     const job = options.store.claimNext(workerId, maxJobsPerSession)
     if (!job) {
       if (stopWhenIdle && options.store.countClaimable() === 0) return stats
@@ -11750,6 +12008,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       if (lifecycleFlush) await lifecycleFlush
       lifecycleSchedulingOpen = false
       await options.notifier?.settleLifecycleSideEffects?.()
+      await options.notifier?.settleStatusSideEffects?.(job.id)
       await options.notifier?.settleStartedSideEffects?.()
     }
     const quiesceMonitorBeforeTerminal = async (): Promise<void> => {
@@ -11871,11 +12130,38 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           },
           reportCommentary: event => {
             if (!progressReportsOpen) return false
+            const current = options.store.get(job.id) ?? job
+            const publicText = sanitizeExecutionTextForSlack(
+              current,
+              current.sessionId ?? '',
+              event.text,
+              dirname(options.store.dbPath),
+              [],
+              'progress',
+            )
+            const publicBody = publicText.startsWith('💬 ')
+              ? publicText.slice('💬 '.length).trim()
+              : publicText.trim()
+            if (!publicBody) return true
+            const publicCommentary = publicText.startsWith('💬 ')
+              ? publicText
+              : `💬 ${publicText}`
             const disposition = options.store.stageCommentaryNotification(
               job.id,
               job.attempts,
               event.sourceKey,
-              event.text,
+              publicCommentary,
+            )
+            if (disposition === 'staged') scheduleNotificationFlush()
+            return disposition === 'staged' || disposition === 'duplicate'
+          },
+          reportRateLimitWait: binding => {
+            if (!progressReportsOpen) return false
+            const disposition = options.store.stageAppServerRateLimitWaitNotification(
+              job.id,
+              job.attempts,
+              binding.threadId,
+              binding.turnId,
             )
             if (disposition === 'staged') scheduleNotificationFlush()
             return disposition === 'staged' || disposition === 'duplicate'
@@ -12216,6 +12502,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
     // Arbitrary notifier failures must not block the FIFO forever, but the
     // production Slack uploader must finish any side effect it already began
     // and persist its receipt before the DB can be closed by the caller.
+    await options.notifier?.settleStatusSideEffects?.()
     await options.notifier?.settleStartedSideEffects?.()
   }
 }
@@ -12692,6 +12979,7 @@ export function sanitizeExecutionTextForSlack(
   text: string,
   dir: string,
   additionalSensitiveValues: readonly string[] = [],
+  purpose: 'result' | 'progress' = 'result',
 ): string {
   const normalizeGuardText = normalizePublicGuardText
   const slackAuthoredTask = (task: string, attachments: readonly string[]): string => {
@@ -13391,7 +13679,7 @@ export function sanitizeExecutionTextForSlack(
       if (containsConfusableInternalImplementationName(clause, userText)) return ''
       if (implementationExecutionDisclosure(clause)) return ''
       if (publicProductClause(clause)) return protectProductNames(clause)
-      if (selfImplementationQuestion) return ''
+      if (selfImplementationQuestion && purpose === 'result') return ''
       if (externalTechnicalTask && !explicitResponseSelfIdentity.test(clause)
         && !selfExecutionContext.test(clause)) {
         if (!implementationName.test(clause)) return clause
@@ -13405,7 +13693,7 @@ export function sanitizeExecutionTextForSlack(
       return clause
     }).join('')
   }).join('')
-  if (selfImplementationQuestion) {
+  if (selfImplementationQuestion && purpose === 'result') {
     const nonDisclosure = SELF_IMPLEMENTATION_NON_DISCLOSURE
     const publicText = sanitized.split(/\r?\n/)
       .filter(line => line.trim() !== nonDisclosure)
@@ -13483,6 +13771,11 @@ export function sanitizeExecutionTextForSlack(
       `\uE004${gitCommitPlaceholderNonce}_${index}\uE005`, commit,
     )
   })
+  if (purpose === 'progress') {
+    sanitized = sanitized.split(/\r?\n/)
+      .filter(line => line.trim().replace(/^💬\s*/, '') !== SELF_IMPLEMENTATION_NON_DISCLOSURE)
+      .join('\n')
+  }
   return naturalizeSlackRedactions(sanitized).trim()
 }
 
@@ -14024,6 +14317,7 @@ export function slackFileIsSharedInThread(
 export class SlackNotifier implements JobNotifier {
   private readonly client: WebClient
   private readonly lifecycleSideEffects = new Set<Promise<unknown>>()
+  private readonly statusSideEffects = new Map<string, Set<Promise<unknown>>>()
   private readonly startedSideEffects = new Set<Promise<unknown>>()
   private readonly uploadDependencies: SlackUploadDependencies
 
@@ -14153,6 +14447,37 @@ export class SlackNotifier implements JobNotifier {
     }
   }
 
+  private trackStatusSideEffect<T>(
+    jobId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const pending = operation()
+    const tracked = this.statusSideEffects.get(jobId) ?? new Set<Promise<unknown>>()
+    tracked.add(pending)
+    this.statusSideEffects.set(jobId, tracked)
+    void pending.then(
+      () => {
+        tracked.delete(pending)
+        if (tracked.size === 0) this.statusSideEffects.delete(jobId)
+      },
+      () => {
+        tracked.delete(pending)
+        if (tracked.size === 0) this.statusSideEffects.delete(jobId)
+      },
+    )
+    return pending
+  }
+
+  async settleStatusSideEffects(jobId?: string): Promise<void> {
+    while (true) {
+      const pending = jobId === undefined
+        ? [...this.statusSideEffects.values()].flatMap(sideEffects => [...sideEffects])
+        : [...(this.statusSideEffects.get(jobId) ?? [])]
+      if (pending.length === 0) return
+      await Promise.allSettled(pending)
+    }
+  }
+
   private async post(
     job: JobRecord,
     text: string,
@@ -14174,18 +14499,12 @@ export class SlackNotifier implements JobNotifier {
   }
 
   async started(
-    job: JobRecord,
-    notificationId?: string,
-    signal?: AbortSignal,
+    _job: JobRecord,
+    _notificationId?: string,
+    _signal?: AbortSignal,
   ): Promise<void> {
-    await this.trackLifecycleSideEffect(
-      () => this.post(
-        job,
-        '確認します 👀',
-        notificationId,
-        signal,
-      ),
-    )
+    // The eyes reaction on the inbound message is the visible acknowledgement.
+    // Keep the durable row as an internal lifecycle barrier only.
   }
 
   async progress(
@@ -14199,14 +14518,17 @@ export class SlackNotifier implements JobNotifier {
       job.sessionId ?? '',
       text,
       dirname(this.store.dbPath),
+      [],
+      'progress',
     )
     const slackText = safeText.startsWith('💬 ')
       ? safeText.slice('💬 '.length)
       : safeText
+    if (!slackText) return
     await this.trackLifecycleSideEffect(
       () => this.post(
         job,
-        slackText || '少し時間がかかっていますが、まだ作業を続けています 🔍',
+        slackText,
         notificationId,
         signal,
       ),
@@ -14235,14 +14557,21 @@ export class SlackNotifier implements JobNotifier {
         ],
       ) || '確認した内容を元の作業へ反映して続けます。'
     }
-    const chunks = splitSlackChunks(payload)
-    for (let index = 0; index < chunks.length; index += 1) {
-      await withSlackDeadline(childSignal => this.uploadDependencies.postMessage({
-        chatId: notification.chatId,
-        threadTs: notification.threadTs,
-        text: chunks[index]!,
-        clientMessageId: slackClientMessageId(notification.id, index),
-      }, childSignal), undefined, 'Slack status chat.postMessage', signal)
+    const deliver = async (): Promise<void> => {
+      const chunks = splitSlackChunks(payload)
+      for (let index = 0; index < chunks.length; index += 1) {
+        await withSlackDeadline(childSignal => this.uploadDependencies.postMessage({
+          chatId: notification.chatId,
+          threadTs: notification.threadTs,
+          text: chunks[index]!,
+          clientMessageId: slackClientMessageId(notification.id, index),
+        }, childSignal), undefined, 'Slack status chat.postMessage', signal)
+      }
+    }
+    if (notification.jobId) {
+      await this.trackStatusSideEffect(notification.jobId, deliver)
+    } else {
+      await deliver()
     }
   }
 
@@ -16251,6 +16580,7 @@ async function runCli(): Promise<void> {
                 throw new Error('Codex commentary could not be staged for Slack delivery')
               }
             },
+            onRateLimitWait: binding => executionContext.reportRateLimitWait(binding),
             finalizeSuccessfulResult: rawExecution => {
               try {
                 return finalizeSuccessfulExecution(

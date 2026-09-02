@@ -515,9 +515,11 @@ for line in sys.stdin:
             emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
             terminal_failure = {"message": "turn failed", "codexErrorInfo": None, "additionalDetails": None} if mode in ("capacity-error-generic-terminal", "capacity-started-command") else failure
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": items, "error": terminal_failure}}})
-        elif mode == "rate-retrying":
+        elif mode in ("rate-retrying", "rate-retrying-two-turn"):
             emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
-            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "内部retry後に完了"}], "error": None}}})
+            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
+            answer = "内部retry後に完了" if mode == "rate-retrying" else "内部retry後に完了-" + str(turn_count)
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": answer}], "error": None}}})
         elif mode == "error-steer":
             emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "temporary fixture error", "codexErrorInfo": None, "additionalDetails": None}}})
         elif mode == "summary-stream-no-history":
@@ -722,7 +724,8 @@ function fixture(
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
     | 'failed-steer' | 'failed-turn'
-    | 'error-steer' | 'rate-error' | 'rate-retrying' | 'capacity-error'
+    | 'error-steer' | 'rate-error' | 'rate-retrying' | 'rate-retrying-two-turn'
+    | 'capacity-error'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
     | 'capacity-started-command' | 'phased' | 'phased-publication'
     | 'phased-publication-targeted' | 'phased-promotion'
@@ -4611,6 +4614,7 @@ describe('production App Server executor', () => {
   test('willRetry中のrate-limit通知はhost requeueせず同じturnのterminalを待つ', async () => {
     const value = fixture('rate-retrying')
     let hostRequeues = 0
+    const waitBindings: Array<{ threadId: string; turnId: string }> = []
     const recordRateLimit = value.hooks.recordRateLimit
     value.hooks.recordRateLimit = options => {
       hostRequeues += 1
@@ -4622,15 +4626,73 @@ describe('production App Server executor', () => {
       stateDir: value.state,
       skipEffectiveConfigCheck: true,
       extraEnvironment: { ZERO_FIXTURE_MODE: 'rate-retrying' },
+      onRateLimitWait: binding => {
+        waitBindings.push(binding)
+        return true
+      },
       liveControls: value.hooks,
     })
     expect(result).toEqual({
       sessionId: 'thread-app-server-1', result: '内部retry後に完了',
     })
     expect(hostRequeues).toBe(0)
+    expect(waitBindings).toEqual([{
+      threadId: 'thread-app-server-1',
+      turnId: 'turn-app-server-1',
+    }])
     expect(value.store.get(value.job.id)).toMatchObject({
       status: 'running', notBefore: null, acceptsControl: false,
     })
+    value.store.close()
+  })
+
+  test('同じprocessで追加入力の次turnへ進んでもrate-limit待機をturnごとに一度だけ通知する', async () => {
+    const value = fixture('rate-retrying-two-turn')
+    const waitBindings: Array<{ threadId: string; turnId: string }> = []
+    const finishTurn = value.hooks.finishTurn
+    let stagedFollowUp = false
+    value.hooks.finishTurn = options => {
+      if (!stagedFollowUp) {
+        stagedFollowUp = true
+        const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
+        expect(target).not.toBeNull()
+        expect(value.store.stageLiveControl(target!, {
+          chatId: value.job.chatId,
+          threadTs: value.job.threadTs,
+          messageId: 'rate-limit-follow-up',
+          userId: 'UOTHER',
+          task: '追加条件も確認して',
+          kind: 'steer',
+        })).toBe('staged')
+      }
+      return finishTurn(options)
+    }
+
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'rate-retrying-two-turn' },
+      onRateLimitWait: binding => {
+        waitBindings.push(binding)
+        return true
+      },
+      liveControls: value.hooks,
+    })
+
+    expect(result).toEqual({
+      sessionId: 'thread-app-server-1', result: '内部retry後に完了-2',
+    })
+    expect(waitBindings).toEqual([
+      { threadId: 'thread-app-server-1', turnId: 'turn-app-server-1' },
+      { threadId: 'thread-app-server-1', turnId: 'turn-app-server-2' },
+    ])
+    expect(value.store.listJobControls(value.job.id)).toEqual([
+      expect.objectContaining({
+        messageId: 'rate-limit-follow-up', kind: 'steer', status: 'observed',
+      }),
+    ])
     value.store.close()
   })
 

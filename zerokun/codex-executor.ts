@@ -5074,6 +5074,8 @@ export async function executeCodexJob(
     onProgressProbeSuperseded?(slot: number, supersededBySlot: number | null): void
     /** User-safe status captured from the same active App Server turn. */
     onProgressReport?(report: CodexProgressReport): boolean
+    /** Durable notice for a structured App Server rate-limit retry on this exact turn. */
+    onRateLimitWait?(binding: { threadId: string; turnId: string }): boolean
     /** Executor activation boundary persisted by the queue owner. */
     progressActivatedAtMs?: number
     /** Deterministic fixture override; production uses 10m/30m/60m/hourly. */
@@ -6695,6 +6697,7 @@ export async function executeCodexJob(
           })
         }
 
+        let rateLimitWaitReportedForTurnId: string | null = null
         while (true) {
           flushMonitorMessages()
           if (abortedBeforeProcessExit) throw new CodexInterruptedError('Codex job was interrupted')
@@ -6721,6 +6724,20 @@ export async function executeCodexJob(
                 turnId: currentTurnId,
                 resumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs),
               })
+            }
+            if (appServerError.willRetry && rateLimit.rateLimited
+              && rateLimitWaitReportedForTurnId !== currentTurnId) {
+              try {
+                const staged = options.onRateLimitWait?.({
+                  threadId: currentThreadId,
+                  turnId: currentTurnId,
+                }) === true
+                if (staged) rateLimitWaitReportedForTurnId = currentTurnId
+              } catch (error) {
+                process.stderr.write(
+                  `zerochan: rate-limit wait notification could not be staged: ${error instanceof Error ? error.message : String(error)}\n`,
+                )
+              }
             }
             // Official `error` is a turn-scoped progress notification; the
             // authoritative terminal remains `turn/completed`. Treating it as

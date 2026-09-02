@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import {
   JobStore,
+  SLACK_QUEUE_WAIT_MESSAGE,
+  SLACK_RATE_LIMIT_WAIT_MESSAGE,
   SlackNotifier,
   flushCommentaryNotifications,
   flushInterjectionNotifications,
@@ -224,6 +227,208 @@ function stageRecoverableInterjection(
 }
 
 describe('durable lifecycle notifications', () => {
+  test('通常受付は本文を送らず、先行jobがある場合だけ待機通知を一度stageする', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerochan-queue-wait-'))
+    roots.push(root)
+    const repo = join(root, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(root, 'state', 'jobs.sqlite3'))
+    const first = store.enqueue({
+      chatId: 'D1', threadTs: 'queue-first', messageId: 'queue-first', userId: 'U1',
+      repoPath: repo, task: 'first', writeEnabled: false, notifyAccepted: true,
+    })
+    expect(first.queuePosition).toBe(1)
+    expect(store.pendingStatusNotifications()).toEqual([])
+
+    const secondInput = {
+      chatId: 'D2', threadTs: 'queue-second', messageId: 'queue-second', userId: 'U2',
+      repoPath: repo, task: 'second', writeEnabled: false, notifyAccepted: true,
+    }
+    const second = store.enqueue(secondInput)
+    expect(second.queuePosition).toBe(2)
+    expect(store.pendingStatusNotifications()).toHaveLength(1)
+    expect(store.pendingStatusNotifications()[0]).toMatchObject({
+      jobId: second.job.id,
+      kind: 'accepted',
+      payload: SLACK_QUEUE_WAIT_MESSAGE,
+    })
+    expect(store.enqueue(secondInput).duplicate).toBe(true)
+    expect(store.pendingStatusNotifications()).toHaveLength(1)
+    store.close()
+  })
+
+  test('job別status送信は完了まで追跡し、無関係なjobの待機を巻き込まない', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerochan-status-side-effect-'))
+    roots.push(root)
+    const repo = join(root, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(root, 'state', 'jobs.sqlite3'))
+    const first = store.enqueue({
+      chatId: 'D1', threadTs: 'status-first', messageId: 'status-first', userId: 'U1',
+      repoPath: repo, task: 'first', writeEnabled: false,
+    }).job
+    const second = store.enqueue({
+      chatId: 'D2', threadTs: 'status-second', messageId: 'status-second', userId: 'U2',
+      repoPath: repo, task: 'second', writeEnabled: false, notifyAccepted: true,
+    }).job
+    const notification = store.pendingStatusNotifications()[0]!
+    let announceStarted!: () => void
+    const started = new Promise<void>(resolve => { announceStarted = resolve })
+    let releasePost!: () => void
+    const released = new Promise<void>(resolve => { releasePost = resolve })
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async () => {
+        announceStarted()
+        await released
+      },
+    })
+    const posting = notifier.status(notification)
+    await started
+    await notifier.settleStatusSideEffects(first.id)
+    let secondSettled = false
+    const settlingSecond = notifier.settleStatusSideEffects(second.id)
+      .then(() => { secondSettled = true })
+    await Bun.sleep(10)
+    expect(secondSettled).toBe(false)
+    releasePost()
+    await Promise.all([posting, settlingSecond])
+    expect(secondSettled).toBe(true)
+    store.close()
+  })
+
+  test('送信中の待機通知を追い越して対象jobをclaimしない', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerochan-queue-wait-order-'))
+    roots.push(root)
+    const repo = join(root, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(root, 'state', 'jobs.sqlite3'))
+    const first = store.enqueue({
+      chatId: 'D1', threadTs: 'order-first', messageId: 'order-first', userId: 'U1',
+      repoPath: repo, task: 'first', writeEnabled: false,
+    }).job
+    const second = store.enqueue({
+      chatId: 'D2', threadTs: 'order-second', messageId: 'order-second', userId: 'U2',
+      repoPath: repo, task: 'second', writeEnabled: false, notifyAccepted: true,
+    }).job
+    let announceWaitPost!: () => void
+    const waitPostStarted = new Promise<void>(resolve => { announceWaitPost = resolve })
+    let releaseWaitPost!: () => void
+    const waitPostReleased = new Promise<void>(resolve => { releaseWaitPost = resolve })
+    const order: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async input => {
+        if (input.text === SLACK_QUEUE_WAIT_MESSAGE) {
+          order.push('queue-wait-started')
+          announceWaitPost()
+          await waitPostReleased
+          order.push('queue-wait-finished')
+        }
+      },
+      addReaction: async () => {},
+    })
+    const running = runQueuedJobs({
+      store,
+      maxJobsPerSession: 20,
+      stopWhenIdle: true,
+      pollMs: 1,
+      notificationRetryMs: 5,
+      notifier,
+      executor: async job => {
+        order.push(`executed:${job.id}`)
+        return { sessionId: `session-${job.id}`, result: 'done' }
+      },
+    })
+    await waitPostStarted
+    for (let attempt = 0; attempt < 100 && !order.includes(`executed:${first.id}`); attempt += 1) {
+      await Bun.sleep(2)
+    }
+    expect(order).toContain(`executed:${first.id}`)
+    await Bun.sleep(20)
+    expect(order).not.toContain(`executed:${second.id}`)
+    releaseWaitPost()
+    await running
+    expect(order.indexOf('queue-wait-finished'))
+      .toBeLessThan(order.indexOf(`executed:${second.id}`))
+    store.close()
+  })
+
+  test('旧releaseの未配信受付本文を起動migrationで無効化する', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerochan-legacy-acceptance-'))
+    roots.push(root)
+    const repo = join(root, 'repo')
+    mkdirSync(repo)
+    const dbPath = join(root, 'state', 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const job = store.enqueue({
+      chatId: 'D1', threadTs: 'legacy', messageId: 'legacy', userId: 'U1',
+      repoPath: repo, task: 'legacy', writeEnabled: false,
+    }).job
+    store.close()
+
+    const db = new Database(dbPath)
+    db.run("DELETE FROM migration_ledger WHERE name = 'queue-wait-notifications-v1'")
+    db.run(
+      `INSERT INTO status_notifications (
+         id, idempotency_key, job_id, chat_id, thread_ts, kind, payload, created_at
+       ) VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?)`,
+      ['legacy-acceptance', 'accepted:legacy', job.id, 'D1', 'legacy',
+        '🙌 受け付けました（待ち順 1）。', 1_000],
+    )
+    db.close()
+
+    store = new JobStore(dbPath)
+    expect(store.migrationApplied('queue-wait-notifications-v1')).toBe(true)
+    expect(store.pendingStatusNotifications()).toEqual([])
+    store.close()
+  })
+
+  test('旧releaseの未配信固定非公開progressを起動migrationで無効化する', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerochan-legacy-progress-'))
+    roots.push(root)
+    const repo = join(root, 'repo')
+    mkdirSync(repo)
+    const dbPath = join(root, 'state', 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const job = store.enqueue({
+      chatId: 'D1', threadTs: 'legacy-progress', messageId: 'legacy-progress', userId: 'U1',
+      repoPath: repo, task: 'legacy progress', writeEnabled: false,
+    }).job
+    const running = store.claimNext('legacy-progress-worker')!
+    expect(running.id).toBe(job.id)
+    expect(store.stageCommentaryNotification(
+      running.id,
+      running.attempts,
+      '9'.repeat(64),
+      '💬 内部構成は公開していません。',
+      1_000,
+    )).toBe('staged')
+    store.close()
+
+    const db = new Database(dbPath)
+    db.run(
+      "DELETE FROM migration_ledger WHERE name = 'progress-nondisclosure-tombstones-v1'",
+    )
+    db.close()
+
+    store = new JobStore(dbPath)
+    expect(store.migrationApplied('progress-nondisclosure-tombstones-v1')).toBe(true)
+    expect(store.pendingCommentaryNotifications()).toEqual([])
+    expect(store.commentaryNotificationCount()).toBe(0)
+    store.fail(job.id, 'fixture complete')
+    store.close()
+  })
+
+  test('開始lifecycleは内部で完了するがSlack本文を投稿しない', async () => {
+    const { store, job } = runningJob()
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async input => { posted.push(input.text) },
+    })
+    await notifier.started(job, 'started-no-body')
+    expect(posted).toEqual([])
+    store.close()
+  })
+
   test('interjection回答は同じIDで再送しSlack配送後だけtask-updateへ昇格する', async () => {
     const { store, job } = runningJob()
     const interjection = stageAnsweredInterjection(store, job, 'task-update')
@@ -429,8 +634,16 @@ describe('durable lifecycle notifications', () => {
       job.id, job.attempts, 'a'.repeat(64), '💬 原因を確認しています 🔎', 1_100,
     )).toBe('staged')
     expect(store.stageCommentaryNotification(
+      job.id, job.attempts, 'e'.repeat(64), '💬 原因を確認しています 🔎', 1_150,
+    )).toBe('duplicate')
+    expect(store.stageCommentaryNotification(
       job.id, job.attempts, 'b'.repeat(64), '💬 修正内容を検証しています 🧪', 1_200,
     )).toBe('staged')
+    // The suppressed source identity must remain durable. Replaying it after
+    // an intervening message must not resurrect the older public body.
+    expect(store.stageCommentaryNotification(
+      job.id, job.attempts, 'e'.repeat(64), '💬 原因を確認しています 🔎', 1_250,
+    )).toBe('duplicate')
     expect(store.stageCommentaryNotification(
       job.id, job.attempts, 'a'.repeat(64), '💬 原因を確認しています 🔎', 1_300,
     )).toBe('duplicate')
@@ -571,6 +784,52 @@ describe('durable lifecycle notifications', () => {
     ])
     expect(store.commentaryNotificationCount()).toBe(0)
     expect(store.terminalNotificationCount()).toBe(0)
+    store.close()
+  })
+
+  test('runnerは自己構成依頼の固定非公開文を捨て、有意なcommentaryだけを一度送る', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerochan-commentary-sanitize-'))
+    roots.push(root)
+    const repo = join(root, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(root, 'state', 'jobs.sqlite3'))
+    store.enqueue({
+      chatId: 'D1', threadTs: '1.6', messageId: '1.6', userId: 'U1',
+      repoPath: repo,
+      task: '当システムの内部構成による遅延原因を調べてください。',
+      writeEnabled: false,
+    })
+    const events: string[] = []
+    const stats = await runQueuedJobs({
+      store,
+      stopWhenIdle: true,
+      pollMs: 5,
+      notificationRetryMs: 5,
+      notifier: {
+        started: async () => { events.push('started') },
+        progress: async (_job, text) => { events.push(text) },
+        completed: async () => { events.push('completed') },
+      },
+      executor: async (_job, _signal, context) => {
+        expect(context?.reportCommentary({
+          sourceKey: '1'.repeat(64), text: '💬 内部構成は公開していません。',
+        })).toBe(true)
+        expect(context?.reportCommentary({
+          sourceKey: '2'.repeat(64), text: '💬 遅延条件を再現して計測しています 🔎',
+        })).toBe(true)
+        expect(context?.reportCommentary({
+          sourceKey: '3'.repeat(64), text: '💬 遅延条件を再現して計測しています 🔎',
+        })).toBe(true)
+        return { sessionId: 'commentary-sanitize-session', result: '調査しました' }
+      },
+    })
+    expect(stats.completed).toBe(1)
+    expect(events).toEqual([
+      'started',
+      '💬 遅延条件を再現して計測しています 🔎',
+      'completed',
+    ])
+    expect(store.commentaryNotificationCount()).toBe(0)
     store.close()
   })
 
@@ -772,6 +1031,11 @@ describe('durable lifecycle notifications', () => {
     mkdirSync(repo)
     const dbPath = join(root, 'state', 'jobs.sqlite3')
     let store = new JobStore(dbPath)
+    store.enqueue({
+      chatId: 'D0', threadTs: '5.0', messageId: '5.0', userId: 'U0',
+      repoPath: repo, task: 'blocker', writeEnabled: false,
+    })
+    const blocker = store.claimNext('blocker-worker')!
     const queued = store.enqueue({
       chatId: 'D1', threadTs: '6.0', messageId: '6.0', userId: 'U1',
       repoPath: repo, task: 'status fixture', writeEnabled: false, notifyAccepted: true,
@@ -796,10 +1060,88 @@ describe('durable lifecycle notifications', () => {
     expect(clientMessageIds).toHaveLength(2)
     expect(clientMessageIds[0]).toBeTruthy()
     expect(clientMessageIds[1]).toBe(clientMessageIds[0])
+    store.complete(blocker.id, 'blocker-session', 'done')
     const running = store.claimNext('status-worker')!
-    store.requeueAt(running.id, Date.now() + 60_000, 'rate limit fixture')
+    expect(running.id).toBe(queued.id)
+    const resumeAt = Date.now() + 60_000
+    store.requeueAt(running.id, resumeAt, 'rate limit fixture')
     const rate = store.pendingStatusNotifications().find(row => row.kind === 'rate-limited')
     expect(rate).toMatchObject({ jobId: queued.id, chatId: 'D1', threadTs: '6.0' })
+    store.deferStatusNotification(rate!.id, 'temporary Slack failure', Date.now(), 1)
+    expect(store.claimNext('resumed-status-worker', 20, resumeAt + 1)?.id).toBe(queued.id)
+    const stalePosts: string[] = []
+    await flushStatusNotifications(store, {
+      status: async notification => { stalePosts.push(notification.payload) },
+    }, () => {})
+    expect(stalePosts).toEqual([])
+    expect(store.statusNotificationCount()).toBe(0)
+    store.close()
+  })
+
+  test('App Server内部retryのrate limitは同じturnで一度だけdurable通知する', async () => {
+    const { store, job } = runningJob()
+    const nonce = 'f'.repeat(32)
+    store.bindAppServerTurn(
+      job.id,
+      job.workerId!,
+      job.controlEpoch,
+      nonce,
+      'thread-rate-wait',
+      'turn-rate-wait',
+    )
+    expect(store.stageAppServerRateLimitWaitNotification(
+      job.id, job.attempts, 'thread-rate-wait', 'turn-rate-wait', 1_000,
+    )).toBe('staged')
+    expect(store.stageAppServerRateLimitWaitNotification(
+      job.id, job.attempts, 'thread-rate-wait', 'turn-rate-wait', 1_001,
+    )).toBe('duplicate')
+    const pending = store.pendingStatusNotifications(2_000)
+    expect(pending).toHaveLength(1)
+    expect(pending[0]).toMatchObject({
+      jobId: job.id,
+      kind: 'rate-limited',
+      payload: SLACK_RATE_LIMIT_WAIT_MESSAGE,
+    })
+
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async input => { posted.push(input.text) },
+    })
+    await flushStatusNotifications(store, notifier, () => {})
+    expect(posted).toEqual([SLACK_RATE_LIMIT_WAIT_MESSAGE])
+    expect(store.pendingStatusNotifications()).toEqual([])
+    store.close()
+  })
+
+  test('turn終了が先なら未送信のrate limit待機通知を破棄する', async () => {
+    const { store, job } = runningJob()
+    const nonce = 'e'.repeat(32)
+    store.bindAppServerTurn(
+      job.id,
+      job.workerId!,
+      job.controlEpoch,
+      nonce,
+      'thread-rate-finished',
+      'turn-rate-finished',
+    )
+    expect(store.stageAppServerRateLimitWaitNotification(
+      job.id, job.attempts, 'thread-rate-finished', 'turn-rate-finished', 1_000,
+    )).toBe('staged')
+    store.finishAppServerTurn({
+      jobId: job.id,
+      epoch: job.controlEpoch,
+      executorNonce: nonce,
+      threadId: 'thread-rate-finished',
+      turnId: 'turn-rate-finished',
+    })
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async input => { posted.push(input.text) },
+    })
+    await flushStatusNotifications(store, notifier, () => {})
+    expect(posted).toEqual([])
+    expect(store.statusNotificationCount()).toBe(0)
+    store.fail(job.id, 'fixture complete')
     store.close()
   })
 

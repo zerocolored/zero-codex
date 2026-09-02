@@ -46,8 +46,10 @@ import {
   reconcileEphemeralAndRetiredAdvisorRounds,
   reconcileAdvisorsWithMonitorHealthBarrier,
   runQueuedJobs,
+  sanitizeExecutionTextForSlack,
   sealArtifactResult,
   sealedArtifactDirForJob,
+  SLACK_QUEUE_WAIT_MESSAGE,
   SlackNotifier,
   slackArtifactPublicationBlockedMessage,
   slackArtifactsAbandonedMessage,
@@ -489,10 +491,10 @@ describe('Codex job store', () => {
     const first = idle.enqueue(input({ messageId: 'accepted-idle', notifyAccepted: true }))
     expect(first.queuePosition).toBe(1)
     expect(idle.pendingStatusNotifications().map(value => value.payload))
-      .toEqual(['🙌 受け付けました。'])
+      .toEqual([])
     const duplicate = idle.enqueue(input({ messageId: 'accepted-idle', notifyAccepted: true }))
     expect(duplicate.duplicate).toBe(true)
-    expect(idle.pendingStatusNotifications()).toHaveLength(1)
+    expect(idle.pendingStatusNotifications()).toHaveLength(0)
     idle.close()
 
     const behindRunning = makeStore()
@@ -503,7 +505,7 @@ describe('Codex job store', () => {
       threadTs: '1800000000.000101',
     }))
     expect(behindRunning.pendingStatusNotifications().map(value => value.payload))
-      .toEqual(['🙌 受け付けました（待ち順 1）。'])
+      .toEqual([SLACK_QUEUE_WAIT_MESSAGE])
     behindRunning.close()
 
     const behindQueued = makeStore()
@@ -513,7 +515,7 @@ describe('Codex job store', () => {
       threadTs: '1800000000.000102',
     }))
     expect(behindQueued.pendingStatusNotifications().map(value => value.payload))
-      .toEqual(['🙌 受け付けました（待ち順 2）。'])
+      .toEqual([SLACK_QUEUE_WAIT_MESSAGE])
     behindQueued.close()
 
     const afterFailure = makeStore()
@@ -525,8 +527,49 @@ describe('Codex job store', () => {
       threadTs: '1800000000.000103',
     }))
     expect(afterFailure.pendingStatusNotifications().map(value => value.payload))
-      .toEqual(['🙌 受け付けました。'])
+      .toEqual([])
     afterFailure.close()
+  })
+
+  test('実Slack受信のprocessing行が残る間も先行queued jobを待機案内の対象にする', () => {
+    const store = makeStore()
+    store.enqueue(input({ messageId: 'accepted-real-inbound-root' }))
+    const staged = store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000150',
+      messageId: '1800000000.000151',
+      userId: 'U0TRIGGER',
+      repoPath: '/tmp/project',
+      text: '次の依頼',
+      writeEnabled: false,
+    }, {
+      initialContextEligible: false,
+      appId: 'A0123456789',
+    })
+    expect(staged.outcome).toBe('staged')
+    const inbound = store.claimNextInboundDelivery()!
+
+    const queued = store.enqueue({
+      chatId: inbound.chatId,
+      threadTs: inbound.threadTs,
+      messageId: inbound.messageId,
+      userId: inbound.userId,
+      repoPath: inbound.repoPath,
+      task: inbound.text,
+      writeEnabled: inbound.writeEnabled,
+      notifyAccepted: true,
+    })
+
+    expect(queued.duplicate).toBe(false)
+    expect(store.pendingStatusNotifications()).toEqual([
+      expect.objectContaining({
+        jobId: queued.job.id,
+        kind: 'accepted',
+        payload: SLACK_QUEUE_WAIT_MESSAGE,
+      }),
+    ])
+    store.completeInboundDelivery(inbound.idempotencyKey)
+    store.close()
   })
 
   test('承認待ちとinbound待ちの非実行jobは受付の待ち順へ数えない', () => {
@@ -550,7 +593,7 @@ describe('Codex job store', () => {
       notifyAccepted: true,
     }))
     expect(parkedStore.pendingStatusNotifications().map(value => value.payload))
-      .toEqual(['🙌 受け付けました。'])
+      .toEqual([])
     parkedStore.close()
 
     const inboundStore = makeStore()
@@ -565,7 +608,7 @@ describe('Codex job store', () => {
       notifyAccepted: true,
     }))
     expect(inboundStore.pendingStatusNotifications().map(value => value.payload))
-      .toEqual(['🙌 受け付けました。'])
+      .toEqual([])
     inboundStore.close()
   })
 
@@ -9613,7 +9656,7 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('進捗がhost blockだけでもSlackへ空送信せず安全な継続文を返す', async () => {
+  test('進捗がhost blockだけなら固定fallbackをSlackへ連投しない', async () => {
     const store = makeStore()
     const job = store.enqueue(input({ messageId: 'progress-host-block-only' })).job
     const posted: string[] = []
@@ -9632,9 +9675,52 @@ describe('Slack output guard', () => {
       'progress-safe-fallback',
     )
 
-    expect(posted).toEqual(['少し時間がかかっていますが、まだ作業を続けています 🔍'])
-    expect(posted[0]).not.toContain(job.id)
-    expect(posted[0]).not.toContain(job.repoPath)
+    expect(posted).toEqual([])
+    store.close()
+  })
+
+  test('自己構成を含む依頼でも進捗は有意な公開文を残し非公開固定文を生成しない', async () => {
+    const state = fixtureDir()
+    const repo = join(state, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const job = store.enqueue(input({
+      repoPath: repo,
+      messageId: 'progress-self-question-regression',
+      task: '当システムのFAQ抽出ロジックが遅い理由を調べてください。',
+    })).job
+    const raw = [
+      '一次調査では、質問抽出の待ち時間がボトルネック候補です。次に実測します 🔍',
+      `Codex workerは ${repo} で動作し、token=xoxb-secret-value を使います。`,
+    ].join('\n')
+    const sanitized = sanitizeExecutionTextForSlack(
+      job, 'session-private', raw, state, [], 'progress',
+    )
+    expect(sanitized).toContain('一次調査では、質問抽出の待ち時間がボトルネック候補です。')
+    expect(sanitized).not.toContain('内部構成は公開していません。')
+    expect(sanitized).not.toContain(repo)
+    expect(sanitized).not.toMatch(/Codex|worker|xoxb|session-private/i)
+
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+    await notifier.progress(job, raw, 'progress-self-question')
+    expect(posted).toEqual([sanitized])
+    store.close()
+  })
+
+  test('進捗用sanitizerは非公開固定文そのものを投稿対象から除外する', () => {
+    const store = makeStore()
+    const job = store.enqueue(input({ messageId: 'progress-nondisclosure-only' })).job
+    expect(sanitizeExecutionTextForSlack(
+      job,
+      'session-private',
+      '内部構成は公開していません。',
+      dirname(store.dbPath),
+      [],
+      'progress',
+    )).toBe('')
     store.close()
   })
 
