@@ -14,7 +14,6 @@ import {
   planCatchupSweep,
   catchupThreadParents,
   pruneDeliveredKeys,
-  classifyThreadReply,
   mentionsBot,
   resolveIsMention,
   decideThreadReplyDelivery,
@@ -251,31 +250,24 @@ describe('active Slack thread authority', () => {
   test('別humanはlive targetへsteerでき、exact中止だけsettle targetへ届く', () => {
     const base = {
       isBot: false,
-      isDM: false,
-      text: '方針を変えて',
-      botUserId: 'U_ZERO',
       hasInterruptTarget: true,
       isInterrupt: false,
     }
     expect(canUseActiveThreadAuthority({ ...base, hasLiveTarget: true })).toBe(true)
     expect(canUseActiveThreadAuthority({ ...base, hasLiveTarget: false })).toBe(false)
     expect(canUseActiveThreadAuthority({
-      ...base, text: '中止', hasLiveTarget: false, isInterrupt: true,
+      ...base, hasLiveTarget: false, isInterrupt: true,
     })).toBe(true)
   })
 
-  test('botと他人宛て返信はactive targetがあってもauthorityを得ない', () => {
+  test('semantic audience確定後はhumanだけがactive target authorityを得る', () => {
     const base = {
-      isDM: false,
-      botUserId: 'U_ZERO',
       hasLiveTarget: true,
       hasInterruptTarget: true,
       isInterrupt: false,
     }
-    expect(canUseActiveThreadAuthority({ ...base, isBot: true, text: '操作して' })).toBe(false)
-    expect(canUseActiveThreadAuthority({
-      ...base, isBot: false, text: '<@U0OTHER1> これはどう？',
-    })).toBe(false)
+    expect(canUseActiveThreadAuthority({ ...base, isBot: true })).toBe(false)
+    expect(canUseActiveThreadAuthority({ ...base, isBot: false })).toBe(true)
   })
 })
 
@@ -370,135 +362,6 @@ describe('selectNewReplies — thread catch-up poller', () => {
   })
 })
 
-describe('classifyThreadReply — who is this reply talking to?', () => {
-  const BOT_USER = 'U0B8JC02X7E'
-  const ALICE = 'U06R9GU88RF'
-  const BOB = 'U0A0DCGSJA0'
-
-  // The three replies below are verbatim from the thread that exposed the bug:
-  // the bot answered all of them, and the humans only wanted the first.
-  test('bot mention → ours', () => {
-    const text = `<@${BOT_USER}> このmdファイルのタスクないようをCSVフォーマットにして`
-    expect(classifyThreadReply(text, BOT_USER)).toBe('bot')
-  })
-
-  test('addressed at two humans → not ours (the original complaint)', () => {
-    const text = `<@${ALICE}> <@${BOB}> ゼロくんが作ってくれたCSVのチェックリストを共有します`
-    expect(classifyThreadReply(text, BOT_USER)).toBe('others')
-  })
-
-  test('addressed at one human → not ours', () => {
-    expect(classifyThreadReply(`<@${ALICE}> すいません下記の詳細をお願いしたいです！`, BOT_USER)).toBe('others')
-  })
-
-  // Un-mentioned follow-ups are how the humans actually drive the bot in an
-  // owned thread — dropping these would break "いいね、マージして".
-  test('no mention at all → ours (the owned thread is the address)', () => {
-    expect(classifyThreadReply('いいね、マージして', BOT_USER)).toBe('none')
-    expect(classifyThreadReply('', BOT_USER)).toBe('none')
-  })
-
-  test('bot mentioned alongside humans → ours (explicit beats company)', () => {
-    expect(classifyThreadReply(`<@${ALICE}> <@${BOT_USER}> これ直して`, BOT_USER)).toBe('bot')
-    expect(classifyThreadReply(`<@${BOT_USER}> <@${ALICE}> これ直して`, BOT_USER)).toBe('bot')
-  })
-
-  test('the bot display name in plain text is NOT a mention', () => {
-    // Exactly why name-matching was rejected: this sentence is *about* the bot
-    // while being addressed at humans.
-    expect(classifyThreadReply(`<@${ALICE}> ゼロくんが作ってくれたCSV`, BOT_USER)).toBe('others')
-    expect(classifyThreadReply('ゼロくん、これお願い', BOT_USER)).toBe('none')
-  })
-
-  test('broadcasts are a call to the humans, not to us', () => {
-    for (const token of ['<!here>', '<!channel>', '<!everyone>', '<!subteam^S12345ABC>']) {
-      expect(classifyThreadReply(`${token} 確認お願いします`, BOT_USER)).toBe('others')
-    }
-  })
-
-  test('a broadcast that also names the bot is ours', () => {
-    expect(classifyThreadReply(`<!here> <@${BOT_USER}> 頼む`, BOT_USER)).toBe('bot')
-  })
-
-  test('link-style mention tokens (<@U…|label>) are matched', () => {
-    expect(classifyThreadReply(`<@${BOT_USER}|zerokun> 頼む`, BOT_USER)).toBe('bot')
-    expect(classifyThreadReply(`<@${ALICE}|alice> よろしく`, BOT_USER)).toBe('others')
-  })
-
-  test('workspace-shared user ids (W-prefix) count as human mentions', () => {
-    expect(classifyThreadReply('<@W012345AB> よろしく', BOT_USER)).toBe('others')
-  })
-
-  test('an unresolved botUserId cannot mute a plain reply', () => {
-    // Only reachable if auth.test has not returned yet. A reply with no mention
-    // still gets through; one naming us degrades to 'others' because we cannot
-    // recognise our own id — acceptable because pollThreads only runs after
-    // botUserId is assigned (server.ts start-up order).
-    expect(classifyThreadReply('マージして', undefined)).toBe('none')
-    expect(classifyThreadReply(`<@${BOT_USER}> 頼む`, undefined)).toBe('others')
-  })
-
-  test('a channel link is not a mention', () => {
-    expect(classifyThreadReply('<#C0B69UHBP7Y|dev> に貼っておいた', BOT_USER)).toBe('none')
-  })
-
-  test('labelled broadcast tokens (the common form) still count', () => {
-    expect(classifyThreadReply('<!here|@here> 確認お願いします', BOT_USER)).toBe('others')
-    expect(classifyThreadReply('<!subteam^S06ABC1DEF|@dev-team> 見てください', BOT_USER)).toBe('others')
-  })
-
-  test('escaped mention text is inert (Slack escapes < and > it did not author)', () => {
-    expect(classifyThreadReply('&lt;@U06R9GU88RF&gt; と書いた', BOT_USER)).toBe('none')
-  })
-
-  test('a bot-id token is not a user mention', () => {
-    expect(classifyThreadReply('<@B012345AB> が投稿した', BOT_USER)).toBe('none')
-  })
-
-  test('an id that merely starts with ours is somebody else', () => {
-    expect(classifyThreadReply('<@U0B8JC02X7EXTRA> よろしく', BOT_USER)).toBe('others')
-  })
-
-  // Quoting a colleague and then instructing us is the everyday Slack idiom;
-  // reading the citation as the address would swallow the instruction.
-  test('a mention inside a quote is a citation, not an address', () => {
-    expect(classifyThreadReply(`&gt; <@${ALICE}> さんの案\nいいね、マージして`, BOT_USER)).toBe('none')
-    expect(classifyThreadReply(`> <@${ALICE}> さんの案\nいいね、マージして`, BOT_USER)).toBe('none')
-  })
-
-  test('a mention inside code is a citation, not an address', () => {
-    expect(classifyThreadReply(`\`<@${ALICE}>\` の話だけど直して`, BOT_USER)).toBe('none')
-    expect(classifyThreadReply('```\n<@U06R9GU88RF> hi\n```\nこれ直して', BOT_USER)).toBe('none')
-  })
-
-  test('naming us survives quoting that swallows the token', () => {
-    // Quote detection must not be able to eat our own name when nobody else is
-    // addressed: a stray backtick shifts every span and the message would
-    // vanish in silence.
-    expect(classifyThreadReply(`\`\`\`\n<@${BOT_USER}> これ実行して`, BOT_USER)).toBe('bot')
-    expect(classifyThreadReply(`&gt; 昨日の\n\`<@${BOT_USER}>\` やっといて`, BOT_USER)).toBe('bot')
-  })
-
-  test('an unclosed fence quotes to the end, the way Slack renders it', () => {
-    // Otherwise the tail reads as ordinary prose and the mention inside it
-    // looks like a plain address, outranking the human named above.
-    const text = `<@${ALICE}> 確認して\n\`\`\`\n<@${BOT_USER}> デプロイして`
-    expect(classifyThreadReply(text, BOT_USER)).toBe('others')
-  })
-
-  test('but a quoted mention of us never outranks a human addressed in the open', () => {
-    // Quoting an old request to us while asking a colleague about it is the
-    // exact interruption this whole change exists to stop.
-    const text = `<@${ALICE}> 昨日の件です\n&gt; <@${BOT_USER}> デプロイして\nこれ確認お願いします`
-    expect(classifyThreadReply(text, BOT_USER)).toBe('others')
-  })
-
-  test('quoting does not smuggle a real address past the filter', () => {
-    // The quote is stripped, but the live line still addresses a human.
-    expect(classifyThreadReply(`&gt; 参考\n<@${ALICE}> お願いします`, BOT_USER)).toBe('others')
-  })
-})
-
 describe('decideThreadReplyDelivery — the poller wiring', () => {
   const BOT_USER = 'U0B8JC02X7E'
   const ALICE = 'U06R9GU88RF'
@@ -518,8 +381,8 @@ describe('decideThreadReplyDelivery — the poller wiring', () => {
     expect(decideThreadReplyDelivery(open, reply({ text: 'いいね、マージして' }), BOT_USER)).toBe('deliver')
   })
 
-  test('drops a reply addressed at a human — the whole point of this change', () => {
-    expect(decideThreadReplyDelivery(open, reply({ text: `<@${ALICE}> お願いします` }), BOT_USER)).toBe('drop-others')
+  test('semantic audienceをhost regexで決めずLLM gateへ渡す', () => {
+    expect(decideThreadReplyDelivery(open, reply({ text: `<@${ALICE}> お願いします` }), BOT_USER)).toBe('deliver')
   })
 
   test('legacy allowlist does not exclude a human reply', () => {
@@ -530,7 +393,7 @@ describe('decideThreadReplyDelivery — the poller wiring', () => {
   test('missing registry defaults to the mention/noise rule for an owned thread', () => {
     expect(decideThreadReplyDelivery(undefined, reply(), BOT_USER)).toBe('deliver')
     expect(decideThreadReplyDelivery(undefined, reply({ text: `<@${ALICE}> hi` }), BOT_USER))
-      .toBe('drop-others')
+      .toBe('deliver')
   })
 
   test('an attachment with no text is ours', () => {
@@ -561,7 +424,7 @@ describe('advanceReadCursor — read position vs delivery position', () => {
     expect(advanceReadCursor(replies, '1786400000.000000')).toBe('1786400030.000000')
   })
 
-  test('skipped “addressed to others” replies advance it too', () => {
+  test('later LLMで無視される返信もread cursor自体は進められる', () => {
     const replies = [reply('1786400050.000000', { text: '<@U06R9GU88RF> お願い' })]
     expect(advanceReadCursor(replies, '1786400000.000000')).toBe('1786400050.000000')
   })
@@ -861,7 +724,7 @@ describe('planThreadPoll — one page of a thread, end to end', () => {
   const open = policy({ requireMention: true, allowFrom: [HUMAN] })
   const reply = (ts: string, over: Partial<SlackReply> = {}): SlackReply => ({ ts, user: HUMAN, text: 'hi', ...over })
 
-  test('routes a mixed page: bot-addressed and bare delivered, human-addressed skipped', () => {
+  test('routes every human candidate to the later durable LLM gate', () => {
     const replies = [
       reply('1786325100.000000', { text: `<@${ALICE}> <@U0A0DCGSJA0> 共有します` }),
       reply('1786325200.000000', { text: `<@${BOT_USER}> これやって` }),
@@ -869,18 +732,20 @@ describe('planThreadPoll — one page of a thread, end to end', () => {
       reply('1786325400.000000', { user: BOT_USER, text: '対応しました' }),
     ]
     const plan = planThreadPoll(replies, CURSOR, open, BOT_USER)
-    expect(plan.deliver.map((r) => r.ts)).toEqual(['1786325200.000000', '1786325300.000000'])
-    expect(plan.skipped).toEqual([{ reply: replies[0]!, reason: 'others' }])
+    expect(plan.deliver.map((r) => r.ts)).toEqual([
+      '1786325100.000000', '1786325200.000000', '1786325300.000000',
+    ])
+    expect(plan.skipped).toEqual([])
     expect(plan.cursor).toBe('1786325400.000000')
   })
 
-  test('a page of nothing deliverable still moves the read cursor', () => {
+  test('bot投稿を除きhuman候補はLLM gateへ渡す', () => {
     const replies = [
       reply('1786325100.000000', { user: BOT_USER }),
       reply('1786325200.000000', { text: `<@${ALICE}> お願い` }),
     ]
     const plan = planThreadPoll(replies, CURSOR, open, BOT_USER)
-    expect(plan.deliver).toEqual([])
+    expect(plan.deliver).toEqual([replies[1]!])
     expect(plan.cursor).toBe('1786325200.000000')
   })
 

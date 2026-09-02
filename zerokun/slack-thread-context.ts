@@ -1,5 +1,4 @@
 import {
-  classifyThreadReply,
   isSlackBotAuthored,
   mentionsBot,
   SLACK_USER_ID_RE,
@@ -240,38 +239,24 @@ export function planInitialSlackThreadContext(input: {
     )
   }
 
-  const firstMentionIndex = messages.findIndex(message => (
-    mentionsBot(message.text ?? '', input.botUserId)
-  ))
-  if (firstMentionIndex < 0) {
-    throw new SlackInitialThreadContextIncompleteError(
-      '途中メンションがまだSlack履歴へ反映されていません',
-    )
-  }
-
-  const deliverableAfter = (index: number) => messages.slice(index)
-    .filter(message => classifyThreadReply(message.text ?? '', input.botUserId) !== 'others')
-    .map(message => eventFromReply(message, input.botUserId))
-
-  if (firstMentionIndex === 0 && messages[0]!.ts === input.threadTs) {
-    const [rootEvent, ...followups] = deliverableAfter(0)
-    if (!rootEvent) {
-      throw new SlackInitialThreadContextError('Slackスレッドの先頭依頼を復元できませんでした')
-    }
-    return { kind: 'root-already-addressed', root: rootEvent, followups }
-  }
-
-  const contextMessages = messages.slice(0, firstMentionIndex + 1)
+  // The observed trigger has already passed the durable LLM audience gate.
+  // Keep it as the canonical delivery and render earlier human discussion as
+  // untrusted context only. Selecting an older reply by mention regex would
+  // bypass that LLM gate and could turn member-to-member conversation into
+  // controls or separate jobs.
+  const contextMessages = messages
   const context = renderContext(
     contextMessages,
     input.threadTs,
-    contextMessages.at(-1)!.ts,
+    input.triggerTs,
     input.botUserId,
   )
   return {
     kind: 'context',
     context,
-    followups: deliverableAfter(firstMentionIndex + 1),
+    // Do not replay semantic replies directly into the inbound FIFO here.
+    // They are intentionally left for the common LLM admission poller.
+    followups: [],
   }
 }
 

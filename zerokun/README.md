@@ -58,7 +58,8 @@ Git repositoryでなくてもmulti-repository workspaceとして起動できま�
 | `../codex-channel.sh` | `zerochan start/stop`の検証とservice controllerへの委譲 |
 | `service-control.ts` | job保護付き停止、専用runtime tab作成、安定起動確認 |
 | `../server.ts` | Slack Socket Mode、access gate、添付取得、durable enqueue、catch-up |
-| `job-runner.ts` | SQLite FIFO、thread/session 所有権、Slack 通知 |
+| `job-runner.ts` | SQLite FIFO、thread/session 所有権、Slack 通知、返信宛先判定ledger |
+| `slack-thread-intent.ts` | 匿名化したthread文脈をsubscription Codexで宛先分類 |
 | `runner-launcher.ts` | runnerの独立process group起動、安全なlog接続 |
 | `herdr-runtime.ts` | Herdr socket・pane・terminal・workspaceの起動前/各job再検証 |
 | `herdr-job-monitor.ts` | job専用Herdr監視tabの永続state、安全な日本語タイムライン、再起動reconcile、自動close |
@@ -292,7 +293,9 @@ Codex stdout/stderr logはfileごとに20MB、解析用memoryは1MB tailへ制�
   再試行でき、既に採用済みのthreadは再構築しない
 - 48時間以内に活動した採用済み thread を60秒ごとに poll
 - Socket Modeで受信した採用済みthreadの返信は60秒を待たず、現在turnのlive controlとして優先回収
-- human 向け mention だけの雑談は channel policy に従って除外
+- 採用済みthreadまたはAppが明示メンションされたthreadのhuman返信は、直前文脈を含むdurableなLLM宛先判定を先に通す
+- Zeroちゃん宛てでないメンバー間の会話はreaction・投稿・queue・割り込みを一切発生させず無視
+- 分類器障害時は誤受付／誤無視に確定せず、本文・添付ID・同じsnapshotをSQLiteに残した常駐workerからbackoff再試行
 - DM follow-up は現在の DM allowlist を再確認
 - senderが変わっても同threadならactive jobを安全に一時停止して先に回答し、そのjobの固定済み権限を引き継ぐ
 - Socket Modeと履歴回収のどちらもdurable handoff後に同じ`eyes`リアクションを付ける

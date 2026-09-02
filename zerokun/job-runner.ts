@@ -243,6 +243,29 @@ export interface LiveControlTarget {
   awaitingUiApproval?: boolean
 }
 
+export type SlackThreadReplyIntentStatus =
+  | 'pending' | 'processing' | 'addressed' | 'ignored'
+
+export interface SlackThreadReplyIntentRecord {
+  idempotencyKey: string
+  chatId: string
+  threadTs: string
+  messageId: string
+  userId: string
+  candidateText: string
+  fileIds: string[]
+  promptVersion: number
+  snapshotJson: string
+  inputDigest: string
+  status: SlackThreadReplyIntentStatus
+  attempts: number
+  notBefore: number | null
+  leaseExpiresAt: number | null
+  lastError: string | null
+  createdAt: number
+  decidedAt: number | null
+}
+
 /** An active Slack thread is the live-control authority, including replies from other senders. */
 export function liveControlAcceptsInput(
   _target: LiveControlTarget,
@@ -1001,6 +1024,28 @@ CREATE TABLE IF NOT EXISTS delivery_tombstones (
   write_enabled INTEGER NOT NULL DEFAULT 0,
   completed_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS slack_thread_reply_intents (
+  idempotency_key TEXT PRIMARY KEY,
+  chat_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  candidate_text TEXT NOT NULL DEFAULT '',
+  file_ids_json TEXT NOT NULL DEFAULT '[]',
+  prompt_version INTEGER NOT NULL CHECK (prompt_version > 0),
+  snapshot_json TEXT NOT NULL,
+  input_digest TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'processing', 'addressed', 'ignored')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  not_before INTEGER,
+  lease_expires_at INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_slack_thread_reply_intents_ready
+  ON slack_thread_reply_intents(status, not_before, created_at);
 CREATE TABLE IF NOT EXISTS migration_ledger (
   name TEXT PRIMARY KEY,
   completed_at INTEGER NOT NULL
@@ -1695,6 +1740,23 @@ function ensureJobSchemaMigrations(db: Database): void {
       if (!migrated.some(column => column.name === 'monitor_state')) throw error
     }
   }
+  const threadIntentColumns = db.query<{ name: string }, []>(
+    'PRAGMA table_info(slack_thread_reply_intents)',
+  ).all()
+  for (const [name, definition] of [
+    ['candidate_text', "TEXT NOT NULL DEFAULT ''"],
+    ['file_ids_json', "TEXT NOT NULL DEFAULT '[]'"],
+  ] as const) {
+    if (threadIntentColumns.some(column => column.name === name)) continue
+    try {
+      db.exec(`ALTER TABLE slack_thread_reply_intents ADD COLUMN ${name} ${definition}`)
+    } catch (error) {
+      const migrated = db.query<{ name: string }, []>(
+        'PRAGMA table_info(slack_thread_reply_intents)',
+      ).all()
+      if (!migrated.some(column => column.name === name)) throw error
+    }
+  }
   for (const [name, definition] of [
     ['pending_session_id', 'TEXT'],
     ['pending_result', 'TEXT'],
@@ -2270,6 +2332,53 @@ function mapInboundDeliveryRow(row: InboundDeliveryRow): InboundDeliveryRecord {
     expectedControlEpoch: row.expected_control_epoch,
     downloadedFiles: parseInboundDownloadedFiles(row.downloaded_files_json),
     initialContextState: row.initial_context_state,
+  }
+}
+
+type SlackThreadReplyIntentRow = {
+  idempotency_key: string
+  chat_id: string
+  thread_ts: string
+  message_id: string
+  user_id: string
+  candidate_text: string
+  file_ids_json: string
+  prompt_version: number
+  snapshot_json: string
+  input_digest: string
+  status: SlackThreadReplyIntentStatus
+  attempts: number
+  not_before: number | null
+  lease_expires_at: number | null
+  last_error: string | null
+  created_at: number
+  decided_at: number | null
+}
+
+function mapSlackThreadReplyIntentRow(
+  row: SlackThreadReplyIntentRow,
+): SlackThreadReplyIntentRecord {
+  if (!['pending', 'processing', 'addressed', 'ignored'].includes(row.status)) {
+    throw new Error(`invalid Slack thread reply intent status: ${row.idempotency_key}`)
+  }
+  return {
+    idempotencyKey: row.idempotency_key,
+    chatId: row.chat_id,
+    threadTs: row.thread_ts,
+    messageId: row.message_id,
+    userId: row.user_id,
+    candidateText: row.candidate_text,
+    fileIds: parseAttachments(row.file_ids_json),
+    promptVersion: row.prompt_version,
+    snapshotJson: row.snapshot_json,
+    inputDigest: row.input_digest,
+    status: row.status,
+    attempts: row.attempts,
+    notBefore: row.not_before,
+    leaseExpiresAt: row.lease_expires_at,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    decidedAt: row.decided_at,
   }
 }
 
@@ -3195,6 +3304,7 @@ export class JobStore {
           OR EXISTS(SELECT 1 FROM job_controls)
           OR EXISTS(SELECT 1 FROM job_interjections)
           OR EXISTS(SELECT 1 FROM delivery_tombstones)
+          OR EXISTS(SELECT 1 FROM slack_thread_reply_intents)
           OR EXISTS(SELECT 1 FROM update_request_ledger)
           OR EXISTS(SELECT 1 FROM slack_threads)
           OR EXISTS(SELECT 1 FROM slack_channel_routes)
@@ -3438,6 +3548,342 @@ export class JobStore {
     }
     if (/^D[A-Z0-9]+$/.test(chatId)) return { repoPath: defaultRepoPath, owned: false }
     throw new Error(`invalid Slack conversation ID: ${chatId}`)
+  }
+
+  /** Persist the raw Slack reply before any context fetch or model call. */
+  stageSlackThreadReplyCandidate(input: {
+    chatId: string
+    threadTs: string
+    messageId: string
+    userId: string
+    promptVersion: number
+    candidateText: string
+    fileIds?: string[]
+    createdAt?: number
+    notBefore?: number
+  }): SlackThreadReplyIntentRecord {
+    const chatId = requireSlackChannelId(input.chatId)
+    const threadTs = requireText(input.threadTs, 'thread intent threadTs')
+    const messageId = requireText(input.messageId, 'thread intent messageId')
+    const userId = requireText(input.userId, 'thread intent userId')
+    if (!/^\d+\.\d+$/.test(threadTs) || !/^\d+\.\d+$/.test(messageId)
+      || Number(messageId) <= Number(threadTs)) {
+      throw new Error('thread intent timestamps are invalid')
+    }
+    if (!/^[UW][A-Z0-9]+$/.test(userId)) throw new Error('thread intent user is invalid')
+    if (!Number.isSafeInteger(input.promptVersion) || input.promptVersion < 1) {
+      throw new Error('thread intent prompt version is invalid')
+    }
+    if (typeof input.candidateText !== 'string'
+      || Buffer.byteLength(input.candidateText, 'utf8') > 128 * 1024) {
+      throw new Error('thread intent candidate text is invalid')
+    }
+    const fileIds = [...new Set((input.fileIds ?? []).map(id => (
+      requireText(id, 'thread intent file ID')
+    )))]
+    if (fileIds.length > 100 || fileIds.some(id => Buffer.byteLength(id, 'utf8') > 255)) {
+      throw new Error('thread intent file IDs are invalid')
+    }
+    const createdAt = input.createdAt ?? Date.now()
+    if (!Number.isSafeInteger(createdAt) || createdAt <= 0) {
+      throw new Error('thread intent createdAt is invalid')
+    }
+    const notBefore = input.notBefore ?? createdAt
+    if (!Number.isSafeInteger(notBefore) || notBefore <= 0) {
+      throw new Error('thread intent notBefore is invalid')
+    }
+    const key = `${chatId}:${messageId}`
+    const stage = this.db.transaction(() => {
+      this.db.run(
+        `INSERT OR IGNORE INTO slack_thread_reply_intents (
+           idempotency_key, chat_id, thread_ts, message_id, user_id,
+           candidate_text, file_ids_json, prompt_version, snapshot_json,
+           input_digest, not_before, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?)`,
+        [
+          key, chatId, threadTs, messageId, userId, input.candidateText,
+          JSON.stringify(fileIds), input.promptVersion, notBefore, createdAt,
+        ],
+      )
+      const row = this.db.query<SlackThreadReplyIntentRow, [string]>(
+        'SELECT * FROM slack_thread_reply_intents WHERE idempotency_key = ?',
+      ).get(key)
+      if (!row) throw new Error(`thread intent disappeared after staging: ${key}`)
+      if (row.chat_id !== chatId || row.thread_ts !== threadTs
+        || row.message_id !== messageId || row.user_id !== userId) {
+        throw new Error(`thread intent identity collision: ${key}`)
+      }
+      return mapSlackThreadReplyIntentRow(row)
+    })
+    return retrySqlite(() => stage.immediate())
+  }
+
+  /**
+   * Persist the exact bounded model input. The first completed snapshot wins,
+   * while a raw candidate can survive a failed Slack context request.
+   */
+  prepareSlackThreadReplyIntent(
+    idempotencyKey: string,
+    input: { promptVersion: number; snapshotJson: string; inputDigest: string },
+  ): SlackThreadReplyIntentRecord {
+    const key = requireText(idempotencyKey, 'thread intent idempotencyKey')
+    if (!Number.isSafeInteger(input.promptVersion) || input.promptVersion < 1) {
+      throw new Error('thread intent prompt version is invalid')
+    }
+    if (typeof input.snapshotJson !== 'string' || input.snapshotJson.length === 0
+      || Buffer.byteLength(input.snapshotJson, 'utf8') > 64 * 1024) {
+      throw new Error('thread intent snapshot is invalid')
+    }
+    try { JSON.parse(input.snapshotJson) } catch { throw new Error('thread intent snapshot is invalid JSON') }
+    if (!/^[0-9a-f]{64}$/.test(input.inputDigest)) {
+      throw new Error('thread intent digest is invalid')
+    }
+    const prepare = this.db.transaction(() => {
+      const row = this.db.query<SlackThreadReplyIntentRow, [string]>(
+        'SELECT * FROM slack_thread_reply_intents WHERE idempotency_key = ?',
+      ).get(key)
+      if (!row) throw new Error(`thread intent was not staged: ${key}`)
+      if (row.snapshot_json || row.input_digest) {
+        if (!row.snapshot_json || !row.input_digest) {
+          throw new Error(`thread intent snapshot is incomplete: ${key}`)
+        }
+        return mapSlackThreadReplyIntentRow(row)
+      }
+      if (row.status !== 'pending') {
+        throw new Error(`thread intent cannot be prepared from ${row.status}: ${key}`)
+      }
+      this.db.run(
+        `UPDATE slack_thread_reply_intents
+         SET prompt_version = ?, snapshot_json = ?, input_digest = ?, last_error = NULL
+         WHERE idempotency_key = ? AND status = 'pending'
+           AND snapshot_json = '' AND input_digest = ''`,
+        [input.promptVersion, input.snapshotJson, input.inputDigest, key],
+      )
+      const prepared = this.db.query<SlackThreadReplyIntentRow, [string]>(
+        'SELECT * FROM slack_thread_reply_intents WHERE idempotency_key = ?',
+      ).get(key)
+      if (!prepared?.snapshot_json || !prepared.input_digest) {
+        throw new Error(`thread intent was not prepared: ${key}`)
+      }
+      return mapSlackThreadReplyIntentRow(prepared)
+    })
+    return retrySqlite(() => prepare.immediate())
+  }
+
+  /** Backward-compatible atomic-style helper used by focused store tests. */
+  stageSlackThreadReplyIntent(input: {
+    chatId: string
+    threadTs: string
+    messageId: string
+    userId: string
+    promptVersion: number
+    snapshotJson: string
+    inputDigest: string
+    candidateText?: string
+    fileIds?: string[]
+    createdAt?: number
+  }): SlackThreadReplyIntentRecord {
+    let candidateText = input.candidateText
+    if (candidateText === undefined) {
+      try {
+        const parsed = JSON.parse(input.snapshotJson) as {
+          messages?: Array<{ candidate?: boolean; text?: unknown }>
+        }
+        const text = parsed.messages?.find(message => message.candidate)?.text
+        candidateText = typeof text === 'string' ? text : ''
+      } catch {
+        candidateText = ''
+      }
+    }
+    const staged = this.stageSlackThreadReplyCandidate({
+      chatId: input.chatId,
+      threadTs: input.threadTs,
+      messageId: input.messageId,
+      userId: input.userId,
+      promptVersion: input.promptVersion,
+      candidateText,
+      fileIds: input.fileIds,
+      createdAt: input.createdAt,
+      notBefore: Date.now(),
+    })
+    return this.prepareSlackThreadReplyIntent(staged.idempotencyKey, {
+      promptVersion: input.promptVersion,
+      snapshotJson: input.snapshotJson,
+      inputDigest: input.inputDigest,
+    })
+  }
+
+  getSlackThreadReplyIntent(idempotencyKey: string): SlackThreadReplyIntentRecord | null {
+    const key = requireText(idempotencyKey, 'thread intent idempotencyKey')
+    const row = retrySqlite(() => this.db.query<SlackThreadReplyIntentRow, [string]>(
+      'SELECT * FROM slack_thread_reply_intents WHERE idempotency_key = ?',
+    ).get(key))
+    return row ? mapSlackThreadReplyIntentRow(row) : null
+  }
+
+  listDueSlackThreadReplyIntents(
+    now = Date.now(),
+    limit = 32,
+  ): SlackThreadReplyIntentRecord[] {
+    if (!Number.isSafeInteger(now) || now <= 0
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
+      throw new Error('thread intent due-list parameters are invalid')
+    }
+    const rows = retrySqlite(() => this.db.query<
+      SlackThreadReplyIntentRow,
+      [number, number, number, number]
+    >(
+      `SELECT * FROM slack_thread_reply_intents AS intent
+       WHERE (
+         (intent.status = 'pending'
+           AND (intent.not_before IS NULL OR intent.not_before <= ?))
+         OR (intent.status = 'processing'
+           AND (intent.lease_expires_at IS NULL OR intent.lease_expires_at <= ?))
+         OR (intent.status = 'addressed'
+           AND (intent.not_before IS NULL OR intent.not_before <= ?))
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM inbound_deliveries WHERE idempotency_key = intent.idempotency_key
+         UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = intent.idempotency_key
+         UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = intent.idempotency_key
+         UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = intent.idempotency_key
+         UNION ALL SELECT 1 FROM delivery_tombstones WHERE idempotency_key = intent.idempotency_key
+         UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = intent.idempotency_key
+         LIMIT 1
+       )
+       ORDER BY intent.chat_id, intent.thread_ts,
+                CAST(intent.message_id AS REAL), intent.created_at
+       LIMIT ?`,
+    ).all(now, now, now, limit))
+    return rows.map(mapSlackThreadReplyIntentRow)
+  }
+
+  /** Claim one candidate without imposing a global FIFO across other threads. */
+  claimSlackThreadReplyIntent(
+    idempotencyKey: string,
+    now = Date.now(),
+    leaseMs = 2 * 60_000,
+  ): SlackThreadReplyIntentRecord | null {
+    const key = requireText(idempotencyKey, 'thread intent idempotencyKey')
+    if (!Number.isSafeInteger(now) || now <= 0
+      || !Number.isSafeInteger(leaseMs) || leaseMs < 10_000) {
+      throw new Error('thread intent claim timing is invalid')
+    }
+    const claim = this.db.transaction(() => {
+      const row = this.db.query<SlackThreadReplyIntentRow, [string]>(
+        'SELECT * FROM slack_thread_reply_intents WHERE idempotency_key = ?',
+      ).get(key)
+      if (!row) return null
+      if (row.status === 'addressed' || row.status === 'ignored') {
+        return mapSlackThreadReplyIntentRow(row)
+      }
+      if (row.status === 'processing'
+        && row.lease_expires_at !== null && row.lease_expires_at > now) return null
+      if (row.status === 'pending' && row.not_before !== null && row.not_before > now) return null
+      const changed = this.db.run(
+        `UPDATE slack_thread_reply_intents
+         SET status = 'processing', attempts = attempts + 1,
+             not_before = NULL, lease_expires_at = ?, last_error = NULL
+         WHERE idempotency_key = ?
+           AND (status = 'pending'
+             OR (status = 'processing' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+           AND snapshot_json <> '' AND input_digest <> ''
+           AND NOT EXISTS (
+             SELECT 1 FROM slack_thread_reply_intents AS earlier
+             WHERE earlier.chat_id = ? AND earlier.thread_ts = ?
+               AND CAST(earlier.message_id AS REAL) < CAST(? AS REAL)
+               AND earlier.status IN ('pending', 'processing', 'addressed')
+               AND NOT EXISTS (
+                 SELECT 1 FROM inbound_deliveries WHERE idempotency_key = earlier.idempotency_key
+                 UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = earlier.idempotency_key
+                 UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = earlier.idempotency_key
+                 UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = earlier.idempotency_key
+                 UNION ALL SELECT 1 FROM delivery_tombstones WHERE idempotency_key = earlier.idempotency_key
+                 UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = earlier.idempotency_key
+                 LIMIT 1
+               )
+           )`,
+        [now + leaseMs, key, now, row.chat_id, row.thread_ts, row.message_id],
+      ).changes
+      if (changed !== 1) return null
+      const claimed = this.db.query<SlackThreadReplyIntentRow, [string]>(
+        'SELECT * FROM slack_thread_reply_intents WHERE idempotency_key = ?',
+      ).get(key)
+      if (!claimed) throw new Error(`claimed thread intent disappeared: ${key}`)
+      return mapSlackThreadReplyIntentRow(claimed)
+    })
+    return retrySqlite(() => claim.immediate())
+  }
+
+  completeSlackThreadReplyIntent(
+    idempotencyKey: string,
+    decision: 'addressed' | 'ignored',
+    decidedAt = Date.now(),
+  ): SlackThreadReplyIntentRecord {
+    const key = requireText(idempotencyKey, 'thread intent idempotencyKey')
+    if (!Number.isSafeInteger(decidedAt) || decidedAt <= 0) {
+      throw new Error('thread intent decidedAt is invalid')
+    }
+    const complete = this.db.transaction(() => {
+      const row = this.db.query<SlackThreadReplyIntentRow, [string]>(
+        'SELECT * FROM slack_thread_reply_intents WHERE idempotency_key = ?',
+      ).get(key)
+      if (!row) throw new Error(`thread intent was not staged: ${key}`)
+      if (row.status === 'addressed' || row.status === 'ignored') {
+        if (row.status !== decision) throw new Error(`thread intent decision changed: ${key}`)
+        return mapSlackThreadReplyIntentRow(row)
+      }
+      if (row.status !== 'processing') throw new Error(`thread intent is not claimed: ${key}`)
+      this.db.run(
+        `UPDATE slack_thread_reply_intents
+         SET status = ?, not_before = NULL, lease_expires_at = NULL,
+             last_error = NULL, decided_at = ?
+         WHERE idempotency_key = ? AND status = 'processing'`,
+        [decision, decidedAt, key],
+      )
+      if (decision === 'ignored') {
+        this.db.run(
+          `INSERT INTO delivery_tombstones (idempotency_key, write_enabled, completed_at)
+           VALUES (?, 0, ?)
+           ON CONFLICT(idempotency_key) DO UPDATE SET
+             completed_at = MAX(completed_at, excluded.completed_at)`,
+          [key, decidedAt],
+        )
+      }
+      const completed = this.db.query<SlackThreadReplyIntentRow, [string]>(
+        'SELECT * FROM slack_thread_reply_intents WHERE idempotency_key = ?',
+      ).get(key)
+      if (!completed) throw new Error(`completed thread intent disappeared: ${key}`)
+      return mapSlackThreadReplyIntentRow(completed)
+    })
+    return retrySqlite(() => complete.immediate())
+  }
+
+  retrySlackThreadReplyIntent(
+    idempotencyKey: string,
+    error: string,
+    notBefore: number,
+  ): boolean {
+    return this.deferSlackThreadReplyIntent(idempotencyKey, error, notBefore)
+  }
+
+  deferSlackThreadReplyIntent(
+    idempotencyKey: string,
+    error: string,
+    notBefore: number,
+  ): boolean {
+    const key = requireText(idempotencyKey, 'thread intent idempotencyKey')
+    if (!Number.isSafeInteger(notBefore) || notBefore <= Date.now()) {
+      throw new Error('thread intent retry time is invalid')
+    }
+    const message = error.replace(/[\r\n]+/g, ' ').slice(0, 512) || 'classifier failed'
+    return retrySqlite(() => this.db.run(
+      `UPDATE slack_thread_reply_intents
+       SET status = CASE WHEN status = 'processing' THEN 'pending' ELSE status END,
+           not_before = ?, lease_expires_at = NULL, last_error = ?
+       WHERE idempotency_key = ? AND status IN ('pending', 'processing', 'addressed')`,
+      [notBefore, message, key],
+    ).changes === 1)
   }
 
   recordDeliveryTombstone(idempotencyKey: string, completedAt = Date.now()): void {
@@ -9407,6 +9853,10 @@ export class JobStore {
         [tombstoneCutoff],
       ).changes + this.db.run(
         'DELETE FROM update_request_ledger WHERE created_at < ?',
+        [tombstoneCutoff],
+      ).changes + this.db.run(
+        `DELETE FROM slack_thread_reply_intents
+         WHERE decided_at IS NOT NULL AND decided_at < ?`,
         [tombstoneCutoff],
       ).changes
       const liveJobs = this.db.query<{ id: string; attachments_json: string }, []>(

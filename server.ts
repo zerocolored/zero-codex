@@ -17,7 +17,7 @@ import { join, extname } from 'path'
 import {
   decideChannelPolicy, isBotDMBlocked, threadPollCursor, planThreadPoll,
   planDirectMessageThreadPoll,
-  classifyThreadReply, canUseActiveThreadAuthority, resolveIsMention,
+  canUseActiveThreadAuthority, resolveIsMention,
   pruneDeliveredKeys, planCatchupSweep, msToSlackTs,
   effectiveDmAllowFrom, isExplicitUpdateRequest, catchupThreadParents,
   slackThreadKey, slackTsToMs,
@@ -50,6 +50,7 @@ import {
   type InboundDeliveryInput,
   type InboundDeliveryRecord,
   type LiveControlTarget,
+  type SlackThreadReplyIntentRecord,
 } from './zerokun/job-runner.ts'
 import { requireLegacyThreadRepoRoute } from './zerokun/routing.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './zerokun/state-dir.ts'
@@ -101,6 +102,16 @@ import {
   MAX_INITIAL_THREAD_CONTEXT_MESSAGES,
   SlackInitialThreadContextError,
 } from './zerokun/slack-thread-context.ts'
+import {
+  buildSlackThreadIntentSnapshot,
+  runSlackThreadIntentClassifier,
+  serializeSlackThreadIntentSnapshot,
+  slackThreadIntentInputDigest,
+  slackThreadIntentClassifierLeaseMs,
+  SLACK_THREAD_INTENT_PROMPT_VERSION,
+  type SlackThreadIntentDecision,
+  type SlackThreadIntentRunner,
+} from './zerokun/slack-thread-intent.ts'
 
 const STATE_DIR = resolveZeroStateDir()
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -122,6 +133,8 @@ const THREAD_POLL_INTERVAL_MS = 60_000
 const CATCHUP_SWEEP_INTERVAL_MS = 5 * 60_000
 const UPDATE_RECOVERY_INTERVAL_MS = 5 * 60_000
 const THREAD_ACTIVE_WINDOW_MS = 48 * 60 * 60 * 1000
+const THREAD_INTENT_REORDER_MS = 750
+const THREAD_INTENT_DRAIN_INTERVAL_MS = 5_000
 
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
@@ -363,9 +376,6 @@ function activeThreadAuthorityTarget(
     : null
   const authorized = canUseActiveThreadAuthority({
     isBot,
-    isDM,
-    text,
-    botUserId,
     hasLiveTarget: liveTarget !== null,
     hasInterruptTarget: interruptTarget !== null,
     isInterrupt: interrupt,
@@ -490,6 +500,9 @@ class SlackProjectUnavailableError extends Error {
 const DELIVERED_KEY_LIMIT = 1000
 const delivered = new Set<string>()
 const inFlight = new Map<string, Promise<boolean>>()
+type ThreadReplyAdmission = 'addressed' | 'ignored' | 'retry' | 'handled'
+const threadIntentInFlight = new Map<string, Promise<ThreadReplyAdmission>>()
+const threadIntentRunner: SlackThreadIntentRunner = runSlackThreadIntentClassifier
 
 function rememberDelivered(key: string): void {
   delivered.add(key)
@@ -497,6 +510,307 @@ function rememberDelivered(key: string): void {
     const kept = pruneDeliveredKeys(delivered, DELIVERED_KEY_LIMIT)
     delivered.clear()
     for (const k of kept) delivered.add(k)
+  }
+}
+
+function settledThreadReplyAdmission(
+  key: string,
+): ThreadReplyAdmission | null {
+  const intent = jobStore.getSlackThreadReplyIntent(key)
+  if (intent?.status === 'ignored') return 'ignored'
+  if (intent?.status === 'addressed') {
+    return jobStore.hasDurableEvent(key) ? 'handled' : 'addressed'
+  }
+  if (!intent && jobStore.hasDurableEvent(key)) return 'handled'
+  return null
+}
+
+async function readSlackThreadIntentContext(
+  channelId: string,
+  threadTs: string,
+  messageTs: string,
+  lane: SlackBudgetLane,
+): Promise<any[]> {
+  if (!slackApp) throw new Error('Slack runtime is unavailable')
+  const oldestMs = slackTsToMs(threadTs)
+  let cursor: string | undefined
+  const messages = new Map<string, any>()
+  for (let page = 0; page < 5; page += 1) {
+    takeSlackMethodBudget('replies', lane)
+    const response = await withSlackDeadline(
+      () => slackApp!.client.conversations.replies({
+        channel: channelId,
+        ts: threadTs,
+        oldest: msToSlackTs(oldestMs),
+        latest: messageTs,
+        inclusive: true,
+        limit: 200,
+        ...(cursor ? { cursor } : {}),
+      }),
+      slackHttpTimeoutMs(),
+      'Slack thread audience context',
+    )
+    for (const message of response.messages ?? []) {
+      if (message.ts && Number(message.ts) <= Number(messageTs)) {
+        messages.set(message.ts, message)
+      }
+    }
+    cursor = response.response_metadata?.next_cursor || undefined
+    if (!cursor) break
+  }
+  return [...messages.values()]
+}
+
+function stageEarlierSlackThreadIntentCandidates(input: {
+  channelId: string
+  threadTs: string
+  messageTs: string
+  messages: any[]
+}): void {
+  const ownedThread = jobStore.getThread(input.channelId, input.threadTs) !== null
+  const now = Date.now()
+  for (const message of input.messages) {
+    if (!message.ts || message.ts === input.threadTs
+      || Number(message.ts) >= Number(input.messageTs)
+      || (message.thread_ts ?? input.threadTs) !== input.threadTs
+      || isSlackBotAuthored(message)) continue
+    const userId = message.user as string | undefined
+    if (!userId || !SLACK_USER_ID_RE.test(userId)) continue
+    const text = typeof message.text === 'string' ? message.text : ''
+    if (!ownedThread && !mentionsBot(text, botUserId)) continue
+    const key = `${input.channelId}:${message.ts}`
+    if (jobStore.hasDurableEvent(key)) continue
+    jobStore.stageSlackThreadReplyCandidate({
+      chatId: input.channelId,
+      threadTs: input.threadTs,
+      messageId: message.ts,
+      userId,
+      promptVersion: SLACK_THREAD_INTENT_PROMPT_VERSION,
+      candidateText: text,
+      fileIds: (message.files ?? []).map((file: any) => file.id),
+      createdAt: Math.max(1, Math.min(now, slackTsToMs(message.ts))),
+      notBefore: now,
+    })
+  }
+}
+
+/**
+ * LLM admission for every human reply inside a channel thread. It runs before
+ * active authority, update detection, attachment downloads, queueing and Slack
+ * acknowledgement. A model/runtime failure remains an invisible durable retry.
+ */
+async function admitSlackChannelThreadReply(input: {
+  channelId: string
+  threadTs: string
+  messageTs: string
+  userId: string
+  text: string
+  fileIds?: string[]
+  budgetLane?: SlackBudgetLane
+}): Promise<ThreadReplyAdmission> {
+  if (input.channelId.startsWith('D') || input.threadTs === input.messageTs) {
+    return 'addressed'
+  }
+  const key = `${input.channelId}:${input.messageTs}`
+  let intent = jobStore.getSlackThreadReplyIntent(key)
+  if (!intent) {
+    const structurallyPickedUp = jobStore.getThread(input.channelId, input.threadTs) !== null
+      || mentionsBot(input.text, botUserId)
+    if (!structurallyPickedUp) return 'ignored'
+    const now = Date.now()
+    intent = jobStore.stageSlackThreadReplyCandidate({
+      chatId: input.channelId,
+      threadTs: input.threadTs,
+      messageId: input.messageTs,
+      userId: input.userId,
+      promptVersion: SLACK_THREAD_INTENT_PROMPT_VERSION,
+      candidateText: input.text,
+      fileIds: input.fileIds,
+      createdAt: now,
+      notBefore: now + THREAD_INTENT_REORDER_MS,
+    })
+  }
+  const settled = settledThreadReplyAdmission(key)
+  if (settled) return settled
+  const existing = threadIntentInFlight.get(key)
+  if (existing) return existing
+
+  const operation = (async (): Promise<ThreadReplyAdmission> => {
+    try {
+      let current = jobStore.getSlackThreadReplyIntent(key)
+      if (!current) throw new Error(`thread audience candidate disappeared: ${key}`)
+      if (!current.snapshotJson) {
+        const contextMessages = await readSlackThreadIntentContext(
+          input.channelId,
+          input.threadTs,
+          input.messageTs,
+          input.budgetLane ?? 'owned',
+        )
+        stageEarlierSlackThreadIntentCandidates({
+          channelId: input.channelId,
+          threadTs: input.threadTs,
+          messageTs: input.messageTs,
+          messages: contextMessages,
+        })
+        const snapshotJson = serializeSlackThreadIntentSnapshot(
+          buildSlackThreadIntentSnapshot({
+            messages: contextMessages,
+            candidate: {
+              ts: input.messageTs,
+              threadTs: input.threadTs,
+              userId: input.userId,
+              text: input.text,
+              files: input.fileIds?.map(id => ({ id })),
+            },
+            botUserId,
+          }),
+        )
+        current = jobStore.prepareSlackThreadReplyIntent(key, {
+          promptVersion: SLACK_THREAD_INTENT_PROMPT_VERSION,
+          snapshotJson,
+          inputDigest: slackThreadIntentInputDigest(snapshotJson),
+        })
+      }
+      if (current.status === 'ignored') return 'ignored'
+      if (current.status === 'addressed') {
+        return jobStore.hasDurableEvent(key) ? 'handled' : 'addressed'
+      }
+
+      const waitMs = Math.max(0, (current.notBefore ?? 0) - Date.now())
+      if (waitMs > 0) await new Promise<void>(resolve => setTimeout(resolve, waitMs))
+
+      const claimed = jobStore.claimSlackThreadReplyIntent(
+        key,
+        Date.now(),
+        slackThreadIntentClassifierLeaseMs(),
+      )
+      if (!claimed) return 'retry'
+      if (claimed.status === 'ignored') return 'ignored'
+      if (claimed.status === 'addressed') {
+        return jobStore.hasDurableEvent(key) ? 'handled' : 'addressed'
+      }
+      const decision: SlackThreadIntentDecision = await threadIntentRunner(
+        claimed.snapshotJson,
+      )
+      const completed = jobStore.completeSlackThreadReplyIntent(
+        key,
+        decision === 'addressed' ? 'addressed' : 'ignored',
+      )
+      if (completed.status === 'ignored') {
+        rememberDelivered(key)
+        return 'ignored'
+      }
+      return 'addressed'
+    } catch (error) {
+      const current = jobStore.getSlackThreadReplyIntent(key)
+      if (current && current.status !== 'ignored') {
+        const delay = Math.min(
+          15 * 60_000,
+          30_000 * (2 ** Math.min(5, Math.max(0, current.attempts - 1))),
+        )
+        jobStore.deferSlackThreadReplyIntent(
+          key,
+          error instanceof Error ? error.message : String(error),
+          Date.now() + delay,
+        )
+      }
+      process.stderr.write(
+        `slack channel: thread audience pending retry for ${key}: `
+        + `${error instanceof Error ? error.message : String(error)}\n`,
+      )
+      return 'retry'
+    }
+  })().finally(() => threadIntentInFlight.delete(key))
+  threadIntentInFlight.set(key, operation)
+  return operation
+}
+
+function settleAddressedThreadReplyWithoutDelivery(
+  channelId: string,
+  messageTs: string,
+): void {
+  const key = `${channelId}:${messageTs}`
+  if (jobStore.getSlackThreadReplyIntent(key)?.status !== 'addressed') return
+  jobStore.recordDeliveryTombstone(key)
+  rememberDelivered(key)
+}
+
+let threadIntentDrainInFlight = false
+
+async function replayDueSlackThreadReplyIntent(
+  intent: SlackThreadReplyIntentRecord,
+): Promise<void> {
+  const admission = await admitSlackChannelThreadReply({
+    channelId: intent.chatId,
+    threadTs: intent.threadTs,
+    messageTs: intent.messageId,
+    userId: intent.userId,
+    text: intent.candidateText,
+    fileIds: intent.fileIds,
+    budgetLane: 'owned',
+  })
+  if (admission !== 'addressed') return
+  const ownedThread = jobStore.getThread(intent.chatId, intent.threadTs) !== null
+  const threadAuthorityTarget = activeThreadAuthorityTarget(
+    intent.chatId, intent.threadTs, intent.candidateText, false, false,
+  )
+  const result = await gate(
+    intent.userId,
+    intent.chatId,
+    'channel',
+    mentionsBot(intent.candidateText, botUserId) || ownedThread,
+    false,
+    threadAuthorityTarget !== null,
+  )
+  if (result.action !== 'deliver') {
+    settleAddressedThreadReplyWithoutDelivery(intent.chatId, intent.messageId)
+    return
+  }
+  const accepted = await deliver(
+    intent.chatId,
+    intent.messageId,
+    intent.userId,
+    normalizeSlackInboundText(intent.candidateText, botUserId, false),
+    intent.threadTs,
+    intent.fileIds.length ? intent.fileIds : undefined,
+    threadAuthorityTarget ? { target: threadAuthorityTarget } : undefined,
+    mentionsBot(intent.candidateText, botUserId),
+  )
+  if (accepted) {
+    await acknowledgeSlackDelivery(intent.chatId, intent.messageId, result.access)
+    return
+  }
+  if (!jobStore.hasDurableEvent(intent.idempotencyKey)) {
+    jobStore.deferSlackThreadReplyIntent(
+      intent.idempotencyKey,
+      'addressed reply hand-off was not confirmed',
+      Date.now() + 30_000,
+    )
+  }
+}
+
+async function drainSlackThreadReplyIntents(): Promise<void> {
+  if (threadIntentDrainInFlight || !slackApp) return
+  threadIntentDrainInFlight = true
+  try {
+    const due = jobStore.listDueSlackThreadReplyIntents(Date.now(), 16)
+    await Promise.allSettled(due.map(async (intent) => {
+      try {
+        await replayDueSlackThreadReplyIntent(intent)
+      } catch (error) {
+        jobStore.deferSlackThreadReplyIntent(
+          intent.idempotencyKey,
+          error instanceof Error ? error.message : String(error),
+          Date.now() + 30_000,
+        )
+        process.stderr.write(
+          `slack channel: durable thread audience retry failed for ${intent.idempotencyKey}: `
+          + `${error instanceof Error ? error.message : String(error)}\n`,
+        )
+      }
+    }))
+  } finally {
+    threadIntentDrainInFlight = false
   }
 }
 
@@ -1138,10 +1452,22 @@ slackApp.event('app_mention', async ({ event }) => {
   const ev = event as any
   const isBot = isSlackBotAuthored(ev)
   const senderId: string | undefined = isBot ? ev.bot_id : ev.user
-  if (!senderId) return
+  if (!senderId || isBot || !SLACK_USER_ID_RE.test(senderId)) return
   const channelId = event.channel
   const threadTs = event.thread_ts || event.ts
   const text = stripSlackUserMention(event.text, botUserId).trim()
+  const fileIds = ((event as any).files ?? []).map((f: any) => f.id)
+  if (event.thread_ts) {
+    const admission = await admitSlackChannelThreadReply({
+      channelId,
+      threadTs: event.thread_ts,
+      messageTs: event.ts,
+      userId: senderId,
+      text: event.text ?? '',
+      fileIds,
+    })
+    if (admission !== 'addressed') return
+  }
   const threadAuthorityTarget = activeThreadAuthorityTarget(
     channelId, event.thread_ts, event.text, false, isBot,
   )
@@ -1149,10 +1475,15 @@ slackApp.event('app_mention', async ({ event }) => {
   const result = await gate(
     senderId, channelId, 'channel', true, isBot, threadAuthorityTarget !== null,
   )
-  if (result.action === 'drop') return
-  if (result.action === 'pair') return
+  if (result.action === 'drop') {
+    settleAddressedThreadReplyWithoutDelivery(channelId, event.ts)
+    return
+  }
+  if (result.action === 'pair') {
+    settleAddressedThreadReplyWithoutDelivery(channelId, event.ts)
+    return
+  }
 
-  const fileIds = ((event as any).files ?? []).map((f: any) => f.id)
   const handedOver = await deliver(
     channelId, event.ts, senderId, text, threadTs,
     fileIds.length > 0 ? fileIds : undefined,
@@ -1196,7 +1527,7 @@ slackApp.event('message', async ({ event }) => {
   // For bots, identify by bot_id (B-prefix) since msg.user may be unset on
   // classic incoming-webhook posts. The gate rejects every bot sender.
   const senderId = isBot ? (msg.bot_id as string) : (msg.user as string)
-  if (!senderId) return
+  if (!senderId || isBot || !SLACK_USER_ID_RE.test(senderId)) return
   const channelId = msg.channel as string
   const channelType = msg.channel_type as string
   const threadTs = msg.thread_ts
@@ -1211,9 +1542,18 @@ slackApp.event('message', async ({ event }) => {
   // catch-up poller; exact cancellation in particular cannot survive that lag.
   const ownedThread = typeof threadTs === 'string'
     && jobStore.getThread(channelId, threadTs) !== null
-  if (ownedThread && !isDM
-    && (loadAccess().channels[channelId]?.requireMention ?? true)
-    && classifyThreadReply(text, botUserId) === 'others') return
+  const fileIds = (msg.files ?? []).map((f: any) => f.id)
+  if (!isDM && typeof threadTs === 'string') {
+    const admission = await admitSlackChannelThreadReply({
+      channelId,
+      threadTs,
+      messageTs: msg.ts,
+      userId: senderId,
+      text,
+      fileIds,
+    })
+    if (admission !== 'addressed') return
+  }
   const isMention = resolveIsMention(isDM, text, botUserId) || ownedThread
   const threadAuthorityTarget = activeThreadAuthorityTarget(
     channelId, typeof threadTs === 'string' ? threadTs : undefined, text, isDM, isBot,
@@ -1228,7 +1568,10 @@ slackApp.event('message', async ({ event }) => {
     threadAuthorityTarget !== null,
   )
 
-  if (result.action === 'drop') return
+  if (result.action === 'drop') {
+    settleAddressedThreadReplyWithoutDelivery(channelId, msg.ts)
+    return
+  }
 
   if (result.action === 'pair') {
     const lead = result.isResend
@@ -1239,13 +1582,13 @@ slackApp.event('message', async ({ event }) => {
         channel: channelId,
         text: `${lead}。ターミナルで次を実行してください。\n\n\`zerochan-access pair ${result.code}\``,
       })
+      settleAddressedThreadReplyWithoutDelivery(channelId, msg.ts)
     } catch (err) {
       process.stderr.write(`slack channel: failed to send pairing code: ${err}\n`)
     }
     return
   }
 
-  const fileIds = (msg.files ?? []).map((f: any) => f.id)
   const handedOver = await deliver(
     channelId,
     msg.ts,
@@ -1667,14 +2010,29 @@ async function processPendingReplyScanPages(
       const resolvedThreadTs = message.thread_ts || scan.threadTs
       const ownedThread = !isDM
         && jobStore.getThread(scan.channelId, resolvedThreadTs) !== null
-      if (ownedThread
-        && (access.channels[scan.channelId]?.requireMention ?? true)
-        && classifyThreadReply(text, botUserId) === 'others') {
+      if (isBot || !SLACK_USER_ID_RE.test(senderId)) {
         outstanding.delete(message.ts)
         if (candidateTimestamps.has(message.ts)) {
           requiredEventKeys.delete(`${scan.channelId}:${message.ts}`)
         }
         continue
+      }
+      const fileIds = (message.files ?? []).map((file: any) => file.id)
+      if (!isDM && resolvedThreadTs !== message.ts) {
+        const admission = await admitSlackChannelThreadReply({
+          channelId: scan.channelId,
+          threadTs: resolvedThreadTs,
+          messageTs: message.ts,
+          userId: senderId,
+          text,
+          fileIds,
+          budgetLane: 'catchup',
+        })
+        if (admission === 'retry') continue
+        if (admission === 'ignored' || admission === 'handled') {
+          outstanding.delete(message.ts)
+          continue
+        }
       }
       const threadAuthorityTarget = activeThreadAuthorityTarget(
         scan.channelId, resolvedThreadTs, text, isDM, isBot,
@@ -1688,6 +2046,7 @@ async function processPendingReplyScanPages(
         threadAuthorityTarget !== null,
       )
       if (result.action === 'drop') {
+        settleAddressedThreadReplyWithoutDelivery(scan.channelId, message.ts)
         outstanding.delete(message.ts)
         if (candidateTimestamps.has(message.ts)) {
           requiredEventKeys.delete(`${scan.channelId}:${message.ts}`)
@@ -1703,6 +2062,7 @@ async function processPendingReplyScanPages(
             channel: scan.channelId,
             text: `${lead}。ターミナルで次を実行してください。\n\n\`zerochan-access pair ${result.code}\``,
           })
+          settleAddressedThreadReplyWithoutDelivery(scan.channelId, message.ts)
           outstanding.delete(message.ts)
           if (candidateTimestamps.has(message.ts)) {
             requiredEventKeys.delete(`${scan.channelId}:${message.ts}`)
@@ -1712,7 +2072,6 @@ async function processPendingReplyScanPages(
         }
         continue
       }
-      const fileIds = (message.files ?? []).map((file: any) => file.id)
       const handedOver = await deliver(
         scan.channelId,
         message.ts,
@@ -1880,9 +2239,7 @@ async function catchupSweep(): Promise<void> {
       const resolvedThreadTs = message.thread_ts || message.ts
       const ownedThread = !isDM
         && jobStore.getThread(channelId, resolvedThreadTs) !== null
-      if (ownedThread
-        && (access.channels[channelId]?.requireMention ?? true)
-        && classifyThreadReply(text, botUserId) === 'others') {
+      if (isBot || !SLACK_USER_ID_RE.test(senderId)) {
         outstandingScanReplies.delete(message.ts)
         outstandingRecentMessages.delete(message.ts)
         if (scanCandidateTimestamps.has(message.ts)) {
@@ -1892,6 +2249,24 @@ async function catchupSweep(): Promise<void> {
           requiredRecentEventKeys.delete(`${channelId}:${message.ts}`)
         }
         continue
+      }
+      const fileIds = (message.files ?? []).map(file => file.id)
+      if (!isDM && resolvedThreadTs !== message.ts) {
+        const admission = await admitSlackChannelThreadReply({
+          channelId,
+          threadTs: resolvedThreadTs,
+          messageTs: message.ts,
+          userId: senderId,
+          text,
+          fileIds,
+          budgetLane: 'catchup',
+        })
+        if (admission === 'retry') continue
+        if (admission === 'ignored' || admission === 'handled') {
+          outstandingScanReplies.delete(message.ts)
+          outstandingRecentMessages.delete(message.ts)
+          continue
+        }
       }
       const threadAuthorityTarget = activeThreadAuthorityTarget(
         channelId, message.thread_ts, text, isDM, isBot,
@@ -1905,6 +2280,7 @@ async function catchupSweep(): Promise<void> {
         threadAuthorityTarget !== null,
       )
       if (result.action === 'drop') {
+        settleAddressedThreadReplyWithoutDelivery(channelId, message.ts)
         outstandingScanReplies.delete(message.ts)
         outstandingRecentMessages.delete(message.ts)
         if (scanCandidateTimestamps.has(message.ts)) {
@@ -1924,6 +2300,7 @@ async function catchupSweep(): Promise<void> {
             channel: channelId,
             text: `${lead}。ターミナルで次を実行してください。\n\n\`zerochan-access pair ${result.code}\``,
           })
+          settleAddressedThreadReplyWithoutDelivery(channelId, message.ts)
           outstandingScanReplies.delete(message.ts)
           outstandingRecentMessages.delete(message.ts)
           if (scanCandidateTimestamps.has(message.ts)) {
@@ -1938,7 +2315,6 @@ async function catchupSweep(): Promise<void> {
         continue
       }
 
-      const fileIds = (message.files ?? []).map(file => file.id)
       const handedOver = await deliver(
         channelId,
         message.ts,
@@ -2161,30 +2537,7 @@ async function pollThreads(): Promise<void> {
         )
         : planThreadPoll(replies, cursorTs, access.channels[channelId], botUserId)
 
-      const policyExists = channelId.startsWith('D')
-        ? access.dmPolicy !== 'disabled'
-        : true
-      const promotedAuthorities = new Map<string, LiveControlTarget>()
-      const promoted = planned.skipped.filter(({ reply, reason }) => {
-        if (reason !== 'policy' || !policyExists || !reply.ts) return false
-        const target = activeThreadAuthorityTarget(
-          channelId,
-          threadTs,
-          reply.text ?? '',
-          channelId.startsWith('D'),
-          Boolean(reply.bot_id),
-        )
-        if (!target) return false
-        promotedAuthorities.set(reply.ts, target)
-        return true
-      }).map(({ reply }) => reply)
-      const promotedTs = new Set(promoted.map(reply => reply.ts))
-      const plan = {
-        ...planned,
-        deliver: [...planned.deliver, ...promoted]
-          .sort((left, right) => parseFloat(left.ts!) - parseFloat(right.ts!)),
-        skipped: planned.skipped.filter(({ reply }) => !promotedTs.has(reply.ts)),
-      }
+      const plan = planned
 
       for (const { reply, reason } of plan.skipped) {
         process.stderr.write(
@@ -2193,8 +2546,20 @@ async function pollThreads(): Promise<void> {
       }
       const handedOver = await confirmedWithin(plan.deliver.map(async (r) => {
         const fileIds = (r.files ?? []).map((f: any) => f.id)
-        const promotedTarget = promotedAuthorities.get(r.ts!)
-        const ordinaryTarget = promotedTarget ?? activeThreadAuthorityTarget(
+        if (!channelId.startsWith('D')) {
+          const admission = await admitSlackChannelThreadReply({
+            channelId,
+            threadTs,
+            messageTs: r.ts!,
+            userId: r.user!,
+            text: r.text ?? '',
+            fileIds,
+            budgetLane: 'owned',
+          })
+          if (admission === 'retry') return false
+          if (admission === 'ignored' || admission === 'handled') return true
+        }
+        const ordinaryTarget = activeThreadAuthorityTarget(
           channelId,
           threadTs,
           r.text ?? '',
@@ -2208,9 +2573,7 @@ async function pollThreads(): Promise<void> {
           normalizeSlackInboundText(r.text ?? '', botUserId, channelId.startsWith('D')),
           threadTs,
           fileIds.length ? fileIds : undefined,
-          ordinaryTarget
-            ? { target: ordinaryTarget }
-            : undefined,
+          ordinaryTarget ? { target: ordinaryTarget } : undefined,
         )
         if (accepted) await acknowledgeSlackDelivery(channelId, r.ts!, access)
         return accepted
@@ -2288,6 +2651,7 @@ try {
 
   // Sweep once on startup for new mentions/DMs, and recover replies in owned threads.
   scheduleInboundDrain()
+  void drainSlackThreadReplyIntents()
   void scheduleCatchupSweep()
   recoverUpdateNotificationWorker()
   // then keep a light timer for near-real-time follow-ups in owned threads.
@@ -2296,6 +2660,7 @@ try {
   setInterval(() => { void scheduleCatchupSweep() }, CATCHUP_SWEEP_INTERVAL_MS).unref()
   setInterval(recoverUpdateNotificationWorker, UPDATE_RECOVERY_INTERVAL_MS).unref()
   setInterval(() => scheduleInboundDrain(), 5_000).unref()
+  setInterval(() => { void drainSlackThreadReplyIntents() }, THREAD_INTENT_DRAIN_INTERVAL_MS).unref()
   setInterval(stopOrphanedUpdateCandidate, 5_000).unref()
 } catch (err) {
   process.stderr.write(`slack channel: failed to start: ${err}\n`)

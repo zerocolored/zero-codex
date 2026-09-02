@@ -124,7 +124,7 @@ describe('buildInitialSlackThreadContext', () => {
     })).toThrow(`${MAX_INITIAL_THREAD_CONTEXT_BYTES} bytes`)
   })
 
-  test('SQLite到着順でなく最初のhuman mentionを採用点にする', () => {
+  test('LLM承認済みの観測triggerをcanonicalにし、それ以前を文脈としてだけ保持する', () => {
     const firstMention = '1788000001.000001'
     const plan = planInitialSlackThreadContext({
       chatId: CHANNEL,
@@ -144,22 +144,14 @@ describe('buildInitialSlackThreadContext', () => {
     })
     expect(plan.kind).toBe('context')
     if (plan.kind !== 'context') throw new Error('context plan expected')
-    expect(plan.context.trigger.messageId).toBe(firstMention)
+    expect(plan.context.trigger.messageId).toBe(TRIGGER)
     expect(plan.context.text).toContain('先に確認して')
-    expect(plan.context.text).not.toContain('後から確認して')
-    expect(plan.followups).toEqual([
-      {
-        messageId: '1788000002.000001', userId: 'U0CAROL',
-        text: '補足です', fileIds: ['F002'],
-      },
-      {
-        messageId: TRIGGER, userId: 'U0DAVE',
-        text: '後から確認して', fileIds: [],
-      },
-    ])
+    expect(plan.context.text).toContain('後から確認して')
+    expect(plan.context.text).toContain('補足です')
+    expect(plan.followups).toEqual([])
   })
 
-  test('先頭がmention済みなら独立依頼としてthread_broadcast返信も復元する', () => {
+  test('先頭がmention済みでも後続を直接replayせず観測triggerの文脈へまとめる', () => {
     const plan = planInitialSlackThreadContext({
       chatId: CHANNEL,
       threadTs: ROOT,
@@ -175,19 +167,15 @@ describe('buildInitialSlackThreadContext', () => {
         { ts: TRIGGER, thread_ts: ROOT, user: 'U0CAROL', text: `<@${BOT}> 再確認` },
       ],
     })
-    expect(plan).toEqual({
-      kind: 'root-already-addressed',
-      root: {
-        messageId: ROOT, userId: 'U0ALICE', text: '先頭の依頼', fileIds: ['F001'],
-      },
-      followups: [
-        {
-          messageId: '1788000002.000001', userId: 'U0BOB',
-          text: '途中の補足', fileIds: ['F002'],
-        },
-        { messageId: TRIGGER, userId: 'U0CAROL', text: '再確認', fileIds: [] },
-      ],
+    expect(plan.kind).toBe('context')
+    if (plan.kind !== 'context') throw new Error('context plan expected')
+    expect(plan.context.trigger).toEqual({
+      messageId: TRIGGER, userId: 'U0CAROL', text: '再確認', fileIds: [],
     })
+    expect(plan.context.fileIds).toEqual(['F001', 'F002'])
+    expect(plan.context.text).toContain('先頭の依頼')
+    expect(plan.context.text).toContain('途中の補足')
+    expect(plan.followups).toEqual([])
   })
 
   test('bot/system rootは文脈から除外しhumanのmention自体は失敗させない', () => {

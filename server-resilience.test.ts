@@ -3,6 +3,11 @@ import { readFileSync } from 'fs'
 import { join } from 'path'
 
 const server = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+const gateSource = readFileSync(join(import.meta.dir, 'gate.ts'), 'utf8')
+const threadIntentSource = readFileSync(
+  join(import.meta.dir, 'zerokun', 'slack-thread-intent.ts'),
+  'utf8',
+)
 
 describe('Slack bridge resilience wiring', () => {
   test('Bot tokenとApp tokenのApp ID一致をSocket接続前に検証する', () => {
@@ -138,12 +143,16 @@ describe('Slack bridge resilience wiring', () => {
   })
 
   test('update journal中のcandidate gatewayは受信DBとdedupへeventを確定しない', () => {
+    const deliver = server.slice(
+      server.indexOf('function deliver('),
+      server.indexOf('// Handle @mentions'),
+    )
     expect(server).toContain("const UPDATE_JOURNAL_FILE = join(STATE_DIR, 'update-transaction.json')")
     expect(server).toContain('if (updateTransactionPending(UPDATE_JOURNAL_FILE)) return Promise.resolve(false)')
     expect(server.match(/if \(updateTransactionPending\(UPDATE_JOURNAL_FILE\)\) return/g)?.length)
       .toBeGreaterThanOrEqual(3)
-    expect(server.indexOf('if (updateTransactionPending(UPDATE_JOURNAL_FILE)) return Promise.resolve(false)'))
-      .toBeLessThan(server.indexOf('rememberDelivered(key)'))
+    expect(deliver.indexOf('if (updateTransactionPending(UPDATE_JOURNAL_FILE)) return Promise.resolve(false)'))
+      .toBeLessThan(deliver.indexOf('rememberDelivered(key)'))
   })
 
   test('updater crash後はjournalをwrite barrierにしcandidate gatewayも終了する', () => {
@@ -195,7 +204,7 @@ describe('Slack bridge resilience wiring', () => {
     }
   })
 
-  test('active threadだけは別humanの受信gateを越え、bot・他者宛て・別threadは越えない', () => {
+  test('LLMで宛先確定したactive threadだけが別humanの受信gateを越える', () => {
     expect(server).toContain('function activeThreadAuthorityTarget(')
     expect(server).toContain('const liveTarget = jobStore.liveControlTarget(channelId, threadTs)')
     expect(server).toContain('jobStore.interruptControlTarget(channelId, threadTs)')
@@ -206,10 +215,57 @@ describe('Slack bridge resilience wiring', () => {
       server.indexOf("slackApp.event('message'"),
       server.indexOf("slackApp.event('member_joined_channel'"),
     )
+    expect(message.indexOf('const admission = await admitSlackChannelThreadReply({'))
+      .toBeLessThan(message.indexOf('const threadAuthorityTarget = activeThreadAuthorityTarget('))
     expect(message.indexOf('const threadAuthorityTarget = activeThreadAuthorityTarget('))
       .toBeLessThan(message.indexOf('const result = await gate('))
     expect(message).toContain('threadAuthorityTarget !== null')
     expect(message).toContain('? { target: threadAuthorityTarget }')
+  })
+
+  test('無関係判定は全入口でreaction・queue・controlより前に完全終了する', () => {
+    expect(server).not.toContain('classifyThreadReply')
+    expect(gateSource).not.toContain('classifyThreadReply')
+    const admission = server.slice(
+      server.indexOf('async function admitSlackChannelThreadReply('),
+      server.indexOf('function resolveRepoPath('),
+    )
+    expect(admission).not.toContain('reactions.add')
+    expect(admission).not.toContain('chat.postMessage')
+    expect(admission).not.toContain('stageInboundDeliveryForControl')
+    expect(admission).not.toContain('stageInboundDeliveryAndAdoptSlackThread')
+    expect(admission).not.toContain('enqueueUpdate(')
+
+    const mention = server.slice(
+      server.indexOf("slackApp.event('app_mention'"),
+      server.indexOf("slackApp.event('message'"),
+    )
+    const message = server.slice(
+      server.indexOf("slackApp.event('message'"),
+      server.indexOf("slackApp.event('member_joined_channel'"),
+    )
+    for (const handler of [mention, message]) {
+      const llm = handler.indexOf('await admitSlackChannelThreadReply({')
+      const stop = handler.indexOf("if (admission !== 'addressed') return", llm)
+      expect(llm).toBeGreaterThan(-1)
+      expect(stop).toBeGreaterThan(llm)
+      expect(stop).toBeLessThan(handler.indexOf('activeThreadAuthorityTarget(', stop))
+      expect(stop).toBeLessThan(handler.indexOf('const handedOver = await deliver(', stop))
+      expect(stop).toBeLessThan(handler.indexOf('await acknowledgeSlackDelivery(', stop))
+    }
+
+    const recovery = server.slice(
+      server.indexOf('async function processPendingReplyScanPages('),
+      server.indexOf('async function catchupSweep()'),
+    )
+    expect(recovery).toContain('await admitSlackChannelThreadReply({')
+    expect(recovery).toContain("admission === 'ignored' || admission === 'handled'")
+    const poll = server.slice(
+      server.indexOf('async function pollThreads()'),
+      server.indexOf("process.on('SIGTERM'"),
+    )
+    expect(poll).toContain('await admitSlackChannelThreadReply({')
+    expect(poll).toContain("admission === 'ignored' || admission === 'handled'")
   })
 
   test('catch-upも表示名に依存しないpairing文とdurable handoff後のeyes経路を使う', () => {
@@ -223,24 +279,79 @@ describe('Slack bridge resilience wiring', () => {
     expect(catchup).not.toContain('Still pending')
     expect(catchup).not.toContain('Pairing required')
     expect(catchup).toContain('activeThreadAuthorityTarget(')
+    expect(catchup).toContain('await admitSlackChannelThreadReply({')
     expect(catchup).toContain('? { target: threadAuthorityTarget }')
     expect(catchup).toContain('await acknowledgeSlackDelivery(')
     expect(server).toContain("const reaction = access.ackReaction ?? 'eyes'")
   })
 
-  test('owned threadのlive返信はmention待ちをせず、他者宛てだけpoller同様に除外する', () => {
+  test('owned threadのlive返信は正規表現でなくdurable LLM gateを先に通す', () => {
     const message = server.slice(
       server.indexOf("slackApp.event('message'"),
       server.indexOf("slackApp.event('member_joined_channel'"),
     )
     const owned = message.indexOf("const ownedThread = typeof threadTs === 'string'")
-    const audience = message.indexOf("classifyThreadReply(text, botUserId) === 'others'", owned)
+    const audience = message.indexOf('const admission = await admitSlackChannelThreadReply({', owned)
     const addressed = message.indexOf('|| ownedThread', audience)
     const gate = message.indexOf('const result = await gate(', addressed)
     expect(owned).toBeGreaterThan(-1)
     expect(audience).toBeGreaterThan(owned)
     expect(addressed).toBeGreaterThan(audience)
     expect(gate).toBeGreaterThan(addressed)
+    expect(message).not.toContain('classifyThreadReply(')
+    const contextReader = server.slice(
+      server.indexOf('async function readSlackThreadIntentContext('),
+      server.indexOf('/**\n * LLM admission'),
+    )
+    expect(contextReader).toContain("takeSlackMethodBudget('replies', lane)")
+    expect(contextReader).toContain('const oldestMs = slackTsToMs(threadTs)')
+  })
+
+  test('候補を文脈取得より先に保存し、部分pageをsnapshotへ固定しない', () => {
+    const admission = server.slice(
+      server.indexOf('async function admitSlackChannelThreadReply('),
+      server.indexOf('function settleAddressedThreadReplyWithoutDelivery('),
+    )
+    expect(admission.indexOf('jobStore.stageSlackThreadReplyCandidate({'))
+      .toBeLessThan(admission.indexOf('await readSlackThreadIntentContext('))
+    expect(admission).toContain('jobStore.prepareSlackThreadReplyIntent(key, {')
+    expect(admission).not.toContain('contextMessages?:')
+    expect(server).not.toContain('contextMessages: response.messages')
+    expect(server).not.toContain('contextMessages: catchup.messages')
+    expect(server).not.toContain('contextMessages: replies')
+  })
+
+  test('未所有・mentionなしの雑談はLLMへ送らず、picked-up返信だけを意味判定する', () => {
+    const admission = server.slice(
+      server.indexOf('async function admitSlackChannelThreadReply('),
+      server.indexOf('function settleAddressedThreadReplyWithoutDelivery('),
+    )
+    const structural = admission.indexOf('const structurallyPickedUp =')
+    const stage = admission.indexOf('jobStore.stageSlackThreadReplyCandidate({')
+    expect(structural).toBeGreaterThan(-1)
+    expect(structural).toBeLessThan(stage)
+    expect(admission).toContain('jobStore.getThread(input.channelId, input.threadTs) !== null')
+    expect(admission).toContain('mentionsBot(input.text, botUserId)')
+    expect(admission).toContain("if (!structurallyPickedUp) return 'ignored'")
+  })
+
+  test('classifier障害はraw入力から自動drainし、dropもdurable完了にする', () => {
+    expect(server).toContain('async function drainSlackThreadReplyIntents()')
+    expect(server).toContain('jobStore.listDueSlackThreadReplyIntents(Date.now(), 16)')
+    expect(server).toContain('await replayDueSlackThreadReplyIntent(intent)')
+    expect(server).toContain('setInterval(() => { void drainSlackThreadReplyIntents() }')
+    expect(server).toContain('settleAddressedThreadReplyWithoutDelivery(')
+    expect(server).toContain('jobStore.recordDeliveryTombstone(key)')
+    expect(server).toContain('candidateText: input.text')
+    expect(server).toContain('fileIds: input.fileIds')
+  })
+
+  test('分類用Codexは読取toolを無効化し、Slack本文をJSON string dataとして渡す', () => {
+    for (const feature of ['shell_tool', 'unified_exec', 'js_repl', 'view_image']) {
+      expect(threadIntentSource).toContain(`'--disable', '${feature}'`)
+    }
+    expect(threadIntentSource).toContain('JSON.stringify(snapshotJson)')
+    expect(threadIntentSource).not.toContain("'<untrusted_slack_thread_json>'")
   })
 
   test('owned threadのpoll回収もbot mention除去後に中止判定へ渡す', () => {
@@ -265,7 +376,8 @@ describe('Slack bridge resilience wiring', () => {
 
   test('参加channelを自動記録し、channel routeへ最初のthreadを原子的に固定する', () => {
     expect(server).toContain('rememberChannel(channelId, ACCESS_FILE)')
-    expect(server).toContain('(loadAccess().channels[channelId]?.requireMention ?? true)')
+    expect(server).toContain('const admission = await admitSlackChannelThreadReply({')
+    expect(server).toContain("if (admission !== 'addressed') return")
     expect(server).toContain('このチャンネルで私を利用できます。')
     expect(server).toContain('新しい依頼は私をメンションしてください。')
     expect(server).not.toContain('@Zeroちゃん')

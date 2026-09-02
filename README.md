@@ -29,7 +29,12 @@ Slack bot
   更新するためのlocal上限です。会話そのものは別のsanitized論理履歴としてSQLiteへjob単位で保存し、
   失敗・完了・daemon再起動・write mode変更・物理thread更新・30日job GCの後も、同じchannel・Slack
   thread・repositoryの次のfresh Codex threadへ引き継ぎます。native resume時は同じ内容を二重注入しません。
-  senderは履歴scopeに含めないため、同じthread内なら別userの返信も同じ会話として扱います。
+  senderは履歴scopeに含めないため、同じthread内なら別userからZeroちゃん宛てに届いた返信も同じ会話として扱います。
+- 採用済みSlackスレッドの人間による返信は、受付・リアクション・割り込み・キュー投入より前に、
+  直前のスレッド文脈を含む専用LLMで宛先を判定します。Zeroちゃん宛てと判断できた返信だけを既存フローへ渡し、
+  メンバー同士の会話は投稿もリアクションもせず完全に無視します。宛先は正規表現では決めません。
+  分類器のcapacity・timeout・不正出力時も誤受付せず、本文・添付ID・同じsnapshotをSQLiteへ残し、
+  Slackの再送がなくても常駐workerがbackoff後に再判定して既存フローを再開します。
 - 論理履歴の永続archive自体をscopeごとの直近64 jobに圧縮し、省略件数だけを台帳へ残します。
   各実行snapshotも直近64 job blockかつ128 Ki文字／256 KiBまでです。現在の依頼とhost権限が常に優先され、
   過去の回答は参考情報として再確認されます。credential、local path、内部ID、成果物pathは保存前に除去し、
@@ -264,7 +269,8 @@ zerochan start
 
 複数channelを同じprojectへ紐付ける場合は、channel IDを変えて`zerochan set slack-channel`を繰り返します。
 Appを各channelへ招待したうえで、新しい依頼はそのAppをメンションします。同じthreadの続きは
-再メンション不要です。メンションなしで始まったthreadでも、途中の返信でAppをメンションすると、
+再メンション不要ですが、各返信は文脈込みのLLM判定でApp宛てと確認された場合だけ処理されます。
+メンションなしで始まったthreadでも、途中の返信でAppをメンションすると、
 先頭コメントからその返信までのhuman投稿と添付を時系列の1タスクとして受け付けます。
 別の参加者がメンションしても利用できます。DMは最初に表示されるcodeを
 `zerochan-access pair <code>`で承認し、

@@ -83,23 +83,17 @@ export function decideChannelPolicy(
 }
 
 /**
- * A currently active Zero thread is a delegated conversation boundary: any
- * human participant may steer it, while bots, replies aimed at somebody else,
+ * After the LLM has confirmed that a reply is for Zero, an active thread is a
+ * delegated conversation boundary: any human participant may steer it. Bots,
  * completed threads and unrelated roots retain the ordinary access gate.
  */
 export function canUseActiveThreadAuthority(options: {
   isBot: boolean
-  isDM: boolean
-  text: string
-  botUserId: string | undefined
   hasLiveTarget: boolean
   hasInterruptTarget: boolean
   isInterrupt: boolean
 }): boolean {
   if (options.isBot) return false
-  if (!options.isDM && classifyThreadReply(options.text, options.botUserId) === 'others') {
-    return false
-  }
   return options.hasLiveTarget || (options.isInterrupt && options.hasInterruptTarget)
 }
 
@@ -348,28 +342,11 @@ export function refreshSlackDirectMessageAvailability(
   }
 }
 
-// Slack renders an addressed mention as a token, never as plain text:
-// `<@U…>` / `<@U…|label>` for a user, `<!here>` / `<!channel>` / `<!everyone>`
-// / `<!subteam^S…>` for a broadcast. Matching the bot's *display name* instead
-// would misfire — the reply that first exposed this rule read
-// "ゼロくんが作ってくれたCSV…" while being addressed at two humans.
+// Slack renders an explicit bot mention as a token. This helper only detects
+// that structural fact for top-level channel routing and initial-context
+// bookkeeping; semantic thread audience is decided exclusively by the LLM
+// admission gate in server.ts.
 const USER_MENTION_RE = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g
-// Same pattern without /g: `test` on a global regex carries lastIndex between
-// calls, which would make the answer depend on what was asked before it.
-const ANY_USER_MENTION_RE = /<@[UW][A-Z0-9]+(?:\|[^>]*)?>/
-const BROADCAST_RE = /<!(?:here|channel|everyone)(?:\|[^>]*)?>|<!subteam\^[A-Z0-9]+(?:\|[^>]*)?>/
-
-// A mention inside a quote or a code span is a citation, not an address:
-// "> <@alice> の案 / いいね、マージして" is still an instruction to us. Slack
-// escapes a typed '>' to '&gt;' in the raw text, so both spellings count.
-// An unclosed fence runs to the end, which is how Slack renders it too —
-// without that alternative the tail reads as ordinary prose and a mention
-// inside it would look like an address.
-const QUOTED_SPAN_RE = /```[\s\S]*?```|```[\s\S]*$|`[^`\n]*`|^[ \t]*(?:&gt;|>)+.*$/gm
-
-function withoutQuotedSpans(text: string): string {
-  return text.replace(QUOTED_SPAN_RE, ' ')
-}
 
 /** Whether `text` carries an explicit `<@bot>` mention token. */
 export function mentionsBot(text: string, botUserId: string | undefined): boolean {
@@ -378,35 +355,6 @@ export function mentionsBot(text: string, botUserId: string | undefined): boolea
     if (m[1] === botUserId) return true
   }
   return false
-}
-
-/**
- * Who a thread reply is talking to:
- *
- *   - 'bot'    — mentions the bot (possibly alongside humans). Always for us.
- *   - 'others' — mentions somebody else, or broadcasts, without naming the bot.
- *                Humans @ing each other in a thread the bot happens to own; the
- *                bot chiming in is pure noise.
- *   - 'none'   — no mention at all. In an owned thread the thread itself is the
- *                addressing ("いいね、マージして"), so this stays ours.
- */
-export type ThreadReplyAudience = 'bot' | 'others' | 'none'
-
-export function classifyThreadReply(
-  text: string,
-  botUserId: string | undefined,
-): ThreadReplyAudience {
-  // Quoted text is set aside first, so citing a colleague before instructing us
-  // stays ours rather than being mistaken for mail addressed to them.
-  const addressed = withoutQuotedSpans(text)
-  if (mentionsBot(addressed, botUserId)) return 'bot'
-  if (ANY_USER_MENTION_RE.test(addressed)) return 'others'
-  if (BROADCAST_RE.test(addressed)) return 'others'
-  // Nobody was addressed in the open. A mention of us that only survives in a
-  // quote or code span still counts here — quoting back an old request to us,
-  // or a stray backtick shifting every span, must not silently eat a message
-  // — but it never outranks somebody else being addressed plainly above.
-  return mentionsBot(text, botUserId) ? 'bot' : 'none'
 }
 
 /** Live channel path: a DM is self-addressed, a channel post must name us. */
@@ -502,29 +450,25 @@ export function planCatchupSweep(
 }
 
 /**
- * The poller's per-reply verdict, split out so the wiring — not just the
- * classifier — is covered by tests. `drop-others` is the noise rule; sender
- * validity is checked first so bot/system replies retain a policy verdict.
- *
- * The noise rule only applies where `requireMention` is on. A channel with it
- * off has explicitly asked Codex to read everything, and the live path obeys
- * that; filtering here too would make the two paths disagree about the same
- * message depending on which one happened to see it first.
+ * The poller's structural per-reply verdict. Semantic audience is deliberately
+ * absent: server.ts sends every eligible human reply to the durable LLM gate.
  */
 export function decideThreadReplyDelivery(
   policy: ChannelPolicy | undefined,
   reply: SlackReply,
-  botUserId: string | undefined,
-): 'deliver' | 'drop-policy' | 'drop-others' {
+  _botUserId: string | undefined,
+): 'deliver' | 'drop-policy' {
   if (decideChannelPolicy(policy, reply.user!, true, false) !== 'deliver') return 'drop-policy'
-  if ((policy?.requireMention ?? true) === false) return 'deliver'
-  return classifyThreadReply(reply.text ?? '', botUserId) === 'others' ? 'drop-others' : 'deliver'
+  // Semantic audience is intentionally not decided here. Every human channel
+  // reply is passed to the durable LLM gate in server.ts before it can produce
+  // any reaction, queue item, control message or attachment download.
+  return 'deliver'
 }
 
 /**
  * How far the poller has now READ, which is not the same as how far it has
  * delivered. Every reply on the page counts — the bot's own posts, system
- * subtypes, replies aimed at other people. Advancing only past delivered
+ * subtypes and replies the later LLM gate ignores. Advancing only past delivered
  * replies lets a page that happens to hold 50 of the bot's own messages pin
  * the cursor forever, and every human reply behind it becomes unreachable.
  */
@@ -549,7 +493,7 @@ export type ThreadPollPlan = {
   /** How far the thread has now been read, delivered or not. */
   cursor: string
   deliver: SlackReply[]
-  skipped: { reply: SlackReply; reason: 'policy' | 'others' }[]
+  skipped: { reply: SlackReply; reason: 'policy' }[]
 }
 
 /**
@@ -572,7 +516,7 @@ export function planThreadPoll(
   for (const reply of selectNewReplies(replies, cursorTs, botUserId)) {
     const verdict = decideThreadReplyDelivery(policy, reply, botUserId)
     if (verdict === 'deliver') plan.deliver.push(reply)
-    else plan.skipped.push({ reply, reason: verdict === 'drop-policy' ? 'policy' : 'others' })
+    else plan.skipped.push({ reply, reason: 'policy' })
   }
   return plan
 }
