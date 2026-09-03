@@ -300,6 +300,38 @@ async function runLauncher(
 }
 
 describe('codex-channel.sh replacement guard', () => {
+  test('zerochan updateは通常起動検査より前にrepository updaterへ直接委譲する', async () => {
+    const state = fixture()
+    const project = join(dirname(state), 'project')
+    rmSync(join(state, '.env'))
+
+    const updateLog = join(state, 'update-bun.log')
+    const update = await runLauncher(state, { FAKE_BUN_LOG: updateLog }, undefined, {
+      invokedAs: 'zerochan', cwd: dirname(state), args: ['update'],
+    })
+    expect(update.exitCode, update.output).toBe(0)
+    const updateCalls = readFileSync(updateLog, 'utf8')
+    expect(updateCalls).toContain(`${join(dirname(import.meta.dir), 'zerokun/update.ts')}`)
+    expect(updateCalls).not.toContain('project-selection.ts')
+    expect(updateCalls).not.toContain('slack-app-identity.ts')
+    expect(updateCalls).not.toContain('herdr-runtime.ts')
+
+    const recoveryLog = join(state, 'recovery-bun.log')
+    const recovery = await runLauncher(state, { FAKE_BUN_LOG: recoveryLog }, undefined, {
+      invokedAs: 'zerochan', cwd: project, args: ['update', '--recover-only'],
+    })
+    expect(recovery.exitCode, recovery.output).toBe(0)
+    expect(readFileSync(recoveryLog, 'utf8')).toContain('zerokun/update.ts --recover-only')
+
+    const invalidLog = join(state, 'invalid-update-bun.log')
+    const invalid = await runLauncher(state, { FAKE_BUN_LOG: invalidLog }, undefined, {
+      invokedAs: 'zerochan', cwd: project, args: ['update', '--skip-tests'],
+    })
+    expect(invalid.exitCode).toBe(2)
+    expect(invalid.output).toContain('zerochan update [--recover-only]')
+    expect(existsSync(invalidLog)).toBe(false)
+  })
+
   test('zerochan start/stopは専用service controllerへ正しいscopeで委譲する', async () => {
     const state = fixture()
     const project = join(dirname(state), 'project')

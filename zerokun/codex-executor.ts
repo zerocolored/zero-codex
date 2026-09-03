@@ -5236,6 +5236,19 @@ export async function executeCodexJob(
   }
   const runtimeRepo = realpathSync(join(import.meta.dir, '..'))
   const jobRepo = realpathSync(job.repoPath)
+  // Reject direct runtime containment before resolving a multi-repository
+  // layout. A linked worktree has a regular-file `.git`, so resolving its
+  // parent first can otherwise surface the workspace-member diagnostic rather
+  // than the invariant that write-enabled jobs never target this runtime.
+  if (job.writeEnabled && (
+    pathContains(runtimeRepo, jobRepo)
+    || pathContains(jobRepo, runtimeRepo)
+  )) {
+    throw new Error(
+      'write-enabled Slack job cannot target the Zeroちゃん runtime repository; '
+      + 'configure a separate project route to keep host runtime code immutable',
+    )
+  }
   const advisorProjectLayout: AdvisorProjectLayout = resolveAdvisorProjectLayout(jobRepo)
   const runtimeGitPaths = resolveGitMetadataPaths(runtimeRepo)
   const jobGitPaths = advisorProjectLayout.gitRoots.length > 0
@@ -5246,11 +5259,7 @@ export async function executeCodexJob(
       pathContains(runtimePath, path) || pathContains(path, runtimePath)
     ))
   ))
-  if (job.writeEnabled && (
-    pathContains(runtimeRepo, jobRepo)
-    || pathContains(jobRepo, runtimeRepo)
-    || sharesRuntimeGit
-  )) {
+  if (job.writeEnabled && sharesRuntimeGit) {
     throw new Error(
       'write-enabled Slack job cannot target the Zeroちゃん runtime repository; '
       + 'configure a separate project route to keep host runtime code immutable',

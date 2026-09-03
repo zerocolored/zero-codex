@@ -91,11 +91,20 @@ command -v bun >/dev/null 2>&1 || { echo "❌ bun がありません → bash ze
 # coordinator can reach any process-stop boundary so an unrelated user command
 # is never overwritten after services have already been interrupted.
 require_installable_launcher_link() {
-  local path="$1" target="$2" current
+  local path="$1" target="$2" previous_target="${3:-}" current target_physical previous_physical
   if [ -L "$path" ]; then
-    current="$(readlink "$path")"
-    [ "$current" = "$target" ] || {
-      echo "❌ 既存の無関係なcommandを上書きしません: $path -> $current" >&2
+    current="$(resolve_launcher_link_target "$path")" || {
+      echo "❌ 既存commandのsymlink targetを安全に確認できません: $path" >&2
+      exit 1
+    }
+    target_physical="$(resolve_regular_path "$target")" || exit 1
+    if [ -n "$previous_target" ]; then
+      previous_physical="$(resolve_regular_path "$previous_target")" || exit 1
+    else
+      previous_physical=""
+    fi
+    [ "$current" = "$target_physical" ] || [ "$current" = "$previous_physical" ] || {
+      echo "❌ 既存の無関係なcommandを上書きしません: $path" >&2
       exit 1
     }
   elif [ -e "$path" ]; then
@@ -113,9 +122,81 @@ require_safe_launcher_parent() {
   done
 }
 require_safe_launcher_parent
-require_installable_launcher_link "$HOME/.local/bin/zerochan" "$REPO_DIR/codex-channel.sh"
-require_installable_launcher_link "$HOME/.local/bin/zerokun" "$REPO_DIR/codex-channel.sh"
-require_installable_launcher_link "$HOME/.local/bin/zerochan-access" "$REPO_DIR/zerokun/access.ts"
+
+resolve_regular_path() {
+  local path="$1" parent leaf
+  parent="$(CDPATH='' cd -P "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+  leaf="$(basename "$path")"
+  [ -f "$parent/$leaf" ] && [ ! -L "$parent/$leaf" ] || return 1
+  printf '%s/%s\n' "$parent" "$leaf"
+}
+
+resolve_launcher_link_target() {
+  local path="$1" raw
+  [ "$(/usr/bin/stat -f '%u:%l:%HT' "$path" 2>/dev/null || true)" \
+    = "$(/usr/bin/id -u):1:Symbolic Link" ] || return 1
+  raw="$(readlink "$path")" || return 1
+  case "$raw" in
+    /*) ;;
+    *) raw="$(dirname "$path")/$raw" ;;
+  esac
+  resolve_regular_path "$raw"
+}
+
+discover_bootstrap_previous_repo() {
+  local previous="" path suffix expected resolved expected_physical candidate
+  while [ "$#" -gt 0 ]; do
+    path="$1"
+    suffix="$2"
+    expected="$3"
+    shift 3
+    [ -L "$path" ] || continue
+    resolved="$(resolve_launcher_link_target "$path")" || return 1
+    expected_physical="$(resolve_regular_path "$expected")" || return 1
+    [ "$resolved" != "$expected_physical" ] || continue
+    case "$resolved" in
+      */"$suffix") candidate="${resolved%/$suffix}" ;;
+      *) return 1 ;;
+    esac
+    [ -n "$candidate" ] && [ "$candidate" != "$REPO_DIR" ] || return 1
+    if [ -n "$previous" ] && [ "$previous" != "$candidate" ]; then
+      return 1
+    fi
+    previous="$candidate"
+  done
+  if [ -n "$previous" ]; then
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/validate-update-repo.ts" \
+      "$previous" main >/dev/null 2>&1 || return 1
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" \
+      validate-owned-regular \
+      "$previous/codex-channel.sh" \
+      "$previous/zerokun/access.ts" \
+      "$previous/zerokun/update.ts" \
+      "$previous/zerokun/setup.sh" >/dev/null 2>&1 || return 1
+  fi
+  printf '%s\n' "$previous"
+}
+
+BOOTSTRAP_PREVIOUS_REPO=""
+if [ "${ZEROKUN_BOOTSTRAP:-0}" = "1" ]; then
+  BOOTSTRAP_PREVIOUS_REPO="$(discover_bootstrap_previous_repo \
+    "$HOME/.local/bin/zerochan" codex-channel.sh "$REPO_DIR/codex-channel.sh" \
+    "$HOME/.local/bin/zerokun" codex-channel.sh "$REPO_DIR/codex-channel.sh" \
+    "$HOME/.local/bin/zerochan-access" zerokun/access.ts "$REPO_DIR/zerokun/access.ts")" || {
+      echo "❌ 旧Zeroちゃんlauncherの所有元を安全に確認できません。既存commandは変更しません。" >&2
+      exit 1
+    }
+fi
+
+require_installable_launcher_link \
+  "$HOME/.local/bin/zerochan" "$REPO_DIR/codex-channel.sh" \
+  "${BOOTSTRAP_PREVIOUS_REPO:+$BOOTSTRAP_PREVIOUS_REPO/codex-channel.sh}"
+require_installable_launcher_link \
+  "$HOME/.local/bin/zerokun" "$REPO_DIR/codex-channel.sh" \
+  "${BOOTSTRAP_PREVIOUS_REPO:+$BOOTSTRAP_PREVIOUS_REPO/codex-channel.sh}"
+require_installable_launcher_link \
+  "$HOME/.local/bin/zerochan-access" "$REPO_DIR/zerokun/access.ts" \
+  "${BOOTSTRAP_PREVIOUS_REPO:+$BOOTSTRAP_PREVIOUS_REPO/zerokun/access.ts}"
 
 case "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" in
   0|1) ;;
@@ -148,20 +229,20 @@ trap 'exit 143' TERM
 if [ "${ZEROKUN_UPDATE_IN_PROGRESS:-0}" = "1" ]; then
   CH="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" \
     require-root "$CH")" || {
-      echo "❌ 現在のzerokun-update lock pathをread-only検証できません。Codex版のoffline bootstrapを実行してください。変更は開始しません。" >&2
+      echo "❌ 現在のzerochan update lock pathをread-only検証できません。Codex版のoffline bootstrapを実行してください。変更は開始しません。" >&2
       exit 1
     }
   SETUP_LOCK="$CH/update.lock"
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" \
     require-directories "$CH" "$SETUP_LOCK" || {
-      echo "❌ 現在のzerokun-update lock directoryが安全ではありません。Codex版のoffline bootstrapを実行してください。変更は開始しません。" >&2
+      echo "❌ 現在のzerochan update lock directoryが安全ではありません。Codex版のoffline bootstrapを実行してください。変更は開始しません。" >&2
       exit 1
     }
   if bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
     delegate-active "$SETUP_LOCK/pid" "$$"; then
     : # Current updater registered this gated setup before allowing mutation.
   else
-    echo "❌ 現在のzerokun-updateは安全なlock委譲に対応していません。Codex版のoffline bootstrapを実行してください。変更は開始しません。" >&2
+    echo "❌ 現在のzerochan updateは安全なlock委譲に対応していません。Codex版のoffline bootstrapを実行してください。変更は開始しません。" >&2
     exit 1
   fi
 fi
@@ -495,20 +576,31 @@ fi
 ln -sfn "$REPO_DIR/zerokun/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
 ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerochan-access"
 ln -sfn "$REPO_DIR/zerokun/status.ts" "$HOME/.local/bin/zerokun-status"
-ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"
 ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/codex-channel"
-[ -L "$HOME/.local/bin/zerochan" ] \
-  || ln -s "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/zerochan"
-[ -L "$HOME/.local/bin/zerokun" ] \
-  || ln -s "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/zerokun"
-# Remove only dangling Claude-era links that this same Zeroちゃん checkout owned.
+ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/zerochan"
+ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/zerokun"
+# Remove only links owned by this checkout or its validated bootstrap predecessor.
 remove_owned_legacy_link() {
-  local legacy_path="$1" legacy_target="$2"
-  if [ -L "$legacy_path" ] && [ "$(readlink "$legacy_path")" = "$legacy_target" ]; then
+  local legacy_path="$1" legacy_target="$2" previous_target="${3:-}" \
+    current target_physical previous_physical
+  [ -L "$legacy_path" ] || return 0
+  current="$(resolve_launcher_link_target "$legacy_path")" || return 0
+  target_physical="$(resolve_regular_path "$legacy_target")" || return 0
+  if [ -n "$previous_target" ]; then
+    previous_physical="$(resolve_regular_path "$previous_target")" || return 0
+  else
+    previous_physical=""
+  fi
+  if [ "$current" = "$target_physical" ] || [ "$current" = "$previous_physical" ]; then
     rm -f "$legacy_path"
   fi
 }
-remove_owned_legacy_link "$HOME/.local/bin/zerokun-access" "$REPO_DIR/zerokun/access.ts"
+remove_owned_legacy_link \
+  "$HOME/.local/bin/zerokun-access" "$REPO_DIR/zerokun/access.ts" \
+  "${BOOTSTRAP_PREVIOUS_REPO:+$BOOTSTRAP_PREVIOUS_REPO/zerokun/access.ts}"
+remove_owned_legacy_link \
+  "$HOME/.local/bin/zerokun-update" "$REPO_DIR/zerokun/update.ts" \
+  "${BOOTSTRAP_PREVIOUS_REPO:+$BOOTSTRAP_PREVIOUS_REPO/zerokun/update.ts}"
 if [ "$LEGACY_CUTOVER" = "1" ]; then
   remove_owned_legacy_link "$HOME/.local/bin/claude-channel" "$REPO_DIR/claude-channel.sh"
   remove_owned_legacy_link "$HOME/.claude/skills/threads" "$REPO_DIR/skills/threads"
@@ -516,7 +608,7 @@ if [ "$LEGACY_CUTOVER" = "1" ]; then
 fi
 echo "   SQLite job runner を設置しました(永続FIFO / 同時実行数1)"
 echo "   Slack更新リクエストworkerを設置しました"
-echo "   安全更新コマンドを設置しました: zerokun-update"
+echo "   安全更新コマンドを設置しました: zerochan update"
 
 # 4. zsh エイリアス。既存の管理ブロックだけをatomicに置換する。
 # symlink/hardlinkや不均衡markerではユーザー設定を変更せず停止する。
@@ -570,6 +662,6 @@ else
   echo "     Herdr内で起動: zerochan start"
   echo "     ログtabごと起動し直す: zerochan stop → zerochan start"
   echo "     queue確認: zerokun-jobs status"
-  echo "     Codex版更新: zerokun-update"
+  echo "     Codex版更新: zerochan update"
   echo "     書込み許可: zerochan-access write allow <SlackユーザーID>"
 fi

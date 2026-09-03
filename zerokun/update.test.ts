@@ -48,6 +48,7 @@ import {
   waitForStableHealth,
   withUpdateTestPolicy,
   updaterTrustedToolPath,
+  validManagedLauncherSnapshot,
 } from './update.ts'
 import {
   assertCurrentAppServerCodexPermissionConfig,
@@ -449,27 +450,57 @@ function spawnStandaloneSetup(
 }
 
 describe('updater helpers', () => {
-  test('access command renameのrollbackはzerochan-accessを消し旧owned linkだけを復元する', () => {
+  test('launcher snapshot decoderは旧2/4-key journalと新5-key journalを受理する', () => {
+    const missing = { kind: 'missing' }
+    expect(validManagedLauncherSnapshot({
+      zerochan: missing,
+      zerokun: missing,
+    })).toBe(true)
+    expect(validManagedLauncherSnapshot({
+      zerochan: missing,
+      zerokun: missing,
+      zerochanAccess: missing,
+      zerokunAccess: missing,
+    })).toBe(true)
+    expect(validManagedLauncherSnapshot({
+      zerochan: missing,
+      zerokun: missing,
+      zerochanAccess: missing,
+      zerokunAccess: missing,
+      zerokunUpdate: missing,
+    })).toBe(true)
+    expect(validManagedLauncherSnapshot({
+      zerochan: missing,
+      zerokun: missing,
+      zerokunUpdate: missing,
+    })).toBe(false)
+  })
+
+  test('command renameのrollbackは新linkを消し旧owned linkだけを復元する', () => {
     const dir = fixtureDir()
     const repo = join(dir, 'repo')
     const bin = join(dir, 'bin')
     const accessTarget = join(repo, 'zerokun', 'access.ts')
+    const updaterTarget = join(repo, 'zerokun', 'update.ts')
     const launcherTarget = join(repo, 'codex-channel.sh')
     mkdirSync(dirname(accessTarget), { recursive: true })
     mkdirSync(bin)
     writeFileSync(accessTarget, '#!/usr/bin/env bun\n')
+    writeFileSync(updaterTarget, '#!/usr/bin/env bun\n')
     writeFileSync(launcherTarget, '#!/bin/sh\n')
     const paths = {
       zerochan: join(bin, 'zerochan'),
       zerokun: join(bin, 'zerokun'),
       zerochanAccess: join(bin, 'zerochan-access'),
       zerokunAccess: join(bin, 'zerokun-access'),
+      zerokunUpdate: join(bin, 'zerokun-update'),
     }
     const snapshot = {
       zerochan: { kind: 'missing' },
       zerokun: { kind: 'missing' },
       zerochanAccess: { kind: 'missing' },
       zerokunAccess: { kind: 'symlink', target: accessTarget },
+      zerokunUpdate: { kind: 'symlink', target: updaterTarget },
     } as const
 
     symlinkSync(launcherTarget, paths.zerochan)
@@ -482,6 +513,8 @@ describe('updater helpers', () => {
     expect(existsSync(paths.zerochanAccess)).toBe(false)
     expect(lstatSync(paths.zerokunAccess).isSymbolicLink()).toBe(true)
     expect(readlinkSync(paths.zerokunAccess)).toBe(accessTarget)
+    expect(lstatSync(paths.zerokunUpdate).isSymbolicLink()).toBe(true)
+    expect(readlinkSync(paths.zerokunUpdate)).toBe(updaterTarget)
   })
 
   test('restart tokenはUUID v4を非可逆digestへ固定する', () => {
@@ -893,7 +926,7 @@ describe('updater helpers', () => {
     const delegateActive = setup.indexOf('delegate-active "$SETUP_LOCK/pid" "$$"')
     const requireRoot = setup.indexOf('require-root "$CH"')
     const requireLockDirectory = setup.indexOf('require-directories "$CH" "$SETUP_LOCK"')
-    const legacyUpdaterFailure = setup.indexOf('現在のzerokun-updateは安全なlock委譲に対応していません')
+    const legacyUpdaterFailure = setup.indexOf('現在のzerochan updateは安全なlock委譲に対応していません')
     const prepareState = setup.indexOf('prepare-root "$CH"')
     const inheritedPreflight = setup.indexOf('verify-system-config --inherit-process-group')
     const installDependencies = setup.indexOf('install --frozen-lockfile')
@@ -974,7 +1007,7 @@ describe('updater helpers', () => {
     writeFileSync(join(fixture.state, 'update-transaction.json'), '{}\n', { mode: 0o600 })
     const result = runStandaloneSetup(fixture)
     expect(result.exitCode).toBe(1)
-    expect(result.stderr.toString()).toContain('zerokun-update --recover-only')
+    expect(result.stderr.toString()).toContain('zerochan update --recover-only')
     expect(existsSync(fixture.setupMarker)).toBe(false)
     expect(existsSync(join(fixture.state, 'update.lock/pid'))).toBe(false)
   })
@@ -1924,7 +1957,7 @@ describe('Codex branch self update', () => {
     const result = runUpdater(fixture, ['--skip-tests'], environment)
 
     expect(result.exitCode).toBe(1)
-    expect(result.stderr.toString()).toContain('zerokun-update --recover-only')
+    expect(result.stderr.toString()).toContain('zerochan update --recover-only')
     expect(result.stderr.toString()).toContain('pinned Herdr runtime identity is missing')
     expect(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)).toBe(head)
     expect(existsSync(fixture.setupMarker)).toBe(false)
@@ -2324,7 +2357,7 @@ describe('Codex branch self update', () => {
     const accidentalNormalUpdate = runUpdater(fixture)
     expect(accidentalNormalUpdate.exitCode).not.toBe(0)
     expect(accidentalNormalUpdate.stderr.toString()).toContain(
-      'zerokun-update --recover-only',
+      'zerochan update --recover-only',
     )
     expect(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)).toBe(pending.targetHead)
     const stillPending = JSON.parse(readFileSync(

@@ -366,7 +366,7 @@ zerokun             # 互換alias。現在directoryで起動
 zerokun-status
 zerokun-jobs status
 zerochan-access status
-zerokun-update
+zerochan update
 ```
 
 チャンネルは利用するSlack Appを招待し、対象projectで `zerochan set slack-channel C...` を実行すると
@@ -404,11 +404,12 @@ macOSのno-replace renameで公開し、公開前crashで残った固定staging 
 
 watchdog は停止を2回連続検出した時だけ通知し、復旧も通知します。自動 restart はしません。
 
-安全なprocess-group委譲を持たない旧Codex版からの初回更新だけは、Slack経由や
-`zerokun-update`ではなく、冒頭の公開`bootstrap-macos.sh`を端末から実行し、旧checkoutとは別の
+`zerochan update`導入前の旧Codex版からの初回更新だけは、Slack経由や新subcommandではなく、
+冒頭の公開`bootstrap-macos.sh`を端末から実行し、旧checkoutとは別の
 空directory（例: `--repo-dir "$HOME/Desktop/Project/zero-codex-next"`）へ配置します。旧updater経由の
 setupはstate変更前に停止して旧版へrollbackし、新checkoutのsetupが同じstateをlockしてserviceを
-切り替えます。以後は`zerokun-update`を利用できます。
+切り替えます。以後は`zerochan update`を利用できます。`zerochan stop` → `zerochan start`は
+同じ版の再起動だけを行い、更新の代わりにはなりません。
 自己更新用runtimeは全import companionをversioned bundleへpublishした後にentrypointをatomic切替します。
 process-levelのSIGKILLはfail-closedで復旧しますが、突然の電源断に対するfilesystem durabilityは
 保証対象外です。再起動後にjournalが残る場合はserviceを起動せずoffline bootstrapで復旧してください。

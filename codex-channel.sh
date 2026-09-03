@@ -32,6 +32,7 @@ REPLACE_TOKEN_VALUE="${ZEROKUN_REPLACE_TOKEN:-}"
 unset ZEROKUN_REPLACE_TOKEN
 LAUNCH_MODE="start"
 CHANNEL_ID=""
+UPDATE_RECOVER_ONLY=0
 
 case "$INVOKED_AS" in
   zerochan)
@@ -43,6 +44,13 @@ case "$INVOKED_AS" in
     elif [ "$#" -eq 1 ] && [ "$1" = "stop" ]; then
       LAUNCH_MODE="managed-stop"
       PROJECT=""
+    elif [ "$#" -eq 1 ] && [ "$1" = "update" ]; then
+      LAUNCH_MODE="update"
+      PROJECT="$(pwd -P)"
+    elif [ "$#" -eq 2 ] && [ "$1" = "update" ] && [ "$2" = "--recover-only" ]; then
+      LAUNCH_MODE="update"
+      UPDATE_RECOVER_ONLY=1
+      PROJECT="$(pwd -P)"
     elif [ "$#" -eq 1 ] && [ "$1" = "--restart" ]; then
       LAUNCH_MODE="restart"
       PROJECT="$(bun --config=/dev/null --no-env-file \
@@ -61,7 +69,7 @@ case "$INVOKED_AS" in
       LAUNCH_MODE="status"
       PROJECT="$(pwd -P)"
     else
-      echo "使い方: zerochan | zerochan start | zerochan stop | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
+      echo "使い方: zerochan | zerochan start | zerochan stop | zerochan update [--recover-only] | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
       exit 2
     fi
     ;;
@@ -81,6 +89,21 @@ case "$INVOKED_AS" in
     fi
     ;;
 esac
+
+# Updating is a repository-level maintenance action. Dispatch it before the
+# ordinary project, Slack token, and Herdr startup checks so a broken runtime
+# can still be repaired. The current physical directory is only the updater's
+# final project-selection fallback; an active transaction or running gateway
+# remains authoritative inside update.ts.
+if [ "$LAUNCH_MODE" = "update" ]; then
+  export ZEROKUN_PROJECT_DIR="$PROJECT"
+  if [ "$UPDATE_RECOVER_ONLY" = "1" ]; then
+    exec bun --config=/dev/null --no-env-file \
+      "$REPO_DIR/zerokun/update.ts" --recover-only
+  fi
+  exec bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/update.ts"
+fi
 
 # stop is global to this installed Slack App and intentionally does not select,
 # sync, or mutate a project route. The service controller still verifies the

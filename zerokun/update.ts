@@ -603,6 +603,8 @@ export interface ManagedLauncherSnapshot {
   zerochanAccess?: LauncherPathSnapshot
   /** Captures the owned legacy link that setup removes during the rename. */
   zerokunAccess?: LauncherPathSnapshot
+  /** Captures the former standalone updater while setup removes that public command. */
+  zerokunUpdate?: LauncherPathSnapshot
 }
 
 const decoder = new TextDecoder()
@@ -1128,9 +1130,9 @@ export function acquireUpdateLock(stateDir: string): UpdateLockCoordinator {
   const attempt = tryAcquireProcessLock(pidPath)
   if (attempt.acquired === false) {
     if (attempt.kind === 'held') {
-      fail(`別のzerokun-updateが実行中です (PID ${attempt.heldPid})`)
+      fail(`別のzerochan updateが実行中です (PID ${attempt.heldPid})`)
     }
-    fail('zerokun-update lockの所有者を確認できません。安全のため更新を中止します')
+    fail('zerochan update lockの所有者を確認できません。安全のため更新を中止します')
   }
   let gateHelper: ReturnType<typeof prepareProcessGroupGateHelper>
   try {
@@ -1148,16 +1150,16 @@ export function acquireUpdateLock(stateDir: string): UpdateLockCoordinator {
     gateHelperRoot: gateHelper.root,
     gateLockTool: gateHelper.lockTool,
     delegate: (pid: number) => {
-      if (!held) fail('zerokun-update lockは既に解放されています')
-      if (activeDelegate) fail('zerokun-update lockには既に実行中の委譲があります')
+      if (!held) fail('zerochan update lockは既に解放されています')
+      if (activeDelegate) fail('zerochan update lockには既に実行中の委譲があります')
       const delegated = delegateProcessLock(pidPath, lease, pid)
-      if (!delegated) fail('子processへzerokun-update lockを安全に委譲できません')
+      if (!delegated) fail('子processへzerochan update lockを安全に委譲できません')
       activeDelegate = delegated
       return delegated
     },
     undelegate: (delegate: ProcessLockDelegate) => {
       if (!held || !undelegateProcessLock(pidPath, delegate)) {
-        fail('子processのzerokun-update lock委譲を安全に解除できません')
+        fail('子processのzerochan update lock委譲を安全に解除できません')
       }
       activeDelegate = undefined
     },
@@ -1166,7 +1168,7 @@ export function acquireUpdateLock(stateDir: string): UpdateLockCoordinator {
         || activeDelegate.pid !== delegate.pid
         || activeDelegate.nonce !== delegate.nonce
         || !blockProcessLockDelegate(pidPath, delegate)) {
-        fail('子process cleanup不確実性をzerokun-update lockへ記録できません')
+        fail('子process cleanup不確実性をzerochan update lockへ記録できません')
       }
     },
     protect: (delegate: ProcessLockDelegate) => {
@@ -1185,7 +1187,7 @@ export function acquireUpdateLock(stateDir: string): UpdateLockCoordinator {
     release: () => {
       if (!held) return
       if (activeDelegate || !releaseProcessLock(pidPath, lease)) {
-        fail('zerokun-update lockを安全に解放できません')
+        fail('zerochan update lockを安全に解放できません')
       }
       held = false
       rmSync(gateHelper.root, { recursive: true, force: true })
@@ -1528,18 +1530,24 @@ function journalPath(stateDir: string): string {
   return join(stateDir, 'update-transaction.json')
 }
 
-function launcherPaths(): {
+interface ManagedLauncherPaths {
   zerochan: string
   zerokun: string
   zerochanAccess: string
   zerokunAccess: string
-} {
+  zerokunUpdate?: string
+}
+
+type ManagedLauncherName = keyof ManagedLauncherPaths
+
+function launcherPaths(): ManagedLauncherPaths {
   const bin = join(homedir(), '.local', 'bin')
   return {
     zerochan: join(bin, 'zerochan'),
     zerokun: join(bin, 'zerokun'),
     zerochanAccess: join(bin, 'zerochan-access'),
     zerokunAccess: join(bin, 'zerokun-access'),
+    zerokunUpdate: join(bin, 'zerokun-update'),
   }
 }
 
@@ -1562,6 +1570,7 @@ export function snapshotManagedLaunchers(): ManagedLauncherSnapshot {
     zerokun: snapshotLauncherPath(paths.zerokun),
     zerochanAccess: snapshotLauncherPath(paths.zerochanAccess),
     zerokunAccess: snapshotLauncherPath(paths.zerokunAccess),
+    zerokunUpdate: snapshotLauncherPath(paths.zerokunUpdate!),
   }
 }
 
@@ -1578,7 +1587,7 @@ function validLauncherPathSnapshot(value: unknown): value is LauncherPathSnapsho
     && Object.keys(snapshot).length === 2
 }
 
-function validManagedLauncherSnapshot(value: unknown): value is ManagedLauncherSnapshot {
+export function validManagedLauncherSnapshot(value: unknown): value is ManagedLauncherSnapshot {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const snapshot = value as Record<string, unknown>
   const keys = Object.keys(snapshot).sort()
@@ -1587,13 +1596,18 @@ function validManagedLauncherSnapshot(value: unknown): value is ManagedLauncherS
   const current = keys.length === 4
     && keys[0] === 'zerochan' && keys[1] === 'zerochanAccess'
     && keys[2] === 'zerokun' && keys[3] === 'zerokunAccess'
-  return (legacy || current)
+  const withUpdater = keys.length === 5
+    && keys[0] === 'zerochan' && keys[1] === 'zerochanAccess'
+    && keys[2] === 'zerokun' && keys[3] === 'zerokunAccess'
+    && keys[4] === 'zerokunUpdate'
+  return (legacy || current || withUpdater)
     && validLauncherPathSnapshot(snapshot.zerochan)
     && validLauncherPathSnapshot(snapshot.zerokun)
-    && (!current || (
+    && (!(current || withUpdater) || (
       validLauncherPathSnapshot(snapshot.zerochanAccess)
       && validLauncherPathSnapshot(snapshot.zerokunAccess)
     ))
+    && (!withUpdater || validLauncherPathSnapshot(snapshot.zerokunUpdate))
 }
 
 export function restoreManagedLaunchers(
@@ -1606,13 +1620,17 @@ export function restoreManagedLaunchers(
     zerokun: join(repoPath, 'codex-channel.sh'),
     zerochanAccess: join(repoPath, 'zerokun', 'access.ts'),
     zerokunAccess: join(repoPath, 'zerokun', 'access.ts'),
+    zerokunUpdate: join(repoPath, 'zerokun', 'update.ts'),
+  } satisfies Record<ManagedLauncherName, string>
+  const names: ManagedLauncherName[] = ['zerochan', 'zerokun']
+  if (snapshot.zerochanAccess && snapshot.zerokunAccess) {
+    names.push('zerochanAccess', 'zerokunAccess')
   }
-  const names = (snapshot.zerochanAccess && snapshot.zerokunAccess)
-    ? ['zerochan', 'zerokun', 'zerochanAccess', 'zerokunAccess'] as const
-    : ['zerochan', 'zerokun'] as const
+  if (snapshot.zerokunUpdate) names.push('zerokunUpdate')
   for (const name of names) {
     const path = paths[name]
-    const before = snapshot[name]!
+    const before = snapshot[name]
+    if (!path || !before) fail(`rollback対象commandのsnapshotがありません: ${name}`)
     const candidateTarget = candidateTargets[name]
     let current: LauncherPathSnapshot
     current = snapshotLauncherPath(path)
@@ -2804,7 +2822,7 @@ async function assertPinnedHerdrRestartReady(
     fail(
       'Zeroちゃんの再起動先Herdr paneを確認できません。'
       + (recovery
-        ? ' 先に zerokun-update --recover-only を実行し、'
+        ? ' 先に zerochan update --recover-only を実行し、'
           + '専用paneでZeroちゃんを起動してください。'
         : ' 専用paneでZeroちゃんを一度起動してから更新してください。')
       + ` この検査ではserviceを停止していません: ${reason}`,
@@ -3061,7 +3079,7 @@ async function superviseStandaloneSetup(testing = false): Promise<void> {
       lstatSync(pendingJournal)
       fail(
         '未完了の更新transactionがあります。standalone setupを開始せず、'
-        + '先に zerokun-update --recover-only を実行してください',
+        + '先に zerochan update --recover-only を実行してください',
       )
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
@@ -3210,7 +3228,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
   process.on('SIGINT', interrupt)
   process.on('SIGTERM', interrupt)
   try {
-    output('▶ zerokun-update')
+    output('▶ zerochan update')
     const interrupted = readJournal(stateDir, { repoPath: rootRepo, projectDir, setupScript })
     if (interrupted) {
       if (realpathSync(interrupted.repoPath) !== rootRepo) {
@@ -3225,7 +3243,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       if (interrupted.phase === 'rolling-forward') {
         fail(
           'forward recoveryが未完了です。現行commitとjournalを保持しました。'
-          + ' zerokun-update --recover-only を再実行してください',
+          + ' zerochan update --recover-only を再実行してください',
         )
       }
       const restartInterrupted = !recoverOnly && !interrupted.noRestart

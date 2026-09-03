@@ -173,7 +173,7 @@ describe('Zero-kun Codex wiring', () => {
       'update-runtime.ts',
       'zerochan-access',
       'codex-channel',
-      'zerokun-update',
+      'zerochan update',
       'watchdog.sh',
       'zerokun_require_herdr_version',
     ]) expect(setup).toContain(expected)
@@ -190,7 +190,7 @@ describe('Zero-kun Codex wiring', () => {
     expect(setup).toContain('ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerochan-access"')
     expect(setup).not.toContain('ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerokun-access"')
     expect(setup).toContain(
-      'remove_owned_legacy_link "$HOME/.local/bin/zerokun-access" "$REPO_DIR/zerokun/access.ts"',
+      '"$HOME/.local/bin/zerokun-access" "$REPO_DIR/zerokun/access.ts"',
     )
     expect(setup).not.toContain('command -v claude')
     expect(setup).not.toContain('claude-config')
@@ -302,8 +302,12 @@ describe('Zero-kun Codex wiring', () => {
 
   test('explicit update request bypasses the normal FIFO to avoid self-deadlock', () => {
     const server = readFileSync(join(root, 'server.ts'), 'utf8')
+    const updateRequest = readFileSync(join(import.meta.dir, 'update-request.ts'), 'utf8')
     expect(server).toContain('isExplicitUpdateRequest(text)')
     expect(server).toContain('await enqueueUpdate(')
+    expect(server).toContain("const UPDATE_ENTRYPOINT = join(import.meta.dir, 'zerokun', 'update.ts')")
+    expect(server.match(/updaterPath: UPDATE_ENTRYPOINT/g)?.length).toBe(2)
+    expect(updateRequest).not.toContain("join(homedir(), '.local', 'bin', 'zerokun-update')")
     const updateBranch = server.indexOf('isExplicitUpdateRequest(text)')
     const normalInboundFifo = server.indexOf('const inbound: InboundDeliveryInput = {', updateBranch)
     expect(updateBranch).toBeGreaterThan(-1)
