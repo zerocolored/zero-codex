@@ -93,8 +93,22 @@ describe('Herdr-owned runner launcher', () => {
     const launcherIdentity = readProcessIdentity(launched.pid)
     expect(launcherIdentity).toBeDefined()
     processes.push(launcherIdentity!)
-    for (let attempt = 0; attempt < 100 && !existsSync(pidFile); attempt += 1) await Bun.sleep(20)
+    // A saturated macOS CI runner can take several seconds to schedule the
+    // nested Bun process after the preceding process-heavy suite.  Keep this
+    // startup wait bounded, but do not turn ordinary scheduler delay into a
+    // flaky two-second failure.
+    for (let attempt = 0; attempt < 500 && !existsSync(pidFile); attempt += 1) await Bun.sleep(20)
     if (!existsSync(pidFile)) {
+      // `Response.text()` waits for EOF.  Stop the owned launcher before
+      // draining stderr so a failed startup produces a diagnostic instead of
+      // hanging the whole workflow until its 30-minute timeout.
+      signalProcessIfLive(launcherIdentity!, 'SIGTERM')
+      const exited = await Promise.race([
+        launched.exited.then(() => true),
+        Bun.sleep(1_000).then(() => false),
+      ])
+      if (!exited) signalProcessIfLive(launcherIdentity!, 'SIGKILL')
+      await launched.exited
       const stderr = await new Response(launched.stderr).text()
       const runnerLog = existsSync(join(state, 'runner.log'))
         ? readFileSync(join(state, 'runner.log'), 'utf8')
