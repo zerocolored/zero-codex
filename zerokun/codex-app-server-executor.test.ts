@@ -4697,9 +4697,11 @@ describe('production App Server executor', () => {
       progressActivatedAtMs: activatedAtMs,
       progressScheduleForTesting: {
         firstMs: 10,
-        secondMs: 1_000,
-        thirdMs: 2_000,
-        repeatMs: 1_000,
+        // This case verifies the first slot. Keep later boundaries well outside the
+        // fixture runtime so a loaded host cannot turn it into a different test.
+        secondMs: 10_000,
+        thirdMs: 20_000,
+        repeatMs: 10_000,
       },
       onProgressProbeStarted: () => true,
       onProgressProbeSuperseded: () => {},

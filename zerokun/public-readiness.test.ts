@@ -226,6 +226,7 @@ describe('public Codex defaults', () => {
       '表示されないpromptへ',
       'zerochan set slack-channel',
       'zerochan start',
+      'zerochan update',
       'Slackの実メンションまたはDMにZeroちゃんが返信した',
     ]) expect(setup).toContain(expected)
 
@@ -235,6 +236,9 @@ describe('public Codex defaults', () => {
       'ln -sfn "$REPO_DIR/zerokun/status.ts" "$HOME/.local/bin/zerokun-status"',
     )
     expect(setupScript).not.toContain('alias zerokun-status=')
+    expect(setupScript).not.toContain(
+      'ln -sfn "$REPO_DIR/zerokun/update.ts" "$HOME/.local/bin/zerokun-update"',
+    )
     expect(rootReadme).not.toContain('SLACK_BOT_TOKEN=xoxb-...')
     expect(rootReadme).not.toContain('SLACK_APP_TOKEN=xapp-...')
     expect(rootReadme).not.toContain('新PCの`~/.codex/zerokun/.env`へ2値を保存')

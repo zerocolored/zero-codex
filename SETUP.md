@@ -187,6 +187,28 @@ repositoryの変更も許可する利用者だけ、別途write権限を付け�
 zerochan-access write allow <Slack user ID>
 ```
 
+## 更新する
+
+通常の更新は、対象projectまたはZeroちゃん本体のdirectoryから次の1コマンドで行います。
+
+```bash
+zerochan update
+```
+
+`origin/main`の候補版を検証し、fast-forward、setup、gateway／runnerの再起動まで自動で行います。
+正常終了後に`zerochan stop`／`zerochan start`を追加実行する必要はありません。逆に、stop／startだけでは
+checkoutの版は変わらないため、更新の代わりにはなりません。
+
+中断された更新transactionの復旧を案内された場合だけ、次を使います。
+
+```bash
+zerochan update --recover-only
+```
+
+`zerochan update`をまだ認識しない古い版からの初回移行は、通常の新Mac導入と同じ公開
+`bootstrap-macos.sh`を使います。別の空directoryへ新checkoutを作り、同じstateを引き継いで
+配線を切り替えます。移行後の更新コマンドはすべて`zerochan update`です。
+
 ## 旧PCを止めて移行する場合だけ
 
 1. 旧PCで`zerokun-jobs status`を確認し、running／queued jobがない状態にする。

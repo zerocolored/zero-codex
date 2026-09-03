@@ -418,7 +418,7 @@ runtime log tabを作り直す場合は `zerochan stop` → `zerochan start` を
 更新:
 
 ```bash
-zerokun-update
+zerochan update
 ```
 
 更新対象は `origin/main` の fast-forward のみです。未コミット変更や未 push の local commit
@@ -433,8 +433,8 @@ helper・include・HTTP/credential設定があれば実行前に停止します�
 旧commit・旧DB・旧serviceへ自動rollbackします。強制終了でjournalが残った場合も次回起動前に
 rollbackを完了します。
 
-安全なprocess-group委譲に対応する前の旧Codex版から、最初の1回だけは`zerokun-update`やSlack経由で
-更新できません。旧updaterは変更開始前に停止して旧版へrollbackするため、上記の公開
+`zerochan update`導入前の旧Codex版から、最初の1回だけは新subcommandやSlack経由で
+更新できません。旧版の更新処理は変更開始前に停止してrollbackするため、上記の公開
 `bootstrap-macos.sh`を端末から実行し、旧checkoutとは別の空directoryへ配置してください。
 
 ```bash
@@ -451,7 +451,8 @@ bash "$bootstrap_path" --repo-dir "$HOME/Desktop/Project/zero-codex-next" --skip
 
 同じstate directoryを引き継いだ新checkoutのsetupがlock取得・旧service停止・配線切替を行い、
 旧checkoutを直接fast-forwardしません。以後の更新は
-`zerokun-update`で行えます。stateへ配置する自己更新runtimeは、全依存fileを検証済みbundleへ
+`zerochan update`で行えます。`zerochan stop` → `zerochan start`は同じ版の再起動であり、
+更新の代わりにはなりません。stateへ配置する自己更新runtimeは、全依存fileを検証済みbundleへ
 publishしてからentrypointをatomicに切り替えるため、途中終了しても旧bundleを維持します。
 
 更新中のprocess回収はmacOSのmicrosecond世代IDでPID/PGID再利用を判別し、観測不能または残存processが

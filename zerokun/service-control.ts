@@ -380,7 +380,7 @@ async function cleanupRecordedTab(
 
 function requireNoInterruptedUpdate(stateDir: string): void {
   if (existsSync(join(stateDir, 'update-transaction.json'))) {
-    fail('未完了の自己更新があります。先に zerokun-update --recover-only を実行してください')
+    fail('未完了の自己更新があります。先に zerochan update --recover-only を実行してください')
   }
 }
 

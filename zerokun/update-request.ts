@@ -10,7 +10,6 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'fs'
-import { homedir } from 'os'
 import { dirname, isAbsolute, join } from 'path'
 import { fileURLToPath } from 'url'
 import { buildUpdaterEnvironment, parseStateSlackTokens } from './child-environment.ts'
@@ -316,11 +315,12 @@ export function launchDetachedUpdateWorker(
 ): void {
   const dir = options.stateDir ?? stateDir()
   const workerFile = options.workerFile ?? join(dir, 'update-request.ts')
-  const updaterPath = options.updaterPath ?? join(homedir(), '.local', 'bin', 'zerokun-update')
+  const updaterPath = options.updaterPath
   const tmux = resolveTmuxPath(options.tmuxPath)
   const session = options.tmuxSession ?? WORKER_SESSION
   if (!existsSync(workerFile)) throw new Error(`update workerがありません: ${workerFile}`)
-  if (!existsSync(updaterPath)) throw new Error(`zerokun-updateがありません: ${updaterPath}`)
+  if (!updaterPath) throw new Error('Zeroちゃん更新entrypointが指定されていません')
+  if (!existsSync(updaterPath)) throw new Error(`Zeroちゃん更新entrypointがありません: ${updaterPath}`)
   if (tmuxSessionExists(tmux, session)) throw new Error('別のZeroちゃん更新workerが実行中です')
   const legacyCutover = options.legacyCutover
     ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
@@ -875,7 +875,7 @@ export async function executeUpdater(
       }
     }
     gateExitConfirmed = true
-    throw new Error(`zerokun-updateが${timeoutMs}msでtimeoutしました`)
+    throw new Error(`zerochan updateが${timeoutMs}msでtimeoutしました`)
   } finally {
     if (registeredGate && gateExitConfirmed) options.onGateExit?.(registeredGate)
     closeSync(logFd)
@@ -891,7 +891,7 @@ export async function runUpdateWorker(
   const request = readRequest(dir)
   if (!request || request.id !== requestId) throw new Error(`更新依頼が見つかりません: ${requestId}`)
   const logPath = join(dir, 'update-request.log')
-  const updaterPath = options.updaterPath ?? join(homedir(), '.local', 'bin', 'zerokun-update')
+  const updaterPath = options.updaterPath
   const legacyCutover = options.legacyCutover
     ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
   const projectDir = request.projectDir ?? options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
@@ -902,8 +902,11 @@ export async function runUpdateWorker(
     ZEROKUN_LEGACY_CUTOVER: legacyCutover ? '1' : '0',
     ...(projectDir ? { ZEROKUN_PROJECT_DIR: projectDir } : {}),
   }
+  if (!options.executeUpdater && !updaterPath) {
+    throw new Error('Zeroちゃん更新entrypointが指定されていません')
+  }
   const run = options.executeUpdater ?? (() => executeUpdater(
-    updaterPath,
+    updaterPath!,
     logPath,
     options.updaterTimeoutMs,
     options.updaterTermGraceMs,
@@ -935,7 +938,7 @@ export async function runUpdateWorker(
     try {
       exitCode = await run()
       success = exitCode === 0
-      if (!success) errorText = `zerokun-updateが終了コード${exitCode}で失敗しました。`
+      if (!success) errorText = `zerochan updateが終了コード${exitCode}で失敗しました。`
     } catch (error) {
       errorText = error instanceof Error ? error.message : String(error)
     }
@@ -1001,7 +1004,7 @@ async function runCli(): Promise<void> {
 
 if (import.meta.main) {
   runCli().catch(error => {
-    process.stderr.write(`zerokun update worker: ${error instanceof Error ? error.message : String(error)}\n`)
+    process.stderr.write(`zerochan update worker: ${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
   })
 }

@@ -385,6 +385,8 @@ describe('advisor broker boundaries', () => {
     const fakeClaude = join(root, 'claude')
     writeFileSync(fakeClaude, [
       '#!/bin/sh',
+      // Keep the fixture alive long enough for runBounded to record its process generation.
+      '/bin/sleep 0.2',
       'if [ -n "${USER:-}" ] && [ "$USER" = "${LOGNAME:-}" ] && [ -n "${SHELL:-}" ] && [ -n "${TMPDIR:-}" ]; then',
       '  printf \'%s\\n\' \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\'',
       'else',

@@ -258,6 +258,19 @@ describe('Slack update request', () => {
     }
   })
 
+  test('workerは旧standalone commandへfallbackせず明示entrypointを要求する', async () => {
+    const stateDir = fixtureDir()
+    await requestUpdate(input(), {
+      stateDir,
+      idFactory: () => 'request-without-entrypoint',
+      launchWorker: () => {},
+    })
+    await expect(runUpdateWorker('request-without-entrypoint', {
+      stateDir,
+      notify: async () => {},
+    })).rejects.toThrow('Zeroちゃん更新entrypointが指定されていません')
+  })
+
   test('Slack完了通知のnetwork hangをdeadlineで中断する', async () => {
     await expect(withUpdateSlackDeadline(
       () => new Promise<void>(() => {}),

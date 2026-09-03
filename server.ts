@@ -123,6 +123,7 @@ const THREADS_FILE = join(STATE_DIR, 'threads.json')
 const UPDATE_JOURNAL_FILE = join(STATE_DIR, 'update-transaction.json')
 const UPDATE_LOCK_DIR = join(STATE_DIR, 'update.lock')
 const UPDATE_REQUEST_FILE = process.env.ZEROKUN_UPDATE_REQUEST ?? join(STATE_DIR, 'update-request.ts')
+const UPDATE_ENTRYPOINT = join(import.meta.dir, 'zerokun', 'update.ts')
 const READY_FILE = join(STATE_DIR, 'gateway-ready.json')
 
 // Thread catch-up poller cadence and reach. Only threads whose dispatcher
@@ -1050,6 +1051,7 @@ async function enqueueUpdate(
     {
       stateDir: STATE_DIR,
       workerFile: UPDATE_REQUEST_FILE,
+      updaterPath: UPDATE_ENTRYPOINT,
       // A self-update must preserve the shared gateway's bootstrap/default
       // project. The Slack thread's project remains pinned independently in
       // SQLite and must not become the new DM/default destination.
@@ -2370,7 +2372,13 @@ const scheduleCatchupSweep = singleFlightAsync(catchupSweep, error => {
 })
 
 function recoverUpdateNotificationWorker(): void {
-  try { resumePendingUpdateWorker({ stateDir: STATE_DIR, workerFile: UPDATE_REQUEST_FILE }) }
+  try {
+    resumePendingUpdateWorker({
+      stateDir: STATE_DIR,
+      workerFile: UPDATE_REQUEST_FILE,
+      updaterPath: UPDATE_ENTRYPOINT,
+    })
+  }
   catch (error) {
     process.stderr.write(`slack channel: update worker recovery failed: ${error}\n`)
   }

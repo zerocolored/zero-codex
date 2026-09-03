@@ -1696,6 +1696,10 @@ codex --version
         join(root, 'zerokun/access.ts'),
         join(fakeHome, '.local/bin/zerokun-access'),
       )
+      symlinkSync(
+        join(root, 'zerokun/update.ts'),
+        join(fakeHome, '.local/bin/zerokun-update'),
+      )
       mkdirSync(join(stateDir, 'owner/claude-config/.git'), { recursive: true })
       mkdirSync(join(stateDir, 'owner/claude-skills/.git'), { recursive: true })
       mkdirSync(projectDir, { recursive: true })
@@ -1737,6 +1741,7 @@ codex --version
       expect(realpathSync(join(fakeHome, '.local/bin/zerokun-status')))
         .toBe(realpathSync(join(root, 'zerokun/status.ts')))
       expect(existsSync(join(fakeHome, '.local/bin/zerokun-access'))).toBe(false)
+      expect(existsSync(join(fakeHome, '.local/bin/zerokun-update'))).toBe(false)
       expect(statSync(join(fakeHome, '.zshrc')).mode & 0o777).toBe(0o644)
       expect(readFileSync(
         join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),
@@ -1760,8 +1765,130 @@ codex --version
         stderr: 'pipe',
       })
       expect(copiedWorker.exitCode).toBe(1)
+      expect(copiedWorker.stderr.toString()).toContain('zerochan update worker:')
       expect(copiedWorker.stderr.toString()).toContain('usage: update-request.ts run')
       expect(copiedWorker.stderr.toString()).not.toContain('Cannot find module')
+
+      const unrelatedUpdater = join(fakeHome, '.local/bin/zerokun-update')
+      writeFileSync(unrelatedUpdater, '#!/bin/sh\necho unrelated\n', { mode: 0o700 })
+      const repeated = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_PROJECT_DIR: projectDir,
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          PATH: testPath,
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(repeated.exitCode, repeated.stderr.toString()).toBe(0)
+      expect(readFileSync(unrelatedUpdater, 'utf8')).toBe('#!/bin/sh\necho unrelated\n')
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('bootstrap setupは検証済み旧checkoutのlauncherを新checkoutへ引き継ぐ', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-checkout-handoff-'))
+    const stateDir = join(fakeHome, '.codex/zerokun')
+    const projectDir = join(fakeHome, 'project')
+    const oldRepo = join(fakeHome, 'old-zero-codex')
+    const oldZerokun = join(oldRepo, 'zerokun')
+    try {
+      const testPath = setupTestPath(fakeHome)
+      mkdirSync(oldZerokun, { recursive: true })
+      for (const [path, contents] of [
+        [join(oldRepo, 'codex-channel.sh'), '#!/bin/bash\n'],
+        [join(oldZerokun, 'access.ts'), '#!/usr/bin/env bun\n'],
+        [join(oldZerokun, 'update.ts'), '#!/usr/bin/env bun\n'],
+        [join(oldZerokun, 'setup.sh'), '#!/bin/bash\n'],
+      ] as const) writeFileSync(path, contents, { mode: 0o700 })
+      const initialized = Bun.spawnSync(['/usr/bin/git', 'init', '--initial-branch=main', oldRepo], {
+        stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(initialized.exitCode, initialized.stderr.toString()).toBe(0)
+      for (const [key, value] of [
+        ['remote.origin.url', 'https://github.com/zerocolored/zero-codex.git'],
+        ['remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*'],
+        ['branch.main.remote', 'origin'],
+        ['branch.main.merge', 'refs/heads/main'],
+      ] as const) {
+        const configured = Bun.spawnSync(['/usr/bin/git', '-C', oldRepo, 'config', key, value], {
+          stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+        })
+        expect(configured.exitCode, configured.stderr.toString()).toBe(0)
+      }
+
+      const localBin = join(fakeHome, '.local/bin')
+      symlinkSync(join(oldRepo, 'codex-channel.sh'), join(localBin, 'zerochan'))
+      symlinkSync(join(oldRepo, 'codex-channel.sh'), join(localBin, 'zerokun'))
+      symlinkSync(join(oldZerokun, 'access.ts'), join(localBin, 'zerochan-access'))
+      symlinkSync(join(oldZerokun, 'access.ts'), join(localBin, 'zerokun-access'))
+      symlinkSync(join(oldZerokun, 'update.ts'), join(localBin, 'zerokun-update'))
+      mkdirSync(join(stateDir, 'owner/claude-config/.git'), { recursive: true })
+      mkdirSync(join(stateDir, 'owner/claude-skills/.git'), { recursive: true })
+      mkdirSync(projectDir, { recursive: true })
+      writeFileSync(join(stateDir, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-existing-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-A0123456789-existing-not-a-real-token',
+        '',
+      ].join('\n'), { mode: 0o600 })
+
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_BOOTSTRAP: '1',
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_PROJECT_DIR: projectDir,
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          PATH: testPath,
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+
+      expect(result.exitCode, `${result.stdout.toString()}\n${result.stderr.toString()}`).toBe(0)
+      expect(realpathSync(join(localBin, 'zerochan'))).toBe(realpathSync(join(root, 'codex-channel.sh')))
+      expect(realpathSync(join(localBin, 'zerokun'))).toBe(realpathSync(join(root, 'codex-channel.sh')))
+      expect(realpathSync(join(localBin, 'zerochan-access')))
+        .toBe(realpathSync(join(root, 'zerokun/access.ts')))
+      expect(existsSync(join(localBin, 'zerokun-access'))).toBe(false)
+      expect(existsSync(join(localBin, 'zerokun-update'))).toBe(false)
+      expect(existsSync(join(oldRepo, 'codex-channel.sh'))).toBe(true)
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  test('bootstrap setupは未検証checkoutを指すlauncherを変更しない', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-untrusted-handoff-'))
+    const oldRepo = join(fakeHome, 'untrusted-zero')
+    const command = join(fakeHome, '.local/bin/zerochan')
+    try {
+      const testPath = setupTestPath(fakeHome)
+      mkdirSync(oldRepo, { recursive: true })
+      writeFileSync(join(oldRepo, 'codex-channel.sh'), '#!/bin/bash\n', { mode: 0o700 })
+      symlinkSync(join(oldRepo, 'codex-channel.sh'), command)
+      const stateDir = join(fakeHome, 'state-that-must-not-be-created')
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          ZEROKUN_BOOTSTRAP: '1',
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          PATH: testPath,
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode).toBe(1)
+      expect(result.stderr.toString()).toContain('旧Zeroちゃんlauncherの所有元を安全に確認できません')
+      expect(realpathSync(command)).toBe(realpathSync(join(oldRepo, 'codex-channel.sh')))
+      expect(existsSync(stateDir)).toBe(false)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
