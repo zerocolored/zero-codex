@@ -8173,10 +8173,10 @@ export class JobStore {
         // would incorrectly skip a newer ordinary failure and resurrect an
         // older, no-longer-adjacent session.
         const preceding = this.db.query<
-          { session_id: string | null; status: JobStatus; last_error: string | null },
+          { session_id: string | null; status: JobStatus },
           [string, string, string, number, number]
         >(
-          `SELECT jobs.session_id, jobs.status, jobs.last_error
+          `SELECT jobs.session_id, jobs.status
            FROM jobs
            WHERE jobs.runtime = 'codex'
              AND jobs.chat_id = ?
@@ -8193,10 +8193,12 @@ export class JobStore {
           row.write_enabled,
           row.seq,
         )
+        // A failed App Server turn does not erase the durable Codex thread.
+        // When the executor knows the session itself is unusable it clears or
+        // retires that session explicitly; every other same-thread failure is
+        // valuable continuation context for the user's next "resume" request.
         const prior = preceding?.session_id
-          && (preceding.status === 'completed'
-            || (preceding.status === 'failed'
-              && preceding.last_error === FORCED_SERVICE_STOP_FAILURE_MESSAGE))
+          && (preceding.status === 'completed' || preceding.status === 'failed')
           && sessionUsesCurrentProtocol(preceding.session_id)
           && this.db.query<{ present: number }, [string]>(
             `SELECT 1 AS present FROM codex_session_retirements WHERE session_id = ?`,
@@ -8308,11 +8310,9 @@ export class JobStore {
              WHERE interjection.job_id = jobs.id
                AND interjection.status NOT IN ('promoted', 'superseded')
            )
-           AND (
-             jobs.write_enabled = 0 OR EXISTS (
-               SELECT 1 FROM github_publication_sets AS publication
-               WHERE publication.job_id = jobs.id AND publication.status = 'completed'
-             )
+           AND NOT EXISTS (
+             SELECT 1 FROM github_publication_sets AS publication
+             WHERE publication.job_id = jobs.id AND publication.status != 'completed'
            )`,
         [persistedSessionId, result, finishedAt, id],
       )
@@ -8383,9 +8383,6 @@ export class JobStore {
       ).get(id)
       if (!row || row.status !== 'running') {
         throw new Error(`job is no longer running: ${id}`)
-      }
-      if (row.write_enabled === 1 && !publication) {
-        throw new Error(`write result omitted its reviewed GitHub publication set for job ${id}`)
       }
       const persistedSession = requireText(sessionId, 'sessionId')
       const resultDigest = executionResultDigest(persistedSession, result)
@@ -9098,7 +9095,7 @@ export class JobStore {
     const publication = this.db.query<{ status: 'pending' | 'completed' }, [string]>(
       'SELECT status FROM github_publication_sets WHERE job_id = ?',
     ).get(id)
-    if (row.write_enabled === 1 && publication?.status !== 'completed') {
+    if (publication?.status === 'pending') {
       throw new Error(`GitHub publication is still pending for job ${id}`)
     }
     this.completeInternal(
@@ -9121,11 +9118,9 @@ export class JobStore {
       `SELECT id FROM jobs
        WHERE runtime = 'codex' AND status = 'running'
          AND pending_session_id IS NOT NULL AND pending_result IS NOT NULL
-         AND (
-           jobs.write_enabled = 0 OR EXISTS (
-             SELECT 1 FROM github_publication_sets AS publication
-             WHERE publication.job_id = jobs.id AND publication.status = 'completed'
-           )
+         AND NOT EXISTS (
+           SELECT 1 FROM github_publication_sets AS publication
+           WHERE publication.job_id = jobs.id AND publication.status != 'completed'
          )
          AND cancel_requested_at IS NULL
          AND NOT EXISTS (
@@ -12329,6 +12324,24 @@ export function requeueGitHubPublicationConflictForCodex(
   )
 }
 
+export function requeueLegacyGitHubPublicationForCodex(
+  store: JobStore,
+  stateDir: string,
+  jobId: string,
+): GitHubPublicationRecoveryContext {
+  const pending = store.pendingGitHubPublications(jobId)
+  if (pending.length === 0) {
+    throw new Error(`legacy GitHub publication disappeared for job ${jobId}`)
+  }
+  discardExecutionResultJournalForPublicationRecovery(stateDir, jobId)
+  return store.requeueGitHubPublicationConflictForCodex(
+    jobId,
+    pending[0]!.plan,
+    'Legacy host publication was returned to the primary Codex workflow; '
+      + 'inspect live GitHub and deployment state before continuing the original request.',
+  )
+}
+
 export async function publishStagedGitHubPublication(
   store: JobStore,
   jobId: string,
@@ -12975,10 +12988,10 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       }
       scheduleNotificationFlush()
 
-      if (options.store.countClaimable() > 0) {
+      if (options.store.countClaimable() > 0 && options.beforeClaim) {
         await runExternalContextBoundary(
           options.beforeClaim,
-          'advisor pre-claim reconciliation is unavailable',
+          'external context pre-claim reconciliation is unavailable',
         )
       }
 
@@ -13048,15 +13061,17 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           continue
         }
         await updateMonitor(job, '待機中のタスクに届いた中止要求を反映します')
-        await runExternalContextBoundary(
-          options.cancelExternalContext
-            ? () => options.cancelExternalContext!(job)
-            : options.settleExternalContext
-              ? () => options.settleExternalContext!(job)
-              : undefined,
-          `advisor cancellation cleanup is pending for job ${job.id}`,
-        )
-        await updateMonitor(job, '一時的な補助セッションを終了しました')
+        const cancelExternalContext = options.cancelExternalContext
+          ? () => options.cancelExternalContext!(job)
+          : options.settleExternalContext
+            ? () => options.settleExternalContext!(job)
+            : undefined
+        if (cancelExternalContext) {
+          await runExternalContextBoundary(
+            cancelExternalContext,
+            `external context cancellation cleanup is pending for job ${job.id}`,
+          )
+        }
         await quiesceMonitorBeforeTerminal()
         options.store.cancel(job.id)
         stats.failed += 1
@@ -13233,15 +13248,16 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       }
       options.assertJobMonitorHealthy?.(job)
       await updateMonitor(job, '実行結果を安全に保存しました')
-      await runExternalContextBoundary(
-        options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
-        `advisor cleanup is pending for job ${job.id}`,
-      )
+      if (options.settleExternalContext) {
+        await runExternalContextBoundary(
+          () => options.settleExternalContext!(job),
+          `external context cleanup is pending for job ${job.id}`,
+        )
+      }
       if (options.store.get(job.id)?.cancelRequestedAt !== null) {
         throw new CodexUserCancelledError()
       }
       options.assertJobMonitorHealthy?.(job)
-      await updateMonitor(job, '一時的な補助セッションを終了しました')
       if (execution.publication && execution.publication.plans.length > 0) {
         await updateMonitor(job, 'review済みcommitをGitHubへ公開します')
         await publishStagedGitHubPublication(options.store, job.id, {
@@ -13448,7 +13464,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           + 'then resend only if needed.'
         await runExternalContextBoundary(
           options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
-          `advisor cleanup is pending for rate-limited write job ${job.id}`,
+          `owned process cleanup is pending for rate-limited write job ${job.id}`,
         )
         await updateMonitor(job, '利用上限後の副作用が不確実なため失敗として確定します')
         await quiesceMonitorBeforeTerminal()
@@ -13480,8 +13496,8 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       }
       const failure = job.writeEnabled
         && options.store.writePhaseMayHaveBeenDelivered(job.id, job.attempts)
-        ? 'write-enabled implementation may already have changed the repository or external '
-          + 'services before a later phase failed. Review those effects, then resend only if '
+        ? 'write-enabled work may already have changed the repository or external services '
+          + 'before the Codex workflow failed. Review those effects, then resend only if '
           + `needed. Underlying failure: ${message}`
         : message
       await updateMonitor(job, '失敗として確定します')
@@ -13718,9 +13734,6 @@ export function persistExecutionResultJournal(
   job: JobRecord,
   execution: JobExecutionResult,
 ): void {
-  if (job.writeEnabled && !execution.publication) {
-    throw new Error(`write result omitted its reviewed GitHub publication set for job ${job.id}`)
-  }
   const path = executionResultJournalPath(dir, job.id)
   const existing = readOptionalPrivateFile(path)
   if (existing !== null) {
@@ -15038,16 +15051,16 @@ export async function recoverExecutionCheckpointBeforeAdvisorCleanup(
   store: JobStore,
   dir: string,
   reconcileAdvisors: () => Promise<void>,
-  publishStaged?: (jobId: string) => Promise<void>,
+  settleLegacyPublication?: (jobId: string) => Promise<void>,
 ): Promise<{ journaled: number; completed: number }> {
   // A result journal is the process-exit checkpoint, but its SQLite stage must
   // exist before recovery may close a round-owned ephemeral advisor workspace.
   // Keep this order identical for daemon startup and explicit recovery.
   const journaled = recoverExecutionResultJournals(store, dir)
   await reconcileAdvisors()
-  if (publishStaged) {
+  if (settleLegacyPublication) {
     for (const jobId of store.pendingGitHubPublicationJobIds()) {
-      await publishStaged(jobId)
+      await settleLegacyPublication(jobId)
     }
   }
   const completed = store.recoverStagedExecutions()
@@ -16850,10 +16863,6 @@ async function runCli(): Promise<void> {
       throw new Error('job runner is still running; refuse interrupted-job recovery')
     }
     const log = (message: string) => process.stderr.write(`${message}\n`)
-    const recoveryController = new AbortController()
-    const abortRecovery = () => recoveryController.abort()
-    process.on('SIGINT', abortRecovery)
-    process.on('SIGTERM', abortRecovery)
     try {
       const runtime = readPinnedHerdrRuntime(dir)
       await verifyHerdrRuntimeIdentityAsync(runtime)
@@ -16923,28 +16932,16 @@ async function runCli(): Promise<void> {
         ),
         async jobId => {
           try {
-            await publishStagedGitHubPublication(store, jobId, {
-              signal: recoveryController.signal,
-              onStatus: message => {
-                try { appendHerdrJobMonitorStatus(dir, jobId, message) } catch (error) {
-                  log(`GitHub publication monitor update failed for ${jobId}: ${String(error)}`)
-                }
-              },
-            })
-          } catch (error) {
-            if (!(error instanceof CodexPublicationConflictRecoveryError)) throw error
-            try {
-              appendHerdrJobMonitorStatus(
-                dir,
-                jobId,
-                'GitHub側の競合を同じ履歴へ戻し、Codexが解消方法を判断して続行します',
-              )
-            } catch (monitorError) {
-              log(`GitHub publication monitor update failed for ${jobId}: ${String(monitorError)}`)
-            }
-            requeueGitHubPublicationConflictForCodex(store, dir, error)
-            log(`requeued ${jobId} for Codex publication conflict recovery during startup`)
+            appendHerdrJobMonitorStatus(
+              dir,
+              jobId,
+              '旧公開処理を同じCodexセッションへ戻し、現在のGitHub状態から続行します',
+            )
+          } catch (monitorError) {
+            log(`GitHub publication monitor update failed for ${jobId}: ${String(monitorError)}`)
           }
+          requeueLegacyGitHubPublicationForCodex(store, dir, jobId)
+          log(`requeued ${jobId} from legacy host publication to its primary Codex session`)
         },
       )
       if (journaled > 0) log(`recovered ${journaled} durable execution result journal(s)`)
@@ -16966,8 +16963,6 @@ async function runCli(): Promise<void> {
       }
       process.stdout.write(`${JSON.stringify(recovered)}\n`)
     } finally {
-      process.off('SIGINT', abortRecovery)
-      process.off('SIGTERM', abortRecovery)
       store.close()
       releaseDaemonLock(lockDir, lease)
     }
@@ -17124,28 +17119,16 @@ async function runCli(): Promise<void> {
       ),
       async jobId => {
         try {
-          await publishStagedGitHubPublication(store, jobId, {
-            signal: controller.signal,
-            onStatus: message => {
-              try { appendHerdrJobMonitorStatus(dir, jobId, message) } catch (error) {
-                log(`GitHub publication monitor update failed for ${jobId}: ${String(error)}`)
-              }
-            },
-          })
-        } catch (error) {
-          if (!(error instanceof CodexPublicationConflictRecoveryError)) throw error
-          try {
-            appendHerdrJobMonitorStatus(
-              dir,
-              jobId,
-              'GitHub側の競合を同じ履歴へ戻し、Codexが解消方法を判断して続行します',
-            )
-          } catch (monitorError) {
-            log(`GitHub publication monitor update failed for ${jobId}: ${String(monitorError)}`)
-          }
-          requeueGitHubPublicationConflictForCodex(store, dir, error)
-          log(`requeued ${jobId} for Codex publication conflict recovery during startup`)
+          appendHerdrJobMonitorStatus(
+            dir,
+            jobId,
+            '旧公開処理を同じCodexセッションへ戻し、現在のGitHub状態から続行します',
+          )
+        } catch (monitorError) {
+          log(`GitHub publication monitor update failed for ${jobId}: ${String(monitorError)}`)
         }
+        requeueLegacyGitHubPublicationForCodex(store, dir, jobId)
+        log(`requeued ${jobId} from legacy host publication to its primary Codex session`)
       },
     )
     if (journaled > 0) log(`recovered ${journaled} durable execution result journal(s)`)
@@ -17309,21 +17292,6 @@ async function runCli(): Promise<void> {
       stopWhenIdle: command === 'run-until-idle',
       shouldPause,
       advisorStateDir: dir,
-      beforeClaim: async () => { await reconcileEphemeralAndRetiredAdvisorRounds({
-        stateDir: dir,
-        runtime: pinnedHerdrRuntime,
-        log,
-      }) },
-      settleExternalContext: async () => { await reconcileEphemeralAndRetiredAdvisorRounds({
-        stateDir: dir,
-        runtime: pinnedHerdrRuntime,
-        log,
-      }) },
-      cancelExternalContext: async () => { await reconcileEphemeralAndRetiredAdvisorRounds({
-        stateDir: dir,
-        runtime: pinnedHerdrRuntime,
-        log,
-      }) },
       openJobMonitor: async job => {
         try {
           const current = store.get(job.id)
@@ -17400,16 +17368,11 @@ async function runCli(): Promise<void> {
         }
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
-          const execution = await executeCodexJob({
-            ...job,
-            githubPublicationRecovery: store.latestGitHubPublicationRecovery(job.id),
-          }, {
+          const execution = await executeCodexJob(job, {
             signal: executionController.signal,
             stateDir: dir,
             logDir: join(dir, 'job-logs'),
-            uiApproval: store.latestUiApprovalContext(job.id),
             threadHistory: store.threadHistorySnapshot(job.id, job.attempts),
-            publicationContinuation: store.githubPublicationContinuation(job.id),
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId),
             onSessionReset: () => store.clearSession(job.id),
@@ -17710,17 +17673,16 @@ async function runCli(): Promise<void> {
               log,
             ),
           })
-          // Phased write results are already sealed and staged atomically.
-          // Compatibility/read results are staged here before the executor
-          // callback returns to the serial queue. The journal is an extra
-          // recovery copy, never the only durable publication checkpoint.
+          // The executor seals the final input revision before returning.
+          // Stage the result again idempotently before the callback returns to
+          // the serial queue. The journal is an extra recovery copy, never the
+          // only durable completion checkpoint.
           try {
             persistExecutionResultJournal(dir, job, execution)
           } catch (error) {
-            // The SQLite phase seal above is the authoritative durable
+            // The SQLite input/result seal above is the authoritative durable
             // checkpoint. A best-effort filesystem journal failure must not
-            // turn a reviewed result into a failed job or cause Codex to run
-            // the implementation again.
+            // turn an accepted result into a failed job or rerun the work.
             log(`result journal: SQLite checkpoint retained (${String(error)})`)
           }
           store.ensureExecutionResultStaged(

@@ -23,6 +23,7 @@ const MAX_DIRECT_ENTRIES = 1_024
 const MAX_WORKSPACE_REPOSITORIES = 16
 const MAX_PIN_BYTES = 16 * 1024
 const MAX_ROOT_INSTRUCTION_BYTES = 1024 * 1024
+const LOCAL_GIT_TIMEOUT_MS = 10_000
 const WORKSPACE_PIN_VERSION = 1 as const
 const ROOT_INSTRUCTION_NAMES = new Set(['AGENTS.md', 'CLAUDE.md'])
 
@@ -106,6 +107,7 @@ function gitResult(
       LC_ALL: 'C',
     },
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    timeout: LOCAL_GIT_TIMEOUT_MS,
   })
 }
 

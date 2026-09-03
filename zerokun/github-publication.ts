@@ -169,6 +169,8 @@ export class GitHubPublicationError extends Error {
   }
 }
 
+const LOCAL_GIT_TIMEOUT_MS = 10_000
+
 function gitSync(repo: string, args: readonly string[], allowFailure = false): string {
   const result = Bun.spawnSync([
     '/usr/bin/git',
@@ -193,6 +195,7 @@ function gitSync(repo: string, args: readonly string[], allowFailure = false): s
       LC_ALL: 'C',
     },
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    timeout: LOCAL_GIT_TIMEOUT_MS,
   })
   if (result.exitCode !== 0 && !allowFailure) {
     throw new GitHubPublicationError('configuration', 'Git repository metadata is unavailable')
@@ -214,6 +217,7 @@ function validBranch(repo: string, value: string): string {
   ], {
     env: { PATH: '/usr/bin:/bin', HOME: '/', LC_ALL: 'C' },
     stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+    timeout: LOCAL_GIT_TIMEOUT_MS,
   })
   if (result.exitCode !== 0) {
     throw new GitHubPublicationError('configuration', `Git branch binding is invalid for ${repo}`)
@@ -641,6 +645,7 @@ export function prepareGitHubPublicationPlans(
         GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1', LC_ALL: 'C',
       },
       stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+      timeout: LOCAL_GIT_TIMEOUT_MS,
     })
     if (ancestor.exitCode !== 0) {
       throw new GitHubPublicationError(
@@ -1054,6 +1059,7 @@ function assertGitHubPublicationSource(value: GitHubPublicationPlan): void {
       GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1', LC_ALL: 'C',
     },
     stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+    timeout: LOCAL_GIT_TIMEOUT_MS,
   })
   if (ancestor.exitCode !== 0) {
     throw new GitHubPublicationError(

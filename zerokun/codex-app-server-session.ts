@@ -1115,7 +1115,12 @@ export class CodexAppServerSession {
       const observed = this.takeTurnProjection(threadId, turnId)
       return {
         threadId,
-        turn: mergeTurnItems(turn, observed.lastAgentMessage ? [observed.lastAgentMessage] : []),
+        turn: mergeTurnItems(
+          turn,
+          turn.itemsView === 'full' || !observed.lastAgentMessage
+            ? []
+            : [observed.lastAgentMessage],
+        ),
         permissionEvidence: mergeAppServerPermissionProbeEvidence(
           observed.permissionEvidence,
           permissionProbeEvidenceFromItems(turn.items),
@@ -1154,7 +1159,12 @@ export class CodexAppServerSession {
         sequence: notification.sequence,
         terminal: {
           threadId,
-          turn: mergeTurnItems(turn, observed.lastAgentMessage ? [observed.lastAgentMessage] : []),
+          turn: mergeTurnItems(
+            turn,
+            turn.itemsView === 'full' || !observed.lastAgentMessage
+              ? []
+              : [observed.lastAgentMessage],
+          ),
           permissionEvidence: mergeAppServerPermissionProbeEvidence(
             observed.permissionEvidence,
             permissionProbeEvidenceFromItems(turn.items),

@@ -1659,6 +1659,29 @@ describe('Codex App Server session', () => {
     expect(appServerFinalMessage(terminal!.turn)).toBe('確定した回答')
   })
 
+  test('full turn/completedにないstream回答を公式finalとして補完しない', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    transport.emit({ method: 'turn/started', params: { threadId: 'thread-official-final', turn: {
+      id: 'turn-official-final', status: 'inProgress', itemsView: 'full', items: [], error: null,
+    } } })
+    transport.emit({ method: 'item/completed', params: {
+      threadId: 'thread-official-final', turnId: 'turn-official-final',
+      item: { type: 'agentMessage', id: 'stream-only-final', text: 'stream上だけの回答' },
+    } })
+    transport.emit({ method: 'turn/completed', params: {
+      threadId: 'thread-official-final', turn: {
+        id: 'turn-official-final', status: 'completed', itemsView: 'full', items: [], error: null,
+      },
+    } })
+    transport.close()
+    await session.waitForReader()
+
+    const terminal = session.takeTurnTerminal('thread-official-final', 'turn-official-final')
+    expect(terminal).not.toBeNull()
+    expect(appServerFinalMessage(terminal!.turn)).toBeNull()
+  })
+
   test('permission item journalは初回未対応だけnullにし成功page後はfail-closeする', async () => {
     const unsupportedTransport = mockTransport((request, emit) => {
       if (request.method === 'thread/items/list') {

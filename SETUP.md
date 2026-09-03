@@ -21,6 +21,11 @@ Codexには次のように依頼します。
 ## 「一言でセットアップ」の範囲
 
 Codexが技術的な選択、commandの順序、再実行、検証を引き受けます。完全無人という意味ではありません。
+セットアップ後の各Slack依頼も、Zeroちゃんが準備・実装・review・公開へ分割せず、1つのprimary Codex
+workflowとして実行します。Codexは対象projectの`AGENTS.md`に従い、依頼に含まれるGitHub操作や
+deploy確認まで自分で進めます。ZeroちゃんはFIFO、同一thread継続、process回収、認証情報を隠した
+GitHub transportだけを担当します。
+
 次の外部認証だけは、画面を見ているユーザー本人の操作が必要です。
 
 1. macOSのCommand Line Toolsなどのinstall dialog
