@@ -531,6 +531,103 @@ describe('Herdr job monitor', () => {
     expect(control.createCalls).toBe(1)
   })
 
+  test('service stopはqueued monitorを保持せず停止表示後に閉じる', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job()
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    const retired: string[] = []
+
+    const result = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ status: 'queued' }),
+      closeForServiceStop: true,
+      onMonitorRetired: id => { retired.push(id) },
+      control,
+    })
+
+    expect(result).toEqual({ retained: 0, closed: 1, retainedJobIds: [] })
+    expect(control.closeCalls).toBe(1)
+    expect(control.tabs).toHaveLength(0)
+    expect(retired).toEqual([record.id])
+    expect(existsSync(join(state, 'job-monitors', record.id))).toBe(false)
+  })
+
+  test('service stopはmonitor root欠落時もdurable obligationを解除する', async () => {
+    const state = fixtureDirectory()
+    const record = job({ status: 'failed', monitorState: 'required' })
+    let obligations = [{
+      id: record.id,
+      status: 'failed' as const,
+      state: 'required' as const,
+    }]
+
+    const result = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ seq: record.seq, status: 'failed' }),
+      listMonitorObligations: () => obligations,
+      recoverMissingBindingAfterExecutorsStopped: () => {
+        obligations = []
+        return 'terminalized'
+      },
+      closeForServiceStop: true,
+      control: new FakeControl(),
+    })
+
+    expect(result).toEqual({ retained: 0, closed: 0, retainedJobIds: [] })
+    expect(obligations).toEqual([])
+  })
+
+  test('service stopはstate欠落時に同じmonitor labelが残ればobligationを保持する', async () => {
+    const state = fixtureDirectory()
+    const record = job({ status: 'failed', monitorState: 'required' })
+    const control = new FakeControl()
+    control.tabs.push({
+      tabId: 'wT:t9', workspaceId: 'wT', label: `Zeroちゃん #${record.seq}`, paneCount: 1,
+    })
+
+    await expect(reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ seq: record.seq, status: 'failed' }),
+      listMonitorObligations: () => [{
+        id: record.id, status: 'failed', state: 'required',
+      }],
+      recoverMissingBindingAfterExecutorsStopped: () => 'terminalized',
+      closeForServiceStop: true,
+      control,
+    })).rejects.toThrow(`unrecorded monitor tab may still exist for ${record.id}`)
+  })
+
+  test('service stopはbindingのない空monitor directoryを確認してから退役する', async () => {
+    const state = fixtureDirectory()
+    const record = job({ status: 'failed', monitorState: 'required' })
+    mkdirSync(join(state, 'job-monitors'), { mode: 0o700 })
+    mkdirSync(join(state, 'job-monitors', record.id), { mode: 0o700 })
+    let retired = false
+
+    const result = await reconcileHerdrJobMonitors({
+      stateDir: state,
+      runtime: runtime(),
+      getJob: () => ({ seq: record.seq, status: 'failed' }),
+      listMonitorObligations: () => retired ? [] : [{
+        id: record.id, status: 'failed', state: 'required' as const,
+      }],
+      recoverMissingBindingAfterExecutorsStopped: () => {
+        retired = true
+        return 'terminalized'
+      },
+      closeForServiceStop: true,
+      control: new FakeControl(),
+    })
+
+    expect(result).toEqual({ retained: 0, closed: 0, retainedJobIds: [] })
+    expect(retired).toBe(true)
+    expect(existsSync(join(state, 'job-monitors', record.id))).toBe(false)
+  })
+
   test('pane shell PIDが別でもforegroundが一意なviewerならactiveにできる', async () => {
     const state = fixtureDirectory()
     const control = new FakeControl()

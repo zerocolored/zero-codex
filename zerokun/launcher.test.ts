@@ -354,6 +354,24 @@ describe('codex-channel.sh replacement guard', () => {
     expect(stopCalls).toContain(`service-control.ts stop ${dirname(import.meta.dir)} ${state}`)
     expect(stopCalls).not.toContain('slack-app-identity.ts')
     expect(stopCalls).not.toContain('project-selection.ts')
+
+    const forceStopLog = join(state, 'force-stop-bun.log')
+    const forceStop = await runLauncher(state, { FAKE_BUN_LOG: forceStopLog }, undefined, {
+      invokedAs: 'zerochan', cwd: project, args: ['stop', '--force'],
+    })
+    expect(forceStop.exitCode, forceStop.output).toBe(0)
+    const forceStopCalls = readFileSync(forceStopLog, 'utf8')
+    expect(forceStopCalls).toContain(
+      `service-control.ts stop ${dirname(import.meta.dir)} ${state} --force`,
+    )
+    expect(forceStopCalls).not.toContain('slack-app-identity.ts')
+    expect(forceStopCalls).not.toContain('project-selection.ts')
+
+    const invalidStop = await runLauncher(state, {}, undefined, {
+      invokedAs: 'zerochan', cwd: project, args: ['stop', '--unsafe'],
+    })
+    expect(invalidStop.exitCode).toBe(2)
+    expect(invalidStop.output).toContain('zerochan stop [--force]')
   })
 
   test('Herdr外のzerochan startは可視workspace作成helperへ委譲する', async () => {

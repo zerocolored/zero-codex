@@ -380,6 +380,9 @@ zerochan start
 zerochan stop
 zerochan start
 
+# 実行中jobも中断して強制停止（通常stopが拒否した場合だけ）
+zerochan stop --force
+
 # 設定・解除・確認
 zerochan status
 zerochan unset slack-channel
@@ -414,6 +417,12 @@ runtime log tabを作り直す場合は `zerochan stop` → `zerochan start` を
 待機中jobとSlack channel設定は保持されます。停止に成功するとgateway、runner、所有確認できたruntime tabを
 終了し、意図的停止中のwatchdog警報を抑止します。裸の`zerochan`、`zerokun`、`zerochan --restart`は
 従来運用との互換用に残ります。通常運用では`start`/`stop`を使用してください。
+
+実行中jobが原因で通常停止できない場合は`zerochan stop --force`を使えます。これはZeroちゃんが記録した
+exact process generationだけを停止し、待機中jobとchannel設定は保持します。停止時点までに結果保存が完了した
+jobは確定し、それ以外の実行中jobは「強制停止による中断」として履歴・Codex sessionを残します。同じSlack
+threadで「再開して」と送れば、保存済み履歴を参照して続行できます。完了済みのrepository変更や外部操作は
+自動で巻き戻しません。
 
 更新:
 

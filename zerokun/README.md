@@ -358,6 +358,7 @@ cd /absolute/path/to/project
 zerochan set slack-channel C0123456789
 zerochan start
 zerochan stop       # 実行中jobがある場合は何も停止せず拒否
+zerochan stop --force # 所有processを停止し、待機jobと再開用履歴を保持
 zerochan start      # 新しい「Zeroちゃん runtime」tabを作って再開
 zerochan --restart  # 従来互換。通常は stop → start を使用
 zerochan status

@@ -154,6 +154,8 @@ zerochan start
 
 `zerochan`だけでも起動できます。`zerochan start`は重複起動を避けて既存processを共有します。
 runtime log tabを作り直したい場合は`zerochan stop`のあと`zerochan start`を実行します。
+実行中jobがあって通常停止を拒否された場合だけ、`zerochan stop --force`でZeroちゃん所有のprocessを
+強制停止できます。待機中jobは保持され、途中のjobは同じSlack threadから再開できます。
 
 ### 5. 完了確認
 

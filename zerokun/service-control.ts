@@ -13,6 +13,7 @@ import {
 import {
   inspectProcessLock,
   processLockOwnerMatches,
+  stopProcessLockOwner,
 } from './process-lock.ts'
 import {
   observeProcessGeneration,
@@ -21,6 +22,7 @@ import {
   signalProcessIfLive,
   type ProcessIdentity,
 } from './process-generation.ts'
+import { freezeAndKillTrackedProcessTree } from './process-tree.ts'
 import { readGatewayReadiness } from './readiness.ts'
 import { requireManagedStateRoot } from './managed-path.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
@@ -57,6 +59,15 @@ type ServiceControlHooks = {
   startBot?: typeof startBotInHerdr
   sleep?: (milliseconds: number) => Promise<void>
   pauseTimeoutMs?: number
+  forceStopTimeoutMs?: number
+  recoverForcedJobs?: (input: {
+    stateDir: string
+    runtime: HerdrRuntimeIdentity
+  }) => Promise<{ completed: number; failed: number; queued: number }>
+}
+
+export type StopManagedServiceOptions = {
+  force?: boolean
 }
 
 const APP_ID_PATTERN = /^A[A-Z0-9]+$/
@@ -185,6 +196,85 @@ async function stopRunnerLauncherIfPresent(stateDir: string): Promise<number | n
     10_000,
   )
   return launcher.pid
+}
+
+async function forceStopLockedProcess(
+  process: ManagedProcess,
+  timeoutMs: number,
+): Promise<number | null> {
+  if (!process.pid) return null
+  const result = await stopProcessLockOwner(
+    process.lockFile,
+    process.pid,
+    process.pattern,
+    { timeoutMs, forceKill: true, killWaitMs: 2_000 },
+  )
+  if (result === 'stopped') return process.pid
+  if (result === 'timeout') fail(`${process.label} PID ${process.pid} を強制停止できません`)
+  fail(`${process.label} PID ${process.pid} の停止generationを再確認できません`)
+}
+
+async function forceKillCurrentRunner(
+  stateDir: string,
+  sleep: (milliseconds: number) => Promise<void>,
+  onFrozen: () => Promise<void> | void,
+): Promise<number | null> {
+  const runner = serviceProcesses(stateDir).runner
+  if (!runner.pid) return null
+  if (!processLockOwnerMatches(runner.lockFile, runner.pid, runner.pattern)) {
+    fail('job runnerの強制停止generationを固定できません')
+  }
+  const identity = readProcessIdentity(runner.pid)
+  if (!identity || !processLockOwnerMatches(runner.lockFile, runner.pid, runner.pattern)) {
+    fail('job runnerの強制停止generation identityを確認できません')
+  }
+  const remaining = await freezeAndKillTrackedProcessTree({
+    root: identity,
+    excludePids: new Set([process.pid]),
+    onFrozen: async () => {
+      if (!processLockOwnerMatches(runner.lockFile, runner.pid!, runner.pattern)) {
+        fail('job runnerの強制停止generationを再確認できません')
+      }
+      await onFrozen()
+    },
+  })
+  if (remaining.length > 0) {
+    fail(`job runner配下のprocessを強制停止できません: ${remaining.join(', ')}`)
+  }
+  // Keep the injected sleep contract used by service-control fixtures while
+  // the production helper itself performs generation-aware waits.
+  await sleep(0)
+  return runner.pid
+}
+
+async function forceStopRunnerAndLauncher(
+  stateDir: string,
+  sleep: (milliseconds: number) => Promise<void>,
+  timeoutMs: number,
+  onStoppedBoundary: () => Promise<void> | void,
+): Promise<boolean> {
+  let stoppedAny = false
+  let boundaryCaptured = false
+  const captureBoundary = async (): Promise<void> => {
+    if (boundaryCaptured) return
+    await onStoppedBoundary()
+    boundaryCaptured = true
+  }
+  for (let pass = 0; pass < 3; pass += 1) {
+    const runnerPid = await forceKillCurrentRunner(stateDir, sleep, captureBoundary)
+    stoppedAny = Boolean(runnerPid) || stoppedAny
+    const launcher = runnerLauncherProcess(stateDir)
+    if (launcher.pid) {
+      await forceStopLockedProcess(launcher, timeoutMs)
+      stoppedAny = true
+    }
+    await sleep(25)
+    if (!serviceProcesses(stateDir).runner.pid && !runnerLauncherProcess(stateDir).pid) {
+      await captureBoundary()
+      return stoppedAny
+    }
+  }
+  fail('job runnerまたはlauncherの強制停止を確認できません')
 }
 
 async function quiesceRunnerAndLauncher(
@@ -388,6 +478,7 @@ export async function stopManagedService(
   rootRepoInput: string,
   stateDirInput: string,
   hooks: ServiceControlHooks = {},
+  options: StopManagedServiceOptions = {},
 ): Promise<ServiceControlResult> {
   // Resolve the repository even though stop is global. This prevents a copied
   // helper from signalling services owned by a different installation.
@@ -404,6 +495,71 @@ export async function stopManagedService(
     let stoppedAny = Boolean(initial.gateway.pid || initial.runner.pid)
     const runningReadiness = readGatewayReadiness(join(stateDir, 'gateway-ready.json'))
     const before = activeCounts(stateDir)
+    if (options.force) {
+      const forceTimeoutMs = hooks.forceStopTimeoutMs ?? 5_000
+      if (initial.gateway.pid) {
+        await forceStopLockedProcess(initial.gateway, forceTimeoutMs)
+        stoppedAny = true
+      }
+      let forceBaseline: { queued: number; running: number } | null = null
+      stoppedAny = await forceStopRunnerAndLauncher(
+        stateDir,
+        sleep,
+        forceTimeoutMs,
+        () => {
+          // The gateway is dead and every exact runner descendant is frozen.
+          // No enqueue or claim can cross this authoritative SQLite snapshot.
+          forceBaseline = activeCounts(stateDir)
+          writeIntentionalServiceStop(stateDir)
+          writePinnedHerdrRuntime(stateDir, controlRuntime)
+        },
+      ) || stoppedAny
+      const capturedForceBaseline = forceBaseline as {
+        queued: number
+        running: number
+      } | null
+      if (!capturedForceBaseline) fail('強制停止時のjob境界を取得できません')
+      const stopped = serviceProcesses(stateDir)
+      if (stopped.gateway.pid || stopped.runner.pid || runnerLauncherProcess(stateDir).pid) {
+        fail('gateway、job runner、またはlauncherの強制停止を確認できません')
+      }
+
+      // The intentional-stop marker was published at the frozen boundary. If
+      // recovery reports an exact ownership problem, watchdog must not undo
+      // the user's requested stop while the durable job state is inspected.
+      const recover = hooks.recoverForcedJobs ?? (async input => {
+        const module = await import('./job-runner.ts')
+        return module.recoverForcedServiceStop(input)
+      })
+      let recovered: Awaited<ReturnType<typeof recover>>
+      try {
+        recovered = await recover({ stateDir, runtime: controlRuntime })
+      } catch (error) {
+        fail(
+          'service本体は停止しましたが、実行中タスクの回収を完了できませんでした。'
+          + ` zerochan stop --force を再実行できます: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+      const after = activeCounts(stateDir)
+      if (after.running > 0) fail('強制停止後も実行中タスクが残っています')
+      if (after.queued !== capturedForceBaseline.queued
+        || recovered.queued !== capturedForceBaseline.queued) {
+        fail('強制停止中に待機中タスクの件数が変わりました')
+      }
+      const tabCleanup = await cleanupRecordedTab(
+        stateDir,
+        controlRuntime,
+        runningReadiness?.projectDir,
+        close,
+      )
+      return {
+        status: stoppedAny || capturedForceBaseline.running > 0 || recovered.completed > 0
+          || recovered.failed > 0 ? 'stopped' : 'already-stopped',
+        tabCleanup,
+      }
+    }
     if (before.running > 0) {
       fail(`実行中のタスクが${before.running}件あるため停止しませんでした。完了後に zerochan stop を再実行してください`)
     }
@@ -726,16 +882,18 @@ async function main(): Promise<void> {
     return
   }
   if (command !== 'start' && command !== 'stop') {
-    fail('usage: service-control.ts start ROOT_REPO STATE_DIR PROJECT_DIR APP_ID | stop ROOT_REPO STATE_DIR | assert-idle STATE_DIR')
+    fail('usage: service-control.ts start ROOT_REPO STATE_DIR PROJECT_DIR APP_ID | stop ROOT_REPO STATE_DIR [--force] | assert-idle STATE_DIR')
   }
   const [rootRepo, stateDir, projectDir, expectedAppId, ...extra] = args
+  const forceStop = command === 'stop' && projectDir === '--force'
   if (!rootRepo || !stateDir || extra.length > 0
     || (command === 'start' && (!projectDir || !expectedAppId))
-    || (command === 'stop' && (projectDir !== undefined || expectedAppId !== undefined))) {
-    fail('usage: service-control.ts start ROOT_REPO STATE_DIR PROJECT_DIR APP_ID | stop ROOT_REPO STATE_DIR | assert-idle STATE_DIR')
+    || (command === 'stop' && (expectedAppId !== undefined
+      || (projectDir !== undefined && !forceStop)))) {
+    fail('usage: service-control.ts start ROOT_REPO STATE_DIR PROJECT_DIR APP_ID | stop ROOT_REPO STATE_DIR [--force] | assert-idle STATE_DIR')
   }
   if (command === 'stop') {
-    const result = await stopManagedService(rootRepo, stateDir)
+    const result = await stopManagedService(rootRepo, stateDir, {}, { force: forceStop })
     process.stdout.write(result.status === 'already-stopped'
       ? '✅ 既に停止しています。\n'
       : '✅ 停止しました。\n')

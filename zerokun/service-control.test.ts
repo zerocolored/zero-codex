@@ -32,6 +32,12 @@ import {
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
 import { writeGatewayReadiness } from './readiness.ts'
+import {
+  observeProcessGeneration,
+  readProcessIdentity,
+  signalProcessIfLive,
+  type ProcessIdentity,
+} from './process-generation.ts'
 
 const directories: string[] = []
 const processes: Bun.Subprocess[] = []
@@ -96,7 +102,10 @@ async function waitFor(path: string): Promise<void> {
 async function spawnManagedServices(
   state: string,
   base: string,
-  options: { acknowledgePause?: boolean } = {},
+  options: {
+    acknowledgePause?: boolean
+    detachedDescendantPidFile?: string
+  } = {},
 ): Promise<{ gateway: Bun.Subprocess; runner: Bun.Subprocess }> {
   const processLock = join(import.meta.dir, 'process-lock.ts')
   const serviceState = join(import.meta.dir, 'service-control-state.ts')
@@ -104,6 +113,21 @@ async function spawnManagedServices(
   const runner = join(base, 'job-runner.ts')
   const gatewayReady = join(base, 'gateway.ready')
   const runnerReady = join(base, 'runner.ready')
+  const descendantScript = join(base, 'runner-descendant.ts')
+  if (options.detachedDescendantPidFile) {
+    writeFileSync(descendantScript, [
+      "import { writeFileSync } from 'fs'",
+      "const grandchild = Bun.spawn(['/bin/sleep', '60'], {",
+      "  detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',",
+      '})',
+      `writeFileSync(${JSON.stringify(options.detachedDescendantPidFile)}, JSON.stringify({`,
+      '  child: process.pid, grandchild: grandchild.pid,',
+      '}))',
+      "process.on('SIGTERM', () => {})",
+      'await Bun.sleep(60_000)',
+      '',
+    ].join('\n'))
+  }
   writeFileSync(server, [
     `import { releaseProcessLock, tryAcquireProcessLock } from ${JSON.stringify(processLock)}`,
     `const lock = ${JSON.stringify(join(state, 'plugin.lock'))}`,
@@ -131,6 +155,14 @@ async function spawnManagedServices(
     'const acquired = tryAcquireProcessLock(lock, process.pid)',
     "if (!acquired.acquired) throw new Error('runner lock unavailable')",
     `await Bun.write(${JSON.stringify(runnerReady)}, String(process.pid))`,
+    ...(options.detachedDescendantPidFile ? [
+      `const descendant = Bun.spawn([process.execPath, ${JSON.stringify(descendantScript)}], {`,
+      "  detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',",
+      '})',
+      `while (!Bun.file(${JSON.stringify(options.detachedDescendantPidFile)}).size) {`,
+      '  await Bun.sleep(10)',
+      '}',
+    ] : []),
     ...(options.acknowledgePause === false ? [
       'const timer = setInterval(() => {}, 20)',
     ] : [
@@ -255,6 +287,86 @@ describe('zerochan stop/start', () => {
     expect(services.runner.exitCode).toBeNull()
     expect(intentionalServiceStopIsSet(state)).toBe(false)
   })
+
+  test('stop --forceはrunning jobがあってもexact serviceを停止しqueued jobを保持する', async () => {
+    const { base, state } = fixture()
+    createJobDatabase(state, [{ status: 'running' }, { status: 'queued' }])
+    const services = await spawnManagedServices(state, base)
+    const result = await stopManagedService(dirname(import.meta.dir), state, {
+      ...testHooks,
+      recoverForcedJobs: async ({ stateDir }) => {
+        const database = new Database(join(stateDir, 'jobs.sqlite3'))
+        database.run("UPDATE jobs SET status = 'completed' WHERE status = 'running'")
+        const queued = database.query<{ count: number }, []>(
+          "SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'",
+        ).get()?.count ?? 0
+        database.close()
+        return { completed: 1, failed: 0, queued }
+      },
+    }, { force: true })
+    expect(result.status).toBe('stopped')
+    await Promise.all([services.gateway.exited, services.runner.exited])
+    expect(inspectManagedServiceStatus(state)).toEqual({ status: 'stopped' })
+    const database = new Database(join(state, 'jobs.sqlite3'), { readonly: true })
+    expect(database.query<{ count: number }, []>(
+      "SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'",
+    ).get()?.count).toBe(1)
+    database.close()
+    expect(intentionalServiceStopIsSet(state)).toBe(true)
+  })
+
+  test('stop --forceは回収失敗時もservice停止markerを残して自動再起動を防ぐ', async () => {
+    const { base, state } = fixture()
+    createJobDatabase(state, [{ status: 'running' }])
+    const services = await spawnManagedServices(state, base)
+    await expect(stopManagedService(dirname(import.meta.dir), state, {
+      ...testHooks,
+      recoverForcedJobs: async () => { throw new Error('fixture recovery failure') },
+    }, { force: true })).rejects.toThrow('service本体は停止しました')
+    await Promise.all([services.gateway.exited, services.runner.exited])
+    expect(inspectManagedServiceStatus(state)).toEqual({ status: 'stopped' })
+    expect(intentionalServiceStopIsSet(state)).toBe(true)
+  })
+
+  test.skipIf(process.platform === 'win32' || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
+    'stop --forceはdetached publication相当の子孫をoffline回収前に停止する',
+    async () => {
+      const { base, state } = fixture()
+      createJobDatabase(state, [{ status: 'running' }])
+      const pidFile = join(base, 'runner-descendants.json')
+      const services = await spawnManagedServices(state, base, {
+        detachedDescendantPidFile: pidFile,
+      })
+      await waitFor(pidFile)
+      const pids = JSON.parse(readFileSync(pidFile, 'utf8')) as {
+        child: number
+        grandchild: number
+      }
+      const identities = [pids.child, pids.grandchild]
+        .map(pid => readProcessIdentity(pid))
+        .filter((value): value is ProcessIdentity => value !== null)
+      expect(identities).toHaveLength(2)
+      try {
+        const result = await stopManagedService(dirname(import.meta.dir), state, {
+          ...testHooks,
+          recoverForcedJobs: async ({ stateDir }) => {
+            expect(identities.map(identity => observeProcessGeneration(identity).status))
+              .toEqual(['dead', 'dead'])
+            const database = new Database(join(stateDir, 'jobs.sqlite3'))
+            database.run("UPDATE jobs SET status = 'completed' WHERE status = 'running'")
+            database.close()
+            return { completed: 1, failed: 0, queued: 0 }
+          },
+        }, { force: true })
+        expect(result.status).toBe('stopped')
+        await Promise.all([services.gateway.exited, services.runner.exited])
+        expect(identities.map(identity => observeProcessGeneration(identity).status))
+          .toEqual(['dead', 'dead'])
+      } finally {
+        for (const identity of identities) signalProcessIfLive(identity, 'SIGKILL')
+      }
+    },
+  )
 
   test('stopは更新前runnerがack非対応でも凍結境界で安全に停止する', async () => {
     const { base, state } = fixture()

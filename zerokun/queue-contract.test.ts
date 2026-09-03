@@ -70,7 +70,10 @@ describe('Zero-kun Codex wiring', () => {
     expect(runner).toContain('assertJobMonitorHealthy:')
     expect(runner).toContain('controller.abort()')
     expect(runner).toContain('failAfterMonitorLoss(')
-    expect(runner.match(/recoverMissingBindingAfterExecutorsStopped:/g)).toHaveLength(4)
+    expect(runner.match(/recoverMissingBindingAfterExecutorsStopped:/g)).toHaveLength(5)
+    expect(runner).toContain(
+      'listMonitorObligations: () => storeInput.monitorObligationsForForcedServiceStop()',
+    )
     const recoveryCommand = runner.slice(
       runner.indexOf("if (command === 'recover-interrupted')"),
       runner.indexOf("if (command !== 'daemon'"),

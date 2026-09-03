@@ -44,6 +44,9 @@ case "$INVOKED_AS" in
     elif [ "$#" -eq 1 ] && [ "$1" = "stop" ]; then
       LAUNCH_MODE="managed-stop"
       PROJECT=""
+    elif [ "$#" -eq 2 ] && [ "$1" = "stop" ] && [ "$2" = "--force" ]; then
+      LAUNCH_MODE="managed-force-stop"
+      PROJECT=""
     elif [ "$#" -eq 1 ] && [ "$1" = "update" ]; then
       LAUNCH_MODE="update"
       PROJECT="$(pwd -P)"
@@ -69,7 +72,7 @@ case "$INVOKED_AS" in
       LAUNCH_MODE="status"
       PROJECT="$(pwd -P)"
     else
-      echo "使い方: zerochan | zerochan start | zerochan stop | zerochan update [--recover-only] | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
+      echo "使い方: zerochan | zerochan start | zerochan stop [--force] | zerochan update [--recover-only] | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
       exit 2
     fi
     ;;
@@ -108,7 +111,11 @@ fi
 # stop is global to this installed Slack App and intentionally does not select,
 # sync, or mutate a project route. The service controller still verifies the
 # current Herdr control plane before signalling any exact process generation.
-if [ "$LAUNCH_MODE" = "managed-stop" ]; then
+if [ "$LAUNCH_MODE" = "managed-stop" ] || [ "$LAUNCH_MODE" = "managed-force-stop" ]; then
+  if [ "$LAUNCH_MODE" = "managed-force-stop" ]; then
+    exec bun --config=/dev/null --no-env-file \
+      "$REPO_DIR/zerokun/service-control.ts" stop "$REPO_DIR" "$STATE_DIR" --force
+  fi
   exec bun --config=/dev/null --no-env-file \
     "$REPO_DIR/zerokun/service-control.ts" stop "$REPO_DIR" "$STATE_DIR"
 fi
