@@ -1,6 +1,7 @@
 import {
   observeProcessGeneration,
   parseProcessStartKey,
+  processIdentityIsStopped,
   processIdentityIsLive,
   readProcessIdentity,
   readProcessTable,
@@ -80,6 +81,128 @@ export function captureTrackedProcesses(
     generationObserver,
   )
   return table
+}
+
+/**
+ * Freeze an exact process generation and every descendant reachable from it,
+ * rescan to a fixed point, then kill only those pinned generations.  This is
+ * used when the owner itself cannot be trusted to run its async cleanup (for
+ * example a force-stopped daemon with detached git/gh process groups).
+ *
+ * The callback runs only after two stable scans while every discovered
+ * generation is stopped.  If freezing or the callback fails before the kill
+ * boundary, every still-live pinned generation is resumed.
+ */
+export async function freezeAndKillTrackedProcessTree(options: {
+  root: ProcessIdentity
+  excludePids?: ReadonlySet<number>
+  onFrozen?: () => Promise<void> | void
+  stopWaitMs?: number
+  killWaitMs?: number
+}): Promise<number[]> {
+  const exclude = options.excludePids ?? new Set<number>()
+  const tracked = new Map<number, string>([[options.root.pid, options.root.started]])
+  const stopWaitMs = options.stopWaitMs ?? 2_000
+  const killWaitMs = options.killWaitMs ?? 2_000
+  let killBoundaryCrossed = false
+
+  const live = (): ProcessIdentity[] => liveTrackedIdentities(tracked, exclude)
+  const resumeFrozen = (): void => {
+    // Recovery must remain best-effort even when one direct generation probe
+    // is temporarily unreadable.  Reconstruct every already-pinned identity
+    // and let the exact-generation signal helper refuse recycled PIDs.
+    for (const [pid, started] of tracked) {
+      if (exclude.has(pid)) continue
+      const identity = expectedIdentity(pid, started)
+      if (!identity) continue
+      signalProcessIfLive(identity, 'SIGCONT')
+    }
+  }
+
+  try {
+    let stablePasses = 0
+    let previousSignature = ''
+    for (let pass = 0; pass < 100 && stablePasses < 2; pass += 1) {
+      captureTrackedProcesses(
+        [options.root.pid],
+        options.root.pid,
+        tracked,
+        exclude,
+      )
+      for (const identity of live()) signalProcessIfLive(identity, 'SIGSTOP')
+
+      const deadline = Date.now() + stopWaitMs
+      while (true) {
+        const unstopped = live().filter(identity => !processIdentityIsStopped(identity))
+        if (unstopped.length === 0) break
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `process treeを停止境界へ固定できません: ${unstopped.map(value => value.pid).join(', ')}`,
+          )
+        }
+        await Bun.sleep(10)
+      }
+
+      const signature = [...tracked.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([pid, started]) => `${pid}:${started}`)
+        .join('\n')
+      stablePasses = signature === previousSignature ? stablePasses + 1 : 0
+      previousSignature = signature
+      await Bun.sleep(25)
+    }
+    if (stablePasses < 2) {
+      throw new Error('process treeの停止境界が安定しませんでした')
+    }
+
+    await options.onFrozen?.()
+    // Descendants die first while the exact owner remains frozen. Killing the
+    // root first would orphan a detached publication child if a later
+    // exact-generation signal failed. Until every descendant is confirmed
+    // dead, an error resumes the still-owned root in the finally block.
+    const descendants = live().filter(identity => identity.pid !== options.root.pid)
+    for (const identity of descendants) {
+      if (signalProcessIfLive(identity, 'SIGKILL')) continue
+      const observation = observeProcessGeneration(identity)
+      if (observation.status !== 'dead') {
+        throw new Error(`descendant process ${identity.pid}を強制停止できません`)
+      }
+    }
+    const descendantDeadline = Date.now() + killWaitMs
+    let remainingDescendants = live().filter(identity => identity.pid !== options.root.pid)
+    while (remainingDescendants.length > 0 && Date.now() < descendantDeadline) {
+      await Bun.sleep(25)
+      remainingDescendants = live().filter(identity => identity.pid !== options.root.pid)
+    }
+    if (remainingDescendants.length > 0) {
+      throw new Error(
+        `descendant processを強制停止できません: ${remainingDescendants.map(value => value.pid).join(', ')}`,
+      )
+    }
+
+    const root = live().find(identity => identity.pid === options.root.pid)
+    if (!root) {
+      killBoundaryCrossed = true
+    } else if (signalProcessIfLive(root, 'SIGKILL')) {
+      killBoundaryCrossed = true
+    } else {
+      const observation = observeProcessGeneration(root)
+      if (observation.status === 'dead') {
+        killBoundaryCrossed = true
+      } else {
+        throw new Error(`root process ${root.pid}を強制停止できません`)
+      }
+    }
+    const rootDeadline = Date.now() + killWaitMs
+    let remaining = live()
+    while (remaining.length > 0 && Date.now() < rootDeadline) {
+      await Bun.sleep(25)
+      remaining = live()
+    }
+    return remaining.map(identity => identity.pid)
+  } finally {
+    if (!killBoundaryCrossed) resumeFrozen()
+  }
 }
 
 export function updateTrackedProcesses(

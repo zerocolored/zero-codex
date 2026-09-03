@@ -42,6 +42,7 @@ import {
   readUploadableArtifact,
   recoverExecutionCheckpointBeforeAdvisorCleanup,
   recoverExecutionResultJournals,
+  recoverForcedServiceStop,
   requeueGitHubPublicationConflictForCodex,
   reconcileEphemeralAndRetiredAdvisorRounds,
   reconcileAdvisorsWithMonitorHealthBarrier,
@@ -2939,6 +2940,26 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('通常失敗のCodex sessionは同じSlack threadでもresumeしない', () => {
+    const store = makeStore()
+    store.enqueue(input())
+    const first = store.claimNext('serial-worker')!
+    store.complete(first.id, 'older-completed-session', 'first complete')
+
+    store.enqueue(input({ messageId: '1800000000.000201', task: '通常失敗する続き' }))
+    const failed = store.claimNext('serial-worker')!
+    expect(failed).toMatchObject({
+      sessionId: 'older-completed-session', resumed: true,
+    })
+    store.fail(failed.id, 'ordinary failure')
+
+    store.enqueue(input({ messageId: '1800000000.000202', task: '失敗後の続き' }))
+    const followUp = store.claimNext('serial-worker')!
+    expect(followUp.sessionId).toBeNull()
+    expect(followUp.resumed).toBe(false)
+    store.close()
+  })
+
   test('同じSlackスレッドは既定20 jobまで同じCodex sessionをresumeする', () => {
     const store = makeStore()
     const sessionId = 'twenty-job-thread'
@@ -4021,6 +4042,120 @@ describe('single FIFO worker', () => {
     expect(store.get(queued.id)).toMatchObject({
       status: 'completed', sessionId: 'journal-session', result: 'journal result',
     })
+    store.close()
+  })
+
+  test('force stop recoveryはrunningを再開可能な失敗へ移しqueuedを保持する', async () => {
+    const dir = fixtureDir()
+    let store = new JobStore(join(dir, 'jobs.sqlite3'))
+    const interrupted = store.enqueue(input({
+      messageId: 'force-interrupted',
+      threadTs: '1800000000.000201',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('force-worker')!
+    store.saveSession(running.id, 'force-session')
+    store.beginMonitorPreparation(running.id, running.workerId!)
+    store.commitMonitorRequired(running.id, running.workerId!)
+    store.recordMonitorFailure(running.id, 'fixture monitor failure')
+    const queued = store.enqueue(input({
+      messageId: 'force-queued',
+      threadTs: '1800000000.000203',
+    })).job
+    store.close()
+
+    const recovered = await recoverForcedServiceStop({
+      stateDir: dir,
+      runtime: {
+        binary: '/bin/sh', binaryDevice: 1, binaryInode: 1,
+        binaryMode: 0o100755, binarySize: 1, binaryModifiedMs: 1,
+        binaryChangedMs: 1, socketPath: '/tmp/not-used.sock',
+        socketDevice: 1, socketInode: 1, paneId: 'wT:p1',
+        tabId: 'wT:t1', terminalId: 'term_abcdef012345', workspaceId: 'wT',
+      },
+      reconcileAdvisors: async () => {},
+      reconcileMonitors: async storeInput => {
+        const obligations = storeInput.monitorObligationsForForcedServiceStop()
+        expect(obligations).toEqual([{
+          id: interrupted.id,
+          status: 'failed',
+          state: 'required',
+        }])
+        storeInput.retireMonitorForForcedServiceStop(interrupted.id)
+        return { retained: 0, closed: 1, retainedJobIds: [] }
+      },
+    })
+    expect(recovered).toEqual({ completed: 0, failed: 1, queued: 1 })
+
+    store = new JobStore(join(dir, 'jobs.sqlite3'))
+    expect(store.get(interrupted.id)).toMatchObject({
+      status: 'failed', sessionId: 'force-session', terminalOutcome: 'failed',
+      workerId: null, monitorState: 'none',
+    })
+    expect(() => store.monitorObligations()).not.toThrow()
+    expect(store.get(interrupted.id)?.lastError).toContain('同じSlackスレッド')
+    expect(store.get(queued.id)).toMatchObject({ status: 'queued', attempts: 0 })
+
+    const queuedClaim = store.claimNext('next-worker')!
+    expect(queuedClaim.id).toBe(queued.id)
+    store.complete(queuedClaim.id, 'unrelated-queued-session', 'done')
+    store.enqueue(input({
+      messageId: 'force-resume',
+      threadTs: '1800000000.000201',
+      task: '再開して',
+      writeEnabled: true,
+    }))
+    const resumed = store.claimNext('resume-worker')!
+    expect(resumed).toMatchObject({ sessionId: 'force-session', resumed: true })
+    store.close()
+  })
+
+  test('force stop recoveryはstaged resultとmonitor faultを失わず完了後に退役する', async () => {
+    const dir = fixtureDir()
+    let store = new JobStore(join(dir, 'jobs.sqlite3'))
+    const staged = store.enqueue(input({
+      messageId: 'force-staged-monitor-fault',
+      threadTs: '1800000000.000211',
+    })).job
+    const running = store.claimNext('force-staged-worker')!
+    store.saveSession(running.id, 'force-staged-session')
+    store.beginMonitorPreparation(running.id, running.workerId!)
+    store.commitMonitorRequired(running.id, running.workerId!)
+    store.recordMonitorFailure(running.id, 'fixture staged monitor failure')
+    store.stageExecutionResult(running.id, 'force-staged-session', 'saved answer')
+    expect(store.markMonitorLostAfterStagedResult(running.id)).toBe(true)
+    store.close()
+
+    const recovered = await recoverForcedServiceStop({
+      stateDir: dir,
+      runtime: {
+        binary: '/bin/sh', binaryDevice: 1, binaryInode: 1,
+        binaryMode: 0o100755, binarySize: 1, binaryModifiedMs: 1,
+        binaryChangedMs: 1, socketPath: '/tmp/not-used.sock',
+        socketDevice: 1, socketInode: 1, paneId: 'wT:p1',
+        tabId: 'wT:t1', terminalId: 'term_abcdef012345', workspaceId: 'wT',
+      },
+      reconcileAdvisors: async () => {},
+      reconcileMonitors: async storeInput => {
+        expect(storeInput.get(staged.id)).toMatchObject({
+          status: 'completed', sessionId: 'force-staged-session', result: 'saved answer',
+          monitorState: 'lost-staged',
+        })
+        expect(storeInput.monitorFailure(staged.id)).not.toBeNull()
+        expect(storeInput.monitorObligationsForForcedServiceStop()).toEqual([{
+          id: staged.id, status: 'completed', state: 'lost-staged',
+        }])
+        storeInput.retireMonitorForForcedServiceStop(staged.id)
+        return { retained: 0, closed: 1, retainedJobIds: [] }
+      },
+    })
+    expect(recovered).toEqual({ completed: 1, failed: 0, queued: 0 })
+
+    store = new JobStore(join(dir, 'jobs.sqlite3'))
+    expect(store.get(staged.id)).toMatchObject({
+      status: 'completed', monitorState: 'none', result: 'saved answer',
+    })
+    expect(store.monitorFailure(staged.id)).toBeNull()
     store.close()
   })
 

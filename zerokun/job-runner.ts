@@ -107,6 +107,7 @@ import {
   readPinnedHerdrRuntime,
   verifyHerdrRuntimeIdentityAsync,
   writePinnedHerdrRuntime,
+  type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
 import { isSlackInterruptCommand } from './live-control.ts'
 import {
@@ -258,6 +259,9 @@ const MONITOR_LOSS_RECOVERY_MESSAGE =
   '監視タブが失われたため、安全に処理状態を復旧できませんでした。'
   + '実行プロセスの停止を確認して、この依頼を失敗として終了しました。'
   + '必要なら再送してください。'
+const FORCED_SERVICE_STOP_FAILURE_MESSAGE =
+  'zerochan stop --force により実行を中断しました。完了済みの変更は自動では戻していません。'
+  + '同じSlackスレッドで「再開して」と送ると、保存済みの履歴とCodexセッションを参照して続行できます。'
 
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed'
 export type JobTerminalOutcome = 'completed' | 'failed' | 'cancelled'
@@ -8087,6 +8091,18 @@ export class JobStore {
     ).get()?.count ?? 0
   }
 
+  activeCounts(): { queued: number; running: number } {
+    const rows = this.db.query<{ status: 'queued' | 'running'; count: number }, []>(
+      `SELECT status, COUNT(*) AS count FROM jobs
+       WHERE runtime = 'codex' AND status IN ('queued', 'running')
+       GROUP BY status`,
+    ).all()
+    return rows.reduce((counts, row) => {
+      counts[row.status] = row.count
+      return counts
+    }, { queued: 0, running: 0 })
+  }
+
   countClaimable(now = Date.now()): number {
     const head = this.db.query<{
       not_before: number | null
@@ -8152,26 +8168,22 @@ export class JobStore {
         sessionId = row.session_id!
         resumed = true
       } else {
-        const prior = this.db.query<
-          { session_id: string },
+        // Only the immediately preceding job in the same conversation domain
+        // may provide continuity. Filtering for an eligible status inside SQL
+        // would incorrectly skip a newer ordinary failure and resurrect an
+        // older, no-longer-adjacent session.
+        const preceding = this.db.query<
+          { session_id: string | null; status: JobStatus; last_error: string | null },
           [string, string, string, number, number]
         >(
-          `SELECT jobs.session_id
+          `SELECT jobs.session_id, jobs.status, jobs.last_error
            FROM jobs
-           JOIN codex_session_protocols protocols
-             ON protocols.session_id = jobs.session_id
-            AND protocols.protocol_version = ${CODEX_SESSION_PROTOCOL_VERSION}
-           LEFT JOIN codex_session_retirements retirements
-             ON retirements.session_id = jobs.session_id
            WHERE jobs.runtime = 'codex'
              AND jobs.chat_id = ?
              AND jobs.thread_ts = ?
              AND jobs.repo_path = ?
              AND jobs.write_enabled = ?
              AND jobs.seq < ?
-             AND jobs.session_id IS NOT NULL
-             AND jobs.status = 'completed'
-             AND retirements.session_id IS NULL
            ORDER BY jobs.seq DESC
            LIMIT 1`,
         ).get(
@@ -8181,6 +8193,16 @@ export class JobStore {
           row.write_enabled,
           row.seq,
         )
+        const prior = preceding?.session_id
+          && (preceding.status === 'completed'
+            || (preceding.status === 'failed'
+              && preceding.last_error === FORCED_SERVICE_STOP_FAILURE_MESSAGE))
+          && sessionUsesCurrentProtocol(preceding.session_id)
+          && this.db.query<{ present: number }, [string]>(
+            `SELECT 1 AS present FROM codex_session_retirements WHERE session_id = ?`,
+          ).get(preceding.session_id) === null
+          ? { session_id: preceding.session_id }
+          : null
         const sessionJobCount = prior
           ? this.db.query<{ count: number }, [string]>(
             `SELECT COUNT(*) AS count
@@ -8249,6 +8271,15 @@ export class JobStore {
   }
 
   complete(id: string, sessionId: string, result: string): void {
+    this.completeInternal(id, sessionId, result, false)
+  }
+
+  private completeInternal(
+    id: string,
+    sessionId: string,
+    result: string,
+    ignoreMonitorBarriersForForcedServiceStop: boolean,
+  ): void {
     const persistedSessionId = requireText(sessionId, 'sessionId')
     const complete = this.db.transaction(() => {
       const finishedAt = Date.now()
@@ -8265,9 +8296,9 @@ export class JobStore {
              finished_at = ?
          WHERE id = ? AND runtime = 'codex' AND status = 'running'
            AND cancel_requested_at IS NULL
-           AND monitor_state != 3
            AND (executor_nonce IS NULL OR (accepts_control = 0 AND active_turn_id IS NULL))
-           AND NOT EXISTS (SELECT 1 FROM monitor_failures WHERE job_id = jobs.id)
+           ${ignoreMonitorBarriersForForcedServiceStop ? '' : `AND monitor_state != 3
+           AND NOT EXISTS (SELECT 1 FROM monitor_failures WHERE job_id = jobs.id)`}
            AND NOT EXISTS (
              SELECT 1 FROM inbound_deliveries AS inbound
              WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
@@ -9049,7 +9080,10 @@ export class JobStore {
     return retrySqlite(() => complete.immediate())
   }
 
-  completeStagedExecution(id: string): void {
+  completeStagedExecution(
+    id: string,
+    options: { ignoreMonitorBarriersForForcedServiceStop?: boolean } = {},
+  ): void {
     const row = this.db.query<{
       write_enabled: number
       pending_session_id: string | null
@@ -9067,10 +9101,17 @@ export class JobStore {
     if (row.write_enabled === 1 && publication?.status !== 'completed') {
       throw new Error(`GitHub publication is still pending for job ${id}`)
     }
-    this.complete(id, row.pending_session_id, row.pending_result)
+    this.completeInternal(
+      id,
+      row.pending_session_id,
+      row.pending_result,
+      options.ignoreMonitorBarriersForForcedServiceStop === true,
+    )
   }
 
-  recoverStagedExecutions(): number {
+  recoverStagedExecutions(
+    options: { ignoreMonitorBarriersForForcedServiceStop?: boolean } = {},
+  ): number {
     // A success checkpoint and a later durable Slack cancellation can coexist
     // if the daemon stops during owned advisor cleanup. Keep those rows in
     // stagedExecutionJobIds() so the monitor/advisor barriers still verify
@@ -9098,7 +9139,7 @@ export class JobStore {
          )
        ORDER BY seq ASC`,
     ).all()
-    for (const row of rows) this.completeStagedExecution(row.id)
+    for (const row of rows) this.completeStagedExecution(row.id, options)
     return rows.length
   }
 
@@ -9228,6 +9269,14 @@ export class JobStore {
         `durable Herdr monitor failure blocks queue recovery for ${fault.job_id} (${fault.reason_digest})`,
       )
     }
+    return this.monitorObligationsForForcedServiceStop()
+  }
+
+  monitorObligationsForForcedServiceStop(): Array<{
+    id: string
+    status: JobStatus
+    state: 'preparing' | 'required' | 'lost-staged'
+  }> {
     return this.db.query<{
       id: string
       status: JobStatus
@@ -9240,8 +9289,13 @@ export class JobStore {
        WHERE runtime = 'codex' AND monitor_state IN (1, 2, 3)
        ORDER BY seq ASC`,
     ).all().map(row => {
-      if (row.monitor_state === 3 && (row.status !== 'running'
-        || row.executor_pid !== null || !row.pending_session_id || row.pending_result === null)) {
+      const validLostStaged = row.monitor_state !== 3
+        || (row.status === 'running' && row.executor_pid === null
+          && row.pending_session_id !== null && row.pending_result !== null)
+        || ((row.status === 'completed' || row.status === 'failed')
+          && row.executor_pid === null
+          && row.pending_session_id === null && row.pending_result === null)
+      if (!validLostStaged) {
         throw new Error(`lost-staged monitor state is inconsistent for job ${row.id}`)
       }
       return {
@@ -11920,6 +11974,48 @@ export class JobStore {
       }
     }
     return { requeued, failedWrites, failedUncertain }
+  }
+
+  failRunningForForcedServiceStop(): string[] {
+    const jobs = this.runningJobs()
+    const failed: string[] = []
+    for (const job of jobs) {
+      if (job.cancelRequestedAt !== null) {
+        this.cancel(job.id)
+      } else {
+        this.fail(
+          job.id,
+          FORCED_SERVICE_STOP_FAILURE_MESSAGE,
+        )
+      }
+      retrySqlite(() => this.db.run(
+        `UPDATE jobs SET worker_id = NULL
+         WHERE id = ? AND runtime = 'codex' AND status = 'failed'`,
+        [job.id],
+      ))
+      failed.push(job.id)
+    }
+    return failed
+  }
+
+  retireMonitorForForcedServiceStop(idInput: string): void {
+    const id = requireText(idInput, 'jobId')
+    const retire = this.db.transaction(() => {
+      const updated = this.db.run(
+        `UPDATE jobs SET monitor_state = 0
+         WHERE id = ? AND runtime = 'codex'
+           AND status IN ('queued', 'completed', 'failed')`,
+        [id],
+      )
+      const terminal = this.db.query<{ present: number }, [string]>(
+        `SELECT 1 AS present FROM jobs
+         WHERE id = ? AND runtime = 'codex'
+           AND status IN ('queued', 'completed', 'failed') AND monitor_state = 0`,
+      ).get(id)
+      if (terminal) this.db.run('DELETE FROM monitor_failures WHERE job_id = ?', [id])
+      return updated.changes
+    })
+    retrySqlite(() => retire.immediate())
   }
 }
 
@@ -16555,6 +16651,91 @@ export async function terminateTrackedExecutors(
     log(
       `stopped orphaned fingerprint processes: ${recoveredFingerprintPids.join(', ')}`,
     )
+  }
+}
+
+export type ForcedServiceStopRecoveryResult = {
+  completed: number
+  failed: number
+  queued: number
+}
+
+export async function recoverForcedServiceStop(input: {
+  stateDir: string
+  runtime: HerdrRuntimeIdentity
+  log?: (message: string) => void
+  reconcileAdvisors?: () => Promise<void>
+  reconcileMonitors?: (store: JobStore) => Promise<{
+    retained: number
+    closed: number
+    retainedJobIds: string[]
+  }>
+}): Promise<ForcedServiceStopRecoveryResult> {
+  const dir = requireManagedStateRoot(input.stateDir)
+  const log = input.log ?? (message => {
+    process.stderr.write(`${new Date().toISOString()} force-stop recovery: ${message}\n`)
+  })
+  const store = new JobStore(resolveZeroJobDatabasePath(dir, {}))
+  const lockDir = join(dir, 'job-runner.lock')
+  const lease = acquireDaemonLock(
+    lockDir,
+    dir,
+    `force-stop:${herdrRuntimeFingerprint(input.runtime)}`,
+  )
+  if (!lease) {
+    store.close()
+    throw new Error('job runnerの停止lockを取得できません')
+  }
+  try {
+    await terminateTrackedExecutors(store, log, 15_000, dir)
+    const interjections = store.reconcileInterjectionsBeforeRecovery()
+    if (interjections.preparedReset > 0 || interjections.promoted > 0
+      || interjections.blocked > 0) {
+      log(`reconciled conversational interjections: ${JSON.stringify(interjections)}`)
+    }
+
+    const journaled = recoverExecutionResultJournals(store, dir)
+    if (journaled > 0) log(`recovered ${journaled} durable execution result journal(s)`)
+    await (input.reconcileAdvisors ?? (() => reconcileEphemeralAndRetiredAdvisorRounds({
+      stateDir: dir,
+      runtime: input.runtime,
+      log,
+    })))()
+
+    // Results whose complete durable checkpoint needs no GitHub side effect
+    // can be finalized locally. Pending publication is intentionally not
+    // performed by a stop command; those rows become recoverable failures
+    // below, retaining their thread/session audit trail.
+    const completed = store.recoverStagedExecutions({
+      ignoreMonitorBarriersForForcedServiceStop: true,
+    })
+    const failedJobIds = store.failRunningForForcedServiceStop()
+    const monitors = await (input.reconcileMonitors ?? (storeInput => reconcileHerdrJobMonitors({
+      stateDir: dir,
+      runtime: input.runtime,
+      getJob: jobId => storeInput.get(jobId),
+      listMonitorObligations: () => storeInput.monitorObligationsForForcedServiceStop(),
+      recoverMissingBindingAfterExecutorsStopped: (jobId, status) => {
+        storeInput.retireMonitorForForcedServiceStop(jobId)
+        return status === 'queued' ? 'unarmed' : 'terminalized'
+      },
+      onMonitorRetired: jobId => storeInput.retireMonitorForForcedServiceStop(jobId),
+      publicFailureReason: jobId => publicJobFailureSummary(
+        storeInput.get(jobId)?.lastError ?? 'zerochan stop --force により中断しました。',
+      ),
+      closeForServiceStop: true,
+    })))(store)
+    if (monitors.closed > 0 || monitors.retained > 0) {
+      log(`reconciled Herdr job monitors: ${JSON.stringify(monitors)}`)
+    }
+    const active = store.activeCounts()
+    if (active.running !== 0) {
+      throw new Error(`強制停止後も実行中jobが${active.running}件残っています`)
+    }
+    return { completed, failed: failedJobIds.length, queued: active.queued }
+  } finally {
+    store.close()
+    releaseDaemonLock(lockDir, lease)
   }
 }
 

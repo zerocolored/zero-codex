@@ -16,7 +16,7 @@ import {
   unlinkSync,
   writeSync,
 } from 'fs'
-import { basename, isAbsolute, join } from 'path'
+import { basename, isAbsolute, join, resolve } from 'path'
 import type { JobRecord, JobStatus } from './job-runner.ts'
 import {
   ensureManagedDirectory,
@@ -1405,6 +1405,46 @@ async function proveManifestBindingAbsent(
   }
 }
 
+async function proveUnrecordedMonitorBindingAbsent(input: {
+  stateDir: string
+  jobId: string
+  seq: number
+  runtime: HerdrRuntimeIdentity
+  control: HerdrJobMonitorControl
+}): Promise<void> {
+  if (!Number.isSafeInteger(input.seq) || input.seq < 1) {
+    throw new HerdrJobMonitorPendingError(
+      `monitor sequence is unavailable for ${input.jobId}`,
+    )
+  }
+  const expectedLabel = `Zeroちゃん #${input.seq}`
+  const expectedDirectory = resolve(input.stateDir, MONITOR_ROOT, input.jobId)
+  const workspaceIds = [...new Set([
+    input.runtime.workspaceId,
+    ...(await input.control.listWorkspaceIds()),
+  ])]
+  for (const workspaceId of workspaceIds) {
+    const [tabs, panes] = await Promise.all([
+      input.control.listTabs(workspaceId),
+      input.control.listPanes(workspaceId),
+    ])
+    if (tabs.some(tab => tab.label === expectedLabel)) {
+      throw new HerdrJobMonitorPendingError(
+        `unrecorded monitor tab may still exist for ${input.jobId}`,
+      )
+    }
+    if (panes.some(pane => (
+      resolve(pane.cwd) === expectedDirectory
+      || (pane.foregroundCwd !== undefined
+        && resolve(pane.foregroundCwd) === expectedDirectory)
+    ))) {
+      throw new HerdrJobMonitorPendingError(
+        `unrecorded monitor pane may still exist for ${input.jobId}`,
+      )
+    }
+  }
+}
+
 async function verifyViewer(
   manifest: MonitorManifest,
   directory: string,
@@ -1956,7 +1996,7 @@ export async function closeHerdrJobMonitor(input: {
   stateDir: string
   runtime: HerdrRuntimeIdentity
   jobId: string
-  outcome?: 'completed' | 'failed' | 'cancelled' | 'waiting'
+  outcome?: 'completed' | 'failed' | 'cancelled' | 'waiting' | 'stopped'
   onMonitorRetired?: (jobId: string) => Promise<void> | void
   control?: HerdrJobMonitorControl
 }): Promise<void> {
@@ -2038,6 +2078,8 @@ export async function closeHerdrJobMonitor(input: {
               ? 'タスク処理は中止されました'
               : input.outcome === 'waiting'
                 ? 'Before／AfterをSlackへ提示し、回答待ちに移りました'
+                : input.outcome === 'stopped'
+                  ? 'Zeroちゃんを停止したため、この監視タブを終了します'
               : 'タスク処理が完了しました',
         )
       }
@@ -2109,6 +2151,7 @@ export async function reconcileHerdrJobMonitors(input: {
   stateDir: string
   runtime: HerdrRuntimeIdentity
   getJob(jobId: string): {
+    seq?: number
     status: JobStatus
     terminalOutcome?: JobRecord['terminalOutcome']
     uiApprovalRequestId?: string | null
@@ -2126,6 +2169,7 @@ export async function reconcileHerdrJobMonitors(input: {
   onMonitorRetired?: (jobId: string) => Promise<void> | void
   publicFailureReason?: (jobId: string) => string
   progressGraceMs?: number
+  closeForServiceStop?: boolean
   control?: HerdrJobMonitorControl
 }): Promise<{ retained: number; closed: number; retainedJobIds: string[] }> {
   const stateDir = requireManagedStateRoot(input.stateDir)
@@ -2181,11 +2225,35 @@ export async function reconcileHerdrJobMonitors(input: {
     }
     return disposition
   }
+  const recoverAbsentForServiceStop = async (
+    jobId: string,
+    status: JobStatus | 'missing',
+    state: 'preparing' | 'required' | 'lost-staged',
+  ): Promise<boolean> => {
+    if (!input.closeForServiceStop || !input.recoverMissingBindingAfterExecutorsStopped) {
+      return false
+    }
+    if (state !== 'preparing') {
+      const job = input.getJob(jobId)
+      await proveUnrecordedMonitorBindingAbsent({
+        stateDir,
+        jobId,
+        seq: job?.seq ?? 0,
+        runtime: input.runtime,
+        control,
+      })
+    }
+    recoverObligation(jobId, status, state)
+    return true
+  }
   let root: string
   try { root = requireManagedDirectory(stateDir, join(stateDir, MONITOR_ROOT)) } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       const retainedJobIds: string[] = []
       for (const [jobId, obligation] of obligations()) {
+        if (await recoverAbsentForServiceStop(
+          jobId, obligation.status, obligation.state,
+        )) continue
         if (obligation.state === 'lost-staged') {
           throw new HerdrJobMonitorPendingError(
             `staged execution remains blocked after losing its Herdr monitor: ${jobId}`,
@@ -2210,6 +2278,9 @@ export async function reconcileHerdrJobMonitors(input: {
   const nameSet = new Set(names)
   for (const [jobId, obligation] of obligations()) {
     if (nameSet.has(jobId)) continue
+    if (await recoverAbsentForServiceStop(
+      jobId, obligation.status, obligation.state,
+    )) continue
     if (obligation.state === 'lost-staged') {
       throw new HerdrJobMonitorPendingError(
         `staged execution remains blocked after losing its Herdr monitor: ${jobId}`,
@@ -2232,6 +2303,25 @@ export async function reconcileHerdrJobMonitors(input: {
       || obligationBeforeRecovery?.state === 'lost-staged') {
       const rawManifest = readSmallOwnedFile(join(directory, MANIFEST_FILE), 'monitor manifest')
       if (rawManifest === null) {
+        if (input.closeForServiceStop
+          && input.recoverMissingBindingAfterExecutorsStopped) {
+          const job = input.getJob(name)
+          await proveUnrecordedMonitorBindingAbsent({
+            stateDir,
+            jobId: name,
+            seq: job?.seq ?? 0,
+            runtime: input.runtime,
+            control,
+          })
+          if (recoverIncompleteMonitorInitialization(stateDir, name)) {
+            recoverObligation(
+              name,
+              obligationBeforeRecovery.status,
+              obligationBeforeRecovery.state,
+            )
+            continue
+          }
+        }
         throw new HerdrJobMonitorPendingError(
           `required monitor manifest is missing for ${name}`,
         )
@@ -2254,6 +2344,23 @@ export async function reconcileHerdrJobMonitors(input: {
     const job = input.getJob(name)
     const status: JobStatus | 'missing' = job?.status ?? 'missing'
     const obligation = obligations().get(name)
+    if (input.closeForServiceStop) {
+      if (status === 'running') {
+        throw new HerdrJobMonitorPendingError(
+          `service stop cannot close a monitor for running job ${name}`,
+        )
+      }
+      await closeHerdrJobMonitor({
+        stateDir,
+        runtime: input.runtime,
+        jobId: name,
+        outcome: 'stopped',
+        onMonitorRetired: input.onMonitorRetired,
+        control,
+      })
+      closed += 1
+      continue
+    }
     if (manifest.phase === 'retained-failure') {
       if ((status !== 'failed' && status !== 'missing')
         || job?.terminalOutcome === 'cancelled') {
