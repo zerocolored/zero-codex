@@ -28,6 +28,10 @@ import {
   signalProcessIfLive,
   type ProcessIdentity,
 } from './process-generation.ts'
+import {
+  requireTmuxCommand,
+  tmuxSessionExists as boundedTmuxSessionExists,
+} from './tmux-command.ts'
 
 const REQUEST_FILE = 'update-request.json'
 const WORKER_SESSION = 'zerokun-update-worker'
@@ -290,7 +294,9 @@ function resolveTmuxPath(configured?: string): string {
 }
 
 function tmuxSessionExists(tmux: string, session: string): boolean {
-  return command([tmux, 'has-session', '-t', session]).exitCode === 0
+  return boundedTmuxSessionExists(tmux, session, {
+    env: buildUpdaterEnvironment(),
+  })
 }
 
 function updateMutationIsRunning(dir: string): boolean {
@@ -350,8 +356,7 @@ export function launchDetachedUpdateWorker(
     legacyCutover ? '1' : '0',
     ...(projectDir ? ['--project-dir', shellQuote(projectDir)] : []),
   ].join(' ')
-  requireCommand([
-    tmux,
+  requireTmuxCommand(tmux, [
     'new-session',
     '-d',
     '-s',
@@ -363,7 +368,7 @@ export function launchDetachedUpdateWorker(
     '-c',
     dir,
     launchCommand,
-  ])
+  ], { env: buildUpdaterEnvironment() })
 }
 
 export async function requestUpdate(

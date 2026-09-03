@@ -18,6 +18,7 @@ import {
   buildUpdaterEnvironment,
 } from './child-environment'
 import { observeProcessGeneration, readProcessIdentity } from './process-generation'
+import { runTmuxCommand } from './tmux-command'
 
 const tempDirs: string[] = []
 
@@ -492,16 +493,22 @@ describe('Slack update request', () => {
       '',
     ].join('\n'))
     writeFileSync(updaterPath, '#!/usr/bin/env bun\n')
-    expect(Bun.spawnSync([tmuxPath, 'new-session', '-d', '-s', keeper, 'sleep 30']).exitCode).toBe(0)
-    expect(Bun.spawnSync([
-      tmuxPath, 'set-environment', '-g', 'ZEROKUN_JOB_DB', '/tmux/stale/jobs.sqlite3',
-    ]).exitCode).toBe(0)
-    expect(Bun.spawnSync([
-      tmuxPath, 'set-environment', '-g', 'ZEROKUN_SETUP_SCRIPT', '/tmux/stale/setup.sh',
-    ]).exitCode).toBe(0)
-    expect(Bun.spawnSync([
-      tmuxPath, 'set-environment', '-g', 'SLACK_BOT_TOKEN', 'xoxb-tmux-stale-not-real',
-    ]).exitCode).toBe(0)
+    expect(runTmuxCommand(
+      tmuxPath,
+      ['new-session', '-d', '-s', keeper, 'sleep 30'],
+    ).exitCode).toBe(0)
+    expect(runTmuxCommand(
+      tmuxPath,
+      ['set-environment', '-g', 'ZEROKUN_JOB_DB', '/tmux/stale/jobs.sqlite3'],
+    ).exitCode).toBe(0)
+    expect(runTmuxCommand(
+      tmuxPath,
+      ['set-environment', '-g', 'ZEROKUN_SETUP_SCRIPT', '/tmux/stale/setup.sh'],
+    ).exitCode).toBe(0)
+    expect(runTmuxCommand(
+      tmuxPath,
+      ['set-environment', '-g', 'SLACK_BOT_TOKEN', 'xoxb-tmux-stale-not-real'],
+    ).exitCode).toBe(0)
     const previousJobDb = process.env.ZEROKUN_JOB_DB
     process.env.ZEROKUN_JOB_DB = join(stateDir, 'jobs.sqlite3')
 
@@ -532,10 +539,10 @@ describe('Slack update request', () => {
         projectDirArg: projectDir,
         jobDb: join(realpathSync(stateDir), 'jobs.sqlite3'),
       })
-      const alive = Bun.spawnSync([tmuxPath, 'has-session', '-t', session])
+      const alive = runTmuxCommand(tmuxPath, ['has-session', '-t', session])
       expect(alive.exitCode).toBe(0)
     } finally {
-      Bun.spawnSync([tmuxPath, 'kill-server'])
+      runTmuxCommand(tmuxPath, ['kill-server'])
       if (previousJobDb === undefined) delete process.env.ZEROKUN_JOB_DB
       else process.env.ZEROKUN_JOB_DB = previousJobDb
     }

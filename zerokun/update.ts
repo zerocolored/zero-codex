@@ -83,6 +83,7 @@ import {
   verifyHerdrRuntimeIdentityAsync,
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
+import { requireTmuxCommand, runTmuxCommand, tmuxSessionExists } from './tmux-command.ts'
 
 interface Repository {
   label: string
@@ -2213,13 +2214,14 @@ export function assertTmuxSessionAvailableOrOwned(options: {
   sessionName: string
   stateDir: string
 }): void {
-  if (command([options.tmuxPath, 'has-session', '-t', options.sessionName]).exitCode !== 0) return
-  const panes = command([
-    options.tmuxPath, 'list-panes', '-t', options.sessionName, '-F', '#{pane_pid}',
-  ])
-  const panePids = panes.exitCode === 0
-    ? panes.stdout.split(/\s+/).map(Number).filter(pid => Number.isInteger(pid) && pid > 0)
-    : []
+  if (!tmuxSessionExists(options.tmuxPath, options.sessionName)) return
+  const paneOutput = requireTmuxCommand(
+    options.tmuxPath,
+    ['list-panes', '-t', options.sessionName, '-F', '#{pane_pid}'],
+    { capture: true },
+  )
+  const panePids = paneOutput.split(/\s+/).map(Number)
+    .filter(pid => Number.isInteger(pid) && pid > 0)
   const lockFile = join(options.stateDir, 'plugin.lock')
   const gatewayPid = readPid(lockFile)
   if (panePids.length === 1 && gatewayPid === panePids[0]
@@ -2278,8 +2280,7 @@ export async function startBotInTmux(options: {
     }).map(shellQuote),
   ].join(' ')
 
-  requireCommand([
-    tmux,
+  requireTmuxCommand(tmux, [
     'new-session',
     '-d',
     '-s',
@@ -2294,8 +2295,7 @@ export async function startBotInTmux(options: {
   ])
 
   try {
-    requireCommand([
-      tmux,
+    requireTmuxCommand(tmux, [
       'pipe-pane',
       '-o',
       '-t',
@@ -2309,16 +2309,15 @@ export async function startBotInTmux(options: {
         shellQuote(options.logPath),
       ].join(' '),
     ])
-    const maxChecks = Math.ceil(timeoutMs / 100)
-    for (let check = 0; check < maxChecks; check += 1) {
-      const panePid = Number(command([
+    const readinessDeadline = Date.now() + timeoutMs
+    while (Date.now() < readinessDeadline) {
+      const remainingMs = Math.max(1, readinessDeadline - Date.now())
+      const paneResult = runTmuxCommand(
         tmux,
-        'list-panes',
-        '-t',
-        sessionName,
-        '-F',
-        '#{pane_pid}',
-      ]).stdout)
+        ['list-panes', '-t', sessionName, '-F', '#{pane_pid}'],
+        { capture: true, timeoutMs: Math.min(1_000, remainingMs) },
+      )
+      const panePid = paneResult.exitCode === 0 ? Number(paneResult.stdout) : 0
       if (Number.isInteger(panePid) && panePid > 0) {
         atomicWritePrivateFile(
           join(stateDir, 'tmux-session.json'),
@@ -2326,11 +2325,13 @@ export async function startBotInTmux(options: {
         )
         return panePid
       }
-      await Bun.sleep(100)
+      if (Date.now() < readinessDeadline) {
+        await Bun.sleep(Math.min(100, readinessDeadline - Date.now()))
+      }
     }
     fail(`Codex版gatewayのtmux sessionを${timeoutMs / 1_000}秒以内に確認できませんでした`)
   } catch (error) {
-    command([tmux, 'kill-session', '-t', sessionName])
+    runTmuxCommand(tmux, ['kill-session', '-t', sessionName])
     throw error
   }
 }

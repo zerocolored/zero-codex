@@ -186,6 +186,7 @@ describe('Zero-kun Codex wiring', () => {
       'state-dir.ts',
       'slack-http.ts',
       'slack-app-identity.ts',
+      'tmux-command.ts',
     ]) expect(runtime).toContain(`'${companion}'`)
     expect(setup).toContain('ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerochan-access"')
     expect(setup).not.toContain('ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerokun-access"')
