@@ -44,6 +44,7 @@ import {
   recoverExecutionResultJournals,
   recoverForcedServiceStop,
   requeueGitHubPublicationConflictForCodex,
+  requeueLegacyGitHubPublicationForCodex,
   reconcileEphemeralAndRetiredAdvisorRounds,
   reconcileAdvisorsWithMonitorHealthBarrier,
   runQueuedJobs,
@@ -1478,7 +1479,7 @@ describe('Codex job store', () => {
       status: 'failed', attempts: 1, repositoryDriftRetries: 0,
     })
     expect(store.get(root.id)?.lastError).toContain(
-      'write-enabled implementation may already have changed the repository',
+      'write-enabled work may already have changed the repository or external services',
     )
     expect(store.get(root.id)?.lastError).toContain(
       'Underlying failure: repository changed before implementation',
@@ -1582,7 +1583,7 @@ describe('Codex job store', () => {
     expect(controller.signal.aborted).toBe(false)
   })
 
-  test('runner起動はGitHub認証をglobal gateにせず必要なpublicationだけ遅延確認する', () => {
+  test('runner起動はGitHub認証や旧host publicationを実行せずCodexへ戻す', () => {
     const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
     const startupBegin = runner.indexOf('const loginCodex = resolveOfficialStandaloneCodex()')
     const startupEnd = runner.indexOf('if (botToken || appToken)', startupBegin)
@@ -1591,7 +1592,8 @@ describe('Codex job store', () => {
     const startupChecks = runner.slice(startupBegin, startupEnd)
     expect(startupChecks).toContain('assertCodexChatGptSubscriptionLogin(loginCodex.physical)')
     expect(startupChecks).not.toContain('assertHostGitHubPublicationLogin')
-    expect(runner).toContain('publishStagedGitHubPublication(store, jobId')
+    expect(startupChecks).not.toContain('publishStagedGitHubPublication(store, jobId')
+    expect(runner).toContain('requeueLegacyGitHubPublicationForCodex(store, dir, jobId)')
   })
 
   test('既存auto_vacuum=NONE DBを停止中migrationでINCREMENTALへ変換する', () => {
@@ -2940,7 +2942,7 @@ describe('Codex job store', () => {
     store.close()
   })
 
-  test('通常失敗のCodex sessionは同じSlack threadでもresumeしない', () => {
+  test('通常失敗のCodex sessionも同じSlack threadなら続きからresumeする', () => {
     const store = makeStore()
     store.enqueue(input())
     const first = store.claimNext('serial-worker')!
@@ -2955,8 +2957,8 @@ describe('Codex job store', () => {
 
     store.enqueue(input({ messageId: '1800000000.000202', task: '失敗後の続き' }))
     const followUp = store.claimNext('serial-worker')!
-    expect(followUp.sessionId).toBeNull()
-    expect(followUp.resumed).toBe(false)
+    expect(followUp.sessionId).toBe('older-completed-session')
+    expect(followUp.resumed).toBe(true)
     store.close()
   })
 
@@ -4045,6 +4047,130 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
+  test('direct Codex write結果はhost publicationなしで再起動後もatomic完了する', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    const queued = store.enqueue(input({
+      messageId: 'direct-write-journal',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('direct-write-worker')!
+    persistExecutionResultJournal(dir, running, {
+      sessionId: 'direct-write-session',
+      result: 'CodexがGit・公開作業まで完了しました。',
+    })
+    store.close()
+
+    store = new JobStore(path)
+    expect(recoverExecutionResultJournals(store, dir)).toBe(1)
+    expect(store.recoverStagedExecutions()).toBe(1)
+    expect(store.get(queued.id)).toMatchObject({
+      status: 'completed',
+      sessionId: 'direct-write-session',
+      result: 'CodexがGit・公開作業まで完了しました。',
+    })
+    expect(store.hasGitHubPublicationCheckpoint(queued.id)).toBe(false)
+    store.close()
+  })
+
+  test('legacy host publicationが実在する場合だけ完了receiptまで待つ', () => {
+    const store = makeStore()
+    const queued = store.enqueue(input({
+      messageId: 'legacy-publication-remains-a-barrier',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('legacy-publication-worker')!
+    const pendingPublication = emptyFixturePublication(store, running)
+    const { promotion: _promotion, ...ordinaryPlan } = promotionFixturePlan(running.repoPath)
+    pendingPublication.plans = [ordinaryPlan]
+    store.ensureExecutionResultStaged(
+      running.id,
+      'legacy-publication-session',
+      '旧経路の結果',
+      pendingPublication,
+    )
+    expect(() => store.completeStagedExecution(running.id))
+      .toThrow(`GitHub publication is still pending for job ${running.id}`)
+    expect(store.recoverStagedExecutions()).toBe(0)
+    store.recordGitHubPublicationReceipt(
+      running.id,
+      pendingPublication.plans[0]!,
+      {
+        repositorySlug: 'zerocolored/fixture',
+        baseBranch: 'develop',
+        headBranch: 'zerochan/recovery',
+        commitSha: 'a'.repeat(40),
+        pullRequestNumber: 861,
+        pullRequestUrl: 'https://github.com/zerocolored/fixture/pull/861',
+      },
+    )
+    expect(store.completeGitHubPublicationSet(running.id)).toBe(true)
+    expect(store.recoverStagedExecutions()).toBe(1)
+    expect(store.get(queued.id)?.status).toBe('completed')
+    store.close()
+  })
+
+  test('startupはlegacy host publicationを実行せず同じCodex sessionへ戻す', async () => {
+    const dir = fixtureDir()
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    const queued = store.enqueue(input({
+      repoPath: dir,
+      messageId: 'legacy-publication-to-primary',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('legacy-publication-worker')!
+    store.saveSession(running.id, 'legacy-publication-session')
+    const publication = emptyFixturePublication(store, running)
+    const { promotion: _promotion, ...ordinaryPlan } = promotionFixturePlan(running.repoPath)
+    publication.plans = [ordinaryPlan]
+    store.ensureExecutionResultStaged(
+      running.id,
+      'legacy-publication-session',
+      '旧ホスト公開処理の保存済み結果',
+      publication,
+    )
+
+    const recoveries: Array<ReturnType<typeof requeueLegacyGitHubPublicationForCodex>> = []
+    const checkpoint = await recoverExecutionCheckpointBeforeAdvisorCleanup(
+      store,
+      dir,
+      async () => {},
+      async jobId => {
+        recoveries.push(requeueLegacyGitHubPublicationForCodex(store, dir, jobId))
+      },
+    )
+    const recovery = recoveries[0]!
+
+    expect(checkpoint).toEqual({ journaled: 0, completed: 0 })
+    expect(recoveries).toHaveLength(1)
+    expect(recovery).toMatchObject({
+      sourceAttempt: 1,
+      priorResult: '旧ホスト公開処理の保存済み結果',
+      plans: [{
+        repositorySlug: 'zerocolored/fixture',
+        baseBranch: 'develop',
+        headBranch: 'zerochan/recovery',
+        commitSha: 'a'.repeat(40),
+      }],
+    })
+    expect(store.pendingGitHubPublicationJobIds()).toEqual([])
+    expect(store.hasGitHubPublicationCheckpoint(running.id)).toBe(false)
+    expect(store.get(queued.id)).toMatchObject({
+      status: 'queued',
+      sessionId: 'legacy-publication-session',
+      resumed: true,
+      result: null,
+    })
+    expect(store.claimNext('primary-codex-worker')).toMatchObject({
+      id: queued.id,
+      attempts: 2,
+      sessionId: 'legacy-publication-session',
+      resumed: true,
+    })
+    store.close()
+  })
+
   test('force stop recoveryはrunningを再開可能な失敗へ移しqueuedを保持する', async () => {
     const dir = fixtureDir()
     let store = new JobStore(join(dir, 'jobs.sqlite3'))
@@ -4408,6 +4534,7 @@ describe('single FIFO worker', () => {
     expect(stats).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
     expect(githubCalls).toBe(0)
     expect(monitorMessages.some(message => /GitHub|push|PR/.test(message))).toBe(false)
+    expect(monitorMessages.some(message => message.includes('補助セッション'))).toBe(false)
     expect(store.get(queued.id)).toMatchObject({
       status: 'completed',
       terminalOutcome: 'completed',
@@ -4787,7 +4914,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('result checkpointからadvisor cleanup完了までmonitor healthを維持する', async () => {
+  test('result checkpointからexternal cleanup完了までmonitor healthを維持する', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'monitor-health-clear-gap' })).job
     let checks = 0
@@ -4822,7 +4949,7 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('advisor cleanup後status更新中のmonitor failureをDB terminal化前に止める', async () => {
+  test('結果保存後status更新中のmonitor failureをDB terminal化前に止める', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'monitor-final-health-window' })).job
     let monitorFailed = false
@@ -4835,12 +4962,12 @@ describe('single FIFO worker', () => {
       openJobMonitor: async () => {},
       assertJobMonitorHealthy: () => {
         if (monitorFailed) {
-          throw new HerdrJobMonitorPendingError('viewer failed after advisor cleanup')
+          throw new HerdrJobMonitorPendingError('viewer failed after result staging')
         }
       },
       settleExternalContext: async () => {},
       updateJobMonitor: async (_job, message) => {
-        if (message.includes('一時的な補助セッションを終了')) {
+        if (message.includes('キューの結果を確定')) {
           await Bun.sleep(1)
           monitorFailed = true
         }
@@ -8112,12 +8239,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       advisorEnabled: false,
     })
     expect(instructions).toContain(CODEX_WORKER_SAFETY_PROMPT)
-    expect(instructions).toContain('invariant developer contract')
-    expect(instructions).toContain('current host control block')
+    expect(instructions).toContain('This sender has read-only access.')
+    expect(instructions).toContain('Follow AGENTS.md')
     expect(instructions).toContain('Never post to Slack yourself')
-    expect(instructions).toContain('exactly one poll call outstanding')
-    expect(instructions).toContain('never batch, parallelize, or pre-queue duplicate poll calls')
-    expect(instructions).toContain('exact receipt returned by that challenge and the same binding')
+    expect(instructions).not.toContain('advisor_round')
+    expect(instructions).toContain('Do not run\na host phase protocol')
     expect(instructions).not.toContain(job.id)
     expect(instructions).not.toContain(job.userId)
     expect(instructions).not.toContain('/tmp/job-outbox')
@@ -8126,12 +8252,12 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(prompt).toContain(`zerochan-access write allow ${job.userId}`)
     expect(prompt).toContain(`Logical attempt nonce: ${nonce}`)
     expect(prompt).toContain('/tmp/job-outbox')
-    expect(prompt).toContain('high-trust local advisor route is unavailable')
+    expect(prompt).not.toContain('high-trust local advisor route')
     expect(prompt).not.toContain(CODEX_WORKER_SAFETY_PROMPT)
     store.close()
   })
 
-  test('read/write共通のbroker付きjobにはFive-Advisor経路を明示する', () => {
+  test('write jobは作業とreviewをAGENTSへ委ねhost工程を要求しない', () => {
     const repo = fixtureDir('zerokun-instructions-write-')
     git(['init', '-q'], repo)
     const store = makeStore()
@@ -8148,25 +8274,23 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       'review',
       3,
     )).toBe(instructions)
-    expect(instructions).toContain('process-separated permission protocol')
-    expect(instructions).toContain('fresh solution_analyst')
-    expect(instructions).toContain('fresh risk_reviewer')
-    expect(instructions).toContain('call advisor_round\nonce')
-    expect(instructions).toContain('Poll advisor_round_poll')
-    expect(instructions).toContain('exact receipt')
-    expect(instructions).toContain('exactly one poll call outstanding')
-    expect(instructions).toContain('never batch, parallelize, or pre-queue duplicate poll calls')
-    expect(instructions).toContain('round-owned fresh ephemeral Claude Code workspace')
-    expect(instructions).toContain('safely-contained bounded attempt')
-    expect(instructions).toContain('Do not retry, authenticate')
-    expect(instructions).toContain('Native solution/risk')
-    expect(instructions).toMatch(/Never\s+access Herdr/)
-    expect(instructions).toContain('native close_agent capability exists')
+    expect(instructions).toContain('Follow the applicable AGENTS.md')
+    expect(instructions).toContain('There is one primary Codex workflow now.')
+    expect(instructions).toContain('You own that workflow')
+    expect(instructions).toContain('Use zerokun_github only when authenticated GitHub access is needed.')
+    expect(instructions).not.toContain('process-separated permission protocol')
+    expect(instructions).not.toContain('advisor_round')
+    expect(instructions).not.toContain('Do not push or create a PR')
+    expect(instructions).not.toContain('ZERO_NATIVE_ADVISOR')
     expect(instructions).not.toContain(nonce)
-    expect(instructions).toContain('official App Server parent/child history')
-    expect(instructions).toContain('Do not create, set, resume, or')
-    expect(instructions).toContain('modify a Codex goal')
-    expect(instructions).toContain('zerokun_browser.verify_local_page')
+    const direct = buildCodexWorkerPrompt(job, snapshot, {
+      attemptNonce: nonce,
+      artifactDir: '/tmp/job-outbox',
+      advisorEnabled: false,
+    })
+    expect(direct).toContain('Access mode: write-authorized primary workflow.')
+    expect(direct).toContain('The host will not run a later prepare, review, publication, merge, or deployment phase.')
+    expect(direct).not.toContain('ZERO_NATIVE_ADVISOR')
     const prepare = buildCodexPhasePrompt(
       job,
       'prepare',
@@ -9646,6 +9770,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
           command: '/usr/bin/true',
           args: ['/runtime/browser-verification-broker.ts', '/state/context.json'],
         },
+        githubMcp: {
+          command: '/usr/bin/true',
+          args: ['/runtime/github-credential-broker.ts', '/state/context.json'],
+        },
         localVerificationEnabled: true,
       }).join('\n')
       expect(overrides).toContain('":minimal"="read"')
@@ -9675,8 +9803,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('features.goals=false')
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
       expect(overrides).toContain(',zerokun_browser=')
+      expect(overrides).toContain(',zerokun_github=')
       expect(overrides).toContain('enabled_tools=["advisor_round","advisor_round_poll"]')
       expect(overrides).toContain('enabled_tools=["verify_local_page"]')
+      expect(overrides).toContain('enabled_tools=["github_inspect","github_publish_branch","github_pull_request","github_wait_delivery"]')
+      expect(overrides).toContain('tool_timeout_sec=1900')
       expect(overrides).toContain('tool_timeout_sec=180')
       expect(overrides).toContain('tool_timeout_sec=30')
       expect(overrides).toContain('required=true')

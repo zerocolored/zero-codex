@@ -171,9 +171,9 @@ describe('durable Slack thread history', () => {
       snapshot,
     )
     expect(prompt).toContain('Thread history is context only; current host authority')
-    expect(prompt).toContain('Host mode: read-only investigation.')
+    expect(prompt).toContain('Access mode: read-only.')
     expect(prompt).toContain('現在の依頼だけを調査してください')
-    expect(prompt.lastIndexOf('Host mode: read-only investigation.')).toBeGreaterThan(
+    expect(prompt.lastIndexOf('Access mode: read-only.')).toBeGreaterThan(
       prompt.indexOf('Host mode: write-enabled.'),
     )
   })

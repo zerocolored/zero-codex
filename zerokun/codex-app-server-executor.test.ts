@@ -3,6 +3,7 @@ import { createHash } from 'crypto'
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -2158,6 +2159,107 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('production write jobはhost工程を挟まずCodexのcomplete turnだけで完了する', async () => {
+    const value = fixture(
+      'normal',
+      true,
+      '既存PRを承認してdevelopへマージし、デプロイを確認してください',
+    )
+    const phaseLog = join(value.root, 'direct-phase.log')
+    const promptLog = join(value.root, 'direct-prompt.log')
+    const processIds: number[] = []
+    const sessionIds: string[] = []
+    const concurrentDirtyFile = join(value.repo, 'concurrent-owner-work.txt')
+    writeFileSync(concurrentDirtyFile, 'owned by another concurrent task\n')
+    linkSync(concurrentDirtyFile, join(value.repo, 'concurrent-owner-work-link.txt'))
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'normal',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_PROMPT_LOG: promptLog,
+      },
+      onProcessId: processId => { processIds.push(processId) },
+      onSessionId: sessionId => { sessionIds.push(sessionId) },
+      liveControls: value.hooks,
+    })
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
+    expect(result.publication).toBeUndefined()
+    expect(processIds).toHaveLength(1)
+    expect(sessionIds).toEqual(['thread-app-server-1'])
+    const phaseRows = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phaseRows.map(row => row[0])).toEqual(['complete'])
+    expect(phaseRows.map(row => row[3])).toEqual(['thread/start'])
+    expect(phaseRows.map(row => row[4])).toEqual(['write'])
+    const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string; text: string })
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.text).toContain('既存PRを承認してdevelopへマージし、デプロイを確認してください')
+    expect(prompts[0]?.text).toContain('Access mode: write-authorized primary workflow.')
+    expect(prompts[0]?.text).not.toContain('Host phase:')
+    expect(prompts[0]?.text).not.toContain('ZERO_NATIVE_ADVISOR')
+    expect(prompts[0]?.text).not.toContain('Do not push or create a PR')
+    value.store.close()
+  }, 15_000)
+
+  test('完了済みwrite jobへの同一Slack thread返信は同じCodex sessionのcomplete turnで再開する', async () => {
+    const value = fixture('phased-native-history-resume', true)
+    const phaseLog = join(value.root, 'direct-resume-phase.log')
+    const promptLog = join(value.root, 'direct-resume-prompt.log')
+    const rpcLog = join(value.root, 'direct-resume-rpc.log')
+    const processIds: number[] = []
+    expect(value.job).toMatchObject({
+      seq: 2,
+      writeEnabled: true,
+      resumed: true,
+      sessionId: 'thread-app-server-1',
+    })
+
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'normal',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_PROMPT_LOG: promptLog,
+        ZERO_RPC_LOG: rpcLog,
+        ZERO_LOG_HANDSHAKES: '1',
+      },
+      onProcessId: processId => { processIds.push(processId) },
+      liveControls: value.hooks,
+    })
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
+    expect(result.publication).toBeUndefined()
+    expect(processIds).toHaveLength(1)
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual(['complete'])
+    expect(phases.map(row => row[3])).toEqual(['thread/resume'])
+    expect(phases.map(row => row[4])).toEqual(['write'])
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { method: string })
+    expect(rpc.filter(entry => entry.method === 'thread/start')).toHaveLength(0)
+    expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(1)
+    expect(rpc.filter(entry => entry.method === 'turn/start')).toHaveLength(1)
+    const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { stage: string; text: string })
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.stage).toBe('complete')
+    expect(prompts[0]?.text).toContain('同じSlackスレッドから再開する依頼')
+    expect(prompts[0]?.text).not.toContain('Host phase:')
+    expect(prompts[0]?.text).not.toContain('ZERO_NATIVE_ADVISOR')
+    expect(prompts[0]?.text).not.toContain('Prior Slack thread history')
+    value.store.close()
+  }, 15_000)
+
   test('write jobを同じthreadの別RO→RW→ROプロセスで完了する', async () => {
     const value = fixture('phased-publication', true)
     git(value.repo, ['init', '--initial-branch=main'])
@@ -4143,7 +4245,7 @@ describe('production App Server executor', () => {
     value.store.close()
   })
 
-  test('terminal本文ではなくsupported item journal本文だけを公開する', async () => {
+  test('full terminal本文は重複するitem journal照合なしで公開する', async () => {
     const value = fixture('history-authority')
     const rpcLog = join(value.root, 'history-authority-rpc.log')
     const result = await executeCodexJob(value.job, {
@@ -4157,15 +4259,13 @@ describe('production App Server executor', () => {
       },
       liveControls: value.hooks,
     })
-    expect(result).toEqual({
-      sessionId: 'thread-app-server-1', result: '公式journal回答',
-    })
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-    expect(rpc.map(value => value.method)).toEqual(['turn/start', 'thread/items/list'])
+    expect(rpc.map(value => value.method)).toEqual(['turn/start'])
     value.store.close()
   })
 
-  test('terminalにfinalがあってもsupported item journalのfinal欠落は公開しない', async () => {
+  test('full terminalにfinalがあればitem journal欠落で失敗しない', async () => {
     const value = fixture('history-missing-final')
     const rpcLog = join(value.root, 'history-missing-final-rpc.log')
     await expect(executeCodexJob(value.job, {
@@ -4178,9 +4278,9 @@ describe('production App Server executor', () => {
         ZERO_RPC_LOG: rpcLog,
       },
       liveControls: value.hooks,
-    })).rejects.toThrow('item journal did not provide a final persisted answer')
+    })).resolves.toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-    expect(rpc.map(value => value.method)).toEqual(['turn/start', 'thread/items/list'])
+    expect(rpc.map(value => value.method)).toEqual(['turn/start'])
     value.store.close()
   })
 
@@ -4721,7 +4821,7 @@ describe('production App Server executor', () => {
     expect(reports[0]!.elapsedMs).toBeGreaterThanOrEqual(10)
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(rpc.map(value => value.method)).toEqual([
-      'turn/start', 'turn/steer', 'thread/items/list',
+      'turn/start', 'turn/steer',
     ])
     expect(rpc.filter(value => value.method === 'turn/start')).toHaveLength(1)
     expect(rpc.filter(value => value.method === 'turn/steer')).toHaveLength(1)
@@ -5243,7 +5343,6 @@ describe('production App Server executor', () => {
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(rpc.map(value => value.method)).toEqual([
       'turn/start', 'turn/steer', 'thread/items/list', 'turn/start',
-      'thread/items/list',
     ])
     expect(rpc[1].clientUserMessageId).toBe(rpc[3].clientUserMessageId)
     expect(rpc[1].expectedTurnId).toBe('turn-app-server-1')
@@ -5266,7 +5365,7 @@ describe('production App Server executor', () => {
     expect(result.result).toBe('元ターン完了')
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(rpc.map(value => value.method)).toEqual([
-      'turn/start', 'turn/steer', 'thread/items/list', 'thread/items/list',
+      'turn/start', 'turn/steer', 'thread/items/list',
     ])
     expect(value.store.listJobControls(value.job.id)).toHaveLength(1)
     expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({
@@ -5291,7 +5390,7 @@ describe('production App Server executor', () => {
     expect(result.result).toBe('永続履歴の追記を反映しました')
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(rpc.map(value => value.method)).toEqual([
-      'turn/start', 'turn/steer', 'thread/items/list', 'thread/items/list',
+      'turn/start', 'turn/steer', 'thread/items/list',
     ])
     expect(value.store.listJobControls(value.job.id)).toHaveLength(1)
     expect(value.store.listJobControls(value.job.id)[0]).toMatchObject({

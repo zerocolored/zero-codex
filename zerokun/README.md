@@ -4,9 +4,8 @@
 
 常駐するSlack gatewayが受信をSQLiteへ保存し、Herdr内から起動された1本のrunnerが
 `codex app-server --stdio`をJSON-RPCで直列実行します。Codexはglobal→projectの`AGENTS.md`をjobごとに読み、
-read jobのinvestigation、write jobの編集前design・編集後reviewでnative subagent・専用Grok reviewer・
-各round専用のfresh Claude Code第五advisorを必須実行します。Claudeは非フォーカスの一時workspaceへ
-新規起動し、回答取得後にそのworkspaceだけを自動で閉じます。既存Claude paneは再利用・`/clear`・closeしません。
+read jobは回答まで、write jobは調査・設計・実装・review・Git・依頼されたmerge／deploy確認までを
+1つのprimary Codex workflowで完遂します。Zeroちゃんは独自のphaseやadvisor照合を追加しません。
 
 ## 導入
 
@@ -17,8 +16,8 @@ Codex CLI 0.149.0以上、Herdr 0.8.2以上（必要なworkspace/tab/pane/agent 
 
 GitHub未認証のMacでは起動前に人が`gh auth login --hostname github.com --git-protocol https --web`を
 一度実行します。稼働中のZeroちゃんはloginを行わず、CodexへGitHub credentialを渡しません。Codexは
-review対象のlocal commitまでを作り、host runtimeが入力seal後に完全一致SHAだけをpushしてPR receiptを保存します。
-実装processはcommit後かつread-only review前にcheckoutを元のcleanなbase branchへ戻します。reviewは固定feature branchのcommit差分を確認し、認証を持つhost publisherはcheckoutを変更しないため、次の依頼が前のPRへ連鎖しません。
+repository限定の`zerokun_github`経由で認証済みpush・PR・approve・merge・checks確認を実行できます。
+このbrokerはcredential transportだけを担当し、作業方針や公開順序はCodexと`AGENTS.md`が決めます。
 
 ```bash
 bootstrap_dir="$(/usr/bin/mktemp -d /tmp/zerokun-bootstrap.XXXXXX)"
@@ -66,14 +65,13 @@ Git repositoryでなくてもmulti-repository workspaceとして起動できま�
 | `herdr-job-monitor-view.ts` | tokenを持たずrolling feedだけをterminalへ安全に表示するviewer |
 | `codex-executor.ts` | sandboxを選び、App Server thread/turn/controlを検証 |
 | `browser-verification-broker.ts` | fresh Chrome profileでlocalhostだけを描画・PNG検証 |
+| `github-credential-broker.ts` | operator credentialを隠したrepository限定GitHub transport |
 | `access.ts` | pairing、DM/channel、write 許可の端末 CLI |
 | `project-channel-config.ts` | project-local channel設定と共有SQLite routeの同期 |
 | `update.ts` | `origin/main` から安全に fast-forward 更新 |
 | `update-request.ts` | Slack 自己更新を FIFO 外の detached worker へ渡す |
 | `process-generation.ts` | macOS libprocによるmicrosecond process世代IDとsignal前再検証 |
 | `seatbelt-fingerprint.ts` | setsid/reparent後も継承sandboxからjob固有processを再発見・回収 |
-| `native-advisor-evidence.ts` | App Server履歴によるnative Codex advisorの親子・role・完了照合 |
-| `ephemeral-claude-session.ts` | round専用Claude workspaceのreceipt・再起動cleanup |
 | `watchdog.sh` | gateway と runner の状態遷移を監視 |
 
 ## Durable FIFO
@@ -90,7 +88,7 @@ state dir の `jobs.sqlite3` に、認可済み Slack event を transaction で�
 6. supervisorがPID registrationを先に永続化し、`thread/start`または`thread/resume`の
    handshakeを検証した時点でthread IDをDBへ保存する。
 7. 正常終了/失敗とterminal通知を同じtransactionで保存し、Slack投稿成功後に通知済みにする。
-8. Codexとround専用advisorの停止・exact workspace cleanup、結果checkpoint、SQLite terminal化のすべてが確定してから
+8. Codexとその所有processの停止、結果checkpoint、SQLite terminal化のすべてが確定してから
    viewerのterminal write/drainとbindingを再確認する。正常完了と中止は監視tabをexact IDで閉じる。
    通常失敗は公開可能な固定分類の原因を表示し、全feedをseal/drainしてviewerを待機状態へ固定したうえで
    tabを確認用に残す。monitor obligationだけをretireするため、失敗tabは後続FIFOを止めない。rate-limit再開では
@@ -100,12 +98,13 @@ state dir の `jobs.sqlite3` に、認可済み Slack event を transaction で�
    次回起動や`recover-interrupted`は当該jobを自動failed化せず、監視tab再作成も行わず、
    durable monitor obligationを保持してFIFOを止める。失敗確定後に確認用として残ったtabは閉じてよく、
    次回reconcileが残存stateだけを回収する。Slack deliveryだけはFIFOと独立に再試行する。
-10. runner 停止中のread-only `running` jobは次回起動時に`queued`へ戻してresumeする。write jobは外部副作用が不確実なためfailedにし、状態確認後の手動再送を求める。
+10. 通常stopは実行中jobがあれば拒否する。`zerochan stop --force`では所有processだけを停止し、
+    待機job・同一thread履歴・Codex sessionを保持して、次回start後の再開判断へ渡す。
 
 sessionはSlack thread・repository・write modeが同じ場合に最大20 jobまで再利用し、senderは
 session keyに含めません。利用回数はjob retentionとは独立したappend-only台帳で記録し、古いjobをGCしても
-20件上限を再利用しません。実行中jobへの同thread返信はsenderを問わず会話割り込みとして扱い、active
-turnを安全な境界で一時停止してfresh read-only turnから先に回答します。active jobの固定済み権限で処理するため、active write jobでは同threadのread-only senderにも操作を
+20件上限を再利用しません。実行中jobへの同thread返信はsenderを問わず同じCodex workflowへ渡します。
+active jobの固定済み権限で処理するため、active write jobでは同threadのread-only senderにも操作を
 委任します。別threadは独立FIFOであり、完了後に作る新jobの権限はそのsenderから改めて判定します。
 
 20 jobはCodex側のcontext window／自動compact制限ではなく、Zeroちゃんがnative physical threadを
@@ -118,48 +117,38 @@ snapshot scopeではないため、権限を継承せずに同じ会話だけを
 20 job rotation、protocol変更、job retention GCをまたいでもarchiveは残ります。
 
 公開、継続、中止、branch方向などSlack本文の意味は、このdurable historyとcurrent requestを受け取った
-Codexが判断します。hostは同じ本文を独自regexや別の承認snapshotで再分類せず、Codexの構造化結果を
-対象repository・固定commit SHA・非強制push・idempotent receiptへ機械的に束縛して実行します。
-write許可は利用可能な能力を示すだけで、GitHub公開の要求ではありません。Codexが`no-change`を選んだ
-質問・調査は公開計画0件のdurable checkpointとして完了し、hostはpush／PR処理を起動しません。
-共有checkoutが別セッションで動いても、hostは完了したprepare／reviewを破棄して自動再試行しません。
-後続phaseのCodexがlive Git状態を再確認し、他者変更を保持して継続します。公開時のexact target検証は維持します。
-既存commitだけを公開する場合はCodexがsource branchを明示し、hostは古いorigin追跡refや現在checkoutではなく
-そのlocal branch先端を固定するため、detached／dirtyな共有checkoutを公開判断の失敗条件にしません。
+Codexが判断します。write許可は利用可能な能力を示すだけで、GitHub公開の要求ではありません。質問・調査、
+実装、既存PRのapprove／merge、deploy確認を別のhost phaseへ分けず、同じCodex workflowがlive Git／GitHub
+状態を読みながら依頼どおり進めます。Zeroちゃんはrepository境界とcredential transportを提供しますが、
+Codexの結論を別のreview snapshotやpublication coordinatorで差し戻しません。
 
 永続archive自体をscopeごとの直近64 jobへ圧縮し、省略済みjob数とcutoffだけを別台帳へ残します。
 snapshotも直近64 job block、128 Ki文字／256 KiBを上限とし、UTF-8 block境界で古いものから省略します。
 各archiveはevent数・文字数・byte数も制限します。credential、URL、machine-local path、Slack／内部ID、
 `<zerokun_files>`成果物path、host control風markerは保存前に除去し、履歴本文はhost authority、write許可、
-UI/UX承認、phase、repository、sandboxを変更できません。添付は件数だけ保持し、binaryは保持しません。
+UI/UX承認、repository、sandboxを変更できません。添付は件数だけ保持し、binaryは保持しません。
 upgrade前にすでにretention GCされたjobはbackfillできないため、その範囲だけはSlack本文または再添付から
 改めて確認します。
 
-Claude第五advisorは各roundで`fifth-advisor-<nonce>` workspaceをfresh作成し、そこに一意なClaudeを
-起動します。完全なmarker付き回答、repository/protected snapshot不変、exact workspace消失の3条件が
-揃った場合だけ必須第五枠を採択します。既存workspace/paneは入力・focus・closeしません。Herdrに
-compare-and-sendの原子的APIはないため、送達後の曖昧な結果では同じpromptを再送しません。
-
 並列 worker はありません。別threadのrequestは全て1本のFIFOです。ただし実行中の同じthreadへの
-認可済み返信は、別userからでも現在turnを一時停止し、同じCodex threadのfresh read-only turnで
-先に回答するため、新規jobにしません。単なる質問は元taskをそのまま再開し、更新依頼は回答のSlack
-配送後だけdurable inputへ昇格します。完全一致の`中止`（mention除去・NFKC正規化後）は
+認可済み返信は、別userからでも同じCodex threadへ渡すため、新規会話として扱いません。単なる質問は
+元taskの文脈で回答し、更新依頼は同じworkflowのdurable inputへ昇格します。完全一致の`中止`
+（mention除去・NFKC正規化後）は
 先行する未送信controlをdurableに取り消して
-`turn/interrupt`します。App Serverの最終入力barrierが閉じた後も、round専用advisor cleanupとDB terminal確定が
+`turn/interrupt`します。App Serverの最終入力barrierが閉じた後も、Codex process回収とDB terminal確定が
 終わるまでは同threadの完全一致`中止`だけを元jobへdurableに束縛します。barrier後の通常返信は次の
 FIFO入力として保持し、後から`中止`が届いても元jobに束縛されていない返信を削除しません。後発の別threadは現在taskと
-所有workspaceのcleanupが終わってから開始します。受付返信は enqueue 直後に
+所有processのcleanupが終わってから開始します。受付返信は enqueue 直後に
 返り、terminal通知はjobと同じSQLite transactionへ保存されます。Slack APIの遅延や一時失敗は
 後続jobを止めず、durable notification workerが独立して再試行します。
 
 ## Codex 実行契約
 
-read-only jobは次の1 process、write jobは同じCodex threadを順次resumeするfresh 3 process以上で
-実行します。write jobの基本順序はread-only準備→write実装→read-only reviewです。reviewが必須修正を
-返した場合だけwrite実装→read-only reviewを最大3 review roundまで繰り返します。前processとその全子processの
-回収を確認するまで次processを起動しません。未信頼のSlack本文はprocess argvへ入れず、JSON-RPCの
-`turn/start` inputとして渡します。Grok reviewerへ渡す同じcanonical本文は専用launcherのstdinから
-owner-only一時fileへ固定し、公式`--prompt-file`だけをargvへ載せます。
+read-only／write jobとも、1つのprimary Codex processと1つの`complete` turnで実行します。write jobでは
+`AGENTS.md`を読んだCodexが調査・design・実装・review・test・Git・依頼されたmerge／deploy確認を最後まで
+担当します。Zeroちゃんはprepare／implementation／reviewへprocess分割せず、review markerや外部advisor
+receiptの照合で結果を差し戻しません。未信頼のSlack本文はprocess argvへ入れず、JSON-RPCの
+`turn/start` inputとして渡します。
 
 ```text
 codex <trust-args> -C <repo> \
@@ -172,20 +161,14 @@ codex <trust-args> -C <repo> \
 
 - 新規sessionは`thread/start`、継続sessionは`thread/resume`を使います。session IDをZeroちゃん側で
   推測・採番せず、responseのthread ID、物理cwd、OpenAI provider、model、`approvalPolicy: never`、
-  named permission profile、AGENTS instruction sourceが全て一致した場合だけ保存します。
-- 実行中の同thread返信には`turn/steer`で安全な停止markerだけを送り、返信本文は別のfresh read-only
-  `turn/start`へ渡します。完全一致の`中止`は`turn/interrupt`です。各controlはSQLite receiptを
-  JSON writeより先に固定し、曖昧な送達を自動再送しません。
-- write実装またはread-only review中の更新依頼は、回答のSlack配送を確認した後に入力へ昇格し、
-  現phaseを終了してfresh read-only準備から再開します。新しい内容を編集前のinvestigation/designなしで
-  実装・公開しません。phaseごとの`prepared → dispatching → acknowledged → observed` receiptと最終sealで、
-  process間の入力変更・中止・未処理inboundをfail-closeにします。
-- `turn/completed`までに届いた最後の`agentMessage`だけをbounded projectionへ残し、長いturnの
-  `item/completed`を全件保持しません。terminal本文は公開根拠にせず、完了turnは毎回
-  `thread/items/list`を正本として全page走査します。一度成功したjournalのfinal欠落や後続`-32601`を
-  terminal／snapshotで補完しません。最初のrequestが同一methodの数値`-32601`だったreleaseだけ、
-  full指定の`thread/turns/list`と`thread/read`を両方読み、最大4 snapshot内でselected turnが
-  2回連続完全一致した場合に限って代用します。片endpointの失敗や不一致はfail-closeします。
+  named permission profile、AGENTS instruction sourceが全て一致した場合だけ保存します。通常失敗でも
+  session自体を明示的にretireしていなければ、同じSlack threadの次jobでそのsessionをresumeします。
+- 実行中の同thread返信は`turn/steer`で同じturnへ渡し、Codexが質問と作業更新を現在の文脈で判断します。
+  完全一致の`中止`は`turn/interrupt`です。各controlはSQLite receiptをJSON writeより先に固定し、
+  曖昧な送達を自動再送しません。
+- `turn/completed`の`itemsView:"full"`に最終`agentMessage`があれば、その公式terminal結果を採用します。
+  terminalがsummaryまたは本文欠落の場合だけ、`thread/items/list`等のbounded履歴APIへfallbackします。
+  正常なterminal本文を別endpointとの完全一致不足だけで破棄しません。
 - job本体に終了時間制限はありません。App Serverの`error` notificationはterminalではなく、
   `willRetry: true`ではrate-limitを含む同一turnの内部retryを待ちます。host側で同じpromptを
   再投入しません。`willRetry: false`の構造化rate-limitはSQLiteへ待刻を保存し、read-only jobは
@@ -199,16 +182,12 @@ codex <trust-args> -C <repo> \
   crash recovery時だけbounded KILLへ進み、3回連続で空になるまでv4 cleanup receiptを発行しません。
   relayの明示cancelが必要だった場合も成功へ昇格しません。tag identityはregistrationに
   永続化されるため、runner crash後の起動時recoveryでも同じ検査を行います。
-- 実効config preflight、Grokのcustom reviewer sandbox、native advisor履歴用App Server、brokerから起動する
-  Herdr／fifth-advisor helperも同じjob tagを継承します。brokerとreviewer launcher自身はexact-generation
-  ledgerで追跡し、executor登録より前にcrashしてもtag pair自体をdurable obligationとしてstartup時に
-  全owner processから再発見し、固定点回収が終わるまで次jobをclaimしません。
+- 実効config preflight、localhost browser broker、GitHub credential brokerも同じjob tagを継承します。
+  executor登録より前にcrashしてもtag pairをdurable obligationとしてstartup時に再発見し、固定点回収が
+  終わるまで次jobをclaimしません。
 - resume先がないと公式responseで確定した場合だけsessionを消し、新規`thread/start`へ1回fallbackします。
-- 安全規則は`developerInstructions`、未信頼のSlack本文はCodexのJSON-RPC input、Grok launcherのstdin、
-  またはowner-only Claude prompt fileへ分けます。Slack/Codex本文からshell commandを組み立てず、Claudeへの
-  transportは検証済みhelperの`send --owned`からHerdrのowner-only local socket APIへ直接渡す経路だけに限定します。
-- workspace作成応答前の中断でnonce labelが見つからない場合はabsence guardを削除せず、runner起動時と
-  job claim前に同じlabelが遅れて現れていないことを再検証します。
+- 安全規則は`developerInstructions`、未信頼のSlack本文はCodexのJSON-RPC inputへ分けます。
+  Slack/Codex本文からhost shell commandを組み立てません。
 - `<trust-args>` はread/writeとも `-a never` で、sandbox bypassを使いません。
 - App Serverは`--ignore-user-config`を持たず、subscription認証済みの`CODEX_HOME`とそのuser configを読みます。
   起動直前の`config/read`が返す実際のeffective configをuser/project/managed/MDM込みで照合し、
@@ -218,8 +197,8 @@ codex <trust-args> -C <repo> \
 - `AGENTS.md`の探索は無効化しません。Herdr identityと`project_doc_max_bytes=262144`は
   runtime側の信頼済み設定として毎job固定し、対象repository直下の物理`AGENTS.md`がApp Serverの
   `instructionSources`へ実際に含まれることもhandshakeで検証します。
-- apps・plugins・hookと一般MCPは無効化し、用途固定の開始用
-  `zerokun_advisors/advisor_round`と状態照会用`advisor_round_poll`だけを有効にします。
+- apps・plugins・hookと一般MCPは無効化し、必要なwrite jobで`zerokun_browser`と
+  `zerokun_github`だけを追加します。
   Web検索はwrite許可jobだけに限定し、command networkとSlack関連domainをpermission profileで制限します。
   Slack tokenは子へ渡さず、Slack投稿をdeveloper instructionsでも禁止します。
 
@@ -229,36 +208,10 @@ codex <trust-args> -C <repo> \
 
 - 通常: minimal runtime + repository read + 当該添付read + job outbox/scratch write
 - `writeAllowFrom` の sender: minimal runtime + repository/`.git` write + network + localhost bind
-- 全read job: `investigation-1`、全write job: `design-1`と`review-1`を最低契約とし、native subagentは
-  read-onlyの準備・review processだけで起動します。write implementation processではnative multi-agentと
-  advisor brokerを無効化し、localhost限定browser verifierだけを有効化します。review processでは
-  repositoryをread-onlyのままlocalhost bindと同じverifierを使えます。専用Grok launcherとround専用fresh Claudeの起動・cleanupはhost-side brokerの
-  `advisor_round`（durable開始）と`advisor_round_poll`（短い状態照会）だけがread-onlyで代行。
-  Grok reviewer本体とCodex jobは壁時計上限なしで継続し、pollの回数・合計時間にも上限を設けない。
-  Claude第五advisorのacquisitionはroundごとに最大1時間。terminal結果は
-  1回目のpollでrandom receiptと共に渡し、そのreceiptを次pollで返した時だけ完了journalへ昇格する
-
-macOSではCodexの外側sandbox内からGrokの独立sandboxやHerdrのUnix socketを直接利用できないため、
-それらは用途固定flagと非秘密の一時path、固定repository・固定Herdr identityを持つbrokerへ分離します。
-Slack本文はGrok launcherのstdinから渡し、Claude本文はowner-only prompt fileと検証済み
-`fifth-advisor.py send --owned`からHerdr local socket APIを通してfresh workspaceのexact agentへ1回だけ送ります。送達可能receipt後の
-timeout/stalledは曖昧送達として再送しません。2本のGrok launcherは
-startup lock内でstale回収・run directory作成・owner receiptを一体化し、並行起動や電源断残骸で相互破壊しません。Codex shellへGrok auth、
-Herdr socket、account HOMEは公開せず、read/writeともrepository限定sandboxを維持します。
-Grok/Claudeは各roundで必ず1回ずつ試行します。認証切れ、rate limit、起動不能、回答不成立は
-安全に終了した利用不能結果としてreason digestと共にjournalへ残し、利用可能なadvisor証拠で処理を続けます。
-Zeroちゃん自身はloginやOAuth操作を行いません。Grok processを回収できない、作成済みClaude workspaceの
-exact cleanupが成立しない、repository/inputが変化した場合はterminal結果にせず、Slackへの成功公開を拒否します。
-runnerは各roundのowner-only journalとreceiptを検査し、成功した外部advisorにはPID/response digestまたは
-fresh Claude response/cleanup receiptを、利用不能枠には安全なcontainment evidenceを要求します。
-native Codex 2件はさらに、最初のturn前に親direct-child baselineを固定し、全source kindの`thread/list`と
-公式turn履歴を全page照合します。`thread/items/list`未対応を同一methodの最初の数値`-32601`でだけ判定し、
-その場合はfull指定の`thread/turns/list`と`thread/read`を両方使い、最大4 snapshot内で連続する2回が
-完全一致する固定点として照合します。現在の親turnから直接spawn
-された一意な`solution_analyst`/`risk_reviewer`、baseline以外の余分な子なし、子の単一completed full turn、
-round固有marker、host計算digest、各advisorのlisted childなしがすべて一致した場合だけ採択します。setupは
-公式Codex自身が生成するexperimental protocol型のsource/activity kindをexact検査し、必要な履歴APIが
-変わったreleaseを起動前に拒否します。
+- read senderは1つのread-only Codex workflow、write senderは1つのwrite-authorized Codex workflowを使います。
+  advisor、review、test、Git、deployの進め方はCodexが`AGENTS.md`から決め、Zeroちゃんは別phaseへ分割しません。
+- write jobではlocalhost限定browser verifierとrepository限定GitHub credential brokerを利用できます。
+  brokerはSlack token、GitHub token、operator HOMEをmodelへ公開せず、Codexが選んだ操作だけを実行します。
 
 Zeroちゃん本体のrepositoryはhost runtimeの信頼境界なので、そこへのwrite jobは許可者であっても
 拒否します。bootstrapは本体と別の`zerokun-workspace`を、最小安全指示の`AGENTS.md`初期commit付き
@@ -269,10 +222,9 @@ global `AGENTS.md`の後に読み込みとinstruction sourceを検証します�
 再許可します。Codex CLI 0.149.0以上を必須とし、古いCLIはjob受付前に拒否します。
 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
 linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。またHOMEのglobal
-Git/GitHub credentialはmodelへ公開しません。review済みcommitの公開だけはhost runtimeがlogin済み`gh`を
-使い、canonical `github.com`、単一branch、非強制、tag・submoduleなしのpushとPR作成に限定します。
-Codex shell HOMEはread/writeともjob scratchへ分離します。専用Grok launcherが必要とするaccount HOMEは
-brokerの固定子processだけが使い、model shellへは渡しません。commit identityはZeroちゃんが中立の固定値を
+Git/GitHub credentialはmodelへ公開しません。認証済み操作はhost runtimeがlogin済み`gh`を使う
+repository限定brokerへ委譲します。Codexはそのtoolでbranch publish、PR作成・承認・merge、GitHub
+checks確認を行えます。Codex shell HOMEはread/writeともjob scratchへ分離します。commit identityはZeroちゃんが中立の固定値を
 子processへ設定するため、repository localの`user.name`/`user.email`は必須ではありません。
 
 Codex から Slack tool/API を呼ばせません。最終文は runner が bot token で投稿します。成果物を
@@ -377,8 +329,8 @@ zerochan update
 既存threadは最初のprojectへ固定されたままです。DMは共有gatewayを起動したprojectを使います。
 multi-repository workspaceのmemberは初回設定時に`.zerochan/workspace.json`へ固定されます。
 隠しfolder、symlink、Gitではない直下項目は作業対象外で、変更した各memberは個別に
-test・commitされ、最終review後にhostが個別にpush・PR作成します。read-only準備で選ばれた最小の
-repository scopeだけがwrite permissionとpublication対象になります。直下repositoryの追加・削除時は、意図しない対象拡大を防ぐため
+test・commitされます。必要なpush・PR・merge・deploy確認も同じCodex workflowが担当します。
+workspace memberだけがwrite permissionとGitHub brokerの対象になります。直下repositoryの追加・削除時は、意図しない対象拡大を防ぐため
 設定を自動更新せず起動を停止します。
 
 log:
@@ -392,16 +344,9 @@ in-place cutoverでは`ZEROKUN_LEGACY_CUTOVER=1`も併せて指定してくだ�
 
 完了jobはterminal通知と全成果物の配送checkpointが確定してから既定30日で削除します。
 Slack eventのidempotency tombstoneは既定10年保持し、runtime logは20MBで上限化します。
-即時maintenanceは`zerokun-jobs gc`で実行できます。ただしcanonical Slack本文はCodex、2つのGrok reviewer、
-round専用Claude第五advisorへ送られ、`thread/start`は`ephemeral:false`です。local GCや一時workspaceのcloseは
-各provider側の履歴削除を保証しないため、秘密・credential・個人情報を依頼へ貼り付けないでください。
-
-Claude promptの送達境界後にcrashした場合、同じpromptは再送しません。次回起動または
-`zerokun-jobs recover-interrupted`がowner-only intent/workspace/closed receiptを検証し、作成済みのexact
-workspaceだけをcloseします。すでにverified close receiptまで永続化されていれば再closeせず消失確認として
-採用します。所有identityやprotected metadataを証明できない場合は他workspaceを推測して操作せず、
-cleanup pendingとしてFIFOを停止します。各lifecycle receiptはowner-only staging fileを完全write・fsync後に
-macOSのno-replace renameで公開し、公開前crashで残った固定staging fileだけをidentity検証後に破棄します。
+即時maintenanceは`zerokun-jobs gc`で実行できます。canonical Slack本文はCodexと、必要に応じて
+Codexが起動したadvisorへ送られ、`thread/start`は`ephemeral:false`です。local GCは各provider側の
+履歴削除を保証しないため、秘密・credential・個人情報を依頼へ貼り付けないでください。
 
 watchdog は停止を2回連続検出した時だけ通知し、復旧も通知します。自動 restart はしません。
 
