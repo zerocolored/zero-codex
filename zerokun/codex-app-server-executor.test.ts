@@ -23,8 +23,13 @@ import {
   captureGitHubPublicationBaselineForLocalBranches,
   publishGitHubPlan,
   type GitHubPublicationCommands,
+  type GitHubPublicationPlan,
   type PublicationCommandResult,
 } from './github-publication.ts'
+import {
+  publicationContinuationDigest,
+  type GitHubPublicationContinuationBundle,
+} from './publication-continuation.ts'
 import {
   CodexCleanupPendingError,
   CodexPublicationPreflightRetryError,
@@ -81,6 +86,101 @@ function publicationCommandResult(
   stderr = '',
 ): PublicationCommandResult {
   return { exitCode, stdout, stderr }
+}
+
+function continuationPullRequest(
+  plan: GitHubPublicationPlan,
+  number: number,
+  body: string | null,
+  mergedAt: string | null = null,
+  mergeCommitSha: string | null = null,
+): Record<string, unknown> {
+  return {
+    number,
+    html_url: `https://github.com/${plan.repositorySlug}/pull/${number}`,
+    state: mergedAt ? 'closed' : 'open',
+    merged_at: mergedAt,
+    merge_commit_sha: mergeCommitSha,
+    body,
+    head: {
+      ref: plan.headBranch,
+      sha: plan.commitSha,
+      repo: { full_name: plan.repositorySlug },
+    },
+    base: { ref: plan.baseBranch, repo: { full_name: plan.repositorySlug } },
+  }
+}
+
+function publicationContinuationFixture(
+  job: JobRecord,
+  commitSha: string,
+  options: {
+    baseBranch?: string
+    headBranch?: string
+    initialHead?: string
+    pullRequestNumber?: number
+  } = {},
+): GitHubPublicationContinuationBundle {
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex')
+  const baseBranch = options.baseBranch ?? 'develop'
+  const headBranch = options.headBranch ?? 'zerochan/reviewed-continuation'
+  const pullRequestNumber = options.pullRequestNumber ?? 861
+  const plan: GitHubPublicationPlan = {
+    version: 1,
+    // Deliberately unavailable: continuation must rebind by GitHub repository
+    // identity and must not depend on an old task checkout surviving.
+    gitRoot: '/private/tmp/retired-zero-worktree',
+    repositorySlug: 'example/app-server-continuation',
+    canonicalUrl: 'https://github.com/example/app-server-continuation.git',
+    baseBranch,
+    headBranch,
+    commitSha,
+    initialHead: options.initialHead ?? commitSha,
+    statusDigest: digest('archived-status'),
+    localConfigDigest: digest('archived-config'),
+    originUrlDigest: digest('archived-origin'),
+    title: 'feat: reviewed continuation fixture',
+  }
+  const archive = {
+    version: 1 as const,
+    sourceJobId: 'completed-source-job',
+    sourceJobSeq: job.seq - 1,
+    chatId: job.chatId,
+    threadTs: job.threadTs,
+    repoPath: job.repoPath,
+    publicationCompletedAt: Date.now() - 1,
+    inputDigest: digest('archived-input'),
+    reviewRound: 1 as const,
+    reviewedRepositoryDigest: digest('archived-review'),
+    baselineDigest: digest('archived-baseline'),
+    entries: [{
+      plan,
+      receipt: {
+        repositorySlug: plan.repositorySlug,
+        baseBranch: plan.baseBranch,
+        headBranch: plan.headBranch,
+        commitSha: plan.commitSha,
+        pullRequestNumber,
+        pullRequestUrl:
+          `https://github.com/example/app-server-continuation/pull/${pullRequestNumber}`,
+      },
+    }],
+  }
+  const candidate = {
+    archiveDigest: publicationContinuationDigest(JSON.stringify(archive)),
+    archive,
+  }
+  return {
+    version: 1,
+    targetJobId: job.id,
+    targetJobSeq: job.seq,
+    chatId: job.chatId,
+    threadTs: job.threadTs,
+    repoPath: job.repoPath,
+    boundAt: Date.now(),
+    omittedCandidateCount: 0,
+    candidates: [candidate],
+  }
 }
 
 function completeFixtureJob(
@@ -289,6 +389,8 @@ for line in sys.stdin:
         )
         if "Zero host interjection response control" in phase_prompt:
             stage = "interjection"
+        elif "Host phase: read-only continuation decision." in phase_prompt:
+            stage = "continuation"
         elif "Host phase: read-only preparation." in phase_prompt:
             stage = "prepare"
         elif "Host phase: write implementation." in phase_prompt:
@@ -307,7 +409,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-continuation", "phased-continuation-release", "phased-continuation-answer", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -348,7 +450,58 @@ for line in sys.stdin:
             if fixture_state and os.path.exists(fixture_state):
                 final = "追加条件を反映して完了しました" if mode == "interjection-update" else "元の作業を完了しました"
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "resumed-final", "text": final}], "error": None}}})
-        elif mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased-continuation", "phased-continuation-release", "phased-continuation-answer", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale", "phased-no-change-empty-scope") and stage == "continuation":
+            if mode == "phased-continuation-malformed":
+                message = "継続判定の形式を壊したfixtureです"
+            else:
+                nonce_match = re.search(r"Logical attempt nonce: ([0-9a-f]{32})", phase_prompt)
+                revision_match = re.search(r"Durable input revision: ([0-9]+)", phase_prompt)
+                input_match = re.search(r"Durable input digest: ([0-9a-f]{64})", phase_prompt)
+                bundle_match = re.search(r"Publication checkpoint bundle digest: ([0-9a-f]{64})", phase_prompt)
+                if not nonce_match or not revision_match or not input_match or not bundle_match:
+                    raise RuntimeError("continuation binding missing")
+                if mode == "phased-continuation-answer":
+                    action = "answer-only"
+                    candidate_digest = None
+                    targets = []
+                    answer = "前回の公開状況を引き継いで回答しました。"
+                elif mode == "phased-continuation-new-work":
+                    action = "new-work"
+                    candidate_digest = None
+                    targets = []
+                    answer = "製品変更が必要なので通常工程へ進みます。"
+                else:
+                    candidate_match = re.search(r'"candidateDigest":"([0-9a-f]{64})"', phase_prompt)
+                    repository_match = re.search(r'"repositorySlug":"([^"]+)"', phase_prompt)
+                    if not candidate_match or not repository_match:
+                        raise RuntimeError("continuation candidate missing")
+                    action = "continue-publication"
+                    candidate_digest = candidate_match.group(1)
+                    terminal_release = mode == "phased-continuation-release"
+                    targets = [{
+                        "repositorySlug": repository_match.group(1),
+                        "followupBaseBranch": None if terminal_release else "main",
+                        "waitForChecks": False,
+                        "integrationPullRequestBody": "## Summary\\nReviewed continuation {{COMMIT_SHA}}",
+                        "followupPullRequestBody": "## Release\\nPromote develop to main",
+                        "closePullRequestNumbers": [],
+                    }]
+                    answer = "既存のrelease PRをmainへ統合しました。" if terminal_release else "既存のレビュー済みPRをdevelopへ統合し、main向けPRを用意しました。"
+                envelope = {
+                    "version": 1,
+                    "logicalNonce": nonce_match.group(1),
+                    "inputRevision": int(revision_match.group(1)),
+                    "inputDigest": input_match.group(1),
+                    "bundleDigest": bundle_match.group(1),
+                    "action": action,
+                    "candidateDigest": candidate_digest,
+                    "targets": targets,
+                }
+                message = "<zerokun_thread_continuation>" + json.dumps(envelope, ensure_ascii=False, separators=(",", ":")) + "</zerokun_thread_continuation>\\n" + answer
+            hold_for_continuation_steer = os.environ.get("ZERO_CONTINUATION_STEER") == "1" and os.environ.get("ZERO_CONTROL_LOG") and not os.path.exists(os.environ["ZERO_CONTROL_LOG"])
+            if not hold_for_continuation_steer:
+                emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "continuation-final", "text": message}], "error": None}}})
+        elif mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"main","mergePullRequest":false,"followupBaseBranch":null}]}</zerokun_work_action>'
@@ -384,7 +537,7 @@ for line in sys.stdin:
                         semantic = envelope.group(0).replace("<approve|revise|question|reject>", "approve").replace("<unchanged|compatible|conflict>", "unchanged")
                         message = semantic + "\\n" + message
             elif stage == "implementation":
-                if mode == "phased-publication":
+                if mode in ("phased-publication", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale"):
                     branch_match = re.search(r"Host-assigned feature branch: (zerochan/[0-9a-f]{20})", phase_prompt)
                     if not branch_match:
                         raise RuntimeError("publication branch missing from implementation prompt")
@@ -594,7 +747,32 @@ for line in sys.stdin:
         }] if mode == "phased-native-history-resume" else []
         emit({"id": request_id, "result": {"data": children, "nextCursor": None}})
     elif method == "turn/steer":
-        if mode in ("interjection-answer", "interjection-update", "interjection-late-answer", "phased-interjection-update"):
+        if os.environ.get("ZERO_CONTINUATION_STEER") == "1":
+            steer_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
+            control_log = os.environ.get("ZERO_CONTROL_LOG")
+            if control_log:
+                with open(control_log, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"text": steer_text}, ensure_ascii=False) + "\\n")
+            nonce_match = re.search(r"Logical attempt nonce: ([0-9a-f]{32})", steer_text)
+            revision_match = re.search(r"Durable input revision: ([0-9]+)", steer_text)
+            input_match = re.search(r"Durable input digest: ([0-9a-f]{64})", steer_text)
+            bundle_match = re.search(r"Publication checkpoint bundle digest: ([0-9a-f]{64})", steer_text)
+            if not nonce_match or not revision_match or not input_match or not bundle_match:
+                raise RuntimeError("steered continuation binding missing")
+            envelope = {
+                "version": 1,
+                "logicalNonce": nonce_match.group(1),
+                "inputRevision": int(revision_match.group(1)),
+                "inputDigest": input_match.group(1),
+                "bundleDigest": bundle_match.group(1),
+                "action": "answer-only",
+                "candidateDigest": None,
+                "targets": [],
+            }
+            message = "<zerokun_thread_continuation>" + json.dumps(envelope, ensure_ascii=False, separators=(",", ":")) + "</zerokun_thread_continuation>\\n追加入力を含む最新状態で回答しました。"
+            emit({"id": request_id, "result": {"turnId": value["params"]["expectedTurnId"]}})
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "continuation-steered-final", "text": message}], "error": None}}})
+        elif mode in ("interjection-answer", "interjection-update", "interjection-late-answer", "phased-interjection-update"):
             pause_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
             marker = re.search(r"\\[ZERO_INTERJECTION_PAUSED:[^\\]]+\\]", pause_text)
             emit({"id": request_id, "result": {"turnId": value["params"]["expectedTurnId"]}})
@@ -733,6 +911,9 @@ function fixture(
     | 'phased-ui-approved'
     | 'phased-capacity-review-once'
     | 'phased-capacity-implementation-once'
+    | 'phased-continuation' | 'phased-continuation-release' | 'phased-continuation-answer'
+    | 'phased-continuation-new-work' | 'phased-continuation-malformed'
+    | 'phased-continuation-stale'
     | 'phased-review-fix-three-times'
     | 'phased-reprepare-after-review-fix'
     | 'phased-native-history-fresh' | 'phased-native-history-resume'
@@ -1085,6 +1266,674 @@ function fixture(
 }
 
 describe('production App Server executor', () => {
+  test('完了済みPRの同thread公開依頼は調査・設計を再実行せず直接promotionへ進む', async () => {
+    const value = fixture(
+      'phased-continuation',
+      true,
+      '前回完成したPRをdevelopへマージし、main向けPRを作ってください',
+    )
+    git(value.repo, ['init', '--initial-branch=main'])
+    git(value.repo, ['config', 'user.email', 'zero@example.invalid'])
+    git(value.repo, ['config', 'user.name', 'Zero Test'])
+    git(value.repo, ['add', 'AGENTS.md'])
+    git(value.repo, ['commit', '-m', 'chore: initial'])
+    git(value.repo, [
+      'remote', 'add', 'origin',
+      'https://github.com/example/app-server-continuation.git',
+    ])
+    const commitSha = git(value.repo, ['rev-parse', 'HEAD'])
+    const job = { ...value.job, seq: 2 }
+    const continuation = publicationContinuationFixture(job, commitSha)
+    const phaseLog = join(value.root, 'continuation-phases.log')
+    let preparationGates = 0
+    let reviewGates = 0
+    let stagedPlan: GitHubPublicationPlan | undefined
+    const integrationMergeHead = 'd'.repeat(40)
+    let integrationMerged = false
+    let releaseExists = false
+    let releaseBody: string | null = null
+    let integrationMerges = 0
+    let integrationCreates = 0
+    let releaseCreates = 0
+    let pushes = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repo, args) {
+        if (args[0] === 'ls-remote') {
+          const ref = String(args.at(-1))
+          const branch = ref.replace(/^refs\/heads\//, '')
+          const head = branch === 'main'
+            ? commitSha
+            : branch === 'develop'
+              ? integrationMerged ? integrationMergeHead : commitSha
+              : branch === 'zerochan/reviewed-continuation'
+                ? commitSha
+                : null
+          return publicationCommandResult(0, head ? `${head}\t${ref}\n` : '')
+        }
+        if (args[0] === 'push') {
+          pushes += 1
+          return publicationCommandResult(0)
+        }
+        throw new Error(`unexpected continuation Git command: ${args.join(' ')}`)
+      },
+      async runGh(args, stdin) {
+        if (!stagedPlan) {
+          throw new Error('continuation decision must not call GitHub before durable staging')
+        }
+        const command = args.join(' ')
+        if (args.includes('GET') && command.endsWith('/pulls/861')) {
+          return publicationCommandResult(0, JSON.stringify({
+            ...continuationPullRequest(
+              stagedPlan,
+              861,
+              'existing reviewed PR body',
+              integrationMerged ? '2026-09-03T00:00:00Z' : null,
+              integrationMerged ? integrationMergeHead : null,
+            ),
+            draft: false,
+            mergeable: true,
+            mergeable_state: 'clean',
+          }))
+        }
+        if (args.includes('GET')
+          && command.endsWith('repos/example/app-server-continuation')) {
+          return publicationCommandResult(0, JSON.stringify({ allow_merge_commit: true }))
+        }
+        if (command.includes('/compare/')) {
+          const preparedHead = /\/compare\/([0-9a-f]+)\.\.\./.exec(command)?.[1]
+          if (!preparedHead) throw new Error(`invalid continuation comparison: ${command}`)
+          return publicationCommandResult(0, JSON.stringify({
+            status: 'ahead', ahead_by: 1, behind_by: 0,
+            base_commit: { sha: preparedHead }, merge_base_commit: { sha: preparedHead },
+          }))
+        }
+        if (args.includes('PUT') && command.includes('/pulls/861/merge')) {
+          integrationMerges += 1
+          integrationMerged = true
+          return publicationCommandResult(0, '{}')
+        }
+        if (args.includes('GET') && command.includes('/pulls?')) {
+          if (command.includes('base=develop')) {
+            throw new Error('exact continuation PR must not use branch-list lookup')
+          }
+          if (command.includes('base=main')) {
+            const releasePlan: GitHubPublicationPlan = {
+              ...stagedPlan,
+              baseBranch: 'main',
+              headBranch: 'develop',
+              commitSha: integrationMergeHead,
+              initialHead: commitSha,
+              promotion: undefined,
+            }
+            return publicationCommandResult(0, releaseExists
+              ? JSON.stringify([continuationPullRequest(releasePlan, 862, releaseBody)])
+              : '[]')
+          }
+        }
+        if (args.includes('POST') && command.includes('/pulls')) {
+          const request = JSON.parse(stdin ?? '{}') as Record<string, string>
+          if (request.base === 'develop') integrationCreates += 1
+          if (request.base === 'main') {
+            releaseCreates += 1
+            releaseExists = true
+            releaseBody = request.body
+          }
+          return publicationCommandResult(0, '{}')
+        }
+        throw new Error(`unexpected continuation gh command: ${command}`)
+      },
+    }
+    const result = await executeCodexJob(job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-continuation',
+        ZERO_PHASE_LOG: phaseLog,
+      },
+      phaseGateForTesting: {
+        validatePreparation: () => { preparationGates += 1 },
+        validateReview: () => { reviewGates += 1 },
+      },
+      liveControls: value.hooks,
+      publicationContinuation: continuation,
+      publicationCommandsForTesting: commands,
+    })
+    expect(result.result).toContain('既存のレビュー済みPR')
+    expect(result.publication?.plans).toHaveLength(1)
+    expect(result.publication?.plans[0]).toMatchObject({
+      gitRoot: value.repo,
+      repositorySlug: 'example/app-server-continuation',
+      baseBranch: 'develop',
+      headBranch: 'zerochan/reviewed-continuation',
+      commitSha,
+      promotion: {
+        sourceBranch: 'zerochan/reviewed-continuation',
+        sourceHead: commitSha,
+        followupBaseBranch: 'main',
+        followupInitialHead: commitSha,
+        expectedIntegrationPullRequestNumber: 861,
+      },
+    })
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual(['continuation'])
+    expect(phases.map(row => row[4])).toEqual(['read'])
+    expect({ preparationGates, reviewGates }).toEqual({
+      preparationGates: 0,
+      reviewGates: 0,
+    })
+    stagedPlan = result.publication!.plans[0]!
+    value.store.ensureExecutionResultStaged(
+      value.job.id,
+      result.sessionId,
+      result.result,
+      result.publication!,
+    )
+    await publishStagedGitHubPublication(value.store, value.job.id, {
+      commands,
+      retryMsForTesting: 1,
+    })
+    value.store.completeStagedExecution(value.job.id)
+    expect(value.store.get(value.job.id)).toMatchObject({ status: 'completed' })
+    expect(value.store.get(value.job.id)?.result).toContain(
+      'https://github.com/example/app-server-continuation/pull/862',
+    )
+    expect({ integrationMerges, integrationCreates, releaseCreates, pushes }).toEqual({
+      integrationMerges: 1,
+      integrationCreates: 0,
+      releaseCreates: 1,
+      pushes: 0,
+    })
+    value.store.close()
+  }, 30_000)
+
+  test('archive済みrelease PRは同threadで新規工程なしにexact番号をmergeして終了する', async () => {
+    const value = fixture(
+      'phased-continuation-release',
+      true,
+      '前回作成したdevelopからmainへのrelease PRをマージしてデプロイしてください',
+    )
+    git(value.repo, ['init', '--initial-branch=main'])
+    git(value.repo, ['config', 'user.email', 'zero@example.invalid'])
+    git(value.repo, ['config', 'user.name', 'Zero Test'])
+    git(value.repo, ['add', 'AGENTS.md'])
+    git(value.repo, ['commit', '-m', 'chore: initial'])
+    const mainInitial = git(value.repo, ['rev-parse', 'HEAD'])
+    git(value.repo, ['switch', '-c', 'develop'])
+    writeFileSync(join(value.repo, 'release.txt'), 'reviewed release\n')
+    git(value.repo, ['add', 'release.txt'])
+    git(value.repo, ['commit', '-m', 'feat: reviewed release'])
+    const releaseHead = git(value.repo, ['rev-parse', 'HEAD'])
+    git(value.repo, ['switch', 'main'])
+    git(value.repo, [
+      'remote', 'add', 'origin',
+      'https://github.com/example/app-server-continuation.git',
+    ])
+    const job = { ...value.job, seq: 2 }
+    const continuation = publicationContinuationFixture(job, releaseHead, {
+      baseBranch: 'main',
+      headBranch: 'develop',
+      initialHead: mainInitial,
+      pullRequestNumber: 862,
+    })
+    const phaseLog = join(value.root, 'continuation-release-phases.log')
+    let preparationGates = 0
+    let reviewGates = 0
+    let stagedPlan: GitHubPublicationPlan | undefined
+    const finalMergeHead = 'f'.repeat(40)
+    let merged = false
+    let mergeCalls = 0
+    let pushCalls = 0
+    let listLookups = 0
+    let createCalls = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repo, args) {
+        if (args[0] === 'ls-remote') {
+          const ref = String(args.at(-1))
+          const branch = ref.replace(/^refs\/heads\//, '')
+          const head = branch === 'develop'
+            ? releaseHead
+            : branch === 'main'
+              ? merged ? finalMergeHead : mainInitial
+              : null
+          return publicationCommandResult(0, head ? `${head}\t${ref}\n` : '')
+        }
+        if (args[0] === 'push') {
+          pushCalls += 1
+          return publicationCommandResult(0)
+        }
+        throw new Error(`unexpected terminal continuation Git command: ${args.join(' ')}`)
+      },
+      async runGh(args, stdin) {
+        if (!stagedPlan) {
+          throw new Error('terminal continuation must not call GitHub before durable staging')
+        }
+        const command = args.join(' ')
+        if (args.includes('GET') && command.endsWith('/pulls/862')) {
+          return publicationCommandResult(0, JSON.stringify({
+            ...continuationPullRequest(
+              stagedPlan,
+              862,
+              'human-edited release body',
+              merged ? '2026-09-03T00:00:00Z' : null,
+              merged ? finalMergeHead : null,
+            ),
+            draft: false,
+            mergeable: true,
+            mergeable_state: 'clean',
+          }))
+        }
+        if (args.includes('GET')
+          && command.endsWith('repos/example/app-server-continuation')) {
+          return publicationCommandResult(0, JSON.stringify({ allow_merge_commit: true }))
+        }
+        if (command.includes('/compare/')) {
+          const preparedHead = /\/compare\/([0-9a-f]+)\.\.\./.exec(command)?.[1]
+          if (!preparedHead) throw new Error(`invalid terminal comparison: ${command}`)
+          return publicationCommandResult(0, JSON.stringify({
+            status: 'ahead', ahead_by: 1, behind_by: 0,
+            base_commit: { sha: preparedHead }, merge_base_commit: { sha: preparedHead },
+          }))
+        }
+        if (args.includes('PUT') && command.includes('/pulls/862/merge')) {
+          expect(JSON.parse(stdin ?? '{}')).toMatchObject({
+            sha: releaseHead,
+            merge_method: 'merge',
+          })
+          mergeCalls += 1
+          merged = true
+          return publicationCommandResult(0, '{}')
+        }
+        if (args.includes('GET') && command.includes('/pulls?')) {
+          listLookups += 1
+          return publicationCommandResult(0, '[]')
+        }
+        if (args.includes('POST') && command.includes('/pulls')) {
+          createCalls += 1
+          return publicationCommandResult(0, '{}')
+        }
+        throw new Error(`unexpected terminal continuation gh command: ${command}`)
+      },
+    }
+    const result = await executeCodexJob(job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-continuation-release',
+        ZERO_PHASE_LOG: phaseLog,
+      },
+      phaseGateForTesting: {
+        validatePreparation: () => { preparationGates += 1 },
+        validateReview: () => { reviewGates += 1 },
+      },
+      liveControls: value.hooks,
+      publicationContinuation: continuation,
+      publicationCommandsForTesting: commands,
+    })
+    expect(result.result).toContain('release PRをmainへ統合')
+    expect(result.publication?.plans).toHaveLength(1)
+    expect(result.publication?.plans[0]).toMatchObject({
+      gitRoot: value.repo,
+      repositorySlug: 'example/app-server-continuation',
+      baseBranch: 'main',
+      headBranch: 'develop',
+      commitSha: releaseHead,
+      promotion: {
+        sourceBranch: 'develop',
+        sourceHead: releaseHead,
+        followupBaseBranch: null,
+        followupInitialHead: null,
+        expectedIntegrationPullRequestNumber: 862,
+      },
+    })
+    expect(readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])).toEqual(['continuation'])
+    expect({ preparationGates, reviewGates }).toEqual({
+      preparationGates: 0,
+      reviewGates: 0,
+    })
+    stagedPlan = result.publication!.plans[0]!
+    value.store.ensureExecutionResultStaged(
+      value.job.id,
+      result.sessionId,
+      result.result,
+      result.publication!,
+    )
+    await publishStagedGitHubPublication(value.store, value.job.id, {
+      commands,
+      retryMsForTesting: 1,
+    })
+    value.store.completeStagedExecution(value.job.id)
+    expect(value.store.get(value.job.id)).toMatchObject({ status: 'completed' })
+    expect(value.store.get(value.job.id)?.result)
+      .toContain('https://github.com/example/app-server-continuation/pull/862')
+    expect({ mergeCalls, pushCalls, listLookups, createCalls }).toEqual({
+      mergeCalls: 1,
+      pushCalls: 0,
+      listLookups: 0,
+      createCalls: 0,
+    })
+    value.store.close()
+  }, 30_000)
+
+  test('同threadの回答だけなら継続判定1回でzero-plan完了する', async () => {
+    const value = fixture('phased-continuation-answer', true, '前回のPRは何番ですか？')
+    const job = { ...value.job, seq: 2 }
+    const continuation = publicationContinuationFixture(job, 'a'.repeat(40))
+    const phaseLog = join(value.root, 'continuation-answer-phases.log')
+    let preparationGates = 0
+    let reviewGates = 0
+    let githubCalls = 0
+    const result = await executeCodexJob(job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-continuation-answer',
+        ZERO_PHASE_LOG: phaseLog,
+      },
+      phaseGateForTesting: {
+        validatePreparation: () => { preparationGates += 1 },
+        validateReview: () => { reviewGates += 1 },
+      },
+      liveControls: value.hooks,
+      publicationContinuation: continuation,
+      publicationCommandsForTesting: {
+        async runGit() { githubCalls += 1; throw new Error('answer-only touched Git') },
+        async runGh() { githubCalls += 1; throw new Error('answer-only touched GitHub') },
+      },
+    })
+    expect(result.result).toBe('前回の公開状況を引き継いで回答しました。')
+    expect(result.publication?.plans).toEqual([])
+    expect(readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])).toEqual(['continuation'])
+    expect({ preparationGates, reviewGates, githubCalls }).toEqual({
+      preparationGates: 0,
+      reviewGates: 0,
+      githubCalls: 0,
+    })
+    value.store.close()
+  }, 30_000)
+
+  test('継続判定中の追加指示は最新revisionの継続envelopeへsteerする', async () => {
+    const value = fixture('phased-continuation-answer', true, '前回のPRは何番ですか？')
+    const job = { ...value.job, seq: 2 }
+    const continuation = publicationContinuationFixture(job, 'a'.repeat(40))
+    const phaseLog = join(value.root, 'continuation-steer-phases.log')
+    const controlLog = join(value.root, 'continuation-steer-controls.log')
+    let staged = false
+    let preparationGates = 0
+    let reviewGates = 0
+    const acknowledgeInitial = value.hooks.acknowledgeInitialDispatch
+    value.hooks.acknowledgeInitialDispatch = options => {
+      acknowledgeInitial(options)
+      if (!staged) {
+        staged = true
+        const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
+        if (!target) throw new Error('continuation live control target disappeared')
+        expect(value.store.stageLiveControl(target, {
+          chatId: value.job.chatId,
+          threadTs: value.job.threadTs,
+          messageId: '1800000000.000-continuation-steer',
+          userId: 'UOTHER',
+          writeEnabled: false,
+          task: 'そのPRの状態も含めて教えて',
+          kind: 'steer',
+        })).toBe('staged')
+      }
+    }
+    const result = await executeCodexJob(job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-continuation-answer',
+        ZERO_CONTINUATION_STEER: '1',
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_CONTROL_LOG: controlLog,
+      },
+      phaseGateForTesting: {
+        validatePreparation: () => { preparationGates += 1 },
+        validateReview: () => { reviewGates += 1 },
+      },
+      liveControls: value.hooks,
+      publicationContinuation: continuation,
+      publicationCommandsForTesting: {
+        async runGit() { throw new Error('answer-only steer touched Git') },
+        async runGh() { throw new Error('answer-only steer touched GitHub') },
+      },
+    })
+    expect(result).toMatchObject({
+      result: '追加入力を含む最新状態で回答しました。',
+      publication: { plans: [] },
+    })
+    expect(readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t')[0])).toEqual(['continuation'])
+    const controls = readFileSync(controlLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { text: string })
+    expect(controls).toHaveLength(1)
+    expect(controls[0]!.text).toContain('そのPRの状態も含めて教えて')
+    expect(controls[0]!.text).toContain('Host phase: read-only continuation decision.')
+    expect(controls[0]!.text).toContain('Durable input revision: 2')
+    expect(controls[0]!.text).toContain('Publication checkpoint bundle digest:')
+    expect(controls[0]!.text).not.toContain('ZERO_PRE_EDIT_READY')
+    expect({ staged, preparationGates, reviewGates }).toEqual({
+      staged: true,
+      preparationGates: 0,
+      reviewGates: 0,
+    })
+    value.store.close()
+  }, 30_000)
+
+  test('同一GitHub identityの子repoが複数でも継続判定は失敗せず通常工程へ一度だけ戻る', async () => {
+    const value = fixture(
+      'phased-no-change-empty-scope',
+      true,
+      '前回完成したPRをdevelopへマージしてください',
+    )
+    const repositories = ['frontend-a', 'frontend-b'].map((name, index) => {
+      const repository = join(value.repo, name)
+      mkdirSync(repository, { mode: 0o700 })
+      writeFileSync(join(repository, 'README.md'), `# duplicate fixture ${index}\n`, {
+        mode: 0o600,
+      })
+      git(repository, ['init', '--initial-branch=main'])
+      git(repository, ['config', 'user.email', 'zero@example.invalid'])
+      git(repository, ['config', 'user.name', 'Zero Test'])
+      git(repository, [
+        'remote', 'add', 'origin',
+        'https://github.com/example/app-server-continuation.git',
+      ])
+      git(repository, ['add', 'README.md'])
+      git(repository, ['commit', '-m', 'chore: initial'])
+      return repository
+    })
+    const job = { ...value.job, seq: 2 }
+    const continuation = publicationContinuationFixture(
+      job,
+      git(repositories[0]!, ['rev-parse', 'HEAD']),
+    )
+    const before = repositories.map(repository => ({
+      head: git(repository, ['rev-parse', 'HEAD']),
+      status: git(repository, ['status', '--short']),
+    }))
+    const phaseLog = join(value.root, 'continuation-duplicate-repo-phases.log')
+    let preparationGates = 0
+    let reviewGates = 0
+    let transportCalls = 0
+    const result = await executeCodexJob(job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-no-change-empty-scope',
+        ZERO_PHASE_LOG: phaseLog,
+      },
+      phaseGateForTesting: {
+        validatePreparation: () => { preparationGates += 1 },
+        validateReview: () => { reviewGates += 1 },
+      },
+      liveControls: value.hooks,
+      publicationContinuation: continuation,
+      publicationCommandsForTesting: {
+        async runGit() {
+          transportCalls += 1
+          throw new Error('duplicate identity fallback touched Git')
+        },
+        async runGh() {
+          transportCalls += 1
+          throw new Error('duplicate identity fallback touched GitHub')
+        },
+      },
+    })
+
+    expect(result).toMatchObject({
+      result: '公開できます',
+      publication: { plans: [] },
+    })
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual(['continuation', 'prepare', 'review'])
+    expect(phases.map(row => row[4])).toEqual(['read', 'read', 'read'])
+    expect(new Set(phases.map(row => row[6])).size).toBe(1)
+    expect({ preparationGates, reviewGates, transportCalls }).toEqual({
+      preparationGates: 1,
+      reviewGates: 1,
+      transportCalls: 0,
+    })
+    expect(repositories.map(repository => ({
+      head: git(repository, ['rev-parse', 'HEAD']),
+      status: git(repository, ['status', '--short']),
+    }))).toEqual(before)
+    value.store.close()
+  }, 30_000)
+
+  for (const mode of [
+    'phased-continuation-new-work',
+    'phased-continuation-malformed',
+  ] as const) {
+    test(`${mode === 'phased-continuation-new-work' ? '新しい製品変更' : '壊れた継続判定'}は一度だけ通常工程へfallbackする`, async () => {
+      const value = fixture(mode, true, '新しい製品変更を行ってください')
+      git(value.repo, ['init', '--initial-branch=main'])
+      git(value.repo, ['config', 'user.email', 'zero@example.invalid'])
+      git(value.repo, ['config', 'user.name', 'Zero Test'])
+      git(value.repo, ['config', 'remote.origin.url',
+        'https://github.com/example/app-server-continuation.git'])
+      git(value.repo, ['add', 'AGENTS.md'])
+      git(value.repo, ['commit', '-m', 'chore: initial'])
+      const archivedCommit = git(value.repo, ['rev-parse', 'HEAD'])
+      const baseline = captureGitHubPublicationBaseline(value.repo, [value.repo])
+      const job = { ...value.job, seq: 2 }
+      const continuation = publicationContinuationFixture(job, archivedCommit)
+      const phaseLog = join(value.root, `${mode}-phases.log`)
+      let preparationGates = 0
+      let reviewGates = 0
+      const result = await executeCodexJob(job, {
+        codexBinForTesting: value.executable,
+        logDir: value.logDir,
+        stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: mode, ZERO_PHASE_LOG: phaseLog },
+        phaseGateForTesting: {
+          validatePreparation: () => { preparationGates += 1 },
+          validateReview: () => { reviewGates += 1 },
+        },
+        liveControls: value.hooks,
+        publicationContinuation: continuation,
+        publicationBaselineForTesting: baseline,
+      })
+      expect(result.publication?.plans).toHaveLength(1)
+      expect(result.publication?.plans[0]).toMatchObject({
+        repositorySlug: 'example/app-server-continuation',
+        baseBranch: 'main',
+      })
+      expect(result.publication?.plans[0]?.headBranch)
+        .not.toBe('zerochan/reviewed-continuation')
+      expect(result.publication?.plans[0]?.commitSha).not.toBe(archivedCommit)
+      const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+        .map(line => line.split('\t'))
+      expect(phases.map(row => row[0])).toEqual([
+        'continuation', 'prepare', 'implementation', 'review',
+      ])
+      expect(phases.map(row => row[4])).toEqual(['read', 'read', 'write', 'read'])
+      expect(new Set(phases.map(row => row[6])).size).toBe(1)
+      expect({ preparationGates, reviewGates }).toEqual({
+        preparationGates: 1,
+        reviewGates: 1,
+      })
+      value.store.close()
+    }, 30_000)
+  }
+
+  test('現在projectへ結び直せない古いcheckpointは一度だけ通常工程へfallbackする', async () => {
+    const value = fixture(
+      'phased-continuation-stale',
+      true,
+      '前回のPRをdevelopへマージしてください',
+    )
+    git(value.repo, ['init', '--initial-branch=main'])
+    git(value.repo, ['config', 'user.email', 'zero@example.invalid'])
+    git(value.repo, ['config', 'user.name', 'Zero Test'])
+    git(value.repo, ['config', 'remote.origin.url',
+      'https://github.com/example/app-server-continuation.git'])
+    git(value.repo, ['add', 'AGENTS.md'])
+    git(value.repo, ['commit', '-m', 'chore: initial'])
+    const archivedCommit = git(value.repo, ['rev-parse', 'HEAD'])
+    const baseline = captureGitHubPublicationBaseline(value.repo, [value.repo])
+    const job = { ...value.job, seq: 2 }
+    const phaseLog = join(value.root, 'continuation-stale-phases.log')
+    let preparationGates = 0
+    let reviewGates = 0
+    let preflightCalls = 0
+    const result = await executeCodexJob(job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'phased-continuation-stale',
+        ZERO_PHASE_LOG: phaseLog,
+      },
+      phaseGateForTesting: {
+        validatePreparation: () => { preparationGates += 1 },
+        validateReview: () => { reviewGates += 1 },
+      },
+      liveControls: value.hooks,
+      publicationContinuation: publicationContinuationFixture(job, archivedCommit),
+      publicationBaselineForTesting: baseline,
+      publicationCommandsForTesting: {
+        async runGit() {
+          preflightCalls += 1
+          // The archived request named main, but that remote branch no longer
+          // exists. This is a stale accelerator, not a terminal job failure.
+          return publicationCommandResult(0, '')
+        },
+        async runGh() { throw new Error('stale preflight must not mutate GitHub') },
+      },
+    })
+    expect(result.publication?.plans).toHaveLength(1)
+    expect(result.publication?.plans[0]?.commitSha).not.toBe(archivedCommit)
+    const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
+      .map(line => line.split('\t'))
+    expect(phases.map(row => row[0])).toEqual([
+      'continuation', 'prepare', 'implementation', 'review',
+    ])
+    expect(phases.map(row => row[4])).toEqual(['read', 'read', 'write', 'read'])
+    expect({ preflightCalls, preparationGates, reviewGates }).toEqual({
+      preflightCalls: 1,
+      preparationGates: 1,
+      reviewGates: 1,
+    })
+    value.store.close()
+  }, 30_000)
+
   for (const shouldResume of [false, true]) {
     test(`${shouldResume ? 'native resume' : 'fresh physical session'}の履歴注入を一意にする`, async () => {
       const value = fixture('normal')

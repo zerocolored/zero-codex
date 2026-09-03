@@ -150,6 +150,19 @@ import {
   type GitHubPublicationSet,
   type GitHubPromotionCheckpoint,
 } from './github-publication.ts'
+import {
+  assertPublicationContinuationArchive,
+  assertPublicationContinuationBundle,
+  MAX_PUBLICATION_CONTINUATION_ARCHIVE_BYTES,
+  MAX_PUBLICATION_CONTINUATION_ARCHIVES_PER_SCOPE,
+  MAX_PUBLICATION_CONTINUATION_BUNDLE_BYTES,
+  MAX_PUBLICATION_CONTINUATION_CANDIDATES,
+  publicationContinuationDigest,
+  type GitHubPublicationContinuationArchive,
+  type GitHubPublicationContinuationBundle,
+  type GitHubPublicationContinuationCandidate,
+  type GitHubPublicationContinuationEntry,
+} from './publication-continuation.ts'
 
 export class SlackChannelRouteRequiredError extends Error {
   constructor(readonly channelId: string) {
@@ -998,6 +1011,56 @@ CREATE TABLE IF NOT EXISTS github_publication_recoveries (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (job_id, source_attempt),
   FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
+-- A completed, reviewed ordinary PR is a durable workflow checkpoint. This
+-- archive intentionally has no source-job foreign key so job retention cannot
+-- erase the exact branch/SHA/PR identity needed by a later same-thread turn.
+CREATE TABLE IF NOT EXISTS github_publication_continuation_archives (
+  source_job_id TEXT PRIMARY KEY,
+  version INTEGER NOT NULL CHECK (version = 1),
+  source_job_seq INTEGER NOT NULL CHECK (source_job_seq > 0),
+  chat_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  eligible_plan_count INTEGER NOT NULL CHECK (eligible_plan_count > 0),
+  archive_json TEXT NOT NULL,
+  archive_digest TEXT NOT NULL,
+  publication_completed_at INTEGER NOT NULL,
+  eligible_at INTEGER,
+  UNIQUE (chat_id, thread_ts, repo_path, source_job_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_github_publication_continuation_archives_scope
+  ON github_publication_continuation_archives(
+    chat_id, thread_ts, repo_path, eligible_at, source_job_seq DESC
+  );
+-- Bind a snapshot of the available checkpoints to the target job at claim
+-- time. Empty bundles are persisted too, preventing a retry from adopting a
+-- newer checkpoint that did not exist when the job first began.
+CREATE TABLE IF NOT EXISTS job_github_publication_continuations (
+  job_id TEXT PRIMARY KEY,
+  version INTEGER NOT NULL CHECK (version = 1),
+  target_job_seq INTEGER NOT NULL CHECK (target_job_seq > 0),
+  chat_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+  omitted_candidate_count INTEGER NOT NULL CHECK (omitted_candidate_count >= 0),
+  bundle_json TEXT NOT NULL,
+  bundle_digest TEXT NOT NULL,
+  bound_at INTEGER NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
+-- A continuation can consume only part of a multi-repository archive. Keep a
+-- per-entry tombstone without a source-job foreign key so an already advanced
+-- PR never becomes actionable again after ordinary job retention.
+CREATE TABLE IF NOT EXISTS github_publication_continuation_consumptions (
+  source_job_id TEXT NOT NULL,
+  repository_slug TEXT NOT NULL,
+  commit_sha TEXT NOT NULL,
+  pull_request_number INTEGER NOT NULL CHECK (pull_request_number > 0),
+  consuming_job_id TEXT NOT NULL,
+  consumed_at INTEGER NOT NULL,
+  PRIMARY KEY (source_job_id, repository_slug)
 );
 CREATE TABLE IF NOT EXISTS ui_approval_requests (
   id TEXT PRIMARY KEY,
@@ -1885,6 +1948,43 @@ function ensureJobSchemaMigrations(db: Database): void {
     `)
   })
   migrateLegacyPromotions.immediate()
+  const migratePublicationContinuationArchives = db.transaction(() => {
+    if (db.query<{ present: number }, []>(
+      "SELECT 1 AS present FROM migration_ledger WHERE name = 'github-publication-continuation-archive-v1'",
+    ).get()) return
+    const completed = db.query<{ job_id: string }, []>(
+      `SELECT sets.job_id FROM github_publication_sets AS sets
+       JOIN jobs ON jobs.id = sets.job_id
+       WHERE sets.status = 'completed' AND sets.plan_count > 0
+         AND jobs.runtime = 'codex' AND jobs.status = 'completed'
+       ORDER BY jobs.seq ASC`,
+    ).all()
+    for (const row of completed) {
+      tryMaterializeCompletedPublicationContinuationArchive(db, row.job_id, 'migration')
+    }
+    const scopes = db.query<{
+      chat_id: string
+      thread_ts: string
+      repo_path: string
+    }, []>(
+      `SELECT DISTINCT chat_id, thread_ts, repo_path
+       FROM github_publication_continuation_archives
+       WHERE eligible_at IS NOT NULL`,
+    ).all()
+    for (const scope of scopes) {
+      try {
+        prunePublicationContinuationArchivesForScope(db, scope)
+      } catch (error) {
+        warnPublicationContinuation('migration retention', error)
+      }
+    }
+    db.run(
+      `INSERT INTO migration_ledger (name, completed_at)
+       VALUES ('github-publication-continuation-archive-v1', ?)`,
+      [Date.now()],
+    )
+  })
+  migratePublicationContinuationArchives.immediate()
   const controlColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_controls)').all()
   for (const [name, definition] of [
     ['input_revision', 'INTEGER NOT NULL DEFAULT 1'],
@@ -2777,6 +2877,19 @@ function validateStoredGitHubPublicationSet(value: GitHubPublicationSet): void {
     }
     if (plan.promotion) {
       const promotion = plan.promotion
+      const validFollowup = (promotion.followupBaseBranch === null
+          && promotion.followupInitialHead === null
+          && Number.isSafeInteger(promotion.expectedIntegrationPullRequestNumber)
+          && promotion.expectedIntegrationPullRequestNumber! > 0)
+        || (typeof promotion.followupBaseBranch === 'string'
+          && typeof promotion.followupInitialHead === 'string'
+          && Boolean(promotion.followupBaseBranch)
+          && GITHUB_PUBLICATION_SHA.test(promotion.followupInitialHead)
+          && promotion.sourceBranch !== promotion.followupBaseBranch
+          && promotion.followupBaseBranch !== plan.baseBranch
+          && promotion.followupBaseBranch !== plan.headBranch
+          && !/[\0\r\n]/.test(promotion.followupBaseBranch)
+          && Buffer.byteLength(promotion.followupBaseBranch) <= 255)
       const delegated = promotion.waitForChecks !== undefined
         || promotion.integrationPullRequestBody !== undefined
         || promotion.followupPullRequestBody !== undefined
@@ -2784,17 +2897,14 @@ function validateStoredGitHubPublicationSet(value: GitHubPublicationSet): void {
       if (!promotion || typeof promotion !== 'object' || promotion.version !== 1
         || typeof promotion.sourceBranch !== 'string'
         || typeof promotion.sourceHead !== 'string'
-        || typeof promotion.followupBaseBranch !== 'string'
-        || typeof promotion.followupInitialHead !== 'string'
         || promotion.sourceHead !== plan.commitSha
         || !GITHUB_PUBLICATION_SHA.test(promotion.sourceHead)
-        || !GITHUB_PUBLICATION_SHA.test(promotion.followupInitialHead)
-        || !promotion.sourceBranch || !promotion.followupBaseBranch
+        || !promotion.sourceBranch || !validFollowup
         || promotion.sourceBranch === plan.baseBranch
-        || promotion.sourceBranch === promotion.followupBaseBranch
-        || promotion.followupBaseBranch === plan.baseBranch
-        || promotion.followupBaseBranch === plan.headBranch
-        || [promotion.sourceBranch, promotion.followupBaseBranch].some(branch => (
+        || (promotion.expectedIntegrationPullRequestNumber !== undefined
+          && (!Number.isSafeInteger(promotion.expectedIntegrationPullRequestNumber)
+            || promotion.expectedIntegrationPullRequestNumber <= 0))
+        || [promotion.sourceBranch].some(branch => (
           /[\0\r\n]/.test(branch) || Buffer.byteLength(branch) > 255
         ))
         || (delegated && (
@@ -2885,6 +2995,23 @@ function githubPublicationTableForPlan(
     : NORMAL_GITHUB_PUBLICATION_TABLE
 }
 
+function publicationPlanExpectsFollowupReceipt(plan: GitHubPublicationPlan): boolean {
+  return plan.promotion !== undefined && plan.promotion.followupBaseBranch !== null
+}
+
+function publicationRowHasCompleteReceipt(
+  row: GitHubPublicationRow,
+  plan: GitHubPublicationPlan,
+): boolean {
+  if (row.status !== 'completed' || row.pull_request_number === null
+    || row.pull_request_url === null) return false
+  const hasFollowup = row.followup_pull_request_number !== null
+    && row.followup_pull_request_url !== null
+  const hasNoFollowup = row.followup_pull_request_number === null
+    && row.followup_pull_request_url === null
+  return publicationPlanExpectsFollowupReceipt(plan) ? hasFollowup : hasNoFollowup
+}
+
 function githubPublicationRows(db: Database, jobId: string): GitHubPublicationRow[] {
   const rows = [
     ...db.query<GitHubPublicationRow, [string]>(
@@ -2926,17 +3053,23 @@ function publicationPlanFromRow(row: GitHubPublicationRow): GitHubPublicationPla
     const keys = Object.keys(record).sort().join('\n')
     const legacyKeys = 'followupBaseBranch\nfollowupInitialHead\nsourceBranch\nsourceHead\nversion'
     const delegatedKeys = 'closePullRequestNumbers\nfollowupBaseBranch\nfollowupInitialHead\nfollowupPullRequestBody\nintegrationPullRequestBody\nsourceBranch\nsourceHead\nversion\nwaitForChecks'
-    if ((keys !== legacyKeys && keys !== delegatedKeys)
+    const continuationKeys = 'closePullRequestNumbers\nexpectedIntegrationPullRequestNumber\nfollowupBaseBranch\nfollowupInitialHead\nfollowupPullRequestBody\nintegrationPullRequestBody\nsourceBranch\nsourceHead\nversion\nwaitForChecks'
+    if ((keys !== legacyKeys && keys !== delegatedKeys && keys !== continuationKeys)
       || record.version !== 1
       || typeof record.sourceBranch !== 'string'
       || typeof record.sourceHead !== 'string'
-      || typeof record.followupBaseBranch !== 'string'
-      || typeof record.followupInitialHead !== 'string'
-      || (keys === delegatedKeys && (
+      || !((record.followupBaseBranch === null && record.followupInitialHead === null)
+        || (typeof record.followupBaseBranch === 'string'
+          && typeof record.followupInitialHead === 'string'))
+      || (record.followupBaseBranch === null && keys !== continuationKeys)
+      || ((keys === delegatedKeys || keys === continuationKeys) && (
         typeof record.waitForChecks !== 'boolean'
         || typeof record.integrationPullRequestBody !== 'string'
         || typeof record.followupPullRequestBody !== 'string'
         || !Array.isArray(record.closePullRequestNumbers)
+        || (keys === continuationKeys
+          && (!Number.isSafeInteger(record.expectedIntegrationPullRequestNumber)
+            || Number(record.expectedIntegrationPullRequestNumber) <= 0))
       ))) {
       throw new Error('stored GitHub publication promotion is invalid')
     }
@@ -2999,6 +3132,679 @@ type GitHubPublicationRecoveryRow = {
   created_at: number
 }
 
+type GitHubPublicationContinuationArchiveRow = {
+  source_job_id: string
+  source_job_seq: number
+  chat_id: string
+  thread_ts: string
+  repo_path: string
+  eligible_plan_count: number
+  archive_json: string
+  archive_digest: string
+  publication_completed_at: number
+  eligible_at: number | null
+}
+
+type GitHubPublicationContinuationBindingRow = {
+  job_id: string
+  target_job_seq: number
+  chat_id: string
+  thread_ts: string
+  repo_path: string
+  candidate_count: number
+  omitted_candidate_count: number
+  bundle_json: string
+  bundle_digest: string
+  bound_at: number
+}
+
+type GitHubPublicationContinuationConsumptionRow = {
+  source_job_id: string
+  repository_slug: string
+  commit_sha: string
+  pull_request_number: number
+  consuming_job_id: string
+  consumed_at: number
+}
+
+function publicationContinuationReceiptFromRow(
+  row: GitHubPublicationRow,
+): GitHubPublicationReceipt {
+  if (row.status !== 'completed' || row.pull_request_number === null
+    || row.pull_request_url === null || row.followup_pull_request_number !== null
+    || row.followup_pull_request_url !== null) {
+    throw new Error(`ordinary GitHub publication receipt is incomplete for job ${row.job_id}`)
+  }
+  return {
+    repositorySlug: row.repository_slug,
+    baseBranch: row.base_branch,
+    headBranch: row.head_branch,
+    commitSha: row.commit_sha,
+    pullRequestNumber: row.pull_request_number,
+    pullRequestUrl: row.pull_request_url,
+  }
+}
+
+function publicationContinuationEntryFromRow(
+  db: Database,
+  row: GitHubPublicationRow,
+): GitHubPublicationContinuationEntry | null {
+  const plan = publicationPlanFromRow(row)
+  if (!publicationRowHasCompleteReceipt(row, plan)) {
+    throw new Error(`GitHub publication receipt is incomplete for job ${row.job_id}`)
+  }
+  if (!plan.promotion) {
+    return { plan, receipt: publicationContinuationReceiptFromRow(row) }
+  }
+  const progress = db.query<GitHubPromotionProgressRow, [string, string]>(
+    `SELECT commit_sha, checkpoint_kind, checkpoint_json
+     FROM github_promotion_progress WHERE job_id = ? AND git_root = ?`,
+  ).get(row.job_id, plan.gitRoot)
+  if (!progress) {
+    throw new Error(`GitHub promotion continuation checkpoint is missing for job ${row.job_id}`)
+  }
+  const checkpoint = parseStoredGitHubPromotionCheckpoint(plan, progress)
+  if (!('pullRequestNumber' in checkpoint)
+    || checkpoint.pullRequestNumber !== row.pull_request_number
+    || checkpoint.pullRequestUrl !== row.pull_request_url
+    || (plan.promotion.expectedIntegrationPullRequestNumber !== undefined
+      && plan.promotion.expectedIntegrationPullRequestNumber !== row.pull_request_number)) {
+    throw new Error(`GitHub promotion continuation checkpoint conflicts for job ${row.job_id}`)
+  }
+  if (plan.promotion.followupBaseBranch === null) {
+    if (checkpoint.kind !== 'integration-merged') {
+      throw new Error(`terminal GitHub promotion checkpoint conflicts for job ${row.job_id}`)
+    }
+    // The exact selected PR was merged and no next publication boundary exists.
+    return null
+  }
+  if (plan.promotion.followupInitialHead === null
+    || row.followup_pull_request_number === null
+    || row.followup_pull_request_url === null
+    || checkpoint.kind !== 'followup-pr'
+    || checkpoint.followupHeadSha === undefined
+    || checkpoint.followupPullRequestNumber !== row.followup_pull_request_number
+    || checkpoint.followupPullRequestUrl !== row.followup_pull_request_url) {
+    throw new Error(`GitHub promotion continuation checkpoint conflicts for job ${row.job_id}`)
+  }
+  const releasePlan: GitHubPublicationPlan = {
+    ...plan,
+    baseBranch: plan.promotion.followupBaseBranch,
+    headBranch: plan.baseBranch,
+    commitSha: checkpoint.followupHeadSha,
+    initialHead: plan.promotion.followupInitialHead,
+    // Exact PR number is the continuation authority; retain the already
+    // validated bounded title instead of synthesizing from branch names.
+    title: plan.title,
+    promotion: undefined,
+  }
+  return {
+    plan: releasePlan,
+    receipt: {
+      repositorySlug: releasePlan.repositorySlug,
+      baseBranch: releasePlan.baseBranch,
+      headBranch: releasePlan.headBranch,
+      commitSha: releasePlan.commitSha,
+      pullRequestNumber: checkpoint.followupPullRequestNumber,
+      pullRequestUrl: checkpoint.followupPullRequestUrl,
+    },
+  }
+}
+
+function validatePublicationContinuationArchivePlans(
+  archive: GitHubPublicationContinuationArchive,
+): void {
+  validateStoredGitHubPublicationSet({
+    version: 1,
+    jobId: archive.sourceJobId,
+    jobAttempt: 1,
+    logicalNonce: '0'.repeat(32),
+    inputRevision: 1,
+    inputDigest: archive.inputDigest,
+    reviewRound: archive.reviewRound,
+    reviewedRepositoryDigest: archive.reviewedRepositoryDigest,
+    baselineDigest: archive.baselineDigest,
+    plans: archive.entries.map(entry => entry.plan),
+  })
+  if (archive.entries.some(entry => entry.plan.promotion !== undefined)) {
+    throw new Error('publication continuation archive contains a promotion plan')
+  }
+}
+
+function parsePublicationContinuationArchiveRow(
+  row: GitHubPublicationContinuationArchiveRow,
+): GitHubPublicationContinuationCandidate {
+  if (Buffer.byteLength(row.archive_json) > MAX_PUBLICATION_CONTINUATION_ARCHIVE_BYTES
+    || !/^[0-9a-f]{64}$/.test(row.archive_digest)
+    || publicationContinuationDigest(row.archive_json) !== row.archive_digest) {
+    throw new Error(`publication continuation archive digest changed for ${row.source_job_id}`)
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(row.archive_json) } catch {
+    throw new Error(`publication continuation archive is invalid JSON for ${row.source_job_id}`)
+  }
+  assertPublicationContinuationArchive(parsed, {
+    sourceJobId: row.source_job_id,
+    sourceJobSeq: row.source_job_seq,
+    chatId: row.chat_id,
+    threadTs: row.thread_ts,
+    repoPath: row.repo_path,
+  })
+  if (parsed.publicationCompletedAt !== row.publication_completed_at
+    || parsed.entries.length !== row.eligible_plan_count) {
+    throw new Error(`publication continuation archive fields changed for ${row.source_job_id}`)
+  }
+  validatePublicationContinuationArchivePlans(parsed)
+  return { archiveDigest: row.archive_digest, archive: parsed }
+}
+
+function parsePublicationContinuationBindingRow(
+  row: GitHubPublicationContinuationBindingRow,
+): GitHubPublicationContinuationBundle {
+  if (Buffer.byteLength(row.bundle_json) > MAX_PUBLICATION_CONTINUATION_BUNDLE_BYTES
+    || !/^[0-9a-f]{64}$/.test(row.bundle_digest)
+    || publicationContinuationDigest(row.bundle_json) !== row.bundle_digest) {
+    throw new Error(`publication continuation bundle digest changed for ${row.job_id}`)
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(row.bundle_json) } catch {
+    throw new Error(`publication continuation bundle is invalid JSON for ${row.job_id}`)
+  }
+  assertPublicationContinuationBundle(parsed, {
+    targetJobId: row.job_id,
+    targetJobSeq: row.target_job_seq,
+    chatId: row.chat_id,
+    threadTs: row.thread_ts,
+    repoPath: row.repo_path,
+  })
+  if (parsed.boundAt !== row.bound_at
+    || parsed.candidates.length !== row.candidate_count
+    || parsed.omittedCandidateCount !== row.omitted_candidate_count) {
+    throw new Error(`publication continuation bundle fields changed for ${row.job_id}`)
+  }
+  for (const candidate of parsed.candidates) {
+    validatePublicationContinuationArchivePlans(candidate.archive)
+  }
+  return parsed
+}
+
+function availablePublicationContinuationCandidate(
+  db: Database,
+  candidate: GitHubPublicationContinuationCandidate,
+): GitHubPublicationContinuationCandidate | null {
+  const consumed = db.query<GitHubPublicationContinuationConsumptionRow, [string]>(
+    `SELECT source_job_id, repository_slug, commit_sha, pull_request_number,
+            consuming_job_id, consumed_at
+     FROM github_publication_continuation_consumptions WHERE source_job_id = ?`,
+  ).all(candidate.archive.sourceJobId)
+  const entriesByRepository = new Map(candidate.archive.entries.map(entry => [
+    entry.plan.repositorySlug.toLowerCase(),
+    entry,
+  ]))
+  const consumedRepositories = new Set<string>()
+  for (const row of consumed) {
+    const repository = row.repository_slug.toLowerCase()
+    const entry = entriesByRepository.get(repository)
+    if (!entry || row.repository_slug !== repository
+      || row.source_job_id !== candidate.archive.sourceJobId
+      || row.commit_sha !== entry.plan.commitSha
+      || row.pull_request_number !== entry.receipt.pullRequestNumber
+      || !row.consuming_job_id || /[\0\r\n]/.test(row.consuming_job_id)
+      || !Number.isSafeInteger(row.consumed_at) || row.consumed_at <= 0) {
+      throw new Error(
+        `publication continuation consumption conflicts for ${candidate.archive.sourceJobId}`,
+      )
+    }
+    consumedRepositories.add(repository)
+  }
+  if (consumedRepositories.size === 0) return candidate
+  const entries = candidate.archive.entries.filter(entry => (
+    !consumedRepositories.has(entry.plan.repositorySlug.toLowerCase())
+  ))
+  if (entries.length === 0) return null
+  const archive = { ...candidate.archive, entries }
+  return {
+    archive,
+    archiveDigest: publicationContinuationDigest(JSON.stringify(archive)),
+  }
+}
+
+function recordCompletedPublicationContinuationConsumptions(
+  db: Database,
+  jobId: string,
+  consumedAt: number,
+): void {
+  const bindingRow = db.query<GitHubPublicationContinuationBindingRow, [string]>(
+    'SELECT * FROM job_github_publication_continuations WHERE job_id = ?',
+  ).get(jobId)
+  if (!bindingRow) return
+  const bundle = parsePublicationContinuationBindingRow(bindingRow)
+  const plans = githubPublicationRows(db, jobId).map(publicationPlanFromRow)
+    .filter(plan => plan.promotion?.expectedIntegrationPullRequestNumber !== undefined)
+  for (const plan of plans) {
+    const pullRequestNumber = plan.promotion!.expectedIntegrationPullRequestNumber!
+    const matches = bundle.candidates.flatMap(candidate => (
+      candidate.archive.entries
+        .filter(entry => entry.plan.repositorySlug.toLowerCase()
+          === plan.repositorySlug.toLowerCase()
+          && entry.plan.baseBranch === plan.baseBranch
+          && entry.plan.headBranch === plan.headBranch
+          && entry.plan.commitSha === plan.commitSha
+          && entry.receipt.pullRequestNumber === pullRequestNumber)
+        .map(entry => ({ candidate, entry }))
+    ))
+    // A normal promotion prepared from current repository state can coexist
+    // with an empty historical bundle.  Only an exact bound archive match is
+    // consumable; absence is not corruption and must not affect publication.
+    if (matches.length === 0) continue
+    if (matches.length !== 1) {
+      throw new Error(`publication continuation source is ambiguous for job ${jobId}`)
+    }
+    for (const { candidate, entry } of matches) {
+      const repository = entry.plan.repositorySlug.toLowerCase()
+      db.run(
+        `INSERT INTO github_publication_continuation_consumptions (
+           source_job_id, repository_slug, commit_sha, pull_request_number,
+           consuming_job_id, consumed_at
+         ) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(source_job_id, repository_slug) DO NOTHING`,
+        [
+          candidate.archive.sourceJobId, repository, entry.plan.commitSha,
+          entry.receipt.pullRequestNumber, jobId, consumedAt,
+        ],
+      )
+      const persisted = db.query<GitHubPublicationContinuationConsumptionRow, [string, string]>(
+        `SELECT source_job_id, repository_slug, commit_sha, pull_request_number,
+                consuming_job_id, consumed_at
+         FROM github_publication_continuation_consumptions
+         WHERE source_job_id = ? AND repository_slug = ?`,
+      ).get(candidate.archive.sourceJobId, repository)
+      if (!persisted || persisted.commit_sha !== entry.plan.commitSha
+        || persisted.pull_request_number !== entry.receipt.pullRequestNumber) {
+        throw new Error(`publication continuation consumption raced for job ${jobId}`)
+      }
+    }
+  }
+}
+
+function tryRecordCompletedPublicationContinuationConsumptions(
+  db: Database,
+  jobId: string,
+  consumedAt: number,
+  context: string,
+): void {
+  try {
+    recordCompletedPublicationContinuationConsumptions(db, jobId, consumedAt)
+  } catch (error) {
+    // Consumption only removes an accelerator. Failure leaves the ordinary
+    // Codex workflow available and must not undo a confirmed GitHub receipt.
+    warnPublicationContinuation(context, error)
+  }
+}
+
+function materializeCompletedPublicationContinuationArchive(
+  db: Database,
+  jobId: string,
+): 'archived' | 'terminal' | null {
+  const set = db.query<{
+    input_digest: string
+    review_round: 1 | 2 | 3
+    reviewed_repository_digest: string
+    baseline_digest: string
+    plan_count: number
+    status: 'pending' | 'completed'
+    completed_at: number | null
+  }, [string]>(
+    `SELECT input_digest, review_round, reviewed_repository_digest, baseline_digest,
+            plan_count, status, completed_at
+     FROM github_publication_sets WHERE job_id = ?`,
+  ).get(jobId)
+  if (!set || set.status !== 'completed' || set.plan_count < 1 || set.completed_at === null) {
+    return null
+  }
+  const job = db.query<{
+    seq: number
+    chat_id: string
+    thread_ts: string
+    repo_path: string
+    status: JobStatus
+    finished_at: number | null
+  }, [string]>(
+    'SELECT seq, chat_id, thread_ts, repo_path, status, finished_at FROM jobs WHERE id = ?',
+  ).get(jobId)
+  if (!job) return null
+  const rows = githubPublicationRows(db, jobId)
+  if (rows.length !== set.plan_count || rows.some(row => row.status !== 'completed')) return null
+  const entries = rows
+    .map(row => publicationContinuationEntryFromRow(db, row))
+    .filter((entry): entry is GitHubPublicationContinuationEntry => entry !== null)
+    .sort((left, right) => {
+      const leftRepository = left.plan.repositorySlug.toLowerCase()
+      const rightRepository = right.plan.repositorySlug.toLowerCase()
+      return leftRepository < rightRepository ? -1 : leftRepository > rightRepository ? 1 : 0
+    })
+  if (entries.length === 0) return 'terminal'
+  const archive: GitHubPublicationContinuationArchive = {
+    version: 1,
+    sourceJobId: jobId,
+    sourceJobSeq: job.seq,
+    chatId: job.chat_id,
+    threadTs: job.thread_ts,
+    repoPath: job.repo_path,
+    publicationCompletedAt: set.completed_at,
+    inputDigest: set.input_digest,
+    reviewRound: set.review_round,
+    reviewedRepositoryDigest: set.reviewed_repository_digest,
+    baselineDigest: set.baseline_digest,
+    entries,
+  }
+  assertPublicationContinuationArchive(archive, {
+    sourceJobId: jobId,
+    sourceJobSeq: job.seq,
+    chatId: job.chat_id,
+    threadTs: job.thread_ts,
+    repoPath: job.repo_path,
+  })
+  validatePublicationContinuationArchivePlans(archive)
+  const serialized = JSON.stringify(archive)
+  if (Buffer.byteLength(serialized) > MAX_PUBLICATION_CONTINUATION_ARCHIVE_BYTES) return null
+  const digest = publicationContinuationDigest(serialized)
+  db.run(
+    `INSERT INTO github_publication_continuation_archives (
+       source_job_id, version, source_job_seq, chat_id, thread_ts, repo_path,
+       eligible_plan_count, archive_json, archive_digest, publication_completed_at, eligible_at
+     ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(source_job_id) DO NOTHING`,
+    [
+      jobId, job.seq, job.chat_id, job.thread_ts, job.repo_path, archive.entries.length,
+      serialized, digest, set.completed_at,
+      // The GitHub receipt, not the later Slack/job terminal notification, is
+      // the authority that this workflow checkpoint exists.  Making it
+      // eligible here preserves an already-created PR across late cancel,
+      // monitor loss, daemon restart and failed-job retention.
+      set.completed_at,
+    ],
+  )
+  const persisted = db.query<GitHubPublicationContinuationArchiveRow, [string]>(
+    'SELECT * FROM github_publication_continuation_archives WHERE source_job_id = ?',
+  ).get(jobId)
+  if (!persisted) throw new Error(`publication continuation archive was not persisted for ${jobId}`)
+  const parsed = parsePublicationContinuationArchiveRow(persisted)
+  if (parsed.archiveDigest !== digest || persisted.archive_json !== serialized) {
+    throw new Error(`publication continuation archive conflicts for ${jobId}`)
+  }
+  return 'archived'
+}
+
+function warnPublicationContinuation(context: string, error: unknown): void {
+  const category = error instanceof Error ? error.name : 'unknown'
+  try {
+    process.stderr.write(
+      `[Zero continuation warning] ${context}: ${category}; ordinary workflow remains available\n`,
+    )
+  } catch {}
+}
+
+function tryMaterializeCompletedPublicationContinuationArchive(
+  db: Database,
+  jobId: string,
+  context: string,
+): 'archived' | 'terminal' | null {
+  try {
+    return materializeCompletedPublicationContinuationArchive(db, jobId)
+  } catch (error) {
+    // Continuation history is an accelerator, never authority for whether an
+    // otherwise completed job may finish. Corrupt legacy data therefore falls
+    // back to the ordinary Codex flow instead of wedging the queue.
+    warnPublicationContinuation(context, error)
+    return null
+  }
+}
+
+function hasUnresolvedLegacyFollowupContinuation(db: Database, jobId: string): boolean {
+  let rows: GitHubPublicationRow[]
+  try {
+    rows = githubPublicationRows(db, jobId)
+  } catch {
+    return false
+  }
+  for (const row of rows) {
+    try {
+      const plan = publicationPlanFromRow(row)
+      if (!plan.promotion || plan.promotion.followupBaseBranch === null
+        || row.status !== 'completed' || row.pull_request_number === null
+        || row.pull_request_url === null || row.followup_pull_request_number === null
+        || row.followup_pull_request_url === null) continue
+      const progress = db.query<GitHubPromotionProgressRow, [string, string]>(
+        `SELECT commit_sha, checkpoint_kind, checkpoint_json
+         FROM github_promotion_progress WHERE job_id = ? AND git_root = ?`,
+      ).get(jobId, plan.gitRoot)
+      if (!progress) continue
+      const checkpoint = parseStoredGitHubPromotionCheckpoint(plan, progress)
+      if (checkpoint.kind === 'followup-pr'
+        && checkpoint.followupHeadSha === undefined
+        && checkpoint.pullRequestNumber === row.pull_request_number
+        && checkpoint.pullRequestUrl === row.pull_request_url
+        && checkpoint.followupPullRequestNumber === row.followup_pull_request_number
+        && checkpoint.followupPullRequestUrl === row.followup_pull_request_url) {
+        return true
+      }
+    } catch {
+      // Corruption is not mistaken for a supported legacy checkpoint. The
+      // ordinary retention policy remains authoritative for unrelated rows.
+    }
+  }
+  return false
+}
+
+function prunePublicationContinuationArchivesForScope(
+  db: Database,
+  scope: { chat_id: string; thread_ts: string; repo_path: string },
+): void {
+  db.run(
+    `DELETE FROM github_publication_continuation_archives
+     WHERE source_job_id IN (
+       SELECT source_job_id FROM github_publication_continuation_archives
+       WHERE chat_id = ? AND thread_ts = ? AND repo_path = ? AND eligible_at IS NOT NULL
+       ORDER BY source_job_seq DESC
+       LIMIT -1 OFFSET ?
+     )`,
+    [
+      scope.chat_id, scope.thread_ts, scope.repo_path,
+      MAX_PUBLICATION_CONTINUATION_ARCHIVES_PER_SCOPE,
+    ],
+  )
+  db.run(
+    `DELETE FROM github_publication_continuation_consumptions
+     WHERE NOT EXISTS (
+       SELECT 1 FROM github_publication_continuation_archives AS archives
+       WHERE archives.source_job_id = github_publication_continuation_consumptions.source_job_id
+     )`,
+  )
+}
+
+function activatePublicationContinuationArchive(
+  db: Database,
+  jobId: string,
+  finishedAt: number,
+): void {
+  materializeCompletedPublicationContinuationArchive(db, jobId)
+  db.run(
+    `UPDATE github_publication_continuation_archives
+     SET eligible_at = COALESCE(eligible_at, ?)
+     WHERE source_job_id = ?`,
+    [finishedAt, jobId],
+  )
+  const scope = db.query<{ chat_id: string; thread_ts: string; repo_path: string }, [string]>(
+    `SELECT chat_id, thread_ts, repo_path
+     FROM github_publication_continuation_archives WHERE source_job_id = ?`,
+  ).get(jobId)
+  if (!scope) return
+  prunePublicationContinuationArchivesForScope(db, scope)
+}
+
+function tryActivatePublicationContinuationArchive(
+  db: Database,
+  jobId: string,
+  finishedAt: number,
+  context: string,
+): void {
+  try {
+    activatePublicationContinuationArchive(db, jobId, finishedAt)
+  } catch (error) {
+    warnPublicationContinuation(context, error)
+  }
+}
+
+function ensurePublicationContinuationBinding(
+  db: Database,
+  job: JobRow,
+  boundAt: number,
+): void {
+  const existing = db.query<GitHubPublicationContinuationBindingRow, [string]>(
+    'SELECT * FROM job_github_publication_continuations WHERE job_id = ?',
+  ).get(job.id)
+  if (existing) {
+    // A damaged historical binding is never replaced with a newer candidate:
+    // retries fall back to the normal workflow instead of changing authority.
+    try { parsePublicationContinuationBindingRow(existing) } catch {}
+    return
+  }
+  const candidates: GitHubPublicationContinuationCandidate[] = []
+  let omittedCandidateCount = 0
+  const signatures = new Set<string>()
+  if (job.write_enabled === 1) {
+    const rows = db.query<GitHubPublicationContinuationArchiveRow, [string, string, string, number]>(
+      `SELECT * FROM github_publication_continuation_archives
+       WHERE chat_id = ? AND thread_ts = ? AND repo_path = ?
+         AND eligible_at IS NOT NULL AND source_job_seq < ?
+       ORDER BY source_job_seq DESC
+       LIMIT ${MAX_PUBLICATION_CONTINUATION_ARCHIVES_PER_SCOPE}`,
+    ).all(job.chat_id, job.thread_ts, job.repo_path, job.seq)
+    for (const row of rows) {
+      let candidate: GitHubPublicationContinuationCandidate | null
+      try {
+        candidate = availablePublicationContinuationCandidate(
+          db,
+          parsePublicationContinuationArchiveRow(row),
+        )
+      } catch {
+        omittedCandidateCount += 1
+        continue
+      }
+      if (candidate === null) continue
+      const signature = publicationContinuationDigest(JSON.stringify(
+        candidate.archive.entries.map(entry => ({
+          repositorySlug: entry.plan.repositorySlug.toLowerCase(),
+          baseBranch: entry.plan.baseBranch,
+          headBranch: entry.plan.headBranch,
+          commitSha: entry.plan.commitSha,
+          pullRequestNumber: entry.receipt.pullRequestNumber,
+        })),
+      ))
+      if (signatures.has(signature) || candidates.length >= MAX_PUBLICATION_CONTINUATION_CANDIDATES) {
+        omittedCandidateCount += 1
+        continue
+      }
+      const proposed = {
+        version: 1 as const,
+        targetJobId: job.id,
+        targetJobSeq: job.seq,
+        chatId: job.chat_id,
+        threadTs: job.thread_ts,
+        repoPath: job.repo_path,
+        boundAt,
+        omittedCandidateCount,
+        candidates: [...candidates, candidate],
+      }
+      if (Buffer.byteLength(JSON.stringify(proposed)) > MAX_PUBLICATION_CONTINUATION_BUNDLE_BYTES) {
+        omittedCandidateCount += 1
+        continue
+      }
+      signatures.add(signature)
+      candidates.push(candidate)
+    }
+  }
+  const bundle: GitHubPublicationContinuationBundle = {
+    version: 1,
+    targetJobId: job.id,
+    targetJobSeq: job.seq,
+    chatId: job.chat_id,
+    threadTs: job.thread_ts,
+    repoPath: job.repo_path,
+    boundAt,
+    omittedCandidateCount,
+    candidates,
+  }
+  assertPublicationContinuationBundle(bundle, {
+    targetJobId: job.id,
+    targetJobSeq: job.seq,
+    chatId: job.chat_id,
+    threadTs: job.thread_ts,
+    repoPath: job.repo_path,
+  })
+  const serialized = JSON.stringify(bundle)
+  if (Buffer.byteLength(serialized) > MAX_PUBLICATION_CONTINUATION_BUNDLE_BYTES) {
+    throw new Error(`publication continuation bundle is too large for ${job.id}`)
+  }
+  const digest = publicationContinuationDigest(serialized)
+  db.run(
+    `INSERT INTO job_github_publication_continuations (
+       job_id, version, target_job_seq, chat_id, thread_ts, repo_path,
+       candidate_count, omitted_candidate_count, bundle_json, bundle_digest, bound_at
+     ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      job.id, job.seq, job.chat_id, job.thread_ts, job.repo_path,
+      candidates.length, omittedCandidateCount, serialized, digest, boundAt,
+    ],
+  )
+}
+
+function ensurePublicationContinuationBindingBestEffort(
+  db: Database,
+  job: JobRow,
+  boundAt: number,
+): void {
+  try {
+    ensurePublicationContinuationBinding(db, job, boundAt)
+    return
+  } catch (error) {
+    warnPublicationContinuation('job claim binding', error)
+  }
+  try {
+    const existing = db.query<{ present: number }, [string]>(
+      'SELECT 1 AS present FROM job_github_publication_continuations WHERE job_id = ?',
+    ).get(job.id)
+    if (existing) return
+    const bundle: GitHubPublicationContinuationBundle = {
+      version: 1,
+      targetJobId: job.id,
+      targetJobSeq: job.seq,
+      chatId: job.chat_id,
+      threadTs: job.thread_ts,
+      repoPath: job.repo_path,
+      boundAt,
+      omittedCandidateCount: 0,
+      candidates: [],
+    }
+    const serialized = JSON.stringify(bundle)
+    db.run(
+      `INSERT OR IGNORE INTO job_github_publication_continuations (
+         job_id, version, target_job_seq, chat_id, thread_ts, repo_path,
+         candidate_count, omitted_candidate_count, bundle_json, bundle_digest, bound_at
+       ) VALUES (?, 1, ?, ?, ?, ?, 0, 0, ?, ?, ?)`,
+      [
+        job.id, job.seq, job.chat_id, job.thread_ts, job.repo_path,
+        serialized, publicationContinuationDigest(serialized), boundAt,
+      ],
+    )
+  } catch (error) {
+    // Even an unavailable empty snapshot must not roll back the primary FIFO
+    // claim. A later executor invocation will simply use the normal workflow.
+    warnPublicationContinuation('empty job claim binding', error)
+  }
+}
+
 const GITHUB_PROMOTION_CHECKPOINT_RANK: Record<GitHubPromotionCheckpoint['kind'], number> = {
   'source-branch': 1,
   'integration-pr': 2,
@@ -3040,7 +3846,9 @@ function assertPromotionCheckpointExtends(
   }
   if (previous.kind === 'followup-pr' && next.kind === 'followup-pr'
     && (previous.followupPullRequestNumber !== next.followupPullRequestNumber
-      || previous.followupPullRequestUrl !== next.followupPullRequestUrl)) {
+      || previous.followupPullRequestUrl !== next.followupPullRequestUrl
+      || (previous.followupHeadSha !== undefined
+        && previous.followupHeadSha !== next.followupHeadSha))) {
     throw new Error('GitHub promotion follow-up PR checkpoint conflicts')
   }
 }
@@ -7408,6 +8216,7 @@ export class JobStore {
         [sessionId, resumed ? 1 : 0, claimingWorkerId, claimAt, row.id],
       )
       if (update.changes !== 1) return null
+      ensurePublicationContinuationBindingBestEffort(this.db, row, claimAt)
       // Queue and host-side rate-limit notices are useful only while this job
       // is waiting. If delivery lagged behind the claim, retire them before
       // execution can resume.
@@ -7477,6 +8286,12 @@ export class JobStore {
         [persistedSessionId, result, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer running: ' + id)
+      tryActivatePublicationContinuationArchive(
+        this.db,
+        id,
+        finishedAt,
+        'job completion',
+      )
       this.db.run(
         `UPDATE ui_approval_requests SET status = 'superseded'
          WHERE job_id = ? AND status IN ('publishing', 'awaiting', 'responded')`,
@@ -7627,7 +8442,7 @@ export class JobStore {
               const storedPlan = publicationPlanFromRow(entry)
               if (entry.status !== 'completed' || entry.pull_request_number === null
                 || entry.pull_request_url === null
-                || (storedPlan.promotion
+                || (publicationPlanExpectsFollowupReceipt(storedPlan)
                   ? entry.followup_pull_request_number === null
                     || entry.followup_pull_request_url === null
                   : entry.followup_pull_request_number !== null
@@ -7776,7 +8591,13 @@ export class JobStore {
       assertPromotionCheckpointExtends(previous, checkpoint)
       if (nextRank === previousRank) {
         if (existing.checkpoint_json === serialized) return
-        throw new Error(`GitHub promotion checkpoint conflicts for job ${jobId}`)
+        const enrichesLegacyFollowup = previous.kind === 'followup-pr'
+          && checkpoint.kind === 'followup-pr'
+          && previous.followupHeadSha === undefined
+          && checkpoint.followupHeadSha !== undefined
+        if (!enrichesLegacyFollowup) {
+          throw new Error(`GitHub promotion checkpoint conflicts for job ${jobId}`)
+        }
       }
       const updated = this.db.run(
         `UPDATE github_promotion_progress
@@ -8069,7 +8890,7 @@ export class JobStore {
       || receipt.pullRequestNumber <= 0
       || receipt.pullRequestUrl.toLowerCase()
         !== `https://github.com/${plan.repositorySlug}/pull/${receipt.pullRequestNumber}`.toLowerCase()
-      || (plan.promotion
+      || (publicationPlanExpectsFollowupReceipt(plan)
         ? !Number.isSafeInteger(receipt.followupPullRequestNumber)
           || receipt.followupPullRequestNumber! <= 0
           || receipt.followupPullRequestUrl?.toLowerCase()
@@ -8112,7 +8933,7 @@ export class JobStore {
       const plan = publicationPlanFromRow(row)
       if (row.status !== 'completed' || row.pull_request_number === null
         || row.pull_request_url === null
-        || (plan.promotion
+        || (publicationPlanExpectsFollowupReceipt(plan)
           ? row.followup_pull_request_number === null || row.followup_pull_request_url === null
           : row.followup_pull_request_number !== null || row.followup_pull_request_url !== null)) {
         throw new Error(`GitHub publication is incomplete for job ${jobId}`)
@@ -8136,16 +8957,52 @@ export class JobStore {
     })
   }
 
+  /**
+   * Return the immutable same-thread publication checkpoints that were bound
+   * when this job was first claimed. A corrupt binding is deliberately treated
+   * as unavailable; the executor then performs the ordinary Codex workflow
+   * instead of silently adopting a newer checkpoint.
+   */
+  githubPublicationContinuation(
+    jobId: string,
+  ): GitHubPublicationContinuationBundle | undefined {
+    const row = this.db.query<GitHubPublicationContinuationBindingRow, [string]>(
+      'SELECT * FROM job_github_publication_continuations WHERE job_id = ?',
+    ).get(jobId)
+    if (!row) return undefined
+    try {
+      return parsePublicationContinuationBindingRow(row)
+    } catch {
+      return undefined
+    }
+  }
+
   completeGitHubPublicationSet(jobId: string): boolean {
     const complete = this.db.transaction(() => {
       const set = this.db.query<{
         status: 'pending' | 'completed'
         plan_count: number
+        completed_at: number | null
       }, [string]>(
-        'SELECT status, plan_count FROM github_publication_sets WHERE job_id = ?',
+        'SELECT status, plan_count, completed_at FROM github_publication_sets WHERE job_id = ?',
       ).get(jobId)
       if (!set) return false
-      if (set.status === 'completed') return false
+      if (set.status === 'completed') {
+        const transition = tryMaterializeCompletedPublicationContinuationArchive(
+          this.db,
+          jobId,
+          'completed publication replay',
+        )
+        if (transition !== null) {
+          tryRecordCompletedPublicationContinuationConsumptions(
+            this.db,
+            jobId,
+            set.completed_at ?? Date.now(),
+            'completed publication consumption replay',
+          )
+        }
+        return false
+      }
       const pending = githubPublicationRows(this.db, jobId)
         .filter(row => row.status !== 'completed').length
       if (pending !== 0) throw new Error(`GitHub publication is still pending for job ${jobId}`)
@@ -8168,11 +9025,25 @@ export class JobStore {
       if (updated.changes !== 1) {
         throw new Error(`GitHub publication result checkpoint conflicts for job ${jobId}`)
       }
+      const completedAt = Date.now()
       this.db.run(
         `UPDATE github_publication_sets SET status = 'completed', completed_at = ?
          WHERE job_id = ? AND status = 'pending'`,
-        [Date.now(), jobId],
+        [completedAt, jobId],
       )
+      const transition = tryMaterializeCompletedPublicationContinuationArchive(
+        this.db,
+        jobId,
+        'publication completion',
+      )
+      if (transition !== null) {
+        tryRecordCompletedPublicationContinuationConsumptions(
+          this.db,
+          jobId,
+          completedAt,
+          'publication continuation consumption',
+        )
+      }
       return true
     })
     return retrySqlite(() => complete.immediate())
@@ -9979,8 +10850,9 @@ export class JobStore {
         write_enabled: number
         attachments_json: string
         finished_at: number
+        status: 'completed' | 'failed'
       }, [number]>(
-        `SELECT id, idempotency_key, write_enabled, attachments_json, finished_at
+        `SELECT id, idempotency_key, write_enabled, attachments_json, finished_at, status
          FROM jobs AS j
          WHERE status IN ('completed', 'failed') AND finished_at IS NOT NULL AND finished_at < ?
            AND NOT EXISTS (
@@ -10009,9 +10881,42 @@ export class JobStore {
              WHERE a.job_id = j.id AND a.delivered_at IS NULL AND a.abandoned_at IS NULL
            )`,
       ).all(cutoff)
+      const prunedCandidates: typeof candidates = []
       const prunedInterjectionAttachments: string[] = []
       for (const row of candidates) {
         materializeSettledThreadHistoryJob(this.db, row.id)
+        if (row.status === 'completed'
+          && hasUnresolvedLegacyFollowupContinuation(this.db, row.id)) {
+          // Pre-upgrade follow-up checkpoints did not persist the exact PR head
+          // SHA. Never invent it from the earlier integration merge, and keep
+          // this finite legacy source until a later exact reconciliation can
+          // enrich the checkpoint. New checkpoints always contain the SHA.
+          continue
+        }
+        // Defensive lazy materialization covers an upgrade/crash boundary in
+        // which the source job predates the archive migration.
+        tryMaterializeCompletedPublicationContinuationArchive(
+          this.db,
+          row.id,
+          'job retention',
+        )
+        if (row.status === 'completed') {
+          tryActivatePublicationContinuationArchive(
+            this.db,
+            row.id,
+            row.finished_at,
+            'job retention activation',
+          )
+        } else {
+          // A failed source never became an authoritative completed workflow.
+          // Remove any pre-terminal archive before the FK-free source row is
+          // collected so it cannot become an unbounded orphan.
+          this.db.run(
+            `DELETE FROM github_publication_continuation_archives
+             WHERE source_job_id = ? AND eligible_at IS NULL`,
+            [row.id],
+          )
+        }
         this.db.run(
           `INSERT INTO delivery_tombstones (idempotency_key, write_enabled, completed_at)
            VALUES (?, ?, ?)
@@ -10086,6 +10991,7 @@ export class JobStore {
         this.db.run('DELETE FROM job_phase_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_initial_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM jobs WHERE id = ?', [row.id])
+        prunedCandidates.push(row)
       }
       // Thread ownership is a security boundary: restarting zerochan from a
       // different project must never retarget an already-adopted Slack thread.
@@ -10109,7 +11015,7 @@ export class JobStore {
         'SELECT attachments_json FROM job_interjections',
       ).all()
       return {
-        candidates,
+        candidates: prunedCandidates,
         prunedInterjectionAttachments,
         threads,
         tombstones,
@@ -11401,9 +12307,13 @@ export async function publishStagedGitHubPublication(
                 `GitHub publication remains staged for job ${jobId} after shutdown interruption`,
               )
             }
-            // The final follow-up PR is the plan's terminal remote mutation. Let
-            // the caller persist the complete receipt before honoring cancel.
-            if (progress.kind !== 'followup-pr') assertNotCancelled()
+            // A follow-up PR, or the exact merge of a terminal archived PR, is
+            // the plan's final remote mutation. Persist the complete receipt
+            // before honoring a cancellation observed at that boundary.
+            const terminalCheckpoint = progress.kind === 'followup-pr'
+              || (work.plan.promotion?.followupBaseBranch === null
+                && progress.kind === 'integration-merged')
+            if (!terminalCheckpoint) assertNotCancelled()
           }
         : undefined
       // Every mutation is reconciled first. Promotion substeps are then stored
@@ -11490,7 +12400,22 @@ export async function publishStagedGitHubPublication(
         `GitHub publication receipt remains staged for job ${jobId}: ${error}`,
       )
     }
-    assertNotCancelled()
+    if (store.get(jobId)?.cancelRequestedAt !== null) {
+      // The last irreversible GitHub operation completed before the cancel was
+      // observed.  If every plan now has a durable receipt, seal the
+      // publication set (and its next exact checkpoint) before terminalizing
+      // the user's cancellation.  This never performs another remote action.
+      let remaining: PendingGitHubPublication[]
+      try {
+        remaining = store.pendingGitHubPublications(jobId)
+        if (remaining.length === 0) store.completeGitHubPublicationSet(jobId)
+      } catch (error) {
+        throw new CodexResultPersistencePendingError(
+          `GitHub publication completed before cancellation but its continuation remains staged for job ${jobId}: ${error}`,
+        )
+      }
+      throw new CodexUserCancelledError()
+    }
     try {
       await options.onStatus?.(
         `GitHub公開を確認しました: ${receipt.repositorySlug} #${receipt.pullRequestNumber}`,
@@ -16303,6 +17228,7 @@ async function runCli(): Promise<void> {
             logDir: join(dir, 'job-logs'),
             uiApproval: store.latestUiApprovalContext(job.id),
             threadHistory: store.threadHistorySnapshot(job.id, job.attempts),
+            publicationContinuation: store.githubPublicationContinuation(job.id),
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId),
             onSessionReset: () => store.clearSession(job.id),

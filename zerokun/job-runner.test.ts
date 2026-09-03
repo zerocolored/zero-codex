@@ -186,6 +186,28 @@ function promotionFixturePlan(root: string): GitHubPublicationPlan {
   }
 }
 
+function ordinaryPublicationFixturePlan(
+  root: string,
+  repositorySlug = 'zerocolored/fixture-continuation',
+): GitHubPublicationPlan {
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex')
+  const commitSha = git(['rev-parse', 'HEAD'], root)
+  return {
+    version: 1,
+    gitRoot: root,
+    repositorySlug,
+    canonicalUrl: `https://github.com/${repositorySlug}.git`,
+    baseBranch: 'develop',
+    headBranch: 'zerochan/reviewed-checkpoint',
+    commitSha,
+    initialHead: commitSha,
+    statusDigest: digest('status'),
+    localConfigDigest: digest('config'),
+    originUrlDigest: digest('origin'),
+    title: 'feat: durable continuation fixture',
+  }
+}
+
 function completeFixtureJob(
   store: JobStore,
   job: JobRecord,
@@ -478,6 +500,584 @@ describe('host-enforced App Server permission phases', () => {
 })
 
 describe('Codex job store', () => {
+  test('完了済みPR checkpointはsource job削除とcold start後も同threadの次jobへ固定される', () => {
+    const state = fixtureDir('zero-publication-continuation-store-')
+    const repo = join(state, 'project')
+    mkdirSync(repo)
+    git(['init', '--initial-branch=develop'], repo)
+    git(['config', 'user.email', 'zero@example.invalid'], repo)
+    git(['config', 'user.name', 'Zero Test'], repo)
+    writeFileSync(join(repo, 'README.md'), 'fixture\n')
+    git(['add', 'README.md'], repo)
+    git(['commit', '-m', 'chore: initial'], repo)
+    git(['switch', '-c', 'zerochan/reviewed-checkpoint'], repo)
+    writeFileSync(join(repo, 'reviewed.txt'), 'reviewed\n')
+    git(['add', 'reviewed.txt'], repo)
+    git(['commit', '-m', 'feat: reviewed checkpoint'], repo)
+    git([
+      'remote', 'add', 'origin',
+      'https://github.com/zerocolored/fixture-continuation.git',
+    ], repo)
+
+    let store = new JobStore(join(state, 'jobs.sqlite3'))
+    const source = store.enqueue(input({
+      chatId: 'C-CONTINUATION',
+      threadTs: '1800000000.000777',
+      messageId: '1800000000.000777',
+      repoPath: repo,
+      task: '実装してPRを作成してください',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('source-worker')!
+    const advisorInput = readAdvisorInputSnapshot(state, running.id)
+    const plan = ordinaryPublicationFixturePlan(repo)
+    const publication: GitHubPublicationSet = {
+      version: 1,
+      jobId: running.id,
+      jobAttempt: running.attempts,
+      logicalNonce: '1'.repeat(32),
+      inputRevision: advisorInput.revision,
+      inputDigest: advisorInput.digest,
+      reviewRound: 1,
+      reviewedRepositoryDigest: createHash('sha256').update('review').digest('hex'),
+      baselineDigest: createHash('sha256').update('baseline').digest('hex'),
+      plans: [plan],
+    }
+    store.ensureExecutionResultStaged(
+      running.id,
+      'thread-publication-continuation',
+      '実装とレビューが完了しました。',
+      publication,
+    )
+    store.recordGitHubPublicationReceipt(running.id, plan, {
+      repositorySlug: plan.repositorySlug,
+      baseBranch: plan.baseBranch,
+      headBranch: plan.headBranch,
+      commitSha: plan.commitSha,
+      pullRequestNumber: 861,
+      pullRequestUrl: 'https://github.com/zerocolored/fixture-continuation/pull/861',
+    })
+    expect(store.completeGitHubPublicationSet(running.id)).toBe(true)
+    store.completeStagedExecution(running.id)
+    expect(store.get(source.id)?.status).toBe('completed')
+    const terminal = store.pendingTerminalNotifications()[0]!
+    store.markTerminalNotificationDelivered(terminal.id)
+    expect(store.pruneSettled({
+      stateDir: state,
+      now: Date.now() + 10_000,
+      retentionMs: 1,
+      tombstoneRetentionMs: 60_000,
+    }).jobs).toBe(1)
+    expect(store.get(source.id)).toBeNull()
+    store.close()
+
+    // A process restart and deleted source job must not erase continuation.
+    store = new JobStore(join(state, 'jobs.sqlite3'))
+    const target = store.enqueue(input({
+      chatId: 'C-CONTINUATION',
+      threadTs: '1800000000.000777',
+      messageId: '1800000000.000778',
+      repoPath: repo,
+      task: 'ではdevelopへマージし、main向けPRを作ってください',
+      writeEnabled: true,
+    })).job
+    const claimed = store.claimNext('target-worker')!
+    expect(claimed.id).toBe(target.id)
+    expect(claimed.sessionId).toBeNull()
+    const bundle = store.githubPublicationContinuation(target.id)
+    expect(bundle).toMatchObject({
+      targetJobId: target.id,
+      targetJobSeq: target.seq,
+      chatId: target.chatId,
+      threadTs: target.threadTs,
+      repoPath: repo,
+      omittedCandidateCount: 0,
+      candidates: [{
+        archive: {
+          sourceJobId: source.id,
+          sourceJobSeq: source.seq,
+          entries: [{
+            plan: {
+              repositorySlug: 'zerocolored/fixture-continuation',
+              headBranch: 'zerochan/reviewed-checkpoint',
+              commitSha: plan.commitSha,
+            },
+            receipt: { pullRequestNumber: 861 },
+          }],
+        },
+      }],
+    })
+    const boundSnapshot = JSON.parse(JSON.stringify(bundle))
+    const db = new Database(store.dbPath)
+    db.run(
+      'DELETE FROM github_publication_continuation_archives WHERE source_job_id = ?',
+      [source.id],
+    )
+    db.close()
+    expect(store.githubPublicationContinuation(target.id)).toEqual(boundSnapshot)
+    store.close()
+  })
+
+  test('promotion直後のlate cancelとsource削除を越えてrelease PRをexact mergeへ引き継ぐ', () => {
+    const state = fixtureDir('zero-publication-continuation-chain-')
+    const repo = join(state, 'project')
+    mkdirSync(repo)
+    git(['init', '--initial-branch=develop'], repo)
+    git(['config', 'user.email', 'zero@example.invalid'], repo)
+    git(['config', 'user.name', 'Zero Test'], repo)
+    writeFileSync(join(repo, 'README.md'), 'fixture\n')
+    git(['add', 'README.md'], repo)
+    git(['commit', '-m', 'chore: initial'], repo)
+    git(['switch', '-c', 'zerochan/reviewed-checkpoint'], repo)
+    writeFileSync(join(repo, 'reviewed.txt'), 'reviewed\n')
+    git(['add', 'reviewed.txt'], repo)
+    git(['commit', '-m', 'feat: reviewed checkpoint'], repo)
+    git([
+      'remote', 'add', 'origin',
+      'https://github.com/zerocolored/fixture-continuation.git',
+    ], repo)
+
+    let store = new JobStore(join(state, 'jobs.sqlite3'))
+    const source = store.enqueue(input({
+      chatId: 'C-CONTINUATION-CHAIN',
+      threadTs: '1800000000.000977',
+      messageId: '1800000000.000977',
+      repoPath: repo,
+      task: '実装してfeature PRを作成してください',
+      writeEnabled: true,
+    })).job
+    const sourceRunning = store.claimNext('source-worker')!
+    const sourceInput = readAdvisorInputSnapshot(state, sourceRunning.id)
+    const sourcePlan = ordinaryPublicationFixturePlan(repo)
+    store.ensureExecutionResultStaged(
+      sourceRunning.id,
+      'thread-publication-chain-source',
+      'feature PRを作成しました。',
+      {
+        version: 1,
+        jobId: sourceRunning.id,
+        jobAttempt: sourceRunning.attempts,
+        logicalNonce: '3'.repeat(32),
+        inputRevision: sourceInput.revision,
+        inputDigest: sourceInput.digest,
+        reviewRound: 1,
+        reviewedRepositoryDigest: createHash('sha256').update('source-review').digest('hex'),
+        baselineDigest: createHash('sha256').update('source-baseline').digest('hex'),
+        plans: [sourcePlan],
+      },
+    )
+    store.recordGitHubPublicationReceipt(sourceRunning.id, sourcePlan, {
+      repositorySlug: sourcePlan.repositorySlug,
+      baseBranch: sourcePlan.baseBranch,
+      headBranch: sourcePlan.headBranch,
+      commitSha: sourcePlan.commitSha,
+      pullRequestNumber: 861,
+      pullRequestUrl: 'https://github.com/zerocolored/fixture-continuation/pull/861',
+    })
+    expect(store.completeGitHubPublicationSet(sourceRunning.id)).toBe(true)
+    store.completeStagedExecution(sourceRunning.id)
+
+    const promotion = store.enqueue(input({
+      chatId: source.chatId,
+      threadTs: source.threadTs,
+      messageId: '1800000000.000978',
+      repoPath: repo,
+      task: 'feature PRをdevelopへmergeし、main向けrelease PRを作成してください',
+      writeEnabled: true,
+    })).job
+    const promotionRunning = store.claimNext('promotion-worker')!
+    const promotionInput = readAdvisorInputSnapshot(state, promotionRunning.id)
+    const promotionPlan: GitHubPublicationPlan = {
+      ...sourcePlan,
+      promotion: {
+        version: 1,
+        sourceBranch: sourcePlan.headBranch,
+        sourceHead: sourcePlan.commitSha,
+        followupBaseBranch: 'main',
+        followupInitialHead: 'c'.repeat(40),
+        expectedIntegrationPullRequestNumber: 861,
+        waitForChecks: true,
+        integrationPullRequestBody: 'Integrate the reviewed change.',
+        followupPullRequestBody: 'Release the integrated change.',
+        closePullRequestNumbers: [],
+      },
+    }
+    store.ensureExecutionResultStaged(
+      promotionRunning.id,
+      'thread-publication-chain-promotion',
+      'developへmergeし、release PRを作成しました。',
+      {
+        version: 1,
+        jobId: promotionRunning.id,
+        jobAttempt: promotionRunning.attempts,
+        logicalNonce: '4'.repeat(32),
+        inputRevision: promotionInput.revision,
+        inputDigest: promotionInput.digest,
+        reviewRound: 1,
+        reviewedRepositoryDigest: createHash('sha256').update('promotion-review').digest('hex'),
+        baselineDigest: createHash('sha256').update('promotion-baseline').digest('hex'),
+        plans: [promotionPlan],
+      },
+    )
+    const integrationMergeHead = 'd'.repeat(40)
+    // Deliberately differs from the integration merge receipt: develop may
+    // advance compatibly before the release PR is created, and the exact PR
+    // head—not the earlier merge SHA—must become the next authority.
+    const releaseHead = 'e'.repeat(40)
+    store.recordGitHubPromotionCheckpoint(promotionRunning.id, promotionPlan, {
+      version: 1,
+      kind: 'followup-pr',
+      pullRequestNumber: 861,
+      pullRequestUrl: 'https://github.com/zerocolored/fixture-continuation/pull/861',
+      mergeCommitSha: integrationMergeHead,
+      followupHeadSha: releaseHead,
+      followupPullRequestNumber: 862,
+      followupPullRequestUrl: 'https://github.com/zerocolored/fixture-continuation/pull/862',
+    })
+    store.recordGitHubPublicationReceipt(promotionRunning.id, promotionPlan, {
+      repositorySlug: promotionPlan.repositorySlug,
+      baseBranch: promotionPlan.baseBranch,
+      headBranch: promotionPlan.headBranch,
+      commitSha: promotionPlan.commitSha,
+      pullRequestNumber: 861,
+      pullRequestUrl: 'https://github.com/zerocolored/fixture-continuation/pull/861',
+      followupPullRequestNumber: 862,
+      followupPullRequestUrl: 'https://github.com/zerocolored/fixture-continuation/pull/862',
+    })
+    expect(store.completeGitHubPublicationSet(promotionRunning.id)).toBe(true)
+    const cancelTarget = store.liveControlTarget(
+      promotionRunning.chatId,
+      promotionRunning.threadTs,
+    )!
+    expect(store.stageLiveControl(cancelTarget, {
+      chatId: promotionRunning.chatId,
+      threadTs: promotionRunning.threadTs,
+      messageId: '1800000000.000978-cancel',
+      userId: promotionRunning.userId,
+      task: 'ここで中止',
+      kind: 'interrupt',
+    })).toBe('staged')
+    store.cancel(promotionRunning.id)
+    expect(store.get(promotionRunning.id)).toMatchObject({
+      status: 'failed',
+      terminalOutcome: 'cancelled',
+    })
+
+    for (const terminal of store.pendingTerminalNotifications()) {
+      store.markTerminalNotificationDelivered(terminal.id)
+    }
+    expect(store.pruneSettled({
+      stateDir: state,
+      now: Date.now() + 10_000,
+      retentionMs: 1,
+      tombstoneRetentionMs: 60_000,
+    }).jobs).toBe(2)
+    expect(store.get(source.id)).toBeNull()
+    expect(store.get(promotion.id)).toBeNull()
+    store.close()
+
+    store = new JobStore(join(state, 'jobs.sqlite3'))
+    const terminal = store.enqueue(input({
+      chatId: source.chatId,
+      threadTs: source.threadTs,
+      messageId: '1800000000.000979',
+      repoPath: repo,
+      task: 'release PRをmainへmergeしてデプロイしてください',
+      writeEnabled: true,
+    })).job
+    const terminalRunning = store.claimNext('terminal-worker')!
+    expect(terminalRunning.id).toBe(terminal.id)
+    const bundle = store.githubPublicationContinuation(terminal.id)
+    expect(bundle?.candidates).toHaveLength(1)
+    expect(bundle?.candidates[0]).toMatchObject({
+      archive: {
+        sourceJobId: promotion.id,
+        entries: [{
+          plan: {
+            repositorySlug: sourcePlan.repositorySlug,
+            baseBranch: 'main',
+            headBranch: 'develop',
+            commitSha: releaseHead,
+            initialHead: 'c'.repeat(40),
+          },
+          receipt: {
+            pullRequestNumber: 862,
+            pullRequestUrl: 'https://github.com/zerocolored/fixture-continuation/pull/862',
+          },
+        }],
+      },
+    })
+    expect(bundle?.omittedCandidateCount).toBe(0)
+
+    const releaseEntry = bundle!.candidates[0]!.archive.entries[0]!
+    const terminalPlan: GitHubPublicationPlan = {
+      ...releaseEntry.plan,
+      gitRoot: repo,
+      promotion: {
+        version: 1,
+        sourceBranch: releaseEntry.plan.headBranch,
+        sourceHead: releaseEntry.plan.commitSha,
+        followupBaseBranch: null,
+        followupInitialHead: null,
+        expectedIntegrationPullRequestNumber: 862,
+        waitForChecks: true,
+        integrationPullRequestBody: 'Merge the reviewed release.',
+        followupPullRequestBody: 'No follow-up PR is requested.',
+        closePullRequestNumbers: [],
+      },
+    }
+    const terminalInput = readAdvisorInputSnapshot(state, terminalRunning.id)
+    store.ensureExecutionResultStaged(
+      terminalRunning.id,
+      'thread-publication-chain-terminal',
+      'release PRをmainへmergeしました。',
+      {
+        version: 1,
+        jobId: terminalRunning.id,
+        jobAttempt: terminalRunning.attempts,
+        logicalNonce: '5'.repeat(32),
+        inputRevision: terminalInput.revision,
+        inputDigest: terminalInput.digest,
+        reviewRound: 1,
+        reviewedRepositoryDigest: createHash('sha256').update('terminal-review').digest('hex'),
+        baselineDigest: createHash('sha256').update('terminal-baseline').digest('hex'),
+        plans: [terminalPlan],
+      },
+    )
+    store.recordGitHubPromotionCheckpoint(terminalRunning.id, terminalPlan, {
+      version: 1,
+      kind: 'integration-merged',
+      pullRequestNumber: 862,
+      pullRequestUrl: 'https://github.com/zerocolored/fixture-continuation/pull/862',
+      mergeCommitSha: 'f'.repeat(40),
+    })
+    store.recordGitHubPublicationReceipt(terminalRunning.id, terminalPlan, {
+      repositorySlug: terminalPlan.repositorySlug,
+      baseBranch: terminalPlan.baseBranch,
+      headBranch: terminalPlan.headBranch,
+      commitSha: terminalPlan.commitSha,
+      pullRequestNumber: 862,
+      pullRequestUrl: 'https://github.com/zerocolored/fixture-continuation/pull/862',
+    })
+    expect(store.completeGitHubPublicationSet(terminalRunning.id)).toBe(true)
+    store.completeStagedExecution(terminalRunning.id)
+
+    const afterTerminal = store.enqueue(input({
+      chatId: source.chatId,
+      threadTs: source.threadTs,
+      messageId: '1800000000.000980',
+      repoPath: repo,
+      task: '次の作業状況を教えてください',
+      writeEnabled: true,
+    })).job
+    expect(store.claimNext('after-terminal-worker')?.id).toBe(afterTerminal.id)
+    expect(store.githubPublicationContinuation(afterTerminal.id)).toMatchObject({
+      omittedCandidateCount: 0,
+      candidates: [],
+    })
+    store.close()
+  })
+
+  test('旧follow-up checkpointはexact head未確定のまま削除せず後から安全に継続化できる', () => {
+    const state = fixtureDir('zero-publication-continuation-legacy-head-')
+    const repo = join(state, 'project')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const queued = store.enqueue(input({
+      chatId: 'C-CONTINUATION-LEGACY',
+      threadTs: '1800000000.001100',
+      messageId: '1800000000.001100',
+      repoPath: repo,
+      task: 'developへmergeしてrelease PRを作成してください',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('legacy-continuation-worker')!
+    const advisorInput = readAdvisorInputSnapshot(state, running.id)
+    const plan = promotionFixturePlan(repo)
+    store.ensureExecutionResultStaged(
+      running.id,
+      'thread-publication-legacy-head',
+      'release PRを作成しました。',
+      {
+        version: 1,
+        jobId: running.id,
+        jobAttempt: running.attempts,
+        logicalNonce: '6'.repeat(32),
+        inputRevision: advisorInput.revision,
+        inputDigest: advisorInput.digest,
+        reviewRound: 1,
+        reviewedRepositoryDigest: createHash('sha256').update('legacy-review').digest('hex'),
+        baselineDigest: createHash('sha256').update('legacy-baseline').digest('hex'),
+        plans: [plan],
+      },
+    )
+    const legacyCheckpoint = {
+      version: 1 as const,
+      kind: 'followup-pr' as const,
+      pullRequestNumber: 861,
+      pullRequestUrl: 'https://github.com/zerocolored/fixture/pull/861',
+      mergeCommitSha: 'd'.repeat(40),
+      followupPullRequestNumber: 862,
+      followupPullRequestUrl: 'https://github.com/zerocolored/fixture/pull/862',
+    }
+    store.recordGitHubPromotionCheckpoint(running.id, plan, legacyCheckpoint)
+    store.recordGitHubPublicationReceipt(running.id, plan, {
+      repositorySlug: plan.repositorySlug,
+      baseBranch: plan.baseBranch,
+      headBranch: plan.headBranch,
+      commitSha: plan.commitSha,
+      pullRequestNumber: 861,
+      pullRequestUrl: legacyCheckpoint.pullRequestUrl,
+      followupPullRequestNumber: 862,
+      followupPullRequestUrl: legacyCheckpoint.followupPullRequestUrl,
+    })
+    expect(store.completeGitHubPublicationSet(running.id)).toBe(true)
+    store.completeStagedExecution(running.id)
+    for (const terminal of store.pendingTerminalNotifications()) {
+      store.markTerminalNotificationDelivered(terminal.id)
+    }
+
+    const retention = {
+      stateDir: state,
+      now: Date.now() + 10_000,
+      retentionMs: 1,
+      tombstoneRetentionMs: 60_000,
+    }
+    expect(store.pruneSettled(retention).jobs).toBe(0)
+    expect(store.get(queued.id)).not.toBeNull()
+
+    const releaseHead = 'e'.repeat(40)
+    store.recordGitHubPromotionCheckpoint(running.id, plan, {
+      ...legacyCheckpoint,
+      followupHeadSha: releaseHead,
+    })
+    expect(store.completeGitHubPublicationSet(running.id)).toBe(false)
+    expect(store.pruneSettled({ ...retention, now: retention.now + 1 }).jobs).toBe(1)
+    expect(store.get(queued.id)).toBeNull()
+
+    const followup = store.enqueue(input({
+      chatId: queued.chatId,
+      threadTs: queued.threadTs,
+      messageId: '1800000000.001101',
+      repoPath: repo,
+      task: 'release PRをmainへmergeしてください',
+      writeEnabled: true,
+    })).job
+    expect(store.claimNext('legacy-continuation-followup')?.id).toBe(followup.id)
+    expect(store.githubPublicationContinuation(followup.id)?.candidates[0]).toMatchObject({
+      archive: {
+        sourceJobId: queued.id,
+        entries: [{
+          plan: { baseBranch: 'main', headBranch: 'develop', commitSha: releaseHead },
+          receipt: { pullRequestNumber: 862 },
+        }],
+      },
+    })
+    store.close()
+  })
+
+  test('破損したcontinuation archiveは起動・job完了・次job claimを止めない', () => {
+    const state = fixtureDir('zero-publication-continuation-corrupt-')
+    const repo = join(state, 'project')
+    mkdirSync(repo)
+    git(['init', '--initial-branch=develop'], repo)
+    git(['config', 'user.email', 'zero@example.invalid'], repo)
+    git(['config', 'user.name', 'Zero Test'], repo)
+    writeFileSync(join(repo, 'README.md'), 'fixture\n')
+    git(['add', 'README.md'], repo)
+    git(['commit', '-m', 'chore: initial'], repo)
+    git(['switch', '-c', 'zerochan/reviewed-checkpoint'], repo)
+    git([
+      'remote', 'add', 'origin',
+      'https://github.com/zerocolored/fixture-continuation-corrupt.git',
+    ], repo)
+
+    let store = new JobStore(join(state, 'jobs.sqlite3'))
+    const source = store.enqueue(input({
+      chatId: 'C-CORRUPT-CONTINUATION',
+      threadTs: '1800000000.000887',
+      messageId: '1800000000.000887',
+      repoPath: repo,
+      task: '実装してPRを作成してください',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('source-worker')!
+    const advisorInput = readAdvisorInputSnapshot(state, running.id)
+    const plan = ordinaryPublicationFixturePlan(
+      repo,
+      'zerocolored/fixture-continuation-corrupt',
+    )
+    store.ensureExecutionResultStaged(
+      running.id,
+      'thread-publication-corrupt',
+      '実装とレビューが完了しました。',
+      {
+        version: 1,
+        jobId: running.id,
+        jobAttempt: running.attempts,
+        logicalNonce: '2'.repeat(32),
+        inputRevision: advisorInput.revision,
+        inputDigest: advisorInput.digest,
+        reviewRound: 1,
+        reviewedRepositoryDigest: createHash('sha256').update('review').digest('hex'),
+        baselineDigest: createHash('sha256').update('baseline').digest('hex'),
+        plans: [plan],
+      },
+    )
+    store.recordGitHubPublicationReceipt(running.id, plan, {
+      repositorySlug: plan.repositorySlug,
+      baseBranch: plan.baseBranch,
+      headBranch: plan.headBranch,
+      commitSha: plan.commitSha,
+      pullRequestNumber: 871,
+      pullRequestUrl:
+        'https://github.com/zerocolored/fixture-continuation-corrupt/pull/871',
+    })
+    expect(store.completeGitHubPublicationSet(running.id)).toBe(true)
+    let db = new Database(store.dbPath)
+    db.run(
+      `UPDATE github_publication_continuation_archives
+       SET archive_json = '{}', archive_digest = ? WHERE source_job_id = ?`,
+      ['0'.repeat(64), source.id],
+    )
+    db.close()
+
+    // The auxiliary checkpoint is damaged, but the primary completed result
+    // must still become terminal rather than wedging the FIFO.
+    expect(() => store.completeStagedExecution(running.id)).not.toThrow()
+    expect(store.get(source.id)?.status).toBe('completed')
+    db = new Database(store.dbPath)
+    db.run(
+      `UPDATE github_publication_continuation_archives SET eligible_at = ?
+       WHERE source_job_id = ?`,
+      [Date.now(), source.id],
+    )
+    db.run(
+      "DELETE FROM migration_ledger WHERE name = 'github-publication-continuation-archive-v1'",
+    )
+    db.close()
+    store.close()
+
+    // Startup migration and claim both skip the corrupt candidate. The target
+    // gets a durable empty/omitted snapshot and proceeds through normal Codex.
+    expect(() => { store = new JobStore(join(state, 'jobs.sqlite3')) }).not.toThrow()
+    const target = store.enqueue(input({
+      chatId: source.chatId,
+      threadTs: source.threadTs,
+      messageId: '1800000000.000888',
+      repoPath: repo,
+      task: '続けてください',
+      writeEnabled: true,
+    })).job
+    expect(store.claimNext('target-worker')?.id).toBe(target.id)
+    expect(store.githubPublicationContinuation(target.id)).toMatchObject({
+      targetJobId: target.id,
+      candidates: [],
+      omittedCandidateCount: 1,
+    })
+    store.close()
+  })
+
   test('session job上限は設定値にかかわらず20を超えない', () => {
     expect(configuredMaxJobsPerSession(undefined)).toBe(20)
     expect(configuredMaxJobsPerSession('5')).toBe(5)
