@@ -41,14 +41,10 @@ function installFixture(home: string): string {
     ? 'grok-macos-aarch64'
     : 'grok-macos-x86_64'
   const executable = join(downloads, officialName)
-  const source = join(home, 'fixture-grok.c')
-  writeFileSync(source, 'int main(void) { return 0; }\n', { mode: 0o600 })
-  const compiled = Bun.spawnSync(['/usr/bin/cc', '-Os', '-o', executable, source], {
-    stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
-  })
-  rmSync(source, { force: true })
-  if (compiled.exitCode !== 0) throw new Error(compiled.stderr.toString())
-  chmodSync(executable, 0o700)
+  // This fixture is inspected as an owner-only executable but is never run.
+  // Keep it process-free: an unbounded compiler subprocess can outlive Bun's
+  // per-test deadline on a loaded CI host and wedge the remainder of the suite.
+  writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
   symlinkSync(`../downloads/${officialName}`, join(bin, 'grok'))
   writeFileSync(join(grokRoot, 'auth.json'), '{"fixture":true}\n', { mode: 0o600 })
   return installGrokReviewer(home)
