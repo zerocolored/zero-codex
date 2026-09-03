@@ -36,6 +36,7 @@ import {
 } from './herdr-job-monitor.ts'
 import { processStartKey, type ProcessIdentity } from './process-generation.ts'
 import { completeUtf8PrefixLength } from './herdr-job-monitor-view.ts'
+import { atomicWritePrivateFile } from './safe-file.ts'
 
 const directories: string[] = []
 
@@ -1970,7 +1971,7 @@ describe('Herdr job monitor', () => {
       const stderrEpochPath = join(directory, 'stderr.epoch.json')
       const stderrEpoch = JSON.parse(readFileSync(stderrEpochPath, 'utf8')) as Record<string, unknown>
       stderrEpoch.sealed = true
-      writeFileSync(stderrEpochPath, `${JSON.stringify(stderrEpoch)}\n`, { mode: 0o600 })
+      atomicWritePrivateFile(stderrEpochPath, `${JSON.stringify(stderrEpoch)}\n`)
       await waitUntil(() => {
         const progress = JSON.parse(readFileSync(
           join(directory, 'progress.json'),
@@ -1986,7 +1987,7 @@ describe('Herdr job monitor', () => {
         const path = join(directory, `${kind}.epoch.json`)
         const epoch = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
         epoch.sealed = true
-        writeFileSync(path, `${JSON.stringify(epoch)}\n`, { mode: 0o600 })
+        atomicWritePrivateFile(path, `${JSON.stringify(epoch)}\n`)
       }
       await waitUntil(() => {
         const progress = JSON.parse(readFileSync(

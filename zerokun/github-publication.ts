@@ -64,8 +64,11 @@ export type GitHubPublicationPromotion = {
   version: 1
   sourceBranch: string
   sourceHead: string
-  followupBaseBranch: string
-  followupInitialHead: string
+  /** Null means merge the exact integration PR without opening another PR. */
+  followupBaseBranch: string | null
+  followupInitialHead: string | null
+  /** Exact already-published PR selected from a durable same-thread checkpoint. */
+  expectedIntegrationPullRequestNumber?: number
   waitForChecks?: boolean
   integrationPullRequestBody?: string
   followupPullRequestBody?: string
@@ -137,6 +140,8 @@ export type GitHubPromotionCheckpoint =
       pullRequestNumber: number
       pullRequestUrl: string
       mergeCommitSha: string
+      /** Exact head SHA of the follow-up PR; absent only in legacy checkpoints. */
+      followupHeadSha?: string
       followupPullRequestNumber: number
       followupPullRequestUrl: string
     }
@@ -224,6 +229,14 @@ function hasDelegatedPromotionDetails(promotion: GitHubPublicationPromotion): bo
 }
 
 function assertDelegatedPromotionDetails(promotion: GitHubPublicationPromotion): void {
+  if (promotion.expectedIntegrationPullRequestNumber !== undefined
+    && (!Number.isSafeInteger(promotion.expectedIntegrationPullRequestNumber)
+      || promotion.expectedIntegrationPullRequestNumber <= 0)) {
+    throw new GitHubPublicationError(
+      'configuration',
+      'expected GitHub integration PR number is invalid',
+    )
+  }
   if (!hasDelegatedPromotionDetails(promotion)) return
   const closeNumbers = promotion.closePullRequestNumbers
   if (typeof promotion.waitForChecks !== 'boolean'
@@ -323,6 +336,11 @@ function repositoryIdentity(repoInput: string): {
     throw new GitHubPublicationError('configuration', 'publication repository root changed')
   }
   return { gitRoot, config: localConfig(gitRoot) }
+}
+
+/** Read-only public identity used to bind a durable archive to a current checkout. */
+export function githubRepositoryIdentity(repoInput: string): GitHubRepositoryIdentity {
+  return repositoryIdentity(repoInput).config.origin
 }
 
 function repositoryStatusDigest(gitRoot: string): string {
@@ -764,6 +782,103 @@ export async function prepareGitHubPromotionPlans(
   return plans
 }
 
+export type ArchivedGitHubPromotionBinding = {
+  plan: GitHubPublicationPlan
+  gitRoot: string
+  expectedIntegrationPullRequestNumber: number
+  followupBaseBranch: string | null
+  waitForChecks: boolean
+  integrationPullRequestBody: string
+  followupPullRequestBody: string
+  closePullRequestNumbers: number[]
+}
+
+/**
+ * Resume a completed ordinary publication as a promotion without depending on
+ * the old process, checkout branch, or retained job row. The archived PR
+ * number, head branch, and commit remain authoritative; only the current
+ * follow-up branch head is observed here.
+ */
+export async function prepareArchivedGitHubPromotionPlans(
+  bindings: readonly ArchivedGitHubPromotionBinding[],
+  commands: GitHubPublicationCommands,
+  signal?: AbortSignal,
+): Promise<GitHubPublicationPlan[]> {
+  if (bindings.length === 0 || bindings.length > MAX_GITHUB_PUBLICATION_REPOSITORIES) {
+    throw new GitHubPublicationError('configuration', 'archived promotion bindings are invalid')
+  }
+  const repositories = new Set<string>()
+  const roots = new Set<string>()
+  const plans: GitHubPublicationPlan[] = []
+  for (const binding of bindings) {
+    const archived = binding.plan
+    if (archived.promotion !== undefined) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'archived promotion source must be an ordinary publication',
+      )
+    }
+    const gitRoot = realpathSync(binding.gitRoot)
+    const identity = repositoryIdentity(gitRoot)
+    if (repositories.has(archived.repositorySlug.toLowerCase()) || roots.has(gitRoot)
+      || identity.config.origin.slug.toLowerCase() !== archived.repositorySlug.toLowerCase()
+      || identity.config.origin.canonicalUrl !== archived.canonicalUrl) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'archived promotion repository identity changed',
+      )
+    }
+    repositories.add(archived.repositorySlug.toLowerCase())
+    roots.add(gitRoot)
+    const sourceBranch = validBranch(gitRoot, archived.headBranch)
+    const baseBranch = validBranch(gitRoot, archived.baseBranch)
+    const followupBaseBranch = binding.followupBaseBranch === null
+      ? null
+      : validBranch(gitRoot, binding.followupBaseBranch)
+    if (sourceBranch === baseBranch || (followupBaseBranch !== null
+      && (sourceBranch === followupBaseBranch || baseBranch === followupBaseBranch))) {
+      throw new GitHubPublicationError('configuration', 'archived promotion branches conflict')
+    }
+    if (!Number.isSafeInteger(binding.expectedIntegrationPullRequestNumber)
+      || binding.expectedIntegrationPullRequestNumber <= 0) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'archived promotion PR identity is invalid',
+      )
+    }
+    let followupInitialHead: string | null = null
+    if (followupBaseBranch !== null) {
+      const followup = await commands.runGit(gitRoot, [
+        'ls-remote', '--heads', archived.canonicalUrl, `refs/heads/${followupBaseBranch}`,
+      ], signal)
+      if (followup.exitCode !== 0) commandFailure(followup, 'GitHub follow-up base lookup')
+      followupInitialHead = parseRemoteHead(followup.stdout, followupBaseBranch)
+      if (followupInitialHead === null) {
+        throw new GitHubPublicationError('conflict', 'GitHub follow-up base branch is unavailable')
+      }
+    }
+    const plan: GitHubPublicationPlan = {
+      ...archived,
+      gitRoot,
+      promotion: {
+        version: 1,
+        sourceBranch,
+        sourceHead: archived.commitSha,
+        followupBaseBranch,
+        followupInitialHead,
+        expectedIntegrationPullRequestNumber: binding.expectedIntegrationPullRequestNumber,
+        waitForChecks: binding.waitForChecks,
+        integrationPullRequestBody: binding.integrationPullRequestBody,
+        followupPullRequestBody: binding.followupPullRequestBody,
+        closePullRequestNumbers: [...binding.closePullRequestNumbers],
+      },
+    }
+    assertGitHubPublicationPlan(plan)
+    plans.push(plan)
+  }
+  return plans
+}
+
 function assertGitHubPublicationPlanShape(value: GitHubPublicationPlan): void {
   if (!value || value.version !== 1 || !SHA_PATTERN.test(value.commitSha)
     || !SHA_PATTERN.test(value.initialHead) || !/^[0-9a-f]{64}$/.test(value.statusDigest)
@@ -784,20 +899,26 @@ function assertGitHubPublicationPlanShape(value: GitHubPublicationPlan): void {
     if (!promotion || typeof promotion !== 'object' || promotion.version !== 1
       || typeof promotion.sourceBranch !== 'string'
       || typeof promotion.sourceHead !== 'string'
-      || typeof promotion.followupBaseBranch !== 'string'
-      || typeof promotion.followupInitialHead !== 'string'
       || !SHA_PATTERN.test(promotion.sourceHead)
       || promotion.sourceHead !== value.commitSha
-      || !SHA_PATTERN.test(promotion.followupInitialHead)
       || promotion.sourceBranch === value.baseBranch
-      || promotion.sourceBranch === promotion.followupBaseBranch
-      || promotion.followupBaseBranch === value.baseBranch
-      || promotion.followupBaseBranch === value.headBranch) {
+      || !((promotion.followupBaseBranch === null
+          && promotion.followupInitialHead === null
+          && Number.isSafeInteger(promotion.expectedIntegrationPullRequestNumber)
+          && promotion.expectedIntegrationPullRequestNumber! > 0)
+        || (typeof promotion.followupBaseBranch === 'string'
+          && typeof promotion.followupInitialHead === 'string'
+          && SHA_PATTERN.test(promotion.followupInitialHead)
+          && promotion.sourceBranch !== promotion.followupBaseBranch
+          && promotion.followupBaseBranch !== value.baseBranch
+          && promotion.followupBaseBranch !== value.headBranch))) {
       throw new GitHubPublicationError('configuration', 'publication promotion is invalid')
     }
     assertDelegatedPromotionDetails(promotion)
     validBranch(value.gitRoot, promotion.sourceBranch)
-    validBranch(value.gitRoot, promotion.followupBaseBranch)
+    if (promotion.followupBaseBranch !== null) {
+      validBranch(value.gitRoot, promotion.followupBaseBranch)
+    }
   }
 }
 
@@ -845,14 +966,20 @@ export function assertGitHubPromotionCheckpoint(
     return
   }
   if (record.kind === 'followup-pr') {
+    const keys = Object.keys(record).sort().join('\n')
+    const legacyKeys = 'followupPullRequestNumber\nfollowupPullRequestUrl\nkind\nmergeCommitSha\npullRequestNumber\npullRequestUrl\nversion'
+    const currentKeys = 'followupHeadSha\nfollowupPullRequestNumber\nfollowupPullRequestUrl\nkind\nmergeCommitSha\npullRequestNumber\npullRequestUrl\nversion'
     const followupUrl = Number.isSafeInteger(record.followupPullRequestNumber)
       && Number(record.followupPullRequestNumber) > 0
       ? `https://github.com/${plan.repositorySlug}/pull/${record.followupPullRequestNumber}`
       : null
-    if (Object.keys(record).sort().join('\n')
-        !== 'followupPullRequestNumber\nfollowupPullRequestUrl\nkind\nmergeCommitSha\npullRequestNumber\npullRequestUrl\nversion'
+    if ((keys !== legacyKeys && keys !== currentKeys)
       || !validIntegration || typeof record.mergeCommitSha !== 'string'
       || !SHA_PATTERN.test(record.mergeCommitSha) || followupUrl === null
+      || plan.promotion.followupBaseBranch === null
+      || plan.promotion.followupInitialHead === null
+      || (keys === currentKeys && (typeof record.followupHeadSha !== 'string'
+        || !SHA_PATTERN.test(record.followupHeadSha)))
       || typeof record.followupPullRequestUrl !== 'string'
       || record.followupPullRequestUrl.toLowerCase() !== followupUrl.toLowerCase()) {
       throw new GitHubPublicationError('configuration', 'promotion follow-up checkpoint is invalid')
@@ -865,6 +992,15 @@ export function assertGitHubPromotionCheckpoint(
 export function assertGitHubPublicationPlan(value: GitHubPublicationPlan): void {
   assertGitHubPublicationPlanShape(value)
   const state = repositoryIdentity(value.gitRoot)
+  if (value.promotion?.expectedIntegrationPullRequestNumber !== undefined) {
+    if (state.config.origin.slug.toLowerCase() !== value.repositorySlug.toLowerCase()) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'archived promotion repository identity changed',
+      )
+    }
+    return
+  }
   const implementedPromotion = value.promotion?.sourceBranch === value.headBranch
   if (value.promotion && !implementedPromotion) {
     const source = gitSync(
@@ -1285,6 +1421,31 @@ type PullRequestApiRecord = {
   base: { ref: string; repo: { full_name: string } }
 }
 
+function structurallyValidPullRequestRecord(value: unknown): PullRequestApiRecord | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const row = value as Record<string, unknown>
+  const head = row.head as Record<string, unknown> | undefined
+  const base = row.base as Record<string, unknown> | undefined
+  const headRepo = head?.repo as Record<string, unknown> | undefined
+  const baseRepo = base?.repo as Record<string, unknown> | undefined
+  if (!Number.isSafeInteger(row.number) || Number(row.number) <= 0
+    || typeof row.html_url !== 'string'
+    || !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9][0-9]*$/.test(
+      row.html_url,
+    )
+    || !row.html_url.endsWith(`/pull/${row.number}`)
+    || (row.state !== 'open' && row.state !== 'closed')
+    || (row.merged_at !== null && typeof row.merged_at !== 'string')
+    || typeof head?.ref !== 'string' || !head.ref || /[\0\r\n]/.test(head.ref)
+    || typeof head.sha !== 'string' || !SHA_PATTERN.test(head.sha)
+    || typeof base?.ref !== 'string' || !base.ref || /[\0\r\n]/.test(base.ref)
+    || typeof headRepo?.full_name !== 'string'
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(headRepo.full_name)
+    || typeof baseRepo?.full_name !== 'string'
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(baseRepo.full_name)) return null
+  return row as unknown as PullRequestApiRecord
+}
+
 async function readExactPullRequest(
   plan: GitHubPublicationPlan,
   pullRequestNumber: number,
@@ -1300,10 +1461,23 @@ async function readExactPullRequest(
   try { parsed = JSON.parse(response.stdout) } catch {
     throw new GitHubPublicationError('remote', 'GitHub PR lookup returned invalid JSON')
   }
-  const classified = classifiedPullRequestRecord(parsed, plan)
-  if (!classified || classified.record.number !== pullRequestNumber
-    || classified.kind !== 'valid') {
+  const structural = structurallyValidPullRequestRecord(parsed)
+  if (!structural || structural.number !== pullRequestNumber) {
     throw new GitHubPublicationError('remote', 'GitHub PR receipt is invalid')
+  }
+  const classified = classifiedPullRequestRecord(structural, plan)
+  if (!classified || classified.kind === 'unrelated'
+    || classified.kind === 'head-sha-mismatch') {
+    throw new GitHubPublicationError(
+      'conflict',
+      'GitHub PR identity changed from the reviewed publication checkpoint',
+    )
+  }
+  if (classified.kind === 'closed-unmerged') {
+    throw new GitHubPublicationError(
+      'conflict',
+      'GitHub publication PR was closed without being merged',
+    )
   }
   return { record: classified.record, detail: parsed as Record<string, unknown> }
 }
@@ -1436,24 +1610,24 @@ async function readPullRequestForMerge(
 function classifiedPullRequestRecord(
   value: unknown,
   plan: GitHubPublicationPlan,
-): { kind: 'valid' | 'closed-unmerged'; record: PullRequestApiRecord } | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const row = value as Record<string, unknown>
-  const head = row.head as Record<string, unknown> | undefined
-  const base = row.base as Record<string, unknown> | undefined
-  const headRepo = head?.repo as Record<string, unknown> | undefined
-  const baseRepo = base?.repo as Record<string, unknown> | undefined
-  if (!Number.isSafeInteger(row.number) || Number(row.number) <= 0
-    || typeof row.html_url !== 'string'
-    || (row.state !== 'open' && row.state !== 'closed')
-    || (row.merged_at !== null && typeof row.merged_at !== 'string')
-    || head?.ref !== plan.headBranch || head?.sha !== plan.commitSha
-    || base?.ref !== plan.baseBranch
-    || String(headRepo?.full_name ?? '').toLowerCase() !== plan.repositorySlug.toLowerCase()
-    || String(baseRepo?.full_name ?? '').toLowerCase() !== plan.repositorySlug.toLowerCase()) return null
-  const expectedUrl = `https://github.com/${plan.repositorySlug}/pull/${row.number}`
-  if (row.html_url.toLowerCase() !== expectedUrl.toLowerCase()) return null
-  const record = row as unknown as PullRequestApiRecord
+): {
+  kind: 'valid' | 'closed-unmerged' | 'head-sha-mismatch' | 'unrelated'
+  record: PullRequestApiRecord
+} | null {
+  const record = structurallyValidPullRequestRecord(value)
+  if (!record) return null
+  const sameRepositories = record.head.repo.full_name.toLowerCase()
+      === plan.repositorySlug.toLowerCase()
+    && record.base.repo.full_name.toLowerCase() === plan.repositorySlug.toLowerCase()
+  const sameBranches = record.head.ref === plan.headBranch && record.base.ref === plan.baseBranch
+  const expectedUrl = `https://github.com/${plan.repositorySlug}/pull/${record.number}`
+  if (!sameRepositories || !sameBranches
+    || record.html_url.toLowerCase() !== expectedUrl.toLowerCase()) {
+    return { kind: 'unrelated', record }
+  }
+  if (record.head.sha !== plan.commitSha) {
+    return { kind: 'head-sha-mismatch', record }
+  }
   if (record.state === 'open' || record.merged_at !== null) {
     return { kind: 'valid', record }
   }
@@ -1465,6 +1639,11 @@ async function findPullRequest(
   commands: GitHubPublicationCommands,
   signal?: AbortSignal,
 ): Promise<PullRequestApiRecord | null> {
+  const expectedNumber = plan.promotion?.expectedIntegrationPullRequestNumber
+  if (expectedNumber !== undefined) {
+    const exact = await readExactPullRequest(plan, expectedNumber, commands, signal)
+    return exact.record
+  }
   const [owner] = plan.repositorySlug.split('/')
   const query = new URLSearchParams({
     state: 'all', head: `${owner}:${plan.headBranch}`, base: plan.baseBranch, per_page: '100',
@@ -1491,7 +1670,34 @@ async function findPullRequest(
       'GitHub publication PR was closed without being merged',
     )
   }
+  if (matches.length === 0
+    && classified.some(value => value!.kind === 'head-sha-mismatch')) {
+    throw new GitHubPublicationError(
+      'conflict',
+      'GitHub publication branch advanced beyond the reviewed commit',
+    )
+  }
   return matches[0] ?? null
+}
+
+async function assertPullRequestHeadStillReviewed(
+  plan: GitHubPublicationPlan,
+  commands: GitHubPublicationCommands,
+  signal?: AbortSignal,
+): Promise<void> {
+  const ref = `refs/heads/${plan.headBranch}`
+  const response = await commands.runGit(
+    plan.gitRoot,
+    ['ls-remote', '--heads', plan.canonicalUrl, ref],
+    signal,
+  )
+  if (response.exitCode !== 0) commandFailure(response, 'GitHub PR head verification')
+  if (parseRemoteHead(response.stdout, plan.headBranch) !== plan.commitSha) {
+    throw new GitHubPublicationError(
+      'conflict',
+      'GitHub publication branch advanced before pull request creation',
+    )
+  }
 }
 
 type RepositoryPullRequestRecord = {
@@ -1660,6 +1866,7 @@ export async function publishGitHubPlan(
       base: plan.baseBranch,
       body: integrationBody,
     })
+    await assertPullRequestHeadStillReviewed(plan, commands, signal)
     const create = await commands.runGh([
       'api', '--method', 'POST', `repos/${plan.repositorySlug}/pulls`, '--input', '-',
     ], request, signal)
@@ -1674,7 +1881,12 @@ export async function publishGitHubPlan(
     pullRequest = await reconcilePullRequestBody(
       plan,
       pullRequest,
-      plan.promotion.integrationPullRequestBody,
+      // A continuation is bound to an exact, already reviewed PR. Preserve
+      // any human edits made to that PR after creation instead of replacing
+      // its body with fresh classifier prose.
+      plan.promotion.expectedIntegrationPullRequestNumber === undefined
+        ? plan.promotion.integrationPullRequestBody
+        : undefined,
       commands,
       signal,
     )
@@ -1793,25 +2005,44 @@ export async function publishGitHubPlan(
       pullRequestUrl: pullRequest.html_url,
       mergeCommitSha: integrationMergeHead,
     })
+    if (plan.promotion.followupBaseBranch === null) {
+      return {
+        repositorySlug: plan.repositorySlug,
+        baseBranch: plan.baseBranch,
+        headBranch: plan.headBranch,
+        commitSha: plan.commitSha,
+        pullRequestNumber: pullRequest.number,
+        pullRequestUrl: pullRequest.html_url,
+        ...(closedPullRequestNumbers.length > 0 ? { closedPullRequestNumbers } : {}),
+      }
+    }
+    if (plan.promotion.followupInitialHead === null) {
+      throw new GitHubPublicationError(
+        'configuration',
+        'GitHub follow-up base receipt is unavailable',
+      )
+    }
+    const followupBaseBranch = plan.promotion.followupBaseBranch
+    const followupInitialHead = plan.promotion.followupInitialHead
     const followupPlan: GitHubPublicationPlan = {
       ...plan,
-      baseBranch: plan.promotion.followupBaseBranch,
+      baseBranch: followupBaseBranch,
       headBranch: plan.baseBranch,
       commitSha: promotedHead,
-      initialHead: plan.promotion.followupInitialHead,
-      title: `release: ${plan.baseBranch} to ${plan.promotion.followupBaseBranch}`,
+      initialHead: followupInitialHead,
+      title: `release: ${plan.baseBranch} to ${followupBaseBranch}`,
       promotion: undefined,
     }
     const followupBase = await commands.runGit(
       plan.gitRoot,
       ['ls-remote', '--heads', plan.canonicalUrl,
-        `refs/heads/${plan.promotion.followupBaseBranch}`],
+        `refs/heads/${followupBaseBranch}`],
       signal,
     )
     if (followupBase.exitCode !== 0) commandFailure(followupBase, 'GitHub follow-up base lookup')
     const followupBaseHead = parseRemoteHead(
       followupBase.stdout,
-      plan.promotion.followupBaseBranch,
+      followupBaseBranch,
     )
     if (followupBaseHead === null) {
       throw new GitHubPublicationError('conflict', 'GitHub follow-up base branch is unavailable')
@@ -1823,10 +2054,12 @@ export async function publishGitHubPlan(
       signal,
     )
     let followupPullRequest = await findPullRequest(followupPlan, commands, signal)
+    const reusedFollowupPullRequest = followupPullRequest !== null
     if (!followupPullRequest) {
       const followupBody = plan.promotion.followupPullRequestBody === undefined
         ? 'The authorized integration branch is ready for release review. This PR is not auto-merged.'
         : renderPullRequestBody(plan.promotion.followupPullRequestBody, followupPlan)
+      await assertPullRequestHeadStillReviewed(followupPlan, commands, signal)
       const create = await commands.runGh([
         'api', '--method', 'POST', `repos/${plan.repositorySlug}/pulls`, '--input', '-',
       ], JSON.stringify({
@@ -1847,7 +2080,14 @@ export async function publishGitHubPlan(
     followupPullRequest = await reconcilePullRequestBody(
       followupPlan,
       followupPullRequest,
-      plan.promotion.followupPullRequestBody,
+      // On an exact archived continuation, a reused release PR may have been
+      // edited by a human after creation. Reconciliation proves identity; it
+      // must not erase those edits. A newly created PR still receives the
+      // selected body in its POST above.
+      plan.promotion.expectedIntegrationPullRequestNumber !== undefined
+        && reusedFollowupPullRequest
+        ? undefined
+        : plan.promotion.followupPullRequestBody,
       commands,
       signal,
     )
@@ -1857,6 +2097,7 @@ export async function publishGitHubPlan(
       pullRequestNumber: pullRequest.number,
       pullRequestUrl: pullRequest.html_url,
       mergeCommitSha: integrationMergeHead,
+      followupHeadSha: promotedHead,
       followupPullRequestNumber: followupPullRequest.number,
       followupPullRequestUrl: followupPullRequest.html_url,
     })

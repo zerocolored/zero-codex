@@ -12,6 +12,7 @@ import {
   captureFreshGitHubPublicationBaselineForBranches,
   gitHubPublicationBaselineDigest,
   GitHubPublicationError,
+  prepareArchivedGitHubPromotionPlans,
   prepareGitHubPublicationPlans,
   prepareGitHubPromotionPlans,
   publishGitHubPlan,
@@ -893,6 +894,371 @@ describe('host GitHub publication', () => {
     expect(git(value.repo, 'status', '--porcelain')).toContain('operator-notes.txt')
   })
 
+  test('archive済みPRはlocal branchなしでもexact番号を一度だけmergeしrelease PRを再利用する', async () => {
+    const value = implementedPromotionFixture('example/archived-continuation')
+    const archived: GitHubPublicationPlan = { ...value.plan, promotion: undefined }
+    git(value.repo, 'branch', '-D', archived.headBranch)
+    expect(git(value.repo, 'branch', '--list', archived.headBranch)).toBe('')
+
+    const prepared = await prepareArchivedGitHubPromotionPlans([{
+      plan: archived,
+      gitRoot: value.repo,
+      expectedIntegrationPullRequestNumber: 861,
+      followupBaseBranch: 'main',
+      waitForChecks: false,
+      integrationPullRequestBody: 'classifier text must not replace a reviewed PR',
+      followupPullRequestBody: '## Release\npromote {{COMMIT_SHA}}',
+      closePullRequestNumbers: [],
+    }], {
+      async runGit(_repo, args) {
+        expect(args).toEqual([
+          'ls-remote', '--heads', archived.canonicalUrl, 'refs/heads/main',
+        ])
+        return result(0, `${value.mainHead}\trefs/heads/main\n`)
+      },
+      async runGh() { throw new Error('archive preparation must not call GitHub API') },
+    })
+    expect(prepared).toHaveLength(1)
+    const plan = prepared[0]!
+    expect(plan).toMatchObject({
+      gitRoot: value.repo,
+      headBranch: archived.headBranch,
+      commitSha: archived.commitSha,
+      promotion: {
+        expectedIntegrationPullRequestNumber: 861,
+        sourceBranch: archived.headBranch,
+        sourceHead: archived.commitSha,
+        followupBaseBranch: 'main',
+      },
+    })
+
+    const integrationMergeHead = 'd'.repeat(40)
+    const remoteHeads = new Map<string, string>([
+      [plan.headBranch, plan.commitSha],
+      ['develop', value.developHead],
+      ['main', value.mainHead],
+    ])
+    let integrationMerged = false
+    let followupExists = false
+    let integrationMergeCalls = 0
+    let integrationCreateCalls = 0
+    let followupCreateCalls = 0
+    let pushCalls = 0
+    let patchCalls = 0
+    let integrationBody = 'human-edited reviewed PR body'
+    let followupBody: string | null = null
+    const followupPlan = (): GitHubPublicationPlan => ({
+      ...plan,
+      baseBranch: 'main',
+      headBranch: 'develop',
+      commitSha: integrationMergeHead,
+      initialHead: value.mainHead,
+      promotion: undefined,
+    })
+    const exact = (
+      target: GitHubPublicationPlan,
+      number: number,
+      body: string | null,
+      merged = false,
+    ): string => {
+      const record = JSON.parse(exactPullRequestJson({
+        plan: target,
+        number,
+        state: merged ? 'closed' : 'open',
+        mergedAt: merged ? '2026-09-03T00:00:00Z' : null,
+        mergeCommitSha: merged ? integrationMergeHead : null,
+        body,
+      }))[0] as Record<string, unknown>
+      return JSON.stringify({
+        ...record,
+        draft: false,
+        mergeable: true,
+        mergeable_state: 'clean',
+      })
+    }
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repo, args) {
+        if (args[0] === 'ls-remote') {
+          const ref = String(args.at(-1))
+          const branch = ref.replace(/^refs\/heads\//, '')
+          const head = remoteHeads.get(branch)
+          return result(0, head ? `${head}\t${ref}\n` : '')
+        }
+        if (args[0] === 'push') {
+          pushCalls += 1
+          return result(0)
+        }
+        throw new Error(`unexpected archived-continuation Git command: ${args.join(' ')}`)
+      },
+      async runGh(args, stdin) {
+        const command = args.join(' ')
+        if (args.includes('GET')
+          && command.endsWith('repos/example/archived-continuation/pulls/861')) {
+          return result(0, exact(plan, 861, integrationBody, integrationMerged))
+        }
+        if (args.includes('GET')
+          && command.endsWith('repos/example/archived-continuation')) {
+          return result(0, JSON.stringify({ allow_merge_commit: true }))
+        }
+        if (command.includes('/compare/')) {
+          const preparedHead = /\/compare\/([0-9a-f]+)\.\.\./.exec(command)?.[1]
+          if (!preparedHead) throw new Error(`invalid comparison: ${command}`)
+          return result(0, JSON.stringify({
+            status: 'ahead', ahead_by: 1, behind_by: 0,
+            base_commit: { sha: preparedHead },
+            merge_base_commit: { sha: preparedHead },
+          }))
+        }
+        if (args.includes('PUT') && command.includes('/pulls/861/merge')) {
+          integrationMergeCalls += 1
+          expect(JSON.parse(stdin ?? '{}')).toEqual({
+            sha: plan.commitSha,
+            merge_method: 'merge',
+          })
+          integrationMerged = true
+          remoteHeads.set('develop', integrationMergeHead)
+          return result(0, '{}')
+        }
+        if (args.includes('GET') && command.includes('/pulls?')) {
+          if (command.includes('base=develop')) {
+            throw new Error('exact archived integration PR must not use a branch-list lookup')
+          }
+          if (command.includes('base=main')) {
+            return result(0, followupExists
+              ? exactPullRequestJson({
+                  plan: followupPlan(), number: 862, body: followupBody,
+                })
+              : '[]')
+          }
+        }
+        if (args.includes('POST') && command.includes('/pulls')) {
+          const request = JSON.parse(stdin ?? '{}') as Record<string, string>
+          if (request.base === 'develop') {
+            integrationCreateCalls += 1
+          } else if (request.base === 'main') {
+            followupCreateCalls += 1
+            followupExists = true
+            followupBody = request.body
+          }
+          return result(0, '{}')
+        }
+        if (args.includes('PATCH') && command.includes('/pulls/')) {
+          patchCalls += 1
+          if (command.endsWith('/pulls/861 --input -')) {
+            integrationBody = String((JSON.parse(stdin ?? '{}') as { body?: string }).body)
+          } else if (command.endsWith('/pulls/862 --input -')) {
+            followupBody = String((JSON.parse(stdin ?? '{}') as { body?: string }).body)
+          }
+          return result(0, '{}')
+        }
+        throw new Error(`unexpected archived-continuation gh command: ${command}`)
+      },
+    }
+
+    const expected = {
+      pullRequestNumber: 861,
+      pullRequestUrl: 'https://github.com/example/archived-continuation/pull/861',
+      followupPullRequestNumber: 862,
+      followupPullRequestUrl: 'https://github.com/example/archived-continuation/pull/862',
+    }
+    await expect(publishGitHubPlan(plan, commands)).resolves.toMatchObject(expected)
+    followupBody = 'human-edited release PR body'
+    await expect(publishGitHubPlan(plan, commands)).resolves.toMatchObject(expected)
+    expect({
+      integrationMergeCalls,
+      integrationCreateCalls,
+      followupCreateCalls,
+      pushCalls,
+      patchCalls,
+    }).toEqual({
+      integrationMergeCalls: 1,
+      integrationCreateCalls: 0,
+      followupCreateCalls: 1,
+      pushCalls: 0,
+      patchCalls: 0,
+    })
+    expect(integrationBody).toBe('human-edited reviewed PR body')
+    expect(followupBody).toBe('human-edited release PR body')
+    expect(git(value.repo, 'branch', '--list', archived.headBranch)).toBe('')
+    expect(git(value.repo, 'branch', '--show-current')).toBe(value.unrelatedBranch)
+    expect(git(value.repo, 'rev-parse', 'HEAD')).toBe(value.unrelatedHead)
+  })
+
+  test('archiveが固定したexact PRのclosed-unmergedはmutationせず競合になる', async () => {
+    const value = implementedPromotionFixture('example/archived-closed')
+    const archived: GitHubPublicationPlan = { ...value.plan, promotion: undefined }
+    const [plan] = await prepareArchivedGitHubPromotionPlans([{
+      plan: archived,
+      gitRoot: value.repo,
+      expectedIntegrationPullRequestNumber: 863,
+      followupBaseBranch: 'main',
+      waitForChecks: false,
+      integrationPullRequestBody: 'unused for an exact PR',
+      followupPullRequestBody: 'release body',
+      closePullRequestNumbers: [],
+    }], {
+      async runGit() {
+        return result(0, `${value.mainHead}\trefs/heads/main\n`)
+      },
+      async runGh() { throw new Error('archive preparation must not call GitHub API') },
+    })
+    if (!plan) throw new Error('archived exact-PR fixture omitted its plan')
+    let mutations = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repo, args) {
+        if (args[0] !== 'ls-remote') throw new Error(`unexpected Git command: ${args.join(' ')}`)
+        return result(0, `${plan.commitSha}\trefs/heads/${plan.headBranch}\n`)
+      },
+      async runGh(args) {
+        const command = args.join(' ')
+        if (args.includes('GET') && command.endsWith('/pulls/863')) {
+          const record = JSON.parse(exactPullRequestJson({
+            plan,
+            number: 863,
+            state: 'closed',
+            mergedAt: null,
+          }))[0]
+          return result(0, JSON.stringify(record))
+        }
+        mutations += 1
+        return result(0, '{}')
+      },
+    }
+    await expect(publishGitHubPlan(plan, commands)).rejects.toEqual(
+      expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'conflict' }),
+    )
+    expect(mutations).toBe(0)
+  })
+
+  test('archiveが固定したexact PRのhead SHA差異はremote再試行せず競合になる', async () => {
+    const value = implementedPromotionFixture('example/archived-head-drift')
+    const archived: GitHubPublicationPlan = { ...value.plan, promotion: undefined }
+    const [plan] = await prepareArchivedGitHubPromotionPlans([{
+      plan: archived,
+      gitRoot: value.repo,
+      expectedIntegrationPullRequestNumber: 864,
+      followupBaseBranch: null,
+      waitForChecks: false,
+      integrationPullRequestBody: 'preserve exact reviewed PR',
+      followupPullRequestBody: 'unused',
+      closePullRequestNumbers: [],
+    }], {
+      async runGit() { throw new Error('terminal archive preparation touched Git') },
+      async runGh() { throw new Error('terminal archive preparation touched GitHub') },
+    })
+    if (!plan) throw new Error('archived head-drift fixture omitted its plan')
+    let mutations = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repo, args) {
+        const ref = String(args.at(-1))
+        return result(0, `${plan.commitSha}\t${ref}\n`)
+      },
+      async runGh(args) {
+        const command = args.join(' ')
+        if (args.includes('GET') && command.endsWith('/pulls/864')) {
+          const record = JSON.parse(exactPullRequestJson({ plan, number: 864 }))[0] as {
+            head: { sha: string }
+          }
+          record.head.sha = 'f'.repeat(40)
+          return result(0, JSON.stringify(record))
+        }
+        mutations += 1
+        return result(0, '{}')
+      },
+    }
+    await expect(publishGitHubPlan(plan, commands)).rejects.toEqual(
+      expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'conflict' }),
+    )
+    expect(mutations).toBe(0)
+  })
+
+  test('follow-up PR作成中にbranchが進んでも1件だけ作成して競合へ戻す', async () => {
+    const value = implementedPromotionFixture('example/followup-create-race')
+    const plan: GitHubPublicationPlan = {
+      ...value.plan,
+      promotion: {
+        ...value.plan.promotion!,
+        expectedIntegrationPullRequestNumber: 861,
+      },
+    }
+    const integrationMergeHead = 'd'.repeat(40)
+    const advancedHead = 'e'.repeat(40)
+    let developHead = integrationMergeHead
+    let releaseExists = false
+    let followupCreates = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repo, args) {
+        if (args[0] !== 'ls-remote') {
+          throw new Error(`unexpected follow-up race Git command: ${args.join(' ')}`)
+        }
+        const ref = String(args.at(-1))
+        const branch = ref.replace(/^refs\/heads\//, '')
+        const head = branch === plan.headBranch
+          ? plan.commitSha
+          : branch === plan.baseBranch
+            ? developHead
+            : branch === plan.promotion!.followupBaseBranch
+              ? value.mainHead
+              : null
+        return result(0, head ? `${head}\t${ref}\n` : '')
+      },
+      async runGh(args) {
+        const command = args.join(' ')
+        if (args.includes('GET') && command.endsWith('/pulls/861')) {
+          const record = JSON.parse(exactPullRequestJson({
+            plan,
+            number: 861,
+            state: 'closed',
+            mergedAt: '2026-09-03T00:00:00Z',
+            mergeCommitSha: integrationMergeHead,
+            body: plan.promotion!.integrationPullRequestBody,
+          }))[0]
+          return result(0, JSON.stringify(record))
+        }
+        if (command.includes('/compare/')) {
+          const prepared = /\/compare\/([0-9a-f]+)\.\.\./.exec(command)?.[1]
+          if (!prepared) throw new Error(`invalid follow-up race comparison: ${command}`)
+          return result(0, JSON.stringify({
+            status: 'ahead', ahead_by: 1, behind_by: 0,
+            base_commit: { sha: prepared }, merge_base_commit: { sha: prepared },
+          }))
+        }
+        if (args.includes('GET') && command.includes('/pulls?')) {
+          if (!command.includes('base=main')) {
+            throw new Error(`unexpected follow-up race PR query: ${command}`)
+          }
+          if (!releaseExists) return result(0, '[]')
+          const advancedPlan: GitHubPublicationPlan = {
+            ...plan,
+            baseBranch: 'main',
+            headBranch: 'develop',
+            commitSha: advancedHead,
+            initialHead: value.mainHead,
+            promotion: undefined,
+          }
+          return result(0, exactPullRequestJson({
+            plan: advancedPlan,
+            number: 862,
+            body: plan.promotion!.followupPullRequestBody,
+          }))
+        }
+        if (args.includes('POST') && command.includes('/pulls')) {
+          followupCreates += 1
+          releaseExists = true
+          // Simulate the unavoidable GitHub branch-name race after the
+          // pre-POST exact-head check but before PR creation is committed.
+          developHead = advancedHead
+          return result(0, '{}')
+        }
+        throw new Error(`unexpected follow-up race gh command: ${command}`)
+      },
+    }
+    await expect(publishGitHubPlan(plan, commands)).rejects.toEqual(
+      expect.objectContaining<Partial<GitHubPublicationError>>({ category: 'conflict' }),
+    )
+    expect(followupCreates).toBe(1)
+  })
+
   test('実装feature refはCodexが選んだintegration baseの子孫でなければならない', () => {
     const value = implementedPromotionFixture('example/implemented-ancestry')
     const unrelatedPublicationBranch = 'zerochan/not-from-develop'
@@ -995,6 +1361,21 @@ describe('host GitHub publication', () => {
     )
     expect(git(value.repo, 'branch', '--show-current')).toBe(value.unrelatedBranch)
     expect(git(value.repo, 'rev-parse', 'HEAD')).toBe(value.unrelatedHead)
+  })
+
+  test('follow-upなしpromotionはarchiveが固定したexact PR番号なしでは拒否する', () => {
+    const value = implementedPromotionFixture('example/terminal-promotion-authority')
+    const invalid: GitHubPublicationPlan = {
+      ...value.plan,
+      promotion: {
+        ...value.plan.promotion!,
+        followupBaseBranch: null,
+        followupInitialHead: null,
+      },
+    }
+    expect(() => assertGitHubPublicationPlan(invalid)).toThrow(
+      'publication promotion is invalid',
+    )
   })
 
   test('remote mutation中のcancelは確定receiptを保存してから停止する', async () => {
@@ -1215,6 +1596,156 @@ describe('host GitHub publication', () => {
     store.close()
     store = new JobStore(dbPath)
     expect(store.githubPromotionCheckpoint(queued.id, plan)?.kind).toBe('integration-pr')
+    store.close()
+  })
+
+  test('archive済みrelease PRのmerge直後にcancelされても完了receiptを先に保存する', async () => {
+    const value = implementedPromotionFixture('example/terminal-promotion-cancel')
+    const releasePlan: GitHubPublicationPlan = {
+      ...value.plan,
+      baseBranch: 'main',
+      headBranch: 'develop',
+      commitSha: value.developHead,
+      initialHead: value.mainHead,
+      title: 'release: develop to main',
+      promotion: undefined,
+    }
+    const [plan] = await prepareArchivedGitHubPromotionPlans([{
+      plan: releasePlan,
+      gitRoot: value.repo,
+      expectedIntegrationPullRequestNumber: 862,
+      followupBaseBranch: null,
+      waitForChecks: false,
+      integrationPullRequestBody: 'human-reviewed release PR body',
+      followupPullRequestBody: 'unused terminal continuation body',
+      closePullRequestNumbers: [],
+    }], {
+      async runGit() {
+        throw new Error('terminal continuation preparation must not resolve a follow-up branch')
+      },
+      async runGh() {
+        throw new Error('terminal continuation preparation must not call GitHub')
+      },
+    })
+    if (!plan) throw new Error('terminal continuation fixture omitted its plan')
+
+    const dbPath = join(fixtureDir(), 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const queued = store.enqueue({
+      chatId: 'C0123456789', threadTs: '1900000000.000460',
+      messageId: '1900000000.000460', userId: 'U0123456789',
+      repoPath: value.repo, task: 'release PRをmainへmergeしてデプロイして', writeEnabled: true,
+    }).job
+    const running = store.claimNext('terminal-promotion-cancel-boundary')!
+    const input = readAdvisorInputSnapshot(dirname(dbPath), running.id)
+    store.ensureExecutionResultStaged(running.id, 'terminal-promotion-cancel-session', '公開します。', {
+      version: 1,
+      jobId: running.id,
+      jobAttempt: running.attempts,
+      logicalNonce: 'e'.repeat(32),
+      inputRevision: input.revision,
+      inputDigest: input.digest,
+      reviewRound: 1,
+      reviewedRepositoryDigest: createHash('sha256').update('terminal-cancel').digest('hex'),
+      baselineDigest: gitHubPublicationBaselineDigest(value.baseline),
+      plans: [plan],
+    })
+    const target = store.liveControlTarget(running.chatId, running.threadTs)!
+    const mergeCommitSha = 'd'.repeat(40)
+    let merged = false
+    let mergeCalls = 0
+    const exact = (): string => {
+      const record = JSON.parse(exactPullRequestJson({
+        plan,
+        number: 862,
+        state: merged ? 'closed' : 'open',
+        mergedAt: merged ? '2026-09-03T00:00:00Z' : null,
+        mergeCommitSha: merged ? mergeCommitSha : null,
+        body: 'human-reviewed release PR body',
+      }))[0] as Record<string, unknown>
+      return JSON.stringify({
+        ...record,
+        draft: false,
+        mergeable: true,
+        mergeable_state: 'clean',
+      })
+    }
+    const commands: GitHubPublicationCommands = {
+      async runGit(_repository, args) {
+        if (args[0] !== 'ls-remote') {
+          throw new Error(`unexpected terminal-cancel Git command: ${args.join(' ')}`)
+        }
+        const ref = String(args.at(-1))
+        const branch = ref.replace(/^refs\/heads\//, '')
+        const head = branch === 'develop'
+          ? merged ? mergeCommitSha : plan.commitSha
+          : branch === 'main'
+            ? plan.initialHead
+            : null
+        return result(0, head ? `${head}\t${ref}\n` : '')
+      },
+      async runGh(args, stdin) {
+        const command = args.join(' ')
+        if (args.includes('GET')
+          && command.endsWith('repos/example/terminal-promotion-cancel/pulls/862')) {
+          return result(0, exact())
+        }
+        if (args.includes('GET')
+          && command.endsWith('repos/example/terminal-promotion-cancel')) {
+          return result(0, JSON.stringify({ allow_merge_commit: true }))
+        }
+        if (command.includes('/compare/')) {
+          const prepared = /\/compare\/([0-9a-f]+)\.\.\./.exec(command)?.[1]
+          if (!prepared) throw new Error(`invalid terminal-cancel comparison: ${command}`)
+          return result(0, JSON.stringify({
+            status: 'ahead', ahead_by: 1, behind_by: 0,
+            base_commit: { sha: prepared }, merge_base_commit: { sha: prepared },
+          }))
+        }
+        if (args.includes('PUT') && command.includes('/pulls/862/merge')) {
+          mergeCalls += 1
+          merged = true
+          expect(store.stageLiveControl(target, {
+            chatId: running.chatId,
+            threadTs: running.threadTs,
+            messageId: '1900000000.000461',
+            userId: running.userId,
+            task: 'やめて',
+            kind: 'interrupt',
+          })).toBe('staged')
+          return result(0, '{}')
+        }
+        throw new Error(`unexpected terminal-cancel gh command: ${command}`)
+      },
+    }
+
+    await expect(publishStagedGitHubPublication(store, queued.id, {
+      commands,
+      retryMsForTesting: 1,
+    })).rejects.toMatchObject({ name: 'CodexUserCancelledError' })
+    expect(mergeCalls).toBe(1)
+    // The publisher seals the all-receipts-complete set before honoring the
+    // cancellation; replay therefore observes an already-completed set.
+    expect(store.completeGitHubPublicationSet(queued.id)).toBe(false)
+    expect(store.pendingGitHubPublications(queued.id)).toEqual([])
+    expect(store.githubPromotionCheckpoint(queued.id, plan)).toEqual({
+      version: 1,
+      kind: 'integration-merged',
+      pullRequestNumber: 862,
+      pullRequestUrl: 'https://github.com/example/terminal-promotion-cancel/pull/862',
+      mergeCommitSha,
+    })
+    expect(store.githubPublicationReceipts(queued.id)).toEqual([
+      expect.objectContaining({
+        pullRequestNumber: 862,
+        pullRequestUrl: 'https://github.com/example/terminal-promotion-cancel/pull/862',
+      }),
+    ])
+    store.close()
+    store = new JobStore(dbPath)
+    expect(store.pendingGitHubPublications(queued.id)).toEqual([])
+    expect(store.githubPublicationReceipts(queued.id)).toHaveLength(1)
+    expect(store.githubPromotionCheckpoint(queued.id, plan)?.kind).toBe('integration-merged')
     store.close()
   })
 
