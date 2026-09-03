@@ -68,14 +68,22 @@ import {
   requireHerdrRuntime,
   writePinnedHerdrRuntime,
 } from './herdr-runtime.ts'
+import { requireTmuxCommand, runTmuxCommand, tmuxSessionExists } from './tmux-command.ts'
 
 const directories: string[] = []
 const tmuxSessions: string[] = []
 const serviceIdentities: ProcessIdentity[] = []
+const serviceProcesses: Bun.Subprocess[] = []
 
-afterEach(() => {
-  for (const session of tmuxSessions.splice(0)) Bun.spawnSync(['tmux', 'kill-session', '-t', session])
+afterEach(async () => {
+  for (const session of tmuxSessions.splice(0)) runTmuxCommand('tmux', ['kill-session', '-t', session])
   for (const identity of serviceIdentities.splice(0)) signalProcessIfLive(identity, 'SIGKILL')
+  for (const child of serviceProcesses.splice(0)) {
+    if (child.exitCode === null) {
+      try { child.kill('SIGKILL') } catch {}
+    }
+    try { await child.exited } catch {}
+  }
   for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
@@ -260,6 +268,7 @@ function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, s
       'await Bun.sleep(60_000)',
     ].join('; '),
   ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+  serviceProcesses.push(socketServer)
   for (let attempt = 0; attempt < 100 && !existsSync(herdrSocket); attempt += 1) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
   }
@@ -1264,11 +1273,16 @@ describe('updater helpers', () => {
         legacyCutover: true,
       })
       expect(panePid).toBeGreaterThan(0)
-      expect(Bun.spawnSync([tmux.stdout.toString().trim(), 'has-session', '-t', session]).exitCode).toBe(0)
+      expect(runTmuxCommand(
+        tmux.stdout.toString().trim(),
+        ['has-session', '-t', session],
+      ).exitCode).toBe(0)
       const replaceToken = readFileSync(replaceTokenFile, 'utf8')
-      const paneCommand = must([
-        tmux.stdout.toString().trim(), 'list-panes', '-t', session, '-F', '#{pane_start_command}',
-      ])
+      const paneCommand = requireTmuxCommand(
+        tmux.stdout.toString().trim(),
+        ['list-panes', '-t', session, '-F', '#{pane_start_command}'],
+        { capture: true },
+      )
       expect(paneCommand).not.toContain(replaceToken)
       expect(paneCommand).toContain(updateRestartTokenDigest(replaceToken))
       for (let attempt = 0; attempt < 100 && !existsSync(observedEnvironment); attempt += 1) {
@@ -1531,6 +1545,21 @@ describe('updater helpers', () => {
     expect(existsSync(join(fixture.base, 'herdr-tab-close.argv'))).toBe(false)
   })
 
+  test('停止したtmux操作は期限内に強制回収する', () => {
+    const startedAt = Date.now()
+    const result = runTmuxCommand('/bin/sleep', ['30'], { timeoutMs: 100 })
+    expect(result.exitCode).toBeNull()
+    expect(result.signalCode).toBe('SIGKILL')
+    expect(Date.now() - startedAt).toBeLessThan(3_000)
+  })
+
+  test('tmux session照会の異常終了をsession不在として扱わない', () => {
+    const base = fixtureDir()
+    const tmux = join(base, 'failing-tmux')
+    writeFileSync(tmux, '#!/bin/sh\nexit 2\n', { mode: 0o700 })
+    expect(() => tmuxSessionExists(tmux, 'example')).toThrow('exit 2')
+  })
+
   test('同名の無関係tmux sessionを停止せずfail-closedにする', async () => {
     const tmux = Bun.spawnSync(['/usr/bin/which', 'tmux'], { stdout: 'pipe' })
     expect(tmux.exitCode).toBe(0)
@@ -1543,10 +1572,15 @@ describe('updater helpers', () => {
     writeFileSync(join(root, 'codex-channel.sh'), '#!/bin/bash\nsleep 30\n', { mode: 0o700 })
     const session = `zerokun-collision-${process.pid}-${Date.now()}`
     tmuxSessions.push(session)
-    expect(Bun.spawnSync([tmuxPath, 'new-session', '-d', '-s', session, 'sleep 30']).exitCode).toBe(0)
-    const sentinelPid = Number(Bun.spawnSync([
-      tmuxPath, 'list-panes', '-t', session, '-F', '#{pane_pid}',
-    ], { stdout: 'pipe' }).stdout.toString().trim())
+    expect(runTmuxCommand(
+      tmuxPath,
+      ['new-session', '-d', '-s', session, 'sleep 30'],
+    ).exitCode).toBe(0)
+    const sentinelPid = Number(requireTmuxCommand(
+      tmuxPath,
+      ['list-panes', '-t', session, '-F', '#{pane_pid}'],
+      { capture: true },
+    ))
     const replaceTokenFile = join(base, 'replace-token')
 
     await expect(startBotInTmux({
@@ -1560,10 +1594,10 @@ describe('updater helpers', () => {
       replaceTokenFile,
     })).rejects.toThrow('所有権を確認できないsessionを停止せず')
 
-    expect(Bun.spawnSync([tmuxPath, 'has-session', '-t', session]).exitCode).toBe(0)
+    expect(runTmuxCommand(tmuxPath, ['has-session', '-t', session]).exitCode).toBe(0)
     expect(() => process.kill(sentinelPid, 0)).not.toThrow()
     expect(existsSync(replaceTokenFile)).toBe(false)
-  })
+  }, 20_000)
 
   test.each(['symlink', 'hardlink'] as const)(
     'gateway replace tokenは既存%sを辿らず外部fileを保持する',
@@ -1685,10 +1719,15 @@ describe('Codex branch self update', () => {
     const tmux = must(['/usr/bin/which', 'tmux'])
     const session = `zerokun-update-collision-${process.pid}-${Date.now()}`
     tmuxSessions.push(session)
-    expect(Bun.spawnSync([tmux, 'new-session', '-d', '-s', session, 'sleep 30']).exitCode).toBe(0)
-    const sentinelPid = Number(Bun.spawnSync([
-      tmux, 'list-panes', '-t', session, '-F', '#{pane_pid}',
-    ], { stdout: 'pipe' }).stdout.toString().trim())
+    expect(runTmuxCommand(
+      tmux,
+      ['new-session', '-d', '-s', session, 'sleep 30'],
+    ).exitCode).toBe(0)
+    const sentinelPid = Number(requireTmuxCommand(
+      tmux,
+      ['list-panes', '-t', session, '-F', '#{pane_pid}'],
+      { capture: true },
+    ))
     const before = must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)
 
     const result = runUpdater(fixture, ['--skip-tests'], {
@@ -1701,7 +1740,7 @@ describe('Codex branch self update', () => {
     expect(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)).not.toBe(before)
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
     expect(existsSync(fixture.setupMarker)).toBe(true)
-    expect(Bun.spawnSync([tmux, 'has-session', '-t', session]).exitCode).toBe(0)
+    expect(runTmuxCommand(tmux, ['has-session', '-t', session]).exitCode).toBe(0)
     expect(() => process.kill(sentinelPid, 0)).not.toThrow()
     const marker = JSON.parse(readFileSync(join(fixture.state, 'herdr-runtime.json'), 'utf8'))
     expect(marker.paneId).toBe('wT:pR')

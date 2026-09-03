@@ -32,6 +32,7 @@ export const UPDATE_RUNTIME_FILES = [
   'state-dir.ts',
   'slack-http.ts',
   'slack-app-identity.ts',
+  'tmux-command.ts',
 ] as const
 
 export type UpdateRuntimeInstallPhase = 'staged' | 'published' | 'activated'
