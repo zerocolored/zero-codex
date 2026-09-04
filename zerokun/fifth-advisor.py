@@ -76,6 +76,7 @@ HERDR_COMMAND_TIMEOUT_SECONDS = 20
 CLAUDE_START_TIMEOUT_MS = 300_000
 CLAUDE_START_PROCESS_TIMEOUT_SECONDS = 310
 CLAUDE_SETTLE_TIMEOUT_SECONDS = 120
+CLAUDE_PROCESS_SETTLE_TIMEOUT_SECONDS = 5
 PROVISIONAL_RECONCILE_SECONDS = 30
 CLAUDE_ARGUMENTS = (
     "--dangerously-skip-permissions",
@@ -87,12 +88,48 @@ CLAUDE_OBSERVED_ARGUMENT_FORMS = (
     CLAUDE_ARGUMENTS,
     ("--effort", "max", *CLAUDE_ARGUMENTS),
 )
+CLAUDE_REQUIRED_ARGUMENTS = frozenset(CLAUDE_ARGUMENTS)
+CLAUDE_DENIED_OPTION_NAMES = frozenset(
+    {
+        "--add-dir",
+        "--agent",
+        "--agents",
+        "--allowed-tools",
+        "--allowedTools",
+        "--append-system-prompt",
+        "--chrome",
+        "--continue",
+        "--disallowed-tools",
+        "--disallowedTools",
+        "--fork-session",
+        "--from-pr",
+        "--ide",
+        "--mcp-config",
+        "--permission-mode",
+        "--plugin-dir",
+        "--print",
+        "--prompt",
+        "--remote",
+        "--resume",
+        "--session-id",
+        "--setting-sources",
+        "--settings",
+        "--strict-mcp-config",
+        "--system-prompt",
+        "--teleport",
+        "--tools",
+    }
+)
+CLAUDE_BENIGN_EFFORT_VALUES = frozenset(
+    {"auto", "low", "medium", "high", "max"}
+)
+CLAUDE_BENIGN_FLAG = re.compile(
+    r"--[A-Za-z0-9][A-Za-z0-9-]{0,63}(?:=[^\s\x00-\x1f\x7f]{0,256})?\Z"
+)
 OWNED_PROCESS_IDENTITY_KEYS = (
     "shell_pid",
     "claude_pid",
     "process_group_id",
-    "argv",
-    "argv0",
     "executable",
 )
 OPEN_TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
@@ -148,7 +185,17 @@ class _OpenSignal(BaseException):
 
 
 class _PreparedSend:
-    __slots__ = ("request", "request_id", "socket_path", "marker_line", "target")
+    __slots__ = (
+        "request",
+        "request_id",
+        "socket_path",
+        "marker_line",
+        "target",
+        "project_root",
+        "request_dir",
+        "nonce",
+        "owned_records",
+    )
 
     def __init__(
         self,
@@ -158,12 +205,20 @@ class _PreparedSend:
         socket_path: str,
         marker_line: str,
         target: str,
+        project_root: str,
+        request_dir: str,
+        nonce: str,
+        owned_records: Tuple[Dict[str, object], Dict[str, object], Dict[str, object]],
     ) -> None:
         self.request = request
         self.request_id = request_id
         self.socket_path = socket_path
         self.marker_line = marker_line
         self.target = target
+        self.project_root = project_root
+        self.request_dir = request_dir
+        self.nonce = nonce
+        self.owned_records = owned_records
 
     def __repr__(self) -> str:
         return "_PreparedSend(request=<redacted>)"
@@ -175,6 +230,10 @@ def _same_owned_process_identity(
     return all(
         observed.get(key) == recorded.get(key)
         for key in OWNED_PROCESS_IDENTITY_KEYS
+    ) and _valid_claude_invocation(
+        observed.get("argv"), observed.get("argv0"), observed.get("executable")
+    ) and _valid_claude_invocation(
+        recorded.get("argv"), recorded.get("argv0"), recorded.get("executable")
     )
 
 
@@ -238,20 +297,81 @@ def _valid_claude_invocation(
     argv0: object,
     executable: object,
 ) -> bool:
-    if (
-        not isinstance(argv, list)
-        or not all(isinstance(value, str) for value in argv)
-        or tuple(argv[1:]) not in CLAUDE_OBSERVED_ARGUMENT_FORMS
-        or argv0 != "claude"
-        or not _valid_executable_identity(executable)
-    ):
+    if not isinstance(argv, list) or not argv or not all(
+        isinstance(value, str) for value in argv
+    ) or not isinstance(argv0, str) or not _valid_executable_identity(executable):
         return False
     assert isinstance(executable, dict)
-    return argv[0] in {
+    claude_entries = {
         "claude",
         executable["lookup_path"],
         executable["resolved_path"],
     }
+    arguments: List[str]
+    if argv[0] in claude_entries and argv0 in claude_entries:
+        arguments = argv[1:]
+    else:
+        launcher = _diagnostic_launcher_identity(executable)
+        if launcher is None or len(argv) < 2:
+            return False
+        launcher_entries = {
+            launcher["bare_name"],
+            launcher["executable"]["lookup_path"],
+            launcher["executable"]["resolved_path"],
+        }
+        if (
+            argv0 not in launcher_entries
+            or argv[0] not in launcher_entries
+            or argv[1] not in claude_entries
+        ):
+            return False
+        arguments = argv[2:]
+    return _valid_claude_option_arguments(arguments)
+
+
+def _valid_claude_option_arguments(arguments: List[str]) -> bool:
+    if len(arguments) > 64:
+        return False
+    observed_required = set()
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if not value or len(value) > MAX_DIAGNOSTIC_STRING_CHARS or any(
+            ord(character) < 32 or ord(character) == 127 for character in value
+        ):
+            return False
+        if value in CLAUDE_REQUIRED_ARGUMENTS:
+            if value in observed_required:
+                return False
+            observed_required.add(value)
+            index += 1
+            continue
+        option_name = value.partition("=")[0]
+        if option_name in CLAUDE_REQUIRED_ARGUMENTS:
+            # Required capabilities must be present as bare flags. In
+            # particular, `=false` and other inline overrides are rejected.
+            return False
+        if option_name in CLAUDE_DENIED_OPTION_NAMES:
+            return False
+        if value == "--effort":
+            if index + 1 >= len(arguments) or arguments[index + 1] not in (
+                CLAUDE_BENIGN_EFFORT_VALUES
+            ):
+                return False
+            index += 2
+            continue
+        if option_name == "--effort":
+            separator = value.find("=")
+            if separator < 0 or value[separator + 1 :] not in CLAUDE_BENIGN_EFFORT_VALUES:
+                return False
+            index += 1
+            continue
+        # Unknown long flags are diagnostic/benign only when self-contained;
+        # a following positional value could be a startup prompt or path.
+        if not CLAUDE_BENIGN_FLAG.fullmatch(value):
+            return False
+        index += 1
+    return observed_required == CLAUDE_REQUIRED_ARGUMENTS
 
 
 def _valid_recorded_process_ids(receipt: Dict[str, object]) -> bool:
@@ -1854,6 +1974,26 @@ def _process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
         "argv0": matched["argv0"],
         "executable": executable,
     }
+
+
+def _settled_process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
+    """Wait for two consecutive observations of the same owned Claude core.
+
+    Claude may briefly replace its launcher process while Herdr already shows
+    the empty ready prompt. Pinning that transitional PID makes every later
+    send fail before delivery. Raw argv spelling and incidental descendants
+    are diagnostic only; the shell, Claude PID, process group, executable
+    identity, and semantically valid invocation must remain stable.
+    """
+    deadline = time.monotonic() + CLAUDE_PROCESS_SETTLE_TIMEOUT_SECONDS
+    previous = _process_receipt(workspace)
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        current = _process_receipt(workspace)
+        if _same_owned_process_identity(current, previous):
+            return current
+        previous = current
+    raise UnsafeRequest("ephemeral Claude process did not settle at its ready prompt")
 
 
 def _wait_for_process_exit(
@@ -3970,7 +4110,7 @@ def _open_ephemeral_workspace(
             root_descriptor,
             root_metadata,
         )
-        processes = _process_receipt(workspace_receipt)
+        processes = _settled_process_receipt(workspace_receipt)
         _write_request_record(
             args.project_root,
             args.request_dir,
@@ -4530,17 +4670,6 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
         if not isinstance(claimed_target, str) or not isinstance(claimed_nonce, str):
             raise UnsafeRequest("ephemeral Claude receipts are unavailable")
         _validate_target(claimed_target)
-        _exclusive_json_record(
-            request_descriptor,
-            SEND_RECEIPT_NAME,
-            {
-                "version": EPHEMERAL_SESSION_VERSION,
-                "nonce": claimed_nonce,
-                "target": claimed_target,
-                "marker": marker_line,
-                "status": "delivery-possible",
-            },
-        )
     finally:
         _close_descriptors(request_descriptor, root_descriptor)
     if owned_records is None:
@@ -4574,7 +4703,56 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
         socket_path=socket_path,
         marker_line=marker_line,
         target=target,
+        project_root=args.project_root,
+        request_dir=args.request_dir,
+        nonce=claimed_nonce,
+        owned_records=owned_records,
     )
+
+
+def _persist_send_receipt(prepared: _PreparedSend) -> None:
+    """Publish delivery evidence only after the complete request was sent.
+
+    A preflight or connected socket is not evidence that a prompt reached
+    Herdr. Keeping the no-replace receipt absent until sendall succeeds makes
+    interruption recovery conservative: a crash before that boundary remains
+    start-unconfirmed instead of being counted as a started Claude reviewer.
+    """
+    root_descriptor = None
+    request_descriptor = None
+    try:
+        root_descriptor, root = _open_physical_directory(Path(prepared.project_root))
+        request_descriptor, _request = _request_directory(prepared.request_dir, root)
+        _discard_staged_records(request_descriptor)
+        changed, _before_count, _after_count = _verify_unchanged(
+            root_descriptor,
+            root,
+            request_descriptor,
+        )
+        if changed:
+            raise UnsafeRequest("protected metadata changed after fifth-advisor send")
+        rebound_records = (
+            _read_request_record(request_descriptor, SESSION_INTENT_NAME),
+            _read_request_record(request_descriptor, WORKSPACE_RECEIPT_NAME),
+            _read_request_record(request_descriptor, AGENT_RECEIPT_NAME),
+        )
+        if rebound_records != prepared.owned_records:
+            raise UnsafeRequest("ephemeral Claude receipts changed during prompt send")
+        if _request_entry_exists(request_descriptor, PROCESS_MISMATCH_RECEIPT_NAME):
+            raise UnsafeRequest("ephemeral process mismatch conflicts with prompt delivery")
+        _exclusive_json_record(
+            request_descriptor,
+            SEND_RECEIPT_NAME,
+            {
+                "version": EPHEMERAL_SESSION_VERSION,
+                "nonce": prepared.nonce,
+                "target": prepared.target,
+                "marker": prepared.marker_line,
+                "status": "delivery-possible",
+            },
+        )
+    finally:
+        _close_descriptors(request_descriptor, root_descriptor)
 
 
 def _announce_send(prepared: _PreparedSend) -> None:
@@ -4598,6 +4776,8 @@ def _attempt_send(prepared: _PreparedSend) -> int:
                 connection.settimeout(PROMPT_SOCKET_TIMEOUT_SECONDS)
                 connection.connect(prepared.socket_path)
                 connection.sendall(prepared.request)
+                _persist_send_receipt(prepared)
+                _announce_send(prepared)
                 while b"\n" not in response:
                     chunk = connection.recv(65_536)
                     if not chunk:
@@ -4629,7 +4809,6 @@ def _attempt_send(prepared: _PreparedSend) -> int:
 
 def _send_command(args: argparse.Namespace) -> int:
     prepared = _prepare_send(args)
-    _announce_send(prepared)
     try:
         return _attempt_send(prepared)
     except Exception:

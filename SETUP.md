@@ -95,6 +95,11 @@ grok login
 gh auth login --hostname github.com --git-protocol https --web
 ```
 
+これは初回セットアップ用です。稼働後にGrok 1.0.5が既知の未認証応答だけを返した場合は、
+ZeroちゃんがmacOSの固定OAuth helperをphase内で1回だけ試します。復旧できない場合もGrok枠だけを
+利用不能として扱い、primary Codexのtaskは継続します。rate limit、quota、network障害ではOAuthを
+起動しません。
+
 ZeroちゃんはAPI key認証を代用せず、login画面や秘密を勝手に操作しません。login後、Codexは
 同じ`interactive-bootstrap.sh --with-slack ...`を再実行します。既存の安全な設定は上書きされません。
 

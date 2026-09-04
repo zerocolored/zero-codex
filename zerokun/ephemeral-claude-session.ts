@@ -18,7 +18,7 @@ import {
   writeSync,
 } from 'fs'
 import { homedir } from 'os'
-import { dirname, isAbsolute, join, relative, sep } from 'path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import {
   environmentForPinnedHerdrRuntime,
   verifyHerdrRuntimeIdentityAsync,
@@ -251,7 +251,7 @@ export class EphemeralClaudeCleanupPendingError extends Error {}
 export class EphemeralClaudeOwnedProcessStillLiveError
   extends EphemeralClaudeCleanupPendingError {}
 
-function cleanupDiagnosticConfirmsOwnedProcessStillLive(stderr: string): boolean {
+export function cleanupDiagnosticConfirmsOwnedProcessStillLive(stderr: string): boolean {
   return stderr.includes('ephemeral Claude process survived workspace cleanup')
     || stderr.includes('ephemeral owned workspace still exists')
     || stderr.includes('provisional owned workspace still exists')
@@ -466,13 +466,35 @@ export function createEphemeralClaudeRequestDirectory(options: {
   return requireManagedDirectory(stateDir, requestDir)
 }
 
+export function resolveClaudeExecutableLookup(options: {
+  pathLookup?: string | null
+  homeDirectory?: string
+} = {}): string {
+  const candidates = options.pathLookup === undefined
+    ? [
+        Bun.which('claude'),
+        join(options.homeDirectory ?? homedir(), '.local', 'bin', 'claude'),
+      ]
+    : [options.pathLookup]
+  const visited = new Set<string>()
+  for (const candidate of candidates) {
+    if (!candidate || visited.has(candidate) || !isAbsolute(candidate)
+      || candidate !== resolve(candidate) || basename(candidate) !== 'claude') continue
+    visited.add(candidate)
+    try {
+      resolveCodexExecutableDetails(candidate)
+      return candidate
+    } catch {}
+  }
+  throw new Error('Claude executable is unavailable')
+}
+
 function verifiedClaudeLookup(): string {
-  const lookup = Bun.which('claude')
-  if (!lookup || !isAbsolute(lookup)) {
+  try {
+    return resolveClaudeExecutableLookup()
+  } catch {
     throw new EphemeralClaudeCleanupPendingError('Claude executable is unavailable for cleanup')
   }
-  resolveCodexExecutableDetails(lookup)
-  return lookup
 }
 
 function cleanupEnvironment(

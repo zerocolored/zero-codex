@@ -35,6 +35,7 @@ import {
   createSlackIdentityPauseGuard,
   extractArtifactPaths,
   encodeSlackGuardNonce,
+  enforceHostAdvisorCoverage,
   flushUiApprovalNotifications,
   flushTerminalNotifications,
   finalizeSuccessfulExecution,
@@ -8861,7 +8862,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).not.toContain(job.id)
     expect(instructions).not.toContain(job.userId)
     expect(instructions).not.toContain('/tmp/job-outbox')
-    expect(resumedInstructions).toBe(instructions)
+    expect(resumedInstructions).not.toBe(instructions)
+    expect(resumedInstructions).toContain('advisor_round phase=investigation')
+    expect(resumedInstructions).toContain('returned slotSummary')
     expect(prompt).toContain(job.task)
     expect(prompt).toContain(`zerochan-access write allow ${job.userId}`)
     expect(prompt).toContain(`Logical attempt nonce: ${nonce}`)
@@ -8880,14 +8883,16 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
     const nonce = 'f'.repeat(32)
     const instructions = buildCodexDeveloperInstructions(job, '/tmp/job-outbox', true, nonce)
-    expect(buildCodexDeveloperInstructions(
+    const withoutAdvisor = buildCodexDeveloperInstructions(
       job,
       '/tmp/other-outbox',
       false,
       'a'.repeat(32),
       'review',
       3,
-    )).toBe(instructions)
+    )
+    expect(withoutAdvisor).not.toBe(instructions)
+    expect(withoutAdvisor).toContain('external advisor transport is unavailable')
     expect(instructions).toContain('Follow the applicable AGENTS.md')
     expect(instructions).toContain('There is one primary Codex workflow now.')
     expect(instructions).toContain('You own that workflow')
@@ -8896,7 +8901,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('public HTTPS')
     expect(instructions).not.toContain('never use an operator browser or a remote URL')
     expect(instructions).not.toContain('process-separated permission protocol')
-    expect(instructions).not.toContain('advisor_round')
+    expect(instructions).toContain('advisor_round phase=investigation')
+    expect(instructions).toContain('returned slotSummary')
+    expect(instructions).toContain('Do not call\nthe legacy separate design phase')
     expect(instructions).not.toContain('Do not push or create a PR')
     expect(instructions).not.toContain('ZERO_NATIVE_ADVISOR')
     expect(instructions).not.toContain(nonce)
@@ -8908,6 +8915,14 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(direct).toContain('Access mode: write-authorized primary workflow.')
     expect(direct).toContain('The host will not run a later prepare, review, publication, merge, or deployment phase.')
     expect(direct).not.toContain('ZERO_NATIVE_ADVISOR')
+    const advised = buildCodexWorkerPrompt(job, snapshot, {
+      attemptNonce: nonce,
+      artifactDir: '/tmp/job-outbox',
+      advisorEnabled: true,
+    })
+    expect(advised).toContain('Advisor transport: zerokun_advisors')
+    expect(advised).toContain('Base any advisor-count statement only on slotSummary')
+    expect(advised).toContain('Do not use the legacy design phase')
     const prepare = buildCodexPhasePrompt(
       job,
       'prepare',
@@ -10439,6 +10454,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('tool_timeout_sec=1900')
       expect(overrides).toContain('tool_timeout_sec=180')
       expect(overrides).toContain('tool_timeout_sec=30')
+      expect(overrides).toContain('required=false')
       expect(overrides).toContain('required=true')
       expect(overrides).not.toContain('.grok/auth.json')
       expect(overrides).not.toContain('HERDR_SOCKET_PATH')
@@ -11471,6 +11487,161 @@ describe('Slack output guard', () => {
       result: 'Codex と Grok は役割が異なります。',
     }, state)
     expect(finalized.result).toBe('Codex と Grok は役割が異なります。')
+    store.close()
+  })
+
+  test('advisor実行数のモデル作文はterminal journal由来のhost集計へ置き換える', () => {
+    const state = fixtureDir()
+    const repo = join(state, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({
+      repoPath: repo,
+      task: '5つの独立レビュー枠が実際に動いたか教えて',
+    }))
+    const job = store.claimNext('serial-worker')!
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'coverage-session',
+      result: '5つの独立レビュー枠をすべて試行し、有効だった2枠を採択しました。検討結果は問題ありません。',
+      advisorCoverage: {
+        version: 1,
+        phases: [{
+          phase: 'investigation', inputRevision: 1, finishedAt: 100,
+          total: 5, started: 2, responsesObtained: 2, startedNoResponse: 0,
+          startUnconfirmed: 2, unavailableBeforeStart: 1,
+          slots: [
+            { slot: 'codex-solution', state: 'response-obtained' },
+            { slot: 'codex-risk', state: 'response-obtained' },
+            { slot: 'grok-solution', state: 'start-unconfirmed' },
+            { slot: 'grok-risk', state: 'start-unconfirmed' },
+            { slot: 'claude', state: 'unavailable-before-start' },
+          ],
+        }],
+      },
+    }, state)
+    expect(finalized.result).not.toContain('すべて試行')
+    expect(finalized.result).toContain('検討結果は問題ありません。')
+    expect(finalized.result).toContain(
+      '独立レビュー実行記録(ホスト確認): 初期設計—起動2/5・回答2/5'
+        + '・起動済み未回答0/5・起動未確認2/5・起動前利用不能1/5。',
+    )
+    expect(finalized).not.toHaveProperty('advisorCoverage')
+    store.close()
+  })
+
+  test('host記録がないadvisor件数は実行済みと報告せず進捗からは除外する', () => {
+    const falseClaim = '5つの独立レビュー枠をすべて実行しました。通常作業は継続中です。'
+    expect(enforceHostAdvisorCoverage(falseClaim, undefined, 'progress'))
+      .toBe('通常作業は継続中です。')
+    expect(enforceHostAdvisorCoverage(falseClaim, undefined, 'result')).toBe(
+      '通常作業は継続中です。\n\n'
+        + '独立レビュー実行記録(ホスト確認): '
+        + '完了した実行記録なし（実行済みとは報告しません）。',
+    )
+    expect(enforceHostAdvisorCoverage(
+      '最終コードレビューで必須修正はありません。', undefined, 'result',
+    )).toBe('最終コードレビューで必須修正はありません。')
+    expect(enforceHostAdvisorCoverage(
+      '5つの変更ファイルを確認し、テストも完了しました。', undefined, 'result',
+    )).toBe('5つの変更ファイルを確認し、テストも完了しました。')
+
+    for (const claim of [
+      'はい、5人で検証しました。',
+      'Grokは2件とも起動できず、Claudeも使えませんでした。',
+      '独立レビューを実施しました。残る3枠は起動できませんでした。',
+      '残る3枠は安全な起動条件を確認できなかったため不採択です。',
+      '有効だった2枠だけを採択しました。',
+      '3枠は利用不能でした。',
+      '全5モデルから回答を得ました。',
+      '5モデルの見解が揃いました。',
+      '全モデルの意見が一致しました。',
+    ]) {
+      expect(enforceHostAdvisorCoverage(claim, undefined, 'progress')).toBe('')
+    }
+    expect(enforceHostAdvisorCoverage(
+      '5つの独立レビュー枠をすべて試行し、有効だった2枠と私のコード精査は一致しました。'
+        + '残る3枠は安全な起動条件を確認できなかったため不採択です。今回は検討のみです。',
+      undefined,
+      'progress',
+    )).toBe('今回は検討のみです。')
+
+    for (const ordinary of [
+      '5つの変更ファイルを確認しました。',
+      'Grokのネットワーク設定修正が完了しました。',
+      'Claude executableの探索を修正し、テストに成功しました。',
+      'Grok reviewerを実際に起動できるようにしました。',
+      'Claudeレビュー枠の起動経路を修正しました。',
+      'Codexレビューで5件の必須修正を確認しました。',
+      '独立レビューを実施しました。変更ファイルは3件です。テストは10件通りました。',
+      '5枠のレビューを実施しました。修正したファイルは2件です。',
+    ]) {
+      const guarded = enforceHostAdvisorCoverage(ordinary, undefined, 'progress')
+      if (ordinary.startsWith('独立レビュー') || ordinary.startsWith('5枠のレビュー')) {
+        expect(guarded).not.toContain(ordinary.split('。')[0]!)
+        expect(guarded).toContain(ordinary.split('。').slice(1).filter(Boolean).join('。'))
+      } else {
+        expect(guarded).toBe(ordinary)
+      }
+    }
+  })
+
+  test('長い完了本文でもhost advisor集計を12,000字内の末尾に保持する', () => {
+    const state = fixtureDir()
+    const repo = join(state, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo, task: '長い結果を確認して' }))
+    const job = store.claimNext('serial-worker')!
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'long-coverage-session',
+      result: '本文'.repeat(8_000),
+      advisorCoverage: {
+        version: 1,
+        phases: [{
+          phase: 'review', inputRevision: 2, finishedAt: 200,
+          total: 5, started: 4, responsesObtained: 3, startedNoResponse: 1,
+          startUnconfirmed: 1, unavailableBeforeStart: 0,
+          slots: [
+            { slot: 'codex-solution', state: 'response-obtained' },
+            { slot: 'codex-risk', state: 'response-obtained' },
+            { slot: 'grok-solution', state: 'response-obtained' },
+            { slot: 'grok-risk', state: 'started-no-response' },
+            { slot: 'claude', state: 'start-unconfirmed' },
+          ],
+        }],
+      },
+    }, state)
+    expect(finalized.result.length).toBeLessThanOrEqual(12_000)
+    expect(finalized.result).toEndWith(
+      '独立レビュー実行記録(ホスト確認): 最終レビュー—起動4/5・回答3/5'
+        + '・起動済み未回答1/5・起動未確認1/5・起動前利用不能0/5。',
+    )
+    store.close()
+  })
+
+  test('更新前に保存された完了通知もSlack送信境界でadvisor自己申告を除去する', async () => {
+    const store = makeStore()
+    const queued = store.enqueue(input({ messageId: 'legacy-advisor-claim' })).job
+    const running = store.claimNext('serial-worker')!
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      addReaction: async () => {},
+      postMessage: async request => { posted.push(request.text) },
+    })
+    await notifier.completed(
+      store.get(queued.id) ?? running,
+      '5つの独立レビュー枠をすべて試行しました。残る3枠は利用不能でした。通常回答です。',
+    )
+    expect(posted).toEqual(['通常回答です。'])
+
+    posted.length = 0
+    await notifier.completed(
+      store.get(queued.id) ?? running,
+      '回答本文です。\n\n独立レビュー実行記録(ホスト確認): '
+        + '初期設計—起動2/5・回答2/5・起動済み未回答0/5'
+        + '・起動未確認2/5・起動前利用不能1/5。',
+    )
+    expect(posted[0]).toContain('独立レビュー実行記録(ホスト確認)')
     store.close()
   })
 

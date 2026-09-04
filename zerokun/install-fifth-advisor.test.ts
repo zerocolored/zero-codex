@@ -511,6 +511,45 @@ describe('fifth-advisor helper installer', () => {
     expect(JSON.parse(result.stdout.toString())).toEqual({ sequence: 7, status: 'idle' })
   })
 
+  test('Claude起動argvはrequired flagを意味的に確認し順序とbenign optionだけを許容する', () => {
+    const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
+    const program = [
+      'import importlib.util,json,stat,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'metadata={"kind":"regular","file_type":stat.S_IFREG,"mode":0o100700,"uid":0,"gid":0,"nlink":1,"size":1,"dev":1,"ino":1,"rdev":0,"mtime_ns":1,"ctime_ns":1}',
+      'executable={"lookup_path":"/fixture/claude","lookup_metadata":metadata,"resolved_path":"/fixture/claude","resolved_metadata":metadata}',
+      'required=["--dangerously-skip-permissions","--safe-mode","--no-chrome","--disable-slash-commands"]',
+      'def valid(values): return module._valid_claude_invocation(["claude",*values],"claude",executable)',
+      'result={',
+      ' "exact":valid(required),',
+      ' "reordered":valid(["--effort","max",required[2],required[0],required[3],required[1]]),',
+      ' "unknown_bare_benign":valid([*required,"--diagnostic-footer"]),',
+      ' "duplicate_required":valid([*required,required[0]]),',
+      ' "required_override":valid([*required[:-1],"--disable-slash-commands=false"]),',
+      ' "resume":valid([*required,"--resume=foreign-session"]),',
+      ' "permission_override":valid([*required,"--permission-mode","default"]),',
+      ' "startup_prompt":valid([*required,"untrusted prompt"]),',
+      '}',
+      'print(json.dumps(result,sort_keys=True))',
+    ].join('\n')
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], {
+      stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(JSON.parse(result.stdout.toString())).toEqual({
+      duplicate_required: false,
+      exact: true,
+      permission_override: false,
+      reordered: true,
+      required_override: false,
+      resume: false,
+      startup_prompt: false,
+      unknown_bare_benign: true,
+    })
+  })
+
   test('agent_not_ready後のblocked launchはexact trust検査へだけ渡す', () => {
     const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
     const program = [
@@ -803,6 +842,14 @@ describe('fifth-advisor helper installer', () => {
     const state = JSON.parse(readFileSync(lifecycle.state, 'utf8')) as Record<string, unknown>
     state.process_changed = true
     writeFileSync(lifecycle.state, `${JSON.stringify(state)}\n`, { mode: 0o600 })
+
+    const rejectedSend = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'send',
+      '--project-root', project, '--request-dir', request, '--owned',
+    ], { env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(rejectedSend.exitCode).not.toBe(0)
+    expect(rejectedSend.stdout.toString()).not.toContain('prompt-started')
+    expect(existsSync(join(request, 'ephemeral-send-receipt.json'))).toBe(false)
 
     const closed = Bun.spawnSync([
       '/usr/bin/python3', helper, 'close',

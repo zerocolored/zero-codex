@@ -16,10 +16,13 @@ import {
   reviewerConfig,
   reviewerRequirements,
   reviewerSandbox,
+  renderedGrokIdentity,
+  renderedGrokOAuthLauncher,
 } from './install-grok-reviewer.ts'
 import { resolveCodexExecutableDetails } from './standalone-codex.ts'
 
 export const DEDICATED_GROK_RELATIVE_PATH = '.grok-reviewer/bin/grok' as const
+export const DEDICATED_GROK_OAUTH_RELATIVE_PATH = '.grok-reviewer/bin/grok-login-oauth' as const
 
 function sameMetadata(left: Stats, right: Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
@@ -122,6 +125,44 @@ export function resolveDedicatedGrokLauncher(home = homedir()): string {
   }
 }
 
+/** Resolve the separately optional, fixed no-argument OAuth recovery helper. */
+export function resolveDedicatedGrokOAuthHelper(home = homedir()): string {
+  const homePhysical = realpathSync(home)
+  const reviewerRoot = join(homePhysical, '.grok-reviewer')
+  const reviewerBin = join(reviewerRoot, 'bin')
+  const requested = join(homePhysical, DEDICATED_GROK_OAUTH_RELATIVE_PATH)
+  try {
+    requirePrivateDirectory(reviewerRoot)
+    requirePrivateDirectory(reviewerBin)
+    const grokPhysical = resolveCodexExecutableDetails(
+      join(homePhysical, '.grok', 'bin', 'grok'),
+    ).physical
+    const helper = resolveCodexExecutableDetails(requested).physical
+    if (helper !== requested) throw new Error('Grok OAuth helper must not be a symlink')
+    requireExactFile(
+      helper,
+      renderedGrokOAuthLauncher(grokPhysical, homePhysical),
+      { executable: true },
+    )
+    const runtimePath = join(reviewerBin, 'oauth-login-runtime.py')
+    const runtime = resolveCodexExecutableDetails(runtimePath).physical
+    if (runtime !== runtimePath) throw new Error('Grok OAuth runtime must not be a symlink')
+    requireExactFile(
+      runtime,
+      readTrustedFile(join(import.meta.dir, 'grok-reviewer', 'oauth-login-runtime.py')),
+      { executable: true },
+    )
+    requireExactFile(
+      join(reviewerRoot, 'grok-identity.json'),
+      renderedGrokIdentity(grokPhysical),
+      { private: true },
+    )
+    return helper
+  } catch {
+    throw new Error(`専用Grok OAuth helperが未導入または安全ではありません: ${requested}`)
+  }
+}
+
 if (import.meta.main) {
   try {
     const [command] = process.argv.slice(2)
@@ -129,6 +170,7 @@ if (import.meta.main) {
       throw new Error('usage: advisor-prerequisites.ts verify-grok')
     }
     resolveDedicatedGrokLauncher()
+    resolveDedicatedGrokOAuthHelper()
     process.stdout.write('dedicated Grok reviewer: ready\n')
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)

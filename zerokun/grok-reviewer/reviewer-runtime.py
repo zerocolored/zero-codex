@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
 import signal
 import stat
@@ -26,6 +27,27 @@ TERMINATION_GRACE_SECONDS = 2
 FINAL_REAP_SECONDS = 1
 OFFICIAL_GROK_NAME = re.compile(r"grok-[0-9]+\.[0-9]+\.[0-9]+")
 MAX_GROK_BYTES = 1024 * 1024 * 1024
+MAX_AUTH_DIAGNOSTIC_BYTES = 65_536
+MAX_REVIEW_CAPTURE_BYTES = 4 * 1024 * 1024
+AUTH_REQUIRED_EXIT = 78
+AUTH_REQUIRED_MARKER = b"GROK_REVIEWER_AUTH_REQUIRED\n"
+AUTH_REQUIRED_MARKER_TOKEN = AUTH_REQUIRED_MARKER.rstrip(b"\n")
+GROK_105_NOT_SIGNED_IN = (
+    "Not signed in. To authenticate without a browser, run: "
+    "grok login --device-code Alternatively, set the XAI_API_KEY "
+    "environment variable or run `grok login` on a machine with a browser."
+)
+GROK_105_AUTH_DIAGNOSTICS = frozenset(
+    {
+        GROK_105_NOT_SIGNED_IN,
+        f"{GROK_105_NOT_SIGNED_IN} Error: {GROK_105_NOT_SIGNED_IN}",
+    }
+)
+RESERVED_AUTH_EXIT_COLLISION = 70
+RESERVED_AUTH_DIAGNOSTIC = b"Grok reviewer child used a reserved protocol value.\n"
+CAPTURE_LIMIT_EXIT = 69
+CAPTURE_LIMIT_DIAGNOSTIC = b"Grok reviewer output exceeded its safety limit.\n"
+RELAY_CHUNK_BYTES = 65_536
 
 
 class AuthCopyTimeout(Exception):
@@ -821,6 +843,94 @@ def _terminate_group(process: subprocess.Popen[bytes], signum: int) -> bool:
     return group_gone
 
 
+def _write_all(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("reviewer output could not be relayed")
+        view = view[written:]
+
+
+def _capture_size(source: object) -> int:
+    source.seek(0, os.SEEK_END)
+    return source.tell()
+
+
+def _capture_contains_reserved_marker(source: object, limit: int) -> bool:
+    overlap = len(AUTH_REQUIRED_MARKER_TOKEN) - 1
+    remaining = limit
+    tail = b""
+    source.seek(0)
+    while remaining > 0:
+        chunk = source.read(min(RELAY_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise OSError("reviewer capture changed while scanning")
+        remaining -= len(chunk)
+        combined = tail + chunk
+        if AUTH_REQUIRED_MARKER_TOKEN in combined:
+            return True
+        tail = combined[-overlap:] if overlap else b""
+    return False
+
+
+def _review_auth_required(
+    returncode: int,
+    stdout_size: int,
+    stderr_capture: object,
+) -> bool:
+    if returncode != 1 or stdout_size != 0:
+        return False
+    stderr_capture.seek(0, os.SEEK_END)
+    size = stderr_capture.tell()
+    if size <= 0 or size > MAX_AUTH_DIAGNOSTIC_BYTES:
+        return False
+    stderr_capture.seek(0)
+    raw = stderr_capture.read(MAX_AUTH_DIAGNOSTIC_BYTES + 1)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    normalized = " ".join(text.split())
+    lowered = normalized.lower()
+    excluded = (
+        "401",
+        "402",
+        "403",
+        "429",
+        "payment required",
+        "balance exhausted",
+        "quota",
+        "network",
+        "connection",
+        "timed out",
+        "timeout",
+        "tls",
+        "dns",
+        "certificate",
+        "forbidden",
+        "authentication required",
+        "session expired",
+    )
+    rate_limit = re.search(r"rate(?:[\s_\-‐-―]*)limit", lowered)
+    if rate_limit is not None or any(token in lowered for token in excluded):
+        return False
+    return normalized in GROK_105_AUTH_DIAGNOSTICS
+
+
+def _child_preexec(active_mask: set[signal.Signals]) -> None:
+    for handled in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(handled, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_SETMASK, active_mask)
+
+
+def _first_pending_signal(blocked_signals: set[signal.Signals]) -> int | None:
+    pending = signal.sigpending() & blocked_signals
+    if not pending:
+        return None
+    return min(int(signum) for signum in pending)
+
+
 def _run_supervised(reviewer_root: Path, run_root: Path, command: list[str]) -> int:
     reviewer_root = reviewer_root.resolve(strict=True)
     run_root = run_root.resolve(strict=True)
@@ -836,59 +946,247 @@ def _run_supervised(reviewer_root: Path, run_root: Path, command: list[str]) -> 
 
     blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+    active_mask = set(previous_mask) - blocked_signals
+    previous_handlers = {
+        handled: signal.getsignal(handled) for handled in blocked_signals
+    }
     process: subprocess.Popen[bytes] | None = None
+    capture_selector: selectors.BaseSelector | None = None
+    stdout_pipe: object | None = None
+    stderr_pipe: object | None = None
+    stdout_capture: object | None = None
+    stderr_capture: object | None = None
     received_signal: int | None = None
-    result = 126
-    cleanup_confirmed = False
+    capture_limit_exceeded = False
+    capture_sizes = {"stdout": 0, "stderr": 0}
+    stdout_bytes = b""
+    stderr_bytes = b""
+    outcome = "runtime-error"
+    outcome_code = 126
+    cleanup_ok = False
     try:
-        def restore_child_signal_mask() -> None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-
+        stdout_capture = tempfile.TemporaryFile(dir=run_root)
+        stderr_capture = tempfile.TemporaryFile(dir=run_root)
         process = subprocess.Popen(
             command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             start_new_session=True,
-            restore_signals=True,
-            preexec_fn=restore_child_signal_mask,
+            preexec_fn=lambda: _child_preexec(active_mask),
         )
         _write_private_exclusive(
             run_root / "child.pgid", f"{process.pid}\n".encode("ascii")
         )
+        stdout_pipe = process.stdout
+        stderr_pipe = process.stderr
+        if stdout_pipe is None or stderr_pipe is None:
+            raise OSError("reviewer capture pipes are unavailable")
+        capture_selector = selectors.DefaultSelector()
+        for pipe, capture, name in (
+            (stdout_pipe, stdout_capture, "stdout"),
+            (stderr_pipe, stderr_capture, "stderr"),
+        ):
+            os.set_blocking(pipe.fileno(), False)
+            capture_selector.register(pipe, selectors.EVENT_READ, (capture, name))
 
         def forward(signum: int, _frame: object) -> None:
             nonlocal received_signal
             if received_signal is not None:
                 return
             received_signal = signum
+            for handled in blocked_signals:
+                signal.signal(handled, signal.SIG_IGN)
+            _terminate_group(process, signum)
 
         for handled in blocked_signals:
             signal.signal(handled, forward)
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        while process.poll() is None and received_signal is None:
-            time.sleep(0.05)
+        signal.pthread_sigmask(signal.SIG_SETMASK, active_mask)
+
+        signal_drain_deadline: float | None = None
+        group_reconciled = False
+        while process.poll() is None or capture_selector.get_map():
+            if received_signal is not None:
+                if signal_drain_deadline is None:
+                    signal_drain_deadline = time.monotonic() + FINAL_REAP_SECONDS
+                if time.monotonic() >= signal_drain_deadline:
+                    break
+            if (
+                received_signal is None
+                and process.poll() is not None
+                and not group_reconciled
+            ):
+                if _process_group_is_active(process.pid):
+                    _terminate_group(process, signal.SIGTERM)
+                group_reconciled = True
+            if not capture_selector.get_map():
+                try:
+                    process.wait(timeout=0.1)
+                except (subprocess.TimeoutExpired, InterruptedError):
+                    pass
+                continue
+            for key, _event_mask in capture_selector.select(timeout=0.1):
+                try:
+                    chunk = os.read(key.fd, RELAY_CHUNK_BYTES)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    capture_selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                capture, name = key.data
+                remaining = MAX_REVIEW_CAPTURE_BYTES - capture_sizes[name]
+                if len(chunk) > remaining:
+                    if remaining > 0:
+                        capture.write(chunk[:remaining])
+                        capture_sizes[name] += remaining
+                    capture_limit_exceeded = True
+                    break
+                capture.write(chunk)
+                capture_sizes[name] += len(chunk)
+            if capture_limit_exceeded:
+                break
+
         if received_signal is not None:
-            cleanup_confirmed = _terminate_group(process, received_signal)
-            result = 128 + received_signal
+            if process.poll() is None or _process_group_is_active(process.pid):
+                _terminate_group(process, received_signal)
+        elif capture_limit_exceeded:
+            if process.poll() is None or _process_group_is_active(process.pid):
+                _terminate_group(process, signal.SIGTERM)
+        elif _process_group_is_active(process.pid):
+            _terminate_group(process, signal.SIGTERM)
+        try:
+            process.wait(timeout=FINAL_REAP_SECONDS)
+        except (subprocess.TimeoutExpired, InterruptedError):
+            _terminate_group(process, signal.SIGKILL)
+        group_gone = _wait_until_group_gone(process.pid, FINAL_REAP_SECONDS)
+        returncode = process.returncode if process.returncode is not None else 126
+
+        signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+        pending_signal = _first_pending_signal(blocked_signals)
+        committed_signal = received_signal or pending_signal
+        for handled in blocked_signals:
+            signal.signal(handled, signal.SIG_IGN)
+
+        stdout_size = capture_sizes["stdout"]
+        stderr_size = capture_sizes["stderr"]
+        if not group_gone:
+            outcome = "runtime-error"
+        elif capture_limit_exceeded:
+            outcome = "overflow"
+            outcome_code = CAPTURE_LIMIT_EXIT
+        elif committed_signal is not None:
+            outcome = "signal"
+            outcome_code = 128 + committed_signal
         else:
-            returncode = process.returncode if process.returncode is not None else 126
-            cleanup_confirmed = not _process_group_is_active(process.pid)
-            if not cleanup_confirmed:
-                cleanup_confirmed = _terminate_group(process, signal.SIGTERM)
-            result = returncode if returncode >= 0 else 128 - returncode
+            reserved_marker = _capture_contains_reserved_marker(
+                stdout_capture, stdout_size
+            ) or _capture_contains_reserved_marker(stderr_capture, stderr_size)
+            if reserved_marker or returncode == AUTH_REQUIRED_EXIT:
+                outcome = "collision"
+                outcome_code = RESERVED_AUTH_EXIT_COLLISION
+            elif (
+                _capture_size(stdout_capture) != stdout_size
+                or _capture_size(stderr_capture) != stderr_size
+            ):
+                outcome = "runtime-error"
+            elif "--prompt-file" in command and _review_auth_required(
+                returncode, stdout_size, stderr_capture
+            ):
+                outcome = "auth"
+                outcome_code = AUTH_REQUIRED_EXIT
+            else:
+                stdout_capture.seek(0)
+                stderr_capture.seek(0)
+                stdout_bytes = stdout_capture.read(stdout_size)
+                stderr_bytes = stderr_capture.read(stderr_size)
+                if len(stdout_bytes) != stdout_size or len(stderr_bytes) != stderr_size:
+                    outcome = "runtime-error"
+                else:
+                    outcome = "ordinary"
+                    outcome_code = returncode if returncode >= 0 else 128 - returncode
+    except (OSError, subprocess.SubprocessError):
+        outcome = "runtime-error"
+        outcome_code = 126
+    finally:
+        cleanup_error = False
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+            for handled in blocked_signals:
+                signal.signal(handled, signal.SIG_IGN)
+        except OSError:
+            cleanup_error = True
+        if process is not None and (
+            process.poll() is None or _process_group_is_active(process.pid)
+        ):
+            try:
+                _terminate_group(process, signal.SIGTERM)
+            except (OSError, ValueError):
+                cleanup_error = True
+        if capture_selector is not None:
+            try:
+                capture_selector.close()
+            except OSError:
+                cleanup_error = True
+        for pipe in (stdout_pipe, stderr_pipe):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    cleanup_error = True
+        for capture in (stdout_capture, stderr_capture):
+            if capture is not None:
+                try:
+                    capture.close()
+                except (OSError, ValueError):
+                    cleanup_error = True
+        cleanup_ok = _remove_run_directory(reviewer_root, run_root) and not cleanup_error
+
+    if not cleanup_ok:
+        outcome = "runtime-error"
+        outcome_code = 125
+
+    def latch_output_signal(signum: int, _frame: object) -> None:
+        nonlocal received_signal
+        if received_signal is None:
+            received_signal = signum
+        for handled in blocked_signals:
+            signal.signal(handled, signal.SIG_IGN)
+
+    try:
+        if outcome == "ordinary":
+            received_signal = None
+            for handled in blocked_signals:
+                signal.signal(handled, latch_output_signal)
+            signal.pthread_sigmask(signal.SIG_SETMASK, active_mask)
+            _write_all(sys.stdout.fileno(), stdout_bytes)
+            if received_signal is not None:
+                _write_all(sys.stderr.fileno(), stderr_bytes)
+                return 128 + received_signal
+            _write_all(sys.stderr.fileno(), stderr_bytes)
+            if received_signal is not None:
+                return 128 + received_signal
+            return outcome_code
+        if outcome == "overflow":
+            _write_all(sys.stderr.fileno(), CAPTURE_LIMIT_DIAGNOSTIC)
+        elif outcome == "collision":
+            _write_all(sys.stderr.fileno(), RESERVED_AUTH_DIAGNOSTIC)
+        elif outcome == "auth":
+            _write_all(sys.stderr.fileno(), AUTH_REQUIRED_MARKER)
+        return outcome_code
     except OSError:
-        result = 126
+        return 126
     finally:
         try:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+            if outcome == "auth" and cleanup_ok:
+                for handled in blocked_signals:
+                    signal.signal(handled, signal.SIG_IGN)
+            else:
+                for handled, previous in previous_handlers.items():
+                    signal.signal(handled, previous)
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         except OSError:
             pass
-        if process is not None and not cleanup_confirmed:
-            try:
-                cleanup_confirmed = _terminate_group(process, signal.SIGTERM)
-            except OSError:
-                cleanup_confirmed = False
-        if cleanup_confirmed:
-            cleanup_confirmed = _remove_run_directory(reviewer_root, run_root)
-    return result if cleanup_confirmed else 125
 
 
 def _verify_install(reviewer_root: Path, real_home: Path, grok: Path, auth: Path) -> int:

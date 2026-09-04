@@ -225,7 +225,12 @@ describe('Zero-kun Codex wiring', () => {
     )
     expect(executor).toContain('const herdrRuntime: HerdrRuntimeIdentity | undefined = undefined')
     expect(executor).toContain('const localAdvisorAccess = false')
-    expect(executor).toContain('const advisorMcp = undefined')
+    expect(executor).toContain("const brokerPath = requireSafeBroker('advisor-broker.ts')")
+    expect(executor).toContain('const advisorMcp = testCodexBin === undefined')
+    expect(executor).toContain("'complete', processNonce")
+    expect(executor).toContain('zerokun_advisors is the only permitted route')
+    expect(executor).toContain('Base any advisor-count statement only on slotSummary')
+    expect(executor).not.toContain('const advisorMcp = undefined')
   })
 
   test('Slack上のsystem文面は表示名を固定せず実装名も露出しない', () => {
