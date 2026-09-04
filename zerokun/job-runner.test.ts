@@ -34,6 +34,7 @@ import {
   SERIAL_WORKER_COUNT,
   createSlackIdentityPauseGuard,
   extractArtifactPaths,
+  encodeSlackGuardNonce,
   flushUiApprovalNotifications,
   flushTerminalNotifications,
   finalizeSuccessfulExecution,
@@ -11079,6 +11080,24 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
 })
 
 describe('Slack output guard', () => {
+  test('commit保護nonceは内部名称やID形式と衝突しない', () => {
+    const formerlyColliding = encodeSlackGuardNonce(
+      '09d00000-0000-4000-8000-000000000000',
+    )
+    const second = encodeSlackGuardNonce(
+      '0b840000-0000-4000-8000-000000000000',
+    )
+
+    expect(formerlyColliding).not.toMatch(/gpt|grok/i)
+    expect(second).not.toMatch(/gpt|grok/i)
+    expect(formerlyColliding).not.toMatch(/[0-9a-f]{32,64}/i)
+    expect(formerlyColliding).not.toMatch(/\b[UCBWD][A-Z0-9]{8,}\b/)
+    expect(formerlyColliding).not.toBe(second)
+    expect(() => encodeSlackGuardNonce('not-a-uuid')).toThrow(
+      'Slack guard placeholder entropy is invalid',
+    )
+  })
+
   test('rate-limit通知は表示名を固定せず内部job識別子を含めない', () => {
     const message = slackRateLimitMessage(Date.UTC(2026, 0, 2, 3, 4))
     expect(message).not.toContain('Zeroちゃん')
