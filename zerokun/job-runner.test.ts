@@ -1431,7 +1431,7 @@ describe('Codex job store', () => {
       store,
       maxJobsPerSession: 5,
       pollMs: 1,
-      retainedAttachmentRetryMsForTesting: 1,
+      retainedAttachmentRetryMsForTesting: 60_000,
       stopWhenIdle: true,
       executor: async job => {
         attempts += 1
@@ -1445,8 +1445,15 @@ describe('Codex job store', () => {
       },
     })
     expect(firstPass).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
-    expect(store.get(followup.id)).toMatchObject({ status: 'queued', attempts: 1 })
-    await Bun.sleep(5)
+    const deferred = store.get(followup.id)
+    expect(deferred).toMatchObject({ status: 'queued', attempts: 1 })
+    expect(deferred!.notBefore).toBeGreaterThan(Date.now())
+    const retryClock = new Database(store.dbPath)
+    retryClock.run(
+      'UPDATE jobs SET not_before = ? WHERE id = ? AND status = ?',
+      [Date.now() - 1, followup.id, 'queued'],
+    )
+    retryClock.close()
     const secondPass = await runQueuedJobs({
       store,
       maxJobsPerSession: 5,
