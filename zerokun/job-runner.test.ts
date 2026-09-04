@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, setSystemTime, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { createHash } from 'crypto'
 import {
@@ -246,6 +246,7 @@ function stageFixtureExecution(
 const temporaryDirs: string[] = []
 
 afterEach(() => {
+  setSystemTime()
   for (const dir of temporaryDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
@@ -1401,6 +1402,8 @@ describe('Codex job store', () => {
   })
 
   test('一時I/O失敗は添付台帳を保持してbackoff後に再試行する', async () => {
+    const initialTime = Date.now()
+    setSystemTime(initialTime)
     const root = fixtureDir('zero-retained-attachment-transient-')
     const state = join(root, 'state')
     const repo = join(root, 'repo')
@@ -1431,7 +1434,7 @@ describe('Codex job store', () => {
       store,
       maxJobsPerSession: 5,
       pollMs: 1,
-      retainedAttachmentRetryMsForTesting: 60_000,
+      retainedAttachmentRetryMsForTesting: 1,
       stopWhenIdle: true,
       executor: async job => {
         attempts += 1
@@ -1447,13 +1450,8 @@ describe('Codex job store', () => {
     expect(firstPass).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
     const deferred = store.get(followup.id)
     expect(deferred).toMatchObject({ status: 'queued', attempts: 1 })
-    expect(deferred!.notBefore).toBeGreaterThan(Date.now())
-    const retryClock = new Database(store.dbPath)
-    retryClock.run(
-      'UPDATE jobs SET not_before = ? WHERE id = ? AND status = ?',
-      [Date.now() - 1, followup.id, 'queued'],
-    )
-    retryClock.close()
+    expect(deferred!.notBefore).toBe(initialTime + 1)
+    setSystemTime(initialTime + 5)
     const secondPass = await runQueuedJobs({
       store,
       maxJobsPerSession: 5,
