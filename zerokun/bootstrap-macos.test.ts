@@ -2415,7 +2415,10 @@ codex --version
       const updateScript = [
         'import { Database } from "bun:sqlite"',
         `const db = new Database(${JSON.stringify(dbPath)})`,
+        'db.exec("BEGIN EXCLUSIVE")',
         'db.run("UPDATE jobs SET status = ? WHERE id = ?", ["queued", "self-exit-job"])',
+        'Bun.spawnSync(["/bin/sleep", "3"])',
+        'db.exec("COMMIT")',
         'db.close()',
       ].join('; ')
       writeFileSync(legacyPath, [
@@ -2446,6 +2449,7 @@ codex --version
       })
       expect(setup.exitCode, setup.stderr.toString()).toBe(0)
       expect(setup.stdout.toString()).toContain('▶ Codex版standalone setup')
+      expect(setup.stdout.toString()).toContain('SQLiteの一時的な競合が解消するまで待っています...')
       expect(await legacyRunner.exited).toBe(0)
       expect(existsSync(join(stateDir, 'job-runner.lock/pid'))).toBe(false)
     } finally {

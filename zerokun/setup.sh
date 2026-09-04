@@ -424,15 +424,19 @@ legacy_running_state() {
   local db="$CH/jobs.sqlite3"
   [ -f "$db" ] || return 0
   ZEROKUN_CUTOVER_DB="$db" bun --config=/dev/null --no-env-file -e '
-    import { Database } from "bun:sqlite";
+    import { Database, SQLiteError } from "bun:sqlite";
     const db = new Database(process.env.ZEROKUN_CUTOVER_DB!, { readonly: true });
     let count = -1;
+    let status = 70;
     try {
       const row = db.query("SELECT COUNT(*) AS count FROM jobs WHERE status = ?").get("running") as { count: number };
       count = row.count;
+      if (Number.isSafeInteger(count) && count >= 0) status = count > 0 ? 10 : 0;
+    } catch (error) {
+      if (error instanceof SQLiteError && (error.errno & 0xff) === 5) status = 11;
+      else throw error;
     } finally { db.close(); }
-    if (!Number.isSafeInteger(count) || count < 0) process.exit(70);
-    process.exit(count > 0 ? 10 : 0);
+    process.exit(status);
   '
 }
 
@@ -461,10 +465,14 @@ if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$
       break
     else
       running_state=$?
-      [ "$running_state" -eq 10 ] || {
-        echo "❌ 実行中job件数を安全に確認できません。旧runnerは停止していません。" >&2
-        exit 1
-      }
+      case "$running_state" in
+        10) ;;
+        11) echo "   SQLiteの一時的な競合が解消するまで待っています..." ;;
+        *)
+          echo "❌ 実行中job件数を安全に確認できません。旧runnerは停止していません。" >&2
+          exit 1
+          ;;
+      esac
     fi
     [ "$(date +%s)" -lt "$drain_deadline" ] || {
       echo "❌ 実行中jobのdrain待ちがtimeoutしました。旧runnerは停止していません。" >&2
