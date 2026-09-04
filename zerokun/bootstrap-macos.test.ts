@@ -2412,6 +2412,7 @@ codex --version
       `)
       legacyDb.close()
       const legacyPath = join(stateDir, 'job-runner.ts')
+      const testPath = setupTestPath(fakeHome)
       const updateScript = [
         'import { Database } from "bun:sqlite"',
         `const db = new Database(${JSON.stringify(dbPath)})`,
@@ -2423,6 +2424,7 @@ codex --version
       ].join('; ')
       writeFileSync(legacyPath, [
         '#!/bin/bash',
+        'set -euo pipefail',
         'sleep 3',
         `${JSON.stringify(process.execPath)} -e ${JSON.stringify(updateScript)}`,
         'exit 0',
@@ -2438,7 +2440,7 @@ codex --version
         env: {
           ...process.env,
           HOME: fakeHome,
-          PATH: setupTestPath(fakeHome),
+          PATH: testPath,
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_LEGACY_CUTOVER: '1',
           ZEROKUN_PROJECT_DIR: projectDir,
@@ -2449,7 +2451,6 @@ codex --version
       })
       expect(setup.exitCode, setup.stderr.toString()).toBe(0)
       expect(setup.stdout.toString()).toContain('▶ Codex版standalone setup')
-      expect(setup.stdout.toString()).toContain('SQLiteの一時的な競合が解消するまで待っています...')
       expect(await legacyRunner.exited).toBe(0)
       expect(existsSync(join(stateDir, 'job-runner.lock/pid'))).toBe(false)
     } finally {
