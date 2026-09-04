@@ -16,7 +16,7 @@ job-runner.ts
   ↓ verified Herdr context / codex app-server --stdio
 Codex App Server（1 jobにつき1つのprimary Codex workflow）
   ├→ AGENTS.mdに従って調査・実装・review・Git・deployを自律実行
-  └→ 必要時だけ認証情報を隠したGitHub／localhost確認toolを利用
+  └→ 必要時だけ認証情報を隠したGitHub／Browser・Chrome確認toolを利用
   ↓ 最終回答と明示された成果物だけ
 Slack bot
 ```
@@ -40,7 +40,8 @@ Slack bot
 - 論理履歴の永続archive自体をscopeごとの直近64 jobに圧縮し、省略件数だけを台帳へ残します。
   各実行snapshotも直近64 job blockかつ128 Ki文字／256 KiBまでです。現在の依頼とhost権限が常に優先され、
   過去の回答は参考情報として再確認されます。credential、local path、内部ID、成果物pathは保存前に除去し、
-  添付は件数だけ残すため、後から実ファイルが必要な場合は再添付してください。導入前にすでに30日GCされた
+  添付はSlackスレッドへ永続的にひも付け、同じスレッドの継続・失敗後の再開・Codex sessionの
+  rotation・zerochan再起動後にも、検証済みの同一ファイルを読み取り専用で再利用します。導入前にすでに30日GCされた
   jobは復元できません。
 - 実行中の同じSlackスレッドへの返信は、別userからでも同じCodex threadへ渡します。単なる質問は
   現在作業の文脈で先に回答し、更新依頼は同じworkflowの入力へ昇格して続行します。
@@ -55,9 +56,11 @@ Slack bot
   実装を解放します。質問、却下、条件付き回答は承認にせず、Codexが回答内容を踏まえて必要な提案更新を
   判断します。待機中はworkerと監視tabを解放し、別threadのjobは
   続行できますが、同じthreadの後続jobは承認対象を追い越しません。`中止`は待機中も利用できます。
-- 長時間jobでは、Codex本人が監視tabへ出した短い日本語の`💬 commentary`を、その発生ごとに
-  同じSlack threadへFIFOで投稿します。固定時刻の問い合わせ、固定stage文、推測の進捗率は使いません。
-  配送はSQLiteへ先に保存して再試行し、terminalは未配送のcommentaryを追い越しません。
+- 監視tabにはCodex本人の短い日本語commentaryと技術的な進行を随時表示します。Slackへはその全件を
+  転送せず、原因・方針の確定、実装完了から検証への移行、ユーザー判断または外部状態を本当に待つ停止要因、
+  最終結果という利用者に意味のある節目だけを投稿します。長時間無言にならないよう、10分、30分、60分、
+  以後1時間ごとには同じactive turnへ短い状況照会を行います。固定stageや推測の進捗率は使いません。
+  節目と定時報告はSQLiteへ先に保存して再試行し、terminalは未配送の公開対象を追い越しません。
   受付には`eyes`、正常完了時には元メッセージへ`white_check_mark` reactionを付けます。本文は
   Slackアシスタントとして一人称の簡潔で温かい日本語と自然な絵文字1〜2個を使い、固定の表示名や
   内部engine名は表示しません。
@@ -85,10 +88,14 @@ Slack bot
   独自のprepare／implementation／review／publication phaseやreview照合を追加しません。
 - 受信許可と書込み許可は別です。既定profileはrepository readとjob outbox writeだけです。`writeAllowFrom` を
   明示した利用者だけrepository・`.git` writeとネットワークを使えますが、Mac全体のsandboxは解除しません。
-- write許可されたWebタスクでは、primary Codexに`verify_local_page`を公開します。
-  既存Chrome session・拡張・個人profileは使わず、署名済みGoogle Chromeをowner-onlyの一時profileで起動し、
-  明示したlocalhost origin以外のHTTP/WebSocketをdeny-by-default proxyで遮断します。HTTP 2xx、描画後DOMの
-  期待文字列、1280×720 PNG、遮断request数、Chrome子processと一時profileの回収をまとめて返します。
+- write許可されたWebタスクでは、primary Codexへ利用可能なBrowser／Chrome能力を渡し、localhostだけでなく
+  依頼対象の公開HTTPS環境も実際に開いて確認できます。設定済みの`go-chrome-mcp`は起動時に取得した
+  owner管理のtransportを固定し、cookie取得・任意JavaScript等を除いた画面操作だけを引き渡します。
+  Chrome拡張との接続にはhost側の既存bridgeを使いますが、Codex shellのHOMEはjob scratchへ隔離したままです。
+  それ以外の一般MCPは無効のままです。localhost用には
+  `verify_local_page`も残し、署名済みGoogle Chromeをowner-onlyの一時profileで起動して、明示したorigin以外の
+  HTTP/WebSocketを遮断します。HTTP 2xx、描画後DOMの期待文字列、1280×720 PNG、遮断request数、
+  Chrome子processと一時profileの回収をまとめて返します。
   UI/UX承認前は製品repositoryを書き換えず、現在画面とscratch内だけの提案画面を撮影します。画像は
   完全decode後にpixel-bearing chunkだけへ再封印し、metadataとローカルpathをSlackへ持ち出しません。
 - advisorの要否、人数、取得結果の扱いは`AGENTS.md`に従ってCodexが決めます。Zeroちゃんはadvisorを
@@ -169,7 +176,7 @@ Zeroちゃんは認証画面を開かず、tokenやSSH keyをCodexへ渡しま�
 操作できる`zerokun_github`をCodexへ公開します。これは認証済み`gh`／Git pushを実行する薄いtransportで、
 作業手順や安全判定を決める別のorchestratorではありません。branch選択、commit、push、PR作成・承認・
 merge、checks待機、deploy確認は、依頼と各repositoryの`AGENTS.md`を読んだCodexが同じworkflow内で判断・
-実行します。GitHub外の実環境確認はCodexが対象projectの通常手順やlocalhost browser確認で行います。
+実行します。GitHub外の実環境確認はCodexが利用可能なBrowser／Chromeまたは対象projectの通常手順で行います。
 
 既にclone済みなら、次だけで構いません。
 
@@ -464,8 +471,9 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   jobを停止しません。
 - `thread/start`は`ephemeral:false`なので、Codex/provider側のnative履歴はZeroちゃんのSQLiteとは別に
   残り得ます。Codexがadvisorを利用した場合は各providerの保持方針も適用されます。
-- apps・plugins・hookと一般MCPは無効化し、localhost表示確認用`zerokun_browser`と、認証情報を
-  隠したGitHub transport用`zerokun_github`だけを必要なwrite jobで有効にします。
+- apps・plugins・hookと一般MCPは無効化し、localhost表示確認用`zerokun_browser`、認証情報を
+  隠したGitHub transport用`zerokun_github`、およびoperatorが設定済みの検証済みChrome transportだけを
+  必要なwrite jobで有効にします。
   Web検索はwrite許可jobだけに限定し、write jobのcommand networkはproxyを通してSlack関連domainを拒否します。
 - Zeroちゃんはadvisor数、review round、phase marker、publication planを成功条件として照合しません。
   `AGENTS.md`に従った相談とreviewはprimary Codexのworkflow内で完結し、利用不能なadvisorだけを理由に
@@ -502,7 +510,7 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - `zerokun/job-runner.ts`: SQLite queue、session/thread 所有権、Slack 完了通知
 - `zerokun/runner-launcher.ts`: runnerの独立process group起動、安全なlog接続
 - `zerokun/codex-executor.ts`: Codex App Server実行、turn/control処理、sandbox分離
-- `zerokun/browser-verification-broker.ts`: localhost限定のChrome描画・PNG検証
+- `zerokun/browser-verification-broker.ts`: localhost用の隔離Chrome描画・PNG検証
 - `zerokun/github-credential-broker.ts`: credentialを隠したrepository限定GitHub transport
 - `zerokun/access.ts`: pairing・受信権限・書込み権限の管理 CLI
 - `codex-channel.sh`: standalone gateway と runner の launcher

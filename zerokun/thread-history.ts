@@ -119,7 +119,7 @@ export function sanitizeThreadHistoryText(value: string): string {
   )
   sanitized = sanitized.replace(/\bZERO_[A-Z0-9_:-]+\b/g, '[historical marker omitted]')
   sanitized = sanitized.replace(
-    /---\s*(?:end\s+)?(?:Prior Slack thread history|Slack request|Zero host (?:phase )?control)[^\n-]*---/gi,
+    /---\s*(?:end\s+)?(?:Prior Slack thread history|Slack request|Zero host (?:(?:phase )?control|attachment bindings))[^\n-]*---/gi,
     '[historical control delimiter omitted]',
   )
   sanitized = sanitized
@@ -154,7 +154,7 @@ function renderEvent(event: ThreadHistoryEvent): string | null {
   const body = [
     ...(text ? text.split('\n').map(line => `│ ${line}`) : []),
     ...(attachment > 0
-      ? [`│ ${attachment} attachment(s) existed; local copies are not retained in history.`]
+      ? [`│ ${attachment} attachment(s) existed; files are retained by the host's thread binding.`]
       : []),
   ]
   return `[${eventLabel(event)}]\n${body.join('\n')}`

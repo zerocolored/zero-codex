@@ -78,11 +78,13 @@ import {
   CodexPublicationPreflightRetryError,
   CodexRepositoryChangedBeforeImplementationError,
   CodexRepositoryChangedBeforePublicationError,
+  RetainedSlackAttachmentUnavailableError,
   CodexUserCancelledError,
   codexAttemptDisposition,
   codexRateLimitResumeAt,
   CodexRateLimitError,
   artifactDirForJob,
+  browserCaptureDirForJob,
   buildCodexChildEnvironment,
   assertCodexChatGptSubscriptionLogin,
   buildCodexTrustArguments,
@@ -91,6 +93,7 @@ import {
   buildCodexPhasePrompt,
   buildCodexPermissionOverrides,
   buildCodexWorkerPrompt,
+  buildCodexInterjectionPrompt,
   codexThreadIdFromEvent,
   executeCodexJob,
   extractCodexRateLimit,
@@ -309,6 +312,58 @@ function uiApprovalRepositorySnapshot(
 
 function makeStore(): JobStore {
   return new JobStore(join(fixtureDir(), 'jobs.sqlite3'))
+}
+
+function stageInboundAttachment(options: {
+  store: JobStore
+  stateDir: string
+  chatId: string
+  threadTs: string
+  messageId: string
+  repoPath: string
+  fileId: string
+  contents: string
+}): JobRecord {
+  const staged = options.store.stageInboundDeliveryAndAdoptSlackThread({
+    chatId: options.chatId,
+    threadTs: options.threadTs,
+    messageId: options.messageId,
+    userId: 'U0123456789',
+    repoPath: options.repoPath,
+    text: 'このPDFを確認してください',
+    fileIds: [options.fileId],
+    writeEnabled: false,
+  }, {
+    initialContextEligible: false,
+    appId: 'A0123456789',
+  })
+  expect(staged.outcome).toBe('staged')
+  const inbound = options.store.claimNextInboundDelivery()!
+  const directory = join(options.stateDir, 'inbox', options.messageId)
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  chmodSync(directory, 0o700)
+  const path = join(directory, `${options.fileId}.pdf`)
+  writeFileSync(path, options.contents, { mode: 0o600 })
+  chmodSync(path, 0o600)
+  options.store.recordInboundDownloadedFile(inbound.idempotencyKey, {
+    fileId: options.fileId,
+    ordinal: 0,
+    path,
+    size: Buffer.byteLength(options.contents),
+    digest: createHash('sha256').update(options.contents).digest('hex'),
+  })
+  const job = options.store.enqueue({
+    chatId: inbound.chatId,
+    threadTs: inbound.threadTs,
+    messageId: inbound.messageId,
+    userId: inbound.userId,
+    repoPath: inbound.repoPath,
+    task: inbound.text,
+    attachments: [path],
+    writeEnabled: inbound.writeEnabled,
+  }).job
+  options.store.completeInboundDelivery(inbound.idempotencyKey)
+  return job
 }
 
 function recordCompletedInitialPreparePhase(
@@ -1077,6 +1132,500 @@ describe('Codex job store', () => {
       candidates: [],
       omittedCandidateCount: 1,
     })
+    store.close()
+  })
+
+  test('同じSlack threadのPDFは完了・GC・再起動・cold start後も再添付なしで利用できる', () => {
+    const root = fixtureDir('zero-thread-attachment-')
+    const state = join(root, 'state')
+    const repo = join(root, 'repo')
+    mkdirSync(state, { mode: 0o700 })
+    mkdirSync(repo)
+    const dbPath = join(state, 'jobs.sqlite3')
+    const scope = {
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000100',
+      repoPath: repo,
+    }
+    let store = new JobStore(dbPath)
+    const source = stageInboundAttachment({
+      store,
+      stateDir: state,
+      ...scope,
+      messageId: '1800000000.000101',
+      fileId: 'FPDF1234567',
+      contents: '%PDF-1.7 durable-thread-fixture',
+    })
+    expect(source.threadAttachments).toEqual([
+      expect.objectContaining({
+        sourceMessageId: '1800000000.000101',
+        fileId: 'FPDF1234567',
+      }),
+    ])
+    const sourcePath = source.threadAttachments![0]!.path
+    const runningSource = store.claimNext('attachment-source-worker')!
+    store.complete(runningSource.id, 'attachment-source-session', '確認しました')
+    const sourceNotice = store.pendingTerminalNotifications()
+      .find(notification => notification.jobId === source.id)!
+    store.markTerminalNotificationDelivered(sourceNotice.id)
+    expect(store.pruneSettled({
+      stateDir: state,
+      now: Date.now() + 10_000,
+      retentionMs: 1,
+      tombstoneRetentionMs: 60_000,
+    }).jobs).toBe(1)
+    expect(store.get(source.id)).toBeNull()
+    expect(existsSync(sourcePath)).toBe(true)
+    store.close()
+
+    store = new JobStore(dbPath)
+    expect(store.listThreadAttachments(scope.chatId, scope.threadTs, repo)).toEqual([
+      expect.objectContaining({ path: sourcePath, digest: source.threadAttachments![0]!.digest }),
+    ])
+    const continuation = store.enqueue(input({
+      ...scope,
+      messageId: '1800000000.000102',
+      task: '前に添付したPDFの処理を再開してください',
+    })).job
+    const otherThread = store.enqueue(input({
+      chatId: scope.chatId,
+      threadTs: '1800000000.000200',
+      messageId: '1800000000.000200',
+      repoPath: repo,
+    })).job
+    expect(continuation.threadAttachments?.map(item => item.path)).toEqual([sourcePath])
+    expect(otherThread.threadAttachments).toEqual([])
+
+    const claimed = store.claimNext('attachment-continuation-worker')!
+    const snapshot = readAdvisorInputSnapshot(state, claimed.id)
+    const prompt = buildCodexWorkerPrompt(claimed, snapshot, {
+      attemptNonce: 'a'.repeat(32),
+      artifactDir: join(state, 'outbox', claimed.id),
+      advisorEnabled: false,
+    })
+    expect(prompt).toContain('Zero host attachment bindings')
+    expect(prompt).toContain(sourcePath)
+    expect(prompt).toContain('instead of asking the user to attach the same file again')
+    const phasePrompt = buildCodexPhasePrompt(
+      claimed, 'prepare', snapshot, 1, 'b'.repeat(32), join(state, 'outbox', claimed.id),
+    )
+    expect(phasePrompt).toContain(sourcePath)
+
+    const outbox = join(state, 'outbox', claimed.id)
+    const scratch = join(state, 'tmp', claimed.id)
+    mkdirSync(outbox, { recursive: true })
+    mkdirSync(scratch, { recursive: true })
+    const overrides = buildCodexPermissionOverrides(claimed, {
+      stateDir: state,
+      artifactDir: outbox,
+      scratchDir: scratch,
+    }).join('\n')
+    expect(overrides).toContain(`${JSON.stringify(realpathSync(sourcePath))}="read"`)
+    store.close()
+  })
+
+  test('保持済みSlack添付のdigest改変は実行前に拒否する', () => {
+    const root = fixtureDir('zero-thread-attachment-tamper-')
+    const state = join(root, 'state')
+    const repo = join(root, 'repo')
+    mkdirSync(state, { mode: 0o700 })
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const source = stageInboundAttachment({
+      store,
+      stateDir: state,
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000300',
+      messageId: '1800000000.000301',
+      repoPath: repo,
+      fileId: 'FTAMPER1234',
+      contents: 'original',
+    })
+    const sourceRun = store.claimNext('attachment-source-worker')!
+    store.complete(sourceRun.id, 'source-session', 'source complete')
+    store.enqueue(input({
+      chatId: source.chatId,
+      threadTs: source.threadTs,
+      messageId: '1800000000.000302',
+      repoPath: repo,
+      task: '以前のPDFを確認してください',
+    }))
+    writeFileSync(source.threadAttachments![0]!.path, 'tampered', { mode: 0o600 })
+    const running = store.claimNext('attachment-tamper-worker')!
+    expect(running.attachments).toEqual([])
+    const outbox = join(state, 'outbox', running.id)
+    const scratch = join(state, 'tmp', running.id)
+    mkdirSync(outbox, { recursive: true })
+    mkdirSync(scratch, { recursive: true })
+    let unavailable: RetainedSlackAttachmentUnavailableError | null = null
+    try {
+      buildCodexPermissionOverrides(running, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+      })
+    } catch (error) {
+      expect(error).toBeInstanceOf(RetainedSlackAttachmentUnavailableError)
+      unavailable = error as RetainedSlackAttachmentUnavailableError
+    }
+    expect(unavailable).not.toBeNull()
+    expect(unavailable!.reason).toBe('integrity')
+    expect(store.retireUnavailableThreadAttachment(running, unavailable!.attachment)).toBe(true)
+    const healed = store.get(running.id)!
+    expect(healed.threadAttachments).toEqual([])
+    expect(store.listThreadAttachments(
+      running.chatId, running.threadTs, running.repoPath,
+    )).toEqual([])
+    expect(() => buildCodexPermissionOverrides(healed, {
+      stateDir: state,
+      artifactDir: outbox,
+      scratchDir: scratch,
+    })).not.toThrow()
+    store.close()
+  })
+
+  test('壊れた過去添付は隔離して同じjobを自動再開する', async () => {
+    const root = fixtureDir('zero-thread-attachment-auto-heal-')
+    const state = join(root, 'state')
+    const repo = join(root, 'repo')
+    mkdirSync(state, { mode: 0o700 })
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const queued = stageInboundAttachment({
+      store,
+      stateDir: state,
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000400',
+      messageId: '1800000000.000401',
+      repoPath: repo,
+      fileId: 'FAUTOHEAL1',
+      contents: 'original-pdf',
+    })
+    const sourceRun = store.claimNext('attachment-source-worker')!
+    store.complete(sourceRun.id, 'source-session', 'source complete')
+    const followup = store.enqueue(input({
+      chatId: queued.chatId,
+      threadTs: queued.threadTs,
+      messageId: '1800000000.000402',
+      repoPath: repo,
+      task: '以前のPDFを使って続けてください',
+    })).job
+    writeFileSync(queued.threadAttachments![0]!.path, 'tampered', { mode: 0o600 })
+
+    const attempts: Array<{ attempt: number; current: number; retained: number }> = []
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async job => {
+        attempts.push({
+          attempt: job.attempts,
+          current: job.attachments.length,
+          retained: job.threadAttachments?.length ?? 0,
+        })
+        const outbox = join(state, 'outbox', job.id)
+        const scratch = join(state, 'tmp', job.id)
+        mkdirSync(outbox, { recursive: true })
+        mkdirSync(scratch, { recursive: true })
+        buildCodexPermissionOverrides(job, {
+          stateDir: state,
+          artifactDir: outbox,
+          scratchDir: scratch,
+        })
+        return { sessionId: 'attachment-healed-session', result: '再開完了' }
+      },
+    })
+
+    expect(stats).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
+    expect(attempts).toEqual([
+      { attempt: 1, current: 0, retained: 1 },
+      { attempt: 2, current: 0, retained: 0 },
+    ])
+    expect(store.get(followup.id)).toMatchObject({
+      status: 'completed',
+      attempts: 2,
+      result: '再開完了',
+    })
+    expect(store.listThreadAttachments(
+      queued.chatId, queued.threadTs, queued.repoPath,
+    )).toEqual([])
+    store.close()
+  })
+
+  test('今回添付の改変はmanifestを捨てて自動再試行しない', async () => {
+    const root = fixtureDir('zero-current-attachment-tamper-')
+    const state = join(root, 'state')
+    const repo = join(root, 'repo')
+    mkdirSync(state, { mode: 0o700 })
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const queued = stageInboundAttachment({
+      store,
+      stateDir: state,
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000450',
+      messageId: '1800000000.000451',
+      repoPath: repo,
+      fileId: 'FCURRENTBAD1',
+      contents: 'original-pdf',
+    })
+    writeFileSync(queued.threadAttachments![0]!.path, 'tampered', { mode: 0o600 })
+    let attempts = 0
+    const stats = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async job => {
+        attempts += 1
+        const outbox = join(state, 'outbox', job.id)
+        const scratch = join(state, 'tmp', job.id)
+        mkdirSync(outbox, { recursive: true })
+        mkdirSync(scratch, { recursive: true })
+        buildCodexPermissionOverrides(job, {
+          stateDir: state,
+          artifactDir: outbox,
+          scratchDir: scratch,
+        })
+        return { sessionId: 'must-not-complete', result: 'unexpected' }
+      },
+    })
+    expect(stats).toEqual({ completed: 0, failed: 1, workersStarted: 1 })
+    expect(attempts).toBe(1)
+    expect(store.get(queued.id)).toMatchObject({ status: 'failed', attempts: 1 })
+    expect(store.listThreadAttachments(
+      queued.chatId, queued.threadTs, queued.repoPath,
+    )).toHaveLength(1)
+    store.close()
+  })
+
+  test('一時I/O失敗は添付台帳を保持してbackoff後に再試行する', async () => {
+    const root = fixtureDir('zero-retained-attachment-transient-')
+    const state = join(root, 'state')
+    const repo = join(root, 'repo')
+    mkdirSync(state, { mode: 0o700 })
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const source = stageInboundAttachment({
+      store,
+      stateDir: state,
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000460',
+      messageId: '1800000000.000461',
+      repoPath: repo,
+      fileId: 'FTRANSIENT1',
+      contents: 'still-valid-pdf',
+    })
+    const sourceRun = store.claimNext('attachment-source-worker')!
+    store.complete(sourceRun.id, 'source-session', 'source complete')
+    const followup = store.enqueue(input({
+      chatId: source.chatId,
+      threadTs: source.threadTs,
+      messageId: '1800000000.000462',
+      repoPath: repo,
+      task: '以前のPDFを確認してください',
+    })).job
+    let attempts = 0
+    const firstPass = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      retainedAttachmentRetryMsForTesting: 1,
+      stopWhenIdle: true,
+      executor: async job => {
+        attempts += 1
+        if (attempts === 1) {
+          throw new RetainedSlackAttachmentUnavailableError(
+            job.threadAttachments![0]!,
+            'transient',
+          )
+        }
+        return { sessionId: 'transient-recovered', result: '再開完了' }
+      },
+    })
+    expect(firstPass).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+    expect(store.get(followup.id)).toMatchObject({ status: 'queued', attempts: 1 })
+    await Bun.sleep(5)
+    const secondPass = await runQueuedJobs({
+      store,
+      maxJobsPerSession: 5,
+      pollMs: 1,
+      stopWhenIdle: true,
+      executor: async () => {
+        attempts += 1
+        return { sessionId: 'transient-recovered', result: '再開完了' }
+      },
+    })
+    expect(secondPass).toEqual({ completed: 1, failed: 0, workersStarted: 1 })
+    expect(attempts).toBe(2)
+    expect(store.get(followup.id)).toMatchObject({ status: 'completed', attempts: 2 })
+    expect(store.listThreadAttachments(
+      source.chatId, source.threadTs, source.repoPath,
+    )).toEqual(source.threadAttachments)
+    store.close()
+  })
+
+  test('失敗済みjobとdaemon再起動後の再queueでもthread添付を失わない', () => {
+    const root = fixtureDir('zero-thread-attachment-recovery-')
+    const state = join(root, 'state')
+    const repo = join(root, 'repo')
+    mkdirSync(state, { mode: 0o700 })
+    mkdirSync(repo)
+    const dbPath = join(state, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const source = stageInboundAttachment({
+      store,
+      stateDir: state,
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000500',
+      messageId: '1800000000.000501',
+      repoPath: repo,
+      fileId: 'FRECOVER123',
+      contents: 'recoverable-pdf',
+    })
+    const failed = store.claimNext('attachment-failure-worker')!
+    store.fail(failed.id, 'fixture failure after investigation')
+    const followup = store.enqueue(input({
+      chatId: source.chatId,
+      threadTs: source.threadTs,
+      messageId: '1800000000.000502',
+      repoPath: repo,
+      task: '失敗した処理を再開してください',
+    })).job
+    const running = store.claimNext('attachment-recovery-worker')!
+    expect(running.id).toBe(followup.id)
+    expect(running.threadAttachments).toEqual(source.threadAttachments)
+    store.close()
+
+    store = new JobStore(dbPath)
+    expect(store.recoverInterrupted()).toMatchObject({ requeued: 1 })
+    const retried = store.claimNext('attachment-restarted-worker')!
+    expect(retried.id).toBe(followup.id)
+    expect(retried.threadAttachments).toEqual(source.threadAttachments)
+    expect(buildCodexWorkerPrompt(
+      retried,
+      readAdvisorInputSnapshot(state, retried.id),
+    )).toContain(source.threadAttachments![0]!.path)
+    store.close()
+  })
+
+  test('実行中threadへの添付はinterjectionへ固定し旧copyも移行できる', () => {
+    const root = fixtureDir('zero-thread-live-attachment-')
+    const state = join(root, 'state')
+    const repo = join(root, 'repo')
+    mkdirSync(state, { mode: 0o700 })
+    mkdirSync(repo)
+    const dbPath = join(state, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const rootJob = store.enqueue(input({
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000600',
+      messageId: '1800000000.000600',
+      repoPath: repo,
+    })).job
+    store.claimNext('live-attachment-worker')
+    const target = store.liveControlTarget(rootJob.chatId, rootJob.threadTs)!
+    expect(store.stageInboundDeliveryForControl({
+      chatId: rootJob.chatId,
+      threadTs: rootJob.threadTs,
+      messageId: '1800000000.000601',
+      userId: rootJob.userId,
+      repoPath: repo,
+      text: 'この追加PDFも見てください',
+      fileIds: ['FLIVE123456'],
+      writeEnabled: false,
+    }, target)).toBe('bound')
+    const inbound = store.claimNextInboundDelivery()!
+    const inboxDirectory = join(state, 'inbox', inbound.messageId)
+    mkdirSync(inboxDirectory, { recursive: true, mode: 0o700 })
+    chmodSync(inboxDirectory, 0o700)
+    const original = join(inboxDirectory, 'FLIVE123456.pdf')
+    writeFileSync(original, 'live-control-pdf', { mode: 0o600 })
+    chmodSync(original, 0o600)
+    store.recordInboundDownloadedFile(inbound.idempotencyKey, {
+      fileId: 'FLIVE123456',
+      ordinal: 0,
+      path: original,
+      size: 16,
+      digest: createHash('sha256').update('live-control-pdf').digest('hex'),
+    })
+    const liveDirectory = join(state, 'live-input', rootJob.id, inbound.messageId)
+    mkdirSync(liveDirectory, { recursive: true, mode: 0o700 })
+    const liveCopy = join(liveDirectory, '000-FLIVE123456.pdf')
+    writeFileSync(liveCopy, 'live-control-pdf', { mode: 0o600 })
+    expect(store.stageLiveInterjection(target, {
+      chatId: rootJob.chatId,
+      threadTs: rootJob.threadTs,
+      messageId: inbound.messageId,
+      userId: rootJob.userId,
+      task: inbound.text,
+      attachments: [liveCopy],
+      writeEnabled: false,
+    })).toBe('staged')
+    store.completeInboundDelivery(inbound.idempotencyKey)
+    const refreshed = store.get(rootJob.id)!
+    expect(refreshed.threadAttachments).toEqual([
+      expect.objectContaining({ fileId: 'FLIVE123456', path: realpathSync(original) }),
+    ])
+    const interjection = store.listJobInterjections(rootJob.id)[0]!
+    expect(buildCodexInterjectionPrompt(
+      refreshed, interjection, 'c'.repeat(32),
+    )).toContain(realpathSync(original))
+    store.close()
+
+    // Simulate upgrading a database that only knew the 000-F… live copy.
+    const db = new Database(dbPath)
+    db.run('DELETE FROM slack_thread_attachments')
+    db.run("DELETE FROM migration_ledger WHERE name = 'thread-attachment-catalog-v1'")
+    db.run("UPDATE jobs SET thread_attachments_json = '[]' WHERE id = ?", [rootJob.id])
+    db.close()
+    store = new JobStore(dbPath)
+    expect(store.get(rootJob.id)?.threadAttachments).toEqual([
+      expect.objectContaining({ fileId: 'FLIVE123456', path: realpathSync(original) }),
+    ])
+    store.close()
+  })
+
+  test('upgrade時に旧jobのinbox添付をthread catalogへ一度だけ移行する', () => {
+    const root = fixtureDir('zero-thread-attachment-migration-')
+    const state = join(root, 'state')
+    const repo = join(root, 'repo')
+    const messageId = '1800000000.000401'
+    const fileId = 'FMIGRATE1234'
+    const directory = join(state, 'inbox', messageId)
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    chmodSync(state, 0o700)
+    chmodSync(join(state, 'inbox'), 0o700)
+    chmodSync(directory, 0o700)
+    mkdirSync(repo)
+    const path = join(directory, `${fileId}.pdf`)
+    writeFileSync(path, 'legacy-pdf', { mode: 0o600 })
+    chmodSync(path, 0o600)
+    const dbPath = join(state, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const legacy = store.enqueue(input({
+      chatId: 'C0123456789',
+      threadTs: '1800000000.000400',
+      messageId,
+      repoPath: repo,
+      attachments: [path],
+    })).job
+    store.close()
+    const db = new Database(dbPath)
+    db.run('DELETE FROM slack_thread_attachments')
+    db.run("DELETE FROM migration_ledger WHERE name = 'thread-attachment-catalog-v1'")
+    db.run("UPDATE jobs SET thread_attachments_json = '[]' WHERE id = ?", [legacy.id])
+    db.close()
+
+    store = new JobStore(dbPath)
+    const migrated = store.get(legacy.id)!
+    expect(migrated.threadAttachments).toEqual([
+      expect.objectContaining({ sourceMessageId: messageId, fileId, path: realpathSync(path) }),
+    ])
+    expect(store.listThreadAttachments(
+      migrated.chatId, migrated.threadTs, migrated.repoPath,
+    )).toHaveLength(1)
     store.close()
   })
 
@@ -2069,6 +2618,49 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('添付付き中止は未ダウンロードのfile IDで止まらず即時送達する', () => {
+    const store = makeStore()
+    const root = store.enqueue(input({ messageId: 'attachment-interrupt-root' })).job
+    store.claimNext('serial-worker')
+    const target = store.liveControlTarget(root.chatId, root.threadTs)!
+    expect(store.stageInboundDeliveryForControl({
+      ...input({ messageId: 'attachment-interrupt-message' }),
+      chatId: root.chatId,
+      threadTs: root.threadTs,
+      text: '中止',
+      fileIds: ['FSTOPIMAGE1'],
+      isInterrupt: true,
+    }, target)).toBe('bound')
+
+    const interrupt = store.claimNextInboundDelivery()!
+    expect(interrupt).toMatchObject({
+      messageId: 'attachment-interrupt-message',
+      fileIds: ['FSTOPIMAGE1'],
+      downloadedFiles: [],
+      isInterrupt: true,
+    })
+    expect(store.stageLiveControl(target, {
+      chatId: interrupt.chatId,
+      threadTs: interrupt.threadTs,
+      messageId: interrupt.messageId,
+      userId: interrupt.userId,
+      task: '中止',
+      kind: 'interrupt',
+      attachments: [],
+    })).toBe('staged')
+    store.completeInboundDelivery(interrupt.idempotencyKey)
+
+    expect(store.get(root.id)?.cancelRequestedAt).not.toBeNull()
+    expect(store.listJobControls(root.id)).toEqual([
+      expect.objectContaining({
+        messageId: 'attachment-interrupt-message',
+        kind: 'interrupt',
+        status: 'ready',
+      }),
+    ])
+    store.close()
+  })
+
   test('同一threadの別sender追記も後続中止が追い越してtombstone化する', () => {
     const store = makeStore()
     const root = store.enqueue(input({
@@ -2742,7 +3334,9 @@ describe('Codex job store', () => {
     const delivered = store.pendingTerminalNotifications().find(item => item.jobId === removable.id)!
     store.markTerminalNotificationDelivered(delivered.id)
     mkdirSync(join(state, 'outbox', removable.id), { recursive: true })
-    for (const root of ['final-output', 'advisor-runtime', 'advisor-context', 'advisor-journal']) {
+    for (const root of [
+      'browser-captures', 'final-output', 'advisor-runtime', 'advisor-context', 'advisor-journal',
+    ]) {
       const path = join(state, root, removable.id)
       mkdirSync(path, { recursive: true })
       writeFileSync(join(path, 'evidence'), root)
@@ -2776,7 +3370,9 @@ describe('Codex job store', () => {
     expect(store.getThread(removable.chatId, removable.threadTs)?.repoPath).toBe(removable.repoPath)
     expect(existsSync(attachment)).toBe(false)
     expect(existsSync(join(state, 'outbox', removable.id))).toBe(false)
-    for (const root of ['final-output', 'advisor-runtime', 'advisor-context', 'advisor-journal']) {
+    for (const root of [
+      'browser-captures', 'final-output', 'advisor-runtime', 'advisor-context', 'advisor-journal',
+    ]) {
       expect(existsSync(join(state, root, removable.id))).toBe(false)
     }
     expect(existsSync(pendingEphemeral)).toBe(true)
@@ -8205,10 +8801,16 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       HERDR_ENV: '1',
       HERDR_SOCKET_PATH: '/tmp/herdr.sock',
       HERDR_PANE_ID: 'wT:p1',
+      BROWSER_USE_AVAILABLE_BACKENDS: 'chrome',
+      NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S: 'a'.repeat(64),
+      NODE_REPL_TRUSTED_CODE_PATHS: '/Applications/ChatGPT.app/browser-client.mjs',
       KEEP: 'yes',
     })
     expect(child).toEqual({
       PATH: '/usr/bin',
+      BROWSER_USE_AVAILABLE_BACKENDS: 'chrome',
+      NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S: 'a'.repeat(64),
+      NODE_REPL_TRUSTED_CODE_PATHS: '/Applications/ChatGPT.app/browser-client.mjs',
     })
     expect(child.SLACK_BOT_TOKEN).toBeUndefined()
     expect(child.SLACK_APP_TOKEN).toBeUndefined()
@@ -8278,6 +8880,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('There is one primary Codex workflow now.')
     expect(instructions).toContain('You own that workflow')
     expect(instructions).toContain('Use zerokun_github only when authenticated GitHub access is needed.')
+    expect(instructions).toContain('[ZERO_SLACK_UPDATE_BEGIN:PLAN]')
+    expect(instructions).toContain('public HTTPS')
+    expect(instructions).not.toContain('never use an operator browser or a remote URL')
     expect(instructions).not.toContain('process-separated permission protocol')
     expect(instructions).not.toContain('advisor_round')
     expect(instructions).not.toContain('Do not push or create a PR')
@@ -8352,6 +8957,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       `[ZERO_UI_APPROVAL_REQUIRED:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
     )
     expect(prepare).toContain('zerokun_browser.verify_local_page')
+    expect(prepare).toContain('including a public HTTPS target when required')
+    expect(prepare).not.toContain('never use an operator browser or a remote URL')
     expect(prepare).toContain('role=before')
     expect(prepare).toContain('role=after')
     expect(prepare).toContain('synthetic/test data')
@@ -8360,6 +8967,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       `[ZERO_IMPLEMENTATION_READY:${nonce}:r${snapshot.revision}:${snapshot.digest}]`,
     )
     expect(implementation).toContain('zerokun_browser.verify_local_page')
+    expect(implementation).toContain('including public HTTPS environments')
+    expect(implementation).not.toContain('never use an operator browser or a remote URL')
     expect(implementation).toContain(
       'Host-approved implementation repository scope: ["frontend"]',
     )
@@ -8367,6 +8976,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(review).toContain(`[ZERO_REVIEW_PUBLISH:${nonce}:round-1]`)
     expect(review).toContain(`[ZERO_REVIEW_FIX_REQUIRED:${nonce}:round-1]`)
     expect(review).toContain('zerokun_browser.verify_local_page')
+    expect(review).toContain('including a public HTTPS environment when required')
+    expect(review).not.toContain('never use an operator browser or a remote URL')
     expect(review).toContain('do not request fixes for them in review')
     expect(noChangeReview).toContain('Host-confirmed repository write scope: none.')
     expect(noChangeReview).toContain('Review the prepared no-change decision')
@@ -9783,6 +10394,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain(`${JSON.stringify(join(realpathSync(repo), '.zerochan'))}="deny"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(attachment))}="read"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(state))}="deny"`)
+      expect(overrides).not.toContain(JSON.stringify(browserCaptureDirForJob(state, job.id)))
       expect(overrides).toContain(`${JSON.stringify(realpathSync(codexHome))}="deny"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
       expect(overrides).toContain('"PATH"="/usr/bin:/bin:/usr/sbin:/sbin')
@@ -9801,6 +10413,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('features.apps=false')
       expect(overrides).toContain('features.plugins=false')
       expect(overrides).toContain('features.goals=false')
+      expect(overrides).toContain('features.browser_use=true')
+      expect(overrides).toContain('features.browser_use_external=true')
+      expect(overrides).toContain('features.browser_use_full_cdp_access=false')
+      expect(overrides).toContain('features.computer_use=false')
+      expect(overrides).toContain('features.in_app_browser=true')
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
@@ -9826,6 +10443,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(preEditOverrides).toContain('network.allow_local_binding=false')
       expect(preEditOverrides).toContain('web_search="disabled"')
       expect(preEditOverrides).toContain('features.network_proxy=false')
+      expect(preEditOverrides).toContain('features.browser_use=false')
       const implementationOverrides = buildCodexPermissionOverrides(job, {
         stateDir: state,
         artifactDir: outbox,
@@ -9854,6 +10472,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         },
         executionWriteEnabled: false,
         localVerificationEnabled: true,
+        browserAccessEnabled: true,
         multiAgentEnabled: true,
       }).join('\n')
       expect(reviewOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="read"`)
@@ -9861,10 +10480,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(reviewOverrides).toContain('network.allow_local_binding=true')
       expect(reviewOverrides).toContain('web_search="disabled"')
       expect(reviewOverrides).toContain('features.network_proxy=true')
-      expect(reviewOverrides).not.toContain('network.domains={"*"="allow"')
-      expect(reviewOverrides).toContain(
-        'network.domains={"127.0.0.1"="allow","localhost"="allow"}',
-      )
+      expect(reviewOverrides).toContain('network.domains={"*"="allow"')
+      expect(reviewOverrides).toContain('features.browser_use=true')
+      expect(reviewOverrides).toContain('features.browser_use_external=true')
+      expect(reviewOverrides).toContain('features.browser_use_full_cdp_access=false')
+      expect(reviewOverrides).toContain('features.computer_use=false')
       expect(() => buildCodexPermissionOverrides(
         { ...job, repoPath: homedir() },
         { stateDir: state, artifactDir: outbox, scratchDir: scratch },
@@ -10336,23 +10956,61 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     runSandboxCommit(submodule, join(submoduleBase, 'state'), 'submodule sandbox commit')
   }, 30_000)
 
-  test.skipIf(process.platform !== 'darwin')('実Codex 0.149 sandboxでstate deny・添付read・outbox/.git writeを強制する', () => {
+  test.skipIf(process.platform !== 'darwin')('実Codex sandboxは完了・GC・再起動後の同一thread添付だけをread許可する', () => {
     const codex = resolveOfficialStandaloneCodex().physical
     const dir = fixtureDir()
     const state = join(dir, 'state')
     const repo = join(dir, 'repo')
-    const attachment = join(state, 'inbox', 'message', 'input.txt')
     const secret = join(state, '.env')
-    mkdirSync(dirname(attachment), { recursive: true })
+    mkdirSync(state, { recursive: true })
     chmodSync(state, 0o700)
     mkdirSync(repo, { recursive: true })
     Bun.spawnSync(['git', 'init', '-q', repo])
-    writeFileSync(attachment, 'input')
     writeFileSync(secret, 'SLACK_BOT_TOKEN=must-not-read')
-    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const dbPath = join(state, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
     try {
-      store.enqueue(input({ repoPath: repo, attachments: [attachment], writeEnabled: true }))
+      const source = stageInboundAttachment({
+        store,
+        stateDir: state,
+        chatId: 'C0123456789',
+        threadTs: '1800000000.009000',
+        messageId: '1800000000.009001',
+        repoPath: repo,
+        fileId: 'FSANDBOX123',
+        contents: 'persisted thread attachment',
+      })
+      const sourceRun = store.claimNext('attachment-source-worker')!
+      expect(sourceRun.id).toBe(source.id)
+      store.complete(sourceRun.id, 'source-session', 'source complete')
+      const attachment = source.threadAttachments![0]!.path
+      const sourceNotice = store.pendingTerminalNotifications()
+        .find(notification => notification.jobId === source.id)!
+      store.markTerminalNotificationDelivered(sourceNotice.id)
+      expect(store.pruneSettled({
+        stateDir: state,
+        now: Date.now() + 10_000,
+        retentionMs: 1,
+        tombstoneRetentionMs: 60_000,
+      }).jobs).toBe(1)
+      expect(store.get(source.id)).toBeNull()
+      expect(existsSync(attachment)).toBe(true)
+      store.close()
+
+      // A fresh daemon and physical Codex job receive the immutable same-thread
+      // attachment snapshot without asking Slack to upload it again.
+      store = new JobStore(dbPath)
+      store.enqueue(input({
+        chatId: source.chatId,
+        threadTs: source.threadTs,
+        messageId: '1800000000.009002',
+        repoPath: repo,
+        task: '以前のPDFを続けて確認してください',
+        writeEnabled: true,
+      }))
       const job = store.claimNext('serial-worker')!
+      expect(job.attachments).toEqual([])
+      expect(job.threadAttachments?.map(file => file.path)).toEqual([attachment])
       const outbox = artifactDirForJob(state, job.id)
       const scratch = join(state, 'tmp', job.id)
       mkdirSync(outbox, { recursive: true })
@@ -10370,7 +11028,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         '-P', 'zerokun_job',
         '--',
         '/bin/zsh', '-c',
-        'test ! -r "$1" && test -r "$2" && touch "$3/from-sandbox" && touch .git/from-sandbox',
+        'test ! -r "$1" && test -r "$2" && test "$(/bin/cat "$2")" = "persisted thread attachment" && touch "$3/from-sandbox" && touch .git/from-sandbox',
         'zerokun-sandbox', secret, attachment, outbox,
       ], { stdout: 'pipe', stderr: 'pipe' })
       expect(result.exitCode, result.stderr.toString()).toBe(0)
@@ -10430,6 +11088,112 @@ describe('Slack output guard', () => {
       text: '完了',
       files: ['/tmp/a.csv'],
     })
+  })
+
+  test('hostが取得したbrowser画像をmodel markerなしでも封印対象へ統合する', () => {
+    const state = fixtureDir()
+    const repo = join(state, 'browser-artifact-repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo, messageId: 'browser-artifact-message' }))
+    const job = store.claimNext('serial-worker')!
+    const outbox = artifactDirForJob(state, job.id)
+    mkdirSync(outbox, { recursive: true })
+    const captureDir = browserCaptureDirForJob(state, job.id)
+    mkdirSync(captureDir, { recursive: true, mode: 0o700 })
+    chmodSync(captureDir, 0o700)
+    const screenshot = join(captureDir, 'browser-capture.png')
+    const source = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    writeFileSync(screenshot, source, { mode: 0o600 })
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'browser-artifact-session',
+      result: '公開画面を確認しました。',
+      capturedArtifacts: [{
+        kind: 'browser-screenshot', path: screenshot,
+        digest: createHash('sha256').update(source).digest('hex'),
+        width: 1, height: 1,
+      }],
+    }, state)
+    const output = extractArtifactPaths(finalized.result)
+    expect(output.text).toBe('公開画面を確認しました。')
+    expect(output.files).toHaveLength(1)
+    expect(readFileSync(output.files[0]!).subarray(0, 8)).toEqual(source.subarray(0, 8))
+    expect(finalized.capturedArtifacts).toBeUndefined()
+    store.close()
+  })
+
+  test('browser画像はmodelが宣言した10件のartifactより優先して封印する', () => {
+    const state = fixtureDir()
+    const repo = join(state, 'browser-artifact-priority-repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo, messageId: 'browser-artifact-priority-message' }))
+    const job = store.claimNext('serial-worker')!
+    const outbox = artifactDirForJob(state, job.id)
+    mkdirSync(outbox, { recursive: true })
+    const declared = Array.from({ length: 10 }, (_, index) => {
+      const path = join(outbox, `declared-${index}.txt`)
+      writeFileSync(path, `declared-${index}`)
+      return path
+    })
+    const captureDir = browserCaptureDirForJob(state, job.id)
+    mkdirSync(captureDir, { recursive: true, mode: 0o700 })
+    chmodSync(captureDir, 0o700)
+    const screenshot = join(captureDir, 'browser-capture.png')
+    const source = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    writeFileSync(screenshot, source, { mode: 0o600 })
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'browser-artifact-priority-session',
+      result: `公開画面を確認しました。\n<zerokun_files>${JSON.stringify(declared)}</zerokun_files>`,
+      capturedArtifacts: [{
+        kind: 'browser-screenshot', path: screenshot,
+        digest: createHash('sha256').update(source).digest('hex'),
+        width: 1, height: 1,
+      }],
+    }, state)
+    const output = extractArtifactPaths(finalized.result)
+    expect(output.files).toHaveLength(10)
+    expect(output.files.some(path => path.endsWith('.png'))).toBe(true)
+    expect(output.files.some(path => path.endsWith('declared-9.txt'))).toBe(false)
+    store.close()
+  })
+
+  test('host取得後に差し替えられたbrowser画像はSlack artifactへ昇格しない', () => {
+    const state = fixtureDir()
+    const repo = join(state, 'browser-artifact-tamper-repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo, messageId: 'browser-artifact-tamper-message' }))
+    const job = store.claimNext('serial-worker')!
+    mkdirSync(artifactDirForJob(state, job.id), { recursive: true })
+    const captureDir = browserCaptureDirForJob(state, job.id)
+    mkdirSync(captureDir, { recursive: true, mode: 0o700 })
+    chmodSync(captureDir, 0o700)
+    const screenshot = join(captureDir, 'browser-capture.png')
+    const source = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    const digest = createHash('sha256').update(source).digest('hex')
+    writeFileSync(screenshot, source, { mode: 0o600 })
+    writeFileSync(screenshot, 'replaced after capture', { mode: 0o600 })
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'browser-artifact-tamper-session',
+      result: '公開画面を確認しました。',
+      capturedArtifacts: [{
+        kind: 'browser-screenshot', path: screenshot, digest, width: 1, height: 1,
+      }],
+    }, state)
+    const output = extractArtifactPaths(finalized.result)
+    expect(output.files).toEqual([])
+    expect(output.text).toContain('ファイル添付だけを省略しました')
+    store.close()
   })
 
   test('壊れたartifact markerも内部absolute pathごとSlack本文から除去する', () => {

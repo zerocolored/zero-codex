@@ -17,6 +17,18 @@ import type { InboundDownloadedFile } from './job-runner.ts'
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 const HASH_CHUNK_BYTES = 64 * 1024
 
+/** A deterministic cache binding/integrity failure, never a transient host I/O error. */
+export class InboundAttachmentIntegrityError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'InboundAttachmentIntegrityError'
+  }
+}
+
+function integrityFailure(message: string): never {
+  throw new InboundAttachmentIntegrityError(message)
+}
+
 export interface InboundAttachmentIdentity {
   dev: number
   ino: number
@@ -86,12 +98,12 @@ export function removeRenamedInboundAttachment(
 }
 
 function safeMessageDirectory(inboxDir: string, messageTs: string): string {
-  if (!/^\d+\.\d+$/.test(messageTs)) throw new Error('invalid Slack message ts')
+  if (!/^\d+\.\d+$/.test(messageTs)) integrityFailure('invalid Slack message ts')
   return resolve(join(inboxDir, messageTs.replace(/[^0-9.]/g, '_')))
 }
 
 function safeFileId(fileId: string): string {
-  if (!/^F[A-Z0-9]+$/.test(fileId)) throw new Error('invalid Slack file id')
+  if (!/^F[A-Z0-9]+$/.test(fileId)) integrityFailure('invalid Slack file id')
   return fileId
 }
 
@@ -114,13 +126,27 @@ function inspectCandidate(
   pathInput: string,
 ): InboundDownloadedFile | null {
   const directory = safeMessageDirectory(inboxDir, messageTs)
-  const candidate = resolve(pathInput)
-  const name = basename(candidate)
-  if (dirname(candidate) !== directory
-    || !name.startsWith(`${safeFileId(fileId)}.`)
+  const candidateInput = resolve(pathInput)
+  const name = basename(candidateInput)
+  if (!name.startsWith(`${safeFileId(fileId)}.`)
     || name.includes('.partial-')) {
-    throw new Error('cached inbound attachment path is outside its managed slot')
+    integrityFailure('cached inbound attachment path is outside its managed slot')
   }
+  let physicalDirectory: string
+  let physicalCandidateDirectory: string
+  try {
+    physicalDirectory = realpathSync(directory)
+    physicalCandidateDirectory = realpathSync(dirname(candidateInput))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+  if (physicalCandidateDirectory !== physicalDirectory) {
+    integrityFailure('cached inbound attachment path is outside its managed slot')
+  }
+  // Resolve only the already-verified parent. The leaf is still opened with
+  // O_NOFOLLOW below, so a symlink cannot be smuggled in through realpath().
+  const candidate = join(physicalDirectory, name)
   let descriptor: number
   try {
     descriptor = openSync(
@@ -129,14 +155,17 @@ function inspectCandidate(
     )
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw new Error('cached inbound attachment cannot be opened safely')
+    if (['ELOOP', 'EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+      integrityFailure('cached inbound attachment cannot be opened safely')
+    }
+    throw error
   }
   try {
     const before = fstatSync(descriptor)
     const owner = typeof process.getuid !== 'function' || before.uid === process.getuid()
     if (!before.isFile() || before.nlink !== 1 || !owner || before.mode & 0o077
       || before.size < 0 || before.size > MAX_ATTACHMENT_BYTES) {
-      throw new Error('cached inbound attachment metadata is unsafe')
+      integrityFailure('cached inbound attachment metadata is unsafe')
     }
     const digest = createHash('sha256')
     let total = 0
@@ -147,18 +176,18 @@ function inspectCandidate(
       digest.update(chunk.subarray(0, count))
       total += count
     }
-    if (total > MAX_ATTACHMENT_BYTES) throw new Error('cached inbound attachment is too large')
+    if (total > MAX_ATTACHMENT_BYTES) integrityFailure('cached inbound attachment is too large')
     const after = fstatSync(descriptor)
     if (!stableFileMetadata(before, after) || total !== before.size) {
-      throw new Error('cached inbound attachment changed while reading')
+      integrityFailure('cached inbound attachment changed while reading')
     }
     const leaf = lstatSync(candidate)
     if (leaf.dev !== before.dev || leaf.ino !== before.ino || !leaf.isFile()
       || leaf.isSymbolicLink() || leaf.nlink !== 1) {
-      throw new Error('cached inbound attachment changed after reading')
+      integrityFailure('cached inbound attachment changed after reading')
     }
     if (realpathSync(dirname(candidate)) !== realpathSync(directory)) {
-      throw new Error('cached inbound attachment parent changed')
+      integrityFailure('cached inbound attachment parent changed')
     }
     return {
       fileId,
@@ -187,12 +216,12 @@ export function loadCachedInboundAttachment(options: {
   const { inboxDir, messageTs, fileId, ordinal, manifest } = options
   if (manifest) {
     if (manifest.fileId !== fileId || manifest.ordinal !== ordinal) {
-      throw new Error('cached inbound attachment manifest binding is invalid')
+      integrityFailure('cached inbound attachment manifest binding is invalid')
     }
     const inspected = inspectCandidate(inboxDir, messageTs, fileId, ordinal, manifest.path)
     if (!inspected) return null
     if (inspected.size !== manifest.size || inspected.digest !== manifest.digest) {
-      throw new Error('cached inbound attachment does not match its manifest')
+      integrityFailure('cached inbound attachment does not match its manifest')
     }
     return inspected
   }
@@ -206,7 +235,7 @@ export function loadCachedInboundAttachment(options: {
     // on Unix, so unlike regular files they must not be constrained to one.
     if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.nlink < 1 || !owner
       || (metadata.mode & 0o077) !== 0) {
-      throw new Error('cached inbound attachment directory is unsafe')
+      integrityFailure('cached inbound attachment directory is unsafe')
     }
     names = readdirSync(directory).filter(name => (
       name.startsWith(`${safeFileId(fileId)}.`) && !name.includes('.partial-')
@@ -216,6 +245,6 @@ export function loadCachedInboundAttachment(options: {
     throw error
   }
   if (names.length === 0) return null
-  if (names.length !== 1) throw new Error('cached inbound attachment adoption is ambiguous')
+  if (names.length !== 1) integrityFailure('cached inbound attachment adoption is ambiguous')
   return inspectCandidate(inboxDir, messageTs, fileId, ordinal, join(directory, names[0]!))
 }

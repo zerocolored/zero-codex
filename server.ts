@@ -10,7 +10,7 @@
 import { App } from '@slack/bolt'
 import { createHash, randomBytes } from 'crypto'
 import {
-  closeSync, constants, existsSync, openSync, writeFileSync,
+  closeSync, constants, existsSync, fsyncSync, openSync, writeFileSync,
   mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync,
 } from 'fs'
 import { join, extname } from 'path'
@@ -943,10 +943,19 @@ async function downloadInboundFiles(
           received,
           expectedSize,
         )
+        // The catalog is durable across daemon restarts, so make the bytes
+        // durable before publishing their final name and SQLite binding.
+        fsyncSync(descriptor)
         closeSync(descriptor)
         descriptorOpen = false
         renameSync(temporary, destination)
         renamed = true
+        const directoryDescriptor = openSync(directory, constants.O_RDONLY)
+        try {
+          fsyncSync(directoryDescriptor)
+        } finally {
+          closeSync(directoryDescriptor)
+        }
         const completed = loadCachedInboundAttachment({
           inboxDir: INBOX_DIR,
           messageTs,

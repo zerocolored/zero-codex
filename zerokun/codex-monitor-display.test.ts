@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import type { AppServerNotification } from './codex-app-server-session'
-import { CodexMonitorDisplay, sanitizeMonitorText } from './codex-monitor-display'
+import {
+  browserScreenshotFromNotification,
+  CodexMonitorDisplay,
+  parseSlackUpdateCommentary,
+  sanitizeMonitorText,
+  slackUpdateCommentaryFromNotification,
+} from './codex-monitor-display'
 
 function notification(
   method: string,
@@ -19,6 +25,41 @@ function itemNotification(
 }
 
 describe('Codex monitor display', () => {
+  test('active root turnのChrome screenshotだけをbounded PNGとして取り出す', () => {
+    const data = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+    const root = itemNotification('item/completed', {
+      id: 'screenshot-1', type: 'mcpToolCall', server: 'go-chrome-mcp',
+      tool: 'screenshot', status: 'completed',
+      result: { content: [{ type: 'image', mimeType: 'image/png', data }] },
+    })
+    const image = browserScreenshotFromNotification(root, 'root-thread', 'turn-1')
+    expect(image && Buffer.from(image.bytes).toString('base64')).toBe(data)
+    expect(image && { width: image.width, height: image.height }).toEqual({ width: 1, height: 1 })
+    expect(browserScreenshotFromNotification(root, 'child-thread', 'turn-1')).toBeNull()
+    expect(browserScreenshotFromNotification(root, 'root-thread', 'turn-2')).toBeNull()
+    expect(browserScreenshotFromNotification(itemNotification('item/completed', {
+      ...root.params.item as Record<string, unknown>, server: 'untrusted-browser',
+    }), 'root-thread', 'turn-1')).toBeNull()
+    expect(browserScreenshotFromNotification(itemNotification('item/completed', {
+      ...root.params.item as Record<string, unknown>,
+      result: { content: [{ type: 'image', mimeType: 'image/png', data: `${data.slice(0, -1)}!` }] },
+    }), 'root-thread', 'turn-1')).toBeNull()
+    const builtIn = itemNotification('item/completed', {
+      id: 'browser-screenshot-1', type: 'dynamicToolCall', namespace: 'browser',
+      tool: 'screenshot', status: 'completed', success: true,
+      contentItems: [{ type: 'inputImage', imageUrl: `data:image/png;base64,${data}` }],
+    })
+    const builtInImage = browserScreenshotFromNotification(
+      builtIn,
+      'root-thread',
+      'turn-1',
+    )
+    expect(builtInImage && Buffer.from(builtInImage.bytes).toString('base64')).toBe(data)
+    expect(browserScreenshotFromNotification(itemNotification('item/completed', {
+      ...builtIn.params.item as Record<string, unknown>, namespace: 'third_party',
+    }), 'root-thread', 'turn-1')).toBeNull()
+  })
+
   test('root threadの安全な状況だけを追記用文面へ投影する', () => {
     const display = new CodexMonitorDisplay()
     const lines = [
@@ -76,6 +117,56 @@ describe('Codex monitor display', () => {
       threadId: 'root-thread', payload: { jsonrpc: '2.0' },
     }), 'root-thread')).toEqual([])
     expect(sanitizeMonitorText('{"jsonrpc":"2.0","id":"secret"}')).toBeNull()
+  })
+
+  test('Slack向け節目だけをkind付き完全envelopeから取り出す', () => {
+    const plan = [
+      '[ZERO_SLACK_UPDATE_BEGIN:PLAN]',
+      '原因を特定し、修正方針を確定しました 🔎',
+      '[ZERO_SLACK_UPDATE_END:PLAN]',
+    ].join('\n')
+    expect(parseSlackUpdateCommentary(plan)).toEqual({
+      kind: 'PLAN',
+      text: '原因を特定し、修正方針を確定しました 🔎',
+    })
+    expect(parseSlackUpdateCommentary(plan.replaceAll(':PLAN]', ':VERIFY]'))).toEqual({
+      kind: 'VERIFY',
+      text: '原因を特定し、修正方針を確定しました 🔎',
+    })
+    expect(parseSlackUpdateCommentary(plan.replace(
+      '[ZERO_SLACK_UPDATE_END:PLAN]',
+      '[ZERO_SLACK_UPDATE_END:BLOCKED]',
+    ))).toBeNull()
+    expect(parseSlackUpdateCommentary(`前置き\n${plan}`)).toBeNull()
+    expect(parseSlackUpdateCommentary('通常の技術的な実況です')).toBeNull()
+
+    const root = itemNotification('item/completed', {
+      type: 'agentMessage', phase: 'commentary', text: plan,
+    })
+    expect(slackUpdateCommentaryFromNotification(root, 'root-thread')).toEqual({
+      kind: 'PLAN',
+      text: '原因を特定し、修正方針を確定しました 🔎',
+    })
+    expect(slackUpdateCommentaryFromNotification(root, 'root-thread', 'turn-1')).toEqual({
+      kind: 'PLAN',
+      text: '原因を特定し、修正方針を確定しました 🔎',
+    })
+    expect(slackUpdateCommentaryFromNotification(root, 'root-thread', 'turn-2')).toBeNull()
+    expect(slackUpdateCommentaryFromNotification(root, 'child-thread')).toBeNull()
+  })
+
+  test('節目markerは監視タブでは外し、通常commentaryも従来どおり表示する', () => {
+    const display = new CodexMonitorDisplay()
+    display.observe(notification('turn/started', {
+      threadId: 'root-thread', turn: { id: 'turn-1', status: 'inProgress' },
+    }), 'root-thread')
+    expect(display.observe(itemNotification('item/completed', {
+      type: 'agentMessage', phase: 'commentary',
+      text: '[ZERO_SLACK_UPDATE_BEGIN:VERIFY]\n実装が完了し、検証へ進みます 🧪\n[ZERO_SLACK_UPDATE_END:VERIFY]',
+    }), 'root-thread')).toEqual(['💬 実装が完了し、検証へ進みます 🧪'])
+    expect(display.observe(itemNotification('item/completed', {
+      type: 'agentMessage', phase: 'commentary', text: 'テスト設定を調整しています',
+    }), 'root-thread')).toEqual(['💬 テスト設定を調整しています'])
   })
 
   test('絶対path、URL、ID、terminal制御を除去しcredential含有行は棄却する', () => {

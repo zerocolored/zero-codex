@@ -7,6 +7,7 @@ import {
   openSync,
   readSync,
   readdirSync,
+  realpathSync,
   rmSync,
   writeSync,
 } from 'fs'
@@ -153,7 +154,7 @@ export function removeSettledJobState(options: {
   )))
   for (const id of ids) {
     for (const root of [
-      'outbox', 'tmp', 'sealed-artifacts', 'final-output', 'execution-results',
+      'outbox', 'browser-captures', 'tmp', 'sealed-artifacts', 'final-output', 'execution-results',
       'advisor-runtime', 'advisor-context', 'advisor-journal', 'live-input',
     ]) {
       if (removeEntry(options.stateDir, join(options.stateDir, root, id), report)) removed += 1
@@ -178,7 +179,11 @@ export function removeSettledJobState(options: {
     } catch {
       continue
     }
-    if (options.stillReferencedAttachments.has(path)) continue
+    let retained = options.stillReferencedAttachments.has(path)
+    if (!retained) {
+      try { retained = options.stillReferencedAttachments.has(realpathSync(path)) } catch {}
+    }
+    if (retained) continue
     if (removeEntry(options.stateDir, path, report)) removed += 1
     try {
       const parentMetadata = managedMetadata(options.stateDir, dirname(path))
@@ -204,7 +209,7 @@ export function removeOrphanedJobState(options: {
   let removed = 0
   const report = options.onUnsafe ?? reportUnsafeByDefault
   for (const root of [
-    'outbox', 'tmp', 'sealed-artifacts', 'final-output', 'execution-results',
+    'outbox', 'browser-captures', 'tmp', 'sealed-artifacts', 'final-output', 'execution-results',
     'advisor-runtime', 'advisor-context', 'advisor-journal', 'live-input',
   ]) {
     for (const entry of scanRoot(options.stateDir, root, report)) {
@@ -227,7 +232,11 @@ export function removeOrphanedJobState(options: {
     let containsLive = false
     try {
       for (const name of readdirSync(directory)) {
-        if (options.liveAttachmentPaths.has(resolve(join(directory, name)))) containsLive = true
+        const path = resolve(join(directory, name))
+        if (options.liveAttachmentPaths.has(path)) containsLive = true
+        if (!containsLive) {
+          try { containsLive = options.liveAttachmentPaths.has(realpathSync(path)) } catch {}
+        }
       }
       if (!containsLive && lstatSync(directory).mtimeMs < options.olderThan
         && removeEntry(options.stateDir, directory, report)) removed += 1

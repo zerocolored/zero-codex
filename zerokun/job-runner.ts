@@ -25,10 +25,12 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from 'path'
 import { WebClient } from '@slack/web-api'
 import {
   artifactDirForJob,
+  browserCaptureDirForJob,
   CodexCleanupPendingError,
   CodexInterruptedError,
   CodexPublicationPreflightRetryError,
   CodexRateLimitError,
+  RetainedSlackAttachmentUnavailableError,
   CodexUserCancelledError,
   codexRateLimitResumeAt,
   executeCodexJob,
@@ -86,6 +88,10 @@ import {
   requireManagedStateRoot,
 } from './managed-path.ts'
 import {
+  InboundAttachmentIntegrityError,
+  loadCachedInboundAttachment,
+} from './inbound-attachment-cache.ts'
+import {
   captureTrackedProcesses,
   MAX_EXECUTOR_REGISTRATION_BYTES,
   MAX_TRACKED_PROCESSES,
@@ -110,8 +116,10 @@ import {
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
 import { isSlackInterruptCommand } from './live-control.ts'
+import type { SlackUpdateKind } from './codex-monitor-display.ts'
 import {
   CodexUiApprovalRequiredError,
+  reencodeBrowserScreenshot,
   reencodeUiApprovalImages,
   type UiApprovalResumeContext,
 } from './ui-approval.ts'
@@ -214,7 +222,10 @@ import {
 export const SERIAL_WORKER_COUNT = 1 as const
 export const JOB_RUNNER_HANDSHAKE = 'zerokun-codex-runner-v1' as const
 export const DEFAULT_MAX_JOBS_PER_SESSION = 20 as const
-export const CODEX_SESSION_PROTOCOL_VERSION = 2 as const
+// v3 removes the former localhost-only browser instruction and introduces
+// explicit Slack-milestone commentary. Never resume a physical Codex thread
+// that still carries the v2 trusted host policy.
+export const CODEX_SESSION_PROTOCOL_VERSION = 3 as const
 export const SLACK_QUEUE_WAIT_MESSAGE = '🙇 別件の作業中のため、しばらくお待ちください。' as const
 export const SLACK_RATE_LIMIT_WAIT_MESSAGE = '⏸ レートリミットのため待機中です。自動で再開します。' as const
 const RATE_LIMIT_WAIT_NOTIFICATION_PREFIX = 'rate-limit-waiting:' as const
@@ -504,6 +515,8 @@ export interface JobRecord {
   task: string
   inputRevision: number
   attachments: string[]
+  /** Immutable, thread-scoped Slack files available to every continuation. */
+  threadAttachments?: ThreadAttachmentRecord[]
   runtime: 'claude' | 'codex'
   writeEnabled: boolean
   status: JobStatus
@@ -530,6 +543,15 @@ export interface JobRecord {
   uiApprovalRequestId: string | null
   /** Trusted host context injected only for a same-job publication recovery. */
   githubPublicationRecovery?: GitHubPublicationRecoveryContext
+}
+
+export type ThreadAttachmentRecord = {
+  sourceMessageId: string
+  fileId: string
+  ordinal: number
+  path: string
+  size: number
+  digest: string
 }
 
 export type GitHubPublicationRecoveryPlanContext = {
@@ -567,6 +589,7 @@ type JobRow = {
   task: string
   input_revision: number
   attachments_json: string
+  thread_attachments_json: string
   runtime: 'claude' | 'codex'
   write_enabled: number
   status: JobStatus
@@ -672,6 +695,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   task TEXT NOT NULL,
   input_revision INTEGER NOT NULL DEFAULT 1,
   attachments_json TEXT NOT NULL DEFAULT '[]',
+  thread_attachments_json TEXT NOT NULL DEFAULT '[]',
   runtime TEXT NOT NULL DEFAULT 'codex'
     CHECK (runtime IN ('claude', 'codex')),
   write_enabled INTEGER NOT NULL DEFAULT 0,
@@ -734,6 +758,22 @@ CREATE TABLE IF NOT EXISTS slack_threads (
   last_activity_ms INTEGER NOT NULL,
   PRIMARY KEY (chat_id, thread_ts)
 );
+CREATE TABLE IF NOT EXISTS slack_thread_attachments (
+  chat_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  source_message_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  path TEXT NOT NULL,
+  size INTEGER NOT NULL CHECK (size >= 0 AND size <= 52428800),
+  digest TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, thread_ts, source_message_id, file_id),
+  UNIQUE (chat_id, thread_ts, path)
+);
+CREATE INDEX IF NOT EXISTS idx_slack_thread_attachments_scope
+  ON slack_thread_attachments(chat_id, thread_ts, repo_path, source_message_id, ordinal);
 CREATE TABLE IF NOT EXISTS slack_thread_job_history (
   job_id TEXT PRIMARY KEY,
   job_seq INTEGER NOT NULL,
@@ -1814,6 +1854,14 @@ function ensureJobSchemaMigrations(db: Database): void {
       if (!migrated.some(column => column.name === 'attachments_json')) throw error
     }
   }
+  if (!columns.some(column => column.name === 'thread_attachments_json')) {
+    try {
+      db.exec("ALTER TABLE jobs ADD COLUMN thread_attachments_json TEXT NOT NULL DEFAULT '[]'")
+    } catch (error) {
+      const migrated = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
+      if (!migrated.some(column => column.name === 'thread_attachments_json')) throw error
+    }
+  }
   if (!columns.some(column => column.name === 'executor_pid')) {
     try {
       db.exec('ALTER TABLE jobs ADD COLUMN executor_pid INTEGER')
@@ -2163,6 +2211,27 @@ function ensureJobSchemaMigrations(db: Database): void {
     )
   })
   retireLegacyNondisclosureProgress.immediate()
+  const retireLegacyRoutineCommentary = db.transaction(() => {
+    if (db.query<{ present: number }, []>(
+      "SELECT 1 AS present FROM migration_ledger WHERE name = 'commentary-milestone-cutover-v1'",
+    ).get()) return
+    const migratedAt = Date.now()
+    // Before milestone envelopes existed, every tactical commentary item was
+    // eligible for Slack. Retire only copies that were still unsent at the
+    // upgrade boundary; already-delivered history remains an audit record.
+    db.run(
+      `UPDATE commentary_notifications
+       SET suppressed_at = COALESCE(suppressed_at, ?)
+       WHERE delivered_at IS NULL AND suppressed_at IS NULL`,
+      [migratedAt],
+    )
+    db.run(
+      `INSERT INTO migration_ledger (name, completed_at)
+       VALUES ('commentary-milestone-cutover-v1', ?)`,
+      [migratedAt],
+    )
+  })
+  retireLegacyRoutineCommentary.immediate()
   const retireLegacyAcceptanceMessages = db.transaction(() => {
     if (db.query<{ present: number }, []>(
       "SELECT 1 AS present FROM migration_ledger WHERE name = 'queue-wait-notifications-v1'",
@@ -2459,6 +2528,50 @@ function parseAttachments(value: string): string[] {
   }
 }
 
+function parseThreadAttachments(value: string | null | undefined): ThreadAttachmentRecord[] {
+  let parsed: unknown
+  try { parsed = JSON.parse(value ?? '[]') } catch {
+    throw new Error('thread attachment snapshot is invalid JSON')
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error('thread attachment snapshot is invalid')
+  }
+  const records: ThreadAttachmentRecord[] = []
+  const identities = new Set<string>()
+  const paths = new Set<string>()
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error('thread attachment snapshot entry is invalid')
+    }
+    const record = item as Record<string, unknown>
+    if (typeof record.sourceMessageId !== 'string'
+      || !/^\d+\.\d+$/.test(record.sourceMessageId)
+      || typeof record.fileId !== 'string' || !/^F[A-Z0-9]+$/.test(record.fileId)
+      || !Number.isSafeInteger(record.ordinal) || Number(record.ordinal) < 0
+      || typeof record.path !== 'string' || !isAbsolute(record.path)
+      || !Number.isSafeInteger(record.size) || Number(record.size) < 0
+      || Number(record.size) > 50 * 1024 * 1024
+      || typeof record.digest !== 'string' || !/^[0-9a-f]{64}$/.test(record.digest)) {
+      throw new Error('thread attachment snapshot fields are invalid')
+    }
+    const identity = `${record.sourceMessageId}\0${record.fileId}`
+    if (identities.has(identity) || paths.has(record.path)) {
+      throw new Error('thread attachment snapshot contains duplicates')
+    }
+    identities.add(identity)
+    paths.add(record.path)
+    records.push({
+      sourceMessageId: record.sourceMessageId,
+      fileId: record.fileId,
+      ordinal: Number(record.ordinal),
+      path: record.path,
+      size: Number(record.size),
+      digest: record.digest,
+    })
+  }
+  return records
+}
+
 function parseInboundDownloadedFiles(value: string): InboundDownloadedFile[] {
   let parsed: unknown
   try { parsed = JSON.parse(value) } catch { throw new Error('inbound attachment manifest is invalid JSON') }
@@ -2590,6 +2703,7 @@ function mapRow(row: JobRow): JobRecord {
     task: row.task,
     inputRevision: row.input_revision,
     attachments: parseAttachments(row.attachments_json),
+    threadAttachments: parseThreadAttachments(row.thread_attachments_json),
     runtime: row.runtime,
     writeEnabled: row.write_enabled === 1,
     status: row.status,
@@ -4010,6 +4124,249 @@ export class JobStore {
       chmodSync(`${dbPath}-wal`, 0o600)
       chmodSync(`${dbPath}-shm`, 0o600)
     } catch {}
+    this.migrateLegacyThreadAttachments(dirname(dbPath))
+  }
+
+  private migrateLegacyThreadAttachments(stateDir: string): void {
+    if (this.db.query<{ present: number }, []>(
+      "SELECT 1 AS present FROM migration_ledger WHERE name = 'thread-attachment-catalog-v1'",
+    ).get()) return
+    const sources = this.db.query<{
+      chat_id: string
+      thread_ts: string
+      repo_path: string
+      message_id: string
+      attachments_json: string
+      created_at: number
+    }, []>(
+      `SELECT chat_id, thread_ts, repo_path, message_id, attachments_json, created_at
+       FROM jobs
+       UNION ALL
+       SELECT controls.chat_id, controls.thread_ts, jobs.repo_path,
+              controls.message_id, controls.attachments_json, controls.created_at
+       FROM job_controls AS controls JOIN jobs ON jobs.id = controls.job_id
+       UNION ALL
+       SELECT interjections.chat_id, interjections.thread_ts, jobs.repo_path,
+              interjections.message_id, interjections.attachments_json, interjections.created_at
+       FROM job_interjections AS interjections JOIN jobs ON jobs.id = interjections.job_id`,
+    ).all()
+    const recovered: Array<{
+      source: typeof sources[number]
+      file: InboundDownloadedFile
+    }> = []
+    let retryRequired = false
+    for (const source of sources) {
+      if (!/^\d+\.\d+$/.test(source.message_id)) continue
+      for (const [ordinal, path] of parseAttachments(source.attachments_json).entries()) {
+        // Initial-job paths are named F….ext. Live-control/interjection copies
+        // are named 000-F….ext; both refer back to the immutable inbox file.
+        const match = /^(?:\d{3}-)?(F[A-Z0-9]+)\./.exec(basename(path))
+        if (!match) continue
+        try {
+          const file = loadCachedInboundAttachment({
+            inboxDir: join(stateDir, 'inbox'),
+            messageTs: source.message_id,
+            fileId: match[1]!,
+            ordinal,
+          })
+          if (file) recovered.push({ source, file })
+        } catch (error) {
+          // Missing or legacy-unsafe files cannot be made readable by this
+          // migration. A host I/O failure is different: keep the ledger open
+          // so a later daemon start can recover the still-valid attachment.
+          if (!(error instanceof InboundAttachmentIntegrityError)) retryRequired = true
+        }
+      }
+    }
+    const migrate = this.db.transaction(() => {
+      for (const { source, file } of recovered) {
+        const owned = this.db.query<{ repo_path: string }, [string, string]>(
+          'SELECT repo_path FROM slack_threads WHERE chat_id = ? AND thread_ts = ?',
+        ).get(source.chat_id, source.thread_ts)
+        if (!owned || owned.repo_path !== source.repo_path) continue
+        this.db.run(
+          `INSERT OR IGNORE INTO slack_thread_attachments (
+             chat_id, thread_ts, repo_path, source_message_id, file_id,
+             ordinal, path, size, digest, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            source.chat_id, source.thread_ts, source.repo_path, source.message_id,
+            file.fileId, file.ordinal, file.path, file.size, file.digest, source.created_at,
+          ],
+        )
+      }
+      const jobs = this.db.query<{
+        id: string
+        chat_id: string
+        thread_ts: string
+        repo_path: string
+      }, []>('SELECT id, chat_id, thread_ts, repo_path FROM jobs').all()
+      for (const job of jobs) {
+        this.db.run(
+          'UPDATE jobs SET thread_attachments_json = ? WHERE id = ?',
+          [JSON.stringify(this.threadAttachmentSnapshot(
+            job.chat_id, job.thread_ts, job.repo_path,
+          )), job.id],
+        )
+      }
+      if (!retryRequired) {
+        this.db.run(
+          `INSERT INTO migration_ledger (name, completed_at)
+           VALUES ('thread-attachment-catalog-v1', ?)`,
+          [Date.now()],
+        )
+      }
+    })
+    retrySqlite(() => migrate.immediate())
+  }
+
+  private threadAttachmentSnapshot(
+    chatId: string,
+    threadTs: string,
+    repoPath: string,
+  ): ThreadAttachmentRecord[] {
+    const rows = this.db.query<{
+      source_message_id: string
+      file_id: string
+      ordinal: number
+      path: string
+      size: number
+      digest: string
+    }, [string, string, string]>(
+      `SELECT source_message_id, file_id, ordinal, path, size, digest
+       FROM slack_thread_attachments
+       WHERE chat_id = ? AND thread_ts = ? AND repo_path = ?
+       ORDER BY CAST(source_message_id AS REAL), source_message_id, ordinal, file_id`,
+    ).all(chatId, threadTs, repoPath)
+    return rows.map(row => ({
+      sourceMessageId: row.source_message_id,
+      fileId: row.file_id,
+      ordinal: row.ordinal,
+      path: row.path,
+      size: row.size,
+      digest: row.digest,
+    }))
+  }
+
+  private catalogProcessingInboundAttachments(
+    idempotencyKey: string,
+    scope: { chatId: string; threadTs: string; repoPath: string },
+    requireComplete: boolean,
+  ): ThreadAttachmentRecord[] {
+    const inbound = this.db.query<{
+      seq: number
+      chat_id: string
+      thread_ts: string
+      message_id: string
+      repo_path: string
+      file_ids_json: string
+      downloaded_files_json: string
+      created_at: number
+    }, [string]>(
+      `SELECT seq, chat_id, thread_ts, message_id, repo_path, file_ids_json,
+              downloaded_files_json, created_at
+       FROM inbound_deliveries
+       WHERE idempotency_key = ? AND status = 'processing'`,
+    ).get(idempotencyKey)
+    if (!inbound) {
+      return this.threadAttachmentSnapshot(scope.chatId, scope.threadTs, scope.repoPath)
+    }
+    if (inbound.chat_id !== scope.chatId || inbound.thread_ts !== scope.threadTs
+      || inbound.repo_path !== scope.repoPath) {
+      throw new Error('inbound attachment crossed its Slack thread or repository scope')
+    }
+    const fileIds = parseAttachments(inbound.file_ids_json)
+    const files = parseInboundDownloadedFiles(inbound.downloaded_files_json)
+    if (requireComplete && files.length !== fileIds.length) {
+      throw new Error('Slack attachment handoff is incomplete')
+    }
+    for (const file of files) {
+      if (fileIds[file.ordinal] !== file.fileId) {
+        throw new Error('Slack attachment handoff changed its ordinal binding')
+      }
+      const verified = loadCachedInboundAttachment({
+        inboxDir: join(dirname(this.dbPath), 'inbox'),
+        messageTs: inbound.message_id,
+        fileId: file.fileId,
+        ordinal: file.ordinal,
+        manifest: file,
+      })
+      if (!verified) {
+        throw new Error('Slack attachment disappeared before its thread binding was committed')
+      }
+      const inserted = this.db.run(
+        `INSERT OR IGNORE INTO slack_thread_attachments (
+           chat_id, thread_ts, repo_path, source_message_id, file_id,
+           ordinal, path, size, digest, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          scope.chatId, scope.threadTs, scope.repoPath, inbound.message_id,
+          verified.fileId, verified.ordinal, verified.path, verified.size, verified.digest,
+          inbound.created_at,
+        ],
+      )
+      if (inserted.changes === 1) continue
+      const existing = this.db.query<{
+        repo_path: string
+        ordinal: number
+        path: string
+        size: number
+        digest: string
+      }, [string, string, string, string]>(
+        `SELECT repo_path, ordinal, path, size, digest
+         FROM slack_thread_attachments
+         WHERE chat_id = ? AND thread_ts = ? AND source_message_id = ? AND file_id = ?`,
+      ).get(scope.chatId, scope.threadTs, inbound.message_id, file.fileId)
+      if (!existing || existing.repo_path !== scope.repoPath
+        || existing.ordinal !== verified.ordinal || existing.path !== verified.path
+        || existing.size !== verified.size || existing.digest !== verified.digest) {
+        throw new Error('Slack thread attachment identity collision')
+      }
+    }
+    return this.threadAttachmentSnapshot(scope.chatId, scope.threadTs, scope.repoPath)
+  }
+
+  listThreadAttachments(
+    chatIdInput: string,
+    threadTsInput: string,
+    repoPathInput: string,
+  ): ThreadAttachmentRecord[] {
+    return retrySqlite(() => this.threadAttachmentSnapshot(
+      requireText(chatIdInput, 'chatId'),
+      requireText(threadTsInput, 'threadTs'),
+      requireText(repoPathInput, 'repoPath'),
+    ))
+  }
+
+  retireUnavailableThreadAttachment(
+    jobInput: Pick<JobRecord, 'chatId' | 'threadTs' | 'repoPath'>,
+    attachment: ThreadAttachmentRecord,
+  ): boolean {
+    const chatId = requireText(jobInput.chatId, 'chatId')
+    const threadTs = requireText(jobInput.threadTs, 'threadTs')
+    const repoPath = requireText(jobInput.repoPath, 'repoPath')
+    const retire = this.db.transaction(() => {
+      const removed = this.db.run(
+        `DELETE FROM slack_thread_attachments
+         WHERE chat_id = ? AND thread_ts = ? AND repo_path = ?
+           AND source_message_id = ? AND file_id = ? AND ordinal = ?
+           AND path = ? AND size = ? AND digest = ?`,
+        [
+          chatId, threadTs, repoPath,
+          attachment.sourceMessageId, attachment.fileId, attachment.ordinal,
+          attachment.path, attachment.size, attachment.digest,
+        ],
+      ).changes
+      const snapshot = JSON.stringify(this.threadAttachmentSnapshot(chatId, threadTs, repoPath))
+      this.db.run(
+        `UPDATE jobs SET thread_attachments_json = ?
+         WHERE chat_id = ? AND thread_ts = ? AND repo_path = ?
+           AND status IN ('queued', 'running')`,
+        [snapshot, chatId, threadTs, repoPath],
+      )
+      return removed === 1
+    })
+    return retrySqlite(() => retire.immediate())
   }
 
   private supersedeLifecycleNotifications(jobId: string, now = Date.now()): void {
@@ -5879,15 +6236,25 @@ export class JobStore {
       if (!row) throw new Error(`inbound delivery is no longer processing: ${key}`)
       const now = Date.now()
       const jobId = randomUUID()
+      const downloaded = parseInboundDownloadedFiles(row.downloaded_files_json)
+      const threadAttachments = row.initial_context_state === 'pending'
+        ? []
+        : this.catalogProcessingInboundAttachments(key, {
+            chatId: row.chat_id,
+            threadTs: row.thread_ts,
+            repoPath: row.repo_path,
+          }, false)
       this.db.run(
         `INSERT INTO jobs (
            id, idempotency_key, chat_id, thread_ts, message_id, user_id,
-           repo_path, task, attachments_json, runtime, write_enabled,
+           repo_path, task, attachments_json, thread_attachments_json, runtime, write_enabled,
            status, attempts, last_error, created_at, finished_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', 'codex', ?, 'failed', ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?, 'failed', ?, ?, ?, ?)`,
         [
           jobId, key, row.chat_id, row.thread_ts, row.message_id, row.user_id,
-          row.repo_path, row.text || '(attachment delivery failed)', row.write_enabled,
+          row.repo_path, row.text || '(attachment delivery failed)',
+          JSON.stringify(downloaded.map(file => file.path)),
+          JSON.stringify(threadAttachments), row.write_enabled,
           row.attempts + 1, error, row.created_at, now,
         ],
       )
@@ -6082,6 +6449,21 @@ export class JobStore {
         || !(target.status === 'running' || target.status === 'queued')
         || (input.kind === 'steer' && target.accepts_control !== 1)
         || (input.kind === 'interrupt' && target.cancel_requested_at !== null)) return 'closed'
+      // An interrupt never consumes an attached file: the gateway deliberately
+      // skips downloads so cancellation can overtake large transfers. Preserve
+      // the existing catalog snapshot instead of treating those undownloaded
+      // file IDs as an incomplete handoff that would swallow the interrupt.
+      const threadAttachments = input.kind === 'interrupt'
+        ? this.threadAttachmentSnapshot(chatId, threadTs, target.repo_path)
+        : this.catalogProcessingInboundAttachments(key, {
+            chatId,
+            threadTs,
+            repoPath: target.repo_path,
+          }, true)
+      this.db.run(
+        'UPDATE jobs SET thread_attachments_json = ? WHERE id = ?',
+        [JSON.stringify(threadAttachments), jobId],
+      )
       const now = Date.now()
       let inputRevision = target.input_revision
       if (input.kind === 'interrupt') {
@@ -6314,11 +6696,12 @@ export class JobStore {
         write_enabled: number
         task: string
         attachments_json: string
+        repo_path: string
         ui_approval_request_id: string | null
       }, [string]>(
         `SELECT accepts_control, control_epoch, input_revision, chat_id, thread_ts,
                 status, cancel_requested_at, id, message_id, user_id, write_enabled,
-                task, attachments_json, ui_approval_request_id
+                task, attachments_json, repo_path, ui_approval_request_id
          FROM jobs WHERE id = ? AND runtime = 'codex'`,
       ).get(jobId)
       if (!target || target.control_epoch !== epoch
@@ -6326,6 +6709,15 @@ export class JobStore {
         || !(target.status === 'running' || target.status === 'queued')
         || target.accepts_control !== 1 || target.cancel_requested_at !== null) return 'closed'
       if (target.ui_approval_request_id !== null) return 'closed'
+      const threadAttachments = this.catalogProcessingInboundAttachments(key, {
+        chatId,
+        threadTs,
+        repoPath: target.repo_path,
+      }, true)
+      this.db.run(
+        'UPDATE jobs SET thread_attachments_json = ? WHERE id = ?',
+        [JSON.stringify(threadAttachments), jobId],
+      )
       const snapshotControls = this.db.query<{
         input_revision: number
         message_id: string
@@ -7926,12 +8318,18 @@ export class JobStore {
         'SELECT 1 AS present FROM delivery_tombstones WHERE idempotency_key = ?',
       ).get(idempotencyKey)
       if (retained) throw new Error(`event already completed and retained: ${idempotencyKey}`)
+      const threadAttachments = this.catalogProcessingInboundAttachments(idempotencyKey, {
+        chatId,
+        threadTs,
+        repoPath,
+      }, true)
       const result = this.db.run(
         `INSERT OR IGNORE INTO jobs (
            id, idempotency_key, chat_id, thread_ts, message_id, user_id,
-           repo_path, task, attachments_json, runtime, write_enabled, status,
+           repo_path, task, attachments_json, thread_attachments_json,
+           runtime, write_enabled, status,
            control_epoch, accepts_control, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?, 'queued', 1, 1, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?, 'queued', 1, 1, ?)`,
         [
           id,
           idempotencyKey,
@@ -7942,6 +8340,7 @@ export class JobStore {
           repoPath,
           task,
           JSON.stringify(attachments),
+          JSON.stringify(threadAttachments),
           input.writeEnabled ? 1 : 0,
           Date.now(),
         ],
@@ -10059,6 +10458,60 @@ export class JobStore {
     ).get()?.count ?? 0
   }
 
+  stageMilestoneCommentaryNotification(
+    jobIdInput: string,
+    attemptInput: number,
+    inputRevisionInput: number,
+    kindInput: 'PLAN' | 'VERIFY' | 'BLOCKED',
+    payloadInput: string,
+    now = Date.now(),
+  ): 'staged' | 'duplicate' | 'closed' {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const attempt = Math.floor(attemptInput)
+    const inputRevision = Math.floor(inputRevisionInput)
+    const kind = kindInput
+    const payload = normalizePublicGuardText(payloadInput).trim()
+    if (!Number.isSafeInteger(attempt) || attempt < 1
+      || !Number.isSafeInteger(inputRevision) || inputRevision < 1
+      || !['PLAN', 'VERIFY', 'BLOCKED'].includes(kind)
+      || !payload.startsWith('💬 ') || payload.length > 700
+      || containsCredentialMaterial(payload)
+      || !Number.isSafeInteger(now) || now <= 0) {
+      throw new Error('milestone commentary notification is invalid')
+    }
+    const sourceKey = createHash('sha256')
+      .update('zerochan-slack-milestone-v1\0')
+      .update(jobId).update('\0')
+      .update(String(inputRevision)).update('\0')
+      .update(kind)
+      .digest('hex')
+    const stage = this.db.transaction((): 'staged' | 'duplicate' | 'closed' => {
+      const existing = this.db.query<{ job_id: string }, [string]>(
+        'SELECT job_id FROM commentary_notifications WHERE source_key = ?',
+      ).get(sourceKey)
+      if (existing) {
+        if (existing.job_id !== jobId) {
+          throw new Error(`milestone commentary source identity changed: ${sourceKey}`)
+        }
+        // First public wording wins across process retries, permission phases,
+        // App Server turns, and daemon restarts for this durable input revision.
+        return 'duplicate'
+      }
+      const job = this.db.query<{ status: JobStatus; attempts: number }, [string]>(
+        'SELECT status, attempts FROM jobs WHERE id = ?',
+      ).get(jobId)
+      if (!job || job.status !== 'running' || job.attempts !== attempt) return 'closed'
+      this.db.run(
+        `INSERT INTO commentary_notifications (
+           id, source_key, job_id, attempt, payload, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+        [randomUUID(), sourceKey, jobId, attempt, payload, now],
+      )
+      return 'staged'
+    })
+    return retrySqlite(() => stage.immediate())
+  }
+
   stageCommentaryNotification(
     jobIdInput: string,
     attemptInput: number,
@@ -11063,6 +11516,9 @@ export class JobStore {
       const liveInterjections = this.db.query<{ attachments_json: string }, []>(
         'SELECT attachments_json FROM job_interjections',
       ).all()
+      const retainedThreadAttachments = this.db.query<{ path: string }, []>(
+        'SELECT path FROM slack_thread_attachments',
+      ).all()
       return {
         candidates: prunedCandidates,
         prunedInterjectionAttachments,
@@ -11073,6 +11529,7 @@ export class JobStore {
           [
             ...liveJobs.flatMap(row => parseAttachments(row.attachments_json)),
             ...liveInterjections.flatMap(row => parseAttachments(row.attachments_json)),
+            ...retainedThreadAttachments.map(row => row.path),
           ].map(path => resolve(path)),
         ),
       }
@@ -11514,13 +11971,16 @@ export class JobStore {
     ).all().map(mapRow)
   }
 
-  requeue(id: string, reason: string): void {
+  requeue(id: string, reason: string, notBefore: number | null = null): void {
+    if (notBefore !== null && (!Number.isSafeInteger(notBefore) || notBefore <= Date.now())) {
+      throw new Error('job retry deadline is invalid')
+    }
     const requeue = this.db.transaction(() => {
       const updated = this.db.run(
         `UPDATE jobs
          SET status = 'queued', worker_id = NULL, started_at = NULL,
              executor_pid = NULL, pending_session_id = NULL, pending_result = NULL,
-             not_before = NULL, finished_at = NULL, last_error = ?,
+             not_before = ?, finished_at = NULL, last_error = ?,
              accepts_control = CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END,
              executor_nonce = NULL,
              active_thread_id = NULL, active_turn_id = NULL
@@ -11530,7 +11990,7 @@ export class JobStore {
              WHERE receipts.job_id = jobs.id AND receipts.attempt = jobs.attempts
                AND receipts.status IN ('prepared', 'rejected')
            )`,
-        [reason, id],
+        [notBefore, reason, id],
       )
       if (updated.changes === 1) this.supersedeLifecycleNotifications(id)
       return updated.changes
@@ -12043,12 +12503,22 @@ export function createExecutorPidLifecycle(
 export interface JobExecutionResult {
   sessionId: string
   result: string
+  /** Host-captured browser images kept outside the model-writable outbox. */
+  capturedArtifacts?: HostCapturedArtifact[]
   /**
    * Present after a write-authorized job passed final review and input sealing.
    * A Codex-decided no-change result uses a durable empty plan set so write
    * capability is never reinterpreted as a GitHub publication requirement.
    */
   publication?: GitHubPublicationSet
+}
+
+export interface HostCapturedArtifact {
+  kind: 'browser-screenshot'
+  path: string
+  digest: string
+  width: number
+  height: number
 }
 
 export interface UiApprovalRequestRecord {
@@ -12144,7 +12614,12 @@ export interface JobExecutionContext {
   beginProgressProbe(probe: { slot: number; clientMessageId: string }): boolean
   supersedeProgressProbe(slot: number, supersededBySlot: number | null): void
   reportProgress(report: { slot: number; elapsedMs: number; text: string }): boolean
-  reportCommentary(event: { sourceKey: string; text: string }): boolean
+  reportCommentary(event: {
+    sourceKey: string
+    text: string
+    inputRevision?: number
+    milestoneKind?: SlackUpdateKind
+  }): boolean
   reportRateLimitWait(binding: { threadId: string; turnId: string }): boolean
 }
 
@@ -12202,6 +12677,8 @@ export interface RunQueuedJobsOptions {
   /** Fixture-only host transport; production resolves the authenticated gh CLI itself. */
   githubPublicationCommandsForTesting?: GitHubPublicationCommands
   githubPublicationRetryMsForTesting?: number
+  /** Fixture-only delay for a transient retained-attachment host I/O retry. */
+  retainedAttachmentRetryMsForTesting?: number
   signal?: AbortSignal
   onLog?: (message: string) => void
 }
@@ -13182,12 +13659,21 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
             const publicCommentary = publicText.startsWith('💬 ')
               ? publicText
               : `💬 ${publicText}`
-            const disposition = options.store.stageCommentaryNotification(
-              job.id,
-              job.attempts,
-              event.sourceKey,
-              publicCommentary,
-            )
+            const disposition = event.inputRevision !== undefined
+              && event.milestoneKind !== undefined
+              ? options.store.stageMilestoneCommentaryNotification(
+                  job.id,
+                  job.attempts,
+                  event.inputRevision,
+                  event.milestoneKind,
+                  publicCommentary,
+                )
+              : options.store.stageCommentaryNotification(
+                  job.id,
+                  job.attempts,
+                  event.sourceKey,
+                  publicCommentary,
+                )
             if (disposition === 'staged') scheduleNotificationFlush()
             return disposition === 'staged' || disposition === 'duplicate'
           },
@@ -13380,6 +13866,50 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         || error instanceof EphemeralClaudeOwnedProcessStillLiveError
         || error instanceof CodexResultPersistencePendingError
         || error instanceof HerdrJobMonitorPendingError) throw error
+      if (error instanceof RetainedSlackAttachmentUnavailableError) {
+        const unavailableIsCurrentInput = error.attachment.sourceMessageId === job.messageId
+        // Never remove the manifest for the current Slack input before that
+        // input reaches a terminal state. A crash in this catch block must not
+        // turn the same unverified path into an ordinary legacy attachment on
+        // recovery. Later jobs may retire a definitively bad historical file.
+        if (error.reason !== 'transient' && !unavailableIsCurrentInput) {
+          options.store.retireUnavailableThreadAttachment(job, error.attachment)
+        }
+        const safeToRetry = options.store.initialTurnDispatchIsSafeToRetry(job.id)
+          && !options.store.controlMayHaveBeenDelivered(job.id)
+          && (error.reason === 'transient' || !unavailableIsCurrentInput)
+        if (safeToRetry) {
+          await updateMonitor(
+            job,
+            error.reason === 'transient'
+              ? '以前の添付の読み取りを一時的に再試行します'
+              : '利用できなくなった過去の添付を隔離し、残りの同一スレッド情報で再開します',
+          )
+          await quiesceLifecycleBeforeStateChange()
+          options.store.requeue(
+            job.id,
+            error.reason === 'transient'
+              ? 'retained Slack attachment read hit a transient host error'
+              : 'unavailable retained Slack attachment was isolated before execution',
+            error.reason === 'transient'
+              ? Date.now() + positiveInteger(options.retainedAttachmentRetryMsForTesting, 5_000)
+              : null,
+          )
+          log(`${workerId} isolated an unavailable retained attachment and requeued ${job.id}`)
+          continue
+        }
+        const attachmentFailure = job.writeEnabled
+          && options.store.writePhaseMayHaveBeenDelivered(job.id, job.attempts)
+          ? '以前の添付ファイルが処理途中で利用できなくなりました。現在までの変更は保持されています。'
+            + '必要な場合は元のファイルを再添付して、続きから実行してください。'
+          : '以前の添付ファイルが利用できなくなりました。必要な場合は元のファイルを再添付してください。'
+        await updateMonitor(job, '利用できない過去の添付を隔離しました')
+        await quiesceMonitorBeforeTerminal()
+        options.store.fail(job.id, attachmentFailure)
+        stats.failed += 1
+        scheduleNotificationFlush()
+        continue
+      }
       if (error instanceof CodexUserCancelledError) {
         if (!executionStarted) {
           await runExternalContextBoundary(
@@ -14029,7 +14559,7 @@ export function sanitizeExecutionTextForSlack(
   let insideHostBlock = false
   for (const line of text.split(/\r?\n/)) {
     const normalized = line.trim().replace(/^>\s*/, '')
-    if (/^--- Zero host (?:control|phase control|follow-up binding|write-phase preemption|progress check)\b/i.test(normalized)) {
+    if (/^--- Zero host (?:control|phase control|follow-up binding|write-phase preemption|progress check|attachment bindings)\b/i.test(normalized)) {
       insideHostBlock = true
       continue
     }
@@ -14070,6 +14600,9 @@ export function sanitizeExecutionTextForSlack(
     artifactDirForJob(dir, job.id),
     sealedArtifactDirForJob(dir, job.id),
     ...job.attachments,
+    ...(job.threadAttachments ?? []).map(attachment => attachment.path),
+    ...(job.threadAttachments ?? []).map(attachment => attachment.sourceMessageId),
+    ...(job.threadAttachments ?? []).map(attachment => attachment.fileId),
     ...inputEntries.flatMap(entry => entry.attachments),
     ...inputEntries.map(entry => entry.messageId),
     ...inputEntries.map(entry => entry.userId),
@@ -14920,14 +15453,61 @@ export function sealArtifactResult(job: JobRecord, result: string, dir = stateDi
   return output.text ? `${output.text}\n${marker}` : marker
 }
 
+function stageHostCapturedArtifacts(
+  job: JobRecord,
+  artifacts: readonly HostCapturedArtifact[],
+  dir: string,
+): string[] {
+  if (artifacts.length === 0) return []
+  const captureRoot = resolve(browserCaptureDirForJob(dir, job.id))
+  requireManagedDirectory(dir, captureRoot)
+  const outbox = resolve(artifactDirForJob(dir, job.id))
+  requireManagedDirectory(dir, outbox)
+  const staged: string[] = []
+  for (const artifact of artifacts) {
+    if (artifact.kind !== 'browser-screenshot' || dirname(resolve(artifact.path)) !== captureRoot) {
+      throw new Error('host-captured browser artifact binding is invalid')
+    }
+    const sanitized = reencodeBrowserScreenshot({
+      source: artifact.path,
+      sourceDir: captureRoot,
+      digest: artifact.digest,
+      width: artifact.width,
+      height: artifact.height,
+    })
+    const digest = createHash('sha256').update(sanitized).digest('hex')
+    const destination = join(
+      outbox,
+      `browser-${digest.slice(0, 32)}-${artifact.width}x${artifact.height}.png`,
+    )
+    atomicWritePrivateFile(destination, sanitized)
+    staged.push(destination)
+  }
+  return [...new Set(staged)]
+}
+
 export function finalizeSuccessfulExecution(
   job: JobRecord,
   execution: JobExecutionResult,
   dir: string,
   log: (message: string) => void = () => {},
 ): JobExecutionResult {
+  const { capturedArtifacts = [], ...persistedExecution } = execution
   try {
-    const sealed = sealArtifactResult(job, execution.result, dir)
+    const declared = extractArtifactPaths(execution.result)
+    // Browser evidence is bounded by the host at capture time and cannot be
+    // displaced by ten model-declared files. It is decoded only after Codex
+    // exits, then copied into the ordinary outbox immediately before sealing.
+    const capturedPaths = stageHostCapturedArtifacts(job, capturedArtifacts, dir)
+    const artifactPaths = [...new Set([...capturedPaths, ...declared.files])].slice(0, 10)
+    const artifactMarker = artifactPaths.length > 0
+      ? `<zerokun_files>${JSON.stringify(artifactPaths)}</zerokun_files>`
+      : ''
+    const sealed = sealArtifactResult(
+      job,
+      artifactMarker ? `${declared.text}\n${artifactMarker}`.trim() : declared.text,
+      dir,
+    )
     const output = extractArtifactPaths(sealed)
     const sanitized = sanitizeExecutionTextForSlack(job, execution.sessionId, output.text, dir)
     const containsSelfNonDisclosure = sanitized.split(/\r?\n/)
@@ -14936,7 +15516,7 @@ export function finalizeSuccessfulExecution(
       ? `<zerokun_files>${JSON.stringify(output.files)}</zerokun_files>`
       : ''
     return {
-      ...execution,
+      ...persistedExecution,
       result: normalizePersistedExecutionResult(
         job,
         execution.sessionId,
@@ -14957,7 +15537,7 @@ export function finalizeSuccessfulExecution(
     const message = error instanceof Error ? error.message : String(error)
     log(`artifact sealing failed for completed job ${job.id}: ${message}`)
     return {
-      ...execution,
+      ...persistedExecution,
       result: normalizePersistedExecutionResult(
         job,
         execution.sessionId,
@@ -17645,6 +18225,12 @@ async function runCli(): Promise<void> {
               cancellationRequested: () => store.get(job.id)?.cancelRequestedAt != null,
             },
             onMonitorMessage: message => mirrorMonitorMessage(message),
+            progressActivatedAtMs: executionContext.progressActivatedAtMs,
+            onProgressProbeStarted: probe => executionContext.beginProgressProbe(probe),
+            onProgressProbeSuperseded: (slot, supersededBySlot) => {
+              executionContext.supersedeProgressProbe(slot, supersededBySlot)
+            },
+            onProgressReport: report => executionContext.reportProgress(report),
             onCommentaryMessage: event => {
               if (executionContext.reportCommentary(event) !== true) {
                 throw new Error('Codex commentary could not be staged for Slack delivery')

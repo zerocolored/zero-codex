@@ -418,6 +418,35 @@ describe('durable lifecycle notifications', () => {
     store.close()
   })
 
+  test('旧releaseの未配信routine commentaryを節目通知への移行時に無効化する', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerochan-legacy-commentary-'))
+    roots.push(root)
+    const repo = join(root, 'repo')
+    mkdirSync(repo)
+    const dbPath = join(root, 'state', 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    const job = store.enqueue({
+      chatId: 'D1', threadTs: 'legacy-commentary', messageId: 'legacy-commentary',
+      userId: 'U1', repoPath: repo, task: 'legacy commentary', writeEnabled: false,
+    }).job
+    const running = store.claimNext('legacy-commentary-worker')!
+    expect(store.stageCommentaryNotification(
+      running.id, running.attempts, '8'.repeat(64), '💬 ファイルを確認しています。', 1_000,
+    )).toBe('staged')
+    store.close()
+
+    const db = new Database(dbPath)
+    db.run("DELETE FROM migration_ledger WHERE name = 'commentary-milestone-cutover-v1'")
+    db.close()
+
+    store = new JobStore(dbPath)
+    expect(store.migrationApplied('commentary-milestone-cutover-v1')).toBe(true)
+    expect(store.pendingCommentaryNotifications()).toEqual([])
+    expect(store.commentaryNotificationCount()).toBe(0)
+    store.fail(job.id, 'fixture complete')
+    store.close()
+  })
+
   test('開始lifecycleは内部で完了するがSlack本文を投稿しない', async () => {
     const { store, job } = runningJob()
     const posted: string[] = []
@@ -683,6 +712,25 @@ describe('durable lifecycle notifications', () => {
     expect(delivered[1]?.id).toBe(firstId)
     expect(store.commentaryNotificationCount()).toBe(0)
     expect(store.pendingTerminalNotifications()).toHaveLength(1)
+    store.close()
+  })
+
+  test('節目commentaryはjob・入力revision・kindごとに再試行と文面を跨いで一度だけ送る', () => {
+    const { store, job } = runningJob()
+    expect(store.stageMilestoneCommentaryNotification(
+      job.id, job.attempts, 1, 'PLAN', '💬 原因と方針を確定しました。', 1_000,
+    )).toBe('staged')
+    expect(store.stageMilestoneCommentaryNotification(
+      job.id, job.attempts, 1, 'PLAN', '💬 同じ方針を別表現で再掲します。', 1_100,
+    )).toBe('duplicate')
+    expect(store.stageMilestoneCommentaryNotification(
+      job.id, job.attempts, 1, 'VERIFY', '💬 実装が終わり、検証へ進みます。', 1_200,
+    )).toBe('staged')
+    expect(store.stageMilestoneCommentaryNotification(
+      job.id, job.attempts, 2, 'PLAN', '💬 追加依頼の方針を確定しました。', 1_300,
+    )).toBe('staged')
+    expect(store.commentaryNotificationCount()).toBe(3)
+    store.fail(job.id, 'fixture complete')
     store.close()
   })
 
