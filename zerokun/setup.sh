@@ -195,6 +195,9 @@ require_installable_launcher_link \
   "$HOME/.local/bin/zerokun" "$REPO_DIR/codex-channel.sh" \
   "${BOOTSTRAP_PREVIOUS_REPO:+$BOOTSTRAP_PREVIOUS_REPO/codex-channel.sh}"
 require_installable_launcher_link \
+  "$HOME/.local/bin/zero" "$REPO_DIR/codex-channel.sh" \
+  "${BOOTSTRAP_PREVIOUS_REPO:+$BOOTSTRAP_PREVIOUS_REPO/codex-channel.sh}"
+require_installable_launcher_link \
   "$HOME/.local/bin/zerochan-access" "$REPO_DIR/zerokun/access.ts" \
   "${BOOTSTRAP_PREVIOUS_REPO:+$BOOTSTRAP_PREVIOUS_REPO/zerokun/access.ts}"
 
@@ -580,6 +583,8 @@ ln -sfn "$REPO_DIR/zerokun/status.ts" "$HOME/.local/bin/zerokun-status"
 ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/codex-channel"
 ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/zerochan"
 ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/zerokun"
+# `zero` は操作ガイド専用の入口です。実行系は zerochan のままにします。
+ln -sfn "$REPO_DIR/codex-channel.sh" "$HOME/.local/bin/zero"
 # Remove only links owned by this checkout or its validated bootstrap predecessor.
 remove_owned_legacy_link() {
   local legacy_path="$1" legacy_target="$2" previous_target="${3:-}" \
@@ -665,4 +670,5 @@ else
   echo "     queue確認: zerokun-jobs status"
   echo "     Codex版更新: zerochan update"
   echo "     書込み許可: zerochan-access write allow <SlackユーザーID>"
+  echo "  4. 操作コマンド一覧はいつでも: zero help"
 fi

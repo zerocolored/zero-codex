@@ -953,3 +953,69 @@ describe('codex-channel.sh replacement guard', () => {
     expect(existsSync(join(state, 'fake-runner-pid'))).toBe(false)
   }, 10_000)
 })
+
+describe('zero help', () => {
+  // The guide must stay answerable while the runtime is broken, so these run
+  // without bun, without state, and without Slack credentials on PATH.
+  async function runHelp(invokedAs: string, args: string[]) {
+    const base = mkdtempSync(join(tmpdir(), 'zerokun-zero-help-'))
+    temporaryDirs.push(base)
+    const path = join(base, invokedAs)
+    symlinkSync(LAUNCHER, path)
+    const child = Bun.spawn(['/bin/bash', path, ...args], {
+      env: { HOME: base, PATH: '/usr/bin:/bin' },
+      cwd: base,
+      stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    })
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    return { exitCode, stdout, stderr }
+  }
+
+  function expectsGuide(text: string): void {
+    expect(text).toContain('zerochan start')
+    expect(text).toContain('zerochan stop --force')
+    expect(text).toContain('zerochan update --recover-only')
+    expect(text).toContain('zerochan set slack-channel')
+    expect(text).toContain('zerokun-jobs status')
+    expect(text).toContain('zerochan-access write allow')
+  }
+
+  test('zero helpはbun・state・Slack資格情報なしで操作ガイドを返す', async () => {
+    const result = await runHelp('zero', ['help'])
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe('')
+    expectsGuide(result.stdout)
+  })
+
+  test('引数なしのzeroも同じガイドを返す', async () => {
+    const result = await runHelp('zero', [])
+    expect(result.exitCode).toBe(0)
+    expectsGuide(result.stdout)
+  })
+
+  test('zeroは実行系subcommandを受け付けずzerochanへ案内する', async () => {
+    const result = await runHelp('zero', ['start'])
+    expect(result.exitCode).toBe(2)
+    expect(result.stdout).toBe('')
+    expect(result.stderr).toContain('zerochan を使ってください')
+    expectsGuide(result.stderr)
+  })
+
+  test('zerochan help / --help / -h も同じガイドを返す', async () => {
+    for (const argument of ['help', '--help', '-h']) {
+      const result = await runHelp('zerochan', [argument])
+      expect(result.exitCode).toBe(0)
+      expectsGuide(result.stdout)
+    }
+  })
+
+  test('zerokun helpも同じガイドを返す', async () => {
+    const result = await runHelp('zerokun', ['help'])
+    expect(result.exitCode).toBe(0)
+    expectsGuide(result.stdout)
+  })
+})

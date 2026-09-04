@@ -10,6 +10,63 @@ while [ -L "$SOURCE_PATH" ]; do
   case "$SOURCE_PATH" in /*) ;; *) SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH" ;; esac
 done
 REPO_DIR="$(CDPATH='' cd -P "$(dirname "$SOURCE_PATH")" >/dev/null 2>&1 && pwd)"
+
+# `zero help` は、bun・state・Slack資格情報・project選択のどれにも依存せずに答えます。
+# runtimeが壊れている時ほど操作方法を思い出したいので、他の依存より前に置きます。
+print_zero_help() {
+  cat <<'ZERO_HELP'
+Zeroちゃん 操作ガイド
+
+起動・停止（対象projectのdirectoryで実行します）
+  zerochan start                        起動する（既に稼働中なら既存processを共有します）
+  zerochan                              引数なしでも同じ起動です
+  zerochan stop                         実行中jobが無ければ停止します
+  zerochan stop --force                 Zeroちゃん所有processを強制停止します（待機jobは残ります）
+  zerochan --restart                    最後に接続したprojectで再起動します
+
+更新
+  zerochan update                       origin/mainの候補版を検証し、fast-forward・setup・再起動まで行います
+  zerochan update --recover-only        中断した更新transactionの復旧だけ行います
+
+状態
+  zerochan status                       対象projectとSlackチャンネルの紐付けを表示します
+  zerokun-status                        gatewayとjob runnerの稼働PIDを表示します
+  zerokun-jobs status                   queueとrunnerの状態を表示します
+
+Slackチャンネル（先にSlack Appをchannelへ招待します）
+  zerochan set slack-channel <C...>     現在のprojectへchannelを紐付けます
+  zerochan unset slack-channel <C...>   紐付けを解除します
+
+利用者の権限
+  zerochan-access status                現在の許可状態を表示します
+  zerochan-access pair <code>           DMのpairing codeを承認します
+  zerochan-access allow|deny <U...>     DMの受信を許可・拒否します
+  zerochan-access write allow|deny <U...>  repositoryの書込みを許可・拒否します
+  zerochan-access policy pairing|allowlist|disabled   DM policyを切り替えます
+
+初回セットアップは SETUP.md、権限の詳細は ACCESS.md を参照してください。
+ZERO_HELP
+}
+
+case "$INVOKED_AS" in
+  zero|zerochan|zerokun)
+    if [ "$#" -eq 1 ]; then
+      case "$1" in
+        help|--help|-h) print_zero_help; exit 0 ;;
+      esac
+    fi
+    ;;
+esac
+if [ "$INVOKED_AS" = "zero" ]; then
+  if [ "$#" -eq 0 ]; then
+    print_zero_help
+    exit 0
+  fi
+  echo "❌ zero は操作ガイド専用です。起動・停止・更新は zerochan を使ってください。" >&2
+  print_zero_help >&2
+  exit 2
+fi
+
 . "$REPO_DIR/zerokun/state-dir.sh"
 
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -72,7 +129,7 @@ case "$INVOKED_AS" in
       LAUNCH_MODE="status"
       PROJECT="$(pwd -P)"
     else
-      echo "使い方: zerochan | zerochan start | zerochan stop [--force] | zerochan update [--recover-only] | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
+      echo "使い方: zerochan | zerochan start | zerochan stop [--force] | zerochan update [--recover-only] | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status | zerochan help（詳しい操作ガイドは zero help）" >&2
       exit 2
     fi
     ;;

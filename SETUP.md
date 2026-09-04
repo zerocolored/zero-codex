@@ -176,6 +176,9 @@ cd /absolute/path/to/project && zerochan status
 - `zerokun-jobs status`: queue／runnerが利用可能であること
 - `zerochan status`: 対象projectとchannelの紐付けが意図どおりであること
 
+起動・停止・更新・権限のコマンド一覧は `zero help` で表示できます（`zerochan help` も同じ）。
+bun・state・Slack資格情報に依存しないので、runtimeが壊れている時でも読めます。
+
 最後にSlackでAppをメンションし、同じthreadへ実際に返信が来ることを確認します。
 
 ```text

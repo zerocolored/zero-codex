@@ -333,6 +333,13 @@ zerochan-access write deny U0123456789
 
 ## 起動と運用
 
+操作コマンドの一覧は `zero help` でいつでも表示できます。bun・state・Slack資格情報のどれにも依存しないので、
+runtimeが動かない状態でも読めます。`zerochan help` も同じ内容です。
+
+```bash
+zero help
+```
+
 ```bash
 # setup後、対象projectへ移動して起動（Herdr外なら専用workspaceを自動作成）
 cd /absolute/path/to/project
