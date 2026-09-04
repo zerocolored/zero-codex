@@ -14537,6 +14537,18 @@ export function naturalizeSlackRedactions(value: string): string {
     .replace(/対象箇所(?:\s*[、,・／/]\s*対象箇所)+/g, '対象箇所')
 }
 
+export function encodeSlackGuardNonce(uuid: string): string {
+  const entropy = uuid.replaceAll('-', '').toLowerCase()
+  if (!/^[0-9a-f]{32}$/.test(entropy)) {
+    throw new Error('Slack guard placeholder entropy is invalid')
+  }
+  // Keep all 128 random bits while separating every hex nibble with a
+  // non-hex character.  This prevents the nonce itself from looking like a
+  // runtime ID or accidentally spelling a protected implementation name
+  // (for example the old alphabet could produce "gpt").
+  return [...entropy].map(character => `z${character}`).join('')
+}
+
 export function sanitizeExecutionTextForSlack(
   job: JobRecord,
   sessionId: string,
@@ -14672,12 +14684,7 @@ export function sanitizeExecutionTextForSlack(
     return verified
   }
   const protectedGitCommits: string[] = []
-  const gitCommitPlaceholderNonce = [...randomUUID().replaceAll('-', '')]
-    // Use only lowercase non-hex letters. Uppercase placeholders can
-    // accidentally resemble Slack IDs (for example UXXXXXXXX), while a hex
-    // nonce can be consumed by the generic internal-ID guard before restore.
-    .map(character => String.fromCharCode(103 + Number.parseInt(character, 16)))
-    .join('')
+  const gitCommitPlaceholderNonce = encodeSlackGuardNonce(randomUUID())
   sanitized = sanitized.replace(
     /(?<![A-Za-z0-9_])((?:commit(?:[ \t]*(?:id|sha|hash))?|コミット(?:[ \t]*(?:ID|SHA|ハッシュ))?)[ \t]*[:：#]?[ \t]*`?)([0-9a-f]{7,64})(`?)(?![0-9a-f])/gi,
     (match, prefix: string, value: string, suffix: string) => {
