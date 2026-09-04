@@ -420,8 +420,15 @@ for line in sys.stdin:
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "通常完了"}], "error": None}}},
             ])
             continue
-        emit({"id": request_id, "result": {"turn": active_turn}})
-        emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
+        if mode == "commentary-coalesced":
+            emit_batch([
+                {"id": request_id, "result": {"turn": active_turn}},
+                {"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}},
+                {"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-coalesced-plan", "phase": "commentary", "text": "[ZERO_SLACK_UPDATE_BEGIN:PLAN]\\n同じ通信で届いた方針を確定しました\\n[ZERO_SLACK_UPDATE_END:PLAN]"}}},
+            ])
+        else:
+            emit({"id": request_id, "result": {"turn": active_turn}})
+            emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
         turn_latch_stage = os.environ.get("ZERO_TURN_LATCH_STAGE")
         if turn_latch_stage == stage:
             turn_latch_ready = os.environ["ZERO_TURN_LATCH_READY"]
@@ -626,7 +633,7 @@ for line in sys.stdin:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": items, "error": failure}}})
             elif not hold_for_steer and not hold_for_interjection:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": message}], "error": None}}})
-        elif mode in ("normal", "commentary", "interjection-late-answer", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
+        elif mode in ("normal", "commentary", "commentary-coalesced", "interjection-late-answer", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
             if mode == "slow":
                 time.sleep(0.1)
             if mode == "large-ledger":
@@ -637,8 +644,10 @@ for line in sys.stdin:
             progress_error = {"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "fixture progress", "codexErrorInfo": None, "additionalDetails": None}}}
             late_error = {"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": {"message": "late fixture failure", "codexErrorInfo": None, "additionalDetails": None}}}
             if mode == "commentary":
-                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-shared", "phase": "commentary", "text": "原因を確認しています 🔎"}}})
-                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-shared", "phase": "commentary", "text": "修正内容を検証しています 🧪"}}})
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-technical", "phase": "commentary", "text": "関連ファイルを順に確認しています"}}})
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-plan", "phase": "commentary", "text": "[ZERO_SLACK_UPDATE_BEGIN:PLAN]\\n原因を特定し、修正方針を確定しました 🔎\\n[ZERO_SLACK_UPDATE_END:PLAN]"}}})
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-plan-repeat", "phase": "commentary", "text": "[ZERO_SLACK_UPDATE_BEGIN:PLAN]\\n方針の再確認が終わりました\\n[ZERO_SLACK_UPDATE_END:PLAN]"}}})
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-verify", "phase": "commentary", "text": "[ZERO_SLACK_UPDATE_BEGIN:VERIFY]\\n実装が完了し、検証へ進みます 🧪\\n[ZERO_SLACK_UPDATE_END:VERIFY]"}}})
             if mode == "late-error-coalesced":
                 emit_batch([terminal, late_error])
             elif mode == "errors-before-terminal-coalesced":
@@ -1984,10 +1993,15 @@ describe('production App Server executor', () => {
     }, 30_000)
   }
 
-  test('root commentaryを監視表示とdurable Slack handoffへ同じ順序で渡す', async () => {
+  test('root commentaryは全件監視し節目だけをdurable Slack handoffへ渡す', async () => {
     const value = fixture('commentary')
     const monitorMessages: string[] = []
-    const commentary: Array<{ sourceKey: string; text: string }> = []
+    const commentary: Array<{
+      sourceKey: string
+      text: string
+      inputRevision?: number
+      milestoneKind?: 'PLAN' | 'VERIFY' | 'BLOCKED'
+    }> = []
     const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
@@ -2000,16 +2014,49 @@ describe('production App Server executor', () => {
     })
     expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
     expect(commentary.map(event => event.text)).toEqual([
-      '💬 原因を確認しています 🔎',
-      '💬 修正内容を検証しています 🧪',
+      '💬 原因を特定し、修正方針を確定しました 🔎',
+      '💬 実装が完了し、検証へ進みます 🧪',
     ])
     expect(commentary.every(event => /^[0-9a-f]{64}$/.test(event.sourceKey))).toBe(true)
     expect(new Set(commentary.map(event => event.sourceKey)).size).toBe(2)
+    expect(commentary.map(event => [event.inputRevision, event.milestoneKind])).toEqual([
+      [1, 'PLAN'],
+      [1, 'VERIFY'],
+    ])
     expect(monitorMessages).toEqual([
       '● 作業を開始しました',
-      '💬 原因を確認しています 🔎',
-      '💬 修正内容を検証しています 🧪',
+      '💬 関連ファイルを順に確認しています',
+      '💬 原因を特定し、修正方針を確定しました 🔎',
+      '💬 方針の再確認が終わりました',
+      '💬 実装が完了し、検証へ進みます 🧪',
     ])
+    value.store.close()
+  }, 15_000)
+
+  test('turn開始と最初の節目が同一chunkでもactive turnへ結び付ける', async () => {
+    const value = fixture('commentary-coalesced')
+    const commentary: Array<{
+      text: string
+      inputRevision?: number
+      milestoneKind?: 'PLAN' | 'VERIFY' | 'BLOCKED'
+    }> = []
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'commentary-coalesced' },
+      onCommentaryMessage: event => { commentary.push(event) },
+      liveControls: value.hooks,
+    })
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
+    expect(commentary).toHaveLength(1)
+    expect(commentary[0]).toMatchObject({
+      text: '💬 同じ通信で届いた方針を確定しました',
+      inputRevision: 1,
+      milestoneKind: 'PLAN',
+    })
     value.store.close()
   }, 15_000)
 

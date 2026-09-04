@@ -64,7 +64,7 @@ Git repositoryでなくてもmulti-repository workspaceとして起動できま�
 | `herdr-job-monitor.ts` | job専用Herdr監視tabの永続state、安全な日本語タイムライン、再起動reconcile、自動close |
 | `herdr-job-monitor-view.ts` | tokenを持たずrolling feedだけをterminalへ安全に表示するviewer |
 | `codex-executor.ts` | sandboxを選び、App Server thread/turn/controlを検証 |
-| `browser-verification-broker.ts` | fresh Chrome profileでlocalhostだけを描画・PNG検証 |
+| `browser-verification-broker.ts` | fresh Chrome profileでlocalhostを隔離描画・PNG検証 |
 | `github-credential-broker.ts` | operator credentialを隠したrepository限定GitHub transport |
 | `access.ts` | pairing、DM/channel、write 許可の端末 CLI |
 | `project-channel-config.ts` | project-local channel設定と共有SQLite routeの同期 |
@@ -126,7 +126,8 @@ Codexの結論を別のreview snapshotやpublication coordinatorで差し戻し�
 snapshotも直近64 job block、128 Ki文字／256 KiBを上限とし、UTF-8 block境界で古いものから省略します。
 各archiveはevent数・文字数・byte数も制限します。credential、URL、machine-local path、Slack／内部ID、
 `<zerokun_files>`成果物path、host control風markerは保存前に除去し、履歴本文はhost authority、write許可、
-UI/UX承認、repository、sandboxを変更できません。添付は件数だけ保持し、binaryは保持しません。
+UI/UX承認、repository、sandboxを変更できません。添付binaryはSlack thread・repository・source messageへ
+固定したhost側catalogで保持し、同じthreadの後続jobとnative resume/cold startへ読み取り専用で再提示します。
 upgrade前にすでにretention GCされたjobはbackfillできないため、その範囲だけはSlack本文または再添付から
 改めて確認します。
 
@@ -197,8 +198,10 @@ codex <trust-args> -C <repo> \
 - `AGENTS.md`の探索は無効化しません。Herdr identityと`project_doc_max_bytes=262144`は
   runtime側の信頼済み設定として毎job固定し、対象repository直下の物理`AGENTS.md`がApp Serverの
   `instructionSources`へ実際に含まれることもhandshakeで検証します。
-- apps・plugins・hookと一般MCPは無効化し、必要なwrite jobで`zerokun_browser`と
-  `zerokun_github`だけを追加します。
+- apps・plugins・hookと一般MCPは無効化し、必要なwrite jobで`zerokun_browser`、
+  `zerokun_github`、設定済みでowner管理の`go-chrome-mcp`だけを追加します。
+  `go-chrome-mcp`はproject設定からの差替えを拒否し、cookie取得・任意JavaScript等を無効化したうえで、
+  hostのChrome bridgeへ接続します。Codex shell自体のHOME/TMPDIR隔離は維持します。
   Web検索はwrite許可jobだけに限定し、command networkとSlack関連domainをpermission profileで制限します。
   Slack tokenは子へ渡さず、Slack投稿をdeveloper instructionsでも禁止します。
 
@@ -207,10 +210,11 @@ codex <trust-args> -C <repo> \
 受信可否と repository write は別です。
 
 - 通常: minimal runtime + repository read + 当該添付read + job outbox/scratch write
-- `writeAllowFrom` の sender: minimal runtime + repository/`.git` write + network + localhost bind
+- `writeAllowFrom` の sender: minimal runtime + repository/`.git` write + network + browser/local bind
 - read senderは1つのread-only Codex workflow、write senderは1つのwrite-authorized Codex workflowを使います。
   advisor、review、test、Git、deployの進め方はCodexが`AGENTS.md`から決め、Zeroちゃんは別phaseへ分割しません。
-- write jobではlocalhost限定browser verifierとrepository限定GitHub credential brokerを利用できます。
+- write jobでは公開HTTPSへ到達できるBrowser／Chrome、localhost用の隔離browser verifier、
+  repository限定GitHub credential brokerを利用できます。
   brokerはSlack token、GitHub token、operator HOMEをmodelへ公開せず、Codexが選んだ操作だけを実行します。
 
 Zeroちゃん本体のrepositoryはhost runtimeの信頼境界なので、そこへのwrite jobは許可者であっても

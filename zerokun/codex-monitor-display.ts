@@ -4,6 +4,7 @@ import { containsCredentialMaterial, normalizePublicGuardText } from './public-o
 const MAX_MONITOR_TEXT_CHARS = 600
 const MAX_MONITOR_INPUT_CHARS = 8_192
 const MAX_TRACKED_MONITOR_ITEMS = 512
+const MAX_BROWSER_SCREENSHOT_BYTES = 16 * 1024 * 1024
 
 const SECRET_PATTERNS = [
   /\b(?:Basic|Bearer)\s+[A-Za-z0-9._~+\/-]{8,}={0,2}\b/i,
@@ -17,6 +18,79 @@ const SECRET_PATTERNS = [
 function plainRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   return value as Record<string, unknown>
+}
+
+export type BrowserScreenshotImage = {
+  bytes: Uint8Array
+  width: number
+  height: number
+}
+
+/**
+ * Extract a completed public-browser screenshot from the active root turn.
+ * The image payload is treated as host transport data, never as model text:
+ * only the configured Chrome bridge, exact screenshot tool, canonical base64,
+ * PNG header, and bounded dimensions are accepted.
+ */
+export function browserScreenshotFromNotification(
+  notification: AppServerNotification,
+  parentThreadId: string | null,
+  activeTurnId: string | null,
+): BrowserScreenshotImage | null {
+  if (!parentThreadId || !activeTurnId || notification.method !== 'item/completed'
+    || notification.params.threadId !== parentThreadId
+    || notification.params.turnId !== activeTurnId) return null
+  const item = plainRecord(notification.params.item)
+  if (!item) return null
+  let images: Record<string, unknown>[] = []
+  if (['mcpToolCall', 'mcp_tool_call'].includes(String(item.type))
+    && item.server === 'go-chrome-mcp' && item.tool === 'screenshot'
+    && ['completed', 'success', 'succeeded'].includes(String(item.status).toLowerCase())) {
+    const result = plainRecord(item.result)
+    const content = result?.content
+    if (!Array.isArray(content)) return null
+    images = content
+      .map(plainRecord)
+      .filter((block): block is Record<string, unknown> => block?.type === 'image')
+  } else if (['dynamicToolCall', 'dynamic_tool_call'].includes(String(item.type))
+    && ['browser', 'in_app_browser', 'in-app-browser'].includes(String(item.namespace))
+    && item.tool === 'screenshot'
+    && item.success !== false
+    && ['completed', 'success', 'succeeded'].includes(String(item.status).toLowerCase())) {
+    const content = item.contentItems ?? item.content_items
+    if (!Array.isArray(content)) return null
+    images = content
+      .map(plainRecord)
+      .filter((block): block is Record<string, unknown> => (
+        block?.type === 'inputImage' || block?.type === 'input_image'
+      ))
+      .map(block => {
+        const imageUrl = block.imageUrl ?? block.image_url
+        if (typeof imageUrl !== 'string' || !imageUrl.startsWith('data:image/png;base64,')) {
+          return {}
+        }
+        return { type: 'image', mimeType: 'image/png', data: imageUrl.slice(22) }
+      })
+  } else {
+    return null
+  }
+  if (images.length !== 1) return null
+  const image = images[0]!
+  const mimeType = image.mimeType ?? image.mime_type
+  const data = image.data
+  if (mimeType !== 'image/png' || typeof data !== 'string' || data.length < 44
+    || data.length > Math.ceil(MAX_BROWSER_SCREENSHOT_BYTES / 3) * 4 + 4
+    || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return null
+  const bytes = Buffer.from(data, 'base64')
+  if (bytes.length < 33 || bytes.length > MAX_BROWSER_SCREENSHOT_BYTES
+    || bytes.toString('base64') !== data) return null
+  const magic = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+  if (!bytes.subarray(0, 8).equals(magic) || bytes.readUInt32BE(8) !== 13
+    || bytes.subarray(12, 16).toString('ascii') !== 'IHDR') return null
+  const width = bytes.readUInt32BE(16)
+  const height = bytes.readUInt32BE(20)
+  if (width < 1 || height < 1 || width > 16_384 || height > 16_384) return null
+  return { bytes, width, height }
 }
 
 function stripUnsafeTerminalText(value: string): string {
@@ -125,6 +199,52 @@ function looksLikeProgressProbe(text: string): boolean {
   return text.includes('[ZERO_PROGRESS_BEGIN:') || text.includes('[ZERO_PROGRESS_END:')
 }
 
+export type SlackUpdateKind = 'PLAN' | 'VERIFY' | 'BLOCKED'
+
+export type SlackUpdateCommentary = {
+  kind: SlackUpdateKind
+  text: string
+}
+
+function looksLikeSlackUpdate(text: string): boolean {
+  return text.includes('[ZERO_SLACK_UPDATE_BEGIN')
+    || text.includes('[ZERO_SLACK_UPDATE_END')
+}
+
+/**
+ * Commentary is intentionally richer in the local monitor than in Slack.
+ * Only a complete, standalone milestone envelope is eligible for Slack; the
+ * public body is sanitized here so the monitor and Slack use the same text.
+ */
+export function parseSlackUpdateCommentary(value: unknown): SlackUpdateCommentary | null {
+  if (typeof value !== 'string' || value.length > MAX_MONITOR_INPUT_CHARS
+    || value.includes('\0')) return null
+  const text = value.trim()
+  const opening = /^\[ZERO_SLACK_UPDATE_BEGIN:(PLAN|VERIFY|BLOCKED)\]\n/.exec(text)
+  const closing = /\n\[ZERO_SLACK_UPDATE_END:(PLAN|VERIFY|BLOCKED)\]$/.exec(text)
+  if (!opening || !closing || opening[1] !== closing[1]) return null
+  const body = text
+    .slice(opening[0].length, -closing[0].length)
+    .trim()
+  if (!body || looksLikeSlackUpdate(body)) return null
+  const sanitized = sanitizeMonitorText(body)
+  return sanitized ? { kind: opening[1] as SlackUpdateKind, text: sanitized } : null
+}
+
+export function slackUpdateCommentaryFromNotification(
+  notification: AppServerNotification,
+  parentThreadId: string | null,
+  activeTurnId?: string | null,
+): SlackUpdateCommentary | null {
+  if (!parentThreadId || notification.method !== 'item/completed'
+    || notification.params.threadId !== parentThreadId
+    || (activeTurnId !== undefined && notification.params.turnId !== activeTurnId)) return null
+  const item = plainRecord(notification.params.item)
+  if (!item || !['agentMessage', 'agent_message'].includes(String(item.type))
+    || item.phase !== 'commentary') return null
+  return parseSlackUpdateCommentary(item.text)
+}
+
 type TrackedMonitorItem = {
   kind: 'command' | 'review' | 'tool' | 'file' | 'image'
   category?: CommandCategory | 'browser' | 'tool'
@@ -223,8 +343,13 @@ export class CodexMonitorDisplay {
       if (!completed || typeof item.text !== 'string') return null
       if (item.phase === 'commentary') {
         if (looksLikeProgressProbe(item.text)) return null
-        const text = sanitizeMonitorText(item.text)
-        return text ? `💬 ${text}` : this.once('commentary-redacted', '💬 状況を確認しています')
+        const milestone = parseSlackUpdateCommentary(item.text)
+        const text = milestone ?? (looksLikeSlackUpdate(item.text)
+          ? null
+          : sanitizeMonitorText(item.text))
+        return text
+          ? `💬 ${typeof text === 'string' ? text : text.text}`
+          : this.once('commentary-redacted', '💬 状況を確認しています')
       }
       if (item.phase === undefined || item.phase === null || item.phase === 'final_answer') {
         return this.once('final-answer', '✓ 回答をまとめました')

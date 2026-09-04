@@ -788,8 +788,11 @@ function pngCrc32(bytes: Buffer): number {
   return (crc ^ 0xffffffff) >>> 0
 }
 
-/** Validate the browser screenshot and remove every non-visual metadata chunk. */
-export function stripUiApprovalPngMetadata(input: Buffer): Buffer {
+/** Validate a decoded screenshot and remove every non-visual metadata chunk. */
+function stripPngMetadata(
+  input: Buffer,
+  expected?: { width: number; height: number },
+): { bytes: Buffer; width: number; height: number } {
   if (input.byteLength === 0 || input.byteLength > MAX_UI_APPROVAL_PNG_BYTES
     || !input.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
     throw new Error('UI/UX approval image is not a bounded PNG')
@@ -799,6 +802,8 @@ export function stripUiApprovalPngMetadata(input: Buffer): Buffer {
   let ihdr = false
   let idat = false
   let iend = false
+  let width = 0
+  let height = 0
   while (offset < input.byteLength) {
     if (input.byteLength - offset < 12) throw new Error('UI/UX approval PNG is truncated')
     const length = input.readUInt32BE(offset)
@@ -814,10 +819,12 @@ export function stripUiApprovalPngMetadata(input: Buffer): Buffer {
       throw new Error('UI/UX approval PNG checksum is invalid')
     }
     if (type === 'IHDR') {
+      width = data.readUInt32BE(0)
+      height = data.readUInt32BE(4)
       if (ihdr || offset !== PNG_SIGNATURE.length || length !== 13
-        || data.readUInt32BE(0) !== SCREENSHOT_WIDTH
-        || data.readUInt32BE(4) !== SCREENSHOT_HEIGHT) {
-        throw new Error('UI/UX approval PNG must be a 1280x720 browser screenshot')
+        || width < 1 || height < 1 || width > 16_384 || height > 16_384
+        || (expected && (width !== expected.width || height !== expected.height))) {
+        throw new Error('browser screenshot PNG dimensions are invalid')
       }
       ihdr = true
     } else if (type === 'IDAT') {
@@ -842,7 +849,15 @@ export function stripUiApprovalPngMetadata(input: Buffer): Buffer {
   if (!ihdr || !idat || !iend || offset !== input.byteLength) {
     throw new Error('UI/UX approval PNG structure is incomplete')
   }
-  return Buffer.concat(kept)
+  return { bytes: Buffer.concat(kept), width, height }
+}
+
+/** Validate a fixed hearing screenshot and remove every non-visual metadata chunk. */
+export function stripUiApprovalPngMetadata(input: Buffer): Buffer {
+  return stripPngMetadata(input, {
+    width: SCREENSHOT_WIDTH,
+    height: SCREENSHOT_HEIGHT,
+  }).bytes
 }
 
 function assertDirectOwnedRegularFile(path: string, directory: string): void {
@@ -898,6 +913,50 @@ function reencodeUiApprovalPng(source: string, outbox: string, role: 'before' | 
       chmodSync(output, 0o600)
     }
     return output
+  } finally {
+    rmSync(decoded, { force: true })
+  }
+}
+
+/**
+ * Decode an App Server browser image with the trusted macOS decoder, verify the
+ * capture-time digest and dimensions, and return a metadata-free PNG. The
+ * source directory is host-only and is never granted to the model sandbox.
+ */
+export function reencodeBrowserScreenshot(input: {
+  source: string
+  sourceDir: string
+  digest: string
+  width: number
+  height: number
+}): Buffer {
+  const sourceDir = resolve(input.sourceDir)
+  assertDirectOwnedRegularFile(input.source, sourceDir)
+  if (!/^[0-9a-f]{64}$/.test(input.digest)
+    || !Number.isSafeInteger(input.width) || !Number.isSafeInteger(input.height)
+    || input.width < 1 || input.height < 1
+    || input.width > 16_384 || input.height > 16_384) {
+    throw new Error('browser screenshot capture binding is invalid')
+  }
+  const captured = readFileSync(input.source)
+  if (createHash('sha256').update(captured).digest('hex') !== input.digest) {
+    throw new Error('browser screenshot changed after host capture')
+  }
+  const decoded = join(sourceDir, `.browser-capture-${randomUUID()}.decoded.png`)
+  const result = Bun.spawnSync(
+    ['/usr/bin/sips', '-s', 'format', 'png', input.source, '--out', decoded],
+    { stdout: 'ignore', stderr: 'ignore', env: { PATH: '/usr/bin:/bin', LANG: 'C' } },
+  )
+  if (result.exitCode !== 0) {
+    rmSync(decoded, { force: true })
+    throw new Error('browser screenshot could not be decoded')
+  }
+  try {
+    assertDirectOwnedRegularFile(decoded, sourceDir)
+    return stripPngMetadata(readFileSync(decoded), {
+      width: input.width,
+      height: input.height,
+    }).bytes
   } finally {
     rmSync(decoded, { force: true })
   }

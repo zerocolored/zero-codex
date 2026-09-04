@@ -2412,14 +2412,19 @@ codex --version
       `)
       legacyDb.close()
       const legacyPath = join(stateDir, 'job-runner.ts')
+      const testPath = setupTestPath(fakeHome)
       const updateScript = [
         'import { Database } from "bun:sqlite"',
         `const db = new Database(${JSON.stringify(dbPath)})`,
+        'db.exec("BEGIN EXCLUSIVE")',
         'db.run("UPDATE jobs SET status = ? WHERE id = ?", ["queued", "self-exit-job"])',
+        'Bun.spawnSync(["/bin/sleep", "3"])',
+        'db.exec("COMMIT")',
         'db.close()',
       ].join('; ')
       writeFileSync(legacyPath, [
         '#!/bin/bash',
+        'set -euo pipefail',
         'sleep 3',
         `${JSON.stringify(process.execPath)} -e ${JSON.stringify(updateScript)}`,
         'exit 0',
@@ -2435,7 +2440,7 @@ codex --version
         env: {
           ...process.env,
           HOME: fakeHome,
-          PATH: setupTestPath(fakeHome),
+          PATH: testPath,
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_LEGACY_CUTOVER: '1',
           ZEROKUN_PROJECT_DIR: projectDir,

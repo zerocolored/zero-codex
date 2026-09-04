@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'fs'
@@ -453,6 +454,101 @@ describe('Codex app-server config preflight', () => {
       value: Record<string, Record<string, unknown>>
     }
     expect(parsed.value['go-chrome-mcp']).toEqual({
+      enabled: false,
+      command: '/usr/bin/false',
+      args: [],
+    })
+  })
+
+  test('write browser jobだけowner管理のgo-chrome transportを固定して保持する', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerokun-browser-mcp-test-'))
+    temporaryRoots.push(root)
+    const repo = join(root, 'repo')
+    const browserRoot = join(root, 'browser-runtime')
+    const entrypoint = join(browserRoot, 'mcp-broker.js')
+    mkdirSync(repo)
+    mkdirSync(browserRoot)
+    chmodSync(browserRoot, 0o700)
+    writeFileSync(entrypoint, '#!/usr/bin/env node\n')
+    chmodSync(entrypoint, 0o600)
+    const browserOverrides = overrides.map(value => {
+      if (value === 'features.browser_use=false') return 'features.browser_use=true'
+      if (value === 'features.browser_use_external=false') {
+        return 'features.browser_use_external=true'
+      }
+      return value
+    })
+    const trustedLayers = [{
+      name: { type: 'user', file: '/operator/.codex/config.toml' },
+      config: { mcp_servers: { 'go-chrome-mcp': { command: 'node', args: [entrypoint] } } },
+    }]
+    const isolated = mcpIsolationOverridesForConfig({
+      mcp_servers: {
+        'go-chrome-mcp': {
+          command: 'node', args: [entrypoint], enabled: true,
+          startup_timeout_sec: 20, tool_timeout_sec: 60,
+        },
+        unrelated: { command: '/tmp/unrelated', args: [], enabled: true },
+      },
+    }, browserOverrides, repo, trustedLayers)
+    const encoded = isolated.find(value => value.startsWith('mcp_servers='))!
+    const parsed = Bun.TOML.parse(`value=${encoded.slice('mcp_servers='.length)}`) as {
+      value: Record<string, Record<string, unknown>>
+    }
+    expect(parsed.value['go-chrome-mcp']?.enabled).toBe(true)
+    expect(parsed.value['go-chrome-mcp']?.command).toBe('node')
+    expect(parsed.value['go-chrome-mcp']?.args).toEqual([realpathSync(entrypoint)])
+    expect(parsed.value['go-chrome-mcp']?.cwd).toBeUndefined()
+    expect(parsed.value['go-chrome-mcp']?.env).toBeUndefined()
+    expect(parsed.value['go-chrome-mcp']?.enabled_tools).toContain('screenshot')
+    expect(parsed.value['go-chrome-mcp']?.enabled_tools).toContain('navigate')
+    expect(parsed.value['go-chrome-mcp']?.enabled_tools).not.toContain('cookies_get')
+    expect(parsed.value['go-chrome-mcp']?.disabled_tools).toEqual([
+      'cookies_get', 'fetch_as_page', 'javascript_exec',
+    ])
+    expect(parsed.value['go-chrome-mcp']?.default_tools_approval_mode).toBe('approve')
+    expect(parsed.value['go-chrome-mcp']?.startup_timeout_sec).toBe(20)
+    expect(parsed.value['go-chrome-mcp']?.tool_timeout_sec).toBe(60)
+    expect(parsed.value.unrelated).toEqual({
+      enabled: false,
+      command: '/usr/bin/false',
+      args: [],
+    })
+
+    const projectEntrypoint = join(repo, 'mcp-broker.js')
+    writeFileSync(projectEntrypoint, '#!/usr/bin/env node\n')
+    chmodSync(projectEntrypoint, 0o600)
+    const unsafe = mcpIsolationOverridesForConfig({
+      mcp_servers: {
+        'go-chrome-mcp': { command: 'node', args: [projectEntrypoint], enabled: true },
+      },
+    }, browserOverrides, repo, trustedLayers)
+    const unsafeEncoded = unsafe.find(value => value.startsWith('mcp_servers='))!
+    const unsafeParsed = Bun.TOML.parse(`value=${unsafeEncoded.slice('mcp_servers='.length)}`) as {
+      value: Record<string, Record<string, unknown>>
+    }
+    expect(unsafeParsed.value['go-chrome-mcp']).toEqual({
+      enabled: false,
+      command: '/usr/bin/false',
+      args: [],
+    })
+
+    const projectInjected = mcpIsolationOverridesForConfig({
+      mcp_servers: {
+        'go-chrome-mcp': { command: 'node', args: [entrypoint], enabled: true },
+      },
+    }, browserOverrides, repo, [
+      ...trustedLayers,
+      {
+        name: { type: 'project', file: join(repo, '.codex/config.toml') },
+        config: { mcp_servers: { 'go-chrome-mcp': { tool_timeout_sec: 600 } } },
+      },
+    ])
+    const injectedEncoded = projectInjected.find(value => value.startsWith('mcp_servers='))!
+    const injected = Bun.TOML.parse(
+      `value=${injectedEncoded.slice('mcp_servers='.length)}`,
+    ) as { value: Record<string, Record<string, unknown>> }
+    expect(injected.value['go-chrome-mcp']).toEqual({
       enabled: false,
       command: '/usr/bin/false',
       args: [],

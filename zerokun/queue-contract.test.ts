@@ -53,6 +53,10 @@ describe('Zero-kun Codex wiring', () => {
     expect(executor).toContain('session.steer(')
     expect(executor).toContain('session.interrupt(')
     expect(executor).toContain('session.loadFullTurn(')
+    expect(runner).toContain('progressActivatedAtMs: executionContext.progressActivatedAtMs')
+    expect(runner).toContain('onProgressProbeStarted: probe => executionContext.beginProgressProbe(probe)')
+    expect(runner).toContain('executionContext.supersedeProgressProbe(slot, supersededBySlot)')
+    expect(runner).toContain('onProgressReport: report => executionContext.reportProgress(report)')
   })
 
   test('jobごとのHerdr monitorは安全な進捗を表示し失敗時だけ確認用に残す', () => {
@@ -207,11 +211,11 @@ describe('Zero-kun Codex wiring', () => {
     expect(executor).toContain("features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}")
     expect(executor).toContain('multiAgentEnabled: !continuationDecision')
     expect(executor).toContain('features.goals=false')
-    expect(executor).toContain('features.browser_use=false')
-    expect(executor).toContain('features.browser_use_external=false')
+    expect(executor).toContain("features.browser_use=${browserAccessEnabled ? 'true' : 'false'}")
+    expect(executor).toContain("features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain('features.browser_use_full_cdp_access=false')
     expect(executor).toContain('features.computer_use=false')
-    expect(executor).toContain('features.in_app_browser=false')
+    expect(executor).toContain("features.in_app_browser=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain('There is one primary Codex workflow now.')
     expect(executor).toContain(
       'Read AGENTS.md and decide the necessary investigation, advisors, implementation, review,',

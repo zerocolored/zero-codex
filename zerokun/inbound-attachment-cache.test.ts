@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -109,7 +110,7 @@ describe('durable inbound attachment cache', () => {
     expect(adopted).toEqual({
       fileId: 'FABC123',
       ordinal: 0,
-      path,
+      path: realpathSync(path),
       size: Buffer.byteLength('completed attachment'),
       digest: createHash('sha256').update('completed attachment').digest('hex'),
     })

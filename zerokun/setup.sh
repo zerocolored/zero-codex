@@ -428,6 +428,7 @@ legacy_running_state() {
     const db = new Database(process.env.ZEROKUN_CUTOVER_DB!, { readonly: true });
     let count = -1;
     try {
+      db.exec("PRAGMA busy_timeout=5000");
       const row = db.query("SELECT COUNT(*) AS count FROM jobs WHERE status = ?").get("running") as { count: number };
       count = row.count;
     } finally { db.close(); }
