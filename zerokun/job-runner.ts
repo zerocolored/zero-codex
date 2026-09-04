@@ -17221,12 +17221,14 @@ export async function terminateTrackedExecutors(
     log(`stopping orphaned Codex executor PID ${pid} for job ${registration.jobId}`)
     signalTrackedExecutor(signalIdentity, 'SIGTERM')
     const startedAt = Date.now()
+    let durableRecoveryCompleted = false
     while (processIdentityIsLive(signalIdentity) && Date.now() - startedAt < timeoutMs) {
       await Bun.sleep(50)
     }
     if (processIdentityIsLive(signalIdentity)) {
       if (registration.version === 3 || registration.version === 4) {
         await reapDurablyTrackedDescendants(pid, registration)
+        durableRecoveryCompleted = true
       } else {
         signalTrackedExecutor(signalIdentity, 'SIGKILL')
         await Bun.sleep(100)
@@ -17235,7 +17237,9 @@ export async function terminateTrackedExecutors(
     if (processIdentityIsLive(signalIdentity)) {
       throw new Error(`orphaned Codex executor PID ${pid} did not stop`)
     }
-    await reapDurablyTrackedDescendants(pid, registration)
+    if (!durableRecoveryCompleted) {
+      await reapDurablyTrackedDescendants(pid, registration)
+    }
     store.clearExecutorPid(registration.jobId, pid)
     removeRegistrationArtifacts(registration)
   }

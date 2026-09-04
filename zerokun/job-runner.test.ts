@@ -6724,13 +6724,17 @@ describe('single FIFO worker', () => {
       })).job
       const claimed = store.claimNext('serial-worker')!
       const supervisorScript = join(dir, `codex-supervisor-${job.id}.ts`)
+      const supervisorReady = join(dir, 'supervisor-ready')
       writeFileSync(supervisorScript, [
+        "import { writeFileSync } from 'fs'",
         "process.on('SIGTERM', () => {})",
+        "writeFileSync(process.argv.at(-1)!, 'ready')",
         'setInterval(() => {}, 1_000)',
         '',
       ].join('\n'))
       const supervisor = Bun.spawn([
         process.execPath, '--config=/dev/null', '--no-env-file', supervisorScript, job.id,
+        supervisorReady,
       ], {
         cwd: repo,
         stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
@@ -6745,7 +6749,8 @@ describe('single FIFO worker', () => {
       let detachedIdentity = readProcessIdentity(detached.pid)
       const identityDeadline = Date.now() + 2_000
       while ((!supervisorIdentity || supervisorIdentity.pgid !== supervisor.pid
-        || !detachedIdentity || detachedIdentity.pgid !== detached.pid)
+        || !detachedIdentity || detachedIdentity.pgid !== detached.pid
+        || !existsSync(supervisorReady))
         && Date.now() < identityDeadline) {
         await Bun.sleep(10)
         supervisorIdentity = readProcessIdentity(supervisor.pid)
@@ -6753,6 +6758,7 @@ describe('single FIFO worker', () => {
       }
       expect(supervisorIdentity?.pgid).toBe(supervisor.pid)
       expect(detachedIdentity?.pgid).toBe(detached.pid)
+      expect(readFileSync(supervisorReady, 'utf8')).toBe('ready')
 
       const registration = join(dir, 'executors', `${job.id}.json`)
       mkdirSync(dirname(registration), { recursive: true })
