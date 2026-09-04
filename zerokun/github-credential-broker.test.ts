@@ -109,9 +109,16 @@ async function connectedBroker<T>(
   try {
     return await action(client)
   } finally {
-    await bounded('broker fixture cleanup', Promise.allSettled([
-      client.close(), server.close(),
-    ]))
+    await bounded('broker fixture cleanup', (async () => {
+      await Promise.allSettled([client.close()])
+      // A cancelled client request rejects before the SDK has necessarily
+      // finished the corresponding server request chain. Give that chain one
+      // event-loop turn to settle before closing the server side of the linked
+      // in-memory transport; concurrently closing both ends can strand Bun's
+      // test runner under process-heavy suites.
+      await Bun.sleep(0)
+      await Promise.allSettled([server.close()])
+    })())
   }
 }
 
@@ -318,6 +325,10 @@ describe('GitHub credential broker', () => {
       await Bun.sleep(25)
       controller.abort()
       await expect(pending).rejects.toThrow()
+      // Client cancellation is observable slightly before the server-side MCP
+      // handler's catch/finally chain has quiesced. Do not let fixture teardown
+      // race that protocol cleanup.
+      await Bun.sleep(0)
       expect(signals.length).toBeGreaterThan(0)
       expect(signals.every(signal => signal instanceof AbortSignal)).toBe(true)
       expect(signals.some(signal => signal?.aborted)).toBe(true)
