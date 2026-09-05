@@ -15,9 +15,11 @@ import {
   CodexInterruptedError,
   assertCurrentAppServerCodexPermissionConfig,
   assertEffectiveCodexPermissionConfig,
+  buildCodexChildEnvironment,
   mcpIsolationOverridesForConfig,
   resolveEffectiveCodexPermissionOverrides,
 } from './codex-executor.ts'
+import { CodexAppServerSession } from './codex-app-server-session.ts'
 import { captureTrackedProcesses } from './process-tree.ts'
 import { readProcessIdentity, signalProcessIfLive } from './process-generation.ts'
 import { runLeasedCommandForTests } from './update.ts'
@@ -188,6 +190,93 @@ async function check(testCase: Parameters<typeof fixture>[0]): Promise<void> {
 }
 
 describe('Codex app-server config preflight', () => {
+  const advisorDefinition = {
+    command: '/usr/bin/false', args: [], enabled: true, required: false,
+    enabled_tools: ['advisor_round', 'advisor_round_poll'],
+    default_tools_approval_mode: 'approve', startup_timeout_sec: 30, tool_timeout_sec: 30,
+    tools: {
+      advisor_round: { approval_mode: 'approve' },
+      advisor_round_poll: { approval_mode: 'approve' },
+    },
+  }
+  const advisorOverrides = overrides.map(value => value === 'mcp_servers={}'
+    ? 'mcp_servers={zerokun_advisors={command="/usr/bin/false",args=[],enabled=true,required=false,enabled_tools=["advisor_round","advisor_round_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"}}}}'
+    : value)
+
+  function advisorSession(server: Record<string, unknown>) {
+    const config = Bun.TOML.parse(advisorOverrides.join('\n')) as Record<string, unknown>
+    config.mcp_servers = { zerokun_advisors: server }
+    return {
+      async request(method: string) {
+        return { requestId: 1, result: method === 'configRequirements/read'
+          ? { requirements: null } : { config } }
+      },
+    }
+  }
+
+  test('MCPの既定required=falseはconfig/readの省略形と同じ意味として受理する', async () => {
+    const { required: _required, ...omitted } = advisorDefinition
+    for (const server of [advisorDefinition, omitted, { ...omitted, environment_id: 'local' }]) {
+      await assertCurrentAppServerCodexPermissionConfig(
+        advisorSession(server), '/repo', advisorOverrides, profile,
+      )
+    }
+  })
+
+  test('MCP既定値の正規化で実際の起動先・権限・required変更を隠さない', async () => {
+    for (const change of [
+      { required: true }, { required: 'false' }, { required: 0 },
+      { command: '/another/server' }, { args: ['--different'] }, { enabled: false },
+      { enabled_tools: ['another_tool'] }, { default_tools_approval_mode: 'prompt' },
+      { startup_timeout_sec: 60 }, { tool_timeout_sec: 60 },
+      { tools: { advisor_round: { approval_mode: 'prompt' } } },
+      { tools: { ...advisorDefinition.tools, advisor_round: { approval_mode: 'approve', required: false } } },
+    ]) {
+      await expect(assertCurrentAppServerCodexPermissionConfig(
+        advisorSession({ ...advisorDefinition, ...change }), '/repo', advisorOverrides, profile,
+      )).rejects.toThrow('Codex managed config changed MCP server zerokun_advisors')
+    }
+  })
+
+  test.skipIf(!Bun.which('codex') || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
+    '実Codexのoptional advisor MCP設定を起動前と同じApp Server接続で検証できる（モデル呼出なし）',
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'zero-advisor-mcp-config-')))
+      temporaryRoots.push(root)
+      const repo = join(root, 'repo')
+      const codexHome = join(root, 'codex-home')
+      mkdirSync(repo)
+      mkdirSync(codexHome)
+      const environment = { ...buildCodexChildEnvironment(), CODEX_HOME: codexHome }
+      const executable = realpathSync(Bun.which('codex')!)
+      const isolated = await resolveEffectiveCodexPermissionOverrides(
+        executable, repo, advisorOverrides, profile, environment,
+      )
+      expect(isolated.some(value => value.includes('required=false'))).toBe(true)
+      const proc = Bun.spawn([
+        executable, '-C', repo, ...isolated.flatMap(value => ['-c', value]),
+        'app-server', '--stdio',
+      ], { env: environment, stdin: 'pipe', stdout: 'pipe', stderr: 'ignore' })
+      const session = new CodexAppServerSession(proc.stdin, proc.stdout)
+      try {
+        await session.initialize()
+        await assertCurrentAppServerCodexPermissionConfig(session, repo, isolated, profile)
+        const response = await session.request('config/read', { cwd: repo, includeLayers: false })
+        const config = response.result.config as Record<string, unknown>
+        const servers = config.mcp_servers as Record<string, Record<string, unknown>>
+        expect(servers.zerokun_advisors?.command).toBe('/usr/bin/false')
+        expect(servers.zerokun_advisors?.required ?? false).toBe(false)
+      } finally {
+        session.closeInput()
+        const ended = await Promise.race([proc.exited.then(() => true), Bun.sleep(2_000).then(() => false)])
+        if (!ended) proc.kill()
+        await proc.exited
+        await session.waitForReader()
+      }
+      expect(proc.exitCode).toBe(0)
+    }, 30_000,
+  )
+
   test('本番と同じApp Server connectionをthread開始前に再検証する', async () => {
     const calls: string[] = []
     const effective = {

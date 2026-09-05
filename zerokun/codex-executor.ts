@@ -399,6 +399,14 @@ function withoutMaterializedMcpDefaults(value: unknown): unknown {
     .map(([key, child]) => [key, withoutMaterializedMcpDefaults(child)]))
 }
 
+function normalizedMcpServer(value: Record<string, unknown>): string {
+  const server = withoutMaterializedMcpDefaults(value) as Record<string, unknown>
+  // config/read omits the default `required=false` (observed in Codex 0.153.2).
+  // Canonicalize only this server-level default: nested tool settings and an
+  // actual required=true/invalid-value change must remain distinguishable.
+  return normalizedJson({ required: false, ...server })
+}
+
 function assertEffectiveMcpIsolation(
   config: Record<string, unknown>,
   overrides: string[],
@@ -448,8 +456,7 @@ function assertEffectiveMcpIsolation(
           ))) {
           throw new Error(`Codex managed config changed disabled MCP server ${name}`)
         }
-      } else if (normalizedJson(withoutMaterializedMcpDefaults(server))
-        !== normalizedJson(withoutMaterializedMcpDefaults(expectedServer))) {
+      } else if (normalizedMcpServer(server) !== normalizedMcpServer(expectedRecord)) {
         throw new Error(`Codex managed config changed MCP server ${name}`)
       }
       continue
