@@ -448,6 +448,7 @@ function parseRetirement(raw: string): RetirementRecord {
 function contextRepositoryDigest(
   stateDir: string,
   receipt: RetirementRecord,
+  journal: Record<string, unknown>,
 ): string {
   const contextPath = join(
     stateDir, 'advisor-context', safeJob(receipt.jobId), `${receipt.attemptNonce}.json`,
@@ -458,8 +459,23 @@ function contextRepositoryDigest(
   if (context.version !== 4 || context.jobId !== receipt.jobId
     || context.attemptNonce !== receipt.attemptNonce
     || sha256(JSON.stringify(context)) !== receipt.contextDigest
-    || typeof context.repoPath !== 'string') {
+    || typeof context.repoPath !== 'string'
+    || typeof context.initialRepositoryDigest !== 'string'
+    || !SHA256.test(context.initialRepositoryDigest)) {
     throw new Error('advisor recovery context does not match its receipt')
+  }
+  // Unified rounds bind the resolved repository layout, not repository
+  // contents. Recomputing a content snapshot here compares different hash
+  // domains and made every interrupted normal round stale (or unrecoverable
+  // when a large dirty file existed). The requested journal records this
+  // observation mode before any reviewer starts. Version-8 journals created
+  // just before this field was introduced are recognized by the same exact
+  // context binding for backward-compatible recovery.
+  if (journal.repositoryObservation === 'not-required-in-unified-workflow'
+    || (journal.version === 8
+      && journal.repositoryObservation === undefined
+      && journal.repositoryDigest === context.initialRepositoryDigest)) {
+    return context.initialRepositoryDigest
   }
   return advisorRepositoryDigest(snapshotAdvisorRepository(
     resolveAdvisorProjectLayout(String(context.repoPath)),
@@ -480,14 +496,36 @@ function releaseLockExact(path: string, receipt: RetirementRecord): void {
   unlinkSync(path)
 }
 
-function recoveredClaudeJournal(outcome: AdvisorClaudeCleanupOutcome | null): Record<string, unknown> {
+function recoveredClaudeJournal(
+  outcome: AdvisorClaudeCleanupOutcome | null,
+  unverifiedResidual: { promptMayHaveBeenDelivered: boolean } | null = null,
+): Record<string, unknown> {
   const reasonDigest = sha256('ephemeral Claude round ended with its retired Codex generation')
   if (!outcome) {
+    if (unverifiedResidual) {
+      return {
+        attempted: true,
+        required: true,
+        lifecycle: 'ephemeral-v2',
+        adopted: false,
+        // A send receipt is a delivery-possible boundary, not evidence that
+        // Claude's state sequence advanced and model work actually began.
+        executionState: 'start-unconfirmed',
+        workspaceCreationAttempted: true,
+        freshEphemeral: unverifiedResidual.promptMayHaveBeenDelivered,
+        cleanupVerified: false,
+        cleanupStatus: 'unverified-after-retirement',
+        containmentVerified: false,
+        promptMayHaveBeenDelivered: unverifiedResidual.promptMayHaveBeenDelivered,
+        reasonDigest,
+      }
+    }
     return {
       attempted: true,
       required: true,
       lifecycle: 'ephemeral-v2',
       adopted: false,
+      executionState: 'unavailable-before-start',
       workspaceCreationAttempted: false,
       freshEphemeral: false,
       cleanupVerified: false,
@@ -501,6 +539,9 @@ function recoveredClaudeJournal(outcome: AdvisorClaudeCleanupOutcome | null): Re
     required: true,
     lifecycle: 'ephemeral-v2',
     adopted: false,
+    executionState: outcome.workspaceCreationAttempted || outcome.freshEphemeral
+        ? 'start-unconfirmed'
+        : 'unavailable-before-start',
     workspaceCreationAttempted: outcome.workspaceCreationAttempted,
     freshEphemeral: outcome.freshEphemeral,
     cleanupVerified: outcome.cleanupVerified,
@@ -512,7 +553,10 @@ function recoveredClaudeJournal(outcome: AdvisorClaudeCleanupOutcome | null): Re
   }
 }
 
-export function finalizeRetiredAdvisorRounds(stateDirInput: string): { finalized: number } {
+export function finalizeRetiredAdvisorRounds(
+  stateDirInput: string,
+  options: { allowUnverifiedClaudeResidual?: boolean } = {},
+): { finalized: number } {
   const stateDir = requireManagedStateRoot(stateDirInput)
   const rootPath = join(stateDir, 'advisor-retirement')
   if (!existsSync(rootPath)) return { finalized: 0 }
@@ -555,20 +599,31 @@ export function finalizeRetiredAdvisorRounds(stateDirInput: string): { finalized
           const latestInput = readAdvisorInputSnapshot(stateDir, receipt.jobId)
           const inputUnchanged = latestInput.revision === receipt.inputRevision
             && latestInput.digest === receipt.inputDigest
-          const repositoryDigestAfter = contextRepositoryDigest(stateDir, receipt)
+          const repositoryDigestAfter = contextRepositoryDigest(stateDir, receipt, journal)
           const repositoryUnchanged = repositoryDigestAfter === journal.repositoryDigest
           const cleanupOutcome = readCleanupOutcome(stateDir, {
             ...journal,
             jobId: receipt.jobId,
           })
-          if (!cleanupOutcome && existsSync(join(
+          const claudeRequestDir = join(
             stateDir, 'advisor-ephemeral', receipt.jobId, receipt.attemptNonce,
             `revision-${receipt.inputRevision}-${receipt.inputDigest.slice(0, 16)}`,
             `${receipt.phase}-${receipt.round}`,
-          ))) {
+          )
+          const hasUnverifiedClaudeResidual = !cleanupOutcome && existsSync(claudeRequestDir)
+          if (hasUnverifiedClaudeResidual && !options.allowUnverifiedClaudeResidual) {
             throw new Error('retired advisor Claude workspace cleanup is still pending')
           }
-          const claude = recoveredClaudeJournal(cleanupOutcome)
+          const claude = recoveredClaudeJournal(
+            cleanupOutcome,
+            hasUnverifiedClaudeResidual
+              ? {
+                  promptMayHaveBeenDelivered: existsSync(join(
+                    claudeRequestDir, 'ephemeral-send-receipt.json',
+                  )),
+                }
+              : null,
+          )
           const terminalStatus = inputUnchanged && repositoryUnchanged
             ? 'reviewers-completed'
             : 'stale-input'
@@ -578,6 +633,7 @@ export function finalizeRetiredAdvisorRounds(stateDirInput: string): { finalized
             attempted: true,
             adopted: false,
             perspective,
+            executionState: 'start-unconfirmed',
             containmentVerified: true,
             reasonDigest: sha256(reason),
           }))

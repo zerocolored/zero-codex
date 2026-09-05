@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import {
   chmodSync,
   existsSync,
@@ -127,7 +127,63 @@ function reviewSync(
   }
 }
 
+function compileFixtureProgram(home: string, output: string, sourceText: string): void {
+  const source = join(home, `.fixture-${randomUUID()}.c`)
+  writeFileSync(source, sourceText, { mode: 0o600 })
+  try {
+    const compiled = Bun.spawnSync(['/usr/bin/cc', '-Os', '-o', output, source], {
+      stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    })
+    if (compiled.exitCode !== 0) throw new Error(compiled.stderr.toString())
+    chmodSync(output, 0o700)
+  } finally {
+    rmSync(source, { force: true })
+  }
+}
+
 describe('dedicated Grok reviewer installer', () => {
+  test('Grok 1.0.5のexact未認証診断だけをcleanup後のmarker+78へ変換する', () => {
+    const { home, reviewRoot, physicalGrok } = fixture()
+    const launcher = installGrokReviewer(home)
+    compileFixtureProgram(home, physicalGrok, String.raw`
+#include <stdio.h>
+int main(void) {
+  fputs("Not signed in. To authenticate without a browser, run: grok login --device-code Alternatively, set the XAI_API_KEY environment variable or run \x60grok login\x60 on a machine with a browser.\n", stderr);
+  return 1;
+}
+`)
+    const result = reviewSync(launcher, 'auth boundary review', {
+      HOME: home,
+      PATH: '/usr/bin:/bin',
+      ZEROKUN_GROK_REVIEW_ROOT: reviewRoot,
+    })
+    expect(result.exitCode).toBe(78)
+    expect(result.stdout.toString()).toBe('')
+    expect(result.stderr.toString()).toBe('GROK_REVIEWER_AUTH_REQUIRED\n')
+    expect(readdirSync(join(home, '.grok-reviewer')).filter(name => name.startsWith('run.')))
+      .toEqual([])
+  })
+
+  test('childが予約markerまたはexit 78を偽装してもOAuth recovery triggerへしない', () => {
+    const { home, reviewRoot, physicalGrok } = fixture()
+    const launcher = installGrokReviewer(home)
+    compileFixtureProgram(home, physicalGrok, String.raw`
+#include <stdio.h>
+int main(void) {
+  fputs("GROK_REVIEWER_AUTH_REQUIRED\n", stderr);
+  return 78;
+}
+`)
+    const result = reviewSync(launcher, 'collision review', {
+      HOME: home,
+      PATH: '/usr/bin:/bin',
+      ZEROKUN_GROK_REVIEW_ROOT: reviewRoot,
+    })
+    expect(result.exitCode).toBe(70)
+    expect(result.stdout.toString()).toBe('')
+    expect(result.stderr.toString()).toBe('Grok reviewer child used a reserved protocol value.\n')
+  })
+
   test('official downloads symlinkを受け入れowner-onlyに配置してrunを片付ける', () => {
     const { home } = fixture()
     mkdirSync(join(home, '.grok-reviewer'), { mode: 0o755 })
@@ -139,6 +195,9 @@ describe('dedicated Grok reviewer installer', () => {
     expect(mode(join(home, '.grok-reviewer', 'bin'))).toBe(0o700)
     expect(mode(launcher)).toBe(0o700)
     expect(mode(join(home, '.grok-reviewer', 'bin', 'reviewer-runtime.py'))).toBe(0o700)
+    expect(mode(join(home, '.grok-reviewer', 'bin', 'oauth-login-runtime.py'))).toBe(0o700)
+    expect(mode(join(home, '.grok-reviewer', 'bin', 'grok-login-oauth'))).toBe(0o700)
+    expect(mode(join(home, '.grok-reviewer', 'grok-identity.json'))).toBe(0o600)
     expect(mode(join(home, '.grok-reviewer', 'config.toml'))).toBe(0o600)
     expect(mode(join(home, '.grok-reviewer', 'sandbox.toml'))).toBe(0o600)
     expect(mode(join(home, '.grok-reviewer', 'requirements.toml'))).toBe(0o600)
@@ -146,6 +205,17 @@ describe('dedicated Grok reviewer installer', () => {
       .toContain('default = "grok-4.6"')
     expect(readFileSync(join(home, '.grok-reviewer', 'requirements.toml'), 'utf8'))
       .toContain('disable_api_key_auth = true')
+    const oauthLauncher = readFileSync(
+      join(home, '.grok-reviewer', 'bin', 'grok-login-oauth'), 'utf8',
+    )
+    expect(oauthLauncher).not.toContain('__GROK_REAL_BIN_SH__')
+    expect(oauthLauncher).not.toContain('__USER_HOME_SH__')
+    const identity = JSON.parse(readFileSync(
+      join(home, '.grok-reviewer', 'grok-identity.json'), 'utf8',
+    )) as Record<string, unknown>
+    expect(identity).toMatchObject({ version: 1, path: realpathSync(join(home, '.grok', 'bin', 'grok')) })
+    expect(identity.sha256).toBe(createHash('sha256')
+      .update(readFileSync(realpathSync(join(home, '.grok', 'bin', 'grok')))).digest('hex'))
 
     const result = Bun.spawnSync([launcher, '--version'], {
       env: { HOME: home, PATH: '/usr/bin:/bin' },
@@ -157,6 +227,14 @@ describe('dedicated Grok reviewer installer', () => {
     expect(result.stdout.toString()).toMatch(/SELF=.*\.grok-reviewer\/run\.[^/]+\/official-grok/)
     expect(readdirSync(join(home, '.grok-reviewer')).filter(name => name.startsWith('run.')))
       .toEqual([])
+  })
+
+  test('auth.json未作成でも固定OAuth helperを導入できる', () => {
+    const { home, auth } = fixture()
+    rmSync(auth)
+    expect(() => installGrokReviewer(home)).not.toThrow()
+    expect(existsSync(join(home, '.grok-reviewer', 'bin', 'grok-login-oauth'))).toBe(true)
+    expect(existsSync(join(home, '.grok-reviewer', 'grok-identity.json'))).toBe(true)
   })
 
   test('単発reviewへ再委任・web・write禁止と隔離環境を強制する', () => {
@@ -184,6 +262,9 @@ describe('dedicated Grok reviewer installer', () => {
       /^PATH=.*\.grok-reviewer\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin$/m,
     )
     expect(output).toContain('extends = "strict"')
+    expect(output).toContain(
+      `restrict_network = ${process.platform === 'darwin' ? 'false' : 'true'}`,
+    )
     expect(output).toMatch(new RegExp(
       `read_only = \\[${JSON.stringify(realpathSync(reviewRoot)).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`
         + `, ".*\\.grok-reviewer/run\\.[^/]+/workspace"\\]`,

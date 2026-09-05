@@ -1,0 +1,66 @@
+#!/bin/sh
+
+# Fixed browser-OAuth launcher for a reviewer authentication recovery. The
+# Python runtime owns validation, single-flight locking, Chrome opening, and
+# finite process-group cleanup; this wrapper accepts no dynamic input.
+umask 077
+
+if [ "$#" -ne 0 ]; then
+  echo '{"status":"oauth-login-invalid-invocation"}' >&2
+  exit 64
+fi
+
+if [ -z "${HOME:-}" ]; then
+  echo '{"status":"oauth-login-unsafe-environment"}' >&2
+  exit 126
+fi
+
+case "$0" in
+  */*) launcher_directory=${0%/*} ;;
+  *)
+    echo '{"status":"oauth-login-invalid-invocation"}' >&2
+    exit 64
+    ;;
+esac
+
+reviewer_root=$(CDPATH= cd -P -- "$launcher_directory/.." && pwd -P) || {
+  echo '{"status":"oauth-login-unsafe-installation"}' >&2
+  exit 126
+}
+runtime_user_home="$HOME"
+installed_user_home=__USER_HOME_SH__
+real_grok=__GROK_REAL_BIN_SH__
+reviewer_python=__PYTHON_BIN_SH__
+runtime="$reviewer_root/bin/oauth-login-runtime.py"
+real_grok_directory=${real_grok%/*}
+runtime_path="$real_grok_directory:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+runtime_lang=${LC_ALL:-${LANG:-en_US.UTF-8}}
+
+case "$runtime_user_home" in
+  /*/../*|/*/..|../*|..)
+    echo '{"status":"oauth-login-unsafe-environment"}' >&2
+    exit 126
+    ;;
+  /*) ;;
+  *)
+    echo '{"status":"oauth-login-unsafe-environment"}' >&2
+    exit 126
+    ;;
+esac
+runtime_home_physical=$(CDPATH= cd -P -- "$runtime_user_home" 2>/dev/null && pwd -P) || {
+  echo '{"status":"oauth-login-unsafe-environment"}' >&2
+  exit 126
+}
+if [ "$runtime_home_physical" != "$installed_user_home" ]; then
+  echo '{"status":"oauth-login-unsafe-environment"}' >&2
+  exit 126
+fi
+
+if [ ! -x "$real_grok" ] || [ ! -x "$reviewer_python" ] || [ ! -f "$runtime" ] || [ -L "$runtime" ]; then
+  echo '{"status":"oauth-login-unsafe-installation"}' >&2
+  exit 126
+fi
+
+exec "$reviewer_python" -I "$runtime" \
+  "$reviewer_root" "$installed_user_home" "$real_grok" \
+  "$runtime_path" "$runtime_lang"

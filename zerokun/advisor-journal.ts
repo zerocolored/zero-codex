@@ -20,6 +20,17 @@ function nativeAgentId(value: unknown): value is string {
     && value.split('/').every(segment => segment !== '.' && segment !== '..')
 }
 
+const executionStates = new Set([
+  'unavailable-before-start',
+  'start-unconfirmed',
+  'started-no-response',
+  'response-obtained',
+])
+
+function validExecutionState(value: unknown): boolean {
+  return typeof value === 'string' && executionStates.has(value)
+}
+
 /**
  * Version 8 gives both native Codex slots the same best-effort terminal model
  * as the external reviewers. A missing model response is publishable only
@@ -46,11 +57,19 @@ export function validTerminalNativeAttempts(value: unknown): boolean {
       if (!nativeAgentId(attempt.agentId)
         || !sha256(attempt.responseDigest)
         || !sha256(attempt.responseTransportDigest)
-        || attempt.reasonDigest !== undefined) return false
+        || attempt.reasonDigest !== undefined
+        || (attempt.executionState !== undefined
+          && attempt.executionState !== 'response-obtained')) return false
     } else if (attempt.agentId !== undefined
       || !sha256(attempt.reasonDigest)
       || attempt.responseDigest !== undefined
-      || attempt.responseTransportDigest !== undefined) return false
+      || attempt.responseTransportDigest !== undefined
+      || (attempt.started !== undefined && typeof attempt.started !== 'boolean')
+      || (attempt.executionState !== undefined && !validExecutionState(attempt.executionState))
+      || (attempt.executionState !== undefined
+        && attempt.executionState !== (attempt.started === true
+          ? 'started-no-response'
+          : 'unavailable-before-start'))) return false
   }
   return true
 }
@@ -69,22 +88,41 @@ export function validTerminalGrokAttempts(value: unknown): boolean {
   if (perspectives.size !== 2 || !perspectives.has('solution') || !perspectives.has('risk')) {
     return false
   }
-  const adoptedProcessIds = new Set<number>()
-  let adoptedCount = 0
+  const startedProcessIds = new Set<number>()
+  let startedCount = 0
   for (const attempt of attempts) {
-    if (attempt.attempted !== true || attempt.containmentVerified !== true
-      || typeof attempt.adopted !== 'boolean') return false
+    if (attempt.attempted !== true || typeof attempt.adopted !== 'boolean') return false
+    if (attempt.containmentVerified !== true) {
+      if (attempt.containmentVerified !== false || attempt.adopted
+        || attempt.containmentStatus !== 'unverified-bounded-residual'
+        || !sha256(attempt.reasonDigest)
+        || attempt.processId !== undefined || attempt.responseDigest !== undefined
+        || !['unavailable-before-start', 'start-unconfirmed']
+          .includes(String(attempt.executionState))) return false
+      continue
+    }
     if (attempt.adopted) {
       if (!positiveInteger(attempt.processId) || !sha256(attempt.responseDigest)
-        || attempt.reasonDigest !== undefined) return false
-      adoptedCount += 1
-      adoptedProcessIds.add(Number(attempt.processId))
+        || attempt.reasonDigest !== undefined
+        || (attempt.executionState !== undefined
+          && attempt.executionState !== 'response-obtained')) return false
+      startedCount += 1
+      startedProcessIds.add(Number(attempt.processId))
+    } else if (attempt.executionState === 'started-no-response') {
+      if (!positiveInteger(attempt.processId) || !sha256(attempt.reasonDigest)
+        || attempt.responseDigest !== undefined) return false
+      startedCount += 1
+      startedProcessIds.add(Number(attempt.processId))
     } else if (!sha256(attempt.reasonDigest)
-      || attempt.processId !== undefined || attempt.responseDigest !== undefined) {
+      || attempt.processId !== undefined || attempt.responseDigest !== undefined
+      || (attempt.executionState !== undefined && !validExecutionState(attempt.executionState))
+      || (attempt.executionState !== undefined
+        && !['unavailable-before-start', 'start-unconfirmed']
+          .includes(String(attempt.executionState)))) {
       return false
     }
   }
-  return adoptedProcessIds.size === adoptedCount
+  return startedProcessIds.size === startedCount
 }
 
 /** A Claude failure is terminal only before a workspace existed or after its exact cleanup. */
@@ -96,17 +134,52 @@ export function validTerminalClaudeAttempt(value: unknown): boolean {
     || typeof attempt.freshEphemeral !== 'boolean'
     || typeof attempt.cleanupVerified !== 'boolean'
     || typeof attempt.promptMayHaveBeenDelivered !== 'boolean'
-    || attempt.containmentVerified !== true) return false
+    || typeof attempt.containmentVerified !== 'boolean') return false
   if (attempt.adopted) {
     return attempt.workspaceCreationAttempted === true
       && attempt.freshEphemeral === true
+      && attempt.promptMayHaveBeenDelivered === true
       && attempt.cleanupVerified === true
       && attempt.cleanupStatus === 'closed-and-verified'
       && sha256(attempt.responseDigest)
       && sha256(attempt.cleanupReceiptDigest)
+      && (attempt.executionState === undefined
+        || attempt.executionState === 'response-obtained')
       && attempt.reasonDigest === undefined
   }
   if (!sha256(attempt.reasonDigest) || attempt.responseDigest !== undefined) return false
+  if (attempt.executionState !== undefined && !validExecutionState(attempt.executionState)) {
+    return false
+  }
+  if (attempt.executionState === 'response-obtained') return false
+  const fallbackExecutionState = attempt.promptMayHaveBeenDelivered
+    ? 'started-no-response'
+    : attempt.workspaceCreationAttempted
+      ? 'start-unconfirmed'
+      : 'unavailable-before-start'
+  const allowedExecutionStates = attempt.promptMayHaveBeenDelivered
+    ? ['start-unconfirmed', 'started-no-response']
+    : [fallbackExecutionState]
+  if (attempt.executionState !== undefined
+    && !allowedExecutionStates.includes(String(attempt.executionState))) return false
+  // A positive observation of an owned live process is never a bounded
+  // residual. It must not become terminal merely because a retirement marker
+  // or an otherwise accepted cleanup status is also present.
+  if (attempt.containmentStatus === 'owned-process-still-live') return false
+  if (attempt.containmentVerified === false) {
+    if (attempt.executionState !== undefined
+      && !allowedExecutionStates.includes(String(attempt.executionState))) return false
+    if (attempt.cleanupStatus === 'unverified-after-retirement') {
+      return attempt.cleanupVerified === false
+        && attempt.cleanupReceiptDigest === undefined
+    }
+    if (attempt.containmentStatus !== 'unverified-bounded-residual') return false
+    if (attempt.cleanupVerified === false) return attempt.cleanupReceiptDigest === undefined
+    return attempt.cleanupVerified === true
+      && sha256(attempt.cleanupReceiptDigest)
+      && ['closed-and-verified', 'provisional-workspace-closed',
+        'provisional-workspace-not-created'].includes(String(attempt.cleanupStatus))
+  }
   if (attempt.workspaceCreationAttempted) {
     if (!attempt.cleanupVerified || !sha256(attempt.cleanupReceiptDigest)) return false
     return attempt.freshEphemeral

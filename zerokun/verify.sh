@@ -275,9 +275,21 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     'host共有helperを変更せずZero専用namespaceだけへ配置する'
 else
   # Process-heavy fixtures intentionally exercise detached children and
-  # generation-safe cleanup. Keep each file's globals/handles isolated and
-  # make the test runner reap only its own descendants when it exits.
-  bun test --isolate --no-orphans
+  # generation-safe cleanup. Bun's --isolate separates module globals but still
+  # keeps every test file in one long-lived process, so child-process handles or
+  # runtime pressure from an earlier file can stall an unrelated later file on
+  # GitHub's macOS runner. Give every tracked test file a fresh Bun process and
+  # let --no-orphans reap only that file's descendants before continuing.
+  full_suite_count=0
+  while IFS= read -r test_file; do
+    [[ -n "$test_file" ]] || continue
+    full_suite_count=$((full_suite_count + 1))
+    bun test --isolate --no-orphans "$test_file"
+  done < <(git ls-files -- '*test.ts')
+  if [[ "$full_suite_count" -eq 0 ]]; then
+    echo 'error: full test suite is empty' >&2
+    exit 1
+  fi
 fi
 bun run typecheck
 

@@ -36,6 +36,7 @@ import {
   CodexPublicationPreflightRetryError,
   CodexRateLimitError,
   CodexUserCancelledError,
+  collectHostAdvisorCoverage,
   executeCodexJob,
   type CodexLiveControlHooks,
 } from './codex-executor.ts'
@@ -1276,6 +1277,108 @@ function fixture(
 }
 
 describe('production App Server executor', () => {
+  test('Slackへ出すadvisor件数はモデル文やcached集計でなくterminal slotから導出する', () => {
+    const state = secureRoot()
+    prepareManagedStateRoot(state)
+    const jobId = 'coverage-fixture'
+    const nonce = 'a'.repeat(32)
+    const digest = (value: string) => value.repeat(64)
+    const revisionRoot = join(
+      state, 'advisor-journal', jobId, nonce,
+      `revision-1-${digest('b').slice(0, 16)}`,
+    )
+    mkdirSync(revisionRoot, { recursive: true, mode: 0o700 })
+    writeFileSync(join(revisionRoot, 'investigation-1.json'), `${JSON.stringify({
+      version: 8,
+      status: 'completed',
+      phase: 'investigation',
+      round: 1,
+      attemptNonce: nonce,
+      inputRevision: 1,
+      inputDigest: digest('b'),
+      finishedAt: Date.now(),
+      slotSummary: { total: 5, started: 5, responsesObtained: 5 },
+      native: [
+        {
+          attempted: true, adopted: true, perspective: 'solution',
+          agentId: '/root/solution', responseDigest: digest('1'),
+          responseTransportDigest: digest('2'), executionState: 'response-obtained',
+        },
+        {
+          attempted: true, adopted: true, perspective: 'risk',
+          agentId: '/root/risk', responseDigest: digest('3'),
+          responseTransportDigest: digest('4'), executionState: 'response-obtained',
+        },
+      ],
+      grok: [
+        {
+          attempted: true, adopted: true, perspective: 'solution',
+          containmentVerified: true, processId: 101, responseDigest: digest('5'),
+          executionState: 'response-obtained',
+        },
+        {
+          attempted: true, adopted: false, perspective: 'risk',
+          containmentVerified: true, reasonDigest: digest('6'),
+          executionState: 'unavailable-before-start',
+        },
+      ],
+      claude: {
+        attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
+        workspaceCreationAttempted: false, freshEphemeral: false,
+        cleanupVerified: false, containmentVerified: true,
+        promptMayHaveBeenDelivered: false, reasonDigest: digest('7'),
+        executionState: 'unavailable-before-start',
+      },
+    })}\n`, { mode: 0o600 })
+
+    const initialJournal = JSON.parse(
+      readFileSync(join(revisionRoot, 'investigation-1.json'), 'utf8'),
+    ) as Record<string, unknown>
+    const reviewRoot = join(
+      state, 'advisor-journal', jobId, nonce,
+      `revision-2-${digest('c').slice(0, 16)}`,
+    )
+    mkdirSync(reviewRoot, { recursive: true, mode: 0o700 })
+    writeFileSync(join(reviewRoot, 'review-1.json'), `${JSON.stringify({
+      ...initialJournal,
+      phase: 'review',
+      inputRevision: 2,
+      inputDigest: digest('c'),
+      finishedAt: Number(initialJournal.finishedAt) + 1,
+    })}\n`, { mode: 0o600 })
+
+    expect(collectHostAdvisorCoverage(
+      state, jobId, nonce, false,
+    )).toMatchObject({
+      version: 1,
+      phases: [
+        {
+          phase: 'investigation', inputRevision: 1,
+          total: 5, started: 1, responsesObtained: 1, unavailableBeforeStart: 4,
+        },
+        {
+          phase: 'review', inputRevision: 2,
+          total: 5, started: 1, responsesObtained: 1, unavailableBeforeStart: 4,
+        },
+      ],
+    })
+    expect(collectHostAdvisorCoverage(
+      state, jobId, nonce, true,
+    )).toMatchObject({
+      version: 1,
+      phases: [
+        {
+          phase: 'investigation', inputRevision: 1,
+          total: 5, started: 3, responsesObtained: 3, unavailableBeforeStart: 2,
+        },
+        {
+          phase: 'review', inputRevision: 2,
+          total: 5, started: 3, responsesObtained: 3, unavailableBeforeStart: 2,
+        },
+      ],
+    })
+  })
+
   test('完了済みPRの同thread公開依頼は調査・設計を再実行せず直接promotionへ進む', async () => {
     const value = fixture(
       'phased-continuation',

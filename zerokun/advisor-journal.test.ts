@@ -35,6 +35,20 @@ describe('best-effort external advisor journal', () => {
     expect(validTerminalNativeAttempts([
       { ...unavailable[0], responseDigest: digest('c') }, unavailable[1],
     ])).toBe(false)
+    expect(validTerminalNativeAttempts([
+      {
+        ...unavailable[0], started: false,
+        executionState: 'response-obtained',
+      },
+      unavailable[1],
+    ])).toBe(false)
+    expect(validTerminalNativeAttempts([
+      {
+        ...unavailable[0], started: true,
+        executionState: 'unavailable-before-start',
+      },
+      unavailable[1],
+    ])).toBe(false)
   })
 
   test('安全に終了したGrok欠員を成功数0でもterminalとして受理する', () => {
@@ -51,6 +65,36 @@ describe('best-effort external advisor journal', () => {
     ])).toBe(false)
     expect(validTerminalGrokAttempts([
       { ...unavailable[0], reasonDigest: undefined }, unavailable[1],
+    ])).toBe(false)
+    expect(validTerminalGrokAttempts([
+      { ...unavailable[0], executionState: 'response-obtained' }, unavailable[1],
+    ])).toBe(false)
+    expect(validTerminalGrokAttempts([
+      { ...unavailable[0], executionState: 'started-no-response' }, unavailable[1],
+    ])).toBe(false)
+    expect(validTerminalGrokAttempts([
+      {
+        ...unavailable[0], executionState: 'started-no-response', processId: 101,
+      },
+      unavailable[1],
+    ])).toBe(true)
+    expect(validTerminalGrokAttempts([
+      {
+        ...unavailable[0],
+        containmentVerified: false,
+        containmentStatus: 'unverified-bounded-residual',
+        executionState: 'start-unconfirmed',
+      },
+      unavailable[1],
+    ])).toBe(true)
+    expect(validTerminalGrokAttempts([
+      {
+        ...unavailable[0],
+        containmentVerified: false,
+        containmentStatus: 'owned-process-still-live',
+        executionState: 'start-unconfirmed',
+      },
+      unavailable[1],
     ])).toBe(false)
   })
 
@@ -96,6 +140,7 @@ describe('best-effort external advisor journal', () => {
       cleanupStatus: 'closed-and-verified',
       cleanupReceiptDigest: digest('b'),
       promptMayHaveBeenDelivered: true,
+      executionState: 'started-no-response',
     })).toBe(true)
     expect(validTerminalClaudeAttempt({
       ...notStarted,
@@ -110,6 +155,54 @@ describe('best-effort external advisor journal', () => {
       cleanupVerified: true,
       cleanupStatus: 'unexpected-cleanup-status',
       cleanupReceiptDigest: digest('d'),
+    })).toBe(false)
+    expect(validTerminalClaudeAttempt({
+      ...notStarted,
+      executionState: 'response-obtained',
+    })).toBe(false)
+    expect(validTerminalClaudeAttempt({
+      ...notStarted,
+      adopted: true,
+      workspaceCreationAttempted: true,
+      freshEphemeral: true,
+      cleanupVerified: true,
+      cleanupStatus: 'closed-and-verified',
+      cleanupReceiptDigest: digest('f'),
+      responseDigest: digest('1'),
+      executionState: 'response-obtained',
+    })).toBe(false)
+    expect(validTerminalClaudeAttempt({
+      ...notStarted,
+      workspaceCreationAttempted: true,
+      freshEphemeral: true,
+      cleanupVerified: true,
+      cleanupStatus: 'closed-and-verified',
+      cleanupReceiptDigest: digest('e'),
+      promptMayHaveBeenDelivered: true,
+      executionState: 'start-unconfirmed',
+    })).toBe(true)
+    expect(validTerminalClaudeAttempt({
+      ...notStarted,
+      workspaceCreationAttempted: true,
+      cleanupStatus: 'unverified-after-retirement',
+      containmentVerified: false,
+      executionState: 'start-unconfirmed',
+    })).toBe(true)
+    expect(validTerminalClaudeAttempt({
+      ...notStarted,
+      workspaceCreationAttempted: true,
+      cleanupStatus: undefined,
+      containmentVerified: false,
+      containmentStatus: 'unverified-bounded-residual',
+      executionState: 'start-unconfirmed',
+    })).toBe(true)
+    expect(validTerminalClaudeAttempt({
+      ...notStarted,
+      workspaceCreationAttempted: true,
+      cleanupStatus: undefined,
+      containmentVerified: false,
+      containmentStatus: 'owned-process-still-live',
+      executionState: 'start-unconfirmed',
     })).toBe(false)
   })
 

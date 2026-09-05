@@ -12,7 +12,10 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { resolveDedicatedGrokLauncher } from './advisor-prerequisites.ts'
+import {
+  resolveDedicatedGrokLauncher,
+  resolveDedicatedGrokOAuthHelper,
+} from './advisor-prerequisites.ts'
 import { installGrokReviewer } from './install-grok-reviewer.ts'
 
 const temporaryDirs: string[] = []
@@ -55,6 +58,24 @@ describe('dedicated Grok prerequisite', () => {
     const home = fixtureHome()
     const path = installFixture(home)
     expect(resolveDedicatedGrokLauncher(home)).toBe(realpathSync(path))
+    expect(resolveDedicatedGrokOAuthHelper(home)).toBe(
+      join(realpathSync(home), '.grok-reviewer', 'bin', 'grok-login-oauth'),
+    )
+  })
+
+  test('OAuth helper/runtime/実行binary identityの改変を個別に拒否する', () => {
+    const helperHome = fixtureHome()
+    installFixture(helperHome)
+    const helper = join(helperHome, '.grok-reviewer', 'bin', 'grok-login-oauth')
+    writeFileSync(helper, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+    expect(() => resolveDedicatedGrokOAuthHelper(helperHome)).toThrow('未導入または安全ではありません')
+    expect(() => resolveDedicatedGrokLauncher(helperHome)).not.toThrow()
+
+    const binaryHome = fixtureHome()
+    installFixture(binaryHome)
+    const physical = realpathSync(join(binaryHome, '.grok', 'bin', 'grok'))
+    writeFileSync(physical, '#!/bin/sh\nexit 1\n', { mode: 0o700 })
+    expect(() => resolveDedicatedGrokOAuthHelper(binaryHome)).toThrow('未導入または安全ではありません')
   })
 
   test('missing・hardlink・group/world writable launcherを拒否する', () => {

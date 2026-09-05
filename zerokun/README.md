@@ -5,7 +5,8 @@
 常駐するSlack gatewayが受信をSQLiteへ保存し、Herdr内から起動された1本のrunnerが
 `codex app-server --stdio`をJSON-RPCで直列実行します。Codexはglobal→projectの`AGENTS.md`をjobごとに読み、
 read jobは回答まで、write jobは調査・設計・実装・review・Git・依頼されたmerge／deploy確認までを
-1つのprimary Codex workflowで完遂します。Zeroちゃんは独自のphaseやadvisor照合を追加しません。
+1つのprimary Codex workflowで完遂します。Zeroちゃんは独自のphaseやadvisor quorumを追加せず、
+外部advisorには認証を隔離した狭いtransportと実測したslot状態だけを提供します。
 
 ## 導入
 
@@ -147,8 +148,8 @@ FIFO入力として保持し、後から`中止`が届いても元jobに束縛�
 
 read-only／write jobとも、1つのprimary Codex processと1つの`complete` turnで実行します。write jobでは
 `AGENTS.md`を読んだCodexが調査・design・実装・review・test・Git・依頼されたmerge／deploy確認を最後まで
-担当します。Zeroちゃんはprepare／implementation／reviewへprocess分割せず、review markerや外部advisor
-receiptの照合で結果を差し戻しません。未信頼のSlack本文はprocess argvへ入れず、JSON-RPCの
+担当します。Zeroちゃんはprepare／implementation／reviewへprocess分割せず、外部advisor transportの
+欠員やreceiptを完了gateにして結果を差し戻しません。未信頼のSlack本文はprocess argvへ入れず、JSON-RPCの
 `turn/start` inputとして渡します。
 
 ```text
@@ -213,6 +214,12 @@ codex <trust-args> -C <repo> \
 - `writeAllowFrom` の sender: minimal runtime + repository/`.git` write + network + browser/local bind
 - read senderは1つのread-only Codex workflow、write senderは1つのwrite-authorized Codex workflowを使います。
   advisor、review、test、Git、deployの進め方はCodexが`AGENTS.md`から決め、Zeroちゃんは別phaseへ分割しません。
+- advisorが必要なjobでは、native Codex 2枠に加え、`zerokun_advisors`がGrok 2枠とfresh Claude 1枠を
+  best-effortで起動します。返却するslot集計は`未起動／起動未確認／起動済み未回答／回答取得`を区別し、
+  primary Codexはこの構造化値だけを人数報告の根拠にします。
+- Grokの既知の未認証応答だけは、phase内で1回に限って固定OAuth helperへ渡し、復旧できた場合も
+  認証で終了した枠だけを再実行します。helper、reviewer、Claudeの失敗は外部枠の利用不能として閉じ、
+  primary Codexのtaskを失敗や再設計へ戻しません。
 - write jobでは公開HTTPSへ到達できるBrowser／Chrome、localhost用の隔離browser verifier、
   repository限定GitHub credential brokerを利用できます。
   brokerはSlack token、GitHub token、operator HOMEをmodelへ公開せず、Codexが選んだ操作だけを実行します。

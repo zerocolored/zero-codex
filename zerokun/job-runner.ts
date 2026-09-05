@@ -12511,6 +12511,30 @@ export interface JobExecutionResult {
    * capability is never reinterpreted as a GitHub publication requirement.
    */
   publication?: GitHubPublicationSet
+  /** Host-derived facts from terminal advisor journals; never model-authored. */
+  advisorCoverage?: HostAdvisorCoverage
+}
+
+export type HostAdvisorSlotState =
+  | 'unavailable-before-start'
+  | 'start-unconfirmed'
+  | 'started-no-response'
+  | 'response-obtained'
+
+export interface HostAdvisorCoverage {
+  version: 1
+  phases: Array<{
+    phase: 'investigation' | 'review'
+    inputRevision: number
+    finishedAt: number
+    total: 5
+    started: number
+    responsesObtained: number
+    startedNoResponse: number
+    startUnconfirmed: number
+    unavailableBeforeStart: number
+    slots: Array<{ slot: string, state: HostAdvisorSlotState }>
+  }>
 }
 
 export interface HostCapturedArtifact {
@@ -13632,11 +13656,25 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           },
           reportProgress: report => {
             if (!progressReportsOpen) return false
+            const current = options.store.get(job.id) ?? job
+            const publicText = enforceHostAdvisorCoverage(
+              sanitizeExecutionTextForSlack(
+                current,
+                current.sessionId ?? '',
+                report.text,
+                dirname(options.store.dbPath),
+                [],
+                'progress',
+              ),
+              undefined,
+              'progress',
+            )
+            if (!publicText.trim()) return true
             const disposition = options.store.stageProgressNotification(
               job.id,
               job.attempts,
               report.slot,
-              report.text,
+              publicText,
             )
             if (disposition === 'staged') scheduleLifecycleFlush()
             return disposition === 'staged' || disposition === 'duplicate'
@@ -13644,12 +13682,16 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           reportCommentary: event => {
             if (!progressReportsOpen) return false
             const current = options.store.get(job.id) ?? job
-            const publicText = sanitizeExecutionTextForSlack(
-              current,
-              current.sessionId ?? '',
-              event.text,
-              dirname(options.store.dbPath),
-              [],
+            const publicText = enforceHostAdvisorCoverage(
+              sanitizeExecutionTextForSlack(
+                current,
+                current.sessionId ?? '',
+                event.text,
+                dirname(options.store.dbPath),
+                [],
+                'progress',
+              ),
+              undefined,
               'progress',
             )
             const publicBody = publicText.startsWith('💬 ')
@@ -15493,13 +15535,120 @@ function stageHostCapturedArtifacts(
   return [...new Set(staged)]
 }
 
+const ADVISOR_COVERAGE_SUBJECT = /(?:Five[- ]Advisor|独立(?:した)?(?:レビュー|確認|検証|枠)|補助(?:レビュー|確認|検証|枠)|外部(?:レビュー|確認|検証|枠)|\b(?:advisors?|reviewers?)\b|アドバイザー|レビュアー|(?:Codex|Claude|Grok).{0,16}(?:レビュー|検証枠|確認枠|枠)|(?:全|全て|全員|5|五)\s*(?:つの)?(?:AI|モデル|枠|人|名|者))/iu
+const ADVISOR_COVERAGE_ASSERTION = /(?:すべて|全(?:て|員)?|残(?:る|り)|有効|不採択|採択|利用不能|欠員|試行|起動|実施|実行|回答|取得|完了|成功|失敗|使(?:え|用)|見解|意見|揃|一致|確認(?:済み|でき)|\d+\s*\/\s*5|[0-9０-９一二三四五六七八九十]+\s*(?:件|枠|人|名|者))/u
+// Cross-sentence context is intentionally limited to words which still name
+// advisor slots.  A broad `N件` continuation used to erase unrelated facts
+// such as "変更ファイルは3件です" from the same paragraph.
+const ADVISOR_COVERAGE_CONTEXT = /(?:残(?:る|り)(?:の)?\s*[0-9０-９一二三四五六七八九十]+\s*枠|そのうち\s*[0-9０-９一二三四五六七八九十]+\s*枠|両枠|両方の枠|(?:有効|不採択|採択|利用不能|欠員)(?:だった|となった|の)?\s*[0-9０-９一二三四五六七八九十]+\s*枠)/u
+const ADVISOR_COVERAGE_OPERATION = /(?:試行|起動|実施|実行|回答|取得|利用不能|欠員|不採択|採択|使え|見解.{0,12}揃|意見.{0,12}一致)/u
+const ADVISOR_COVERAGE_QUANTITY = /(?:全|全て|全員|\d+\s*\/\s*5|[0-9０-９一二三四五六七八九十]+\s*(?:枠|人|名|者|モデル|AI))/u
+
+function advisorCoverageClause(clause: string): boolean {
+  const normalized = clause.replace(/\s+/g, ' ').trim()
+  if (!normalized || !ADVISOR_COVERAGE_ASSERTION.test(normalized)) return false
+  const namedModels = normalized.match(/(?:Codex|Claude|Grok)/giu) ?? []
+  const coverageQuantity = ADVISOR_COVERAGE_QUANTITY.test(normalized)
+  const implementationStatement = /(?:起動経路|起動できるよう|起動可能|実装|設定|修正)/u.test(normalized)
+  if (implementationStatement) return false
+  // Commentary is delivered one Slack message at a time. A later sentence
+  // such as "残る3枠…" or "3枠は利用不能" therefore has to be recognized
+  // without relying on the previous message to name the advisors.
+  if (ADVISOR_COVERAGE_CONTEXT.test(normalized)) return true
+  if (coverageQuantity && ADVISOR_COVERAGE_OPERATION.test(normalized)) return true
+  if (ADVISOR_COVERAGE_SUBJECT.test(normalized)
+    && (ADVISOR_COVERAGE_OPERATION.test(normalized) || coverageQuantity)) return true
+  if (namedModels.length >= 2
+    && (ADVISOR_COVERAGE_OPERATION.test(normalized)
+      || ADVISOR_COVERAGE_CONTEXT.test(normalized))) return true
+  if (namedModels.length >= 1
+    && /[0-9０-９一二三四五六七八九十]+\s*(?:枠|人|名|者)/u.test(normalized)) return true
+  return /[0-9０-９一二三四五六七八九十]+\s*(?:人|名|者)/u.test(normalized)
+    && /(?:レビュー|確認|検証|試行|実施|実行|回答|起動)/u.test(normalized)
+}
+
+const HOST_ADVISOR_COVERAGE_LINE = /^独立レビュー実行記録\(ホスト確認\): (?:完了した実行記録なし（実行済みとは報告しません）|(?:(?:初期設計|最終レビュー)—起動[0-5]\/5・回答[0-5]\/5・起動済み未回答[0-5]\/5・起動未確認[0-5]\/5・起動前利用不能[0-5]\/5)(?:、(?:初期設計|最終レビュー)—起動[0-5]\/5・回答[0-5]\/5・起動済み未回答[0-5]\/5・起動未確認[0-5]\/5・起動前利用不能[0-5]\/5)*)。$/u
+
+function stripModelAuthoredAdvisorCoverage(
+  text: string,
+  preserveHostCoverageLine = false,
+): {
+  text: string
+  removed: boolean
+} {
+  let removed = false
+  const kept = text.split(/(\r?\n[ \t]*\r?\n+)/).map(paragraph => {
+    if (/^\r?\n[ \t]*\r?\n+$/.test(paragraph)) return paragraph
+    const clauses = (paragraph.match(/.*?(?:[。！？!?]|\.(?=[ \t\r\n]|$)|\r?\n|$)/gs) ?? [paragraph])
+      .filter(clause => clause.length > 0)
+    const coverageContext = clauses.some(advisorCoverageClause)
+    return clauses.map(clause => {
+      if (preserveHostCoverageLine && HOST_ADVISOR_COVERAGE_LINE.test(clause.trim())) {
+        return clause
+      }
+      const direct = advisorCoverageClause(clause)
+      const contextual = coverageContext
+        && ADVISOR_COVERAGE_CONTEXT.test(clause)
+        && ADVISOR_COVERAGE_ASSERTION.test(clause)
+      if (!direct && !contextual) return clause
+      removed = true
+      return clause.endsWith('\r\n') ? '\r\n' : clause.endsWith('\n') ? '\n' : ''
+    }).join('')
+  }).join('')
+  return {
+    text: kept.replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, '\n\n').trim(),
+    removed,
+  }
+}
+
+function hostAdvisorCoverageLine(coverage?: HostAdvisorCoverage): string {
+  if (!coverage || coverage.phases.length === 0) {
+    return '独立レビュー実行記録(ホスト確認): 完了した実行記録なし（実行済みとは報告しません）。'
+  }
+  const phases = [...coverage.phases]
+    .sort((left, right) => left.finishedAt - right.finishedAt)
+    .map(value => {
+      const label = value.phase === 'investigation' ? '初期設計' : '最終レビュー'
+      return `${label}—起動${value.started}/5・回答${value.responsesObtained}/5`
+        + `・起動済み未回答${value.startedNoResponse}/5`
+        + `・起動未確認${value.startUnconfirmed}/5`
+        + `・起動前利用不能${value.unavailableBeforeStart}/5`
+    })
+  return `独立レビュー実行記録(ホスト確認): ${phases.join('、')}。`
+}
+
+/**
+ * Advisor coverage is an execution fact, not prose for the model to infer.
+ * Progress drops unsealed counts; terminal output replaces every model claim
+ * with one journal-derived line (or an explicit absence of a durable record).
+ */
+export function enforceHostAdvisorCoverage(
+  text: string,
+  coverage: HostAdvisorCoverage | undefined,
+  purpose: 'result' | 'progress' | 'delivery',
+): string {
+  const stripped = stripModelAuthoredAdvisorCoverage(text, purpose === 'delivery')
+  if (purpose !== 'result') return stripped.text
+  if (coverage?.phases.length) {
+    return stripped.text
+      ? `${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
+      : hostAdvisorCoverageLine(coverage)
+  }
+  if (!stripped.removed) return stripped.text
+  return stripped.text
+    ? `${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
+    : hostAdvisorCoverageLine(coverage)
+}
+
 export function finalizeSuccessfulExecution(
   job: JobRecord,
   execution: JobExecutionResult,
   dir: string,
   log: (message: string) => void = () => {},
 ): JobExecutionResult {
-  const { capturedArtifacts = [], ...persistedExecution } = execution
+  const {
+    capturedArtifacts = [], advisorCoverage, ...persistedExecution
+  } = execution
   try {
     const declared = extractArtifactPaths(execution.result)
     // Browser evidence is bounded by the host at capture time and cannot be
@@ -15516,7 +15665,11 @@ export function finalizeSuccessfulExecution(
       dir,
     )
     const output = extractArtifactPaths(sealed)
-    const sanitized = sanitizeExecutionTextForSlack(job, execution.sessionId, output.text, dir)
+    const sanitized = enforceHostAdvisorCoverage(
+      sanitizeExecutionTextForSlack(job, execution.sessionId, output.text, dir),
+      advisorCoverage,
+      'result',
+    )
     const containsSelfNonDisclosure = sanitized.split(/\r?\n/)
       .some(line => line.trim() === SELF_IMPLEMENTATION_NON_DISCLOSURE)
     const marker = output.files.length > 0 && !containsSelfNonDisclosure
@@ -15535,12 +15688,9 @@ export function finalizeSuccessfulExecution(
     // Codex already exited successfully. A malformed/unsealable artifact
     // declaration is a delivery failure, not evidence that a write job itself
     // failed; marking it failed would invite duplicate external side effects.
-    const text = sanitizeExecutionTextForSlack(
-      job,
-      execution.sessionId,
-      extractArtifactPaths(execution.result).text,
-      dir,
-    )
+    const text = enforceHostAdvisorCoverage(sanitizeExecutionTextForSlack(
+      job, execution.sessionId, extractArtifactPaths(execution.result).text, dir,
+    ), advisorCoverage, 'result')
     const message = error instanceof Error ? error.message : String(error)
     log(`artifact sealing failed for completed job ${job.id}: ${message}`)
     return {
@@ -15587,18 +15737,22 @@ export function prepareUiApprovalForParking(
   if (paths.length !== 2 || paths[0] === paths[1]) {
     throw new Error('UI/UX approval images could not be sealed as an exact Before/After pair')
   }
-  const proposalText = sanitizeExecutionTextForSlack(
-    job,
-    error.approval.sessionId,
-    error.approval.text,
-    dir,
-    [
-      error.approval.beforePath,
-      error.approval.afterPath,
-      images.beforePath,
-      images.afterPath,
-      ...paths,
-    ],
+  const proposalText = enforceHostAdvisorCoverage(
+    sanitizeExecutionTextForSlack(
+      job,
+      error.approval.sessionId,
+      error.approval.text,
+      dir,
+      [
+        error.approval.beforePath,
+        error.approval.afterPath,
+        images.beforePath,
+        images.afterPath,
+        ...paths,
+      ],
+    ),
+    undefined,
+    'progress',
   )
   if (!proposalText) throw new Error('UI/UX approval proposal is empty after sanitization')
   return {
@@ -15623,9 +15777,22 @@ function normalizePersistedExecutionResult(
 ): string {
   const output = extractArtifactPaths(result)
   const sanitized = sanitizeExecutionTextForSlack(job, sessionId, output.text, dir)
-  const text = sanitized.length <= MAX_PERSISTED_RESULT_TEXT_CHARS
-    ? sanitized
-    : `${sanitized.slice(0, MAX_PERSISTED_RESULT_TEXT_CHARS)}\n\n…(長いため ${MAX_PERSISTED_RESULT_TEXT_CHARS} 字で打ち切りました)`
+  const lines = sanitized.split(/\r?\n/)
+  const trustedCoverageLine = lines.length > 0
+    && HOST_ADVISOR_COVERAGE_LINE.test(lines[lines.length - 1]!.trim())
+    ? lines.pop()!.trim()
+    : ''
+  while (trustedCoverageLine && lines.at(-1)?.trim() === '') lines.pop()
+  const body = lines.join('\n')
+  const suffix = trustedCoverageLine ? `\n\n${trustedCoverageLine}` : ''
+  const truncationNotice = `\n\n…(長いため本文を打ち切りました)`
+  const availableBodyChars = Math.max(
+    0,
+    MAX_PERSISTED_RESULT_TEXT_CHARS - suffix.length - truncationNotice.length,
+  )
+  const text = body.length + suffix.length <= MAX_PERSISTED_RESULT_TEXT_CHARS
+    ? `${body}${suffix}`.trim()
+    : `${body.slice(0, availableBodyChars)}${truncationNotice}${suffix}`.trim()
   const containsSelfNonDisclosure = sanitized.split(/\r?\n/)
     .some(line => line.trim() === SELF_IMPLEMENTATION_NON_DISCLOSURE)
   const marker = output.files.length > 0 && !containsSelfNonDisclosure
@@ -15713,7 +15880,9 @@ export async function reconcileEphemeralAndRetiredAdvisorRounds(options: {
     }`)
   }
   try {
-    const result = finalizeRetiredAdvisorRounds(options.stateDir)
+    const result = finalizeRetiredAdvisorRounds(options.stateDir, {
+      allowUnverifiedClaudeResidual: true,
+    })
     if (result.finalized > 0) {
       options.log?.(`finalized ${result.finalized} interrupted advisor round(s)`)
     }
@@ -16134,12 +16303,16 @@ export class SlackNotifier implements JobNotifier {
     notificationId?: string,
     signal?: AbortSignal,
   ): Promise<void> {
-    const safeText = sanitizeExecutionTextForSlack(
-      job,
-      job.sessionId ?? '',
-      text,
-      dirname(this.store.dbPath),
-      [],
+    const safeText = enforceHostAdvisorCoverage(
+      sanitizeExecutionTextForSlack(
+        job,
+        job.sessionId ?? '',
+        text,
+        dirname(this.store.dbPath),
+        [],
+        'progress',
+      ),
+      undefined,
       'progress',
     )
     const slackText = safeText.startsWith('💬 ')
@@ -16164,18 +16337,23 @@ export class SlackNotifier implements JobNotifier {
       if (!job || !interjection) {
         throw new Error('interjection notification lost its durable job binding')
       }
-      payload = sanitizeExecutionTextForSlack(
-        job,
-        job.sessionId ?? '',
-        payload,
-        dirname(this.store.dbPath),
-        [
-          ...interjection.attachments,
-          interjection.messageId,
-          interjection.userId,
-          interjection.id,
-          interjection.idempotencyKey,
-        ],
+      payload = enforceHostAdvisorCoverage(
+        sanitizeExecutionTextForSlack(
+          job,
+          job.sessionId ?? '',
+          payload,
+          dirname(this.store.dbPath),
+          [
+            ...interjection.attachments,
+            interjection.messageId,
+            interjection.userId,
+            interjection.id,
+            interjection.idempotencyKey,
+          ],
+          'progress',
+        ),
+        undefined,
+        'progress',
       ) || '確認した内容を元の作業へ反映して続けます。'
     }
     const deliver = async (): Promise<void> => {
@@ -16268,12 +16446,17 @@ export class SlackNotifier implements JobNotifier {
     await this.deliverSealedArtifact(job, request.afterPath, 'After.png', signal)
     if (signal?.aborted) return
     if (!this.store.uiApprovalNotificationDeliverable(notification.id)) return
-    const safeText = sanitizeExecutionTextForSlack(
-      job,
-      request.sessionId,
-      request.proposalText,
-      dirname(this.store.dbPath),
-      [request.beforePath, request.afterPath, request.id],
+    const safeText = enforceHostAdvisorCoverage(
+      sanitizeExecutionTextForSlack(
+        job,
+        request.sessionId,
+        request.proposalText,
+        dirname(this.store.dbPath),
+        [request.beforePath, request.afterPath, request.id],
+        'progress',
+      ),
+      undefined,
+      'progress',
     )
     if (!safeText) throw new Error('UI/UX approval proposal became empty after sanitization')
     const promptText = `${safeText}\n\nこの方向で実装してよいですか？`
@@ -16318,11 +16501,15 @@ export class SlackNotifier implements JobNotifier {
     signal?: AbortSignal,
   ): Promise<void> {
     const output = extractArtifactPaths(result)
-    const safeText = sanitizeExecutionTextForSlack(
-      job,
-      job.sessionId ?? '',
-      output.text,
-      dirname(this.store.dbPath),
+    const safeText = enforceHostAdvisorCoverage(
+      sanitizeExecutionTextForSlack(
+        job,
+        job.sessionId ?? '',
+        output.text,
+        dirname(this.store.dbPath),
+      ),
+      undefined,
+      'delivery',
     )
     if (!notificationId || !this.store.terminalNotificationBodyDelivered(notificationId)) {
       await this.post(job, safeText || 'できました ✅', notificationId, signal)

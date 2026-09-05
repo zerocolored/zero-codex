@@ -94,6 +94,17 @@ describe('public Codex defaults', () => {
     }
   })
 
+  test('公開CIは全test fileをfresh Bun processへ分離する', () => {
+    const verify = readFileSync(join(import.meta.dir, 'verify.sh'), 'utf8')
+    const discovery = verify.indexOf("done < <(git ls-files -- '*test.ts')")
+    const freshProcess = verify.indexOf(
+      'bun test --isolate --no-orphans "$test_file"',
+    )
+    expect(freshProcess).toBeGreaterThan(0)
+    expect(discovery).toBeGreaterThan(freshProcess)
+    expect(verify).not.toContain('"${full_suite_tests[@]}"')
+  })
+
   test('認証済みlive検証も本番と同じMCP隔離結果だけでApp Serverを起動する', () => {
     const liveCheck = readFileSync(join(import.meta.dir, 'live-codex-permission-check.ts'), 'utf8')
     const build = liveCheck.indexOf('const baseOverrides = buildCodexPermissionOverrides(')

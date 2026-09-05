@@ -13,6 +13,7 @@ import {
   realpathSync,
   rmSync,
   writeSync,
+  type Dirent,
 } from 'fs'
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import { homedir, tmpdir } from 'os'
@@ -61,9 +62,11 @@ import {
 } from './inbound-attachment-cache.ts'
 import {
   EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,
+  EphemeralClaudeOwnedProcessStillLiveError,
   MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES,
   parseEphemeralClaudeDeliveryEvidence,
   reconcileEphemeralClaudeSessions,
+  resolveClaudeExecutableLookup,
 } from './ephemeral-claude-session.ts'
 import {
   finalizeRetiredAdvisorRounds,
@@ -79,6 +82,7 @@ import {
   type OfficialCodexSnapshot,
 } from './standalone-codex.ts'
 import {
+  readPinnedHerdrRuntime,
   verifyHerdrRuntimeIdentityAsync,
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
@@ -89,6 +93,7 @@ import {
   validTerminalGrokAttempts,
   validTerminalNativeAttempts,
 } from './advisor-journal.ts'
+import { summarizeAdvisorSlots } from './advisor-broker.ts'
 import {
   advisorRepositoryDigest,
   advisorRepositoryIdentifiers,
@@ -956,13 +961,17 @@ async function readCodexAppServer(
     }
   }
   if (seatbeltCleanupError) {
-    throw new CodexCleanupPendingError(
-      `Codex ${method} Seatbelt cleanup is unconfirmed: ${seatbeltCleanupError}`,
-    )
+    const message = `Codex ${method} Seatbelt cleanup is unconfirmed: ${seatbeltCleanupError}`
+    if (/processes remain after KILL:/u.test(String(seatbeltCleanupError))) {
+      throw new CodexOwnedProcessStillLiveError(message)
+    }
+    throw new CodexCleanupPendingError(message)
   }
   if (terminationError) throw terminationError
   if (remaining.length > 0) {
-    throw new Error(`Codex ${method} left child processes running: ${remaining.join(', ')}`)
+    throw new CodexOwnedProcessStillLiveError(
+      `Codex ${method} left child processes running: ${remaining.join(', ')}`,
+    )
   }
   if (trackingError) throw trackingError
   if (failure) throw failure
@@ -1628,6 +1637,96 @@ function advisorJournalPath(
     `revision-${input.revision}-${input.digest.slice(0, 16)}`,
     `${requirement.phase}-${requirement.round}.json`,
   )
+}
+
+/**
+ * Read-only, best-effort accounting for public execution claims. It derives
+ * counts from validated terminal slot records and never trusts the model's
+ * prose or the journal's cached aggregate.
+ */
+export function collectHostAdvisorCoverage(
+  stateDirInput: string,
+  jobId: string,
+  attemptNonce: string,
+  nativeHistoryVerified = false,
+): NonNullable<JobExecutionResult['advisorCoverage']> | undefined {
+  if (!/^[0-9a-f]{32}$/.test(attemptNonce)) return undefined
+  let stateDir: string
+  let attemptRoot: string
+  try {
+    stateDir = requireManagedStateRoot(stateDirInput)
+    attemptRoot = requireManagedDirectory(stateDir, join(
+      stateDir,
+      'advisor-journal',
+      jobId.replace(/[^A-Za-z0-9._-]/g, '_'),
+      attemptNonce,
+    ))
+  } catch {
+    return undefined
+  }
+  const phasesByName = new Map<'investigation' | 'review',
+    NonNullable<JobExecutionResult['advisorCoverage']>['phases'][number]>()
+  let revisions: Dirent<string>[]
+  try { revisions = readdirSync(attemptRoot, { withFileTypes: true }) } catch { return undefined }
+  for (const revision of revisions) {
+    const match = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/.exec(revision.name)
+    if (!match || !revision.isDirectory() || revision.isSymbolicLink()) continue
+    const inputRevision = Number(match[1])
+    if (!Number.isSafeInteger(inputRevision)) continue
+    let revisionRoot: string
+    try { revisionRoot = requireManagedDirectory(stateDir, join(attemptRoot, revision.name)) } catch {
+      continue
+    }
+    for (const phase of ['investigation', 'review'] as const) {
+      const raw = readOptionalPrivateFile(join(revisionRoot, `${phase}-1.json`))
+      if (raw === null || Buffer.byteLength(raw) > 64 * 1024) continue
+      let journal: Record<string, unknown>
+      try { journal = JSON.parse(raw) as Record<string, unknown> } catch { continue }
+      if (journal.version !== 8
+        || !['reviewers-completed', 'completed'].includes(String(journal.status))
+        || journal.phase !== phase || journal.round !== 1
+        || journal.attemptNonce !== attemptNonce
+        || journal.inputRevision !== inputRevision
+        || typeof journal.inputDigest !== 'string'
+        || !/^[0-9a-f]{64}$/.test(journal.inputDigest)
+        || !journal.inputDigest.startsWith(match[2]!)
+        || !Number.isSafeInteger(journal.finishedAt)
+        || Number(journal.finishedAt) <= 0
+        || !validTerminalNativeAttempts(journal.native)
+        || !validTerminalGrokAttempts(journal.grok)
+        || !validTerminalClaudeAttempt(journal.claude)) continue
+      const native = nativeHistoryVerified
+        ? journal.native as Array<Record<string, unknown>>
+        : (journal.native as Array<Record<string, unknown>>).map(value => ({
+            perspective: value.perspective,
+            attempted: true,
+            adopted: false,
+            started: false,
+            reasonDigest: createHash('sha256')
+              .update('native advisor history was not host-verified')
+              .digest('hex'),
+          }))
+      const summary = summarizeAdvisorSlots(
+        native,
+        journal.grok as Array<Record<string, unknown>>,
+        journal.claude as Record<string, unknown>,
+      )
+      const candidate: NonNullable<JobExecutionResult['advisorCoverage']>['phases'][number] = {
+        phase,
+        inputRevision,
+        finishedAt: Number(journal.finishedAt),
+        ...summary,
+      }
+      // A unified logical attempt may bind its initial and final reviews to
+      // different Slack input revisions. Preserve both. Conversely, two
+      // terminal journals for the same phase violate the once-per-attempt
+      // ledger, so do not guess which one should be exposed to Slack.
+      if (phasesByName.has(phase)) return undefined
+      phasesByName.set(phase, candidate)
+    }
+  }
+  const phases = [...phasesByName.values()]
+  return phases.length > 0 ? { version: 1, phases } : undefined
 }
 
 function validSha256(value: unknown): value is string {
@@ -3164,7 +3263,7 @@ export async function assertNativeAdvisorHistory(options: {
 export function buildCodexDeveloperInstructions(
   job: JobRecord,
   _artifactDir: string,
-  _advisorEnabled = false,
+  advisorEnabled = false,
   _advisorAttemptNonce?: string,
   _stage: 'complete' | 'prepare' | 'implementation' | 'review' | 'interjection' = 'complete',
   _reviewRound: 1 | 2 | 3 = 1,
@@ -3184,6 +3283,33 @@ export function buildCodexDeveloperInstructions(
         ...projectLayout.gitRoots.map(root => `Workspace repository member: ${root}`),
       ].join('\n')
     : ''
+  const advisorProtocol = advisorEnabled
+    ? [
+        '',
+        'A narrow zerokun_advisors transport is available for advisor consultations required by',
+        'the applicable AGENTS.md. Keep one primary Codex workflow: the transport starts external',
+        'reviewers but never selects work phases, blocks implementation, or publishes changes.',
+        'For the single combined initial-design consultation use advisor_round phase=investigation',
+        'round=1. For the one post-implementation final review use phase=review round=1. Do not call',
+        'the legacy separate design phase or repeat a panel because a reviewer is unavailable.',
+        'Attempt the two native solution/risk advisors yourself, wait for each started attempt, then',
+        'pass their exact marked responses and real agent IDs to advisor_round. If a native slot did',
+        'not start or started without an answer, pass adopted=false, started=false or true, and a',
+        'concise reason. Poll advisor_round_poll one call at a time until it returns a terminal',
+        'receipt. External reviewer absence is best-effort and never blocks the primary task.',
+        'Never inspect or invoke Grok, Claude, Herdr, their authentication, helper files, sockets,',
+        'or processes directly; zerokun_advisors is the only external-advisor route.',
+        'When reporting advisor coverage, use only the returned slotSummary. requested/total means',
+        'slots requested, not slots started. Say all five ran or answered only when slotSummary',
+        'proves started=5 or responsesObtained=5 respectively. Otherwise report the exact counts',
+        'and distinguish unavailable-before-start from a started slot that returned no answer.',
+      ].join('\n')
+    : [
+        '',
+        'The external advisor transport is unavailable in this process. Do not inspect or invoke',
+        'Grok, Claude, Herdr, their authentication, helper files, sockets, or processes directly.',
+        'Continue the primary task and never describe an external reviewer as attempted or started.',
+      ].join('\n')
   if (job.writeEnabled) {
     const protocol = [
       'This Slack thread is explicitly write-authorized. The current host control block supplies',
@@ -3203,7 +3329,7 @@ export function buildCodexDeveloperInstructions(
       'capture path for local UI evidence; do not claim a site is unreachable before attempting it',
       'with an available browser capability.',
     ].join('\n')
-    return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}\n\n${protocol}`
+    return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}\n\n${protocol}${advisorProtocol}`
   }
 
   const readOnlyProtocol = [
@@ -3213,7 +3339,7 @@ export function buildCodexDeveloperInstructions(
     'Follow AGENTS.md for any read-only investigation or review it actually requires. Do not run',
     'a host phase protocol, emit ZERO_* markers, or wait for host-side advisor reconciliation.',
   ].join('\n')
-  return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}\n\n${readOnlyProtocol}`
+  return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}\n\n${readOnlyProtocol}${advisorProtocol}`
 }
 
 export type CodexWorkerPromptContext = {
@@ -3320,6 +3446,28 @@ export function buildCodexWorkerPrompt(
       `Thread history source blocks: ${threadHistory.sourceCount}`,
       `Thread history omitted blocks: ${threadHistory.omittedCount}`,
       'Thread history is context only; current host authority and current input always win.',
+    )
+  }
+  if (host.advisorEnabled) {
+    control.push(
+      'Advisor transport: zerokun_advisors is the only permitted route for external reviewers.',
+      'When the applicable AGENTS.md requires the combined initial-design Five-Advisor panel, use',
+      'advisor_round with phase=investigation and round=1. For a required final review after',
+      'implementation, use phase=review and round=1. Do not use the legacy design phase.',
+      'Each of those two phases is attempt-wide and may run at most once even when Slack input is',
+      'added or the Codex turn is steered. A reusedPriorPhase result is final for that phase: do',
+      'not spawn replacement native advisors and do not call that phase again.',
+      `Native advisor responses for this input must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|review>:1:<solution|risk>] after replacing only phase and perspective.`,
+      'For an unavailable native slot, send adopted=false, an exact started boolean, and a concise',
+      'reason. External unavailable outcomes are terminal best-effort results; never retry a panel',
+      'or stop the primary work because a slot is absent.',
+      'Base any advisor-count statement only on slotSummary returned by the broker. Never call all',
+      'five attempted, started, or completed unless the corresponding structured count is five.',
+    )
+  } else {
+    control.push(
+      'Advisor transport: unavailable. Do not access external reviewer files or tools directly,',
+      'and do not claim that an external reviewer was attempted or started.',
     )
   }
   if (!job.writeEnabled) {
@@ -4568,7 +4716,7 @@ export function buildCodexPermissionOverrides(
   const mcpEntries: string[] = []
   if (options.advisorMcp) {
     mcpEntries.push(
-      `zerokun_advisors={command=${tomlString(options.advisorMcp.command)},args=[${options.advisorMcp.args.map(tomlString).join(',')}],enabled=true,required=true,enabled_tools=["advisor_round","advisor_round_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"}}}`,
+      `zerokun_advisors={command=${tomlString(options.advisorMcp.command)},args=[${options.advisorMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["advisor_round","advisor_round_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"}}}`,
     )
   }
   if (options.browserMcp) {
@@ -5028,6 +5176,7 @@ export class CodexRateLimitError extends Error {
 
 export class CodexInterruptedError extends Error {}
 export class CodexCleanupPendingError extends Error {}
+export class CodexOwnedProcessStillLiveError extends CodexCleanupPendingError {}
 export class RetainedSlackAttachmentUnavailableError extends Error {
   constructor(
     readonly attachment: ThreadAttachmentRecord,
@@ -5464,8 +5613,8 @@ export async function executeCodexJob(
     join(stateDir, 'advisor-context', job.id.replace(/[^A-Za-z0-9._-]/g, '_')),
   )
   // Work policy belongs to Codex and the applicable AGENTS.md. Herdr remains
-  // the operator-facing monitor, but it is no longer injected into a job as a
-  // second advisor/phase orchestrator.
+  // outside the primary sandbox; a narrow broker is exposed below only as a
+  // reviewer transport and never as a host phase/work-policy orchestrator.
   const herdrRuntime: HerdrRuntimeIdentity | undefined = undefined
   const requireSafeBroker = (basename: string): string => {
     const path = realpathSync(join(import.meta.dir, basename))
@@ -5477,10 +5626,19 @@ export async function executeCodexJob(
     }
     return path
   }
+  const brokerPath = requireSafeBroker('advisor-broker.ts')
   const browserBrokerPath = requireSafeBroker('browser-verification-broker.ts')
   const githubBrokerPath = requireSafeBroker('github-credential-broker.ts')
   const localAdvisorAccess = false
-  const nativeAdvisorHistoryEnabled = options.nativeAdvisorHistoryFixtureForTesting !== undefined
+  const claudeAdvisorLookup = (() => {
+    try { return resolveClaudeExecutableLookup() } catch { return undefined }
+  })()
+  // Native advisor claims originate inside the model turn. Production counts
+  // them only after a separate App Server history read proves the child
+  // threads and their complete marker-bound responses exist. Test binaries do
+  // not emulate that API unless an explicit history fixture is supplied.
+  const nativeAdvisorHistoryEnabled = testCodexBin === undefined
+    || options.nativeAdvisorHistoryFixtureForTesting !== undefined
   const advisorVerificationWarnings = new Set<string>()
   const reportAdvisorVerificationWarning = (stage: string, error: unknown): void => {
     const category = error instanceof Error ? error.name : 'unknown'
@@ -5504,7 +5662,8 @@ export async function executeCodexJob(
     try {
       return await action()
     } catch (error) {
-      if (error instanceof CodexCleanupPendingError
+      if (error instanceof CodexOwnedProcessStillLiveError
+        || error instanceof EphemeralClaudeOwnedProcessStillLiveError
         || error instanceof CodexInterruptedError
         || error instanceof CodexUserCancelledError) throw error
       reportAdvisorVerificationWarning(stage, error)
@@ -5661,7 +5820,17 @@ export async function executeCodexJob(
           attachments_json: JSON.stringify(job.attachments),
           input_revision: 1,
         }, []))
-      const advisorMcp = undefined
+      const advisorMcp = testCodexBin === undefined && !continuationDecision
+        && stage !== 'implementation' && stage !== 'interjection' ? {
+          command: realpathSync(process.execPath),
+          args: [
+            '--config=/dev/null', '--no-env-file', brokerPath,
+            logicalAttempt.contextPath, managedStateDir, runtimeDir,
+            seatbeltFingerprint.allow.path, seatbeltFingerprint.deny.path,
+            'complete', processNonce,
+            ...(claudeAdvisorLookup ? [claudeAdvisorLookup] : []),
+          ],
+        } : undefined
       const browserEnabled = testCodexBin === undefined && job.writeEnabled
         && process.platform === 'darwin' && stage !== 'interjection' && !continuationDecision
       const browserReceiptKey = browserEnabled ? randomBytes(32).toString('hex') : undefined
@@ -6103,36 +6272,41 @@ export async function executeCodexJob(
         },
       })
       if (retirement.recorded) {
-        if (!herdrRuntime) {
-          throw new CodexCleanupPendingError(
-            'advisor round retirement requires the pinned Herdr runtime',
-          )
-        }
-        await reconcileEphemeralClaudeSessions({
-          stateDir: managedStateDir,
-          runtime: herdrRuntime,
-          onReconciledRound: outcome => {
-            if (outcome.jobId !== job.id
-              || outcome.attemptNonce !== advisorAttempt.attemptNonce) return
-            try {
-              const input = readAdvisorInputSnapshot(
-                managedStateDir, job.id, outcome.inputRevision,
-              )
-              if (!input.digest.startsWith(outcome.inputDigestPrefix)) {
-                throw new Error('reconciled Claude round input digest changed')
+        try {
+          const retirementHerdrRuntime = readPinnedHerdrRuntime(managedStateDir)
+          await reconcileEphemeralClaudeSessions({
+            stateDir: managedStateDir,
+            runtime: retirementHerdrRuntime,
+            onReconciledRound: outcome => {
+              if (outcome.jobId !== job.id
+                || outcome.attemptNonce !== advisorAttempt.attemptNonce) return
+              try {
+                const input = readAdvisorInputSnapshot(
+                  managedStateDir, job.id, outcome.inputRevision,
+                )
+                if (!input.digest.startsWith(outcome.inputDigestPrefix)) {
+                  throw new Error('reconciled Claude round input digest changed')
+                }
+                persistAdvisorClaudeCleanupOutcome(managedStateDir, {
+                  ...outcome,
+                  inputDigest: input.digest,
+                })
+              } catch (error) {
+                reportAdvisorVerificationWarning('claude-round-history', error)
               }
-              persistAdvisorClaudeCleanupOutcome(managedStateDir, {
-                ...outcome,
-                inputDigest: input.digest,
-              })
-            } catch (error) {
-              reportAdvisorVerificationWarning('claude-round-history', error)
-            }
-          },
-        })
+            },
+          })
+        } catch (error) {
+          if (error instanceof EphemeralClaudeOwnedProcessStillLiveError) {
+            throw new CodexCleanupPendingError(error.message)
+          }
+          reportAdvisorVerificationWarning('claude-round-cleanup', error)
+        }
         await bestEffortAdvisorVerification(
           'retired-round-history',
-          () => finalizeRetiredAdvisorRounds(managedStateDir),
+          () => finalizeRetiredAdvisorRounds(managedStateDir, {
+            allowUnverifiedClaudeResidual: true,
+          }),
         )
       }
       rmSync(registrationPath, { force: true })
@@ -9506,33 +9680,75 @@ export async function executeCodexJob(
           if (!finalInput) {
             throw new Error('native advisor history omitted its durable final input')
           }
-          await bestEffortAdvisorVerification(
+          if (!completeAdvisorRounds) {
+            completeAdvisorRounds = await bestEffortAdvisorVerification(
+              'completion-journal-evidence',
+              () => collectNativeAdvisorJournalEvidence({
+                stateDir: managedStateDir,
+                journalRoot: requireManagedDirectory(managedStateDir, join(
+                  managedStateDir,
+                  'advisor-journal',
+                  job.id.replace(/[^A-Za-z0-9._-]/g, '_'),
+                  execution.advisorAttemptNonce,
+                )),
+                jobId: job.id.replace(/[^A-Za-z0-9._-]/g, '_'),
+                contextDigest: execution.advisorContextDigest,
+                attemptNonce: execution.advisorAttemptNonce,
+              }),
+            )
+          }
+          const nativeHistoryVerified = await bestEffortAdvisorVerification(
             'completion-history',
-            () => verifyNativeAdvisorHistoryForPublication({
-              stage: 'complete',
-              reviewRound: 1,
-              input: finalInput!,
-              codexBin,
-              repoPath: job.repoPath,
-              permissionOverrides: execution.advisorPermissionOverrides,
-              attemptNonce: execution.advisorAttemptNonce,
-              parentThreadId: resolvedSessionId,
-              parentSource: completeParentSource ?? execution.parentSource ?? (() => {
-                throw new Error('Codex App Server omitted the parent thread source binding')
-              })(),
-              parentChildBaseline: completeParentChildBaseline ?? execution.parentChildBaseline,
-              parentTurnBaseline: completeParentTurnBaseline ?? execution.parentTurnBaseline,
-              parentTurnIds: [...completeParentTurnIds],
-              seatbeltFingerprint: execution.seatbeltFingerprint,
-            }, completeAdvisorRounds),
+            async () => {
+              await verifyNativeAdvisorHistoryForPublication({
+                stage: 'complete',
+                reviewRound: 1,
+                input: finalInput!,
+                codexBin,
+                repoPath: job.repoPath,
+                permissionOverrides: execution.advisorPermissionOverrides,
+                attemptNonce: execution.advisorAttemptNonce,
+                parentThreadId: resolvedSessionId,
+                parentSource: completeParentSource ?? execution.parentSource ?? (() => {
+                  throw new Error('Codex App Server omitted the parent thread source binding')
+                })(),
+                parentChildBaseline: completeParentChildBaseline ?? execution.parentChildBaseline,
+                parentTurnBaseline: completeParentTurnBaseline ?? execution.parentTurnBaseline,
+                parentTurnIds: [...completeParentTurnIds],
+                seatbeltFingerprint: execution.seatbeltFingerprint,
+              }, completeAdvisorRounds)
+              return true
+            },
+          ) === true
+          const advisorCoverage = collectHostAdvisorCoverage(
+            managedStateDir,
+            job.id,
+            execution.advisorAttemptNonce,
+            nativeHistoryVerified,
           )
-        }
-        result = {
-          sessionId: resolvedSessionId,
-          result: parseCodexResult(execution.stdout, execution.finalMessage),
-          ...(execution.capturedArtifacts.length > 0
-            ? { capturedArtifacts: execution.capturedArtifacts }
-            : {}),
+          result = {
+            sessionId: resolvedSessionId,
+            result: parseCodexResult(execution.stdout, execution.finalMessage),
+            ...(advisorCoverage ? { advisorCoverage } : {}),
+            ...(execution.capturedArtifacts.length > 0
+              ? { capturedArtifacts: execution.capturedArtifacts }
+              : {}),
+          }
+        } else {
+          const advisorCoverage = collectHostAdvisorCoverage(
+            managedStateDir,
+            job.id,
+            execution.advisorAttemptNonce,
+            false,
+          )
+          result = {
+            sessionId: resolvedSessionId,
+            result: parseCodexResult(execution.stdout, execution.finalMessage),
+            ...(advisorCoverage ? { advisorCoverage } : {}),
+            ...(execution.capturedArtifacts.length > 0
+              ? { capturedArtifacts: execution.capturedArtifacts }
+              : {}),
+          }
         }
       } finally {
         // Native-advisor history is queried through short-lived App Server
