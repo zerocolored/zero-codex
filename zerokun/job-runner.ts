@@ -15567,7 +15567,7 @@ function advisorCoverageClause(clause: string): boolean {
     && /(?:レビュー|確認|検証|試行|実施|実行|回答|起動)/u.test(normalized)
 }
 
-const HOST_ADVISOR_COVERAGE_LINE = /^独立レビュー実行記録\(ホスト確認\): (?:完了した実行記録なし（実行済みとは報告しません）|(?:(?:初期設計|最終レビュー)—起動[0-5]\/5・回答[0-5]\/5・起動済み未回答[0-5]\/5・起動未確認[0-5]\/5・起動前利用不能[0-5]\/5)(?:、(?:初期設計|最終レビュー)—起動[0-5]\/5・回答[0-5]\/5・起動済み未回答[0-5]\/5・起動未確認[0-5]\/5・起動前利用不能[0-5]\/5)*)。$/u
+const HOST_ADVISOR_COVERAGE_LINE = /^独立レビュー実行記録\(ホスト確認\): (?:完了した実行記録なし（実行済みとは報告しません）|(?:(?:初期設計|最終レビュー)—起動[0-5]\/5・回答[0-5]\/5・起動済み(?:未回答|回答未確認)[0-5]\/5・起動未確認[0-5]\/5・起動前利用不能[0-5]\/5)(?:、(?:初期設計|最終レビュー)—起動[0-5]\/5・回答[0-5]\/5・起動済み(?:未回答|回答未確認)[0-5]\/5・起動未確認[0-5]\/5・起動前利用不能[0-5]\/5)*)。$/u
 
 function stripModelAuthoredAdvisorCoverage(
   text: string,
@@ -15610,7 +15610,7 @@ function hostAdvisorCoverageLine(coverage?: HostAdvisorCoverage): string {
     .map(value => {
       const label = value.phase === 'investigation' ? '初期設計' : '最終レビュー'
       return `${label}—起動${value.started}/5・回答${value.responsesObtained}/5`
-        + `・起動済み未回答${value.startedNoResponse}/5`
+        + `・起動済み回答未確認${value.startedNoResponse}/5`
         + `・起動未確認${value.startUnconfirmed}/5`
         + `・起動前利用不能${value.unavailableBeforeStart}/5`
     })

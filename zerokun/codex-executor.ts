@@ -94,6 +94,7 @@ import {
   validTerminalNativeAttempts,
 } from './advisor-journal.ts'
 import { summarizeAdvisorSlots } from './advisor-broker.ts'
+import { observeNativeAdvisorCoverage, type NativeAdvisorObservation } from './native-advisor-coverage.ts'
 import {
   advisorRepositoryDigest,
   advisorRepositoryIdentifiers,
@@ -1655,7 +1656,7 @@ export function collectHostAdvisorCoverage(
   stateDirInput: string,
   jobId: string,
   attemptNonce: string,
-  nativeHistoryVerified = false,
+  nativeEvidence: boolean | NativeAdvisorObservation[] = false,
 ): NonNullable<JobExecutionResult['advisorCoverage']> | undefined {
   if (!/^[0-9a-f]{32}$/.test(attemptNonce)) return undefined
   let stateDir: string
@@ -1702,21 +1703,21 @@ export function collectHostAdvisorCoverage(
         || !validTerminalNativeAttempts(journal.native)
         || !validTerminalGrokAttempts(journal.grok)
         || !validTerminalClaudeAttempt(journal.claude)) continue
-      const native = nativeHistoryVerified
-        ? journal.native as Array<Record<string, unknown>>
-        : (journal.native as Array<Record<string, unknown>>).map(value => ({
-            perspective: value.perspective,
-            attempted: true,
-            adopted: false,
-            started: false,
-            reasonDigest: createHash('sha256')
-              .update('native advisor history was not host-verified')
-              .digest('hex'),
-          }))
+      const nativeState = (perspective: 'solution' | 'risk') => {
+        const matches = Array.isArray(nativeEvidence) ? nativeEvidence.filter(value => (
+          value.attemptNonce === attemptNonce && value.inputRevision === inputRevision
+          && value.inputDigest === journal.inputDigest && value.phase === phase
+          && value.round === 1 && value.perspective === perspective
+        )) : []
+        return matches.length === 1 ? matches[0]!.state : 'start-unconfirmed' as const
+      }
       const summary = summarizeAdvisorSlots(
-        native,
+        journal.native as Array<Record<string, unknown>>,
         journal.grok as Array<Record<string, unknown>>,
         journal.claude as Record<string, unknown>,
+        nativeEvidence === true ? undefined : {
+          solution: nativeState('solution'), risk: nativeState('risk'),
+        },
       )
       const candidate: NonNullable<JobExecutionResult['advisorCoverage']>['phases'][number] = {
         phase,
@@ -1943,7 +1944,7 @@ function collectNativeAdvisorJournalEvidence(options: {
       const round = Number(journalMatch[2]) as NativeAdvisorRoundEvidence['round']
       if ((journal.version !== 5 && journal.version !== 6
           && journal.version !== 7 && journal.version !== 8)
-        || !['requested', 'completed', 'required-reviewer-failed', 'stale-input']
+        || !['requested', 'reviewers-completed', 'completed', 'required-reviewer-failed', 'stale-input']
           .includes(String(journal.status))
         || journal.phase !== phase || journal.round !== round
         || journal.contextDigest !== options.contextDigest
@@ -9704,9 +9705,11 @@ export async function executeCodexJob(
               }),
             )
           }
-          const nativeHistoryVerified = await bestEffortAdvisorVerification(
-            'completion-history',
-            async () => {
+          // Coverage asks whether each advisor actually ran and replied, not
+          // whether Codex copied that reply verbatim into a broker argument.
+          // Keep strict adoption checks only for the legacy protocol fixtures.
+          const nativeEvidence = options.nativeAdvisorHistoryFixtureForTesting
+            ? await bestEffortAdvisorVerification('completion-history', async () => {
               await verifyNativeAdvisorHistoryForPublication({
                 stage: 'complete',
                 reviewRound: 1,
@@ -9725,13 +9728,40 @@ export async function executeCodexJob(
                 seatbeltFingerprint: execution.seatbeltFingerprint,
               }, completeAdvisorRounds)
               return true
-            },
-          ) === true
+            }) === true
+            : await bestEffortAdvisorVerification('completion-coverage', async () => {
+              const overrides = nativeAdvisorHistoryPermissionOverrides(execution.advisorPermissionOverrides)
+              const observations = await observeNativeAdvisorCoverage({
+                attemptNonce: execution.advisorAttemptNonce,
+                parentThreadId: resolvedSessionId,
+                repoPath: job.repoPath,
+                parentChildBaseline: completeParentChildBaseline ?? execution.parentChildBaseline,
+                rounds: completeAdvisorRounds ?? [],
+                read: (method, params) => bestEffortAdvisorVerification(`coverage-${method}`, () => (
+                  readCodexAppServer(codexBin, job.repoPath, overrides, method,
+                    buildCodexChildEnvironment(), {
+                      params, signal: options.signal, timeoutMs: 15_000,
+                      seatbeltFingerprint: execution.seatbeltFingerprint,
+                      seatbeltStateDir: managedStateDir,
+                    })
+                )),
+              })
+              // Keep source IDs/digests for later diagnosis without copying
+              // private response text. Storage failure never changes counts.
+              await bestEffortAdvisorVerification('coverage-record', () => {
+                const root = ensureManagedDirectory(managedStateDir, join(managedStateDir,
+                  'advisor-observations', job.id.replace(/[^A-Za-z0-9._-]/g, '_')))
+                atomicWritePrivateFile(join(root, `${execution.advisorAttemptNonce}.json`), JSON.stringify({
+                  version: 1, observedAt: Date.now(), parentThreadId: resolvedSessionId, observations,
+                }))
+              })
+              return observations
+            })
           const advisorCoverage = collectHostAdvisorCoverage(
             managedStateDir,
             job.id,
             execution.advisorAttemptNonce,
-            nativeHistoryVerified,
+            nativeEvidence ?? false,
           )
           result = {
             sessionId: resolvedSessionId,

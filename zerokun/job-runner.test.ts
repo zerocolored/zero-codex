@@ -11523,7 +11523,7 @@ describe('Slack output guard', () => {
     expect(finalized.result).toContain('検討結果は問題ありません。')
     expect(finalized.result).toContain(
       '独立レビュー実行記録(ホスト確認): 初期設計—起動2/5・回答2/5'
-        + '・起動済み未回答0/5・起動未確認2/5・起動前利用不能1/5。',
+        + '・起動済み回答未確認0/5・起動未確認2/5・起動前利用不能1/5。',
     )
     expect(finalized).not.toHaveProperty('advisorCoverage')
     store.close()
@@ -11614,7 +11614,7 @@ describe('Slack output guard', () => {
     expect(finalized.result.length).toBeLessThanOrEqual(12_000)
     expect(finalized.result).toEndWith(
       '独立レビュー実行記録(ホスト確認): 最終レビュー—起動4/5・回答3/5'
-        + '・起動済み未回答1/5・起動未確認1/5・起動前利用不能0/5。',
+        + '・起動済み回答未確認1/5・起動未確認1/5・起動前利用不能0/5。',
     )
     store.close()
   })
@@ -11642,6 +11642,12 @@ describe('Slack output guard', () => {
         + '・起動未確認2/5・起動前利用不能1/5。',
     )
     expect(posted[0]).toContain('独立レビュー実行記録(ホスト確認)')
+    posted.length = 0
+    const observed = '回答本文です。\n\n独立レビュー実行記録(ホスト確認): '
+      + '初期設計—起動5/5・回答4/5・起動済み回答未確認1/5'
+      + '・起動未確認0/5・起動前利用不能0/5。'
+    await notifier.completed(store.get(queued.id) ?? running, observed)
+    expect(posted).toEqual([observed])
     store.close()
   })
 
