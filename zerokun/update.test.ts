@@ -2421,7 +2421,7 @@ describe('Codex branch self update', () => {
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
     expect(existsSync(fixture.setupMarker)).toBe(true)
     expect(readFileSync(forwardObserved, 'utf8')).toBe('before-forward\n')
-  })
+  }, 15_000)
 
   test('forward setupがtracked差分を残せばjournalとユーザー差分を保持する', () => {
     const fixture = updaterFixture()

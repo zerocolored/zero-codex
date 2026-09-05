@@ -94,6 +94,24 @@ describe('public Codex defaults', () => {
     }
   })
 
+  test('公開CIはchannel route SQLite suiteをfresh Bun processへ分離する', () => {
+    const verify = readFileSync(join(import.meta.dir, 'verify.sh'), 'utf8')
+    const exclusion = verify.indexOf(
+      'if [[ "$test_file" != "zerokun/project-channel-config.test.ts" ]]',
+    )
+    const mainSuite = verify.indexOf(
+      'bun test --isolate --no-orphans "${full_suite_tests[@]}"',
+      exclusion,
+    )
+    const isolatedSuite = verify.indexOf(
+      'bun test --isolate --no-orphans zerokun/project-channel-config.test.ts',
+      mainSuite,
+    )
+    expect(exclusion).toBeGreaterThan(0)
+    expect(mainSuite).toBeGreaterThan(exclusion)
+    expect(isolatedSuite).toBeGreaterThan(mainSuite)
+  })
+
   test('認証済みlive検証も本番と同じMCP隔離結果だけでApp Serverを起動する', () => {
     const liveCheck = readFileSync(join(import.meta.dir, 'live-codex-permission-check.ts'), 'utf8')
     const build = liveCheck.indexOf('const baseOverrides = buildCodexPermissionOverrides(')

@@ -277,7 +277,22 @@ else
   # Process-heavy fixtures intentionally exercise detached children and
   # generation-safe cleanup. Keep each file's globals/handles isolated and
   # make the test runner reap only its own descendants when it exits.
-  bun test --isolate --no-orphans
+  # Keep the project-channel SQLite/process-lock suite in a fresh Bun process.
+  # On GitHub's macOS runner, running it after the process-heavy suite in the
+  # same long-lived Bun process can leave the next SQLite fixture waiting even
+  # though the same file completes in seconds on its own.
+  full_suite_tests=()
+  while IFS= read -r test_file; do
+    if [[ "$test_file" != "zerokun/project-channel-config.test.ts" ]]; then
+      full_suite_tests+=("$test_file")
+    fi
+  done < <(git ls-files -- '*test.ts')
+  if [[ ${#full_suite_tests[@]} -eq 0 ]]; then
+    echo 'error: full test suite is empty' >&2
+    exit 1
+  fi
+  bun test --isolate --no-orphans "${full_suite_tests[@]}"
+  bun test --isolate --no-orphans zerokun/project-channel-config.test.ts
 fi
 bun run typecheck
 
