@@ -305,11 +305,11 @@ describe('native advisor App Server history', () => {
     expect(calls).toEqual([
       {
         threadId: 'parent-thread', cursor: null, limit: 100,
-        sortDirection: 'asc', itemsView: 'full',
+        sortDirection: 'asc', itemsView: 'notLoaded',
       },
       {
         threadId: 'parent-thread', cursor: 'page-2', limit: 100,
-        sortDirection: 'asc', itemsView: 'full',
+        sortDirection: 'asc', itemsView: 'notLoaded',
       },
     ])
   })

@@ -518,6 +518,10 @@ export class CodexAppServerSession {
   private readonly decoder = new TextDecoder('utf-8', { fatal: true })
   private buffer = ''
   private readerFailure: unknown
+  private signalReaderFailure!: (error: unknown) => void
+  private readonly readerFailureSignal = new Promise<unknown>(resolve => {
+    this.signalReaderFailure = resolve
+  })
   private readerClosed = false
   private inputClosed = false
   private itemsListState: 'unknown' | 'supported' | 'unsupported' = 'unknown'
@@ -802,26 +806,49 @@ export class CodexAppServerSession {
   }
 
   private async readLoop(): Promise<void> {
+    const fail = (error: unknown): void => {
+      this.readerFailure ??= error ?? new AppServerProtocolError('App Server output failed')
+      this.signalReaderFailure(this.readerFailure)
+      this.buffer = ''
+      // Notify the owner before EOF so it can terminate the server. Keep
+      // consuming its pipe below: releasing the reader here can backpressure
+      // the supervisor, preventing the very cleanup that the owner awaits.
+      this.rejectPending(this.readerFailure)
+      this.wakeNotificationWaiters()
+    }
     try {
       while (true) {
         const chunk = await this.reader.read()
         if (chunk.done) break
-        this.options.onOutputChunk?.(chunk.value)
-        this.buffer += this.decoder.decode(chunk.value, { stream: true })
-        if (this.buffer.length > MAX_JSON_LINE_CHARS) {
-          throw new AppServerProtocolError('App Server emitted an oversized JSON line')
-        }
-        const lines = this.buffer.split(/\r?\n/)
-        this.buffer = lines.pop() ?? ''
-        for (const line of lines) {
-          if (!line.trim()) continue
-          this.consumeLine(line)
+        if (this.readerFailure !== undefined) continue
+        try {
+          this.options.onOutputChunk?.(chunk.value)
+          const text = this.decoder.decode(chunk.value, { stream: true })
+          let start = 0
+          let end: number
+          while ((end = text.indexOf('\n', start)) !== -1) {
+            if (this.buffer.length + end - start > MAX_JSON_LINE_CHARS) {
+              throw new AppServerProtocolError('App Server emitted an oversized JSON line')
+            }
+            const line = this.buffer + text.slice(start, end)
+            this.buffer = ''
+            if (line.trim()) this.consumeLine(line)
+            start = end + 1
+          }
+          if (this.buffer.length + text.length - start > MAX_JSON_LINE_CHARS) {
+            throw new AppServerProtocolError('App Server emitted an oversized JSON line')
+          }
+          this.buffer += text.slice(start)
+        } catch (error) {
+          fail(error)
         }
       }
-      this.buffer += this.decoder.decode()
-      if (this.buffer.trim()) this.consumeLine(this.buffer)
+      if (this.readerFailure === undefined) {
+        this.buffer += this.decoder.decode()
+        if (this.buffer.trim()) this.consumeLine(this.buffer)
+      }
     } catch (error) {
-      this.readerFailure = error
+      fail(error)
     } finally {
       this.readerClosed = true
       this.rejectPending(this.readerFailure ?? 'stdout closed')
@@ -1005,7 +1032,11 @@ export class CodexAppServerSession {
     params: Record<string, unknown>,
     timeoutMs = 30_000,
   ): Promise<AppServerThreadHandshake> {
-    const response = await this.request('thread/resume', params, { timeoutMs })
+    // Resume the same durable model context, but do not serialize its entire
+    // transcript into one JSON response. History reads are paginated separately.
+    const response = await this.request('thread/resume', {
+      ...params, excludeTurns: true,
+    }, { timeoutMs })
     const handshake = this.threadHandshake('thread/resume', response.result, params)
     this.controlledThreadIds.add(handshake.threadId)
     return handshake
@@ -1563,6 +1594,11 @@ export class CodexAppServerSession {
     if (this.inputClosed) return
     this.inputClosed = true
     this.input.end?.()
+  }
+
+  /** Failure notification is independent of EOF, including after turn completion. */
+  waitForReaderFailure(): Promise<unknown> {
+    return this.readerFailureSignal
   }
 
   async waitForReader(): Promise<void> {
