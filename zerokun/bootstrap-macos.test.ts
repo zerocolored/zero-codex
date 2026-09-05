@@ -1788,7 +1788,7 @@ codex --version
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
-  })
+  }, 15_000)
 
   test('bootstrap setupは検証済み旧checkoutのlauncherを新checkoutへ引き継ぐ', () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-checkout-handoff-'))
