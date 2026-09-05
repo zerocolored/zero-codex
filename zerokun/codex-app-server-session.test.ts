@@ -54,6 +54,107 @@ function mockTransport(
 }
 
 describe('Codex App Server session', () => {
+  test('長い会話のresumeは履歴本体の返却だけを省略し同じthreadへ接続する', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'zero-resume-metadata-'))
+    const transport = mockTransport((request, emit) => {
+      if (request.method !== 'thread/resume') return
+      emit({ id: request.id, result: {
+        thread: {
+          id: 'existing-thread', cwd: repo, source: 'appServer', modelProvider: 'openai',
+          status: { type: 'idle' }, canAcceptDirectInput: true, turns: [],
+        },
+        model: 'gpt-test', modelProvider: 'openai', cwd: repo, approvalPolicy: 'never',
+        activePermissionProfile: { id: 'profile-1', extends: null }, instructionSources: [],
+      } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    try {
+      const result = await session.resumeThread({
+        threadId: 'existing-thread', cwd: repo, permissions: 'profile-1',
+        approvalPolicy: 'never', model: 'gpt-test', excludeTurns: false,
+      })
+      expect(result.threadId).toBe('existing-thread')
+      expect(transport.sent).toHaveLength(1)
+      expect(transport.sent[0]).toMatchObject({ method: 'thread/resume', params: {
+        threadId: 'existing-thread', excludeTurns: true, cwd: repo, permissions: 'profile-1',
+      } })
+    } finally {
+      session.closeInput()
+      await session.waitForReader()
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  for (const failure of ['oversized', 'malformed', 'utf8', 'output-callback', 'notification-callback']) {
+    test(`受信異常(${failure})はEOF前に通知し残りのpipeを解析せず排出する`, async () => {
+      const encoder = new TextEncoder()
+      let releaseDrain!: () => void
+      const drainGate = new Promise<void>(resolve => { releaseDrain = resolve })
+      let pulls = 0
+      let observedChunks = 0
+      let observedNotifications = 0
+      const notification = encoder.encode('{"method":"ignored","params":{}}\n')
+      const bad = failure === 'oversized'
+        ? encoder.encode(`{"id":1,"result":{"history":"${'x'.repeat(32 * 1024 * 1024)}"}}\n`)
+        : failure === 'malformed' ? encoder.encode('{broken\n')
+          : failure === 'utf8' ? new Uint8Array([0xff]) : notification
+      const stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          pulls += 1
+          if (pulls === 1) controller.enqueue(bad)
+          else if (pulls === 2) { await drainGate; controller.enqueue(notification) }
+          else controller.close()
+        },
+      }, { highWaterMark: 0 })
+      const session = new CodexAppServerSession({ write() {}, end() {} }, stream, {
+        onOutputChunk() {
+          observedChunks += 1
+          if (failure === 'output-callback') throw new Error('output persistence failed')
+        },
+        onNotification() {
+          observedNotifications += 1
+          if (failure === 'notification-callback') throw new Error('notification failed')
+        },
+      })
+      try {
+        // EOF is withheld until the request has already failed. Waiting for
+        // drain before rejecting would deadlock the supervisor's termination.
+        const requestError = await session.request('thread/read', {}, { timeoutMs: 1000 })
+          .catch(error => error)
+        expect(requestError).toBeInstanceOf(AppServerAmbiguousRequestError)
+        const readerError = await session.waitForReaderFailure()
+        expect(String(requestError)).toContain(String(readerError))
+        expect(String(requestError)).not.toContain('timed out')
+        releaseDrain()
+        await expect(session.waitForReader()).rejects.toThrow()
+        expect(pulls).toBe(3)
+        expect(observedChunks).toBe(1)
+        expect(observedNotifications).toBe(failure === 'notification-callback' ? 1 : 0)
+      } finally {
+        releaseDrain()
+        session.closeInput()
+        if (!stream.locked) await stream.cancel()
+      }
+    }, 5000)
+  }
+
+  test('同じchunkの複数JSON行は合計32MiB超でも行ごとの上限で処理する', async () => {
+    const line = `${JSON.stringify({ method: 'history/metadata', params: {
+      text: 'x'.repeat(9 * 1024 * 1024),
+    } })}\r\n`
+    const batch = new TextEncoder().encode(line.repeat(4))
+    let notifications = 0
+    const output = new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(batch)
+      controller.close()
+    } })
+    const session = new CodexAppServerSession({ write() {} }, output, {
+      onNotification() { notifications += 1 },
+    })
+    await session.waitForReader()
+    expect(notifications).toBe(4)
+  })
+
   test('公式v2 SessionSourceをhandshakeと履歴照合で共通解釈する', () => {
     expect(parseAppServerSessionSource('appServer')).toBe('appServer')
     expect(parseAppServerSessionSource({ custom: 'zerochan' })).toEqual({ custom: 'zerochan' })

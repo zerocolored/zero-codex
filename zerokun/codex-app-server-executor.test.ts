@@ -15,7 +15,9 @@ import { homedir } from 'os'
 import { dirname, join } from 'path'
 import {
   JobStore,
+  createExecutorPidLifecycle,
   publishStagedGitHubPublication,
+  runQueuedJobs,
   type JobRecord,
 } from './job-runner.ts'
 import {
@@ -289,6 +291,8 @@ import time
 mode = os.environ.get("ZERO_FIXTURE_MODE", "normal")
 if mode in ("interrupt-no-terminal-forced", "late-error-after-complete"):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
+if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1":
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
 if mode == "logical-stop-required":
     def logical_stop(_signum, _frame):
         with open(os.environ["ZERO_LOGICAL_STOP_MARKER"], "w", encoding="utf-8") as stream:
@@ -348,7 +352,7 @@ for line in sys.stdin:
     if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId")}, ensure_ascii=False) + "\\n")
+            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns")}, ensure_ascii=False) + "\\n")
     if method == "initialized":
         continue
     if method == "initialize":
@@ -360,6 +364,9 @@ for line in sys.stdin:
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
     elif method in ("thread/start", "thread/resume"):
         params = value.get("params", {})
+        if method == "thread/resume" and (os.environ.get("ZERO_FORCE_OVERSIZED_RESUME") == "1" or (os.environ.get("ZERO_LARGE_RESUME_HISTORY") == "1" and params.get("excludeTurns") is not True)):
+            emit({"id": request_id, "result": {"thread": {"turns": [{"history": "x" * (33 * 1024 * 1024)}]}}})
+            continue
         if mode == "missing-session-resume" and method == "thread/resume" and params.get("threadId") == "thread-provider-missing":
             emit({"id": request_id, "error": {"code": -32001, "message": "thread not found"}})
             continue
@@ -658,6 +665,12 @@ for line in sys.stdin:
             if mode == "late-error-after-complete":
                 time.sleep(0.2)
                 emit(late_error)
+            if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1":
+                time.sleep(0.3)
+                sys.stdout.write("{broken JSON\\n")
+                sys.stdout.flush()
+                while True:
+                    time.sleep(1)
         elif mode in ("defer", "terminal-race") and turn_id == "turn-app-server-2":
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "次ターンで追加入力を反映しました"}], "error": None}}})
         elif mode in ("failed-steer", "failed-turn"):
@@ -2223,6 +2236,30 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 15_000)
 
+  test('terminal受理後の遅延parse異常もEOFを待たずTERM無視processを回収する', async () => {
+    const value = fixture('normal')
+    const processIds: number[] = []
+    try {
+      const error = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable,
+        logDir: value.logDir,
+        stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'normal', ZERO_LATE_PARSE_FAILURE: '1' },
+        onProcessId: pid => { processIds.push(pid) },
+        liveControls: value.hooks,
+      }).catch(error => error)
+      expect(error).toBeInstanceOf(Error)
+      expect(error).not.toBeInstanceOf(CodexCleanupPendingError)
+      expect(String(error)).toContain('JSON')
+      expect(processIds).toHaveLength(1)
+      expect(() => process.kill(processIds[0]!, 0)).toThrow()
+      expect(existsSync(join(value.state, 'executors', `${value.job.id}.json`))).toBe(false)
+    } finally {
+      value.store.close()
+    }
+  }, 15_000)
+
   test('failed turnの安全な監視表示を例外経路でもflushする', async () => {
     const value = fixture('failed-turn')
     const monitorMessages: string[] = []
@@ -2406,6 +2443,7 @@ describe('production App Server executor', () => {
         ZERO_PROMPT_LOG: promptLog,
         ZERO_RPC_LOG: rpcLog,
         ZERO_LOG_HANDSHAKES: '1',
+        ZERO_LARGE_RESUME_HISTORY: '1',
       },
       onProcessId: processId => { processIds.push(processId) },
       liveControls: value.hooks,
@@ -2423,6 +2461,7 @@ describe('production App Server executor', () => {
       .map(line => JSON.parse(line) as { method: string })
     expect(rpc.filter(entry => entry.method === 'thread/start')).toHaveLength(0)
     expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(1)
+    expect(rpc.find(entry => entry.method === 'thread/resume')).toMatchObject({ excludeTurns: true })
     expect(rpc.filter(entry => entry.method === 'turn/start')).toHaveLength(1)
     const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
       .map(line => JSON.parse(line) as { stage: string; text: string })
@@ -2434,6 +2473,82 @@ describe('production App Server executor', () => {
     expect(prompts[0]?.text).not.toContain('Prior Slack thread history')
     value.store.close()
   }, 15_000)
+
+  test('巨大な再開応答でもsupervisorを回収し、同じworkerで次のFIFO jobを完了する', async () => {
+    const value = fixture('phased-native-history-resume')
+    const firstId = value.job.id
+    expect(value.store.releaseUnstartedClaim(
+      firstId, value.job.workerId!, 'return fixture claim before worker run',
+    )).toBe(true)
+    const second = value.store.enqueue({
+      chatId: value.job.chatId,
+      threadTs: '1800000000.000300',
+      messageId: '1800000000.000300',
+      userId: 'UROOT',
+      repoPath: value.repo,
+      task: '次の依頼',
+      writeEnabled: false,
+    }).job
+    const executed: string[] = []
+    const processIds: number[] = []
+    let firstError: unknown
+    try {
+      const stats = await runQueuedJobs({
+        store: value.store,
+        maxJobsPerSession: 5,
+        pollMs: 1,
+        stopWhenIdle: true,
+        executorStagesResult: true,
+        openJobMonitor: async current => {
+          value.store.beginMonitorPreparation(current.id, current.workerId!)
+          value.store.commitMonitorRequired(current.id, current.workerId!)
+        },
+        executor: async (current, signal) => {
+          executed.push(current.id)
+          Object.assign(value.job, current)
+          try {
+            const lifecycle = createExecutorPidLifecycle(value.store, current.id)
+            return await executeCodexJob(current, {
+              codexBinForTesting: value.executable,
+              logDir: value.logDir,
+              stateDir: value.state,
+              skipEffectiveConfigCheck: true,
+              extraEnvironment: {
+                ZERO_FIXTURE_MODE: 'normal',
+                ZERO_FORCE_OVERSIZED_RESUME: current.id === firstId ? '1' : '0',
+              },
+              ...lifecycle,
+              onProcessId: pid => { processIds.push(pid); lifecycle.onProcessId(pid) },
+              liveControls: value.hooks,
+              signal,
+            })
+          } catch (error) {
+            if (current.id === firstId) firstError = error
+            throw error
+          }
+        },
+      })
+      expect(stats).toEqual({ completed: 1, failed: 1, workersStarted: 1 })
+      expect(executed).toEqual([firstId, second.id])
+      expect(firstError).not.toBeInstanceOf(CodexCleanupPendingError)
+      expect(String(firstError)).toContain('oversized JSON line')
+      expect(value.store.get(firstId)).toMatchObject({
+        status: 'failed', terminalOutcome: 'failed', executorPid: null,
+      })
+      expect(value.store.get(second.id)?.status).toBe('completed')
+      expect(processIds).toHaveLength(2)
+      for (const pid of processIds) expect(() => process.kill(pid, 0)).toThrow()
+      for (const id of [firstId, second.id]) {
+        expect(existsSync(join(value.state, 'executors', `${id}.json`))).toBe(false)
+      }
+      const errorLog = readFileSync(join(value.logDir, `${firstId}.resume.stderr.log`), 'utf8')
+      expect(errorLog).toContain('zero-app-server-error')
+      expect(errorLog).toContain('oversized JSON line')
+      expect(errorLog).not.toContain('Codex output relay remained open')
+    } finally {
+      value.store.close()
+    }
+  }, 30_000)
 
   test('write jobを同じthreadの別RO→RW→ROプロセスで完了する', async () => {
     const value = fixture('phased-publication', true)
@@ -4542,6 +4657,8 @@ describe('production App Server executor', () => {
         ZERO_PROMPT_LOG: promptLog,
         ZERO_PHASE_LOG: phaseLog,
         ZERO_RPC_LOG: rpcLog,
+        ZERO_LOG_HANDSHAKES: '1',
+        ZERO_LARGE_RESUME_HISTORY: '1',
       },
       liveControls: value.hooks,
     })
@@ -4590,6 +4707,10 @@ describe('production App Server executor', () => {
       .map(line => JSON.parse(line) as { method: string })
     expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(3)
     expect(rpc.filter(row => row.method === 'turn/steer')).toHaveLength(1)
+    expect(rpc.filter(row => row.method === 'thread/resume')).toEqual([
+      expect.objectContaining({ excludeTurns: true }),
+      expect.objectContaining({ excludeTurns: true }),
+    ])
     value.store.close()
   }, 30_000)
 

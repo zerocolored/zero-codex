@@ -95,6 +95,7 @@ import {
 } from './advisor-journal.ts'
 import { summarizeAdvisorSlots } from './advisor-broker.ts'
 import { observeNativeAdvisorCoverage, type NativeAdvisorObservation } from './native-advisor-coverage.ts'
+import { redactCredentialMaterial } from './public-output-guard.ts'
 import {
   advisorRepositoryDigest,
   advisorRepositoryIdentifiers,
@@ -2434,7 +2435,9 @@ export async function captureNativeAdvisorParentTurnBaseline(
       cursor,
       limit: 100,
       sortDirection: 'asc',
-      itemsView: 'full',
+      // The baseline only needs turn identity/status, not every historical
+      // command output. Fetch individual items later when evidence needs them.
+      itemsView: 'notLoaded',
     }, { timeoutMs: 15_000 })).result
     if (!Array.isArray(page.data)) {
       throw new Error('native advisor pre-turn parent history page is invalid')
@@ -7618,17 +7621,21 @@ export async function executeCodexJob(
       if (userCancelled) terminateForCancellation()
 
       let processOutcome: { kind: 'exit', exitCode: number } | 'cleanup' | {
-        kind: 'reader-closed'
+        kind: 'reader-closed' | 'reader-failed'
         error: unknown | null
       } = await Promise.race([
         proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
         forcedCleanup,
+        session.waitForReaderFailure().then(error => ({
+          kind: 'reader-failed' as const, error,
+        })),
         session.waitForReader().then(
           () => ({ kind: 'reader-closed' as const, error: null }),
           error => ({ kind: 'reader-closed' as const, error }),
         ),
       ])
-      if (typeof processOutcome === 'object' && processOutcome.kind === 'reader-closed') {
+      if (typeof processOutcome === 'object'
+        && (processOutcome.kind === 'reader-closed' || processOutcome.kind === 'reader-failed')) {
         let outputCloseError = processOutcome.error
         let outputClosePhase: unknown
         try {
@@ -7753,6 +7760,21 @@ export async function executeCodexJob(
       protocolError ??= lateProtocolError
       if (protocolError && !userCancelled) {
         const detail = protocolError instanceof Error ? protocolError.message : String(protocolError)
+        // stdout may already have reached its persistence cap (especially for
+        // legacy full-history responses). Persist the original bounded cause
+        // after the stderr relay has closed, before cleanup classification can
+        // replace the public failure with a more general message.
+        try {
+          const descriptor = openSafeLog(stderrPath, 'append')
+          try {
+            writeSync(descriptor, `${JSON.stringify({
+              type: 'zero-app-server-error', stage,
+              message: redactCredentialMaterial(detail.slice(0, MAX_FAILURE_CHARS), '[redacted]'),
+            })}\n`)
+          } finally { closeSync(descriptor) }
+        } catch {
+          process.stderr.write('zerochan: original App Server error could not be persisted\n')
+        }
         stdoutTail = `${stdoutTail}\n${JSON.stringify({
           type: 'error', message: detail,
         })}\n`.slice(-MAX_LOG_TAIL_CHARS)
