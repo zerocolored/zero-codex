@@ -1405,16 +1405,10 @@ export function assertSafeLocalGitConfig(
     }
   }
   requireOnly('remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*')
-  const configuredBranches = new Set<string>()
-  for (const entry of entries) {
-    const key = entry.split(/\n|=/, 1)[0] ?? ''
-    const match = /^branch\.(.+)\.(?:remote|merge)$/i.exec(key)
-    if (match) configuredBranches.add(match[1]!)
-  }
-  for (const branch of configuredBranches) {
-    requireOnly(`branch.${branch}.remote`, 'origin')
-    requireOnly(`branch.${branch}.merge`, `refs/heads/${branch}`)
-  }
+  // The updater always names the target remote and ref explicitly. Tracking
+  // metadata for unrelated local branches is inert here and may legitimately
+  // point at a differently named base branch (for example a feature branch
+  // created from origin/main), so only validate the branch being updated.
   const branchRemoteKey = `branch.${repo.branch}.remote`
   const branchMergeKey = `branch.${repo.branch}.merge`
   const hasTracking = values(branchRemoteKey).length > 0 || values(branchMergeKey).length > 0

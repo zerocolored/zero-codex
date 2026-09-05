@@ -1864,6 +1864,33 @@ describe('Codex branch self update', () => {
     expect(existsSync(marker)).toBe(false)
   })
 
+  test('無関係なfeature branchがbase branchを追跡していても更新できる', () => {
+    const fixture = updaterFixture()
+    must(['git', 'branch', '--track', 'feature/review', 'origin/codex'], fixture.repo.local)
+    expect(must([
+      'git', 'config', '--local', 'branch.feature/review.merge',
+    ], fixture.repo.local)).toBe('refs/heads/codex')
+
+    const result = runUpdater(fixture)
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v2\n')
+  })
+
+  test('更新対象branchの追跡先不一致は引き続き拒否する', () => {
+    const fixture = updaterFixture()
+    must([
+      'git', 'config', '--local', 'branch.codex.merge', 'refs/heads/main',
+    ], fixture.repo.local)
+
+    const result = runUpdater(fixture)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr.toString()).toContain(
+      'local Git configが安全な値ではありません: branch.codex.merge',
+    )
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
+    expect(existsSync(fixture.setupMarker)).toBe(false)
+  })
+
   test('include経由filterとHTTP proxy設定をorigin fetch前に拒否する', () => {
     for (const mode of ['include-filter', 'http-proxy']) {
       const fixture = updaterFixture()
