@@ -94,22 +94,32 @@ describe('public Codex defaults', () => {
     }
   })
 
-  test('公開CIはchannel route SQLite suiteをfresh Bun processへ分離する', () => {
+  test('公開CIはprocess-sensitive suiteをfresh Bun processへ分離する', () => {
     const verify = readFileSync(join(import.meta.dir, 'verify.sh'), 'utf8')
-    const exclusion = verify.indexOf(
-      'if [[ "$test_file" != "zerokun/project-channel-config.test.ts" ]]',
+    const githubExclusion = verify.indexOf(
+      '"$test_file" != "zerokun/github-credential-broker.test.ts"',
+    )
+    const channelExclusion = verify.indexOf(
+      '"$test_file" != "zerokun/project-channel-config.test.ts"',
+      githubExclusion,
     )
     const mainSuite = verify.indexOf(
       'bun test --isolate --no-orphans "${full_suite_tests[@]}"',
-      exclusion,
+      channelExclusion,
     )
-    const isolatedSuite = verify.indexOf(
-      'bun test --isolate --no-orphans zerokun/project-channel-config.test.ts',
+    const isolatedGithubSuite = verify.indexOf(
+      'bun test --isolate --no-orphans zerokun/github-credential-broker.test.ts',
       mainSuite,
     )
-    expect(exclusion).toBeGreaterThan(0)
-    expect(mainSuite).toBeGreaterThan(exclusion)
-    expect(isolatedSuite).toBeGreaterThan(mainSuite)
+    const isolatedChannelSuite = verify.indexOf(
+      'bun test --isolate --no-orphans zerokun/project-channel-config.test.ts',
+      isolatedGithubSuite,
+    )
+    expect(githubExclusion).toBeGreaterThan(0)
+    expect(channelExclusion).toBeGreaterThan(githubExclusion)
+    expect(mainSuite).toBeGreaterThan(channelExclusion)
+    expect(isolatedGithubSuite).toBeGreaterThan(mainSuite)
+    expect(isolatedChannelSuite).toBeGreaterThan(isolatedGithubSuite)
   })
 
   test('認証済みlive検証も本番と同じMCP隔離結果だけでApp Serverを起動する', () => {
