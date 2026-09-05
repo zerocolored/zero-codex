@@ -1209,6 +1209,7 @@ export function summarizeAdvisorSlots(
   native: ReadonlyArray<Record<string, unknown>>,
   grok: ReadonlyArray<Record<string, unknown>>,
   claude: Record<string, unknown>,
+  nativeStates?: Partial<Record<'solution' | 'risk', AdvisorExecutionState>>,
 ): {
   total: 5
   started: number
@@ -1225,8 +1226,8 @@ export function summarizeAdvisorSlots(
     grok.find(value => value.perspective === perspective) ?? {}
   )
   const slots = [
-    { slot: 'codex-solution', state: advisorExecutionState(nativeFor('solution'), 'native') },
-    { slot: 'codex-risk', state: advisorExecutionState(nativeFor('risk'), 'native') },
+    { slot: 'codex-solution', state: nativeStates?.solution ?? advisorExecutionState(nativeFor('solution'), 'native') },
+    { slot: 'codex-risk', state: nativeStates?.risk ?? advisorExecutionState(nativeFor('risk'), 'native') },
     { slot: 'grok-solution', state: advisorExecutionState(grokFor('solution'), 'grok') },
     { slot: 'grok-risk', state: advisorExecutionState(grokFor('risk'), 'grok') },
     { slot: 'claude', state: advisorExecutionState(claude, 'claude') },

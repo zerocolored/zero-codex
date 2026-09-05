@@ -1354,11 +1354,11 @@ describe('production App Server executor', () => {
       phases: [
         {
           phase: 'investigation', inputRevision: 1,
-          total: 5, started: 1, responsesObtained: 1, unavailableBeforeStart: 4,
+          total: 5, started: 1, responsesObtained: 1, startUnconfirmed: 2, unavailableBeforeStart: 2,
         },
         {
           phase: 'review', inputRevision: 2,
-          total: 5, started: 1, responsesObtained: 1, unavailableBeforeStart: 4,
+          total: 5, started: 1, responsesObtained: 1, startUnconfirmed: 2, unavailableBeforeStart: 2,
         },
       ],
     })
@@ -1377,6 +1377,31 @@ describe('production App Server executor', () => {
         },
       ],
     })
+
+    const observed = (['solution', 'risk'] as const).map(perspective => ({
+      attemptNonce: nonce, inputRevision: 1, inputDigest: digest('b'),
+      phase: 'investigation' as const, round: 1 as const, perspective,
+      state: 'response-obtained' as const, threadId: `${perspective}-physical-thread`,
+      responseDigest: digest('f'),
+    }))
+    for (const status of ['reviewers-completed', 'completed']) {
+      writeFileSync(join(revisionRoot, 'investigation-1.json'), JSON.stringify({
+        ...initialJournal, status,
+      }), { mode: 0o600 })
+      const coverage = collectHostAdvisorCoverage(state, jobId, nonce, observed)!
+      expect(coverage.phases[0]).toMatchObject({
+        phase: 'investigation', started: 3, responsesObtained: 3, startUnconfirmed: 0,
+      })
+      // The same two observations must not leak into the final-review revision.
+      expect(coverage.phases[1]).toMatchObject({
+        phase: 'review', started: 1, responsesObtained: 1, startUnconfirmed: 2,
+      })
+    }
+    expect(collectHostAdvisorCoverage(state, jobId, nonce, observed.slice(1))!.phases[0])
+      .toMatchObject({ started: 2, responsesObtained: 2, startUnconfirmed: 1, unavailableBeforeStart: 2 })
+    expect(collectHostAdvisorCoverage(state, jobId, nonce, observed.map(value => ({
+      ...value, attemptNonce: 'e'.repeat(32),
+    })))!.phases[0]).toMatchObject({ started: 1, responsesObtained: 1, startUnconfirmed: 2 })
   })
 
   test('完了済みPRの同thread公開依頼は調査・設計を再実行せず直接promotionへ進む', async () => {

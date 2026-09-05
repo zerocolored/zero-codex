@@ -186,6 +186,7 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     zerokun/herdr-runtime.test.ts \
     zerokun/herdr-job-monitor.test.ts \
     zerokun/native-advisor-evidence.test.ts \
+    zerokun/native-advisor-coverage.test.ts \
     zerokun/codex-app-server-capability.test.ts \
     zerokun/codex-app-server-session.test.ts \
     zerokun/seatbelt-fingerprint.test.ts \
