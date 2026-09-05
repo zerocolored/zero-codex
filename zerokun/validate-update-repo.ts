@@ -63,20 +63,16 @@ function validateLocalConfig(repo: string, branch: string): void {
     /^branch\..+\.(?:remote|merge)$/i,
     /^user\.(?:name|email)$/i,
   ]
-  const branches = new Set<string>()
   for (const entry of entries) {
     const key = entry.split(/\n|=/, 1)[0] ?? ''
     if (!allow.some(pattern => pattern.test(key))) {
       throw new Error(`local Git config contains disallowed key: ${key}`)
     }
-    const match = /^branch\.(.+)\.(?:remote|merge)$/i.exec(key)
-    if (match) branches.add(match[1]!)
   }
   requireOnly(repo, 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*')
-  for (const name of branches) {
-    requireOnly(repo, `branch.${name}.remote`, 'origin')
-    requireOnly(repo, `branch.${name}.merge`, `refs/heads/${name}`)
-  }
+  // Bootstrap/update commands use an explicit origin and target ref. An
+  // unrelated feature branch may safely track a differently named base branch.
+  // Its inert tracking metadata must not prevent validating the target branch.
   const hasTargetTracking = values(repo, `branch.${branch}.remote`).length > 0
     || values(repo, `branch.${branch}.merge`).length > 0
   if (hasTargetTracking) {

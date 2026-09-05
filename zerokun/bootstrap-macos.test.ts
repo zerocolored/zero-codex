@@ -1216,11 +1216,21 @@ codex --version
     try {
       Bun.spawnSync(['git', 'init', '--initial-branch=main', repo])
       Bun.spawnSync(['git', '-C', repo, 'remote', 'add', 'origin', 'https://github.com/zerocolored/zero-codex.git'])
+      Bun.spawnSync(['git', '-C', repo, 'config', 'branch.feature/review.remote', 'origin'])
+      Bun.spawnSync(['git', '-C', repo, 'config', 'branch.feature/review.merge', 'refs/heads/main'])
       writeFileSync(standalone, readFileSync(join(import.meta.dir, 'validate-update-repo.ts'), 'utf8'))
       const result = Bun.spawnSync(['bun', standalone, repo, 'main'], {
         stdout: 'pipe', stderr: 'pipe',
       })
       expect(result.exitCode, result.stderr.toString()).toBe(0)
+
+      Bun.spawnSync(['git', '-C', repo, 'config', 'branch.main.remote', 'origin'])
+      Bun.spawnSync(['git', '-C', repo, 'config', 'branch.main.merge', 'refs/heads/develop'])
+      const unsafeTarget = Bun.spawnSync(['bun', standalone, repo, 'main'], {
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(unsafeTarget.exitCode).not.toBe(0)
+      expect(unsafeTarget.stderr.toString()).toContain('local Git config is unsafe: branch.main.merge')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
