@@ -142,6 +142,10 @@ import {
   type AdvisorRepositorySnapshot,
 } from './advisor-snapshot.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
+import {
+  threeAdvisorRepositoryDeltaDigest,
+  threeAdvisorTaskOwnedFixPathsDigest,
+} from './advisor-journal.ts'
 import { CodexAppServerSession } from './codex-app-server-session.ts'
 import { CodexUiApprovalRequiredError } from './ui-approval.ts'
 
@@ -8903,7 +8907,12 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).not.toContain('process-separated permission protocol')
     expect(instructions).toContain('advisor_round phase=investigation')
     expect(instructions).toContain('returned slotSummary')
-    expect(instructions).toContain('Do not call\nthe legacy separate design phase')
+    expect(instructions).toContain('legacy separate design phase')
+    expect(instructions).toContain('solution_analyst with model=gpt-6-astra')
+    expect(instructions).toContain('risk_reviewer with')
+    expect(instructions).toContain('model=gpt-5.6-sol and fork_turns=none')
+    expect(instructions).toContain('Minor findings, missing advisor responses, or infrastructure failures never')
+    expect(instructions).toContain('Never call review round 3')
     expect(instructions).not.toContain('Do not push or create a PR')
     expect(instructions).not.toContain('ZERO_NATIVE_ADVISOR')
     expect(instructions).not.toContain(nonce)
@@ -8922,7 +8931,12 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     })
     expect(advised).toContain('Advisor transport: zerokun_advisors')
     expect(advised).toContain('Base any advisor-count statement only on slotSummary')
-    expect(advised).toContain('Do not use the legacy design phase')
+    expect(advised).toContain('legacy design phase')
+    expect(advised).toContain('solution_analyst with model=gpt-6-astra')
+    expect(advised).toContain('risk_reviewer with model=gpt-5.6-sol')
+    expect(advised).toContain('fork_turns=none')
+    expect(advised).toContain('unavailability, and infrastructure failures do not trigger round 2')
+    expect(advised).toContain('Never call round 3')
     const prepare = buildCodexPhasePrompt(
       job,
       'prepare',
@@ -9093,15 +9107,230 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     store.close()
   })
 
-  test('advisor publication gateはreadにinvestigation、writeに全3phaseを要求する', () => {
+  test('advisor publication gateはreadに初期設計、writeに初期設計と最終reviewを要求する', () => {
     expect(requiredAdvisorRoundsForJob({ writeEnabled: false })).toEqual([
       { phase: 'investigation', round: 1 },
     ])
     expect(requiredAdvisorRoundsForJob({ writeEnabled: true })).toEqual([
       { phase: 'investigation', round: 1 },
-      { phase: 'design', round: 1 },
       { phase: 'review', round: 1 },
     ])
+  })
+
+  test('version 9の実装前gateはdesignを要求せずrevision跨ぎの初期設計を再利用する', () => {
+    const state = fixtureDir()
+    const job = { id: 'advisor-v9-preparation' }
+    const contextDigest = 'a'.repeat(64)
+    const attemptNonce = 'f'.repeat(32)
+    const initialRepositoryDigest = '8'.repeat(64)
+    const currentRepositoryDigest = '9'.repeat(64)
+    const journalRoot = join(state, 'advisor-journal', job.id, attemptNonce)
+    const writeJournal = (
+      inputRevision: number,
+      inputDigest: string,
+      repositoryDigest: string,
+      startedAt: number,
+    ) => {
+      const root = join(
+        journalRoot,
+        `revision-${inputRevision}-${inputDigest.slice(0, 16)}`,
+      )
+      mkdirSync(root, { recursive: true, mode: 0o700 })
+      writeFileSync(join(root, 'investigation-1.json'), `${JSON.stringify({
+        version: 9,
+        advisorPolicy: 'three-phase-specific-conditional-final-v2',
+        status: 'completed',
+        phase: 'investigation',
+        round: 1,
+        attemptNonce,
+        contextDigest,
+        inputRevision,
+        inputDigest,
+        repositoryDigest,
+        repositoryDigestBefore: repositoryDigest,
+        repositoryDigestAfter: repositoryDigest,
+        brokerProcessId: 101,
+        primaryEvidenceDigest: 'b'.repeat(64),
+        startedAt,
+        finishedAt: startedAt + 1,
+        receiptIssuedAt: startedAt + 2,
+        receiptDigest: 'c'.repeat(64),
+        pollObservedAt: startedAt + 3,
+        native: [{
+          attempted: true, adopted: false, perspective: 'solution',
+          reasonDigest: 'd'.repeat(64), executionState: 'unavailable-before-start',
+        }],
+        grok: [{
+          attempted: true, adopted: false, perspective: 'solution',
+          containmentVerified: true, reasonDigest: 'e'.repeat(64),
+          executionState: 'unavailable-before-start',
+        }],
+        claude: {
+          attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
+          workspaceCreationAttempted: false, freshEphemeral: false,
+          cleanupVerified: false, containmentVerified: true,
+          promptMayHaveBeenDelivered: false, reasonDigest: '1'.repeat(64),
+          executionState: 'unavailable-before-start',
+        },
+      })}\n`, { mode: 0o600 })
+    }
+    const firstInput = { revision: 1, digest: '2'.repeat(64) }
+    writeJournal(
+      firstInput.revision,
+      firstInput.digest,
+      initialRepositoryDigest,
+      1,
+    )
+    expect(assertRequiredAdvisorPreparationRounds(
+      job,
+      state,
+      contextDigest,
+      attemptNonce,
+      firstInput,
+      initialRepositoryDigest,
+      initialRepositoryDigest,
+    )).toHaveLength(1)
+
+    const continuedInput = { revision: 2, digest: '3'.repeat(64) }
+    const continued = assertRequiredAdvisorPreparationRounds(
+      job,
+      state,
+      contextDigest,
+      attemptNonce,
+      continuedInput,
+      initialRepositoryDigest,
+      currentRepositoryDigest,
+    )
+    expect(continued.map(value => [value.inputRevision, value.phase, value.journalVersion]))
+      .toEqual([[1, 'investigation', 9]])
+  })
+
+  test('旧unified version 8の初期設計を入力revision更新後も再利用する', () => {
+    const state = fixtureDir()
+    const job = { id: 'advisor-v8-unified-preparation' }
+    const contextDigest = 'a'.repeat(64)
+    const attemptNonce = 'f'.repeat(32)
+    const repositoryDigest = '8'.repeat(64)
+    const firstInput = { revision: 1, digest: '2'.repeat(64) }
+    const continuedInput = { revision: 2, digest: '3'.repeat(64) }
+    const root = join(
+      state, 'advisor-journal', job.id, attemptNonce,
+      `revision-${firstInput.revision}-${firstInput.digest.slice(0, 16)}`,
+    )
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    writeFileSync(join(root, 'investigation-1.json'), `${JSON.stringify({
+      version: 8,
+      status: 'completed',
+      phase: 'investigation',
+      round: 1,
+      attemptNonce,
+      contextDigest,
+      inputRevision: firstInput.revision,
+      inputDigest: firstInput.digest,
+      repositoryDigest,
+      repositoryDigestBefore: repositoryDigest,
+      repositoryDigestAfter: repositoryDigest,
+      repositoryObservation: 'not-required-in-unified-workflow',
+      brokerProcessId: 101,
+      primaryEvidenceDigest: 'b'.repeat(64),
+      startedAt: 1,
+      finishedAt: 2,
+      receiptIssuedAt: 3,
+      receiptDigest: 'c'.repeat(64),
+      pollObservedAt: 4,
+      native: (['solution', 'risk'] as const).map((perspective, index) => ({
+        attempted: true, adopted: false, perspective,
+        reasonDigest: String(index + 1).repeat(64),
+        executionState: 'unavailable-before-start',
+      })),
+      grok: (['solution', 'risk'] as const).map((perspective, index) => ({
+        attempted: true, adopted: false, perspective, containmentVerified: true,
+        reasonDigest: String(index + 3).repeat(64),
+        executionState: 'unavailable-before-start',
+      })),
+      claude: {
+        attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
+        workspaceCreationAttempted: false, freshEphemeral: false,
+        cleanupVerified: false, containmentVerified: true,
+        promptMayHaveBeenDelivered: false, reasonDigest: '5'.repeat(64),
+        executionState: 'unavailable-before-start',
+      },
+    })}\n`, { mode: 0o600 })
+
+    const continued = assertRequiredAdvisorPreparationRounds(
+      job,
+      state,
+      contextDigest,
+      attemptNonce,
+      continuedInput,
+      repositoryDigest,
+      '9'.repeat(64),
+    )
+    expect(continued.map(value => [value.inputRevision, value.phase, value.journalVersion]))
+      .toEqual([[1, 'investigation', 8]])
+  })
+
+  test('初期設計のv9とlegacy pairが並存しても後続v9を重複実行として拒否する', () => {
+    const state = fixtureDir()
+    const job = { id: 'advisor-mixed-initial-duplicate' }
+    const contextDigest = 'a'.repeat(64)
+    const attemptNonce = 'f'.repeat(32)
+    const repositoryDigest = '8'.repeat(64)
+    const claude = {
+      attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
+      executionState: 'unavailable-before-start', workspaceCreationAttempted: false,
+      freshEphemeral: false, cleanupVerified: false, containmentVerified: true,
+      promptMayHaveBeenDelivered: false, reasonDigest: '7'.repeat(64),
+    }
+    const write = (
+      input: { revision: number, digest: string },
+      version: 8 | 9,
+      phase: 'investigation' | 'design',
+      startedAt: number,
+    ) => {
+      const root = join(
+        state, 'advisor-journal', job.id, attemptNonce,
+        `revision-${input.revision}-${input.digest.slice(0, 16)}`,
+      )
+      mkdirSync(root, { recursive: true, mode: 0o700 })
+      const perspectives = version === 9 ? ['solution'] : ['solution', 'risk']
+      writeFileSync(join(root, `${phase}-1.json`), `${JSON.stringify({
+        version,
+        ...(version === 9 ? {
+          advisorPolicy: 'three-phase-specific-conditional-final-v2',
+        } : {}),
+        status: 'completed', phase, round: 1, attemptNonce, contextDigest,
+        inputRevision: input.revision, inputDigest: input.digest,
+        repositoryDigest, repositoryDigestBefore: repositoryDigest,
+        repositoryDigestAfter: repositoryDigest, brokerProcessId: 100 + startedAt,
+        primaryEvidenceDigest: 'b'.repeat(64), startedAt, finishedAt: startedAt + 1,
+        receiptIssuedAt: startedAt + 2, receiptDigest: 'c'.repeat(64),
+        pollObservedAt: startedAt + 3,
+        native: perspectives.map((perspective, index) => ({
+          attempted: true, adopted: false, perspective,
+          reasonDigest: String(index + 1).repeat(64),
+          executionState: 'unavailable-before-start',
+        })),
+        grok: perspectives.map((perspective, index) => ({
+          attempted: true, adopted: false, perspective, containmentVerified: true,
+          reasonDigest: String(index + 3).repeat(64),
+          executionState: 'unavailable-before-start',
+        })),
+        claude,
+      })}\n`, { mode: 0o600 })
+    }
+    const first = { revision: 1, digest: '1'.repeat(64) }
+    const legacy = { revision: 2, digest: '2'.repeat(64) }
+    const current = { revision: 3, digest: '3'.repeat(64) }
+    write(first, 9, 'investigation', 1)
+    write(legacy, 8, 'investigation', 5)
+    write(legacy, 8, 'design', 9)
+    write(current, 9, 'investigation', 13)
+
+    expect(() => assertRequiredAdvisorPreparationRounds(
+      job, state, contextDigest, attemptNonce, current,
+      repositoryDigest, repositoryDigest,
+    )).toThrow('duplicate attempt-wide advisor round: investigation-1')
   })
 
   test('advisor publication gateは旧version 5の全採択証跡を後方互換で検証する', () => {
@@ -9380,6 +9609,253 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     )).toThrow('uncontained external advisor outcomes')
   })
 
+  test('更新を跨いだversion 8初期phaseとversion 9最終reviewを同じattemptで受理する', () => {
+    const state = fixtureDir()
+    const job = { id: 'advisor-mixed-version-job', writeEnabled: true }
+    const contextDigest = 'a'.repeat(64)
+    const attemptNonce = 'f'.repeat(32)
+    const advisorInput = { revision: 1, digest: '6'.repeat(64) }
+    const initialRepositoryDigest = '8'.repeat(64)
+    const currentRepositoryDigest = '9'.repeat(64)
+    const root = join(
+      state, 'advisor-journal', job.id, attemptNonce,
+      `revision-${advisorInput.revision}-${advisorInput.digest.slice(0, 16)}`,
+    )
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    const claude = {
+      attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
+      workspaceCreationAttempted: false, freshEphemeral: false,
+      cleanupVerified: false, containmentVerified: true,
+      promptMayHaveBeenDelivered: false, reasonDigest: '7'.repeat(64),
+      executionState: 'unavailable-before-start',
+    }
+    const legacyNative = (['solution', 'risk'] as const).map((perspective, index) => ({
+      attempted: true, adopted: false, perspective,
+      reasonDigest: String(index + 1).repeat(64),
+      executionState: 'unavailable-before-start',
+    }))
+    const legacyGrok = (['solution', 'risk'] as const).map((perspective, index) => ({
+      attempted: true, adopted: false, perspective, containmentVerified: true,
+      reasonDigest: String(index + 3).repeat(64),
+      executionState: 'unavailable-before-start',
+    }))
+    const common = {
+      status: 'completed', round: 1, attemptNonce, contextDigest,
+      inputRevision: advisorInput.revision, inputDigest: advisorInput.digest,
+      brokerProcessId: 101, primaryEvidenceDigest: 'b'.repeat(64),
+      receiptDigest: 'c'.repeat(64), claude,
+    }
+    writeFileSync(join(root, 'investigation-1.json'), `${JSON.stringify({
+      ...common,
+      version: 8,
+      phase: 'investigation',
+      repositoryDigest: initialRepositoryDigest,
+      repositoryDigestBefore: initialRepositoryDigest,
+      repositoryDigestAfter: initialRepositoryDigest,
+      startedAt: 1, finishedAt: 2, receiptIssuedAt: 3, pollObservedAt: 4,
+      native: legacyNative,
+      grok: legacyGrok,
+    })}\n`, { mode: 0o600 })
+    writeFileSync(join(root, 'design-1.json'), `${JSON.stringify({
+      ...common,
+      version: 8,
+      phase: 'design',
+      repositoryDigest: initialRepositoryDigest,
+      repositoryDigestBefore: initialRepositoryDigest,
+      repositoryDigestAfter: initialRepositoryDigest,
+      startedAt: 5, finishedAt: 6, receiptIssuedAt: 7, pollObservedAt: 8,
+      native: legacyNative,
+      grok: legacyGrok,
+    })}\n`, { mode: 0o600 })
+    writeFileSync(join(root, 'review-1.json'), `${JSON.stringify({
+      ...common,
+      version: 9,
+      advisorPolicy: 'three-phase-specific-conditional-final-v2',
+      phase: 'review',
+      repositoryDigest: currentRepositoryDigest,
+      repositoryDigestBefore: currentRepositoryDigest,
+      repositoryDigestAfter: currentRepositoryDigest,
+      startedAt: 9, finishedAt: 10, receiptIssuedAt: 11, pollObservedAt: 12,
+      native: [{
+        attempted: true, adopted: false, perspective: 'risk',
+        reasonDigest: 'd'.repeat(64), executionState: 'unavailable-before-start',
+      }],
+      grok: [{
+        attempted: true, adopted: false, perspective: 'risk', containmentVerified: true,
+        reasonDigest: 'e'.repeat(64), executionState: 'unavailable-before-start',
+      }],
+    })}\n`, { mode: 0o600 })
+
+    const evidence = assertRequiredAdvisorRounds(
+      job,
+      state,
+      contextDigest,
+      attemptNonce,
+      advisorInput,
+      initialRepositoryDigest,
+      currentRepositoryDigest,
+    )
+    expect(evidence.map(value => `${value.phase}:${value.journalVersion}`).sort())
+      .toEqual(['design:8', 'investigation:8', 'review:9'])
+  })
+
+  test('version 9の条件付き最終review第2回は第1回の採択結果とfresh nativeへ結合する', () => {
+    const state = fixtureDir()
+    const job = { id: 'advisor-v9-review-two', writeEnabled: true }
+    const contextDigest = 'a'.repeat(64)
+    const attemptNonce = 'f'.repeat(32)
+    const advisorInput = { revision: 1, digest: '6'.repeat(64) }
+    const fixedInput = { revision: 2, digest: '0'.repeat(64) }
+    const initialRepositoryDigest = '8'.repeat(64)
+    const currentRepositoryDigest = '9'.repeat(64)
+    const root = join(
+      state, 'advisor-journal', job.id, attemptNonce,
+      `revision-${advisorInput.revision}-${advisorInput.digest.slice(0, 16)}`,
+    )
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    const unavailableClaude = {
+      attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
+      workspaceCreationAttempted: false, freshEphemeral: false,
+      cleanupVerified: false, containmentVerified: true,
+      promptMayHaveBeenDelivered: false, reasonDigest: '7'.repeat(64),
+      executionState: 'unavailable-before-start',
+    }
+    const journal = (
+      phase: 'investigation' | 'review',
+      round: 1 | 2,
+      repositoryDigest: string,
+      startedAt: number,
+      agentId: string,
+    ) => ({
+      version: 9,
+      advisorPolicy: 'three-phase-specific-conditional-final-v2',
+      status: 'completed',
+      phase,
+      round,
+      attemptNonce,
+      contextDigest,
+      inputRevision: advisorInput.revision,
+      inputDigest: advisorInput.digest,
+      repositoryDigest,
+      repositoryDigestBefore: repositoryDigest,
+      repositoryDigestAfter: repositoryDigest,
+      ...(phase === 'review' && round === 1
+        ? { repositoryDeltaBaselineDigest: '6'.repeat(64) }
+        : {}),
+      ...(phase === 'review' && round === 2
+        ? {
+            repositoryDeltaCurrentDigest: '7'.repeat(64),
+            repositoryDeltaCurrentDigestAfter: '7'.repeat(64),
+          }
+        : {}),
+      brokerProcessId: 100 + startedAt,
+      primaryEvidenceDigest: 'b'.repeat(64),
+      startedAt,
+      finishedAt: startedAt + 1,
+      receiptIssuedAt: startedAt + 2,
+      receiptDigest: 'c'.repeat(64),
+      pollObservedAt: startedAt + 3,
+      native: [{
+        attempted: true,
+        adopted: true,
+        perspective: phase === 'review' ? 'risk' : 'solution',
+        agentId,
+        responseDigest: phase === 'review' ? '1'.repeat(64) : '2'.repeat(64),
+        responseTransportDigest: phase === 'review' ? '3'.repeat(64) : '4'.repeat(64),
+        executionState: 'response-obtained',
+      }],
+      grok: [{
+        attempted: true,
+        adopted: false,
+        perspective: phase === 'review' ? 'risk' : 'solution',
+        containmentVerified: true,
+        reasonDigest: '5'.repeat(64),
+        executionState: 'unavailable-before-start',
+      }],
+      claude: unavailableClaude,
+    })
+    const investigation = journal(
+      'investigation', 1, initialRepositoryDigest, 1, '/root/initial-solution',
+    )
+    const reviewOne = journal('review', 1, '4'.repeat(64), 5, '/root/review-one')
+    const roundTwoBasis = {
+      reviewOneJournalDigest: createHash('sha256')
+        .update(JSON.stringify(reviewOne)).digest('hex'),
+      mandatoryFindingDigest: 'd'.repeat(64),
+      repositoryBaselineDigest: '6'.repeat(64),
+      repositoryCurrentDigest: '7'.repeat(64),
+      changedRepositoryCount: 1,
+      taskOwnedFixDeltaDigest: threeAdvisorRepositoryDeltaDigest(
+        '6'.repeat(64), '7'.repeat(64), 1,
+      ),
+      taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+      taskOwnedFixPathCount: 1,
+      taskOwnedFixPathsDigest: threeAdvisorTaskOwnedFixPathsDigest([
+        { repository: '.', path: 'round-two-fix.ts' },
+      ]),
+      roundOneSources: ['native'],
+      roundOneResponseDigests: { native: '1'.repeat(64) },
+    }
+    const reviewTwo = {
+      ...journal('review', 2, currentRepositoryDigest, 9, '/root/review-two'),
+      inputRevision: fixedInput.revision,
+      inputDigest: fixedInput.digest,
+      roundTwoBasis,
+    }
+    writeFileSync(join(root, 'investigation-1.json'), `${JSON.stringify(investigation)}\n`, {
+      mode: 0o600,
+    })
+    writeFileSync(join(root, 'review-1.json'), `${JSON.stringify(reviewOne)}\n`, { mode: 0o600 })
+    const fixedRoot = join(
+      state, 'advisor-journal', job.id, attemptNonce,
+      `revision-${fixedInput.revision}-${fixedInput.digest.slice(0, 16)}`,
+    )
+    mkdirSync(fixedRoot, { recursive: true, mode: 0o700 })
+    const reviewTwoPath = join(fixedRoot, 'review-2.json')
+    writeFileSync(reviewTwoPath, `${JSON.stringify(reviewTwo)}\n`, { mode: 0o600 })
+
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, fixedInput,
+      initialRepositoryDigest, currentRepositoryDigest,
+    )).not.toThrow()
+
+    writeFileSync(reviewTwoPath, `${JSON.stringify({
+      ...reviewTwo,
+      roundTwoBasis: { ...roundTwoBasis, reviewOneJournalDigest: '0'.repeat(64) },
+    })}\n`, { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, fixedInput,
+      initialRepositoryDigest, currentRepositoryDigest,
+    )).toThrow('mandatory fix')
+
+    writeFileSync(reviewTwoPath, `${JSON.stringify({
+      ...reviewTwo,
+      native: [{ ...reviewTwo.native[0], agentId: '/root/review-one' }],
+    })}\n`, { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, fixedInput,
+      initialRepositoryDigest, currentRepositoryDigest,
+    )).toThrow('fresh native')
+
+    writeFileSync(reviewTwoPath, `${JSON.stringify(reviewTwo)}\n`, { mode: 0o600 })
+    writeFileSync(join(root, 'review-1.json'), `${JSON.stringify({
+      ...reviewOne, version: 8, advisorPolicy: undefined,
+    })}\n`, { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, fixedInput,
+      initialRepositoryDigest, currentRepositoryDigest,
+    )).toThrow('mixes legacy and current')
+
+    writeFileSync(join(root, 'review-1.json'), `${JSON.stringify(reviewOne)}\n`, { mode: 0o600 })
+    writeFileSync(join(fixedRoot, 'review-1.json'), `${JSON.stringify({
+      ...reviewOne, inputRevision: fixedInput.revision, inputDigest: fixedInput.digest,
+    })}\n`, { mode: 0o600 })
+    expect(() => assertRequiredAdvisorRounds(
+      job, state, contextDigest, attemptNonce, fixedInput,
+      initialRepositoryDigest, currentRepositoryDigest,
+    )).toThrow('duplicate attempt-wide advisor round: review-1')
+  })
+
   test('実装前の正当なrepository driftだけをtyped retryへ分類する', () => {
     const state = fixtureDir()
     const job = { id: 'advisor-preparation-drift' }
@@ -9628,7 +10104,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     )).toThrow('investigation-1')
   })
 
-  test('write jobは最大3回の連続reviewのうち最終repository digestだけを公開採択する', () => {
+  test('旧version 5 write jobは最大3回の連続reviewのうち最終repository digestだけを公開採択する', () => {
     const state = fixtureDir()
     const job = { id: 'write-review-rounds', writeEnabled: true }
     const attemptNonce = 'f'.repeat(32)
@@ -9712,7 +10188,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     )).toThrow('gap')
   })
 
-  test('Five-Advisor broker利用時もrepository sandboxを外さない', () => {
+  test('advisor broker利用時もrepository sandboxを外さない', () => {
     expect(buildCodexTrustArguments()).toEqual(['-a', 'never'])
   })
 
@@ -11506,7 +11982,7 @@ describe('Slack output guard', () => {
       advisorCoverage: {
         version: 1,
         phases: [{
-          phase: 'investigation', inputRevision: 1, finishedAt: 100,
+          phase: 'investigation', round: 1, inputRevision: 1, finishedAt: 100,
           total: 5, started: 2, responsesObtained: 2, startedNoResponse: 0,
           startUnconfirmed: 2, unavailableBeforeStart: 1,
           slots: [
@@ -11527,6 +12003,85 @@ describe('Slack output guard', () => {
     )
     expect(finalized).not.toHaveProperty('advisorCoverage')
     store.close()
+  })
+
+  test('Three-Advisorのhost集計は3枠で表示し旧5枠表示と混同しない', () => {
+    const state = fixtureDir()
+    const repo = join(state, 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input({ repoPath: repo, task: '3者の独立レビュー結果を教えて' }))
+    const job = store.claimNext('serial-worker')!
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'three-advisor-coverage-session',
+      result: '3枠すべてから回答を得ました。変更ファイルは3件です。',
+      advisorCoverage: {
+        version: 1,
+        phases: [{
+          phase: 'review', round: 1, inputRevision: 2, finishedAt: 200,
+          total: 3, started: 2, responsesObtained: 1, startedNoResponse: 1,
+          startUnconfirmed: 0, unavailableBeforeStart: 1,
+          slots: [
+            { slot: 'codex-risk', state: 'response-obtained' },
+            { slot: 'grok', state: 'started-no-response' },
+            { slot: 'claude', state: 'unavailable-before-start' },
+          ],
+        }],
+      },
+    }, state)
+    expect(finalized.result).not.toContain('すべてから回答')
+    expect(finalized.result).toContain('変更ファイルは3件です。')
+    expect(finalized.result).toContain(
+      '独立レビュー実行記録(ホスト確認): 最終レビュー第1回—起動2/3・回答1/3'
+        + '・起動済み回答未確認1/3・起動未確認0/3・起動前利用不能1/3。',
+    )
+    store.close()
+  })
+
+  test('条件付き第2回を独立した3区分で表示し旧aliasの二重計上を拒否する', () => {
+    const segment = '起動3/3・回答3/3・起動済み回答未確認0/3・起動未確認0/3・起動前利用不能0/3'
+    const coverageLine = enforceHostAdvisorCoverage('回答本文です。', {
+      version: 1,
+      phases: [
+        {
+          phase: 'investigation', round: 1, inputRevision: 1, finishedAt: 100,
+          total: 3, started: 3, responsesObtained: 3, startedNoResponse: 0,
+          startUnconfirmed: 0, unavailableBeforeStart: 0,
+          slots: [
+            { slot: 'codex-solution', state: 'response-obtained' },
+            { slot: 'grok', state: 'response-obtained' },
+            { slot: 'claude', state: 'response-obtained' },
+          ],
+        },
+        {
+          phase: 'review', round: 1, inputRevision: 2, finishedAt: 200,
+          total: 3, started: 3, responsesObtained: 3, startedNoResponse: 0,
+          startUnconfirmed: 0, unavailableBeforeStart: 0,
+          slots: [
+            { slot: 'codex-risk', state: 'response-obtained' },
+            { slot: 'grok', state: 'response-obtained' },
+            { slot: 'claude', state: 'response-obtained' },
+          ],
+        },
+        {
+          phase: 'review', round: 2, inputRevision: 3, finishedAt: 300,
+          total: 3, started: 3, responsesObtained: 3, startedNoResponse: 0,
+          startUnconfirmed: 0, unavailableBeforeStart: 0,
+          slots: [
+            { slot: 'codex-risk', state: 'response-obtained' },
+            { slot: 'grok', state: 'response-obtained' },
+            { slot: 'claude', state: 'response-obtained' },
+          ],
+        },
+      ],
+    }, 'result')
+    expect(coverageLine).toContain(
+      `初期設計—${segment}、最終レビュー第1回—${segment}、最終レビュー第2回—${segment}。`,
+    )
+
+    const duplicatedAlias = `回答本文です。\n\n独立レビュー実行記録(ホスト確認): 最終レビュー—${segment}、最終レビュー第1回—${segment}。`
+    expect(enforceHostAdvisorCoverage(duplicatedAlias, undefined, 'delivery'))
+      .toBe('回答本文です。')
   })
 
   test('host記録がないadvisor件数は実行済みと報告せず進捗からは除外する', () => {
@@ -11574,9 +12129,10 @@ describe('Slack output guard', () => {
       'Codexレビューで5件の必須修正を確認しました。',
       '独立レビューを実施しました。変更ファイルは3件です。テストは10件通りました。',
       '5枠のレビューを実施しました。修正したファイルは2件です。',
+      '3枠のレビューを実施しました。変更ファイルは3件です。',
     ]) {
       const guarded = enforceHostAdvisorCoverage(ordinary, undefined, 'progress')
-      if (ordinary.startsWith('独立レビュー') || ordinary.startsWith('5枠のレビュー')) {
+      if (ordinary.startsWith('独立レビュー') || /[35]枠のレビュー/u.test(ordinary)) {
         expect(guarded).not.toContain(ordinary.split('。')[0]!)
         expect(guarded).toContain(ordinary.split('。').slice(1).filter(Boolean).join('。'))
       } else {
@@ -11598,7 +12154,7 @@ describe('Slack output guard', () => {
       advisorCoverage: {
         version: 1,
         phases: [{
-          phase: 'review', inputRevision: 2, finishedAt: 200,
+          phase: 'review', round: 1, inputRevision: 2, finishedAt: 200,
           total: 5, started: 4, responsesObtained: 3, startedNoResponse: 1,
           startUnconfirmed: 1, unavailableBeforeStart: 0,
           slots: [
@@ -11613,7 +12169,7 @@ describe('Slack output guard', () => {
     }, state)
     expect(finalized.result.length).toBeLessThanOrEqual(12_000)
     expect(finalized.result).toEndWith(
-      '独立レビュー実行記録(ホスト確認): 最終レビュー—起動4/5・回答3/5'
+      '独立レビュー実行記録(ホスト確認): 最終レビュー第1回—起動4/5・回答3/5'
         + '・起動済み回答未確認1/5・起動未確認1/5・起動前利用不能0/5。',
     )
     store.close()

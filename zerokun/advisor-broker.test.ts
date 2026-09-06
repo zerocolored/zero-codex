@@ -24,6 +24,7 @@ import {
   allAdvisorAttemptsAdopted,
   advisorReceiptAlreadyObserved,
   advisorReceiptChallenge,
+  advisorPrompt,
   assertClaudeSubscriptionLogin,
   brokerEnvironment,
   claudeSubscriptionStatusIsReady,
@@ -54,6 +55,10 @@ import {
   snapshotAdvisorRepository,
 } from './advisor-snapshot.ts'
 import { nativeAdvisorMarker } from './native-advisor-evidence.ts'
+import {
+  threeAdvisorRepositoryDeltaDigest,
+  threeAdvisorTaskOwnedFixPathsDigest,
+} from './advisor-journal.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 import { requireHerdrRuntime, writePinnedHerdrRuntime } from './herdr-runtime.ts'
 import { installFifthAdvisorHelper } from './install-fifth-advisor.ts'
@@ -106,8 +111,26 @@ type BrokerFixture = {
   }
   call(
     phase?: 'investigation' | 'design' | 'review',
-    binding?: 'revision-one' | 'revision-two',
+    binding?: 'revision-one' | 'revision-two' | AdvisorInputSnapshot,
     nativeMode?: 'adopted' | 'unavailable',
+    round?: 1 | 2 | 3,
+    overrides?: {
+      nativeAgentId?: string
+      roundTwoBasis?: {
+        roundOneSources: Array<'native' | 'grok' | 'claude'>
+        mandatoryFindingSummary: string
+        taskOwnedFixDelta: string
+        taskOwnedFixPaths: Array<{ repository: string, path: string }>
+      }
+    },
+  ): Promise<{
+    result: Awaited<ReturnType<Client['callTool']>>
+    payload: Record<string, unknown>
+  }>
+  stageRevision(task: string): AdvisorInputSnapshot
+  poll(
+    phase: 'investigation' | 'review',
+    binding: 'revision-one' | 'revision-two' | AdvisorInputSnapshot,
     round?: 1 | 2,
   ): Promise<{
     result: Awaited<ReturnType<Client['callTool']>>
@@ -205,7 +228,7 @@ if len(args) >= 3 and args[:2] == ["agent", "start"]:
     state["state_change_seq"] = 1
     state["agent_status"] = "idle"
     child = subprocess.Popen(
-        [claude, "--dangerously-skip-permissions", "--safe-mode", "--no-chrome", "--disable-slash-commands"],
+        [claude, "--dangerously-skip-permissions", "--safe-mode", "--no-chrome", "--disable-slash-commands", "--model=claude-fable-5-1"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -238,7 +261,7 @@ if args == ["pane", "process-info", "--pane", pane]:
         missing("pane_not_found")
     process_pid = state["process_pid"]
     process_group_id = state["process_group_id"]
-    processes = [{"pid": process_pid, "argv": ["claude", "--dangerously-skip-permissions", "--safe-mode", "--no-chrome", "--disable-slash-commands"], "argv0": "claude"}] if state["process"] else []
+    processes = [{"pid": process_pid, "argv": ["claude", "--dangerously-skip-permissions", "--safe-mode", "--no-chrome", "--disable-slash-commands", "--model=claude-fable-5-1"], "argv0": "claude"}] if state["process"] else []
     success({"process_info": {"pane_id": pane, "shell_pid": process_pid, "foreground_process_group_id": process_group_id, "foreground_processes": processes}})
 if args == ["workspace", "close", workspace]:
     if not state["owned"]:
@@ -435,6 +458,7 @@ async function brokerFixture(options: {
     kind: 'steer',
   })).toBe('staged')
   const revisionTwo = readAdvisorInputSnapshot(state, job.id)
+  let stagedRevision = 2
 
   const nonce = 'a'.repeat(32)
   const layout = resolveAdvisorProjectLayout(repo)
@@ -491,11 +515,23 @@ async function brokerFixture(options: {
     } : {}),
     async call(
       phase = 'investigation',
-      binding = 'revision-one',
+      binding: 'revision-one' | 'revision-two' | AdvisorInputSnapshot = 'revision-one',
       nativeMode: 'adopted' | 'unavailable' = 'adopted',
-      round: 1 | 2 = 1,
+      round: 1 | 2 | 3 = 1,
+      overrides: {
+        nativeAgentId?: string
+        roundTwoBasis?: {
+          roundOneSources: Array<'native' | 'grok' | 'claude'>
+          mandatoryFindingSummary: string
+          taskOwnedFixDelta: string
+          taskOwnedFixPaths: Array<{ repository: string, path: string }>
+        }
+      } = {},
     ) {
-      const selectedInput = binding === 'revision-one' ? revisionOne : revisionTwo
+      const selectedInput = typeof binding === 'object'
+        ? binding
+        : binding === 'revision-one' ? revisionOne : revisionTwo
+      const expectedPerspective = phase === 'review' ? 'risk' : 'solution'
       const responseFor = (perspective: 'solution' | 'risk') => [
         `${perspective} response`,
         nativeAdvisorMarker(
@@ -512,21 +548,20 @@ async function brokerFixture(options: {
             inputRevision: selectedInput.revision,
             inputDigest: selectedInput.digest,
             primaryEvidence: 'bounded primary evidence',
+            ...(overrides.roundTwoBasis ? { roundTwoBasis: overrides.roundTwoBasis } : {}),
             nativeAdvisors: nativeMode === 'adopted'
               ? [
-                { perspective: 'solution', agentId: '/root/native-solution', response: responseFor('solution') },
-                { perspective: 'risk', agentId: '/root/native-risk', response: responseFor('risk') },
+                {
+                  perspective: expectedPerspective,
+                  agentId: overrides.nativeAgentId ?? `/root/native-${expectedPerspective}`,
+                  response: responseFor(expectedPerspective),
+                },
               ]
               : [
                 {
-                  perspective: 'solution', attempted: true, adopted: false,
+                  perspective: expectedPerspective, attempted: true, adopted: false,
                   started: false,
-                  reason: 'native solution slot could not start',
-                },
-                {
-                  perspective: 'risk', attempted: true, adopted: false,
-                  started: false,
-                  reason: 'native risk slot could not start',
+                  reason: `native ${expectedPerspective} slot could not start`,
                 },
               ],
           },
@@ -559,6 +594,40 @@ async function brokerFixture(options: {
       }
       return { result, payload }
     },
+    stageRevision(task: string) {
+      stagedRevision += 1
+      const staged = store.stageLiveControl(target, {
+        chatId: job.chatId,
+        threadTs: job.threadTs,
+        messageId: `1800000000.${String(stagedRevision).padStart(6, '0')}`,
+        userId: 'U_DIFFERENT',
+        task,
+        kind: 'steer',
+      })
+      if (staged !== 'staged') throw new Error(`broker fixture input was not staged: ${staged}`)
+      return readAdvisorInputSnapshot(state, job.id)
+    },
+    async poll(
+      phase: 'investigation' | 'review',
+      binding: 'revision-one' | 'revision-two' | AdvisorInputSnapshot,
+      round: 1 | 2 = 1,
+    ) {
+      const selectedInput = typeof binding === 'object'
+        ? binding
+        : binding === 'revision-one' ? revisionOne : revisionTwo
+      const result = await client.callTool({
+        name: 'advisor_round_poll',
+        arguments: {
+          phase,
+          round,
+          inputRevision: selectedInput.revision,
+          inputDigest: selectedInput.digest,
+        },
+      })
+      const block = result.content.find(value => value.type === 'text')
+      if (!block || block.type !== 'text') throw new Error('advisor broker omitted poll result')
+      return { result, payload: JSON.parse(block.text) as Record<string, unknown> }
+    },
     async close() {
       try { await client.close() } finally {
         if (options.externalSuccess && existsSync(fakeHerdrState)) {
@@ -582,8 +651,15 @@ async function brokerFixture(options: {
 function armRetiredRequestedRound(
   fixture: BrokerFixture,
   input: AdvisorInputSnapshot,
-  options: { persistClaudeOutcome?: boolean } = {},
+  options: {
+    persistClaudeOutcome?: boolean
+    version?: 8 | 9
+    phase?: 'investigation' | 'review'
+  } = {},
 ): { journalPath: string; lockPath: string } {
+  const version = options.version ?? 8
+  const phase = options.phase ?? 'investigation'
+  const perspective = phase === 'review' ? 'risk' : 'solution'
   const revisionRoot = join(
     fixture.journalRoot,
     `revision-${input.revision}-${input.digest.slice(0, 16)}`,
@@ -594,13 +670,14 @@ function armRetiredRequestedRound(
   )
   const startedAt = Date.now() - 10
   const brokerProcessId = 4242
-  const journalPath = join(revisionRoot, 'investigation-1.json')
+  const journalPath = join(revisionRoot, `${phase}-1.json`)
   const lockPath = join(fixture.journalRoot, 'active-round.lock')
   writeFileSync(journalPath, `${JSON.stringify({
-    version: 8,
+    version,
+    ...(version === 9 ? { advisorPolicy: 'three-phase-specific-conditional-final-v2' } : {}),
     status: 'requested',
     jobId: fixture.jobId,
-    phase: 'investigation',
+    phase,
     round: 1,
     attemptNonce: fixture.nonce,
     contextDigest: fixture.contextDigest,
@@ -609,10 +686,16 @@ function armRetiredRequestedRound(
     inputDigest: input.digest,
     repositoryDigest,
     repositoryDigestBefore: repositoryDigest,
+    repositoryObservation: 'not-required-in-unified-workflow',
     brokerProcessId,
     primaryEvidenceDigest: '5'.repeat(64),
-    native: [
-      {
+    native: version === 9
+      ? [{
+        perspective, attempted: true, adopted: true,
+        agentId: `/root/native-${perspective}`, responseDigest: '1'.repeat(64),
+        responseTransportDigest: '2'.repeat(64),
+      }]
+      : [{
         perspective: 'solution', attempted: true, adopted: true,
         agentId: '/root/native-solution', responseDigest: '1'.repeat(64),
         responseTransportDigest: '2'.repeat(64),
@@ -621,8 +704,7 @@ function armRetiredRequestedRound(
         perspective: 'risk', attempted: true, adopted: true,
         agentId: '/root/native-risk', responseDigest: '3'.repeat(64),
         responseTransportDigest: '4'.repeat(64),
-      },
-    ],
+      }],
     startedAt,
   })}\n`, { mode: 0o600 })
   writeFileSync(lockPath, `${JSON.stringify({
@@ -631,7 +713,7 @@ function armRetiredRequestedRound(
     attemptNonce: fixture.nonce,
     contextDigest: fixture.contextDigest,
     processNonce: fixture.nonce,
-    phase: 'investigation',
+    phase,
     round: 1,
     inputRevision: input.revision,
     inputDigest: input.digest,
@@ -645,7 +727,7 @@ function armRetiredRequestedRound(
       inputRevision: input.revision,
       inputDigest: input.digest,
       inputDigestPrefix: input.digest.slice(0, 16),
-      phase: 'investigation',
+      phase,
       round: 1,
       workspaceCreationAttempted: false,
       freshEphemeral: false,
@@ -1116,6 +1198,28 @@ print('review complete')
     ])
   })
 
+  test('最終review round 2 promptは必須修正deltaと直接回帰だけへ限定する', () => {
+    const prompt = advisorPrompt({
+      version: 4,
+      jobId: 'job-1',
+      attemptNonce: 'a'.repeat(32),
+      repoPath: '/tmp/example',
+      gitRoot: '/tmp/example',
+      gitRoots: ['/tmp/example'],
+      writeEnabled: true,
+      initialRepositoryDigest: 'b'.repeat(64),
+    }, {
+      revision: 2,
+      digest: 'c'.repeat(64),
+      transcript: 'current task',
+      entries: [],
+    }, 'review', 2, 'bounded delta evidence')
+    expect(prompt).toContain('最終レビューround 2')
+    expect(prompt).toContain('task-owned修正差分')
+    expect(prompt).toContain('回帰だけ')
+    expect(prompt).toContain('元実装全体の再レビュー')
+  })
+
   test('Claude cleanup receiptはcallerのproperty挿入順によらず再送可能', () => {
     const state = fixtureDir()
     chmodSync(state, 0o700)
@@ -1169,13 +1273,32 @@ print('review complete')
       )
       const journal = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
       expect(journal).toMatchObject({
-        version: 8,
+        version: 9,
+        advisorPolicy: 'three-phase-specific-conditional-final-v2',
         status: 'stale-input',
         inputRevision: fixture.revisionOne.revision,
         inputDigest: fixture.revisionOne.digest,
       })
-      expect(journal.grok).toEqual([])
-      expect(journal.claude).toMatchObject({ attempted: false, adopted: false })
+      expect(journal.grok).toEqual([
+        expect.objectContaining({
+          perspective: 'solution', attempted: true, adopted: false,
+          executionState: 'start-unconfirmed',
+        }),
+      ])
+      expect(journal.claude).toMatchObject({
+        attempted: true,
+        required: true,
+        lifecycle: 'ephemeral-v2',
+        adopted: false,
+        executionState: 'unavailable-before-start',
+      })
+      expect(journal.slotSummary).toMatchObject({
+        total: 3,
+        started: 1,
+        responsesObtained: 1,
+        startUnconfirmed: 1,
+        unavailableBeforeStart: 1,
+      })
       expect((journal.native as Array<Record<string, unknown>>).every(entry => (
         typeof entry.responseTransportDigest === 'string'
         && /^[0-9a-f]{64}$/.test(entry.responseTransportDigest)
@@ -1185,7 +1308,7 @@ print('review complete')
     }
   }, 15_000)
 
-  test('native成功数0でも両slotのattempted unavailableをversion 8へ固定する', async () => {
+  test('native成功数0でもphase別slotのattempted unavailableをversion 9へ固定する', async () => {
     const fixture = await brokerFixture()
     try {
       const { payload } = await fixture.call('investigation', 'revision-one', 'unavailable')
@@ -1200,10 +1323,9 @@ print('review complete')
         'investigation-1.json',
       )
       const journal = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
-      expect(journal.version).toBe(8)
+      expect(journal.version).toBe(9)
       expect(journal.native).toEqual([
         expect.objectContaining({ perspective: 'solution', attempted: true, adopted: false }),
-        expect.objectContaining({ perspective: 'risk', attempted: true, adopted: false }),
       ])
       expect((journal.native as Array<Record<string, unknown>>).every(entry => (
         typeof entry.reasonDigest === 'string'
@@ -1215,7 +1337,7 @@ print('review complete')
     }
   }, 15_000)
 
-  test('外部model起動未確認とnative未起動を5枠成功と誤報せずroundは完了する', async () => {
+  test('外部model起動未確認とnative未起動を3枠成功と誤報せずroundは完了する', async () => {
     const fixture = await brokerFixture()
     try {
       const { result, payload } = await fixture.call(
@@ -1225,11 +1347,11 @@ print('review complete')
       expect(payload).toMatchObject({
         complete: true,
         slotSummary: {
-          total: 5,
+          total: 3,
           started: 0,
           responsesObtained: 0,
-          startUnconfirmed: 2,
-          unavailableBeforeStart: 3,
+          startUnconfirmed: 1,
+          unavailableBeforeStart: 2,
         },
       })
     } finally {
@@ -1237,7 +1359,7 @@ print('review complete')
     }
   }, 15_000)
 
-  test('broker正常系は異なるGrok process 2件とfresh Claude 1件を実起動して5/5を記録する', async () => {
+  test('broker正常系はGrok 1件とfresh Claude 1件を実起動して3/3を記録する', async () => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
       const { result, payload } = await fixture.call('investigation', 'revision-two')
@@ -1245,9 +1367,9 @@ print('review complete')
       expect(payload).toMatchObject({
         complete: true,
         slotSummary: {
-          total: 5,
-          started: 5,
-          responsesObtained: 5,
+          total: 3,
+          started: 3,
+          responsesObtained: 3,
           startUnconfirmed: 0,
           unavailableBeforeStart: 0,
         },
@@ -1261,7 +1383,7 @@ print('review complete')
         },
       })
       const grok = payload.grok as Array<Record<string, unknown>>
-      expect(grok).toHaveLength(2)
+      expect(grok).toHaveLength(1)
       expect(grok.every(entry => (
         entry.adopted === true && entry.executionState === 'response-obtained'
       ))).toBe(true)
@@ -1272,18 +1394,19 @@ print('review complete')
       )
       const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as Record<string, unknown>
       expect(journal).toMatchObject({
-        version: 8,
+        version: 9,
+        advisorPolicy: 'three-phase-specific-conditional-final-v2',
         status: 'completed',
-        slotSummary: { started: 5, responsesObtained: 5 },
+        slotSummary: { total: 3, started: 3, responsesObtained: 3 },
       })
       const journalGrok = journal.grok as Array<Record<string, unknown>>
-      expect(new Set(journalGrok.map(entry => entry.processId)).size).toBe(2)
+      expect(new Set(journalGrok.map(entry => entry.processId)).size).toBe(1)
       const modelPids = grok.map(entry => {
         const match = /pid=([1-9][0-9]*)/.exec(String(entry.response ?? ''))
         return match ? Number(match[1]) : Number.NaN
       })
       expect(modelPids.every(Number.isSafeInteger)).toBe(true)
-      expect(new Set(modelPids).size).toBe(2)
+      expect(new Set(modelPids).size).toBe(1)
       const evidence = fixture.externalEvidence
       expect(evidence).toBeDefined()
       const claudeState = JSON.parse(readFileSync(evidence!.fakeHerdrState, 'utf8')) as {
@@ -1316,6 +1439,7 @@ print('review complete')
       kind: 'present-safe', home: '/fixture',
     }
     const outcomes = await executeGrokPanelWithRecovery({
+      perspective: 'solution',
       initialAuth: present,
       runAttempt: async perspective => {
         const attempt = (attempts.get(perspective) ?? 0) + 1
@@ -1331,14 +1455,91 @@ print('review complete')
       unavailable: (perspective, reason) => ({ perspective, adopted: false, reason }),
     })
     expect(recoveries).toBe(1)
-    expect(attempts).toEqual(new Map([['solution', 2], ['risk', 1]]))
+    expect(attempts).toEqual(new Map([['solution', 2]]))
     expect(outcomes).toEqual([
       {
         perspective: 'solution', adopted: true,
         authenticationRecoveryAttempted: true,
       },
-      { perspective: 'risk', adopted: true },
     ])
+  })
+
+  test('Grok OAuth回復予算は最終reviewの複数roundで共有し失敗時も再消費しない', async () => {
+    const present: ReturnType<typeof classifyGrokAuthState> = {
+      kind: 'present-safe', home: '/fixture',
+    }
+    let claimed = false
+    let recoveries = 0
+    const claimRecovery = () => {
+      if (claimed) return false
+      claimed = true
+      return true
+    }
+    const run = () => executeGrokPanelWithRecovery({
+      perspective: 'risk' as const,
+      initialAuth: present,
+      runAttempt: async perspective => ({
+        perspective, authRequired: true as const, adopted: false,
+      }),
+      runRecovery: async () => {
+        recoveries += 1
+        return { recovered: false, reason: 'fixture recovery failed' }
+      },
+      unavailable: (perspective, reason) => ({ perspective, adopted: false, reason }),
+      claimRecovery,
+    })
+    expect(await run()).toEqual([expect.objectContaining({
+      authenticationRecoveryAttempted: true,
+    })])
+    expect(await run()).toEqual([expect.not.objectContaining({
+      authenticationRecoveryAttempted: true,
+    })])
+    expect(recoveries).toBe(1)
+  })
+
+  test('OAuth claimのI/O例外はGrok欠員へ閉じて並行phaseをrejectしない', async () => {
+    let attempts = 0
+    let recoveries = 0
+    const outcomes = await executeGrokPanelWithRecovery({
+      perspective: 'risk',
+      initialAuth: { kind: 'absent-safe', home: '/fixture' },
+      runAttempt: async perspective => {
+        attempts += 1
+        return { perspective, adopted: true }
+      },
+      runRecovery: async () => {
+        recoveries += 1
+        return { recovered: true, reason: 'must not run' }
+      },
+      unavailable: (perspective, reason) => ({ perspective, adopted: false, reason }),
+      claimRecovery: () => { throw new Error('fixture I/O failure') },
+    })
+    expect(attempts).toBe(0)
+    expect(recoveries).toBe(0)
+    expect(outcomes).toEqual([expect.objectContaining({
+      perspective: 'risk',
+      adopted: false,
+      reason: 'Grok OAuth recovery was already attempted for this advisor phase',
+    })])
+  })
+
+  test('Grok auth不在からの回復成功も回復試行済みとして記録する', async () => {
+    const present: ReturnType<typeof classifyGrokAuthState> = {
+      kind: 'present-safe', home: '/fixture',
+    }
+    let claims = 0
+    const outcomes = await executeGrokPanelWithRecovery({
+      perspective: 'solution',
+      initialAuth: { kind: 'absent-safe', home: '/fixture' },
+      runAttempt: async perspective => ({ perspective, adopted: true }),
+      runRecovery: async () => ({ recovered: true, reason: 'fixture', state: present }),
+      unavailable: (perspective, reason) => ({ perspective, adopted: false, reason }),
+      claimRecovery: () => { claims += 1; return true },
+    })
+    expect(claims).toBe(1)
+    expect(outcomes).toEqual([{
+      perspective: 'solution', adopted: true, authenticationRecoveryAttempted: true,
+    }])
   })
 
   test('read-only jobのstale designはphase検証で拒否してjournalを作らない', async () => {
@@ -1362,9 +1563,9 @@ print('review complete')
       expect(payload).toMatchObject({
         complete: true,
         slotSummary: {
-          total: 5,
-          started: 2,
-          responsesObtained: 2,
+          total: 3,
+          started: 1,
+          responsesObtained: 1,
         },
       })
       expect(payload.repositoryUnchanged).toBeUndefined()
@@ -1383,7 +1584,7 @@ print('review complete')
       expect(result.isError).not.toBe(true)
       expect(payload).toMatchObject({
         complete: true,
-        slotSummary: { total: 5, responsesObtained: 2 },
+        slotSummary: { total: 3, responsesObtained: 1 },
       })
       expect(payload.repositoryUnchanged).toBeUndefined()
       const journal = JSON.parse(readFileSync(join(
@@ -1430,7 +1631,7 @@ print('review complete')
       expect(review.payload).toMatchObject({
         complete: true,
         inputRevision: fixture.revisionTwo.revision,
-        slotSummary: { total: 5, responsesObtained: 2 },
+        slotSummary: { total: 3, responsesObtained: 1 },
       })
     } finally {
       await fixture.close()
@@ -1475,6 +1676,117 @@ print('review complete')
     }
   }, 15_000)
 
+  test('旧unified workflowのversion 8初期設計を更新後も再利用する', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true })
+    try {
+      expect((await fixture.call('investigation', 'revision-two')).payload)
+        .toMatchObject({ complete: true })
+      const revisionRoot = join(
+        fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`,
+      )
+      const journalPath = join(revisionRoot, 'investigation-1.json')
+      const current = JSON.parse(readFileSync(journalPath, 'utf8')) as Record<string, unknown>
+      writeFileSync(journalPath, `${JSON.stringify({
+        ...current,
+        version: 8,
+        advisorPolicy: undefined,
+        native: (['solution', 'risk'] as const).map((perspective, index) => ({
+          attempted: true, adopted: false, perspective,
+          reasonDigest: String(index + 1).repeat(64),
+          executionState: 'unavailable-before-start',
+        })),
+        grok: (['solution', 'risk'] as const).map((perspective, index) => ({
+          attempted: true, adopted: false, perspective, containmentVerified: true,
+          reasonDigest: String(index + 3).repeat(64),
+          executionState: 'unavailable-before-start',
+        })),
+      })}\n`, { mode: 0o600 })
+
+      const repeated = await fixture.call('investigation', 'revision-one')
+      expect(repeated.result.isError).not.toBe(true)
+      expect(repeated.payload).toMatchObject({
+        complete: true,
+        reusedPriorPhase: true,
+        inputRevision: fixture.revisionTwo.revision,
+      })
+    } finally {
+      await fixture.close()
+    }
+  }, 20_000)
+
+  test('legacy investigation単体を初期設計完了として再利用しない', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true })
+    try {
+      expect((await fixture.call('investigation', 'revision-two')).payload)
+        .toMatchObject({ complete: true })
+      const revisionRoot = join(
+        fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`,
+      )
+      const journalPath = join(revisionRoot, 'investigation-1.json')
+      const current = JSON.parse(readFileSync(journalPath, 'utf8')) as Record<string, unknown>
+      const unavailableClaude = current.claude
+      writeFileSync(journalPath, `${JSON.stringify({
+        ...current,
+        version: 8,
+        advisorPolicy: undefined,
+        repositoryObservation: 'observed',
+        native: (['solution', 'risk'] as const).map((perspective, index) => ({
+          attempted: true, adopted: false, perspective,
+          reasonDigest: String(index + 1).repeat(64),
+          executionState: 'unavailable-before-start',
+        })),
+        grok: (['solution', 'risk'] as const).map((perspective, index) => ({
+          attempted: true, adopted: false, perspective, containmentVerified: true,
+          reasonDigest: String(index + 3).repeat(64),
+          executionState: 'unavailable-before-start',
+        })),
+        claude: unavailableClaude,
+      })}\n`, { mode: 0o600 })
+
+      const repeated = await fixture.call('investigation', 'revision-one')
+      expect(repeated.result.isError).toBe(true)
+      expect(String(repeated.payload.reason)).toContain('ledger is inconsistent')
+    } finally {
+      await fixture.close()
+    }
+  }, 20_000)
+
+  test('completed fast pathでもattempt全体の同一round重複を拒否する', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true })
+    try {
+      expect((await fixture.call('investigation', 'revision-two')).payload)
+        .toMatchObject({ complete: true })
+      const sourceRoot = join(
+        fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`,
+      )
+      const duplicateRoot = join(
+        fixture.journalRoot,
+        `revision-${fixture.revisionOne.revision}-${fixture.revisionOne.digest.slice(0, 16)}`,
+      )
+      mkdirSync(duplicateRoot, { recursive: true, mode: 0o700 })
+      const journal = JSON.parse(
+        readFileSync(join(sourceRoot, 'investigation-1.json'), 'utf8'),
+      ) as Record<string, unknown>
+      writeFileSync(join(duplicateRoot, 'investigation-1.json'), `${JSON.stringify({
+        ...journal,
+        inputRevision: fixture.revisionOne.revision,
+        inputDigest: fixture.revisionOne.digest,
+      })}\n`, { mode: 0o600 })
+
+      const poll = await fixture.poll('investigation', 'revision-two')
+      expect(poll.result.isError).toBe(true)
+      expect(String(poll.payload.reason)).toContain('ledger is inconsistent')
+      const repeated = await fixture.call('investigation', 'revision-two')
+      expect(repeated.result.isError).toBe(true)
+      expect(String(repeated.payload.reason)).toContain('ledger is inconsistent')
+    } finally {
+      await fixture.close()
+    }
+  }, 20_000)
+
   test('単一workflowは最終reviewもattempt全体で一度だけ実行する', async () => {
     const fixture = await brokerFixture({ writeEnabled: true })
     try {
@@ -1498,15 +1810,334 @@ print('review complete')
     }
   }, 20_000)
 
-  test('単一workflow schemaはdesignとround 2をbroker起動前に拒否する', async () => {
+  test('単一workflowは条件付きreview round 2だけを一度許可し不正roundを起動前に拒否する', async () => {
     const fixture = await brokerFixture({ writeEnabled: true })
     try {
       const design = await fixture.call('design', 'revision-two')
       expect(design.result.isError).toBe(true)
       expect(String(design.payload.rawError)).toContain('Invalid option')
-      const roundTwo = await fixture.call('review', 'revision-two', 'adopted', 2)
+      const investigationTwo = await fixture.call('investigation', 'revision-two', 'adopted', 2)
+      expect(investigationTwo.result.isError).toBe(true)
+      const reviewThree = await fixture.call('review', 'revision-two', 'adopted', 3)
+      expect(reviewThree.result.isError).toBe(true)
+
+      const roundTwoBeforeRoundOne = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-r2',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '主要導線で再現する不具合',
+          taskOwnedFixDelta: '対象処理と回帰テストを修正',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(roundTwoBeforeRoundOne.result.isError).toBe(true)
+      expect(String(roundTwoBeforeRoundOne.payload.reason)).toContain('round 1')
+
+      expect((await fixture.call('investigation', 'revision-two')).payload)
+        .toMatchObject({ complete: true })
+      expect((await fixture.call('review', 'revision-two')).payload)
+        .toMatchObject({ complete: true })
+      const missingBasis = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-r2',
+      })
+      expect(missingBasis.result.isError).toBe(true)
+      expect(String(missingBasis.payload.reason)).toContain('requires')
+      const whitespaceBasis = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-r2',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: ' \n\t',
+          taskOwnedFixDelta: ' \n\t',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(whitespaceBasis.result.isError).toBe(true)
+      const descriptionOnlyDelta = await fixture.call(
+        'review', 'revision-two', 'adopted', 2,
+        {
+          nativeAgentId: '/root/native-risk-r2-no-delta',
+          roundTwoBasis: {
+            roundOneSources: ['native'],
+            mandatoryFindingSummary: '主要導線で再現する不具合',
+            taskOwnedFixDelta: '実際にはrepositoryを変更していない説明文だけの修正',
+            taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+          },
+        },
+      )
+      expect(descriptionOnlyDelta.result.isError).toBe(true)
+      expect(String(descriptionOnlyDelta.payload.reason)).toContain('host-observed non-empty')
+      writeFileSync(
+        join(fixture.repo, 'round-two-fix.ts'),
+        'export const reviewedFix = true\n',
+      )
+      const wrongOwnedPath = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-r2-wrong-path',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '主要導線で再現する不具合',
+          taskOwnedFixDelta: '対象処理と回帰テストを修正',
+          taskOwnedFixPaths: [{ repository: '.', path: 'another-task.ts' }],
+        },
+      })
+      expect(wrongOwnedPath.result.isError).toBe(true)
+      expect(String(wrongOwnedPath.payload.reason)).toContain('do not exactly match')
+      writeFileSync(join(fixture.repo, 'another-task.ts'), 'export const foreign = true\n')
+      const omittedForeignPath = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-r2-omitted-path',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '主要導線で再現する不具合',
+          taskOwnedFixDelta: '対象処理と回帰テストを修正',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(omittedForeignPath.result.isError).toBe(true)
+      expect(String(omittedForeignPath.payload.reason)).toContain('do not exactly match')
+      rmSync(join(fixture.repo, 'another-task.ts'))
+      const reusedNative = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '主要導線で再現する不具合',
+          taskOwnedFixDelta: '対象処理と回帰テストを修正',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(reusedNative.result.isError).toBe(true)
+      expect(String(reusedNative.payload.reason)).toContain('fresh native advisor')
+      const roundTwo = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-r2',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '主要導線で再現する不具合',
+          taskOwnedFixDelta: '対象処理と回帰テストを修正',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(roundTwo.payload).toMatchObject({ complete: true, round: 2 })
+      const repeated = await fixture.call('review', 'revision-one', 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-r2-second',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '同じ必須指摘',
+          taskOwnedFixDelta: '同じ修正差分',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(repeated.payload).toMatchObject({ complete: true, reusedPriorPhase: true, round: 2 })
+    } finally {
+      await fixture.close()
+    }
+  }, 30_000)
+
+  test('必須修正後の新しいinput revisionでreview round 2を一度だけ実行する', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true })
+    try {
+      expect((await fixture.call('investigation', 'revision-two')).payload)
+        .toMatchObject({ complete: true })
+      expect((await fixture.call('review', 'revision-two')).payload)
+        .toMatchObject({ complete: true, round: 1 })
+
+      writeFileSync(
+        join(fixture.repo, 'round-two-fix.ts'),
+        'export const reviewedFix = true\n',
+      )
+      const fixedInput = fixture.stageRevision('最終reviewの必須指摘を修正した')
+      expect(fixedInput.revision).toBeGreaterThan(fixture.revisionTwo.revision)
+      const roundTwo = await fixture.call('review', fixedInput, 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-after-fix',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '主要導線で再現する不具合',
+          taskOwnedFixDelta: '対象処理と直接回帰テストを修正',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(roundTwo.payload).toMatchObject({
+        complete: true,
+        round: 2,
+        inputRevision: fixedInput.revision,
+        inputDigest: fixedInput.digest,
+      })
+
+      const repeated = await fixture.call('review', fixedInput, 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-after-fix-second',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '同じ必須指摘',
+          taskOwnedFixDelta: '同じ修正差分',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(repeated.payload).toMatchObject({
+        complete: true,
+        alreadyObserved: true,
+        round: 2,
+        inputRevision: fixedInput.revision,
+      })
+
+      const reviewJournals = readdirSync(fixture.journalRoot)
+        .flatMap(name => readdirSync(join(fixture.journalRoot, name))
+          .filter(entry => entry === 'review-1.json' || entry === 'review-2.json'))
+      expect(reviewJournals.sort()).toEqual(['review-1.json', 'review-2.json'])
+    } finally {
+      await fixture.close()
+    }
+  }, 30_000)
+
+  test('review round 1後のHEAD移動はdirty path申告だけでtask-owned fixにしない', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true })
+    try {
+      expect((await fixture.call('investigation', 'revision-two')).payload)
+        .toMatchObject({ complete: true, round: 1 })
+      expect((await fixture.call('review', 'revision-two')).payload)
+        .toMatchObject({ complete: true, round: 1 })
+      writeFileSync(join(fixture.repo, 'round-two-fix.ts'), 'committed\n')
+      git(['add', 'round-two-fix.ts'], fixture.repo)
+      git(['commit', '-qm', 'concurrent commit'], fixture.repo)
+      writeFileSync(join(fixture.repo, 'round-two-fix.ts'), 'dirty after commit\n')
+      const roundTwo = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-r2-after-head-move',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '主要導線で再現する不具合',
+          taskOwnedFixDelta: '対象処理を修正',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
       expect(roundTwo.result.isError).toBe(true)
-      expect(String(roundTwo.payload.rawError)).toContain('Invalid input')
+      expect(String(roundTwo.payload.reason)).toContain('complete path-level')
+    } finally {
+      await fixture.close()
+    }
+  }, 20_000)
+
+  test('current-policy review第2回をlegacy review第1回へ結合しない', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true })
+    try {
+      expect((await fixture.call('investigation', 'revision-two')).payload)
+        .toMatchObject({ complete: true })
+      expect((await fixture.call('review', 'revision-two')).payload)
+        .toMatchObject({ complete: true })
+      const revisionRoot = join(
+        fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`,
+      )
+      const path = join(revisionRoot, 'review-1.json')
+      const current = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+      writeFileSync(path, `${JSON.stringify({
+        ...current,
+        version: 8,
+        advisorPolicy: undefined,
+        native: (['solution', 'risk'] as const).map((perspective, index) => ({
+          attempted: true, adopted: false, perspective,
+          reasonDigest: String(index + 1).repeat(64),
+          executionState: 'unavailable-before-start',
+        })),
+        grok: (['solution', 'risk'] as const).map((perspective, index) => ({
+          attempted: true, adopted: false, perspective, containmentVerified: true,
+          reasonDigest: String(index + 3).repeat(64),
+          executionState: 'unavailable-before-start',
+        })),
+      })}\n`, { mode: 0o600 })
+
+      const roundTwo = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-risk-r2',
+        roundTwoBasis: {
+          roundOneSources: ['native'],
+          mandatoryFindingSummary: '主要導線で再現する不具合',
+          taskOwnedFixDelta: '対象処理と回帰テストを修正',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(roundTwo.result.isError).toBe(true)
+      expect(String(roundTwo.payload.reason)).toContain('round 1')
+    } finally {
+      await fixture.close()
+    }
+  }, 25_000)
+
+  test('中断回収はshapeだけのreview第2回を先行reviewなしでterminal化しない', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true })
+    try {
+      const input = fixture.revisionTwo
+      const revisionRoot = join(
+        fixture.journalRoot,
+        `revision-${input.revision}-${input.digest.slice(0, 16)}`,
+      )
+      mkdirSync(revisionRoot, { recursive: true, mode: 0o700 })
+      const repositoryDigest = advisorRepositoryDigest(
+        snapshotAdvisorRepository(resolveAdvisorProjectLayout(fixture.repo)),
+      )
+      const startedAt = Date.now()
+      const common = {
+        version: 9,
+        advisorPolicy: 'three-phase-specific-conditional-final-v2',
+        status: 'requested',
+        jobId: fixture.jobId,
+        attemptNonce: fixture.nonce,
+        contextDigest: fixture.contextDigest,
+        processNonce: fixture.nonce,
+        phase: 'review',
+        round: 2,
+        inputRevision: input.revision,
+        inputDigest: input.digest,
+        repositoryDigest,
+        repositoryDigestBefore: repositoryDigest,
+        repositoryDeltaCurrentDigest: '8'.repeat(64),
+        brokerProcessId: 4242,
+        primaryEvidenceDigest: '5'.repeat(64),
+        native: [{
+          perspective: 'risk', attempted: true, adopted: true,
+          agentId: '/root/native-risk-r2', responseDigest: '1'.repeat(64),
+          responseTransportDigest: '2'.repeat(64), executionState: 'response-obtained',
+        }],
+        roundTwoBasis: {
+          reviewOneJournalDigest: '3'.repeat(64),
+          mandatoryFindingDigest: '4'.repeat(64),
+          repositoryBaselineDigest: '7'.repeat(64),
+          repositoryCurrentDigest: '8'.repeat(64),
+          changedRepositoryCount: 1,
+          taskOwnedFixDeltaDigest: threeAdvisorRepositoryDeltaDigest(
+            '7'.repeat(64), '8'.repeat(64), 1,
+          ),
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+          taskOwnedFixPathCount: 1,
+          taskOwnedFixPathsDigest: threeAdvisorTaskOwnedFixPathsDigest([
+            { repository: '.', path: 'round-two-fix.ts' },
+          ]),
+          roundOneSources: ['native'],
+          roundOneResponseDigests: { native: '6'.repeat(64) },
+        },
+        startedAt,
+      }
+      writeFileSync(join(revisionRoot, 'review-2.json'), `${JSON.stringify(common)}\n`, {
+        mode: 0o600,
+      })
+      writeFileSync(join(fixture.journalRoot, 'active-round.lock'), `${JSON.stringify({
+        version: 2,
+        jobId: fixture.jobId,
+        attemptNonce: fixture.nonce,
+        contextDigest: fixture.contextDigest,
+        processNonce: fixture.nonce,
+        phase: 'review',
+        round: 2,
+        inputRevision: input.revision,
+        inputDigest: input.digest,
+        brokerProcessId: 4242,
+        startedAt,
+      })}\n`, { mode: 0o600 })
+
+      expect(() => recordAdvisorExecutorRetirement({
+        stateDir: fixture.state,
+        jobId: fixture.jobId,
+        attemptNonce: fixture.nonce,
+        contextDigest: fixture.contextDigest,
+        fingerprint: fixture.fingerprint,
+        supervisor: {
+          pid: 9876, pgid: 9876, started: 'fixture-generation',
+          bootSession: 'fixture-boot', startSec: 1, startUsec: 0,
+        },
+      })).toThrow('not bound to one completed current-policy round 1')
     } finally {
       await fixture.close()
     }
@@ -1568,6 +2199,7 @@ print('review complete')
         inputDigest: input.digest,
         repositoryDigest,
         repositoryDigestBefore: repositoryDigest,
+        repositoryObservation: 'not-required-in-unified-workflow',
         brokerProcessId,
         primaryEvidenceDigest: '5'.repeat(64),
         native,
@@ -1653,6 +2285,73 @@ print('review complete')
       ) as Record<string, unknown>
       expect(journal.status).toBe('completed')
       expect(journal.receiptAcknowledgement).toBe('exact-echo')
+    } finally {
+      await fixture.close()
+    }
+  }, 15_000)
+
+  test('version 9 requested roundの中断復旧はphase別Grok 1枠とtotal 3を維持する', async () => {
+    const fixture = await brokerFixture()
+    try {
+      const armed = armRetiredRequestedRound(
+        fixture,
+        fixture.revisionTwo,
+        { version: 9 },
+      )
+      expect(finalizeRetiredAdvisorRounds(fixture.state)).toEqual({ finalized: 1 })
+      expect(existsSync(armed.lockPath)).toBe(false)
+      let journal = JSON.parse(readFileSync(armed.journalPath, 'utf8')) as Record<string, unknown>
+      expect(journal).toMatchObject({
+        version: 9,
+        advisorPolicy: 'three-phase-specific-conditional-final-v2',
+        status: 'reviewers-completed',
+        recoveredAfterInterruption: true,
+      })
+      expect((journal.native as Array<Record<string, unknown>>).map(value => value.perspective))
+        .toEqual(['solution'])
+      expect((journal.grok as Array<Record<string, unknown>>).map(value => value.perspective))
+        .toEqual(['solution'])
+
+      const { result, payload } = await fixture.call('investigation', 'revision-two')
+      expect(result.isError).not.toBe(true)
+      expect(payload).toMatchObject({
+        complete: true,
+        recoveredAfterInterruption: true,
+        slotSummary: {
+          total: 3,
+          started: 1,
+          responsesObtained: 1,
+          startUnconfirmed: 1,
+          unavailableBeforeStart: 1,
+        },
+      })
+      journal = JSON.parse(readFileSync(armed.journalPath, 'utf8')) as Record<string, unknown>
+      expect(journal.status).toBe('completed')
+    } finally {
+      await fixture.close()
+    }
+  }, 15_000)
+
+  test('version 9 review中断復旧はriskのGrok 1枠だけを記録する', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true })
+    try {
+      const armed = armRetiredRequestedRound(
+        fixture,
+        fixture.revisionTwo,
+        { version: 9, phase: 'review' },
+      )
+      expect(finalizeRetiredAdvisorRounds(fixture.state)).toEqual({ finalized: 1 })
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8')) as Record<string, unknown>
+      expect(journal).toMatchObject({
+        version: 9,
+        advisorPolicy: 'three-phase-specific-conditional-final-v2',
+        phase: 'review',
+        status: 'reviewers-completed',
+      })
+      expect((journal.native as Array<Record<string, unknown>>).map(value => value.perspective))
+        .toEqual(['risk'])
+      expect((journal.grok as Array<Record<string, unknown>>).map(value => value.perspective))
+        .toEqual(['risk'])
     } finally {
       await fixture.close()
     }

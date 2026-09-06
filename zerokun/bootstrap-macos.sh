@@ -688,7 +688,7 @@ EOF
 }
 
 grok_reviewer_ready() {
-  local root="$HOME/.grok-reviewer"
+  local root="$HOME/.zerokun/runtime/grok-reviewer"
   grok_build_executable >/dev/null && grok_auth_ready \
     && grok_reviewer_directory_ready "$root" \
     && grok_reviewer_directory_ready "$root/bin" \
@@ -759,7 +759,7 @@ run_doctor() {
   if grok_reviewer_ready; then
     printf '   %-20s %s\n' 'Grok reviewer:' 'ready (read-only検査)'
   else
-    printf '   %-20s %s\n' 'Grok reviewer:' "$HOME/.grok-reviewer/bin/grok が未導入またはunsafe"
+    printf '   %-20s %s\n' 'Grok reviewer:' "$HOME/.zerokun/runtime/grok-reviewer/bin/grok が未導入またはunsafe"
     missing=1
   fi
   if ! doctor_item 'Codex CLI' codex --version; then

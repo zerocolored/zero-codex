@@ -98,9 +98,9 @@ Slack bot
   Chrome子processと一時profileの回収をまとめて返します。
   UI/UX承認前は製品repositoryを書き換えず、現在画面とscratch内だけの提案画面を撮影します。画像は
   完全decode後にpixel-bearing chunkだけへ再封印し、metadataとローカルpathをSlackへ持ち出しません。
-- advisorの要否、人数、取得結果の扱いは`AGENTS.md`に従ってCodexが決めます。外部3枠には
+- advisorの要否、人数、取得結果の扱いは`AGENTS.md`に従ってCodexが決めます。GrokとClaudeには
   認証情報をモデルへ渡さない狭い`zerokun_advisors` transportだけを提供しますが、phase選択・quorum・
-  完了判定は行いません。5枠の起動／回答状態は構造化した実測値で返し、欠員をjob失敗へ変換しません。
+  完了判定は行いません。各phaseの3枠の起動／回答状態は構造化した実測値で返し、欠員をjob失敗へ変換しません。
   秘密・credential・個人情報をSlack依頼へ貼り付けないでください。
 - Socket Mode 停止中の DM・メンションと、採用済みスレッドの未メンション返信を履歴から回収します。
 
@@ -124,11 +124,16 @@ managed/MDMを含む実効permission検査には`app-server config/read`と`conf
 - Slack workspaceと、既存Appのtokenを管理できる権限（新規Appを使う場合はApp作成・install権限）
 - このMacでsubscription login済みのGrok CLIとClaude Code（Zeroちゃん稼働中にAPI key認証は行いません）
 
-advisorはprojectの`AGENTS.md`が利用を求める場合にprimary Codexが呼び出します。Codex native 2枠は
-通常のsub-agent、Grok 2枠とfresh Claude 1枠は`zerokun_advisors`経由です。transportは別のreview
-roundを強制せず、各枠を`未起動／起動未確認／起動済み未回答／回答取得`に分けて返します。
+advisorはprojectの`AGENTS.md`が利用を求める場合にprimary Codexが呼び出します。初期設計は
+`gpt-6-astra`のsolution analyst 1枠、最終review第1回は`gpt-5.6-sol`のrisk reviewer 1枠を通常の
+sub-agentとして起動し、各roundでGrok 1枠とfresh Claude Fable 5.1 1枠を`zerokun_advisors`経由で起動します。
+最終review第1回の必須指摘をprimary Codexが実際に採用し、task所有の修正差分を作った場合だけ、同じ3枠を
+freshにした第2回でその差分と直接の回帰だけを確認します。軽微な指摘、advisorの欠員、空の修正差分では
+第2回を起動せず、第3回はありません。transportはreview roundを独自に要求せず、各枠を
+`未起動／起動未確認／起動済み未回答／回答取得`に分けて返します。
 advisorが利用不能でも、`AGENTS.md`のbest-effort規則に従ってCodex本体の作業を継続します。
-Grok 1.0.5の既知の未認証応答を厳密に確認した場合だけ、macOSでは1 phaseにつき1回のOAuth復旧を
+Grok 1.0.5の既知の未認証応答を厳密に確認した場合だけ、macOSでは初期設計phaseと最終review phaseで
+それぞれ1回だけOAuth復旧を
 試み、成功時は認証で終了した枠だけを再実行します。認証画面・rate limit・quota・network障害を
 未認証と推測して繰り返すことはなく、復旧不能でもprimary Codexの作業は止めません。
 
@@ -480,8 +485,8 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   隠したGitHub transport用`zerokun_github`、およびoperatorが設定済みの検証済みChrome transportだけを
   必要なwrite jobで有効にします。
   Web検索はwrite許可jobだけに限定し、write jobのcommand networkはproxyを通してSlack関連domainを拒否します。
-- Zeroちゃんはadvisor数、review round、phase marker、publication planを成功条件として照合しません。
-  `zerokun_advisors`はprimary Codexが選んだ初期設計・最終reviewの外部枠を安全に起動し、5枠の
+- Zeroちゃんはadvisorの必須性や指摘の重大度、publication planを独自に裁定しません。
+  `zerokun_advisors`はprimary Codexが選んだ初期設計・最終reviewの外部枠を安全に起動し、各round 3枠の
   実測状態を返すtransportに限定します。利用不能なadvisorだけを理由にSlack jobを失敗させません。
   Slackの完全一致`中止`では現在turnを明示的に止めます。
 - App Serverの`turn/completed`と、fullな`agentMessage`を含むturn履歴が同じthread/turn IDで揃った

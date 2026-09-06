@@ -160,7 +160,7 @@ int main(void) {
     expect(result.exitCode).toBe(78)
     expect(result.stdout.toString()).toBe('')
     expect(result.stderr.toString()).toBe('GROK_REVIEWER_AUTH_REQUIRED\n')
-    expect(readdirSync(join(home, '.grok-reviewer')).filter(name => name.startsWith('run.')))
+    expect(readdirSync(join(home, '.zerokun/runtime/grok-reviewer')).filter(name => name.startsWith('run.')))
       .toEqual([])
   })
 
@@ -186,32 +186,32 @@ int main(void) {
 
   test('official downloads symlinkを受け入れowner-onlyに配置してrunを片付ける', () => {
     const { home } = fixture()
-    mkdirSync(join(home, '.grok-reviewer'), { mode: 0o755 })
+    mkdirSync(join(home, '.zerokun/runtime/grok-reviewer'), { mode: 0o755, recursive: true })
 
     const launcher = installGrokReviewer(home)
 
-    expect(launcher).toBe(join(realpathSync(home), '.grok-reviewer', 'bin', 'grok'))
-    expect(mode(join(home, '.grok-reviewer'))).toBe(0o700)
-    expect(mode(join(home, '.grok-reviewer', 'bin'))).toBe(0o700)
+    expect(launcher).toBe(join(realpathSync(home), '.zerokun/runtime/grok-reviewer', 'bin', 'grok'))
+    expect(mode(join(home, '.zerokun/runtime/grok-reviewer'))).toBe(0o700)
+    expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'bin'))).toBe(0o700)
     expect(mode(launcher)).toBe(0o700)
-    expect(mode(join(home, '.grok-reviewer', 'bin', 'reviewer-runtime.py'))).toBe(0o700)
-    expect(mode(join(home, '.grok-reviewer', 'bin', 'oauth-login-runtime.py'))).toBe(0o700)
-    expect(mode(join(home, '.grok-reviewer', 'bin', 'grok-login-oauth'))).toBe(0o700)
-    expect(mode(join(home, '.grok-reviewer', 'grok-identity.json'))).toBe(0o600)
-    expect(mode(join(home, '.grok-reviewer', 'config.toml'))).toBe(0o600)
-    expect(mode(join(home, '.grok-reviewer', 'sandbox.toml'))).toBe(0o600)
-    expect(mode(join(home, '.grok-reviewer', 'requirements.toml'))).toBe(0o600)
-    expect(readFileSync(join(home, '.grok-reviewer', 'config.toml'), 'utf8'))
+    expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'bin', 'reviewer-runtime.py'))).toBe(0o700)
+    expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'bin', 'oauth-login-runtime.py'))).toBe(0o700)
+    expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'bin', 'grok-login-oauth'))).toBe(0o700)
+    expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'grok-identity.json'))).toBe(0o600)
+    expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'config.toml'))).toBe(0o600)
+    expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'sandbox.toml'))).toBe(0o600)
+    expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'requirements.toml'))).toBe(0o600)
+    expect(readFileSync(join(home, '.zerokun/runtime/grok-reviewer', 'config.toml'), 'utf8'))
       .toContain('default = "grok-4.6"')
-    expect(readFileSync(join(home, '.grok-reviewer', 'requirements.toml'), 'utf8'))
+    expect(readFileSync(join(home, '.zerokun/runtime/grok-reviewer', 'requirements.toml'), 'utf8'))
       .toContain('disable_api_key_auth = true')
     const oauthLauncher = readFileSync(
-      join(home, '.grok-reviewer', 'bin', 'grok-login-oauth'), 'utf8',
+      join(home, '.zerokun/runtime/grok-reviewer', 'bin', 'grok-login-oauth'), 'utf8',
     )
     expect(oauthLauncher).not.toContain('__GROK_REAL_BIN_SH__')
     expect(oauthLauncher).not.toContain('__USER_HOME_SH__')
     const identity = JSON.parse(readFileSync(
-      join(home, '.grok-reviewer', 'grok-identity.json'), 'utf8',
+      join(home, '.zerokun/runtime/grok-reviewer', 'grok-identity.json'), 'utf8',
     )) as Record<string, unknown>
     expect(identity).toMatchObject({ version: 1, path: realpathSync(join(home, '.grok', 'bin', 'grok')) })
     expect(identity.sha256).toBe(createHash('sha256')
@@ -224,17 +224,37 @@ int main(void) {
     })
     expect(result.exitCode, result.stderr.toString()).toBe(0)
     expect(result.stdout.toString()).toContain('ARGS= <--no-auto-update> <--version>')
-    expect(result.stdout.toString()).toMatch(/SELF=.*\.grok-reviewer\/run\.[^/]+\/official-grok/)
-    expect(readdirSync(join(home, '.grok-reviewer')).filter(name => name.startsWith('run.')))
+    expect(result.stdout.toString()).toMatch(/SELF=.*\.zerokun\/runtime\/grok-reviewer\/run\.[^/]+\/official-grok/)
+    expect(readdirSync(join(home, '.zerokun/runtime/grok-reviewer')).filter(name => name.startsWith('run.')))
       .toEqual([])
+  })
+
+  test('global codex-configのGrok reviewer namespaceを変更しない', () => {
+    const { home } = fixture()
+    const sharedRoot = join(home, '.grok-reviewer')
+    const sharedBin = join(sharedRoot, 'bin')
+    const sentinel = join(sharedBin, 'grok')
+    mkdirSync(sharedBin, { recursive: true, mode: 0o700 })
+    chmodSync(sharedRoot, 0o700)
+    writeFileSync(sentinel, '#!/bin/sh\necho global-reviewer\n', { mode: 0o700 })
+    const before = lstatSync(sentinel)
+    const contents = readFileSync(sentinel)
+
+    const launcher = installGrokReviewer(home)
+
+    expect(launcher).toContain('/.zerokun/runtime/grok-reviewer/bin/grok')
+    expect(readFileSync(sentinel)).toEqual(contents)
+    const after = lstatSync(sentinel)
+    expect([after.dev, after.ino, after.mode, after.size, after.mtimeMs])
+      .toEqual([before.dev, before.ino, before.mode, before.size, before.mtimeMs])
   })
 
   test('auth.json未作成でも固定OAuth helperを導入できる', () => {
     const { home, auth } = fixture()
     rmSync(auth)
     expect(() => installGrokReviewer(home)).not.toThrow()
-    expect(existsSync(join(home, '.grok-reviewer', 'bin', 'grok-login-oauth'))).toBe(true)
-    expect(existsSync(join(home, '.grok-reviewer', 'grok-identity.json'))).toBe(true)
+    expect(existsSync(join(home, '.zerokun/runtime/grok-reviewer', 'bin', 'grok-login-oauth'))).toBe(true)
+    expect(existsSync(join(home, '.zerokun/runtime/grok-reviewer', 'grok-identity.json'))).toBe(true)
   })
 
   test('単発reviewへ再委任・web・write禁止と隔離環境を強制する', () => {
@@ -256,10 +276,10 @@ int main(void) {
     expect(output).toContain('<--tools> <read_file,grep,list_dir>')
     expect(output).not.toContain('independent review')
     expect(output).toContain('<--prompt-file>')
-    expect(output).toMatch(/GROK_HOME=.*\.grok-reviewer\/run\.[^/]+\/user-home\/\.grok/)
-    expect(output).toMatch(/HOME=.*\.grok-reviewer\/run\.[^/]+\/user-home/)
+    expect(output).toMatch(/GROK_HOME=.*\.zerokun\/runtime\/grok-reviewer\/run\.[^/]+\/user-home\/\.grok/)
+    expect(output).toMatch(/HOME=.*\.zerokun\/runtime\/grok-reviewer\/run\.[^/]+\/user-home/)
     expect(output).toMatch(
-      /^PATH=.*\.grok-reviewer\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin$/m,
+      /^PATH=.*\.zerokun\/runtime\/grok-reviewer\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin$/m,
     )
     expect(output).toContain('extends = "strict"')
     expect(output).toContain(
@@ -267,13 +287,13 @@ int main(void) {
     )
     expect(output).toMatch(new RegExp(
       `read_only = \\[${JSON.stringify(realpathSync(reviewRoot)).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`
-        + `, ".*\\.grok-reviewer/run\\.[^/]+/workspace"\\]`,
+        + `, ".*\\.zerokun/runtime/grok-reviewer/run\\.[^/]+/workspace"\\]`,
     ))
     expect(output).toContain(`${realpathSync(reviewRoot)}/**/.env.*`)
     expect(output).not.toContain('__ZEROKUN_')
     expect(output).toContain('<--deny> <Read(~/**)>')
     expect(output).not.toContain('/must-not-inherit')
-    expect(readdirSync(join(home, '.grok-reviewer')).filter(name => name.startsWith('run.')))
+    expect(readdirSync(join(home, '.zerokun/runtime/grok-reviewer')).filter(name => name.startsWith('run.')))
       .toEqual([])
   })
 
@@ -317,7 +337,7 @@ int main(void) {
     if (process.platform === 'darwin') {
       expect(output).toContain(`  ${JSON.stringify(realpathSync(deny))},`)
     }
-    expect(readdirSync(join(home, '.grok-reviewer')).filter(name => name.startsWith('run.')))
+    expect(readdirSync(join(home, '.zerokun/runtime/grok-reviewer')).filter(name => name.startsWith('run.')))
       .toEqual([])
   })
 
@@ -363,19 +383,19 @@ int main(void) {
     const output = result.stdout.toString()
     expect(result.exitCode, result.stderr.toString()).toBe(0)
     expect(output).toContain('<--prompt-file>')
-    expect(output).toMatch(/<[^>]+\.grok-reviewer\/run\.[^/]+\/workspace\/review-prompt>/)
+    expect(output).toMatch(/<[^>]+\.zerokun\/runtime\/grok-reviewer\/run\.[^/]+\/workspace\/review-prompt>/)
     expect(output).toMatch(new RegExp(`PROMPT_BYTES=\\s*${Buffer.byteLength(confidentialBody)}(?:\\s|$)`))
     expect(output).toContain('PROMPT_MODE=600')
     expect(output).toContain('PROMPT_LINKS=1')
     expect(output).not.toContain(confidentialBody)
-    expect(readdirSync(join(home, '.grok-reviewer')).filter(name => name.startsWith('run.')))
+    expect(readdirSync(join(home, '.zerokun/runtime/grok-reviewer')).filter(name => name.startsWith('run.')))
       .toEqual([])
   })
 
   test('並列review起動を直列化しowner receipt前crashのrunも自動回収する', async () => {
     const { home, reviewRoot } = fixture()
     const launcher = installGrokReviewer(home)
-    const reviewerRoot = join(home, '.grok-reviewer')
+    const reviewerRoot = join(home, '.zerokun/runtime/grok-reviewer')
     const ownerless = join(reviewerRoot, 'run.ownerless-fixture')
     mkdirSync(ownerless, { mode: 0o700 })
 
@@ -465,7 +485,7 @@ int main(void) {
       expect(result.exitCode).toBe(64)
       expect(result.stdout.toString() + result.stderr.toString()).not.toContain(inlineBody)
     }
-    expect(readdirSync(join(home, '.grok-reviewer')).filter(name => name.startsWith('run.')))
+    expect(readdirSync(join(home, '.zerokun/runtime/grok-reviewer')).filter(name => name.startsWith('run.')))
       .toEqual([])
   }, 15_000)
 
@@ -484,7 +504,7 @@ int main(void) {
     child.stdin.write(confidential)
     child.stdin.end()
 
-    const reviewerRoot = join(home, '.grok-reviewer')
+    const reviewerRoot = join(home, '.zerokun/runtime/grok-reviewer')
     let childReceipt = ''
     const receiptDeadline = Date.now() + 5_000
     while (!childReceipt && Date.now() < receiptDeadline) {

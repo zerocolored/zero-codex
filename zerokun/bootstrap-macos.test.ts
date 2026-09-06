@@ -110,7 +110,7 @@ function setupDoctorGrok(fakeHome: string): void {
   symlinkSync('grok-1.0.0', join(grokBin, 'grok'))
   writeFileSync(join(grokRoot, 'auth.json'), '{"fixture":true}\n', { mode: 0o600 })
 
-  const reviewerRoot = join(fakeHome, '.grok-reviewer')
+  const reviewerRoot = join(fakeHome, '.zerokun/runtime/grok-reviewer')
   const reviewerBin = join(reviewerRoot, 'bin')
   mkdirSync(reviewerBin, { recursive: true, mode: 0o700 })
   chmodSync(reviewerRoot, 0o700)

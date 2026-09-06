@@ -12525,9 +12525,10 @@ export interface HostAdvisorCoverage {
   version: 1
   phases: Array<{
     phase: 'investigation' | 'review'
+    round: 1 | 2
     inputRevision: number
     finishedAt: number
-    total: 5
+    total: 3 | 5
     started: number
     responsesObtained: number
     startedNoResponse: number
@@ -15535,14 +15536,14 @@ function stageHostCapturedArtifacts(
   return [...new Set(staged)]
 }
 
-const ADVISOR_COVERAGE_SUBJECT = /(?:Five[- ]Advisor|独立(?:した)?(?:レビュー|確認|検証|枠)|補助(?:レビュー|確認|検証|枠)|外部(?:レビュー|確認|検証|枠)|\b(?:advisors?|reviewers?)\b|アドバイザー|レビュアー|(?:Codex|Claude|Grok).{0,16}(?:レビュー|検証枠|確認枠|枠)|(?:全|全て|全員|5|五)\s*(?:つの)?(?:AI|モデル|枠|人|名|者))/iu
-const ADVISOR_COVERAGE_ASSERTION = /(?:すべて|全(?:て|員)?|残(?:る|り)|有効|不採択|採択|利用不能|欠員|試行|起動|実施|実行|回答|取得|完了|成功|失敗|使(?:え|用)|見解|意見|揃|一致|確認(?:済み|でき)|\d+\s*\/\s*5|[0-9０-９一二三四五六七八九十]+\s*(?:件|枠|人|名|者))/u
+const ADVISOR_COVERAGE_SUBJECT = /(?:(?:Three|Five)[- ]Advisor|独立(?:した)?(?:レビュー|確認|検証|枠)|補助(?:レビュー|確認|検証|枠)|外部(?:レビュー|確認|検証|枠)|\b(?:advisors?|reviewers?)\b|アドバイザー|レビュアー|(?:Codex|Claude|Grok).{0,16}(?:レビュー|検証枠|確認枠|枠)|(?:全|全て|全員|3|三|5|五)\s*(?:つの)?(?:AI|モデル|枠|人|名|者))/iu
+const ADVISOR_COVERAGE_ASSERTION = /(?:すべて|全(?:て|員)?|残(?:る|り)|有効|不採択|採択|利用不能|欠員|試行|起動|実施|実行|回答|取得|完了|成功|失敗|使(?:え|用)|見解|意見|揃|一致|確認(?:済み|でき)|\d+\s*\/\s*[35]|[0-9０-９一二三四五六七八九十]+\s*(?:件|枠|人|名|者))/u
 // Cross-sentence context is intentionally limited to words which still name
 // advisor slots.  A broad `N件` continuation used to erase unrelated facts
 // such as "変更ファイルは3件です" from the same paragraph.
 const ADVISOR_COVERAGE_CONTEXT = /(?:残(?:る|り)(?:の)?\s*[0-9０-９一二三四五六七八九十]+\s*枠|そのうち\s*[0-9０-９一二三四五六七八九十]+\s*枠|両枠|両方の枠|(?:有効|不採択|採択|利用不能|欠員)(?:だった|となった|の)?\s*[0-9０-９一二三四五六七八九十]+\s*枠)/u
 const ADVISOR_COVERAGE_OPERATION = /(?:試行|起動|実施|実行|回答|取得|利用不能|欠員|不採択|採択|使え|見解.{0,12}揃|意見.{0,12}一致)/u
-const ADVISOR_COVERAGE_QUANTITY = /(?:全|全て|全員|\d+\s*\/\s*5|[0-9０-９一二三四五六七八九十]+\s*(?:枠|人|名|者|モデル|AI))/u
+const ADVISOR_COVERAGE_QUANTITY = /(?:全|全て|全員|\d+\s*\/\s*[35]|[0-9０-９一二三四五六七八九十]+\s*(?:枠|人|名|者|モデル|AI))/u
 
 function advisorCoverageClause(clause: string): boolean {
   const normalized = clause.replace(/\s+/g, ' ').trim()
@@ -15567,7 +15568,48 @@ function advisorCoverageClause(clause: string): boolean {
     && /(?:レビュー|確認|検証|試行|実施|実行|回答|起動)/u.test(normalized)
 }
 
-const HOST_ADVISOR_COVERAGE_LINE = /^独立レビュー実行記録\(ホスト確認\): (?:完了した実行記録なし（実行済みとは報告しません）|(?:(?:初期設計|最終レビュー)—起動[0-5]\/5・回答[0-5]\/5・起動済み(?:未回答|回答未確認)[0-5]\/5・起動未確認[0-5]\/5・起動前利用不能[0-5]\/5)(?:、(?:初期設計|最終レビュー)—起動[0-5]\/5・回答[0-5]\/5・起動済み(?:未回答|回答未確認)[0-5]\/5・起動未確認[0-5]\/5・起動前利用不能[0-5]\/5)*)。$/u
+const HOST_ADVISOR_COVERAGE_SEGMENT = /^起動([0-5])\/([35])・回答([0-5])\/\2・起動済み(?:未回答|回答未確認)([0-5])\/\2・起動未確認([0-5])\/\2・起動前利用不能([0-5])\/\2$/u
+
+function validHostAdvisorCoverageLine(value: string): boolean {
+  if (value === '独立レビュー実行記録(ホスト確認): 完了した実行記録なし（実行済みとは報告しません）。') {
+    return true
+  }
+  const match = /^独立レビュー実行記録\(ホスト確認\): (.+)。$/u.exec(value)
+  if (!match) return false
+  const segments = match[1]!.split('、')
+  if (segments.length < 1 || segments.length > 3) return false
+  const labels: string[] = []
+  const logicalLabels = new Set<string>()
+  const valid = segments.every(segment => {
+    const separator = segment.indexOf('—')
+    if (separator <= 0) return false
+    const label = segment.slice(0, separator)
+    if (!['初期設計', '最終レビュー', '最終レビュー第1回', '最終レビュー第2回']
+      .includes(label)) return false
+    const logicalLabel = label === '最終レビュー' ? '最終レビュー第1回' : label
+    if (logicalLabels.has(logicalLabel)) return false
+    logicalLabels.add(logicalLabel)
+    labels.push(label)
+    const parsed = HOST_ADVISOR_COVERAGE_SEGMENT.exec(segment.slice(separator + 1))
+    if (!parsed) return false
+    const total = Number(parsed[2])
+    const started = Number(parsed[1])
+    const answered = Number(parsed[3])
+    const startedNoAnswer = Number(parsed[4])
+    const startUnconfirmed = Number(parsed[5])
+    const unavailable = Number(parsed[6])
+    return [started, answered, startedNoAnswer, startUnconfirmed, unavailable]
+      .every(count => count <= total)
+      && started === answered + startedNoAnswer
+      && answered + startedNoAnswer + startUnconfirmed + unavailable === total
+  })
+  if (!valid) return false
+  const reviewOneIndex = labels.findIndex(label => (
+    label === '最終レビュー' || label === '最終レビュー第1回'
+  ))
+  const reviewTwoIndex = labels.indexOf('最終レビュー第2回')
+  return reviewTwoIndex < 0 || (reviewOneIndex >= 0 && reviewOneIndex < reviewTwoIndex)
+}
 
 function stripModelAuthoredAdvisorCoverage(
   text: string,
@@ -15583,7 +15625,7 @@ function stripModelAuthoredAdvisorCoverage(
       .filter(clause => clause.length > 0)
     const coverageContext = clauses.some(advisorCoverageClause)
     return clauses.map(clause => {
-      if (preserveHostCoverageLine && HOST_ADVISOR_COVERAGE_LINE.test(clause.trim())) {
+      if (preserveHostCoverageLine && validHostAdvisorCoverageLine(clause.trim())) {
         return clause
       }
       const direct = advisorCoverageClause(clause)
@@ -15608,11 +15650,13 @@ function hostAdvisorCoverageLine(coverage?: HostAdvisorCoverage): string {
   const phases = [...coverage.phases]
     .sort((left, right) => left.finishedAt - right.finishedAt)
     .map(value => {
-      const label = value.phase === 'investigation' ? '初期設計' : '最終レビュー'
-      return `${label}—起動${value.started}/5・回答${value.responsesObtained}/5`
-        + `・起動済み回答未確認${value.startedNoResponse}/5`
-        + `・起動未確認${value.startUnconfirmed}/5`
-        + `・起動前利用不能${value.unavailableBeforeStart}/5`
+      const label = value.phase === 'investigation'
+        ? '初期設計'
+        : `最終レビュー第${value.round}回`
+      return `${label}—起動${value.started}/${value.total}・回答${value.responsesObtained}/${value.total}`
+        + `・起動済み回答未確認${value.startedNoResponse}/${value.total}`
+        + `・起動未確認${value.startUnconfirmed}/${value.total}`
+        + `・起動前利用不能${value.unavailableBeforeStart}/${value.total}`
     })
   return `独立レビュー実行記録(ホスト確認): ${phases.join('、')}。`
 }
@@ -15779,7 +15823,7 @@ function normalizePersistedExecutionResult(
   const sanitized = sanitizeExecutionTextForSlack(job, sessionId, output.text, dir)
   const lines = sanitized.split(/\r?\n/)
   const trustedCoverageLine = lines.length > 0
-    && HOST_ADVISOR_COVERAGE_LINE.test(lines[lines.length - 1]!.trim())
+    && validHostAdvisorCoverageLine(lines[lines.length - 1]!.trim())
     ? lines.pop()!.trim()
     : ''
   while (trustedCoverageLine && lines.at(-1)?.trim() === '') lines.pop()

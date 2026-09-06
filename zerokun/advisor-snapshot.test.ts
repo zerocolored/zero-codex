@@ -69,6 +69,22 @@ describe('advisor repository snapshot', () => {
     expect(advisorRepositoryDigest(deleted)).not.toBe(modified)
   })
 
+  test('単一repositoryの変更要約は内部absolute pathではなくdot labelを使う', () => {
+    const repository = fixtureDir()
+    git(repository, ['init', '-q'])
+    git(repository, ['config', 'user.name', 'Zero Test'])
+    git(repository, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(repository, 'tracked.txt'), 'before\n')
+    git(repository, ['add', '.'])
+    git(repository, ['commit', '-qm', 'initial'])
+    const layout = resolveAdvisorProjectLayout(repository)
+    const baseline = snapshotAdvisorRepository(layout)
+    writeFileSync(join(repository, 'tracked.txt'), 'after\n')
+    const current = snapshotAdvisorRepository(layout)
+    expect(summarizeAdvisorRepositoryChanges(baseline, current).repositories)
+      .toMatchObject([{ repository: '.', changedPaths: ['tracked.txt'] }])
+  })
+
   test('non-Git treeをbounded no-followでsnapshotし、symlink targetは読まない', () => {
     const project = fixtureDir()
     const outside = fixtureDir()

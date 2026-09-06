@@ -75,6 +75,7 @@ const claudeArguments = [
   '--safe-mode',
   '--no-chrome',
   '--disable-slash-commands',
+  '--model=claude-fable-5-1',
 ]
 
 function fakeLifecycle(home: string, project: string): {
@@ -135,7 +136,7 @@ if args == ["pane", "process-info", "--pane", pane]:
         missing("pane_not_found")
     claude_pid = 999994 if state.get("process_changed") else 999992
     process_group_id = 999995 if state.get("process_changed") else 999993
-    processes = [{"pid": claude_pid, "argv": ["claude", "--dangerously-skip-permissions", "--safe-mode", "--no-chrome", "--disable-slash-commands"], "argv0": "claude"}] if state["process"] else []
+    processes = [{"pid": claude_pid, "argv": ["claude", "--dangerously-skip-permissions", "--safe-mode", "--no-chrome", "--disable-slash-commands", "--model=claude-fable-5-1"], "argv0": "claude"}] if state["process"] else []
     success({"process_info": {"pane_id": pane, "shell_pid": 999991, "foreground_process_group_id": process_group_id, "foreground_processes": processes}})
 if args == ["agent", "get", agent_name]:
     if not state["owned"] or not state["agent"]:
@@ -521,16 +522,22 @@ describe('fifth-advisor helper installer', () => {
       'metadata={"kind":"regular","file_type":stat.S_IFREG,"mode":0o100700,"uid":0,"gid":0,"nlink":1,"size":1,"dev":1,"ino":1,"rdev":0,"mtime_ns":1,"ctime_ns":1}',
       'executable={"lookup_path":"/fixture/claude","lookup_metadata":metadata,"resolved_path":"/fixture/claude","resolved_metadata":metadata}',
       'required=["--dangerously-skip-permissions","--safe-mode","--no-chrome","--disable-slash-commands"]',
+      'model="--model=claude-fable-5-1"',
       'def valid(values): return module._valid_claude_invocation(["claude",*values],"claude",executable)',
       'result={',
-      ' "exact":valid(required),',
-      ' "reordered":valid(["--effort","max",required[2],required[0],required[3],required[1]]),',
-      ' "unknown_bare_benign":valid([*required,"--diagnostic-footer"]),',
-      ' "duplicate_required":valid([*required,required[0]]),',
-      ' "required_override":valid([*required[:-1],"--disable-slash-commands=false"]),',
-      ' "resume":valid([*required,"--resume=foreign-session"]),',
-      ' "permission_override":valid([*required,"--permission-mode","default"]),',
-      ' "startup_prompt":valid([*required,"untrusted prompt"]),',
+      ' "exact":valid([*required,model]),',
+      ' "split_model":valid([*required,"--model","claude-fable-5-1"]),',
+      ' "missing_model":valid(required),',
+      ' "wrong_model":valid([*required,"--model=claude-sonnet-4-6"]),',
+      ' "duplicate_model":valid([*required,model,model]),',
+      ' "fallback_model":valid([*required,model,"--fallback-model=claude-sonnet-4-6"]),',
+      ' "reordered":valid(["--effort","max",required[2],model,required[0],required[3],required[1]]),',
+      ' "unknown_bare_benign":valid([*required,model,"--diagnostic-footer"]),',
+      ' "duplicate_required":valid([*required,model,required[0]]),',
+      ' "required_override":valid([*required[:-1],model,"--disable-slash-commands=false"]),',
+      ' "resume":valid([*required,model,"--resume=foreign-session"]),',
+      ' "permission_override":valid([*required,model,"--permission-mode","default"]),',
+      ' "startup_prompt":valid([*required,model,"untrusted prompt"]),',
       '}',
       'print(json.dumps(result,sort_keys=True))',
     ].join('\n')
@@ -540,14 +547,43 @@ describe('fifth-advisor helper installer', () => {
     expect(result.exitCode, result.stderr.toString()).toBe(0)
     expect(JSON.parse(result.stdout.toString())).toEqual({
       duplicate_required: false,
+      duplicate_model: false,
       exact: true,
+      fallback_model: false,
+      missing_model: false,
       permission_override: false,
       reordered: true,
       required_override: false,
       resume: false,
+      split_model: true,
       startup_prompt: false,
       unknown_bare_benign: true,
+      wrong_model: false,
     })
+  })
+
+  test('open境界がFable modelをexact 1件でHerdr agent startへ渡す', () => {
+    const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
+    const program = [
+      'import importlib.util,json,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'command=module._claude_start_command("fifth-test","wOWN:p1")',
+      'print(json.dumps(command))',
+    ].join('\n')
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], {
+      stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    const command = JSON.parse(result.stdout.toString()) as string[]
+    expect(command.slice(0, 10)).toEqual([
+      'agent', 'start', 'fifth-test', '--kind', 'claude',
+      '--pane', 'wOWN:p1', '--timeout', '300000', '--',
+    ])
+    expect(command.filter(value => value === '--model=claude-fable-5-1')).toHaveLength(1)
+    expect(command.some(value => value === '--model' || value.startsWith('--fallback-model')))
+      .toBe(false)
   })
 
   test('agent_not_ready後のblocked launchはexact trust検査へだけ渡す', () => {

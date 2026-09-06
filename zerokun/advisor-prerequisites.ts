@@ -21,8 +21,9 @@ import {
 } from './install-grok-reviewer.ts'
 import { resolveCodexExecutableDetails } from './standalone-codex.ts'
 
-export const DEDICATED_GROK_RELATIVE_PATH = '.grok-reviewer/bin/grok' as const
-export const DEDICATED_GROK_OAUTH_RELATIVE_PATH = '.grok-reviewer/bin/grok-login-oauth' as const
+export const DEDICATED_GROK_RUNTIME_RELATIVE_PATH = '.zerokun/runtime/grok-reviewer' as const
+export const DEDICATED_GROK_RELATIVE_PATH = `${DEDICATED_GROK_RUNTIME_RELATIVE_PATH}/bin/grok` as const
+export const DEDICATED_GROK_OAUTH_RELATIVE_PATH = `${DEDICATED_GROK_RUNTIME_RELATIVE_PATH}/bin/grok-login-oauth` as const
 
 function sameMetadata(left: Stats, right: Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
@@ -77,7 +78,7 @@ function requireExactFile(path: string, expected: Buffer, options: { executable?
  */
 export function resolveDedicatedGrokLauncher(home = homedir()): string {
   const homePhysical = realpathSync(home)
-  const reviewerRoot = join(homePhysical, '.grok-reviewer')
+  const reviewerRoot = join(homePhysical, DEDICATED_GROK_RUNTIME_RELATIVE_PATH)
   const reviewerBin = join(reviewerRoot, 'bin')
   const requested = join(homePhysical, DEDICATED_GROK_RELATIVE_PATH)
   try {
@@ -128,7 +129,7 @@ export function resolveDedicatedGrokLauncher(home = homedir()): string {
 /** Resolve the separately optional, fixed no-argument OAuth recovery helper. */
 export function resolveDedicatedGrokOAuthHelper(home = homedir()): string {
   const homePhysical = realpathSync(home)
-  const reviewerRoot = join(homePhysical, '.grok-reviewer')
+  const reviewerRoot = join(homePhysical, DEDICATED_GROK_RUNTIME_RELATIVE_PATH)
   const reviewerBin = join(reviewerRoot, 'bin')
   const requested = join(homePhysical, DEDICATED_GROK_OAUTH_RELATIVE_PATH)
   try {

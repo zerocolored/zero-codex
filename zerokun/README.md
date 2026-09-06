@@ -214,10 +214,12 @@ codex <trust-args> -C <repo> \
 - `writeAllowFrom` の sender: minimal runtime + repository/`.git` write + network + browser/local bind
 - read senderは1つのread-only Codex workflow、write senderは1つのwrite-authorized Codex workflowを使います。
   advisor、review、test、Git、deployの進め方はCodexが`AGENTS.md`から決め、Zeroちゃんは別phaseへ分割しません。
-- advisorが必要なjobでは、native Codex 2枠に加え、`zerokun_advisors`がGrok 2枠とfresh Claude 1枠を
-  best-effortで起動します。返却するslot集計は`未起動／起動未確認／起動済み未回答／回答取得`を区別し、
-  primary Codexはこの構造化値だけを人数報告の根拠にします。
-- Grokの既知の未認証応答だけは、phase内で1回に限って固定OAuth helperへ渡し、復旧できた場合も
+- advisorが必要なjobでは、初期設計のnative Codex solution analyst 1枠、最終reviewのnative Codex risk reviewer
+  1枠に加え、`zerokun_advisors`が各roundでGrok 1枠とfresh Claude Fable 5.1 1枠をbest-effortで起動します。
+  最終review第2回は、第1回の必須指摘をprimary Codexが採用しtask所有の修正差分を作った場合だけ、そのdeltaに
+  限って起動します。軽微な指摘・advisor欠員・空deltaでは起動せず、第3回はありません。返却するslot集計は
+  `未起動／起動未確認／起動済み未回答／回答取得`を区別し、primary Codexはこの構造化値だけを人数報告の根拠にします。
+- Grokの既知の未認証応答だけは、初期設計phaseと最終review phaseでそれぞれ1回に限って固定OAuth helperへ渡し、復旧できた場合も
   認証で終了した枠だけを再実行します。helper、reviewer、Claudeの失敗は外部枠の利用不能として閉じ、
   primary Codexのtaskを失敗や再設計へ戻しません。
 - write jobでは公開HTTPSへ到達できるBrowser／Chrome、localhost用の隔離browser verifier、

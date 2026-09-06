@@ -6,6 +6,11 @@ import {
   sameAppServerSessionSource,
   type AppServerSessionSource,
 } from './codex-app-server-session.ts'
+import {
+  advisorPerspectiveForPhase,
+  THREE_ADVISOR_JOURNAL_VERSION,
+  validThreeAdvisorPhaseRound,
+} from './advisor-journal.ts'
 
 export type NativeAdvisorPerspective = 'solution' | 'risk'
 
@@ -34,6 +39,8 @@ export function retryableNativeAdvisorHistoryMaterialization(
 }
 
 export type NativeAdvisorRoundEvidence = {
+  /** Omitted by legacy fixtures and treated as the original two-native contract. */
+  journalVersion?: number
   inputRevision: number
   inputDigest: string
   phase: 'investigation' | 'design' | 'review'
@@ -904,11 +911,20 @@ export function assertNativeAdvisorEvidence(options: {
     ['risk', 0],
   ])
   for (const evidence of options.rounds) {
-    if (!Array.isArray(evidence.native) || evidence.native.length !== 2) {
+    const threeAdvisor = evidence.journalVersion === THREE_ADVISOR_JOURNAL_VERSION
+    if (threeAdvisor && !validThreeAdvisorPhaseRound(evidence.phase, evidence.round)) {
+      throw new Error(`native advisor ${evidence.phase}-${evidence.round} is invalid for v9`)
+    }
+    const expectedPerspectives: NativeAdvisorPerspective[] = threeAdvisor
+      ? [advisorPerspectiveForPhase(evidence.phase)]
+      : ['solution', 'risk']
+    if (!Array.isArray(evidence.native)
+      || evidence.native.length !== expectedPerspectives.length) {
       throw new Error(`native advisor ${evidence.phase}-${evidence.round} count is invalid`)
     }
     const perspectives = new Set(evidence.native.map(entry => entry.perspective))
-    if (perspectives.size !== 2 || !perspectives.has('solution') || !perspectives.has('risk')) {
+    if (perspectives.size !== expectedPerspectives.length
+      || expectedPerspectives.some(perspective => !perspectives.has(perspective))) {
       throw new Error(`native advisor ${evidence.phase}-${evidence.round} roles are invalid`)
     }
     for (const entry of evidence.native) {

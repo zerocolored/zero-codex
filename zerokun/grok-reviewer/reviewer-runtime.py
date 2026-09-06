@@ -1191,8 +1191,12 @@ def _run_supervised(reviewer_root: Path, run_root: Path, command: list[str]) -> 
 
 def _verify_install(reviewer_root: Path, real_home: Path, grok: Path, auth: Path) -> int:
     try:
-        if reviewer_root.resolve(strict=True).parent != real_home.resolve(strict=True):
+        home = real_home.resolve(strict=True)
+        expected_root = home / ".zerokun" / "runtime" / "grok-reviewer"
+        if reviewer_root.resolve(strict=True) != expected_root:
             return 7
+        _safe_owned_directory(home / ".zerokun", private=True)
+        _safe_owned_directory(home / ".zerokun" / "runtime", private=True)
         _resolve_official_grok(real_home, grok)
         _safe_regular(auth, executable=False, maximum=MAX_AUTH_BYTES, private=True)
         _safe_owned_directory(reviewer_root, private=True)
