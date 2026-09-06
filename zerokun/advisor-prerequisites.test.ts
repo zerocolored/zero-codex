@@ -59,14 +59,14 @@ describe('dedicated Grok prerequisite', () => {
     const path = installFixture(home)
     expect(resolveDedicatedGrokLauncher(home)).toBe(realpathSync(path))
     expect(resolveDedicatedGrokOAuthHelper(home)).toBe(
-      join(realpathSync(home), '.grok-reviewer', 'bin', 'grok-login-oauth'),
+      join(realpathSync(home), '.zerokun/runtime/grok-reviewer', 'bin', 'grok-login-oauth'),
     )
   })
 
   test('OAuth helper/runtime/実行binary identityの改変を個別に拒否する', () => {
     const helperHome = fixtureHome()
     installFixture(helperHome)
-    const helper = join(helperHome, '.grok-reviewer', 'bin', 'grok-login-oauth')
+    const helper = join(helperHome, '.zerokun/runtime/grok-reviewer', 'bin', 'grok-login-oauth')
     writeFileSync(helper, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
     expect(() => resolveDedicatedGrokOAuthHelper(helperHome)).toThrow('未導入または安全ではありません')
     expect(() => resolveDedicatedGrokLauncher(helperHome)).not.toThrow()
@@ -96,7 +96,7 @@ describe('dedicated Grok prerequisite', () => {
   test('bundle改変は拒否しlogin authの可用性はservice gateにしない', () => {
     const configHome = fixtureHome()
     installFixture(configHome)
-    writeFileSync(join(configHome, '.grok-reviewer', 'config.toml'), 'tampered = true\n', { mode: 0o600 })
+    writeFileSync(join(configHome, '.zerokun/runtime/grok-reviewer', 'config.toml'), 'tampered = true\n', { mode: 0o600 })
     expect(() => resolveDedicatedGrokLauncher(configHome)).toThrow('未導入または安全ではありません')
 
     const authHome = fixtureHome()
@@ -113,7 +113,7 @@ describe('dedicated Grok prerequisite', () => {
   test('launcher/runtimeのleaf symlinkとowner実行不能modeを拒否する', () => {
     const launcherHome = fixtureHome()
     const launcher = installFixture(launcherHome)
-    const launcherCopy = join(launcherHome, '.grok-reviewer', 'bin', 'grok-copy')
+    const launcherCopy = join(launcherHome, '.zerokun/runtime/grok-reviewer', 'bin', 'grok-copy')
     writeFileSync(launcherCopy, readFileSync(launcher), { mode: 0o700 })
     rmSync(launcher)
     symlinkSync('grok-copy', launcher)
@@ -122,8 +122,8 @@ describe('dedicated Grok prerequisite', () => {
 
     const runtimeHome = fixtureHome()
     installFixture(runtimeHome)
-    const runtime = join(runtimeHome, '.grok-reviewer', 'bin', 'reviewer-runtime.py')
-    const runtimeCopy = join(runtimeHome, '.grok-reviewer', 'bin', 'runtime-copy.py')
+    const runtime = join(runtimeHome, '.zerokun/runtime/grok-reviewer', 'bin', 'reviewer-runtime.py')
+    const runtimeCopy = join(runtimeHome, '.zerokun/runtime/grok-reviewer', 'bin', 'runtime-copy.py')
     writeFileSync(runtimeCopy, readFileSync(runtime), { mode: 0o700 })
     rmSync(runtime)
     symlinkSync('runtime-copy.py', runtime)

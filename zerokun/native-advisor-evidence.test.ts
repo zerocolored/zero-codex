@@ -133,6 +133,31 @@ function fixture(): {
 }
 
 describe('native Codex advisor host evidence', () => {
+  test('journal version 9はphaseに対応するnative 1枠を履歴照合する', () => {
+    const { options, solutionId, riskId } = fixture()
+    options.rounds[0]!.journalVersion = 9
+    options.rounds[0]!.native = [options.rounds[0]!.native[0]!]
+    const parent = options.parentResponse as {
+      thread: { turns: Array<{ items: Array<{ agentThreadId?: string }> }> }
+    }
+    parent.thread.turns[0]!.items = parent.thread.turns[0]!.items
+      .filter(item => item.agentThreadId === solutionId)
+    options.childrenListResponse = {
+      data: [{ id: solutionId, parentThreadId: options.parentThreadId }],
+      nextCursor: null,
+    }
+    options.childResponses.delete(riskId)
+    options.childChildrenListResponses.delete(riskId)
+
+    expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
+
+    options.rounds[0]!.native[0] = {
+      ...options.rounds[0]!.native[0]!,
+      perspective: 'risk',
+    }
+    expect(() => assertNativeAdvisorEvidence(options)).toThrow('roles are invalid')
+  })
+
   test('Markdown hard-breakの転送差だけを補助digestで照合する', () => {
     const { options, solutionId } = fixture()
     const marker = nativeAdvisorMarker(

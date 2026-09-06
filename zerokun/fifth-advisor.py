@@ -70,7 +70,7 @@ AGENT_START_STATE_PROTOCOL = "durable-agent-start-intent-v1"
 MAX_SESSION_STATE_BYTES = 131_072
 MAX_PROCESS_MISMATCH_BYTES = 65_536
 MAX_PROCESS_COUNT = 32
-MAX_DIAGNOSTIC_ARGUMENTS = 8
+MAX_DIAGNOSTIC_ARGUMENTS = 12
 MAX_DIAGNOSTIC_STRING_CHARS = 512
 HERDR_COMMAND_TIMEOUT_SECONDS = 20
 CLAUDE_START_TIMEOUT_MS = 300_000
@@ -78,17 +78,20 @@ CLAUDE_START_PROCESS_TIMEOUT_SECONDS = 310
 CLAUDE_SETTLE_TIMEOUT_SECONDS = 120
 CLAUDE_PROCESS_SETTLE_TIMEOUT_SECONDS = 5
 PROVISIONAL_RECONCILE_SECONDS = 30
-CLAUDE_ARGUMENTS = (
+CLAUDE_REQUIRED_ARGUMENT_SEQUENCE = (
     "--dangerously-skip-permissions",
     "--safe-mode",
     "--no-chrome",
     "--disable-slash-commands",
 )
+CLAUDE_MODEL = "claude-fable-5-1"
+CLAUDE_MODEL_ARGUMENT = f"--model={CLAUDE_MODEL}"
+CLAUDE_ARGUMENTS = (*CLAUDE_REQUIRED_ARGUMENT_SEQUENCE, CLAUDE_MODEL_ARGUMENT)
 CLAUDE_OBSERVED_ARGUMENT_FORMS = (
     CLAUDE_ARGUMENTS,
     ("--effort", "max", *CLAUDE_ARGUMENTS),
 )
-CLAUDE_REQUIRED_ARGUMENTS = frozenset(CLAUDE_ARGUMENTS)
+CLAUDE_REQUIRED_ARGUMENTS = frozenset(CLAUDE_REQUIRED_ARGUMENT_SEQUENCE)
 CLAUDE_DENIED_OPTION_NAMES = frozenset(
     {
         "--add-dir",
@@ -102,6 +105,7 @@ CLAUDE_DENIED_OPTION_NAMES = frozenset(
         "--disallowed-tools",
         "--disallowedTools",
         "--fork-session",
+        "--fallback-model",
         "--from-pr",
         "--ide",
         "--mcp-config",
@@ -332,6 +336,19 @@ def _valid_claude_invocation(
 def _valid_claude_option_arguments(arguments: List[str]) -> bool:
     if len(arguments) > 64:
         return False
+    model_selectors = [
+        (index, argument)
+        for index, argument in enumerate(arguments)
+        if argument == "--model" or argument.startswith("--model=")
+    ]
+    if len(model_selectors) != 1:
+        return False
+    model_index, model_argument = model_selectors[0]
+    if model_argument == "--model":
+        if model_index + 1 >= len(arguments) or arguments[model_index + 1] != CLAUDE_MODEL:
+            return False
+    elif model_argument != CLAUDE_MODEL_ARGUMENT:
+        return False
     observed_required = set()
     index = 0
     while index < len(arguments):
@@ -353,6 +370,12 @@ def _valid_claude_option_arguments(arguments: List[str]) -> bool:
             return False
         if option_name in CLAUDE_DENIED_OPTION_NAMES:
             return False
+        if value == "--model":
+            index += 2
+            continue
+        if option_name == "--model":
+            index += 1
+            continue
         if value == "--effort":
             if index + 1 >= len(arguments) or arguments[index + 1] not in (
                 CLAUDE_BENIGN_EFFORT_VALUES
@@ -3693,6 +3716,22 @@ def _open_command(args: argparse.Namespace) -> int:
         os.close(root_descriptor)
 
 
+def _claude_start_command(agent_name: str, pane_id: str) -> List[str]:
+    return [
+        "agent",
+        "start",
+        agent_name,
+        "--kind",
+        "claude",
+        "--pane",
+        pane_id,
+        "--timeout",
+        str(CLAUDE_START_TIMEOUT_MS),
+        "--",
+        *CLAUDE_ARGUMENTS,
+    ]
+
+
 def _validate_provisional_closed_receipt(
     intent: Dict[str, object],
     receipt: Dict[str, object],
@@ -4060,19 +4099,7 @@ def _open_ephemeral_workspace(
         )
         start_attempted = True
         started = _run_herdr(
-            [
-                "agent",
-                "start",
-                agent_name,
-                "--kind",
-                "claude",
-                "--pane",
-                str(pane_id),
-                "--timeout",
-                str(CLAUDE_START_TIMEOUT_MS),
-                "--",
-                *CLAUDE_ARGUMENTS,
-            ],
+            _claude_start_command(agent_name, str(pane_id)),
             timeout=CLAUDE_START_PROCESS_TIMEOUT_SECONDS,
         )
         _require_open_root_identity(
@@ -4834,10 +4861,10 @@ def main() -> int:
     except _OpenSignal as interrupted:
         print(
             (
-                "fifth advisor unavailable: interrupted; exact cleanup could not be "
+                "ephemeral Claude advisor unavailable: interrupted; exact cleanup could not be "
                 "verified"
                 if interrupted.cleanup_error is not None
-                else "fifth advisor unavailable: interrupted after exact cleanup"
+                else "ephemeral Claude advisor unavailable: interrupted after exact cleanup"
             ),
             file=sys.stderr,
         )
@@ -4845,20 +4872,20 @@ def main() -> int:
     except UnsafeRequest as error:
         if args.command == "verify":
             print(
-                "fifth advisor response rejected: protected verification failed",
+                "ephemeral Claude advisor response rejected: protected verification failed",
                 file=sys.stderr,
             )
             return 4
-        print(f"fifth advisor unavailable: {error}", file=sys.stderr)
+        print(f"ephemeral Claude advisor unavailable: {error}", file=sys.stderr)
         return 3
     except Exception:
         if args.command == "verify":
             print(
-                "fifth advisor response rejected: protected verification failed",
+                "ephemeral Claude advisor response rejected: protected verification failed",
                 file=sys.stderr,
             )
             return 4
-        print("fifth advisor unavailable: local safety check failed", file=sys.stderr)
+        print("ephemeral Claude advisor unavailable: local safety check failed", file=sys.stderr)
         return 3
 
 

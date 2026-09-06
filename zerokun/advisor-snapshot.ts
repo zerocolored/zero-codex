@@ -245,9 +245,9 @@ export function summarizeAdvisorRepositoryChanges(
       && pathChanges.paths.length === 0 && pathChanges.omitted === 0) continue
     const lexical = relative(current.projectPath, gitRoot)
     repositories.push({
-      repository: lexical && lexical !== '..' && !lexical.startsWith(`..${sep}`)
-        ? lexical
-        : gitRoot,
+      repository: lexical === ''
+        ? '.'
+        : lexical !== '..' && !lexical.startsWith(`..${sep}`) ? lexical : gitRoot,
       kind,
       headBefore: before?.head ?? null,
       headAfter: after?.head ?? null,

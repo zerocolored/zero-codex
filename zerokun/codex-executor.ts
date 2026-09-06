@@ -87,11 +87,19 @@ import {
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
 import {
+  advisorPerspectiveForPhase,
+  THREE_ADVISOR_JOURNAL_VERSION,
+  THREE_ADVISOR_POLICY,
   validLegacyAdoptedClaude,
   validLegacyAdoptedGrok,
   validTerminalClaudeAttempt,
   validTerminalGrokAttempts,
   validTerminalNativeAttempts,
+  validThreeAdvisorPhaseRound,
+  validThreeAdvisorGrokAttempts,
+  validThreeAdvisorNativeAttempts,
+  validThreeAdvisorReviewSequence,
+  validThreeAdvisorRoundTwoBasis,
 } from './advisor-journal.ts'
 import { summarizeAdvisorSlots } from './advisor-broker.ts'
 import { observeNativeAdvisorCoverage, type NativeAdvisorObservation } from './native-advisor-coverage.ts'
@@ -1609,7 +1617,6 @@ export function requiredAdvisorRoundsForJob(
   return job.writeEnabled
     ? [
       { phase: 'investigation', round: 1 },
-      { phase: 'design', round: 1 },
       { phase: 'review', round: 1 },
     ]
     : [{ phase: 'investigation', round: 1 }]
@@ -1673,8 +1680,9 @@ export function collectHostAdvisorCoverage(
   } catch {
     return undefined
   }
-  const phasesByName = new Map<'investigation' | 'review',
+  const phasesByName = new Map<string,
     NonNullable<JobExecutionResult['advisorCoverage']>['phases'][number]>()
+  const journalsByName = new Map<string, Record<string, unknown>>()
   let revisions: Dirent<string>[]
   try { revisions = readdirSync(attemptRoot, { withFileTypes: true }) } catch { return undefined }
   for (const revision of revisions) {
@@ -1686,14 +1694,27 @@ export function collectHostAdvisorCoverage(
     try { revisionRoot = requireManagedDirectory(stateDir, join(attemptRoot, revision.name)) } catch {
       continue
     }
-    for (const phase of ['investigation', 'review'] as const) {
-      const raw = readOptionalPrivateFile(join(revisionRoot, `${phase}-1.json`))
+    for (const [phase, rounds] of [
+      ['investigation', [1]],
+      ['review', [1, 2]],
+    ] as const) {
+      for (const round of rounds) {
+      const raw = readOptionalPrivateFile(join(revisionRoot, `${phase}-${round}.json`))
       if (raw === null || Buffer.byteLength(raw) > 64 * 1024) continue
       let journal: Record<string, unknown>
       try { journal = JSON.parse(raw) as Record<string, unknown> } catch { continue }
-      if (journal.version !== 8
-        || !['reviewers-completed', 'completed'].includes(String(journal.status))
-        || journal.phase !== phase || journal.round !== 1
+      const version = Number(journal.version)
+      const threeAdvisor = version === THREE_ADVISOR_JOURNAL_VERSION
+      if ((version !== 8 && !threeAdvisor)
+        || (threeAdvisor && journal.advisorPolicy !== THREE_ADVISOR_POLICY)
+        || !(threeAdvisor
+          ? ['reviewers-completed', 'completed', 'stale-input'].includes(String(journal.status))
+          : ['reviewers-completed', 'completed'].includes(String(journal.status)))
+        || (threeAdvisor && !validThreeAdvisorPhaseRound(phase, round))
+        || (!threeAdvisor && round !== 1)
+        || (threeAdvisor && phase === 'review' && round === 2
+          && !validThreeAdvisorRoundTwoBasis(journal.roundTwoBasis))
+        || journal.phase !== phase || journal.round !== round
         || journal.attemptNonce !== attemptNonce
         || journal.inputRevision !== inputRevision
         || typeof journal.inputDigest !== 'string'
@@ -1701,14 +1722,18 @@ export function collectHostAdvisorCoverage(
         || !journal.inputDigest.startsWith(match[2]!)
         || !Number.isSafeInteger(journal.finishedAt)
         || Number(journal.finishedAt) <= 0
-        || !validTerminalNativeAttempts(journal.native)
-        || !validTerminalGrokAttempts(journal.grok)
+        || !(threeAdvisor
+          ? validThreeAdvisorNativeAttempts(journal.native, phase)
+          : validTerminalNativeAttempts(journal.native))
+        || !(threeAdvisor
+          ? validThreeAdvisorGrokAttempts(journal.grok, phase)
+          : validTerminalGrokAttempts(journal.grok))
         || !validTerminalClaudeAttempt(journal.claude)) continue
       const nativeState = (perspective: 'solution' | 'risk') => {
         const matches = Array.isArray(nativeEvidence) ? nativeEvidence.filter(value => (
           value.attemptNonce === attemptNonce && value.inputRevision === inputRevision
           && value.inputDigest === journal.inputDigest && value.phase === phase
-          && value.round === 1 && value.perspective === perspective
+          && value.round === round && value.perspective === perspective
         )) : []
         return matches.length === 1 ? matches[0]!.state : 'start-unconfirmed' as const
       }
@@ -1719,9 +1744,11 @@ export function collectHostAdvisorCoverage(
         nativeEvidence === true ? undefined : {
           solution: nativeState('solution'), risk: nativeState('risk'),
         },
+        { version, phase },
       )
       const candidate: NonNullable<JobExecutionResult['advisorCoverage']>['phases'][number] = {
         phase,
+        round,
         inputRevision,
         finishedAt: Number(journal.finishedAt),
         ...summary,
@@ -1730,11 +1757,23 @@ export function collectHostAdvisorCoverage(
       // different Slack input revisions. Preserve both. Conversely, two
       // terminal journals for the same phase violate the once-per-attempt
       // ledger, so do not guess which one should be exposed to Slack.
-      if (phasesByName.has(phase)) return undefined
-      phasesByName.set(phase, candidate)
+      const logicalRound = `${phase}:${round}`
+      if (phasesByName.has(logicalRound)) return undefined
+      phasesByName.set(logicalRound, candidate)
+      journalsByName.set(logicalRound, journal)
+      }
     }
   }
   const phases = [...phasesByName.values()]
+  const reviewOne = phasesByName.get('review:1')
+  const reviewTwo = phasesByName.get('review:2')
+  if (reviewTwo && (!reviewOne || reviewTwo.finishedAt < reviewOne.finishedAt)) return undefined
+  if (reviewTwo) {
+    const reviewOneJournal = journalsByName.get('review:1')!
+    const reviewTwoJournal = journalsByName.get('review:2')!
+    if (reviewOneJournal.status !== 'completed'
+      || !validThreeAdvisorReviewSequence(reviewOneJournal, reviewTwoJournal)) return undefined
+  }
   return phases.length > 0 ? { version: 1, phases } : undefined
 }
 
@@ -1748,13 +1787,19 @@ function validPositiveInteger(value: unknown): value is number {
 
 function parseNativeAdvisorJournalEntries(
   journal: Record<string, unknown>,
+  phase: NativeAdvisorRoundEvidence['phase'],
 ): NativeAdvisorJournalEntry[] {
   const journalVersion = Number(journal.version)
-  if (!Array.isArray(journal.native) || journal.native.length !== 2) {
-    throw new Error('advisor journal does not contain exactly two native Codex advisors')
+  const threeAdvisor = journalVersion === THREE_ADVISOR_JOURNAL_VERSION
+  const expectedCount = threeAdvisor ? 1 : 2
+  if (!Array.isArray(journal.native) || journal.native.length !== expectedCount) {
+    throw new Error(`advisor journal does not contain exactly ${expectedCount} native Codex advisor outcome(s)`)
   }
-  if (journalVersion === 8) {
-    if (!validTerminalNativeAttempts(journal.native)) {
+  if (journalVersion === 8 || threeAdvisor) {
+    const valid = threeAdvisor
+      ? validThreeAdvisorNativeAttempts(journal.native, phase)
+      : validTerminalNativeAttempts(journal.native)
+    if (!valid) {
       throw new Error('advisor journal contains invalid native Codex terminal outcomes')
     }
     return (journal.native as Array<Record<string, unknown>>).map(reviewer => ({
@@ -1816,11 +1861,17 @@ function parseCompletedAdvisorJournal(
   expectedInput: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
   expectedInitialRepositoryDigest: string,
   expectedRepositoryDigest?: string,
+  acceptedStatuses: readonly ('completed' | 'reviewers-completed' | 'stale-input')[] = [
+    'completed',
+  ],
 ): {
+  journalVersion: number
+  status: 'completed' | 'reviewers-completed' | 'stale-input'
   startedAt: number
   finishedAt: number
   repositoryDigest: string
   native: NativeAdvisorJournalEntry[]
+  journal: Record<string, unknown>
 } {
   if (Buffer.byteLength(raw) > 64 * 1024) {
     throw new Error('advisor journal exceeds the managed size limit')
@@ -1833,10 +1884,23 @@ function parseCompletedAdvisorJournal(
     throw new Error('advisor journal must be an object')
   }
   const journal = parsed as Record<string, unknown>
+  const status = String(journal.status) as 'completed' | 'reviewers-completed' | 'stale-input'
+  const completedReceiptRequired = status === 'completed'
   if ((journal.version !== 5 && journal.version !== 6
-      && journal.version !== 7 && journal.version !== 8)
-    || journal.status !== 'completed'
+      && journal.version !== 7 && journal.version !== 8
+      && journal.version !== THREE_ADVISOR_JOURNAL_VERSION)
+    || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+      && journal.advisorPolicy !== THREE_ADVISOR_POLICY)
+    || !acceptedStatuses.includes(status)
     || journal.phase !== requirement.phase || journal.round !== requirement.round
+    || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+      && !validThreeAdvisorPhaseRound(requirement.phase, requirement.round))
+    || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+      && requirement.phase === 'review' && requirement.round === 2
+      && !validThreeAdvisorRoundTwoBasis(journal.roundTwoBasis))
+    || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+      && !(requirement.phase === 'review' && requirement.round === 2)
+      && journal.roundTwoBasis !== undefined)
     || journal.contextDigest !== expectedContextDigest
     || journal.attemptNonce !== expectedAttemptNonce
     || journal.inputRevision !== expectedInput.revision
@@ -1849,18 +1913,33 @@ function parseCompletedAdvisorJournal(
     || !validPositiveInteger(journal.startedAt)
     || !validPositiveInteger(journal.finishedAt)
     || Number(journal.finishedAt) < Number(journal.startedAt)
-    || !validPositiveInteger(journal.pollObservedAt)
-    || !validPositiveInteger(journal.receiptIssuedAt)
-    || Number(journal.receiptIssuedAt) < Number(journal.finishedAt)
-    || Number(journal.pollObservedAt) < Number(journal.receiptIssuedAt)
-    || !validSha256(journal.receiptDigest)) {
+    || (completedReceiptRequired && (!validPositiveInteger(journal.pollObservedAt)
+      || !validPositiveInteger(journal.receiptIssuedAt)
+      || Number(journal.receiptIssuedAt) < Number(journal.finishedAt)
+      || Number(journal.pollObservedAt) < Number(journal.receiptIssuedAt)
+      || !validSha256(journal.receiptDigest)))
+    || (!completedReceiptRequired && journal.receiptIssuedAt !== undefined
+      && (!validPositiveInteger(journal.receiptIssuedAt)
+        || Number(journal.receiptIssuedAt) < Number(journal.finishedAt)))
+    || (!completedReceiptRequired && journal.pollObservedAt !== undefined
+      && (!validPositiveInteger(journal.pollObservedAt)
+        || Number(journal.pollObservedAt) < Number(journal.finishedAt)
+        || (journal.receiptIssuedAt !== undefined
+          && Number(journal.pollObservedAt) < Number(journal.receiptIssuedAt))))
+    || (!completedReceiptRequired && journal.receiptDigest !== undefined
+      && !validSha256(journal.receiptDigest))) {
     throw new Error(`advisor journal ${requirement.phase}-${requirement.round} is incomplete`)
   }
-  const native = parseNativeAdvisorJournalEntries(journal)
+  const journalVersion = Number(journal.version)
+  const threeAdvisor = journalVersion === THREE_ADVISOR_JOURNAL_VERSION
+  const native = parseNativeAdvisorJournalEntries(journal, requirement.phase)
 
   const externalValid = journal.version === 5
     ? validLegacyAdoptedGrok(journal.grok) && validLegacyAdoptedClaude(journal.claude)
-    : validTerminalGrokAttempts(journal.grok) && validTerminalClaudeAttempt(journal.claude)
+    : (threeAdvisor
+      ? validThreeAdvisorGrokAttempts(journal.grok, requirement.phase)
+      : validTerminalGrokAttempts(journal.grok))
+      && validTerminalClaudeAttempt(journal.claude)
   if (!externalValid) {
     throw new Error('advisor journal has invalid or uncontained external advisor outcomes')
   }
@@ -1872,10 +1951,27 @@ function parseCompletedAdvisorJournal(
     )
   }
   return {
+    journalVersion,
+    status,
     startedAt: Number(journal.startedAt),
     finishedAt: Number(journal.finishedAt),
     repositoryDigest: String(journal.repositoryDigest),
     native,
+    journal,
+  }
+}
+
+function acceptedAdvisorJournalStatuses(
+  raw: string,
+): readonly ('completed' | 'reviewers-completed' | 'stale-input')[] {
+  try {
+    const journal = JSON.parse(raw) as Record<string, unknown>
+    return journal.version === THREE_ADVISOR_JOURNAL_VERSION
+      ? ['completed', 'reviewers-completed', 'stale-input']
+      : ['completed']
+  } catch {
+    // Preserve the normal parser's precise malformed-JSON diagnostic.
+    return ['completed']
   }
 }
 
@@ -1908,6 +2004,25 @@ function collectNativeAdvisorJournalEvidence(options: {
         throw new Error('advisor journal contains invalid ephemeral delivery evidence')
       }
       // Delivery possibility is a retry-safety latch, never an advisor round.
+      continue
+    }
+    const oauthClaim = /^grok-oauth-(initial|review)\.json$/.exec(revisionEntry.name)
+    if (oauthClaim) {
+      if (!revisionEntry.isFile() || revisionEntry.isSymbolicLink()) {
+        throw new Error('advisor journal contains unsafe Grok OAuth phase evidence')
+      }
+      const raw = readOptionalPrivateFile(join(options.journalRoot, revisionEntry.name))
+      let claim: Record<string, unknown>
+      try { claim = JSON.parse(raw ?? '') as Record<string, unknown> } catch {
+        throw new Error('advisor journal contains invalid Grok OAuth phase evidence')
+      }
+      if (raw === null || Buffer.byteLength(raw) > 4_096
+        || claim.version !== 1 || claim.advisorPhase !== oauthClaim[1]
+        || claim.jobId !== options.jobId || claim.attemptNonce !== options.attemptNonce
+        || claim.contextDigest !== options.contextDigest
+        || !validPositiveInteger(claim.claimedAt)) {
+        throw new Error('advisor journal contains invalid Grok OAuth phase evidence')
+      }
       continue
     }
     const revisionMatch = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/.exec(revisionEntry.name)
@@ -1944,10 +2059,21 @@ function collectNativeAdvisorJournalEvidence(options: {
       const phase = journalMatch[1] as NativeAdvisorRoundEvidence['phase']
       const round = Number(journalMatch[2]) as NativeAdvisorRoundEvidence['round']
       if ((journal.version !== 5 && journal.version !== 6
-          && journal.version !== 7 && journal.version !== 8)
+          && journal.version !== 7 && journal.version !== 8
+          && journal.version !== THREE_ADVISOR_JOURNAL_VERSION)
+        || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+          && journal.advisorPolicy !== THREE_ADVISOR_POLICY)
         || !['requested', 'reviewers-completed', 'completed', 'required-reviewer-failed', 'stale-input']
           .includes(String(journal.status))
         || journal.phase !== phase || journal.round !== round
+        || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+          && !validThreeAdvisorPhaseRound(phase, round))
+        || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+          && phase === 'review' && round === 2
+          && !validThreeAdvisorRoundTwoBasis(journal.roundTwoBasis))
+        || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+          && !(phase === 'review' && round === 2)
+          && journal.roundTwoBasis !== undefined)
         || journal.contextDigest !== options.contextDigest
         || journal.attemptNonce !== options.attemptNonce
         || journal.inputRevision !== inputRevision
@@ -1956,11 +2082,12 @@ function collectNativeAdvisorJournalEvidence(options: {
         throw new Error(`advisor native evidence binding is invalid: ${journalEntry.name}`)
       }
       evidence.push({
+        journalVersion: Number(journal.version),
         inputRevision,
         inputDigest: journal.inputDigest,
         phase,
         round,
-        native: parseNativeAdvisorJournalEntries(journal),
+        native: parseNativeAdvisorJournalEntries(journal, phase),
       })
       if (evidence.length > 4_096) {
         throw new Error('advisor native evidence exceeds the managed bound')
@@ -1970,15 +2097,18 @@ function collectNativeAdvisorJournalEvidence(options: {
   return evidence
 }
 
-function findEarlierInitialAdvisorPair(options: {
+function findEarlierInitialAdvisorCompletion(options: {
   stateDir: string
   journalRoot: string
   contextDigest: string
   attemptNonce: string
   beforeRevision: number
   initialRepositoryDigest: string
-}): { finishedAt: number } | null {
-  let selected: { finishedAt: number } | null = null
+  writeEnabled: boolean
+}): { finishedAt: number, journalVersion: number, hasThreeAdvisorCompletion: boolean } | null {
+  let selected: { finishedAt: number, journalVersion: number } | null = null
+  let initialCompletions = 0
+  let hasThreeAdvisorCompletion = false
   for (const entry of readdirSync(options.journalRoot, { withFileTypes: true })) {
     const match = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/.exec(entry.name)
     if (!match || !entry.isDirectory() || entry.isSymbolicLink()) continue
@@ -1989,14 +2119,15 @@ function findEarlierInitialAdvisorPair(options: {
       join(options.journalRoot, entry.name),
     )
     const investigationRaw = readOptionalPrivateFile(join(revisionRoot, 'investigation-1.json'))
-    const designRaw = readOptionalPrivateFile(join(revisionRoot, 'design-1.json'))
-    if (investigationRaw === null || designRaw === null) continue
+    if (investigationRaw === null) continue
     let candidateInput: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>
+    let journalVersion: number
     try {
       const value = JSON.parse(investigationRaw) as Record<string, unknown>
       if (value.inputRevision !== revision || !validSha256(value.inputDigest)
         || !String(value.inputDigest).startsWith(match[2]!)) continue
       candidateInput = { revision, digest: String(value.inputDigest) }
+      journalVersion = Number(value.version)
     } catch {
       continue
     }
@@ -2009,27 +2140,145 @@ function findEarlierInitialAdvisorPair(options: {
         candidateInput,
         options.initialRepositoryDigest,
         options.initialRepositoryDigest,
+        journalVersion === THREE_ADVISOR_JOURNAL_VERSION
+          ? ['completed', 'reviewers-completed', 'stale-input']
+          : ['completed'],
       )
-      const design = parseCompletedAdvisorJournal(
-        designRaw,
-        { phase: 'design', round: 1 },
+      let finishedAt = investigation.finishedAt
+      if (journalVersion === THREE_ADVISOR_JOURNAL_VERSION) {
+        hasThreeAdvisorCompletion = true
+      }
+      const legacyUnified = journalVersion === 8
+        && investigation.journal.repositoryObservation === 'not-required-in-unified-workflow'
+      if (journalVersion !== THREE_ADVISOR_JOURNAL_VERSION
+        && options.writeEnabled && !legacyUnified) {
+        const designRaw = readOptionalPrivateFile(join(revisionRoot, 'design-1.json'))
+        if (designRaw === null) continue
+        const design = parseCompletedAdvisorJournal(
+          designRaw,
+          { phase: 'design', round: 1 },
+          options.contextDigest,
+          options.attemptNonce,
+          candidateInput,
+          options.initialRepositoryDigest,
+          options.initialRepositoryDigest,
+        )
+        if (design.startedAt < investigation.finishedAt) {
+          throw new Error('initial advisor phases overlap or are out of order')
+        }
+        finishedAt = design.finishedAt
+      }
+      initialCompletions += 1
+      if (selected === null || finishedAt > selected.finishedAt) {
+        selected = { finishedAt, journalVersion }
+      }
+    } catch {
+      // A malformed historical initial consultation never authorizes post-edit preparation.
+    }
+  }
+  if (initialCompletions > 1) {
+    throw new Error('duplicate attempt-wide advisor round: investigation-1')
+  }
+  return selected ? { ...selected, hasThreeAdvisorCompletion } : null
+}
+
+function findEarlierThreeAdvisorPhaseCompletion(options: {
+  stateDir: string
+  journalRoot: string
+  contextDigest: string
+  attemptNonce: string
+  beforeRevision: number
+  initialRepositoryDigest: string
+  phase: 'investigation' | 'review'
+  round: 1 | 2
+}): ReturnType<typeof parseCompletedAdvisorJournal> | null {
+  let selected: ReturnType<typeof parseCompletedAdvisorJournal> | null = null
+  let duplicate = false
+  for (const entry of readdirSync(options.journalRoot, { withFileTypes: true })) {
+    const match = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/.exec(entry.name)
+    if (!match || !entry.isDirectory() || entry.isSymbolicLink()) continue
+    const revision = Number(match[1])
+    if (!Number.isSafeInteger(revision) || revision >= options.beforeRevision) continue
+    const revisionRoot = requireManagedDirectory(
+      options.stateDir,
+      join(options.journalRoot, entry.name),
+    )
+    const raw = readOptionalPrivateFile(join(
+      revisionRoot, `${options.phase}-${options.round}.json`,
+    ))
+    if (raw === null) continue
+    let candidateInput: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>
+    try {
+      const value = JSON.parse(raw) as Record<string, unknown>
+      if (value.version !== THREE_ADVISOR_JOURNAL_VERSION
+        || value.inputRevision !== revision || !validSha256(value.inputDigest)
+        || !String(value.inputDigest).startsWith(match[2]!)) continue
+      candidateInput = { revision, digest: String(value.inputDigest) }
+    } catch {
+      continue
+    }
+    try {
+      const completed = parseCompletedAdvisorJournal(
+        raw,
+        { phase: options.phase, round: options.round },
         options.contextDigest,
         options.attemptNonce,
         candidateInput,
         options.initialRepositoryDigest,
-        options.initialRepositoryDigest,
+        undefined,
+        ['completed', 'reviewers-completed', 'stale-input'],
       )
-      if (design.startedAt < investigation.finishedAt) {
-        throw new Error('initial advisor phases overlap or are out of order')
+      if (selected !== null) {
+        duplicate = true
+        continue
       }
-      if (selected === null || design.finishedAt > selected.finishedAt) {
-        selected = { finishedAt: design.finishedAt }
-      }
+      selected = completed
     } catch {
-      // A malformed historical pair never authorizes post-edit preparation.
+      // A malformed historical phase cannot authorize attempt-wide reuse.
     }
   }
+  if (duplicate) {
+    throw new Error(`duplicate attempt-wide advisor round: ${options.phase}-${options.round}`)
+  }
   return selected
+}
+
+function attemptAdvisorJournalVersions(options: {
+  stateDir: string
+  journalRoot: string
+  contextDigest: string
+  attemptNonce: string
+  phase: 'investigation' | 'design' | 'review'
+  round: 1 | 2 | 3
+}): number[] {
+  const versions: number[] = []
+  for (const entry of readdirSync(options.journalRoot, { withFileTypes: true })) {
+    const match = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/.exec(entry.name)
+    if (!match || !entry.isDirectory() || entry.isSymbolicLink()) continue
+    const revisionRoot = requireManagedDirectory(
+      options.stateDir,
+      join(options.journalRoot, entry.name),
+    )
+    const raw = readOptionalPrivateFile(join(
+      revisionRoot, `${options.phase}-${options.round}.json`,
+    ))
+    if (raw === null || Buffer.byteLength(raw) > 64 * 1024) continue
+    try {
+      const journal = JSON.parse(raw) as Record<string, unknown>
+      const version = Number(journal.version)
+      if (![5, 6, 7, 8, THREE_ADVISOR_JOURNAL_VERSION].includes(version)
+        || journal.phase !== options.phase || journal.round !== options.round
+        || journal.contextDigest !== options.contextDigest
+        || journal.attemptNonce !== options.attemptNonce
+        || journal.inputRevision !== Number(match[1])
+        || !validSha256(journal.inputDigest)
+        || !String(journal.inputDigest).startsWith(match[2]!)) continue
+      versions.push(version)
+    } catch {
+      // Malformed historical files cannot establish a recognized logical round.
+    }
+  }
+  return versions
 }
 
 export function assertRequiredAdvisorPreparationRounds(
@@ -2049,23 +2298,55 @@ export function assertRequiredAdvisorPreparationRounds(
     attemptNonce,
   )
   try { requireManagedDirectory(stateDir, journalRoot) } catch {
-    throw new Error('required pre-edit Five-Advisor journal directory is missing or unsafe')
+    throw new Error('required pre-edit advisor journal directory is missing or unsafe')
   }
-  const earlierInitialPair = findEarlierInitialAdvisorPair({
+  const earlierInitialCompletion = findEarlierInitialAdvisorCompletion({
     stateDir,
     journalRoot,
     contextDigest: expectedContextDigest,
     attemptNonce,
     beforeRevision: expectedInput.revision,
     initialRepositoryDigest,
+    writeEnabled: true,
   })
-  const repositoryChangedWithoutEarlierPreparation =
-    currentRepositoryDigest !== initialRepositoryDigest && earlierInitialPair === null
-  const requirements: RequiredAdvisorRound[] = [
+  const currentInvestigationRaw = readOptionalPrivateFile(advisorJournalPath(
+    stateDir,
+    job.id,
+    attemptNonce,
+    expectedInput,
     { phase: 'investigation', round: 1 },
-    { phase: 'design', round: 1 },
-  ]
-  let priorFinishedAt = earlierInitialPair?.finishedAt ?? 0
+  ))
+  const reusableEarlierInitial = earlierInitialCompletion !== null
+    && currentInvestigationRaw === null
+  if (earlierInitialCompletion?.hasThreeAdvisorCompletion === true
+    && currentInvestigationRaw !== null) {
+    try {
+      if (Number((JSON.parse(currentInvestigationRaw) as Record<string, unknown>).version)
+        === THREE_ADVISOR_JOURNAL_VERSION) {
+        throw new Error('duplicate attempt-wide advisor round: investigation-1')
+      }
+    } catch (error) {
+      if (String(error).includes('duplicate attempt-wide advisor round')) throw error
+    }
+  }
+  const repositoryChangedWithoutEarlierPreparation =
+    currentRepositoryDigest !== initialRepositoryDigest && earlierInitialCompletion === null
+  let legacyCurrentContract = false
+  if (currentInvestigationRaw !== null) {
+    try {
+      const currentInvestigation = JSON.parse(currentInvestigationRaw) as Record<string, unknown>
+      legacyCurrentContract = [5, 6, 7, 8].includes(Number(currentInvestigation.version))
+    } catch {
+      // The normal journal parser below reports malformed JSON with full phase context.
+    }
+  }
+  const requirements: RequiredAdvisorRound[] = reusableEarlierInitial
+    ? []
+    : [
+        { phase: 'investigation', round: 1 },
+        ...(legacyCurrentContract ? [{ phase: 'design' as const, round: 1 as const }] : []),
+      ]
+  let priorFinishedAt = earlierInitialCompletion?.finishedAt ?? 0
   let repositoryDigestMismatch = false
   const missing: RequiredAdvisorRound[] = []
   for (const requirement of requirements) {
@@ -2086,6 +2367,7 @@ export function assertRequiredAdvisorPreparationRounds(
         expectedInput,
         initialRepositoryDigest,
         currentRepositoryDigest,
+        acceptedAdvisorJournalStatuses(raw),
       )
     } catch (error) {
       if (error instanceof AdvisorJournalRepositoryDigestMismatchError
@@ -2098,6 +2380,8 @@ export function assertRequiredAdvisorPreparationRounds(
           attemptNonce,
           expectedInput,
           initialRepositoryDigest,
+          undefined,
+          acceptedAdvisorJournalStatuses(raw),
         )
       } else {
         throw error
@@ -2123,7 +2407,7 @@ export function assertRequiredAdvisorPreparationRounds(
       throw new CodexRepositoryChangedBeforeImplementationError()
     }
     throw new Error(
-      `required pre-edit Five-Advisor round is missing: ${missing[0]!.phase}-1`,
+      `required pre-edit advisor round is missing: ${missing[0]!.phase}-1`,
     )
   }
   if (repositoryDigestMismatch || repositoryChangedWithoutEarlierPreparation) {
@@ -2160,27 +2444,73 @@ export function assertRequiredAdvisorRounds(
     attemptNonce,
   )
   try { requireManagedDirectory(stateDir, journalRoot) } catch {
-    throw new Error('required Five-Advisor journal directory is missing or unsafe')
+    throw new Error('required advisor journal directory is missing or unsafe')
   }
-  const earlierInitialPair = findEarlierInitialAdvisorPair({
+  const earlierInitialCompletion = findEarlierInitialAdvisorCompletion({
     stateDir,
     journalRoot,
     contextDigest: expectedContextDigest,
     attemptNonce,
     beforeRevision: expectedInput.revision,
     initialRepositoryDigest,
+    writeEnabled: job.writeEnabled,
   })
-  let priorFinishedAt = 0
-  let revisionBaselineDigest: string | null = null
+  const currentInvestigationPath = advisorJournalPath(
+    stateDir,
+    job.id,
+    attemptNonce,
+    expectedInput,
+    { phase: 'investigation', round: 1 },
+  )
+  const currentInvestigationRaw = readOptionalPrivateFile(currentInvestigationPath)
+  const reusableEarlierInitial = earlierInitialCompletion !== null
+    && currentInvestigationRaw === null
+  if (earlierInitialCompletion?.hasThreeAdvisorCompletion === true
+    && currentInvestigationRaw !== null) {
+    try {
+      if (Number((JSON.parse(currentInvestigationRaw) as Record<string, unknown>).version)
+        === THREE_ADVISOR_JOURNAL_VERSION) {
+        throw new Error('duplicate attempt-wide advisor round: investigation-1')
+      }
+    } catch (error) {
+      if (String(error).includes('duplicate attempt-wide advisor round')) throw error
+    }
+  }
+  let priorFinishedAt = reusableEarlierInitial ? earlierInitialCompletion.finishedAt : 0
+  let revisionBaselineDigest: string | null = reusableEarlierInitial
+    ? initialRepositoryDigest
+    : null
   const evidence: NativeAdvisorRoundEvidence[] = []
-  const fixedRequirements = requiredAdvisorRoundsForJob(job)
-    .filter(requirement => requirement.phase !== 'review')
+  let legacyCurrentContract = false
+  let threeAdvisorCurrentContract = reusableEarlierInitial
+    && earlierInitialCompletion!.hasThreeAdvisorCompletion
+  if (currentInvestigationRaw !== null) {
+    try {
+      const currentInvestigation = JSON.parse(currentInvestigationRaw) as Record<string, unknown>
+      legacyCurrentContract = [5, 6, 7, 8].includes(Number(currentInvestigation.version))
+      threeAdvisorCurrentContract = Number(currentInvestigation.version)
+        === THREE_ADVISOR_JOURNAL_VERSION
+    } catch {
+      // The normal journal parser below reports malformed JSON with full phase context.
+    }
+  }
+  const fixedRequirements: RequiredAdvisorRound[] = reusableEarlierInitial
+    ? []
+    : [
+        { phase: 'investigation', round: 1 },
+        ...(legacyCurrentContract && job.writeEnabled
+          ? [{ phase: 'design' as const, round: 1 as const }]
+          : []),
+      ]
   for (const requirement of fixedRequirements) {
     const path = advisorJournalPath(stateDir, job.id, attemptNonce, expectedInput, requirement)
     const raw = readOptionalPrivateFile(path)
+    if (raw === null && reusableEarlierInitial && requirement.phase === 'investigation') {
+      continue
+    }
     if (raw === null) {
       throw new Error(
-        `required Five-Advisor round is missing: ${requirement.phase}-${requirement.round}`,
+        `required advisor round is missing: ${requirement.phase}-${requirement.round}`,
       )
     }
     try {
@@ -2192,30 +2522,32 @@ export function assertRequiredAdvisorRounds(
         expectedInput,
         initialRepositoryDigest,
         requirement.phase === 'review' ? currentRepositoryDigest : undefined,
+        acceptedAdvisorJournalStatuses(raw),
       )
       if (completed.startedAt < priorFinishedAt) {
         throw new Error('advisor journal phases overlap or are out of order')
       }
       if (revisionBaselineDigest === null
         && completed.repositoryDigest !== initialRepositoryDigest
-        && earlierInitialPair === null) {
+        && earlierInitialCompletion === null) {
         throw new CodexRepositoryChangedBeforePublicationError(
           'initial advisor investigation was not based on the pre-change repository',
         )
       }
-      if (revisionBaselineDigest === null && earlierInitialPair !== null
-        && completed.startedAt < earlierInitialPair.finishedAt) {
+      if (revisionBaselineDigest === null && earlierInitialCompletion !== null
+        && completed.startedAt < earlierInitialCompletion.finishedAt) {
         throw new Error('current advisor investigation predates the initial pre-change pair')
       }
       if (revisionBaselineDigest !== null
         && completed.repositoryDigest !== revisionBaselineDigest) {
         throw new CodexRepositoryChangedBeforePublicationError(
-          'advisor investigation and design use different repository baselines',
+          'initial advisor phases use different repository baselines',
         )
       }
       revisionBaselineDigest ??= completed.repositoryDigest
       priorFinishedAt = completed.finishedAt
       evidence.push({
+        journalVersion: completed.journalVersion,
         inputRevision: expectedInput.revision,
         inputDigest: expectedInput.digest,
         ...requirement,
@@ -2229,14 +2561,14 @@ export function assertRequiredAdvisorRounds(
           : new CodexRepositoryChangedBeforePublicationError(error.message)
       }
       throw new Error(
-        `required Five-Advisor round is not publishable: ${requirement.phase}-${requirement.round}: ${error}`,
+        `required advisor round is not publishable: ${requirement.phase}-${requirement.round}: ${error}`,
       )
     }
   }
   if (!job.writeEnabled) {
     if (!currentRepositoryDigest || revisionBaselineDigest !== currentRepositoryDigest) {
       throw new CodexRepositoryChangedBeforePublicationError(
-        'completed Five-Advisor investigation is stale for the publication state',
+        'completed advisor investigation is stale for the publication state',
       )
     }
     return collectNativeAdvisorJournalEvidence({
@@ -2252,50 +2584,160 @@ export function assertRequiredAdvisorRounds(
   }
 
   let latestReviewDigest: string | null = null
-  let missingReview = false
+  const reviewJournalVersions = new Map<1 | 2 | 3, number[]>()
   for (const round of [1, 2, 3] as const) {
-    const requirement: RequiredAdvisorRound = { phase: 'review', round }
-    const path = advisorJournalPath(stateDir, job.id, attemptNonce, expectedInput, requirement)
-    const raw = readOptionalPrivateFile(path)
-    if (raw === null) {
-      if (round === 1) {
-        throw new Error('required Five-Advisor round is missing: review-1')
-      }
-      missingReview = true
-      continue
+    const versions = attemptAdvisorJournalVersions({
+      stateDir,
+      journalRoot,
+      contextDigest: expectedContextDigest,
+      attemptNonce,
+      phase: 'review',
+      round,
+    })
+    if (versions.length > 1) {
+      throw new Error(`duplicate attempt-wide advisor round: review-${round}`)
     }
-    if (missingReview) {
-      throw new Error(`required Five-Advisor review rounds contain a gap before review-${round}`)
-    }
+    reviewJournalVersions.set(round, versions)
+  }
+  const finalReviewVersions = [...reviewJournalVersions.values()].flat()
+  const hasCurrentReviewPolicy = finalReviewVersions.includes(THREE_ADVISOR_JOURNAL_VERSION)
+  const hasLegacyReviewPolicy = finalReviewVersions.some(
+    version => version !== THREE_ADVISOR_JOURNAL_VERSION,
+  )
+  if (hasCurrentReviewPolicy && hasLegacyReviewPolicy) {
+    throw new Error('final-review journal sequence mixes legacy and current advisor policies')
+  }
+  if (reviewJournalVersions.get(3)?.includes(THREE_ADVISOR_JOURNAL_VERSION)) {
+    throw new Error('current advisor policy does not permit final-review round 3')
+  }
+  const currentReviewOneRaw = readOptionalPrivateFile(advisorJournalPath(
+    stateDir, job.id, attemptNonce, expectedInput, { phase: 'review', round: 1 },
+  ))
+  let currentReviewOneIsThreeAdvisor = false
+  if (currentReviewOneRaw !== null) {
     try {
-      const completed = parseCompletedAdvisorJournal(
-        raw,
-        requirement,
-        expectedContextDigest,
-        attemptNonce,
-        expectedInput,
-        initialRepositoryDigest,
+      currentReviewOneIsThreeAdvisor = Number(
+        (JSON.parse(currentReviewOneRaw) as Record<string, unknown>).version,
+      ) === THREE_ADVISOR_JOURNAL_VERSION
+    } catch {}
+  }
+  const earlierV9ReviewOne = findEarlierThreeAdvisorPhaseCompletion({
+    stateDir,
+    journalRoot,
+    contextDigest: expectedContextDigest,
+    attemptNonce,
+    beforeRevision: expectedInput.revision,
+    initialRepositoryDigest,
+    phase: 'review',
+    round: 1,
+  })
+  const threeAdvisorReviewContract = threeAdvisorCurrentContract
+    || hasCurrentReviewPolicy || currentReviewOneIsThreeAdvisor || earlierV9ReviewOne !== null
+  if (threeAdvisorReviewContract) {
+    const completedRounds = new Map<1 | 2, ReturnType<typeof parseCompletedAdvisorJournal>>()
+    for (const round of [1, 2] as const) {
+      const requirement: RequiredAdvisorRound = { phase: 'review', round }
+      const raw = readOptionalPrivateFile(
+        advisorJournalPath(stateDir, job.id, attemptNonce, expectedInput, requirement),
       )
+      const earlier = round === 1 ? earlierV9ReviewOne : findEarlierThreeAdvisorPhaseCompletion({
+        stateDir,
+        journalRoot,
+        contextDigest: expectedContextDigest,
+        attemptNonce,
+        beforeRevision: expectedInput.revision,
+        initialRepositoryDigest,
+        phase: 'review',
+        round,
+      })
+      if (raw !== null && earlier !== null) {
+        throw new Error(`duplicate attempt-wide advisor round: review-${round}`)
+      }
+      let completed = earlier
+      if (raw !== null) {
+        try {
+          completed = parseCompletedAdvisorJournal(
+            raw,
+            requirement,
+            expectedContextDigest,
+            attemptNonce,
+            expectedInput,
+            initialRepositoryDigest,
+            undefined,
+            acceptedAdvisorJournalStatuses(raw),
+          )
+        } catch (error) {
+          throw new Error(`required advisor round is not publishable: review-${round}: ${error}`)
+        }
+      }
+      if (!completed) {
+        if (round === 1) throw new Error('required advisor round is missing: review-1')
+        continue
+      }
+      if (completed.journalVersion !== THREE_ADVISOR_JOURNAL_VERSION) {
+        throw new Error(`required advisor round mixes legacy and current policy: review-${round}`)
+      }
       if (completed.startedAt < priorFinishedAt) {
         throw new Error('advisor journal phases overlap or are out of order')
       }
       priorFinishedAt = completed.finishedAt
       latestReviewDigest = completed.repositoryDigest
-      evidence.push({
-        inputRevision: expectedInput.revision,
-        inputDigest: expectedInput.digest,
-        ...requirement,
-        native: completed.native,
-      })
-    } catch (error) {
-      throw new Error(
-        `required Five-Advisor round is not publishable: review-${round}: ${error}`,
-      )
+      completedRounds.set(round, completed)
+    }
+    const reviewOne = completedRounds.get(1)!
+    const reviewTwo = completedRounds.get(2)
+    if (reviewTwo) {
+      const roundOneIds = new Set(reviewOne.native.flatMap(entry => (
+        entry.agentId === undefined ? [] : [entry.agentId]
+      )))
+      if (reviewTwo.native.some(entry => (
+        entry.agentId !== undefined && roundOneIds.has(entry.agentId)
+      ))) {
+        throw new Error('final-review round 2 did not use a fresh native advisor')
+      }
+      if (reviewOne.status !== 'completed'
+        || !validThreeAdvisorReviewSequence(reviewOne.journal, reviewTwo.journal)) {
+        throw new Error('final-review round 2 is not bound to an adopted round-1 mandatory fix')
+      }
+    }
+  } else {
+    let missingReview = false
+    for (const round of [1, 2, 3] as const) {
+      const requirement: RequiredAdvisorRound = { phase: 'review', round }
+      const path = advisorJournalPath(stateDir, job.id, attemptNonce, expectedInput, requirement)
+      const raw = readOptionalPrivateFile(path)
+      if (raw === null) {
+        if (round === 1) throw new Error('required advisor round is missing: review-1')
+        missingReview = true
+        continue
+      }
+      if (missingReview) {
+        throw new Error(`required advisor review rounds contain a gap before review-${round}`)
+      }
+      try {
+        const completed = parseCompletedAdvisorJournal(
+          raw,
+          requirement,
+          expectedContextDigest,
+          attemptNonce,
+          expectedInput,
+          initialRepositoryDigest,
+          undefined,
+          acceptedAdvisorJournalStatuses(raw),
+        )
+        if (completed.startedAt < priorFinishedAt) {
+          throw new Error('advisor journal phases overlap or are out of order')
+        }
+        priorFinishedAt = completed.finishedAt
+        latestReviewDigest = completed.repositoryDigest
+      } catch (error) {
+        throw new Error(`required advisor round is not publishable: review-${round}: ${error}`)
+      }
     }
   }
   if (latestReviewDigest !== currentRepositoryDigest) {
     throw new CodexRepositoryChangedBeforePublicationError(
-      'latest completed Five-Advisor review is stale for the publication state',
+      'latest completed advisor review is stale for the publication state',
     )
   }
   return collectNativeAdvisorJournalEvidence({
@@ -3301,18 +3743,27 @@ export function buildCodexDeveloperInstructions(
         'the applicable AGENTS.md. Keep one primary Codex workflow: the transport starts external',
         'reviewers but never selects work phases, blocks implementation, or publishes changes.',
         'For the single combined initial-design consultation use advisor_round phase=investigation',
-        'round=1. For the one post-implementation final review use phase=review round=1. Do not call',
-        'the legacy separate design phase or repeat a panel because a reviewer is unavailable.',
-        'Attempt the two native solution/risk advisors yourself, wait for each started attempt, then',
-        'pass their exact marked responses and real agent IDs to advisor_round. If a native slot did',
+        'round=1. For post-implementation final review round 1 use phase=review round=1. Only when',
+        'you adopt at least one round-1 mandatory finding and implement a non-empty task-owned fix',
+        'delta, call one fresh phase=review round=2 with roundTwoBasis identifying adopted sources,',
+        'the mandatory finding summary, that fix delta, and taskOwnedFixPaths as the exact sorted',
+        'repository-relative paths you changed for that fix. The host requires this list to match',
+        'every path changed since round 1; do not claim paths changed by another task. Limit round 2 to that delta and its',
+        'regressions. Minor findings, missing advisor responses, or infrastructure failures never',
+        'trigger round 2. Never call review round 3 or the legacy separate design phase.',
+        'For the initial phase, attempt exactly one solution_analyst with model=gpt-6-astra and',
+        'fork_turns=none. For each final-review round, attempt exactly one fresh risk_reviewer with',
+        'model=gpt-5.6-sol and fork_turns=none. Do not substitute another model or add a second',
+        'native advisor. Wait for the started attempt, then pass its exact marked response and real',
+        'agent ID to advisor_round. If the native slot did',
         'not start or started without an answer, pass adopted=false, started=false or true, and a',
         'concise reason. Poll advisor_round_poll one call at a time until it returns a terminal',
         'receipt. External reviewer absence is best-effort and never blocks the primary task.',
         'Never inspect or invoke Grok, Claude, Herdr, their authentication, helper files, sockets,',
         'or processes directly; zerokun_advisors is the only external-advisor route.',
         'When reporting advisor coverage, use only the returned slotSummary. requested/total means',
-        'slots requested, not slots started. Say all five ran or answered only when slotSummary',
-        'proves started=5 or responsesObtained=5 respectively. Otherwise report the exact counts',
+        'slots requested, not slots started. Say all three ran or answered only when slotSummary',
+        'proves started=3 or responsesObtained=3 respectively. Otherwise report the exact counts',
         'and distinguish unavailable-before-start from a started slot that returned no answer.',
       ].join('\n')
     : [
@@ -3462,18 +3913,27 @@ export function buildCodexWorkerPrompt(
   if (host.advisorEnabled) {
     control.push(
       'Advisor transport: zerokun_advisors is the only permitted route for external reviewers.',
-      'When the applicable AGENTS.md requires the combined initial-design Five-Advisor panel, use',
+      'When the applicable AGENTS.md requires the combined initial-design Three-Advisor panel, use',
       'advisor_round with phase=investigation and round=1. For a required final review after',
-      'implementation, use phase=review and round=1. Do not use the legacy design phase.',
-      'Each of those two phases is attempt-wide and may run at most once even when Slack input is',
-      'added or the Codex turn is steered. A reusedPriorPhase result is final for that phase: do',
-      'not spawn replacement native advisors and do not call that phase again.',
-      `Native advisor responses for this input must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|review>:1:<solution|risk>] after replacing only phase and perspective.`,
+      'implementation, use phase=review and round=1. Only if you adopt a round-1 mandatory finding',
+      'and implement a non-empty task-owned fix delta, call one fresh phase=review round=2 with',
+      'roundTwoBasis, including taskOwnedFixPaths as the exact sorted repository-relative paths',
+      'you changed for that fix. The host requires an exact match with every observed path since',
+      'round 1; never claim another task\'s paths. Restrict round 2 to that delta and direct',
+      'regressions. Minor findings, advisor',
+      'unavailability, and infrastructure failures do not trigger round 2. Never call round 3 or',
+      'the legacy design phase. Each logical round is attempt-wide and may run at most once even',
+      'when Slack input is added or the Codex turn is steered. A reusedPriorPhase result is final',
+      'for that logical round; do not spawn replacements or call it again.',
+      'For investigation, spawn exactly one solution_analyst with model=gpt-6-astra and',
+      'fork_turns=none. For each review round, spawn exactly one fresh risk_reviewer with model=gpt-5.6-sol and',
+      'fork_turns=none. Do not substitute a different model and do not add another native slot.',
+      `That native advisor response must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|review>:<1|2>:<solution|risk>] after replacing phase, round, and perspective.`,
       'For an unavailable native slot, send adopted=false, an exact started boolean, and a concise',
       'reason. External unavailable outcomes are terminal best-effort results; never retry a panel',
       'or stop the primary work because a slot is absent.',
       'Base any advisor-count statement only on slotSummary returned by the broker. Never call all',
-      'five attempted, started, or completed unless the corresponding structured count is five.',
+      'three attempted, started, or completed unless the corresponding structured count is three.',
     )
   } else {
     control.push(

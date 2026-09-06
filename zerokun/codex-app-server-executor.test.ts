@@ -59,6 +59,10 @@ import {
   resolveAdvisorProjectLayout,
   snapshotAdvisorRepository,
 } from './advisor-snapshot.ts'
+import {
+  threeAdvisorRepositoryDeltaDigest,
+  threeAdvisorTaskOwnedFixPathsDigest,
+} from './advisor-journal.ts'
 
 const roots: string[] = []
 afterEach(() => {
@@ -1415,6 +1419,116 @@ describe('production App Server executor', () => {
     expect(collectHostAdvisorCoverage(state, jobId, nonce, observed.map(value => ({
       ...value, attemptNonce: 'e'.repeat(32),
     })))!.phases[0]).toMatchObject({ started: 1, responsesObtained: 1, startUnconfirmed: 2 })
+  })
+
+  test('version 9 journalはphase別3枠として集計しphase違いnativeを拒否する', () => {
+    const state = secureRoot()
+    prepareManagedStateRoot(state)
+    const jobId = 'three-coverage-fixture'
+    const nonce = '9'.repeat(32)
+    const digest = (value: string) => value.repeat(64)
+    const revisionRoot = join(
+      state, 'advisor-journal', jobId, nonce,
+      `revision-2-${digest('c').slice(0, 16)}`,
+    )
+    mkdirSync(revisionRoot, { recursive: true, mode: 0o700 })
+    const journalPath = join(revisionRoot, 'review-1.json')
+    const reviewStartedAt = Date.now()
+    const journal = {
+      version: 9,
+      advisorPolicy: 'three-phase-specific-conditional-final-v2',
+      status: 'completed',
+      phase: 'review',
+      round: 1,
+      attemptNonce: nonce,
+      inputRevision: 2,
+      inputDigest: digest('c'),
+      startedAt: reviewStartedAt,
+      finishedAt: reviewStartedAt + 1,
+      receiptIssuedAt: reviewStartedAt + 2,
+      receiptDigest: digest('8'),
+      pollObservedAt: reviewStartedAt + 3,
+      repositoryDeltaBaselineDigest: digest('5'),
+      native: [{
+        attempted: true, adopted: true, perspective: 'risk',
+        agentId: '/root/risk', responseDigest: digest('1'),
+        responseTransportDigest: digest('2'), executionState: 'response-obtained',
+      }],
+      grok: [{
+        attempted: true, adopted: false, perspective: 'risk',
+        containmentVerified: true, reasonDigest: digest('3'),
+        executionState: 'unavailable-before-start',
+      }],
+      claude: {
+        attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
+        workspaceCreationAttempted: false, freshEphemeral: false,
+        cleanupVerified: false, containmentVerified: true,
+        promptMayHaveBeenDelivered: false, reasonDigest: digest('4'),
+        executionState: 'unavailable-before-start',
+      },
+    }
+    writeFileSync(journalPath, `${JSON.stringify(journal)}\n`, { mode: 0o600 })
+
+    expect(collectHostAdvisorCoverage(state, jobId, nonce, true)).toMatchObject({
+      version: 1,
+      phases: [{
+        phase: 'review', round: 1, inputRevision: 2, total: 3,
+        started: 1, responsesObtained: 1, startUnconfirmed: 0,
+        unavailableBeforeStart: 2,
+      }],
+    })
+
+    const reviewTwoPath = join(revisionRoot, 'review-2.json')
+    const roundTwoBasis = {
+      reviewOneJournalDigest: createHash('sha256')
+        .update(JSON.stringify(journal)).digest('hex'),
+      mandatoryFindingDigest: digest('5'),
+      repositoryBaselineDigest: digest('5'),
+      repositoryCurrentDigest: digest('7'),
+      changedRepositoryCount: 1,
+      taskOwnedFixDeltaDigest: threeAdvisorRepositoryDeltaDigest(
+        digest('5'), digest('7'), 1,
+      ),
+      taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+      taskOwnedFixPathCount: 1,
+      taskOwnedFixPathsDigest: threeAdvisorTaskOwnedFixPathsDigest([
+        { repository: '.', path: 'round-two-fix.ts' },
+      ]),
+      roundOneSources: ['native'],
+      roundOneResponseDigests: { native: digest('1') },
+    }
+    const reviewTwo = {
+      ...journal,
+      round: 2,
+      startedAt: journal.pollObservedAt + 1,
+      finishedAt: journal.pollObservedAt + 2,
+      receiptIssuedAt: journal.pollObservedAt + 3,
+      receiptDigest: digest('9'),
+      pollObservedAt: journal.pollObservedAt + 4,
+      repositoryDeltaCurrentDigest: digest('7'),
+      repositoryDeltaCurrentDigestAfter: digest('7'),
+      roundTwoBasis,
+      native: [{ ...journal.native[0], agentId: '/root/risk-two' }],
+    }
+    writeFileSync(reviewTwoPath, `${JSON.stringify(reviewTwo)}\n`, { mode: 0o600 })
+    expect(collectHostAdvisorCoverage(state, jobId, nonce, true)?.phases)
+      .toMatchObject([
+        { phase: 'review', round: 1, total: 3 },
+        { phase: 'review', round: 2, total: 3 },
+      ])
+
+    writeFileSync(reviewTwoPath, `${JSON.stringify({
+      ...reviewTwo,
+      roundTwoBasis: { ...roundTwoBasis, reviewOneJournalDigest: digest('7') },
+    })}\n`, { mode: 0o600 })
+    expect(collectHostAdvisorCoverage(state, jobId, nonce, true)).toBeUndefined()
+    writeFileSync(reviewTwoPath, `${JSON.stringify(reviewTwo)}\n`, { mode: 0o600 })
+
+    writeFileSync(journalPath, `${JSON.stringify({
+      ...journal,
+      native: [{ ...journal.native[0], perspective: 'solution' }],
+    })}\n`, { mode: 0o600 })
+    expect(collectHostAdvisorCoverage(state, jobId, nonce, true)).toBeUndefined()
   })
 
   test('完了済みPRの同thread公開依頼は調査・設計を再実行せず直接promotionへ進む', async () => {

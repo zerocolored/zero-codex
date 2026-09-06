@@ -23,6 +23,15 @@ import type { ReconciledEphemeralClaudeRound } from './ephemeral-claude-session.
 import { ensureManagedDirectory, requireManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
 import { assertDescriptorStillNamesPath, atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import type { SeatbeltFingerprint } from './seatbelt-fingerprint.ts'
+import {
+  advisorPerspectiveForPhase,
+  THREE_ADVISOR_JOURNAL_VERSION,
+  THREE_ADVISOR_POLICY,
+  validThreeAdvisorPhaseRound,
+  validThreeAdvisorReviewSequence,
+  validThreeAdvisorRoundTwoBasis,
+  type AdvisorPhase,
+} from './advisor-journal.ts'
 
 const MAX_RECORD_BYTES = 64 * 1024
 const SHA256 = /^[0-9a-f]{64}$/
@@ -288,7 +297,14 @@ function requestedRound(
       const snapshot = readFileSnapshot(path)
       if (!snapshot) continue
       const journal = parseObject(snapshot.raw, 'advisor requested journal')
-      if (journal.version === 8 && journal.status === 'requested'
+      if ((journal.version === 8
+          || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+            && journal.advisorPolicy === THREE_ADVISOR_POLICY
+            && validThreeAdvisorPhaseRound(journal.phase, journal.round)
+            && (journal.phase === 'review' && journal.round === 2
+              ? validThreeAdvisorRoundTwoBasis(journal.roundTwoBasis)
+              : journal.roundTwoBasis === undefined)))
+        && journal.status === 'requested'
         && journal.jobId === jobId && journal.attemptNonce === attemptNonce
         && journal.processNonce === processNonce) {
         matches.push({ path, journal, snapshot })
@@ -296,7 +312,29 @@ function requestedRound(
     }
   }
   if (matches.length > 1) throw new Error('multiple requested advisor rounds share one process')
-  return matches[0] ?? null
+  const selected = matches[0] ?? null
+  if (selected?.journal.version === THREE_ADVISOR_JOURNAL_VERSION
+    && selected.journal.phase === 'review' && selected.journal.round === 2) {
+    const reviewOnes: Record<string, unknown>[] = []
+    for (const entry of readdirSync(attemptRoot, { withFileTypes: true })) {
+      if (!REVISION.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) continue
+      const revisionRoot = requireManagedDirectory(stateDir, join(attemptRoot, entry.name))
+      const snapshot = readFileSnapshot(join(revisionRoot, 'review-1.json'))
+      if (!snapshot) continue
+      const journal = parseObject(snapshot.raw, 'advisor first review journal')
+      if ((journal.version === 8 || journal.version === THREE_ADVISOR_JOURNAL_VERSION)
+        && journal.phase === 'review' && journal.round === 1
+        && journal.attemptNonce === attemptNonce
+        && journal.contextDigest === selected.journal.contextDigest) {
+        reviewOnes.push(journal)
+      }
+    }
+    if (reviewOnes.length !== 1
+      || !validThreeAdvisorReviewSequence(reviewOnes[0], selected.journal)) {
+      throw new Error('requested final-review round 2 is not bound to one completed current-policy round 1')
+    }
+  }
+  return selected
 }
 
 function retirementRoot(stateDir: string, jobId: string, attemptNonce: string): string {
@@ -330,7 +368,9 @@ export function recordAdvisorExecutorRetirement(options: {
     || Number(journal.brokerProcessId) <= 0 || !SHA256.test(String(journal.inputDigest ?? ''))
     || !Number.isSafeInteger(journal.inputRevision) || Number(journal.inputRevision) < 1
     || !['investigation', 'design', 'review'].includes(String(journal.phase))
-    || ![1, 2, 3].includes(Number(journal.round))) {
+    || ![1, 2, 3].includes(Number(journal.round))
+    || (journal.version === THREE_ADVISOR_JOURNAL_VERSION
+      && !validThreeAdvisorPhaseRound(journal.phase, journal.round))) {
     throw new Error('requested advisor journal cannot be bound to its executor')
   }
   const attemptRoot = dirname(dirname(requested.path))
@@ -629,7 +669,10 @@ export function finalizeRetiredAdvisorRounds(
             : 'stale-input'
           const finishedAt = Math.max(Date.now(), Number(journal.startedAt) || 0)
           const reason = 'reviewer process ended at a verified interjection generation boundary'
-          const grok = (['solution', 'risk'] as const).map(perspective => ({
+          const grokPerspectives = journal.version === THREE_ADVISOR_JOURNAL_VERSION
+            ? [advisorPerspectiveForPhase(journal.phase as AdvisorPhase)]
+            : ['solution', 'risk'] as const
+          const grok = grokPerspectives.map(perspective => ({
             attempted: true,
             adopted: false,
             perspective,

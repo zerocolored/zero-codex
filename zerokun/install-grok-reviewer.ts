@@ -21,6 +21,8 @@ import { dirname, join } from 'path'
 import { createHash, randomUUID } from 'crypto'
 import { resolveCodexExecutableDetails } from './standalone-codex.ts'
 
+const ZEROKUN_GROK_RUNTIME_RELATIVE_PATH = ['.zerokun', 'runtime', 'grok-reviewer'] as const
+
 function ensurePrivateDirectory(path: string): string {
   mkdirSync(path, { recursive: true, mode: 0o700 })
   let metadata = lstatSync(path)
@@ -210,7 +212,7 @@ deny = [
   ${toml('Bash(codex *)')},
   ${toml('Bash(grok *)')},
   ${toml(`Bash(${join(home, '.grok', 'bin', 'grok')} *)`)},
-  ${toml(`Bash(${join(home, '.grok-reviewer', 'bin', 'grok')} *)`)},
+  ${toml(`Bash(${join(home, ...ZEROKUN_GROK_RUNTIME_RELATIVE_PATH, 'bin', 'grok')} *)`)},
 ]
 
 [marketplace]
@@ -263,7 +265,9 @@ export function installGrokReviewer(homeInput = homedir()): string {
   // symlink, so use the hardened executable resolver for supported layouts.
   const grokPhysical = resolveCodexExecutableDetails(grok).physical
 
-  const reviewerRoot = ensurePrivateDirectory(join(home, '.grok-reviewer'))
+  const zerokunRoot = ensurePrivateDirectory(join(home, '.zerokun'))
+  const runtimeRoot = ensurePrivateDirectory(join(zerokunRoot, 'runtime'))
+  const reviewerRoot = ensurePrivateDirectory(join(runtimeRoot, 'grok-reviewer'))
   const bin = ensurePrivateDirectory(join(reviewerRoot, 'bin'))
   const sourceRoot = join(import.meta.dir, 'grok-reviewer')
   atomicPrivateWrite(join(bin, 'grok'), readInstallSource(join(sourceRoot, 'grok')), 0o700)
