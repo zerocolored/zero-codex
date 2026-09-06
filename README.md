@@ -115,6 +115,11 @@ managed/MDMを含む実効permission検査には`app-server config/read`と`conf
 同じSlackスレッドの途中入力は現在turnへ安全に割り込み、単なる質問か作業更新かの意味判断もCodexへ
 委ねます。Zeroちゃんは配送順序、重複防止、取消、process回収だけを管理します。
 
+Primary Codexはrelease codeで`gpt-5.6-sol`、reasoning effortは`xhigh`へ固定しています。
+App Server起動、thread開始／再開、各turnで同じ値を明示し、handshakeの実効値も照合します。
+利用者の`~/.codex/config.toml`、shell環境、state内`.env`では変更されないため、別Macでも同じ設定です。
+Advisorのmodel選択はこのprimary設定とは別に`AGENTS.md`の契約へ従います。
+
 ## 必要なもの
 
 - macOS
@@ -474,6 +479,7 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   current projectのcanonical `github.com` repositoryだけを操作します。作業判断はCodexが行います。
 - App Serverは認証済み`CODEX_HOME`を使うためuser configも読みます。そのため起動直前の
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、
+  primary model=`gpt-5.6-sol`、reasoning effort=`xhigh`をrelease側から上書きして実効値を照合し、
   endpoint/provider差替え、legacy sandbox、named permissionの変更を拒否します。安全規則は
   `developerInstructions`、未信頼のSlack本文はJSON-RPC inputへ分離し、子環境はallowlistです。
 - Codexが返す`instructionSources`を照合し、存在するglobal `AGENTS.md`とproject

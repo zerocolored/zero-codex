@@ -87,6 +87,10 @@ import {
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
 import {
+  ZEROCHAN_PRIMARY_CODEX_MODEL,
+  ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+} from './codex-runtime-selection.ts'
+import {
   advisorPerspectiveForPhase,
   THREE_ADVISOR_JOURNAL_VERSION,
   THREE_ADVISOR_POLICY,
@@ -4998,6 +5002,10 @@ export function buildCodexPermissionOverrides(
     browserAccessEnabled?: boolean
     multiAgentEnabled?: boolean
     toolchainPath?: string
+    /** Fixture-only selection override. Production uses the release constants. */
+    model?: string
+    /** Fixture-only selection override. Production uses the release constants. */
+    reasoningEffort?: string
   },
 ): string[] {
   const profile = options.profile ?? 'zerokun_job'
@@ -5037,6 +5045,9 @@ export function buildCodexPermissionOverrides(
   const browserAccessEnabled = options.browserAccessEnabled ?? executionWriteEnabled
   const networkEnabled = executionWriteEnabled || localVerificationEnabled || browserAccessEnabled
   const multiAgentEnabled = options.multiAgentEnabled ?? true
+  const model = options.model ?? ZEROCHAN_PRIMARY_CODEX_MODEL
+  const reasoningEffort = options.reasoningEffort
+    ?? ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT
   if (pathContains(repo, home)) {
     throw new Error(`repository must not contain HOME: ${repo}`)
   }
@@ -5214,6 +5225,8 @@ export function buildCodexPermissionOverrides(
     'approval_policy="never"',
     'project_doc_max_bytes=262144',
     'notify=[]',
+    `model=${tomlString(model)}`,
+    `model_reasoning_effort=${tomlString(reasoningEffort)}`,
     'model_provider="openai"',
     'model_providers={}',
     'shell_environment_policy.inherit="core"',
@@ -5869,7 +5882,10 @@ export async function executeCodexJob(
   options: {
     /** Explicit fixture injection. Production callers must use the official standalone install. */
     codexBinForTesting?: string
+    /** Fixture-only model override. Production always uses the release constant. */
     model?: string
+    /** Fixture-only reasoning override. Production always uses the release constant. */
+    reasoningEffort?: string
     /** Legacy exec-fixture wall clock. Production App Server jobs do not use it. */
     timeoutMs?: number
     logDir: string
@@ -5989,6 +6005,10 @@ export async function executeCodexJob(
   }
   if (options.signal?.aborted) throw new CodexInterruptedError('Codex job was interrupted')
   const testCodexBin = options.codexBinForTesting
+  if (testCodexBin === undefined
+    && (options.model !== undefined || options.reasoningEffort !== undefined)) {
+    throw new Error('primary Codex model selection cannot be overridden in production')
+  }
   if (testCodexBin === undefined && options.phaseGateForTesting) {
     throw new Error('phaseGateForTesting cannot replace production advisor verification')
   }
@@ -6024,7 +6044,12 @@ export async function executeCodexJob(
       throw new Error(`Codex executable changed after resolution: ${requestedCodex}`)
     }
   }
-  const model = options.model ?? process.env.ZEROKUN_JOB_MODEL
+  const model = testCodexBin === undefined
+    ? ZEROCHAN_PRIMARY_CODEX_MODEL
+    : options.model ?? ZEROCHAN_PRIMARY_CODEX_MODEL
+  const reasoningEffort = testCodexBin === undefined
+    ? ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT
+    : options.reasoningEffort ?? ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT
   const progressSchedule = validProgressSchedule(options.progressScheduleForTesting)
   const progressProbeRetryMs = positiveInteger(options.progressProbeRetryMsForTesting, 30_000)
   const progressPublishRetryMs = positiveInteger(options.progressPublishRetryMsForTesting, 1_000)
@@ -6358,6 +6383,8 @@ export async function executeCodexJob(
         browserAccessEnabled: browserEnabled,
         multiAgentEnabled: !continuationDecision
           && stage !== 'implementation' && stage !== 'interjection',
+        model,
+        reasoningEffort,
       })
       return {
         attemptNonce: logicalAttempt.attemptNonce,
@@ -7194,7 +7221,8 @@ export async function executeCodexJob(
               cwd: job.repoPath,
               permissions: advisorAttempt.permissionProfile,
               approvalPolicy: 'never',
-              ...(model ? { model } : {}),
+              model,
+              effort: reasoningEffort,
               beforeWrite: id => {
                 activeInputRevision = control.inputRevision
                 requestId = id
@@ -7481,13 +7509,18 @@ export async function executeCodexJob(
           approvalPolicy: 'never',
           permissions: advisorAttempt.permissionProfile,
           developerInstructions: advisorAttempt.developerInstructions,
-          ...(model ? { model } : {}),
+          model,
+          config: { model_reasoning_effort: reasoningEffort },
         }
         const resumeThreadId = resumed && sessionId ? sessionId : null
         const startedFreshThread = resumeThreadId === null
         const threadHandshake = resumeThreadId
           ? await session.resumeThread({ threadId: resumeThreadId, ...threadParams })
-          : await session.startThread({ ...threadParams, ephemeral: false })
+          : await session.startThread({
+            ...threadParams,
+            allowProviderModelFallback: false,
+            ephemeral: false,
+          })
         currentThreadId = threadHandshake.threadId
         monitorParentThreadId = currentThreadId
         currentThreadSource = threadHandshake.source
@@ -7604,7 +7637,8 @@ export async function executeCodexJob(
               cwd: job.repoPath,
               permissions: advisorAttempt.permissionProfile,
               approvalPolicy: 'never',
-              ...(model ? { model } : {}),
+              model,
+              effort: reasoningEffort,
               beforeWrite: requestId => {
                 initialRequestId = requestId
                 const disposition = isInterjectionStage

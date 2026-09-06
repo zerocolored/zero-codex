@@ -57,6 +57,9 @@ function fixture(): string {
       'approvalPolicy?: AskForApproval | null',
       'permissions?: string | null',
       'developerInstructions?: string | null',
+      'model?: string | null',
+      'allowProviderModelFallback?: boolean',
+      'config?: { [key in string]?: JsonValue } | null',
     ].join('\n'),
     'v2/ThreadResumeParams.ts': [
       'threadId: string',
@@ -64,6 +67,8 @@ function fixture(): string {
       'approvalPolicy?: AskForApproval | null',
       'permissions?: string | null',
       'developerInstructions?: string | null',
+      'model?: string | null',
+      'config?: { [key in string]?: JsonValue } | null',
     ].join('\n'),
     'v2/ThreadListParams.ts': [
       'sourceKinds?: Array<ThreadSourceKind> | null',
@@ -123,6 +128,8 @@ function fixture(): string {
       'cwd?: string | null',
       'approvalPolicy?: AskForApproval | null',
       'permissions?: string | null',
+      'model?: string | null',
+      'effort?: ReasoningEffort | null',
     ].join('\n'),
     'v2/TurnSteerParams.ts': [
       'threadId: string',
@@ -149,6 +156,7 @@ function fixture(): string {
       'cwd: AbsolutePathBuf',
       'thread: Thread',
       'model: string',
+      'reasoningEffort: ReasoningEffort | null',
       'modelProvider: string',
     ].join('\n'),
     'v2/ThreadResumeResponse.ts': [
@@ -158,6 +166,7 @@ function fixture(): string {
       'cwd: AbsolutePathBuf',
       'thread: Thread',
       'model: string',
+      'reasoningEffort: ReasoningEffort | null',
       'modelProvider: string',
     ].join('\n'),
   }
@@ -178,6 +187,44 @@ describe('Codex App Server capability gate', () => {
     const root = fixture()
     writeFileSync(join(root, 'v2/ThreadItemsListResponse.ts'), 'data: Array<ThreadItemEntry>')
     expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('nextCursor')
+  })
+
+  test('primary model固定に必要なthreadとturn fieldが欠けたreleaseをfail-closeする', () => {
+    const missingThreadConfig = fixture()
+    const threadPath = join(missingThreadConfig, 'v2/ThreadStartParams.ts')
+    writeFileSync(
+      threadPath,
+      readFileSync(threadPath, 'utf8').replace(
+        'config?: { [key in string]?: JsonValue } | null',
+        '',
+      ),
+      { mode: 0o600 },
+    )
+    expect(() => assertCodexAppServerGeneratedCapabilities(missingThreadConfig))
+      .toThrow('config')
+
+    const missingTurnEffort = fixture()
+    const turnPath = join(missingTurnEffort, 'v2/TurnStartParams.ts')
+    writeFileSync(
+      turnPath,
+      readFileSync(turnPath, 'utf8').replace('effort?: ReasoningEffort | null', ''),
+      { mode: 0o600 },
+    )
+    expect(() => assertCodexAppServerGeneratedCapabilities(missingTurnEffort))
+      .toThrow('effort')
+
+    const missingHandshakeEffort = fixture()
+    const responsePath = join(missingHandshakeEffort, 'v2/ThreadStartResponse.ts')
+    writeFileSync(
+      responsePath,
+      readFileSync(responsePath, 'utf8').replace(
+        'reasoningEffort: ReasoningEffort | null',
+        '',
+      ),
+      { mode: 0o600 },
+    )
+    expect(() => assertCodexAppServerGeneratedCapabilities(missingHandshakeEffort))
+      .toThrow('reasoningEffort')
   })
 
   test('0.149系とcurrentの既知activity kind集合だけを受理する', () => {

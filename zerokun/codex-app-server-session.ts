@@ -50,6 +50,7 @@ export type AppServerThreadHandshake = {
   threadId: string
   instructionSources: string[]
   model: string
+  reasoningEffort: string | null
   modelProvider: string
   source: AppServerSessionSource
 }
@@ -70,11 +71,54 @@ export type AppServerPermissionProbeEvidence = {
   unexpectedItemType: string | null
 }
 
+function sameCommandExecutionIdentity(
+  left: AppServerCommandExecutionEvidence,
+  right: AppServerCommandExecutionEvidence,
+): boolean {
+  return left.itemId !== null
+    && left.itemId === right.itemId
+    && left.command === right.command
+    && left.cwd === right.cwd
+    && left.source === right.source
+}
+
+function commandExecutionEvidencePriority(
+  evidence: AppServerCommandExecutionEvidence,
+): number {
+  const failed = (evidence.exitCode !== null && evidence.exitCode !== 0)
+    || (evidence.status !== null
+      && evidence.status !== 'inProgress'
+      && evidence.status !== 'completed')
+  if (failed) return 3
+  if (evidence.status === 'completed' && evidence.exitCode === 0) return 2
+  if (evidence.status === 'completed' || evidence.exitCode === 0) return 1
+  return 0
+}
+
+function mergeSameCommandExecutionEvidence(
+  left: AppServerCommandExecutionEvidence,
+  right: AppServerCommandExecutionEvidence,
+): AppServerCommandExecutionEvidence {
+  // Keep status and exitCode from one observation. Combining the two fields
+  // independently could manufacture a successful completion from two partial
+  // or contradictory records. Any explicit failure outranks success, while a
+  // complete success outranks the earlier in-progress notification.
+  return {
+    ...(commandExecutionEvidencePriority(right) > commandExecutionEvidencePriority(left)
+      ? right
+      : left),
+  }
+}
+
 export function mergeAppServerPermissionProbeEvidence(
   left: AppServerPermissionProbeEvidence,
   right: AppServerPermissionProbeEvidence,
 ): AppServerPermissionProbeEvidence {
-  const firstCommand = left.firstCommand ?? right.firstCommand
+  const sameCommand = left.firstCommand !== null && right.firstCommand !== null
+    && sameCommandExecutionIdentity(left.firstCommand, right.firstCommand)
+  const firstCommand = sameCommand
+    ? mergeSameCommandExecutionEvidence(left.firstCommand!, right.firstCommand!)
+    : left.firstCommand ?? right.firstCommand
   let commandCount: AppServerPermissionProbeEvidence['commandCount']
   if (left.commandCount === 0) {
     commandCount = right.commandCount
@@ -83,14 +127,6 @@ export function mergeAppServerPermissionProbeEvidence(
   } else if (left.commandCount === 2 || right.commandCount === 2) {
     commandCount = 2
   } else {
-    const leftCommand = left.firstCommand
-    const rightCommand = right.firstCommand
-    const sameCommand = leftCommand !== null && rightCommand !== null
-      && leftCommand.itemId !== null
-      && leftCommand.itemId === rightCommand.itemId
-      && leftCommand.command === rightCommand.command
-      && leftCommand.cwd === rightCommand.cwd
-      && leftCommand.source === rightCommand.source
     commandCount = sameCommand ? 1 : 2
   }
   return {
@@ -407,7 +443,10 @@ function projectClientTurnHistory(
 type ObservedTurnProjection = {
   lastAgentMessage: Record<string, unknown> | null
   permissionEvidence: AppServerPermissionProbeEvidence
-  permissionItemIds: Set<string>
+  permissionCommandStates: Map<string, {
+    phase: 'started' | 'completed'
+    command: AppServerCommandExecutionEvidence
+  }>
   pendingSubAgentActivityIds: Set<string>
 }
 
@@ -423,7 +462,8 @@ function emptyPermissionProbeEvidence(): AppServerPermissionProbeEvidence {
 function observePermissionProbeItem(
   evidence: AppServerPermissionProbeEvidence,
   item: Record<string, unknown>,
-  observedItemIds?: Set<string>,
+  observedCommands?: ObservedTurnProjection['permissionCommandStates'],
+  phase?: 'started' | 'completed',
 ): void {
   const allowedItemTypes = new Set([
     'userMessage', 'agentMessage', 'plan', 'reasoning', 'commandExecution',
@@ -438,33 +478,62 @@ function observePermissionProbeItem(
     return
   }
   if (itemType !== 'commandExecution') return
-  if (typeof item.id === 'string' && observedItemIds) {
-    if (observedItemIds.has(item.id)) return
-    observedItemIds.add(item.id)
+  const markInvalidCommand = (): void => {
+    if (!evidence.unexpectedItemSeen) {
+      evidence.unexpectedItemSeen = true
+      evidence.unexpectedItemType = 'invalidCommandExecution'
+    }
   }
-  evidence.commandCount = evidence.commandCount === 0 ? 1 : 2
-  if (evidence.firstCommand !== null) return
-  const boundedString = (value: unknown): string | null => (
-    typeof value === 'string' && value.length <= 8_192 ? value : null
-  )
-  evidence.firstCommand = {
-    itemId: boundedString(item.id),
+  const boundedString = (value: unknown): string | null => {
+    if (value === undefined || value === null) return null
+    if (typeof value === 'string' && value.length <= 8_192) return value
+    markInvalidCommand()
+    return null
+  }
+  const itemId = boundedString(item.id)
+  if (itemId === null || itemId.length === 0) markInvalidCommand()
+  const exitCode = item.exitCode === undefined || item.exitCode === null
+    ? null
+    : typeof item.exitCode === 'number' && Number.isSafeInteger(item.exitCode)
+      ? item.exitCode
+      : (markInvalidCommand(), null)
+  const command: AppServerCommandExecutionEvidence = {
+    itemId,
     command: boundedString(item.command),
     cwd: boundedString(item.cwd),
     source: boundedString(item.source),
     status: boundedString(item.status),
-    exitCode: typeof item.exitCode === 'number' && Number.isSafeInteger(item.exitCode)
-      ? item.exitCode
-      : null,
+    exitCode,
   }
+  if (itemId !== null && itemId.length > 0 && observedCommands && phase) {
+    const observed = observedCommands.get(itemId)
+    if (observed) {
+      const identityMatches = sameCommandExecutionIdentity(observed.command, command)
+      const advancesOnce = observed.phase === 'started' && phase === 'completed'
+      if (!identityMatches || !advancesOnce) {
+        // An ID collision, duplicated notification, or restarted lifecycle can
+        // no longer prove exactly-once execution. Keep this failure sticky.
+        evidence.commandCount = 2
+        markInvalidCommand()
+        return
+      }
+      const merged = mergeSameCommandExecutionEvidence(observed.command, command)
+      observedCommands.set(itemId, { phase, command: merged })
+      if (evidence.firstCommand?.itemId === itemId) evidence.firstCommand = merged
+      return
+    }
+    observedCommands.set(itemId, { phase, command })
+  }
+  evidence.commandCount = evidence.commandCount === 0 ? 1 : 2
+  if (evidence.firstCommand !== null) return
+  evidence.firstCommand = command
 }
 
 function permissionProbeEvidenceFromItems(
   items: readonly Record<string, unknown>[],
 ): AppServerPermissionProbeEvidence {
   const evidence = emptyPermissionProbeEvidence()
-  const observedItemIds = new Set<string>()
-  for (const item of items) observePermissionProbeItem(evidence, item, observedItemIds)
+  for (const item of items) observePermissionProbeItem(evidence, item)
   return evidence
 }
 
@@ -584,7 +653,7 @@ export class CodexAppServerSession {
     this.turnProjections.set(key, {
       lastAgentMessage: null,
       permissionEvidence: emptyPermissionProbeEvidence(),
-      permissionItemIds: new Set(),
+      permissionCommandStates: new Map(),
       pendingSubAgentActivityIds: new Set(),
     })
   }
@@ -618,7 +687,8 @@ export class CodexAppServerSession {
     observePermissionProbeItem(
       projection.permissionEvidence,
       item,
-      projection.permissionItemIds,
+      projection.permissionCommandStates,
+      'started',
     )
     if (item.type !== 'subAgentActivity') return
     const itemId = identifier(item.id, 'item/started subAgentActivity id')
@@ -664,7 +734,8 @@ export class CodexAppServerSession {
     observePermissionProbeItem(
       projection.permissionEvidence,
       item,
-      projection.permissionItemIds,
+      projection.permissionCommandStates,
+      'completed',
     )
     if (item.type === 'agentMessage' || item.type === 'agent_message') {
       if (isFinalAppServerAgentMessage(item)) projection.lastAgentMessage = item
@@ -688,7 +759,7 @@ export class CodexAppServerSession {
     const projection = this.turnProjections.get(key) ?? {
       lastAgentMessage: null,
       permissionEvidence: emptyPermissionProbeEvidence(),
-      permissionItemIds: new Set<string>(),
+      permissionCommandStates: new Map(),
       pendingSubAgentActivityIds: new Set<string>(),
     }
     this.turnProjections.delete(key)
@@ -975,6 +1046,22 @@ export class CodexAppServerSession {
     if (expected.model !== undefined && expected.model !== null && model !== expected.model) {
       throw new AppServerProtocolError(`${method} activated a different model`)
     }
+    const expectedConfig = expected.config
+    const rawReasoningEffort = result.reasoningEffort
+    const reasoningEffort = rawReasoningEffort === undefined || rawReasoningEffort === null
+      ? null
+      : nonEmptyString(rawReasoningEffort, `${method} reasoning effort`)
+    if (expectedConfig !== undefined && expectedConfig !== null) {
+      const config = record(expectedConfig, `${method} requested config`)
+      const expectedReasoningEffort = config.model_reasoning_effort
+      if (expectedReasoningEffort !== undefined && expectedReasoningEffort !== null
+        && nonEmptyString(
+          expectedReasoningEffort,
+          `${method} requested reasoning effort`,
+        ) !== reasoningEffort) {
+        throw new AppServerProtocolError(`${method} activated a different reasoning effort`)
+      }
+    }
     const modelProvider = nonEmptyString(result.modelProvider, `${method} model provider`)
     if (modelProvider !== 'openai'
       || nonEmptyString(thread.modelProvider, `${method} thread model provider`) !== modelProvider) {
@@ -1015,7 +1102,7 @@ export class CodexAppServerSession {
     if (missingInstruction) {
       throw new AppServerProtocolError(`${method} did not load the requested ${missingInstruction.label}`)
     }
-    return { threadId, instructionSources, model, modelProvider, source }
+    return { threadId, instructionSources, model, reasoningEffort, modelProvider, source }
   }
 
   async startThread(
@@ -1051,6 +1138,7 @@ export class CodexAppServerSession {
       permissions: string
       approvalPolicy: 'never'
       model?: string
+      effort?: string
       timeoutMs?: number
       beforeWrite?(requestId: number): void
     },
@@ -1064,6 +1152,7 @@ export class CodexAppServerSession {
       permissions: options.permissions,
       approvalPolicy: options.approvalPolicy,
       ...(options.model ? { model: options.model } : {}),
+      ...(options.effort ? { effort: options.effort } : {}),
     }, { timeoutMs: options.timeoutMs ?? 30_000, beforeWrite: options.beforeWrite })
     const turn = parseTurn(response.result.turn)
     if (turn.status !== 'inProgress') {

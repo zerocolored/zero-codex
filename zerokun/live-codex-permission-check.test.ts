@@ -128,4 +128,43 @@ describe('live Codex permission evidence', () => {
     expect(evidence.commandCount).toBe(2)
     expect(evidence.unexpectedItemType).toBe('mcpToolCall')
   })
+
+  test('stream開始状態を公式履歴の同一command完了状態で更新する', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'zero-live-permission-merge-'))
+    const script = '/tmp/permission-probe'
+    const terminal: AppServerTurnTerminal = {
+      threadId: 'thread-merge',
+      turn: {
+        id: 'turn-merge', status: 'completed', itemsView: 'summary', items: [], error: null,
+      },
+      permissionEvidence: {
+        commandCount: 1,
+        firstCommand: {
+          itemId: 'command-merge', command: script, cwd: repo, source: 'agent',
+          status: 'inProgress', exitCode: null,
+        },
+        unexpectedItemSeen: false,
+        unexpectedItemType: null,
+      },
+    }
+    const session = {
+      loadPermissionProbeEvidence: async (): Promise<AppServerPermissionProbeEvidence> => ({
+        commandCount: 1,
+        firstCommand: {
+          itemId: 'command-merge', command: script, cwd: repo, source: 'agent',
+          status: 'completed', exitCode: 0,
+        },
+        unexpectedItemSeen: false,
+        unexpectedItemType: null,
+      }),
+    } as unknown as CodexAppServerSession
+    try {
+      const evidence = await loadPermissionProbeEvidenceForTerminal(session, terminal)
+      expect(evidence.firstCommand?.status).toBe('completed')
+      expect(evidence.firstCommand?.exitCode).toBe(0)
+      expect(() => requireSingleProbeExecution(evidence, script, repo)).not.toThrow()
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
 })

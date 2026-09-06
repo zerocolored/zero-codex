@@ -67,6 +67,9 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
       /approvalPolicy\?:\s*AskForApproval \| null/,
       /permissions\?:\s*string \| null/,
       /developerInstructions\?:\s*string \| null/,
+      /model\?:\s*string \| null/,
+      /allowProviderModelFallback\?:\s*boolean/,
+      /config\?:\s*\{ \[key in string\]\?: JsonValue \} \| null/,
     ],
   },
   {
@@ -77,6 +80,8 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
       /approvalPolicy\?:\s*AskForApproval \| null/,
       /permissions\?:\s*string \| null/,
       /developerInstructions\?:\s*string \| null/,
+      /model\?:\s*string \| null/,
+      /config\?:\s*\{ \[key in string\]\?: JsonValue \} \| null/,
     ],
   },
   {
@@ -179,6 +184,8 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
       /cwd\?:\s*string \| null/,
       /approvalPolicy\?:\s*AskForApproval \| null/,
       /permissions\?:\s*string \| null/,
+      /model\?:\s*string \| null/,
+      /effort\?:\s*ReasoningEffort \| null/,
     ],
   },
   {
@@ -229,6 +236,7 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
       /cwd:\s*AbsolutePathBuf/,
       /thread:\s*Thread/,
       /model:\s*string/,
+      /reasoningEffort:\s*ReasoningEffort \| null/,
       /modelProvider:\s*string/,
     ],
   },
@@ -241,6 +249,7 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
       /cwd:\s*AbsolutePathBuf/,
       /thread:\s*Thread/,
       /model:\s*string/,
+      /reasoningEffort:\s*ReasoningEffort \| null/,
       /modelProvider:\s*string/,
     ],
   },

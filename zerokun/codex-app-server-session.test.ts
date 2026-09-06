@@ -7,6 +7,7 @@ import {
   AppServerProtocolError,
   CodexAppServerSession,
   appServerFinalMessage,
+  mergeAppServerPermissionProbeEvidence,
   parseAppServerSessionSource,
   isAppServerMethodUnsupported,
   sameAppServerSessionSource,
@@ -63,7 +64,8 @@ describe('Codex App Server session', () => {
           id: 'existing-thread', cwd: repo, source: 'appServer', modelProvider: 'openai',
           status: { type: 'idle' }, canAcceptDirectInput: true, turns: [],
         },
-        model: 'gpt-test', modelProvider: 'openai', cwd: repo, approvalPolicy: 'never',
+        model: 'gpt-test', reasoningEffort: 'xhigh', modelProvider: 'openai', cwd: repo,
+        approvalPolicy: 'never',
         activePermissionProfile: { id: 'profile-1', extends: null }, instructionSources: [],
       } })
     })
@@ -72,12 +74,42 @@ describe('Codex App Server session', () => {
       const result = await session.resumeThread({
         threadId: 'existing-thread', cwd: repo, permissions: 'profile-1',
         approvalPolicy: 'never', model: 'gpt-test', excludeTurns: false,
+        config: { model_reasoning_effort: 'xhigh' },
       })
       expect(result.threadId).toBe('existing-thread')
       expect(transport.sent).toHaveLength(1)
       expect(transport.sent[0]).toMatchObject({ method: 'thread/resume', params: {
         threadId: 'existing-thread', excludeTurns: true, cwd: repo, permissions: 'profile-1',
+        model: 'gpt-test', config: { model_reasoning_effort: 'xhigh' },
       } })
+      expect(result.reasoningEffort).toBe('xhigh')
+    } finally {
+      session.closeInput()
+      await session.waitForReader()
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  test('thread handshakeは要求した推論強度と異なる実効値を拒否する', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'zero-reasoning-effort-mismatch-'))
+    const transport = mockTransport((request, emit) => {
+      if (request.method !== 'thread/start') return
+      emit({ id: request.id, result: {
+        thread: {
+          id: 'thread-effort', cwd: repo, source: 'appServer', modelProvider: 'openai',
+          status: { type: 'idle' }, canAcceptDirectInput: true,
+        },
+        model: 'gpt-test', reasoningEffort: 'medium', modelProvider: 'openai', cwd: repo,
+        approvalPolicy: 'never',
+        activePermissionProfile: { id: 'profile-1', extends: null }, instructionSources: [],
+      } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    try {
+      await expect(session.startThread({
+        cwd: repo, permissions: 'profile-1', approvalPolicy: 'never', model: 'gpt-test',
+        config: { model_reasoning_effort: 'xhigh' },
+      })).rejects.toThrow('activated a different reasoning effort')
     } finally {
       session.closeInput()
       await session.waitForReader()
@@ -190,6 +222,7 @@ describe('Codex App Server session', () => {
             status: { type: 'idle' }, canAcceptDirectInput: true,
           },
           model: 'gpt-test',
+          reasoningEffort: 'xhigh',
           modelProvider: 'openai',
           cwd: repo,
           approvalPolicy: 'never',
@@ -211,6 +244,8 @@ describe('Codex App Server session', () => {
       await session.initialize()
       const handshake = await session.startThread({
         cwd: repo, permissions: 'profile-1', approvalPolicy: 'never', model: 'gpt-test',
+        config: { model_reasoning_effort: 'xhigh' },
+        allowProviderModelFallback: false,
       })
       const threadId = handshake.threadId
       const turnId = await session.startTurn(threadId, '最初', 'slack-root', {
@@ -218,6 +253,7 @@ describe('Codex App Server session', () => {
         permissions: 'profile-1',
         approvalPolicy: 'never',
         model: 'gpt-test',
+        effort: 'xhigh',
       })
       await session.steer(threadId, turnId, '追記', 'slack-reply', {
         beforeWrite: id => beforeWrites.push(id),
@@ -242,7 +278,14 @@ describe('Codex App Server session', () => {
       expect(beforeWrites).toEqual([4])
       expect(transport.sent[3]?.params).toMatchObject({
         cwd: repo, permissions: 'profile-1', approvalPolicy: 'never', model: 'gpt-test',
+        effort: 'xhigh',
       })
+      expect(transport.sent[2]?.params).toMatchObject({
+        model: 'gpt-test',
+        config: { model_reasoning_effort: 'xhigh' },
+        allowProviderModelFallback: false,
+      })
+      expect(handshake.reasoningEffort).toBe('xhigh')
       expect(transport.sent.map(value => value.method)).toEqual([
         'initialize', 'initialized', 'thread/start', 'turn/start', 'turn/steer',
       ])
@@ -1265,6 +1308,203 @@ describe('Codex App Server session', () => {
     expect(terminal?.permissionEvidence.firstCommand?.command).toBe('/tmp/probe')
   })
 
+  test('同じcommandのstartedからcompletedへ終端状態を更新する', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    const startedCommand = {
+      type: 'commandExecution', id: 'command-lifecycle', command: '/tmp/probe',
+      cwd: '/tmp', source: 'agent', status: 'inProgress', exitCode: null,
+    }
+    const completedCommand = {
+      ...startedCommand, status: 'completed', exitCode: 0,
+    }
+    transport.emit({
+      method: 'turn/started',
+      params: { threadId: 'thread-lifecycle', turn: {
+        id: 'turn-lifecycle', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } },
+    })
+    transport.emit({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-lifecycle', turnId: 'turn-lifecycle', item: startedCommand,
+      },
+    })
+    transport.emit({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-lifecycle', turnId: 'turn-lifecycle', item: completedCommand,
+      },
+    })
+    transport.emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-lifecycle', turn: {
+        id: 'turn-lifecycle', status: 'completed', itemsView: 'summary', items: [],
+        error: null,
+      } },
+    })
+    session.closeInput()
+    await session.waitForReader()
+    const terminal = session.takeTurnTerminal('thread-lifecycle', 'turn-lifecycle')
+    expect(terminal?.permissionEvidence).toEqual({
+      commandCount: 1,
+      firstCommand: {
+        itemId: 'command-lifecycle', command: '/tmp/probe', cwd: '/tmp',
+        source: 'agent', status: 'completed', exitCode: 0,
+      },
+      unexpectedItemSeen: false,
+      unexpectedItemType: null,
+    })
+  })
+
+  for (const scenario of [
+    {
+      id: 'oversized-id',
+      name: '上限超過item IDの再利用',
+      observations: [
+        { phase: 'completed', item: {
+          type: 'commandExecution', id: 'x'.repeat(8_193), command: '/tmp/probe',
+          cwd: '/tmp', source: 'agent', status: 'completed', exitCode: 0,
+        } },
+        { phase: 'completed', item: {
+          type: 'commandExecution', id: 'x'.repeat(8_193), command: '/tmp/other',
+          cwd: '/tmp', source: 'agent', status: 'failed', exitCode: 1,
+        } },
+      ],
+    },
+    {
+      id: 'invalid-exit',
+      name: '不正な非整数exit codeの後続成功',
+      observations: [
+        { phase: 'completed', item: {
+          type: 'commandExecution', id: 'command-invalid-exit', command: '/tmp/probe',
+          cwd: '/tmp', source: 'agent', status: 'completed', exitCode: 1.5,
+        } },
+        { phase: 'completed', item: {
+          type: 'commandExecution', id: 'command-invalid-exit', command: '/tmp/probe',
+          cwd: '/tmp', source: 'agent', status: 'completed', exitCode: 0,
+        } },
+      ],
+    },
+    {
+      id: 'restarted-lifecycle',
+      name: '完了後に再開した同一ID lifecycle',
+      observations: [
+        { phase: 'started', item: {
+          type: 'commandExecution', id: 'command-restarted', command: '/tmp/probe',
+          cwd: '/tmp', source: 'agent', status: 'inProgress', exitCode: null,
+        } },
+        { phase: 'completed', item: {
+          type: 'commandExecution', id: 'command-restarted', command: '/tmp/probe',
+          cwd: '/tmp', source: 'agent', status: 'completed', exitCode: 0,
+        } },
+        { phase: 'started', item: {
+          type: 'commandExecution', id: 'command-restarted', command: '/tmp/probe',
+          cwd: '/tmp', source: 'agent', status: 'inProgress', exitCode: null,
+        } },
+        { phase: 'completed', item: {
+          type: 'commandExecution', id: 'command-restarted', command: '/tmp/probe',
+          cwd: '/tmp', source: 'agent', status: 'completed', exitCode: 0,
+        } },
+      ],
+    },
+  ] as const) {
+    test(`${scenario.name}はexact-once成功へ昇格しない`, async () => {
+      const transport = mockTransport()
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      const threadId = `thread-${scenario.id}`
+      const turnId = `turn-${scenario.id}`
+      transport.emit({
+        method: 'turn/started',
+        params: { threadId, turn: {
+          id: turnId, status: 'inProgress', itemsView: 'full', items: [], error: null,
+        } },
+      })
+      for (const observation of scenario.observations) {
+        transport.emit({
+          method: observation.phase === 'started' ? 'item/started' : 'item/completed',
+          params: { threadId, turnId, item: observation.item },
+        })
+      }
+      transport.emit({
+        method: 'turn/completed',
+        params: { threadId, turn: {
+          id: turnId, status: 'completed', itemsView: 'summary', items: [], error: null,
+        } },
+      })
+      session.closeInput()
+      await session.waitForReader()
+      const evidence = session.takeTurnTerminal(threadId, turnId)?.permissionEvidence
+      expect(evidence?.commandCount).toBe(2)
+      expect(evidence?.unexpectedItemSeen).toBe(true)
+      expect(evidence?.unexpectedItemType).toBe('invalidCommandExecution')
+    })
+  }
+
+  test('同じcommandの履歴統合は成功を復元し明示的な失敗を隠さない', () => {
+    const command = {
+      itemId: 'command-merge', command: '/tmp/probe', cwd: '/tmp', source: 'agent',
+    }
+    const evidence = (
+      status: string,
+      exitCode: number | null,
+    ) => ({
+      commandCount: 1 as const,
+      firstCommand: { ...command, status, exitCode },
+      unexpectedItemSeen: false,
+      unexpectedItemType: null,
+    })
+    const started = evidence('inProgress', null)
+    const completed = evidence('completed', 0)
+    const failed = evidence('failed', 1)
+
+    expect(mergeAppServerPermissionProbeEvidence(started, completed).firstCommand)
+      .toEqual(completed.firstCommand)
+    expect(mergeAppServerPermissionProbeEvidence(completed, started).firstCommand)
+      .toEqual(completed.firstCommand)
+    expect(mergeAppServerPermissionProbeEvidence(completed, failed).firstCommand)
+      .toEqual(failed.firstCommand)
+    expect(mergeAppServerPermissionProbeEvidence(failed, completed).firstCommand)
+      .toEqual(failed.firstCommand)
+  })
+
+  test('同じitem IDが別command identityへ変わった場合は複数実行として保持する', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    transport.emit({
+      method: 'turn/started',
+      params: { threadId: 'thread-conflict', turn: {
+        id: 'turn-conflict', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } },
+    })
+    transport.emit({
+      method: 'item/started',
+      params: { threadId: 'thread-conflict', turnId: 'turn-conflict', item: {
+        type: 'commandExecution', id: 'command-conflict', command: '/tmp/first',
+        cwd: '/tmp', source: 'agent', status: 'inProgress', exitCode: null,
+      } },
+    })
+    transport.emit({
+      method: 'item/completed',
+      params: { threadId: 'thread-conflict', turnId: 'turn-conflict', item: {
+        type: 'commandExecution', id: 'command-conflict', command: '/tmp/other',
+        cwd: '/tmp', source: 'agent', status: 'completed', exitCode: 0,
+      } },
+    })
+    transport.emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-conflict', turn: {
+        id: 'turn-conflict', status: 'completed', itemsView: 'summary', items: [], error: null,
+      } },
+    })
+    session.closeInput()
+    await session.waitForReader()
+    expect(session.takeTurnTerminal(
+      'thread-conflict',
+      'turn-conflict',
+    )?.permissionEvidence.commandCount).toBe(2)
+  })
+
   test('item/startedだけ観測したcommandも副作用候補として保持する', async () => {
     const transport = mockTransport()
     const session = new CodexAppServerSession(transport.input, transport.stream)
@@ -1896,11 +2136,11 @@ describe('Codex App Server session', () => {
       emit({ id: request.id, result: {
         data: [
           { turnId: 'turn-multiple', item: {
-            type: 'commandExecution', command: '/tmp/first', cwd: '/tmp',
+            type: 'commandExecution', id: 'command-first', command: '/tmp/first', cwd: '/tmp',
             source: 'agent', status: 'completed', exitCode: 0,
           } },
           { turnId: 'turn-multiple', item: {
-            type: 'commandExecution', command: '/tmp/second', cwd: '/tmp',
+            type: 'commandExecution', id: 'command-second', command: '/tmp/second', cwd: '/tmp',
             source: 'agent', status: 'completed', exitCode: 0,
           } },
           { turnId: 'turn-multiple', item: { type: 'mcpToolCall' } },
