@@ -36,6 +36,10 @@ import {
 } from './codex-executor.ts'
 import { verifyCodexAppServerCapabilities } from './codex-app-server-capability.ts'
 import {
+  ZEROCHAN_PRIMARY_CODEX_MODEL,
+  ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+} from './codex-runtime-selection.ts'
+import {
   CodexAppServerSession,
   mergeAppServerPermissionProbeEvidence,
   sameAppServerSessionSource,
@@ -453,17 +457,23 @@ async function runCompletedProbe(
   return runAppServer(
     codex, value, stateDir, artifactDir, scratchDir, profile,
     async session => {
-      const model = process.env.ZEROKUN_JOB_MODEL?.trim() || undefined
       const threadParams = {
         cwd: value.repoPath,
         approvalPolicy: 'never',
         permissions: profile,
         developerInstructions: 'Run only the exact authorized acceptance command requested by the user.',
-        ...(model ? { model } : {}),
+        model: ZEROCHAN_PRIMARY_CODEX_MODEL,
+        config: {
+          model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+        },
       }
       const handshake = value.sessionId
         ? await session.resumeThread({ threadId: value.sessionId, ...threadParams })
-        : await session.startThread({ ...threadParams, ephemeral: false })
+        : await session.startThread({
+          ...threadParams,
+          allowProviderModelFallback: false,
+          ephemeral: false,
+        })
       requireFixtureAgentsSource(handshake.instructionSources, value.repoPath)
       const turnId = await session.startTurn(
         handshake.threadId,
@@ -473,7 +483,8 @@ async function runCompletedProbe(
           cwd: value.repoPath,
           permissions: profile,
           approvalPolicy: 'never',
-          ...(model ? { model } : {}),
+          model: ZEROCHAN_PRIMARY_CODEX_MODEL,
+          effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
         },
       )
       const terminal = await waitForTurnTerminal(session, handshake.threadId, turnId)
@@ -591,14 +602,16 @@ async function main(): Promise<void> {
     const controlRun = await runAppServer(
       codex, controlJob, stateDir, controlArtifact, controlScratch, controlProfile,
       async session => {
-        const model = process.env.ZEROKUN_JOB_MODEL?.trim() || undefined
         const handshake = await session.resumeThread({
           threadId: readRun.value.threadId,
           cwd: repo,
           approvalPolicy: 'never',
           permissions: controlProfile,
           developerInstructions: 'Run only the exact authorized acceptance command requested by the user.',
-          ...(model ? { model } : {}),
+          model: ZEROCHAN_PRIMARY_CODEX_MODEL,
+          config: {
+            model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+          },
         })
         requireFixtureAgentsSource(handshake.instructionSources, repo)
         if (handshake.threadId !== readRun.value.threadId) {
@@ -612,7 +625,8 @@ async function main(): Promise<void> {
             cwd: repo,
             permissions: controlProfile,
             approvalPolicy: 'never',
-            ...(model ? { model } : {}),
+            model: ZEROCHAN_PRIMARY_CODEX_MODEL,
+            effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
           },
         )
         const startDeadline = Date.now() + CONTROL_START_DEADLINE_MS
@@ -884,7 +898,8 @@ async function main(): Promise<void> {
       writeTurn: 'thread-resume,repo-write-allowed,outbox-write-allowed,state-read-denied,unrelated-home-read-denied',
       writeResume: 'same-write-thread,repo-write-allowed,outbox-write-allowed,state-read-denied,unrelated-home-read-denied',
       writeReview: 'same-write-thread,repo-write-denied,state-read-denied,unrelated-home-read-denied',
-      model: process.env.ZEROKUN_JOB_MODEL?.trim() || 'Codex default',
+      model: ZEROCHAN_PRIMARY_CODEX_MODEL,
+      reasoningEffort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
       provider: 'openai',
     }) + '\n')
   } finally {

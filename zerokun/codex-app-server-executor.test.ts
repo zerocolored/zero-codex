@@ -52,6 +52,10 @@ import {
   createThreadHistoryArchive,
 } from './thread-history.ts'
 import { prepareManagedStateRoot } from './managed-path.ts'
+import {
+  ZEROCHAN_PRIMARY_CODEX_MODEL,
+  ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+} from './codex-runtime-selection.ts'
 import { readAdvisorInputSnapshot } from './advisor-input.ts'
 import {
   advisorRepositoryDigest,
@@ -356,7 +360,7 @@ for line in sys.stdin:
     if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns")}, ensure_ascii=False) + "\\n")
+            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback")}, ensure_ascii=False) + "\\n")
     if method == "initialized":
         continue
     if method == "initialize":
@@ -377,12 +381,13 @@ for line in sys.stdin:
         requested = params.get("threadId")
         cwd = params.get("cwd")
         model = params.get("model") or "gpt-test"
+        reasoning_effort = params.get("config", {}).get("model_reasoning_effort") or "medium"
         developer_instructions = params.get("developerInstructions") or ""
         handshake_method = method
         requested_thread = requested
         handshake_cwd = cwd
         permission_profile = params.get("permissions") or ""
-        emit({"id": request_id, "result": {"thread": {"id": requested or thread_id, "cwd": cwd, "source": "unknown", "modelProvider": "openai", "status": {"type": "idle"}, "canAcceptDirectInput": True}, "model": model, "modelProvider": "openai", "cwd": cwd, "approvalPolicy": "never", "activePermissionProfile": {"id": params.get("permissions"), "extends": None}, "instructionSources": [cwd + "/AGENTS.md"]}})
+        emit({"id": request_id, "result": {"thread": {"id": requested or thread_id, "cwd": cwd, "source": "unknown", "modelProvider": "openai", "status": {"type": "idle"}, "canAcceptDirectInput": True}, "model": model, "reasoningEffort": reasoning_effort, "modelProvider": "openai", "cwd": cwd, "approvalPolicy": "never", "activePermissionProfile": {"id": params.get("permissions"), "extends": None}, "instructionSources": [cwd + "/AGENTS.md"]}})
     elif method == "turn/start":
         if mode == "hang-turn-start":
             with open(os.environ["ZERO_BLOCKED_MARKER"], "w", encoding="utf-8") as stream:
@@ -2247,6 +2252,78 @@ describe('production App Server executor', () => {
       value.store.close()
     }, 30_000)
   }
+
+  test('primary modelと推論強度をthreadとturnへ明示固定する', async () => {
+    const value = fixture('normal')
+    const rpcLog = join(value.root, 'runtime-selection-rpc.log')
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'normal',
+        ZERO_RPC_LOG: rpcLog,
+        ZERO_LOG_HANDSHAKES: '1',
+        // A stale machine-local setting must never become the primary selection.
+        ZEROKUN_JOB_MODEL: 'gpt-machine-local',
+      },
+      liveControls: value.hooks,
+    })
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(rpc).toHaveLength(2)
+    expect(rpc[0]).toMatchObject({
+      method: 'thread/start',
+      model: ZEROCHAN_PRIMARY_CODEX_MODEL,
+      config: {
+        model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+      },
+      allowProviderModelFallback: false,
+    })
+    expect(rpc[1]).toMatchObject({
+      method: 'turn/start',
+      model: ZEROCHAN_PRIMARY_CODEX_MODEL,
+      effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+    })
+    value.store.close()
+  }, 30_000)
+
+  test('resumeでもprimary modelと推論強度を再固定する', async () => {
+    const value = fixture('normal')
+    const rpcLog = join(value.root, 'runtime-selection-resume-rpc.log')
+    const job = { ...value.job, sessionId: 'thread-existing', resumed: true }
+    const result = await executeCodexJob(job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'normal',
+        ZERO_RPC_LOG: rpcLog,
+        ZERO_LOG_HANDSHAKES: '1',
+      },
+      liveControls: value.hooks,
+    })
+    expect(result.sessionId).toBe('thread-existing')
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(rpc[0]).toMatchObject({
+      method: 'thread/resume',
+      model: ZEROCHAN_PRIMARY_CODEX_MODEL,
+      config: {
+        model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+      },
+    })
+    expect(rpc[0]?.allowProviderModelFallback).toBeNull()
+    expect(rpc[1]).toMatchObject({
+      method: 'turn/start',
+      model: ZEROCHAN_PRIMARY_CODEX_MODEL,
+      effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+    })
+    value.store.close()
+  }, 30_000)
 
   test('root commentaryは全件監視し節目だけをdurable Slack handoffへ渡す', async () => {
     const value = fixture('commentary')

@@ -114,6 +114,7 @@ describe('Slack update request', () => {
       SLACK_BOT_TOKEN: 'xoxb-old-app-not-real',
       SLACK_APP_TOKEN: 'xapp-old-app-not-real',
       ZEROKUN_JOB_POLL_MS: '250',
+      ZEROKUN_JOB_MODEL: 'gpt-machine-local',
       ZEROKUN_UPDATE_TESTING: '1',
       ZEROKUN_SLACK_IDENTITY_TEST_APP_ID: 'AOLDAPP123',
       ZEROKUN_SETUP_TEST_STOP_PROBE: '/tmp/should-not-be-used',
@@ -125,6 +126,7 @@ describe('Slack update request', () => {
       'SLACK_BOT_TOKEN=xoxb-new-app-not-real',
       'SLACK_APP_TOKEN=xapp-1-ANEWAPP123-new-app-not-real',
       'ZEROKUN_JOB_POLL_MS=500',
+      'ZEROKUN_JOB_MODEL=gpt-state-local',
       'HTTPS_PROXY=http://state-proxy.invalid',
       'NODE_TLS_REJECT_UNAUTHORIZED=0',
       'ZEROKUN_UPDATE_TESTING=1',
@@ -141,6 +143,7 @@ describe('Slack update request', () => {
     expect(environment.SLACK_BOT_TOKEN).toBe('xoxb-new-app-not-real')
     expect(environment.SLACK_APP_TOKEN).toBe('xapp-1-ANEWAPP123-new-app-not-real')
     expect(environment.ZEROKUN_JOB_POLL_MS).toBe('250')
+    expect(environment.ZEROKUN_JOB_MODEL).toBeUndefined()
     expect(environment.HTTPS_PROXY).toBeUndefined()
     expect(environment.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined()
     expect(environment.ZEROKUN_UPDATE_TESTING).toBeUndefined()
@@ -174,6 +177,7 @@ describe('Slack update request', () => {
       ZEROKUN_STATE_DIR: '/safe/state',
       ZEROKUN_LEGACY_CUTOVER: '1',
       ZEROKUN_JOB_DB: '/safe/state/jobs.sqlite3',
+      ZEROKUN_JOB_MODEL: 'gpt-machine-local',
       ZEROKUN_SETUP_SCRIPT: '/unsafe/stale-setup.sh',
       HTTPS_PROXY: 'http://fake-user:fake-password@proxy.invalid:8080',
       ALL_PROXY: 'socks5://fake-user:fake-password@proxy.invalid:1080',
@@ -212,6 +216,7 @@ describe('Slack update request', () => {
     expect(service.ZEROKUN_JOB_DB).toBeUndefined()
     expect(service.ZEROKUN_SETUP_SCRIPT).toBeUndefined()
     expect(service.ZEROKUN_CODEX_BIN).toBeUndefined()
+    expect(service.ZEROKUN_JOB_MODEL).toBeUndefined()
   })
 
   test('workerは選択stateとcutover flagをambient環境に頼らずupdaterへ固定する', async () => {
