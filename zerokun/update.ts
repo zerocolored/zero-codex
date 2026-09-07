@@ -67,13 +67,21 @@ import {
 } from './safe-file.ts'
 import {
   captureTrackedProcesses,
+  freezeAndKillTrackedProcessTree,
   reapTrackedProcesses,
   seedTrackedProcess,
 } from './process-tree.ts'
 import {
+  observeProcessGeneration,
+  sameProcessGeneration,
   signalProcessGroupIfLeaderLive,
   signalProcessIfLive,
 } from './process-generation.ts'
+import {
+  clearAbandonedRunnerLaunchIntent,
+  clearRunnerLaunchReceiptAfterReap,
+  readRunnerLaunchReceipt,
+} from './runner-launch-receipt.ts'
 import {
   decodeHerdrRuntimeIdentity,
   encodeHerdrRuntimeIdentity,
@@ -2131,7 +2139,7 @@ export async function waitForStableHealth(options: {
     if (consecutive >= options.requiredConsecutive) return
     await options.sleep()
   }
-  fail('bot・bridge・runnerの安定稼働を確認できません')
+  fail('bot・bridge・runner・launcherの安定稼働を確認できません')
 }
 
 function shellQuote(value: string): string {
@@ -2755,8 +2763,18 @@ export async function startBotInHerdr(options: {
     const maxChecks = Math.ceil(timeoutMs / 100)
     for (let check = 0; check < maxChecks; check += 1) {
       const gatewayPid = readPid(join(options.stateDir, 'plugin.lock'))
-      if (gatewayPid && processLockOwnerMatches(
+      const runnerPid = readPid(join(options.stateDir, 'job-runner.lock', 'pid'))
+      const launcherPid = readPid(join(options.stateDir, 'job-runner-starter.lock'))
+      if (gatewayPid && runnerPid && launcherPid && processLockOwnerMatches(
         join(options.stateDir, 'plugin.lock'), gatewayPid, /server\.ts(?:\s|$)/,
+      ) && processLockOwnerMatches(
+        join(options.stateDir, 'job-runner.lock', 'pid'),
+        runnerPid,
+        /job-runner\.ts\s+daemon(?:\s|$)/,
+      ) && processLockOwnerMatches(
+        join(options.stateDir, 'job-runner-starter.lock'),
+        launcherPid,
+        /runner-launcher\.ts(?:\s|$)/,
       )) {
         const pinned = readPinnedHerdrRuntime(options.stateDir)
         if (!sameHerdrRuntime(pinned, runtime)) {
@@ -2825,15 +2843,149 @@ async function assertPinnedHerdrRestartReady(
   }
 }
 
+async function stopRunnerLaunchReceiptForUpdate(
+  stateDir: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const launcherLock = join(stateDir, 'job-runner-starter.lock')
+  const runnerLock = join(stateDir, 'job-runner.lock', 'pid')
+
+  const stopExactTree = async (
+    label: string,
+    expected: Parameters<typeof observeProcessGeneration>[0],
+  ): Promise<void> => {
+    if (signal?.aborted) fail('更新を中断しました')
+    const observation = observeProcessGeneration(expected)
+    if (observation.status === 'dead') return
+    if (observation.status === 'unknown') {
+      fail(`${label}のreceipt generationを確認できません`)
+    }
+    const remaining = await freezeAndKillTrackedProcessTree({
+      root: observation.identity,
+      excludePids: new Set([process.pid]),
+    })
+    if (remaining.length > 0) {
+      fail(`${label}のreceipt processを回収できません: ${remaining.join(', ')}`)
+    }
+  }
+
+  const discardExactStoppedLease = (
+    lockFile: string,
+    expectedPid: number,
+    label: string,
+  ): void => {
+    const currentPid = readPid(lockFile)
+    if (currentPid !== expectedPid) return
+    if (!discardProcessLock(lockFile, expectedPid) && readPid(lockFile) === expectedPid) {
+      fail(`${label}の停止済みreceipt leaseを回収できません`)
+    }
+  }
+
+  // The normal leases do not cover the interval between a detached child
+  // being spawned and that child acquiring the daemon lock.  Converge the
+  // durable launch receipt under its mutation lock so an updater can never
+  // switch repositories while an old-release pre-lock runner is still alive.
+  for (let pass = 0; pass < 5; pass += 1) {
+    if (signal?.aborted) fail('更新を中断しました')
+    const receipt = readRunnerLaunchReceipt(stateDir)
+    if (!receipt) return
+
+    await stopExactTree('job runner launcher', receipt.launcher)
+    let current = readRunnerLaunchReceipt(stateDir)
+    if (!current) return
+    if (current.intentId !== receipt.intentId
+      || !sameProcessGeneration(current.launcher, receipt.launcher)) {
+      continue
+    }
+
+    if (current.state === 'prepared') {
+      try {
+        clearAbandonedRunnerLaunchIntent(stateDir, current)
+      } catch (error) {
+        const changed = readRunnerLaunchReceipt(stateDir)
+        if (!changed || changed.intentId !== current.intentId
+          || !sameProcessGeneration(changed.launcher, current.launcher)
+          || changed.state === 'published') {
+          continue
+        }
+        throw error
+      }
+    } else {
+      await stopExactTree('job runner', current.runner)
+      const stoppedRunner = observeProcessGeneration(current.runner)
+      if (stoppedRunner.status !== 'dead') {
+        fail(stoppedRunner.status === 'unknown'
+          ? 'job runnerのreceipt generationを停止後に確認できません'
+          : 'job runnerのreceipt processが停止後も残っています')
+      }
+      try {
+        clearRunnerLaunchReceiptAfterReap(stateDir, current, current.runner)
+      } catch (error) {
+        const changed = readRunnerLaunchReceipt(stateDir)
+        if (!changed || changed.intentId !== current.intentId
+          || !sameProcessGeneration(changed.launcher, current.launcher)) {
+          continue
+        }
+        throw error
+      }
+      discardExactStoppedLease(runnerLock, current.runner.pid, 'job runner')
+    }
+    discardExactStoppedLease(launcherLock, current.launcher.pid, 'job runner launcher')
+  }
+  if (readRunnerLaunchReceipt(stateDir)) {
+    fail('runner launch receiptの停止を確認できません')
+  }
+}
+
 async function stopServices(
   stateDir: string,
   signal?: AbortSignal,
 ): Promise<void> {
   ensureManagedDirectory(stateDir, join(stateDir, 'job-runner.lock'))
+  const launcherLock = join(stateDir, 'job-runner-starter.lock')
+  const launcherPid = readPid(launcherLock)
+  if (launcherPid) {
+    // The persistent launcher replaces a runner that exits unexpectedly. It
+    // must be gone before signalling the child, otherwise an old-release
+    // runner can be published between the runner stop and repository switch.
+    await stopLockedProcess(
+      launcherLock,
+      launcherPid,
+      'job runner launcher',
+      /runner-launcher\.ts(?:\s|$)/,
+      signal,
+    )
+  }
+
+  await stopRunnerLaunchReceiptForUpdate(stateDir, signal)
+
   const runnerLock = join(stateDir, 'job-runner.lock', 'pid')
   const runnerPid = readPid(runnerLock)
   if (runnerPid) {
     await stopLockedProcess(runnerLock, runnerPid, 'job runner', /job-runner\.ts\s+daemon(?:\s|$)/, signal)
+  }
+
+  const lateLauncherPid = readPid(launcherLock)
+  if (lateLauncherPid) {
+    // A normal launcher releases its lease in finally. If it was an older
+    // generation that left a proven-dead lock behind, reclaim that lock here;
+    // if another live launcher appeared, stopLockedProcess verifies and stops
+    // that exact generation instead of allowing it across the update boundary.
+    await stopLockedProcess(
+      launcherLock,
+      lateLauncherPid,
+      'job runner launcher',
+      /runner-launcher\.ts(?:\s|$)/,
+      signal,
+    )
+  }
+  await stopRunnerLaunchReceiptForUpdate(stateDir, signal)
+  const retainedLauncherPid = readPid(launcherLock)
+  if (retainedLauncherPid) {
+    fail(`job runner launcher PID ${retainedLauncherPid} が停止境界の後に残っています`)
+  }
+  if (readRunnerLaunchReceipt(stateDir)) {
+    fail('runner launch receiptが停止境界の後に残っています')
   }
 
   const bridgeLock = join(stateDir, 'plugin.lock')
@@ -2869,10 +3021,15 @@ async function restartServices(
     sleep: () => Bun.sleep(Number(process.env.ZEROKUN_HEALTH_SLEEP_MS ?? 500)),
     observe: () => {
       const newRunnerPid = readPid(join(stateDir, 'job-runner.lock', 'pid'))
+      const newLauncherPid = readPid(join(stateDir, 'job-runner-starter.lock'))
       const newBridgePid = readPid(join(stateDir, 'plugin.lock'))
       const readiness = readGatewayReadiness(join(stateDir, 'gateway-ready.json'))
       const expectedRelease = command(['git', 'rev-parse', 'HEAD'], { cwd: rootRepo }).stdout
-      return Boolean(newRunnerPid && processLockOwnerMatches(
+      return Boolean(newLauncherPid && processLockOwnerMatches(
+        join(stateDir, 'job-runner-starter.lock'),
+        newLauncherPid,
+        /runner-launcher\.ts(?:\s|$)/,
+      )) && Boolean(newRunnerPid && processLockOwnerMatches(
         join(stateDir, 'job-runner.lock', 'pid'), newRunnerPid, /job-runner\.ts\s+daemon(?:\s|$)/,
       )) && Boolean(newBridgePid && processLockOwnerMatches(
         join(stateDir, 'plugin.lock'), newBridgePid, /server\.ts(?:\s|$)/,
@@ -2883,9 +3040,14 @@ async function restartServices(
   }).catch(error => {
     fail(`${error instanceof Error ? error.message : String(error)}。ログ: ${logPath}`)
   })
+  const newLauncherPid = readPid(join(stateDir, 'job-runner-starter.lock'))
   const newRunnerPid = readPid(join(stateDir, 'job-runner.lock', 'pid'))
   const newBridgePid = readPid(join(stateDir, 'plugin.lock'))
-  output(`   start: Slack gateway PID ${newBridgePid} + Codex job runner PID ${newRunnerPid}`)
+  output(
+    `   start: Slack gateway PID ${newBridgePid}`
+    + ` + Codex job runner PID ${newRunnerPid}`
+    + ` + recovery launcher PID ${newLauncherPid}`,
+  )
 }
 
 async function rollbackUpdate(

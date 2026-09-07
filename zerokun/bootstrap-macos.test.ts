@@ -2472,11 +2472,12 @@ codex --version
     }
   }, 30_000)
 
-  test('Claude版runnerを停止し、待機jobをsessionなしのCodex queueへcutoverする', async () => {
+  test('旧launcherをrunnerより先に停止し、再生成させずCodex queueへcutoverする', async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-cutover-'))
     const stateDir = join(fakeHome, '.claude/channels/slack')
     const projectDir = join(fakeHome, 'Work/BellSalesAI')
     let legacyRunner: Bun.Subprocess | undefined
+    let legacyLauncher: Bun.Subprocess | undefined
     let legacyGateway: Bun.Subprocess | undefined
     try {
       mkdirSync(join(stateDir, 'job-runner.lock'), { recursive: true })
@@ -2487,8 +2488,28 @@ codex --version
         '',
       ].join('\n'), { mode: 0o600 })
       const legacyPath = join(stateDir, 'job-runner.ts')
+      const legacyLauncherPath = join(stateDir, 'runner-launcher.ts')
       const legacyServer = join(stateDir, 'server.ts')
+      const respawnMarker = join(stateDir, 'unexpected-runner-respawned')
       writeFileSync(legacyPath, '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n', { mode: 0o700 })
+      writeFileSync(legacyLauncherPath, [
+        '#!/bin/bash',
+        'runner_pid="$1"',
+        'runner="$2"',
+        'runner_lock="$3"',
+        'respawn_marker="$4"',
+        'trap "exit 0" TERM INT',
+        'while :; do',
+        '  if ! kill -0 "$runner_pid" 2>/dev/null; then',
+        '    /bin/bash "$runner" daemon &',
+        '    runner_pid=$!',
+        '    printf "%s\\n" "$runner_pid" > "$runner_lock"',
+        '    : > "$respawn_marker"',
+        '  fi',
+        '  sleep 0.05',
+        'done',
+        '',
+      ].join('\n'), { mode: 0o700 })
       writeFileSync(legacyServer, '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n', { mode: 0o700 })
       legacyRunner = Bun.spawn(['/bin/bash', legacyPath, 'daemon'], {
         stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
@@ -2496,7 +2517,12 @@ codex --version
       legacyGateway = Bun.spawn(['/bin/bash', legacyServer], {
         stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
       })
+      legacyLauncher = Bun.spawn([
+        '/bin/bash', legacyLauncherPath, String(legacyRunner.pid), legacyPath,
+        join(stateDir, 'job-runner.lock/pid'), respawnMarker,
+      ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
       writeFileSync(join(stateDir, 'job-runner.lock/pid'), `${legacyRunner.pid}\n`)
+      writeFileSync(join(stateDir, 'job-runner-starter.lock'), `${legacyLauncher.pid}\n`)
       writeFileSync(join(stateDir, 'plugin.lock'), `${legacyGateway.pid}\n`)
 
       const dbPath = join(stateDir, 'jobs.sqlite3')
@@ -2531,7 +2557,9 @@ codex --version
       })
       expect(setup.exitCode, setup.stderr.toString()).toBe(0)
       expect(setup.stdout.toString()).toContain('▶ Codex版standalone setup')
-      await Promise.all([legacyRunner.exited, legacyGateway.exited])
+      expect(setup.stdout.toString()).toContain('旧runner launcherを安全に停止しました')
+      await Promise.all([legacyLauncher.exited, legacyRunner.exited, legacyGateway.exited])
+      expect(existsSync(respawnMarker)).toBe(false)
 
       const runtimeInfo = Bun.spawnSync([
         process.execPath,
@@ -2553,7 +2581,7 @@ codex --version
       migrated.close()
 
     } finally {
-      for (const child of [legacyRunner, legacyGateway]) {
+      for (const child of [legacyLauncher, legacyRunner, legacyGateway]) {
         if (!child) continue
         try { child.kill() } catch {}
         try { await child.exited } catch {}

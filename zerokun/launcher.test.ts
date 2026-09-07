@@ -462,6 +462,7 @@ describe('codex-channel.sh replacement guard', () => {
     const project = realpathSync(join(dirname(state), 'project'))
     const gateway = startGateway(state)
     const runner = startRunner(state)
+    const launcher = await startOrphanedRunnerLauncher(state)
     writeFileSync(join(state, 'gateway-ready.json'), JSON.stringify({
       runtime: 'codex',
       pid: gateway.pid,
@@ -480,7 +481,44 @@ describe('codex-channel.sh replacement guard', () => {
     })
     expect(result.exitCode, result.output).toBe(0)
     expect(result.output).toContain('既存のZeroちゃんを共用します')
-    expect(result.output).toContain(`gateway: PID ${gateway.pid} / runner: PID ${runner.pid}`)
+    expect(result.output).toContain(
+      `gateway: PID ${gateway.pid} / runner: PID ${runner.pid} / recovery: PID ${launcher.pid}`,
+    )
+    expect(() => process.kill(gateway.pid, 0)).not.toThrow()
+    expect(() => process.kill(runner.pid, 0)).not.toThrow()
+    expect(() => process.kill(launcher.pid, 0)).not.toThrow()
+  })
+
+  test('引数なしzerochanはlauncher欠落を共用扱いせず安全な再構築へ委譲する', async () => {
+    const state = fixture()
+    const project = realpathSync(join(dirname(state), 'project'))
+    const gateway = startGateway(state)
+    const runner = startRunner(state)
+    writeFileSync(join(state, 'gateway-ready.json'), JSON.stringify({
+      runtime: 'codex',
+      pid: gateway.pid,
+      connectedAt: Date.now(),
+      release: 'fixture',
+      projectDir: project,
+      channelRoutingVersion: 1,
+      slackAppId: 'A0123456789',
+    }), { mode: 0o600 })
+    const bunLog = join(state, 'missing-launcher-bun.log')
+    await Bun.sleep(100)
+
+    const result = await runLauncher(state, {
+      FAKE_HERDR_RUNTIME_ID: '1'.repeat(64),
+      FAKE_BUN_LOG: bunLog,
+    }, undefined, {
+      invokedAs: 'zerochan', cwd: project,
+    })
+
+    expect(result.exitCode, result.output).toBe(0)
+    expect(result.output).not.toContain('既存のZeroちゃんを共用します')
+    expect(result.output).toContain('自動復旧機構が停止しているため')
+    expect(readFileSync(bunLog, 'utf8')).toContain(
+      `service-control.ts start ${dirname(import.meta.dir)} ${state} ${project} A0123456789`,
+    )
     expect(() => process.kill(gateway.pid, 0)).not.toThrow()
     expect(() => process.kill(runner.pid, 0)).not.toThrow()
   })

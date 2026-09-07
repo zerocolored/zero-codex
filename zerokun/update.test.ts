@@ -61,7 +61,14 @@ import {
   reapTrackedProcesses,
   type ProcessIdentity,
 } from './process-tree.ts'
-import { signalProcessIfLive } from './process-generation.ts'
+import {
+  acquireProcessGroupLeaderIdentity,
+  observeProcessGeneration,
+  signalProcessIfLive,
+} from './process-generation.ts'
+import {
+  readRunnerLaunchReceipt,
+} from './runner-launch-receipt.ts'
 import { resolveOfficialStandaloneCodex } from './standalone-codex.ts'
 import {
   encodeHerdrRuntimeIdentity,
@@ -183,6 +190,46 @@ function makeRepo(base: string) {
     'await Bun.sleep(60_000)',
     '',
   ].join('\n'))
+  writeFileSync(join(seed, 'zerokun', 'runner-launcher.ts'), [
+    "import { appendFileSync, rmSync } from 'fs'",
+    "import { join } from 'path'",
+    "import { acquire } from './fixture-lock.ts'",
+    'const state = process.env.ZEROKUN_STATE_DIR!',
+    "const lock = join(state, 'job-runner-starter.lock')",
+    "const runner = join(import.meta.dir, 'job-runner.ts')",
+    "acquire(lock)",
+    'let stopping = false',
+    'let child: ReturnType<typeof Bun.spawn> | undefined',
+    'const stop = () => {',
+    '  if (stopping) return',
+    '  stopping = true',
+    "  try { child?.kill('SIGTERM') } catch {}",
+    '}',
+    "process.on('SIGINT', stop)",
+    "process.on('SIGTERM', stop)",
+    'try {',
+    '  while (!stopping) {',
+    '    child = Bun.spawn([process.execPath, \'--no-env-file\', runner, \'daemon\'], {',
+    "      stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', env: process.env,",
+    '    })',
+    "    appendFileSync(join(state, 'runner-generations.log'),",
+    "      `${process.env.ZEROKUN_RELEASE_COMMIT ?? 'unknown'}:${child.pid}\\n`)",
+    '    await child.exited',
+    '    child = undefined',
+    '    if (!stopping) await Bun.sleep(20)',
+    '  }',
+    '} finally {',
+    "  process.off('SIGINT', stop)",
+    "  process.off('SIGTERM', stop)",
+    '  if (child && child.exitCode === null) {',
+    "    try { child.kill('SIGTERM') } catch {}",
+    '    await child.exited.catch(() => {})',
+    '  }',
+    "  rmSync(lock, { force: true })",
+    "  rmSync(`${lock}.identity`, { force: true })",
+    '}',
+    '',
+  ].join('\n'))
   writeFileSync(join(seed, 'server.ts'), [
     "import { existsSync, writeFileSync } from 'fs'",
     "import { join } from 'path'",
@@ -199,7 +246,11 @@ function makeRepo(base: string) {
     '#!/bin/bash',
     'set -e',
     'root="$(cd "$(dirname "$0")" && pwd)"',
-    'bun "$root/zerokun/job-runner.ts" daemon >/dev/null 2>&1 &',
+    'if [ -f "$ZEROKUN_STATE_DIR/fixture-no-launcher" ]; then',
+    '  bun "$root/zerokun/job-runner.ts" daemon >/dev/null 2>&1 &',
+    'else',
+    '  bun "$root/zerokun/runner-launcher.ts" >/dev/null 2>&1 &',
+    'fi',
     'exec bun "$root/server.ts"',
     '',
   ].join('\n'), { mode: 0o700 })
@@ -379,12 +430,68 @@ function serviceUpdaterEnvironment(fixture: ReturnType<typeof updaterFixture>, s
   return environment
 }
 
+const fixtureHerdrEnvironmentKeys = [
+  'HERDR_ENV', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'HERDR_PANE_ID',
+  'HERDR_TAB_ID', 'HERDR_TERMINAL_ID', 'HERDR_WORKSPACE_ID',
+] as const
+
+async function startFixtureBot(
+  fixture: ReturnType<typeof updaterFixture>,
+  environment: ReturnType<typeof serviceUpdaterEnvironment>,
+  startupTimeoutMs = 3_000,
+) {
+  const previous = Object.fromEntries(
+    fixtureHerdrEnvironmentKeys.map(key => [key, process.env[key]]),
+  )
+  for (const key of fixtureHerdrEnvironmentKeys) process.env[key] = environment[key]
+  try {
+    return await startBotInHerdr({
+      rootRepo: fixture.repo.local,
+      stateDir: fixture.state,
+      projectDir: fixture.project,
+      startupTimeoutMs,
+    })
+  } finally {
+    for (const key of fixtureHerdrEnvironmentKeys) {
+      const value = previous[key]
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+function fixtureServicePid(state: string, relativeLock: string): number {
+  return Number(readFileSync(join(state, relativeLock), 'utf8').trim())
+}
+
+function fixtureProcessIsAlive(pid: number): boolean {
+  const result = Bun.spawnSync(['/bin/ps', '-o', 'state=', '-p', String(pid)], {
+    stdout: 'pipe', stderr: 'ignore',
+  })
+  return result.exitCode === 0 && processStateIsAlive(result.stdout.toString().trim())
+}
+
+function fixtureRunnerGenerations(state: string): Array<{ release: string; pid: number }> {
+  return readFileSync(join(state, 'runner-generations.log'), 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map(line => {
+      const [release, pidText] = line.split(':')
+      return { release: release!, pid: Number(pidText) }
+    })
+}
+
 function rememberFixtureServices(state: string): void {
   try {
     const marker = JSON.parse(readFileSync(join(state, 'tmux-session.json'), 'utf8')) as { name?: unknown }
     if (typeof marker.name === 'string') tmuxSessions.push(marker.name)
   } catch {}
-  for (const path of [join(state, 'plugin.lock'), join(state, 'job-runner.lock', 'pid')]) {
+  for (const path of [
+    join(state, 'job-runner-starter.lock'),
+    join(state, 'job-runner.lock', 'pid'),
+    join(state, 'plugin.lock'),
+  ]) {
     try {
       const pid = Number(readFileSync(path, 'utf8').trim())
       if (Number.isInteger(pid) && pid > 0) {
@@ -958,6 +1065,34 @@ describe('updater helpers', () => {
     expect(setup).not.toContain('delegate-parent')
   })
 
+  test('setup切替はdrain後にlauncherをrunnerより先に停止してからgatewayを止める', () => {
+    const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
+    const cutover = setup.slice(
+      setup.indexOf('GATEWAY_SCRIPT="$CH/server.ts"'),
+      setup.indexOf('# No old process can be executing the previous helper'),
+    )
+    const drain = cutover.indexOf('legacy_running_state')
+    const launcherStop = cutover.indexOf(
+      'stop-owner "$CH/job-runner-starter.lock" "$RUNNER_LAUNCHER_PID"',
+    )
+    const runnerRefresh = cutover.lastIndexOf(
+      'RUNNER_PID="$(read_lock_pid "$CH/job-runner.lock/pid")"',
+    )
+    const runnerStop = cutover.indexOf(
+      'stop-owner "$CH/job-runner.lock/pid" "$RUNNER_PID"',
+      runnerRefresh,
+    )
+    const gatewayStop = cutover.indexOf(
+      'stop-owner "$CH/plugin.lock" "$GATEWAY_PID"',
+    )
+
+    expect(drain).toBeGreaterThanOrEqual(0)
+    expect(launcherStop).toBeGreaterThan(drain)
+    expect(runnerRefresh).toBeGreaterThan(launcherStop)
+    expect(runnerStop).toBeGreaterThan(runnerRefresh)
+    expect(gatewayStop).toBeGreaterThan(runnerStop)
+  })
+
   test('setup完了案内は可視log tabを再生成するstop/start導線を示す', () => {
     const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
     expect(setup).toContain('Herdr内で起動: zerochan start')
@@ -1358,6 +1493,22 @@ describe('updater helpers', () => {
       }
     }
   })
+
+  test('runnerとgatewayだけではHerdr起動成功にせずlauncherを必須にする', async () => {
+    const fixture = updaterFixture()
+    const environment = serviceUpdaterEnvironment(fixture, 'unused-fixture-session')
+    writeFileSync(join(fixture.state, 'fixture-no-launcher'), '1\n', { mode: 0o600 })
+
+    try {
+      await expect(startFixtureBot(fixture, environment, 1_000))
+        .rejects.toThrow('Herdr再起動')
+      expect(fixtureServicePid(fixture.state, 'plugin.lock')).toBeGreaterThan(0)
+      expect(fixtureServicePid(fixture.state, 'job-runner.lock/pid')).toBeGreaterThan(0)
+      expect(existsSync(join(fixture.state, 'job-runner-starter.lock'))).toBe(false)
+    } finally {
+      rememberFixtureServices(fixture.state)
+    }
+  }, 10_000)
 
   test('Herdr restart tokenが起動直前に変わればdigest不一致でgatewayを起動しない', async () => {
     const fixture = updaterFixture()
@@ -1946,14 +2097,92 @@ describe('Codex branch self update', () => {
     expect(result.stdout.toString().match(/queue: /g)?.length).toBe(2)
   })
 
-  test('journal保持中のcandidate gatewayとrunnerを起動しreadiness後にcommitする', () => {
+  test.skipIf(process.platform === 'win32')(
+    '更新はlauncher死亡後にlock前で生き残ったreceipt runnerを停止してから切り替える',
+    async () => {
+      const fixture = updaterFixture()
+      const runner = join(fixture.base, 'pre-lock-runner.ts')
+      const launcher = join(fixture.base, 'pre-lock-launcher.ts')
+      const processGeneration = join(import.meta.dir, 'process-generation.ts')
+      const launchReceipt = join(import.meta.dir, 'runner-launch-receipt.ts')
+      writeFileSync(runner, [
+        "process.on('SIGHUP', () => {})",
+        "process.on('SIGINT', () => {})",
+        "process.on('SIGTERM', () => {})",
+        'setInterval(() => {}, 1_000)',
+        '',
+      ].join('\n'))
+      writeFileSync(launcher, [
+        `import { readProcessIdentity } from ${JSON.stringify(processGeneration)}`,
+        `import { prepareRunnerLaunchReceipt, publishRunnerLaunchReceipt } from ${JSON.stringify(launchReceipt)}`,
+        'const [stateDir, runnerIdentityJson] = process.argv.slice(2)',
+        'const runnerIdentity = JSON.parse(runnerIdentityJson!)',
+        'const launcherIdentity = readProcessIdentity(process.pid)',
+        "if (!launcherIdentity) throw new Error('launcher identity unavailable')",
+        'const intent = prepareRunnerLaunchReceipt(stateDir!, launcherIdentity)',
+        'publishRunnerLaunchReceipt(stateDir!, intent.intentId, runnerIdentity)',
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+
+      const daemon = Bun.spawn([process.execPath, runner, 'daemon'], {
+        detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+      })
+      serviceProcesses.push(daemon)
+      const spawnedRunnerIdentity = await acquireProcessGroupLeaderIdentity(daemon.pid)
+      expect(spawnedRunnerIdentity).toBeDefined()
+      if (!spawnedRunnerIdentity) throw new Error('runner identity unavailable')
+
+      const owner = Bun.spawn([
+        process.execPath,
+        launcher,
+        fixture.state,
+        JSON.stringify(spawnedRunnerIdentity),
+      ], {
+        stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
+      })
+      serviceProcesses.push(owner)
+      expect(await owner.exited).toBe(0)
+      const runnerPid = daemon.pid
+      const receipt = readRunnerLaunchReceipt(fixture.state)
+      expect(receipt?.state).toBe('published')
+      if (!receipt || receipt.state !== 'published') throw new Error('runner launch was not published')
+      const runnerIdentity = receipt.runner
+      expect(runnerIdentity.pid).toBe(runnerPid)
+      let runnerObservation = observeProcessGeneration(runnerIdentity)
+      for (let attempt = 0; attempt < 50 && runnerObservation.status === 'unknown'; attempt += 1) {
+        await Bun.sleep(10)
+        runnerObservation = observeProcessGeneration(runnerIdentity)
+      }
+      expect(runnerObservation.status).toBe('alive')
+      if (runnerObservation.status === 'alive') serviceIdentities.push(runnerObservation.identity)
+      expect(existsSync(join(fixture.state, 'job-runner-starter.lock'))).toBe(false)
+      expect(existsSync(join(fixture.state, 'job-runner.lock', 'pid'))).toBe(false)
+      expect(existsSync(join(fixture.state, 'job-runner-launch.json'))).toBe(true)
+
+      const result = runUpdater(fixture, ['--skip-tests', '--no-restart'])
+
+      expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0)
+      expect(fixtureProcessIsAlive(runnerPid)).toBe(false)
+      expect(existsSync(join(fixture.state, 'job-runner-launch.json'))).toBe(false)
+      expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v2\n')
+    },
+    20_000,
+  )
+
+  test('通常更新は旧launcherを先に止め、旧runnerを再生成せずcandidate一式でcommitする', async () => {
     const fixture = updaterFixture()
     const session = `zerokun-update-success-${process.pid}-${Date.now()}`
     tmuxSessions.push(session)
+    const environment = serviceUpdaterEnvironment(fixture, session)
+    const originalHead = must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)
+    const initial = await startFixtureBot(fixture, environment)
+    const oldLauncherPid = fixtureServicePid(fixture.state, 'job-runner-starter.lock')
+    const oldRunnerPid = fixtureServicePid(fixture.state, 'job-runner.lock/pid')
     const result = runUpdater(
       fixture,
       ['--skip-tests'],
-      serviceUpdaterEnvironment(fixture, session),
+      environment,
     )
     rememberFixtureServices(fixture.state)
     const serviceLog = existsSync(join(fixture.state, 'zerokun.log'))
@@ -1961,6 +2190,7 @@ describe('Codex branch self update', () => {
       : '(no gateway log)'
     expect(result.exitCode, `${result.stderr}\n${result.stdout}\n${serviceLog}`).toBe(0)
     expect(result.stdout.toString()).toContain('再起動完了')
+    expect(result.stdout.toString()).toContain('recovery launcher PID')
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
     const head = must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)
     const readiness = JSON.parse(readFileSync(join(fixture.state, 'gateway-ready.json'), 'utf8'))
@@ -1968,6 +2198,19 @@ describe('Codex branch self update', () => {
     expect(readiness.projectDir).toBe(realpathSync(fixture.project))
     expect(readFileSync(fixture.setupProjectMarker, 'utf8')).toBe(realpathSync(fixture.project))
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v2\n')
+    expect(fixtureProcessIsAlive(initial.gatewayPid)).toBe(false)
+    expect(fixtureProcessIsAlive(oldLauncherPid)).toBe(false)
+    expect(fixtureProcessIsAlive(oldRunnerPid)).toBe(false)
+    const newLauncherPid = fixtureServicePid(fixture.state, 'job-runner-starter.lock')
+    const newRunnerPid = fixtureServicePid(fixture.state, 'job-runner.lock/pid')
+    expect(newLauncherPid).not.toBe(oldLauncherPid)
+    expect(newRunnerPid).not.toBe(oldRunnerPid)
+    expect(fixtureProcessIsAlive(newLauncherPid)).toBe(true)
+    expect(fixtureProcessIsAlive(newRunnerPid)).toBe(true)
+    expect(fixtureRunnerGenerations(fixture.state)).toEqual([
+      { release: originalHead, pid: oldRunnerPid },
+      { release: head, pid: newRunnerPid },
+    ])
   }, 20_000)
 
   test('Herdr restart pin欠落は稼働serviceを停止する前に失敗する', async () => {
@@ -2045,6 +2288,7 @@ describe('Codex branch self update', () => {
     must(['git', 'add', 'server.ts'], fixture.repo.seed)
     must(['git', 'commit', '-m', 'broken candidate readiness'], fixture.repo.seed)
     must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
+    const candidateHead = must(['git', 'rev-parse', 'HEAD'], fixture.repo.seed)
     const session = `zerokun-update-rollback-${process.pid}-${Date.now()}`
     tmuxSessions.push(session)
     const result = runUpdater(
@@ -2065,6 +2309,14 @@ describe('Codex branch self update', () => {
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
     const readiness = JSON.parse(readFileSync(join(fixture.state, 'gateway-ready.json'), 'utf8'))
     expect(readiness.release).toBe(originalHead)
+    const launcherPid = fixtureServicePid(fixture.state, 'job-runner-starter.lock')
+    const runnerPid = fixtureServicePid(fixture.state, 'job-runner.lock/pid')
+    expect(fixtureProcessIsAlive(launcherPid)).toBe(true)
+    expect(fixtureProcessIsAlive(runnerPid)).toBe(true)
+    expect(fixtureRunnerGenerations(fixture.state)).toEqual([
+      { release: candidateHead, pid: expect.any(Number) },
+      { release: originalHead, pid: runnerPid },
+    ])
   }, 20_000)
 
   test('setup失敗時はGitとSQLiteを旧版へ自動rollbackしてjournalを消す', () => {

@@ -26,7 +26,7 @@ workflowとして実行します。Codexは対象projectの`AGENTS.md`に従い�
 deploy確認まで自分で進めます。ZeroちゃんはFIFO、同一thread継続、process回収、認証情報を隠した
 GitHub transportだけを担当します。
 
-Primary Codexのmodelは`gpt-5.6-sol`、reasoning effortは`xhigh`としてrelease codeに固定されています。
+Primary Codexのmodelは`gpt-6-astra`、reasoning effortは`low`としてrelease codeに固定されています。
 利用者のCodex設定、shell環境、state内`.env`を揃える必要はなく、どのMacでも同じ値で起動します。
 Grok、Claude、review用Codexの選択には`AGENTS.md`のadvisor契約が別途適用されます。
 

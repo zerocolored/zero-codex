@@ -5,14 +5,67 @@ import { basename, join } from 'path'
 import { requireManagedStateRoot } from './managed-path.ts'
 import {
   inspectManagedServiceStatus,
+  startManagedService,
   type ManagedServiceStatus,
 } from './service-control.ts'
+import {
+  environmentForPinnedHerdrRuntime,
+  readPinnedHerdrRuntime,
+  verifyHerdrRuntimeIdentityAsync,
+} from './herdr-runtime.ts'
+import { readGatewayReadiness } from './readiness.ts'
 
 type HerdrStartHooks = {
   inspectStatus?: (stateDir: string) => ManagedServiceStatus
   invoke?: (args: string[]) => Promise<Record<string, unknown>>
   sleep?: (milliseconds: number) => Promise<void>
   timeoutMs?: number
+  cleanupTimeoutMs?: number
+  repairMissingLauncher?: (input: {
+    rootRepo: string
+    stateDir: string
+    projectDir: string
+  }) => Promise<ManagedServiceStatus>
+}
+
+async function closeFailedStartWorkspace(input: {
+  workspaceId: string
+  stateDir: string
+  invoke: (args: string[]) => Promise<Record<string, unknown>>
+  inspect: (stateDir: string) => ManagedServiceStatus
+  sleep: (milliseconds: number) => Promise<void>
+  timeoutMs: number
+}): Promise<void> {
+  // workspace.create returned this exact identity during this invocation. Do
+  // not rediscover by label or close a tab/pane that may have moved meanwhile.
+  await input.invoke(['workspace', 'close', input.workspaceId])
+
+  const maxChecks = Math.max(1, Math.ceil(input.timeoutMs / 100))
+  let lastStatus: ManagedServiceStatus | undefined
+  let lastError: unknown
+  for (let check = 0; check < maxChecks; check += 1) {
+    try {
+      lastStatus = input.inspect(input.stateDir)
+      lastError = undefined
+      if (lastStatus.status === 'stopped') return
+    } catch (error) {
+      lastError = error
+    }
+    if (check + 1 < maxChecks) await input.sleep(100)
+  }
+  if (lastError) {
+    throw new Error(
+      `workspace close後のservice停止確認に失敗しました: ${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`,
+    )
+  }
+  throw new Error(
+    'workspace close後もZeroちゃんのprocessが残っています'
+    + (lastStatus
+      ? ` (gateway=${lastStatus.gatewayPid ?? 'none'}, runner=${lastStatus.runnerPid ?? 'none'}, launcher=${lastStatus.launcherPid ?? 'none'})`
+      : ''),
+  )
 }
 
 export type HerdrStartResult = {
@@ -21,6 +74,7 @@ export type HerdrStartResult = {
   paneId?: string
   gatewayPid?: number
   runnerPid?: number
+  launcherPid?: number
 }
 
 const IDENTIFIERS = {
@@ -107,6 +161,32 @@ function resolveHerdrBinary(): string {
   return realpathSync(selected)
 }
 
+async function repairMissingLauncher(input: {
+  rootRepo: string
+  stateDir: string
+  projectDir: string
+}): Promise<ManagedServiceStatus> {
+  const readiness = readGatewayReadiness(join(input.stateDir, 'gateway-ready.json'))
+  if (!readiness || typeof readiness.slackAppId !== 'string') {
+    throw new Error('稼働中gatewayのSlack App identityを確認できません')
+  }
+  const pinned = readPinnedHerdrRuntime(input.stateDir)
+  await startManagedService(
+    input.rootRepo,
+    input.stateDir,
+    input.projectDir,
+    readiness.slackAppId,
+    {
+      controlRuntime: pinned,
+      verifyControlRuntime: runtime => verifyHerdrRuntimeIdentityAsync(
+        runtime,
+        environmentForPinnedHerdrRuntime(runtime),
+      ),
+    },
+  )
+  return inspectManagedServiceStatus(input.stateDir)
+}
+
 export async function startZeroInHerdrWorkspace(
   rootRepoInput: string,
   stateDirInput: string,
@@ -124,10 +204,25 @@ export async function startZeroInHerdrWorkspace(
       status: 'already-running',
       gatewayPid: initial.gatewayPid,
       runnerPid: initial.runnerPid,
+      launcherPid: initial.launcherPid,
     }
   }
   if (initial.status === 'partial') {
-    throw new Error('Zeroちゃんが部分起動状態です。Herdr内で zerochan stop を実行してから再試行してください')
+    if (initial.gatewayPid && initial.runnerPid && !initial.launcherPid) {
+      const repaired = await (
+        hooks.repairMissingLauncher ?? repairMissingLauncher
+      )({ rootRepo, stateDir, projectDir })
+      if (repaired.status !== 'running') {
+        throw new Error('Zeroちゃんの自動復旧機構を再構築できませんでした')
+      }
+      return {
+        status: 'already-running',
+        gatewayPid: repaired.gatewayPid,
+        runnerPid: repaired.runnerPid,
+        launcherPid: repaired.launcherPid,
+      }
+    }
+    throw new Error('Zeroちゃんが部分起動状態です。zerochan stop --force の後に zerochan start を実行してください')
   }
 
   const invoke = hooks.invoke ?? productionInvoker(resolveHerdrBinary())
@@ -155,30 +250,44 @@ export async function startZeroInHerdrWorkspace(
     throw new Error(`Herdrが要求と異なるworkspaceを作成しました (${workspaceId})`)
   }
 
+  const sleep = hooks.sleep ?? (milliseconds => Bun.sleep(milliseconds))
   try {
     await invoke(['pane', 'run', paneId, launcher, 'start'])
-  } catch (error) {
-    throw new Error(`作成したHerdr workspace ${workspaceId}で起動できませんでした: ${error instanceof Error ? error.message : String(error)}`)
-  }
 
-  const deadline = Date.now() + (hooks.timeoutMs ?? 90_000)
-  while (Date.now() <= deadline) {
-    const current = inspect(stateDir)
-    if (current.status === 'running') {
-      return {
-        status: 'started',
-        workspaceId,
-        paneId,
-        gatewayPid: current.gatewayPid,
-        runnerPid: current.runnerPid,
+    const deadline = Date.now() + (hooks.timeoutMs ?? 90_000)
+    while (Date.now() <= deadline) {
+      const current = inspect(stateDir)
+      if (current.status === 'running') {
+        return {
+          status: 'started',
+          workspaceId,
+          paneId,
+          gatewayPid: current.gatewayPid,
+          runnerPid: current.runnerPid,
+          launcherPid: current.launcherPid,
+        }
       }
+      await sleep(500)
     }
-    if (current.status === 'partial') {
-      throw new Error(`Herdr workspace ${workspaceId}でZeroちゃんが部分起動になりました`)
+    throw new Error(`Herdr workspace ${workspaceId}でZeroちゃんの起動確認がtimeoutしました`)
+  } catch (error) {
+    let cleanupFailure = ''
+    try {
+      await closeFailedStartWorkspace({
+        workspaceId,
+        stateDir,
+        invoke,
+        inspect,
+        sleep,
+        timeoutMs: hooks.cleanupTimeoutMs ?? 10_000,
+      })
+    } catch (cleanupError) {
+      cleanupFailure = `\n起動失敗後のworkspace/process回収にも失敗しました: ${
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+      }`
     }
-    await (hooks.sleep ?? (milliseconds => Bun.sleep(milliseconds)))(500)
+    throw new Error(`${error instanceof Error ? error.message : String(error)}${cleanupFailure}`)
   }
-  throw new Error(`Herdr workspace ${workspaceId}でZeroちゃんの起動確認がtimeoutしました`)
 }
 
 async function main(): Promise<void> {
@@ -194,7 +303,7 @@ async function main(): Promise<void> {
   } else {
     process.stdout.write(`✅ Herdr workspace ${result.workspaceId}でZeroちゃんを起動しました。\n`)
   }
-  process.stdout.write(`   gateway: PID ${result.gatewayPid} / runner: PID ${result.runnerPid}\n`)
+  process.stdout.write(`   gateway: PID ${result.gatewayPid} / runner: PID ${result.runnerPid} / recovery: PID ${result.launcherPid}\n`)
 }
 
 if (import.meta.main) {

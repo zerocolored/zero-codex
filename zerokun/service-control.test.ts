@@ -99,6 +99,42 @@ async function waitFor(path: string): Promise<void> {
   expect(existsSync(path)).toBe(true)
 }
 
+async function spawnManagedLauncher(
+  state: string,
+  base: string,
+  label = 'initial',
+): Promise<Bun.Subprocess> {
+  const processLock = join(import.meta.dir, 'process-lock.ts')
+  const launcherDir = join(base, `launcher-${label}`)
+  const launcher = join(launcherDir, 'runner-launcher.ts')
+  const ready = join(launcherDir, 'ready')
+  mkdirSync(launcherDir, { recursive: true })
+  writeFileSync(launcher, [
+    `import { releaseProcessLock, tryAcquireProcessLock } from ${JSON.stringify(processLock)}`,
+    `const lock = ${JSON.stringify(join(state, 'job-runner-starter.lock'))}`,
+    'const acquired = tryAcquireProcessLock(lock, process.pid)',
+    "if (!acquired.acquired) throw new Error('launcher lock unavailable')",
+    `await Bun.write(${JSON.stringify(ready)}, String(process.pid))`,
+    'let stopping = false',
+    'const stop = () => {',
+    '  if (stopping) return',
+    '  stopping = true',
+    '  releaseProcessLock(lock, acquired.lease)',
+    '  process.exit(0)',
+    '}',
+    "process.on('SIGTERM', stop)",
+    "process.on('SIGINT', stop)",
+    'await Bun.sleep(60_000)',
+    '',
+  ].join('\n'))
+  const child = Bun.spawn([process.execPath, launcher], {
+    stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
+  })
+  processes.push(child)
+  await waitFor(ready)
+  return child
+}
+
 async function spawnManagedServices(
   state: string,
   base: string,
@@ -106,7 +142,7 @@ async function spawnManagedServices(
     acknowledgePause?: boolean
     detachedDescendantPidFile?: string
   } = {},
-): Promise<{ gateway: Bun.Subprocess; runner: Bun.Subprocess }> {
+): Promise<{ gateway: Bun.Subprocess; runner: Bun.Subprocess; launcher: Bun.Subprocess }> {
   const processLock = join(import.meta.dir, 'process-lock.ts')
   const serviceState = join(import.meta.dir, 'service-control-state.ts')
   const server = join(base, 'server.ts')
@@ -193,7 +229,8 @@ async function spawnManagedServices(
   })
   processes.push(gateway, worker)
   await Promise.all([waitFor(gatewayReady), waitFor(runnerReady)])
-  return { gateway, runner: worker }
+  const launcher = await spawnManagedLauncher(state, base)
+  return { gateway, runner: worker, launcher }
 }
 
 function publishRuntime(
@@ -249,6 +286,7 @@ describe('zerochan stop/start', () => {
       status: 'running',
       gatewayPid: services.gateway.pid,
       runnerPid: services.runner.pid,
+      launcherPid: services.launcher.pid,
     })
 
     services.runner.kill('SIGTERM')
@@ -257,8 +295,105 @@ describe('zerochan stop/start', () => {
       status: 'partial',
       gatewayPid: services.gateway.pid,
       runnerPid: undefined,
+      launcherPid: services.launcher.pid,
     })
   })
+
+  test.skipIf(process.platform === 'win32')(
+    'statusとforce stopはlock前にreparentしたreceipt runnerを追跡して回収する',
+    async () => {
+      const { base, state } = fixture()
+      createJobDatabase(state)
+      const runner = join(base, 'receipt-job-runner.ts')
+      const launcher = join(base, 'receipt-runner-launcher.ts')
+      const pidFile = join(base, 'receipt-runner.pid')
+      const processGeneration = join(import.meta.dir, 'process-generation.ts')
+      const launchReceipt = join(import.meta.dir, 'runner-launch-receipt.ts')
+      writeFileSync(runner, "process.on('SIGTERM', () => {})\nawait Bun.sleep(60_000)\n")
+      writeFileSync(launcher, [
+        "import { writeFileSync } from 'fs'",
+        `import { acquireProcessGroupLeaderIdentity, readProcessIdentity } from ${JSON.stringify(processGeneration)}`,
+        `import { prepareRunnerLaunchReceipt, publishRunnerLaunchReceipt } from ${JSON.stringify(launchReceipt)}`,
+        'const [runner, stateDir] = process.argv.slice(2)',
+        'const launcherIdentity = readProcessIdentity(process.pid)',
+        "if (!launcherIdentity) throw new Error('launcher identity unavailable')",
+        'const intent = prepareRunnerLaunchReceipt(stateDir!, launcherIdentity)',
+        'const daemon = Bun.spawn([process.execPath, runner!, "daemon"], {',
+        "  detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',",
+        '})',
+        'daemon.unref()',
+        'const daemonIdentity = await acquireProcessGroupLeaderIdentity(daemon.pid)',
+        "if (!daemonIdentity) throw new Error('runner identity unavailable')",
+        'publishRunnerLaunchReceipt(stateDir!, intent.intentId, daemonIdentity)',
+        `writeFileSync(${JSON.stringify(pidFile)}, String(daemon.pid))`,
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+
+      const owner = Bun.spawn([process.execPath, launcher, runner, state], {
+        stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
+      })
+      processes.push(owner)
+      await waitFor(pidFile)
+      expect(await owner.exited).toBe(0)
+      const runnerPid = Number(readFileSync(pidFile, 'utf8'))
+      const runnerIdentity = readProcessIdentity(runnerPid)
+      try {
+        expect(inspectManagedServiceStatus(state)).toEqual(runnerIdentity
+          ? { status: 'partial', runnerPid }
+          : { status: 'partial' })
+        const result = await stopManagedService(
+          dirname(import.meta.dir),
+          state,
+          {
+            ...testHooks,
+            recoverForcedJobs: async () => ({ completed: 0, failed: 0, queued: 0 }),
+          },
+          { force: true },
+        )
+        expect(result.status).toBe('stopped')
+        expect(readProcessIdentity(runnerPid)).toBeUndefined()
+        expect(existsSync(join(state, 'job-runner-launch.json'))).toBe(false)
+        expect(inspectManagedServiceStatus(state)).toEqual({ status: 'stopped' })
+      } finally {
+        if (runnerIdentity && observeProcessGeneration(runnerIdentity).status === 'alive') {
+          signalProcessIfLive(runnerIdentity, 'SIGKILL')
+        }
+      }
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    '通常stopもdead launcherのprepared receiptをpartialとして回収する',
+    async () => {
+      const { base, state } = fixture()
+      createJobDatabase(state)
+      const launcher = join(base, 'prepared-runner-launcher.ts')
+      const launchReceipt = join(import.meta.dir, 'runner-launch-receipt.ts')
+      const processGeneration = join(import.meta.dir, 'process-generation.ts')
+      writeFileSync(launcher, [
+        `import { readProcessIdentity } from ${JSON.stringify(processGeneration)}`,
+        `import { prepareRunnerLaunchReceipt } from ${JSON.stringify(launchReceipt)}`,
+        'const stateDir = process.argv[2]!',
+        'const identity = readProcessIdentity(process.pid)',
+        "if (!identity) throw new Error('launcher identity unavailable')",
+        'prepareRunnerLaunchReceipt(stateDir, identity)',
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+      const owner = Bun.spawn([process.execPath, launcher, state], {
+        stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
+      })
+      processes.push(owner)
+      expect(await owner.exited).toBe(0)
+
+      expect(inspectManagedServiceStatus(state)).toEqual({ status: 'partial' })
+      const result = await stopManagedService(dirname(import.meta.dir), state, testHooks)
+      expect(result.status).toBe('stopped')
+      expect(existsSync(join(state, 'job-runner-launch.json'))).toBe(false)
+      expect(inspectManagedServiceStatus(state)).toEqual({ status: 'stopped' })
+    },
+  )
 
   test('stopはidle ack後だけ停止しqueued jobと意図的停止状態を保持する', async () => {
     const { base, state } = fixture()
@@ -281,8 +416,18 @@ describe('zerochan stop/start', () => {
     const { base, state } = fixture()
     createJobDatabase(state, [{ status: 'running' }])
     const services = await spawnManagedServices(state, base)
-    await expect(stopManagedService(dirname(import.meta.dir), state, testHooks))
-      .rejects.toThrow('実行中のタスクが1件')
+    let refusal: unknown
+    try {
+      await stopManagedService(dirname(import.meta.dir), state, testHooks)
+    } catch (error) {
+      refusal = error
+    }
+    expect(refusal).toBeInstanceOf(Error)
+    const message = (refusal as Error).message
+    expect(message).toContain('実行中のタスクが1件')
+    expect(message).toContain('zerochan stop --force')
+    expect(message).toContain('履歴とCodexセッションは保持')
+    expect(message).toContain('完了済みの変更や外部操作は元に戻りません')
     expect(services.gateway.exitCode).toBeNull()
     expect(services.runner.exitCode).toBeNull()
     expect(intentionalServiceStopIsSet(state)).toBe(false)
@@ -407,7 +552,7 @@ describe('zerochan stop/start', () => {
     expect(started).toBe(false)
   })
 
-  test('startは停止markerを消しgateway/runnerの安定起動を返す', async () => {
+  test('startは停止markerを消しgateway/runner/launcherの安定起動を返す', async () => {
     const { base, state, project } = fixture()
     createJobDatabase(state)
     writeIntentionalServiceStop(state)
@@ -441,8 +586,533 @@ describe('zerochan stop/start', () => {
     expect(result.paneId).toBe('wT:pR')
     expect(result.gatewayPid).toBe(services!.gateway.pid)
     expect(result.runnerPid).toBe(services!.runner.pid)
+    expect(result.launcherPid).toBe(services!.launcher.pid)
     expect(intentionalServiceStopIsSet(state)).toBe(false)
   })
+
+  test('別projectからのstartもgatewayとrunnerを止めず欠落したlauncherだけを再構築する', async () => {
+    const { base, state, project } = fixture()
+    const callerProject = join(base, 'caller-project')
+    mkdirSync(callerProject)
+    createJobDatabase(state)
+    const services = await spawnManagedServices(state, base)
+    publishRuntime(state)
+    const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+      cwd: dirname(import.meta.dir), stdout: 'pipe', stderr: 'pipe',
+    }).stdout.toString().trim()
+    writeGatewayReadiness(
+      join(state, 'gateway-ready.json'),
+      release,
+      services.gateway.pid,
+      project,
+      'A0123456789',
+    )
+    services.launcher.kill('SIGTERM')
+    expect(await services.launcher.exited).toBe(0)
+    expect(inspectManagedServiceStatus(state)).toMatchObject({
+      status: 'partial',
+      gatewayPid: services.gateway.pid,
+      runnerPid: services.runner.pid,
+    })
+
+    let rebuilt: Bun.Subprocess | undefined
+    const result = await startManagedService(
+      dirname(import.meta.dir),
+      state,
+      callerProject,
+      'A0123456789',
+      {
+        ...testHooks,
+        startBot: async () => { throw new Error('full service must not restart') },
+        startRunnerLauncher: async () => {
+          rebuilt = await spawnManagedLauncher(state, base, 'rebuilt')
+          const identity = readProcessIdentity(rebuilt.pid)
+          if (!identity) throw new Error('rebuilt launcher identity unavailable')
+          return { pid: rebuilt.pid, identity }
+        },
+      },
+    )
+
+    expect(result).toEqual({
+      status: 'already-running',
+      gatewayPid: services.gateway.pid,
+      runnerPid: services.runner.pid,
+      launcherPid: rebuilt!.pid,
+    })
+    expect(services.gateway.exitCode).toBeNull()
+    expect(services.runner.exitCode).toBeNull()
+    expect(rebuilt!.exitCode).toBeNull()
+  })
+
+  test('launcher修復の安定確認中にrunnerが正当に世代交代しても新PIDを返す', async () => {
+    const { base, state, project } = fixture()
+    createJobDatabase(state)
+    const services = await spawnManagedServices(state, base)
+    publishRuntime(state)
+    const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+      cwd: dirname(import.meta.dir), stdout: 'pipe', stderr: 'pipe',
+    }).stdout.toString().trim()
+    writeGatewayReadiness(
+      join(state, 'gateway-ready.json'),
+      release,
+      services.gateway.pid,
+      project,
+      'A0123456789',
+    )
+    services.launcher.kill('SIGTERM')
+    expect(await services.launcher.exited).toBe(0)
+
+    let rebuilt: Bun.Subprocess | undefined
+    let replacement: Bun.Subprocess | undefined
+    let sleepCount = 0
+    const result = await startManagedService(
+      dirname(import.meta.dir),
+      state,
+      project,
+      'A0123456789',
+      {
+        ...testHooks,
+        startRunnerLauncher: async () => {
+          rebuilt = await spawnManagedLauncher(state, base, 'replacement-supervisor')
+          const identity = readProcessIdentity(rebuilt.pid)
+          if (!identity) throw new Error('replacement launcher identity unavailable')
+          return { pid: rebuilt.pid, identity }
+        },
+        sleep: async () => {
+          sleepCount += 1
+          if (sleepCount === 1) {
+            services.runner.kill('SIGTERM')
+            expect(await services.runner.exited).toBe(0)
+            rmSync(join(base, 'runner.ready'), { force: true })
+            replacement = Bun.spawn([
+              process.execPath, join(base, 'job-runner.ts'), 'daemon',
+            ], {
+              stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
+            })
+            processes.push(replacement)
+            await waitFor(join(base, 'runner.ready'))
+          }
+          await Bun.sleep(5)
+        },
+      },
+    )
+
+    expect(replacement).toBeDefined()
+    expect(result).toEqual({
+      status: 'already-running',
+      gatewayPid: services.gateway.pid,
+      runnerPid: replacement!.pid,
+      launcherPid: rebuilt!.pid,
+    })
+    expect(inspectManagedServiceStatus(state)).toEqual({
+      status: 'running',
+      gatewayPid: services.gateway.pid,
+      runnerPid: replacement!.pid,
+      launcherPid: rebuilt!.pid,
+    })
+  })
+
+  test('launcher修復後のhealth失敗は新launcherだけを回収し既存serviceを保持する', async () => {
+    const { base, state, project } = fixture()
+    createJobDatabase(state)
+    const services = await spawnManagedServices(state, base)
+    publishRuntime(state)
+    const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+      cwd: dirname(import.meta.dir), stdout: 'pipe', stderr: 'pipe',
+    }).stdout.toString().trim()
+    writeGatewayReadiness(
+      join(state, 'gateway-ready.json'),
+      release,
+      services.gateway.pid,
+      project,
+      'A0123456789',
+    )
+    services.launcher.kill('SIGTERM')
+    expect(await services.launcher.exited).toBe(0)
+
+    let rebuilt: Bun.Subprocess | undefined
+    await expect(startManagedService(
+      dirname(import.meta.dir),
+      state,
+      project,
+      'A0123456789',
+      {
+        ...testHooks,
+        startRunnerLauncher: async () => {
+          rebuilt = await spawnManagedLauncher(state, base, 'failed-health')
+          writeGatewayReadiness(
+            join(state, 'gateway-ready.json'),
+            release,
+            services.gateway.pid,
+            base,
+            'A0123456789',
+          )
+          const identity = readProcessIdentity(rebuilt.pid)
+          if (!identity) throw new Error('failed-health launcher identity unavailable')
+          return { pid: rebuilt.pid, identity }
+        },
+        sleep: async () => {},
+        runnerLauncherCleanupGraceMs: 100,
+      },
+    )).rejects.toThrow('安定稼働を確認できません')
+
+    expect(await rebuilt!.exited).toBe(0)
+    expect(existsSync(join(state, 'job-runner-starter.lock'))).toBe(false)
+    expect(services.gateway.exitCode).toBeNull()
+    expect(services.runner.exitCode).toBeNull()
+    expect(inspectManagedServiceStatus(state)).toEqual({
+      status: 'partial',
+      gatewayPid: services.gateway.pid,
+      runnerPid: services.runner.pid,
+    })
+  })
+
+  test('production再構築は既存gateway/runnerを保持してlauncher lockをpublishする', async () => {
+    const { base, state, project } = fixture()
+    const root = join(base, 'runtime-root')
+    const runtimeDir = join(root, 'zerokun')
+    mkdirSync(runtimeDir, { recursive: true })
+    writeFileSync(join(runtimeDir, 'job-runner.ts'), '// fixture runner\n')
+    const processLock = join(import.meta.dir, 'process-lock.ts')
+    writeFileSync(join(runtimeDir, 'runner-launcher.ts'), [
+      `import { releaseProcessLock, tryAcquireProcessLock } from ${JSON.stringify(processLock)}`,
+      'const starterLock = process.argv[5]!',
+      'const acquired = tryAcquireProcessLock(starterLock, process.pid)',
+      "if (!acquired.acquired) throw new Error('launcher lock unavailable')",
+      'const stop = () => { releaseProcessLock(starterLock, acquired.lease); process.exit(0) }',
+      "process.on('SIGTERM', stop)",
+      "process.on('SIGINT', stop)",
+      'await Bun.sleep(60_000)',
+      '',
+    ].join('\n'))
+    createJobDatabase(state)
+    const services = await spawnManagedServices(state, base)
+    publishRuntime(state)
+    const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+      cwd: dirname(import.meta.dir), stdout: 'pipe', stderr: 'pipe',
+    }).stdout.toString().trim()
+    writeGatewayReadiness(
+      join(state, 'gateway-ready.json'),
+      release,
+      services.gateway.pid,
+      project,
+      'A0123456789',
+    )
+    services.launcher.kill('SIGTERM')
+    expect(await services.launcher.exited).toBe(0)
+    let rebuiltIdentity: ProcessIdentity | undefined
+    try {
+      const result = await startManagedService(
+        root,
+        state,
+        project,
+        'A0123456789',
+        testHooks,
+      )
+      expect(result.status).toBe('already-running')
+      expect(result.gatewayPid).toBe(services.gateway.pid)
+      expect(result.runnerPid).toBe(services.runner.pid)
+      expect(result.launcherPid).toBeGreaterThan(0)
+      rebuiltIdentity = readProcessIdentity(result.launcherPid!)
+      expect(rebuiltIdentity).toBeDefined()
+      expect(inspectManagedServiceStatus(state)).toEqual({
+        status: 'running',
+        gatewayPid: services.gateway.pid,
+        runnerPid: services.runner.pid,
+        launcherPid: result.launcherPid,
+      })
+    } finally {
+      if (rebuiltIdentity) {
+        signalProcessIfLive(rebuiltIdentity, 'SIGTERM')
+        for (let attempt = 0; attempt < 100
+          && observeProcessGeneration(rebuiltIdentity).status === 'alive'; attempt += 1) {
+          await Bun.sleep(10)
+        }
+        if (observeProcessGeneration(rebuiltIdentity).status === 'alive') {
+          signalProcessIfLive(rebuiltIdentity, 'SIGKILL')
+        }
+      }
+    }
+  })
+
+  test.skipIf(process.platform === 'win32')(
+    'launcher再構築失敗はTERMを先行しdetached runner treeと両leaseを回収する',
+    async () => {
+      const { base, state, project } = fixture()
+      const root = join(base, 'failed-repair-root')
+      const runtimeDir = join(root, 'zerokun')
+      const processLock = join(import.meta.dir, 'process-lock.ts')
+      const runnerReady = join(base, 'failed-repair-runner.ready')
+      const pidFile = join(base, 'failed-repair-pids.json')
+      const termMarker = join(base, 'failed-repair-launcher.term')
+      mkdirSync(runtimeDir, { recursive: true })
+      writeFileSync(join(runtimeDir, 'job-runner.ts'), [
+        "import { writeFileSync } from 'fs'",
+        `import { tryAcquireProcessLock } from ${JSON.stringify(processLock)}`,
+        `const lock = ${JSON.stringify(join(state, 'job-runner.lock', 'pid'))}`,
+        'const acquired = tryAcquireProcessLock(lock, process.pid)',
+        "if (!acquired.acquired) throw new Error('runner lock unavailable')",
+        "const grandchild = Bun.spawn(['/bin/sleep', '60'], {",
+        "  detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',",
+        '})',
+        `writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({`,
+        '  runner: process.pid, grandchild: grandchild.pid,',
+        '}))',
+        `writeFileSync(${JSON.stringify(runnerReady)}, 'ready')`,
+        "process.on('SIGTERM', () => {})",
+        "process.on('SIGINT', () => {})",
+        'await Bun.sleep(60_000)',
+        '',
+      ].join('\n'))
+      writeFileSync(join(runtimeDir, 'runner-launcher.ts'), [
+        "import { writeFileSync } from 'fs'",
+        'const runner = process.argv[2]!',
+        'const daemon = Bun.spawn([process.execPath, runner, "daemon"], {',
+        "  detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',",
+        '})',
+        'let stopping = false',
+        "process.on('SIGTERM', () => {",
+        '  if (stopping) return',
+        '  stopping = true',
+        `  writeFileSync(${JSON.stringify(termMarker)}, 'term-first')`,
+        "  try { process.kill(-daemon.pid, 'SIGTERM') } catch {}",
+        '  void daemon.exited.then(() => process.exit(0))',
+        '})',
+        'await Bun.sleep(60_000)',
+        '',
+      ].join('\n'))
+
+      createJobDatabase(state)
+      const services = await spawnManagedServices(state, base)
+      publishRuntime(state)
+      const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+        cwd: dirname(import.meta.dir), stdout: 'pipe', stderr: 'pipe',
+      }).stdout.toString().trim()
+      writeGatewayReadiness(
+        join(state, 'gateway-ready.json'),
+        release,
+        services.gateway.pid,
+        project,
+        'A0123456789',
+      )
+      services.launcher.kill('SIGTERM')
+      expect(await services.launcher.exited).toBe(0)
+
+      let verifyCount = 0
+      await expect(startManagedService(
+        root,
+        state,
+        project,
+        'A0123456789',
+        {
+          ...testHooks,
+          verifyControlRuntime: async () => {
+            verifyCount += 1
+            if (verifyCount !== 2) return
+            services.runner.kill('SIGTERM')
+            expect(await services.runner.exited).toBe(0)
+          },
+          sleep: milliseconds => Bun.sleep(Math.min(milliseconds, 10)),
+          runnerLauncherStartTimeoutMs: 500,
+          runnerLauncherCleanupGraceMs: 100,
+        },
+      )).rejects.toThrow('runner launcher再構築')
+
+      expect(existsSync(termMarker)).toBe(true)
+      expect(readFileSync(termMarker, 'utf8')).toBe('term-first')
+      const pids = JSON.parse(readFileSync(pidFile, 'utf8')) as {
+        runner: number
+        grandchild: number
+      }
+      const identities = [pids.runner, pids.grandchild]
+        .map(pid => readProcessIdentity(pid))
+        .filter((value): value is ProcessIdentity => value !== undefined)
+      // readProcessIdentity returns undefined only after the exact generations
+      // are gone; lock disappearance independently proves lease cleanup.
+      expect(identities).toHaveLength(0)
+      expect(existsSync(join(state, 'job-runner-starter.lock'))).toBe(false)
+      expect(existsSync(join(state, 'job-runner.lock', 'pid'))).toBe(false)
+      expect(inspectManagedServiceStatus(state)).toEqual({
+        status: 'partial', gatewayPid: services.gateway.pid,
+      })
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'launcherが先に終了しlock前にreparentしたrunnerもreceipt世代で回収する',
+    async () => {
+      const { base, state, project } = fixture()
+      const root = join(base, 'reparented-repair-root')
+      const runtimeDir = join(root, 'zerokun')
+      const pidFile = join(base, 'reparented-runner.pid')
+      const launcherPidFile = join(base, 'failed-launcher.pid')
+      const processGeneration = join(import.meta.dir, 'process-generation.ts')
+      const launchReceipt = join(import.meta.dir, 'runner-launch-receipt.ts')
+      mkdirSync(runtimeDir, { recursive: true })
+      writeFileSync(join(runtimeDir, 'job-runner.ts'), [
+        "import { writeFileSync } from 'fs'",
+        "process.on('SIGTERM', () => {})",
+        'await Bun.sleep(60_000)',
+        '',
+      ].join('\n'))
+      writeFileSync(join(runtimeDir, 'runner-launcher.ts'), [
+        "import { writeFileSync } from 'fs'",
+        `import { acquireProcessGroupLeaderIdentity, readProcessIdentity } from ${JSON.stringify(processGeneration)}`,
+        `import { prepareRunnerLaunchReceipt, publishRunnerLaunchReceipt } from ${JSON.stringify(launchReceipt)}`,
+        'const [runner, stateDir] = process.argv.slice(2)',
+        'const launcherIdentity = readProcessIdentity(process.pid)',
+        "if (!launcherIdentity) throw new Error('launcher identity unavailable')",
+        'const intent = prepareRunnerLaunchReceipt(stateDir!, launcherIdentity)',
+        'const daemon = Bun.spawn([process.execPath, runner, "daemon"], {',
+        "  detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',",
+        '})',
+        'daemon.unref()',
+        'const daemonIdentity = await acquireProcessGroupLeaderIdentity(daemon.pid)',
+        "if (!daemonIdentity) throw new Error('runner identity unavailable')",
+        'publishRunnerLaunchReceipt(stateDir!, intent.intentId, daemonIdentity)',
+        `writeFileSync(${JSON.stringify(pidFile)}, String(daemon.pid))`,
+        `writeFileSync(${JSON.stringify(launcherPidFile)}, String(process.pid))`,
+        'process.exit(17)',
+        '',
+      ].join('\n'))
+
+      createJobDatabase(state)
+      const services = await spawnManagedServices(state, base)
+      publishRuntime(state)
+      const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+        cwd: dirname(import.meta.dir), stdout: 'pipe', stderr: 'pipe',
+      }).stdout.toString().trim()
+      writeGatewayReadiness(
+        join(state, 'gateway-ready.json'),
+        release,
+        services.gateway.pid,
+        project,
+        'A0123456789',
+      )
+      services.launcher.kill('SIGTERM')
+      expect(await services.launcher.exited).toBe(0)
+
+      let verifyCount = 0
+      await expect(startManagedService(
+        root,
+        state,
+        project,
+        'A0123456789',
+        {
+          ...testHooks,
+          verifyControlRuntime: async () => {
+            verifyCount += 1
+            if (verifyCount !== 2) return
+            services.runner.kill('SIGTERM')
+            expect(await services.runner.exited).toBe(0)
+          },
+          sleep: milliseconds => Bun.sleep(Math.min(milliseconds, 10)),
+          runnerLauncherStartTimeoutMs: 1_000,
+          runnerLauncherCleanupGraceMs: 100,
+        },
+      )).rejects.toThrow('runner launcher再構築processが終了しました')
+
+      const runnerPid = Number(readFileSync(pidFile, 'utf8'))
+      const failedLauncherPid = Number(readFileSync(launcherPidFile, 'utf8'))
+      expect(runnerPid).not.toBe(failedLauncherPid)
+      expect(readProcessIdentity(runnerPid)).toBeUndefined()
+      expect(existsSync(join(state, 'job-runner-starter.lock'))).toBe(false)
+      expect(existsSync(join(state, 'job-runner.lock', 'pid'))).toBe(false)
+      expect(existsSync(join(state, 'job-runner-launch.json'))).toBe(false)
+      expect(inspectManagedServiceStatus(state)).toEqual({
+        status: 'partial', gatewayPid: services.gateway.pid,
+      })
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'launcher死亡後もprepared intentを取消して遅延publisherのrunner起動を防ぐ',
+    async () => {
+      const { base, state, project } = fixture()
+      const root = join(base, 'delayed-publication-root')
+      const runtimeDir = join(root, 'zerokun')
+      const childPidFile = join(base, 'delayed-publisher.pid')
+      const lateRunnerMarker = join(base, 'late-runner.started')
+      const processGeneration = join(import.meta.dir, 'process-generation.ts')
+      const launchReceipt = join(import.meta.dir, 'runner-launch-receipt.ts')
+      mkdirSync(runtimeDir, { recursive: true })
+      writeFileSync(join(runtimeDir, 'job-runner.ts'), [
+        "import { writeFileSync } from 'fs'",
+        `import { readProcessIdentity } from ${JSON.stringify(processGeneration)}`,
+        `import { publishRunnerLaunchReceipt } from ${JSON.stringify(launchReceipt)}`,
+        'const [stateDir, intentId] = process.argv.slice(2)',
+        `writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid))`,
+        'await Bun.sleep(350)',
+        'const identity = readProcessIdentity(process.pid)',
+        "if (!identity) throw new Error('delayed publisher identity unavailable')",
+        'publishRunnerLaunchReceipt(stateDir!, intentId!, identity)',
+        `writeFileSync(${JSON.stringify(lateRunnerMarker)}, 'started')`,
+        'await Bun.sleep(60_000)',
+        '',
+      ].join('\n'))
+      writeFileSync(join(runtimeDir, 'runner-launcher.ts'), [
+        `import { readProcessIdentity } from ${JSON.stringify(processGeneration)}`,
+        `import { prepareRunnerLaunchReceipt } from ${JSON.stringify(launchReceipt)}`,
+        'const [runner, stateDir] = process.argv.slice(2)',
+        'const launcherIdentity = readProcessIdentity(process.pid)',
+        "if (!launcherIdentity) throw new Error('launcher identity unavailable')",
+        'const intent = prepareRunnerLaunchReceipt(stateDir!, launcherIdentity)',
+        'Bun.spawn([process.execPath, runner!, stateDir!, intent.intentId], {',
+        "  detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',",
+        '})',
+        `while (!Bun.file(${JSON.stringify(childPidFile)}).size) await Bun.sleep(5)`,
+        'process.exit(17)',
+        '',
+      ].join('\n'))
+
+      createJobDatabase(state)
+      const services = await spawnManagedServices(state, base)
+      publishRuntime(state)
+      const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+        cwd: dirname(import.meta.dir), stdout: 'pipe', stderr: 'pipe',
+      }).stdout.toString().trim()
+      writeGatewayReadiness(
+        join(state, 'gateway-ready.json'),
+        release,
+        services.gateway.pid,
+        project,
+        'A0123456789',
+      )
+      services.launcher.kill('SIGTERM')
+      expect(await services.launcher.exited).toBe(0)
+
+      let verifyCount = 0
+      await expect(startManagedService(
+        root,
+        state,
+        project,
+        'A0123456789',
+        {
+          ...testHooks,
+          verifyControlRuntime: async () => {
+            verifyCount += 1
+            if (verifyCount !== 2) return
+            services.runner.kill('SIGTERM')
+            expect(await services.runner.exited).toBe(0)
+          },
+          sleep: milliseconds => Bun.sleep(Math.min(milliseconds, 10)),
+          runnerLauncherStartTimeoutMs: 1_000,
+          runnerLauncherCleanupGraceMs: 100,
+        },
+      )).rejects.toThrow('runner launcher再構築processが終了しました')
+
+      const childPid = Number(readFileSync(childPidFile, 'utf8'))
+      await Bun.sleep(500)
+      expect(existsSync(lateRunnerMarker)).toBe(false)
+      expect(readProcessIdentity(childPid)).toBeUndefined()
+      expect(existsSync(join(state, 'job-runner-launch.json'))).toBe(false)
+      expect(existsSync(join(state, 'job-runner-starter.lock'))).toBe(false)
+      expect(existsSync(join(state, 'job-runner.lock', 'pid'))).toBe(false)
+      expect(inspectManagedServiceStatus(state)).toEqual({
+        status: 'partial', gatewayPid: services.gateway.pid,
+      })
+    },
+  )
 
   test('startは稼働中serviceのSlack App identity不一致を共有しない', async () => {
     const { base, state, project } = fixture()

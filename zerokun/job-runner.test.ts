@@ -1867,7 +1867,25 @@ describe('Codex job store', () => {
       threadId: prepared.activeThreadId!, requestId: 2,
       inputRevision: snapshot.revision, inputDigest: snapshot.digest,
     })
-    store.requeueAt(prepared.id, Date.now() - 1, 'fixture retry')
+    store.acknowledgeAppServerPhaseDispatch({
+      jobId: prepared.id, workerId: prepared.workerId!, attempt: prepared.attempts,
+      epoch: prepared.controlEpoch, phaseSequence: 1,
+      logicalNonce: prepared.executorNonce!, threadId: prepared.activeThreadId!,
+      turnId: 'turn-repository-drift-prior-implementation', requestId: 2,
+    })
+    const resumeAt = Date.now() - 1
+    store.finishAppServerTurn({
+      jobId: prepared.id, epoch: prepared.controlEpoch,
+      executorNonce: prepared.executorNonce!, threadId: prepared.activeThreadId!,
+      turnId: 'turn-repository-drift-prior-implementation', retainInput: true,
+      rateLimitResumeAt: resumeAt,
+      rateLimitReason: 'rate-limit',
+      rateLimitSafeToReplay: false,
+    })
+    store.requeueAt(
+      prepared.id, resumeAt, 'fixture terminal continuation',
+      prepared.activeThreadId!, 'rate-limit',
+    )
     const retried = store.claimNext('repository-drift-prior-worker')!
     recordCompletedInitialPreparePhase(store, retried, 'repository-drift-prior-retry')
 
@@ -6032,6 +6050,8 @@ describe('single FIFO worker', () => {
       turnId: 'turn-rate-crash',
       retainInput: true,
       rateLimitResumeAt: resumeAt,
+      rateLimitReason: 'rate-limit',
+      rateLimitSafeToReplay: false,
     })).toEqual({ closeInput: false, cancelled: false, pending: 0, pendingInbound: 0 })
     store.close()
 
@@ -6044,6 +6064,805 @@ describe('single FIFO worker', () => {
     })
     expect(recovered.liveControlTarget(running.chatId, running.threadTs)?.jobId).toBe(running.id)
     recovered.close()
+  })
+
+  test('command実行後のwrite rate-limit terminalを同じthreadの続きとして再開する', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    const queued = store.enqueue(input({
+      messageId: 'write-terminal-continuation',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('write-terminal-worker')!
+    const snapshot = readAdvisorInputSnapshot(dir, running.id)
+    const firstNonce = '9'.repeat(32)
+    const threadId = 'thread-write-terminal-continuation'
+    expect(store.beginInitialTurnDispatch({
+      jobId: running.id,
+      attempt: running.attempts,
+      epoch: running.controlEpoch,
+      executorNonce: firstNonce,
+      threadId,
+      requestId: 91,
+      inputRevision: snapshot.revision,
+      inputDigest: snapshot.digest,
+    })).toBe('dispatching')
+    store.acknowledgeInitialTurnDispatch({
+      jobId: running.id,
+      workerId: running.workerId!,
+      attempt: running.attempts,
+      epoch: running.controlEpoch,
+      executorNonce: firstNonce,
+      threadId,
+      turnId: 'turn-write-terminal-continuation',
+      requestId: 91,
+    })
+    const resumeAt = Date.now() - 1
+    store.finishAppServerTurn({
+      jobId: running.id,
+      epoch: running.controlEpoch,
+      executorNonce: firstNonce,
+      threadId,
+      turnId: 'turn-write-terminal-continuation',
+      retainInput: true,
+      rateLimitResumeAt: resumeAt,
+      rateLimitReason: 'rate-limit',
+      // The prior turn may have run commands. Recovery remains safe because
+      // it continues the terminal thread after inspecting current state.
+      rateLimitSafeToReplay: false,
+    })
+    expect(store.hasDurableRateLimitTerminal(running.id)).toBe(true)
+    expect(() => store.requeueAt(
+      running.id, resumeAt, 'wrong receipt reason', threadId, 'capacity',
+    )).toThrow('cannot be safely deferred')
+    expect(() => store.requeueAt(
+      running.id, resumeAt, 'wrong receipt thread', 'thread-other', 'rate-limit',
+    )).toThrow('cannot be safely deferred')
+    expect(store.get(running.id)).toMatchObject({
+      status: 'running', sessionId: threadId, notBefore: resumeAt,
+    })
+    store.close()
+
+    store = new JobStore(path)
+    expect(store.recoverInterrupted()).toEqual({
+      requeued: 1, failedWrites: 0, failedUncertain: 0,
+    })
+    const waiting = store.get(queued.id)!
+    expect(waiting).toMatchObject({
+      status: 'queued',
+      sessionId: threadId,
+      notBefore: resumeAt,
+      rateLimitRecovery: {
+        version: 1,
+        attempt: 1,
+        threadId,
+        reason: 'rate-limit',
+        safeToReplay: false,
+      },
+    })
+    const resumed = store.claimNext('write-terminal-retry', 20, Date.now())!
+    expect(resumed).toMatchObject({
+      id: queued.id,
+      attempts: 2,
+      resumed: true,
+      sessionId: threadId,
+    })
+    const resumedSnapshot = readAdvisorInputSnapshot(dir, resumed.id)
+    const prompt = buildCodexWorkerPrompt(resumed, resumedSnapshot, {
+      attemptNonce: 'a'.repeat(32),
+      artifactDir: join(dir, 'artifacts'),
+      advisorEnabled: false,
+    })
+    expect(prompt).toContain('Rate-limit continuation (trusted host state)')
+    expect(prompt).toContain('Do not blindly replay commands, edits, Git operations')
+    expect(prompt).toContain('if the host starts a fresh thread, the durable Slack history')
+
+    const secondNonce = 'b'.repeat(32)
+    expect(store.beginInitialTurnDispatch({
+      jobId: resumed.id,
+      attempt: resumed.attempts,
+      epoch: resumed.controlEpoch,
+      executorNonce: secondNonce,
+      threadId,
+      requestId: 92,
+      inputRevision: resumedSnapshot.revision,
+      inputDigest: resumedSnapshot.digest,
+    })).toBe('dispatching')
+    store.acknowledgeInitialTurnDispatch({
+      jobId: resumed.id,
+      workerId: resumed.workerId!,
+      attempt: resumed.attempts,
+      epoch: resumed.controlEpoch,
+      executorNonce: secondNonce,
+      threadId,
+      turnId: 'turn-write-terminal-success',
+      requestId: 92,
+    })
+    store.finishAppServerTurn({
+      jobId: resumed.id,
+      epoch: resumed.controlEpoch,
+      executorNonce: secondNonce,
+      threadId,
+      turnId: 'turn-write-terminal-success',
+    })
+    expect(store.get(resumed.id)).toMatchObject({
+      notBefore: null,
+      rateLimitRecovery: null,
+    })
+    store.close()
+  })
+
+  test('bareまたは破損したrate-limit hintはwrite jobの再実行を認可しない', () => {
+    for (const kind of ['bare', 'malformed'] as const) {
+      const dir = fixtureDir()
+      const path = join(dir, 'jobs.sqlite3')
+      let store = new JobStore(path)
+      const queued = store.enqueue(input({
+        messageId: `write-rate-${kind}`,
+        threadTs: `1800000000.${kind === 'bare' ? '410001' : '410002'}`,
+        writeEnabled: true,
+      })).job
+      const running = store.claimNext(`write-rate-${kind}-worker`)!
+      const snapshot = readAdvisorInputSnapshot(dir, running.id)
+      const nonce = kind === 'bare' ? 'c'.repeat(32) : 'd'.repeat(32)
+      const threadId = `thread-write-rate-${kind}`
+      expect(store.beginInitialTurnDispatch({
+        jobId: running.id,
+        attempt: running.attempts,
+        epoch: running.controlEpoch,
+        executorNonce: nonce,
+        threadId,
+        requestId: 93,
+        inputRevision: snapshot.revision,
+        inputDigest: snapshot.digest,
+      })).toBe('dispatching')
+      store.acknowledgeInitialTurnDispatch({
+        jobId: running.id,
+        workerId: running.workerId!,
+        attempt: running.attempts,
+        epoch: running.controlEpoch,
+        executorNonce: nonce,
+        threadId,
+        turnId: `turn-write-rate-${kind}`,
+        requestId: 93,
+      })
+      const resumeAt = Date.now() + 60_000
+      if (kind === 'bare') {
+        // This is only the non-terminal App Server error hint; active_turn_id
+        // remains bound and therefore cannot authorize a write continuation.
+        store.recordAppServerRateLimit({
+          jobId: running.id,
+          epoch: running.controlEpoch,
+          executorNonce: nonce,
+          threadId,
+          turnId: `turn-write-rate-${kind}`,
+          resumeAt,
+        })
+      } else {
+        store.finishAppServerTurn({
+          jobId: running.id,
+          epoch: running.controlEpoch,
+          executorNonce: nonce,
+          threadId,
+          turnId: `turn-write-rate-${kind}`,
+          retainInput: true,
+          rateLimitResumeAt: resumeAt,
+          rateLimitReason: 'capacity',
+          rateLimitSafeToReplay: false,
+        })
+      }
+      store.close()
+      if (kind === 'malformed') {
+        const db = new Database(path)
+        db.run(
+          'UPDATE jobs SET rate_limit_terminal_json = ? WHERE id = ?',
+          ['{"version":1}', queued.id],
+        )
+        db.close()
+      }
+
+      store = new JobStore(path)
+      expect(store.recoverInterrupted()).toEqual({
+        requeued: 0, failedWrites: 1, failedUncertain: 0,
+      })
+      expect(store.get(queued.id)).toMatchObject({
+        status: 'failed',
+        writeEnabled: true,
+      })
+      expect(store.claimNext(`write-rate-${kind}-retry`)).toBeNull()
+      store.close()
+    }
+  })
+
+  test('通常terminalは先行する非terminal rate-limit hintとreceiptを消去する', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    store.enqueue(input({
+      messageId: 'normal-terminal-clears-rate-limit',
+      writeEnabled: true,
+    }))
+    const running = store.claimNext('normal-terminal-clears-worker')!
+    const snapshot = readAdvisorInputSnapshot(dir, running.id)
+    const nonce = '7'.repeat(32)
+    const threadId = 'thread-normal-terminal-clears-rate-limit'
+    store.beginInitialTurnDispatch({
+      jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+      executorNonce: nonce, threadId, requestId: 98,
+      inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+    })
+    store.acknowledgeInitialTurnDispatch({
+      jobId: running.id, workerId: running.workerId!, attempt: running.attempts,
+      epoch: running.controlEpoch, executorNonce: nonce, threadId,
+      turnId: 'turn-normal-terminal-clears-rate-limit', requestId: 98,
+    })
+    store.recordAppServerRateLimit({
+      jobId: running.id, epoch: running.controlEpoch, executorNonce: nonce,
+      threadId, turnId: 'turn-normal-terminal-clears-rate-limit',
+      resumeAt: Date.now() + 60_000,
+    })
+    expect(store.get(running.id)?.notBefore).not.toBeNull()
+    store.finishAppServerTurn({
+      jobId: running.id, epoch: running.controlEpoch, executorNonce: nonce,
+      threadId, turnId: 'turn-normal-terminal-clears-rate-limit', retainInput: true,
+    })
+    expect(store.get(running.id)).toMatchObject({
+      notBefore: null,
+      rateLimitRecovery: null,
+      activeTurnId: null,
+    })
+    store.close()
+
+    store = new JobStore(path)
+    expect(store.get(running.id)).toMatchObject({
+      notBefore: null,
+      rateLimitRecovery: null,
+    })
+    expect(store.recoverInterrupted()).toEqual({
+      requeued: 0, failedWrites: 1, failedUncertain: 0,
+    })
+    store.close()
+  })
+
+  test('旧finishTurnの厳密なcrash形だけを保守的なterminal receiptへ移行する', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    const queued = store.enqueue(input({
+      messageId: 'legacy-write-rate-terminal',
+      writeEnabled: true,
+    })).job
+    const running = store.claimNext('legacy-write-rate-worker')!
+    const snapshot = readAdvisorInputSnapshot(dir, running.id)
+    const nonce = 'e'.repeat(32)
+    const threadId = 'thread-legacy-write-rate'
+    store.beginInitialTurnDispatch({
+      jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+      executorNonce: nonce, threadId, requestId: 94,
+      inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+    })
+    store.acknowledgeInitialTurnDispatch({
+      jobId: running.id, workerId: running.workerId!, attempt: running.attempts,
+      epoch: running.controlEpoch, executorNonce: nonce, threadId,
+      turnId: 'turn-legacy-write-rate', requestId: 94,
+    })
+    const resumeAt = Date.now() + 60_000
+    store.finishAppServerTurn({
+      jobId: running.id, epoch: running.controlEpoch, executorNonce: nonce,
+      threadId, turnId: 'turn-legacy-write-rate', retainInput: true,
+      rateLimitResumeAt: resumeAt,
+      rateLimitReason: 'capacity',
+      rateLimitSafeToReplay: true,
+    })
+    store.close()
+
+    // Recreate the on-disk shape written by the old finishTurn implementation.
+    const oldDb = new Database(path)
+    oldDb.run('UPDATE jobs SET rate_limit_terminal_json = NULL WHERE id = ?', [queued.id])
+    oldDb.close()
+
+    store = new JobStore(path)
+    expect(store.get(queued.id)?.rateLimitRecovery).toMatchObject({
+      version: 1,
+      jobId: queued.id,
+      attempt: 1,
+      controlEpoch: 1,
+      executorNonce: nonce,
+      threadId,
+      turnId: 'turn-legacy-write-rate',
+      resumeAt,
+      reason: 'rate-limit',
+      safeToReplay: false,
+    })
+    expect(store.recoverInterrupted()).toEqual({
+      requeued: 1, failedWrites: 0, failedUncertain: 0,
+    })
+    expect(store.get(queued.id)).toMatchObject({
+      status: 'queued', sessionId: threadId, notBefore: resumeAt,
+    })
+    store.close()
+  })
+
+  test('rate-limit terminalは未処理inboundがあっても旧turnを解放してqueue側で待つ', () => {
+    const store = makeStore()
+    store.enqueue(input({
+      messageId: 'rate-terminal-pending-inbound',
+      writeEnabled: true,
+    }))
+    const running = store.claimNext('rate-terminal-pending-worker')!
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), running.id)
+    const nonce = '1'.repeat(32)
+    const threadId = 'thread-rate-terminal-pending-inbound'
+    store.beginInitialTurnDispatch({
+      jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+      executorNonce: nonce, threadId, requestId: 95,
+      inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+    })
+    store.acknowledgeInitialTurnDispatch({
+      jobId: running.id, workerId: running.workerId!, attempt: running.attempts,
+      epoch: running.controlEpoch, executorNonce: nonce, threadId,
+      turnId: 'turn-rate-terminal-pending-inbound', requestId: 95,
+    })
+    store.stageInboundDelivery({
+      chatId: running.chatId,
+      threadTs: running.threadTs,
+      messageId: '1800000000.950001',
+      userId: 'UOTHER',
+      repoPath: running.repoPath,
+      text: '途中の追記',
+      writeEnabled: true,
+    })
+    const resumeAt = Date.now() + 60_000
+    expect(store.finishAppServerTurn({
+      jobId: running.id, epoch: running.controlEpoch, executorNonce: nonce,
+      threadId, turnId: 'turn-rate-terminal-pending-inbound', retainInput: true,
+      rateLimitResumeAt: resumeAt,
+      rateLimitReason: 'rate-limit',
+      rateLimitSafeToReplay: false,
+    })).toEqual({ closeInput: false, cancelled: false, pending: 0, pendingInbound: 1 })
+    expect(store.get(running.id)).toMatchObject({
+      activeTurnId: null,
+      rateLimitRecovery: { turnId: 'turn-rate-terminal-pending-inbound' },
+    })
+    expect(store.hasDurableRateLimitTerminal(running.id)).toBe(true)
+    store.requeueAt(running.id, resumeAt, 'rate limited', threadId, 'rate-limit')
+    expect(store.get(running.id)?.status).toBe('queued')
+    expect(store.claimNext('must-wait-for-inbound', 20, resumeAt + 1)).toBeNull()
+    store.close()
+  })
+
+  test('phase turnのrate-limit terminalもexact receiptからcrash recoveryする', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    store.enqueue(input({
+      messageId: 'phase-rate-terminal-recovery',
+      writeEnabled: true,
+    }))
+    const running = store.claimNext('phase-rate-terminal-worker')!
+    const snapshot = readAdvisorInputSnapshot(dir, running.id)
+    const nonce = '2'.repeat(32)
+    const threadId = 'thread-phase-rate-terminal'
+    store.beginInitialTurnDispatch({
+      jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+      executorNonce: nonce, threadId, requestId: 96,
+      inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+    })
+    store.acknowledgeInitialTurnDispatch({
+      jobId: running.id, workerId: running.workerId!, attempt: running.attempts,
+      epoch: running.controlEpoch, executorNonce: nonce, threadId,
+      turnId: 'turn-phase-prepare', requestId: 96,
+    })
+    store.finishAppServerTurn({
+      jobId: running.id, epoch: running.controlEpoch, executorNonce: nonce,
+      threadId, turnId: 'turn-phase-prepare', retainInput: true,
+    })
+    expect(store.prepareAppServerPhaseDispatch({
+      jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+      phaseSequence: 1, stage: 'implementation', logicalNonce: nonce, threadId,
+      inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+    })).toContain(':phase:1')
+    expect(store.beginAppServerPhaseDispatch({
+      jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+      phaseSequence: 1, logicalNonce: nonce, threadId, requestId: 97,
+      inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+    })).toBe('dispatching')
+    store.acknowledgeAppServerPhaseDispatch({
+      jobId: running.id, workerId: running.workerId!, attempt: running.attempts,
+      epoch: running.controlEpoch, phaseSequence: 1, logicalNonce: nonce, threadId,
+      turnId: 'turn-phase-implementation-rate', requestId: 97,
+    })
+    const resumeAt = Date.now() + 60_000
+    store.finishAppServerTurn({
+      jobId: running.id, epoch: running.controlEpoch, executorNonce: nonce,
+      threadId, turnId: 'turn-phase-implementation-rate', retainInput: true,
+      rateLimitResumeAt: resumeAt,
+      rateLimitReason: 'capacity',
+      rateLimitSafeToReplay: false,
+    })
+    expect(store.hasDurableRateLimitTerminal(running.id)).toBe(true)
+    store.close()
+
+    store = new JobStore(path)
+    expect(store.recoverInterrupted()).toEqual({
+      requeued: 1, failedWrites: 0, failedUncertain: 0,
+    })
+    expect(store.get(running.id)).toMatchObject({
+      status: 'queued', sessionId: threadId, notBefore: resumeAt,
+      rateLimitRecovery: {
+        attempt: running.attempts,
+        turnId: 'turn-phase-implementation-rate',
+        reason: 'capacity',
+      },
+    })
+    store.close()
+  })
+
+  test('interjection answerのrate-limit receiptはcrash recoveryと成功時consumeを両立する', () => {
+    const terminalFixture = (tag: string) => {
+      const dir = fixtureDir()
+      const path = join(dir, 'jobs.sqlite3')
+      const store = new JobStore(path)
+      store.enqueue(input({
+        messageId: `interjection-rate-${tag}`,
+        threadTs: tag === 'crash' ? '1800000000.710001' : '1800000000.710002',
+        writeEnabled: true,
+      }))
+      const running = store.claimNext(`interjection-rate-${tag}-worker`)!
+      const snapshot = readAdvisorInputSnapshot(dir, running.id)
+      const nonce = tag === 'crash' ? '3'.repeat(32) : '4'.repeat(32)
+      const threadId = `thread-interjection-rate-${tag}`
+      const target = store.liveControlTarget(running.chatId, running.threadTs)!
+      expect(store.stageLiveInterjection(target, {
+        chatId: running.chatId,
+        threadTs: running.threadTs,
+        messageId: tag === 'crash' ? '1800000000.711001' : '1800000000.711002',
+        userId: 'UOTHER',
+        task: '途中の質問です',
+        writeEnabled: false,
+        attachments: [],
+      })).toBe('staged')
+      const interjection = store.listJobInterjections(running.id)[0]!
+      store.beginInitialTurnDispatch({
+        jobId: running.id, attempt: running.attempts, epoch: running.controlEpoch,
+        executorNonce: nonce, threadId, requestId: 99,
+        inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+      })
+      store.acknowledgeInitialTurnDispatch({
+        jobId: running.id, workerId: running.workerId!, attempt: running.attempts,
+        epoch: running.controlEpoch, executorNonce: nonce, threadId,
+        turnId: `turn-interjection-parent-${tag}`, requestId: 99,
+      })
+      store.finishAppServerTurn({
+        jobId: running.id, epoch: running.controlEpoch, executorNonce: nonce,
+        threadId, turnId: `turn-interjection-parent-${tag}`, retainInput: true,
+      })
+      expect(store.prepareInterjectionAnswer({
+        interjectionId: interjection.id, jobId: running.id,
+        epoch: running.controlEpoch, logicalNonce: nonce, threadId,
+      })).toBe(`${interjection.id}:answer`)
+      expect(store.beginInterjectionAnswer({
+        interjectionId: interjection.id, jobId: running.id,
+        epoch: running.controlEpoch, logicalNonce: nonce, threadId, requestId: 100,
+      })).toBe('dispatching')
+      store.acknowledgeInterjectionAnswer({
+        interjectionId: interjection.id, jobId: running.id,
+        workerId: running.workerId!, epoch: running.controlEpoch,
+        logicalNonce: nonce, threadId,
+        turnId: `turn-interjection-answer-rate-${tag}`, requestId: 100,
+      })
+      const resumeAt = Date.now() + 60_000
+      store.finishAppServerTurn({
+        jobId: running.id, epoch: running.controlEpoch, executorNonce: nonce,
+        threadId, turnId: `turn-interjection-answer-rate-${tag}`, retainInput: true,
+        rateLimitResumeAt: resumeAt,
+        rateLimitReason: 'rate-limit',
+        rateLimitSafeToReplay: false,
+      })
+      expect(store.hasDurableRateLimitTerminal(running.id)).toBe(true)
+      expect(store.listJobInterjections(running.id)[0]).toMatchObject({
+        status: 'ready',
+        answerLogicalNonce: nonce,
+        answerThreadId: threadId,
+        answerTurnId: `turn-interjection-answer-rate-${tag}`,
+      })
+      return { dir, path, store, running, nonce, threadId, interjection, resumeAt }
+    }
+
+    const crashed = terminalFixture('crash')
+    crashed.store.close()
+    const recovered = new JobStore(crashed.path)
+    expect(recovered.recoverInterrupted()).toEqual({
+      requeued: 1, failedWrites: 0, failedUncertain: 0,
+    })
+    expect(recovered.get(crashed.running.id)).toMatchObject({
+      status: 'queued', sessionId: crashed.threadId, notBefore: crashed.resumeAt,
+    })
+
+    // Exercise the complete crash -> claim -> same-thread continuation ->
+    // interjection answer success lifecycle. The replacement attempt first
+    // observes a normal terminal on the resumed native thread, then answers
+    // the preserved ready interjection with a fresh exact dispatch binding.
+    const retried = recovered.claimNext(
+      'interjection-rate-crash-retry-worker',
+      20,
+      crashed.resumeAt + 1,
+    )!
+    expect(retried).toMatchObject({
+      attempts: 2,
+      resumed: true,
+      sessionId: crashed.threadId,
+      rateLimitRecovery: {
+        attempt: 1,
+        turnId: 'turn-interjection-answer-rate-crash',
+      },
+    })
+    const retrySnapshot = readAdvisorInputSnapshot(crashed.dir, retried.id)
+    const retryNonce = '7'.repeat(32)
+    expect(recovered.beginInitialTurnDispatch({
+      jobId: retried.id,
+      attempt: retried.attempts,
+      epoch: retried.controlEpoch,
+      executorNonce: retryNonce,
+      threadId: crashed.threadId,
+      requestId: 102,
+      inputRevision: retrySnapshot.revision,
+      inputDigest: retrySnapshot.digest,
+    })).toBe('dispatching')
+    recovered.acknowledgeInitialTurnDispatch({
+      jobId: retried.id,
+      workerId: retried.workerId!,
+      attempt: retried.attempts,
+      epoch: retried.controlEpoch,
+      executorNonce: retryNonce,
+      threadId: crashed.threadId,
+      turnId: 'turn-interjection-crash-retry-parent',
+      requestId: 102,
+    })
+    recovered.finishAppServerTurn({
+      jobId: retried.id,
+      epoch: retried.controlEpoch,
+      executorNonce: retryNonce,
+      threadId: crashed.threadId,
+      turnId: 'turn-interjection-crash-retry-parent',
+      retainInput: true,
+    })
+    expect(recovered.prepareInterjectionAnswer({
+      interjectionId: crashed.interjection.id,
+      jobId: retried.id,
+      epoch: retried.controlEpoch,
+      logicalNonce: retryNonce,
+      threadId: crashed.threadId,
+    })).toBe(`${crashed.interjection.id}:answer`)
+    expect(recovered.beginInterjectionAnswer({
+      interjectionId: crashed.interjection.id,
+      jobId: retried.id,
+      epoch: retried.controlEpoch,
+      logicalNonce: retryNonce,
+      threadId: crashed.threadId,
+      requestId: 103,
+    })).toBe('dispatching')
+    recovered.acknowledgeInterjectionAnswer({
+      interjectionId: crashed.interjection.id,
+      jobId: retried.id,
+      workerId: retried.workerId!,
+      epoch: retried.controlEpoch,
+      logicalNonce: retryNonce,
+      threadId: crashed.threadId,
+      turnId: 'turn-interjection-crash-retry-answer',
+      requestId: 103,
+    })
+    expect(recovered.stageInterjectionAnswer({
+      interjectionId: crashed.interjection.id,
+      jobId: retried.id,
+      epoch: retried.controlEpoch,
+      logicalNonce: retryNonce,
+      threadId: crashed.threadId,
+      turnId: 'turn-interjection-crash-retry-answer',
+      disposition: 'answer-only',
+      answer: 'クラッシュ後の回答です',
+    })).toBe('staged')
+    expect(recovered.get(retried.id)).toMatchObject({
+      activeTurnId: null,
+      notBefore: null,
+      rateLimitRecovery: null,
+    })
+    recovered.close()
+
+    const successful = terminalFixture('success')
+    expect(successful.store.prepareInterjectionAnswer({
+      interjectionId: successful.interjection.id,
+      jobId: successful.running.id,
+      epoch: successful.running.controlEpoch,
+      logicalNonce: successful.nonce,
+      threadId: successful.threadId,
+    })).toBe(`${successful.interjection.id}:answer`)
+    expect(successful.store.beginInterjectionAnswer({
+      interjectionId: successful.interjection.id,
+      jobId: successful.running.id,
+      epoch: successful.running.controlEpoch,
+      logicalNonce: successful.nonce,
+      threadId: successful.threadId,
+      requestId: 101,
+    })).toBe('dispatching')
+    successful.store.acknowledgeInterjectionAnswer({
+      interjectionId: successful.interjection.id,
+      jobId: successful.running.id,
+      workerId: successful.running.workerId!,
+      epoch: successful.running.controlEpoch,
+      logicalNonce: successful.nonce,
+      threadId: successful.threadId,
+      turnId: 'turn-interjection-answer-success',
+      requestId: 101,
+    })
+    expect(successful.store.stageInterjectionAnswer({
+      interjectionId: successful.interjection.id,
+      jobId: successful.running.id,
+      epoch: successful.running.controlEpoch,
+      logicalNonce: successful.nonce,
+      threadId: successful.threadId,
+      turnId: 'turn-interjection-answer-success',
+      disposition: 'answer-only',
+      answer: '回答です',
+    })).toBe('staged')
+    expect(successful.store.get(successful.running.id)).toMatchObject({
+      activeTurnId: null,
+      notBefore: null,
+      rateLimitRecovery: null,
+    })
+    successful.store.close()
+  })
+
+  test('terminal receiptは複数回のpre-delivery retry後もcontinuation制約を保持する', () => {
+    const dir = fixtureDir()
+    const store = new JobStore(join(dir, 'jobs.sqlite3'))
+    store.enqueue(input({
+      messageId: 'rate-terminal-multiple-pre-delivery',
+      writeEnabled: true,
+    }))
+    const first = store.claimNext('rate-terminal-first-worker')!
+    const firstSnapshot = readAdvisorInputSnapshot(dir, first.id)
+    const firstNonce = '5'.repeat(32)
+    const threadId = 'thread-rate-terminal-multiple-pre-delivery'
+    store.beginInitialTurnDispatch({
+      jobId: first.id, attempt: first.attempts, epoch: first.controlEpoch,
+      executorNonce: firstNonce, threadId, requestId: 102,
+      inputRevision: firstSnapshot.revision, inputDigest: firstSnapshot.digest,
+    })
+    store.acknowledgeInitialTurnDispatch({
+      jobId: first.id, workerId: first.workerId!, attempt: first.attempts,
+      epoch: first.controlEpoch, executorNonce: firstNonce, threadId,
+      turnId: 'turn-rate-terminal-multiple-pre-delivery', requestId: 102,
+    })
+    const terminalResumeAt = Date.now() - 1
+    store.finishAppServerTurn({
+      jobId: first.id, epoch: first.controlEpoch, executorNonce: firstNonce,
+      threadId, turnId: 'turn-rate-terminal-multiple-pre-delivery', retainInput: true,
+      rateLimitResumeAt: terminalResumeAt,
+      rateLimitReason: 'capacity',
+      rateLimitSafeToReplay: false,
+    })
+    store.requeueAt(first.id, terminalResumeAt, 'terminal capacity', threadId, 'capacity')
+    const second = store.claimNext('rate-terminal-second-worker', 20, Date.now())!
+    expect(second.attempts).toBe(2)
+    // Attempt 2 has not written thread/start yet, so another transient retry
+    // is safe while the original terminal receipt remains the authority.
+    store.requeueAt(
+      second.id, Date.now() - 1, 'pre-delivery capacity retry', threadId, 'capacity',
+    )
+    const third = store.claimNext('rate-terminal-third-worker', 20, Date.now())!
+    expect(third).toMatchObject({
+      attempts: 3,
+      resumed: true,
+      sessionId: threadId,
+      rateLimitRecovery: { attempt: 1, turnId: 'turn-rate-terminal-multiple-pre-delivery' },
+    })
+    const thirdPrompt = buildCodexWorkerPrompt(
+      third,
+      readAdvisorInputSnapshot(dir, third.id),
+      {
+        attemptNonce: '6'.repeat(32),
+        artifactDir: join(dir, 'artifacts'),
+        advisorEnabled: false,
+      },
+    )
+    expect(thirdPrompt).toContain('Rate-limit continuation (trusted host state)')
+    expect(thirdPrompt).toContain('Do not blindly replay commands, edits, Git operations')
+    store.close()
+  })
+
+  test('terminal receiptを継承した未送達attemptはdaemon crash後も再queueする', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    store.enqueue(input({
+      messageId: 'rate-terminal-pre-delivery-crash',
+      writeEnabled: true,
+    }))
+    const first = store.claimNext('rate-terminal-pre-crash-first')!
+    const firstSnapshot = readAdvisorInputSnapshot(dir, first.id)
+    const firstNonce = '8'.repeat(32)
+    const threadId = 'thread-rate-terminal-pre-delivery-crash'
+    store.beginInitialTurnDispatch({
+      jobId: first.id,
+      attempt: first.attempts,
+      epoch: first.controlEpoch,
+      executorNonce: firstNonce,
+      threadId,
+      requestId: 104,
+      inputRevision: firstSnapshot.revision,
+      inputDigest: firstSnapshot.digest,
+    })
+    store.acknowledgeInitialTurnDispatch({
+      jobId: first.id,
+      workerId: first.workerId!,
+      attempt: first.attempts,
+      epoch: first.controlEpoch,
+      executorNonce: firstNonce,
+      threadId,
+      turnId: 'turn-rate-terminal-pre-delivery-crash',
+      requestId: 104,
+    })
+    const resumeAt = Date.now() - 1
+    store.finishAppServerTurn({
+      jobId: first.id,
+      epoch: first.controlEpoch,
+      executorNonce: firstNonce,
+      threadId,
+      turnId: 'turn-rate-terminal-pre-delivery-crash',
+      retainInput: true,
+      rateLimitResumeAt: resumeAt,
+      rateLimitReason: 'capacity',
+      rateLimitSafeToReplay: false,
+    })
+    store.requeueAt(first.id, resumeAt, 'first terminal capacity', threadId, 'capacity')
+    const second = store.claimNext('rate-terminal-pre-crash-second', 20, Date.now())!
+    expect(second).toMatchObject({
+      attempts: 2,
+      resumed: true,
+      sessionId: threadId,
+      rateLimitRecovery: {
+        attempt: 1,
+        turnId: 'turn-rate-terminal-pre-delivery-crash',
+      },
+    })
+    expect(store.initialTurnDispatchIsSafeToRetry(second.id)).toBe(true)
+    store.close()
+
+    // The replacement process died before thread/start was written. The old
+    // terminal remains the authority and the untouched attempt-2 prepared
+    // receipt makes this exact crash window replay-safe.
+    store = new JobStore(path)
+    expect(store.recoverInterrupted()).toEqual({
+      requeued: 1,
+      failedWrites: 0,
+      failedUncertain: 0,
+    })
+    expect(store.get(second.id)).toMatchObject({
+      status: 'queued',
+      attempts: 2,
+      sessionId: threadId,
+      notBefore: resumeAt,
+      rateLimitRecovery: {
+        attempt: 1,
+        turnId: 'turn-rate-terminal-pre-delivery-crash',
+      },
+    })
+    const third = store.claimNext('rate-terminal-pre-crash-third', 20, Date.now())!
+    expect(third).toMatchObject({ attempts: 3, resumed: true, sessionId: threadId })
+    const prompt = buildCodexWorkerPrompt(
+      third,
+      readAdvisorInputSnapshot(dir, third.id),
+      {
+        attemptNonce: '9'.repeat(32),
+        artifactDir: join(dir, 'artifacts'),
+        advisorEnabled: false,
+      },
+    )
+    expect(prompt).toContain('Rate-limit continuation (trusted host state)')
+    expect(prompt).toContain('Do not blindly replay commands, edits, Git operations')
+    store.close()
   })
 
   test('uncorrelated App Server rate-limitもcrash前に再開可能状態へ固定する', () => {
@@ -6348,6 +7167,8 @@ describe('single FIFO worker', () => {
           turnId: 'turn-capacity-safe',
           retainInput: true,
           rateLimitResumeAt: Date.now() + 60_000,
+          rateLimitReason: 'capacity',
+          rateLimitSafeToReplay: true,
         })
         throw new CodexRateLimitError(
           'Selected model is at capacity',
@@ -8908,9 +9729,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('advisor_round phase=investigation')
     expect(instructions).toContain('returned slotSummary')
     expect(instructions).toContain('legacy separate design phase')
-    expect(instructions).toContain('solution_analyst with model=gpt-6-astra')
+    expect(instructions).toContain('solution_analyst with model=gpt-6-astra,')
+    expect(instructions).toContain('reasoning_effort=medium')
     expect(instructions).toContain('risk_reviewer with')
-    expect(instructions).toContain('model=gpt-5.6-sol and fork_turns=none')
+    expect(instructions).toContain('model=gpt-6-astra, reasoning_effort=low')
     expect(instructions).toContain('Minor findings, missing advisor responses, or infrastructure failures never')
     expect(instructions).toContain('Never call review round 3')
     expect(instructions).not.toContain('Do not push or create a PR')
@@ -8932,8 +9754,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(advised).toContain('Advisor transport: zerokun_advisors')
     expect(advised).toContain('Base any advisor-count statement only on slotSummary')
     expect(advised).toContain('legacy design phase')
-    expect(advised).toContain('solution_analyst with model=gpt-6-astra')
-    expect(advised).toContain('risk_reviewer with model=gpt-5.6-sol')
+    expect(advised).toContain('solution_analyst with model=gpt-6-astra,')
+    expect(advised).toContain('reasoning_effort=medium')
+    expect(advised).toContain('risk_reviewer with model=gpt-6-astra, reasoning_effort=low')
     expect(advised).toContain('fork_turns=none')
     expect(advised).toContain('unavailability, and infrastructure failures do not trigger round 2')
     expect(advised).toContain('Never call round 3')
@@ -10915,9 +11738,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       ]) expect(overrides).toContain(`${JSON.stringify(slackDomain)}="deny"`)
       expect(overrides).toContain('features.apps=false')
       expect(overrides.split('\n').filter(value => value.startsWith('model=')))
-        .toEqual(['model="gpt-5.6-sol"'])
+        .toEqual(['model="gpt-6-astra"'])
       expect(overrides.split('\n').filter(value => value.startsWith('model_reasoning_effort=')))
-        .toEqual(['model_reasoning_effort="xhigh"'])
+        .toEqual(['model_reasoning_effort="low"'])
       expect(overrides).toContain('features.plugins=false')
       expect(overrides).toContain('features.goals=false')
       expect(overrides).toContain('features.browser_use=true')

@@ -543,6 +543,26 @@ export interface JobRecord {
   uiApprovalRequestId: string | null
   /** Trusted host context injected only for a same-job publication recovery. */
   githubPublicationRecovery?: GitHubPublicationRecoveryContext
+  /**
+   * Authoritative terminal receipt from the immediately preceding rate-limited
+   * App Server turn.  A retry may use it only when every durable binding still
+   * matches; `notBefore` by itself is never write-retry authority.
+   */
+  rateLimitRecovery?: CodexRateLimitTerminalReceipt | null
+}
+
+export type CodexRateLimitTerminalReceipt = {
+  version: 1
+  jobId: string
+  attempt: number
+  controlEpoch: number
+  executorNonce: string
+  threadId: string
+  turnId: string
+  resumeAt: number
+  reason: 'rate-limit' | 'capacity'
+  safeToReplay: boolean
+  recordedAt: number
 }
 
 export type ThreadAttachmentRecord = {
@@ -616,6 +636,7 @@ type JobRow = {
   cancel_requested_at: number | null
   terminal_outcome: JobTerminalOutcome | null
   ui_approval_request_id: string | null
+  rate_limit_terminal_json: string | null
 }
 
 type UiApprovalRequestRow = {
@@ -727,6 +748,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   ,cancel_requested_at INTEGER
   ,terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'failed', 'cancelled'))
   ,ui_approval_request_id TEXT
+  ,rate_limit_terminal_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status_seq ON jobs(status, seq);
 CREATE INDEX IF NOT EXISTS idx_jobs_thread_seq ON jobs(chat_id, thread_ts, seq);
@@ -1916,6 +1938,7 @@ function ensureJobSchemaMigrations(db: Database): void {
       "TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'failed', 'cancelled'))",
     ],
     ['ui_approval_request_id', 'TEXT'],
+    ['rate_limit_terminal_json', 'TEXT'],
   ] as const) {
     const current = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
     if (current.some(column => column.name === name)) continue
@@ -1926,6 +1949,86 @@ function ensureJobSchemaMigrations(db: Database): void {
       if (!migrated.some(column => column.name === name)) throw error
     }
   }
+  // Releases before the durable terminal receipt stored only `not_before`.
+  // Backfill solely the exact post-finishTurn crash shape: an observed initial
+  // terminal has released active_turn_id, retained the same current-protocol
+  // thread and executor binding, and no result/cancellation was staged.  A
+  // mere non-terminal App Server `error` keeps active_turn_id bound and is
+  // deliberately excluded.  Running this check at every open also handles a
+  // database that was first opened by the old runner during a rolling update.
+  const backfillLegacyRateLimitTerminals = db.transaction(() => {
+    const rows = db.query<{
+      id: string
+      attempts: number
+      control_epoch: number
+      executor_nonce: string
+      session_id: string
+      active_thread_id: string
+      not_before: number
+      turn_id: string
+      observed_at: number
+    }, [number]>(
+      `SELECT jobs.id, jobs.attempts, jobs.control_epoch, jobs.executor_nonce,
+              jobs.session_id, jobs.active_thread_id, jobs.not_before,
+              receipts.turn_id, receipts.observed_at
+       FROM jobs
+       JOIN job_initial_dispatches AS receipts
+         ON receipts.job_id = jobs.id AND receipts.attempt = jobs.attempts
+       JOIN codex_session_protocols AS protocols
+         ON protocols.session_id = jobs.session_id AND protocols.protocol_version = ?
+       WHERE jobs.runtime = 'codex' AND jobs.status = 'running'
+         AND jobs.write_enabled = 1 AND jobs.not_before IS NOT NULL
+         AND jobs.session_id IS NOT NULL AND jobs.active_thread_id = jobs.session_id
+         AND jobs.active_turn_id IS NULL AND jobs.executor_pid IS NULL
+         AND jobs.executor_nonce IS NOT NULL AND jobs.worker_id IS NOT NULL
+         AND jobs.accepts_control = 1 AND jobs.cancel_requested_at IS NULL
+         AND jobs.pending_session_id IS NULL AND jobs.pending_result IS NULL
+         AND jobs.terminal_outcome IS NULL AND jobs.rate_limit_terminal_json IS NULL
+         AND receipts.control_epoch = jobs.control_epoch
+         AND receipts.status = 'observed' AND receipts.observed_at IS NOT NULL
+         AND receipts.executor_nonce = jobs.executor_nonce
+         AND receipts.app_thread_id = jobs.active_thread_id
+         AND receipts.turn_id IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM job_phase_dispatches AS phases
+           WHERE phases.job_id = jobs.id AND phases.attempt = jobs.attempts
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM job_controls AS controls
+           WHERE controls.job_id = jobs.id AND controls.control_epoch = jobs.control_epoch
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM job_interjections AS interjections
+           WHERE interjections.job_id = jobs.id
+             AND interjections.control_epoch = jobs.control_epoch
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM inbound_deliveries AS inbound
+           WHERE inbound.chat_id = jobs.chat_id AND inbound.thread_ts = jobs.thread_ts
+         )`,
+    ).all(CODEX_SESSION_PROTOCOL_VERSION)
+    for (const row of rows) {
+      const receipt = serializeCodexRateLimitTerminalReceipt({
+        version: 1,
+        jobId: row.id,
+        attempt: row.attempts,
+        controlEpoch: row.control_epoch,
+        executorNonce: row.executor_nonce,
+        threadId: row.session_id,
+        turnId: row.turn_id,
+        resumeAt: row.not_before,
+        reason: 'rate-limit',
+        safeToReplay: false,
+        recordedAt: row.observed_at,
+      })
+      db.run(
+        `UPDATE jobs SET rate_limit_terminal_json = ?
+         WHERE id = ? AND status = 'running' AND rate_limit_terminal_json IS NULL`,
+        [receipt, row.id],
+      )
+    }
+  })
+  backfillLegacyRateLimitTerminals.immediate()
   for (const [name, definition] of [
     ['prompt_client_message_id', "TEXT NOT NULL DEFAULT ''"],
     ['prompt_delivery_started_at', 'INTEGER'],
@@ -2634,6 +2737,59 @@ function mapInboundDeliveryRow(row: InboundDeliveryRow): InboundDeliveryRecord {
   }
 }
 
+function parseCodexRateLimitTerminalReceipt(
+  value: string | null | undefined,
+): CodexRateLimitTerminalReceipt | null {
+  if (value === null || value === undefined) return null
+  let parsed: unknown
+  try { parsed = JSON.parse(value) } catch { return null }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  const receipt = parsed as Record<string, unknown>
+  const exactKeys = [
+    'version', 'jobId', 'attempt', 'controlEpoch', 'executorNonce', 'threadId',
+    'turnId', 'resumeAt', 'reason', 'safeToReplay', 'recordedAt',
+  ].sort()
+  if (JSON.stringify(Object.keys(receipt).sort()) !== JSON.stringify(exactKeys)
+    || receipt.version !== 1
+    || typeof receipt.jobId !== 'string' || receipt.jobId.length === 0
+    || receipt.jobId.length > 256
+    || !Number.isSafeInteger(receipt.attempt) || Number(receipt.attempt) < 1
+    || !Number.isSafeInteger(receipt.controlEpoch) || Number(receipt.controlEpoch) < 1
+    || typeof receipt.executorNonce !== 'string' || receipt.executorNonce.length === 0
+    || receipt.executorNonce.length > 256
+    || typeof receipt.threadId !== 'string' || receipt.threadId.length === 0
+    || receipt.threadId.length > 256
+    || typeof receipt.turnId !== 'string' || receipt.turnId.length === 0
+    || receipt.turnId.length > 256
+    || !Number.isSafeInteger(receipt.resumeAt) || Number(receipt.resumeAt) <= 0
+    || (receipt.reason !== 'rate-limit' && receipt.reason !== 'capacity')
+    || typeof receipt.safeToReplay !== 'boolean'
+    || !Number.isSafeInteger(receipt.recordedAt) || Number(receipt.recordedAt) <= 0) {
+    return null
+  }
+  return {
+    version: 1,
+    jobId: receipt.jobId,
+    attempt: Number(receipt.attempt),
+    controlEpoch: Number(receipt.controlEpoch),
+    executorNonce: receipt.executorNonce,
+    threadId: receipt.threadId,
+    turnId: receipt.turnId,
+    resumeAt: Number(receipt.resumeAt),
+    reason: receipt.reason,
+    safeToReplay: receipt.safeToReplay,
+    recordedAt: Number(receipt.recordedAt),
+  }
+}
+
+function serializeCodexRateLimitTerminalReceipt(
+  receipt: CodexRateLimitTerminalReceipt,
+): string {
+  const parsed = parseCodexRateLimitTerminalReceipt(JSON.stringify(receipt))
+  if (!parsed) throw new Error('Codex rate-limit terminal receipt is invalid')
+  return JSON.stringify(parsed)
+}
+
 type SlackThreadReplyIntentRow = {
   idempotency_key: string
   chat_id: string
@@ -2728,6 +2884,7 @@ function mapRow(row: JobRow): JobRecord {
     cancelRequestedAt: row.cancel_requested_at,
     terminalOutcome: row.terminal_outcome,
     uiApprovalRequestId: row.ui_approval_request_id,
+    rateLimitRecovery: parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json),
   }
 }
 
@@ -7906,7 +8063,8 @@ export class JobStore {
         throw new Error(`interjection answer was not staged: ${options.interjectionId}`)
       }
       const released = this.db.run(
-        `UPDATE jobs SET active_turn_id = NULL
+        `UPDATE jobs SET active_turn_id = NULL,
+           not_before = NULL, rate_limit_terminal_json = NULL
          WHERE id = ? AND control_epoch = ? AND executor_nonce = ?
            AND active_thread_id = ? AND active_turn_id = ?`,
         [options.jobId, Math.floor(options.epoch), options.logicalNonce,
@@ -7928,11 +8086,18 @@ export class JobStore {
     turnId: string
     retainInput?: boolean
     rateLimitResumeAt?: number
+    rateLimitReason?: 'rate-limit' | 'capacity'
+    rateLimitSafeToReplay?: boolean
   }): { closeInput: boolean; cancelled: boolean; pending: number; pendingInbound: number } {
     if (options.rateLimitResumeAt !== undefined
       && (!Number.isSafeInteger(options.rateLimitResumeAt)
         || options.rateLimitResumeAt <= 0)) {
       throw new Error('App Server rate-limit resume time is invalid')
+    }
+    const hasRateLimitTerminal = options.rateLimitResumeAt !== undefined
+    if (hasRateLimitTerminal !== (options.rateLimitReason !== undefined)
+      || hasRateLimitTerminal !== (options.rateLimitSafeToReplay !== undefined)) {
+      throw new Error('App Server rate-limit terminal binding is incomplete')
     }
     const finish = this.db.transaction(() => {
       const job = this.db.query<{
@@ -8041,10 +8206,6 @@ export class JobStore {
         this.db.run(
           `UPDATE job_interjections
            SET status = CASE WHEN paused_at IS NULL THEN 'ready' ELSE 'paused' END,
-               answer_request_id = NULL, answer_logical_nonce = NULL,
-               answer_thread_id = NULL, answer_turn_id = NULL,
-               answer_prepared_at = NULL, answer_dispatched_at = NULL,
-               answer_acknowledged_at = NULL,
                last_error = 'answer turn reached a rate-limit terminal and may retry'
            WHERE job_id = ? AND control_epoch = ? AND status = 'answering'
              AND answer_logical_nonce = ? AND answer_thread_id = ? AND answer_turn_id = ?`,
@@ -8075,7 +8236,29 @@ export class JobStore {
       // exist, even at a retainInput phase boundary, because the executor must
       // call finishAppServerTurn again after that conversion settles.  Once the
       // inbound ledger is empty the next call releases the terminal binding.
-      const holdTerminalBinding = !cancelled && pendingInbound > 0
+      // A rate-limited turn is already authoritative and the executor exits
+      // immediately after this barrier. Release it even while an inbound row
+      // is being converted; the queue predicate will keep the retry dormant
+      // until that durable inbound delivery is incorporated.
+      const holdTerminalBinding = !hasRateLimitTerminal && !cancelled && pendingInbound > 0
+      const terminalReceipt = hasRateLimitTerminal
+        ? serializeCodexRateLimitTerminalReceipt({
+            version: 1,
+            jobId: options.jobId,
+            attempt: job.attempts,
+            controlEpoch: Math.floor(options.epoch),
+            executorNonce: options.executorNonce,
+            threadId: options.threadId,
+            turnId: options.turnId,
+            resumeAt: options.rateLimitResumeAt!,
+            reason: options.rateLimitReason!,
+            safeToReplay: options.rateLimitSafeToReplay!,
+            recordedAt: now,
+          })
+        : null
+      if (hasRateLimitTerminal) {
+        this.recordCodexSessionUse(options.threadId, options.jobId, now)
+      }
       this.db.run(
         `UPDATE status_notifications
          SET superseded_at = COALESCE(superseded_at, ?)
@@ -8095,13 +8278,14 @@ export class JobStore {
       this.db.run(
         `UPDATE jobs SET accepts_control = ?,
            active_turn_id = CASE WHEN ? THEN active_turn_id ELSE NULL END,
-           not_before = COALESCE(?, not_before),
+           not_before = ?, rate_limit_terminal_json = ?,
            session_id = CASE WHEN ? IS NULL THEN session_id ELSE ? END
          WHERE id = ? AND control_epoch = ?`,
         [
           cancelled ? 0 : (retainInput || pending > 0 || pendingInbound > 0 ? 1 : 0),
           holdTerminalBinding ? 1 : 0,
           options.rateLimitResumeAt ?? null,
+          terminalReceipt,
           options.rateLimitResumeAt ?? null,
           options.threadId,
           options.jobId,
@@ -8971,6 +9155,187 @@ export class JobStore {
        WHERE sets.job_id = ? AND jobs.runtime = 'codex'
          AND jobs.status = 'running' AND jobs.pending_result IS NOT NULL`,
     ).get(jobId))
+  }
+
+  private durableRateLimitTerminalForRunningJob(
+    jobIdInput: string,
+  ): CodexRateLimitTerminalReceipt | null {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const row = this.db.query<JobRow, [string]>(
+      `SELECT * FROM jobs
+       WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+    ).get(jobId)
+    if (!row) return null
+    const receipt = parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json)
+    if (!receipt
+      || receipt.jobId !== row.id
+      || receipt.attempt !== row.attempts
+      || receipt.controlEpoch !== row.control_epoch
+      || receipt.executorNonce !== row.executor_nonce
+      || receipt.threadId !== row.session_id
+      || receipt.threadId !== row.active_thread_id
+      || receipt.resumeAt !== row.not_before
+      || row.active_turn_id !== null
+      || row.executor_pid !== null
+      || row.pending_session_id !== null
+      || row.pending_result !== null
+      || row.cancel_requested_at !== null
+      || row.terminal_outcome !== null) return null
+    const dispatch = this.db.query<{
+      status: string
+      control_epoch: number
+      executor_nonce: string | null
+      app_thread_id: string | null
+      turn_id: string | null
+      observed_at: number | null
+    }, [string, number]>(
+      `SELECT status, control_epoch, executor_nonce, app_thread_id, turn_id, observed_at
+       FROM job_initial_dispatches WHERE job_id = ? AND attempt = ?`,
+    ).get(row.id, row.attempts)
+    const initialDispatchMatches = dispatch?.status === 'observed'
+      && dispatch.observed_at !== null
+      && dispatch.control_epoch === receipt.controlEpoch
+      && dispatch.executor_nonce === receipt.executorNonce
+      && dispatch.app_thread_id === receipt.threadId
+      && dispatch.turn_id === receipt.turnId
+    const phaseDispatch = this.db.query<{
+      status: string
+      control_epoch: number
+      logical_nonce: string
+      app_thread_id: string
+      turn_id: string | null
+      observed_at: number | null
+    }, [string, number, string]>(
+      `SELECT status, control_epoch, logical_nonce, app_thread_id, turn_id, observed_at
+       FROM job_phase_dispatches
+       WHERE job_id = ? AND attempt = ? AND turn_id = ?`,
+    ).get(row.id, row.attempts, receipt.turnId)
+    const phaseDispatchMatches = phaseDispatch?.status === 'observed'
+      && phaseDispatch.observed_at !== null
+      && phaseDispatch.control_epoch === receipt.controlEpoch
+      && phaseDispatch.logical_nonce === receipt.executorNonce
+      && phaseDispatch.app_thread_id === receipt.threadId
+      && phaseDispatch.turn_id === receipt.turnId
+    const interjectionDispatches = this.db.query<{
+      status: string
+      control_epoch: number
+      answer_request_id: number | null
+      answer_logical_nonce: string | null
+      answer_thread_id: string | null
+      answer_turn_id: string | null
+      answer_dispatched_at: number | null
+      answer_acknowledged_at: number | null
+    }, [string, number, string]>(
+      `SELECT status, control_epoch, answer_request_id, answer_logical_nonce,
+              answer_thread_id, answer_turn_id, answer_dispatched_at,
+              answer_acknowledged_at
+       FROM job_interjections
+       WHERE job_id = ? AND control_epoch = ? AND answer_turn_id = ?`,
+    ).all(row.id, receipt.controlEpoch, receipt.turnId)
+    const interjectionDispatchMatches = interjectionDispatches.length === 1
+      && ['ready', 'paused'].includes(interjectionDispatches[0]!.status)
+      && interjectionDispatches[0]!.control_epoch === receipt.controlEpoch
+      && interjectionDispatches[0]!.answer_request_id !== null
+      && interjectionDispatches[0]!.answer_logical_nonce === receipt.executorNonce
+      && interjectionDispatches[0]!.answer_thread_id === receipt.threadId
+      && interjectionDispatches[0]!.answer_turn_id === receipt.turnId
+      && interjectionDispatches[0]!.answer_dispatched_at !== null
+      && interjectionDispatches[0]!.answer_acknowledged_at !== null
+    if (!initialDispatchMatches && !phaseDispatchMatches && !interjectionDispatchMatches) {
+      return null
+    }
+    const currentProtocol = this.db.query<{ present: number }, [string, number]>(
+      `SELECT 1 AS present FROM codex_session_protocols
+       WHERE session_id = ? AND protocol_version = ?`,
+    ).get(receipt.threadId, CODEX_SESSION_PROTOCOL_VERSION)
+    return currentProtocol ? receipt : null
+  }
+
+  hasDurableRateLimitTerminal(jobId: string): boolean {
+    return this.durableRateLimitTerminalForRunningJob(jobId) !== null
+  }
+
+  /**
+   * A terminal receipt belongs to the turn that actually hit the limit, not
+   * to later attempts that have not written their initial turn yet. Preserve
+   * that authority across any number of prepared/rejected attempts so a
+   * daemon crash in the pre-delivery window cannot turn a known continuation
+   * into an uncertain write failure.
+   */
+  private carriedRateLimitTerminalForUndeliveredAttempt(
+    jobIdInput: string,
+  ): CodexRateLimitTerminalReceipt | null {
+    const jobId = requireText(jobIdInput, 'jobId')
+    const row = this.db.query<JobRow, [string]>(
+      `SELECT * FROM jobs
+       WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+    ).get(jobId)
+    if (!row) return null
+    const receipt = parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json)
+    if (!receipt
+      || receipt.jobId !== row.id
+      || receipt.attempt >= row.attempts
+      || receipt.controlEpoch !== row.control_epoch
+      || receipt.threadId !== row.session_id
+      || row.resumed !== 1
+      || row.executor_nonce !== null
+      || row.active_thread_id !== null
+      || row.active_turn_id !== null
+      || row.executor_pid !== null
+      || row.not_before !== null
+      || row.pending_session_id !== null
+      || row.pending_result !== null
+      || row.cancel_requested_at !== null
+      || row.terminal_outcome !== null) return null
+    const currentInitial = this.db.query<{
+      status: string
+      control_epoch: number
+    }, [string, number]>(
+      `SELECT status, control_epoch FROM job_initial_dispatches
+       WHERE job_id = ? AND attempt = ?`,
+    ).get(row.id, row.attempts)
+    if (!currentInitial
+      || !['prepared', 'rejected'].includes(currentInitial.status)
+      || currentInitial.control_epoch !== receipt.controlEpoch) return null
+    const currentPhase = this.db.query<{ present: number }, [string, number]>(
+      `SELECT 1 AS present FROM job_phase_dispatches
+       WHERE job_id = ? AND attempt = ? LIMIT 1`,
+    ).get(row.id, row.attempts)
+    if (currentPhase) return null
+    const sourceDispatch = this.db.query<{ present: number }, [
+      string, number, number, string, string, string,
+      string, number, number, string, string, string,
+      string, number, string, string, string,
+    ]>(
+      `SELECT 1 AS present FROM job_initial_dispatches
+       WHERE job_id = ? AND attempt = ? AND control_epoch = ?
+         AND status = 'observed' AND executor_nonce = ?
+         AND app_thread_id = ? AND turn_id = ? AND observed_at IS NOT NULL
+       UNION ALL
+       SELECT 1 AS present FROM job_phase_dispatches
+       WHERE job_id = ? AND attempt = ? AND control_epoch = ?
+         AND status = 'observed' AND logical_nonce = ?
+         AND app_thread_id = ? AND turn_id = ? AND observed_at IS NOT NULL
+       UNION ALL
+       SELECT 1 AS present FROM job_interjections
+       WHERE job_id = ? AND control_epoch = ? AND status IN ('ready', 'paused')
+         AND answer_request_id IS NOT NULL AND answer_logical_nonce = ?
+         AND answer_thread_id = ? AND answer_turn_id = ?
+         AND answer_dispatched_at IS NOT NULL AND answer_acknowledged_at IS NOT NULL
+       LIMIT 1`,
+    ).get(
+      row.id, receipt.attempt, receipt.controlEpoch, receipt.executorNonce,
+      receipt.threadId, receipt.turnId,
+      row.id, receipt.attempt, receipt.controlEpoch, receipt.executorNonce,
+      receipt.threadId, receipt.turnId,
+      row.id, receipt.controlEpoch, receipt.executorNonce,
+      receipt.threadId, receipt.turnId,
+    )
+    const currentProtocol = this.db.query<{ present: number }, [string, number]>(
+      `SELECT 1 AS present FROM codex_session_protocols
+       WHERE session_id = ? AND protocol_version = ?`,
+    ).get(receipt.threadId, CODEX_SESSION_PROTOCOL_VERSION)
+    return sourceDispatch && currentProtocol ? receipt : null
   }
 
   pendingGitHubPublications(jobId: string): PendingGitHubPublication[] {
@@ -12276,8 +12641,47 @@ export class JobStore {
       ? undefined
       : requireText(sessionId, 'sessionId')
     const requeue = this.db.transaction(() => {
-      if (persistedSessionId) {
-        this.recordCodexSessionUse(persistedSessionId, id, Date.now())
+      const current = this.db.query<{
+        attempts: number
+        write_enabled: number
+        not_before: number | null
+      }, [string]>(
+        `SELECT attempts, write_enabled, not_before FROM jobs
+         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+      ).get(id)
+      const initialReceipt = current
+        ? this.db.query<{ status: string }, [string, number]>(
+            `SELECT status FROM job_initial_dispatches
+             WHERE job_id = ? AND attempt = ?`,
+          ).get(id, current.attempts)
+        : null
+      const preDeliveryRetry = initialReceipt?.status === 'prepared'
+        || initialReceipt?.status === 'rejected'
+      const legacyReadOnlyRetry = current?.write_enabled === 0
+        && current.not_before !== null
+        && (initialReceipt?.status === 'acknowledged' || initialReceipt?.status === 'observed')
+      const terminalRateLimitReceipt = this.durableRateLimitTerminalForRunningJob(id)
+      const terminalRateLimitRetry = terminalRateLimitReceipt !== null
+      const publicationRetry = transientReason === 'github'
+        && (preDeliveryRetry || initialReceipt?.status === 'observed' || legacyReadOnlyRetry)
+      const transientRetry = transientReason !== 'github'
+        && (preDeliveryRetry || terminalRateLimitRetry || legacyReadOnlyRetry)
+      if (!current || (!publicationRetry && !transientRetry)) return 0
+      if (terminalRateLimitReceipt
+        && (transientReason !== terminalRateLimitReceipt.reason
+          || (persistedSessionId !== undefined
+            && persistedSessionId !== terminalRateLimitReceipt.threadId))) {
+        return 0
+      }
+      // Once an authoritative terminal receipt exists, every carried value is
+      // sourced from that receipt rather than from the later exception path.
+      // This keeps a delayed catch (or a clamped reset timestamp) from
+      // detaching the queued attempt from the exact terminal it is continuing.
+      const nextSessionId = terminalRateLimitReceipt?.threadId ?? persistedSessionId
+      const nextNotBefore = terminalRateLimitReceipt?.resumeAt ?? notBefore
+      const nextTransientReason = terminalRateLimitReceipt?.reason ?? transientReason
+      if (nextSessionId) {
+        this.recordCodexSessionUse(nextSessionId, id, Date.now())
       }
       const updated = this.db.run(
         `UPDATE jobs
@@ -12291,11 +12695,9 @@ export class JobStore {
            AND EXISTS (
              SELECT 1 FROM job_initial_dispatches receipts
              WHERE receipts.job_id = jobs.id AND receipts.attempt = jobs.attempts
-               AND (receipts.status IN ('prepared', 'rejected', 'observed')
-                 OR (jobs.write_enabled = 0 AND jobs.not_before IS NOT NULL
-                   AND receipts.status = 'acknowledged'))
+               AND receipts.status IN ('prepared', 'rejected', 'acknowledged', 'observed')
            )`,
-        [persistedSessionId ?? null, notBefore, reason, id],
+        [nextSessionId ?? null, nextNotBefore, reason, id],
       )
       if (updated.changes === 1) {
         this.supersedeLifecycleNotifications(id)
@@ -12308,12 +12710,12 @@ export class JobStore {
         ).get(id)
         if (!job) throw new Error(`rate-limited job disappeared: ${id}`)
         this.stageStatusNotificationRow({
-          idempotencyKey: `rate-limited:${id}:${job.attempts}:${notBefore}`,
+          idempotencyKey: `rate-limited:${id}:${job.attempts}:${nextNotBefore}`,
           jobId: id,
           chatId: job.chat_id,
           threadTs: job.thread_ts,
           kind: 'rate-limited',
-          payload: slackRateLimitMessage(notBefore, transientReason),
+          payload: slackRateLimitMessage(nextNotBefore, nextTransientReason),
           createdAt: Date.now(),
         })
       }
@@ -12383,6 +12785,26 @@ export class JobStore {
       if (job.cancelRequestedAt !== null) {
         this.cancel(job.id)
         failedUncertain += 1
+      } else if (this.hasDurableRateLimitTerminal(job.id)) {
+        const receipt = this.durableRateLimitTerminalForRunningJob(job.id)!
+        this.requeueAt(
+          job.id,
+          receipt.resumeAt,
+          'daemon restarted after a durable terminal Codex rate-limit receipt',
+          receipt.threadId,
+          receipt.reason,
+        )
+        requeued += 1
+      } else if (this.carriedRateLimitTerminalForUndeliveredAttempt(job.id)) {
+        const receipt = this.carriedRateLimitTerminalForUndeliveredAttempt(job.id)!
+        this.requeueAt(
+          job.id,
+          receipt.resumeAt,
+          'daemon restarted before a carried rate-limit continuation was delivered',
+          receipt.threadId,
+          receipt.reason,
+        )
+        requeued += 1
       } else if (job.writeEnabled) {
         // A reviewed result with a durable host-publication checkpoint has
         // known effects: the exact commit/branch/PR receipt is either pending
@@ -14028,8 +14450,15 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           error.stage,
           error.phaseSequence,
         ))
+      // A terminal receipt means the old turn is finished and the durable
+      // Codex thread can be continued after inspecting its already-applied
+      // effects.  This is not a raw replay, so a command-bearing failed turn
+      // does not by itself force the whole Slack task to fail.
+      const durableTerminalContinuation = error instanceof CodexRateLimitError
+        && options.store.hasDurableRateLimitTerminal(job.id)
       const rateLimitSafeToRetry = rateLimitSafeBeforeInitialDelivery
-        || transientFailureSafeAfterDelivery
+        || durableTerminalContinuation
+        || (!job.writeEnabled && transientFailureSafeAfterDelivery)
       if (error instanceof CodexRateLimitError && job.writeEnabled
         && !rateLimitSafeToRetry) {
         const uncertain = 'write-enabled job hit a rate limit after execution began; '
@@ -18387,6 +18816,7 @@ async function runCli(): Promise<void> {
               },
               finishTurn: ({
                 executorNonce, threadId, turnId, retainInput, rateLimitResumeAt,
+                rateLimitReason, rateLimitSafeToReplay,
               }) => store.finishAppServerTurn({
                 jobId: job.id,
                 epoch: job.controlEpoch,
@@ -18395,6 +18825,8 @@ async function runCli(): Promise<void> {
                 turnId,
                 retainInput,
                 rateLimitResumeAt,
+                rateLimitReason,
+                rateLimitSafeToReplay,
               }),
               recordRateLimit: ({ executorNonce, threadId, turnId, resumeAt }) => (
                 store.recordAppServerRateLimit({

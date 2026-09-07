@@ -378,6 +378,20 @@ for line in sys.stdin:
         if mode == "missing-session-resume" and method == "thread/resume" and params.get("threadId") == "thread-provider-missing":
             emit({"id": request_id, "error": {"code": -32001, "message": "thread not found"}})
             continue
+        phase_account_switch = mode in (
+            "phased-capacity-review-account-switch",
+            "phased-capacity-implementation-account-switch",
+        )
+        capacity_state = os.environ.get("ZERO_CAPACITY_FIXTURE_STATE")
+        if (
+            phase_account_switch
+            and method == "thread/resume"
+            and params.get("threadId") == "thread-app-server-1"
+            and capacity_state
+            and os.path.exists(capacity_state)
+        ):
+            emit({"id": request_id, "error": {"code": -32001, "message": "thread not found after account switch"}})
+            continue
         requested = params.get("threadId")
         cwd = params.get("cwd")
         model = params.get("model") or "gpt-test"
@@ -387,6 +401,8 @@ for line in sys.stdin:
         requested_thread = requested
         handshake_cwd = cwd
         permission_profile = params.get("permissions") or ""
+        if phase_account_switch and method == "thread/start" and capacity_state and os.path.exists(capacity_state):
+            thread_id = "thread-app-server-2"
         emit({"id": request_id, "result": {"thread": {"id": requested or thread_id, "cwd": cwd, "source": "unknown", "modelProvider": "openai", "status": {"type": "idle"}, "canAcceptDirectInput": True}, "model": model, "reasoningEffort": reasoning_effort, "modelProvider": "openai", "cwd": cwd, "approvalPolicy": "never", "activePermissionProfile": {"id": params.get("permissions"), "extends": None}, "instructionSources": [cwd + "/AGENTS.md"]}})
     elif method == "turn/start":
         if mode == "hang-turn-start":
@@ -427,7 +443,7 @@ for line in sys.stdin:
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
-        unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-continuation", "phased-continuation-release", "phased-continuation-answer", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-capacity-review-account-switch", "phased-capacity-implementation-account-switch", "phased-continuation", "phased-continuation-release", "phased-continuation-answer", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -526,7 +542,7 @@ for line in sys.stdin:
             hold_for_continuation_steer = os.environ.get("ZERO_CONTINUATION_STEER") == "1" and os.environ.get("ZERO_CONTROL_LOG") and not os.path.exists(os.environ["ZERO_CONTROL_LOG"])
             if not hold_for_continuation_steer:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "continuation-final", "text": message}], "error": None}}})
-        elif mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
+        elif mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-capacity-review-account-switch", "phased-capacity-implementation-account-switch", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume"):
             if stage == "prepare":
                 marker = re.search(r"\\[ZERO_PRE_EDIT_READY:[0-9a-f]{32}:r[0-9]+:[0-9a-f]{64}\\]", phase_prompt)
                 action = '<zerokun_work_action>{"kind":"implement","targets":[{"repository":".","baseBranch":"main","mergePullRequest":false,"followupBaseBranch":null}]}</zerokun_work_action>'
@@ -634,8 +650,8 @@ for line in sys.stdin:
             hold_for_interjection = mode == "phased-interjection-update" and stage == "implementation" and (not fixture_state or not os.path.exists(fixture_state))
             capacity_state = os.environ.get("ZERO_CAPACITY_FIXTURE_STATE")
             fail_capacity = capacity_state and not os.path.exists(capacity_state) and (
-                (mode == "phased-capacity-review-once" and stage == "review") or
-                (mode == "phased-capacity-implementation-once" and stage == "implementation")
+                (mode in ("phased-capacity-review-once", "phased-capacity-review-account-switch") and stage == "review") or
+                (mode in ("phased-capacity-implementation-once", "phased-capacity-implementation-account-switch") and stage == "implementation")
             )
             if fail_capacity:
                 with open(capacity_state, "w", encoding="utf-8") as stream:
@@ -944,6 +960,8 @@ function fixture(
     | 'phased-ui-approved'
     | 'phased-capacity-review-once'
     | 'phased-capacity-implementation-once'
+    | 'phased-capacity-review-account-switch'
+    | 'phased-capacity-implementation-account-switch'
     | 'phased-continuation' | 'phased-continuation-release' | 'phased-continuation-answer'
     | 'phased-continuation-new-work' | 'phased-continuation-malformed'
     | 'phased-continuation-stale'
@@ -1220,6 +1238,7 @@ function fixture(
     ),
     finishTurn: ({
       executorNonce, threadId, turnId, retainInput, rateLimitResumeAt,
+      rateLimitReason, rateLimitSafeToReplay,
     }) => store.finishAppServerTurn({
       jobId: job.id,
       epoch: job.controlEpoch,
@@ -1228,6 +1247,8 @@ function fixture(
       turnId,
       retainInput,
       rateLimitResumeAt,
+      rateLimitReason,
+      rateLimitSafeToReplay,
     }),
     recordRateLimit: ({ executorNonce, threadId, turnId, resumeAt }) => (
       store.recordAppServerRateLimit({
@@ -3657,6 +3678,123 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('phase rate-limit後のaccount切替はhost再queueからfresh prepareへ戻る', async () => {
+    const cases = [
+      {
+        mode: 'phased-capacity-implementation-account-switch' as const,
+        capacityStage: 'implementation',
+        expectedStages: ['prepare', 'implementation', 'prepare', 'implementation', 'review'],
+      },
+      {
+        mode: 'phased-capacity-review-account-switch' as const,
+        capacityStage: 'review',
+        expectedStages: [
+          'prepare', 'implementation', 'review',
+          'prepare', 'implementation', 'review',
+        ],
+      },
+    ]
+    for (const fixtureCase of cases) {
+      const value = fixture(fixtureCase.mode, true)
+      const phaseLog = join(value.root, `${fixtureCase.capacityStage}-account-switch-phases.log`)
+      const promptLog = join(value.root, `${fixtureCase.capacityStage}-account-switch-prompts.log`)
+      const rpcLog = join(value.root, `${fixtureCase.capacityStage}-account-switch-rpc.log`)
+      const capacityState = join(value.root, `${fixtureCase.capacityStage}-account-switch.state`)
+      const environment = {
+        ZERO_FIXTURE_MODE: fixtureCase.mode,
+        ZERO_PHASE_LOG: phaseLog,
+        ZERO_PROMPT_LOG: promptLog,
+        ZERO_RPC_LOG: rpcLog,
+        ZERO_LOG_HANDSHAKES: '1',
+        ZERO_CAPACITY_FIXTURE_STATE: capacityState,
+      }
+      let firstError: unknown
+      try {
+        await executeCodexJob(value.job, {
+          codexBinForTesting: value.executable,
+          logDir: value.logDir,
+          stateDir: value.state,
+          skipEffectiveConfigCheck: true,
+          extraEnvironment: environment,
+          phaseGateForTesting: {},
+          transientRetryDelayMsForTesting: 1,
+          liveControls: value.hooks,
+        })
+      } catch (error) {
+        firstError = error
+      }
+      expect(firstError).toBeInstanceOf(CodexRateLimitError)
+      const rateLimitError = firstError as CodexRateLimitError
+      expect(rateLimitError.stage).toBe(fixtureCase.capacityStage)
+      expect(value.store.hasDurableRateLimitTerminal(value.job.id)).toBe(true)
+      const receipt = value.store.get(value.job.id)?.rateLimitRecovery
+      expect(receipt).toMatchObject({
+        attempt: 1,
+        threadId: 'thread-app-server-1',
+        reason: 'capacity',
+      })
+      value.store.requeueAt(
+        value.job.id,
+        receipt!.resumeAt,
+        'phase account switched after terminal capacity',
+        rateLimitError.sessionId,
+        rateLimitError.reason,
+      )
+      const retried = value.store.claimNext(
+        `${fixtureCase.capacityStage}-account-switch-worker`,
+        20,
+        receipt!.resumeAt + 1,
+      )!
+      expect(retried).toMatchObject({
+        attempts: 2,
+        resumed: true,
+        sessionId: 'thread-app-server-1',
+        rateLimitRecovery: { attempt: 1 },
+      })
+      Object.assign(value.job, retried)
+      let resets = 0
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable,
+        logDir: value.logDir,
+        stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: environment,
+        phaseGateForTesting: {},
+        transientRetryDelayMsForTesting: 1,
+        onSessionReset: () => { resets += 1 },
+        liveControls: value.hooks,
+        threadHistory: value.store.threadHistorySnapshot(value.job.id, value.job.attempts),
+      })
+
+      expect(result).toMatchObject({ sessionId: 'thread-app-server-2', result: '公開できます' })
+      expect(resets).toBe(1)
+      const stages = readFileSync(phaseLog, 'utf8').trim().split('\n')
+        .map(line => line.split('\t')[0])
+      expect(stages).toEqual(fixtureCase.expectedStages)
+      const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+        .map(line => JSON.parse(line) as { stage: string, text: string })
+      const preparePrompts = prompts.filter(prompt => prompt.stage === 'prepare')
+      expect(preparePrompts).toHaveLength(2)
+      expect(preparePrompts[1]!.text).toContain('Prior Slack thread history')
+      expect(preparePrompts[1]!.text).toContain('Rate-limit continuation (trusted host state)')
+      expect(preparePrompts[1]!.text).toContain(
+        'Do not blindly replay commands, edits, Git operations',
+      )
+      const handshakes = readFileSync(rpcLog, 'utf8').trim().split('\n')
+        .map(line => JSON.parse(line) as { method: string })
+        .map(row => row.method)
+        .filter(method => method === 'thread/start' || method === 'thread/resume')
+      expect(handshakes.slice(-4)).toEqual([
+        'thread/resume', 'thread/start', 'thread/resume', 'thread/resume',
+      ])
+      expect(value.store.get(value.job.id)).toMatchObject({
+        notBefore: null,
+        rateLimitRecovery: null,
+      })
+      value.store.close()
+    }
+  }, 60_000)
+
   test('Codexが3回必須修正を判断してもhost上限で止めず4回目のreviewまで継続する', async () => {
     const value = fixture('phased-review-fix-three-times', true)
     const phaseLog = join(value.root, 'unbounded-review-phases.log')
@@ -4363,6 +4501,95 @@ describe('production App Server executor', () => {
     expect(prompts[0]!.text).toContain('前回の実装結果を引き継ぐ')
     expect(prompts.slice(1).every(prompt => !prompt.text.includes('Prior Slack thread history')))
       .toBe(true)
+    value.store.close()
+  }, 30_000)
+
+  test('account切替でrate-limit継続threadが消えてもfresh App Serverへ一度だけfallbackする', async () => {
+    const value = fixture('missing-session-resume', true)
+    const snapshot = readAdvisorInputSnapshot(value.state, value.job.id)
+    const nonce = '6'.repeat(32)
+    const missingThread = 'thread-provider-missing'
+    expect(value.store.beginInitialTurnDispatch({
+      jobId: value.job.id,
+      attempt: value.job.attempts,
+      epoch: value.job.controlEpoch,
+      executorNonce: nonce,
+      threadId: missingThread,
+      requestId: 601,
+      inputRevision: snapshot.revision,
+      inputDigest: snapshot.digest,
+    })).toBe('dispatching')
+    value.store.acknowledgeInitialTurnDispatch({
+      jobId: value.job.id,
+      workerId: value.job.workerId!,
+      attempt: value.job.attempts,
+      epoch: value.job.controlEpoch,
+      executorNonce: nonce,
+      threadId: missingThread,
+      turnId: 'turn-before-account-switch',
+      requestId: 601,
+    })
+    const resumeAt = Date.now() - 1
+    value.store.finishAppServerTurn({
+      jobId: value.job.id,
+      epoch: value.job.controlEpoch,
+      executorNonce: nonce,
+      threadId: missingThread,
+      turnId: 'turn-before-account-switch',
+      retainInput: true,
+      rateLimitResumeAt: resumeAt,
+      rateLimitReason: 'rate-limit',
+      rateLimitSafeToReplay: false,
+    })
+    value.store.requeueAt(
+      value.job.id, resumeAt, 'account switch fixture', missingThread, 'rate-limit',
+    )
+    const retried = value.store.claimNext('account-switch-worker', 20, Date.now())!
+    expect(retried).toMatchObject({
+      attempts: 2,
+      resumed: true,
+      sessionId: missingThread,
+      rateLimitRecovery: { attempt: 1, safeToReplay: false },
+    })
+    // The fixture hooks retain this object by reference.
+    Object.assign(value.job, retried)
+    const rpcLog = join(value.root, 'account-switch-rpc.log')
+    const promptLog = join(value.root, 'account-switch-prompt.log')
+    const processIds: number[] = []
+    let resets = 0
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable,
+      logDir: value.logDir,
+      stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'missing-session-resume',
+        ZERO_RPC_LOG: rpcLog,
+        ZERO_PROMPT_LOG: promptLog,
+        ZERO_LOG_HANDSHAKES: '1',
+      },
+      onProcessId: pid => { processIds.push(pid) },
+      onSessionReset: () => { resets += 1 },
+      liveControls: value.hooks,
+      threadHistory: value.store.threadHistorySnapshot(value.job.id, value.job.attempts),
+    })
+
+    expect(result).toEqual({ sessionId: 'thread-app-server-1', result: 'unexpected phase' })
+    expect(resets).toBe(1)
+    expect(processIds).toHaveLength(2)
+    expect(new Set(processIds).size).toBe(2)
+    const methods = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line).method)
+      .filter(method => method === 'thread/start' || method === 'thread/resume')
+    expect(methods).toEqual(['thread/resume', 'thread/start'])
+    const prompt = (JSON.parse(readFileSync(promptLog, 'utf8').trim()) as { text: string }).text
+    expect(prompt).toContain('Prior Slack thread history')
+    expect(prompt).toContain('Rate-limit continuation (trusted host state)')
+    expect(prompt).toContain('Do not blindly replay commands, edits, Git operations')
+    expect(value.store.get(value.job.id)).toMatchObject({
+      notBefore: null,
+      rateLimitRecovery: null,
+    })
     value.store.close()
   }, 30_000)
 

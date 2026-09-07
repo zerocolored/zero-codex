@@ -158,8 +158,8 @@ codex <trust-args> -C <repo> \
   -c permissions.zerokun_job.network.enabled=<false|true> \
   -c default_permissions="zerokun_job" \
   -c project_doc_max_bytes=262144 \
-  -c model="gpt-5.6-sol" \
-  -c model_reasoning_effort="xhigh" \
+  -c model="gpt-6-astra" \
+  -c model_reasoning_effort="low" \
   app-server --stdio
 ```
 
@@ -167,7 +167,7 @@ codex <trust-args> -C <repo> \
   推測・採番せず、responseのthread ID、物理cwd、OpenAI provider、model、`approvalPolicy: never`、
   named permission profile、AGENTS instruction sourceが全て一致した場合だけ保存します。通常失敗でも
   session自体を明示的にretireしていなければ、同じSlack threadの次jobでそのsessionをresumeします。
-- primary modelは`gpt-5.6-sol`、reasoning effortは`xhigh`をrelease codeからApp Server起動、
+- primary modelは`gpt-6-astra`、reasoning effortは`low`をrelease codeからApp Server起動、
   `thread/start`／`thread/resume`、全`turn/start`へ明示します。handshakeの実効値も照合し、
   `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。advisor modelは`AGENTS.md`の別契約です。
 - 実行中の同thread返信は`turn/steer`で同じturnへ渡し、Codexが質問と作業更新を現在の文脈で判断します。
