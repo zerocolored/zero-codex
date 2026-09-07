@@ -189,10 +189,14 @@ gh auth status --hostname github.com
 ```
 
 Zeroちゃんは認証画面を開かず、tokenやSSH keyをCodexへ渡しません。代わりに、現在jobのrepositoryだけを
-操作できる`zerokun_github`をCodexへ公開します。これは認証済み`gh`／Git pushを実行する薄いtransportで、
+操作できる`zerokun_github`をCodexへ公開します。これは認証済み`gh`／Git fetch・pushを実行する薄いtransportで、
 作業手順や安全判定を決める別のorchestratorではありません。branch選択、commit、push、PR作成・承認・
 merge、checks待機、deploy確認は、依頼と各repositoryの`AGENTS.md`を読んだCodexが同じworkflow内で判断・
 実行します。GitHub外の実環境確認はCodexが利用可能なBrowser／Chromeまたは対象projectの通常手順で行います。
+
+最新コードの取得には`github_fetch_branch(repository, branch)`を使います。既存のGitHub認証で指定branchを
+`origin/<branch>`へ取得し、取得したcommit SHAを返します。HEADや作業ファイルは切り替えず、競合解消や
+mergeはCodexが続けて実行します。SSHのknown_hostsやHTTPS認証をsandboxへ公開する必要はありません。
 
 既にclone済みなら、次だけで構いません。
 

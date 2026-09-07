@@ -529,6 +529,34 @@ export function registerGitHubCredentialTools(
     }
   })
 
+  server.registerTool('github_fetch_branch', {
+    description: 'Fetch the latest branch using the operator\'s existing GitHub login. Updates only the selected origin remote-tracking ref and Git objects; never checks out, merges, or changes working files. Use before resolving conflicts or integrating latest develop.',
+    inputSchema: {
+      repository: z.string().max(256),
+      branch: z.string().min(1).max(255),
+    },
+  }, async ({ repository, branch }, extra) => {
+    try {
+      if (!context.writeEnabled) throw new Error('GitHub fetch requires write access')
+      const selected = selectRepository(repository)
+      const checkedBranch = validBranch(branch)
+      const ref = `refs/remotes/origin/${checkedBranch}`
+      const fetched = await commands.runGit(selected.root, [
+        'fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
+        selected.remote.canonicalUrl, `+refs/heads/${checkedBranch}:${ref}`,
+      ], extra.signal)
+      if (fetched.exitCode !== 0) commandFailure(fetched, 'GitHub branch fetch')
+      const resolved = await commands.runGit(selected.root, [
+        'rev-parse', '--verify', `${ref}^{commit}`,
+      ], extra.signal)
+      if (resolved.exitCode !== 0) commandFailure(resolved, 'GitHub fetched commit inspection')
+      return toolText({ complete: true, repository, branch, ref,
+        commitSha: validSha(resolved.stdout.trim()) })
+    } catch (error) {
+      return toolText({ complete: false, reason: error instanceof Error ? error.message : String(error) }, true)
+    }
+  })
+
   server.registerTool('github_publish_branch', {
     description: 'Publish one exact local commit to one branch of a repository in the current project. The push is non-force and is reconciled with the remote before and after execution.',
     inputSchema: {
