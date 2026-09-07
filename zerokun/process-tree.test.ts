@@ -198,7 +198,7 @@ describe('process tree identity tracking', () => {
     updateTrackedProcesses([
       processIdentity(100, 1, 100, 'unrelated-root-b'),
       processIdentity(200, 100, 100, 'unrelated-child-b'),
-    ], [], 100, tracked)
+    ], [], 100, tracked, new Set(), () => ({ status: 'dead', reason: 'reused' }))
 
     expect(tracked.size).toBe(0)
   })
