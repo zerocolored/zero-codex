@@ -138,6 +138,77 @@ function responseJson(response: Awaited<ReturnType<Client['callTool']>>): Record
 }
 
 describe('GitHub credential broker', () => {
+  test('fetch imports latest commit through transport while preserving HEAD and dirty files', async () => {
+    const value = fixture()
+    const remote = join(value.repo, '..', 'remote')
+    git(value.repo, ['clone', '--bare', value.repo, remote])
+    writeFileSync(join(value.repo, 'README.md'), 'remote revision\n')
+    git(value.repo, ['commit', '-am', 'feat: remote change'])
+    const latest = git(value.repo, ['rev-parse', 'HEAD'])
+    git(value.repo, ['push', remote, 'develop'])
+    git(value.repo, ['reset', '--hard', value.commitSha])
+    writeFileSync(join(value.repo, 'README.md'), 'user dirty change\n')
+    const before = git(value.repo, ['diff'])
+    const calls: string[][] = []
+    const commands: GitHubPublicationCommands = {
+      async runGit(repo, args) {
+        calls.push(args)
+        // Only the test transport maps the authenticated HTTPS remote to a local fixture.
+        return result(0, git(repo, args.map(arg => arg ===
+          'https://github.com/example/broker-fixture.git' ? remote : arg)))
+      },
+      async runGh() { throw new Error('unexpected gh call') },
+    }
+    await connectedBroker(value.context, commands, async client => {
+      const response = responseJson(await callBrokerTool(client, {
+        name: 'github_fetch_branch', arguments: { repository: 'example/broker-fixture', branch: 'develop' },
+      }))
+      expect(response).toMatchObject({ complete: true, commitSha: latest, ref: 'refs/remotes/origin/develop' })
+    })
+    expect(calls[0]).toEqual(['fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
+      'https://github.com/example/broker-fixture.git', '+refs/heads/develop:refs/remotes/origin/develop'])
+    expect(git(value.repo, ['rev-parse', 'HEAD'])).toBe(value.commitSha)
+    expect(git(value.repo, ['diff'])).toBe(before)
+    expect(git(value.repo, ['rev-parse', 'origin/develop'])).toBe(latest)
+  })
+
+  test('failed fetch does not report stale ref or expose transport output', async () => {
+    const value = fixture()
+    let calls = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit() { calls++; return result(128, 'private transport output', 'private diagnostic') },
+      async runGh() { throw new Error('unexpected gh call') },
+    }
+    await connectedBroker(value.context, commands, async client => {
+      const response = await callBrokerTool(client, {
+        name: 'github_fetch_branch', arguments: { repository: 'example/broker-fixture', branch: 'develop' },
+      })
+      expect(response.isError).toBe(true)
+      expect(responseJson(response)).toEqual({ complete: false, reason: 'GitHub branch fetch failed with exit 128' })
+      expect(calls).toBe(1)
+    })
+  })
+
+  test('fetch rejects read-only access, foreign repository and invalid branch before transport', async () => {
+    const value = fixture()
+    const commands: GitHubPublicationCommands = {
+      async runGit() { throw new Error('transport must not run') },
+      async runGh() { throw new Error('transport must not run') },
+    }
+    for (const [context, repository, branch] of [
+      [{ ...value.context, writeEnabled: false }, 'example/broker-fixture', 'develop'],
+      [value.context, 'example/foreign', 'develop'],
+      [value.context, 'example/broker-fixture', '--upload-pack=evil'],
+      [value.context, 'example/broker-fixture', 'develop:refs/heads/main'],
+    ] as const) {
+      await connectedBroker(context, commands, async client => {
+        const response = await callBrokerTool(client, { name: 'github_fetch_branch', arguments: { repository, branch } })
+        expect(response.isError).toBe(true)
+        expect(JSON.stringify(response)).not.toContain('transport must not run')
+      })
+    }
+  })
+
   test('startupはGitHub remoteや認証を必要とせずtool利用時まで遅延する', async () => {
     const value = fixture(false)
     let invoked = false
@@ -148,6 +219,7 @@ describe('GitHub credential broker', () => {
     await connectedBroker(value.context, commands, async client => {
       const tools = await client.listTools()
       expect(tools.tools.map(tool => tool.name).sort()).toEqual([
+        'github_fetch_branch',
         'github_inspect',
         'github_publish_branch',
         'github_pull_request',

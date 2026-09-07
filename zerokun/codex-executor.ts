@@ -3791,6 +3791,9 @@ export function buildCodexDeveloperInstructions(
       'external service unless the current user request authorizes that action.',
       'Use zerokun_github only when authenticated GitHub access is needed. It is credential',
       'transport, not a work-policy gate; you decide which repository-scoped operation to call.',
+      'Use github_fetch_branch to obtain latest remote code before conflict resolution or integration.',
+      'It returns the fetched commit and origin tracking ref without changing HEAD or working files.',
+      'Use that transport when shell Git cannot access SSH host keys or HTTPS credentials.',
       'Use the available Browser or Chrome capability for browser evidence, including public HTTPS',
       'environments when the request requires them. Use zerokun_browser as the isolated localhost',
       'capture path for local UI evidence; do not claim a site is unreachable before attempting it',
@@ -5232,7 +5235,7 @@ export function buildCodexPermissionOverrides(
   }
   if (options.githubMcp) {
     mcpEntries.push(
-      `zerokun_github={command=${tomlString(options.githubMcp.command)},args=[${options.githubMcp.args.map(tomlString).join(',')}],enabled=true,required=true,enabled_tools=["github_inspect","github_publish_branch","github_pull_request","github_wait_delivery"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=1900,tools={github_inspect={approval_mode="approve"},github_publish_branch={approval_mode="approve"},github_pull_request={approval_mode="approve"},github_wait_delivery={approval_mode="approve"}}}`,
+      `zerokun_github={command=${tomlString(options.githubMcp.command)},args=[${options.githubMcp.args.map(tomlString).join(',')}],enabled=true,required=true,enabled_tools=["github_inspect","github_fetch_branch","github_publish_branch","github_pull_request","github_wait_delivery"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=1900,tools={github_inspect={approval_mode="approve"},github_fetch_branch={approval_mode="approve"},github_publish_branch={approval_mode="approve"},github_pull_request={approval_mode="approve"},github_wait_delivery={approval_mode="approve"}}}`,
     )
   }
   const mcpServers = `{${mcpEntries.join(',')}}`
