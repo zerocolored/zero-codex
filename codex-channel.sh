@@ -335,6 +335,15 @@ if [ -n "$existing_bridge_pid" ]; then
     existing_runner_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_PID" 2>/dev/null || true)"
   fi
   existing_runner_runtime="$(tr -d '[:space:]' < "$JOB_RUNNER_RUNTIME" 2>/dev/null || true)"
+  existing_launcher_pid=""
+  if [ -f "$JOB_RUNNER_STARTER_LOCK" ]; then
+    existing_launcher_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_STARTER_LOCK" 2>/dev/null || true)"
+  fi
+  existing_launcher_live=0
+  if lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$existing_launcher_pid" \
+      'runner-launcher\.ts'; then
+    existing_launcher_live=1
+  fi
   shared_runner_runtime=0
   case "$existing_runner_runtime" in
     "zerokun-codex-runner-v1:$RUNNER_RUNTIME_ID:"*) shared_runner_runtime=1 ;;
@@ -350,6 +359,10 @@ if [ -n "$existing_bridge_pid" ]; then
     # daemon changed, continue through the ordinary safe replacement path.
     joined_bridge_pid="$(tr -d '[:space:]' < "$LOCK_FILE" 2>/dev/null || true)"
     joined_runner_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_PID" 2>/dev/null || true)"
+    joined_launcher_pid=""
+    if [ -f "$JOB_RUNNER_STARTER_LOCK" ]; then
+      joined_launcher_pid="$(tr -d '[:space:]' < "$JOB_RUNNER_STARTER_LOCK" 2>/dev/null || true)"
+    fi
     if [ "$joined_bridge_pid" = "$existing_bridge_pid" ] \
        && [ "$joined_runner_pid" = "$existing_runner_pid" ] \
        && [ "$(tr -d '[:space:]' < "$JOB_RUNNER_RUNTIME" 2>/dev/null)" = "$existing_runner_runtime" ] \
@@ -357,10 +370,19 @@ if [ -n "$existing_bridge_pid" ]; then
        && lock_process_is "$JOB_RUNNER_PID" "$joined_runner_pid" 'job-runner\.ts[[:space:]]+daemon' \
        && bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/readiness.ts" \
          can-share "$READY_FILE" "$joined_bridge_pid" "$SLACK_APP_ID"; then
-      echo "✅ 既存のZeroちゃんを共用します。" >&2
-      echo "   project: $PROJECT" >&2
-      echo "   gateway: PID $joined_bridge_pid / runner: PID $joined_runner_pid" >&2
-      exit 0
+      if [ "$existing_launcher_live" = "1" ] \
+         && [ "$joined_launcher_pid" = "$existing_launcher_pid" ] \
+         && lock_process_is "$JOB_RUNNER_STARTER_LOCK" "$joined_launcher_pid" \
+           'runner-launcher\.ts'; then
+        echo "✅ 既存のZeroちゃんを共用します。" >&2
+        echo "   project: $PROJECT" >&2
+        echo "   gateway: PID $joined_bridge_pid / runner: PID $joined_runner_pid / recovery: PID $joined_launcher_pid" >&2
+        exit 0
+      fi
+      echo "⚠️  自動復旧機構が停止しているため、稼働中のgatewayとrunnerを保持して再構築します。" >&2
+      exec bun --config=/dev/null --no-env-file \
+        "$REPO_DIR/zerokun/service-control.ts" start \
+        "$REPO_DIR" "$STATE_DIR" "$PROJECT" "$SLACK_APP_ID"
     fi
   fi
   echo "⚠️  ZeroちゃんのSlack gatewayは既に起動中です (PID $existing_bridge_pid)。" >&2

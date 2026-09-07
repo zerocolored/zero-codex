@@ -22,6 +22,9 @@ export const MAX_EXECUTOR_REGISTRATION_BYTES = 512 * 1024
 
 type ProcessGenerationObserver = typeof observeProcessGeneration
 
+const CLEANUP_GENERATION_PROBE_ATTEMPTS = 5
+const CLEANUP_GENERATION_PROBE_RETRY_MS = 10
+
 /**
  * Keep the durable recovery ledger aligned with the exact generations that
  * remain pinned by the live tracker. Confirmed-dead non-root generations no
@@ -314,30 +317,87 @@ function liveTrackedIdentities(
   return live
 }
 
-function signalGroupLeader(
+/**
+ * Cleanup runs exactly when short-lived descendants are most likely to exit.
+ * A Darwin generation read can therefore become temporarily unreadable
+ * between the process-table scan and the direct probe. Re-observe that exact
+ * pinned generation for a small, bounded interval; never reinterpret an
+ * unreadable numeric PID as alive or as a different generation.
+ */
+async function observeProcessGenerationForCleanup(
+  expected: ProcessIdentity,
+  generationObserver: ProcessGenerationObserver,
+): Promise<ReturnType<ProcessGenerationObserver>> {
+  for (let attempt = 0; attempt < CLEANUP_GENERATION_PROBE_ATTEMPTS; attempt += 1) {
+    const observation = generationObserver(expected)
+    if (observation.status !== 'unknown') return observation
+    if (attempt + 1 < CLEANUP_GENERATION_PROBE_ATTEMPTS) {
+      await Bun.sleep(CLEANUP_GENERATION_PROBE_RETRY_MS)
+    }
+  }
+  return { status: 'unknown' }
+}
+
+async function liveTrackedIdentitiesForCleanup(
+  tracked: ReadonlyMap<number, string>,
+  excludePids: ReadonlySet<number>,
+  generationObserver: ProcessGenerationObserver,
+): Promise<ProcessIdentity[]> {
+  const pending: Array<{ pid: number; expected: ProcessIdentity }> = []
+  for (const [pid, started] of tracked) {
+    if (excludePids.has(pid) || !started) continue
+    const expected = expectedIdentity(pid, started)
+    if (!expected) throw new Error(`process ${pid}のgenerationが不正です`)
+    pending.push({ pid, expected })
+  }
+  // Probe all pinned generations in parallel so the retry window remains
+  // globally bounded even for a large descendant tree.
+  const observations = await Promise.all(pending.map(({ expected }) =>
+    observeProcessGenerationForCleanup(expected, generationObserver)))
+  const live: ProcessIdentity[] = []
+  for (let index = 0; index < pending.length; index += 1) {
+    const { pid } = pending[index]!
+    const observation = observations[index]!
+    if (observation.status === 'unknown') {
+      throw new Error(`process ${pid}のgenerationを確認できません`)
+    }
+    if (observation.status === 'alive') live.push(observation.identity)
+  }
+  return live
+}
+
+async function signalGroupLeaderForCleanup(
   expectedLeader: ProcessIdentity | undefined,
   signal: NodeJS.Signals,
-  generationObserver: ProcessGenerationObserver = observeProcessGeneration,
-): boolean {
+  generationObserver: ProcessGenerationObserver,
+): Promise<boolean> {
   if (!expectedLeader) return false
-  const observation = generationObserver(expectedLeader)
+  const observation = await observeProcessGenerationForCleanup(
+    expectedLeader,
+    generationObserver,
+  )
   if (observation.status === 'unknown') {
     throw new Error(`process group ${expectedLeader.pid}のgenerationを確認できません`)
   }
-  if (observation.status === 'alive') {
-    return signalProcessGroupIfLeaderLive(expectedLeader, signal)
-  }
-  return false
+  if (observation.status === 'dead') return false
+  return signalProcessGroupIfLeaderLive(expectedLeader, signal)
 }
 
-function signalIdentities(
+async function signalIdentitiesForCleanup(
   identities: Iterable<ProcessIdentity>,
   signal: NodeJS.Signals,
-  generationObserver: ProcessGenerationObserver = observeProcessGeneration,
-): void {
+  generationObserver: ProcessGenerationObserver,
+): Promise<void> {
+  const unsignaled: ProcessIdentity[] = []
   for (const identity of identities) {
     if (signalProcessIfLive(identity, signal)) continue
-    const observation = generationObserver(identity)
+    unsignaled.push(identity)
+  }
+  const observations = await Promise.all(unsignaled.map(identity =>
+    observeProcessGenerationForCleanup(identity, generationObserver)))
+  for (let index = 0; index < unsignaled.length; index += 1) {
+    const identity = unsignaled[index]!
+    const observation = observations[index]!
     if (observation.status === 'unknown') {
       throw new Error(`process ${identity.pid}のgenerationを確認できません`)
     }
@@ -373,15 +433,19 @@ export async function reapTrackedProcesses(options: {
     ? initialTable.find(entry => entry.pid === options.groupId && entry.started === groupStarted)
     : undefined
   const termGroupSignaled = options.signalGroup !== false
-    && signalGroupLeader(groupLeader, 'SIGTERM', generationObserver)
-  signalIdentities(
-    liveTrackedIdentities(options.tracked, exclude, generationObserver)
+    && await signalGroupLeaderForCleanup(groupLeader, 'SIGTERM', generationObserver)
+  await signalIdentitiesForCleanup(
+    (await liveTrackedIdentitiesForCleanup(options.tracked, exclude, generationObserver))
       .filter(identity => !termGroupSignaled || identity.pgid !== options.groupId),
     'SIGTERM',
     generationObserver,
   )
 
-  let live = liveTrackedIdentities(options.tracked, exclude, generationObserver)
+  let live = await liveTrackedIdentitiesForCleanup(
+    options.tracked,
+    exclude,
+    generationObserver,
+  )
   if (options.waitForForce) {
     while (live.length > 0 && !options.waitForForce()) {
       await Bun.sleep(25)
@@ -392,7 +456,11 @@ export async function reapTrackedProcesses(options: {
         exclude,
         generationObserver,
       )
-      live = liveTrackedIdentities(options.tracked, exclude, generationObserver)
+      live = await liveTrackedIdentitiesForCleanup(
+        options.tracked,
+        exclude,
+        generationObserver,
+      )
     }
   } else {
     const termDeadline = Date.now() + (options.termGraceMs ?? 1_000)
@@ -405,7 +473,11 @@ export async function reapTrackedProcesses(options: {
         exclude,
         generationObserver,
       )
-      live = liveTrackedIdentities(options.tracked, exclude, generationObserver)
+      live = await liveTrackedIdentitiesForCleanup(
+        options.tracked,
+        exclude,
+        generationObserver,
+      )
     }
   }
   if (live.length === 0) return []
@@ -414,8 +486,8 @@ export async function reapTrackedProcesses(options: {
   // TERM-time observations are never reused for delayed KILL. Both helpers
   // perform a fresh microsecond-generation read immediately before signaling.
   const killGroupSignaled = options.signalGroup !== false
-    && signalGroupLeader(groupLeader, 'SIGKILL', generationObserver)
-  signalIdentities(
+    && await signalGroupLeaderForCleanup(groupLeader, 'SIGKILL', generationObserver)
+  await signalIdentitiesForCleanup(
     live.filter(identity => !killGroupSignaled || identity.pgid !== options.groupId),
     'SIGKILL',
     generationObserver,
@@ -430,7 +502,11 @@ export async function reapTrackedProcesses(options: {
       exclude,
       generationObserver,
     )
-    live = liveTrackedIdentities(options.tracked, exclude, generationObserver)
+    live = await liveTrackedIdentitiesForCleanup(
+      options.tracked,
+      exclude,
+      generationObserver,
+    )
   }
   return live.map(identity => identity.pid)
 }

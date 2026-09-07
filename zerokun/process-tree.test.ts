@@ -159,19 +159,74 @@ describe('process tree identity tracking', () => {
   })
 
   test.skipIf(process.platform !== 'darwin')(
+    'cleanupは一時unknownの後にdeadとなったgenerationを安全に回収済みと扱う',
+    async () => {
+      const pid = 1_000_000
+      const started = generation('cleanup-transient-unknown')
+      const tracked = new Map([[pid, started]])
+      let observations = 0
+
+      const remaining = await reapTrackedProcesses({
+        rootPids: [pid],
+        groupId: pid,
+        tracked,
+        generationObserver: () => {
+          observations += 1
+          return observations <= 2
+            ? { status: 'unknown' }
+            : { status: 'dead', reason: 'missing' }
+        },
+      })
+
+      expect(remaining).toEqual([])
+      expect(observations).toBeGreaterThanOrEqual(3)
+    },
+  )
+
+  test.skipIf(process.platform !== 'darwin')(
+    'cleanupは一時unknownの後に再利用されたPIDへsignalを送らない',
+    async () => {
+      const pid = 1_000_000
+      const started = generation('cleanup-reused-after-unknown')
+      const tracked = new Map([[pid, started]])
+      let observations = 0
+
+      const remaining = await reapTrackedProcesses({
+        rootPids: [pid],
+        groupId: pid,
+        tracked,
+        generationObserver: () => {
+          observations += 1
+          return observations <= 2
+            ? { status: 'unknown' }
+            : { status: 'dead', reason: 'reused' }
+        },
+      })
+
+      expect(remaining).toEqual([])
+      expect(observations).toBeGreaterThanOrEqual(3)
+    },
+  )
+
+  test.skipIf(process.platform !== 'darwin')(
     'cleanupはpersistent unknownを許容せずsignal前にfail closedする',
     async () => {
       const pid = 1_000_000
       const started = generation('cleanup-unknown')
       const tracked = new Map([[pid, started]])
+      let observations = 0
 
       await expect(reapTrackedProcesses({
         rootPids: [pid],
         groupId: pid,
         tracked,
-        generationObserver: () => ({ status: 'unknown' }),
+        generationObserver: () => {
+          observations += 1
+          return { status: 'unknown' }
+        },
       })).rejects.toThrow(`process ${pid}のgenerationを確認できません`)
       expect(tracked.get(pid)).toBe(started)
+      expect(observations).toBeGreaterThan(1)
     },
   )
 

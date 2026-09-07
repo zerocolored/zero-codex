@@ -726,7 +726,12 @@ describe('process lock contention states', () => {
       const identity = JSON.parse(readFileSync(identityPath, 'utf8'))
       delete identity.delegate.groupId
       writeFileSync(identityPath, `${JSON.stringify(identity)}\n`, { mode: 0o600 })
-      expect(processLockDelegateMatches(lock, childPid)).toBe(true)
+      let admitted = false
+      for (let attempt = 0; attempt < 100 && !admitted; attempt += 1) {
+        admitted = processLockDelegateMatches(lock, childPid)
+        if (!admitted) await Bun.sleep(5)
+      }
+      expect(admitted).toBe(true)
       expect(processLockDelegateMatches(lock, childPid)).toBe(false)
       expect(JSON.parse(readFileSync(identityPath, 'utf8')).delegate.groupId).toBe(leader.pid)
       expect(processLockDelegateMatches(lock, process.pid)).toBe(false)

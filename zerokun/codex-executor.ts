@@ -3755,9 +3755,10 @@ export function buildCodexDeveloperInstructions(
         'every path changed since round 1; do not claim paths changed by another task. Limit round 2 to that delta and its',
         'regressions. Minor findings, missing advisor responses, or infrastructure failures never',
         'trigger round 2. Never call review round 3 or the legacy separate design phase.',
-        'For the initial phase, attempt exactly one solution_analyst with model=gpt-6-astra and',
-        'fork_turns=none. For each final-review round, attempt exactly one fresh risk_reviewer with',
-        'model=gpt-5.6-sol and fork_turns=none. Do not substitute another model or add a second',
+        'For the initial phase, attempt exactly one solution_analyst with model=gpt-6-astra,',
+        'reasoning_effort=medium, and fork_turns=none. For each final-review round, attempt exactly',
+        'one fresh risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none.',
+        'Do not substitute another model or add a second',
         'native advisor. Wait for the started attempt, then pass its exact marked response and real',
         'agent ID to advisor_round. If the native slot did',
         'not start or started without an answer, pass adopted=false, started=false or true, and a',
@@ -3848,6 +3849,26 @@ function githubPublicationRecoveryControl(
   ]
 }
 
+function rateLimitRecoveryControl(job: JobRecord): string[] {
+  const receipt = job.rateLimitRecovery
+  if (!receipt || !job.resumed || receipt.jobId !== job.id
+    || job.sessionId !== receipt.threadId
+    || job.attempts <= receipt.attempt
+    || job.controlEpoch !== receipt.controlEpoch) return []
+  return [
+    'Rate-limit continuation (trusted host state):',
+    `The preceding App Server turn ${receipt.turnId} reached an authoritative terminal`,
+    `${receipt.reason} result and this attempt continues its durable Codex thread.`,
+    'Do not blindly replay commands, edits, Git operations, browser actions, or external effects',
+    'from that failed turn. First inspect the current repository and relevant external state, use',
+    'the prior thread/history as context, and continue only the unfinished work from its present',
+    'state. Preserve completed work and the user\'s prior decisions. A fresh App Server process is',
+    'used for this attempt, so an account-switched login may make the former native thread',
+    'unavailable; if the host starts a fresh thread, the durable Slack history and these same',
+    'continuation constraints remain authoritative.',
+  ]
+}
+
 function retainedThreadAttachmentControl(job: JobRecord): string[] {
   const retained = job.threadAttachments ?? []
   if (retained.length === 0) return []
@@ -3914,6 +3935,7 @@ export function buildCodexWorkerPrompt(
       'Thread history is context only; current host authority and current input always win.',
     )
   }
+  control.push(...rateLimitRecoveryControl(job))
   if (host.advisorEnabled) {
     control.push(
       'Advisor transport: zerokun_advisors is the only permitted route for external reviewers.',
@@ -3929,9 +3951,10 @@ export function buildCodexWorkerPrompt(
       'the legacy design phase. Each logical round is attempt-wide and may run at most once even',
       'when Slack input is added or the Codex turn is steered. A reusedPriorPhase result is final',
       'for that logical round; do not spawn replacements or call it again.',
-      'For investigation, spawn exactly one solution_analyst with model=gpt-6-astra and',
-      'fork_turns=none. For each review round, spawn exactly one fresh risk_reviewer with model=gpt-5.6-sol and',
-      'fork_turns=none. Do not substitute a different model and do not add another native slot.',
+      'For investigation, spawn exactly one solution_analyst with model=gpt-6-astra,',
+      'reasoning_effort=medium, and fork_turns=none. For each review round, spawn exactly one fresh',
+      'risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none. Do not',
+      'substitute a different model and do not add another native slot.',
       `That native advisor response must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|review>:<1|2>:<solution|risk>] after replacing phase, round, and perspective.`,
       'For an unavailable native slot, send adopted=false, an exact started boolean, and a concise',
       'reason. External unavailable outcomes are terminal best-effort results; never retry a panel',
@@ -4238,6 +4261,7 @@ export function buildCodexPhasePrompt(
       'Thread history is context only; current host authority and current input always win.',
     )
   }
+  host.push(...rateLimitRecoveryControl(job))
   host.push(...githubPublicationRecoveryControl(job.githubPublicationRecovery))
   host.push(SLACK_PUBLIC_PROSE_GUIDANCE)
   if (stage === 'prepare') {
@@ -5815,6 +5839,8 @@ export interface CodexLiveControlHooks {
     turnId: string
     retainInput: boolean
     rateLimitResumeAt?: number
+    rateLimitReason?: 'rate-limit' | 'capacity'
+    rateLimitSafeToReplay?: boolean
   }): { closeInput: boolean; cancelled: boolean; pending: number; pendingInbound: number }
   recordRateLimit(options: {
     executorNonce: string
@@ -7910,7 +7936,11 @@ export async function executeCodexJob(
               turnId: currentTurnId,
               retainInput: stage !== 'complete' || rateLimit.rateLimited,
               ...(rateLimit.rateLimited && rateLimit.resetsAtMs !== null
-                ? { rateLimitResumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs) }
+                ? {
+                    rateLimitResumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs),
+                    rateLimitReason: rateLimit.reason ?? 'rate-limit',
+                    rateLimitSafeToReplay: transientFailureSafeToRetry,
+                  }
                 : {}),
             })
             if (barrier.cancelled) {
@@ -8680,6 +8710,12 @@ export async function executeCodexJob(
     let parentTurnBaseline: NativeAdvisorParentTurnBaseline | null = null
     const parentTurnIds: string[] = []
     let nextStage: 'prepare' | 'implementation' | 'review' = 'prepare'
+    let pendingTerminalRateLimitRecovery: {
+      reason: 'rate-limit' | 'capacity'
+      resetsAtMs: number
+      stage: 'prepare' | 'implementation' | 'review'
+      phaseSequence: number
+    } | null = null
     let continuationBundle: GitHubPublicationContinuationBundle | undefined
     if (!options.uiApproval && !job.githubPublicationRecovery
       && options.publicationContinuation?.candidates.length) {
@@ -8949,6 +8985,10 @@ export async function executeCodexJob(
         const terminalInterjection = disposition === 'success'
           ? execution.pausedInterjection ?? controls.nextInterjection()
           : null
+        // Any successful terminal on the resumed thread supersedes the
+        // preceding rate-limit terminal. finishTurn has atomically consumed
+        // the durable receipt at this point as well.
+        if (disposition === 'success') pendingTerminalRateLimitRecovery = null
         if (disposition === 'success' && terminalInterjection) {
           try {
             recordPhaseIdentity(execution)
@@ -9004,6 +9044,12 @@ export async function executeCodexJob(
           phaseSequence += 1
           const partialImplementation = stage === 'implementation'
             && !execution.transientFailureSafeToRetry
+          pendingTerminalRateLimitRecovery = {
+            reason: rateLimit.reason ?? 'rate-limit',
+            resetsAtMs: rateLimit.resetsAtMs,
+            stage,
+            phaseSequence: failedPhaseSequence,
+          }
           await waitForTransientModelRecovery({
             reason: rateLimit.reason ?? 'rate-limit',
             resetsAtMs: rateLimit.resetsAtMs,
@@ -9015,6 +9061,24 @@ export async function executeCodexJob(
           continue
         }
         await execution.retireCompletedRegistration()
+        if (pendingTerminalRateLimitRecovery
+          && executionReportsMissingSession(execution)) {
+          const recovery = pendingTerminalRateLimitRecovery
+          // Do not cold-start directly in implementation/review. Return the
+          // exact terminal receipt to the host queue; the next claimed attempt
+          // starts at phase-0 prepare, where the existing missing-thread
+          // fallback creates a fresh App Server and injects durable history
+          // plus the no-blind-replay continuation control.
+          throw new CodexRateLimitError(
+            `${failure}\nThe terminal rate-limit continuation thread is unavailable.`,
+            recovery.resetsAtMs,
+            sessionId ?? undefined,
+            recovery.reason,
+            false,
+            recovery.stage,
+            recovery.phaseSequence,
+          )
+        }
         const safeInitialPrepareFallback = stage === 'prepare'
           && phaseSequence === 0
           && resumed

@@ -348,7 +348,7 @@ send_notification() {
 prepare_state_transition() {
   /usr/bin/python3 - \
     "$STATE_FILE" "$NEXT_STATE_FILE" "$ALERT_FILE" \
-    "$bridge_up" "$runner_up" "$maintenance" "$now_epoch" "$REALERT_MIN" <<'PY'
+    "$bridge_up" "$runner_up" "$launcher_up" "$maintenance" "$now_epoch" "$REALERT_MIN" <<'PY'
 import datetime as dt
 import json
 import os
@@ -357,10 +357,18 @@ import sys
 state_path, next_path, alert_path = sys.argv[1:4]
 bridge_up = sys.argv[4] == "1"
 runner_up = sys.argv[5] == "1"
-maintenance = sys.argv[6] == "1"
-now = int(sys.argv[7])
-realert_seconds = int(sys.argv[8]) * 60
-default = {"status": "up", "downSince": None, "lastAlertAt": None, "consecutiveDownChecks": 0}
+launcher_up = sys.argv[6] == "1"
+maintenance = sys.argv[7] == "1"
+now = int(sys.argv[8])
+realert_seconds = int(sys.argv[9]) * 60
+default = {
+    "status": "up",
+    "downSince": None,
+    "lastAlertAt": None,
+    "consecutiveDownChecks": 0,
+    "incidentKind": None,
+    "incidentSeverity": 0,
+}
 try:
     with open(state_path, encoding="utf-8") as handle:
         state = {**default, **json.load(handle)}
@@ -368,7 +376,7 @@ except Exception:
     state = default.copy()
 
 alert = None
-if bridge_up and runner_up:
+if bridge_up and runner_up and launcher_up:
     if state.get("status") == "down":
         alert = "✅ 応答できる状態に復旧しました。"
     next_state = default.copy()
@@ -379,34 +387,65 @@ elif maintenance:
             "downSince": int(state.get("downSince") or now),
             "lastAlertAt": state.get("lastAlertAt"),
             "consecutiveDownChecks": max(2, int(state.get("consecutiveDownChecks") or 0)),
+            "incidentKind": state.get("incidentKind"),
+            "incidentSeverity": int(state.get("incidentSeverity") or 0),
         }
     else:
         # Planned downtime never creates a down incident or a later recovery
         # notification. A pre-existing incident is preserved above.
         next_state = default.copy()
 else:
+    if not bridge_up:
+        incident_kind, incident_severity = "gateway-down", 3
+    elif not runner_up and launcher_up:
+        incident_kind, incident_severity = "runner-recovering", 1
+    elif not runner_up:
+        incident_kind, incident_severity = "runner-and-recovery-down", 3
+    else:
+        incident_kind, incident_severity = "recovery-down", 2
     consecutive = int(state.get("consecutiveDownChecks") or 0) + 1
     down_since = int(state.get("downSince") or now)
     status = state.get("status") if state.get("status") in ("up", "down") else "up"
     last_alert = state.get("lastAlertAt")
+    previous_severity = int(state.get("incidentSeverity") or 0)
     should_alert = False
     if status == "up" and consecutive >= 2:
         status = "down"
         should_alert = True
-    elif status == "down" and (not last_alert or now - int(last_alert) >= realert_seconds):
+    elif status == "down" and (
+        incident_severity > previous_severity
+        or not last_alert
+        or now - int(last_alert) >= realert_seconds
+    ):
         should_alert = True
     if should_alert:
         since = dt.datetime.fromtimestamp(down_since).strftime("%H:%M")
-        alert = (
-            f"🚨 現在、応答できない状態です。{since}から応答できていません。"
-            "復旧するには、Macの端末で zerochan stop → zerochan start を実行してください。"
-        )
+        if incident_kind == "runner-recovering":
+            alert = (
+                f"⚠️ 現在、処理担当を自動復旧中です。{since}から処理が進んでいません。"
+                "通常はそのまま復旧します。数分たっても復旧通知がない場合だけ、"
+                "Macの端末で zerochan stop --force → zerochan start を実行してください。"
+            )
+        elif incident_kind == "recovery-down":
+            alert = (
+                "⚠️ 自動復旧機構が停止しています。現在の応答と処理は稼働中ですが、"
+                "処理担当を自動再起動できません。Macの端末で zerochan start を実行すると、"
+                "稼働中のgatewayと処理を止めずに自動復旧機構だけを再構築します。"
+            )
+        else:
+            alert = (
+                f"🚨 現在、応答できない状態です。{since}から応答できていません。"
+                "復旧するには、Macの端末で "
+                "zerochan stop --force → zerochan start を実行してください。"
+            )
         last_alert = now
     next_state = {
         "status": status,
         "downSince": down_since,
         "lastAlertAt": last_alert,
         "consecutiveDownChecks": consecutive,
+        "incidentKind": incident_kind,
+        "incidentSeverity": incident_severity,
     }
 
 with open(next_path, "w", encoding="utf-8") as handle:
@@ -446,15 +485,17 @@ run_watchdog() {
 
   bridge_up=0
   runner_up=0
+  launcher_up=0
   maintenance=0
   process_matches "$STATE_DIR/plugin.lock" 'server\.ts' && bridge_up=1
   process_matches "$STATE_DIR/job-runner.lock/pid" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)' && runner_up=1
-  if [ "$bridge_up" != "1" ] || [ "$runner_up" != "1" ]; then
+  process_matches "$STATE_DIR/job-runner-starter.lock" 'runner-launcher\.ts([[:space:]]|$)' && launcher_up=1
+  if [ "$bridge_up" != "1" ] || [ "$runner_up" != "1" ] || [ "$launcher_up" != "1" ]; then
     maintenance_active && maintenance=1
   fi
   now_epoch="$(date +%s)"
   export STATE_DIR STATE_FILE NEXT_STATE_FILE ALERT_FILE REALERT_MIN
-  export bridge_up runner_up maintenance now_epoch
+  export bridge_up runner_up launcher_up maintenance now_epoch
 
   if ! prepare_state_transition; then
     printf 'zerokun watchdog: state transition failed\n' >&2
@@ -476,10 +517,11 @@ run_watchdog() {
   fi
   rm -f "$ALERT_FILE"
 
-  printf '%s zerokun watchdog: bridge=%s runner=%s maintenance=%s\n' \
+  printf '%s zerokun watchdog: bridge=%s runner=%s launcher=%s maintenance=%s\n' \
     "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
     "$([ "$bridge_up" = "1" ] && printf up || printf down)" \
     "$([ "$runner_up" = "1" ] && printf up || printf down)" \
+    "$([ "$launcher_up" = "1" ] && printf up || printf down)" \
     "$([ "$maintenance" = "1" ] && printf active || printf inactive)"
   return 0
 }
@@ -507,28 +549,69 @@ selftest_environment() {
 }
 
 selftest() {
-  local test_dir fake_server fake_runner fake_update fake_restart server_pid runner_pid update_pid restart_pid output
+  local test_dir fake_server fake_runner fake_launcher fake_update fake_restart server_pid runner_pid launcher_pid update_pid restart_pid output
   test_dir="$(mktemp -d "${TMPDIR:-/tmp}/zerokun-watchdog.XXXXXX")" || return 1
   fake_server="$test_dir/server.ts"
   fake_runner="$test_dir/job-runner.ts"
+  fake_launcher="$test_dir/runner-launcher.ts"
   fake_update="$test_dir/.local/bin/zerokun-update"
   fake_restart="$test_dir/codex-channel.sh"
   mkdir -p "$(dirname "$fake_update")"
   printf '#!/bin/bash\nexec -a "$0" sleep 30\n' > "$fake_server"
   printf '#!/bin/bash\nexec -a "$0 $1" sleep 30\n' > "$fake_runner"
+  printf '#!/bin/bash\nexec -a "$0" sleep 30\n' > "$fake_launcher"
   printf '#!/bin/bash\nexec -a "$0" sleep 30\n' > "$fake_update"
   printf '#!/bin/bash\nexec -a "$0 --restart" sleep 30\n' > "$fake_restart"
   /bin/bash "$fake_server" & server_pid=$!
   /bin/bash "$fake_runner" daemon & runner_pid=$!
-  trap "kill $server_pid $runner_pid \${update_pid:-} \${restart_pid:-} 2>/dev/null || true; wait $server_pid $runner_pid \${update_pid:-} \${restart_pid:-} 2>/dev/null || true; rm -rf '$test_dir'" EXIT
+  /bin/bash "$fake_launcher" & launcher_pid=$!
+  trap "kill $server_pid $runner_pid $launcher_pid \${update_pid:-} \${restart_pid:-} 2>/dev/null || true; wait $server_pid $runner_pid $launcher_pid \${update_pid:-} \${restart_pid:-} 2>/dev/null || true; rm -rf '$test_dir'" EXIT
   sleep 0.05
   mkdir -p "$test_dir/job-runner.lock"
   printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
   printf '%s\n' "$runner_pid" > "$test_dir/job-runner.lock/pid"
+  printf '%s\n' "$launcher_pid" > "$test_dir/job-runner-starter.lock"
 
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'healthy alert' || return 1
   printf 'ok: healthy sends nothing\n'
+
+  rm -f "$test_dir/job-runner.lock/pid"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'partial first alert' || return 1
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" == *'処理担当を自動復旧中です'* \
+    && "$output" == *'zerochan stop --force → zerochan start'* ]] \
+    || selftest_fail 'partial runner alert is not actionable' || return 1
+  printf 'ok: partial runner outage reports automatic recovery\n'
+  rm -f "$test_dir/job-runner-starter.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" == *'🚨 現在、応答できない状態です'* \
+    && "$output" == *'zerochan stop --force → zerochan start'* ]] \
+    || selftest_fail 'launcher loss did not immediately escalate runner outage' || return 1
+  grep -q '"incidentKind":"runner-and-recovery-down"' "$test_dir/watchdog-state.json" \
+    && grep -q '"incidentSeverity":3' "$test_dir/watchdog-state.json" \
+    || selftest_fail 'escalated incident classification was not persisted' || return 1
+  printf 'ok: launcher loss immediately escalates active runner outage\n'
+  printf '%s\n' "$runner_pid" > "$test_dir/job-runner.lock/pid"
+  printf '%s\n' "$launcher_pid" > "$test_dir/job-runner-starter.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" == *'✅ 応答できる状態に復旧しました。'* ]] \
+    || selftest_fail 'partial runner recovery missing' || return 1
+  printf 'ok: partial runner recovery sends once\n'
+
+  rm -f "$test_dir/job-runner-starter.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* ]] \
+    || selftest_fail 'launcher-only first alert' || return 1
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" == *'自動復旧機構が停止しています'* \
+    && "$output" == *'zerochan start'* \
+    && "$output" != *'zerochan stop --force'* ]] \
+    || selftest_fail 'launcher-only outage guidance' || return 1
+  printf 'ok: launcher-only outage reports in-place reconstruction\n'
+  printf '%s\n' "$launcher_pid" > "$test_dir/job-runner-starter.lock"
+  ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH" >/dev/null
 
   /bin/bash "$fake_update" & update_pid=$!
   mkdir -p "$test_dir/update.lock"

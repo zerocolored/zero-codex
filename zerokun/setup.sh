@@ -439,11 +439,13 @@ legacy_running_state() {
 
 GATEWAY_SCRIPT="$CH/server.ts"
 RUNNER_SCRIPT="$CH/job-runner.ts"
+RUNNER_LAUNCHER_SCRIPT="$CH/runner-launcher.ts"
 if [ "$LEGACY_CUTOVER" = "1" ]; then
   # Existing legacy processes were launched from the user-facing HOME path,
   # which may differ from pwd -P on macOS (for example /var vs /private/var).
   GATEWAY_SCRIPT="$LEGACY_STATE_DIR/server.ts"
   RUNNER_SCRIPT="$LEGACY_STATE_DIR/job-runner.ts"
+  RUNNER_LAUNCHER_SCRIPT="$LEGACY_STATE_DIR/runner-launcher.ts"
 fi
 RUNNER_PID="$(read_lock_pid "$CH/job-runner.lock/pid")"
 if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)'; then
@@ -474,24 +476,57 @@ if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$
     echo "   旧runnerの実行中job完了を待っています..."
     sleep 2
   done
+fi
+
+# A persistent launcher treats an independently stopped runner as a crash and
+# replaces it. Tear down the launcher first, after the current job has drained,
+# so no old-release runner can appear during helper replacement or migration.
+RUNNER_LAUNCHER_PID="$(read_lock_pid "$CH/job-runner-starter.lock")"
+if process_matches "$RUNNER_LAUNCHER_PID" 'runner-launcher\.ts([[:space:]]|$)'; then
+  if ! lock_process_matches "$CH/job-runner-starter.lock" "$RUNNER_LAUNCHER_PID" \
+    'runner-launcher\.ts([[:space:]]|$)'; then
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/adopt-legacy-lock.ts" \
+      "$CH/job-runner-starter.lock" "$RUNNER_LAUNCHER_PID" "$RUNNER_LAUNCHER_SCRIPT" \
+      || { echo "❌ runner launcher lock identityを検証できないため自動停止しません。" >&2; exit 1; }
+    lock_process_matches "$CH/job-runner-starter.lock" "$RUNNER_LAUNCHER_PID" \
+      'runner-launcher\.ts([[:space:]]|$)' \
+      || { echo "❌ runner launcher lock identityの移行に失敗しました。" >&2; exit 1; }
+  fi
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+    stop-owner "$CH/job-runner-starter.lock" "$RUNNER_LAUNCHER_PID" \
+    'runner-launcher\.ts(?:\s|$)' 30000 \
+    || { echo "❌ 旧runner launcherを世代検証付きで停止できません。" >&2; exit 1; }
+  echo "   旧runner launcherを安全に停止しました"
+fi
+
+# Re-read the daemon lock only after the launcher is gone. The launcher's TERM
+# handler normally stops its child, while older launchers may leave it alive.
+# Both cases converge on one exact, non-respawnable runner generation here.
+RUNNER_PID="$(read_lock_pid "$CH/job-runner.lock/pid")"
+if process_matches "$RUNNER_PID" 'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)'; then
+  if ! lock_process_matches "$CH/job-runner.lock/pid" "$RUNNER_PID" \
+    'job-runner\.ts[[:space:]]+daemon([[:space:]]|$)'; then
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/adopt-legacy-lock.ts" \
+      "$CH/job-runner.lock/pid" "$RUNNER_PID" "$RUNNER_SCRIPT" daemon \
+      || { echo "❌ job runner lock identityを停止境界で検証できません。" >&2; exit 1; }
+  fi
   if pid_is_alive "$RUNNER_PID"; then
     bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
       stop-owner "$CH/job-runner.lock/pid" "$RUNNER_PID" \
       'job-runner\.ts\s+daemon(?:\s|$)' 30000 \
       || { echo "❌ 旧runnerを世代検証付きで停止できません。" >&2; exit 1; }
-  elif [ -e "$CH/job-runner.lock/pid" ]; then
-    # The legacy runner can finish the last job and exit between the drain
-    # query and this stop boundary. Reclaim only the exact, proven-dead lock;
-    # never unlink a PID file directly because the PID may already be reused.
-    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
-      discard "$CH/job-runner.lock/pid" "$RUNNER_PID" \
-      || { echo "❌ 自然終了した旧runnerのlockを安全に回収できません。" >&2; exit 1; }
   fi
   echo "   旧job runnerを安全に停止しました"
+elif [ -n "$RUNNER_PID" ] && [ -e "$CH/job-runner.lock/pid" ]; then
+  # The launcher or the final job can finish the runner between snapshots.
+  # Reclaim only the exact, proven-dead owner; never unlink a PID file directly.
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-lock.ts" \
+    discard "$CH/job-runner.lock/pid" "$RUNNER_PID" \
+    || { echo "❌ 自然終了した旧runnerのlockを安全に回収できません。" >&2; exit 1; }
 fi
 
 # Keep Slack intake available while an existing job drains. Once the runner
-# is stopped no accepted event can start work, so the gateway can be stopped
+# and its launcher are stopped no accepted event can start work, so the gateway can be stopped
 # immediately before storage/setup mutation without leaving a partial outage
 # on a drain timeout.
 GATEWAY_PID="$(read_lock_pid "$CH/plugin.lock")"

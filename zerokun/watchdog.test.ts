@@ -20,6 +20,10 @@ describe('Zero-kun watchdog', () => {
 
     expect(result.exitCode, stderr).toBe(0)
     expect(stdout).toContain('ok: healthy sends nothing')
+    expect(stdout).toContain('ok: partial runner outage reports automatic recovery')
+    expect(stdout).toContain('ok: launcher loss immediately escalates active runner outage')
+    expect(stdout).toContain('ok: partial runner recovery sends once')
+    expect(stdout).toContain('ok: launcher-only outage reports in-place reconstruction')
     expect(stdout).toContain('ok: active update maintenance suppresses down alert')
     expect(stdout).toContain('ok: stale update maintenance resumes down alert')
     expect(stdout).toContain('ok: active restart maintenance suppresses down alert')
@@ -61,7 +65,11 @@ describe('Zero-kun watchdog', () => {
       watchdogSource.indexOf('with open(next_path', start),
     )
     expect(alertProgram).toContain('現在、応答できない状態です')
-    expect(alertProgram).toContain('zerochan stop → zerochan start')
+    expect(alertProgram).toContain('処理担当を自動復旧中です')
+    expect(alertProgram).toContain('incidentSeverity')
+    expect(alertProgram).toContain('自動復旧機構が停止しています')
+    expect(alertProgram).toContain('zerochan stop --force → zerochan start')
+    expect(alertProgram).not.toContain('zerochan stop → zerochan start')
     expect(alertProgram).not.toContain('Zeroちゃん')
     expect(alertProgram).toContain('zerochan start')
     expect(alertProgram).not.toContain('zerokun-restart')
