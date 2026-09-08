@@ -1,10 +1,8 @@
 name: Codex runtime verification
 
 on:
-  push:
-    branches: [main, codex]
-  pull_request:
-    branches: [main, codex]
+  # Full verification runs locally. Hosted macOS runners are opt-in only.
+  workflow_dispatch:
 
 permissions:
   contents: read

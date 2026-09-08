@@ -412,7 +412,16 @@ zerochan update
 通常 FIFO の外にある detached updater が自己デッドロックを避けて実行します。
 remoteの候補commitは隔離cloneをCodex sandbox内でsandbox-safe contract test・型検査・build・shell検査してから
 live branchをfast-forwardします。macOSはsandboxの入れ子を拒否するため、実Codex sandbox・tmux・process制御を
-使うintegration testは通常の`verify.sh`と公開CIで全件実行し、候補sandbox内では再実行しません。
+使うintegration testはローカルの`verify.sh`で全件実行し、候補sandbox内では再実行しません。
+
+### 検証とGitHub Actionsの費用
+
+変更の検証はCodexがローカルで `bash zerokun/verify.sh` を実行します。
+GitHub Actionsはpush・PR作成・更新・マージでは自動起動しません。
+別環境での互換性確認が必要な場合だけ、Actionsの「Codex runtime verification」から
+「Run workflow」を手動実行してください。これはmacOS上でCodex固定版・最新版の2ジョブを
+実行するため、GitHub Actionsの利用枠を消費し、契約に応じて費用が発生します。
+ローカル検証はGitHub Actionsの実行時間を消費しません。
 更新元は`https://github.com/zerocolored/zero-codex(.git)`だけで、local Git configは安全なallowlist外の
 helper・include・HTTP/credential設定があれば実行前に停止します。
 停止前に更新journalとSQLiteの整合snapshotを作成し、setupまたは再起動後の接続確認に失敗した場合は
