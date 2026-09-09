@@ -992,6 +992,170 @@ describe('updater helpers', () => {
     expect(result.exitCode, result.stderr.toString()).toBe(0)
   })
 
+  /**
+   * updaterがstageVerifiedCandidateCodexで作る配置を再現する。候補rootの名前と
+   * 権限まで契約なので、mkdtempの既定modeに頼らず明示する。
+   */
+  function stagedCandidateGitFixture(prefix = 'zerokun-update-candidate-'): {
+    root: string
+    bin: string
+    git: string
+    cleanup: () => void
+  } {
+    const root = mkdtempSync(join(realpathSync('/tmp'), prefix))
+    const bin = join(root, 'trusted-bin')
+    mkdirSync(bin, { mode: 0o700 })
+    const git = join(bin, 'git')
+    copyFileSync('/bin/echo', git)
+    chmodSync(git, 0o500)
+    chmodSync(bin, 0o500)
+    chmodSync(root, 0o700)
+    return {
+      root,
+      bin,
+      git,
+      cleanup: () => {
+        try { chmodSync(bin, 0o700) } catch {}
+        rmSync(root, { recursive: true, force: true })
+      },
+    }
+  }
+
+  function runCandidateGitShell(
+    call: string,
+    environment: Record<string, string>,
+  ): { exitCode: number, stdout: string, stderr: string } {
+    const dir = fixtureDir()
+    const script = join(dir, 'candidate-git-selection.sh')
+    writeFileSync(script, [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      candidateGitDiffFunction(),
+      call,
+      '',
+    ].join('\n'))
+    const result = Bun.spawnSync(['/bin/bash', script], {
+      env: { PATH: '/usr/bin:/bin', HOME: dir, ...environment },
+      stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    })
+    return {
+      exitCode: result.exitCode,
+      stdout: result.stdout.toString(),
+      stderr: result.stderr.toString(),
+    }
+  }
+
+  test('candidate sandboxはupdaterがstagingしたGitをそのまま採用する', () => {
+    // sandboxは開発者directoryを読めない。updaterが検証してtrusted-binへ置いた
+    // gitだけが、この中で使える唯一のgitになる。
+    const staged = stagedCandidateGitFixture()
+    try {
+      const result = runCandidateGitShell('staged_candidate_git', {
+        ZERO_CODEX_CANDIDATE_GIT: staged.git,
+      })
+      expect(result.exitCode, result.stderr).toBe(0)
+      expect(result.stdout.trim()).toBe(staged.git)
+    } finally {
+      staged.cleanup()
+    }
+  })
+
+  test('staging identityを満たさないcandidate Gitは採用しない', () => {
+    const cases: { label: string, build: () => { candidate: string, cleanup: () => void } }[] = [
+      {
+        label: 'path未指定',
+        build: () => ({ candidate: '', cleanup: () => {} }),
+      },
+      {
+        label: '相対path',
+        build: () => ({ candidate: 'trusted-bin/git', cleanup: () => {} }),
+      },
+      {
+        label: 'updaterのものでない候補root名',
+        build: () => {
+          const staged = stagedCandidateGitFixture('zerokun-not-a-candidate-')
+          return { candidate: staged.git, cleanup: staged.cleanup }
+        },
+      },
+      {
+        label: 'trusted-binのmodeが緩い',
+        build: () => {
+          const staged = stagedCandidateGitFixture()
+          chmodSync(staged.bin, 0o700)
+          return { candidate: staged.git, cleanup: staged.cleanup }
+        },
+      },
+      {
+        label: '候補rootのmodeが緩い',
+        build: () => {
+          const staged = stagedCandidateGitFixture()
+          chmodSync(staged.root, 0o755)
+          return { candidate: staged.git, cleanup: staged.cleanup }
+        },
+      },
+      {
+        label: 'gitがsymlink',
+        build: () => {
+          const staged = stagedCandidateGitFixture()
+          chmodSync(staged.bin, 0o700)
+          rmSync(staged.git)
+          symlinkSync('/bin/echo', staged.git)
+          chmodSync(staged.bin, 0o500)
+          return { candidate: staged.git, cleanup: staged.cleanup }
+        },
+      },
+      {
+        label: 'gitがhard link',
+        build: () => {
+          const staged = stagedCandidateGitFixture()
+          chmodSync(staged.bin, 0o700)
+          linkSync(staged.git, join(staged.bin, 'git-alias'))
+          chmodSync(staged.bin, 0o500)
+          return { candidate: staged.git, cleanup: staged.cleanup }
+        },
+      },
+    ]
+    for (const { label, build } of cases) {
+      const { candidate, cleanup } = build()
+      try {
+        const result = runCandidateGitShell('staged_candidate_git', {
+          ZERO_CODEX_CANDIDATE_GIT: candidate,
+        })
+        expect(result.exitCode, `${label}: ${result.stderr}`).not.toBe(0)
+        expect(result.stdout.trim(), label).toBe('')
+      } finally {
+        cleanup()
+      }
+    }
+  })
+
+  test('candidate Gitの採用可否はsandbox在否だけで決める', () => {
+    const staged = stagedCandidateGitFixture()
+    try {
+      // sandbox内: staging済みgitを使い、開発者directoryを引き直さない。
+      const inside = runCandidateGitShell(
+        'candidate_git_diff_check >/dev/null 2>&1 || true\n'
+        + 'staged_candidate_git',
+        {
+          ZERO_CODEX_CANDIDATE_SANDBOX: '1',
+          CODEX_SANDBOX: 'seatbelt',
+          ZERO_CODEX_CANDIDATE_GIT: staged.git,
+        },
+      )
+      expect(inside.exitCode, inside.stderr).toBe(0)
+      expect(inside.stdout.trim()).toBe(staged.git)
+
+      // sandbox外からstaging済みgitを指定されても、黙って使わない。
+      const outside = runCandidateGitShell('candidate_git_diff_check', {
+        ZERO_CODEX_CANDIDATE_GIT: staged.git,
+      })
+      expect(outside.exitCode).not.toBe(0)
+      expect(outside.stderr).toContain('検証済みCodex sandbox内でのみ使用できます')
+    } finally {
+      staged.cleanup()
+    }
+  })
+
   test('rollback用SQLite snapshotをsidecarごと原子的に復元する', () => {
     const dir = fixtureDir()
     const databasePath = join(dir, 'jobs.sqlite3')

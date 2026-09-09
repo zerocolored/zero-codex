@@ -33,8 +33,10 @@ candidate_git_directory_metadata_safe() {
   return 1
 }
 
-candidate_git_diff_check() {
-  local developer_dir physical_developer_dir selected_app candidate_git
+# Xcode / Command Line Tools が選択されている開発者directoryからgitを解決する。
+# updaterのcandidate sandboxはこのdirectoryを読めないため、そこでは使わない。
+developer_candidate_git() {
+  local developer_dir physical_developer_dir selected_app
   local metadata file_type owner group mode checked_path
   local -a checked_paths
 
@@ -119,7 +121,92 @@ candidate_git_diff_check() {
     fi
   done
 
-  candidate_git="$physical_developer_dir/usr/bin/git"
+  printf '%s\n' "$physical_developer_dir/usr/bin/git"
+}
+
+# staging済みcandidate Gitの1要素を、期待するfile種別・owner・mode・hard link数と
+# 突き合わせる。expected_linksが空なら、directoryのようにlink数が可変のものとして
+# link数を見ない。
+staged_candidate_metadata_safe() {
+  local target="$1" expected_type="$2" expected_mode="$3" expected_links="${4:-}"
+  local metadata file_type owner links mode
+
+  metadata="$(LANG=C LC_ALL=C /usr/bin/stat -f '%HT:%u:%l:%Lp' "$target" 2>/dev/null)" || {
+    echo "error: staging済みcandidate検証用Gitの ${target} を検証できません" >&2
+    return 1
+  }
+  if [[ ! "$metadata" =~ ^([^:]+):([0-9]+):([0-9]+):([0-7]{3,4})$ ]]; then
+    echo "error: staging済みcandidate検証用Gitの ${target} のmetadataが不正です" >&2
+    return 1
+  fi
+  file_type="${BASH_REMATCH[1]}"
+  owner="${BASH_REMATCH[2]}"
+  links="${BASH_REMATCH[3]}"
+  mode="${BASH_REMATCH[4]}"
+  if [[ "$file_type" != "$expected_type" || "$owner" != "$EUID" ]] \
+    || (( 8#$mode != 8#$expected_mode )) \
+    || [[ -n "$expected_links" && "$links" != "$expected_links" ]]; then
+    echo "error: staging済みcandidate検証用Gitの ${target} が想定と異なります" >&2
+    return 1
+  fi
+}
+
+# updaterがstageVerifiedCandidateCodexで配置し、ZERO_CODEX_CANDIDATE_GITで渡してくる
+# 検証済みgitを解決する。要求するstaging identityは zerokun/project-git.ts の
+# candidateGitExecutable と同じにする。
+staged_candidate_git() {
+  local candidate physical trusted_bin candidate_root system_temporary
+
+  candidate="${ZERO_CODEX_CANDIDATE_GIT:-}"
+  if [[ -z "$candidate" || "$candidate" != /* || ${#candidate} -gt 1024 \
+    || "$candidate" == *$'\n'* || "$candidate" =~ [[:cntrl:]] ]]; then
+    echo 'error: staging済みcandidate検証用Gitのpathが不正です' >&2
+    return 1
+  fi
+  physical="$(
+    cd -P -- "$(dirname -- "$candidate")" 2>/dev/null \
+      && printf '%s/%s\n' "$(pwd -P)" "$(basename -- "$candidate")"
+  )" || {
+    echo 'error: staging済みcandidate検証用Gitを解決できません' >&2
+    return 1
+  }
+  if [[ "$physical" != "$candidate" || "$(basename -- "$physical")" != 'git' ]]; then
+    echo 'error: staging済みcandidate検証用Gitが物理pathではありません' >&2
+    return 1
+  fi
+  trusted_bin="$(dirname -- "$physical")"
+  candidate_root="$(dirname -- "$trusted_bin")"
+  system_temporary="$(cd -P -- /tmp 2>/dev/null && pwd -P)" || {
+    echo 'error: system temporary directoryを解決できません' >&2
+    return 1
+  }
+  if [[ "$(dirname -- "$candidate_root")" != "$system_temporary" \
+    || ! "$(basename -- "$candidate_root")" =~ ^zerokun-update-candidate-[A-Za-z0-9]+$ ]]; then
+    echo 'error: staging済みcandidate検証用Gitの配置が想定外です' >&2
+    return 1
+  fi
+  staged_candidate_metadata_safe "$candidate_root" 'Directory' 0700 || return 1
+  staged_candidate_metadata_safe "$trusted_bin" 'Directory' 0500 || return 1
+  staged_candidate_metadata_safe "$physical" 'Regular File' 0500 1 || return 1
+  printf '%s\n' "$physical"
+}
+
+candidate_git_diff_check() {
+  local candidate_git metadata owner mode
+
+  # candidate sandboxはseatbelt内で走り、開発者directoryを読めない。updaterは
+  # そこへ入る前に開発者directoryのgitを検証してtrusted-binへstageし、その物理path
+  # をZERO_CODEX_CANDIDATE_GITで渡している。sandbox内で開発者directoryを引き直すと
+  # 必ず失敗するので、渡されたstaging済みgitを使う。判定は zerokun/project-git.ts の
+  # projectGitExecutable と同じく環境変数だけで行い、この関数を単体で呼べる状態に保つ。
+  if [[ "${ZERO_CODEX_CANDIDATE_SANDBOX:-}" == "1" && "${CODEX_SANDBOX:-}" == "seatbelt" ]]; then
+    candidate_git="$(staged_candidate_git)" || return 1
+  elif [[ -n "${ZERO_CODEX_CANDIDATE_GIT:-}" ]]; then
+    echo 'error: staging済みcandidate検証用Gitは検証済みCodex sandbox内でのみ使用できます' >&2
+    return 1
+  else
+    candidate_git="$(developer_candidate_git)" || return 1
+  fi
   if [[ ! -f "$candidate_git" || -L "$candidate_git" || ! -x "$candidate_git" ]]; then
     echo 'error: candidate検証用Gitが安全な実行fileではありません' >&2
     return 1
