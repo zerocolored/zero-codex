@@ -290,6 +290,38 @@ const TRANSIENT_INITIAL_CONTEXT_SLACK_ERRORS = new Set([
 ])
 
 /**
+ * Transport failures that mean "the network went away", not "this request is
+ * wrong". A laptop that sleeps or drops Wi-Fi produces these against every
+ * in-flight Slack call at once.
+ *
+ * ENOTFOUND is here because macOS getaddrinfo returns it while the interface is
+ * down, not only for a genuinely unknown host — and slack.com is never
+ * genuinely unknown.
+ */
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',
+  'ENOTFOUND', 'ENETDOWN', 'ENETUNREACH', 'EHOSTUNREACH',
+])
+
+/**
+ * True when the failure is the network being gone. Retrying is the durable
+ * queue's job, so callers use this to hold their attempt budget rather than
+ * spend it — and the process uses it to stay alive instead of dying with the
+ * Wi-Fi. `cause` is walked because the SDK wraps socket errors before they
+ * surface.
+ */
+export function isTransientNetworkFailure(error: unknown): boolean {
+  for (let current: unknown = error, depth = 0; current && depth < 4; depth += 1) {
+    if (typeof current !== 'object') break
+    const candidate = current as { code?: unknown; cause?: unknown }
+    if (typeof candidate.code === 'string'
+      && TRANSIENT_NETWORK_ERROR_CODES.has(candidate.code.toUpperCase())) return true
+    current = candidate.cause
+  }
+  return false
+}
+
+/**
  * Classify the initial root→mention read without interpreting user-authored
  * text. Known permanent platform errors fail that one inbound row; known
  * backpressure/transport errors keep its finite attempt budget intact.
@@ -301,11 +333,9 @@ export function slackInitialThreadContextFailureDisposition(
   if (structured && PERMANENT_INITIAL_CONTEXT_SLACK_ERRORS.has(structured)) return 'fail'
   if (structured && TRANSIENT_INITIAL_CONTEXT_SLACK_ERRORS.has(structured)) return 'defer'
 
+  if (isTransientNetworkFailure(error)) return 'defer'
   if (error && typeof error === 'object') {
-    const candidate = error as { code?: unknown; statusCode?: unknown; status?: unknown }
-    const code = typeof candidate.code === 'string' ? candidate.code.toUpperCase() : ''
-    if (['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETDOWN', 'ENETUNREACH']
-      .includes(code)) return 'defer'
+    const candidate = error as { statusCode?: unknown; status?: unknown }
     const status = typeof candidate.statusCode === 'number'
       ? candidate.statusCode
       : typeof candidate.status === 'number'
