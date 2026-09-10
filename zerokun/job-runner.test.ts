@@ -104,6 +104,7 @@ import {
   parseCodexResult,
   parseCodexReviewDecision,
   requiredAdvisorRoundsForJob,
+  isSupportedDeveloperDirectory,
   resolveCodexToolchainRuntime,
   resolveCodexExecutable,
   resolveGitMetadataPaths,
@@ -11737,6 +11738,63 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(runtime.path).not.toContain(repoBin)
     expect(runtime.path).not.toContain(stateBin)
     expect(runtime.path).not.toContain('relative')
+  })
+
+  test.skipIf(process.platform !== 'darwin')(
+    'macOSでは選択中の開発者directoryを読めるようにする',
+    () => {
+      const dir = fixtureDir()
+      // macOS の /usr/bin/git は開発者directoryへ転送する shim なので、PATH だけ
+      // 許可しても `xcrun: invalid active developer path` で起動できない。job は
+      // repository を触るために git を使うため、その転送先も読めなければならない。
+      const selected = Bun.spawnSync(['/usr/bin/xcode-select', '-p'], {
+        env: { PATH: '/usr/bin:/bin', HOME: '/var/empty', LANG: 'C', LC_ALL: 'C' },
+        stdin: 'ignore', stdout: 'pipe', stderr: 'ignore',
+      })
+      expect(selected.exitCode).toBe(0)
+      const developerDirectory = realpathSync(selected.stdout.toString().trim())
+      const runtime = resolveCodexToolchainRuntime({
+        sourcePath: '/usr/bin:/bin',
+        repoPath: join(dir, 'repo'),
+        stateDir: join(dir, 'state'),
+        artifactDir: join(dir, 'outbox'),
+        scratchDir: join(dir, 'tmp'),
+        homeDir: dir,
+      })
+      expect(runtime.readPaths).toContain(developerDirectory)
+      // PATH そのものは変えない。読み取り許可だけを足す。
+      expect(runtime.path.split(':')).toEqual(['/usr/bin', '/bin', '/usr/sbin', '/sbin'])
+      expect(runtime.path).not.toContain(developerDirectory)
+    },
+  )
+
+  test('開発者directoryはAppleが配置する2形だけを受理する', () => {
+    // Xcode を入れている Mac と Command Line Tools だけの Mac の両方を、
+    // その環境が手元になくても固定できるようにする。
+    for (const accepted of [
+      '/Library/Developer/CommandLineTools',
+      '/Applications/Xcode.app/Contents/Developer',
+      '/Applications/Xcode-beta.app/Contents/Developer',
+      '/Applications/Xcode_16.2.app/Contents/Developer',
+    ]) {
+      expect(isSupportedDeveloperDirectory(accepted), accepted).toBe(true)
+    }
+    for (const rejected of [
+      '',
+      '/',
+      '/Library/Developer',
+      '/Library/Developer/CommandLineTools/usr',
+      '/library/developer/commandlinetools',
+      '/Applications/Contents/Developer',
+      '/Applications/Developer/Xcode.app/Contents/Developer',
+      '/Applications/Xcode.app/Contents/Developer/usr',
+      '/Applications/NotXcode.app/Contents/Developer',
+      '/Applications/Xcode.app',
+      '/Users/someone/Xcode.app/Contents/Developer',
+      '/opt/Xcode.app/Contents/Developer',
+    ]) {
+      expect(isSupportedDeveloperDirectory(rejected), rejected).toBe(false)
+    }
   })
 
   test('permission profileはHOME/stateを閉じ、repo・当該添付・outboxだけを再許可する', () => {
