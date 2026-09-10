@@ -2368,6 +2368,52 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('bootstrapに失敗した先行投稿はスレッドを塞ぎ続けない', () => {
+    const store = makeStore()
+    const channel = 'C0123456789'
+    const rootTs = '1800000400.000100'
+    const failedTs = '1800000401.000100'
+    const triggerTs = '1800000402.000100'
+    // failInboundDelivery records a failed job for the message it could not
+    // prepare. Treating that row as a claim makes the failure self
+    // perpetuating: the next request in the thread cannot absorb it, fails the
+    // same way, and records another blocker. A failed job answered nothing and
+    // never returns to the queue, so the retry must be able to fold it in.
+    store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: channel, threadTs: rootTs, messageId: failedTs,
+      userId: 'U0OTHER', repoPath: '/tmp/project', text: '前の依頼',
+    }, { initialContextEligible: true, appId: 'A0123456789' })
+    const broken = store.claimNextInboundDelivery()!
+    const brokenJobId = store.failInboundDelivery(
+      broken.idempotencyKey, 'fixture bootstrap failure',
+    )
+    expect(store.get(brokenJobId)).toMatchObject({
+      status: 'failed', messageId: failedTs,
+    })
+
+    store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: channel, threadTs: rootTs, messageId: triggerTs,
+      userId: 'U0TRIGGER', repoPath: '/tmp/project', text: '確認して',
+    }, { initialContextEligible: true, appId: 'A0123456789' })
+    const claimed = store.claimNextInboundDelivery()!
+    const hydrated = store.finalizeInboundThreadBootstrap(claimed.idempotencyKey, {
+      mode: 'context',
+      canonical: {
+        messageId: triggerTs, userId: 'U0TRIGGER', text: '確認して',
+        fileIds: [], writeEnabled: false, isInterrupt: false,
+      },
+      text: 'root\n前の依頼\n確認して',
+      fileIds: [],
+      consumedMessageTs: [rootTs, failedTs],
+      followups: [],
+    })
+    expect(hydrated).toMatchObject({
+      text: 'root\n前の依頼\n確認して',
+      initialContextState: 'hydrated',
+    })
+    store.close()
+  })
+
   test('同じ未所有threadへの別mentionは最初の1件だけ初期文脈を要求する', () => {
     const store = makeStore()
     const common = {

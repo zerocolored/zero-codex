@@ -6142,9 +6142,15 @@ export class JobStore {
       }
 
       // A message that already became durable work belongs to that work alone.
+      // A failed job is the exception. It answered nothing and never returns to
+      // the queue — every requeue path requires status = 'running' — so keeping
+      // its claim would block the thread for good. failInboundDelivery records
+      // such a job for a message it could not prepare, which makes the failure
+      // self perpetuating unless the retry can fold that message back in.
       const claimedByDurableWork = (eventKey: string): boolean => (
         this.db.query<{ present: number }, [string, string, string, string]>(
-          `SELECT 1 AS present FROM jobs WHERE idempotency_key = ?
+          `SELECT 1 AS present FROM jobs
+             WHERE idempotency_key = ? AND status <> 'failed'
            UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = ?
