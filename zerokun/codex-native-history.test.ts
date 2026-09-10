@@ -370,6 +370,7 @@ describe('native advisor App Server history', () => {
     const overrides = nativeAdvisorHistoryPermissionOverrides([
       'mcp_servers={zerokun_advisors={command="/safe/broker",args=[],enabled=true},host_http={url="http://127.0.0.1:9",enabled=false},host_stdio={command="/usr/bin/false",args=[],enabled=false}}',
       'features.multi_agent=true',
+      'features.goals=true',
     ])
     const mcp = overrides.filter(value => value.startsWith('mcp_servers='))
     expect(mcp).toHaveLength(1)
@@ -384,6 +385,8 @@ describe('native advisor App Server history', () => {
       enabled: false, url: 'http://127.0.0.1:9',
     })
     expect(overrides.filter(value => value === 'features.multi_agent=false')).toHaveLength(1)
+    expect(overrides.filter(value => value === 'features.goals=false')).toHaveLength(1)
+    expect(overrides).not.toContain('features.goals=true')
   })
 
   test('history readerは重複またはdotted MCP overrideをspawn前に拒否する', () => {

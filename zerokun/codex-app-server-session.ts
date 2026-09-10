@@ -1211,6 +1211,17 @@ export class CodexAppServerSession {
     })
   }
 
+  takeNativeTurnStart(threadId: string, knownTurnIds: readonly string[]): string | null {
+    for (let index = 0; index < this.notifications.length; index += 1) {
+      const notification = this.notifications[index]!
+      if (notification.method !== 'turn/started' || notification.params.threadId !== threadId) continue
+      const turn = parseTurn(notification.params.turn)
+      this.notifications.splice(index--, 1)
+      if (!knownTurnIds.includes(turn.id)) return turn.id
+    }
+    return null
+  }
+
   hasNextTurnActivity(threadId: string, turnId: string): boolean {
     for (const notification of this.notifications) {
       if (notification.method === 'error') return true

@@ -83,9 +83,10 @@ describe('durable Slack thread reply intent ledger', () => {
     const duplicate = stage(store, messageId)
     expect(duplicate.inputDigest).toBe(first.inputDigest)
 
-    const claimed = store.claimSlackThreadReplyIntent(first.idempotencyKey, 1_789_000_200_000)
+    const now = Date.now()
+    const claimed = store.claimSlackThreadReplyIntent(first.idempotencyKey, now)
     expect(claimed?.status).toBe('processing')
-    store.completeSlackThreadReplyIntent(first.idempotencyKey, 'addressed', 1_789_000_200_100)
+    store.completeSlackThreadReplyIntent(first.idempotencyKey, 'addressed', now + 100)
     expect(store.hasDurableEvent(first.idempotencyKey)).toBe(false)
     store.close()
 

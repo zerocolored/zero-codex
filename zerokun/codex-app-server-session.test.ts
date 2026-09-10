@@ -55,6 +55,26 @@ function mockTransport(
 }
 
 describe('Codex App Server session', () => {
+  test('native turn start consumes only new turns of the requested root thread', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    const start = (threadId: string, id: string) => transport.emit({
+      method: 'turn/started', params: { threadId, turn: {
+        id, status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } },
+    })
+    start('root', 'first')
+    start('other', 'foreign')
+    await Bun.sleep(0)
+    expect(session.takeNativeTurnStart('root', ['first'])).toBeNull()
+    start('root', 'second')
+    await Bun.sleep(0)
+    expect(session.takeNativeTurnStart('root', ['first'])).toBe('second')
+    expect(session.takeNativeTurnStart('root', ['first', 'second'])).toBeNull()
+    expect(session.takeNativeTurnStart('other', [])).toBe('foreign')
+    session.closeInput()
+    await session.waitForReader()
+  })
   test('長い会話のresumeは履歴本体の返却だけを省略し同じthreadへ接続する', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'zero-resume-metadata-'))
     const transport = mockTransport((request, emit) => {

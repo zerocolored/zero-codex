@@ -16,6 +16,7 @@ import {
   type Dirent,
 } from 'fs'
 import { createHash, randomBytes, randomUUID } from 'crypto'
+import { ensureTaskGoal, readTaskGoal, type GoalStatus } from './codex-goal.ts'
 import { homedir, tmpdir } from 'os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import type {
@@ -678,6 +679,7 @@ export function nativeAdvisorHistoryPermissionOverrides(
     ['features.plugins', 'false'],
     ['features.remote_plugin', 'false'],
     ['features.hooks', 'false'],
+    ['features.goals', 'false'],
     ['features.browser_use', 'false'],
     ['features.browser_use_external', 'false'],
     ['features.browser_use_full_cdp_access', 'false'],
@@ -5028,6 +5030,7 @@ export function buildCodexPermissionOverrides(
     localVerificationEnabled?: boolean
     browserAccessEnabled?: boolean
     multiAgentEnabled?: boolean
+    taskGoalEnabled?: boolean
     toolchainPath?: string
     /** Fixture-only selection override. Production uses the release constants. */
     model?: string
@@ -5269,7 +5272,7 @@ export function buildCodexPermissionOverrides(
     'features.plugins=false',
     'features.remote_plugin=false',
     'features.hooks=false',
-    'features.goals=false',
+    `features.goals=${options.taskGoalEnabled === true ? 'true' : 'false'}`,
     `features.browser_use=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}`,
     'features.browser_use_full_cdp_access=false',
@@ -5772,6 +5775,7 @@ export interface CodexLiveControlHooks {
   next(): JobLiveInputRecord | null
   nextInterjection(): JobInterjectionRecord | null
   bindTurn(executorNonce: string, threadId: string, turnId: string): void
+  recordGoalStatus?(status: GoalStatus): void
   beginInitialDispatch(options: {
     executorNonce: string
     threadId: string
@@ -6412,6 +6416,7 @@ export async function executeCodexJob(
         browserAccessEnabled: browserEnabled,
         multiAgentEnabled: !continuationDecision
           && stage !== 'implementation' && stage !== 'interjection',
+        taskGoalEnabled: stage === 'complete',
         model,
         reasoningEffort,
       })
@@ -7131,6 +7136,7 @@ export async function executeCodexJob(
       let inputChangedBeforeDispatch = false
       let observedSessionId: string | null = sessionId
       let finalMessage = ''
+      let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null
       let currentThreadSource: AppServerSessionSource | null = null
@@ -7298,6 +7304,12 @@ export async function executeCodexJob(
         capturedProgress = null
         let requestId: number | null = null
         try {
+          // Suspend native continuation before asking the root turn to yield
+          // for a question. Otherwise the goal can start another work turn
+          // before the existing interjection pause receipt is consumed.
+          if (stage === 'complete' && (control.kind === 'interjection' || control.kind === 'interrupt')) {
+            await session.request('thread/goal/set', { threadId, status: 'paused' }, { timeoutMs: 15_000 })
+          }
           const response = control.kind === 'interrupt'
             ? await session.interrupt(threadId, turnId, {
               beforeWrite: id => {
@@ -7617,6 +7629,10 @@ export async function executeCodexJob(
         }
         let initialRequestId: number | null = null
         try {
+          if (stage === 'complete') {
+            await ensureTaskGoal(session, currentThreadId, job.id)
+            controls.recordGoalStatus?.('active')
+          }
           activeTurnTransientFailure = null
           currentTurnId = await session.startTurn(
             currentThreadId,
@@ -7932,6 +7948,38 @@ export async function executeCodexJob(
               finalMessage = message
               protocolCompleted = true
               break
+            }
+            // A physical turn ending is not task completion while the native
+            // goal is active. App Server owns continuation; never send a second
+            // synthetic user request or restart the development workflow here.
+            if (stage === 'complete' && terminal.turn.status === 'completed'
+              && !pausedInterjection && !rateLimit.rateLimited && !controls.cancellationRequested()) {
+              let goal = await readTaskGoal(session, currentThreadId)
+              let nativeTurn = session.takeNativeTurnStart(currentThreadId, parentTurnIds)
+              if (goal?.status === 'active' || nativeTurn) {
+                controls.finishTurn({
+                  executorNonce: advisorAttempt.attemptNonce,
+                  threadId: currentThreadId, turnId: currentTurnId, retainInput: true,
+                })
+                while (!controls.cancellationRequested() && !abortedBeforeProcessExit) {
+                  nativeTurn ??= session.takeNativeTurnStart(currentThreadId, parentTurnIds)
+                  if (nativeTurn) break
+                  goal = await readTaskGoal(session, currentThreadId)
+                  if (!goal || goal.status !== 'active') break
+                  await Bun.sleep(APP_SERVER_CONTROL_POLL_MS)
+                }
+                if (nativeTurn) {
+                  currentTurnId = nativeTurn
+                  parentTurnIds.push(nativeTurn)
+                  controls.bindTurn(advisorAttempt.attemptNonce, currentThreadId, nativeTurn)
+                  continue
+                }
+                // Rebind the terminal for the existing finish barrier after
+                // native goal suspension or cancellation during the turn gap.
+                controls.bindTurn(advisorAttempt.attemptNonce, currentThreadId, currentTurnId)
+              }
+              taskGoalStatus = goal?.status
+              if (taskGoalStatus) controls.recordGoalStatus?.(taskGoalStatus)
             }
             let barrier = controls.finishTurn({
               executorNonce: advisorAttempt.attemptNonce,
@@ -8315,6 +8363,7 @@ export async function executeCodexJob(
         stderr,
         timedOut: false,
         finalMessage,
+        taskGoalStatus,
         observedSessionId,
         interruptedAtExit,
         protocolCompleted: protocolCompleted && protocolError == null,
@@ -10349,6 +10398,8 @@ export async function executeCodexJob(
           result = {
             sessionId: resolvedSessionId,
             result: parseCodexResult(execution.stdout, execution.finalMessage),
+            ...('taskGoalStatus' in execution && execution.taskGoalStatus !== 'complete'
+              && execution.taskGoalStatus ? { taskGoalStatus: execution.taskGoalStatus } : {}),
             ...(advisorCoverage ? { advisorCoverage } : {}),
             ...(execution.capturedArtifacts.length > 0
               ? { capturedArtifacts: execution.capturedArtifacts }
@@ -10364,6 +10415,8 @@ export async function executeCodexJob(
           result = {
             sessionId: resolvedSessionId,
             result: parseCodexResult(execution.stdout, execution.finalMessage),
+            ...('taskGoalStatus' in execution && execution.taskGoalStatus !== 'complete'
+              && execution.taskGoalStatus ? { taskGoalStatus: execution.taskGoalStatus } : {}),
             ...(advisorCoverage ? { advisorCoverage } : {}),
             ...(execution.capturedArtifacts.length > 0
               ? { capturedArtifacts: execution.capturedArtifacts }

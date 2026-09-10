@@ -210,7 +210,7 @@ describe('Zero-kun Codex wiring', () => {
     expect(executor).toContain('project_doc_max_bytes=262144')
     expect(executor).toContain("features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}")
     expect(executor).toContain('multiAgentEnabled: !continuationDecision')
-    expect(executor).toContain('features.goals=false')
+    expect(executor).toContain('taskGoalEnabled: stage === \'complete\'')
     expect(executor).toContain("features.browser_use=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain("features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain('features.browser_use_full_cdp_access=false')

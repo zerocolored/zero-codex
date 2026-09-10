@@ -504,6 +504,7 @@ type InboundDeliveryRow = {
 }
 
 export interface JobRecord {
+  taskGoalStatus?: string | null
   seq: number
   id: string
   idempotencyKey: string
@@ -1938,6 +1939,7 @@ function ensureJobSchemaMigrations(db: Database): void {
       "TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'failed', 'cancelled'))",
     ],
     ['ui_approval_request_id', 'TEXT'],
+    ['task_goal_status', 'TEXT'],
     ['rate_limit_terminal_json', 'TEXT'],
   ] as const) {
     const current = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
@@ -2883,6 +2885,7 @@ function mapRow(row: JobRow): JobRecord {
     activeTurnId: row.active_turn_id,
     cancelRequestedAt: row.cancel_requested_at,
     terminalOutcome: row.terminal_outcome,
+    taskGoalStatus: (row as typeof row & { task_goal_status?: string | null }).task_goal_status ?? null,
     uiApprovalRequestId: row.ui_approval_request_id,
     rateLimitRecovery: parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json),
   }
@@ -7091,6 +7094,13 @@ export class JobStore {
       ],
     ))
     if (updated.changes !== 1) throw new Error(`App Server turn binding changed for ${jobIdInput}`)
+  }
+
+  recordTaskGoalStatus(jobId: string, status: string): void {
+    retrySqlite(() => this.db.run(
+      'UPDATE jobs SET task_goal_status = ? WHERE id = ? AND status = \'running\'',
+      [status, jobId],
+    ))
   }
 
   beginInitialTurnDispatch(options: {
@@ -12923,6 +12933,7 @@ export function createExecutorPidLifecycle(
 }
 
 export interface JobExecutionResult {
+  taskGoalStatus?: string
   sessionId: string
   result: string
   /** Host-captured browser images kept outside the model-writable outbox. */
@@ -13678,7 +13689,8 @@ export async function flushTerminalNotifications(
         )
         if (signal?.aborted) return
       }
-      if (notification.kind === 'completed' && notifier.completionReaction) {
+      if (notification.kind === 'completed' && notifier.completionReaction
+        && (!notification.job.taskGoalStatus || notification.job.taskGoalStatus === 'complete')) {
         await notifier.completionReaction(notification.job, notification.id, signal)
         if (signal?.aborted) return
       }
@@ -16985,7 +16997,10 @@ export class SlackNotifier implements JobNotifier {
       'delivery',
     )
     if (!notificationId || !this.store.terminalNotificationBodyDelivered(notificationId)) {
-      await this.post(job, safeText || 'できました ✅', notificationId, signal)
+      const waiting = job.taskGoalStatus && job.taskGoalStatus !== 'complete'
+      await this.post(job, waiting
+        ? `⏸️ 未完了・待機中です。\n\n${safeText || '続行に必要な条件を確認してください。'}`
+        : safeText || 'できました ✅', notificationId, signal)
       if (signal?.aborted) return
       if (notificationId) this.store.markTerminalNotificationBodyDelivered(notificationId)
     }
@@ -18584,7 +18599,8 @@ async function runCli(): Promise<void> {
             ? 'cancelled'
             : job.status === 'failed'
               ? 'failed'
-              : job.uiApprovalRequestId !== null ? 'waiting' : 'completed',
+              : job.uiApprovalRequestId !== null
+                || (job.taskGoalStatus && job.taskGoalStatus !== 'complete') ? 'waiting' : 'completed',
           onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
         })
       },
@@ -18628,6 +18644,7 @@ async function runCli(): Promise<void> {
             onSessionId: sessionId => store.saveSession(job.id, sessionId),
             onSessionReset: () => store.clearSession(job.id),
             liveControls: {
+              recordGoalStatus: status => store.recordTaskGoalStatus(job.id, status),
               next: () => store.nextReadyLiveInput(job.id, job.controlEpoch),
               nextInterjection: () => store.nextPendingInterjection(job.id, job.controlEpoch),
               bindTurn: (executorNonce, threadId, turnId) => store.bindAppServerTurn(

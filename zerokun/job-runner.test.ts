@@ -15169,6 +15169,30 @@ describe('durable terminal notifications', () => {
     store.close()
   })
 
+  test('Goal判断待ちはDB再open後も完了リアクションを送らない', async () => {
+    const dbPath = join(fixtureDir(), 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    store.enqueue(input())
+    const job = store.claimNext('serial-worker')!
+    store.recordTaskGoalStatus(job.id, 'blocked')
+    store.complete(job.id, 'thread-goal', '承認が必要です')
+    store.close()
+    store = new JobStore(dbPath)
+    let delivered = 0
+    let reactions = 0
+    await flushTerminalNotifications(store, {
+      completed: async current => {
+        expect(current.taskGoalStatus).toBe('blocked')
+        delivered += 1
+      },
+      completionReaction: async () => { reactions += 1 },
+    }, () => {}, 1)
+    expect(delivered).toBe(1)
+    expect(reactions).toBe(0)
+    expect(store.terminalNotificationCount()).toBe(0)
+    store.close()
+  })
+
   test('Slack失敗後もDBへ残り、daemon再開相当のflushで再送する', async () => {
     const dir = fixtureDir()
     const dbPath = join(dir, 'jobs.sqlite3')

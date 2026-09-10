@@ -319,8 +319,10 @@ permission_profile = ""
 steer_client_id = None
 progress_probe_count = 0
 persisted_items = {}
+goal_status = None
 
 def observe_emission(value):
+    global goal_status
     method = value.get("method")
     params = value.get("params", {})
     if method == "turn/started":
@@ -334,6 +336,8 @@ def observe_emission(value):
         if observed_turn_id and isinstance(observed_item, dict):
             persisted_items.setdefault(observed_turn_id, []).append(observed_item)
     elif method == "turn/completed":
+        if goal_status == "active":
+            goal_status = "blocked" if mode == "goal-blocked" else "complete"
         observed_turn = params.get("turn", {})
         observed_turn_id = observed_turn.get("id")
         terminal_items = observed_turn.get("items", [])
@@ -370,6 +374,11 @@ for line in sys.stdin:
             while True:
                 time.sleep(30)
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
+    elif method == "thread/goal/get":
+        emit({"id": request_id, "result": {"goal": None if goal_status is None else {"objective": "fixture task", "status": goal_status}}})
+    elif method == "thread/goal/set":
+        goal_status = value.get("params", {}).get("status", "active")
+        emit({"id": request_id, "result": {"goal": {"objective": "fixture task", "status": goal_status}}})
     elif method in ("thread/start", "thread/resume"):
         params = value.get("params", {})
         if method == "thread/resume" and (os.environ.get("ZERO_FORCE_OVERSIZED_RESUME") == "1" or (os.environ.get("ZERO_LARGE_RESUME_HISTORY") == "1" and params.get("excludeTurns") is not True)):
@@ -471,7 +480,15 @@ for line in sys.stdin:
             while not os.path.exists(turn_latch_release):
                 time.sleep(0.01)
         fixture_state = os.environ.get("ZERO_INTERJECTION_FIXTURE_STATE")
-        if is_legacy_continuation:
+        if mode == "goal-native":
+            emit_batch([
+                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "interim", "text": "残タスクがあります"}], "error": None}}},
+                {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": [], "error": None}}},
+                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "native-final", "text": "Goalを完遂しました"}], "error": None}}},
+            ])
+        elif mode == "goal-blocked":
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "判断を待っています"}], "error": None}}})
+        elif is_legacy_continuation:
             continuation_answers = {
                 "defer": "次ターンで追加入力を反映しました",
                 "terminal-race": "次ターンで追加入力を反映しました",
@@ -950,7 +967,7 @@ function fixture(
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
-    | 'failed-steer' | 'failed-turn'
+    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked'
     | 'error-steer' | 'rate-error' | 'rate-retrying' | 'rate-retrying-two-turn'
     | 'capacity-error'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
@@ -2224,6 +2241,27 @@ describe('production App Server executor', () => {
     })
     value.store.close()
   }, 30_000)
+
+  for (const mode of ['goal-native', 'goal-blocked'] as const) {
+    test(`native goal lifecycle ${mode}`, async () => {
+      const value = fixture(mode)
+      const statuses: string[] = []
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable,
+        logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: mode },
+        liveControls: { ...value.hooks, recordGoalStatus: status => statuses.push(status) },
+      })
+      expect(statuses).toEqual(['active', mode === 'goal-native' ? 'complete' : 'blocked'])
+      expect(result.taskGoalStatus).toBe(mode === 'goal-native' ? undefined : 'blocked')
+      if (mode === 'goal-native') {
+        expect(result.result).toContain('Goalを完遂しました')
+        expect(result.result).not.toContain('残タスクがあります')
+      }
+      value.store.close()
+    }, 30_000)
+  }
 
   for (const shouldResume of [false, true]) {
     test(`${shouldResume ? 'native resume' : 'fresh physical session'}の履歴注入を一意にする`, async () => {

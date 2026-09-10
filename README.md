@@ -86,6 +86,11 @@ Slack bot
   project側の`AGENTS.md`は任意です。調査、advisor、実装、review、test、Git、PR、merge、deployの
   手順と判断は、この指示を読んだprimary Codex自身が1つのworkflow内で担当します。Zeroちゃんは
   独自のprepare／implementation／review／publication phaseやreview照合を追加しません。
+- 新規依頼にはメインCodexの標準Goalを設定します。途中の回答だけでは終了せず、Goalがactiveの間は
+  App Serverの自動継続ターンを追跡します。同じ未完了スレッドの再開では目標と使用履歴を保持します。
+  判断・認証・権限などが必要な待機は未完了として通知し、完了リアクションを付けません。
+  停止指示とレート制限は従来の処理を維持します。Goalは依頼範囲を広げる許可ではありません。
+  Claude・Grok・補助CodexにはGoalを設定せず、更新候補の検証でも有効化しません。
 - 受信許可と書込み許可は別です。既定profileはrepository readとjob outbox writeだけです。`writeAllowFrom` を
   明示した利用者だけrepository・`.git` writeとネットワークを使えますが、Mac全体のsandboxは解除しません。
 - write許可されたWebタスクでは、primary Codexへ利用可能なBrowser／Chrome能力を渡し、localhostだけでなく
