@@ -11739,6 +11739,34 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(runtime.path).not.toContain('relative')
   })
 
+  test.skipIf(process.platform !== 'darwin')(
+    'macOSでは選択中の開発者directoryを読めるようにする',
+    () => {
+      const dir = fixtureDir()
+      // macOS の /usr/bin/git は開発者directoryへ転送する shim なので、PATH だけ
+      // 許可しても `xcrun: invalid active developer path` で起動できない。job は
+      // repository を触るために git を使うため、その転送先も読めなければならない。
+      const selected = Bun.spawnSync(['/usr/bin/xcode-select', '-p'], {
+        env: { PATH: '/usr/bin:/bin', HOME: '/var/empty', LANG: 'C', LC_ALL: 'C' },
+        stdin: 'ignore', stdout: 'pipe', stderr: 'ignore',
+      })
+      expect(selected.exitCode).toBe(0)
+      const developerDirectory = realpathSync(selected.stdout.toString().trim())
+      const runtime = resolveCodexToolchainRuntime({
+        sourcePath: '/usr/bin:/bin',
+        repoPath: join(dir, 'repo'),
+        stateDir: join(dir, 'state'),
+        artifactDir: join(dir, 'outbox'),
+        scratchDir: join(dir, 'tmp'),
+        homeDir: dir,
+      })
+      expect(runtime.readPaths).toContain(developerDirectory)
+      // PATH そのものは変えない。読み取り許可だけを足す。
+      expect(runtime.path.split(':')).toEqual(['/usr/bin', '/bin', '/usr/sbin', '/sbin'])
+      expect(runtime.path).not.toContain(developerDirectory)
+    },
+  )
+
   test('permission profileはHOME/stateを閉じ、repo・当該添付・outboxだけを再許可する', () => {
     const dir = fixtureDir()
     const state = join(dir, 'state')

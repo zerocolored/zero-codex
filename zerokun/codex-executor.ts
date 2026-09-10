@@ -14,6 +14,7 @@ import {
   rmSync,
   writeSync,
   type Dirent,
+  type Stats,
 } from 'fs'
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import { ensureTaskGoal, readTaskGoal, type GoalStatus } from './codex-goal.ts'
@@ -4920,6 +4921,49 @@ export type CodexToolchainRuntime = {
 const CORE_TOOLCHAIN_PATHS = ['/usr/bin', '/bin', '/usr/sbin', '/sbin'] as const
 const HOMEBREW_PREFIXES = ['/opt/homebrew', '/usr/local', '/home/linuxbrew/.linuxbrew'] as const
 
+/**
+ * macOS の `/usr/bin/git` は実体ではなく、選択中の開発者directoryへ転送する shim
+ * である。sandbox がそのdirectoryを読めないと、`git` も `gh` も
+ * `xcrun: error: invalid active developer path` で起動できない。job は repository を
+ * 触るために必ず git を使うので、読み取りだけ許可する。
+ *
+ * 許可するのは Apple が配置する2形だけに限り、owner と mode も確認する。zerokun/verify.sh
+ * の candidate Git 検証と同じ契約にする。
+ */
+function activeDeveloperDirectory(): string | null {
+  if (process.platform !== 'darwin') return null
+  const selected = Bun.spawnSync(['/usr/bin/xcode-select', '-p'], {
+    env: { PATH: '/usr/bin:/bin', HOME: '/var/empty', LANG: 'C', LC_ALL: 'C' },
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'ignore',
+    timeout: 5_000,
+    killSignal: 'SIGKILL',
+    maxBuffer: 4 * 1024,
+  })
+  if (selected.exitCode !== 0) return null
+  const reported = selected.stdout.toString().trim().replace(/\/+$/u, '')
+  if (!reported || !isAbsolute(reported) || reported.length > 1_024
+    || /[\0\r\n]/u.test(reported)) return null
+  let physical: string
+  try { physical = realpathSync(reported) } catch { return null }
+  if (physical !== reported) return null
+  const selectedApp = physical.startsWith('/Applications/')
+    && physical.endsWith('/Contents/Developer')
+    ? physical.slice('/Applications/'.length, -'/Contents/Developer'.length)
+    : null
+  const supported = physical === '/Library/Developer/CommandLineTools'
+    || (selectedApp !== null && !selectedApp.includes('/') && /^Xcode.*\.app$/u.test(selectedApp))
+  if (!supported) return null
+  let entry: Stats
+  try { entry = lstatSync(physical) } catch { return null }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : undefined
+  if (!entry.isDirectory() || entry.isSymbolicLink()) return null
+  if (uid !== undefined && entry.uid !== 0 && entry.uid !== uid) return null
+  if ((entry.mode & 0o022) !== 0) return null
+  return physical
+}
+
 function existingDirectory(path: string): boolean {
   try { return lstatSync(realpathSync(path)).isDirectory() } catch { return false }
 }
@@ -4982,6 +5026,9 @@ export function resolveCodexToolchainRuntime(options: {
     }
   }
   for (const path of CORE_TOOLCHAIN_PATHS) addPath(path, true)
+  // `/usr/bin` を許可しても、そこの git は開発者directoryへ転送するだけで動かない。
+  const developerDirectory = activeDeveloperDirectory()
+  if (developerDirectory) readPaths.add(developerDirectory)
   for (const path of (options.sourcePath ?? process.env.PATH ?? '').split(':')) addPath(path)
 
   for (const prefixInput of HOMEBREW_PREFIXES) {
