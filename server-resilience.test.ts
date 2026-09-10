@@ -448,6 +448,20 @@ describe('Slack bridge resilience wiring', () => {
     expect(startup).toBeLessThan(server.indexOf('scheduleInboundDrain()'))
   })
 
+  test('network断のunhandled rejectionでgatewayを落とさず、それ以外は落とす', () => {
+    // watchdogは通知するだけで再起動しない。ここでprocessが死ぬと、Wi-Fiが
+    // 戻ってもgatewayは戻らない。
+    expect(server).toContain("process.on('unhandledRejection'")
+    expect(server).toContain('isTransientNetworkFailure(reason)')
+    expect(server).toContain('network unavailable, staying up')
+    // transientでない失敗は従来どおり落とす。握り潰して半死のgatewayにしない。
+    expect(server).toContain('unhandled rejection:')
+    expect(server).toContain('process.exit(1)')
+    const guard = server.indexOf("process.on('unhandledRejection'")
+    expect(guard).toBeGreaterThan(-1)
+    expect(guard).toBeLessThan(server.indexOf('await slackApp.start()'))
+  })
+
   test('未所有threadの途中mentionはrootからdurableにhydrateしlive/catch-upで同じ条件を使う', () => {
     expect(server).toContain('inbound = await hydrateInitialThreadContext(')
     expect(server).toContain('channel: inbound.chatId')

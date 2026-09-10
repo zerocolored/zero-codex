@@ -32,6 +32,7 @@ import {
   slackDirectMessageFailureDisposition,
   slackReplyScanFailureDisposition,
   slackInitialThreadContextFailureDisposition,
+  isTransientNetworkFailure,
   structuredSlackApiErrorCode,
   validateLegacyThreadMap,
   SLACK_USER_ID_RE,
@@ -2631,6 +2632,24 @@ async function pollThreads(): Promise<void> {
 
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+
+// A closed lid or a dropped Wi-Fi makes every in-flight Slack call reject at
+// once, including calls issued by code this file does not own — Socket Mode's
+// own reconnect among them. Bun turns an unhandled rejection into process
+// death, so the gateway used to die with the network and stay dead: the
+// watchdog only notifies, it does not restart. Retrying transport is the
+// durable queue's job and Socket Mode reconnects by itself, so log and keep
+// running. Everything else keeps the previous fail-fast behaviour, because a
+// real defect must not be swallowed into a half-working gateway.
+process.on('unhandledRejection', reason => {
+  const detail = reason instanceof Error ? reason.message : String(reason)
+  if (isTransientNetworkFailure(reason)) {
+    process.stderr.write(`slack channel: network unavailable, staying up: ${detail}\n`)
+    return
+  }
+  process.stderr.write(`slack channel: unhandled rejection: ${detail}\n`)
+  process.exit(1)
+})
 
 // Start the Slack app
 try {

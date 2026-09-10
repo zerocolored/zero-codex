@@ -33,6 +33,7 @@ import {
   slackDirectMessageFailureDisposition,
   slackReplyScanFailureDisposition,
   slackInitialThreadContextFailureDisposition,
+  isTransientNetworkFailure,
   type ChannelPolicy,
   type SlackReply,
 } from './gate.ts'
@@ -110,10 +111,37 @@ describe('Slack cursor recovery', () => {
     expect(slackInitialThreadContextFailureDisposition(Object.assign(
       new Error('socket reset'), { code: 'ECONNRESET' },
     ))).toBe('defer')
+    // Wi-Fiが落ちた瞬間のgetaddrinfoはENOTFOUNDを返す。永久errorではないので
+    // 試行回数を消費させない。
+    expect(slackInitialThreadContextFailureDisposition(Object.assign(
+      new Error('getaddrinfo ENOTFOUND slack.com'), { code: 'ENOTFOUND' },
+    ))).toBe('defer')
     expect(slackInitialThreadContextFailureDisposition(new Error('unknown SDK failure'))).toBe('retry')
     expect(slackInitialThreadContextFailureDisposition(
       new Error('調査対象は thread_not_found の原因です'),
     )).toBe('retry')
+  })
+
+  test('network断のtransport failureだけをtransientとして識別する', () => {
+    for (const code of [
+      'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',
+      'ENOTFOUND', 'ENETDOWN', 'ENETUNREACH', 'EHOSTUNREACH',
+    ]) {
+      expect(isTransientNetworkFailure(Object.assign(new Error(code), { code }))).toBe(true)
+    }
+    expect(isTransientNetworkFailure(Object.assign(new Error('lower'), { code: 'enotfound' })))
+      .toBe(true)
+    // SDKはsocket errorを包んでから投げる。causeを辿らないと素通りする。
+    expect(isTransientNetworkFailure(Object.assign(new Error('request failed'), {
+      cause: Object.assign(new Error('getaddrinfo ENOTFOUND slack.com'), { code: 'ENOTFOUND' }),
+    }))).toBe(true)
+    // 本当のbugをnetwork断に混ぜない。processはこれで落ち続ける必要がある。
+    expect(isTransientNetworkFailure(new Error('unknown SDK failure'))).toBe(false)
+    expect(isTransientNetworkFailure({ data: { error: 'ratelimited' } })).toBe(false)
+    expect(isTransientNetworkFailure(Object.assign(new Error('bad input'), { code: 'EINVAL' })))
+      .toBe(false)
+    expect(isTransientNetworkFailure(null)).toBe(false)
+    expect(isTransientNetworkFailure('ENOTFOUND')).toBe(false)
   })
 
   test('DM復旧stateの更新失敗はlive受信処理へ例外を伝播しない', () => {
