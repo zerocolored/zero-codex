@@ -5104,8 +5104,11 @@ export function buildCodexPermissionOverrides(
   if (!workspace && gitRoot && !pathContains(gitRoot, repo)) {
     throw new Error(`repository route is outside its Git worktree: ${repo}`)
   }
+  // A workspace root must live inside the launched directory. The launched
+  // directory itself qualifies when it is a repository holding members: the
+  // project layout lists it first, and it is not outside itself.
   if (workspace && (JSON.stringify(gitRoots) !== JSON.stringify(projectLayout.gitRoots)
-    || gitRoots.some(root => !pathContains(repo, root) || root === repo))) {
+    || gitRoots.some(root => !pathContains(repo, root)))) {
     throw new Error(`workspace repository layout does not match the project route: ${repo}`)
   }
   const gitRootSet = new Set(gitRoots)
