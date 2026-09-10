@@ -6141,15 +6141,21 @@ export class JobStore {
         replayKeys.add(followupKey)
       }
 
-      const completedOutsideInbound = (eventKey: string): boolean => (
-        this.db.query<{ present: number }, [string, string, string, string, string]>(
-          `SELECT 1 AS present FROM delivery_tombstones WHERE idempotency_key = ?
-           UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = ?
+      // A message that already became durable work belongs to that work alone.
+      const claimedByDurableWork = (eventKey: string): boolean => (
+        this.db.query<{ present: number }, [string, string, string, string]>(
+          `SELECT 1 AS present FROM jobs WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = ?
            UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = ?
            LIMIT 1`,
-        ).get(eventKey, eventKey, eventKey, eventKey, eventKey) !== null
+        ).get(eventKey, eventKey, eventKey, eventKey) !== null
+      )
+      const completedOutsideInbound = (eventKey: string): boolean => (
+        claimedByDurableWork(eventKey)
+        || this.db.query<{ present: number }, [string]>(
+          'SELECT 1 AS present FROM delivery_tombstones WHERE idempotency_key = ?',
+        ).get(eventKey) !== null
       )
 
       const canonicalKey = `${row.chat_id}:${canonical.messageId}`
@@ -6186,7 +6192,11 @@ export class JobStore {
         if (replayKeys.has(consumedKey)) {
           throw new Error('initial context cannot both consume and replay a message')
         }
-        if (completedOutsideInbound(consumedKey)) {
+        // A tombstone alone only records that the message will never become its
+        // own job: the audience gate ignored it, or a route notice answered it.
+        // That is exactly what consuming it guarantees, so fold it into the
+        // thread context instead of failing the whole bootstrap.
+        if (claimedByDurableWork(consumedKey)) {
           throw new InboundInitialContextConflictError(
             `Slackスレッドの投稿 ${messageTs} はすでに別の処理へ渡されています`,
           )

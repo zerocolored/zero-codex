@@ -2302,6 +2302,71 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('先行投稿の墓標は初期文脈の取り込みを止めない', () => {
+    const store = makeStore()
+    const channel = 'C0123456789'
+    const rootTs = '1800000200.000100'
+    const ignoredTs = '1800000201.000100'
+    const triggerTs = '1800000202.000100'
+    store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: channel, threadTs: rootTs, messageId: triggerTs,
+      userId: 'U0TRIGGER', repoPath: '/tmp/project', text: '確認して',
+    }, { initialContextEligible: true, appId: 'A0123456789' })
+    // A channel-route notice answered the thread root and the audience gate
+    // ignored a later reply. Both leave a tombstone, but neither handed the
+    // message to another job, so the bootstrap must absorb them as context.
+    store.recordDeliveryTombstone(`${channel}:${rootTs}`)
+    store.recordDeliveryTombstone(`${channel}:${ignoredTs}`)
+    const claimed = store.claimNextInboundDelivery()!
+    const hydrated = store.finalizeInboundThreadBootstrap(claimed.idempotencyKey, {
+      mode: 'context',
+      canonical: {
+        messageId: triggerTs, userId: 'U0TRIGGER', text: '確認して',
+        fileIds: [], writeEnabled: false, isInterrupt: false,
+      },
+      text: 'root\n無視された返信\n確認して',
+      fileIds: [],
+      consumedMessageTs: [rootTs, ignoredTs],
+      followups: [],
+    })
+    expect(hydrated).toMatchObject({
+      text: 'root\n無視された返信\n確認して',
+      initialContextState: 'hydrated',
+    })
+    store.close()
+  })
+
+  test('先行投稿が実ジョブになっている場合は初期文脈の取り込みを拒否する', () => {
+    const store = makeStore()
+    const channel = 'C0123456789'
+    const rootTs = '1800000300.000100'
+    const earlierTs = '1800000301.000100'
+    const triggerTs = '1800000302.000100'
+    store.stageInboundDeliveryAndAdoptSlackThread({
+      chatId: channel, threadTs: rootTs, messageId: triggerTs,
+      userId: 'U0TRIGGER', repoPath: '/tmp/project', text: '確認して',
+    }, { initialContextEligible: true, appId: 'A0123456789' })
+    // An earlier reply that really did become its own job stays off limits.
+    store.enqueue({
+      chatId: channel, threadTs: rootTs, messageId: earlierTs,
+      userId: 'U0OTHER', repoPath: '/tmp/project', task: '別依頼',
+      writeEnabled: false,
+    })
+    const claimed = store.claimNextInboundDelivery()!
+    expect(() => store.finalizeInboundThreadBootstrap(claimed.idempotencyKey, {
+      mode: 'context',
+      canonical: {
+        messageId: triggerTs, userId: 'U0TRIGGER', text: '確認して',
+        fileIds: [], writeEnabled: false, isInterrupt: false,
+      },
+      text: 'root\n別依頼\n確認して',
+      fileIds: [],
+      consumedMessageTs: [rootTs, earlierTs],
+      followups: [],
+    })).toThrow(/はすでに別の処理へ渡されています/)
+    store.close()
+  })
+
   test('同じ未所有threadへの別mentionは最初の1件だけ初期文脈を要求する', () => {
     const store = makeStore()
     const common = {
