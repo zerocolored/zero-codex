@@ -12858,6 +12858,57 @@ describe('Slack output guard', () => {
     store.close()
   })
 
+  test('自リポジトリ名は伏せるが、それを含む説明文は消さない', () => {
+    const state = fixtureDir()
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const job = store.enqueue(input({
+      messageId: 'repository-name-not-internal',
+      task: 'https://github.com/zerocolored/zero-codex/pull/21 Review帰ってるので修正お願いします！',
+    })).job
+    const raw = [
+      '現在の許可対象は BellSalesAI のため、`zero-codex` の修正には進めず、ブロック状態にしました。',
+      '再開には、作業対象を `zero-codex` に指定した再実行が必要です。',
+    ].join('\n')
+    const sanitized = sanitizeExecutionTextForSlack(job, 'session-private', raw, state, [], 'result')
+    // The name itself never reaches Slack, but the reader can still tell a
+    // refusal from a crash because the explanation around it survives.
+    expect(sanitized).not.toMatch(/zero[-_ ]?codex/i)
+    expect(sanitized).toContain('指定のリポジトリ')
+    expect(sanitized).toContain('現在の許可対象は BellSalesAI のため')
+    expect(sanitized).toContain('再開には、作業対象を')
+    expect(sanitized).not.toContain('内部構成は公開していません。')
+    expect(sanitized).not.toContain('内部パスを省略')
+    store.close()
+  })
+
+  test('自リポジトリ名を引用していても素の内部実装名は伏せる', () => {
+    const state = fixtureDir()
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const task = 'https://github.com/zerocolored/zero-codex/pull/21 修正お願いします'
+    let ordinal = 0
+    const sanitize = (raw: string): string => sanitizeExecutionTextForSlack(
+      store.enqueue(input({ messageId: `repository-name-guard-${ordinal += 1}`, task })).job,
+      'session-private', raw, state, [], 'result',
+    )
+    // Withholding the repository name keeps its sentence readable; every
+    // genuine implementation name stays redacted, including in a clause that
+    // also cites the repository.
+    const withheld = sanitize('zero-codex の修正には進めません。')
+    expect(withheld).not.toMatch(/zero[-_ ]?codex/i)
+    expect(withheld).toContain('の修正には進めません。')
+    // The unseparated spelling is withheld too, which the bare name guard missed.
+    expect(sanitize('zerocodex の修正には進めません。')).not.toMatch(/zerocodex/i)
+    for (const raw of [
+      'Codex が実行しています。',
+      'OpenAI Codex で動いています。',
+      'Herdr の pane で動作しています。',
+      'zero-codex は Codex と Herdr で動きます。',
+    ]) {
+      expect(sanitize(raw)).not.toMatch(/Codex|Herdr/i)
+    }
+    store.close()
+  })
+
   test('進捗用sanitizerは非公開固定文そのものを投稿対象から除外する', () => {
     const store = makeStore()
     const job = store.enqueue(input({ messageId: 'progress-nondisclosure-only' })).job
