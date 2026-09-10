@@ -104,6 +104,7 @@ import {
   parseCodexResult,
   parseCodexReviewDecision,
   requiredAdvisorRoundsForJob,
+  isSupportedDeveloperDirectory,
   resolveCodexToolchainRuntime,
   resolveCodexExecutable,
   resolveGitMetadataPaths,
@@ -11766,6 +11767,35 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(runtime.path).not.toContain(developerDirectory)
     },
   )
+
+  test('開発者directoryはAppleが配置する2形だけを受理する', () => {
+    // Xcode を入れている Mac と Command Line Tools だけの Mac の両方を、
+    // その環境が手元になくても固定できるようにする。
+    for (const accepted of [
+      '/Library/Developer/CommandLineTools',
+      '/Applications/Xcode.app/Contents/Developer',
+      '/Applications/Xcode-beta.app/Contents/Developer',
+      '/Applications/Xcode_16.2.app/Contents/Developer',
+    ]) {
+      expect(isSupportedDeveloperDirectory(accepted), accepted).toBe(true)
+    }
+    for (const rejected of [
+      '',
+      '/',
+      '/Library/Developer',
+      '/Library/Developer/CommandLineTools/usr',
+      '/library/developer/commandlinetools',
+      '/Applications/Contents/Developer',
+      '/Applications/Developer/Xcode.app/Contents/Developer',
+      '/Applications/Xcode.app/Contents/Developer/usr',
+      '/Applications/NotXcode.app/Contents/Developer',
+      '/Applications/Xcode.app',
+      '/Users/someone/Xcode.app/Contents/Developer',
+      '/opt/Xcode.app/Contents/Developer',
+    ]) {
+      expect(isSupportedDeveloperDirectory(rejected), rejected).toBe(false)
+    }
+  })
 
   test('permission profileはHOME/stateを閉じ、repo・当該添付・outboxだけを再許可する', () => {
     const dir = fixtureDir()

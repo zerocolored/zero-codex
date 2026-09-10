@@ -4930,6 +4930,19 @@ const HOMEBREW_PREFIXES = ['/opt/homebrew', '/usr/local', '/home/linuxbrew/.linu
  * 許可するのは Apple が配置する2形だけに限り、owner と mode も確認する。zerokun/verify.sh
  * の candidate Git 検証と同じ契約にする。
  */
+/**
+ * Apple が配置する2形だけを受理する。Command Line Tools の固定path と、
+ * `/Applications` 直下の Xcode bundle だけ。入れ子や別名の bundle は拒否する。
+ */
+export function isSupportedDeveloperDirectory(path: string): boolean {
+  if (path === '/Library/Developer/CommandLineTools') return true
+  const prefix = '/Applications/'
+  const suffix = '/Contents/Developer'
+  if (!path.startsWith(prefix) || !path.endsWith(suffix)) return false
+  const bundle = path.slice(prefix.length, -suffix.length)
+  return bundle.length > 0 && !bundle.includes('/') && /^Xcode[^/]*\.app$/u.test(bundle)
+}
+
 function activeDeveloperDirectory(): string | null {
   if (process.platform !== 'darwin') return null
   const selected = Bun.spawnSync(['/usr/bin/xcode-select', '-p'], {
@@ -4948,13 +4961,7 @@ function activeDeveloperDirectory(): string | null {
   let physical: string
   try { physical = realpathSync(reported) } catch { return null }
   if (physical !== reported) return null
-  const selectedApp = physical.startsWith('/Applications/')
-    && physical.endsWith('/Contents/Developer')
-    ? physical.slice('/Applications/'.length, -'/Contents/Developer'.length)
-    : null
-  const supported = physical === '/Library/Developer/CommandLineTools'
-    || (selectedApp !== null && !selectedApp.includes('/') && /^Xcode.*\.app$/u.test(selectedApp))
-  if (!supported) return null
+  if (!isSupportedDeveloperDirectory(physical)) return null
   let entry: Stats
   try { entry = lstatSync(physical) } catch { return null }
   const uid = typeof process.getuid === 'function' ? process.getuid() : undefined
