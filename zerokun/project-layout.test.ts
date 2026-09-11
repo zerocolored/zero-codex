@@ -45,6 +45,36 @@ function workspaceFixture(): { root: string; workspace: string } {
 }
 
 describe('multi-repository project layout', () => {
+  test('親repositoryと子1個のpinを保存して再読込できる', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zero-single-child-'))
+    roots.push(root)
+    gitInit(root)
+    gitInit(join(root, 'backend'))
+    const layout = resolveProjectLayout(root)
+    expect(layout.memberNames).toEqual(['backend'])
+    ensureWorkspacePin(layout)
+    const reopened = resolveProjectLayout(root)
+    expect(reopened.pinned).toBe(true)
+    expect(reopened.gitRoots).toEqual(layout.gitRoots)
+    expect(reopened.gitRoots).toHaveLength(2)
+  })
+
+  test('親を含めても合計2repository未満のpinは拒否する', () => {
+    for (const pin of [
+      { version: 2, projectRepository: true, members: [] },
+      { version: 2, projectRepository: false, members: ['backend'] },
+      { version: 1, members: ['backend'] },
+    ]) {
+      const root = mkdtempSync(join(tmpdir(), 'zero-invalid-small-pin-'))
+      roots.push(root)
+      mkdirSync(join(root, '.zerochan'), { mode: 0o700 })
+      writeFileSync(join(root, '.zerochan/workspace.json'), JSON.stringify({
+        ...pin, kind: 'multi-repo-workspace',
+      }), { mode: 0o600 })
+      expect(() => resolveProjectLayout(root)).toThrow('workspace設定JSONが不正')
+    }
+  })
+
   test('launched directory自身がGit repositoryでも中のmemberへ届く', () => {
     // The bot is scoped to the directory it was launched in. A repository
     // inside that directory is not outside it, so stopping at the outer

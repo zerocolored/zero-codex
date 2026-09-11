@@ -147,7 +147,8 @@ function parseWorkspacePin(projectPath: string): WorkspacePin | null {
     || Object.keys(record).sort().join(',') !== expectedKeys
     || (!legacy && typeof record.projectRepository !== 'boolean')
     || !Array.isArray(record.members)
-    || record.members.length < 2 || record.members.length > MAX_WORKSPACE_REPOSITORIES
+    || record.members.length < (!legacy && record.projectRepository === true ? 1 : 2)
+    || record.members.length > MAX_WORKSPACE_REPOSITORIES
     || record.members.some(member => (
       typeof member !== 'string' || !member || member.startsWith('.')
       || basename(member) !== member || member.includes('/') || member.includes('\\')
