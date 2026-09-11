@@ -4,17 +4,46 @@ import {
   rmSync, symlinkSync, writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
-import { dirname, join } from 'path'
+import { basename, dirname, join } from 'path'
 
 const LAUNCHER = join(dirname(import.meta.dir), 'codex-channel.sh')
 const temporaryDirs: string[] = []
 const processes: Bun.Subprocess[] = []
 
-afterEach(() => {
-  for (const process of processes.splice(0)) {
-    try { process.kill() } catch {}
+/**
+ * launcher が起こす孫プロセス(runner-launcher 等)は `processes` に載らない。
+ * 一時ディレクトリを消す前に、その名前を持つものを落としておく。残すと、消えた
+ * ファイルを指したまま孤児として溜まり続ける(2026-09-11 に5体が滞留していた)。
+ */
+function sweepStrayProcesses(dir: string): void {
+  const marker = basename(dir)
+  const found = Bun.spawnSync(['/usr/bin/pgrep', '-f', marker], {
+    stdout: 'pipe', stderr: 'ignore',
+  })
+  if (found.exitCode !== 0) return
+  for (const line of new TextDecoder().decode(found.stdout).trim().split('\n')) {
+    const pid = Number(line.trim())
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue
+    Bun.spawnSync(['/bin/kill', '-9', String(pid)], { stderr: 'ignore' })
   }
-  for (const dir of temporaryDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+}
+
+afterEach(async () => {
+  // 後片付けは trap できない SIGKILL で行う。SIGTERM を無視する代役を意図的に
+  // 立てるテストがあり(下の ignoreTerm)、SIGTERM のままだと生き残るため。
+  // 2026-09-11: 生き残った4体が、削除済みのスクリプトを読もうとして各 87% CPU で
+  // 空回りしたまま26時間孤児として残り、合計で約3.5コアを占有していた。
+  const running = processes.splice(0)
+  for (const process of running) {
+    try { process.kill(9) } catch {}
+  }
+  // 消えたことを確認してから次のテストへ。漏れたら次が遅くなるのではなく、
+  // ここで止まって気づけるようにする。
+  await Promise.all(running.map(process => process.exited))
+  for (const dir of temporaryDirs.splice(0)) {
+    sweepStrayProcesses(dir)
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 function fixture(): string {
@@ -41,8 +70,11 @@ function startGateway(
   options: { ignoreTerm?: boolean } = {},
 ): Bun.Subprocess {
   const server = join(state, 'server.ts')
+  // ignoreTerm は SIGTERM を無視する代役。待ち方に sleep を使うのが要点で、
+  // read -t は stdin が /dev/null だと待たずに即 EOF を返すため、待っているつもりで
+  // 全力で空回りし CPU を1コア食い潰す。
   writeFileSync(server, options.ignoreTerm
-    ? "#!/bin/bash\ntrap '' TERM\nwhile :; do read -r -t 1 _ || :; done\n"
+    ? "#!/bin/bash\ntrap '' TERM\nwhile :; do sleep 1; done\n"
     : '#!/bin/bash\nsleep 30\n')
   chmodSync(server, 0o700)
   const process = Bun.spawn(['/bin/bash', server], {
