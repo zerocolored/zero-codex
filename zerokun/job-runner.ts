@@ -14860,6 +14860,9 @@ export function extractArtifactPaths(result: string): { text: string; files: str
 
 const INTERNAL_IMPLEMENTATION_NAME = /(?:\bOpenAI[ -]Codex\b|\bOpenAI(?:[ -]?API)?\b|\bCodex\b|\bClaude(?:[ -]Code)?\b|\bGrok\b|\bHerdr\b|\bApp[ -]Server\b|\bModel[ -]Context[ -]Protocol\b|\bMCP(?:[ -]?broker)?\b|\bGPT(?:[- ]?(?:\d+(?:\.\d+)*(?:[A-Za-z][A-Za-z0-9]*)?(?:-[A-Za-z0-9]+)*|oss(?:-[A-Za-z0-9]+)*))?\b|\bo\d+(?:[-.][A-Za-z0-9]+)*\b|\badvisor[ -]?panels?\b|\badvisors?\b|\bsub[ -]?agents?\b|\bbrokers?\b|\bJSON[ -]?RPC\b|\bSeatbelt\b|コーデックス|クロードコード|クロード|グロック|モデルコンテキストプロトコル|アドバイザー|サブエージェント|ブローカー)/i
 const SELF_IMPLEMENTATION_NON_DISCLOSURE = '内部構成は公開していません。'
+/** Stands in for the runtime's own repository name, which carries an
+ * implementation name inside it and must not be echoed into Slack. */
+const WITHHELD_REPOSITORY_NAME = '指定のリポジトリ'
 
 const INTERNAL_IMPLEMENTATION_ALIASES = [
   'OpenAI Codex', 'OpenAI API', 'OpenAI', 'Codex', 'Claude Code', 'Claude',
@@ -15086,7 +15089,22 @@ export function sanitizeExecutionTextForSlack(
     visible.push(line)
   }
 
-  let sanitized = normalizeGuardText(visible.join('\n'))
+  // The runtime's own repository name still must not reach Slack: it carries
+  // an implementation name inside it. Deleting every clause that mentions it
+  // is what fails, because the whole answer collapses into a bare
+  // non-disclosure notice and the reader cannot tell a refusal from a crash.
+  // Withhold the name the way other protected terms are withheld - replace it
+  // with a neutral noun - so the surrounding explanation survives.
+  const repositoryNames: string[] = []
+  const repositoryPlaceholderNonce = encodeSlackGuardNonce(randomUUID())
+  const maskRepositoryNames = (value: string): string => value.replace(
+    /\bzero[-_ ]?codex\b/gi,
+    match => {
+      const index = repositoryNames.push(match) - 1
+      return `\uE002${repositoryPlaceholderNonce}_${index}\uE003`
+    },
+  )
+  let sanitized = maskRepositoryNames(normalizeGuardText(visible.join('\n')))
   let inputEntries = [{
     task: job.task,
     attachments: job.attachments,
@@ -15101,13 +15119,13 @@ export function sanitizeExecutionTextForSlack(
       userId: entry.userId,
     }))
   } catch {}
-  const userText = normalizeGuardText(inputEntries
+  const userText = maskRepositoryNames(normalizeGuardText(inputEntries
     .map(entry => slackAuthoredTask(entry.task, entry.attachments))
-    .join('\n'))
+    .join('\n')))
   const latestEntry = inputEntries.at(-1)
-  const latestUserText = normalizeGuardText(latestEntry
+  const latestUserText = maskRepositoryNames(normalizeGuardText(latestEntry
     ? slackAuthoredTask(latestEntry.task, latestEntry.attachments)
-    : job.task)
+    : job.task))
   const sensitiveValues = [
     artifactDirForJob(dir, job.id),
     sealedArtifactDirForJob(dir, job.id),
@@ -15825,6 +15843,12 @@ export function sanitizeExecutionTextForSlack(
   }
   protectedProductNames.forEach((name, index) => {
     sanitized = sanitized.replaceAll(`\uE002${productPlaceholderNonce}:${index}\uE003`, name)
+  })
+  repositoryNames.forEach((_name, index) => {
+    sanitized = sanitized.replaceAll(
+      `\uE002${repositoryPlaceholderNonce}_${index}\uE003`,
+      WITHHELD_REPOSITORY_NAME,
+    )
   })
   const zeroMarker = /\[ZERO_/i.exec(sanitized)
   if (zeroMarker) sanitized = sanitized.slice(0, zeroMarker.index).trimEnd()

@@ -32,6 +32,7 @@ import {
   slackDirectMessageFailureDisposition,
   slackReplyScanFailureDisposition,
   slackInitialThreadContextFailureDisposition,
+  isTransientNetworkFailure,
   structuredSlackApiErrorCode,
   validateLegacyThreadMap,
   SLACK_USER_ID_RE,
@@ -60,6 +61,13 @@ import {
   openDirectSlackDownload,
   withSlackDeadline,
 } from './zerokun/slack-http.ts'
+import {
+  createSupervisedSocketModeReceiver,
+  startSlackSocketWithRetry,
+  superviseSlackSocketMode,
+  type SlackSocketSupervisor,
+  type SlackSocketSupervisorEvent,
+} from './zerokun/slack-socket-supervisor.ts'
 import {
   clearGatewayReadiness,
   writeGatewayReadiness,
@@ -439,13 +447,43 @@ function checkApprovals(): void {
 // This process is the long-lived Slack parent and writes every authorized
 // event to SQLite. Codex runs only as a short-lived child of the queue worker.
 
-// Initialize Slack Bolt app with Socket Mode
-slackApp = new App({
-  token: BOT_TOKEN,
+// Initialize Slack Bolt app with Socket Mode.
+//
+// The receiver is built here rather than left to Bolt because Bolt never passes
+// `autoReconnectEnabled` through, and Socket Mode's own reconnect is the one
+// that gives up on a transport failure and rejects into a promise nobody holds.
+// With it off, every close is an observable `disconnected` and the supervisor
+// below owns reconnection. slackWebClientOptions() is called twice on purpose:
+// Bolt writes its logger into the object it is handed, and Socket Mode keeps
+// the same reference, so the two must not share one.
+const slackSocketReceiver = createSupervisedSocketModeReceiver({
   appToken: APP_TOKEN,
-  socketMode: true,
   clientOptions: slackWebClientOptions(),
 })
+
+slackApp = new App({
+  token: BOT_TOKEN,
+  // Unused while a receiver is supplied, kept so the token pair that
+  // verifySlackAppTokenPair checks stays visible at the call site.
+  appToken: APP_TOKEN,
+  socketMode: true,
+  receiver: slackSocketReceiver,
+  clientOptions: slackWebClientOptions(),
+})
+
+let slackSocket: SlackSocketSupervisor | null = null
+
+function describeSlackSocketEvent(event: SlackSocketSupervisorEvent): string {
+  if (event.phase === 'lost') return 'socket mode disconnected; reconnecting'
+  if (event.phase === 'retrying') {
+    return `socket mode reconnect attempt ${event.attempt} failed,`
+      + ` retrying in ${event.delayMs}ms: ${event.error}`
+  }
+  if (event.phase === 'reconnected') {
+    return `socket mode reconnected after ${event.attempt} attempt(s)`
+  }
+  return `socket mode cannot reconnect: ${event.error}`
+}
 
 let botUserId: string | undefined
 let slackAppId: string | undefined
@@ -1658,6 +1696,11 @@ let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
+  // Stop supervising before Bolt disconnects, or the shutdown close reads as a
+  // network drop and reopens the socket this function is closing. The
+  // 'disconnecting' event alone is not enough: a SIGTERM that lands during a
+  // backoff has no live socket to emit it.
+  slackSocket?.stop()
   process.stderr.write('slack channel: shutting down\n')
   clearGatewayReadiness(READY_FILE)
   // Keep the singleton lock and SQLite handle until the process exits. Releasing
@@ -2632,6 +2675,27 @@ async function pollThreads(): Promise<void> {
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+// A closed lid or a dropped Wi-Fi makes every in-flight Slack call reject at
+// once, including calls this file fires and never awaits. Bun turns an
+// unhandled rejection into process death, so the gateway used to die with the
+// network and stay dead: the watchdog only notifies, it does not restart.
+// Retrying transport is the durable queue's job, so log and keep running.
+// Everything else keeps the previous fail-fast behaviour, because a real defect
+// must not be swallowed into a half-working gateway.
+//
+// This is the backstop, not the socket's lifeline: the reconnect that used to
+// reject here is now owned by the supervisor, which reconnects rather than
+// merely surviving.
+process.on('unhandledRejection', reason => {
+  const detail = reason instanceof Error ? reason.message : String(reason)
+  if (isTransientNetworkFailure(reason)) {
+    process.stderr.write(`slack channel: network unavailable, staying up: ${detail}\n`)
+    return
+  }
+  process.stderr.write(`slack channel: unhandled rejection: ${detail}\n`)
+  process.exit(1)
+})
+
 // Start the Slack app
 try {
   // Import legacy ownership before Socket Mode can deliver a competing event.
@@ -2649,7 +2713,40 @@ try {
   })
   botUserId = identity.botUserId
   slackAppId = identity.appId
-  await slackApp.start()
+  // Subscribed before the first connection so a close that races `hello` is
+  // stashed, and armed only after it, so the supervisor never races the
+  // startup connection it does not own.
+  slackSocket = superviseSlackSocketMode({
+    connection: slackSocketReceiver.client,
+    // Deliberately not slackApp.start(): this receiver runs no OAuth HTTP
+    // server, so the client is the whole of it.
+    reconnect: () => slackSocketReceiver.client.start(),
+    sleep: milliseconds => Bun.sleep(milliseconds),
+    report: event => process.stderr.write(
+      `slack channel: ${describeSlackSocketEvent(event)}\n`,
+    ),
+    onUnrecoverable: error => {
+      // A credential Slack refuses cannot be waited out. Die loudly so the
+      // watchdog reports a stopped gateway instead of a silent one.
+      process.stderr.write(`slack channel: failed to start: ${error}\n`)
+      process.exit(1)
+    },
+  })
+  // The first connection needs the same ownership as every later one. With the
+  // SDK's own reconnect switched off, one `ratelimited` on
+  // apps.connections.open or one lost handshake race rejects here, and nothing
+  // restarts this process: the launcher execs it and the watchdog only reports.
+  // The budget is small, so an unreachable Slack still exits within about half
+  // a minute rather than hanging.
+  await startSlackSocketWithRetry({
+    start: async () => { await slackApp.start() },
+    sleep: milliseconds => Bun.sleep(milliseconds),
+    report: ({ attempt, delayMs, error }) => process.stderr.write(
+      `slack channel: socket mode start attempt ${attempt} failed,`
+      + ` retrying in ${delayMs}ms: ${error}\n`,
+    ),
+  })
+  slackSocket.arm()
   setInterval(checkApprovals, 5_000).unref()
   const connectedProjectDir = realpathSync(process.cwd())
   writeLastConnectedProject(STATE_DIR, connectedProjectDir)
