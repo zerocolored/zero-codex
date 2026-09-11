@@ -462,6 +462,34 @@ describe('Slack bridge resilience wiring', () => {
     expect(guard).toBeLessThan(server.indexOf('await slackApp.start()'))
   })
 
+  test('Socket Modeの再接続はSDK任せにせずgatewayが所有する', () => {
+    // 挙動の検証はzerokun/slack-socket-supervisor.test.tsが実SDKで行う。
+    // ここはwiringの順序だけを固定する。
+    expect(server).toContain('createSupervisedSocketModeReceiver({')
+    expect(server).toContain('receiver: slackSocketReceiver,')
+    expect(server).toContain('connection: slackSocketReceiver.client,')
+    expect(server).toContain('reconnect: () => slackSocketReceiver.client.start(),')
+    const supervise = server.indexOf('superviseSlackSocketMode({')
+    const start = server.indexOf('await slackApp.start()')
+    const arm = server.indexOf('slackSocket.arm()')
+    expect(supervise).toBeGreaterThan(-1)
+    // 初回接続の前にdisconnectedを購読し、接続が立ってから所有権を握る。
+    expect(supervise).toBeLessThan(start)
+    expect(arm).toBeGreaterThan(start)
+    // SDKの再接続を切った以上、初回接続の一過性失敗も自分で吸収する。
+    // 有界なので、本当に繋がらない起動は従来どおり短時間でexit(1)に落ちる。
+    expect(server).toContain('startSlackSocketWithRetry({')
+    const shutdown = server.slice(
+      server.indexOf('function shutdown()'),
+      server.indexOf('// ── Thread catch-up'),
+    )
+    // 存在を先に固定する。indexOfは無いとき-1を返すので、順序比較だけでは
+    // 呼び出しごと消えても緑のままになる。
+    const stopSocket = shutdown.indexOf('slackSocket?.stop()')
+    expect(stopSocket).toBeGreaterThan(-1)
+    expect(stopSocket).toBeLessThan(shutdown.indexOf('slackApp?.stop()'))
+  })
+
   test('未所有threadの途中mentionはrootからdurableにhydrateしlive/catch-upで同じ条件を使う', () => {
     expect(server).toContain('inbound = await hydrateInitialThreadContext(')
     expect(server).toContain('channel: inbound.chatId')

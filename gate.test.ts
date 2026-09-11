@@ -144,6 +144,49 @@ describe('Slack cursor recovery', () => {
     expect(isTransientNetworkFailure('ENOTFOUND')).toBe(false)
   })
 
+  test('実SDKが実際に作るwrapper形式のnetwork断を見落とさない', () => {
+    // @slack/web-api の requestErrorWithOriginal は errno を cause ではなく
+    // original に置き、外側のcodeを自分のものに差し替える。causeだけを辿ると
+    // 実outageでは一致がゼロになり、network断がbugとして扱われる。
+    const requestError = Object.assign(
+      new Error('A request error occurred: getaddrinfo ENOTFOUND slack.com'),
+      {
+        code: 'slack_webapi_request_error',
+        original: Object.assign(new Error('getaddrinfo ENOTFOUND slack.com'), {
+          code: 'ENOTFOUND',
+          cause: Object.assign(new Error('getaddrinfo ENOTFOUND slack.com'), {
+            code: 'ENOTFOUND',
+          }),
+        }),
+      },
+    )
+    expect('cause' in requestError).toBe(false)
+    expect(isTransientNetworkFailure(requestError)).toBe(true)
+    expect(slackInitialThreadContextFailureDisposition(requestError)).toBe('defer')
+
+    // @slack/socket-mode の websocketErrorWithOriginal も同じ形で、causeを持たない。
+    expect(isTransientNetworkFailure(Object.assign(new Error('WebSocket error'), {
+      code: 'slack_socket_mode_websocket_error',
+      original: Object.assign(new Error('read EAI_AGAIN'), { code: 'EAI_AGAIN' }),
+    }))).toBe(true)
+
+    // 恒久的な誤設定はwrapperの外側codeが同じでもtransientにしない。
+    expect(isTransientNetworkFailure(Object.assign(new Error('A request error occurred'), {
+      code: 'slack_webapi_request_error',
+      original: Object.assign(new Error('certificate has expired'), {
+        code: 'CERT_HAS_EXPIRED',
+      }),
+    }))).toBe(false)
+
+    // 自己参照するwrapperでも走査が止まる。
+    const cyclic: Record<string, unknown> = { code: 'EOUTER' }
+    cyclic.cause = { code: 'ENOTFOUND', original: cyclic }
+    expect(isTransientNetworkFailure(cyclic)).toBe(true)
+    const cyclicClean: Record<string, unknown> = { code: 'EOUTER' }
+    cyclicClean.original = { code: 'EINNER', cause: cyclicClean }
+    expect(isTransientNetworkFailure(cyclicClean)).toBe(false)
+  })
+
   test('DM復旧stateの更新失敗はlive受信処理へ例外を伝播しない', () => {
     expect(refreshSlackDirectMessageAvailability(() => true)).toBe('restored')
     expect(refreshSlackDirectMessageAvailability(() => false)).toBe('unchanged')
