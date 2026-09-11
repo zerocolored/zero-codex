@@ -307,16 +307,31 @@ const TRANSIENT_NETWORK_ERROR_CODES = new Set([
  * True when the failure is the network being gone. Retrying is the durable
  * queue's job, so callers use this to hold their attempt budget rather than
  * spend it — and the process uses it to stay alive instead of dying with the
- * Wi-Fi. `cause` is walked because the SDK wraps socket errors before they
- * surface.
+ * Wi-Fi.
+ *
+ * Both `cause` and `original` are walked because the Slack SDK wraps a socket
+ * error and does not use `cause` at all: `requestErrorWithOriginal` builds a
+ * fresh Error whose own `code` is `slack_webapi_request_error` and parks the
+ * transport error on `original`, and `websocketErrorWithOriginal` does the
+ * same. A `cause`-only walk therefore matches nothing during a real outage and
+ * reads the dropped Wi-Fi as a defect.
+ *
+ * Only a real transport code counts. The wrapper code itself is not enough,
+ * because a permanently misconfigured TLS or proxy setup arrives inside the
+ * very same wrapper and must keep failing.
  */
 export function isTransientNetworkFailure(error: unknown): boolean {
-  for (let current: unknown = error, depth = 0; current && depth < 4; depth += 1) {
-    if (typeof current !== 'object') break
-    const candidate = current as { code?: unknown; cause?: unknown }
+  const pending: unknown[] = [error]
+  const seen = new Set<object>()
+  for (let visited = 0; pending.length > 0 && visited < 8; visited += 1) {
+    const current = pending.pop()
+    if (!current || typeof current !== 'object') continue
+    if (seen.has(current)) continue
+    seen.add(current)
+    const candidate = current as { code?: unknown; cause?: unknown; original?: unknown }
     if (typeof candidate.code === 'string'
       && TRANSIENT_NETWORK_ERROR_CODES.has(candidate.code.toUpperCase())) return true
-    current = candidate.cause
+    pending.push(candidate.cause, candidate.original)
   }
   return false
 }
