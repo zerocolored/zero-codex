@@ -277,6 +277,69 @@ describe('Slack update request', () => {
     })).rejects.toThrow('Zeroちゃん更新entrypointが指定されていません')
   })
 
+  test('Slack完了通知はbodyを読み終えるまでdeadlineの内側で完結する', async () => {
+    const stateDir = fixtureDir()
+    const projectDir = join(stateDir, 'project')
+    const updater = join(stateDir, 'noop-updater.ts')
+    writeFileSync(updater, 'export {}\n')
+    writeFileSync(join(stateDir, '.env'), [
+      'SLACK_BOT_TOKEN=xoxb-0123456789abcdef',
+      'SLACK_APP_TOKEN=xapp-1-A0TESTAPP-1234567890abcdef',
+      '',
+    ].join('\n'))
+    await requestUpdate(input(), {
+      stateDir,
+      idFactory: () => 'request-notify-body',
+      launchWorker: () => {},
+    })
+
+    // 実物のfetchと同じく、bodyはheaderより後に届き、signalがabortされたらstreamが壊れる。
+    // 以前はdeadline scopeを抜けた後にresponse.json()を呼んでいたため、必ずここで失敗していた。
+    const posted: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = ((url: any, init: any = {}) => {
+      const target = String(url)
+      posted.push(target)
+      const payload = target.endsWith('auth.test')
+        ? { ok: true, app_id: 'A0TESTAPP', bot_id: 'B0TESTBOT', user_id: 'U0TESTBOT' }
+        : target.endsWith('bots.info')
+          ? { ok: true, bot: { app_id: 'A0TESTAPP' } }
+          : { ok: true }
+      const signal = init.signal as AbortSignal | undefined
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          setTimeout(() => {
+            if (signal?.aborted) {
+              controller.error(new Error('The operation was aborted.'))
+              return
+            }
+            controller.enqueue(new TextEncoder().encode(JSON.stringify(payload)))
+            controller.close()
+          }, 0)
+        },
+      })
+      return Promise.resolve(new Response(body, { status: 200 }))
+    }) as typeof fetch
+
+    const previousJobDb = process.env.ZEROKUN_JOB_DB
+    process.env.ZEROKUN_JOB_DB = join(stateDir, 'jobs.sqlite3')
+    try {
+      const result = await runUpdateWorker('request-notify-body', {
+        stateDir,
+        updaterPath: updater,
+        legacyCutover: true,
+        projectDir,
+        maxNotifyAttempts: 1,
+      })
+      expect(result.notificationSent).toBe(true)
+      expect(posted.some(url => url.endsWith('chat.postMessage'))).toBe(true)
+    } finally {
+      globalThis.fetch = originalFetch
+      if (previousJobDb === undefined) delete process.env.ZEROKUN_JOB_DB
+      else process.env.ZEROKUN_JOB_DB = previousJobDb
+    }
+  })
+
   test('Slack完了通知のnetwork hangをdeadlineで中断する', async () => {
     await expect(withUpdateSlackDeadline(
       () => new Promise<void>(() => {}),
