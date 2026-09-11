@@ -33,6 +33,7 @@ import {
   slackDirectMessageFailureDisposition,
   slackReplyScanFailureDisposition,
   slackInitialThreadContextFailureDisposition,
+  isTransientNetworkFailure,
   type ChannelPolicy,
   type SlackReply,
 } from './gate.ts'
@@ -110,10 +111,80 @@ describe('Slack cursor recovery', () => {
     expect(slackInitialThreadContextFailureDisposition(Object.assign(
       new Error('socket reset'), { code: 'ECONNRESET' },
     ))).toBe('defer')
+    // Wi-Fiが落ちた瞬間のgetaddrinfoはENOTFOUNDを返す。永久errorではないので
+    // 試行回数を消費させない。
+    expect(slackInitialThreadContextFailureDisposition(Object.assign(
+      new Error('getaddrinfo ENOTFOUND slack.com'), { code: 'ENOTFOUND' },
+    ))).toBe('defer')
     expect(slackInitialThreadContextFailureDisposition(new Error('unknown SDK failure'))).toBe('retry')
     expect(slackInitialThreadContextFailureDisposition(
       new Error('調査対象は thread_not_found の原因です'),
     )).toBe('retry')
+  })
+
+  test('network断のtransport failureだけをtransientとして識別する', () => {
+    for (const code of [
+      'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',
+      'ENOTFOUND', 'ENETDOWN', 'ENETUNREACH', 'EHOSTUNREACH',
+    ]) {
+      expect(isTransientNetworkFailure(Object.assign(new Error(code), { code }))).toBe(true)
+    }
+    expect(isTransientNetworkFailure(Object.assign(new Error('lower'), { code: 'enotfound' })))
+      .toBe(true)
+    // SDKはsocket errorを包んでから投げる。causeを辿らないと素通りする。
+    expect(isTransientNetworkFailure(Object.assign(new Error('request failed'), {
+      cause: Object.assign(new Error('getaddrinfo ENOTFOUND slack.com'), { code: 'ENOTFOUND' }),
+    }))).toBe(true)
+    // 本当のbugをnetwork断に混ぜない。processはこれで落ち続ける必要がある。
+    expect(isTransientNetworkFailure(new Error('unknown SDK failure'))).toBe(false)
+    expect(isTransientNetworkFailure({ data: { error: 'ratelimited' } })).toBe(false)
+    expect(isTransientNetworkFailure(Object.assign(new Error('bad input'), { code: 'EINVAL' })))
+      .toBe(false)
+    expect(isTransientNetworkFailure(null)).toBe(false)
+    expect(isTransientNetworkFailure('ENOTFOUND')).toBe(false)
+  })
+
+  test('実SDKが実際に作るwrapper形式のnetwork断を見落とさない', () => {
+    // @slack/web-api の requestErrorWithOriginal は errno を cause ではなく
+    // original に置き、外側のcodeを自分のものに差し替える。causeだけを辿ると
+    // 実outageでは一致がゼロになり、network断がbugとして扱われる。
+    const requestError = Object.assign(
+      new Error('A request error occurred: getaddrinfo ENOTFOUND slack.com'),
+      {
+        code: 'slack_webapi_request_error',
+        original: Object.assign(new Error('getaddrinfo ENOTFOUND slack.com'), {
+          code: 'ENOTFOUND',
+          cause: Object.assign(new Error('getaddrinfo ENOTFOUND slack.com'), {
+            code: 'ENOTFOUND',
+          }),
+        }),
+      },
+    )
+    expect('cause' in requestError).toBe(false)
+    expect(isTransientNetworkFailure(requestError)).toBe(true)
+    expect(slackInitialThreadContextFailureDisposition(requestError)).toBe('defer')
+
+    // @slack/socket-mode の websocketErrorWithOriginal も同じ形で、causeを持たない。
+    expect(isTransientNetworkFailure(Object.assign(new Error('WebSocket error'), {
+      code: 'slack_socket_mode_websocket_error',
+      original: Object.assign(new Error('read EAI_AGAIN'), { code: 'EAI_AGAIN' }),
+    }))).toBe(true)
+
+    // 恒久的な誤設定はwrapperの外側codeが同じでもtransientにしない。
+    expect(isTransientNetworkFailure(Object.assign(new Error('A request error occurred'), {
+      code: 'slack_webapi_request_error',
+      original: Object.assign(new Error('certificate has expired'), {
+        code: 'CERT_HAS_EXPIRED',
+      }),
+    }))).toBe(false)
+
+    // 自己参照するwrapperでも走査が止まる。
+    const cyclic: Record<string, unknown> = { code: 'EOUTER' }
+    cyclic.cause = { code: 'ENOTFOUND', original: cyclic }
+    expect(isTransientNetworkFailure(cyclic)).toBe(true)
+    const cyclicClean: Record<string, unknown> = { code: 'EOUTER' }
+    cyclicClean.original = { code: 'EINNER', cause: cyclicClean }
+    expect(isTransientNetworkFailure(cyclicClean)).toBe(false)
   })
 
   test('DM復旧stateの更新失敗はlive受信処理へ例外を伝播しない', () => {
