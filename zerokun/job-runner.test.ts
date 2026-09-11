@@ -1232,6 +1232,47 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('起動repository自身をworkspace rootに含めても権限profileを組める', () => {
+    // The launched directory is a repository that also holds members, so it is
+    // a root of its own workspace. It is not outside itself, and rejecting it
+    // would leave those members unreachable.
+    const root = fixtureDir('zero-workspace-self-root-')
+    const state = join(root, 'state')
+    const workspace = join(root, 'workspace')
+    mkdirSync(state, { mode: 0o700 })
+    for (const path of [workspace, join(workspace, 'backend'), join(workspace, 'frontend')]) {
+      mkdirSync(path, { recursive: true })
+      git(['init', '-q'], path)
+    }
+    const store = new JobStore(join(root, 'jobs.sqlite3'))
+    store.enqueue({
+      chatId: 'C0123456789', threadTs: '1800001000.000100', messageId: '1800001001.000100',
+      userId: 'U0TRIGGER', repoPath: workspace, task: '確認して', writeEnabled: true,
+    })
+    const claimed = store.claimNext('workspace-self-root-worker')!
+    expect(realpathSync(claimed.repoPath)).toBe(realpathSync(workspace))
+    const outbox = join(state, 'outbox', claimed.id)
+    const scratch = join(state, 'tmp', claimed.id)
+    mkdirSync(outbox, { recursive: true })
+    mkdirSync(scratch, { recursive: true })
+    const overrides = buildCodexPermissionOverrides(claimed, {
+      stateDir: state, artifactDir: outbox, scratchDir: scratch,
+    }).join('\n')
+    for (const member of [workspace, join(workspace, 'backend'), join(workspace, 'frontend')]) {
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(member))}="write"`)
+    }
+    // A repository outside the launched directory still has no place here.
+    const outside = join(root, 'outside')
+    mkdirSync(outside)
+    expect(() => buildCodexPermissionOverrides(claimed, {
+      stateDir: state,
+      artifactDir: outbox,
+      scratchDir: scratch,
+      gitRoots: [realpathSync(workspace), realpathSync(outside)],
+    })).toThrow(/workspace repository layout does not match the project route/)
+    store.close()
+  })
+
   test('保持済みSlack添付のdigest改変は実行前に拒否する', () => {
     const root = fixtureDir('zero-thread-attachment-tamper-')
     const state = join(root, 'state')

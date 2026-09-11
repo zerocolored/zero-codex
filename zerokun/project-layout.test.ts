@@ -45,6 +45,74 @@ function workspaceFixture(): { root: string; workspace: string } {
 }
 
 describe('multi-repository project layout', () => {
+  test('親repositoryと子1個のpinを保存して再読込できる', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zero-single-child-'))
+    roots.push(root)
+    gitInit(root)
+    gitInit(join(root, 'backend'))
+    const layout = resolveProjectLayout(root)
+    expect(layout.memberNames).toEqual(['backend'])
+    ensureWorkspacePin(layout)
+    const reopened = resolveProjectLayout(root)
+    expect(reopened.pinned).toBe(true)
+    expect(reopened.gitRoots).toEqual(layout.gitRoots)
+    expect(reopened.gitRoots).toHaveLength(2)
+  })
+
+  test('親を含めても合計2repository未満のpinは拒否する', () => {
+    for (const pin of [
+      { version: 2, projectRepository: true, members: [] },
+      { version: 2, projectRepository: false, members: ['backend'] },
+      { version: 1, members: ['backend'] },
+    ]) {
+      const root = mkdtempSync(join(tmpdir(), 'zero-invalid-small-pin-'))
+      roots.push(root)
+      mkdirSync(join(root, '.zerochan'), { mode: 0o700 })
+      writeFileSync(join(root, '.zerochan/workspace.json'), JSON.stringify({
+        ...pin, kind: 'multi-repo-workspace',
+      }), { mode: 0o600 })
+      expect(() => resolveProjectLayout(root)).toThrow('workspace設定JSONが不正')
+    }
+  })
+
+  test('launched directory自身がGit repositoryでも中のmemberへ届く', () => {
+    // The bot is scoped to the directory it was launched in. A repository
+    // inside that directory is not outside it, so stopping at the outer
+    // repository would hide members the operator sees in the same folder.
+    const { workspace } = workspaceFixture()
+    gitInit(workspace)
+    const layout = resolveProjectLayout(workspace)
+    expect(layout.kind).toBe('multi-repo-workspace')
+    expect(layout.gitRoot).toBeNull()
+    expect(layout.memberNames).toEqual(['backend', 'frontend', 'meeting-app'])
+    // 起動したrepository自身が先頭に来て、`.` として自分を名乗る。
+    expect(layout.gitRoots.map(path => relative(layout.projectPath, path)))
+      .toEqual(['', 'backend', 'frontend', 'meeting-app'])
+  })
+
+  test('member repositoryを持たないGit repositoryは単一repository扱いのまま', () => {
+    const root = mkdtempSync(join(tmpdir(), 'zerochan-single-layout-'))
+    roots.push(root)
+    const repository = join(root, 'solo')
+    gitInit(repository)
+    mkdirSync(join(repository, 'src'))
+    const layout = resolveProjectLayout(repository)
+    expect(layout.kind).toBe('git-worktree')
+    expect(layout.gitRoots).toEqual([layout.gitRoot!])
+    expect(layout.memberNames).toEqual([])
+  })
+
+  test('Git repositoryのsubdirectoryから起動してもmemberを探しに行かない', () => {
+    const { workspace } = workspaceFixture()
+    gitInit(workspace)
+    const inside = join(workspace, 'docs')
+    mkdirSync(inside)
+    const layout = resolveProjectLayout(inside)
+    // 起動位置がrepository rootではないので、外側のrepository1つに閉じる。
+    expect(layout.kind).toBe('git-worktree')
+    expect(layout.memberNames).toEqual([])
+  })
+
   test('visible direct Git clonesだけを安定順でworkspace memberにする', () => {
     const { workspace } = workspaceFixture()
     const layout = resolveProjectLayout(workspace)
@@ -65,9 +133,10 @@ describe('multi-repository project layout', () => {
     expect(lstatSync(join(workspace, '.zerochan')).mode & 0o777).toBe(0o700)
     expect(lstatSync(pin).mode & 0o777).toBe(0o600)
     expect(JSON.parse(readFileSync(pin, 'utf8'))).toEqual({
-      version: 1,
+      version: 2,
       kind: 'multi-repo-workspace',
       members: ['backend', 'frontend', 'meeting-app'],
+      projectRepository: false,
     })
     expect(resolveProjectLayout(workspace).pinned).toBe(true)
 
@@ -103,6 +172,32 @@ describe('multi-repository project layout', () => {
     rmSync(agents)
     symlinkSync(join(workspace, 'backend', '.git', 'HEAD'), agents)
     expect(() => resolveProjectLayout(workspace)).toThrow('安全な通常file')
+  })
+
+  test('version 1のpinは「memberのみ」として読み、そのまま使える', () => {
+    const { workspace } = workspaceFixture()
+    mkdirSync(join(workspace, '.zerochan'), { mode: 0o700 })
+    const pin = join(workspace, '.zerochan', 'workspace.json')
+    writeFileSync(pin, `${JSON.stringify({
+      version: 1,
+      kind: 'multi-repo-workspace',
+      members: ['backend', 'frontend', 'meeting-app'],
+    })}\n`, { mode: 0o600 })
+    const layout = resolveProjectLayout(workspace)
+    expect(layout.kind).toBe('multi-repo-workspace')
+    expect(layout.pinned).toBe(true)
+    expect(layout.gitRoots.map(path => relative(layout.projectPath, path)))
+      .toEqual(['backend', 'frontend', 'meeting-app'])
+  })
+
+  test('launched repositoryを含むpinのGit repositoryが消えたら黙って狭めない', () => {
+    const { workspace } = workspaceFixture()
+    gitInit(workspace)
+    ensureWorkspacePin(resolveProjectLayout(workspace))
+    expect(JSON.parse(readFileSync(join(workspace, '.zerochan', 'workspace.json'), 'utf8')))
+      .toMatchObject({ version: 2, projectRepository: true })
+    rmSync(join(workspace, '.git'), { recursive: true, force: true })
+    expect(() => resolveProjectLayout(workspace)).toThrow('Git repositoryが失われています')
   })
 
   test('pin済みworkspace parentがGit化されたら単一repoへ黙って切り替えない', () => {

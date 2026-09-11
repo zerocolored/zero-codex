@@ -24,7 +24,10 @@ const MAX_WORKSPACE_REPOSITORIES = 16
 const MAX_PIN_BYTES = 16 * 1024
 const MAX_ROOT_INSTRUCTION_BYTES = 1024 * 1024
 const LOCAL_GIT_TIMEOUT_MS = 10_000
-const WORKSPACE_PIN_VERSION = 1 as const
+const WORKSPACE_PIN_VERSION = 2 as const
+// Version 1 predates the launched repository ever being part of a workspace,
+// so it always means "members only".
+const LEGACY_WORKSPACE_PIN_VERSION = 1 as const
 const ROOT_INSTRUCTION_NAMES = new Set(['AGENTS.md', 'CLAUDE.md'])
 
 export type ProjectLayoutKind = 'git-worktree' | 'multi-repo-workspace' | 'non-git'
@@ -41,8 +44,10 @@ export type ProjectLayout = {
 }
 
 type WorkspacePin = {
-  version: typeof WORKSPACE_PIN_VERSION
+  version: typeof WORKSPACE_PIN_VERSION | typeof LEGACY_WORKSPACE_PIN_VERSION
   kind: 'multi-repo-workspace'
+  /** Whether the launched directory's own repository is part of the workspace. */
+  projectRepository: boolean
   members: string[]
 }
 
@@ -133,10 +138,17 @@ function parseWorkspacePin(projectPath: string): WorkspacePin | null {
     throw new Error('Zeroちゃんworkspace設定JSONが不正です')
   }
   const record = value as Record<string, unknown>
-  if (record.version !== WORKSPACE_PIN_VERSION || record.kind !== 'multi-repo-workspace'
-    || Object.keys(record).sort().join(',') !== 'kind,members,version'
+  const legacy = record.version === LEGACY_WORKSPACE_PIN_VERSION
+  const expectedKeys = legacy
+    ? 'kind,members,version'
+    : 'kind,members,projectRepository,version'
+  if ((record.version !== WORKSPACE_PIN_VERSION && !legacy)
+    || record.kind !== 'multi-repo-workspace'
+    || Object.keys(record).sort().join(',') !== expectedKeys
+    || (!legacy && typeof record.projectRepository !== 'boolean')
     || !Array.isArray(record.members)
-    || record.members.length < 2 || record.members.length > MAX_WORKSPACE_REPOSITORIES
+    || record.members.length < (!legacy && record.projectRepository === true ? 1 : 2)
+    || record.members.length > MAX_WORKSPACE_REPOSITORIES
     || record.members.some(member => (
       typeof member !== 'string' || !member || member.startsWith('.')
       || basename(member) !== member || member.includes('/') || member.includes('\\')
@@ -149,7 +161,12 @@ function parseWorkspacePin(projectPath: string): WorkspacePin | null {
     || JSON.stringify(members) !== JSON.stringify(record.members)) {
     throw new Error('Zeroちゃんworkspace設定のmember一覧が不正です')
   }
-  return { version: WORKSPACE_PIN_VERSION, kind: 'multi-repo-workspace', members }
+  return {
+    version: legacy ? LEGACY_WORKSPACE_PIN_VERSION : WORKSPACE_PIN_VERSION,
+    kind: 'multi-repo-workspace',
+    projectRepository: legacy ? false : record.projectRepository === true,
+    members,
+  }
 }
 
 type DiscoveredWorkspace = {
@@ -281,6 +298,39 @@ export function resolveProjectLayout(
     if (!contained(gitRoot, projectPath)) {
       throw new Error('project path is outside its physical Git worktree')
     }
+    // The bot is scoped to the directory it was launched in. A repository that
+    // sits inside that directory is not outside it, so a launched directory
+    // that is itself a repository and also holds member repositories has to
+    // reach all of them. Stopping at the outer repository would exclude
+    // members the operator can see in the same folder.
+    const nested = gitRoot === projectPath
+      ? discoverWorkspace(projectPath, gitExecutable)
+      : null
+    if (nested && nested.roots.length > 0) {
+      const nestedPin = options.ignorePin ? null : parseWorkspacePin(projectPath)
+      // A pin written while this directory was not a repository covers members
+      // only. Adopting the newly created outer repository would widen the
+      // writable scope without the operator saying so.
+      if (nestedPin && !nestedPin.projectRepository) {
+        throw new Error('workspace設定済みの親directoryがGit化されています。親の.gitを確認してください')
+      }
+      if (nestedPin && JSON.stringify(nestedPin.members) !== JSON.stringify(nested.names)) {
+        throw new Error(
+          `workspace member構成が設定時から変わっています（設定: ${nestedPin.members.join(', ')} / 現在: ${nested.names.join(', ')}）`,
+        )
+      }
+      return {
+        projectPath,
+        kind: 'multi-repo-workspace',
+        gitRoot: null,
+        // The launched repository comes first and identifies itself as `.`.
+        gitRoots: [gitRoot, ...nested.roots],
+        memberNames: nested.names,
+        excludedDirectPaths: nested.excludedDirectPaths,
+        rootInstructionPaths: nested.rootInstructionPaths,
+        pinned: nestedPin !== null,
+      }
+    }
     if (!options.ignorePin && parseWorkspacePin(projectPath) !== null) {
       throw new Error('workspace設定済みの親directoryがGit化されています。親の.gitを確認してください')
     }
@@ -298,6 +348,11 @@ export function resolveProjectLayout(
 
   const discovered = discoverWorkspace(projectPath, gitExecutable)
   const pin = options.ignorePin ? null : parseWorkspacePin(projectPath)
+  // The mirror of the check above: the pinned workspace included this
+  // directory's own repository and it is gone.
+  if (pin && pin.projectRepository) {
+    throw new Error('workspace設定済みの親directoryのGit repositoryが失われています。親の.gitを確認してください')
+  }
   if (pin && JSON.stringify(pin.members) !== JSON.stringify(discovered.names)) {
     throw new Error(
       `workspace member構成が設定時から変わっています（設定: ${pin.members.join(', ')} / 現在: ${discovered.names.join(', ')}）`,
@@ -347,6 +402,7 @@ export function ensureWorkspacePin(layoutInput: ProjectLayout): void {
     version: WORKSPACE_PIN_VERSION,
     kind: 'multi-repo-workspace',
     members: layout.memberNames,
+    projectRepository: layout.gitRoots[0] === layout.projectPath,
   }
   atomicWritePrivateFile(workspacePinPath(layout.projectPath), `${JSON.stringify(pin, null, 2)}\n`)
   chmodSync(workspacePinPath(layout.projectPath), 0o600)
