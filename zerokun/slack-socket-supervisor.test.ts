@@ -54,6 +54,10 @@ type Harness = {
   armDeadSocketOpens: (count: number) => void
   /** Fails apps.connections.open with a Slack error for the next `count` calls. */
   setPlatformError: (value: string | null, count?: number) => void
+  /** Fails apps.connections.open at the transport layer for the next `count` calls. */
+  setTransportError: (error: (() => Error) | null, count?: number) => void
+  /** Answers apps.connections.open with an HTTP status for the next `count` calls. */
+  setHttpStatus: (status: number | null, count?: number) => void
   /** Makes the Slack stand-in hang up the moment it has sent `hello`. */
   setDropOnHello: (value: boolean) => void
 }
@@ -95,6 +99,10 @@ function startHarness(options: {
   let remainingDeadOpens = 0
   let platformError: string | null = null
   let remainingPlatformErrorOpens = Number.POSITIVE_INFINITY
+  let transportError: (() => Error) | null = null
+  let remainingTransportErrorOpens = Number.POSITIVE_INFINITY
+  let httpStatus: number | null = null
+  let remainingHttpStatusOpens = Number.POSITIVE_INFINITY
   let dropOnHello = false
 
   const wsServer = Bun.serve({
@@ -132,6 +140,17 @@ function startHarness(options: {
         }
         openCalls += 1
         if (!online) throw dnsFailure()
+        if (transportError && remainingTransportErrorOpens > 0) {
+          remainingTransportErrorOpens -= 1
+          throw transportError()
+        }
+        if (httpStatus !== null && remainingHttpStatusOpens > 0) {
+          remainingHttpStatusOpens -= 1
+          return {
+            data: {}, status: httpStatus, statusText: 'NG',
+            headers: {}, config, request: {},
+          }
+        }
         if (platformError && remainingPlatformErrorOpens > 0) {
           remainingPlatformErrorOpens -= 1
           return {
@@ -164,6 +183,10 @@ function startHarness(options: {
       waits.push(milliseconds)
       options.onSleep?.(milliseconds)
       if (waits.length >= options.recoverAfterSleeps) online = true
+      // Real time stays at zero, but the loop has to yield the macrotask queue
+      // or a retry that never gives up starves `until` and hangs the runner
+      // instead of failing it.
+      await Bun.sleep(0)
     },
     report: event => {
       reported.push(event)
@@ -198,6 +221,14 @@ function startHarness(options: {
     setPlatformError: (value, count = Number.POSITIVE_INFINITY) => {
       platformError = value
       remainingPlatformErrorOpens = count
+    },
+    setTransportError: (error, count = Number.POSITIVE_INFINITY) => {
+      transportError = error
+      remainingTransportErrorOpens = count
+    },
+    setHttpStatus: (status, count = Number.POSITIVE_INFINITY) => {
+      httpStatus = status
+      remainingHttpStatusOpens = count
     },
     setDropOnHello: value => { dropOnHello = value },
   }
@@ -289,6 +320,91 @@ describe('Socket Mode reconnection ownership', () => {
     expect(h.waits).toEqual([])
     expect(h.supervisor.connected).toBe(false)
   })
+
+  test('待っても直らないtransport不調も諦める。無通信のまま生き続けない', async () => {
+    // Owning the reconnect means owning the decision to stop. The SDK called
+    // these unrecoverable and the process died; retrying them forever would
+    // trade a gateway that dies loudly for one that is up and mute, which is
+    // the failure this whole change exists to remove.
+    const h = startHarness({ recoverAfterSleeps: Infinity })
+
+    await h.receiver.client.start()
+    h.supervisor.arm()
+    h.setTransportError(() => Object.assign(new Error('certificate has expired'), {
+      code: 'CERT_HAS_EXPIRED', isAxiosError: true, request: {},
+    }))
+    h.live()?.close()
+    await until(() => h.unrecoverable.length === 1, 'the unrecoverable report')
+    await h.supervisor.settled()
+
+    expect(h.reported.map(event => event.phase)).toEqual(['lost', 'unrecoverable'])
+    expect(h.waits).toEqual([])
+    const error = h.lastConnectError() as { code?: string; original?: { code?: string } }
+    expect(error.code).toBe('slack_webapi_request_error')
+    expect(error.original?.code).toBe('CERT_HAS_EXPIRED')
+  })
+
+  test('Slackが恒久的に拒むHTTPエラーは諦める', async () => {
+    const h = startHarness({ recoverAfterSleeps: Infinity })
+
+    await h.receiver.client.start()
+    h.supervisor.arm()
+    // A proxy that refuses the call outright will refuse the next one too.
+    h.setHttpStatus(403)
+    h.live()?.close()
+    await until(() => h.unrecoverable.length === 1, 'the unrecoverable report')
+    await h.supervisor.settled()
+
+    expect(h.reported.map(event => event.phase)).toEqual(['lost', 'unrecoverable'])
+    expect(h.waits).toEqual([])
+  })
+
+  // Slack having a bad minute is not a reason to stop being a gateway. 421 is
+  // here because the spec says to retry a misdirected request on a fresh
+  // connection, which is exactly what the next attempt opens.
+  for (const status of [421, 429, 503]) {
+    test(`一時的なHTTP ${status}は待って張り直す`, async () => {
+      const h = startHarness({ recoverAfterSleeps: Infinity })
+
+      await h.receiver.client.start()
+      h.supervisor.arm()
+      h.setHttpStatus(status, 2)
+      h.live()?.close()
+      await until(() => h.waits.length >= 2, `two backoff sleeps after ${status}`)
+      await h.supervisor.settled()
+
+      expect(h.supervisor.connected).toBe(true)
+      expect(h.unrecoverable).toHaveLength(0)
+      expect(h.waits).toEqual([1_000, 2_000])
+      expect(h.reported.map(event => event.phase))
+        .toEqual(['lost', 'retrying', 'retrying', 'reconnected'])
+    })
+  }
+
+  // Codes a link in trouble produces and a healthy one does not. Reading either
+  // as a permanent fault would end the gateway on exactly the conditions it is
+  // supposed to ride out: axios reports its own request timeout as
+  // ECONNABORTED rather than ETIMEDOUT, and a refused connection is what a
+  // restarting proxy or a Slack edge in rotation answers with.
+  for (const code of ['ECONNABORTED', 'ECONNREFUSED']) {
+    test(`${code}はnetwork断として扱い、諦めない`, async () => {
+      const h = startHarness({ recoverAfterSleeps: Infinity })
+
+      await h.receiver.client.start()
+      h.supervisor.arm()
+      h.setTransportError(() => Object.assign(new Error(`${code} happened`), {
+        code, isAxiosError: true, request: {},
+      }), 2)
+      h.live()?.close()
+      await until(() => h.waits.length >= 2, `two backoff sleeps after ${code}`)
+      await h.supervisor.settled()
+
+      expect(h.supervisor.connected).toBe(true)
+      expect(h.unrecoverable).toHaveLength(0)
+      expect(h.waits).toEqual([1_000, 2_000])
+      expect(isTransientNetworkFailure(h.lastConnectError())).toBe(true)
+    })
+  }
 
   test('shutdownはbackoff待機中でも再接続を止める', async () => {
     const h = startHarness({

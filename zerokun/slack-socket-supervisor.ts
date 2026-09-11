@@ -20,7 +20,7 @@
  */
 import { SocketModeReceiver } from '@slack/bolt'
 import type { WebClientOptions } from '@slack/web-api'
-import { structuredSlackApiErrorCode } from '../gate.ts'
+import { isTransientNetworkFailure, structuredSlackApiErrorCode } from '../gate.ts'
 
 /** @slack/socket-mode's own UnrecoverableSocketModeStartError list. */
 const UNRECOVERABLE_SOCKET_START_SLACK_ERRORS = new Set([
@@ -32,14 +32,38 @@ const UNRECOVERABLE_SOCKET_START_SLACK_ERRORS = new Set([
 ])
 
 /**
- * Retrying is the default on purpose. With `retryConfig.retries: 0` both a 429
- * and a response missing its URL surface as a plain Error carrying no code, and
- * the SDK treats both as recoverable today; calling every unfamiliar shape
- * fatal would leave the gateway less available than it was before this change.
+ * HTTP answers worth waiting out; every other 4xx will say the same thing next
+ * time. 421 is in here because it means "wrong connection", and the next
+ * attempt opens a new one.
+ */
+const RETRYABLE_SLACK_HTTP_STATUSES = new Set([408, 421, 425, 429])
+
+/**
+ * Whether waiting is pointless.
+ *
+ * Retrying is the default. With `retryConfig.retries: 0` both a 429 and a
+ * response missing its URL surface as a plain Error carrying no code, and the
+ * SDK treats both as recoverable today; calling every unfamiliar shape fatal
+ * would leave the gateway less available than it was before this change.
+ *
+ * What is not the default is a transport or HTTP failure that is not the
+ * network being gone. An expired certificate, a proxy that answers 403 — the
+ * SDK called these unrecoverable and let the process die, and taking ownership
+ * of the reconnect means taking ownership of that decision too. Retrying them
+ * forever would swap a gateway that dies loudly for one that is up and mute,
+ * which is the very failure this module exists to remove.
  */
 export function isPermanentSlackSocketConnectFailure(error: unknown): boolean {
   const structured = structuredSlackApiErrorCode(error)
-  return structured !== null && UNRECOVERABLE_SOCKET_START_SLACK_ERRORS.has(structured)
+  if (structured !== null) return UNRECOVERABLE_SOCKET_START_SLACK_ERRORS.has(structured)
+  if (!error || typeof error !== 'object') return false
+  const candidate = error as { code?: unknown; statusCode?: unknown }
+  if (candidate.code === 'slack_webapi_request_error') return !isTransientNetworkFailure(error)
+  if (candidate.code === 'slack_webapi_http_error') {
+    const status = typeof candidate.statusCode === 'number' ? candidate.statusCode : 0
+    return status >= 400 && status < 500 && !RETRYABLE_SLACK_HTTP_STATUSES.has(status)
+  }
+  return false
 }
 
 export const SLACK_SOCKET_RECONNECT_BASE_MS = 1_000

@@ -297,9 +297,16 @@ const TRANSIENT_INITIAL_CONTEXT_SLACK_ERRORS = new Set([
  * ENOTFOUND is here because macOS getaddrinfo returns it while the interface is
  * down, not only for a genuinely unknown host — and slack.com is never
  * genuinely unknown.
+ *
+ * ECONNABORTED is here because axios, which the Slack SDK requests through,
+ * reports its own request timeout under that code rather than ETIMEDOUT. A
+ * request that ran out of time on a degraded link is the network being gone,
+ * and the code that decides whether to keep the gateway alive has to see it
+ * that way. ECONNREFUSED joins it because a proxy mid-restart or a Slack edge
+ * leaving rotation refuses the connection for a moment, not for good.
  */
 const TRANSIENT_NETWORK_ERROR_CODES = new Set([
-  'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',
+  'ECONNABORTED', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',
   'ENOTFOUND', 'ENETDOWN', 'ENETUNREACH', 'EHOSTUNREACH',
 ])
 
