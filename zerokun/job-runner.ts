@@ -15599,13 +15599,20 @@ export function sanitizeExecutionTextForSlack(
   const selfInquirySubject = /(?:Zeroちゃん|\bZero\b|ゼロ(?:ちゃん)?|当システム|本システム|このシステム|そのシステム|当サービス|本サービス|このサービス|このボット|当ボット|本ボット|あなた|君|お前|そちら|\b(?:you|your|yourself|this\s+(?:bot|assistant|agent|system|service))\b)/i
   const explicitResponseSelfIdentity = /(?:Zeroちゃん|\bZero\b|ゼロ(?:ちゃん)?|当システム|本システム|このシステム|そのシステム|当サービス|本サービス|このサービス|このボット|当ボット|本ボット|私は|私たちは|こちら|当方|ここ(?:で|では)|\b(?:i|we|me|my|our|us|here)\b|\b(?:this|our|my)\s+(?:bot|assistant|agent|system|service|application|app|backend|runtime|implementation)\b)/i
   const selfExecutionContext = /(?:\b(?:this|the\s+current)\s+(?:request|response|answer|reply)\b|\bthe\s+active\s+model\b|^\s*handled\s+by\b|\bhandled\s+(?:this|the\s+current)\s+request\b|\bran\s+through\b|\bgenerated\s+(?:this|the\s+current)\s+(?:answer|response)\b|(?:この|今回の)(?:依頼|回答|返答|応答|処理)|(?:担当|採用)(?:モデル|エンジン)|(?:が|で)(?:この)?(?:回答|返答|応答)を?生成|で回答(?:しました|した|しています))/i
-  const subjectOmittedSelfQuestion = /(?:(?:何|なに)(?:で|の)?(?:動いて|動く|動作|モデル|エンジン|基盤|書かれて|できて|作られて)|(?:何|なに).{0,12}(?:使ってる|使う|製)|(?:どんな|どういう).{0,12}(?:技術|部品|構成要素|材料|仕組み|構成)(?:で動いてる|で動く|を使ってる|でできてる|なの|[?？])|どうやって.{0,16}(?:動いて|動く|動作|作られ|構築)|(?:仕組み|裏側|中身|部品|構成要素|土台|成り立ち|材料|依存関係)(?:は|を)?.{0,16}(?:[?？]|教えて|説明して)|使用(?:モデル|エンジン)|(?:what|which)\s+(?:model|engine|runtime|backend)\s*(?:are\s+you|do\s+you|is\s+it|does\s+it|[?？])|what\s+(?:do\s+you|does\s+it)\s+(?:run|use)|what\s+is\s+it\s+(?:made\s+of|written\s+in)|what\s+is\s+under\s+the\s+hood|how\s+was\s+it\s+built|what\s+dependencies\s+does\s+it\s+have|(?:what|how).{0,28}\byou\b.{0,28}(?:built|implemented|technology|using|use|powered)|what\s+powers?\s+you)/i
+  // A current-usage question is not an indefinite alternative (何かを使う)
+  // or a prospective choice (何を使うべき). Do not bridge arbitrary prose
+  // between the interrogative and verb: one false match erases the result.
+  // なに must not be the tail of こんなに/そんなに; 製 is a predicate,
+  // not the prefix of a compound noun such as 製品 or 製造.
+  const subjectOmittedCurrentUsageQuestion = /(?:何|(?<![\p{Script=Hiragana}\p{Script=Katakana}])なに)(?:製(?!\p{Script=Han})|(?:を|の[^\s、。！？!?]{1,12}を?)?使ってる)/u
+  const subjectOmittedSelfQuestion = /(?:(?:何|なに)(?:で|の)?(?:動いて|動く|動作|モデル|エンジン|基盤|書かれて|できて|作られて)|(?:どんな|どういう).{0,12}(?:技術|部品|構成要素|材料|仕組み|構成)(?:で動いてる|で動く|を使ってる|でできてる|なの|[?？])|どうやって.{0,16}(?:動いて|動く|動作|作られ|構築)|(?:仕組み|裏側|中身|部品|構成要素|土台|成り立ち|材料|依存関係)(?:は|を)?.{0,16}(?:[?？]|教えて|説明して)|使用(?:モデル|エンジン)|(?:what|which)\s+(?:model|engine|runtime|backend)\s*(?:are\s+you|do\s+you|is\s+it|does\s+it|[?？])|what\s+(?:do\s+you|does\s+it)\s+(?:run|use)|what\s+is\s+it\s+(?:made\s+of|written\s+in)|what\s+is\s+under\s+the\s+hood|how\s+was\s+it\s+built|what\s+dependencies\s+does\s+it\s+have|(?:what|how).{0,28}\byou\b.{0,28}(?:built|implemented|technology|using|use|powered)|what\s+powers?\s+you)/i
   const configurationInquiry = /(?:仕組み|構成|実装|アーキテクチャ|技術スタック|使用技術|裏側|中身|基盤|土台|部品|構成要素|成り立ち|材料|ライブラリ|ランタイム|バックエンド|モデル|エンジン|言語|フレームワーク|OS|設計|テクノロジー|技術|依存関係|依存|できて|作られて|作り|構築|runtime|backend|model|engine|stack|architecture|implementation|language|framework|librar|parts?|components?|building\s+blocks?|make\s*up|makeup|foundation|origin|operating\s+system|\bOS\b|design|technolog|dependenc|built|made|powering|tick)/i
   const questionIntent = /(?:[?？]|教えて|説明(?:して)?|開示|列挙|述べ|何|なに|どの|what|which|tell|show|explain|describe|list|reveal|disclose)/i
   const subjectOmittedImplementationRelation = /(?:で動いて(?:る|いる)?|で動く|を使って(?:る|いる)|を採用して(?:る|いる)|powered\s+by|runs?\s+on)\s*[?？]?/i
   const isSelfImplementationInquiry = (clause: string): boolean => {
     if (externalTechnicalTarget.test(clause) && !selfInquirySubject.test(clause)) return false
-    return subjectOmittedSelfQuestion.test(clause)
+    return subjectOmittedCurrentUsageQuestion.test(clause)
+      || subjectOmittedSelfQuestion.test(clause)
       || (implementationName.test(clause)
         && subjectOmittedImplementationRelation.test(clause)
         && questionIntent.test(clause))

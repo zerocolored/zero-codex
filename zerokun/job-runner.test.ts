@@ -13717,8 +13717,57 @@ describe('Slack output guard', () => {
     store.close()
   })
 
+  test('何かを使う・何を使うべきという選択相談を自己構成質問にしない', () => {
+    const answer = '二重検索を削減し、検索基盤のプラン変更と代替サービスを比較します。精度・費用・遅延を測定して選びます。'
+    for (const task of [
+      'では、そこを1秒以内に改善するためにどうすべきか、全員で検討してください。ロジック改善はもちろん、パインコーンの中でもプランを変更するとか、パインコーンよりも高速の他の何かを使うとか、あらゆる根本的な対応を含めて検討してみてください',
+      'もっと高速な別の何かを使う案を検討して',
+      '他のなにかを使う方法も比較して',
+      '高速化には何を使うべき？',
+      '何を使えばよいか検討して',
+      '何を使うと速くなる？',
+      '他の何かの製品に置き換える案も検討して',
+      '何の製品を使うべきか検討して',
+      '検索には何を使っていますか？',
+      '現在の検索基盤は何を使っていますか？',
+      '何製品を使うべきか検討して',
+      'メモリをこんなに使ってる原因を調べて',
+      'そんなに使ってるのはなぜ？',
+      'あんなに使ってる原因を調べて',
+    ]) {
+      const state = fixtureDir()
+      const repo = join(state, 'repo')
+      mkdirSync(repo)
+      const store = new JobStore(join(state, 'jobs.sqlite3'))
+      store.enqueue(input({ repoPath: repo, task }))
+      const job = store.claimNext('serial-worker')!
+      const finalized = finalizeSuccessfulExecution(job, {
+        sessionId: 'performance-choice', result: answer,
+      }, state)
+      expect(finalized.result).toBe(answer)
+      const filtered = finalizeSuccessfulExecution(job, {
+        sessionId: 'performance-choice-filtered',
+        result: `${answer}\nZeroちゃんはBunで動いています。\n認証: Bearer synthetic-secret-123\n保存先: /Users/example/private/report.txt`,
+      }, state)
+      expect(filtered.result).toContain(answer)
+      expect(filtered.result).not.toContain('内部構成は公開していません')
+      expect(filtered.result).not.toMatch(/Bun|synthetic-secret-123|\/Users\/example/)
+      store.close()
+    }
+  })
+
   test('自己実装質問が混ざる場合は自然文の紐付けを信頼せず本文全体を非公開にする', () => {
     for (const [index, task, answer] of [
+      [
+        'performance-and-self',
+        '高速化には別の何かを使う案を比較して。Zeroちゃんの構成も教えて',
+        '検索を高速化できます。\nイベント駆動方式です。',
+      ],
+      [
+        'performance-and-current-usage',
+        '高速化を検討して。何使ってるか教えて',
+        'イベント駆動方式です。',
+      ],
       [
         'readme',
         'READMEを直した結果を説明して。ZeroちゃんはCodexで動いていますか？',
@@ -13784,6 +13833,11 @@ describe('Slack output guard', () => {
       ['bare-how', '仕組みを教えて', 'TypeScriptとBun、SQLiteで構成されています。'],
       ['english-stack', 'What is your stack?', 'TypeScript, Bun, and SQLite.'],
       ['what-use', '何使ってる？', 'Bunです。'],
+      ['what-use-hiragana', 'なに使ってる？', 'Bunです。'],
+      ['what-use-tell', '何使ってるか教えて', 'イベント駆動方式です。'],
+      ['what-use-period', '何使ってる。', 'イベント駆動方式です。'],
+      ['what-library', '何のライブラリ使ってる？', 'TypeScriptとBunです。'],
+      ['what-made-tell', '何製か教えて', 'TypeScript製です。'],
       ['which-tech', 'どんな技術で動いてる？', 'TypeScriptとBunです。'],
       ['what-made', '何製なの？', 'TypeScript製です。'],
       ['how-run', 'どうやって動いてる？', 'Bunです。'],
