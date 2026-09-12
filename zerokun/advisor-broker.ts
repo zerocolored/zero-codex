@@ -23,6 +23,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
+import { classifyAdvisorFailure } from './advisor-availability.ts'
 import {
   readPinnedHerdrRuntime,
   verifyHerdrRuntimeIdentityAsync,
@@ -102,11 +103,11 @@ import {
   validThreeAdvisorReviewSequence,
   type AdvisorPhase,
 } from './advisor-journal.ts'
-import { persistAdvisorClaudeCleanupOutcome } from './advisor-round-recovery.ts'
+import { persistAdvisorClaudeCleanupOutcome, retireAdvisorClaudeCleanupOutcome } from './advisor-round-recovery.ts'
 
 export type FifthAdvisorSendOutcome =
   | { kind: 'unconfirmed' }
-  | { kind: 'possibly-delivered'; marker: string }
+  | { kind: 'possibly-delivered'; marker: string; stateChangeSeq?: number }
 
 export class AdvisorContainmentError extends Error {}
 export class AdvisorOwnedProcessStillLiveError extends AdvisorContainmentError {}
@@ -123,7 +124,10 @@ export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOu
   if (started.length !== 1 || typeof started[0]!.marker !== 'string') {
     return { kind: 'unconfirmed' }
   }
-  return { kind: 'possibly-delivered', marker: started[0]!.marker }
+  return { kind: 'possibly-delivered', marker: started[0]!.marker,
+    ...(Number.isSafeInteger(started[0]!.state_change_seq)
+      ? { stateChangeSeq: Number(started[0]!.state_change_seq) } : {}),
+  }
 }
 
 const CLAUDE_MARKER_INSTRUCTION =
@@ -1228,7 +1232,7 @@ export function advisorReceiptAlreadyObserved(input: {
   slotSummary: ReturnType<typeof summarizeAdvisorSlots>
 }): Record<string, unknown> {
   return {
-    complete: true,
+    complete: input.slotSummary.responsesObtained === input.slotSummary.total,
     alreadyObserved: true,
     phase: input.phase,
     round: input.round,
@@ -1256,7 +1260,7 @@ function unavailableAdvisorReasons(
 ): Array<{ advisor: 'codex' | 'grok' | 'claude', reason: string }> {
   const result: Array<{ advisor: 'codex' | 'grok' | 'claude', reason: string }> = []
   for (const attempt of native) {
-    if (attempt.adopted !== true) result.push({ advisor: 'codex', reason: String(attempt.reason ?? '回答未取得') })
+    if (attempt.adopted === false) result.push({ advisor: 'codex', reason: String(attempt.reason ?? '回答未取得') })
   }
   for (const attempt of grok) {
     if (attempt.adopted !== true) result.push({ advisor: 'grok', reason: String(attempt.reason ?? '回答未取得') })
@@ -1459,7 +1463,7 @@ async function main(): Promise<void> {
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
     phase: 'investigation' | 'design' | 'review',
     round: 1 | 2 | 3,
-    status: 'reviewers-completed' | 'completed' | 'stale-input',
+    status: 'reviewers-completed' | 'completed' | 'stale-input' | 'required-reviewer-failed',
   ): Record<string, unknown> | null => {
     const raw = readOptionalPrivateFile(join(revisionJournalRoot(input), `${phase}-${round}.json`))
     if (raw === null || Buffer.byteLength(raw) > 64 * 1024) return null
@@ -1590,6 +1594,7 @@ async function main(): Promise<void> {
         let terminal = readTerminalJournal(input, phase, round, 'completed')
           ?? readTerminalJournal(input, phase, round, 'reviewers-completed')
           ?? readTerminalJournal(input, phase, round, 'stale-input')
+          ?? readTerminalJournal(input, phase, round, 'required-reviewer-failed')
         // Version 8 existed in both the older split investigation/design
         // workflow and the immediately preceding unified workflow. Preserve
         // completed unified history across an update, while requiring the
@@ -1839,6 +1844,7 @@ async function main(): Promise<void> {
     let stateChangeSeqAfter: number | undefined
     let modelStartObserved = false
     let reason = 'Claude advisor was not sent'
+    const cleanupWarnings: string[] = []
     let workspaceCreationAttempted = false
     let helperContainmentVerified = true
     let containmentStatus: string | undefined
@@ -1935,10 +1941,11 @@ async function main(): Promise<void> {
       ], jobFingerprint), { env: helperEnvironment, timeoutMs: 140_000 })
       const sendOutcome = parseFifthAdvisorSendOutcome(send.stdout)
       if (sendOutcome.kind === 'unconfirmed') {
-        throw new Error('fifth-advisor helper did not confirm prompt delivery boundary')
+        throw new Error(`Claude prompt delivery failed (${send.exitCode}): ${send.stderr.slice(-2_000)}`)
       }
       {
         marker = sendOutcome.marker
+        if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
         persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir)
         const acquisitionDeadline = Date.now() + 60 * 60 * 1_000
         // Once prompt-started is durable, helper timeout/exit 5 is an ambiguous
@@ -1973,6 +1980,7 @@ async function main(): Promise<void> {
             const completeResponse = extractCompleteClaudeResponse(transcript, marker)
             if (completeResponse) {
               response = completeResponse
+              reason = 'Claude response obtained but subsequent cleanup validation did not complete'
               stateChangeSeqAfter = current.state_change_seq
               break
             }
@@ -2014,14 +2022,14 @@ async function main(): Promise<void> {
             || verifyBeforeClose.outputTruncated
             || verifyBeforeClose.exitCode !== 0) {
             response = undefined
-            reason = 'repository changed during Claude advisor attempt'
+            cleanupWarnings.push('repository verification was unavailable during Claude advisor attempt')
           }
           if (beforeSnapshot) {
             const snapshotBeforeClose = snapshotAdvisorRepository(projectLayout)
             if (advisorRepositoryDigest(beforeSnapshot)
               !== advisorRepositoryDigest(snapshotBeforeClose)) {
               response = undefined
-              reason = 'repository changed during Claude advisor attempt'
+              cleanupWarnings.push('repository changed during Claude advisor attempt')
             }
           }
           const receiptTarget = readEphemeralClaudeWorkspaceTarget(
@@ -2034,7 +2042,7 @@ async function main(): Promise<void> {
               || target.paneId !== receiptTarget.paneId
               || target.terminalId !== receiptTarget.terminalId)) {
               response = undefined
-              reason = 'ephemeral Claude open output disagreed with its durable workspace receipt'
+              cleanupWarnings.push('ephemeral Claude open output disagreed with its durable workspace receipt')
             }
             if (!target) target = receiptTarget
             const close = await runBounded(fingerprintedCommand([
@@ -2057,9 +2065,7 @@ async function main(): Promise<void> {
             cleanupReceiptDigest = cleanup.digest
             cleanupStatus = cleanup.status
             if (closeOutcome.processIdentityWarning) {
-              response = undefined
-              reason = 'ephemeral Claude process identity changed before cleanup; '
-                + 'the exact owned workspace and all recorded processes were still closed'
+              cleanupWarnings.push('Claude process identity changed during cleanup; owned workspace and recorded processes were closed')
             }
           } else {
             const recovered = await runBounded(fingerprintedCommand([
@@ -2092,7 +2098,7 @@ async function main(): Promise<void> {
             || verifyAfterClose.outputTruncated
             || verifyAfterClose.exitCode !== 0) {
             response = undefined
-            reason = 'repository changed while closing the ephemeral Claude advisor'
+            cleanupWarnings.push('repository verification was unavailable while closing the ephemeral Claude advisor')
           } else {
             requestRemovalReady = true
           }
@@ -2102,7 +2108,7 @@ async function main(): Promise<void> {
               !== advisorRepositoryDigest(snapshotAfterClose)) {
               response = undefined
               requestRemovalReady = false
-              reason = 'repository changed while closing the ephemeral Claude advisor'
+              cleanupWarnings.push('repository changed while closing the ephemeral Claude advisor')
             }
           }
         } catch (error) {
@@ -2116,7 +2122,7 @@ async function main(): Promise<void> {
             containmentStatus = 'unverified-bounded-residual'
           }
           response = undefined
-          reason = `ephemeral Claude cleanup verification failed: ${error}`
+          cleanupWarnings.push(`ephemeral Claude cleanup verification failed: ${error}`)
         }
       }
       if (requestDir && cleanupVerified && requestRemovalReady) {
@@ -2145,8 +2151,7 @@ async function main(): Promise<void> {
           // A later journal/tombstone removal failure is bounded residue, not
           // evidence that the reviewer is still live and not a reason to make
           // the whole advisor round retry forever.
-          response = undefined
-          reason = `ephemeral Claude request directory cleanup failed: ${error}`
+          cleanupWarnings.push(`ephemeral Claude request directory cleanup failed: ${error}`)
         }
       }
     }
@@ -2169,6 +2174,7 @@ async function main(): Promise<void> {
         stateChangeSeqBefore: target.stateChangeSeq,
         stateChangeSeqAfter,
         response,
+        cleanupWarnings,
       }
     }
     return {
@@ -2194,6 +2200,8 @@ async function main(): Promise<void> {
       ...(containmentStatus ? { containmentStatus } : {}),
       promptMayHaveBeenDelivered: Boolean(marker),
       reason,
+      failure: classifyAdvisorFailure('claude', reason),
+      cleanupWarnings,
     }
   }
 
@@ -2216,6 +2224,8 @@ async function main(): Promise<void> {
     }),
   ])
   const advisorRoundInputSchema = {
+    retryUnavailable: z.boolean().optional(),
+    inputUpdateIsRecoveryOnly: z.boolean().optional().describe('Only for missing-slot recovery: the primary has checked that newer Slack input only resolves the failure and does not change the reviewed request.'),
     phase: completeWorkflow
       ? z.enum(['investigation', 'review'])
       : z.enum(['investigation', 'design', 'review']),
@@ -2278,8 +2288,11 @@ async function main(): Promise<void> {
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
     phase: 'investigation' | 'design' | 'review',
     round: 1 | 2 | 3,
+    allowRecoveryOnlyInput = false,
   ): ReturnType<typeof toolText> | null => {
-    const journal = readTerminalJournal(input, phase, round, 'reviewers-completed')
+    const journal = readTerminalJournal(input, phase, round, 'required-reviewer-failed')
+      ?? readTerminalJournal(input, phase, round, 'reviewers-completed')
+      ?? (allowRecoveryOnlyInput ? readTerminalJournal(input, phase, round, 'stale-input') : null)
     if (!journal || journal.recoveredAfterInterruption !== true
       || typeof journal.recoveryId !== 'string' || !/^[0-9a-f]{64}$/.test(journal.recoveryId)) {
       return null
@@ -2356,7 +2369,8 @@ async function main(): Promise<void> {
       ? journal.native as Array<Record<string, unknown>>
       : []
     return toolText({
-      complete: true,
+      complete: false,
+      waitingForAdvisors: true,
       recoveredAfterInterruption: true,
       inputRevision: input.revision,
       inputDigest: input.digest,
@@ -2386,7 +2400,7 @@ async function main(): Promise<void> {
     description: 'Durably start one ordered Three-Advisor attempt round. Unavailable outcomes are contained and journaled; call advisor_round_poll until the same binding reaches a terminal receipt.',
     inputSchema: advisorRoundInputSchema,
   }, async ({
-    phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis,
+    phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis, retryUnavailable, inputUpdateIsRecoveryOnly,
   }) => {
     if (phaseScope === 'prepare' && phase === 'review') {
       return toolText({ complete: false, reason: 'review is unavailable in the pre-edit process' }, true)
@@ -2428,6 +2442,59 @@ async function main(): Promise<void> {
       'agentId' in value ? [value.agentId] : []
     ))
     const taskKey = roundTaskKey(phase, round, inputRevision, inputDigest)
+    let retryResult: {
+      grok: Array<Record<string, unknown>>, claude: Record<string, unknown>,
+      native: Array<Record<string, unknown>>, evidenceDigest: string,
+      responseCacheDigest?: string,
+    } | undefined
+    let retryBackoff = false
+    if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
+      const retryPath = `${roundJournalPath({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3)}.responses`
+      const raw = readOptionalPrivateFile(retryPath)
+      if (raw && Buffer.byteLength(raw) <= 2 * 1024 * 1024) {
+        try {
+          const saved = JSON.parse(raw)
+          const durable = JSON.parse(readOptionalPrivateFile(retryPath.slice(0, -10)) ?? '{}')
+          retryBackoff = Date.now() - Number(saved.finishedAt) < 30_000
+          if (saved.complete === false && saved.contextDigest === contextDigest
+            && durable.responseCacheDigest === createHash('sha256').update(raw).digest('hex')
+            && saved.inputRevision === inputRevision && saved.inputDigest === inputDigest
+            && saved.phase === phase && saved.round === round
+            && (phaseScope === 'complete' || saved.retryRepositoryDigest === advisorRepositoryDigest(snapshotAdvisorRepository(projectLayout)))
+            && Date.now() - Number(saved.finishedAt) >= 30_000
+            && saved.claude?.containmentVerified === true
+            && durable.claude?.containmentVerified === true
+            && saved.grok?.every((slot: Record<string, unknown>) => slot.containmentVerified === true)) {
+            retryResult = { ...saved, claude: { ...saved.claude,
+              cleanupReceiptDigest: durable.claude.cleanupReceiptDigest,
+            }, responseCacheDigest: durable.responseCacheDigest }
+          }
+        } catch {}
+      }
+      if (!raw) {
+        const recovered = recoveredRoundResult({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3, inputUpdateIsRecoveryOnly === true)
+        const journal = readTerminalJournal({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3, 'required-reviewer-failed')
+          ?? (inputUpdateIsRecoveryOnly === true
+            ? readTerminalJournal({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3, 'stale-input') : null)
+        const claude = journal?.claude as Record<string, unknown> | undefined
+        if (recovered && journal && claude?.containmentVerified === true) {
+          retryBackoff = Date.now() - Number(journal.finishedAt) < 30_000
+        }
+        if (recovered && journal && claude?.containmentVerified === true
+          && Date.now() - Number(journal.finishedAt) >= 30_000) {
+          // No response text survived the interrupted first attempt. Keep the
+          // native answer binding, but obtain external answers afresh.
+          retryResult = { native: journal.native as Array<Record<string, unknown>>,
+            grok: [], claude, evidenceDigest: String(journal.primaryEvidenceDigest) }
+        }
+      }
+      if (!retryResult) return toolText({ complete: false, waitingForAdvisors: true,
+        retryable: retryBackoff,
+        reason: retryBackoff
+          ? 'Advisor retry backoff: wait at least 30 seconds after the last attempt.'
+          : 'Saved advisor responses are not available for this retry. Report the missing advisor and dependency; preserve the work. Do not repeat this retry unchanged.',
+      }, true)
+    }
     let priorUnifiedEntry: UnifiedPhaseLedgerEntry | undefined
     if (phaseScope === 'complete') {
       const ledger = unifiedRoundLedger(phase, round as 1 | 2)
@@ -2451,7 +2518,7 @@ async function main(): Promise<void> {
     const recovered = recoveredRoundResult(
       { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3,
     )
-    if (recovered) {
+    if (recovered && !retryResult) {
       roundTasks.set(taskKey, Promise.resolve(recovered))
       return toolText({
         complete: false,
@@ -2467,7 +2534,7 @@ async function main(): Promise<void> {
     const alreadyObserved = readCompletedJournal(
       { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3,
     )
-    if (alreadyObserved) {
+    if (alreadyObserved && !retryResult) {
       return toolText(advisorReceiptAlreadyObserved({
         phase,
         round,
@@ -2477,7 +2544,7 @@ async function main(): Promise<void> {
         slotSummary: journalSlotSummary(alreadyObserved),
       }))
     }
-    if (roundTasks.has(taskKey)) {
+    if (!retryResult && roundTasks.has(taskKey)) {
       return toolText({
         complete: false,
         pending: true,
@@ -2494,7 +2561,7 @@ async function main(): Promise<void> {
     // logical phase.
     if (phaseScope === 'complete') {
       const prior = priorUnifiedEntry
-      if (prior) {
+      if (prior && !retryResult) {
         if (prior.status === 'requested') {
           return toolText({
             complete: false,
@@ -2509,7 +2576,7 @@ async function main(): Promise<void> {
         }
         if (prior.terminal) {
           return toolText({
-            complete: true,
+            complete: journalSlotSummary(prior.terminal).responsesObtained === journalSlotSummary(prior.terminal).total,
             reusedPriorPhase: true,
             phase,
             round,
@@ -2750,6 +2817,9 @@ async function main(): Promise<void> {
         }), 'delta-limited review evidence')
       : primaryEvidenceValue
     const evidenceDigest = createHash('sha256').update(evidence).digest('hex')
+    if (retryResult && retryResult.evidenceDigest !== evidenceDigest) {
+      return toolText({ complete: false, reason: 'The advisor question changed; do not mix previous answers with different evidence.' }, true)
+    }
     const expectedNativePerspective = advisorPerspectiveForPhase(phase)
     const nativePerspectives = new Set(nativeAdvisors.map(value => value.perspective))
     if (nativePerspectives.size !== 1
@@ -2770,6 +2840,7 @@ async function main(): Promise<void> {
       responseDigest?: string
       responseTransportDigest?: string
       reasonDigest?: string
+      failure?: ReturnType<typeof classifyAdvisorFailure>
     }> => nativeAdvisors.map(advisor => {
         if (advisor.adopted === false) {
           const reason = safeInput(advisor.reason, `${advisor.perspective} native advisor reason`)
@@ -2782,6 +2853,7 @@ async function main(): Promise<void> {
               ? 'started-no-response' as const
               : 'unavailable-before-start' as const,
             reasonDigest: createHash('sha256').update(reason).digest('hex'),
+            failure: classifyAdvisorFailure('codex', reason),
           }
         }
         const response = safeInput(advisor.response, `${advisor.perspective} native advisor response`)
@@ -2828,6 +2900,11 @@ async function main(): Promise<void> {
       nativeEvidence = nativeEvidenceFor(input)
     } catch (error) {
       return toolText({ complete: false, reason: String(error) }, true)
+    }
+    if (retryResult && retryResult.native.some((saved, index) => saved.adopted === true
+      && ['agentId', 'responseDigest', 'responseTransportDigest'].some(key =>
+        saved[key] !== (nativeEvidence[index] as Record<string, unknown> | undefined)?.[key]))) {
+      return toolText({ complete: false, reason: 'Reuse the already obtained native advisor answer for this round.' }, true)
     }
     if (activeRoundKeys.size > 0) {
       return toolText({
@@ -2984,15 +3061,42 @@ async function main(): Promise<void> {
         reason: 'final-review round 2 sequence became invalid before journal creation',
       }, true)
     }
-    if (!createExclusivePrivateFile(journalPath, `${JSON.stringify(requestedJournal)}\n`)) {
+    if (retryResult) {
+      const current = readOptionalPrivateFile(journalPath)
+      const currentStatus = current ? String(JSON.parse(current).status) : ''
+      if (!current || !(currentStatus === 'required-reviewer-failed'
+        || (currentStatus === 'stale-input' && inputUpdateIsRecoveryOnly === true))) {
+        return toolText({ complete: false, waitingForAdvisors: true, reason: 'Advisor round changed before retry.' }, true)
+      }
+      if (retryResult.claude.adopted !== true) {
+        try {
+          retireAdvisorClaudeCleanupOutcome(stateDir, {
+            jobId: context.jobId, attemptNonce: context.attemptNonce,
+            inputRevision: boundInput.revision, inputDigest: boundInput.digest, phase, round: round as 1 | 2 | 3,
+          }, retryResult.claude.cleanupReceiptDigest)
+        } catch {
+          return toolText({ complete: false, waitingForAdvisors: true, retryable: false,
+            reason: 'Claude cleanup recovery is incomplete; preserve the previous round and report the missing Claude response.',
+          }, true)
+        }
+      }
+      atomicWritePrivateFile(journalPath, `${JSON.stringify({ ...requestedJournal,
+        responseCacheDigest: retryResult.responseCacheDigest,
+        grok: JSON.parse(current).grok,
+      })}\n`)
+    } else if (!createExclusivePrivateFile(journalPath, `${JSON.stringify(requestedJournal)}\n`)) {
       return toolText({
         complete: false,
         uncertain: true,
         reason: 'this advisor round was already attempted; it will not be resent',
       }, true)
     }
-    const grokPromise = runGrokPanel(boundInput, phase, round, evidence)
-    const claudePromise = runClaude(boundInput, phase, round as 1 | 2 | 3, evidence)
+    let retryRepositoryDigest: string | undefined
+    try { retryRepositoryDigest = advisorRepositoryDigest(snapshotAdvisorRepository(projectLayout)) } catch {}
+    const grokPromise = retryResult?.grok?.length && retryResult.grok.every((slot: Record<string, unknown>) => slot.adopted === true)
+      ? Promise.resolve(retryResult.grok) : runGrokPanel(boundInput, phase, round, evidence)
+    const claudePromise = retryResult?.claude?.adopted === true
+      ? Promise.resolve(retryResult.claude) : runClaude(boundInput, phase, round as 1 | 2 | 3, evidence)
     const [grok, claude] = await Promise.all([grokPromise, claudePromise])
     if (phaseScope === 'complete' && context.writeEnabled
       && phase === 'review' && round === 1) {
@@ -3041,8 +3145,10 @@ async function main(): Promise<void> {
       : undefined
     let finalInput: AdvisorInputSnapshot | null = null
     try { finalInput = readAdvisorInputSnapshot(stateDir, context.jobId) } catch {}
-    const inputUnchanged = finalInput?.revision === boundInput.revision
-      && finalInput.digest === boundInput.digest
+    const recoveryInputAccepted = Boolean(retryResult && inputUpdateIsRecoveryOnly
+      && finalInput?.revision === input.revision && finalInput?.digest === input.digest)
+    const inputUnchanged = (finalInput?.revision === boundInput.revision
+      && finalInput.digest === boundInput.digest) || recoveryInputAccepted
     const grokJournal = grok.map(result => ({
       attempted: true,
       adopted: result.adopted === true,
@@ -3059,6 +3165,7 @@ async function main(): Promise<void> {
       reasonDigest: result.adopted !== true
         ? createHash('sha256').update(String(result.reason ?? 'unavailable')).digest('hex')
         : undefined,
+      failure: result.adopted !== true ? classifyAdvisorFailure('grok', String(result.reason ?? '')) : undefined,
       authenticationRecoveryAttempted: result.authenticationRecoveryAttempted === true
         ? true
         : undefined,
@@ -3083,6 +3190,7 @@ async function main(): Promise<void> {
       reasonDigest: claude.adopted !== true
         ? createHash('sha256').update(String(claude.reason ?? 'unavailable')).digest('hex')
         : undefined,
+      failure: claude.adopted !== true ? classifyAdvisorFailure('claude', String(claude.reason ?? '')) : undefined,
     }
     const slotSummary = summarizeAdvisorSlots(
       nativeEvidence,
@@ -3101,6 +3209,12 @@ async function main(): Promise<void> {
       && validThreeAdvisorGrokAttempts(grokJournal, phase)
       && validTerminalClaudeAttempt(claudeJournal)
     const finishedAt = Date.now()
+    const responseCache = JSON.stringify({
+      contextDigest, phase, round, complete, finishedAt, retryRepositoryDigest, evidenceDigest,
+      inputRevision: boundInput.revision, inputDigest: boundInput.digest,
+      native: nativeEvidence, grok, claude,
+    })
+    atomicWritePrivateFile(`${journalPath}.responses`, responseCache)
     atomicWritePrivateFile(journalPath, `${JSON.stringify({
       version: THREE_ADVISOR_JOURNAL_VERSION,
       advisorPolicy: THREE_ADVISOR_POLICY,
@@ -3113,6 +3227,7 @@ async function main(): Promise<void> {
       contextDigest,
       inputRevision: boundInput.revision,
       inputDigest: boundInput.digest,
+      ...(recoveryInputAccepted ? { recoveryInputRevision: input.revision, recoveryInputDigest: input.digest } : {}),
       repositoryDigest,
       repositoryDigestBefore: repositoryDigest,
       repositoryDigestAfter,
@@ -3121,6 +3236,7 @@ async function main(): Promise<void> {
       primaryEvidenceDigest: evidenceDigest,
       native: nativeEvidence,
       slotSummary,
+      responseCacheDigest: createHash('sha256').update(responseCache).digest('hex'),
       startedAt,
       finishedAt,
       grok: grokJournal,
@@ -3158,7 +3274,8 @@ async function main(): Promise<void> {
           grok as Array<Record<string, unknown>>,
           claude as Record<string, unknown>,
         ),
-        nextAction: '未回収のadvisorがあるため成功扱いにせず、欠員理由をSlackへ報告してから再試行してください。',
+        waitingForAdvisors: true,
+        nextAction: '3人の回答が揃うまで設計・レビュー完了としない。欠員理由をSlackへ報告する。認証はユーザーの復旧を待ち、混雑は待機する。復旧後は同じ入力・round・取得済みnative回答でadvisor_round(retryUnavailable=true)を呼ぶ。30秒以内に再試行しない。取得済み外部回答は保持され、欠員だけ再実行する。',
       }),
       slotSummary,
       grok,
@@ -3294,8 +3411,9 @@ async function main(): Promise<void> {
         throw new Error('reviewer completion journal is missing or invalid')
       }
       const latestInput = readAdvisorInputSnapshot(stateDir, context.jobId)
-      const inputUnchanged = latestInput.revision === inputRevision
-        && latestInput.digest === inputDigest
+      const inputUnchanged = (latestInput.revision === inputRevision
+        && latestInput.digest === inputDigest)
+        || (latestInput.revision === journal.recoveryInputRevision && latestInput.digest === journal.recoveryInputDigest)
       const observedAt = Date.now()
       if (!inputUnchanged) {
         atomicWritePrivateFile(journalPath, `${JSON.stringify({

@@ -1,6 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
+import { advisorFailureMessage, PUBLIC_ADVISOR_FAILURE_MESSAGES, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
   chmodSync,
@@ -8391,6 +8392,7 @@ export class JobStore {
       if (snapshot.revision !== options.inputRevision
         || snapshot.digest !== options.inputDigest) return 'input-changed' as const
       if (options.execution) {
+        if (options.execution.taskGoalStatus) this.recordTaskGoalStatus(options.jobId, options.execution.taskGoalStatus)
         this.ensureExecutionResultStagedInternal(
           options.jobId,
           options.execution.sessionId,
@@ -12984,6 +12986,7 @@ export interface HostAdvisorCoverage {
     startUnconfirmed: number
     unavailableBeforeStart: number
     slots: Array<{ slot: string, state: HostAdvisorSlotState }>
+    failures?: AdvisorFailure[]
   }>
 }
 
@@ -15104,7 +15107,16 @@ export function sanitizeExecutionTextForSlack(
       return `\uE002${repositoryPlaceholderNonce}_${index}\uE003`
     },
   )
-  let sanitized = maskRepositoryNames(normalizeGuardText(visible.join('\n')))
+  // Preserve only the fixed public dependency diagnostics through the internal
+  // implementation filter. An arbitrary line mentioning an advisor is not exempt.
+  const publicDiagnosticNonce = encodeSlackGuardNonce(randomUUID())
+  const publicDiagnostics: string[] = []
+  const visibleText = visible.map(line => {
+    if (!PUBLIC_ADVISOR_FAILURE_MESSAGES.has(line.trim())) return line
+    const index = publicDiagnostics.push(line.trim()) - 1
+    return `\uE006${publicDiagnosticNonce}_${index}\uE007`
+  }).join('\n')
+  let sanitized = maskRepositoryNames(normalizeGuardText(visibleText))
   let inputEntries = [{
     task: job.task,
     attachments: job.attachments,
@@ -15874,7 +15886,11 @@ export function sanitizeExecutionTextForSlack(
       .filter(line => line.trim().replace(/^💬\s*/, '') !== SELF_IMPLEMENTATION_NON_DISCLOSURE)
       .join('\n')
   }
-  return naturalizeSlackRedactions(sanitized).trim()
+  sanitized = naturalizeSlackRedactions(sanitized).trim()
+  publicDiagnostics.forEach((diagnostic, index) => {
+    sanitized = sanitized.replaceAll(`\uE006${publicDiagnosticNonce}_${index}\uE007`, diagnostic)
+  })
+  return sanitized
 }
 
 /**
@@ -16155,9 +16171,14 @@ export function enforceHostAdvisorCoverage(
   const stripped = stripModelAuthoredAdvisorCoverage(text, purpose === 'delivery')
   if (purpose !== 'result') return stripped.text
   if (coverage?.phases.length) {
+    const failures = [...new Map(coverage.phases.flatMap(phase => phase.failures ?? [])
+      .map(failure => [failure.advisor, failure] as const)).values()]
+    const notice = failures.length > 0
+      ? `必要な回答が揃っていないため、設計・レビューは未完了です。\n${failures.map(advisorFailureMessage).join('\n')}\n取得済みの回答と作業は保持しています。原因の解消後、このスレッドで再開を依頼してください。\n\n`
+      : ''
     return stripped.text
-      ? `${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
-      : hostAdvisorCoverageLine(coverage)
+      ? `${notice}${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
+      : `${notice}${hostAdvisorCoverageLine(coverage)}`
   }
   if (!stripped.removed) return stripped.text
   return stripped.text
@@ -16174,6 +16195,9 @@ export function finalizeSuccessfulExecution(
   const {
     capturedArtifacts = [], advisorCoverage, ...persistedExecution
   } = execution
+  if (advisorCoverage?.phases.some(phase => phase.responsesObtained < phase.total)) {
+    persistedExecution.taskGoalStatus = 'blocked'
+  }
   try {
     const declared = extractArtifactPaths(execution.result)
     // Browser evidence is bounded by the host at capture time and cannot be
@@ -18983,12 +19007,14 @@ async function runCli(): Promise<void> {
             onRateLimitWait: binding => executionContext.reportRateLimitWait(binding),
             finalizeSuccessfulResult: rawExecution => {
               try {
-                return finalizeSuccessfulExecution(
+                const finalized = finalizeSuccessfulExecution(
                   store.get(job.id) ?? job,
                   rawExecution,
                   dir,
                   log,
                 )
+                if (finalized.taskGoalStatus) store.recordTaskGoalStatus(job.id, finalized.taskGoalStatus)
+                return finalized
               } catch (error) {
                 if (error instanceof CodexResultPersistencePendingError) throw error
                 throw new CodexResultPersistencePendingError(
@@ -18996,12 +19022,11 @@ async function runCli(): Promise<void> {
                 )
               }
             },
-            onSuccessfulResult: rawExecution => finalizeSuccessfulExecution(
-              store.get(job.id) ?? job,
-              rawExecution,
-              dir,
-              log,
-            ),
+            onSuccessfulResult: rawExecution => {
+              const finalized = finalizeSuccessfulExecution(store.get(job.id) ?? job, rawExecution, dir, log)
+              if (finalized.taskGoalStatus) store.recordTaskGoalStatus(job.id, finalized.taskGoalStatus)
+              return finalized
+            },
           })
           // The executor seals the final input revision before returning.
           // Stage the result again idempotently before the callback returns to
