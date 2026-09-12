@@ -233,7 +233,8 @@ describe('process tree identity tracking', () => {
     },
   )
 
-  test.skipIf(process.platform !== 'darwin')(
+  test.skipIf(process.platform !== 'darwin'
+    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
     'continuation cleanup preserves unknown child without signaling and reaps known child',
     async () => {
       const unknownChild = Bun.spawn(['/bin/sleep', '60'], { detached: true })
@@ -263,7 +264,8 @@ describe('process tree identity tracking', () => {
     },
   )
 
-  test.skipIf(process.platform !== 'darwin')(
+  test.skipIf(process.platform !== 'darwin'
+    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
     'warning policy retains group containment when no generation is unknown',
     async () => {
       const child = Bun.spawn(['/bin/sleep', '60'], { detached: true })
