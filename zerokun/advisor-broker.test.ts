@@ -1345,7 +1345,9 @@ print('review complete')
       )
       expect(result.isError).toBe(true)
       expect(payload).toMatchObject({
-        complete: true,
+        complete: false,
+        allAdopted: false,
+        advisorUnavailable: expect.any(Array),
         slotSummary: {
           total: 3,
           started: 0,
@@ -1365,7 +1367,9 @@ print('review complete')
       const { result, payload } = await fixture.call('investigation', 'revision-two')
       expect(result.isError).not.toBe(true)
       expect(payload).toMatchObject({
-        complete: true,
+        complete: false,
+        allAdopted: false,
+        advisorUnavailable: expect.any(Array),
         slotSummary: {
           total: 3,
           started: 3,
@@ -1559,7 +1563,7 @@ print('review complete')
     try {
       writeFileSync(join(fixture.repo, 'README.md'), 'edited before investigation\n', { mode: 0o600 })
       const { result, payload } = await fixture.call('investigation', 'revision-two')
-      expect(result.isError).not.toBe(true)
+      expect(result.isError).toBe(true)
       expect(payload).toMatchObject({
         complete: true,
         slotSummary: {
