@@ -5076,7 +5076,7 @@ describe('production App Server executor', () => {
     value.store.close()
   })
 
-  test('同じthreadの質問へ先に回答してから元のtaskを同じCodex threadで再開する', async () => {
+  test.each([false, true])('同じthreadの質問へ先に回答してから元のtaskを同じCodex threadで再開する (unknown cleanup=%s)', async injectUnknown => {
     const value = fixture('interjection-answer')
     const fixtureState = join(value.root, 'interjection-answer.state')
     const promptLog = join(value.root, 'interjection-answer-prompts.log')
@@ -5115,6 +5115,7 @@ describe('production App Server executor', () => {
         ZERO_RPC_LOG: rpcLog,
         ZERO_LOG_HANDSHAKES: '1',
         ZERO_LARGE_RESUME_HISTORY: '1',
+        ...(injectUnknown ? { ZEROKUN_SUPERVISOR_TEST_UNKNOWN_DESCENDANT: '1' } : {}),
       },
       liveControls: value.hooks,
     })
@@ -5135,6 +5136,11 @@ describe('production App Server executor', () => {
       result: '元の作業を完了しました',
     })
     expect(readFileSync(fixtureState, 'utf8')).toBe('answer-only')
+    if (injectUnknown) {
+      const stderr = readFileSync(join(value.logDir, `${value.job.id}.resume.stderr.log`), 'utf8')
+      expect(stderr).toContain('generation unavailable for PID 1000000; not signaled, continuing')
+      expect(stderr).not.toContain('retaining supervisor registration')
+    }
     expect(value.store.get(value.job.id)?.inputRevision).toBe(1)
     expect(value.store.listJobControls(value.job.id)).toHaveLength(0)
     expect(value.store.listJobInterjections(value.job.id)).toHaveLength(1)

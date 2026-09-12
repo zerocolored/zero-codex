@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { observeProcessGeneration, signalProcessIfLive } from './process-generation.ts'
 import {
   MAX_TRACKED_PROCESSES,
   readProcessIdentity,
@@ -227,6 +228,59 @@ describe('process tree identity tracking', () => {
       })).rejects.toThrow(`process ${pid}のgenerationを確認できません`)
       expect(tracked.get(pid)).toBe(started)
       expect(observations).toBeGreaterThan(1)
+    },
+  )
+
+  test.skipIf(process.platform !== 'darwin')(
+    'continuation cleanup preserves unknown child without signaling and reaps known child',
+    async () => {
+      const unknownChild = Bun.spawn(['/bin/sleep', '60'], { detached: true })
+      const knownChild = Bun.spawn(['/bin/sleep', '60'], { detached: true })
+      const unknown = readProcessIdentity(unknownChild.pid)!
+      const known = readProcessIdentity(knownChild.pid)!
+      const tracked = new Map([[unknown.pid, unknown.started], [known.pid, known.started]])
+      const warnings: number[] = []
+      try {
+        const remaining = await reapTrackedProcesses({
+          rootPids: [], groupId: 1_000_000, tracked, signalGroup: false,
+          generationObserver: expected => expected.pid === unknown.pid
+            ? { status: 'unknown' }
+            : observeProcessGeneration(expected),
+          onUnknownGeneration: identity => warnings.push(identity.pid),
+        })
+        expect(remaining).toEqual([])
+        expect(warnings).toEqual([unknown.pid])
+        expect(tracked.get(unknown.pid)).toBe(unknown.started)
+        expect(observeProcessGeneration(unknown).status).toBe('alive')
+        expect(observeProcessGeneration(known).status).toBe('dead')
+      } finally {
+        signalProcessIfLive(unknown, 'SIGKILL')
+        signalProcessIfLive(known, 'SIGKILL')
+        await Promise.all([unknownChild.exited, knownChild.exited])
+      }
+    },
+  )
+
+  test.skipIf(process.platform !== 'darwin')(
+    'warning policy retains group containment when no generation is unknown',
+    async () => {
+      const child = Bun.spawn(['/bin/sleep', '60'], { detached: true })
+      const identity = readProcessIdentity(child.pid)!
+      const kill = spyOn(process, 'kill')
+      try {
+        const remaining = await reapTrackedProcesses({
+          rootPids: [identity.pid], groupId: identity.pid,
+          tracked: new Map([[identity.pid, identity.started]]),
+          onUnknownGeneration: () => { throw new Error('unexpected unknown') },
+        })
+        expect(remaining).toEqual([])
+        expect(kill.mock.calls.some(([pid, signal]) => pid === -identity.pid && signal === 'SIGTERM')).toBe(true)
+        expect(observeProcessGeneration(identity).status).toBe('dead')
+      } finally {
+        kill.mockRestore()
+        signalProcessIfLive(identity, 'SIGKILL')
+        await child.exited
+      }
     },
   )
 

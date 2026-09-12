@@ -165,6 +165,10 @@ async function main(): Promise<void> {
     { pid: process.pid, started: supervisorIdentity.started },
   ]])
   let registrationPhase: 'active' | 'cleanup-confirmed' = 'active'
+  // cleanup-confirmed means the lifecycle finished, not that unreadable PIDs
+  // were proven dead. Keep those observations separate from the pinned ledger.
+  const cleanupWarnings: Array<{ pid: number; started: string }> = []
+  let cleanupWarningCount = 0
   let revision = 0
   const mergeTrackedLedger = (): void => {
     synchronizeTrackedProcessLedger(tracked, trackedLedger)
@@ -174,6 +178,8 @@ async function main(): Promise<void> {
     phase: registrationPhase,
     revision,
     cleanupPending: true,
+    cleanupWarnings,
+    cleanupWarningCount,
     jobId,
     pid: supervisorIdentity.pid,
     pgid: supervisorIdentity.pgid,
@@ -385,12 +391,30 @@ async function main(): Promise<void> {
     // completed subagent or MCP descendant still owns the pipe.
     captureTrackedProcesses([process.pid], process.pid, tracked, excluded)
     persistTracked()
+    const unknownTestPid = 1_000_000
+    const injectUnknown = hasTestOverride
+      && process.env.ZEROKUN_SUPERVISOR_TEST_UNKNOWN_DESCENDANT === '1'
+    if (injectUnknown) tracked.set(unknownTestPid, supervisorIdentity.started)
     const remaining = await reapTrackedProcesses({
       rootPids: [process.pid],
       groupId: process.pid,
       tracked,
       excludePids: excluded,
       signalGroup: false,
+      ...(injectUnknown ? {
+        generationObserver: (identity: Parameters<typeof observeProcessGeneration>[0]) => identity.pid === unknownTestPid
+          ? { status: 'unknown' as const }
+          : observeProcessGeneration(identity),
+      } : {}),
+      onUnknownGeneration: identity => {
+        cleanupWarningCount += 1
+        // The full identities already remain in tracked. Bound the duplicate
+        // diagnostic sample so uncertainty cannot overflow the registration.
+        if (cleanupWarnings.length < 32) {
+          cleanupWarnings.push({ pid: identity.pid, started: identity.started })
+        }
+        process.stderr.write(`Codex cleanup warning: generation unavailable for PID ${identity.pid}; not signaled, continuing.\n`)
+      },
       waitForForce: () => forceCleanupRequested,
     })
     // Keep SIGUSR2 handled until the supervisor process itself exits. The
