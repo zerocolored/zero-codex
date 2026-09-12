@@ -499,8 +499,10 @@ describe('host-enforced App Server permission phases', () => {
       threadId: 'thread-phase',
       inputRevision: snapshot.revision,
       inputDigest: snapshot.digest,
+      execution: { sessionId: 'thread-phase', result: '回答待ち', taskGoalStatus: 'blocked' },
     })).toBe('sealed')
     expect(store.get(job.id)?.acceptsControl).toBe(false)
+    expect(store.get(job.id)?.taskGoalStatus).toBe('blocked')
     store.close()
   })
 
@@ -8233,7 +8235,7 @@ describe('single FIFO worker', () => {
         })
         expect(JSON.parse(readFileSync(journalPath, 'utf8'))).toMatchObject({
           version: 8,
-          status: 'reviewers-completed',
+          status: 'required-reviewer-failed',
           recoveredAfterInterruption: true,
           inputUnchanged: true,
         })
@@ -10607,6 +10609,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       `revision-${advisorInput.revision}-${advisorInput.digest.slice(0, 16)}`,
     )
     mkdirSync(root, { recursive: true, mode: 0o700 })
+    // Broker retry caches are not native-history evidence and must not make
+    // otherwise valid round collection fail (or be parsed as journal JSON).
+    writeFileSync(join(root, 'review-1.json.responses'), 'opaque response cache', { mode: 0o600 })
     const claude = {
       attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
       workspaceCreationAttempted: false, freshEphemeral: false,
@@ -13127,6 +13132,7 @@ describe('Slack output guard', () => {
       },
     }, state)
     expect(finalized.result).not.toContain('すべてから回答')
+    expect(finalized.taskGoalStatus).toBe('blocked')
     expect(finalized.result).toContain('変更ファイルは3件です。')
     expect(finalized.result).toContain(
       '独立レビュー実行記録(ホスト確認): 最終レビュー第1回—起動2/3・回答1/3'
@@ -15436,6 +15442,41 @@ describe('durable terminal notifications', () => {
     expect(delivered).toEqual([second.id])
     expect(store.terminalNotificationCount()).toBe(1)
     expect(store.pendingTerminalNotifications()).toHaveLength(0)
+    store.close()
+  })
+
+  test('Claude未回収はDB再open後も担当名付き待機通知1件になり完了リアクションを出さない', async () => {
+    const state = fixtureDir()
+    const dbPath = join(state, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    store.enqueue(input())
+    const job = store.claimNext('serial-worker')!
+    const finalized = finalizeSuccessfulExecution(job, { sessionId: 'advisor-waiting', result: '途中の調査は保存しました。',
+      advisorCoverage: { version: 1, phases: [{
+        phase: 'review', round: 1, inputRevision: 1, finishedAt: 1,
+        total: 3, started: 2, responsesObtained: 2, startedNoResponse: 0,
+        startUnconfirmed: 0, unavailableBeforeStart: 1,
+        slots: [{ slot: 'codex-risk', state: 'response-obtained' }, { slot: 'grok', state: 'response-obtained' },
+          { slot: 'claude', state: 'unavailable-before-start' }],
+        failures: [{ advisor: 'claude', cause: 'authentication' }],
+      }] },
+    }, state)
+    store.recordTaskGoalStatus(job.id, finalized.taskGoalStatus!)
+    store.complete(job.id, finalized.sessionId, finalized.result)
+    store.close()
+    store = new JobStore(dbPath)
+    const posted: string[] = []
+    let reactions = 0
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async request => { posted.push(request.text) },
+      addReaction: async () => { reactions += 1 },
+    })
+    await flushTerminalNotifications(store, notifier, () => {}, 1)
+    await flushTerminalNotifications(store, notifier, () => {}, 1)
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toContain('未完了・待機中')
+    expect(posted[0]).toContain('Claude Code: 認証が必要です')
+    expect(reactions).toBe(0)
     store.close()
   })
 

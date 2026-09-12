@@ -108,6 +108,7 @@ import {
   validThreeAdvisorRoundTwoBasis,
 } from './advisor-journal.ts'
 import { summarizeAdvisorSlots } from './advisor-broker.ts'
+import { type AdvisorFailure } from './advisor-availability.ts'
 import { observeNativeAdvisorCoverage, type NativeAdvisorObservation } from './native-advisor-coverage.ts'
 import { redactCredentialMaterial } from './public-output-guard.ts'
 import {
@@ -1715,7 +1716,7 @@ export function collectHostAdvisorCoverage(
       if ((version !== 8 && !threeAdvisor)
         || (threeAdvisor && journal.advisorPolicy !== THREE_ADVISOR_POLICY)
         || !(threeAdvisor
-          ? ['reviewers-completed', 'completed', 'stale-input'].includes(String(journal.status))
+          ? ['reviewers-completed', 'completed', 'stale-input', 'required-reviewer-failed'].includes(String(journal.status))
           : ['reviewers-completed', 'completed'].includes(String(journal.status)))
         || (threeAdvisor && !validThreeAdvisorPhaseRound(phase, round))
         || (!threeAdvisor && round !== 1)
@@ -1759,6 +1760,15 @@ export function collectHostAdvisorCoverage(
         inputRevision,
         finishedAt: Number(journal.finishedAt),
         ...summary,
+        failures: summary.slots.filter(slot => slot.state !== 'response-obtained').map(slot => {
+          const advisor: AdvisorFailure['advisor'] = slot.slot.includes('claude') ? 'claude'
+            : slot.slot.includes('grok') ? 'grok' : 'codex'
+          const entry = advisor === 'claude' ? journal.claude
+            : advisor === 'grok' ? (journal.grok as unknown[])[0] : (journal.native as unknown[])[0]
+          const failure = (entry as Record<string, unknown>)?.failure as AdvisorFailure | undefined
+          return { advisor, cause: failure && ['authentication', 'rate-limit', 'timeout', 'startup', 'response', 'validation', 'unknown']
+            .includes(failure.cause) ? failure.cause : 'unknown' }
+        }),
       }
       // A unified logical attempt may bind its initial and final reviews to
       // different Slack input revisions. Preserve both. Conversely, two
@@ -2047,6 +2057,10 @@ function collectNativeAdvisorJournalEvidence(options: {
     const journalEntries = readdirSync(revisionRoot, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name))
     for (const journalEntry of journalEntries) {
+      // Response bodies are broker-owned retry data, not native-history
+      // evidence. Never parse them as a round journal or expose their content.
+      if (/^(investigation|design|review)-[123]\.json\.responses$/.test(journalEntry.name)
+        && journalEntry.isFile() && !journalEntry.isSymbolicLink()) continue
       const journalMatch = /^(investigation|design|review)-([123])\.json$/.exec(journalEntry.name)
       if (!journalMatch || !journalEntry.isFile() || journalEntry.isSymbolicLink()) {
         throw new Error(`advisor journal contains an unsafe revision entry: ${journalEntry.name}`)
@@ -3766,7 +3780,7 @@ export function buildCodexDeveloperInstructions(
         'agent ID to advisor_round. If the native slot did',
         'not start or started without an answer, pass adopted=false, started=false or true, and a',
         'concise reason. Poll advisor_round_poll one call at a time until it returns a terminal',
-        'receipt. External reviewer absence is best-effort and never blocks the primary task.',
+        'receipt. Missing required reviewer answers mean the review is incomplete; retain work and report the missing advisor and cause.',
         'Never inspect or invoke Grok, Claude, Herdr, their authentication, helper files, sockets,',
         'or processes directly; zerokun_advisors is the only external-advisor route.',
         'When reporting advisor coverage, use only the returned slotSummary. requested/total means',
@@ -3954,17 +3968,22 @@ export function buildCodexWorkerPrompt(
       'round 1; never claim another task\'s paths. Restrict round 2 to that delta and direct',
       'regressions. Minor findings, advisor',
       'unavailability, and infrastructure failures do not trigger round 2. Never call round 3 or',
-      'the legacy design phase. Each logical round is attempt-wide and may run at most once even',
-      'when Slack input is added or the Codex turn is steered. A reusedPriorPhase result is final',
-      'for that logical round; do not spawn replacements or call it again.',
+      'the legacy design phase. A completed logical round is attempt-wide and is not rerun when',
+      'Slack input is added or the Codex turn is steered. An incomplete round is not completion:',
+      'recover its missing slots using the original binding and evidence; do not replace obtained answers.',
       'For investigation, spawn exactly one solution_analyst with model=gpt-6-astra,',
       'reasoning_effort=medium, and fork_turns=none. For each review round, spawn exactly one fresh',
       'risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none. Do not',
       'substitute a different model and do not add another native slot.',
       `That native advisor response must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|review>:<1|2>:<solution|risk>] after replacing phase, round, and perspective.`,
       'For an unavailable native slot, send adopted=false, an exact started boolean, and a concise',
-      'reason. External unavailable outcomes are terminal best-effort results; never retry a panel',
-      'or stop the primary work because a slot is absent.',
+      'reason. Do not report a required design or review complete until all three answers are obtained.',
+      'If a slot is unavailable, report its named cause to Slack and preserve completed work and answers.',
+      'After resolving that cause, retry the same round with retryUnavailable=true, at least 30 seconds',
+      'after the attempt finished. The broker reuses obtained external answers and retries only missing slots.',
+      'If newer Slack input only reports recovery (not a changed request), explicitly classify it and set',
+      'inputUpdateIsRecoveryOnly=true while retaining the original binding and question. Never set it for changed requirements.',
+      'Do not repeatedly retry an unresolved authentication failure or a still-active attempt.',
       'Base any advisor-count statement only on slotSummary returned by the broker. Never call all',
       'three attempted, started, or completed unless the corresponding structured count is three.',
     )
