@@ -1565,7 +1565,9 @@ print('review complete')
       const { result, payload } = await fixture.call('investigation', 'revision-two')
       expect(result.isError).toBe(true)
       expect(payload).toMatchObject({
-        complete: true,
+        complete: false,
+        allAdopted: false,
+        advisorUnavailable: expect.any(Array),
         slotSummary: {
           total: 3,
           started: 1,
