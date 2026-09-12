@@ -1343,7 +1343,7 @@ print('review complete')
       const { result, payload } = await fixture.call(
         'investigation', 'revision-two', 'unavailable',
       )
-      expect(result.isError).not.toBe(true)
+      expect(result.isError).toBe(true)
       expect(payload).toMatchObject({
         complete: true,
         slotSummary: {
@@ -1581,9 +1581,14 @@ print('review complete')
       writeFileSync(oversized, '', { mode: 0o600 })
       truncateSync(oversized, 65 * 1024 * 1024)
       const { result, payload } = await fixture.call('investigation', 'revision-two')
-      expect(result.isError).not.toBe(true)
+      expect(result.isError).toBe(true)
       expect(payload).toMatchObject({
-        complete: true,
+        complete: false,
+        allAdopted: false,
+        advisorUnavailable: expect.arrayContaining([
+          expect.objectContaining({ advisor: 'grok' }),
+          expect.objectContaining({ advisor: 'claude' }),
+        ]),
         slotSummary: { total: 3, responsesObtained: 1 },
       })
       expect(payload.repositoryUnchanged).toBeUndefined()
@@ -1599,7 +1604,7 @@ print('review complete')
   }, 15_000)
 
   test('単一write workflowは実装差分後のreviewを初期phaseの再実行なしで通す', async () => {
-    const fixture = await brokerFixture({ writeEnabled: true })
+    const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
     try {
       const initial = await fixture.call('investigation', 'revision-two')
       expect(initial.result.isError).not.toBe(true)
@@ -1622,7 +1627,7 @@ print('review complete')
   }, 20_000)
 
   test('単一write workflowはSlack追記後のreviewを新revisionで直接通す', async () => {
-    const fixture = await brokerFixture({ writeEnabled: true })
+    const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
     try {
       const initial = await fixture.call('investigation', 'revision-one')
       expect(initial.payload).toMatchObject({ complete: false, staleInput: true })
@@ -1754,7 +1759,7 @@ print('review complete')
   }, 20_000)
 
   test('completed fast pathでもattempt全体の同一round重複を拒否する', async () => {
-    const fixture = await brokerFixture({ writeEnabled: true })
+    const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
     try {
       expect((await fixture.call('investigation', 'revision-two')).payload)
         .toMatchObject({ complete: true })

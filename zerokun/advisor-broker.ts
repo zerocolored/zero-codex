@@ -1249,6 +1249,22 @@ export function allAdvisorAttemptsAdopted(
     && claude.adopted === true
 }
 
+function unavailableAdvisorReasons(
+  native: ReadonlyArray<Record<string, unknown>>,
+  grok: ReadonlyArray<Record<string, unknown>>,
+  claude: Record<string, unknown>,
+): Array<{ advisor: 'codex' | 'grok' | 'claude', reason: string }> {
+  const result: Array<{ advisor: 'codex' | 'grok' | 'claude', reason: string }> = []
+  for (const attempt of native) {
+    if (attempt.adopted !== true) result.push({ advisor: 'codex', reason: String(attempt.reason ?? '回答未取得') })
+  }
+  for (const attempt of grok) {
+    if (attempt.adopted !== true) result.push({ advisor: 'grok', reason: String(attempt.reason ?? '回答未取得') })
+  }
+  if (claude.adopted !== true) result.push({ advisor: 'claude', reason: String(claude.reason ?? '回答未取得') })
+  return result
+}
+
 export type AdvisorExecutionState =
   | 'unavailable-before-start'
   | 'start-unconfirmed'
@@ -3077,6 +3093,10 @@ async function main(): Promise<void> {
     )
     const complete = inputUnchanged && roundTwoRepositoryStable
       && (phaseScope === 'complete' || repositoryUnchanged)
+      // A three-advisor phase is not complete unless every requested advisor
+      // returned an adopted response.  Unavailable slots remain journaled for
+      // diagnosis, but must never be silently treated as a successful panel.
+      && allAdvisorAttemptsAdopted(nativeAdvisors, grok, claude)
       && validThreeAdvisorNativeAttempts(nativeEvidence, phase)
       && validThreeAdvisorGrokAttempts(grokJournal, phase)
       && validTerminalClaudeAttempt(claudeJournal)
@@ -3132,6 +3152,14 @@ async function main(): Promise<void> {
         ? { repositoryDeltaStable: roundTwoRepositoryStable }
         : {}),
       allAdopted: allAdvisorAttemptsAdopted(nativeAdvisors, grok, claude),
+      ...(complete ? {} : {
+        advisorUnavailable: unavailableAdvisorReasons(
+          nativeAdvisors as Array<Record<string, unknown>>,
+          grok as Array<Record<string, unknown>>,
+          claude as Record<string, unknown>,
+        ),
+        nextAction: '未回収のadvisorがあるため成功扱いにせず、欠員理由をSlackへ報告してから再試行してください。',
+      }),
       slotSummary,
       grok,
       claude,
