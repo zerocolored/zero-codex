@@ -342,6 +342,7 @@ async function liveTrackedIdentitiesForCleanup(
   tracked: ReadonlyMap<number, string>,
   excludePids: ReadonlySet<number>,
   generationObserver: ProcessGenerationObserver,
+  onUnknownGeneration?: (identity: ProcessIdentity) => void,
 ): Promise<ProcessIdentity[]> {
   const pending: Array<{ pid: number; expected: ProcessIdentity }> = []
   for (const [pid, started] of tracked) {
@@ -359,6 +360,10 @@ async function liveTrackedIdentitiesForCleanup(
     const { pid } = pending[index]!
     const observation = observations[index]!
     if (observation.status === 'unknown') {
+      if (onUnknownGeneration) {
+        onUnknownGeneration(pending[index]!.expected)
+        continue
+      }
       throw new Error(`process ${pid}のgenerationを確認できません`)
     }
     if (observation.status === 'alive') live.push(observation.identity)
@@ -370,6 +375,7 @@ async function signalGroupLeaderForCleanup(
   expectedLeader: ProcessIdentity | undefined,
   signal: NodeJS.Signals,
   generationObserver: ProcessGenerationObserver,
+  onUnknownGeneration?: (identity: ProcessIdentity) => void,
 ): Promise<boolean> {
   if (!expectedLeader) return false
   const observation = await observeProcessGenerationForCleanup(
@@ -377,6 +383,10 @@ async function signalGroupLeaderForCleanup(
     generationObserver,
   )
   if (observation.status === 'unknown') {
+    if (onUnknownGeneration) {
+      onUnknownGeneration(expectedLeader)
+      return false
+    }
     throw new Error(`process group ${expectedLeader.pid}のgenerationを確認できません`)
   }
   if (observation.status === 'dead') return false
@@ -387,6 +397,7 @@ async function signalIdentitiesForCleanup(
   identities: Iterable<ProcessIdentity>,
   signal: NodeJS.Signals,
   generationObserver: ProcessGenerationObserver,
+  onUnknownGeneration?: (identity: ProcessIdentity) => void,
 ): Promise<void> {
   const unsignaled: ProcessIdentity[] = []
   for (const identity of identities) {
@@ -399,6 +410,10 @@ async function signalIdentitiesForCleanup(
     const identity = unsignaled[index]!
     const observation = observations[index]!
     if (observation.status === 'unknown') {
+      if (onUnknownGeneration) {
+        onUnknownGeneration(identity)
+        continue
+      }
       throw new Error(`process ${identity.pid}のgenerationを確認できません`)
     }
   }
@@ -418,9 +433,25 @@ export async function reapTrackedProcesses(options: {
   onForce?: () => void
   /** Deterministic process-generation probe used only by contract tests. */
   generationObserver?: ProcessGenerationObserver
+  /**
+   * Opt-in continuation policy: record unreadable generations without signaling
+   * them or claiming they died. Other verified children are still reaped.
+   * The ledger retains these identities; callers must report the uncertainty.
+   * Strict recovery/freeze callers omit this callback and retain their contract.
+   */
+  onUnknownGeneration?: (identity: ProcessIdentity) => void
 }): Promise<number[]> {
   const exclude = options.excludePids ?? new Set<number>()
   const generationObserver = options.generationObserver ?? observeProcessGeneration
+  const warned = new Set<string>()
+  const onUnknownGeneration = options.onUnknownGeneration
+    ? (identity: ProcessIdentity): void => {
+      const key = `${identity.pid}:${identity.started}`
+      if (warned.has(key)) return
+      warned.add(key)
+      options.onUnknownGeneration!(identity)
+    }
+    : undefined
   const initialTable = captureTrackedProcesses(
     options.rootPids,
     options.groupId,
@@ -432,19 +463,27 @@ export async function reapTrackedProcesses(options: {
   const groupLeader = groupStarted
     ? initialTable.find(entry => entry.pid === options.groupId && entry.started === groupStarted)
     : undefined
-  const termGroupSignaled = options.signalGroup !== false
-    && await signalGroupLeaderForCleanup(groupLeader, 'SIGTERM', generationObserver)
+  // Preserve group containment for fully observed trees. Only actual unknown
+  // observations disable group signals; opting into warnings alone must not
+  // weaken the normal force/cancel path for newly spawned group members.
+  const initialLive = onUnknownGeneration
+    ? await liveTrackedIdentitiesForCleanup(options.tracked, exclude, generationObserver, onUnknownGeneration)
+    : undefined
+  const termGroupSignaled = warned.size === 0 && options.signalGroup !== false
+    && await signalGroupLeaderForCleanup(groupLeader, 'SIGTERM', generationObserver, onUnknownGeneration)
   await signalIdentitiesForCleanup(
-    (await liveTrackedIdentitiesForCleanup(options.tracked, exclude, generationObserver))
+    (initialLive ?? await liveTrackedIdentitiesForCleanup(options.tracked, exclude, generationObserver, onUnknownGeneration))
       .filter(identity => !termGroupSignaled || identity.pgid !== options.groupId),
     'SIGTERM',
     generationObserver,
+    onUnknownGeneration,
   )
 
   let live = await liveTrackedIdentitiesForCleanup(
     options.tracked,
     exclude,
     generationObserver,
+    onUnknownGeneration,
   )
   if (options.waitForForce) {
     while (live.length > 0 && !options.waitForForce()) {
@@ -460,6 +499,7 @@ export async function reapTrackedProcesses(options: {
         options.tracked,
         exclude,
         generationObserver,
+        onUnknownGeneration,
       )
     }
   } else {
@@ -477,6 +517,7 @@ export async function reapTrackedProcesses(options: {
         options.tracked,
         exclude,
         generationObserver,
+        onUnknownGeneration,
       )
     }
   }
@@ -485,12 +526,13 @@ export async function reapTrackedProcesses(options: {
   options.onForce?.()
   // TERM-time observations are never reused for delayed KILL. Both helpers
   // perform a fresh microsecond-generation read immediately before signaling.
-  const killGroupSignaled = options.signalGroup !== false
-    && await signalGroupLeaderForCleanup(groupLeader, 'SIGKILL', generationObserver)
+  const killGroupSignaled = warned.size === 0 && options.signalGroup !== false
+    && await signalGroupLeaderForCleanup(groupLeader, 'SIGKILL', generationObserver, onUnknownGeneration)
   await signalIdentitiesForCleanup(
     live.filter(identity => !killGroupSignaled || identity.pgid !== options.groupId),
     'SIGKILL',
     generationObserver,
+    onUnknownGeneration,
   )
   const killDeadline = Date.now() + (options.killWaitMs ?? 1_000)
   while (live.length > 0 && Date.now() < killDeadline) {
@@ -506,6 +548,7 @@ export async function reapTrackedProcesses(options: {
       options.tracked,
       exclude,
       generationObserver,
+      onUnknownGeneration,
     )
   }
   return live.map(identity => identity.pid)

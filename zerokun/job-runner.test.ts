@@ -7632,7 +7632,7 @@ describe('single FIFO worker', () => {
     }
   })
 
-  test('cleanup-confirmed直後に残るexact supervisorを復旧時に回収する', async () => {
+  test.each([false, true])('cleanup-confirmed直後に残るexact supervisorを復旧時に回収する (unknown descendant=%s)', async injectUnknown => {
     const dir = fixtureDir()
     const repo = join(dir, 'repo')
     const fixture = join(dir, 'codex-supervisor-fixture.ts')
@@ -7672,18 +7672,27 @@ describe('single FIFO worker', () => {
       bootSession: identity!.bootSession,
       startSec: identity!.startSec,
       startUsec: identity!.startUsec,
-      tracked: [{ pid: identity!.pid, started: identity!.started }],
+      tracked: [
+        { pid: identity!.pid, started: identity!.started },
+        ...(injectUnknown ? [{ pid: 1_000_000, started: identity!.started }] : []),
+      ],
     })}\n`, { mode: 0o600 })
     store.beginMonitorPreparation(job.id, claimed.workerId!)
     store.commitMonitorRequired(job.id, claimed.workerId!)
     store.saveExecutorPid(job.id, supervisor.pid)
 
     try {
-      await terminateTrackedExecutors(store, () => {}, 50, dir)
+      const warnings: string[] = []
+      await terminateTrackedExecutors(store, message => warnings.push(message), 50, dir, {
+        observeGeneration: expected => injectUnknown && expected.pid === 1_000_000
+          ? { status: 'unknown' }
+          : observeProcessGeneration(expected),
+      })
       await supervisor.exited
       expect(observeProcessGeneration(identity!).status).toBe('dead')
       expect(existsSync(registration)).toBe(false)
       expect(store.get(job.id)?.executorPid).toBeNull()
+      if (injectUnknown) expect(warnings.filter(message => message.includes('PID 1000000'))).toHaveLength(1)
     } finally {
       try { supervisor.kill('SIGKILL') } catch {}
       await supervisor.exited

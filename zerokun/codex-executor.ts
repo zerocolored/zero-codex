@@ -6739,6 +6739,9 @@ export async function executeCodexJob(
           tracked,
           waitForForce: cleanup.waitForForce,
           onForce: cleanup.onForce,
+          onUnknownGeneration: identity => {
+            process.stderr.write(`Codex cleanup warning: generation unavailable for PID ${identity.pid}; not signaled, continuing.\n`)
+          },
         })
       } catch (error) {
         throw new CodexCleanupPendingError(

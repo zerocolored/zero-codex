@@ -17424,6 +17424,7 @@ function readBoundedExecutorRegistration(path: string): string {
 export interface ExecutorRecoveryTestHooks {
   /** Deterministically exercise a supervisor write between the first read and freeze. */
   afterInitialRegistrationRead?(registrationPath: string): void
+  observeGeneration?: typeof observeProcessGeneration
 }
 
 export async function terminateTrackedExecutors(
@@ -17663,11 +17664,23 @@ export async function terminateTrackedExecutors(
       if (!generation) throw new Error(`invalid tracked generation for PID ${item.pid}`)
       return { pid: item.pid, ppid: 0, pgid: 0, status: 0, ...generation, started: item.started }
     }
+    const warnedCleanupGenerations = new Set<string>()
     const liveTracked = (): Map<number, string> => {
       const live = new Map<number, string>()
       for (const item of ledger.values()) {
-        const observation = observeProcessGeneration(expectedIdentity(item))
+        const observation = (testHooks.observeGeneration ?? observeProcessGeneration)(expectedIdentity(item))
         if (observation.status === 'unknown') {
+          // A completed supervisor may retain unreadable pins as diagnostic
+          // evidence. Do not reintroduce the pause failure on daemon restart.
+          // Active/recovery freeze contracts and supervisor identity stay strict.
+          if (phase === 'cleanup-confirmed' && item.pid !== pid) {
+            const key = `${item.pid}:${item.started}`
+            if (!warnedCleanupGenerations.has(key)) {
+              warnedCleanupGenerations.add(key)
+              log(`executor cleanup warning: generation unavailable for PID ${item.pid}; not signaled, continuing`)
+            }
+            continue
+          }
           throw new Error(`executor process ${item.pid} generation is unknown`)
         }
         if (observation.status !== 'alive') continue
