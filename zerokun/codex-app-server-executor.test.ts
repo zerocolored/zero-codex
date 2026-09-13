@@ -57,6 +57,8 @@ import {
   ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
 } from './codex-runtime-selection.ts'
 import { readAdvisorInputSnapshot } from './advisor-input.ts'
+import { CloudRuntime } from './cloud-runtime.ts'
+import { CloudHandoffClient } from './cloud-handoff.ts'
 import {
   advisorRepositoryDigest,
   advisorRepositoryScopeDigest,
@@ -720,9 +722,10 @@ for line in sys.stdin:
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [], "error": {"message": "fixture failure"}}}})
             else:
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "失敗後の追加入力を反映しました"}], "error": None}}})
-        elif mode == "rate-error":
+        elif mode in ("rate-error", "rate-terminal-only"):
             failure = {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}
-            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
+            if mode != "rate-terminal-only":
+                emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [], "error": failure}}})
         elif mode in ("capacity-error", "capacity-after-command", "capacity-error-generic-terminal", "capacity-started-command"):
             failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None, "additionalDetails": None}
@@ -968,7 +971,7 @@ function fixture(
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
     | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked'
-    | 'error-steer' | 'rate-error' | 'rate-retrying' | 'rate-retrying-two-turn'
+    | 'error-steer' | 'rate-error' | 'rate-terminal-only' | 'rate-retrying' | 'rate-retrying-two-turn'
     | 'capacity-error'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
     | 'capacity-started-command' | 'phased' | 'phased-publication'
@@ -6318,6 +6321,60 @@ describe('production App Server executor', () => {
     expect(value.store.get(value.job.id)?.status).toBe('queued')
     value.store.close()
   }, 15_000)
+
+  test('cloud prepared single repository crosses the real executor boundary and parks only after shutdown', async () => {
+    const value = fixture('rate-error', true)
+    git(value.repo, ['init', '--initial-branch=main'])
+    git(value.repo, ['config', 'user.email', 'fixture@example.invalid'])
+    git(value.repo, ['config', 'user.name', 'Fixture'])
+    git(value.repo, ['add', '.']); git(value.repo, ['commit', '-m', 'fixture'])
+    const remote = join(value.root, 'remote.git')
+    git(value.repo, ['clone', '--bare', value.repo, remote])
+    git(value.repo, ['remote', 'add', 'origin', 'https://github.com/example/fixture.git'])
+    git(value.repo, ['config', `url.${remote}.insteadOf`, 'https://github.com/example/fixture.git'])
+    const h = { id: '11111111-1111-4111-8111-111111111111', space_id: '22222222-2222-4222-8222-222222222222',
+      owner_id: '33333333-3333-4333-8333-333333333333', epoch: 1, slack_team_id: 'T1',
+      channel_id: value.job.chatId, thread_ts: value.job.threadTs, state: 'active', checkpoint_key: null,
+      checkpoint_digest: null, checkpoint_bytes: null, reset_at: null, updated_at: new Date(0).toISOString() }
+    const client = new CloudHandoffClient({ version: 1, url: 'https://example.supabase.co',
+      publishableKey: 'public-fixture-key-only', accessToken: 'fixture-access-token-only' },
+    (async () => Response.json(h)) as typeof fetch)
+    const runtime = new CloudRuntime(value.store, value.state, client, join(value.root, 'owned'))
+    try {
+      await runtime.prepare(value.job)
+      const job = runtime.executionJob(value.job)
+      expect(job.repoPath).not.toBe(value.job.repoPath)
+      let exited = false
+      await expect(executeCodexJob(job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: 'rate-error' },
+        parkOnUsageLimit: true, liveControls: value.hooks,
+        threadHistorySnapshot: value.store.threadHistorySnapshot(value.job.id),
+        onProcessExit: () => { exited = true },
+      })).rejects.toBeInstanceOf(CodexRateLimitError)
+      expect(exited).toBe(true)
+      expect(git(value.repo, ['status', '--porcelain'])).toBe('')
+    } finally { value.store.close() }
+  }, 30_000)
+
+  for (const mode of ['rate-error', 'rate-terminal-only', 'rate-retrying'] as const) {
+    test(`cloud quota ${mode} stops the owned executor instead of automatic continuation`, async () => {
+      const value = fixture(mode)
+      let exited = false
+      const waits: string[] = []
+      try {
+        await expect(executeCodexJob(value.job, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: mode },
+          parkOnUsageLimit: true, liveControls: value.hooks,
+          onProcessExit: () => { exited = true },
+          onCommentaryMessage: event => { waits.push(event.text) },
+        })).rejects.toBeInstanceOf(CodexRateLimitError)
+        expect(exited).toBe(true)
+        expect(waits.some(text => text.includes('自動再開'))).toBe(false)
+      } finally { value.store.close() }
+    }, 30_000)
+  }
 
   test('willRetry中のrate-limit通知はhost requeueせず同じturnのterminalを待つ', async () => {
     const value = fixture('rate-retrying')

@@ -241,6 +241,13 @@ zerochan update --recover-only
 
 ## 中断・再実行
 
+### クラウド引き継ぎを追加する場合（リリース前検証中）
+
+通常セットアップに加え、[クラウド引き継ぎの設定](docs/cloud-handoff.md) が必要です。
+各PCは別のSlack App・別のSupabase Authユーザーで接続します。
+`zerochan cloud login` は端末で認証し、`zerochan cloud activate` は管理者による所属登録を確認して有効化します。
+管理者キーや別PCのセッションは流用しません。所属するSlack team・Bot user IDを確認してから有効化してください。
+
 - bootstrapは再実行可能で、既存の安全な`.env`やaccess設定を無条件に上書きしません。
 - Slack Appを作成済みでtoken入力前に中断した場合は、同じcommandを再実行してSlack設定から続けます。
 - `xapp-`と`xoxb-`が別Appのものなら保存せず停止します。同じAppからコピーし直します。
