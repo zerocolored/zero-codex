@@ -774,6 +774,11 @@ CREATE TABLE IF NOT EXISTS codex_session_protocols (
   protocol_version INTEGER NOT NULL,
   recorded_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS codex_session_workspaces (
+  session_id TEXT PRIMARY KEY,
+  physical_cwd TEXT NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES codex_session_protocols(session_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS codex_session_job_uses (
   session_id TEXT NOT NULL,
   job_id TEXT NOT NULL,
@@ -10319,11 +10324,28 @@ export class JobStore {
     })
   }
 
-  saveSession(id: string, sessionId: string): void {
+  sessionWorkspace(sessionId: string): string | null {
+    return this.db.query<{ physical_cwd: string }, [string]>(
+      'SELECT physical_cwd FROM codex_session_workspaces WHERE session_id = ?',
+    ).get(sessionId)?.physical_cwd ?? null
+  }
+
+  saveSession(id: string, sessionId: string, executionCwd?: string): void {
     const persistedSessionId = requireText(sessionId, 'sessionId')
+    const physicalCwd = executionCwd === undefined ? null : realpathSync(executionCwd)
     const save = this.db.transaction(() => {
       const recordedAt = Date.now()
       this.recordCodexSessionUse(persistedSessionId, id, recordedAt)
+      if (physicalCwd !== null) {
+        const existing = this.sessionWorkspace(persistedSessionId)
+        if (existing !== null && existing !== physicalCwd) {
+          throw new Error('Codex session workspace changed')
+        }
+        this.db.run(
+          'INSERT OR IGNORE INTO codex_session_workspaces(session_id,physical_cwd) VALUES (?,?)',
+          [persistedSessionId, physicalCwd],
+        )
+      }
       const updated = this.db.run(
         `UPDATE jobs SET session_id = ?
          WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
@@ -19009,13 +19031,14 @@ async function runCli(): Promise<void> {
         }
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
-          const execution = await executeCodexJob(cloudRuntime?.executionJob(job) ?? job, {
+          const executionJob = cloudRuntime?.executionJob(job) ?? job
+          const execution = await executeCodexJob(executionJob, {
             signal: executionController.signal,
             stateDir: dir,
             logDir: join(dir, 'job-logs'),
             threadHistory: store.threadHistorySnapshot(job.id, job.attempts),
             ...executorPidLifecycle,
-            onSessionId: sessionId => store.saveSession(job.id, sessionId),
+            onSessionId: sessionId => store.saveSession(job.id, sessionId, executionJob.repoPath),
             onSessionReset: () => store.clearSession(job.id),
             liveControls: {
               recordGoalStatus: status => store.recordTaskGoalStatus(job.id, status),

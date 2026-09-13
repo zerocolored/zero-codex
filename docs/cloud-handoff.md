@@ -46,6 +46,7 @@ zerochan cloud status
 ## 保存内容と制約
 
 - 最新の統合ブランチから作成したタスク専用クローンを使います。共有作業場所にあった他者の未コミット差分は取り込みません。
+- native Codexセッションは実際の作業フォルダと紐づけてローカルに保存します。同じフォルダなら再開し、クラウド導入前のセッションや別PCからの引き継ぎなど、フォルダが異なる場合は保存済みスレッド履歴を添えて新規セッションを開始します。旧セッションの削除はしません。導入前の共有フォルダに残る未コミット変更は保持しますが、新しいクローンへの自動移植は行いません。
 - 基点コミット、staged/unstaged差分、削除・バイナリ・未追跡ファイル、添付ファイル、依頼と可視Codex出力を保存します。Slackに出していない可視コメントも対象です。非公開の推論、認証ファイル、無制限の生ツールログは共有しません。
 - 未pushコミットの**変更内容**は差分に含めますが、元のコミットグラフは再現しません。元HEADは出所として記録します。受け手は基点コミットをGitHub remoteから取得できる必要があります。
 - パッケージ上限512 MiB、個別ファイル上限50 MiBです。symlinkや保護対象ファイル、検出した機密情報は黙って欠落させず、保存未完了として通知します。会話中の検出可能な認証情報は伏せます。任意の資料に機密情報がないことを完全保証する検査ではありません。
@@ -60,7 +61,7 @@ zerochan cloud status
 
 ```sh
 bun test zerokun/cloud-handoff.test.ts zerokun/cloud-runtime.test.ts zerokun/handoff-package.test.ts zerokun/handoff-coordinator.test.ts zerokun/handoff-control.test.ts zerokun/cloud-setup.test.ts
-bun test zerokun/codex-app-server-executor.test.ts -t 'cloud prepared|cloud quota'
+bun test zerokun/codex-app-server-executor.test.ts -t 'cloud legacy session migration|cloud quota'
 bun run typecheck
 ```
 

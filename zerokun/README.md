@@ -166,7 +166,9 @@ codex <trust-args> -C <repo> \
 - 新規sessionは`thread/start`、継続sessionは`thread/resume`を使います。session IDをZeroちゃん側で
   推測・採番せず、responseのthread ID、物理cwd、OpenAI provider、model、`approvalPolicy: never`、
   named permission profile、AGENTS instruction sourceが全て一致した場合だけ保存します。通常失敗でも
-  session自体を明示的にretireしていなければ、同じSlack threadの次jobでそのsessionをresumeします。
+  session自体を明示的にretireしていなければ、同じSlack thread・同じ物理作業場所の次jobでそのsessionをresumeします。
+  クラウド作業場所へ移る場合はsessionとcwdのローカル台帳を照合し、不一致・旧台帳未登録なら
+  保存済みスレッド履歴を渡して新規sessionを開始します。旧sessionや元の作業ファイルは削除しません。
 - primary modelは`gpt-6-astra`、reasoning effortは`low`をrelease codeからApp Server起動、
   `thread/start`／`thread/resume`、全`turn/start`へ明示します。handshakeの実効値も照合し、
   `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。advisor modelは`AGENTS.md`の別契約です。

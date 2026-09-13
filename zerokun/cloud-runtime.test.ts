@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { execFileSync } from 'child_process'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { JobStore } from './job-runner.ts'
@@ -23,6 +23,61 @@ test('permanent ownership refusal is not classified as a retryable preparation o
   store.close()
 })
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
+test('legacy native session is reset durably when cloud changes cwd; managed continuation resumes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-session-cwd-')); roots.push(root)
+  const source = join(root, 'source'), managed = join(root, 'managed')
+  mkdirSync(source); mkdirSync(managed)
+  const store = new JobStore(join(root, 'jobs.sqlite3'))
+  try {
+    const runtime = new CloudRuntime(store, root, new MemberClient(new CloudFixture(), ownerA, 'UA'))
+    const input = { chatId: 'C1', threadTs: '1.0', userId: 'U1', repoPath: source, task: 'Continue approved work', writeEnabled: true }
+    store.enqueue({ ...input, messageId: '1.0' })
+    const previous = store.claimNext('worker')!
+    store.saveSession(previous.id, 'legacy-session')
+    store.complete(previous.id, 'legacy-session', 'Approved implementation completed; publish next.')
+    store.enqueue({ ...input, messageId: '2.0' })
+    const job = store.claimNext('worker')!
+    expect(job.sessionId).toBe('legacy-session')
+    store.bindCloudHandoff(job.id, initial.id, 1, JSON.stringify(initial))
+    writeCheckpoint(join(root, 'cloud-workspaces', `${initial.id}.json`), Buffer.from(JSON.stringify({ epoch: 1,
+      project: managed, repositories: [{ root: managed, name: 'project', base: 'fixture' }] })))
+    const execution = runtime.executionJob(job)
+    expect(execution.sessionId).toBeNull()
+    expect(execution.resumed).toBe(false)
+    expect(store.get(job.id)?.sessionId).toBeNull()
+    expect(store.get(job.id)?.resumed).toBe(false)
+    expect(execution.historyRepoPath).toBe(source)
+    expect(store.threadHistorySnapshot(job.id).transcript).toContain('Approved implementation completed')
+    // A pre-dispatch retry must not revive the preceding ID.
+    expect(store.releaseUnstartedClaim(job.id, 'worker', 'fixture pre-dispatch retry')).toBe(true)
+    const reclaimed = store.claimNext('worker')!
+    expect(reclaimed.sessionId).toBeNull()
+    expect(runtime.executionJob(reclaimed).sessionId).toBeNull()
+    store.saveSession(job.id, 'managed-session', managed)
+    const alias = join(root, 'managed-alias'); symlinkSync(managed, alias)
+    store.saveSession(job.id, 'managed-session', alias)
+    expect(() => store.saveSession(job.id, 'managed-session', source)).toThrow('workspace changed')
+    expect(store.sessionWorkspace('managed-session')).toBe(realpathSync(managed))
+    store.requeue(job.id, 'fixture same-workspace retry before dispatch')
+    const retryClaim = store.claimNext('worker')!
+    expect(retryClaim.resumed).toBe(true)
+    const retry = runtime.executionJob(retryClaim)
+    expect(retry.sessionId).toBe('managed-session')
+    expect(retry.resumed).toBe(true)
+    store.complete(job.id, 'managed-session', 'Work continued in managed workspace.')
+    store.enqueue({ ...input, messageId: '3.0' })
+    const next = store.claimNext('worker')!
+    store.bindCloudHandoff(next.id, initial.id, 1, JSON.stringify(initial))
+    expect(runtime.executionJob(next).sessionId).toBe('managed-session')
+    expect(runtime.executionJob(next).resumed).toBe(true)
+    // Import/epoch changes cannot reuse a local native session at another cwd.
+    const imported = join(root, 'imported'); mkdirSync(imported)
+    writeCheckpoint(join(root, 'cloud-workspaces', `${initial.id}.json`), Buffer.from(JSON.stringify({ epoch: 2,
+      project: imported, repositories: [{ root: imported, name: 'project', base: 'fixture' }] })))
+    expect(runtime.executionJob(next).sessionId).toBeNull()
+    expect(store.get(next.id)?.sessionId).toBeNull()
+  } finally { store.close() }
+})
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', env: { ...process.env,
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
