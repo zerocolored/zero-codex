@@ -405,6 +405,8 @@ for line in sys.stdin:
             continue
         requested = params.get("threadId")
         cwd = params.get("cwd")
+        if method == "thread/resume" and os.environ.get("ZERO_RESUME_CWD"):
+            cwd = os.environ["ZERO_RESUME_CWD"]
         model = params.get("model") or "gpt-test"
         reasoning_effort = params.get("config", {}).get("model_reasoning_effort") or "medium"
         developer_instructions = params.get("developerInstructions") or ""
@@ -6322,8 +6324,11 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 15_000)
 
-  test('cloud prepared single repository crosses the real executor boundary and parks only after shutdown', async () => {
-    const value = fixture('rate-error', true)
+  for (const mode of ['rate-error', 'normal'] as const) {
+  test(`cloud legacy session migration crosses executor boundary (${mode})`, async () => {
+    const value = fixture(mode, true)
+    const rpcLog = join(value.root, 'cloud-session-rpc.log')
+    const promptLog = join(value.root, 'cloud-session-prompts.log')
     git(value.repo, ['init', '--initial-branch=main'])
     git(value.repo, ['config', 'user.email', 'fixture@example.invalid'])
     git(value.repo, ['config', 'user.name', 'Fixture'])
@@ -6342,20 +6347,53 @@ describe('production App Server executor', () => {
     const runtime = new CloudRuntime(value.store, value.state, client, join(value.root, 'owned'))
     try {
       await runtime.prepare(value.job)
-      const job = runtime.executionJob(value.job)
+      value.store.saveSession(value.job.id, 'legacy-other-cwd', value.repo)
+      const job = runtime.executionJob({ ...value.job, seq: 2, sessionId: 'legacy-other-cwd', resumed: true })
       expect(job.repoPath).not.toBe(value.job.repoPath)
+      expect(job.sessionId).toBeNull()
+      if (mode === 'normal') {
+        // Negative control reproduces #144's actual handshake rejection when
+        // the original session reports its original physical directory.
+        await expect(executeCodexJob({ ...job, sessionId: 'legacy-other-cwd', resumed: true }, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true,
+          extraEnvironment: { ZERO_FIXTURE_MODE: mode, ZERO_RESUME_CWD: value.repo },
+          liveControls: value.hooks,
+        })).rejects.toThrow('different cwd')
+      }
+      const threadHistory = createDurableThreadHistorySnapshot({
+        jobId: job.id, attempt: job.attempts, chatId: job.chatId, threadTs: job.threadTs,
+        repoPath: value.repo, currentJobSeq: job.seq, createdAt: Date.now(),
+        archives: [createThreadHistoryArchive({ jobId: 'legacy-prior-job', jobSeq: 1,
+          chatId: job.chatId, threadTs: job.threadTs, repoPath: value.repo,
+          outcome: 'completed', finishedAt: Date.now() - 1,
+          events: [{ order: 0, kind: 'result', text: 'Previously approved implementation; continue publication only.' }] })],
+      })
       let exited = false
-      await expect(executeCodexJob(job, {
+      const execution = executeCodexJob(job, {
         codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
-        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: 'rate-error' },
+        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: mode,
+          ZERO_RPC_LOG: rpcLog, ZERO_PROMPT_LOG: promptLog, ZERO_LOG_HANDSHAKES: '1' },
         parkOnUsageLimit: true, liveControls: value.hooks,
-        threadHistorySnapshot: value.store.threadHistorySnapshot(value.job.id),
+        threadHistory,
+        onSessionId: id => value.store.saveSession(job.id, id, job.repoPath),
         onProcessExit: () => { exited = true },
-      })).rejects.toBeInstanceOf(CodexRateLimitError)
+      })
+      if (mode === 'rate-error') await expect(execution).rejects.toBeInstanceOf(CodexRateLimitError)
+      else {
+        expect((await execution).result).toBe('通常完了')
+        const prompts = readFileSync(promptLog, 'utf8').trim().split('\n').map(line => JSON.parse(line).text as string)
+        expect(prompts.filter(text => text.includes('Previously approved implementation'))).toHaveLength(1)
+      }
+      const methods = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line).method)
+        .filter(method => method === 'thread/start' || method === 'thread/resume')
+      expect(methods).toEqual(['thread/start'])
+      expect(value.store.sessionWorkspace('thread-app-server-1')).toBe(job.repoPath)
       expect(exited).toBe(true)
       expect(git(value.repo, ['status', '--porcelain'])).toBe('')
     } finally { value.store.close() }
   }, 30_000)
+  }
 
   for (const mode of ['rate-error', 'rate-terminal-only', 'rate-retrying'] as const) {
     test(`cloud quota ${mode} stops the owned executor instead of automatic continuation`, async () => {

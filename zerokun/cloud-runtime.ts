@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process'
-import { existsSync, mkdirSync, readFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'fs'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 import { CloudHandoffClient, CloudHandoffError, digestBytes, handoffSchema, readCloudConfig } from './cloud-handoff.ts'
@@ -96,8 +96,15 @@ export class CloudRuntime {
     if (!binding) return job
     const workspace = JSON.parse(readFileSync(this.workspacePath(binding.cloudId), 'utf8')) as Workspace
     const context = join(workspace.project, 'HANDOFF.md')
+    const repoPath = realpathSync(workspace.repositories.length === 1 ? workspace.repositories[0]!.root : workspace.project)
+    // Conversation routing is logical; a native Codex session belongs to one
+    // physical cwd. Unknown legacy bindings and imports must start fresh with
+    // durable thread history, not resume the old session at a new directory.
+    const resumed = job.resumed && job.sessionId !== null
+      && this.store.sessionWorkspace(job.sessionId) === repoPath
+    if (job.sessionId !== null && !resumed) this.store.clearSession(job.id)
     return { ...job, historyRepoPath: job.repoPath,
-      repoPath: workspace.repositories.length === 1 ? workspace.repositories[0]!.root : workspace.project,
+      repoPath, resumed, sessionId: resumed ? job.sessionId : null,
       task: job.task + CONTINUATION_INSTRUCTIONS,
       attachments: [...new Set([...job.attachments, ...(existsSync(context) ? [context] : [])])] }
   }
