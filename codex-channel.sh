@@ -25,6 +25,10 @@ unset ZEROKUN_UPDATE_TESTING ZEROKUN_SLACK_IDENTITY_TEST_APP_ID \
   ZEROKUN_SETUP_TEST_STOP_PROBE
 command -v bun >/dev/null 2>&1 || { echo "❌ bun が見つかりません。" >&2; exit 1; }
 STATE_DIR="$(zerokun_resolve_state_dir)"
+if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "cloud" ]; then
+  [ "$#" -eq 2 ] || { echo "使い方: zerochan cloud login|activate|status" >&2; exit 2; }
+  exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/cloud-setup.ts" "$2" "$STATE_DIR"
+fi
 # The updater may hand this value to the launcher through an internal
 # trampoline. Capture it as a non-exported shell value before the first Bun
 # helper so Slack, advisor, runner, and gateway children never inherit it.

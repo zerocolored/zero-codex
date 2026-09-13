@@ -257,6 +257,10 @@ bash zerokun/interactive-bootstrap.sh \
 別PCのtokenは使いません。同じSlackチャンネルへ複数のAppを招待しても構いませんが、新規依頼では
 処理させたいAppをメンションしてください。
 
+クラウド経由で作業を引き継ぐ追加機能は [クラウド引き継ぎ](docs/cloud-handoff.md) を参照してください。
+利用上限時の保存と、別Appへの明示的な引き継ぎを扱います。各PCで追加設定が必要で、
+通常のupdateだけでは有効になりません。SQLiteや認証ファイルをPC間でコピーしないでください。
+
 ### 3. projectとSlackチャンネルを設定して起動する
 
 対象projectを新PCへcloneし、通常TerminalまたはHerdrで次を実行します。Herdr外なら専用workspaceが

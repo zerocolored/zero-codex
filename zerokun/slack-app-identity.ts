@@ -6,7 +6,7 @@ import { readOptionalPrivateFile } from './safe-file.ts'
 import { slackWebClientOptions } from './slack-http.ts'
 
 export interface SlackIdentityApi {
-  authTest(): Promise<{ app_id?: string; bot_id?: string; user_id?: string }>
+  authTest(): Promise<{ app_id?: string; bot_id?: string; user_id?: string; team_id?: string }>
   botsInfo(bot: string): Promise<{ app_id?: string }>
 }
 
@@ -33,7 +33,7 @@ export function slackTokenPairRuntimeIdentity(botToken: string, appToken: string
 export async function verifySlackAppTokenPair(
   appToken: string,
   api: SlackIdentityApi,
-): Promise<{ appId: string; botUserId?: string }> {
+): Promise<{ appId: string; botUserId?: string; teamId?: string }> {
   const expectedAppId = appIdFromAppToken(appToken)
   const auth = await api.authTest()
   let botAppId = auth.app_id
@@ -42,7 +42,7 @@ export async function verifySlackAppTokenPair(
   if (botAppId !== expectedAppId) {
     throw new Error('SLACK_BOT_TOKEN and SLACK_APP_TOKEN belong to different Slack Apps')
   }
-  return { appId: botAppId, botUserId: auth.user_id }
+  return { appId: botAppId, botUserId: auth.user_id, ...(auth.team_id ? { teamId: auth.team_id } : {}) }
 }
 
 async function verifyFile(path: string): Promise<void> {
@@ -52,13 +52,16 @@ async function verifyFile(path: string): Promise<void> {
   }
   const { WebClient } = await import('@slack/web-api')
   const client = new WebClient(tokens.SLACK_BOT_TOKEN, slackWebClientOptions(10_000))
-  await verifySlackAppTokenPair(tokens.SLACK_APP_TOKEN, {
+  const identity = await verifySlackAppTokenPair(tokens.SLACK_APP_TOKEN, {
     authTest: () => client.auth.test({}),
     botsInfo: async bot => {
       const result = await client.bots.info({ bot })
       return { app_id: result.bot?.app_id }
     },
   })
+  if (identity.teamId && identity.botUserId) {
+    process.stdout.write(`Slack workspace: ${identity.teamId}; bot user: ${identity.botUserId}\n`)
+  }
 }
 
 if (import.meta.main) {

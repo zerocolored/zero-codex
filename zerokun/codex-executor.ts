@@ -3920,7 +3920,7 @@ export function buildCodexWorkerPrompt(
       attempt: job.attempts,
       chatId: job.chatId,
       threadTs: job.threadTs,
-      repoPath: job.repoPath,
+      repoPath: job.historyRepoPath ?? job.repoPath,
       currentJobSeq: job.seq,
     })
   }
@@ -6024,6 +6024,11 @@ export async function executeCodexJob(
     onStderrChunk?(value: Uint8Array): void
     /** Bounded, user-safe status projected from validated root-thread notifications. */
     onMonitorMessage?(message: string): void
+    /** Full visible assistant messages for portable context, independent of Slack milestones. */
+    onHandoffContext?(key: string, text: string): void
+    /** Cloud handoff parks on quota rather than automatically resuming. */
+    parkOnUsageLimit?: boolean
+    onCloudQuotaDetected?(resetAt: number | undefined): void
     /** Durable Slack outbox handoff for an explicitly enveloped milestone commentary. */
     onCommentaryMessage?(event: {
       sourceKey: string
@@ -6077,7 +6082,7 @@ export async function executeCodexJob(
       attempt: job.attempts,
       chatId: job.chatId,
       threadTs: job.threadTs,
-      repoPath: job.repoPath,
+      repoPath: job.historyRepoPath ?? job.repoPath,
       currentJobSeq: job.seq,
     })
   }
@@ -7131,6 +7136,13 @@ export async function executeCodexJob(
                 }
               }
             }
+            if (notification.method === 'item/completed'
+              && notification.params.threadId === monitorParentThreadId) {
+              const item = notification.params.item as Record<string, unknown> | undefined
+              if (item?.type === 'agentMessage' && typeof item.id === 'string' && typeof item.text === 'string') {
+                options.onHandoffContext?.(`${monitorParentThreadId}:${item.id}`, item.text)
+              }
+            }
             const slackUpdate = slackUpdateCommentaryFromNotification(
               notification,
               monitorParentThreadId,
@@ -7875,6 +7887,13 @@ export async function executeCodexJob(
               method: 'error', params: appServerError,
             }))
             if (rateLimit.rateLimited) activeTurnTransientFailure = rateLimit
+            if (options.parkOnUsageLimit && rateLimit.rateLimited && rateLimit.reason !== 'capacity') {
+              options.onCloudQuotaDetected?.(rateLimit.resetsAtMs ?? undefined)
+              // The catch below stops and reaps this exact supervisor before
+              // the typed exception is allowed to reach the cloud checkpoint.
+              throw new CodexRateLimitError('Usage limit requires explicit cloud continuation',
+                rateLimit.resetsAtMs ?? Date.now(), currentThreadId, 'rate-limit', false, stage, phaseSequence)
+            }
             if (!appServerError.willRetry
               && rateLimit.rateLimited
               && rateLimit.resetsAtMs !== null) {
@@ -7989,6 +8008,12 @@ export async function executeCodexJob(
               : terminal.turn.status === 'failed' && activeTurnTransientFailure?.rateLimited
                 ? activeTurnTransientFailure
                 : terminalRateLimit
+            if (options.parkOnUsageLimit && terminal.turn.status === 'failed'
+              && rateLimit.rateLimited && rateLimit.reason !== 'capacity') {
+              options.onCloudQuotaDetected?.(rateLimit.resetsAtMs ?? undefined)
+              throw new CodexRateLimitError('Usage limit requires explicit cloud continuation',
+                rateLimit.resetsAtMs ?? Date.now(), currentThreadId, 'rate-limit', false, stage, phaseSequence)
+            }
             if (rateLimit.rateLimited && terminal.turn.status === 'failed') {
               // A terminal marked `full` is the bounded official item view for
               // this failed turn. The session projection intentionally strips
@@ -8436,6 +8461,10 @@ export async function executeCodexJob(
       if (protocolCompleted && protocolError == null && finalMessage) {
         atomicWritePrivateFile(finalPath, finalMessage)
       }
+      if (protocolError instanceof CodexRateLimitError && options.parkOnUsageLimit && !userCancelled) {
+        await retireCompletedRegistration()
+        throw protocolError
+      }
       return {
         exitCode,
         stdout: stdoutTail,
@@ -8874,6 +8903,11 @@ export async function executeCodexJob(
       phaseSequence: number
       partialImplementation: boolean
     }): Promise<void> => {
+      if (options.parkOnUsageLimit && input.reason === 'rate-limit') {
+        options.onCloudQuotaDetected?.(input.resetsAtMs)
+        throw new CodexRateLimitError('Usage limit requires explicit cloud continuation',
+          input.resetsAtMs, sessionId ?? undefined, 'rate-limit', false, input.stage, input.phaseSequence)
+      }
       const resumeAt = options.transientRetryDelayMsForTesting === undefined
         ? codexRateLimitResumeAt(input.resetsAtMs)
         : Date.now() + positiveInteger(options.transientRetryDelayMsForTesting, 1)
