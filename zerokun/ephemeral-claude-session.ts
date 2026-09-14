@@ -938,7 +938,6 @@ export async function reconcileEphemeralClaudeSessions(options: {
       for (const revisionRoot of managedChildren(stateDir, attemptRoot, REVISION_COMPONENT)) {
         for (const requestDir of managedChildren(stateDir, revisionRoot, ROUND_COMPONENT)) {
           try {
-            let retainProvisionalAbsenceGuard = false
             discardStagedEphemeralClaudeRecords(requestDir)
             const relativeComponents = relative(root, requestDir).split(sep)
             const revisionMatch = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/
@@ -994,8 +993,6 @@ export async function reconcileEphemeralClaudeSessions(options: {
               cleanupStatus = provisional.status
               cleanupReceiptDigest = provisional.digest
               freshEphemeral = provisional.status === 'provisional-workspace-closed'
-              retainProvisionalAbsenceGuard = provisional.status
-                === 'provisional-workspace-not-created'
             } else {
               const close = await run('close', projectRoot, requestDir)
               if (close.exitCode !== 0) {
@@ -1027,13 +1024,9 @@ export async function reconcileEphemeralClaudeSessions(options: {
                 join(requestDir, 'ephemeral-send-receipt.json'),
               ) !== null,
             })
-            if (!retainProvisionalAbsenceGuard) {
-              removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
-            }
+            removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
             closed += 1
-            options.log?.(retainProvisionalAbsenceGuard
-              ? 'revalidated one retained provisional Claude absence guard'
-              : 'recovered one owned ephemeral Claude workspace')
+            options.log?.('recovered one owned ephemeral Claude workspace')
           } catch (error) {
             const failure = error instanceof EphemeralClaudeCleanupPendingError
               ? error
