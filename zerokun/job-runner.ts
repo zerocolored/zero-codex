@@ -518,6 +518,8 @@ type InboundDeliveryRow = {
 }
 
 export interface JobRecord {
+  /** Actual host receipts, independent of what the resumed model remembers saying. */
+  previousSlackDelivery?: { seq: number; bodyDelivered: boolean; filesDelivered: number; filesDeclared: number }
   /** Host-only logical history scope when executing in a dedicated cloud worktree. */
   historyRepoPath?: string
   taskGoalStatus?: string | null
@@ -8693,6 +8695,25 @@ export class JobStore {
     return row ? mapRow(row) : null
   }
 
+  previousSlackDelivery(id: string): JobRecord['previousSlackDelivery'] {
+    const prior = this.db.query<{ id: string; seq: number }, [string]>(
+      `SELECT prior.id, prior.seq FROM jobs current JOIN jobs prior
+       ON prior.chat_id=current.chat_id AND prior.thread_ts=current.thread_ts
+         AND prior.repo_path=current.repo_path AND prior.write_enabled=current.write_enabled
+         AND prior.runtime=current.runtime AND prior.seq<current.seq
+       WHERE current.id=? ORDER BY prior.seq DESC LIMIT 1`,
+    ).get(id)
+    if (!prior) return undefined
+    const files = this.db.query<{ declared: number; delivered: number }, [string]>(
+      'SELECT COUNT(*) AS declared, COUNT(delivered_at) AS delivered FROM artifact_deliveries WHERE job_id=?',
+    ).get(prior.id)!
+    const body = this.db.query<{ body_delivered_at: number | null }, [string]>(
+      'SELECT body_delivered_at FROM terminal_notifications WHERE job_id=?',
+    ).get(prior.id)
+    return { seq: prior.seq, bodyDelivered: body?.body_delivered_at != null,
+      filesDelivered: files.delivered, filesDeclared: files.declared }
+  }
+
   cloudHandoff(id: string): { state: string; cloudId: string; epoch: number; receipt: string; packagePath: string | null; resetAt: number | null } | null {
     const row = this.db.query<{ state: string; cloud_id: string; epoch: number; receipt_json: string; package_path: string | null; reset_at: number | null }, [string]>(
       'SELECT * FROM cloud_handoff_jobs WHERE job_id = ?',
@@ -13970,8 +13991,7 @@ export async function flushTerminalNotifications(
       if (signal?.aborted) return
       const message = error instanceof Error ? error.message : String(error)
       if (error instanceof ArtifactDeliveryAmbiguousError
-        && notification.kind === 'completed'
-        && store.terminalNotificationBodyDelivered(notification.id)) {
+        && notification.kind === 'completed') {
         const exhausted = error.artifactPaths.filter(path => (
           store.recordArtifactAmbiguityCheck(notification.job.id, path, message)
             >= MAX_ARTIFACT_DELIVERY_ATTEMPTS
@@ -13986,9 +14006,11 @@ export async function flushTerminalNotifications(
                 notification.job, message, notification.id, signal,
               )
               if (signal?.aborted) return
-              await notifier.completionReaction?.(
-                notification.job, notification.id, signal,
-              )
+              if (!notification.job.taskGoalStatus || notification.job.taskGoalStatus === 'complete') {
+                await notifier.completionReaction?.(
+                  notification.job, notification.id, signal,
+                )
+              }
               if (signal?.aborted) return
               store.markTerminalNotificationDelivered(notification.id)
               continue
@@ -17356,7 +17378,9 @@ export class SlackNotifier implements JobNotifier {
       undefined,
       'delivery',
     )
-    if (!notificationId || !this.store.terminalNotificationBodyDelivered(notificationId)) {
+    const attachmentsBeforeWaiting = ['blocked', 'paused'].includes(job.taskGoalStatus ?? '') && output.files.length > 0
+    const postBody = async () => {
+      if (notificationId && this.store.terminalNotificationBodyDelivered(notificationId)) return
       const waiting = job.taskGoalStatus && job.taskGoalStatus !== 'complete'
       await this.post(job, waiting
         ? `⏸️ 未完了・待機中です。\n\n${safeText || '続行に必要な条件を確認してください。'}`
@@ -17364,6 +17388,7 @@ export class SlackNotifier implements JobNotifier {
       if (signal?.aborted) return
       if (notificationId) this.store.markTerminalNotificationBodyDelivered(notificationId)
     }
+    if (!attachmentsBeforeWaiting) await postBody()
     const ambiguousPaths: string[] = []
     let ambiguityCause: unknown
     for (const requested of output.files) {
@@ -17451,7 +17476,8 @@ export class SlackNotifier implements JobNotifier {
     if (this.store.publicationBlockedArtifactCount(job.id) > 0) {
       await this.post(
         job,
-        slackArtifactPublicationBlockedMessage(),
+        slackArtifactPublicationBlockedMessage()
+          + (attachmentsBeforeWaiting ? '\n比較案の添付が揃っていないため、承認依頼は送らず待機しています。再開を依頼してください。' : ''),
         notificationId ? `${notificationId}:artifact-policy` : undefined,
         signal,
       )
@@ -17459,6 +17485,10 @@ export class SlackNotifier implements JobNotifier {
     }
     if (ambiguousPaths.length > 0) {
       throw new ArtifactDeliveryAmbiguousError(ambiguousPaths, ambiguityCause)
+    }
+    if (attachmentsBeforeWaiting && this.store.publicationBlockedArtifactCount(job.id) === 0
+      && this.store.abandonedArtifactCount(job.id) === 0) {
+      await postBody()
     }
   }
 
@@ -17510,7 +17540,9 @@ export class SlackNotifier implements JobNotifier {
     this.log(`job ${job.id} artifact delivery abandoned: ${error}`)
     await this.post(
       job,
-      slackArtifactsAbandonedMessage(),
+      slackArtifactsAbandonedMessage()
+        + (['blocked', 'paused'].includes(job.taskGoalStatus ?? '')
+          ? '\n比較案の添付を確認できないため、承認依頼は送らず待機しています。' : ''),
       notificationId ? `${notificationId}:artifacts-abandoned` : undefined,
       signal,
     )
@@ -19032,6 +19064,7 @@ async function runCli(): Promise<void> {
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
           const executionJob = cloudRuntime?.executionJob(job) ?? job
+          executionJob.previousSlackDelivery = store.previousSlackDelivery(job.id)
           const execution = await executeCodexJob(executionJob, {
             signal: executionController.signal,
             stateDir: dir,

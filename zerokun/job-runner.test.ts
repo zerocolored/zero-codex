@@ -322,6 +322,31 @@ function makeStore(): JobStore {
   return new JobStore(join(fixtureDir(), 'jobs.sqlite3'))
 }
 
+test('再開には同じスレッドの実配送記録を渡し生成済み回答と区別する', () => {
+  const store = makeStore()
+  try {
+    const first = store.enqueue(input()).job
+    expect(store.previousSlackDelivery(first.id)).toBeUndefined()
+    store.claimNext('receipt-worker')
+    store.complete(first.id, 'receipt-session', '承認待ちです')
+    const notification = store.pendingTerminalNotifications()[0]!
+    store.markTerminalNotificationBodyDelivered(notification.id)
+    const next = store.enqueue(input({ messageId: '1800000000.000101', task: '案が見えない' })).job
+    expect(store.previousSlackDelivery(next.id)).toEqual({
+      seq: first.seq, bodyDelivered: true, filesDeclared: 0, filesDelivered: 0,
+    })
+    next.previousSlackDelivery = store.previousSlackDelivery(next.id)
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), next.id)
+    const prompt = buildCodexWorkerPrompt(next, snapshot, {
+      attemptNonce: 'a'.repeat(32), artifactDir: '/tmp/receipt-outbox', advisorEnabled: false,
+    })
+    expect(prompt).toContain('attachments delivered=0/0')
+    expect(prompt).toContain('do not merely repeat that approval is pending')
+    const other = store.enqueue(input({ threadTs: '1800000000.000999', messageId: '1800000000.000999' })).job
+    expect(store.previousSlackDelivery(other.id)).toBeUndefined()
+  } finally { store.close() }
+})
+
 function stageInboundAttachment(options: {
   store: JobStore
   stateDir: string
@@ -15669,6 +15694,42 @@ describe('durable terminal notifications', () => {
     expect(store.terminalNotificationCount()).toBe(0)
     expect(store.artifactDelivered(job.id, artifact)).toBe(true)
     store.close()
+  })
+
+  test('承認本文未送でも不明な添付を有限照合して障害通知だけを投稿する', async () => {
+    const store = makeStore()
+    try {
+      store.enqueue(input({ messageId: 'blocked-upload-budget' }))
+      const job = store.claimNext('serial-worker')!
+      store.recordTaskGoalStatus(job.id, 'blocked')
+      const outbox = artifactDirForJob(dirname(store.dbPath), job.id)
+      mkdirSync(outbox, { recursive: true })
+      const source = join(outbox, 'proposal.txt')
+      writeFileSync(source, 'proposal')
+      const result = sealArtifactResult(job, `承認してください\n<zerokun_files>${JSON.stringify([source])}</zerokun_files>`, dirname(store.dbPath))
+      store.complete(job.id, 'blocked-session', result)
+      let uploads = 0, reactions = 0
+      const messages: string[] = []
+      const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+        requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FUNKNOWN' }),
+        uploadBytes: async (_url, _bytes, commit) => { commit(); uploads++ },
+        completeUpload: async () => { throw new Error('response lost') },
+        inspectUpload: async () => false,
+        addReaction: async () => { reactions++ },
+        postMessage: async ({ text }) => { messages.push(text); return { messageId: '123.456' } },
+      })
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await flushTerminalNotifications(store, notifier, () => {}, 1)
+        await Bun.sleep(2 ** (attempt + 1) + 2)
+      }
+      expect(uploads).toBe(1)
+      expect(reactions).toBe(0)
+      expect(messages).toHaveLength(1)
+      expect(messages[0]).toContain('添付を打ち切りました')
+      expect(messages[0]).toContain('承認依頼は送らず待機しています')
+      expect(messages[0]).not.toContain('承認してください')
+      expect(store.terminalNotificationCount()).toBe(0)
+    } finally { store.close() }
   })
 
   test('byte開始後の曖昧性だけをartifact単位で5回確認して打ち切る', async () => {

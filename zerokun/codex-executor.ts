@@ -18,6 +18,7 @@ import {
 } from 'fs'
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import { ensureTaskGoal, readTaskGoal, type GoalStatus } from './codex-goal.ts'
+import { ContinuedArtifactMessage } from './continued-artifact-message.ts'
 import { homedir, tmpdir } from 'os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import type {
@@ -4007,6 +4008,21 @@ export function buildCodexWorkerPrompt(
       'If design or review is required, report the missing transport and keep the task blocked until recovery.',
     )
   }
+  control.push(
+    'Slack delivery occurs after the logical task suspends or finishes, not after every physical final answer.',
+    'When waiting for user approval, restate the complete proposal/question and zerokun_files declaration in the final answer.',
+    'An earlier attachment-bearing answer in this same input revision is retained if the goal becomes blocked or paused.',
+    'To replace attachments declare the new complete list; to withdraw an earlier proposal explicitly emit <zerokun_files>[]</zerokun_files>.',
+    'Do not claim the user has seen a proposal just because you previously generated it in this conversation.',
+  )
+  if (job.previousSlackDelivery) {
+    const delivery = job.previousSlackDelivery
+    control.push(
+      `Host Slack delivery receipt for preceding job #${delivery.seq}: final body delivered=${delivery.bodyDelivered}; attachments delivered=${delivery.filesDelivered}/${delivery.filesDeclared}.`,
+      'This receipt describes actual host delivery, not answers generated inside Codex. Zero declared attachments does not prove a proposal was shown.',
+      'If the user says the proposal is missing, supply the complete proposal and its attachments in this job output; do not merely repeat that approval is pending.',
+    )
+  }
   if (!job.writeEnabled) {
     control.push(
       'Access mode: read-only.',
@@ -7241,6 +7257,7 @@ export async function executeCodexJob(
       let inputChangedBeforeDispatch = false
       let observedSessionId: string | null = sessionId
       let finalMessage = ''
+      const continuedArtifactMessage = new ContinuedArtifactMessage(artifactDirForJob(managedStateDir, job.id))
       let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null
@@ -8072,6 +8089,17 @@ export async function executeCodexJob(
             // synthetic user request or restart the development workflow here.
             if (stage === 'complete' && terminal.turn.status === 'completed'
               && !pausedInterjection && !rateLimit.rateLimited && !controls.cancellationRequested()) {
+              try {
+                const completedTurn = reconciledTurn.itemsView === 'full'
+                  ? reconciledTurn : await session.loadFullTurn(currentThreadId!, reconciledTurn)
+                reconciledTurn = completedTurn
+                const completedMessage = appServerFinalMessage(completedTurn)
+                if (completedMessage) continuedArtifactMessage.observe(completedMessage, activeInputRevision)
+              } catch {
+                // Intermediate tool-only turns can legitimately have no final message.
+                // Observation must not prevent the native goal from continuing.
+                process.stderr.write('zerochan: intermediate attachment observation unavailable; continuing native goal.\n')
+              }
               let goal = await readTaskGoal(session, currentThreadId)
               let nativeTurn = session.takeNativeTurnStart(currentThreadId, parentTurnIds)
               if (goal?.status === 'active' || nativeTurn) {
@@ -8473,6 +8501,9 @@ export async function executeCodexJob(
         })}\n`.slice(-MAX_LOG_TAIL_CHARS)
       }
       if (protocolCompleted && protocolError == null && finalMessage) {
+        if (!userCancelled && stage === 'complete') {
+          finalMessage = continuedArtifactMessage.resolve(finalMessage, activeInputRevision, taskGoalStatus)
+        }
         atomicWritePrivateFile(finalPath, finalMessage)
       }
       if (protocolError instanceof CodexRateLimitError && options.parkOnUsageLimit && !userCancelled) {
