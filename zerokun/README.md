@@ -230,6 +230,9 @@ codex <trust-args> -C <repo> \
 - Grokの既知の未認証応答だけは、初期設計phaseと最終review phaseでそれぞれ1回に限って固定OAuth helperへ渡し、復旧できた場合も
   認証で終了した枠だけを再実行します。helper、reviewer、Claudeの失敗は外部枠の利用不能として閉じ、
   primary Codexのtaskを失敗や再設計へ戻しません。
+  回答不足を理由にGoalをblockedへ上書きせず、既存roundの再pollで欠員枠を再起動しません。
+  クラウド用multi-repo作業場所は新規作成・既存再開・引き継ぎ時にworkspace設定を保証し、
+  Claude helperは旧v1と非Git親のv2設定を読み取ります。既存のbranchや未コミット変更は作り直しません。
 - write jobでは公開HTTPSへ到達できるBrowser／Chrome、localhost用の隔離browser verifier、
   repository限定GitHub credential brokerを利用できます。
   brokerはSlack token、GitHub token、operator HOMEをmodelへ公開せず、Codexが選んだ操作だけを実行します。

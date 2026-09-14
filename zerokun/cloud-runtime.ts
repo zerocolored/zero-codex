@@ -5,7 +5,7 @@ import { homedir } from 'os'
 import { CloudHandoffClient, CloudHandoffError, digestBytes, handoffSchema, readCloudConfig } from './cloud-handoff.ts'
 import { CloudCheckpointBlockedError, HandoffCoordinator, writeCheckpoint } from './handoff-coordinator.ts'
 import { captureAttachment, captureRepository, restoreRepository, type HandoffPackage } from './handoff-package.ts'
-import { resolveProjectLayout } from './project-layout.ts'
+import { ensureWorkspacePin, resolveProjectLayout } from './project-layout.ts'
 import type { JobRecord, JobStore } from './job-runner.ts'
 
 type Workspace = { epoch: number; project: string; repositories: Array<{ root: string; name: string; base: string }> }
@@ -61,6 +61,7 @@ export class CloudRuntime {
     if (existsSync(receipt)) {
       const existing = JSON.parse(readFileSync(receipt, 'utf8')) as Workspace
       if (existing.epoch !== h.epoch) throw new CloudPreparationError(true)
+      this.prepareWorkspaceMetadata(existing)
       return
     }
     // A unique new worktree owns the task's changes. Never capture a dirty
@@ -89,7 +90,9 @@ export class CloudRuntime {
     const instructions = layout.rootInstructionPaths.filter(p => basename(p) === 'AGENTS.md')
       .map(p => readFileSync(p, 'utf8')).join('\n\n')
     writeCheckpoint(join(project, 'AGENTS.md'), Buffer.from(instructions + CONTINUATION_INSTRUCTIONS))
-    writeCheckpoint(receipt, Buffer.from(JSON.stringify({ epoch: h.epoch, project, repositories } satisfies Workspace)))
+    const workspace = { epoch: h.epoch, project, repositories }
+    this.prepareWorkspaceMetadata(workspace)
+    writeCheckpoint(receipt, Buffer.from(JSON.stringify(workspace)))
   }
   executionJob(job: JobRecord): JobRecord {
     const binding = this.store.cloudHandoff(job.id)
@@ -107,6 +110,16 @@ export class CloudRuntime {
       repoPath, resumed, sessionId: resumed ? job.sessionId : null,
       task: job.task + CONTINUATION_INSTRUCTIONS,
       attachments: [...new Set([...job.attachments, ...(existsSync(context) ? [context] : [])])] }
+  }
+  private prepareWorkspaceMetadata(workspace: Workspace): void {
+    if (workspace.repositories.length > 1) {
+      const layout = resolveProjectLayout(workspace.project)
+      const expected = workspace.repositories.map(r => realpathSync(r.root)).sort()
+      if (JSON.stringify([...layout.gitRoots].sort()) !== JSON.stringify(expected)) {
+        throw new Error('cloud workspace repositories changed; existing work preserved')
+      }
+      ensureWorkspacePin(layout)
+    }
   }
   async pause(job: JobRecord, resetAt: number | undefined): Promise<void> {
     const pending = this.saves.get(job.id)
@@ -215,6 +228,7 @@ export class CloudRuntime {
           .map(p => readFileSync(p, 'utf8')).join('\n\n')
         writeCheckpoint(join(project, 'AGENTS.md'), Buffer.from(instructions + CONTINUATION_INSTRUCTIONS))
       }
+      this.prepareWorkspaceMetadata(workspace)
       const attachments = packet.attachments.map(file => {
         const path = join(workspace.project, '.handoff-input', file.path)
         const data = Buffer.from(file.data, 'base64')

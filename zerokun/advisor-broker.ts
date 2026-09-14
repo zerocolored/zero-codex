@@ -1232,7 +1232,7 @@ export function advisorReceiptAlreadyObserved(input: {
   slotSummary: ReturnType<typeof summarizeAdvisorSlots>
 }): Record<string, unknown> {
   return {
-    complete: input.slotSummary.responsesObtained === input.slotSummary.total,
+    complete: true,
     alreadyObserved: true,
     phase: input.phase,
     round: input.round,
@@ -2224,8 +2224,8 @@ async function main(): Promise<void> {
     }),
   ])
   const advisorRoundInputSchema = {
-    retryUnavailable: z.boolean().optional(),
-    inputUpdateIsRecoveryOnly: z.boolean().optional().describe('Only for missing-slot recovery: the primary has checked that newer Slack input only resolves the failure and does not change the reviewed request.'),
+    retryUnavailable: z.boolean().optional().describe('Legacy compatibility only; finished slots are not restarted.'),
+    inputUpdateIsRecoveryOnly: z.boolean().optional().describe('Legacy compatibility only; does not authorize another advisor attempt.'),
     phase: completeWorkflow
       ? z.enum(['investigation', 'review'])
       : z.enum(['investigation', 'design', 'review']),
@@ -2370,8 +2370,10 @@ async function main(): Promise<void> {
       : []
     return toolText({
       complete: false,
-      waitingForAdvisors: true,
+      waitingForAdvisors: false,
       recoveredAfterInterruption: true,
+      attemptsFinished: true,
+      nextAction: '中断前のadvisor試行は終了しています。欠員と取得済み証拠を明示し、主担当の判断で本作業を継続してください。同じ枠の再起動や追加pollは不要です。',
       inputRevision: input.revision,
       inputDigest: input.digest,
       inputUnchanged: true,
@@ -2402,6 +2404,9 @@ async function main(): Promise<void> {
   }, async ({
     phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis, retryUnavailable, inputUpdateIsRecoveryOnly,
   }) => {
+    // Accept the legacy argument for old sessions, but never restart a
+    // finished advisor slot merely to fill a response quorum.
+    retryUnavailable = false
     if (phaseScope === 'prepare' && phase === 'review') {
       return toolText({ complete: false, reason: 'review is unavailable in the pre-edit process' }, true)
     }
@@ -2576,7 +2581,7 @@ async function main(): Promise<void> {
         }
         if (prior.terminal) {
           return toolText({
-            complete: journalSlotSummary(prior.terminal).responsesObtained === journalSlotSummary(prior.terminal).total,
+            complete: prior.status !== 'stale-input',
             reusedPriorPhase: true,
             phase,
             round,
@@ -3201,10 +3206,8 @@ async function main(): Promise<void> {
     )
     const complete = inputUnchanged && roundTwoRepositoryStable
       && (phaseScope === 'complete' || repositoryUnchanged)
-      // A three-advisor phase is not complete unless every requested advisor
-      // returned an adopted response.  Unavailable slots remain journaled for
-      // diagnosis, but must never be silently treated as a successful panel.
-      && allAdvisorAttemptsAdopted(nativeAdvisors, grok, claude)
+      // Completion records bounded attempts, not a response quorum. Keep
+      // adoption and unavailable reasons separate from task continuation.
       && validThreeAdvisorNativeAttempts(nativeEvidence, phase)
       && validThreeAdvisorGrokAttempts(grokJournal, phase)
       && validTerminalClaudeAttempt(claudeJournal)
@@ -3268,15 +3271,15 @@ async function main(): Promise<void> {
         ? { repositoryDeltaStable: roundTwoRepositoryStable }
         : {}),
       allAdopted: allAdvisorAttemptsAdopted(nativeAdvisors, grok, claude),
-      ...(complete ? {} : {
+      ...(!allAdvisorAttemptsAdopted(nativeAdvisors, grok, claude) ? {
         advisorUnavailable: unavailableAdvisorReasons(
           nativeAdvisors as Array<Record<string, unknown>>,
           grok as Array<Record<string, unknown>>,
           claude as Record<string, unknown>,
         ),
-        waitingForAdvisors: true,
-        nextAction: '3人の回答が揃うまで設計・レビュー完了としない。欠員理由をSlackへ報告する。認証はユーザーの復旧を待ち、混雑は待機する。復旧後は同じ入力・round・取得済みnative回答でadvisor_round(retryUnavailable=true)を呼ぶ。30秒以内に再試行しない。取得済み外部回答は保持され、欠員だけ再実行する。',
-      }),
+        waitingForAdvisors: false,
+        nextAction: '各枠の試行は終了しました。取得できなかった回答と原因を明示し、取得済みの証拠と主担当の判断で本作業を継続してください。欠員だけを理由に待機・再試行・追加roundを行わないでください。',
+      } : {}),
       slotSummary,
       grok,
       claude,

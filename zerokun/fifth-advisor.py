@@ -594,8 +594,12 @@ def _workspace_members(root_descriptor: int, root: Path) -> Optional[Tuple[str, 
             raise UnsafeRequest("workspace configuration is invalid") from error
         if (
             not isinstance(value, dict)
-            or set(value) != {"version", "kind", "members"}
-            or value.get("version") != 1
+            or not (
+                (value.get("version") == 1 and set(value) == {"version", "kind", "members"})
+                or (value.get("version") == 2
+                    and set(value) == {"version", "kind", "members", "projectRepository"}
+                    and value.get("projectRepository") is False)
+            )
             or value.get("kind") != "multi-repo-workspace"
             or not isinstance(value.get("members"), list)
         ):
