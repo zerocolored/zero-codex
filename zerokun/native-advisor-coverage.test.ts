@@ -111,6 +111,38 @@ describe('host native advisor execution observations', () => {
     expect((await f.run())[0]!.state).toBe('start-unconfirmed')
   })
 
+  test('同じmarkerの失敗世代が残っても再試行の実回答を回収する', async () => {
+    const f = fixture()
+    const failed = structuredClone(f.children[0]!)
+    failed.id = 'failed-thread'
+    failed.turns[0]!.status = 'failed'
+    failed.turns[0]!.items.pop()
+    f.children.push(failed)
+    expect((await f.run())[0]!.threadId).toBe('solution-thread')
+    expect((await f.run())[0]!.state).toBe('response-obtained')
+  })
+
+  test('journalのagent未指定とchildのpath欠落が一致しても回答を選ばない', async () => {
+    const f = fixture()
+    const duplicate = structuredClone(f.children[0]!)
+    duplicate.id = 'duplicate-thread'
+    Reflect.deleteProperty(duplicate.source.subAgent.thread_spawn, 'agent_path')
+    f.children.push(duplicate)
+    const evidence = [{ ...rounds[0]!, native: rounds[0]!.native.map(entry => ({
+      ...entry, agentId: undefined,
+    })) }]
+    expect((await f.run([], evidence))[0]!.state).toBe('start-unconfirmed')
+  })
+
+  test('複数回答がある場合はjournalで選択した物理agentだけを回収する', async () => {
+    const f = fixture()
+    f.children.push({ ...f.children[0]!, id: 'retry-thread' })
+    const evidence = [{ ...rounds[0]!, native: rounds[0]!.native.map(entry => ({
+      ...entry, agentId: entry.perspective === 'solution' ? 'retry-thread' : entry.agentId,
+    })) }]
+    expect((await f.run([], evidence))[0]!.threadId).toBe('retry-thread')
+  })
+
   test('phase省略/nullの公式最終回答にも対応し、commentaryとの区別を保つ', async () => {
     for (const phase of [undefined, null]) {
       const f = fixture()

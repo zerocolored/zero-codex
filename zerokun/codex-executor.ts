@@ -2059,7 +2059,7 @@ function collectNativeAdvisorJournalEvidence(options: {
     for (const journalEntry of journalEntries) {
       // Response bodies are broker-owned retry data, not native-history
       // evidence. Never parse them as a round journal or expose their content.
-      if (/^(investigation|design|review)-[123]\.json\.responses$/.test(journalEntry.name)
+      if (/^(investigation|design|review)-[123]\.json\.(responses|slots)$/.test(journalEntry.name)
         && journalEntry.isFile() && !journalEntry.isSymbolicLink()) continue
       const journalMatch = /^(investigation|design|review)-([123])\.json$/.exec(journalEntry.name)
       if (!journalMatch || !journalEntry.isFile() || journalEntry.isSymbolicLink()) {
@@ -3762,7 +3762,7 @@ export function buildCodexDeveloperInstructions(
         '',
         'A narrow zerokun_advisors transport is available for advisor consultations required by',
         'the applicable AGENTS.md. Keep one primary Codex workflow: the transport starts external',
-        'reviewers but never selects work phases, blocks implementation, or publishes changes.',
+        'reviewers but never selects work phases or publishes changes; required answers must be obtained before proceeding.',
         'For the single combined initial-design consultation use advisor_round phase=investigation',
         'round=1. For post-implementation final review round 1 use phase=review round=1. Only when',
         'you adopt at least one round-1 mandatory finding and implement a non-empty task-owned fix',
@@ -3780,8 +3780,14 @@ export function buildCodexDeveloperInstructions(
         'agent ID to advisor_round. If the native slot did',
         'not start or started without an answer, pass adopted=false, started=false or true, and a',
         'concise reason. Poll advisor_round_poll one call at a time until it returns a terminal',
-        'receipt. Missing reviewer answers are warnings, not a quorum gate: report the missing advisor and cause,',
-        'retain work and continue with available evidence and your own assessment. Do not retry only to fill missing slots.',
+        'receipt. All three real answers are required before this design or review is complete.',
+        'This explicit required-response policy overrides best-effort advisor guidance in repository instructions.',
+        'For failure diagnostics only, name GPT, Grok or Claude Code and its safe cause in Slack; omit secrets and internal paths.',
+        'If any answer is missing, report the named cause to Slack. Preserve obtained answers and retry',
+        'only the missing slot with retryUnavailable=true and the same phase/round/input binding after nextRetryAt.',
+        'A missing native answer requires retrying that native slot with the same model and marker; reuse successful native answers.',
+        'The broker automatically retries contained transient external failures with backoff. Authentication or persistent',
+        'configuration failures require a concrete recovery action and task goal blocked; never claim completion with missing answers.',
         'Never inspect or invoke Grok, Claude, Herdr, their authentication, helper files, sockets,',
         'or processes directly; zerokun_advisors is the only external-advisor route.',
         'When reporting advisor coverage, use only the returned slotSummary. requested/total means',
@@ -3793,7 +3799,8 @@ export function buildCodexDeveloperInstructions(
         '',
         'The external advisor transport is unavailable in this process. Do not inspect or invoke',
         'Grok, Claude, Herdr, their authentication, helper files, sockets, or processes directly.',
-        'Continue the primary task and never describe an external reviewer as attempted or started.',
+        'If design or review is required, report that the advisor transport needs recovery and keep the task blocked.',
+        'Never describe an external reviewer as attempted, started, or completed without evidence.',
       ].join('\n')
   if (job.writeEnabled) {
     const protocol = [
@@ -3971,18 +3978,19 @@ export function buildCodexWorkerPrompt(
       'unavailability, and infrastructure failures do not trigger round 2. Never call round 3 or',
       'the legacy design phase. A completed logical round is attempt-wide and is not rerun when',
       'Slack input is added or the Codex turn is steered. An interrupted round with attemptsFinished=true',
-      'is terminal: do not poll or restart it to recover missing slots. Preserve obtained answers and continue the task.',
+      'has ended its process attempts, not its required review. Preserve answers and retry missing slots using the same binding.',
       'For investigation, spawn exactly one solution_analyst with model=gpt-6-astra,',
       'reasoning_effort=medium, and fork_turns=none. For each review round, spawn exactly one fresh',
       'risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none. Do not',
       'substitute a different model and do not add another native slot.',
       `That native advisor response must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|review>:<1|2>:<solution|risk>] after replacing phase, round, and perspective.`,
       'For an unavailable native slot, send adopted=false, an exact started boolean, and a concise',
-      'reason. Each advisor is best-effort; zero obtained answers is not a task blocker.',
-      'After the bounded attempts finish, report unavailable advisors and their named causes, then',
-      'continue the task using obtained evidence and your own assessment. Never invent missing answers.',
-      'Do not mark the task goal blocked, wait for user recovery, restart a slot, or add a round solely',
-      'because an advisor is unavailable. An actual task blocker or required user decision remains separate.',
+      'reason. All three real answers are mandatory for design/review completion. Never invent missing answers.',
+      'If a native answer is missing, retry only that native slot using the same required model and marker.',
+      'Report missing advisors and causes to Slack, preserve successful answers, and call advisor_round with',
+      'retryUnavailable=true after nextRetryAt for the same phase/round/input binding. Never poll a terminal result in a tight loop.',
+      'Authentication or persistent configuration failures require a concrete recovery action and task goal blocked.',
+      'Do not proceed past design/review or claim task completion until all three answers are obtained.',
       'Preserve completed work and answers. Changed requirements still need your assessment; old advice',
       'must not be treated as approval for a different request.',
       'Base any advisor-count statement only on slotSummary returned by the broker. Never call all',
@@ -3992,6 +4000,7 @@ export function buildCodexWorkerPrompt(
     control.push(
       'Advisor transport: unavailable. Do not access external reviewer files or tools directly,',
       'and do not claim that an external reviewer was attempted or started.',
+      'If design or review is required, report the missing transport and keep the task blocked until recovery.',
     )
   }
   if (!job.writeEnabled) {

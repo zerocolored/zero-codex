@@ -104,6 +104,7 @@ import {
   type AdvisorPhase,
 } from './advisor-journal.ts'
 import { persistAdvisorClaudeCleanupOutcome, retireAdvisorClaudeCleanupOutcome } from './advisor-round-recovery.ts'
+import { recoverAdvisorSlot } from './advisor-retry.ts'
 
 export type FifthAdvisorSendOutcome =
   | { kind: 'unconfirmed' }
@@ -1232,8 +1233,10 @@ export function advisorReceiptAlreadyObserved(input: {
   slotSummary: ReturnType<typeof summarizeAdvisorSlots>
 }): Record<string, unknown> {
   return {
-    complete: true,
+    complete: input.slotSummary.total > 0 && input.slotSummary.responsesObtained === input.slotSummary.total,
     alreadyObserved: true,
+    waitingForAdvisors: input.slotSummary.responsesObtained < input.slotSummary.total,
+    nextAction: '回答不足なら取得済み回答を保持し、同じbindingでadvisor_round(retryUnavailable=true)を呼んで欠員だけを復旧してください。',
     phase: input.phase,
     round: input.round,
     inputRevision: input.inputRevision,
@@ -1248,8 +1251,8 @@ export function allAdvisorAttemptsAdopted(
   grok: ReadonlyArray<{ adopted?: boolean }>,
   claude: { adopted?: boolean },
 ): boolean {
-  return native.every(result => result.adopted !== false)
-    && grok.every(result => result.adopted === true)
+  return native.length > 0 && native.every(result => result.adopted === true)
+    && grok.length > 0 && grok.every(result => result.adopted === true)
     && claude.adopted === true
 }
 
@@ -2143,9 +2146,7 @@ async function main(): Promise<void> {
             cleanupReceiptDigest,
             promptMayHaveBeenDelivered: Boolean(marker),
           })
-          if (cleanupStatus !== 'provisional-workspace-not-created') {
-            removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
-          }
+          removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
         } catch (error) {
           // The exact workspace/process cleanup receipt was already verified.
           // A later journal/tombstone removal failure is bounded residue, not
@@ -2224,8 +2225,8 @@ async function main(): Promise<void> {
     }),
   ])
   const advisorRoundInputSchema = {
-    retryUnavailable: z.boolean().optional().describe('Legacy compatibility only; finished slots are not restarted.'),
-    inputUpdateIsRecoveryOnly: z.boolean().optional().describe('Legacy compatibility only; does not authorize another advisor attempt.'),
+    retryUnavailable: z.boolean().optional().describe('Retry only missing answers in this same round, preserving adopted answers. Wait for nextRetryAt first.'),
+    inputUpdateIsRecoveryOnly: z.boolean().optional().describe('True only when newer Slack input resolves the failure without changing the reviewed request.'),
     phase: completeWorkflow
       ? z.enum(['investigation', 'review'])
       : z.enum(['investigation', 'design', 'review']),
@@ -2370,10 +2371,11 @@ async function main(): Promise<void> {
       : []
     return toolText({
       complete: false,
-      waitingForAdvisors: false,
+      waitingForAdvisors: true,
       recoveredAfterInterruption: true,
       attemptsFinished: true,
-      nextAction: '中断前のadvisor試行は終了しています。欠員と取得済み証拠を明示し、主担当の判断で本作業を継続してください。同じ枠の再起動や追加pollは不要です。',
+      nextRetryAt: Number(journal.finishedAt) + 30_000,
+      nextAction: '中断前の試行は終了しましたが回答は不足しています。取得済み回答を保持し、nextRetryAt以降に同じbindingでadvisor_round(retryUnavailable=true)を呼び、未取得枠だけ再開してください。',
       inputRevision: input.revision,
       inputDigest: input.digest,
       inputUnchanged: true,
@@ -2404,9 +2406,6 @@ async function main(): Promise<void> {
   }, async ({
     phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis, retryUnavailable, inputUpdateIsRecoveryOnly,
   }) => {
-    // Accept the legacy argument for old sessions, but never restart a
-    // finished advisor slot merely to fill a response quorum.
-    retryUnavailable = false
     if (phaseScope === 'prepare' && phase === 'review') {
       return toolText({ complete: false, reason: 'review is unavailable in the pre-edit process' }, true)
     }
@@ -2451,6 +2450,9 @@ async function main(): Promise<void> {
       grok: Array<Record<string, unknown>>, claude: Record<string, unknown>,
       native: Array<Record<string, unknown>>, evidenceDigest: string,
       responseCacheDigest?: string,
+      retryCount?: number,
+      recoveryInputRevision?: number,
+      recoveryInputDigest?: string,
     } | undefined
     let retryBackoff = false
     if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
@@ -2460,8 +2462,22 @@ async function main(): Promise<void> {
         try {
           const saved = JSON.parse(raw)
           const durable = JSON.parse(readOptionalPrivateFile(retryPath.slice(0, -10)) ?? '{}')
+          const missing = [...(saved.native ?? []), ...(saved.grok ?? []), saved.claude ?? {}]
+            .filter(slot => slot.adopted !== true)
+          const manualRecovery = missing.some(slot => ['authentication', 'workspace'].includes(
+            String(slot.failure?.cause ?? classifyAdvisorFailure('claude', String(slot.reason ?? '')).cause)))
+          const recoveryInput = inputUpdateIsRecoveryOnly === true
+            && input.revision > Math.max(inputRevision, Number(saved.recoveryInputRevision ?? 0))
+          if (durable.recoveredAfterInterruption !== true
+            && (manualRecovery || Number(saved.retryCount ?? 0) >= 3) && !recoveryInput) {
+            return toolText({ complete: false, waitingForAdvisors: true, retryable: false,
+              humanActionRequired: manualRecovery, retryBudgetExhausted: Number(saved.retryCount ?? 0) >= 3,
+              reason: manualRecovery ? '認証または作業設定の復旧が必要です。原因を通知し、復旧後の入力で不足枠だけ再開してください。'
+                : '一時障害の再試行後も回答が不足しています。原因を通知して待機し、復旧後に同じroundを再開してください。',
+            }, true)
+          }
           retryBackoff = Date.now() - Number(saved.finishedAt) < 30_000
-          if (saved.complete === false && saved.contextDigest === contextDigest
+          if (!allAdvisorAttemptsAdopted(saved.native ?? [], saved.grok ?? [], saved.claude ?? {}) && saved.contextDigest === contextDigest
             && durable.responseCacheDigest === createHash('sha256').update(raw).digest('hex')
             && saved.inputRevision === inputRevision && saved.inputDigest === inputDigest
             && saved.phase === phase && saved.round === round
@@ -2470,13 +2486,15 @@ async function main(): Promise<void> {
             && saved.claude?.containmentVerified === true
             && durable.claude?.containmentVerified === true
             && saved.grok?.every((slot: Record<string, unknown>) => slot.containmentVerified === true)) {
-            retryResult = { ...saved, claude: { ...saved.claude,
+            retryResult = { ...saved, retryCount: recoveryInput ? 0 : Number(saved.retryCount ?? 0) + 1,
+              ...(recoveryInput ? { recoveryInputRevision: input.revision, recoveryInputDigest: input.digest } : {}),
+              claude: { ...saved.claude,
               cleanupReceiptDigest: durable.claude.cleanupReceiptDigest,
             }, responseCacheDigest: durable.responseCacheDigest }
           }
         } catch {}
       }
-      if (!raw) {
+      {
         const recovered = recoveredRoundResult({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3, inputUpdateIsRecoveryOnly === true)
         const journal = readTerminalJournal({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3, 'required-reviewer-failed')
           ?? (inputUpdateIsRecoveryOnly === true
@@ -2487,14 +2505,41 @@ async function main(): Promise<void> {
         }
         if (recovered && journal && claude?.containmentVerified === true
           && Date.now() - Number(journal.finishedAt) >= 30_000) {
-          // No response text survived the interrupted first attempt. Keep the
-          // native answer binding, but obtain external answers afresh.
-          retryResult = { native: journal.native as Array<Record<string, unknown>>,
-            grok: [], claude, evidenceDigest: String(journal.primaryEvidenceDigest) }
+          retryResult ??= { native: journal.native as Array<Record<string, unknown>>,
+            grok: [], claude, evidenceDigest: String(journal.primaryEvidenceDigest),
+            retryCount: Number(journal.retryCount ?? 0) + 1,
+            recoveryInputRevision: Number(journal.recoveryInputRevision ?? 0),
+            recoveryInputDigest: String(journal.recoveryInputDigest ?? ''),
+          }
+          if (inputUpdateIsRecoveryOnly === true
+            && input.revision > Math.max(inputRevision,
+              Number(retryResult.recoveryInputRevision ?? 0), Number(journal.recoveryInputRevision ?? 0))) {
+            retryResult.retryCount = 0
+            retryResult.recoveryInputRevision = input.revision
+            retryResult.recoveryInputDigest = input.digest
+          }
+          // Each external answer is persisted immediately, independently of
+          // its peer. Reuse it after the old generation has been retired.
+          const slotsRaw = readOptionalPrivateFile(`${roundJournalPath({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3)}.slots`)
+          if (slotsRaw && Buffer.byteLength(slotsRaw) <= 2 * 1024 * 1024) {
+            try {
+              const slots = JSON.parse(slotsRaw)
+              if (slots.contextDigest === contextDigest && slots.phase === phase && slots.round === round
+                && slots.inputRevision === inputRevision && slots.inputDigest === inputDigest
+                && slots.evidenceDigest === retryResult.evidenceDigest) {
+                if (Array.isArray(slots.grok) && slots.grok.length === 1
+                  && slots.grok[0].adopted === true && slots.grok[0].containmentVerified === true
+                  && typeof slots.grok[0].response === 'string' && slots.grok[0].response.trim()) retryResult.grok = slots.grok
+                if (slots.claude?.adopted === true && slots.claude.containmentVerified === true
+                  && typeof slots.claude.response === 'string' && slots.claude.response.trim()) retryResult.claude = slots.claude
+              }
+            } catch {}
+          }
         }
       }
       if (!retryResult) return toolText({ complete: false, waitingForAdvisors: true,
         retryable: retryBackoff,
+        nextRetryAt: Date.now() + 30_000,
         reason: retryBackoff
           ? 'Advisor retry backoff: wait at least 30 seconds after the last attempt.'
           : 'Saved advisor responses are not available for this retry. Report the missing advisor and dependency; preserve the work. Do not repeat this retry unchanged.',
@@ -2581,7 +2626,9 @@ async function main(): Promise<void> {
         }
         if (prior.terminal) {
           return toolText({
-            complete: prior.status !== 'stale-input',
+            complete: prior.status !== 'stale-input' && journalSlotSummary(prior.terminal).responsesObtained === journalSlotSummary(prior.terminal).total,
+            waitingForAdvisors: journalSlotSummary(prior.terminal).responsesObtained < journalSlotSummary(prior.terminal).total,
+            nextAction: '不足枠だけを同じ返却bindingのretryUnavailable=trueで復旧してください。',
             reusedPriorPhase: true,
             phase,
             round,
@@ -2618,7 +2665,8 @@ async function main(): Promise<void> {
             reason: 'the attempt-wide initial-design advisor phase is still active',
           })
         }
-        if (!investigation.entries[0]!.terminal) {
+        if (!investigation.entries[0]!.terminal
+          || journalSlotSummary(investigation.entries[0]!.terminal!).responsesObtained !== journalSlotSummary(investigation.entries[0]!.terminal!).total) {
           return toolText({
             complete: false,
             uncertain: true,
@@ -2906,9 +2954,9 @@ async function main(): Promise<void> {
     } catch (error) {
       return toolText({ complete: false, reason: String(error) }, true)
     }
-    if (retryResult && retryResult.native.some((saved, index) => saved.adopted === true
+    if (retryResult && retryResult.native.some(saved => saved.adopted === true
       && ['agentId', 'responseDigest', 'responseTransportDigest'].some(key =>
-        saved[key] !== (nativeEvidence[index] as Record<string, unknown> | undefined)?.[key]))) {
+        saved[key] !== (nativeEvidence.find(value => value.perspective === saved.perspective) as Record<string, unknown> | undefined)?.[key]))) {
       return toolText({ complete: false, reason: 'Reuse the already obtained native advisor answer for this round.' }, true)
     }
     if (activeRoundKeys.size > 0) {
@@ -3070,6 +3118,8 @@ async function main(): Promise<void> {
       const current = readOptionalPrivateFile(journalPath)
       const currentStatus = current ? String(JSON.parse(current).status) : ''
       if (!current || !(currentStatus === 'required-reviewer-failed'
+        || (['completed', 'reviewers-completed'].includes(currentStatus)
+          && journalSlotSummary(JSON.parse(current)).responsesObtained < journalSlotSummary(JSON.parse(current)).total)
         || (currentStatus === 'stale-input' && inputUpdateIsRecoveryOnly === true))) {
         return toolText({ complete: false, waitingForAdvisors: true, reason: 'Advisor round changed before retry.' }, true)
       }
@@ -3087,6 +3137,9 @@ async function main(): Promise<void> {
       }
       atomicWritePrivateFile(journalPath, `${JSON.stringify({ ...requestedJournal,
         responseCacheDigest: retryResult.responseCacheDigest,
+        retryCount: retryResult.retryCount,
+        recoveryInputRevision: retryResult.recoveryInputRevision,
+        recoveryInputDigest: retryResult.recoveryInputDigest,
         grok: JSON.parse(current).grok,
       })}\n`)
     } else if (!createExclusivePrivateFile(journalPath, `${JSON.stringify(requestedJournal)}\n`)) {
@@ -3098,11 +3151,40 @@ async function main(): Promise<void> {
     }
     let retryRepositoryDigest: string | undefined
     try { retryRepositoryDigest = advisorRepositoryDigest(snapshotAdvisorRepository(projectLayout)) } catch {}
-    const grokPromise = retryResult?.grok?.length && retryResult.grok.every((slot: Record<string, unknown>) => slot.adopted === true)
-      ? Promise.resolve(retryResult.grok) : runGrokPanel(boundInput, phase, round, evidence)
-    const claudePromise = retryResult?.claude?.adopted === true
-      ? Promise.resolve(retryResult.claude) : runClaude(boundInput, phase, round as 1 | 2 | 3, evidence)
-    const [grok, claude] = await Promise.all([grokPromise, claudePromise])
+    const savedSlots: { grok?: Array<Record<string, unknown>>, claude?: Record<string, unknown> } = {
+      ...(retryResult?.grok?.[0]?.adopted === true ? { grok: retryResult.grok } : {}),
+      ...(retryResult?.claude?.adopted === true ? { claude: retryResult.claude } : {}),
+    }
+    const persistSlot = (kind: 'grok' | 'claude', value: Record<string, unknown>) => {
+      if (kind === 'grok') savedSlots.grok = [value]
+      else savedSlots.claude = value
+      atomicWritePrivateFile(`${journalPath}.slots`, JSON.stringify({
+        contextDigest, phase, round, inputRevision: boundInput.revision,
+        inputDigest: boundInput.digest, evidenceDigest, native: nativeEvidence,
+        ...savedSlots,
+      }))
+    }
+    const grokPromise = recoverAdvisorSlot({
+      advisor: 'grok', saved: retryResult?.grok?.[0]?.adopted === true ? retryResult.grok[0] : undefined,
+      ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
+      run: async () => (await runGrokPanel(boundInput, phase, round, evidence))[0]!,
+      persist: result => persistSlot('grok', result),
+    }).then(result => [result])
+    const claudePromise = recoverAdvisorSlot({
+      advisor: 'claude', saved: retryResult?.claude?.adopted === true ? retryResult.claude : undefined,
+      ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
+      run: () => runClaude(boundInput, phase, round as 1 | 2 | 3, evidence),
+      persist: result => persistSlot('claude', result),
+      beforeRetry: result => retireAdvisorClaudeCleanupOutcome(stateDir, {
+        jobId: context.jobId, attemptNonce: context.attemptNonce,
+        inputRevision: boundInput.revision, inputDigest: boundInput.digest, phase, round: round as 1 | 2 | 3,
+      }, result.cleanupReceiptDigest),
+    })
+    const outcomes = await Promise.allSettled([grokPromise, claudePromise])
+    if (outcomes[0].status === 'rejected') throw outcomes[0].reason
+    if (outcomes[1].status === 'rejected') throw outcomes[1].reason
+    const grok = outcomes[0].value
+    const claude = outcomes[1].value
     if (phaseScope === 'complete' && context.writeEnabled
       && phase === 'review' && round === 1) {
       try {
@@ -3206,14 +3288,16 @@ async function main(): Promise<void> {
     )
     const complete = inputUnchanged && roundTwoRepositoryStable
       && (phaseScope === 'complete' || repositoryUnchanged)
-      // Completion records bounded attempts, not a response quorum. Keep
-      // adoption and unavailable reasons separate from task continuation.
+      && allAdvisorAttemptsAdopted(nativeEvidence, grokJournal, claudeJournal)
       && validThreeAdvisorNativeAttempts(nativeEvidence, phase)
       && validThreeAdvisorGrokAttempts(grokJournal, phase)
       && validTerminalClaudeAttempt(claudeJournal)
     const finishedAt = Date.now()
     const responseCache = JSON.stringify({
       contextDigest, phase, round, complete, finishedAt, retryRepositoryDigest, evidenceDigest,
+      retryCount: retryResult?.retryCount ?? 0,
+      recoveryInputRevision: retryResult?.recoveryInputRevision,
+      recoveryInputDigest: retryResult?.recoveryInputDigest,
       inputRevision: boundInput.revision, inputDigest: boundInput.digest,
       native: nativeEvidence, grok, claude,
     })
@@ -3270,15 +3354,16 @@ async function main(): Promise<void> {
       ...(phase === 'review' && round === 2
         ? { repositoryDeltaStable: roundTwoRepositoryStable }
         : {}),
-      allAdopted: allAdvisorAttemptsAdopted(nativeAdvisors, grok, claude),
-      ...(!allAdvisorAttemptsAdopted(nativeAdvisors, grok, claude) ? {
+      allAdopted: allAdvisorAttemptsAdopted(nativeEvidence, grok, claude),
+      ...(!allAdvisorAttemptsAdopted(nativeEvidence, grok, claude) ? {
         advisorUnavailable: unavailableAdvisorReasons(
           nativeAdvisors as Array<Record<string, unknown>>,
           grok as Array<Record<string, unknown>>,
           claude as Record<string, unknown>,
         ),
-        waitingForAdvisors: false,
-        nextAction: '各枠の試行は終了しました。取得できなかった回答と原因を明示し、取得済みの証拠と主担当の判断で本作業を継続してください。欠員だけを理由に待機・再試行・追加roundを行わないでください。',
+        waitingForAdvisors: true,
+        nextRetryAt: finishedAt + 30_000,
+        nextAction: '3者の有効な回答が揃うまで設計・レビューは未完了です。原因をSlackへ報告し、取得済み回答を保持してください。一時障害はnextRetryAt以降に同じbindingのretryUnavailable=trueで未取得枠だけ再試行し、認証など人の操作が必要な場合は具体的な操作を案内して待機してください。',
       } : {}),
       slotSummary,
       grok,

@@ -23,10 +23,10 @@ test('ホスト通知は未回収Claudeを明記し内部診断を公開しな�
     failures: [{ advisor: 'claude', cause: 'startup' }],
   }] }
   const result = enforceHostAdvisorCoverage('暫定の調査内容。', coverage, 'result')
-  expect(result).not.toContain('設計・レビューは未完了')
+  expect(result).toContain('設計・レビューは未完了')
   expect(result).toContain('Claude Code: 起動または依頼送信に失敗しました。')
-  expect(result).toContain('取得済みの回答と主担当の確認')
-  expect(result).not.toContain('再開を依頼')
+  expect(result).toContain('取得済みの回答と作業は保持')
+  expect(result).toContain('再開を依頼')
   expect(result).toContain('暫定の調査内容。')
   expect(result).not.toContain('process_identity')
 })
