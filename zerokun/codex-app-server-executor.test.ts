@@ -15,6 +15,9 @@ import { homedir } from 'os'
 import { dirname, join } from 'path'
 import {
   JobStore,
+  SlackNotifier,
+  finalizeSuccessfulExecution,
+  extractArtifactPaths,
   createExecutorPidLifecycle,
   publishStagedGitHubPublication,
   runQueuedJobs,
@@ -35,6 +38,7 @@ import {
 } from './publication-continuation.ts'
 import {
   CodexCleanupPendingError,
+  artifactDirForJob,
   CodexPublicationPreflightRetryError,
   CodexRateLimitError,
   CodexUserCancelledError,
@@ -339,7 +343,7 @@ def observe_emission(value):
             persisted_items.setdefault(observed_turn_id, []).append(observed_item)
     elif method == "turn/completed":
         if goal_status == "active":
-            goal_status = "blocked" if mode == "goal-blocked" else "complete"
+            goal_status = os.environ.get("ZERO_PROPOSAL_GOAL", "blocked") if mode in ("goal-blocked", "goal-proposal") else "complete"
         observed_turn = params.get("turn", {})
         observed_turn_id = observed_turn.get("id")
         terminal_items = observed_turn.get("items", [])
@@ -484,7 +488,16 @@ for line in sys.stdin:
             while not os.path.exists(turn_latch_release):
                 time.sleep(0.01)
         fixture_state = os.environ.get("ZERO_INTERJECTION_FIXTURE_STATE")
-        if mode == "goal-native":
+        if mode == "goal-proposal":
+            proposal = "比較案です。この方向で本実装してよいですか？\\n<zerokun_files>" + os.environ["ZERO_PROPOSAL_FILES"] + "</zerokun_files>"
+            emit_batch([
+                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": proposal}], "error": None}}},
+                {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": []}}},
+                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "summary" if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else "full", "items": [] if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else [{"type": "agentMessage", "text": "承認待ちです"}], "error": None}}},
+                {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "inProgress", "itemsView": "full", "items": []}}},
+                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "保持して待機しました"}], "error": None}}},
+            ])
+        elif mode == "goal-native":
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "interim", "text": "残タスクがあります"}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": [], "error": None}}},
@@ -972,7 +985,7 @@ function fixture(
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
-    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked'
+    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked' | 'goal-proposal'
     | 'error-steer' | 'rate-error' | 'rate-terminal-only' | 'rate-retrying' | 'rate-retrying-two-turn'
     | 'capacity-error'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
@@ -2246,6 +2259,57 @@ describe('production App Server executor', () => {
     })
     value.store.close()
   }, 30_000)
+
+  for (const goalStatus of ['blocked', 'paused'] as const) {
+  test(`提案後2回native継続しても画像2件をSlackへ届けた後に承認質問を投稿する ${goalStatus}`, async () => {
+    const value = fixture('goal-proposal')
+    try {
+      const outbox = artifactDirForJob(value.state, value.job.id)
+      mkdirSync(outbox, { recursive: true, mode: 0o700 })
+      const files = ['before.png', 'after.png'].map(name => join(outbox, name))
+      const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
+      for (const file of files) writeFileSync(file, png)
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-proposal', ZERO_PROPOSAL_FILES: JSON.stringify(files),
+          ZERO_PROPOSAL_GOAL: goalStatus, ...(goalStatus === 'paused' ? { ZERO_PROPOSAL_TOOL_ONLY: '1' } : {}) },
+        finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+      })
+      expect(result.taskGoalStatus).toBe(goalStatus)
+      expect(result.result).toContain('この方向で本実装してよいですか')
+      const output = extractArtifactPaths(result.result)
+      expect(output.files).toHaveLength(2)
+      value.store.complete(value.job.id, result.sessionId, result.result)
+      const notification = value.store.pendingTerminalNotifications()[0]!
+      const events: string[] = []
+      let target = 0
+      let loseSecondUploadResponse = true
+      const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+        requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: `F${++target}` }),
+        uploadBytes: async (_url, _bytes, commit) => { commit() },
+        completeUpload: async ({ fileId }) => {
+          events.push(fileId)
+          if (fileId === 'F2' && loseSecondUploadResponse) {
+            loseSecondUploadResponse = false
+            throw new Error('upload response lost')
+          }
+        },
+        inspectUpload: async () => true,
+        postMessage: async ({ text }) => { events.push('body'); expect(text).toContain('この方向で本実装してよいですか'); return { messageId: '123.456' } },
+      })
+      await expect(notifier.completed({ ...value.job, taskGoalStatus: goalStatus }, result.result, notification.id))
+        .rejects.toThrow('artifact upload result is ambiguous')
+      expect(events).toEqual(['F1', 'F2'])
+      expect(value.store.terminalNotificationBodyDelivered(notification.id)).toBe(false)
+      await notifier.completed({ ...value.job, taskGoalStatus: goalStatus }, result.result, notification.id)
+      expect(events).toEqual(['F1', 'F2', 'body'])
+      for (const file of output.files) expect(value.store.artifactDeliveryState(value.job.id, file)).toBe('delivered')
+      await notifier.completed({ ...value.job, taskGoalStatus: goalStatus }, result.result, notification.id)
+      expect(events).toEqual(['F1', 'F2', 'body'])
+    } finally { value.store.close() }
+  }, 30_000)
+  }
 
   for (const mode of ['goal-native', 'goal-blocked'] as const) {
     test(`native goal lifecycle ${mode}`, async () => {
