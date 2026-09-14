@@ -3967,6 +3967,10 @@ export function buildCodexWorkerPrompt(
   if (host.advisorEnabled) {
     control.push(
       'Advisor transport: zerokun_advisors is the only permitted route for external reviewers.',
+      'Conversation resumption preserves prior work and context, but a new attempt can have no advisor ledger yet.',
+      'If advisor_round or advisor_round_poll returns notStarted=true, use its current binding to start advisor_round',
+      'with retryUnavailable=false. This is normal initialization, not corruption or a reason to block for an administrator.',
+      'Never promote historical answers into current approvals merely by replacing their binding markers.',
       'When the applicable AGENTS.md requires the combined initial-design Three-Advisor panel, use',
       'advisor_round with phase=investigation and round=1. For a required final review after',
       'implementation, use phase=review and round=1. Only if you adopt a round-1 mandatory finding',
