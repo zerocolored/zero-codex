@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { execFileSync } from 'child_process'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { JobStore } from './job-runner.ts'
@@ -124,6 +124,7 @@ test('new cloud preparation and multi-repo import both pin the execution parent'
     git(repo, 'init', '-b', 'main', '--quiet')
     writeFileSync(join(repo, 'file.txt'), 'base'); git(repo, 'add', '.'); git(repo, 'commit', '--quiet', '-m', 'base')
     git(repo, 'remote', 'add', 'origin', repo)
+    writeFileSync(join(repo, '.env.keys'), `synthetic-A-${name}`, { mode: 0o600 })
   }
   const stateA = join(root, 'A'), stateB = join(root, 'B')
   const a = new JobStore(join(stateA, 'jobs.sqlite3')), b = new JobStore(join(stateB, 'jobs.sqlite3'))
@@ -136,6 +137,16 @@ test('new cloud preparation and multi-repo import both pin the execution parent'
     await runtimeA.prepare(job)
     const execution = runtimeA.executionJob(job)
     expect(resolveProjectLayout(execution.repoPath).pinned).toBe(true)
+    expect(execution.task).toContain('dotenvx run --strict')
+    expect(execution.task).not.toContain('synthetic-A')
+    for (const name of ['back', 'front']) {
+      const key = join(execution.repoPath, name, '.env.keys')
+      expect(readFileSync(key, 'utf8')).toBe(`synthetic-A-${name}`)
+      // Existing pre-fix workspaces are repaired without creating a new session.
+      rmSync(key)
+    }
+    runtimeA.executionJob(job)
+    for (const name of ['back', 'front']) expect(readFileSync(join(execution.repoPath, name, '.env.keys'), 'utf8')).toBe(`synthetic-A-${name}`)
     for (const name of ['back', 'front']) {
       // Handoff remote identity is public HTTPS; all transfers still use the
       // already present local fixture objects, never GitHub or cloud network.
@@ -144,12 +155,20 @@ test('new cloud preparation and multi-repo import both pin the execution parent'
       writeFileSync(join(execution.repoPath, name, 'file.txt'), 'unfinished work')
     }
     await runtimeA.pause(job, undefined)
+    expect(Buffer.from(cloud.bytes).toString()).not.toContain('synthetic-A')
+    expect(Buffer.from(cloud.bytes).toString()).not.toContain('.env.keys')
+    for (const name of ['back', 'front']) expect(Buffer.from(cloud.bytes).toString()).not.toContain(Buffer.from(`synthetic-A-${name}`).toString('base64'))
+    // Model the receiving PC's own keys; A's workspace retains its local copy.
+    for (const name of ['back', 'front']) writeFileSync(join(source, name, '.env.keys'), `synthetic-B-${name}`)
+    renameSync(join(source, 'back'), join(source, 'backend-on-another-PC'))
     const control = { channel: 'C1', thread: '1.0', message: '2.0', user: 'U1', bot: 'UB', project: source,
       writeEnabled: true, action: 'handoff' as const }
     await runtimeB.receive(control)
     await runtimeB.receive(control)
     const imported = runtimeB.executionJob(b.claimNext('worker-B')!)
     expect(resolveProjectLayout(imported.repoPath).pinned).toBe(true)
+    for (const name of ['back', 'front']) expect(readFileSync(join(imported.repoPath, name, '.env.keys'), 'utf8')).toBe(`synthetic-B-${name}`)
+    expect(Buffer.from(cloud.bytes).toString()).not.toContain('synthetic-B')
     const request = join(root, 'snapshot'); mkdirSync(request, { mode: 0o700 })
     const result = Bun.spawnSync(['/usr/bin/python3', join(import.meta.dir, 'fifth-advisor.py'), 'snapshot',
       '--project-root', imported.repoPath, '--request-dir', request], { stdout: 'pipe', stderr: 'pipe' })

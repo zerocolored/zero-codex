@@ -7,6 +7,7 @@ import { CloudCheckpointBlockedError, HandoffCoordinator, writeCheckpoint } from
 import { captureAttachment, captureRepository, restoreRepository, type HandoffPackage } from './handoff-package.ts'
 import { ensureWorkspacePin, resolveProjectLayout } from './project-layout.ts'
 import type { JobRecord, JobStore } from './job-runner.ts'
+import { localRepositoryIdentity, provisionLocalWorkspaceSettings } from './local-workspace-settings.ts'
 
 type Workspace = { epoch: number; project: string; repositories: Array<{ root: string; name: string; base: string }> }
 export type CloudControl = { channel: string; thread: string; message: string; user: string;
@@ -106,9 +107,34 @@ export class CloudRuntime {
     const resumed = job.resumed && job.sessionId !== null
       && this.store.sessionWorkspace(job.sessionId) === repoPath
     if (job.sessionId !== null && !resumed) this.store.clearSession(job.id)
+    // Runs on every dispatch, including legacy workspace reuse and imports.
+    // Never persist host credentials or source paths in cloud workspace receipts.
+    const settings: string[] = []
+    try {
+      const sources = new Map<string, string>()
+      for (const root of resolveProjectLayout(job.repoPath).gitRoots) {
+        try { sources.set(localRepositoryIdentity(root), root) } catch { /* no configured origin */ }
+      }
+      for (const repository of workspace.repositories) {
+        let status = 'unavailable'
+        try {
+          const source = sources.get(localRepositoryIdentity(repository.root))
+          if (source) status = provisionLocalWorkspaceSettings(source, repository.root)
+        } catch { /* an unrelated member must not prevent the others from preparing */ }
+        settings.push(`${repository.name}: ${status}`)
+      }
+    } catch { settings.push('local settings unavailable') }
+    const settingsInstructions = '\n\n# Host-local environment settings\n'
+      + settings.join('\n')
+      + '\nOnly this PC\'s .env.keys is provisioned locally; it is never uploaded. Existing workspace keys are preserved. '
+      + 'Ready means a local file exists, not that decryption or API authentication succeeded. '
+      + 'For dotenvx projects, use dotenvx run --strict for commands requiring decrypted settings; verify required variables without printing their values before API calls. '
+      + 'MISSING_PRIVATE_KEY or decryption failure is local configuration failure, not evidence of API key expiry. '
+      + 'Do not call authenticated APIs with absent or still-encrypted credentials, request key rotation, read keys into the conversation, or bypass strict loading. '
+      + 'Missing/unavailable settings do not prevent unrelated local investigation; report the concrete local configuration requirement if needed.\n'
     return { ...job, historyRepoPath: job.repoPath,
       repoPath, resumed, sessionId: resumed ? job.sessionId : null,
-      task: job.task + CONTINUATION_INSTRUCTIONS,
+      task: job.task + CONTINUATION_INSTRUCTIONS + settingsInstructions,
       attachments: [...new Set([...job.attachments, ...(existsSync(context) ? [context] : [])])] }
   }
   private prepareWorkspaceMetadata(workspace: Workspace): void {
