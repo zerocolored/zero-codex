@@ -240,6 +240,9 @@ if len(args) >= 3 and args[:2] == ["agent", "start"]:
     state["state_change_seq"] = 1
     state["agent_status"] = "idle"
     state["prompt"] = None
+    if state.get("startup_audit_drift"):
+        with open(os.path.join(state["project"], ".env.audit-fixture"), "w") as handle:
+            handle.write("synthetic concurrent startup metadata")
     child = subprocess.Popen(
         [claude, "--dangerously-skip-permissions", "--safe-mode", "--no-chrome", "--disable-slash-commands", "--model=claude-fable-5-1"],
         stdin=subprocess.DEVNULL,
@@ -263,6 +266,13 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
     if not isinstance(prompt, str) or state.get("answer_missing"):
         print("❯", flush=True)
     else:
+        if state.get("git_audit_failure"):
+            head = os.path.join(state["project"], ".git", "HEAD")
+            if os.path.isfile(head):
+                os.rename(head, head + ".audit-fixture")
+        if state.get("audit_drift"):
+            with open(os.path.join(state["project"], ".env.audit-fixture"), "w") as handle:
+                handle.write("synthetic concurrent runtime metadata")
         marker = next((line for line in reversed(prompt.splitlines()) if line.startswith("REQUEST_MARKER=")), "")
         print(prompt.rstrip("\\n"))
         print("Claude independent review completed")
@@ -310,6 +320,10 @@ if args == ["workspace", "close", workspace]:
     state["agent"] = False
     state["process"] = False
     state["close_count"] += 1
+    if state.get("git_audit_failure"):
+        head = os.path.join(state["project"], ".git", "HEAD")
+        if os.path.isfile(head + ".audit-fixture"):
+            os.rename(head + ".audit-fixture", head)
     save()
     success({"closed": True})
 if args == ["pane", "get", pane]:
@@ -1424,6 +1438,36 @@ print('review complete')
       expect(state.prompt_count).toBe(3)
       expect(state.close_count).toBe(3)
       expect(state.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 40_000)
+
+  test.each(['audit_drift', 'startup_audit_drift', 'git_audit_failure'])('Claude実回答は並行metadata変化 %s で破棄せず一度の起動で3回答を保存する', async drift => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const state = JSON.parse(readFileSync(path, 'utf8'))
+      state[drift] = true
+      writeFileSync(path, JSON.stringify(state), { mode: 0o600 })
+      const result = await fixture.call('investigation', 'revision-two')
+      expect(result.payload).toMatchObject({ complete: true, allAdopted: true,
+        slotSummary: { responsesObtained: 3 } })
+      const after = JSON.parse(readFileSync(path, 'utf8'))
+      expect(after.prompt_count).toBe(1)
+      expect(after.close_count).toBe(1)
+      expect(after.owned).toBe(false)
+      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
+      const cache = JSON.parse(readFileSync(join(fixture.journalRoot, revision, 'investigation-1.json.responses'), 'utf8'))
+      expect(cache.claude.adopted).toBe(true)
+      expect(cache.claude.cleanupWarnings.length).toBeGreaterThan(0)
+      expect(existsSync(join(fixture.state, 'advisor-ephemeral', fixture.jobId, fixture.nonce, revision, 'investigation-1'))).toBe(false)
+      if (drift === 'git_audit_failure') {
+        expect(existsSync(join(fixture.repo, '.git', 'HEAD'))).toBe(true)
+      } else {
+        expect(existsSync(join(fixture.repo, '.env.audit-fixture'))).toBe(true)
+      }
+      const replay = await fixture.call('investigation', 'revision-two')
+      expect(replay.payload).toMatchObject({ complete: true, slotSummary: { responsesObtained: 3 } })
+      expect(JSON.parse(readFileSync(path, 'utf8')).prompt_count).toBe(1)
     } finally { await fixture.close() }
   }, 40_000)
 

@@ -1855,7 +1855,6 @@ async function main(): Promise<void> {
     let cleanupReceiptDigest: string | undefined
     let cleanupStatus: string | undefined
     let helperEnvironment: Record<string, string> | undefined
-    let requestRemovalReady = false
     let claudeRuntime: HerdrRuntimeIdentity | undefined
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
       ? projectLayout.projectPath
@@ -1886,9 +1885,13 @@ async function main(): Promise<void> {
       )
       helperEnvironment = brokerHelperEnvironment(claudeRuntime, claudeLookupInput)
       await assertClaudeSubscriptionLogin(helperEnvironment)
-      beforeSnapshot = phaseScope === 'complete'
-        ? undefined
-        : snapshotAdvisorRepository(projectLayout)
+      try {
+        beforeSnapshot = phaseScope === 'complete'
+          ? undefined
+          : snapshotAdvisorRepository(projectLayout)
+      } catch (error) {
+        cleanupWarnings.push(`initial repository audit unavailable: ${error}`)
+      }
       requestDir = createEphemeralClaudeRequestDirectory({
         stateDir,
         jobId: context.jobId,
@@ -1925,18 +1928,22 @@ async function main(): Promise<void> {
         throw new Error(`ephemeral Claude open failed (${opened.exitCode}): ${opened.stderr}`)
       }
       target = parseEphemeralClaudeOpen(opened.stdout)
-      const afterOpenVerify = await runBounded(fingerprintedCommand(
-        [python, helper, 'verify', ...helperArgs], jobFingerprint,
-      ), { env: helperEnvironment, timeoutMs: 130_000 })
-      if (afterOpenVerify.timedOut || afterOpenVerify.forcedCleanup || afterOpenVerify.outputTruncated
-        || afterOpenVerify.exitCode !== 0) {
-        throw new Error('repository changed while opening the ephemeral Claude advisor')
-      }
-      if (beforeSnapshot) {
-        const afterOpenSnapshot = snapshotAdvisorRepository(projectLayout)
-        if (advisorRepositoryDigest(beforeSnapshot) !== advisorRepositoryDigest(afterOpenSnapshot)) {
-          throw new Error('repository changed while opening the ephemeral Claude advisor')
+      try {
+        const afterOpenVerify = await runBounded(fingerprintedCommand(
+          [python, helper, 'verify', ...helperArgs], jobFingerprint,
+        ), { env: helperEnvironment, timeoutMs: 130_000 })
+        if (afterOpenVerify.timedOut || afterOpenVerify.forcedCleanup || afterOpenVerify.outputTruncated
+          || afterOpenVerify.exitCode !== 0) {
+          cleanupWarnings.push('repository audit changed or unavailable while opening the ephemeral Claude advisor')
         }
+        if (beforeSnapshot) {
+          const afterOpenSnapshot = snapshotAdvisorRepository(projectLayout)
+          if (advisorRepositoryDigest(beforeSnapshot) !== advisorRepositoryDigest(afterOpenSnapshot)) {
+            cleanupWarnings.push('repository changed while opening the ephemeral Claude advisor')
+          }
+        }
+      } catch (error) {
+        cleanupWarnings.push(`repository audit after Claude open unavailable: ${error}`)
       }
       await verifyHerdrRuntimeIdentityAsync(claudeRuntime, brokerEnvironment(claudeRuntime))
       const send = await runBounded(fingerprintedCommand([
@@ -2017,23 +2024,28 @@ async function main(): Promise<void> {
           const helperArgs = [
             '--project-root', claudeProjectRoot!, '--request-dir', requestDir,
           ]
-          const verifyBeforeClose = await runBounded(fingerprintedCommand([
-            realpathSync('/usr/bin/python3'), helper, 'verify',
-            ...helperArgs,
-          ], jobFingerprint), { env: cleanupEnvironment, timeoutMs: 130_000 })
-          if (verifyBeforeClose.timedOut || verifyBeforeClose.forcedCleanup
-            || verifyBeforeClose.outputTruncated
-            || verifyBeforeClose.exitCode !== 0) {
-            response = undefined
-            cleanupWarnings.push('repository verification was unavailable during Claude advisor attempt')
-          }
-          if (beforeSnapshot) {
-            const snapshotBeforeClose = snapshotAdvisorRepository(projectLayout)
-            if (advisorRepositoryDigest(beforeSnapshot)
-              !== advisorRepositoryDigest(snapshotBeforeClose)) {
-              response = undefined
-              cleanupWarnings.push('repository changed during Claude advisor attempt')
+          // Repository observations cannot attribute concurrent writes to this
+          // advisor. Audit failures must neither discard its answer nor skip
+          // the independently owned workspace close below.
+          try {
+            const verifyBeforeClose = await runBounded(fingerprintedCommand([
+              realpathSync('/usr/bin/python3'), helper, 'verify',
+              ...helperArgs,
+            ], jobFingerprint), { env: cleanupEnvironment, timeoutMs: 130_000 })
+            if (verifyBeforeClose.timedOut || verifyBeforeClose.forcedCleanup
+              || verifyBeforeClose.outputTruncated
+              || verifyBeforeClose.exitCode !== 0) {
+              cleanupWarnings.push('repository verification was unavailable during Claude advisor attempt')
             }
+            if (beforeSnapshot) {
+              const snapshotBeforeClose = snapshotAdvisorRepository(projectLayout)
+              if (advisorRepositoryDigest(beforeSnapshot)
+                !== advisorRepositoryDigest(snapshotBeforeClose)) {
+                cleanupWarnings.push('repository changed during Claude advisor attempt')
+              }
+            }
+          } catch (error) {
+            cleanupWarnings.push(`repository audit before Claude close unavailable: ${error}`)
           }
           const receiptTarget = readEphemeralClaudeWorkspaceTarget(
             requestDir,
@@ -2093,26 +2105,25 @@ async function main(): Promise<void> {
             cleanupReceiptDigest = cleanup.digest
             cleanupStatus = cleanup.status
           }
-          persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir)
-          const verifyAfterClose = await runBounded(fingerprintedCommand([
-            python, helper, 'verify', ...helperArgs,
-          ], jobFingerprint), { env: cleanupEnvironment, timeoutMs: 130_000 })
-          if (verifyAfterClose.timedOut || verifyAfterClose.forcedCleanup
-            || verifyAfterClose.outputTruncated
-            || verifyAfterClose.exitCode !== 0) {
-            response = undefined
-            cleanupWarnings.push('repository verification was unavailable while closing the ephemeral Claude advisor')
-          } else {
-            requestRemovalReady = true
-          }
-          if (beforeSnapshot) {
-            const snapshotAfterClose = snapshotAdvisorRepository(projectLayout)
-            if (advisorRepositoryDigest(beforeSnapshot)
-              !== advisorRepositoryDigest(snapshotAfterClose)) {
-              response = undefined
-              requestRemovalReady = false
-              cleanupWarnings.push('repository changed while closing the ephemeral Claude advisor')
+          try {
+            persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir)
+            const verifyAfterClose = await runBounded(fingerprintedCommand([
+              python, helper, 'verify', ...helperArgs,
+            ], jobFingerprint), { env: cleanupEnvironment, timeoutMs: 130_000 })
+            if (verifyAfterClose.timedOut || verifyAfterClose.forcedCleanup
+              || verifyAfterClose.outputTruncated
+              || verifyAfterClose.exitCode !== 0) {
+              cleanupWarnings.push('repository verification was unavailable while closing the ephemeral Claude advisor')
             }
+            if (beforeSnapshot) {
+              const snapshotAfterClose = snapshotAdvisorRepository(projectLayout)
+              if (advisorRepositoryDigest(beforeSnapshot)
+                !== advisorRepositoryDigest(snapshotAfterClose)) {
+                cleanupWarnings.push('repository changed while closing the ephemeral Claude advisor')
+              }
+            }
+          } catch (error) {
+            cleanupWarnings.push(`post-close Claude audit unavailable: ${error}`)
           }
         } catch (error) {
           if (error instanceof AdvisorContainmentError) {
@@ -2128,7 +2139,7 @@ async function main(): Promise<void> {
           cleanupWarnings.push(`ephemeral Claude cleanup verification failed: ${error}`)
         }
       }
-      if (requestDir && cleanupVerified && requestRemovalReady) {
+      if (requestDir && cleanupVerified) {
         try {
           persistAdvisorClaudeCleanupOutcome(stateDir, {
             jobId: context.jobId,

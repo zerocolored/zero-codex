@@ -871,6 +871,52 @@ describe('fifth-advisor helper installer', () => {
     }
   }, 15_000)
 
+  test('metadata監査例外は起動や送信を拒否する例外に昇格しない', () => {
+    const home = fixture()
+    const helper = installFifthAdvisorHelper(home)
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', [
+      'import importlib.util,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor_under_test",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'def unavailable(*args): raise OSError("synthetic audit failure")',
+      'module._verify_unchanged=unavailable',
+      'module._audit_metadata(-1,None,-1)',
+      'print("audit exception retained as warning")',
+    ].join('\n'), helper], { stdout: 'pipe', stderr: 'pipe' })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.toString()).toContain('audit exception retained as warning')
+    expect(result.stderr.toString()).toContain('audit unavailable')
+  })
+
+  test('snapshot後workspace作成前の並行metadata変化でも起動できる', () => {
+    const home = fixture()
+    const { project, request } = gitProject(home)
+    const helper = installFifthAdvisorHelper(home)
+    const lifecycle = fakeLifecycle(home, project)
+    const invoke = (command: string) => Bun.spawnSync([
+      '/usr/bin/python3', helper, command,
+      '--project-root', project, '--request-dir', request,
+    ], { env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(invoke('snapshot').exitCode).toBe(0)
+    writeFileSync(join(project, '.env.audit-fixture'), 'synthetic runtime', { mode: 0o600 })
+    const opened = Bun.spawnSync(['/usr/bin/python3', '-c', [
+      'import argparse,importlib.util,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor_under_test",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'module._run_open_with_signal_cleanup=lambda *args: 0',
+      'args=argparse.Namespace(project_root=sys.argv[2],request_dir=sys.argv[3])',
+      'assert module._open_command(args)==0',
+      'print("workspace creation reached")',
+    ].join('\n'), helper, project, request], {
+      env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(opened.exitCode, opened.stderr.toString()).toBe(0)
+    expect(opened.stdout.toString()).toContain('workspace creation reached')
+    expect(opened.stderr.toString()).toContain('metadata changed')
+  })
+
   test('exact closeはforeign workspaceとprotected差を監査値に留め再実行可能にする', () => {
     const home = fixture()
     const { project, request } = gitProject(home)

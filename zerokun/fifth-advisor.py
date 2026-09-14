@@ -3703,13 +3703,7 @@ def _open_command(args: argparse.Namespace) -> int:
         request_descriptor, _request = _request_directory(args.request_dir, root)
         try:
             _discard_staged_records(request_descriptor)
-            changed, _before_count, _after_count = _verify_unchanged(
-                root_descriptor,
-                root,
-                request_descriptor,
-            )
-            if changed:
-                raise UnsafeRequest("protected metadata changed before workspace creation")
+            _audit_metadata(root_descriptor, root, request_descriptor)
             root_metadata = os.fstat(root_descriptor)
         finally:
             os.close(request_descriptor)
@@ -4167,8 +4161,14 @@ def _open_ephemeral_workspace(
                 "executable": processes["executable"],
             },
         )
-        if not _protected_unchanged(args.project_root, args.request_dir):
-            raise UnsafeRequest("protected metadata changed while starting ephemeral Claude")
+        # Metadata drift cannot attribute a concurrent primary/other-session
+        # write to this advisor. Keep the audit diagnostic without discarding
+        # an otherwise valid, exactly owned launch.
+        try:
+            if not _protected_unchanged(args.project_root, args.request_dir):
+                print("warning: protected metadata changed while starting ephemeral Claude", file=sys.stderr)
+        except Exception:
+            print("warning: protected metadata audit unavailable while starting ephemeral Claude", file=sys.stderr)
         _suppress_open_signals()
         print(
             json.dumps(
@@ -4656,6 +4656,18 @@ def _write_json_record(payload: Dict[str, object]) -> None:
         view = view[written:]
 
 
+def _audit_metadata(root_descriptor: int, root: Path, request_descriptor: int) -> None:
+    """Observe metadata without confusing concurrent writes with wrong-target I/O."""
+    try:
+        changed, _before_count, _after_count = _verify_unchanged(
+            root_descriptor, root, request_descriptor,
+        )
+        if changed:
+            print("warning: protected metadata changed during Claude lifecycle", file=sys.stderr)
+    except Exception:
+        print("warning: protected metadata audit unavailable during Claude lifecycle", file=sys.stderr)
+
+
 def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
     if os.environ.get("HERDR_ENV") != "1":
         raise UnsafeRequest("HERDR_ENV is not active")
@@ -4670,13 +4682,7 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
         root_descriptor, root = _open_physical_directory(Path(args.project_root))
         request_descriptor, _request = _request_directory(args.request_dir, root)
         _discard_staged_records(request_descriptor)
-        changed, _before_count, _after_count = _verify_unchanged(
-            root_descriptor,
-            root,
-            request_descriptor,
-        )
-        if changed:
-            raise UnsafeRequest("protected metadata changed before fifth-advisor prompt")
+        _audit_metadata(root_descriptor, root, request_descriptor)
         if _request_entry_exists(
             request_descriptor,
             PROCESS_MISMATCH_RECEIPT_NAME,
@@ -4763,13 +4769,7 @@ def _persist_send_receipt(prepared: _PreparedSend) -> None:
         root_descriptor, root = _open_physical_directory(Path(prepared.project_root))
         request_descriptor, _request = _request_directory(prepared.request_dir, root)
         _discard_staged_records(request_descriptor)
-        changed, _before_count, _after_count = _verify_unchanged(
-            root_descriptor,
-            root,
-            request_descriptor,
-        )
-        if changed:
-            raise UnsafeRequest("protected metadata changed after fifth-advisor send")
+        _audit_metadata(root_descriptor, root, request_descriptor)
         rebound_records = (
             _read_request_record(request_descriptor, SESSION_INTENT_NAME),
             _read_request_record(request_descriptor, WORKSPACE_RECEIPT_NAME),
