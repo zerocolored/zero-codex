@@ -424,6 +424,21 @@ describe('fifth-advisor helper installer', () => {
     expect(memberChanged.stdout.toString()).toContain('protected-metadata-changed')
   })
 
+  test('multi-repo snapshot accepts current v2 workspace pins', () => {
+    const home = fixture()
+    const { project, request } = multiRepoProject(home)
+    writeFileSync(join(project, '.zerochan', 'workspace.json'), JSON.stringify({
+      version: 2, kind: 'multi-repo-workspace', projectRepository: false,
+      members: ['backend', 'frontend', 'meeting-app'],
+    }), { mode: 0o600 })
+    const result = Bun.spawnSync(['/usr/bin/python3', installFifthAdvisorHelper(home), 'snapshot',
+      '--project-root', project, '--request-dir', request], {
+      env: { HOME: home, PATH: '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(result.stdout.toString()).toContain('snapshot-recorded')
+  })
+
   test('multi-repo snapshotは安全な親AGENTS.mdの内容変更を検出する', () => {
     const home = fixture()
     const { project, request } = multiRepoProject(home)

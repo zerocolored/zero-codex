@@ -1143,7 +1143,7 @@ print('review complete')
       slotSummary,
     })
     expect(observed).toEqual({
-      complete: false,
+      complete: true,
       alreadyObserved: true,
       phase: 'investigation',
       round: 1,
@@ -1377,9 +1377,9 @@ print('review complete')
       const { result, payload } = await fixture.call(
         'investigation', 'revision-two', 'unavailable',
       )
-      expect(result.isError).toBe(true)
+      expect(result.isError).not.toBe(true)
       expect(payload).toMatchObject({
-        complete: false,
+        complete: true,
         allAdopted: false,
         advisorUnavailable: expect.any(Array),
         slotSummary: {
@@ -1395,66 +1395,31 @@ print('review complete')
     }
   }, 15_000)
 
-  test('Claude復旧receipt不一致でも元の未完了roundをrequestedで破壊しない', async () => {
-    const fixture = await brokerFixture({ externalSuccess: true, claudeFailures: 1 })
-    try {
-      const first = await fixture.call('investigation', 'revision-two')
-      expect(first.payload.complete).toBe(false)
-      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
-      const journalPath = join(fixture.journalRoot, revision, 'investigation-1.json')
-      const cache = JSON.parse(readFileSync(`${journalPath}.responses`, 'utf8'))
-      cache.finishedAt -= 31_000
-      const raw = JSON.stringify(cache)
-      writeFileSync(`${journalPath}.responses`, raw, { mode: 0o600 })
-      const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
-      journal.responseCacheDigest = createHash('sha256').update(raw).digest('hex')
-      writeFileSync(journalPath, JSON.stringify(journal), { mode: 0o600 })
-      const cleanupPath = join(fixture.state, 'advisor-round-cleanup', fixture.jobId, fixture.nonce, revision, 'investigation-1.json')
-      const cleanup = JSON.parse(readFileSync(cleanupPath, 'utf8'))
-      cleanup.cleanupReceiptDigest = 'f'.repeat(64)
-      writeFileSync(cleanupPath, JSON.stringify(cleanup), { mode: 0o600 })
-      const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1, { retryUnavailable: true })
-      expect(retry.payload).toMatchObject({ complete: false, waitingForAdvisors: true, retryable: false })
-      expect(JSON.parse(readFileSync(journalPath, 'utf8')).status).toBe('required-reviewer-failed')
-      expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(1)
-    } finally { await fixture.close() }
-  }, 20_000)
-
-  test('Claudeだけ2回未回収でも取得済み回答を保持し3回目で同じroundを完了する', async () => {
+  test('Claude欠員は警告として完了しlegacy retry指定でも同じ枠を再起動しない', async () => {
     const fixture = await brokerFixture({ externalSuccess: true, claudeFailures: 2 })
     try {
-      const journalPath = join(fixture.journalRoot,
-        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`,
-        'investigation-1.json')
       const first = await fixture.call('investigation', 'revision-two')
-      expect(first.payload.complete).toBe(false)
-      expect(first.payload.slotSummary).toMatchObject({ responsesObtained: 2 })
-      const firstGrok = JSON.stringify(first.payload.grok)
-      const early = await fixture.call('investigation', 'revision-two', 'adopted', 1, { retryUnavailable: true })
-      expect(early.payload).toMatchObject({ complete: false, retryable: true })
-      expect(JSON.parse(readFileSync(journalPath, 'utf8')).status).toBe('required-reviewer-failed')
+      expect(first.result.isError).not.toBe(true)
+      expect(first.payload).toMatchObject({ complete: true, allAdopted: false,
+        waitingForAdvisors: false, slotSummary: { responsesObtained: 2 } })
+      expect(first.payload.advisorUnavailable).toEqual(expect.arrayContaining([
+        expect.objectContaining({ advisor: 'claude' }),
+      ]))
+      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
+      const journalPath = join(fixture.journalRoot, revision, 'investigation-1.json')
+      const cacheBefore = readFileSync(`${journalPath}.responses`, 'utf8')
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        if (attempt === 1) fixture.stageRevision('ログインを復旧しました。依頼内容は変更せず再開してください。')
-        // Simulate elapsed recovery backoff without adding a minute to the suite.
-        const cache = JSON.parse(readFileSync(`${journalPath}.responses`, 'utf8'))
-        cache.finishedAt -= 31_000
-        const raw = JSON.stringify(cache)
-        writeFileSync(`${journalPath}.responses`, raw, { mode: 0o600 })
-        const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
-        journal.responseCacheDigest = createHash('sha256').update(raw).digest('hex')
-        writeFileSync(journalPath, JSON.stringify(journal), { mode: 0o600 })
-        const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1,
-          { retryUnavailable: true, inputUpdateIsRecoveryOnly: attempt === 1 })
-        expect(JSON.stringify(retry.payload.grok)).toBe(firstGrok)
-        expect(retry.payload.complete).toBe(attempt === 1)
-        expect(retry.payload.slotSummary).toMatchObject({ responsesObtained: attempt === 1 ? 3 : 2 })
+        const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1, { retryUnavailable: true })
+        expect(retry.payload).toMatchObject({ complete: true, slotSummary: { responsesObtained: 2 } })
       }
+      expect(readFileSync(`${journalPath}.responses`, 'utf8')).toBe(cacheBefore)
+      expect(JSON.parse(readFileSync(journalPath, 'utf8')).status).toBe('completed')
       const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
-      expect(state.prompt_count).toBe(3)
-      expect(state.close_count).toBe(3)
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
       expect(state.owned).toBe(false)
     } finally { await fixture.close() }
-  }, 45_000)
+  }, 20_000)
 
   test('broker正常系はGrok 1件とfresh Claude 1件を実起動して3/3を記録する', async () => {
     const fixture = await brokerFixture({ externalSuccess: true, transientProbeDenial: true })
@@ -1657,9 +1622,9 @@ print('review complete')
     try {
       writeFileSync(join(fixture.repo, 'README.md'), 'edited before investigation\n', { mode: 0o600 })
       const { result, payload } = await fixture.call('investigation', 'revision-two')
-      expect(result.isError).toBe(true)
+      expect(result.isError).not.toBe(true)
       expect(payload).toMatchObject({
-        complete: false,
+        complete: true,
         allAdopted: false,
         advisorUnavailable: expect.any(Array),
         slotSummary: {
@@ -1681,9 +1646,9 @@ print('review complete')
       writeFileSync(oversized, '', { mode: 0o600 })
       truncateSync(oversized, 65 * 1024 * 1024)
       const { result, payload } = await fixture.call('investigation', 'revision-two')
-      expect(result.isError).toBe(true)
+      expect(result.isError).not.toBe(true)
       expect(payload).toMatchObject({
-        complete: false,
+        complete: true,
         allAdopted: false,
         advisorUnavailable: expect.arrayContaining([
           expect.objectContaining({ advisor: 'grok' }),
@@ -1823,7 +1788,7 @@ print('review complete')
       const repeated = await fixture.call('investigation', 'revision-one')
       expect(repeated.result.isError).not.toBe(true)
       expect(repeated.payload).toMatchObject({
-        complete: false,
+        complete: true,
         reusedPriorPhase: true,
         inputRevision: fixture.revisionTwo.revision,
       })
@@ -2409,18 +2374,17 @@ print('review complete')
     }
   }, 15_000)
 
-  test('初回中断で回答cacheがなくても終了確認後に外部枠を再取得できる', async () => {
+  test('初回中断で回答cacheがなくても終了済み外部枠を再起動しない', async () => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
       const nativeResponse = `solution response\n${nativeAdvisorMarker(fixture.nonce,
         fixture.revisionTwo.revision, fixture.revisionTwo.digest, 'investigation', 1, 'solution')}`
       const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo, { version: 9, nativeResponse })
-      fixture.stageRevision('接続を復旧しました。元の依頼内容は変更せず再開してください。')
       expect(finalizeRetiredAdvisorRounds(fixture.state)).toEqual({ finalized: 1 })
       expect(existsSync(`${armed.journalPath}.responses`)).toBe(false)
       const early = await fixture.call('investigation', 'revision-two', 'adopted', 1,
         { retryUnavailable: true, inputUpdateIsRecoveryOnly: true })
-      expect(early.payload).toMatchObject({ complete: false, retryable: true })
+      expect(early.payload).toMatchObject({ complete: false, recoveredAfterInterruption: true, waitingForAdvisors: false, attemptsFinished: true })
       const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
       journal.startedAt -= 31_000
       journal.finishedAt -= 31_000
@@ -2431,7 +2395,8 @@ print('review complete')
       receipt.terminalJournalDigest = createHash('sha256').update(raw).digest('hex')
       writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 })
       const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1, { retryUnavailable: true, inputUpdateIsRecoveryOnly: true })
-      expect(retry.payload).toMatchObject({ complete: true, slotSummary: { responsesObtained: 3 } })
+      expect(retry.payload).toMatchObject({ complete: false, recoveredAfterInterruption: true, waitingForAdvisors: false })
+      expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count ?? 0).toBe(0)
     } finally { await fixture.close() }
   }, 20_000)
 
@@ -2531,7 +2496,7 @@ print('review complete')
     }
   }, 15_000)
 
-  test('retirement receipt後にactive lockのinodeが置換されたら削除せずfail closedにする', async () => {
+  test('retirement後の置換lockは削除せず、終了済み試行の再起動もしない', async () => {
     const fixture = await brokerFixture()
     try {
       const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo)
@@ -2549,7 +2514,7 @@ print('review complete')
       })
       const { payload } = await fixture.call('investigation', 'revision-two')
       expect(payload).toMatchObject({
-        complete: false,
+        complete: true,
         reusedPriorPhase: true,
         priorStatus: 'required-reviewer-failed',
       })

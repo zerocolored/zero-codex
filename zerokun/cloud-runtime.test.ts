@@ -23,6 +23,44 @@ test('permanent ownership refusal is not classified as a retryable preparation o
   store.close()
 })
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
+test('cloud multi-repo pin repair preserves existing HEAD, index and uncommitted files and passes real Claude snapshot', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-pin-repair-')); roots.push(root)
+  const project = join(root, 'project'); mkdirSync(project)
+  const repositories = ['back', 'front'].map(name => {
+    const repo = join(project, name); mkdirSync(repo)
+    git(repo, 'init', '--quiet')
+    writeFileSync(join(repo, 'file.txt'), 'base'); git(repo, 'add', '.'); git(repo, 'commit', '--quiet', '-m', 'base')
+    const base = git(repo, 'rev-parse', 'HEAD')
+    writeFileSync(join(repo, 'file.txt'), 'staged'); git(repo, 'add', '.')
+    writeFileSync(join(repo, 'file.txt'), 'unstaged')
+    writeFileSync(join(repo, 'untracked.txt'), 'owned work')
+    return { name, root: repo, base }
+  })
+  const state = join(root, 'state'), store = new JobStore(join(state, 'jobs.sqlite3'))
+  try {
+    store.enqueue({ chatId: 'C1', threadTs: '1.0', messageId: '1.0', userId: 'U1', repoPath: project, task: 'continue', writeEnabled: true })
+    const job = store.claimNext('worker')!
+    store.bindCloudHandoff(job.id, initial.id, 1, JSON.stringify(initial))
+    writeCheckpoint(join(state, 'cloud-workspaces', `${initial.id}.json`), Buffer.from(JSON.stringify({ epoch: 1, project, repositories })))
+    const runtime = new CloudRuntime(store, state, new MemberClient(new CloudFixture(), ownerA, 'UA'))
+    const request = join(root, 'request'); mkdirSync(request, { mode: 0o700 })
+    const snapshot = () => Bun.spawnSync(['/usr/bin/python3', join(import.meta.dir, 'fifth-advisor.py'), 'snapshot',
+      '--project-root', project, '--request-dir', request], { stdout: 'pipe', stderr: 'pipe' })
+    expect(snapshot().stderr.toString()).toContain('project is not a Git worktree or pinned workspace')
+    await runtime.prepare(job)
+    expect(resolveProjectLayout(project).pinned).toBe(true)
+    expect(runtime.executionJob(job).repoPath).toBe(realpathSync(project))
+    const after = snapshot()
+    expect(after.exitCode, after.stderr.toString()).toBe(0)
+    await runtime.prepare(job)
+    for (const repo of repositories) {
+      expect(git(repo.root, 'rev-parse', 'HEAD')).toBe(repo.base)
+      expect(git(repo.root, 'show', ':file.txt')).toBe('staged')
+      expect(readFileSync(join(repo.root, 'file.txt'), 'utf8')).toBe('unstaged')
+      expect(readFileSync(join(repo.root, 'untracked.txt'), 'utf8')).toBe('owned work')
+    }
+  } finally { store.close() }
+})
 test('legacy native session is reset durably when cloud changes cwd; managed continuation resumes', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-session-cwd-')); roots.push(root)
   const source = join(root, 'source'), managed = join(root, 'managed')
@@ -77,6 +115,47 @@ test('legacy native session is reset durably when cloud changes cwd; managed con
     expect(runtime.executionJob(next).sessionId).toBeNull()
     expect(store.get(next.id)?.sessionId).toBeNull()
   } finally { store.close() }
+})
+test('new cloud preparation and multi-repo import both pin the execution parent', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-new-pin-')); roots.push(root)
+  const source = join(root, 'source'); mkdirSync(source)
+  for (const name of ['back', 'front']) {
+    const repo = join(source, name); mkdirSync(repo)
+    git(repo, 'init', '-b', 'main', '--quiet')
+    writeFileSync(join(repo, 'file.txt'), 'base'); git(repo, 'add', '.'); git(repo, 'commit', '--quiet', '-m', 'base')
+    git(repo, 'remote', 'add', 'origin', repo)
+  }
+  const stateA = join(root, 'A'), stateB = join(root, 'B')
+  const a = new JobStore(join(stateA, 'jobs.sqlite3')), b = new JobStore(join(stateB, 'jobs.sqlite3'))
+  try {
+    const cloud = new CloudFixture()
+    const runtimeA = new CloudRuntime(a, stateA, new MemberClient(cloud, ownerA, 'UA'), join(root, 'owned-A'))
+    const runtimeB = new CloudRuntime(b, stateB, new MemberClient(cloud, ownerB, 'UB'), join(root, 'owned-B'))
+    a.enqueue({ chatId: 'C1', threadTs: '1.0', messageId: '1.0', userId: 'U1', repoPath: source, task: 'continue', writeEnabled: true })
+    const job = a.claimNext('worker')!
+    await runtimeA.prepare(job)
+    const execution = runtimeA.executionJob(job)
+    expect(resolveProjectLayout(execution.repoPath).pinned).toBe(true)
+    for (const name of ['back', 'front']) {
+      // Handoff remote identity is public HTTPS; all transfers still use the
+      // already present local fixture objects, never GitHub or cloud network.
+      git(join(source, name), 'remote', 'set-url', 'origin', `https://github.com/example/${name}.git`)
+      git(join(execution.repoPath, name), 'remote', 'set-url', 'origin', `https://github.com/example/${name}.git`)
+      writeFileSync(join(execution.repoPath, name, 'file.txt'), 'unfinished work')
+    }
+    await runtimeA.pause(job, undefined)
+    const control = { channel: 'C1', thread: '1.0', message: '2.0', user: 'U1', bot: 'UB', project: source,
+      writeEnabled: true, action: 'handoff' as const }
+    await runtimeB.receive(control)
+    await runtimeB.receive(control)
+    const imported = runtimeB.executionJob(b.claimNext('worker-B')!)
+    expect(resolveProjectLayout(imported.repoPath).pinned).toBe(true)
+    const request = join(root, 'snapshot'); mkdirSync(request, { mode: 0o700 })
+    const result = Bun.spawnSync(['/usr/bin/python3', join(import.meta.dir, 'fifth-advisor.py'), 'snapshot',
+      '--project-root', imported.repoPath, '--request-dir', request], { stdout: 'pipe', stderr: 'pipe' })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    for (const name of ['back', 'front']) expect(readFileSync(join(imported.repoPath, name, 'file.txt'), 'utf8')).toBe('unfinished work')
+  } finally { a.close(); b.close() }
 })
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', env: { ...process.env,

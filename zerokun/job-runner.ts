@@ -16470,7 +16470,7 @@ export function enforceHostAdvisorCoverage(
     const failures = [...new Map(coverage.phases.flatMap(phase => phase.failures ?? [])
       .map(failure => [failure.advisor, failure] as const)).values()]
     const notice = failures.length > 0
-      ? `必要な回答が揃っていないため、設計・レビューは未完了です。\n${failures.map(advisorFailureMessage).join('\n')}\n取得済みの回答と作業は保持しています。原因の解消後、このスレッドで再開を依頼してください。\n\n`
+      ? `独立レビューの一部を取得できませんでした。\n${failures.map(advisorFailureMessage).join('\n')}\n取得済みの回答と主担当の確認を基に判断しています。\n\n`
       : ''
     return stripped.text
       ? `${notice}${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
@@ -16491,9 +16491,6 @@ export function finalizeSuccessfulExecution(
   const {
     capturedArtifacts = [], advisorCoverage, ...persistedExecution
   } = execution
-  if (advisorCoverage?.phases.some(phase => phase.responsesObtained < phase.total)) {
-    persistedExecution.taskGoalStatus = 'blocked'
-  }
   try {
     const declared = extractArtifactPaths(execution.result)
     // Browser evidence is bounded by the host at capture time and cannot be
