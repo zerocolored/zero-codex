@@ -4,46 +4,25 @@ import {
   rmSync, symlinkSync, writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
-import { basename, dirname, join } from 'path'
+import { dirname, join } from 'path'
+import { FIXTURE_PROCESS_DIR, FIXTURE_STOPPING, recordFixtureProcess, reapFixtureHandles, stopRecordedFixtureProcesses } from './launcher-fixture-processes.ts'
 
 const LAUNCHER = join(dirname(import.meta.dir), 'codex-channel.sh')
+const BUN = process.execPath
 const temporaryDirs: string[] = []
 const processes: Bun.Subprocess[] = []
 
-/**
- * launcher が起こす孫プロセス(runner-launcher 等)は `processes` に載らない。
- * 一時ディレクトリを消す前に、その名前を持つものを落としておく。残すと、消えた
- * ファイルを指したまま孤児として溜まり続ける(2026-09-11 に5体が滞留していた)。
- */
-function sweepStrayProcesses(dir: string): void {
-  const marker = basename(dir)
-  const found = Bun.spawnSync(['/usr/bin/pgrep', '-f', marker], {
-    stdout: 'pipe', stderr: 'ignore',
-  })
-  if (found.exitCode !== 0) return
-  for (const line of new TextDecoder().decode(found.stdout).trim().split('\n')) {
-    const pid = Number(line.trim())
-    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue
-    Bun.spawnSync(['/bin/kill', '-9', String(pid)], { stderr: 'ignore' })
-  }
-}
-
 afterEach(async () => {
-  // 後片付けは trap できない SIGKILL で行う。SIGTERM を無視する代役を意図的に
-  // 立てるテストがあり(下の ignoreTerm)、SIGTERM のままだと生き残るため。
-  // 2026-09-11: 生き残った4体が、削除済みのスクリプトを読もうとして各 87% CPU で
-  // 空回りしたまま26時間孤児として残り、合計で約3.5コアを占有していた。
-  const running = processes.splice(0)
-  for (const process of running) {
-    try { process.kill(9) } catch {}
-  }
-  // 消えたことを確認してから次のテストへ。漏れたら次が遅くなるのではなく、
-  // ここで止まって気づけるようにする。
-  await Promise.all(running.map(process => process.exited))
+  for (const dir of temporaryDirs) writeFileSync(join(dir, 'state', FIXTURE_STOPPING), '')
+  const errors: unknown[] = []
+  try { await reapFixtureHandles(processes.splice(0)) } catch (error) { errors.push(error) }
   for (const dir of temporaryDirs.splice(0)) {
-    sweepStrayProcesses(dir)
-    rmSync(dir, { recursive: true, force: true })
+    try {
+      await stopRecordedFixtureProcesses(join(dir, 'state'))
+      if (!errors.length) rmSync(dir, { recursive: true, force: true })
+    } catch (error) { errors.push(error) }
   }
+  if (errors.length) throw new AggregateError(errors, 'fixture cleanup failed; diagnostic directories retained')
 })
 
 function fixture(): string {
@@ -52,6 +31,7 @@ function fixture(): string {
   const state = join(base, 'state')
   const project = join(base, 'project')
   mkdirSync(state)
+  mkdirSync(join(state, FIXTURE_PROCESS_DIR), { mode: 0o700 })
   mkdirSync(project)
   const initialized = Bun.spawnSync(['git', 'init', '-q', project], {
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
@@ -70,17 +50,14 @@ function startGateway(
   options: { ignoreTerm?: boolean } = {},
 ): Bun.Subprocess {
   const server = join(state, 'server.ts')
-  // ignoreTerm は SIGTERM を無視する代役。待ち方に sleep を使うのが要点で、
-  // read -t は stdin が /dev/null だと待たずに即 EOF を返すため、待っているつもりで
-  // 全力で空回りし CPU を1コア食い潰す。
-  writeFileSync(server, options.ignoreTerm
-    ? "#!/bin/bash\ntrap '' TERM\nwhile :; do sleep 1; done\n"
-    : '#!/bin/bash\nsleep 30\n')
+  // A timer neither spins on stdin EOF nor creates an untracked sleep child.
+  writeFileSync(server, `${options.ignoreTerm ? "process.on('SIGTERM', () => {});" : ''}\nawait Bun.sleep(30_000)\n`)
   chmodSync(server, 0o700)
-  const process = Bun.spawn(['/bin/bash', server], {
+  const process = Bun.spawn([BUN, '--no-env-file', server], {
     stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
   })
   processes.push(process)
+  recordFixtureProcess(state, process)
   writeFileSync(join(state, 'plugin.lock'), `${process.pid}\n`)
   const started = Bun.spawnSync(['/bin/ps', '-o', 'lstart=', '-p', String(process.pid)], {
     stdout: 'pipe',
@@ -93,12 +70,13 @@ function startGateway(
 
 function startRunner(state: string): Bun.Subprocess {
   const runner = join(state, 'job-runner.ts')
-  writeFileSync(runner, '#!/bin/bash\nsleep 30\n')
+  writeFileSync(runner, 'await Bun.sleep(30_000)\n')
   chmodSync(runner, 0o700)
-  const process = Bun.spawn(['/bin/bash', runner, 'daemon'], {
+  const process = Bun.spawn([BUN, '--no-env-file', runner, 'daemon'], {
     stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
   })
   processes.push(process)
+  recordFixtureProcess(state, process)
   const lockDir = join(state, 'job-runner.lock')
   mkdirSync(lockDir, { mode: 0o700 })
   const lock = join(lockDir, 'pid')
@@ -141,6 +119,7 @@ async function startOrphanedRunnerLauncher(state: string): Promise<Bun.Subproces
     stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
   })
   processes.push(launcher)
+  recordFixtureProcess(state, launcher)
   for (let attempt = 0; attempt < 100 && !existsSync(ready); attempt += 1) {
     await Bun.sleep(20)
   }
@@ -152,12 +131,7 @@ async function stopFixturePid(path: string): Promise<void> {
   if (!existsSync(path)) return
   const pid = Number(readFileSync(path, 'utf8').trim())
   if (!Number.isSafeInteger(pid) || pid <= 0) return
-  try { process.kill(pid, 'SIGTERM') } catch {}
-  const deadline = Date.now() + 2_000
-  while (Date.now() < deadline) {
-    try { process.kill(pid, 0); await Bun.sleep(20) } catch { return }
-  }
-  try { process.kill(pid, 'SIGKILL') } catch {}
+  await stopRecordedFixtureProcesses(dirname(path), pid)
 }
 
 async function runLauncher(
@@ -172,11 +146,27 @@ async function runLauncher(
   const fakeBin = join(state, '.local', 'bin')
   mkdirSync(fakeBin, { recursive: true })
   const fakeRunnerLauncher = join(state, 'runner-launcher.ts')
+  const fixtureWait = join(state, 'fixture-wait.ts')
+  writeFileSync(fixtureWait, [
+    `import { recordFixtureProcess } from ${JSON.stringify(join(import.meta.dir, 'launcher-fixture-processes.ts'))}`,
+    `recordFixtureProcess(${JSON.stringify(state)})`,
+    'await Bun.sleep(Number(process.argv[2] ?? 30_000))',
+  ].join('\n'))
+  const fakeRunner = join(state, 'fixture-runner', 'job-runner.ts')
+  mkdirSync(dirname(fakeRunner), { recursive: true })
+  writeFileSync(fakeRunner, [
+    `import { recordFixtureProcess } from ${JSON.stringify(join(import.meta.dir, 'launcher-fixture-processes.ts'))}`,
+    `recordFixtureProcess(${JSON.stringify(state)})`,
+    "process.on('SIGTERM', () => {})",
+    'await Bun.sleep(30_000)',
+  ].join('\n'))
   writeFileSync(fakeRunnerLauncher, [
     "import { mkdirSync, writeFileSync } from 'fs'",
     "import { join } from 'path'",
     `import { releaseProcessLock, tryAcquireProcessLock } from ${JSON.stringify(join(import.meta.dir, 'process-lock.ts'))}`,
     "const state = process.env.FAKE_RUNNER_STATE!",
+    `import { recordFixtureProcess, reapFixtureHandles } from ${JSON.stringify(join(import.meta.dir, 'launcher-fixture-processes.ts'))}`,
+    'recordFixtureProcess(state)',
     "const starterLock = join(state, 'job-runner-starter.lock')",
     "const starter = tryAcquireProcessLock(starterLock, process.pid)",
     "if (!starter.acquired) process.exit(72)",
@@ -186,7 +176,7 @@ async function runLauncher(
     "const shutdown = async () => {",
     "  if (stopping || process.env.FAKE_RUNNER_IGNORE_TERM === '1') return",
     "  stopping = true",
-    "  if (runner) { try { runner.kill('SIGKILL') } catch {}; await runner.exited }",
+    '  if (runner) await reapFixtureHandles([runner])',
     "  releaseProcessLock(starterLock, starter.lease)",
     "  process.exit(143)",
     "}",
@@ -196,7 +186,8 @@ async function runLauncher(
     "if (!stopping) {",
     "  const lockDir = join(state, 'job-runner.lock')",
     "  mkdirSync(lockDir, { mode: 0o700 })",
-    "  runner = Bun.spawn(['/bin/bash', '-c', 'trap \\\'\\\' TERM; while :; do /bin/sleep 1; done', 'job-runner.ts', 'daemon'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })",
+    `  runner = Bun.spawn([process.execPath, '--no-env-file', ${JSON.stringify(fakeRunner)}, 'daemon'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })`,
+    '  recordFixtureProcess(state, runner)',
     "  const runnerLease = tryAcquireProcessLock(join(lockDir, 'pid'), runner.pid)",
     "  if (!runnerLease.acquired) process.exit(73)",
     "  writeFileSync(join(lockDir, 'runtime'), process.env.FAKE_RUNNER_RUNTIME!)",
@@ -230,7 +221,7 @@ async function runLauncher(
       '    [ ! -f "$FAKE_IDENTITY_COUNTER" ] || count="$(/bin/cat "$FAKE_IDENTITY_COUNTER")"',
       '    count=$((count + 1))',
       '    printf "%s\\n" "$count" > "$FAKE_IDENTITY_COUNTER"',
-      '    [ "${FAKE_DELAY_SECOND_IDENTITY:-0}" != "1" ] || [ "$count" != "2" ] || sleep 1',
+      `    [ "\${FAKE_DELAY_SECOND_IDENTITY:-0}" != "1" ] || [ "$count" != "2" ] || ${JSON.stringify(BUN)} --no-env-file ${JSON.stringify(fixtureWait)} 1000`,
       '  fi',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
@@ -278,7 +269,7 @@ async function runLauncher(
   const herdr = join(fakeBin, 'herdr')
   writeFileSync(herdr, [
     '#!/bin/bash',
-    '[ "${FAKE_HERDR_HANG:-0}" != "1" ] || exec /bin/sleep 30',
+    `[ "\${FAKE_HERDR_HANG:-0}" != "1" ] || exec ${JSON.stringify(BUN)} --no-env-file ${JSON.stringify(fixtureWait)} 30000`,
     'if [ "${1:-}" = "--version" ]; then',
     '  echo "herdr ${FAKE_HERDR_VERSION:-0.8.2}"',
     '  exit 0',
@@ -319,6 +310,8 @@ async function runLauncher(
     cwd: launch.cwd,
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
   })
+  processes.push(child)
+  recordFixtureProcess(state, child)
   if (beforeConfirm) {
     await Bun.sleep(300)
     await beforeConfirm()
@@ -332,6 +325,17 @@ async function runLauncher(
 }
 
 describe('codex-channel.sh replacement guard', () => {
+  test('beforeConfirm failure still leaves the spawned launcher owned for cleanup', async () => {
+    const state = fixture()
+    await expect(runLauncher(state, { FAKE_HERDR_HANG: '1' }, () => { throw new Error('fixture callback failure') }))
+      .rejects.toThrow('fixture callback failure')
+    const child = processes.at(-1)!
+    expect(child).toBeDefined()
+    writeFileSync(join(state, FIXTURE_STOPPING), '')
+    await reapFixtureHandles([child])
+    await stopRecordedFixtureProcesses(state)
+    expect(typeof await child.exited).toBe('number')
+  })
   test('zerochan updateは通常起動検査より前にrepository updaterへ直接委譲する', async () => {
     const state = fixture()
     const project = join(dirname(state), 'project')
