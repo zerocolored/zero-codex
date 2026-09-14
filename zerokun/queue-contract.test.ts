@@ -298,4 +298,29 @@ describe('Zero-kun Codex wiring', () => {
     expect(updateBranch).toBeGreaterThan(-1)
     expect(updateBranch).toBeLessThan(normalInboundFifo)
   })
+
+  // 2026-09-14: cutoverがcommandの形だけでmachine全体から停止対象を選び、
+  // 偽HOMEで走らせたテストが実HOMEで稼働中の本番bridgeを停止させた。
+  // 「所有権を証明してから止める」順序をsourceの契約として固定する。
+  test('cutoverは所有権を証明したClaude bridgeだけを停止する', () => {
+    const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
+    const generation = readFileSync(join(import.meta.dir, 'process-generation.ts'), 'utf8')
+    // 候補列挙は差し替え可能な継ぎ目を通す。裸のpgrep直書きに戻さない。
+    expect(setup).toContain('PGREP_BIN="${ZEROKUN_PGREP_BIN:-/usr/bin/pgrep}"')
+    expect(setup).not.toMatch(/(?:^|[^A-Z_])pgrep -f/)
+    // 継ぎ目はsanitizeされた再実行(update.ts --setup-supervisor)でも生き残る必要がある。
+    const environment = readFileSync(join(import.meta.dir, 'child-environment.ts'), 'utf8')
+    expect(environment).toContain("'ZEROKUN_PGREP_BIN'")
+    // 所有権の判定は停止呼び出しより前で、停止側にもfragmentを渡す。
+    const owned = setup.indexOf('legacy_parent_owned_by_state "$legacy_parent"')
+    const stop = setup.indexOf('stop-owned "$legacy_parent"')
+    expect(owned).toBeGreaterThan(-1)
+    expect(stop).toBeGreaterThan(owned)
+    expect(setup).toContain('"$LEGACY_OWNED_PRIMARY"')
+    // 所有権の証拠なしに任意の正規表現で止める汎用APIを残さない。
+    expect(generation).not.toContain('stopMatchingProcess')
+    expect(generation).toContain('export function commandOwnedByState')
+    expect(generation).toContain('ownedFragments.length === 0) return \'unavailable\'')
+  })
+
 })

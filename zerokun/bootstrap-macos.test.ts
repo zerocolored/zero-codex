@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import {
   existsSync,
@@ -19,6 +19,21 @@ import { installGrokReviewer } from './install-grok-reviewer.ts'
 
 const root = join(import.meta.dir, '..')
 const bootstrap = join(import.meta.dir, 'bootstrap-macos.sh')
+// setup.shのcutoverは旧Claude版bridgeの候補をpgrepで列挙する。実pgrepのままだと
+// 偽HOMEで走らせても実HOMEで稼働中の本物のbridgeが候補に入り、テストが本番の
+// 常駐processを停止してしまう(2026-09-14に実際に発生)。ここで既定を「自分が
+// 登録したPIDしか見えないshim」に倒し、テストからmachine全体の走査を無くす。
+// 候補を登録するテストはZEROKUN_PGREP_CANDIDATESへPID一覧のpathを渡す。
+const pgrepShim = join(import.meta.dir, 'test-fixtures', 'pgrep-candidates.sh')
+let savedPgrepBin: string | undefined
+beforeAll(() => {
+  savedPgrepBin = process.env.ZEROKUN_PGREP_BIN
+  process.env.ZEROKUN_PGREP_BIN = pgrepShim
+})
+afterAll(() => {
+  if (savedPgrepBin === undefined) delete process.env.ZEROKUN_PGREP_BIN
+  else process.env.ZEROKUN_PGREP_BIN = savedPgrepBin
+})
 const completeHerdrCapabilities = [
   '--current --workspace --cwd --label --no-focus --match --source --lines',
   '--kind --pane --wait --until --timeout',
@@ -2100,7 +2115,9 @@ codex --version
       writeFileSync(fakeLaunchctl, '#!/bin/bash\nexit 42\n', { mode: 0o700 })
       claudeParent = Bun.spawn([
         '/bin/bash', '-c',
-        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+        `exec -a "claude --mcp-config ${join(stateDir, 'mcp.slack-channel.json')}`
+          + ' --dangerously-load-development-channels server:slack-channel"'
+          + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
 
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
@@ -2142,7 +2159,9 @@ codex --version
     try {
       claudeParent = Bun.spawn([
         '/bin/bash', '-c',
-        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+        `exec -a "claude --mcp-config ${join(stateDir, 'mcp.slack-channel.json')}`
+          + ' --dangerously-load-development-channels server:slack-channel"'
+          + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
@@ -2184,7 +2203,9 @@ codex --version
       writeFileSync(join(stateDir, '.env'), ambiguousEnvironment, { mode: 0o600 })
       claudeParent = Bun.spawn([
         '/bin/bash', '-c',
-        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+        `exec -a "claude --mcp-config ${join(stateDir, 'mcp.slack-channel.json')}`
+          + ' --dangerously-load-development-channels server:slack-channel"'
+          + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
@@ -2224,7 +2245,9 @@ codex --version
       ].join('\n'), { mode: 0o600 })
       claudeParent = Bun.spawn([
         '/bin/bash', '-c',
-        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+        `exec -a "claude --mcp-config ${join(stateDir, 'mcp.slack-channel.json')}`
+          + ' --dangerously-load-development-channels server:slack-channel"'
+          + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
@@ -2319,7 +2342,9 @@ codex --version
       symlinkSync(externalDb, join(stateDir, 'jobs.sqlite3'))
       claudeParent = Bun.spawn([
         '/bin/bash', '-c',
-        'exec -a "claude --dangerously-load-development-channels server:slack-channel" /bin/sleep 30',
+        `exec -a "claude --mcp-config ${join(stateDir, 'mcp.slack-channel.json')}`
+          + ' --dangerously-load-development-channels server:slack-channel"'
+          + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
@@ -2589,4 +2614,85 @@ codex --version
       rmSync(fakeHome, { recursive: true, force: true })
     }
   }, 30_000)
+
+  // 旧Claude版bridgeはlock fileを持たないので、commandの「形」だけでは
+  // どのinstallのものか判定できない。legacy launcherはstate dirをargvへ
+  // 3回渡す(--mcp-config / --settings / --append-system-prompt-file)ので、
+  // そのpathを所有権の証拠にする。形だけで止めていた頃は、別installや
+  // 実HOMEで稼働中の本番bridgeまで巻き込んでいた(2026-09-14)。
+  test('cutoverは別のstate dirに属するClaude bridgeを停止しない', async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-scope-own-'))
+    const otherHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-scope-foreign-'))
+    const stateDir = join(fakeHome, '.claude/channels/slack')
+    const foreignState = join(otherHome, '.claude/channels/slack')
+    const projectDir = join(fakeHome, 'project')
+    const decoys: Bun.Subprocess[] = []
+    try {
+      mkdirSync(stateDir, { recursive: true })
+      mkdirSync(foreignState, { recursive: true })
+      mkdirSync(projectDir, { recursive: true })
+      writeFileSync(join(stateDir, '.env'), [
+        'SLACK_BOT_TOKEN=xoxb-scope-not-a-real-token',
+        'SLACK_APP_TOKEN=xapp-1-A0123456789-scope-not-a-real-token',
+        '',
+      ].join('\n'), { mode: 0o600 })
+      // 本番bridgeと同じ形のargv。違いは埋め込まれたstate dirだけにする。
+      const decoy = (dir: string): Bun.Subprocess => {
+        const argv0 = [
+          'claude --model opus --effort max --dangerously-skip-permissions',
+          `--mcp-config ${join(dir, 'mcp.slack-channel.json')}`,
+          `--settings ${join(dir, 'bot-settings.json')}`,
+          `--append-system-prompt-file ${join(dir, 'zerokun-heavy-mode.generated.md')}`,
+          '--dangerously-load-development-channels server:slack-channel',
+        ].join(' ')
+        const child = Bun.spawn(['/bin/bash', '-c', `exec -a ${JSON.stringify(argv0)} /bin/sleep 30`], {
+          stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+        })
+        decoys.push(child)
+        return child
+      }
+      const owned = decoy(stateDir)
+      const foreign = decoy(foreignState)
+      // 候補はこの2体だけを返すshimを書く。実pgrepを呼ばないので、このMacで
+      // 稼働中の本物のbridgeは候補集合に入りようがない。
+      const candidateShim = join(fakeHome, 'pgrep-candidates.sh')
+      writeFileSync(candidateShim, `#!/bin/bash\nprintf '%s\\n' ${owned.pid} ${foreign.pid}\n`, { mode: 0o700 })
+
+      const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          PATH: setupTestPath(fakeHome),
+          ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_LEGACY_CUTOVER: '1',
+          ZEROKUN_PROJECT_DIR: projectDir,
+          ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          ZEROKUN_PGREP_BIN: candidateShim,
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(result.stdout.toString()).toContain('旧Claude版Zeroちゃん親processを停止しました')
+      // 停止済みの子はreapされるまでzombieとして残り、kill(pid, 0)は成功して
+      // しまう。生死はexitedの解決で判定する。
+      const settled = async (child: Bun.Subprocess): Promise<'exited' | 'alive'> =>
+        await Promise.race([
+          child.exited.then(() => 'exited' as const),
+          Bun.sleep(1_000).then(() => 'alive' as const),
+        ])
+      expect(await settled(owned)).toBe('exited')
+      // 別のstate dirに属するbridgeには触れない。
+      expect(await settled(foreign)).toBe('alive')
+    } finally {
+      for (const child of decoys) {
+        try { child.kill(9) } catch {}
+        try { await child.exited } catch {}
+      }
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(otherHome, { recursive: true, force: true })
+    }
+  }, 30_000)
+
 })

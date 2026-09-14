@@ -298,7 +298,22 @@ export function signalProcessGroupIfLeaderLive(
 
 export type ExactProcessStopResult = 'stopped' | 'unavailable' | 'timeout'
 
-function processCommandMatches(pid: number, pattern: RegExp): boolean | undefined {
+/**
+ * Literal argv substrings proving the process belongs to this installation.
+ * The command shape alone is not ownership: every Zero-kun bridge on the
+ * machine shares it, so matching on shape stops other people's processes.
+ * Fragments are compared literally, never as a pattern, so a path containing
+ * regular-expression metacharacters cannot widen the match.
+ */
+export function commandOwnedByState(
+  command: string, ownedFragments: readonly string[],
+): boolean {
+  return ownedFragments.some(fragment => fragment.length > 0 && command.includes(fragment))
+}
+
+function processCommandMatches(
+  pid: number, pattern: RegExp, ownedFragments: readonly string[],
+): boolean | undefined {
   const result = Bun.spawnSync(
     ['/bin/ps', '-ww', '-o', 'command=', '-p', String(pid)],
     {
@@ -310,20 +325,30 @@ function processCommandMatches(pid: number, pattern: RegExp): boolean | undefine
     },
   )
   if (result.exitCode !== 0) return undefined
-  return new RegExp(pattern.source, pattern.flags).test(result.stdout.toString())
+  const command = result.stdout.toString()
+  if (!commandOwnedByState(command, ownedFragments)) return false
+  return new RegExp(pattern.source, pattern.flags).test(command)
 }
 
-/** Stop a matching command without ever following a recycled numeric PID. */
-export async function stopMatchingProcess(
+/**
+ * Stop a process owned by this installation, without ever following a recycled
+ * numeric PID. Ownership is re-checked on both reads, so a PID recycled into
+ * another installation's bridge between the caller's check and the signal is
+ * refused rather than stopped. An empty fragment list fails closed.
+ */
+export async function stopOwnedProcess(
   pid: number,
   commandPattern: RegExp,
-  timeoutMs = 30_000,
+  timeoutMs: number,
+  ownedFragments: readonly string[],
 ): Promise<ExactProcessStopResult> {
   if (!Number.isSafeInteger(pid) || pid <= 1
-    || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return 'unavailable'
-  if (processCommandMatches(pid, commandPattern) !== true) return 'unavailable'
+    || !Number.isFinite(timeoutMs) || timeoutMs <= 0
+    || ownedFragments.length === 0) return 'unavailable'
+  if (processCommandMatches(pid, commandPattern, ownedFragments) !== true) return 'unavailable'
   const expected = readProcessIdentity(pid)
-  if (!expected || processCommandMatches(pid, commandPattern) !== true) return 'unavailable'
+  if (!expected
+    || processCommandMatches(pid, commandPattern, ownedFragments) !== true) return 'unavailable'
   if (!signalProcessIfLive(expected, 'SIGTERM')) {
     return observeProcessGeneration(expected).status === 'dead' ? 'stopped' : 'unavailable'
   }
@@ -338,17 +363,18 @@ export async function stopMatchingProcess(
 }
 
 if (import.meta.main) {
-  const [command, pidValue, patternValue, timeoutValue] = process.argv.slice(2)
-  if (command !== 'stop-matching' || !pidValue || !patternValue) {
+  const [command, pidValue, patternValue, timeoutValue, ...ownedFragments] = process.argv.slice(2)
+  if (command !== 'stop-owned' || !pidValue || !patternValue || ownedFragments.length === 0) {
     process.stderr.write(
-      'usage: process-generation.ts stop-matching <pid> <command-pattern> [timeout-ms]\n',
+      'usage: process-generation.ts stop-owned <pid> <command-pattern> <timeout-ms>'
+        + ' <owned-path-fragment>...\n',
     )
     process.exit(2)
   }
   try {
     const timeoutMs = timeoutValue === undefined ? 30_000 : Number(timeoutValue)
-    const result = await stopMatchingProcess(
-      Number(pidValue), new RegExp(patternValue), timeoutMs,
+    const result = await stopOwnedProcess(
+      Number(pidValue), new RegExp(patternValue), timeoutMs, ownedFragments,
     )
     if (result !== 'stopped') {
       process.stderr.write(`exact process stop failed: ${result}\n`)
