@@ -554,20 +554,24 @@ async function notifySlack(dir: string, request: UpdateRequest, text: string): P
       method: 'auth.test' | 'bots.info',
       fields: Record<string, string> = {},
     ): Promise<Record<string, any>> => {
-      const response = await withUpdateSlackDeadline(signal => fetch(
-        `https://slack.com/api/${method}`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${botToken}`,
-            'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+      // bodyの読み出しまでdeadlineの内側で行う。scopeを抜けるとsignalがabortされ、
+      // 外でresponse.json()を呼ぶと必ず「The operation was aborted」になる。
+      const { result, status } = await withUpdateSlackDeadline(async signal => {
+        const response = await fetch(
+          `https://slack.com/api/${method}`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${botToken}`,
+              'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+            },
+            body: new URLSearchParams(fields),
+            signal,
           },
-          body: new URLSearchParams(fields),
-          signal,
-        },
-      ), 10_000)
-      const result = await response.json() as Record<string, any>
-      if (!result.ok) throw new Error(result.error ?? `Slack ${method} HTTP ${response.status}`)
+        )
+        return { result: await response.json() as Record<string, any>, status: response.status }
+      }, 10_000)
+      if (!result.ok) throw new Error(result.error ?? `Slack ${method} HTTP ${status}`)
       return result
     }
     await verifySlackAppTokenPair(appToken, {
@@ -588,26 +592,32 @@ async function notifySlack(dir: string, request: UpdateRequest, text: string): P
   let lastError = 'unknown error'
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const response = await withoutUpdateNotificationNetworkOverrides(() => (
-        withUpdateSlackDeadline(signal => fetch(
-          'https://slack.com/api/chat.postMessage', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${botToken}`,
-            'Content-Type': 'application/json; charset=utf-8',
-          },
-          body: JSON.stringify({
-            channel: request.chatId,
-            thread_ts: request.threadTs,
-            text,
-            client_msg_id: updateNotificationClientId(request.id),
-          }),
-          signal,
-        }), Number(process.env.ZEROKUN_SLACK_HTTP_TIMEOUT_MS) || DEFAULT_SLACK_HTTP_TIMEOUT_MS)
+      const { result, status } = await withoutUpdateNotificationNetworkOverrides(() => (
+        withUpdateSlackDeadline(async signal => {
+          const response = await fetch(
+            'https://slack.com/api/chat.postMessage', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${botToken}`,
+              'Content-Type': 'application/json; charset=utf-8',
+            },
+            body: JSON.stringify({
+              channel: request.chatId,
+              thread_ts: request.threadTs,
+              text,
+              client_msg_id: updateNotificationClientId(request.id),
+            }),
+            signal,
+          })
+          // 上のidentity呼び出しと同じ理由で、bodyもこのscopeの中で読み切る。
+          return {
+            result: await response.json() as { ok?: boolean; error?: string },
+            status: response.status,
+          }
+        }, Number(process.env.ZEROKUN_SLACK_HTTP_TIMEOUT_MS) || DEFAULT_SLACK_HTTP_TIMEOUT_MS)
       ))
-      const result = await response.json() as { ok?: boolean; error?: string }
       if (result.ok) return
-      lastError = result.error ?? `HTTP ${response.status}`
+      lastError = result.error ?? `HTTP ${status}`
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error)
     }

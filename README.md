@@ -103,9 +103,9 @@ Slack bot
   Chrome子processと一時profileの回収をまとめて返します。
   UI/UX承認前は製品repositoryを書き換えず、現在画面とscratch内だけの提案画面を撮影します。画像は
   完全decode後にpixel-bearing chunkだけへ再封印し、metadataとローカルpathをSlackへ持ち出しません。
-- advisorの要否、人数、取得結果の扱いは`AGENTS.md`に従ってCodexが決めます。GrokとClaudeには
-  認証情報をモデルへ渡さない狭い`zerokun_advisors` transportだけを提供しますが、phase選択・quorum・
-  完了判定は行いません。各phaseの3枠の起動／回答状態は構造化した実測値で返し、欠員をjob失敗へ変換しません。
+- advisorを使用する設計・レビューでは、GPT・Grok・Claudeの3回答取得が必須です。GrokとClaudeには
+  認証情報をモデルへ渡さない`zerokun_advisors` transportを提供します。
+  各phaseの実測状態を返し、欠員は成功扱いせず未完了で復旧します。
   秘密・credential・個人情報をSlack依頼へ貼り付けないでください。
 - Socket Mode 停止中の DM・メンションと、採用済みスレッドの未メンション返信を履歴から回収します。
 
@@ -142,11 +142,17 @@ Grok 1枠とfresh Claude Fable 5.1 1枠を`zerokun_advisors`経由で起動し�
 freshにした第2回でその差分と直接の回帰だけを確認します。軽微な指摘、advisorの欠員、空の修正差分では
 第2回を起動せず、第3回はありません。transportはreview roundを独自に要求せず、各枠を
 `未起動／起動未確認／起動済み未回答／回答取得`に分けて返します。
-advisorが利用不能でも、`AGENTS.md`のbest-effort規則に従ってCodex本体の作業を継続します。
+3者の有効な回答が揃うまで設計・レビューを完了扱いにしません。未回収時はSlackへ担当名と原因を通知します。
+終了と回収を確認した外部枠の一時失敗は30秒・60秒後に自動再試行し、取得済み枠は再起動しません。
+なお不足する場合は同じroundの`retryUnavailable=true`で欠員だけを復旧します。これは追加review roundではありません。
+認証切れ・設定不備は必要な復旧操作を案内し未完了で待機します。復旧後は同じスレッドで再開できます。
+回答本文はowner-onlyのローカルstateへ保存します。追加入力の意味はメインCodexが判定し、
+依頼内容が変わった場合は古い回答をそのまま新しい依頼への承認として扱いません。
+実行が終了して新しいジョブとして再開する場合は、スレッドの履歴を参照したうえで必要な意見を取得し直します。
 Grok 1.0.5の既知の未認証応答を厳密に確認した場合だけ、macOSでは初期設計phaseと最終review phaseで
 それぞれ1回だけOAuth復旧を
 試み、成功時は認証で終了した枠だけを再実行します。認証画面・rate limit・quota・network障害を
-未認証と推測して繰り返すことはなく、復旧不能でもprimary Codexの作業は止めません。
+未認証と推測して繰り返すことはありません。復旧不能の場合は未完了と必要な対応を通知します。
 
 ## セットアップ
 
@@ -251,6 +257,10 @@ bash zerokun/interactive-bootstrap.sh \
 生成されたmanifestでAppを作成・installし、そのApp自身の`xapp-...`と`xoxb-...`を入力します。
 別PCのtokenは使いません。同じSlackチャンネルへ複数のAppを招待しても構いませんが、新規依頼では
 処理させたいAppをメンションしてください。
+
+クラウド経由で作業を引き継ぐ追加機能は [クラウド引き継ぎ](docs/cloud-handoff.md) を参照してください。
+利用上限時の保存と、別Appへの明示的な引き継ぎを扱います。各PCで追加設定が必要で、
+通常のupdateだけでは有効になりません。SQLiteや認証ファイルをPC間でコピーしないでください。
 
 ### 3. projectとSlackチャンネルを設定して起動する
 

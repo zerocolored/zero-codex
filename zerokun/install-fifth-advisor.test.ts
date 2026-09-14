@@ -424,6 +424,21 @@ describe('fifth-advisor helper installer', () => {
     expect(memberChanged.stdout.toString()).toContain('protected-metadata-changed')
   })
 
+  test('multi-repo snapshot accepts current v2 workspace pins', () => {
+    const home = fixture()
+    const { project, request } = multiRepoProject(home)
+    writeFileSync(join(project, '.zerochan', 'workspace.json'), JSON.stringify({
+      version: 2, kind: 'multi-repo-workspace', projectRepository: false,
+      members: ['backend', 'frontend', 'meeting-app'],
+    }), { mode: 0o600 })
+    const result = Bun.spawnSync(['/usr/bin/python3', installFifthAdvisorHelper(home), 'snapshot',
+      '--project-root', project, '--request-dir', request], {
+      env: { HOME: home, PATH: '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(result.stdout.toString()).toContain('snapshot-recorded')
+  })
+
   test('multi-repo snapshotは安全な親AGENTS.mdの内容変更を検出する', () => {
     const home = fixture()
     const { project, request } = multiRepoProject(home)
@@ -487,6 +502,55 @@ describe('fifth-advisor helper installer', () => {
     ], { env: { HOME: home, PATH: '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe' })
     expect(opened.exitCode).toBe(3)
     expect(opened.stdout.toString()).not.toContain('ephemeral-claude-ready')
+  })
+
+  test('同じClaudeの起動後sequence前進は許容し送信直前の状態変化は拒否する', () => {
+    const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
+    const program = [
+      'import importlib.util,json,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor",sys.argv[1])',
+      'm=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+      'workspace={"nonce":"n","agent_name":"fifth-test","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef"}',
+      'receipt=dict(workspace,version=2,native_session="N/A:safe-mode",state_change_seq=1,shell_pid=10,claude_pid=11,process_group_id=11,process_ids=[10,11],argv=[],argv0="claude",executable={})',
+      'm._validate_workspace_receipt=lambda *args: None',
+      'm._same_caller=lambda *args: True; m._current_pane=lambda: {}',
+      'm._valid_claude_invocation=lambda *args: True',
+      'm._validate_owned_agent=lambda *args,**kwargs: None',
+      'm._read_visible=lambda target: "❯\\n"',
+      'm._process_receipt=lambda workspace: dict(receipt)',
+      'm._agent_information=lambda target: ({},{"state_change_seq":7})',
+      'assert m._owned_target({"caller":{}},workspace,receipt)=="fifth-test"',
+      'observations=iter([7,8])',
+      'm._agent_information=lambda target: ({},{"state_change_seq":next(observations)})',
+      'try: m._owned_target({"caller":{}},workspace,receipt)',
+      'except m.UnsafeRequest: print("stable accepted; concurrent transition rejected")',
+      'else: raise AssertionError("concurrent transition was accepted")',
+    ].join('\n')
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], { stdout: 'pipe', stderr: 'pipe' })
+    expect(result.stderr.toString()).toBe('')
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.toString()).toContain('stable accepted; concurrent transition rejected')
+  })
+
+  test('送信前のsocket失敗は原因種別を残し送達済みと誤報しない', () => {
+    const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
+    const program = [
+      'import importlib.util,sys,types',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor",sys.argv[1])',
+      'm=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+      'class Connection:',
+      ' def __enter__(self): return self',
+      ' def __exit__(self,*args): pass',
+      ' def settimeout(self,value): pass',
+      ' def connect(self,value): raise TimeoutError("private diagnostic content")',
+      'm.socket.socket=lambda *args: Connection()',
+      'sys.exit(m._attempt_send(types.SimpleNamespace(socket_path="unused")))',
+    ].join('\n')
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], { stdout: 'pipe', stderr: 'pipe' })
+    expect(result.exitCode).toBe(5)
+    expect(result.stdout.toString()).not.toContain('prompt-started')
+    expect(result.stderr.toString()).toContain('TimeoutError')
+    expect(result.stderr.toString()).not.toContain('private diagnostic content')
   })
 
   test('agent_not_ready後に既trustのempty ready promptへ到達したClaudeを受理する', () => {
@@ -806,6 +870,52 @@ describe('fifth-advisor helper installer', () => {
       if (serverExpectedToComplete) expect(exitCode, stderr).toBe(0)
     }
   }, 15_000)
+
+  test('metadata監査例外は起動や送信を拒否する例外に昇格しない', () => {
+    const home = fixture()
+    const helper = installFifthAdvisorHelper(home)
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', [
+      'import importlib.util,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor_under_test",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'def unavailable(*args): raise OSError("synthetic audit failure")',
+      'module._verify_unchanged=unavailable',
+      'module._audit_metadata(-1,None,-1)',
+      'print("audit exception retained as warning")',
+    ].join('\n'), helper], { stdout: 'pipe', stderr: 'pipe' })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.toString()).toContain('audit exception retained as warning')
+    expect(result.stderr.toString()).toContain('audit unavailable')
+  })
+
+  test('snapshot後workspace作成前の並行metadata変化でも起動できる', () => {
+    const home = fixture()
+    const { project, request } = gitProject(home)
+    const helper = installFifthAdvisorHelper(home)
+    const lifecycle = fakeLifecycle(home, project)
+    const invoke = (command: string) => Bun.spawnSync([
+      '/usr/bin/python3', helper, command,
+      '--project-root', project, '--request-dir', request,
+    ], { env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(invoke('snapshot').exitCode).toBe(0)
+    writeFileSync(join(project, '.env.audit-fixture'), 'synthetic runtime', { mode: 0o600 })
+    const opened = Bun.spawnSync(['/usr/bin/python3', '-c', [
+      'import argparse,importlib.util,sys',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor_under_test",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'module._run_open_with_signal_cleanup=lambda *args: 0',
+      'args=argparse.Namespace(project_root=sys.argv[2],request_dir=sys.argv[3])',
+      'assert module._open_command(args)==0',
+      'print("workspace creation reached")',
+    ].join('\n'), helper, project, request], {
+      env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(opened.exitCode, opened.stderr.toString()).toBe(0)
+    expect(opened.stdout.toString()).toContain('workspace creation reached')
+    expect(opened.stderr.toString()).toContain('metadata changed')
+  })
 
   test('exact closeはforeign workspaceとprotected差を監査値に留め再実行可能にする', () => {
     const home = fixture()

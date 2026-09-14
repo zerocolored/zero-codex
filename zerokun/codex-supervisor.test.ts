@@ -40,6 +40,45 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<voi
 }
 
 describe('Codex stable supervisor gate', () => {
+  test.skipIf(process.platform !== 'darwin')(
+    'interjection pause survives unreadable descendant cleanup and retains warning evidence',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'zerokun-supervisor-unknown-pause-'))
+      temporaryRoots.push(root)
+      const registration = join(root, 'executor.json')
+      const fakeCodex = join(root, 'fake-codex')
+      writeFileSync(fakeCodex, '#!/bin/sh\necho "[ZERO_INTERJECTION_PAUSED:test]"\nexit 0\n', { mode: 0o700 })
+      const supervisor = Bun.spawn([
+        process.execPath, '--config=/dev/null', '--no-env-file',
+        join(import.meta.dir, 'codex-supervisor.ts'),
+        'unknown-pause-job', registration, '--unverified-for-tests', '--', fakeCodex,
+      ], {
+        cwd: root,
+        env: {
+          PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root,
+          ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1',
+          ZEROKUN_SUPERVISOR_TEST_UNKNOWN_DESCENDANT: '1',
+        },
+        stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', detached: true,
+      })
+      const identity = readProcessIdentity(supervisor.pid)!
+      liveSupervisors.push(identity)
+      const [exit, stdout, stderr] = await Promise.all([
+        supervisor.exited, new Response(supervisor.stdout).text(), new Response(supervisor.stderr).text(),
+      ])
+      expect(exit).toBe(0)
+      expect(stdout).toContain('[ZERO_INTERJECTION_PAUSED:test]')
+      expect(stdout).not.toContain('supervisor-retained')
+      expect(stderr).toContain('not signaled, continuing')
+      const receipt = JSON.parse(readFileSync(registration, 'utf8'))
+      expect(receipt.phase).toBe('cleanup-confirmed')
+      expect(receipt.cleanupWarnings).toEqual([{ pid: 1_000_000, started: identity.started }])
+      expect(receipt.tracked).toContainEqual(receipt.cleanupWarnings[0])
+      expect(observeProcessGeneration(identity).status).toBe('dead')
+    },
+    10_000,
+  )
+
   test('Bunが返すsignal名を数値のshell exit codeへ正規化する', () => {
     expect(subprocessExitCode(null, 'SIGTERM')).toBe(143)
     expect(subprocessExitCode(null, 'SIGINT')).toBe(130)

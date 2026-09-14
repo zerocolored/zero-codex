@@ -5,8 +5,8 @@
 常駐するSlack gatewayが受信をSQLiteへ保存し、Herdr内から起動された1本のrunnerが
 `codex app-server --stdio`をJSON-RPCで直列実行します。Codexはglobal→projectの`AGENTS.md`をjobごとに読み、
 read jobは回答まで、write jobは調査・設計・実装・review・Git・依頼されたmerge／deploy確認までを
-1つのprimary Codex workflowで完遂します。Zeroちゃんは独自のphaseやadvisor quorumを追加せず、
-外部advisorには認証を隔離した狭いtransportと実測したslot状態だけを提供します。
+1つのprimary Codex workflowで完遂します。設計・レビューで使うGPT・Grok・Claudeの回答は3者分を必須とし、
+認証を隔離したtransportで未取得枠だけを復旧します。
 
 ## 導入
 
@@ -149,7 +149,7 @@ FIFO入力として保持し、後から`中止`が届いても元jobに束縛�
 read-only／write jobとも、1つのprimary Codex processと1つの`complete` turnで実行します。write jobでは
 `AGENTS.md`を読んだCodexが調査・design・実装・review・test・Git・依頼されたmerge／deploy確認を最後まで
 担当します。Zeroちゃんはprepare／implementation／reviewへprocess分割せず、外部advisor transportの
-欠員やreceiptを完了gateにして結果を差し戻しません。未信頼のSlack本文はprocess argvへ入れず、JSON-RPCの
+欠員があれば設計・レビューを未完了に保ち、取得済み回答を保持して復旧します。未信頼のSlack本文はprocess argvへ入れず、JSON-RPCの
 `turn/start` inputとして渡します。
 
 ```text
@@ -166,7 +166,9 @@ codex <trust-args> -C <repo> \
 - 新規sessionは`thread/start`、継続sessionは`thread/resume`を使います。session IDをZeroちゃん側で
   推測・採番せず、responseのthread ID、物理cwd、OpenAI provider、model、`approvalPolicy: never`、
   named permission profile、AGENTS instruction sourceが全て一致した場合だけ保存します。通常失敗でも
-  session自体を明示的にretireしていなければ、同じSlack threadの次jobでそのsessionをresumeします。
+  session自体を明示的にretireしていなければ、同じSlack thread・同じ物理作業場所の次jobでそのsessionをresumeします。
+  クラウド作業場所へ移る場合はsessionとcwdのローカル台帳を照合し、不一致・旧台帳未登録なら
+  保存済みスレッド履歴を渡して新規sessionを開始します。旧sessionや元の作業ファイルは削除しません。
 - primary modelは`gpt-6-astra`、reasoning effortは`low`をrelease codeからApp Server起動、
   `thread/start`／`thread/resume`、全`turn/start`へ明示します。handshakeの実効値も照合し、
   `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。advisor modelは`AGENTS.md`の別契約です。
@@ -221,13 +223,16 @@ codex <trust-args> -C <repo> \
 - read senderは1つのread-only Codex workflow、write senderは1つのwrite-authorized Codex workflowを使います。
   advisor、review、test、Git、deployの進め方はCodexが`AGENTS.md`から決め、Zeroちゃんは別phaseへ分割しません。
 - advisorが必要なjobでは、初期設計のnative Codex solution analyst 1枠、最終reviewのnative Codex risk reviewer
-  1枠に加え、`zerokun_advisors`が各roundでGrok 1枠とfresh Claude Fable 5.1 1枠をbest-effortで起動します。
+  1枠に加え、`zerokun_advisors`が各roundでGrok 1枠とfresh Claude Fable 5.1 1枠を起動し3者の有効回答を必須とします。
   最終review第2回は、第1回の必須指摘をprimary Codexが採用しtask所有の修正差分を作った場合だけ、そのdeltaに
   限って起動します。軽微な指摘・advisor欠員・空deltaでは起動せず、第3回はありません。返却するslot集計は
   `未起動／起動未確認／起動済み未回答／回答取得`を区別し、primary Codexはこの構造化値だけを人数報告の根拠にします。
 - Grokの既知の未認証応答だけは、初期設計phaseと最終review phaseでそれぞれ1回に限って固定OAuth helperへ渡し、復旧できた場合も
-  認証で終了した枠だけを再実行します。helper、reviewer、Claudeの失敗は外部枠の利用不能として閉じ、
-  primary Codexのtaskを失敗や再設計へ戻しません。
+  認証で終了した枠だけを再実行します。一時失敗は30秒・60秒後に外部枠だけを自動再試行します。
+  取得済み回答は直ちに保存し、他枠の待機中の中断にも備えます。回答不足のまま終了しても成功通知にしません。
+  未取得枠の再試行は同じroundのretry指定で行い、認証や設定修復が必要なら具体的な操作を案内して待機します。
+  クラウド用multi-repo作業場所は新規作成・既存再開・引き継ぎ時にworkspace設定を保証し、
+  Claude helperは旧v1と非Git親のv2設定を読み取ります。既存のbranchや未コミット変更は作り直しません。
 - write jobでは公開HTTPSへ到達できるBrowser／Chrome、localhost用の隔離browser verifier、
   repository限定GitHub credential brokerを利用できます。
   brokerはSlack token、GitHub token、operator HOMEをmodelへ公開せず、Codexが選んだ操作だけを実行します。

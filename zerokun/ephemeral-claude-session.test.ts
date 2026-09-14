@@ -779,7 +779,7 @@ describe('ephemeral Claude lifecycle state', () => {
     })
     expect(result).toEqual({ closed: 1, discardedBeforeOpen: 0 })
     expect(commands).toEqual(['recover'])
-    expect(existsSync(intentOnly)).toBe(true)
+    expect(existsSync(intentOnly)).toBe(false)
     const repeated = await reconcileEphemeralClaudeSessions({ stateDir: state, runtime }, {
       resolveHelper: () => '/fixture/helper',
       resolveClaudeLookup: () => '/usr/local/bin/claude',
@@ -793,8 +793,9 @@ describe('ephemeral Claude lifecycle state', () => {
         }
       },
     })
-    expect(repeated).toEqual({ closed: 1, discardedBeforeOpen: 0 })
-    expect(existsSync(intentOnly)).toBe(true)
+    expect(repeated).toEqual({ closed: 0, discardedBeforeOpen: 0 })
+    expect(existsSync(intentOnly)).toBe(false)
+    expect(request(state, { phase: 'review' })).toBe(intentOnly)
 
     expect(() => parseEphemeralClaudeProvisionalRecovery(
       '{"status":"ephemeral-provisional-reconciled","workspace_id":"foreign"}\n',

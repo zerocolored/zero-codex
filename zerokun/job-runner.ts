@@ -1,6 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
+import { advisorFailureMessage, PUBLIC_ADVISOR_FAILURE_MESSAGES, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
   chmodSync,
@@ -47,6 +48,8 @@ import {
   type ProcessLockLease,
 } from './process-lock.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
+import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, type CloudControl } from './cloud-runtime.ts'
+import { CLOUD_SAVE_FAILED_MESSAGE } from './cloud-handoff.ts'
 import { createAdvisorInputSnapshot, readAdvisorInputSnapshot } from './advisor-input.ts'
 import {
   containsCredentialMaterial,
@@ -245,6 +248,17 @@ export const DEFAULT_MAX_REPOSITORY_DRIFT_RETRIES = 3 as const
 const CLAIMABLE_CODEX_JOB_PREDICATE = `
   jobs.runtime = 'codex'
   AND jobs.status = 'queued'
+  AND NOT EXISTS (
+    SELECT 1 FROM cloud_handoff_controls pending_cloud
+    WHERE pending_cloud.completed_at IS NULL
+      AND json_extract(pending_cloud.payload,'$.channel') = jobs.chat_id
+      AND json_extract(pending_cloud.payload,'$.thread') = jobs.thread_ts
+      AND CAST(json_extract(pending_cloud.payload,'$.message') AS REAL) < CAST(jobs.message_id AS REAL)
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM cloud_handoff_jobs cloud_wait
+    WHERE cloud_wait.job_id = jobs.id AND cloud_wait.state <> 'active'
+  )
   AND jobs.ui_approval_request_id IS NULL
   AND NOT EXISTS (
     SELECT 1 FROM inbound_deliveries AS inbound
@@ -504,6 +518,10 @@ type InboundDeliveryRow = {
 }
 
 export interface JobRecord {
+  /** Actual host receipts, independent of what the resumed model remembers saying. */
+  previousSlackDelivery?: { seq: number; bodyDelivered: boolean; filesDelivered: number; filesDeclared: number }
+  /** Host-only logical history scope when executing in a dedicated cloud worktree. */
+  historyRepoPath?: string
   taskGoalStatus?: string | null
   seq: number
   id: string
@@ -757,6 +775,11 @@ CREATE TABLE IF NOT EXISTS codex_session_protocols (
   session_id TEXT PRIMARY KEY,
   protocol_version INTEGER NOT NULL,
   recorded_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS codex_session_workspaces (
+  session_id TEXT PRIMARY KEY,
+  physical_cwd TEXT NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES codex_session_protocols(session_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS codex_session_job_uses (
   session_id TEXT NOT NULL,
@@ -4268,6 +4291,26 @@ export class JobStore {
           db.exec('PRAGMA journal_mode=WAL')
           db.exec('PRAGMA synchronous=FULL')
           db.exec(JOB_SCHEMA)
+          db.exec(`CREATE TABLE IF NOT EXISTS cloud_handoff_jobs (
+            job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+            state TEXT NOT NULL CHECK (state IN ('active','saving','waiting','transferred','importing')),
+            cloud_id TEXT NOT NULL, epoch INTEGER NOT NULL,
+            receipt_json TEXT NOT NULL, package_path TEXT,
+            last_error TEXT, reset_at INTEGER, updated_at INTEGER NOT NULL
+          )`)
+          if (!db.query<{ name: string }, []>('PRAGMA table_info(cloud_handoff_jobs)').all().some(c => c.name === 'reset_at')) {
+            db.exec('ALTER TABLE cloud_handoff_jobs ADD COLUMN reset_at INTEGER')
+          }
+          db.exec(`CREATE TABLE IF NOT EXISTS cloud_handoff_controls (
+            event_id TEXT PRIMARY KEY, payload TEXT NOT NULL,
+            completed_at INTEGER, retry_at INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+          )`)
+          db.exec(`CREATE TABLE IF NOT EXISTS cloud_handoff_context (
+            job_id TEXT NOT NULL REFERENCES jobs(id), source_key TEXT NOT NULL,
+            payload TEXT NOT NULL, created_at INTEGER NOT NULL,
+            PRIMARY KEY(job_id,source_key)
+          )`)
           ensureJobSchemaMigrations(db)
           return db
         } catch (error) {
@@ -4610,6 +4653,7 @@ export class JobStore {
       throw new Error('App Server rate-limit wait notification is invalid')
     }
     const idempotencyKey = rateLimitWaitNotificationKey(jobId, attempt, threadId, turnId)
+    if (this.cloudHandoff(jobId)) return 'closed'
     const stage = this.db.transaction((): 'staged' | 'duplicate' | 'closed' => {
       const job = this.db.query<{
         status: JobStatus
@@ -5214,6 +5258,7 @@ export class JobStore {
          UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = intent.idempotency_key
          UNION ALL SELECT 1 FROM delivery_tombstones WHERE idempotency_key = intent.idempotency_key
          UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = intent.idempotency_key
+         UNION ALL SELECT 1 FROM cloud_handoff_controls WHERE event_id = intent.idempotency_key
          LIMIT 1
        )
        ORDER BY intent.chat_id, intent.thread_ts,
@@ -5265,6 +5310,7 @@ export class JobStore {
                  UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = earlier.idempotency_key
                  UNION ALL SELECT 1 FROM delivery_tombstones WHERE idempotency_key = earlier.idempotency_key
                  UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = earlier.idempotency_key
+                 UNION ALL SELECT 1 FROM cloud_handoff_controls WHERE event_id = earlier.idempotency_key
                  LIMIT 1
                )
            )`,
@@ -5599,6 +5645,7 @@ export class JobStore {
 
   hasDurableEvent(idempotencyKey: string): boolean {
     const key = requireText(idempotencyKey, 'idempotencyKey')
+    if (this.db.query<{ present: number }, [string]>('SELECT 1 AS present FROM cloud_handoff_controls WHERE event_id=?').get(key)) return true
     return retrySqlite(() => this.db.query<
       { present: number }, [string, string, string, string, string, string]
     >(
@@ -8391,6 +8438,7 @@ export class JobStore {
       if (snapshot.revision !== options.inputRevision
         || snapshot.digest !== options.inputDigest) return 'input-changed' as const
       if (options.execution) {
+        if (options.execution.taskGoalStatus) this.recordTaskGoalStatus(options.jobId, options.execution.taskGoalStatus)
         this.ensureExecutionResultStagedInternal(
           options.jobId,
           options.execution.sessionId,
@@ -8647,6 +8695,207 @@ export class JobStore {
     return row ? mapRow(row) : null
   }
 
+  previousSlackDelivery(id: string): JobRecord['previousSlackDelivery'] {
+    const prior = this.db.query<{ id: string; seq: number }, [string]>(
+      `SELECT prior.id, prior.seq FROM jobs current JOIN jobs prior
+       ON prior.chat_id=current.chat_id AND prior.thread_ts=current.thread_ts
+         AND prior.repo_path=current.repo_path AND prior.write_enabled=current.write_enabled
+         AND prior.runtime=current.runtime AND prior.seq<current.seq
+       WHERE current.id=? ORDER BY prior.seq DESC LIMIT 1`,
+    ).get(id)
+    if (!prior) return undefined
+    const files = this.db.query<{ declared: number; delivered: number }, [string]>(
+      'SELECT COUNT(*) AS declared, COUNT(delivered_at) AS delivered FROM artifact_deliveries WHERE job_id=?',
+    ).get(prior.id)!
+    const body = this.db.query<{ body_delivered_at: number | null }, [string]>(
+      'SELECT body_delivered_at FROM terminal_notifications WHERE job_id=?',
+    ).get(prior.id)
+    return { seq: prior.seq, bodyDelivered: body?.body_delivered_at != null,
+      filesDelivered: files.delivered, filesDeclared: files.declared }
+  }
+
+  cloudHandoff(id: string): { state: string; cloudId: string; epoch: number; receipt: string; packagePath: string | null; resetAt: number | null } | null {
+    const row = this.db.query<{ state: string; cloud_id: string; epoch: number; receipt_json: string; package_path: string | null; reset_at: number | null }, [string]>(
+      'SELECT * FROM cloud_handoff_jobs WHERE job_id = ?',
+    ).get(id)
+    return row ? { state: row.state, cloudId: row.cloud_id, epoch: row.epoch,
+      receipt: row.receipt_json, packagePath: row.package_path, resetAt: row.reset_at } : null
+  }
+
+  cloudHistory(id: string): string {
+    const job = this.db.query<JobRow, [string]>('SELECT * FROM jobs WHERE id=?').get(id)
+    if (!job) throw new Error('cloud history job missing')
+    const prior = this.threadHistorySnapshot(id).transcript
+    const events = threadHistoryEventsForSettledJob(this.db, job).filter(event => event.kind !== 'outcome')
+    const messages = this.db.query<{ payload: string }, [string]>(
+      'SELECT payload FROM cloud_handoff_context WHERE job_id=? ORDER BY created_at,rowid',
+    ).all(id).map(row => row.payload).join('\n\n')
+    return redactCredentialMaterial(`${prior}\n\nCurrent task events:\n${events.map(event => `[${event.kind}] ${event.text}`).join('\n\n')}\n\nVisible Codex output (including messages not posted to Slack):\n${messages}`, '[credential removed]')
+  }
+
+  recordCloudContext(id: string, sourceKey: string, text: string): void {
+    if (!this.cloudHandoff(id)) return
+    this.db.run('INSERT OR IGNORE INTO cloud_handoff_context(job_id,source_key,payload,created_at) VALUES(?,?,?,?)',
+      [id, sourceKey, redactCredentialMaterial(text, '[credential removed]'), Date.now()])
+  }
+
+  pendingCloudSaves(): JobRecord[] {
+    return this.db.query<JobRow, []>(`SELECT jobs.* FROM jobs JOIN cloud_handoff_jobs c ON c.job_id=jobs.id
+      WHERE c.state='saving' AND jobs.status='queued' AND coalesce(c.last_error,'')<>'checkpoint-blocked'
+      AND c.updated_at<${Date.now() - 30_000} ORDER BY jobs.seq`).all().map(mapRow)
+  }
+
+  recordCloudQuotaDetected(id: string, resetAt: number | undefined): void {
+    this.db.run("UPDATE cloud_handoff_jobs SET last_error='quota-observed',reset_at=coalesce(?,reset_at),updated_at=? WHERE job_id=? AND state='active'",
+      [resetAt ?? null, Date.now(), id])
+  }
+
+  blockCloudSave(id: string): void {
+    const previous = this.db.query<{ last_error: string | null }, [string]>('SELECT last_error FROM cloud_handoff_jobs WHERE job_id=?').get(id)
+    if (previous?.last_error === 'checkpoint-blocked') return
+    this.db.run("UPDATE cloud_handoff_jobs SET last_error='checkpoint-blocked',updated_at=? WHERE job_id=? AND state='saving'", [Date.now(), id])
+    const job = this.get(id)
+    if (!job) return
+    this.stageStatusNotificationRow({ idempotencyKey: `cloud-save-blocked:${id}:${randomUUID()}`, jobId: id,
+      chatId: job.chatId, threadTs: job.threadTs, kind: 'rate-limited', createdAt: Date.now(),
+      payload: '利用上限で待機していますが、保存対象のファイル・サイズ・機密情報の確認が必要なため、クラウド保存を完了できません。ローカルの作業は保持しています。対象を確認した後に「続けて」と指示すると保存を再試行します。まだ他の担当へは引き継げません。' })
+  }
+
+  retryBlockedCloudSave(cloudId: string): boolean {
+    return this.db.run("UPDATE cloud_handoff_jobs SET last_error=NULL,updated_at=0 WHERE cloud_id=? AND state='saving' AND last_error='checkpoint-blocked'", [cloudId]).changes > 0
+  }
+
+  deferCloudPreparation(id: string, workerId: string): boolean {
+    const defer = this.db.transaction(() => {
+      if (!this.releaseUnstartedClaim(id, workerId, 'cloud preparation pending')) return false
+      this.db.run('UPDATE jobs SET not_before=? WHERE id=?', [Date.now() + 60_000, id])
+      const job = this.get(id)!
+      this.stageStatusNotificationRow({ idempotencyKey: `cloud-prepare-pending:${id}`, jobId: null,
+        chatId: job.chatId, threadTs: job.threadTs, kind: 'rate-limited', createdAt: Date.now(),
+        payload: 'クラウド接続または作業場所の準備を完了できていないため、開始を待機しています。依頼は保持し、再試行します。' })
+      return true
+    })
+    return retrySqlite(() => defer.immediate())
+  }
+
+  retireCloudSave(id: string, remoteEpoch: number): void {
+    const retire = this.db.transaction(() => {
+      const changed = this.db.run(`UPDATE cloud_handoff_jobs SET state='transferred',last_error=NULL,updated_at=?
+        WHERE job_id=? AND epoch<? AND state IN ('saving','waiting')`, [Date.now(), id, remoteEpoch])
+      if (changed.changes === 1) this.supersedeLifecycleNotifications(id)
+    })
+    retrySqlite(() => retire.immediate())
+  }
+
+  retireCloudThread(cloudId: string, remoteEpoch: number): void {
+    const ids = this.db.query<{ job_id: string }, [string]>(
+      'SELECT job_id FROM cloud_handoff_jobs WHERE cloud_id=?',
+    ).all(cloudId)
+    for (const row of ids) this.retireCloudSave(row.job_id, remoteEpoch)
+  }
+
+  finishCloudControlWithMessage(input: CloudControl, message: string): void {
+    const finish = this.db.transaction(() => {
+      this.stageCloudControl(input)
+      this.stageStatusNotificationRow({ idempotencyKey: `cloud-control-result:${input.channel}:${input.message}`,
+        jobId: null, chatId: input.channel, threadTs: input.thread, kind: 'rate-limited',
+        createdAt: Date.now(), payload: message })
+      this.finishCloudControl(`${input.channel}:${input.message}`)
+    })
+    retrySqlite(() => finish.immediate())
+  }
+
+  stageCloudControl(input: CloudControl): void {
+    this.db.run(`INSERT OR IGNORE INTO cloud_handoff_controls(event_id,payload,created_at) VALUES(?,?,?)`,
+      [`${input.channel}:${input.message}`, JSON.stringify(input), Date.now()])
+  }
+
+  hasEarlierPendingCloudControl(channel: string, thread: string, message: string): boolean {
+    return this.db.query<{ present: number }, [string, string, string]>(`SELECT 1 AS present FROM cloud_handoff_controls
+      WHERE completed_at IS NULL AND json_extract(payload,'$.channel')=? AND json_extract(payload,'$.thread')=?
+      AND CAST(json_extract(payload,'$.message') AS REAL)<CAST(? AS REAL) LIMIT 1`).get(channel, thread, message) !== null
+  }
+
+  cloudControlHasImported(channel: string, message: string): boolean {
+    return this.db.query<{ present: number }, [string]>(
+      `SELECT 1 AS present FROM jobs JOIN cloud_handoff_jobs c ON c.job_id=jobs.id WHERE jobs.idempotency_key=?`,
+    ).get(`${channel}:${message}`) !== null
+  }
+
+  pendingCloudControls(now = Date.now()): Array<{ eventId: string; input: CloudControl }> {
+    return this.db.query<{ event_id: string; payload: string }, [number]>(
+      `SELECT event_id,payload FROM cloud_handoff_controls WHERE completed_at IS NULL AND retry_at<=? ORDER BY created_at LIMIT 10`,
+    ).all(now).map(row => ({ eventId: row.event_id, input: JSON.parse(row.payload) as CloudControl }))
+  }
+
+  finishCloudControl(eventId: string): void {
+    this.db.run('UPDATE cloud_handoff_controls SET completed_at=? WHERE event_id=?', [Date.now(), eventId])
+  }
+
+  retryCloudControl(eventId: string, input: CloudControl): void {
+    this.db.run('UPDATE cloud_handoff_controls SET retry_at=? WHERE event_id=?', [Date.now() + 60_000, eventId])
+    this.stageStatusNotificationRow({ idempotencyKey: `cloud-control-pending:${eventId}`, jobId: null,
+      chatId: input.channel, threadTs: input.thread, kind: 'rate-limited', createdAt: Date.now(),
+      payload: '引き継ぎの準備をまだ完了できていません。保存済みの作業は保持しています。接続・権限・対象リポジトリを再確認して再試行します。' })
+  }
+
+  notifyCloudSaveFailure(id: string): void {
+    if (this.db.query<{ blocked: number }, [string]>("SELECT 1 AS blocked FROM cloud_handoff_jobs WHERE job_id=? AND last_error='checkpoint-blocked'").get(id)) return
+    const job = this.get(id)
+    if (!job) return
+    this.stageStatusNotificationRow({ idempotencyKey: `cloud-save-pending:${id}:${job.attempts}`, jobId: id,
+      chatId: job.chatId, threadTs: job.threadTs, kind: 'rate-limited', payload: CLOUD_SAVE_FAILED_MESSAGE, createdAt: Date.now() })
+  }
+
+  enqueueCloudImport(input: EnqueueInput, cloudId: string, epoch: number, receipt: string): ReturnType<JobStore['enqueue']> {
+    const commit = this.db.transaction(() => {
+      const result = this.enqueue(input)
+      this.bindCloudHandoff(result.job.id, cloudId, epoch, receipt)
+      this.db.run(`UPDATE cloud_handoff_jobs SET state='transferred',updated_at=?
+        WHERE cloud_id=? AND job_id<>? AND state IN ('saving','waiting')`, [Date.now(), cloudId, result.job.id])
+      return result
+    })
+    return retrySqlite(() => commit.immediate())
+  }
+
+  bindCloudHandoff(id: string, cloudId: string, epoch: number, receipt: string): void {
+    this.db.run(`INSERT INTO cloud_handoff_jobs(job_id,state,cloud_id,epoch,receipt_json,updated_at)
+      VALUES (?,'active',?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
+      cloud_id=excluded.cloud_id,epoch=excluded.epoch,receipt_json=excluded.receipt_json,updated_at=excluded.updated_at
+      WHERE cloud_handoff_jobs.state='active'`, [id, cloudId, epoch, receipt, Date.now()])
+  }
+
+  /** Must follow owned-process quiescence. The wait flag and worker release
+   * commit together, before any fallible network upload. */
+  parkCloudHandoff(id: string, message: string, resetAt: number | null = null): void {
+    const park = this.db.transaction(() => {
+      const binding = this.cloudHandoff(id)
+      if (!binding || !['active', 'saving'].includes(binding.state)) throw new Error('cloud handoff binding unavailable')
+      const changed = this.db.run(`UPDATE jobs SET status='queued',worker_id=NULL,executor_pid=NULL,
+        started_at=NULL,accepts_control=0,executor_nonce=NULL,active_thread_id=NULL,active_turn_id=NULL
+        WHERE id=? AND status='running'`, [id])
+      if (changed.changes !== 1 && binding.state !== 'saving') throw new Error('job cannot park for cloud handoff')
+      this.db.run("UPDATE cloud_handoff_jobs SET state='saving',last_error=?,reset_at=coalesce(?,reset_at),updated_at=? WHERE job_id=?", [message, resetAt, Date.now(), id])
+      this.supersedeLifecycleNotifications(id)
+    })
+    retrySqlite(() => park.immediate())
+  }
+
+  recordCloudCheckpoint(id: string, receipt: string, packagePath: string, notification: string): void {
+    const commit = this.db.transaction(() => {
+      if (this.cloudHandoff(id)?.state === 'waiting') return
+      const changed = this.db.run(`UPDATE cloud_handoff_jobs SET state='waiting',receipt_json=?,package_path=?,
+        last_error=NULL,updated_at=? WHERE job_id=? AND state IN ('saving','waiting')`, [receipt, packagePath, Date.now(), id])
+      if (changed.changes !== 1) throw new Error('cloud checkpoint is no longer current')
+      const job = this.get(id)
+      if (!job) throw new Error('cloud checkpoint job missing')
+      this.supersedeLifecycleNotifications(id)
+      this.stageStatusNotificationRow({ idempotencyKey: `cloud-wait:${id}:${job.attempts}`, jobId: id,
+        chatId: job.chatId, threadTs: job.threadTs, kind: 'rate-limited', payload: notification, createdAt: Date.now() })
+    })
+    retrySqlite(() => commit.immediate())
+  }
+
   threadHistorySnapshot(
     jobIdInput: string,
     attemptInput?: number,
@@ -8696,7 +8945,8 @@ export class JobStore {
   countActive(): number {
     return this.db.query<{ count: number }, []>(
       `SELECT COUNT(*) AS count FROM jobs
-       WHERE runtime = 'codex' AND status IN ('queued', 'running')`,
+       WHERE runtime = 'codex' AND status IN ('queued', 'running')
+         AND NOT EXISTS (SELECT 1 FROM cloud_handoff_jobs c WHERE c.job_id=jobs.id AND c.state<>'active')`,
     ).get()?.count ?? 0
   }
 
@@ -8704,6 +8954,7 @@ export class JobStore {
     const rows = this.db.query<{ status: 'queued' | 'running'; count: number }, []>(
       `SELECT status, COUNT(*) AS count FROM jobs
        WHERE runtime = 'codex' AND status IN ('queued', 'running')
+         AND NOT EXISTS (SELECT 1 FROM cloud_handoff_jobs c WHERE c.job_id=jobs.id AND c.state<>'active')
        GROUP BY status`,
     ).all()
     return rows.reduce((counts, row) => {
@@ -8821,7 +9072,8 @@ export class JobStore {
              WHERE session_id = ?`,
           ).get(prior.session_id)?.count ?? 0
           : 0
-        resumed = prior !== null && sessionJobCount > 0 && sessionJobCount < sessionJobLimit
+        resumed = this.cloudHandoff(row.id) === null
+          && prior !== null && sessionJobCount > 0 && sessionJobCount < sessionJobLimit
         sessionId = resumed && prior ? prior.session_id : null
       }
 
@@ -10093,11 +10345,28 @@ export class JobStore {
     })
   }
 
-  saveSession(id: string, sessionId: string): void {
+  sessionWorkspace(sessionId: string): string | null {
+    return this.db.query<{ physical_cwd: string }, [string]>(
+      'SELECT physical_cwd FROM codex_session_workspaces WHERE session_id = ?',
+    ).get(sessionId)?.physical_cwd ?? null
+  }
+
+  saveSession(id: string, sessionId: string, executionCwd?: string): void {
     const persistedSessionId = requireText(sessionId, 'sessionId')
+    const physicalCwd = executionCwd === undefined ? null : realpathSync(executionCwd)
     const save = this.db.transaction(() => {
       const recordedAt = Date.now()
       this.recordCodexSessionUse(persistedSessionId, id, recordedAt)
+      if (physicalCwd !== null) {
+        const existing = this.sessionWorkspace(persistedSessionId)
+        if (existing !== null && existing !== physicalCwd) {
+          throw new Error('Codex session workspace changed')
+        }
+        this.db.run(
+          'INSERT OR IGNORE INTO codex_session_workspaces(session_id,physical_cwd) VALUES (?,?)',
+          [persistedSessionId, physicalCwd],
+        )
+      }
       const updated = this.db.run(
         `UPDATE jobs SET session_id = ?
          WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
@@ -12811,6 +13080,9 @@ export class JobStore {
       if (job.cancelRequestedAt !== null) {
         this.cancel(job.id)
         failedUncertain += 1
+      } else if (this.db.query<{ present: number }, [string]>("SELECT 1 AS present FROM cloud_handoff_jobs WHERE job_id=? AND last_error='quota-observed'").get(job.id)) {
+        this.parkCloudHandoff(job.id, 'recovering observed cloud quota', this.cloudHandoff(job.id)?.resetAt ?? undefined)
+        requeued += 1
       } else if (this.hasDurableRateLimitTerminal(job.id)) {
         const receipt = this.durableRateLimitTerminalForRunningJob(job.id)!
         this.requeueAt(
@@ -12984,6 +13256,7 @@ export interface HostAdvisorCoverage {
     startUnconfirmed: number
     unavailableBeforeStart: number
     slots: Array<{ slot: string, state: HostAdvisorSlotState }>
+    failures?: AdvisorFailure[]
   }>
 }
 
@@ -13137,6 +13410,9 @@ export interface RunQueuedJobsOptions {
   shouldPause?: () => boolean
   advisorStateDir?: string
   beforeClaim?: () => Promise<void>
+  /** Cloud controller is optional: installations without it retain local behavior. */
+  prepareCloudJob?: (job: JobRecord) => Promise<void>
+  parkCloudQuota?: (job: JobRecord, resetAt: number | undefined) => Promise<void>
   prepareExternalContext?: (job: JobRecord, signal?: AbortSignal) => Promise<void>
   settleExternalContext?: (job: JobRecord) => Promise<void>
   cancelExternalContext?: (job: JobRecord) => Promise<void>
@@ -13715,8 +13991,7 @@ export async function flushTerminalNotifications(
       if (signal?.aborted) return
       const message = error instanceof Error ? error.message : String(error)
       if (error instanceof ArtifactDeliveryAmbiguousError
-        && notification.kind === 'completed'
-        && store.terminalNotificationBodyDelivered(notification.id)) {
+        && notification.kind === 'completed') {
         const exhausted = error.artifactPaths.filter(path => (
           store.recordArtifactAmbiguityCheck(notification.job.id, path, message)
             >= MAX_ARTIFACT_DELIVERY_ATTEMPTS
@@ -13731,9 +14006,11 @@ export async function flushTerminalNotifications(
                 notification.job, message, notification.id, signal,
               )
               if (signal?.aborted) return
-              await notifier.completionReaction?.(
-                notification.job, notification.id, signal,
-              )
+              if (!notification.job.taskGoalStatus || notification.job.taskGoalStatus === 'complete') {
+                await notifier.completionReaction?.(
+                  notification.job, notification.id, signal,
+                )
+              }
               if (signal?.aborted) return
               store.markTerminalNotificationDelivered(notification.id)
               continue
@@ -14084,6 +14361,7 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       options.assertJobMonitorHealthy?.(job)
       let execution: JobExecutionResult
       try {
+        await options.prepareCloudJob?.(job)
         executionStarted = true
         execution = await options.executor(job, options.signal, {
           progressActivatedAtMs,
@@ -14334,6 +14612,22 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           continue
         }
       }
+      if (error instanceof CloudPreparationError && !executionStarted) {
+        await quiesceLifecycleBeforeStateChange()
+        await runExternalContextBoundary(options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
+          `advisor cleanup is pending for job ${job.id}`)
+        if (error.permanent) {
+          options.store.fail(job.id, error.message)
+          stats.failed += 1
+          scheduleNotificationFlush()
+          continue
+        }
+        if (!options.store.deferCloudPreparation(job.id, workerId)) {
+          throw new CodexResultPersistencePendingError('cloud preparation claim could not be deferred')
+        }
+        scheduleNotificationFlush()
+        continue
+      }
       if (error instanceof HerdrJobMonitorPendingError
         && !executionStarted && !unstartedMonitorClaimReleased) {
         // A lifecycle delivery may already be in flight if the monitor failed
@@ -14487,6 +14781,26 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       const rateLimitSafeToRetry = rateLimitSafeBeforeInitialDelivery
         || durableTerminalContinuation
         || (!job.writeEnabled && transientFailureSafeAfterDelivery)
+      if (error instanceof CodexRateLimitError && error.reason === 'rate-limit'
+        && options.parkCloudQuota && options.store.cloudHandoff(job.id)) {
+        await runExternalContextBoundary(
+          options.settleExternalContext ? () => options.settleExternalContext!(job) : undefined,
+          `owned processes must stop before cloud handoff for ${job.id}`,
+        )
+        await quiesceLifecycleBeforeStateChange()
+        // parkCloudQuota must persist the local wait before upload. Incomplete
+        // or uncertain execution is recorded in the package, never replayed.
+        try {
+          await options.parkCloudQuota(job, error.resetsAtMs)
+        } catch (cloudError) {
+          if (!options.store.cloudHandoff(job.id)
+            || options.store.cloudHandoff(job.id)?.state === 'active') throw cloudError
+          options.store.notifyCloudSaveFailure(job.id)
+          log(`${workerId} cloud checkpoint is pending for ${job.id}`)
+        }
+        scheduleNotificationFlush()
+        continue
+      }
       if (error instanceof CodexRateLimitError && job.writeEnabled
         && !rateLimitSafeToRetry) {
         const uncertain = 'write-enabled job hit a rate limit after execution began; '
@@ -15104,7 +15418,16 @@ export function sanitizeExecutionTextForSlack(
       return `\uE002${repositoryPlaceholderNonce}_${index}\uE003`
     },
   )
-  let sanitized = maskRepositoryNames(normalizeGuardText(visible.join('\n')))
+  // Preserve only the fixed public dependency diagnostics through the internal
+  // implementation filter. An arbitrary line mentioning an advisor is not exempt.
+  const publicDiagnosticNonce = encodeSlackGuardNonce(randomUUID())
+  const publicDiagnostics: string[] = []
+  const visibleText = visible.map(line => {
+    if (!PUBLIC_ADVISOR_FAILURE_MESSAGES.has(line.trim())) return line
+    const index = publicDiagnostics.push(line.trim()) - 1
+    return `\uE006${publicDiagnosticNonce}_${index}\uE007`
+  }).join('\n')
+  let sanitized = maskRepositoryNames(normalizeGuardText(visibleText))
   let inputEntries = [{
     task: job.task,
     attachments: job.attachments,
@@ -15587,13 +15910,20 @@ export function sanitizeExecutionTextForSlack(
   const selfInquirySubject = /(?:Zeroちゃん|\bZero\b|ゼロ(?:ちゃん)?|当システム|本システム|このシステム|そのシステム|当サービス|本サービス|このサービス|このボット|当ボット|本ボット|あなた|君|お前|そちら|\b(?:you|your|yourself|this\s+(?:bot|assistant|agent|system|service))\b)/i
   const explicitResponseSelfIdentity = /(?:Zeroちゃん|\bZero\b|ゼロ(?:ちゃん)?|当システム|本システム|このシステム|そのシステム|当サービス|本サービス|このサービス|このボット|当ボット|本ボット|私は|私たちは|こちら|当方|ここ(?:で|では)|\b(?:i|we|me|my|our|us|here)\b|\b(?:this|our|my)\s+(?:bot|assistant|agent|system|service|application|app|backend|runtime|implementation)\b)/i
   const selfExecutionContext = /(?:\b(?:this|the\s+current)\s+(?:request|response|answer|reply)\b|\bthe\s+active\s+model\b|^\s*handled\s+by\b|\bhandled\s+(?:this|the\s+current)\s+request\b|\bran\s+through\b|\bgenerated\s+(?:this|the\s+current)\s+(?:answer|response)\b|(?:この|今回の)(?:依頼|回答|返答|応答|処理)|(?:担当|採用)(?:モデル|エンジン)|(?:が|で)(?:この)?(?:回答|返答|応答)を?生成|で回答(?:しました|した|しています))/i
-  const subjectOmittedSelfQuestion = /(?:(?:何|なに)(?:で|の)?(?:動いて|動く|動作|モデル|エンジン|基盤|書かれて|できて|作られて)|(?:何|なに).{0,12}(?:使ってる|使う|製)|(?:どんな|どういう).{0,12}(?:技術|部品|構成要素|材料|仕組み|構成)(?:で動いてる|で動く|を使ってる|でできてる|なの|[?？])|どうやって.{0,16}(?:動いて|動く|動作|作られ|構築)|(?:仕組み|裏側|中身|部品|構成要素|土台|成り立ち|材料|依存関係)(?:は|を)?.{0,16}(?:[?？]|教えて|説明して)|使用(?:モデル|エンジン)|(?:what|which)\s+(?:model|engine|runtime|backend)\s*(?:are\s+you|do\s+you|is\s+it|does\s+it|[?？])|what\s+(?:do\s+you|does\s+it)\s+(?:run|use)|what\s+is\s+it\s+(?:made\s+of|written\s+in)|what\s+is\s+under\s+the\s+hood|how\s+was\s+it\s+built|what\s+dependencies\s+does\s+it\s+have|(?:what|how).{0,28}\byou\b.{0,28}(?:built|implemented|technology|using|use|powered)|what\s+powers?\s+you)/i
+  // A current-usage question is not an indefinite alternative (何かを使う)
+  // or a prospective choice (何を使うべき). Do not bridge arbitrary prose
+  // between the interrogative and verb: one false match erases the result.
+  // なに must not be the tail of こんなに/そんなに; 製 is a predicate,
+  // not the prefix of a compound noun such as 製品 or 製造.
+  const subjectOmittedCurrentUsageQuestion = /(?:何|(?<![\p{Script=Hiragana}\p{Script=Katakana}])なに)(?:製(?!\p{Script=Han})|(?:を|の[^\s、。！？!?]{1,12}を?)?使ってる)/u
+  const subjectOmittedSelfQuestion = /(?:(?:何|なに)(?:で|の)?(?:動いて|動く|動作|モデル|エンジン|基盤|書かれて|できて|作られて)|(?:どんな|どういう).{0,12}(?:技術|部品|構成要素|材料|仕組み|構成)(?:で動いてる|で動く|を使ってる|でできてる|なの|[?？])|どうやって.{0,16}(?:動いて|動く|動作|作られ|構築)|(?:仕組み|裏側|中身|部品|構成要素|土台|成り立ち|材料|依存関係)(?:は|を)?.{0,16}(?:[?？]|教えて|説明して)|使用(?:モデル|エンジン)|(?:what|which)\s+(?:model|engine|runtime|backend)\s*(?:are\s+you|do\s+you|is\s+it|does\s+it|[?？])|what\s+(?:do\s+you|does\s+it)\s+(?:run|use)|what\s+is\s+it\s+(?:made\s+of|written\s+in)|what\s+is\s+under\s+the\s+hood|how\s+was\s+it\s+built|what\s+dependencies\s+does\s+it\s+have|(?:what|how).{0,28}\byou\b.{0,28}(?:built|implemented|technology|using|use|powered)|what\s+powers?\s+you)/i
   const configurationInquiry = /(?:仕組み|構成|実装|アーキテクチャ|技術スタック|使用技術|裏側|中身|基盤|土台|部品|構成要素|成り立ち|材料|ライブラリ|ランタイム|バックエンド|モデル|エンジン|言語|フレームワーク|OS|設計|テクノロジー|技術|依存関係|依存|できて|作られて|作り|構築|runtime|backend|model|engine|stack|architecture|implementation|language|framework|librar|parts?|components?|building\s+blocks?|make\s*up|makeup|foundation|origin|operating\s+system|\bOS\b|design|technolog|dependenc|built|made|powering|tick)/i
   const questionIntent = /(?:[?？]|教えて|説明(?:して)?|開示|列挙|述べ|何|なに|どの|what|which|tell|show|explain|describe|list|reveal|disclose)/i
   const subjectOmittedImplementationRelation = /(?:で動いて(?:る|いる)?|で動く|を使って(?:る|いる)|を採用して(?:る|いる)|powered\s+by|runs?\s+on)\s*[?？]?/i
   const isSelfImplementationInquiry = (clause: string): boolean => {
     if (externalTechnicalTarget.test(clause) && !selfInquirySubject.test(clause)) return false
-    return subjectOmittedSelfQuestion.test(clause)
+    return subjectOmittedCurrentUsageQuestion.test(clause)
+      || subjectOmittedSelfQuestion.test(clause)
       || (implementationName.test(clause)
         && subjectOmittedImplementationRelation.test(clause)
         && questionIntent.test(clause))
@@ -15874,7 +16204,11 @@ export function sanitizeExecutionTextForSlack(
       .filter(line => line.trim().replace(/^💬\s*/, '') !== SELF_IMPLEMENTATION_NON_DISCLOSURE)
       .join('\n')
   }
-  return naturalizeSlackRedactions(sanitized).trim()
+  sanitized = naturalizeSlackRedactions(sanitized).trim()
+  publicDiagnostics.forEach((diagnostic, index) => {
+    sanitized = sanitized.replaceAll(`\uE006${publicDiagnosticNonce}_${index}\uE007`, diagnostic)
+  })
+  return sanitized
 }
 
 /**
@@ -16155,9 +16489,14 @@ export function enforceHostAdvisorCoverage(
   const stripped = stripModelAuthoredAdvisorCoverage(text, purpose === 'delivery')
   if (purpose !== 'result') return stripped.text
   if (coverage?.phases.length) {
+    const failures = [...new Map(coverage.phases.flatMap(phase => phase.failures ?? [])
+      .map(failure => [failure.advisor, failure] as const)).values()]
+    const notice = failures.length > 0
+      ? `必要な回答が揃っていないため、設計・レビューは未完了です。\n${failures.map(advisorFailureMessage).join('\n')}\n取得済みの回答と作業は保持しています。未取得枠を復旧・再試行し、3者の回答が揃ってから進めます。認証などの操作後はこのスレッドで再開を依頼してください。\n\n`
+      : ''
     return stripped.text
-      ? `${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
-      : hostAdvisorCoverageLine(coverage)
+      ? `${notice}${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
+      : `${notice}${hostAdvisorCoverageLine(coverage)}`
   }
   if (!stripped.removed) return stripped.text
   return stripped.text
@@ -16174,6 +16513,9 @@ export function finalizeSuccessfulExecution(
   const {
     capturedArtifacts = [], advisorCoverage, ...persistedExecution
   } = execution
+  if (advisorCoverage?.phases.some(phase => phase.responsesObtained < phase.total)) {
+    persistedExecution.taskGoalStatus = 'blocked'
+  }
   try {
     const declared = extractArtifactPaths(execution.result)
     // Browser evidence is bounded by the host at capture time and cannot be
@@ -17036,7 +17378,9 @@ export class SlackNotifier implements JobNotifier {
       undefined,
       'delivery',
     )
-    if (!notificationId || !this.store.terminalNotificationBodyDelivered(notificationId)) {
+    const attachmentsBeforeWaiting = ['blocked', 'paused'].includes(job.taskGoalStatus ?? '') && output.files.length > 0
+    const postBody = async () => {
+      if (notificationId && this.store.terminalNotificationBodyDelivered(notificationId)) return
       const waiting = job.taskGoalStatus && job.taskGoalStatus !== 'complete'
       await this.post(job, waiting
         ? `⏸️ 未完了・待機中です。\n\n${safeText || '続行に必要な条件を確認してください。'}`
@@ -17044,6 +17388,7 @@ export class SlackNotifier implements JobNotifier {
       if (signal?.aborted) return
       if (notificationId) this.store.markTerminalNotificationBodyDelivered(notificationId)
     }
+    if (!attachmentsBeforeWaiting) await postBody()
     const ambiguousPaths: string[] = []
     let ambiguityCause: unknown
     for (const requested of output.files) {
@@ -17131,7 +17476,8 @@ export class SlackNotifier implements JobNotifier {
     if (this.store.publicationBlockedArtifactCount(job.id) > 0) {
       await this.post(
         job,
-        slackArtifactPublicationBlockedMessage(),
+        slackArtifactPublicationBlockedMessage()
+          + (attachmentsBeforeWaiting ? '\n比較案の添付が揃っていないため、承認依頼は送らず待機しています。再開を依頼してください。' : ''),
         notificationId ? `${notificationId}:artifact-policy` : undefined,
         signal,
       )
@@ -17139,6 +17485,10 @@ export class SlackNotifier implements JobNotifier {
     }
     if (ambiguousPaths.length > 0) {
       throw new ArtifactDeliveryAmbiguousError(ambiguousPaths, ambiguityCause)
+    }
+    if (attachmentsBeforeWaiting && this.store.publicationBlockedArtifactCount(job.id) === 0
+      && this.store.abandonedArtifactCount(job.id) === 0) {
+      await postBody()
     }
   }
 
@@ -17190,7 +17540,9 @@ export class SlackNotifier implements JobNotifier {
     this.log(`job ${job.id} artifact delivery abandoned: ${error}`)
     await this.post(
       job,
-      slackArtifactsAbandonedMessage(),
+      slackArtifactsAbandonedMessage()
+        + (['blocked', 'paused'].includes(job.taskGoalStatus ?? '')
+          ? '\n比較案の添付を確認できないため、承認依頼は送らず待機しています。' : ''),
       notificationId ? `${notificationId}:artifacts-abandoned` : undefined,
       signal,
     )
@@ -17424,6 +17776,7 @@ function readBoundedExecutorRegistration(path: string): string {
 export interface ExecutorRecoveryTestHooks {
   /** Deterministically exercise a supervisor write between the first read and freeze. */
   afterInitialRegistrationRead?(registrationPath: string): void
+  observeGeneration?: typeof observeProcessGeneration
 }
 
 export async function terminateTrackedExecutors(
@@ -17663,11 +18016,23 @@ export async function terminateTrackedExecutors(
       if (!generation) throw new Error(`invalid tracked generation for PID ${item.pid}`)
       return { pid: item.pid, ppid: 0, pgid: 0, status: 0, ...generation, started: item.started }
     }
+    const warnedCleanupGenerations = new Set<string>()
     const liveTracked = (): Map<number, string> => {
       const live = new Map<number, string>()
       for (const item of ledger.values()) {
-        const observation = observeProcessGeneration(expectedIdentity(item))
+        const observation = (testHooks.observeGeneration ?? observeProcessGeneration)(expectedIdentity(item))
         if (observation.status === 'unknown') {
+          // A completed supervisor may retain unreadable pins as diagnostic
+          // evidence. Do not reintroduce the pause failure on daemon restart.
+          // Active/recovery freeze contracts and supervisor identity stay strict.
+          if (phase === 'cleanup-confirmed' && item.pid !== pid) {
+            const key = `${item.pid}:${item.started}`
+            if (!warnedCleanupGenerations.has(key)) {
+              warnedCleanupGenerations.add(key)
+              log(`executor cleanup warning: generation unavailable for PID ${item.pid}; not signaled, continuing`)
+            }
+            continue
+          }
           throw new Error(`executor process ${item.pid} generation is unknown`)
         }
         if (observation.status !== 'alive') continue
@@ -18588,9 +18953,32 @@ async function runCli(): Promise<void> {
   // rather than waiting for notBefore to expire and the job to be claimed.
   for (const jobId of startupRetainedMonitorJobIds) ensureMonitorGuard(jobId)
 
+  const cloudRuntime = CloudRuntime.configured(store, dir)
+  let cloudRetry: Promise<void> | undefined
+  const cloudRetryTimer = cloudRuntime ? setInterval(() => {
+    if (cloudRetry || shouldPause()) return
+    cloudRetry = (async () => {
+      for (const control of store.pendingCloudControls()) {
+        if (shouldPause()) break
+        try {
+          await cloudRuntime.receive(control.input)
+          store.finishCloudControl(control.eventId)
+        } catch (error) {
+          if (error instanceof CloudControlUnavailableError) store.finishCloudControlWithMessage(control.input, error.message)
+          else store.retryCloudControl(control.eventId, control.input)
+        }
+      }
+      for (const job of store.pendingCloudSaves()) {
+        try { await cloudRuntime.pause(job, undefined) } catch { store.notifyCloudSaveFailure(job.id) }
+      }
+    })().finally(() => { cloudRetry = undefined })
+  }, 5_000) : undefined
+  cloudRetryTimer?.unref()
   try {
     await runQueuedJobs({
       store,
+      prepareCloudJob: cloudRuntime ? job => cloudRuntime.prepare(job) : undefined,
+      parkCloudQuota: cloudRuntime ? (job, resetAt) => cloudRuntime.pause(job, resetAt) : undefined,
       maxJobsPerSession: configuredMaxJobsPerSession(
         process.env.ZEROKUN_MAX_JOBS_PER_SESSION,
       ),
@@ -18675,13 +19063,15 @@ async function runCli(): Promise<void> {
         }
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
-          const execution = await executeCodexJob(job, {
+          const executionJob = cloudRuntime?.executionJob(job) ?? job
+          executionJob.previousSlackDelivery = store.previousSlackDelivery(job.id)
+          const execution = await executeCodexJob(executionJob, {
             signal: executionController.signal,
             stateDir: dir,
             logDir: join(dir, 'job-logs'),
             threadHistory: store.threadHistorySnapshot(job.id, job.attempts),
             ...executorPidLifecycle,
-            onSessionId: sessionId => store.saveSession(job.id, sessionId),
+            onSessionId: sessionId => store.saveSession(job.id, sessionId, executionJob.repoPath),
             onSessionReset: () => store.clearSession(job.id),
             liveControls: {
               recordGoalStatus: status => store.recordTaskGoalStatus(job.id, status),
@@ -18956,6 +19346,9 @@ async function runCli(): Promise<void> {
               cancellationRequested: () => store.get(job.id)?.cancelRequestedAt != null,
             },
             onMonitorMessage: message => mirrorMonitorMessage(message),
+            onHandoffContext: cloudRuntime ? (key, text) => store.recordCloudContext(job.id, key, text) : undefined,
+            parkOnUsageLimit: cloudRuntime !== null,
+            onCloudQuotaDetected: cloudRuntime ? resetAt => store.recordCloudQuotaDetected(job.id, resetAt) : undefined,
             progressActivatedAtMs: executionContext.progressActivatedAtMs,
             onProgressProbeStarted: probe => executionContext.beginProgressProbe(probe),
             onProgressProbeSuperseded: (slot, supersededBySlot) => {
@@ -18970,12 +19363,14 @@ async function runCli(): Promise<void> {
             onRateLimitWait: binding => executionContext.reportRateLimitWait(binding),
             finalizeSuccessfulResult: rawExecution => {
               try {
-                return finalizeSuccessfulExecution(
+                const finalized = finalizeSuccessfulExecution(
                   store.get(job.id) ?? job,
                   rawExecution,
                   dir,
                   log,
                 )
+                if (finalized.taskGoalStatus) store.recordTaskGoalStatus(job.id, finalized.taskGoalStatus)
+                return finalized
               } catch (error) {
                 if (error instanceof CodexResultPersistencePendingError) throw error
                 throw new CodexResultPersistencePendingError(
@@ -18983,12 +19378,11 @@ async function runCli(): Promise<void> {
                 )
               }
             },
-            onSuccessfulResult: rawExecution => finalizeSuccessfulExecution(
-              store.get(job.id) ?? job,
-              rawExecution,
-              dir,
-              log,
-            ),
+            onSuccessfulResult: rawExecution => {
+              const finalized = finalizeSuccessfulExecution(store.get(job.id) ?? job, rawExecution, dir, log)
+              if (finalized.taskGoalStatus) store.recordTaskGoalStatus(job.id, finalized.taskGoalStatus)
+              return finalized
+            },
           })
           // The executor seals the final input revision before returning.
           // Stage the result again idempotently before the callback returns to
@@ -19031,6 +19425,8 @@ async function runCli(): Promise<void> {
     if (monitorFatal) throw monitorFatal
   } finally {
     const interrupted = controller.signal.aborted && !monitorFatal
+    if (cloudRetryTimer) clearInterval(cloudRetryTimer)
+    if (cloudRetry) await cloudRetry
     clearInterval(maintenanceTimer)
     clearInterval(herdrIdentityTimer)
     const finalHerdrIdentityCheck = herdrIdentityCheck

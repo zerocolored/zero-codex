@@ -322,6 +322,31 @@ function makeStore(): JobStore {
   return new JobStore(join(fixtureDir(), 'jobs.sqlite3'))
 }
 
+test('再開には同じスレッドの実配送記録を渡し生成済み回答と区別する', () => {
+  const store = makeStore()
+  try {
+    const first = store.enqueue(input()).job
+    expect(store.previousSlackDelivery(first.id)).toBeUndefined()
+    store.claimNext('receipt-worker')
+    store.complete(first.id, 'receipt-session', '承認待ちです')
+    const notification = store.pendingTerminalNotifications()[0]!
+    store.markTerminalNotificationBodyDelivered(notification.id)
+    const next = store.enqueue(input({ messageId: '1800000000.000101', task: '案が見えない' })).job
+    expect(store.previousSlackDelivery(next.id)).toEqual({
+      seq: first.seq, bodyDelivered: true, filesDeclared: 0, filesDelivered: 0,
+    })
+    next.previousSlackDelivery = store.previousSlackDelivery(next.id)
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), next.id)
+    const prompt = buildCodexWorkerPrompt(next, snapshot, {
+      attemptNonce: 'a'.repeat(32), artifactDir: '/tmp/receipt-outbox', advisorEnabled: false,
+    })
+    expect(prompt).toContain('attachments delivered=0/0')
+    expect(prompt).toContain('do not merely repeat that approval is pending')
+    const other = store.enqueue(input({ threadTs: '1800000000.000999', messageId: '1800000000.000999' })).job
+    expect(store.previousSlackDelivery(other.id)).toBeUndefined()
+  } finally { store.close() }
+})
+
 function stageInboundAttachment(options: {
   store: JobStore
   stateDir: string
@@ -499,8 +524,10 @@ describe('host-enforced App Server permission phases', () => {
       threadId: 'thread-phase',
       inputRevision: snapshot.revision,
       inputDigest: snapshot.digest,
+      execution: { sessionId: 'thread-phase', result: '回答待ち', taskGoalStatus: 'blocked' },
     })).toBe('sealed')
     expect(store.get(job.id)?.acceptsControl).toBe(false)
+    expect(store.get(job.id)?.taskGoalStatus).toBe('blocked')
     store.close()
   })
 
@@ -7632,7 +7659,7 @@ describe('single FIFO worker', () => {
     }
   })
 
-  test('cleanup-confirmed直後に残るexact supervisorを復旧時に回収する', async () => {
+  test.each([false, true])('cleanup-confirmed直後に残るexact supervisorを復旧時に回収する (unknown descendant=%s)', async injectUnknown => {
     const dir = fixtureDir()
     const repo = join(dir, 'repo')
     const fixture = join(dir, 'codex-supervisor-fixture.ts')
@@ -7672,18 +7699,27 @@ describe('single FIFO worker', () => {
       bootSession: identity!.bootSession,
       startSec: identity!.startSec,
       startUsec: identity!.startUsec,
-      tracked: [{ pid: identity!.pid, started: identity!.started }],
+      tracked: [
+        { pid: identity!.pid, started: identity!.started },
+        ...(injectUnknown ? [{ pid: 1_000_000, started: identity!.started }] : []),
+      ],
     })}\n`, { mode: 0o600 })
     store.beginMonitorPreparation(job.id, claimed.workerId!)
     store.commitMonitorRequired(job.id, claimed.workerId!)
     store.saveExecutorPid(job.id, supervisor.pid)
 
     try {
-      await terminateTrackedExecutors(store, () => {}, 50, dir)
+      const warnings: string[] = []
+      await terminateTrackedExecutors(store, message => warnings.push(message), 50, dir, {
+        observeGeneration: expected => injectUnknown && expected.pid === 1_000_000
+          ? { status: 'unknown' }
+          : observeProcessGeneration(expected),
+      })
       await supervisor.exited
       expect(observeProcessGeneration(identity!).status).toBe('dead')
       expect(existsSync(registration)).toBe(false)
       expect(store.get(job.id)?.executorPid).toBeNull()
+      if (injectUnknown) expect(warnings.filter(message => message.includes('PID 1000000'))).toHaveLength(1)
     } finally {
       try { supervisor.kill('SIGKILL') } catch {}
       await supervisor.exited
@@ -8224,7 +8260,7 @@ describe('single FIFO worker', () => {
         })
         expect(JSON.parse(readFileSync(journalPath, 'utf8'))).toMatchObject({
           version: 8,
-          status: 'reviewers-completed',
+          status: 'required-reviewer-failed',
           recoveredAfterInterruption: true,
           inputUnchanged: true,
         })
@@ -9881,6 +9917,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).not.toContain('process-separated permission protocol')
     expect(instructions).toContain('advisor_round phase=investigation')
     expect(instructions).toContain('returned slotSummary')
+    expect(instructions).toContain('All three real answers are required')
+    expect(instructions).not.toContain('Missing required reviewer answers mean the review is incomplete')
     expect(instructions).toContain('legacy separate design phase')
     expect(instructions).toContain('solution_analyst with model=gpt-6-astra,')
     expect(instructions).toContain('reasoning_effort=medium')
@@ -9906,6 +9944,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     })
     expect(advised).toContain('Advisor transport: zerokun_advisors')
     expect(advised).toContain('Base any advisor-count statement only on slotSummary')
+    expect(advised).not.toContain('zero obtained answers is not a task blocker')
+    expect(advised).toContain('until all three answers are obtained')
+    expect(advised).toContain('retryUnavailable=true')
+    expect(advised).not.toContain('recover its missing slots using the original binding')
+    expect(advised).toContain('An interrupted round with attemptsFinished=true')
     expect(advised).toContain('legacy design phase')
     expect(advised).toContain('solution_analyst with model=gpt-6-astra,')
     expect(advised).toContain('reasoning_effort=medium')
@@ -10598,6 +10641,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       `revision-${advisorInput.revision}-${advisorInput.digest.slice(0, 16)}`,
     )
     mkdirSync(root, { recursive: true, mode: 0o700 })
+    // Broker retry caches are not native-history evidence and must not make
+    // otherwise valid round collection fail (or be parsed as journal JSON).
+    writeFileSync(join(root, 'review-1.json.responses'), 'opaque response cache', { mode: 0o600 })
+    writeFileSync(join(root, 'review-1.json.slots'), 'opaque per-slot response cache', { mode: 0o600 })
     const claude = {
       attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
       workspaceCreationAttempted: false, freshEphemeral: false,
@@ -13118,6 +13165,7 @@ describe('Slack output guard', () => {
       },
     }, state)
     expect(finalized.result).not.toContain('すべてから回答')
+    expect(finalized.taskGoalStatus).toBe('blocked')
     expect(finalized.result).toContain('変更ファイルは3件です。')
     expect(finalized.result).toContain(
       '独立レビュー実行記録(ホスト確認): 最終レビュー第1回—起動2/3・回答1/3'
@@ -13702,8 +13750,57 @@ describe('Slack output guard', () => {
     store.close()
   })
 
+  test('何かを使う・何を使うべきという選択相談を自己構成質問にしない', () => {
+    const answer = '二重検索を削減し、検索基盤のプラン変更と代替サービスを比較します。精度・費用・遅延を測定して選びます。'
+    for (const task of [
+      'では、そこを1秒以内に改善するためにどうすべきか、全員で検討してください。ロジック改善はもちろん、パインコーンの中でもプランを変更するとか、パインコーンよりも高速の他の何かを使うとか、あらゆる根本的な対応を含めて検討してみてください',
+      'もっと高速な別の何かを使う案を検討して',
+      '他のなにかを使う方法も比較して',
+      '高速化には何を使うべき？',
+      '何を使えばよいか検討して',
+      '何を使うと速くなる？',
+      '他の何かの製品に置き換える案も検討して',
+      '何の製品を使うべきか検討して',
+      '検索には何を使っていますか？',
+      '現在の検索基盤は何を使っていますか？',
+      '何製品を使うべきか検討して',
+      'メモリをこんなに使ってる原因を調べて',
+      'そんなに使ってるのはなぜ？',
+      'あんなに使ってる原因を調べて',
+    ]) {
+      const state = fixtureDir()
+      const repo = join(state, 'repo')
+      mkdirSync(repo)
+      const store = new JobStore(join(state, 'jobs.sqlite3'))
+      store.enqueue(input({ repoPath: repo, task }))
+      const job = store.claimNext('serial-worker')!
+      const finalized = finalizeSuccessfulExecution(job, {
+        sessionId: 'performance-choice', result: answer,
+      }, state)
+      expect(finalized.result).toBe(answer)
+      const filtered = finalizeSuccessfulExecution(job, {
+        sessionId: 'performance-choice-filtered',
+        result: `${answer}\nZeroちゃんはBunで動いています。\n認証: Bearer synthetic-secret-123\n保存先: /Users/example/private/report.txt`,
+      }, state)
+      expect(filtered.result).toContain(answer)
+      expect(filtered.result).not.toContain('内部構成は公開していません')
+      expect(filtered.result).not.toMatch(/Bun|synthetic-secret-123|\/Users\/example/)
+      store.close()
+    }
+  })
+
   test('自己実装質問が混ざる場合は自然文の紐付けを信頼せず本文全体を非公開にする', () => {
     for (const [index, task, answer] of [
+      [
+        'performance-and-self',
+        '高速化には別の何かを使う案を比較して。Zeroちゃんの構成も教えて',
+        '検索を高速化できます。\nイベント駆動方式です。',
+      ],
+      [
+        'performance-and-current-usage',
+        '高速化を検討して。何使ってるか教えて',
+        'イベント駆動方式です。',
+      ],
       [
         'readme',
         'READMEを直した結果を説明して。ZeroちゃんはCodexで動いていますか？',
@@ -13769,6 +13866,11 @@ describe('Slack output guard', () => {
       ['bare-how', '仕組みを教えて', 'TypeScriptとBun、SQLiteで構成されています。'],
       ['english-stack', 'What is your stack?', 'TypeScript, Bun, and SQLite.'],
       ['what-use', '何使ってる？', 'Bunです。'],
+      ['what-use-hiragana', 'なに使ってる？', 'Bunです。'],
+      ['what-use-tell', '何使ってるか教えて', 'イベント駆動方式です。'],
+      ['what-use-period', '何使ってる。', 'イベント駆動方式です。'],
+      ['what-library', '何のライブラリ使ってる？', 'TypeScriptとBunです。'],
+      ['what-made-tell', '何製か教えて', 'TypeScript製です。'],
       ['which-tech', 'どんな技術で動いてる？', 'TypeScriptとBunです。'],
       ['what-made', '何製なの？', 'TypeScript製です。'],
       ['how-run', 'どうやって動いてる？', 'Bunです。'],
@@ -15430,6 +15532,41 @@ describe('durable terminal notifications', () => {
     store.close()
   })
 
+  test('Claude未回収ならDB再open後も未完了を保持し成功リアクションしない', async () => {
+    const state = fixtureDir()
+    const dbPath = join(state, 'jobs.sqlite3')
+    let store = new JobStore(dbPath)
+    store.enqueue(input())
+    const job = store.claimNext('serial-worker')!
+    const finalized = finalizeSuccessfulExecution(job, { sessionId: 'advisor-waiting', taskGoalStatus: 'complete', result: '調査結果をまとめました。',
+      advisorCoverage: { version: 1, phases: [{
+        phase: 'review', round: 1, inputRevision: 1, finishedAt: 1,
+        total: 3, started: 2, responsesObtained: 2, startedNoResponse: 0,
+        startUnconfirmed: 0, unavailableBeforeStart: 1,
+        slots: [{ slot: 'codex-risk', state: 'response-obtained' }, { slot: 'grok', state: 'response-obtained' },
+          { slot: 'claude', state: 'unavailable-before-start' }],
+        failures: [{ advisor: 'claude', cause: 'authentication' }],
+      }] },
+    }, state)
+    store.recordTaskGoalStatus(job.id, finalized.taskGoalStatus!)
+    store.complete(job.id, finalized.sessionId, finalized.result)
+    store.close()
+    store = new JobStore(dbPath)
+    const posted: string[] = []
+    let reactions = 0
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async request => { posted.push(request.text) },
+      addReaction: async () => { reactions += 1 },
+    })
+    await flushTerminalNotifications(store, notifier, () => {}, 1)
+    await flushTerminalNotifications(store, notifier, () => {}, 1)
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toContain('未完了・待機中')
+    expect(posted[0]).toContain('Claude Code: 認証が必要です')
+    expect(reactions).toBe(0)
+    store.close()
+  })
+
   test('Goal判断待ちはDB再open後も完了リアクションを送らない', async () => {
     const dbPath = join(fixtureDir(), 'jobs.sqlite3')
     let store = new JobStore(dbPath)
@@ -15557,6 +15694,42 @@ describe('durable terminal notifications', () => {
     expect(store.terminalNotificationCount()).toBe(0)
     expect(store.artifactDelivered(job.id, artifact)).toBe(true)
     store.close()
+  })
+
+  test('承認本文未送でも不明な添付を有限照合して障害通知だけを投稿する', async () => {
+    const store = makeStore()
+    try {
+      store.enqueue(input({ messageId: 'blocked-upload-budget' }))
+      const job = store.claimNext('serial-worker')!
+      store.recordTaskGoalStatus(job.id, 'blocked')
+      const outbox = artifactDirForJob(dirname(store.dbPath), job.id)
+      mkdirSync(outbox, { recursive: true })
+      const source = join(outbox, 'proposal.txt')
+      writeFileSync(source, 'proposal')
+      const result = sealArtifactResult(job, `承認してください\n<zerokun_files>${JSON.stringify([source])}</zerokun_files>`, dirname(store.dbPath))
+      store.complete(job.id, 'blocked-session', result)
+      let uploads = 0, reactions = 0
+      const messages: string[] = []
+      const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+        requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FUNKNOWN' }),
+        uploadBytes: async (_url, _bytes, commit) => { commit(); uploads++ },
+        completeUpload: async () => { throw new Error('response lost') },
+        inspectUpload: async () => false,
+        addReaction: async () => { reactions++ },
+        postMessage: async ({ text }) => { messages.push(text); return { messageId: '123.456' } },
+      })
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await flushTerminalNotifications(store, notifier, () => {}, 1)
+        await Bun.sleep(2 ** (attempt + 1) + 2)
+      }
+      expect(uploads).toBe(1)
+      expect(reactions).toBe(0)
+      expect(messages).toHaveLength(1)
+      expect(messages[0]).toContain('添付を打ち切りました')
+      expect(messages[0]).toContain('承認依頼は送らず待機しています')
+      expect(messages[0]).not.toContain('承認してください')
+      expect(store.terminalNotificationCount()).toBe(0)
+    } finally { store.close() }
   })
 
   test('byte開始後の曖昧性だけをartifact単位で5回確認して打ち切る', async () => {

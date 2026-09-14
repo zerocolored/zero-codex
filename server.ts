@@ -121,6 +121,9 @@ import {
   type SlackThreadIntentRunner,
 } from './zerokun/slack-thread-intent.ts'
 
+import { CloudRuntime } from './zerokun/cloud-runtime.ts'
+import { handoffControl, explicitlyAddressedHandoff } from './zerokun/handoff-control.ts'
+
 const STATE_DIR = resolveZeroStateDir()
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
@@ -263,6 +266,7 @@ clearGatewayReadiness(READY_FILE)
 // The gateway owns inbound durability. The runner opens the same WAL database
 // from another process and claims Codex jobs one at a time.
 const jobStore = new JobStore(resolveZeroJobDatabasePath(STATE_DIR))
+const cloudRuntime = CloudRuntime.configured(jobStore, STATE_DIR)
 const recoveredInbound = jobStore.recoverInboundDeliveries()
 if (recoveredInbound > 0) {
   process.stderr.write(`slack channel: recovered ${recoveredInbound} interrupted inbound delivery(s)\n`)
@@ -647,6 +651,7 @@ async function admitSlackChannelThreadReply(input: {
   fileIds?: string[]
   budgetLane?: SlackBudgetLane
 }): Promise<ThreadReplyAdmission> {
+  if (cloudRuntime && explicitlyAddressedHandoff(input.text, botUserId)) return 'addressed'
   if (input.channelId.startsWith('D') || input.threadTs === input.messageTs) {
     return 'addressed'
   }
@@ -1382,12 +1387,34 @@ function deliver(
   if (updateTransactionPending(UPDATE_JOURNAL_FILE)) return Promise.resolve(false)
   const key = `${chatId}:${messageTs}`
   if (delivered.has(key)) return Promise.resolve(true)
+  if (jobStore.hasDurableEvent(key)) return Promise.resolve(true)
   const pending = inFlight.get(key)
   if (pending) return pending
   const resolvedThreadTs = threadTs ?? messageTs
+  if (cloudRuntime && jobStore.hasEarlierPendingCloudControl(chatId, resolvedThreadTs, messageTs)) return Promise.resolve(false)
   const handOver = (async () => {
     const access = loadAccess()
     const writeEnabled = access.writeAllowFrom.includes(userId)
+    const cloudAction = cloudRuntime ? handoffControl(text) : null
+    if (cloudRuntime && cloudAction && botUserId && threadTs && !chatId.startsWith('D')) {
+      const waiting = await cloudRuntime.client.find(chatId, threadTs)
+      if (waiting && cloudAction === 'continue') {
+        const member = await cloudRuntime.client.member()
+        if (waiting.owner_id !== member.user_id) {
+          jobStore.retireCloudThread(waiting.id, waiting.epoch)
+          rememberDelivered(key)
+          return true
+        }
+      }
+      if (cloudAction === 'handoff' || (waiting && ['saving', 'waiting', 'importing'].includes(waiting.state))) {
+        if (cloudAction === 'handoff' && !initialContextEligible) { rememberDelivered(key); return true }
+        jobStore.stageCloudControl({ channel: chatId, thread: threadTs, message: messageTs,
+          user: userId, bot: botUserId, project: resolveUnclaimedRepoPath(chatId, threadTs),
+          writeEnabled, action: cloudAction })
+        rememberDelivered(key)
+        return true
+      }
+    }
     if (writeEnabled && isExplicitUpdateRequest(text)) {
       // Detached updates do not enter the inbound queue, so retain their
       // existing immediate thread pin before launching the update request.

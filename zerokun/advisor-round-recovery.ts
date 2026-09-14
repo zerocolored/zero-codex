@@ -191,6 +191,30 @@ function cleanupOutcomePath(
   return join(revisionRoot, `${binding.phase}-${binding.round}.json`)
 }
 
+/** Retire only a verified, finished Claude generation before a missing-slot retry. */
+export function retireAdvisorClaudeCleanupOutcome(
+  stateDirInput: string,
+  binding: Parameters<typeof cleanupOutcomePath>[1],
+  expectedReceiptDigest: unknown,
+): void {
+  const stateDir = requireManagedStateRoot(stateDirInput)
+  const path = cleanupOutcomePath(stateDir, binding)
+  const previous = readFileSnapshot(path)
+  if (!previous) return
+  const value = parseObject(previous.raw, 'previous Claude cleanup')
+  if ((value.workspaceCreationAttempted === true && value.cleanupVerified !== true)
+    || value.cleanupReceiptDigest !== expectedReceiptDigest) {
+    throw new Error('previous Claude generation has not been verified closed')
+  }
+  writeIdempotent(`${path}.retired-${previous.digest}`, value)
+  const current = readFileSnapshot(path)
+  if (!current || current.dev !== previous.dev || current.ino !== previous.ino
+    || current.digest !== previous.digest) throw new Error('Claude cleanup generation changed')
+  unlinkSync(path)
+  const parent = openSync(dirname(path), constants.O_RDONLY | constants.O_NOFOLLOW)
+  try { fsyncSync(parent) } finally { closeSync(parent) }
+}
+
 export function persistAdvisorClaudeCleanupOutcome(
   stateDirInput: string,
   outcome: AdvisorClaudeCleanupOutcome,
@@ -626,7 +650,7 @@ export function finalizeRetiredAdvisorRounds(
         const journalSnapshot = readFileSnapshot(journalPath)
         if (!journalSnapshot) throw new Error('retired advisor journal is missing')
         const journal = parseObject(journalSnapshot.raw, 'retired advisor journal')
-        if (['reviewers-completed', 'stale-input'].includes(String(journal.status))
+        if (['reviewers-completed', 'stale-input', 'required-reviewer-failed'].includes(String(journal.status))
           && journal.recoveredAfterInterruption === true
           && journal.recoveryId === receipt.recoveryId) {
           releaseLockExact(lockPath, receipt)
@@ -665,21 +689,28 @@ export function finalizeRetiredAdvisorRounds(
               : null,
           )
           const terminalStatus = inputUnchanged && repositoryUnchanged
-            ? 'reviewers-completed'
+            ? 'required-reviewer-failed'
             : 'stale-input'
           const finishedAt = Math.max(Date.now(), Number(journal.startedAt) || 0)
           const reason = 'reviewer process ended at a verified interjection generation boundary'
           const grokPerspectives = journal.version === THREE_ADVISOR_JOURNAL_VERSION
             ? [advisorPerspectiveForPhase(journal.phase as AdvisorPhase)]
             : ['solution', 'risk'] as const
-          const grok = grokPerspectives.map(perspective => ({
+          const grok = grokPerspectives.map(perspective => {
+            const retained = Array.isArray(journal.grok) ? journal.grok.find(value =>
+              value?.perspective === perspective && value.adopted === true
+              && value.containmentVerified === true && typeof value.responseDigest === 'string'
+              && SHA256.test(value.responseDigest)) : undefined
+            if (retained) return retained
+            return {
             attempted: true,
             adopted: false,
             perspective,
             executionState: 'start-unconfirmed',
             containmentVerified: true,
             reasonDigest: sha256(reason),
-          }))
+            }
+          })
           atomicWritePrivateFile(journalPath, `${JSON.stringify({
             ...journal,
             status: terminalStatus,

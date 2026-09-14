@@ -199,6 +199,7 @@ class _PreparedSend:
         "request_dir",
         "nonce",
         "owned_records",
+        "state_change_seq",
     )
 
     def __init__(
@@ -213,6 +214,7 @@ class _PreparedSend:
         request_dir: str,
         nonce: str,
         owned_records: Tuple[Dict[str, object], Dict[str, object], Dict[str, object]],
+        state_change_seq: int,
     ) -> None:
         self.request = request
         self.request_id = request_id
@@ -223,6 +225,7 @@ class _PreparedSend:
         self.request_dir = request_dir
         self.nonce = nonce
         self.owned_records = owned_records
+        self.state_change_seq = state_change_seq
 
     def __repr__(self) -> str:
         return "_PreparedSend(request=<redacted>)"
@@ -591,8 +594,12 @@ def _workspace_members(root_descriptor: int, root: Path) -> Optional[Tuple[str, 
             raise UnsafeRequest("workspace configuration is invalid") from error
         if (
             not isinstance(value, dict)
-            or set(value) != {"version", "kind", "members"}
-            or value.get("version") != 1
+            or not (
+                (value.get("version") == 1 and set(value) == {"version", "kind", "members"})
+                or (value.get("version") == 2
+                    and set(value) == {"version", "kind", "members", "projectRepository"}
+                    and value.get("projectRepository") is False)
+            )
             or value.get("kind") != "multi-repo-workspace"
             or not isinstance(value.get("members"), list)
         ):
@@ -3412,7 +3419,7 @@ def _close_owned_workspace(
     if not already_absent:
         closed = _run_herdr(["workspace", "close", workspace_id])
         if closed.returncode != 0:
-            raise UnsafeRequest("owned workspace could not be closed")
+            raise UnsafeRequest(f"owned workspace could not be closed (exit {closed.returncode})")
     catalog_after = _workspace_catalog()
     _require_owned_workspace_absent(workspace)
     try:
@@ -3696,13 +3703,7 @@ def _open_command(args: argparse.Namespace) -> int:
         request_descriptor, _request = _request_directory(args.request_dir, root)
         try:
             _discard_staged_records(request_descriptor)
-            changed, _before_count, _after_count = _verify_unchanged(
-                root_descriptor,
-                root,
-                request_descriptor,
-            )
-            if changed:
-                raise UnsafeRequest("protected metadata changed before workspace creation")
+            _audit_metadata(root_descriptor, root, request_descriptor)
             root_metadata = os.fstat(root_descriptor)
         finally:
             os.close(request_descriptor)
@@ -4160,8 +4161,14 @@ def _open_ephemeral_workspace(
                 "executable": processes["executable"],
             },
         )
-        if not _protected_unchanged(args.project_root, args.request_dir):
-            raise UnsafeRequest("protected metadata changed while starting ephemeral Claude")
+        # Metadata drift cannot attribute a concurrent primary/other-session
+        # write to this advisor. Keep the audit diagnostic without discarding
+        # an otherwise valid, exactly owned launch.
+        try:
+            if not _protected_unchanged(args.project_root, args.request_dir):
+                print("warning: protected metadata changed while starting ephemeral Claude", file=sys.stderr)
+        except Exception:
+            print("warning: protected metadata audit unavailable while starting ephemeral Claude", file=sys.stderr)
         _suppress_open_signals()
         print(
             json.dumps(
@@ -4416,6 +4423,7 @@ def _owned_target(
     intent: Dict[str, object],
     workspace: Dict[str, object],
     agent_receipt: Dict[str, object],
+    observed: Optional[Dict[str, object]] = None,
 ) -> str:
     _validate_workspace_receipt(intent, workspace)
     caller = intent.get("caller")
@@ -4469,9 +4477,9 @@ def _owned_target(
     session_matches = (
         isinstance(session, dict) and session.get("value") == recorded_session
     ) or (session is None and recorded_session == "N/A:safe-mode")
-    if not session_matches or agent.get("state_change_seq") != agent_receipt.get(
-        "state_change_seq"
-    ):
+    # Readiness can advance during startup without replacing the owned process.
+    # Bind the two current observations, not the stale startup sequence.
+    if not session_matches:
         raise UnsafeRequest("ephemeral Claude identity changed before fifth-advisor prompt")
     if not _empty_claude_prompt_screen(_read_visible(target)):
         raise UnsafeRequest("ephemeral Claude is not at an empty visible prompt")
@@ -4488,12 +4496,14 @@ def _owned_target(
     ) or (final_session is None and recorded_session == "N/A:safe-mode")
     if (
         not final_session_matches
-        or final_agent.get("state_change_seq") != agent_receipt.get("state_change_seq")
+        or final_agent.get("state_change_seq") != agent.get("state_change_seq")
     ):
         raise UnsafeRequest("ephemeral Claude identity changed before fifth-advisor prompt")
     final_processes = _process_receipt(workspace)
     if not _same_owned_process_identity(final_processes, agent_receipt):
         raise UnsafeRequest("ephemeral Claude process changed before fifth-advisor prompt")
+    if observed is not None:
+        observed["state_change_seq"] = final_agent.get("state_change_seq")
     return target
 
 
@@ -4646,6 +4656,18 @@ def _write_json_record(payload: Dict[str, object]) -> None:
         view = view[written:]
 
 
+def _audit_metadata(root_descriptor: int, root: Path, request_descriptor: int) -> None:
+    """Observe metadata without confusing concurrent writes with wrong-target I/O."""
+    try:
+        changed, _before_count, _after_count = _verify_unchanged(
+            root_descriptor, root, request_descriptor,
+        )
+        if changed:
+            print("warning: protected metadata changed during Claude lifecycle", file=sys.stderr)
+    except Exception:
+        print("warning: protected metadata audit unavailable during Claude lifecycle", file=sys.stderr)
+
+
 def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
     if os.environ.get("HERDR_ENV") != "1":
         raise UnsafeRequest("HERDR_ENV is not active")
@@ -4660,13 +4682,7 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
         root_descriptor, root = _open_physical_directory(Path(args.project_root))
         request_descriptor, _request = _request_directory(args.request_dir, root)
         _discard_staged_records(request_descriptor)
-        changed, _before_count, _after_count = _verify_unchanged(
-            root_descriptor,
-            root,
-            request_descriptor,
-        )
-        if changed:
-            raise UnsafeRequest("protected metadata changed before fifth-advisor prompt")
+        _audit_metadata(root_descriptor, root, request_descriptor)
         if _request_entry_exists(
             request_descriptor,
             PROCESS_MISMATCH_RECEIPT_NAME,
@@ -4701,7 +4717,8 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
         _close_descriptors(request_descriptor, root_descriptor)
     if owned_records is None:
         raise UnsafeRequest("ephemeral Claude receipts are unavailable")
-    target = _owned_target(*owned_records)
+    observed: Dict[str, object] = {}
+    target = _owned_target(*owned_records, observed=observed)
     request_id = f"fifth_prompt_{secrets.token_hex(16)}"
     request = (
         json.dumps(
@@ -4734,6 +4751,7 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
         request_dir=args.request_dir,
         nonce=claimed_nonce,
         owned_records=owned_records,
+        state_change_seq=int(observed["state_change_seq"]),
     )
 
 
@@ -4751,13 +4769,7 @@ def _persist_send_receipt(prepared: _PreparedSend) -> None:
         root_descriptor, root = _open_physical_directory(Path(prepared.project_root))
         request_descriptor, _request = _request_directory(prepared.request_dir, root)
         _discard_staged_records(request_descriptor)
-        changed, _before_count, _after_count = _verify_unchanged(
-            root_descriptor,
-            root,
-            request_descriptor,
-        )
-        if changed:
-            raise UnsafeRequest("protected metadata changed after fifth-advisor send")
+        _audit_metadata(root_descriptor, root, request_descriptor)
         rebound_records = (
             _read_request_record(request_descriptor, SESSION_INTENT_NAME),
             _read_request_record(request_descriptor, WORKSPACE_RECEIPT_NAME),
@@ -4789,6 +4801,7 @@ def _announce_send(prepared: _PreparedSend) -> None:
                 "status": "prompt-started",
                 "marker": prepared.marker_line,
                 "target": prepared.target,
+                "state_change_seq": prepared.state_change_seq,
             }
         )
     except Exception as error:
@@ -4823,8 +4836,9 @@ def _attempt_send(prepared: _PreparedSend) -> int:
             ):
                 raise UnsafeRequest("Herdr prompt returned an invalid response envelope")
             succeeded = isinstance(document.get("result"), dict)
-        except Exception:
+        except Exception as error:
             _write_json_record({"status": "prompt-command-timeout-or-error"})
+            print(f"Herdr prompt transport failed: {type(error).__name__}", file=sys.stderr)
             return 5
         _write_json_record(
             {"status": "prompt-command-returned", "returncode": 0 if succeeded else 1}

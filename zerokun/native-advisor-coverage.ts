@@ -126,7 +126,22 @@ export async function observeNativeAdvisorCoverage(options: {
         matched.push({ ...observation, state: 'started-no-response', threadId: id })
       }
     }
-    if (matched.length === 1) Object.assign(observation, matched[0])
+    // An earlier failed generation may share the same slot marker. Prefer
+    // the unique completed answer; two completed answers remain ambiguous
+    // unless the broker explicitly selected one physical/logical agent.
+    const obtained = matched.filter(value => value.state === 'response-obtained')
+    const claimed = options.rounds.find(value => value.phase === observation.phase
+      && value.round === observation.round && value.inputRevision === observation.inputRevision
+      && value.inputDigest === observation.inputDigest)?.native
+      .find(value => value.perspective === observation.perspective)?.agentId
+    const selected = obtained.filter(value => {
+      const thread = threads.get(value.threadId!)!
+      return typeof claimed === 'string'
+        && (claimed === value.threadId || claimed === spawnSource(thread).agent_path)
+    })
+    const resolved = obtained.length === 1 ? obtained[0]
+      : selected.length === 1 ? selected[0] : matched.length === 1 ? matched[0] : undefined
+    if (resolved) Object.assign(observation, resolved)
   }
   return observations
 }

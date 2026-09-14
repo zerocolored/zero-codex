@@ -18,6 +18,7 @@ import {
 } from 'fs'
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import { ensureTaskGoal, readTaskGoal, type GoalStatus } from './codex-goal.ts'
+import { ContinuedArtifactMessage } from './continued-artifact-message.ts'
 import { homedir, tmpdir } from 'os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import type {
@@ -108,6 +109,7 @@ import {
   validThreeAdvisorRoundTwoBasis,
 } from './advisor-journal.ts'
 import { summarizeAdvisorSlots } from './advisor-broker.ts'
+import { type AdvisorFailure } from './advisor-availability.ts'
 import { observeNativeAdvisorCoverage, type NativeAdvisorObservation } from './native-advisor-coverage.ts'
 import { redactCredentialMaterial } from './public-output-guard.ts'
 import {
@@ -1715,7 +1717,7 @@ export function collectHostAdvisorCoverage(
       if ((version !== 8 && !threeAdvisor)
         || (threeAdvisor && journal.advisorPolicy !== THREE_ADVISOR_POLICY)
         || !(threeAdvisor
-          ? ['reviewers-completed', 'completed', 'stale-input'].includes(String(journal.status))
+          ? ['reviewers-completed', 'completed', 'stale-input', 'required-reviewer-failed'].includes(String(journal.status))
           : ['reviewers-completed', 'completed'].includes(String(journal.status)))
         || (threeAdvisor && !validThreeAdvisorPhaseRound(phase, round))
         || (!threeAdvisor && round !== 1)
@@ -1759,6 +1761,15 @@ export function collectHostAdvisorCoverage(
         inputRevision,
         finishedAt: Number(journal.finishedAt),
         ...summary,
+        failures: summary.slots.filter(slot => slot.state !== 'response-obtained').map(slot => {
+          const advisor: AdvisorFailure['advisor'] = slot.slot.includes('claude') ? 'claude'
+            : slot.slot.includes('grok') ? 'grok' : 'codex'
+          const entry = advisor === 'claude' ? journal.claude
+            : advisor === 'grok' ? (journal.grok as unknown[])[0] : (journal.native as unknown[])[0]
+          const failure = (entry as Record<string, unknown>)?.failure as AdvisorFailure | undefined
+          return { advisor, cause: failure && ['authentication', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'unknown']
+            .includes(failure.cause) ? failure.cause : 'unknown' }
+        }),
       }
       // A unified logical attempt may bind its initial and final reviews to
       // different Slack input revisions. Preserve both. Conversely, two
@@ -2047,6 +2058,10 @@ function collectNativeAdvisorJournalEvidence(options: {
     const journalEntries = readdirSync(revisionRoot, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name))
     for (const journalEntry of journalEntries) {
+      // Response bodies are broker-owned retry data, not native-history
+      // evidence. Never parse them as a round journal or expose their content.
+      if (/^(investigation|design|review)-[123]\.json\.(responses|slots)$/.test(journalEntry.name)
+        && journalEntry.isFile() && !journalEntry.isSymbolicLink()) continue
       const journalMatch = /^(investigation|design|review)-([123])\.json$/.exec(journalEntry.name)
       if (!journalMatch || !journalEntry.isFile() || journalEntry.isSymbolicLink()) {
         throw new Error(`advisor journal contains an unsafe revision entry: ${journalEntry.name}`)
@@ -3748,7 +3763,7 @@ export function buildCodexDeveloperInstructions(
         '',
         'A narrow zerokun_advisors transport is available for advisor consultations required by',
         'the applicable AGENTS.md. Keep one primary Codex workflow: the transport starts external',
-        'reviewers but never selects work phases, blocks implementation, or publishes changes.',
+        'reviewers but never selects work phases or publishes changes; required answers must be obtained before proceeding.',
         'For the single combined initial-design consultation use advisor_round phase=investigation',
         'round=1. For post-implementation final review round 1 use phase=review round=1. Only when',
         'you adopt at least one round-1 mandatory finding and implement a non-empty task-owned fix',
@@ -3766,7 +3781,14 @@ export function buildCodexDeveloperInstructions(
         'agent ID to advisor_round. If the native slot did',
         'not start or started without an answer, pass adopted=false, started=false or true, and a',
         'concise reason. Poll advisor_round_poll one call at a time until it returns a terminal',
-        'receipt. External reviewer absence is best-effort and never blocks the primary task.',
+        'receipt. All three real answers are required before this design or review is complete.',
+        'This explicit required-response policy overrides best-effort advisor guidance in repository instructions.',
+        'For failure diagnostics only, name GPT, Grok or Claude Code and its safe cause in Slack; omit secrets and internal paths.',
+        'If any answer is missing, report the named cause to Slack. Preserve obtained answers and retry',
+        'only the missing slot with retryUnavailable=true and the same phase/round/input binding after nextRetryAt.',
+        'A missing native answer requires retrying that native slot with the same model and marker; reuse successful native answers.',
+        'The broker automatically retries contained transient external failures with backoff. Authentication or persistent',
+        'configuration failures require a concrete recovery action and task goal blocked; never claim completion with missing answers.',
         'Never inspect or invoke Grok, Claude, Herdr, their authentication, helper files, sockets,',
         'or processes directly; zerokun_advisors is the only external-advisor route.',
         'When reporting advisor coverage, use only the returned slotSummary. requested/total means',
@@ -3778,7 +3800,8 @@ export function buildCodexDeveloperInstructions(
         '',
         'The external advisor transport is unavailable in this process. Do not inspect or invoke',
         'Grok, Claude, Herdr, their authentication, helper files, sockets, or processes directly.',
-        'Continue the primary task and never describe an external reviewer as attempted or started.',
+        'If design or review is required, report that the advisor transport needs recovery and keep the task blocked.',
+        'Never describe an external reviewer as attempted, started, or completed without evidence.',
       ].join('\n')
   if (job.writeEnabled) {
     const protocol = [
@@ -3906,7 +3929,7 @@ export function buildCodexWorkerPrompt(
       attempt: job.attempts,
       chatId: job.chatId,
       threadTs: job.threadTs,
-      repoPath: job.repoPath,
+      repoPath: job.historyRepoPath ?? job.repoPath,
       currentJobSeq: job.seq,
     })
   }
@@ -3945,6 +3968,10 @@ export function buildCodexWorkerPrompt(
   if (host.advisorEnabled) {
     control.push(
       'Advisor transport: zerokun_advisors is the only permitted route for external reviewers.',
+      'Conversation resumption preserves prior work and context, but a new attempt can have no advisor ledger yet.',
+      'If advisor_round or advisor_round_poll returns notStarted=true, use its current binding to start advisor_round',
+      'with retryUnavailable=false. This is normal initialization, not corruption or a reason to block for an administrator.',
+      'Never promote historical answers into current approvals merely by replacing their binding markers.',
       'When the applicable AGENTS.md requires the combined initial-design Three-Advisor panel, use',
       'advisor_round with phase=investigation and round=1. For a required final review after',
       'implementation, use phase=review and round=1. Only if you adopt a round-1 mandatory finding',
@@ -3954,17 +3981,23 @@ export function buildCodexWorkerPrompt(
       'round 1; never claim another task\'s paths. Restrict round 2 to that delta and direct',
       'regressions. Minor findings, advisor',
       'unavailability, and infrastructure failures do not trigger round 2. Never call round 3 or',
-      'the legacy design phase. Each logical round is attempt-wide and may run at most once even',
-      'when Slack input is added or the Codex turn is steered. A reusedPriorPhase result is final',
-      'for that logical round; do not spawn replacements or call it again.',
+      'the legacy design phase. A completed logical round is attempt-wide and is not rerun when',
+      'Slack input is added or the Codex turn is steered. An interrupted round with attemptsFinished=true',
+      'has ended its process attempts, not its required review. Preserve answers and retry missing slots using the same binding.',
       'For investigation, spawn exactly one solution_analyst with model=gpt-6-astra,',
       'reasoning_effort=medium, and fork_turns=none. For each review round, spawn exactly one fresh',
       'risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none. Do not',
       'substitute a different model and do not add another native slot.',
       `That native advisor response must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|review>:<1|2>:<solution|risk>] after replacing phase, round, and perspective.`,
       'For an unavailable native slot, send adopted=false, an exact started boolean, and a concise',
-      'reason. External unavailable outcomes are terminal best-effort results; never retry a panel',
-      'or stop the primary work because a slot is absent.',
+      'reason. All three real answers are mandatory for design/review completion. Never invent missing answers.',
+      'If a native answer is missing, retry only that native slot using the same required model and marker.',
+      'Report missing advisors and causes to Slack, preserve successful answers, and call advisor_round with',
+      'retryUnavailable=true after nextRetryAt for the same phase/round/input binding. Never poll a terminal result in a tight loop.',
+      'Authentication or persistent configuration failures require a concrete recovery action and task goal blocked.',
+      'Do not proceed past design/review or claim task completion until all three answers are obtained.',
+      'Preserve completed work and answers. Changed requirements still need your assessment; old advice',
+      'must not be treated as approval for a different request.',
       'Base any advisor-count statement only on slotSummary returned by the broker. Never call all',
       'three attempted, started, or completed unless the corresponding structured count is three.',
     )
@@ -3972,6 +4005,22 @@ export function buildCodexWorkerPrompt(
     control.push(
       'Advisor transport: unavailable. Do not access external reviewer files or tools directly,',
       'and do not claim that an external reviewer was attempted or started.',
+      'If design or review is required, report the missing transport and keep the task blocked until recovery.',
+    )
+  }
+  control.push(
+    'Slack delivery occurs after the logical task suspends or finishes, not after every physical final answer.',
+    'When waiting for user approval, restate the complete proposal/question and zerokun_files declaration in the final answer.',
+    'An earlier attachment-bearing answer in this same input revision is retained if the goal becomes blocked or paused.',
+    'To replace attachments declare the new complete list; to withdraw an earlier proposal explicitly emit <zerokun_files>[]</zerokun_files>.',
+    'Do not claim the user has seen a proposal just because you previously generated it in this conversation.',
+  )
+  if (job.previousSlackDelivery) {
+    const delivery = job.previousSlackDelivery
+    control.push(
+      `Host Slack delivery receipt for preceding job #${delivery.seq}: final body delivered=${delivery.bodyDelivered}; attachments delivered=${delivery.filesDelivered}/${delivery.filesDeclared}.`,
+      'This receipt describes actual host delivery, not answers generated inside Codex. Zero declared attachments does not prove a proposal was shown.',
+      'If the user says the proposal is missing, supply the complete proposal and its attachments in this job output; do not merely repeat that approval is pending.',
     )
   }
   if (!job.writeEnabled) {
@@ -6005,6 +6054,11 @@ export async function executeCodexJob(
     onStderrChunk?(value: Uint8Array): void
     /** Bounded, user-safe status projected from validated root-thread notifications. */
     onMonitorMessage?(message: string): void
+    /** Full visible assistant messages for portable context, independent of Slack milestones. */
+    onHandoffContext?(key: string, text: string): void
+    /** Cloud handoff parks on quota rather than automatically resuming. */
+    parkOnUsageLimit?: boolean
+    onCloudQuotaDetected?(resetAt: number | undefined): void
     /** Durable Slack outbox handoff for an explicitly enveloped milestone commentary. */
     onCommentaryMessage?(event: {
       sourceKey: string
@@ -6058,7 +6112,7 @@ export async function executeCodexJob(
       attempt: job.attempts,
       chatId: job.chatId,
       threadTs: job.threadTs,
-      repoPath: job.repoPath,
+      repoPath: job.historyRepoPath ?? job.repoPath,
       currentJobSeq: job.seq,
     })
   }
@@ -6739,6 +6793,9 @@ export async function executeCodexJob(
           tracked,
           waitForForce: cleanup.waitForForce,
           onForce: cleanup.onForce,
+          onUnknownGeneration: identity => {
+            process.stderr.write(`Codex cleanup warning: generation unavailable for PID ${identity.pid}; not signaled, continuing.\n`)
+          },
         })
       } catch (error) {
         throw new CodexCleanupPendingError(
@@ -7109,6 +7166,13 @@ export async function executeCodexJob(
                 }
               }
             }
+            if (notification.method === 'item/completed'
+              && notification.params.threadId === monitorParentThreadId) {
+              const item = notification.params.item as Record<string, unknown> | undefined
+              if (item?.type === 'agentMessage' && typeof item.id === 'string' && typeof item.text === 'string') {
+                options.onHandoffContext?.(`${monitorParentThreadId}:${item.id}`, item.text)
+              }
+            }
             const slackUpdate = slackUpdateCommentaryFromNotification(
               notification,
               monitorParentThreadId,
@@ -7193,6 +7257,7 @@ export async function executeCodexJob(
       let inputChangedBeforeDispatch = false
       let observedSessionId: string | null = sessionId
       let finalMessage = ''
+      const continuedArtifactMessage = new ContinuedArtifactMessage(artifactDirForJob(managedStateDir, job.id))
       let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null
@@ -7853,6 +7918,13 @@ export async function executeCodexJob(
               method: 'error', params: appServerError,
             }))
             if (rateLimit.rateLimited) activeTurnTransientFailure = rateLimit
+            if (options.parkOnUsageLimit && rateLimit.rateLimited && rateLimit.reason !== 'capacity') {
+              options.onCloudQuotaDetected?.(rateLimit.resetsAtMs ?? undefined)
+              // The catch below stops and reaps this exact supervisor before
+              // the typed exception is allowed to reach the cloud checkpoint.
+              throw new CodexRateLimitError('Usage limit requires explicit cloud continuation',
+                rateLimit.resetsAtMs ?? Date.now(), currentThreadId, 'rate-limit', false, stage, phaseSequence)
+            }
             if (!appServerError.willRetry
               && rateLimit.rateLimited
               && rateLimit.resetsAtMs !== null) {
@@ -7967,6 +8039,12 @@ export async function executeCodexJob(
               : terminal.turn.status === 'failed' && activeTurnTransientFailure?.rateLimited
                 ? activeTurnTransientFailure
                 : terminalRateLimit
+            if (options.parkOnUsageLimit && terminal.turn.status === 'failed'
+              && rateLimit.rateLimited && rateLimit.reason !== 'capacity') {
+              options.onCloudQuotaDetected?.(rateLimit.resetsAtMs ?? undefined)
+              throw new CodexRateLimitError('Usage limit requires explicit cloud continuation',
+                rateLimit.resetsAtMs ?? Date.now(), currentThreadId, 'rate-limit', false, stage, phaseSequence)
+            }
             if (rateLimit.rateLimited && terminal.turn.status === 'failed') {
               // A terminal marked `full` is the bounded official item view for
               // this failed turn. The session projection intentionally strips
@@ -8011,6 +8089,17 @@ export async function executeCodexJob(
             // synthetic user request or restart the development workflow here.
             if (stage === 'complete' && terminal.turn.status === 'completed'
               && !pausedInterjection && !rateLimit.rateLimited && !controls.cancellationRequested()) {
+              try {
+                const completedTurn = reconciledTurn.itemsView === 'full'
+                  ? reconciledTurn : await session.loadFullTurn(currentThreadId!, reconciledTurn)
+                reconciledTurn = completedTurn
+                const completedMessage = appServerFinalMessage(completedTurn)
+                if (completedMessage) continuedArtifactMessage.observe(completedMessage, activeInputRevision)
+              } catch {
+                // Intermediate tool-only turns can legitimately have no final message.
+                // Observation must not prevent the native goal from continuing.
+                process.stderr.write('zerochan: intermediate attachment observation unavailable; continuing native goal.\n')
+              }
               let goal = await readTaskGoal(session, currentThreadId)
               let nativeTurn = session.takeNativeTurnStart(currentThreadId, parentTurnIds)
               if (goal?.status === 'active' || nativeTurn) {
@@ -8412,7 +8501,14 @@ export async function executeCodexJob(
         })}\n`.slice(-MAX_LOG_TAIL_CHARS)
       }
       if (protocolCompleted && protocolError == null && finalMessage) {
+        if (!userCancelled && stage === 'complete') {
+          finalMessage = continuedArtifactMessage.resolve(finalMessage, activeInputRevision, taskGoalStatus)
+        }
         atomicWritePrivateFile(finalPath, finalMessage)
+      }
+      if (protocolError instanceof CodexRateLimitError && options.parkOnUsageLimit && !userCancelled) {
+        await retireCompletedRegistration()
+        throw protocolError
       }
       return {
         exitCode,
@@ -8852,6 +8948,11 @@ export async function executeCodexJob(
       phaseSequence: number
       partialImplementation: boolean
     }): Promise<void> => {
+      if (options.parkOnUsageLimit && input.reason === 'rate-limit') {
+        options.onCloudQuotaDetected?.(input.resetsAtMs)
+        throw new CodexRateLimitError('Usage limit requires explicit cloud continuation',
+          input.resetsAtMs, sessionId ?? undefined, 'rate-limit', false, input.stage, input.phaseSequence)
+      }
       const resumeAt = options.transientRetryDelayMsForTesting === undefined
         ? codexRateLimitResumeAt(input.resetsAtMs)
         : Date.now() + positiveInteger(options.transientRetryDelayMsForTesting, 1)
