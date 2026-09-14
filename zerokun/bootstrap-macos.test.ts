@@ -23,8 +23,32 @@ const bootstrap = join(import.meta.dir, 'bootstrap-macos.sh')
 // 偽HOMEで走らせても実HOMEで稼働中の本物のbridgeが候補に入り、テストが本番の
 // 常駐processを停止してしまう(2026-09-14に実際に発生)。ここで既定を「自分が
 // 登録したPIDしか見えないshim」に倒し、テストからmachine全体の走査を無くす。
-// 候補を登録するテストはZEROKUN_PGREP_CANDIDATESへPID一覧のpathを渡す。
+// decoyを立てるテストはpgrepCandidateShimで自分専用のshimを作って渡す。
 const pgrepShim = join(import.meta.dir, 'test-fixtures', 'pgrep-candidates.sh')
+
+/**
+ * Per-test ZEROKUN_PGREP_BIN shim reporting exactly the PIDs this test spawned.
+ * A decoy is only meaningful if the cutover actually enumerates it, so a test
+ * that stands one up must hand it over here instead of inheriting the
+ * deny-all default. Real pgrep is never called, so a live production bridge
+ * still cannot enter the candidate set.
+ */
+function pgrepCandidateShim(dir: string, pids: readonly number[]): string {
+  const path = join(dir, 'pgrep-candidates.sh')
+  writeFileSync(path, `#!/bin/bash\nprintf '%s\\n' ${pids.join(' ')}\n`, { mode: 0o700 })
+  return path
+}
+
+/**
+ * A stopped child stays a zombie until it is reaped, so process.kill(pid, 0)
+ * keeps succeeding and cannot tell "alive" from "already stopped".
+ */
+async function settled(child: Bun.Subprocess): Promise<'exited' | 'alive'> {
+  return await Promise.race([
+    child.exited.then(() => 'exited' as const),
+    Bun.sleep(1_000).then(() => 'alive' as const),
+  ])
+}
 let savedPgrepBin: string | undefined
 beforeAll(() => {
   savedPgrepBin = process.env.ZEROKUN_PGREP_BIN
@@ -2101,7 +2125,7 @@ codex --version
     } finally { rmSync(fakeHome, { recursive: true, force: true }) }
   })
 
-  test('watchdogのlaunchctl登録失敗後もCLIリンクとzsh aliasを設置する', () => {
+  test('watchdogのlaunchctl登録失敗後もCLIリンクとzsh aliasを設置する', async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-launchctl-failure-'))
     const stateDir = join(fakeHome, '.claude/channels/slack')
     const projectDir = join(fakeHome, 'Work/BellSalesAI')
@@ -2119,6 +2143,7 @@ codex --version
           + ' --dangerously-load-development-channels server:slack-channel"'
           + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      const candidateShim = pgrepCandidateShim(fakeHome, [claudeParent.pid])
 
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
@@ -2127,6 +2152,7 @@ codex --version
           HOME: fakeHome,
           ZEROKUN_STATE_DIR: `${join(fakeHome, '.claude/channels/../channels/slack')}//`,
           ZEROKUN_LEGACY_CUTOVER: '0',
+          ZEROKUN_PGREP_BIN: candidateShim,
           SLACK_STATE_DIR: stateDir,
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_LAUNCHCTL_BIN: fakeLaunchctl,
@@ -2142,7 +2168,7 @@ codex --version
       expect(readFileSync(join(fakeHome, '.zshrc'), 'utf8')).toContain("alias zerokun=")
       expect(readFileSync(join(stateDir, '.env'), 'utf8')).toBe('LEGACY_SENTINEL=keep\n')
       expect(existsSync(join(fakeHome, '.codex/zerokun/.env'))).toBe(true)
-      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+      expect(await settled(claudeParent!)).toBe('alive')
     } finally {
       if (claudeParent) {
         try { claudeParent.kill() } catch {}
@@ -2151,7 +2177,7 @@ codex --version
     }
   })
 
-  test('存在しない標準legacy stateのcutoverは作成やClaude親停止より前に拒否する', () => {
+  test('存在しない標準legacy stateのcutoverは作成やClaude親停止より前に拒否する', async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-missing-cutover-'))
     const stateDir = join(fakeHome, '.claude/channels/slack')
     const projectDir = join(fakeHome, 'project')
@@ -2163,6 +2189,7 @@ codex --version
           + ' --dangerously-load-development-channels server:slack-channel"'
           + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      const candidateShim = pgrepCandidateShim(fakeHome, [claudeParent.pid])
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
         env: {
@@ -2170,6 +2197,7 @@ codex --version
           HOME: fakeHome,
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_LEGACY_CUTOVER: '1',
+          ZEROKUN_PGREP_BIN: candidateShim,
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
         },
@@ -2178,7 +2206,7 @@ codex --version
       expect(result.exitCode).not.toBe(0)
       expect(result.stderr.toString()).toContain('legacy cutover state')
       expect(existsSync(stateDir)).toBe(false)
-      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+      expect(await settled(claudeParent!)).toBe('alive')
     } finally {
       if (claudeParent) {
         try { claudeParent.kill() } catch {}
@@ -2187,7 +2215,7 @@ codex --version
     }
   })
 
-  test('重複行で実効tokenが空になるlegacy .envはClaude親停止より前に拒否する', () => {
+  test('重複行で実効tokenが空になるlegacy .envはClaude親停止より前に拒否する', async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-empty-cutover-'))
     const stateDir = join(fakeHome, '.claude/channels/slack')
     let claudeParent: Bun.Subprocess | undefined
@@ -2207,6 +2235,7 @@ codex --version
           + ' --dangerously-load-development-channels server:slack-channel"'
           + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      const candidateShim = pgrepCandidateShim(fakeHome, [claudeParent.pid])
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
         env: {
@@ -2214,6 +2243,7 @@ codex --version
           HOME: fakeHome,
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_LEGACY_CUTOVER: '1',
+          ZEROKUN_PGREP_BIN: candidateShim,
           ZEROKUN_PROJECT_DIR: join(fakeHome, 'project'),
           ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
         },
@@ -2222,7 +2252,7 @@ codex --version
       expect(result.exitCode).not.toBe(0)
       expect(result.stderr.toString()).toContain('legacy cutover state')
       expect(readFileSync(join(stateDir, '.env'), 'utf8')).toBe(ambiguousEnvironment)
-      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+      expect(await settled(claudeParent!)).toBe('alive')
     } finally {
       if (claudeParent) {
         try { claudeParent.kill() } catch {}
@@ -2231,7 +2261,7 @@ codex --version
     }
   })
 
-  test('異なるSlack Appのtoken pairはcutover停止境界より前に拒否する', () => {
+  test('異なるSlack Appのtoken pairはcutover停止境界より前に拒否する', async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-token-mismatch-cutover-'))
     const stateDir = join(fakeHome, '.claude/channels/slack')
     const stopProbe = join(fakeHome, 'cutover-stop-reached')
@@ -2249,6 +2279,7 @@ codex --version
           + ' --dangerously-load-development-channels server:slack-channel"'
           + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      const candidateShim = pgrepCandidateShim(fakeHome, [claudeParent.pid])
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
         env: {
@@ -2256,6 +2287,7 @@ codex --version
           HOME: fakeHome,
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_LEGACY_CUTOVER: '1',
+          ZEROKUN_PGREP_BIN: candidateShim,
           PATH: setupTestPath(fakeHome, 'AOLDAPP123'),
           ZEROKUN_PROJECT_DIR: join(fakeHome, 'project'),
           ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
@@ -2266,7 +2298,7 @@ codex --version
       expect(result.stderr.toString()).toContain('different Slack Apps')
       expect(existsSync(stopProbe)).toBe(false)
       expect(existsSync(join(stateDir, '.codex-legacy-cutover'))).toBe(false)
-      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+      expect(await settled(claudeParent!)).toBe('alive')
     } finally {
       if (claudeParent) {
         try { claudeParent.kill() } catch {}
@@ -2325,7 +2357,7 @@ codex --version
     }
   })
 
-  test('legacy DB symlinkはClaude親停止より前に拒否する', () => {
+  test('legacy DB symlinkはClaude親停止より前に拒否する', async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-db-symlink-cutover-'))
     const stateDir = join(fakeHome, '.claude/channels/slack')
     const externalDb = join(fakeHome, 'external.sqlite3')
@@ -2346,6 +2378,7 @@ codex --version
           + ' --dangerously-load-development-channels server:slack-channel"'
           + ' /bin/sleep 30',
       ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      const candidateShim = pgrepCandidateShim(fakeHome, [claudeParent.pid])
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
         env: {
@@ -2353,6 +2386,7 @@ codex --version
           HOME: fakeHome,
           ZEROKUN_STATE_DIR: stateDir,
           ZEROKUN_LEGACY_CUTOVER: '1',
+          ZEROKUN_PGREP_BIN: candidateShim,
           PATH: setupTestPath(fakeHome),
           ZEROKUN_PROJECT_DIR: join(fakeHome, 'project'),
           ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
@@ -2363,7 +2397,7 @@ codex --version
       expect(result.stderr.toString()).toContain('unsafe SQLite file')
       expect(readFileSync(externalDb, 'utf8')).toBe('preserve')
       expect(existsSync(stopProbe)).toBe(false)
-      expect(() => process.kill(claudeParent!.pid, 0)).not.toThrow()
+      expect(await settled(claudeParent!)).toBe('alive')
     } finally {
       if (claudeParent) {
         try { claudeParent.kill() } catch {}
@@ -2630,6 +2664,7 @@ codex --version
     try {
       mkdirSync(stateDir, { recursive: true })
       mkdirSync(foreignState, { recursive: true })
+      mkdirSync(`${stateDir}-old`, { recursive: true })
       mkdirSync(projectDir, { recursive: true })
       writeFileSync(join(stateDir, '.env'), [
         'SLACK_BOT_TOKEN=xoxb-scope-not-a-real-token',
@@ -2653,10 +2688,14 @@ codex --version
       }
       const owned = decoy(stateDir)
       const foreign = decoy(foreignState)
-      // 候補はこの2体だけを返すshimを書く。実pgrepを呼ばないので、このMacで
-      // 稼働中の本物のbridgeは候補集合に入りようがない。
-      const candidateShim = join(fakeHome, 'pgrep-candidates.sh')
-      writeFileSync(candidateShim, `#!/bin/bash\nprintf '%s\\n' ${owned.pid} ${foreign.pid}\n`, { mode: 0o700 })
+      // 兄弟state。fragmentの末尾 / が落ちると <state> が <state>-old に前方
+      // 一致して、別installのbridgeを自分のものと誤判定する。
+      const sibling = decoy(`${stateDir}-old`)
+      // 候補はこの3体だけ。実pgrepを呼ばないので、このMacで稼働中の本物の
+      // bridgeは候補集合に入りようがない。
+      const candidateShim = pgrepCandidateShim(
+        fakeHome, [owned.pid, foreign.pid, sibling.pid],
+      )
 
       const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
         cwd: root,
@@ -2675,16 +2714,12 @@ codex --version
 
       expect(result.exitCode, result.stderr.toString()).toBe(0)
       expect(result.stdout.toString()).toContain('旧Claude版Zeroちゃん親processを停止しました')
-      // 停止済みの子はreapされるまでzombieとして残り、kill(pid, 0)は成功して
-      // しまう。生死はexitedの解決で判定する。
-      const settled = async (child: Bun.Subprocess): Promise<'exited' | 'alive'> =>
-        await Promise.race([
-          child.exited.then(() => 'exited' as const),
-          Bun.sleep(1_000).then(() => 'alive' as const),
-        ])
       expect(await settled(owned)).toBe('exited')
       // 別のstate dirに属するbridgeには触れない。
       expect(await settled(foreign)).toBe('alive')
+      expect(await settled(sibling)).toBe('alive')
+      expect(result.stderr.toString())
+        .toContain('このstateに属さないClaude bridge候補 2 件は停止しません')
     } finally {
       for (const child of decoys) {
         try { child.kill(9) } catch {}

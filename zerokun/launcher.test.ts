@@ -30,7 +30,7 @@ const processes: Bun.Subprocess[] = []
  * The marker is the only selector. Cleaning up by command shape would match a
  * real `job-runner.ts daemon` on the machine, which is the same "stop anything
  * that looks like us" mistake that stopped the production bridge on
- * 2026-09-14. `-x` also limits the listing to this user's processes.
+ * 2026-09-14. Omitting `-a` keeps the listing to this user's own processes.
  */
 function strayPids(marker: string): number[] {
   if (!/^[A-Za-z0-9_.-]+$/.test(marker)) throw new Error(`unsafe sweep marker: ${marker}`)

@@ -98,10 +98,15 @@ describe('Darwin process generation', () => {
     expect(commandOwnedByState(production, [
       '/Users/example/.claude/channels/slack/',
     ])).toBe(true)
-    // 末尾の / が無いと <state>-old を取り違える。
-    expect(commandOwnedByState(production, [
-      '/Users/example/.claude/channels/slack-old/',
+    // 末尾の / が無いと <state> が <state>-old に前方一致して、別installの
+    // bridgeを自分のものと誤判定する。commandを兄弟state側にして向きを固定する。
+    const sibling = production.replaceAll('/channels/slack/', '/channels/slack-old/')
+    expect(commandOwnedByState(sibling, [
+      '/Users/example/.claude/channels/slack/',
     ])).toBe(false)
+    expect(commandOwnedByState(sibling, [
+      '/Users/example/.claude/channels/slack',
+    ])).toBe(true)
     // 証拠が無ければ止めない(fail closed)。
     expect(commandOwnedByState(production, [])).toBe(false)
     expect(commandOwnedByState(production, [''])).toBe(false)
