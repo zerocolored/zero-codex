@@ -5,6 +5,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   fsyncSync,
   lstatSync,
@@ -2267,6 +2268,26 @@ async function main(): Promise<void> {
     phase: 'investigation' | 'design' | 'review',
     round: 1 | 2 | 3,
   ): string => join(revisionJournalRoot(input), `${phase}-${round}.json`)
+  // A resumed conversation gets a fresh attempt ledger. Absence is not damage.
+  // Partial files or an active claim must not be mistaken for a fresh round.
+  const roundNotStarted = (phase: 'investigation' | 'review', round: 1 | 2): boolean => {
+    const ledger = unifiedRoundLedger(phase, round)
+    if (ledger.invalid || ledger.entries.length > 0
+      || [...roundTasks.keys()].some(key => key.startsWith(`${phase}:${round}:`))
+      || existsSync(join(journalRoot, 'active-round.lock'))) return false
+    return !readdirSync(journalRoot, { withFileTypes: true }).some(entry =>
+      /^revision-[1-9][0-9]*-[0-9a-f]{16}$/.test(entry.name)
+      && (!entry.isDirectory() || entry.isSymbolicLink()
+        || readdirSync(join(journalRoot, entry.name)).some(name =>
+          name.startsWith(`${phase}-${round}.json`))))
+  }
+  const notStartedResult = (phase: string, round: number, input: AdvisorInputSnapshot) => toolText({
+    complete: false,
+    notStarted: true,
+    phase, round, inputRevision: input.revision, inputDigest: input.digest,
+    reason: 'No advisor round has started in this attempt; this is not a ledger inconsistency.',
+    nextAction: 'Continue the retained conversation and work. Start advisor_round with this current binding and retryUnavailable=false, completing required preceding phases first (investigation before review-1, review-1 and its mandatory fix delta before review-2). Do not block or request administrative repair for an unstarted round. Historical answers remain context, not new approvals.',
+  })
   const reviewDeltaBaselinePath = (
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
   ): string => join(
@@ -2466,6 +2487,10 @@ async function main(): Promise<void> {
       recoveryInputDigest?: string,
     } | undefined
     let retryBackoff = false
+    if (retryUnavailable && phaseScope === 'complete'
+      && roundNotStarted(phase as 'investigation' | 'review', round as 1 | 2)) {
+      return notStartedResult(phase, round, input)
+    }
     if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
       const retryPath = `${roundJournalPath({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3)}.responses`
       const raw = readOptionalPrivateFile(retryPath)
@@ -3424,6 +3449,13 @@ async function main(): Promise<void> {
     if (phaseScope === 'complete') {
       const ledger = unifiedRoundLedger(phase, round as 1 | 2)
       const registeredButNotMaterialized = ledger.entries.length === 0 && roundTasks.has(taskKey)
+      if (roundNotStarted(phase as 'investigation' | 'review', round as 1 | 2)) {
+        try {
+          return notStartedResult(phase, round, readAdvisorInputSnapshot(stateDir, context.jobId))
+        } catch (error) {
+          return toolText({ complete: false, reason: `durable input is unavailable: ${String(error)}` }, true)
+        }
+      }
       if (ledger.invalid || ledger.entries.length > 1
         || (ledger.entries.length === 0 && !registeredButNotMaterialized)
         || (phase === 'review' && round === 2 && ledger.entries.length === 1

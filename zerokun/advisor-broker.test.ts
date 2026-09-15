@@ -1951,6 +1951,42 @@ print('review complete')
     }
   }, 20_000)
 
+  test('新規attemptのpollとcold retryは未開始を返し通常開始で3回答を取得できる', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
+    try {
+      const poll = await fixture.poll('investigation', 'revision-one')
+      expect(poll.result.isError).not.toBe(true)
+      expect(poll.payload).toMatchObject({ complete: false, notStarted: true,
+        inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest })
+      const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1,
+        { retryUnavailable: true, inputUpdateIsRecoveryOnly: true })
+      expect(retry.result.isError).not.toBe(true)
+      expect(retry.payload).toMatchObject({ complete: false, notStarted: true })
+      const review = await fixture.poll('review', 'revision-two')
+      expect(review.payload).toMatchObject({ complete: false, notStarted: true })
+      expect(String(review.payload.nextAction)).toContain('investigation before review-1')
+      expect((await fixture.call('investigation', 'revision-two')).payload).toMatchObject({ complete: true })
+      expect((await fixture.poll('investigation', 'revision-two')).payload).toMatchObject({ complete: true })
+    } finally { await fixture.close() }
+  }, 30_000)
+
+  test('部分的な保存記録は未開始とせず上書きしない', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
+    try {
+      const root = join(fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`)
+      mkdirSync(root, { recursive: true, mode: 0o700 })
+      const path = join(root, 'investigation-1.json.responses')
+      writeFileSync(path, '{"preserved":true}', { mode: 0o600 })
+      const poll = await fixture.poll('investigation', 'revision-two')
+      expect(poll.payload.notStarted).not.toBe(true)
+      const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1,
+        { retryUnavailable: true })
+      expect(retry.payload.notStarted).not.toBe(true)
+      expect(readFileSync(path, 'utf8')).toBe('{"preserved":true}')
+    } finally { await fixture.close() }
+  }, 20_000)
+
   test('completed fast pathでもattempt全体の同一round重複を拒否する', async () => {
     const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
     try {

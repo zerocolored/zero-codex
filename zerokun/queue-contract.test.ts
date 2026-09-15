@@ -302,6 +302,20 @@ describe('Zero-kun Codex wiring', () => {
   // 2026-09-14: cutoverがcommandの形だけでmachine全体から停止対象を選び、
   // 偽HOMEで走らせたテストが実HOMEで稼働中の本番bridgeを停止させた。
   // 「所有権を証明してから止める」順序をsourceの契約として固定する。
+  // 2026-09-14: 実HOMEの本番bridgeを偽HOMEのテストが停止させた。実行時の赤で
+  // 気づくのは「本番が止まった後」なので、既定がdeny-all shimであることを
+  // source契約として固定する。beforeAllの数行が消えたらここで赤くなる。
+  test('setup.shを起こすテストはpgrep候補列挙の既定をdeny-all shimに倒す', () => {
+    const bootstrap = readFileSync(join(import.meta.dir, 'bootstrap-macos.test.ts'), 'utf8')
+    expect(bootstrap).toContain(
+      "const pgrepShim = join(import.meta.dir, 'test-fixtures', 'pgrep-candidates.sh')",
+    )
+    expect(bootstrap).toContain('process.env.ZEROKUN_PGREP_BIN = pgrepShim')
+    expect(readFileSync(
+      join(import.meta.dir, 'test-fixtures', 'pgrep-candidates.sh'), 'utf8',
+    )).toMatch(/^exit 1$/m)
+  })
+
   test('cutoverは所有権を証明したClaude bridgeだけを停止する', () => {
     const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
     const generation = readFileSync(join(import.meta.dir, 'process-generation.ts'), 'utf8')
