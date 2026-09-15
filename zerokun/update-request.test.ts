@@ -454,6 +454,59 @@ describe('Slack update request', () => {
     expect(launched).toEqual(['request-recover-notify'])
   })
 
+  test('配信し損ねたoutcomeが残っていても新しい更新依頼を受け付ける', async () => {
+    const stateDir = fixtureDir()
+    await requestUpdate(input(), {
+      stateDir,
+      idFactory: () => 'request-undelivered',
+      launchWorker: () => {},
+    })
+    const request = JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8'))
+    // 更新自体は完了したがSlack通知だけが落ちた状態。notifiedAtは配信成功でしか付かないので、
+    // ここでduplicateを返し続けると二度と更新できなくなる(実機で発生した)。
+    request.outcome = { success: true, exitCode: 0, text: 'done', completedAt: Date.now() }
+    writeFileSync(join(stateDir, 'update-request.json'), JSON.stringify(request))
+
+    const events: string[] = []
+    const second = await requestUpdate(input('1787000000.000200'), {
+      stateDir,
+      idFactory: () => 'request-after-undelivered',
+      isWorkerRunning: () => false,
+      isUpdateRunning: () => false,
+      launchWorker: () => events.push('launch'),
+      onAccepted: async () => { events.push('ack') },
+      onDuplicate: async () => { events.push('duplicate') },
+    })
+
+    expect(second.accepted).toBe(true)
+    expect(second.duplicate).toBe(false)
+    expect(second.request.id).toBe('request-after-undelivered')
+    expect(events).toEqual(['ack', 'launch'])
+  })
+
+  test('配信できないoutcomeはSTALEを超えたら畳み、workerを起こし直さない', async () => {
+    const stateDir = fixtureDir()
+    await requestUpdate(input(), {
+      stateDir,
+      idFactory: () => 'request-give-up-notify',
+      launchWorker: () => {},
+    })
+    const request = JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8'))
+    request.outcome = { success: true, exitCode: 0, text: 'done', completedAt: Date.now() }
+    writeFileSync(join(stateDir, 'update-request.json'), JSON.stringify(request))
+
+    const launched: string[] = []
+    expect(resumePendingUpdateWorker({
+      stateDir,
+      isWorkerRunning: () => false,
+      isUpdateRunning: () => false,
+      launchWorker: value => launched.push(value.id),
+      now: () => Date.now() + 7 * 60 * 60 * 1000,
+    })).toBe(false)
+    expect(launched).toEqual([])
+    expect(existsSync(join(stateDir, 'update-request.json'))).toBe(false)
+  })
+
   test('受付通知後に独立workerを1回だけ起動し、同時依頼をまとめる', async () => {
     const stateDir = fixtureDir()
     const events: string[] = []
