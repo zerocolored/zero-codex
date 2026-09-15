@@ -116,10 +116,14 @@ test('launcher fixtureはcommand textから停止対象を選ばない', () => {
   const launcher = readFileSync(join(import.meta.dir, 'launcher.test.ts'), 'utf8')
   const ledger = readFileSync(join(import.meta.dir, 'launcher-fixture-processes.ts'), 'utf8')
   expect(launcher).toContain("from './launcher-fixture-processes.ts'")
-  expect(launcher).not.toContain('pgrep')
+  // 許すのは `/bin/ps -o <fmt>= -p <pid>` の単一PID再照合だけ。
+  // process表を丸ごと引く手段は、外部commandでもこのrepo自身のAPIでも拒む。
+  // readProcessTable() は proc_listallpids のラッパ(process-generation.ts)で、
+  // launcher.test.ts は既に同じmoduleからimportしているため1語で到達できる。
   expect(launcher).not.toContain('strayPids')
   expect(launcher).not.toContain('reapFixtureDirectory')
-  // `/bin/ps -o lstart= -p <pid>` の単一PID再検証は許す。machine全体の列挙だけ拒む。
-  expect(launcher).not.toMatch(/-xo|-ax/)
+  expect(launcher).not.toMatch(
+    /pgrep|pkill|killall|readProcessTable|proc_listallpids|-xo|-ax|-ef|ps -A|ps -e/,
+  )
   expect(ledger).toContain('Never discover kill targets by command text')
 })

@@ -1041,6 +1041,7 @@ describe('codex-channel.sh replacement guard', () => {
     for (let attempt = 0; attempt < 100 && !existsSync(runnerPidFile); attempt += 1) {
       await Bun.sleep(20)
     }
+    expect(existsSync(runnerPidFile)).toBe(true)
     const starter = Number(readFileSync(join(state, 'fake-starter-pid'), 'utf8'))
     const runner = Number(readFileSync(runnerPidFile, 'utf8'))
     expect(Number.isSafeInteger(starter) && starter > 1).toBe(true)
