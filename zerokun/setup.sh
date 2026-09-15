@@ -15,6 +15,11 @@ LEGACY_STATE_DIR="$HOME/.claude/channels/slack"
 TPL="$REPO_DIR/zerokun/templates"
 PROJECT_DIR="${ZEROKUN_PROJECT_DIR:-$(dirname "$REPO_DIR")/zerokun-workspace}"
 LAUNCHCTL_BIN="${ZEROKUN_LAUNCHCTL_BIN:-/bin/launchctl}"
+# 旧Claude版bridgeの候補列挙。testはここへ「自分が起こしたPIDだけを返すshim」を
+# 挿し、machine全体の走査そのものを起こさせない。この継ぎ目は候補を狭める方向に
+# しか効かず、列挙されたPIDは必ず実/bin/psでの再照合と世代検証を通るため、
+# 値を差し替えても停止対象を広げることはできない。
+PGREP_BIN="${ZEROKUN_PGREP_BIN:-/usr/bin/pgrep}"
 . "$REPO_DIR/zerokun/codex-version.sh"
 
 # Cutoverは既存legacy stateへの明示操作だけに限定する。検査より先にdirectoryを
@@ -377,7 +382,31 @@ bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/managed-path.ts" prepare
 process_matches() {
   local pid="$1" pattern="$2"
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
-    && ps -o command= -p "$pid" 2>/dev/null | grep -Eq "$pattern"
+    && /bin/ps -ww -o command= -p "$pid" 2>/dev/null | grep -Eq "$pattern"
+}
+
+# 旧Claude版の親processはlock fileを持たないので、machine全体のcommand名一致だけ
+# では「どのinstallのbridgeか」を判定できない。legacy launcherはこのstate dirを
+# argvへ3回渡す(--mcp-config / --settings / --append-system-prompt-file)ので、
+# state dir pathそのものを所有権の証拠にする。
+# $LEGACY_STATE_DIRはHOME由来の論理path、$CHはprepare-root済みの物理path。
+# macOSでは/varと/private/varが食い違い、$HOME/.claudeがsymlinkのこともあるため
+# 両方を許す(下のGATEWAY_SCRIPTの既存コメントと同じ理由)。
+# 比較はcaseのクォート展開によるliteral部分一致で、pathを正規表現へ入れない。
+# これでERE/JS両方のメタ文字escapeというバグ源が構造的に消える。
+# 末尾の / は必須。付けないと <state> が <state>-old に誤一致する。
+LEGACY_OWNED_PRIMARY="$CH/"
+LEGACY_OWNED_ALIAS="$LEGACY_STATE_DIR/"
+[ "$LEGACY_OWNED_ALIAS" != "$LEGACY_OWNED_PRIMARY" ] || LEGACY_OWNED_ALIAS=""
+
+legacy_parent_owned_by_state() {
+  local argv
+  argv="$(/bin/ps -ww -o command= -p "$1" 2>/dev/null)" || return 1
+  [ -n "$argv" ] || return 1
+  case "$argv" in *"$LEGACY_OWNED_PRIMARY"*) return 0 ;; esac
+  [ -n "$LEGACY_OWNED_ALIAS" ] || return 1
+  case "$argv" in *"$LEGACY_OWNED_ALIAS"*) return 0 ;; esac
+  return 1
 }
 
 lock_process_matches() {
@@ -407,17 +436,39 @@ ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file \
 # Explicitly selecting the legacy state is the opt-in in-place cutover path.
 # A normal Codex setup never scans for or stops Claude processes.
 if [ "$LEGACY_CUTOVER_INITIAL" = "1" ]; then
+  # exit 1は「候補なし」で正常。2以上はpgrep自体の失敗なので、「対象なし」へ
+  # 丸めてcutoverを黙って不完全に終わらせない。
+  # `if ! cmd` にすると `!` が反転後の状態を $? へ入れてしまい、exit codeを
+  # 分類できない。非反転のelse側で受けること。
+  if LEGACY_PARENT_CANDIDATES="$("$PGREP_BIN" -U "$(/usr/bin/id -u)" -f \
+    'claude.*dangerously-load-development-channels.*server:slack-channel' 2>/dev/null)"; then
+    :
+  else
+    pgrep_status=$?
+    [ "$pgrep_status" -eq 1 ] \
+      || { echo "❌ 旧Claude版bridge候補を列挙できません。" >&2; exit 1; }
+    LEGACY_PARENT_CANDIDATES=""
+  fi
+  LEGACY_PARENT_SKIPPED=0
   while IFS= read -r legacy_parent; do
     [ -n "$legacy_parent" ] || continue
     [ "$legacy_parent" != "$$" ] || continue
-    if process_matches "$legacy_parent" 'claude.*dangerously-load-development-channels[[:space:]]+server:slack-channel'; then
-      bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-generation.ts" \
-        stop-matching "$legacy_parent" \
-        'claude.*dangerously-load-development-channels\s+server:slack-channel' 30000 \
-        || { echo "❌ 旧Claude版Zeroちゃん親processを世代検証付きで停止できません。" >&2; exit 1; }
-      echo "   旧Claude版Zeroちゃん親processを停止しました"
+    process_matches "$legacy_parent" \
+      'claude.*dangerously-load-development-channels[[:space:]]+server:slack-channel' \
+      || continue
+    if ! legacy_parent_owned_by_state "$legacy_parent"; then
+      LEGACY_PARENT_SKIPPED=$((LEGACY_PARENT_SKIPPED + 1))
+      continue
     fi
-  done < <(pgrep -f 'claude.*dangerously-load-development-channels.*server:slack-channel' 2>/dev/null || true)
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/process-generation.ts" \
+      stop-owned "$legacy_parent" \
+      'claude.*dangerously-load-development-channels\s+server:slack-channel' 30000 \
+      "$LEGACY_OWNED_PRIMARY" ${LEGACY_OWNED_ALIAS:+"$LEGACY_OWNED_ALIAS"} </dev/null \
+      || { echo "❌ 旧Claude版Zeroちゃん親processを世代検証付きで停止できません。" >&2; exit 1; }
+    echo "   旧Claude版Zeroちゃん親processを停止しました"
+  done <<< "$LEGACY_PARENT_CANDIDATES"
+  [ "$LEGACY_PARENT_SKIPPED" -eq 0 ] \
+    || echo "   このstateに属さないClaude bridge候補 ${LEGACY_PARENT_SKIPPED} 件は停止しません" >&2
 fi
 
 legacy_running_state() {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  commandOwnedByState,
   observeProcessGeneration,
   processGroupSignalAllowed,
   processStartKey,
@@ -73,4 +74,51 @@ describe('Darwin process generation', () => {
     })
     },
   )
+
+  // 2026-09-14: cutoverがcommandの「形」だけで停止対象を選んでいたため、
+  // 偽HOMEで走らせたテストが実HOMEで稼働中の本番bridgeを巻き込んで停止させた。
+  // 形は所有権ではない、という契約をここで固定する。
+  test('commandの形だけでは所有権にならない: 別stateのClaude bridgeは対象外', () => {
+    const production = [
+      'claude --model opus --effort max --dangerously-skip-permissions',
+      '--mcp-config /Users/example/.claude/channels/slack/mcp.slack-channel.json',
+      '--settings /Users/example/.claude/channels/slack/bot-settings.json',
+      '--append-system-prompt-file'
+        + ' /Users/example/.claude/channels/slack/zerokun-heavy-mode.generated.md',
+      '--dangerously-load-development-channels server:slack-channel',
+    ].join(' ')
+    const shape = /claude.*dangerously-load-development-channels\s+server:slack-channel/
+    // 形は一致する。旧ルールはこれだけで停止していた。
+    expect(shape.test(production)).toBe(true)
+    // テストの一時stateからは他人のbridgeに見える。
+    expect(commandOwnedByState(production, [
+      '/private/var/folders/zz/T/zerokun-setup-cutover-ab12cd/.claude/channels/slack/',
+    ])).toBe(false)
+    // 本物のcutoverはちゃんと捕まえる。
+    expect(commandOwnedByState(production, [
+      '/Users/example/.claude/channels/slack/',
+    ])).toBe(true)
+    // 末尾の / が無いと <state> が <state>-old に前方一致して、別installの
+    // bridgeを自分のものと誤判定する。commandを兄弟state側にして向きを固定する。
+    const sibling = production.replaceAll('/channels/slack/', '/channels/slack-old/')
+    expect(commandOwnedByState(sibling, [
+      '/Users/example/.claude/channels/slack/',
+    ])).toBe(false)
+    expect(commandOwnedByState(sibling, [
+      '/Users/example/.claude/channels/slack',
+    ])).toBe(true)
+    // 証拠が無ければ止めない(fail closed)。
+    expect(commandOwnedByState(production, [])).toBe(false)
+    expect(commandOwnedByState(production, [''])).toBe(false)
+    // pathは正規表現ではなくliteralとして比較する。
+    expect(commandOwnedByState(
+      'x /tmp/a+b(c)/.claude/channels/slack/y',
+      ['/tmp/a+b(c)/.claude/channels/slack/'],
+    )).toBe(true)
+    expect(commandOwnedByState(
+      'x /tmp/aZb(c)/.claude/channels/slack/y',
+      ['/tmp/a+b(c)/.claude/channels/slack/'],
+    )).toBe(false)
+  })
+
 })

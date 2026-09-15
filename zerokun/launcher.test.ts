@@ -5,7 +5,8 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
-import { FIXTURE_PROCESS_DIR, FIXTURE_STOPPING, recordFixtureProcess, reapFixtureHandles, stopRecordedFixtureProcesses } from './launcher-fixture-processes.ts'
+import { FIXTURE_PROCESS_DIR, FIXTURE_STOPPING, recordFixtureProcess, recordedFixtureProcesses, reapFixtureHandles, stopRecordedFixtureProcesses } from './launcher-fixture-processes.ts'
+import { observeProcessGeneration } from './process-generation.ts'
 
 const LAUNCHER = join(dirname(import.meta.dir), 'codex-channel.sh')
 const BUN = process.execPath
@@ -1026,4 +1027,35 @@ describe('codex-channel.sh replacement guard', () => {
     expect(() => process.kill(starterPid, 0)).toThrow()
     expect(existsSync(join(state, 'fake-runner-pid'))).toBe(false)
   }, 10_000)
+  // 2026-09-11 と 2026-09-14: テストを1回流すごとに孤児が1体増え、最古は4日前から
+  // 滞留していた。launcherが起こす孫(runner-launcher)とその子(runner)は
+  // `processes` に載らず、親をSIGKILLしてもlaunchdへ里親交代して生き残る。
+  // afterEachの掃除は台帳に載ったidentityしか止めないので、fixtureから登録が
+  // 落ちても掃除は黙って成功し、孤児だけが増える。孫が台帳へ載ることと、
+  // 台帳経由の世代検証つき停止で実際に消えることの両方を固定する。
+  test('launcherが起こす孫processは所有権台帳に載りteardownで必ず消える', async () => {
+    const state = fixture()
+    const result = await runLauncher(state, {})
+    expect(result.exitCode, result.output).toBe(0)
+    const runnerPidFile = join(state, 'fake-runner-pid')
+    for (let attempt = 0; attempt < 100 && !existsSync(runnerPidFile); attempt += 1) {
+      await Bun.sleep(20)
+    }
+    expect(existsSync(runnerPidFile)).toBe(true)
+    const starter = Number(readFileSync(join(state, 'fake-starter-pid'), 'utf8'))
+    const runner = Number(readFileSync(runnerPidFile, 'utf8'))
+    expect(Number.isSafeInteger(starter) && starter > 1).toBe(true)
+    expect(Number.isSafeInteger(runner) && runner > 1).toBe(true)
+    const owned = recordedFixtureProcesses(state)
+      .filter(identity => identity.pid === starter || identity.pid === runner)
+    expect(owned.some(identity => identity.pid === starter)).toBe(true)
+    expect(owned.some(identity => identity.pid === runner)).toBe(true)
+    expect(owned.every(identity => observeProcessGeneration(identity).status === 'alive')).toBe(true)
+
+    // afterEach と同じ実体を直接呼ぶ。PIDだけのkill(pid,0)はzombieとPID再利用を
+    // 区別できないので、取得済みidentityの世代で死亡を判定する。
+    writeFileSync(join(state, FIXTURE_STOPPING), '')
+    await stopRecordedFixtureProcesses(state)
+    expect(owned.every(identity => observeProcessGeneration(identity).status === 'dead')).toBe(true)
+  }, 20_000)
 })
