@@ -63,7 +63,8 @@ Slack bot
   節目と定時報告はSQLiteへ先に保存して再試行し、terminalは未配送の公開対象を追い越しません。
   受付には`eyes`、正常完了時には元メッセージへ`white_check_mark` reactionを付けます。本文は
   Slackアシスタントとして一人称の簡潔で温かい日本語と自然な絵文字1〜2個を使い、固定の表示名や
-  内部engine名は表示しません。
+  質問や回答に含まれる製品名・実装名を理由に、回答を削除したり非公開の定型文へ置き換えたりしません。
+  APIキーなどの認証情報、実行環境のパス・内部IDの保護は維持します。
 - Codex 子プロセスには Slack token や任意の親process環境を渡しません。Slack 投稿は gateway/runner の bot 経路だけです。
 - 起動時のHerdr socket・pane・terminal・workspaceを固定し、job開始前に同じidentityを再検証します。
   staleなHerdr環境ではCodexを起動しません。

@@ -12876,11 +12876,8 @@ describe('Slack output guard', () => {
     expect(finalized.result).not.toContain(job.chatId)
     expect(finalized.result).not.toContain(job.userId)
     expect(finalized.result).not.toContain(job.executorNonce!)
-    expect(finalized.result).not.toMatch(/Codex|worker|\bjob\b|Herdr|App Server|Grok/i)
-    expect(finalized.result).not.toMatch(
-      /Claude|advisor|MCP|broker|JSON[ -]?RPC|Seatbelt|subagent|クロード|アドバイザー|ブローカー/i,
-    )
-    expect(finalized.result).not.toMatch(/Codex|App[ -]Server|Claude[ -]Code|MCP/i)
+    expect(finalized.result).toContain('Codex worker job 123 finished through Herdr App Server and Grok.')
+    expect(finalized.result).toContain('クロードコードのアドバイザーとブローカーが確認しました。')
     expect(finalized.result).not.toContain('\u200b')
     expect(finalized.result).not.toContain('/opt/homebrew/bin')
     expect(finalized.result).not.toContain('wabc:pdef')
@@ -12935,7 +12932,8 @@ describe('Slack output guard', () => {
     expect(sanitized).toContain('一次調査では、質問抽出の待ち時間がボトルネック候補です。')
     expect(sanitized).not.toContain('内部構成は公開していません。')
     expect(sanitized).not.toContain(repo)
-    expect(sanitized).not.toMatch(/Codex|worker|xoxb|session-private/i)
+    expect(sanitized).toContain('Codex worker')
+    expect(sanitized).not.toMatch(/xoxb|session-private/i)
 
     const posted: string[] = []
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
@@ -12946,7 +12944,7 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('自リポジトリ名は伏せるが、それを含む説明文は消さない', () => {
+  test('自リポジトリ名も通常の説明文として保持する', () => {
     const state = fixtureDir()
     const store = new JobStore(join(state, 'jobs.sqlite3'))
     const job = store.enqueue(input({
@@ -12958,10 +12956,7 @@ describe('Slack output guard', () => {
       '再開には、作業対象を `zero-codex` に指定した再実行が必要です。',
     ].join('\n')
     const sanitized = sanitizeExecutionTextForSlack(job, 'session-private', raw, state, [], 'result')
-    // The name itself never reaches Slack, but the reader can still tell a
-    // refusal from a crash because the explanation around it survives.
-    expect(sanitized).not.toMatch(/zero[-_ ]?codex/i)
-    expect(sanitized).toContain('指定のリポジトリ')
+    expect(sanitized).toBe(raw)
     expect(sanitized).toContain('現在の許可対象は BellSalesAI のため')
     expect(sanitized).toContain('再開には、作業対象を')
     expect(sanitized).not.toContain('内部構成は公開していません。')
@@ -12969,7 +12964,7 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('自リポジトリ名を引用していても素の内部実装名は伏せる', () => {
+  test('自リポジトリ名も実装名も質問への出現有無で削除しない', () => {
     const state = fixtureDir()
     const store = new JobStore(join(state, 'jobs.sqlite3'))
     const task = 'https://github.com/zerocolored/zero-codex/pull/21 修正お願いします'
@@ -12978,21 +12973,17 @@ describe('Slack output guard', () => {
       store.enqueue(input({ messageId: `repository-name-guard-${ordinal += 1}`, task })).job,
       'session-private', raw, state, [], 'result',
     )
-    // Withholding the repository name keeps its sentence readable; every
-    // genuine implementation name stays redacted, including in a clause that
-    // also cites the repository.
     const withheld = sanitize('zero-codex の修正には進めません。')
-    expect(withheld).not.toMatch(/zero[-_ ]?codex/i)
+    expect(withheld).toContain('zero-codex')
     expect(withheld).toContain('の修正には進めません。')
-    // The unseparated spelling is withheld too, which the bare name guard missed.
-    expect(sanitize('zerocodex の修正には進めません。')).not.toMatch(/zerocodex/i)
+    expect(sanitize('zerocodex の修正には進めません。')).toContain('zerocodex')
     for (const raw of [
       'Codex が実行しています。',
       'OpenAI Codex で動いています。',
       'Herdr の pane で動作しています。',
       'zero-codex は Codex と Herdr で動きます。',
     ]) {
-      expect(sanitize(raw)).not.toMatch(/Codex|Herdr/i)
+      expect(sanitize(raw)).toBe(raw)
     }
     store.close()
   })
@@ -13343,7 +13334,7 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('製品名を質問してもZeroちゃんの内部構成句とcredentialは常にSlackから落とす', () => {
+  test('内部構成の説明は残し実credentialだけをSlackから落とす', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
     mkdirSync(repo)
@@ -13375,7 +13366,7 @@ describe('Slack output guard', () => {
       ].join('\n'),
     }, state)
     expect(finalized.result).toContain('Codex と Grok は役割が異なります。')
-    expect(finalized.result).not.toMatch(/Zeroちゃん内部|App Server|Herdr|MCP|broker/i)
+    expect(finalized.result).toContain('Zeroちゃん内部は Codex App Server と Herdr の MCP broker 経由で動作します。')
     expect(finalized.result).not.toContain(token)
     expect(finalized.result).not.toContain(appToken)
     expect(finalized.result).not.toContain(enterpriseToken)
@@ -13387,806 +13378,91 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('製品名の一般説明は残しZeroちゃん自身の採用実装だけを隠す', () => {
+  test('質問の主語・製品名・実装名から回答を非公開へ分類しない', () => {
     const state = fixtureDir()
-    const repo = join(state, 'repo')
-    mkdirSync(repo)
     const store = new JobStore(join(state, 'jobs.sqlite3'))
-    store.enqueue(input({
-      repoPath: repo,
-      task: 'Codex と MCP について説明して。ZeroちゃんはCodexで動いていますか？',
-    }))
-    const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'public-product-answer',
-      result: [
-        'Codex はコード作業を支援する製品です。',
-        'MCPはモデルとツールを接続する標準です。',
-        'MCPの動作は JSON-RPC を使います。',
-        'はい。',
-        'はい、その通りです。',
-        'その通りです。',
-        'そうですね。',
-        'もちろんです。',
-        '間違いありません。',
-        'Yes, that’s correct.',
-        'Correct, it does.',
-        'Absolutely.',
-        'Indeed.',
-        'Affirmative.',
-        '👍',
-        'Codexを採用しています。',
-        'GPT-5.4を採用しています。',
-        'Codexベースです。',
-        'Codex製です。',
-        '処理には Codex を使っています。',
-        '採用エンジンはCodexです。',
-        '私はClaude Codeを利用しています。',
-        'バックエンド=Codexです。',
-        'このボットのモデルはCodexです。',
-        'はい、Codexで動いています。',
-        'I use Codex.',
-        'Codexです。',
-        'Zeroちゃん（Codex）。',
-        '中身はCodex。',
-        'Zeroちゃん: Codex',
-        'Zero uses Codex.',
-        'Zero relies on Codex.',
-        'Codex powers Zero.',
-        'The bot uses Codex.',
-        'It runs on Codex.',
-        'Under the hood, Codex handles requests.',
-        'Zeroちゃんの処理担当＝Codex',
-        '内部では Codex が動作しています。',
-        '基盤として Codex を採用しています。',
-        'Codexはここで使っています。',
-        'Codexは今ここで動作しています。',
-        'Codexは当方の基盤です。',
-      ].join('\n'),
-    }, state)
-    expect(finalized.result).toContain('Codex はコード作業を支援する製品です。')
-    expect(finalized.result).toContain('MCPはモデルとツールを接続する標準です。')
-    expect(finalized.result).toContain('MCPの動作は JSON-RPC を使います。')
-    expect(finalized.result).not.toContain('はい。')
-    expect(finalized.result).not.toMatch(/その通り|そうですね|もちろん|間違い|that’s correct|Correct, it does|Absolutely|Indeed|Affirmative|👍/i)
-    expect(finalized.result.match(/内部構成は公開していません。/g)).toHaveLength(1)
-    expect(finalized.result).not.toContain('GPT-5.4')
-    expect(finalized.result).not.toContain('処理には')
-    expect(finalized.result).not.toContain('採用エンジン')
-    expect(finalized.result).not.toContain('私はClaude')
-    expect(finalized.result).not.toContain('バックエンド')
-    expect(finalized.result).not.toContain('このボットのモデル')
-    expect(finalized.result).not.toContain('Codexで動いて')
-    expect(finalized.result).not.toContain('I use Codex')
-    expect(finalized.result).not.toMatch(/Codexです|Zeroちゃん.*Codex|中身|Zero (?:uses|relies)|Codex powers Zero|The bot uses|It runs|Under the hood|Codex が動作|基盤として|ここで使|ここで動作|当方の基盤/i)
-    store.close()
-  })
-
-  test('主語を省いた自己実装質問でもモデル名を隠し一般製品説明は残す', () => {
-    for (const [index, task, answer] of [
-      ['runs-on', '何で動いてるの？', 'GPT-5.4です。'],
-      ['used-model', '使用モデルを教えて', 'o3です。'],
-      ['which-model', '何のモデル？', 'GPT-5です。'],
-    ] as const) {
-      const state = fixtureDir()
-      const repo = join(state, `repo-${index}`)
-      mkdirSync(repo)
-      const store = new JobStore(join(state, 'jobs.sqlite3'))
-      store.enqueue(input({ repoPath: repo, task }))
-      const job = store.claimNext('serial-worker')!
-      const finalized = finalizeSuccessfulExecution(job, {
-        sessionId: `subject-omitted-${index}`,
-        result: answer,
-      }, state)
-      expect(finalized.result).not.toMatch(/GPT|\bo3\b/i)
-      store.close()
+    const questions = [
+      '本番環境では数分で抽出まで完了するのに、あなたの検証環境では100分を超えて続くというのはなぜなのか教えてください。',
+      'あなたの検証ではなぜ遅いの？', 'あなたのフレームワークは？',
+      'Zeroちゃんは何言語で動いてる？', '何のモデル？', '何でできているの？',
+      'READMEを直して。Zeroちゃんの構成は？', 'Fix README. What is your architecture?',
+      'What language are you written in?', 'What powers you?', 'Describe Zero dependencies.',
+      'このリポジトリのCodex実装を調べて', 'このコードはGrokを使う？',
+      '何かを使う方法は？', '何を使うべき？', 'CodexとGrokを比較して',
+    ]
+    const answer = '検証では本番と異なる処理を実行しています。比較条件を揃える必要があります。\nCodex App Server、Claude Code、Grok、MCP、GPT-6 Astraを使っています。\nREADMEを更新しました。'
+    for (const [index, task] of questions.entries()) {
+      const job = store.enqueue(input({ messageId: `no-classifier-${index}`, task })).job
+      for (const purpose of ['progress', 'result'] as const) {
+        expect(sanitizeExecutionTextForSlack(job, 'safe-session', answer, state, [], purpose)).toBe(answer)
+      }
+      expect(finalizeSuccessfulExecution(job, { sessionId: 'safe-session', result: answer }, state).result).toBe(answer)
     }
-
-    const generalState = fixtureDir()
-    const generalRepo = join(generalState, 'general-repo')
-    mkdirSync(generalRepo)
-    const generalStore = new JobStore(join(generalState, 'jobs.sqlite3'))
-    generalStore.enqueue(input({ repoPath: generalRepo, task: 'GPT-5.4について説明して' }))
-    const generalJob = generalStore.claimNext('serial-worker')!
-    const general = finalizeSuccessfulExecution(generalJob, {
-      sessionId: 'general-model-explanation',
-      result: 'GPT-5.4は一般的なモデル名です。',
-    }, generalState)
-    expect(general.result).toContain('GPT-5.4は一般的なモデル名です。')
-    generalStore.close()
-
-    const unrelatedState = fixtureDir()
-    const unrelatedRepo = join(unrelatedState, 'unrelated-repo')
-    mkdirSync(unrelatedRepo)
-    const unrelatedStore = new JobStore(join(unrelatedState, 'jobs.sqlite3'))
-    unrelatedStore.enqueue(input({ repoPath: unrelatedRepo, task: '結果だけ教えて' }))
-    const unrelatedJob = unrelatedStore.claimNext('serial-worker')!
-    const unrelated = finalizeSuccessfulExecution(unrelatedJob, {
-      sessionId: 'unrelated-model-leak',
-      result: 'GPT-5.4で処理しました。',
-    }, unrelatedState)
-    expect(unrelated.result).not.toContain('GPT-5.4')
-    unrelatedStore.close()
-  })
-
-  test('一般製品の質問でも英語の自己実装文節だけを隠す', () => {
-    const state = fixtureDir()
-    const repo = join(state, 'repo')
-    mkdirSync(repo)
-    const store = new JobStore(join(state, 'jobs.sqlite3'))
-    store.enqueue(input({ repoPath: repo, task: 'Codex と一般的なMCPの説明をして' }))
-    const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'public-product-general-answer',
-      result: [
-        'Codex はコード作業を支援する製品です。',
-        'MCPはJSON-RPCを使う標準です。',
-        'Our implementation relies on Codex.',
-        'This application delegates requests to Codex.',
-        'My backend calls Codex.',
-        'My engine is Codex.',
-        'The underlying engine is Codex.',
-        'Requests are handled by Codex behind the scenes.',
-        'Codex serves as our reasoning engine.',
-        'This agent calls Codex.',
-        'Our stack is Codex.',
-        'Implementation: Codex.',
-        'The architecture uses Codex.',
-        'Backend uses Codex.',
-        '技術スタックはCodexです。',
-        '使用技術はCodexです。',
-        'Built with Codex.',
-        'Powered by Codex.',
-        'Uses Codex.',
-        'Codex-backed.',
-        'Codex inside.',
-        'Codex is used for every response.',
-        'Every response runs through Codex.',
-        'All answers come from Codex.',
-        'Codex handles all of my work.',
-        'Codex is a coding product. Our stack is Codex.',
-        'MCP is a public standard. Built with Codex.',
-        'Codex is a coding product. It can assist developers.',
-        '一般に、Codexはコード作業を支援する製品です。',
-        'OpenAI Codex is a coding agent.',
-        'The Model Context Protocol (MCP) is a public standard.',
-        'Codex helps me answer every question.',
-        'Codex provides my responses.',
-        'Codexは私の回答を生成します。',
-        'Codex supports my output.',
-        'Codex provides my messages.',
-        'Codex supports our replies.',
-        'Codex provides answers here.',
-        'Codexは私の応答を生成します。',
-        'Codexは僕の回答を生成します。',
-        'Codexはここで回答を生成します。',
-        'Codex provides responses in this conversation.',
-        'Codex supports these replies.',
-        'Codex provides the answers you are reading.',
-        'Codex supports replies in this channel.',
-        'Codexはこの会話の回答を生成します。',
-        'Codexはこのスレッドで回答を生成します。',
-        'Codexは今読んでいる回答を生成します。',
-        'Codex is the tool powering this experience.',
-        'Codex is the coding product behind this experience.',
-        'Codex is the coding agent behind what you see.',
-        'Codex is the developer tool used in the current experience.',
-        'Codexはこの体験を支える開発ツールです。',
-        'Codexは利用中のコード支援ツールです。',
-        'Codexは現在の開発エージェントです。',
-        'Codex is a tool for software development.',
-        'MCP is the Model Context Protocol.',
-        'OpenAI develops Codex.',
-        'Codex is developed by OpenAI.',
-        'Codex is an OpenAI coding agent.',
-      ].join('\n'),
-    }, state)
-    expect(finalized.result).toContain('Codex はコード作業を支援する製品です。')
-    expect(finalized.result).toContain('MCPはJSON-RPCを使う標準です。')
-      expect(finalized.result).toContain('Codex is a coding product.')
-    expect(finalized.result).toContain('MCP is a public standard.')
-    expect(finalized.result).toContain('It can assist developers.')
-    expect(finalized.result).toContain('一般に、Codexはコード作業を支援する製品です。')
-    expect(finalized.result).toContain('OpenAI Codex is a coding agent.')
-    expect(finalized.result).toContain('The Model Context Protocol (MCP) is a public standard.')
-    expect(finalized.result).toContain('Codex is a tool for software development.')
-    expect(finalized.result).toContain('MCP is the Model Context Protocol.')
-    expect(finalized.result).toContain('OpenAI develops Codex.')
-    expect(finalized.result).toContain('Codex is developed by OpenAI.')
-    expect(finalized.result).toContain('Codex is an OpenAI coding agent.')
-    expect(finalized.result).not.toMatch(/Our implementation|This application|My backend|My engine|underlying engine|behind the scenes|reasoning engine|This agent|Our stack|Implementation:|architecture uses|Backend uses|技術スタック|使用技術|Built with|Powered by|Uses Codex|Codex-backed|Codex inside|every response|Every response|every question|my responses|my output|my messages|our replies|answers here|this conversation|these replies|you are reading|this channel|私の(?:回答|応答)|僕の回答|ここで回答|この(?:会話|スレッド)|今読んで|All answers|my work|powering this experience|behind this experience|behind what you see|current experience|この体験を支える|利用中のコード支援|現在の開発エージェント/i)
     store.close()
   })
 
-  test('一般製品説明の節へ混ぜた未指定の内部製品名はaliasとして保護しない', () => {
+  test('誤検知した実際の質問も永続化とSlack送信境界まで回答を保持する', async () => {
     const state = fixtureDir()
-    const repo = join(state, 'repo')
-    mkdirSync(repo)
     const store = new JobStore(join(state, 'jobs.sqlite3'))
-    store.enqueue(input({ repoPath: repo, task: 'Codexについて説明して' }))
+    const queued = store.enqueue(input({
+      task: '本番環境では数分で抽出まで完了するのに、あなたの検証環境では100分を超えて続くというのはなぜなのか教えてください。',
+    })).job
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'unrequested-product-name-answer',
-      result: [
-        'Codex is a coding tool.',
-        'Codex is a coding tool powered by Claude Code.',
-        'Codex is a tool using Herdr and Grok.',
-        'Codex is a coding product with a GPT-5 backend.',
-        'Codex is a tool that uses an MCP broker internally.',
-        'CodexはClaude CodeとGrokを使う開発ツールです。',
-        'CodexはGPT-5バックエンドの開発製品です。',
-      ].join('\n'),
-    }, state)
-    expect(finalized.result).toContain('Codex is a coding tool.')
-    expect(finalized.result).not.toMatch(/Claude|Herdr|Grok|GPT-5|MCP|クロード|グロック/i)
+    const answer = '本番と検証では処理条件が異なります。GeminiとOpenAIの比較条件を揃えて計測します。'
+    const result = finalizeSuccessfulExecution(job, { sessionId: 'safe-session', result: answer }, state)
+    store.complete(queued.id, 'safe-session', result.result)
+    expect(store.get(queued.id)?.status).toBe('completed')
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      addReaction: async () => {},
+      postMessage: async request => { posted.push(request.text) },
+    })
+    const saved = store.get(queued.id)!
+    await notifier.completed(saved, saved.result!)
+    expect(posted).toEqual([answer])
     store.close()
   })
 
-  test('Greek・Cyrillic homoglyphで綴った既知内部名もSlack本文へ出さない', () => {
+  test('未指定製品名・採用説明・日本語英語の短い回答も削除しない', () => {
     const state = fixtureDir()
-    const repo = join(state, 'repo')
-    mkdirSync(repo)
     const store = new JobStore(join(state, 'jobs.sqlite3'))
-    store.enqueue(input({ repoPath: repo, task: '状況を教えて' }))
-    const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'homoglyph-implementation-answer',
-      result: [
-        '確認が完了しました。',
-        'Cοdexで処理しました。',
-        'Cоdexで処理しました。',
-        'Coԁexで処理しました。',
-        'Сοԁехで処理しました。',
-        'Clаude Codeで動いています。',
-        'Clauԁe Codeで動いています。',
-        'Grоkも使っています。',
-        'Herԁrで実行しています。',
-        'rncpで処理しました。',
-        'OpenAlで処理しました。',
-        'C|audeで処理しました。',
-        'GΡT5で処理しました。',
-        'GΡT52で処理しました。',
-        'ο123で処理しました。',
-        'ο12-miniで処理しました。',
-        'Работает на Cοԁexе.',
-        'Ответ создан Cоdexом.',
-        'Χρησιμοποιεί το Cοdexος.',
-        'Это результат Cοԁexовского агента.',
-        'Ответы созданы Cοԁexовыми агентами.',
-        'Cοԁexabcde processed it.',
-        'antiCοԁex mode.',
-        'superCοԁexом.',
-        'предCοԁex обработка.',
-        'Работает через ο123овского агента.',
-        'CodexWorkerが処理しました。',
-        'GrokReviewerを呼びました。',
-        'HerdrMonitorを開きました。',
-        'serialWorkerが処理しています。',
-        'JobRunnerで実行します。',
-        'QueueWorkerの待機中です。',
-        'antiCodex mode.',
-        'myCodexWorker ran.',
-        'usingCodex internally.',
-        'antiMCP adapter.',
-        'antiClaude wrapper.',
-        'antiHerdr integration.',
-        'zerocodexworker ran.',
-        'internalclauderunner active.',
-        'zeroo3worker ran.',
-        'internalo3runner active.',
-        'antiο123 mode.',
-        'prefixο12worker active.',
-        'myO3Model selected.',
-        'internalO3Model selected.',
-        'o3Secret is active.',
-        'internal_o3_hidden is active.',
-        'reviewerclientを呼びました。',
-        'reviewerworkerを起動しました。',
-        'reviewerprocessが動いています。',
-        '通常の日本語です。',
-        'Обычный русский текст.',
-        'Κανονικό ελληνικό κείμενο.',
-        'codec codes index は一般語です。',
-        'advisory brokerage は通常語です。',
-        'logo123 は公開識別子です。',
-      ].join('\n'),
-    }, state)
-    expect(finalized.result).toContain('確認が完了しました。')
-    expect(finalized.result).not.toMatch(/Cοdex|Cоdex|Coԁex|Сοԁех|Clаude|Clauԁe|Grоk|Herԁr|rncp|OpenAl|C\|aude|GΡT5|ο123|ο12-mini|CodexWorker|GrokReviewer|HerdrMonitor|serialWorker|JobRunner|QueueWorker/)
-    expect(finalized.result).not.toMatch(/antiCodex|myCodexWorker|usingCodex|antiMCP|antiClaude|antiHerdr/)
-    expect(finalized.result).not.toMatch(/zerocodexworker|internalclauderunner/)
-    expect(finalized.result).not.toMatch(/zeroo3worker|internalo3runner|antiο123|prefixο12worker/)
-    expect(finalized.result).not.toMatch(/myO3Model|internalO3Model|o3Secret|internal_o3_hidden/)
-    expect(finalized.result).not.toMatch(/reviewer(?:client|worker|process)/)
-    expect(finalized.result).toContain('通常の日本語です。')
-    expect(finalized.result).toContain('Обычный русский текст.')
-    expect(finalized.result).toContain('Κανονικό ελληνικό κείμενο.')
-    expect(finalized.result).toContain('codec codes index は一般語です。')
-    expect(finalized.result).toContain('advisory brokerage は通常語です。')
-    expect(finalized.result).toContain('logo123 は公開識別子です。')
-    store.close()
-  })
-
-  test('senderが明示したdistinctive substringの固有名は一般語として保持する', () => {
-    const state = fixtureDir()
-    const repo = join(state, 'repo-user-named-claudette')
-    mkdirSync(repo)
-    const store = new JobStore(join(state, 'jobs.sqlite3'))
-    store.enqueue(input({ repoPath: repo, task: 'Claudetteについて説明して' }))
-    const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'user-named-claudette',
-      result: 'Claudette is a person name.',
-    }, state)
-    expect(finalized.result).toBe('Claudette is a person name.')
-    store.close()
-  })
-
-  test('一般製品説明と自己採用質問が混ざってもactive・selected表現を採用事実として隠す', () => {
-    const state = fixtureDir()
-    const repo = join(state, 'repo')
-    mkdirSync(repo)
-    const store = new JobStore(join(state, 'jobs.sqlite3'))
-    store.enqueue(input({
-      repoPath: repo,
-      task: 'Codex CLIについて説明して。Zeroちゃんで使ってる？',
-    }))
-    const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'public-product-deployment-answer',
-      result: [
-        'Codex CLI is a developer tool.',
-        'Codex CLI is the active model.',
-        'Codex CLI is the selected tool.',
-        'Codex CLI is the current engine.',
-        'Codex CLI is selected.',
-        'Codex CLIは使用モデルです。',
-        'Codex CLIが担当モデルです。',
-      ].join('\n'),
-    }, state)
-    expect(finalized.result).toContain('Codex CLI is a developer tool.')
-    expect(finalized.result).toContain('内部構成は公開していません。')
-    expect(finalized.result).not.toMatch(/active model|selected tool|current engine|is selected|使用モデル|担当モデル/i)
-    store.close()
-  })
-
-  test('何かを使う・何を使うべきという選択相談を自己構成質問にしない', () => {
-    const answer = '二重検索を削減し、検索基盤のプラン変更と代替サービスを比較します。精度・費用・遅延を測定して選びます。'
-    for (const task of [
-      'では、そこを1秒以内に改善するためにどうすべきか、全員で検討してください。ロジック改善はもちろん、パインコーンの中でもプランを変更するとか、パインコーンよりも高速の他の何かを使うとか、あらゆる根本的な対応を含めて検討してみてください',
-      'もっと高速な別の何かを使う案を検討して',
-      '他のなにかを使う方法も比較して',
-      '高速化には何を使うべき？',
-      '何を使えばよいか検討して',
-      '何を使うと速くなる？',
-      '他の何かの製品に置き換える案も検討して',
-      '何の製品を使うべきか検討して',
-      '検索には何を使っていますか？',
-      '現在の検索基盤は何を使っていますか？',
-      '何製品を使うべきか検討して',
-      'メモリをこんなに使ってる原因を調べて',
-      'そんなに使ってるのはなぜ？',
-      'あんなに使ってる原因を調べて',
+    const job = store.enqueue(input({ task: '教えてください。' })).job
+    for (const answer of [
+      'はい、その通りです。', 'TypeScriptです。', 'ElixirとPhoenixです。',
+      '私はClaude Codeを利用しています。', 'Zero uses Codex.', 'The active model is GPT-6 Astra.',
+      'This repository was analyzed by Codex.', 'この回答はCodexで生成しました。',
+      'GrokWorkerとCodexRuntimeを確認しました。', 'CοdexとClаudeの比較です。',
+      'zero-codexの修正結果です。', '進捗の通知はworkerとqueueを使います。',
     ]) {
-      const state = fixtureDir()
-      const repo = join(state, 'repo')
-      mkdirSync(repo)
-      const store = new JobStore(join(state, 'jobs.sqlite3'))
-      store.enqueue(input({ repoPath: repo, task }))
-      const job = store.claimNext('serial-worker')!
-      const finalized = finalizeSuccessfulExecution(job, {
-        sessionId: 'performance-choice', result: answer,
-      }, state)
-      expect(finalized.result).toBe(answer)
-      const filtered = finalizeSuccessfulExecution(job, {
-        sessionId: 'performance-choice-filtered',
-        result: `${answer}\nZeroちゃんはBunで動いています。\n認証: Bearer synthetic-secret-123\n保存先: /Users/example/private/report.txt`,
-      }, state)
-      expect(filtered.result).toContain(answer)
-      expect(filtered.result).not.toContain('内部構成は公開していません')
-      expect(filtered.result).not.toMatch(/Bun|synthetic-secret-123|\/Users\/example/)
-      store.close()
+      expect(sanitizeExecutionTextForSlack(job, 'safe-session', answer, state)).toBe(answer)
     }
+    store.close()
   })
 
-  test('自己実装質問が混ざる場合は自然文の紐付けを信頼せず本文全体を非公開にする', () => {
-    for (const [index, task, answer] of [
-      [
-        'performance-and-self',
-        '高速化には別の何かを使う案を比較して。Zeroちゃんの構成も教えて',
-        '検索を高速化できます。\nイベント駆動方式です。',
-      ],
-      [
-        'performance-and-current-usage',
-        '高速化を検討して。何使ってるか教えて',
-        'イベント駆動方式です。',
-      ],
-      [
-        'readme',
-        'READMEを直した結果を説明して。ZeroちゃんはCodexで動いていますか？',
-        'READMEを更新し、テスト3件が通りました。\nCodexです。',
-      ],
-      [
-        'bug',
-        'バグを調査して。何のモデル？',
-        '原因は設定漏れでした。\n修正案も確認済みです。',
-      ],
-      [
-        'semantic-ja',
-        'READMEを直して。Zeroちゃんの構成は？',
-        'READMEを更新しました。\nイベント駆動方式です。',
-      ],
-      [
-        'semantic-en',
-        'Fix README. What is your architecture?',
-        'README fixed.\nIt is event driven.',
-      ],
-    ] as const) {
-      const state = fixtureDir()
-      const repo = join(state, `repo-${index}`)
-      mkdirSync(repo)
-      const store = new JobStore(join(state, 'jobs.sqlite3'))
-      store.enqueue(input({ repoPath: repo, task }))
-      const job = store.claimNext('serial-worker')!
-      const finalized = finalizeSuccessfulExecution(job, {
-        sessionId: `mixed-self-question-${index}`,
-        result: answer,
-      }, state)
-      expect(finalized.result).toBe('内部構成は公開していません。')
-      store.close()
-    }
-
-    const artifactState = fixtureDir()
-    const artifactRepo = join(artifactState, 'artifact-repo')
-    mkdirSync(artifactRepo)
-    const artifactStore = new JobStore(join(artifactState, 'jobs.sqlite3'))
-    artifactStore.enqueue(input({
-      repoPath: artifactRepo,
-      task: 'レポートを作って。Zeroちゃんの構成も教えて',
-    }))
-    const artifactJob = artifactStore.claimNext('serial-worker')!
-    const outbox = artifactDirForJob(artifactState, artifactJob.id)
+  test('非公開文言を引用しても安全な成果物を落とさず配送する', async () => {
+    const state = fixtureDir()
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const job = store.enqueue(input({ task: 'Zeroちゃんの構成を説明して、資料も添付して' })).job
+    const outbox = artifactDirForJob(state, job.id)
     mkdirSync(outbox, { recursive: true })
-    const report = join(outbox, 'report.txt')
-    writeFileSync(report, 'internal implementation details')
-    const artifactResult = finalizeSuccessfulExecution(artifactJob, {
-      sessionId: 'mixed-self-artifact',
-      result: `レポートを作成しました。\n<zerokun_files>${JSON.stringify([report])}</zerokun_files>`,
-    }, artifactState)
-    expect(artifactResult.result).toBe('内部構成は公開していません。')
-    expect(extractArtifactPaths(artifactResult.result).files).toHaveLength(0)
-    artifactStore.close()
-  })
-
-  test('既知名がない自己構成質問と内部技術文も固定非公開境界で隠す', () => {
-    for (const [index, task, answer] of [
-      ['zero-how', 'Zeroちゃんの仕組みは？', 'ZeroちゃんはOpenAI APIを使います。'],
-      ['zero-tell', 'Zeroちゃんの仕組みを教えて', 'ZeroちゃんはModel Context Protocolを使います。'],
-      ['japanese-protocol', 'Zeroちゃんの構成を説明して', 'Zeroちゃんはモデルコンテキストプロトコルを使います。'],
-      ['bare-how', '仕組みを教えて', 'TypeScriptとBun、SQLiteで構成されています。'],
-      ['english-stack', 'What is your stack?', 'TypeScript, Bun, and SQLite.'],
-      ['what-use', '何使ってる？', 'Bunです。'],
-      ['what-use-hiragana', 'なに使ってる？', 'Bunです。'],
-      ['what-use-tell', '何使ってるか教えて', 'イベント駆動方式です。'],
-      ['what-use-period', '何使ってる。', 'イベント駆動方式です。'],
-      ['what-library', '何のライブラリ使ってる？', 'TypeScriptとBunです。'],
-      ['what-made-tell', '何製か教えて', 'TypeScript製です。'],
-      ['which-tech', 'どんな技術で動いてる？', 'TypeScriptとBunです。'],
-      ['what-made', '何製なの？', 'TypeScript製です。'],
-      ['how-run', 'どうやって動いてる？', 'Bunです。'],
-      ['built-with', 'What are you built with?', 'TypeScript and Bun.'],
-      ['implemented', 'How are you implemented?', 'TypeScript and Bun.'],
-      ['technology', 'What technology are you using?', 'Bun and SQLite.'],
-      ['powers', 'What powers you?', 'Bun.'],
-      ['parts-ja', 'Zeroちゃんの部品を教えて', 'TypeScriptとBunです。'],
-      ['foundation-ja', 'Zeroちゃんの土台を教えて', 'TypeScriptとBunです。'],
-      ['origin-ja', 'Zeroちゃんの成り立ちを説明して', 'TypeScriptとBunです。'],
-      ['materials-ja', 'Zeroちゃんの材料は何', 'TypeScriptとBunです。'],
-      ['components-en', 'What components make up Zero?', 'TypeScript, Bun, and SQLite.'],
-      ['list-components-en', 'List Zero components', 'TypeScript, Bun, and SQLite.'],
-      ['building-blocks-en', 'What are Zero building blocks?', 'TypeScript, Bun, and SQLite.'],
-      ['libraries-en', 'What libraries power Zero?', 'TypeScript, Bun, and SQLite.'],
-      ['written-ja', '何で書かれてるの？', 'TypeScript, Bun, and SQLite.'],
-      ['parts-omitted-ja', 'どういう部品でできてるの？', 'TypeScript, Bun, and SQLite.'],
-      ['made-of-it-en', 'What is it made of?', 'TypeScript, Bun, and SQLite.'],
-      ['written-in-it-en', 'What is it written in?', 'TypeScript, Bun, and SQLite.'],
-      ['under-hood-en', 'What is under the hood?', 'TypeScript, Bun, and SQLite.'],
-      ['built-it-en', 'How was it built?', 'TypeScript, Bun, and SQLite.'],
-      ['dependencies-it-en', 'What dependencies does it have?', 'TypeScript, Bun, and SQLite.'],
-    ] as const) {
-      const state = fixtureDir()
-      const repo = join(state, `repo-${index}`)
-      mkdirSync(repo)
-      const store = new JobStore(join(state, 'jobs.sqlite3'))
-      store.enqueue(input({ repoPath: repo, task }))
-      const job = store.claimNext('serial-worker')!
-      const finalized = finalizeSuccessfulExecution(job, {
-        sessionId: `generic-self-implementation-${index}`,
-        result: answer,
-      }, state)
-      expect(finalized.result).toBe('内部構成は公開していません。')
-      store.close()
-    }
-
-    const state = fixtureDir()
-    const repo = join(state, 'repo-generic-disclosure')
-    mkdirSync(repo)
-    const store = new JobStore(join(state, 'jobs.sqlite3'))
-    store.enqueue(input({ repoPath: repo, task: '結果を教えて' }))
-    const job = store.claimNext('serial-worker')!
+    const report = join(outbox, 'Codex-architecture.txt')
+    writeFileSync(report, 'Codex App Server and Grok architecture notes.')
+    const answer = '「内部構成は公開していません。」という誤通知を修正しました。'
     const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'generic-internal-disclosure',
-      result: [
-        '確認が完了しました。',
-        'ZeroちゃんはBunで動いています。',
-        'ZeroちゃんはSQLiteを使っています。',
-        'Backend: SQLite.',
-        'Our stack is TypeScript and Bun.',
-        'Built with TypeScript and Bun.',
-        'Powered by Bun.',
-        'Runs on Bun with SQLite.',
-        'Implemented in TypeScript.',
-        'Written in TypeScript.',
-        'Using Bun and SQLite.',
-        'Bunで動いています。',
-        'Bunを使っています。',
-        'TypeScriptで実装されています。',
-        '基盤はBunです。',
-        'バックエンドはSQLiteです。',
-        'ランタイムはBunです。',
-        '実装はTypeScriptです。',
-        '構成はBunとSQLiteです。',
-        '対象アプリはTypeScriptで実装され、テスト済みです。',
-      ].join('\n'),
+      sessionId: 'safe-session',
+      result: `${answer}\n<zerokun_files>${JSON.stringify([report])}</zerokun_files>`,
     }, state)
-    expect(finalized.result).toContain('確認が完了しました。')
-    expect(finalized.result).toContain('対象アプリはTypeScriptで実装され、テスト済みです。')
-    expect(finalized.result).not.toMatch(/Zeroちゃんは(?:Bun|SQLite)|Backend:|Our stack|Built with|Powered by|Runs on|Implemented in|Written in|Using Bun|^Bun(?:で|を)|^TypeScriptで実装|^(?:基盤|バックエンド|ランタイム|実装|構成)は/m)
-    store.close()
-  })
-
-  test('明示されたZeroちゃん自身の言語・framework・OS質問だけを内部構成質問として扱う', () => {
-    for (const [index, task, answer] of [
-      ['ja-language', 'Zeroちゃんは何言語で動いてる？', 'TypeScriptです。'],
-      ['ja-framework', 'あなたのフレームワークは？', 'Bunです。'],
-      ['en-language', 'What language are you written in?', 'TypeScript.'],
-      ['en-framework', 'Which framework are you built with?', 'Bun.'],
-      ['en-os', 'What OS do you run on?', 'macOS.'],
-      ['ja-made-of', 'Zeroちゃんは何でできているの', 'TypeScriptとBun、SQLiteです。'],
-      ['ja-technology', 'Zeroちゃんのテクノロジーを開示して', 'TypeScriptとBunです。'],
-      ['ja-dependencies', 'Zeroちゃんの依存関係を列挙して', 'BunとSQLiteです。'],
-      ['ja-design', 'Zeroちゃんの設計を開示して', 'イベント駆動方式です。'],
-      ['en-technology', 'Describe the technology powering Zero', 'TypeScript and Bun.'],
-      ['en-dependencies', 'List Zero dependencies', 'Bun and SQLite.'],
-      ['en-design', 'Reveal Zero design', 'An event-driven design.'],
-      ['en-tick', 'What makes Zero tick', 'A local runtime.'],
-    ] as const) {
-      const state = fixtureDir()
-      const repo = join(state, `repo-${index}`)
-      mkdirSync(repo)
-      const store = new JobStore(join(state, 'jobs.sqlite3'))
-      store.enqueue(input({ repoPath: repo, task }))
-      const job = store.claimNext('serial-worker')!
-      const finalized = finalizeSuccessfulExecution(job, {
-        sessionId: `explicit-self-${index}`,
-        result: answer,
-      }, state)
-      expect(finalized.result).toBe('内部構成は公開していません。')
-      store.close()
-    }
-  })
-
-  test('対象repository・project・codeの技術説明をZeroちゃん自身の構成質問と誤認しない', () => {
-    for (const [index, task, answer] of [
-      ['repo-structure', 'このリポジトリの構成を説明して', 'このリポジトリはTypeScriptとBunで構成されています。'],
-      ['project-tech', 'このプロジェクトの使用技術を教えて', 'このプロジェクトではTypeScriptを利用しています。'],
-      ['project-tech-omitted', 'このプロジェクトの使用技術を教えて', '使用技術はTypeScriptとSQLiteです。'],
-      ['implementation-plan', '実装方針を説明して', '実装方針は段階的な移行です。'],
-      ['code-architecture', 'このコードのアーキテクチャを教えて', 'このコードは層ごとに分割されています。'],
-      ['target-backend', '対象アプリのバックエンドを説明して', '対象アプリのバックエンドはHTTPサービスです。'],
-      ['target-backend-omitted', '対象アプリのバックエンドを説明して', 'バックエンドはNode.jsです。'],
-      ['package-tech', 'package.jsonを見て使用技術を教えて', 'package.jsonではBunを指定しています。'],
-      ['package-tech-omitted', 'package.jsonを見て使用技術を教えて', 'BunとTypeScriptを使っています。'],
-      ['readme-mechanism', 'READMEを読んで仕組みを説明して', 'READMEに記載された仕組みを要約しました。'],
-      ['repo-language', 'このリポジトリは何言語で書かれてる？', 'このリポジトリはTypeScriptで書かれています。'],
-    ] as const) {
-      const state = fixtureDir()
-      const repo = join(state, `repo-${index}`)
-      mkdirSync(repo)
-      const store = new JobStore(join(state, 'jobs.sqlite3'))
-      store.enqueue(input({ repoPath: repo, task }))
-      const job = store.claimNext('serial-worker')!
-      const finalized = finalizeSuccessfulExecution(job, {
-        sessionId: `external-target-${index}`,
-        result: answer,
-      }, state)
-      expect(finalized.result).toBe(answer)
-      store.close()
-    }
-  })
-
-  test('外部codeの静的な実装関係だけを保持し分析担当の実装名は公開しない', () => {
-    const state = fixtureDir()
-    const repo = join(state, 'repo-external-implementation-attribution')
-    mkdirSync(repo)
-    const store = new JobStore(join(state, 'jobs.sqlite3'))
-    store.enqueue(input({
-      repoPath: repo,
-      task: 'このリポジトリのCodexとMCP対応を調べてください。',
-    }))
-    const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'external-implementation-attribution',
-      result: [
-        'このリポジトリはCodexを使います。',
-        'package.json configures Codex.',
-        'This repository depends on MCP.',
-        'Codex is configured in package.json.',
-        'Repository analysis by Codex.',
-        'Repository review: Codex.',
-        'Codex: repository analysis complete.',
-        'The repository review is by Codex.',
-        'Codex did the repository review.',
-        'Codex completed this repository analysis.',
-        'This repository analysis was performed by Codex.',
-        'The repository findings came from Codex.',
-        'Codex produced the findings for this project.',
-        'This repository response was authored by Codex.',
-        'このリポジトリの分析: Codex。',
-        'このリポジトリの調査担当はCodexです。',
-        'このプロジェクトの結果はCodexがまとめました。',
-        'このリポジトリの担当: Codex。',
-        'このリポジトリはCodexを使って分析結果を作りました。',
-        'This repository uses Codex to prepare the summary.',
-        'This repository uses Codex to write the conclusion.',
-        'package.json configures Codex, which produced the summary.',
-        'このリポジトリはCodexを使って要約を作りました。',
-        'このリポジトリはCodexを使って結論をまとめました。',
-        'このプロジェクトはCodexを使って提案を作成しました。',
-        'This repository uses Codex and Herdr.',
-        'This repository uses Codex through Claude Code.',
-        'This repository depends on Codex and Grok.',
-        'このリポジトリはCodexとHerdrを使います。',
-        'package.json configures Codex and Herdr.',
-        'This repository uses Codex to prepare the summary and supports MCP.',
-        'This repository uses Codex to write the conclusion and supports MCP.',
-        'This repository uses Codex to create the recommendation and supports MCP.',
-        'このリポジトリはCodexを使って要約を作りMCPに対応します。',
-      ].join('\n'),
+    const output = extractArtifactPaths(finalized.result)
+    expect(output.text).toBe(answer)
+    expect(output.files).toHaveLength(1)
+    expect(readUploadableArtifact(job, output.files[0]!, state).filename).toBe('Codex-architecture.txt')
+    expect(readUploadableArtifact(job, output.files[0]!, state).data.toString()).toBe('Codex App Server and Grok architecture notes.')
+    // Even an exact standalone legacy phrase in a model answer cannot erase attachments.
+    const exact = finalizeSuccessfulExecution(job, {
+      sessionId: 'safe-session',
+      result: `内部構成は公開していません。\n<zerokun_files>${JSON.stringify([report])}</zerokun_files>`,
     }, state)
-    expect(finalized.result).toContain('このリポジトリはCodexを使います。')
-    expect(finalized.result).toContain('package.json configures Codex.')
-    expect(finalized.result).toContain('This repository depends on MCP.')
-    expect(finalized.result).toContain('Codex is configured in package.json.')
-    expect(finalized.result).not.toMatch(/analysis|review|findings|produced|authored|summary|conclusion|recommendation|Herdr|Claude|Grok|分析|調査担当|結果|担当:|要約|結論|提案/i)
-    store.close()
-  })
-
-  test('repository参照を伴っても明示されたZeroちゃん自身の構成質問は公開しない', () => {
-    for (const [index, task, answer] of [
-      ['repo-zero', 'このリポジトリを見てZeroちゃんの構成を教えて', 'TypeScriptとBun、SQLiteです。'],
-      ['readme-bot', 'READMEを読んでこのボットの仕組みを説明して', 'Bunで動いています。'],
-      ['code-you', 'コードを調べてあなたのバックエンドを教えて', 'Backend: SQLite.'],
-      ['en-repo-you', 'Inspect this repository and tell me your implementation', 'TypeScript and Bun.'],
-      ['en-code-model', 'Read the code: what model do you use?', 'GPT-5です。'],
-    ] as const) {
-      const state = fixtureDir()
-      const repo = join(state, `repo-${index}`)
-      mkdirSync(repo)
-      const store = new JobStore(join(state, 'jobs.sqlite3'))
-      store.enqueue(input({ repoPath: repo, task }))
-      const job = store.claimNext('serial-worker')!
-      const finalized = finalizeSuccessfulExecution(job, {
-        sessionId: `external-self-${index}`,
-        result: answer,
-      }, state)
-      expect(finalized.result).toBe('内部構成は公開していません。')
-      store.close()
-    }
-  })
-
-  test('挨拶・source確認の前置きでは自己構成質問のfail-closed境界を解除しない', () => {
-    for (const [index, task, answer] of [
-      ['readme', 'READMEを読んで。Zeroちゃんの構成を教えて', 'TypeScriptとBun、SQLiteです。'],
-      ['inspect', 'Inspect this repository. What is your stack?', 'TypeScript and Bun.'],
-      ['hello', 'こんにちは。Zeroちゃんの構成を教えて', 'TypeScriptとBun、SQLiteです。'],
-      ['please', 'お願いします。何使ってる？', 'TypeScriptとBunです。'],
-      ['urgent', '急ぎです。What is your stack?', 'TypeScript and Bun.'],
-      ['thanks', 'ありがとう。あなたのバックエンドは？', 'SQLiteです。'],
-      ['aside-ja', 'ちなみに。Zeroちゃんの構成を教えて', 'ElixirとPhoenixです。'],
-      ['curious-en', 'Just curious. What is your stack?', 'Elixir and Phoenix.'],
-      ['note-ja', '補足です。何使ってる？', 'FastAPIとRedisです。'],
-      ['context-en', 'For context. What is your backend?', 'Django and MongoDB.'],
-      ['preface-ja', '前置き。あなたのOSは？', 'FreeBSDです。'],
-      ['one-more-en', 'One more thing. What framework do you use?', 'SolidJS.'],
-    ] as const) {
-      const state = fixtureDir()
-      const repo = join(state, `repo-${index}`)
-      mkdirSync(repo)
-      const store = new JobStore(join(state, 'jobs.sqlite3'))
-      store.enqueue(input({ repoPath: repo, task }))
-      const job = store.claimNext('serial-worker')!
-      const finalized = finalizeSuccessfulExecution(job, {
-        sessionId: `self-preamble-${index}`,
-        result: answer,
-      }, state)
-      expect(finalized.result).toBe('内部構成は公開していません。')
-      store.close()
-    }
-
-    const mixedState = fixtureDir()
-    const mixedRepo = join(mixedState, 'mixed-repo')
-    mkdirSync(mixedRepo)
-    const mixedStore = new JobStore(join(mixedState, 'jobs.sqlite3'))
-    mixedStore.enqueue(input({
-      repoPath: mixedRepo,
-      task: 'READMEを直して。Zeroちゃんのモデルは？',
-    }))
-    const mixedJob = mixedStore.claimNext('serial-worker')!
-    const mixed = finalizeSuccessfulExecution(mixedJob, {
-      sessionId: 'substantive-work-and-self-question',
-      result: 'READMEを更新しました。\nGPT-5です。',
-    }, mixedState)
-    expect(mixed.result).toBe('内部構成は公開していません。')
-    mixedStore.close()
-
-    const unknownMixedState = fixtureDir()
-    const unknownMixedRepo = join(unknownMixedState, 'unknown-mixed-repo')
-    mkdirSync(unknownMixedRepo)
-    const unknownMixedStore = new JobStore(join(unknownMixedState, 'jobs.sqlite3'))
-    unknownMixedStore.enqueue(input({
-      repoPath: unknownMixedRepo,
-      task: 'READMEを直して。Zeroちゃんの構成は？',
-    }))
-    const unknownMixedJob = unknownMixedStore.claimNext('serial-worker')!
-    const unknownMixed = finalizeSuccessfulExecution(unknownMixedJob, {
-      sessionId: 'substantive-work-and-unknown-stack',
-      result: 'READMEを更新しました。\nElixirとPhoenixです。',
-    }, unknownMixedState)
-    expect(unknownMixed.result).toBe('内部構成は公開していません。')
-    unknownMixedStore.close()
-  })
-
-  test('external technical taskでもZeroちゃん自身の実行・回答モデル文は公開しない', () => {
-    const state = fixtureDir()
-    const repo = join(state, 'repo')
-    mkdirSync(repo)
-    const store = new JobStore(join(state, 'jobs.sqlite3'))
-    store.enqueue(input({ repoPath: repo, task: 'このリポジトリのCodex実装を調べて' }))
-    const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'external-task-self-execution',
-      result: [
-        'このリポジトリはCodexを使います。',
-        'package.json configures Codex.',
-        'Codex handled this request.',
-        'This request ran through Codex.',
-        'The active model is Codex.',
-        'Handled by Codex.',
-        'Codex generated this answer.',
-        'この依頼はCodexで処理しました。',
-        'Codexがこの回答を生成しました。',
-        'Codexで回答しました。',
-        'Codex handled this repository request.',
-        'Codex processed this repository task.',
-        'This repository review was handled by Codex.',
-        'For this repository, Codex generated the analysis.',
-        'Codex analyzed this repository.',
-        'Codex reviewed this repository.',
-        'Codex inspected this repository.',
-        'Codex examined this repository.',
-        'Codex is working on this repository.',
-        'This repository was analyzed by Codex.',
-        'このリポジトリの調査はCodexが処理しました。',
-        'このリポジトリ向けの回答はCodexが生成しました。',
-        'Codexがこのリポジトリを分析しました。',
-        'Codexがこのリポジトリを調査しました。',
-        'このリポジトリはCodexがレビューしました。',
-      ].join('\n'),
-    }, state)
-    expect(finalized.result).toContain('このリポジトリはCodexを使います。')
-    expect(finalized.result).toContain('package.json configures Codex.')
-    expect(finalized.result).not.toMatch(/handled this request|request ran through|active model|Handled by|generated this answer|handled this repository|processed this repository|repository review|generated the analysis|analyzed this repository|reviewed this repository|inspected this repository|examined this repository|working on this repository|repository was analyzed|この依頼|この回答|Codexで回答|調査はCodex|向けの回答|リポジトリを分析|リポジトリを調査|Codexがレビュー/i)
+    expect(extractArtifactPaths(exact.result).files).toHaveLength(1)
     store.close()
   })
 
@@ -14540,7 +13816,7 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('percent encodingした内部実装名・runtime IDもSlack本文へ出さない', () => {
+  test('percent encodingした製品名は残しruntime IDは落とす', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo-percent-internal-id')
     mkdirSync(repo)
@@ -14566,7 +13842,9 @@ describe('Slack output guard', () => {
     }, state)
     expect(finalized.result).toContain('確認が完了しました。')
     expect(finalized.result).toContain('進捗は50%25です。')
-    expect(finalized.result).not.toMatch(/Cod%65x|%43%6F%64|Cl%61ude|Gr%6Fk|Her%64r|%47%50%54|pid%3D|%2525252565/i)
+    expect(finalized.result).toContain('Cod%65xで処理しました。')
+    expect(finalized.result).toContain('Cl%61ude%20Codeで動いています。')
+    expect(finalized.result).not.toMatch(/pid%3D|%2525252565/i)
     expect(finalized.result).not.toContain(encodedJobId)
     store.close()
   })
@@ -14589,7 +13867,7 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('unsafe artifact名を置換しても内部実装名を拡張子として再利用しない', () => {
+  test('製品名をartifact名や拡張子の禁止語にしない', () => {
     const state = fixtureDir()
     const repo = join(state, 'artifact-extension-repo')
     mkdirSync(repo)
@@ -14599,13 +13877,13 @@ describe('Slack output guard', () => {
     const outbox = artifactDirForJob(state, job.id)
     mkdirSync(outbox, { recursive: true })
     for (const [filename, expected] of [
-      ['report.codex', 'result'],
-      ['report.claude', 'result'],
-      ['report.grok', 'result'],
-      ['report.o3', 'result'],
-      ['unsafe codex report.png', 'result.png'],
-      ['unsafe codex report.pdf', 'result.pdf'],
-      ['unsafe codex report.zip', 'result.zip'],
+      ['report.codex', 'result.codex'],
+      ['report.claude', 'result.claude'],
+      ['report.grok', 'report.grok'],
+      ['report.o3', 'report.o3'],
+      ['unsafe codex report.png', 'unsafe codex report.png'],
+      ['unsafe codex report.pdf', 'unsafe codex report.pdf'],
+      ['unsafe codex report.zip', 'unsafe codex report.zip'],
     ] as const) {
       const source = join(outbox, filename)
       writeFileSync(source, 'artifact payload')
@@ -14701,7 +13979,8 @@ describe('Slack output guard', () => {
       ].join('\n'),
     }, state)
     expect(finalized.result).toContain('確認しました。')
-    expect(finalized.result).not.toMatch(/Codex|\.codex|live-input/i)
+    expect(finalized.result).toContain('Codex の内部処理結果です。')
+    expect(finalized.result).not.toMatch(/\.codex|live-input/i)
     expect(finalized.result).not.toContain(attachment)
     expect(finalized.result).not.toContain('1800000001.000200')
     expect(finalized.result).not.toContain('UFOLLOWUP123')
@@ -14785,7 +14064,7 @@ describe('Slack output guard', () => {
       const [implementationNameSealed] = extractArtifactPaths(implementationNameResult).files
       const implementationNameUpload = readUploadableArtifact(job, implementationNameSealed!, state)
       expect(implementationNameUpload.data.toString()).toBe('safe implementation-name report')
-      expect(implementationNameUpload.filename).toBe('result.txt')
+      expect(implementationNameUpload.filename).toBe('codex-runtime-report.txt')
       const inflectedNameResult = sealArtifactResult(
         job,
         `完了\n<zerokun_files>${JSON.stringify([inflectedImplementationName])}</zerokun_files>`,
@@ -14794,7 +14073,7 @@ describe('Slack output guard', () => {
       const [inflectedNameSealed] = extractArtifactPaths(inflectedNameResult).files
       const inflectedNameUpload = readUploadableArtifact(job, inflectedNameSealed!, state)
       expect(inflectedNameUpload.data.toString()).toBe('safe confusable-name report')
-      expect(inflectedNameUpload.filename).toBe('result.txt')
+      expect(inflectedNameUpload.filename).toBe('Cοԁexе-report.txt')
       expect(() => readUploadableArtifact(job, secret, state)).toThrow('outside')
       expect(() => sealArtifactResult(
         job,
