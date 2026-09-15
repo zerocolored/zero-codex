@@ -430,7 +430,15 @@ export async function requestUpdate(
       }
     }
     running ||= isUpdateRunning()
-    if (age <= (options.staleAfterMs ?? DEFAULT_STALE_MS) || running || existing.outcome) {
+    // outcomeが載っていてworkerも更新処理も走っていない記録に残る仕事は、Slack通知の配信だけ。
+    // ここでdurationを見ずにduplicateを返すと、通知が失敗し続ける環境では二度と更新を受け付けられない
+    // ——notifiedAtは配信成功でしか付かないため、update-request.jsonを手で消す以外に回復手段が無くなる。
+    // 実機で、更新自体は成功しているのに以後の依頼がすべて「すでに待機中または実行中です」になり、
+    // watchdogが60秒ごとにworkerを起こし直す状態が4日続いた。
+    // 新しい依頼が来た時点で、配信し損ねた古いoutcomeは畳んで新しい更新を受け付ける。
+    const onlyDeliveryPending = Boolean(existing.outcome) && !running
+    if (!onlyDeliveryPending
+      && (age <= (options.staleAfterMs ?? DEFAULT_STALE_MS) || running)) {
       if (!running) launch(existing)
       await options.onDuplicate?.(existing)
       return { accepted: false, duplicate: true, request: existing }
@@ -486,6 +494,15 @@ export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean
   }
   const isUpdateRunning = options.isUpdateRunning ?? (() => updateMutationIsRunning(dir))
   if (isUpdateRunning()) return false
+  // 配信だけが残ったoutcomeを無期限に再launchしない。STALEを超えたら配信を諦めて記録を畳む。
+  // 残すと、watchdog(60秒間隔)がworkerを起こす→3回失敗して終了→また起こす、を延々繰り返し、
+  // update-request.logが伸び続けたうえで以後の更新依頼もすべてduplicateで拒否され続ける。
+  const now = options.now ?? Date.now
+  if (request.outcome
+    && now() - request.requestedAt > (options.staleAfterMs ?? DEFAULT_STALE_MS)) {
+    clearRequest(dir, request.id)
+    return false
+  }
   const launch = options.launchWorker ?? ((value: UpdateRequest) => {
     launchDetachedUpdateWorker(value, {
       stateDir: dir,
@@ -975,9 +992,12 @@ export async function runUpdateWorker(
       persistRequest(dir, { ...request, outcome })
       return { success: outcome.success, exitCode: outcome.exitCode, notificationSent: true }
     } catch (error) {
+      // 種別と試行回数まで残す。messageだけだと "The operation was aborted." のような
+      // どの層が中断したのか判らない1行になり、実機で原因の切り分けができなかった。
       appendUpdateLog(
         logPath,
-        `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}\n`,
+        `${new Date().toISOString()} notify attempt ${attempt}/${maxAttempts} failed: `
+        + `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}\n`,
       )
       if (attempt < maxAttempts) await Bun.sleep(retryMs)
     }
