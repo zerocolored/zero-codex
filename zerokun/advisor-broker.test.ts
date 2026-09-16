@@ -2917,6 +2917,22 @@ print('review complete')
       '⏵⏵ bypass permissions on',
     ].join('\n'), marker)).toBe('独立したレビュー結果です。\n二行目です。')
 
+    // Claude Code 2.1.273 は回答完了後の空プロンプトにプレースホルダを重ね、
+    // 区切りに NBSP を使う（'❯\u00a0Try "fix lint errors"'、2026-09-16 実機採取）。
+    // これを端末装飾として認めないと、完全な回答が届いていても
+    // 「complete marked response was unavailable」で全滅する。
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      '独立したレビュー結果です。',
+      marker,
+      '\u2500\u2500\u2500\u2500',
+      '❯\u00a0Try "fix lint errors"',
+      '\u2500\u2500\u2500\u2500',
+      '⏵⏵ bypass permissions on',
+    ].join('\n'), marker)).toBe('独立したレビュー結果です。')
+
     expect(extractCompleteClaudeResponse([
       '依頼本文',
       '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
