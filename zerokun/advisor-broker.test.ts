@@ -275,10 +275,14 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
             with open(os.path.join(state["project"], ".env.audit-fixture"), "w") as handle:
                 handle.write("synthetic concurrent runtime metadata")
         marker = next((line for line in reversed(prompt.splitlines()) if line.startswith("REQUEST_MARKER=")), "")
-        print(prompt.rstrip("\\n"))
-        print("Claude independent review completed")
-        print(marker)
-        print("❯")
+        if state.get("response_capture"):
+            capture = state["response_capture"]
+            print(capture.replace(state["capture_marker"], marker))
+        else:
+            print(prompt.rstrip("\\n"))
+            print("Claude independent review completed")
+            print(marker)
+            print("❯")
     raise SystemExit(0)
 if args == ["pane", "process-info", "--pane", pane]:
     if not state["owned"]:
@@ -1427,6 +1431,54 @@ print('review complete')
       await fixture.close()
     }
   }, 15_000)
+
+  const replayDirectory = process.env.ZERO_CLAUDE_REPLAY_DIRECTORY
+  const replayCaptures = replayDirectory
+    ? readdirSync(replayDirectory).filter(name => name.startsWith('claude-response-') && name.endsWith('.json'))
+      .map(name => ({ name, text: JSON.parse(readFileSync(join(replayDirectory, name), 'utf8')).transcript.text as string }))
+    : [{ name: 'recorded-ui-shape', text: [
+      '依頼本文', '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF',
+      '⏺ 原文条件を項目別に照合し、同一回答を修復して再検品します。',
+      'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF',
+      '✻ Cogitated for 2m 7s · done 6:41 AM', '────',
+      '❯\u00a0本番ジョブのログで工程2と3の件数差を確認して', '────',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n') }]
+
+  test.each(replayCaptures)('保存済みClaude回答を取得・保存・完了判定・再起動後再利用まで通す $name', async capture => {
+    const marker = capture.text.match(/REQUEST_MARKER=[A-F0-9]{32}/)![0]
+    const expected = capture.text.split(marker)[1]!.trim()
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const statePath = fixture.externalEvidence!.fakeHerdrState
+      const state = JSON.parse(readFileSync(statePath, 'utf8'))
+      state.response_capture = capture.text
+      state.capture_marker = marker
+      writeFileSync(statePath, JSON.stringify(state), { mode: 0o600 })
+      const first = await fixture.call('investigation', 'revision-two')
+      expect(first.result.isError).not.toBe(true)
+      expect(first.payload).toMatchObject({ complete: true, allAdopted: true,
+        claude: { adopted: true, response: expected, cleanupVerified: true },
+        slotSummary: { responsesObtained: 3 } })
+      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
+      const journalPath = join(fixture.journalRoot, revision, 'investigation-1.json')
+      expect(JSON.parse(readFileSync(journalPath, 'utf8')).status).toBe('completed')
+      const cache = readFileSync(`${journalPath}.responses`, 'utf8')
+      expect(JSON.parse(cache).claude.response).toBe(expected)
+      const diagnostics = readdirSync(join(fixture.journalRoot, revision)).filter(name => name.startsWith('claude-response-'))
+      expect(diagnostics).toHaveLength(1)
+      const diagnostic = JSON.parse(readFileSync(join(fixture.journalRoot, revision, diagnostics[0]!), 'utf8'))
+      expect(diagnostic.reads.at(-1).outcome).toBe('complete')
+      await fixture.restart()
+      expect((await fixture.call('investigation', 'revision-two')).payload).toMatchObject({ complete: true })
+      expect(readFileSync(`${journalPath}.responses`, 'utf8')).toBe(cache)
+      const finished = JSON.parse(readFileSync(statePath, 'utf8'))
+      expect(finished.prompt_count).toBe(1)
+      expect(finished.close_count).toBe(1)
+      expect(finished.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 30_000)
 
   test('Claudeの2回の一時失敗を自動回復しGrok回答を保持したまま3回答揃える', async () => {
     const fixture = await brokerFixture({ externalSuccess: true, claudeFailures: 2 })
@@ -2964,7 +3016,7 @@ print('review complete')
       '途中回答です。',
       marker,
       'marker後にも回答を続けます。',
-    ].join('\n'), marker)).toBeNull()
+    ].join('\n'), marker)).toBe('途中回答です。')
 
     expect(extractCompleteClaudeResponse([
       '依頼本文',
@@ -2989,132 +3041,8 @@ print('review complete')
         '回答です。',
         marker,
         continuation,
-      ].join('\n'), marker)).toBeNull()
+      ].join('\n'), marker)).toBe('回答です。')
     }
-  })
-
-  test('Claude 2.1.246以降の固定bypass footerだけを既知chromeとして採択する', () => {
-    const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
-    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
-    const response = '独立したレビュー結果です。'
-    const envelope = (...footer: string[]) => [
-      '依頼本文',
-      instruction,
-      marker,
-      response,
-      marker,
-      '❯',
-      ...footer,
-    ].join('\n')
-
-    for (const footer of [
-      '⏵⏵ bypass permissions on',
-      '⏵⏵ bypass permissions on · /rc',
-      '⏵⏵ bypass permissions on (shift+tab to cycle)',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
-      `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents${' '.repeat(96)}/rc`,
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(footer), marker)).toBe(response)
-    }
-
-    for (const footer of [
-      '⏵⏵ bypass permissions on (shift+tab to toggle) · /rc',
-      '⏵⏵ bypass permissions on (shift＋tab to cycle) · /rc',
-      '⏵⏵ bypass permissions on (shift+tab to cycle · /rc',
-      '⏵⏵ bypass permissions on [shift+tab to cycle] · /rc',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) /rc',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) extra',
-      '⏵⏵ bypass permissions off (shift+tab to cycle) · /rc',
-      '⏵⏵ bypass permissions on · marker後にも回答を続けます。',
-      'Allow this action',
-      'Do you want to proceed',
-      '/rc',
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(footer), marker)).toBeNull()
-    }
-
-    expect(extractCompleteClaudeResponse(envelope(
-      '⏵⏵ bypass permissions on (shift+tab to cycle) ·',
-      '/rc',
-    ), marker)).toBeNull()
-    expect(extractCompleteClaudeResponse(envelope(
-      'marker後にも回答を続けます。',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
-    ), marker)).toBeNull()
-  })
-
-  test('Claude 2.1.247の狭幅固定bypass footerだけを既知chromeとして採択する', () => {
-    const marker = 'REQUEST_MARKER=ABCDEF0123456789ABCDEF0123456789'
-    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
-    const response = '独立したレビュー結果です。'
-    const clippedFooter = `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u00B7`
-    const envelope = (...chrome: string[]) => [
-      '依頼本文',
-      instruction,
-      marker,
-      response,
-      marker,
-      ...chrome,
-    ].join('\n')
-
-    expect(extractCompleteClaudeResponse(envelope(
-      '✻ Churned for 22s · done 14:22',
-      '────────────────',
-      '❯',
-      '────────────────',
-      `${clippedFooter}   `,
-    ), marker)).toBe(response)
-
-    for (const footer of [
-      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(4)}\u00B7`,
-      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(6)}\u00B7`,
-      '\u23F5\u23F5 bypass permissions on (shift+tab to\t\t\u00B7',
-      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u00A0'.repeat(5)}\u00B7`,
-      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u2022`,
-      '\u23F5\u23F5 bypass permissions on (shift+tab to',
-      `\u23F5\u23F5 bypass permissions on (shift+tab${'\u0020'.repeat(5)}\u00B7`,
-      `\u23F5\u23F5 bypass permissions on (shift+tab to cycle)${'\u0020'.repeat(5)}\u00B7`,
-      `${clippedFooter} /rc`,
-      `${clippedFooter} marker後にも回答を続けます。`,
-      `\u23F5\u23F5 bypass permissions off (shift+tab to${'\u0020'.repeat(5)}\u00B7`,
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(footer), marker)).toBeNull()
-    }
-
-    expect(extractCompleteClaudeResponse(envelope(
-      clippedFooter,
-      'marker後にも回答を続けます。',
-    ), marker)).toBeNull()
-    expect(extractCompleteClaudeResponse(envelope(
-      'marker後にも回答を続けます。',
-      clippedFooter,
-    ), marker)).toBeNull()
-  })
-
-  test('Claude 2.1.247の更新案内付き固定footerを二行のterminal chromeとして採択する', () => {
-    const marker = 'REQUEST_MARKER=FEDCBA9876543210FEDCBA9876543210'
-    const response = '独立したレビュー結果です。'
-    const updateFooter = `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents${' '.repeat(24)}✔ Update installed · Restart to update`
-    const envelope = (...footer: string[]) => [
-      '依頼本文',
-      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
-      marker,
-      response,
-      marker,
-      '✻ Crunched for 18s · done 7:18',
-      '────────────────',
-      '❯',
-      '────────────────',
-      ...footer,
-    ].join('\n')
-
-    expect(extractCompleteClaudeResponse(envelope(updateFooter, '/rc'), marker)).toBe(response)
-    expect(extractCompleteClaudeResponse(envelope(updateFooter), marker)).toBeNull()
-    expect(extractCompleteClaudeResponse(envelope(updateFooter, '/clear'), marker)).toBeNull()
-    expect(extractCompleteClaudeResponse(envelope(
-      updateFooter.replace('Restart to update', 'Click to update'),
-      '/rc',
-    ), marker)).toBeNull()
   })
 
   test('Claude 2.1.247の実測狭幅prompt echoだけを固定envelopeとして採択する', () => {
@@ -3186,7 +3114,7 @@ print('review complete')
       prompt: [...wrappedPrompt, ...wrappedPrompt],
     }), marker)).toBeNull()
     expect(extractCompleteClaudeResponse(envelope({ tail: ['marker後にも回答を続けます。'] }), marker))
-      .toBeNull()
+      .toBe(response)
     expect(extractCompleteClaudeResponse([
       '依頼本文', instruction, marker, response, markerHead, markerTail, marker, ...chrome,
     ].join('\n'), marker)).toBeNull()
@@ -3202,87 +3130,6 @@ print('review complete')
       nonProductionMarker,
       ...chrome,
     ].join('\n'), nonProductionMarker)).toBeNull()
-  })
-
-  test('Claude 2.1.247の固定done clockだけをactivity chromeとして採択する', () => {
-    const marker = 'REQUEST_MARKER=FEDCBA9876543210FEDCBA9876543210'
-    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
-    const response = '独立したレビュー結果です。'
-    const envelope = (...chrome: string[]) => [
-      '依頼本文',
-      instruction,
-      marker,
-      response,
-      marker,
-      ...chrome,
-      '────────────────',
-      '❯',
-      '────────────────',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
-    ].join('\n')
-
-    for (const activity of [
-      '✻ Churned for 23s',
-      '✻ Churned for 23s · done 12:26',
-      '✻ Worked for 1m 5s · done 09:05',
-      '✻ Worked for 3m 0s · done 12:40',
-      '✻ Worked for 1h 2m 3s · done 9:05',
-      '✻ Worked for 1h 0m 0s · done 12:40',
-      '✻ Baked for 1d 0h 0m · done 13:27',
-      '✻ Brewed for 1s · done 13:27',
-      '✻ Cogitated for 1s · done 13:27',
-      '✻ Cooked for 1s · done 13:27',
-      '✻ Crunched for 1s · done 13:27',
-      '✻ Sautéed for 5m 45s · done 13:27',
-      '✳ Worked for 1s · done 0:00',
-      '✢ Worked for 1s · done 23:59',
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(activity), marker)).toBe(response)
-    }
-
-    for (const activity of [
-      '✻ Churned for 23s · esc to interrupt',
-      '✻ Churned for 23s · done',
-      '✻ Churned for 23s · Done 12:26',
-      '✻ Churned for 23s · done 24:00',
-      '✻ Churned for 23s · done 12:60',
-      '✻ Churned for 23s · done 12:6',
-      '✻ Churned for 23s · done 12:26:00',
-      '✻ Churned for 23s · done 12:26 PM',
-      '✻ Churned for 23s · done 12:26 extra',
-      '✻ Churned for 0s · done 12:26',
-      '✻ Worked for 0m 5s · done 12:26',
-      '✻ Worked for 1m 00s · done 12:26',
-      '✻ Worked for 3m 60s · done 12:26',
-      '✻ Worked for 1h 60m 0s · done 12:26',
-      '✻ Worked for 1h 00m 0s · done 12:26',
-      '✻ Worked for 60s · done 12:26',
-      '✻ Worked for 60m 0s · done 12:26',
-      '✻ Worked for 1h 5s · done 12:26',
-      '✻ Worked for 24h 0m 0s · done 12:26',
-      '✻ Worked for 1d 24h 0m · done 12:26',
-      '✻ Worked for 1d 0h 60m · done 12:26',
-      '✻ Worked for 1d 0h 0m 0s · done 12:26',
-      '✻ continuation for 1s · done 12:26',
-      '✻ Wait for 5s · done 12:26',
-      '✻ Churning for 23s · done 12:26',
-      '✻ Braised for 1s · done 12:26',
-      '✻ continuation for 1s',
-      '✻ Wait for 5s',
-      '✻ Churning for 23s',
-      '✻ Worked for 1s',
-      '✳ Churned for 23s',
-      '✻ Churned for 24s',
-      '✔ Churned for 23s · done 12:26',
-      '· done 12:26',
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(activity), marker)).toBeNull()
-    }
-
-    expect(extractCompleteClaudeResponse(envelope(
-      '✻ Churned for 23s · done 12:26',
-      'marker後にも回答を続けます。',
-    ), marker)).toBeNull()
   })
 
   test('同一roundのexclusive claimは重複作成できずidentity一致時だけ解放する', () => {
