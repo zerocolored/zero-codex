@@ -9926,6 +9926,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('model=gpt-6-astra, reasoning_effort=low')
     expect(instructions).toContain('Minor findings, missing advisor responses, or infrastructure failures never')
     expect(instructions).toContain('Never call review round 3')
+    expect(instructions).toContain('compares their committed or dirty content')
+    expect(instructions).not.toContain('every path changed since round 1')
     expect(instructions).not.toContain('Do not push or create a PR')
     expect(instructions).not.toContain('ZERO_NATIVE_ADVISOR')
     expect(instructions).not.toContain(nonce)
@@ -9956,6 +9958,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(advised).toContain('fork_turns=none')
     expect(advised).toContain('unavailability, and infrastructure failures do not trigger round 2')
     expect(advised).toContain('Never call round 3')
+    expect(advised).toContain('compares their committed or dirty content')
+    expect(advised).not.toContain('every observed path since')
     const prepare = buildCodexPhasePrompt(
       job,
       'prepare',

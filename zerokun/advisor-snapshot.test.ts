@@ -20,6 +20,7 @@ import {
   serializeAdvisorRepositorySnapshot,
   snapshotAdvisorRepository,
   summarizeAdvisorRepositoryChanges,
+  summarizeAdvisorTaskOwnedFixChanges,
 } from './advisor-snapshot.ts'
 
 const temporaryDirs: string[] = []
@@ -46,6 +47,95 @@ function git(cwd: string, args: string[]): void {
 }
 
 describe('advisor repository snapshot', () => {
+  test('第2reviewはコミット済み修正を内容で比較し、既存dirtyのcommitだけを修正としない', () => {
+    const root = fixtureDir()
+    git(root, ['init', '-q'])
+    git(root, ['config', 'user.name', 'Zero Test'])
+    git(root, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(root, 'fix.ts'), 'before\n')
+    git(root, ['add', '.'])
+    git(root, ['commit', '-qm', 'initial'])
+    const layout = resolveAdvisorProjectLayout(root)
+    const baseline = snapshotAdvisorRepository(layout)
+    const paths = [{ repository: '.', path: 'fix.ts' }]
+    writeFileSync(join(root, 'fix.ts'), 'fixed\n')
+    // Owner-only files must compare equal after Git normalizes them to 100644.
+    chmodSync(join(root, 'fix.ts'), 0o600)
+    const dirty = snapshotAdvisorRepository(layout)
+    expect(summarizeAdvisorTaskOwnedFixChanges(baseline, dirty, paths).changed).toBe(true)
+    git(root, ['add', '.'])
+    git(root, ['commit', '-qm', 'mandatory fix'])
+    const committed = snapshotAdvisorRepository(layout)
+    expect(summarizeAdvisorRepositoryChanges(baseline, committed).repositories[0]!.changedPaths).toEqual([])
+    expect(summarizeAdvisorTaskOwnedFixChanges(baseline, committed, paths).repositories)
+      .toMatchObject([{ repository: '.', changedPaths: ['fix.ts'] }])
+    expect(summarizeAdvisorTaskOwnedFixChanges(dirty, committed, paths).changed).toBe(false)
+    writeFileSync(join(root, 'fix.ts'), 'fixed again\n')
+    const edited = snapshotAdvisorRepository(layout)
+    expect(summarizeAdvisorTaskOwnedFixChanges(dirty, edited, paths).changed).toBe(true)
+    writeFileSync(join(root, 'fix.ts'), 'fixed again\n')
+    expect(summarizeAdvisorTaskOwnedFixChanges(edited, snapshotAdvisorRepository(layout), paths).changed).toBe(false)
+    chmodSync(join(root, 'fix.ts'), 0o640)
+    expect(summarizeAdvisorTaskOwnedFixChanges(edited, snapshotAdvisorRepository(layout), paths).changed).toBe(false)
+    chmodSync(join(root, 'fix.ts'), 0o740)
+    expect(summarizeAdvisorTaskOwnedFixChanges(edited, snapshotAdvisorRepository(layout), paths).changed).toBe(true)
+    expect(summarizeAdvisorTaskOwnedFixChanges(baseline, edited, [{ repository: '.', path: 'absent.ts' }]).changed).toBe(false)
+  })
+
+  test('第2reviewのrename・削除・literal pathをコミット前後で保持する', () => {
+    const root = fixtureDir()
+    git(root, ['init', '-q'])
+    git(root, ['config', 'user.name', 'Zero Test'])
+    git(root, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(root, 'old.ts'), 'rename\n')
+    writeFileSync(join(root, 'deleted.ts'), 'delete\n')
+    writeFileSync(join(root, '[literal].ts'), 'before\n')
+    git(root, ['add', '.'])
+    git(root, ['commit', '-qm', 'initial'])
+    const layout = resolveAdvisorProjectLayout(root)
+    const baseline = snapshotAdvisorRepository(layout)
+    git(root, ['mv', 'old.ts', 'new.ts'])
+    rmSync(join(root, 'deleted.ts'))
+    writeFileSync(join(root, '[literal].ts'), 'after\n')
+    const paths = ['[literal].ts', 'deleted.ts', 'new.ts', 'old.ts'].map(path => ({ repository: '.', path }))
+    expect(summarizeAdvisorTaskOwnedFixChanges(baseline, snapshotAdvisorRepository(layout), paths)
+      .repositories[0]!.changedPaths).toEqual(paths.map(value => value.path))
+    git(root, ['add', '.'])
+    git(root, ['commit', '-qm', 'fix'])
+    expect(summarizeAdvisorTaskOwnedFixChanges(baseline, snapshotAdvisorRepository(layout), paths)
+      .repositories[0]!.changedPaths).toEqual(paths.map(value => value.path))
+  })
+
+  test('第2reviewは別repo・200件超の生成物・workspace指示変更を修正対象へ混ぜない', () => {
+    const project = fixtureDir()
+    for (const name of ['backend', 'frontend']) {
+      const root = join(project, name)
+      mkdirSync(root)
+      git(root, ['init', '-q'])
+      git(root, ['config', 'user.name', 'Zero Test'])
+      git(root, ['config', 'user.email', 'zero@example.invalid'])
+      writeFileSync(join(root, 'fix.ts'), 'before\n')
+      git(root, ['add', '.'])
+      git(root, ['commit', '-qm', 'initial'])
+    }
+    writeFileSync(join(project, 'AGENTS.md'), 'before\n')
+    const layout = resolveAdvisorProjectLayout(project)
+    const baseline = snapshotAdvisorRepository(layout)
+    writeFileSync(join(project, 'backend', 'fix.ts'), 'fixed\n')
+    git(join(project, 'backend'), ['add', 'fix.ts'])
+    git(join(project, 'backend'), ['commit', '-qm', 'fix'])
+    writeFileSync(join(project, 'frontend', 'fix.ts'), 'other task\n')
+    for (let index = 0; index < 205; index++) writeFileSync(join(project, 'backend', `generated-${index}.js`), 'build\n')
+    writeFileSync(join(project, 'AGENTS.md'), 'updated instructions\n')
+    const current = snapshotAdvisorRepository(layout)
+    expect(summarizeAdvisorRepositoryChanges(baseline, current).repositories[0]!.omittedChangedPaths).toBeGreaterThan(0)
+    const delta = summarizeAdvisorTaskOwnedFixChanges(baseline, current, [{ repository: 'backend', path: 'fix.ts' }])
+    expect(delta.changed).toBe(true)
+    expect(delta.repositories).toHaveLength(1)
+    expect(delta.repositories[0]).toMatchObject({ repository: 'backend', changedPaths: ['fix.ts'], omittedChangedPaths: 0 })
+    expect(delta.rootInstructionPaths).toEqual(['AGENTS.md'])
+  }, 30_000)
+
   test('Git subdirectoryを物理worktree rootへ結び、変更・削除をdigestへ反映する', () => {
     const root = fixtureDir()
     const project = join(root, 'packages', 'app')
@@ -59,10 +149,14 @@ describe('advisor repository snapshot', () => {
 
     const layout = resolveAdvisorProjectLayout(project)
     expect(layout.gitRoot).toBe(realpathSync(root))
-    const clean = advisorRepositoryDigest(snapshotAdvisorRepository(layout))
+    const baseline = snapshotAdvisorRepository(layout)
+    const clean = advisorRepositoryDigest(baseline)
     writeFileSync(join(project, 'tracked.txt'), 'after\n')
     const modified = advisorRepositoryDigest(snapshotAdvisorRepository(layout))
     expect(modified).not.toBe(clean)
+    expect(summarizeAdvisorTaskOwnedFixChanges(baseline, snapshotAdvisorRepository(layout), [
+      { repository: '.', path: 'packages/app/tracked.txt' },
+    ]).repositories).toMatchObject([{ repository: '.', changedPaths: ['packages/app/tracked.txt'] }])
     rmSync(join(project, 'tracked.txt'))
     const deleted = snapshotAdvisorRepository(layout)
     expect(deleted.dirty['packages/app/tracked.txt']).toBe('missing')
