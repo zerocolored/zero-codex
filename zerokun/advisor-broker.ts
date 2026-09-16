@@ -102,6 +102,7 @@ import {
   validThreeAdvisorNativeAttempts,
   validThreeAdvisorRoundTwoBasis,
   validThreeAdvisorReviewSequence,
+  validThreeAdvisorReviewBinding,
   type AdvisorPhase,
 } from './advisor-journal.ts'
 import { persistAdvisorClaudeCleanupOutcome, retireAdvisorClaudeCleanupOutcome } from './advisor-round-recovery.ts'
@@ -1633,7 +1634,7 @@ async function main(): Promise<void> {
     return !firstLedger.invalid && firstLedger.entries.length === 1
       && firstLedger.entries[0]!.status === 'completed'
       && firstLedger.entries[0]!.terminal !== null
-      && validThreeAdvisorReviewSequence(
+      && validThreeAdvisorReviewBinding(
         firstLedger.entries[0]!.terminal,
         second.journal,
       )
@@ -2317,6 +2318,65 @@ async function main(): Promise<void> {
       return null
     }
   }
+  const repositoryReviewWarning = (journal: Record<string, unknown>) => {
+    if (journal.phase !== 'review' || journal.round !== 2) return {}
+    const stable = journal.repositoryDeltaCurrentDigestAfter
+      === (journal.roundTwoBasis as Record<string, unknown>)?.repositoryCurrentDigest
+    return {
+      repositoryDeltaStable: stable,
+      ...(stable ? {} : {
+        repositoryAssessmentRequired: true,
+        nextAction: 'The saved answers are available for the original reviewed snapshot. The repository changed or its final observation is unavailable; this is not missing feedback or a corrupt ledger. Inspect the intervening diff and assess relevance using these answers, run targeted checks, and continue the same task. Do not restart advisors or create another round. Answer delivery is not approval of changed code.',
+      }),
+    }
+  }
+  // Restore delivery, not reviewer execution. A fully acquired round can have
+  // been labelled failed by older brokers solely because the checkout moved.
+  const savedRoundResult = (
+    input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
+    phase: 'investigation' | 'design' | 'review',
+    round: 1 | 2 | 3,
+  ): ReturnType<typeof toolText> | null => {
+    const journal = readCompletedJournal(input, phase, round)
+      ?? readTerminalJournal(input, phase, round, 'reviewers-completed')
+      ?? readTerminalJournal(input, phase, round, 'required-reviewer-failed')
+      ?? readTerminalJournal(input, phase, round, 'stale-input')
+    if (!journal) return null
+    const raw = readOptionalPrivateFile(`${roundJournalPath(input, phase, round)}.responses`)
+    if (!raw || Buffer.byteLength(raw) > 2 * 1024 * 1024
+      || createHash('sha256').update(raw).digest('hex') !== journal.responseCacheDigest) return null
+    try {
+      const saved = JSON.parse(raw)
+      if (saved.contextDigest !== contextDigest || saved.phase !== phase || saved.round !== round
+        || saved.inputRevision !== input.revision || saved.inputDigest !== input.digest
+        || saved.evidenceDigest !== journal.primaryEvidenceDigest
+        || JSON.stringify(saved.native) !== JSON.stringify(journal.native)
+        || !Array.isArray(saved.grok) || !Array.isArray(journal.grok)
+        || saved.grok.length !== journal.grok.length) return null
+      const matches = (answer: Record<string, unknown>, recorded: Record<string, unknown>) =>
+        answer?.adopted === recorded?.adopted && (recorded.adopted !== true
+          || (answer.containmentVerified === true && recorded.containmentVerified === true
+            && typeof answer.response === 'string' && answer.response.trim().length > 0
+            && createHash('sha256').update(answer.response).digest('hex') === recorded.responseDigest))
+      if (!saved.grok.every((slot: Record<string, unknown>, index: number) =>
+        matches(slot, (journal.grok as Array<Record<string, unknown>>)[index]!))
+        || !matches(saved.claude, journal.claude as Record<string, unknown>)) return null
+      const latest = readAdvisorInputSnapshot(stateDir, context.jobId)
+      const inputUnchanged = (latest.revision === input.revision && latest.digest === input.digest)
+        || (latest.revision === journal.recoveryInputRevision && latest.digest === journal.recoveryInputDigest)
+      const allAdopted = allAdvisorAttemptsAdopted(saved.native, saved.grok, saved.claude)
+      return toolText({
+        complete: inputUnchanged && allAdopted,
+        restoredSavedResponses: true, phase, round,
+        inputRevision: input.revision, inputDigest: input.digest, inputUnchanged,
+        ...(inputUnchanged ? {} : { staleInput: true }),
+        allAdopted, waitingForAdvisors: !allAdopted,
+        slotSummary: journalSlotSummary(journal),
+        native: saved.native, grok: saved.grok, claude: saved.claude,
+        ...repositoryReviewWarning(journal),
+      })
+    } catch { return null }
+  }
   const recoveredRoundResult = (
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
     phase: 'investigation' | 'design' | 'review',
@@ -2487,6 +2547,15 @@ async function main(): Promise<void> {
       recoveryInputDigest?: string,
     } | undefined
     let retryBackoff = false
+    if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
+      const saved = savedRoundResult({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3)
+      if (saved && resultPayload(saved)?.allAdopted === true) {
+        // Poll applies the ordinary ledger/receipt checks. Never re-run an
+        // already acquired advisor just to redeliver its saved answer.
+        roundTasks.set(taskKey, Promise.resolve(saved))
+        return toolText({ complete: false, pending: true, phase, round, inputRevision, inputDigest })
+      }
+    }
     if (retryUnavailable && phaseScope === 'complete'
       && roundNotStarted(phase as 'investigation' | 'review', round as 1 | 2)) {
       return notStartedResult(phase, round, input)
@@ -2621,14 +2690,16 @@ async function main(): Promise<void> {
       { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3,
     )
     if (alreadyObserved && !retryResult) {
-      return toolText(advisorReceiptAlreadyObserved({
+      return toolText({
+        ...resultPayload(savedRoundResult({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3) ?? toolText({})),
+        ...advisorReceiptAlreadyObserved({
         phase,
         round,
         inputRevision,
         inputDigest,
         pollObservedAt: Number(alreadyObserved.pollObservedAt),
         slotSummary: journalSlotSummary(alreadyObserved),
-      }))
+      }), ...repositoryReviewWarning(alreadyObserved) })
     }
     if (!retryResult && roundTasks.has(taskKey)) {
       return toolText({
@@ -2662,6 +2733,7 @@ async function main(): Promise<void> {
         }
         if (prior.terminal) {
           return toolText({
+            ...resultPayload(savedRoundResult(prior.input, phase, round as 1 | 2 | 3) ?? toolText({})),
             complete: prior.status !== 'stale-input' && journalSlotSummary(prior.terminal).responsesObtained === journalSlotSummary(prior.terminal).total,
             waitingForAdvisors: journalSlotSummary(prior.terminal).responsesObtained < journalSlotSummary(prior.terminal).total,
             nextAction: '不足枠だけを同じ返却bindingのretryUnavailable=trueで復旧してください。',
@@ -2672,6 +2744,7 @@ async function main(): Promise<void> {
             inputDigest: prior.input.digest,
             priorStatus: prior.status,
             slotSummary: journalSlotSummary(prior.terminal),
+            ...repositoryReviewWarning(prior.terminal),
           })
         }
         return toolText({
@@ -3245,17 +3318,12 @@ async function main(): Promise<void> {
       }
     }
     let roundTwoRepositoryCurrentDigestAfter: string | undefined
-    let roundTwoRepositoryStable = true
     if (phaseScope === 'complete' && phase === 'review' && round === 2) {
       try {
         roundTwoRepositoryCurrentDigestAfter = advisorRepositoryDigest(
           snapshotAdvisorRepository(projectLayout),
         )
-        roundTwoRepositoryStable = roundTwoRepositoryCurrentDigestAfter
-          === roundTwoJournalBinding?.repositoryCurrentDigest
-      } catch {
-        roundTwoRepositoryStable = false
-      }
+      } catch { /* Missing observation is reported separately from answer acquisition. */ }
     }
     const afterSnapshot = phaseScope === 'complete'
       ? undefined
@@ -3322,7 +3390,7 @@ async function main(): Promise<void> {
       undefined,
       { version: THREE_ADVISOR_JOURNAL_VERSION, phase },
     )
-    const complete = inputUnchanged && roundTwoRepositoryStable
+    const complete = inputUnchanged
       && (phaseScope === 'complete' || repositoryUnchanged)
       && allAdvisorAttemptsAdopted(nativeEvidence, grokJournal, claudeJournal)
       && validThreeAdvisorNativeAttempts(nativeEvidence, phase)
@@ -3388,7 +3456,8 @@ async function main(): Promise<void> {
       durationMs: finishedAt - startedAt,
       ...(repositoryUnchanged === undefined ? {} : { repositoryUnchanged }),
       ...(phase === 'review' && round === 2
-        ? { repositoryDeltaStable: roundTwoRepositoryStable }
+        ? repositoryReviewWarning({ phase, round, roundTwoBasis: roundTwoJournalBinding,
+          repositoryDeltaCurrentDigestAfter: roundTwoRepositoryCurrentDigestAfter })
         : {}),
       allAdopted: allAdvisorAttemptsAdopted(nativeEvidence, grok, claude),
       ...(!allAdvisorAttemptsAdopted(nativeEvidence, grok, claude) ? {
@@ -3469,16 +3538,20 @@ async function main(): Promise<void> {
     }
     let task = roundTasks.get(taskKey)
     if (!task) {
+      const saved = savedRoundResult(binding, phase, boundRound)
+      if (saved) task = Promise.resolve(saved)
+    }
+    if (!task) {
       const completed = readCompletedJournal(binding, phase, boundRound)
       if (completed) {
-        return toolText(advisorReceiptAlreadyObserved({
+        return toolText({ ...advisorReceiptAlreadyObserved({
           phase,
           round,
           inputRevision,
           inputDigest,
           pollObservedAt: Number(completed.pollObservedAt),
           slotSummary: journalSlotSummary(completed),
-        }))
+        }), ...repositoryReviewWarning(completed) })
       }
       const recovered = recoveredRoundResult(binding, phase, boundRound)
       if (!recovered) {
@@ -3528,16 +3601,23 @@ async function main(): Promise<void> {
     try {
       const alreadyObserved = readCompletedJournal(binding, phase, boundRound)
       if (alreadyObserved) {
-        return toolText(advisorReceiptAlreadyObserved({
+        return toolText({ ...payload, ...advisorReceiptAlreadyObserved({
           phase,
           round,
           inputRevision,
           inputDigest,
           pollObservedAt: Number(alreadyObserved.pollObservedAt),
           slotSummary: journalSlotSummary(alreadyObserved),
-        }))
+        }), ...repositoryReviewWarning(alreadyObserved) })
       }
-      const journal = readTerminalJournal(binding, phase, boundRound, 'reviewers-completed')
+      let journal = readTerminalJournal(binding, phase, boundRound, 'reviewers-completed')
+      if (!journal && payload.restoredSavedResponses === true && payload.allAdopted === true) {
+        const previous = readTerminalJournal(binding, phase, boundRound, 'required-reviewer-failed')
+        if (previous) {
+          journal = { ...previous, status: 'reviewers-completed' }
+          atomicWritePrivateFile(journalPath, `${JSON.stringify(journal)}\n`)
+        }
+      }
       if (!journal) {
         throw new Error('reviewer completion journal is missing or invalid')
       }

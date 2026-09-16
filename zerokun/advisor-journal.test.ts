@@ -10,6 +10,7 @@ import {
   validThreeAdvisorNativeAttempts,
   validThreeAdvisorPhaseRound,
   validThreeAdvisorReviewSequence,
+  validThreeAdvisorReviewBinding,
   validThreeAdvisorRoundTwoBasis,
   threeAdvisorRepositoryDeltaDigest,
   threeAdvisorTaskOwnedFixPathsDigest,
@@ -163,6 +164,16 @@ describe('best-effort external advisor journal', () => {
     })).toBe(false)
     expect(validThreeAdvisorReviewSequence(reviewOne, {
       ...reviewTwo, repositoryDeltaCurrentDigestAfter: digest('0'),
+    })).toBe(false)
+    expect(validThreeAdvisorReviewBinding(reviewOne, {
+      ...reviewTwo, repositoryDeltaCurrentDigestAfter: digest('0'),
+    })).toBe(true)
+    expect(validThreeAdvisorReviewBinding(reviewOne, {
+      ...reviewTwo, status: 'required-reviewer-failed', repositoryDeltaCurrentDigestAfter: undefined,
+      recoveredAfterInterruption: true,
+    })).toBe(true)
+    expect(validThreeAdvisorReviewBinding(reviewOne, {
+      ...reviewTwo, roundTwoBasis: { ...basis, reviewOneJournalDigest: digest('0') },
     })).toBe(false)
   })
 
