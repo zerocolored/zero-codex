@@ -1325,10 +1325,10 @@ def _herdr_binary() -> str:
     ):
         raise UnsafeRequest("pinned Herdr executable is unavailable")
     discovered = shutil.which("herdr")
-    if discovered is None or os.path.normpath(discovered) != candidate:
-        raise UnsafeRequest("PATH does not resolve the pinned Herdr executable")
     try:
         resolved = Path(candidate).resolve(strict=True)
+        if discovered is None or Path(discovered).resolve(strict=True) != resolved:
+            raise UnsafeRequest("PATH does not resolve the pinned Herdr executable")
     except OSError as error:
         raise UnsafeRequest("Herdr cannot be resolved safely") from error
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
@@ -2163,6 +2163,66 @@ def _empty_claude_prompt_screen(text: str) -> bool:
     return _EMPTY_PROMPT_LINE.fullmatch(lines[prompt_lines[-1]]) is not None
 
 
+_STARTUP_FORBIDDEN_UI = re.compile(
+    r"(?i)password|passkey|captcha|rate limit|payment|survey|sign in|log in|"
+    r"approve|allow access|grant permission|permissions? (?:request|required|needed)|"
+    r"(?:enter|provide|paste).*(?:token|credential)|(?:MFA|2FA)|authentication required"
+)
+
+
+def _keep_xhigh_screen(text: str) -> bool:
+    plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
+    lines = [line.strip() for line in plain.splitlines() if line.strip()]
+    return (
+        sum(line == "Use Fable 5.1 at high effort by default?" for line in lines) == 1
+        and sum(line == "❯ Keep xhigh" for line in lines) == 1
+        and sum(line == "Switch Fable 5.1 to high effort" for line in lines) == 1
+        and sum("❯" in line for line in lines) == 1
+        and not any(_STARTUP_FORBIDDEN_UI.search(line) for line in lines)
+    )
+
+
+def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str, object]:
+    """Metadata-ready can precede the effort question. Confirm only the owned UI."""
+    accepted_effort = False
+    deadline = time.monotonic() + CLAUDE_SETTLE_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        _result, first = _agent_information(target)
+        if first is None:
+            raise UnsafeRequest("ephemeral Claude disappeared before visible readiness")
+        _validate_owned_agent(first, workspace, require_ready=False)
+        first_text = _read_visible(target)
+        time.sleep(1.0)
+        _result, second = _agent_information(target)
+        if second is None:
+            raise UnsafeRequest("ephemeral Claude disappeared before visible readiness")
+        _validate_owned_agent(second, workspace, require_ready=False)
+        second_text = _read_visible(target)
+        stable = (type(first.get("state_change_seq")) is int
+                  and first.get("state_change_seq") == second.get("state_change_seq")
+                  and first_text == second_text)
+        if not stable:
+            continue
+        if _keep_xhigh_screen(second_text):
+            if not accepted_effort:
+                _validate_owned_topology(workspace)
+                result = _run_herdr(["agent", "send-keys", target, "Enter"])
+                if result.returncode != 0:
+                    raise UnsafeRequest("ephemeral Claude effort confirmation failed")
+                accepted_effort = True
+            continue
+        plain = _ANSI_SEQUENCE.sub("", second_text).replace("\r", "")
+        if _STARTUP_FORBIDDEN_UI.search(plain):
+            raise UnsafeRequest("ephemeral Claude has a prohibited startup UI")
+        if _empty_claude_prompt_screen(second_text):
+            _validate_owned_agent(second, workspace, require_ready=True)
+            return second
+        # Metadata can precede a fully painted startup screen. Do not turn an
+        # incidental frame into a launch failure; wait within the same attempt.
+        continue
+    raise UnsafeRequest("ephemeral Claude visible ready prompt did not settle")
+
+
 def _strict_trust_screen(text: str, project_root: str) -> bool:
     plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
     lines = plain.splitlines()
@@ -2297,6 +2357,8 @@ def _settle_after_agent_not_ready(
     if first_agent is None:
         raise UnsafeRequest("ephemeral Claude disappeared after startup")
     _validate_owned_agent(first_agent, workspace, require_ready=False)
+    if _keep_xhigh_screen(_read_visible(target)):
+        return _settle_visible_ready(target, workspace)
     if (
         first_agent.get("agent_status") == "blocked"
         and first_agent.get("launch_pending") is True
@@ -4166,6 +4228,8 @@ def _open_ephemeral_workspace(
             root_metadata,
         )
         processes = _settled_process_receipt(workspace_receipt)
+        agent = _settle_visible_ready(agent_name, workspace_receipt)
+        sequence = agent.get("state_change_seq")
         _write_request_record(
             args.project_root,
             args.request_dir,

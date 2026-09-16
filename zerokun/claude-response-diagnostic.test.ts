@@ -17,14 +17,14 @@ function fixture() {
 const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
 const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
 
-test('parser identifies the failed boundary without changing acceptance', () => {
+test('parser reports missing boundaries while accepting complete responses with unfamiliar UI', () => {
   const envelope = [instruction, marker, '回答内容', marker, '❯'].join('\n')
   expect(analyzeClaudeResponse(envelope, marker)).toMatchObject({ code: 'complete', response: '回答内容', markerLines: [1, 3] })
+  expect(analyzeClaudeResponse(envelope + '\nnew footer text', marker)).toMatchObject({ code: 'complete', response: '回答内容' })
   for (const [text, code] of [
     ['❯', 'marker-count-mismatch'],
     [[marker, '回答', marker].join('\n'), 'prompt-boundary-mismatch'],
     [[instruction, marker, marker].join('\n'), 'empty-response'],
-    [envelope + '\nnew footer text', 'unexpected-trailing-content'],
   ]) {
     expect(analyzeClaudeResponse(text!, marker).code).toBe(code!)
     expect(extractCompleteClaudeResponse(text!, marker)).toBeNull()
@@ -43,7 +43,7 @@ test('stores terminal content privately with a verifiable receipt, replacing the
   const path = join(options.stateDir, receipt.path!)
   const content = readFileSync(path, 'utf8')
   expect(createHash('sha256').update(content).digest('hex')).toBe(receipt.sha256!)
-  expect(JSON.parse(content)).toMatchObject({ transcript: { text: transcript, truncated: false }, reads: [{ outcome: 'unexpected-trailing-content' }] })
+  expect(JSON.parse(content)).toMatchObject({ transcript: { text: transcript, truncated: false }, reads: [{ outcome: 'complete' }] })
   expect(lstatSync(path).mode & 0o777).toBe(0o600)
   expect(lstatSync(options.directory).mode & 0o777).toBe(0o700)
   expect(saveClaudeResponseDiagnostic({ ...options, transcript: 'later snapshot' }).path).toBe(receipt.path)

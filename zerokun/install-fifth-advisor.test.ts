@@ -712,6 +712,7 @@ describe('fifth-advisor helper installer', () => {
       'workspace={"agent_name":"fifth-test","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","project_root":"/tmp/project"}',
       'blocked={"name":"fifth-test","agent":"claude","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","cwd":"/tmp/project","agent_status":"blocked","interactive_ready":False,"launch_pending":True,"state_change_seq":8}',
       'module._agent_information=lambda target: ({},dict(blocked))',
+      'module._read_visible=lambda target: "trust screen"',
       'module._settle_after_trust=lambda target,workspace: {"path":"strict-trust"}',
       'resolved=module._settle_after_agent_not_ready("fifth-test",workspace)',
       'print(json.dumps(resolved,sort_keys=True))',
@@ -1224,4 +1225,29 @@ describe('fifth-advisor helper installer', () => {
     expect(repeated.exitCode, repeated.stderr.toString()).toBe(0)
     expect(repeated.stdout.toString()).toContain('ephemeral-provisional-already-reconciled')
   })
+})
+
+ test('Herdr pin accepts symlink aliases of the same executable, rejecting another binary', () => {
+  const root = fixture()
+  const helper = join(import.meta.dir, 'fifth-advisor.py')
+  const program = [
+    'import runpy, os, pathlib, sys',
+    'm=runpy.run_path(sys.argv[1],run_name="probe")',
+    'root=pathlib.Path(sys.argv[2]); binary=root/"real"; binary.write_text("#!/bin/sh\\nexit 0\\n"); binary.chmod(0o700)',
+    '(root/"bin").mkdir(); (root/"bin"/"herdr").symlink_to(binary); (root/"pinned").symlink_to(binary)',
+    'os.environ["PATH"]=str(root/"bin"); os.environ["HERDR_BIN_PATH"]=str(root/"pinned")',
+    'assert m["_herdr_binary"]()==str(binary.resolve())',
+    '(root/"bin"/"herdr").unlink(); (root/"bin"/"herdr").write_text("#!/bin/sh\\nexit 1\\n"); (root/"bin"/"herdr").chmod(0o700)',
+    'try: m["_herdr_binary"]()',
+    'except m["UnsafeRequest"]: pass',
+    'else: raise AssertionError("foreign binary accepted")',
+  ].join('\n')
+  const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper, root], { stdout: 'pipe', stderr: 'pipe' })
+  expect(result.stderr.toString()).toBe('')
+  expect(result.exitCode).toBe(0)
+})
+
+test('visible startup readiness keeps xhigh once and rejects prohibited UI', () => {
+  const result = Bun.spawnSync(['/usr/bin/python3', join(import.meta.dir, 'fifth-visible-ready.test.py')], { stdout: 'pipe', stderr: 'pipe' })
+  expect(result.exitCode, result.stderr.toString()).toBe(0)
 })

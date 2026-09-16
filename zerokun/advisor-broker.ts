@@ -149,19 +149,6 @@ const CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL =
   'markerをそのまま記載してください。'
 const CLAUDE_REQUEST_MARKER = /^REQUEST_MARKER=[0-9A-F]{32}$/
 
-const CLAUDE_DURATION =
-  '(?:[1-9][0-9]*d (?:0|[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m|(?:[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])s)'
-const CLAUDE_LEGACY_ACTIVITY_CHROME = /^✻ Churned for 23s$/u
-const CLAUDE_DONE_ACTIVITY_CHROME = new RegExp(
-  `^[✻✳✽✶✢] (?:Baked|Brewed|Churned|Cogitated|Cooked|Crunched|Sautéed|Worked) for ${CLAUDE_DURATION} · done (?:[01]?[0-9]|2[0-3]):[0-5][0-9]$`,
-  'u',
-)
-// Exact narrow-pane rendering observed from Claude Code 2.1.247 in Herdr.
-const CLAUDE_NARROW_BYPASS_FOOTER_CHROME =
-  `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u00B7`
-const CLAUDE_UPDATE_READY_FOOTER_CHROME =
-  /^⏵⏵ bypass permissions on \(shift\+tab to cycle\) · ← for agents {1,256}✔ Update installed · Restart to update$/u
-
 /**
  * 空の入力プロンプト行か。Claude Code 2.1.27x は空の入力行に薄いプレースホルダ
  * （Try "…"）を重ね、❯ との区切りに NBSP（U+00A0）を使う（2026-09-16 に
@@ -172,32 +159,6 @@ function isEmptyClaudePromptLine(trimmedLine: string): boolean {
   if (!trimmedLine.startsWith('❯')) return false
   const remainder = trimmedLine.slice(1).replace(/\u00a0/g, ' ').trim()
   return remainder === '' || /^Try "[^"]{0,80}"$/.test(remainder)
-}
-
-function isClaudeTerminalChrome(line: string): boolean {
-  const value = line.trim()
-  return value === ''
-    || isEmptyClaudePromptLine(value)
-    || /^─+$/.test(value)
-    || CLAUDE_LEGACY_ACTIVITY_CHROME.test(value)
-    || CLAUDE_DONE_ACTIVITY_CHROME.test(value)
-    || value === CLAUDE_NARROW_BYPASS_FOOTER_CHROME
-    // 2.1.273 は「· ← for agents」の後ろに /rc を描画しない（2026-09-16 tmux 実描画）。
-    // /rc 付き（旧版）と無し（2.1.273）の両方を認める。
-    || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · (?:\/rc|← for agents(?: {1,256}\/rc)?))?$/.test(value)
-}
-
-function isCompleteClaudeTerminalChrome(lines: string[]): boolean {
-  for (let index = 0; index < lines.length; index += 1) {
-    const value = lines[index]!.trim()
-    if (CLAUDE_UPDATE_READY_FOOTER_CHROME.test(value)
-      && lines[index + 1]?.trim() === '/rc') {
-      index += 1
-      continue
-    }
-    if (!isClaudeTerminalChrome(value)) return false
-  }
-  return true
 }
 
 export function extractCompleteClaudeResponse(transcript: string, marker: string): string | null {
@@ -245,7 +206,9 @@ export function analyzeClaudeResponse(transcript: string, marker: string): Claud
   } else return result('marker-count-mismatch')
 
   if (responseMarker <= promptEnd + 1) return result('empty-response')
-  if (!isCompleteClaudeTerminalChrome(lines.slice(responseMarker + 1))) return result('unexpected-trailing-content')
+  // The per-request terminal marker ends the answer. Terminal UI after it is not
+  // an answer-validity contract: clocks, suggestions and version changes vary.
+  // The caller separately verifies the owned agent and response lifecycle.
   const response = lines.slice(promptEnd + 1, responseMarker).join('\n').trim()
   return response ? result('complete', response) : result('empty-response')
 }
