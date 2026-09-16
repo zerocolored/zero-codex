@@ -108,6 +108,13 @@ import {
 } from './advisor-journal.ts'
 import { persistAdvisorClaudeCleanupOutcome, retireAdvisorClaudeCleanupOutcome } from './advisor-round-recovery.ts'
 import { recoverAdvisorSlot } from './advisor-retry.ts'
+import {
+  saveClaudeResponseDiagnostic,
+  captureClaudeFailureDiagnostic,
+  type ClaudeResponseAnalysis,
+  type ClaudeDiagnosticRead,
+  type ClaudeDiagnosticReceipt,
+} from './claude-response-diagnostic.ts'
 
 export type FifthAdvisorSendOutcome =
   | { kind: 'unconfirmed' }
@@ -180,7 +187,13 @@ function isCompleteClaudeTerminalChrome(lines: string[]): boolean {
 }
 
 export function extractCompleteClaudeResponse(transcript: string, marker: string): string | null {
-  if (!marker || marker.includes('\n') || marker.includes('\r')) return null
+  return analyzeClaudeResponse(transcript, marker).response
+}
+
+export function analyzeClaudeResponse(transcript: string, marker: string): ClaudeResponseAnalysis {
+  if (!marker || marker.includes('\n') || marker.includes('\r')) {
+    return { response: null, code: 'invalid-marker', markerLines: [], exactOccurrences: 0, wrappedMarkerPairs: [] }
+  }
   const lines = transcript.replaceAll('\r\n', '\n').split('\n')
   const values = lines.map(line => line.trim())
   const markerLines = values.flatMap((line, index) => line === marker ? [index] : [])
@@ -192,6 +205,9 @@ export function extractCompleteClaudeResponse(transcript: string, marker: string
           : []
       ))
     : []
+  const result = (code: ClaudeResponseAnalysis['code'], response: string | null = null): ClaudeResponseAnalysis => ({
+    response, code, markerLines, exactOccurrences, wrappedMarkerPairs,
+  })
 
   let promptEnd: number
   let responseMarker: number
@@ -201,7 +217,7 @@ export function extractCompleteClaudeResponse(transcript: string, marker: string
     const promptMarker = markerLines[0]!
     responseMarker = markerLines[1]!
     if (promptMarker < 1
-      || values[promptMarker - 1] !== CLAUDE_MARKER_INSTRUCTION) return null
+      || values[promptMarker - 1] !== CLAUDE_MARKER_INSTRUCTION) return result('prompt-boundary-mismatch')
     promptEnd = promptMarker
   } else if (markerLines.length === 1
     && exactOccurrences === 1
@@ -210,14 +226,14 @@ export function extractCompleteClaudeResponse(transcript: string, marker: string
     responseMarker = markerLines[0]!
     if (wrappedMarker < 2
       || values[wrappedMarker - 2] !== CLAUDE_NARROW_MARKER_INSTRUCTION_HEAD
-      || values[wrappedMarker - 1] !== CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL) return null
+      || values[wrappedMarker - 1] !== CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL) return result('prompt-boundary-mismatch')
     promptEnd = wrappedMarker + 1
-  } else return null
+  } else return result('marker-count-mismatch')
 
-  if (responseMarker <= promptEnd + 1) return null
-  if (!isCompleteClaudeTerminalChrome(lines.slice(responseMarker + 1))) return null
+  if (responseMarker <= promptEnd + 1) return result('empty-response')
+  if (!isCompleteClaudeTerminalChrome(lines.slice(responseMarker + 1))) return result('unexpected-trailing-content')
   const response = lines.slice(promptEnd + 1, responseMarker).join('\n').trim()
-  return response || null
+  return response ? result('complete', response) : result('empty-response')
 }
 
 const MAX_INPUT_CHARS = 24_000
@@ -1859,6 +1875,23 @@ async function main(): Promise<void> {
     let cleanupStatus: string | undefined
     let helperEnvironment: Record<string, string> | undefined
     let claudeRuntime: HerdrRuntimeIdentity | undefined
+    const diagnosticAttempt = randomBytes(16).toString('hex')
+    const diagnosticReads: ClaudeDiagnosticRead[] = []
+    let diagnosticTranscript: string | undefined
+    let diagnosticTranscriptReadIndex: number | undefined
+    let responseDiagnostic: ClaudeDiagnosticReceipt | undefined
+    const persistDiagnostic = () => {
+      responseDiagnostic = saveClaudeResponseDiagnostic({
+        stateDir,
+        directory: join(journalRoot, `revision-${input.revision}-${input.digest.slice(0, 16)}`),
+        attempt: diagnosticAttempt,
+        reads: diagnosticReads,
+        transcript: diagnosticTranscript,
+        transcriptReadIndex: diagnosticTranscriptReadIndex,
+        phase,
+        round,
+      })
+    }
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
       ? projectLayout.projectPath
       : projectLayout.gitRoot
@@ -1978,24 +2011,44 @@ async function main(): Promise<void> {
           if (!modelStartObserved || !['idle', 'done'].includes(current.agent_status ?? '')) continue
           let transcript = ''
           for (const lines of [300, 600, 1200]) {
-            transcript = decodeHerdrReadOutput(await herdrText(claudeRuntime, [
-              'agent', 'read', target.target, '--source', 'recent-unwrapped', '--lines', String(lines),
-            ], 'Herdr acquisition read', jobFingerprint))
-            const afterRead = unwrapAgent(await herdrJson(
-              claudeRuntime, ['agent', 'get', target.target], 'Herdr acquisition recheck', jobFingerprint,
-            ))
-            if (!ephemeralClaudeAgentMatches(afterRead, target, claudeProjectRoot)
-              || afterRead.state_change_seq !== current.state_change_seq
-              || !['idle', 'done'].includes(afterRead.agent_status ?? '')) {
-              transcript = ''
-              break
+            const observation: ClaudeDiagnosticRead = {
+              requestedLines: lines,
+              observedAt: new Date().toISOString(),
+              stateBefore: { status: current.agent_status, sequence: current.state_change_seq },
+              outcome: 'read-failed',
             }
-            const completeResponse = extractCompleteClaudeResponse(transcript, marker)
-            if (completeResponse) {
-              response = completeResponse
-              reason = 'Claude response obtained but subsequent cleanup validation did not complete'
-              stateChangeSeqAfter = current.state_change_seq
-              break
+            diagnosticReads.push(observation)
+            if (diagnosticReads.length > 3) diagnosticReads.shift()
+            try {
+              transcript = decodeHerdrReadOutput(await herdrText(claudeRuntime, [
+                'agent', 'read', target.target, '--source', 'recent-unwrapped', '--lines', String(lines),
+              ], 'Herdr acquisition read', jobFingerprint))
+              const afterRead = unwrapAgent(await herdrJson(
+                claudeRuntime, ['agent', 'get', target.target], 'Herdr acquisition recheck', jobFingerprint,
+              ))
+              observation.stateAfter = { status: afterRead.agent_status, sequence: afterRead.state_change_seq }
+              const identityMatches = ephemeralClaudeAgentMatches(afterRead, target, claudeProjectRoot)
+              if (!identityMatches || afterRead.state_change_seq !== current.state_change_seq
+                || !['idle', 'done'].includes(afterRead.agent_status ?? '')) {
+                observation.outcome = identityMatches ? 'state-changed' : 'identity-changed'
+                transcript = ''
+                break
+              }
+              const { response: completeResponse, ...analysis } = analyzeClaudeResponse(transcript, marker)
+              observation.outcome = analysis.code
+              observation.analysis = analysis
+              diagnosticTranscript = transcript
+              diagnosticTranscriptReadIndex = diagnosticReads.length - 1
+              if (completeResponse) {
+                response = completeResponse
+                reason = 'Claude response obtained but subsequent cleanup validation did not complete'
+                stateChangeSeqAfter = current.state_change_seq
+                break
+              }
+            } finally {
+              // Persist each owned snapshot before close/removal, even when the
+              // next read fails. Keep content out of the returned advisor object.
+              persistDiagnostic()
             }
           }
           if (response) break
@@ -2018,6 +2071,30 @@ async function main(): Promise<void> {
       }
       reason = String(error)
     } finally {
+      if (!response && marker && target && claudeRuntime && diagnosticReads.length === 0) {
+        const runtime = claudeRuntime
+        const ownedTarget = target
+        const snapshot = await captureClaudeFailureDiagnostic({
+          getState: async () => unwrapAgent(await herdrJson(
+            runtime, ['agent', 'get', ownedTarget.target], 'Herdr failure diagnostic identity', jobFingerprint,
+          )),
+          readTranscript: async () => decodeHerdrReadOutput(await herdrText(runtime, [
+            'agent', 'read', ownedTarget.target, '--source', 'recent-unwrapped', '--lines', '1200',
+          ], 'Herdr failure diagnostic read', jobFingerprint)),
+          matchesIdentity: current => ephemeralClaudeAgentMatches(current, ownedTarget, claudeProjectRoot!),
+          onError: error => {
+            if (error instanceof AdvisorContainmentError) {
+              helperContainmentVerified = false
+              containmentStatus = error instanceof AdvisorOwnedProcessStillLiveError
+                ? 'owned-process-still-live' : 'unverified-bounded-residual'
+            }
+          },
+        })
+        diagnosticReads.push(snapshot.read)
+        diagnosticTranscript = snapshot.transcript
+        diagnosticTranscriptReadIndex = snapshot.transcript === undefined ? undefined : 0
+        persistDiagnostic()
+      }
       if (requestDir && claudeRuntime) {
         try {
           const helper = resolveFifthAdvisorHelper()
@@ -2189,6 +2266,7 @@ async function main(): Promise<void> {
         stateChangeSeqBefore: target.stateChangeSeq,
         stateChangeSeqAfter,
         response,
+        responseDiagnostic,
         cleanupWarnings,
       }
     }
@@ -2215,6 +2293,7 @@ async function main(): Promise<void> {
       ...(containmentStatus ? { containmentStatus } : {}),
       promptMayHaveBeenDelivered: Boolean(marker),
       reason,
+      responseDiagnostic,
       failure: classifyAdvisorFailure('claude', reason),
       cleanupWarnings,
     }
@@ -3371,6 +3450,7 @@ async function main(): Promise<void> {
       responseDigest: claude.adopted === true && typeof claude.response === 'string'
         ? createHash('sha256').update(claude.response).digest('hex')
         : undefined,
+      responseDiagnostic: claude.responseDiagnostic,
       reasonDigest: claude.adopted !== true
         ? createHash('sha256').update(String(claude.reason ?? 'unavailable')).digest('hex')
         : undefined,

@@ -107,7 +107,9 @@ test.skipIf(!Bun.which('dotenvx'))('real dotenvx strict loading fails without ke
   const command = ['dotenvx', 'run', '--strict', '--', 'node', '-e', 'process.exit(process.env.ZERO_SYNTHETIC_PROBE === "fixture-value" ? 0 : 41)']
   const before = Bun.spawnSync(command, { cwd: target, stdout: 'pipe', stderr: 'pipe' })
   expect(before.exitCode).not.toBe(0)
-  expect(before.stderr.toString()).toContain('MISSING_PRIVATE_KEY')
+  // dotenvx 2.20 reports missing decryption keys as DECRYPTION_FAILED.
+  // The nonzero-before / zero-after assertions remain the behavioral contract.
+  expect(before.stderr.toString()).toMatch(/\[(?:MISSING_PRIVATE_KEY|DECRYPTION_FAILED)\]/)
   expect(provisionLocalWorkspaceSettings(source, target)).toBe('ready')
   const after = Bun.spawnSync(command, { cwd: target, stdout: 'pipe', stderr: 'pipe' })
   expect(after.exitCode).toBe(0)
