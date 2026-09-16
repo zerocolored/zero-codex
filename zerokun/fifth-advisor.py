@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 
 PROMPT_NAME = "prompt"
@@ -555,7 +555,14 @@ def _run_git(root: Path, arguments: List[str]) -> bytes:
     return result.stdout
 
 
-def _workspace_members(root_descriptor: int, root: Path) -> Optional[Tuple[str, ...]]:
+class _WorkspacePin(NamedTuple):
+    members: Tuple[str, ...]
+    # .zerochan/workspace.json の projectRepository。true は「親フォルダ自体も
+    # レビュー対象の Git リポジトリ」という正式な宣言（project-layout.ts が生成する）。
+    project_repository: bool
+
+
+def _workspace_members(root_descriptor: int, root: Path) -> Optional[_WorkspacePin]:
     zerochan_descriptor: Optional[int] = None
     pin_descriptor: Optional[int] = None
     try:
@@ -592,13 +599,18 @@ def _workspace_members(root_descriptor: int, root: Path) -> Optional[Tuple[str, 
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise UnsafeRequest("workspace configuration is invalid") from error
+        # v2 の projectRepository は true / false の両方が正式な値。
+        # かつて false しか受け付けず、「親フォルダ自体も Git リポ」の workspace
+        # （BellSalesAI 型・projectRepository: true）では Claude advisor が snapshot 前に
+        # 必ず落ちていた（2026-09-16 実機確認。Grok reviewer 側 #43 と同型の、
+        # 生成側 project-layout.ts と検証側の契約食い違い）。
         if (
             not isinstance(value, dict)
             or not (
                 (value.get("version") == 1 and set(value) == {"version", "kind", "members"})
                 or (value.get("version") == 2
                     and set(value) == {"version", "kind", "members", "projectRepository"}
-                    and value.get("projectRepository") is False)
+                    and isinstance(value.get("projectRepository"), bool))
             )
             or value.get("kind") != "multi-repo-workspace"
             or not isinstance(value.get("members"), list)
@@ -641,7 +653,10 @@ def _workspace_members(root_descriptor: int, root: Path) -> Optional[Tuple[str, 
             finally:
                 if child_descriptor is not None:
                     os.close(child_descriptor)
-        return tuple(members)
+        return _WorkspacePin(
+            members=tuple(members),
+            project_repository=bool(value.get("projectRepository", False)),
+        )
     finally:
         if pin_descriptor is not None:
             os.close(pin_descriptor)
@@ -664,7 +679,10 @@ def _physical_git_root(path_text: str) -> Tuple[int, Path]:
         reported = Path(decoded).resolve(strict=True)
         if reported != physical:
             raise UnsafeRequest("project root must be the physical Git worktree root")
-        if _workspace_members(descriptor, physical) is not None:
+        # projectRepository: true の pin は「親自体も Git リポ」を明示した構成なので許可する。
+        # false / v1 の pin で親が Git 化されていたら従来どおり拒否する（黙った昇格を防ぐ）。
+        pin = _workspace_members(descriptor, physical)
+        if pin is not None and not pin.project_repository:
             raise UnsafeRequest("a pinned workspace parent must not also be a Git worktree")
         return descriptor, physical
     except BaseException:
@@ -803,7 +821,11 @@ def _filesystem_protected_digest(root_descriptor: int, root: Path) -> Tuple[int,
     digest = hashlib.sha256()
     digest.update(PROTECTED_DIGEST_DOMAIN)
     protected_count = 0
-    workspace_members = _workspace_members(root_descriptor, root)
+    workspace_pin = _workspace_members(root_descriptor, root)
+    # projectRepository: true でも棚卸しは member + root instruction に限定したままにする。
+    # 親直下には .worktrees/ など巨大で変化し続けるディレクトリが置かれうるため、
+    # 全走査にすると advisor round 中に protected digest が揺れて偽陽性で落ちる。
+    workspace_members = workspace_pin.members if workspace_pin is not None else None
 
     def visit(
         descriptor: int,
