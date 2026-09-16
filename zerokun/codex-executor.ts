@@ -106,6 +106,7 @@ import {
   validThreeAdvisorGrokAttempts,
   validThreeAdvisorNativeAttempts,
   validThreeAdvisorReviewSequence,
+  validThreeAdvisorReviewBinding,
   validThreeAdvisorRoundTwoBasis,
 } from './advisor-journal.ts'
 import { summarizeAdvisorSlots } from './advisor-broker.ts'
@@ -1789,7 +1790,7 @@ export function collectHostAdvisorCoverage(
     const reviewOneJournal = journalsByName.get('review:1')!
     const reviewTwoJournal = journalsByName.get('review:2')!
     if (reviewOneJournal.status !== 'completed'
-      || !validThreeAdvisorReviewSequence(reviewOneJournal, reviewTwoJournal)) return undefined
+      || !validThreeAdvisorReviewBinding(reviewOneJournal, reviewTwoJournal)) return undefined
   }
   return phases.length > 0 ? { version: 1, phases } : undefined
 }
