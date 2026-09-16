@@ -2137,7 +2137,12 @@ _ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\
 _TRUST_DECORATION = re.compile(r"[\u2500-\u257f❯›▶▷◉●○◆◇]")
 _TRUST_SELECTION = re.compile(r"[❯›▶▷]")
 _FIRST_CHOICE_SELECTED = re.compile(r"^[\s\u2500-\u257f]*[❯›▶▷][\s\u2500-\u257f]*1\.")
-_EMPTY_PROMPT_LINE = re.compile(r"^\s*❯\s*$")
+# Claude Code 2.1.27x は空の入力行に薄いプレースホルダ（Try "…"）を重ねて表示し、
+# ❯ との区切りに NBSP（U+00A0）を使う（2026-09-16 に v2.1.273 実機で採取:
+# '❯\xa0Try "fix lint errors"'）。プレースホルダは入力が空のときにしか出ないので、
+# 「❯ + プレースホルダのみ」も空の可視プロンプトとして扱う。advisor-broker.ts の
+# emptyClaudePrompt と同じ判定に保つこと。
+_EMPTY_PROMPT_LINE = re.compile(r"^\s*❯[\s ]*(?:Try \"[^\"]{0,80}\")?[\s ]*$")
 _INTERACTIVE_HINT = re.compile(
     r"(?i)(?:\b(?:press|hit|choose|select|confirm|cancel|continue|proceed|approve|deny|allow)\b.*\b(?:enter|return|esc|escape|key|option)\b|"
     r"\b(?:enter|return|esc|escape)\b.*\b(?:confirm|cancel|continue|select|submit)\b|"

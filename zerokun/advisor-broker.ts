@@ -1068,7 +1068,12 @@ export function emptyClaudePrompt(value: string): boolean {
   for (let index = 0; index < lines.length; index += 1) {
     if (lines[index]?.startsWith('❯')) lastPrompt = index
   }
-  if (lastPrompt < 0 || lines[lastPrompt] !== '❯') return false
+  if (lastPrompt < 0) return false
+  // Claude Code 2.1.27x は空の入力行に薄いプレースホルダ（Try "…"）を重ねて表示し、
+  // ❯ との区切りに NBSP（U+00A0）を使う（2026-09-16 に v2.1.273 実機で採取）。
+  // プレースホルダは入力が空のときにしか出ないので、「❯ + プレースホルダのみ」も空として扱う。
+  const promptRemainder = (lines[lastPrompt] ?? '').slice(1).replace(/\u00a0/g, ' ').trim()
+  if (promptRemainder !== '' && !/^Try "[^"]{0,80}"$/.test(promptRemainder)) return false
   const tailIsOnlyKnownStatus = lines.slice(lastPrompt + 1).every(line => (
     line === ''
     || /^[─━═╌╍┄┅┈┉]+$/.test(line)

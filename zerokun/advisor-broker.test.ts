@@ -2885,6 +2885,12 @@ print('review complete')
 
   test('Claudeは末尾が完全一致の空promptだけreadyと判定する', () => {
     expect(emptyClaudePrompt('previous output\n❯\n')).toBe(true)
+    // Claude Code 2.1.27x は空の入力行に薄いプレースホルダを重ね、区切りに NBSP を使う
+    // （2026-09-16 に v2.1.273 実機で採取: '❯\u00a0Try "fix lint errors"'）。
+    // プレースホルダは入力が空のときにしか表示されないので、これも空として扱う。
+    expect(emptyClaudePrompt('previous output\n❯\u00a0Try "fix lint errors"\n')).toBe(true)
+    expect(emptyClaudePrompt('previous output\n❯ Try "explain this codebase"\n')).toBe(true)
+    expect(emptyClaudePrompt('previous output\n❯ Try "fix lint errors" draft\n')).toBe(false)
     expect(emptyClaudePrompt('previous output\n❯ typed draft\n')).toBe(false)
     expect(emptyClaudePrompt('How is Claude doing this session?\n0: Dismiss\n❯')).toBe(false)
     expect(emptyClaudePrompt('Allow this action\n❯')).toBe(false)
