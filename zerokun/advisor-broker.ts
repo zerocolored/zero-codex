@@ -162,15 +162,29 @@ const CLAUDE_NARROW_BYPASS_FOOTER_CHROME =
 const CLAUDE_UPDATE_READY_FOOTER_CHROME =
   /^⏵⏵ bypass permissions on \(shift\+tab to cycle\) · ← for agents {1,256}✔ Update installed · Restart to update$/u
 
+/**
+ * 空の入力プロンプト行か。Claude Code 2.1.27x は空の入力行に薄いプレースホルダ
+ * （Try "…"）を重ね、❯ との区切りに NBSP（U+00A0）を使う（2026-09-16 に
+ * v2.1.273 実機で採取）。プレースホルダは入力が空のときにしか表示されないので、
+ * 「❯ + プレースホルダのみ」も空として扱う。
+ */
+function isEmptyClaudePromptLine(trimmedLine: string): boolean {
+  if (!trimmedLine.startsWith('❯')) return false
+  const remainder = trimmedLine.slice(1).replace(/\u00a0/g, ' ').trim()
+  return remainder === '' || /^Try "[^"]{0,80}"$/.test(remainder)
+}
+
 function isClaudeTerminalChrome(line: string): boolean {
   const value = line.trim()
   return value === ''
-    || value === '❯'
+    || isEmptyClaudePromptLine(value)
     || /^─+$/.test(value)
     || CLAUDE_LEGACY_ACTIVITY_CHROME.test(value)
     || CLAUDE_DONE_ACTIVITY_CHROME.test(value)
     || value === CLAUDE_NARROW_BYPASS_FOOTER_CHROME
-    || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · (?:\/rc|← for agents {1,256}\/rc))?$/.test(value)
+    // 2.1.273 は「· ← for agents」の後ろに /rc を描画しない（2026-09-16 tmux 実描画）。
+    // /rc 付き（旧版）と無し（2.1.273）の両方を認める。
+    || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · (?:\/rc|← for agents(?: {1,256}\/rc)?))?$/.test(value)
 }
 
 function isCompleteClaudeTerminalChrome(lines: string[]): boolean {
@@ -1068,7 +1082,8 @@ export function emptyClaudePrompt(value: string): boolean {
   for (let index = 0; index < lines.length; index += 1) {
     if (lines[index]?.startsWith('❯')) lastPrompt = index
   }
-  if (lastPrompt < 0 || lines[lastPrompt] !== '❯') return false
+  if (lastPrompt < 0) return false
+  if (!isEmptyClaudePromptLine(lines[lastPrompt] ?? '')) return false
   const tailIsOnlyKnownStatus = lines.slice(lastPrompt + 1).every(line => (
     line === ''
     || /^[─━═╌╍┄┅┈┉]+$/.test(line)

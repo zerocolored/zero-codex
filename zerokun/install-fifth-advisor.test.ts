@@ -439,6 +439,58 @@ describe('fifth-advisor helper installer', () => {
     expect(result.stdout.toString()).toContain('snapshot-recorded')
   })
 
+  test('projectRepository=true のpin（親自体もGitリポ）を受け付ける', () => {
+    // BellSalesAI 型のworkspace: 親フォルダ自体もGitリポで、.zerochan/workspace.json が
+    // projectRepository: true を宣言する。fifth-advisor は v2 で false しか受け付けず、
+    // この構成では Claude advisor が snapshot 前に「workspace configuration is invalid」で
+    // 必ず落ちていた（2026-09-16 に実機で確認。Grok reviewer の #43 と同型の食い違い）。
+    const home = fixture()
+    const { project, request } = multiRepoProject(home)
+    const rootInitialized = Bun.spawnSync(['/usr/bin/git', 'init', '-q', project], {
+      env: { PATH: '/usr/bin:/bin', HOME: home }, stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(rootInitialized.exitCode, rootInitialized.stderr.toString()).toBe(0)
+    writeFileSync(join(project, '.zerochan', 'workspace.json'), `${JSON.stringify({
+      version: 2, kind: 'multi-repo-workspace', projectRepository: true,
+      members: ['backend', 'frontend', 'meeting-app'],
+    })}\n`, { mode: 0o600 })
+    const helper = installFifthAdvisorHelper(home)
+    const environment = { HOME: home, PATH: '/usr/bin:/bin' }
+    const snapshot = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'snapshot',
+      '--project-root', project, '--request-dir', request,
+    ], { env: environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(snapshot.exitCode, snapshot.stderr.toString()).toBe(0)
+    expect(snapshot.stdout.toString()).toContain('snapshot-recorded')
+
+    // member の保護対象変更は projectRepository=true でも従来どおり検出する
+    mkdirSync(join(project, 'backend', '.credentials'), { mode: 0o700 })
+    const memberChanged = Bun.spawnSync([
+      '/usr/bin/python3', helper, 'verify',
+      '--project-root', project, '--request-dir', request,
+    ], { env: environment, stdout: 'pipe', stderr: 'pipe' })
+    expect(memberChanged.exitCode).toBe(4)
+  })
+
+  test('projectRepository=false のpin付き親がGit化されたら従来どおり拒否する', () => {
+    const home = fixture()
+    const { project, request } = multiRepoProject(home)
+    const rootInitialized = Bun.spawnSync(['/usr/bin/git', 'init', '-q', project], {
+      env: { PATH: '/usr/bin:/bin', HOME: home }, stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(rootInitialized.exitCode, rootInitialized.stderr.toString()).toBe(0)
+    writeFileSync(join(project, '.zerochan', 'workspace.json'), `${JSON.stringify({
+      version: 2, kind: 'multi-repo-workspace', projectRepository: false,
+      members: ['backend', 'frontend', 'meeting-app'],
+    })}\n`, { mode: 0o600 })
+    const result = Bun.spawnSync(['/usr/bin/python3', installFifthAdvisorHelper(home), 'snapshot',
+      '--project-root', project, '--request-dir', request], {
+      env: { HOME: home, PATH: '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(3)
+    expect(result.stderr.toString()).toContain('ephemeral Claude advisor unavailable')
+  })
+
   test('multi-repo snapshotは安全な親AGENTS.mdの内容変更を検出する', () => {
     const home = fixture()
     const { project, request } = multiRepoProject(home)
