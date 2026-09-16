@@ -1448,6 +1448,19 @@ print('review complete')
       expect(state.prompt_count).toBe(3)
       expect(state.close_count).toBe(3)
       expect(state.owned).toBe(false)
+      const diagnosticPaths = readdirSync(join(fixture.journalRoot, revision))
+        .filter(name => name.startsWith('claude-response-'))
+      expect(diagnosticPaths.length).toBe(3)
+      const diagnostics = diagnosticPaths.map(name => JSON.parse(readFileSync(join(fixture.journalRoot, revision, name), 'utf8')))
+      const failed = diagnostics.filter(item => item.reads.at(-1).outcome === 'marker-count-mismatch')
+      expect(failed.length).toBe(2)
+      for (const item of failed) {
+        expect(item.reads.map((read: { requestedLines: number }) => read.requestedLines)).toEqual([300, 600, 1200])
+        expect(item.transcript.text.trim()).toBe('❯')
+      }
+      expect(diagnostics.some(item => item.transcript.text.includes('Claude independent review completed'))).toBe(true)
+      expect(JSON.parse(cacheBefore).claude.responseDiagnostic.status).toBe('saved')
+      expect(existsSync(join(fixture.state, 'advisor-ephemeral', fixture.jobId, fixture.nonce, revision, 'investigation-1'))).toBe(false)
     } finally { await fixture.close() }
   }, 40_000)
 

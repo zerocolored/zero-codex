@@ -215,6 +215,15 @@ zerochan update
 正常終了後に`zerochan stop`／`zerochan start`を追加実行する必要はありません。逆に、stop／startだけでは
 checkoutの版は変わらないため、更新の代わりにはなりません。
 
+Claudeの回答取得を調べる場合は、state directory（既定 `~/.codex/zerokun`）の
+`advisor-journal/<job>/<attempt>/revision-*/claude-response-*.json` を確認します。
+各取得の行数、状態、マーカー判定理由と、最後に所有identityを確認できた端末出力を保存します。
+回答の成否にかかわらずworkspace削除後も残り、再試行は別ファイルになります。
+本文は最大64 KiBの先頭・末尾で、完全なセッション履歴ではありません。credential検出時は
+本文全体を伏せ、URL・email・ユーザーホーム名も伏せます。任意の個人情報まで検出できる
+保証はないため、owner-onlyのローカル診断として扱い、Slackなどへファイル全体を転載しないでください。
+保存失敗は `responseDiagnostic.status=unavailable` となり、cleanupは継続します。
+
 中断された更新transactionの復旧を案内された場合だけ、次を使います。
 
 ```bash
