@@ -182,7 +182,9 @@ function isClaudeTerminalChrome(line: string): boolean {
     || CLAUDE_LEGACY_ACTIVITY_CHROME.test(value)
     || CLAUDE_DONE_ACTIVITY_CHROME.test(value)
     || value === CLAUDE_NARROW_BYPASS_FOOTER_CHROME
-    || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · (?:\/rc|← for agents {1,256}\/rc))?$/.test(value)
+    // 2.1.273 は「· ← for agents」の後ろに /rc を描画しない（2026-09-16 tmux 実描画）。
+    // /rc 付き（旧版）と無し（2.1.273）の両方を認める。
+    || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · (?:\/rc|← for agents(?: {1,256}\/rc)?))?$/.test(value)
 }
 
 function isCompleteClaudeTerminalChrome(lines: string[]): boolean {

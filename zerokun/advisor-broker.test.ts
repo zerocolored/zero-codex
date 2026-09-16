@@ -2933,6 +2933,21 @@ print('review complete')
       '⏵⏵ bypass permissions on',
     ].join('\n'), marker)).toBe('独立したレビュー結果です。')
 
+    // 2.1.273 の footer は「· ← for agents」で終わり、末尾の /rc が無い
+    // （2026-09-16 に tmux 実描画から採取。旧regexは /rc 必須で全滅していた）。
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      '⏺ 2',
+      marker,
+      '✻ Churned for 1s · done 18:09',
+      '\u2500\u2500\u2500\u2500',
+      '❯',
+      '\u2500\u2500\u2500\u2500',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n'), marker)).toBe('⏺ 2')
+
     expect(extractCompleteClaudeResponse([
       '依頼本文',
       '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
