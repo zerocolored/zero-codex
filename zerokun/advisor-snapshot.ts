@@ -289,6 +289,64 @@ function repositoryIdentifier(snapshot: AdvisorRepositorySnapshot, gitRoot: stri
   return lexical === '' ? '.' : lexical
 }
 
+/** Compare the reviewed file contents, not checkout status or commit bookkeeping. */
+function reviewPathIdentity(repository: AdvisorGitRepositorySnapshot, path: string): string {
+  if (Object.hasOwn(repository.dirty, path)) {
+    const identity = repository.dirty[path]!
+    const parts = identity.split(':')
+    // fileIdentity includes inode/timestamps. Rewriting identical content is not a fix.
+    if (parts[0] === 'sha256') return `${parts[0]}:${parts[1]}:${Boolean(Number(parts[2]) & 0o100)}`
+    return identity
+  }
+  const tree = git(repository.gitRoot, ['--literal-pathspecs', 'ls-tree', '-z', repository.head, '--', path])
+  if (!tree) return 'missing'
+  const entry = tree.split('\0').find(value => value.slice(value.indexOf('\t') + 1) === path)
+  if (!entry) return 'missing'
+  const [mode, type, object] = entry.slice(0, entry.indexOf('\t')).split(' ')
+  // Never read protected content or symlink targets to make a review decision.
+  if (type !== 'blob' || !['100644', '100755'].includes(mode!)
+    || path.split('/').some(part => PROTECTED_COMPONENT.test(part))) return `git:${mode}:${object}`
+  const size = Number(git(repository.gitRoot, ['cat-file', '-s', object!]).trim())
+  if (!Number.isSafeInteger(size) || size < 0 || size > MAX_DIRTY_FILE_BYTES) return `git:${mode}:${object}`
+  const content = gitResult(repository.gitRoot, ['cat-file', 'blob', object!])
+  if (content.exitCode !== 0 || !content.stdout) throw new Error('review fix Git object is unavailable')
+  return `sha256:${createHash('sha256').update(content.stdout).digest('hex')}:${Boolean(parseInt(mode!, 8) & 0o100)}`
+}
+
+/**
+ * R2 reviews only the primary's task-owned paths. Commits and unrelated workspace
+ * drift remain context, not a requirement to include every observed file in R2.
+ */
+export function summarizeAdvisorTaskOwnedFixChanges(
+  baseline: AdvisorRepositorySnapshot,
+  current: AdvisorRepositorySnapshot,
+  paths: readonly { repository: string, path: string }[],
+): AdvisorRepositoryChangeSummary {
+  const summary = summarizeAdvisorRepositoryChanges(baseline, current)
+  const repositories: AdvisorRepositoryChange[] = []
+  for (const repository of [...new Set(paths.map(value => value.repository))].sort()) {
+    const before = baseline.repositories.find(value =>
+      (baseline.kind === 'git-worktree' ? '.' : repositoryIdentifier(baseline, value.gitRoot)) === repository)
+    const after = current.repositories.find(value =>
+      (current.kind === 'git-worktree' ? '.' : repositoryIdentifier(current, value.gitRoot)) === repository)
+    const candidates = paths.filter(value => value.repository === repository).map(value => value.path)
+    let changedPaths: string[]
+    if (before && after && before.gitRoot === after.gitRoot) {
+      changedPaths = candidates.filter(path => reviewPathIdentity(before, path) !== reviewPathIdentity(after, path))
+    } else if (repository === '.' && baseline.kind === 'non-git' && current.kind === 'non-git') {
+      changedPaths = candidates.filter(path => baseline.dirty[path] !== current.dirty[path])
+    } else {
+      // A missing/foreign repository must not become an advisor read target.
+      continue
+    }
+    if (!changedPaths.length) continue
+    repositories.push({ repository, kind: 'changed', headBefore: before?.head ?? null,
+      headAfter: after?.head ?? null, statusChanged: before?.status !== after?.status,
+      changedPaths, omittedChangedPaths: 0 })
+  }
+  return { ...summary, changed: repositories.length > 0, repositories }
+}
+
 export function advisorRepositoryIdentifiers(
   snapshot: AdvisorRepositorySnapshot,
 ): AdvisorRepositoryScope {

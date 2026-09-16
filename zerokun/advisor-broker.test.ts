@@ -2125,20 +2125,8 @@ print('review complete')
         },
       })
       expect(wrongOwnedPath.result.isError).toBe(true)
-      expect(String(wrongOwnedPath.payload.reason)).toContain('do not exactly match')
+      expect(String(wrongOwnedPath.payload.reason)).toContain('non-empty')
       writeFileSync(join(fixture.repo, 'another-task.ts'), 'export const foreign = true\n')
-      const omittedForeignPath = await fixture.call('review', 'revision-two', 'adopted', 2, {
-        nativeAgentId: '/root/native-risk-r2-omitted-path',
-        roundTwoBasis: {
-          roundOneSources: ['native'],
-          mandatoryFindingSummary: '主要導線で再現する不具合',
-          taskOwnedFixDelta: '対象処理と回帰テストを修正',
-          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
-        },
-      })
-      expect(omittedForeignPath.result.isError).toBe(true)
-      expect(String(omittedForeignPath.payload.reason)).toContain('do not exactly match')
-      rmSync(join(fixture.repo, 'another-task.ts'))
       const reusedNative = await fixture.call('review', 'revision-two', 'adopted', 2, {
         roundTwoBasis: {
           roundOneSources: ['native'],
@@ -2159,6 +2147,7 @@ print('review complete')
         },
       })
       expect(roundTwo.payload).toMatchObject({ complete: true, round: 2 })
+      expect(readFileSync(join(fixture.repo, 'another-task.ts'), 'utf8')).toBe('export const foreign = true\n')
       const repeated = await fixture.call('review', 'revision-one', 'adopted', 2, {
         nativeAgentId: '/root/native-risk-r2-second',
         roundTwoBasis: {
@@ -2300,7 +2289,7 @@ print('review complete')
     }
   }, 60_000)
 
-  test('review round 1後のHEAD移動はdirty path申告だけでtask-owned fixにしない', async () => {
+  test('review round 1後のコミット済み修正を同じ第2reviewへ結合し再起動後も回答を保持する', async () => {
     const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
     try {
       expect((await fixture.call('investigation', 'revision-two')).payload)
@@ -2310,7 +2299,12 @@ print('review complete')
       writeFileSync(join(fixture.repo, 'round-two-fix.ts'), 'committed\n')
       git(['add', 'round-two-fix.ts'], fixture.repo)
       git(['commit', '-qm', 'concurrent commit'], fixture.repo)
-      writeFileSync(join(fixture.repo, 'round-two-fix.ts'), 'dirty after commit\n')
+      // Production regression: the primary commits a valid fix before R2.
+      // Generated files and a changed instruction file must not become review scope.
+      for (let index = 0; index < 205; index++) {
+        writeFileSync(join(fixture.repo, `generated-${index}.js`), 'unrelated build output\n')
+      }
+      writeFileSync(join(fixture.repo, 'AGENTS.md'), 'updated workspace instructions\n')
       const roundTwo = await fixture.call('review', 'revision-two', 'adopted', 2, {
         nativeAgentId: '/root/native-risk-r2-after-head-move',
         roundTwoBasis: {
@@ -2320,8 +2314,20 @@ print('review complete')
           taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
         },
       })
-      expect(roundTwo.result.isError).toBe(true)
-      expect(String(roundTwo.payload.reason)).toContain('complete path-level')
+      expect(roundTwo.payload).toMatchObject({ complete: true, round: 2,
+        grok: [{ adopted: true }], claude: { adopted: true } })
+      const journalPath = join(fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`, 'review-2.json')
+      const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
+      expect(journal.roundTwoBasis.taskOwnedFixPaths).toEqual([{ repository: '.', path: 'round-two-fix.ts' }])
+      expect(journal.roundTwoBasis.changedRepositoryCount).toBe(1)
+      await fixture.restart()
+      const polled = await fixture.poll('review', 'revision-two', 2)
+      expect(polled.payload).toMatchObject({ complete: true, alreadyObserved: true })
+      expect(polled.payload.grok).toEqual(roundTwo.payload.grok)
+      expect(polled.payload.claude).toEqual(roundTwo.payload.claude)
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(3)
     } finally {
       await fixture.close()
     }

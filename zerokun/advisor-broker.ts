@@ -56,6 +56,7 @@ import {
   serializeAdvisorRepositorySnapshot,
   snapshotAdvisorRepository,
   summarizeAdvisorRepositoryChanges,
+  summarizeAdvisorTaskOwnedFixChanges,
   type AdvisorProjectLayout,
   type AdvisorRepositorySnapshot,
 } from './advisor-snapshot.ts'
@@ -2856,28 +2857,26 @@ async function main(): Promise<void> {
             reason: 'review round 2 has no verified round-1 repository baseline',
           }, true)
         }
-        roundTwoRepositoryDelta = summarizeAdvisorRepositoryChanges(
-          repositoryBaseline.snapshot,
-          repositoryCurrent,
+        const declaredTaskOwnedFixPaths = [...roundTwoBasis!.taskOwnedFixPaths]
+          .sort((left, right) => {
+            const leftKey = `${left.repository}\0${left.path}`
+            const rightKey = `${right.repository}\0${right.path}`
+            return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
+          })
+        const declaredTaskOwnedFixPathsDigest = threeAdvisorTaskOwnedFixPathsDigest(
+          roundTwoBasis!.taskOwnedFixPaths,
+        )
+        if (!declaredTaskOwnedFixPathsDigest) {
+          return toolText({ complete: false, reason: 'review round 2 task-owned fix paths are invalid' }, true)
+        }
+        roundTwoRepositoryDelta = summarizeAdvisorTaskOwnedFixChanges(
+          repositoryBaseline.snapshot, repositoryCurrent, declaredTaskOwnedFixPaths,
         )
         if (!roundTwoRepositoryDelta.changed || roundTwoRepositoryDelta.layoutChanged
           || roundTwoRepositoryDelta.repositories.length === 0) {
           return toolText({
             complete: false,
             reason: 'review round 2 requires a host-observed non-empty repository fix delta after round 1',
-          }, true)
-        }
-        if (roundTwoRepositoryDelta.omittedRootInstructionPaths !== 0
-          || roundTwoRepositoryDelta.rootInstructionPaths.length !== 0
-          || roundTwoRepositoryDelta.repositories.some(repository => (
-            repository.kind !== 'changed'
-              || repository.headBefore !== repository.headAfter
-              || repository.omittedChangedPaths !== 0
-              || repository.changedPaths.length === 0
-          ))) {
-          return toolText({
-            complete: false,
-            reason: 'review round 2 requires a complete path-level repository delta without unbound workspace-instruction changes',
           }, true)
         }
         const observedTaskOwnedFixPaths = roundTwoRepositoryDelta.repositories
@@ -2890,17 +2889,8 @@ async function main(): Promise<void> {
             const rightKey = `${right.repository}\0${right.path}`
             return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
           })
-        const declaredTaskOwnedFixPaths = [...roundTwoBasis!.taskOwnedFixPaths]
-          .sort((left, right) => {
-            const leftKey = `${left.repository}\0${left.path}`
-            const rightKey = `${right.repository}\0${right.path}`
-            return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
-          })
         const observedTaskOwnedFixPathsDigest = threeAdvisorTaskOwnedFixPathsDigest(
           observedTaskOwnedFixPaths,
-        )
-        const declaredTaskOwnedFixPathsDigest = threeAdvisorTaskOwnedFixPathsDigest(
-          roundTwoBasis!.taskOwnedFixPaths,
         )
         if (!observedTaskOwnedFixPathsDigest || !declaredTaskOwnedFixPathsDigest
           || JSON.stringify(roundTwoBasis!.taskOwnedFixPaths)
@@ -2909,7 +2899,7 @@ async function main(): Promise<void> {
             !== JSON.stringify(observedTaskOwnedFixPaths)) {
           return toolText({
             complete: false,
-            reason: 'review round 2 task-owned fix paths do not exactly match the complete host-observed repository delta',
+            reason: 'review round 2 task-owned fix paths include unchanged or unobserved paths',
           }, true)
         }
         const repositoryDeltaDigest = threeAdvisorRepositoryDeltaDigest(
@@ -2968,6 +2958,9 @@ async function main(): Promise<void> {
           taskOwnedFixDelta: roundTwoFixDelta,
           taskOwnedFixPaths: roundTwoBasis!.taskOwnedFixPaths,
           hostObservedRepositoryDelta: {
+            scope: 'Declared task-owned fix paths only; commits and unrelated workspace changes do not block review.',
+            rootInstructionPaths: roundTwoRepositoryDelta!.rootInstructionPaths,
+            omittedRootInstructionPaths: roundTwoRepositoryDelta!.omittedRootInstructionPaths,
             baselineDigest: roundTwoRepositoryDelta!.baselineDigest,
             currentDigest: roundTwoRepositoryDelta!.currentDigest,
             changedRepositoryCount: roundTwoRepositoryDelta!.repositories.length,
