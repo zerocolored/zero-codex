@@ -38,6 +38,11 @@ import {
   requireManagedStateRoot,
 } from './managed-path.ts'
 import {
+  describeUnverifiedFailureClaims,
+  extractExecutedCommands,
+  findUnverifiedFailureClaims,
+} from './unverified-failure-claim.ts'
+import {
   captureTrackedProcesses,
   MAX_EXECUTOR_REGISTRATION_BYTES,
   MAX_TRACKED_PROCESSES,
@@ -8845,6 +8850,18 @@ export async function executeCodexJob(
       finalMessage = finalSnapshot.text
     } else {
       try { finalMessage = readFinalMessage(finalPath) } catch {}
+    }
+    // 「試して失敗した」と書いた機構を、このターンで一度も実行していないなら通さない。
+    // 2026-09-16、本番セッションの調査で dotenvx を 1 度も動かさずに
+    // 「dotenvx の起動失敗で止まった」と報告した。接続も鍵も揃っていたのに
+    // 調査を打ち切ってユーザーへデータ提供を求めており、事実と違う報告だった。
+    // 検査そのものではジョブを落とさない（ログが読めなければ空配列＝違反なし）。
+    const unverifiedFailureClaims = findUnverifiedFailureClaims(
+      finalMessage,
+      extractExecutedCommands(stdoutPath),
+    )
+    if (unverifiedFailureClaims.length > 0) {
+      throw new Error(describeUnverifiedFailureClaims(unverifiedFailureClaims))
     }
     return {
       exitCode, stdout, stderr, timedOut, finalMessage, observedSessionId,
