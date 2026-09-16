@@ -371,6 +371,11 @@ export function launchDetachedUpdateWorker(
   ], { env: buildUpdaterEnvironment() })
 }
 
+function notificationRetryWindowOpen(request: UpdateRequest, now: number, staleAfterMs: number): boolean {
+  return Boolean(request.outcome && !request.outcome.notifiedAt
+    && now - request.outcome.completedAt <= staleAfterMs)
+}
+
 export async function requestUpdate(
   rawInput: UpdateRequestInput,
   options: RequestOptions = {},
@@ -430,12 +435,15 @@ export async function requestUpdate(
       }
     }
     running ||= isUpdateRunning()
-    // outcomeが載っていてworkerも更新処理も走っていない記録に残る仕事は、Slack通知の配信だけ。
-    // ここでdurationを見ずにduplicateを返すと、通知が失敗し続ける環境では二度と更新を受け付けられない
-    // ——notifiedAtは配信成功でしか付かないため、update-request.jsonを手で消す以外に回復手段が無くなる。
-    // 実機で、更新自体は成功しているのに以後の依頼がすべて「すでに待機中または実行中です」になり、
-    // watchdogが60秒ごとにworkerを起こし直す状態が4日続いた。
-    // 新しい依頼が来た時点で、配信し損ねた古いoutcomeは畳んで新しい更新を受け付ける。
+    if (existing.outcome && existing.chatId === input.chatId && existing.messageId === input.messageId) {
+      // 同じSlack eventは更新を再実行しない。期限内なら保存済み結果の通知だけを再開する。
+      if (!running && notificationRetryWindowOpen(existing, now(), options.staleAfterMs ?? DEFAULT_STALE_MS)) {
+        launch(existing)
+      }
+      await options.onDuplicate?.(existing)
+      return { accepted: false, duplicate: true, request: existing }
+    }
+    // 別の新規依頼は、通知だけが残った過去の結果に永久に塞がれない。
     const onlyDeliveryPending = Boolean(existing.outcome) && !running
     if (!onlyDeliveryPending
       && (age <= (options.staleAfterMs ?? DEFAULT_STALE_MS) || running)) {
@@ -494,13 +502,10 @@ export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean
   }
   const isUpdateRunning = options.isUpdateRunning ?? (() => updateMutationIsRunning(dir))
   if (isUpdateRunning()) return false
-  // 配信だけが残ったoutcomeを無期限に再launchしない。STALEを超えたら配信を諦めて記録を畳む。
-  // 残すと、watchdog(60秒間隔)がworkerを起こす→3回失敗して終了→また起こす、を延々繰り返し、
-  // update-request.logが伸び続けたうえで以後の更新依頼もすべてduplicateで拒否され続ける。
+  // 長い更新の直後にも通知の猶予を確保する。期限切れでも同一eventの再実行を防ぐ記録は残す。
   const now = options.now ?? Date.now
   if (request.outcome
-    && now() - request.requestedAt > (options.staleAfterMs ?? DEFAULT_STALE_MS)) {
-    clearRequest(dir, request.id)
+    && !notificationRetryWindowOpen(request, now(), options.staleAfterMs ?? DEFAULT_STALE_MS)) {
     return false
   }
   const launch = options.launchWorker ?? ((value: UpdateRequest) => {

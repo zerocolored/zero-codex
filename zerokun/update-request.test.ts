@@ -484,7 +484,7 @@ describe('Slack update request', () => {
     expect(events).toEqual(['ack', 'launch'])
   })
 
-  test('配信できないoutcomeはSTALEを超えたら畳み、workerを起こし直さない', async () => {
+  test('通知期限切れのoutcomeは再起動せず同一event用の記録として残す', async () => {
     const stateDir = fixtureDir()
     await requestUpdate(input(), {
       stateDir,
@@ -504,8 +504,130 @@ describe('Slack update request', () => {
       now: () => Date.now() + 7 * 60 * 60 * 1000,
     })).toBe(false)
     expect(launched).toEqual([])
-    expect(existsSync(join(stateDir, 'update-request.json'))).toBe(false)
+    expect(JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8')).id)
+      .toBe('request-give-up-notify')
+    const replay = await requestUpdate(input(), {
+      stateDir,
+      isWorkerRunning: () => false,
+      isUpdateRunning: () => false,
+      launchWorker: value => launched.push(value.id),
+      now: () => Date.now() + 8 * 60 * 60 * 1000,
+    })
+    expect(replay.duplicate).toBe(true)
+    expect(replay.request.id).toBe('request-give-up-notify')
+    expect(launched).toEqual([])
   })
+
+  for (const success of [true, false]) {
+    test(`未通知の同一eventは通知だけ再開する: update success=${success}`, async () => {
+      const stateDir = fixtureDir()
+      await requestUpdate(input(), {
+        stateDir, idFactory: () => 'original-update', launchWorker: () => {},
+      })
+      let executions = 0
+      await runUpdateWorker('original-update', {
+        stateDir,
+        executeUpdater: async () => { executions += 1; return success ? 0 : 17 },
+        notify: async () => { throw new Error('synthetic delivery failure') },
+        maxNotifyAttempts: 1,
+      })
+      const launched: string[] = []
+      const replay = await requestUpdate(input(), {
+        stateDir,
+        idFactory: () => 'must-not-create-new-update',
+        isWorkerRunning: () => false,
+        isUpdateRunning: () => false,
+        launchWorker: request => launched.push(request.id),
+      })
+      expect(replay.accepted).toBe(false)
+      expect(replay.duplicate).toBe(true)
+      expect(launched).toEqual(['original-update'])
+      const result = await runUpdateWorker(launched[0]!, {
+        stateDir,
+        executeUpdater: async () => { executions += 1; return 0 },
+        notify: async () => {},
+      })
+      expect(executions).toBe(1)
+      expect(result).toEqual({ success, exitCode: success ? 0 : 17, notificationSent: true })
+    })
+  }
+
+  for (const elapsed of [999, 1000, 1001]) {
+    test(`通知期限は完了時刻から計測し両入口で一致する: elapsed=${elapsed}`, async () => {
+      const stateDir = fixtureDir()
+      const completedAt = 8 * 60 * 60 * 1000
+      await requestUpdate(input(), {
+        stateDir, now: () => 1, idFactory: () => 'long-update', launchWorker: () => {},
+      })
+      const path = join(stateDir, 'update-request.json')
+      const request = JSON.parse(readFileSync(path, 'utf8'))
+      request.outcome = { success: true, exitCode: 0, text: 'done', completedAt }
+      writeFileSync(path, JSON.stringify(request))
+      const launched: string[] = []
+      const options = {
+        stateDir, now: () => completedAt + elapsed, staleAfterMs: 1000,
+        isWorkerRunning: () => false, isUpdateRunning: () => false,
+        launchWorker: (value: { id: string }) => launched.push(value.id),
+      }
+      const expectedLaunch = elapsed <= 1000
+      expect(resumePendingUpdateWorker(options)).toBe(expectedLaunch)
+      expect(resumePendingUpdateWorker(options)).toBe(expectedLaunch)
+      const replay = await requestUpdate(input(), options)
+      expect(replay.accepted).toBe(false)
+      expect(replay.request.id).toBe('long-update')
+      expect(launched).toEqual(expectedLaunch ? ['long-update', 'long-update', 'long-update'] : [])
+      expect(JSON.parse(readFileSync(path, 'utf8')).outcome).toEqual(request.outcome)
+      const next = await requestUpdate(input('1787000000.000200'), {
+        ...options, idFactory: () => 'next-update',
+      })
+      expect(next.accepted).toBe(true)
+      expect(next.request.id).toBe('next-update')
+    })
+  }
+
+  for (const guard of ['worker', 'updater', 'gate'] as const) {
+    test(`未通知outcomeでも${guard}が動作中なら再起動も置換もしない`, async () => {
+      const stateDir = fixtureDir()
+      await requestUpdate(input(), {
+        stateDir, now: () => 1, idFactory: () => 'running-update', launchWorker: () => {},
+      })
+      const path = join(stateDir, 'update-request.json')
+      const request = JSON.parse(readFileSync(path, 'utf8'))
+      request.outcome = { success: true, exitCode: 0, text: 'done', completedAt: 2 }
+      const gateProcess = guard === 'gate'
+        ? Bun.spawn(['/bin/sleep', '30'], { detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+        : undefined
+      try {
+        if (guard === 'gate') {
+          request.gate = await acquireDetachedLeaderIdentity(gateProcess!.pid)
+          expect(request.gate).toBeDefined()
+          expect(request.gate.pgid).toBe(request.gate.pid)
+        }
+        writeFileSync(path, JSON.stringify(request))
+        const launched: string[] = []
+        const options = {
+          stateDir, isWorkerRunning: () => guard === 'worker',
+          isUpdateRunning: () => guard === 'updater',
+          launchWorker: (value: { id: string }) => launched.push(value.id),
+        }
+        for (const now of [3, 8 * 60 * 60 * 1000]) {
+          expect(resumePendingUpdateWorker({ ...options, now: () => now })).toBe(false)
+          for (const messageId of [input().messageId, '1787000000.000200']) {
+            const replay = await requestUpdate(input(messageId), { ...options, now: () => now })
+            expect(replay.duplicate).toBe(true)
+            expect(replay.request.id).toBe('running-update')
+          }
+        }
+        expect(launched).toEqual([])
+        expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(request)
+      } finally {
+        if (gateProcess) {
+          gateProcess.kill()
+          await gateProcess.exited
+        }
+      }
+    })
+  }
 
   test('受付通知後に独立workerを1回だけ起動し、同時依頼をまとめる', async () => {
     const stateDir = fixtureDir()
@@ -781,6 +903,8 @@ describe('Slack update request', () => {
     expect(first.notificationSent).toBe(false)
     expect(JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8')).outcome)
       .toMatchObject({ success: true, exitCode: 0 })
+    expect(readFileSync(join(stateDir, 'update-request.log'), 'utf8'))
+      .toContain('notify attempt 1/1 failed: Error: Slack 503')
 
     const notifications: string[] = []
     const resumed = await runUpdateWorker('request-durable-notify', {
