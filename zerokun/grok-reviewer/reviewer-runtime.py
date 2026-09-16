@@ -661,11 +661,17 @@ def _workspace_review_roots(input_path: Path | None, review_root: Path) -> list[
         raise OSError("workspace review scope contract is invalid")
     members: list[str] = []
     for candidate in value["members"]:
+        # `projectRepository: true` の workspace では、一番上のフォルダ自体も git リポジトリで、
+        # advisor-broker が members へ review root 自身を含める（members = projectLayout.gitRoots）。
+        # 直下の子だけを許す検証にしていたため、その構成では必ず
+        # "workspace review member path is invalid" になり、launcher が exit 126 で止まっていた。
+        # review root は既に _safe_owned_directory で検証済みなので、member として受け付ける。
+        is_review_root = isinstance(candidate, str) and Path(candidate) == review_root
         if (
             not isinstance(candidate, str)
             or not candidate.startswith("/")
             or candidate != os.path.normpath(candidate)
-            or Path(candidate).parent != review_root
+            or (not is_review_root and Path(candidate).parent != review_root)
             or Path(candidate).name in ("", ".", "..")
             or any(character in candidate for character in "*?[\x00\r\n")
         ):
@@ -673,7 +679,7 @@ def _workspace_review_roots(input_path: Path | None, review_root: Path) -> list[
         member = Path(candidate)
         physical = member.resolve(strict=True)
         if physical != member:
-            raise OSError("workspace review member must be a physical direct child")
+            raise OSError("workspace review member must be a physical path")
         _safe_owned_directory(member)
         _safe_owned_directory(member / ".git")
         members.append(candidate)
@@ -795,7 +801,14 @@ def _prepare_run_home(
         _write_private_exclusive(grok_home / "requirements.toml", requirements)
         _write_private_exclusive(grok_home / "sandbox.toml", sandbox.encode("utf-8"))
         return 0
-    except (OSError, UnicodeError, ValueError):
+    except (OSError, UnicodeError, ValueError) as error:
+        # 握り潰すと launcher の "read allowlist is invalid" だけが残り、どの検査で落ちたのか
+        # 一切分からなくなる。2026-09-16、この無言失敗のせいで原因特定に半日かかった。
+        # path や scope の中身は出さず、例外の型とメッセージだけを stderr へ出す。
+        print(
+            f"prepare-run-home failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
         return 8
 
 
