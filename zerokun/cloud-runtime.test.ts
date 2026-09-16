@@ -175,7 +175,9 @@ test('new cloud preparation and multi-repo import both pin the execution parent'
     expect(result.exitCode, result.stderr.toString()).toBe(0)
     for (const name of ['back', 'front']) expect(readFileSync(join(imported.repoPath, name, 'file.txt'), 'utf8')).toBe('unfinished work')
   } finally { a.close(); b.close() }
-})
+// Real multi-repository clone/fetch/import plus a Python snapshot can exceed
+// Bun's default 5 seconds under full-suite load. Keep all assertions unchanged.
+}, 30_000)
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', env: { ...process.env,
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid',

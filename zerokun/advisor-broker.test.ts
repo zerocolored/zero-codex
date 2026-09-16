@@ -139,6 +139,7 @@ type BrokerFixture = {
     payload: Record<string, unknown>
   }>
   close(): Promise<void>
+  restart(): Promise<void>
 }
 
 function successfulFakeHerdr(
@@ -339,6 +340,7 @@ async function brokerFixture(options: {
   externalSuccess?: boolean
   claudeFailures?: number
   transientProbeDenial?: boolean
+  onExternalPrompt?: (count: number, repo: string) => void
 } = {}): Promise<BrokerFixture> {
   const root = fixtureDir()
   chmodSync(root, 0o700)
@@ -395,6 +397,7 @@ async function brokerFixture(options: {
         stateValue.prompt_count = Number(stateValue.prompt_count ?? 0) + 1
         stateValue.answer_missing = Number(stateValue.prompt_count) <= (options.claudeFailures ?? 0)
         writeFileSync(fakeHerdrState, `${JSON.stringify(stateValue)}\n`, { mode: 0o600 })
+        options.onExternalPrompt?.(Number(stateValue.prompt_count), repo)
         client.write(`${JSON.stringify({
           id: request.id,
           result: { type: 'agent_prompt', status: 'done' },
@@ -519,7 +522,7 @@ async function brokerFixture(options: {
   writeFileSync(contextPath, `${JSON.stringify(context)}\n`, { mode: 0o600 })
   const contextDigest = createHash('sha256').update(JSON.stringify(context)).digest('hex')
   const fingerprint = createSeatbeltFingerprint(state, job.id, nonce)
-  const transport = new StdioClientTransport({
+  const createTransport = () => new StdioClientTransport({
     command: process.execPath,
     args: [
       '--config=/dev/null', '--no-env-file', realpathSync(join(import.meta.dir, 'advisor-broker.ts')),
@@ -530,9 +533,10 @@ async function brokerFixture(options: {
     env: environment,
     stderr: 'pipe',
   })
+  let transport = createTransport()
   let brokerStderr = ''
   transport.stderr?.on('data', chunk => { brokerStderr += String(chunk) })
-  const client = new Client({ name: 'zerochan-advisor-broker-test', version: '1.0.0' })
+  let client = new Client({ name: 'zerochan-advisor-broker-test', version: '1.0.0' })
   try {
     await client.connect(transport)
   } catch (error) {
@@ -551,6 +555,12 @@ async function brokerFixture(options: {
     journalRoot,
     contextDigest,
     fingerprint,
+    async restart() {
+      await client.close()
+      transport = createTransport()
+      client = new Client({ name: 'zerochan-advisor-broker-test', version: '1.0.0' })
+      await client.connect(transport)
+    },
     ...(options.externalSuccess ? {
       externalEvidence: { fakeHerdrState },
     } : {}),
@@ -2162,6 +2172,76 @@ print('review complete')
     } finally {
       await fixture.close()
     }
+  }, 60_000)
+
+  test('review第2回はrepository変化でも回答を配送しcold retryも外部再起動しない', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true,
+      onExternalPrompt: (count, repo) => {
+        if (count === 3) writeFileSync(join(repo, 'parallel-work.txt'), 'concurrent work\n')
+      },
+    })
+    try {
+      expect((await fixture.call('investigation', 'revision-two')).payload.complete).toBe(true)
+      expect((await fixture.call('review', 'revision-two')).payload.complete).toBe(true)
+      writeFileSync(join(fixture.repo, 'round-two-fix.ts'), 'export const fix = true\n')
+      const overrides = { nativeAgentId: '/root/native-risk-r2', roundTwoBasis: {
+        roundOneSources: ['native'] as Array<'native'>,
+        mandatoryFindingSummary: '主要導線の不具合', taskOwnedFixDelta: '回帰を修正',
+        taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+      } }
+      const round = await fixture.call('review', 'revision-two', 'adopted', 2, overrides)
+      expect(round.payload).toMatchObject({ complete: true, round: 2,
+        repositoryDeltaStable: false, repositoryAssessmentRequired: true,
+        slotSummary: { responsesObtained: 3 } })
+      const journalPath = join(fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`, 'review-2.json')
+      const cacheBefore = readFileSync(`${journalPath}.responses`, 'utf8')
+      const original = JSON.parse(readFileSync(journalPath, 'utf8'))
+      // Exact pre-fix failure: all responses exist, only repository drift
+      // caused a failed terminal journal and no delivery receipt.
+      const legacy = { ...original, status: 'required-reviewer-failed',
+        receiptIssuedAt: undefined, receiptDigest: undefined, pollObservedAt: undefined,
+        receiptAcknowledgement: undefined }
+      writeFileSync(journalPath, JSON.stringify(legacy), { mode: 0o600 })
+      await fixture.restart()
+      writeFileSync(`${journalPath}.responses`, cacheBefore + ' ', { mode: 0o600 })
+      const corrupt = await fixture.call('review', 'revision-two', 'adopted', 2,
+        { ...overrides, retryUnavailable: true })
+      expect(corrupt.payload.complete).toBe(false)
+      expect(corrupt.payload.grok).toBeUndefined()
+      writeFileSync(`${journalPath}.responses`, cacheBefore, { mode: 0o600 })
+      const recovered = await fixture.call('review', 'revision-two', 'adopted', 2,
+        { ...overrides, retryUnavailable: true })
+      expect(recovered.payload).toMatchObject({ complete: true, restoredSavedResponses: true,
+        repositoryDeltaStable: false, repositoryAssessmentRequired: true,
+        grok: [{ adopted: true }], claude: { adopted: true } })
+      expect(recovered.payload.grok).toEqual(round.payload.grok)
+      expect(recovered.payload.claude).toEqual(round.payload.claude)
+      expect(readFileSync(`${journalPath}.responses`, 'utf8')).toBe(cacheBefore)
+      await fixture.restart()
+      const polled = await fixture.poll('review', 'revision-two', 2)
+      expect(polled.payload).toMatchObject({ complete: true, alreadyObserved: true,
+        restoredSavedResponses: true, repositoryDeltaStable: false })
+      expect(polled.payload.grok).toEqual(round.payload.grok)
+      // Interrupted older generations omitted the after-observation. Missing
+      // metadata must not make the same bound answers inaccessible either.
+      writeFileSync(journalPath, JSON.stringify({ ...legacy,
+        repositoryDeltaCurrentDigestAfter: undefined }), { mode: 0o600 })
+      await fixture.restart()
+      const withoutAfter = await fixture.call('review', 'revision-two', 'adopted', 2,
+        { ...overrides, retryUnavailable: true })
+      expect(withoutAfter.payload).toMatchObject({ complete: true, restoredSavedResponses: true,
+        repositoryDeltaStable: false, repositoryAssessmentRequired: true })
+      expect(withoutAfter.payload.grok).toEqual(round.payload.grok)
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(3)
+      expect(readFileSync(join(fixture.repo, 'parallel-work.txt'), 'utf8')).toBe('concurrent work\n')
+      // Recovery must not turn a foreign/tampered binding into valid feedback.
+      const tampered = JSON.parse(readFileSync(journalPath, 'utf8'))
+      tampered.roundTwoBasis.reviewOneJournalDigest = '0'.repeat(64)
+      writeFileSync(journalPath, JSON.stringify(tampered), { mode: 0o600 })
+      expect((await fixture.poll('review', 'revision-two', 2)).result.isError).toBe(true)
+    } finally { await fixture.close() }
   }, 60_000)
 
   test('必須修正後の新しいinput revisionでreview round 2を一度だけ実行する', async () => {
