@@ -152,8 +152,11 @@ const CLAUDE_REQUEST_MARKER = /^REQUEST_MARKER=[0-9A-F]{32}$/
 const CLAUDE_DURATION =
   '(?:[1-9][0-9]*d (?:0|[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m|(?:[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])s)'
 const CLAUDE_LEGACY_ACTIVITY_CHROME = /^✻ Churned for 23s$/u
+// done の時刻は環境の時刻書式に従う。ephemeral の fresh HOME では
+// 12時間表記 + AM/PM（例: done 6:34 AM）になる（2026-09-17、#48 が保存した
+// 実 transcript から採取）。24時間表記（done 18:09）と両方を認める。
 const CLAUDE_DONE_ACTIVITY_CHROME = new RegExp(
-  `^[✻✳✽✶✢] (?:Baked|Brewed|Churned|Cogitated|Cooked|Crunched|Sautéed|Worked) for ${CLAUDE_DURATION} · done (?:[01]?[0-9]|2[0-3]):[0-5][0-9]$`,
+  `^[✻✳✽✶✢] (?:Baked|Brewed|Churned|Cogitated|Cooked|Crunched|Sautéed|Worked) for ${CLAUDE_DURATION} · done (?:[01]?[0-9]|2[0-3]):[0-5][0-9](?: [AP]M)?$`,
   'u',
 )
 // Exact narrow-pane rendering observed from Claude Code 2.1.247 in Herdr.

@@ -2948,6 +2948,26 @@ print('review complete')
       '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
     ].join('\n'), marker)).toBe('⏺ 2')
 
+    // ephemeral の fresh HOME では done 時刻が 12時間表記 + AM/PM で描画される
+    // （2026-09-17、#48 が保存した実 transcript から採取:
+    //  '✻ Churned for 2m 31s · done 6:34 AM'）。24時間表記しか認めない regex が
+    // この 1 行を未知扱いにし、outcome=unexpected-trailing-content で全滅していた。
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      '⏺ 2',
+      marker,
+      '',
+      '✻ Churned for 2m 31s · done 6:34 AM',
+      '',
+      '\u2500\u2500\u2500\u2500',
+      '❯',
+      '\u2500\u2500\u2500\u2500',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+      '',
+    ].join('\n'), marker)).toBe('⏺ 2')
+
     expect(extractCompleteClaudeResponse([
       '依頼本文',
       '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
@@ -3236,6 +3256,9 @@ print('review complete')
       '✻ Sautéed for 5m 45s · done 13:27',
       '✳ Worked for 1s · done 0:00',
       '✢ Worked for 1s · done 23:59',
+      // fresh HOME では 12時間表記 + AM/PM（2026-09-17、#48 保存の実transcriptから採取）
+      '✻ Churned for 2m 31s · done 6:34 AM',
+      '✻ Churned for 23s · done 12:26 PM',
     ]) {
       expect(extractCompleteClaudeResponse(envelope(activity), marker)).toBe(response)
     }
@@ -3248,8 +3271,9 @@ print('review complete')
       '✻ Churned for 23s · done 12:60',
       '✻ Churned for 23s · done 12:6',
       '✻ Churned for 23s · done 12:26:00',
-      '✻ Churned for 23s · done 12:26 PM',
       '✻ Churned for 23s · done 12:26 extra',
+      '✻ Churned for 23s · done 12:26 XM',
+      '✻ Churned for 23s · done 12:26 am',
       '✻ Churned for 0s · done 12:26',
       '✻ Worked for 0m 5s · done 12:26',
       '✻ Worked for 1m 00s · done 12:26',
