@@ -281,7 +281,7 @@ int main(void) {
     expect(output).toMatch(
       /^PATH=.*\.zerokun\/runtime\/grok-reviewer\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin$/m,
     )
-    expect(output).toContain('extends = "strict"')
+    expect(output).toContain(`extends = "${process.platform === 'darwin' ? 'read-only' : 'strict'}"`)
     expect(output).toContain(
       `restrict_network = ${process.platform === 'darwin' ? 'false' : 'true'}`,
     )

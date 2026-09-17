@@ -77,7 +77,9 @@ OAUTH_SCOPE = (
 URL_TOKEN = re.compile(rb"https://[^\x00-\x20\x7f\x1b]{1,8192}")
 OAUTH_CODE_CHALLENGE = re.compile(r"[A-Za-z0-9_-]{43}")
 OAUTH_NONCE = re.compile(r"[A-Za-z0-9_-]{36}")
-OAUTH_STATE = re.compile(r"[A-Za-z0-9_-]{32}")
+OAUTH_STATE = re.compile(
+    r"(?:[A-Za-z0-9_-]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})"
+)
 
 
 class LoginFailure(Exception):
@@ -643,6 +645,61 @@ def _minimal_environment(
     }
 
 
+def _publish_auth(staging_home: Path, user_home: Path, expected: tuple) -> None:
+    """Publish successful login only; failed CLI runs never touch live auth.
+
+    Credential bytes stay opaque and are never returned or logged. Refuse to
+    overwrite an independently updated login observed before publication.
+    """
+    _raise_if_interrupted()
+    staged = _auth_metadata(staging_home)
+    source = staging_home / ".grok" / "auth.json"
+    destination = user_home / ".grok"
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    temporary = None
+    try:
+        if tuple(getattr(os.fstat(descriptor), f) for f in AUTH_FIELDS) != staged[2]:
+            raise LoginFailure("oauth-login-unsafe-auth")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            data = stream.read(MAX_AUTH_BYTES + 1)
+        if not data or len(data) > MAX_AUTH_BYTES or _auth_metadata(staging_home) != staged:
+            raise LoginFailure("oauth-login-unsafe-auth")
+        if _auth_metadata(user_home, allow_missing=True) != expected:
+            raise LoginFailure("oauth-login-auth-changed-before-publish", 1)
+        fd, name = tempfile.mkstemp(prefix=".oauth-auth-", dir=destination)
+        temporary = Path(name)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        handled = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+        try:
+            if _auth_metadata(user_home, allow_missing=True) != expected:
+                raise LoginFailure("oauth-login-auth-changed-before-publish", 1)
+            _raise_if_interrupted()
+            pending = signal.sigpending() & handled
+            if pending:
+                raise LoginInterrupted(min(pending))
+            # Publication commits here. Later interruption cannot roll back a
+            # valid new login or overwrite a concurrent user's subsequent login.
+            # Non-cooperating writers still have a check/rename race; do not run
+            # a separate manual login concurrently with this helper.
+            os.replace(temporary, destination / "auth.json")
+            temporary = None
+            directory_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    finally:
+        os.close(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _capture_bounded(
     process: subprocess.Popen[bytes], maximum: int, deadline: float
 ) -> bytes:
@@ -799,6 +856,19 @@ def _url_token_count(captured: bytes) -> int:
     return sum(1 for _match in URL_TOKEN.finditer(captured))
 
 
+def _plain_pty_output(captured: bytes, *, final: bool = False) -> bytes:
+    # Grok clears the progress line (CSI K) even with TERM=dumb.
+    # Strip presentation codes only; never relay potentially sensitive output.
+    plain = re.sub(rb"\x1b\[(?:[0-9;]*m|[012]?K)", b"", captured)
+    if not final:
+        plain = re.sub(rb"\x1b(?:\[[0-9;]*)?$", b"", plain)
+    if b"\x1b" in plain or any(
+        byte < 0x20 and byte not in {0x09, 0x0A, 0x0D} for byte in plain
+    ):
+        raise LoginFailure("oauth-login-control-sequence-rejected")
+    return plain
+
+
 def _open_chrome(url: str, deadline: float) -> None:
     if '"' in url or "\\" in url or "\n" in url or "\r" in url:
         raise LoginFailure("oauth-login-url-rejected")
@@ -918,14 +988,10 @@ def _run_login(
                 if len(captured) + len(chunk) > MAX_LOGIN_BYTES:
                     raise LoginFailure("oauth-login-output-limit", 69)
                 captured.extend(chunk)
-                if b"\x1b" in captured or any(
-                    byte < 0x20 and byte not in {0x09, 0x0A, 0x0D}
-                    for byte in captured
-                ):
-                    raise LoginFailure("oauth-login-control-sequence-rejected")
-                if _url_token_count(bytes(captured)) > 1:
+                plain = _plain_pty_output(bytes(captured))
+                if _url_token_count(plain) > 1:
                     raise LoginFailure("oauth-login-url-rejected")
-                tokens = _completed_url_tokens(bytes(captured))
+                tokens = _completed_url_tokens(plain)
                 if len(tokens) > 1:
                     raise LoginFailure("oauth-login-url-rejected")
                 if tokens and not browser_opened:
@@ -943,13 +1009,14 @@ def _run_login(
             time.sleep(0.05)
         _raise_if_interrupted()
         try:
-            bytes(captured).decode("utf-8")
+            plain = _plain_pty_output(bytes(captured), final=True)
+            plain.decode("utf-8")
         except UnicodeDecodeError as error:
             raise LoginFailure("oauth-login-control-sequence-rejected") from error
         if (
             not browser_opened
             or process.returncode != 0
-            or len(_completed_url_tokens(bytes(captured))) != 1
+            or len(_completed_url_tokens(plain)) != 1
         ):
             raise LoginFailure("oauth-login-failed", 1)
         remaining = max(0.0, deadline - time.monotonic())
@@ -1178,8 +1245,10 @@ def _main(arguments: list[str]) -> int:
             _materialize_verified_executable(grok, identity, runtime_root)
         )
         _validate_executable(grok, identity)
+        staging_home = runtime_root / "home"
+        staging_home.mkdir(mode=0o700)
         environment = _minimal_environment(
-            user_home, runtime_root, runtime_path, runtime_lang
+            staging_home, runtime_root, runtime_path, runtime_lang
         )
         _validate_materialized_executable(
             pinned_grok, copied_identity, copied_digest
@@ -1261,6 +1330,7 @@ def _main(arguments: list[str]) -> int:
             overall_deadline,
         )
         _validate_executable(grok, identity)
+        _publish_auth(staging_home, user_home, auth_before)
         auth_after = _auth_metadata(user_home)
         if auth_after == auth_before:
             raise LoginFailure("oauth-login-auth-unchanged", 1)
