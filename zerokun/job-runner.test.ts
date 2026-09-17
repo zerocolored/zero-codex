@@ -9917,7 +9917,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).not.toContain('process-separated permission protocol')
     expect(instructions).toContain('advisor_round phase=investigation')
     expect(instructions).toContain('returned slotSummary')
-    expect(instructions).toContain('All three real answers are required')
+    expect(instructions).toContain('Advisor availability never blocks the primary task.')
+    expect(instructions).not.toContain('overrides best-effort advisor guidance')
     expect(instructions).not.toContain('Missing required reviewer answers mean the review is incomplete')
     expect(instructions).toContain('legacy separate design phase')
     expect(instructions).toContain('solution_analyst with model=gpt-6-astra,')
@@ -9947,7 +9948,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(advised).toContain('Advisor transport: zerokun_advisors')
     expect(advised).toContain('Base any advisor-count statement only on slotSummary')
     expect(advised).not.toContain('zero obtained answers is not a task blocker')
-    expect(advised).toContain('until all three answers are obtained')
+    expect(advised).not.toContain('until all three answers are obtained')
+    expect(advised).toContain('Advisor availability never blocks the primary task.')
+    expect(advised).toContain('even when zero advisors return an answer')
     expect(advised).toContain('retryUnavailable=true')
     expect(advised).not.toContain('recover its missing slots using the original binding')
     expect(advised).toContain('An interrupted round with attemptsFinished=true')
@@ -13162,7 +13165,7 @@ describe('Slack output guard', () => {
       },
     }, state)
     expect(finalized.result).not.toContain('すべてから回答')
-    expect(finalized.taskGoalStatus).toBe('blocked')
+    expect(finalized.taskGoalStatus).toBeUndefined()
     expect(finalized.result).toContain('変更ファイルは3件です。')
     expect(finalized.result).toContain(
       '独立レビュー実行記録(ホスト確認): 最終レビュー第1回—起動2/3・回答1/3'
@@ -14817,7 +14820,35 @@ describe('durable terminal notifications', () => {
     store.close()
   })
 
-  test('Claude未回収ならDB再open後も未完了を保持し成功リアクションしない', async () => {
+  test.each([0, 2])('回答%d件でも主処理の完了・未完了判断を保持しGrok認証障害だけで停止しない', responses => {
+    const state = fixtureDir()
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    store.enqueue(input())
+    const job = store.claimNext('serial-worker')!
+    for (const outcome of ['complete', 'blocked'] as const) {
+      const finalized = finalizeSuccessfulExecution(job, {
+        sessionId: 'best-effort', taskGoalStatus: outcome, result: '必要な検証の結果です。',
+        advisorCoverage: { version: 1, phases: [{
+          phase: 'review', round: 2, inputRevision: 1, finishedAt: 1,
+          total: 3, started: 3, responsesObtained: responses,
+          startedNoResponse: 3 - responses, startUnconfirmed: 0, unavailableBeforeStart: 0,
+          slots: [
+            { slot: 'codex-risk', state: responses ? 'response-obtained' : 'started-no-response' },
+            { slot: 'grok', state: 'started-no-response' },
+            { slot: 'claude', state: responses ? 'response-obtained' : 'started-no-response' },
+          ],
+          failures: [{ advisor: 'grok', cause: 'authentication' }],
+        }] },
+      }, state)
+      expect(finalized.taskGoalStatus).toBe(outcome)
+      expect(finalized.result).toContain(`回答${responses}/3`)
+      expect(finalized.result).toContain('Grok: 認証が必要です')
+      expect(finalized.result).not.toContain('3者の回答が揃ってから')
+    }
+    store.close()
+  })
+
+  test('Claude未回収でもprimaryの完了をDB再open後まで保持し欠員は正確に通知する', async () => {
     const state = fixtureDir()
     const dbPath = join(state, 'jobs.sqlite3')
     let store = new JobStore(dbPath)
@@ -14846,9 +14877,11 @@ describe('durable terminal notifications', () => {
     await flushTerminalNotifications(store, notifier, () => {}, 1)
     await flushTerminalNotifications(store, notifier, () => {}, 1)
     expect(posted).toHaveLength(1)
-    expect(posted[0]).toContain('未完了・待機中')
+    expect(posted[0]).not.toContain('未完了・待機中')
+    expect(posted[0]).toContain('回答2/3')
+    expect(store.get(job.id)?.taskGoalStatus).toBe('complete')
     expect(posted[0]).toContain('Claude Code: 認証が必要です')
-    expect(reactions).toBe(0)
+    expect(reactions).toBe(1)
     store.close()
   })
 

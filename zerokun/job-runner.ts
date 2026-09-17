@@ -16010,7 +16010,7 @@ export function enforceHostAdvisorCoverage(
     const failures = [...new Map(coverage.phases.flatMap(phase => phase.failures ?? [])
       .map(failure => [failure.advisor, failure] as const)).values()]
     const notice = failures.length > 0
-      ? `必要な回答が揃っていないため、設計・レビューは未完了です。\n${failures.map(advisorFailureMessage).join('\n')}\n取得済みの回答と作業は保持しています。未取得枠を復旧・再試行し、3者の回答が揃ってから進めます。認証などの操作後はこのスレッドで再開を依頼してください。\n\n`
+      ? `一部の独立レビュー回答を取得できませんでした。\n${failures.map(advisorFailureMessage).join('\n')}\n取得済みの回答と実行記録を保持しています。\n\n`
       : ''
     return stripped.text
       ? `${notice}${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
@@ -16031,9 +16031,8 @@ export function finalizeSuccessfulExecution(
   const {
     capturedArtifacts = [], advisorCoverage, ...persistedExecution
   } = execution
-  if (advisorCoverage?.phases.some(phase => phase.responsesObtained < phase.total)) {
-    persistedExecution.taskGoalStatus = 'blocked'
-  }
+  // Coverage describes advisor availability. Keep the primary's task outcome;
+  // a missing external answer must not turn completed work into a blocked job.
   try {
     const declared = extractArtifactPaths(execution.result)
     // Browser evidence is bounded by the host at capture time and cannot be
