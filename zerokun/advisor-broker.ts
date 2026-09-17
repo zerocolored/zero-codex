@@ -55,6 +55,7 @@ import {
   resolveAdvisorProjectLayout,
   serializeAdvisorRepositorySnapshot,
   snapshotAdvisorRepository,
+  snapshotAdvisorReviewWorktrees,
   summarizeAdvisorRepositoryChanges,
   summarizeAdvisorTaskOwnedFixChanges,
   type AdvisorProjectLayout,
@@ -1695,11 +1696,16 @@ async function main(): Promise<void> {
     round: number,
     perspective: 'solution' | 'risk',
     evidence: string,
+    reviewContext = context,
   ): Promise<GrokAttemptResult> => {
     let launchRequested = false
     try {
       const launcher = resolveDedicatedGrokLauncher()
-      const prompt = `${advisorPrompt(context, input, phase, round, evidence)}\nPerspective: ${perspective}`
+      const prompt = `${advisorPrompt(reviewContext, input, phase, round, evidence)}\nPerspective: ${perspective}`
+      const reviewScope = reviewContext === context ? grokWorkspaceScope
+        : join(advisorRuntimeDir, `grok-review-scope-${phase}-${round}.json`)
+      if (reviewScope && reviewContext !== context) atomicWritePrivateFile(reviewScope,
+        JSON.stringify({ version: 2, reviewRoot: context.repoPath, members: reviewContext.gitRoots }))
       const startedAt = Date.now()
       launchRequested = true
       const result = await runBounded([launcher, '-p'], {
@@ -1708,8 +1714,8 @@ async function main(): Promise<void> {
         env: {
           ...brokerEnvironment(),
           ZEROKUN_GROK_REVIEW_ROOT: context.repoPath,
-          ...(grokWorkspaceScope
-            ? { ZEROKUN_GROK_REVIEW_SCOPE_FILE: grokWorkspaceScope }
+          ...(reviewScope
+            ? { ZEROKUN_GROK_REVIEW_SCOPE_FILE: reviewScope }
             : {}),
           ZEROKUN_SEATBELT_FINGERPRINT_ALLOW: fingerprintAllow,
           ZEROKUN_SEATBELT_FINGERPRINT_DENY: fingerprintDeny,
@@ -1812,13 +1818,14 @@ async function main(): Promise<void> {
     phase: AdvisorPhase,
     round: number,
     evidence: string,
+    reviewContext = context,
   ): Promise<GrokAttemptResult[]> => {
     const perspective = advisorPerspectiveForPhase(phase)
     try {
       return await executeGrokPanelWithRecovery({
         perspective,
         initialAuth: classifyGrokAuthState(),
-        runAttempt: value => runGrokOnce(input, phase, round, value, evidence),
+        runAttempt: value => runGrokOnce(input, phase, round, value, evidence, reviewContext),
         runRecovery: runGrokOAuthRecovery,
         unavailable: unavailableGrok,
         claimRecovery: () => claimGrokOAuthRecovery(phase),
@@ -1835,6 +1842,7 @@ async function main(): Promise<void> {
     phase: 'investigation' | 'design' | 'review',
     round: 1 | 2 | 3,
     evidence: string,
+    reviewContext = context,
   ): Promise<Record<string, unknown>> => {
     let requestDir: string | undefined
     let beforeSnapshot: AdvisorRepositorySnapshot | undefined
@@ -1916,7 +1924,7 @@ async function main(): Promise<void> {
         round,
       })
       chmodSync(requestDir, 0o700)
-      const prompt = advisorPrompt(context, input, phase, round, evidence)
+      const prompt = advisorPrompt(reviewContext, input, phase, round, evidence)
       writeFileSync(join(requestDir, 'prompt'), prompt, { flag: 'wx', mode: 0o600 })
       const helper = resolveFifthAdvisorHelper()
       const python = realpathSync('/usr/bin/python3')
@@ -2304,6 +2312,7 @@ async function main(): Promise<void> {
     round: completeWorkflow ? z.number().int().min(1).max(2) : z.number().int().min(1).max(3),
     inputRevision: z.number().int().min(1),
     inputDigest: z.string().regex(/^[0-9a-f]{64}$/),
+    reviewWorktrees: z.array(z.string().min(1).max(512)).max(16).optional().describe('Project-relative registered task worktrees. Set in review round 1 when implementation is in a linked worktree; round 2 reuses this baseline scope.'),
     primaryEvidence: z.string().min(1).max(MAX_INPUT_CHARS),
     nativeAdvisors: z.array(nativeAdvisorAttemptSchema).length(1),
     roundTwoBasis: z.object({
@@ -2554,7 +2563,7 @@ async function main(): Promise<void> {
     description: 'Durably start one ordered Three-Advisor attempt round. Unavailable outcomes are contained and journaled; call advisor_round_poll until the same binding reaches a terminal receipt.',
     inputSchema: advisorRoundInputSchema,
   }, async ({
-    phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis, retryUnavailable, inputUpdateIsRecoveryOnly,
+    phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis, retryUnavailable, inputUpdateIsRecoveryOnly, reviewWorktrees,
   }) => {
     if (phaseScope === 'prepare' && phase === 'review') {
       return toolText({ complete: false, reason: 'review is unavailable in the pre-edit process' }, true)
@@ -2585,6 +2594,11 @@ async function main(): Promise<void> {
     const roundTwoFixDelta = roundTwoBasis
       ? safeInput(roundTwoBasis.taskOwnedFixDelta.trim(), 'task-owned fix delta')
       : undefined
+    let selectedReviewWorktrees = reviewWorktrees ?? []
+    let reviewSnapshot: AdvisorRepositorySnapshot | undefined
+    try {
+      if (selectedReviewWorktrees.length) reviewSnapshot = snapshotAdvisorReviewWorktrees(projectLayout, selectedReviewWorktrees)
+    } catch (error) { return toolText({ complete: false, reason: String(error) }, true) }
     let roundTwoRepositoryDelta: ReturnType<typeof summarizeAdvisorRepositoryChanges> | undefined
     let roundTwoJournalBinding: Record<string, unknown> | undefined
     let roundOneReviewJournalForRoundTwo: Record<string, unknown> | undefined
@@ -2899,7 +2913,13 @@ async function main(): Promise<void> {
         let repositoryCurrent: AdvisorRepositorySnapshot
         try {
           repositoryBaseline = readReviewDeltaBaseline(firstReview.entries[0]!.input)
-          repositoryCurrent = snapshotAdvisorRepository(projectLayout)
+          if (repositoryBaseline) {
+            selectedReviewWorktrees = repositoryBaseline.snapshot.gitRoots
+              .filter(root => !projectLayout.gitRoots.includes(root))
+              .map(root => relative(projectLayout.projectPath, root))
+          }
+          repositoryCurrent = snapshotAdvisorReviewWorktrees(projectLayout, selectedReviewWorktrees)
+          reviewSnapshot = repositoryCurrent
         } catch (error) {
           return toolText({
             complete: false,
@@ -3007,7 +3027,7 @@ async function main(): Promise<void> {
         }
       }
     }
-    const evidence = roundTwoBasis
+    const evidenceBody = roundTwoBasis
       ? safeInput(JSON.stringify({
           primaryEvidence: primaryEvidenceValue,
           reviewScope: 'Only the adopted mandatory round-1 fix delta and regressions from it.',
@@ -3028,6 +3048,12 @@ async function main(): Promise<void> {
           },
         }), 'delta-limited review evidence')
       : primaryEvidenceValue
+    const evidence = selectedReviewWorktrees.length
+      ? `${evidenceBody}\nHost-selected review worktrees: ${JSON.stringify(selectedReviewWorktrees)}`
+      : evidenceBody
+    const reviewContext = reviewSnapshot
+      && JSON.stringify(reviewSnapshot.gitRoots) !== JSON.stringify(context.gitRoots)
+      ? { ...context, gitRoots: reviewSnapshot.gitRoots } : context
     const evidenceDigest = createHash('sha256').update(evidence).digest('hex')
     if (retryResult && retryResult.evidenceDigest !== evidenceDigest) {
       return toolText({ complete: false, reason: 'The advisor question changed; do not mix previous answers with different evidence.' }, true)
@@ -3326,13 +3352,13 @@ async function main(): Promise<void> {
     const grokPromise = recoverAdvisorSlot({
       advisor: 'grok', saved: retryResult?.grok?.[0]?.adopted === true ? retryResult.grok[0] : undefined,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
-      run: async () => (await runGrokPanel(boundInput, phase, round, evidence))[0]!,
+      run: async () => (await runGrokPanel(boundInput, phase, round, evidence, reviewContext))[0]!,
       persist: result => persistSlot('grok', result),
     }).then(result => [result])
     const claudePromise = recoverAdvisorSlot({
       advisor: 'claude', saved: retryResult?.claude?.adopted === true ? retryResult.claude : undefined,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
-      run: () => runClaude(boundInput, phase, round as 1 | 2 | 3, evidence),
+      run: () => runClaude(boundInput, phase, round as 1 | 2 | 3, evidence, reviewContext),
       persist: result => persistSlot('claude', result),
       beforeRetry: result => retireAdvisorClaudeCleanupOutcome(stateDir, {
         jobId: context.jobId, attemptNonce: context.attemptNonce,
@@ -3347,7 +3373,7 @@ async function main(): Promise<void> {
     if (phaseScope === 'complete' && context.writeEnabled
       && phase === 'review' && round === 1) {
       try {
-        const snapshot = snapshotAdvisorRepository(projectLayout)
+        const snapshot = snapshotAdvisorReviewWorktrees(projectLayout, selectedReviewWorktrees)
         atomicWritePrivateFile(
           reviewDeltaBaselinePath(boundInput),
           serializeAdvisorRepositorySnapshot(snapshot),
@@ -3355,9 +3381,9 @@ async function main(): Promise<void> {
         const baseline = readReviewDeltaBaseline(boundInput)
         if (!baseline
           || baseline.snapshot.projectPath !== projectLayout.projectPath
-          || baseline.snapshot.kind !== projectLayout.kind
-          || baseline.snapshot.gitRoot !== projectLayout.gitRoot
-          || JSON.stringify(baseline.snapshot.gitRoots) !== JSON.stringify(projectLayout.gitRoots)) {
+          || baseline.snapshot.kind !== snapshot.kind
+          || baseline.snapshot.gitRoot !== snapshot.gitRoot
+          || JSON.stringify(baseline.snapshot.gitRoots) !== JSON.stringify(snapshot.gitRoots)) {
           throw new Error('round-1 repository baseline does not match the target layout')
         }
         reviewOneRepositoryBaselineDigest = baseline.digest
@@ -3371,7 +3397,7 @@ async function main(): Promise<void> {
     if (phaseScope === 'complete' && phase === 'review' && round === 2) {
       try {
         roundTwoRepositoryCurrentDigestAfter = advisorRepositoryDigest(
-          snapshotAdvisorRepository(projectLayout),
+          snapshotAdvisorReviewWorktrees(projectLayout, selectedReviewWorktrees),
         )
       } catch { /* Missing observation is reported separately from answer acquisition. */ }
     }

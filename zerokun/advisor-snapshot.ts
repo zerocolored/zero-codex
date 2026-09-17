@@ -9,6 +9,7 @@ import {
   fstatSync,
   readdirSync,
   readSync,
+  realpathSync,
 } from 'fs'
 import { isAbsolute, relative, resolve, sep } from 'path'
 import {
@@ -693,6 +694,48 @@ export function snapshotAdvisorRepository(
     dirty,
     repositories,
     rootInstructions: {},
+  }
+}
+
+/** Select only task-owned, Git-registered worktrees; do not expand project discovery. */
+export function snapshotAdvisorReviewWorktrees(
+  layout: AdvisorProjectLayout,
+  worktrees: readonly string[] = [],
+): AdvisorRepositorySnapshot {
+  const base = snapshotAdvisorRepository(layout)
+  if (!worktrees.length) return base
+  const registered = new Map(layout.gitRoots.flatMap(root => {
+    const common = realpathSync(git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim())
+    return git(root, ['worktree', 'list', '--porcelain', '-z']).split('\0')
+      .filter(line => line.startsWith('worktree ')).map(line => [line.slice(9), common] as const)
+  }))
+  const selected = [...new Set(worktrees)].sort().map(path => {
+    const root = resolve(layout.projectPath, path)
+    if (isAbsolute(path) || !contained(layout.projectPath, root)
+      || realpathSync(root) !== root || !registered.has(root)
+      || realpathSync(git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim()) !== registered.get(root)) {
+      throw new Error('review worktree must be a registered physical worktree inside the project')
+    }
+    return root
+  })
+  const repositories = [...base.repositories]
+  for (const root of selected) {
+    if (repositories.some(repo => repo.gitRoot === root)) continue
+    const snapshot = snapshotAdvisorRepository(resolveAdvisorProjectLayout(root))
+    if (snapshot.kind !== 'git-worktree' || snapshot.gitRoot !== root) {
+      throw new Error('review worktree is not a Git worktree')
+    }
+    repositories.push(snapshot.repositories[0]!)
+  }
+  // Use the same lexicographic order as the serialized snapshot contract.
+  repositories.sort((a, b) => a.gitRoot < b.gitRoot ? -1 : a.gitRoot > b.gitRoot ? 1 : 0)
+  if (repositories.length === base.repositories.length) return base
+  return {
+    ...base, kind: 'multi-repo-workspace', gitRoot: null, head: null,
+    gitRoots: repositories.map(repo => repo.gitRoot), repositories,
+    status: 'multi-repo-workspace-v1',
+    dirty: Object.fromEntries(repositories.flatMap(repo => Object.entries(repo.dirty)
+      .map(([path, identity]) => [`${relative(layout.projectPath, repo.gitRoot) || '.'}/${path}`, identity]))),
   }
 }
 
