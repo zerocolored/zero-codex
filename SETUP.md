@@ -104,6 +104,14 @@ ZeroちゃんがmacOSの固定OAuth helperをphase内で1回だけ試します�
 利用不能として扱い、primary Codexのtaskは継続します。rate limit、quota、network障害ではOAuthを
 起動しません。
 
+再認証は専用の一時HOMEで実行し、CLIが成功して安全な認証ファイルを生成した場合だけ、
+開始時から変わっていない実HOMEの認証情報へ原子的に反映します。反映前の失敗・中断では
+既存の認証情報を保持します。反映後の中断では新しい認証情報が残る場合があります。
+並行する手動loginを完全に排他できないため、自動復旧中に別途`grok login`を実行しないでください。
+OAuthの旧32文字・UUID形式のstateと通常のANSI表示に対応しています。
+このhelperはZeroちゃん専用の同梱物です。codex-configのAGENTS.mdやhelperだけを更新しても
+置き換わらないため、Zeroちゃん側の修正版は`zerochan update`で配備してください。
+
 ZeroちゃんはAPI key認証を代用せず、login画面や秘密を勝手に操作しません。login後、Codexは
 同じ`interactive-bootstrap.sh --with-slack ...`を再実行します。既存の安全な設定は上書きされません。
 

@@ -239,7 +239,7 @@ export function reviewerSandbox(home: string): string {
     join(home, '.git-credentials'),
   ]
   return `[profiles.reviewer]
-extends = "strict"
+extends = "${process.platform === 'darwin' ? 'read-only' : 'strict'}"
 restrict_network = ${process.platform === 'darwin' ? 'false' : 'true'}
 read_only = [__ZEROKUN_REVIEW_ROOTS____ZEROKUN_FINGERPRINT_ALLOW_JSON____ZEROKUN_PROMPT_ROOT_JSON__]
 deny = [
