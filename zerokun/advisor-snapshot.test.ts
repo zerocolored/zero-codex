@@ -194,6 +194,115 @@ describe('advisor repository snapshot', () => {
     expect(advisorRepositoryDigest(after)).not.toBe(advisorRepositoryDigest(before))
   })
 
+  test('R2はmember配下のlinked worktreeへ保存された未commitの修正を観測する', () => {
+    // 2026-09-17 job d3b85f46 の再現。bot は運用規則どおり workspace 配下の
+    // .worktrees/<name> に隔離worktreeを作って9ファイルを修正・保存したのに、
+    // R2 の観測が primary checkout の dirty / HEAD しか見ず
+    // 「review round 2 requires a host-observed non-empty repository fix delta」で
+    // 必ず拒否されていた。行儀よく worktree を使うジョブほど再レビューを通れない。
+    const project = fixtureDir()
+    const member = join(project, 'backend')
+    mkdirSync(join(member, 'src'), { recursive: true })
+    git(member, ['init', '-q'])
+    git(member, ['config', 'user.name', 'Zero Test'])
+    git(member, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(member, 'src', 'service.ts'), 'original\n')
+    git(member, ['add', '.'])
+    git(member, ['commit', '-qm', 'initial'])
+    const sibling = join(project, 'frontend')
+    mkdirSync(sibling)
+    git(sibling, ['init', '-q'])
+    git(sibling, ['config', 'user.name', 'Zero Test'])
+    git(sibling, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(sibling, 'app.ts'), 'app\n')
+    git(sibling, ['add', '.'])
+    git(sibling, ['commit', '-qm', 'initial'])
+
+    const baseline = snapshotAdvisorRepository(resolveAdvisorProjectLayout(project))
+
+    mkdirSync(join(project, '.worktrees'), { recursive: true })
+    const worktree = join(project, '.worktrees', 'backend-fix')
+    git(member, ['worktree', 'add', '-q', '-b', 'fix/observed', worktree])
+    writeFileSync(join(worktree, 'src', 'service.ts'), 'fixed in worktree\n')
+
+    const current = snapshotAdvisorRepository(resolveAdvisorProjectLayout(project))
+    const summary = summarizeAdvisorTaskOwnedFixChanges(baseline, current, [
+      { repository: 'backend', path: 'src/service.ts' },
+    ])
+    expect(summary.changed).toBe(true)
+    expect(summary.repositories).toHaveLength(1)
+    expect(summary.repositories[0]!.changedPaths).toEqual(['src/service.ts'])
+  })
+
+  test('R2はlinked worktreeでcommit済みの修正も観測する', () => {
+    const project = fixtureDir()
+    const member = join(project, 'backend')
+    mkdirSync(join(member, 'src'), { recursive: true })
+    git(member, ['init', '-q'])
+    git(member, ['config', 'user.name', 'Zero Test'])
+    git(member, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(member, 'src', 'service.ts'), 'original\n')
+    git(member, ['add', '.'])
+    git(member, ['commit', '-qm', 'initial'])
+    const sibling = join(project, 'frontend')
+    mkdirSync(sibling)
+    git(sibling, ['init', '-q'])
+    git(sibling, ['config', 'user.name', 'Zero Test'])
+    git(sibling, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(sibling, 'app.ts'), 'app\n')
+    git(sibling, ['add', '.'])
+    git(sibling, ['commit', '-qm', 'initial'])
+
+    const baseline = snapshotAdvisorRepository(resolveAdvisorProjectLayout(project))
+
+    mkdirSync(join(project, '.worktrees'), { recursive: true })
+    const worktree = join(project, '.worktrees', 'backend-fix')
+    git(member, ['worktree', 'add', '-q', '-b', 'fix/committed', worktree])
+    writeFileSync(join(worktree, 'src', 'service.ts'), 'fixed and committed\n')
+    git(worktree, ['add', '.'])
+    git(worktree, ['commit', '-qm', 'fix'])
+
+    const current = snapshotAdvisorRepository(resolveAdvisorProjectLayout(project))
+    const summary = summarizeAdvisorTaskOwnedFixChanges(baseline, current, [
+      { repository: 'backend', path: 'src/service.ts' },
+    ])
+    expect(summary.changed).toBe(true)
+    expect(summary.repositories[0]!.changedPaths).toEqual(['src/service.ts'])
+  })
+
+  test('workspace外のlinked worktreeは観測へ加えない', () => {
+    const project = fixtureDir()
+    const outside = fixtureDir()
+    const member = join(project, 'backend')
+    mkdirSync(join(member, 'src'), { recursive: true })
+    git(member, ['init', '-q'])
+    git(member, ['config', 'user.name', 'Zero Test'])
+    git(member, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(member, 'src', 'service.ts'), 'original\n')
+    git(member, ['add', '.'])
+    git(member, ['commit', '-qm', 'initial'])
+    const sibling = join(project, 'frontend')
+    mkdirSync(sibling)
+    git(sibling, ['init', '-q'])
+    git(sibling, ['config', 'user.name', 'Zero Test'])
+    git(sibling, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(sibling, 'app.ts'), 'app\n')
+    git(sibling, ['add', '.'])
+    git(sibling, ['commit', '-qm', 'initial'])
+
+    const baseline = snapshotAdvisorRepository(resolveAdvisorProjectLayout(project))
+    const worktree = join(outside, 'backend-escape')
+    git(member, ['worktree', 'add', '-q', '-b', 'fix/escape', worktree])
+    writeFileSync(join(worktree, 'src', 'service.ts'), 'outside edit\n')
+
+    const current = snapshotAdvisorRepository(resolveAdvisorProjectLayout(project))
+    expect(Object.keys(current.dirty).some(key => key.includes('backend-escape'))).toBe(false)
+    const summary = summarizeAdvisorTaskOwnedFixChanges(baseline, current, [
+      { repository: 'backend', path: 'src/service.ts' },
+    ])
+    expect(summary.changed).toBe(false)
+  })
+
   test('multi-repo workspaceは各memberのHEADとdirty stateを合成しhidden repoを除外する', () => {
     const project = fixtureDir()
     const members = ['backend', 'frontend', 'meeting-app'].map(name => {

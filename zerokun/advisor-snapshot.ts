@@ -4,6 +4,7 @@ import { createHash } from 'crypto'
 import {
   lstatSync,
   openSync,
+  realpathSync,
   closeSync,
   constants,
   fstatSync,
@@ -17,6 +18,17 @@ import {
 } from './project-layout.ts'
 
 const MAX_DIRTY_FILE_BYTES = 64 * 1024 * 1024
+/**
+ * R2 が観測する linked worktree（workspace 配下に作られた隔離作業ツリー）の上限。
+ * 2026-09-17 job d3b85f46: bot が運用規則どおり .worktrees/ の隔離 worktree へ修正を
+ * 保存したのに、観測が primary checkout しか見ず R2 が「fix delta なし」で必ず拒否された。
+ */
+const MAX_LINKED_WORKTREES = 8
+const MAX_LINKED_WORKTREE_DIRTY_PATHS = 512
+// snapshot.dirty 内で linked worktree 由来の項目を分離する接頭辞。
+// 区切りは NUL（ファイルパスに現れない唯一の文字）。
+const LINKED_WORKTREE_KEY_PREFIX = '@worktree\u0000'
+const LINKED_WORKTREE_HEAD_PREFIX = '@worktree-head\u0000'
 const MAX_NON_GIT_ENTRIES = 50_000
 const PROTECTED_COMPONENT = /^(?:\.env.*|.*(?:auth|credential|token|secret).*|sessions|logs|memories)$/i
 
@@ -289,15 +301,48 @@ function repositoryIdentifier(snapshot: AdvisorRepositorySnapshot, gitRoot: stri
   return lexical === '' ? '.' : lexical
 }
 
+/** fileIdentity は inode/時刻を含む。内容が同じままの書き直しは修正ではない。 */
+function normalizeDirtyIdentity(identity: string): string {
+  const parts = identity.split(':')
+  if (parts[0] === 'sha256') return `${parts[0]}:${parts[1]}:${Boolean(Number(parts[2]) & 0o100)}`
+  return identity
+}
+
 /** Compare the reviewed file contents, not checkout status or commit bookkeeping. */
 function reviewPathIdentity(repository: AdvisorGitRepositorySnapshot, path: string): string {
   if (Object.hasOwn(repository.dirty, path)) {
-    const identity = repository.dirty[path]!
-    const parts = identity.split(':')
-    // fileIdentity includes inode/timestamps. Rewriting identical content is not a fix.
-    if (parts[0] === 'sha256') return `${parts[0]}:${parts[1]}:${Boolean(Number(parts[2]) & 0o100)}`
-    return identity
+    return normalizeDirtyIdentity(repository.dirty[path]!)
   }
+  // linked worktree に保存された修正（dirty → worktree HEAD の順・rel 昇順で決定的）。
+  // primary の dirty が無いとき、bot が隔離 worktree へ保存した内容を修正の実体として扱う。
+  const suffix = `\u0000${path}`
+  const worktreeDirtyKeys = Object.keys(repository.dirty)
+    .filter(key => key.startsWith(LINKED_WORKTREE_KEY_PREFIX)
+      && key.endsWith(suffix)
+      && !key.slice(LINKED_WORKTREE_KEY_PREFIX.length, key.length - suffix.length).includes('\u0000'))
+    .sort()
+  if (worktreeDirtyKeys.length > 0) {
+    const identities = [...new Set(
+      worktreeDirtyKeys.map(key => normalizeDirtyIdentity(repository.dirty[key]!)),
+    )]
+    if (identities.length === 1) return identities[0]!
+    // 複数 worktree が同じパスを別内容で持つ場合は決定的な合成値にする（等値比較のみに使う）。
+    return `conflict:${createHash('sha256').update(JSON.stringify(identities)).digest('hex')}`
+  }
+  const worktreeHeads = Object.entries(repository.dirty)
+    .filter(([key]) => key.startsWith(LINKED_WORKTREE_HEAD_PREFIX))
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+  for (const [, value] of worktreeHeads) {
+    if (!value.startsWith('head:')) continue
+    const identity = treeObjectIdentity(repository.gitRoot, value.slice('head:'.length), path)
+    if (identity !== 'missing') return identity
+  }
+  return treeObjectIdentity(repository.gitRoot, repository.head, path)
+}
+
+/** head の tree からファイル内容の同一性を読む（object は不変なので gitRoot から参照できる）。 */
+function treeObjectIdentity(gitRoot: string, head: string, path: string): string {
+  const repository = { gitRoot, head }
   const tree = git(repository.gitRoot, ['--literal-pathspecs', 'ls-tree', '-z', repository.head, '--', path])
   if (!tree) return 'missing'
   const entry = tree.split('\0').find(value => value.slice(value.indexOf('\t') + 1) === path)
@@ -540,6 +585,41 @@ function fileIdentity(
   }
 }
 
+/**
+ * gitRoot の linked worktree のうち workspace root（projectPath）配下にあるものを
+ * 決定的順序で返す。workspace 外の worktree は advisor の読み取り対象を広げないため
+ * 取り込まない。bare・壊れた HEAD・消えた実体は黙って除外する。
+ */
+function linkedWorktreesInside(
+  gitRoot: string,
+  projectPath: string,
+): { path: string, relative: string, head: string }[] {
+  const listed = gitResult(gitRoot, ['worktree', 'list', '--porcelain'])
+  if (listed.exitCode !== 0) return []
+  const results: { path: string, relative: string, head: string }[] = []
+  let realProject: string
+  let realPrimary: string
+  try {
+    realProject = realpathSync(projectPath)
+    realPrimary = realpathSync(gitRoot)
+  } catch { return [] }
+  for (const block of (listed.stdout?.toString() ?? '').split('\n\n')) {
+    const lines = block.split('\n')
+    const pathLine = lines.find(line => line.startsWith('worktree '))
+    const headLine = lines.find(line => line.startsWith('HEAD '))
+    if (!pathLine || !headLine || lines.includes('bare')) continue
+    const head = headLine.slice('HEAD '.length).trim()
+    if (!/^[0-9a-f]{40,64}$/.test(head)) continue
+    let real: string
+    try { real = realpathSync(pathLine.slice('worktree '.length)) } catch { continue }
+    if (real === realPrimary || real === realProject || !contained(realProject, real)) continue
+    results.push({ path: real, relative: relative(realProject, real), head })
+  }
+  return results
+    .sort((left, right) => left.relative < right.relative ? -1 : left.relative > right.relative ? 1 : 0)
+    .slice(0, MAX_LINKED_WORKTREES)
+}
+
 function dirtyPaths(status: string): string[] {
   const entries = status.split('\0')
   const paths: string[] = []
@@ -645,6 +725,28 @@ export function snapshotAdvisorRepository(
         acceptedHardlinks.get(relativePath),
       )
     }
+    // linked worktree（workspace 配下）の保存状態も観測へ含める。
+    // 2026-09-17 job d3b85f46: 隔離 worktree に保存された 9 ファイルの修正が不可視で、
+    // R2 が「host-observed non-empty repository fix delta」を出せず必ず拒否された。
+    // 旧 baseline はこのキーを持たないだけで妥当（スキーマ不変・後方互換）。
+    for (const linked of linkedWorktreesInside(gitRoot, layout.projectPath)) {
+      dirty[`${LINKED_WORKTREE_HEAD_PREFIX}${linked.relative}`] = `head:${linked.head}`
+      const linkedStatus = git(linked.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+      const linkedDirty = dirtyPaths(linkedStatus).sort()
+      for (const relativePath of linkedDirty.slice(0, MAX_LINKED_WORKTREE_DIRTY_PATHS)) {
+        const lexical = resolve(linked.path, relativePath)
+        if (!contained(linked.path, lexical)) {
+          throw new Error('linked worktree status returned a path outside its tree')
+        }
+        const protectedContent = relativePath.split('/').some(value => PROTECTED_COMPONENT.test(value))
+        dirty[`${LINKED_WORKTREE_KEY_PREFIX}${linked.relative}\u0000${relativePath}`]
+          = fileIdentity(lexical, protectedContent)
+      }
+      if (linkedDirty.length > MAX_LINKED_WORKTREE_DIRTY_PATHS) {
+        dirty[`${LINKED_WORKTREE_KEY_PREFIX}${linked.relative}\u0000`]
+          = `overflow:${linkedDirty.length}`
+      }
+    }
     return {
       gitRoot,
       head: git(gitRoot, ['rev-parse', 'HEAD']).trim(),
@@ -659,8 +761,12 @@ export function snapshotAdvisorRepository(
       fileIdentity(path, false),
     ]))
     const dirty: Record<string, string> = {}
-    repositories.forEach((repository, index) => {
-      const namespace = layout.memberNames[index]!
+    repositories.forEach(repository => {
+      // memberNames[index] は projectRepository: true の workspace で必ず 1 つずれる
+      // （gitRoots は root 込み・memberNames は member のみで index が食い違う）。
+      // root の dirty が先頭 member 名義になり、各 member が隣の名義になっていた。
+      // 名前は必ず実パスから引く（root は '.'）。
+      const namespace = relative(layout.projectPath, repository.gitRoot) || '.'
       for (const [path, identity] of Object.entries(repository.dirty)) {
         dirty[`${namespace}/${path}`] = identity
       }
