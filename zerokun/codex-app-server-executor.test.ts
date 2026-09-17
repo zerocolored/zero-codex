@@ -381,6 +381,11 @@ for line in sys.stdin:
                 time.sleep(30)
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
     elif method == "thread/inject_items":
+        if mode == "resume-early-start":
+            goal_status = "active"
+            emit({"method": "thread/goal/updated", "params": {"threadId": requested_thread or thread_id, "goal": {"objective": "fixture task", "status": "active"}}})
+            emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}}})
+            emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "resume-early-plan", "phase": "commentary", "text": "[ZERO_SLACK_UPDATE_BEGIN:PLAN]\\n再開した作業の方針を確認しました\\n[ZERO_SLACK_UPDATE_END:PLAN]"}}})
         emit({"id": request_id, "result": {}})
     elif method == "thread/goal/get":
         emit({"id": request_id, "result": {"goal": None if goal_status is None else {"objective": "fixture task", "status": goal_status}}})
@@ -478,6 +483,13 @@ for line in sys.stdin:
                 {"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}},
                 {"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-coalesced-plan", "phase": "commentary", "text": "[ZERO_SLACK_UPDATE_BEGIN:PLAN]\\n同じ通信で届いた方針を確定しました\\n[ZERO_SLACK_UPDATE_END:PLAN]"}}},
             ])
+        elif mode == "resume-early-start":
+            # Already started during instruction injection, as observed in job193.
+            # The latest explicit input is accepted into that same native turn.
+            emit({"id": request_id, "result": {"turn": active_turn}})
+            user_item = {"id": "latest-user", "type": "userMessage", "content": prompt_items}
+            emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": user_item}})
+            emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": user_item}})
         else:
             emit({"id": request_id, "result": {"turn": active_turn}})
             emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
@@ -708,7 +720,7 @@ for line in sys.stdin:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": items, "error": failure}}})
             elif not hold_for_steer and not hold_for_interjection:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": message}], "error": None}}})
-        elif mode in ("normal", "commentary", "commentary-coalesced", "interjection-late-answer", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
+        elif mode in ("normal", "resume-early-start", "commentary", "commentary-coalesced", "interjection-late-answer", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
             if mode == "slow":
                 time.sleep(0.1)
             if mode == "large-ledger":
@@ -993,7 +1005,7 @@ function fixture(
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
-    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked' | 'goal-proposal'
+    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked' | 'goal-proposal' | 'resume-early-start'
     | 'error-steer' | 'rate-error' | 'rate-terminal-only' | 'rate-retrying' | 'rate-retrying-two-turn'
     | 'capacity-error'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
@@ -2327,6 +2339,40 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 30_000)
   }
+
+  test('resumeの指示注入で先行開始したnative turnへ最新依頼を一度届け正常完了する', async () => {
+    const value = fixture('resume-early-start', false, '追加の条件を反映して続けてください')
+    const rpcLog = join(value.root, 'resume-early-rpc.log')
+    const promptLog = join(value.root, 'resume-early-prompt.log')
+    const statuses: string[] = []
+    const commentary: string[] = []
+    try {
+      const result = await executeCodexJob({ ...value.job, sessionId: 'thread-existing', resumed: true }, {
+        codexBinForTesting: value.executable,
+        logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: {
+          ZERO_FIXTURE_MODE: 'resume-early-start', ZERO_RPC_LOG: rpcLog,
+          ZERO_LOG_HANDSHAKES: '1', ZERO_PROMPT_LOG: promptLog,
+        },
+        liveControls: { ...value.hooks, recordGoalStatus: status => statuses.push(status) },
+        onCommentaryMessage: event => { commentary.push(event.text) },
+      })
+      expect(result.result).toBe('通常完了')
+      expect(result.sessionId).toBe('thread-existing')
+      expect(statuses).toEqual(['active', 'complete'])
+      expect(commentary).toEqual(['💬 再開した作業の方針を確認しました'])
+      const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      expect(rpc.filter(row => row.method === 'thread/resume')).toHaveLength(1)
+      expect(rpc.filter(row => row.method === 'thread/inject_items')).toHaveLength(1)
+      expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(1)
+      expect(rpc.find(row => row.method === 'turn/start').clientUserMessageId).toBe(value.job.idempotencyKey)
+      expect(rpc.filter(row => ['thread/start', 'turn/steer', 'turn/interrupt'].includes(row.method))).toHaveLength(0)
+      const prompts = readFileSync(promptLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0].text).toContain(value.job.task)
+    } finally { value.store.close() }
+  }, 45_000)
 
   for (const mode of ['goal-native', 'goal-blocked'] as const) {
     test(`native goal lifecycle ${mode}`, async () => {

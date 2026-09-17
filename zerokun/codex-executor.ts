@@ -7683,6 +7683,9 @@ export async function executeCodexJob(
         }
         const resumeThreadId = resumed && sessionId ? sessionId : null
         const startedFreshThread = resumeThreadId === null
+        // A resumed native goal may emit progress during instruction injection,
+        // before resumeThread resolves. Its saved identity is already known.
+        monitorParentThreadId = resumeThreadId
         const threadHandshake = resumeThreadId
           ? await session.resumeThread({ threadId: resumeThreadId, ...threadParams })
           : await session.startThread({

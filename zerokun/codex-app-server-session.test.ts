@@ -575,6 +575,69 @@ describe('Codex App Server session', () => {
     }
   })
 
+  test.each([false, true])('要求前の実行中turn開始を同一応答へ結び付け入力を一度送る (応答中完了=%s)', async completesDuringRequest => {
+    const turn = { id: 'native-live', status: 'inProgress', itemsView: 'full', items: [], error: null }
+    const terminal = { method: 'turn/completed', params: { threadId: 'root', turn: {
+      ...turn, status: 'completed', items: [{ type: 'agentMessage', text: '新しい依頼を反映しました' }],
+    } } }
+    const transport = mockTransport((request, emit) => {
+      if (completesDuringRequest) emit(terminal)
+      emit({ id: request.id, result: { turn } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    try {
+      transport.emit({ method: 'turn/started', params: { threadId: 'root', turn } })
+      await Bun.sleep(0)
+      const writes: number[] = []
+      expect(await session.startTurn('root', '最新の依頼', 'new-client-id', {
+        cwd: '/tmp', permissions: 'fixture', approvalPolicy: 'never',
+        model: 'gpt-test', effort: 'low', timeoutMs: 50,
+        beforeWrite: id => { writes.push(id) },
+      })).toBe('native-live')
+      expect(transport.sent).toHaveLength(1)
+      expect(transport.sent[0]).toMatchObject({ method: 'turn/start', params: {
+        threadId: 'root', clientUserMessageId: 'new-client-id',
+        input: [{ type: 'text', text: '最新の依頼' }], model: 'gpt-test', effort: 'low',
+      } })
+      expect(writes).toEqual([transport.sent[0]!.id as number])
+      expect(session.takeNativeTurnStart('root', [])).toBeNull()
+      if (!completesDuringRequest) {
+        transport.emit(terminal)
+        await Bun.sleep(0)
+      }
+      expect(session.takeTurnTerminal('root', 'native-live')?.turn.status).toBe('completed')
+    } finally {
+      session.closeInput()
+      await session.waitForReader()
+    }
+  })
+
+  test.each(['completed', 'foreign-thread', 'different-turn', 'consumed'] as const)(
+    '要求前の開始通知でも古い完了・別対象・消費済みは採用しない (%s)', async mismatch => {
+      const turn = { id: 'native-live', status: 'inProgress', itemsView: 'full', items: [], error: null }
+      const transport = mockTransport((request, emit) => emit({ id: request.id, result: { turn } }))
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      try {
+        transport.emit({ method: 'turn/started', params: {
+          threadId: mismatch === 'foreign-thread' ? 'other' : 'root',
+          turn: mismatch === 'different-turn' ? { ...turn, id: 'other' } : turn,
+        } })
+        if (mismatch === 'completed') transport.emit({ method: 'turn/completed', params: {
+          threadId: 'root', turn: { ...turn, status: 'completed' },
+        } })
+        await Bun.sleep(0)
+        if (mismatch === 'consumed') expect(session.takeNativeTurnStart('root', [])).toBe(turn.id)
+        await expect(session.startTurn('root', '最新の依頼', 'new-client-id', {
+          cwd: '/tmp', permissions: 'fixture', approvalPolicy: 'never', timeoutMs: 10,
+        })).rejects.toBeInstanceOf(AppServerAmbiguousRequestError)
+        expect(transport.sent).toHaveLength(1)
+      } finally {
+        session.closeInput()
+        await session.waitForReader()
+      }
+    },
+  )
+
   test('malformedなcorrelated responseでもpending requestを取り残さない', async () => {
     const transport = mockTransport((request, emit) => {
       emit({ id: request.id, error: 'not-an-object' })
