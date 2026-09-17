@@ -1855,6 +1855,150 @@ describe('Codex App Server session', () => {
     await session.waitForReader()
   })
 
+  test('job188: 次turn中の開始済みcommand遅延完了は結果を混ぜず受信する', async () => {
+    for (const status of ['completed', 'failed', 'interrupted'] as const) {
+      const transport = mockTransport()
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      const threadId = 'thread-late-command'
+      transport.emit({ method: 'turn/started', params: { threadId, turn: {
+        id: 'old', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      transport.emit({ method: 'item/started', params: { threadId, turnId: 'old', item: {
+        type: 'commandExecution', id: 'background-command', status: 'inProgress', command: 'fixture',
+      } } })
+      transport.emit({ method: 'turn/completed', params: { threadId, turn: {
+        id: 'old', status, itemsView: 'full', items: [], error: null,
+      } } })
+      let old = session.takeTurnTerminal(threadId, 'old')
+      while (!old) {
+        await session.waitForActivity(1)
+        old = session.takeTurnTerminal(threadId, 'old')
+      }
+      expect(old?.turn.status).toBe(status)
+      // Exceed the completed-turn tombstone window: pending command identity,
+      // not age or a blanket terminal-turn exception, authorizes the event.
+      for (let i = 0; i < 66; i++) {
+        transport.emit({ method: 'turn/started', params: { threadId, turn: {
+          id: `middle-${i}`, status: 'inProgress', itemsView: 'full', items: [], error: null,
+        } } })
+        transport.emit({ method: 'turn/completed', params: { threadId, turn: {
+          id: `middle-${i}`, status: 'completed', itemsView: 'full', items: [], error: null,
+        } } })
+        while (!session.takeTurnTerminal(threadId, `middle-${i}`)) await session.waitForActivity(1)
+      }
+      transport.emit({ method: 'turn/started', params: { threadId, turn: {
+        id: 'next', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      transport.emit({ method: 'item/completed', params: { threadId, turnId: 'old', item: {
+        type: 'commandExecution', id: 'background-command', status: 'completed', command: 'fixture', exitCode: 0,
+      } } })
+      transport.emit({ method: 'turn/completed', params: { threadId, turn: {
+        id: 'next', status: 'completed', itemsView: 'full', items: [], error: null,
+      } } })
+      session.closeInput()
+      await session.waitForReader()
+      expect(old?.turn.status).toBe(status)
+      expect(old?.permissionEvidence.firstCommand?.status).toBe('inProgress')
+      const next = session.takeTurnTerminal(threadId, 'next')!
+      expect(next.turn.items).toEqual([])
+      expect(next.permissionEvidence.commandCount).toBe(0)
+    }
+  })
+
+  test('未消費terminalの遅延commandもpermission証拠を後から成功へ変えない', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+      id: 'turn', status: 'inProgress', itemsView: 'full', items: [], error: null,
+    } } })
+    transport.emit({ method: 'item/started', params: { threadId: 'thread', turnId: 'turn', item: {
+      type: 'commandExecution', id: 'command', command: 'fixture', status: 'inProgress',
+    } } })
+    transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+      id: 'turn', status: 'failed', itemsView: 'summary', items: [], error: null,
+    } } })
+    transport.emit({ method: 'item/completed', params: { threadId: 'thread', turnId: 'turn', item: {
+      type: 'commandExecution', id: 'command', command: 'fixture', status: 'completed', exitCode: 0,
+    } } })
+    session.closeInput()
+    await session.waitForReader()
+    const terminal = session.takeTurnTerminal('thread', 'turn')!
+    expect(terminal.turn.status).toBe('failed')
+    expect(terminal.permissionEvidence.firstCommand?.status).toBe('inProgress')
+    expect(terminal.permissionEvidence.firstCommand?.exitCode).toBeNull()
+  })
+
+  test('commandの保留上限は通常完了と遅延完了で解放される', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    for (let round = 0; round < 2; round++) {
+      const turnId = `turn-${round}`
+      transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+        id: turnId, status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      for (let i = 0; i < 4096; i++) transport.emit({ method: 'item/started', params: {
+        threadId: 'thread', turnId, item: { type: 'commandExecution', id: `command-${i}`, status: 'inProgress', command: 'fixture' },
+      } })
+      if (round === 0) transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+        id: turnId, status: 'completed', itemsView: 'full', items: [], error: null,
+      } } })
+      for (let i = 0; i < 4096; i++) transport.emit({ method: 'item/completed', params: {
+        threadId: 'thread', turnId, item: { type: 'commandExecution', id: `command-${i}`, status: 'completed', exitCode: 1, command: 'fixture' },
+      } })
+    }
+    session.closeInput()
+    await session.waitForReader()
+  })
+
+  test('保留commandが残るturn IDは墓標の期限後も再利用しない', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    for (let i = 0; i < 66; i++) {
+      transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+        id: `turn-${i}`, status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      if (i === 0) transport.emit({ method: 'item/started', params: {
+        threadId: 'thread', turnId: 'turn-0', item: { type: 'commandExecution', id: 'pending', status: 'inProgress', command: 'fixture' },
+      } })
+      transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+        id: `turn-${i}`, status: 'completed', itemsView: 'full', items: [], error: null,
+      } } })
+      while (!session.takeTurnTerminal('thread', `turn-${i}`)) await session.waitForActivity(1)
+    }
+    transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+      id: 'turn-0', status: 'inProgress', itemsView: 'full', items: [], error: null,
+    } } })
+    transport.close()
+    await expect(session.waitForReader()).rejects.toThrow('reused a completed turn id')
+  })
+
+  test('遅延commandは別thread・turn・item・typeと二重完了を受け入れない', async () => {
+    for (const mismatch of ['thread', 'turn', 'item', 'type', 'duplicate']) {
+      const transport = mockTransport()
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+        id: 'turn', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      transport.emit({ method: 'item/started', params: { threadId: 'thread', turnId: 'turn', item: {
+        type: 'commandExecution', id: 'command', command: 'fixture', status: 'inProgress',
+      } } })
+      transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+        id: 'turn', status: 'completed', itemsView: 'full', items: [], error: null,
+      } } })
+      const completion = { method: 'item/completed', params: {
+        threadId: mismatch === 'thread' ? 'other' : 'thread',
+        turnId: mismatch === 'turn' ? 'other' : 'turn', item: {
+          type: mismatch === 'type' ? 'agentMessage' : 'commandExecution',
+          id: mismatch === 'item' ? 'other' : 'command', status: 'completed', exitCode: 0,
+        },
+      } }
+      transport.emit(completion)
+      if (mismatch === 'duplicate') transport.emit(completion)
+      transport.close()
+      await expect(session.waitForReader()).rejects.toThrow('before turn/started')
+    }
+  })
+
   test('terminal後の通常itemとstarted無しのsubAgentActivityは拒否する', async () => {
     const lateCommand = mockTransport()
     const first = new CodexAppServerSession(lateCommand.input, lateCommand.stream)
