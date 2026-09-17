@@ -367,10 +367,10 @@ for line in sys.stdin:
     request_id = value.get("id")
     rpc_log = os.environ.get("ZERO_RPC_LOG")
     log_handshakes = os.environ.get("ZERO_LOG_HANDSHAKES") == "1"
-    if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume"))):
+    if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume", "thread/inject_items"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback")}, ensure_ascii=False) + "\\n")
+            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
     if method == "initialized":
         continue
     if method == "initialize":
@@ -380,6 +380,8 @@ for line in sys.stdin:
             while True:
                 time.sleep(30)
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
+    elif method == "thread/inject_items":
+        emit({"id": request_id, "result": {}})
     elif method == "thread/goal/get":
         emit({"id": request_id, "result": {"goal": None if goal_status is None else {"objective": "fixture task", "status": goal_status}}})
     elif method == "thread/goal/set":
@@ -2454,7 +2456,8 @@ describe('production App Server executor', () => {
       },
     })
     expect(rpc[0]?.allowProviderModelFallback).toBeNull()
-    expect(rpc[1]).toMatchObject({
+    expect(rpc[1]).toMatchObject({ method: 'thread/inject_items', currentInstructions: true })
+    expect(rpc[2]).toMatchObject({
       method: 'turn/start',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
@@ -2790,6 +2793,9 @@ describe('production App Server executor', () => {
     expect(rpc.filter(entry => entry.method === 'thread/start')).toHaveLength(0)
     expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(1)
     expect(rpc.find(entry => entry.method === 'thread/resume')).toMatchObject({ excludeTurns: true })
+    expect(rpc.find(entry => entry.method === 'thread/inject_items')).toMatchObject({ currentInstructions: true })
+    expect(rpc.findIndex(entry => entry.method === 'thread/inject_items'))
+      .toBeLessThan(rpc.findIndex(entry => entry.method === 'turn/start'))
     expect(rpc.filter(entry => entry.method === 'turn/start')).toHaveLength(1)
     const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
       .map(line => JSON.parse(line) as { stage: string; text: string })
