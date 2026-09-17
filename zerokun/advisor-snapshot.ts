@@ -660,12 +660,15 @@ export function snapshotAdvisorRepository(
       fileIdentity(path, false),
     ]))
     const dirty: Record<string, string> = {}
-    repositories.forEach((repository, index) => {
-      const namespace = layout.memberNames[index]!
+    for (const repository of repositories) {
+      // memberNames excludes a project-root repository, so index alignment with
+      // gitRoots breaks for projectRepository workspaces. Derive the namespace
+      // from the real path like repositoryIdentifier ('.' = the root itself).
+      const namespace = relative(layout.projectPath, repository.gitRoot) || '.'
       for (const [path, identity] of Object.entries(repository.dirty)) {
         dirty[`${namespace}/${path}`] = identity
       }
-    })
+    }
     return {
       version: 2,
       projectPath: layout.projectPath,
