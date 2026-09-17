@@ -1180,7 +1180,8 @@ print('review complete')
     })
     expect(observed).toMatchObject({
       complete: false,
-      waitingForAdvisors: true,
+      waitingForAdvisors: false,
+      attemptsFinished: true,
       alreadyObserved: true,
       phase: 'investigation',
       round: 1,
@@ -1411,7 +1412,7 @@ print('review complete')
     }
   }, 15_000)
 
-  test('外部model起動未確認とnative未起動は3枠未取得のまま未完了にする', async () => {
+  test('回答0件を正確に保持し試行終了後は主処理へ待機を要求しない', async () => {
     const fixture = await brokerFixture()
     try {
       const { result, payload } = await fixture.call(
@@ -1421,6 +1422,8 @@ print('review complete')
       expect(payload).toMatchObject({
         complete: false,
         allAdopted: false,
+        waitingForAdvisors: false,
+        attemptsFinished: true,
         advisorUnavailable: expect.any(Array),
         slotSummary: {
           total: 3,
