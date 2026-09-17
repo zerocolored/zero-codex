@@ -75,9 +75,13 @@ describe('Codex App Server session', () => {
     session.closeInput()
     await session.waitForReader()
   })
-  test('長い会話のresumeは履歴本体の返却だけを省略し同じthreadへ接続する', async () => {
+  test.each([undefined, 'Current policy: unavailable advisors do not block the primary task.'])('長い会話のresumeは履歴を保持し現在のdeveloper指示を反映する (%s)', async developerInstructions => {
     const repo = mkdtempSync(join(tmpdir(), 'zero-resume-metadata-'))
     const transport = mockTransport((request, emit) => {
+      if (request.method === 'thread/inject_items') {
+        emit({ id: request.id, result: {} })
+        return
+      }
       if (request.method !== 'thread/resume') return
       emit({ id: request.id, result: {
         thread: {
@@ -94,15 +98,49 @@ describe('Codex App Server session', () => {
       const result = await session.resumeThread({
         threadId: 'existing-thread', cwd: repo, permissions: 'profile-1',
         approvalPolicy: 'never', model: 'gpt-test', excludeTurns: false,
+        developerInstructions,
         config: { model_reasoning_effort: 'xhigh' },
       })
       expect(result.threadId).toBe('existing-thread')
-      expect(transport.sent).toHaveLength(1)
+      expect(transport.sent).toHaveLength(developerInstructions ? 2 : 1)
       expect(transport.sent[0]).toMatchObject({ method: 'thread/resume', params: {
         threadId: 'existing-thread', excludeTurns: true, cwd: repo, permissions: 'profile-1',
         model: 'gpt-test', config: { model_reasoning_effort: 'xhigh' },
       } })
       expect(result.reasoningEffort).toBe('xhigh')
+      if (developerInstructions) {
+        expect(transport.sent[1]).toMatchObject({ method: 'thread/inject_items', params: {
+          threadId: 'existing-thread',
+          items: [{ type: 'message', role: 'developer',
+            content: [{ type: 'input_text', text: developerInstructions }] }],
+        } })
+      }
+    } finally {
+      session.closeInput()
+      await session.waitForReader()
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  test('resume応答が別threadなら現在の指示を送信しない', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'zero-resume-target-'))
+    const transport = mockTransport((request, emit) => {
+      emit({ id: request.id, result: {
+        thread: { id: 'foreign-thread', cwd: repo, source: 'appServer', modelProvider: 'openai',
+          status: { type: 'idle' }, canAcceptDirectInput: true, turns: [] },
+        model: 'gpt-test', reasoningEffort: 'low', modelProvider: 'openai', cwd: repo,
+        approvalPolicy: 'never', activePermissionProfile: { id: 'profile-1', extends: null },
+        instructionSources: [],
+      } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    try {
+      await expect(session.resumeThread({
+        threadId: 'owned-thread', cwd: repo, permissions: 'profile-1',
+        approvalPolicy: 'never', model: 'gpt-test', config: { model_reasoning_effort: 'low' },
+        developerInstructions: 'Current trusted instructions',
+      })).rejects.toThrow('different thread id')
+      expect(transport.sent.map(request => request.method)).toEqual(['thread/resume'])
     } finally {
       session.closeInput()
       await session.waitForReader()

@@ -1125,6 +1125,18 @@ export class CodexAppServerSession {
       ...params, excludeTurns: true,
     }, { timeoutMs })
     const handshake = this.threadHandshake('thread/resume', response.result, params)
+    if (typeof params.developerInstructions === 'string' && params.developerInstructions.trim()) {
+      // Resume configuration alone does not replace developer messages already
+      // stored in model-visible history. Append the current trusted instructions
+      // before the next user turn, retaining the conversation and its evidence.
+      await this.request('thread/inject_items', {
+        threadId: handshake.threadId,
+        items: [{
+          type: 'message', role: 'developer',
+          content: [{ type: 'input_text', text: params.developerInstructions }],
+        }],
+      }, { timeoutMs })
+    }
     this.controlledThreadIds.add(handshake.threadId)
     return handshake
   }
