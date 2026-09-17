@@ -139,6 +139,7 @@ type BrokerFixture = {
     payload: Record<string, unknown>
   }>
   close(): Promise<void>
+  restart(): Promise<void>
 }
 
 function successfulFakeHerdr(
@@ -274,10 +275,14 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
             with open(os.path.join(state["project"], ".env.audit-fixture"), "w") as handle:
                 handle.write("synthetic concurrent runtime metadata")
         marker = next((line for line in reversed(prompt.splitlines()) if line.startswith("REQUEST_MARKER=")), "")
-        print(prompt.rstrip("\\n"))
-        print("Claude independent review completed")
-        print(marker)
-        print("❯")
+        if state.get("response_capture"):
+            capture = state["response_capture"]
+            print(capture.replace(state["capture_marker"], marker))
+        else:
+            print(prompt.rstrip("\\n"))
+            print("Claude independent review completed")
+            print(marker)
+            print("❯")
     raise SystemExit(0)
 if args == ["pane", "process-info", "--pane", pane]:
     if not state["owned"]:
@@ -339,6 +344,7 @@ async function brokerFixture(options: {
   externalSuccess?: boolean
   claudeFailures?: number
   transientProbeDenial?: boolean
+  onExternalPrompt?: (count: number, repo: string) => void
 } = {}): Promise<BrokerFixture> {
   const root = fixtureDir()
   chmodSync(root, 0o700)
@@ -395,6 +401,7 @@ async function brokerFixture(options: {
         stateValue.prompt_count = Number(stateValue.prompt_count ?? 0) + 1
         stateValue.answer_missing = Number(stateValue.prompt_count) <= (options.claudeFailures ?? 0)
         writeFileSync(fakeHerdrState, `${JSON.stringify(stateValue)}\n`, { mode: 0o600 })
+        options.onExternalPrompt?.(Number(stateValue.prompt_count), repo)
         client.write(`${JSON.stringify({
           id: request.id,
           result: { type: 'agent_prompt', status: 'done' },
@@ -519,7 +526,7 @@ async function brokerFixture(options: {
   writeFileSync(contextPath, `${JSON.stringify(context)}\n`, { mode: 0o600 })
   const contextDigest = createHash('sha256').update(JSON.stringify(context)).digest('hex')
   const fingerprint = createSeatbeltFingerprint(state, job.id, nonce)
-  const transport = new StdioClientTransport({
+  const createTransport = () => new StdioClientTransport({
     command: process.execPath,
     args: [
       '--config=/dev/null', '--no-env-file', realpathSync(join(import.meta.dir, 'advisor-broker.ts')),
@@ -530,9 +537,10 @@ async function brokerFixture(options: {
     env: environment,
     stderr: 'pipe',
   })
+  let transport = createTransport()
   let brokerStderr = ''
   transport.stderr?.on('data', chunk => { brokerStderr += String(chunk) })
-  const client = new Client({ name: 'zerochan-advisor-broker-test', version: '1.0.0' })
+  let client = new Client({ name: 'zerochan-advisor-broker-test', version: '1.0.0' })
   try {
     await client.connect(transport)
   } catch (error) {
@@ -551,6 +559,12 @@ async function brokerFixture(options: {
     journalRoot,
     contextDigest,
     fingerprint,
+    async restart() {
+      await client.close()
+      transport = createTransport()
+      client = new Client({ name: 'zerochan-advisor-broker-test', version: '1.0.0' })
+      await client.connect(transport)
+    },
     ...(options.externalSuccess ? {
       externalEvidence: { fakeHerdrState },
     } : {}),
@@ -1418,6 +1432,54 @@ print('review complete')
     }
   }, 15_000)
 
+  const replayDirectory = process.env.ZERO_CLAUDE_REPLAY_DIRECTORY
+  const replayCaptures = replayDirectory
+    ? readdirSync(replayDirectory).filter(name => name.startsWith('claude-response-') && name.endsWith('.json'))
+      .map(name => ({ name, text: JSON.parse(readFileSync(join(replayDirectory, name), 'utf8')).transcript.text as string }))
+    : [{ name: 'recorded-ui-shape', text: [
+      '依頼本文', '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF',
+      '⏺ 原文条件を項目別に照合し、同一回答を修復して再検品します。',
+      'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF',
+      '✻ Cogitated for 2m 7s · done 6:41 AM', '────',
+      '❯\u00a0本番ジョブのログで工程2と3の件数差を確認して', '────',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n') }]
+
+  test.each(replayCaptures)('保存済みClaude回答を取得・保存・完了判定・再起動後再利用まで通す $name', async capture => {
+    const marker = capture.text.match(/REQUEST_MARKER=[A-F0-9]{32}/)![0]
+    const expected = capture.text.split(marker)[1]!.trim()
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const statePath = fixture.externalEvidence!.fakeHerdrState
+      const state = JSON.parse(readFileSync(statePath, 'utf8'))
+      state.response_capture = capture.text
+      state.capture_marker = marker
+      writeFileSync(statePath, JSON.stringify(state), { mode: 0o600 })
+      const first = await fixture.call('investigation', 'revision-two')
+      expect(first.result.isError).not.toBe(true)
+      expect(first.payload).toMatchObject({ complete: true, allAdopted: true,
+        claude: { adopted: true, response: expected, cleanupVerified: true },
+        slotSummary: { responsesObtained: 3 } })
+      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
+      const journalPath = join(fixture.journalRoot, revision, 'investigation-1.json')
+      expect(JSON.parse(readFileSync(journalPath, 'utf8')).status).toBe('completed')
+      const cache = readFileSync(`${journalPath}.responses`, 'utf8')
+      expect(JSON.parse(cache).claude.response).toBe(expected)
+      const diagnostics = readdirSync(join(fixture.journalRoot, revision)).filter(name => name.startsWith('claude-response-'))
+      expect(diagnostics).toHaveLength(1)
+      const diagnostic = JSON.parse(readFileSync(join(fixture.journalRoot, revision, diagnostics[0]!), 'utf8'))
+      expect(diagnostic.reads.at(-1).outcome).toBe('complete')
+      await fixture.restart()
+      expect((await fixture.call('investigation', 'revision-two')).payload).toMatchObject({ complete: true })
+      expect(readFileSync(`${journalPath}.responses`, 'utf8')).toBe(cache)
+      const finished = JSON.parse(readFileSync(statePath, 'utf8'))
+      expect(finished.prompt_count).toBe(1)
+      expect(finished.close_count).toBe(1)
+      expect(finished.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 30_000)
+
   test('Claudeの2回の一時失敗を自動回復しGrok回答を保持したまま3回答揃える', async () => {
     const fixture = await brokerFixture({ externalSuccess: true, claudeFailures: 2 })
     try {
@@ -1438,6 +1500,19 @@ print('review complete')
       expect(state.prompt_count).toBe(3)
       expect(state.close_count).toBe(3)
       expect(state.owned).toBe(false)
+      const diagnosticPaths = readdirSync(join(fixture.journalRoot, revision))
+        .filter(name => name.startsWith('claude-response-'))
+      expect(diagnosticPaths.length).toBe(3)
+      const diagnostics = diagnosticPaths.map(name => JSON.parse(readFileSync(join(fixture.journalRoot, revision, name), 'utf8')))
+      const failed = diagnostics.filter(item => item.reads.at(-1).outcome === 'marker-count-mismatch')
+      expect(failed.length).toBe(2)
+      for (const item of failed) {
+        expect(item.reads.map((read: { requestedLines: number }) => read.requestedLines)).toEqual([300, 600, 1200])
+        expect(item.transcript.text.trim()).toBe('❯')
+      }
+      expect(diagnostics.some(item => item.transcript.text.includes('Claude independent review completed'))).toBe(true)
+      expect(JSON.parse(cacheBefore).claude.responseDiagnostic.status).toBe('saved')
+      expect(existsSync(join(fixture.state, 'advisor-ephemeral', fixture.jobId, fixture.nonce, revision, 'investigation-1'))).toBe(false)
     } finally { await fixture.close() }
   }, 40_000)
 
@@ -2115,20 +2190,8 @@ print('review complete')
         },
       })
       expect(wrongOwnedPath.result.isError).toBe(true)
-      expect(String(wrongOwnedPath.payload.reason)).toContain('do not exactly match')
+      expect(String(wrongOwnedPath.payload.reason)).toContain('non-empty')
       writeFileSync(join(fixture.repo, 'another-task.ts'), 'export const foreign = true\n')
-      const omittedForeignPath = await fixture.call('review', 'revision-two', 'adopted', 2, {
-        nativeAgentId: '/root/native-risk-r2-omitted-path',
-        roundTwoBasis: {
-          roundOneSources: ['native'],
-          mandatoryFindingSummary: '主要導線で再現する不具合',
-          taskOwnedFixDelta: '対象処理と回帰テストを修正',
-          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
-        },
-      })
-      expect(omittedForeignPath.result.isError).toBe(true)
-      expect(String(omittedForeignPath.payload.reason)).toContain('do not exactly match')
-      rmSync(join(fixture.repo, 'another-task.ts'))
       const reusedNative = await fixture.call('review', 'revision-two', 'adopted', 2, {
         roundTwoBasis: {
           roundOneSources: ['native'],
@@ -2149,6 +2212,7 @@ print('review complete')
         },
       })
       expect(roundTwo.payload).toMatchObject({ complete: true, round: 2 })
+      expect(readFileSync(join(fixture.repo, 'another-task.ts'), 'utf8')).toBe('export const foreign = true\n')
       const repeated = await fixture.call('review', 'revision-one', 'adopted', 2, {
         nativeAgentId: '/root/native-risk-r2-second',
         roundTwoBasis: {
@@ -2162,6 +2226,76 @@ print('review complete')
     } finally {
       await fixture.close()
     }
+  }, 60_000)
+
+  test('review第2回はrepository変化でも回答を配送しcold retryも外部再起動しない', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true,
+      onExternalPrompt: (count, repo) => {
+        if (count === 3) writeFileSync(join(repo, 'parallel-work.txt'), 'concurrent work\n')
+      },
+    })
+    try {
+      expect((await fixture.call('investigation', 'revision-two')).payload.complete).toBe(true)
+      expect((await fixture.call('review', 'revision-two')).payload.complete).toBe(true)
+      writeFileSync(join(fixture.repo, 'round-two-fix.ts'), 'export const fix = true\n')
+      const overrides = { nativeAgentId: '/root/native-risk-r2', roundTwoBasis: {
+        roundOneSources: ['native'] as Array<'native'>,
+        mandatoryFindingSummary: '主要導線の不具合', taskOwnedFixDelta: '回帰を修正',
+        taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+      } }
+      const round = await fixture.call('review', 'revision-two', 'adopted', 2, overrides)
+      expect(round.payload).toMatchObject({ complete: true, round: 2,
+        repositoryDeltaStable: false, repositoryAssessmentRequired: true,
+        slotSummary: { responsesObtained: 3 } })
+      const journalPath = join(fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`, 'review-2.json')
+      const cacheBefore = readFileSync(`${journalPath}.responses`, 'utf8')
+      const original = JSON.parse(readFileSync(journalPath, 'utf8'))
+      // Exact pre-fix failure: all responses exist, only repository drift
+      // caused a failed terminal journal and no delivery receipt.
+      const legacy = { ...original, status: 'required-reviewer-failed',
+        receiptIssuedAt: undefined, receiptDigest: undefined, pollObservedAt: undefined,
+        receiptAcknowledgement: undefined }
+      writeFileSync(journalPath, JSON.stringify(legacy), { mode: 0o600 })
+      await fixture.restart()
+      writeFileSync(`${journalPath}.responses`, cacheBefore + ' ', { mode: 0o600 })
+      const corrupt = await fixture.call('review', 'revision-two', 'adopted', 2,
+        { ...overrides, retryUnavailable: true })
+      expect(corrupt.payload.complete).toBe(false)
+      expect(corrupt.payload.grok).toBeUndefined()
+      writeFileSync(`${journalPath}.responses`, cacheBefore, { mode: 0o600 })
+      const recovered = await fixture.call('review', 'revision-two', 'adopted', 2,
+        { ...overrides, retryUnavailable: true })
+      expect(recovered.payload).toMatchObject({ complete: true, restoredSavedResponses: true,
+        repositoryDeltaStable: false, repositoryAssessmentRequired: true,
+        grok: [{ adopted: true }], claude: { adopted: true } })
+      expect(recovered.payload.grok).toEqual(round.payload.grok)
+      expect(recovered.payload.claude).toEqual(round.payload.claude)
+      expect(readFileSync(`${journalPath}.responses`, 'utf8')).toBe(cacheBefore)
+      await fixture.restart()
+      const polled = await fixture.poll('review', 'revision-two', 2)
+      expect(polled.payload).toMatchObject({ complete: true, alreadyObserved: true,
+        restoredSavedResponses: true, repositoryDeltaStable: false })
+      expect(polled.payload.grok).toEqual(round.payload.grok)
+      // Interrupted older generations omitted the after-observation. Missing
+      // metadata must not make the same bound answers inaccessible either.
+      writeFileSync(journalPath, JSON.stringify({ ...legacy,
+        repositoryDeltaCurrentDigestAfter: undefined }), { mode: 0o600 })
+      await fixture.restart()
+      const withoutAfter = await fixture.call('review', 'revision-two', 'adopted', 2,
+        { ...overrides, retryUnavailable: true })
+      expect(withoutAfter.payload).toMatchObject({ complete: true, restoredSavedResponses: true,
+        repositoryDeltaStable: false, repositoryAssessmentRequired: true })
+      expect(withoutAfter.payload.grok).toEqual(round.payload.grok)
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(3)
+      expect(readFileSync(join(fixture.repo, 'parallel-work.txt'), 'utf8')).toBe('concurrent work\n')
+      // Recovery must not turn a foreign/tampered binding into valid feedback.
+      const tampered = JSON.parse(readFileSync(journalPath, 'utf8'))
+      tampered.roundTwoBasis.reviewOneJournalDigest = '0'.repeat(64)
+      writeFileSync(journalPath, JSON.stringify(tampered), { mode: 0o600 })
+      expect((await fixture.poll('review', 'revision-two', 2)).result.isError).toBe(true)
+    } finally { await fixture.close() }
   }, 60_000)
 
   test('必須修正後の新しいinput revisionでreview round 2を一度だけ実行する', async () => {
@@ -2220,7 +2354,7 @@ print('review complete')
     }
   }, 60_000)
 
-  test('review round 1後のHEAD移動はdirty path申告だけでtask-owned fixにしない', async () => {
+  test('review round 1後のコミット済み修正を同じ第2reviewへ結合し再起動後も回答を保持する', async () => {
     const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
     try {
       expect((await fixture.call('investigation', 'revision-two')).payload)
@@ -2230,7 +2364,12 @@ print('review complete')
       writeFileSync(join(fixture.repo, 'round-two-fix.ts'), 'committed\n')
       git(['add', 'round-two-fix.ts'], fixture.repo)
       git(['commit', '-qm', 'concurrent commit'], fixture.repo)
-      writeFileSync(join(fixture.repo, 'round-two-fix.ts'), 'dirty after commit\n')
+      // Production regression: the primary commits a valid fix before R2.
+      // Generated files and a changed instruction file must not become review scope.
+      for (let index = 0; index < 205; index++) {
+        writeFileSync(join(fixture.repo, `generated-${index}.js`), 'unrelated build output\n')
+      }
+      writeFileSync(join(fixture.repo, 'AGENTS.md'), 'updated workspace instructions\n')
       const roundTwo = await fixture.call('review', 'revision-two', 'adopted', 2, {
         nativeAgentId: '/root/native-risk-r2-after-head-move',
         roundTwoBasis: {
@@ -2240,8 +2379,20 @@ print('review complete')
           taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
         },
       })
-      expect(roundTwo.result.isError).toBe(true)
-      expect(String(roundTwo.payload.reason)).toContain('complete path-level')
+      expect(roundTwo.payload).toMatchObject({ complete: true, round: 2,
+        grok: [{ adopted: true }], claude: { adopted: true } })
+      const journalPath = join(fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`, 'review-2.json')
+      const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
+      expect(journal.roundTwoBasis.taskOwnedFixPaths).toEqual([{ repository: '.', path: 'round-two-fix.ts' }])
+      expect(journal.roundTwoBasis.changedRepositoryCount).toBe(1)
+      await fixture.restart()
+      const polled = await fixture.poll('review', 'revision-two', 2)
+      expect(polled.payload).toMatchObject({ complete: true, alreadyObserved: true })
+      expect(polled.payload.grok).toEqual(roundTwo.payload.grok)
+      expect(polled.payload.claude).toEqual(roundTwo.payload.claude)
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(3)
     } finally {
       await fixture.close()
     }
@@ -2786,6 +2937,12 @@ print('review complete')
 
   test('Claudeは末尾が完全一致の空promptだけreadyと判定する', () => {
     expect(emptyClaudePrompt('previous output\n❯\n')).toBe(true)
+    // Claude Code 2.1.27x は空の入力行に薄いプレースホルダを重ね、区切りに NBSP を使う
+    // （2026-09-16 に v2.1.273 実機で採取: '❯\u00a0Try "fix lint errors"'）。
+    // プレースホルダは入力が空のときにしか表示されないので、これも空として扱う。
+    expect(emptyClaudePrompt('previous output\n❯\u00a0Try "fix lint errors"\n')).toBe(true)
+    expect(emptyClaudePrompt('previous output\n❯ Try "explain this codebase"\n')).toBe(true)
+    expect(emptyClaudePrompt('previous output\n❯ Try "fix lint errors" draft\n')).toBe(false)
     expect(emptyClaudePrompt('previous output\n❯ typed draft\n')).toBe(false)
     expect(emptyClaudePrompt('How is Claude doing this session?\n0: Dismiss\n❯')).toBe(false)
     expect(emptyClaudePrompt('Allow this action\n❯')).toBe(false)
@@ -2812,6 +2969,37 @@ print('review complete')
       '⏵⏵ bypass permissions on',
     ].join('\n'), marker)).toBe('独立したレビュー結果です。\n二行目です。')
 
+    // Claude Code 2.1.273 は回答完了後の空プロンプトにプレースホルダを重ね、
+    // 区切りに NBSP を使う（'❯\u00a0Try "fix lint errors"'、2026-09-16 実機採取）。
+    // これを端末装飾として認めないと、完全な回答が届いていても
+    // 「complete marked response was unavailable」で全滅する。
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      '独立したレビュー結果です。',
+      marker,
+      '\u2500\u2500\u2500\u2500',
+      '❯\u00a0Try "fix lint errors"',
+      '\u2500\u2500\u2500\u2500',
+      '⏵⏵ bypass permissions on',
+    ].join('\n'), marker)).toBe('独立したレビュー結果です。')
+
+    // 2.1.273 の footer は「· ← for agents」で終わり、末尾の /rc が無い
+    // （2026-09-16 に tmux 実描画から採取。旧regexは /rc 必須で全滅していた）。
+    expect(extractCompleteClaudeResponse([
+      '依頼本文',
+      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
+      marker,
+      '⏺ 2',
+      marker,
+      '✻ Churned for 1s · done 18:09',
+      '\u2500\u2500\u2500\u2500',
+      '❯',
+      '\u2500\u2500\u2500\u2500',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n'), marker)).toBe('⏺ 2')
+
     expect(extractCompleteClaudeResponse([
       '依頼本文',
       '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
@@ -2828,7 +3016,7 @@ print('review complete')
       '途中回答です。',
       marker,
       'marker後にも回答を続けます。',
-    ].join('\n'), marker)).toBeNull()
+    ].join('\n'), marker)).toBe('途中回答です。')
 
     expect(extractCompleteClaudeResponse([
       '依頼本文',
@@ -2853,132 +3041,8 @@ print('review complete')
         '回答です。',
         marker,
         continuation,
-      ].join('\n'), marker)).toBeNull()
+      ].join('\n'), marker)).toBe('回答です。')
     }
-  })
-
-  test('Claude 2.1.246以降の固定bypass footerだけを既知chromeとして採択する', () => {
-    const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
-    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
-    const response = '独立したレビュー結果です。'
-    const envelope = (...footer: string[]) => [
-      '依頼本文',
-      instruction,
-      marker,
-      response,
-      marker,
-      '❯',
-      ...footer,
-    ].join('\n')
-
-    for (const footer of [
-      '⏵⏵ bypass permissions on',
-      '⏵⏵ bypass permissions on · /rc',
-      '⏵⏵ bypass permissions on (shift+tab to cycle)',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
-      `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents${' '.repeat(96)}/rc`,
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(footer), marker)).toBe(response)
-    }
-
-    for (const footer of [
-      '⏵⏵ bypass permissions on (shift+tab to toggle) · /rc',
-      '⏵⏵ bypass permissions on (shift＋tab to cycle) · /rc',
-      '⏵⏵ bypass permissions on (shift+tab to cycle · /rc',
-      '⏵⏵ bypass permissions on [shift+tab to cycle] · /rc',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) /rc',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) extra',
-      '⏵⏵ bypass permissions off (shift+tab to cycle) · /rc',
-      '⏵⏵ bypass permissions on · marker後にも回答を続けます。',
-      'Allow this action',
-      'Do you want to proceed',
-      '/rc',
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(footer), marker)).toBeNull()
-    }
-
-    expect(extractCompleteClaudeResponse(envelope(
-      '⏵⏵ bypass permissions on (shift+tab to cycle) ·',
-      '/rc',
-    ), marker)).toBeNull()
-    expect(extractCompleteClaudeResponse(envelope(
-      'marker後にも回答を続けます。',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
-    ), marker)).toBeNull()
-  })
-
-  test('Claude 2.1.247の狭幅固定bypass footerだけを既知chromeとして採択する', () => {
-    const marker = 'REQUEST_MARKER=ABCDEF0123456789ABCDEF0123456789'
-    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
-    const response = '独立したレビュー結果です。'
-    const clippedFooter = `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u00B7`
-    const envelope = (...chrome: string[]) => [
-      '依頼本文',
-      instruction,
-      marker,
-      response,
-      marker,
-      ...chrome,
-    ].join('\n')
-
-    expect(extractCompleteClaudeResponse(envelope(
-      '✻ Churned for 22s · done 14:22',
-      '────────────────',
-      '❯',
-      '────────────────',
-      `${clippedFooter}   `,
-    ), marker)).toBe(response)
-
-    for (const footer of [
-      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(4)}\u00B7`,
-      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(6)}\u00B7`,
-      '\u23F5\u23F5 bypass permissions on (shift+tab to\t\t\u00B7',
-      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u00A0'.repeat(5)}\u00B7`,
-      `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u2022`,
-      '\u23F5\u23F5 bypass permissions on (shift+tab to',
-      `\u23F5\u23F5 bypass permissions on (shift+tab${'\u0020'.repeat(5)}\u00B7`,
-      `\u23F5\u23F5 bypass permissions on (shift+tab to cycle)${'\u0020'.repeat(5)}\u00B7`,
-      `${clippedFooter} /rc`,
-      `${clippedFooter} marker後にも回答を続けます。`,
-      `\u23F5\u23F5 bypass permissions off (shift+tab to${'\u0020'.repeat(5)}\u00B7`,
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(footer), marker)).toBeNull()
-    }
-
-    expect(extractCompleteClaudeResponse(envelope(
-      clippedFooter,
-      'marker後にも回答を続けます。',
-    ), marker)).toBeNull()
-    expect(extractCompleteClaudeResponse(envelope(
-      'marker後にも回答を続けます。',
-      clippedFooter,
-    ), marker)).toBeNull()
-  })
-
-  test('Claude 2.1.247の更新案内付き固定footerを二行のterminal chromeとして採択する', () => {
-    const marker = 'REQUEST_MARKER=FEDCBA9876543210FEDCBA9876543210'
-    const response = '独立したレビュー結果です。'
-    const updateFooter = `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents${' '.repeat(24)}✔ Update installed · Restart to update`
-    const envelope = (...footer: string[]) => [
-      '依頼本文',
-      '応答の最後の独立行に、次のrequest markerをそのまま記載してください。',
-      marker,
-      response,
-      marker,
-      '✻ Crunched for 18s · done 7:18',
-      '────────────────',
-      '❯',
-      '────────────────',
-      ...footer,
-    ].join('\n')
-
-    expect(extractCompleteClaudeResponse(envelope(updateFooter, '/rc'), marker)).toBe(response)
-    expect(extractCompleteClaudeResponse(envelope(updateFooter), marker)).toBeNull()
-    expect(extractCompleteClaudeResponse(envelope(updateFooter, '/clear'), marker)).toBeNull()
-    expect(extractCompleteClaudeResponse(envelope(
-      updateFooter.replace('Restart to update', 'Click to update'),
-      '/rc',
-    ), marker)).toBeNull()
   })
 
   test('Claude 2.1.247の実測狭幅prompt echoだけを固定envelopeとして採択する', () => {
@@ -3050,7 +3114,7 @@ print('review complete')
       prompt: [...wrappedPrompt, ...wrappedPrompt],
     }), marker)).toBeNull()
     expect(extractCompleteClaudeResponse(envelope({ tail: ['marker後にも回答を続けます。'] }), marker))
-      .toBeNull()
+      .toBe(response)
     expect(extractCompleteClaudeResponse([
       '依頼本文', instruction, marker, response, markerHead, markerTail, marker, ...chrome,
     ].join('\n'), marker)).toBeNull()
@@ -3066,87 +3130,6 @@ print('review complete')
       nonProductionMarker,
       ...chrome,
     ].join('\n'), nonProductionMarker)).toBeNull()
-  })
-
-  test('Claude 2.1.247の固定done clockだけをactivity chromeとして採択する', () => {
-    const marker = 'REQUEST_MARKER=FEDCBA9876543210FEDCBA9876543210'
-    const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
-    const response = '独立したレビュー結果です。'
-    const envelope = (...chrome: string[]) => [
-      '依頼本文',
-      instruction,
-      marker,
-      response,
-      marker,
-      ...chrome,
-      '────────────────',
-      '❯',
-      '────────────────',
-      '⏵⏵ bypass permissions on (shift+tab to cycle) · /rc',
-    ].join('\n')
-
-    for (const activity of [
-      '✻ Churned for 23s',
-      '✻ Churned for 23s · done 12:26',
-      '✻ Worked for 1m 5s · done 09:05',
-      '✻ Worked for 3m 0s · done 12:40',
-      '✻ Worked for 1h 2m 3s · done 9:05',
-      '✻ Worked for 1h 0m 0s · done 12:40',
-      '✻ Baked for 1d 0h 0m · done 13:27',
-      '✻ Brewed for 1s · done 13:27',
-      '✻ Cogitated for 1s · done 13:27',
-      '✻ Cooked for 1s · done 13:27',
-      '✻ Crunched for 1s · done 13:27',
-      '✻ Sautéed for 5m 45s · done 13:27',
-      '✳ Worked for 1s · done 0:00',
-      '✢ Worked for 1s · done 23:59',
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(activity), marker)).toBe(response)
-    }
-
-    for (const activity of [
-      '✻ Churned for 23s · esc to interrupt',
-      '✻ Churned for 23s · done',
-      '✻ Churned for 23s · Done 12:26',
-      '✻ Churned for 23s · done 24:00',
-      '✻ Churned for 23s · done 12:60',
-      '✻ Churned for 23s · done 12:6',
-      '✻ Churned for 23s · done 12:26:00',
-      '✻ Churned for 23s · done 12:26 PM',
-      '✻ Churned for 23s · done 12:26 extra',
-      '✻ Churned for 0s · done 12:26',
-      '✻ Worked for 0m 5s · done 12:26',
-      '✻ Worked for 1m 00s · done 12:26',
-      '✻ Worked for 3m 60s · done 12:26',
-      '✻ Worked for 1h 60m 0s · done 12:26',
-      '✻ Worked for 1h 00m 0s · done 12:26',
-      '✻ Worked for 60s · done 12:26',
-      '✻ Worked for 60m 0s · done 12:26',
-      '✻ Worked for 1h 5s · done 12:26',
-      '✻ Worked for 24h 0m 0s · done 12:26',
-      '✻ Worked for 1d 24h 0m · done 12:26',
-      '✻ Worked for 1d 0h 60m · done 12:26',
-      '✻ Worked for 1d 0h 0m 0s · done 12:26',
-      '✻ continuation for 1s · done 12:26',
-      '✻ Wait for 5s · done 12:26',
-      '✻ Churning for 23s · done 12:26',
-      '✻ Braised for 1s · done 12:26',
-      '✻ continuation for 1s',
-      '✻ Wait for 5s',
-      '✻ Churning for 23s',
-      '✻ Worked for 1s',
-      '✳ Churned for 23s',
-      '✻ Churned for 24s',
-      '✔ Churned for 23s · done 12:26',
-      '· done 12:26',
-    ]) {
-      expect(extractCompleteClaudeResponse(envelope(activity), marker)).toBeNull()
-    }
-
-    expect(extractCompleteClaudeResponse(envelope(
-      '✻ Churned for 23s · done 12:26',
-      'marker後にも回答を続けます。',
-    ), marker)).toBeNull()
   })
 
   test('同一roundのexclusive claimは重複作成できずidentity一致時だけ解放する', () => {

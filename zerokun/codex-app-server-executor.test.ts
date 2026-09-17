@@ -1579,6 +1579,15 @@ describe('production App Server executor', () => {
       ])
 
     writeFileSync(reviewTwoPath, `${JSON.stringify({
+      ...reviewTwo, repositoryDeltaCurrentDigestAfter: digest('8'),
+    })}\n`, { mode: 0o600 })
+    expect(collectHostAdvisorCoverage(state, jobId, nonce, true)?.phases)
+      .toMatchObject([
+        { phase: 'review', round: 1, total: 3 },
+        { phase: 'review', round: 2, total: 3 },
+      ])
+
+    writeFileSync(reviewTwoPath, `${JSON.stringify({
       ...reviewTwo,
       roundTwoBasis: { ...roundTwoBasis, reviewOneJournalDigest: digest('7') },
     })}\n`, { mode: 0o600 })

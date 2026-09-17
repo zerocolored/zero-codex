@@ -326,6 +326,18 @@ export function validThreeAdvisorReviewSequence(
   reviewOneValue: unknown,
   reviewTwoValue: unknown,
 ): boolean {
+  const reviewTwo = record(reviewTwoValue)
+  return validThreeAdvisorReviewBinding(reviewOneValue, reviewTwoValue)
+    && (reviewTwo?.status === 'requested'
+      || reviewTwo?.repositoryDeltaCurrentDigestAfter
+        === record(reviewTwo?.roundTwoBasis)?.repositoryCurrentDigest)
+}
+
+/** Answer provenance is independent of whether the reviewed checkout later changed. */
+export function validThreeAdvisorReviewBinding(
+  reviewOneValue: unknown,
+  reviewTwoValue: unknown,
+): boolean {
   const reviewOne = record(reviewOneValue)
   const reviewTwo = record(reviewTwoValue)
   if (!reviewOne || !reviewTwo
@@ -384,7 +396,6 @@ export function validThreeAdvisorReviewSequence(
   if (reviewTwo.status !== 'requested') {
     if (!positiveInteger(reviewTwo.finishedAt)
       || Number(reviewTwo.finishedAt) < Number(reviewTwo.startedAt)
-      || reviewTwo.repositoryDeltaCurrentDigestAfter !== basis.repositoryCurrentDigest
       || !validThreeAdvisorGrokAttempts(reviewTwo.grok, 'review')
       || !validTerminalClaudeAttempt(reviewTwo.claude)) return false
   }

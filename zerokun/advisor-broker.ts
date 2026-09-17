@@ -56,6 +56,7 @@ import {
   serializeAdvisorRepositorySnapshot,
   snapshotAdvisorRepository,
   summarizeAdvisorRepositoryChanges,
+  summarizeAdvisorTaskOwnedFixChanges,
   type AdvisorProjectLayout,
   type AdvisorRepositorySnapshot,
 } from './advisor-snapshot.ts'
@@ -102,10 +103,18 @@ import {
   validThreeAdvisorNativeAttempts,
   validThreeAdvisorRoundTwoBasis,
   validThreeAdvisorReviewSequence,
+  validThreeAdvisorReviewBinding,
   type AdvisorPhase,
 } from './advisor-journal.ts'
 import { persistAdvisorClaudeCleanupOutcome, retireAdvisorClaudeCleanupOutcome } from './advisor-round-recovery.ts'
 import { recoverAdvisorSlot } from './advisor-retry.ts'
+import {
+  saveClaudeResponseDiagnostic,
+  captureClaudeFailureDiagnostic,
+  type ClaudeResponseAnalysis,
+  type ClaudeDiagnosticRead,
+  type ClaudeDiagnosticReceipt,
+} from './claude-response-diagnostic.ts'
 
 export type FifthAdvisorSendOutcome =
   | { kind: 'unconfirmed' }
@@ -140,45 +149,26 @@ const CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL =
   'markerをそのまま記載してください。'
 const CLAUDE_REQUEST_MARKER = /^REQUEST_MARKER=[0-9A-F]{32}$/
 
-const CLAUDE_DURATION =
-  '(?:[1-9][0-9]*d (?:0|[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m|(?:[1-9]|1[0-9]|2[0-3])h (?:0|[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])m (?:0|[1-9]|[1-5][0-9])s|(?:[1-9]|[1-5][0-9])s)'
-const CLAUDE_LEGACY_ACTIVITY_CHROME = /^✻ Churned for 23s$/u
-const CLAUDE_DONE_ACTIVITY_CHROME = new RegExp(
-  `^[✻✳✽✶✢] (?:Baked|Brewed|Churned|Cogitated|Cooked|Crunched|Sautéed|Worked) for ${CLAUDE_DURATION} · done (?:[01]?[0-9]|2[0-3]):[0-5][0-9]$`,
-  'u',
-)
-// Exact narrow-pane rendering observed from Claude Code 2.1.247 in Herdr.
-const CLAUDE_NARROW_BYPASS_FOOTER_CHROME =
-  `\u23F5\u23F5 bypass permissions on (shift+tab to${'\u0020'.repeat(5)}\u00B7`
-const CLAUDE_UPDATE_READY_FOOTER_CHROME =
-  /^⏵⏵ bypass permissions on \(shift\+tab to cycle\) · ← for agents {1,256}✔ Update installed · Restart to update$/u
-
-function isClaudeTerminalChrome(line: string): boolean {
-  const value = line.trim()
-  return value === ''
-    || value === '❯'
-    || /^─+$/.test(value)
-    || CLAUDE_LEGACY_ACTIVITY_CHROME.test(value)
-    || CLAUDE_DONE_ACTIVITY_CHROME.test(value)
-    || value === CLAUDE_NARROW_BYPASS_FOOTER_CHROME
-    || /^⏵⏵ bypass permissions on(?: \(shift\+tab to cycle\))?(?: · (?:\/rc|← for agents {1,256}\/rc))?$/.test(value)
-}
-
-function isCompleteClaudeTerminalChrome(lines: string[]): boolean {
-  for (let index = 0; index < lines.length; index += 1) {
-    const value = lines[index]!.trim()
-    if (CLAUDE_UPDATE_READY_FOOTER_CHROME.test(value)
-      && lines[index + 1]?.trim() === '/rc') {
-      index += 1
-      continue
-    }
-    if (!isClaudeTerminalChrome(value)) return false
-  }
-  return true
+/**
+ * 空の入力プロンプト行か。Claude Code 2.1.27x は空の入力行に薄いプレースホルダ
+ * （Try "…"）を重ね、❯ との区切りに NBSP（U+00A0）を使う（2026-09-16 に
+ * v2.1.273 実機で採取）。プレースホルダは入力が空のときにしか表示されないので、
+ * 「❯ + プレースホルダのみ」も空として扱う。
+ */
+function isEmptyClaudePromptLine(trimmedLine: string): boolean {
+  if (!trimmedLine.startsWith('❯')) return false
+  const remainder = trimmedLine.slice(1).replace(/\u00a0/g, ' ').trim()
+  return remainder === '' || /^Try "[^"]{0,80}"$/.test(remainder)
 }
 
 export function extractCompleteClaudeResponse(transcript: string, marker: string): string | null {
-  if (!marker || marker.includes('\n') || marker.includes('\r')) return null
+  return analyzeClaudeResponse(transcript, marker).response
+}
+
+export function analyzeClaudeResponse(transcript: string, marker: string): ClaudeResponseAnalysis {
+  if (!marker || marker.includes('\n') || marker.includes('\r')) {
+    return { response: null, code: 'invalid-marker', markerLines: [], exactOccurrences: 0, wrappedMarkerPairs: [] }
+  }
   const lines = transcript.replaceAll('\r\n', '\n').split('\n')
   const values = lines.map(line => line.trim())
   const markerLines = values.flatMap((line, index) => line === marker ? [index] : [])
@@ -190,6 +180,9 @@ export function extractCompleteClaudeResponse(transcript: string, marker: string
           : []
       ))
     : []
+  const result = (code: ClaudeResponseAnalysis['code'], response: string | null = null): ClaudeResponseAnalysis => ({
+    response, code, markerLines, exactOccurrences, wrappedMarkerPairs,
+  })
 
   let promptEnd: number
   let responseMarker: number
@@ -199,7 +192,7 @@ export function extractCompleteClaudeResponse(transcript: string, marker: string
     const promptMarker = markerLines[0]!
     responseMarker = markerLines[1]!
     if (promptMarker < 1
-      || values[promptMarker - 1] !== CLAUDE_MARKER_INSTRUCTION) return null
+      || values[promptMarker - 1] !== CLAUDE_MARKER_INSTRUCTION) return result('prompt-boundary-mismatch')
     promptEnd = promptMarker
   } else if (markerLines.length === 1
     && exactOccurrences === 1
@@ -208,14 +201,16 @@ export function extractCompleteClaudeResponse(transcript: string, marker: string
     responseMarker = markerLines[0]!
     if (wrappedMarker < 2
       || values[wrappedMarker - 2] !== CLAUDE_NARROW_MARKER_INSTRUCTION_HEAD
-      || values[wrappedMarker - 1] !== CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL) return null
+      || values[wrappedMarker - 1] !== CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL) return result('prompt-boundary-mismatch')
     promptEnd = wrappedMarker + 1
-  } else return null
+  } else return result('marker-count-mismatch')
 
-  if (responseMarker <= promptEnd + 1) return null
-  if (!isCompleteClaudeTerminalChrome(lines.slice(responseMarker + 1))) return null
+  if (responseMarker <= promptEnd + 1) return result('empty-response')
+  // The per-request terminal marker ends the answer. Terminal UI after it is not
+  // an answer-validity contract: clocks, suggestions and version changes vary.
+  // The caller separately verifies the owned agent and response lifecycle.
   const response = lines.slice(promptEnd + 1, responseMarker).join('\n').trim()
-  return response || null
+  return response ? result('complete', response) : result('empty-response')
 }
 
 const MAX_INPUT_CHARS = 24_000
@@ -1050,7 +1045,8 @@ export function emptyClaudePrompt(value: string): boolean {
   for (let index = 0; index < lines.length; index += 1) {
     if (lines[index]?.startsWith('❯')) lastPrompt = index
   }
-  if (lastPrompt < 0 || lines[lastPrompt] !== '❯') return false
+  if (lastPrompt < 0) return false
+  if (!isEmptyClaudePromptLine(lines[lastPrompt] ?? '')) return false
   const tailIsOnlyKnownStatus = lines.slice(lastPrompt + 1).every(line => (
     line === ''
     || /^[─━═╌╍┄┅┈┉]+$/.test(line)
@@ -1633,7 +1629,7 @@ async function main(): Promise<void> {
     return !firstLedger.invalid && firstLedger.entries.length === 1
       && firstLedger.entries[0]!.status === 'completed'
       && firstLedger.entries[0]!.terminal !== null
-      && validThreeAdvisorReviewSequence(
+      && validThreeAdvisorReviewBinding(
         firstLedger.entries[0]!.terminal,
         second.journal,
       )
@@ -1857,6 +1853,23 @@ async function main(): Promise<void> {
     let cleanupStatus: string | undefined
     let helperEnvironment: Record<string, string> | undefined
     let claudeRuntime: HerdrRuntimeIdentity | undefined
+    const diagnosticAttempt = randomBytes(16).toString('hex')
+    const diagnosticReads: ClaudeDiagnosticRead[] = []
+    let diagnosticTranscript: string | undefined
+    let diagnosticTranscriptReadIndex: number | undefined
+    let responseDiagnostic: ClaudeDiagnosticReceipt | undefined
+    const persistDiagnostic = () => {
+      responseDiagnostic = saveClaudeResponseDiagnostic({
+        stateDir,
+        directory: join(journalRoot, `revision-${input.revision}-${input.digest.slice(0, 16)}`),
+        attempt: diagnosticAttempt,
+        reads: diagnosticReads,
+        transcript: diagnosticTranscript,
+        transcriptReadIndex: diagnosticTranscriptReadIndex,
+        phase,
+        round,
+      })
+    }
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
       ? projectLayout.projectPath
       : projectLayout.gitRoot
@@ -1976,24 +1989,44 @@ async function main(): Promise<void> {
           if (!modelStartObserved || !['idle', 'done'].includes(current.agent_status ?? '')) continue
           let transcript = ''
           for (const lines of [300, 600, 1200]) {
-            transcript = decodeHerdrReadOutput(await herdrText(claudeRuntime, [
-              'agent', 'read', target.target, '--source', 'recent-unwrapped', '--lines', String(lines),
-            ], 'Herdr acquisition read', jobFingerprint))
-            const afterRead = unwrapAgent(await herdrJson(
-              claudeRuntime, ['agent', 'get', target.target], 'Herdr acquisition recheck', jobFingerprint,
-            ))
-            if (!ephemeralClaudeAgentMatches(afterRead, target, claudeProjectRoot)
-              || afterRead.state_change_seq !== current.state_change_seq
-              || !['idle', 'done'].includes(afterRead.agent_status ?? '')) {
-              transcript = ''
-              break
+            const observation: ClaudeDiagnosticRead = {
+              requestedLines: lines,
+              observedAt: new Date().toISOString(),
+              stateBefore: { status: current.agent_status, sequence: current.state_change_seq },
+              outcome: 'read-failed',
             }
-            const completeResponse = extractCompleteClaudeResponse(transcript, marker)
-            if (completeResponse) {
-              response = completeResponse
-              reason = 'Claude response obtained but subsequent cleanup validation did not complete'
-              stateChangeSeqAfter = current.state_change_seq
-              break
+            diagnosticReads.push(observation)
+            if (diagnosticReads.length > 3) diagnosticReads.shift()
+            try {
+              transcript = decodeHerdrReadOutput(await herdrText(claudeRuntime, [
+                'agent', 'read', target.target, '--source', 'recent-unwrapped', '--lines', String(lines),
+              ], 'Herdr acquisition read', jobFingerprint))
+              const afterRead = unwrapAgent(await herdrJson(
+                claudeRuntime, ['agent', 'get', target.target], 'Herdr acquisition recheck', jobFingerprint,
+              ))
+              observation.stateAfter = { status: afterRead.agent_status, sequence: afterRead.state_change_seq }
+              const identityMatches = ephemeralClaudeAgentMatches(afterRead, target, claudeProjectRoot)
+              if (!identityMatches || afterRead.state_change_seq !== current.state_change_seq
+                || !['idle', 'done'].includes(afterRead.agent_status ?? '')) {
+                observation.outcome = identityMatches ? 'state-changed' : 'identity-changed'
+                transcript = ''
+                break
+              }
+              const { response: completeResponse, ...analysis } = analyzeClaudeResponse(transcript, marker)
+              observation.outcome = analysis.code
+              observation.analysis = analysis
+              diagnosticTranscript = transcript
+              diagnosticTranscriptReadIndex = diagnosticReads.length - 1
+              if (completeResponse) {
+                response = completeResponse
+                reason = 'Claude response obtained but subsequent cleanup validation did not complete'
+                stateChangeSeqAfter = current.state_change_seq
+                break
+              }
+            } finally {
+              // Persist each owned snapshot before close/removal, even when the
+              // next read fails. Keep content out of the returned advisor object.
+              persistDiagnostic()
             }
           }
           if (response) break
@@ -2016,6 +2049,30 @@ async function main(): Promise<void> {
       }
       reason = String(error)
     } finally {
+      if (!response && marker && target && claudeRuntime && diagnosticReads.length === 0) {
+        const runtime = claudeRuntime
+        const ownedTarget = target
+        const snapshot = await captureClaudeFailureDiagnostic({
+          getState: async () => unwrapAgent(await herdrJson(
+            runtime, ['agent', 'get', ownedTarget.target], 'Herdr failure diagnostic identity', jobFingerprint,
+          )),
+          readTranscript: async () => decodeHerdrReadOutput(await herdrText(runtime, [
+            'agent', 'read', ownedTarget.target, '--source', 'recent-unwrapped', '--lines', '1200',
+          ], 'Herdr failure diagnostic read', jobFingerprint)),
+          matchesIdentity: current => ephemeralClaudeAgentMatches(current, ownedTarget, claudeProjectRoot!),
+          onError: error => {
+            if (error instanceof AdvisorContainmentError) {
+              helperContainmentVerified = false
+              containmentStatus = error instanceof AdvisorOwnedProcessStillLiveError
+                ? 'owned-process-still-live' : 'unverified-bounded-residual'
+            }
+          },
+        })
+        diagnosticReads.push(snapshot.read)
+        diagnosticTranscript = snapshot.transcript
+        diagnosticTranscriptReadIndex = snapshot.transcript === undefined ? undefined : 0
+        persistDiagnostic()
+      }
       if (requestDir && claudeRuntime) {
         try {
           const helper = resolveFifthAdvisorHelper()
@@ -2187,6 +2244,7 @@ async function main(): Promise<void> {
         stateChangeSeqBefore: target.stateChangeSeq,
         stateChangeSeqAfter,
         response,
+        responseDiagnostic,
         cleanupWarnings,
       }
     }
@@ -2213,6 +2271,7 @@ async function main(): Promise<void> {
       ...(containmentStatus ? { containmentStatus } : {}),
       promptMayHaveBeenDelivered: Boolean(marker),
       reason,
+      responseDiagnostic,
       failure: classifyAdvisorFailure('claude', reason),
       cleanupWarnings,
     }
@@ -2316,6 +2375,65 @@ async function main(): Promise<void> {
     } catch {
       return null
     }
+  }
+  const repositoryReviewWarning = (journal: Record<string, unknown>) => {
+    if (journal.phase !== 'review' || journal.round !== 2) return {}
+    const stable = journal.repositoryDeltaCurrentDigestAfter
+      === (journal.roundTwoBasis as Record<string, unknown>)?.repositoryCurrentDigest
+    return {
+      repositoryDeltaStable: stable,
+      ...(stable ? {} : {
+        repositoryAssessmentRequired: true,
+        nextAction: 'The saved answers are available for the original reviewed snapshot. The repository changed or its final observation is unavailable; this is not missing feedback or a corrupt ledger. Inspect the intervening diff and assess relevance using these answers, run targeted checks, and continue the same task. Do not restart advisors or create another round. Answer delivery is not approval of changed code.',
+      }),
+    }
+  }
+  // Restore delivery, not reviewer execution. A fully acquired round can have
+  // been labelled failed by older brokers solely because the checkout moved.
+  const savedRoundResult = (
+    input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
+    phase: 'investigation' | 'design' | 'review',
+    round: 1 | 2 | 3,
+  ): ReturnType<typeof toolText> | null => {
+    const journal = readCompletedJournal(input, phase, round)
+      ?? readTerminalJournal(input, phase, round, 'reviewers-completed')
+      ?? readTerminalJournal(input, phase, round, 'required-reviewer-failed')
+      ?? readTerminalJournal(input, phase, round, 'stale-input')
+    if (!journal) return null
+    const raw = readOptionalPrivateFile(`${roundJournalPath(input, phase, round)}.responses`)
+    if (!raw || Buffer.byteLength(raw) > 2 * 1024 * 1024
+      || createHash('sha256').update(raw).digest('hex') !== journal.responseCacheDigest) return null
+    try {
+      const saved = JSON.parse(raw)
+      if (saved.contextDigest !== contextDigest || saved.phase !== phase || saved.round !== round
+        || saved.inputRevision !== input.revision || saved.inputDigest !== input.digest
+        || saved.evidenceDigest !== journal.primaryEvidenceDigest
+        || JSON.stringify(saved.native) !== JSON.stringify(journal.native)
+        || !Array.isArray(saved.grok) || !Array.isArray(journal.grok)
+        || saved.grok.length !== journal.grok.length) return null
+      const matches = (answer: Record<string, unknown>, recorded: Record<string, unknown>) =>
+        answer?.adopted === recorded?.adopted && (recorded.adopted !== true
+          || (answer.containmentVerified === true && recorded.containmentVerified === true
+            && typeof answer.response === 'string' && answer.response.trim().length > 0
+            && createHash('sha256').update(answer.response).digest('hex') === recorded.responseDigest))
+      if (!saved.grok.every((slot: Record<string, unknown>, index: number) =>
+        matches(slot, (journal.grok as Array<Record<string, unknown>>)[index]!))
+        || !matches(saved.claude, journal.claude as Record<string, unknown>)) return null
+      const latest = readAdvisorInputSnapshot(stateDir, context.jobId)
+      const inputUnchanged = (latest.revision === input.revision && latest.digest === input.digest)
+        || (latest.revision === journal.recoveryInputRevision && latest.digest === journal.recoveryInputDigest)
+      const allAdopted = allAdvisorAttemptsAdopted(saved.native, saved.grok, saved.claude)
+      return toolText({
+        complete: inputUnchanged && allAdopted,
+        restoredSavedResponses: true, phase, round,
+        inputRevision: input.revision, inputDigest: input.digest, inputUnchanged,
+        ...(inputUnchanged ? {} : { staleInput: true }),
+        allAdopted, waitingForAdvisors: !allAdopted,
+        slotSummary: journalSlotSummary(journal),
+        native: saved.native, grok: saved.grok, claude: saved.claude,
+        ...repositoryReviewWarning(journal),
+      })
+    } catch { return null }
   }
   const recoveredRoundResult = (
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
@@ -2487,6 +2605,15 @@ async function main(): Promise<void> {
       recoveryInputDigest?: string,
     } | undefined
     let retryBackoff = false
+    if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
+      const saved = savedRoundResult({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3)
+      if (saved && resultPayload(saved)?.allAdopted === true) {
+        // Poll applies the ordinary ledger/receipt checks. Never re-run an
+        // already acquired advisor just to redeliver its saved answer.
+        roundTasks.set(taskKey, Promise.resolve(saved))
+        return toolText({ complete: false, pending: true, phase, round, inputRevision, inputDigest })
+      }
+    }
     if (retryUnavailable && phaseScope === 'complete'
       && roundNotStarted(phase as 'investigation' | 'review', round as 1 | 2)) {
       return notStartedResult(phase, round, input)
@@ -2621,14 +2748,16 @@ async function main(): Promise<void> {
       { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3,
     )
     if (alreadyObserved && !retryResult) {
-      return toolText(advisorReceiptAlreadyObserved({
+      return toolText({
+        ...resultPayload(savedRoundResult({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3) ?? toolText({})),
+        ...advisorReceiptAlreadyObserved({
         phase,
         round,
         inputRevision,
         inputDigest,
         pollObservedAt: Number(alreadyObserved.pollObservedAt),
         slotSummary: journalSlotSummary(alreadyObserved),
-      }))
+      }), ...repositoryReviewWarning(alreadyObserved) })
     }
     if (!retryResult && roundTasks.has(taskKey)) {
       return toolText({
@@ -2662,6 +2791,7 @@ async function main(): Promise<void> {
         }
         if (prior.terminal) {
           return toolText({
+            ...resultPayload(savedRoundResult(prior.input, phase, round as 1 | 2 | 3) ?? toolText({})),
             complete: prior.status !== 'stale-input' && journalSlotSummary(prior.terminal).responsesObtained === journalSlotSummary(prior.terminal).total,
             waitingForAdvisors: journalSlotSummary(prior.terminal).responsesObtained < journalSlotSummary(prior.terminal).total,
             nextAction: '不足枠だけを同じ返却bindingのretryUnavailable=trueで復旧してください。',
@@ -2672,6 +2802,7 @@ async function main(): Promise<void> {
             inputDigest: prior.input.digest,
             priorStatus: prior.status,
             slotSummary: journalSlotSummary(prior.terminal),
+            ...repositoryReviewWarning(prior.terminal),
           })
         }
         return toolText({
@@ -2783,28 +2914,26 @@ async function main(): Promise<void> {
             reason: 'review round 2 has no verified round-1 repository baseline',
           }, true)
         }
-        roundTwoRepositoryDelta = summarizeAdvisorRepositoryChanges(
-          repositoryBaseline.snapshot,
-          repositoryCurrent,
+        const declaredTaskOwnedFixPaths = [...roundTwoBasis!.taskOwnedFixPaths]
+          .sort((left, right) => {
+            const leftKey = `${left.repository}\0${left.path}`
+            const rightKey = `${right.repository}\0${right.path}`
+            return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
+          })
+        const declaredTaskOwnedFixPathsDigest = threeAdvisorTaskOwnedFixPathsDigest(
+          roundTwoBasis!.taskOwnedFixPaths,
+        )
+        if (!declaredTaskOwnedFixPathsDigest) {
+          return toolText({ complete: false, reason: 'review round 2 task-owned fix paths are invalid' }, true)
+        }
+        roundTwoRepositoryDelta = summarizeAdvisorTaskOwnedFixChanges(
+          repositoryBaseline.snapshot, repositoryCurrent, declaredTaskOwnedFixPaths,
         )
         if (!roundTwoRepositoryDelta.changed || roundTwoRepositoryDelta.layoutChanged
           || roundTwoRepositoryDelta.repositories.length === 0) {
           return toolText({
             complete: false,
             reason: 'review round 2 requires a host-observed non-empty repository fix delta after round 1',
-          }, true)
-        }
-        if (roundTwoRepositoryDelta.omittedRootInstructionPaths !== 0
-          || roundTwoRepositoryDelta.rootInstructionPaths.length !== 0
-          || roundTwoRepositoryDelta.repositories.some(repository => (
-            repository.kind !== 'changed'
-              || repository.headBefore !== repository.headAfter
-              || repository.omittedChangedPaths !== 0
-              || repository.changedPaths.length === 0
-          ))) {
-          return toolText({
-            complete: false,
-            reason: 'review round 2 requires a complete path-level repository delta without unbound workspace-instruction changes',
           }, true)
         }
         const observedTaskOwnedFixPaths = roundTwoRepositoryDelta.repositories
@@ -2817,17 +2946,8 @@ async function main(): Promise<void> {
             const rightKey = `${right.repository}\0${right.path}`
             return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
           })
-        const declaredTaskOwnedFixPaths = [...roundTwoBasis!.taskOwnedFixPaths]
-          .sort((left, right) => {
-            const leftKey = `${left.repository}\0${left.path}`
-            const rightKey = `${right.repository}\0${right.path}`
-            return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
-          })
         const observedTaskOwnedFixPathsDigest = threeAdvisorTaskOwnedFixPathsDigest(
           observedTaskOwnedFixPaths,
-        )
-        const declaredTaskOwnedFixPathsDigest = threeAdvisorTaskOwnedFixPathsDigest(
-          roundTwoBasis!.taskOwnedFixPaths,
         )
         if (!observedTaskOwnedFixPathsDigest || !declaredTaskOwnedFixPathsDigest
           || JSON.stringify(roundTwoBasis!.taskOwnedFixPaths)
@@ -2836,7 +2956,7 @@ async function main(): Promise<void> {
             !== JSON.stringify(observedTaskOwnedFixPaths)) {
           return toolText({
             complete: false,
-            reason: 'review round 2 task-owned fix paths do not exactly match the complete host-observed repository delta',
+            reason: 'review round 2 task-owned fix paths include unchanged or unobserved paths',
           }, true)
         }
         const repositoryDeltaDigest = threeAdvisorRepositoryDeltaDigest(
@@ -2895,6 +3015,9 @@ async function main(): Promise<void> {
           taskOwnedFixDelta: roundTwoFixDelta,
           taskOwnedFixPaths: roundTwoBasis!.taskOwnedFixPaths,
           hostObservedRepositoryDelta: {
+            scope: 'Declared task-owned fix paths only; commits and unrelated workspace changes do not block review.',
+            rootInstructionPaths: roundTwoRepositoryDelta!.rootInstructionPaths,
+            omittedRootInstructionPaths: roundTwoRepositoryDelta!.omittedRootInstructionPaths,
             baselineDigest: roundTwoRepositoryDelta!.baselineDigest,
             currentDigest: roundTwoRepositoryDelta!.currentDigest,
             changedRepositoryCount: roundTwoRepositoryDelta!.repositories.length,
@@ -3245,17 +3368,12 @@ async function main(): Promise<void> {
       }
     }
     let roundTwoRepositoryCurrentDigestAfter: string | undefined
-    let roundTwoRepositoryStable = true
     if (phaseScope === 'complete' && phase === 'review' && round === 2) {
       try {
         roundTwoRepositoryCurrentDigestAfter = advisorRepositoryDigest(
           snapshotAdvisorRepository(projectLayout),
         )
-        roundTwoRepositoryStable = roundTwoRepositoryCurrentDigestAfter
-          === roundTwoJournalBinding?.repositoryCurrentDigest
-      } catch {
-        roundTwoRepositoryStable = false
-      }
+      } catch { /* Missing observation is reported separately from answer acquisition. */ }
     }
     const afterSnapshot = phaseScope === 'complete'
       ? undefined
@@ -3310,6 +3428,7 @@ async function main(): Promise<void> {
       responseDigest: claude.adopted === true && typeof claude.response === 'string'
         ? createHash('sha256').update(claude.response).digest('hex')
         : undefined,
+      responseDiagnostic: claude.responseDiagnostic,
       reasonDigest: claude.adopted !== true
         ? createHash('sha256').update(String(claude.reason ?? 'unavailable')).digest('hex')
         : undefined,
@@ -3322,7 +3441,7 @@ async function main(): Promise<void> {
       undefined,
       { version: THREE_ADVISOR_JOURNAL_VERSION, phase },
     )
-    const complete = inputUnchanged && roundTwoRepositoryStable
+    const complete = inputUnchanged
       && (phaseScope === 'complete' || repositoryUnchanged)
       && allAdvisorAttemptsAdopted(nativeEvidence, grokJournal, claudeJournal)
       && validThreeAdvisorNativeAttempts(nativeEvidence, phase)
@@ -3388,7 +3507,8 @@ async function main(): Promise<void> {
       durationMs: finishedAt - startedAt,
       ...(repositoryUnchanged === undefined ? {} : { repositoryUnchanged }),
       ...(phase === 'review' && round === 2
-        ? { repositoryDeltaStable: roundTwoRepositoryStable }
+        ? repositoryReviewWarning({ phase, round, roundTwoBasis: roundTwoJournalBinding,
+          repositoryDeltaCurrentDigestAfter: roundTwoRepositoryCurrentDigestAfter })
         : {}),
       allAdopted: allAdvisorAttemptsAdopted(nativeEvidence, grok, claude),
       ...(!allAdvisorAttemptsAdopted(nativeEvidence, grok, claude) ? {
@@ -3469,16 +3589,20 @@ async function main(): Promise<void> {
     }
     let task = roundTasks.get(taskKey)
     if (!task) {
+      const saved = savedRoundResult(binding, phase, boundRound)
+      if (saved) task = Promise.resolve(saved)
+    }
+    if (!task) {
       const completed = readCompletedJournal(binding, phase, boundRound)
       if (completed) {
-        return toolText(advisorReceiptAlreadyObserved({
+        return toolText({ ...advisorReceiptAlreadyObserved({
           phase,
           round,
           inputRevision,
           inputDigest,
           pollObservedAt: Number(completed.pollObservedAt),
           slotSummary: journalSlotSummary(completed),
-        }))
+        }), ...repositoryReviewWarning(completed) })
       }
       const recovered = recoveredRoundResult(binding, phase, boundRound)
       if (!recovered) {
@@ -3528,16 +3652,23 @@ async function main(): Promise<void> {
     try {
       const alreadyObserved = readCompletedJournal(binding, phase, boundRound)
       if (alreadyObserved) {
-        return toolText(advisorReceiptAlreadyObserved({
+        return toolText({ ...payload, ...advisorReceiptAlreadyObserved({
           phase,
           round,
           inputRevision,
           inputDigest,
           pollObservedAt: Number(alreadyObserved.pollObservedAt),
           slotSummary: journalSlotSummary(alreadyObserved),
-        }))
+        }), ...repositoryReviewWarning(alreadyObserved) })
       }
-      const journal = readTerminalJournal(binding, phase, boundRound, 'reviewers-completed')
+      let journal = readTerminalJournal(binding, phase, boundRound, 'reviewers-completed')
+      if (!journal && payload.restoredSavedResponses === true && payload.allAdopted === true) {
+        const previous = readTerminalJournal(binding, phase, boundRound, 'required-reviewer-failed')
+        if (previous) {
+          journal = { ...previous, status: 'reviewers-completed' }
+          atomicWritePrivateFile(journalPath, `${JSON.stringify(journal)}\n`)
+        }
+      }
       if (!journal) {
         throw new Error('reviewer completion journal is missing or invalid')
       }

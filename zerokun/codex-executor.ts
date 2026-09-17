@@ -106,6 +106,7 @@ import {
   validThreeAdvisorGrokAttempts,
   validThreeAdvisorNativeAttempts,
   validThreeAdvisorReviewSequence,
+  validThreeAdvisorReviewBinding,
   validThreeAdvisorRoundTwoBasis,
 } from './advisor-journal.ts'
 import { summarizeAdvisorSlots } from './advisor-broker.ts'
@@ -1425,8 +1426,7 @@ export const CODEX_WORKER_SAFETY_PROMPT = [
   'In the user-facing answer, speak warmly and concisely in the first person as this Slack',
   'assistant, using one or two natural emoji when appropriate. Do not introduce or repeat a',
   'fixed assistant name: the installed Slack App display name is the visible identity. Accuracy',
-  'matters more than decoration. Do not expose or mention the internal use',
-  'of Codex, Claude Code, Grok, Herdr, App Server, advisor panels, queues, or process names.',
+  'matters more than decoration.',
   '',
   'First read every applicable AGENTS.md. If this repository has only CLAUDE.md, read it',
   'as legacy repository guidance, but AGENTS.md and higher-priority instructions win.',
@@ -1790,7 +1790,7 @@ export function collectHostAdvisorCoverage(
     const reviewOneJournal = journalsByName.get('review:1')!
     const reviewTwoJournal = journalsByName.get('review:2')!
     if (reviewOneJournal.status !== 'completed'
-      || !validThreeAdvisorReviewSequence(reviewOneJournal, reviewTwoJournal)) return undefined
+      || !validThreeAdvisorReviewBinding(reviewOneJournal, reviewTwoJournal)) return undefined
   }
   return phases.length > 0 ? { version: 1, phases } : undefined
 }
@@ -2058,12 +2058,12 @@ function collectNativeAdvisorJournalEvidence(options: {
     const journalEntries = readdirSync(revisionRoot, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name))
     for (const journalEntry of journalEntries) {
-      // Response bodies are broker-owned retry data, not native-history
-      // evidence. Never parse them as a round journal or expose their content.
-      if (/^(investigation|design|review)-[123]\.json\.(responses|slots)$/.test(journalEntry.name)
-        && journalEntry.isFile() && !journalEntry.isSymbolicLink()) continue
+      // Select round journals, rather than enumerating allowed sidecars.
+      // Diagnostics and retry data share this directory but are not native
+      // evidence. Do not open them or let their presence discard valid rounds.
       const journalMatch = /^(investigation|design|review)-([123])\.json$/.exec(journalEntry.name)
-      if (!journalMatch || !journalEntry.isFile() || journalEntry.isSymbolicLink()) {
+      if (!journalMatch) continue
+      if (!journalEntry.isFile() || journalEntry.isSymbolicLink()) {
         throw new Error(`advisor journal contains an unsafe revision entry: ${journalEntry.name}`)
       }
       const raw = readOptionalPrivateFile(join(revisionRoot, journalEntry.name))
@@ -3769,8 +3769,8 @@ export function buildCodexDeveloperInstructions(
         'you adopt at least one round-1 mandatory finding and implement a non-empty task-owned fix',
         'delta, call one fresh phase=review round=2 with roundTwoBasis identifying adopted sources,',
         'the mandatory finding summary, that fix delta, and taskOwnedFixPaths as the exact sorted',
-        'repository-relative paths you changed for that fix. The host requires this list to match',
-        'every path changed since round 1; do not claim paths changed by another task. Limit round 2 to that delta and its',
+        'repository-relative paths you changed for that fix. The host compares their committed or dirty content',
+        'against round 1; unrelated changes are context, not review scope. Never claim another task\'s paths. Limit round 2 to that delta and its',
         'regressions. Minor findings, missing advisor responses, or infrastructure failures never',
         'trigger round 2. Never call review round 3 or the legacy separate design phase.',
         'For the initial phase, attempt exactly one solution_analyst with model=gpt-6-astra,',
@@ -3977,8 +3977,8 @@ export function buildCodexWorkerPrompt(
       'implementation, use phase=review and round=1. Only if you adopt a round-1 mandatory finding',
       'and implement a non-empty task-owned fix delta, call one fresh phase=review round=2 with',
       'roundTwoBasis, including taskOwnedFixPaths as the exact sorted repository-relative paths',
-      'you changed for that fix. The host requires an exact match with every observed path since',
-      'round 1; never claim another task\'s paths. Restrict round 2 to that delta and direct',
+      'you changed for that fix. The host compares their committed or dirty content against',
+      'round 1; unrelated changes are context, not review scope. Never claim another task\'s paths. Restrict round 2 to that delta and direct',
       'regressions. Minor findings, advisor',
       'unavailability, and infrastructure failures do not trigger round 2. Never call round 3 or',
       'the legacy design phase. A completed logical round is attempt-wide and is not rerun when',

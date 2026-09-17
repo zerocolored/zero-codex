@@ -28,7 +28,7 @@ import {
   THREE_ADVISOR_JOURNAL_VERSION,
   THREE_ADVISOR_POLICY,
   validThreeAdvisorPhaseRound,
-  validThreeAdvisorReviewSequence,
+  validThreeAdvisorReviewBinding,
   validThreeAdvisorRoundTwoBasis,
   type AdvisorPhase,
 } from './advisor-journal.ts'
@@ -354,7 +354,7 @@ function requestedRound(
       }
     }
     if (reviewOnes.length !== 1
-      || !validThreeAdvisorReviewSequence(reviewOnes[0], selected.journal)) {
+      || !validThreeAdvisorReviewBinding(reviewOnes[0], selected.journal)) {
       throw new Error('requested final-review round 2 is not bound to one completed current-policy round 1')
     }
   }

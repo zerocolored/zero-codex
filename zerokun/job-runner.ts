@@ -1,7 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
-import { advisorFailureMessage, PUBLIC_ADVISOR_FAILURE_MESSAGES, type AdvisorFailure } from './advisor-availability.ts'
+import { advisorFailureMessage, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
   chmodSync,
@@ -15172,174 +15172,8 @@ export function extractArtifactPaths(result: string): { text: string; files: str
   }
 }
 
-const INTERNAL_IMPLEMENTATION_NAME = /(?:\bOpenAI[ -]Codex\b|\bOpenAI(?:[ -]?API)?\b|\bCodex\b|\bClaude(?:[ -]Code)?\b|\bGrok\b|\bHerdr\b|\bApp[ -]Server\b|\bModel[ -]Context[ -]Protocol\b|\bMCP(?:[ -]?broker)?\b|\bGPT(?:[- ]?(?:\d+(?:\.\d+)*(?:[A-Za-z][A-Za-z0-9]*)?(?:-[A-Za-z0-9]+)*|oss(?:-[A-Za-z0-9]+)*))?\b|\bo\d+(?:[-.][A-Za-z0-9]+)*\b|\badvisor[ -]?panels?\b|\badvisors?\b|\bsub[ -]?agents?\b|\bbrokers?\b|\bJSON[ -]?RPC\b|\bSeatbelt\b|コーデックス|クロードコード|クロード|グロック|モデルコンテキストプロトコル|アドバイザー|サブエージェント|ブローカー)/i
+// Kept only to suppress legacy queued refusal messages; never classify new answers.
 const SELF_IMPLEMENTATION_NON_DISCLOSURE = '内部構成は公開していません。'
-/** Stands in for the runtime's own repository name, which carries an
- * implementation name inside it and must not be echoed into Slack. */
-const WITHHELD_REPOSITORY_NAME = '指定のリポジトリ'
-
-const INTERNAL_IMPLEMENTATION_ALIASES = [
-  'OpenAI Codex', 'OpenAI API', 'OpenAI', 'Codex', 'Claude Code', 'Claude',
-  'Grok', 'Herdr', 'App Server', 'Model Context Protocol', 'MCP broker', 'MCP',
-  'GPT', 'advisor panel', 'advisor panels', 'advisor', 'advisors', 'subagent',
-  'subagents', 'sub agent', 'sub agents', 'reviewer', 'reviewers', 'broker',
-  'brokers', 'JSON RPC', 'Seatbelt',
-] as const
-
-const escapeRegularExpression = (value: string): string => (
-  value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-)
-
-const implementationSkeletonAlternatives = [
-  ...INTERNAL_IMPLEMENTATION_ALIASES.flatMap(alias => [
-    alias,
-    alias.toLowerCase(),
-    alias.toUpperCase(),
-  ]),
-].map(alias => normalizeImplementationGuardText(alias)
-  .split(/[\s_-]+/)
-  .map(escapeRegularExpression)
-  .join('[\\s_-]*'))
-  .sort((left, right) => right.length - left.length)
-
-const implementationSkeletonLeftBoundary = '(?:(?<![\\p{L}\\p{N}_])|(?<=[\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}]))'
-const implementationSkeletonRightBoundary = '(?=$|[^\\p{L}\\p{N}_]|[\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}])'
-const implementationStaticSkeletonCore = `(?:${implementationSkeletonAlternatives.join('|')})`
-const INTERNAL_IMPLEMENTATION_SKELETON = new RegExp(
-  `${implementationSkeletonLeftBoundary}${implementationStaticSkeletonCore}${implementationSkeletonRightBoundary}`,
-  'iu',
-)
-const implementationDigitSkeletonValues = [...new Set(
-  Array.from({ length: 10 }, (_value, digit) => (
-    normalizeImplementationGuardText(String(digit))
-  )),
-)]
-const implementationDigitSkeleton = implementationDigitSkeletonValues
-  .map(escapeRegularExpression).join('|')
-const IMPLEMENTATION_DIGIT_SKELETON_SET = new Set(implementationDigitSkeletonValues)
-const gptSkeleton = escapeRegularExpression(normalizeImplementationGuardText('GPT'))
-const oSkeleton = [
-  normalizeImplementationGuardText('o'),
-  normalizeImplementationGuardText('O'),
-].map(escapeRegularExpression).join('|')
-const implementationDynamicSkeletonCore = `(?:${gptSkeleton}(?:(?:[- ]?(?:${implementationDigitSkeleton})+(?:\\.(?:${implementationDigitSkeleton})+)*(?:[A-Za-z][A-Za-z0-9]*)?(?:-[A-Za-z0-9]+)*)|(?:[- ]?oss(?:-[A-Za-z0-9]+)*))|(?:${oSkeleton})(?:${implementationDigitSkeleton})+(?:[-.][A-Za-z0-9]+)*)`
-const INTERNAL_DYNAMIC_IMPLEMENTATION_SKELETON = new RegExp(
-  `${implementationSkeletonLeftBoundary}${implementationDynamicSkeletonCore}${implementationSkeletonRightBoundary}`,
-  'iu',
-)
-const implementationRoleSuffix = '(?:Worker|Runner|Reviewer|Monitor|Runtime|Executor|Session|Queue|Broker|Server|Backend|Agent|Supervisor|Client|Window|Pane|Endpoint|Transport|Connection|Channel|Thread|Process)'
-const INTERNAL_PROCESS_IDENTIFIER_SKELETON = new RegExp(
-  `${implementationSkeletonLeftBoundary}(?:(?:${implementationStaticSkeletonCore}|${implementationDynamicSkeletonCore})[\\s_-]*${implementationRoleSuffix}s?|(?:serial|job|queue|task|thread|session)[\\s_-]*${implementationRoleSuffix}s?)${implementationSkeletonRightBoundary}`,
-  'iu',
-)
-const INTERNAL_INFLECTED_IMPLEMENTATION_SKELETON = new RegExp(
-  implementationStaticSkeletonCore,
-  'iu',
-)
-const INTERNAL_INFLECTED_DYNAMIC_IMPLEMENTATION_SKELETON = new RegExp(
-  `^${implementationDynamicSkeletonCore}[\\p{L}\\p{N}\\p{M}_]{1,4}$`,
-  'iu',
-)
-
-const DISTINCTIVE_IMPLEMENTATION_IDENTIFIER = /(?:OpenAI|Codex|Claude|Grok|Herdr|Seatbelt|MCP|GPT)/gi
-const INTERNAL_PRODUCT_ROLE_IDENTIFIER = /(?:OpenAI|Codex|Claude|Grok|Herdr|Seatbelt|MCP|GPT)(?:worker|runner|reviewer|monitor|runtime|executor|session|queue|broker|server|backend|agent|supervisor|client|window|pane|endpoint|transport|connection|channel|thread|process)s?/i
-const INTERNAL_O_PRODUCT_ROLE_IDENTIFIER = /o\d+[A-Za-z0-9._-]*(?:worker|runner|reviewer|monitor|runtime|executor|session|queue|broker|server|backend|agent|supervisor|client|window|pane|endpoint|transport|connection|channel|thread|process)s?/i
-const DISTINCTIVE_IMPLEMENTATION_IDENTIFIER_NAMES = [
-  'openai', 'codex', 'claude', 'grok', 'herdr', 'seatbelt', 'mcp', 'gpt',
-] as const
-
-function containsAsciiImplementationIdentifier(value: string, allowedText = ''): boolean {
-  const allowedTokens = new Set(
-    (allowedText.match(/[A-Za-z0-9_]+/g) ?? []).map(token => token.toLowerCase()),
-  )
-  return (value.match(/[A-Za-z0-9_]+/g) ?? []).some(token => {
-    const folded = token.toLowerCase()
-    if (allowedTokens.has(folded)) return false
-    if (DISTINCTIVE_IMPLEMENTATION_IDENTIFIER_NAMES.some(name => (
-      folded !== name && folded.includes(name)
-    ))) return true
-    if (INTERNAL_PRODUCT_ROLE_IDENTIFIER.test(token)) return true
-    if (INTERNAL_O_PRODUCT_ROLE_IDENTIFIER.test(token)) return true
-    for (const match of token.matchAll(/o\d+/gi)) {
-      const index = match.index ?? 0
-      const end = index + match[0].length
-      const previous = token[index - 1] ?? ''
-      const next = token[end] ?? ''
-      const startsSegment = index === 0 || previous === '_'
-        || (/[a-z0-9]/.test(previous) && /[A-Z]/.test(token[index] ?? ''))
-      const endsSegment = end === token.length || next === '_' || /[A-Z]/.test(next)
-      if (startsSegment && endsSegment) return true
-    }
-    for (const match of token.matchAll(new RegExp(DISTINCTIVE_IMPLEMENTATION_IDENTIFIER.source, 'gi'))) {
-      const index = match.index ?? 0
-      const end = index + match[0].length
-      const previous = token[index - 1] ?? ''
-      const next = token[end] ?? ''
-      const beginsCamelSegment = index > 0
-        && (previous === '_' || /[A-Z]/.test(token[index] ?? ''))
-      const endsAtSegmentBoundary = end === token.length || next === '_'
-        || /[A-Z]/.test(next)
-      if ((beginsCamelSegment && endsAtSegmentBoundary)
-        || (index === 0 && end < token.length && /[A-Z_]/.test(next))) {
-        return true
-      }
-    }
-    return false
-  })
-}
-
-function containsImplementationSkeleton(value: string, allowedIdentifierText = ''): boolean {
-  const skeleton = normalizeImplementationGuardText(value)
-  return containsAsciiImplementationIdentifier(value, allowedIdentifierText)
-    || INTERNAL_IMPLEMENTATION_SKELETON.test(skeleton)
-    || INTERNAL_DYNAMIC_IMPLEMENTATION_SKELETON.test(skeleton)
-    || INTERNAL_PROCESS_IDENTIFIER_SKELETON.test(skeleton)
-    || (value.match(/[\p{L}\p{N}\p{M}_]+/gu) ?? []).some(token => {
-      const tokenSkeleton = normalizeImplementationGuardText(token)
-      if (tokenSkeleton === token.normalize('NFD')) return false
-      if (INTERNAL_INFLECTED_IMPLEMENTATION_SKELETON.test(tokenSkeleton)
-        || INTERNAL_INFLECTED_DYNAMIC_IMPLEMENTATION_SKELETON.test(tokenSkeleton)) {
-        return true
-      }
-      const characters = [...token.normalize('NFD')]
-      for (let start = 0; start < characters.length - 1; start += 1) {
-        const source = characters[start] ?? ''
-        const sourceSkeleton = normalizeImplementationGuardText(source)
-        if (!/\p{L}/u.test(source) || !/^o$/i.test(sourceSkeleton)) continue
-        // Interior ASCII `o` is common in public identifiers such as logo123.
-        // Interior confusables are not: their skeleton change is the signal
-        // that an o-family model name was embedded inside a larger token.
-        if (start > 0 && sourceSkeleton === source.normalize('NFD')) continue
-        let digitCount = 0
-        for (const character of characters.slice(start + 1)) {
-          if (!/\p{N}/u.test(character)
-            || !IMPLEMENTATION_DIGIT_SKELETON_SET.has(
-              normalizeImplementationGuardText(character),
-            )) break
-          digitCount += 1
-        }
-        if (digitCount > 0) return true
-      }
-      return false
-    })
-}
-
-function containsInternalImplementationName(value: string): boolean {
-  const normalized = normalizePublicGuardText(value)
-  return INTERNAL_IMPLEMENTATION_NAME.test(normalized)
-    || containsImplementationSkeleton(normalized)
-}
-
-function containsConfusableInternalImplementationName(
-  value: string,
-  allowedIdentifierText = '',
-): boolean {
-  const withoutExactNames = value.replace(
-    new RegExp(INTERNAL_IMPLEMENTATION_NAME.source, 'gi'),
-    match => ' '.repeat(match.length),
-  )
-  return containsImplementationSkeleton(withoutExactNames, allowedIdentifierText)
-}
 
 /**
  * Path redaction is a safety boundary, but its implementation marker is not
@@ -15403,31 +15237,7 @@ export function sanitizeExecutionTextForSlack(
     visible.push(line)
   }
 
-  // The runtime's own repository name still must not reach Slack: it carries
-  // an implementation name inside it. Deleting every clause that mentions it
-  // is what fails, because the whole answer collapses into a bare
-  // non-disclosure notice and the reader cannot tell a refusal from a crash.
-  // Withhold the name the way other protected terms are withheld - replace it
-  // with a neutral noun - so the surrounding explanation survives.
-  const repositoryNames: string[] = []
-  const repositoryPlaceholderNonce = encodeSlackGuardNonce(randomUUID())
-  const maskRepositoryNames = (value: string): string => value.replace(
-    /\bzero[-_ ]?codex\b/gi,
-    match => {
-      const index = repositoryNames.push(match) - 1
-      return `\uE002${repositoryPlaceholderNonce}_${index}\uE003`
-    },
-  )
-  // Preserve only the fixed public dependency diagnostics through the internal
-  // implementation filter. An arbitrary line mentioning an advisor is not exempt.
-  const publicDiagnosticNonce = encodeSlackGuardNonce(randomUUID())
-  const publicDiagnostics: string[] = []
-  const visibleText = visible.map(line => {
-    if (!PUBLIC_ADVISOR_FAILURE_MESSAGES.has(line.trim())) return line
-    const index = publicDiagnostics.push(line.trim()) - 1
-    return `\uE006${publicDiagnosticNonce}_${index}\uE007`
-  }).join('\n')
-  let sanitized = maskRepositoryNames(normalizeGuardText(visibleText))
+  let sanitized = normalizeGuardText(visible.join('\n'))
   let inputEntries = [{
     task: job.task,
     attachments: job.attachments,
@@ -15442,13 +15252,9 @@ export function sanitizeExecutionTextForSlack(
       userId: entry.userId,
     }))
   } catch {}
-  const userText = maskRepositoryNames(normalizeGuardText(inputEntries
+  const userText = normalizeGuardText(inputEntries
     .map(entry => slackAuthoredTask(entry.task, entry.attachments))
-    .join('\n')))
-  const latestEntry = inputEntries.at(-1)
-  const latestUserText = maskRepositoryNames(normalizeGuardText(latestEntry
-    ? slackAuthoredTask(latestEntry.task, latestEntry.attachments)
-    : job.task))
+    .join('\n'))
   const sensitiveValues = [
     artifactDirForJob(dir, job.id),
     sealedArtifactDirForJob(dir, job.id),
@@ -15535,9 +15341,7 @@ export function sanitizeExecutionTextForSlack(
     },
   )
 
-  // Strip path and runtime-identity shapes before replacing their component
-  // implementation names. Otherwise `~/.codex/...` could become a partially
-  // redacted path that still reveals the host layout.
+  // Protect path and runtime-identity shapes independently of product names.
   const redactPathUnlessUserAuthored = (value: string): string => (
     userText.includes(normalizeGuardText(value)) ? value : '（内部パスを省略）'
   )
@@ -15574,7 +15378,6 @@ export function sanitizeExecutionTextForSlack(
   const containsDecodedInternalIdentity = (value: string): boolean => {
     const decoded = normalizeGuardText(value)
     return sensitiveValues.some(sensitive => decoded.includes(sensitive))
-      || containsInternalImplementationName(decoded)
       || /\bw[A-Za-z0-9_-]+:[pt][A-Za-z0-9_-]+\b|\bterm_[A-Za-z0-9_-]+\b/.test(decoded)
       || /(?<![A-Za-z0-9_])"?(?:pid|process[ _-]?id|state[ _-]?change[ _-]?seq|duration[ _-]?ms)"?(?:\s*[:=]\s*|\s+(?:is\s+)?)"?\d+"?(?![A-Za-z0-9_])/i.test(decoded)
       || /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/i.test(decoded)
@@ -15894,292 +15697,10 @@ export function sanitizeExecutionTextForSlack(
   })
 
   // Credentials are never safe to echo into a shared Slack thread, even when
-  // the sender pasted the same value in the request. Product-name exemptions
-  // below must not turn user input into a credential allowlist.
+  // the sender pasted the same value in the request. User input must not
+  // turn into a credential allowlist.
   sanitized = redactCredentialMaterial(sanitized, '（認証情報を省略）')
 
-  // Keep legitimate product comparisons when the user asked for them, but
-  // drop clauses that describe Zeroちゃん's host/runtime wiring. A product
-  // name appearing anywhere in the request must never globally authorize an
-  // unrelated internal architecture disclosure in the response.
-  const implementationName = INTERNAL_IMPLEMENTATION_NAME
-  const internalSubject = /(?:Zeroちゃん|\bZero\b|ゼロ(?:ちゃん)?|当システム|本システム|このシステム|そのシステム|当サービス|本サービス|このサービス|このボット|当ボット|本ボット|この処理|その処理|当処理|本処理|内部では|裏側|中身|基盤として|技術スタック|使用技術|全(?:ての)?(?:回答|処理)|私の(?:回答|返答|処理|作業)|under\s+the\s+hood|behind\s+the\s+scenes|\b(?:requests?|responses?)\s+(?:are\s+)?handled\b|\b(?:every|each)\s+(?:request|response|question)\b|\ball\s+answers?\b|\b(?:the\s+)?answers?\s+in\s+this\s+Slack\s+thread\b|\bthis\s+Slack\s+thread\b|\bme\b|\bmy\s+(?:responses?|answers?|replies?|work)\b|(?:^|[\s、])(?:処理|回答|実行)(?:には|は|で)|私は|私たちは|こちら|\b(?:i|we|it)\b|\b(?:the|our|this|my|your)\s+(?:underlying\s+|reasoning\s+)?(?:system|service|application|agent|assistant|bot|implementation|model|engine|runtime|backend|worker|stack|architecture)\b|(?:^|[\s])(?:implementation|backend|runtime|model|engine|architecture|stack)\s*(?:is\b|uses?\b|[:=])|\bour\s+reasoning\s+engine\b)/i
-  const internalRelationship = /(?:使用中|利用中|稼働中|で動いて|で動作|で構成|を使って(?:いる|います)|使(?:う|い|って|用し)|使用し|利用し|採用|動作し|稼働し|起動し|呼び出し|経由し|構成され|(?:は|=|:|：|（|\().{0,60}(?:です|である|だ|is\b|）|\))|(?:powered\s+by|runs?\s+(?:on|through)|(?:i|we)\s+use|i['’]?m\s+using|\buses?\b|\bused\b|based\s+on|built\s+(?:on|with)|composed\s+of|implemented\s+in|written\s+in|implementation\s+(?:uses?|is)|engine\s*(?:is|:)))/i
-  const internalConfiguration = /(?:採用(?:エンジン|モデル|実装|構成)|(?:バックエンド|モデル|エンジン|実装|構成|ランタイム|基盤|中身|裏側))\s*(?:は|=|:|：)/i
-  const externalTechnicalTarget = /(?:\b(?:repo(?:sitory)?|project|code(?:base)?|source|package\.json|readme|target\s+(?:app|application|service|system))\b|(?:この|その|対象|当該|現在の)?(?:リポジトリ|レポジトリ|プロジェクト|コード(?:ベース)?|ソースコード)|対象(?:アプリ|サービス|システム)|package\.json|README)/i
-  const selfInquirySubject = /(?:Zeroちゃん|\bZero\b|ゼロ(?:ちゃん)?|当システム|本システム|このシステム|そのシステム|当サービス|本サービス|このサービス|このボット|当ボット|本ボット|あなた|君|お前|そちら|\b(?:you|your|yourself|this\s+(?:bot|assistant|agent|system|service))\b)/i
-  const explicitResponseSelfIdentity = /(?:Zeroちゃん|\bZero\b|ゼロ(?:ちゃん)?|当システム|本システム|このシステム|そのシステム|当サービス|本サービス|このサービス|このボット|当ボット|本ボット|私は|私たちは|こちら|当方|ここ(?:で|では)|\b(?:i|we|me|my|our|us|here)\b|\b(?:this|our|my)\s+(?:bot|assistant|agent|system|service|application|app|backend|runtime|implementation)\b)/i
-  const selfExecutionContext = /(?:\b(?:this|the\s+current)\s+(?:request|response|answer|reply)\b|\bthe\s+active\s+model\b|^\s*handled\s+by\b|\bhandled\s+(?:this|the\s+current)\s+request\b|\bran\s+through\b|\bgenerated\s+(?:this|the\s+current)\s+(?:answer|response)\b|(?:この|今回の)(?:依頼|回答|返答|応答|処理)|(?:担当|採用)(?:モデル|エンジン)|(?:が|で)(?:この)?(?:回答|返答|応答)を?生成|で回答(?:しました|した|しています))/i
-  // A current-usage question is not an indefinite alternative (何かを使う)
-  // or a prospective choice (何を使うべき). Do not bridge arbitrary prose
-  // between the interrogative and verb: one false match erases the result.
-  // なに must not be the tail of こんなに/そんなに; 製 is a predicate,
-  // not the prefix of a compound noun such as 製品 or 製造.
-  const subjectOmittedCurrentUsageQuestion = /(?:何|(?<![\p{Script=Hiragana}\p{Script=Katakana}])なに)(?:製(?!\p{Script=Han})|(?:を|の[^\s、。！？!?]{1,12}を?)?使ってる)/u
-  const subjectOmittedSelfQuestion = /(?:(?:何|なに)(?:で|の)?(?:動いて|動く|動作|モデル|エンジン|基盤|書かれて|できて|作られて)|(?:どんな|どういう).{0,12}(?:技術|部品|構成要素|材料|仕組み|構成)(?:で動いてる|で動く|を使ってる|でできてる|なの|[?？])|どうやって.{0,16}(?:動いて|動く|動作|作られ|構築)|(?:仕組み|裏側|中身|部品|構成要素|土台|成り立ち|材料|依存関係)(?:は|を)?.{0,16}(?:[?？]|教えて|説明して)|使用(?:モデル|エンジン)|(?:what|which)\s+(?:model|engine|runtime|backend)\s*(?:are\s+you|do\s+you|is\s+it|does\s+it|[?？])|what\s+(?:do\s+you|does\s+it)\s+(?:run|use)|what\s+is\s+it\s+(?:made\s+of|written\s+in)|what\s+is\s+under\s+the\s+hood|how\s+was\s+it\s+built|what\s+dependencies\s+does\s+it\s+have|(?:what|how).{0,28}\byou\b.{0,28}(?:built|implemented|technology|using|use|powered)|what\s+powers?\s+you)/i
-  const configurationInquiry = /(?:仕組み|構成|実装|アーキテクチャ|技術スタック|使用技術|裏側|中身|基盤|土台|部品|構成要素|成り立ち|材料|ライブラリ|ランタイム|バックエンド|モデル|エンジン|言語|フレームワーク|OS|設計|テクノロジー|技術|依存関係|依存|できて|作られて|作り|構築|runtime|backend|model|engine|stack|architecture|implementation|language|framework|librar|parts?|components?|building\s+blocks?|make\s*up|makeup|foundation|origin|operating\s+system|\bOS\b|design|technolog|dependenc|built|made|powering|tick)/i
-  const questionIntent = /(?:[?？]|教えて|説明(?:して)?|開示|列挙|述べ|何|なに|どの|what|which|tell|show|explain|describe|list|reveal|disclose)/i
-  const subjectOmittedImplementationRelation = /(?:で動いて(?:る|いる)?|で動く|を使って(?:る|いる)|を採用して(?:る|いる)|powered\s+by|runs?\s+on)\s*[?？]?/i
-  const isSelfImplementationInquiry = (clause: string): boolean => {
-    if (externalTechnicalTarget.test(clause) && !selfInquirySubject.test(clause)) return false
-    return subjectOmittedCurrentUsageQuestion.test(clause)
-      || subjectOmittedSelfQuestion.test(clause)
-      || (implementationName.test(clause)
-        && subjectOmittedImplementationRelation.test(clause)
-        && questionIntent.test(clause))
-      || (selfInquirySubject.test(clause)
-        && (implementationName.test(clause) || internalRelationship.test(clause)
-          || internalConfiguration.test(clause)
-          || (configurationInquiry.test(clause) && questionIntent.test(clause))))
-  }
-  const latestInputClauses = latestUserText.split(/\r?\n/)
-    .flatMap(part => (part.match(/.*?(?:[。！？!?]|\.(?=\s|$)|$)/g) ?? [part])
-      .map(clause => clause.trim()).filter(Boolean))
-  const selfImplementationQuestion = latestInputClauses.some(isSelfImplementationInquiry)
-  const externalTechnicalTask = !selfImplementationQuestion
-    && latestInputClauses.some(clause => externalTechnicalTarget.test(clause))
-  const canonicalImplementationName = (value: string): string => normalizeGuardText(value)
-    .replace(/[\s_-]+/g, '')
-    .toLowerCase()
-  const userImplementationMatches = [
-    ...latestUserText.matchAll(new RegExp(implementationName.source, 'gi')),
-  ]
-  const userImplementationNames = new Set(userImplementationMatches
-    .map(match => canonicalImplementationName(match[0])))
-  const userPublicProductPhrases = userImplementationMatches.map(match => {
-    const end = (match.index ?? 0) + match[0].length
-    const suffix = latestUserText.slice(end).match(
-      /^(?:(?:-[A-Za-z0-9]+)|(?:[ \t]+[A-Za-z0-9][A-Za-z0-9._-]*)){0,4}/,
-    )?.[0] ?? ''
-    return `${match[0]}${suffix}`
-      .replace(/\s+(?:and|versus|vs\.?|is|are|was|were|about|explain|describe|compare|difference|pricing|price|features?)\b.*$/i, '')
-      .trim()
-  }).filter(Boolean).sort((left, right) => right.length - left.length)
-  const publicProductDiscussion = userImplementationNames.size > 0
-    && /(?:説明|違い|比較|とは|について|機能|特徴|価格|料金|概要|何ができ|できること|使(?:う|い|って|用)|利用|設定|調査|実装|サンプル|例|書いて|explain|describe|overview|compare|difference|what\s+(?:is|are)|about|capabilit|features?|pricing|price|how\s+to|use|using|configure|configuration|investigate|implement|sample|example|write)/i.test(latestUserText)
-  const userNamedProduct = (name: string): boolean => {
-    const canonical = canonicalImplementationName(name)
-    return userImplementationNames.has(canonical)
-      || (canonical === 'jsonrpc' && userImplementationNames.has('mcp'))
-      || (canonical === 'openaicodex' && userImplementationNames.has('codex'))
-      || (canonical === 'codex' && userImplementationNames.has('openaicodex'))
-      || (canonical === 'modelcontextprotocol' && userImplementationNames.has('mcp'))
-      || (canonical === 'mcp' && userImplementationNames.has('modelcontextprotocol'))
-  }
-  const publicRelationship = /(?:\b(?:develops?|developed|creates?|created|makes?|made|maintains?|maintained|publishes?|published)\b|(?:開発|作成|提供|公開|保守)(?:する|した|している|される|された|元))/i
-  const implementationExecutionDisclosure = (clause: string): boolean => {
-    const name = `(?:${implementationName.source})`
-    const englishWork = '(?:request|task|review|analysis|answer|response|reply|output|result|repository|project)'
-    const englishVerb = '(?:handled|processed|generated|executed|analy[sz]ed|reviewed|inspected|examined|checked|ran|(?:is\\s+)?working\\s+on)'
-    const japaneseWork = '(?:依頼|タスク|調査|回答|返答|応答|分析|レビュー|出力|結果|リポジトリ|プロジェクト)'
-    const japaneseVerb = '(?:処理|生成|実行|担当|分析|解析|調査|確認|レビュー|作業)(?:しました|した|しています|する|済み)?'
-    return new RegExp(`${name}.{0,80}${englishVerb}.{0,80}${englishWork}|${englishWork}.{0,80}${englishVerb}(?:\\s+by)?.{0,32}${name}|${name}.{0,80}${japaneseWork}.{0,80}${japaneseVerb}|${japaneseWork}.{0,80}${name}.{0,32}${japaneseVerb}`, 'i').test(clause)
-  }
-  const externalStaticTechnicalRelationship = (clause: string): boolean => {
-    const plain = normalizeGuardText(clause)
-      .trim()
-      .replace(/^(?:(?:[-+*>]|\d+[.)])\s*)+/, '')
-      .replace(/[*_`~]/g, '')
-      .replace(/[。！？!?]|\.(?=\s*$)/g, '')
-      .trim()
-    if (!externalTechnicalTarget.test(plain) || !implementationName.test(plain)
-      || explicitResponseSelfIdentity.test(plain) || selfExecutionContext.test(plain)) {
-      return false
-    }
-    const names = [...plain.matchAll(new RegExp(implementationName.source, 'gi'))]
-      .map(match => match[0])
-    if (names.length === 0 || names.some(name => !isAllowedPublicProductName(name, plain))) {
-      return false
-    }
-    let masked = plain.replace(
-      new RegExp(`(?:(?:this|the|current|target)\\s+)?(?:${externalTechnicalTarget.source})`, 'gi'),
-      'TARGET',
-    )
-    masked = masked.replace(new RegExp(implementationName.source, 'gi'), 'PRODUCT')
-      .replace(/\s+/g, ' ')
-      .trim()
-    const englishRelation = '(?:uses?|configures?|depends on|imports?|requires?|pins?|integrates? with|supports?|is compatible with|contains?|declares?|references?|enables?)'
-    const englishPassive = '(?:used|configured|imported|required|pinned|integrated|supported|declared|referenced|enabled)'
-    const japaneseRelation = '(?:使(?:う|います|って(?:いる|います)?|われ(?:る|ています)?)|(?:使用|採用|設定|依存|連携|統合|対応|サポート|参照)(?:する|します|し|して(?:いる|います)?|され(?:る|ています)?)?|含(?:む|みます|んで(?:いる|います)?))'
-    return new RegExp(`^TARGET ${englishRelation} PRODUCT(?:\\s*(?:,|and)\\s*(?:${englishRelation} )?PRODUCT)*$`, 'i').test(masked)
-      || new RegExp(`^PRODUCT (?:is|are) ${englishPassive} (?:in|by|for) TARGET$`, 'i').test(masked)
-      || new RegExp(`^TARGET(?:は|が|で|では|に|には)?PRODUCT(?:とPRODUCT)*(?:を|に|へ|が)?${japaneseRelation}$`).test(masked)
-      || new RegExp(`^TARGETのPRODUCT(?:実装|設定|依存関係|対応|サポート)?を(?:確認|検証|調査)(?:しました|済みです|しています)$`).test(masked)
-  }
-  const isAllowedPublicProductName = (name: string, clause: string): boolean => {
-    if (userNamedProduct(name)) return true
-    if (canonicalImplementationName(name) !== 'openai'
-      || !userImplementationNames.has('codex')) return false
-    return /(?:\bOpenAI\s+(?:develops?|creates?|maintains?|publishes?)\s+(?:OpenAI[ -])?Codex\b|\b(?:OpenAI[ -])?Codex\b.{0,48}\b(?:developed|created|maintained|published)\s+by\s+OpenAI\b|\b(?:OpenAI[ -])?Codex\b.{0,48}\bis\s+an?\s+OpenAI\s+(?:coding\s+)?(?:agent|product|tool|model)\b)/i.test(clause)
-  }
-  const publicProductClause = (clause: string): boolean => {
-    if (!publicProductDiscussion) return false
-    if (implementationExecutionDisclosure(clause)) return false
-    const plain = normalizeGuardText(clause)
-      .trim()
-      .replace(/^(?:(?:[-+*>]|\d+[.)])\s*)+/, '')
-      .replace(/[*_`~]/g, '')
-      .replace(/^(?:(?:一般に|一般論として|一般的には)[、,\s]+|(?:in\s+general|generally)[,\s]+)/i, '')
-      .replace(/^the\s+/i, '')
-    const implementationNamesInClause = [
-      ...plain.matchAll(new RegExp(implementationName.source, 'gi')),
-    ].map(match => match[0])
-    if (implementationNamesInClause.some(name => !isAllowedPublicProductName(name, plain))) {
-      return false
-    }
-    const plainFolded = plain.toLowerCase()
-    const exactPublicPhrase = userPublicProductPhrases.find(phrase => {
-      if (!plainFolded.startsWith(phrase.toLowerCase())) return false
-      const remainder = plain.slice(phrase.length)
-      return /^(?:\s|は|が|の|を|と|や|、|とは|という|について|[:,：]|$)/i.test(remainder)
-    })
-    const leading = new RegExp(implementationName.source, 'i').exec(plain)
-    const requestedProductMatch = [...plain.matchAll(new RegExp(implementationName.source, 'gi'))]
-      .find(match => userNamedProduct(match[0]))
-    const containsRequestedProduct = requestedProductMatch !== undefined
-    const leadingText = exactPublicPhrase
-      ?? (leading && leading.index === 0 && userNamedProduct(leading[0]) ? leading[0] : null)
-      ?? (leading && leading.index === 0 && containsRequestedProduct
-        && publicRelationship.test(plain) ? leading[0] : null)
-    if (!leadingText) return false
-    const requestedProductIndex = plain.toLowerCase().indexOf(leadingText.toLowerCase())
-    const unaliasedRemainder = requestedProductIndex === 0
-      ? plain.slice(leadingText.length)
-      : `${plain.slice(0, requestedProductIndex)} ${plain.slice(requestedProductIndex + leadingText.length)}`
-    const remainder = unaliasedRemainder
-      .replace(/^\s*\((?:MCP|Model[ -]Context[ -]Protocol)\)\s*/i, ' ')
-    const selfDeictic = /(?:\b(?:my|me|our|us|here)\b|私|僕|俺|こちら|ここ|当方)/i
-    const remainderWithoutProductAliases = remainder.replace(
-      new RegExp(implementationName.source, 'gi'),
-      '',
-    )
-    if (internalSubject.test(remainderWithoutProductAliases) || selfDeictic.test(plain)
-      || selfExecutionContext.test(plain)) return false
-    const selfDeploymentContext = /(?:\b(?:this|these|that|the\s+current|current)\s+(?:experience|environment|setup|deployment|system|service|application|app|assistant|bot|agent)\b|\b(?:power(?:ed|ing)?|behind|used\s+in|runs?\s+in)\s+(?:this|these|the\s+current|what\s+you\s+see)\b|(?:この|その|現在の|今の|利用中の|使用中の|稼働中の)(?:体験|環境|仕組み|システム|サービス|アプリ|ボット|アシスタント|エージェント|コード支援ツール|開発ツール|開発エージェント|ツール)|(?:この|その)(?:体験|環境|仕組み|システム|サービス|アプリ|ボット)を支える)/i
-    if (selfDeploymentContext.test(plain)) return false
-    if (selfImplementationQuestion
-      && /(?:ここ|こちら|当方|現在|今|この環境|採用|使用中|利用中|使って|使用し|利用し|稼働|基盤|裏側|中身|powered\s+by|runs?\s+(?:on|through)|built\s+(?:on|with)|used\s+(?:here|by\s+us))/i.test(plain)) {
-      return false
-    }
-    if (/^\s*(?:[-–—]?\s*(?:backed|powered)\b|inside\b|is\s+used\b)/i.test(remainder)) {
-      return false
-    }
-    const selectedDeployment = /(?:\b(?:active|current|selected|chosen|in[- ]use)\s+(?:model|engine|tool|agent|assistant|backend|runtime)\b|\bis\s+(?:active|selected|chosen|in[- ]use)\b|(?:使用|担当|採用|選択|利用中|使用中)(?:モデル|エンジン|ツール|エージェント|アシスタント|バックエンド|ランタイム))/i
-    if (selfImplementationQuestion && selectedDeployment.test(plain)) return false
-    const publicDescriptor = /(?:製品|モデル|ツール|標準|規格|プロトコル|機能|特徴|価格|料金|役割|コード|開発|実装|ソフトウェア|エージェント|動作|仕組み|コマンド|API|ライブラリ|設定|サンプル|\b(?:product|model|tool|standard|protocol|feature|pricing|price|role|code|coding|software|developer|agent|assistant|implementation|capabilit(?:y|ies)?|public|open[- ]?weight|operation|command|api|library|configuration|sample|example)\b)/i
-    const selfOutputContext = /(?:\b(?:responses?|replies?|answers?|messages?|outputs?|threads?|conversations?|channels?)\b|回答|返答|応答|メッセージ|出力|スレッド|会話|チャンネル)/i
-    return (/^\s*(?:は|が|の|を|と|や|、|とは|という|について|向け(?:の)?|is\b|are\b|was\b|were\b|means?\b|refers?\b|provides?\b|supports?\b|helps?\b|can\b|does\b|has\b|offers?\b|uses?\b|and\b|vs\.?\b|versus\b|[:,：])/i.test(remainder)
-        || publicRelationship.test(remainder))
-      && (publicDescriptor.test(remainder) || publicRelationship.test(remainder))
-      && !selfOutputContext.test(plain)
-  }
-  const internalTechnicalDisclosure = (clause: string): boolean => {
-    if (!internalSubject.test(clause)) return false
-    return internalRelationship.test(clause) || internalConfiguration.test(clause)
-      || /(?:\b(?:backend|runtime|stack|architecture|implementation|model|engine)\b|(?:バックエンド|ランタイム|技術スタック|使用技術|構成|実装))\s*(?:[:=：]|\bis\b|\buses?\b|\bruns?\b)/i.test(clause)
-  }
-  const subjectOmittedInternalTechnicalDisclosure = (clause: string): boolean => {
-    const value = normalizeGuardText(clause).trim()
-    return /^(?:built\s+with|powered\s+by|runs?\s+on|implemented\s+in|written\s+in|using)\b/i.test(value)
-      || /^(?:(?:[A-Za-z0-9_.+#-]+(?:\s*(?:と|、|,|and)\s*[A-Za-z0-9_.+#-]+)*)\s*(?:で動いて|で動作|を使って|を使用|で実装|で構成)|(?:基盤|バックエンド|ランタイム|実装|構成)\s*(?:は|[:=：]))/i.test(value)
-  }
-  const protectedProductNames: string[] = []
-  const productPlaceholderNonce = randomUUID().replaceAll('-', '')
-  const protectProductNames = (clause: string, protectAll = false): string => clause.replace(
-    new RegExp(implementationName.source, 'gi'),
-    value => {
-      if (!protectAll && !isAllowedPublicProductName(value, clause)) return value
-      const index = protectedProductNames.push(value) - 1
-      return `\uE002${productPlaceholderNonce}:${index}\uE003`
-    },
-  )
-  sanitized = sanitized.split(/(\r?\n)/).map(part => {
-    if (/^\r?\n$/.test(part)) return part
-    const clauses = (part.match(/.*?(?:[。！？!?]|\.(?=\s|$)|$)/g) ?? [part])
-      .filter(clause => clause.length > 0)
-    return clauses.map(clause => {
-      if (containsConfusableInternalImplementationName(clause, userText)) return ''
-      if (implementationExecutionDisclosure(clause)) return ''
-      if (publicProductClause(clause)) return protectProductNames(clause)
-      if (selfImplementationQuestion && purpose === 'result') return ''
-      if (externalTechnicalTask && !explicitResponseSelfIdentity.test(clause)
-        && !selfExecutionContext.test(clause)) {
-        if (!implementationName.test(clause)) return clause
-        if (externalStaticTechnicalRelationship(clause)) {
-          return protectProductNames(clause)
-        }
-        return ''
-      }
-      if (implementationName.test(clause) || internalTechnicalDisclosure(clause)
-        || subjectOmittedInternalTechnicalDisclosure(clause)) return ''
-      return clause
-    }).join('')
-  }).join('')
-  if (selfImplementationQuestion && purpose === 'result') {
-    const nonDisclosure = SELF_IMPLEMENTATION_NON_DISCLOSURE
-    const publicText = sanitized.split(/\r?\n/)
-      .filter(line => line.trim() !== nonDisclosure)
-      .join('\n')
-      .trim()
-    sanitized = publicText.length > 0
-      ? `${publicText}\n${nonDisclosure}`
-      : nonDisclosure
-  }
-
-  for (const pattern of [
-    /\bOpenAI[ -]Codex\b/gi,
-    /\bOpenAI(?:[ -]?API)?\b/gi,
-    /\bCodex\b/gi,
-    /\bClaude(?:[ -]Code)?\b/gi,
-    /\bGrok\b/gi,
-    /\bHerdr\b/gi,
-    /\bApp[ -]Server\b/gi,
-    /\bModel[ -]Context[ -]Protocol\b/gi,
-    /\bMCP[ -]?broker\b/gi,
-    /\bMCP\b/gi,
-    /\badvisor[ -]?panels?\b/gi,
-    /\badvisors?\b/gi,
-    /\breviewers?\b/gi,
-    /\bsub[ -]?agents?\b/gi,
-    /\bbrokers?\b/gi,
-    /\bJSON[ -]?RPC\b/gi,
-    /\bSeatbelt\b/gi,
-    /\bGPT(?:[- ]?(?:\d+(?:\.\d+)*(?:[A-Za-z][A-Za-z0-9]*)?(?:-[A-Za-z0-9]+)*|oss(?:-[A-Za-z0-9]+)*))?\b/gi,
-    /\bo\d+(?:[-.][A-Za-z0-9]+)*\b/gi,
-    /コーデックス/gi,
-    /クロードコード/gi,
-    /クロード/gi,
-    /グロック/gi,
-    /モデルコンテキストプロトコル/gi,
-    /アドバイザー/g,
-    /レビュアー/g,
-    /サブエージェント/g,
-    /ブローカー/g,
-    /\bjob\b/gi,
-    /\bworker\b/gi,
-    /\bqueue\b/gi,
-  ]) {
-    const inputPattern = new RegExp(pattern.source, pattern.flags.replace('g', ''))
-    const relatedPublicTerm = pattern.source.includes('JSON') && pattern.source.includes('RPC')
-      && /(?:\bMCP\b|モデルコンテキストプロトコル)/i.test(latestUserText)
-    const relatedOpenAICodex = pattern.source.includes('OpenAI')
-      && /\bCodex\b/i.test(latestUserText) && /\bOpenAI[ -]Codex\b/i.test(sanitized)
-    const relatedMcpLongName = pattern.source.includes('Model[ -]Context')
-      && /\bMCP\b/i.test(latestUserText)
-    if (!inputPattern.test(latestUserText) && !relatedPublicTerm
-      && !relatedOpenAICodex && !relatedMcpLongName) {
-      sanitized = sanitized.replace(pattern, '内部処理')
-    }
-  }
-  protectedProductNames.forEach((name, index) => {
-    sanitized = sanitized.replaceAll(`\uE002${productPlaceholderNonce}:${index}\uE003`, name)
-  })
-  repositoryNames.forEach((_name, index) => {
-    sanitized = sanitized.replaceAll(
-      `\uE002${repositoryPlaceholderNonce}_${index}\uE003`,
-      WITHHELD_REPOSITORY_NAME,
-    )
-  })
   const zeroMarker = /\[ZERO_/i.exec(sanitized)
   if (zeroMarker) sanitized = sanitized.slice(0, zeroMarker.index).trimEnd()
   sanitized = sanitized.replace(
@@ -16205,9 +15726,6 @@ export function sanitizeExecutionTextForSlack(
       .join('\n')
   }
   sanitized = naturalizeSlackRedactions(sanitized).trim()
-  publicDiagnostics.forEach((diagnostic, index) => {
-    sanitized = sanitized.replaceAll(`\uE006${publicDiagnosticNonce}_${index}\uE007`, diagnostic)
-  })
   return sanitized
 }
 
@@ -16537,9 +16055,7 @@ export function finalizeSuccessfulExecution(
       advisorCoverage,
       'result',
     )
-    const containsSelfNonDisclosure = sanitized.split(/\r?\n/)
-      .some(line => line.trim() === SELF_IMPLEMENTATION_NON_DISCLOSURE)
-    const marker = output.files.length > 0 && !containsSelfNonDisclosure
+    const marker = output.files.length > 0
       ? `<zerokun_files>${JSON.stringify(output.files)}</zerokun_files>`
       : ''
     return {
@@ -16660,9 +16176,7 @@ function normalizePersistedExecutionResult(
   const text = body.length + suffix.length <= MAX_PERSISTED_RESULT_TEXT_CHARS
     ? `${body}${suffix}`.trim()
     : `${body.slice(0, availableBodyChars)}${truncationNotice}${suffix}`.trim()
-  const containsSelfNonDisclosure = sanitized.split(/\r?\n/)
-    .some(line => line.trim() === SELF_IMPLEMENTATION_NON_DISCLOSURE)
-  const marker = output.files.length > 0 && !containsSelfNonDisclosure
+  const marker = output.files.length > 0
     ? `<zerokun_files>${JSON.stringify(output.files.slice(0, 10))}</zerokun_files>`
     : ''
   return marker ? `${text}\n${marker}`.trim() : text
@@ -16810,13 +16324,11 @@ function slackVisibleArtifactFilename(job: JobRecord, filename: string, dir: str
   )
   const unsafe = sanitized !== normalized
     || internalValues.some(value => normalized.includes(value.normalize('NFKC')))
-    || containsInternalImplementationName(normalized)
     || /[\0\r\n/\\]/.test(normalized)
     || Buffer.byteLength(normalized) > 180
   if (!unsafe) return filename
   const extension = extname(normalized)
   const safeExtension = /^\.[A-Za-z0-9]{1,10}$/.test(extension)
-    && !containsInternalImplementationName(extension)
     ? extension.toLowerCase()
     : ''
   return `result${safeExtension}`

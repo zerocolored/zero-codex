@@ -371,6 +371,11 @@ export function launchDetachedUpdateWorker(
   ], { env: buildUpdaterEnvironment() })
 }
 
+function notificationRetryWindowOpen(request: UpdateRequest, now: number, staleAfterMs: number): boolean {
+  return Boolean(request.outcome && !request.outcome.notifiedAt
+    && now - request.outcome.completedAt <= staleAfterMs)
+}
+
 export async function requestUpdate(
   rawInput: UpdateRequestInput,
   options: RequestOptions = {},
@@ -430,7 +435,18 @@ export async function requestUpdate(
       }
     }
     running ||= isUpdateRunning()
-    if (age <= (options.staleAfterMs ?? DEFAULT_STALE_MS) || running || existing.outcome) {
+    if (existing.outcome && existing.chatId === input.chatId && existing.messageId === input.messageId) {
+      // 同じSlack eventは更新を再実行しない。期限内なら保存済み結果の通知だけを再開する。
+      if (!running && notificationRetryWindowOpen(existing, now(), options.staleAfterMs ?? DEFAULT_STALE_MS)) {
+        launch(existing)
+      }
+      await options.onDuplicate?.(existing)
+      return { accepted: false, duplicate: true, request: existing }
+    }
+    // 別の新規依頼は、通知だけが残った過去の結果に永久に塞がれない。
+    const onlyDeliveryPending = Boolean(existing.outcome) && !running
+    if (!onlyDeliveryPending
+      && (age <= (options.staleAfterMs ?? DEFAULT_STALE_MS) || running)) {
       if (!running) launch(existing)
       await options.onDuplicate?.(existing)
       return { accepted: false, duplicate: true, request: existing }
@@ -486,6 +502,12 @@ export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean
   }
   const isUpdateRunning = options.isUpdateRunning ?? (() => updateMutationIsRunning(dir))
   if (isUpdateRunning()) return false
+  // 長い更新の直後にも通知の猶予を確保する。期限切れでも同一eventの再実行を防ぐ記録は残す。
+  const now = options.now ?? Date.now
+  if (request.outcome
+    && !notificationRetryWindowOpen(request, now(), options.staleAfterMs ?? DEFAULT_STALE_MS)) {
+    return false
+  }
   const launch = options.launchWorker ?? ((value: UpdateRequest) => {
     launchDetachedUpdateWorker(value, {
       stateDir: dir,
@@ -975,9 +997,12 @@ export async function runUpdateWorker(
       persistRequest(dir, { ...request, outcome })
       return { success: outcome.success, exitCode: outcome.exitCode, notificationSent: true }
     } catch (error) {
+      // 種別と試行回数まで残す。messageだけだと "The operation was aborted." のような
+      // どの層が中断したのか判らない1行になり、実機で原因の切り分けができなかった。
       appendUpdateLog(
         logPath,
-        `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}\n`,
+        `${new Date().toISOString()} notify attempt ${attempt}/${maxAttempts} failed: `
+        + `${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}\n`,
       )
       if (attempt < maxAttempts) await Bun.sleep(retryMs)
     }

@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 
 PROMPT_NAME = "prompt"
@@ -555,7 +555,14 @@ def _run_git(root: Path, arguments: List[str]) -> bytes:
     return result.stdout
 
 
-def _workspace_members(root_descriptor: int, root: Path) -> Optional[Tuple[str, ...]]:
+class _WorkspacePin(NamedTuple):
+    members: Tuple[str, ...]
+    # .zerochan/workspace.json の projectRepository。true は「親フォルダ自体も
+    # レビュー対象の Git リポジトリ」という正式な宣言（project-layout.ts が生成する）。
+    project_repository: bool
+
+
+def _workspace_members(root_descriptor: int, root: Path) -> Optional[_WorkspacePin]:
     zerochan_descriptor: Optional[int] = None
     pin_descriptor: Optional[int] = None
     try:
@@ -592,13 +599,18 @@ def _workspace_members(root_descriptor: int, root: Path) -> Optional[Tuple[str, 
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise UnsafeRequest("workspace configuration is invalid") from error
+        # v2 の projectRepository は true / false の両方が正式な値。
+        # かつて false しか受け付けず、「親フォルダ自体も Git リポ」の workspace
+        # （BellSalesAI 型・projectRepository: true）では Claude advisor が snapshot 前に
+        # 必ず落ちていた（2026-09-16 実機確認。Grok reviewer 側 #43 と同型の、
+        # 生成側 project-layout.ts と検証側の契約食い違い）。
         if (
             not isinstance(value, dict)
             or not (
                 (value.get("version") == 1 and set(value) == {"version", "kind", "members"})
                 or (value.get("version") == 2
                     and set(value) == {"version", "kind", "members", "projectRepository"}
-                    and value.get("projectRepository") is False)
+                    and isinstance(value.get("projectRepository"), bool))
             )
             or value.get("kind") != "multi-repo-workspace"
             or not isinstance(value.get("members"), list)
@@ -641,7 +653,10 @@ def _workspace_members(root_descriptor: int, root: Path) -> Optional[Tuple[str, 
             finally:
                 if child_descriptor is not None:
                     os.close(child_descriptor)
-        return tuple(members)
+        return _WorkspacePin(
+            members=tuple(members),
+            project_repository=bool(value.get("projectRepository", False)),
+        )
     finally:
         if pin_descriptor is not None:
             os.close(pin_descriptor)
@@ -664,7 +679,10 @@ def _physical_git_root(path_text: str) -> Tuple[int, Path]:
         reported = Path(decoded).resolve(strict=True)
         if reported != physical:
             raise UnsafeRequest("project root must be the physical Git worktree root")
-        if _workspace_members(descriptor, physical) is not None:
+        # projectRepository: true の pin は「親自体も Git リポ」を明示した構成なので許可する。
+        # false / v1 の pin で親が Git 化されていたら従来どおり拒否する（黙った昇格を防ぐ）。
+        pin = _workspace_members(descriptor, physical)
+        if pin is not None and not pin.project_repository:
             raise UnsafeRequest("a pinned workspace parent must not also be a Git worktree")
         return descriptor, physical
     except BaseException:
@@ -803,7 +821,11 @@ def _filesystem_protected_digest(root_descriptor: int, root: Path) -> Tuple[int,
     digest = hashlib.sha256()
     digest.update(PROTECTED_DIGEST_DOMAIN)
     protected_count = 0
-    workspace_members = _workspace_members(root_descriptor, root)
+    workspace_pin = _workspace_members(root_descriptor, root)
+    # projectRepository: true でも棚卸しは member + root instruction に限定したままにする。
+    # 親直下には .worktrees/ など巨大で変化し続けるディレクトリが置かれうるため、
+    # 全走査にすると advisor round 中に protected digest が揺れて偽陽性で落ちる。
+    workspace_members = workspace_pin.members if workspace_pin is not None else None
 
     def visit(
         descriptor: int,
@@ -1303,10 +1325,10 @@ def _herdr_binary() -> str:
     ):
         raise UnsafeRequest("pinned Herdr executable is unavailable")
     discovered = shutil.which("herdr")
-    if discovered is None or os.path.normpath(discovered) != candidate:
-        raise UnsafeRequest("PATH does not resolve the pinned Herdr executable")
     try:
         resolved = Path(candidate).resolve(strict=True)
+        if discovered is None or Path(discovered).resolve(strict=True) != resolved:
+            raise UnsafeRequest("PATH does not resolve the pinned Herdr executable")
     except OSError as error:
         raise UnsafeRequest("Herdr cannot be resolved safely") from error
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
@@ -2115,7 +2137,12 @@ _ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\
 _TRUST_DECORATION = re.compile(r"[\u2500-\u257f❯›▶▷◉●○◆◇]")
 _TRUST_SELECTION = re.compile(r"[❯›▶▷]")
 _FIRST_CHOICE_SELECTED = re.compile(r"^[\s\u2500-\u257f]*[❯›▶▷][\s\u2500-\u257f]*1\.")
-_EMPTY_PROMPT_LINE = re.compile(r"^\s*❯\s*$")
+# Claude Code 2.1.27x は空の入力行に薄いプレースホルダ（Try "…"）を重ねて表示し、
+# ❯ との区切りに NBSP（U+00A0）を使う（2026-09-16 に v2.1.273 実機で採取:
+# '❯\xa0Try "fix lint errors"'）。プレースホルダは入力が空のときにしか出ないので、
+# 「❯ + プレースホルダのみ」も空の可視プロンプトとして扱う。advisor-broker.ts の
+# emptyClaudePrompt と同じ判定に保つこと。
+_EMPTY_PROMPT_LINE = re.compile(r"^\s*❯[\s ]*(?:Try \"[^\"]{0,80}\")?[\s ]*$")
 _INTERACTIVE_HINT = re.compile(
     r"(?i)(?:\b(?:press|hit|choose|select|confirm|cancel|continue|proceed|approve|deny|allow)\b.*\b(?:enter|return|esc|escape|key|option)\b|"
     r"\b(?:enter|return|esc|escape)\b.*\b(?:confirm|cancel|continue|select|submit)\b|"
@@ -2134,6 +2161,66 @@ def _empty_claude_prompt_screen(text: str) -> bool:
     if not prompt_lines:
         return False
     return _EMPTY_PROMPT_LINE.fullmatch(lines[prompt_lines[-1]]) is not None
+
+
+_STARTUP_FORBIDDEN_UI = re.compile(
+    r"(?i)password|passkey|captcha|rate limit|payment|survey|sign in|log in|"
+    r"approve|allow access|grant permission|permissions? (?:request|required|needed)|"
+    r"(?:enter|provide|paste).*(?:token|credential)|(?:MFA|2FA)|authentication required"
+)
+
+
+def _keep_xhigh_screen(text: str) -> bool:
+    plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
+    lines = [line.strip() for line in plain.splitlines() if line.strip()]
+    return (
+        sum(line == "Use Fable 5.1 at high effort by default?" for line in lines) == 1
+        and sum(line == "❯ Keep xhigh" for line in lines) == 1
+        and sum(line == "Switch Fable 5.1 to high effort" for line in lines) == 1
+        and sum("❯" in line for line in lines) == 1
+        and not any(_STARTUP_FORBIDDEN_UI.search(line) for line in lines)
+    )
+
+
+def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str, object]:
+    """Metadata-ready can precede the effort question. Confirm only the owned UI."""
+    accepted_effort = False
+    deadline = time.monotonic() + CLAUDE_SETTLE_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        _result, first = _agent_information(target)
+        if first is None:
+            raise UnsafeRequest("ephemeral Claude disappeared before visible readiness")
+        _validate_owned_agent(first, workspace, require_ready=False)
+        first_text = _read_visible(target)
+        time.sleep(1.0)
+        _result, second = _agent_information(target)
+        if second is None:
+            raise UnsafeRequest("ephemeral Claude disappeared before visible readiness")
+        _validate_owned_agent(second, workspace, require_ready=False)
+        second_text = _read_visible(target)
+        stable = (type(first.get("state_change_seq")) is int
+                  and first.get("state_change_seq") == second.get("state_change_seq")
+                  and first_text == second_text)
+        if not stable:
+            continue
+        if _keep_xhigh_screen(second_text):
+            if not accepted_effort:
+                _validate_owned_topology(workspace)
+                result = _run_herdr(["agent", "send-keys", target, "Enter"])
+                if result.returncode != 0:
+                    raise UnsafeRequest("ephemeral Claude effort confirmation failed")
+                accepted_effort = True
+            continue
+        plain = _ANSI_SEQUENCE.sub("", second_text).replace("\r", "")
+        if _STARTUP_FORBIDDEN_UI.search(plain):
+            raise UnsafeRequest("ephemeral Claude has a prohibited startup UI")
+        if _empty_claude_prompt_screen(second_text):
+            _validate_owned_agent(second, workspace, require_ready=True)
+            return second
+        # Metadata can precede a fully painted startup screen. Do not turn an
+        # incidental frame into a launch failure; wait within the same attempt.
+        continue
+    raise UnsafeRequest("ephemeral Claude visible ready prompt did not settle")
 
 
 def _strict_trust_screen(text: str, project_root: str) -> bool:
@@ -2270,6 +2357,8 @@ def _settle_after_agent_not_ready(
     if first_agent is None:
         raise UnsafeRequest("ephemeral Claude disappeared after startup")
     _validate_owned_agent(first_agent, workspace, require_ready=False)
+    if _keep_xhigh_screen(_read_visible(target)):
+        return _settle_visible_ready(target, workspace)
     if (
         first_agent.get("agent_status") == "blocked"
         and first_agent.get("launch_pending") is True
@@ -4139,6 +4228,8 @@ def _open_ephemeral_workspace(
             root_metadata,
         )
         processes = _settled_process_receipt(workspace_receipt)
+        agent = _settle_visible_ready(agent_name, workspace_receipt)
+        sequence = agent.get("state_change_seq")
         _write_request_record(
             args.project_root,
             args.request_dir,
