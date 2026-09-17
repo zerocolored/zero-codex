@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs'
 import { basename, join } from 'path'
 import { tmpdir } from 'os'
 import { FIXTURE_PROCESS_DIR, FIXTURE_STOPPING, reapFixtureHandles, recordFixtureProcess, recordedFixtureProcesses, stopRecordedFixtureProcesses, trackFixtureHandle } from './launcher-fixture-processes.ts'
@@ -107,4 +107,23 @@ test('registered child is recovered after its producer has exited', async () => 
   writeFileSync(join(state, FIXTURE_STOPPING), '')
   await stopRecordedFixtureProcesses(state)
   expect(recordedFixtureProcesses(state).every(identity => observeProcessGeneration(identity).status === 'dead')).toBe(true)
+})
+
+// 2026-09-14: 一時directory名をargvに持つだけのprocessを掃除対象にする実装が
+// 二度書かれ、二度とも無関係なprocessを巻き込む形だった。台帳が唯一の停止根拠で
+// あることを、実装が戻された瞬間に赤くなる形で固定する。
+test('launcher fixtureはcommand textから停止対象を選ばない', () => {
+  const launcher = readFileSync(join(import.meta.dir, 'launcher.test.ts'), 'utf8')
+  const ledger = readFileSync(join(import.meta.dir, 'launcher-fixture-processes.ts'), 'utf8')
+  expect(launcher).toContain("from './launcher-fixture-processes.ts'")
+  // 許すのは `/bin/ps -o <fmt>= -p <pid>` の単一PID再照合だけ。
+  // process表を丸ごと引く手段は、外部commandでもこのrepo自身のAPIでも拒む。
+  // readProcessTable() は proc_listallpids のラッパ(process-generation.ts)で、
+  // launcher.test.ts は既に同じmoduleからimportしているため1語で到達できる。
+  expect(launcher).not.toContain('strayPids')
+  expect(launcher).not.toContain('reapFixtureDirectory')
+  expect(launcher).not.toMatch(
+    /pgrep|pkill|killall|readProcessTable|proc_listallpids|-xo|-ax|-ef|ps -A|ps -e/,
+  )
+  expect(ledger).toContain('Never discover kill targets by command text')
 })
