@@ -1192,6 +1192,10 @@ export class CodexAppServerSession {
     },
   ): Promise<string> {
     const baseline = this.notificationSequence
+    // Resume/injected instructions can wake a native goal before turn/start.
+    // The server may accept this input into that already-running turn. Snapshot
+    // liveness now: a short turn can finish while its RPC response is in flight.
+    const activeAtDispatch = new Set(this.turnProjections.keys())
     const response = await this.request('turn/start', {
       threadId,
       clientUserMessageId,
@@ -1210,11 +1214,13 @@ export class CodexAppServerSession {
     while (true) {
       for (let index = 0; index < this.notifications.length; index += 1) {
         const notification = this.notifications[index]!
-        if (notification.sequence <= baseline || notification.method !== 'turn/started') continue
+        if (notification.method !== 'turn/started') continue
         const params = notification.params
         if (params.threadId !== threadId) continue
         const started = parseTurn(params.turn)
         if (started.id !== turn.id || started.status !== 'inProgress') continue
+        if (notification.sequence <= baseline
+          && !activeAtDispatch.has(turnProjectionKey(threadId, turn.id))) continue
         this.notifications.splice(index, 1)
         return turn.id
       }
