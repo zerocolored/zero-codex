@@ -481,6 +481,8 @@ for line in sys.stdin:
         else:
             emit({"id": request_id, "result": {"turn": active_turn}})
             emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
+        if mode == "late-command-completion":
+            emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "commandExecution", "id": "background-command", "command": "fixture-only", "status": "inProgress"}}})
         turn_latch_stage = os.environ.get("ZERO_TURN_LATCH_STAGE")
         if turn_latch_stage == stage:
             turn_latch_ready = os.environ["ZERO_TURN_LATCH_READY"]
@@ -499,10 +501,14 @@ for line in sys.stdin:
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "inProgress", "itemsView": "full", "items": []}}},
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "保持して待機しました"}], "error": None}}},
             ])
-        elif mode == "goal-native":
+        elif mode in ("goal-native", "late-command-completion"):
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "interim", "text": "残タスクがあります"}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": [], "error": None}}},
+            ])
+            if mode == "late-command-completion":
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "commandExecution", "id": "background-command", "command": "fixture-only", "status": "completed", "exitCode": 0}}})
+            emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "native-final", "text": "Goalを完遂しました"}], "error": None}}},
             ])
         elif mode == "goal-blocked":
@@ -982,7 +988,7 @@ if mode == "logical-stop-required":
 }
 
 function fixture(
-  mode: 'normal' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
+  mode: 'normal' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
     | 'interjection-answer' | 'interjection-update' | 'interjection-late-answer'
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
@@ -2700,6 +2706,21 @@ describe('production App Server executor', () => {
       sessionId: 'thread-app-server-1', result: '通常完了',
     })
     value.store.close()
+  }, 30_000)
+
+  test('job188: 実executorは旧turnのcommand遅延完了で終了143にせず一度の起動で完了する', async () => {
+    const value = fixture('late-command-completion', true)
+    const processIds: number[] = []
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'late-command-completion' },
+        onProcessId: pid => { processIds.push(pid) }, liveControls: value.hooks,
+      })
+      expect(result).toEqual({ sessionId: 'thread-app-server-1', result: 'Goalを完遂しました' })
+      expect(processIds).toHaveLength(1)
+    } finally { value.store.close() }
   }, 30_000)
 
   test('production write jobはhost工程を挟まずCodexのcomplete turnだけで完了する', async () => {
