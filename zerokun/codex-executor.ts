@@ -2058,12 +2058,12 @@ function collectNativeAdvisorJournalEvidence(options: {
     const journalEntries = readdirSync(revisionRoot, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name))
     for (const journalEntry of journalEntries) {
-      // Response bodies are broker-owned retry data, not native-history
-      // evidence. Never parse them as a round journal or expose their content.
-      if (/^(investigation|design|review)-[123]\.json\.(responses|slots)$/.test(journalEntry.name)
-        && journalEntry.isFile() && !journalEntry.isSymbolicLink()) continue
+      // Select round journals, rather than enumerating allowed sidecars.
+      // Diagnostics and retry data share this directory but are not native
+      // evidence. Do not open them or let their presence discard valid rounds.
       const journalMatch = /^(investigation|design|review)-([123])\.json$/.exec(journalEntry.name)
-      if (!journalMatch || !journalEntry.isFile() || journalEntry.isSymbolicLink()) {
+      if (!journalMatch) continue
+      if (!journalEntry.isFile() || journalEntry.isSymbolicLink()) {
         throw new Error(`advisor journal contains an unsafe revision entry: ${journalEntry.name}`)
       }
       const raw = readOptionalPrivateFile(join(revisionRoot, journalEntry.name))

@@ -10649,6 +10649,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     // otherwise valid round collection fail (or be parsed as journal JSON).
     writeFileSync(join(root, 'review-1.json.responses'), 'opaque response cache', { mode: 0o600 })
     writeFileSync(join(root, 'review-1.json.slots'), 'opaque per-slot response cache', { mode: 0o600 })
+    writeFileSync(join(root, 'claude-response-' + 'a'.repeat(32) + '.json'), 'opaque diagnostic', { mode: 0o600 })
+    writeFileSync(join(root, 'future-diagnostic.json'), 'not journal JSON', { mode: 0o600 })
     const claude = {
       attempted: true, required: true, lifecycle: 'ephemeral-v2', adopted: false,
       workspaceCreationAttempted: false, freshEphemeral: false,
