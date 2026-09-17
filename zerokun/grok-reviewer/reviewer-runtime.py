@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import fcntl
 import json
@@ -404,6 +405,192 @@ def _copy_auth(source: Path, destination: Path) -> int:
                 destination.unlink()
             except OSError:
                 pass
+
+
+AUTH_SYNC_LOCK_TIMEOUT_SECONDS = 2.0
+
+
+def _decode_jwt_issue_time(token: str) -> int | None:
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    issued = claims.get("iat")
+    return issued if isinstance(issued, int) and issued > 0 else None
+
+
+def _auth_issue_time(payload: object) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    newest = None
+    for entry in payload.values():
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        if not isinstance(key, str):
+            continue
+        issued = _decode_jwt_issue_time(key)
+        if issued is not None and (newest is None or issued > newest):
+            newest = issued
+    return newest
+
+
+def _auth_accounts_conflict(host: object, candidate: object) -> bool:
+    if not isinstance(host, dict) or not isinstance(candidate, dict):
+        return False
+    for scope, entry in candidate.items():
+        existing = host.get(scope)
+        if not isinstance(entry, dict) or not isinstance(existing, dict):
+            continue
+        theirs = entry.get("email")
+        ours = existing.get("email")
+        if isinstance(theirs, str) and isinstance(ours, str) and theirs != ours:
+            return True
+    return False
+
+
+def _read_auth_bytes(path: Path) -> bytes | None:
+    _safe_regular(path, executable=False, maximum=MAX_AUTH_BYTES, private=True)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 65_536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_AUTH_BYTES:
+                raise OSError(f"auth file grew past limit: {path}")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _reviewer_real_home(reviewer_root: Path) -> Path:
+    root = reviewer_root.resolve(strict=True)
+    runtime = root.parent
+    zerokun = runtime.parent
+    if (
+        root.name != "grok-reviewer"
+        or runtime.name != "runtime"
+        or zerokun.name != ".zerokun"
+    ):
+        raise OSError(f"unexpected reviewer runtime location: {root}")
+    return zerokun.parent
+
+
+def _sync_auth_back(reviewer_root: Path, run_root: Path) -> int:
+    """Persist tokens the isolated run refreshed so the host copy stays alive.
+
+    Grok rotates its 6-hour access token inside the throwaway run home; without
+    this write-back the host auth.json keeps the credentials from the last
+    manual login until the server invalidates them (~1 day) and every advisor
+    run starts failing with an auth error.
+    """
+    try:
+        reviewer_root = reviewer_root.resolve(strict=True)
+        run_root = run_root.resolve(strict=True)
+        if not _is_direct_run_directory(reviewer_root, run_root):
+            return 8
+        home = _reviewer_real_home(reviewer_root)
+        run_auth = run_root / "user-home" / ".grok" / "auth.json"
+        try:
+            run_bytes = _read_auth_bytes(run_auth)
+        except (OSError, FileNotFoundError):
+            return 3
+        if not run_bytes:
+            return 3
+        try:
+            run_payload = json.loads(run_bytes)
+        except ValueError:
+            return 3
+        run_issue = _auth_issue_time(run_payload)
+        if run_issue is None:
+            return 3
+        grok_directory = home / ".grok"
+        if grok_directory.is_symlink() or not grok_directory.is_dir():
+            return 8
+        host_auth = grok_directory / "auth.json"
+        lock_flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        lock_descriptor = os.open(grok_directory / "auth.json.lock", lock_flags, 0o600)
+        try:
+            deadline = time.monotonic() + AUTH_SYNC_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        return 5
+                    time.sleep(0.05)
+            host_bytes = None
+            try:
+                host_bytes = _read_auth_bytes(host_auth)
+            except FileNotFoundError:
+                host_bytes = None
+            except OSError:
+                return 5
+            if host_bytes is not None:
+                if host_bytes == run_bytes:
+                    return 3
+                try:
+                    host_payload = json.loads(host_bytes)
+                except ValueError:
+                    host_payload = None
+                if _auth_accounts_conflict(host_payload, run_payload):
+                    return 3
+                host_issue = _auth_issue_time(host_payload)
+                if host_issue is not None and host_issue >= run_issue:
+                    return 3
+            staging = grok_directory / "auth.json.zerokun-sync"
+            try:
+                staging.unlink()
+            except OSError:
+                pass
+            staging_flags = (
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            )
+            staging_descriptor = os.open(staging, staging_flags, 0o600)
+            written = False
+            try:
+                os.fchmod(staging_descriptor, 0o600)
+                view = memoryview(run_bytes)
+                while view:
+                    count = os.write(staging_descriptor, view)
+                    if count <= 0:
+                        return 5
+                    view = view[count:]
+                os.fsync(staging_descriptor)
+                written = True
+            finally:
+                os.close(staging_descriptor)
+                if not written:
+                    try:
+                        staging.unlink()
+                    except OSError:
+                        pass
+            os.replace(staging, host_auth)
+            return 0
+        finally:
+            os.close(lock_descriptor)
+    except Exception:
+        return 5
+
+
+def _sync_auth_back_quietly(reviewer_root: Path, run_root: Path) -> None:
+    try:
+        _sync_auth_back(reviewer_root, run_root)
+    except Exception:
+        pass
 
 
 def _is_direct_run_directory(reviewer_root: Path, candidate: Path) -> bool:
@@ -1170,6 +1357,7 @@ def _run_supervised(reviewer_root: Path, run_root: Path, command: list[str]) -> 
                     capture.close()
                 except (OSError, ValueError):
                     cleanup_error = True
+        _sync_auth_back_quietly(reviewer_root, run_root)
         cleanup_ok = _remove_run_directory(reviewer_root, run_root) and not cleanup_error
 
     if not cleanup_ok:
@@ -1261,6 +1449,8 @@ def _print_resolved_grok(real_home: Path, grok: Path) -> int:
 def main() -> int:
     if len(sys.argv) == 4 and sys.argv[1] == "copy-auth":
         return _copy_auth(Path(sys.argv[2]), Path(sys.argv[3]))
+    if len(sys.argv) == 4 and sys.argv[1] == "sync-auth-back":
+        return _sync_auth_back(Path(sys.argv[2]), Path(sys.argv[3]))
     if len(sys.argv) == 3 and sys.argv[1] == "cleanup-stale":
         return _cleanup_stale(Path(sys.argv[2]))
     if len(sys.argv) == 4 and sys.argv[1] == "create-run":
