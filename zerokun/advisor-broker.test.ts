@@ -118,6 +118,7 @@ type BrokerFixture = {
       retryUnavailable?: boolean
       inputUpdateIsRecoveryOnly?: boolean
       nativeAgentId?: string
+      reviewWorktrees?: string[]
       roundTwoBasis?: {
         roundOneSources: Array<'native' | 'grok' | 'claude'>
         mandatoryFindingSummary: string
@@ -577,6 +578,7 @@ async function brokerFixture(options: {
         retryUnavailable?: boolean
         inputUpdateIsRecoveryOnly?: boolean
         nativeAgentId?: string
+      reviewWorktrees?: string[]
         roundTwoBasis?: {
           roundOneSources: Array<'native' | 'grok' | 'claude'>
           mandatoryFindingSummary: string
@@ -605,6 +607,7 @@ async function brokerFixture(options: {
             inputRevision: selectedInput.revision,
             inputDigest: selectedInput.digest,
             primaryEvidence: 'bounded primary evidence',
+            ...(overrides.reviewWorktrees ? { reviewWorktrees: overrides.reviewWorktrees } : {}),
             ...(overrides.retryUnavailable ? { retryUnavailable: true } : {}),
             ...(overrides.inputUpdateIsRecoveryOnly ? { inputUpdateIsRecoveryOnly: true } : {}),
             ...(overrides.roundTwoBasis ? { roundTwoBasis: overrides.roundTwoBasis } : {}),
@@ -2120,6 +2123,33 @@ print('review complete')
     }
   }, 60_000)
 
+  test('linked worktreeだけの修正でも保存したround 1から外部round 2を完了する', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
+    try {
+      writeFileSync(join(fixture.repo, '.gitignore'), '.worktrees/\n')
+      git(['add', '.gitignore'], fixture.repo)
+      git(['commit', '-qm', 'ignore worktrees'], fixture.repo)
+      git(['worktree', 'add', '-qb', 'task', '.worktrees/task'], fixture.repo)
+      expect((await fixture.call('investigation', 'revision-two')).payload.complete).toBe(true)
+      const first = await fixture.call('review', 'revision-two', 'adopted', 1,
+        { reviewWorktrees: ['.worktrees/task'] })
+      expect(first.payload).toMatchObject({ complete: true, slotSummary: { responsesObtained: 3 } })
+      writeFileSync(join(fixture.repo, '.worktrees/task/fix.ts'), 'export const fixed = true\n')
+      // Restart proves the selected scope comes from the durable baseline, not process state.
+      await fixture.restart()
+      const second = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-linked-risk-r2',
+        roundTwoBasis: {
+          roundOneSources: ['native'], mandatoryFindingSummary: '主要処理の不具合',
+          taskOwnedFixDelta: 'linked worktree内の処理を修正',
+          taskOwnedFixPaths: [{ repository: '.worktrees/task', path: 'fix.ts' }],
+        },
+      })
+      expect(second.payload).toMatchObject({ complete: true, round: 2,
+        slotSummary: { responsesObtained: 3 } })
+    } finally { await fixture.close() }
+  }, 60_000)
+
   test('単一workflowは条件付きreview round 2だけを一度許可し不正roundを起動前に拒否する', async () => {
     const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
     try {
@@ -2145,7 +2175,7 @@ print('review complete')
 
       expect((await fixture.call('investigation', 'revision-two')).payload)
         .toMatchObject({ complete: true })
-      expect((await fixture.call('review', 'revision-two')).payload)
+      expect((await fixture.call('review', 'revision-two', 'adopted', 1, { reviewWorktrees: ['.'] })).payload)
         .toMatchObject({ complete: true })
       const missingBasis = await fixture.call('review', 'revision-two', 'adopted', 2, {
         nativeAgentId: '/root/native-risk-r2',
@@ -2211,7 +2241,7 @@ print('review complete')
           taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
         },
       })
-      expect(roundTwo.payload).toMatchObject({ complete: true, round: 2 })
+      expect(roundTwo.payload).toMatchObject({ complete: true, round: 2, slotSummary: { responsesObtained: 3 } })
       expect(readFileSync(join(fixture.repo, 'another-task.ts'), 'utf8')).toBe('export const foreign = true\n')
       const repeated = await fixture.call('review', 'revision-one', 'adopted', 2, {
         nativeAgentId: '/root/native-risk-r2-second',

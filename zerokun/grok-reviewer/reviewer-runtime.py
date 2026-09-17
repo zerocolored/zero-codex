@@ -671,7 +671,7 @@ def _workspace_review_roots(input_path: Path | None, review_root: Path) -> list[
             not isinstance(candidate, str)
             or not candidate.startswith("/")
             or candidate != os.path.normpath(candidate)
-            or (not is_review_root and Path(candidate).parent != review_root)
+            or (not is_review_root and review_root not in Path(candidate).parents)
             or Path(candidate).name in ("", ".", "..")
             or any(character in candidate for character in "*?[\x00\r\n")
         ):
@@ -681,7 +681,25 @@ def _workspace_review_roots(input_path: Path | None, review_root: Path) -> list[
         if physical != member:
             raise OSError("workspace review member must be a physical path")
         _safe_owned_directory(member)
-        _safe_owned_directory(member / ".git")
+        git_entry = member / ".git"
+        if git_entry.is_dir():
+            _safe_owned_directory(git_entry)
+        else:
+            # Linked worktrees are explicitly selected by the host, not discovered
+            # through arbitrary directories. Verify the Git registration both ways.
+            pointer = _read_safe_regular(git_entry, maximum=32768).decode("utf-8").strip()
+            if not pointer.startswith("gitdir: "):
+                raise OSError("invalid linked worktree Git pointer")
+            git_dir = (member / pointer[8:]).resolve(strict=True)
+            _safe_owned_directory(git_dir)
+            common = (git_dir / _read_safe_regular(git_dir / "commondir", maximum=32768)
+                      .decode("utf-8").strip()).resolve(strict=True)
+            allowed_common = {Path(root) / ".git" for root in value["members"]
+                              if (Path(root) / ".git").is_dir()}
+            backlink = Path(_read_safe_regular(git_dir / "gitdir", maximum=32768)
+                            .decode("utf-8").strip())
+            if common not in allowed_common or backlink != git_entry:
+                raise OSError("linked worktree is not registered to a review repository")
         members.append(candidate)
     if value["members"] != sorted(set(value["members"])):
         raise OSError("workspace review member paths must be sorted and unique")

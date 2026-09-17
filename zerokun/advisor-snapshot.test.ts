@@ -19,6 +19,7 @@ import {
   resolveAdvisorProjectLayout,
   serializeAdvisorRepositorySnapshot,
   snapshotAdvisorRepository,
+  snapshotAdvisorReviewWorktrees,
   summarizeAdvisorRepositoryChanges,
   summarizeAdvisorTaskOwnedFixChanges,
 } from './advisor-snapshot.ts'
@@ -47,6 +48,39 @@ function git(cwd: string, args: string[]): void {
 }
 
 describe('advisor repository snapshot', () => {
+  test('選択したlinked worktreeの修正をround 1から比較し、無関係なworktreeを含めない', () => {
+    const root = realpathSync(fixtureDir())
+    git(root, ['init', '-q'])
+    git(root, ['config', 'user.name', 'Zero Test'])
+    git(root, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(root, '.gitignore'), '.worktrees/\n')
+    writeFileSync(join(root, 'fix.ts'), 'before\n')
+    git(root, ['add', '.'])
+    git(root, ['commit', '-qm', 'initial'])
+    git(root, ['worktree', 'add', '-qb', 'task', '.worktrees/task'])
+    git(root, ['worktree', 'add', '-qb', 'unrelated', '.worktrees/unrelated'])
+    const layout = resolveAdvisorProjectLayout(root)
+    const selected = ['.worktrees/task']
+    const baseline = snapshotAdvisorReviewWorktrees(layout, selected)
+    expect(parseAdvisorRepositorySnapshot(serializeAdvisorRepositorySnapshot(baseline))).toEqual(baseline)
+    expect(baseline.gitRoots).not.toContain(join(root, '.worktrees/unrelated'))
+    writeFileSync(join(root, '.worktrees/task/fix.ts'), 'fixed\n')
+    const paths = [{ repository: '.worktrees/task', path: 'fix.ts' }]
+    const changed = summarizeAdvisorTaskOwnedFixChanges(baseline,
+      snapshotAdvisorReviewWorktrees(layout, selected), paths)
+    expect(changed.layoutChanged).toBe(false)
+    expect(changed.repositories[0]?.changedPaths).toEqual(['fix.ts'])
+    git(join(root, '.worktrees/task'), ['add', 'fix.ts'])
+    git(join(root, '.worktrees/task'), ['commit', '-qm', 'fix'])
+    expect(summarizeAdvisorTaskOwnedFixChanges(baseline,
+      snapshotAdvisorReviewWorktrees(layout, selected), paths).changed).toBe(true)
+    symlinkSync(join(root, '.worktrees/task'), join(root, 'alias'))
+    expect(() => snapshotAdvisorReviewWorktrees(layout, ['alias'])).toThrow()
+    mkdirSync(join(root, 'foreign'))
+    git(join(root, 'foreign'), ['init', '-q'])
+    expect(() => snapshotAdvisorReviewWorktrees(layout, ['foreign'])).toThrow()
+  })
+
   test('第2reviewはコミット済み修正を内容で比較し、既存dirtyのcommitだけを修正としない', () => {
     const root = fixtureDir()
     git(root, ['init', '-q'])
