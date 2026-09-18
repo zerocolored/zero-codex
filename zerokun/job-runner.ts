@@ -13467,6 +13467,9 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  if (error.startsWith('Codex network recovery exhausted after ')) {
+    return '通信障害が続いており、自動再試行3回でも復旧しませんでした。作業内容は保持しています。接続回復後、このスレッドで再開できます。'
+  }
   if (error.includes('repository changed before implementation')
     || error.includes('repository changed repeatedly before implementation')) {
     return '作業中に対象projectが別の変更で更新されたため、最新状態で安全に続行できませんでした。'
