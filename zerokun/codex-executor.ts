@@ -5314,6 +5314,21 @@ export function buildCodexPermissionOverrides(
     }
     rules.set(realpathSync(verified.path), 'read')
   }
+  if (computerUseEnabled) {
+    // CUA（デスクトップ操作）の node カーネルとプラグイン実行体は、
+    // ChatGPT.app 同梱リソース・OpenSSL 設定・plugin cache を読む。
+    // HOME は deny のままで、必要な subtree だけを read で再許可する。
+    for (const cuaPath of [
+      '/Applications/ChatGPT.app',
+      '/System/Library/OpenSSL',
+      join(home, '.codex', 'computer-use'),
+      join(home, '.codex', 'plugins'),
+    ]) {
+      if (!existsSync(cuaPath)) continue
+      const physical = realpathSync(cuaPath)
+      if (!rules.has(physical)) rules.set(physical, 'read')
+    }
+  }
   const filesystem = [...rules.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([path, access]) => `${tomlString(path)}=${tomlString(access)}`)

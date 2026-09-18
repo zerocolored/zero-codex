@@ -12014,6 +12014,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('features.browser_use_full_cdp_access=false')
       expect(overrides).toContain('features.computer_use=true')
       expect(overrides).toContain('features.in_app_browser=true')
+      // CUA nodeカーネルはOpenSSL設定とChatGPT.app同梱リソースを読む
+      expect(overrides).toContain(`${JSON.stringify(realpathSync('/System/Library/OpenSSL'))}="read"`)
+      if (existsSync('/Applications/ChatGPT.app')) {
+        expect(overrides).toContain(`${JSON.stringify(realpathSync('/Applications/ChatGPT.app'))}="read"`)
+      }
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
@@ -12083,6 +12088,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(reviewOverrides).toContain('features.browser_use_full_cdp_access=false')
       expect(reviewOverrides).toContain('features.computer_use=false')
       expect(reviewOverrides).toContain('features.plugins=false')
+      expect(reviewOverrides).not.toContain('/System/Library/OpenSSL')
       expect(() => buildCodexPermissionOverrides(
         { ...job, repoPath: homedir() },
         { stateDir: state, artifactDir: outbox, scratchDir: scratch },
