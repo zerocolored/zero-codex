@@ -396,6 +396,43 @@ describe('advisor repository snapshot', () => {
     expect(snapshot.dirty['backend/generated-b']).toStartWith('metadata:')
   })
 
+  test('root自身がGit repoのworkspaceでも合成dirtyのnamespaceがズレない', () => {
+    const project = fixtureDir()
+    git(project, ['init', '-q'])
+    git(project, ['config', 'user.name', 'Zero Test'])
+    git(project, ['config', 'user.email', 'zero@example.invalid'])
+    writeFileSync(join(project, 'root-tracked.txt'), 'root\n')
+    git(project, ['add', '.'])
+    git(project, ['commit', '-qm', 'initial'])
+    const members = ['backend', 'frontend'].map(name => {
+      const repository = join(project, name)
+      mkdirSync(repository)
+      git(repository, ['init', '-q'])
+      git(repository, ['config', 'user.name', 'Zero Test'])
+      git(repository, ['config', 'user.email', 'zero@example.invalid'])
+      writeFileSync(join(repository, 'tracked.txt'), `${name}\n`)
+      git(repository, ['add', '.'])
+      git(repository, ['commit', '-qm', 'initial'])
+      return repository
+    })
+
+    const layout = resolveAdvisorProjectLayout(project)
+    expect(layout.kind).toBe('multi-repo-workspace')
+    expect(layout.gitRoots[0]).toBe(realpathSync(project))
+
+    writeFileSync(join(project, 'root-tracked.txt'), 'root changed\n')
+    writeFileSync(join(members[0]!, 'tracked.txt'), 'backend changed\n')
+    writeFileSync(join(members[1]!, 'tracked.txt'), 'frontend changed\n')
+    const snapshot = snapshotAdvisorRepository(layout)
+
+    expect(snapshot.dirty['./root-tracked.txt']).toStartWith('sha256:')
+    expect(snapshot.dirty['backend/tracked.txt']).toStartWith('sha256:')
+    expect(snapshot.dirty['frontend/tracked.txt']).toStartWith('sha256:')
+    expect(Object.keys(snapshot.dirty).filter(key => key.startsWith('undefined/'))).toEqual([])
+    expect(snapshot.dirty['backend/root-tracked.txt']).toBeUndefined()
+    expect(snapshot.dirty['frontend/tracked.txt']).not.toBe(snapshot.dirty['backend/tracked.txt'])
+  })
+
   test('unsafe hardlinked non-Git fileを拒否する', () => {
     const project = fixtureDir()
     const source = join(project, 'source')
