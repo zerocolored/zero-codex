@@ -3848,6 +3848,7 @@ export type CodexWorkerPromptContext = {
   artifactDir: string
   advisorEnabled: boolean
   browserEnabled?: boolean
+  computerUseEnabled?: boolean
 }
 
 /** Native resume already carries its own turns; a cold start receives the durable Slack history. */
@@ -4053,6 +4054,17 @@ export function buildCodexWorkerPrompt(
         'approval capture, zerokun_browser.verify_local_page remains an isolated evidence option.',
         'Report the observed result of the actual browser attempt; do not pre-emptively refuse a',
         'remote target because the localhost verifier exists.',
+      )
+    }
+    if (host.computerUseEnabled) {
+      control.push(
+        'Computer Use and the host audio bridge are authorized in this workflow. Sandboxed afplay',
+        'always aborts with AudioQueueStart -1; to play audio on the real output device, put the',
+        'WAV under your scratch or artifact directory, write {"wav":"<absolute path>"} to',
+        '$TMPDIR/zerokun-audio/request-<alphanumeric nonce>.json, then wait for',
+        'result-<nonce>.json: {startedAtMs,endedAtMs,exitCode} on success, {error} on refusal.',
+        'The host plays requests sequentially with /usr/bin/afplay and its timestamps are wall',
+        'clock, so they are valid playback-window evidence.',
       )
     }
     if (job.githubPublicationRecovery) {
@@ -7852,6 +7864,7 @@ export async function executeCodexJob(
                 artifactDir,
                 advisorEnabled: advisorAttempt.advisorEnabled,
                 browserEnabled: advisorAttempt.browserEnabled,
+                computerUseEnabled: advisorAttempt.computerUseEnabled,
               }, threadHistoryForPhysicalSession(options.threadHistory, resumed))
               : buildCodexPhasePrompt(
                 job,
@@ -8678,6 +8691,7 @@ export async function executeCodexJob(
         artifactDir,
         advisorEnabled: advisorAttempt.advisorEnabled,
         browserEnabled: advisorAttempt.browserEnabled,
+        computerUseEnabled: advisorAttempt.computerUseEnabled,
       }, threadHistoryForPhysicalSession(options.threadHistory, resumed)))
     }
     proc.stdin.end()
