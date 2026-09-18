@@ -12007,7 +12007,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         .toEqual(['model="gpt-6-astra"'])
       expect(overrides.split('\n').filter(value => value.startsWith('model_reasoning_effort=')))
         .toEqual(['model_reasoning_effort="low"'])
-      expect(overrides).toContain('features.plugins=false')
+      expect(overrides).toContain('features.plugins=true')
       expect(overrides).toContain('features.goals=false')
       expect(overrides).toContain('features.browser_use=true')
       expect(overrides).toContain('features.browser_use_external=true')
@@ -12082,6 +12082,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(reviewOverrides).toContain('features.browser_use_external=true')
       expect(reviewOverrides).toContain('features.browser_use_full_cdp_access=false')
       expect(reviewOverrides).toContain('features.computer_use=false')
+      expect(reviewOverrides).toContain('features.plugins=false')
       expect(() => buildCodexPermissionOverrides(
         { ...job, repoPath: homedir() },
         { stateDir: state, artifactDir: outbox, scratchDir: scratch },

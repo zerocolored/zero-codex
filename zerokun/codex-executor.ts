@@ -5387,7 +5387,9 @@ export function buildCodexPermissionOverrides(
     'apps._default.open_world_enabled=false',
     'apps._default.destructive_enabled=false',
     'features.apps=false',
-    'features.plugins=false',
+    // CUA（デスクトップ操作）は openai-bundled プラグインが担うため、
+    // computer_use を許可するステージだけプラグインも解錠する。
+    `features.plugins=${computerUseEnabled ? 'true' : 'false'}`,
     'features.remote_plugin=false',
     'features.hooks=false',
     `features.goals=${options.taskGoalEnabled === true ? 'true' : 'false'}`,
@@ -6552,6 +6554,7 @@ export async function executeCodexJob(
         reviewRound,
         advisorEnabled: advisorMcp !== undefined,
         browserEnabled: browserMcp !== undefined,
+        computerUseEnabled: executionWriteEnabled && browserEnabled,
         browserReceiptKey,
         browserReceiptKeyPath,
         permissionProfile,
@@ -6695,7 +6698,9 @@ export async function executeCodexJob(
       ...advisorAttempt.permissionOverrides.flatMap(value => ['-c', value]),
       '-c', `developer_instructions=${tomlString(advisorAttempt.developerInstructions)}`,
       'exec',
-      '--ignore-user-config',
+      // computer_use 許可時は CUA プラグイン（ユーザー設定由来）を残す。
+      // それ以外は従来どおりユーザー設定を遮断する。
+      ...(advisorAttempt.computerUseEnabled ? [] : ['--ignore-user-config']),
       '--ignore-rules',
       '--skip-git-repo-check',
       '--json',
