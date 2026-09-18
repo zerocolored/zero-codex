@@ -400,6 +400,9 @@ for line in sys.stdin:
         if mode == "missing-session-resume" and method == "thread/resume" and params.get("threadId") == "thread-provider-missing":
             emit({"id": request_id, "error": {"code": -32001, "message": "thread not found"}})
             continue
+        if mode == "network-session-missing" and method == "thread/resume":
+            emit({"id": request_id, "error": {"code": -32001, "message": "thread not found"}})
+            continue
         phase_account_switch = mode in (
             "phased-capacity-review-account-switch",
             "phased-capacity-implementation-account-switch",
@@ -468,6 +471,7 @@ for line in sys.stdin:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
         unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-capacity-review-account-switch", "phased-capacity-implementation-account-switch", "phased-continuation", "phased-continuation-release", "phased-continuation-answer", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = unique_turn or mode.startswith("network-")
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -757,6 +761,22 @@ for line in sys.stdin:
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [], "error": {"message": "fixture failure"}}}})
             else:
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "失敗後の追加入力を反映しました"}], "error": None}}})
+        elif mode.startswith("network-"):
+            state_path = os.environ["ZERO_NETWORK_STATE"]
+            count = int(open(state_path).read()) if os.path.exists(state_path) else 0
+            with open(state_path, "w") as stream:
+                stream.write(str(count + 1))
+            failure = {"message": "stream disconnected before completion", "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": None}}}
+            if mode == "network-permanent":
+                failure = {"message": "The access_programs parameter is not enabled for this organization.", "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 400}}, "code": "unsupported_parameter"}
+            if mode == "network-native":
+                for _ in range(2):
+                    emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": failure}})
+            if mode == "network-native" or (mode == "network-once" and count > 0):
+                emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "通信復旧後に完了"}], "error": None}}})
+            else:
+                emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
+                emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [{"type": "commandExecution", "id": "already-done", "command": "echo completed", "status": "completed", "exitCode": 0}], "error": failure}}})
         elif mode in ("rate-error", "rate-terminal-only"):
             failure = {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}
             if mode != "rate-terminal-only":
@@ -1007,7 +1027,7 @@ function fixture(
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
     | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked' | 'goal-proposal' | 'resume-early-start'
     | 'error-steer' | 'rate-error' | 'rate-terminal-only' | 'rate-retrying' | 'rate-retrying-two-turn'
-    | 'capacity-error'
+    | 'capacity-error' | 'network-once' | 'network-always' | 'network-native' | 'network-permanent' | 'network-session-missing'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
     | 'capacity-started-command' | 'phased' | 'phased-publication'
     | 'phased-publication-targeted' | 'phased-promotion'
@@ -6559,6 +6579,116 @@ describe('production App Server executor', () => {
       } finally { value.store.close() }
     }, 30_000)
   }
+
+  for (const mode of ['network-once', 'network-always', 'network-native', 'network-permanent'] as const) {
+    test(`network recovery ${mode} preserves thread and bounds dispatch`, async () => {
+      const value = fixture(mode, mode === 'network-once')
+      const state = join(value.root, 'network-state')
+      const phases = join(value.root, 'network-phases')
+      const prompts = join(value.root, 'network-prompts')
+      const messages: string[] = []
+      const staged: string[] = []
+      try {
+        const run = executeCodexJob(value.job, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true, liveControls: value.hooks,
+          transientRetryDelayMsForTesting: 1, parkOnUsageLimit: true,
+          onCloudQuotaDetected: () => { throw new Error('network must not park on quota') },
+          onCommentaryMessage: event => {
+            messages.push(event.text)
+            staged.push(value.store.stageCommentaryNotification(value.job.id, value.job.attempts,
+              event.sourceKey, `💬 ${event.text}`))
+          },
+          extraEnvironment: { ZERO_FIXTURE_MODE: mode, ZERO_NETWORK_STATE: state,
+            ZERO_PHASE_LOG: phases, ZERO_PROMPT_LOG: prompts },
+        })
+        if (mode === 'network-always') await expect(run).rejects.toThrow('network recovery exhausted after 3 retries')
+        else if (mode === 'network-permanent') await expect(run).rejects.toThrow('access_programs')
+        else expect(await run).toMatchObject({ sessionId: 'thread-app-server-1', result: '通信復旧後に完了' })
+        expect(Number(readFileSync(state, 'utf8'))).toBe(mode === 'network-always' ? 4 : mode === 'network-once' ? 2 : 1)
+        if (mode === 'network-once') {
+          const calls = readFileSync(phases, 'utf8').trim().split('\n').map(line => line.split('\t'))
+          expect(calls.map(call => call[2])).toEqual(['thread-app-server-1', 'thread-app-server-1'])
+          expect(calls.map(call => call[3])).toEqual(['thread/start', 'thread/resume'])
+          const resumedPrompt = JSON.parse(readFileSync(prompts, 'utf8').trim().split('\n')[1]!).text
+          expect(resumedPrompt).toStartWith('--- Transport recovery: continue the SAME task')
+          expect(resumedPrompt).toContain('Do not blindly replay')
+          expect(messages).toHaveLength(1)
+        }
+        if (mode === 'network-native') expect(messages).toHaveLength(1)
+        if (mode === 'network-permanent') expect(messages).toHaveLength(0)
+        expect(staged).toEqual(messages.map(() => 'staged'))
+      } finally { value.store.close() }
+    }, 30_000)
+  }
+
+  test('network recovery cancellation during backoff dispatches no second turn', async () => {
+    const value = fixture('network-always')
+    const state = join(value.root, 'network-state')
+    const controller = new AbortController()
+    try {
+      await expect(executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks, signal: controller.signal,
+        onCommentaryMessage: () => { controller.abort() },
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'network-always', ZERO_NETWORK_STATE: state },
+      })).rejects.toThrow('network recovery was interrupted')
+      expect(readFileSync(state, 'utf8')).toBe('1')
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('network recovery drains concurrent Slack input before resuming', async () => {
+    const value = fixture('network-once')
+    const state = join(value.root, 'network-state')
+    const prompts = join(value.root, 'network-prompts')
+    let inserted = false
+    const finishTurn = value.hooks.finishTurn
+    value.hooks.finishTurn = options => {
+      if (inserted) return finishTurn(options)
+      inserted = true
+      value.store.stageInboundDelivery({
+        chatId: value.job.chatId, threadTs: value.job.threadTs, messageId: '1800000000.000955',
+        userId: 'UOTHER', repoPath: value.job.repoPath, text: '通信回復後も既存変更を保持して', writeEnabled: false,
+      })
+      const barrier = finishTurn(options)
+      expect(barrier.pendingInbound).toBe(1)
+      expect(value.store.get(value.job.id)?.activeTurnId).toBe(options.turnId)
+      const inbound = value.store.claimNextInboundDelivery()!
+      const target = value.store.liveControlTarget(inbound.chatId, inbound.threadTs)!
+      value.store.stageLiveControl(target, {
+        chatId: inbound.chatId, threadTs: inbound.threadTs, messageId: inbound.messageId,
+        userId: inbound.userId, writeEnabled: false, task: inbound.text, kind: 'steer',
+      })
+      value.store.completeInboundDelivery(inbound.idempotencyKey)
+      return barrier
+    }
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks, transientRetryDelayMsForTesting: 1,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'network-once', ZERO_NETWORK_STATE: state, ZERO_PROMPT_LOG: prompts },
+      })
+      expect(result.result).toBe('通信復旧後に完了')
+      expect(readFileSync(state, 'utf8')).toBe('2')
+      expect(JSON.parse(readFileSync(prompts, 'utf8').trim().split('\n')[1]!).text).toContain('通信回復後も既存変更を保持して')
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('network recovery never creates a fresh thread when saved context is unavailable', async () => {
+    const value = fixture('network-session-missing')
+    const state = join(value.root, 'network-state')
+    let resets = 0
+    try {
+      await expect(executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks, transientRetryDelayMsForTesting: 1,
+        onSessionReset: () => { resets += 1 },
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'network-session-missing', ZERO_NETWORK_STATE: state },
+      })).rejects.toThrow('thread not found')
+      expect(resets).toBe(0)
+      expect(readFileSync(state, 'utf8')).toBe('1')
+    } finally { value.store.close() }
+  }, 30_000)
 
   test('willRetry中のrate-limit通知はhost requeueせず同じturnのterminalを待つ', async () => {
     const value = fixture('rate-retrying')
