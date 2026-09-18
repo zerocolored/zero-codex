@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { nativeAdvisorMarker, type NativeAdvisorRoundEvidence } from './native-advisor-evidence.ts'
+import { nativeAdvisorMarker, nativeAdvisorResponseDigest, type NativeAdvisorRoundEvidence } from './native-advisor-evidence.ts'
 import { observeNativeAdvisorCoverage } from './native-advisor-coverage.ts'
 
 const nonce = 'a'.repeat(32)
@@ -45,6 +45,73 @@ function fixture() {
 }
 
 describe('host native advisor execution observations', () => {
+  test('同じGPTへの補足依頼で最終回答が増えても1枠として最新の完了回答を回収する', async () => {
+    const f = fixture()
+    const child = f.children[0]!
+    // job196: the binding is in the actual answers, not the initial input.
+    child.turns[0]!.items[0]!.content![0]!.text = 'Review this task.'
+    const followup = structuredClone(child.turns[0]!)
+    followup.id = 'followup-turn'
+    followup.items[1]!.text = `Updated review after clarification.\n${nativeAdvisorMarker(nonce, 1, digest, 'investigation', 1, 'solution')}`
+    child.turns.push(followup)
+    const result = await f.run()
+    expect(result[0]!.state).toBe('response-obtained')
+    expect(result[0]!.threadId).toBe(child.id)
+    expect(result[0]!.responseDigest).toBe(nativeAdvisorResponseDigest(followup.items[1]!.text!))
+    expect(result).toHaveLength(2)
+  })
+
+  test('同じ子の後続commentary・失敗・別markerは取得済み完了回答を置き換えない', async () => {
+    for (const invalid of ['commentary', 'failed', 'foreign-marker'] as const) {
+      const f = fixture()
+      const child = f.children[0]!
+      const original = child.turns[0]!.items[1]!.text!
+      const later = structuredClone(child.turns[0]!)
+      later.id = 'later-turn'
+      later.items[1]!.text = `Later response.\n${nativeAdvisorMarker(nonce, 1, digest, 'investigation', 1, 'solution')}`
+      if (invalid === 'commentary') later.items[1]!.phase = 'commentary'
+      if (invalid === 'failed') later.status = 'failed'
+      if (invalid === 'foreign-marker') later.items[1]!.text = later.items[1]!.text!.replace(nonce, 'f'.repeat(32))
+      child.turns.push(later)
+      const result = await f.run()
+      expect(result[0]!.state).toBe('response-obtained')
+      expect(result[0]!.responseDigest).toBe(nativeAdvisorResponseDigest(original))
+    }
+  })
+
+  test('回答がAからBを経てAへ戻った場合も最後のAのdigestを保持する', async () => {
+    const f = fixture()
+    const child = f.children[0]!
+    const original = child.turns[0]!.items[1]!.text!
+    const middle = structuredClone(child.turns[0]!)
+    middle.id = 'middle-turn'
+    middle.items[1]!.text = `Different answer.\n${nativeAdvisorMarker(nonce, 1, digest, 'investigation', 1, 'solution')}`
+    const last = structuredClone(child.turns[0]!)
+    last.id = 'last-turn'
+    child.turns.push(middle, last)
+    const result = await f.run()
+    expect(result[0]!.state).toBe('response-obtained')
+    expect(result[0]!.responseDigest).toBe(nativeAdvisorResponseDigest(original))
+  })
+
+  test('補足回答を持つ物理子が複数なら曖昧性を残しjournalで選んだ子だけを採用する', async () => {
+    const f = fixture()
+    const child = f.children[0]!
+    const later = structuredClone(child.turns[0]!)
+    later.id = 'followup-turn'
+    later.items[1]!.text = `Updated review.\n${nativeAdvisorMarker(nonce, 1, digest, 'investigation', 1, 'solution')}`
+    child.turns.push(later)
+    f.children.push({ ...structuredClone(child), id: 'another-child' })
+    expect((await f.run())[0]!.state).toBe('start-unconfirmed')
+    const evidence = [{ ...rounds[0]!, native: rounds[0]!.native.map(entry => ({
+      ...entry, agentId: entry.perspective === 'solution' ? child.id : entry.agentId,
+    })) }]
+    const result = await f.run([], evidence)
+    expect(result[0]!.threadId).toBe(child.id)
+    expect(result[0]!.state).toBe('response-obtained')
+    expect(result[0]!.responseDigest).toBe(nativeAdvisorResponseDigest(later.items[1]!.text!))
+  })
+
   test('broker要約のdigest不一致でも実子セッションの今回の最終回答を数える', async () => {
     const f = fixture()
     const result = await f.run()

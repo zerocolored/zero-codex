@@ -65,8 +65,23 @@ function fixture() {
     read: async method => !available ? undefined
       : method === 'thread/list' ? { data: [child], nextCursor: null } : { thread: child },
   })
-  return { state, job, nonce, journal, journalPath, rounds, observe }
+  return { state, job, nonce, journal, journalPath, rounds, observe, child, marker }
 }
+
+test('GPT補足回答を取得した同じ子はSlack最終報告でも1枠だけ数え3/3を維持する', async () => {
+  const f = fixture()
+  f.child.turns[0]!.items[0]!.content![0]!.text = 'Review this task.'
+  const followup = structuredClone(f.child.turns[0]!)
+  followup.id = 'followup'
+  followup.items[1]!.text = `Additional independent findings.\n${f.marker}`
+  f.child.turns.push(followup)
+  const coverage = collectHostAdvisorCoverage(f.state, f.job.id, f.nonce, await f.observe(true))
+  expect(coverage?.phases[0]).toMatchObject({ total: 3, started: 3, responsesObtained: 3, startUnconfirmed: 0 })
+  const result = enforceHostAdvisorCoverage('確認した結果を報告します。', coverage, 'result')
+  expect(result).toContain('起動3/3・回答3/3')
+  expect(result).not.toContain('GPT:')
+  expect(result).not.toContain('回答を取得できませんでした')
+})
 
 test('Claude診断ログが同居しても実回答観測からSlack最終報告まで3/3で通過する', async () => {
   const f = fixture()
