@@ -37,6 +37,20 @@ printf 'Call mcp__cua_repl.js once with code: var b = await cua.getApp("<bundle 
 
 結果にアプリの UI ツリーが返れば成立。`not approved` が返るなら承認が永続化されていない（「Allow」や「Allow for this session」を選ぶと次回また要求されるので、必ず **Always allow**）。
 
+## プロジェクト固有の読み取りパス（E2E素材・アプリのログ等）
+
+CUA での実機E2Eは、対象アプリのログや QA 素材など**プロジェクト固有のパス**を読む必要がある。project リポジトリ直下に `.zerokun/computer-use-read-paths`（1行1パス、`#` コメント可、`~/` 展開あり）を置くと、computer_use 許可ジョブに限りそのパスを read で許可する。
+
+```
+# 例（BellSalesAI）
+~/Library/Application Support/BellSalesAI-QA/sales-roleplay-20260916
+~/Library/Application Support/com.meeting-app.meeting-app/logs
+```
+
+安全のため許可域は `/Applications` と `~/Library/Application Support` 配下に限定している（repo はジョブ自身が書けるため、HOME 直下の資格情報等へは広げない）。範囲外・存在しないパスは黙って無視する。
+
+このほか computer_use 許可時は、CUAService がスクリーンショットを書き出すユーザーtempの `com.openai.sky.CUAService` ディレクトリ（write）と `/Applications`（read）を自動で許可する。
+
 ## 設計メモ
 
 - ゲート条件は `executionWriteEnabled && browserAccessEnabled`。ブラウザ操作許可と同じ「書き込みジョブの実装ステージのみ」で、レビュー段（read-only）には出さない。

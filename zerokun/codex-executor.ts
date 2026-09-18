@@ -5320,6 +5320,7 @@ export function buildCodexPermissionOverrides(
     // HOME は deny のままで、必要な subtree だけを read で再許可する。
     for (const cuaPath of [
       '/Applications/ChatGPT.app',
+      '/Applications',
       '/System/Library/OpenSSL',
       join(home, '.codex', 'computer-use'),
       join(home, '.codex', 'plugins'),
@@ -5327,6 +5328,35 @@ export function buildCodexPermissionOverrides(
       if (!existsSync(cuaPath)) continue
       const physical = realpathSync(cuaPath)
       if (!rules.has(physical)) rules.set(physical, 'read')
+    }
+    // CUAService はスクリーンショットをユーザーtempの専用ディレクトリへ
+    // 書き出す。ジョブの TMPDIR は scratch に差し替えるため、実tempの
+    // この1ディレクトリだけを write で許可する。
+    const cuaScreenshotDir = join(realpathSync(tmpdir()), 'com.openai.sky.CUAService')
+    mkdirSync(cuaScreenshotDir, { recursive: true })
+    if (!rules.has(cuaScreenshotDir)) rules.set(cuaScreenshotDir, 'write')
+    // プロジェクトが宣言する追加読み取りパス（実機E2Eの素材・アプリのログ等）。
+    // 宣言はrepo内ファイルで行い、許可域は /Applications と
+    // ~/Library/Application Support 配下（とそれ自身）に限定する。repo は
+    // ジョブ自身が書けるため、HOME直下の資格情報等へは絶対に広げない。
+    const grantFile = join(repo, '.zerokun', 'computer-use-read-paths')
+    if (existsSync(grantFile)) {
+      const grantRoots = [
+        '/Applications',
+        join(home, 'Library', 'Application Support'),
+      ].filter(existingDirectory).map(root => realpathSync(root))
+      for (const rawLine of readFileSync(grantFile, 'utf8').split('\n')) {
+        const line = rawLine.trim()
+        if (line === '' || line.startsWith('#')) continue
+        const expanded = line === '~' || line.startsWith('~/')
+          ? join(home, line.slice(1))
+          : line
+        if (!expanded.startsWith('/')) continue
+        if (!existsSync(expanded)) continue
+        const physical = realpathSync(expanded)
+        if (!grantRoots.some(root => pathContains(root, physical))) continue
+        if (!rules.has(physical)) rules.set(physical, 'read')
+      }
     }
   }
   const filesystem = [...rules.entries()]
