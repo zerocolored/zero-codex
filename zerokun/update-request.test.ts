@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
-  existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync,
+  writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { basename, join } from 'path'
 import {
-  acquireDetachedLeaderIdentity, executeUpdater, requestUpdate, resumePendingUpdateWorker,
-  runUpdaterGate, runUpdateWorker,
+  acquireDetachedLeaderIdentity, executeUpdater, launchDetachedUpdateWorker,
+  requestUpdate, resumePendingUpdateWorker,
+  runUpdaterGate, runUpdateWorker, updateWorkerSessionName,
   withUpdateSlackDeadline, withoutUpdateNotificationNetworkOverrides,
 } from './update-request'
 import {
@@ -30,6 +32,50 @@ function fixtureDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'zerokun-update-request-test-'))
   tempDirs.push(dir)
   return dir
+}
+
+// 実機の既定tmux serverには本番のbotが載っているので、テストは私設socketへ隔離する。
+function tmuxHarness(dir: string) {
+  const which = Bun.spawnSync(['/usr/bin/which', 'tmux'], { stdout: 'pipe' })
+  expect(which.exitCode).toBe(0)
+  const realTmux = new TextDecoder().decode(which.stdout).trim()
+  const socket = `zerochan-update-test-${basename(dir)}`
+  const tmuxPath = join(dir, 'isolated-tmux')
+  writeFileSync(
+    tmuxPath,
+    `#!/bin/bash\nexec ${JSON.stringify(realTmux)} -L ${JSON.stringify(socket)} "$@"\n`,
+    { mode: 0o700 },
+  )
+  return {
+    tmuxPath,
+    exists: (session: string) =>
+      runTmuxCommand(tmuxPath, ['has-session', '-t', `=${session}`]).exitCode === 0,
+    start: (session: string) =>
+      runTmuxCommand(tmuxPath, ['new-session', '-d', '-s', session, 'sleep 60']).exitCode,
+    killServer: () => { runTmuxCommand(tmuxPath, ['kill-server']) },
+  }
+}
+
+function fakeWorkerFiles(dir: string) {
+  const workerFile = join(dir, 'fake-worker.ts')
+  const updaterPath = join(dir, 'fake-updater.ts')
+  writeFileSync(workerFile, [
+    "import { writeFileSync } from 'fs'",
+    "import { join } from 'path'",
+    "const args = process.argv.slice(2)",
+    "const stateIndex = args.indexOf('--state-dir')",
+    "writeFileSync(join(args[stateIndex + 1], 'worker-started'), args[1])",
+    'await Bun.sleep(60_000)',
+    '',
+  ].join('\n'))
+  writeFileSync(updaterPath, '#!/usr/bin/env bun\n')
+  return { workerFile, updaterPath }
+}
+
+async function waitForWorker(stateDir: string): Promise<void> {
+  for (let attempt = 0; attempt < 80 && !existsSync(join(stateDir, 'worker-started')); attempt += 1) {
+    await Bun.sleep(25)
+  }
 }
 
 function input(messageId = '1787000000.000100') {
@@ -695,6 +741,159 @@ describe('Slack update request', () => {
 
     expect(recovered.accepted).toBe(true)
     expect(recovered.request.id).toBe('request-after-corruption')
+  })
+
+  // 2026-09-18、オーナーが全台へ同時に更新を依頼したとき、ベルミちゃんとベルミくんが
+  // 同じ 'zerokun-update-worker' というtmux session名を取り合い、先に取った側だけが更新
+  // できて、もう一方が「別の…更新workerが実行中です」で弾かれた。
+  test('同居する相手製品や旧名のsessionが居ても更新を受け付け、同じstate dirの二重起動は今まで通り弾く', async () => {
+    const tmux = tmuxHarness(fixtureDir())
+    const stateA = fixtureDir()
+    const stateB = fixtureDir()
+    const { workerFile, updaterPath } = fakeWorkerFiles(fixtureDir())
+    // 相手製品(ベルミくん)の更新workerと、旧実装が使っていた固定名を先に立てておく。
+    const decoys = ['bellmi-update-5f51677912cc', 'zerokun-update-worker']
+
+    try {
+      for (const decoy of decoys) expect(tmux.start(decoy)).toBe(0)
+
+      const first = await requestUpdate(input(), {
+        stateDir: stateA,
+        workerFile,
+        updaterPath,
+        tmuxPath: tmux.tmuxPath,
+        idFactory: () => 'alpha',
+      })
+      expect(first.accepted).toBe(true)
+      await waitForWorker(stateA)
+      expect(tmux.exists(updateWorkerSessionName(stateA))).toBe(true)
+      // 相手のworkerも旧名のsessionも、こちらの更新で巻き添えにしない。
+      for (const decoy of decoys) expect(tmux.exists(decoy)).toBe(true)
+
+      // 別のstate dir(=別の同居ボット)は同時に更新を始められる。
+      const second = await requestUpdate(input('1787000000.000200'), {
+        stateDir: stateB,
+        workerFile,
+        updaterPath,
+        tmuxPath: tmux.tmuxPath,
+        idFactory: () => 'beta',
+      })
+      expect(second.accepted).toBe(true)
+      await waitForWorker(stateB)
+      expect(updateWorkerSessionName(stateB)).not.toBe(updateWorkerSessionName(stateA))
+      expect(tmux.exists(updateWorkerSessionName(stateA))).toBe(true)
+      expect(tmux.exists(updateWorkerSessionName(stateB))).toBe(true)
+
+      // 同じstate dirの二重更新は今まで通り弾く。
+      expect(() => launchDetachedUpdateWorker(first.request, {
+        stateDir: stateA,
+        workerFile,
+        updaterPath,
+        tmuxPath: tmux.tmuxPath,
+      })).toThrow('別のZeroちゃん更新workerが実行中です')
+    } finally {
+      tmux.killServer()
+    }
+  })
+
+  // bot起動のたびに走る経路。ここだけ旧固定名のままだと、生きているworkerを見落として
+  // 2本目を起こす。
+  test('resumePendingUpdateWorkerもstate dirごとのsessionで生存workerを見つける', async () => {
+    const tmux = tmuxHarness(fixtureDir())
+    const stateDir = fixtureDir()
+    const { workerFile, updaterPath } = fakeWorkerFiles(fixtureDir())
+
+    try {
+      const accepted = await requestUpdate(input(), {
+        stateDir,
+        workerFile,
+        updaterPath,
+        tmuxPath: tmux.tmuxPath,
+        idFactory: () => 'resume-target',
+      })
+      expect(accepted.accepted).toBe(true)
+      await waitForWorker(stateDir)
+      expect(tmux.exists(updateWorkerSessionName(stateDir))).toBe(true)
+
+      expect(resumePendingUpdateWorker({
+        stateDir,
+        workerFile,
+        updaterPath,
+        tmuxPath: tmux.tmuxPath,
+      })).toBe(false)
+    } finally {
+      tmux.killServer()
+    }
+  })
+
+  test('前方一致する無関係sessionを自分のworkerと誤認しない', async () => {
+    const tmux = tmuxHarness(fixtureDir())
+    const stateDir = fixtureDir()
+    const { workerFile, updaterPath } = fakeWorkerFiles(fixtureDir())
+
+    try {
+      expect(tmux.start(`${updateWorkerSessionName(stateDir)}-decoy`)).toBe(0)
+      const result = await requestUpdate(input(), {
+        stateDir,
+        workerFile,
+        updaterPath,
+        tmuxPath: tmux.tmuxPath,
+        idFactory: () => 'not-confused',
+      })
+      expect(result.accepted).toBe(true)
+      await waitForWorker(stateDir)
+      expect(tmux.exists(updateWorkerSessionName(stateDir))).toBe(true)
+    } finally {
+      tmux.killServer()
+    }
+  })
+
+  test('更新worker sessionはstate dirの実体pathごとに決まり、旧名やbot名の前方一致を作らない', () => {
+    const a = fixtureDir()
+    const b = fixtureDir()
+
+    expect(updateWorkerSessionName(a)).toBe(updateWorkerSessionName(a))
+    expect(updateWorkerSessionName(a)).not.toBe(updateWorkerSessionName(b))
+    expect(updateWorkerSessionName(`${a}/`)).toBe(updateWorkerSessionName(a))
+
+    const link = join(b, 'link-to-a')
+    symlinkSync(a, link)
+    expect(updateWorkerSessionName(link)).toBe(updateWorkerSessionName(a))
+
+    // requestUpdate は state dir を作る前に名前を決めるので、作成の前後で名前が変わって
+    // はいけない(macOS の /var -> /private/var で単純な realpath だと実際に変わる)。
+    const missing = join(a, 'not-created-yet')
+    const before = updateWorkerSessionName(missing)
+    mkdirSync(missing)
+    expect(updateWorkerSessionName(missing)).toBe(before)
+
+    expect(updateWorkerSessionName(a)).toMatch(/^zerochan-update-[0-9a-f]{12}$/)
+    // 旧固定名やbot常駐sessionの前方一致になると、tmuxの緩い名前解決で
+    // 相手repoの旧コードやkill-sessionに巻き込まれる。
+    expect(updateWorkerSessionName(a).startsWith('zerokun-update-worker')).toBe(false)
+    expect(updateWorkerSessionName(a).startsWith('zerokun-slack')).toBe(false)
+    // 本番のstate dirで実際に使われる名前。同居するベルミくんは bellmi-update-* になる。
+    expect(updateWorkerSessionName('/Users/zerocolored_ai03/.codex/zerokun'))
+      .toBe('zerochan-update-5ab1dda68a07')
+  })
+
+  test('tmuxのtarget構文になるsession名を拒否する', () => {
+    const stateDir = fixtureDir()
+    const { workerFile, updaterPath } = fakeWorkerFiles(stateDir)
+    const request = {
+      ...input(),
+      id: 'rejected-session-name',
+      requestedAt: 1787000000000,
+    }
+
+    for (const name of ['session.dot', 'session:colon', 'session*', '', 'session space']) {
+      expect(() => launchDetachedUpdateWorker(request, {
+        stateDir,
+        workerFile,
+        updaterPath,
+        tmuxSession: name,
+      })).toThrow('tmux session名が不正です')
+    }
   })
 
   test('tmux workerへstate/cutoverを固定して切り離し、受付process終了後も生存させる', async () => {

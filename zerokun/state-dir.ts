@@ -5,7 +5,7 @@ import { parseStateSlackTokens } from './child-environment.ts'
 
 const CUTOVER_MARKER = 'zerokun-codex-legacy-cutover-v1'
 
-function physicalPathWithMissingSuffix(input: string): string {
+export function physicalPathWithMissingSuffix(input: string): string {
   const normalized = resolve(input)
   let ancestor = normalized
   const suffix: string[] = []

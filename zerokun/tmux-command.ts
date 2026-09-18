@@ -68,7 +68,10 @@ export function tmuxSessionExists(
   session: string,
   options: { env?: Record<string, string | undefined>; timeoutMs?: number } = {},
 ): boolean {
-  const result = runTmuxCommand(tmux, ['has-session', '-t', session], {
+  // tmux の -t は「完全一致 -> 前方一致 -> fnmatch」で解決される。'=' を付けて完全一致
+  // だけに絞る。前方一致のままだと、無関係な長い名前に誤ヒットしたり、候補が複数あると
+  // rc=1 で「居ない」と誤答したりする。
+  const result = runTmuxCommand(tmux, ['has-session', '-t', `=${session}`], {
     ...options,
     capture: true,
   })

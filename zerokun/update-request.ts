@@ -15,7 +15,11 @@ import { fileURLToPath } from 'url'
 import { buildUpdaterEnvironment, parseStateSlackTokens } from './child-environment.ts'
 import { atomicWritePrivateFile, openSafeLog, readOptionalPrivateFile } from './safe-file.ts'
 import { requireManagedStateRoot } from './managed-path.ts'
-import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
+import {
+  physicalPathWithMissingSuffix,
+  resolveZeroJobDatabasePath,
+  resolveZeroStateDir,
+} from './state-dir.ts'
 import { verifySlackAppTokenPair } from './slack-app-identity.ts'
 import { inspectProcessLock } from './process-lock.ts'
 import {
@@ -34,7 +38,30 @@ import {
 } from './tmux-command.ts'
 
 const REQUEST_FILE = 'update-request.json'
-const WORKER_SESSION = 'zerokun-update-worker'
+// 更新workerのdetached session名のprefix。同じMacに同居するベルミくん
+// (claude-channel-slack)と名前を奪い合わないよう、製品ごとのprefixに state dir 由来の
+// hashを足した名前にする。旧固定名は接頭辞としても持たない — tmux の -t は前方一致でも
+// 解決されるので、旧名を接頭辞に残すと相手repoが旧コードのままのときに同じ相互ブロック
+// が復活する。
+const WORKER_SESSION_PREFIX = 'zerochan-update'
+// tmux は -s では作れるのに -t '=' では引けなくなる '.' ':' を弾く。
+const TMUX_SESSION_NAME = /^[A-Za-z0-9_-]{1,128}$/
+
+// 更新workerのtmux session名。排他は「まだ何のファイルも無い時点」で別プロセスと
+// 合意できないと成立しないので、state dir のpathだけから決まる純関数にする
+// (tmux-session.json のような後から読む発見型にはしない)。
+export function updateWorkerSessionName(dir: string): string {
+  const digest = createHash('sha256')
+    .update(physicalPathWithMissingSuffix(dir), 'utf8')
+    .digest('hex')
+    .slice(0, 12)
+  return `${WORKER_SESSION_PREFIX}-${digest}`
+}
+
+function requireSessionName(name: string): string {
+  if (!TMUX_SESSION_NAME.test(name)) throw new Error(`tmux session名が不正です: ${name}`)
+  return name
+}
 const BOT_SESSION_FALLBACK = 'zerokun-slack'
 const DEFAULT_STALE_MS = 6 * 60 * 60 * 1000
 const DEFAULT_SLACK_HTTP_TIMEOUT_MS = 120_000
@@ -323,7 +350,7 @@ export function launchDetachedUpdateWorker(
   const workerFile = options.workerFile ?? join(dir, 'update-request.ts')
   const updaterPath = options.updaterPath
   const tmux = resolveTmuxPath(options.tmuxPath)
-  const session = options.tmuxSession ?? WORKER_SESSION
+  const session = requireSessionName(options.tmuxSession ?? updateWorkerSessionName(dir))
   if (!existsSync(workerFile)) throw new Error(`update workerがありません: ${workerFile}`)
   if (!updaterPath) throw new Error('Zeroちゃん更新entrypointが指定されていません')
   if (!existsSync(updaterPath)) throw new Error(`Zeroちゃん更新entrypointがありません: ${updaterPath}`)
@@ -382,7 +409,7 @@ export async function requestUpdate(
 ): Promise<UpdateRequestResult> {
   const dir = options.stateDir ?? stateDir()
   const now = options.now ?? Date.now
-  const session = options.tmuxSession ?? WORKER_SESSION
+  const session = requireSessionName(options.tmuxSession ?? updateWorkerSessionName(dir))
   const isWorkerRunning = options.isWorkerRunning
     ?? (() => tmuxSessionExists(resolveTmuxPath(options.tmuxPath), session))
   const isUpdateRunning = options.isUpdateRunning ?? (() => updateMutationIsRunning(dir))
@@ -487,7 +514,7 @@ export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean
   const dir = options.stateDir ?? stateDir()
   const request = readRequest(dir)
   if (!request || request.outcome?.notifiedAt) return false
-  const session = options.tmuxSession ?? WORKER_SESSION
+  const session = requireSessionName(options.tmuxSession ?? updateWorkerSessionName(dir))
   const running = options.isWorkerRunning
     ? options.isWorkerRunning()
     : tmuxSessionExists(resolveTmuxPath(options.tmuxPath), session)
