@@ -51,6 +51,18 @@ CUA での実機E2Eは、対象アプリのログや QA 素材など**プロジ�
 
 このほか computer_use 許可時は、CUAService がスクリーンショットを書き出すユーザーtempの `com.openai.sky.CUAService` ディレクトリ（write）と `/Applications`（read）を自動で許可する。
 
+## 音声再生（afplay はsandbox内で必ず失敗する）
+
+codex のカスタム権限サンドボックスは CoreAudio を封じるため、ジョブ内の `afplay` は `AudioQueueStart failed (-1)`（SIGABRT）で落ちる。computer_use 許可ジョブでは、ランナーが**音声ブリッジ**を起動して再生を肩代わりする。
+
+ジョブ側の使い方（file protocol）:
+
+1. 再生したい WAV を**自分の scratch か artifact 配下**に置く
+2. `$TMPDIR/zerokun-audio/request-<英数nonce>.json` へ `{"wav": "<WAVの絶対パス>"}` を書く（`$TMPDIR` はジョブの scratch）
+3. `$TMPDIR/zerokun-audio/result-<nonce>.json` を待つ。成功なら `{"startedAtMs","endedAtMs","exitCode"}`、失敗なら `{"error"}`。`startedAtMs`/`endedAtMs` はランナーの実時刻で、再生窓の照合に使える
+
+範囲外のパス・symlink 持ち出し・64MB 超は `error` になる。再生は直列（同時要求は順番待ち）。
+
 ## 設計メモ
 
 - ゲート条件は `executionWriteEnabled && browserAccessEnabled`。ブラウザ操作許可と同じ「書き込みジョブの実装ステージのみ」で、レビュー段（read-only）には出さない。

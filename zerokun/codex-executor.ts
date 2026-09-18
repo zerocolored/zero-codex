@@ -212,6 +212,7 @@ import {
   publicationContinuationDigest,
   type GitHubPublicationContinuationBundle,
 } from './publication-continuation.ts'
+import { startComputerUseAudioBridge } from './audio-bridge.ts'
 
 type BoundCodexImplementationIntent = CodexImplementationIntent & {
   gitRoot: string
@@ -6794,6 +6795,13 @@ export async function executeCodexJob(
     } catch (error) {
       await retireUnregisteredAttempt('Codex supervisor spawn')
       throw error
+    }
+    if (advisorAttempt.computerUseEnabled) {
+      // sandbox内の afplay は CoreAudio 拒否で必ず落ちるため、実機E2Eの音声
+      // 再生はランナー側の file protocol で肩代わりする（audio-bridge.ts）。
+      // 停止は supervisor の終了へ束ねる。
+      const audioBridge = startComputerUseAudioBridge({ scratchDir, artifactDir })
+      void proc.exited.then(() => audioBridge.stop(), () => audioBridge.stop())
     }
     const supervisorIdentity = await acquireProcessGroupLeaderIdentity(proc.pid)
     if (!supervisorIdentity) {
