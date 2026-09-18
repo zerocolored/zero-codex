@@ -5139,6 +5139,7 @@ export function buildCodexPermissionOverrides(
     executionWriteEnabled?: boolean
     localVerificationEnabled?: boolean
     browserAccessEnabled?: boolean
+    computerUseEnabled?: boolean
     multiAgentEnabled?: boolean
     taskGoalEnabled?: boolean
     toolchainPath?: string
@@ -5186,6 +5187,10 @@ export function buildCodexPermissionOverrides(
   const executionWriteEnabled = options.executionWriteEnabled ?? job.writeEnabled
   const localVerificationEnabled = options.localVerificationEnabled ?? false
   const browserAccessEnabled = options.browserAccessEnabled ?? executionWriteEnabled
+  // 実機E2E（画面操作）は書き込み実装ステージだけに許可する。レビュー段
+  // (executionWriteEnabled=false) は browser access があっても画面操作させない。
+  const computerUseEnabled = options.computerUseEnabled
+    ?? (executionWriteEnabled && browserAccessEnabled)
   const networkEnabled = executionWriteEnabled || localVerificationEnabled || browserAccessEnabled
   const multiAgentEnabled = options.multiAgentEnabled ?? true
   const model = options.model ?? ZEROCHAN_PRIMARY_CODEX_MODEL
@@ -5389,7 +5394,7 @@ export function buildCodexPermissionOverrides(
     `features.browser_use=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}`,
     'features.browser_use_full_cdp_access=false',
-    'features.computer_use=false',
+    `features.computer_use=${computerUseEnabled ? 'true' : 'false'}`,
     `features.in_app_browser=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}`,
     `features.network_proxy=${networkEnabled ? 'true' : 'false'}`,
