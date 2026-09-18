@@ -12007,13 +12007,24 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         .toEqual(['model="gpt-6-astra"'])
       expect(overrides.split('\n').filter(value => value.startsWith('model_reasoning_effort=')))
         .toEqual(['model_reasoning_effort="low"'])
-      expect(overrides).toContain('features.plugins=false')
+      expect(overrides).toContain('features.plugins=true')
       expect(overrides).toContain('features.goals=false')
       expect(overrides).toContain('features.browser_use=true')
       expect(overrides).toContain('features.browser_use_external=true')
       expect(overrides).toContain('features.browser_use_full_cdp_access=false')
-      expect(overrides).toContain('features.computer_use=false')
+      expect(overrides).toContain('features.computer_use=true')
       expect(overrides).toContain('features.in_app_browser=true')
+      // CUA nodeカーネルはOpenSSL設定とChatGPT.app同梱リソースを読む
+      expect(overrides).toContain(`${JSON.stringify(realpathSync('/System/Library/OpenSSL'))}="read"`)
+      if (existsSync('/Applications/ChatGPT.app')) {
+        expect(overrides).toContain(`${JSON.stringify(realpathSync('/Applications/ChatGPT.app'))}="read"`)
+      }
+      // スクリーンショットはCUAServiceのユーザーtempへ保存される。対象アプリの
+      // 版・実行ファイル確認のため /Applications は read。
+      expect(overrides).toContain(
+        `${JSON.stringify(join(realpathSync(tmpdir()), 'com.openai.sky.CUAService'))}="write"`,
+      )
+      expect(overrides).toContain(`${JSON.stringify(realpathSync('/Applications'))}="read"`)
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
@@ -12082,6 +12093,40 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(reviewOverrides).toContain('features.browser_use_external=true')
       expect(reviewOverrides).toContain('features.browser_use_full_cdp_access=false')
       expect(reviewOverrides).toContain('features.computer_use=false')
+      expect(reviewOverrides).toContain('features.plugins=false')
+      expect(reviewOverrides).not.toContain('/System/Library/OpenSSL')
+      // プロジェクト宣言の読み取りパス: /Applications と ~/Library/Application Support
+      // 配下だけを read で許可し、それ以外（~/.ssh 等）は無視する
+      mkdirSync(join(repo, '.zerokun'), { recursive: true })
+      writeFileSync(join(repo, '.zerokun', 'computer-use-read-paths'), [
+        '# コメント行と空行は無視',
+        '',
+        '~/Library/Application Support',
+        join(homedir(), '.ssh'),
+        '/etc',
+      ].join('\n'))
+      const projectGrantOverrides = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        executionWriteEnabled: true,
+        browserAccessEnabled: true,
+      }).join('\n')
+      expect(projectGrantOverrides).toContain(
+        `${JSON.stringify(realpathSync(join(homedir(), 'Library', 'Application Support')))}="read"`,
+      )
+      expect(projectGrantOverrides).not.toContain('.ssh')
+      expect(projectGrantOverrides).not.toContain('"/etc"="read"')
+      // computer_use が無効な build では宣言ファイルがあっても付与しない
+      const reviewWithGrantFile = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        executionWriteEnabled: false,
+        browserAccessEnabled: true,
+      }).join('\n')
+      expect(reviewWithGrantFile).not.toContain('Application Support')
+      rmSync(join(repo, '.zerokun'), { recursive: true, force: true })
       expect(() => buildCodexPermissionOverrides(
         { ...job, repoPath: homedir() },
         { stateDir: state, artifactDir: outbox, scratchDir: scratch },

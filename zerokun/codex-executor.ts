@@ -212,6 +212,7 @@ import {
   publicationContinuationDigest,
   type GitHubPublicationContinuationBundle,
 } from './publication-continuation.ts'
+import { startComputerUseAudioBridge } from './audio-bridge.ts'
 
 type BoundCodexImplementationIntent = CodexImplementationIntent & {
   gitRoot: string
@@ -3847,6 +3848,7 @@ export type CodexWorkerPromptContext = {
   artifactDir: string
   advisorEnabled: boolean
   browserEnabled?: boolean
+  computerUseEnabled?: boolean
 }
 
 /** Native resume already carries its own turns; a cold start receives the durable Slack history. */
@@ -4052,6 +4054,17 @@ export function buildCodexWorkerPrompt(
         'approval capture, zerokun_browser.verify_local_page remains an isolated evidence option.',
         'Report the observed result of the actual browser attempt; do not pre-emptively refuse a',
         'remote target because the localhost verifier exists.',
+      )
+    }
+    if (host.computerUseEnabled) {
+      control.push(
+        'Computer Use and the host audio bridge are authorized in this workflow. Sandboxed afplay',
+        'always aborts with AudioQueueStart -1; to play audio on the real output device, put the',
+        'WAV under your scratch or artifact directory, write {"wav":"<absolute path>"} to',
+        '$TMPDIR/zerokun-audio/request-<alphanumeric nonce>.json, then wait for',
+        'result-<nonce>.json: {startedAtMs,endedAtMs,exitCode} on success, {error} on refusal.',
+        'The host plays requests sequentially with /usr/bin/afplay and its timestamps are wall',
+        'clock, so they are valid playback-window evidence.',
       )
     }
     if (job.githubPublicationRecovery) {
@@ -5139,6 +5152,7 @@ export function buildCodexPermissionOverrides(
     executionWriteEnabled?: boolean
     localVerificationEnabled?: boolean
     browserAccessEnabled?: boolean
+    computerUseEnabled?: boolean
     multiAgentEnabled?: boolean
     taskGoalEnabled?: boolean
     toolchainPath?: string
@@ -5186,6 +5200,10 @@ export function buildCodexPermissionOverrides(
   const executionWriteEnabled = options.executionWriteEnabled ?? job.writeEnabled
   const localVerificationEnabled = options.localVerificationEnabled ?? false
   const browserAccessEnabled = options.browserAccessEnabled ?? executionWriteEnabled
+  // 実機E2E（画面操作）は書き込み実装ステージだけに許可する。レビュー段
+  // (executionWriteEnabled=false) は browser access があっても画面操作させない。
+  const computerUseEnabled = options.computerUseEnabled
+    ?? (executionWriteEnabled && browserAccessEnabled)
   const networkEnabled = executionWriteEnabled || localVerificationEnabled || browserAccessEnabled
   const multiAgentEnabled = options.multiAgentEnabled ?? true
   const model = options.model ?? ZEROCHAN_PRIMARY_CODEX_MODEL
@@ -5309,6 +5327,51 @@ export function buildCodexPermissionOverrides(
     }
     rules.set(realpathSync(verified.path), 'read')
   }
+  if (computerUseEnabled) {
+    // CUA（デスクトップ操作）の node カーネルとプラグイン実行体は、
+    // ChatGPT.app 同梱リソース・OpenSSL 設定・plugin cache を読む。
+    // HOME は deny のままで、必要な subtree だけを read で再許可する。
+    for (const cuaPath of [
+      '/Applications/ChatGPT.app',
+      '/Applications',
+      '/System/Library/OpenSSL',
+      join(home, '.codex', 'computer-use'),
+      join(home, '.codex', 'plugins'),
+    ]) {
+      if (!existsSync(cuaPath)) continue
+      const physical = realpathSync(cuaPath)
+      if (!rules.has(physical)) rules.set(physical, 'read')
+    }
+    // CUAService はスクリーンショットをユーザーtempの専用ディレクトリへ
+    // 書き出す。ジョブの TMPDIR は scratch に差し替えるため、実tempの
+    // この1ディレクトリだけを write で許可する。
+    const cuaScreenshotDir = join(realpathSync(tmpdir()), 'com.openai.sky.CUAService')
+    mkdirSync(cuaScreenshotDir, { recursive: true })
+    if (!rules.has(cuaScreenshotDir)) rules.set(cuaScreenshotDir, 'write')
+    // プロジェクトが宣言する追加読み取りパス（実機E2Eの素材・アプリのログ等）。
+    // 宣言はrepo内ファイルで行い、許可域は /Applications と
+    // ~/Library/Application Support 配下（とそれ自身）に限定する。repo は
+    // ジョブ自身が書けるため、HOME直下の資格情報等へは絶対に広げない。
+    const grantFile = join(repo, '.zerokun', 'computer-use-read-paths')
+    if (existsSync(grantFile)) {
+      const grantRoots = [
+        '/Applications',
+        join(home, 'Library', 'Application Support'),
+      ].filter(existingDirectory).map(root => realpathSync(root))
+      for (const rawLine of readFileSync(grantFile, 'utf8').split('\n')) {
+        const line = rawLine.trim()
+        if (line === '' || line.startsWith('#')) continue
+        const expanded = line === '~' || line.startsWith('~/')
+          ? join(home, line.slice(1))
+          : line
+        if (!expanded.startsWith('/')) continue
+        if (!existsSync(expanded)) continue
+        const physical = realpathSync(expanded)
+        if (!grantRoots.some(root => pathContains(root, physical))) continue
+        if (!rules.has(physical)) rules.set(physical, 'read')
+      }
+    }
+  }
   const filesystem = [...rules.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([path, access]) => `${tomlString(path)}=${tomlString(access)}`)
@@ -5382,14 +5445,16 @@ export function buildCodexPermissionOverrides(
     'apps._default.open_world_enabled=false',
     'apps._default.destructive_enabled=false',
     'features.apps=false',
-    'features.plugins=false',
+    // CUA（デスクトップ操作）は openai-bundled プラグインが担うため、
+    // computer_use を許可するステージだけプラグインも解錠する。
+    `features.plugins=${computerUseEnabled ? 'true' : 'false'}`,
     'features.remote_plugin=false',
     'features.hooks=false',
     `features.goals=${options.taskGoalEnabled === true ? 'true' : 'false'}`,
     `features.browser_use=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}`,
     'features.browser_use_full_cdp_access=false',
-    'features.computer_use=false',
+    `features.computer_use=${computerUseEnabled ? 'true' : 'false'}`,
     `features.in_app_browser=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}`,
     `features.network_proxy=${networkEnabled ? 'true' : 'false'}`,
@@ -6547,6 +6612,7 @@ export async function executeCodexJob(
         reviewRound,
         advisorEnabled: advisorMcp !== undefined,
         browserEnabled: browserMcp !== undefined,
+        computerUseEnabled: executionWriteEnabled && browserEnabled,
         browserReceiptKey,
         browserReceiptKeyPath,
         permissionProfile,
@@ -6690,7 +6756,9 @@ export async function executeCodexJob(
       ...advisorAttempt.permissionOverrides.flatMap(value => ['-c', value]),
       '-c', `developer_instructions=${tomlString(advisorAttempt.developerInstructions)}`,
       'exec',
-      '--ignore-user-config',
+      // computer_use 許可時は CUA プラグイン（ユーザー設定由来）を残す。
+      // それ以外は従来どおりユーザー設定を遮断する。
+      ...(advisorAttempt.computerUseEnabled ? [] : ['--ignore-user-config']),
       '--ignore-rules',
       '--skip-git-repo-check',
       '--json',
@@ -6739,6 +6807,13 @@ export async function executeCodexJob(
     } catch (error) {
       await retireUnregisteredAttempt('Codex supervisor spawn')
       throw error
+    }
+    if (advisorAttempt.computerUseEnabled) {
+      // sandbox内の afplay は CoreAudio 拒否で必ず落ちるため、実機E2Eの音声
+      // 再生はランナー側の file protocol で肩代わりする（audio-bridge.ts）。
+      // 停止は supervisor の終了へ束ねる。
+      const audioBridge = startComputerUseAudioBridge({ scratchDir, artifactDir })
+      void proc.exited.then(() => audioBridge.stop(), () => audioBridge.stop())
     }
     const supervisorIdentity = await acquireProcessGroupLeaderIdentity(proc.pid)
     if (!supervisorIdentity) {
@@ -7789,6 +7864,7 @@ export async function executeCodexJob(
                 artifactDir,
                 advisorEnabled: advisorAttempt.advisorEnabled,
                 browserEnabled: advisorAttempt.browserEnabled,
+                computerUseEnabled: advisorAttempt.computerUseEnabled,
               }, threadHistoryForPhysicalSession(options.threadHistory, resumed))
               : buildCodexPhasePrompt(
                 job,
@@ -8615,6 +8691,7 @@ export async function executeCodexJob(
         artifactDir,
         advisorEnabled: advisorAttempt.advisorEnabled,
         browserEnabled: advisorAttempt.browserEnabled,
+        computerUseEnabled: advisorAttempt.computerUseEnabled,
       }, threadHistoryForPhysicalSession(options.threadHistory, resumed)))
     }
     proc.stdin.end()
