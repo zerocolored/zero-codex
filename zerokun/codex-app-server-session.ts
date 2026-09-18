@@ -9,6 +9,7 @@ const MAX_CONTROL_NOTIFICATION_HISTORY = 4_096
 const MAX_ACTIVE_TURN_PROJECTIONS = 16
 const MAX_COMPLETED_TURN_PROJECTIONS = 64
 const MAX_PENDING_LATE_SUBAGENT_ACTIVITIES = 4_096
+const MAX_PENDING_LATE_COMMANDS = 4_096
 const MAX_APP_SERVER_HISTORY_PAGES = 128
 const MAX_APP_SERVER_HISTORY_TURNS = 4_096
 const MAX_APP_SERVER_HISTORY_RAW_ITEMS = 65_536
@@ -448,6 +449,7 @@ type ObservedTurnProjection = {
     command: AppServerCommandExecutionEvidence
   }>
   pendingSubAgentActivityIds: Set<string>
+  pendingCommandIds: Set<string>
 }
 
 function emptyPermissionProbeEvidence(): AppServerPermissionProbeEvidence {
@@ -581,6 +583,8 @@ export class CodexAppServerSession {
   private readonly sealedTurnProjections = new Map<string, ObservedTurnProjection>()
   private readonly lateSubAgentActivities = new Map<string, Set<string>>()
   private pendingSubAgentActivityCount = 0
+  private readonly lateCommands = new Map<string, Set<string>>()
+  private pendingCommandCount = 0
   private readonly completedTurnProjectionKeys = new Set<string>()
   private notificationSequence = 0
   private readonly notificationWaiters = new Set<() => void>()
@@ -641,7 +645,8 @@ export class CodexAppServerSession {
     const threadId = identifier(params.threadId, 'turn/started thread id')
     const turn = parseTurn(params.turn)
     const key = turnProjectionKey(threadId, turn.id)
-    if (this.completedTurnProjectionKeys.has(key) || this.sealedTurnProjections.has(key)) {
+    if (this.completedTurnProjectionKeys.has(key) || this.sealedTurnProjections.has(key)
+      || this.lateCommands.has(key) || this.lateSubAgentActivities.has(key)) {
       throw new AppServerProtocolError('App Server reused a completed turn id')
     }
     if (this.turnProjections.has(key)) {
@@ -655,6 +660,7 @@ export class CodexAppServerSession {
       permissionEvidence: emptyPermissionProbeEvidence(),
       permissionCommandStates: new Map(),
       pendingSubAgentActivityIds: new Set(),
+      pendingCommandIds: new Set(),
     })
   }
 
@@ -690,6 +696,17 @@ export class CodexAppServerSession {
       projection.permissionCommandStates,
       'started',
     )
+    if (item.type === 'commandExecution' && typeof item.id === 'string'
+      && item.id.length > 0 && item.id.length <= 8_192) {
+      const itemId = item.id
+      if (!projection.pendingCommandIds.has(itemId)) {
+        if (this.pendingCommandCount >= MAX_PENDING_LATE_COMMANDS) {
+          throw new AppServerProtocolError('App Server opened too many pending commandExecution items')
+        }
+        projection.pendingCommandIds.add(itemId)
+        this.pendingCommandCount += 1
+      }
+    }
     if (item.type !== 'subAgentActivity') return
     const itemId = identifier(item.id, 'item/started subAgentActivity id')
     if (projection.pendingSubAgentActivityIds.has(itemId)) {
@@ -709,6 +726,18 @@ export class CodexAppServerSession {
     const projection = this.turnProjections.get(key)
     const item = record(params.item, 'item/completed item')
     if (!projection) {
+      // A background command may finish after its parent turn was sealed and
+      // the next turn started. Consume only an observed pending identity.
+      // Never mutate terminal/permission evidence or redispatch the command.
+      if (item.type === 'commandExecution' && typeof item.id === 'string') {
+        const itemId = item.id
+        const pending = this.lateCommands.get(key)
+        if (pending?.delete(itemId)) {
+          this.pendingCommandCount -= 1
+          if (pending.size === 0) this.lateCommands.delete(key)
+          return
+        }
+      }
       // Codex may attribute a successful child-agent lifecycle completion to
       // its parent after that parent's terminal notification. Accept only the
       // exact activity observed before the terminal; an age-based parent
@@ -724,6 +753,9 @@ export class CodexAppServerSession {
         }
       }
       throw new AppServerProtocolError('App Server completed an item before turn/started')
+    }
+    if (item.type === 'commandExecution' && typeof item.id === 'string') {
+      if (projection.pendingCommandIds.delete(item.id)) this.pendingCommandCount -= 1
     }
     if (item.type === 'subAgentActivity') {
       const itemId = identifier(item.id, 'item/completed subAgentActivity id')
@@ -761,6 +793,7 @@ export class CodexAppServerSession {
       permissionEvidence: emptyPermissionProbeEvidence(),
       permissionCommandStates: new Map(),
       pendingSubAgentActivityIds: new Set<string>(),
+      pendingCommandIds: new Set<string>(),
     }
     this.turnProjections.delete(key)
     if (this.retainsControlNotifications(threadId)) {
@@ -773,6 +806,9 @@ export class CodexAppServerSession {
     }
     if (projection.pendingSubAgentActivityIds.size > 0) {
       this.lateSubAgentActivities.set(key, projection.pendingSubAgentActivityIds)
+    }
+    if (projection.pendingCommandIds.size > 0) {
+      this.lateCommands.set(key, projection.pendingCommandIds)
     }
   }
 
@@ -1125,6 +1161,18 @@ export class CodexAppServerSession {
       ...params, excludeTurns: true,
     }, { timeoutMs })
     const handshake = this.threadHandshake('thread/resume', response.result, params)
+    if (typeof params.developerInstructions === 'string' && params.developerInstructions.trim()) {
+      // Resume configuration alone does not replace developer messages already
+      // stored in model-visible history. Append the current trusted instructions
+      // before the next user turn, retaining the conversation and its evidence.
+      await this.request('thread/inject_items', {
+        threadId: handshake.threadId,
+        items: [{
+          type: 'message', role: 'developer',
+          content: [{ type: 'input_text', text: params.developerInstructions }],
+        }],
+      }, { timeoutMs })
+    }
     this.controlledThreadIds.add(handshake.threadId)
     return handshake
   }
@@ -1144,6 +1192,10 @@ export class CodexAppServerSession {
     },
   ): Promise<string> {
     const baseline = this.notificationSequence
+    // Resume/injected instructions can wake a native goal before turn/start.
+    // The server may accept this input into that already-running turn. Snapshot
+    // liveness now: a short turn can finish while its RPC response is in flight.
+    const activeAtDispatch = new Set(this.turnProjections.keys())
     const response = await this.request('turn/start', {
       threadId,
       clientUserMessageId,
@@ -1162,11 +1214,13 @@ export class CodexAppServerSession {
     while (true) {
       for (let index = 0; index < this.notifications.length; index += 1) {
         const notification = this.notifications[index]!
-        if (notification.sequence <= baseline || notification.method !== 'turn/started') continue
+        if (notification.method !== 'turn/started') continue
         const params = notification.params
         if (params.threadId !== threadId) continue
         const started = parseTurn(params.turn)
         if (started.id !== turn.id || started.status !== 'inProgress') continue
+        if (notification.sequence <= baseline
+          && !activeAtDispatch.has(turnProjectionKey(threadId, turn.id))) continue
         this.notifications.splice(index, 1)
         return turn.id
       }

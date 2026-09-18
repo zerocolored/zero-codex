@@ -118,10 +118,13 @@ export async function observeNativeAdvisorCoverage(options: {
           }
         }
       }
-      const distinctFinals = [...new Set(finals)]
-      if (distinctFinals.length === 1) {
+      // A follow-up may produce another valid answer in this same physical
+      // child. Count execution once and retain its latest completed response;
+      // distinct answers here are not competing child identities.
+      const latestFinal = finals.at(-1)
+      if (latestFinal !== undefined) {
         matched.push({ ...observation, state: 'response-obtained', threadId: id,
-          responseDigest: nativeAdvisorResponseDigest(distinctFinals[0]!) })
+          responseDigest: nativeAdvisorResponseDigest(latestFinal) })
       } else if (inputObserved) {
         matched.push({ ...observation, state: 'started-no-response', threadId: id })
       }

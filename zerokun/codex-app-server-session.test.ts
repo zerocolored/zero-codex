@@ -75,9 +75,13 @@ describe('Codex App Server session', () => {
     session.closeInput()
     await session.waitForReader()
   })
-  test('長い会話のresumeは履歴本体の返却だけを省略し同じthreadへ接続する', async () => {
+  test.each([undefined, 'Current policy: unavailable advisors do not block the primary task.'])('長い会話のresumeは履歴を保持し現在のdeveloper指示を反映する (%s)', async developerInstructions => {
     const repo = mkdtempSync(join(tmpdir(), 'zero-resume-metadata-'))
     const transport = mockTransport((request, emit) => {
+      if (request.method === 'thread/inject_items') {
+        emit({ id: request.id, result: {} })
+        return
+      }
       if (request.method !== 'thread/resume') return
       emit({ id: request.id, result: {
         thread: {
@@ -94,15 +98,49 @@ describe('Codex App Server session', () => {
       const result = await session.resumeThread({
         threadId: 'existing-thread', cwd: repo, permissions: 'profile-1',
         approvalPolicy: 'never', model: 'gpt-test', excludeTurns: false,
+        developerInstructions,
         config: { model_reasoning_effort: 'xhigh' },
       })
       expect(result.threadId).toBe('existing-thread')
-      expect(transport.sent).toHaveLength(1)
+      expect(transport.sent).toHaveLength(developerInstructions ? 2 : 1)
       expect(transport.sent[0]).toMatchObject({ method: 'thread/resume', params: {
         threadId: 'existing-thread', excludeTurns: true, cwd: repo, permissions: 'profile-1',
         model: 'gpt-test', config: { model_reasoning_effort: 'xhigh' },
       } })
       expect(result.reasoningEffort).toBe('xhigh')
+      if (developerInstructions) {
+        expect(transport.sent[1]).toMatchObject({ method: 'thread/inject_items', params: {
+          threadId: 'existing-thread',
+          items: [{ type: 'message', role: 'developer',
+            content: [{ type: 'input_text', text: developerInstructions }] }],
+        } })
+      }
+    } finally {
+      session.closeInput()
+      await session.waitForReader()
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  test('resume応答が別threadなら現在の指示を送信しない', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'zero-resume-target-'))
+    const transport = mockTransport((request, emit) => {
+      emit({ id: request.id, result: {
+        thread: { id: 'foreign-thread', cwd: repo, source: 'appServer', modelProvider: 'openai',
+          status: { type: 'idle' }, canAcceptDirectInput: true, turns: [] },
+        model: 'gpt-test', reasoningEffort: 'low', modelProvider: 'openai', cwd: repo,
+        approvalPolicy: 'never', activePermissionProfile: { id: 'profile-1', extends: null },
+        instructionSources: [],
+      } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    try {
+      await expect(session.resumeThread({
+        threadId: 'owned-thread', cwd: repo, permissions: 'profile-1',
+        approvalPolicy: 'never', model: 'gpt-test', config: { model_reasoning_effort: 'low' },
+        developerInstructions: 'Current trusted instructions',
+      })).rejects.toThrow('different thread id')
+      expect(transport.sent.map(request => request.method)).toEqual(['thread/resume'])
     } finally {
       session.closeInput()
       await session.waitForReader()
@@ -536,6 +574,69 @@ describe('Codex App Server session', () => {
       rmSync(repo, { recursive: true, force: true })
     }
   })
+
+  test.each([false, true])('要求前の実行中turn開始を同一応答へ結び付け入力を一度送る (応答中完了=%s)', async completesDuringRequest => {
+    const turn = { id: 'native-live', status: 'inProgress', itemsView: 'full', items: [], error: null }
+    const terminal = { method: 'turn/completed', params: { threadId: 'root', turn: {
+      ...turn, status: 'completed', items: [{ type: 'agentMessage', text: '新しい依頼を反映しました' }],
+    } } }
+    const transport = mockTransport((request, emit) => {
+      if (completesDuringRequest) emit(terminal)
+      emit({ id: request.id, result: { turn } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    try {
+      transport.emit({ method: 'turn/started', params: { threadId: 'root', turn } })
+      await Bun.sleep(0)
+      const writes: number[] = []
+      expect(await session.startTurn('root', '最新の依頼', 'new-client-id', {
+        cwd: '/tmp', permissions: 'fixture', approvalPolicy: 'never',
+        model: 'gpt-test', effort: 'low', timeoutMs: 50,
+        beforeWrite: id => { writes.push(id) },
+      })).toBe('native-live')
+      expect(transport.sent).toHaveLength(1)
+      expect(transport.sent[0]).toMatchObject({ method: 'turn/start', params: {
+        threadId: 'root', clientUserMessageId: 'new-client-id',
+        input: [{ type: 'text', text: '最新の依頼' }], model: 'gpt-test', effort: 'low',
+      } })
+      expect(writes).toEqual([transport.sent[0]!.id as number])
+      expect(session.takeNativeTurnStart('root', [])).toBeNull()
+      if (!completesDuringRequest) {
+        transport.emit(terminal)
+        await Bun.sleep(0)
+      }
+      expect(session.takeTurnTerminal('root', 'native-live')?.turn.status).toBe('completed')
+    } finally {
+      session.closeInput()
+      await session.waitForReader()
+    }
+  })
+
+  test.each(['completed', 'foreign-thread', 'different-turn', 'consumed'] as const)(
+    '要求前の開始通知でも古い完了・別対象・消費済みは採用しない (%s)', async mismatch => {
+      const turn = { id: 'native-live', status: 'inProgress', itemsView: 'full', items: [], error: null }
+      const transport = mockTransport((request, emit) => emit({ id: request.id, result: { turn } }))
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      try {
+        transport.emit({ method: 'turn/started', params: {
+          threadId: mismatch === 'foreign-thread' ? 'other' : 'root',
+          turn: mismatch === 'different-turn' ? { ...turn, id: 'other' } : turn,
+        } })
+        if (mismatch === 'completed') transport.emit({ method: 'turn/completed', params: {
+          threadId: 'root', turn: { ...turn, status: 'completed' },
+        } })
+        await Bun.sleep(0)
+        if (mismatch === 'consumed') expect(session.takeNativeTurnStart('root', [])).toBe(turn.id)
+        await expect(session.startTurn('root', '最新の依頼', 'new-client-id', {
+          cwd: '/tmp', permissions: 'fixture', approvalPolicy: 'never', timeoutMs: 10,
+        })).rejects.toBeInstanceOf(AppServerAmbiguousRequestError)
+        expect(transport.sent).toHaveLength(1)
+      } finally {
+        session.closeInput()
+        await session.waitForReader()
+      }
+    },
+  )
 
   test('malformedなcorrelated responseでもpending requestを取り残さない', async () => {
     const transport = mockTransport((request, emit) => {
@@ -1815,6 +1916,150 @@ describe('Codex App Server session', () => {
     } })
     session.closeInput()
     await session.waitForReader()
+  })
+
+  test('job188: 次turn中の開始済みcommand遅延完了は結果を混ぜず受信する', async () => {
+    for (const status of ['completed', 'failed', 'interrupted'] as const) {
+      const transport = mockTransport()
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      const threadId = 'thread-late-command'
+      transport.emit({ method: 'turn/started', params: { threadId, turn: {
+        id: 'old', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      transport.emit({ method: 'item/started', params: { threadId, turnId: 'old', item: {
+        type: 'commandExecution', id: 'background-command', status: 'inProgress', command: 'fixture',
+      } } })
+      transport.emit({ method: 'turn/completed', params: { threadId, turn: {
+        id: 'old', status, itemsView: 'full', items: [], error: null,
+      } } })
+      let old = session.takeTurnTerminal(threadId, 'old')
+      while (!old) {
+        await session.waitForActivity(1)
+        old = session.takeTurnTerminal(threadId, 'old')
+      }
+      expect(old?.turn.status).toBe(status)
+      // Exceed the completed-turn tombstone window: pending command identity,
+      // not age or a blanket terminal-turn exception, authorizes the event.
+      for (let i = 0; i < 66; i++) {
+        transport.emit({ method: 'turn/started', params: { threadId, turn: {
+          id: `middle-${i}`, status: 'inProgress', itemsView: 'full', items: [], error: null,
+        } } })
+        transport.emit({ method: 'turn/completed', params: { threadId, turn: {
+          id: `middle-${i}`, status: 'completed', itemsView: 'full', items: [], error: null,
+        } } })
+        while (!session.takeTurnTerminal(threadId, `middle-${i}`)) await session.waitForActivity(1)
+      }
+      transport.emit({ method: 'turn/started', params: { threadId, turn: {
+        id: 'next', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      transport.emit({ method: 'item/completed', params: { threadId, turnId: 'old', item: {
+        type: 'commandExecution', id: 'background-command', status: 'completed', command: 'fixture', exitCode: 0,
+      } } })
+      transport.emit({ method: 'turn/completed', params: { threadId, turn: {
+        id: 'next', status: 'completed', itemsView: 'full', items: [], error: null,
+      } } })
+      session.closeInput()
+      await session.waitForReader()
+      expect(old?.turn.status).toBe(status)
+      expect(old?.permissionEvidence.firstCommand?.status).toBe('inProgress')
+      const next = session.takeTurnTerminal(threadId, 'next')!
+      expect(next.turn.items).toEqual([])
+      expect(next.permissionEvidence.commandCount).toBe(0)
+    }
+  })
+
+  test('未消費terminalの遅延commandもpermission証拠を後から成功へ変えない', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+      id: 'turn', status: 'inProgress', itemsView: 'full', items: [], error: null,
+    } } })
+    transport.emit({ method: 'item/started', params: { threadId: 'thread', turnId: 'turn', item: {
+      type: 'commandExecution', id: 'command', command: 'fixture', status: 'inProgress',
+    } } })
+    transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+      id: 'turn', status: 'failed', itemsView: 'summary', items: [], error: null,
+    } } })
+    transport.emit({ method: 'item/completed', params: { threadId: 'thread', turnId: 'turn', item: {
+      type: 'commandExecution', id: 'command', command: 'fixture', status: 'completed', exitCode: 0,
+    } } })
+    session.closeInput()
+    await session.waitForReader()
+    const terminal = session.takeTurnTerminal('thread', 'turn')!
+    expect(terminal.turn.status).toBe('failed')
+    expect(terminal.permissionEvidence.firstCommand?.status).toBe('inProgress')
+    expect(terminal.permissionEvidence.firstCommand?.exitCode).toBeNull()
+  })
+
+  test('commandの保留上限は通常完了と遅延完了で解放される', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    for (let round = 0; round < 2; round++) {
+      const turnId = `turn-${round}`
+      transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+        id: turnId, status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      for (let i = 0; i < 4096; i++) transport.emit({ method: 'item/started', params: {
+        threadId: 'thread', turnId, item: { type: 'commandExecution', id: `command-${i}`, status: 'inProgress', command: 'fixture' },
+      } })
+      if (round === 0) transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+        id: turnId, status: 'completed', itemsView: 'full', items: [], error: null,
+      } } })
+      for (let i = 0; i < 4096; i++) transport.emit({ method: 'item/completed', params: {
+        threadId: 'thread', turnId, item: { type: 'commandExecution', id: `command-${i}`, status: 'completed', exitCode: 1, command: 'fixture' },
+      } })
+    }
+    session.closeInput()
+    await session.waitForReader()
+  })
+
+  test('保留commandが残るturn IDは墓標の期限後も再利用しない', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    for (let i = 0; i < 66; i++) {
+      transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+        id: `turn-${i}`, status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      if (i === 0) transport.emit({ method: 'item/started', params: {
+        threadId: 'thread', turnId: 'turn-0', item: { type: 'commandExecution', id: 'pending', status: 'inProgress', command: 'fixture' },
+      } })
+      transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+        id: `turn-${i}`, status: 'completed', itemsView: 'full', items: [], error: null,
+      } } })
+      while (!session.takeTurnTerminal('thread', `turn-${i}`)) await session.waitForActivity(1)
+    }
+    transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+      id: 'turn-0', status: 'inProgress', itemsView: 'full', items: [], error: null,
+    } } })
+    transport.close()
+    await expect(session.waitForReader()).rejects.toThrow('reused a completed turn id')
+  })
+
+  test('遅延commandは別thread・turn・item・typeと二重完了を受け入れない', async () => {
+    for (const mismatch of ['thread', 'turn', 'item', 'type', 'duplicate']) {
+      const transport = mockTransport()
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+        id: 'turn', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      transport.emit({ method: 'item/started', params: { threadId: 'thread', turnId: 'turn', item: {
+        type: 'commandExecution', id: 'command', command: 'fixture', status: 'inProgress',
+      } } })
+      transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+        id: 'turn', status: 'completed', itemsView: 'full', items: [], error: null,
+      } } })
+      const completion = { method: 'item/completed', params: {
+        threadId: mismatch === 'thread' ? 'other' : 'thread',
+        turnId: mismatch === 'turn' ? 'other' : 'turn', item: {
+          type: mismatch === 'type' ? 'agentMessage' : 'commandExecution',
+          id: mismatch === 'item' ? 'other' : 'command', status: 'completed', exitCode: 0,
+        },
+      } }
+      transport.emit(completion)
+      if (mismatch === 'duplicate') transport.emit(completion)
+      transport.close()
+      await expect(session.waitForReader()).rejects.toThrow('before turn/started')
+    }
   })
 
   test('terminal後の通常itemとstarted無しのsubAgentActivityは拒否する', async () => {

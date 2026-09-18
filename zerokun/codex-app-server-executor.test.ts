@@ -367,10 +367,10 @@ for line in sys.stdin:
     request_id = value.get("id")
     rpc_log = os.environ.get("ZERO_RPC_LOG")
     log_handshakes = os.environ.get("ZERO_LOG_HANDSHAKES") == "1"
-    if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume"))):
+    if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume", "thread/inject_items"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback")}, ensure_ascii=False) + "\\n")
+            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
     if method == "initialized":
         continue
     if method == "initialize":
@@ -380,6 +380,13 @@ for line in sys.stdin:
             while True:
                 time.sleep(30)
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
+    elif method == "thread/inject_items":
+        if mode == "resume-early-start":
+            goal_status = "active"
+            emit({"method": "thread/goal/updated", "params": {"threadId": requested_thread or thread_id, "goal": {"objective": "fixture task", "status": "active"}}})
+            emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}}})
+            emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "resume-early-plan", "phase": "commentary", "text": "[ZERO_SLACK_UPDATE_BEGIN:PLAN]\\n再開した作業の方針を確認しました\\n[ZERO_SLACK_UPDATE_END:PLAN]"}}})
+        emit({"id": request_id, "result": {}})
     elif method == "thread/goal/get":
         emit({"id": request_id, "result": {"goal": None if goal_status is None else {"objective": "fixture task", "status": goal_status}}})
     elif method == "thread/goal/set":
@@ -391,6 +398,9 @@ for line in sys.stdin:
             emit({"id": request_id, "result": {"thread": {"turns": [{"history": "x" * (33 * 1024 * 1024)}]}}})
             continue
         if mode == "missing-session-resume" and method == "thread/resume" and params.get("threadId") == "thread-provider-missing":
+            emit({"id": request_id, "error": {"code": -32001, "message": "thread not found"}})
+            continue
+        if mode == "network-session-missing" and method == "thread/resume":
             emit({"id": request_id, "error": {"code": -32001, "message": "thread not found"}})
             continue
         phase_account_switch = mode in (
@@ -461,6 +471,7 @@ for line in sys.stdin:
             with open(prompt_log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"stage": stage, "text": phase_prompt}, ensure_ascii=False) + "\\n")
         unique_turn = mode in ("phased", "phased-publication", "phased-publication-targeted", "phased-promotion", "phased-promotion-history-failed", "phased-no-change", "phased-no-change-empty-scope", "phased-ui-approved", "phased-capacity-review-once", "phased-capacity-implementation-once", "phased-capacity-review-account-switch", "phased-capacity-implementation-account-switch", "phased-continuation", "phased-continuation-release", "phased-continuation-answer", "phased-continuation-new-work", "phased-continuation-malformed", "phased-continuation-stale", "phased-review-fix-three-times", "phased-reprepare-after-review-fix", "phased-native-history-fresh", "phased-native-history-resume", "phased-native-history-resume-unmaterialized", "phased-steer", "phased-late-inbound", "phased-interjection-update", "missing-session-resume", "interjection-answer", "interjection-update", "interjection-late-answer") or is_legacy_continuation
+        unique_turn = unique_turn or mode.startswith("network-")
         turn_id = "turn-app-server-" + (stage + "-" + str(os.getpid()) + "-" + str(turn_count) if unique_turn else str(turn_count))
         active_turn = {"id": turn_id, "status": "inProgress", "itemsView": "full", "items": [], "error": None}
         if mode == "terminal-cancel-race":
@@ -476,9 +487,18 @@ for line in sys.stdin:
                 {"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}},
                 {"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": "commentary-coalesced-plan", "phase": "commentary", "text": "[ZERO_SLACK_UPDATE_BEGIN:PLAN]\\n同じ通信で届いた方針を確定しました\\n[ZERO_SLACK_UPDATE_END:PLAN]"}}},
             ])
+        elif mode == "resume-early-start":
+            # Already started during instruction injection, as observed in job193.
+            # The latest explicit input is accepted into that same native turn.
+            emit({"id": request_id, "result": {"turn": active_turn}})
+            user_item = {"id": "latest-user", "type": "userMessage", "content": prompt_items}
+            emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": user_item}})
+            emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": user_item}})
         else:
             emit({"id": request_id, "result": {"turn": active_turn}})
             emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
+        if mode == "late-command-completion":
+            emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "commandExecution", "id": "background-command", "command": "fixture-only", "status": "inProgress"}}})
         turn_latch_stage = os.environ.get("ZERO_TURN_LATCH_STAGE")
         if turn_latch_stage == stage:
             turn_latch_ready = os.environ["ZERO_TURN_LATCH_READY"]
@@ -497,10 +517,14 @@ for line in sys.stdin:
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "inProgress", "itemsView": "full", "items": []}}},
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "保持して待機しました"}], "error": None}}},
             ])
-        elif mode == "goal-native":
+        elif mode in ("goal-native", "late-command-completion"):
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "interim", "text": "残タスクがあります"}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": [], "error": None}}},
+            ])
+            if mode == "late-command-completion":
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "commandExecution", "id": "background-command", "command": "fixture-only", "status": "completed", "exitCode": 0}}})
+            emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "native-final", "text": "Goalを完遂しました"}], "error": None}}},
             ])
         elif mode == "goal-blocked":
@@ -700,7 +724,7 @@ for line in sys.stdin:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": items, "error": failure}}})
             elif not hold_for_steer and not hold_for_interjection:
                 emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": message}], "error": None}}})
-        elif mode in ("normal", "commentary", "commentary-coalesced", "interjection-late-answer", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
+        elif mode in ("normal", "resume-early-start", "commentary", "commentary-coalesced", "interjection-late-answer", "slow", "logical-stop-required", "late-error-after-complete", "late-error-coalesced", "errors-before-terminal-coalesced", "terminal-cancel-race", "large-ledger", "history-authority", "history-missing-final"):
             if mode == "slow":
                 time.sleep(0.1)
             if mode == "large-ledger":
@@ -737,6 +761,22 @@ for line in sys.stdin:
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [], "error": {"message": "fixture failure"}}}})
             else:
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "失敗後の追加入力を反映しました"}], "error": None}}})
+        elif mode.startswith("network-"):
+            state_path = os.environ["ZERO_NETWORK_STATE"]
+            count = int(open(state_path).read()) if os.path.exists(state_path) else 0
+            with open(state_path, "w") as stream:
+                stream.write(str(count + 1))
+            failure = {"message": "stream disconnected before completion", "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": None}}}
+            if mode == "network-permanent":
+                failure = {"message": "The access_programs parameter is not enabled for this organization.", "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 400}}, "code": "unsupported_parameter"}
+            if mode == "network-native":
+                for _ in range(2):
+                    emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": failure}})
+            if mode == "network-native" or (mode == "network-once" and count > 0):
+                emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "通信復旧後に完了"}], "error": None}}})
+            else:
+                emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
+                emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [{"type": "commandExecution", "id": "already-done", "command": "echo completed", "status": "completed", "exitCode": 0}], "error": failure}}})
         elif mode in ("rate-error", "rate-terminal-only"):
             failure = {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}
             if mode != "rate-terminal-only":
@@ -980,14 +1020,14 @@ if mode == "logical-stop-required":
 }
 
 function fixture(
-  mode: 'normal' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
+  mode: 'normal' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
     | 'interjection-answer' | 'interjection-update' | 'interjection-late-answer'
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
-    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked' | 'goal-proposal'
+    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked' | 'goal-proposal' | 'resume-early-start'
     | 'error-steer' | 'rate-error' | 'rate-terminal-only' | 'rate-retrying' | 'rate-retrying-two-turn'
-    | 'capacity-error'
+    | 'capacity-error' | 'network-once' | 'network-always' | 'network-native' | 'network-permanent' | 'network-session-missing'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
     | 'capacity-started-command' | 'phased' | 'phased-publication'
     | 'phased-publication-targeted' | 'phased-promotion'
@@ -2320,6 +2360,40 @@ describe('production App Server executor', () => {
   }, 30_000)
   }
 
+  test('resumeの指示注入で先行開始したnative turnへ最新依頼を一度届け正常完了する', async () => {
+    const value = fixture('resume-early-start', false, '追加の条件を反映して続けてください')
+    const rpcLog = join(value.root, 'resume-early-rpc.log')
+    const promptLog = join(value.root, 'resume-early-prompt.log')
+    const statuses: string[] = []
+    const commentary: string[] = []
+    try {
+      const result = await executeCodexJob({ ...value.job, sessionId: 'thread-existing', resumed: true }, {
+        codexBinForTesting: value.executable,
+        logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: {
+          ZERO_FIXTURE_MODE: 'resume-early-start', ZERO_RPC_LOG: rpcLog,
+          ZERO_LOG_HANDSHAKES: '1', ZERO_PROMPT_LOG: promptLog,
+        },
+        liveControls: { ...value.hooks, recordGoalStatus: status => statuses.push(status) },
+        onCommentaryMessage: event => { commentary.push(event.text) },
+      })
+      expect(result.result).toBe('通常完了')
+      expect(result.sessionId).toBe('thread-existing')
+      expect(statuses).toEqual(['active', 'complete'])
+      expect(commentary).toEqual(['💬 再開した作業の方針を確認しました'])
+      const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      expect(rpc.filter(row => row.method === 'thread/resume')).toHaveLength(1)
+      expect(rpc.filter(row => row.method === 'thread/inject_items')).toHaveLength(1)
+      expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(1)
+      expect(rpc.find(row => row.method === 'turn/start').clientUserMessageId).toBe(value.job.idempotencyKey)
+      expect(rpc.filter(row => ['thread/start', 'turn/steer', 'turn/interrupt'].includes(row.method))).toHaveLength(0)
+      const prompts = readFileSync(promptLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0].text).toContain(value.job.task)
+    } finally { value.store.close() }
+  }, 45_000)
+
   for (const mode of ['goal-native', 'goal-blocked'] as const) {
     test(`native goal lifecycle ${mode}`, async () => {
       const value = fixture(mode)
@@ -2454,7 +2528,8 @@ describe('production App Server executor', () => {
       },
     })
     expect(rpc[0]?.allowProviderModelFallback).toBeNull()
-    expect(rpc[1]).toMatchObject({
+    expect(rpc[1]).toMatchObject({ method: 'thread/inject_items', currentInstructions: true })
+    expect(rpc[2]).toMatchObject({
       method: 'turn/start',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
@@ -2699,6 +2774,21 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('job188: 実executorは旧turnのcommand遅延完了で終了143にせず一度の起動で完了する', async () => {
+    const value = fixture('late-command-completion', true)
+    const processIds: number[] = []
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'late-command-completion' },
+        onProcessId: pid => { processIds.push(pid) }, liveControls: value.hooks,
+      })
+      expect(result).toEqual({ sessionId: 'thread-app-server-1', result: 'Goalを完遂しました' })
+      expect(processIds).toHaveLength(1)
+    } finally { value.store.close() }
+  }, 30_000)
+
   test('production write jobはhost工程を挟まずCodexのcomplete turnだけで完了する', async () => {
     const value = fixture(
       'normal',
@@ -2790,6 +2880,9 @@ describe('production App Server executor', () => {
     expect(rpc.filter(entry => entry.method === 'thread/start')).toHaveLength(0)
     expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(1)
     expect(rpc.find(entry => entry.method === 'thread/resume')).toMatchObject({ excludeTurns: true })
+    expect(rpc.find(entry => entry.method === 'thread/inject_items')).toMatchObject({ currentInstructions: true })
+    expect(rpc.findIndex(entry => entry.method === 'thread/inject_items'))
+      .toBeLessThan(rpc.findIndex(entry => entry.method === 'turn/start'))
     expect(rpc.filter(entry => entry.method === 'turn/start')).toHaveLength(1)
     const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
       .map(line => JSON.parse(line) as { stage: string; text: string })
@@ -6486,6 +6579,116 @@ describe('production App Server executor', () => {
       } finally { value.store.close() }
     }, 30_000)
   }
+
+  for (const mode of ['network-once', 'network-always', 'network-native', 'network-permanent'] as const) {
+    test(`network recovery ${mode} preserves thread and bounds dispatch`, async () => {
+      const value = fixture(mode, mode === 'network-once')
+      const state = join(value.root, 'network-state')
+      const phases = join(value.root, 'network-phases')
+      const prompts = join(value.root, 'network-prompts')
+      const messages: string[] = []
+      const staged: string[] = []
+      try {
+        const run = executeCodexJob(value.job, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true, liveControls: value.hooks,
+          transientRetryDelayMsForTesting: 1, parkOnUsageLimit: true,
+          onCloudQuotaDetected: () => { throw new Error('network must not park on quota') },
+          onCommentaryMessage: event => {
+            messages.push(event.text)
+            staged.push(value.store.stageCommentaryNotification(value.job.id, value.job.attempts,
+              event.sourceKey, `💬 ${event.text}`))
+          },
+          extraEnvironment: { ZERO_FIXTURE_MODE: mode, ZERO_NETWORK_STATE: state,
+            ZERO_PHASE_LOG: phases, ZERO_PROMPT_LOG: prompts },
+        })
+        if (mode === 'network-always') await expect(run).rejects.toThrow('network recovery exhausted after 3 retries')
+        else if (mode === 'network-permanent') await expect(run).rejects.toThrow('access_programs')
+        else expect(await run).toMatchObject({ sessionId: 'thread-app-server-1', result: '通信復旧後に完了' })
+        expect(Number(readFileSync(state, 'utf8'))).toBe(mode === 'network-always' ? 4 : mode === 'network-once' ? 2 : 1)
+        if (mode === 'network-once') {
+          const calls = readFileSync(phases, 'utf8').trim().split('\n').map(line => line.split('\t'))
+          expect(calls.map(call => call[2])).toEqual(['thread-app-server-1', 'thread-app-server-1'])
+          expect(calls.map(call => call[3])).toEqual(['thread/start', 'thread/resume'])
+          const resumedPrompt = JSON.parse(readFileSync(prompts, 'utf8').trim().split('\n')[1]!).text
+          expect(resumedPrompt).toStartWith('--- Transport recovery: continue the SAME task')
+          expect(resumedPrompt).toContain('Do not blindly replay')
+          expect(messages).toHaveLength(1)
+        }
+        if (mode === 'network-native') expect(messages).toHaveLength(1)
+        if (mode === 'network-permanent') expect(messages).toHaveLength(0)
+        expect(staged).toEqual(messages.map(() => 'staged'))
+      } finally { value.store.close() }
+    }, 30_000)
+  }
+
+  test('network recovery cancellation during backoff dispatches no second turn', async () => {
+    const value = fixture('network-always')
+    const state = join(value.root, 'network-state')
+    const controller = new AbortController()
+    try {
+      await expect(executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks, signal: controller.signal,
+        onCommentaryMessage: () => { controller.abort() },
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'network-always', ZERO_NETWORK_STATE: state },
+      })).rejects.toThrow('network recovery was interrupted')
+      expect(readFileSync(state, 'utf8')).toBe('1')
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('network recovery drains concurrent Slack input before resuming', async () => {
+    const value = fixture('network-once')
+    const state = join(value.root, 'network-state')
+    const prompts = join(value.root, 'network-prompts')
+    let inserted = false
+    const finishTurn = value.hooks.finishTurn
+    value.hooks.finishTurn = options => {
+      if (inserted) return finishTurn(options)
+      inserted = true
+      value.store.stageInboundDelivery({
+        chatId: value.job.chatId, threadTs: value.job.threadTs, messageId: '1800000000.000955',
+        userId: 'UOTHER', repoPath: value.job.repoPath, text: '通信回復後も既存変更を保持して', writeEnabled: false,
+      })
+      const barrier = finishTurn(options)
+      expect(barrier.pendingInbound).toBe(1)
+      expect(value.store.get(value.job.id)?.activeTurnId).toBe(options.turnId)
+      const inbound = value.store.claimNextInboundDelivery()!
+      const target = value.store.liveControlTarget(inbound.chatId, inbound.threadTs)!
+      value.store.stageLiveControl(target, {
+        chatId: inbound.chatId, threadTs: inbound.threadTs, messageId: inbound.messageId,
+        userId: inbound.userId, writeEnabled: false, task: inbound.text, kind: 'steer',
+      })
+      value.store.completeInboundDelivery(inbound.idempotencyKey)
+      return barrier
+    }
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks, transientRetryDelayMsForTesting: 1,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'network-once', ZERO_NETWORK_STATE: state, ZERO_PROMPT_LOG: prompts },
+      })
+      expect(result.result).toBe('通信復旧後に完了')
+      expect(readFileSync(state, 'utf8')).toBe('2')
+      expect(JSON.parse(readFileSync(prompts, 'utf8').trim().split('\n')[1]!).text).toContain('通信回復後も既存変更を保持して')
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('network recovery never creates a fresh thread when saved context is unavailable', async () => {
+    const value = fixture('network-session-missing')
+    const state = join(value.root, 'network-state')
+    let resets = 0
+    try {
+      await expect(executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks, transientRetryDelayMsForTesting: 1,
+        onSessionReset: () => { resets += 1 },
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'network-session-missing', ZERO_NETWORK_STATE: state },
+      })).rejects.toThrow('thread not found')
+      expect(resets).toBe(0)
+      expect(readFileSync(state, 'utf8')).toBe('1')
+    } finally { value.store.close() }
+  }, 30_000)
 
   test('willRetry中のrate-limit通知はhost requeueせず同じturnのterminalを待つ', async () => {
     const value = fixture('rate-retrying')

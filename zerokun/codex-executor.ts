@@ -1,3 +1,4 @@
+import { CODEX_NETWORK_CONTINUATION, CODEX_NETWORK_RETRY_DELAYS_MS, isTransientCodexNetworkError } from './codex-network-retry.ts'
 import {
   closeSync,
   constants,
@@ -6574,6 +6575,7 @@ export async function executeCodexJob(
     }
   }
 
+  let networkRecoveryPending = false
   const runAttempt = async (
     sessionId: string | null,
     resumed: boolean,
@@ -7683,6 +7685,9 @@ export async function executeCodexJob(
         }
         const resumeThreadId = resumed && sessionId ? sessionId : null
         const startedFreshThread = resumeThreadId === null
+        // A resumed native goal may emit progress during instruction injection,
+        // before resumeThread resolves. Its saved identity is already known.
+        monitorParentThreadId = resumeThreadId
         const threadHandshake = resumeThreadId
           ? await session.resumeThread({ threadId: resumeThreadId, ...threadParams })
           : await session.startThread({
@@ -7779,7 +7784,7 @@ export async function executeCodexJob(
                 threadHistoryForPhysicalSession(options.threadHistory, resumed),
               )
               : stage === 'complete'
-              ? buildCodexWorkerPrompt(job, advisorAttempt.inputSnapshot, {
+              ? (networkRecoveryPending ? `${CODEX_NETWORK_CONTINUATION}\n\n` : '') + buildCodexWorkerPrompt(job, advisorAttempt.inputSnapshot, {
                 attemptNonce: advisorAttempt.attemptNonce,
                 artifactDir,
                 advisorEnabled: advisorAttempt.advisorEnabled,
@@ -7907,6 +7912,7 @@ export async function executeCodexJob(
         }
 
         let rateLimitWaitReportedForTurnId: string | null = null
+        let networkWaitReportedForTurnId: string | null = null
         while (true) {
           flushMonitorMessages()
           if (abortedBeforeProcessExit) throw new CodexInterruptedError('Codex job was interrupted')
@@ -7954,6 +7960,18 @@ export async function executeCodexJob(
                   `zerochan: rate-limit wait notification could not be staged: ${error instanceof Error ? error.message : String(error)}\n`,
                 )
               }
+            }
+            if (appServerError.willRetry && isTransientCodexNetworkError(appServerError.error)
+              && networkWaitReportedForTurnId !== currentTurnId) {
+              networkWaitReportedForTurnId = currentTurnId
+              try {
+                options.onCommentaryMessage?.({
+                  sourceKey: createHash('sha256').update(JSON.stringify([
+                    job.id, job.attempts, 'network-wait', currentThreadId, currentTurnId,
+                  ])).digest('hex'),
+                  text: '一時的な通信障害を検知しました。作業内容を保持し、接続の回復を待っています。',
+                })
+              } catch { /* Notification failure must not interrupt native recovery. */ }
             }
             // Official `error` is a turn-scoped progress notification; the
             // authoritative terminal remains `turn/completed`. Treating it as
@@ -8137,7 +8155,8 @@ export async function executeCodexJob(
               executorNonce: advisorAttempt.attemptNonce,
               threadId: currentThreadId,
               turnId: currentTurnId,
-              retainInput: stage !== 'complete' || rateLimit.rateLimited,
+              retainInput: stage !== 'complete' || rateLimit.rateLimited
+                || (terminal.turn.status === 'failed' && isTransientCodexNetworkError(terminal.turn.error)),
               ...(rateLimit.rateLimited && rateLimit.resetsAtMs !== null
                 ? {
                     rateLimitResumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs),
@@ -8161,7 +8180,23 @@ export async function executeCodexJob(
               ? `App Server turn ${currentTurnId} ended as ${terminal.turn.status}: `
                 + `${JSON.stringify(terminal.turn.error ?? {})}`
               : null
-            if (turnFailed && rateLimit.rateLimited) {
+            if (turnFailed && !rateLimit.rateLimited && isTransientCodexNetworkError(terminal.turn.error)) {
+              // Slack input conversion may retain the terminal binding. Drain
+              // it before retiring this process, otherwise the next durable
+              // phase dispatch sees a still-active turn and cannot resume.
+              while (barrier.pendingInbound > 0 && !barrier.cancelled) {
+                await waitForProtocolActivity()
+                barrier = controls.finishTurn({
+                  executorNonce: advisorAttempt.attemptNonce,
+                  threadId: currentThreadId, turnId: currentTurnId, retainInput: true,
+                })
+              }
+              if (barrier.cancelled) {
+                userCancelled = true
+                break
+              }
+            }
+            if (turnFailed && (rateLimit.rateLimited || isTransientCodexNetworkError(terminal.turn.error))) {
               throw new AppServerProtocolError(
                 turnFailure!,
               )
@@ -10239,6 +10274,7 @@ export async function executeCodexJob(
   }
   const completeControls = options.liveControls
   let completePhaseSequence = 0
+  let networkRetryCount = 0
   let completeThreadReady = false
   let completeParentSource: AppServerSessionSource | null = null
   let completeParentChildBaseline: string[] | null = null
@@ -10636,6 +10672,37 @@ export async function executeCodexJob(
       execution.stderr,
       execution.stdoutPath,
     )
+    if (!rateLimit.rateLimited && execution.finalTurn?.status === 'failed'
+      && isTransientCodexNetworkError(execution.finalTurn.error)) {
+      const delay = CODEX_NETWORK_RETRY_DELAYS_MS[networkRetryCount]
+      if (delay === undefined) {
+        throw new Error(`Codex network recovery exhausted after ${networkRetryCount} retries. ${failure}`)
+      }
+      // Only an authoritative failed terminal permits another turn. Preserve
+      // this exact thread/history and use durable phase dispatch, not initial
+      // task delivery. The previous owned supervisor has already been reaped.
+      recordCompleteIdentity(execution)
+      networkRetryCount += 1
+      completePhaseSequence += 1
+      networkRecoveryPending = true
+      const message = `一時的な通信障害を検知しました。作業内容を保持し、${delay / 1000}秒後に続きから自動再開します（${networkRetryCount}/${CODEX_NETWORK_RETRY_DELAYS_MS.length}）。`
+      try { options.onMonitorMessage?.(message) } catch {}
+      try {
+        options.onCommentaryMessage?.({
+          sourceKey: createHash('sha256').update(JSON.stringify([
+            job.id, job.attempts, 'network-retry', sessionId, completePhaseSequence,
+          ])).digest('hex'),
+          text: message,
+        })
+      } catch {}
+      const resumeAt = Date.now() + (options.transientRetryDelayMsForTesting ?? delay)
+      while (Date.now() < resumeAt) {
+        if (completeControls?.cancellationRequested()) throw new CodexUserCancelledError()
+        if (options.signal?.aborted) throw new CodexInterruptedError('Codex network recovery was interrupted')
+        await Bun.sleep(Math.min(100, resumeAt - Date.now()))
+      }
+      continue
+    }
     if (rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
       throw new CodexRateLimitError(
         failure,
@@ -10647,7 +10714,7 @@ export async function executeCodexJob(
         completePhaseSequence,
       )
     }
-    if (resumed && !resumeFallbackAttempted && executionReportsMissingSession(execution)) {
+    if (resumed && !networkRecoveryPending && !resumeFallbackAttempted && executionReportsMissingSession(execution)) {
       options.onSessionReset?.()
       resumeFallbackAttempted = true
       sessionId = null
