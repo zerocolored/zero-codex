@@ -553,7 +553,7 @@ describe('zerochan stop/start', () => {
     expect(intentionalServiceStopIsSet(state)).toBe(true)
   })
 
-  test('startは回収不能な旧runtime tabを上書きせず新規起動しない', async () => {
+  test('startは回収不能な旧runtime tabを操作せず新規起動へ進む', async () => {
     const { state, project } = fixture()
     let started = false
     await expect(startManagedService(
@@ -566,11 +566,11 @@ describe('zerochan stop/start', () => {
         closeRecordedTab: async () => 'retained',
         startBot: async () => {
           started = true
-          throw new Error('must not start')
+          throw new Error('fixture reached fresh start')
         },
       },
-    )).rejects.toThrow('既存runtime tabを安全に回収できない')
-    expect(started).toBe(false)
+    )).rejects.toThrow('fixture reached fresh start')
+    expect(started).toBe(true)
   })
 
   test('startは停止markerを消しgateway/runner/launcherの安定起動を返す', async () => {
@@ -588,6 +588,7 @@ describe('zerochan stop/start', () => {
       'A0123456789',
       {
         ...testHooks,
+        closeRecordedTab: async () => 'retained',
         startBot: async options => {
           options.onRuntimeSelected?.(fakeRuntime)
         services = await spawnManagedServices(state, base)
