@@ -32,8 +32,8 @@ function existingRoutesBelongToSelectedApp(project: string, selectedId: string, 
   return selectedMatches
 }
 
-/** Read directly from the user's TTY: no readline history, echo, argv or environment. */
-export function terminalInput(label: string): Promise<string> {
+/** Read from the TTY without history. Only non-secret selections opt into echo. */
+export function terminalInput(label: string, options: { echo?: boolean } = {}): Promise<string> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error('対話端末で zerochan set slack-app を実行してください。トークンを引数に渡さないでください')
   }
@@ -76,8 +76,15 @@ export function terminalInput(label: string): Promise<string> {
         }
         if (char === '\u0003' || char === '\u0004') { finish(new Error('入力を中止しました')); return }
         if (char === '\r' || char === '\n') { finish(); return }
-        if (char === '\u007f' || char === '\b') value = value.slice(0, -1)
-        else if (char >= ' ' && char <= '~') value += char
+        if (char === '\u007f' || char === '\b') {
+          if (value.length) {
+            value = value.slice(0, -1)
+            if (options.echo) process.stdout.write('\b \b')
+          }
+        } else if (char >= ' ' && char <= '~') {
+          value += char
+          if (options.echo) process.stdout.write(char)
+        }
         if (value.length > 4096) { finish(new Error('入力が長すぎます')); return }
       }
     }
@@ -104,7 +111,7 @@ async function verifyTokens(botToken: string, appToken: string): Promise<{ appId
 
 export async function runSlackAppCommand(project: string, hooks: {
   home?: string
-  input?: (label: string) => Promise<string>
+  input?: (label: string, options?: { echo?: boolean }) => Promise<string>
   output?: (text: string) => void
   verify?: (bot: string, app: string) => Promise<{ appId: string }>
   prepare?: typeof prepareSlackAppState
@@ -117,7 +124,7 @@ export async function runSlackAppCommand(project: string, hooks: {
   const existing = listRegisteredSlackApps(home)
   existing.forEach((app, index) => output(`${index + 1}: ${app.appId}\n`))
   let selected = existing[0]
-  const choice = existing.length ? await input('登録済みアプリの番号、または新規登録は n') : 'n'
+  const choice = existing.length ? await input('登録済みアプリの番号、または新規登録は n', { echo: true }) : 'n'
   if (choice === 'n') {
     const botToken = await input('Bot Token xoxb-（非表示）')
     const appToken = await input('App-Level Token xapp-（非表示）')
