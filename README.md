@@ -269,6 +269,37 @@ bash zerokun/interactive-bootstrap.sh \
 
 ### 3. projectとSlackチャンネルを設定して起動する
 
+コマンドを忘れた場合は `zerochan help`、個別の説明は `zerochan stop --help` や
+`zerochan help update` で確認できます。ヘルプには認証やサービスの起動は不要です。
+
+同じPCから別々のSlackアプリを使う場合は `zerochan set slack-app` で登録します。
+トークンは非表示の端末入力で一度だけ登録し、以後は登録済みApp IDの一覧から選択します。
+任意のフォルダで登録できますが、プロジェクト内で実行するとそのプロジェクトへも紐付きます。
+プロジェクト外で登録した場合は、対象プロジェクトへ移動して同じコマンドで選択してください。
+既存の単一アプリ設定は元の保存先のまま一覧へ取り込まれます。
+トークンをコマンド引数・チャット・Gitへ貼らないでください。
+
+```bash
+cd /absolute/path/to/project-a
+zerochan set slack-app
+zerochan set slack-channel C0123456789
+zerochan start
+
+cd /absolute/path/to/project-b
+zerochan set slack-app
+zerochan set slack-channel C9876543210
+zerochan start
+```
+
+通常はインスタンス名の指定は不要です。各プロジェクトのApp IDから保存先を選びます。
+同じAppを複数プロジェクトで選ぶ場合は、そのAppのgateway・キューを共有します。
+別Appならキューと稼働状態は分離しますが、同じOSユーザーのCodex・Claude・Grok認証や
+利用上限は別枠になりません。別PCではそのPC用のAppを登録してください。
+
+`zerochan update` は同じソースを使う登録済みAppの作業終了を待ち、まとめて更新します。
+起動中だったAppだけを再起動し、停止中だったAppは停止状態を保ちます。
+更新や再起動が中断した場合は `zerochan update --recover-only` で保存済みの復旧処理を進めます。
+
 対象projectを新PCへcloneし、通常TerminalまたはHerdrで次を実行します。Herdr外なら専用workspaceが
 自動作成されます。複数repositoryをまとめた親folderも対象にできます。
 

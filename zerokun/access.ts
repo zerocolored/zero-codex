@@ -10,7 +10,7 @@ import {
   tryAcquireProcessLock,
   type ProcessLockLease,
 } from './process-lock.ts'
-import { resolveZeroStateDir } from './state-dir.ts'
+import { legacyCutoverForState, resolveZeroStateDir } from './state-dir.ts'
 import { atomicWritePrivateFile, readOptionalPrivateFile } from './safe-file.ts'
 
 type PendingEntry = {
@@ -266,7 +266,13 @@ async function runCli(args = process.argv.slice(2)): Promise<void> {
 }
 
 if (import.meta.main) {
-  runCli().catch(error => {
+  const runSelectedCli = async () => {
+    const { resolveProjectAppState } = await import('./project-app-state.ts')
+    process.env.ZEROKUN_STATE_DIR = resolveProjectAppState(process.cwd(), resolveZeroStateDir())
+    process.env.ZEROKUN_LEGACY_CUTOVER = legacyCutoverForState(process.env.ZEROKUN_STATE_DIR)
+    await runCli()
+  }
+  runSelectedCli().catch(error => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n${usage()}\n`)
     process.exitCode = 1
   })

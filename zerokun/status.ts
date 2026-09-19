@@ -2,6 +2,7 @@
 
 import { inspectManagedServiceStatus } from './service-control.ts'
 import { resolveZeroStateDir } from './state-dir.ts'
+import { resolveProjectAppState } from './project-app-state.ts'
 
 type PartialServiceStatus = {
   gatewayPid?: number
@@ -38,7 +39,7 @@ function main(): void {
   }
   let current: ReturnType<typeof inspectManagedServiceStatus>
   try {
-    current = inspectManagedServiceStatus(resolveZeroStateDir())
+    current = inspectManagedServiceStatus(resolveProjectAppState(process.cwd(), resolveZeroStateDir()))
   } catch (error) {
     fail(`稼働状態を確認できません: ${error instanceof Error ? error.message : String(error)}`)
   }

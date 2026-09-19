@@ -55,6 +55,8 @@ import {
   mcpIsolationOverridesForConfig,
 } from './codex-executor.ts'
 import { tryAcquireProcessLock } from './process-lock.ts'
+import { registerSlackApp, slackAppRegistryRoot } from './slack-app-registry.ts'
+import { UPDATE_RUNTIME_FILES } from './update-runtime.ts'
 import {
   captureTrackedProcesses,
   readProcessIdentity,
@@ -145,7 +147,9 @@ function makeRepo(base: string) {
   must(['git', 'config', 'user.email', 'test@example.com'], seed)
   must(['git', 'config', 'user.name', 'test'], seed)
   mkdirSync(join(seed, 'zerokun'))
-  copyFileSync(join(import.meta.dir, 'safe-file.ts'), join(seed, 'zerokun', 'safe-file.ts'))
+  for (const file of [...UPDATE_RUNTIME_FILES, 'watchdog.sh']) {
+    copyFileSync(join(import.meta.dir, file), join(seed, 'zerokun', file))
+  }
   const lockSource = [
     "import { mkdirSync, writeFileSync } from 'fs'",
     "import { dirname } from 'path'",
@@ -298,6 +302,7 @@ function updaterEnvironment(fixture: ReturnType<typeof updaterFixture>) {
   }
   return {
     ...process.env,
+    HOME: fixture.base,
     ZEROKUN_REPO_DIR: fixture.repo.local,
     ZEROKUN_STATE_DIR: fixture.state,
     ZEROKUN_PROJECT_DIR: fixture.project,
@@ -1395,7 +1400,7 @@ describe('updater helpers', () => {
       expect(start).toBeGreaterThanOrEqual(0)
       expect(source.slice(start, start + 900)).toContain('processGroupLease')
     }
-    const main = source.slice(source.indexOf('async function main('))
+    const main = source.slice(source.indexOf('async function mainSingle('))
     expect(main.slice(main.indexOf('preflightRepositories('), main.indexOf('throwIfInterrupted()', main.indexOf('preflightRepositories('))))
       .toContain('updateLock')
     expect(main.slice(main.indexOf('validateRemoteTargets('), main.indexOf('throwIfInterrupted()', main.indexOf('validateRemoteTargets('))))
@@ -1999,6 +2004,52 @@ describe('updater helpers', () => {
 })
 
 describe('Codex branch self update', () => {
+  test.each(['token', 'partial'])('source journal消去後のowner再起動失敗(%s)も次回recover-onlyへ引き継ぐ', (failureMode) => {
+    const fixture = updaterFixture()
+    const environment = serviceUpdaterEnvironment(fixture, 'owner-restart-recovery')
+    registerSlackApp('AOWNER', fixture.state, fixture.base)
+    const ownerPath = join(slackAppRegistryRoot(fixture.base), 'shared-update-owner.json')
+    writeFileSync(ownerPath, JSON.stringify({
+      version: 1, repoPath: realpathSync(fixture.repo.local),
+      owner: { stateDir: realpathSync(fixture.state), projectDir: realpathSync(fixture.project), running: true },
+      ownerRestartPending: true,
+    }), { mode: 0o600 })
+    const tamper = failureMode === 'token' ? join(fixture.base, 'tamper-restart-token') : join(fixture.state, 'fixture-no-launcher')
+    writeFileSync(tamper, 'test-only\n')
+    const failed = runUpdater(fixture, ['--recover-only'], { ...environment, ZEROKUN_UPDATE_STARTUP_TIMEOUT_MS: '1000' })
+    rememberFixtureServices(fixture.state)
+    expect(failed.exitCode).not.toBe(0)
+    expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
+    expect(JSON.parse(readFileSync(ownerPath, 'utf8')).ownerRestartPending).toBe(true)
+    rmSync(tamper)
+    const recovered = runUpdater(fixture, ['--recover-only'], environment)
+    rememberFixtureServices(fixture.state)
+    expect(recovered.exitCode, recovered.stderr.toString()).toBe(0)
+    expect(existsSync(join(fixture.state, 'plugin.lock'))).toBe(true)
+    expect(existsSync(ownerPath)).toBe(false)
+    const gatewayPid = fixtureServicePid(fixture.state, 'plugin.lock')
+    writeFileSync(ownerPath, JSON.stringify({
+      version: 1, repoPath: realpathSync(fixture.repo.local),
+      owner: { stateDir: realpathSync(fixture.state), projectDir: realpathSync(fixture.project), running: true },
+      ownerRestartPending: true,
+    }), { mode: 0o600 })
+    const healthyRetry = runUpdater(fixture, ['--recover-only'], environment)
+    expect(healthyRetry.exitCode, healthyRetry.stderr.toString()).toBe(0)
+    expect(fixtureServicePid(fixture.state, 'plugin.lock')).toBe(gatewayPid)
+    expect(existsSync(ownerPath)).toBe(false)
+    writeFileSync(ownerPath, JSON.stringify({
+      version: 1, repoPath: realpathSync(fixture.repo.local),
+      owner: { stateDir: realpathSync(fixture.state), projectDir: realpathSync(fixture.project), running: true },
+      ownerRestartPending: true,
+    }), { mode: 0o600 })
+    const sourceBefore = must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)
+    const normalRetry = runUpdater(fixture, ['--skip-tests'], environment)
+    expect(normalRetry.exitCode).not.toBe(0)
+    expect(normalRetry.stderr.toString()).toContain('新しい更新は未実施')
+    expect(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)).toBe(sourceBefore)
+    expect(existsSync(ownerPath)).toBe(false)
+  }, 30_000)
+
   test('state ancestor aliasをphysical identityへ統一してsetupとjournalへ渡す', () => {
     const fixture = updaterFixture()
     writeFileSync(join(fixture.state, '.env'), [
@@ -2029,7 +2080,7 @@ describe('Codex branch self update', () => {
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
   })
 
-  test('無関係なtmux sessionを保持し、検証済みHerdr paneで更新を完遂する', () => {
+  test('無関係なtmux sessionを保持し、検証済みHerdr paneで更新を完遂する', async () => {
     const fixture = updaterFixture()
     const tmux = must(['/usr/bin/which', 'tmux'])
     const session = `zerokun-update-collision-${process.pid}-${Date.now()}`
@@ -2045,10 +2096,12 @@ describe('Codex branch self update', () => {
     ))
     const before = must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)
 
-    const result = runUpdater(fixture, ['--skip-tests'], {
+    const environment = {
       ...serviceUpdaterEnvironment(fixture, session),
       ZEROKUN_TMUX_PATH: tmux,
-    })
+    }
+    await startFixtureBot(fixture, environment)
+    const result = runUpdater(fixture, ['--skip-tests'], environment)
     rememberFixtureServices(fixture.state)
 
     expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0)
@@ -2334,6 +2387,16 @@ describe('Codex branch self update', () => {
     20_000,
   )
 
+  test('停止中のownerは通常更新後も停止し、Herdr起動履歴を要求しない', () => {
+    const fixture = updaterFixture()
+    const result = runUpdater(fixture, ['--skip-tests'])
+    expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0)
+    expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v2\n')
+    expect(result.stdout.toString()).toContain('停止状態を保持')
+    expect(existsSync(join(fixture.state, 'plugin.lock'))).toBe(false)
+    expect(existsSync(join(fixture.state, 'job-runner-starter.lock'))).toBe(false)
+  })
+
   test('通常更新は旧launcherを先に止め、旧runnerを再生成せずcandidate一式でcommitする', async () => {
     const fixture = updaterFixture()
     const session = `zerokun-update-success-${process.pid}-${Date.now()}`
@@ -2437,7 +2500,7 @@ describe('Codex branch self update', () => {
     expect(existsSync(journal)).toBe(true)
   })
 
-  test('candidate readiness失敗時は旧commitへrollbackし旧gatewayとrunnerを再起動する', () => {
+  test('candidate readiness失敗時は旧commitへrollbackし旧gatewayとrunnerを再起動する', async () => {
     const fixture = updaterFixture()
     const originalHead = must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)
     writeFileSync(join(fixture.repo.seed, 'server.ts'), [
@@ -2455,11 +2518,14 @@ describe('Codex branch self update', () => {
     const candidateHead = must(['git', 'rev-parse', 'HEAD'], fixture.repo.seed)
     const session = `zerokun-update-rollback-${process.pid}-${Date.now()}`
     tmuxSessions.push(session)
+    const environment = serviceUpdaterEnvironment(fixture, session)
+    await startFixtureBot(fixture, environment)
+    const initialRunner = fixtureServicePid(fixture.state, 'job-runner.lock/pid')
     const result = runUpdater(
       fixture,
       ['--skip-tests'],
       {
-        ...serviceUpdaterEnvironment(fixture, session),
+        ...environment,
         ZEROKUN_HEALTH_CONSECUTIVE: '2',
         ZEROKUN_HEALTH_MAX_CHECKS: '20',
         ZEROKUN_HEALTH_SLEEP_MS: '100',
@@ -2469,6 +2535,7 @@ describe('Codex branch self update', () => {
     expect(result.exitCode).not.toBe(0)
     expect(result.stderr.toString()).toContain('旧Codex版へ自動ロールバックしました')
     expect(must(['git', 'rev-parse', 'HEAD'], fixture.repo.local)).toBe(originalHead)
+    expect(existsSync(join(slackAppRegistryRoot(fixture.base), 'shared-update-owner.json'))).toBe(false)
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
     const readiness = JSON.parse(readFileSync(join(fixture.state, 'gateway-ready.json'), 'utf8'))
@@ -2478,6 +2545,7 @@ describe('Codex branch self update', () => {
     expect(fixtureProcessIsAlive(launcherPid)).toBe(true)
     expect(fixtureProcessIsAlive(runnerPid)).toBe(true)
     expect(fixtureRunnerGenerations(fixture.state)).toEqual([
+      { release: originalHead, pid: initialRunner },
       { release: candidateHead, pid: expect.any(Number) },
       { release: originalHead, pid: runnerPid },
     ])
@@ -2747,32 +2815,51 @@ describe('Codex branch self update', () => {
     expect(existsSync(fixture.setupMarker)).toBe(true)
   }, 15_000)
 
-  test('rollback側setupもhangした場合はjournalを保持しrecover-onlyで復旧する', () => {
+  test.each([false, true])('rollback側setupもhangした場合は別Appから対象cutover=%sで復旧する', (ownerCutover) => {
     const fixture = updaterFixture()
+    const peer = join(fixture.base, 'peer-state')
+    mkdirSync(peer, { mode: 0o700 })
+    registerSlackApp('AOWNER', fixture.state, fixture.base)
+    registerSlackApp('APEER', peer, fixture.base)
+    const cutoverState = ownerCutover ? fixture.state : peer
+    writeFileSync(join(cutoverState, '.env'), 'SLACK_BOT_TOKEN=xoxb-cutover-not-a-real-token\nSLACK_APP_TOKEN=xapp-1-A0123456789-cutover-not-a-real-token\n', { mode: 0o600 })
+    writeFileSync(join(cutoverState, '.codex-legacy-cutover'), `zerokun-codex-legacy-cutover-v1\n${realpathSync(cutoverState)}\n`, { mode: 0o600 })
     writeFileSync(fixture.setup, '#!/bin/bash\nsleep 30\n')
     const failed = runUpdater(
       fixture,
       ['--skip-tests', '--no-restart'],
-      { ...updaterEnvironment(fixture), ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '100' },
+      { ...updaterEnvironment(fixture), ZEROKUN_LEGACY_CUTOVER: ownerCutover ? '1' : '0', ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '100' },
     )
     expect(failed.exitCode).not.toBe(0)
     expect(failed.stderr.toString()).toContain('timeout')
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8')).toBe('v1\n')
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(true)
+    const ownerRecord = join(slackAppRegistryRoot(fixture.base), 'shared-update-owner.json')
+    expect(JSON.parse(readFileSync(ownerRecord, 'utf8')).owner.stateDir).toBe(realpathSync(fixture.state))
 
-    writeFileSync(fixture.setup, `#!/bin/bash\ntouch '${fixture.setupMarker}'\n`)
+    writeFileSync(fixture.setup, `#!/bin/bash\n[ "$ZEROKUN_LEGACY_CUTOVER" = '${ownerCutover ? '1' : '0'}' ] || exit 91\ntouch '${fixture.setupMarker}'\n`)
     const recovered = runUpdater(
       fixture,
       ['--recover-only'],
-      { ...updaterEnvironment(fixture), ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '2000' },
+      { ...updaterEnvironment(fixture), ZEROKUN_STATE_DIR: peer, ZEROKUN_LEGACY_CUTOVER: ownerCutover ? '0' : '1', ZEROKUN_UPDATE_SETUP_TIMEOUT_MS: '2000' },
     )
     expect(recovered.exitCode, recovered.stderr.toString()).toBe(0)
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(false)
     expect(existsSync(fixture.setupMarker)).toBe(true)
+    expect(existsSync(ownerRecord)).toBe(false)
   }, 20_000)
 
-  test('旧targetのcleanなpushed descendantはrecover-onlyでforward recoveryを再試行する', () => {
+  test.each([false, true])('旧targetのcleanなpushed descendantを別Appからcutover=%sでforward recoveryする', (ownerCutover) => {
     const fixture = updaterFixture()
+    const peer = join(fixture.base, 'peer-state')
+    mkdirSync(peer, { mode: 0o700 })
+    registerSlackApp('AOWNER', fixture.state, fixture.base)
+    registerSlackApp('APEER', peer, fixture.base)
+    const cutoverState = ownerCutover ? fixture.state : peer
+    writeFileSync(join(cutoverState, '.env'), 'SLACK_BOT_TOKEN=xoxb-cutover-not-a-real-token\nSLACK_APP_TOKEN=xapp-1-A0123456789-cutover-not-a-real-token\n', { mode: 0o600 })
+    writeFileSync(join(cutoverState, '.codex-legacy-cutover'), `zerokun-codex-legacy-cutover-v1\n${realpathSync(cutoverState)}\n`, { mode: 0o600 })
+    const ownerEnvironment = { ...updaterEnvironment(fixture), ZEROKUN_LEGACY_CUTOVER: ownerCutover ? '1' : '0' }
+    const peerEnvironment = { ...updaterEnvironment(fixture), ZEROKUN_STATE_DIR: peer, ZEROKUN_LEGACY_CUTOVER: ownerCutover ? '0' : '1' }
     const allowSetup = join(fixture.base, 'allow-forward-setup')
     const forwardAttempt = join(fixture.base, 'forward-db-attempt')
     const forwardObserved = join(fixture.base, 'forward-db-observed')
@@ -2803,13 +2890,14 @@ describe('Codex branch self update', () => {
     writeFileSync(fixture.setup, [
       '#!/bin/bash',
       'set -euo pipefail',
+      `[ "$ZEROKUN_LEGACY_CUTOVER" = '${ownerCutover ? '1' : '0'}' ] || exit 91`,
       `if [ ! -f ${JSON.stringify(allowSetup)} ]; then exit 42; fi`,
       `${JSON.stringify(process.execPath)} --no-env-file ${JSON.stringify(forwardHelper)}`,
       `touch ${JSON.stringify(fixture.setupMarker)}`,
       '',
     ].join('\n'))
 
-    const failed = runUpdater(fixture)
+    const failed = runUpdater(fixture, ['--skip-tests', '--no-restart'], ownerEnvironment)
     expect(failed.exitCode).not.toBe(0)
     expect(existsSync(join(fixture.state, 'update-transaction.json'))).toBe(true)
 
@@ -2821,7 +2909,7 @@ describe('Codex branch self update', () => {
     must(['git', 'merge', '--ff-only', 'origin/codex'], fixture.repo.local)
 
     writeFileSync(allowSetup, 'ready\n')
-    const firstRecovery = runUpdater(fixture, ['--skip-tests', '--recover-only'])
+    const firstRecovery = runUpdater(fixture, ['--skip-tests', '--recover-only'], peerEnvironment)
     expect(
       firstRecovery.exitCode,
       firstRecovery.stdout.toString() + firstRecovery.stderr.toString(),
@@ -2836,7 +2924,7 @@ describe('Codex branch self update', () => {
       .toBe('partial-forward')
     partial.close()
 
-    const accidentalNormalUpdate = runUpdater(fixture)
+    const accidentalNormalUpdate = runUpdater(fixture, ['--skip-tests', '--no-restart'], peerEnvironment)
     expect(accidentalNormalUpdate.exitCode).not.toBe(0)
     expect(accidentalNormalUpdate.stderr.toString()).toContain(
       'zerochan update --recover-only',
@@ -2853,7 +2941,7 @@ describe('Codex branch self update', () => {
     must(['git', 'commit', '-m', 'v4 after forward intent'], fixture.repo.seed)
     must(['git', 'push', 'origin', 'codex'], fixture.repo.seed)
 
-    const recovered = runUpdater(fixture, ['--skip-tests', '--recover-only'])
+    const recovered = runUpdater(fixture, ['--skip-tests', '--recover-only'], peerEnvironment)
     expect(recovered.exitCode, recovered.stderr.toString()).toBe(0)
     expect(recovered.stdout.toString()).toContain('forward recovery完了')
     expect(readFileSync(join(fixture.repo.local, 'version.txt'), 'utf8'))

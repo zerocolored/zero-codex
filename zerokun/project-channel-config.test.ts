@@ -19,6 +19,7 @@ import {
   projectChannelStatus,
   projectChannelConfigPath,
   readProjectChannelConfig,
+  bindProjectSlackApp,
 } from './project-channel-config.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
 
@@ -60,6 +61,16 @@ function gitStatus(project: string): string {
 }
 
 describe('project-local Slack channel routes', () => {
+  test('App binding survives channel writes and rejects accidental cross-App routes', () => {
+    const { state, projectA } = fixture()
+    bindProjectSlackApp(projectA, APP_ID)
+    mutateProjectChannelConfig({ operation: 'set', repoPath: projectA, stateDir: state, appId: APP_ID, channelId: 'C123456' })
+    expect(readProjectChannelConfig(projectA).slackAppId).toBe(APP_ID)
+    expect(() => mutateProjectChannelConfig({ operation: 'sync', repoPath: projectA, stateDir: state, appId: 'AOTHER' })).toThrow('一致しません')
+    expect(() => bindProjectSlackApp(projectA, 'AOTHER')).toThrow('別のSlackアプリ')
+    mutateProjectChannelConfig({ operation: 'unset', repoPath: projectA, stateDir: state, appId: APP_ID })
+    expect(readProjectChannelConfig(projectA)).toEqual({ version: 1, slackChannels: [], slackAppId: APP_ID })
+  })
   test('channel名・DM ID・不正IDをproject設定として受け付けない', () => {
     const { state, projectA } = fixture()
     for (const channelId of ['#general', 'D0123456789', 'U0123456789']) {
