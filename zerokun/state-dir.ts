@@ -107,6 +107,13 @@ export function resolveZeroStateDir(
 }
 
 /** Keep every runtime/update SQLite path inside the selected physical state root. */
+export function legacyCutoverForState(stateDir: string, home = homedir()): '0' | '1' {
+  const physical = physicalPathWithMissingSuffix(stateDir)
+  return validCutoverMarker(stateDir)
+    || physical === physicalPathWithMissingSuffix(join(home, '.claude', 'channels', 'slack'))
+    || physical.endsWith('/.claude/channels/slack') ? '1' : '0'
+}
+
 export function resolveZeroJobDatabasePath(
   stateDir: string,
   environment: Record<string, string | undefined> = process.env,

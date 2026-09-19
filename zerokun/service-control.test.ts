@@ -395,6 +395,27 @@ describe('zerochan stop/start', () => {
     },
   )
 
+  test('two app processes: stopping A leaves B process generations and queue untouched', async () => {
+    const a = fixture(); const b = fixture()
+    createJobDatabase(a.state, [{ status: 'queued' }])
+    createJobDatabase(b.state, [{ status: 'queued' }, { status: 'queued' }])
+    const first = await spawnManagedServices(a.state, a.base)
+    const second = await spawnManagedServices(b.state, b.base)
+    const before = inspectManagedServiceStatus(b.state)
+    expect(before.status).toBe('running')
+    const result = await stopManagedService(dirname(import.meta.dir), a.state, testHooks)
+    expect(result.status).toBe('stopped')
+    expect(await first.gateway.exited).toBe(0)
+    expect(await first.runner.exited).toBe(0)
+    expect(inspectManagedServiceStatus(b.state)).toEqual(before)
+    expect(second.gateway.exitCode).toBe(null)
+    expect(second.runner.exitCode).toBe(null)
+    const database = new Database(join(b.state, 'jobs.sqlite3'))
+    try { expect(database.query('SELECT count(*) AS n FROM jobs WHERE status = ?').get('queued')).toEqual({ n: 2 }) }
+    finally { database.close() }
+    expect(intentionalServiceStopIsSet(b.state)).toBe(false)
+  }, 20_000)
+
   test('stopはidle ack後だけ停止しqueued jobと意図的停止状態を保持する', async () => {
     const { base, state } = fixture()
     createJobDatabase(state, [{ status: 'queued' }])

@@ -2,6 +2,7 @@
 
 import { closeSync, existsSync, realpathSync } from 'fs'
 import { join } from 'path'
+import { assertSharedSourceReady } from './shared-update.ts'
 import {
   acquireUpdateLock,
   activeJobCountsFromDatabase,
@@ -1364,6 +1365,7 @@ export async function startManagedService(
   let launchAttempted = false
   let attemptedRuntime: HerdrRuntimeIdentity | undefined
   try {
+    assertSharedSourceReady(stateDir)
     requireNoInterruptedUpdate(stateDir)
     const services = serviceProcesses(stateDir)
     const launcher = runnerLauncherProcess(stateDir)
@@ -1581,6 +1583,7 @@ async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2)
   if (command === 'assert-idle') {
     if (args.length !== 1) fail('usage: service-control.ts assert-idle STATE_DIR')
+    assertSharedSourceReady(args[0]!)
     assertServiceMutationIdle(args[0]!)
     return
   }

@@ -148,6 +148,17 @@ bash zerokun/interactive-bootstrap.sh \
 
 ### 3. Appをchannelへ招待し、projectを紐付ける
 
+同一PCへ追加のSlack Appを登録する場合は、`zerochan set slack-app` を使います。
+Bot TokenとApp-Level Tokenは対話端末で非表示入力し、同じAppの組み合わせであることを確認して保存します。
+登録はPC単位なので、次回からはトークンを入力せず一覧から選択できます
+（失効や権限変更時は認証情報の更新が必要です）。
+プロジェクト外で実行した場合は登録だけを行います。対象プロジェクトへ `cd` した後、
+再び `zerochan set slack-app` を実行して登録済みAppを選択してください。
+既存の単一App設定は移動せずに取り込むため、キューや履歴は保持されます。
+
+`zerochan help` は全体の操作一覧、`zerochan <command> --help` は個別の説明です。
+トークン未設定時でもヘルプは表示できます。
+
 Slackで利用したいchannelへ、今作ったAppを招待します。private channelも明示的な招待が必要です。
 channel IDはSlackのchannel詳細またはchannel link末尾の`C...`／`G...`で確認します。
 

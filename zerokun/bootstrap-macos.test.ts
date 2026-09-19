@@ -16,6 +16,7 @@ import {
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { installGrokReviewer } from './install-grok-reviewer.ts'
+import { watchdogLabel } from './watchdog-profile.ts'
 
 const root = join(import.meta.dir, '..')
 const bootstrap = join(import.meta.dir, 'bootstrap-macos.sh')
@@ -1793,11 +1794,11 @@ codex --version
       expect(existsSync(join(fakeHome, '.local/bin/zerokun-update'))).toBe(false)
       expect(statSync(join(fakeHome, '.zshrc')).mode & 0o777).toBe(0o644)
       expect(readFileSync(
-        join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),
+        join(fakeHome, 'Library/LaunchAgents', `${watchdogLabel(stateDir, fakeHome)}.plist`),
         'utf8',
       )).toContain(`${realpathSync(stateDir)}/watchdog.sh`)
       expect(readFileSync(
-        join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),
+        join(fakeHome, 'Library/LaunchAgents', `${watchdogLabel(stateDir, fakeHome)}.plist`),
         'utf8',
       )).toContain(`<string>${realpathSync(stateDir)}</string>`)
       expect(readFileSync(tokenFile, 'utf8')).toBe(

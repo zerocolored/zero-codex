@@ -17,6 +17,13 @@ import {
   writeSync,
 } from 'fs'
 import { basename, isAbsolute, join, resolve } from 'path'
+
+export function monitorTabLabel(stateDir: string, seq: number): string {
+  // Keep existing installations' labels while avoiding equal sequence numbers
+  // across registered Slack Apps in the same Herdr session.
+  const app = /\/zerochan-apps\/states\/(A[A-Z0-9]+)$/.exec(resolve(stateDir))?.[1]
+  return `Zeroちゃん #${seq}${app ? ` [${app}]` : ''}`
+}
 import type { JobRecord, JobStatus } from './job-runner.ts'
 import {
   ensureManagedDirectory,
@@ -340,7 +347,7 @@ function parseManifest(raw: string): MonitorManifest {
     ),
     phase: phase as HerdrMonitorPhase,
     workspaceId: requireIdentifier(record.workspaceId, /^w[0-9A-Za-z]+$/, 'workspace ID'),
-    label: requireIdentifier(record.label, /^Zeroちゃん #[1-9]\d*$/, 'monitor label'),
+    label: requireIdentifier(record.label, /^Zeroちゃん #[1-9]\d*(?: \[A[A-Z0-9]+\])?$/, 'monitor label'),
     tabId: nullableId(record.tabId, /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/, 'tab ID'),
     paneId: nullableId(record.paneId, /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/, 'pane ID'),
     terminalId: nullableId(record.terminalId, /^term_[0-9a-f]+$/, 'terminal ID'),
@@ -1417,7 +1424,7 @@ async function proveUnrecordedMonitorBindingAbsent(input: {
       `monitor sequence is unavailable for ${input.jobId}`,
     )
   }
-  const expectedLabel = `Zeroちゃん #${input.seq}`
+  const expectedLabel = monitorTabLabel(input.stateDir, input.seq)
   const expectedDirectory = resolve(input.stateDir, MONITOR_ROOT, input.jobId)
   const workspaceIds = [...new Set([
     input.runtime.workspaceId,
@@ -1643,7 +1650,7 @@ export async function openHerdrJobMonitor(input: {
       controlPlaneFingerprint: herdrControlPlaneFingerprint(input.runtime),
       phase: 'create-intent',
       workspaceId: input.runtime.workspaceId,
-      label: `Zeroちゃん #${input.job.seq}`,
+      label: monitorTabLabel(stateDir, input.job.seq),
       tabId: null,
       paneId: null,
       terminalId: null,

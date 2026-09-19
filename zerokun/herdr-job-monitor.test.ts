@@ -17,6 +17,7 @@ import type { JobRecord } from './job-runner.ts'
 import type { HerdrRuntimeIdentity } from './herdr-runtime.ts'
 import {
   appendHerdrJobMonitorChunk,
+  monitorTabLabel,
   appendHerdrJobMonitorStatus,
   buildHerdrMonitorControlEnvironment,
   closeHerdrJobMonitor,
@@ -39,6 +40,12 @@ import { completeUtf8PrefixLength } from './herdr-job-monitor-view.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 
 const directories: string[] = []
+
+test('registered Apps with equal sequence numbers have distinct monitor labels', () => {
+  expect(monitorTabLabel('/home/user/.codex/zerochan-apps/states/AONE', 1)).toBe('Zeroちゃん #1 [AONE]')
+  expect(monitorTabLabel('/home/user/.codex/zerochan-apps/states/ATWO', 1)).toBe('Zeroちゃん #1 [ATWO]')
+  expect(monitorTabLabel('/home/user/.codex/zerokun', 1)).toBe('Zeroちゃん #1')
+})
 
 test('monitor行は秒までのJST時刻をprefixにする', () => {
   expect(formatHerdrMonitorLine('確認しています', Date.parse('2026-08-29T15:04:05.000Z')))
