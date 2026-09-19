@@ -43,6 +43,7 @@ import {
   restoreRollbackDatabase,
   restoreManagedLaunchers,
   startBotInHerdr,
+  sameHerdrRuntime,
   startBotInTmux,
   stopLockedProcess,
   waitForStableHealth,
@@ -571,6 +572,15 @@ function spawnStandaloneSetup(
 }
 
 describe('updater helpers', () => {
+  test('service readiness ignores upgrade metadata but requires the freshly created terminal', () => {
+    const fixture = updaterFixture()
+    const identity = requireHerdrRuntime(serviceUpdaterEnvironment(fixture, 'generation-change'))
+    const upgraded = { ...identity, binary: '/new/herdr', binaryInode: identity.binaryInode + 1,
+      socketInode: identity.socketInode + 1 }
+    expect(sameHerdrRuntime(identity, upgraded)).toBe(true)
+    expect(sameHerdrRuntime(identity, { ...upgraded, terminalId: 'term_999999' })).toBe(false)
+    expect(sameHerdrRuntime(identity, { ...upgraded, paneId: 'wT:pOTHER' })).toBe(false)
+  })
   test('launcher snapshot decoderは旧2/4-key journalと新5-key journalを受理する', () => {
     const missing = { kind: 'missing' }
     expect(validManagedLauncherSnapshot({

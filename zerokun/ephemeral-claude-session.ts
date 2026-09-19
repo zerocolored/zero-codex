@@ -21,6 +21,7 @@ import { homedir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import {
   environmentForPinnedHerdrRuntime,
+  currentHerdrBinary,
   verifyHerdrRuntimeIdentityAsync,
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
@@ -506,7 +507,7 @@ function cleanupEnvironment(
   }
   return environmentForPinnedHerdrRuntime(runtime, {
     HOME: homedir(),
-    PATH: `${dirname(runtime.binary)}:${dirname(claudeLookup)}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    PATH: `${dirname(currentHerdrBinary(runtime))}:${dirname(claudeLookup)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
     ZEROKUN_CLAUDE_BIN_PATH: claudeLookup,
     LANG: process.env.LANG ?? 'en_US.UTF-8',
     LC_ALL: process.env.LC_ALL ?? process.env.LANG ?? 'en_US.UTF-8',

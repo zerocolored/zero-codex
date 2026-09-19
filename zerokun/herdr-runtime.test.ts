@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, renameSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import {
   decodeHerdrRuntimeIdentity,
+  environmentForPinnedHerdrRuntime,
   encodeHerdrRuntimeIdentity,
   herdrControlPlaneFingerprint,
   herdrRuntimeFingerprint,
@@ -84,15 +85,62 @@ describe('Herdr runtime binding', () => {
       expect(identity.socketInode).toBeGreaterThan(0)
       expect(() => verifyHerdrRuntimeIdentity(identity, value.environment)).not.toThrow()
       expect(() => verifyHerdrRuntimeIdentity(
-        { ...identity, terminalId: 'term_replaced' },
+        { ...identity, paneId: 'wT:p99' },
         value.environment,
       )).toThrow('identity changed')
       writeFileSync(value.environment.HERDR_BIN_PATH!, '#!/bin/sh\nexit 9\n', { mode: 0o700 })
       expect(() => verifyHerdrRuntimeIdentity(identity, value.environment))
-        .toThrow('identity changed')
+        .toThrow('verification failed')
     } finally {
       value.stop()
     }
+  })
+
+  test('benign binary replacement and socket metadata drift preserve the actual target', async () => {
+    const value = fixture()
+    try {
+      const identity = requireHerdrRuntime(value.environment)
+      const binary = value.environment.HERDR_BIN_PATH!
+      writeFileSync(`${binary}.new`, `${readFileSync(binary, 'utf8')}# upgraded\n`, { mode: 0o700 })
+      renameSync(`${binary}.new`, binary)
+      const previous = { ...identity, socketInode: identity.socketInode + 1 }
+      expect(() => verifyHerdrRuntimeIdentity(previous, value.environment)).not.toThrow()
+      await expect(verifyHerdrRuntimeIdentityAsync(previous, value.environment)).resolves.toBeUndefined()
+      await expect(verifyHerdrRuntimeIdentityAsync({ ...previous, terminalId: 'term_ffffffff' }, value.environment))
+        .resolves.toBeUndefined()
+      await expect(verifyHerdrRuntimeIdentityAsync({ ...previous, paneId: 'wT:p99' }, value.environment))
+        .rejects.toThrow('identity changed')
+    } finally { value.stop() }
+  })
+
+  test('installed launcher replaces a removed versioned binary without changing the saved receipt', async () => {
+    const value = fixture()
+    try {
+      const identity = requireHerdrRuntime(value.environment)
+      const obsolete = { ...identity, binary: `${identity.binary}.removed-version` }
+      const environment = environmentForPinnedHerdrRuntime(obsolete, value.environment)
+      expect(environment.HERDR_BIN_PATH).toBe(identity.binary)
+      expect(obsolete.binary).toEndWith('.removed-version')
+      await expect(verifyHerdrRuntimeIdentityAsync(obsolete, environment)).resolves.toBeUndefined()
+    } finally { value.stop() }
+  })
+
+  test('Homebrew upgrade prefers the installed launcher even while the obsolete binary exists', async () => {
+    const value = fixture()
+    try {
+      const identity = requireHerdrRuntime(value.environment)
+      const oldBin = join(dirname(identity.binary), 'Cellar/herdr/0.8.2/bin')
+      mkdirSync(oldBin, { recursive: true, mode: 0o700 })
+      const oldBinary = join(oldBin, 'herdr')
+      writeFileSync(oldBinary, '#!/bin/sh\nexit 9\n', { mode: 0o700 })
+      const obsolete = { ...identity, binary: oldBinary }
+      const environment = environmentForPinnedHerdrRuntime(obsolete, {
+        ...value.environment, HERDR_BIN_PATH: oldBinary,
+        PATH: `${oldBin}:${dirname(identity.binary)}:/usr/bin:/bin`,
+      })
+      expect(environment.HERDR_BIN_PATH).toBe(identity.binary)
+      await expect(verifyHerdrRuntimeIdentityAsync(obsolete, environment)).resolves.toBeUndefined()
+    } finally { value.stop() }
   })
 
   test('launcherのidentityをowner-only stateへ固定してjob時に再利用する', () => {

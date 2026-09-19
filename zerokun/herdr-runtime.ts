@@ -52,6 +52,7 @@ const HERDR_CURRENT_PANE_OUTPUT_LIMIT = 64 * 1024
 function requireOwnedNode(path: string, kind: 'socket' | 'file'): Stats {
   const metadata = lstatSync(path) as Stats
   const ownerMatches = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
+    || (kind === 'file' && metadata.uid === 0)
   const typeMatches = kind === 'socket' ? metadata.isSocket() : metadata.isFile()
   if (!typeMatches || metadata.isSymbolicLink() || !ownerMatches || (metadata.mode & 0o022) !== 0) {
     throw new Error(`unsafe Herdr ${kind}: ${path}`)
@@ -118,13 +119,43 @@ export function herdrControlPlaneFingerprint(identity: HerdrRuntimeIdentity): st
   })).digest('hex')
 }
 
+/** Runtime metadata is diagnostic, not a lease on a particular installation. */
+export function sameHerdrControlPlane(a: HerdrRuntimeIdentity, b: HerdrRuntimeIdentity): boolean {
+  return a.socketPath === b.socketPath
+}
+
+export function currentHerdrBinary(identity: HerdrRuntimeIdentity, source: Record<string, string | undefined> = process.env): string {
+  // Homebrew's versioned realpath becomes obsolete after an upgrade. Prefer
+  // the installed launcher rather than pinning every future call to that copy.
+  const binaryParts = identity.binary.split('/')
+  const cellar = binaryParts.lastIndexOf('Cellar')
+  const versionedHomebrew = cellar >= 0 && binaryParts[cellar + 1] === 'herdr'
+  if (!versionedHomebrew) {
+    try {
+      const binary = realpathSync(identity.binary)
+      requireOwnedNode(binary, 'file')
+      return binary
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+  const searchPath = (source.PATH ?? '').split(':')
+    .filter(path => !versionedHomebrew || path !== dirname(identity.binary)).join(':')
+  const candidate = source.HERDR_BIN_PATH && (!versionedHomebrew || source.HERDR_BIN_PATH !== identity.binary)
+    ? source.HERDR_BIN_PATH : Bun.which('herdr', { PATH: searchPath }) ?? identity.binary
+  if (!isAbsolute(candidate)) throw new Error('HERDR_BIN_PATH must be absolute')
+  const binary = realpathSync(candidate)
+  requireOwnedNode(binary, 'file')
+  return binary
+}
+
 export function verifyPinnedHerdrControlPlane(
   stateDir: string,
   source: Record<string, string | undefined> = process.env,
 ): void {
   const pinned = readPinnedHerdrRuntime(stateDir)
   const current = requireHerdrRuntime(source)
-  if (herdrControlPlaneFingerprint(pinned) !== herdrControlPlaneFingerprint(current)) {
+  if (!sameHerdrControlPlane(pinned, current)) {
     throw new Error('Herdr control plane changed after Zeroちゃん startup')
   }
 }
@@ -157,13 +188,13 @@ export function environmentForPinnedHerdrRuntime(
   return {
     ...environment,
     HERDR_ENV: '1',
-    HERDR_BIN_PATH: identity.binary,
+    HERDR_BIN_PATH: currentHerdrBinary(identity, source),
     HERDR_SOCKET_PATH: identity.socketPath,
     HERDR_PANE_ID: identity.paneId,
     HERDR_TAB_ID: identity.tabId,
     HERDR_TERMINAL_ID: identity.terminalId,
     HERDR_WORKSPACE_ID: identity.workspaceId,
-    PATH: `${dirname(identity.binary)}:${environment.PATH ?? '/usr/bin:/bin'}`,
+    PATH: environment.PATH ?? '/usr/bin:/bin',
   }
 }
 
@@ -346,22 +377,11 @@ export function verifyHerdrRuntimeIdentity(
   expected: HerdrRuntimeIdentity,
   source: Record<string, string | undefined> = process.env,
 ): void {
-  const binary = requireOwnedNode(expected.binary, 'file')
-  const socket = requireOwnedNode(expected.socketPath, 'socket')
-  if (
-    Number(binary.dev) !== expected.binaryDevice
-    || Number(binary.ino) !== expected.binaryInode
-    || Number(binary.mode) !== expected.binaryMode
-    || Number(binary.size) !== expected.binarySize
-    || Number(binary.mtimeMs) !== expected.binaryModifiedMs
-    || Number(binary.ctimeMs) !== expected.binaryChangedMs
-    || Number(socket.dev) !== expected.socketDevice
-    || Number(socket.ino) !== expected.socketInode
-  ) {
-    throw new Error('Herdr runtime identity changed after Zeroちゃん startup')
-  }
-  const current = requireHerdrRuntime(source)
-  if (JSON.stringify(current) !== JSON.stringify(expected)) {
+  requireOwnedNode(expected.socketPath, 'socket')
+  const current = requireHerdrRuntime({ ...source, HERDR_BIN_PATH: currentHerdrBinary(expected, source) })
+  if (!sameHerdrControlPlane(current, expected)
+    || current.paneId !== expected.paneId || current.tabId !== expected.tabId
+    || current.workspaceId !== expected.workspaceId) {
     throw new Error('Herdr runtime identity changed after Zeroちゃん startup')
   }
 }
@@ -376,37 +396,21 @@ export async function verifyHerdrRuntimeIdentityAsync(
   source: Record<string, string | undefined> = process.env,
   timeoutMs = HERDR_CURRENT_PANE_TIMEOUT_MS,
 ): Promise<void> {
-  const binary = requireOwnedNode(expected.binary, 'file')
-  const socket = requireOwnedNode(expected.socketPath, 'socket')
-  if (
-    Number(binary.dev) !== expected.binaryDevice
-    || Number(binary.ino) !== expected.binaryInode
-    || Number(binary.mode) !== expected.binaryMode
-    || Number(binary.size) !== expected.binarySize
-    || Number(binary.mtimeMs) !== expected.binaryModifiedMs
-    || Number(binary.ctimeMs) !== expected.binaryChangedMs
-    || Number(socket.dev) !== expected.socketDevice
-    || Number(socket.ino) !== expected.socketInode
-  ) {
-    throw new Error('Herdr runtime identity changed after Zeroちゃん startup')
-  }
+  requireOwnedNode(expected.socketPath, 'socket')
   if (source.HERDR_ENV !== '1') {
     throw new Error('ZeroちゃんはHerdr内から起動してください（HERDR_ENV=1 が必要です）')
   }
   const socketInput = source.HERDR_SOCKET_PATH
   if (!socketInput || !isAbsolute(socketInput)) throw new Error('HERDR_SOCKET_PATH must be absolute')
   const socketPath = join(realpathSync(dirname(socketInput)), basename(socketInput))
-  const binaryInput = source.HERDR_BIN_PATH || Bun.which('herdr', { PATH: source.PATH })
-  if (!binaryInput || !isAbsolute(binaryInput)) throw new Error('HERDR_BIN_PATH must be absolute')
-  const resolvedBinary = realpathSync(binaryInput)
-  if (socketPath !== expected.socketPath || resolvedBinary !== expected.binary) {
+  const resolvedBinary = currentHerdrBinary(expected, source)
+  if (socketPath !== expected.socketPath) {
     throw new Error('Herdr runtime identity changed after Zeroちゃん startup')
   }
-  const pane = await readCurrentPaneAsync(expected.binary, source, timeoutMs)
+  const pane = await readCurrentPaneAsync(resolvedBinary, { ...source, HERDR_BIN_PATH: resolvedBinary }, timeoutMs)
   if (
     requireIdentifier(pane.pane_id, 'Herdr pane ID', /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/) !== expected.paneId
     || requireIdentifier(pane.tab_id, 'Herdr tab ID', /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/) !== expected.tabId
-    || requireIdentifier(pane.terminal_id, 'Herdr terminal ID', /^term_[0-9a-f]+$/) !== expected.terminalId
     || requireIdentifier(pane.workspace_id, 'Herdr workspace ID', /^w[0-9A-Za-z]+$/) !== expected.workspaceId
   ) {
     throw new Error('Herdr runtime identity changed after Zeroちゃん startup')

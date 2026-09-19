@@ -27,6 +27,7 @@ import { z } from 'zod'
 import { classifyAdvisorFailure } from './advisor-availability.ts'
 import {
   readPinnedHerdrRuntime,
+  currentHerdrBinary,
   verifyHerdrRuntimeIdentityAsync,
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
@@ -930,13 +931,13 @@ export function brokerEnvironment(runtime?: HerdrRuntimeIdentity): Record<string
   }
   if (runtime) Object.assign(environment, {
     HERDR_ENV: '1',
-    HERDR_BIN_PATH: runtime.binary,
+    HERDR_BIN_PATH: currentHerdrBinary(runtime),
     HERDR_SOCKET_PATH: runtime.socketPath,
     HERDR_PANE_ID: runtime.paneId,
     HERDR_TAB_ID: runtime.tabId,
     HERDR_TERMINAL_ID: runtime.terminalId,
     HERDR_WORKSPACE_ID: runtime.workspaceId,
-    PATH: `${dirname(runtime.binary)}:${environment.PATH}`,
+    PATH: environment.PATH,
   })
   return environment
 }
@@ -955,7 +956,7 @@ function brokerHelperEnvironment(
   const claudeLookup = verifiedClaudeLookupPath(pinnedClaudeLookup)
   return {
     ...environment,
-    PATH: `${dirname(runtime.binary)}:${dirname(claudeLookup)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+    PATH: `${dirname(currentHerdrBinary(runtime))}:${dirname(claudeLookup)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
     ZEROKUN_CLAUDE_BIN_PATH: claudeLookup,
   }
 }
@@ -1008,7 +1009,7 @@ async function herdrJson(
   fingerprint?: FingerprintPaths,
 ): Promise<unknown> {
   await verifyHerdrRuntimeIdentityAsync(runtime, brokerEnvironment(runtime))
-  return commandJson(await runBounded(fingerprintedCommand([runtime.binary, ...args], fingerprint), {
+  return commandJson(await runBounded(fingerprintedCommand([currentHerdrBinary(runtime), ...args], fingerprint), {
     env: brokerEnvironment(runtime), timeoutMs: 130_000,
   }), label)
 }
@@ -1020,7 +1021,7 @@ async function herdrText(
   fingerprint?: FingerprintPaths,
 ): Promise<string> {
   await verifyHerdrRuntimeIdentityAsync(runtime, brokerEnvironment(runtime))
-  const result = await runBounded(fingerprintedCommand([runtime.binary, ...args], fingerprint), {
+  const result = await runBounded(fingerprintedCommand([currentHerdrBinary(runtime), ...args], fingerprint), {
     env: brokerEnvironment(runtime), timeoutMs: 130_000,
   })
   if (result.timedOut || result.forcedCleanup || result.outputTruncated || result.exitCode !== 0) {
