@@ -55,6 +55,11 @@ function fixtureState(): string {
   chmodSync(root, 0o700)
   const state = join(root, 'state')
   mkdirSync(state, { mode: 0o700 })
+  // Cleanup environment resolution must use a fixture, not this Mac's Herdr
+  // installation (which is deliberately hidden in updater verification).
+  const herdr = join(root, 'herdr')
+  writeFileSync(herdr, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+  runtime.binary = herdr
   return state
 }
 
