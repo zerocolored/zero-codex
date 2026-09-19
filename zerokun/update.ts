@@ -84,6 +84,7 @@ import {
 } from './runner-launch-receipt.ts'
 import {
   decodeHerdrRuntimeIdentity,
+  currentHerdrBinary,
   encodeHerdrRuntimeIdentity,
   environmentForPinnedHerdrRuntime,
   HERDR_ENVIRONMENT_KEYS,
@@ -2383,7 +2384,7 @@ function runHerdrCommand(
   args: string[],
   target = control,
 ): string {
-  const result = Bun.spawnSync([control.binary, ...args], {
+  const result = Bun.spawnSync([currentHerdrBinary(control), ...args], {
     env: environmentForPinnedHerdrRuntime(target),
     stdin: 'ignore',
     stdout: 'pipe',
@@ -2422,8 +2423,10 @@ function requireAgentlessHerdrPane(pane: HerdrPaneRecord): void {
   }
 }
 
-function sameHerdrRuntime(left: HerdrRuntimeIdentity, right: HerdrRuntimeIdentity): boolean {
-  return JSON.stringify(left) === JSON.stringify(right)
+export function sameHerdrRuntime(left: HerdrRuntimeIdentity, right: HerdrRuntimeIdentity): boolean {
+  return left.socketPath === right.socketPath && left.paneId === right.paneId
+    && left.tabId === right.tabId && left.terminalId === right.terminalId
+    && left.workspaceId === right.workspaceId
 }
 
 function serviceTabRecordPath(stateDir: string): string {

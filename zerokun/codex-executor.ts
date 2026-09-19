@@ -7254,8 +7254,8 @@ export async function executeCodexJob(
         if (!herdrRuntime || herdrIdentityCheck) return
         herdrIdentityCheck = verifyHerdrRuntimeIdentityAsync(herdrRuntime)
           .catch(error => {
+            if (!runtimeIdentityError) process.stderr.write(`Herdr view unavailable; Codex continues with disk logs: ${String(error)}\n`)
             runtimeIdentityError ??= error
-            abort()
           })
           .finally(() => { herdrIdentityCheck = null })
       }
@@ -8517,11 +8517,6 @@ export async function executeCodexJob(
       closeSync(stdoutDescriptor)
       stdoutTail = (stdoutTail + stdoutDecoder.decode()).slice(-MAX_LOG_TAIL_CHARS)
       const stderr = await stderrPromise
-      if (runtimeIdentityError) {
-        protocolError ??= new CodexInterruptedError(
-          `Herdr runtime identity changed during job: ${runtimeIdentityError}`,
-        )
-      }
       protocolError ??= readerError
       protocolError ??= lateProtocolError
       if (protocolError && !userCancelled) {
@@ -8773,8 +8768,8 @@ export async function executeCodexJob(
       if (!herdrRuntime || herdrIdentityCheck) return
       herdrIdentityCheck = verifyHerdrRuntimeIdentityAsync(herdrRuntime)
         .catch(error => {
+          if (!runtimeIdentityError) process.stderr.write(`Herdr view unavailable; Codex continues with disk logs: ${String(error)}\n`)
           runtimeIdentityError ??= error
-          abort()
         })
         .finally(() => { herdrIdentityCheck = null })
     }
@@ -8835,7 +8830,6 @@ export async function executeCodexJob(
           || registrationError != null
           || processPersistenceError != null
           || sessionPersistenceError != null
-          || runtimeIdentityError != null
           || exitCode !== 0,
         onForce: () => { postExitCleanupForced = true },
       })
@@ -8853,9 +8847,6 @@ export async function executeCodexJob(
     const stdout = stdoutOutcome.value
     if (processPersistenceError) throw processPersistenceError
     if (sessionPersistenceError) throw sessionPersistenceError
-    if (runtimeIdentityError) {
-      throw new CodexInterruptedError(`Herdr runtime identity changed during job: ${runtimeIdentityError}`)
-    }
     // These values are assigned from the stdout callback; capture their
     // post-drain state explicitly because TypeScript cannot narrow mutation
     // performed across that callback boundary.

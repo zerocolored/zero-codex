@@ -34,7 +34,7 @@ import { requireManagedStateRoot } from './managed-path.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
 import {
   environmentForPinnedHerdrRuntime,
-  herdrControlPlaneFingerprint,
+  sameHerdrControlPlane,
   herdrRuntimeFingerprint,
   readPinnedHerdrRuntime,
   requireHerdrRuntime,
@@ -1334,7 +1334,7 @@ async function requireRunningServiceCompatible(
   }
   const pinned = readPinnedHerdrRuntime(stateDir)
   await verifyRuntime(pinned)
-  if (herdrControlPlaneFingerprint(pinned) !== herdrControlPlaneFingerprint(controlRuntime)) {
+  if (!sameHerdrControlPlane(pinned, controlRuntime)) {
     fail('稼働中serviceと現在のHerdr control planeが一致しません')
   }
   const runnerRuntime = readRunnerRuntime(stateDir)

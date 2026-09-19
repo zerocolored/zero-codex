@@ -30,6 +30,7 @@ import {
   createExecutorPidLifecycle,
   DEFAULT_MAX_JOBS_PER_SESSION,
   JobStore,
+  markMonitorUnavailable,
   liveControlAcceptsInput,
   SERIAL_WORKER_COUNT,
   createSlackIdentityPauseGuard,
@@ -4762,6 +4763,39 @@ describe('Codex job store', () => {
 })
 
 describe('single FIFO worker', () => {
+  test('monitor close failure preserves completion and runs the next job once', async () => {
+    const store = makeStore()
+    const first = store.enqueue(input({ messageId: 'view-close-first' })).job
+    const second = store.enqueue(input({ messageId: 'view-close-second', threadId: 'other-thread' })).job
+    const executed: string[] = []
+    const stats = await runQueuedJobs({
+      store, maxJobsPerSession: 5, pollMs: 1, stopWhenIdle: true,
+      executor: async job => {
+        executed.push(job.id)
+        return { sessionId: `session-${job.id}`, result: 'completed despite view restart' }
+      },
+      closeJobMonitor: async () => { throw new Error('display server restarted after quiesce') },
+    })
+    expect(stats).toEqual({ completed: 2, failed: 0, workersStarted: 1 })
+    expect(executed).toEqual([first.id, second.id])
+    expect(store.get(first.id)?.status).toBe('completed')
+    expect(store.get(second.id)?.status).toBe('completed')
+    expect(store.terminalNotificationCount()).toBe(2)
+    store.close()
+  })
+  test('monitor loss records one warning without aborting the running job or runner', () => {
+    const controller = new AbortController()
+    const executionController = new AbortController()
+    const guard = { controller, executionController, unavailable: false }
+    const warnings: string[] = []
+    markMonitorUnavailable(guard, 'job-1', new Error('Herdr restarted'), message => warnings.push(message))
+    markMonitorUnavailable(guard, 'job-1', new Error('same missing view'), message => warnings.push(message))
+    expect(guard.unavailable).toBe(true)
+    expect(controller.signal.aborted).toBe(false)
+    expect(executionController.signal.aborted).toBe(false)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('continuing with saved logs')
+  })
   test('claim直前のadvisor bookkeeping失敗でもprimary workerを続行する', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'blocked-before-claim' })).job

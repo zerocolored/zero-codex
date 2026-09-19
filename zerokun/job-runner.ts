@@ -209,6 +209,8 @@ import {
 } from './advisor-round-recovery.ts'
 import {
   appendHerdrJobMonitorStatus,
+  archiveStoppedHerdrMonitor,
+  stopRecordedHerdrMonitorViewer,
   closeHerdrJobMonitor,
   HerdrJobMonitorPendingError,
   openHerdrJobMonitor,
@@ -14860,11 +14862,19 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         && (settled.status === 'completed' || settled.status === 'failed'
           || (settled.status === 'queued'
             && (settled.uiApprovalRequestId !== null || closeRequeuedUiApprovalMonitor)))) {
-        if (settled.status === 'failed' && settled.terminalOutcome === 'failed'
-          && options.retainFailedJobMonitor) {
-          await options.retainFailedJobMonitor(settled)
-        } else {
-          await options.closeJobMonitor?.(settled)
+        try {
+          if (settled.status === 'failed' && settled.terminalOutcome === 'failed'
+            && options.retainFailedJobMonitor) {
+            await options.retainFailedJobMonitor(settled)
+          } else {
+            await options.closeJobMonitor?.(settled)
+          }
+        } catch (error) {
+          // The result is already durable. A restarted display server must not
+          // turn it into a failed task or prevent the next queued task running.
+          // Keep the view and its saved logs; never guess a replacement target.
+          log(`Herdr monitor finalization unavailable for ${job.id}; keeping saved logs: ${error}`)
+          options.store.retireMonitorObligation(job.id)
         }
       }
     }
@@ -16198,6 +16208,18 @@ export async function reconcileAdvisorsWithMonitorHealthBarrier(
   await verify()
   await reconcileAdvisors()
   await verify()
+}
+
+/** Losing a display must never cancel an independently running Codex task. */
+export function markMonitorUnavailable(
+  guard: { unavailable?: boolean },
+  jobId: string,
+  error: unknown,
+  log: (message: string) => void,
+): void {
+  if (guard.unavailable) return
+  guard.unavailable = true
+  log(`Herdr monitor unavailable for ${jobId}; continuing with saved logs: ${error}`)
 }
 
 export async function reconcileEphemeralAndRetiredAdvisorRounds(options: {
@@ -17881,6 +17903,13 @@ export async function recoverForcedServiceStop(input: {
       ignoreMonitorBarriersForForcedServiceStop: true,
     })
     const failedJobIds = store.failRunningForForcedServiceStop()
+    for (const obligation of store.monitorObligationsForForcedServiceStop()) {
+      await stopRecordedHerdrMonitorViewer(dir, obligation.id)
+      if (archiveStoppedHerdrMonitor({ stateDir: dir, jobId: obligation.id, status: obligation.status })) {
+        store.retireMonitorForForcedServiceStop(obligation.id)
+        log(`preserved dead monitor logs for ${obligation.id}; no old pane was operated`)
+      }
+    }
     const monitors = await (input.reconcileMonitors ?? (storeInput => reconcileHerdrJobMonitors({
       stateDir: dir,
       runtime: input.runtime,
@@ -18339,12 +18368,12 @@ async function runCli(): Promise<void> {
   let herdrIdentityInvalid = false
   let herdrIdentityCheck: Promise<void> | null = null
   const checkHerdrIdentity = (): void => {
-    if (herdrIdentityInvalid || herdrIdentityCheck) return
+    if (herdrIdentityCheck) return
     herdrIdentityCheck = verifyHerdrRuntimeIdentityAsync(pinnedHerdrRuntime)
+      .then(() => { herdrIdentityInvalid = false })
       .catch(error => {
+        if (!herdrIdentityInvalid) log(`Herdr unavailable; keeping active work and waiting before new claims: ${error}`)
         herdrIdentityInvalid = true
-        log(`Herdr runtime identity changed; stopping before claiming more work: ${error}`)
-        controller.abort()
       })
       .finally(() => { herdrIdentityCheck = null })
   }
@@ -18373,6 +18402,7 @@ async function runCli(): Promise<void> {
     controller: AbortController
     health: Promise<void>
     failure?: HerdrJobMonitorPendingError
+    unavailable?: boolean
     executionController?: AbortController
   }
   const monitorGuards = new Map<string, MonitorGuard>()
@@ -18381,18 +18411,9 @@ async function runCli(): Promise<void> {
     // Aborting the polling signal does not cancel an already-started Herdr
     // list/process-info probe. Its failure must still be recorded; only an
     // abort while sleeping exits watchHerdrJobMonitor normally without catch.
-    if (guard.failure) return
-    let persistenceError: unknown
-    try { store.recordMonitorFailure(jobId, String(error)) } catch (recordError) {
-      persistenceError = recordError
-    }
-    guard.failure = new HerdrJobMonitorPendingError(
-      `Herdr monitor became unavailable for job ${jobId}: ${error}`
-        + (persistenceError ? `; durable fault receipt failed: ${persistenceError}` : ''),
-    )
-    monitorFatal ??= guard.failure
-    guard.executionController?.abort()
-    controller.abort()
+    // The monitor is an output view, not the Codex execution lease. Stop
+    // operating on an unverified pane, but keep the actual job and disk logs.
+    markMonitorUnavailable(guard, jobId, error, log)
   }
   const ensureMonitorGuard = (jobId: string): MonitorGuard => {
     const existing = monitorGuards.get(jobId)
@@ -18500,12 +18521,22 @@ async function runCli(): Promise<void> {
       assertJobMonitorHealthy: job => { assertMonitorGuard(job.id) },
       quiesceJobMonitor: job => quiesceMonitorGuard(job.id),
       updateJobMonitor: (job, message) => {
-        appendHerdrJobMonitorStatus(dir, job.id, message)
+        const guard = monitorGuards.get(job.id)
+        if (guard?.unavailable) return
+        try { appendHerdrJobMonitorStatus(dir, job.id, message) } catch (error) {
+          if (guard) failMonitorGuard(job.id, guard, error)
+          else log(`Herdr status unavailable; continuing with saved logs: ${error}`)
+        }
       },
       recordJobMonitorFailure: (job, error) => store.recordMonitorFailure(job.id, String(error)),
       closeJobMonitor: async job => {
+        const unavailable = monitorGuards.get(job.id)?.unavailable
         const guardFailure = await stopMonitorGuard(job.id)
         if (guardFailure) throw guardFailure
+        if (unavailable) {
+          store.retireMonitorObligation(job.id)
+          return
+        }
         await closeHerdrJobMonitor({
           stateDir: dir,
           runtime: pinnedHerdrRuntime,
@@ -18520,8 +18551,13 @@ async function runCli(): Promise<void> {
         })
       },
       retainFailedJobMonitor: async job => {
+        const unavailable = monitorGuards.get(job.id)?.unavailable
         const guardFailure = await stopMonitorGuard(job.id)
         if (guardFailure) throw guardFailure
+        if (unavailable) {
+          store.retireMonitorObligation(job.id)
+          return
+        }
         await retainFailedHerdrJobMonitor({
           stateDir: dir,
           runtime: pinnedHerdrRuntime,
@@ -18543,7 +18579,7 @@ async function runCli(): Promise<void> {
         else signal?.addEventListener('abort', forwardAbort, { once: true })
         if (guard.failure) executionController.abort()
         const mirrorMonitorMessage = (message: string): void => {
-          if (guard.failure) return
+          if (guard.failure || guard.unavailable) return
           try { appendHerdrJobMonitorStatus(dir, job.id, message) } catch (error) {
             failMonitorGuard(job.id, guard, error)
           }
