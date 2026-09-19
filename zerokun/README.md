@@ -211,6 +211,10 @@ codex <trust-args> -C <repo> \
   `zerokun_github`、設定済みでowner管理の`go-chrome-mcp`だけを追加します。
   `go-chrome-mcp`はproject設定からの差替えを拒否し、cookie取得・任意JavaScript等を無効化したうえで、
   hostのChrome bridgeへ接続します。Codex shell自体のHOME/TMPDIR隔離は維持します。
+  Chrome MCPの応答はローカルproxyを通し、URLの認証パラメータ・userinfoとJWT形式の値を
+  Codexへ渡す前に除去します。JSON本文・structuredContent・エラー・通知が対象で、
+  子の生stderrは転送しません。通常のタブIDと検索条件、操作入力は変更しません。
+  画像内の秘密や任意形式のページ本文を完全に除去する仕組みではなく、過去の保存済み履歴も変更しません。
   Web検索はwrite許可jobだけに限定し、command networkとSlack関連domainをpermission profileで制限します。
   Slack tokenは子へ渡さず、Slack投稿をdeveloper instructionsでも禁止します。
 

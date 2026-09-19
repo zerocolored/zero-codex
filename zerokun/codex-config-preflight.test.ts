@@ -586,7 +586,9 @@ describe('Codex app-server config preflight', () => {
     }
     expect(parsed.value['go-chrome-mcp']?.enabled).toBe(true)
     expect(parsed.value['go-chrome-mcp']?.command).toBe('node')
-    expect(parsed.value['go-chrome-mcp']?.args).toEqual([realpathSync(entrypoint)])
+    expect(parsed.value['go-chrome-mcp']?.args).toEqual([
+      join(import.meta.dir, 'browser-mcp-proxy.mjs'), realpathSync(entrypoint),
+    ])
     expect(parsed.value['go-chrome-mcp']?.cwd).toBeUndefined()
     expect(parsed.value['go-chrome-mcp']?.env).toBeUndefined()
     expect(parsed.value['go-chrome-mcp']?.enabled_tools).toContain('screenshot')
