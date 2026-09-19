@@ -19,6 +19,7 @@ import {
 } from 'fs'
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import { ensureTaskGoal, readTaskGoal, type GoalStatus } from './codex-goal.ts'
+import { previousThreadArtifactRoots } from './artifact-source.ts'
 import { ContinuedArtifactMessage } from './continued-artifact-message.ts'
 import { homedir, tmpdir } from 'os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
@@ -1459,7 +1460,10 @@ export const CODEX_WORKER_SAFETY_PROMPT = [
   '',
   'If you create an artifact the Slack user must receive, end the response with exactly one',
   '<zerokun_files> JSON array of absolute local paths </zerokun_files>. Do not include state,',
-  'credential, or token files. Omit this tag when there are no artifacts.',
+  'credential, or token files. Use files in the artifact directory or job scratch directory',
+  '(subdirectories are supported). Copy project outputs there before declaring attachments.',
+  'Previously generated outbox files from this same Slack thread and project may be reattached.',
+  'Omit this tag when there are no artifacts.',
 ].join('\n')
 
 export interface CodexProgressSchedule {
@@ -7265,7 +7269,7 @@ export async function executeCodexJob(
       let inputChangedBeforeDispatch = false
       let observedSessionId: string | null = sessionId
       let finalMessage = ''
-      const continuedArtifactMessage = new ContinuedArtifactMessage(artifactDirForJob(managedStateDir, job.id))
+      const continuedArtifactMessage = new ContinuedArtifactMessage(artifactDirForJob(managedStateDir, job.id), [scratchDir, ...previousThreadArtifactRoots(job, managedStateDir)])
       let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null

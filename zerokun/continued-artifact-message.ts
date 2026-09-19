@@ -1,17 +1,15 @@
 import { createHash } from 'crypto'
 import { closeSync, constants, fstatSync, openSync, readSync } from 'fs'
-import { dirname, isAbsolute, resolve } from 'path'
+import { resolveArtifactSource } from './artifact-source.ts'
 
 /** Only explicit attachment declarations are retained; prose is not an approval classifier. */
 export class ContinuedArtifactMessage {
   private pending?: { message: string; revision: number; files: Array<{ path: string; digest: string }> }
 
-  constructor(private readonly outbox: string) {}
+  constructor(private readonly outbox: string, private readonly additionalRoots: readonly string[] = []) {}
 
   private fingerprint(path: string): string {
-    if (!isAbsolute(path) || dirname(resolve(path)) !== resolve(this.outbox)) {
-      throw new Error('attachment outside current job outbox')
-    }
+    path = resolveArtifactSource(path, [this.outbox, ...this.additionalRoots])
     const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     try {
       const stat = fstatSync(fd)
@@ -44,8 +42,10 @@ export class ContinuedArtifactMessage {
       const files: unknown = JSON.parse(marker[1]!)
       if (!Array.isArray(files) || files.length === 0 || files.length > 10
         || !files.every(path => typeof path === 'string')) return
-      this.pending = { message, revision,
-        files: [...new Set(files as string[])].map(path => ({ path, digest: this.fingerprint(path) })) }
+      const retained = [...new Set(files as string[])].flatMap(path => {
+        try { return [{ path, digest: this.fingerprint(path) }] } catch { return [] }
+      })
+      if (retained.length > 0) this.pending = { message, revision, files: retained }
     } catch { /* Invalid declarations are handled by the normal final delivery path. */ }
   }
 
