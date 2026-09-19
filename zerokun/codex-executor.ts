@@ -621,7 +621,7 @@ export function mcpIsolationOverridesForConfig(
             ? [] : [`tool_timeout_sec=${toolTimeout}`]),
         ]
         additions.push(
-          `${tomlString(name)}={enabled=true,command="node",args=[${tomlString(physicalScript)}],enabled_tools=[${GO_CHROME_ENABLED_TOOLS.map(tomlString).join(',')}],disabled_tools=[${GO_CHROME_DISABLED_TOOLS.map(tomlString).join(',')}],default_tools_approval_mode="approve"${timing.length > 0 ? `,${timing.join(',')}` : ''}}`,
+          `${tomlString(name)}={enabled=true,command="node",args=[${tomlString(join(import.meta.dir, 'browser-mcp-proxy.mjs'))},${tomlString(physicalScript)}],enabled_tools=[${GO_CHROME_ENABLED_TOOLS.map(tomlString).join(',')}],disabled_tools=[${GO_CHROME_DISABLED_TOOLS.map(tomlString).join(',')}],default_tools_approval_mode="approve"${timing.length > 0 ? `,${timing.join(',')}` : ''}}`,
         )
         continue
       } catch {
