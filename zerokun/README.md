@@ -253,8 +253,11 @@ checks確認を行えます。Codex shell HOMEはread/writeともjob scratchへ�
 
 Codex から Slack tool/API を呼ばせません。最終文は runner が bot token で投稿します。成果物を
 返す場合は最終文末の `<zerokun_files>["/absolute/path"]</zerokun_files>` を runner が解釈します。
-job専用`outbox/<job-id>/`直下の空でないregular fileだけをrunner専用sealed領域へ移し、open済みFDから
-50MB上限で読みます。他path、空file、symlink、device/FIFOはuploadしません。terminal本文と成果物ごとの
+job専用outbox・scratch配下の成果物を送信用にコピーし、open済みFDから
+50MB上限で読みます。project内の成果物はoutboxへコピーして指定します。
+同じSlackスレッド・同じprojectの過去のoutboxからも再添付できます。
+1件の準備失敗で他の添付を取り消しません。保護された設定・認証ファイル、
+対象外のpath、空file、symlink、device/FIFOはuploadしません。terminal本文と成果物ごとの
 送信直前に同じbyte列を軽量走査し、平文で明白なcredential patternがあるfileだけ添付を省略します。
 PNG・PDF・ZIPなど形式自体は制限せず、archive展開、復号、OCRは行いません。
 送信済み状態をSQLiteへ別々に残すため、添付失敗時に本文は再投稿しません。upload URL取得までの確実な

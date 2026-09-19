@@ -12807,7 +12807,7 @@ describe('Slack output guard', () => {
     }, state)
     const output = extractArtifactPaths(finalized.result)
     expect(output.files).toEqual([])
-    expect(output.text).toContain('ファイル添付だけを省略しました')
+    expect(output.text).toContain('1件のファイルを添付できませんでした')
     store.close()
   })
 
@@ -14162,12 +14162,68 @@ describe('Slack output guard', () => {
     }, state)
     expect(result.sessionId).toBe('successful-write-session')
     expect(result.result).toContain('変更は完了しました。')
-    expect(result.result).toContain('ファイル添付だけを省略しました')
+    expect(result.result).toContain('1件のファイルを添付できませんでした')
     expect(result.result).not.toContain(internalId)
     expect(result.result).not.toContain(outside)
     expect(result.result).not.toMatch(/Codex|worker|job/i)
     expect(extractArtifactPaths(result.result).files).toEqual([])
     store.close()
+  })
+
+  test('scratch・outboxの子directoryから添付し、欠落した1件だけを省略する', () => {
+    const state = fixtureDir()
+    const repo = join(fixtureDir(), 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const job = store.enqueue(input({ repoPath: repo })).job
+    const outbox = artifactDirForJob(state, job.id)
+    const scratch = join(state, 'tmp', job.id, 'proposal')
+    mkdirSync(join(outbox, 'images'), { recursive: true })
+    mkdirSync(scratch, { recursive: true })
+    const paths = [join(outbox, 'images', 'before.png'), join(scratch, 'after.png'), join(outbox, 'report.txt')]
+    const projectFile = join(repo, 'private-project-report.txt')
+    writeFileSync(projectFile, 'must not be read by attachment host')
+    paths.forEach((path, index) => writeFileSync(path, `artifact-${index}`))
+    try {
+      const result = finalizeSuccessfulExecution(job, {
+        sessionId: 'artifact-recovery',
+        result: `比較案です\n<zerokun_files>${JSON.stringify([paths[0], join(outbox, 'missing.png'), projectFile, ...paths.slice(1)])}</zerokun_files>`,
+      }, state)
+      const files = extractArtifactPaths(result.result).files
+      expect(files).toHaveLength(3)
+      expect(files.map(file => readUploadableArtifact(job, file, state).data.toString()))
+        .toEqual(['artifact-0', 'artifact-1', 'artifact-2'])
+      expect(result.result).toContain('2件のファイルを添付できませんでした')
+      expect(result.result).not.toContain('封印')
+    } finally { store.close() }
+  })
+
+  test('同じthread・projectの前jobの画像を再添付し、別threadの画像は混ぜない', () => {
+    const state = fixtureDir()
+    const repo = join(fixtureDir(), 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const previous = store.enqueue(input({ repoPath: repo, messageId: 'previous-image' })).job
+    const foreign = store.enqueue(input({ repoPath: repo, threadTs: 'other-thread', messageId: 'foreign-image' })).job
+    const otherProject = store.enqueue(input({ repoPath: join(repo, 'other-project'), messageId: 'other-project-image' })).job
+    const current = store.enqueue(input({ repoPath: repo, messageId: 'reattach-image' })).job
+    const sources = [previous, foreign, otherProject].map(job => {
+      const root = artifactDirForJob(state, job.id)
+      mkdirSync(root, { recursive: true })
+      const image = join(root, 'after.png')
+      writeFileSync(image, 'synthetic proposal')
+      return image
+    })
+    mkdirSync(artifactDirForJob(state, current.id), { recursive: true })
+    try {
+      const result = finalizeSuccessfulExecution(current, {
+        sessionId: 'reattach-image', result: `再添付します\n<zerokun_files>${JSON.stringify(sources)}</zerokun_files>`,
+      }, state)
+      const files = extractArtifactPaths(result.result).files
+      expect(files).toHaveLength(1)
+      expect(readUploadableArtifact(current, files[0]!, state).data.toString()).toBe('synthetic proposal')
+      expect(result.result).toContain('2件のファイルを添付できませんでした')
+    } finally { store.close() }
   })
 
   test('成果物添付打ち切り文面はraw error・内部ID・実装名をSlackへ出さない', () => {

@@ -1,6 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
+import { resolveArtifactSource, previousThreadArtifactRoots } from './artifact-source.ts'
 import { advisorFailureMessage, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
@@ -26,6 +27,7 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from 'path'
 import { WebClient } from '@slack/web-api'
 import {
   artifactDirForJob,
+  scratchDirForJob,
   browserCaptureDirForJob,
   CodexCleanupPendingError,
   CodexInterruptedError,
@@ -15733,8 +15735,8 @@ export function sanitizeExecutionTextForSlack(
 }
 
 /**
- * Codex が書ける outbox から、runner だけが読める state 内へ内容をcopyする。
- * sourceはjob outboxの直下だけに限定し、O_NOFOLLOWで開いたfdから読むため、
+ * Codex が書ける job専用outbox・scratchから、送信用stateへ内容をcopyする。
+ * sourceはjob outbox・scratchの通常成果物に限定し、O_NOFOLLOWで開いたfdから読むため、
  * 攻撃者が差し替えられるsymlinkをtraversalしない。destinationはjob/sourceごとに
  * 決定的なので、seal後・DB complete前にrunnerが落ちても同じ結果へ収束する。
  */
@@ -15755,13 +15757,10 @@ export function sealArtifactResult(job: JobRecord, result: string, dir = stateDi
     throw new Error(`sealed artifact root is not a directory: ${sealedRoot}`)
   }
 
+  const sourceRoots = [outbox, scratchDirForJob(dir, job.id), ...previousThreadArtifactRoots(job, dir)]
   const sealed: string[] = []
   for (const requested of [...new Set(output.files)]) {
-    if (!isAbsolute(requested)) throw new Error(`artifact path is not absolute: ${requested}`)
-    const source = resolve(requested)
-    if (dirname(source) !== outbox) {
-      throw new Error(`artifact must be directly inside this job's outbox: ${requested}`)
-    }
+    const source = resolveArtifactSource(requested, sourceRoots)
     const sourceKey = createHash('sha256').update(source).digest('hex').slice(0, 32)
     let descriptor: number
     try {
@@ -16034,60 +16033,34 @@ export function finalizeSuccessfulExecution(
   const {
     capturedArtifacts = [], advisorCoverage, ...persistedExecution
   } = execution
-  // Coverage describes advisor availability. Keep the primary's task outcome;
-  // a missing external answer must not turn completed work into a blocked job.
-  try {
-    const declared = extractArtifactPaths(execution.result)
-    // Browser evidence is bounded by the host at capture time and cannot be
-    // displaced by ten model-declared files. It is decoded only after Codex
-    // exits, then copied into the ordinary outbox immediately before sealing.
-    const capturedPaths = stageHostCapturedArtifacts(job, capturedArtifacts, dir)
-    const artifactPaths = [...new Set([...capturedPaths, ...declared.files])].slice(0, 10)
-    const artifactMarker = artifactPaths.length > 0
-      ? `<zerokun_files>${JSON.stringify(artifactPaths)}</zerokun_files>`
-      : ''
-    const sealed = sealArtifactResult(
-      job,
-      artifactMarker ? `${declared.text}\n${artifactMarker}`.trim() : declared.text,
-      dir,
-    )
-    const output = extractArtifactPaths(sealed)
-    const sanitized = enforceHostAdvisorCoverage(
-      sanitizeExecutionTextForSlack(job, execution.sessionId, output.text, dir),
-      advisorCoverage,
-      'result',
-    )
-    const marker = output.files.length > 0
-      ? `<zerokun_files>${JSON.stringify(output.files)}</zerokun_files>`
-      : ''
-    return {
-      ...persistedExecution,
-      result: normalizePersistedExecutionResult(
-        job,
-        execution.sessionId,
-        marker ? `${sanitized}\n${marker}`.trim() : sanitized,
-        dir,
-      ),
-    }
-  } catch (error) {
-    // Codex already exited successfully. A malformed/unsealable artifact
-    // declaration is a delivery failure, not evidence that a write job itself
-    // failed; marking it failed would invite duplicate external side effects.
-    const text = enforceHostAdvisorCoverage(sanitizeExecutionTextForSlack(
-      job, execution.sessionId, extractArtifactPaths(execution.result).text, dir,
-    ), advisorCoverage, 'result')
-    const message = error instanceof Error ? error.message : String(error)
-    log(`artifact sealing failed for completed job ${job.id}: ${message}`)
-    return {
-      ...persistedExecution,
-      result: normalizePersistedExecutionResult(
-        job,
-        execution.sessionId,
-        `${text}\n\n⚠️ 成果物ファイルを安全に封印できなかったため、ファイル添付だけを省略しました。`
-          + '\n詳細はこのMacの管理ログを確認してください。',
-        dir,
-      ),
-    }
+  const declared = extractArtifactPaths(execution.result)
+  const capturedPaths: string[] = []
+  let failed = 0
+  const recordFailure = (error: unknown) => {
+    failed += 1
+    log(`artifact preparation failed for completed job ${job.id}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  for (const artifact of capturedArtifacts) {
+    try { capturedPaths.push(...stageHostCapturedArtifacts(job, [artifact], dir)) }
+    catch (error) { recordFailure(error) }
+  }
+  const files: string[] = []
+  for (const path of [...new Set([...capturedPaths, ...declared.files])].slice(0, 10)) {
+    try {
+      const prepared = sealArtifactResult(job, `<zerokun_files>${JSON.stringify([path])}</zerokun_files>`, dir)
+      files.push(...extractArtifactPaths(prepared).files)
+    } catch (error) { recordFailure(error) }
+  }
+  const text = enforceHostAdvisorCoverage(
+    sanitizeExecutionTextForSlack(job, execution.sessionId, declared.text, dir), advisorCoverage, 'result',
+  )
+  const notice = failed > 0
+    ? `\n\n⚠️ ${failed}件のファイルを添付できませんでした。ファイルが存在し、読み取れるか確認してください。`
+    : ''
+  const marker = files.length > 0 ? `\n<zerokun_files>${JSON.stringify(files)}</zerokun_files>` : ''
+  return {
+    ...persistedExecution,
+    result: normalizePersistedExecutionResult(job, execution.sessionId, `${text}${notice}${marker}`.trim(), dir),
   }
 }
 
