@@ -230,6 +230,11 @@ zerochan-access write allow <Slack user ID>
 zerochan update
 ```
 
+起動中の自動更新は既定で有効です。30分ごとに確認し、全アプリの実行中作業が終わってから
+更新・再起動します。`zerochan auto-update status` で確認、`zerochan auto-update off` で
+このMac全体の自動更新を無効化できます。再び有効にする場合は `zerochan auto-update on`。
+設定変更は再起動不要です。完了・失敗だけを登録済みユーザーへDM（未登録なら設定済みチャンネル）で通知します。
+
 `origin/main`の候補版を検証し、fast-forward、setup、gateway／runnerの再起動まで自動で行います。
 正常終了後に`zerochan stop`／`zerochan start`を追加実行する必要はありません。逆に、stop／startだけでは
 checkoutの版は変わらないため、更新の代わりにはなりません。

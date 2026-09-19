@@ -18,6 +18,7 @@ zerochan_help() {
         '  zerochan stop --force     実行中の作業も中断して停止' \
         '  zerochan --restart        再起動' \
         '  zerochan update           更新・検証・再起動' \
+        '  zerochan auto-update on|off|status  自動更新の設定・確認' \
         '  zerochan unset slack-channel  チャンネル紐付けを解除' \
         '  zerochan cloud login|activate|status  クラウド引き継ぎ設定' \
         '' \
@@ -42,6 +43,13 @@ zerochan_help() {
         '対象プロジェクトのSlackチャンネル紐付けを確認します。' \
         '紐付け: zerochan set slack-channel C0123456789' \
         '解除: zerochan unset slack-channel'
+      ;;
+    auto-update)
+      printf '%s\n' '使い方: zerochan auto-update on|off|status' \
+        '既定は有効。起動中に30分ごとに確認し、全アプリの作業完了後に更新・再起動します。' \
+        'このMacの全Slackアプリに共通の設定です。変更は再起動不要です。' \
+        'offは新しい自動更新を止めます。既に開始した更新は中断しません。' \
+        '結果だけを登録済みユーザー（いなければ設定済みチャンネル）へ通知します。'
       ;;
     update)
       printf '%s\n' '使い方: zerochan update [--recover-only]' \
