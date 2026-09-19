@@ -39,6 +39,8 @@ import {
   mentionsBot,
 } from './gate.ts'
 import { requestUpdate, resumePendingUpdateWorker } from './zerokun/update-request.ts'
+import { checkAutomaticUpdate, remoteUpdateHead } from './zerokun/auto-update.ts'
+import { slackAppRegistryRoot, listRegisteredSlackApps } from './zerokun/slack-app-registry.ts'
 import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
 import {
   JobStore,
@@ -54,7 +56,7 @@ import {
   type SlackThreadReplyIntentRecord,
 } from './zerokun/job-runner.ts'
 import { requireLegacyThreadRepoRoute } from './zerokun/routing.ts'
-import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './zerokun/state-dir.ts'
+import { legacyCutoverForState, resolveZeroJobDatabasePath, resolveZeroStateDir } from './zerokun/state-dir.ts'
 import {
   slackHttpTimeoutMs,
   slackWebClientOptions,
@@ -2795,6 +2797,37 @@ try {
   void drainSlackThreadReplyIntents()
   void scheduleCatchupSweep()
   recoverUpdateNotificationWorker()
+  // A detached update worker survives gateway replacement. Never enqueue this
+  // as a Codex job: the updater would wait for its own job to finish.
+  const checkForUpdates = async () => {
+    try {
+      const access = loadAccess()
+      const destination = access.allowFrom[0] ?? Object.keys(access.channels).sort()[0]
+      if (!destination) return // Wait until an actual notification recipient is configured.
+      await checkAutomaticUpdate({
+        root: slackAppRegistryRoot(), stateDir: STATE_DIR,
+        detect: () => remoteUpdateHead(import.meta.dir),
+        recoverPending: stateDir => {
+          if (stateDir !== STATE_DIR && !listRegisteredSlackApps().some(app => app.stateDir === stateDir)) return
+          resumePendingUpdateWorker({
+            stateDir, workerFile: join(stateDir, 'update-request.ts'), updaterPath: UPDATE_ENTRYPOINT,
+            legacyCutover: legacyCutoverForState(stateDir) === '1',
+          })
+        },
+        enqueue: sha => requestUpdate({
+          source: 'automatic', chatId: destination, threadTs: '', userId: '',
+          messageId: `auto:${sha}`,
+        }, {
+          stateDir: STATE_DIR, workerFile: UPDATE_REQUEST_FILE,
+          updaterPath: UPDATE_ENTRYPOINT, projectDir: process.cwd(),
+        }),
+      })
+    } catch {
+      process.stderr.write('自動更新の確認を完了できませんでした。通常作業を継続し、次回に再試行します。\n')
+    }
+  }
+  // Allow startup recovery and the other Slack apps to settle first.
+  setInterval(() => { void checkForUpdates() }, 60_000).unref()
   // then keep a light timer for near-real-time follow-ups in owned threads.
   void pollThreads()
   setInterval(() => { void pollThreads() }, THREAD_POLL_INTERVAL_MS).unref()

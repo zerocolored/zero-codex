@@ -64,6 +64,7 @@ function botSessionName(stateDir: string): string {
 }
 
 export interface UpdateRequestInput {
+  source?: 'automatic'
   chatId: string
   threadTs: string
   messageId: string
@@ -170,6 +171,13 @@ function requireText(value: string, field: string): string {
 }
 
 function validateInput(input: UpdateRequestInput): UpdateRequestInput {
+  if (input.source === 'automatic') return {
+    source: 'automatic',
+    chatId: requireText(input.chatId, 'chatId'),
+    threadTs: '',
+    messageId: requireText(input.messageId, 'messageId'),
+    userId: '',
+  }
   return {
     chatId: requireText(input.chatId, 'chatId'),
     threadTs: requireText(input.threadTs, 'threadTs'),
@@ -206,10 +214,7 @@ function readRequest(dir: string): UpdateRequest | undefined {
     if (gate && !validGate) throw new Error('gate identity is invalid')
     return {
       id: requireText(parsed.id, 'id'),
-      chatId: requireText(parsed.chatId, 'chatId'),
-      threadTs: requireText(parsed.threadTs, 'threadTs'),
-      messageId: requireText(parsed.messageId, 'messageId'),
-      userId: requireText(parsed.userId, 'userId'),
+      ...validateInput(parsed),
       requestedAt,
       ...(typeof parsed.projectDir === 'string' && isAbsolute(parsed.projectDir)
         ? { projectDir: requireText(parsed.projectDir, 'projectDir') }
@@ -435,6 +440,12 @@ export async function requestUpdate(
       }
     }
     running ||= isUpdateRunning()
+    // Background maintenance must not discard a user's pending result delivery.
+    if (input.source === 'automatic' && existing.outcome && !existing.outcome.notifiedAt
+      && notificationRetryWindowOpen(existing, now(), options.staleAfterMs ?? DEFAULT_STALE_MS)) {
+      if (!running) launch(existing)
+      return { accepted: false, duplicate: true, request: existing }
+    }
     if (existing.outcome && existing.chatId === input.chatId && existing.messageId === input.messageId) {
       // 同じSlack eventは更新を再実行しない。期限内なら保存済み結果の通知だけを再開する。
       if (!running && notificationRetryWindowOpen(existing, now(), options.staleAfterMs ?? DEFAULT_STALE_MS)) {
@@ -625,7 +636,7 @@ async function notifySlack(dir: string, request: UpdateRequest, text: string): P
             },
             body: JSON.stringify({
               channel: request.chatId,
-              thread_ts: request.threadTs,
+              ...(request.source === 'automatic' ? {} : { thread_ts: request.threadTs }),
               text,
               client_msg_id: updateNotificationClientId(request.id),
             }),
@@ -979,7 +990,11 @@ export async function runUpdateWorker(
     } catch (error) {
       errorText = error instanceof Error ? error.message : String(error)
     }
-    const text = success
+    const text = request.source === 'automatic'
+      ? success
+        ? '✅ 自動更新が完了しました。起動中だったアプリを再起動し、待機中の依頼を再開します。'
+        : `⚠️ 自動更新に失敗しました（更新処理の終了コード: ${exitCode}）。旧版への復旧状況は未確認です。管理ログを確認し、復旧が必要な場合は zerochan update --recover-only を実行してください。`
+      : success
       ? '✅ 更新完了\n更新・テスト・setup・再起動が完了しました。'
       : '❌ 更新失敗\n詳細はこのMacの管理ログを確認してください。'
     outcome = { success, exitCode, text, completedAt: Date.now() }

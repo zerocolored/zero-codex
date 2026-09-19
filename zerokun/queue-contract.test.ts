@@ -291,7 +291,11 @@ describe('Zero-kun Codex wiring', () => {
     expect(server).toContain('isExplicitUpdateRequest(text)')
     expect(server).toContain('await enqueueUpdate(')
     expect(server).toContain("const UPDATE_ENTRYPOINT = join(import.meta.dir, 'zerokun', 'update.ts')")
-    expect(server.match(/updaterPath: UPDATE_ENTRYPOINT/g)?.length).toBe(2)
+    // Manual enqueue/recovery plus automatic enqueue/cross-app recovery all
+    // share the detached updater instead of entering the normal Codex FIFO.
+    expect(server.match(/updaterPath: UPDATE_ENTRYPOINT/g)?.length).toBe(4)
+    expect(server).toContain('await checkAutomaticUpdate({')
+    expect(server).toContain('recoverPending: stateDir =>')
     expect(updateRequest).not.toContain("join(homedir(), '.local', 'bin', 'zerokun-update')")
     const updateBranch = server.indexOf('isExplicitUpdateRequest(text)')
     const normalInboundFifo = server.indexOf('const inbound: InboundDeliveryInput = {', updateBranch)

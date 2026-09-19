@@ -37,6 +37,10 @@ unset ZEROKUN_UPDATE_TESTING ZEROKUN_SLACK_IDENTITY_TEST_APP_ID \
 command -v bun >/dev/null 2>&1 || { echo "❌ bun が見つかりません。" >&2; exit 1; }
 REPLACE_TOKEN_VALUE="${ZEROKUN_REPLACE_TOKEN:-}"
 unset ZEROKUN_REPLACE_TOKEN
+if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "auto-update" ]; then
+  [ "$#" -eq 2 ] || { echo '使い方: zerochan auto-update on|off|status' >&2; exit 2; }
+  exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/auto-update.ts" "$2"
+fi
 if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "set" ] && [ "${2:-}" = "slack-app" ]; then
   [ "$#" -eq 2 ] || { echo '使い方: zerochan set slack-app（トークンは対話入力）' >&2; exit 2; }
   exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-command.ts" "$(pwd -P)"
