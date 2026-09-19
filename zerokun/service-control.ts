@@ -1477,10 +1477,9 @@ export async function startManagedService(
       fail('serviceが部分起動状態です。zerochan stop --force の後に zerochan start を実行してください')
     }
 
-    const tabCleanup = await cleanupRecordedTab(stateDir, controlRuntime, projectDir, close)
-    if (tabCleanup === 'retained') {
-      fail('既存runtime tabを安全に回収できないため、新しいtabは作成していません')
-    }
+    // All managed service processes are absent above. A restored/foreign old
+    // tab is not a running service: preserve it and create a fresh owned tab.
+    await cleanupRecordedTab(stateDir, controlRuntime, projectDir, close)
     launchAttempted = true
     const started = await startBot({
       rootRepo,
