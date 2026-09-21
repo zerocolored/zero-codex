@@ -293,10 +293,11 @@ ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/
 command -v git >/dev/null 2>&1 || { echo "❌ git がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 command -v tmux >/dev/null 2>&1 || { echo "❌ tmux がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 zerokun_require_herdr_version || exit 1
-zerokun_resolve_claude_binary >/dev/null \
-  || { echo "❌ Claude Codeがありません。先に公式Claude Codeを導入してください。" >&2; exit 1; }
-zerokun_claude_subscription_ready \
-  || { echo "❌ Claude Codeはsubscription login済みである必要があります。Herdrで先にloginしてください。Zeroちゃんは認証操作を行いません。" >&2; exit 1; }
+# External advisor availability belongs to each review attempt, not the core
+# service installation transaction. In particular, a transient auth-status
+# failure here used to abort both update AND rollback after gateways stopped.
+# First-install subscription checks remain in bootstrap-macos.sh. Do not probe
+# advisor authentication during unattended setup/recovery (or initiate login).
 BUN_BIN="$(command -v bun)"
 INSTALL_ENV_ROOT="$(/usr/bin/mktemp -d /tmp/zerokun-bun-install.XXXXXX)" \
   || { echo "❌ dependency install用一時directoryを作成できません" >&2; exit 1; }
