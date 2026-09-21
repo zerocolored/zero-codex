@@ -15,7 +15,7 @@ import {
 } from 'fs'
 import { join, extname } from 'path'
 import {
-  decideChannelPolicy, isBotDMBlocked, threadPollCursor, planThreadPoll,
+  decideChannelPolicy, resolveInboundWriteEnabled, isBotDMBlocked, threadPollCursor, planThreadPoll,
   planDirectMessageThreadPoll,
   canUseActiveThreadAuthority, resolveIsMention,
   pruneDeliveredKeys, planCatchupSweep, msToSlackTs,
@@ -1080,7 +1080,7 @@ async function hydrateInitialThreadContext(
     fileIds: string[]
   }) => ({
     ...event,
-    writeEnabled: access.writeAllowFrom.includes(event.userId),
+    writeEnabled: resolveInboundWriteEnabled(inbound.chatId, event.userId, access.writeAllowFrom),
     isInterrupt: isSlackInterruptCommand(event.text),
   })
   const canonical = plan.kind === 'context' ? plan.context.trigger : plan.root
@@ -1396,7 +1396,7 @@ function deliver(
   if (cloudRuntime && jobStore.hasEarlierPendingCloudControl(chatId, resolvedThreadTs, messageTs)) return Promise.resolve(false)
   const handOver = (async () => {
     const access = loadAccess()
-    const writeEnabled = access.writeAllowFrom.includes(userId)
+    const writeEnabled = resolveInboundWriteEnabled(chatId, userId, access.writeAllowFrom)
     const cloudAction = cloudRuntime ? handoffControl(text) : null
     if (cloudRuntime && cloudAction && botUserId && threadTs && !chatId.startsWith('D')) {
       const waiting = await cloudRuntime.client.find(chatId, threadTs)

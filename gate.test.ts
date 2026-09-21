@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   decideChannelPolicy,
+  resolveInboundWriteEnabled,
   canUseActiveThreadAuthority,
   isBotDMBlocked,
   selectNewReplies,
@@ -37,6 +38,32 @@ import {
   type ChannelPolicy,
   type SlackReply,
 } from './gate.ts'
+
+describe('channel member write access', () => {
+  test('admitted channel humans can write without individual registration', () => {
+    for (const channel of ['C123', 'G123']) {
+      for (const user of ['U123', 'W123']) {
+        expect(resolveInboundWriteEnabled(channel, user, [])).toBe(true)
+        expect(resolveInboundWriteEnabled(channel, user, ['UOTHER'])).toBe(true)
+      }
+    }
+  })
+  test('DM write still requires its explicit grant', () => {
+    expect(resolveInboundWriteEnabled('D123', 'U123', [])).toBe(false)
+    expect(resolveInboundWriteEnabled('D123', 'U123', ['UOTHER'])).toBe(false)
+    expect(resolveInboundWriteEnabled('D123', 'U123', ['U123'])).toBe(true)
+    expect(resolveInboundWriteEnabled('D123', 'W123', ['W123'])).toBe(true)
+  })
+  test('unknown conversations and non-human IDs cannot acquire write', () => {
+    for (const chat of ['', 'X123', 'C', 'D', 'C123/other']) {
+      expect(resolveInboundWriteEnabled(chat, 'U123', ['U123'])).toBe(false)
+    }
+    for (const user of ['', 'B123', 'U', 'U123/other']) {
+      expect(resolveInboundWriteEnabled('C123', user, [user])).toBe(false)
+      expect(resolveInboundWriteEnabled('D123', user, [user])).toBe(false)
+    }
+  })
+})
 
 describe('durable round-robin scheduling', () => {
   test('channel budgetを超える30件も次周期で11件目から再開する', () => {

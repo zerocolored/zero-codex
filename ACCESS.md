@@ -1,7 +1,7 @@
 # Access Control Reference
 
-Zeroちゃんは「メッセージを受け取れる人」と「repository を変更できる人」を分離します。
-DM pairingやchannel参加だけでは書込み権限は付きません。
+設定済みチャンネルでは、人間の参加者全員が個別登録なしで利用・repository変更を依頼できます。
+DMだけは受信許可と書込み許可を分離し、pairingだけでは書込み権限は付きません。
 
 設定ファイルは既定で `~/.codex/zerokun/access.json` にあります。旧版の
 `~/.claude/channels/slack` は自動選択しません。旧PCのgatewayを停止する移行では既存Slack Appのtokenだけを
@@ -63,23 +63,24 @@ zerochan-access deny U0123456789
 旧版のchannel allowlistにいた人は、移行時にDMの`allowFrom`へ一度だけ引き継ぎます。
 以後のchannel参加者はDM許可へ自動追加されず、DMはpairingまたはこのコマンドで管理します。
 
-## Repository write
+## Repository write（チャンネルは参加者全員、DMだけ個別設定）
 
 ```bash
 zerochan-access write allow U0123456789
 zerochan-access write deny U0123456789
 ```
 
-- `writeAllowFrom` にいない sender: minimal runtimeから組み立てたnamed profileでrepository readと
+- チャンネルの人間の参加者: 個別登録なしでrepositoryと`.git`のwrite、依頼に必要なnetworkを許可します。
+- DMで`writeAllowFrom` にいない sender: minimal runtimeから組み立てたnamed profileでrepository readと
   job専用outbox writeだけを許可します。調査と回答だけです。
-- `writeAllowFrom` にいる sender: minimal runtimeから組み立てたnamed profileでrepositoryと`.git`の
+- DMで`writeAllowFrom` にいる sender: minimal runtimeから組み立てたnamed profileでrepositoryと`.git`の
   write、request に必要な network accessを許可します。
 - job の権限は enqueue 時点で固定します。queue 待ちの途中で設定を変えても、既存 job の権限は
-  変わりません。
+  変わりません。導入前のread-only jobも自動昇格せず、完了または中止後の新しい依頼から適用します。
 - 実行中の同じSlack threadへの返信はsenderが変わっても会話割り込みです。active jobの権限は途中で
   変更せず、そのthreadへの参加をactive jobの操作委任とみなします。現在turnを安全な境界で一時停止し、
   fresh read-only turnで先に回答した後、更新依頼だけをSlack配送確認後にactive write jobへ反映します。
-  別threadは独立FIFOで、新jobの権限をsenderから判定します。
+  別threadは独立FIFOで、新jobはチャンネルならwrite可、DMならsenderの許可から判定します。
   完全一致の`中止`も同じthread-scoped操作として受け付けます。
 - commit、push、deploy、PR は write 許可だけでは自動実行されず、Slack request が求めた範囲に
   限られます。
