@@ -12027,6 +12027,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
           command: '/usr/bin/true',
           args: ['/runtime/github-credential-broker.ts', '/state/context.json'],
         },
+        cloudLoggingMcp: {
+          command: '/usr/bin/true',
+          args: ['/runtime/cloud-logging-broker.ts', '/state/context.json'],
+        },
         localVerificationEnabled: true,
       }).join('\n')
       expect(overrides).toContain('":minimal"="read"')
@@ -12067,6 +12071,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
+      expect(overrides).toContain(',zerokun_cloud_logging=')
+      expect(overrides).toContain('enabled_tools=["cloud_logging_read"]')
       expect(overrides).toContain('enabled_tools=["advisor_round","advisor_round_poll"]')
       expect(overrides).toContain('enabled_tools=["verify_local_page"]')
       expect(overrides).toContain('enabled_tools=["github_inspect","github_fetch_branch","github_publish_branch","github_pull_request","github_wait_delivery"]')
@@ -12085,6 +12091,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         multiAgentEnabled: true,
       }).join('\n')
       expect(preEditOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="read"`)
+      expect(preEditOverrides).not.toContain('zerokun_cloud_logging=')
       expect(preEditOverrides).toContain(`${JSON.stringify(realpathSync(join(repo, '.git')))}="read"`)
       expect(preEditOverrides).toContain('network.enabled=false')
       expect(preEditOverrides).toContain('network.allow_local_binding=false')

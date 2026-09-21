@@ -1177,17 +1177,19 @@ async function readBoundedStream(
   }
 }
 
-async function runBoundedCommand(
+export async function runBoundedHostCommand(
   argv: readonly string[],
   environment: Record<string, string>,
   stdin: string | undefined,
   signal?: AbortSignal,
   timeoutMs: number | null = COMMAND_TIMEOUT_MS,
+  cwd?: string,
 ): Promise<PublicationCommandResult> {
   if (signal?.aborted) {
     throw new GitHubPublicationError('network', 'GitHub publication was interrupted')
   }
   const proc = Bun.spawn([...argv], {
+    ...(cwd ? { cwd } : {}),
     env: environment,
     stdin: stdin === undefined ? 'ignore' : 'pipe',
     stdout: 'pipe', stderr: 'pipe',
@@ -1284,6 +1286,8 @@ async function runBoundedCommand(
     signal?.removeEventListener('abort', abort)
   }
 }
+
+const runBoundedCommand = runBoundedHostCommand
 
 function shellSingleQuote(value: string): string {
   if (/[\0\r\n]/.test(value)) {
