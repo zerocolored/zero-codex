@@ -22,6 +22,16 @@ zerochan_help() {
         '  zerochan unset slack-channel  チャンネル紐付けを解除' \
         '  zerochan cloud login|activate|status  クラウド引き継ぎ設定' \
         '' \
+        '利用者設定（Slackアプリを紐付けたプロジェクトのフォルダで実行）:' \
+        '  zerochan-access status                    許可設定を確認' \
+        '  zerochan-access pair <code>               DMのペアリングを承認' \
+        '  zerochan-access allow <user-id>           DMの許可リストへ追加' \
+        '  zerochan-access deny <user-id>            DMの許可リストから削除' \
+        '  zerochan-access write allow <user-id>     書き込みを許可' \
+        '  zerochan-access write deny <user-id>      書き込み許可を解除' \
+        'DMの利用許可と書き込み許可は別です。チャンネルの利用者制限には使えません。' \
+        '設定は紐付いたSlackアプリ単位で、同じアプリを使う他のプロジェクトにも適用されます。' \
+        '' \
         '詳細: zerochan <command> --help' \
         'Slackアプリの登録は任意のフォルダで可能です。トークンを引数へ渡さないでください。'
       ;;
