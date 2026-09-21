@@ -14,8 +14,11 @@ READMEの断片的な旧手順だけで完了判定しない。
   このBun不要のlauncherがユーザーから直接操作できる可視Terminalを開き、
   bootstrapの終了receiptまで待つ。対象projectが依頼や環境から一意に分かる場合だけ
   `--project-dir`も付ける。
-- macOSのinstall dialog、Codex／Grok／Claude Code／GitHubのlogin、Slack workspaceの承認、
-  MFA・CAPTCHA・管理者承認は人の操作を待つ。完了後は同じbootstrapを再実行し、自動的に続きから進める。
+- Slack Appの作成・manifest設定・通常のworkspace install・channel招待はAIがブラウザで代行する。
+  手順をユーザーへ渡して作成を任せない。作成済みAppを確認し、中断後も重複作成せず続行する。
+- macOSのinstall dialog、Codex／Grok／Claude Code／GitHub／Slackの本人login、
+  MFA・CAPTCHA・管理者本人による承認は必要な本人操作だけを依頼する。完了後はAIが続きから進める。
+  ブラウザ操作経路が利用不能なら接続・許可の復旧だけを依頼し、App作成全体を人へ差し戻さない。
 - Claude Code CLI自体はbootstrapがAnthropic公式native installerで導入する。未loginなら、導入済み
   `claude`を可視TerminalまたはHerdrでユーザー本人が起動してsubscription loginするのだけを待つ。
 - `xapp-`／`xoxb-` tokenをchat、Codexのtool入力、command argv、環境変数、通常logへ貼らせない。
