@@ -34,6 +34,7 @@ import {
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { verifyEncodedOfficialCodexSnapshot } from './standalone-codex.ts'
 import { subprocessExitCode } from './process-exit-code.ts'
+import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import {
   readSeatbeltFingerprint,
   reapSeatbeltFingerprint,
@@ -280,6 +281,7 @@ async function main(): Promise<void> {
       // kept open until their real EOF; explicit cancellation instead enters
       // the parent-owned bounded process cleanup path.
       onExit: (_subprocess, exitCode, signalCode, error) => {
+        if (hasTestOverride && process.env.ZEROKUN_SUPERVISOR_TEST_DROP_EXIT_CALLBACK === '1') return
         if (error) {
           rejectDirectExit(error)
           return
@@ -378,7 +380,17 @@ async function main(): Promise<void> {
     process.on('SIGINT', forwardSignal)
     process.on('SIGTERM', forwardSignal)
     process.on('SIGUSR2', finishCompletedTurn)
-    const exitCode = await directExit
+    const exitCode = await waitForDirectExit({
+      callback: directExit,
+      state: () => ({
+        exitCode: child.exitCode,
+        signalCode: child.signalCode,
+        generation: observeProcessGeneration(childIdentity).status,
+      }),
+      warn: reason => {
+        process.stderr.write(`Codex direct-exit reconciliation: ${reason}; continuing descendant cleanup.\n`)
+      },
+    })
     if (forceKillTimer) clearTimeout(forceKillTimer)
     tracking = false
     await tracker

@@ -1361,6 +1361,7 @@ codex --version
         'target_state="$2"',
         'set --',
         'source "$bootstrap_path"',
+        'REPO_DIR="$(cd "$(dirname "$bootstrap_path")/.." && pwd -P)"',
         'STATE_DIR="$target_state"',
         'configure_access',
       ].join('; ')
