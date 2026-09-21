@@ -20,7 +20,9 @@ Codexには次のように依頼します。
 
 ## 「一言でセットアップ」の範囲
 
-Codexが技術的な選択、commandの順序、再実行、検証を引き受けます。完全無人という意味ではありません。
+CodexなどのAIエージェントが技術的な選択、commandの順序、再実行、検証に加え、ブラウザでの
+Slack App作成・設定・インストールも代行します。ユーザーへ作成手順を渡して任せる運用にはしません。
+完全無人という意味ではなく、本人にしかできない操作だけを必要な時点で依頼し、終わったらAIが続行します。
 セットアップ後の各Slack依頼も、Zeroちゃんが準備・実装・review・公開へ分割せず、1つのprimary Codex
 workflowとして実行します。Codexは対象projectの`AGENTS.md`に従い、依頼に含まれるGitHub操作や
 deploy確認まで自分で進めます。ZeroちゃんはFIFO、同一thread継続、process回収、認証情報を隠した
@@ -30,13 +32,13 @@ Primary Codexのmodelは`gpt-6-astra`、reasoning effortは`low`としてrelease
 利用者のCodex設定、shell環境、state内`.env`を揃える必要はなく、どのMacでも同じ値で起動します。
 Grok、Claude、review用Codexの選択には`AGENTS.md`のadvisor契約が別途適用されます。
 
-次の外部認証だけは、画面を見ているユーザー本人の操作が必要です。
+次の本人操作や情報指定だけは、必要な場合にユーザーへ依頼します。Slack App作成そのものは含みません。
 
 1. macOSのCommand Line Toolsなどのinstall dialog
 2. Codex、Grok CLI、Claude Code、GitHub CLIの初回login
-3. Slack workspaceの選択、App作成・installの承認、MFA／CAPTCHA／管理者承認
+3. Slackの未ログイン解消、MFA／CAPTCHA／管理者本人による承認。通常のApp作成・install操作はAIが代行する
 4. Codexが開く可視Terminalで、`xapp-`と`xoxb-`を内容が表示されないpromptへ直接貼る操作
-5. 対象projectやSlack channelが依頼から分からない場合の、その場所またはIDの指定
+5. 対象project、Slack workspace／channelが依頼から一意に分からない場合の、その指定
 
 Codexへtokenをchatで送らないでください。tokenはbootstrapの端末入力から
 `~/.codex/zerokun/.env`へmode 0600で保存され、2つが同じSlack Appのものか検証されます。
@@ -71,8 +73,8 @@ bash zerokun/interactive-bootstrap.sh \
 ```
 
 launcherは可視Terminalを開き、そこでbootstrapを動かし、完了receiptを元のCodexへ返します。
-ユーザーはinstall／login／Slack承認／masked token入力だけをそのwindowで行い、通常のcommand順序や
-再実行はCodexへ任せます。
+ユーザーは本人操作が必要なinstall dialog／login／管理者承認／masked token入力だけを行います。
+通常のcommand順序、ブラウザでのSlack App作成・設定、再実行はCodexが担当します。
 
 対象projectが既に決まっている場合は、その絶対pathも渡せます。単一Git repositoryだけでなく、
 直下に複数repositoryを置いた親folderも指定できます。
@@ -115,22 +117,35 @@ OAuthの旧32文字・UUID形式のstateと通常のANSI表示に対応してい
 ZeroちゃんはAPI key認証を代用せず、login画面や秘密を勝手に操作しません。login後、Codexは
 同じ`interactive-bootstrap.sh --with-slack ...`を再実行します。既存の安全な設定は上書きされません。
 
-### 2. このMac専用のSlack Appを作る
+### 2. AIがブラウザでこのMac専用のSlack Appを作る
 
 別PCと同時稼働する通常の新規セットアップでは、bootstrapが表示名を確認し、選んだ名前を反映した
 manifestを`~/.codex/zerokun/slack-app-manifest.generated.yaml`へ生成します。manifestは
 クリップボードへコピーされ、SlackのApp作成画面が開きます。
 
-Slack画面では次の順に進めます。
+ここからもAIエージェントが、利用可能なChrome拡張・ブラウザ操作ツール・Computer Useで操作します。
+既存のログイン済みブラウザを優先し、対象workspaceと既存Appを確認して、作成済みならそのAppから
+続けます。中断・再実行のたびに重複Appを作らないでください。App名・対象workspaceが依頼から
+決まっていれば再質問せず進め、不明な業務上の選択だけ確認します。
+
+次の1〜7はAIが担当する操作です。通常の作成・インストール許可はセットアップ依頼の範囲で進め、
+本人のログイン、MFA／CAPTCHA、管理者承認が現れたときだけ、その操作をユーザーへ依頼します。
+トークン値を回答・スクリーンショット・ツール出力へ取り込まず、取得場所を開いた後のコピーと
+非表示入力（8）は現行の安全な端末入力手順に従って本人へ依頼します。
 
 1. **Create New App** → **From a manifest** を選ぶ。
 2. 利用するworkspaceを選び、生成済みYAML manifestを貼る。
 3. 内容を確認して **Next** → **Create** を実行する。
 4. **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes** を開く。
-5. token名を付け、scopeに`connections:write`を追加して生成し、`xapp-...`を控える。
+5. token名を付け、scopeに`connections:write`を追加して生成する。`xapp-...`の値を記録・転載しない。
 6. **OAuth & Permissions** → **Install to Workspace** を実行して許可する。
-7. **Bot User OAuth Token**の`xoxb-...`を控える。
-8. bootstrap端末へ戻り、表示されないpromptへ`xapp-...`、次に`xoxb-...`を直接貼る。
+7. **Bot User OAuth Token**の取得場所を開く。`xoxb-...`の値を記録・転載しない。
+8. 必要な取得画面をAIが案内し、ユーザー本人がtokenをコピーしてbootstrap端末の
+   表示されないpromptへ`xapp-...`、次に`xoxb-...`を直接貼る。AIは入力完了後の照合結果を確認して続行する。
+
+ブラウザ操作ツールが接続できない場合は、利用可能な別の操作経路を確認します。
+どれも使えなければ、ブラウザ接続・拡張の許可など不足する1操作だけを依頼し、復旧後はAIが続行します。
+作成手順をユーザーに丸投げしたり、Appを作成・設定できたと推測して完了扱いにしたりしません。
 
 同梱manifestにはSocket Mode、必要なbot event、bot scopeが入っています。手作業でscopeを
 足し引きしません。bootstrapはtokenの形式だけでなく、2つが同じAppに属することもSlackへ照合し、
@@ -159,7 +174,7 @@ Bot TokenとApp-Level Tokenは対話端末で非表示入力し、同じAppの�
 `zerochan help` は全体の操作一覧、`zerochan <command> --help` は個別の説明です。
 トークン未設定時でもヘルプは表示できます。
 
-Slackで利用したいchannelへ、今作ったAppを招待します。private channelも明示的な招待が必要です。
+AIがSlack画面で利用したいchannelへ、今作ったAppを招待します。private channelも明示的な招待が必要です。
 channel IDはSlackのchannel詳細またはchannel link末尾の`C...`／`G...`で確認します。
 
 対象projectの物理directoryへ移動して設定します。
