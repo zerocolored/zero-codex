@@ -108,6 +108,17 @@ export function isBotDMBlocked(channelType: 'im' | 'channel', isBot: boolean): b
 // Slack user ids are "U…", or "W…" on Enterprise Grid. Bot ids are "B…".
 export const SLACK_USER_ID_RE = /^[UW][A-Z0-9]+$/
 
+/** Called after admission/routing: channel humans may write; DM grants stay explicit. */
+export function resolveInboundWriteEnabled(
+  chatId: string,
+  userId: string,
+  writeAllowFrom: readonly string[],
+): boolean {
+  if (!SLACK_USER_ID_RE.test(userId)) return false
+  if (/^[CG][A-Z0-9]+$/.test(chatId)) return true
+  return /^D[A-Z0-9]+$/.test(chatId) && writeAllowFrom.includes(userId)
+}
+
 /**
  * Who may reach the bot through a DM.
  *

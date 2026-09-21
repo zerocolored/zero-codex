@@ -112,6 +112,8 @@ describe('Zero-kun Codex wiring', () => {
       join(import.meta.dir, 'browser-verification-broker.ts'), 'utf8',
     )
     expect(server).toContain('writeAllowFrom')
+    expect(server).toContain('resolveInboundWriteEnabled(chatId, userId, access.writeAllowFrom)')
+    expect(server).toContain('resolveInboundWriteEnabled(inbound.chatId, event.userId, access.writeAllowFrom)')
     expect(server).toContain('writeEnabled')
     expect(executor).toContain("[':minimal', 'read']")
     expect(executor).not.toContain("extends=${tomlString(job.writeEnabled")

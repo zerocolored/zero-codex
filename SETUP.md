@@ -238,7 +238,8 @@ DMを使う場合は、最初に返るpairing codeを端末で承認します。
 zerochan-access pair <表示されたcode>
 ```
 
-repositoryの変更も許可する利用者だけ、別途write権限を付けます。
+チャンネルの人間の参加者は、個別登録なしでrepository変更も依頼できます。
+DMでrepositoryの変更も許可する場合だけ、別途write権限を付けます。
 
 ```bash
 zerochan-access write allow <Slack user ID>

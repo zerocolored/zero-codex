@@ -18,7 +18,7 @@ import {
 } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { dirname, join } from 'path'
-import { slackReplyScanFailureDisposition } from '../gate.ts'
+import { resolveInboundWriteEnabled, slackReplyScanFailureDisposition } from '../gate.ts'
 import {
   ArtifactDeliveryAmbiguousError,
   ArtifactPublicationBlockedError,
@@ -3947,6 +3947,22 @@ describe('Codex job store', () => {
     store.complete(first.id, 'codex-thread-user-1', 'done')
     store.enqueue(input({ messageId: '2', userId: 'U2222222222' }))
     expect(store.claimNext('serial-worker')?.sessionId).toBe('codex-thread-user-1')
+    store.close()
+  })
+
+  test('旧read-only channel jobの次の参加者依頼は新しいwrite sessionになり旧jobを再実行しない', () => {
+    const store = makeStore()
+    const previous = store.enqueue(input()).job
+    store.claimNext('serial-worker')
+    store.complete(previous.id, 'old-read-only-session', 'done')
+    store.enqueue(input({ messageId: 'new-member-request', userId: 'UNEW',
+      writeEnabled: resolveInboundWriteEnabled('C0123456789', 'UNEW', []),
+    }))
+    const next = store.claimNext('serial-worker')!
+    expect(next.id).not.toBe(previous.id)
+    expect(next.writeEnabled).toBe(true)
+    expect(next.sessionId).toBeNull()
+    expect(store.enqueue(input()).duplicate).toBe(true)
     store.close()
   })
 

@@ -92,8 +92,8 @@ Slack bot
   判断・認証・権限などが必要な待機は未完了として通知し、完了リアクションを付けません。
   停止指示とレート制限は従来の処理を維持します。Goalは依頼範囲を広げる許可ではありません。
   Claude・Grok・補助CodexにはGoalを設定せず、更新候補の検証でも有効化しません。
-- 受信許可と書込み許可は別です。既定profileはrepository readとjob outbox writeだけです。`writeAllowFrom` を
-  明示した利用者だけrepository・`.git` writeとネットワークを使えますが、Mac全体のsandboxは解除しません。
+- 設定済みチャンネルの人間の参加者は、個別登録なしでrepository・`.git` writeとネットワークを使えます。
+  DMだけは`writeAllowFrom`の明示許可が必要です。Mac全体のsandboxは解除しません。
 - write許可されたWebタスクでは、primary Codexへ利用可能なBrowser／Chrome能力を渡し、localhostだけでなく
   依頼対象の公開HTTPS環境も実際に開いて確認できます。設定済みの`go-chrome-mcp`は起動時に取得した
   owner管理のtransportを固定し、cookie取得・任意JavaScript等を除いた画面操作だけを引き渡します。
@@ -325,7 +325,8 @@ Appを各channelへ招待したうえで、新しい依頼はそのAppをメン�
 先頭コメントからその返信までのhuman投稿と添付を時系列の1タスクとして受け付けます。
 別の参加者がメンションしても利用できます。DMは最初に表示されるcodeを
 `zerochan-access pair <code>`で承認し、
-repositoryの変更を許可する利用者だけ`zerochan-access write allow <Slack user ID>`を実行します。
+DMでrepositoryの変更も許可する場合だけ`zerochan-access write allow <Slack user ID>`を実行します。
+チャンネルの参加者は個別の利用許可・write登録なしで変更を依頼できます。
 
 同一PCのClaude版を完全に置き換える場合だけ、旧 `zero` cloneを残したまま`zero-codex`を
 別directoryへcloneし、旧stateを明示してsetupします。
@@ -402,7 +403,8 @@ zerochan-access status
 実行すると利用できます。参加者は全員利用でき、bot投稿は無視します。新しい依頼は
 そのSlack Appへのメンションが必要ですが、同じスレッドの続きはメンション不要です。
 
-受信を許可しても repository write は許可されません。書込みが必要な利用者だけ別に付与します。
+チャンネルの参加者は全員、個別登録なしでrepositoryの変更を依頼できます。
+DMは受信許可とrepository writeが別なので、DMで書込みが必要な利用者だけ次で付与します。
 
 ```bash
 zerochan-access write allow U0123456789
@@ -468,7 +470,7 @@ zerochan update
 ```
 
 更新対象は `origin/main` の fast-forward のみです。未コミット変更や未 push の local commit
-がある場合は停止します。書込み許可済みの利用者は Slack で「このアプリを更新してください」と依頼でき、
+がある場合は停止します。設定済みチャンネルの参加者、またはDMの書込み許可済み利用者は Slack で「このアプリを更新してください」と依頼でき、
 通常 FIFO の外にある detached updater が自己デッドロックを避けて実行します。
 remoteの候補commitは隔離cloneをCodex sandbox内でsandbox-safe contract test・型検査・build・shell検査してから
 live branchをfast-forwardします。macOSはsandboxの入れ子を拒否するため、実Codex sandbox・tmux・process制御を

@@ -758,5 +758,5 @@ else
   echo "     ログtabごと起動し直す: zerochan stop → zerochan start"
   echo "     queue確認: zerokun-jobs status"
   echo "     Codex版更新: zerochan update"
-  echo "     書込み許可: zerochan-access write allow <SlackユーザーID>"
+  echo "     DMの書込み許可（チャンネルは個別登録不要）: zerochan-access write allow <SlackユーザーID>"
 fi

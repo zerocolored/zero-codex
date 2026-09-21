@@ -220,10 +220,10 @@ codex <trust-args> -C <repo> \
 
 ## 権限
 
-受信可否と repository write は別です。
+チャンネルの人間の参加者は全員write可です。DMでは受信可否とrepository writeを別に管理します。
 
-- 通常: minimal runtime + repository read + 当該添付read + job outbox/scratch write
-- `writeAllowFrom` の sender: minimal runtime + repository/`.git` write + network + browser/local bind
+- write未許可のDM: minimal runtime + repository read + 当該添付read + job outbox/scratch write
+- チャンネルの人間の参加者、またはDMで`writeAllowFrom`にいるsender: minimal runtime + repository/`.git` write + network + browser/local bind
 - read senderは1つのread-only Codex workflow、write senderは1つのwrite-authorized Codex workflowを使います。
   advisor、review、test、Git、deployの進め方はCodexが`AGENTS.md`から決め、Zeroちゃんは別phaseへ分割しません。
 - advisorが必要なjobでは、初期設計のnative Codex solution analyst 1枠、最終reviewのnative Codex risk reviewer
