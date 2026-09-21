@@ -217,7 +217,9 @@ describe('public Codex defaults', () => {
     for (const expected of [
       '「セットアップして」',
       'SETUP.md',
-      'interactive-bootstrap.sh --with-slack',
+      'interactive-bootstrap.sh --repo-dir',
+      'Slack Appの作成・manifest設定・通常のworkspace install・channel招待はAIがブラウザで代行する',
+      'トークン取得・登録もAIが代行し',
       'そのMac専用の新しいSlack App',
       'Slack上の実応答まで確認',
       'zerokun-status',

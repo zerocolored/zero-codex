@@ -40,6 +40,37 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<voi
 }
 
 describe('Codex stable supervisor gate', () => {
+  test.skipIf(process.platform !== 'darwin')('parallel supervisors release their own jobs when exit callbacks are lost', async () => {
+    const runs = [0, 17].map(async expectedCode => {
+      const root = mkdtempSync(join(tmpdir(), 'zerokun-supervisor-lost-exit-'))
+      temporaryRoots.push(root)
+      const registration = join(root, 'executor.json')
+      const fakeCodex = join(root, 'fake-codex')
+      writeFileSync(fakeCodex, `#!/bin/sh\necho task-${expectedCode}\nexit ${expectedCode}\n`, { mode: 0o700 })
+      const supervisor = Bun.spawn([
+        process.execPath, '--config=/dev/null', '--no-env-file',
+        join(import.meta.dir, 'codex-supervisor.ts'), 'lost-exit-job', registration,
+        '--unverified-for-tests', '--', fakeCodex,
+      ], {
+        cwd: root,
+        env: { PATH: '/usr/bin:/bin', HOME: root,
+          ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1', ZEROKUN_SUPERVISOR_TEST_DROP_EXIT_CALLBACK: '1' },
+        stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', detached: true,
+      })
+      const identity = readProcessIdentity(supervisor.pid)!
+      liveSupervisors.push(identity)
+      const [code, stdout, stderr] = await Promise.all([
+        supervisor.exited, new Response(supervisor.stdout).text(), new Response(supervisor.stderr).text(),
+      ])
+      expect(code).toBe(expectedCode)
+      expect(stdout.trim()).toBe(`task-${expectedCode}`)
+      expect(stderr).toContain('metadata-without-callback')
+      expect(JSON.parse(readFileSync(registration, 'utf8')).phase).toBe('cleanup-confirmed')
+      expect(observeProcessGeneration(identity).status).toBe('dead')
+    })
+    await Promise.all(runs)
+  }, 10_000)
+
   test.skipIf(process.platform !== 'darwin')(
     'interjection pause survives unreadable descendant cleanup and retains warning evidence',
     async () => {
