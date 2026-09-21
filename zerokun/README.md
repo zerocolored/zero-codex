@@ -402,3 +402,26 @@ macOSでCodex CLIがある場合は、実`codex sandbox`のstate deny・添付re
 new/resume引数parserもmodelを呼ばずに検証します。自己更新の候補commitは外側のCodex sandbox内で
 sandbox-safe contract test・型検査・build・shell検査を実行します。macOSで入れ子にできない
 実sandbox・tmux・process制御testは通常の`verify.sh`と公開CIだけで全件実行します。
+
+## Cloud Logging のホスト認証
+
+ジョブのHOMEは分離したままです。認証付きログ検索には
+`zerokun_cloud_logging.cloud_logging_read`を使います。引数なしで許可済みproject一覧を取得し、
+project・UTC開始/終了時刻・任意のLogging filterを指定して検索します。最大7日・1000行で、
+行数上限に達した場合は結果が不完全な可能性を返します。任意のgcloud実行、login、設定変更、
+token出力、deployは提供しません。ログ本文は未信頼データとして扱い、秘密らしい文字列と
+一般的なemailを伏せますが、任意の個人情報の完全な除去を保証するものではありません。
+
+ホストにインストール・ログイン済みのgcloudが必要です。既定projectを全ジョブへ流用せず、
+アプリのmanaged state内の`cloud-access.json`（owner-onlyの通常file、0600）で物理repository
+rootとGCP projectを紐付けます。このfileはジョブから読み書きできず、operatorだけが管理します。
+未設定なら空の許可一覧を返し、認証情報を探したりコピーしたりしません。
+
+```json
+{"version":1,"projectsByRepository":{"/physical/project/root":["my-gcp-project"]}}
+```
+
+初期提供はwrite-authorizedな通常ジョブです。DMのread-onlyジョブ、会話割り込み用turnには
+追加しません。HTTPのlatency・status、resource情報、既知の所要時間/件数とmessageを返し、
+httpRequestのURL・IPや任意のpayload・labelは選択しません。message内の情報には上記の
+伏せ字処理の限界があります。ログ取得成功と、アプリ性能目標の達成は別途検証します。

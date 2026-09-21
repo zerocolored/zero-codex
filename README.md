@@ -564,7 +564,7 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - `thread/start`は`ephemeral:false`なので、Codex/provider側のnative履歴はZeroちゃんのSQLiteとは別に
   残り得ます。Codexがadvisorを利用した場合は各providerの保持方針も適用されます。
 - apps・plugins・hookと一般MCPは無効化し、localhost表示確認用`zerokun_browser`、認証情報を
-  隠したGitHub transport用`zerokun_github`、およびoperatorが設定済みの検証済みChrome transportだけを
+  隠したGitHub transport用`zerokun_github`、ログ取得用`zerokun_cloud_logging`、およびoperatorが設定済みの検証済みChrome transportだけを
   必要なwrite jobで有効にします。
   Web検索はwrite許可jobだけに限定し、write jobのcommand networkはproxyを通してSlack関連domainを拒否します。
 - Zeroちゃんはadvisorの必須性や指摘の重大度、publication planを独自に裁定しません。
@@ -605,6 +605,7 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - `zerokun/codex-executor.ts`: Codex App Server実行、turn/control処理、sandbox分離
 - `zerokun/browser-verification-broker.ts`: localhost用の隔離Chrome描画・PNG検証
 - `zerokun/github-credential-broker.ts`: credentialを隠したrepository限定GitHub transport
+- `zerokun/cloud-logging-broker.ts`: ホストのgcloud認証を使うproject限定Cloud Logging検索
 - `zerokun/access.ts`: pairing・受信権限・書込み権限の管理 CLI
 - `codex-channel.sh`: standalone gateway と runner の launcher
 - `zerokun/update.ts`: `main` ブランチ用の安全な自己更新

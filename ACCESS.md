@@ -84,8 +84,9 @@ zerochan-access write deny U0123456789
   完全一致の`中止`も同じthread-scoped操作として受け付けます。
 - commit、push、deploy、PR は write 許可だけでは自動実行されず、Slack request が求めた範囲に
   限られます。
-- HOMEのcredential/configはCodexへ公開しません。commitにはrepository localのuser設定が必要で、
-  push・deploy・PRはHOME外で安全に利用できる認証がない環境ではblockerとして報告されます。
+- HOMEのcredential/configはCodexへ公開しません。commitには固定の実行用identityを使い、
+  認証付きGitHub操作はrepository限定broker、Cloud Logging検索はproject限定brokerへ渡します。
+  ホストの認証が使える限り、scratch HOMEに認証がないことだけではblockしません。
 - 通常cloneに加え、Git自身の登録情報・back pointer・gitlink・`core.worktree`が一致する正規の
   linked worktree/submoduleを利用できます。任意pathを指す偽の`.git` pointerは拒否します。
 
