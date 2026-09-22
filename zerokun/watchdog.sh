@@ -227,10 +227,6 @@ load_state_env() {
         [ -n "${ZEROKUN_WATCHDOG_NOTIFY:-}" ] || ZEROKUN_WATCHDOG_NOTIFY="${line#ZEROKUN_WATCHDOG_NOTIFY=}"
         export ZEROKUN_WATCHDOG_NOTIFY
         ;;
-      ZEROKUN_WATCHDOG_REALERT_MIN=*)
-        [ -n "${ZEROKUN_WATCHDOG_REALERT_MIN:-}" ] || ZEROKUN_WATCHDOG_REALERT_MIN="${line#ZEROKUN_WATCHDOG_REALERT_MIN=}"
-        export ZEROKUN_WATCHDOG_REALERT_MIN
-        ;;
     esac
   done < "$STATE_DIR/.env"
 }
@@ -348,7 +344,7 @@ send_notification() {
 prepare_state_transition() {
   /usr/bin/python3 - \
     "$STATE_FILE" "$NEXT_STATE_FILE" "$ALERT_FILE" \
-    "$bridge_up" "$runner_up" "$launcher_up" "$maintenance" "$now_epoch" "$REALERT_MIN" <<'PY'
+    "$bridge_up" "$runner_up" "$launcher_up" "$maintenance" "$now_epoch" <<'PY'
 import datetime as dt
 import json
 import os
@@ -360,7 +356,6 @@ runner_up = sys.argv[5] == "1"
 launcher_up = sys.argv[6] == "1"
 maintenance = sys.argv[7] == "1"
 now = int(sys.argv[8])
-realert_seconds = int(sys.argv[9]) * 60
 default = {
     "status": "up",
     "downSince": None,
@@ -415,7 +410,6 @@ else:
     elif status == "down" and (
         incident_severity > previous_severity
         or not last_alert
-        or now - int(last_alert) >= realert_seconds
     ):
         should_alert = True
     if should_alert:
@@ -445,7 +439,9 @@ else:
         "lastAlertAt": last_alert,
         "consecutiveDownChecks": consecutive,
         "incidentKind": incident_kind,
-        "incidentSeverity": incident_severity,
+        # Keep the highest notified severity until full recovery. Partial
+        # recovery must not re-arm an already delivered outage warning.
+        "incidentSeverity": max(previous_severity, incident_severity) if status == "down" else 0,
     }
 
 with open(next_path, "w", encoding="utf-8") as handle:
@@ -468,11 +464,6 @@ run_watchdog() {
     return 1
   fi
   load_state_env || return 1
-  REALERT_MIN="${ZEROKUN_WATCHDOG_REALERT_MIN:-60}"
-  case "$REALERT_MIN" in
-    ''|*[!0-9]*) REALERT_MIN=60 ;;
-  esac
-  [ "$REALERT_MIN" -ge 1 ] 2>/dev/null || REALERT_MIN=60
   if [ -e "$STATE_DIR/watchdog-off" ]; then
     printf '%s zerokun watchdog: muted\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     return 0
@@ -494,7 +485,7 @@ run_watchdog() {
     maintenance_active && maintenance=1
   fi
   now_epoch="$(date +%s)"
-  export STATE_DIR STATE_FILE NEXT_STATE_FILE ALERT_FILE REALERT_MIN
+  export STATE_DIR STATE_FILE NEXT_STATE_FILE ALERT_FILE
   export bridge_up runner_up launcher_up maintenance now_epoch
 
   if ! prepare_state_transition; then
@@ -585,6 +576,11 @@ selftest() {
     || selftest_fail 'partial runner alert is not actionable' || return 1
   printf 'ok: partial runner outage reports automatic recovery\n'
   rm -f "$test_dir/job-runner-starter.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=0 /bin/bash "$SCRIPT_PATH" 2>&1)"
+  [[ "$output" == *'tokens are unavailable'* ]] \
+    && grep -q '"incidentSeverity":1' "$test_dir/watchdog-state.json" \
+    || selftest_fail 'failed escalation consumed notification' || return 1
+  printf 'ok: failed escalation delivery is retried\n'
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" == *'🚨 現在、応答できない状態です'* \
     && "$output" == *'zerochan stop --force → zerochan start'* ]] \
@@ -593,6 +589,14 @@ selftest() {
     && grep -q '"incidentSeverity":3' "$test_dir/watchdog-state.json" \
     || selftest_fail 'escalated incident classification was not persisted' || return 1
   printf 'ok: launcher loss immediately escalates active runner outage\n'
+  # A temporary partial recovery must not re-arm the same outage warning.
+  printf '%s\n' "$launcher_pid" > "$test_dir/job-runner-starter.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  rm -f "$test_dir/job-runner-starter.lock"
+  output="$output$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* ]] \
+    || selftest_fail 'partial recovery repeated outage warning' || return 1
+  printf 'ok: partial recovery does not repeat an already notified severity\n'
   printf '%s\n' "$runner_pid" > "$test_dir/job-runner.lock/pid"
   printf '%s\n' "$launcher_pid" > "$test_dir/job-runner-starter.lock"
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
@@ -683,6 +687,11 @@ selftest() {
 
   rm -f "$test_dir/plugin.lock"
   ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH" >/dev/null
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=0 /bin/bash "$SCRIPT_PATH" 2>&1)"
+  [[ "$output" == *'tokens are unavailable'* ]] \
+    && grep -q '"status":"up"' "$test_dir/watchdog-state.json" \
+    || selftest_fail 'failed first delivery consumed notification' || return 1
+  printf 'ok: failed first delivery is retried\n'
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" == *'🚨 現在、応答できない状態です'* ]] || selftest_fail 'second down did not alert' || return 1
   printf 'ok: second down sends alert\n'
@@ -701,15 +710,38 @@ with open(path, "w", encoding="utf-8") as handle:
     json.dump(state, handle)
 PY
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
-  [[ "$output" == *'🚨 現在、応答できない状態です'* ]] || selftest_fail 'late reminder missing' || return 1
-  printf 'ok: reminder is sent after interval\n'
+  [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'late reminder' || return 1
+  printf 'ok: hourly reminder remains suppressed\n'
+  /usr/bin/python3 - "$test_dir/watchdog-state.json" <<'PYTEST'
+import json, sys, time
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    state = json.load(handle)
+state["lastAlertAt"] = int(time.time()) - 86401
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(state, handle)
+PYTEST
+  output="$(ZEROKUN_STATE_DIR="$test_dir" ZEROKUN_WATCHDOG_REALERT_MIN=1 DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'daily reminder' || return 1
+  printf 'ok: daily reminder remains suppressed with legacy configuration\n'
 
   printf '%s\n' "$server_pid" > "$test_dir/plugin.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=0 /bin/bash "$SCRIPT_PATH" 2>&1)"
+  [[ "$output" == *'tokens are unavailable'* ]] \
+    && grep -q '"status":"down"' "$test_dir/watchdog-state.json" \
+    || selftest_fail 'failed recovery delivery consumed notification' || return 1
+  printf 'ok: failed recovery delivery is retried\n'
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" == *'✅ 応答できる状態に復旧しました。'* ]] || selftest_fail 'recovery missing' || return 1
   output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
   [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'duplicate recovery' || return 1
   printf 'ok: recovery sends once\n'
+  rm -f "$test_dir/plugin.lock"
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" != *'DRY_RUN notification:'* ]] || selftest_fail 'new outage first observation' || return 1
+  output="$(ZEROKUN_STATE_DIR="$test_dir" DRY_RUN=1 /bin/bash "$SCRIPT_PATH")"
+  [[ "$output" == *'🚨 現在、応答できない状態です'* ]] || selftest_fail 'new outage notification missing' || return 1
+  printf 'ok: full recovery re-arms the next outage notification\n'
 
   touch "$test_dir/watchdog-off"
   rm -f "$test_dir/plugin.lock"

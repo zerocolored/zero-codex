@@ -5075,6 +5075,22 @@ describe('single FIFO worker', () => {
     })
     expect(() => store.monitorObligations()).not.toThrow()
     expect(store.get(interrupted.id)?.lastError).toContain('同じSlackスレッド')
+    const stoppedJob = store.get(interrupted.id)!
+    const stoppedReason = stoppedJob.lastError!
+    expect(publicJobFailureSummary(stoppedReason)).toBe(stoppedReason)
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+    await notifier.failed(stoppedJob, stoppedReason)
+    expect(posted).toEqual([
+      '🛑 停止操作により中断しました。'
+        + `\n原因: ${stoppedReason}`
+        + `\nキュー #${stoppedJob.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
+    ])
+    expect(publicJobFailureSummary(`${stoppedReason} token=xoxb-private`)).toBe(
+      '内部処理でエラーが発生しました。',
+    )
     expect(store.get(queued.id)).toMatchObject({ status: 'queued', attempts: 0 })
 
     const queuedClaim = store.claimNext('next-worker')!
