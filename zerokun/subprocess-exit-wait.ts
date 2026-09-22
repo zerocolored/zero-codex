@@ -8,32 +8,47 @@ export async function waitForDirectExit(options: {
   pollMs?: number
   deadGraceMs?: number
 }): Promise<number> {
-  let outcome: { code: number } | { error: unknown } | undefined
-  void options.callback.then(code => { outcome = { code } }, error => { outcome = { error } })
-  let deadSince: number | undefined
-  while (true) {
-    if (outcome) {
-      if ('error' in outcome) throw outcome.error
-      return outcome.code
+  // Resolve directly from the exit callback, independently of the periodic
+  // probe. A suspended sleep/continuation must not also suspend exit delivery.
+  return new Promise<number>((resolve, reject) => {
+    let done = false
+    let deadSince: number | undefined
+    let timer: ReturnType<typeof setInterval> | undefined
+    const finish = (code: number): void => {
+      if (done) return
+      done = true
+      clearInterval(timer)
+      resolve(code)
     }
-    const state = options.state()
-    // Metadata is written by the subprocess runtime before notifying JS.
-    // Check generation too: never retire a live/reused PID based on timing.
-    if (state.generation === 'dead') {
-      if (state.exitCode !== null || state.signalCode !== null) {
-        options.warn('metadata-without-callback')
-        return subprocessExitCode(state.exitCode, state.signalCode)
-      }
-      deadSince ??= Date.now()
-      if (Date.now() - deadSince >= (options.deadGraceMs ?? 2_000)) {
-        options.warn('dead-without-exit-status')
-        // Unknown exit is failure, never fabricated success. Continue normal
-        // descendant cleanup so its uncertainty cannot strand the supervisor.
-        return 1
-      }
-    } else {
-      deadSince = undefined
+    const fail = (error: unknown): void => {
+      if (done) return
+      done = true
+      clearInterval(timer)
+      reject(error)
     }
-    await Bun.sleep(options.pollMs ?? 100)
-  }
+    const probe = (): void => {
+      if (done) return
+      try {
+        const state = options.state()
+        if (state.generation !== 'dead') {
+          deadSince = undefined
+          return
+        }
+        if (state.exitCode !== null || state.signalCode !== null) {
+          options.warn('metadata-without-callback')
+          finish(subprocessExitCode(state.exitCode, state.signalCode))
+          return
+        }
+        deadSince ??= Date.now()
+        if (Date.now() - deadSince >= (options.deadGraceMs ?? 2_000)) {
+          options.warn('dead-without-exit-status')
+          finish(1) // Unknown exit is never fabricated success.
+        }
+      } catch (error) { fail(error) }
+    }
+    void options.callback.then(finish, fail)
+    timer = setInterval(probe, options.pollMs ?? 100)
+    // Let an already delivered callback win before the first metadata probe.
+    queueMicrotask(probe)
+  })
 }

@@ -19,6 +19,7 @@ import {
   finalizeSuccessfulExecution,
   extractArtifactPaths,
   createExecutorPidLifecycle,
+  terminateTrackedExecutors,
   publishStagedGitHubPublication,
   runQueuedJobs,
   type JobRecord,
@@ -6202,6 +6203,38 @@ describe('production App Server executor', () => {
     expect(JSON.parse(readFileSync(registration, 'utf8')).phase).toBe('active')
     expect(value.store.claimNext('same-serial-worker')).toBeNull()
     value.store.close()
+  }, 15_000)
+
+  test('periodic watch recovers a dead child with a stalled supervisor continuation', async () => {
+    const value = fixture('normal')
+    const processIds: number[] = []
+    const next = value.store.enqueue({ chatId: value.job.chatId,
+      threadTs: '1800000000.001500', messageId: '1800000000.001500', userId: 'UNEXT',
+      repoPath: value.job.repoPath, task: '次の依頼', writeEnabled: false }).job
+    try {
+      const execution = executeCodexJob(value.job, {
+        codexBinForTesting: value.executable,
+        logDir: value.logDir, stateDir: value.state, skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'normal',
+          ZEROKUN_SUPERVISOR_TEST_STALL_EXIT_WAIT: '1' },
+        supervisorCleanupGraceMs: 50,
+        supervisorWatchForTesting: { intervalMs: 5, graceMs: 50 },
+        onProcessId: pid => { processIds.push(pid) }, liveControls: value.hooks,
+      })
+      // Recovery is a cleanup fault, never a success inferred from silence.
+      await expect(execution).rejects.toBeInstanceOf(CodexCleanupPendingError)
+      expect(processIds).toHaveLength(1)
+      expect(() => process.kill(processIds[0]!, 0)).toThrow()
+      expect(value.store.claimNext('same-serial-worker')).toBeNull()
+      await terminateTrackedExecutors(value.store, () => {}, 2_000, value.state)
+      expect(value.store.recoverInterrupted()).toEqual({
+        requeued: 0, failedWrites: 0, failedUncertain: 1,
+      })
+      expect(value.store.get(value.job.id)?.status).toBe('failed')
+      expect(value.store.claimNext('restarted-serial-worker')?.id).toBe(next.id)
+      expect(value.store.recoverInterrupted().requeued).toBe(1)
+      expect(value.store.get(value.job.id)?.status).toBe('failed')
+    } finally { value.store.close() }
   }, 15_000)
 
   test('supervisor retained-stateは内部通知からbounded recoveryへ入りFIFOを無音停止しない', async () => {

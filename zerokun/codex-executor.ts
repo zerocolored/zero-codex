@@ -1,3 +1,5 @@
+import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
+import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { CODEX_NETWORK_CONTINUATION, CODEX_NETWORK_RETRY_DELAYS_MS, isTransientCodexNetworkError } from './codex-network-retry.ts'
 import {
   closeSync,
@@ -6116,6 +6118,8 @@ export async function executeCodexJob(
     finalizeSuccessfulResult?(execution: JobExecutionResult): JobExecutionResult
     onSuccessfulResult?(execution: JobExecutionResult): JobExecutionResult
     supervisorCleanupGraceMs?: number
+    /** Fixture-only cadence; production checks every 5s with a 30s dead-tree grace. */
+    supervisorWatchForTesting?: { intervalMs: number; graceMs: number }
     /** Grace after an acknowledged user cancel; this is not a whole-job timeout. */
     cancellationTerminalGraceMs?: number
     /** Production App Server control plane. Omit only for legacy executor fixtures. */
@@ -6799,18 +6803,16 @@ export async function executeCodexJob(
       throw new Error('Codex supervisorのgenerationを取得できません')
     }
     const tracked = new Map<number, string>([[proc.pid, supervisorIdentity.started]])
-    let tracking = true
     let trackingError: unknown
-    const tracker = (async () => {
-      try {
-        while (tracking) {
-          captureTrackedProcesses([proc.pid], proc.pid, tracked)
-          await Bun.sleep(50)
-        }
-      } catch (error) {
-        trackingError = error
-      }
-    })()
+    const stopTracking = startProcessPolling(() => {
+      captureTrackedProcesses([proc.pid], proc.pid, tracked)
+    }, error => { trackingError = error }, 50)
+    const supervisorExit = waitForDirectExit({
+      callback: proc.exited,
+      state: () => ({ exitCode: proc.exitCode, signalCode: proc.signalCode,
+        generation: observeProcessGeneration(supervisorIdentity).status }),
+      warn: reason => process.stderr.write(`Codex supervisor exit reconciliation: ${reason}\n`),
+    })
     const reapTrackedSupervisor = async (cleanup: {
       waitForForce?: () => boolean
       onForce?: () => void
@@ -7048,6 +7050,22 @@ export async function executeCodexJob(
       // use the process-group path above and remain distinguishable.
       signalProcessIfLive(supervisorIdentity, 'SIGUSR2')
     }
+    let processOutputRevision = 0
+    let watchdogTriggered = false
+    const stopSupervisorWatch = startSupervisorWatch({
+      supervisor: supervisorIdentity,
+      outputRevision: () => processOutputRevision,
+      readRegistration: () => readVerifiedRegistration({ allowActive: true, requirePresent: true }),
+      ...(officialCodexSnapshot ? {} : options.supervisorWatchForTesting),
+      onStalled: () => {
+        watchdogTriggered = true
+        process.stderr.write('Codex supervisor watchdog: direct child and tracked descendants are gone; recovering stalled cleanup.\n')
+        // An internal cleanup fault follows the existing bounded recovery path.
+        // It never turns a stale final file or silence into a successful result.
+        terminate()
+      },
+    })
+    void supervisorExit.then(stopSupervisorWatch, stopSupervisorWatch)
     if (options.liveControls) {
       const controls = options.liveControls
       let processPersistenceError: unknown
@@ -7144,6 +7162,7 @@ export async function executeCodexJob(
       let notificationTurnId: string | null = null
       const session = new CodexAppServerSession(proc.stdin, proc.stdout, {
         onOutputChunk: value => {
+          processOutputRevision += 1
           if (stdoutBytes < MAX_LOG_FILE_BYTES) {
             const chunk = value.subarray(0, MAX_LOG_FILE_BYTES - stdoutBytes)
             writeSync(stdoutDescriptor, chunk)
@@ -7262,7 +7281,7 @@ export async function executeCodexJob(
       const stderrPromise = collectStreamTailToLog(
         proc.stderr,
         stderrPath,
-        options.onStderrChunk,
+        value => { processOutputRevision += 1; options.onStderrChunk?.(value) },
       )
       let abortedBeforeProcessExit = false
       let runtimeIdentityError: unknown
@@ -7369,6 +7388,9 @@ export async function executeCodexJob(
         )
       }
       const waitForProtocolActivity = async (): Promise<void> => {
+        if (watchdogTriggered) throw new CodexCleanupPendingError(
+          'Codex supervisor stalled after its direct child exited',
+        )
         if (cancellationTerminalDeadline === null) {
           await session.waitForActivity()
           return
@@ -7941,6 +7963,9 @@ export async function executeCodexJob(
         let rateLimitWaitReportedForTurnId: string | null = null
         let networkWaitReportedForTurnId: string | null = null
         while (true) {
+          if (watchdogTriggered) throw new CodexCleanupPendingError(
+            'Codex supervisor stalled after its direct child exited',
+          )
           flushMonitorMessages()
           if (abortedBeforeProcessExit) throw new CodexInterruptedError('Codex job was interrupted')
           const activity = session.takeNextTurnActivity(currentThreadId, currentTurnId)
@@ -8413,7 +8438,7 @@ export async function executeCodexJob(
         kind: 'reader-closed' | 'reader-failed'
         error: unknown | null
       } = await Promise.race([
-        proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
+        supervisorExit.then(exitCode => ({ kind: 'exit' as const, exitCode })),
         forcedCleanup,
         session.waitForReaderFailure().then(error => ({
           kind: 'reader-failed' as const, error,
@@ -8445,17 +8470,17 @@ export async function executeCodexJob(
           terminate()
         }
         processOutcome = await Promise.race([
-          proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
+          supervisorExit.then(exitCode => ({ kind: 'exit' as const, exitCode })),
           forcedCleanup,
         ])
       }
       processBoundarySealed = true
       // Seal both facts at the process/force boundary. A later runner abort
       // cannot rewrite a self-confirmed exit, while a force callback that has
-      // already linearized remains sticky even if proc.exited races it.
+      // already linearized remains sticky even if supervisorExit races it.
       const interruptedAtExit = abortedBeforeProcessExit
       options.signal?.removeEventListener('abort', abort)
-      const forceWasClaimed = processOutcome === 'cleanup' || parentForceClaimed
+      const forceWasClaimed = processOutcome === 'cleanup' || parentForceClaimed || watchdogTriggered
       if (!forceWasClaimed && cleanupTimer) clearTimeout(cleanupTimer)
       observeCancellation(forceWasClaimed)
       let registrationError: unknown
@@ -8480,20 +8505,18 @@ export async function executeCodexJob(
       let postExitCleanupForced = false
       if (forceWasClaimed) {
         forcedCleanupUsed = true
-        tracking = false
-        await tracker
+        stopTracking()
         await reapTrackedSupervisor({
           waitForForce: () => true,
           onForce: () => { postExitCleanupForced = true },
         })
-        exitCode = await proc.exited
+        exitCode = await supervisorExit
       } else {
         if (typeof processOutcome !== 'object' || processOutcome.kind !== 'exit') {
           throw new CodexCleanupPendingError('Codex process boundary remained unresolved')
         }
         exitCode = processOutcome.exitCode
-        tracking = false
-        await tracker
+        stopTracking()
         await reapTrackedSupervisor({
           // A clean successful turn waits without a deadline. Exact Slack
           // cancellation/host abort or an already-established internal fault
@@ -8748,14 +8771,14 @@ export async function executeCodexJob(
     }, stdoutPath, observeEvent, () => {
       eventSequence += 1
       streamInvalid = true
-    }, options.onStdoutChunk).then(
+    }, value => { processOutputRevision += 1; options.onStdoutChunk?.(value) }).then(
       value => ({ ok: true as const, value }),
       error => ({ ok: false as const, error }),
     )
     const stderrPromise = collectStreamTailToLog(
       proc.stderr,
       stderrPath,
-      options.onStderrChunk,
+      value => { processOutputRevision += 1; options.onStderrChunk?.(value) },
     )
     const timer = setTimeout(() => {
       if (claimStopCause('timeout')) {
@@ -8800,7 +8823,7 @@ export async function executeCodexJob(
     herdrIdentityTimer?.unref()
     let logicalCleanupInitiated = false
     let processOutcome = await Promise.race([
-      proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
+      supervisorExit.then(exitCode => ({ kind: 'exit' as const, exitCode })),
       forcedCleanup,
       logicalCompletion,
     ])
@@ -8809,12 +8832,12 @@ export async function executeCodexJob(
       logicalCleanupInitiated = true
       finishLogicalTurn()
       processOutcome = await Promise.race([
-        proc.exited.then(exitCode => ({ kind: 'exit' as const, exitCode })),
+        supervisorExit.then(exitCode => ({ kind: 'exit' as const, exitCode })),
         forcedCleanup,
       ])
     }
     attemptEnded = true
-    const forceWasClaimed = processOutcome === 'cleanup' || parentForceClaimed
+    const forceWasClaimed = processOutcome === 'cleanup' || parentForceClaimed || watchdogTriggered
     const interruptedAtExit = abortedBeforeProcessExit
     processBoundarySealed = true
     options.signal?.removeEventListener('abort', abort)
@@ -8834,20 +8857,18 @@ export async function executeCodexJob(
     let postExitCleanupForced = false
     if (forceWasClaimed) {
       forcedCleanupUsed = true
-      tracking = false
-      await tracker
+      stopTracking()
       await reapTrackedSupervisor({
         waitForForce: () => true,
         onForce: () => { postExitCleanupForced = true },
       })
-      exitCode = await proc.exited
+      exitCode = await supervisorExit
     } else {
       if (processOutcome === 'cleanup') {
         throw new CodexCleanupPendingError('Codex cleanup force state changed unexpectedly')
       }
       exitCode = processOutcome.exitCode
-      tracking = false
-      await tracker
+      stopTracking()
       await reapTrackedSupervisor({
         waitForForce: () => options.signal?.aborted === true
           || registrationError != null

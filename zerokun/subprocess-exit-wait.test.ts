@@ -50,3 +50,14 @@ test('live and unknown generations wait for the real exit callback', async () =>
     expect(await result).toBe(23)
   }
 })
+
+
+test('exit callback resolves independently of a sleeping polling continuation', async () => {
+  let deliver!: (code: number) => void
+  const callback = new Promise<number>(resolve => { deliver = resolve })
+  const result = waitForDirectExit({ callback,
+    state: () => ({ exitCode: null, signalCode: null, generation: 'alive' }),
+    warn: () => {}, pollMs: 60_000 })
+  deliver(37)
+  expect(await Promise.race([result, new Promise(resolve => setTimeout(() => resolve('stalled'), 50))])).toBe(37)
+})
