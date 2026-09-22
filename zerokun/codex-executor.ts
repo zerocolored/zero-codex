@@ -79,6 +79,8 @@ import {
   finalizeRetiredAdvisorRounds,
   persistAdvisorClaudeCleanupOutcome,
   recordAdvisorExecutorRetirement,
+  readInterruptedAdvisorSlots,
+  savedAdvisorSlotJournal,
 } from './advisor-round-recovery.ts'
 import {
   encodeOfficialCodexSnapshot,
@@ -1719,6 +1721,13 @@ export function collectHostAdvisorCoverage(
       if (raw === null || Buffer.byteLength(raw) > 64 * 1024) continue
       let journal: Record<string, unknown>
       try { journal = JSON.parse(raw) as Record<string, unknown> } catch { continue }
+      if (journal.recoveredAfterInterruption === true) {
+        const saved = readInterruptedAdvisorSlots(join(revisionRoot, `${phase}-${round}.json`), journal)
+        journal = { ...journal,
+          ...(saved.grok ? { grok: saved.grok.map(savedAdvisorSlotJournal) } : {}),
+          ...(saved.claude ? { claude: savedAdvisorSlotJournal(saved.claude) } : {}),
+        }
+      }
       const version = Number(journal.version)
       const threeAdvisor = version === THREE_ADVISOR_JOURNAL_VERSION
       if ((version !== 8 && !threeAdvisor)
@@ -1774,7 +1783,10 @@ export function collectHostAdvisorCoverage(
           const entry = advisor === 'claude' ? journal.claude
             : advisor === 'grok' ? (journal.grok as unknown[])[0] : (journal.native as unknown[])[0]
           const failure = (entry as Record<string, unknown>)?.failure as AdvisorFailure | undefined
-          return { advisor, cause: failure && ['authentication', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'unknown']
+          if (journal.recoveredAfterInterruption === true && advisor !== 'codex') {
+            return { advisor, cause: 'interrupted' as const }
+          }
+          return { advisor, cause: failure && ['authentication', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'interrupted', 'unknown']
             .includes(failure.cause) ? failure.cause : 'unknown' }
         }),
       }
@@ -3785,6 +3797,7 @@ export function buildCodexDeveloperInstructions(
         'For the initial phase, attempt exactly one solution_analyst with model=gpt-6-astra,',
         'reasoning_effort=medium, and fork_turns=none. For each final-review round, attempt exactly',
         'one fresh risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none.',
+        'Fresh native creation and the current input marker apply only to a NEW logical round, never interruption recovery.',
         'Do not substitute another model or add a second',
         'native advisor. Wait for the started attempt, then pass its exact marked response and real',
         'agent ID to advisor_round. If the native slot did',
@@ -3796,6 +3809,9 @@ export function buildCodexDeveloperInstructions(
         'For failure diagnostics only, name GPT, Grok or Claude Code and its safe cause in Slack; omit secrets and internal paths.',
         'If any answer is missing, report its cause and preserve obtained answers. Continue the primary work;',
         'do not loop a terminal round or wait for all three answers merely because the transport suggests retrying.',
+        'Exception: recoveredAfterInterruption=true with retryable=true means an interrupted process, not a completed logical round.',
+        'After nextRetryAt, recover the SAME binding with retryUnavailable=true and the ORIGINAL primaryEvidence, native response and marker.',
+        'Never create another native advisor. Assess changed input scope; inputUpdateIsRecoveryOnly=true is only for unchanged scope.',
         'Never invent a missing native answer or substitute a different model. Use the evidence actually obtained.',
         'The broker may perform bounded transport recovery. Authentication or persistent',
         'configuration failures make that advisor unavailable; they do not require task goal blocked.',
@@ -3999,11 +4015,16 @@ export function buildCodexWorkerPrompt(
       'regressions. Minor findings, advisor',
       'unavailability, and infrastructure failures do not trigger round 2. Never call round 3 or',
       'the legacy design phase. A completed logical round is attempt-wide and is not rerun when',
-      'Slack input is added or the Codex turn is steered. An interrupted round with attemptsFinished=true',
-      'has ended its process attempts. Preserve obtained answers and continue under the applicable best-effort policy.',
+      'Slack input is added or the Codex turn is steered. A host-interrupted process is not a completed logical round.',
+      'When recoveredAfterInterruption=true and retryable=true, assess whether the original review scope still applies.',
+      'After nextRetryAt, resume that SAME binding with retryUnavailable=true, identical primaryEvidence and the obtained native answer.',
+      'Set inputUpdateIsRecoveryOnly=true only if newer input does not change the reviewed scope. Never spawn another native advisor.',
+      'Preserve returned external answers; the broker retries only missing slots with a durable recovery limit.',
+      'If scope changed, report the interrupted old review separately; never present old advice as approval of the new requirement.',
       'For investigation, spawn exactly one solution_analyst with model=gpt-6-astra,',
       'reasoning_effort=medium, and fork_turns=none. For each review round, spawn exactly one fresh',
       'risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none. Do not',
+      'apply fresh native creation or current-input markers to interruption recovery; reuse the original marked answer. Do not',
       'substitute a different model and do not add another native slot.',
       `That native advisor response must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|review>:<1|2>:<solution|risk>] after replacing phase, round, and perspective.`,
       'For an unavailable native slot, send adopted=false, an exact started boolean, and a concise',
@@ -4011,7 +4032,8 @@ export function buildCodexWorkerPrompt(
       'Earlier required-response instructions in resumed history are obsolete; preserve useful prior answers without inheriting an availability-only block.',
       'Use acquired answers and your own analysis even when zero advisors return an answer.',
       'Report missing advisors and causes to Slack and preserve successful answers. Do not call',
-      'retryUnavailable=true automatically or poll a terminal result repeatedly just to fill missing slots.',
+      'retryUnavailable=true automatically except for the explicit retryable host-interruption recovery above.',
+      'Do not poll a terminal result repeatedly just to fill missing slots. On exhausted recovery report interruption, not authentication failure.',
       'Authentication or configuration failures are advisor unavailability, not a reason to block the primary task.',
       'A terminal complete=false reports missing or unavailable review evidence; assess its reason and continue the primary work. Actual safety failures and unmet task requirements still prevent completion.',
       'Preserve completed work and answers. Changed requirements still need your assessment; old advice',

@@ -108,7 +108,8 @@ import {
   validThreeAdvisorReviewBinding,
   type AdvisorPhase,
 } from './advisor-journal.ts'
-import { persistAdvisorClaudeCleanupOutcome, retireAdvisorClaudeCleanupOutcome } from './advisor-round-recovery.ts'
+import { persistAdvisorClaudeCleanupOutcome, retireAdvisorClaudeCleanupOutcome,
+  readInterruptedAdvisorSlots, savedAdvisorSlotJournal } from './advisor-round-recovery.ts'
 import { recoverAdvisorSlot } from './advisor-retry.ts'
 import {
   saveClaudeResponseDiagnostic,
@@ -2446,6 +2447,14 @@ async function main(): Promise<void> {
       })
     } catch { return null }
   }
+  // Slot writes survive a main-process interruption independently. Never drop
+  // an acquired answer merely because its peer was still working.
+  const interruptedSlots = (input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
+    phase: 'investigation' | 'design' | 'review', round: 1 | 2 | 3, evidenceDigest: unknown) =>
+    readInterruptedAdvisorSlots(roundJournalPath(input, phase, round), {
+      contextDigest, phase, round, inputRevision: input.revision, inputDigest: input.digest,
+      primaryEvidenceDigest: evidenceDigest,
+    })
   const recoveredRoundResult = (
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
     phase: 'investigation' | 'design' | 'review',
@@ -2486,7 +2495,8 @@ async function main(): Promise<void> {
     const recoveredGrokPerspectives = journal.version === THREE_ADVISOR_JOURNAL_VERSION
       ? [advisorPerspectiveForPhase(phase)]
       : ['solution', 'risk'] as const
-    const recoveredGrok = recoveredGrokPerspectives.map(perspective => {
+    const savedSlots = interruptedSlots(input, phase, round, journal.primaryEvidenceDigest)
+    const recoveredGrok = savedSlots.grok ?? recoveredGrokPerspectives.map(perspective => {
       const recorded = journalGrok.find(value => value.perspective === perspective) ?? {}
       const executionState = advisorExecutionState(recorded, 'grok')
       return {
@@ -2509,7 +2519,7 @@ async function main(): Promise<void> {
       && !Array.isArray(journal.claude)
       ? journal.claude as Record<string, unknown>
       : {}
-    const recoveredClaude = {
+    const recoveredClaude = savedSlots.claude ?? {
       attempted: true,
       adopted: false,
       required: true,
@@ -2530,25 +2540,40 @@ async function main(): Promise<void> {
     const recoveredNative = Array.isArray(journal.native)
       ? journal.native as Array<Record<string, unknown>>
       : []
+    const allAdopted = allAdvisorAttemptsAdopted(recoveredNative, recoveredGrok, recoveredClaude)
+    const retryable = !allAdopted && Number(journal.retryCount ?? 0) < 3
+      && recordedClaude.containmentVerified === true
+    const latestInput = readAdvisorInputSnapshot(stateDir, context.jobId)
+    const inputUnchanged = latestInput.revision === input.revision && latestInput.digest === input.digest
     return toolText({
-      complete: false,
-      waitingForAdvisors: false,
+      complete: allAdopted && inputUnchanged,
+      restoredSavedResponses: allAdopted,
+      waitingForAdvisors: retryable,
       recoveredAfterInterruption: true,
-      attemptsFinished: true,
+      attemptsFinished: !retryable,
+      interrupted: true,
+      retryable,
+      retryBudgetExhausted: Number(journal.retryCount ?? 0) >= 3,
       nextRetryAt: Number(journal.finishedAt) + 30_000,
-      nextAction: '中断前の試行は終了しました。取得済み回答と中断記録を保持し、適用されるAGENTS.mdに従って本作業を継続してください。',
+      nextAction: allAdopted
+        ? '保存済みの全回答を回収しました。新しい指示がある場合は元のreview scopeへの回答として適用範囲を判断し、advisorを再起動しないでください。'
+        : retryable
+        ? '中断した同じroundを復旧してください。最新指示と元のreview scopeを照合し、同じscopeならnextRetryAt以降に同じbinding・primaryEvidence・native回答でadvisor_round(retryUnavailable=true)を呼んでください。新入力がscopeを変えない場合だけinputUpdateIsRecoveryOnly=trueを指定します。取得済み枠は再起動しません。'
+        : '中断からの限定復旧を終了しました。取得済み回答を保持し、中断による未回収を明示してください。',
       inputRevision: input.revision,
       inputDigest: input.digest,
-      inputUnchanged: true,
-      currentInputRevision: input.revision,
-      currentInputDigest: input.digest,
+      inputUnchanged,
+      scopeAssessmentRequired: !inputUnchanged,
+      currentInputRevision: latestInput.revision,
+      currentInputDigest: latestInput.digest,
       phase,
       round,
       durationMs: Number(journal.finishedAt) - Number(journal.startedAt),
       ...(journal.repositoryObservation === 'not-required-in-unified-workflow'
         ? {}
         : { repositoryUnchanged: true }),
-      allAdopted: false,
+      allAdopted,
+      native: recoveredNative,
       slotSummary: summarizeAdvisorSlots(
         recoveredNative,
         recoveredGrok,
@@ -2617,12 +2642,16 @@ async function main(): Promise<void> {
       native: Array<Record<string, unknown>>, evidenceDigest: string,
       responseCacheDigest?: string,
       retryCount?: number,
+      interruptionRecovery?: boolean,
       recoveryInputRevision?: number,
       recoveryInputDigest?: string,
     } | undefined
     let retryBackoff = false
     if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
-      const saved = savedRoundResult({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3)
+      const binding = { revision: inputRevision, digest: inputDigest }
+      const interrupted = recoveredRoundResult(binding, phase, round as 1 | 2 | 3, true)
+      const saved = resultPayload(interrupted ?? toolText({}))?.allAdopted === true
+        ? interrupted : savedRoundResult(binding, phase, round as 1 | 2 | 3)
       if (saved && resultPayload(saved)?.allAdopted === true) {
         // Poll applies the ordinary ledger/receipt checks. Never re-run an
         // already acquired advisor just to redeliver its saved answer.
@@ -2641,16 +2670,21 @@ async function main(): Promise<void> {
         try {
           const saved = JSON.parse(raw)
           const durable = JSON.parse(readOptionalPrivateFile(retryPath.slice(0, -10)) ?? '{}')
+          // Retirement is newer than this completed cache. Its backoff and
+          // independently saved slots are authoritative in the recovery path.
+          if (durable.recoveredAfterInterruption !== true) {
           const missing = [...(saved.native ?? []), ...(saved.grok ?? []), saved.claude ?? {}]
             .filter(slot => slot.adopted !== true)
           const manualRecovery = missing.some(slot => ['authentication', 'workspace'].includes(
             String(slot.failure?.cause ?? classifyAdvisorFailure('claude', String(slot.reason ?? '')).cause)))
           const recoveryInput = inputUpdateIsRecoveryOnly === true
             && input.revision > Math.max(inputRevision, Number(saved.recoveryInputRevision ?? 0))
-          if (durable.recoveredAfterInterruption !== true
-            && (manualRecovery || Number(saved.retryCount ?? 0) >= 3) && !recoveryInput) {
+          const retryCount = Math.max(Number(durable.retryCount ?? 0), Number(saved.retryCount ?? 0))
+          if ((retryCount >= 3
+            && (durable.interruptionRecovery === true || !recoveryInput))
+            || (durable.recoveredAfterInterruption !== true && manualRecovery && !recoveryInput)) {
             return toolText({ complete: false, waitingForAdvisors: true, retryable: false,
-              humanActionRequired: manualRecovery, retryBudgetExhausted: Number(saved.retryCount ?? 0) >= 3,
+              humanActionRequired: manualRecovery, retryBudgetExhausted: retryCount >= 3,
               reason: manualRecovery ? '認証または作業設定の復旧が必要です。原因を通知し、復旧後の入力で不足枠だけ再開してください。'
                 : '一時障害の再試行後も回答が不足しています。原因を通知して待機し、復旧後に同じroundを再開してください。',
             }, true)
@@ -2665,11 +2699,14 @@ async function main(): Promise<void> {
             && saved.claude?.containmentVerified === true
             && durable.claude?.containmentVerified === true
             && saved.grok?.every((slot: Record<string, unknown>) => slot.containmentVerified === true)) {
-            retryResult = { ...saved, retryCount: recoveryInput ? 0 : Number(saved.retryCount ?? 0) + 1,
+            retryResult = { ...saved, interruptionRecovery: durable.interruptionRecovery === true,
+              retryCount: recoveryInput && durable.interruptionRecovery !== true
+              ? 0 : retryCount + 1,
               ...(recoveryInput ? { recoveryInputRevision: input.revision, recoveryInputDigest: input.digest } : {}),
               claude: { ...saved.claude,
               cleanupReceiptDigest: durable.claude.cleanupReceiptDigest,
             }, responseCacheDigest: durable.responseCacheDigest }
+          }
           }
         } catch {}
       }
@@ -2678,6 +2715,11 @@ async function main(): Promise<void> {
         const journal = readTerminalJournal({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3, 'required-reviewer-failed')
           ?? (inputUpdateIsRecoveryOnly === true
             ? readTerminalJournal({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3, 'stale-input') : null)
+        if (recovered && Number(journal?.retryCount ?? 0) >= 3) {
+          return toolText({ complete: false, interrupted: true, retryable: false,
+            attemptsFinished: true, retryBudgetExhausted: true,
+            reason: 'Interrupted review recovery budget exhausted; preserve obtained answers and report the interruption.' }, true)
+        }
         const claude = journal?.claude as Record<string, unknown> | undefined
         if (recovered && journal && claude?.containmentVerified === true) {
           retryBackoff = Date.now() - Number(journal.finishedAt) < 30_000
@@ -2686,6 +2728,7 @@ async function main(): Promise<void> {
           && Date.now() - Number(journal.finishedAt) >= 30_000) {
           retryResult ??= { native: journal.native as Array<Record<string, unknown>>,
             grok: [], claude, evidenceDigest: String(journal.primaryEvidenceDigest),
+            interruptionRecovery: true,
             retryCount: Number(journal.retryCount ?? 0) + 1,
             recoveryInputRevision: Number(journal.recoveryInputRevision ?? 0),
             recoveryInputDigest: String(journal.recoveryInputDigest ?? ''),
@@ -2693,27 +2736,13 @@ async function main(): Promise<void> {
           if (inputUpdateIsRecoveryOnly === true
             && input.revision > Math.max(inputRevision,
               Number(retryResult.recoveryInputRevision ?? 0), Number(journal.recoveryInputRevision ?? 0))) {
-            retryResult.retryCount = 0
             retryResult.recoveryInputRevision = input.revision
             retryResult.recoveryInputDigest = input.digest
           }
           // Each external answer is persisted immediately, independently of
           // its peer. Reuse it after the old generation has been retired.
-          const slotsRaw = readOptionalPrivateFile(`${roundJournalPath({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3)}.slots`)
-          if (slotsRaw && Buffer.byteLength(slotsRaw) <= 2 * 1024 * 1024) {
-            try {
-              const slots = JSON.parse(slotsRaw)
-              if (slots.contextDigest === contextDigest && slots.phase === phase && slots.round === round
-                && slots.inputRevision === inputRevision && slots.inputDigest === inputDigest
-                && slots.evidenceDigest === retryResult.evidenceDigest) {
-                if (Array.isArray(slots.grok) && slots.grok.length === 1
-                  && slots.grok[0].adopted === true && slots.grok[0].containmentVerified === true
-                  && typeof slots.grok[0].response === 'string' && slots.grok[0].response.trim()) retryResult.grok = slots.grok
-                if (slots.claude?.adopted === true && slots.claude.containmentVerified === true
-                  && typeof slots.claude.response === 'string' && slots.claude.response.trim()) retryResult.claude = slots.claude
-              }
-            } catch {}
-          }
+          Object.assign(retryResult, interruptedSlots({ revision: inputRevision, digest: inputDigest },
+            phase, round as 1 | 2 | 3, retryResult.evidenceDigest))
         }
       }
       if (!retryResult) return toolText({ complete: false, waitingForAdvisors: true,
@@ -2806,6 +2835,9 @@ async function main(): Promise<void> {
           })
         }
         if (prior.terminal) {
+          const interrupted = recoveredRoundResult(prior.input, phase, round as 1 | 2 | 3, true)
+          if (interrupted) return toolText({ ...resultPayload(interrupted), reusedPriorPhase: true,
+            priorStatus: prior.status })
           return toolText({
             ...resultPayload(savedRoundResult(prior.input, phase, round as 1 | 2 | 3) ?? toolText({})),
             complete: prior.status !== 'stale-input' && journalSlotSummary(prior.terminal).responsesObtained === journalSlotSummary(prior.terminal).total,
@@ -3264,6 +3296,8 @@ async function main(): Promise<void> {
     const journalPath = join(currentJournalRoot, `${phase}-${round}.json`)
     const startedAt = Date.now()
     const requestedJournal = {
+      retryCount: retryResult?.retryCount ?? 0,
+      interruptionRecovery: retryResult?.interruptionRecovery === true,
       version: THREE_ADVISOR_JOURNAL_VERSION,
       advisorPolicy: THREE_ADVISOR_POLICY,
       status: 'requested',
@@ -3479,6 +3513,7 @@ async function main(): Promise<void> {
     const responseCache = JSON.stringify({
       contextDigest, phase, round, complete, finishedAt, retryRepositoryDigest, evidenceDigest,
       retryCount: retryResult?.retryCount ?? 0,
+      interruptionRecovery: retryResult?.interruptionRecovery === true,
       recoveryInputRevision: retryResult?.recoveryInputRevision,
       recoveryInputDigest: retryResult?.recoveryInputDigest,
       inputRevision: boundInput.revision, inputDigest: boundInput.digest,
@@ -3486,6 +3521,8 @@ async function main(): Promise<void> {
     })
     atomicWritePrivateFile(`${journalPath}.responses`, responseCache)
     atomicWritePrivateFile(journalPath, `${JSON.stringify({
+      retryCount: retryResult?.retryCount ?? 0,
+      interruptionRecovery: retryResult?.interruptionRecovery === true,
       version: THREE_ADVISOR_JOURNAL_VERSION,
       advisorPolicy: THREE_ADVISOR_POLICY,
       status: complete
@@ -3618,8 +3655,12 @@ async function main(): Promise<void> {
     }
     let task = roundTasks.get(taskKey)
     if (!task) {
-      const saved = savedRoundResult(binding, phase, boundRound)
-      if (saved) task = Promise.resolve(saved)
+      const saved = recoveredRoundResult(binding, phase, boundRound, true)
+        ?? savedRoundResult(binding, phase, boundRound)
+      if (saved) {
+        task = Promise.resolve(saved)
+        roundTasks.set(taskKey, task)
+      }
     }
     if (!task) {
       const completed = readCompletedJournal(binding, phase, boundRound)
@@ -3694,7 +3735,24 @@ async function main(): Promise<void> {
       if (!journal && payload.restoredSavedResponses === true && payload.allAdopted === true) {
         const previous = readTerminalJournal(binding, phase, boundRound, 'required-reviewer-failed')
         if (previous) {
-          journal = { ...previous, status: 'reviewers-completed' }
+          journal = { ...previous, status: 'reviewers-completed',
+            ...(payload.recoveredAfterInterruption === true ? {
+              grok: (payload.grok as Array<Record<string, unknown>>).map(savedAdvisorSlotJournal),
+              claude: savedAdvisorSlotJournal(payload.claude as Record<string, unknown>),
+            } : {}) }
+          if (payload.recoveredAfterInterruption === true) {
+            // Persist delivery before issuing the receipt: a second process
+            // restart must not strand answers behind a changed journal digest.
+            const cache = JSON.stringify({
+              contextDigest, phase, round, inputRevision, inputDigest,
+              evidenceDigest: previous.primaryEvidenceDigest,
+              native: payload.native, grok: payload.grok, claude: payload.claude,
+              finishedAt: previous.finishedAt, retryCount: previous.retryCount ?? 0,
+              interruptionRecovery: true,
+            })
+            atomicWritePrivateFile(`${journalPath}.responses`, cache)
+            journal.responseCacheDigest = createHash('sha256').update(cache).digest('hex')
+          }
           atomicWritePrivateFile(journalPath, `${JSON.stringify(journal)}\n`)
         }
       }
