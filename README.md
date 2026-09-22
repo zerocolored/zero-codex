@@ -609,6 +609,12 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - `zerokun/access.ts`: pairing・受信権限・書込み権限の管理 CLI
 - `codex-channel.sh`: standalone gateway と runner の launcher
 - `zerokun/update.ts`: `main` ブランチ用の安全な自己更新
+- `zerokun/supervisor-watch.ts`: runnerから5秒ごとにexecutorの世代と子processを照合します。
+  direct childと追跡中の子孫が全て終了し、出力も進まない状態が30秒続いてもsupervisorが残る場合は、
+  内部cleanup faultとして既存のbounded回収・runner再起動時の復旧へ渡します。
+  無出力だけでは終了と判断せず、liveな子や生死不明の世代がある間は自動停止しません。
+  異常回収した結果を成功として公開することもありません。receiptにdirect childの世代と
+  supervisionStageを残し、終了確認・drain・retainedのどこで止まったかを診断できます。
 - `zerokun/watchdog.sh`: bridge/runner の状態監視
 
 ## 開発時の検証
