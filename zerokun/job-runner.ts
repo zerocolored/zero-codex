@@ -13471,6 +13471,9 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  if (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE) {
+    return FORCED_SERVICE_STOP_FAILURE_MESSAGE
+  }
   if (error.startsWith('Codex network recovery exhausted after ')) {
     return '通信障害が続いており、自動再試行3回でも復旧しませんでした。作業内容は保持しています。接続回復後、このスレッドで再開できます。'
   }
@@ -17029,7 +17032,9 @@ export class SlackNotifier implements JobNotifier {
         job,
         cancelled
           ? '🛑 中止しました。すでに完了した変更は自動では戻していません。'
-          : '🙇 うまく完了できませんでした。'
+          : (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE
+              ? '🛑 停止操作により中断しました。'
+              : '🙇 うまく完了できませんでした。')
             + `\n原因: ${publicJobFailureSummary(error)}`
             + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
         notificationId,
