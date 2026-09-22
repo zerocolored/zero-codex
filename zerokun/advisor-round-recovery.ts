@@ -30,6 +30,8 @@ import {
   validThreeAdvisorPhaseRound,
   validThreeAdvisorReviewBinding,
   validThreeAdvisorRoundTwoBasis,
+  validThreeAdvisorGrokAttempts,
+  validTerminalClaudeAttempt,
   type AdvisorPhase,
 } from './advisor-journal.ts'
 
@@ -38,6 +40,32 @@ const SHA256 = /^[0-9a-f]{64}$/
 const NONCE = /^[0-9a-f]{32}$/
 const REVISION = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/
 const ROUND = /^(investigation|design|review)-([123])\.json$/
+
+/** Per-slot answers survive retirement independently of the final response cache. */
+export function readInterruptedAdvisorSlots(journalPath: string, journal: Record<string, unknown>) {
+  const result: { grok?: Array<Record<string, unknown>>, claude?: Record<string, unknown> } = {}
+  try {
+    const raw = readOptionalBoundedOwnerOnlyRegularFile(`${journalPath}.slots`, 2 * 1024 * 1024)
+    if (!raw) return result
+    const slots = JSON.parse(raw)
+    if (slots.contextDigest !== journal.contextDigest || slots.phase !== journal.phase
+      || slots.round !== journal.round || slots.inputRevision !== journal.inputRevision
+      || slots.inputDigest !== journal.inputDigest || slots.evidenceDigest !== journal.primaryEvidenceDigest) return result
+    const valid = (slot: any) => slot?.adopted === true && slot.containmentVerified === true
+      && typeof slot.response === 'string' && slot.response.trim().length > 0
+    if (Array.isArray(slots.grok) && slots.grok.length === 1 && valid(slots.grok[0])
+      && validThreeAdvisorGrokAttempts(slots.grok.map(savedAdvisorSlotJournal), journal.phase as AdvisorPhase)) {
+      result.grok = slots.grok
+    }
+    if (valid(slots.claude) && validTerminalClaudeAttempt(savedAdvisorSlotJournal(slots.claude))) result.claude = slots.claude
+  } catch { /* Optional cache failure is not evidence of an acquired answer. */ }
+  return result
+}
+
+export function savedAdvisorSlotJournal(slot: Record<string, unknown>): Record<string, unknown> {
+  const { response, reason: _reason, reasonDigest: _reasonDigest, failure: _failure, ...metadata } = slot
+  return { ...metadata, responseDigest: createHash('sha256').update(String(response)).digest('hex') }
+}
 
 type FileSnapshot = {
   dev: number
@@ -678,7 +706,8 @@ export function finalizeRetiredAdvisorRounds(
           if (hasUnverifiedClaudeResidual && !options.allowUnverifiedClaudeResidual) {
             throw new Error('retired advisor Claude workspace cleanup is still pending')
           }
-          const claude = recoveredClaudeJournal(
+          const saved = readInterruptedAdvisorSlots(journalPath, journal)
+          const claude = saved.claude ? savedAdvisorSlotJournal(saved.claude) : recoveredClaudeJournal(
             cleanupOutcome,
             hasUnverifiedClaudeResidual
               ? {
@@ -697,6 +726,8 @@ export function finalizeRetiredAdvisorRounds(
             ? [advisorPerspectiveForPhase(journal.phase as AdvisorPhase)]
             : ['solution', 'risk'] as const
           const grok = grokPerspectives.map(perspective => {
+            const acquired = saved.grok?.find(slot => slot.perspective === perspective)
+            if (acquired) return savedAdvisorSlotJournal(acquired)
             const retained = Array.isArray(journal.grok) ? journal.grok.find(value =>
               value?.perspective === perspective && value.adopted === true
               && value.containmentVerified === true && typeof value.responseDigest === 'string'

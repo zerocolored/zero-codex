@@ -37,3 +37,10 @@ test('cloud workspace snapshot failure is a startup issue, not auth or unknown',
   expect(failure.cause).toBe('workspace')
   expect(advisorFailureMessage(failure)).toContain('作業フォルダの設定を認識できず')
 })
+
+test('ホストによる中断は認証切れや不明な取得失敗と区別する', () => {
+  const message = advisorFailureMessage({ advisor: 'grok', cause: 'interrupted' })
+  expect(message).toContain('実行の中断・切替によりレビューが中断')
+  expect(message).not.toContain('ログイン')
+  expect(message).not.toContain('原因の詳細は実行ログ')
+})

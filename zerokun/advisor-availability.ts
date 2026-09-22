@@ -1,7 +1,7 @@
 /** Stable user-facing classifications; raw CLI output never goes to Slack. */
 export type AdvisorFailure = {
   advisor: 'codex' | 'grok' | 'claude'
-  cause: 'authentication' | 'rate-limit' | 'timeout' | 'startup' | 'workspace' | 'response' | 'validation' | 'unknown'
+  cause: 'authentication' | 'rate-limit' | 'timeout' | 'startup' | 'workspace' | 'response' | 'validation' | 'interrupted' | 'unknown'
 }
 
 export function classifyAdvisorFailure(advisor: AdvisorFailure['advisor'], reason: string): AdvisorFailure {
@@ -19,7 +19,7 @@ export function classifyAdvisorFailure(advisor: AdvisorFailure['advisor'], reaso
 /** Only these fixed, non-secret diagnostics are public, never raw CLI text. */
 export const PUBLIC_ADVISOR_FAILURE_MESSAGES = new Set(
   (['codex', 'grok', 'claude'] as const).flatMap(advisor =>
-    (['authentication', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'unknown'] as const)
+    (['authentication', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'interrupted', 'unknown'] as const)
       .map(cause => advisorFailureMessage({ advisor, cause }))),
 )
 
@@ -33,6 +33,7 @@ export function advisorFailureMessage(failure: AdvisorFailure): string {
     workspace: '作業フォルダの設定を認識できず、起動前に終了しました。',
     response: '完全な回答を取得できませんでした。',
     validation: '回答は届きましたが、取得後の確認を完了できませんでした。',
+    interrupted: '実行の中断・切替によりレビューが中断され、回答の回収が完了していません。',
     unknown: '回答を取得できませんでした。原因の詳細は実行ログに保存しています。',
   }[failure.cause]
   return `${name}: ${detail}`
