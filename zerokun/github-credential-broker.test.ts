@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'fs'
@@ -85,6 +86,7 @@ function fixture(withRemote = true) {
   return {
     repo,
     state,
+    contextPath,
     context: parseGitHubBrokerContext(contextPath, state),
     commitSha: git(repo, ['rev-parse', 'HEAD']),
   }
@@ -138,6 +140,65 @@ function responseJson(response: Awaited<ReturnType<Client['callTool']>>): Record
 }
 
 describe('GitHub credential broker', () => {
+  test('real stdio entrypoint starts for a read-only job and still denies write operations', async () => {
+    const value = fixture()
+    writeFileSync(value.contextPath, JSON.stringify({ ...value.context, writeEnabled: false }), { mode: 0o600 })
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--config=/dev/null', '--no-env-file', join(import.meta.dir, 'github-credential-broker.ts'), value.contextPath, value.state],
+      stderr: 'pipe',
+    })
+    const client = new Client({ name: 'read-only-entrypoint-test', version: '1' })
+    try {
+      await bounded('read-only broker startup', client.connect(transport))
+      const tools = await client.listTools()
+      expect(tools.tools.some(tool => tool.name === 'github_read_issue')).toBe(true)
+      const read = await callBrokerTool(client, { name: 'github_read_issue', arguments: {
+        repository: 'outside/project', issueNumber: 223,
+      } })
+      expect(responseJson(read)).toMatchObject({ complete: false, reason: 'GitHub repository is outside this job' })
+      const write = await callBrokerTool(client, { name: 'github_fetch_branch', arguments: {
+        repository: 'example/broker-fixture', branch: 'develop',
+      } })
+      expect(responseJson(write)).toMatchObject({ complete: false, reason: 'GitHub fetch requires write access' })
+    } finally { await bounded('stdio cleanup', client.close()) }
+  })
+
+  test('issue reading is available read-only but rejects foreign repositories and origin drift before authentication', async () => {
+    const value = fixture()
+    let calls = 0
+    const commands: GitHubPublicationCommands = {
+      async runGit() { throw new Error('unexpected Git mutation') },
+      async runGh() {
+        calls += 1
+        return result(0, JSON.stringify({ data: { repository: {
+          nameWithOwner: 'example/broker-fixture',
+          issue: { number: 223, title: 'Release', body: 'Body\nLatest requirements',
+            url: 'https://github.com/example/broker-fixture/issues/223', state: 'OPEN',
+            createdAt: '2026-09-23T00:00:00Z', updatedAt: '2026-09-23T00:00:00Z',
+            comments: { totalCount: 0, nodes: [], pageInfo: {
+              hasPreviousPage: false, hasNextPage: false, startCursor: null,
+            } },
+          },
+        } } }))
+      },
+    }
+    await connectedBroker({ ...value.context, writeEnabled: false }, commands, async client => {
+      const read = () => callBrokerTool(client, { name: 'github_read_issue', arguments: {
+        repository: 'example/broker-fixture', issueNumber: 223,
+      } })
+      expect(responseJson(await read())).toMatchObject({ complete: true, allCommentsIncluded: true })
+      expect(calls).toBe(1)
+      const foreign = await callBrokerTool(client, { name: 'github_read_issue', arguments: {
+        repository: 'other/private', issueNumber: 223,
+      } })
+      expect(foreign.isError).toBe(true)
+      git(value.repo, ['remote', 'set-url', 'origin', 'https://github.com/other/private.git'])
+      expect((await read()).isError).toBe(true)
+      expect(calls).toBe(1)
+    })
+  })
+
   test('fetch imports latest commit through transport while preserving HEAD and dirty files', async () => {
     const value = fixture()
     const remote = join(value.repo, '..', 'remote')
@@ -223,6 +284,7 @@ describe('GitHub credential broker', () => {
         'github_inspect',
         'github_publish_branch',
         'github_pull_request',
+        'github_read_issue',
         'github_wait_delivery',
       ])
       expect(invoked).toBe(false)

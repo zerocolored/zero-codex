@@ -90,6 +90,9 @@ export function normalizeImplementationGuardText(value: string): string {
 export function containsCredentialMaterial(value: string): boolean {
   const normalized = normalizePublicGuardText(value)
   if (directCredentialMatch(normalized)) return true
+  // Issue bodies can be long Markdown/JSON strings. Avoid the percent-token
+  // search (with its unbounded prefix) when no encoded token can be present.
+  if (!normalized.includes('%')) return false
   return [...normalized.matchAll(new RegExp(PERCENT_ENCODED_TOKEN.source, 'gi'))]
     .some(match => {
       const inspection = decodePercentLayers(match[0])
