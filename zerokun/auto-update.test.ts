@@ -143,7 +143,7 @@ test('automatic request survives worker restart and sends outcome without rerunn
     notify: async (request: any, text: string) => { expect(request.source).toBe('automatic'); expect(request.threadTs).toBe(''); messages.push(text) },
   }
   expect((await runUpdateWorker(result.request.id, options)).success).toBe(true)
-  expect(messages[0]).toContain('自動更新が完了')
+  expect(messages).toEqual(['最新版の自動アップデートが完了しました'])
   expect(runs).toBe(1)
   await runUpdateWorker(result.request.id, options)
   expect(runs).toBe(1)
