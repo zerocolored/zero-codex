@@ -130,7 +130,7 @@ managed/MDMを含む実効permission検査には`app-server config/read`と`conf
 同じSlackスレッドの途中入力は現在turnへ安全に割り込み、単なる質問か作業更新かの意味判断もCodexへ
 委ねます。Zeroちゃんは配送順序、重複防止、取消、process回収だけを管理します。
 
-Primary Codexはrelease codeで`gpt-6-astra`、reasoning effortは`low`へ固定しています。
+Primary Codexはrelease codeで`gpt-6-astra`、reasoning effortは`medium`へ固定しています。
 App Server起動、thread開始／再開、各turnで同じ値を明示し、handshakeの実効値も照合します。
 利用者の`~/.codex/config.toml`、shell環境、state内`.env`では変更されないため、別Macでも同じ設定です。
 Advisorのmodel選択はこのprimary設定とは別に`AGENTS.md`の契約へ従います。
@@ -145,8 +145,8 @@ Advisorのmodel選択はこのprimary設定とは別に`AGENTS.md`の契約へ�
 - このMacでsubscription login済みのGrok CLIとClaude Code（Zeroちゃん稼働中にAPI key認証は行いません）
 
 advisorはprojectの`AGENTS.md`が利用を求める場合にprimary Codexが呼び出します。初期設計は
-`gpt-6-astra` / reasoning `medium`のsolution analyst 1枠、最終reviewは
-`gpt-6-astra` / reasoning `low`のrisk reviewer 1枠を通常のsub-agentとして起動し、各roundで
+`gpt-6-astra` / reasoning `high`のsolution analyst 1枠、最終reviewは
+`gpt-6-astra` / reasoning `medium`のrisk reviewer 1枠を通常のsub-agentとして起動し、各roundで
 Grok 1枠とfresh Claude Fable 5.1 1枠を`zerokun_advisors`経由で起動します。
 最終review第1回の必須指摘をprimary Codexが実際に採用し、task所有の修正差分を作った場合だけ、同じ3枠を
 freshにした第2回でその差分と直接の回帰だけを確認します。軽微な指摘、advisorの欠員、空の修正差分では
@@ -568,7 +568,7 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   current projectのcanonical `github.com` repositoryだけを操作します。作業判断はCodexが行います。
 - App Serverは認証済み`CODEX_HOME`を使うためuser configも読みます。そのため起動直前の
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、
-  primary model=`gpt-6-astra`、reasoning effort=`low`をrelease側から上書きして実効値を照合し、
+  primary model=`gpt-6-astra`、reasoning effort=`medium`をrelease側から上書きして実効値を照合し、
   endpoint/provider差替え、legacy sandbox、named permissionの変更を拒否します。安全規則は
   `developerInstructions`、未信頼のSlack本文はJSON-RPC inputへ分離し、子環境はallowlistです。
 - Codexが返す`instructionSources`を照合し、存在するglobal `AGENTS.md`とproject

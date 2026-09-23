@@ -159,7 +159,7 @@ codex <trust-args> -C <repo> \
   -c default_permissions="zerokun_job" \
   -c project_doc_max_bytes=262144 \
   -c model="gpt-6-astra" \
-  -c model_reasoning_effort="low" \
+  -c model_reasoning_effort="medium" \
   app-server --stdio
 ```
 
@@ -169,9 +169,12 @@ codex <trust-args> -C <repo> \
   session自体を明示的にretireしていなければ、同じSlack thread・同じ物理作業場所の次jobでそのsessionをresumeします。
   クラウド作業場所へ移る場合はsessionとcwdのローカル台帳を照合し、不一致・旧台帳未登録なら
   保存済みスレッド履歴を渡して新規sessionを開始します。旧sessionや元の作業ファイルは削除しません。
-- primary modelは`gpt-6-astra`、reasoning effortは`low`をrelease codeからApp Server起動、
+- primary modelは`gpt-6-astra`、reasoning effortは`medium`をrelease codeからApp Server起動、
   `thread/start`／`thread/resume`、全`turn/start`へ明示します。handshakeの実効値も照合し、
-  `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。advisor modelは`AGENTS.md`の別契約です。
+  `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。
+  設計advisorは`high`、レビューadvisorは`medium`です。release内のread-only／neverなrole TOMLを
+  App Serverの`agents.<role>.config_file`へ指定し、ホストに残った旧role設定より優先します。
+  モデルは両方`gpt-6-astra`のままで、通常のCodex用グローバル設定は変更しません。
 - 実行中の同thread返信は`turn/steer`で同じturnへ渡し、Codexが質問と作業更新を現在の文脈で判断します。
   完全一致の`中止`は`turn/interrupt`です。各controlはSQLite receiptをJSON writeより先に固定し、
   曖昧な送達を自動再送しません。
