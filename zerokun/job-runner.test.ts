@@ -12097,7 +12097,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('enabled_tools=["cloud_logging_read"]')
       expect(overrides).toContain('enabled_tools=["advisor_round","advisor_round_poll"]')
       expect(overrides).toContain('enabled_tools=["verify_local_page"]')
-      expect(overrides).toContain('enabled_tools=["github_inspect","github_fetch_branch","github_publish_branch","github_pull_request","github_wait_delivery"]')
+      expect(overrides).toContain('enabled_tools=["github_inspect","github_read_issue","github_fetch_branch","github_publish_branch","github_pull_request","github_wait_delivery"]')
       expect(overrides).toContain('tool_timeout_sec=1900')
       expect(overrides).toContain('tool_timeout_sec=180')
       expect(overrides).toContain('tool_timeout_sec=30')
@@ -12105,6 +12105,14 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('required=true')
       expect(overrides).not.toContain('.grok/auth.json')
       expect(overrides).not.toContain('HERDR_SOCKET_PATH')
+      const readGitHubOverrides = buildCodexPermissionOverrides({ ...job, writeEnabled: false }, {
+        stateDir: state, artifactDir: outbox, scratchDir: scratch,
+        githubMcp: { command: '/usr/bin/true', args: ['/runtime/github-credential-broker.ts', '/state/context.json'] },
+      }).join('\n')
+      expect(readGitHubOverrides).toContain('enabled_tools=["github_inspect","github_read_issue"]')
+      expect(readGitHubOverrides).not.toContain('github_publish_branch')
+      expect(readGitHubOverrides).not.toContain('github_fetch_branch')
+      expect(readGitHubOverrides).toContain('network.enabled=false')
       const preEditOverrides = buildCodexPermissionOverrides(job, {
         stateDir: state,
         artifactDir: outbox,
