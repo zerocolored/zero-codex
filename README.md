@@ -621,7 +621,7 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - `zerokun/codex-executor.ts`: Codex App Server実行、turn/control処理、sandbox分離
 - `zerokun/browser-verification-broker.ts`: localhost用の隔離Chrome描画・PNG検証
 - `zerokun/github-credential-broker.ts`: credentialを隠したrepository限定GitHub transport
-- `zerokun/cloud-logging-broker.ts`: ホストのgcloud認証・IAMを使う明示project指定の読取専用Cloud Logging検索
+- `zerokun/cloud-logging-broker.ts`: ホストのgcloud認証・IAMを使う読取専用Cloud Logging検索とCloud Run設定取得（`cloud-run-reader.ts`）
 - `zerokun/access.ts`: pairing・受信権限・書込み権限の管理 CLI
 - `codex-channel.sh`: standalone gateway と runner の launcher
 - `zerokun/update.ts`: `main` ブランチ用の安全な自己更新
