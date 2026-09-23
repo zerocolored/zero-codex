@@ -1,4 +1,6 @@
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
+import { installedGoChromeEntrypoint } from './installed-browser.ts'
+import { GO_CHROME_ENABLED_TOOLS, GO_CHROME_DISABLED_TOOLS } from './chrome-tools.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { CODEX_NETWORK_CONTINUATION, CODEX_NETWORK_RETRY_DELAYS_MS, isTransientCodexNetworkError } from './codex-network-retry.ts'
 import {
@@ -335,14 +337,6 @@ const LOGICAL_CLEANUP_EXIT_CODE = 86
 const SYSTEM_CODEX_CONFIGS = ['/etc/codex/config.toml', '/etc/codex/managed_config.toml']
 const DISABLED_STDIO_MCP_COMMAND = '/usr/bin/false'
 const DISABLED_HTTP_MCP_URL = 'http://127.0.0.1:9'
-const GO_CHROME_ENABLED_TOOLS = [
-  'click', 'coordinate_mode', 'coordinate_observe', 'form_input', 'get_page_text',
-  'key_press', 'key_type', 'mouse_click', 'mouse_drag', 'mouse_move', 'mouse_scroll',
-  'navigate', 'read_console', 'read_page', 'screenshot', 'tabs_close', 'tabs_create',
-  'tabs_list',
-] as const
-const GO_CHROME_DISABLED_TOOLS = ['cookies_get', 'fetch_as_page', 'javascript_exec'] as const
-
 function pathContains(root: string, candidate: string): boolean {
   const child = relative(root, candidate)
   return child === '' || (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child))
@@ -521,9 +515,9 @@ export function mcpIsolationOverridesForConfig(
   overrides: string[],
   projectRoot?: string,
   layers?: unknown,
+  browserRuntimeDirectory = import.meta.dir,
 ): string[] {
-  const rawServers = config.mcp_servers
-  if (rawServers === undefined || rawServers === null) return overrides
+  let rawServers = config.mcp_servers ?? {}
   if (typeof rawServers !== 'object' || Array.isArray(rawServers)) {
     throw new Error('Codex effective mcp_servers is invalid')
   }
@@ -544,6 +538,22 @@ export function mcpIsolationOverridesForConfig(
   const browserTransportEnabled = projectRoot !== undefined
     && overrideValue(overrides, 'features.browser_use') === true
     && overrideValue(overrides, 'features.browser_use_external') === true
+  // A desktop-only node_repl registration does not connect a standalone Slack
+  // job to Chrome. Use the already installed standard Go Chrome transport when
+  // no host definition exists; never override an explicit disabled/custom one.
+  if (browserTransportEnabled && !Object.hasOwn(rawServers, 'go-chrome-mcp')
+    && !expectedNames.has('go-chrome-mcp')) {
+    const entrypoint = installedGoChromeEntrypoint(browserRuntimeDirectory, projectRoot)
+    if (entrypoint) {
+      const server = { command: 'node', args: [entrypoint], enabled: true }
+      rawServers = { ...rawServers, 'go-chrome-mcp': server }
+      names.push('go-chrome-mcp')
+      layers = [...(Array.isArray(layers) ? layers : []), {
+        name: { type: 'zerochanInstalledBrowser' },
+        config: { mcp_servers: { 'go-chrome-mcp': server } },
+      }]
+    }
+  }
   const additions: string[] = []
   for (const name of names.sort()) {
     if (expectedNames.has(name)) continue
@@ -625,7 +635,7 @@ export function mcpIsolationOverridesForConfig(
             ? [] : [`tool_timeout_sec=${toolTimeout}`]),
         ]
         additions.push(
-          `${tomlString(name)}={enabled=true,command="node",args=[${tomlString(join(import.meta.dir, 'browser-mcp-proxy.mjs'))},${tomlString(physicalScript)}],enabled_tools=[${GO_CHROME_ENABLED_TOOLS.map(tomlString).join(',')}],disabled_tools=[${GO_CHROME_DISABLED_TOOLS.map(tomlString).join(',')}],default_tools_approval_mode="approve"${timing.length > 0 ? `,${timing.join(',')}` : ''}}`,
+          `${tomlString(name)}={enabled=true,command=${tomlString(realpathSync(process.execPath))},args=["--config=/dev/null","--no-env-file",${tomlString(join(import.meta.dir, 'chrome-session-broker.ts'))},${tomlString(physicalScript)}],enabled_tools=[${GO_CHROME_ENABLED_TOOLS.map(tomlString).join(',')}],disabled_tools=[${GO_CHROME_DISABLED_TOOLS.map(tomlString).join(',')}],default_tools_approval_mode="approve"${timing.length > 0 ? `,${timing.join(',')}` : ''}}`,
         )
         continue
       } catch {
@@ -4091,6 +4101,16 @@ export function buildCodexWorkerPrompt(
       'part of the request.',
     )
     if (host.browserEnabled) {
+      control.push(
+        'For the operator’s signed-in Chrome, use go-chrome-mcp when exposed. It is a separate',
+        'connection from the localhost verifier; desktop node_repl is not automatically available',
+        'inside Slack jobs. Begin with tabs_list and use explicit tabId values from its response.',
+        'The Chrome transport waits for its initial connection. Report the actual tool error if',
+        'it fails, not an unverified claim that the user must open or log into Chrome again.',
+        'Tabs are reserved per job. Use another tab if one is busy, and call release_tab when',
+        'finished to detach coordinate mode and leave the user’s tab open. Never read cookies,',
+        'session storage, password fields, or authentication callback URLs.',
+      )
       control.push(
         'Browser verification: use the Browser or Chrome capability that best matches the requested',
         'target. Public HTTPS environments are valid targets. For a localhost application or UI',

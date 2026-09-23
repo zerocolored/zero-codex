@@ -97,6 +97,15 @@ Slack bot
 - write許可されたWebタスクでは、primary Codexへ利用可能なBrowser／Chrome能力を渡し、localhostだけでなく
   依頼対象の公開HTTPS環境も実際に開いて確認できます。設定済みの`go-chrome-mcp`は起動時に取得した
   owner管理のtransportを固定し、cookie取得・任意JavaScript等を除いた画面操作だけを引き渡します。
+  host設定に`go-chrome-mcp`がない場合は、zero-codexと同じ親directoryに導入済みの
+  `go-chrome-mcp/mcp-broker.js`を検証して利用します。各Slack Appで同じ接続を利用でき、
+  明示的な`enabled=false`や独自transport設定は上書きしません。別の配置では通常のCodex
+  MCP設定へ登録してください。Chrome拡張本体の導入は必要です。ChatGPT内のChrome接続が
+  利用できても、そのdesktop接続がSlack jobへ自動的に渡るわけではありません。
+  最初の接続は読み取り専用のタブ照会で確認し、入力やクリックの失敗を自動再送しません。
+  操作には明示的な`tabId`が必要です。同じタブはjob間で予約し、Chrome操作も直列化します。
+  作業終了時は`release_tab`で予約を解除します。スクリーンショットは画像として受け取り、
+  browser toolからhostの任意pathへ保存することはできません。
   Chrome拡張との接続にはhost側の既存bridgeを使いますが、Codex shellのHOMEはjob scratchへ隔離したままです。
   それ以外の一般MCPは無効のままです。localhost用には
   `verify_local_page`も残し、署名済みGoogle Chromeをowner-onlyの一時profileで起動して、明示したorigin以外の

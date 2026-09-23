@@ -585,9 +585,9 @@ describe('Codex app-server config preflight', () => {
       value: Record<string, Record<string, unknown>>
     }
     expect(parsed.value['go-chrome-mcp']?.enabled).toBe(true)
-    expect(parsed.value['go-chrome-mcp']?.command).toBe('node')
+    expect(parsed.value['go-chrome-mcp']?.command).toBe(realpathSync(process.execPath))
     expect(parsed.value['go-chrome-mcp']?.args).toEqual([
-      join(import.meta.dir, 'browser-mcp-proxy.mjs'), realpathSync(entrypoint),
+      '--config=/dev/null', '--no-env-file', join(import.meta.dir, 'chrome-session-broker.ts'), realpathSync(entrypoint),
     ])
     expect(parsed.value['go-chrome-mcp']?.cwd).toBeUndefined()
     expect(parsed.value['go-chrome-mcp']?.env).toBeUndefined()
