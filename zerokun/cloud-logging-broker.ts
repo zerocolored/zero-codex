@@ -9,6 +9,7 @@ import { z } from 'zod'
 import { parseGitHubBrokerContext } from './github-credential-broker.ts'
 import { runBoundedHostCommand, type PublicationCommandResult } from './github-publication.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
+import { registerCloudRunTool } from './cloud-run-reader.ts'
 
 const PROJECT = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/
 const MAX_ROWS = 1000
@@ -224,6 +225,8 @@ async function main(): Promise<void> {
   let run: CloudLoggingRun | undefined
   const server = new McpServer({ name: 'zerochan-cloud-logging', version: '1.0.0' })
   registerCloudLoggingTool(server,
+    (args, signal) => (run ??= createHostCloudLoggingRun())(args, signal))
+  registerCloudRunTool(server,
     (args, signal) => (run ??= createHostCloudLoggingRun())(args, signal))
   await server.connect(new StdioServerTransport())
 }
