@@ -100,6 +100,7 @@ import {
 import {
   ZEROCHAN_PRIMARY_CODEX_MODEL,
   ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
+  zerochanAdvisorRoleOverrides,
 } from './codex-runtime-selection.ts'
 import {
   advisorPerspectiveForPhase,
@@ -3823,8 +3824,8 @@ export function buildCodexDeveloperInstructions(
         'regressions. Minor findings, missing advisor responses, or infrastructure failures never',
         'trigger round 2. Never call review round 3 or the legacy separate design phase.',
         'For the initial phase, attempt exactly one solution_analyst with model=gpt-6-astra,',
-        'reasoning_effort=medium, and fork_turns=none. For each final-review round, attempt exactly',
-        'one fresh risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none.',
+        'reasoning_effort=high, and fork_turns=none. For each final-review round, attempt exactly',
+        'one fresh risk_reviewer with model=gpt-6-astra, reasoning_effort=medium, and fork_turns=none.',
         'Fresh native creation and the current input marker apply only to a NEW logical round, never interruption recovery.',
         'Do not substitute another model or add a second',
         'native advisor. Wait for the started attempt, then pass its exact marked response and real',
@@ -4069,8 +4070,8 @@ export function buildCodexWorkerPrompt(
       'Preserve returned external answers; the broker retries only missing slots with a durable recovery limit.',
       'If scope changed, report the interrupted old review separately; never present old advice as approval of the new requirement.',
       'For investigation, spawn exactly one solution_analyst with model=gpt-6-astra,',
-      'reasoning_effort=medium, and fork_turns=none. For each review round, spawn exactly one fresh',
-      'risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none. Do not',
+      'reasoning_effort=high, and fork_turns=none. For each review round, spawn exactly one fresh',
+      'risk_reviewer with model=gpt-6-astra, reasoning_effort=medium, and fork_turns=none. Do not',
       'apply fresh native creation or current-input markers to interruption recovery; reuse the original marked answer. Do not',
       'substitute a different model and do not add another native slot.',
       nativeAdvisorStartupRecoveryInstructions(),
@@ -5474,6 +5475,7 @@ export function buildCodexPermissionOverrides(
     'notify=[]',
     `model=${tomlString(model)}`,
     `model_reasoning_effort=${tomlString(reasoningEffort)}`,
+    ...(multiAgentEnabled ? zerochanAdvisorRoleOverrides() : []),
     'model_provider="openai"',
     'model_providers={}',
     'shell_environment_policy.inherit="core"',
