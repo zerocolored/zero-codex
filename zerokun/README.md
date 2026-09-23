@@ -403,7 +403,7 @@ new/resume引数parserもmodelを呼ばずに検証します。自己更新の�
 sandbox-safe contract test・型検査・build・shell検査を実行します。macOSで入れ子にできない
 実sandbox・tmux・process制御testは通常の`verify.sh`と公開CIだけで全件実行します。
 
-## Cloud Logging のホスト認証
+## Cloud Logging・Cloud Run のホスト認証
 
 ジョブのHOMEは分離したままです。認証付きログ検索には
 `zerokun_cloud_logging.cloud_logging_read`を使います。依頼やrepositoryの情報から対象projectを特定し、
@@ -422,3 +422,13 @@ Zeroちゃん独自のrepository別許可リストは設けません。`cloud-ac
 追加しません。HTTPのlatency・status、resource情報、既知の所要時間/件数とmessageを返し、
 httpRequestのURL・IPや任意のpayload・labelは選択しません。message内の情報には上記の
 伏せ字処理の限界があります。ログ取得成功と、アプリ性能目標の達成は別途検証します。
+
+Cloud Runの設定確認には同じtransportの`cloud_run_describe`を使い、project・region・serviceを
+明示します。既定ではservice templateとtraffic配分を返します。templateが本番trafficを受けているとは
+限らないため、稼働設定の判断前に`revision`も指定して実際の配信revisionを確認します。
+timeout・concurrency・CPU/memory・scalingと環境変数名を返し、secret参照名と値、未知の環境変数値は
+伏せます。レビュー済みの検索feature switchだけboolean値を公開します。省略は未指定、伏せ字は不明を
+意味し、無効化や値0を意味しません。任意のenv値、service account、URL、command/argsは返しません。
+Consoleのログイン主体とホスト認証は異なる場合があります。ブラウザで権限拒否が出ても、このツールを
+試す前にCloud Run全体のアクセス不能とは判断しません。ツールでも拒否された場合だけ、対象resourceの
+ホストIAM拒否として扱います。権限付与、設定変更、再ログインを自動で行う機能ではありません。
