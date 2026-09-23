@@ -1,6 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
-import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'fs'
+import { lstatSync, realpathSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join } from 'path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -8,42 +8,12 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { parseGitHubBrokerContext } from './github-credential-broker.ts'
 import { runBoundedHostCommand, type PublicationCommandResult } from './github-publication.ts'
-import { requireManagedStateRoot } from './managed-path.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
 
 const PROJECT = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/
 const MAX_ROWS = 1000
 // Exclude request URLs, IPs, user agents, labels and arbitrary application payloads.
 const LOG_FORMAT = 'json(logName,timestamp,severity,insertId,trace,spanId,resource.type,resource.labels.service_name,resource.labels.revision_name,resource.labels.location,httpRequest.requestMethod,httpRequest.status,httpRequest.latency,httpRequest.requestSize,httpRequest.responseSize,jsonPayload.duration,jsonPayload.durationMs,jsonPayload.elapsedMs,jsonPayload.count,jsonPayload.batchSize,textPayload,jsonPayload.message)'
-
-export function allowedCloudProjects(stateInput: string, repoInput: string): string[] {
-  const state = requireManagedStateRoot(stateInput)
-  const repo = realpathSync(repoInput)
-  let fd: number
-  try { fd = openSync(join(state, 'cloud-access.json'), constants.O_RDONLY | constants.O_NOFOLLOW) } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
-    throw new Error('Cloud Logging policy is unavailable')
-  }
-  try {
-    const metadata = fstatSync(fd)
-    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.uid !== process.getuid?.()
-      || (metadata.mode & 0o077) !== 0 || metadata.size > 64 * 1024) {
-      throw new Error('Cloud Logging policy is unsafe')
-    }
-    const policy = JSON.parse(readFileSync(fd, 'utf8'))
-    if (policy?.version !== 1 || !policy.projectsByRepository
-      || typeof policy.projectsByRepository !== 'object' || Array.isArray(policy.projectsByRepository)) {
-      throw new Error('Cloud Logging policy is invalid')
-    }
-    const projects = Object.hasOwn(policy.projectsByRepository, repo)
-      ? policy.projectsByRepository[repo] : []
-    if (!Array.isArray(projects) || projects.length > 32
-      || projects.some(value => typeof value !== 'string' || !PROJECT.test(value))) {
-      throw new Error('Cloud Logging project binding is invalid')
-    }
-    return [...new Set<string>(projects)]
-  } finally { closeSync(fd) }
-}
 
 export type CloudLogQuery = {
   project: string
@@ -77,9 +47,11 @@ function assertClosedLoggingFilter(filter: string): void {
   if (quoted || depth !== 0) throw new Error('Cloud Logging filter has unbalanced quoting or parentheses')
 }
 
-export function cloudLoggingArguments(query: CloudLogQuery, projects: readonly string[]): string[] {
-  if (!PROJECT.test(query.project) || !projects.includes(query.project)) {
-    throw new Error('Cloud Logging project is not authorized for this repository')
+export function cloudLoggingArguments(query: CloudLogQuery): string[] {
+  // Validate syntax, not authorization. The host's existing Google Cloud IAM
+  // decides access when logging read runs; no per-repository policy is needed.
+  if (typeof query.project !== 'string' || !PROJECT.test(query.project)) {
+    throw new Error('Cloud Logging requires an explicit valid project ID')
   }
   const timePattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/
   const start = Date.parse(query.startTime)
@@ -193,9 +165,9 @@ function projectLogRow(row: Record<string, unknown>): Record<string, unknown> {
 }
 
 export async function readCloudLogs(
-  query: CloudLogQuery, projects: readonly string[], run: CloudLoggingRun, signal?: AbortSignal,
+  query: CloudLogQuery, run: CloudLoggingRun, signal?: AbortSignal,
 ): Promise<unknown> {
-  const args = cloudLoggingArguments(query, projects)
+  const args = cloudLoggingArguments(query)
   const result = await run(args, signal)
   if (result.timedOut) throw new Error('Cloud Logging query timed out; narrow the time range')
   if (result.exitCode !== 0) {
@@ -223,21 +195,17 @@ export async function readCloudLogs(
 }
 
 export function registerCloudLoggingTool(
-  server: McpServer, projects: () => string[], run: CloudLoggingRun,
+  server: McpServer, run: CloudLoggingRun,
 ): void {
   server.registerTool('cloud_logging_read', {
-    description: 'Read Cloud Logging using host authentication, without exposing credentials. Omit project to list repository-authorized projects. Supply an explicit UTC time range and optional Logging filter. Returns diagnostic fields, not arbitrary payloads. Never run gcloud login or change HOME in the job.',
+    description: 'Read Cloud Logging using host authentication and Google Cloud IAM, without exposing credentials. Supply an explicit project ID and UTC time range, plus an optional Logging filter. No repository allowlist or cloud-access.json is required. Returns diagnostic fields, not arbitrary payloads. Never run gcloud login or change HOME in the job.',
     inputSchema: {
-      project: z.string().optional(), startTime: z.string().optional(), endTime: z.string().optional(),
+      project: z.string(), startTime: z.string(), endTime: z.string(),
       filter: z.string().max(8192).optional(), limit: z.number().int().min(1).max(MAX_ROWS).optional(),
     },
   }, async (input, extra) => {
     try {
-      const allowed = projects()
-      const output = input.project === undefined
-        ? { projects: allowed, configured: allowed.length > 0 }
-        : await readCloudLogs({ ...input, project: input.project,
-            startTime: input.startTime ?? '', endTime: input.endTime ?? '' }, allowed, run, extra.signal)
+      const output = await readCloudLogs(input, run, extra.signal)
       return { content: [{ type: 'text' as const, text: JSON.stringify(output) }] }
     } catch (error) {
       const message = error instanceof Error ? error.message : ''
@@ -255,7 +223,7 @@ async function main(): Promise<void> {
   if (!context.writeEnabled) throw new Error('Cloud Logging broker requires an authorized job')
   let run: CloudLoggingRun | undefined
   const server = new McpServer({ name: 'zerochan-cloud-logging', version: '1.0.0' })
-  registerCloudLoggingTool(server, () => allowedCloudProjects(stateInput, context.repoPath),
+  registerCloudLoggingTool(server,
     (args, signal) => (run ??= createHostCloudLoggingRun())(args, signal))
   await server.connect(new StdioServerTransport())
 }
