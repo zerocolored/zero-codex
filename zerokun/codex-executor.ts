@@ -3764,6 +3764,24 @@ export async function assertNativeAdvisorHistory(options: {
   )
 }
 
+function nativeAdvisorStartupRecoveryInstructions(): string {
+  return [
+    'Native GPT startup recovery is an exception to the single-process attempt rule, not a new advisor slot or review round.',
+    'Before reporting a native slot unavailable, inspect the spawn result and list_agents.',
+    'If startup explicitly failed before a child was created (for example MCP initialization Bad file descriptor,',
+    'temporary transport failure or capacity), and no matching child exists, retry that SAME logical slot',
+    'with the same model, reasoning effort, scope and marker after delays of 5, 15, 30, then 60 seconds.',
+    'Continue recoverable pre-start retries at 60-second intervals until started or the user cancels; report the safe cause and waiting status.',
+    'Use a fresh task_name suffix for a failed creation. Do not restart Grok/Claude or call a new advisor round.',
+    'If a child exists or delivery is uncertain, recover and wait for that exact child instead of spawning a duplicate.',
+    'A failed list_agents call is unknown state, not proof that no child exists; restore observation before retrying.',
+    'Authentication, quota exhaustion with no known recovery time, invalid configuration or model errors are not transient:',
+    'retain evidence and report the concrete required recovery; never invent success or substitute a model.',
+    'Optional MCP initialization failure does not invalidate a local read-only GPT response.',
+    'Unavailable browser/GitHub tools still mean their actions are unperformed: never claim screenshots, publication or verification succeeded.',
+  ].join('\n')
+}
+
 export function buildCodexDeveloperInstructions(
   job: JobRecord,
   _artifactDir: string,
@@ -3813,7 +3831,8 @@ export function buildCodexDeveloperInstructions(
         'agent ID to advisor_round. If the native slot did',
         'not start or started without an answer, pass adopted=false, started=false or true, and a',
         'concise reason. Poll advisor_round_poll one call at a time while pending=true and acknowledge any receipt once.',
-        'A terminal unavailable result ends the bounded attempt. Advisor availability never blocks the primary task.',
+        nativeAdvisorStartupRecoveryInstructions(),
+        'A terminal external-advisor unavailable result ends the bounded attempt. Advisor availability never blocks the primary task.',
         'Follow the applicable AGENTS.md best-effort policy; missing answers are warnings, not a task failure.',
         'Earlier required-response instructions in resumed history are obsolete; advisor availability alone never requires a blocked task.',
         'For failure diagnostics only, name GPT, Grok or Claude Code and its safe cause in Slack; omit secrets and internal paths.',
@@ -4054,6 +4073,7 @@ export function buildCodexWorkerPrompt(
       'risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none. Do not',
       'apply fresh native creation or current-input markers to interruption recovery; reuse the original marked answer. Do not',
       'substitute a different model and do not add another native slot.',
+      nativeAdvisorStartupRecoveryInstructions(),
       `That native advisor response must end with [ZERO_NATIVE_ADVISOR:${host.attemptNonce}:r${input.revision}:${input.digest}:<investigation|review>:<1|2>:<solution|risk>] after replacing phase, round, and perspective.`,
       'For an unavailable native slot, send adopted=false, an exact started boolean, and a concise',
       'reason. Advisor availability never blocks the primary task. Never invent missing answers.',
@@ -5417,8 +5437,11 @@ export function buildCodexPermissionOverrides(
     )
   }
   if (options.browserMcp) {
+    // These are task tools, not prerequisites for a read-only native advisor.
+    // A transient stdio initialization failure must not abort child creation.
+    // Tool actions remain unavailable (and cannot be claimed as performed).
     mcpEntries.push(
-      `zerokun_browser={command=${tomlString(options.browserMcp.command)},args=[${options.browserMcp.args.map(tomlString).join(',')}],enabled=true,required=true,enabled_tools=["verify_local_page"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=180,tools={verify_local_page={approval_mode="approve"}}}`,
+      `zerokun_browser={command=${tomlString(options.browserMcp.command)},args=[${options.browserMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["verify_local_page"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=180,tools={verify_local_page={approval_mode="approve"}}}`,
     )
   }
   if (options.githubMcp) {
@@ -5426,7 +5449,7 @@ export function buildCodexPermissionOverrides(
       ? ['github_fetch_branch', 'github_publish_branch', 'github_pull_request', 'github_wait_delivery']
       : [])]
     mcpEntries.push(
-      `zerokun_github={command=${tomlString(options.githubMcp.command)},args=[${options.githubMcp.args.map(tomlString).join(',')}],enabled=true,required=true,enabled_tools=[${githubTools.map(tomlString).join(',')}],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=1900,tools={${githubTools.map(tool => `${tool}={approval_mode="approve"}`).join(',')}}}`,
+      `zerokun_github={command=${tomlString(options.githubMcp.command)},args=[${options.githubMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=[${githubTools.map(tomlString).join(',')}],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=1900,tools={${githubTools.map(tool => `${tool}={approval_mode="approve"}`).join(',')}}}`,
     )
   }
   if (options.cloudLoggingMcp) {
