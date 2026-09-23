@@ -571,6 +571,9 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   隠したGitHub transport用`zerokun_github`、ログ取得用`zerokun_cloud_logging`、およびoperatorが設定済みの検証済みChrome transportだけを
   必要なwrite jobで有効にします。
   Web検索はwrite許可jobだけに限定し、write jobのcommand networkはproxyを通してSlack関連domainを拒否します。
+- 通常の受付・開始はリアクションのみです。ただし、先行作業による待機通知を送信済みの依頼は、
+  実行開始時に同じSlackスレッドへ「作業を開始しました。」を新規投稿します。
+  開始通知はジョブ単位で保存し、再開・再起動による重複を防ぎ、通信失敗時は同じ通知IDで再送します。
 - Zeroちゃんはadvisorの必須性や指摘の重大度、publication planを独自に裁定しません。
   `zerokun_advisors`はprimary Codexが選んだ初期設計・最終reviewの外部枠を安全に起動し、各round 3枠の
   実測状態を返すtransportに限定します。利用不能なadvisorだけを理由にSlack jobを失敗させません。

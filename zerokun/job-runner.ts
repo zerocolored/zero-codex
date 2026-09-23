@@ -234,6 +234,7 @@ export const DEFAULT_MAX_JOBS_PER_SESSION = 20 as const
 // that still carries the v2 trusted host policy.
 export const CODEX_SESSION_PROTOCOL_VERSION = 3 as const
 export const SLACK_QUEUE_WAIT_MESSAGE = '🙇 別件の作業中のため、しばらくお待ちください。' as const
+export const SLACK_QUEUED_START_MESSAGE = '作業を開始しました。' as const
 export const SLACK_RATE_LIMIT_WAIT_MESSAGE = '⏸ レートリミットのため待機中です。自動で再開します。' as const
 const RATE_LIMIT_WAIT_NOTIFICATION_PREFIX = 'rate-limit-waiting:' as const
 
@@ -945,7 +946,7 @@ CREATE TABLE IF NOT EXISTS status_notifications (
   thread_ts TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN (
     'accepted', 'interrupt-accepted', 'closed-control',
-    'inactive-interrupt', 'attachment-control-failed', 'rate-limited'
+    'inactive-interrupt', 'attachment-control-failed', 'rate-limited', 'execution-started'
   )),
   payload TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -1868,6 +1869,21 @@ function persistThreadHistorySnapshot(
 }
 
 function ensureJobSchemaMigrations(db: Database): void {
+  // SQLite cannot alter CHECK constraints. Preserve every outbox receipt and
+  // retry field while adding the new kind, including on existing installations.
+  db.transaction(() => {
+    const schema = db.query<{ sql: string }, []>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'status_notifications'",
+    ).get()!.sql
+    if (schema.includes("'execution-started'")) return
+    db.exec(schema.replace('status_notifications', 'status_notifications_next')
+      .replace("'rate-limited'", "'rate-limited', 'execution-started'"))
+    db.exec(`INSERT INTO status_notifications_next SELECT * FROM status_notifications;
+      DROP TABLE status_notifications;
+      ALTER TABLE status_notifications_next RENAME TO status_notifications;
+      CREATE INDEX idx_status_notifications_pending
+        ON status_notifications(delivered_at, superseded_at, not_before, created_at);`)
+  }).immediate()
   const columns = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
   if (!columns.some(column => column.name === 'not_before')) {
     try {
@@ -10790,6 +10806,31 @@ export class JobStore {
     return retrySqlite(() => fail.immediate())
   }
 
+  stageQueuedJobStart(jobId: string, attempt: number): void {
+    const stage = this.db.transaction(() => {
+      const job = this.get(jobId)
+      if (!job || job.status !== 'running' || job.attempts !== attempt) return
+      if (job.cancelRequestedAt !== null) throw new CodexUserCancelledError()
+      // Legacy releases used 'accepted' for routine acknowledgements too.
+      // Only an actually delivered queue-wait message warrants this follow-up.
+      if (!this.db.query<{ present: number }, [string, string]>(
+        `SELECT 1 AS present FROM status_notifications
+         WHERE job_id = ? AND kind = 'accepted' AND payload = ?
+           AND delivered_at IS NOT NULL LIMIT 1`,
+      ).get(jobId, SLACK_QUEUE_WAIT_MESSAGE)) return
+      this.stageStatusNotificationRow({
+        idempotencyKey: `execution-started:${jobId}`,
+        jobId,
+        chatId: job.chatId,
+        threadTs: job.threadTs,
+        kind: 'execution-started',
+        payload: SLACK_QUEUED_START_MESSAGE,
+        createdAt: Date.now(),
+      })
+    })
+    retrySqlite(() => stage.immediate())
+  }
+
   activateJobLifecycle(
     jobIdInput: string,
     attemptInput: number,
@@ -13340,6 +13381,7 @@ export interface CommentaryNotification {
 export type StatusNotificationKind =
   | 'accepted' | 'interrupt-accepted' | 'closed-control'
   | 'inactive-interrupt' | 'attachment-control-failed' | 'rate-limited'
+  | 'execution-started'
   | 'interjection-answer'
 
 export interface StatusNotification {
@@ -14372,6 +14414,8 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       let execution: JobExecutionResult
       try {
         await options.prepareCloudJob?.(job)
+        options.store.stageQueuedJobStart(job.id, job.attempts)
+        scheduleNotificationFlush()
         executionStarted = true
         execution = await options.executor(job, options.signal, {
           progressActivatedAtMs,
