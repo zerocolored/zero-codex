@@ -992,7 +992,7 @@ export async function runUpdateWorker(
     }
     const text = request.source === 'automatic'
       ? success
-        ? '✅ 自動更新が完了しました。起動中だったアプリを再起動し、待機中の依頼を再開します。'
+        ? '最新版の自動アップデートが完了しました'
         : `⚠️ 自動更新に失敗しました（更新処理の終了コード: ${exitCode}）。旧版への復旧状況は未確認です。管理ログを確認し、復旧が必要な場合は zerochan update --recover-only を実行してください。`
       : success
       ? '✅ 更新完了\n更新・テスト・setup・再起動が完了しました。'
