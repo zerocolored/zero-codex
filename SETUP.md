@@ -18,6 +18,25 @@ Codexには次のように依頼します。
 セットアップして
 ```
 
+## Codexを使わず1コマンドで行う
+
+Codexへ依頼せず、同じ範囲をshellから通す場合は[`zerokun/quick-setup.sh`](zerokun/quick-setup.sh)を使います。
+`bootstrap-macos.sh`の基本導入に加えて、codex-configのglobal `AGENTS.md`配置、Slack設定、
+channel紐付け、起動までを1コマンドで順に実行します。
+
+```bash
+bash zerokun/quick-setup.sh \
+  --project /absolute/path/to/project \
+  --app-name 'Zeroちゃん-新Mac' --bot-name zerochan-new-mac \
+  --channel C0123456789
+```
+
+`--channel`は繰り返し指定できます。`--doctor`は何も変更せず状態だけを表示し、
+`--skip-slack`と`--skip-codex-config`はそれぞれの段階を省略します。
+loginは自動化せず、未了の段階で停止して実行すべきcommandを表示します。
+Herdr serverが動いていないと`zerochan start`はworkspace createに失敗するため、
+Herdrのpane内で実行するか、先に`herdr`でserverを起動しておきます。
+
 ## 「一言でセットアップ」の範囲
 
 CodexなどのAIエージェントが技術的な選択、commandの順序、再実行、検証に加え、ブラウザでの
