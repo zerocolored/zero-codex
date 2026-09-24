@@ -218,7 +218,8 @@ describe('Zero-kun Codex wiring', () => {
     expect(executor).toContain("features.browser_use=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain("features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain('features.browser_use_full_cdp_access=false')
-    expect(executor).toContain('features.computer_use=false')
+    expect(executor).toContain("features.computer_use=${computerUseEnabled ? 'true' : 'false'}")
+    expect(executor).toContain('const computerUseEnabled = job.writeEnabled && executionWriteEnabled')
     expect(executor).toContain("features.in_app_browser=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain('There is one primary Codex workflow now.')
     expect(executor).toContain(

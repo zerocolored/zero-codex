@@ -1,5 +1,6 @@
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
+import { installedComputerUseClient, installedComputerUseNodeRepl } from './installed-computer-use.ts'
 import { GO_CHROME_ENABLED_TOOLS, GO_CHROME_DISABLED_TOOLS } from './chrome-tools.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { CODEX_NETWORK_CONTINUATION, CODEX_NETWORK_RETRY_DELAYS_MS, isTransientCodexNetworkError } from './codex-network-retry.ts'
@@ -428,6 +429,30 @@ function normalizedMcpServer(value: Record<string, unknown>): string {
   return normalizedJson({ required: false, ...server })
 }
 
+function mcpConfigToml(value: unknown): string {
+  if (typeof value === 'string') return tomlString(value)
+  if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) return String(value)
+  if (Array.isArray(value)) return `[${value.map(mcpConfigToml).join(',')}]`
+  if (value && typeof value === 'object') return `{${Object.entries(value)
+    .filter(([key, child]) => key !== 'environment_id' && child !== null && child !== undefined)
+    .map(([key, child]) => `${tomlString(key)}=${mcpConfigToml(child)}`).join(',')}}`
+  throw new Error('unsupported desktop MCP config value')
+}
+
+export function trustedComputerUseNodeTransport(server: Record<string, unknown>, layers: unknown): boolean {
+  if (server.enabled !== true) return false
+  let trusted = false
+  for (const layer of Array.isArray(layers) ? layers : []) {
+    const setting = layer?.config?.mcp_servers?.node_repl
+    if (setting === undefined) continue
+    if (layer?.name?.type === 'project') return false
+    if (layer?.name?.type === 'sessionFlags') continue
+    if (setting.enabled === false) return false
+    trusted = true
+  }
+  return trusted
+}
+
 function assertEffectiveMcpIsolation(
   config: Record<string, unknown>,
   overrides: string[],
@@ -557,6 +582,19 @@ export function mcpIsolationOverridesForConfig(
     }
   }
   const additions: string[] = []
+  const plugins = config.plugins as Record<string, { enabled?: boolean }> | undefined
+  if (projectRoot && overrides.includes('features.computer_use=true')
+    && trustedComputerUsePluginEnabled(config, layers)
+    && (rawServers as Record<string, { enabled?: boolean }>)['computer-use']?.enabled !== false
+    && !expectedNames.has('computer-use')) {
+    const client = installedComputerUseClient(process.env.CODEX_HOME || join(homedir(), '.codex'), projectRoot)
+    if (client) {
+      // The native client enforces its existing per-app approvals. Do not use a
+      // relative ambient transport or set an automatic tool approval override.
+      additions.push(`"computer-use"={enabled=true,command=${tomlString(client)},args=["mcp"],cwd=${tomlString(dirname(client))},startup_timeout_sec=30,tool_timeout_sec=120}`)
+      expectedNames.add('computer-use')
+    }
+  }
   for (const name of names.sort()) {
     if (expectedNames.has(name)) continue
     if (name.length < 1 || name.length > 128 || /[\0-\x1f\x7f]/.test(name)) {
@@ -571,6 +609,15 @@ export function mcpIsolationOverridesForConfig(
     const hasUrl = typeof server.url === 'string' && server.url.length > 0
     if (hasCommand === hasUrl) {
       throw new Error(`Codex effective MCP server ${name} has an ambiguous transport`)
+    }
+    if (name === 'node_repl' && projectRoot && overrides.includes('features.computer_use=true')
+      && trustedComputerUsePluginEnabled(config, layers)
+      && trustedComputerUseNodeTransport(server, layers)
+      && installedComputerUseNodeRepl(projectRoot, server.command)) {
+      // Current official Computer Use uses node_repl + @oai/sky. Preserve the
+      // operator's runtime metadata and approval settings, not just its command.
+      additions.push(`${tomlString(name)}=${mcpConfigToml(server)}`)
+      continue
     }
     if (browserTransportEnabled && name === 'go-chrome-mcp' && server.enabled === true) {
       // Preserve the installed browser transport when it is a simple,
@@ -715,6 +762,38 @@ export function nativeAdvisorHistoryPermissionOverrides(
   return isolated
 }
 
+function trustedComputerUsePluginEnabled(config: Record<string, unknown>, layers: unknown): boolean {
+  const pluginName = 'computer-use@openai-bundled'
+  if ((config.plugins as Record<string, { enabled?: boolean }> | undefined)?.[pluginName]?.enabled !== true) return false
+  let trusted = false
+  for (const layer of Array.isArray(layers) ? layers : []) {
+    const setting = layer?.config?.plugins?.[pluginName]
+    if (setting === undefined) continue
+    if (layer?.name?.type === 'project') return false
+    if (layer?.name?.type === 'sessionFlags') continue
+    if (setting.enabled === false) return false
+    if (setting.enabled === true) trusted = true
+  }
+  return trusted
+}
+
+/** Keep native desktop access from enabling unrelated installed plugins. */
+export function computerUsePluginIsolationOverrides(
+  config: Record<string, unknown>, overrides: string[], layers?: unknown,
+): string[] {
+  if (!overrides.includes('features.computer_use=true')) return overrides
+  const plugins = config.plugins
+  if (plugins !== undefined && plugins !== null
+    && (typeof plugins !== 'object' || Array.isArray(plugins))) {
+    throw new Error('Codex plugin configuration is invalid')
+  }
+  const configured = (plugins ?? {}) as Record<string, { enabled?: boolean }>
+  const names = new Set([...Object.keys(configured), 'computer-use@openai-bundled'])
+  const table = [...names].sort().map(name =>
+    `${tomlString(name)}={enabled=${name === 'computer-use@openai-bundled' && trustedComputerUsePluginEnabled(config, layers)}}`).join(',')
+  return replaceUniqueConfigOverride(overrides, 'plugins', `{${table}}`)
+}
+
 export async function resolveEffectiveCodexPermissionOverrides(
   codexBin: string,
   cwd: string,
@@ -741,10 +820,11 @@ export async function resolveEffectiveCodexPermissionOverrides(
     || Array.isArray(discovered.config)) {
     throw new Error('Codex config/read omitted effective config during MCP isolation')
   }
-  const isolated = mcpIsolationOverridesForConfig(
+  const isolated = computerUsePluginIsolationOverrides(
     discovered.config as Record<string, unknown>,
-    overrides,
-    cwd,
+    mcpIsolationOverridesForConfig(
+      discovered.config as Record<string, unknown>, overrides, cwd, discovered.layers,
+    ),
     discovered.layers,
   )
   await assertEffectiveCodexPermissionConfig(
@@ -1296,6 +1376,16 @@ function assertEffectiveCodexPermissionSnapshot(
     // hooks={} deep-merges with materialized empty event arrays and inert state
     // metadata. The dedicated check above rejects every executable handler.
     if (key === 'hooks') continue
+    if (key === 'plugins') {
+      const plugins = config.plugins as Record<string, { enabled?: boolean }> | undefined
+      const expected = overrideValue(overrides, 'plugins') as Record<string, { enabled: boolean }>
+      if (!plugins || plugins['computer-use@openai-bundled']?.enabled !== expected['computer-use@openai-bundled']?.enabled
+        || Object.entries(plugins).some(([name, value]) =>
+          name !== 'computer-use@openai-bundled' && value?.enabled !== false)) {
+        throw new Error('Codex effective plugins exceed native Computer Use scope')
+      }
+      continue
+    }
     // Disabled apps cannot expose any default tool, network or destructive
     // capability. Some Codex releases omit these subordinate fields from
     // config/read once the global feature is disabled.
@@ -3934,6 +4024,7 @@ export type CodexWorkerPromptContext = {
   artifactDir: string
   advisorEnabled: boolean
   browserEnabled?: boolean
+  computerUseEnabled?: boolean
 }
 
 /** Native resume already carries its own turns; a cold start receives the durable Slack history. */
@@ -4157,6 +4248,13 @@ export function buildCodexWorkerPrompt(
         'Report the observed result of the actual browser attempt; do not pre-emptively refuse a',
         'remote target because the localhost verifier exists.',
       )
+    }
+    if (host.computerUseEnabled) {
+      control.push('Native Computer Use is enabled for this authorized primary execution when installed.',
+        'Read the installed computer-use skill. Current clients use node_repl with @oai/sky;',
+        'discover node_repl tools rather than assuming a direct get_app_state MCP tool exists.',
+        'Existing per-app approvals still apply.',
+        'Do not bypass app approval or claim a missing connection without trying the exposed native tool.')
     }
     if (job.githubPublicationRecovery) {
       control.push(
@@ -5244,6 +5342,7 @@ export function buildCodexPermissionOverrides(
     executionWriteEnabled?: boolean
     localVerificationEnabled?: boolean
     browserAccessEnabled?: boolean
+    computerUseEnabled?: boolean
     multiAgentEnabled?: boolean
     taskGoalEnabled?: boolean
     toolchainPath?: string
@@ -5295,6 +5394,10 @@ export function buildCodexPermissionOverrides(
   const executionWriteEnabled = options.executionWriteEnabled ?? job.writeEnabled
   const localVerificationEnabled = options.localVerificationEnabled ?? false
   const browserAccessEnabled = options.browserAccessEnabled ?? executionWriteEnabled
+  // 実機E2E（画面操作）は書き込み実装ステージだけに許可する。レビュー段
+  // (executionWriteEnabled=false) は browser access があっても画面操作させない。
+  const computerUseEnabled = job.writeEnabled && executionWriteEnabled
+    && browserAccessEnabled && options.computerUseEnabled === true
   const networkEnabled = executionWriteEnabled || localVerificationEnabled || browserAccessEnabled
   const multiAgentEnabled = options.multiAgentEnabled ?? true
   const model = options.model ?? ZEROCHAN_PRIMARY_CODEX_MODEL
@@ -5435,6 +5538,25 @@ export function buildCodexPermissionOverrides(
     }
     rules.set(realpathSync(verified.path), 'read')
   }
+  if (computerUseEnabled) {
+    // CUA（デスクトップ操作）の node カーネルとプラグイン実行体は、
+    // ChatGPT.app 同梱リソース・OpenSSL 設定・plugin cache を読む。
+    // HOME は deny のままで、必要な subtree だけを read で再許可する。
+    for (const cuaPath of [
+      '/Applications/ChatGPT.app',
+      '/System/Library/OpenSSL',
+      join(codexHome || join(home, '.codex'), 'computer-use'),
+      join(codexHome || join(home, '.codex'), 'plugins/cache/openai-bundled/computer-use'),
+    ]) {
+      if (!existsSync(cuaPath)) continue
+      const metadata = lstatSync(cuaPath)
+      const physical = realpathSync(cuaPath)
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()
+        || physical !== cuaPath || (metadata.mode & 0o022) !== 0) continue
+      if (!rules.has(physical)) rules.set(physical, 'read')
+    }
+  }
+
   const filesystem = [...rules.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([path, access]) => `${tomlString(path)}=${tomlString(access)}`)
@@ -5527,14 +5649,16 @@ export function buildCodexPermissionOverrides(
     'apps._default.open_world_enabled=false',
     'apps._default.destructive_enabled=false',
     'features.apps=false',
-    'features.plugins=false',
+    // CUA（デスクトップ操作）は openai-bundled プラグインが担うため、
+    // computer_use を許可するステージだけプラグインも解錠する。
+    `features.plugins=${computerUseEnabled ? 'true' : 'false'}`,
     'features.remote_plugin=false',
     'features.hooks=false',
     `features.goals=${options.taskGoalEnabled === true ? 'true' : 'false'}`,
     `features.browser_use=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}`,
     'features.browser_use_full_cdp_access=false',
-    'features.computer_use=false',
+    `features.computer_use=${computerUseEnabled ? 'true' : 'false'}`,
     `features.in_app_browser=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}`,
     `features.network_proxy=${networkEnabled ? 'true' : 'false'}`,
@@ -6694,6 +6818,7 @@ export async function executeCodexJob(
           && stage !== 'implementation' && stage !== 'interjection',
         taskGoalEnabled: stage === 'complete',
         nativeCloudAccessEnabled: stage === 'complete' && !continuationDecision,
+        computerUseEnabled: executionWriteEnabled && browserEnabled,
         model,
         reasoningEffort,
       })
@@ -6706,6 +6831,7 @@ export async function executeCodexJob(
         reviewRound,
         advisorEnabled: advisorMcp !== undefined,
         browserEnabled: browserMcp !== undefined,
+        computerUseEnabled: executionWriteEnabled && browserEnabled,
         browserReceiptKey,
         browserReceiptKeyPath,
         permissionProfile,
@@ -6849,7 +6975,9 @@ export async function executeCodexJob(
       ...advisorAttempt.permissionOverrides.flatMap(value => ['-c', value]),
       '-c', `developer_instructions=${tomlString(advisorAttempt.developerInstructions)}`,
       'exec',
-      '--ignore-user-config',
+      // computer_use 許可時は CUA プラグイン（ユーザー設定由来）を残す。
+      // それ以外は従来どおりユーザー設定を遮断する。
+      ...(advisorAttempt.computerUseEnabled ? [] : ['--ignore-user-config']),
       '--ignore-rules',
       '--skip-git-repo-check',
       '--json',
@@ -7966,6 +8094,7 @@ export async function executeCodexJob(
                 artifactDir,
                 advisorEnabled: advisorAttempt.advisorEnabled,
                 browserEnabled: advisorAttempt.browserEnabled,
+                computerUseEnabled: advisorAttempt.computerUseEnabled,
               }, threadHistoryForPhysicalSession(options.threadHistory, resumed))
               : buildCodexPhasePrompt(
                 job,
@@ -8788,6 +8917,7 @@ export async function executeCodexJob(
         artifactDir,
         advisorEnabled: advisorAttempt.advisorEnabled,
         browserEnabled: advisorAttempt.browserEnabled,
+        computerUseEnabled: advisorAttempt.computerUseEnabled,
       }, threadHistoryForPhysicalSession(options.threadHistory, resumed)))
     }
     proc.stdin.end()

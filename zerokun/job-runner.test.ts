@@ -12060,6 +12060,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
           args: ['/runtime/cloud-logging-broker.ts', '/state/context.json'],
         },
         localVerificationEnabled: true,
+        computerUseEnabled: true,
       }).join('\n')
       expect(overrides).toContain('":minimal"="read"')
       expect(overrides).not.toContain('extends=')
@@ -12097,14 +12098,25 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         expect(roleConfig.model_reasoning_effort).toBe(effort)
         expect(roleConfig.sandbox_mode).toBe('read-only')
         expect(roleConfig.approval_policy).toBe('never')
+        expect((roleConfig.features as any).computer_use).toBe(false)
+        expect((roleConfig.features as any).plugins).toBe(false)
+        expect((roleConfig.mcp_servers as any)['computer-use'].enabled).toBe(false)
+        expect((roleConfig.mcp_servers as any).node_repl.enabled).toBe(false)
       }
-      expect(overrides).toContain('features.plugins=false')
+      expect(overrides).toContain('features.plugins=true')
       expect(overrides).toContain('features.goals=false')
       expect(overrides).toContain('features.browser_use=true')
       expect(overrides).toContain('features.browser_use_external=true')
       expect(overrides).toContain('features.browser_use_full_cdp_access=false')
-      expect(overrides).toContain('features.computer_use=false')
+      expect(overrides).toContain('features.computer_use=true')
       expect(overrides).toContain('features.in_app_browser=true')
+      // CUA nodeカーネルはOpenSSL設定とChatGPT.app同梱リソースを読む
+      expect(overrides).toContain(`${JSON.stringify(realpathSync('/System/Library/OpenSSL'))}="read"`)
+      if (existsSync('/Applications/ChatGPT.app')) {
+        expect(overrides).toContain(`${JSON.stringify(realpathSync('/Applications/ChatGPT.app'))}="read"`)
+      }
+      expect(overrides).not.toContain('com.openai.sky.CUAService')
+      expect(overrides).not.toContain('\"/Applications\"=\"read\"')
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
@@ -12158,6 +12170,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         },
         executionWriteEnabled: true,
         localVerificationEnabled: true,
+        computerUseEnabled: true,
         multiAgentEnabled: false,
       }).join('\n')
       expect(implementationOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
@@ -12176,6 +12189,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         },
         executionWriteEnabled: false,
         localVerificationEnabled: true,
+        computerUseEnabled: true,
         browserAccessEnabled: true,
         multiAgentEnabled: true,
       }).join('\n')
@@ -12189,6 +12203,39 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(reviewOverrides).toContain('features.browser_use_external=true')
       expect(reviewOverrides).toContain('features.browser_use_full_cdp_access=false')
       expect(reviewOverrides).toContain('features.computer_use=false')
+      expect(reviewOverrides).toContain('features.plugins=false')
+      expect(reviewOverrides).not.toContain('/System/Library/OpenSSL')
+      // Job-owned declarations must not expand host access to personal application data.
+      mkdirSync(join(repo, '.zerokun'), { recursive: true })
+      writeFileSync(join(repo, '.zerokun', 'computer-use-read-paths'), [
+        '# コメント行と空行は無視',
+        '',
+        '~/Library/Application Support',
+        join(homedir(), '.ssh'),
+        '/etc',
+      ].join('\n'))
+      const projectGrantOverrides = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        executionWriteEnabled: true,
+        browserAccessEnabled: true,
+      }).join('\n')
+      expect(projectGrantOverrides).not.toContain(
+        `${JSON.stringify(realpathSync(join(homedir(), 'Library', 'Application Support')))}="read"`,
+      )
+      expect(projectGrantOverrides).not.toContain('.ssh')
+      expect(projectGrantOverrides).not.toContain('"/etc"="read"')
+      // computer_use が無効な build では宣言ファイルがあっても付与しない
+      const reviewWithGrantFile = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        executionWriteEnabled: false,
+        browserAccessEnabled: true,
+      }).join('\n')
+      expect(reviewWithGrantFile).not.toContain('Application Support')
+      rmSync(join(repo, '.zerokun'), { recursive: true, force: true })
       expect(() => buildCodexPermissionOverrides(
         { ...job, repoPath: homedir() },
         { stateDir: state, artifactDir: outbox, scratchDir: scratch },

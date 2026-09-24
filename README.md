@@ -276,6 +276,9 @@ bash zerokun/interactive-bootstrap.sh \
 利用上限時の保存と、別Appへの明示的な引き継ぎを扱います。各PCで追加設定が必要で、
 通常のupdateだけでは有効になりません。SQLiteや認証ファイルをPC間でコピーしないでください。
 
+ジョブに画面操作（実機E2Eなど）をさせる場合は [Computer Use](docs/computer-use.md) を参照してください。
+Macごと・対象アプリごとに1回の永続承認が必要で、これも update だけでは有効になりません。
+
 ### 3. projectとSlackチャンネルを設定して起動する
 
 コマンドを忘れた場合は `zerochan help`、個別の説明は `zerochan stop --help` や
