@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash, randomUUID } from 'crypto'
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -30,7 +31,7 @@ function mode(path: string): number {
   return lstatSync(path).mode & 0o777
 }
 
-function fixture(): { home: string; auth: string; physicalGrok: string; reviewRoot: string } {
+function fixture(version = ''): { home: string; auth: string; physicalGrok: string; reviewRoot: string } {
   const home = mkdtempSync(join(tmpdir(), 'zerokun-grok-reviewer-'))
   temporaryRoots.push(home)
   chmodSync(home, 0o700)
@@ -41,9 +42,7 @@ function fixture(): { home: string; auth: string; physicalGrok: string; reviewRo
   chmodSync(join(home, '.grok'), 0o700)
   chmodSync(bin, 0o700)
   chmodSync(downloads, 0o700)
-  const officialName = process.arch === 'arm64'
-    ? 'grok-macos-aarch64'
-    : 'grok-macos-x86_64'
+  const officialName = `grok-${version ? `${version}-` : ''}macos-${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}`
   const physicalGrok = join(downloads, officialName)
   const reviewRoot = join(home, 'review-project')
   mkdirSync(reviewRoot, { mode: 0o700 })
@@ -227,6 +226,37 @@ int main(void) {
     expect(result.stdout.toString()).toMatch(/SELF=.*\.zerokun\/runtime\/grok-reviewer\/run\.[^/]+\/official-grok/)
     expect(readdirSync(join(home, '.zerokun/runtime/grok-reviewer')).filter(name => name.startsWith('run.')))
       .toEqual([])
+  })
+
+  test('versioned official downloadsをstdin reviewで実行しrunを回収する', () => {
+    const { home, reviewRoot } = fixture('1.0.41')
+    const launcher = installGrokReviewer(home)
+    const result = reviewSync(launcher, 'VERSIONED-REVIEW', {
+      HOME: home, PATH: '/usr/bin:/bin', ZEROKUN_GROK_REVIEW_ROOT: reviewRoot,
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(result.stdout.toString()).toContain('PROMPT_BYTES=16')
+    expect(result.stdout.toString()).toMatch(/SELF=.*\/run\.[^/]+\/official-grok/)
+    expect(readdirSync(join(home, '.zerokun/runtime/grok-reviewer')).filter(name => name.startsWith('run.'))).toEqual([])
+  })
+
+  test('versioned downloadsでも別architecture名・余分なpath要素・非nativeを拒否する', () => {
+    const { home, physicalGrok } = fixture('1.0.41')
+    const launcher = installGrokReviewer(home)
+    const link = join(home, '.grok/bin/grok')
+    const wrongName = `grok-1.0.41-macos-${process.arch === 'arm64' ? 'x86_64' : 'aarch64'}`
+    copyFileSync(physicalGrok, join(home, '.grok/downloads', wrongName))
+    for (const target of [`../downloads/${wrongName}`, `../downloads/./${physicalGrok.split('/').at(-1)}`]) {
+      rmSync(link); symlinkSync(target, link)
+      const result = Bun.spawnSync([launcher, '--version'], { env: { HOME: home, PATH: '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe' })
+      expect(result.exitCode).toBe(127)
+      expect(result.stdout.toString()).toBe('')
+    }
+    rmSync(link); symlinkSync(`../downloads/${physicalGrok.split('/').at(-1)}`, link)
+    writeFileSync(physicalGrok, '#!/bin/sh\necho wrong-native\n')
+    const result = Bun.spawnSync([launcher, '--version'], { env: { HOME: home, PATH: '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe' })
+    expect(result.exitCode).toBe(127)
+    expect(result.stdout.toString()).toBe('')
   })
 
   test('global codex-configのGrok reviewer namespaceを変更しない', () => {
