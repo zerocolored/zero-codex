@@ -19,6 +19,7 @@ import {
   finalizeSuccessfulExecution,
   extractArtifactPaths,
   createExecutorPidLifecycle,
+  terminateTrackedExecutors,
   publishStagedGitHubPublication,
   runQueuedJobs,
   type JobRecord,
@@ -498,7 +499,8 @@ for line in sys.stdin:
             emit({"id": request_id, "result": {"turn": active_turn}})
             emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
         if mode == "late-command-completion":
-            emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "commandExecution", "id": "background-command", "command": "fixture-only", "status": "inProgress"}}})
+            late_item_type = os.environ.get("ZERO_LATE_ITEM_TYPE", "commandExecution")
+            emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "inProgress"}}})
         turn_latch_stage = os.environ.get("ZERO_TURN_LATCH_STAGE")
         if turn_latch_stage == stage:
             turn_latch_ready = os.environ["ZERO_TURN_LATCH_READY"]
@@ -523,7 +525,7 @@ for line in sys.stdin:
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": [], "error": None}}},
             ])
             if mode == "late-command-completion":
-                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "commandExecution", "id": "background-command", "command": "fixture-only", "status": "completed", "exitCode": 0}}})
+                emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "completed", "exitCode": 0}}})
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "native-final", "text": "Goalを完遂しました"}], "error": None}}},
             ])
@@ -2774,20 +2776,22 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test('job188: 実executorは旧turnのcommand遅延完了で終了143にせず一度の起動で完了する', async () => {
+  for (const itemType of ['commandExecution', 'mcpToolCall', 'dynamicToolCall']) {
+  test(`job232/job188: 実executorは旧turnの${itemType}遅延完了で再起動せず完了する`, async () => {
     const value = fixture('late-command-completion', true)
     const processIds: number[] = []
     try {
       const result = await executeCodexJob(value.job, {
         codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
         skipEffectiveConfigCheck: true,
-        extraEnvironment: { ZERO_FIXTURE_MODE: 'late-command-completion' },
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'late-command-completion', ZERO_LATE_ITEM_TYPE: itemType },
         onProcessId: pid => { processIds.push(pid) }, liveControls: value.hooks,
       })
       expect(result).toEqual({ sessionId: 'thread-app-server-1', result: 'Goalを完遂しました' })
       expect(processIds).toHaveLength(1)
     } finally { value.store.close() }
   }, 30_000)
+  }
 
   test('production write jobはhost工程を挟まずCodexのcomplete turnだけで完了する', async () => {
     const value = fixture(
@@ -6202,6 +6206,38 @@ describe('production App Server executor', () => {
     expect(JSON.parse(readFileSync(registration, 'utf8')).phase).toBe('active')
     expect(value.store.claimNext('same-serial-worker')).toBeNull()
     value.store.close()
+  }, 15_000)
+
+  test('periodic watch recovers a dead child with a stalled supervisor continuation', async () => {
+    const value = fixture('normal')
+    const processIds: number[] = []
+    const next = value.store.enqueue({ chatId: value.job.chatId,
+      threadTs: '1800000000.001500', messageId: '1800000000.001500', userId: 'UNEXT',
+      repoPath: value.job.repoPath, task: '次の依頼', writeEnabled: false }).job
+    try {
+      const execution = executeCodexJob(value.job, {
+        codexBinForTesting: value.executable,
+        logDir: value.logDir, stateDir: value.state, skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'normal',
+          ZEROKUN_SUPERVISOR_TEST_STALL_EXIT_WAIT: '1' },
+        supervisorCleanupGraceMs: 50,
+        supervisorWatchForTesting: { intervalMs: 5, graceMs: 50 },
+        onProcessId: pid => { processIds.push(pid) }, liveControls: value.hooks,
+      })
+      // Recovery is a cleanup fault, never a success inferred from silence.
+      await expect(execution).rejects.toBeInstanceOf(CodexCleanupPendingError)
+      expect(processIds).toHaveLength(1)
+      expect(() => process.kill(processIds[0]!, 0)).toThrow()
+      expect(value.store.claimNext('same-serial-worker')).toBeNull()
+      await terminateTrackedExecutors(value.store, () => {}, 2_000, value.state)
+      expect(value.store.recoverInterrupted()).toEqual({
+        requeued: 0, failedWrites: 0, failedUncertain: 1,
+      })
+      expect(value.store.get(value.job.id)?.status).toBe('failed')
+      expect(value.store.claimNext('restarted-serial-worker')?.id).toBe(next.id)
+      expect(value.store.recoverInterrupted().requeued).toBe(1)
+      expect(value.store.get(value.job.id)?.status).toBe('failed')
+    } finally { value.store.close() }
   }, 15_000)
 
   test('supervisor retained-stateは内部通知からbounded recoveryへ入りFIFOを無音停止しない', async () => {

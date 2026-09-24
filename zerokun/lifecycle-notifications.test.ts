@@ -6,6 +6,7 @@ import { dirname, join } from 'path'
 import {
   JobStore,
   SLACK_QUEUE_WAIT_MESSAGE,
+  SLACK_QUEUED_START_MESSAGE,
   SLACK_RATE_LIMIT_WAIT_MESSAGE,
   SlackNotifier,
   flushCommentaryNotifications,
@@ -323,6 +324,7 @@ describe('durable lifecycle notifications', () => {
           await waitPostReleased
           order.push('queue-wait-finished')
         }
+        if (input.text === SLACK_QUEUED_START_MESSAGE) order.push('queued-start')
       },
       addReaction: async () => {},
     })
@@ -349,7 +351,146 @@ describe('durable lifecycle notifications', () => {
     await running
     expect(order.indexOf('queue-wait-finished'))
       .toBeLessThan(order.indexOf(`executed:${second.id}`))
+    expect(order.filter(item => item === 'queued-start')).toHaveLength(1)
+    expect(order.indexOf('queue-wait-finished')).toBeLessThan(order.indexOf('queued-start'))
     store.close()
+  })
+
+  test('待機通知送信済みの開始投稿は再試行・再openでも同じIDで一度だけ', async () => {
+    const { store, job, root } = runningJob()
+    const queued = store.enqueue({
+      chatId: 'D2', threadTs: 'queued-start', messageId: 'queued-start', userId: 'U2',
+      repoPath: job.repoPath, task: 'queued', notifyAccepted: true,
+    }).job
+    await flushStatusNotifications(store, { status: async () => {} }, () => {})
+    store.complete(job.id, 'first-session', 'done')
+    const claimed = store.claimNext('next-worker')!
+    expect(claimed.id).toBe(queued.id)
+    store.stageQueuedJobStart(claimed.id, claimed.attempts)
+    store.stageQueuedJobStart(claimed.id, claimed.attempts)
+    const notice = store.pendingStatusNotifications()[0]!
+    const resumeAt = Date.now() + 100
+    store.requeueAt(claimed.id, resumeAt, 'retry fixture')
+    const resumed = store.claimNext('retry-worker', 20, resumeAt + 1)!
+    store.stageQueuedJobStart(resumed.id, resumed.attempts)
+    expect(store.pendingStatusNotifications().filter(row => row.kind === 'execution-started'))
+      .toHaveLength(1)
+    expect(store.pendingStatusNotifications().find(row => row.kind === 'execution-started')?.id)
+      .toBe(notice.id)
+    expect(notice).toMatchObject({ kind: 'execution-started', payload: SLACK_QUEUED_START_MESSAGE })
+    store.complete(claimed.id, 'next-session', 'done')
+    const terminal = store.pendingTerminalNotifications().find(row => row.jobId === claimed.id)
+    expect(terminal).toBeUndefined()
+    const ids: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async input => {
+        ids.push(input.clientMessageId!)
+        if (ids.length === 1) throw new Error('temporary network failure')
+      },
+    })
+    await flushStatusNotifications(store, notifier, () => {}, 1)
+    store.close()
+    const reopened = new JobStore(join(root, 'state', 'jobs.sqlite3'))
+    await Bun.sleep(5)
+    expect(reopened.pendingStatusNotifications()[0]?.id).toBe(notice.id)
+    const retried = new SlackNotifier('xoxb-fixture', () => {}, reopened, {
+      postMessage: async input => { ids.push(input.clientMessageId!) },
+    })
+    await flushStatusNotifications(reopened, retried, () => {})
+    await flushStatusNotifications(reopened, retried, () => {})
+    expect(ids).toHaveLength(2)
+    expect(ids[0]).toBeTruthy()
+    expect(ids[1]).toBe(ids[0])
+    expect(reopened.pendingTerminalNotifications().some(row => row.jobId === claimed.id)).toBe(true)
+    reopened.close()
+  })
+
+  test('即時開始・未送信待機・旧受付・開始前取消では開始投稿しない', async () => {
+    for (const scenario of ['immediate', 'unsent', 'legacy', 'cancelled']) {
+      const { store, job } = runningJob()
+      if (scenario === 'immediate') {
+        store.stageQueuedJobStart(job.id, job.attempts)
+      } else {
+        const queued = store.enqueue({
+          chatId: 'D2', threadTs: scenario, messageId: scenario, userId: 'U2',
+          repoPath: job.repoPath, task: scenario, notifyAccepted: true,
+        }).job
+        if (scenario !== 'unsent') {
+          if (scenario === 'legacy') {
+            const db = new Database(store.dbPath)
+            db.run("UPDATE status_notifications SET payload = '受け付けました' WHERE job_id = ?", [queued.id])
+            db.close()
+          }
+          await flushStatusNotifications(store, { status: async () => {} }, () => {})
+        }
+        store.complete(job.id, 'first', 'done')
+        const next = store.claimNext('next')!
+        if (scenario === 'cancelled') {
+          const db = new Database(store.dbPath)
+          db.run('UPDATE jobs SET cancel_requested_at = ? WHERE id = ?', [Date.now(), next.id])
+          db.close()
+          expect(() => store.stageQueuedJobStart(next.id, next.attempts)).toThrow()
+        } else {
+          store.stageQueuedJobStart(next.id, next.attempts)
+        }
+      }
+      expect(store.pendingStatusNotifications().filter(row => row.kind === 'execution-started')).toEqual([])
+      store.close()
+    }
+  })
+
+  test('待機通知済みでも実行準備失敗では開始投稿しない', async () => {
+    const { store, job } = runningJob()
+    const queued = store.enqueue({
+      chatId: 'D2', threadTs: 'prepare-failure', messageId: 'prepare-failure', userId: 'U2',
+      repoPath: job.repoPath, task: 'queued', notifyAccepted: true,
+    }).job
+    await flushStatusNotifications(store, { status: async () => {} }, () => {})
+    store.complete(job.id, 'first', 'done')
+    let calls = 0
+    const posts: string[] = []
+    await runQueuedJobs({
+      store, maxJobsPerSession: 20, stopWhenIdle: true, pollMs: 1,
+      prepareCloudJob: async () => { throw new Error('cloud preparation unavailable') },
+      notifier: { status: async n => { posts.push(n.payload) } },
+      executor: async () => { calls += 1; return { sessionId: 'unexpected', result: 'unexpected' } },
+    })
+    expect(calls).toBe(0)
+    expect(posts).not.toContain(SLACK_QUEUED_START_MESSAGE)
+    expect(store.get(queued.id)?.status).toBe('failed')
+    store.close()
+  })
+
+  test('旧CHECK制約から通知履歴とretry情報を保持して移行する', () => {
+    const { store, job } = runningJob()
+    store.enqueue({
+      chatId: 'D2', threadTs: 'migration-start', messageId: 'migration-start', userId: 'U2',
+      repoPath: job.repoPath, task: 'queued', notifyAccepted: true,
+    })
+    const notice = store.pendingStatusNotifications()[0]!
+    store.deferStatusNotification(notice.id, 'fixture failure', 1_000, 20)
+    const path = store.dbPath
+    store.close()
+    const db = new Database(path)
+    const schema = db.query<{ sql: string }, []>(
+      "SELECT sql FROM sqlite_master WHERE name = 'status_notifications'",
+    ).get()!.sql
+    db.exec(schema.replace('status_notifications', 'old_status_notifications')
+      .replace(", 'execution-started'", ''))
+    db.exec(`INSERT INTO old_status_notifications SELECT * FROM status_notifications;
+      DROP TABLE status_notifications;
+      ALTER TABLE old_status_notifications RENAME TO status_notifications;`)
+    const before = db.query('SELECT * FROM status_notifications').all()
+    db.close()
+    const migrated = new JobStore(path)
+    const check = new Database(path)
+    expect(check.query('SELECT * FROM status_notifications').all()).toEqual(before)
+    expect(check.query<{ sql: string }, []>(
+      "SELECT sql FROM sqlite_master WHERE name = 'status_notifications'",
+    ).get()!.sql).toContain("'execution-started'")
+    expect(check.query('PRAGMA foreign_key_check').all()).toEqual([])
+    check.close()
+    migrated.close()
   })
 
   test('旧releaseの未配信受付本文を起動migrationで無効化する', () => {

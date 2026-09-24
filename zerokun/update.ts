@@ -42,7 +42,7 @@ import {
   undelegateProcessLock,
   encodeProcessLockDelegate,
 } from './process-lock.ts'
-import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
+import { legacyCutoverForState, resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
 import { readGatewayReadiness } from './readiness.ts'
 import {
   readLastConnectedProject,
@@ -84,6 +84,7 @@ import {
 } from './runner-launch-receipt.ts'
 import {
   decodeHerdrRuntimeIdentity,
+  currentHerdrBinary,
   encodeHerdrRuntimeIdentity,
   environmentForPinnedHerdrRuntime,
   HERDR_ENVIRONMENT_KEYS,
@@ -92,6 +93,9 @@ import {
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
 import { requireTmuxCommand, runTmuxCommand, tmuxSessionExists } from './tmux-command.ts'
+import { listRegisteredSlackApps, slackAppRegistryRoot } from './slack-app-registry.ts'
+import { coordinateSharedUpdate, type UpdatePeer } from './shared-update.ts'
+import { installUpdateRequestRuntime } from './update-runtime.ts'
 
 interface Repository {
   label: string
@@ -2380,7 +2384,7 @@ function runHerdrCommand(
   args: string[],
   target = control,
 ): string {
-  const result = Bun.spawnSync([control.binary, ...args], {
+  const result = Bun.spawnSync([currentHerdrBinary(control), ...args], {
     env: environmentForPinnedHerdrRuntime(target),
     stdin: 'ignore',
     stdout: 'pipe',
@@ -2419,8 +2423,10 @@ function requireAgentlessHerdrPane(pane: HerdrPaneRecord): void {
   }
 }
 
-function sameHerdrRuntime(left: HerdrRuntimeIdentity, right: HerdrRuntimeIdentity): boolean {
-  return JSON.stringify(left) === JSON.stringify(right)
+export function sameHerdrRuntime(left: HerdrRuntimeIdentity, right: HerdrRuntimeIdentity): boolean {
+  return left.socketPath === right.socketPath && left.paneId === right.paneId
+    && left.tabId === right.tabId && left.terminalId === right.terminalId
+    && left.workspaceId === right.workspaceId
 }
 
 function serviceTabRecordPath(stateDir: string): string {
@@ -2743,7 +2749,7 @@ export async function startBotInHerdr(options: {
     replaceTokenDigest: updateRestartTokenDigest(replaceToken),
     release,
     legacyCutover: options.legacyCutover
-      ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1',
+      ?? legacyCutoverForState(stateDir) === '1',
     environment: requestEnvironment,
   })}\n`)
   const paneCommand = [
@@ -3019,24 +3025,7 @@ async function restartServices(
     requiredConsecutive: Number(process.env.ZEROKUN_HEALTH_CONSECUTIVE ?? 10),
     maxChecks: Number(process.env.ZEROKUN_HEALTH_MAX_CHECKS ?? 60),
     sleep: () => Bun.sleep(Number(process.env.ZEROKUN_HEALTH_SLEEP_MS ?? 500)),
-    observe: () => {
-      const newRunnerPid = readPid(join(stateDir, 'job-runner.lock', 'pid'))
-      const newLauncherPid = readPid(join(stateDir, 'job-runner-starter.lock'))
-      const newBridgePid = readPid(join(stateDir, 'plugin.lock'))
-      const readiness = readGatewayReadiness(join(stateDir, 'gateway-ready.json'))
-      const expectedRelease = command(['git', 'rev-parse', 'HEAD'], { cwd: rootRepo }).stdout
-      return Boolean(newLauncherPid && processLockOwnerMatches(
-        join(stateDir, 'job-runner-starter.lock'),
-        newLauncherPid,
-        /runner-launcher\.ts(?:\s|$)/,
-      )) && Boolean(newRunnerPid && processLockOwnerMatches(
-        join(stateDir, 'job-runner.lock', 'pid'), newRunnerPid, /job-runner\.ts\s+daemon(?:\s|$)/,
-      )) && Boolean(newBridgePid && processLockOwnerMatches(
-        join(stateDir, 'plugin.lock'), newBridgePid, /server\.ts(?:\s|$)/,
-      )) && Boolean(readiness && readiness.pid === newBridgePid
-        && readiness.release === expectedRelease
-        && readiness.projectDir === projectDir)
-    },
+    observe: () => updatedServicesHealthy(rootRepo, stateDir, projectDir),
   }).catch(error => {
     fail(`${error instanceof Error ? error.message : String(error)}。ログ: ${logPath}`)
   })
@@ -3048,6 +3037,25 @@ async function restartServices(
     + ` + Codex job runner PID ${newRunnerPid}`
     + ` + recovery launcher PID ${newLauncherPid}`,
   )
+}
+
+function updatedServicesHealthy(rootRepo: string, stateDir: string, projectDir: string): boolean {
+  const newRunnerPid = readPid(join(stateDir, 'job-runner.lock', 'pid'))
+  const newLauncherPid = readPid(join(stateDir, 'job-runner-starter.lock'))
+  const newBridgePid = readPid(join(stateDir, 'plugin.lock'))
+  const readiness = readGatewayReadiness(join(stateDir, 'gateway-ready.json'))
+  const expectedRelease = command(['git', 'rev-parse', 'HEAD'], { cwd: rootRepo }).stdout
+  return Boolean(newLauncherPid && processLockOwnerMatches(
+    join(stateDir, 'job-runner-starter.lock'),
+    newLauncherPid,
+    /runner-launcher\.ts(?:\s|$)/,
+  )) && Boolean(newRunnerPid && processLockOwnerMatches(
+    join(stateDir, 'job-runner.lock', 'pid'), newRunnerPid, /job-runner\.ts\s+daemon(?:\s|$)/,
+  )) && Boolean(newBridgePid && processLockOwnerMatches(
+    join(stateDir, 'plugin.lock'), newBridgePid, /server\.ts(?:\s|$)/,
+  )) && Boolean(readiness && readiness.pid === newBridgePid
+    && readiness.release === expectedRelease
+    && readiness.projectDir === projectDir)
 }
 
 async function rollbackUpdate(
@@ -3101,6 +3109,7 @@ async function rollbackUpdate(
       ...buildSetupEnvironment(),
       ZEROKUN_STATE_DIR: stateDir,
       ZEROKUN_PROJECT_DIR: journal.projectDir,
+      ZEROKUN_LEGACY_CUTOVER: legacyCutoverForState(stateDir),
       ZEROKUN_UPDATE_IN_PROGRESS: '1',
     },
     timeoutMs: resolveSetupTimeoutMs(process.env, options.testing),
@@ -3187,6 +3196,7 @@ async function recoverForwardUpdate(
       ...buildSetupEnvironment(),
       ZEROKUN_STATE_DIR: stateDir,
       ZEROKUN_PROJECT_DIR: forwardJournal.projectDir,
+      ZEROKUN_LEGACY_CUTOVER: legacyCutoverForState(stateDir),
       ZEROKUN_UPDATE_IN_PROGRESS: '1',
     },
     signal: options.signal,
@@ -3327,10 +3337,10 @@ function runningGatewayProjectDirectory(stateDir: string): string | undefined {
   return readiness.projectDir
 }
 
-async function main(testing = false, argv = process.argv.slice(2)): Promise<void> {
+async function mainSingle(testing = false, argv = process.argv.slice(2), selected?: UpdatePeer, observed?: (owner: UpdatePeer) => void, beforeSwitch?: () => Promise<void>): Promise<void> {
   const args = new Set(argv)
   const skipTests = args.has('--skip-tests')
-  const noRestart = args.has('--no-restart')
+  let noRestart = args.has('--no-restart')
   const recoverOnly = args.has('--recover-only')
   if (skipTests && !testing) fail('--skip-tests はテスト環境でのみ使用できます')
   if (noRestart && !testing) fail('--no-restart はテスト環境でのみ使用できます')
@@ -3342,10 +3352,10 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
   const rootRepo = resolveRootRepo()
   // Use one physical state identity for journals, DB snapshots, candidate
   // setup, restart, and crash recovery even when an ancestor is a symlink.
-  const stateDir = prepareManagedStateRoot(resolveZeroStateDir())
+  const stateDir = prepareManagedStateRoot(selected?.stateDir ?? resolveZeroStateDir())
   const selectedProjectDir = selectUpdateProjectDirectory(
     pendingUpdateProjectDirectory(stateDir),
-    process.env.ZEROKUN_PROJECT_DIR,
+    selected?.projectDir ?? process.env.ZEROKUN_PROJECT_DIR,
     runningGatewayProjectDirectory(stateDir),
     readLastConnectedProject(stateDir)?.projectDir,
   )
@@ -3391,6 +3401,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       if (realpathSync(interrupted.repoPath) !== rootRepo) {
         fail(`別repositoryの未完了更新があります: ${interrupted.repoPath}`)
       }
+      await beforeSwitch?.()
       if (recoverOnly && await recoverForwardUpdate(stateDir, interrupted, {
         testing,
         skipTests,
@@ -3422,6 +3433,11 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
     if (recoverOnly) {
       output('   未完了の更新transactionはありません')
       return
+    }
+    if (selected) {
+      selected.running = Boolean(runningGatewayProjectDirectory(stateDir))
+      noRestart ||= !selected.running
+      observed?.(selected)
     }
     if (!noRestart) await assertPinnedHerdrRestartReady(stateDir)
     await waitForRunningJobs(
@@ -3480,6 +3496,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
     writeJournal(stateDir, journal)
     try {
       output('▶ gatewayとrunnerを停止してrollback snapshotを作成')
+      await beforeSwitch?.()
       await stopServices(stateDir, controller.signal)
       for (const repo of pinnedRepositories) assertPinnedRepositoryState(repo)
       journal = { ...journal, ...snapshotDatabase(stateDir, transactionId) }
@@ -3497,6 +3514,7 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
         env: {
           ...buildSetupEnvironment(),
           ZEROKUN_STATE_DIR: stateDir,
+          ZEROKUN_LEGACY_CUTOVER: legacyCutoverForState(stateDir),
           ZEROKUN_PROJECT_DIR: projectDir,
           ZEROKUN_UPDATE_IN_PROGRESS: '1',
         },
@@ -3513,8 +3531,8 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
       }
       clearJournal(stateDir, journal)
       output(noRestart
-        ? '✅ Codex版更新・setup完了（テスト用 --no-restart）'
-        : '✅ Codex版更新・検証・再起動完了')
+        ? args.has('--no-restart') ? '✅ Codex版更新・setup完了（テスト用 --no-restart）' : '   選択中のアプリは停止状態を保持しました'
+        : '   選択中のアプリの更新・再起動が完了しました')
     } catch (error) {
       const original = error instanceof Error ? error.message : String(error)
       try {
@@ -3529,6 +3547,151 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
     cleanup()
     process.off('SIGINT', interrupt)
     process.off('SIGTERM', interrupt)
+  }
+}
+
+/** One source checkout is shared by the registered Slack apps on this Mac. */
+async function main(testing = false, argv = process.argv.slice(2)): Promise<void> {
+  for (const flag of ['--skip-tests', '--no-restart']) {
+    if (!testing && argv.includes(flag)) fail(`${flag} はテスト環境でのみ使用できます`)
+  }
+  const unknown = argv.filter(arg => !['--skip-tests', '--no-restart', '--recover-only'].includes(arg))
+  if (unknown.length) fail(`不明なオプション: ${unknown.join(', ')}`)
+  const root = prepareManagedStateRoot(slackAppRegistryRoot())
+  const lockPath = join(root, 'shared-update.lock')
+  const attempt = tryAcquireProcessLock(lockPath)
+  if (!attempt.acquired) fail('別のSlackアプリの更新または登録が実行中です。終了後に再実行してください')
+  const ownerPath = join(root, 'shared-update-owner.json')
+  const originalDatabase = process.env.ZEROKUN_JOB_DB
+  const controller = new AbortController()
+  const interrupt = () => controller.abort()
+  process.on('SIGINT', interrupt)
+  process.on('SIGTERM', interrupt)
+  let ownerState: string | undefined
+  let ownerRestartPending = false
+  let ownerRestartOnly = false
+  try {
+    const rootRepo = resolveRootRepo()
+    const apps = listRegisteredSlackApps()
+    const states = new Set(apps.map(app => app.stateDir))
+    const requestedState = prepareManagedStateRoot(resolveZeroStateDir())
+    resolveZeroJobDatabasePath(requestedState) // Validate inherited override once.
+    delete process.env.ZEROKUN_JOB_DB // Each app resolves its own queue from here.
+    states.add(requestedState)
+    const saved = readOptionalBoundedOwnerOnlyRegularFile(ownerPath, 8192)
+    let owner: UpdatePeer
+    if (saved !== null) {
+      const value = JSON.parse(saved)
+      if (value?.version !== 1 || value.repoPath !== rootRepo || !states.has(value.owner?.stateDir)
+        || typeof value.owner?.projectDir !== 'string') fail('共有更新の保存先を確認できません。既存の復旧記録は保持しました')
+      owner = value.owner
+      ownerRestartPending = value.ownerRestartPending === true
+    } else {
+      const projectDir = selectUpdateProjectDirectory(
+        pendingUpdateProjectDirectory(requestedState), process.env.ZEROKUN_PROJECT_DIR,
+        runningGatewayProjectDirectory(requestedState), readLastConnectedProject(requestedState)?.projectDir,
+      )
+      owner = { stateDir: requestedState, projectDir, running: Boolean(runningGatewayProjectDirectory(requestedState)) }
+      atomicWritePrivateFile(ownerPath, JSON.stringify({ version: 1, repoPath: rootRepo, owner }) + '\n')
+    }
+    ownerState = owner.stateDir
+    const saveOwner = () => atomicWritePrivateFile(ownerPath, JSON.stringify({ version: 1, repoPath: rootRepo, owner, ownerRestartPending }) + '\n')
+    // Keep restart intent independently of the source transaction: recovery may
+    // clear its journal before the gateway can be successfully restarted.
+    if (pendingUpdateProjectDirectory(owner.stateDir) && owner.running && !argv.includes('--no-restart')) {
+      ownerRestartPending = true
+      saveOwner()
+    }
+    validateLaunchProject(owner.projectDir, { runtimeRepo: rootRepo, stateDir: owner.stateDir })
+    const peers = apps.filter(app => app.stateDir !== owner.stateDir).map(app => {
+      const runningProject = runningGatewayProjectDirectory(app.stateDir)
+      return { stateDir: app.stateDir, projectDir: runningProject ?? readLastConnectedProject(app.stateDir)?.projectDir ?? owner.projectDir, running: Boolean(runningProject) }
+    })
+    const waitSeconds = Number(process.env.ZEROKUN_UPDATE_WAIT_SECONDS ?? 21_600)
+    if (!Number.isFinite(waitSeconds) || waitSeconds < 0) fail('ZEROKUN_UPDATE_WAIT_SECONDSが不正です')
+    const finishOwnerRestart = async (onlyIfHealthy = false) => {
+      if (!ownerRestartPending || pendingUpdateProjectDirectory(owner.stateDir)) return
+      const operation = acquireUpdateLock(owner.stateDir)
+      try {
+        if (!updatedServicesHealthy(rootRepo, owner.stateDir, owner.projectDir)) {
+          if (onlyIfHealthy) return
+          await waitForRunningJobs(owner.stateDir, waitSeconds, join(rootRepo, 'zerokun', 'job-runner.ts'))
+          await restartServices(rootRepo, owner.stateDir, owner.projectDir)
+        }
+        ownerRestartPending = false
+        try { saveOwner() } catch (error) { ownerRestartPending = true; throw error }
+      } finally { operation.release() }
+    }
+    await coordinateSharedUpdate(root, peers, {
+      deferStop: true,
+      acquire: state => acquireUpdateLock(state),
+      observe: peer => {
+        const projectDir = runningGatewayProjectDirectory(peer.stateDir)
+        return { ...peer, projectDir: projectDir ?? peer.projectDir, running: Boolean(projectDir) }
+      },
+      validate: peer => {
+        if (!states.has(peer.stateDir) || peer.stateDir === owner.stateDir) fail('共有更新のアプリ登録が見つかりません')
+        validateLaunchProject(peer.projectDir, { runtimeRepo: rootRepo, stateDir: peer.stateDir })
+      },
+      drain: async peer => {
+        await waitForRunningJobs(peer.stateDir, waitSeconds, join(rootRepo, 'zerokun', 'job-runner.ts'), controller.signal)
+        if (peer.running !== false) await assertPinnedHerdrRestartReady(peer.stateDir)
+      },
+      stop: peer => stopServices(peer.stateDir, controller.signal),
+      refresh: async peer => {
+        if (pendingUpdateProjectDirectory(owner.stateDir)) {
+          fail('共有コードの更新復旧が未完了です。アプリの再起動記録を保持しています')
+        }
+        // The primary transaction has either committed or rolled back. Refresh
+        // only this peer's runtime; never rewrite shared shell/CLI settings here.
+        installUpdateRequestRuntime(join(rootRepo, 'zerokun'), peer.stateDir)
+        atomicWritePrivateFile(join(peer.stateDir, 'watchdog.sh'), readFileSync(join(rootRepo, 'zerokun', 'watchdog.sh')))
+        chmodSync(join(peer.stateDir, 'watchdog.sh'), 0o700)
+      },
+      restart: async peer => {
+        if (pendingUpdateProjectDirectory(owner.stateDir)) fail('共有コードの更新復旧が未完了です。再起動記録を保持しています')
+        await restartServices(rootRepo, peer.stateDir, peer.projectDir)
+      },
+      recover: async () => {
+        await mainSingle(testing, ['--recover-only', ...(testing && argv.includes('--skip-tests') ? ['--skip-tests'] : [])], owner)
+        await finishOwnerRestart()
+      },
+    }, async stopPeers => {
+      if (controller.signal.aborted) fail('更新を中断しました')
+      const recoveryArgs = ownerRestartPending && !pendingUpdateProjectDirectory(owner.stateDir)
+        ? ['--recover-only', ...(testing && argv.includes('--skip-tests') ? ['--skip-tests'] : [])] : argv
+      ownerRestartOnly = recoveryArgs !== argv
+      try {
+        await mainSingle(testing, recoveryArgs, owner, current => {
+          owner = current
+          saveOwner()
+        }, async () => {
+          if (owner.running && !argv.includes('--no-restart')) {
+            ownerRestartPending = true
+            saveOwner()
+          }
+          await stopPeers()
+        })
+      } catch (error) {
+        // A successful rollback still reports the original update failure.
+        // Release completed restart intent without retrying an unhealthy start.
+        await finishOwnerRestart(true)
+        throw error
+      }
+      await finishOwnerRestart()
+    })
+    if (!argv.includes('--recover-only')) {
+      if (ownerRestartOnly) fail('前回の再起動を復旧しました。新しい更新は未実施です。zerochan update を再実行してください')
+      output('✅ Codex版更新・検証・再起動完了（停止中だったアプリは停止状態を保持）')
+    }
+  } finally {
+    process.off('SIGINT', interrupt)
+    process.off('SIGTERM', interrupt)
+    if (originalDatabase === undefined) delete process.env.ZEROKUN_JOB_DB
+    else process.env.ZEROKUN_JOB_DB = originalDatabase
+    if (!ownerRestartPending && !existsSync(join(root, 'shared-update-peers.json')) && ownerState
+      && !existsSync(join(ownerState, 'update-transaction.json'))) rmSync(ownerPath, { force: true })
+    if (!releaseProcessLock(lockPath, attempt.lease)) fail('共有更新lockを解放できませんでした')
   }
 }
 

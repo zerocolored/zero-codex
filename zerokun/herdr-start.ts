@@ -15,6 +15,14 @@ import {
 } from './herdr-runtime.ts'
 import { readGatewayReadiness } from './readiness.ts'
 
+import { legacyCutoverForState } from './state-dir.ts'
+
+export function herdrStartCommand(launcher: string, stateDir: string, projectDir: string): string {
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+  return ['/usr/bin/env', `ZEROKUN_STATE_DIR=${stateDir}`, `ZEROKUN_LEGACY_CUTOVER=${legacyCutoverForState(stateDir)}`,
+    launcher, projectDir].map(quote).join(' ')
+}
+
 type HerdrStartHooks = {
   inspectStatus?: (stateDir: string) => ManagedServiceStatus
   invoke?: (args: string[]) => Promise<Record<string, unknown>>
@@ -255,7 +263,7 @@ export async function startZeroInHerdrWorkspace(
 
   const sleep = hooks.sleep ?? (milliseconds => Bun.sleep(milliseconds))
   try {
-    await invoke(['pane', 'run', paneId, launcher, 'start'])
+    await invoke(['pane', 'run', paneId, herdrStartCommand(launcher, stateDir, projectDir)])
 
     const deadline = Date.now() + (hooks.timeoutMs ?? 90_000)
     while (Date.now() <= deadline) {

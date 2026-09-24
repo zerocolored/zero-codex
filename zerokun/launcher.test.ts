@@ -229,7 +229,7 @@ async function runLauncher(
       'if [[ "$*" == *process-lock.ts*stop-owner* ]] && [ "${FAKE_PROCESS_LOCK_STOP_FAIL:-0}" = "1" ]; then',
       '  exit 3',
       'fi',
-      'if [[ "$*" == *project-selection.ts* ]]; then',
+      'if [[ "$*" == *project-selection.ts* || "$*" == *project-app-state.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
       'if [[ "$*" == *project-channel-config.ts* ]]; then',

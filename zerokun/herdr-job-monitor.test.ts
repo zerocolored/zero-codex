@@ -17,6 +17,9 @@ import type { JobRecord } from './job-runner.ts'
 import type { HerdrRuntimeIdentity } from './herdr-runtime.ts'
 import {
   appendHerdrJobMonitorChunk,
+  archiveStoppedHerdrMonitor,
+  stopRecordedHerdrMonitorViewer,
+  monitorTabLabel,
   appendHerdrJobMonitorStatus,
   buildHerdrMonitorControlEnvironment,
   closeHerdrJobMonitor,
@@ -34,11 +37,17 @@ import {
   type HerdrMonitorProcessInfo,
   type HerdrMonitorTab,
 } from './herdr-job-monitor.ts'
-import { processStartKey, type ProcessIdentity } from './process-generation.ts'
+import { processStartKey, readProcessIdentity, type ProcessIdentity } from './process-generation.ts'
 import { completeUtf8PrefixLength } from './herdr-job-monitor-view.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 
 const directories: string[] = []
+
+test('registered Apps with equal sequence numbers have distinct monitor labels', () => {
+  expect(monitorTabLabel('/home/user/.codex/zerochan-apps/states/AONE', 1)).toBe('Zeroちゃん #1 [AONE]')
+  expect(monitorTabLabel('/home/user/.codex/zerochan-apps/states/ATWO', 1)).toBe('Zeroちゃん #1 [ATWO]')
+  expect(monitorTabLabel('/home/user/.codex/zerokun', 1)).toBe('Zeroちゃん #1')
+})
 
 test('monitor行は秒までのJST時刻をprefixにする', () => {
   expect(formatHerdrMonitorLine('確認しています', Date.parse('2026-08-29T15:04:05.000Z')))
@@ -373,6 +382,58 @@ class FakeControl implements HerdrJobMonitorControl {
 }
 
 describe('Herdr job monitor', () => {
+  test.skipIf(process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')('explicit stop reaps only the recorded viewer generation before archiving', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job()
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    const child = Bun.spawn(['/bin/sleep', '30'], { stdout: 'ignore', stderr: 'ignore' })
+    try {
+      const identity = readProcessIdentity(child.pid)!
+      expect(identity).toBeDefined()
+      const path = join(state, 'job-monitors', record.id, 'manifest.json')
+      const manifest = JSON.parse(readFileSync(path, 'utf8'))
+      writeFileSync(path, JSON.stringify({ ...manifest, viewerProcess: identity }), { mode: 0o600 })
+      await stopRecordedHerdrMonitorViewer(state, record.id)
+      await child.exited
+      expect(archiveStoppedHerdrMonitor({ stateDir: state, jobId: record.id, status: 'failed' })).toBe(true)
+      expect(control.closeCalls).toBe(0)
+    } finally { child.kill(); await child.exited }
+  })
+  test('detached dead monitor with pruned DB row is archived without touching restored panes', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job()
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    control.generationStatus = 'dead'
+    const calls = [control.createCalls, control.runCalls, control.closeCalls]
+    const result = await reconcileHerdrJobMonitors({
+      stateDir: state, runtime: { ...runtime(), socketInode: runtime().socketInode + 1 },
+      getJob: () => undefined, listMonitorObligations: () => [], control,
+    })
+    expect(result.retained).toBe(1)
+    expect([control.createCalls, control.runCalls, control.closeCalls]).toEqual(calls)
+    expect(existsSync(join(state, 'job-monitors-detached', record.id, 'manifest.json'))).toBe(true)
+  })
+  test('stop recovery archives dead monitor logs without operating a reused pane', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job()
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    appendHerdrJobMonitorStatus(state, record.id, 'keep this output')
+    const source = join(state, 'job-monitors', record.id)
+    const manifest = readFileSync(join(source, 'manifest.json'), 'utf8')
+    const calls = [control.createCalls, control.runCalls, control.closeCalls]
+    expect(archiveStoppedHerdrMonitor({ stateDir: state, jobId: record.id, status: 'running', processStatus: () => 'dead' })).toBe(false)
+    for (const status of ['alive', 'unknown'] as const) {
+      expect(archiveStoppedHerdrMonitor({ stateDir: state, jobId: record.id, status: 'failed', processStatus: () => status })).toBe(false)
+    }
+    expect(archiveStoppedHerdrMonitor({ stateDir: state, jobId: record.id, status: 'failed', processStatus: () => 'dead' })).toBe(true)
+    expect(readFileSync(join(state, 'job-monitors-detached', record.id, 'manifest.json'), 'utf8')).toBe(manifest)
+    expect(existsSync(source)).toBe(false)
+    expect(archiveStoppedHerdrMonitor({ stateDir: state, jobId: record.id, status: 'failed' })).toBe(true)
+    expect([control.createCalls, control.runCalls, control.closeCalls]).toEqual(calls)
+  })
   test('DB arm callbackが失敗したらHerdrへ一度もmutationしない', async () => {
     const state = fixtureDirectory()
     const control = new FakeControl()

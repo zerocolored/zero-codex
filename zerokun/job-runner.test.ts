@@ -18,7 +18,7 @@ import {
 } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { dirname, join } from 'path'
-import { slackReplyScanFailureDisposition } from '../gate.ts'
+import { resolveInboundWriteEnabled, slackReplyScanFailureDisposition } from '../gate.ts'
 import {
   ArtifactDeliveryAmbiguousError,
   ArtifactPublicationBlockedError,
@@ -30,6 +30,7 @@ import {
   createExecutorPidLifecycle,
   DEFAULT_MAX_JOBS_PER_SESSION,
   JobStore,
+  markMonitorUnavailable,
   liveControlAcceptsInput,
   SERIAL_WORKER_COUNT,
   createSlackIdentityPauseGuard,
@@ -3949,6 +3950,22 @@ describe('Codex job store', () => {
     store.close()
   })
 
+  test('旧read-only channel jobの次の参加者依頼は新しいwrite sessionになり旧jobを再実行しない', () => {
+    const store = makeStore()
+    const previous = store.enqueue(input()).job
+    store.claimNext('serial-worker')
+    store.complete(previous.id, 'old-read-only-session', 'done')
+    store.enqueue(input({ messageId: 'new-member-request', userId: 'UNEW',
+      writeEnabled: resolveInboundWriteEnabled('C0123456789', 'UNEW', []),
+    }))
+    const next = store.claimNext('serial-worker')!
+    expect(next.id).not.toBe(previous.id)
+    expect(next.writeEnabled).toBe(true)
+    expect(next.sessionId).toBeNull()
+    expect(store.enqueue(input()).duplicate).toBe(true)
+    store.close()
+  })
+
   test('実行中の同じSlack threadなら別userの返信をFIFO jobではなくcontrolへ束縛する', () => {
     const store = makeStore()
     const root = store.enqueue(input({ userId: 'UROOT' })).job
@@ -4762,6 +4779,39 @@ describe('Codex job store', () => {
 })
 
 describe('single FIFO worker', () => {
+  test('monitor close failure preserves completion and runs the next job once', async () => {
+    const store = makeStore()
+    const first = store.enqueue(input({ messageId: 'view-close-first' })).job
+    const second = store.enqueue(input({ messageId: 'view-close-second', threadId: 'other-thread' })).job
+    const executed: string[] = []
+    const stats = await runQueuedJobs({
+      store, maxJobsPerSession: 5, pollMs: 1, stopWhenIdle: true,
+      executor: async job => {
+        executed.push(job.id)
+        return { sessionId: `session-${job.id}`, result: 'completed despite view restart' }
+      },
+      closeJobMonitor: async () => { throw new Error('display server restarted after quiesce') },
+    })
+    expect(stats).toEqual({ completed: 2, failed: 0, workersStarted: 1 })
+    expect(executed).toEqual([first.id, second.id])
+    expect(store.get(first.id)?.status).toBe('completed')
+    expect(store.get(second.id)?.status).toBe('completed')
+    expect(store.terminalNotificationCount()).toBe(2)
+    store.close()
+  })
+  test('monitor loss records one warning without aborting the running job or runner', () => {
+    const controller = new AbortController()
+    const executionController = new AbortController()
+    const guard = { controller, executionController, unavailable: false }
+    const warnings: string[] = []
+    markMonitorUnavailable(guard, 'job-1', new Error('Herdr restarted'), message => warnings.push(message))
+    markMonitorUnavailable(guard, 'job-1', new Error('same missing view'), message => warnings.push(message))
+    expect(guard.unavailable).toBe(true)
+    expect(controller.signal.aborted).toBe(false)
+    expect(executionController.signal.aborted).toBe(false)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('continuing with saved logs')
+  })
   test('claim直前のadvisor bookkeeping失敗でもprimary workerを続行する', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ messageId: 'blocked-before-claim' })).job
@@ -5025,6 +5075,22 @@ describe('single FIFO worker', () => {
     })
     expect(() => store.monitorObligations()).not.toThrow()
     expect(store.get(interrupted.id)?.lastError).toContain('同じSlackスレッド')
+    const stoppedJob = store.get(interrupted.id)!
+    const stoppedReason = stoppedJob.lastError!
+    expect(publicJobFailureSummary(stoppedReason)).toBe(stoppedReason)
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+    await notifier.failed(stoppedJob, stoppedReason)
+    expect(posted).toEqual([
+      '🛑 停止操作により中断しました。'
+        + `\n原因: ${stoppedReason}`
+        + `\nキュー #${stoppedJob.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
+    ])
+    expect(publicJobFailureSummary(`${stoppedReason} token=xoxb-private`)).toBe(
+      '内部処理でエラーが発生しました。',
+    )
     expect(store.get(queued.id)).toMatchObject({ status: 'queued', attempts: 0 })
 
     const queuedClaim = store.claimNext('next-worker')!
@@ -9911,6 +9977,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('There is one primary Codex workflow now.')
     expect(instructions).toContain('You own that workflow')
     expect(instructions).toContain('Use zerokun_github only when authenticated GitHub access is needed.')
+    expect(instructions).toContain('Supply an explicit project ID from the task or repository')
+    expect(instructions).toContain('decided by host Google Cloud IAM, not a repository allowlist')
+    expect(instructions).not.toContain('discover the host-authorized projects')
     expect(instructions).toContain('[ZERO_SLACK_UPDATE_BEGIN:PLAN]')
     expect(instructions).toContain('public HTTPS')
     expect(instructions).not.toContain('never use an operator browser or a remote URL')
@@ -9918,13 +9987,16 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('advisor_round phase=investigation')
     expect(instructions).toContain('returned slotSummary')
     expect(instructions).toContain('Advisor availability never blocks the primary task.')
+    expect(instructions).toContain('Native GPT startup recovery is an exception')
+    expect(instructions).toContain('inspect the spawn result and list_agents')
+    expect(instructions).toContain('recover and wait for that exact child instead of spawning a duplicate')
     expect(instructions).not.toContain('overrides best-effort advisor guidance')
     expect(instructions).not.toContain('Missing required reviewer answers mean the review is incomplete')
     expect(instructions).toContain('legacy separate design phase')
     expect(instructions).toContain('solution_analyst with model=gpt-6-astra,')
-    expect(instructions).toContain('reasoning_effort=medium')
+    expect(instructions).toContain('reasoning_effort=high')
     expect(instructions).toContain('risk_reviewer with')
-    expect(instructions).toContain('model=gpt-6-astra, reasoning_effort=low')
+    expect(instructions).toContain('model=gpt-6-astra, reasoning_effort=medium')
     expect(instructions).toContain('Minor findings, missing advisor responses, or infrastructure failures never')
     expect(instructions).toContain('Never call review round 3')
     expect(instructions).toContain('compares their committed or dirty content')
@@ -9950,14 +10022,20 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(advised).not.toContain('zero obtained answers is not a task blocker')
     expect(advised).not.toContain('until all three answers are obtained')
     expect(advised).toContain('Advisor availability never blocks the primary task.')
+    expect(advised).toContain('Continue recoverable pre-start retries at 60-second intervals')
+    expect(advised).toContain('Do not restart Grok/Claude or call a new advisor round')
+    expect(advised).toContain('never claim screenshots, publication or verification succeeded')
     expect(advised).toContain('even when zero advisors return an answer')
     expect(advised).toContain('retryUnavailable=true')
     expect(advised).not.toContain('recover its missing slots using the original binding')
-    expect(advised).toContain('An interrupted round with attemptsFinished=true')
+    expect(advised).toContain('A host-interrupted process is not a completed logical round.')
+    expect(advised).toContain('recoveredAfterInterruption=true and retryable=true')
+    expect(advised).toContain('identical primaryEvidence and the obtained native answer')
+    expect(advised).toContain('only if newer input does not change the reviewed scope')
     expect(advised).toContain('legacy design phase')
     expect(advised).toContain('solution_analyst with model=gpt-6-astra,')
-    expect(advised).toContain('reasoning_effort=medium')
-    expect(advised).toContain('risk_reviewer with model=gpt-6-astra, reasoning_effort=low')
+    expect(advised).toContain('reasoning_effort=high')
+    expect(advised).toContain('risk_reviewer with model=gpt-6-astra, reasoning_effort=medium')
     expect(advised).toContain('fork_turns=none')
     expect(advised).toContain('unavailability, and infrastructure failures do not trigger round 2')
     expect(advised).toContain('Never call round 3')
@@ -11977,6 +12055,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
           command: '/usr/bin/true',
           args: ['/runtime/github-credential-broker.ts', '/state/context.json'],
         },
+        cloudLoggingMcp: {
+          command: '/usr/bin/true',
+          args: ['/runtime/cloud-logging-broker.ts', '/state/context.json'],
+        },
         localVerificationEnabled: true,
       }).join('\n')
       expect(overrides).toContain('":minimal"="read"')
@@ -12006,7 +12088,16 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides.split('\n').filter(value => value.startsWith('model=')))
         .toEqual(['model="gpt-6-astra"'])
       expect(overrides.split('\n').filter(value => value.startsWith('model_reasoning_effort=')))
-        .toEqual(['model_reasoning_effort="low"'])
+        .toEqual(['model_reasoning_effort="medium"'])
+      for (const [role, effort] of [['solution_analyst', 'high'], ['risk_reviewer', 'medium']]) {
+        const prefix = `agents.${role}.config_file=`
+        const setting = overrides.split('\n').find(value => value.startsWith(prefix))!
+        const roleConfig = Bun.TOML.parse(readFileSync(JSON.parse(setting.slice(prefix.length)), 'utf8'))
+        expect(roleConfig.model).toBe('gpt-6-astra')
+        expect(roleConfig.model_reasoning_effort).toBe(effort)
+        expect(roleConfig.sandbox_mode).toBe('read-only')
+        expect(roleConfig.approval_policy).toBe('never')
+      }
       expect(overrides).toContain('features.plugins=true')
       expect(overrides).toContain('features.goals=false')
       expect(overrides).toContain('features.browser_use=true')
@@ -12028,16 +12119,31 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
+      expect(overrides).toContain(',zerokun_cloud_logging=')
+      expect(overrides).toContain('enabled_tools=["cloud_logging_read","cloud_run_describe","project_audit_read"]')
       expect(overrides).toContain('enabled_tools=["advisor_round","advisor_round_poll"]')
       expect(overrides).toContain('enabled_tools=["verify_local_page"]')
-      expect(overrides).toContain('enabled_tools=["github_inspect","github_fetch_branch","github_publish_branch","github_pull_request","github_wait_delivery"]')
+      expect(overrides).toContain('enabled_tools=["github_inspect","github_read_issue","github_fetch_branch","github_publish_branch","github_pull_request","github_wait_delivery"]')
       expect(overrides).toContain('tool_timeout_sec=1900')
       expect(overrides).toContain('tool_timeout_sec=180')
       expect(overrides).toContain('tool_timeout_sec=30')
       expect(overrides).toContain('required=false')
-      expect(overrides).toContain('required=true')
+      expect(overrides).not.toContain('required=true')
+      const managedMcp = Bun.TOML.parse(overrides.split('\n').find(value => value.startsWith('mcp_servers='))!) as any
+      expect(managedMcp.mcp_servers.zerokun_browser.required).toBe(false)
+      expect(managedMcp.mcp_servers.zerokun_browser.enabled).toBe(true)
+      expect(managedMcp.mcp_servers.zerokun_github.required).toBe(false)
+      expect(managedMcp.mcp_servers.zerokun_github.enabled).toBe(true)
       expect(overrides).not.toContain('.grok/auth.json')
       expect(overrides).not.toContain('HERDR_SOCKET_PATH')
+      const readGitHubOverrides = buildCodexPermissionOverrides({ ...job, writeEnabled: false }, {
+        stateDir: state, artifactDir: outbox, scratchDir: scratch,
+        githubMcp: { command: '/usr/bin/true', args: ['/runtime/github-credential-broker.ts', '/state/context.json'] },
+      }).join('\n')
+      expect(readGitHubOverrides).toContain('enabled_tools=["github_inspect","github_read_issue"]')
+      expect(readGitHubOverrides).not.toContain('github_publish_branch')
+      expect(readGitHubOverrides).not.toContain('github_fetch_branch')
+      expect(readGitHubOverrides).toContain('network.enabled=false')
       const preEditOverrides = buildCodexPermissionOverrides(job, {
         stateDir: state,
         artifactDir: outbox,
@@ -12046,6 +12152,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         multiAgentEnabled: true,
       }).join('\n')
       expect(preEditOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="read"`)
+      expect(preEditOverrides).not.toContain('zerokun_cloud_logging=')
       expect(preEditOverrides).toContain(`${JSON.stringify(realpathSync(join(repo, '.git')))}="read"`)
       expect(preEditOverrides).toContain('network.enabled=false')
       expect(preEditOverrides).toContain('network.allow_local_binding=false')
@@ -12852,7 +12959,7 @@ describe('Slack output guard', () => {
     }, state)
     const output = extractArtifactPaths(finalized.result)
     expect(output.files).toEqual([])
-    expect(output.text).toContain('ファイル添付だけを省略しました')
+    expect(output.text).toContain('1件のファイルを添付できませんでした')
     store.close()
   })
 
@@ -14207,12 +14314,68 @@ describe('Slack output guard', () => {
     }, state)
     expect(result.sessionId).toBe('successful-write-session')
     expect(result.result).toContain('変更は完了しました。')
-    expect(result.result).toContain('ファイル添付だけを省略しました')
+    expect(result.result).toContain('1件のファイルを添付できませんでした')
     expect(result.result).not.toContain(internalId)
     expect(result.result).not.toContain(outside)
     expect(result.result).not.toMatch(/Codex|worker|job/i)
     expect(extractArtifactPaths(result.result).files).toEqual([])
     store.close()
+  })
+
+  test('scratch・outboxの子directoryから添付し、欠落した1件だけを省略する', () => {
+    const state = fixtureDir()
+    const repo = join(fixtureDir(), 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const job = store.enqueue(input({ repoPath: repo })).job
+    const outbox = artifactDirForJob(state, job.id)
+    const scratch = join(state, 'tmp', job.id, 'proposal')
+    mkdirSync(join(outbox, 'images'), { recursive: true })
+    mkdirSync(scratch, { recursive: true })
+    const paths = [join(outbox, 'images', 'before.png'), join(scratch, 'after.png'), join(outbox, 'report.txt')]
+    const projectFile = join(repo, 'private-project-report.txt')
+    writeFileSync(projectFile, 'must not be read by attachment host')
+    paths.forEach((path, index) => writeFileSync(path, `artifact-${index}`))
+    try {
+      const result = finalizeSuccessfulExecution(job, {
+        sessionId: 'artifact-recovery',
+        result: `比較案です\n<zerokun_files>${JSON.stringify([paths[0], join(outbox, 'missing.png'), projectFile, ...paths.slice(1)])}</zerokun_files>`,
+      }, state)
+      const files = extractArtifactPaths(result.result).files
+      expect(files).toHaveLength(3)
+      expect(files.map(file => readUploadableArtifact(job, file, state).data.toString()))
+        .toEqual(['artifact-0', 'artifact-1', 'artifact-2'])
+      expect(result.result).toContain('2件のファイルを添付できませんでした')
+      expect(result.result).not.toContain('封印')
+    } finally { store.close() }
+  })
+
+  test('同じthread・projectの前jobの画像を再添付し、別threadの画像は混ぜない', () => {
+    const state = fixtureDir()
+    const repo = join(fixtureDir(), 'repo')
+    mkdirSync(repo)
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const previous = store.enqueue(input({ repoPath: repo, messageId: 'previous-image' })).job
+    const foreign = store.enqueue(input({ repoPath: repo, threadTs: 'other-thread', messageId: 'foreign-image' })).job
+    const otherProject = store.enqueue(input({ repoPath: join(repo, 'other-project'), messageId: 'other-project-image' })).job
+    const current = store.enqueue(input({ repoPath: repo, messageId: 'reattach-image' })).job
+    const sources = [previous, foreign, otherProject].map(job => {
+      const root = artifactDirForJob(state, job.id)
+      mkdirSync(root, { recursive: true })
+      const image = join(root, 'after.png')
+      writeFileSync(image, 'synthetic proposal')
+      return image
+    })
+    mkdirSync(artifactDirForJob(state, current.id), { recursive: true })
+    try {
+      const result = finalizeSuccessfulExecution(current, {
+        sessionId: 'reattach-image', result: `再添付します\n<zerokun_files>${JSON.stringify(sources)}</zerokun_files>`,
+      }, state)
+      const files = extractArtifactPaths(result.result).files
+      expect(files).toHaveLength(1)
+      expect(readUploadableArtifact(current, files[0]!, state).data.toString()).toBe('synthetic proposal')
+      expect(result.result).toContain('2件のファイルを添付できませんでした')
+    } finally { store.close() }
   })
 
   test('成果物添付打ち切り文面はraw error・内部ID・実装名をSlackへ出さない', () => {

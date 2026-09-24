@@ -1,6 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
+import { resolveArtifactSource, previousThreadArtifactRoots } from './artifact-source.ts'
 import { advisorFailureMessage, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
@@ -26,6 +27,7 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from 'path'
 import { WebClient } from '@slack/web-api'
 import {
   artifactDirForJob,
+  scratchDirForJob,
   browserCaptureDirForJob,
   CodexCleanupPendingError,
   CodexInterruptedError,
@@ -207,6 +209,8 @@ import {
 } from './advisor-round-recovery.ts'
 import {
   appendHerdrJobMonitorStatus,
+  archiveStoppedHerdrMonitor,
+  stopRecordedHerdrMonitorViewer,
   closeHerdrJobMonitor,
   HerdrJobMonitorPendingError,
   openHerdrJobMonitor,
@@ -230,6 +234,7 @@ export const DEFAULT_MAX_JOBS_PER_SESSION = 20 as const
 // that still carries the v2 trusted host policy.
 export const CODEX_SESSION_PROTOCOL_VERSION = 3 as const
 export const SLACK_QUEUE_WAIT_MESSAGE = '🙇 別件の作業中のため、しばらくお待ちください。' as const
+export const SLACK_QUEUED_START_MESSAGE = '作業を開始しました。' as const
 export const SLACK_RATE_LIMIT_WAIT_MESSAGE = '⏸ レートリミットのため待機中です。自動で再開します。' as const
 const RATE_LIMIT_WAIT_NOTIFICATION_PREFIX = 'rate-limit-waiting:' as const
 
@@ -941,7 +946,7 @@ CREATE TABLE IF NOT EXISTS status_notifications (
   thread_ts TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN (
     'accepted', 'interrupt-accepted', 'closed-control',
-    'inactive-interrupt', 'attachment-control-failed', 'rate-limited'
+    'inactive-interrupt', 'attachment-control-failed', 'rate-limited', 'execution-started'
   )),
   payload TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -1864,6 +1869,21 @@ function persistThreadHistorySnapshot(
 }
 
 function ensureJobSchemaMigrations(db: Database): void {
+  // SQLite cannot alter CHECK constraints. Preserve every outbox receipt and
+  // retry field while adding the new kind, including on existing installations.
+  db.transaction(() => {
+    const schema = db.query<{ sql: string }, []>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'status_notifications'",
+    ).get()!.sql
+    if (schema.includes("'execution-started'")) return
+    db.exec(schema.replace('status_notifications', 'status_notifications_next')
+      .replace("'rate-limited'", "'rate-limited', 'execution-started'"))
+    db.exec(`INSERT INTO status_notifications_next SELECT * FROM status_notifications;
+      DROP TABLE status_notifications;
+      ALTER TABLE status_notifications_next RENAME TO status_notifications;
+      CREATE INDEX idx_status_notifications_pending
+        ON status_notifications(delivered_at, superseded_at, not_before, created_at);`)
+  }).immediate()
   const columns = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
   if (!columns.some(column => column.name === 'not_before')) {
     try {
@@ -10786,6 +10806,31 @@ export class JobStore {
     return retrySqlite(() => fail.immediate())
   }
 
+  stageQueuedJobStart(jobId: string, attempt: number): void {
+    const stage = this.db.transaction(() => {
+      const job = this.get(jobId)
+      if (!job || job.status !== 'running' || job.attempts !== attempt) return
+      if (job.cancelRequestedAt !== null) throw new CodexUserCancelledError()
+      // Legacy releases used 'accepted' for routine acknowledgements too.
+      // Only an actually delivered queue-wait message warrants this follow-up.
+      if (!this.db.query<{ present: number }, [string, string]>(
+        `SELECT 1 AS present FROM status_notifications
+         WHERE job_id = ? AND kind = 'accepted' AND payload = ?
+           AND delivered_at IS NOT NULL LIMIT 1`,
+      ).get(jobId, SLACK_QUEUE_WAIT_MESSAGE)) return
+      this.stageStatusNotificationRow({
+        idempotencyKey: `execution-started:${jobId}`,
+        jobId,
+        chatId: job.chatId,
+        threadTs: job.threadTs,
+        kind: 'execution-started',
+        payload: SLACK_QUEUED_START_MESSAGE,
+        createdAt: Date.now(),
+      })
+    })
+    retrySqlite(() => stage.immediate())
+  }
+
   activateJobLifecycle(
     jobIdInput: string,
     attemptInput: number,
@@ -13336,6 +13381,7 @@ export interface CommentaryNotification {
 export type StatusNotificationKind =
   | 'accepted' | 'interrupt-accepted' | 'closed-control'
   | 'inactive-interrupt' | 'attachment-control-failed' | 'rate-limited'
+  | 'execution-started'
   | 'interjection-answer'
 
 export interface StatusNotification {
@@ -13467,6 +13513,9 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  if (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE) {
+    return FORCED_SERVICE_STOP_FAILURE_MESSAGE
+  }
   if (error.startsWith('Codex network recovery exhausted after ')) {
     return '通信障害が続いており、自動再試行3回でも復旧しませんでした。作業内容は保持しています。接続回復後、このスレッドで再開できます。'
   }
@@ -14365,6 +14414,8 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       let execution: JobExecutionResult
       try {
         await options.prepareCloudJob?.(job)
+        options.store.stageQueuedJobStart(job.id, job.attempts)
+        scheduleNotificationFlush()
         executionStarted = true
         execution = await options.executor(job, options.signal, {
           progressActivatedAtMs,
@@ -14858,11 +14909,19 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         && (settled.status === 'completed' || settled.status === 'failed'
           || (settled.status === 'queued'
             && (settled.uiApprovalRequestId !== null || closeRequeuedUiApprovalMonitor)))) {
-        if (settled.status === 'failed' && settled.terminalOutcome === 'failed'
-          && options.retainFailedJobMonitor) {
-          await options.retainFailedJobMonitor(settled)
-        } else {
-          await options.closeJobMonitor?.(settled)
+        try {
+          if (settled.status === 'failed' && settled.terminalOutcome === 'failed'
+            && options.retainFailedJobMonitor) {
+            await options.retainFailedJobMonitor(settled)
+          } else {
+            await options.closeJobMonitor?.(settled)
+          }
+        } catch (error) {
+          // The result is already durable. A restarted display server must not
+          // turn it into a failed task or prevent the next queued task running.
+          // Keep the view and its saved logs; never guess a replacement target.
+          log(`Herdr monitor finalization unavailable for ${job.id}; keeping saved logs: ${error}`)
+          options.store.retireMonitorObligation(job.id)
         }
       }
     }
@@ -15733,8 +15792,8 @@ export function sanitizeExecutionTextForSlack(
 }
 
 /**
- * Codex が書ける outbox から、runner だけが読める state 内へ内容をcopyする。
- * sourceはjob outboxの直下だけに限定し、O_NOFOLLOWで開いたfdから読むため、
+ * Codex が書ける job専用outbox・scratchから、送信用stateへ内容をcopyする。
+ * sourceはjob outbox・scratchの通常成果物に限定し、O_NOFOLLOWで開いたfdから読むため、
  * 攻撃者が差し替えられるsymlinkをtraversalしない。destinationはjob/sourceごとに
  * 決定的なので、seal後・DB complete前にrunnerが落ちても同じ結果へ収束する。
  */
@@ -15755,13 +15814,10 @@ export function sealArtifactResult(job: JobRecord, result: string, dir = stateDi
     throw new Error(`sealed artifact root is not a directory: ${sealedRoot}`)
   }
 
+  const sourceRoots = [outbox, scratchDirForJob(dir, job.id), ...previousThreadArtifactRoots(job, dir)]
   const sealed: string[] = []
   for (const requested of [...new Set(output.files)]) {
-    if (!isAbsolute(requested)) throw new Error(`artifact path is not absolute: ${requested}`)
-    const source = resolve(requested)
-    if (dirname(source) !== outbox) {
-      throw new Error(`artifact must be directly inside this job's outbox: ${requested}`)
-    }
+    const source = resolveArtifactSource(requested, sourceRoots)
     const sourceKey = createHash('sha256').update(source).digest('hex').slice(0, 32)
     let descriptor: number
     try {
@@ -16034,60 +16090,34 @@ export function finalizeSuccessfulExecution(
   const {
     capturedArtifacts = [], advisorCoverage, ...persistedExecution
   } = execution
-  // Coverage describes advisor availability. Keep the primary's task outcome;
-  // a missing external answer must not turn completed work into a blocked job.
-  try {
-    const declared = extractArtifactPaths(execution.result)
-    // Browser evidence is bounded by the host at capture time and cannot be
-    // displaced by ten model-declared files. It is decoded only after Codex
-    // exits, then copied into the ordinary outbox immediately before sealing.
-    const capturedPaths = stageHostCapturedArtifacts(job, capturedArtifacts, dir)
-    const artifactPaths = [...new Set([...capturedPaths, ...declared.files])].slice(0, 10)
-    const artifactMarker = artifactPaths.length > 0
-      ? `<zerokun_files>${JSON.stringify(artifactPaths)}</zerokun_files>`
-      : ''
-    const sealed = sealArtifactResult(
-      job,
-      artifactMarker ? `${declared.text}\n${artifactMarker}`.trim() : declared.text,
-      dir,
-    )
-    const output = extractArtifactPaths(sealed)
-    const sanitized = enforceHostAdvisorCoverage(
-      sanitizeExecutionTextForSlack(job, execution.sessionId, output.text, dir),
-      advisorCoverage,
-      'result',
-    )
-    const marker = output.files.length > 0
-      ? `<zerokun_files>${JSON.stringify(output.files)}</zerokun_files>`
-      : ''
-    return {
-      ...persistedExecution,
-      result: normalizePersistedExecutionResult(
-        job,
-        execution.sessionId,
-        marker ? `${sanitized}\n${marker}`.trim() : sanitized,
-        dir,
-      ),
-    }
-  } catch (error) {
-    // Codex already exited successfully. A malformed/unsealable artifact
-    // declaration is a delivery failure, not evidence that a write job itself
-    // failed; marking it failed would invite duplicate external side effects.
-    const text = enforceHostAdvisorCoverage(sanitizeExecutionTextForSlack(
-      job, execution.sessionId, extractArtifactPaths(execution.result).text, dir,
-    ), advisorCoverage, 'result')
-    const message = error instanceof Error ? error.message : String(error)
-    log(`artifact sealing failed for completed job ${job.id}: ${message}`)
-    return {
-      ...persistedExecution,
-      result: normalizePersistedExecutionResult(
-        job,
-        execution.sessionId,
-        `${text}\n\n⚠️ 成果物ファイルを安全に封印できなかったため、ファイル添付だけを省略しました。`
-          + '\n詳細はこのMacの管理ログを確認してください。',
-        dir,
-      ),
-    }
+  const declared = extractArtifactPaths(execution.result)
+  const capturedPaths: string[] = []
+  let failed = 0
+  const recordFailure = (error: unknown) => {
+    failed += 1
+    log(`artifact preparation failed for completed job ${job.id}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  for (const artifact of capturedArtifacts) {
+    try { capturedPaths.push(...stageHostCapturedArtifacts(job, [artifact], dir)) }
+    catch (error) { recordFailure(error) }
+  }
+  const files: string[] = []
+  for (const path of [...new Set([...capturedPaths, ...declared.files])].slice(0, 10)) {
+    try {
+      const prepared = sealArtifactResult(job, `<zerokun_files>${JSON.stringify([path])}</zerokun_files>`, dir)
+      files.push(...extractArtifactPaths(prepared).files)
+    } catch (error) { recordFailure(error) }
+  }
+  const text = enforceHostAdvisorCoverage(
+    sanitizeExecutionTextForSlack(job, execution.sessionId, declared.text, dir), advisorCoverage, 'result',
+  )
+  const notice = failed > 0
+    ? `\n\n⚠️ ${failed}件のファイルを添付できませんでした。ファイルが存在し、読み取れるか確認してください。`
+    : ''
+  const marker = files.length > 0 ? `\n<zerokun_files>${JSON.stringify(files)}</zerokun_files>` : ''
+  return {
+    ...persistedExecution,
+    result: normalizePersistedExecutionResult(job, execution.sessionId, `${text}${notice}${marker}`.trim(), dir),
   }
 }
 
@@ -16225,6 +16255,18 @@ export async function reconcileAdvisorsWithMonitorHealthBarrier(
   await verify()
   await reconcileAdvisors()
   await verify()
+}
+
+/** Losing a display must never cancel an independently running Codex task. */
+export function markMonitorUnavailable(
+  guard: { unavailable?: boolean },
+  jobId: string,
+  error: unknown,
+  log: (message: string) => void,
+): void {
+  if (guard.unavailable) return
+  guard.unavailable = true
+  log(`Herdr monitor unavailable for ${jobId}; continuing with saved logs: ${error}`)
 }
 
 export async function reconcileEphemeralAndRetiredAdvisorRounds(options: {
@@ -17034,7 +17076,9 @@ export class SlackNotifier implements JobNotifier {
         job,
         cancelled
           ? '🛑 中止しました。すでに完了した変更は自動では戻していません。'
-          : '🙇 うまく完了できませんでした。'
+          : (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE
+              ? '🛑 停止操作により中断しました。'
+              : '🙇 うまく完了できませんでした。')
             + `\n原因: ${publicJobFailureSummary(error)}`
             + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
         notificationId,
@@ -17908,6 +17952,13 @@ export async function recoverForcedServiceStop(input: {
       ignoreMonitorBarriersForForcedServiceStop: true,
     })
     const failedJobIds = store.failRunningForForcedServiceStop()
+    for (const obligation of store.monitorObligationsForForcedServiceStop()) {
+      await stopRecordedHerdrMonitorViewer(dir, obligation.id)
+      if (archiveStoppedHerdrMonitor({ stateDir: dir, jobId: obligation.id, status: obligation.status })) {
+        store.retireMonitorForForcedServiceStop(obligation.id)
+        log(`preserved dead monitor logs for ${obligation.id}; no old pane was operated`)
+      }
+    }
     const monitors = await (input.reconcileMonitors ?? (storeInput => reconcileHerdrJobMonitors({
       stateDir: dir,
       runtime: input.runtime,
@@ -18366,12 +18417,12 @@ async function runCli(): Promise<void> {
   let herdrIdentityInvalid = false
   let herdrIdentityCheck: Promise<void> | null = null
   const checkHerdrIdentity = (): void => {
-    if (herdrIdentityInvalid || herdrIdentityCheck) return
+    if (herdrIdentityCheck) return
     herdrIdentityCheck = verifyHerdrRuntimeIdentityAsync(pinnedHerdrRuntime)
+      .then(() => { herdrIdentityInvalid = false })
       .catch(error => {
+        if (!herdrIdentityInvalid) log(`Herdr unavailable; keeping active work and waiting before new claims: ${error}`)
         herdrIdentityInvalid = true
-        log(`Herdr runtime identity changed; stopping before claiming more work: ${error}`)
-        controller.abort()
       })
       .finally(() => { herdrIdentityCheck = null })
   }
@@ -18400,6 +18451,7 @@ async function runCli(): Promise<void> {
     controller: AbortController
     health: Promise<void>
     failure?: HerdrJobMonitorPendingError
+    unavailable?: boolean
     executionController?: AbortController
   }
   const monitorGuards = new Map<string, MonitorGuard>()
@@ -18408,18 +18460,9 @@ async function runCli(): Promise<void> {
     // Aborting the polling signal does not cancel an already-started Herdr
     // list/process-info probe. Its failure must still be recorded; only an
     // abort while sleeping exits watchHerdrJobMonitor normally without catch.
-    if (guard.failure) return
-    let persistenceError: unknown
-    try { store.recordMonitorFailure(jobId, String(error)) } catch (recordError) {
-      persistenceError = recordError
-    }
-    guard.failure = new HerdrJobMonitorPendingError(
-      `Herdr monitor became unavailable for job ${jobId}: ${error}`
-        + (persistenceError ? `; durable fault receipt failed: ${persistenceError}` : ''),
-    )
-    monitorFatal ??= guard.failure
-    guard.executionController?.abort()
-    controller.abort()
+    // The monitor is an output view, not the Codex execution lease. Stop
+    // operating on an unverified pane, but keep the actual job and disk logs.
+    markMonitorUnavailable(guard, jobId, error, log)
   }
   const ensureMonitorGuard = (jobId: string): MonitorGuard => {
     const existing = monitorGuards.get(jobId)
@@ -18527,12 +18570,22 @@ async function runCli(): Promise<void> {
       assertJobMonitorHealthy: job => { assertMonitorGuard(job.id) },
       quiesceJobMonitor: job => quiesceMonitorGuard(job.id),
       updateJobMonitor: (job, message) => {
-        appendHerdrJobMonitorStatus(dir, job.id, message)
+        const guard = monitorGuards.get(job.id)
+        if (guard?.unavailable) return
+        try { appendHerdrJobMonitorStatus(dir, job.id, message) } catch (error) {
+          if (guard) failMonitorGuard(job.id, guard, error)
+          else log(`Herdr status unavailable; continuing with saved logs: ${error}`)
+        }
       },
       recordJobMonitorFailure: (job, error) => store.recordMonitorFailure(job.id, String(error)),
       closeJobMonitor: async job => {
+        const unavailable = monitorGuards.get(job.id)?.unavailable
         const guardFailure = await stopMonitorGuard(job.id)
         if (guardFailure) throw guardFailure
+        if (unavailable) {
+          store.retireMonitorObligation(job.id)
+          return
+        }
         await closeHerdrJobMonitor({
           stateDir: dir,
           runtime: pinnedHerdrRuntime,
@@ -18547,8 +18600,13 @@ async function runCli(): Promise<void> {
         })
       },
       retainFailedJobMonitor: async job => {
+        const unavailable = monitorGuards.get(job.id)?.unavailable
         const guardFailure = await stopMonitorGuard(job.id)
         if (guardFailure) throw guardFailure
+        if (unavailable) {
+          store.retireMonitorObligation(job.id)
+          return
+        }
         await retainFailedHerdrJobMonitor({
           stateDir: dir,
           runtime: pinnedHerdrRuntime,
@@ -18570,7 +18628,7 @@ async function runCli(): Promise<void> {
         else signal?.addEventListener('abort', forwardAbort, { once: true })
         if (guard.failure) executionController.abort()
         const mirrorMonitorMessage = (message: string): void => {
-          if (guard.failure) return
+          if (guard.failure || guard.unavailable) return
           try { appendHerdrJobMonitorStatus(dir, job.id, message) } catch (error) {
             failMonitorGuard(job.id, guard, error)
           }

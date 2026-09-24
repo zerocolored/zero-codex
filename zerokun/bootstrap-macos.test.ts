@@ -16,6 +16,7 @@ import {
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { installGrokReviewer } from './install-grok-reviewer.ts'
+import { watchdogLabel } from './watchdog-profile.ts'
 
 const root = join(import.meta.dir, '..')
 const bootstrap = join(import.meta.dir, 'bootstrap-macos.sh')
@@ -1360,6 +1361,7 @@ codex --version
         'target_state="$2"',
         'set --',
         'source "$bootstrap_path"',
+        'REPO_DIR="$(cd "$(dirname "$bootstrap_path")/.." && pwd -P)"',
         'STATE_DIR="$target_state"',
         'configure_access',
       ].join('; ')
@@ -1734,6 +1736,41 @@ codex --version
     expect(readFileSync(bootstrap, 'utf8')).not.toContain('Muxy')
   })
 
+  test.each(['unavailable', 'malformed', 'missing'])('setup and repeated recovery ignore advisor auth availability: %s', (failure) => {
+    const setup = readFileSync(join(import.meta.dir, 'setup.sh'), 'utf8')
+    expect(setup).not.toContain('zerokun_claude_subscription_ready')
+    expect(setup).not.toContain('zerokun_resolve_claude_binary')
+    const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-advisor-independent-setup-'))
+    try {
+      const testPath = setupTestPath(fakeHome)
+      const claude = join(fakeHome, '.local/bin/claude')
+      const invoked = join(fakeHome, 'advisor-auth-invoked')
+      if (failure === 'missing') rmSync(claude)
+      else writeFileSync(claude, [
+        '#!/bin/bash',
+        `touch ${JSON.stringify(invoked)}`,
+        failure === 'malformed' ? 'echo not-json; exit 0' : 'exit 1',
+      ].join('\n'), { mode: 0o700 })
+      const projectDir = join(fakeHome, 'project')
+      mkdirSync(projectDir)
+      const stateDir = join(fakeHome, 'state')
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const result = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'setup.sh')], {
+          cwd: root,
+          env: {
+            ...process.env, HOME: fakeHome, PATH: testPath,
+            ZEROKUN_STATE_DIR: stateDir, ZEROKUN_PROJECT_DIR: projectDir,
+            ZEROKUN_SKIP_WATCHDOG_LAUNCHD: '1',
+          },
+          stdout: 'pipe', stderr: 'pipe',
+        })
+        expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+        expect(existsSync(join(fakeHome, '.local/bin/zerochan'))).toBe(true)
+        expect(existsSync(invoked)).toBe(false)
+      }
+    } finally { rmSync(fakeHome, { recursive: true, force: true }) }
+  }, 30_000)
+
   test('setup wires a custom project path and preserves an existing token file', () => {
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-setup-home-'))
     const stateDir = join(fakeHome, 'Library/Application Support/Zero-kun')
@@ -1793,11 +1830,11 @@ codex --version
       expect(existsSync(join(fakeHome, '.local/bin/zerokun-update'))).toBe(false)
       expect(statSync(join(fakeHome, '.zshrc')).mode & 0o777).toBe(0o644)
       expect(readFileSync(
-        join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),
+        join(fakeHome, 'Library/LaunchAgents', `${watchdogLabel(stateDir, fakeHome)}.plist`),
         'utf8',
       )).toContain(`${realpathSync(stateDir)}/watchdog.sh`)
       expect(readFileSync(
-        join(fakeHome, 'Library/LaunchAgents/com.zerokun.watchdog.plist'),
+        join(fakeHome, 'Library/LaunchAgents', `${watchdogLabel(stateDir, fakeHome)}.plist`),
         'utf8',
       )).toContain(`<string>${realpathSync(stateDir)}</string>`)
       expect(readFileSync(tokenFile, 'utf8')).toBe(

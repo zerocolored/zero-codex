@@ -92,11 +92,20 @@ Slack bot
   判断・認証・権限などが必要な待機は未完了として通知し、完了リアクションを付けません。
   停止指示とレート制限は従来の処理を維持します。Goalは依頼範囲を広げる許可ではありません。
   Claude・Grok・補助CodexにはGoalを設定せず、更新候補の検証でも有効化しません。
-- 受信許可と書込み許可は別です。既定profileはrepository readとjob outbox writeだけです。`writeAllowFrom` を
-  明示した利用者だけrepository・`.git` writeとネットワークを使えますが、Mac全体のsandboxは解除しません。
+- 設定済みチャンネルの人間の参加者は、個別登録なしでrepository・`.git` writeとネットワークを使えます。
+  DMだけは`writeAllowFrom`の明示許可が必要です。Mac全体のsandboxは解除しません。
 - write許可されたWebタスクでは、primary Codexへ利用可能なBrowser／Chrome能力を渡し、localhostだけでなく
   依頼対象の公開HTTPS環境も実際に開いて確認できます。設定済みの`go-chrome-mcp`は起動時に取得した
   owner管理のtransportを固定し、cookie取得・任意JavaScript等を除いた画面操作だけを引き渡します。
+  host設定に`go-chrome-mcp`がない場合は、zero-codexと同じ親directoryに導入済みの
+  `go-chrome-mcp/mcp-broker.js`を検証して利用します。各Slack Appで同じ接続を利用でき、
+  明示的な`enabled=false`や独自transport設定は上書きしません。別の配置では通常のCodex
+  MCP設定へ登録してください。Chrome拡張本体の導入は必要です。ChatGPT内のChrome接続が
+  利用できても、そのdesktop接続がSlack jobへ自動的に渡るわけではありません。
+  最初の接続は読み取り専用のタブ照会で確認し、入力やクリックの失敗を自動再送しません。
+  操作には明示的な`tabId`が必要です。同じタブはjob間で予約し、Chrome操作も直列化します。
+  作業終了時は`release_tab`で予約を解除します。スクリーンショットは画像として受け取り、
+  browser toolからhostの任意pathへ保存することはできません。
   Chrome拡張との接続にはhost側の既存bridgeを使いますが、Codex shellのHOMEはjob scratchへ隔離したままです。
   それ以外の一般MCPは無効のままです。localhost用には
   `verify_local_page`も残し、署名済みGoogle Chromeをowner-onlyの一時profileで起動して、明示したorigin以外の
@@ -121,7 +130,7 @@ managed/MDMを含む実効permission検査には`app-server config/read`と`conf
 同じSlackスレッドの途中入力は現在turnへ安全に割り込み、単なる質問か作業更新かの意味判断もCodexへ
 委ねます。Zeroちゃんは配送順序、重複防止、取消、process回収だけを管理します。
 
-Primary Codexはrelease codeで`gpt-6-astra`、reasoning effortは`low`へ固定しています。
+Primary Codexはrelease codeで`gpt-6-astra`、reasoning effortは`medium`へ固定しています。
 App Server起動、thread開始／再開、各turnで同じ値を明示し、handshakeの実効値も照合します。
 利用者の`~/.codex/config.toml`、shell環境、state内`.env`では変更されないため、別Macでも同じ設定です。
 Advisorのmodel選択はこのprimary設定とは別に`AGENTS.md`の契約へ従います。
@@ -136,8 +145,8 @@ Advisorのmodel選択はこのprimary設定とは別に`AGENTS.md`の契約へ�
 - このMacでsubscription login済みのGrok CLIとClaude Code（Zeroちゃん稼働中にAPI key認証は行いません）
 
 advisorはprojectの`AGENTS.md`が利用を求める場合にprimary Codexが呼び出します。初期設計は
-`gpt-6-astra` / reasoning `medium`のsolution analyst 1枠、最終reviewは
-`gpt-6-astra` / reasoning `low`のrisk reviewer 1枠を通常のsub-agentとして起動し、各roundで
+`gpt-6-astra` / reasoning `high`のsolution analyst 1枠、最終reviewは
+`gpt-6-astra` / reasoning `medium`のrisk reviewer 1枠を通常のsub-agentとして起動し、各roundで
 Grok 1枠とfresh Claude Fable 5.1 1枠を`zerokun_advisors`経由で起動します。
 最終review第1回の必須指摘をprimary Codexが実際に採用し、task所有の修正差分を作った場合だけ、同じ3枠を
 freshにした第2回でその差分と直接の回帰だけを確認します。軽微な指摘、advisorの欠員、空の修正差分では
@@ -272,6 +281,46 @@ Macごと・対象アプリごとに1回の永続承認が必要で、これも 
 
 ### 3. projectとSlackチャンネルを設定して起動する
 
+コマンドを忘れた場合は `zerochan help`、個別の説明は `zerochan stop --help` や
+`zerochan help update` で確認できます。ヘルプには認証やサービスの起動は不要です。
+
+同じPCから別々のSlackアプリを使う場合は `zerochan set slack-app` で登録します。
+トークンは非表示の端末入力で一度だけ登録し、以後は登録済みApp IDの一覧から選択します。
+任意のフォルダで登録できますが、プロジェクト内で実行するとそのプロジェクトへも紐付きます。
+プロジェクト外で登録した場合は、対象プロジェクトへ移動して同じコマンドで選択してください。
+既存の単一アプリ設定は元の保存先のまま一覧へ取り込まれます。
+トークンをコマンド引数・チャット・Gitへ貼らないでください。
+
+```bash
+cd /absolute/path/to/project-a
+zerochan set slack-app
+zerochan set slack-channel C0123456789
+zerochan start
+
+cd /absolute/path/to/project-b
+zerochan set slack-app
+zerochan set slack-channel C9876543210
+zerochan start
+```
+
+通常はインスタンス名の指定は不要です。各プロジェクトのApp IDから保存先を選びます。
+同じAppを複数プロジェクトで選ぶ場合は、そのAppのgateway・キューを共有します。
+別Appならキューと稼働状態は分離しますが、同じOSユーザーのCodex・Claude・Grok認証や
+利用上限は別枠になりません。別PCではそのPC用のAppを登録してください。
+
+`zerochan update` は同じソースを使う登録済みAppの作業終了を待ち、まとめて更新します。
+起動中は既定で30分ごとにリモートの `main` を確認し、更新があれば同じ更新処理を自動実行します。
+実行中の作業は中断せず、更新中に届いた依頼はキューへ保持し、再起動後に再開します。
+このMac全体の設定は `zerochan auto-update status` で確認し、`off` / `on` で切り替えます（再起動不要）。
+更新結果だけを登録済みユーザーのDMへ通知します。ユーザー未登録なら設定済みチャンネルを使い、
+通知先がまだない初期設定中は自動更新を開始しません。通信障害は通常作業を止めず次回に再確認します。
+未コミット変更・別ブランチ・分岐履歴があるcloneは自動更新しません。失敗時の復旧は既存updaterが行い、
+復旧も失敗した場合は記録を保持します。`off` は開始済みの更新を中断しません。
+更新処理で失敗した同じ版を自動で繰り返し適用せず、次の版を待ちます。原因解消後に同じ版を
+再試行したい場合は `zerochan update` を使ってください（リモート確認だけの通信失敗は30分後に再試行）。
+起動中だったAppだけを再起動し、停止中だったAppは停止状態を保ちます。
+更新や再起動が中断した場合は `zerochan update --recover-only` で保存済みの復旧処理を進めます。
+
 対象projectを新PCへcloneし、通常TerminalまたはHerdrで次を実行します。Herdr外なら専用workspaceが
 自動作成されます。複数repositoryをまとめた親folderも対象にできます。
 
@@ -288,7 +337,8 @@ Appを各channelへ招待したうえで、新しい依頼はそのAppをメン�
 先頭コメントからその返信までのhuman投稿と添付を時系列の1タスクとして受け付けます。
 別の参加者がメンションしても利用できます。DMは最初に表示されるcodeを
 `zerochan-access pair <code>`で承認し、
-repositoryの変更を許可する利用者だけ`zerochan-access write allow <Slack user ID>`を実行します。
+DMでrepositoryの変更も許可する場合だけ`zerochan-access write allow <Slack user ID>`を実行します。
+チャンネルの参加者は個別の利用許可・write登録なしで変更を依頼できます。
 
 同一PCのClaude版を完全に置き換える場合だけ、旧 `zero` cloneを残したまま`zero-codex`を
 別directoryへcloneし、旧stateを明示してsetupします。
@@ -365,7 +415,8 @@ zerochan-access status
 実行すると利用できます。参加者は全員利用でき、bot投稿は無視します。新しい依頼は
 そのSlack Appへのメンションが必要ですが、同じスレッドの続きはメンション不要です。
 
-受信を許可しても repository write は許可されません。書込みが必要な利用者だけ別に付与します。
+チャンネルの参加者は全員、個別登録なしでrepositoryの変更を依頼できます。
+DMは受信許可とrepository writeが別なので、DMで書込みが必要な利用者だけ次で付与します。
 
 ```bash
 zerochan-access write allow U0123456789
@@ -424,6 +475,10 @@ jobは確定し、それ以外の実行中jobは「強制停止による中断�
 threadで「再開して」と送れば、保存済み履歴を参照して続行できます。完了済みのrepository変更や外部操作は
 自動で巻き戻しません。
 
+watchdogの障害通知は、同じ障害が続いている間は時間経過だけで再送しません。初回の障害、
+未通知の深刻化、完全復旧を通知します。一部だけ復旧して再び悪化しても、通知済みの警告は繰り返しません。
+完全復旧後に新たな障害が発生した場合は、改めて通知します。
+
 更新:
 
 ```bash
@@ -431,7 +486,7 @@ zerochan update
 ```
 
 更新対象は `origin/main` の fast-forward のみです。未コミット変更や未 push の local commit
-がある場合は停止します。書込み許可済みの利用者は Slack で「このアプリを更新してください」と依頼でき、
+がある場合は停止します。設定済みチャンネルの参加者、またはDMの書込み許可済み利用者は Slack で「このアプリを更新してください」と依頼でき、
 通常 FIFO の外にある detached updater が自己デッドロックを避けて実行します。
 remoteの候補commitは隔離cloneをCodex sandbox内でsandbox-safe contract test・型検査・build・shell検査してから
 live branchをfast-forwardします。macOSはsandboxの入れ子を拒否するため、実Codex sandbox・tmux・process制御を
@@ -516,7 +571,7 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   current projectのcanonical `github.com` repositoryだけを操作します。作業判断はCodexが行います。
 - App Serverは認証済み`CODEX_HOME`を使うためuser configも読みます。そのため起動直前の
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、
-  primary model=`gpt-6-astra`、reasoning effort=`low`をrelease側から上書きして実効値を照合し、
+  primary model=`gpt-6-astra`、reasoning effort=`medium`をrelease側から上書きして実効値を照合し、
   endpoint/provider差替え、legacy sandbox、named permissionの変更を拒否します。安全規則は
   `developerInstructions`、未信頼のSlack本文はJSON-RPC inputへ分離し、子環境はallowlistです。
 - Codexが返す`instructionSources`を照合し、存在するglobal `AGENTS.md`とproject
@@ -525,9 +580,12 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - `thread/start`は`ephemeral:false`なので、Codex/provider側のnative履歴はZeroちゃんのSQLiteとは別に
   残り得ます。Codexがadvisorを利用した場合は各providerの保持方針も適用されます。
 - apps・plugins・hookと一般MCPは無効化し、localhost表示確認用`zerokun_browser`、認証情報を
-  隠したGitHub transport用`zerokun_github`、およびoperatorが設定済みの検証済みChrome transportだけを
+  隠したGitHub transport用`zerokun_github`、ログ取得用`zerokun_cloud_logging`、およびoperatorが設定済みの検証済みChrome transportだけを
   必要なwrite jobで有効にします。
   Web検索はwrite許可jobだけに限定し、write jobのcommand networkはproxyを通してSlack関連domainを拒否します。
+- 通常の受付・開始はリアクションのみです。ただし、先行作業による待機通知を送信済みの依頼は、
+  実行開始時に同じSlackスレッドへ「作業を開始しました。」を新規投稿します。
+  開始通知はジョブ単位で保存し、再開・再起動による重複を防ぎ、通信失敗時は同じ通知IDで再送します。
 - Zeroちゃんはadvisorの必須性や指摘の重大度、publication planを独自に裁定しません。
   `zerokun_advisors`はprimary Codexが選んだ初期設計・最終reviewの外部枠を安全に起動し、各round 3枠の
   実測状態を返すtransportに限定します。利用不能なadvisorだけを理由にSlack jobを失敗させません。
@@ -566,9 +624,16 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - `zerokun/codex-executor.ts`: Codex App Server実行、turn/control処理、sandbox分離
 - `zerokun/browser-verification-broker.ts`: localhost用の隔離Chrome描画・PNG検証
 - `zerokun/github-credential-broker.ts`: credentialを隠したrepository限定GitHub transport
+- `zerokun/cloud-logging-broker.ts`: ホストのgcloud認証・IAMを使う読取専用Cloud Logging検索とCloud Run設定取得（`cloud-run-reader.ts`）
 - `zerokun/access.ts`: pairing・受信権限・書込み権限の管理 CLI
 - `codex-channel.sh`: standalone gateway と runner の launcher
 - `zerokun/update.ts`: `main` ブランチ用の安全な自己更新
+- `zerokun/supervisor-watch.ts`: runnerから5秒ごとにexecutorの世代と子processを照合します。
+  direct childと追跡中の子孫が全て終了し、出力も進まない状態が30秒続いてもsupervisorが残る場合は、
+  内部cleanup faultとして既存のbounded回収・runner再起動時の復旧へ渡します。
+  無出力だけでは終了と判断せず、liveな子や生死不明の世代がある間は自動停止しません。
+  異常回収した結果を成功として公開することもありません。receiptにdirect childの世代と
+  supervisionStageを残し、終了確認・drain・retainedのどこで止まったかを診断できます。
 - `zerokun/watchdog.sh`: bridge/runner の状態監視
 
 ## 開発時の検証
@@ -585,3 +650,9 @@ bun run verify
 ## License
 
 Apache-2.0
+
+### 非公開の監査証拠
+
+隔離ジョブは `zerokun_cloud_logging.project_audit_read` でホスト登録済みの過去記録とDB監査結果を読み取れます。引数なしで当該projectの証拠IDを一覧し、`evidence` にIDを指定して取得します。任意SQL・接続文字列・ファイルパスは受け付けません。過去の期待集合、変更前後のjournal、現在の値を区別し、欠落した基準を現在値で置き換えないでください。
+
+管理者設定はホストの `~/.codex/zerochan-apps/audit-readers.json`（owner-only、Git管理外）です。`version: 1`、`projects: [{root: 物理project root, entries: {証拠ID: ...}}]` を持ちます。`snapshot` は `source` と `data`、`postgres` は `source`・GCP `project`・Secret Managerの `secret` 名・loopback proxyの `port`・照合する `database`・PGクラスタの `systemId`・管理者が精査した単一SELECTの `sql`・`maxRows` を登録します。必要なら既存サービスアカウント鍵の `credentialFile` パスを指定できます。SQLは単にSELECTなら安全という意味ではなく、副作用のある関数・機密列を含まないことを登録者が確認する信頼済み設定です。秘密値は設定せず、Secret Managerからホスト内だけで取得します。PG側のREAD ONLY/RR transaction、時間・件数・返却サイズ制限も適用します。登録がない状態、失われた証拠、実際のDB権限拒否は別の状態です。一時directoryだけに基準記録を保管せず、出典付きsnapshotを永続保管してください。

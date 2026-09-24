@@ -2,6 +2,7 @@
 
 import { closeSync, existsSync, realpathSync } from 'fs'
 import { join } from 'path'
+import { assertSharedSourceReady } from './shared-update.ts'
 import {
   acquireUpdateLock,
   activeJobCountsFromDatabase,
@@ -33,7 +34,7 @@ import { requireManagedStateRoot } from './managed-path.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
 import {
   environmentForPinnedHerdrRuntime,
-  herdrControlPlaneFingerprint,
+  sameHerdrControlPlane,
   herdrRuntimeFingerprint,
   readPinnedHerdrRuntime,
   requireHerdrRuntime,
@@ -1333,7 +1334,7 @@ async function requireRunningServiceCompatible(
   }
   const pinned = readPinnedHerdrRuntime(stateDir)
   await verifyRuntime(pinned)
-  if (herdrControlPlaneFingerprint(pinned) !== herdrControlPlaneFingerprint(controlRuntime)) {
+  if (!sameHerdrControlPlane(pinned, controlRuntime)) {
     fail('稼働中serviceと現在のHerdr control planeが一致しません')
   }
   const runnerRuntime = readRunnerRuntime(stateDir)
@@ -1364,6 +1365,7 @@ export async function startManagedService(
   let launchAttempted = false
   let attemptedRuntime: HerdrRuntimeIdentity | undefined
   try {
+    assertSharedSourceReady(stateDir)
     requireNoInterruptedUpdate(stateDir)
     const services = serviceProcesses(stateDir)
     const launcher = runnerLauncherProcess(stateDir)
@@ -1475,10 +1477,9 @@ export async function startManagedService(
       fail('serviceが部分起動状態です。zerochan stop --force の後に zerochan start を実行してください')
     }
 
-    const tabCleanup = await cleanupRecordedTab(stateDir, controlRuntime, projectDir, close)
-    if (tabCleanup === 'retained') {
-      fail('既存runtime tabを安全に回収できないため、新しいtabは作成していません')
-    }
+    // All managed service processes are absent above. A restored/foreign old
+    // tab is not a running service: preserve it and create a fresh owned tab.
+    await cleanupRecordedTab(stateDir, controlRuntime, projectDir, close)
     launchAttempted = true
     const started = await startBot({
       rootRepo,
@@ -1581,6 +1582,7 @@ async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2)
   if (command === 'assert-idle') {
     if (args.length !== 1) fail('usage: service-control.ts assert-idle STATE_DIR')
+    assertSharedSourceReady(args[0]!)
     assertServiceMutationIdle(args[0]!)
     return
   }

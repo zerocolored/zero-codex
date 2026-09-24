@@ -48,6 +48,7 @@ import {
   MAX_ADVISOR_PROMPT_BYTES,
 } from './advisor-broker.ts'
 import { JobStore } from './job-runner.ts'
+import { collectHostAdvisorCoverage } from './codex-executor.ts'
 import { readAdvisorInputSnapshot, type AdvisorInputSnapshot } from './advisor-input.ts'
 import {
   advisorRepositoryDigest,
@@ -933,6 +934,14 @@ describe('advisor broker boundaries', () => {
     ]) expect(claudeSubscriptionStatusIsReady(invalid)).toBe(false)
   })
 
+  test('Claude実コマンドのexit 1 JSONがstructured authentication failureになる', async () => {
+    const root = fixtureDir()
+    const executable = join(root, 'claude')
+    writeFileSync(executable, '#!/bin/sh\n/bin/sleep 0.2\nprintf \'%s\\n\' \'{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}\'\nexit 1\n', { mode: 0o700 })
+    await expect(assertClaudeSubscriptionLogin({ ...brokerEnvironment(), ZEROKUN_CLAUDE_BIN_PATH: executable }))
+      .rejects.toMatchObject({ failure: { advisor: 'claude', cause: 'authentication' } })
+  })
+
   test('prompt-startedのexact markerだけを送達可能として分類する', () => {
     const marker = 'REQUEST_MARKER=' + 'A'.repeat(32)
     expect(parseFifthAdvisorSendOutcome(JSON.stringify({ status: 'prompt-started', marker, state_change_seq: 42 })))
@@ -1594,7 +1603,7 @@ print('review complete')
     } finally { await fixture.close() }
   }, 20_000)
 
-  test('同じ復旧入力では再試行予算を繰り返しリセットできない', async () => {
+  test.each([false, true])('復旧予算は同じ入力または中断由来の新入力でリセットできない: %s', async interruptionRecovery => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
       await fixture.call('investigation', 'revision-two', 'unavailable')
@@ -1603,11 +1612,14 @@ print('review complete')
       const cache = JSON.parse(readFileSync(`${path}.responses`, 'utf8'))
       cache.finishedAt -= 31_000
       cache.retryCount = 3
-      cache.recoveryInputRevision = restored.revision
-      cache.recoveryInputDigest = restored.digest
+      if (!interruptionRecovery) {
+        cache.recoveryInputRevision = restored.revision
+        cache.recoveryInputDigest = restored.digest
+      }
       const raw = JSON.stringify(cache)
       writeFileSync(`${path}.responses`, raw, { mode: 0o600 })
       const journal = JSON.parse(readFileSync(path, 'utf8'))
+      journal.interruptionRecovery = interruptionRecovery
       journal.responseCacheDigest = createHash('sha256').update(raw).digest('hex')
       writeFileSync(path, JSON.stringify(journal), { mode: 0o600 })
       const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1,
@@ -2729,9 +2741,22 @@ print('review complete')
       }), { mode: 0o600 })
       const oldCache = { contextDigest: fixture.contextDigest, phase: 'investigation', round: 1,
         inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
-        evidenceDigest: interrupted.primaryEvidenceDigest, complete: false, finishedAt: Date.now(),
+        evidenceDigest: interrupted.primaryEvidenceDigest, complete: false, finishedAt: Date.now() - 31_000,
         native: interrupted.native, grok: [], claude: interrupted.claude }
-      writeFileSync(`${armed.journalPath}.responses`, JSON.stringify(oldCache), { mode: 0o600 })
+      const staleCacheRaw = JSON.stringify(oldCache)
+      writeFileSync(`${armed.journalPath}.responses`, staleCacheRaw, { mode: 0o600 })
+      interrupted.responseCacheDigest = createHash('sha256').update(staleCacheRaw).digest('hex')
+      const interruptedRaw = JSON.stringify(interrupted)
+      writeFileSync(armed.journalPath, interruptedRaw, { mode: 0o600 })
+      const oldReceiptPath = join(fixture.state, 'advisor-retirement', fixture.jobId, fixture.nonce, `${fixture.nonce}.json`)
+      const oldReceipt = JSON.parse(readFileSync(oldReceiptPath, 'utf8'))
+      oldReceipt.terminalJournalDigest = createHash('sha256').update(interruptedRaw).digest('hex')
+      writeFileSync(oldReceiptPath, JSON.stringify(oldReceipt), { mode: 0o600 })
+      const polled = await fixture.call('investigation', 'revision-two')
+      expect(polled.payload).toMatchObject({ recoveredAfterInterruption: true,
+        interrupted: true, retryable: true, attemptsFinished: false,
+        slotSummary: { responsesObtained: 2 } })
+      expect(polled.payload.grok).toEqual([savedGrok])
       const early = await fixture.call('investigation', 'revision-two', 'adopted', 1,
         { retryUnavailable: true, inputUpdateIsRecoveryOnly: true })
       expect(early.payload).toMatchObject({ complete: false, waitingForAdvisors: true, retryable: true })
@@ -2749,14 +2774,93 @@ print('review complete')
       receipt.terminalJournalDigest = createHash('sha256').update(raw).digest('hex')
       writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 })
       const recoveryInput = fixture.stageRevision('接続を復旧しました。同じ依頼を再開して')
+      const continued = await fixture.call('investigation', recoveryInput)
+      expect(continued.payload).toMatchObject({ reusedPriorPhase: true, retryable: true,
+        attemptsFinished: false, inputRevision: fixture.revisionTwo.revision,
+        inputDigest: fixture.revisionTwo.digest, scopeAssessmentRequired: true })
       const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1, { retryUnavailable: true, inputUpdateIsRecoveryOnly: true })
       expect(retry.payload).toMatchObject({ complete: true, allAdopted: true })
       expect(retry.payload.grok).toEqual([savedGrok])
       expect(JSON.parse(readFileSync(`${armed.journalPath}.responses`, 'utf8')))
-        .toMatchObject({ recoveryInputRevision: recoveryInput.revision, recoveryInputDigest: recoveryInput.digest })
+        .toMatchObject({ retryCount: 1, interruptionRecovery: true,
+          recoveryInputRevision: recoveryInput.revision, recoveryInputDigest: recoveryInput.digest })
       expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(1)
     } finally { await fixture.close() }
   }, 20_000)
+
+  test.each(['claude', 'both', 'both-current', 'wrong-binding'] as const)('中断時の保存回答を通常pollで回収する: %s', async saved => {
+    const fixture = await brokerFixture()
+    try {
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo, { version: 9 })
+      if (saved !== 'both-current') finalizeRetiredAdvisorRounds(fixture.state)
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+      const both = saved === 'both' || saved === 'both-current'
+      const claude = { attempted: true, adopted: true, required: true, lifecycle: 'ephemeral-v2',
+        workspaceCreationAttempted: true, freshEphemeral: true, cleanupVerified: true,
+        cleanupStatus: 'closed-and-verified', cleanupReceiptDigest: 'a'.repeat(64),
+        containmentVerified: true, promptMayHaveBeenDelivered: true,
+        executionState: 'response-obtained', response: 'saved Claude answer' }
+      const grok = [{ attempted: true, adopted: true, containmentVerified: true,
+        perspective: 'solution', executionState: 'response-obtained', processId: 42424,
+        response: 'saved Grok answer' }]
+      writeFileSync(`${armed.journalPath}.slots`, JSON.stringify({
+        contextDigest: fixture.contextDigest, phase: 'investigation', round: 1,
+        inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
+        evidenceDigest: saved === 'wrong-binding' ? 'f'.repeat(64) : journal.primaryEvidenceDigest,
+        claude, ...(both ? { grok } : {}),
+      }), { mode: 0o600 })
+      if (saved === 'both-current') {
+        finalizeRetiredAdvisorRounds(fixture.state)
+        const terminal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+        expect(terminal.claude.adopted).toBe(true)
+        expect(terminal.grok[0].adopted).toBe(true)
+      }
+      const latest = saved === 'both-current' ? fixture.revisionTwo : fixture.stageRevision('別の質問も確認してください')
+      if (saved === 'both-current') {
+        const first = await fixture.poll('investigation', 'revision-two')
+        expect(first.payload.receiptRequired).toBe(true)
+        await fixture.restart()
+      }
+      const result = saved === 'both-current'
+        ? await fixture.poll('investigation', 'revision-two')
+        : await fixture.call('investigation', 'revision-two')
+      expect(result.payload).toMatchObject({
+        ...(saved === 'both-current' ? { restoredSavedResponses: true } : {
+          recoveredAfterInterruption: true, retryable: !both,
+          scopeAssessmentRequired: true, currentInputRevision: latest.revision,
+        }),
+        inputUnchanged: saved === 'both-current',
+        slotSummary: { responsesObtained: both ? 3 : saved === 'claude' ? 2 : 1 } })
+      expect(result.payload.complete).toBe(saved === 'both-current')
+      expect(result.payload.claude.adopted).toBe(saved !== 'wrong-binding')
+      const coverage = collectHostAdvisorCoverage(fixture.state, fixture.jobId, fixture.nonce, true)
+      expect(coverage?.phases[0]?.responsesObtained).toBe(both ? 3 : saved === 'claude' ? 2 : 1)
+      expect(coverage?.phases[0]?.failures?.every(f => f.cause === 'interrupted')).toBe(true)
+      expect(existsSync(armed.lockPath)).toBe(false)
+    } finally { await fixture.close() }
+  }, 15_000)
+
+  test('中断を繰り返しても同一roundのdurable復旧上限を新入力で解除しない', async () => {
+    const fixture = await brokerFixture()
+    try {
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo, { version: 9 })
+      finalizeRetiredAdvisorRounds(fixture.state)
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+      journal.retryCount = 3
+      const raw = JSON.stringify(journal)
+      writeFileSync(armed.journalPath, raw, { mode: 0o600 })
+      const receiptPath = join(fixture.state, 'advisor-retirement', fixture.jobId, fixture.nonce, `${fixture.nonce}.json`)
+      const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'))
+      receipt.terminalJournalDigest = createHash('sha256').update(raw).digest('hex')
+      writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 })
+      fixture.stageRevision('同じ依頼を続けて')
+      const retried = await fixture.call('investigation', 'revision-two', 'adopted', 1,
+        { retryUnavailable: true, inputUpdateIsRecoveryOnly: true })
+      expect(retried.payload).toMatchObject({ interrupted: true, retryable: false,
+        attemptsFinished: true, retryBudgetExhausted: true })
+      expect(existsSync(armed.lockPath)).toBe(false)
+    } finally { await fixture.close() }
+  }, 15_000)
 
   test('version 9 requested roundの中断復旧はphase別Grok 1枠とtotal 3を維持する', async () => {
     const fixture = await brokerFixture()

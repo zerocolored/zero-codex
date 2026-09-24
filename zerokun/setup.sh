@@ -293,10 +293,11 @@ ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/
 command -v git >/dev/null 2>&1 || { echo "❌ git がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 command -v tmux >/dev/null 2>&1 || { echo "❌ tmux がありません → bash zerokun/bootstrap-macos.sh"; exit 1; }
 zerokun_require_herdr_version || exit 1
-zerokun_resolve_claude_binary >/dev/null \
-  || { echo "❌ Claude Codeがありません。先に公式Claude Codeを導入してください。" >&2; exit 1; }
-zerokun_claude_subscription_ready \
-  || { echo "❌ Claude Codeはsubscription login済みである必要があります。Herdrで先にloginしてください。Zeroちゃんは認証操作を行いません。" >&2; exit 1; }
+# External advisor availability belongs to each review attempt, not the core
+# service installation transaction. In particular, a transient auth-status
+# failure here used to abort both update AND rollback after gateways stopped.
+# First-install subscription checks remain in bootstrap-macos.sh. Do not probe
+# advisor authentication during unattended setup/recovery (or initiate login).
 BUN_BIN="$(command -v bun)"
 INSTALL_ENV_ROOT="$(/usr/bin/mktemp -d /tmp/zerokun-bun-install.XXXXXX)" \
   || { echo "❌ dependency install用一時directoryを作成できません" >&2; exit 1; }
@@ -640,20 +641,20 @@ bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/update-runtime.ts" \
   install "$REPO_DIR/zerokun" "$CH" >/dev/null
 install -m 0700 "$REPO_DIR/zerokun/watchdog.sh" "$CH/watchdog.sh"
 mkdir -p "$HOME/Library/LaunchAgents"
-WATCHDOG_PLIST="$HOME/Library/LaunchAgents/com.zerokun.watchdog.plist"
+WATCHDOG_LABEL="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/watchdog-profile.ts" label "$CH")"
+WATCHDOG_PLIST="$HOME/Library/LaunchAgents/$WATCHDOG_LABEL.plist"
 if [ -e "$WATCHDOG_PLIST" ] || [ -L "$WATCHDOG_PLIST" ]; then
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-owned-regular "$WATCHDOG_PLIST"
 fi
 WATCHDOG_PLIST_TMP="$(mktemp "$HOME/Library/LaunchAgents/.com.zerokun.watchdog.plist.XXXXXX")"
-sed -e "s|__STATE_DIR__|$CH|g" -e "s|__LEGACY_CUTOVER__|$LEGACY_CUTOVER|g" \
-  "$TPL/com.zerokun.watchdog.plist.template" > "$WATCHDOG_PLIST_TMP"
+bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/watchdog-profile.ts" render "$CH" "$LEGACY_CUTOVER" > "$WATCHDOG_PLIST_TMP"
 chmod 600 "$WATCHDOG_PLIST_TMP"
 mv -f -- "$WATCHDOG_PLIST_TMP" "$WATCHDOG_PLIST"
 WATCHDOG_PLIST_TMP=""
 if [ "${ZEROKUN_SKIP_WATCHDOG_LAUNCHD:-0}" = "1" ]; then
   echo "   watchdog のlaunchd登録をスキップしました"
 else
-  "$LAUNCHCTL_BIN" bootout "gui/$(id -u)/com.zerokun.watchdog" 2>/dev/null || true
+  "$LAUNCHCTL_BIN" bootout "gui/$(id -u)/$WATCHDOG_LABEL" 2>/dev/null || true
   if "$LAUNCHCTL_BIN" bootstrap "gui/$(id -u)" "$WATCHDOG_PLIST"; then
     echo "   watchdog をlaunchdへ登録しました(60秒間隔・自動再起動なし)"
   else
@@ -699,6 +700,11 @@ echo "   安全更新コマンドを設置しました: zerochan update"
 
 # 4. zsh エイリアス。既存の管理ブロックだけをatomicに置換する。
 # symlink/hardlinkや不均衡markerではユーザー設定を変更せず停止する。
+case "$CH" in
+  "$HOME/.codex/zerochan-apps/states/"*) UPDATE_SHELL_DEFAULT=0 ;;
+  *) UPDATE_SHELL_DEFAULT=1 ;;
+esac
+if [ "$UPDATE_SHELL_DEFAULT" = "1" ]; then
 ZSHRC="$HOME/.zshrc"
 ZSHRC_TMP="$(mktemp "$HOME/.zshrc.zerokun-tmp.XXXXXX")"
 if [ -e "$ZSHRC" ] || [ -L "$ZSHRC" ]; then
@@ -734,6 +740,9 @@ EOF
 mv -f -- "$ZSHRC_TMP" "$ZSHRC"
 ZSHRC_TMP=""
 echo "   .zshrc のZeroちゃん管理ブロックを更新しました(新しいターミナルで有効)"
+else
+  echo "   アプリ専用設定のため、既定のシェル設定は保持しました"
+fi
 
 echo ""
 if [ "${ZEROKUN_BOOTSTRAP:-0}" = "1" ]; then
@@ -750,5 +759,5 @@ else
   echo "     ログtabごと起動し直す: zerochan stop → zerochan start"
   echo "     queue確認: zerokun-jobs status"
   echo "     Codex版更新: zerochan update"
-  echo "     書込み許可: zerochan-access write allow <SlackユーザーID>"
+  echo "     DMの書込み許可（チャンネルは個別登録不要）: zerochan-access write allow <SlackユーザーID>"
 fi

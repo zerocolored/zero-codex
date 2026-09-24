@@ -17,6 +17,13 @@ import {
   writeSync,
 } from 'fs'
 import { basename, isAbsolute, join, resolve } from 'path'
+
+export function monitorTabLabel(stateDir: string, seq: number): string {
+  // Keep existing installations' labels while avoiding equal sequence numbers
+  // across registered Slack Apps in the same Herdr session.
+  const app = /\/zerochan-apps\/states\/(A[A-Z0-9]+)$/.exec(resolve(stateDir))?.[1]
+  return `Zeroちゃん #${seq}${app ? ` [${app}]` : ''}`
+}
 import type { JobRecord, JobStatus } from './job-runner.ts'
 import {
   ensureManagedDirectory,
@@ -28,6 +35,7 @@ import {
   observeProcessGeneration,
   processStartKey,
   sameProcessGeneration,
+  signalProcessIfLive,
   type ProcessIdentity,
 } from './process-generation.ts'
 import {
@@ -37,6 +45,7 @@ import {
 } from './safe-file.ts'
 import {
   environmentForPinnedHerdrRuntime,
+  currentHerdrBinary,
   herdrControlPlaneFingerprint,
   herdrRuntimeFingerprint,
   verifyHerdrRuntimeIdentityAsync,
@@ -45,6 +54,7 @@ import {
 import { sanitizeMonitorText } from './codex-monitor-display.ts'
 
 const MONITOR_ROOT = 'job-monitors'
+const DETACHED_MONITOR_ROOT = 'job-monitors-detached'
 const CLOSED_MONITOR_ROOT = 'job-monitors-closed'
 const MANIFEST_FILE = 'manifest.json'
 const READY_FILE = 'ready.json'
@@ -340,7 +350,7 @@ function parseManifest(raw: string): MonitorManifest {
     ),
     phase: phase as HerdrMonitorPhase,
     workspaceId: requireIdentifier(record.workspaceId, /^w[0-9A-Za-z]+$/, 'workspace ID'),
-    label: requireIdentifier(record.label, /^Zeroちゃん #[1-9]\d*$/, 'monitor label'),
+    label: requireIdentifier(record.label, /^Zeroちゃん #[1-9]\d*(?: \[A[A-Z0-9]+\])?$/, 'monitor label'),
     tabId: nullableId(record.tabId, /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/, 'tab ID'),
     paneId: nullableId(record.paneId, /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/, 'pane ID'),
     terminalId: nullableId(record.terminalId, /^term_[0-9a-f]+$/, 'terminal ID'),
@@ -696,6 +706,58 @@ function readMonitorManifest(stateDir: string, jobId: string): MonitorManifest |
   const directory = monitorDirectory(stateDir, jobId)
   const raw = readSmallOwnedFile(join(directory, MANIFEST_FILE), 'monitor manifest')
   return raw === null ? null : parseManifest(raw)
+}
+
+/** Explicit service stop only: stop the recorded viewer, never a pane occupant. */
+export async function stopRecordedHerdrMonitorViewer(stateDir: string, jobId: string): Promise<void> {
+  let manifest: MonitorManifest | null
+  try { manifest = readMonitorManifest(requireManagedStateRoot(stateDir), jobId) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  const viewer = manifest?.viewerProcess
+  if (!viewer || observeProcessGeneration(viewer).status !== 'alive') return
+  // Only the explicit service-stop path calls this. The recorded process
+  // generation, not a possibly restored Herdr pane, is the signal target.
+  signalProcessIfLive(viewer, 'SIGTERM')
+  const deadline = Date.now() + 2_000
+  while (observeProcessGeneration(viewer).status === 'alive' && Date.now() < deadline) await Bun.sleep(50)
+  if (observeProcessGeneration(viewer).status === 'alive') {
+    signalProcessIfLive(viewer, 'SIGKILL')
+    const killDeadline = Date.now() + 2_000
+    while (observeProcessGeneration(viewer).status === 'alive' && Date.now() < killDeadline) await Bun.sleep(50)
+  }
+}
+
+/** Preserve dead viewers' logs without operating any Herdr pane. */
+export function archiveStoppedHerdrMonitor(input: {
+  stateDir: string
+  jobId: string
+  status: JobStatus
+  processStatus?: (process: ProcessIdentity) => 'alive' | 'dead' | 'unknown'
+}): boolean {
+  if (input.status === 'running') return false
+  const stateDir = requireManagedStateRoot(input.stateDir)
+  const archivedRoot = ensureManagedDirectory(stateDir, join(stateDir, DETACHED_MONITOR_ROOT))
+  const destination = join(archivedRoot, safeJobId(input.jobId))
+  let directory: string
+  try { directory = monitorDirectory(stateDir, input.jobId) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    try { requireManagedDirectory(stateDir, destination); return true } catch { return false }
+  }
+  const manifest = readMonitorManifest(stateDir, input.jobId)
+  if (!manifest || !manifest.viewerProcess) return false
+  const status = (input.processStatus ?? (process => observeProcessGeneration(process).status))(manifest.viewerProcess)
+  if (status !== 'dead') return false
+  // rename preserves every feed and receipt. Keep the source if a previous
+  // archive already exists, rather than overwriting evidence.
+  try { lstatSync(destination); return false } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  renameSync(directory, destination)
+  fsyncManagedDirectory(stateDir, archivedRoot)
+  fsyncManagedDirectory(stateDir, join(stateDir, MONITOR_ROOT))
+  return true
 }
 
 function writeManifest(directory: string, manifest: MonitorManifest): MonitorManifest {
@@ -1100,7 +1162,8 @@ export function buildHerdrMonitorControlEnvironment(
     HOME: source.HOME,
     USER: source.USER,
     LOGNAME: source.LOGNAME,
-    PATH: '/usr/bin:/bin',
+    PATH: source.PATH ?? '/usr/bin:/bin',
+    HERDR_BIN_PATH: source.HERDR_BIN_PATH,
     LANG: 'C',
     LC_ALL: 'C',
     TERM: 'dumb',
@@ -1115,7 +1178,7 @@ async function invokeHerdr(
   allowFailure = false,
 ): Promise<Record<string, unknown> | null> {
   await verifyHerdrRuntimeIdentityAsync(runtime)
-  const child = Bun.spawn([runtime.binary, ...args], {
+  const child = Bun.spawn([currentHerdrBinary(runtime), ...args], {
     env: buildHerdrMonitorControlEnvironment(runtime),
     stdin: 'ignore',
     stdout: 'pipe',
@@ -1417,7 +1480,7 @@ async function proveUnrecordedMonitorBindingAbsent(input: {
       `monitor sequence is unavailable for ${input.jobId}`,
     )
   }
-  const expectedLabel = `Zeroちゃん #${input.seq}`
+  const expectedLabel = monitorTabLabel(input.stateDir, input.seq)
   const expectedDirectory = resolve(input.stateDir, MONITOR_ROOT, input.jobId)
   const workspaceIds = [...new Set([
     input.runtime.workspaceId,
@@ -1643,7 +1706,7 @@ export async function openHerdrJobMonitor(input: {
       controlPlaneFingerprint: herdrControlPlaneFingerprint(input.runtime),
       phase: 'create-intent',
       workspaceId: input.runtime.workspaceId,
-      label: `Zeroちゃん #${input.job.seq}`,
+      label: monitorTabLabel(stateDir, input.job.seq),
       tabId: null,
       paneId: null,
       terminalId: null,
@@ -2331,6 +2394,22 @@ export async function reconcileHerdrJobMonitors(input: {
         recoverObligation(name, obligationBeforeRecovery.status, obligationBeforeRecovery.state)
       }
       continue
+    }
+    const settledJob = input.getJob(name)
+    if (input.listMonitorObligations && (!settledJob || settledJob.status === 'completed' || settledJob.status === 'failed')
+      && !obligations().has(name)) {
+      // An unavailable view was explicitly detached after the result was
+      // saved. Preserve its logs; do not operate a potentially reused pane.
+      const archived = archiveStoppedHerdrMonitor({
+        stateDir, jobId: name, status: settledJob?.status ?? 'failed',
+        processStatus: process => control.processGenerationStatus(process),
+      })
+      const detached = archived ? null : readMonitorManifest(stateDir, name)
+      if (archived || !settledJob || detached?.phase !== 'retained-failure'
+        || detached.controlPlaneFingerprint !== herdrControlPlaneFingerprint(input.runtime)) {
+        retained += 1
+        continue
+      }
     }
     const manifest = readMonitorManifest(stateDir, name)
     if (!manifest || manifest.jobId !== name

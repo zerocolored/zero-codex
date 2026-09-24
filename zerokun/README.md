@@ -159,7 +159,7 @@ codex <trust-args> -C <repo> \
   -c default_permissions="zerokun_job" \
   -c project_doc_max_bytes=262144 \
   -c model="gpt-6-astra" \
-  -c model_reasoning_effort="low" \
+  -c model_reasoning_effort="medium" \
   app-server --stdio
 ```
 
@@ -169,9 +169,12 @@ codex <trust-args> -C <repo> \
   session自体を明示的にretireしていなければ、同じSlack thread・同じ物理作業場所の次jobでそのsessionをresumeします。
   クラウド作業場所へ移る場合はsessionとcwdのローカル台帳を照合し、不一致・旧台帳未登録なら
   保存済みスレッド履歴を渡して新規sessionを開始します。旧sessionや元の作業ファイルは削除しません。
-- primary modelは`gpt-6-astra`、reasoning effortは`low`をrelease codeからApp Server起動、
+- primary modelは`gpt-6-astra`、reasoning effortは`medium`をrelease codeからApp Server起動、
   `thread/start`／`thread/resume`、全`turn/start`へ明示します。handshakeの実効値も照合し、
-  `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。advisor modelは`AGENTS.md`の別契約です。
+  `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。
+  設計advisorは`high`、レビューadvisorは`medium`です。release内のread-only／neverなrole TOMLを
+  App Serverの`agents.<role>.config_file`へ指定し、ホストに残った旧role設定より優先します。
+  モデルは両方`gpt-6-astra`のままで、通常のCodex用グローバル設定は変更しません。
 - 実行中の同thread返信は`turn/steer`で同じturnへ渡し、Codexが質問と作業更新を現在の文脈で判断します。
   完全一致の`中止`は`turn/interrupt`です。各controlはSQLite receiptをJSON writeより先に固定し、
   曖昧な送達を自動再送しません。
@@ -211,15 +214,19 @@ codex <trust-args> -C <repo> \
   `zerokun_github`、設定済みでowner管理の`go-chrome-mcp`だけを追加します。
   `go-chrome-mcp`はproject設定からの差替えを拒否し、cookie取得・任意JavaScript等を無効化したうえで、
   hostのChrome bridgeへ接続します。Codex shell自体のHOME/TMPDIR隔離は維持します。
+  Chrome MCPの応答はローカルproxyを通し、URLの認証パラメータ・userinfoとJWT形式の値を
+  Codexへ渡す前に除去します。JSON本文・structuredContent・エラー・通知が対象で、
+  子の生stderrは転送しません。通常のタブIDと検索条件、操作入力は変更しません。
+  画像内の秘密や任意形式のページ本文を完全に除去する仕組みではなく、過去の保存済み履歴も変更しません。
   Web検索はwrite許可jobだけに限定し、command networkとSlack関連domainをpermission profileで制限します。
   Slack tokenは子へ渡さず、Slack投稿をdeveloper instructionsでも禁止します。
 
 ## 権限
 
-受信可否と repository write は別です。
+チャンネルの人間の参加者は全員write可です。DMでは受信可否とrepository writeを別に管理します。
 
-- 通常: minimal runtime + repository read + 当該添付read + job outbox/scratch write
-- `writeAllowFrom` の sender: minimal runtime + repository/`.git` write + network + browser/local bind
+- write未許可のDM: minimal runtime + repository read + 当該添付read + job outbox/scratch write
+- チャンネルの人間の参加者、またはDMで`writeAllowFrom`にいるsender: minimal runtime + repository/`.git` write + network + browser/local bind
 - read senderは1つのread-only Codex workflow、write senderは1つのwrite-authorized Codex workflowを使います。
   advisor、review、test、Git、deployの進め方はCodexが`AGENTS.md`から決め、Zeroちゃんは別phaseへ分割しません。
 - advisorが必要なjobでは、初期設計のnative Codex solution analyst 1枠、最終reviewのnative Codex risk reviewer
@@ -253,8 +260,11 @@ checks確認を行えます。Codex shell HOMEはread/writeともjob scratchへ�
 
 Codex から Slack tool/API を呼ばせません。最終文は runner が bot token で投稿します。成果物を
 返す場合は最終文末の `<zerokun_files>["/absolute/path"]</zerokun_files>` を runner が解釈します。
-job専用`outbox/<job-id>/`直下の空でないregular fileだけをrunner専用sealed領域へ移し、open済みFDから
-50MB上限で読みます。他path、空file、symlink、device/FIFOはuploadしません。terminal本文と成果物ごとの
+job専用outbox・scratch配下の成果物を送信用にコピーし、open済みFDから
+50MB上限で読みます。project内の成果物はoutboxへコピーして指定します。
+同じSlackスレッド・同じprojectの過去のoutboxからも再添付できます。
+1件の準備失敗で他の添付を取り消しません。保護された設定・認証ファイル、
+対象外のpath、空file、symlink、device/FIFOはuploadしません。terminal本文と成果物ごとの
 送信直前に同じbyte列を軽量走査し、平文で明白なcredential patternがあるfileだけ添付を省略します。
 PNG・PDF・ZIPなど形式自体は制限せず、archive展開、復号、OCRは行いません。
 送信済み状態をSQLiteへ別々に残すため、添付失敗時に本文は再投稿しません。upload URL取得までの確実な
@@ -395,3 +405,33 @@ macOSでCodex CLIがある場合は、実`codex sandbox`のstate deny・添付re
 new/resume引数parserもmodelを呼ばずに検証します。自己更新の候補commitは外側のCodex sandbox内で
 sandbox-safe contract test・型検査・build・shell検査を実行します。macOSで入れ子にできない
 実sandbox・tmux・process制御testは通常の`verify.sh`と公開CIだけで全件実行します。
+
+## Cloud Logging・Cloud Run のホスト認証
+
+ジョブのHOMEは分離したままです。認証付きログ検索には
+`zerokun_cloud_logging.cloud_logging_read`を使います。依頼やrepositoryの情報から対象projectを特定し、
+project・UTC開始/終了時刻を明示指定します（任意のLogging filterも指定可能）。最大7日・1000行で、
+行数上限に達した場合は結果が不完全な可能性を返します。任意のgcloud実行、login、設定変更、
+token出力、deployは提供しません。ログ本文は未信頼データとして扱い、秘密らしい文字列と
+一般的なemailを伏せますが、任意の個人情報の完全な除去を保証するものではありません。
+
+ホストにインストール・ログイン済みのgcloudが必要です。アクセス可否は既存のGoogle Cloud IAMで判断し、
+Zeroちゃん独自のrepository別許可リストは設けません。`cloud-access.json`の作成・設定は不要で、
+以前作成したfileも参照しません（更新時に削除はしません）。明示指定したprojectについて、ホストの
+認証アカウントがログ読取権限を持つ範囲で利用できます。既定projectへのfallback、権限の付与、
+再ログインや認証情報のコピーは行いません。実際のIAM拒否とホスト認証の失効は区別して報告します。
+
+初期提供はwrite-authorizedな通常ジョブです。DMのread-onlyジョブ、会話割り込み用turnには
+追加しません。HTTPのlatency・status、resource情報、既知の所要時間/件数とmessageを返し、
+httpRequestのURL・IPや任意のpayload・labelは選択しません。message内の情報には上記の
+伏せ字処理の限界があります。ログ取得成功と、アプリ性能目標の達成は別途検証します。
+
+Cloud Runの設定確認には同じtransportの`cloud_run_describe`を使い、project・region・serviceを
+明示します。既定ではservice templateとtraffic配分を返します。templateが本番trafficを受けているとは
+限らないため、稼働設定の判断前に`revision`も指定して実際の配信revisionを確認します。
+timeout・concurrency・CPU/memory・scalingと環境変数名を返し、secret参照名と値、未知の環境変数値は
+伏せます。レビュー済みの検索feature switchだけboolean値を公開します。省略は未指定、伏せ字は不明を
+意味し、無効化や値0を意味しません。任意のenv値、service account、URL、command/argsは返しません。
+Consoleのログイン主体とホスト認証は異なる場合があります。ブラウザで権限拒否が出ても、このツールを
+試す前にCloud Run全体のアクセス不能とは判断しません。ツールでも拒否された場合だけ、対象resourceの
+ホストIAM拒否として扱います。権限付与、設定変更、再ログインを自動で行う機能ではありません。

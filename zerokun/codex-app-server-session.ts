@@ -8,8 +8,7 @@ const MAX_JSON_LINE_CHARS = 32 * 1024 * 1024
 const MAX_CONTROL_NOTIFICATION_HISTORY = 4_096
 const MAX_ACTIVE_TURN_PROJECTIONS = 16
 const MAX_COMPLETED_TURN_PROJECTIONS = 64
-const MAX_PENDING_LATE_SUBAGENT_ACTIVITIES = 4_096
-const MAX_PENDING_LATE_COMMANDS = 4_096
+const MAX_PENDING_ITEMS = 8_192
 const MAX_APP_SERVER_HISTORY_PAGES = 128
 const MAX_APP_SERVER_HISTORY_TURNS = 4_096
 const MAX_APP_SERVER_HISTORY_RAW_ITEMS = 65_536
@@ -448,8 +447,7 @@ type ObservedTurnProjection = {
     phase: 'started' | 'completed'
     command: AppServerCommandExecutionEvidence
   }>
-  pendingSubAgentActivityIds: Set<string>
-  pendingCommandIds: Set<string>
+  pendingItems: Map<string, string>
 }
 
 function emptyPermissionProbeEvidence(): AppServerPermissionProbeEvidence {
@@ -559,15 +557,6 @@ function appServerHistoryDigest(value: unknown): string {
     .digest('hex')
 }
 
-function knownSubAgentActivityKind(value: unknown): boolean {
-  // 0.149.x exposes the first three values; current App Server also exposes
-  // `completed` for successful children whose item/completed may follow the
-  // parent terminal. Exact item identity, rather than kind alone, is the late
-  // notification authority.
-  return value === 'started' || value === 'interacted'
-    || value === 'interrupted' || value === 'completed'
-}
-
 /**
  * One ordered JSON-RPC writer and one stdout reader for a single supervised
  * `codex app-server --stdio` process. It never retries a request after write.
@@ -581,10 +570,10 @@ export class CodexAppServerSession {
   private readonly controlledThreadIds = new Set<string>()
   private readonly turnProjections = new Map<string, ObservedTurnProjection>()
   private readonly sealedTurnProjections = new Map<string, ObservedTurnProjection>()
-  private readonly lateSubAgentActivities = new Map<string, Set<string>>()
-  private pendingSubAgentActivityCount = 0
-  private readonly lateCommands = new Map<string, Set<string>>()
-  private pendingCommandCount = 0
+  // Only identities survive a terminal, never tool arguments/results. An
+  // outstanding item may outlive the bounded completed-turn tombstone window.
+  private readonly lateItems = new Map<string, Map<string, string>>()
+  private pendingItemCount = 0
   private readonly completedTurnProjectionKeys = new Set<string>()
   private notificationSequence = 0
   private readonly notificationWaiters = new Set<() => void>()
@@ -646,7 +635,7 @@ export class CodexAppServerSession {
     const turn = parseTurn(params.turn)
     const key = turnProjectionKey(threadId, turn.id)
     if (this.completedTurnProjectionKeys.has(key) || this.sealedTurnProjections.has(key)
-      || this.lateCommands.has(key) || this.lateSubAgentActivities.has(key)) {
+      || this.lateItems.has(key)) {
       throw new AppServerProtocolError('App Server reused a completed turn id')
     }
     if (this.turnProjections.has(key)) {
@@ -659,8 +648,7 @@ export class CodexAppServerSession {
       lastAgentMessage: null,
       permissionEvidence: emptyPermissionProbeEvidence(),
       permissionCommandStates: new Map(),
-      pendingSubAgentActivityIds: new Set(),
-      pendingCommandIds: new Set(),
+      pendingItems: new Map(),
     })
   }
 
@@ -696,72 +684,50 @@ export class CodexAppServerSession {
       projection.permissionCommandStates,
       'started',
     )
-    if (item.type === 'commandExecution' && typeof item.id === 'string'
-      && item.id.length > 0 && item.id.length <= 8_192) {
-      const itemId = item.id
-      if (!projection.pendingCommandIds.has(itemId)) {
-        if (this.pendingCommandCount >= MAX_PENDING_LATE_COMMANDS) {
-          throw new AppServerProtocolError('App Server opened too many pending commandExecution items')
-        }
-        projection.pendingCommandIds.add(itemId)
-        this.pendingCommandCount += 1
-      }
+    if (item.type === 'subAgentActivity') identifier(item.id, 'item/started subAgentActivity id')
+    // Older transports omit identities on some active items. They remain
+    // usable in that turn, but cannot authorize a later completion.
+    if (typeof item.id !== 'string' || !item.id || item.id.length > 8_192
+      || typeof item.type !== 'string' || !item.type || item.type.length > 8_192) return
+    const previousType = projection.pendingItems.get(item.id)
+    if (previousType !== undefined && previousType !== item.type) {
+      throw new AppServerProtocolError('App Server reused a pending item id with a different type')
     }
-    if (item.type !== 'subAgentActivity') return
-    const itemId = identifier(item.id, 'item/started subAgentActivity id')
-    if (projection.pendingSubAgentActivityIds.has(itemId)) {
+    if (previousType !== undefined && item.type === 'subAgentActivity') {
       throw new AppServerProtocolError('App Server repeated item/started for a subAgentActivity')
     }
-    if (this.pendingSubAgentActivityCount >= MAX_PENDING_LATE_SUBAGENT_ACTIVITIES) {
-      throw new AppServerProtocolError('App Server opened too many subAgentActivity items')
+    if (previousType !== undefined) return
+    if (this.pendingItemCount >= MAX_PENDING_ITEMS) {
+      throw new AppServerProtocolError('App Server opened too many pending items')
     }
-    projection.pendingSubAgentActivityIds.add(itemId)
-    this.pendingSubAgentActivityCount += 1
+    projection.pendingItems.set(item.id, item.type)
+    this.pendingItemCount += 1
   }
 
-  private observeCompletedItem(params: Record<string, unknown>): void {
+  private observeCompletedItem(params: Record<string, unknown>): 'active' | 'late' {
     const threadId = identifier(params.threadId, 'item/completed thread id')
     const turnId = identifier(params.turnId, 'item/completed turn id')
     const key = turnProjectionKey(threadId, turnId)
     const projection = this.turnProjections.get(key)
     const item = record(params.item, 'item/completed item')
     if (!projection) {
-      // A background command may finish after its parent turn was sealed and
-      // the next turn started. Consume only an observed pending identity.
-      // Never mutate terminal/permission evidence or redispatch the command.
-      if (item.type === 'commandExecution' && typeof item.id === 'string') {
-        const itemId = item.id
-        const pending = this.lateCommands.get(key)
-        if (pending?.delete(itemId)) {
-          this.pendingCommandCount -= 1
-          if (pending.size === 0) this.lateCommands.delete(key)
-          return
-        }
-      }
-      // Codex may attribute a successful child-agent lifecycle completion to
-      // its parent after that parent's terminal notification. Accept only the
-      // exact activity observed before the terminal; an age-based parent
-      // tombstone would either reject a valid long-delayed completion or admit
-      // an unrelated forged completion.
-      if (item.type === 'subAgentActivity' && knownSubAgentActivityKind(item.kind)) {
-        const itemId = identifier(item.id, 'late subAgentActivity id')
-        const pending = this.lateSubAgentActivities.get(key)
-        if (pending?.delete(itemId)) {
-          this.pendingSubAgentActivityCount -= 1
-          if (pending.size === 0) this.lateSubAgentActivities.delete(key)
-          return
-        }
+      // MCP, commands, child agents and future item types can all finish after
+      // their turn. Consume the exact observed identity once, not a type list.
+      const pending = this.lateItems.get(key)
+      if (typeof item.id === 'string' && typeof item.type === 'string'
+        && pending?.get(item.id) === item.type) {
+        pending.delete(item.id)
+        this.pendingItemCount -= 1
+        if (pending.size === 0) this.lateItems.delete(key)
+        return 'late'
       }
       throw new AppServerProtocolError('App Server completed an item before turn/started')
     }
-    if (item.type === 'commandExecution' && typeof item.id === 'string') {
-      if (projection.pendingCommandIds.delete(item.id)) this.pendingCommandCount -= 1
-    }
-    if (item.type === 'subAgentActivity') {
-      const itemId = identifier(item.id, 'item/completed subAgentActivity id')
-      if (projection.pendingSubAgentActivityIds.delete(itemId)) {
-        this.pendingSubAgentActivityCount -= 1
-      }
+    if (item.type === 'subAgentActivity') identifier(item.id, 'item/completed subAgentActivity id')
+    if (typeof item.id === 'string' && typeof item.type === 'string'
+      && projection.pendingItems.get(item.id) === item.type) {
+      projection.pendingItems.delete(item.id)
+      this.pendingItemCount -= 1
     }
     observePermissionProbeItem(
       projection.permissionEvidence,
@@ -771,11 +737,12 @@ export class CodexAppServerSession {
     )
     if (item.type === 'agentMessage' || item.type === 'agent_message') {
       if (isFinalAppServerAgentMessage(item)) projection.lastAgentMessage = item
-      return
+      return 'active'
     }
     // User-message evidence is loaded from the authoritative paginated APIs
     // only when a rejected steer must be reconciled. Keeping every streamed
     // user item here would reintroduce a turn-length-dependent memory bound.
+    return 'active'
   }
 
   private sealTurnProjection(params: Record<string, unknown>): void {
@@ -792,8 +759,7 @@ export class CodexAppServerSession {
       lastAgentMessage: null,
       permissionEvidence: emptyPermissionProbeEvidence(),
       permissionCommandStates: new Map(),
-      pendingSubAgentActivityIds: new Set<string>(),
-      pendingCommandIds: new Set<string>(),
+      pendingItems: new Map<string, string>(),
     }
     this.turnProjections.delete(key)
     if (this.retainsControlNotifications(threadId)) {
@@ -804,11 +770,8 @@ export class CodexAppServerSession {
     } else {
       this.rememberCompletedTurnProjection(key)
     }
-    if (projection.pendingSubAgentActivityIds.size > 0) {
-      this.lateSubAgentActivities.set(key, projection.pendingSubAgentActivityIds)
-    }
-    if (projection.pendingCommandIds.size > 0) {
-      this.lateCommands.set(key, projection.pendingCommandIds)
+    if (projection.pendingItems.size > 0) {
+      this.lateItems.set(key, projection.pendingItems)
     }
   }
 
@@ -888,7 +851,9 @@ export class CodexAppServerSession {
     } else if (notification.method === 'item/started') {
       this.observeStartedItem(notification.params)
     } else if (notification.method === 'item/completed') {
-      this.observeCompletedItem(notification.params)
+      // The raw stream remains available for diagnostics, but old results must
+      // not update the current handoff context, artifacts or progress callbacks.
+      if (this.observeCompletedItem(notification.params) === 'late') return
     } else if (notification.method === 'turn/completed') {
       this.sealTurnProjection(notification.params)
     }

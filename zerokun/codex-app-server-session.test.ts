@@ -1918,16 +1918,20 @@ describe('Codex App Server session', () => {
     await session.waitForReader()
   })
 
-  test('job188: 次turn中の開始済みcommand遅延完了は結果を混ぜず受信する', async () => {
+  test('job232/job188: 種類に依存せず開始済みitemの遅延完了を次turnへ混ぜない', async () => {
+    for (const type of ['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'futureItem', 'agentMessage']) {
     for (const status of ['completed', 'failed', 'interrupted'] as const) {
       const transport = mockTransport()
-      const session = new CodexAppServerSession(transport.input, transport.stream)
+      const callbacks: unknown[] = []
+      const session = new CodexAppServerSession(transport.input, transport.stream, {
+        onNotification: value => { if (value.method === 'item/completed') callbacks.push(value) },
+      })
       const threadId = 'thread-late-command'
       transport.emit({ method: 'turn/started', params: { threadId, turn: {
         id: 'old', status: 'inProgress', itemsView: 'full', items: [], error: null,
       } } })
       transport.emit({ method: 'item/started', params: { threadId, turnId: 'old', item: {
-        type: 'commandExecution', id: 'background-command', status: 'inProgress', command: 'fixture',
+        type, id: 'background-command', status: 'inProgress', command: 'fixture',
       } } })
       transport.emit({ method: 'turn/completed', params: { threadId, turn: {
         id: 'old', status, itemsView: 'full', items: [], error: null,
@@ -1953,7 +1957,8 @@ describe('Codex App Server session', () => {
         id: 'next', status: 'inProgress', itemsView: 'full', items: [], error: null,
       } } })
       transport.emit({ method: 'item/completed', params: { threadId, turnId: 'old', item: {
-        type: 'commandExecution', id: 'background-command', status: 'completed', command: 'fixture', exitCode: 0,
+        type, id: 'background-command', status: 'completed', command: 'fixture', exitCode: 0,
+        text: 'stale final answer', phase: 'final_answer',
       } } })
       transport.emit({ method: 'turn/completed', params: { threadId, turn: {
         id: 'next', status: 'completed', itemsView: 'full', items: [], error: null,
@@ -1961,10 +1966,12 @@ describe('Codex App Server session', () => {
       session.closeInput()
       await session.waitForReader()
       expect(old?.turn.status).toBe(status)
-      expect(old?.permissionEvidence.firstCommand?.status).toBe('inProgress')
+      expect(old?.permissionEvidence.firstCommand?.status).toBe(type === 'commandExecution' ? 'inProgress' : undefined)
+      expect(callbacks).toEqual([])
       const next = session.takeTurnTerminal(threadId, 'next')!
       expect(next.turn.items).toEqual([])
       expect(next.permissionEvidence.commandCount).toBe(0)
+    }
     }
   })
 
@@ -1991,7 +1998,7 @@ describe('Codex App Server session', () => {
     expect(terminal.permissionEvidence.firstCommand?.exitCode).toBeNull()
   })
 
-  test('commandの保留上限は通常完了と遅延完了で解放される', async () => {
+  test('全item共通の保留上限は通常完了と遅延完了で解放される', async () => {
     const transport = mockTransport()
     const session = new CodexAppServerSession(transport.input, transport.stream)
     for (let round = 0; round < 2; round++) {
@@ -1999,18 +2006,37 @@ describe('Codex App Server session', () => {
       transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
         id: turnId, status: 'inProgress', itemsView: 'full', items: [], error: null,
       } } })
-      for (let i = 0; i < 4096; i++) transport.emit({ method: 'item/started', params: {
-        threadId: 'thread', turnId, item: { type: 'commandExecution', id: `command-${i}`, status: 'inProgress', command: 'fixture' },
+      for (let i = 0; i < 8192; i++) transport.emit({ method: 'item/started', params: {
+        threadId: 'thread', turnId, item: { type: i % 2 ? 'mcpToolCall' : 'futureItem', id: `item-${i}`, status: 'inProgress' },
       } })
       if (round === 0) transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
         id: turnId, status: 'completed', itemsView: 'full', items: [], error: null,
       } } })
-      for (let i = 0; i < 4096; i++) transport.emit({ method: 'item/completed', params: {
-        threadId: 'thread', turnId, item: { type: 'commandExecution', id: `command-${i}`, status: 'completed', exitCode: 1, command: 'fixture' },
+      for (let i = 0; i < 8192; i++) transport.emit({ method: 'item/completed', params: {
+        threadId: 'thread', turnId, item: { type: i % 2 ? 'mcpToolCall' : 'futureItem', id: `item-${i}`, status: 'completed' },
       } })
     }
     session.closeInput()
     await session.waitForReader()
+  })
+
+  test('種類とturnを跨ぐ未完了item総数を上限内に保つ', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    for (let round = 0; round < 2; round++) {
+      const turnId = `turn-${round}`
+      transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+        id: turnId, status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      for (let i = 0; i < (round ? 1 : 8192); i++) transport.emit({ method: 'item/started', params: {
+        threadId: 'thread', turnId, item: { type: round ? 'newTool' : 'mcpToolCall', id: `item-${i}` },
+      } })
+      transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+        id: turnId, status: 'completed', itemsView: 'full', items: [], error: null,
+      } } })
+    }
+    transport.close()
+    await expect(session.waitForReader()).rejects.toThrow('too many pending items')
   })
 
   test('保留commandが残るturn IDは墓標の期限後も再利用しない', async () => {
@@ -2035,7 +2061,8 @@ describe('Codex App Server session', () => {
     await expect(session.waitForReader()).rejects.toThrow('reused a completed turn id')
   })
 
-  test('遅延commandは別thread・turn・item・typeと二重完了を受け入れない', async () => {
+  test('遅延itemは別thread・turn・item・typeと二重完了を受け入れない', async () => {
+    for (const type of ['commandExecution', 'mcpToolCall', 'futureItem']) {
     for (const mismatch of ['thread', 'turn', 'item', 'type', 'duplicate']) {
       const transport = mockTransport()
       const session = new CodexAppServerSession(transport.input, transport.stream)
@@ -2043,7 +2070,7 @@ describe('Codex App Server session', () => {
         id: 'turn', status: 'inProgress', itemsView: 'full', items: [], error: null,
       } } })
       transport.emit({ method: 'item/started', params: { threadId: 'thread', turnId: 'turn', item: {
-        type: 'commandExecution', id: 'command', command: 'fixture', status: 'inProgress',
+        type, id: 'command', command: 'fixture', status: 'inProgress',
       } } })
       transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
         id: 'turn', status: 'completed', itemsView: 'full', items: [], error: null,
@@ -2051,7 +2078,7 @@ describe('Codex App Server session', () => {
       const completion = { method: 'item/completed', params: {
         threadId: mismatch === 'thread' ? 'other' : 'thread',
         turnId: mismatch === 'turn' ? 'other' : 'turn', item: {
-          type: mismatch === 'type' ? 'agentMessage' : 'commandExecution',
+          type: mismatch === 'type' ? 'agentMessage' : type,
           id: mismatch === 'item' ? 'other' : 'command', status: 'completed', exitCode: 0,
         },
       } }
@@ -2059,6 +2086,7 @@ describe('Codex App Server session', () => {
       if (mismatch === 'duplicate') transport.emit(completion)
       transport.close()
       await expect(session.waitForReader()).rejects.toThrow('before turn/started')
+    }
     }
   })
 

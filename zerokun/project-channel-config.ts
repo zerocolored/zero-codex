@@ -42,6 +42,7 @@ const MUTATION_LOCK_WAIT_MS = 5_000
 export interface ProjectChannelConfig {
   version: typeof CONFIG_VERSION
   slackChannels: string[]
+  slackAppId?: string
 }
 
 interface RouteJournal {
@@ -184,28 +185,67 @@ export function readProjectChannelConfig(repoPathInput: string): ProjectChannelC
   }
   const record = value as Record<string, unknown>
   if (record.version !== CONFIG_VERSION
-    || Object.keys(record).sort().join(',') !== 'slackChannels,version') {
+    || !['slackChannels,version', 'slackAppId,slackChannels,version'].includes(Object.keys(record).sort().join(','))) {
     throw new Error(`未対応のZeroちゃん設定形式です: ${path}`)
   }
   const config: ProjectChannelConfig = {
     version: CONFIG_VERSION,
     slackChannels: normalizeChannels(record.slackChannels),
+    ...(record.slackAppId === undefined ? {} : { slackAppId: requireSlackAppId(String(record.slackAppId)) }),
   }
   sameDirectory(dir, identity)
   return config
 }
 
-function writeProjectChannelConfig(repoPath: string, slackChannels: string[]): void {
+function withProjectConfigLock<T>(repoPath: string, action: () => T): T {
+  ensureLocalConfigDirectory(repoPath)
+  const path = join(configDirectory(repoPath), 'config.lock')
+  const deadline = Date.now() + MUTATION_LOCK_WAIT_MS
+  while (true) {
+    const lock = tryAcquireProcessLock(path)
+    if (lock.acquired) {
+      try { return action() }
+      finally { releaseProcessLock(path, lock.lease) }
+    }
+    if (Date.now() >= deadline || lock.kind === 'owner-unavailable') throw new Error('別のプロジェクト設定操作が実行中です')
+    Bun.sleepSync(50)
+  }
+}
+
+function writeProjectChannelConfig(repoPath: string, slackChannels: string[], appId?: string): void {
+  withProjectConfigLock(repoPath, () => {
   const identity = ensureLocalConfigDirectory(repoPath)
   const path = projectChannelConfigPath(repoPath)
   if (existsSync(path)) requireSafeExistingFile(path)
+  const before = readProjectChannelConfig(repoPath)
+  if (appId && before.slackAppId && before.slackAppId !== appId) throw new Error('プロジェクトと接続先Slackアプリが一致しません')
   const config: ProjectChannelConfig = {
     version: CONFIG_VERSION,
     slackChannels: normalizeChannels(slackChannels),
+    ...(before.slackAppId ? { slackAppId: before.slackAppId } : {}),
   }
   atomicWritePrivateFile(path, `${JSON.stringify(config, null, 2)}\n`)
   chmodSync(path, 0o600)
   sameDirectory(configDirectory(repoPath), identity)
+  })
+}
+
+/** Bind once without copying credentials or silently moving existing channel routes. */
+export function bindProjectSlackApp(repoPathInput: string, appIdInput: string, verifyExistingChannels?: (channels: string[]) => boolean): void {
+  const repoPath = realpathSync(repoPathInput)
+  const appId = requireSlackAppId(appIdInput)
+  withProjectConfigLock(repoPath, () => {
+  const identity = ensureLocalConfigDirectory(repoPath)
+  const before = readProjectChannelConfig(repoPath)
+  if (before.slackAppId && before.slackAppId !== appId) {
+    throw new Error('このプロジェクトは別のSlackアプリに接続済みです。接続先の変更には既存設定の移行が必要です')
+  }
+  if (!before.slackAppId && before.slackChannels.length && !verifyExistingChannels?.(before.slackChannels)) {
+    throw new Error('既存チャンネルは別のアプリで利用中、または接続元を確認できません。先に元の設定で zerochan unset slack-channel を実行してください')
+  }
+  atomicWritePrivateFile(projectChannelConfigPath(repoPath), JSON.stringify({ ...before, slackAppId: appId }, null, 2) + '\n')
+  sameDirectory(configDirectory(repoPath), identity)
+  })
 }
 
 function journalPath(stateDir: string): string {
@@ -297,6 +337,8 @@ function recoverJournal(stateDir: string, store: JobStore): void {
   if (!journal) return
   const repoPath = realpathSync(journal.repoPath)
   if (repoPath !== journal.repoPath) throw new Error('channel route journal project moved')
+  const binding = readProjectChannelConfig(repoPath).slackAppId
+  if (binding && binding !== journal.appId) throw new Error('保存されたチャンネル設定とSlackアプリが一致しません')
   store.assertSlackChannelRoutesAvailable(journal.appId, repoPath, journal.afterChannels)
   if (journal.operation === 'sync') {
     store.syncSlackChannelRoutes({
@@ -312,9 +354,9 @@ function recoverJournal(stateDir: string, store: JobStore): void {
       channelIds: journal.afterChannels,
       configuredAt: journal.createdAt,
     })
-    writeProjectChannelConfig(repoPath, journal.afterChannels)
+    writeProjectChannelConfig(repoPath, journal.afterChannels, journal.appId)
   } else {
-    writeProjectChannelConfig(repoPath, journal.afterChannels)
+    writeProjectChannelConfig(repoPath, journal.afterChannels, journal.appId)
     store.syncSlackChannelRoutes({
       appId: journal.appId,
       repoPath,
@@ -345,6 +387,9 @@ export function mutateProjectChannelConfig(input: {
     const layout = resolveProjectLayout(repoPath)
     if (layout.kind === 'multi-repo-workspace') ensureLocalConfigDirectory(repoPath)
     const before = readProjectChannelConfig(repoPath)
+    if (before.slackAppId && before.slackAppId !== appId) {
+      throw new Error('プロジェクトと接続先Slackアプリが一致しません')
+    }
     const requested = input.channelId === undefined
       ? undefined
       : normalizeSlackChannelId(input.channelId)
@@ -377,9 +422,9 @@ export function mutateProjectChannelConfig(input: {
     try {
       if (input.operation === 'unset') {
         store.syncSlackChannelRoutes({ appId, repoPath, channelIds: afterChannels })
-        writeProjectChannelConfig(repoPath, afterChannels)
+        writeProjectChannelConfig(repoPath, afterChannels, appId)
       } else {
-        if (input.operation === 'set') writeProjectChannelConfig(repoPath, afterChannels)
+        if (input.operation === 'set') writeProjectChannelConfig(repoPath, afterChannels, appId)
         store.syncSlackChannelRoutes({ appId, repoPath, channelIds: afterChannels })
       }
     } catch (error) {
@@ -394,7 +439,7 @@ export function mutateProjectChannelConfig(input: {
           configuredAt: journal.createdAt,
         })
         if (input.operation !== 'sync') {
-          writeProjectChannelConfig(repoPath, before.slackChannels)
+          writeProjectChannelConfig(repoPath, before.slackChannels, appId)
         }
         clearJournal(stateDir)
       } catch {
@@ -404,7 +449,7 @@ export function mutateProjectChannelConfig(input: {
       throw error
     }
     clearJournal(stateDir)
-    return { version: CONFIG_VERSION, slackChannels: afterChannels }
+    return { ...before, slackChannels: afterChannels }
   } finally {
     store?.close()
     if (!releaseProcessLock(lockPath, lease)) {
@@ -439,6 +484,7 @@ export function projectChannelStatus(input: {
       && readiness.channelRoutingVersion === 1 && readiness.slackAppId === appId
     const lines = [
       `📁 project: ${repoPath}`,
+      `🔗 Slackアプリ: ${appId}`,
       ...(layout.kind === 'multi-repo-workspace'
         ? [`🧩 repositories: ${layout.memberNames.join(', ')}`]
         : []),

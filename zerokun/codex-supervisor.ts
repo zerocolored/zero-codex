@@ -34,6 +34,8 @@ import {
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { verifyEncodedOfficialCodexSnapshot } from './standalone-codex.ts'
 import { subprocessExitCode } from './process-exit-code.ts'
+import { startProcessPolling } from './supervisor-watch.ts'
+import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import {
   readSeatbeltFingerprint,
   reapSeatbeltFingerprint,
@@ -164,6 +166,8 @@ async function main(): Promise<void> {
     `${process.pid}:${supervisorIdentity.started}`,
     { pid: process.pid, started: supervisorIdentity.started },
   ]])
+  let directChild: { pid: number; started: string } | undefined
+  let supervisionStage = 'starting'
   let registrationPhase: 'active' | 'cleanup-confirmed' = 'active'
   // cleanup-confirmed means the lifecycle finished, not that unreadable PIDs
   // were proven dead. Keep those observations separate from the pinned ledger.
@@ -178,6 +182,8 @@ async function main(): Promise<void> {
     phase: registrationPhase,
     revision,
     cleanupPending: true,
+    directChild,
+    supervisionStage,
     cleanupWarnings,
     cleanupWarningCount,
     jobId,
@@ -229,6 +235,7 @@ async function main(): Promise<void> {
   const persistCleanupConfirmed = (): void => {
     mergeTrackedLedger()
     registrationPhase = 'cleanup-confirmed'
+    supervisionStage = 'finished'
     revision += 1
     atomicWritePrivateFile(registrationPath, serializedRegistration())
     persistedTracked = JSON.stringify(registration().tracked)
@@ -246,6 +253,7 @@ async function main(): Promise<void> {
     rmSync(registrationPath, { force: true })
   }
   let cleanupConfirmed = false
+  let stopTracking: (() => void) | undefined
   let childStarted = false
   try {
     if (encodedOfficialSnapshot !== undefined) {
@@ -280,6 +288,7 @@ async function main(): Promise<void> {
       // kept open until their real EOF; explicit cancellation instead enters
       // the parent-owned bounded process cleanup path.
       onExit: (_subprocess, exitCode, signalCode, error) => {
+        if (hasTestOverride && process.env.ZEROKUN_SUPERVISOR_TEST_DROP_EXIT_CALLBACK === '1') return
         if (error) {
           rejectDirectExit(error)
           return
@@ -300,6 +309,8 @@ async function main(): Promise<void> {
       if (Date.now() >= gateDeadline) throw new Error('Codex gate did not stop before registration')
       await Bun.sleep(5)
     }
+    directChild = { pid: childIdentity.pid, started: childIdentity.started }
+    supervisionStage = 'running'
     persistTracked()
     if (!signalProcessIfLive(childIdentity, 'SIGCONT')) {
       throw new Error('Codex gateを追跡情報の永続化後に開始できません')
@@ -308,7 +319,6 @@ async function main(): Promise<void> {
     const stderrRelay = relayStream(child.stderr, process.stderr)
     const relayCompletion = Promise.allSettled([stdoutRelay.done, stderrRelay.done])
     const excluded = new Set([process.pid])
-    let tracking = true
     let trackingError: unknown
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined
     let forceCleanupRequested = false
@@ -338,26 +348,19 @@ async function main(): Promise<void> {
       return delivered
     }
     const terminateChild = (): boolean => signalChildTermination(true)
-    const tracker = (async () => {
-      try {
-        while (tracking) {
-          captureTrackedProcesses([process.pid, child.pid], process.pid, tracked, excluded)
-          persistTracked()
-          if (hasTestOverride
-            && process.env.ZEROKUN_SUPERVISOR_TEST_FORCE_TRACKER_ERROR === '1'
-            && existsSync(join(stateDir, '.test-force-tracker-error-ready'))) {
-            throw new Error('forced supervisor tracker error for tests')
-          }
-          await Bun.sleep(100)
-        }
-      } catch (error) {
-        trackingError = error
-        // Tracker failure is an explicit cleanup fault, not ordinary cleanup.
-        // Bound the recovery path even when a descendant ignores TERM.
-        requestForceCleanup()
-        terminateChild()
+    stopTracking = startProcessPolling(() => {
+      captureTrackedProcesses([process.pid, child.pid], process.pid, tracked, excluded)
+      persistTracked()
+      if (hasTestOverride
+        && process.env.ZEROKUN_SUPERVISOR_TEST_FORCE_TRACKER_ERROR === '1'
+        && existsSync(join(stateDir, '.test-force-tracker-error-ready'))) {
+        throw new Error('forced supervisor tracker error for tests')
       }
-    })()
+    }, error => {
+      trackingError = error
+      requestForceCleanup()
+      terminateChild()
+    }, 100)
     // group宛signalはCodexにも届く。wrapper自身は子孫の終了と後始末を待つ。
     const forwardSignal = () => {
       requestForceCleanup()
@@ -378,10 +381,27 @@ async function main(): Promise<void> {
     process.on('SIGINT', forwardSignal)
     process.on('SIGTERM', forwardSignal)
     process.on('SIGUSR2', finishCompletedTurn)
-    const exitCode = await directExit
+    // Simulate a lost continuation without changing the OS child evidence.
+    // Only unverified fixtures may enter this deliberately stalled boundary.
+    if (hasTestOverride && process.env.ZEROKUN_SUPERVISOR_TEST_STALL_EXIT_WAIT === '1') {
+      await forceCleanupSignal
+    }
+    const exitCode = await waitForDirectExit({
+      callback: directExit,
+      state: () => ({
+        exitCode: child.exitCode,
+        signalCode: child.signalCode,
+        generation: observeProcessGeneration(childIdentity).status,
+      }),
+      warn: reason => {
+        process.stderr.write(`Codex direct-exit reconciliation: ${reason}; continuing descendant cleanup.\n`)
+      },
+    })
     if (forceKillTimer) clearTimeout(forceKillTimer)
-    tracking = false
-    await tracker
+    stopTracking?.()
+    supervisionStage = 'draining'
+    revision += 1
+    atomicWritePrivateFile(registrationPath, serializedRegistration())
     if (hasTestOverride
       && process.env.ZEROKUN_SUPERVISOR_TEST_FORCE_RETAIN_AFTER_CHILD_EXIT === '1') {
       throw new Error('forced supervisor retained-state for tests')
@@ -494,8 +514,12 @@ async function main(): Promise<void> {
     // loop alive.
     process.exit(logicalStopDelivered ? LOGICAL_CLEANUP_EXIT_CODE : exitCode)
   } catch (error) {
+    stopTracking?.()
     if (!childStarted) cleanupConfirmed = true
     if (cleanupConfirmed) throw error
+    supervisionStage = 'retained'
+    revision += 1
+    try { atomicWritePrivateFile(registrationPath, serializedRegistration()) } catch {}
     // Keep the exact group leader and durable registration alive whenever
     // cleanup is uncertain. The executor/next runner can then TERM and KILL
     // the still-verifiable group without following a recycled numeric PGID.

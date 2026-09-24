@@ -10,6 +10,17 @@ while [ -L "$SOURCE_PATH" ]; do
   case "$SOURCE_PATH" in /*) ;; *) SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH" ;; esac
 done
 REPO_DIR="$(CDPATH='' cd -P "$(dirname "$SOURCE_PATH")" >/dev/null 2>&1 && pwd)"
+. "$REPO_DIR/zerokun/cli-help.sh"
+if [ "${1:-}" = "help" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  zerochan_help "${2:-}"
+  exit $?
+fi
+for help_argument in "$@"; do
+  if [ "$help_argument" = "--help" ] || [ "$help_argument" = "-h" ]; then
+    zerochan_help "${1:-}"
+    exit $?
+  fi
+done
 . "$REPO_DIR/zerokun/state-dir.sh"
 
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -24,16 +35,26 @@ unset BUN_OPTIONS BUN_CONFIG_PRELOAD NODE_OPTIONS
 unset ZEROKUN_UPDATE_TESTING ZEROKUN_SLACK_IDENTITY_TEST_APP_ID \
   ZEROKUN_SETUP_TEST_STOP_PROBE
 command -v bun >/dev/null 2>&1 || { echo "❌ bun が見つかりません。" >&2; exit 1; }
+REPLACE_TOKEN_VALUE="${ZEROKUN_REPLACE_TOKEN:-}"
+unset ZEROKUN_REPLACE_TOKEN
+if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "auto-update" ]; then
+  [ "$#" -eq 2 ] || { echo '使い方: zerochan auto-update on|off|status' >&2; exit 2; }
+  exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/auto-update.ts" "$2"
+fi
+if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "set" ] && [ "${2:-}" = "slack-app" ]; then
+  [ "$#" -eq 2 ] || { echo '使い方: zerochan set slack-app（トークンは対話入力）' >&2; exit 2; }
+  exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-command.ts" "$(pwd -P)"
+fi
 STATE_DIR="$(zerokun_resolve_state_dir)"
 if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "cloud" ]; then
   [ "$#" -eq 2 ] || { echo "使い方: zerochan cloud login|activate|status" >&2; exit 2; }
+  STATE_DIR="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" "$(pwd -P)" "$STATE_DIR")"
+  export ZEROKUN_LEGACY_CUTOVER="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" cutover "$STATE_DIR")"
   exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/cloud-setup.ts" "$2" "$STATE_DIR"
 fi
 # The updater may hand this value to the launcher through an internal
 # trampoline. Capture it as a non-exported shell value before the first Bun
 # helper so Slack, advisor, runner, and gateway children never inherit it.
-REPLACE_TOKEN_VALUE="${ZEROKUN_REPLACE_TOKEN:-}"
-unset ZEROKUN_REPLACE_TOKEN
 LAUNCH_MODE="start"
 CHANNEL_ID=""
 UPDATE_RECOVER_ONLY=0
@@ -60,11 +81,7 @@ case "$INVOKED_AS" in
       PROJECT="$(pwd -P)"
     elif [ "$#" -eq 1 ] && [ "$1" = "--restart" ]; then
       LAUNCH_MODE="restart"
-      PROJECT="$(bun --config=/dev/null --no-env-file \
-        "$REPO_DIR/zerokun/project-selection.ts" read-last "$STATE_DIR")" || {
-        echo "❌ 前回接続したprojectを確認できません。対象projectへ cd して zerochan を実行してください。" >&2
-        exit 1
-      }
+      PROJECT=""
     elif [ "$#" -eq 3 ] && [ "$1" = "set" ] && [ "$2" = "slack-channel" ]; then
       LAUNCH_MODE="set-channel"
       CHANNEL_ID="$3"
@@ -76,7 +93,8 @@ case "$INVOKED_AS" in
       LAUNCH_MODE="status"
       PROJECT="$(pwd -P)"
     else
-      echo "使い方: zerochan | zerochan start | zerochan stop [--force] | zerochan update [--recover-only] | zerochan --restart | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
+      echo "使い方: zerochan | zerochan start | zerochan stop [--force] | zerochan update [--recover-only] | zerochan --restart | zerochan set slack-app | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
+      echo "コマンド一覧: zerochan help / 詳細: zerochan <command> --help" >&2
       exit 2
     fi
     ;;
@@ -96,6 +114,16 @@ case "$INVOKED_AS" in
     fi
     ;;
 esac
+
+if [ "$INVOKED_AS" = "zerochan" ] || [ "$INVOKED_AS" = "zerokun" ]; then
+  STATE_DIR="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" "${PROJECT:-$(pwd -P)}" "$STATE_DIR")"
+  export ZEROKUN_STATE_DIR="$STATE_DIR"
+  export ZEROKUN_LEGACY_CUTOVER="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" cutover "$STATE_DIR")"
+  unset ZEROKUN_JOB_DB
+  if [ "$LAUNCH_MODE" = "restart" ]; then
+    PROJECT="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-selection.ts" read-last "$STATE_DIR")"
+  fi
+fi
 
 # Updating is a repository-level maintenance action. Dispatch it before the
 # ordinary project, Slack token, and Herdr startup checks so a broken runtime

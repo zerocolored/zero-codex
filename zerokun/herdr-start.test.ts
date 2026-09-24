@@ -9,7 +9,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { startZeroInHerdrWorkspace } from './herdr-start.ts'
+import { startZeroInHerdrWorkspace, herdrStartCommand } from './herdr-start.ts'
 import type { ManagedServiceStatus } from './service-control.ts'
 
 function fixture(): { root: string; state: string; project: string } {
@@ -39,6 +39,21 @@ function createdWorkspace(project: string): Record<string, unknown> {
 }
 
 describe('outside-Herdr start handoff', () => {
+  test('shell handoff preserves exact App state and project paths with spaces and quotes', () => {
+    const { root } = fixture()
+    try {
+      const launcher = join(root, 'launcher.sh')
+      writeFileSync(launcher, '#!/bin/bash\nprintf "%s\\n%s\\n" "$ZEROKUN_STATE_DIR" "$1"\n', { mode: 0o700 })
+      const state = "/private/tmp/state a'quoted"
+      const project = '/private/tmp/project $(must-not-run)'
+      const result = Bun.spawnSync(['/bin/bash', '-c', herdrStartCommand(launcher, state, project)], {
+        env: { PATH: '/usr/bin:/bin', ZEROKUN_STATE_DIR: '/wrong-app' },
+      })
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout.toString()).toBe(`${state}\n${project}\n`)
+      expect(result.stderr.toString()).toBe('')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
   test('fresh workspaceのexact root paneでzerochan startを実行し稼働確認する', async () => {
     const current: ManagedServiceStatus = { status: 'stopped' }
     const calls: string[][] = []
@@ -78,7 +93,7 @@ describe('outside-Herdr start handoff', () => {
         '--label', 'Zeroちゃん project', '--focus',
       ])
       expect(calls[1]).toEqual([
-        'pane', 'run', 'wNEW:p1', realpathSync(join(root, 'codex-channel.sh')), 'start',
+        'pane', 'run', 'wNEW:p1', herdrStartCommand(realpathSync(join(root, 'codex-channel.sh')), realpathSync(state), realpathSync(project)),
       ])
     } finally {
       rmSync(root, { recursive: true, force: true })
