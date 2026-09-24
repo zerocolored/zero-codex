@@ -40,7 +40,7 @@ import {
   mentionsBot,
 } from './gate.ts'
 import { requestUpdate, resumePendingUpdateWorker } from './zerokun/update-request.ts'
-import { checkAutomaticUpdate, remoteUpdateHead } from './zerokun/auto-update.ts'
+import { automaticUpdateRecipient, checkAutomaticUpdate, remoteUpdateHead } from './zerokun/auto-update.ts'
 import { slackAppRegistryRoot, listRegisteredSlackApps } from './zerokun/slack-app-registry.ts'
 import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
 import {
@@ -2807,8 +2807,7 @@ try {
   const checkForUpdates = async () => {
     try {
       const access = loadAccess()
-      const destination = access.allowFrom[0] ?? Object.keys(access.channels).sort()[0]
-      if (!destination) return // Wait until an actual notification recipient is configured.
+      const destination = automaticUpdateRecipient(access.allowFrom)
       await checkAutomaticUpdate({
         root: slackAppRegistryRoot(), stateDir: STATE_DIR,
         detect: () => remoteUpdateHead(import.meta.dir),
