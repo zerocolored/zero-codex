@@ -202,7 +202,7 @@ int main(void) {
     expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'sandbox.toml'))).toBe(0o600)
     expect(mode(join(home, '.zerokun/runtime/grok-reviewer', 'requirements.toml'))).toBe(0o600)
     expect(readFileSync(join(home, '.zerokun/runtime/grok-reviewer', 'config.toml'), 'utf8'))
-      .toContain('default = "grok-4.6"')
+      .toContain('default = "grok-4.7"')
     expect(readFileSync(join(home, '.zerokun/runtime/grok-reviewer', 'requirements.toml'), 'utf8'))
       .toContain('disable_api_key_auth = true')
     const oauthLauncher = readFileSync(
