@@ -5,7 +5,7 @@ test('一時失敗だけ30秒・60秒後に再取得し結果を毎回保存す�
   let calls = 0
   const waits: number[] = [], saved: boolean[] = []
   const result = await recoverAdvisorSlot({
-    advisor: 'claude', run: async () => ({ adopted: ++calls === 3, containmentVerified: true, reason: 'response missing' }),
+    advisor: 'claude', run: async () => ({ adopted: ++calls === 3, containmentVerified: true, promptMayHaveBeenDelivered: false, reason: 'startup failure' }),
     persist: value => { saved.push(value.adopted) }, wait: async ms => { waits.push(ms) },
   })
   expect(result.adopted).toBe(true)
@@ -67,4 +67,31 @@ test('3回失敗しても成功へ変換せず返し、tight loopしない', asy
   expect(calls).toBe(3)
   expect(waits).toEqual([30_000, 60_000])
   expect(result.adopted).toBe(false)
+})
+
+
+test('Claudeの送達可能性がある失敗と送達不明はfresh再送しない', async () => {
+  for (const delivered of [true, undefined]) {
+    for (const reason of ['startup failure', 'response missing', 'timeout', 'network error']) {
+      let calls = 0
+      await recoverAdvisorSlot({ advisor: 'claude',
+        run: async () => { calls++; return { adopted: false, containmentVerified: true,
+          promptMayHaveBeenDelivered: delivered, reason } },
+        persist: () => {}, wait: async () => { throw new Error('must not resend') },
+      })
+      expect(calls).toBe(1)
+    }
+  }
+})
+
+
+test('再開時の保存済みClaude送達不明結果も新規起動しない', async () => {
+  const saved = { adopted: false, containmentVerified: true, promptMayHaveBeenDelivered: true, reason: 'timeout' }
+  let calls = 0
+  const result = await recoverAdvisorSlot({ advisor: 'claude', saved,
+    run: async () => { calls++; return saved }, persist: () => {},
+    wait: async () => { throw new Error('must not resend') },
+  })
+  expect(result).toBe(saved)
+  expect(calls).toBe(0)
 })

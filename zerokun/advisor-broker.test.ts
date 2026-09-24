@@ -43,6 +43,8 @@ import {
   runBounded,
   summarizeAdvisorSlots,
   CLAUDE_HELPER_TIMEOUT_MS,
+  CLAUDE_OPEN_TIMEOUT_MS,
+  recoverFifthAdvisorSendOutcome,
   GROK_OAUTH_TIMEOUT_MS,
   GROK_REVIEW_TIMEOUT_MS,
   MAX_ADVISOR_PROMPT_BYTES,
@@ -116,6 +118,7 @@ type BrokerFixture = {
     nativeMode?: 'adopted' | 'unavailable',
     round?: 1 | 2 | 3,
     overrides?: {
+      primaryEvidence?: string
       retryUnavailable?: boolean
       inputUpdateIsRecoveryOnly?: boolean
       nativeAgentId?: string
@@ -204,7 +207,7 @@ def caller_value():
 def workspace_value():
     return {"workspace_id": workspace, "label": state["label"], "active_tab_id": tab, "focused": False, "pane_count": 1, "tab_count": 1, "worktree": None}
 def agent_value():
-    return {"name": state["agent_name"], "agent": "claude", "agent_session": {"agent": "claude", "kind": "native", "source": "session", "value": "fixture-native-session"}, "workspace_id": workspace, "pane_id": pane, "tab_id": tab, "terminal_id": terminal, "cwd": state["project"], "agent_status": state["agent_status"], "interactive_ready": True, "launch_pending": False, "state_change_seq": state["state_change_seq"]}
+    return {"name": state["agent_name"], "agent": "claude", "agent_session": {"agent": "claude", "kind": "native", "source": "session", "value": None if state.get("late_native_session") and not state.get("visible_observed") else "fixture-native-session"}, "workspace_id": workspace, "pane_id": pane, "tab_id": tab, "terminal_id": terminal, "cwd": state["project"], "agent_status": state["agent_status"], "interactive_ready": True, "launch_pending": False, "state_change_seq": state["state_change_seq"]}
 if args == ["pane", "current", "--current"]:
     success({"pane": {"workspace_id": caller_workspace, "pane_id": caller_pane, "tab_id": caller_tab, "terminal_id": caller_terminal}})
 if args == ["workspace", "list"]:
@@ -262,10 +265,16 @@ if len(args) == 3 and args[:2] == ["agent", "get"]:
         missing("agent_not_found")
     success({"agent": agent_value()})
 if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source", "visible", "--lines"]:
+    state["visible_observed"] = True
+    save()
     print("❯", flush=True)
     raise SystemExit(0)
 if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source", "recent-unwrapped", "--lines"]:
     prompt = state.get("prompt")
+    if state.get("change_during_read") and not state.get("read_changed"):
+        state["read_changed"] = True
+        state["state_change_seq"] += 1
+        save()
     if not isinstance(prompt, str) or state.get("answer_missing"):
         print("❯", flush=True)
     else:
@@ -576,7 +585,8 @@ async function brokerFixture(options: {
       nativeMode: 'adopted' | 'unavailable' = 'adopted',
       round: 1 | 2 | 3 = 1,
       overrides: {
-        retryUnavailable?: boolean
+        primaryEvidence?: string
+      retryUnavailable?: boolean
         inputUpdateIsRecoveryOnly?: boolean
         nativeAgentId?: string
       reviewWorktrees?: string[]
@@ -607,7 +617,7 @@ async function brokerFixture(options: {
             round,
             inputRevision: selectedInput.revision,
             inputDigest: selectedInput.digest,
-            primaryEvidence: 'bounded primary evidence',
+            primaryEvidence: overrides.primaryEvidence ?? 'bounded primary evidence',
             ...(overrides.reviewWorktrees ? { reviewWorktrees: overrides.reviewWorktrees } : {}),
             ...(overrides.retryUnavailable ? { retryUnavailable: true } : {}),
             ...(overrides.inputUpdateIsRecoveryOnly ? { inputUpdateIsRecoveryOnly: true } : {}),
@@ -1059,6 +1069,13 @@ describe('advisor broker boundaries', () => {
   test('外部reviewerの各起動境界は有限timeoutを持つ', () => {
     expect(GROK_REVIEW_TIMEOUT_MS).toBe(60 * 60 * 1_000)
     expect(CLAUDE_HELPER_TIMEOUT_MS).toBe(140_000)
+    const helper = readFileSync(join(import.meta.dir, 'fifth-advisor.py'), 'utf8')
+    const seconds = (name: string) => Number(helper.match(new RegExp(`^${name} = ([0-9]+)$`, 'm'))![1])
+    const startup = seconds('CLAUDE_START_PROCESS_TIMEOUT_SECONDS')
+      + 2 * seconds('CLAUDE_SETTLE_TIMEOUT_SECONDS')
+      + seconds('CLAUDE_PROCESS_SETTLE_TIMEOUT_SECONDS')
+    expect(CLAUDE_OPEN_TIMEOUT_MS).toBeGreaterThan(startup * 1_000 + CLAUDE_HELPER_TIMEOUT_MS)
+    expect(CLAUDE_OPEN_TIMEOUT_MS).toBeLessThanOrEqual(15 * 60 * 1_000)
   })
 
   test.skipIf(process.platform === 'win32')(
@@ -1495,41 +1512,73 @@ print('review complete')
     } finally { await fixture.close() }
   }, 30_000)
 
-  test('Claudeの2回の一時失敗を自動回復しGrok回答を保持したまま3回答揃える', async () => {
+  test('Claude送信後の回答不足は再送せずGrok回答と診断を保存する', async () => {
     const fixture = await brokerFixture({ externalSuccess: true, claudeFailures: 2 })
     try {
       const first = await fixture.call('investigation', 'revision-two')
-      expect(first.result.isError).not.toBe(true)
-      expect(first.payload).toMatchObject({ complete: true, allAdopted: true,
-        slotSummary: { responsesObtained: 3 } })
-      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
-      const journalPath = join(fixture.journalRoot, revision, 'investigation-1.json')
-      const cacheBefore = readFileSync(`${journalPath}.responses`, 'utf8')
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1)
-        expect(retry.payload).toMatchObject({ complete: true, slotSummary: { responsesObtained: 3 } })
-      }
-      expect(readFileSync(`${journalPath}.responses`, 'utf8')).toBe(cacheBefore)
-      expect(JSON.parse(readFileSync(journalPath, 'utf8')).status).toBe('completed')
+      expect(first.payload).toMatchObject({ allAdopted: false,
+        claude: { adopted: false, promptMayHaveBeenDelivered: true },
+        slotSummary: { responsesObtained: 2 } })
       const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
-      expect(state.prompt_count).toBe(3)
-      expect(state.close_count).toBe(3)
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
       expect(state.owned).toBe(false)
-      const diagnosticPaths = readdirSync(join(fixture.journalRoot, revision))
-        .filter(name => name.startsWith('claude-response-'))
-      expect(diagnosticPaths.length).toBe(3)
-      const diagnostics = diagnosticPaths.map(name => JSON.parse(readFileSync(join(fixture.journalRoot, revision, name), 'utf8')))
-      const failed = diagnostics.filter(item => item.reads.at(-1).outcome === 'marker-count-mismatch')
-      expect(failed.length).toBe(2)
-      for (const item of failed) {
-        expect(item.reads.map((read: { requestedLines: number }) => read.requestedLines)).toEqual([300, 600, 1200])
-        expect(item.transcript.text.trim()).toBe('❯')
-      }
-      expect(diagnostics.some(item => item.transcript.text.includes('Claude independent review completed'))).toBe(true)
-      expect(JSON.parse(cacheBefore).claude.responseDiagnostic.status).toBe('saved')
-      expect(existsSync(join(fixture.state, 'advisor-ephemeral', fixture.jobId, fixture.nonce, revision, 'investigation-1'))).toBe(false)
+      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
+      const saved = JSON.parse(readFileSync(join(fixture.journalRoot, revision, 'investigation-1.json.responses'), 'utf8'))
+      expect(saved.grok[0].adopted).toBe(true)
+      expect(saved.claude.responseDiagnostic.status).toBe('saved')
+      const journalPath = join(fixture.journalRoot, revision, 'investigation-1.json')
+      const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
+      saved.finishedAt -= 31_000
+      journal.startedAt -= 31_000
+      journal.finishedAt -= 31_000
+      const cache = JSON.stringify(saved)
+      journal.responseCacheDigest = createHash('sha256').update(cache).digest('hex')
+      const durable = JSON.stringify(journal)
+      writeFileSync(`${journalPath}.responses`, cache, { mode: 0o600 })
+      writeFileSync(journalPath, durable, { mode: 0o600 })
+      const retry = await fixture.call('investigation', 'revision-two', 'adopted', 1, { retryUnavailable: true })
+      expect(retry.payload).toMatchObject({ retryable: false, attemptsFinished: true })
+      expect(readFileSync(journalPath, 'utf8')).toBe(durable)
+      expect(readFileSync(`${journalPath}.responses`, 'utf8')).toBe(cache)
+      const changed = await fixture.call('investigation', 'revision-two', 'adopted', 1,
+        { retryUnavailable: true, primaryEvidence: 'different evidence' })
+      expect(changed.result.isError).toBe(true)
+      expect(changed.payload.reason).toContain('question changed')
+      expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(1)
     } finally { await fixture.close() }
-  }, 40_000)
+  }, 30_000)
+
+  test('起動途中の未確定native sessionを記録せずready後のsessionで送信する', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const initial = JSON.parse(readFileSync(path, 'utf8'))
+      initial.late_native_session = true
+      writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
+      const result = await fixture.call('investigation', 'revision-two')
+      expect(result.payload).toMatchObject({ allAdopted: true, claude: { adopted: true } })
+      const final = JSON.parse(readFileSync(path, 'utf8'))
+      expect(final.prompt_count).toBe(1)
+      expect(final.close_count).toBe(1)
+    } finally { await fixture.close() }
+  }, 30_000)
+
+  test('回答read中のstate変化は同じClaudeの次の安定回答を待つ', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const initial = JSON.parse(readFileSync(path, 'utf8'))
+      initial.change_during_read = true
+      writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
+      const result = await fixture.call('investigation', 'revision-two')
+      expect(result.payload).toMatchObject({ allAdopted: true, claude: { adopted: true } })
+      const final = JSON.parse(readFileSync(path, 'utf8'))
+      expect(final.read_changed).toBe(true)
+      expect(final.prompt_count).toBe(1)
+      expect(final.close_count).toBe(1)
+    } finally { await fixture.close() }
+  }, 30_000)
 
   test.each(['audit_drift', 'startup_audit_drift', 'git_audit_failure'])('Claude実回答は並行metadata変化 %s で破棄せず一度の起動で3回答を保存する', async drift => {
     const fixture = await brokerFixture({ externalSuccess: true })
@@ -3394,4 +3443,19 @@ int main(void) {
     },
     8_000,
   )
+})
+
+
+test('送信stdout喪失は同じreceipt markerへ復旧しjournal障害でも取得を続ける', () => {
+  const marker = `REQUEST_MARKER=${'A'.repeat(32)}`
+  for (const stdout of ['', JSON.stringify({ status: 'prompt-started', marker, state_change_seq: 42 })]) {
+    const warnings: unknown[] = []
+    const outcome = recoverFifthAdvisorSendOutcome(stdout, () => ({ marker, stateChangeSeq: 42 }),
+      () => { throw new Error('fsync failed') }, error => warnings.push(error))
+    expect(outcome).toMatchObject({ kind: 'possibly-delivered', marker, stateChangeSeq: 42 })
+    expect(warnings).toHaveLength(1)
+  }
+  expect(recoverFifthAdvisorSendOutcome('', () => undefined,
+    () => { throw new Error('must not persist absent receipt') }, () => {}))
+    .toEqual({ kind: 'unconfirmed' })
 })
