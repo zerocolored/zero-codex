@@ -71,6 +71,7 @@ import {
   parseEphemeralClaudeOpen,
   parseEphemeralClaudeProvisionalRecovery,
   persistEphemeralClaudeDeliveryEvidence,
+  readEphemeralClaudeDelivery,
   readEphemeralClaudeCleanupReceipt,
   readEphemeralClaudeProvisionalCleanupReceipt,
   readEphemeralClaudeWorkspaceTarget,
@@ -144,6 +145,23 @@ export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOu
     ...(Number.isSafeInteger(started[0]!.state_change_seq)
       ? { stateChangeSeq: Number(started[0]!.state_change_seq) } : {}),
   }
+}
+
+/** A failed journal write cannot negate an observed send or stop acquisition. */
+export function recoverFifthAdvisorSendOutcome(
+  stdout: string,
+  readMarker: () => { marker: string; stateChangeSeq?: number } | undefined,
+  persist: () => unknown,
+  warn: (error: unknown) => void,
+): FifthAdvisorSendOutcome {
+  const announced = parseFifthAdvisorSendOutcome(stdout)
+  const durableMarker = announced.kind === 'unconfirmed' ? readMarker() : undefined
+  const outcome: FifthAdvisorSendOutcome = announced.kind !== 'unconfirmed'
+    ? announced : durableMarker ? { kind: 'possibly-delivered', ...durableMarker } : announced
+  if (outcome.kind !== 'unconfirmed') {
+    try { persist() } catch (error) { warn(error) }
+  }
+  return outcome
 }
 
 const CLAUDE_MARKER_INSTRUCTION =
@@ -226,6 +244,9 @@ export const MAX_ADVISOR_PROMPT_BYTES = 2 * 1024 * 1024
 export const GROK_REVIEW_TIMEOUT_MS = 60 * 60 * 1_000
 export const GROK_OAUTH_TIMEOUT_MS = 10 * 60 * 1_000
 export const CLAUDE_HELPER_TIMEOUT_MS = 140_000
+// Open includes Herdr's 310s process budget, startup dialogs/painting and
+// exact-workspace cleanup. The transport must not kill a valid slow startup.
+export const CLAUDE_OPEN_TIMEOUT_MS = 15 * 60 * 1_000
 const PROTECTED_COMPONENT = /^(?:\.env.*|.*(?:auth|credential|token|secret).*|sessions|logs|memories)$/i
 const GROK_AUTH_REQUIRED_MARKER = 'GROK_REVIEWER_AUTH_REQUIRED\n'
 const MAX_GROK_AUTH_BYTES = 1024 * 1024
@@ -1835,6 +1856,7 @@ async function main(): Promise<void> {
     let beforeSnapshot: AdvisorRepositorySnapshot | undefined
     let target: EphemeralClaudeTarget | undefined
     let marker = ''
+    let deliveryUnknown = false
     let response: string | undefined
     let stateChangeSeqAfter: number | undefined
     let modelStartObserved = false
@@ -1931,7 +1953,7 @@ async function main(): Promise<void> {
       const opened = await runBounded(fingerprintedCommand(
         [python, helper, 'open', ...helperArgs], jobFingerprint,
       ), {
-        env: helperEnvironment, timeoutMs: CLAUDE_HELPER_TIMEOUT_MS,
+        env: helperEnvironment, timeoutMs: CLAUDE_OPEN_TIMEOUT_MS,
       })
       if (opened.timedOut || opened.forcedCleanup
         || opened.outputTruncated || opened.exitCode !== 0) {
@@ -1956,17 +1978,23 @@ async function main(): Promise<void> {
         cleanupWarnings.push(`repository audit after Claude open unavailable: ${error}`)
       }
       await verifyHerdrRuntimeIdentityAsync(claudeRuntime, brokerEnvironment(claudeRuntime))
+      deliveryUnknown = true
       const send = await runBounded(fingerprintedCommand([
         python, helper, 'send', ...helperArgs, '--owned',
       ], jobFingerprint), { env: helperEnvironment, timeoutMs: 140_000 })
-      const sendOutcome = parseFifthAdvisorSendOutcome(send.stdout)
+      const sendOutcome = recoverFifthAdvisorSendOutcome(
+        send.stdout,
+        () => readEphemeralClaudeDelivery(requestDir!),
+        () => persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir!),
+        error => cleanupWarnings.push(`delivery journal unavailable: ${error}`),
+      )
+      deliveryUnknown = false
       if (sendOutcome.kind === 'unconfirmed') {
         throw new Error(`Claude prompt delivery failed (${send.exitCode}): ${send.stderr.slice(-2_000)}`)
       }
       {
         marker = sendOutcome.marker
         if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
-        persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir)
         const acquisitionDeadline = Date.now() + 60 * 60 * 1_000
         // Once prompt-started is durable, helper timeout/exit 5 is an ambiguous
         // transport outcome, not permission to resend or abandon acquisition.
@@ -1984,6 +2012,7 @@ async function main(): Promise<void> {
           }
           if (!modelStartObserved || !['idle', 'done'].includes(current.agent_status ?? '')) continue
           let transcript = ''
+          let stateChangedDuringRead = false
           for (const lines of [300, 600, 1200]) {
             const observation: ClaudeDiagnosticRead = {
               requestedLines: lines,
@@ -2006,6 +2035,8 @@ async function main(): Promise<void> {
                 || !['idle', 'done'].includes(afterRead.agent_status ?? '')) {
                 observation.outcome = identityMatches ? 'state-changed' : 'identity-changed'
                 transcript = ''
+                if (!identityMatches) throw new Error('owned ephemeral Claude identity changed during read')
+                stateChangedDuringRead = true
                 break
               }
               const { response: completeResponse, ...analysis } = analyzeClaudeResponse(transcript, marker)
@@ -2026,6 +2057,7 @@ async function main(): Promise<void> {
             }
           }
           if (response) break
+          if (stateChangedDuringRead) continue
           reason = 'Claude reached a terminal prompt but its complete marked response was unavailable'
           // The same terminal state and sequence were revalidated after every
           // bounded transcript read. No later output can complete this turn,
@@ -2210,7 +2242,7 @@ async function main(): Promise<void> {
             cleanupVerified,
             cleanupStatus,
             cleanupReceiptDigest,
-            promptMayHaveBeenDelivered: Boolean(marker),
+            promptMayHaveBeenDelivered: Boolean(marker) || deliveryUnknown,
           })
           removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
         } catch (error) {
@@ -2266,7 +2298,7 @@ async function main(): Promise<void> {
       containmentVerified: helperContainmentVerified
         && (!workspaceCreationAttempted || cleanupVerified),
       ...(containmentStatus ? { containmentStatus } : {}),
-      promptMayHaveBeenDelivered: Boolean(marker),
+      promptMayHaveBeenDelivered: Boolean(marker) || deliveryUnknown,
       reason,
       responseDiagnostic,
       failure: failure ?? classifyAdvisorFailure('claude', reason),
@@ -3078,6 +3110,14 @@ async function main(): Promise<void> {
     if (retryResult && retryResult.evidenceDigest !== evidenceDigest) {
       return toolText({ complete: false, reason: 'The advisor question changed; do not mix previous answers with different evidence.' }, true)
     }
+    if (retryResult && retryResult.claude.adopted !== true
+      && retryResult.claude.promptMayHaveBeenDelivered !== false
+      && allAdvisorAttemptsAdopted(retryResult.native, retryResult.grok, { adopted: true })) {
+      return toolText({ ...retryResult, complete: false, waitingForAdvisors: false,
+        attemptsFinished: true, retryable: false,
+        reason: 'Claude delivery is possible; preserve the saved outcome without resending or consuming retry budget.' })
+    }
+
     const expectedNativePerspective = advisorPerspectiveForPhase(phase)
     const nativePerspectives = new Set(nativeAdvisors.map(value => value.perspective))
     if (nativePerspectives.size !== 1
@@ -3330,7 +3370,8 @@ async function main(): Promise<void> {
         || (currentStatus === 'stale-input' && inputUpdateIsRecoveryOnly === true))) {
         return toolText({ complete: false, waitingForAdvisors: true, reason: 'Advisor round changed before retry.' }, true)
       }
-      if (retryResult.claude.adopted !== true) {
+      if (retryResult.claude.adopted !== true
+        && retryResult.claude.promptMayHaveBeenDelivered === false) {
         try {
           retireAdvisorClaudeCleanupOutcome(stateDir, {
             jobId: context.jobId, attemptNonce: context.attemptNonce,
@@ -3378,7 +3419,10 @@ async function main(): Promise<void> {
       persist: result => persistSlot('grok', result),
     }).then(result => [result])
     const claudePromise = recoverAdvisorSlot({
-      advisor: 'claude', saved: retryResult?.claude?.adopted === true ? retryResult.claude : undefined,
+      advisor: 'claude',
+      saved: retryResult?.claude?.adopted === true
+        || retryResult?.claude?.promptMayHaveBeenDelivered !== false
+        ? retryResult?.claude : undefined,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
       run: () => runClaude(boundInput, phase, round as 1 | 2 | 3, evidence, reviewContext),
       persist: result => persistSlot('claude', result),

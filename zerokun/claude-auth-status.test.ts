@@ -51,7 +51,7 @@ test('認証・課金・設定は1回、通信・確認障害は30秒60秒で再
     const waits: number[] = []
     const retryable = cause === 'network' || cause === 'auth-check'
     const result = await recoverAdvisorSlot({ advisor: 'claude',
-      run: async () => ({ adopted: ++calls === 3, containmentVerified: true, reason: 'opaque', failure: { advisor: 'claude' as const, cause } }),
+      run: async () => ({ adopted: ++calls === 3, containmentVerified: true, promptMayHaveBeenDelivered: false, reason: 'opaque', failure: { advisor: 'claude' as const, cause } }),
       persist: () => {}, wait: async ms => { waits.push(ms) },
     })
     expect(calls).toBe(retryable ? 3 : 1)
