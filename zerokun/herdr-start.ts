@@ -157,9 +157,6 @@ function productionInvoker(herdrBinary: string): (args: string[]) => Promise<Rec
     if (exitCode !== 0) {
       throw new Error(`Herdr ${args.slice(0, 2).join(' ')}に失敗しました: ${stderr.trim().slice(-1_000)}`)
     }
-    // Herdr 0.9系は pane run 等の成功時に何も出力しない。exit 0 かつ空出力は
-    // 成功応答として空envelopeを返す（呼び出し側はresultを要求時に検証する）。
-    if (stdout.trim() === '') return {}
     let value: unknown
     try { value = JSON.parse(stdout) } catch { throw new Error('Herdrが不正なJSONを返しました') }
     return requiredRecord(value, 'response')

@@ -12060,6 +12060,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
           args: ['/runtime/cloud-logging-broker.ts', '/state/context.json'],
         },
         localVerificationEnabled: true,
+        computerUseEnabled: true,
       }).join('\n')
       expect(overrides).toContain('":minimal"="read"')
       expect(overrides).not.toContain('extends=')
@@ -12097,6 +12098,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         expect(roleConfig.model_reasoning_effort).toBe(effort)
         expect(roleConfig.sandbox_mode).toBe('read-only')
         expect(roleConfig.approval_policy).toBe('never')
+        expect((roleConfig.features as any).computer_use).toBe(false)
+        expect((roleConfig.features as any).plugins).toBe(false)
+        expect((roleConfig.mcp_servers as any)['computer-use'].enabled).toBe(false)
       }
       expect(overrides).toContain('features.plugins=true')
       expect(overrides).toContain('features.goals=false')
@@ -12110,12 +12114,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       if (existsSync('/Applications/ChatGPT.app')) {
         expect(overrides).toContain(`${JSON.stringify(realpathSync('/Applications/ChatGPT.app'))}="read"`)
       }
-      // スクリーンショットはCUAServiceのユーザーtempへ保存される。対象アプリの
-      // 版・実行ファイル確認のため /Applications は read。
-      expect(overrides).toContain(
-        `${JSON.stringify(join(realpathSync(tmpdir()), 'com.openai.sky.CUAService'))}="write"`,
-      )
-      expect(overrides).toContain(`${JSON.stringify(realpathSync('/Applications'))}="read"`)
+      expect(overrides).not.toContain('com.openai.sky.CUAService')
+      expect(overrides).not.toContain('\"/Applications\"=\"read\"')
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
@@ -12169,6 +12169,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         },
         executionWriteEnabled: true,
         localVerificationEnabled: true,
+        computerUseEnabled: true,
         multiAgentEnabled: false,
       }).join('\n')
       expect(implementationOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
@@ -12187,6 +12188,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         },
         executionWriteEnabled: false,
         localVerificationEnabled: true,
+        computerUseEnabled: true,
         browserAccessEnabled: true,
         multiAgentEnabled: true,
       }).join('\n')
@@ -12202,8 +12204,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(reviewOverrides).toContain('features.computer_use=false')
       expect(reviewOverrides).toContain('features.plugins=false')
       expect(reviewOverrides).not.toContain('/System/Library/OpenSSL')
-      // プロジェクト宣言の読み取りパス: /Applications と ~/Library/Application Support
-      // 配下だけを read で許可し、それ以外（~/.ssh 等）は無視する
+      // Job-owned declarations must not expand host access to personal application data.
       mkdirSync(join(repo, '.zerokun'), { recursive: true })
       writeFileSync(join(repo, '.zerokun', 'computer-use-read-paths'), [
         '# コメント行と空行は無視',
@@ -12219,7 +12220,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         executionWriteEnabled: true,
         browserAccessEnabled: true,
       }).join('\n')
-      expect(projectGrantOverrides).toContain(
+      expect(projectGrantOverrides).not.toContain(
         `${JSON.stringify(realpathSync(join(homedir(), 'Library', 'Application Support')))}="read"`,
       )
       expect(projectGrantOverrides).not.toContain('.ssh')

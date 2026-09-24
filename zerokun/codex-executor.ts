@@ -1,5 +1,6 @@
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
+import { installedComputerUseClient } from './installed-computer-use.ts'
 import { GO_CHROME_ENABLED_TOOLS, GO_CHROME_DISABLED_TOOLS } from './chrome-tools.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { CODEX_NETWORK_CONTINUATION, CODEX_NETWORK_RETRY_DELAYS_MS, isTransientCodexNetworkError } from './codex-network-retry.ts'
@@ -221,7 +222,6 @@ import {
   publicationContinuationDigest,
   type GitHubPublicationContinuationBundle,
 } from './publication-continuation.ts'
-import { startComputerUseAudioBridge } from './audio-bridge.ts'
 
 type BoundCodexImplementationIntent = CodexImplementationIntent & {
   gitRoot: string
@@ -558,6 +558,19 @@ export function mcpIsolationOverridesForConfig(
     }
   }
   const additions: string[] = []
+  const plugins = config.plugins as Record<string, { enabled?: boolean }> | undefined
+  if (projectRoot && overrides.includes('features.computer_use=true')
+    && trustedComputerUsePluginEnabled(config, layers)
+    && (rawServers as Record<string, { enabled?: boolean }>)['computer-use']?.enabled !== false
+    && !expectedNames.has('computer-use')) {
+    const client = installedComputerUseClient(process.env.CODEX_HOME || join(homedir(), '.codex'), projectRoot)
+    if (client) {
+      // The native client enforces its existing per-app approvals. Do not use a
+      // relative ambient transport or set an automatic tool approval override.
+      additions.push(`"computer-use"={enabled=true,command=${tomlString(client)},args=["mcp"],cwd=${tomlString(dirname(client))},startup_timeout_sec=30,tool_timeout_sec=120}`)
+      expectedNames.add('computer-use')
+    }
+  }
   for (const name of names.sort()) {
     if (expectedNames.has(name)) continue
     if (name.length < 1 || name.length > 128 || /[\0-\x1f\x7f]/.test(name)) {
@@ -716,6 +729,38 @@ export function nativeAdvisorHistoryPermissionOverrides(
   return isolated
 }
 
+function trustedComputerUsePluginEnabled(config: Record<string, unknown>, layers: unknown): boolean {
+  const pluginName = 'computer-use@openai-bundled'
+  if ((config.plugins as Record<string, { enabled?: boolean }> | undefined)?.[pluginName]?.enabled !== true) return false
+  let trusted = false
+  for (const layer of Array.isArray(layers) ? layers : []) {
+    const setting = layer?.config?.plugins?.[pluginName]
+    if (setting === undefined) continue
+    if (layer?.name?.type === 'project') return false
+    if (layer?.name?.type === 'sessionFlags') continue
+    if (setting.enabled === false) return false
+    if (setting.enabled === true) trusted = true
+  }
+  return trusted
+}
+
+/** Keep native desktop access from enabling unrelated installed plugins. */
+export function computerUsePluginIsolationOverrides(
+  config: Record<string, unknown>, overrides: string[], layers?: unknown,
+): string[] {
+  if (!overrides.includes('features.computer_use=true')) return overrides
+  const plugins = config.plugins
+  if (plugins !== undefined && plugins !== null
+    && (typeof plugins !== 'object' || Array.isArray(plugins))) {
+    throw new Error('Codex plugin configuration is invalid')
+  }
+  const configured = (plugins ?? {}) as Record<string, { enabled?: boolean }>
+  const names = new Set([...Object.keys(configured), 'computer-use@openai-bundled'])
+  const table = [...names].sort().map(name =>
+    `${tomlString(name)}={enabled=${name === 'computer-use@openai-bundled' && trustedComputerUsePluginEnabled(config, layers)}}`).join(',')
+  return replaceUniqueConfigOverride(overrides, 'plugins', `{${table}}`)
+}
+
 export async function resolveEffectiveCodexPermissionOverrides(
   codexBin: string,
   cwd: string,
@@ -742,10 +787,11 @@ export async function resolveEffectiveCodexPermissionOverrides(
     || Array.isArray(discovered.config)) {
     throw new Error('Codex config/read omitted effective config during MCP isolation')
   }
-  const isolated = mcpIsolationOverridesForConfig(
+  const isolated = computerUsePluginIsolationOverrides(
     discovered.config as Record<string, unknown>,
-    overrides,
-    cwd,
+    mcpIsolationOverridesForConfig(
+      discovered.config as Record<string, unknown>, overrides, cwd, discovered.layers,
+    ),
     discovered.layers,
   )
   await assertEffectiveCodexPermissionConfig(
@@ -1297,6 +1343,16 @@ function assertEffectiveCodexPermissionSnapshot(
     // hooks={} deep-merges with materialized empty event arrays and inert state
     // metadata. The dedicated check above rejects every executable handler.
     if (key === 'hooks') continue
+    if (key === 'plugins') {
+      const plugins = config.plugins as Record<string, { enabled?: boolean }> | undefined
+      const expected = overrideValue(overrides, 'plugins') as Record<string, { enabled: boolean }>
+      if (!plugins || plugins['computer-use@openai-bundled']?.enabled !== expected['computer-use@openai-bundled']?.enabled
+        || Object.entries(plugins).some(([name, value]) =>
+          name !== 'computer-use@openai-bundled' && value?.enabled !== false)) {
+        throw new Error('Codex effective plugins exceed native Computer Use scope')
+      }
+      continue
+    }
     // Disabled apps cannot expose any default tool, network or destructive
     // capability. Some Codex releases omit these subordinate fields from
     // config/read once the global feature is disabled.
@@ -4161,15 +4217,9 @@ export function buildCodexWorkerPrompt(
       )
     }
     if (host.computerUseEnabled) {
-      control.push(
-        'Computer Use and the host audio bridge are authorized in this workflow. Sandboxed afplay',
-        'always aborts with AudioQueueStart -1; to play audio on the real output device, put the',
-        'WAV under your scratch or artifact directory, write {"wav":"<absolute path>"} to',
-        '$TMPDIR/zerokun-audio/request-<alphanumeric nonce>.json, then wait for',
-        'result-<nonce>.json: {startedAtMs,endedAtMs,exitCode} on success, {error} on refusal.',
-        'The host plays requests sequentially with /usr/bin/afplay and its timestamps are wall',
-        'clock, so they are valid playback-window evidence.',
-      )
+      control.push('Native Computer Use is enabled for this authorized primary execution when installed.',
+        'Discover its actual tools; names vary by client version. Existing per-app approvals still apply.',
+        'Do not bypass app approval or claim a missing connection without trying the exposed native tool.')
     }
     if (job.githubPublicationRecovery) {
       control.push(
@@ -5311,8 +5361,8 @@ export function buildCodexPermissionOverrides(
   const browserAccessEnabled = options.browserAccessEnabled ?? executionWriteEnabled
   // 実機E2E（画面操作）は書き込み実装ステージだけに許可する。レビュー段
   // (executionWriteEnabled=false) は browser access があっても画面操作させない。
-  const computerUseEnabled = options.computerUseEnabled
-    ?? (executionWriteEnabled && browserAccessEnabled)
+  const computerUseEnabled = job.writeEnabled && executionWriteEnabled
+    && browserAccessEnabled && options.computerUseEnabled === true
   const networkEnabled = executionWriteEnabled || localVerificationEnabled || browserAccessEnabled
   const multiAgentEnabled = options.multiAgentEnabled ?? true
   const model = options.model ?? ZEROCHAN_PRIMARY_CODEX_MODEL
@@ -5459,45 +5509,19 @@ export function buildCodexPermissionOverrides(
     // HOME は deny のままで、必要な subtree だけを read で再許可する。
     for (const cuaPath of [
       '/Applications/ChatGPT.app',
-      '/Applications',
       '/System/Library/OpenSSL',
-      join(home, '.codex', 'computer-use'),
-      join(home, '.codex', 'plugins'),
+      join(codexHome || join(home, '.codex'), 'computer-use'),
+      join(codexHome || join(home, '.codex'), 'plugins/cache/openai-bundled/computer-use'),
     ]) {
       if (!existsSync(cuaPath)) continue
+      const metadata = lstatSync(cuaPath)
       const physical = realpathSync(cuaPath)
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()
+        || physical !== cuaPath || (metadata.mode & 0o022) !== 0) continue
       if (!rules.has(physical)) rules.set(physical, 'read')
     }
-    // CUAService はスクリーンショットをユーザーtempの専用ディレクトリへ
-    // 書き出す。ジョブの TMPDIR は scratch に差し替えるため、実tempの
-    // この1ディレクトリだけを write で許可する。
-    const cuaScreenshotDir = join(realpathSync(tmpdir()), 'com.openai.sky.CUAService')
-    mkdirSync(cuaScreenshotDir, { recursive: true })
-    if (!rules.has(cuaScreenshotDir)) rules.set(cuaScreenshotDir, 'write')
-    // プロジェクトが宣言する追加読み取りパス（実機E2Eの素材・アプリのログ等）。
-    // 宣言はrepo内ファイルで行い、許可域は /Applications と
-    // ~/Library/Application Support 配下（とそれ自身）に限定する。repo は
-    // ジョブ自身が書けるため、HOME直下の資格情報等へは絶対に広げない。
-    const grantFile = join(repo, '.zerokun', 'computer-use-read-paths')
-    if (existsSync(grantFile)) {
-      const grantRoots = [
-        '/Applications',
-        join(home, 'Library', 'Application Support'),
-      ].filter(existingDirectory).map(root => realpathSync(root))
-      for (const rawLine of readFileSync(grantFile, 'utf8').split('\n')) {
-        const line = rawLine.trim()
-        if (line === '' || line.startsWith('#')) continue
-        const expanded = line === '~' || line.startsWith('~/')
-          ? join(home, line.slice(1))
-          : line
-        if (!expanded.startsWith('/')) continue
-        if (!existsSync(expanded)) continue
-        const physical = realpathSync(expanded)
-        if (!grantRoots.some(root => pathContains(root, physical))) continue
-        if (!rules.has(physical)) rules.set(physical, 'read')
-      }
-    }
   }
+
   const filesystem = [...rules.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([path, access]) => `${tomlString(path)}=${tomlString(access)}`)
@@ -6759,6 +6783,7 @@ export async function executeCodexJob(
           && stage !== 'implementation' && stage !== 'interjection',
         taskGoalEnabled: stage === 'complete',
         nativeCloudAccessEnabled: stage === 'complete' && !continuationDecision,
+        computerUseEnabled: executionWriteEnabled && browserEnabled,
         model,
         reasoningEffort,
       })
@@ -6966,13 +6991,6 @@ export async function executeCodexJob(
     } catch (error) {
       await retireUnregisteredAttempt('Codex supervisor spawn')
       throw error
-    }
-    if (advisorAttempt.computerUseEnabled) {
-      // sandbox内の afplay は CoreAudio 拒否で必ず落ちるため、実機E2Eの音声
-      // 再生はランナー側の file protocol で肩代わりする（audio-bridge.ts）。
-      // 停止は supervisor の終了へ束ねる。
-      const audioBridge = startComputerUseAudioBridge({ scratchDir, artifactDir })
-      void proc.exited.then(() => audioBridge.stop(), () => audioBridge.stop())
     }
     const supervisorIdentity = await acquireProcessGroupLeaderIdentity(proc.pid)
     if (!supervisorIdentity) {

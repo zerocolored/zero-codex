@@ -11,3 +11,12 @@ developer_instructions = """
 ファイルや外部サービスを変更せず、実行者本人が最終決定できる簡潔な提案を返す。
 この依頼はbest-effort Three-Advisor初期設計phaseのgpt-6-astra枠である。結果の取得不能や証明不足でprimary Codexの本作業を止めず、この枠の成否だけを簡潔に返す。fresh ClaudeのHerdr create／start／prompt／closeはprimary Codexだけが担当する。別のsubagent、Grok、Codex CLI、Claude Code、Herdr agent等を起動・操作せず、自分だけで分析する。
 """
+
+[features]
+computer_use = false
+plugins = false
+
+[mcp_servers.computer-use]
+enabled = false
+command = "/usr/bin/false"
+args = []
