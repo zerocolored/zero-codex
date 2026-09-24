@@ -8,8 +8,8 @@
 # 実行する順番:
 #   1. bootstrap-macos.sh --skip-slack     CLI一式(Herdr / Codex / Grok / Claude Code / Bun)
 #   2. macOS権限(TCC)の判定と案内          フルディスク / アクセシビリティ / 画面収録
-#   3. Chrome拡張の判定と導入              Claude / Vimium / ChatGPT
-#   4. codex-config を clone し install.py  global AGENTS.md と instruction上限
+#   3. codex-config を clone し install.py  global AGENTS.md と instruction上限
+#   4. Chrome拡張 (Claude / ChatGPT) と go-chrome-mcp の導入
 #   5. bootstrap-macos.sh --slack-only      Slack App作成とtoken登録
 #   6. zerochan set slack-channel           指定channelを対象projectへ紐付け
 #   7. zerochan start                       起動
@@ -29,6 +29,7 @@
 #   bash zerokun/quick-setup.sh --skip-slack        Slack設定を省略
 #   bash zerokun/quick-setup.sh --skip-permissions  TCCの判定を省略
 #   bash zerokun/quick-setup.sh --skip-chrome       Chrome拡張を省略
+#   bash zerokun/quick-setup.sh --skip-go-chrome-mcp go-chrome-mcpを省略
 #   bash zerokun/quick-setup.sh --force-extensions  Chrome拡張をmachine policyで強制install
 #   bash zerokun/quick-setup.sh --no-wait           本人操作の待ち合わせをせず判定だけ出す
 #
@@ -46,6 +47,8 @@ PROJECT_ROOT="$(dirname "$REPO_DIR")"
 CODEX_CONFIG_DIR="${CODEX_CONFIG_DIR:-$PROJECT_ROOT/codex-config}"
 CODEX_CONFIG_REPO="${CODEX_CONFIG_REPO:-https://github.com/zerocolored/codex-config.git}"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+GO_CHROME_MCP_DIR="${GO_CHROME_MCP_DIR:-$PROJECT_ROOT/go-chrome-mcp}"
+GO_CHROME_MCP_REPO="${GO_CHROME_MCP_REPO:-https://github.com/ernie1358/go-chrome-mcp.git}"
 
 TARGET_PROJECT="${ZEROKUN_PROJECT_DIR:-}"
 SLACK_APP_NAME=""
@@ -56,13 +59,13 @@ SKIP_SLACK=0
 SKIP_CODEX_CONFIG=0
 SKIP_PERMISSIONS=0
 SKIP_CHROME=0
+SKIP_GO_CHROME_MCP=0
 FORCE_EXTENSIONS=0
 WAIT_FOR_GRANT=1
 
 # このMacで実際に使っている拡張。すべてWeb Store配布のため policy でも install できる。
 CHROME_EXTENSIONS=(
   "fcoeoabgfenejglbffodgkkbkcdhcgfn:Claude"
-  "dbepggeogbaibhgnhhndojpepiihcmeb:Vimium"
   "hehggadaopoacecdllhhajmbjkdcmajg:ChatGPT"
 )
 
@@ -93,6 +96,7 @@ while [ "$#" -gt 0 ]; do
     --skip-codex-config) SKIP_CODEX_CONFIG=1 ;;
     --skip-permissions) SKIP_PERMISSIONS=1 ;;
     --skip-chrome) SKIP_CHROME=1 ;;
+    --skip-go-chrome-mcp) SKIP_GO_CHROME_MCP=1 ;;
     --force-extensions) FORCE_EXTENSIONS=1 ;;
     --no-wait) WAIT_FOR_GRANT=0 ;;
     -h|--help) usage; exit 0 ;;
@@ -335,6 +339,117 @@ check_chrome() {
 # Homebrewとbunも、profileを読み直していないshellから呼べるようにしておく。
 export PATH="$HOME/.grok/bin:$HOME/.bun/bin:/opt/homebrew/bin:$PATH"
 
+# ------------------------------------------------------------ go-chrome-mcp
+# ClaudeやCodexから実Chromeを操作するMCP。Web Storeには無く、unpackedで読み込む。
+# unpackedの拡張はpolicyでinstallできないため、読み込みだけは本人がchrome://extensionsで行う。
+# scriptが行うのは clone / npm install / MCP登録 / 読み込み済みかの判定。
+setup_go_chrome_mcp() {
+  local mode="$1" loaded=0
+
+  step "go-chrome-mcp (実Chrome操作のMCP)"
+
+  if [ -d "$GO_CHROME_MCP_DIR/.git" ]; then
+    ok "clone済み: $GO_CHROME_MCP_DIR"
+  elif [ "$mode" = fix ]; then
+    mkdir -p "$(dirname "$GO_CHROME_MCP_DIR")"
+    git clone "$GO_CHROME_MCP_REPO" "$GO_CHROME_MCP_DIR"
+    ok "clone完了: $GO_CHROME_MCP_DIR"
+  else
+    warn "未clone: $GO_CHROME_MCP_DIR"
+    return 0
+  fi
+
+  if [ -d "$GO_CHROME_MCP_DIR/node_modules" ]; then
+    ok "依存: 導入済み"
+  elif [ "$mode" = fix ]; then
+    (cd "$GO_CHROME_MCP_DIR" && npm install --silent) && ok "npm install 完了" \
+      || warn "npm install に失敗 (broker起動時のpreflightが再試行します)"
+  else
+    warn "依存: 未導入"
+  fi
+
+  # Claude Code への登録 (~/.claude.json の mcpServers)
+  if [ "$mode" != fix ]; then
+    if grep -q '"go-chrome-mcp"' "$HOME/.claude.json" 2>/dev/null; then
+      ok "Claude Code: 登録済み"
+    else
+      warn "Claude Code: 未登録"
+    fi
+  else
+    python3 - "$HOME/.claude.json" "$GO_CHROME_MCP_DIR" <<'PY'
+import json, os, shutil, sys
+path, repo = sys.argv[1], sys.argv[2]
+entry = {"type": "stdio", "command": "node",
+         "args": [os.path.join(repo, "mcp-broker.js")], "env": {}}
+data = {}
+if os.path.exists(path):
+    with open(path) as f:
+        data = json.load(f)
+servers = data.setdefault("mcpServers", {})
+if servers.get("go-chrome-mcp") == entry:
+    print("  ✅ Claude Code: 登録済み")
+else:
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+    servers["go-chrome-mcp"] = entry
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print("  ✅ Claude Code: mcpServersへ登録 (~/.claude.json)")
+PY
+  fi
+
+  # Codex への登録 (~/.codex/config.toml)。codex-configのinstall.pyより後に行う。
+  local toml="$CODEX_HOME/config.toml"
+  if grep -q '^\[mcp_servers\.go-chrome-mcp\]' "$toml" 2>/dev/null; then
+    ok "Codex: 登録済み"
+  elif [ "$mode" = fix ]; then
+    mkdir -p "$CODEX_HOME"
+    cat >> "$toml" <<EOF
+
+[mcp_servers.go-chrome-mcp]
+command = "node"
+args = [ "$GO_CHROME_MCP_DIR/mcp-broker.js" ]
+EOF
+    ok "Codex: config.tomlへ登録"
+  else
+    warn "Codex: 未登録"
+  fi
+
+  # 拡張が読み込まれているか。unpackedは location=4 と実path で判定できる。
+  loaded="$(python3 - "$GO_CHROME_MCP_DIR" <<'PY'
+import glob, json, os, sys
+repo = os.path.realpath(sys.argv[1])
+root = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+for f in glob.glob(os.path.join(root, "*", "Secure Preferences")):
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    for ext in d.get("extensions", {}).get("settings", {}).values():
+        p = ext.get("path", "")
+        if p and os.path.realpath(p) == repo:
+            print(os.path.basename(os.path.dirname(f)))
+            sys.exit(0)
+print("")
+PY
+)"
+
+  if [ -n "$loaded" ]; then
+    ok "Chrome拡張: 読み込み済み ($loaded)"
+  else
+    warn "Chrome拡張: 未読み込み"
+    echo "    unpackedの拡張はpolicyでinstallできません。次は本人操作です。"
+    echo "      1. Chromeで chrome://extensions を開く (コマンドラインからは開けません)"
+    echo "      2. 「デベロッパーモード」をON"
+    echo "      3. 「パッケージ化されていない拡張機能を読み込む」"
+    echo "      4. $GO_CHROME_MCP_DIR を選ぶ"
+    printf '%s' "$GO_CHROME_MCP_DIR" | pbcopy 2>/dev/null \
+      && echo "    (pathはclipboardへ入れました。⇧⌘G で貼れます)"
+    [ "$mode" = fix ] && { pause_for_grant || true; }
+  fi
+  return 0
+}
+
 [ -f "$BOOTSTRAP" ] || fail "bootstrap-macos.sh が見つかりません: $BOOTSTRAP"
 
 echo "== Zeroちゃん quick setup =="
@@ -344,8 +459,10 @@ if [ "$DOCTOR" = 1 ]; then
   bash "$BOOTSTRAP" --doctor || true
   [ "$SKIP_PERMISSIONS" = 1 ] || check_permissions check
   [ "$SKIP_CHROME" = 1 ] || check_chrome check
+  [ "$SKIP_GO_CHROME_MCP" = 1 ] || setup_go_chrome_mcp check
   exit 0
 fi
+
 
 # ------------------------------------------------------------------ 1. 基本導入
 step "基本導入 (Herdr / Codex CLI / Grok Build / Claude Code / Bun)"
@@ -389,12 +506,6 @@ else
   check_permissions fix
 fi
 
-if [ "$SKIP_CHROME" = 1 ]; then
-  warn "--skip-chrome によりChrome拡張を省略"
-else
-  check_chrome fix
-fi
-
 # ------------------------------------------------------------ 4. codex-config
 if [ "$SKIP_CODEX_CONFIG" = 1 ]; then
   warn "--skip-codex-config によりglobal AGENTS.mdの配置を省略"
@@ -435,7 +546,21 @@ else
   fi
 fi
 
-# ------------------------------------------------------------------ 5. Slack
+# --------------------------------------------- 5. Chrome拡張 / go-chrome-mcp
+if [ "$SKIP_CHROME" = 1 ]; then
+  warn "--skip-chrome によりChrome拡張を省略"
+else
+  check_chrome fix
+fi
+
+# go-chrome-mcpのCodex登録はconfig.tomlへ追記するため、codex-configの適用より後に行う。
+if [ "$SKIP_GO_CHROME_MCP" = 1 ]; then
+  warn "--skip-go-chrome-mcp によりgo-chrome-mcpを省略"
+else
+  setup_go_chrome_mcp fix
+fi
+
+# ------------------------------------------------------------------ 6. Slack
 if [ "$SKIP_SLACK" = 1 ]; then
   warn "--skip-slack によりSlack設定を省略"
 else
@@ -450,7 +575,7 @@ else
   ok "Slack設定 完了"
 fi
 
-# -------------------------------------------------------------- 6. channel紐付け
+# -------------------------------------------------------------- 7. channel紐付け
 if [ "${#SLACK_CHANNELS[@]}" -eq 0 ]; then
   warn "--channel の指定が無いため紐付けを省略"
   echo "    後から行う場合: cd <project> && zerochan set slack-channel <ID>"

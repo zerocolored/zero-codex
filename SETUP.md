@@ -32,8 +32,8 @@ bash zerokun/quick-setup.sh \
 ```
 
 `--channel`は繰り返し指定できます。`--doctor`は何も変更せず状態だけを表示し、
-`--skip-slack` / `--skip-codex-config` / `--skip-permissions` / `--skip-chrome`は
-それぞれの段階を省略します。
+`--skip-slack` / `--skip-codex-config` / `--skip-permissions` / `--skip-chrome` /
+`--skip-go-chrome-mcp`はそれぞれの段階を省略します。
 
 ### macOS権限(TCC)
 
@@ -53,7 +53,7 @@ dialogで許可します。誤って拒否した場合は`tccutil reset AppleEve
 
 ### Chrome拡張
 
-既定でClaude・Vimium・ChatGPTの導入を確認し、未導入ならWeb Storeのページを開きます。
+既定でClaude・ChatGPTの導入を確認し、未導入ならWeb Storeのページを開きます。
 `--chrome-extension <id>`で追加でき、`--force-extensions`を付けた場合は
 machine policy(`/Library/Preferences/com.google.Chrome`の`ExtensionInstallForcelist`)で
 強制installします。この場合Chromeに「組織によって管理されています」が付き、ユーザーは拡張を無効化できません。
@@ -61,6 +61,24 @@ machine policy(`/Library/Preferences/com.google.Chrome`の`ExtensionInstallForce
 ```bash
 sudo defaults delete /Library/Preferences/com.google.Chrome ExtensionInstallForcelist   # 取り消す
 ```
+
+### go-chrome-mcp
+
+実Chromeを操作するMCP([ernie1358/go-chrome-mcp](https://github.com/ernie1358/go-chrome-mcp))を
+導入します。clone、`npm install`、Claude Code(`~/.claude.json`の`mcpServers`)とCodex
+(`~/.codex/config.toml`の`[mcp_servers.go-chrome-mcp]`)への登録、読み込み済みかの判定までを行います。
+置き場の既定はzero-codexと同じ階層の`go-chrome-mcp`で、`GO_CHROME_MCP_DIR`で変えられます。
+
+**拡張の読み込みだけは本人操作です。** Web Storeではなくunpackedで読み込むため、policyでは
+installできません。またChromeはコマンドラインから`chrome://extensions`を開けません。
+
+1. Chromeで`chrome://extensions`を開く
+2. 「デベロッパーモード」をON
+3. 「パッケージ化されていない拡張機能を読み込む」
+4. cloneしたdirectoryを選ぶ(pathはclipboardへ入れてあります)
+
+読み込み済みかどうかは、Chromeのprofileが持つ`location=4`(unpacked)と実pathの一致で判定します。
+Codexへの登録は`config.toml`への追記のため、codex-configの適用より後に実行します。
 
 loginは自動化せず、未了の段階で停止して実行すべきcommandを表示します。
 Herdr serverが動いていないと`zerochan start`はworkspace createに失敗するため、
