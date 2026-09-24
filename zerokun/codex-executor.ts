@@ -27,6 +27,7 @@ import { ensureTaskGoal, readTaskGoal, type GoalStatus } from './codex-goal.ts'
 import { previousThreadArtifactRoots } from './artifact-source.ts'
 import { ContinuedArtifactMessage } from './continued-artifact-message.ts'
 import { homedir, tmpdir } from 'os'
+import { registeredSlackAppStatePaths } from './slack-app-registry.ts'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import type {
   JobControlRecord,
@@ -5392,6 +5393,7 @@ export function buildCodexPermissionOverrides(
     ? requireManagedDirectory(options.stateDir, options.liveInputDir)
     : null
   const executionWriteEnabled = options.executionWriteEnabled ?? job.writeEnabled
+  const primaryWorkspaceAccess = job.writeEnabled && executionWriteEnabled
   const localVerificationEnabled = options.localVerificationEnabled ?? false
   const browserAccessEnabled = options.browserAccessEnabled ?? executionWriteEnabled
   // 実機E2E（画面操作）は書き込み実装ステージだけに許可する。レビュー段
@@ -5410,10 +5412,15 @@ export function buildCodexPermissionOverrides(
     throw new Error(`repository and Zeroちゃん state must not overlap: ${repo}`)
   }
   const rules = new Map<string, 'deny' | 'read' | 'write'>([
+    // Standard workspace semantics for an authorized primary: ordinary host
+    // reads must not depend on a list of executables or SDK installation paths.
+    // In particular, login shells can add PATH entries whose denied lookup
+    // makes Node's spawnSync fail with EPERM before reaching /usr/bin/git.
     [':minimal', 'read'],
-    [home, 'deny'],
+    ...(primaryWorkspaceAccess ? [[':root', 'read'] as const] : []),
+    ...(primaryWorkspaceAccess ? [] : [[home, 'deny'] as const]),
     [state, 'deny'],
-    ['/private/tmp', 'deny'],
+    ['/private/tmp', primaryWorkspaceAccess ? 'write' : 'deny'],
     // A multi-repository parent is only a routing/cwd container. Denying it
     // and reopening the pinned member roots prevents a long-running job from
     // learning about non-member siblings created after this profile was built.
@@ -5439,10 +5446,39 @@ export function buildCodexPermissionOverrides(
   }
   if (liveInputRoot) rules.set(liveInputRoot, 'read')
   if (gitRoot && gitRoot !== repo) rules.set(gitRoot, 'read')
-  const codexHome = process.env.CODEX_HOME
+  const codexHome = process.env.CODEX_HOME || join(home, '.codex')
   if (codexHome && existsSync(codexHome)) rules.set(realpathSync(codexHome), 'deny')
-  if (existsSync(tmpdir())) rules.set(realpathSync(tmpdir()), 'deny')
-  const toolchain = resolveCodexToolchainRuntime({
+  // Read registry metadata only: credentials remain in each private state.
+  // Deny both logical and physical paths, including roots created after launch.
+  const privateRoots = [
+    codexHome, join(home, '.codex'), join(home, '.claude/channels/slack'),
+    join(home, '.zerochan-workspaces'),
+    ...(primaryWorkspaceAccess ? registeredSlackAppStatePaths(home) : []),
+  ].flatMap(root => [resolve(root), ...(existsSync(root) ? [realpathSync(root)] : [])])
+  for (const privateRoot of privateRoots) rules.set(privateRoot, 'deny')
+  const systemTemp = existsSync(tmpdir()) ? realpathSync(tmpdir()) : null
+  // TMPDIR is configurable. It must never turn HOME, private state, or an
+  // arbitrary host directory into a writable tree. Job scratch is always open.
+  const ordinarySystemTemp = systemTemp !== null && (
+    systemTemp === '/tmp' || systemTemp === '/private/tmp' || systemTemp === '/var/tmp'
+    || /^\/private\/var\/folders\/[^/]+\/[^/]+\/T(?:\/|$)/.test(systemTemp)
+  ) && ![home, state, ...privateRoots].some(root => pathContains(root, systemTemp))
+  if (systemTemp && (!primaryWorkspaceAccess || ordinarySystemTemp)) {
+    rules.set(systemTemp, primaryWorkspaceAccess ? 'write' : 'deny')
+  }
+  const primaryPath = (options.toolchainPath ?? process.env.PATH ?? CORE_TOOLCHAIN_PATHS.join(':'))
+    .split(':').filter(path => {
+      if (!isAbsolute(path)) return false
+      let physical = path
+      try { physical = realpathSync(path) } catch { /* Nonexistent ordinary PATH entries are valid. */ }
+      return ![state, ...privateRoots, join(repo, '.zerochan')].some(root => (
+        pathContains(root, path) || pathContains(root, physical)
+      ))
+    }).join(':')
+  const toolchain = primaryWorkspaceAccess ? {
+    path: primaryPath || CORE_TOOLCHAIN_PATHS.join(':'),
+    readPaths: [] as string[],
+  } : resolveCodexToolchainRuntime({
     sourcePath: options.toolchainPath,
     repoPath: repo,
     stateDir: state,
@@ -5456,10 +5492,11 @@ export function buildCodexPermissionOverrides(
   const cloudRuntime = options.nativeCloudAccessEnabled && executionWriteEnabled && job.writeEnabled
     ? (options.googleCloudRuntime === undefined ? resolveGoogleCloudRuntime() : options.googleCloudRuntime)
     : null
-  const cloudProtected = [repo, state, ...(codexHome && existsSync(codexHome) ? [realpathSync(codexHome)] : [])]
+  const cloudProtected = [repo, state, ...privateRoots]
   const cloudPathAllowed = (path: string): boolean => !cloudProtected.some(root => (
     pathContains(root, path) || pathContains(path, root)
   ))
+  const cloudBin = cloudRuntime?.bin && cloudPathAllowed(cloudRuntime.bin) ? cloudRuntime.bin : null
   const cloudConfig = cloudRuntime?.config && cloudPathAllowed(cloudRuntime.config)
     ? cloudRuntime.config : null
   if (cloudRuntime) {
@@ -5566,7 +5603,7 @@ export function buildCodexPermissionOverrides(
     `"TMPDIR"=${tomlString(scratchDir)}`,
     `"XDG_CONFIG_HOME"=${tomlString(join(scratchDir, '.config'))}`,
     `"XDG_CACHE_HOME"=${tomlString(join(scratchDir, '.cache'))}`,
-    `"PATH"=${tomlString(cloudRuntime ? `${cloudRuntime.bin}:${toolchain.path}` : toolchain.path)}`,
+    `"PATH"=${tomlString(cloudBin ? `${cloudBin}:${toolchain.path}` : toolchain.path)}`,
     ...(cloudConfig ? [`"CLOUDSDK_CONFIG"=${tomlString(cloudConfig)}`] : []),
     ...(cloudRuntime ? [
       '"CLOUDSDK_CORE_DISABLE_PROMPTS"="1"',

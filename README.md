@@ -570,18 +570,21 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 
 - Zeroちゃんが参加していないchannel、未許可DM、bot投稿は受け取りません。
 - pairing は1時間で失効し、同時 pending は3件までです。
-- Codex 0.149.0+ の named permission profile を使います。minimal runtimeから始め、
-  対象repository、当該jobの添付、scratch、outboxだけを許可します。HOME・state・共用tempはdenyします。
+- Codex 0.149.0+ の named permission profile を使います。書込み許可済みの主実行は、
+  通常のhost読取り、対象repositoryへの書込み、OSの一時領域を許可します。
+  実行ファイル・SDKの配置先ごとの読取りallowlistは使いません。読取り専用工程は
+  従来のminimal runtimeのままです。Zeroのstate、他アプリのSlack登録領域、Codex設定領域は保護します。
 - read senderはrepository readのみ、write senderだけrepository・`.git` writeとnetworkを許可し、
   どちらも `-a never` で対話的な権限昇格を行いません。
 - host runtimeをSlack経由で書き換えられないよう、Zeroちゃん自身のrepositoryへのwrite jobは拒否します。
   Codex shellのHOME/TMPDIRはjob scratchへ隔離し、commitには固定の中立identityを使います。
   GitHub認証はrepository限定brokerへ渡します。書込み許可済み主担当のCloud操作は通常のgcloudを使い、
   SDKと既存Cloud SDK設定だけを追加許可します（認証cache更新のため設定directoryはwrite）。
-  HOME全体の開放や認証情報のコピーは行いません。このCLI経路は同じshellからcredentialを隔離する方式ではありません。
+  主実行のhost読取りにはHOME内の通常設定も含みますが、HOME全体への書込みや認証情報のコピーは行いません。
+  このCLI経路は同じshellからoperatorのcredentialを隔離する方式ではありません。
 - 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
-  linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。HOMEのglobal
-  Git/GitHub credentialはmodelへ公開しません。brokerはlogin済み`gh`をcredential helperとして使い、
+  linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。読取り専用工程にはHOMEを公開しません。
+  brokerはlogin済み`gh`をcredential helperとして使い、
   current projectのcanonical `github.com` repositoryだけを操作します。作業判断はCodexが行います。
 - App Serverは認証済み`CODEX_HOME`を使うためuser configも読みます。そのため起動直前の
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、

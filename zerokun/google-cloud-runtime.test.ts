@@ -54,7 +54,8 @@ test('native auth is primary-only and cannot reopen managed state or repository 
   const settings = buildCodexPermissionOverrides(f.job, f.options).join('\n')
   expect(settings).toContain(`${JSON.stringify(f.config)}="write"`)
   expect(settings).toContain(`"CLOUDSDK_CONFIG"=${JSON.stringify(f.config)}`)
-  expect(settings).toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
+  expect(settings).toContain('\":root\"=\"read\"')
+  expect(settings).not.toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
   expect(settings).toContain(`${JSON.stringify(f.state)}="deny"`)
   for (const [job, options] of [
     [{ ...f.job, writeEnabled: false }, f.options],

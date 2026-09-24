@@ -11436,7 +11436,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       })
       const args = JSON.parse(readFileSync(capture, 'utf8')) as string[]
       expect(args.some(value => (
-        value.includes('filesystem={') && value.includes('":minimal"="read"')
+        value.includes('filesystem={') && value.includes('":root"="read"')
       ))).toBe(true)
       expect(args.some(value => value.includes('network.enabled=true'))).toBe(true)
       expect(args.some(value => value.includes('network.domains={"*"="allow"'))).toBe(true)
@@ -12018,7 +12018,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     }
   })
 
-  test('permission profileはHOME/stateを閉じ、repo・当該添付・outboxだけを再許可する', () => {
+  test('primaryは標準のhost読取りとrepo書込みを許可しstateとCodex設定を保護する', () => {
     const dir = fixtureDir()
     const state = join(dir, 'state')
     const repo = join(dir, 'repo')
@@ -12062,7 +12062,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         localVerificationEnabled: true,
         computerUseEnabled: true,
       }).join('\n')
-      expect(overrides).toContain('":minimal"="read"')
+      expect(overrides).toContain('":root"="read"')
       expect(overrides).not.toContain('extends=')
       expect(overrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(join(repo, '.git')))}="write"`)
@@ -12071,11 +12071,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain(`${JSON.stringify(realpathSync(state))}="deny"`)
       expect(overrides).not.toContain(JSON.stringify(browserCaptureDirForJob(state, job.id)))
       expect(overrides).toContain(`${JSON.stringify(realpathSync(codexHome))}="deny"`)
-      expect(overrides).toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
-      expect(overrides).toContain('"PATH"="/usr/bin:/bin:/usr/sbin:/sbin')
-      if (existsSync('/opt/homebrew/Cellar')) {
-        expect(overrides).toContain(`${JSON.stringify(realpathSync('/opt/homebrew/Cellar'))}="read"`)
-      }
+      expect(overrides).not.toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
+      const primaryPath = (Bun.TOML.parse(overrides) as any).shell_environment_policy.set.PATH
+      expect(primaryPath.split(':')).toContain('/usr/bin')
+      expect(primaryPath).not.toContain(`${join(homedir(), '.codex')}/`)
       expect(overrides).toContain('"*PROXY*"')
       expect(overrides).toContain('network.enabled=true')
       expect(overrides).toContain('network.allow_local_binding=true')

@@ -2758,6 +2758,12 @@ describe('Codex branch self update', () => {
       '#!/bin/bash',
       'set -euo pipefail',
       candidateGitDiffFunction(),
+      // Candidate Git metadata is intentionally read-only. Construct the
+      // staged-only fixture in a disposable nested repository instead.
+      'mkdir staged-fixture',
+      'cp -R .git staged-fixture/.git',
+      'cp version.txt staged-fixture/version.txt',
+      'cd staged-fixture',
       "printf 'staged-dirty \\n' >> version.txt",
       'candidate_git="$ZERO_CODEX_CANDIDATE_GIT"',
       '/usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty TMPDIR=/var/empty LANG=C LC_ALL=C TERM=dumb GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false GIT_PAGER=cat GIT_OPTIONAL_LOCKS=0 "$candidate_git" --no-pager -c core.fsmonitor=false add -- version.txt </dev/null',
