@@ -255,13 +255,16 @@ def _resolve_official_grok(real_home: Path, logical: Path) -> Path:
     if not _same(logical_before, logical_after):
         raise OSError("Grok Build launcher changed during resolution")
     architecture = "arm64" if _expected_grok_cpu_type() == 0x0100000C else "x86_64"
-    current_official_target = {
-        "arm64": "../downloads/grok-macos-aarch64",
-        "x86_64": "../downloads/grok-macos-x86_64",
+    platform_name = {
+        "arm64": "macos-aarch64",
+        "x86_64": "macos-x86_64",
     }.get(architecture)
     if OFFICIAL_GROK_NAME.fullmatch(raw_target):
         target = expected_bin / raw_target
-    elif current_official_target is not None and raw_target == current_official_target:
+    elif platform_name is not None and re.fullmatch(
+        r"\.\./downloads/grok-(?:[0-9]+\.[0-9]+\.[0-9]+-)?" + re.escape(platform_name),
+        raw_target,
+    ):
         downloads = home / ".grok" / "downloads"
         _safe_owned_directory(downloads)
         target = downloads / Path(raw_target).name
