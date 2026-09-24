@@ -1,6 +1,6 @@
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
-import { installedComputerUseClient } from './installed-computer-use.ts'
+import { installedComputerUseClient, installedComputerUseNodeRepl } from './installed-computer-use.ts'
 import { GO_CHROME_ENABLED_TOOLS, GO_CHROME_DISABLED_TOOLS } from './chrome-tools.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { CODEX_NETWORK_CONTINUATION, CODEX_NETWORK_RETRY_DELAYS_MS, isTransientCodexNetworkError } from './codex-network-retry.ts'
@@ -429,6 +429,30 @@ function normalizedMcpServer(value: Record<string, unknown>): string {
   return normalizedJson({ required: false, ...server })
 }
 
+function mcpConfigToml(value: unknown): string {
+  if (typeof value === 'string') return tomlString(value)
+  if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) return String(value)
+  if (Array.isArray(value)) return `[${value.map(mcpConfigToml).join(',')}]`
+  if (value && typeof value === 'object') return `{${Object.entries(value)
+    .filter(([key, child]) => key !== 'environment_id' && child !== null && child !== undefined)
+    .map(([key, child]) => `${tomlString(key)}=${mcpConfigToml(child)}`).join(',')}}`
+  throw new Error('unsupported desktop MCP config value')
+}
+
+export function trustedComputerUseNodeTransport(server: Record<string, unknown>, layers: unknown): boolean {
+  if (server.enabled !== true) return false
+  let trusted = false
+  for (const layer of Array.isArray(layers) ? layers : []) {
+    const setting = layer?.config?.mcp_servers?.node_repl
+    if (setting === undefined) continue
+    if (layer?.name?.type === 'project') return false
+    if (layer?.name?.type === 'sessionFlags') continue
+    if (setting.enabled === false) return false
+    trusted = true
+  }
+  return trusted
+}
+
 function assertEffectiveMcpIsolation(
   config: Record<string, unknown>,
   overrides: string[],
@@ -585,6 +609,15 @@ export function mcpIsolationOverridesForConfig(
     const hasUrl = typeof server.url === 'string' && server.url.length > 0
     if (hasCommand === hasUrl) {
       throw new Error(`Codex effective MCP server ${name} has an ambiguous transport`)
+    }
+    if (name === 'node_repl' && projectRoot && overrides.includes('features.computer_use=true')
+      && trustedComputerUsePluginEnabled(config, layers)
+      && trustedComputerUseNodeTransport(server, layers)
+      && installedComputerUseNodeRepl(projectRoot, server.command)) {
+      // Current official Computer Use uses node_repl + @oai/sky. Preserve the
+      // operator's runtime metadata and approval settings, not just its command.
+      additions.push(`${tomlString(name)}=${mcpConfigToml(server)}`)
+      continue
     }
     if (browserTransportEnabled && name === 'go-chrome-mcp' && server.enabled === true) {
       // Preserve the installed browser transport when it is a simple,
@@ -4218,7 +4251,9 @@ export function buildCodexWorkerPrompt(
     }
     if (host.computerUseEnabled) {
       control.push('Native Computer Use is enabled for this authorized primary execution when installed.',
-        'Discover its actual tools; names vary by client version. Existing per-app approvals still apply.',
+        'Read the installed computer-use skill. Current clients use node_repl with @oai/sky;',
+        'discover node_repl tools rather than assuming a direct get_app_state MCP tool exists.',
+        'Existing per-app approvals still apply.',
         'Do not bypass app approval or claim a missing connection without trying the exposed native tool.')
     }
     if (job.githubPublicationRecovery) {

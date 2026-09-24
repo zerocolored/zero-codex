@@ -12101,6 +12101,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         expect((roleConfig.features as any).computer_use).toBe(false)
         expect((roleConfig.features as any).plugins).toBe(false)
         expect((roleConfig.mcp_servers as any)['computer-use'].enabled).toBe(false)
+        expect((roleConfig.mcp_servers as any).node_repl.enabled).toBe(false)
       }
       expect(overrides).toContain('features.plugins=true')
       expect(overrides).toContain('features.goals=false')

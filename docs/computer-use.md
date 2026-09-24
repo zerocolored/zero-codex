@@ -13,6 +13,8 @@
 
 MCP接続自体を無効化している場合（`codex mcp get computer-use --json` の `enabled: false`）は、その設定も尊重する。プラグインのインストールだけでは接続の無効設定を上書きしない。
 
+現行の公式プラグインは `node_repl` から `@oai/sky` を使う。Zerochanは、ChatGPT.appが導入した公式の `node_repl` 接続を、許可された主実行だけに引き継ぐ。実行ファイルだけでなく、導入済みのモジュール解決設定・接続情報・承認設定を保持する。プロジェクト側で追加・変更した接続や、利用者が無効化した接続は有効にしない。`computer-use` サーバーのツール一覧が取得できるだけでは、モデルによる画面操作の成功を意味しない。
+
 ## 条件4: アプリ承認を永続化する（Macごとに1回）
 
 「Allow Computer Use to use "<アプリ>"?」の承認は**設定ファイルでは回避できない**（`computer_use.default_app_access` や `computer_use.macos.bundle_ids` を allow にしても対話承認は要求される）。headless ジョブは `approval_policy="never"` のため自動拒否になる。**一度だけ対話セッションで「Always allow」を選ぶと永続化**され、以後 headless でも自動通過する。
@@ -22,7 +24,7 @@ MCP接続自体を無効化している場合（`codex mcp get computer-use --js
 確認（headless で通るか）:
 
 ```bash
-printf 'Use the exposed native Computer Use tool to read the state of <bundle id> once. Tool names depend on the client version (get_app_state or cua_repl). Do not modify the app or access other apps. Report the actual approval or connection error if any.' | codex \
+printf 'Read the installed computer-use skill. Use node_repl and the official @oai/sky package to get_app_state for <bundle id> once. Do not modify the app or access other apps. Report the actual approval or connection error if any.' | codex \
   -c features.computer_use=true -c features.plugins=true \
   -c 'approval_policy="never"' \
   exec --ignore-rules --skip-git-repo-check --json -

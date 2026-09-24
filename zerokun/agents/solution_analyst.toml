@@ -20,3 +20,8 @@ plugins = false
 enabled = false
 command = "/usr/bin/false"
 args = []
+
+[mcp_servers.node_repl]
+enabled = false
+command = "/usr/bin/false"
+args = []
