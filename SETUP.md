@@ -245,6 +245,27 @@ DMでrepositoryの変更も許可する場合だけ、別途write権限を付け
 zerochan-access write allow <Slack user ID>
 ```
 
+## Computer Use（画面操作）を使う場合だけ
+
+`setup.sh` の最後に手動ステップ4として導入状況が表示されます。Zeroちゃんが採用するのは
+**別途インストールする公式clientだけ**で、次のどちらかが必要です。
+
+- `~/.codex/computer-use/Codex Computer Use.app/.../SkyComputerUseClient`
+- `/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl`
+
+導入後、システム設定 → プライバシーとセキュリティ の「画面収録」と「アクセシビリティ」で
+**Codex Computer Use** を許可します。
+
+> 🔴 **ターミナルやHerdrへ画面収録・アクセシビリティを付けてもComputer Useは有効になりません。**
+> 権限はGUIを操作するprocessに紐づき、それはHerdrでもターミナルでもなく公式clientです。
+> TCCの許可はMacごと・path／コード署名ごとなので、別のMacへコピーすることもできません。
+
+いま入っているかは単体でも確認できます。
+
+```bash
+bun zerokun/computer-use-readiness.ts <対象projectのpath>
+```
+
 ## 更新する
 
 通常の更新は、対象projectまたはZeroちゃん本体のdirectoryから次の1コマンドで行います。

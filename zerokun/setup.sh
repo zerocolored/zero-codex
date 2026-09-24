@@ -760,4 +760,6 @@ else
   echo "     queue確認: zerokun-jobs status"
   echo "     Codex版更新: zerochan update"
   echo "     DMの書込み許可（チャンネルは個別登録不要）: zerochan-access write allow <SlackユーザーID>"
+  # Computer Useは別途インストールする公式clientが実体で、ターミナルやHerdrへTCCを付けても有効にならない。
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/computer-use-readiness.ts" "$PROJECT_DIR" || true
 fi
