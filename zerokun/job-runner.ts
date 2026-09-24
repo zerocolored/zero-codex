@@ -1,6 +1,8 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
+import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
+import { startFleetRunnerPulse } from './fleet-runtime.ts'
 import { resolveArtifactSource, previousThreadArtifactRoots } from './artifact-source.ts'
 import { advisorFailureMessage, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
@@ -8988,6 +8990,36 @@ export class JobStore {
       counts[row.status] = row.count
       return counts
     }, { queued: 0, running: 0 })
+  }
+
+  /** Small public projection: never select task/result/raw logs for monitoring. */
+  fleetFacts(now = Date.now()): FleetLocalFacts {
+    const counts = this.activeCounts()
+    counts.queued = this.db.query<{ n: number }, []>(`SELECT count(*) AS n FROM jobs WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}`).get()!.n
+    const current = this.db.query<{ id: string; attempts: number; not_before: number | null; rate_limit_terminal_json: string | null }, []>(
+      `SELECT id, attempts, not_before, rate_limit_terminal_json FROM jobs
+       WHERE runtime='codex' AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
+       ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, seq LIMIT 1`,
+    ).get()
+    const summary = current ? this.db.query<{ payload: string; created_at: number }, [string, number]>(
+      `SELECT payload,created_at FROM commentary_notifications WHERE job_id=? AND attempt=?
+       AND delivered_at IS NOT NULL AND suppressed_at IS NULL ORDER BY seq DESC LIMIT 1`,
+    ).get(current.id, current.attempts) : null
+    const last = this.db.query<{ at: number | null }, []>(
+      `SELECT MAX(at) AS at FROM (SELECT MAX(created_at) AS at FROM jobs WHERE runtime='codex'
+       UNION ALL SELECT MAX(created_at) FROM job_controls WHERE kind='steer')`,
+    ).get()?.at ?? null
+    const limited = !counts.running && (Boolean(current?.rate_limit_terminal_json) || Boolean(this.db.query<{ yes: number }, []>(
+      "SELECT 1 AS yes FROM cloud_handoff_jobs WHERE state IN ('saving','waiting') LIMIT 1",
+    ).get()))
+    const approval = Boolean(this.db.query<{ yes: number }, []>(
+      "SELECT 1 AS yes FROM ui_approval_requests WHERE status IN ('publishing','awaiting') LIMIT 1",
+    ).get())
+    // Public Slack milestones only. Credentials and local paths are not a fleet summary.
+    const text = summary?.payload.replace(/^💬\s*/, '').trim() ?? null
+    const safe = text && !containsCredentialMaterial(text) ? fleetSummaryWithoutPaths(text) : null
+    return { ...counts, limited, approval, deferred: Boolean(current?.not_before && current.not_before > now),
+      lastAcceptedAt: last, summary: limited ? null : safe, summaryAt: !limited && safe ? summary!.created_at : null }
   }
 
   countClaimable(now = Date.now()): number {
@@ -18436,9 +18468,11 @@ async function runCli(): Promise<void> {
   const herdrIdentityTimer = setInterval(checkHerdrIdentity, 5_000)
   herdrIdentityTimer.unref()
   let serviceControlPauseWarning = ''
+  let fleetPaused = true
   const shouldPause = (): boolean => {
-    if (slackIdentityChanged() || herdrIdentityInvalid) return true
+    if (slackIdentityChanged() || herdrIdentityInvalid) { fleetPaused = true; return true }
     const paused = updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
+    fleetPaused = paused
     if (paused) {
       try {
         acknowledgeServiceControlPauseIfRequested(dir)
@@ -18518,6 +18552,8 @@ async function runCli(): Promise<void> {
   for (const jobId of startupRetainedMonitorJobIds) ensureMonitorGuard(jobId)
 
   const cloudRuntime = CloudRuntime.configured(store, dir)
+  // Observe the scheduler's last decision; never acknowledge a stop/update from a monitoring timer.
+  const stopFleetPulse = startFleetRunnerPulse(dir, () => fleetPaused)
   let cloudRetry: Promise<void> | undefined
   const cloudRetryTimer = cloudRuntime ? setInterval(() => {
     if (cloudRetry || shouldPause()) return
@@ -19004,6 +19040,7 @@ async function runCli(): Promise<void> {
     if (monitorFatal) throw monitorFatal
   } finally {
     const interrupted = controller.signal.aborted && !monitorFatal
+    stopFleetPulse()
     if (cloudRetryTimer) clearInterval(cloudRetryTimer)
     if (cloudRetry) await cloudRetry
     clearInterval(maintenanceTimer)

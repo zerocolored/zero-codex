@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync, symlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { AUTO_UPDATE_INTERVAL_MS, checkAutomaticUpdate, configureAutomaticUpdates, automaticUpdatesEnabled, remoteUpdateHead } from './auto-update.ts'
+import { AUTO_UPDATE_INTERVAL_MS, automaticUpdateRecipient, checkAutomaticUpdate, configureAutomaticUpdates, automaticUpdatesEnabled, remoteUpdateHead } from './auto-update.ts'
 import { requestUpdate, runUpdateWorker, resumePendingUpdateWorker } from './update-request.ts'
 import { tryAcquireProcessLock, releaseProcessLock } from './process-lock.ts'
 import { withUpdateTestPolicy } from './update.ts'
@@ -136,7 +136,7 @@ test('another app recovers the originating app durable worker instead of blockin
 
 test('automatic request survives worker restart and sends outcome without rerunning update', async () => {
   const stateDir = temp(); let runs = 0; const messages: string[] = []
-  const result = await requestUpdate({ source: 'automatic', chatId: 'C123', threadTs: '', userId: '', messageId: 'auto:one' }, {
+  const result = await requestUpdate({ source: 'automatic', chatId: 'U123', threadTs: '', userId: '', messageId: 'auto:one' }, {
     stateDir, isWorkerRunning: () => false, isUpdateRunning: () => false, launchWorker: () => {},
   })
   const options = { stateDir, executeUpdater: async () => { runs++; return 0 },
@@ -147,6 +147,7 @@ test('automatic request survives worker restart and sends outcome without rerunn
   expect(runs).toBe(1)
   await runUpdateWorker(result.request.id, options)
   expect(runs).toBe(1)
+  expect(messages).toHaveLength(1)
 })
 
 test('public CLI persists off/on across processes without project or tokens', () => {
@@ -165,9 +166,9 @@ test('public CLI persists off/on across processes without project or tokens', ()
   expect(run('status')).toContain('有効')
 })
 
-test('failure notification retry uses saved result without repeating updater', async () => {
+test('automatic DM failure is terminal without changing failed updater outcome', async () => {
   const stateDir = temp(); let runs = 0
-  const pending = await requestUpdate({ source: 'automatic', chatId: 'C123', threadTs: '', userId: '', messageId: 'auto:failure' }, {
+  const pending = await requestUpdate({ source: 'automatic', chatId: 'U123', threadTs: '', userId: '', messageId: 'auto:failure' }, {
     stateDir, isWorkerRunning: () => false, isUpdateRunning: () => false, launchWorker: () => {},
   })
   const executeUpdater = async () => { runs++; return 9 }
@@ -177,10 +178,63 @@ test('failure notification retry uses saved result without repeating updater', a
   let text = ''
   expect((await runUpdateWorker(pending.request.id, { stateDir, executeUpdater,
     notify: async (_, value) => { text = value },
-  })).notificationSent).toBe(true)
+  })).notificationSkipped).toBe(true)
   expect(runs).toBe(1)
-  expect(text).toContain('終了コード: 9')
-  expect(text).not.toContain('復旧しました')
+  expect(text).toBe('')
+  expect(resumePendingUpdateWorker({ stateDir, isWorkerRunning: () => false, launchWorker: () => { throw new Error('must not launch') } })).toBe(false)
+})
+
+test('automatic recipients never fall back to channel IDs', () => {
+  expect(automaticUpdateRecipient([])).toBe('')
+  expect(automaticUpdateRecipient(['C123', 'G123'])).toBe('')
+  expect(automaticUpdateRecipient(['', 'U123', 'U456'])).toBe('U123')
+  expect(automaticUpdateRecipient(['W123'])).toBe('W123')
+})
+
+test('real notification path addresses personal DM without a thread or channel fallback', async () => {
+  const stateDir = temp()
+  writeFileSync(join(stateDir, '.env'), 'SLACK_BOT_TOKEN=xoxb-0123456789abcdef\nSLACK_APP_TOKEN=xapp-1-A0TESTAPP-1234567890abcdef\n')
+  const pending = await requestUpdate({ source: 'automatic', chatId: 'U123', threadTs: '', userId: '', messageId: 'auto:api' }, {
+    stateDir, isWorkerRunning: () => false, isUpdateRunning: () => false, launchWorker: () => {},
+  })
+  const originalFetch = globalThis.fetch; const messages: any[] = []
+  globalThis.fetch = (async (url: any, init: any) => {
+    const endpoint = String(url)
+    if (endpoint.endsWith('chat.postMessage')) messages.push(JSON.parse(init.body))
+    return Response.json(endpoint.endsWith('auth.test')
+      ? { ok: true, app_id: 'A0TESTAPP', bot_id: 'B0TESTBOT', user_id: 'U0TESTBOT' }
+      : endpoint.endsWith('bots.info') ? { ok: true, bot: { app_id: 'A0TESTAPP' } } : { ok: true })
+  }) as typeof fetch
+  try {
+    expect((await runUpdateWorker(pending.request.id, { stateDir, executeUpdater: async () => 0 })).notificationSent).toBe(true)
+    expect(messages).toHaveLength(1)
+    expect(messages[0].channel).toBe('U123')
+    expect(messages[0].thread_ts).toBeUndefined()
+  } finally { globalThis.fetch = originalFetch }
+})
+
+test('scheduler never recovers a skipped automatic notification', async () => {
+  const root = temp(); const completedAt = Date.now()
+  writeFileSync(join(root, 'auto-update-check.json'), JSON.stringify({ pendingState: root, pendingId: 'skip', checkedAt: completedAt }))
+  writeFileSync(join(root, 'update-request.json'), JSON.stringify({ id: 'skip', source: 'automatic', outcome: { success: true, completedAt, notificationSkippedAt: completedAt } }))
+  expect(await checkAutomaticUpdate({ root, stateDir: root, now: () => completedAt + 1,
+    detect: async () => { throw new Error('not due') }, enqueue: async () => { throw new Error('not due') },
+    recoverPending: () => { throw new Error('must not recover') },
+  })).toBe('not-due')
+})
+
+for (const chatId of ['', 'C123', 'G123']) test(`automatic update without DM (${chatId}) completes silently and durably`, async () => {
+  const stateDir = temp(); let runs = 0; let sent = 0
+  const input = { source: 'automatic' as const, chatId, threadTs: '', userId: '', messageId: 'auto:silent' }
+  const settings = { stateDir, isWorkerRunning: () => false, isUpdateRunning: () => false, launchWorker: () => {} }
+  const pending = await requestUpdate(input, settings)
+  const options = { stateDir, executeUpdater: async () => { runs++; return 0 }, notify: async () => { sent++ } }
+  expect(await runUpdateWorker(pending.request.id, options)).toEqual({ success: true, exitCode: 0, notificationSent: false, notificationSkipped: true })
+  await runUpdateWorker(pending.request.id, options)
+  expect(runs).toBe(1); expect(sent).toBe(0)
+  expect(resumePendingUpdateWorker(settings)).toBe(false)
+  expect((await requestUpdate(input, settings)).duplicate).toBe(true)
+  expect((await requestUpdate({ ...input, messageId: 'auto:next' }, settings)).accepted).toBe(true)
 })
 
 test('real local git remote: only clean main behind remote is scheduled', async () => {

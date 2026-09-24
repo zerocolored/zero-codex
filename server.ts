@@ -8,6 +8,7 @@
  */
 
 import { App } from '@slack/bolt'
+import { startConfiguredFleet } from './zerokun/fleet-runtime.ts'
 import { createHash, randomBytes } from 'crypto'
 import {
   closeSync, constants, existsSync, fsyncSync, openSync, writeFileSync,
@@ -39,7 +40,7 @@ import {
   mentionsBot,
 } from './gate.ts'
 import { requestUpdate, resumePendingUpdateWorker } from './zerokun/update-request.ts'
-import { checkAutomaticUpdate, remoteUpdateHead } from './zerokun/auto-update.ts'
+import { automaticUpdateRecipient, checkAutomaticUpdate, remoteUpdateHead } from './zerokun/auto-update.ts'
 import { slackAppRegistryRoot, listRegisteredSlackApps } from './zerokun/slack-app-registry.ts'
 import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
 import {
@@ -478,6 +479,7 @@ slackApp = new App({
 })
 
 let slackSocket: SlackSocketSupervisor | null = null
+let fleetReporter: { stop(): void } | null = null
 
 function describeSlackSocketEvent(event: SlackSocketSupervisorEvent): string {
   if (event.phase === 'lost') return 'socket mode disconnected; reconnecting'
@@ -1730,6 +1732,7 @@ function shutdown(): void {
   // 'disconnecting' event alone is not enough: a SIGTERM that lands during a
   // backoff has no live socket to emit it.
   slackSocket?.stop()
+  fleetReporter?.stop()
   process.stderr.write('slack channel: shutting down\n')
   clearGatewayReadiness(READY_FILE)
   // Keep the singleton lock and SQLite handle until the process exits. Releasing
@@ -2790,6 +2793,8 @@ try {
   // legacy launcher) re-enables crash alerts only after Socket Mode and the
   // generation-bound readiness record are both established.
   clearIntentionalServiceStop(STATE_DIR)
+  fleetReporter = startConfiguredFleet(STATE_DIR, identity.appId, connectedProjectDir,
+    () => jobStore.fleetFacts(), () => slackSocket?.connected === true)
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 
   // Sweep once on startup for new mentions/DMs, and recover replies in owned threads.
@@ -2802,8 +2807,7 @@ try {
   const checkForUpdates = async () => {
     try {
       const access = loadAccess()
-      const destination = access.allowFrom[0] ?? Object.keys(access.channels).sort()[0]
-      if (!destination) return // Wait until an actual notification recipient is configured.
+      const destination = automaticUpdateRecipient(access.allowFrom)
       await checkAutomaticUpdate({
         root: slackAppRegistryRoot(), stateDir: STATE_DIR,
         detect: () => remoteUpdateHead(import.meta.dir),

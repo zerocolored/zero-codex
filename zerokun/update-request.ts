@@ -82,6 +82,7 @@ export interface UpdateRequest extends UpdateRequestInput {
     text: string
     completedAt: number
     notifiedAt?: number
+    notificationSkippedAt?: number
   }
 }
 
@@ -152,6 +153,7 @@ export interface UpdateWorkerResult {
   success: boolean
   exitCode: number
   notificationSent: boolean
+  notificationSkipped?: boolean
 }
 
 const decoder = new TextDecoder()
@@ -173,7 +175,7 @@ function requireText(value: string, field: string): string {
 function validateInput(input: UpdateRequestInput): UpdateRequestInput {
   if (input.source === 'automatic') return {
     source: 'automatic',
-    chatId: requireText(input.chatId, 'chatId'),
+    chatId: input.chatId.trim(),
     threadTs: '',
     messageId: requireText(input.messageId, 'messageId'),
     userId: '',
@@ -229,6 +231,9 @@ function readRequest(dir: string): UpdateRequest | undefined {
             completedAt: Number(parsed.outcome.completedAt),
             ...(Number.isFinite(Number(parsed.outcome.notifiedAt))
               ? { notifiedAt: Number(parsed.outcome.notifiedAt) }
+              : {}),
+            ...(Number.isFinite(Number(parsed.outcome.notificationSkippedAt))
+              ? { notificationSkippedAt: Number(parsed.outcome.notificationSkippedAt) }
               : {}),
           },
         }
@@ -376,8 +381,12 @@ export function launchDetachedUpdateWorker(
   ], { env: buildUpdaterEnvironment() })
 }
 
+function notificationSettled(request: UpdateRequest): boolean {
+  return Boolean(request.outcome?.notifiedAt || (request.source === 'automatic' && request.outcome?.notificationSkippedAt))
+}
+
 function notificationRetryWindowOpen(request: UpdateRequest, now: number, staleAfterMs: number): boolean {
-  return Boolean(request.outcome && !request.outcome.notifiedAt
+  return Boolean(request.outcome && !notificationSettled(request)
     && now - request.outcome.completedAt <= staleAfterMs)
 }
 
@@ -417,7 +426,7 @@ export async function requestUpdate(
     }
   }
   if (existing) {
-    if (existing.outcome?.notifiedAt) {
+    if (notificationSettled(existing)) {
       if (existing.chatId === input.chatId && existing.messageId === input.messageId) {
         await options.onDuplicate?.(existing)
         return { accepted: false, duplicate: true, request: existing }
@@ -441,7 +450,7 @@ export async function requestUpdate(
     }
     running ||= isUpdateRunning()
     // Background maintenance must not discard a user's pending result delivery.
-    if (input.source === 'automatic' && existing.outcome && !existing.outcome.notifiedAt
+    if (input.source === 'automatic' && existing.outcome && !notificationSettled(existing)
       && notificationRetryWindowOpen(existing, now(), options.staleAfterMs ?? DEFAULT_STALE_MS)) {
       if (!running) launch(existing)
       return { accepted: false, duplicate: true, request: existing }
@@ -497,7 +506,7 @@ export async function requestUpdate(
 export function resumePendingUpdateWorker(options: RequestOptions = {}): boolean {
   const dir = options.stateDir ?? stateDir()
   const request = readRequest(dir)
-  if (!request || request.outcome?.notifiedAt) return false
+  if (!request || notificationSettled(request)) return false
   const session = options.tmuxSession ?? WORKER_SESSION
   const running = options.isWorkerRunning
     ? options.isWorkerRunning()
@@ -938,6 +947,11 @@ export async function runUpdateWorker(
   requireManagedStateRoot(dir)
   const request = readRequest(dir)
   if (!request || request.id !== requestId) throw new Error(`更新依頼が見つかりません: ${requestId}`)
+  if (notificationSettled(request)) return {
+    success: request.outcome!.success, exitCode: request.outcome!.exitCode,
+    notificationSent: Boolean(request.outcome!.notifiedAt),
+    ...(request.outcome!.notificationSkippedAt ? { notificationSkipped: true } : {}),
+  }
   const logPath = join(dir, 'update-request.log')
   const updaterPath = options.updaterPath
   const legacyCutover = options.legacyCutover
@@ -1001,7 +1015,18 @@ export async function runUpdateWorker(
     persistRequest(dir, { ...request, outcome })
   }
 
-  const maxAttempts = Math.max(1, Math.floor(
+  const skipNotification = () => {
+    outcome = { ...outcome!, notificationSkippedAt: Date.now() }
+    persistRequest(dir, { ...request, outcome })
+    return { success: outcome.success, exitCode: outcome.exitCode, notificationSent: false, notificationSkipped: true }
+  }
+  // Old persisted channel targets must also stay silent. D is a one-to-one
+  // conversation; U/W are personal user IDs accepted by chat.postMessage.
+  if (request.source === 'automatic' && !/^[UWD][A-Z0-9]+$/.test(request.chatId)) {
+    appendUpdateLog(logPath, `${new Date().toISOString()} automatic notification skipped: no DM recipient\n`)
+    return skipNotification()
+  }
+  const maxAttempts = request.source === 'automatic' ? 1 : Math.max(1, Math.floor(
     options.maxNotifyAttempts ?? DEFAULT_UPDATE_NOTIFY_ATTEMPTS,
   ))
   const retryMs = Math.max(1, options.notificationRetryMs ?? 60_000)
@@ -1022,6 +1047,7 @@ export async function runUpdateWorker(
       if (attempt < maxAttempts) await Bun.sleep(retryMs)
     }
   }
+  if (request.source === 'automatic') return skipNotification()
   return { success: outcome.success, exitCode: outcome.exitCode, notificationSent: false }
 }
 
@@ -1054,7 +1080,7 @@ async function runCli(): Promise<void> {
     legacyCutover: legacyCutover === undefined ? undefined : legacyCutover === '1',
     projectDir,
   })
-  if (!result.success || !result.notificationSent) process.exitCode = 1
+  if (!result.success || (!result.notificationSent && !result.notificationSkipped)) process.exitCode = 1
 }
 
 if (import.meta.main) {
