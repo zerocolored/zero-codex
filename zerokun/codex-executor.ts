@@ -3894,6 +3894,11 @@ export function buildCodexDeveloperInstructions(
       'A Google Cloud browser Console permission denial is not evidence that host IAM is denied.',
       'Try the host tool before declaring Cloud Run access blocked. Redacted values are unknown,',
       'not absent or disabled. This transport does not grant IAM or modify cloud configuration.',
+      'For private historical evidence or database audit records, first discover the host-registered',
+      'entries with zerokun_cloud_logging.project_audit_read, then read relevant evidence IDs.',
+      'Do not equate missing shell DB credentials with unavailable host reads. Preserve provenance:',
+      'a historical baseline, a before/after recovery journal, and current rows prove different things.',
+      'Never replace missing expected IDs with current results or claim full acceptance from counts.',
       'Supply an explicit project ID from the task or repository and UTC time range; access is',
       'decided by host Google Cloud IAM, not a repository allowlist or cloud-access.json.',
       'The shell has an isolated HOME by design; missing shell',
@@ -5456,7 +5461,7 @@ export function buildCodexPermissionOverrides(
   if (options.cloudLoggingMcp) {
     const cloud = options.cloudLoggingMcp
     mcpEntries.push(
-      `zerokun_cloud_logging={command=${tomlString(cloud.command)},args=[${cloud.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["cloud_logging_read","cloud_run_describe"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=90,tools={cloud_logging_read={approval_mode="approve"},cloud_run_describe={approval_mode="approve"}}}`,
+      `zerokun_cloud_logging={command=${tomlString(cloud.command)},args=[${cloud.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["cloud_logging_read","cloud_run_describe","project_audit_read"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=90,tools={cloud_logging_read={approval_mode="approve"},cloud_run_describe={approval_mode="approve"},project_audit_read={approval_mode="approve"}}}`,
     )
   }
   const mcpServers = `{${mcpEntries.join(',')}}`

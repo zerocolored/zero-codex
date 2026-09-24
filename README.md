@@ -647,3 +647,9 @@ bun run verify
 ## License
 
 Apache-2.0
+
+### 非公開の監査証拠
+
+隔離ジョブは `zerokun_cloud_logging.project_audit_read` でホスト登録済みの過去記録とDB監査結果を読み取れます。引数なしで当該projectの証拠IDを一覧し、`evidence` にIDを指定して取得します。任意SQL・接続文字列・ファイルパスは受け付けません。過去の期待集合、変更前後のjournal、現在の値を区別し、欠落した基準を現在値で置き換えないでください。
+
+管理者設定はホストの `~/.codex/zerochan-apps/audit-readers.json`（owner-only、Git管理外）です。`version: 1`、`projects: [{root: 物理project root, entries: {証拠ID: ...}}]` を持ちます。`snapshot` は `source` と `data`、`postgres` は `source`・GCP `project`・Secret Managerの `secret` 名・loopback proxyの `port`・照合する `database`・PGクラスタの `systemId`・管理者が精査した単一SELECTの `sql`・`maxRows` を登録します。必要なら既存サービスアカウント鍵の `credentialFile` パスを指定できます。SQLは単にSELECTなら安全という意味ではなく、副作用のある関数・機密列を含まないことを登録者が確認する信頼済み設定です。秘密値は設定せず、Secret Managerからホスト内だけで取得します。PG側のREAD ONLY/RR transaction、時間・件数・返却サイズ制限も適用します。登録がない状態、失われた証拠、実際のDB権限拒否は別の状態です。一時directoryだけに基準記録を保管せず、出典付きsnapshotを永続保管してください。
