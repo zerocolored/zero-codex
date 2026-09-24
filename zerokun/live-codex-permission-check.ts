@@ -750,15 +750,17 @@ async function main(): Promise<void> {
     requireStatus(writeRepoStatus, 'allowed')
     requireStatus(writeOutboxStatus, 'allowed')
     requireStatus(writeStateStatus, 'denied')
-    requireStatus(writeHomeStatus, 'denied')
+    requireStatus(writeHomeStatus, 'allowed')
     if (readFileSync(writeProbe, 'utf8') !== 'allowed') {
       throw new Error('write-enabled App Server turn could not write the repository')
     }
     if (readFileSync(outboxProbe, 'utf8') !== 'artifact') {
       throw new Error('write-enabled App Server turn could not write the outbox')
     }
+    if (readFileSync(homeLeakProbe, 'utf8') !== `${homeSentinelValue}\n`) {
+      throw new Error('write-enabled App Server turn lost ordinary host read permission')
+    }
     if (Bun.file(leakProbe).size > 0
-      || Bun.file(homeLeakProbe).size > 0
       || writeRun.transcript.includes('must-not-be-readable')
       || writeRun.transcript.includes(homeSentinelValue)) {
       throw new Error('write-enabled App Server turn exposed protected content')
@@ -811,9 +813,11 @@ async function main(): Promise<void> {
       throw new Error('write-resume turn lost repository or outbox write permission')
     }
     requireStatus(writeResumeStateStatus, 'denied')
-    requireStatus(writeResumeHomeStatus, 'denied')
+    requireStatus(writeResumeHomeStatus, 'allowed')
+    if (readFileSync(writeResumeHomeLeak, 'utf8') !== `${homeSentinelValue}\n`) {
+      throw new Error('write-resume App Server turn lost ordinary host read permission')
+    }
     if (Bun.file(writeResumeStateLeak).size > 0
-      || Bun.file(writeResumeHomeLeak).size > 0
       || writeResumeRun.transcript.includes('must-not-be-readable')
       || writeResumeRun.transcript.includes(homeSentinelValue)) {
       throw new Error('write-resume App Server turn exposed protected content')
@@ -895,8 +899,8 @@ async function main(): Promise<void> {
       readTurn: 'AGENTS loaded,repo-write-denied,state-read-denied,unrelated-home-read-denied',
       liveControl: `thread-resume,turn-steer:${controlRun.value.steerRequestId},turn-interrupt:${controlRun.value.interruptRequestId}`,
       writePermissionPhases: `same-thread,separate-processes:${phaseProcessIds.join(',')},read-only-prepare,write-implementation,read-only-review`,
-      writeTurn: 'thread-resume,repo-write-allowed,outbox-write-allowed,state-read-denied,unrelated-home-read-denied',
-      writeResume: 'same-write-thread,repo-write-allowed,outbox-write-allowed,state-read-denied,unrelated-home-read-denied',
+      writeTurn: 'thread-resume,repo-write-allowed,outbox-write-allowed,state-read-denied,host-read-allowed',
+      writeResume: 'same-write-thread,repo-write-allowed,outbox-write-allowed,state-read-denied,host-read-allowed',
       writeReview: 'same-write-thread,repo-write-denied,state-read-denied,unrelated-home-read-denied',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       reasoningEffort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
