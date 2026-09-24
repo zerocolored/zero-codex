@@ -10,6 +10,7 @@ import { parseGitHubBrokerContext } from './github-credential-broker.ts'
 import { runBoundedHostCommand, type PublicationCommandResult } from './github-publication.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
 import { registerCloudRunTool } from './cloud-run-reader.ts'
+import { registerProjectAuditTool } from './project-audit-reader.ts'
 
 const PROJECT = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/
 const MAX_ROWS = 1000
@@ -81,7 +82,7 @@ export function cloudLoggingArguments(query: CloudLogQuery): string[] {
 
 export type CloudLoggingRun = (args: string[], signal?: AbortSignal) => Promise<PublicationCommandResult>
 
-export function createHostCloudLoggingRun(): CloudLoggingRun {
+export function createHostCloudLoggingRun(credentialFile?: string): CloudLoggingRun {
   // Resolve only operator-installed entry points; never use the job PATH or cwd.
   let executable: string | undefined
   for (const candidate of ['/opt/homebrew/bin/gcloud', '/usr/local/bin/gcloud', '/usr/bin/gcloud', join(homedir(), 'google-cloud-sdk/bin/gcloud')]) {
@@ -108,6 +109,12 @@ export function createHostCloudLoggingRun(): CloudLoggingRun {
     CLOUDSDK_CORE_DISABLE_PROMPTS: '1',
     CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK: '1',
     CLOUDSDK_PYTHON_SITEPACKAGES: '0',
+    ...(credentialFile ? { CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: credentialFile } : {}),
+  }
+  if (credentialFile) {
+    const key = lstatSync(credentialFile)
+    if (realpathSync(credentialFile) !== credentialFile || !key.isFile() || key.nlink !== 1
+      || key.uid !== process.getuid?.() || (key.mode & 0o077)) throw new Error('Host gcloud credential file is unsafe')
   }
   return (args, signal) => {
     const current = lstatSync(executable!)
@@ -228,6 +235,7 @@ async function main(): Promise<void> {
     (args, signal) => (run ??= createHostCloudLoggingRun())(args, signal))
   registerCloudRunTool(server,
     (args, signal) => (run ??= createHostCloudLoggingRun())(args, signal))
+  registerProjectAuditTool(server, context.repoPath)
   await server.connect(new StdioServerTransport())
 }
 
