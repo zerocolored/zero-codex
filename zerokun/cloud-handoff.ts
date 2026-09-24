@@ -48,6 +48,11 @@ export class CloudHandoffError extends Error {
 export class CloudHandoffClient {
   constructor(private readonly config: CloudConfig, private readonly fetcher: typeof fetch = fetch,
     private readonly configPath?: string) {}
+  /** Authentication only: monitoring does not need handoff membership or RPC rights. */
+  async authenticatedUserId(): Promise<string> {
+    const response = await this.request('/auth/v1/user', 'GET')
+    return z.object({ id: z.string().uuid() }).parse(await response.json()).id
+  }
   private async credentials(): Promise<CloudConfig> {
     if (!this.configPath) return this.config
     const initial = readCloudConfig(this.configPath)
@@ -94,6 +99,17 @@ export class CloudHandoffClient {
   private async rpc(name: string, args: Record<string, unknown>): Promise<CloudHandoff> {
     const response = await this.request(`/rest/v1/rpc/${name}`, 'POST', JSON.stringify(args))
     return handoffSchema.parse(await response.json())
+  }
+  /** Monitoring has separate RPC grants and never touches handoff records. */
+  async fleetRpc(name: 'begin' | 'report', args: Record<string, unknown>): Promise<unknown> {
+    const config = await this.credentials()
+    const response = await this.fetcher(`${config.url}/rest/v1/rpc/zerochan_fleet_${name}`, {
+      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
+      headers: { apikey: config.publishableKey, Authorization: `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    })
+    if (!response.ok) { await response.body?.cancel(); throw new CloudHandoffError(response.status, 'fleet') }
+    return response.json()
   }
   async member(): Promise<{ user_id: string; space_id: string; slack_team_id: string; slack_bot_id: string }> {
     const response = await this.request('/rest/v1/zerochan_members?select=user_id,space_id,slack_team_id,slack_bot_id', 'GET')

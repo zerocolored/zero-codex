@@ -4,6 +4,10 @@ Slack の DM・メンションを、Herdr上で動くローカルのCodexへ安�
 Slack Appの表示名はセットアップ時に自由に設定できます。Slackへ投稿する本文は一人称で、表示名を
 固定しません。ローカルの監視tabや管理ログでは、runtime名として `Zeroちゃん` を使います。
 
+## 全員の稼働状況
+
+[稼働状況ページ](https://zerochan-fleet.s-hashimoto-dcd.workers.dev)では、共通パスワードで各PC・アプリの受付状況、作業要約、最終受付・通信時刻を確認できます。閲覧専用で、生ログやフルパスは送信しません。登録・公開・検証手順は [docs/fleet-dashboard.md](docs/fleet-dashboard.md)、送信設定の確認は `zerochan fleet status` です。
+
 ## 仕組み
 
 ```text
