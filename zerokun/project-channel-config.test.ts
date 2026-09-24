@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test, spyOn } from 'bun:test'
 import {
   chmodSync,
   existsSync,
@@ -20,6 +20,7 @@ import {
   projectChannelConfigPath,
   readProjectChannelConfig,
   bindProjectSlackApp,
+  switchProjectSlackApp,
 } from './project-channel-config.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
 
@@ -61,6 +62,138 @@ function gitStatus(project: string): string {
 }
 
 describe('project-local Slack channel routes', () => {
+  function switchFixture() {
+    const f = fixture()
+    mkdirSync(join(f.root, 'next'), { mode: 0o700 })
+    const next = realpathSync(join(f.root, 'next'))
+    const apps = [{ appId: APP_ID, stateDir: f.state }, { appId: 'ANEW', stateDir: next }]
+    bindProjectSlackApp(f.projectA, APP_ID)
+    mutateProjectChannelConfig({ operation: 'set', repoPath: f.projectA, stateDir: f.state, appId: APP_ID, channelId: 'CSWITCH' })
+    mutateProjectChannelConfig({ operation: 'set', repoPath: f.projectB, stateDir: f.state, appId: APP_ID, channelId: 'COTHER' })
+    return { ...f, next, apps }
+  }
+  test('explicit App switch preserves channels, other projects, and is idempotent', () => {
+    const f = switchFixture()
+    const history = new JobStore(join(f.state, 'jobs.sqlite3'))
+    history.resolveOrAdoptSlackThreadRoute({ appId: APP_ID, chatId: 'CSWITCH', threadTs: '1800000000.000100', defaultRepoPath: f.projectA, adoptedFromTs: '1800000000.000100' })
+    history.close()
+    switchProjectSlackApp(f.projectA, 'ANEW', f.apps)
+    switchProjectSlackApp(f.projectA, 'ANEW', f.apps)
+    expect(readProjectChannelConfig(f.projectA)).toEqual({ version: 1, slackAppId: 'ANEW', slackChannels: ['CSWITCH'] })
+    const old = new JobStore(join(f.state, 'jobs.sqlite3')), next = new JobStore(join(f.next, 'jobs.sqlite3'))
+    expect(old.resolveSlackChannelRoute(APP_ID, 'CSWITCH')).toBeNull()
+    expect(old.resolveSlackChannelRoute(APP_ID, 'COTHER')).toBe(f.projectB)
+    expect(next.resolveSlackChannelRoute('ANEW', 'CSWITCH')).toBe(f.projectA)
+    expect(old.resolveOrAdoptSlackThreadRoute({ appId: APP_ID, chatId: 'CSWITCH', threadTs: '1800000000.000100', defaultRepoPath: f.projectB, adoptedFromTs: '1800000000.000200' }).repoPath).toBe(f.projectA)
+    old.close(); next.close()
+    expect(existsSync(join(f.projectA, '.zerochan', 'slack-app-switch.json'))).toBe(false)
+  })
+  test('two processes selecting different Apps serialize without losing channels', async () => {
+    const f = switchFixture()
+    const children = [APP_ID, 'ANEW'].map(id => Bun.spawn([process.execPath, '-e',
+      `import {switchProjectSlackApp} from ${JSON.stringify(import.meta.dir + '/project-channel-config.ts')}; switchProjectSlackApp(${JSON.stringify(f.projectA)},${JSON.stringify(id)},${JSON.stringify(f.apps)});`,
+    ], { stdout: 'pipe', stderr: 'pipe' }))
+    for (const child of children) expect(await child.exited, await new Response(child.stderr).text()).toBe(0)
+    const config = readProjectChannelConfig(f.projectA)
+    expect(config.slackChannels).toEqual(['CSWITCH'])
+    for (const app of f.apps) {
+      const store = new JobStore(join(app.stateDir, 'jobs.sqlite3'))
+      expect(store.resolveSlackChannelRoute(app.appId, 'CSWITCH')).toBe(config.slackAppId === app.appId ? f.projectA : null)
+      store.close()
+    }
+  })
+  test('process exit after destination commit leaves a recoverable durable journal', () => {
+    const f = switchFixture()
+    const script = `
+      import {switchProjectSlackApp} from ${JSON.stringify(import.meta.dir + '/project-channel-config.ts')};
+      import {JobStore} from ${JSON.stringify(import.meta.dir + '/job-runner.ts')};
+      const original=JobStore.prototype.syncSlackChannelRoutes;
+      JobStore.prototype.syncSlackChannelRoutes=function(input){const r=original.call(this,input);if(input.appId==='ANEW')process.exit(99);return r};
+      switchProjectSlackApp(${JSON.stringify(f.projectA)},'ANEW',${JSON.stringify(f.apps)});
+    `
+    expect(Bun.spawnSync([process.execPath, '-e', script]).exitCode).toBe(99)
+    expect(existsSync(join(f.projectA, '.zerochan', 'slack-app-switch.json'))).toBe(true)
+    switchProjectSlackApp(f.projectA, 'ANEW', f.apps)
+    expect(readProjectChannelConfig(f.projectA).slackAppId).toBe('ANEW')
+    expect(existsSync(join(f.projectA, '.zerochan', 'slack-app-switch.json'))).toBe(false)
+    const old = new JobStore(join(f.state, 'jobs.sqlite3')), next = new JobStore(join(f.next, 'jobs.sqlite3'))
+    expect(old.resolveSlackChannelRoute(APP_ID, 'CSWITCH')).toBeNull()
+    expect(next.resolveSlackChannelRoute('ANEW', 'CSWITCH')).toBe(f.projectA)
+    old.close(); next.close()
+  })
+  test('switch with no channels needs no manual unset', () => {
+    const f = switchFixture()
+    mutateProjectChannelConfig({ operation: 'unset', repoPath: f.projectA, stateDir: f.state, appId: APP_ID })
+    switchProjectSlackApp(f.projectA, 'ANEW', f.apps)
+    expect(readProjectChannelConfig(f.projectA)).toEqual({ version: 1, slackAppId: 'ANEW', slackChannels: [] })
+  })
+  test('destination conflict changes neither configuration nor old routes', () => {
+    const f = switchFixture()
+    const next = new JobStore(join(f.next, 'jobs.sqlite3'))
+    next.syncSlackChannelRoutes({ appId: 'ANEW', repoPath: f.projectB, channelIds: ['CSWITCH'] }); next.close()
+    expect(() => switchProjectSlackApp(f.projectA, 'ANEW', f.apps)).toThrow('already connected')
+    expect(readProjectChannelConfig(f.projectA).slackAppId).toBe(APP_ID)
+    const old = new JobStore(join(f.state, 'jobs.sqlite3'))
+    expect(old.resolveSlackChannelRoute(APP_ID, 'CSWITCH')).toBe(f.projectA); old.close()
+  })
+  test('synchronous failure restores both indexes and original binding', () => {
+    const f = switchFixture()
+    const baseline = new JobStore(join(f.state, 'jobs.sqlite3'))
+    const beforeRoutes = baseline.listSlackChannelRoutes(APP_ID)
+    baseline.close()
+    const original = JobStore.prototype.syncSlackChannelRoutes
+    let failed = false
+    const spy = spyOn(JobStore.prototype, 'syncSlackChannelRoutes').mockImplementation(function(input) {
+      if (input.appId === 'ANEW' && !failed) { failed = true; throw new Error('injected destination write failure') }
+      return original.call(this, input)
+    })
+    try { expect(() => switchProjectSlackApp(f.projectA, 'ANEW', f.apps)).toThrow('injected') }
+    finally { spy.mockRestore() }
+    expect(readProjectChannelConfig(f.projectA).slackAppId).toBe(APP_ID)
+    const old = new JobStore(join(f.state, 'jobs.sqlite3')), next = new JobStore(join(f.next, 'jobs.sqlite3'))
+    expect(old.resolveSlackChannelRoute(APP_ID, 'CSWITCH')).toBe(f.projectA)
+    expect(old.listSlackChannelRoutes(APP_ID)).toEqual(beforeRoutes)
+    expect(next.resolveSlackChannelRoute('ANEW', 'CSWITCH')).toBeNull()
+    old.close(); next.close()
+    expect(existsSync(join(f.projectA, '.zerochan', 'slack-app-switch.json'))).toBe(false)
+  })
+  test('failure after destination insertion restores its previous implicit routing mode', () => {
+    const f = switchFixture()
+    const original = JobStore.prototype.syncSlackChannelRoutes
+    let failed = false
+    const spy = spyOn(JobStore.prototype, 'syncSlackChannelRoutes').mockImplementation(function(input) {
+      const result = original.call(this, input)
+      if (input.appId === 'ANEW' && !failed) { failed = true; throw new Error('injected after commit') }
+      return result
+    })
+    try { expect(() => switchProjectSlackApp(f.projectA, 'ANEW', f.apps)).toThrow('after commit') }
+    finally { spy.mockRestore() }
+    const next = new JobStore(join(f.next, 'jobs.sqlite3'))
+    expect(next.slackChannelRoutingIsExplicit('ANEW')).toBe(false)
+    expect(next.resolveOrAdoptSlackThreadRoute({ appId: 'ANEW', chatId: 'CLEGACY', threadTs: '1800000000.000100', defaultRepoPath: f.projectB, adoptedFromTs: '1800000000.000100' }).repoPath).toBe(f.projectB)
+    next.close()
+    expect(readProjectChannelConfig(f.projectA).slackAppId).toBe(APP_ID)
+  })
+  for (const direction of ['forward', 'rollback'] as const) {
+    test(`interrupted ${direction} journal recovers before a new selection`, () => {
+      const f = switchFixture()
+      const before = readProjectChannelConfig(f.projectA)
+      const old = new JobStore(join(f.state, 'jobs.sqlite3'))
+      old.syncSlackChannelRoutes({ appId: APP_ID, repoPath: f.projectA, channelIds: [] }); old.close()
+      writeFileSync(join(f.projectA, '.zerochan', 'slack-app-switch.json'), JSON.stringify({
+        version: 1, direction, before, targetAppId: 'ANEW',
+        routes: [{ ...f.apps[0], channels: ['CSWITCH'] }, { ...f.apps[1], channels: [] }],
+      }), { mode: 0o600 })
+      const extra = join(f.root, 'extra'); mkdirSync(extra, { mode: 0o700 })
+      const apps = [...f.apps, { appId: 'AEXTRA', stateDir: realpathSync(extra) }]
+      expect(() => mutateProjectChannelConfig({ operation: 'set', repoPath: f.projectA, appId: APP_ID, stateDir: f.state, channelId: 'CUNEXPECTED' })).toThrow('再実行')
+      switchProjectSlackApp(f.projectA, 'ANEW', apps)
+      expect(readProjectChannelConfig(f.projectA)).toEqual({ version: 1, slackAppId: 'ANEW', slackChannels: ['CSWITCH'] })
+      const next = new JobStore(join(f.next, 'jobs.sqlite3'))
+      expect(next.resolveSlackChannelRoute('ANEW', 'CSWITCH')).toBe(f.projectA); next.close()
+      expect(existsSync(join(f.projectA, '.zerochan', 'slack-app-switch.json'))).toBe(false)
+    })
+  }
   test('App binding survives channel writes and rejects accidental cross-App routes', () => {
     const { state, projectA } = fixture()
     bindProjectSlackApp(projectA, APP_ID)

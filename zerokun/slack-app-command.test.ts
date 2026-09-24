@@ -44,7 +44,7 @@ test('authentication failure leaves no registration and does not expose provider
   expect(listRegisteredSlackApps(home)).toEqual([])
 })
 
-test('legacy channel routes cannot silently be copied into a different app', async () => {
+test('explicit selection transfers legacy channel routes without asking for tokens again', async () => {
   const { home, project } = fixture()
   const old = prepareManagedStateRoot(join(home, 'old'))
   const next = prepareManagedStateRoot(join(home, 'next'))
@@ -53,8 +53,13 @@ test('legacy channel routes cannot silently be copied into a different app', asy
   new JobStore(join(next, 'jobs.sqlite3')).close()
   mutateProjectChannelConfig({ operation: 'set', repoPath: project, stateDir: old, appId: 'AOLD', channelId: 'COLD' })
   const hooks = { home, output: () => {}, installWatchdog: () => {} }
-  await expect(runSlackAppCommand(project, { ...hooks, input: async () => '2' })).rejects.toThrow('zerochan unset slack-channel')
-  expect(readProjectChannelConfig(project).slackAppId).toBeUndefined()
+  await runSlackAppCommand(project, { ...hooks, input: async () => '2' })
+  expect(readProjectChannelConfig(project).slackAppId).toBe('AZNEW')
+  const oldStore = new JobStore(join(old, 'jobs.sqlite3'))
+  const nextStore = new JobStore(join(next, 'jobs.sqlite3'))
+  expect(oldStore.resolveSlackChannelRoute('AOLD', 'COLD')).toBeNull()
+  expect(nextStore.resolveSlackChannelRoute('AZNEW', 'COLD')).toBe(project)
+  oldStore.close(); nextStore.close()
   await runSlackAppCommand(project, { ...hooks, input: async () => '1' })
   expect(readProjectChannelConfig(project).slackAppId).toBe('AOLD')
   expect(readProjectChannelConfig(project).slackChannels).toEqual(['COLD'])
