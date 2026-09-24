@@ -408,10 +408,19 @@ sandbox-safe contract test・型検査・build・shell検査を実行します�
 
 ## Cloud Logging・Cloud Run のホスト認証
 
-ジョブのHOMEは分離したままです。認証付きログ検索には
+書込みを許可された通常ジョブの主担当Codexは、導入済みの`gcloud`を通常のshellから利用できます。
+SDKの実体とHomebrewの中継pathを読取り許可し、`CLOUDSDK_CONFIG`で既存のホスト設定を引き継ぎます。
+HOME全体は分離したままです。独自のCloud書込みAPIや新しいログインは不要です。
+build・deployなどはユーザーの依頼範囲と既存IAMに従ってCodexが判断します。
+これは主担当への既存認証の利用許可であり、credential DBを同じshellから厳密隔離する方式ではありません。
+主担当から起動するnative Codex subagentに対しても、このcredentialのOSレベル隔離は保証しません。
+認証情報・tokenの本文を読取り、表示、コピーすることは指示で禁止します。
+read-onlyジョブ、旧設計/review stage、会話割込みにはこの追加grantを付けません。
+
+認証付きログ検索の読取り専用補助として、従来の
 `zerokun_cloud_logging.cloud_logging_read`を使います。依頼やrepositoryの情報から対象projectを特定し、
 project・UTC開始/終了時刻を明示指定します（任意のLogging filterも指定可能）。最大7日・1000行で、
-行数上限に達した場合は結果が不完全な可能性を返します。任意のgcloud実行、login、設定変更、
+行数上限に達した場合は結果が不完全な可能性を返します。この補助ツール自体は任意のgcloud実行、login、設定変更、
 token出力、deployは提供しません。ログ本文は未信頼データとして扱い、秘密らしい文字列と
 一般的なemailを伏せますが、任意の個人情報の完全な除去を保証するものではありません。
 
@@ -432,6 +441,7 @@ Cloud Runの設定確認には同じtransportの`cloud_run_describe`を使い、
 timeout・concurrency・CPU/memory・scalingと環境変数名を返し、secret参照名と値、未知の環境変数値は
 伏せます。レビュー済みの検索feature switchだけboolean値を公開します。省略は未指定、伏せ字は不明を
 意味し、無効化や値0を意味しません。任意のenv値、service account、URL、command/argsは返しません。
-Consoleのログイン主体とホスト認証は異なる場合があります。ブラウザで権限拒否が出ても、このツールを
-試す前にCloud Run全体のアクセス不能とは判断しません。ツールでも拒否された場合だけ、対象resourceの
-ホストIAM拒否として扱います。権限付与、設定変更、再ログインを自動で行う機能ではありません。
+Consoleのログイン主体とホスト認証は異なる場合があります。ブラウザで権限拒否が出ても、通常のgcloudか
+このツールを試す前にCloud Run全体のアクセス不能とは判断しません。ローカル実行拒否、認証失効、
+APIからの実際のIAM拒否を分けて報告します。読取り補助ツールが書込みを提供しないことは、
+主担当のgcloudによる許可済み操作ができない理由にはなりません。
