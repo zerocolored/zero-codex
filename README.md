@@ -561,7 +561,9 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   どちらも `-a never` で対話的な権限昇格を行いません。
 - host runtimeをSlack経由で書き換えられないよう、Zeroちゃん自身のrepositoryへのwrite jobは拒否します。
   Codex shellのHOME/TMPDIRはjob scratchへ隔離し、commitには固定の中立identityを使います。
-  CodexへHOME credentialを公開せず、認証が必要なGitHub操作だけをrepository限定brokerへ渡します。
+  GitHub認証はrepository限定brokerへ渡します。書込み許可済み主担当のCloud操作は通常のgcloudを使い、
+  SDKと既存Cloud SDK設定だけを追加許可します（認証cache更新のため設定directoryはwrite）。
+  HOME全体の開放や認証情報のコピーは行いません。このCLI経路は同じshellからcredentialを隔離する方式ではありません。
 - 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
   linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。HOMEのglobal
   Git/GitHub credentialはmodelへ公開しません。brokerはlogin済み`gh`をcredential helperとして使い、
