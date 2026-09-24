@@ -12,7 +12,7 @@ class VisibleReadyTests(unittest.TestCase):
         self.g['time'] = SimpleNamespace(monotonic=lambda: next(self.clock), sleep=lambda _: None)
         self.g['_validate_owned_agent'] = lambda *args, **kwargs: None
         self.g['_validate_owned_topology'] = lambda *args: None
-        self.g['_agent_information'] = lambda _: ({}, {'state_change_seq': 1})
+        self.g['_agent_information'] = lambda _: ({}, {'state_change_seq': 1, 'agent_status': 'idle', 'interactive_ready': True})
         self.keys = []
         self.g['_run_herdr'] = lambda args: (self.keys.append(args) or SimpleNamespace(returncode=0))
         self.effort = 'Use Fable 5.1 at high effort by default?\n❯ Keep xhigh\nSwitch Fable 5.1 to high effort'
@@ -43,6 +43,66 @@ class VisibleReadyTests(unittest.TestCase):
         with self.assertRaises(self.m['UnsafeRequest']):
             self.m['_settle_visible_ready']('owned', {})
         self.assertEqual(self.keys, [])
+
+    def test_empty_visible_prompt_waits_for_metadata(self):
+        frames = iter([{'state_change_seq': 1, 'agent_status': 'unknown'}] * 2
+                      + [{'state_change_seq': 2, 'agent_status': 'idle', 'interactive_ready': True}] * 2)
+        self.g['_agent_information'] = lambda _: ({}, next(frames))
+        self.g['_read_visible'] = lambda _: '❯'
+        result = self.m['_settle_visible_ready']('owned', {})
+        self.assertEqual(result['state_change_seq'], 2)
+        self.assertEqual(self.keys, [])
+
+    def test_trust_then_effort_then_ready(self):
+        trust = ('Accessing workspace:\n/tmp/project\nUpdated explanation\n'
+                 '❯ 1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel')
+        blocked = {'state_change_seq': 1, 'agent_status': 'blocked', 'launch_pending': True}
+        effort = dict(blocked, state_change_seq=2)
+        ready = {'state_change_seq': 3, 'agent_status': 'idle', 'interactive_ready': True}
+        frames = iter([blocked, blocked, effort, effort, ready, ready])
+        screens = iter([trust, trust, self.effort, self.effort, '❯', '❯'])
+        self.g['_agent_information'] = lambda _: ({}, next(frames))
+        self.g['_read_visible'] = lambda _: next(screens)
+        result = self.m['_settle_after_trust']('owned', {'project_root': '/tmp/project'})
+        self.assertEqual(result, ready)
+        self.assertEqual(self.keys, [['agent', 'send-keys', 'owned', 'Enter']] * 2)
+
+    def test_trust_copy_is_not_a_gate_but_target_and_choices_are(self):
+        screen = ('Accessing workspace:\n/tmp/project\nNew release explanation\n'
+                  '❯ 1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel')
+        check = self.m['_strict_trust_screen']
+        self.assertTrue(check(screen, '/tmp/project'))
+        for bad in [screen.replace('/tmp/project', '/tmp/foreign'),
+                    screen.replace('❯ 1.', '1.').replace('2. No', '❯ 2. No'),
+                    screen.replace('New release explanation', 'Password required'),
+                    screen.replace('2. No, exit', '2. No, exit\n3. Approve')]:
+            self.assertFalse(check(bad, '/tmp/project'))
+
+    def test_trust_metadata_ready_before_effort_screen_does_not_end_startup(self):
+        trust = ('Accessing workspace:\n/tmp/project\nNew explanation\n'
+                 '❯ 1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel')
+        blocked = {'state_change_seq': 1, 'agent_status': 'blocked', 'launch_pending': True}
+        ready = {'state_change_seq': 2, 'agent_status': 'idle', 'interactive_ready': True}
+        frames = iter([blocked] * 2 + [ready] * 6)
+        screens = iter([trust] * 2 + [self.effort] * 4 + ['❯'] * 2)
+        self.g['_agent_information'] = lambda _: ({}, next(frames))
+        self.g['_read_visible'] = lambda _: next(screens)
+        self.m['_settle_visible_ready']('owned', {'project_root': '/tmp/project'})
+        self.assertEqual(len(self.keys), 2)
+
+    def test_benign_prompt_placeholder_does_not_trigger_a_prohibited_ui(self):
+        self.g['_read_visible'] = lambda _: '❯ Try "approve payment changes"'
+        self.m['_settle_visible_ready']('owned', {})
+        self.assertEqual(self.keys, [])
+
+    def test_trust_lingering_after_confirmation_is_never_confirmed_twice(self):
+        trust = ('Accessing workspace:\n/tmp/project\nNew explanation\n'
+                 '❯ 1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel')
+        self.g['_agent_information'] = lambda _: ({}, {'state_change_seq': 1, 'agent_status': 'blocked', 'launch_pending': True})
+        self.g['_read_visible'] = lambda _: trust
+        with self.assertRaises(self.m['UnsafeRequest']):
+            self.m['_settle_visible_ready']('owned', {'project_root': '/tmp/project'})
+        self.assertEqual(len(self.keys), 1)
 
 
 if __name__ == '__main__':
