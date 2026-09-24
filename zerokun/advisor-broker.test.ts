@@ -934,6 +934,14 @@ describe('advisor broker boundaries', () => {
     ]) expect(claudeSubscriptionStatusIsReady(invalid)).toBe(false)
   })
 
+  test('Claude実コマンドのexit 1 JSONがstructured authentication failureになる', async () => {
+    const root = fixtureDir()
+    const executable = join(root, 'claude')
+    writeFileSync(executable, '#!/bin/sh\n/bin/sleep 0.2\nprintf \'%s\\n\' \'{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}\'\nexit 1\n', { mode: 0o700 })
+    await expect(assertClaudeSubscriptionLogin({ ...brokerEnvironment(), ZEROKUN_CLAUDE_BIN_PATH: executable }))
+      .rejects.toMatchObject({ failure: { advisor: 'claude', cause: 'authentication' } })
+  })
+
   test('prompt-startedのexact markerだけを送達可能として分類する', () => {
     const marker = 'REQUEST_MARKER=' + 'A'.repeat(32)
     expect(parseFifthAdvisorSendOutcome(JSON.stringify({ status: 'prompt-started', marker, state_change_seq: 42 })))

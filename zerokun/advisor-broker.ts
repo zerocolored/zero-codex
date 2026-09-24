@@ -24,7 +24,9 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { classifyAdvisorFailure } from './advisor-availability.ts'
+import { AdvisorFailureError, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
+import { assertClaudeAuthStatus } from './claude-auth-status.ts'
+export { claudeSubscriptionStatusIsReady } from './claude-auth-status.ts'
 import {
   readPinnedHerdrRuntime,
   currentHerdrBinary,
@@ -962,16 +964,6 @@ function brokerHelperEnvironment(
   }
 }
 
-export function claudeSubscriptionStatusIsReady(value: unknown): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  const status = value as Record<string, unknown>
-  return status.loggedIn === true
-    && status.authMethod === 'claude.ai'
-    && status.apiProvider === 'firstParty'
-    && typeof status.subscriptionType === 'string'
-    && status.subscriptionType.length > 0
-}
-
 export async function assertClaudeSubscriptionLogin(
   environment: Record<string, string>,
 ): Promise<void> {
@@ -983,15 +975,7 @@ export async function assertClaudeSubscriptionLogin(
     timeoutMs: 20_000,
     terminationGraceMs: 2_000,
   })
-  let parsed: unknown
-  try { parsed = commandJson(status, 'Claude subscription status') } catch (error) {
-    throw new Error(`Claude Code subscription login could not be verified: ${error}`)
-  }
-  if (!claudeSubscriptionStatusIsReady(parsed)) {
-    throw new Error(
-      'Claude Code must already be logged in through a first-party subscription',
-    )
-  }
+  assertClaudeAuthStatus(status)
 }
 
 function commandJson(result: ProcessResult, label: string): unknown {
@@ -1855,6 +1839,7 @@ async function main(): Promise<void> {
     let stateChangeSeqAfter: number | undefined
     let modelStartObserved = false
     let reason = 'Claude advisor was not sent'
+    let failure: AdvisorFailure | undefined
     const cleanupWarnings: string[] = []
     let workspaceCreationAttempted = false
     let helperContainmentVerified = true
@@ -2059,6 +2044,7 @@ async function main(): Promise<void> {
           : 'unverified-bounded-residual'
       }
       reason = String(error)
+      if (error instanceof AdvisorFailureError) failure = error.failure
     } finally {
       if (!response && marker && target && claudeRuntime && diagnosticReads.length === 0) {
         const runtime = claudeRuntime
@@ -2283,7 +2269,7 @@ async function main(): Promise<void> {
       promptMayHaveBeenDelivered: Boolean(marker),
       reason,
       responseDiagnostic,
-      failure: classifyAdvisorFailure('claude', reason),
+      failure: failure ?? classifyAdvisorFailure('claude', reason),
       cleanupWarnings,
     }
   }
@@ -2675,7 +2661,7 @@ async function main(): Promise<void> {
           if (durable.recoveredAfterInterruption !== true) {
           const missing = [...(saved.native ?? []), ...(saved.grok ?? []), saved.claude ?? {}]
             .filter(slot => slot.adopted !== true)
-          const manualRecovery = missing.some(slot => ['authentication', 'workspace'].includes(
+          const manualRecovery = missing.some(slot => ['authentication', 'billing', 'configuration', 'workspace'].includes(
             String(slot.failure?.cause ?? classifyAdvisorFailure('claude', String(slot.reason ?? '')).cause)))
           const recoveryInput = inputUpdateIsRecoveryOnly === true
             && input.revision > Math.max(inputRevision, Number(saved.recoveryInputRevision ?? 0))
@@ -3494,7 +3480,7 @@ async function main(): Promise<void> {
       reasonDigest: claude.adopted !== true
         ? createHash('sha256').update(String(claude.reason ?? 'unavailable')).digest('hex')
         : undefined,
-      failure: claude.adopted !== true ? classifyAdvisorFailure('claude', String(claude.reason ?? '')) : undefined,
+      failure: claude.adopted !== true ? claude.failure ?? classifyAdvisorFailure('claude', String(claude.reason ?? '')) : undefined,
     }
     const slotSummary = summarizeAdvisorSlots(
       nativeEvidence,

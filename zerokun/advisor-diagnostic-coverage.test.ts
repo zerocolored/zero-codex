@@ -6,6 +6,7 @@ import { assertRequiredAdvisorRounds, collectHostAdvisorCoverage } from './codex
 import { observeNativeAdvisorCoverage } from './native-advisor-coverage.ts'
 import { nativeAdvisorMarker } from './native-advisor-evidence.ts'
 import { enforceHostAdvisorCoverage } from './job-runner.ts'
+import { advisorFailureMessage } from './advisor-availability.ts'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
@@ -100,6 +101,26 @@ test('診断ログを無視しても未取得の実回答を成功に変えな�
   const f = fixture()
   const coverage = collectHostAdvisorCoverage(f.state, f.job.id, f.nonce, await f.observe(false))
   expect(coverage?.phases[0]).toMatchObject({ responsesObtained: 2, startUnconfirmed: 1 })
+})
+
+test('構造化した認証・課金・通信診断をjournalからSlack通知まで保持する', async () => {
+  for (const cause of ['authentication', 'billing', 'configuration', 'auth-check', 'network'] as const) {
+    const f = fixture()
+    const observations = await f.observe(true)
+    const failure = { advisor: 'claude' as const, cause }
+    writeFileSync(f.journalPath, JSON.stringify({ ...f.journal, status: 'required-reviewer-failed',
+      claude: { ...f.journal.claude, adopted: false, executionState: 'unavailable-before-start',
+        workspaceCreationAttempted: false, promptMayHaveBeenDelivered: false,
+        freshEphemeral: false, cleanupVerified: false, cleanupStatus: undefined,
+        cleanupReceiptDigest: undefined, responseDigest: undefined, reasonDigest: 'd'.repeat(64), failure },
+    }))
+    const coverage = collectHostAdvisorCoverage(f.state, f.job.id, f.nonce, observations)
+    expect(coverage?.phases[0]?.failures).toContainEqual(failure)
+    const message = enforceHostAdvisorCoverage('調査結果を保持しています。', coverage, 'result')
+    expect(message).toContain(advisorFailureMessage(failure))
+    expect(message).not.toContain('原因の詳細は実行ログ')
+    expect(message).toContain('回答2/3')
+  }
 })
 
 test('採択するround journal自体の別nonceやsymlinkは引き続き拒否する', () => {

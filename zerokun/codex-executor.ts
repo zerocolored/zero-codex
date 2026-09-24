@@ -119,7 +119,7 @@ import {
   validThreeAdvisorRoundTwoBasis,
 } from './advisor-journal.ts'
 import { summarizeAdvisorSlots } from './advisor-broker.ts'
-import { type AdvisorFailure } from './advisor-availability.ts'
+import { ADVISOR_FAILURE_CAUSES, type AdvisorFailure } from './advisor-availability.ts'
 import { observeNativeAdvisorCoverage, type NativeAdvisorObservation } from './native-advisor-coverage.ts'
 import { redactCredentialMaterial } from './public-output-guard.ts'
 import {
@@ -1797,7 +1797,7 @@ export function collectHostAdvisorCoverage(
           if (journal.recoveredAfterInterruption === true && advisor !== 'codex') {
             return { advisor, cause: 'interrupted' as const }
           }
-          return { advisor, cause: failure && ['authentication', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'interrupted', 'unknown']
+          return { advisor, cause: failure && ADVISOR_FAILURE_CAUSES
             .includes(failure.cause) ? failure.cause : 'unknown' }
         }),
       }
