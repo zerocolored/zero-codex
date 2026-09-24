@@ -301,6 +301,11 @@ zerochan start
 ```
 
 通常はインスタンス名の指定は不要です。各プロジェクトのApp IDから保存先を選びます。
+接続先を変更する場合も、対象フォルダで `zerochan set slack-app` を実行して別のアプリを選択します。
+既存のチャンネル設定は新しいアプリへ引き継がれ、旧アプリ側の当該プロジェクトのチャンネル紐付けは解除されます。
+トークンの再入力や設定ファイルの手動削除は不要です。新しいアプリを対象チャンネルへ招待し、`zerochan start` で起動してください。
+旧アプリのジョブ・スレッド履歴や他プロジェクトは移動・削除しません。既存スレッドは旧アプリに残るため、新しいアプリへの依頼は新しいメンションから開始してください。
+切り替えが中断された場合は、同じ `zerochan set slack-app` の再実行で保存済みの処理を復旧します。
 同じAppを複数プロジェクトで選ぶ場合は、そのAppのgateway・キューを共有します。
 別Appならキューと稼働状態は分離しますが、同じOSユーザーのCodex・Claude・Grok認証や
 利用上限は別枠になりません。別PCではそのPC用のAppを登録してください。
@@ -561,7 +566,9 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   どちらも `-a never` で対話的な権限昇格を行いません。
 - host runtimeをSlack経由で書き換えられないよう、Zeroちゃん自身のrepositoryへのwrite jobは拒否します。
   Codex shellのHOME/TMPDIRはjob scratchへ隔離し、commitには固定の中立identityを使います。
-  CodexへHOME credentialを公開せず、認証が必要なGitHub操作だけをrepository限定brokerへ渡します。
+  GitHub認証はrepository限定brokerへ渡します。書込み許可済み主担当のCloud操作は通常のgcloudを使い、
+  SDKと既存Cloud SDK設定だけを追加許可します（認証cache更新のため設定directoryはwrite）。
+  HOME全体の開放や認証情報のコピーは行いません。このCLI経路は同じshellからcredentialを隔離する方式ではありません。
 - 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
   linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。HOMEのglobal
   Git/GitHub credentialはmodelへ公開しません。brokerはlogin済み`gh`をcredential helperとして使い、

@@ -630,8 +630,8 @@ elif stat.S_ISLNK(before.st_mode) and before.st_uid == uid and before.st_nlink =
                     machine = "arm64"
             except (OSError, subprocess.SubprocessError):
                 pass
-        expected = "../downloads/grok-macos-aarch64" if machine == "arm64" else "../downloads/grok-macos-x86_64" if machine == "x86_64" else None
-        if expected is None or raw != expected:
+        platform_name = "macos-aarch64" if machine == "arm64" else "macos-x86_64" if machine == "x86_64" else None
+        if platform_name is None or not re.fullmatch(r"\.\./downloads/grok-(?:[0-9]+\.[0-9]+\.[0-9]+-)?" + re.escape(platform_name), raw):
             raise SystemExit(1)
         downloads = os.path.join(home, ".grok", "downloads")
         safe_dir(downloads)

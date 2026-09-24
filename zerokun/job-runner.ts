@@ -4885,6 +4885,13 @@ export class JobStore {
     }
   }
 
+  /** Undo only the explicit-mode activation introduced by a failed route transfer. */
+  restoreSlackChannelImplicitModeAfterRollback(appIdInput: string): void {
+    const appId = requireSlackAppId(appIdInput)
+    this.db.run(`DELETE FROM slack_channel_route_state WHERE app_id = ?
+      AND NOT EXISTS (SELECT 1 FROM slack_channel_routes WHERE app_id = ?)`, [appId, appId])
+  }
+
   /**
    * Replace one project's derived channel index in a single immediate
    * transaction. The project-local config is the durable user declaration;

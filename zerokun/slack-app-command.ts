@@ -1,36 +1,14 @@
 import { homedir } from 'os'
 import { WebClient } from '@slack/web-api'
-import { bindProjectSlackApp } from './project-channel-config.ts'
+import { readProjectChannelConfig, switchProjectSlackApp } from './project-channel-config.ts'
 import { resolveProjectLayout } from './project-layout.ts'
-import { adoptLegacySlackApp, listRegisteredSlackApps, saveNewSlackApp } from './slack-app-registry.ts'
+import { adoptLegacySlackApp, listRegisteredSlackApps, saveNewSlackApp, withSlackAppRegistryLock } from './slack-app-registry.ts'
 import { verifySlackAppTokenPair } from './slack-app-identity.ts'
 import { slackWebClientOptions } from './slack-http.ts'
 import { prepareSlackAppState } from './slack-app-state.ts'
 import { installAppWatchdog } from './watchdog-profile.ts'
 import { join } from 'path'
 import { slackAppRegistryRoot } from './slack-app-registry.ts'
-import { Database } from 'bun:sqlite'
-import { lstatSync, realpathSync } from 'fs'
-
-function existingRoutesBelongToSelectedApp(project: string, selectedId: string, channels: string[], home: string): boolean {
-  const expectedProject = realpathSync(project)
-  let selectedMatches = false
-  for (const app of listRegisteredSlackApps(home)) {
-    const path = join(app.stateDir, 'jobs.sqlite3')
-    let db: Database | undefined
-    try {
-      const metadata = lstatSync(path)
-      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || metadata.uid !== process.getuid!()) return false
-      db = new Database(path, { readonly: true })
-      const routes = db.query('SELECT channel_id FROM slack_channel_routes WHERE app_id = ? AND repo_path = ?').all(app.appId, expectedProject) as Array<{ channel_id: string }>
-      if (app.appId === selectedId) selectedMatches = channels.every(channel => routes.some(route => route.channel_id === channel))
-      else if (routes.some(route => channels.includes(route.channel_id))) return false
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false
-    } finally { db?.close() }
-  }
-  return selectedMatches
-}
 
 /** Read from the TTY without history. Only non-secret selections opt into echo. */
 export function terminalInput(label: string, options: { echo?: boolean } = {}): Promise<string> {
@@ -150,12 +128,19 @@ export async function runSlackAppCommand(project: string, hooks: {
     await (hooks.prepare ?? prepareSlackAppState)(selected!.stateDir, selected!.appId)
     ;(hooks.installWatchdog ?? installAppWatchdog)(selected!.stateDir, home)
   }
-  output(`Slackアプリ登録: ${selected!.appId}\n`)
   const layout = resolveProjectLayout(project)
   if (layout.kind === 'git-worktree' || layout.kind === 'multi-repo-workspace') {
-    bindProjectSlackApp(project, selected!.appId, channels => existingRoutesBelongToSelectedApp(project, selected!.appId, channels, home))
-    output('現在のプロジェクトに紐付けました。次に zerochan set slack-channel <channel-id> を実行してください。\n')
+    const before = readProjectChannelConfig(project)
+    withSlackAppRegistryLock(home, () => switchProjectSlackApp(project, selected!.appId, listRegisteredSlackApps(home)))
+    output(`Slackアプリ接続先: ${selected!.appId}\n`)
+    if (before.slackAppId && before.slackAppId !== selected!.appId) {
+      output(`接続先を変更し、チャンネル設定${before.slackChannels.length}件を引き継ぎました。旧アプリの履歴・作業は保持しています。\n`)
+    }
+    output(before.slackChannels.length
+      ? '対象チャンネルに選択したアプリを招待し、このプロジェクトで zerochan start を実行してください。\n'
+      : '現在のプロジェクトに紐付けました。次に zerochan set slack-channel <channel-id> を実行してください。\n')
   } else {
+    output(`Slackアプリ登録: ${selected!.appId}\n`)
     output('アプリだけを登録しました。対象プロジェクトで同じコマンドを実行し、一覧から選択してください。\n')
   }
 }

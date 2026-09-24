@@ -10,6 +10,7 @@ import {
 } from './service-control.ts'
 import {
   environmentForPinnedHerdrRuntime,
+  parseHerdrCommandEnvelope,
   readPinnedHerdrRuntime,
   verifyHerdrRuntimeIdentityAsync,
 } from './herdr-runtime.ts'
@@ -157,9 +158,7 @@ function productionInvoker(herdrBinary: string): (args: string[]) => Promise<Rec
     if (exitCode !== 0) {
       throw new Error(`Herdr ${args.slice(0, 2).join(' ')}に失敗しました: ${stderr.trim().slice(-1_000)}`)
     }
-    let value: unknown
-    try { value = JSON.parse(stdout) } catch { throw new Error('Herdrが不正なJSONを返しました') }
-    return requiredRecord(value, 'response')
+    return requiredRecord(parseHerdrCommandEnvelope(args, stdout, 'Herdr'), 'response')
   }
 }
 
