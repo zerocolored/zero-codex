@@ -10,7 +10,7 @@ function render(){if(!data)return;const now=Date.now()+offset,counts={available:
  const state=failed||stale||duplicate?'unknown':s?.state??'unknown';counts[state==='waiting'?'unknown':state]++
  const el=node('article','','row'),identity=node('div','');identity.append(node('strong',row.name),node('small',`${s?.project||'プロジェクト未受信'} · ${row.pc}`))
  const status=node('div','');status.append(node('span',labels[state],'badge '+state));status.append(node('small',duplicate?'同じアプリが別PCでも稼働中':state==='unknown'?'接続を確認できません':state==='busy'||state==='waiting'?`待ち ${s.queued}件`:''))
- const summary=node('div','','summary');summary.append(node('strong',state==='unknown'?'現在の作業状況は不明です':s?.summary|| (state==='available'?'現在の作業はありません':state==='limited'?'利用上限の解除を待っています':state==='waiting'?'作業を開始できる状態を待っています':'作業中・要約更新待ち')))
+ const summary=node('div','','summary');summary.append(node('strong',state==='unknown'?'現在の作業状況は不明です':s?.summary|| (state==='available'?'現在の作業はありません':state==='limited'?'利用上限の解除を待っています':state==='waiting'?(s.queued>0?`依頼を${s.queued}件受け付けていますが、まだ着手していません。待機理由は未取得です。`:'現在、作業は始まっていません。待機理由は未取得です。'):'作業中・要約更新待ち')))
  if(state==='unknown'&&s)summary.append(node('small',`最後の報告：${labels[s.state]??'状態不明'}`));else if(s?.summaryAt)summary.append(node('small',`${relative(s.summaryAt,now)}更新`))
  const accepted=node('time',relative(s?.lastAcceptedAt,now));accepted.dataset.label='最後の依頼受付';if(s?.lastAcceptedAt){accepted.dateTime=new Date(s.lastAcceptedAt).toISOString();accepted.append(node('small',new Date(s.lastAcceptedAt).toLocaleString('ja-JP')))}
  const last=node('time',relative(row.receivedAt,now));last.dataset.label='最終通信';if(row.receivedAt)last.dateTime=row.receivedAt
