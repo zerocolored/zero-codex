@@ -14149,6 +14149,27 @@ describe('Slack output guard', () => {
     store.close()
   })
 
+  test('Slack outbound converts Markdown for progress and completion after sanitization', async () => {
+    const store = makeStore()
+    const job = store.enqueue(input({ messageId: 'mrkdwn-outbound' })).job
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+    await notifier.progress(job, '## 確認\n\n**テスト成功**。`**raw**` は保持。')
+    await notifier.completed(job, '**完了**。 [結果](https://example.com/result)')
+    expect(posted[0]).toContain('*確認*\n\n*テスト成功* 。')
+    expect(posted[0]).toContain('`**raw**`')
+    expect(posted[1]).toContain('*完了* 。')
+    expect(posted[1]).toContain('<https://example.com/result|結果>')
+    await notifier.status({ id: 'format-status', idempotencyKey: 'format-status', jobId: job.id,
+      chatId: job.chatId, threadTs: job.threadTs, kind: 'accepted', attempts: 0,
+      payload: '**受付済み**',
+    })
+    expect(posted[2]).toBe('*受付済み*')
+    store.close()
+  })
+
   test('想定外の巨大結果でもSlack 5通を超えない', () => {
     const chunks = splitSlackChunks('x'.repeat(100_000))
     expect(chunks.length).toBeLessThanOrEqual(5)
@@ -15542,7 +15563,7 @@ describe('durable UI/UX approval wait', () => {
       inputDigest: snapshot.digest,
       repositoryDigest: advisorRepositoryDigest(repositorySnapshot),
       repositorySnapshot,
-      proposalText: '余白と情報階層を整理した案です。',
+      proposalText: '**比較案**：余白と情報階層を整理した案です。',
       beforePath: before,
       afterPath: after,
     })
@@ -15584,6 +15605,8 @@ describe('durable UI/UX approval wait', () => {
     expect(posted).toHaveLength(1)
     expect(posted[0]).toMatchObject({ chatId: root.chatId, threadTs: root.threadTs })
     expect(posted[0]?.text).toContain('この方向で実装してよいですか？')
+    expect(posted[0]?.text).toContain('*比較案*')
+    expect(posted[0]?.text).not.toContain('**比較案**')
     expect(posted[0]?.text).not.toContain(directory)
     expect(posted[0]?.clientMessageId).toMatch(/^[0-9a-f-]{36}$/)
     expect(store.uiApprovalRequest(requestId)).toMatchObject({

@@ -1,6 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
+import { toSlackMrkdwn } from './slack-mrkdwn.ts'
 import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
 import { startFleetRunnerPulse } from './fleet-runtime.ts'
 import { resolveArtifactSource, previousThreadArtifactRoots } from './artifact-source.ts'
@@ -16736,7 +16737,7 @@ export class SlackNotifier implements JobNotifier {
     notificationId?: string,
     parentSignal?: AbortSignal,
   ): Promise<void> {
-    const chunks = splitSlackChunks(text)
+    const chunks = splitSlackChunks(toSlackMrkdwn(text))
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index]!
       await withSlackDeadline(signal => this.uploadDependencies.postMessage({
@@ -16819,7 +16820,7 @@ export class SlackNotifier implements JobNotifier {
       ) || '確認した内容を元の作業へ反映して続けます。'
     }
     const deliver = async (): Promise<void> => {
-      const chunks = splitSlackChunks(payload)
+      const chunks = splitSlackChunks(toSlackMrkdwn(payload))
       for (let index = 0; index < chunks.length; index += 1) {
         await withSlackDeadline(childSignal => this.uploadDependencies.postMessage({
           chatId: notification.chatId,
@@ -16921,7 +16922,7 @@ export class SlackNotifier implements JobNotifier {
       'progress',
     )
     if (!safeText) throw new Error('UI/UX approval proposal became empty after sanitization')
-    const promptText = `${safeText}\n\nこの方向で実装してよいですか？`
+    const promptText = toSlackMrkdwn(`${safeText}\n\nこの方向で実装してよいですか？`)
     if (promptText.length > SLACK_CHUNK_CHARS) {
       throw new Error('UI/UX approval proposal exceeds one durable Slack message')
     }
