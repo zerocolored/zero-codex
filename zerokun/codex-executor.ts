@@ -3,6 +3,7 @@ import { installedGoChromeEntrypoint } from './installed-browser.ts'
 import { installedComputerUseClient, installedComputerUseNodeRepl } from './installed-computer-use.ts'
 import { GO_CHROME_ENABLED_TOOLS, GO_CHROME_DISABLED_TOOLS } from './chrome-tools.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
+import { DiagnosticTail } from './diagnostic-tail.ts'
 import { CODEX_NETWORK_CONTINUATION, CODEX_NETWORK_RETRY_DELAYS_MS, isTransientCodexNetworkError } from './codex-network-retry.ts'
 import {
   closeSync,
@@ -5882,7 +5883,8 @@ export function describeCodexFailure(
   return [
     `Codex が exit code ${exitCode} で終了しました。`,
     detail,
-    `全文ログ: ${logPath ?? 'job-logs/<job-id>.stdout.log'}`,
+    `ログ（保存上限あり）: ${logPath ?? 'job-logs/<job-id>.stdout.log'}`,
+    'App Serverの直近ログは同じパスの .tail-0.log / .tail-1.log（.tail.json に順序を記録）',
   ].filter(Boolean).join('\n')
 }
 
@@ -7369,6 +7371,11 @@ export async function executeCodexJob(
         terminate()
       }
       const stdoutDescriptor = openSafeLog(stdoutPath, 'truncate')
+      const tailDescriptors: [number, number] = [
+        openSafeLog(`${stdoutPath}.tail-0.log`, 'truncate'),
+        openSafeLog(`${stdoutPath}.tail-1.log`, 'truncate'),
+      ]
+      const diagnosticTail = new DiagnosticTail(tailDescriptors)
       let stdoutBytes = 0
       let stdoutTail = ''
       const stdoutDecoder = new TextDecoder('utf-8', { fatal: true })
@@ -7456,6 +7463,7 @@ export async function executeCodexJob(
       const session = new CodexAppServerSession(proc.stdin, proc.stdout, {
         onOutputChunk: value => {
           processOutputRevision += 1
+          diagnosticTail.write(value)
           if (stdoutBytes < MAX_LOG_FILE_BYTES) {
             const chunk = value.subarray(0, MAX_LOG_FILE_BYTES - stdoutBytes)
             writeSync(stdoutDescriptor, chunk)
@@ -8855,6 +8863,15 @@ export async function executeCodexJob(
           )
       }
       closeSync(stdoutDescriptor)
+      tailDescriptors.forEach(closeSync)
+      try {
+        atomicWritePrivateFile(`${stdoutPath}.tail.json`, JSON.stringify({
+          ...diagnosticTail.summary(), prefixLimitBytes: MAX_LOG_FILE_BYTES,
+          prefixTruncated: diagnosticTail.summary().totalBytes > MAX_LOG_FILE_BYTES,
+        }))
+      } catch {
+        process.stderr.write('zerochan: diagnostic tail index could not be persisted\n')
+      }
       stdoutTail = (stdoutTail + stdoutDecoder.decode()).slice(-MAX_LOG_TAIL_CHARS)
       const stderr = await stderrPromise
       protocolError ??= readerError

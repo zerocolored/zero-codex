@@ -573,6 +573,12 @@ export class CodexAppServerSession {
   // Only identities survive a terminal, never tool arguments/results. An
   // outstanding item may outlive the bounded completed-turn tombstone window.
   private readonly lateItems = new Map<string, Map<string, string>>()
+  // Items may race the subscription/start notification, including child turns.
+  // They cannot create a turn or publish progress until its real start arrives.
+  private readonly earlyItems = new Map<string, AppServerNotification[]>()
+  private earlyItemBytes = 0
+  private earlyItemCount = 0
+  private incompleteItemEvidence = false
   private pendingItemCount = 0
   private readonly completedTurnProjectionKeys = new Set<string>()
   private notificationSequence = 0
@@ -650,6 +656,56 @@ export class CodexAppServerSession {
       permissionCommandStates: new Map(),
       pendingItems: new Map(),
     })
+    if (this.incompleteItemEvidence) {
+      this.turnProjections.get(key)!.permissionEvidence.unexpectedItemSeen = true
+      this.turnProjections.get(key)!.permissionEvidence.unexpectedItemType = 'incompleteItemHistory'
+    }
+  }
+
+  private takeEarlyItems(key: string): AppServerNotification[] {
+    const items = this.earlyItems.get(key) ?? []
+    this.earlyItems.delete(key)
+    for (const item of items) {
+      this.earlyItemBytes -= JSON.stringify(item).length
+      this.earlyItemCount -= 1
+    }
+    return items
+  }
+
+  private deferUnstartedItem(notification: AppServerNotification): boolean {
+    const params = notification.params
+    const threadId = identifier(params.threadId, 'item thread id')
+    const turnId = identifier(params.turnId, 'item turn id')
+    record(params.item, 'item')
+    const key = turnProjectionKey(threadId, turnId)
+    if (this.turnProjections.has(key)) return false
+    if (this.sealedTurnProjections.has(key) || this.completedTurnProjectionKeys.has(key)
+      || this.lateItems.has(key)) {
+      // Consume matching outstanding identities, but never revise a terminal or
+      // forward late callbacks (even if the start notification was also late).
+      if (notification.method === 'item/completed') this.observeCompletedItem(params)
+      return true
+    }
+    const size = JSON.stringify(notification).length
+    if (this.earlyItemCount >= 256 || this.earlyItemBytes + size > 1024 * 1024) {
+      // Unobserved child turns must not kill the parent's task or grow memory.
+      // Losing evidence disqualifies strict permission proofs, not normal work.
+      this.incompleteItemEvidence = true
+      this.earlyItems.clear()
+      this.earlyItemBytes = 0
+      this.earlyItemCount = 0
+      for (const projection of this.turnProjections.values()) {
+        projection.permissionEvidence.unexpectedItemSeen = true
+        projection.permissionEvidence.unexpectedItemType = 'incompleteItemHistory'
+      }
+      return true
+    }
+    const items = this.earlyItems.get(key) ?? []
+    items.push(notification)
+    this.earlyItems.set(key, items)
+    this.earlyItemBytes += size
+    this.earlyItemCount += 1
+    return true
   }
 
   private retainsControlNotifications(threadId: string): boolean {
@@ -721,7 +777,7 @@ export class CodexAppServerSession {
         if (pending.size === 0) this.lateItems.delete(key)
         return 'late'
       }
-      throw new AppServerProtocolError('App Server completed an item before turn/started')
+      return 'late'
     }
     if (item.type === 'subAgentActivity') identifier(item.id, 'item/completed subAgentActivity id')
     if (typeof item.id === 'string' && typeof item.type === 'string'
@@ -760,6 +816,10 @@ export class CodexAppServerSession {
       permissionEvidence: emptyPermissionProbeEvidence(),
       permissionCommandStates: new Map(),
       pendingItems: new Map<string, string>(),
+    }
+    if (this.takeEarlyItems(key).length > 0 || this.incompleteItemEvidence) {
+      projection.permissionEvidence.unexpectedItemSeen = true
+      projection.permissionEvidence.unexpectedItemType = 'incompleteItemHistory'
     }
     this.turnProjections.delete(key)
     if (this.retainsControlNotifications(threadId)) {
@@ -846,6 +906,8 @@ export class CodexAppServerSession {
       params: record(parsed.params ?? {}, `App Server ${parsed.method} params`),
       sequence: ++this.notificationSequence,
     }
+    if ((notification.method === 'item/started' || notification.method === 'item/completed')
+      && this.deferUnstartedItem(notification)) return
     if (notification.method === 'turn/started') {
       this.beginTurnProjection(notification.params)
     } else if (notification.method === 'item/started') {
@@ -874,6 +936,15 @@ export class CodexAppServerSession {
       }
     }
     this.options.onNotification?.(notification)
+    if (notification.method === 'turn/started') {
+      const key = turnProjectionKey(
+        identifier(notification.params.threadId, 'turn thread id'),
+        parseTurn(notification.params.turn).id,
+      )
+      for (const item of this.takeEarlyItems(key)) {
+        this.consumeLine(JSON.stringify({ method: item.method, params: item.params }))
+      }
+    }
     this.wakeNotificationWaiters()
   }
 
@@ -892,7 +963,11 @@ export class CodexAppServerSession {
       while (true) {
         const chunk = await this.reader.read()
         if (chunk.done) break
-        if (this.readerFailure !== undefined) continue
+        if (this.readerFailure !== undefined) {
+          // Keep terminal diagnostics even when protocol interpretation failed.
+          try { this.options.onOutputChunk?.(chunk.value) } catch { /* drain pipe */ }
+          continue
+        }
         try {
           this.options.onOutputChunk?.(chunk.value)
           const text = this.decoder.decode(chunk.value, { stream: true })

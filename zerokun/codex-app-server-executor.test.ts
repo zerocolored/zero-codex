@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -497,10 +498,14 @@ for line in sys.stdin:
             emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": user_item}})
         else:
             emit({"id": request_id, "result": {"turn": active_turn}})
+            if os.environ.get("ZERO_EARLY_ITEM"):
+                emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
+                emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
             emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
         if mode == "late-command-completion":
             late_item_type = os.environ.get("ZERO_LATE_ITEM_TYPE", "commandExecution")
-            emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "inProgress"}}})
+            if not os.environ.get("ZERO_LATE_START"):
+                emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "inProgress"}}})
         turn_latch_stage = os.environ.get("ZERO_TURN_LATCH_STAGE")
         if turn_latch_stage == stage:
             turn_latch_ready = os.environ["ZERO_TURN_LATCH_READY"]
@@ -525,6 +530,9 @@ for line in sys.stdin:
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": [], "error": None}}},
             ])
             if mode == "late-command-completion":
+                if os.environ.get("ZERO_LATE_START"):
+                    emit({"method": "diagnostic/padding", "params": {"text": "x" * (21 * 1024 * 1024)}})
+                    emit({"method": "item/started", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "late-diagnostic-marker", "status": "inProgress"}}})
                 emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "completed", "exitCode": 0}}})
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "native-final", "text": "Goalを完遂しました"}], "error": None}}},
@@ -2792,6 +2800,31 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 30_000)
   }
+
+  test('job244: 実executorで先行・終了後startを許容し20MiB超の直近証拠を保存する', async () => {
+    const value = fixture('late-command-completion', true)
+    const processIds: number[] = []
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'late-command-completion', ZERO_EARLY_ITEM: '1', ZERO_LATE_START: '1' },
+        onProcessId: pid => { processIds.push(pid) }, liveControls: value.hooks,
+      })
+      expect(result).toEqual({ sessionId: 'thread-app-server-1', result: 'Goalを完遂しました' })
+      expect(processIds).toHaveLength(1)
+      const name = readdirSync(value.logDir).find(name => name.startsWith(value.job.id) && name.endsWith('.stdout.log'))!
+      const path = join(value.logDir, name)
+      expect(statSync(path).size).toBe(20 * 1024 * 1024)
+      const info = JSON.parse(readFileSync(`${path}.tail.json`, 'utf8'))
+      expect(info.prefixTruncated).toBe(true)
+      const tail = readFileSync(`${path}.tail-${1 - info.latestSegment}.log`, 'utf8')
+        + readFileSync(`${path}.tail-${info.latestSegment}.log`, 'utf8')
+      expect(tail).toContain('late-diagnostic-marker')
+      expect(tail).toContain('native-final')
+      for (const slot of [0, 1]) expect(statSync(`${path}.tail-${slot}.log`).size).toBeLessThanOrEqual(1024 * 1024)
+    } finally { value.store.close() }
+  }, 30_000)
 
   test('production write jobはhost工程を挟まずCodexのcomplete turnだけで完了する', async () => {
     const value = fixture(

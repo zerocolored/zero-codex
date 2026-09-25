@@ -11965,7 +11965,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         message = error instanceof Error ? error.message : String(error)
       }
       const expectedLog = join(logs, `${job.id}.new.stdout.log`)
-      expect(message).toContain(`全文ログ: ${expectedLog}`)
+      expect(message).toContain(`ログ（保存上限あり）: ${expectedLog}`)
       expect(existsSync(expectedLog)).toBe(true)
       expect(message).not.toContain(`${job.id}.stdout.log`)
     } finally {
