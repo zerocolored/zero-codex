@@ -2174,7 +2174,7 @@ def _keep_xhigh_screen(text: str) -> bool:
     plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
     lines = [line.strip() for line in plain.splitlines() if line.strip()]
     return (
-        sum(line == "Use Fable 5.1 at high effort by default?" for line in lines) == 1
+        sum(bool(re.fullmatch(r"Use Fable 5\.1 .*high effort.*default\?", line)) for line in lines) == 1
         and sum(line == "❯ Keep xhigh" for line in lines) == 1
         and sum(line == "Switch Fable 5.1 to high effort" for line in lines) == 1
         and sum("❯" in line for line in lines) == 1
@@ -2182,10 +2182,74 @@ def _keep_xhigh_screen(text: str) -> bool:
     )
 
 
+def _trust_screen_choice(text: str, project_root: str) -> Optional[Tuple[str, str]]:
+    """Recognize only the owned two-choice trust dialog, including narrow panes."""
+    plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
+    lines = plain.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == "Accessing workspace:"]
+    ends = [i for i, line in enumerate(lines) if "Enter to confirm" in line and "Esc to cancel" in line]
+    if not project_root or len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        return None
+    start, end = starts[0], ends[0]
+    if any(_INTERACTIVE_HINT.search(_semantic_terminal_line(line)) for line in lines[:start]):
+        return None
+    if any(_semantic_terminal_line(line) for line in lines[end + 1:]):
+        return None
+    path = ""
+    path_end = start
+    for i in range(start + 1, end):
+        fragment = lines[i].strip()
+        if not fragment and not path:
+            continue
+        path += fragment
+        if path == project_root:
+            path_end = i
+            break
+        if not project_root.startswith(path):
+            return None
+    if path != project_root:
+        return None
+    active = lines[path_end + 1:end]
+    if _STARTUP_FORBIDDEN_UI.search("\n".join(lines[:start] + active)):
+        return None
+    choices = []
+    for line in active:
+        match = re.fullmatch(r"\s*([❯›▶▷])?\s*(?:[12]\.\s*)?(Yes, I trust this folder|No, exit)\s*", line)
+        if match:
+            choices.append((bool(match[1]), match[2]))
+        elif (_TRUST_SELECTION.search(line) or re.match(r"\s*\d+[.)]\s", line)
+              or (choices and _semantic_terminal_line(line))):
+            return None
+    if (len(choices) != 2 or sum(selected for selected, _ in choices) != 1
+            or {label for _, label in choices} != {"Yes, I trust this folder", "No, exit"}):
+        return None
+    selected = next(i for i, choice in enumerate(choices) if choice[0])
+    trusted = next(i for i, choice in enumerate(choices) if choice[1] == "Yes, I trust this folder")
+    return ("trust", "") if selected == trusted else ("exit", "Down" if trusted > selected else "Up")
+
+
+def _startup_screen_state(text: str, project_root: str) -> Tuple[str, str]:
+    trust = _trust_screen_choice(text, project_root)
+    if trust:
+        return ("trust-" + trust[0], trust[1])
+    plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
+    active = "\n".join(line for line in plain.splitlines()
+                       if not _EMPTY_PROMPT_LINE.fullmatch(line) and line.strip() != project_root)
+    if _STARTUP_FORBIDDEN_UI.search(active):
+        return ("prohibited-ui", "")
+    if _keep_xhigh_screen(text):
+        return ("keep-xhigh", "")
+    if _empty_claude_prompt_screen(text):
+        return ("empty-prompt", "")
+    return ("unrecognized-screen", "")
+
+
 def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str, object]:
     """Metadata-ready can precede the effort question. Confirm only the owned UI."""
     accepted_effort = False
     accepted_trust = False
+    moved_to_trust = False
+    last_state = "unrecognized-screen"
     deadline = time.monotonic() + CLAUDE_SETTLE_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         _result, first = _agent_information(target)
@@ -2199,12 +2263,17 @@ def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str
             raise UnsafeRequest("ephemeral Claude disappeared before visible readiness")
         _validate_owned_agent(second, workspace, require_ready=False)
         second_text = _read_visible(target)
+        first_screen = _startup_screen_state(first_text, str(workspace.get("project_root", "")))
+        second_screen = _startup_screen_state(second_text, str(workspace.get("project_root", "")))
+        last_state = second_screen[0]
         stable = (type(first.get("state_change_seq")) is int
                   and first.get("state_change_seq") == second.get("state_change_seq")
-                  and first_text == second_text)
+                  and all(first.get(key) == second.get(key)
+                          for key in ("agent_status", "interactive_ready", "launch_pending"))
+                  and first_screen == second_screen)
         if not stable:
             continue
-        if _keep_xhigh_screen(second_text):
+        if last_state == "keep-xhigh":
             if not accepted_effort:
                 _validate_owned_topology(workspace)
                 result = _run_herdr(["agent", "send-keys", target, "Enter"])
@@ -2212,22 +2281,27 @@ def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str
                     raise UnsafeRequest("ephemeral Claude effort confirmation failed")
                 accepted_effort = True
             continue
-        plain = _ANSI_SEQUENCE.sub("", second_text).replace("\r", "")
-        active_text = "\n".join(line for line in plain.splitlines()
-                                if not _EMPTY_PROMPT_LINE.fullmatch(line)
-                                and line.strip() != workspace.get("project_root"))
-        if _STARTUP_FORBIDDEN_UI.search(active_text):
+        if last_state == "prohibited-ui":
             raise UnsafeRequest("ephemeral Claude has a prohibited startup UI")
-        if _strict_trust_screen(second_text, str(workspace.get("project_root", ""))):
+        if last_state in {"trust-trust", "trust-exit"}:
             if (not accepted_trust and second.get("agent_status") == "blocked"
                     and second.get("launch_pending") is True):
                 _validate_owned_topology(workspace)
-                result = _run_herdr(["agent", "send-keys", target, "Enter"])
+                if last_state == "trust-exit":
+                    # Explicitly authorized initial trust only. Reobserve twice
+                    # before Enter; never retry a selection key on a stale UI.
+                    if moved_to_trust:
+                        continue
+                    key = second_screen[1]
+                    moved_to_trust = True
+                else:
+                    key = "Enter"
+                    accepted_trust = True
+                result = _run_herdr(["agent", "send-keys", target, key])
                 if result.returncode != 0:
                     raise UnsafeRequest("ephemeral Claude trust confirmation failed")
-                accepted_trust = True
             continue
-        if (_empty_claude_prompt_screen(second_text)
+        if (last_state == "empty-prompt"
                 and second.get("agent_status") in {"idle", "done"}
                 and second.get("interactive_ready") is True
                 and second.get("launch_pending") is not True):
@@ -2235,50 +2309,26 @@ def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str
         # Metadata can precede a fully painted startup screen. Do not turn an
         # incidental frame into a launch failure; wait within the same attempt.
         continue
-    raise UnsafeRequest("ephemeral Claude visible ready prompt did not settle")
+    raise UnsafeRequest(f"ephemeral Claude visible ready prompt did not settle ({last_state})")
 
 
 def _strict_trust_screen(text: str, project_root: str) -> bool:
-    plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
-    lines = plain.splitlines()
-    starts = [index for index, line in enumerate(lines) if "Accessing workspace:" in line]
-    ends = [
-        index
-        for index, line in enumerate(lines)
-        if "Enter to confirm · Esc to cancel" in line
-    ]
-    if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
-        return False
-    prefix = [_semantic_terminal_line(line) for line in lines[: starts[0]]]
-    suffix = [_semantic_terminal_line(line) for line in lines[ends[0] + 1 :]]
-    if any(_INTERACTIVE_HINT.search(line) for line in prefix if line):
-        return False
-    if any(line for line in suffix):
-        return False
-    active_lines = lines[starts[0] : ends[0] + 1]
-    if sum(len(_TRUST_SELECTION.findall(line)) for line in active_lines) != 1:
-        return False
-    if not any(_FIRST_CHOICE_SELECTED.search(line) for line in active_lines):
-        return False
-    active_tail = "\n".join(lines[starts[0] :])
-    choices = re.findall(r"(?m)^\s*[\u2500-\u257f❯›▶▷◉●○◆◇]*\s*[0-9]+\.", active_tail)
-    if len(choices) != 2:
-        return False
-    semantic_lines = []
-    for line in lines[starts[0] : ends[0] + 1]:
-        normalized = _semantic_terminal_line(line)
-        if normalized:
-            semantic_lines.append(normalized)
-    # Explanatory copy is not an authorization boundary. Match the owned
-    # location and selected action, not a particular Claude release's prose.
-    return (
-        len(semantic_lines) >= 5
-        and semantic_lines[1] == project_root
-        and semantic_lines.count(project_root) == 1
-        and semantic_lines.count("1. Yes, I trust this folder") == 1
-        and semantic_lines.count("2. No, exit") == 1
-        and not _STARTUP_FORBIDDEN_UI.search("\n".join(line for line in lines if line.strip() != project_root))
-    )
+    return _trust_screen_choice(text, project_root) == ("trust", "")
+
+
+def _startup_failure_code(error: BaseException) -> str:
+    message = str(error)
+    if "prohibited startup UI" in message:
+        return "prohibited-ui"
+    if "trust confirmation failed" in message:
+        return "trust-confirmation-failed"
+    if "effort confirmation failed" in message:
+        return "effort-confirmation-failed"
+    if "visible ready prompt did not settle" in message:
+        return "trust-confirmation-timeout" if "(trust-" in message else "readiness-timeout"
+    if "identity" in message or "receipt" in message:
+        return "identity-check-failed"
+    return "startup-failed"
 
 
 def _settle_after_trust(
@@ -4189,6 +4239,10 @@ def _open_ephemeral_workspace(
         return 0
     except BaseException as startup_error:
         _suppress_open_signals()
+        # Preserve a bounded, non-secret diagnosis before closing the only UI
+        # that can explain an open failure. Never relay the screen or argv here.
+        print(json.dumps({"status": "ephemeral-claude-startup-failed",
+                          "code": _startup_failure_code(startup_error)}), flush=True)
         if workspace_validated and workspace_receipt is not None:
             cleanup_process_ids = None
             cleanup_process_group_id = None

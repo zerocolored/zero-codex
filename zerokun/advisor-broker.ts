@@ -117,6 +117,8 @@ import { recoverAdvisorSlot } from './advisor-retry.ts'
 import {
   saveClaudeResponseDiagnostic,
   captureClaudeFailureDiagnostic,
+  parseClaudeStartupDiagnostic,
+  type ClaudeFailureDiagnostic,
   type ClaudeResponseAnalysis,
   type ClaudeDiagnosticRead,
   type ClaudeDiagnosticReceipt,
@@ -206,6 +208,13 @@ export function analyzeClaudeResponse(transcript: string, marker: string): Claud
   const result = (code: ClaudeResponseAnalysis['code'], response: string | null = null): ClaudeResponseAnalysis => ({
     response, code, markerLines, exactOccurrences, wrappedMarkerPairs,
   })
+  // Instruction and marker have different display widths. Either can wrap
+  // independently in the same owned terminal; their content must still match.
+  const hasPromptInstruction = (index: number) => (index >= 1
+    && values[index - 1] === CLAUDE_MARKER_INSTRUCTION)
+    || (index >= 2
+      && values[index - 2] === CLAUDE_NARROW_MARKER_INSTRUCTION_HEAD
+      && values[index - 1] === CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL)
 
   let promptEnd: number
   let responseMarker: number
@@ -214,17 +223,14 @@ export function analyzeClaudeResponse(transcript: string, marker: string): Claud
     && wrappedMarkerPairs.length === 0) {
     const promptMarker = markerLines[0]!
     responseMarker = markerLines[1]!
-    if (promptMarker < 1
-      || values[promptMarker - 1] !== CLAUDE_MARKER_INSTRUCTION) return result('prompt-boundary-mismatch')
+    if (!hasPromptInstruction(promptMarker)) return result('prompt-boundary-mismatch')
     promptEnd = promptMarker
   } else if (markerLines.length === 1
     && exactOccurrences === 1
     && wrappedMarkerPairs.length === 1) {
     const wrappedMarker = wrappedMarkerPairs[0]!
     responseMarker = markerLines[0]!
-    if (wrappedMarker < 2
-      || values[wrappedMarker - 2] !== CLAUDE_NARROW_MARKER_INSTRUCTION_HEAD
-      || values[wrappedMarker - 1] !== CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL) return result('prompt-boundary-mismatch')
+    if (!hasPromptInstruction(wrappedMarker)) return result('prompt-boundary-mismatch')
     promptEnd = wrappedMarker + 1
   } else return result('marker-count-mismatch')
 
@@ -1876,6 +1882,9 @@ async function main(): Promise<void> {
     let diagnosticTranscript: string | undefined
     let diagnosticTranscriptReadIndex: number | undefined
     let responseDiagnostic: ClaudeDiagnosticReceipt | undefined
+    let failureStage: 'startup' | 'send' | 'acquisition' = 'startup'
+    let diagnosticFailure: ClaudeFailureDiagnostic | undefined
+    let startupCode: ClaudeFailureDiagnostic['startupCode']
     const persistDiagnostic = () => {
       responseDiagnostic = saveClaudeResponseDiagnostic({
         stateDir,
@@ -1886,6 +1895,7 @@ async function main(): Promise<void> {
         transcriptReadIndex: diagnosticTranscriptReadIndex,
         phase,
         round,
+        failure: diagnosticFailure,
       })
     }
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
@@ -1957,6 +1967,7 @@ async function main(): Promise<void> {
       })
       if (opened.timedOut || opened.forcedCleanup
         || opened.outputTruncated || opened.exitCode !== 0) {
+        startupCode = parseClaudeStartupDiagnostic(opened.stdout)
         throw new Error(`ephemeral Claude open failed (${opened.exitCode}): ${opened.stderr}`)
       }
       target = parseEphemeralClaudeOpen(opened.stdout)
@@ -1979,6 +1990,7 @@ async function main(): Promise<void> {
       }
       await verifyHerdrRuntimeIdentityAsync(claudeRuntime, brokerEnvironment(claudeRuntime))
       deliveryUnknown = true
+      failureStage = 'send'
       const send = await runBounded(fingerprintedCommand([
         python, helper, 'send', ...helperArgs, '--owned',
       ], jobFingerprint), { env: helperEnvironment, timeoutMs: 140_000 })
@@ -1994,6 +2006,7 @@ async function main(): Promise<void> {
       }
       {
         marker = sendOutcome.marker
+        failureStage = 'acquisition'
         if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
         const acquisitionDeadline = Date.now() + 60 * 60 * 1_000
         // Once prompt-started is durable, helper timeout/exit 5 is an ambiguous
@@ -2077,6 +2090,9 @@ async function main(): Promise<void> {
       }
       reason = String(error)
       if (error instanceof AdvisorFailureError) failure = error.failure
+      failure ??= classifyAdvisorFailure('claude', reason)
+      diagnosticFailure = { stage: failureStage, cause: failure.cause, ...(startupCode ? { startupCode } : {}) }
+      persistDiagnostic()
     } finally {
       if (!response && marker && target && claudeRuntime && diagnosticReads.length === 0) {
         const runtime = claudeRuntime
@@ -2531,6 +2547,7 @@ async function main(): Promise<void> {
         reason: recorded.containmentVerified === true
           ? 'reviewer process ended at the verified interjection boundary'
           : 'reviewer containment remained an explicit bounded residual after interruption',
+        failure: { advisor: 'grok', cause: 'interrupted' },
       }
     })
     const recordedClaude = journal.claude && typeof journal.claude === 'object'
@@ -2551,6 +2568,7 @@ async function main(): Promise<void> {
       containmentVerified: recordedClaude.containmentVerified === true,
       containmentStatus: recordedClaude.containmentStatus,
       promptMayHaveBeenDelivered: recordedClaude.promptMayHaveBeenDelivered === true,
+      failure: { advisor: 'claude', cause: 'interrupted' },
       reason: recordedClaude.containmentVerified === true
         ? 'ephemeral reviewer was closed at the verified interjection boundary'
         : 'ephemeral reviewer cleanup remained an explicit bounded residual after interruption',
@@ -2745,7 +2763,8 @@ async function main(): Promise<void> {
         if (recovered && journal && claude?.containmentVerified === true
           && Date.now() - Number(journal.finishedAt) >= 30_000) {
           retryResult ??= { native: journal.native as Array<Record<string, unknown>>,
-            grok: [], claude, evidenceDigest: String(journal.primaryEvidenceDigest),
+            grok: [], claude: { ...claude, failure: { advisor: 'claude', cause: 'interrupted' } },
+            evidenceDigest: String(journal.primaryEvidenceDigest),
             interruptionRecovery: true,
             retryCount: Number(journal.retryCount ?? 0) + 1,
             recoveryInputRevision: Number(journal.recoveryInputRevision ?? 0),
