@@ -7640,7 +7640,29 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('先頭jobがrate-limit待ちなら後続jobは追い越さない', () => {
+  test('延期中でも別スレッドは進み、同一スレッドの順序は保持する', () => {
+    const store = makeStore()
+    const first = store.enqueue(input({ messageId: 'first' })).job
+    const second = store.enqueue(input({ messageId: 'second', repoPath: '/another-project' })).job
+    const independent = store.enqueue(input({ messageId: 'third', threadTs: 'different-thread' })).job
+    const now = Date.now()
+    expect(store.claimNext('worker')?.id).toBe(first.id)
+    store.requeueAt(first.id, now + 60_000, 'temporary network failure')
+    expect(store.countClaimable(now)).toBe(1)
+    expect(store.claimableHeadId(now)).toBe(independent.id)
+    expect(store.claimNext('worker', undefined, now)?.id).toBe(independent.id)
+    expect(store.claimNext('another-worker', undefined, now)).toBeNull()
+    store.complete(independent.id, 'independent-session', 'done')
+    expect(store.countClaimable(now)).toBe(0)
+    expect(store.claimableHeadId(now)).toBeNull()
+    expect(store.claimNext('worker', undefined, now)).toBeNull()
+    expect(store.claimNext('worker', undefined, now + 60_000)?.id).toBe(first.id)
+    store.complete(first.id, 'first-session', 'done')
+    expect(store.claimNext('worker', undefined, now + 60_000)?.id).toBe(second.id)
+    store.close()
+  })
+
+  test('先頭jobがrate-limit待ちなら同一スレッドの後続jobは追い越さない', () => {
     const store = makeStore()
     const first = store.enqueue(input({ messageId: 'first', task: 'first' })).job
     store.enqueue(input({ messageId: 'second', task: 'second' }))
@@ -7650,6 +7672,28 @@ describe('single FIFO worker', () => {
     expect(store.claimNext('serial-worker')).toBeNull()
     expect(store.countClaimable()).toBe(0)
     store.close()
+  })
+
+  test('延期の順序と二重claim防止は再起動と複数workerでも保持される', () => {
+    const path = join(fixtureDir(), 'jobs.sqlite3')
+    let store = new JobStore(path)
+    const first = store.enqueue(input({ messageId: 'first' })).job
+    store.enqueue(input({ messageId: 'second' }))
+    const other = store.enqueue(input({ messageId: 'other', threadTs: 'other-thread' })).job
+    store.claimNext('worker')
+    store.requeueAt(first.id, Date.now() + 60_000, 'network')
+    store.close()
+    store = new JobStore(path)
+    const peer = new JobStore(path)
+    try {
+      expect(store.claimableHeadId()).toBe(other.id)
+      expect(store.claimNext('worker')?.id).toBe(other.id)
+      expect(peer.claimNext('peer')).toBeNull()
+      store.complete(other.id, 'other-session', 'done')
+      expect(peer.claimableHeadId()).toBeNull()
+      expect(peer.claimNext('peer')).toBeNull()
+      expect(peer.claimNext('peer', undefined, Date.now() + 60_000)?.id).toBe(first.id)
+    } finally { peer.close(); store.close() }
   })
 
   test('monitor消失復旧はqueued/running jobを二重処理できないterminal失敗へ固定する', () => {

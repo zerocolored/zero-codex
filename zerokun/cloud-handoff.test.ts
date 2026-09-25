@@ -40,6 +40,26 @@ test('pending import holds later same-thread execution but not unrelated work', 
   expect(store.get(later.job.id)?.status).toBe('queued')
   store.close()
 })
+test('cloud parked predecessor blocks only its own thread until transfer', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-order-test-')); roots.push(root)
+  const store = new JobStore(join(root, 'jobs.sqlite3'))
+  const input = { chatId: 'C1', threadTs: '1.0', userId: 'U1', repoPath: root, task: 'task' }
+  const first = store.enqueue({ ...input, messageId: '1.0' }).job
+  store.claimNext('worker')
+  store.bindCloudHandoff(first.id, h.id, h.epoch, JSON.stringify(h))
+  store.parkCloudHandoff(first.id, 'quota')
+  const next = store.enqueue({ ...input, messageId: '2.0' }).job
+  const other = store.enqueue({ ...input, messageId: '3.0', threadTs: 'other' }).job
+  expect(store.claimableHeadId()).toBe(other.id)
+  expect(store.claimNext('worker')?.id).toBe(other.id)
+  store.complete(other.id, 'other-session', 'done')
+  expect(store.claimableHeadId()).toBeNull()
+  store.recordCloudCheckpoint(first.id, JSON.stringify(h), '/local/checkpoint', CLOUD_WAIT_MESSAGE)
+  expect(store.claimNext('worker')).toBeNull()
+  store.retireCloudSave(first.id, h.epoch + 1)
+  expect(store.claimNext('worker')?.id).toBe(next.id)
+  store.close()
+})
 test('cloud parked jobs remain unclaimable after clock advance and database reopen', () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-wait-test-')); roots.push(root)
   mkdirSync(join(root, 'repo'))

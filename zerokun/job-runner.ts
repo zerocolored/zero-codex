@@ -53,7 +53,7 @@ import {
   type ProcessLockLease,
 } from './process-lock.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
-import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, type CloudControl } from './cloud-runtime.ts'
+import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, CLOUD_PREPARATION_FAILURE_MESSAGES, type CloudControl } from './cloud-runtime.ts'
 import { CLOUD_SAVE_FAILED_MESSAGE } from './cloud-handoff.ts'
 import { createAdvisorInputSnapshot, readAdvisorInputSnapshot } from './advisor-input.ts'
 import {
@@ -282,9 +282,22 @@ const CLAIMABLE_CODEX_JOB_PREDICATE = `
       AND approval_wait.seq < jobs.seq
   )
 `
+// Deferred work only blocks its own conversation, never unrelated requests.
+const READY_CODEX_JOB_PREDICATE = `
+  ${CLAIMABLE_CODEX_JOB_PREDICATE}
+  AND (jobs.cancel_requested_at IS NOT NULL OR jobs.not_before IS NULL OR jobs.not_before <= ?)
+  AND NOT EXISTS (
+    SELECT 1 FROM jobs earlier
+    WHERE earlier.runtime = 'codex' AND earlier.status IN ('queued', 'running')
+      AND earlier.chat_id = jobs.chat_id AND earlier.thread_ts = jobs.thread_ts
+      AND earlier.seq < jobs.seq
+      AND NOT EXISTS (SELECT 1 FROM cloud_handoff_jobs transferred
+        WHERE transferred.job_id = earlier.id AND transferred.state = 'transferred')
+  )
+`
 const PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE = `
   (jobs.runtime = 'codex' AND jobs.status = 'running')
-  OR (${CLAIMABLE_CODEX_JOB_PREDICATE})
+  OR (${READY_CODEX_JOB_PREDICATE})
 `
 const SLACK_DM_HISTORY_RETRY_BASE_MS = 24 * 60 * 60 * 1_000
 const SLACK_DM_HISTORY_RETRY_MAX_MS = 7 * 24 * 60 * 60 * 1_000
@@ -8659,12 +8672,12 @@ export class JobStore {
       // so deriving this decision from `position > 1` misses the common case
       // of exactly one queued predecessor.  Compare only earlier rows instead;
       // the new job can then never exclude its blocker by excluding itself.
-      const blockedByPriorJob = this.db.query<{ present: number }, [number]>(
+      const blockedByPriorJob = this.db.query<{ present: number }, [number, number]>(
         `SELECT 1 AS present FROM jobs
          WHERE jobs.seq < ?
            AND (${PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE})
          LIMIT 1`,
-      ).get(row.seq) !== null
+      ).get(row.seq, Date.now()) !== null
       const waitsBehindPriorJob = result.changes === 1 && blockedByPriorJob
 
       if (result.changes === 1 && input.notifyAccepted && waitsBehindPriorJob) {
@@ -9024,30 +9037,18 @@ export class JobStore {
   }
 
   countClaimable(now = Date.now()): number {
-    const head = this.db.query<{
-      not_before: number | null
-      cancel_requested_at: number | null
-    }, []>(
-      `SELECT not_before, cancel_requested_at FROM jobs
-       WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}
-       ORDER BY seq ASC LIMIT 1`,
-    ).get()
-    return head && (head.cancel_requested_at !== null
-      || head.not_before === null || head.not_before <= now) ? 1 : 0
+    return this.claimableHeadId(now) === null ? 0 : 1
   }
 
   claimableHeadId(now = Date.now()): string | null {
     const head = this.db.query<{
       id: string
-      not_before: number | null
-      cancel_requested_at: number | null
-    }, []>(
-      `SELECT id, not_before, cancel_requested_at FROM jobs
-       WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}
+    }, [number]>(
+      `SELECT id FROM jobs
+       WHERE ${READY_CODEX_JOB_PREDICATE}
        ORDER BY seq ASC LIMIT 1`,
-    ).get()
-    return head && (head.cancel_requested_at !== null
-      || head.not_before === null || head.not_before <= now) ? head.id : null
+    ).get(now)
+    return head?.id ?? null
   }
 
   claimNext(
@@ -9064,12 +9065,12 @@ export class JobStore {
         "SELECT 1 AS present FROM jobs WHERE runtime = 'codex' AND status = 'running' LIMIT 1",
       ).get()
       if (active) return null
-      const row = this.db.query<JobRow, []>(
+      const row = this.db.query<JobRow, [number]>(
         `SELECT * FROM jobs
-         WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}
+         WHERE ${READY_CODEX_JOB_PREDICATE}
          ORDER BY seq ASC
          LIMIT 1`,
-      ).get()
+      ).get(claimAt)
       if (!row) return null
       if (row.cancel_requested_at === null
         && row.not_before !== null && row.not_before > claimAt) return null
@@ -11755,12 +11756,12 @@ export class JobStore {
         deliverable = row.job_id !== null
           && row.job_status === 'queued'
           && row.job_seq !== null
-          && this.db.query<{ present: number }, [number]>(
+          && this.db.query<{ present: number }, [number, number]>(
             `SELECT 1 AS present FROM jobs
              WHERE jobs.seq < ?
                AND (${PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE})
              LIMIT 1`,
-          ).get(row.job_seq) !== null
+          ).get(row.job_seq, Date.now()) !== null
       } else if (row.kind === 'rate-limited'
         && row.idempotency_key.startsWith(RATE_LIMIT_WAIT_NOTIFICATION_PREFIX)) {
         deliverable = row.job_id !== null
@@ -13553,6 +13554,7 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  if ((Object.values(CLOUD_PREPARATION_FAILURE_MESSAGES) as string[]).includes(error)) return error
   if (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE) {
     return FORCED_SERVICE_STOP_FAILURE_MESSAGE
   }

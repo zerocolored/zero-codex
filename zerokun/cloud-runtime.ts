@@ -12,11 +12,16 @@ import { localRepositoryIdentity, provisionLocalWorkspaceSettings } from './loca
 type Workspace = { epoch: number; project: string; repositories: Array<{ root: string; name: string; base: string }> }
 export type CloudControl = { channel: string; thread: string; message: string; user: string;
   bot: string; project: string; writeEnabled: boolean; action: 'handoff' | 'continue' }
+export const CLOUD_PREPARATION_FAILURE_MESSAGES = {
+  noRepository: '対象フォルダに Git リポジトリがないため開始できません。リポジトリの設定が必要です。',
+  noOrigin: '対象リポジトリに origin が設定されていないため開始できません。接続先を設定した後、このスレッドで再度依頼してください。',
+  noBranch: '接続先に develop・main・master のいずれの統合ブランチもないため開始できません。リポジトリ設定を確認してください。',
+} as const
 const CONTINUATION_INSTRUCTIONS = '\n\n# Managed continuation workspace\nThis task already has dedicated worktrees prepared from fetched integration commits. Continue in these worktrees and branches; do not create, move, delete or edit other worktrees. Preserve uncommitted work for handoff. Do not commit cloud credentials or host state.\n'
 export class CloudPreparationError extends Error {
-  constructor(readonly permanent = false) { super(permanent
+  constructor(readonly permanent = false, reason?: string) { super(reason ?? (permanent
     ? 'このスレッドの所有状態または作業場所の設定により開始できません。引き継ぎ先への「引き継いで」、元の担当への「続けて」、またはリポジトリ設定を確認してください。'
-    : 'cloud workspace preparation is pending; local task preserved') }
+    : 'cloud workspace preparation is pending; local task preserved')) }
 }
 export class CloudControlUnavailableError extends Error {}
 function git(root: string, args: string[]): string {
@@ -68,7 +73,12 @@ export class CloudRuntime {
     // A unique new worktree owns the task's changes. Never capture a dirty
     // shared checkout and infer that all its changes belong to this job.
     const layout = resolveProjectLayout(job.repoPath)
-    if (!layout.gitRoots.length) throw new CloudPreparationError(true)
+    if (!layout.gitRoots.length) throw new CloudPreparationError(true, CLOUD_PREPARATION_FAILURE_MESSAGES.noRepository)
+    for (const source of layout.gitRoots) {
+      if (!git(source, ['remote']).split('\n').includes('origin')) {
+        throw new CloudPreparationError(true, CLOUD_PREPARATION_FAILURE_MESSAGES.noOrigin)
+      }
+    }
     const attempt = crypto.randomUUID()
     const project = join(this.workspaceRoot(), `${h.id}-${attempt}`, 'project')
     mkdirSync(project, { recursive: true, mode: 0o700 })
@@ -78,7 +88,7 @@ export class CloudRuntime {
       const root = join(project, name)
       const branches = git(source, ['ls-remote', '--heads', 'origin', 'develop', 'main', 'master'])
       const branch = ['develop', 'main', 'master'].find(value => branches.includes(`refs/heads/${value}`))
-      if (!branch) throw new CloudPreparationError(true)
+      if (!branch) throw new CloudPreparationError(true, CLOUD_PREPARATION_FAILURE_MESSAGES.noBranch)
       git(source, ['fetch', 'origin', branch])
       const base = git(source, ['rev-parse', 'FETCH_HEAD'])
       // Multi-repository execution expects ordinary repository members, not

@@ -19,6 +19,7 @@ import {
 } from './job-runner.ts'
 import { artifactDirForJob, CodexInterruptedError } from './codex-executor.ts'
 import { readAdvisorInputSnapshot } from './advisor-input.ts'
+import { CloudPreparationError, CLOUD_PREPARATION_FAILURE_MESSAGES } from './cloud-runtime.ts'
 
 const roots: string[] = []
 
@@ -435,6 +436,45 @@ describe('durable lifecycle notifications', () => {
         }
       }
       expect(store.pendingStatusNotifications().filter(row => row.kind === 'execution-started')).toEqual([])
+      store.close()
+    }
+  })
+
+  test('別スレッドの延期jobだけなら別件作業中を登録も送信もしない', async () => {
+    for (const deferBeforeEnqueue of [true, false]) {
+      const { store, job } = runningJob()
+      if (deferBeforeEnqueue) store.requeueAt(job.id, Date.now() + 60_000, 'network')
+      const next = store.enqueue({ chatId: 'D2', threadTs: 'independent', messageId: 'next', userId: 'U2',
+        repoPath: job.repoPath, task: 'next', notifyAccepted: true }).job
+      if (deferBeforeEnqueue) expect(store.pendingStatusNotifications().filter(n => n.kind === 'accepted')).toHaveLength(0)
+      else store.requeueAt(job.id, Date.now() + 60_000, 'network')
+      const posts: string[] = []
+      await flushStatusNotifications(store, { status: async n => { posts.push(n.payload) } }, () => {})
+      expect(posts).not.toContain(SLACK_QUEUE_WAIT_MESSAGE)
+      expect(store.claimableHeadId()).toBe(next.id)
+      store.close()
+    }
+  })
+
+  test('cloud準備の一時失敗と設定不足はいずれも無関係な依頼を止めない', async () => {
+    for (const permanent of [false, true]) {
+      const { store, job } = runningJob()
+      store.requeueAt(job.id, Date.now() - 1, 'fixture')
+      const next = store.enqueue({ chatId: 'D2', threadTs: 'independent', messageId: 'next', userId: 'U2',
+        repoPath: job.repoPath, task: 'next', notifyAccepted: true }).job
+      const executed: string[] = []
+      await runQueuedJobs({ store, stopWhenIdle: true, pollMs: 1,
+        prepareCloudJob: async candidate => {
+          if (candidate.id === job.id) throw new CloudPreparationError(permanent,
+            permanent ? CLOUD_PREPARATION_FAILURE_MESSAGES.noOrigin : undefined)
+        },
+        executor: async candidate => { executed.push(candidate.id); return { sessionId: 'next-session', result: 'done' } },
+      })
+      expect(executed).toEqual([next.id])
+      expect(store.get(next.id)?.status).toBe('completed')
+      expect(store.get(job.id)?.status).toBe(permanent ? 'failed' : 'queued')
+      if (permanent) expect(store.get(job.id)?.lastError).toBe(CLOUD_PREPARATION_FAILURE_MESSAGES.noOrigin)
+      else expect(store.get(job.id)?.notBefore).toBeGreaterThan(Date.now())
       store.close()
     }
   })
