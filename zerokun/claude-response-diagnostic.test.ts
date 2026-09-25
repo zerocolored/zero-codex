@@ -3,7 +3,7 @@ import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync } 
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createHash } from 'crypto'
-import { captureClaudeFailureDiagnostic, saveClaudeResponseDiagnostic, MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES } from './claude-response-diagnostic.ts'
+import { captureClaudeFailureDiagnostic, saveClaudeResponseDiagnostic, parseClaudeStartupDiagnostic, MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES } from './claude-response-diagnostic.ts'
 import { analyzeClaudeResponse, extractCompleteClaudeResponse, AdvisorOwnedProcessStillLiveError } from './advisor-broker.ts'
 
 const roots: string[] = []
@@ -17,6 +17,26 @@ function fixture() {
 const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
 const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
 
+test('startup diagnostics survive cleanup without terminal text or arbitrary error content', () => {
+  const code = parseClaudeStartupDiagnostic('other output\n' + JSON.stringify({
+    status: 'ephemeral-claude-startup-failed', code: 'trust-confirmation-timeout',
+  }))
+  expect(code).toBe('trust-confirmation-timeout')
+  expect(parseClaudeStartupDiagnostic(JSON.stringify({
+    status: 'ephemeral-claude-startup-failed', code: 'arbitrary private error',
+  }))).toBeUndefined()
+  expect(parseClaudeStartupDiagnostic('null\n{}\nmalformed')).toBeUndefined()
+  const options = fixture()
+  const receipt = saveClaudeResponseDiagnostic({ ...options,
+    failure: { stage: 'startup', cause: 'timeout', startupCode: code },
+  })
+  expect(receipt.status).toBe('saved')
+  expect(JSON.parse(readFileSync(join(options.stateDir, receipt.path!), 'utf8'))).toMatchObject({
+    failure: { stage: 'startup', cause: 'timeout', startupCode: 'trust-confirmation-timeout' },
+    transcript: { available: false },
+  })
+})
+
 test('parser reports missing boundaries while accepting complete responses with unfamiliar UI', () => {
   const envelope = [instruction, marker, '回答内容', marker, '❯'].join('\n')
   expect(analyzeClaudeResponse(envelope, marker)).toMatchObject({ code: 'complete', response: '回答内容', markerLines: [1, 3] })
@@ -29,6 +49,23 @@ test('parser reports missing boundaries while accepting complete responses with 
     expect(analyzeClaudeResponse(text!, marker).code).toBe(code!)
     expect(extractCompleteClaudeResponse(text!, marker)).toBeNull()
   }
+})
+
+test.each([false, true])('instruction wrapping is independent of marker wrapping: %s', wrappedMarker => {
+  const promptMarker = wrappedMarker ? marker.slice(0, -1) + '\n  ' + marker.slice(-1) : marker
+  const transcript = [
+    '❯ 接続テスト', '',
+    '  応答の最後の独立行に、次のrequest',
+    '  markerをそのまま記載してください。',
+    '  ' + promptMarker, '', '⏺ 接続確認成功', '', '  ' + marker,
+    '✻ Baked for 2s · done 17:21', '❯',
+  ].join('\n')
+  expect(analyzeClaudeResponse(transcript, marker)).toMatchObject({ code: 'complete', response: '⏺ 接続確認成功' })
+  expect(analyzeClaudeResponse(transcript.replace('markerをそのまま', '別の指示をそのまま'), marker).code)
+    .toBe('prompt-boundary-mismatch')
+  expect(analyzeClaudeResponse(transcript.replace('  応答の最後の独立行に、次のrequest\n', ''), marker).code)
+    .toBe('prompt-boundary-mismatch')
+  expect(analyzeClaudeResponse(transcript + '\n' + marker, marker).code).toBe('marker-count-mismatch')
 })
 
 test('stores terminal content privately with a verifiable receipt, replacing the same attempt', () => {

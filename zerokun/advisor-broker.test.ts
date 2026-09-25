@@ -1476,6 +1476,13 @@ print('review complete')
       '✻ Cogitated for 2m 7s · done 6:41 AM', '────',
       '❯\u00a0本番ジョブのログで工程2と3の件数差を確認して', '────',
       '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n') }, { name: 'live-wrapped-instruction-unwrapped-marker', text: [
+      '❯ 接続テスト', '', '  応答の最後の独立行に、次のrequest',
+      '  markerをそのまま記載してください。',
+      '  REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF',
+      '⏺ 接続確認成功',
+      '  REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF',
+      '✻ Baked for 2s · done 17:21', '────', '❯', '────',
     ].join('\n') }]
 
   test.each(replayCaptures)('保存済みClaude回答を取得・保存・完了判定・再起動後再利用まで通す $name', async capture => {
@@ -3109,6 +3116,7 @@ print('review complete')
       expect(recovered.payload).toMatchObject({
         complete: false,
         recoveredAfterInterruption: true,
+        claude: { failure: { advisor: 'claude', cause: 'interrupted' } },
         slotSummary: {
           total: 5,
           started: 2,
@@ -3120,6 +3128,47 @@ print('review complete')
       await fixture.close()
     }
   }, 15_000)
+
+  test('送達済みClaudeの中断原因を復旧後も保持し再送しない', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const nativeResponse = `solution response\n${nativeAdvisorMarker(fixture.nonce,
+        fixture.revisionTwo.revision, fixture.revisionTwo.digest, 'investigation', 1, 'solution')}`
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo,
+        { version: 9, nativeResponse, persistClaudeOutcome: false })
+      persistAdvisorClaudeCleanupOutcome(fixture.state, {
+        jobId: fixture.jobId, attemptNonce: fixture.nonce,
+        inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
+        inputDigestPrefix: fixture.revisionTwo.digest.slice(0, 16), phase: 'investigation', round: 1,
+        workspaceCreationAttempted: true, freshEphemeral: true, cleanupVerified: true,
+        cleanupStatus: 'closed-and-verified', cleanupReceiptDigest: 'c'.repeat(64),
+        promptMayHaveBeenDelivered: true,
+      })
+      expect(finalizeRetiredAdvisorRounds(fixture.state)).toEqual({ finalized: 1 })
+      const recovered = await fixture.call('investigation', 'revision-two')
+      expect(recovered.payload).toMatchObject({ claude: {
+        promptMayHaveBeenDelivered: true, failure: { advisor: 'claude', cause: 'interrupted' },
+      } })
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+      journal.startedAt -= 31_000
+      journal.finishedAt -= 31_000
+      const raw = JSON.stringify(journal)
+      writeFileSync(armed.journalPath, raw, { mode: 0o600 })
+      const receiptPath = join(fixture.state, 'advisor-retirement', fixture.jobId, fixture.nonce, `${fixture.nonce}.json`)
+      const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'))
+      receipt.terminalJournalDigest = createHash('sha256').update(raw).digest('hex')
+      writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 })
+      const retried = await fixture.call('investigation', 'revision-two', 'adopted', 1,
+        { retryUnavailable: true, inputUpdateIsRecoveryOnly: true })
+      expect(retried.payload.claude).toMatchObject({
+        promptMayHaveBeenDelivered: true, failure: { advisor: 'claude', cause: 'interrupted' },
+      })
+      expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(0)
+      await fixture.restart()
+      const polled = await fixture.call('investigation', 'revision-two')
+      expect(polled.payload.claude).toMatchObject({ failure: { advisor: 'claude', cause: 'interrupted' } })
+    } finally { await fixture.close() }
+  }, 20_000)
 
   test('Claudeは末尾が完全一致の空promptだけreadyと判定する', () => {
     expect(emptyClaudePrompt('previous output\n❯\n')).toBe(true)
@@ -3231,7 +3280,7 @@ print('review complete')
     }
   })
 
-  test('Claude 2.1.247の実測狭幅prompt echoだけを固定envelopeとして採択する', () => {
+  test('実測狭幅prompt echoはinstructionとmarkerの折返しを独立して採択する', () => {
     const marker = 'REQUEST_MARKER=3CC556E85A172CDBDF0101C7C293A2F6'
     const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
     const instructionHead = '応答の最後の独立行に、次のrequest'
@@ -3282,10 +3331,10 @@ print('review complete')
 
     expect(extractCompleteClaudeResponse(envelope({
       prompt: [instructionHead, instructionTail, marker],
-    }), marker)).toBeNull()
+    }), marker)).toBe(response)
     expect(extractCompleteClaudeResponse(envelope({
       prompt: [instruction, markerHead, markerTail],
-    }), marker)).toBeNull()
+    }), marker)).toBe(response)
     expect(extractCompleteClaudeResponse(envelope({
       final: [markerHead, markerTail],
     }), marker)).toBeNull()

@@ -4,6 +4,25 @@ import { join, relative, sep } from 'path'
 import { ensureManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
+import type { AdvisorFailure } from './advisor-availability.ts'
+
+const STARTUP_CODES = ['prohibited-ui', 'trust-confirmation-failed', 'effort-confirmation-failed',
+  'trust-confirmation-timeout', 'readiness-timeout', 'identity-check-failed', 'startup-failed'] as const
+export type ClaudeFailureDiagnostic = {
+  stage: 'startup' | 'send' | 'acquisition'
+  cause: AdvisorFailure['cause']
+  startupCode?: typeof STARTUP_CODES[number]
+}
+
+export function parseClaudeStartupDiagnostic(stdout: string): ClaudeFailureDiagnostic['startupCode'] {
+  for (const line of stdout.split('\n')) {
+    try {
+      const value = JSON.parse(line)
+      if (value?.status === 'ephemeral-claude-startup-failed' && STARTUP_CODES.includes(value.code)) return value.code
+    } catch { /* Other helper records are not startup diagnostics. */ }
+  }
+  return undefined
+}
 
 export const MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES = 64 * 1024
 export const MAX_CLAUDE_DIAGNOSTIC_FILE_BYTES = 512 * 1024
@@ -71,6 +90,7 @@ export function saveClaudeResponseDiagnostic(options: {
   transcriptReadIndex?: number
   phase?: string
   round?: number
+  failure?: ClaudeFailureDiagnostic
 }): ClaudeDiagnosticReceipt {
   try {
     if (!/^[a-f0-9]{32}$/.test(options.attempt)) return { status: 'unavailable' }
@@ -105,6 +125,7 @@ export function saveClaudeResponseDiagnostic(options: {
       scope: 'bounded-terminal-snapshot-not-full-session',
       phase: options.phase,
       round: options.round,
+      failure: options.failure,
       reads: options.reads.slice(-3),
       transcript: {
         available: options.transcript !== undefined,

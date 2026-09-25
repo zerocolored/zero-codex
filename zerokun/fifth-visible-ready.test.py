@@ -104,6 +104,49 @@ class VisibleReadyTests(unittest.TestCase):
             self.m['_settle_visible_ready']('owned', {'project_root': '/tmp/project'})
         self.assertEqual(len(self.keys), 1)
 
+    def test_current_unnumbered_trust_moves_once_then_rechecks_before_enter(self):
+        exit_selected = ('Accessing workspace:\n\n/tmp/pro\nject\n\nQuick safety check\n'
+                         '❯ No, exit\n  Yes, I trust this folder\n\nEnter to confirm · Esc to cancel')
+        trust_selected = exit_selected.replace('❯ No, exit', '  No, exit').replace('  Yes,', '❯ Yes,')
+        blocked = {'state_change_seq': 1, 'agent_status': 'blocked', 'launch_pending': True}
+        ready = {'state_change_seq': 3, 'agent_status': 'idle', 'interactive_ready': True}
+        frames = iter([blocked] * 4 + [dict(blocked, state_change_seq=2)] * 4 + [ready] * 2)
+        screens = iter([exit_selected] * 4 + [trust_selected] * 4 + ['❯'] * 2)
+        self.g['_agent_information'] = lambda _: ({}, next(frames))
+        self.g['_read_visible'] = lambda _: next(screens)
+        self.m['_settle_visible_ready']('owned', {'project_root': '/tmp/project'})
+        self.assertEqual(self.keys, [['agent', 'send-keys', 'owned', 'Down'],
+                                     ['agent', 'send-keys', 'owned', 'Enter']])
+
+    def test_trust_selection_key_is_not_repeated_if_screen_does_not_change(self):
+        screen = ('Accessing workspace:\n/tmp/project\nExplanation\n'
+                  'Yes, I trust this folder\n❯ No, exit\nEnter to confirm · Esc to cancel')
+        self.g['_agent_information'] = lambda _: ({}, {'state_change_seq': 1, 'agent_status': 'blocked', 'launch_pending': True})
+        self.g['_read_visible'] = lambda _: screen
+        with self.assertRaisesRegex(self.m['UnsafeRequest'], 'trust-exit'):
+            self.m['_settle_visible_ready']('owned', {'project_root': '/tmp/project'})
+        self.assertEqual(self.keys, [['agent', 'send-keys', 'owned', 'Up']])
+
+    def test_new_trust_rejects_foreign_path_or_additional_choice(self):
+        screen = ('Accessing workspace:\n/tmp/project\nExplanation\n'
+                  '❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel')
+        for bad in [screen.replace('/tmp/project', '/tmp/foreign'),
+                    screen.replace('Explanation', 'Enter password'),
+                    screen.replace('Yes, I trust this folder', 'Yes, I trust this folder\nContinue')]:
+            self.assertIsNone(self.m['_trust_screen_choice'](bad, '/tmp/project'))
+
+    def test_harmless_changing_banner_does_not_prevent_ready(self):
+        screens = iter(['Update check 1\n❯', 'Update check 2\n❯'])
+        self.g['_read_visible'] = lambda _: next(screens)
+        self.m['_settle_visible_ready']('owned', {})
+        self.assertEqual(self.keys, [])
+
+    def test_startup_diagnostic_is_fixed_code_without_error_payload(self):
+        classify = self.m['_startup_failure_code']
+        self.assertEqual(classify(Exception('ephemeral Claude visible ready prompt did not settle (trust-exit)')), 'trust-confirmation-timeout')
+        self.assertEqual(classify(Exception('ephemeral Claude has a prohibited startup UI')), 'prohibited-ui')
+        self.assertEqual(classify(Exception('private arbitrary error payload')), 'startup-failed')
+
 
 if __name__ == '__main__':
     unittest.main()
