@@ -6,7 +6,7 @@ Slack Appの表示名はセットアップ時に自由に設定できます。Sl
 
 ## 全員の稼働状況
 
-[稼働状況ページ](https://zerochan-fleet.s-hashimoto-dcd.workers.dev)では、共通パスワードで各PC・アプリの受付状況、作業要約、最終受付・通信時刻を確認できます。閲覧専用で、生ログやフルパスは送信しません。登録・公開・検証手順は [docs/fleet-dashboard.md](docs/fleet-dashboard.md)、送信設定の確認は `zerochan fleet status` です。
+[稼働状況ページ](https://zerochan-fleet.s-hashimoto-dcd.workers.dev)では、共通パスワードで各PC・アプリの受付状況、作業要約、最終受付・通信時刻を確認できます。クラウド認証済みPCのアプリは起動時に自動登録します。閲覧専用で、生ログやフルパスは送信しません。登録・公開・検証手順は [docs/fleet-dashboard.md](docs/fleet-dashboard.md)、送信設定の確認は `zerochan fleet status` です。
 
 ## 仕組み
 

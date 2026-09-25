@@ -101,7 +101,7 @@ export class CloudHandoffClient {
     return handoffSchema.parse(await response.json())
   }
   /** Monitoring has separate RPC grants and never touches handoff records. */
-  async fleetRpc(name: 'begin' | 'report', args: Record<string, unknown>): Promise<unknown> {
+  async fleetRpc(name: 'context' | 'register' | 'begin' | 'report', args: Record<string, unknown>): Promise<unknown> {
     const config = await this.credentials()
     const response = await this.fetcher(`${config.url}/rest/v1/rpc/zerochan_fleet_${name}`, {
       method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
