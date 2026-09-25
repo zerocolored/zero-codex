@@ -25,7 +25,7 @@ function runtimeLogBelongsToJob(name: string, jobId: string): boolean {
   if (name === `${jobId}.stdout.log` || name === `${jobId}.stderr.log`) return true
   if (!name.startsWith(`${jobId}.`)) return false
   const phase = name.slice(jobId.length + 1)
-  return /^(?:new|resume|\d+-(?:prepare|implementation|review-[123]))\.(?:stdout|stderr)\.log$/.test(phase)
+  return /^(?:new|resume|\d+-(?:prepare|implementation|review-[123]))\.(?:stdout|stderr)\.log(?:\.tail-(?:0|1)\.log|\.tail\.json)?$/.test(phase)
 }
 
 function stateChild(root: string, candidate: string): string {
