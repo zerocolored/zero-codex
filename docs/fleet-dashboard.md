@@ -24,7 +24,15 @@
 
 パスワード変更時は、管理者が同じtransactionでpassword_hashを更新し、そのspaceの `zerochan_fleet_sessions` を削除する。7日セッションを即失効できる。ログイン試行はIPのHMACごとに15分10回まで。生IPはDBへ保存しない。
 
-## 各PC・アプリの登録
+## 起動時の自動登録
+
+`202609250002_fleet_auto_registration.sql` を適用した対応版では、Slack接続後に自動登録する。アプリごとのDB INSERTや `fleet register` は不要。既存の登録ID・表示名はそのまま使い、新しいアプリはSlack認証で得たBot名を初期表示名にする。PC名はOSユーザー名・hostnameではなく `Mac/PC + ランダムIDの先頭`。起動プロジェクトは従来どおりbasenameだけを送る。
+
+各PCに一度、クラウド認証が必要。起動アプリ自身の認証を優先し、なければ同PCの登録済みアプリが持つ認証を共有する（tokenのコピーはしない）。認証の許可済みSlack workspaceと監視spaceをDBで照合し、異なるspace候補が複数なら勝手に選ばない。既存監視登録の認証はmigrationで監視専用の送信権限へ移行する。新しいPCの認証には監視専用 `zerochan_fleet_senders` または既存の有効なクラウドmemberが必要。監視から引き継ぎ権限を追加することはない。
+
+認証未設定・通信断ではジョブ処理を止めず、同じgateway内で上限付きbackoffにより再試行する。後から認証が整えば再起動なしで登録できる。同一PC・workspace・アプリは同じ行、別PCは別行になる。管理者が無効化した行と `zerochan fleet off` は自動で復活させない。
+
+## 既存の手動登録（互換用）
 
 1. 対応版へ `zerochan update`。対象プロジェクトで `zerochan fleet identity` を実行し、このPCのランダムinstallation IDを取得する。PC名・OSユーザー名を識別子にしない。
 2. このPCのいずれかのアプリで `zerochan cloud login` 済みなら、その認証を使える。未設定なら同コマンドでPC専用Authを設定する。監視だけなら `cloud activate` は不要。監視登録は引き継ぎ有効化を変更しない。
@@ -34,7 +42,7 @@
 
 設定は各アプリのprivate state内 `fleet.json`。projectLabelは省略すると起動プロジェクトのbasename。必要な場合だけ任意の短い表示名を設定する。フルパスは送らない。installation IDのファイルはPCごとに作られるので他PCへコピーしない。
 
-`zerochan fleet off` で送信設定を退避する。稼働中の送信停止は作業終了後の再起動で反映。DBの登録は消えず、90秒後に状態不明になる。完全に一覧から除外するときは管理者が該当instanceのenabledをfalseにする。
+`zerochan fleet off` で送信設定を退避し、未登録の場合も無効化を記録する。稼働中の送信は次の送信確認から停止する（送信済みリクエストは取り消さない）。DBの登録は消えず、90秒後に状態不明になる。完全に一覧から除外するときは管理者が該当instanceのenabledをfalseにする。
 
 ## 検証
 
@@ -52,7 +60,9 @@ SQL契約は**専用の空ローカルDBのみ**で実行する（bootstrapを�
 psql -d <専用テストDB> -v ON_ERROR_STOP=1 \
   -f supabase/tests/fleet-bootstrap.sql \
   -f supabase/migrations/202609250001_fleet.sql \
-  -f supabase/tests/fleet.sql
+  -f supabase/migrations/202609250002_fleet_auto_registration.sql \
+  -f supabase/tests/fleet.sql \
+  -f supabase/tests/fleet-auto.sql
 ```
 
 匿名閲覧・閲覧者書込・別送信者なりすまし・送信順逆転・再起動前の送信を拒否し、ログイン／失効／試行制限を検証する。実機では送信中のアプリ、Slack切断、runner停止、Web通信断、スリープ復帰、複数PCを別途確認する。

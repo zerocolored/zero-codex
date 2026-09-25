@@ -1,7 +1,7 @@
-import { existsSync, renameSync } from 'fs'
+import { existsSync, renameSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import { listRegisteredSlackApps } from './slack-app-registry.ts'
-import { fleetAuthPath, fleetInstallationId, registrationSchema } from './fleet-runtime.ts'
+import { fleetAuthPath, fleetInstallationId, fleetIsOff, registrationSchema } from './fleet-runtime.ts'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import { CloudHandoffClient, readCloudConfig } from './cloud-handoff.ts'
 
@@ -12,15 +12,17 @@ export async function configureFleet(command: string, state: string, args: strin
     return
   }
   if (command === 'status' && !args.length) {
+    if (fleetIsOff(state)) { console.log('稼働状況の送信: 無効'); return }
     const raw = readOptionalBoundedOwnerOnlyRegularFile(path, 4096)
-    if (!raw) { console.log('稼働状況の送信: 未設定'); return }
+    if (!raw) { console.log('稼働状況の送信: 起動時に自動登録（このPCのクラウド認証を使用）'); return }
     const config = registrationSchema.parse(JSON.parse(raw))
     console.log(`稼働状況の送信: 設定済み\nSlack App: ${config.appId}\nInstance: ${config.instanceId}\nPC identity: ${config.installationId === fleetInstallationId() ? '一致' : '別PCの設定・再登録が必要'}`)
     return
   }
   if (command === 'off' && !args.length) {
+    atomicWritePrivateFile(join(state, 'fleet.off.json'), '{}\n')
     if (existsSync(path)) renameSync(path, join(state, 'fleet.disabled.json'))
-    console.log('送信を無効にしました。稼働中の場合は作業終了後の再起動で反映されます。')
+    console.log('送信を無効にしました。稼働中の監視送信は次回の送信確認から停止します。')
     return
   }
   if (command === 'register' && args.length === 2) {
@@ -32,6 +34,7 @@ export async function configureFleet(command: string, state: string, args: strin
     // Read-only authentication check. Do not start a generation while another sender is running.
     await new CloudHandoffClient(auth, fetch, authPath).authenticatedUserId()
     atomicWritePrivateFile(path, JSON.stringify(config) + '\n')
+    if (existsSync(join(state, 'fleet.off.json'))) unlinkSync(join(state, 'fleet.off.json'))
     console.log('稼働状況の送信を登録しました。管理者のDB登録と、作業終了後の再起動で有効になります。クラウド引き継ぎの有効・無効は変更していません。')
     return
   }
