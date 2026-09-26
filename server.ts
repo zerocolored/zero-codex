@@ -1183,9 +1183,10 @@ async function drainFleetQueries(): Promise<void> {
     for(const query of jobStore.pendingFleetQueries()) {
       let answer=unavailableFleet
       let expiresAt=Date.now()+30000
-      if(query.projectKey) {
+      const queryProject=fleetProject(query.repoPath)?.key
+      if(queryProject) {
         try {
-          const data=await readProjectFleet(STATE_DIR,query.projectKey)
+          const data=await readProjectFleet(STATE_DIR,queryProject)
           if(shuttingDown)return
           const received=Date.now(),serverNow=fleetCloudTime(data)
           const deadlines=data.instances.filter(r=>r.receivedAt && serverNow-Date.parse(r.receivedAt)<90000)
@@ -2832,7 +2833,7 @@ try {
   // generation-bound readiness record are both established.
   clearIntentionalServiceStop(STATE_DIR)
   fleetReporter = startConfiguredFleet(STATE_DIR, identity.appId, connectedProjectDir,
-    () => jobStore.fleetFacts(Date.now(), connectedProjectDir), () => slackSocket?.connected === true,
+    () => jobStore.fleetFolderFacts(Date.now(), connectedProjectDir), () => slackSocket?.connected === true,
     { teamId: identity.teamId, name: identity.botName, botToken: BOT_TOKEN })
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 

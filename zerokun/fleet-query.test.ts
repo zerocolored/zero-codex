@@ -7,7 +7,7 @@ import {JobStore,SlackNotifier} from './job-runner.ts'
 import {answerFleetStatus,readProjectFleet,fleetReplyEnvelope,fleetReplyForDelivery,type FleetCloudResult} from './fleet-query.ts'
 import {fleetProject} from './fleet-project.ts'
 import {createWorker} from '../fleet-web/worker.ts'
-const key='a'.repeat(64), other='b'.repeat(64), id='10000000-0000-4000-8000-000000000001'
+const key='BSB', other='Other', id='10000000-0000-4000-8000-000000000001'
 const now=new Date().toISOString()
 const snap={state:'available' as const,project:'ignored display',queued:0,summary:null,summaryAt:null,lastAcceptedAt:null,slackConnected:true,runnerHealthy:true}
 const cloud: FleetCloudResult={status:200,projectKey:key,projectName:'BSB',serverTime:now,instances:[{id,appId:'ATEST',name:'2号',receivedAt:now,snapshot:snap}]}
@@ -31,15 +31,12 @@ test('credentialed cloud query cannot accept another project or follow redirects
   await expect(readProjectFleet(root,key,fetcher)).rejects.toThrow('project mismatch')
  }finally{rmSync(root,{recursive:true,force:true})}
 })
-test('project identity unifies clones, distinguishes same basename, refuses missing/credentialed origins',()=>{
- const root=mkdtempSync(join(tmpdir(),'fleet-identity-'))
- try{
-  const git=(...args:string[])=>{const r=Bun.spawnSync(['git','-C',root,...args]);expect(r.exitCode).toBe(0)}
-  git('init','-q');git('remote','add','origin','https://github.com/acme/BSB.git');const a=fleetProject(root)!
-  git('remote','set-url','origin','git@github.com:acme/BSB.git');expect(fleetProject(root)?.key).toBe(a.key)
-  git('remote','set-url','origin','https://github.com/other/BSB.git');expect(fleetProject(root)?.key).not.toBe(a.key)
-  git('remote','set-url','origin','https://secret@github.com/acme/BSB.git');expect(fleetProject(root)).toBeNull()
- }finally{rmSync(root,{recursive:true,force:true})}
+test('folder names group different clones and non-Git paths without registration',()=>{
+ expect(fleetProject('/pc-one/BSB')).toEqual({key:'BSB',label:'BSB'})
+ expect(fleetProject('/pc-two/BSB/')).toEqual(fleetProject('/pc-one/BSB'))
+ expect(fleetProject('/pc-two/Other')?.key).not.toBe('BSB')
+ expect(fleetProject('/pc/e\u0301')).toEqual(fleetProject('/else/é'))
+ expect(fleetProject('/')).toBeNull()
 })
 test('status route is durable, bypasses active job, and stages exactly one normal outbox reply',()=>{
  const root=mkdtempSync(join(tmpdir(),'fleet-route-')),db=join(root,'jobs.sqlite3');let store=new JobStore(db)
@@ -114,4 +111,30 @@ test('transport latency is conservatively included before rendering availability
  const delayed={...cloud,requestDurationMs:20000,observedAt:performance.now(),instances:[{...cloud.instances[0]!,receivedAt:new Date(Date.parse(now)-80000).toISOString()}]}
  const answer=await answerFleetStatus(delayed,validModel)
  expect(answer).not.toContain('受付可能');expect(answer).toContain('状態不明')
+})
+
+test('current folder facts and summary follow the same live job, and disappear on completion',()=>{
+ const root=mkdtempSync(join(tmpdir(),'fleet-current-')),path=join(root,'jobs.sqlite3'),store=new JobStore(path)
+ try{
+  const {job}=store.enqueue({chatId:'CTEST',threadTs:'100.1',messageId:'100.1',userId:'UTEST',repoPath:'/pc/Other',task:'PRIVATE'})
+  const db=new Database(path);db.run("UPDATE jobs SET status='running',attempts=1 WHERE id=?",[job.id])
+  db.run("INSERT INTO commentary_notifications(id,source_key,job_id,attempt,payload,created_at,delivered_at) VALUES('current','current',?,1,'Other task milestone',1,1)",[job.id])
+  const facts=store.fleetFolderFacts(Date.now(),'/pc/BSB')
+  expect(facts.currentProject).toBe('Other');expect(facts.running).toBe(1);expect(facts.summary).toBe('Other task milestone')
+  db.run("UPDATE jobs SET status='completed' WHERE id=?",[job.id]);db.close()
+  const idle=store.fleetFolderFacts(Date.now(),'/pc/BSB')
+  expect(idle.currentProject).toBeNull();expect(idle.summary).toBeNull();expect(idle.running).toBe(0)
+ }finally{store.close();rmSync(root,{recursive:true,force:true})}
+})
+
+test('unrepresentable current folder never publishes its details under the startup name',()=>{
+ const root=mkdtempSync(join(tmpdir(),'fleet-invalid-current-')),path=join(root,'jobs.sqlite3'),store=new JobStore(path)
+ try{
+  const {job}=store.enqueue({chatId:'CTEST',threadTs:'100.1',messageId:'100.1',userId:'UTEST',repoPath:'/pc/'+ 'x'.repeat(101),task:'PRIVATE'})
+  const db=new Database(path);db.run("UPDATE jobs SET status='running',attempts=1 WHERE id=?",[job.id])
+  db.run("INSERT INTO commentary_notifications(id,source_key,job_id,attempt,payload,created_at,delivered_at) VALUES('unknown','unknown',?,1,'PRIVATE OTHER',1,1)",[job.id]);db.close()
+  const facts=store.fleetFolderFacts(Date.now(),'/pc/BSB')
+  expect(facts.currentProject).toBeNull();expect(facts.occupiedElsewhere).toBe(true);expect(facts.running).toBe(0)
+  expect(facts.summary).toBeNull();expect(facts.queued).toBe(0);expect(facts.lastAcceptedAt).toBeNull();expect(facts.summaryAt).toBeNull()
+ }finally{store.close();rmSync(root,{recursive:true,force:true})}
 })

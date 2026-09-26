@@ -5,7 +5,7 @@ import { FLEET_SENDER_ORIGIN } from './fleet-sender.ts'
 import { runIsolatedCodexJson } from './slack-thread-intent.ts'
 
 export type FleetRoute = 'work' | 'fleet-status'
-export const unavailableFleet = 'このプロジェクトのクラウド上の稼働状況を確認できませんでした。所属未登録または接続障害の可能性があります。ローカルの状態からは推測していません。'
+export const unavailableFleet = 'このプロジェクトのクラウド上の稼働状況を確認できませんでした。報告がまだ届いていないか、接続障害の可能性があります。ローカルの状態からは推測していません。'
 export async function classifyFleetRequest(input: string, context: string): Promise<FleetRoute> {
   const schema = { type: 'object', additionalProperties: false, required: ['route'],
     properties: { route: { type: 'string', enum: ['work', 'fleet-status'] } } }
@@ -25,7 +25,7 @@ Latest message: ${JSON.stringify(input.slice(0,16000))}`
 const snapshot = z.object({state:z.enum(['available','busy','limited','waiting','unknown']), project:z.string().max(100),
   queued:z.number().int().nonnegative(),summary:z.string().max(700).nullable(),summaryAt:z.number().nullable(),
   lastAcceptedAt:z.number().nullable(),slackConnected:z.boolean(),runnerHealthy:z.boolean()}).strict()
-const resultSchema = z.object({status:z.literal(200),projectKey:z.string().regex(/^[a-f0-9]{64}$/),
+const resultSchema = z.object({status:z.literal(200),projectKey:z.string().min(1).max(100),
   projectName:z.string().min(1).max(100),serverTime:z.string().datetime({offset:true}),instances:z.array(z.object({
     id:z.string().uuid(),appId:z.string(),name:z.string().max(100),receivedAt:z.string().datetime({offset:true}).nullable(),
     snapshot:snapshot.nullable(),
@@ -77,7 +77,7 @@ ${JSON.stringify(rows)}`,schema,{independent:true}))
   const escape=(s:string)=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]!)).replace(/[\r\n]/g,' ')
   const labels={available:'受付可能',busy:'作業中',limited:'利用上限で待機',waiting:'開始待ち',unknown:'状態不明'}
   const lines=order.map(i=>{const r=rows[i]!;return `・${escape(r.name)}：${labels[r.state]}${r.summary?` — ${escape(r.summary)}`:r.state==='busy'?'（作業要約は未取得）':''}`})
-  return `${escape(data.projectName)}の状況です。\n${lines.length?lines.join('\n'):'このプロジェクトの報告はまだありません。'}\n確認時刻：${data.serverTime}\nクラウドに所属登録・報告済みの範囲です。状態不明は空きと判断していません。`
+  return `${escape(data.projectName)}の状況です。\n${lines.length?lines.join('\n'):'このプロジェクトの報告はまだありません。'}\n確認時刻：${data.serverTime}\n同じフォルダ名のクラウド報告をもとにしています。状態不明は空きと判断していません。`
 }
 
 export function fleetReplyEnvelope(text: string, expiresAt: number): string {

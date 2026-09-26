@@ -134,14 +134,16 @@ export function startConfiguredFleet(state: string, appId: string, project: stri
           runnerHealthy = Number.isFinite(pulse.at) && Date.now() - pulse.at >= 0 && Date.now() - pulse.at < 35_000
           paused = pulse.paused !== false
         } catch {}
-        return projectFleetStatus(facts(), { project: config?.projectLabel ?? basename(project),
-          slackConnected: connected(), runnerHealthy, paused })
+        const currentFacts=facts()
+        return {...projectFleetStatus(currentFacts, { project: scopedProject?.label ?? basename(project),
+          slackConnected: connected(), runnerHealthy, paused }),currentProject:currentFacts.currentProject??null}
       },
       send: async (generation, sequence, snapshot) => {
         if (fleetIsOff(state)) return
         if (!config) throw new Error('monitoring registration pending')
         if (sender) { await sender.send(generation, sequence, snapshot, scopedProject?.key); return }
-        const result = await client().fleetRpc('report', { p_id: config.instanceId, p_generation: generation, p_sequence: sequence, p_snapshot: snapshot })
+        const {currentProject,...publicSnapshot}=snapshot
+        const result = await client().fleetRpc('report', { p_id: config.instanceId, p_generation: generation, p_sequence: sequence, p_snapshot: publicSnapshot })
         if (result !== true) throw new Error('stale monitoring generation')
       },
     })

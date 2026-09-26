@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
 import { fleetReplyForDelivery } from './fleet-query.ts'
@@ -6573,8 +6574,8 @@ export class JobStore {
     }).immediate())
   }
 
-  pendingFleetQueries(): Array<{key:string;projectKey:string|null}> {
-    return this.db.query<{key:string;projectKey:string|null},[]>(`SELECT idempotency_key AS key, project_key AS projectKey FROM fleet_queries WHERE route='fleet-status' AND completed_at IS NULL ORDER BY created_at LIMIT 1`).all()
+  pendingFleetQueries(): Array<{key:string;projectKey:string|null;repoPath:string}> {
+    return this.db.query<{key:string;projectKey:string|null;repoPath:string},[]>(`SELECT idempotency_key AS key, project_key AS projectKey, repo_path AS repoPath FROM fleet_queries WHERE route='fleet-status' AND completed_at IS NULL ORDER BY created_at LIMIT 1`).all()
   }
 
   completeFleetQuery(key:string, payload:string): void {
@@ -9043,6 +9044,18 @@ export class JobStore {
       counts[row.status] = row.count
       return counts
     }, { queued: 0, running: 0 })
+  }
+
+  /** Current folder and details come from the same live job; otherwise use the startup folder. */
+  fleetFolderFacts(now: number, startup: string): FleetLocalFacts {
+    const current=this.db.query<{repo_path:string},[]>(
+      `SELECT repo_path FROM jobs WHERE runtime='codex' AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
+       ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, seq LIMIT 1`,
+    ).get()
+    const currentProject=current?fleetProject(current.repo_path)?.key??null:null
+    if(current && !currentProject) return {currentProject:null,running:0,queued:0,limited:false,approval:false,deferred:false,
+      occupiedElsewhere:true,lastAcceptedAt:null,summary:null,summaryAt:null}
+    return {...this.fleetFacts(now,current?.repo_path??startup),currentProject}
   }
 
   /** Small public projection: never select task/result/raw logs for monitoring. */

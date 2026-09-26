@@ -56,9 +56,10 @@ export async function senderRequest(request: Request, env: SenderEnv, rpc: Rpc, 
   if (!/^Bearer [a-f0-9]{64}$/.test(auth) || !uuid(input.instanceId)) return reply(401, 'sender_auth_required')
   const common = { p_id: input.instanceId, p_token: auth.slice(7) }
   if (action.startsWith('project-')) {
-    if (typeof input.projectKey !== 'string' || !/^[a-f0-9]{64}$/.test(input.projectKey)) return reply(400, 'invalid_project')
+    if (typeof input.projectKey !== 'string' || !input.projectKey.length || input.projectKey.length>100 || /[\\/\x00-\x1f\x7f]/.test(input.projectKey)) return reply(400, 'invalid_project')
+    if (action==='project-report' && input.currentProject!=null && (typeof input.currentProject!=='string' || !input.currentProject.length || input.currentProject.length>100 || /[\\/\x00-\x1f\x7f]/.test(input.currentProject))) return reply(400,'invalid_project')
     const result = await rpc(action === 'project-status' ? 'project_status' : 'project_report', { ...common, p_project: input.projectKey,
-      ...(action === 'project-report' ? {p_generation:input.generation,p_sequence:input.sequence,p_snapshot:input.snapshot} : {}) })
+      ...(action === 'project-report' ? {p_generation:input.generation,p_sequence:input.sequence,p_snapshot:input.snapshot,p_current:input.currentProject??null} : {}) })
     if (result?.status !== 200) return reply([400,401,403,409].includes(result?.status) ? result.status : 503, 'project_unavailable')
     return Response.json(result, {headers:{'Cache-Control':'no-store'}})
   }

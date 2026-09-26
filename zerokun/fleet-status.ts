@@ -2,6 +2,7 @@
 export type FleetState = 'available' | 'busy' | 'limited' | 'waiting' | 'unknown'
 export class FleetSessionExpired extends Error {}
 export interface FleetSnapshot {
+  currentProject?: string | null
   state: FleetState
   project: string
   queued: number
@@ -12,6 +13,7 @@ export interface FleetSnapshot {
   runnerHealthy: boolean
 }
 export interface FleetLocalFacts {
+  currentProject?: string | null
   occupiedElsewhere?: boolean
   running: number; queued: number; limited: boolean; approval: boolean; deferred: boolean
   lastAcceptedAt: number | null; summary: string | null; summaryAt: number | null
