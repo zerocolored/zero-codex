@@ -1,6 +1,7 @@
 import { UTS39_ASCII_SKELETON_GROUPS } from './uts39-ascii-skeleton'
 
 const CREDENTIAL_PATTERN_SOURCES = [
+  String.raw`sktsec_[A-Za-z0-9_\-]{12,}`,
   String.raw`xox[a-z]-[A-Za-z0-9._-]{12,}`,
   String.raw`xapp-[A-Za-z0-9._-]{12,}`,
   String.raw`sk-[A-Za-z0-9_-]{20,}`,

@@ -1,6 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 import { fleetProject } from './zerokun/fleet-project.ts'
-import { classifyFleetRequest, readProjectFleet, fleetCloudTime, answerFleetStatus, unavailableFleet, fleetReplyEnvelope } from './zerokun/fleet-query.ts'
+import { classifyFleetRequest, separateSecurityWorkflow, readProjectFleet, fleetCloudTime, answerFleetStatus, unavailableFleet, fleetReplyEnvelope } from './zerokun/fleet-query.ts'
 /**
  * Standalone Slack gateway for Codex.
  *
@@ -1221,7 +1221,7 @@ async function drainInboundDeliveries(): Promise<void> {
               download.controller.signal,
             )
             // Classify before steering an active job or downloading attachments. Controls retain their old path.
-            if (!inbound.fileIds.length && !handoffControl(inbound.text) && !isExplicitUpdateRequest(inbound.text)) {
+            if (!handoffControl(inbound.text) && !isExplicitUpdateRequest(inbound.text)) {
               let route=jobStore.fleetQueryRoute(inbound.idempotencyKey)
               if(!route) {
                 const context=jobStore.getSlackThreadReplyIntent(inbound.idempotencyKey)?.snapshotJson
@@ -1248,7 +1248,13 @@ async function drainInboundDeliveries(): Promise<void> {
         // makes host paths indistinguishable from user-authored text later.
         const taskFor = () => inbound.text.trim() || '(添付ファイルを確認してください)'
         const task = taskFor()
-        const target = inbound.expectedControlJobId !== null
+        const auditRequest = jobStore.fleetQueryRoute(inbound.idempotencyKey) === 'security-audit'
+        const auditTarget = inbound.expectedControlJobId
+          ? jobStore.get(inbound.expectedControlJobId)?.workflow === 'security-audit'
+          : jobStore.get(jobStore.liveControlTarget(inbound.chatId,inbound.threadTs)?.jobId ?? '')?.workflow === 'security-audit'
+        // Audit inputs never steer development, and a later fix never steers an audit.
+        const separateWorkflow = separateSecurityWorkflow(auditRequest?'security-audit':'work',auditTarget?'security-audit':undefined,interrupt)
+        const target = separateWorkflow ? null : inbound.expectedControlJobId !== null
           && inbound.expectedControlEpoch !== null
           ? {
               jobId: inbound.expectedControlJobId,
@@ -1302,7 +1308,7 @@ async function drainInboundDeliveries(): Promise<void> {
         // A reply admitted through active-thread authority belongs only to the
         // exact job/epoch persisted with it. Never reinterpret it as a sibling
         // FIFO job after cancellation or another terminal race.
-        if (inbound.expectedControlJobId !== null) {
+        if (inbound.expectedControlJobId !== null && !separateWorkflow) {
           jobStore.tombstoneInboundDelivery(inbound.idempotencyKey, {
             kind: 'closed-control',
             payload: 'この返信を反映する前に現在の処理が終了しました。必要なら新しい依頼として送ってください。',
@@ -1321,6 +1327,7 @@ async function drainInboundDeliveries(): Promise<void> {
           continue
         }
         jobStore.enqueue({
+          workflow: auditRequest ? 'security-audit' : 'work',
           chatId: inbound.chatId,
           threadTs: inbound.threadTs,
           messageId: inbound.messageId,
