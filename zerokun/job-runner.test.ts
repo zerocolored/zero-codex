@@ -10109,6 +10109,30 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     store.close()
   })
 
+  test('IAM修復はwrite主体の明示承認範囲だけを許可し、認証とread-only境界を維持する', () => {
+    const store = makeStore()
+    const repo = fixtureDir('zerokun-iam-policy-')
+    git(['init', '-q'], repo)
+    store.enqueue(input({ repoPath: repo, writeEnabled: true }))
+    const job = store.claimNext('iam-policy-worker')!
+    const write = buildCodexDeveloperInstructions(job, '/tmp/job-outbox', false, 'a'.repeat(32))
+    const read = buildCodexDeveloperInstructions(
+      { ...job, writeEnabled: false }, '/tmp/job-outbox', false, 'a'.repeat(32),
+    )
+    expect(write).toContain('IAM repair is permitted when the current authorized user task explicitly approves')
+    expect(write).toContain('target resource, existing grantee principal, and exact permission or role')
+    expect(write).toContain('do not authorize privilege expansion')
+    expect(write).toContain('Honor an already received explicit approval for that exact repair')
+    expect(write).toContain('etag-aware updates, not a blind policy replacement')
+    expect(write).toContain('additional access beyond the approved scope')
+    expect(write).toContain('permission to repair IAM alone does not authorize those side effects')
+    expect(write).toContain('credential files or tokens, change accounts, run login, or create credential keys')
+    expect(write).toContain('prior assistant claim that all IAM changes are forbidden is not a current policy rule')
+    expect(write).not.toContain('change IAM to bypass a denial')
+    expect(read).not.toContain('IAM repair is permitted')
+    store.close()
+  })
+
   test('write jobは作業とreviewをAGENTSへ委ねhost工程を要求しない', () => {
     const repo = fixtureDir('zerokun-instructions-write-')
     git(['init', '-q'], repo)

@@ -413,6 +413,13 @@ sandbox-safe contract test・型検査・build・shell検査を実行します�
 SDKの実体とHomebrewの中継pathを読取り許可し、`CLOUDSDK_CONFIG`で既存のホスト設定を引き継ぎます。
 HOME全体は分離したままです。独自のCloud書込みAPIや新しいログインは不要です。
 build・deployなどはユーザーの依頼範囲と既存IAMに従ってCodexが判断します。
+対象resource・付与先principal・必要accessをユーザーが明示承認したIAM修復は、主担当が既存認証で
+現状確認し、不足する承認済みbindingだけを最小scopeへ適用・再読取検証できます。同じ承認を再要求しません。
+拒否が出たことや一般的な「直して」という依頼だけでは権限拡大を許可しません。既存binding・条件・policy versionと
+並行変更を保持し、etagを使わない全policy上書きを避けます。roleに承認外のaccessが付随する場合は追加承認が必要です。
+修復の承認だけでjob起動・deployは許可されず、それぞれ依頼範囲に含まれる場合だけ実行します。
+再開履歴の旧developer指示にある一律禁止は、この明示承認された限定修復について置き換えます。
+過去のassistantの説明だけを制約の根拠にせず、その他の現行制約・現在の指示・実際のエラーを基に判断します。
 これは主担当への既存認証の利用許可であり、credential DBを同じshellから厳密隔離する方式ではありません。
 主担当から起動するnative Codex subagentに対しても、このcredentialのOSレベル隔離は保証しません。
 認証情報・tokenの本文を読取り、表示、コピーすることは指示で禁止します。
@@ -428,7 +435,7 @@ token出力、deployは提供しません。ログ本文は未信頼データと
 ホストにインストール・ログイン済みのgcloudが必要です。アクセス可否は既存のGoogle Cloud IAMで判断し、
 Zeroちゃん独自のrepository別許可リストは設けません。`cloud-access.json`の作成・設定は不要で、
 以前作成したfileも参照しません（更新時に削除はしません）。明示指定したprojectについて、ホストの
-認証アカウントがログ読取権限を持つ範囲で利用できます。既定projectへのfallback、権限の付与、
+認証アカウントがログ読取権限を持つ範囲で利用できます。このログ読取補助ツールは既定projectへのfallback、権限の付与、
 再ログインや認証情報のコピーは行いません。実際のIAM拒否とホスト認証の失効は区別して報告します。
 
 初期提供はwrite-authorizedな通常ジョブです。DMのread-onlyジョブ、会話割り込み用turnには

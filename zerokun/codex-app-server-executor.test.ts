@@ -372,7 +372,7 @@ for line in sys.stdin:
     if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume", "thread/inject_items"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
+            stream.write(json.dumps({"method": method, "developerInstructions": params.get("developerInstructions"), "injectedItems": params.get("items") if method == "thread/inject_items" else None, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
     if method == "initialized":
         continue
     if method == "initialize":
@@ -2378,6 +2378,42 @@ describe('production App Server executor', () => {
       expect(events).toEqual(['F1', 'F2', 'body'])
     } finally { value.store.close() }
   }, 30_000)
+  }
+
+  for (const resume of [false, true]) {
+    test(`承認済みIAM修復の現行指示をApp Server ${resume ? 'resume' : 'start'}へ送る`, async () => {
+      const value = fixture('normal', true, '承認した対象ジョブ・実行主体への必要アクセスを修復してください')
+      const rpcLog = join(value.root, 'iam-policy-rpc.log')
+      try {
+        const result = await executeCodexJob({
+          ...value.job, ...(resume ? { sessionId: 'thread-existing', resumed: true } : {}),
+        }, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true,
+          extraEnvironment: { ZERO_FIXTURE_MODE: 'normal', ZERO_RPC_LOG: rpcLog, ZERO_LOG_HANDSHAKES: '1' },
+          liveControls: value.hooks,
+        })
+        expect(result.result).toBe('通常完了')
+        const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        const handshake = rpc.filter(row => row.method === (resume ? 'thread/resume' : 'thread/start'))
+        expect(handshake).toHaveLength(1)
+        expect(handshake[0].developerInstructions).toContain('IAM repair is permitted')
+        expect(handshake[0].developerInstructions).toContain('target resource, existing grantee principal, and exact permission or role')
+        expect(handshake[0].developerInstructions).toContain('other applicable restrictions')
+        expect(handshake[0].developerInstructions).not.toContain('change IAM to bypass a denial')
+        if (resume) {
+          const injected = rpc.filter(row => row.method === 'thread/inject_items')
+          expect(injected).toHaveLength(1)
+          expect(injected[0].injectedItems).toEqual([{
+            type: 'message', role: 'developer',
+            content: [{ type: 'input_text', text: handshake[0].developerInstructions }],
+          }])
+          expect(handshake[0].developerInstructions).toContain('supersedes older developer instructions in resumed history')
+          expect(rpc.findIndex(row => row.method === 'thread/inject_items'))
+            .toBeLessThan(rpc.findIndex(row => row.method === 'turn/start'))
+        }
+      } finally { value.store.close() }
+    }, 30_000)
   }
 
   test('resumeの指示注入で先行開始したnative turnへ最新依頼を一度届け正常完了する', async () => {
