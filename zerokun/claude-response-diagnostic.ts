@@ -91,6 +91,8 @@ export function saveClaudeResponseDiagnostic(options: {
   phase?: string
   round?: number
   failure?: ClaudeFailureDiagnostic
+  sendCode?: 'agent_not_ready' | 'agent_blocked' | 'empty_agent_prompt'
+    | 'agent_prompt_stalled' | 'agent_prompt_failed' | 'timeout' | 'unknown-error'
 }): ClaudeDiagnosticReceipt {
   try {
     if (!/^[a-f0-9]{32}$/.test(options.attempt)) return { status: 'unavailable' }
@@ -126,6 +128,7 @@ export function saveClaudeResponseDiagnostic(options: {
       phase: options.phase,
       round: options.round,
       failure: options.failure,
+      sendCode: options.sendCode,
       reads: options.reads.slice(-3),
       transcript: {
         available: options.transcript !== undefined,

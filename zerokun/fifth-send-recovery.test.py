@@ -18,6 +18,7 @@ class SendRecoveryTests(unittest.TestCase):
         self.receipt = Path(self.tmp.name) / 'claim'
         self.fail_send = False
         self.fail_announce = False
+        self.reply = {"id": "req", "result": {}}
         owner = self
         class Connection:
             def __enter__(self): return self
@@ -28,7 +29,7 @@ class SendRecoveryTests(unittest.TestCase):
                 owner.events.append('send')
                 assert owner.receipt.exists()
                 if owner.fail_send: raise TimeoutError()
-            def recv(self, size): return b'{"id":"req","result":{}}\n'
+            def recv(self, size): return (json.dumps(owner.reply) + '\n').encode()
         self.g['socket'] = SimpleNamespace(socket=lambda *args: Connection(), AF_UNIX=1, SOCK_STREAM=1)
         def claim(prepared):
             fd = os.open(self.receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -55,6 +56,21 @@ class SendRecoveryTests(unittest.TestCase):
         self.assertEqual(self.m['_attempt_send'](self.prepared), 5)
         self.assertTrue(self.receipt.exists())
         self.fail_send = False
+        self.assertEqual(self.m['_attempt_send'](self.prepared), 5)
+        self.assertEqual(self.events.count('send'), 1)
+
+    def test_rejection_preserves_fixed_code_without_server_message(self):
+        self.reply = {"id": "req", "error": {"code": "agent_not_ready", "message": "SECRET-SENTINEL"}}
+        self.assertEqual(self.m['_attempt_send'](self.prepared), 5)
+        self.assertEqual(self.records[-1], {"status": "prompt-command-returned", "returncode": 1, "code": "agent_not_ready"})
+        self.assertNotIn('SECRET-SENTINEL', json.dumps(self.records))
+        self.assertTrue(self.receipt.exists())
+
+    def test_unknown_error_is_fixed_and_claim_still_prevents_resend(self):
+        self.reply = {"id": "req", "error": {"code": "SECRET-SENTINEL", "message": "SECRET-SENTINEL"}}
+        self.assertEqual(self.m['_attempt_send'](self.prepared), 5)
+        self.assertEqual(self.records[-1]['code'], 'unknown-error')
+        self.assertNotIn('SECRET-SENTINEL', json.dumps(self.records))
         self.assertEqual(self.m['_attempt_send'](self.prepared), 5)
         self.assertEqual(self.events.count('send'), 1)
 
