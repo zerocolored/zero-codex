@@ -31,6 +31,30 @@ class VisibleReadyTests(unittest.TestCase):
                     self.m['_settle_visible_ready']('owned', {})
                 self.assertEqual(self.keys, [])
 
+    def test_send_preflight_rechecks_ui_after_startup(self):
+        # Synthetic owned receipt; keep the real screen classifier and complete
+        # _owned_target path so readiness alone cannot bypass an auth dialog.
+        self.g['_validate_workspace_receipt'] = lambda *args: None
+        self.g['_current_pane'] = lambda: {}
+        self.g['_same_caller'] = lambda *args: True
+        self.g['_valid_recorded_process_ids'] = lambda *args: True
+        self.g['_valid_claude_invocation'] = lambda *args: True
+        self.g['_process_receipt'] = lambda *args: {}
+        self.g['_same_owned_process_identity'] = lambda *args: True
+        workspace = dict(agent_name='owned', workspace_id='w1', pane_id='w1:p1', terminal_id='t1', nonce='n', project_root='/tmp/project')
+        receipt = {k: workspace[k] for k in ['agent_name', 'workspace_id', 'pane_id', 'terminal_id', 'nonce']}
+        receipt.update(version=self.m['EPHEMERAL_SESSION_VERSION'], native_session='N/A:safe-mode', state_change_seq=1,
+                       shell_pid=1, claude_pid=2, process_group_id=2, process_ids=[2], argv=[], argv0='claude', executable={})
+        for screen in ['Password:\n❯', 'Sign in\n❯', self.effort,
+                       'Accessing workspace:\n/tmp/project\n❯ Yes, I trust this folder\nNo, exit\nEnter to confirm · Esc to cancel']:
+            self.g['_read_visible'] = lambda _, text=screen: text
+            with self.assertRaises(self.m['UnsafeRequest']):
+                self.m['_owned_target']({'caller': {}}, workspace, receipt)
+        for screen in ['❯', '❯ Try "approve payment changes"']:
+            self.g['_read_visible'] = lambda _, text=screen: text
+            self.assertEqual(self.m['_owned_target']({'caller': {}}, workspace, receipt), 'owned')
+        self.assertEqual(self.keys, [])
+
     def test_transient_startup_frame_waits_for_ready(self):
         reads = iter(['Starting…'] * 2 + ['❯'] * 2)
         self.g['_read_visible'] = lambda _: next(reads)
