@@ -6439,6 +6439,117 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
+  for (const source of ['native', 'control'] as const) {
+    test(`${source} turnのcapacityは再起動と未送達attemptを跨いで同じ作業を継続する`, () => {
+      const dir = fixtureDir()
+      const path = join(dir, 'jobs.sqlite3')
+      let store = new JobStore(path)
+      store.enqueue(input({ messageId: `continuation-${source}`, writeEnabled: true }))
+      const job = store.claimNext('continuation-worker')!
+      const snapshot = readAdvisorInputSnapshot(dir, job.id)
+      const nonce = '6'.repeat(32)
+      const threadId = 'thread-continuation'
+      const binding = { jobId: job.id, epoch: job.controlEpoch, executorNonce: nonce, threadId }
+      store.beginInitialTurnDispatch({
+        ...binding, attempt: job.attempts, requestId: 101,
+        inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+      })
+      store.acknowledgeInitialTurnDispatch({
+        ...binding, workerId: job.workerId!, attempt: job.attempts,
+        requestId: 101, turnId: 'parent',
+      })
+      expect(() => store.bindNativeAppServerTurn(
+        job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'parent', 'premature',
+      )).toThrow('parent binding changed')
+      store.finishAppServerTurn({ ...binding, turnId: 'parent', retainInput: true })
+      if (source === 'native') {
+        for (const [worker, epoch, logicalNonce, thread, parent] of [
+          ['other-worker', job.controlEpoch, nonce, threadId, 'parent'],
+          [job.workerId!, job.controlEpoch + 1, nonce, threadId, 'parent'],
+          [job.workerId!, job.controlEpoch, '7'.repeat(32), threadId, 'parent'],
+          [job.workerId!, job.controlEpoch, nonce, 'other-thread', 'parent'],
+          [job.workerId!, job.controlEpoch, nonce, threadId, 'unknown-parent'],
+        ] as const) {
+          expect(() => store.bindNativeAppServerTurn(
+            job.id, worker, epoch, logicalNonce, thread, parent, 'child',
+          )).toThrow('parent binding changed')
+        }
+        store.bindNativeAppServerTurn(
+          job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'parent', 'middle',
+        )
+        store.finishAppServerTurn({ ...binding, turnId: 'middle', retainInput: true })
+        store.bindNativeAppServerTurn(
+          job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'middle', 'child',
+        )
+      } else {
+        const target = store.liveControlTarget(job.chatId, job.threadTs)!
+        store.stageLiveControl(target, {
+          chatId: job.chatId, threadTs: job.threadTs, messageId: 'continuation-control-followup',
+          userId: 'UOTHER', task: '追加条件', kind: 'steer', writeEnabled: true,
+        })
+        const control = store.nextReadyControl(job.id, job.controlEpoch)!
+        store.beginControlDispatch({ ...binding, controlId: control.id, requestId: 102 })
+        store.acknowledgeControl(control.id, 102, 'child')
+        store.bindAppServerTurn(job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'child')
+      }
+      const resumeAt = Date.now() - 1
+      store.finishAppServerTurn({
+        ...binding, turnId: 'child', retainInput: true,
+        rateLimitResumeAt: resumeAt, rateLimitReason: 'capacity', rateLimitSafeToReplay: false,
+      })
+      expect(store.hasDurableRateLimitTerminal(job.id)).toBe(true)
+      const db = new Database(path)
+      const table = source === 'native' ? 'job_native_turns' : 'job_controls'
+      const corruptions: [string, string | number | null][] = [
+        ['executor_nonce', 'foreign-nonce'], ['app_thread_id', 'foreign-thread'],
+        ['turn_id', 'foreign-turn'], ['control_epoch', job.controlEpoch + 1],
+        ['observed_at', null],
+        ...(source === 'native' ? [['attempt', job.attempts + 1]] as [string, number][]
+          : [['status', 'acknowledged']] as [string, string][]),
+      ]
+      for (const [column, invalid] of corruptions) {
+        const original = db.query(`SELECT ${column} AS value FROM ${table} WHERE turn_id = 'child'`)
+          .get() as { value: string | number | null }
+        db.run(`UPDATE ${table} SET ${column} = ? WHERE job_id = ? AND turn_id = 'child'`,
+          [invalid, job.id])
+        expect(store.hasDurableRateLimitTerminal(job.id)).toBe(false)
+        db.run(`UPDATE ${table} SET ${column} = ? WHERE job_id = ? AND turn_id = ?`,
+          [original.value, job.id, column === 'turn_id' ? 'foreign-turn' : 'child'])
+        expect(store.hasDurableRateLimitTerminal(job.id)).toBe(true)
+      }
+      for (const column of ['executor_pid', 'cancel_requested_at'] as const) {
+        db.run(`UPDATE jobs SET ${column} = 123 WHERE id = ?`, [job.id])
+        expect(store.hasDurableRateLimitTerminal(job.id)).toBe(false)
+        db.run(`UPDATE jobs SET ${column} = NULL WHERE id = ?`, [job.id])
+      }
+      db.close()
+      store.close()
+      store = new JobStore(path)
+      expect(store.recoverInterrupted()).toEqual({ requeued: 1, failedWrites: 0, failedUncertain: 0 })
+      const next = store.claimNext('continuation-second', 20, Date.now())!
+      expect(next).toMatchObject({ attempts: 2, resumed: true, sessionId: threadId,
+        rateLimitRecovery: { turnId: 'child', safeToReplay: false } })
+      store.close()
+      store = new JobStore(path)
+      expect(store.recoverInterrupted()).toEqual({ requeued: 1, failedWrites: 0, failedUncertain: 0 })
+      expect(store.get(job.id)).toMatchObject({ status: 'queued', sessionId: threadId,
+        rateLimitRecovery: { turnId: 'child', safeToReplay: false } })
+      const final = store.claimNext('continuation-final', 20, Date.now())!
+      store.fail(final.id, 'fixture terminal after recovery')
+      const notification = store.pendingTerminalNotifications()[0]!
+      store.markTerminalNotificationDelivered(notification.id)
+      expect(store.pruneSettled({
+        stateDir: dir, now: Date.now() + 10_000, retentionMs: 1, tombstoneRetentionMs: 60_000,
+      }).jobs).toBe(1)
+      expect(store.get(job.id)).toBeNull()
+      const pruned = new Database(path)
+      expect(pruned.query('SELECT COUNT(*) AS count FROM job_native_turns').get())
+        .toEqual({ count: 0 })
+      pruned.close()
+      store.close()
+    })
+  }
+
   test('bareまたは破損したrate-limit hintはwrite jobの再実行を認可しない', () => {
     for (const kind of ['bare', 'malformed'] as const) {
       const dir = fixtureDir()

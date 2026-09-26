@@ -524,7 +524,7 @@ for line in sys.stdin:
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "inProgress", "itemsView": "full", "items": []}}},
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "保持して待機しました"}], "error": None}}},
             ])
-        elif mode in ("goal-native", "late-command-completion"):
+        elif mode in ("goal-native", "goal-native-capacity", "late-command-completion"):
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "interim", "text": "残タスクがあります"}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": [], "error": None}}},
@@ -534,9 +534,14 @@ for line in sys.stdin:
                     emit({"method": "diagnostic/padding", "params": {"text": "x" * (21 * 1024 * 1024)}})
                     emit({"method": "item/started", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "late-diagnostic-marker", "status": "inProgress"}}})
                 emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "completed", "exitCode": 0}}})
-            emit_batch([
-                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "native-final", "text": "Goalを完遂しました"}], "error": None}}},
-            ])
+            if mode == "goal-native-capacity":
+                failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None}
+                items = [{"type": "commandExecution", "id": "native-write", "command": "fixture-only", "status": "completed", "exitCode": 0}]
+                emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "failed", "itemsView": "full", "items": items, "error": failure}}})
+            else:
+                emit_batch([
+                    {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "native-final", "text": "Goalを完遂しました"}], "error": None}}},
+                ])
         elif mode == "goal-blocked":
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "判断を待っています"}], "error": None}}})
         elif is_legacy_continuation:
@@ -1035,7 +1040,7 @@ function fixture(
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
-    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked' | 'goal-proposal' | 'resume-early-start'
+    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-native-capacity' | 'goal-blocked' | 'goal-proposal' | 'resume-early-start'
     | 'error-steer' | 'rate-error' | 'rate-terminal-only' | 'rate-retrying' | 'rate-retrying-two-turn'
     | 'capacity-error' | 'network-once' | 'network-always' | 'network-native' | 'network-permanent' | 'network-session-missing'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
@@ -1155,6 +1160,11 @@ function fixture(
     bindTurn: (executorNonce, threadId, turnId) => {
       store.bindAppServerTurn(
         job.id, job.workerId!, job.controlEpoch, executorNonce, threadId, turnId,
+      )
+    },
+    bindNativeTurn: (nonce, threadId, parentTurnId, turnId) => {
+      store.bindNativeAppServerTurn(
+        job.id, job.workerId!, job.controlEpoch, nonce, threadId, parentTurnId, turnId,
       )
     },
     beginInitialDispatch: ({
@@ -2424,6 +2434,49 @@ describe('production App Server executor', () => {
       value.store.close()
     }, 30_000)
   }
+
+  test('native turnで変更後にcapacityとなってもworkerは失敗通知せず同じthreadを再queueする', async () => {
+    const value = fixture('goal-native-capacity', true)
+    const rpcLog = join(value.root, 'native-capacity-rpc.log')
+    expect(value.store.releaseUnstartedClaim(
+      value.job.id, value.job.workerId!, 'return fixture claim',
+    )).toBe(true)
+    let observedError: unknown
+    try {
+      const stats = await runQueuedJobs({
+        store: value.store, maxJobsPerSession: 5, pollMs: 1, stopWhenIdle: true,
+        openJobMonitor: async current => {
+          value.store.beginMonitorPreparation(current.id, current.workerId!)
+          value.store.commitMonitorRequired(current.id, current.workerId!)
+        },
+        executor: async (current, signal) => {
+          Object.assign(value.job, current)
+          try {
+            return await executeCodexJob(current, {
+              codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+              skipEffectiveConfigCheck: true,
+              extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-native-capacity', ZERO_RPC_LOG: rpcLog },
+              ...createExecutorPidLifecycle(value.store, current.id),
+              liveControls: value.hooks, signal,
+            })
+          } catch (error) { observedError = error; throw error }
+        },
+      })
+      expect(observedError).toBeInstanceOf(CodexRateLimitError)
+      expect((observedError as CodexRateLimitError).safeToRetryAfterDelivery).toBe(false)
+      expect(stats).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+      expect(value.store.get(value.job.id)).toMatchObject({
+        status: 'queued', terminalOutcome: null, executorPid: null,
+        sessionId: 'thread-app-server-1',
+        rateLimitRecovery: { turnId: 'native-next', reason: 'capacity', safeToReplay: false },
+      })
+      expect(value.store.terminalNotificationCount()).toBe(0)
+      expect(value.store.pendingStatusNotifications().map(row => row.payload))
+        .toContainEqual(expect.stringContaining('モデルが混雑'))
+      const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(1)
+    } finally { value.store.close() }
+  }, 30_000)
 
   for (const shouldResume of [false, true]) {
     test(`${shouldResume ? 'native resume' : 'fresh physical session'}の履歴注入を一意にする`, async () => {
