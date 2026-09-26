@@ -6,11 +6,14 @@ import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from 
 import { CloudHandoffClient, readCloudConfig } from './cloud-handoff.ts'
 import { projectFleetStatus, startFleetReporter, type FleetLocalFacts } from './fleet-status.ts'
 import { listRegisteredSlackApps, readRegisteredSlackApp } from './slack-app-registry.ts'
+import { FleetSenderClient, FleetSenderDiagnostic } from './fleet-sender.ts'
+import { FleetSessionExpired } from './fleet-status.ts'
 
 export const registrationSchema = z.object({
   instanceId: z.string().uuid(), installationId: z.string().uuid(), appId: z.string().regex(/^A[A-Z0-9]+$/),
   projectLabel: z.string().min(1).max(100).optional(),
   authAppId: z.string().regex(/^A[A-Z0-9]+$/).optional(),
+  transport: z.literal('slack').optional(),
 }).strict()
 /** A machine-local random identity, not a hostname or an OS username. */
 export function fleetInstallationId(home = homedir()): string {
@@ -48,6 +51,7 @@ type FleetRegistration = z.infer<typeof registrationSchema>
 type FleetOptions = {
   teamId?: string; name?: string; home?: string; fetcher?: typeof fetch; now?: () => number
   warn?: (message: string) => void
+  botToken?: string
 }
 /** Discover references, never duplicate rotating credentials or choose an arbitrary tenant. */
 export async function discoverFleetAuth(state: string, teamId: string, home: string, fetcher: typeof fetch): Promise<string> {
@@ -69,6 +73,7 @@ export function startConfiguredFleet(state: string, appId: string, project: stri
   const home = options.home ?? homedir(), fetcher = options.fetcher ?? fetch
   let config: FleetRegistration | undefined
   let warned = false
+  let sender: FleetSenderClient | undefined
   const warn = options.warn ?? (message => process.stderr.write(message + '\n'))
   const client = () => {
     if (!config) throw new Error('monitoring registration pending')
@@ -84,6 +89,15 @@ export function startConfiguredFleet(state: string, appId: string, project: stri
         const text = readOptionalBoundedOwnerOnlyRegularFile(join(state, 'fleet.json'), 4096)
         const saved = text ? registrationSchema.parse(JSON.parse(text)) : undefined
         if (saved && saved.appId !== appId) throw new Error('app mismatch')
+        if (options.botToken) {
+          sender ??= new FleetSenderClient(state, installationId, appId, options.botToken, fetcher, options.now)
+          const session = await sender.begin()
+          config = { instanceId: session.instanceId, installationId, appId, transport: 'slack',
+            ...(saved?.projectLabel ? { projectLabel: saved.projectLabel } : {}) }
+          atomicWritePrivateFile(join(state, 'fleet.json'), JSON.stringify(config) + '\n')
+          warned = false
+          return session.generation
+        }
         config = saved?.installationId === installationId ? saved : undefined
         if (!config) {
           const teamId = z.string().regex(/^T[A-Z0-9]+$/).parse(options.teamId)
@@ -104,7 +118,10 @@ export function startConfiguredFleet(state: string, appId: string, project: stri
         warned = false
         return result
        } catch (error) {
-         if (!warned) { warned = true; warn('稼働状況の自動登録・接続を再試行します。クラウド認証と接続を確認してください。本体の作業は継続します。') }
+         if (!warned) { warned = true; warn(options.botToken && (error instanceof FleetSenderDiagnostic || error instanceof FleetSessionExpired)
+           ? `稼働状況の登録・接続を再試行します: ${error.message}。本体の作業は継続します。`
+           : options.botToken ? '稼働状況の登録・接続に失敗しました。自動再試行します。本体の作業は継続します。'
+           : '稼働状況の自動登録・接続を再試行します。クラウド認証と接続を確認してください。本体の作業は継続します。') }
          throw error
        }
       },
@@ -121,6 +138,7 @@ export function startConfiguredFleet(state: string, appId: string, project: stri
       send: async (generation, sequence, snapshot) => {
         if (fleetIsOff(state)) return
         if (!config) throw new Error('monitoring registration pending')
+        if (sender) { await sender.send(generation, sequence, snapshot); return }
         const result = await client().fleetRpc('report', { p_id: config.instanceId, p_generation: generation, p_sequence: sequence, p_snapshot: snapshot })
         if (result !== true) throw new Error('stale monitoring generation')
       },

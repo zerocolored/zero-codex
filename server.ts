@@ -2795,7 +2795,7 @@ try {
   clearIntentionalServiceStop(STATE_DIR)
   fleetReporter = startConfiguredFleet(STATE_DIR, identity.appId, connectedProjectDir,
     () => jobStore.fleetFacts(), () => slackSocket?.connected === true,
-    { teamId: identity.teamId, name: identity.botName })
+    { teamId: identity.teamId, name: identity.botName, botToken: BOT_TOKEN })
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 
   // Sweep once on startup for new mentions/DMs, and recover replies in owned threads.

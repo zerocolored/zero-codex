@@ -14,9 +14,10 @@ export async function configureFleet(command: string, state: string, args: strin
   if (command === 'status' && !args.length) {
     if (fleetIsOff(state)) { console.log('稼働状況の送信: 無効'); return }
     const raw = readOptionalBoundedOwnerOnlyRegularFile(path, 4096)
-    if (!raw) { console.log('稼働状況の送信: 起動時に自動登録（このPCのクラウド認証を使用）'); return }
+    if (!raw) { console.log('稼働状況の送信: 起動時に自動登録（登録済みSlackアプリ認証を使用。cloud loginは不要）'); return }
     const config = registrationSchema.parse(JSON.parse(raw))
     console.log(`稼働状況の送信: 設定済み\nSlack App: ${config.appId}\nInstance: ${config.instanceId}\nPC identity: ${config.installationId === fleetInstallationId() ? '一致' : '別PCの設定・再登録が必要'}`)
+    console.log(config.transport === 'slack' ? '送信認証: Slackから自動発行（cloud loginは不要）' : '送信認証: 旧方式（次回起動時にSlack認証へ移行）')
     return
   }
   if (command === 'off' && !args.length) {
