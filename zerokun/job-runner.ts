@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { executeSecurityAudit, copyAuditReportForFollowup } from './security-audit.ts'
 import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
@@ -434,6 +435,7 @@ export interface JobInterjectionRecord {
 export type JobLiveInputRecord = JobControlRecord | JobInterjectionRecord
 
 export interface EnqueueInput {
+  workflow?: 'work' | 'security-audit'
   chatId: string
   threadTs: string
   messageId: string
@@ -541,6 +543,9 @@ type InboundDeliveryRow = {
 }
 
 export interface JobRecord {
+  workflow?: 'work' | 'security-audit'
+  auditReportPath?: string
+  auditReportUnavailable?: boolean
   /** Actual host receipts, independent of what the resumed model remembers saying. */
   previousSlackDelivery?: { seq: number; bodyDelivered: boolean; filesDelivered: number; filesDeclared: number }
   /** Host-only logical history scope when executing in a dedicated cloud worktree. */
@@ -640,6 +645,7 @@ export type GitHubPublicationRecoveryContext = {
 }
 
 type JobRow = {
+  workflow?: 'work' | 'security-audit'
   seq: number
   id: string
   idempotency_key: string
@@ -959,7 +965,7 @@ CREATE INDEX IF NOT EXISTS idx_commentary_notifications_pending
 CREATE TABLE IF NOT EXISTS fleet_queries (
  idempotency_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
  repo_path TEXT NOT NULL, project_key TEXT, input TEXT NOT NULL,
- route TEXT NOT NULL CHECK(route IN ('work','fleet-status')), created_at INTEGER NOT NULL,
+ route TEXT NOT NULL CHECK(route IN ('work','fleet-status','security-audit')), created_at INTEGER NOT NULL,
  completed_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS status_notifications (
@@ -1893,6 +1899,16 @@ function persistThreadHistorySnapshot(
 }
 
 function ensureJobSchemaMigrations(db: Database): void {
+  db.transaction(() => {
+    const schema = db.query<{sql:string},[]>("SELECT sql FROM sqlite_master WHERE name='fleet_queries'").get()!.sql
+    if (!schema.includes("'security-audit'")) {
+      db.exec(schema.replace('fleet_queries','fleet_queries_next').replace("'fleet-status'", "'fleet-status','security-audit'"))
+      db.exec('INSERT INTO fleet_queries_next SELECT * FROM fleet_queries; DROP TABLE fleet_queries; ALTER TABLE fleet_queries_next RENAME TO fleet_queries;')
+    }
+    const columns = db.query<{name:string},[]>('PRAGMA table_info(jobs)').all()
+    if (!columns.some(c=>c.name==='workflow')) db.exec("ALTER TABLE jobs ADD COLUMN workflow TEXT NOT NULL DEFAULT 'work' CHECK(workflow IN ('work','security-audit'))")
+  }).immediate()
+
   // SQLite cannot alter CHECK constraints. Preserve every outbox receipt and
   // retry field while adding the new kind, including on existing installations.
   db.transaction(() => {
@@ -2918,6 +2934,7 @@ function mapRow(row: JobRow): JobRecord {
           ? 'lost-staged'
           : (() => { throw new Error(`invalid monitor_state for job ${row.id}`) })()
   return {
+    workflow: row.workflow ?? 'work',
     seq: row.seq,
     id: row.id,
     idempotencyKey: row.idempotency_key,
@@ -6556,8 +6573,8 @@ export class JobStore {
     return retrySqlite(() => fail.immediate())
   }
 
-  fleetQueryRoute(key: string): 'work' | 'fleet-status' | null {
-    return this.db.query<{route:'work'|'fleet-status'},[string]>('SELECT route FROM fleet_queries WHERE idempotency_key=?').get(key)?.route ?? null
+  fleetQueryRoute(key: string): 'work' | 'fleet-status' | 'security-audit' | null {
+    return this.db.query<{route:'work'|'fleet-status'|'security-audit'},[string]>('SELECT route FROM fleet_queries WHERE idempotency_key=?').get(key)?.route ?? null
   }
 
   fleetTriageContext(chat: string, thread: string, repo: string): string {
@@ -6566,9 +6583,15 @@ export class JobStore {
     return JSON.stringify({recentTasks:jobs,recentQueries:queries}).slice(-20000)
   }
 
-  stageFleetRoute(inbound: InboundDeliveryRecord, route: 'work' | 'fleet-status', projectKey: string | null): void {
+  previousSecurityAudit(job:JobRecord):string|null {
+    return this.db.query<{id:string},[string,string,string,number]>(
+      "SELECT id FROM jobs WHERE workflow='security-audit' AND status='completed' AND chat_id=? AND thread_ts=? AND repo_path=? AND seq<? ORDER BY seq DESC LIMIT 1",
+    ).get(job.chatId,job.threadTs,job.historyRepoPath??job.repoPath,job.seq)?.id??null
+  }
+
+  stageFleetRoute(inbound: InboundDeliveryRecord, route: 'work' | 'fleet-status' | 'security-audit', projectKey: string | null): void {
     retrySqlite(()=>this.db.transaction(()=>{
-      this.db.run(`INSERT OR IGNORE INTO fleet_queries VALUES(?,?,?,?,?,?,?,?,NULL)`,[
+      this.db.run(`INSERT OR IGNORE INTO fleet_queries (idempotency_key,chat_id,thread_ts,repo_path,project_key,input,route,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,NULL)`,[
         inbound.idempotencyKey,inbound.chatId,inbound.threadTs,inbound.repoPath,projectKey,inbound.text,route,Date.now()])
       if(route==='fleet-status') this.tombstoneInboundDelivery(inbound.idempotencyKey)
     }).immediate())
@@ -8668,9 +8691,9 @@ export class JobStore {
         `INSERT OR IGNORE INTO jobs (
            id, idempotency_key, chat_id, thread_ts, message_id, user_id,
            repo_path, task, attachments_json, thread_attachments_json,
-           runtime, write_enabled, status,
+           runtime, write_enabled, status, workflow,
            control_epoch, accepts_control, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?, 'queued', 1, 1, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?, 'queued', ?, 1, 1, ?)`,
         [
           id,
           idempotencyKey,
@@ -8682,7 +8705,8 @@ export class JobStore {
           task,
           JSON.stringify(attachments),
           JSON.stringify(threadAttachments),
-          input.writeEnabled ? 1 : 0,
+          input.workflow === 'security-audit' ? 0 : input.writeEnabled ? 1 : 0,
+          input.workflow ?? 'work',
           Date.now(),
         ],
       )
@@ -8720,7 +8744,15 @@ export class JobStore {
       ).get(row.seq, Date.now()) !== null
       const waitsBehindPriorJob = result.changes === 1 && blockedByPriorJob
 
-      if (result.changes === 1 && input.notifyAccepted && waitsBehindPriorJob) {
+      if (result.changes === 1 && input.workflow === 'security-audit') {
+        this.stageStatusNotificationRow({
+          idempotencyKey: `security-audit-accepted:${idempotencyKey}`,
+          jobId: row.id, chatId, threadTs,
+          kind: 'execution-started', createdAt: Date.now(),
+          payload: 'セキュリティ検査として受け付けました。コードを修正せず13工程を順に検査し、検査不能・失敗も含めたレポートをこのスレッドへ添付します。'
+            + (waitsBehindPriorJob ? ' 現在の作業が終わり次第、開始します。' : ''),
+        })
+      } else if (result.changes === 1 && input.notifyAccepted && waitsBehindPriorJob) {
         this.stageStatusNotificationRow({
           idempotencyKey: `accepted:${idempotencyKey}`,
           jobId: row.id,
@@ -9149,10 +9181,10 @@ export class JobStore {
         // would incorrectly skip a newer ordinary failure and resurrect an
         // older, no-longer-adjacent session.
         const preceding = this.db.query<
-          { session_id: string | null; status: JobStatus },
+          { session_id: string | null; status: JobStatus; workflow: string },
           [string, string, string, number, number]
         >(
-          `SELECT jobs.session_id, jobs.status
+          `SELECT jobs.session_id, jobs.status, jobs.workflow
            FROM jobs
            WHERE jobs.runtime = 'codex'
              AND jobs.chat_id = ?
@@ -9173,7 +9205,7 @@ export class JobStore {
         // When the executor knows the session itself is unusable it clears or
         // retires that session explicitly; every other same-thread failure is
         // valuable continuation context for the user's next "resume" request.
-        const prior = preceding?.session_id
+        const prior = row.workflow !== 'security-audit' && preceding?.workflow !== 'security-audit' && preceding?.session_id
           && (preceding.status === 'completed' || preceding.status === 'failed')
           && sessionUsesCurrentProtocol(preceding.session_id)
           && this.db.query<{ present: number }, [string]>(
@@ -9193,6 +9225,10 @@ export class JobStore {
         sessionId = resumed && prior ? prior.session_id : null
       }
 
+      if (row.workflow === 'security-audit') {
+        sessionId = null
+        resumed = false
+      }
       const update = this.db.run(
         `UPDATE jobs
          SET status = 'running',
@@ -13244,6 +13280,12 @@ export class JobStore {
           receipt.reason,
         )
         requeued += 1
+      } else if (job.workflow === 'security-audit') {
+        this.db.run(`UPDATE jobs SET status='queued', worker_id=NULL, executor_pid=NULL,
+          pending_session_id=NULL,pending_result=NULL,session_id=NULL,resumed=0,not_before=NULL,
+          accepts_control=1,executor_nonce=NULL,active_thread_id=NULL,active_turn_id=NULL WHERE id=?`,[job.id])
+        this.supersedeLifecycleNotifications(job.id)
+        requeued += 1
       } else if (job.writeEnabled) {
         // A reviewed result with a durable host-publication checkpoint has
         // known effects: the exact commit/branch/PR receipt is either pending
@@ -14887,6 +14929,12 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         continue
       }
       if (error instanceof CodexInterruptedError || options.signal?.aborted) {
+        if (job.workflow === 'security-audit') {
+          await updateMonitor(job, '保存済みの検査結果を保持して再開を待ちます')
+          await quiesceLifecycleBeforeStateChange()
+          options.store.requeue(job.id, message || 'audit worker interrupted')
+          return stats
+        }
         const appServerUncertain = options.store.initialTurnMayHaveBeenDelivered(job.id)
           || !options.store.initialTurnDispatchIsSafeToRetry(job.id)
           || options.store.controlMayHaveBeenDelivered(job.id)
@@ -17927,7 +17975,7 @@ export async function terminateTrackedExecutors(
       throw new Error(`executor PID ${pid}のcommandを確認できません`)
     }
     const command = commandProbe.command
-    const supervised = command.includes('codex-supervisor') && command.includes(registration.jobId)
+    const supervised = (command.includes('codex-supervisor') || command.includes('security-audit-supervisor.ts')) && command.includes(registration.jobId)
     const legacyDirect = command.includes(registration.jobId)
       && /(?:^|[\/\s])codex(?:[\/\s]|$)|codex-cli/i.test(command)
     if (!supervised && !legacyDirect) {
@@ -18635,7 +18683,7 @@ async function runCli(): Promise<void> {
   try {
     await runQueuedJobs({
       store,
-      prepareCloudJob: cloudRuntime ? job => cloudRuntime.prepare(job) : undefined,
+      prepareCloudJob: cloudRuntime ? job => job.workflow === 'security-audit' ? Promise.resolve() : cloudRuntime.prepare(job) : undefined,
       parkCloudQuota: cloudRuntime ? (job, resetAt) => cloudRuntime.pause(job, resetAt) : undefined,
       maxJobsPerSession: configuredMaxJobsPerSession(
         process.env.ZEROKUN_MAX_JOBS_PER_SESSION,
@@ -18736,7 +18784,26 @@ async function runCli(): Promise<void> {
         }
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
+          if (job.workflow === 'security-audit') {
+            const raw = await executeSecurityAudit(job, {
+              stateDir: dir, signal: executionController.signal,
+              ...executorPidLifecycle,
+              cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
+              progress: message => mirrorMonitorMessage(message),
+            })
+            const auditResult = finalizeSuccessfulExecution(job, raw, dir, log)
+            store.ensureExecutionResultStaged(job.id, auditResult.sessionId, auditResult.result)
+            return auditResult
+          }
           const executionJob = cloudRuntime?.executionJob(job) ?? job
+          const previousAudit = store.previousSecurityAudit(executionJob)
+          if (previousAudit) {
+            try {
+              executionJob.auditReportPath = copyAuditReportForFollowup(executionJob, dir, previousAudit)
+            } catch {
+              executionJob.auditReportUnavailable = true
+            }
+          }
           executionJob.previousSlackDelivery = store.previousSlackDelivery(job.id)
           const execution = await executeCodexJob(executionJob, {
             signal: executionController.signal,

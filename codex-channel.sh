@@ -46,6 +46,11 @@ if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "set" ] && [ "${2:-}" = "slack
   exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-command.ts" "$(pwd -P)"
 fi
 STATE_DIR="$(zerokun_resolve_state_dir)"
+if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "security" ]; then
+  STATE_DIR="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" "$(pwd -P)" "$STATE_DIR")"
+  shift
+  exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/security-audit-config.ts" "$STATE_DIR" "$(pwd -P)" "$@"
+fi
 if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "fleet" ]; then
   [ "$#" -ge 2 ] || { echo '使い方: zerochan fleet identity|status|off|register <instance-id> <auth-app-id>' >&2; exit 2; }
   STATE_DIR="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" "$(pwd -P)" "$STATE_DIR")"
