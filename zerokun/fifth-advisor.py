@@ -4536,7 +4536,7 @@ def _owned_target(
     # Bind the two current observations, not the stale startup sequence.
     if not session_matches:
         raise UnsafeRequest("ephemeral Claude identity changed before fifth-advisor prompt")
-    if not _empty_claude_prompt_screen(_read_visible(target)):
+    if _startup_screen_state(_read_visible(target), str(workspace.get("project_root", "")))[0] != "empty-prompt":
         raise UnsafeRequest("ephemeral Claude is not at an empty visible prompt")
     processes = _process_receipt(workspace)
     if not _same_owned_process_identity(processes, agent_receipt):
@@ -4890,12 +4890,24 @@ def _attempt_send(prepared: _PreparedSend) -> int:
             ):
                 raise UnsafeRequest("Herdr prompt returned an invalid response envelope")
             succeeded = isinstance(document.get("result"), dict)
+            # Never relay the server's message: it may contain prompt material.
+            # Only these errors establish rejection before any terminal write
+            # in Herdr's agent.prompt handler. Timeout/stalled/unknown errors
+            # remain delivery-possible and must never authorize a resend.
+            error = document.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            known_codes = {
+                "agent_not_ready", "agent_blocked", "empty_agent_prompt",
+                "agent_prompt_stalled", "agent_prompt_failed", "timeout",
+            }
+            send_code = code if isinstance(code, str) and code in known_codes else "unknown-error"
         except Exception as error:
             _write_json_record({"status": "prompt-command-timeout-or-error"})
             print(f"Herdr prompt transport failed: {type(error).__name__}", file=sys.stderr)
             return 5
         _write_json_record(
-            {"status": "prompt-command-returned", "returncode": 0 if succeeded else 1}
+            {"status": "prompt-command-returned", "returncode": 0 if succeeded else 1,
+             **({} if succeeded else {"code": send_code})}
         )
         return 0 if succeeded else 5
     except Exception:

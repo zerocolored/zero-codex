@@ -27,6 +27,9 @@ import {
   advisorPrompt,
   assertClaudeSubscriptionLogin,
   brokerEnvironment,
+  claudeSendRejectedBeforeInput,
+  claudeStartRemainsUnconfirmed,
+  CLAUDE_START_CONFIRMATION_MS,
   claudeSubscriptionStatusIsReady,
   createExclusivePrivateFile,
   decodeHerdrReadOutput,
@@ -354,6 +357,9 @@ async function brokerFixture(options: {
   writeEnabled?: boolean
   externalSuccess?: boolean
   claudeFailures?: number
+  claudeSendError?: string
+  claudeDelayedStart?: boolean
+  claudeNeverStarts?: boolean
   transientProbeDenial?: boolean
   onExternalPrompt?: (count: number, repo: string) => void
 } = {}): Promise<BrokerFixture> {
@@ -406,16 +412,38 @@ async function brokerFixture(options: {
         }
         socketBuffer = socketBuffer.subarray(newline + 1)
         const stateValue = JSON.parse(readFileSync(fakeHerdrState, 'utf8')) as Record<string, unknown>
+        if (options.claudeSendError === 'agent_not_ready') {
+          stateValue.prompt_count = Number(stateValue.prompt_count ?? 0) + 1
+          writeFileSync(fakeHerdrState, JSON.stringify(stateValue), { mode: 0o600 })
+          client.write(`${JSON.stringify({ id: request.id, error: { code: options.claudeSendError, message: 'private rejection detail' } })}\n`)
+          client.end()
+          return
+        }
         stateValue.prompt = request.params.text
         stateValue.state_change_seq = 2
         stateValue.agent_status = 'done'
         stateValue.prompt_count = Number(stateValue.prompt_count ?? 0) + 1
         stateValue.answer_missing = Number(stateValue.prompt_count) <= (options.claudeFailures ?? 0)
+        if (options.claudeDelayedStart || options.claudeNeverStarts) {
+          stateValue.prompt = null
+          stateValue.state_change_seq = 1
+          stateValue.agent_status = 'idle'
+          if (!options.claudeNeverStarts) setTimeout(() => {
+            const delayed = JSON.parse(readFileSync(fakeHerdrState, 'utf8'))
+            if (!delayed.owned) return
+            delayed.prompt = request.params.text
+            delayed.state_change_seq = 2
+            delayed.agent_status = 'done'
+            writeFileSync(fakeHerdrState, JSON.stringify(delayed), { mode: 0o600 })
+          }, 7000)
+        }
         writeFileSync(fakeHerdrState, `${JSON.stringify(stateValue)}\n`, { mode: 0o600 })
         options.onExternalPrompt?.(Number(stateValue.prompt_count), repo)
         client.write(`${JSON.stringify({
           id: request.id,
-          result: { type: 'agent_prompt', status: 'done' },
+          ...(options.claudeSendError
+            ? { error: { code: options.claudeSendError, message: 'private transport detail' } }
+            : { result: { type: 'agent_prompt', status: 'done' } }),
         })}\n`)
         client.end()
       },
@@ -976,6 +1004,27 @@ describe('advisor broker boundaries', () => {
     )).toEqual({ kind: 'unconfirmed' })
   })
 
+  test('確定した送信前拒否だけを曖昧なtransport失敗から区別する', () => {
+    const marker = 'REQUEST_MARKER=' + 'A'.repeat(32)
+    for (const code of ['agent_not_ready', 'agent_blocked', 'empty_agent_prompt', 'timeout', 'agent_prompt_stalled', 'agent_prompt_failed', 'unknown-error']) {
+      const outcome = parseFifthAdvisorSendOutcome([
+        JSON.stringify({ status: 'prompt-started', marker }),
+        JSON.stringify({ status: 'prompt-command-returned', returncode: 1, code }),
+      ].join('\n'))
+      expect(claudeSendRejectedBeforeInput(outcome)).toBe(['agent_not_ready', 'agent_blocked', 'empty_agent_prompt'].includes(code))
+    }
+  })
+
+  test('開始未確認の上限は未送信の証明にせず、稼働・依頼echo・入力中を打ち切らない', () => {
+    const marker = 'REQUEST_MARKER=' + 'A'.repeat(32)
+    expect(claudeStartRemainsUnconfirmed(CLAUDE_START_CONFIRMATION_MS - 1, false, '❯', marker)).toBe(false)
+    expect(claudeStartRemainsUnconfirmed(CLAUDE_START_CONFIRMATION_MS, false, '❯', marker)).toBe(true)
+    expect(claudeStartRemainsUnconfirmed(CLAUDE_START_CONFIRMATION_MS, true, '❯', marker)).toBe(false)
+    expect(claudeStartRemainsUnconfirmed(CLAUDE_START_CONFIRMATION_MS, false, `${marker}\n❯`, marker)).toBe(false)
+    expect(claudeStartRemainsUnconfirmed(CLAUDE_START_CONFIRMATION_MS, false, `${marker.slice(0, -1)}\n${marker.slice(-1)}\n❯`, marker)).toBe(false)
+    expect(claudeStartRemainsUnconfirmed(CLAUDE_START_CONFIRMATION_MS, false, '❯ review draft', marker)).toBe(false)
+  })
+
   test('reviewer promptはstdinだけで渡しprocess argvへ載せない', async () => {
     const confidential = 'SLACK-CONFIDENTIAL-ARGV-SENTINEL'
     const result = await runBounded([
@@ -1518,6 +1567,61 @@ print('review complete')
       expect(finished.owned).toBe(false)
     } finally { await fixture.close() }
   }, 30_000)
+
+  test('Claudeの明示的な送信拒否は1時間待たず原因保存とowned cleanupを行う', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, claudeSendError: 'agent_not_ready' })
+    try {
+      const first = await fixture.call('investigation', 'revision-two')
+      expect(first.payload).toMatchObject({ allAdopted: false,
+        claude: { adopted: false, cleanupVerified: true, failure: { cause: 'startup' } } })
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(1)
+      expect(state.owned).toBe(false)
+      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
+      const directory = join(fixture.journalRoot, revision)
+      const name = readdirSync(directory).find(name => name.startsWith('claude-response-'))!
+      const diagnostic = JSON.parse(readFileSync(join(directory, name), 'utf8'))
+      expect(diagnostic.failure).toMatchObject({ stage: 'send', cause: 'startup' })
+      expect(diagnostic.sendCode).toBe('agent_not_ready')
+      expect(JSON.stringify(first.payload)).not.toContain('private rejection detail')
+    } finally { await fixture.close() }
+  }, 30_000)
+
+  test('Claudeのstalled応答後も同じ依頼の完全回答を回収し再送しない', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, claudeSendError: 'agent_prompt_stalled', claudeDelayedStart: true })
+    try {
+      const first = await fixture.call('investigation', 'revision-two')
+      expect(first.payload).toMatchObject({ allAdopted: true, claude: { adopted: true, cleanupVerified: true } })
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
+      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
+      const directory = join(fixture.journalRoot, revision)
+      const name = readdirSync(directory).find(name => name.startsWith('claude-response-'))!
+      const diagnostic = JSON.parse(readFileSync(join(directory, name), 'utf8'))
+      expect(diagnostic.failure).toBeUndefined()
+      expect(diagnostic.sendCode).toBe('agent_prompt_stalled')
+    } finally { await fixture.close() }
+  }, 50_000)
+
+  test('空画面のまま開始しないClaudeは回答待ち1時間に入らず送信可能性を保持して終了する', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, claudeNeverStarts: true })
+    try {
+      const first = await fixture.call('investigation', 'revision-two')
+      expect(first.payload).toMatchObject({ allAdopted: false, claude: {
+        adopted: false, executionState: 'start-unconfirmed', promptMayHaveBeenDelivered: true,
+        cleanupVerified: true, failure: { cause: 'startup' },
+      } })
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
+      expect(state.owned).toBe(false)
+      await fixture.restart()
+      const replay = await fixture.call('investigation', 'revision-two')
+      expect(replay.payload).toMatchObject({ allAdopted: false })
+      expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(1)
+    } finally { await fixture.close() }
+  }, 160_000)
 
   test('Claude送信後の回答不足は再送せずGrok回答と診断を保存する', async () => {
     const fixture = await brokerFixture({ externalSuccess: true, claudeFailures: 2 })

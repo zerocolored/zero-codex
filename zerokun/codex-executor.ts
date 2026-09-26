@@ -6199,6 +6199,7 @@ export interface CodexLiveControlHooks {
   next(): JobLiveInputRecord | null
   nextInterjection(): JobInterjectionRecord | null
   bindTurn(executorNonce: string, threadId: string, turnId: string): void
+  bindNativeTurn(executorNonce: string, threadId: string, parentTurnId: string, turnId: string): void
   recordGoalStatus?(status: GoalStatus): void
   beginInitialDispatch(options: {
     executorNonce: string
@@ -8496,9 +8497,11 @@ export async function executeCodexJob(
                   await Bun.sleep(APP_SERVER_CONTROL_POLL_MS)
                 }
                 if (nativeTurn) {
+                  controls.bindNativeTurn(
+                    advisorAttempt.attemptNonce, currentThreadId, currentTurnId, nativeTurn,
+                  )
                   currentTurnId = nativeTurn
                   parentTurnIds.push(nativeTurn)
-                  controls.bindTurn(advisorAttempt.attemptNonce, currentThreadId, nativeTurn)
                   continue
                 }
                 // Rebind the terminal for the existing finish barrier after

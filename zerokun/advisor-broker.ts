@@ -124,9 +124,27 @@ import {
   type ClaudeDiagnosticReceipt,
 } from './claude-response-diagnostic.ts'
 
+const CLAUDE_SEND_CODES = ['agent_not_ready', 'agent_blocked', 'empty_agent_prompt',
+  'agent_prompt_stalled', 'agent_prompt_failed', 'timeout', 'unknown-error'] as const
+type ClaudeSendCode = typeof CLAUDE_SEND_CODES[number]
 export type FifthAdvisorSendOutcome =
   | { kind: 'unconfirmed' }
-  | { kind: 'possibly-delivered'; marker: string; stateChangeSeq?: number }
+  | { kind: 'possibly-delivered'; marker: string; stateChangeSeq?: number; sendCode?: ClaudeSendCode }
+
+export function claudeSendRejectedBeforeInput(outcome: FifthAdvisorSendOutcome): boolean {
+  return outcome.kind === 'possibly-delivered' && outcome.sendCode !== undefined
+    && ['agent_not_ready', 'agent_blocked', 'empty_agent_prompt'].includes(outcome.sendCode)
+}
+
+export const CLAUDE_START_CONFIRMATION_MS = 120_000
+
+/** A bounded start failure, never proof of non-delivery or permission to retry. */
+export function claudeStartRemainsUnconfirmed(elapsedMs: number, modelStarted: boolean, transcript: string, marker: string): boolean {
+  return elapsedMs >= CLAUDE_START_CONFIRMATION_MS && !modelStarted
+    && CLAUDE_REQUEST_MARKER.test(marker)
+    && !transcript.replace(/\s/g, '').includes(marker)
+    && emptyClaudePrompt(transcript)
+}
 
 export class AdvisorContainmentError extends Error {}
 export class AdvisorOwnedProcessStillLiveError extends AdvisorContainmentError {}
@@ -143,7 +161,12 @@ export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOu
   if (started.length !== 1 || typeof started[0]!.marker !== 'string') {
     return { kind: 'unconfirmed' }
   }
+  const returned = records.filter(record => record.status === 'prompt-command-returned')
+  const sendCode = returned.length === 1 && returned[0]!.returncode === 1
+    && CLAUDE_SEND_CODES.includes(returned[0]!.code as ClaudeSendCode)
+    ? returned[0]!.code as ClaudeSendCode : undefined
   return { kind: 'possibly-delivered', marker: started[0]!.marker,
+    ...(sendCode ? { sendCode } : {}),
     ...(Number.isSafeInteger(started[0]!.state_change_seq)
       ? { stateChangeSeq: Number(started[0]!.state_change_seq) } : {}),
   }
@@ -1884,6 +1907,7 @@ async function main(): Promise<void> {
     let responseDiagnostic: ClaudeDiagnosticReceipt | undefined
     let failureStage: 'startup' | 'send' | 'acquisition' = 'startup'
     let diagnosticFailure: ClaudeFailureDiagnostic | undefined
+    let diagnosticSendCode: ClaudeSendCode | undefined
     let startupCode: ClaudeFailureDiagnostic['startupCode']
     const persistDiagnostic = () => {
       responseDiagnostic = saveClaudeResponseDiagnostic({
@@ -1896,6 +1920,7 @@ async function main(): Promise<void> {
         phase,
         round,
         failure: diagnosticFailure,
+        sendCode: diagnosticSendCode,
       })
     }
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
@@ -1991,6 +2016,7 @@ async function main(): Promise<void> {
       await verifyHerdrRuntimeIdentityAsync(claudeRuntime, brokerEnvironment(claudeRuntime))
       deliveryUnknown = true
       failureStage = 'send'
+      const sendStartedAt = Date.now()
       const send = await runBounded(fingerprintedCommand([
         python, helper, 'send', ...helperArgs, '--owned',
       ], jobFingerprint), { env: helperEnvironment, timeoutMs: 140_000 })
@@ -2006,6 +2032,13 @@ async function main(): Promise<void> {
       }
       {
         marker = sendOutcome.marker
+        if (sendOutcome.sendCode) {
+          diagnosticSendCode = sendOutcome.sendCode
+          persistDiagnostic()
+        }
+        if (claudeSendRejectedBeforeInput(sendOutcome)) {
+          throw new Error(`Claude prompt delivery failed: Herdr rejected input (${sendOutcome.sendCode})`)
+        }
         failureStage = 'acquisition'
         if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
         const acquisitionDeadline = Date.now() + 60 * 60 * 1_000
@@ -2023,7 +2056,7 @@ async function main(): Promise<void> {
           if ((current.state_change_seq ?? 0) > target.stateChangeSeq) {
             modelStartObserved = true
           }
-          if (!modelStartObserved || !['idle', 'done'].includes(current.agent_status ?? '')) continue
+          if (!['idle', 'done'].includes(current.agent_status ?? '')) continue
           let transcript = ''
           let stateChangedDuringRead = false
           for (const lines of [300, 600, 1200]) {
@@ -2057,7 +2090,7 @@ async function main(): Promise<void> {
               observation.analysis = analysis
               diagnosticTranscript = transcript
               diagnosticTranscriptReadIndex = diagnosticReads.length - 1
-              if (completeResponse) {
+              if (completeResponse && modelStartObserved) {
                 response = completeResponse
                 reason = 'Claude response obtained but subsequent cleanup validation did not complete'
                 stateChangeSeqAfter = current.state_change_seq
@@ -2071,6 +2104,13 @@ async function main(): Promise<void> {
           }
           if (response) break
           if (stateChangedDuringRead) continue
+          // Only the same owned, stable idle screen after the bounded reads
+          // can exhaust startup confirmation. Keep delivery-possible: closing
+          // this read-only advisor never authorizes a second prompt or retry.
+          if (claudeStartRemainsUnconfirmed(Date.now() - sendStartedAt, modelStartObserved, transcript, marker)) {
+            throw new Error('Claude prompt delivery failed: start unconfirmed after the startup confirmation deadline')
+          }
+          if (!modelStartObserved) { await Bun.sleep(28_000); continue }
           reason = 'Claude reached a terminal prompt but its complete marked response was unavailable'
           // The same terminal state and sequence were revalidated after every
           // bounded transcript read. No later output can complete this turn,
@@ -2079,6 +2119,8 @@ async function main(): Promise<void> {
         }
         if (!response && Date.now() >= acquisitionDeadline) {
           reason = 'required ephemeral Claude response exceeded the one-hour acquisition deadline'
+          diagnosticFailure = { ...diagnosticFailure, stage: 'acquisition', cause: 'timeout' }
+          persistDiagnostic()
         }
       }
     } catch (error) {
@@ -2091,7 +2133,7 @@ async function main(): Promise<void> {
       reason = String(error)
       if (error instanceof AdvisorFailureError) failure = error.failure
       failure ??= classifyAdvisorFailure('claude', reason)
-      diagnosticFailure = { stage: failureStage, cause: failure.cause, ...(startupCode ? { startupCode } : {}) }
+      diagnosticFailure = { ...diagnosticFailure, stage: failureStage, cause: failure.cause, ...(startupCode ? { startupCode } : {}) }
       persistDiagnostic()
     } finally {
       if (!response && marker && target && claudeRuntime && diagnosticReads.length === 0) {

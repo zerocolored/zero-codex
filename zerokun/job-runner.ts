@@ -1411,6 +1411,19 @@ CREATE TABLE IF NOT EXISTS job_phase_dispatches (
 );
 CREATE INDEX IF NOT EXISTS idx_job_phase_dispatches_status
   ON job_phase_dispatches(job_id, attempt, status, phase_sequence);
+CREATE TABLE IF NOT EXISTS job_native_turns (
+  job_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  control_epoch INTEGER NOT NULL,
+  executor_nonce TEXT NOT NULL,
+  app_thread_id TEXT NOT NULL,
+  parent_turn_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  observed_at INTEGER,
+  PRIMARY KEY (job_id, attempt, turn_id),
+  FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
 CREATE TABLE IF NOT EXISTS slack_read_cursors (
   scope TEXT NOT NULL CHECK (scope IN ('owned-thread', 'catchup-recent', 'catchup-parent', 'scheduler')),
   cursor_key TEXT NOT NULL,
@@ -7265,6 +7278,48 @@ export class JobStore {
     if (updated.changes !== 1) throw new Error(`App Server turn binding changed for ${jobIdInput}`)
   }
 
+  /** Bind an App Server native goal continuation only to a completed owned parent. */
+  bindNativeAppServerTurn(
+    jobId: string,
+    workerId: string,
+    epoch: number,
+    executorNonce: string,
+    threadId: string,
+    parentTurnId: string,
+    turnId: string,
+  ): void {
+    for (const value of [jobId, workerId, executorNonce, threadId, parentTurnId, turnId]) {
+      requireText(value, 'native turn binding')
+    }
+    const bind = this.db.transaction(() => {
+      const job = this.db.query<JobRow, [string]>(
+        'SELECT * FROM jobs WHERE id = ?',
+      ).get(jobId)
+      if (!job || job.runtime !== 'codex' || job.status !== 'running'
+        || job.worker_id !== workerId || job.control_epoch !== epoch
+        || job.executor_nonce !== executorNonce || job.active_thread_id !== threadId
+        || (job.active_turn_id !== null && job.active_turn_id !== parentTurnId)
+        || job.cancel_requested_at !== null || parentTurnId === turnId
+        || !this.hasObservedTurnSource({
+          jobId, attempt: job.attempts, controlEpoch: epoch,
+          executorNonce, threadId, turnId: parentTurnId,
+        })) {
+        throw new Error(`native App Server parent binding changed for ${jobId}`)
+      }
+      // The ledger and current binding commit together; no historical dispatch
+      // is rewritten and an unobserved native turn cannot authorize recovery.
+      this.db.run(
+        `INSERT INTO job_native_turns (
+           job_id, attempt, control_epoch, executor_nonce, app_thread_id,
+           parent_turn_id, turn_id, started_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [jobId, job.attempts, epoch, executorNonce, threadId, parentTurnId, turnId, Date.now()],
+      )
+      this.bindAppServerTurn(jobId, workerId, epoch, executorNonce, threadId, turnId)
+    })
+    retrySqlite(() => bind())
+  }
+
   recordTaskGoalStatus(jobId: string, status: string): void {
     retrySqlite(() => this.db.run(
       'UPDATE jobs SET task_goal_status = ? WHERE id = ? AND status = \'running\'',
@@ -8349,6 +8404,14 @@ export class JobStore {
           throw new Error(`App Server phase terminal receipt changed for ${options.jobId}`)
         }
       }
+      this.db.run(
+        `UPDATE job_native_turns SET observed_at = ?
+         WHERE job_id = ? AND attempt = ? AND control_epoch = ?
+           AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?
+           AND observed_at IS NULL`,
+        [now, options.jobId, job.attempts, Math.floor(options.epoch),
+          options.executorNonce, options.threadId, options.turnId],
+      )
       this.db.run(
         `UPDATE job_controls SET status = 'observed', observed_at = ?
          WHERE job_id = ? AND control_epoch = ? AND status = 'acknowledged'
@@ -9587,6 +9650,93 @@ export class JobStore {
     ).get(jobId))
   }
 
+  private hasObservedTurnSource(receipt: Pick<CodexRateLimitTerminalReceipt,
+    'jobId' | 'attempt' | 'controlEpoch' | 'executorNonce' | 'threadId' | 'turnId'
+  >): boolean {
+    const dispatch = this.db.query<{
+      status: string
+      control_epoch: number
+      executor_nonce: string | null
+      app_thread_id: string | null
+      turn_id: string | null
+      observed_at: number | null
+    }, [string, number]>(
+      `SELECT status, control_epoch, executor_nonce, app_thread_id, turn_id, observed_at
+       FROM job_initial_dispatches WHERE job_id = ? AND attempt = ?`,
+    ).get(receipt.jobId, receipt.attempt)
+    const initialDispatchMatches = dispatch?.status === 'observed'
+      && dispatch.observed_at !== null
+      && dispatch.control_epoch === receipt.controlEpoch
+      && dispatch.executor_nonce === receipt.executorNonce
+      && dispatch.app_thread_id === receipt.threadId
+      && dispatch.turn_id === receipt.turnId
+    const phaseDispatch = this.db.query<{
+      status: string
+      control_epoch: number
+      logical_nonce: string
+      app_thread_id: string
+      turn_id: string | null
+      observed_at: number | null
+    }, [string, number, string]>(
+      `SELECT status, control_epoch, logical_nonce, app_thread_id, turn_id, observed_at
+       FROM job_phase_dispatches
+       WHERE job_id = ? AND attempt = ? AND turn_id = ?`,
+    ).get(receipt.jobId, receipt.attempt, receipt.turnId)
+    const phaseDispatchMatches = phaseDispatch?.status === 'observed'
+      && phaseDispatch.observed_at !== null
+      && phaseDispatch.control_epoch === receipt.controlEpoch
+      && phaseDispatch.logical_nonce === receipt.executorNonce
+      && phaseDispatch.app_thread_id === receipt.threadId
+      && phaseDispatch.turn_id === receipt.turnId
+    const interjectionDispatches = this.db.query<{
+      status: string
+      control_epoch: number
+      answer_request_id: number | null
+      answer_logical_nonce: string | null
+      answer_thread_id: string | null
+      answer_turn_id: string | null
+      answer_dispatched_at: number | null
+      answer_acknowledged_at: number | null
+    }, [string, number, string]>(
+      `SELECT status, control_epoch, answer_request_id, answer_logical_nonce,
+              answer_thread_id, answer_turn_id, answer_dispatched_at,
+              answer_acknowledged_at
+       FROM job_interjections
+       WHERE job_id = ? AND control_epoch = ? AND answer_turn_id = ?`,
+    ).all(receipt.jobId, receipt.controlEpoch, receipt.turnId)
+    const interjectionDispatchMatches = interjectionDispatches.length === 1
+      && ['ready', 'paused'].includes(interjectionDispatches[0]!.status)
+      && interjectionDispatches[0]!.control_epoch === receipt.controlEpoch
+      && interjectionDispatches[0]!.answer_request_id !== null
+      && interjectionDispatches[0]!.answer_logical_nonce === receipt.executorNonce
+      && interjectionDispatches[0]!.answer_thread_id === receipt.threadId
+      && interjectionDispatches[0]!.answer_turn_id === receipt.turnId
+      && interjectionDispatches[0]!.answer_dispatched_at !== null
+      && interjectionDispatches[0]!.answer_acknowledged_at !== null
+    const continuation = this.db.query<{ present: number }, [
+      string, number, string, string, string,
+      string, number, number, string, string, string,
+    ]>(
+      `SELECT 1 AS present FROM job_controls
+       WHERE job_id = ? AND control_epoch = ? AND status = 'observed'
+         AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?
+         AND request_id IS NOT NULL AND dispatched_at IS NOT NULL
+         AND acknowledged_at IS NOT NULL AND observed_at IS NOT NULL
+       UNION ALL
+       SELECT 1 AS present FROM job_native_turns
+       WHERE job_id = ? AND attempt = ? AND control_epoch = ?
+         AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?
+         AND observed_at IS NOT NULL
+       LIMIT 1`,
+    ).get(
+      receipt.jobId, receipt.controlEpoch, receipt.executorNonce, receipt.threadId, receipt.turnId,
+      receipt.jobId, receipt.attempt, receipt.controlEpoch,
+      receipt.executorNonce, receipt.threadId, receipt.turnId,
+    )
+    return Boolean(initialDispatchMatches || phaseDispatchMatches
+      || interjectionDispatchMatches || continuation)
+  }
+
   private durableRateLimitTerminalForRunningJob(
     jobIdInput: string,
   ): CodexRateLimitTerminalReceipt | null {
@@ -9611,69 +9761,7 @@ export class JobStore {
       || row.pending_result !== null
       || row.cancel_requested_at !== null
       || row.terminal_outcome !== null) return null
-    const dispatch = this.db.query<{
-      status: string
-      control_epoch: number
-      executor_nonce: string | null
-      app_thread_id: string | null
-      turn_id: string | null
-      observed_at: number | null
-    }, [string, number]>(
-      `SELECT status, control_epoch, executor_nonce, app_thread_id, turn_id, observed_at
-       FROM job_initial_dispatches WHERE job_id = ? AND attempt = ?`,
-    ).get(row.id, row.attempts)
-    const initialDispatchMatches = dispatch?.status === 'observed'
-      && dispatch.observed_at !== null
-      && dispatch.control_epoch === receipt.controlEpoch
-      && dispatch.executor_nonce === receipt.executorNonce
-      && dispatch.app_thread_id === receipt.threadId
-      && dispatch.turn_id === receipt.turnId
-    const phaseDispatch = this.db.query<{
-      status: string
-      control_epoch: number
-      logical_nonce: string
-      app_thread_id: string
-      turn_id: string | null
-      observed_at: number | null
-    }, [string, number, string]>(
-      `SELECT status, control_epoch, logical_nonce, app_thread_id, turn_id, observed_at
-       FROM job_phase_dispatches
-       WHERE job_id = ? AND attempt = ? AND turn_id = ?`,
-    ).get(row.id, row.attempts, receipt.turnId)
-    const phaseDispatchMatches = phaseDispatch?.status === 'observed'
-      && phaseDispatch.observed_at !== null
-      && phaseDispatch.control_epoch === receipt.controlEpoch
-      && phaseDispatch.logical_nonce === receipt.executorNonce
-      && phaseDispatch.app_thread_id === receipt.threadId
-      && phaseDispatch.turn_id === receipt.turnId
-    const interjectionDispatches = this.db.query<{
-      status: string
-      control_epoch: number
-      answer_request_id: number | null
-      answer_logical_nonce: string | null
-      answer_thread_id: string | null
-      answer_turn_id: string | null
-      answer_dispatched_at: number | null
-      answer_acknowledged_at: number | null
-    }, [string, number, string]>(
-      `SELECT status, control_epoch, answer_request_id, answer_logical_nonce,
-              answer_thread_id, answer_turn_id, answer_dispatched_at,
-              answer_acknowledged_at
-       FROM job_interjections
-       WHERE job_id = ? AND control_epoch = ? AND answer_turn_id = ?`,
-    ).all(row.id, receipt.controlEpoch, receipt.turnId)
-    const interjectionDispatchMatches = interjectionDispatches.length === 1
-      && ['ready', 'paused'].includes(interjectionDispatches[0]!.status)
-      && interjectionDispatches[0]!.control_epoch === receipt.controlEpoch
-      && interjectionDispatches[0]!.answer_request_id !== null
-      && interjectionDispatches[0]!.answer_logical_nonce === receipt.executorNonce
-      && interjectionDispatches[0]!.answer_thread_id === receipt.threadId
-      && interjectionDispatches[0]!.answer_turn_id === receipt.turnId
-      && interjectionDispatches[0]!.answer_dispatched_at !== null
-      && interjectionDispatches[0]!.answer_acknowledged_at !== null
-    if (!initialDispatchMatches && !phaseDispatchMatches && !interjectionDispatchMatches) {
-      return null
-    }
+    if (!this.hasObservedTurnSource(receipt)) return null
     const currentProtocol = this.db.query<{ present: number }, [string, number]>(
       `SELECT 1 AS present FROM codex_session_protocols
        WHERE session_id = ? AND protocol_version = ?`,
@@ -9732,35 +9820,7 @@ export class JobStore {
        WHERE job_id = ? AND attempt = ? LIMIT 1`,
     ).get(row.id, row.attempts)
     if (currentPhase) return null
-    const sourceDispatch = this.db.query<{ present: number }, [
-      string, number, number, string, string, string,
-      string, number, number, string, string, string,
-      string, number, string, string, string,
-    ]>(
-      `SELECT 1 AS present FROM job_initial_dispatches
-       WHERE job_id = ? AND attempt = ? AND control_epoch = ?
-         AND status = 'observed' AND executor_nonce = ?
-         AND app_thread_id = ? AND turn_id = ? AND observed_at IS NOT NULL
-       UNION ALL
-       SELECT 1 AS present FROM job_phase_dispatches
-       WHERE job_id = ? AND attempt = ? AND control_epoch = ?
-         AND status = 'observed' AND logical_nonce = ?
-         AND app_thread_id = ? AND turn_id = ? AND observed_at IS NOT NULL
-       UNION ALL
-       SELECT 1 AS present FROM job_interjections
-       WHERE job_id = ? AND control_epoch = ? AND status IN ('ready', 'paused')
-         AND answer_request_id IS NOT NULL AND answer_logical_nonce = ?
-         AND answer_thread_id = ? AND answer_turn_id = ?
-         AND answer_dispatched_at IS NOT NULL AND answer_acknowledged_at IS NOT NULL
-       LIMIT 1`,
-    ).get(
-      row.id, receipt.attempt, receipt.controlEpoch, receipt.executorNonce,
-      receipt.threadId, receipt.turnId,
-      row.id, receipt.attempt, receipt.controlEpoch, receipt.executorNonce,
-      receipt.threadId, receipt.turnId,
-      row.id, receipt.controlEpoch, receipt.executorNonce,
-      receipt.threadId, receipt.turnId,
-    )
+    const sourceDispatch = this.hasObservedTurnSource(receipt)
     const currentProtocol = this.db.query<{ present: number }, [string, number]>(
       `SELECT 1 AS present FROM codex_session_protocols
        WHERE session_id = ? AND protocol_version = ?`,
@@ -12327,6 +12387,7 @@ export class JobStore {
         }
         this.db.run('DELETE FROM job_interjections WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_controls WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM job_native_turns WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_phase_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_initial_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM jobs WHERE id = ?', [row.id])
@@ -18824,6 +18885,11 @@ async function runCli(): Promise<void> {
                 executorNonce,
                 threadId,
                 turnId,
+              ),
+              bindNativeTurn: (nonce, threadId, parentTurnId, turnId) => (
+                store.bindNativeAppServerTurn(
+                  job.id, job.workerId!, job.controlEpoch, nonce, threadId, parentTurnId, turnId,
+                )
               ),
               beginInitialDispatch: ({
                 executorNonce, threadId, requestId, inputRevision, inputDigest,
