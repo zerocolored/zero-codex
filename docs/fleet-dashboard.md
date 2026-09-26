@@ -26,6 +26,20 @@
 
 ## 起動時の自動登録
 
+### Slack認証による自動登録（2026-09-26以降）
+
+通常は各PCで `zerochan update` を実行するだけでよい。登録済みSlackアプリのBot認証を使用し、SupabaseのURL・キー・メール・パスワードの入力、`zerochan cloud login`、手動の監視member登録は不要。停止中のアプリは更新で起動しないため、使用するプロジェクトで `zerochan start` する。
+
+管理者は `202609260001_fleet_slack_sender.sql` を適用し、Workerへ `FLEET_SLACK_TEAM_ID`（許可するSlack workspace ID）を設定して公開する。既存の `FLEET_SPACE_ID` / `FLEET_GATEWAY_SECRET` を使う。秘密はGitへ追加しない。固定HTTPS URLだけをクライアントに同梱し、runtime URLへの差し替え・redirectによるトークン転送を許可しない。
+
+Workerは `auth.test` と `bots.info` でworkspace・bot・user・appの対応を検証する（Botには `users:read` が必要）。許可workspace内の各アプリは自身のapp IDに限り登録できる。アプリ名や番号を認証には使わない。Slack Bot tokenはTLS経由でWorkerへ送るが、Slack照合にだけ使用し、保存・ログ出力・DB転送しない。
+
+送信専用の乱数credentialはアプリ＋PCのinstanceに限定し、DBにはSHA-256のみ、PCにはowner-only `fleet-sender-credential.json` へ保存する。期限は30日で、失効・期限切れ時は同じ稼働プロセスが再認証する。一覧閲覧・引き継ぎ・他instance更新はできない。即時停止はDBのinstanceを `enabled=false` にする（自動復活しない）。Slack側の失効は次回登録・更新時に検出するため、発行済みcredentialには最大30日の残存期間がある。古い認証情報やinstance名・履歴は削除しない。
+
+登録は送信元IPごと15分60回まで。通常報告はSlack APIを呼ばない。通信障害はbackoffで再試行し本体を止めない。`zerochan fleet status` で新旧の送信認証方式を確認できる。監視offは引き続き尊重する。同じPCのinstanceを別PCへコピーしない。
+
+以下のクラウド認証方式は旧版互換・クラウド引き継ぎ用。新しい監視の前提ではない。
+
 `202609250002_fleet_auto_registration.sql` を適用した対応版では、Slack接続後に自動登録する。アプリごとのDB INSERTや `fleet register` は不要。既存の登録ID・表示名はそのまま使い、新しいアプリはSlack認証で得たBot名を初期表示名にする。PC名はOSユーザー名・hostnameではなく `Mac/PC + ランダムIDの先頭`。起動プロジェクトは従来どおりbasenameだけを送る。
 
 各PCに一度、クラウド認証が必要。起動アプリ自身の認証を優先し、なければ同PCの登録済みアプリが持つ認証を共有する（tokenのコピーはしない）。認証の許可済みSlack workspaceと監視spaceをDBで照合し、異なるspace候補が複数なら勝手に選ばない。既存監視登録の認証はmigrationで監視専用の送信権限へ移行する。新しいPCの認証には監視専用 `zerochan_fleet_senders` または既存の有効なクラウドmemberが必要。監視から引き継ぎ権限を追加することはない。

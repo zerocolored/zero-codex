@@ -1,9 +1,11 @@
+import { senderRequest } from './sender.ts'
 export interface Env {
   ASSETS: { fetch(request: Request): Promise<Response> }
   SUPABASE_URL: string
   SUPABASE_PUBLISHABLE_KEY: string
   FLEET_SPACE_ID: string
   FLEET_GATEWAY_SECRET: string
+  FLEET_SLACK_TEAM_ID?: string
 }
 const cookieName = '__Host-zero-fleet'
 const security = {
@@ -42,6 +44,7 @@ export function createWorker(fetcher: typeof fetch = fetch) {
       return response.json() as Promise<Record<string, unknown> | null>
     }
     try {
+      if (url.pathname.startsWith('/api/sender/')) return await senderRequest(request, env, rpc, fetcher)
       if (request.method === 'POST') {
         if (request.headers.get('origin') !== url.origin) return json({ error: '操作元を確認できません' }, 403)
         if (url.pathname === '/api/logout') {

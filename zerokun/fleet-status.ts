@@ -1,5 +1,6 @@
 /** Public monitoring contract. Never include prompts, paths, logs or credentials. */
 export type FleetState = 'available' | 'busy' | 'limited' | 'waiting' | 'unknown'
+export class FleetSessionExpired extends Error {}
 export interface FleetSnapshot {
   state: FleetState
   project: string
@@ -63,7 +64,10 @@ export function startFleetReporter(options: {
         await options.send(generation, ++sequence, snapshot)
         lastSent = serialized
         failures = 0
-      } catch { attempted = true; failures = Math.min(failures + 1, 4) }
+      } catch (error) {
+        if (error instanceof FleetSessionExpired) { generation = undefined; sequence = 0 }
+        attempted = true; failures = Math.min(failures + 1, 4)
+      }
       finally {
         if (attempted) nextAt = now() + (options.intervalMs ?? 30_000) * 2 ** failures
       }
