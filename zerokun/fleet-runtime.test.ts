@@ -88,3 +88,19 @@ test('ambiguous tenant candidates are not arbitrarily selected', async () => {
     await expect(discoverFleetAuth(f.state, 'TTEST', f.home, fetcher)).rejects.toThrow('ambiguous')
   } finally { f.cleanup() }
 })
+
+test('Slack sender automatically reports startup and current folder without Git or membership setup',async()=>{
+ const f=fixture();const calls:{action:string;body:any}[]=[]
+ const fetcher=(async(url:any,init:any)=>{
+  const action=String(url).split('/').at(-1)!;calls.push({action,body:JSON.parse(init.body)})
+  return Response.json(action==='enroll'?{instanceId:instance,token:'a'.repeat(64),expiresAt:Date.now()+100000}:action==='begin'?{generation:1}:{status:200})
+ }) as typeof fetch
+ const reporter=startConfiguredFleet(f.state,'ANEW','/not-a-git-folder/BSB',()=>({...facts(),currentProject:'Other',running:1,summary:'Current work'}),()=>true,{...f.options,fetcher,botToken:'xoxb-synthetic-test'})!
+ try{
+  await reporter.tick()
+  expect(calls.map(c=>c.action)).toEqual(['enroll','begin','project-report'])
+  const report=calls.at(-1)!.body
+  expect(report.projectKey).toBe('BSB');expect(report.currentProject).toBe('Other');expect(report.snapshot.project).toBe('BSB')
+  expect(report.snapshot.currentProject).toBeUndefined();expect(JSON.stringify(report)).not.toContain('/not-a-git-folder/')
+ }finally{reporter.stop();f.cleanup()}
+})

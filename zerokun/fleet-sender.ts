@@ -53,12 +53,13 @@ export class FleetSenderClient {
   }
   async send(generation: number, sequence: number, snapshot: FleetSnapshot, projectKey?: string) {
     if (!this.credential) throw new FleetSessionExpired('稼働状況の送信認証が未取得です')
-    const body = { instanceId: this.credential.instanceId, generation, sequence, snapshot }
+    const {currentProject,...publicSnapshot}=snapshot
+    const body = { instanceId: this.credential.instanceId, generation, sequence, snapshot:publicSnapshot }
     if (projectKey) {
-      try { await this.request('project-report', this.credential.token, {...body, projectKey}); return }
+      try { await this.request('project-report', this.credential.token, {...body, projectKey,currentProject:currentProject??null}); return }
       catch (error) { if (error instanceof FleetSessionExpired) throw error }
     }
-    // Unprovisioned projects keep the legacy dashboard heartbeat, but cannot be queried.
+    // An older server can still receive the legacy dashboard heartbeat during rollout.
     await this.request('report', this.credential.token, body)
   }
 }
