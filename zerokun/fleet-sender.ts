@@ -51,8 +51,14 @@ export class FleetSenderClient {
     const result = await this.request('begin', this.credential.token, { instanceId: this.credential.instanceId })
     return { instanceId: this.credential.instanceId, generation: z.number().int().positive().parse(result.generation) }
   }
-  async send(generation: number, sequence: number, snapshot: FleetSnapshot) {
+  async send(generation: number, sequence: number, snapshot: FleetSnapshot, projectKey?: string) {
     if (!this.credential) throw new FleetSessionExpired('稼働状況の送信認証が未取得です')
-    await this.request('report', this.credential.token, { instanceId: this.credential.instanceId, generation, sequence, snapshot })
+    const body = { instanceId: this.credential.instanceId, generation, sequence, snapshot }
+    if (projectKey) {
+      try { await this.request('project-report', this.credential.token, {...body, projectKey}); return }
+      catch (error) { if (error instanceof FleetSessionExpired) throw error }
+    }
+    // Unprovisioned projects keep the legacy dashboard heartbeat, but cannot be queried.
+    await this.request('report', this.credential.token, body)
   }
 }

@@ -1,4 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { fleetProject } from './zerokun/fleet-project.ts'
+import { classifyFleetRequest, readProjectFleet, fleetCloudTime, answerFleetStatus, unavailableFleet, fleetReplyEnvelope } from './zerokun/fleet-query.ts'
 /**
  * Standalone Slack gateway for Codex.
  *
@@ -116,6 +118,7 @@ import {
 import {
   buildSlackThreadIntentSnapshot,
   runSlackThreadIntentClassifier,
+  stopIsolatedCodexProcesses,
   serializeSlackThreadIntentSnapshot,
   slackThreadIntentInputDigest,
   slackThreadIntentClassifierLeaseMs,
@@ -1172,6 +1175,30 @@ function scheduleInboundDrain(delayMs = 0): void {
   inboundRetryTimer.unref()
 }
 
+let fleetQueryActive=false
+async function drainFleetQueries(): Promise<void> {
+  if(fleetQueryActive||shuttingDown)return
+  fleetQueryActive=true
+  try {
+    for(const query of jobStore.pendingFleetQueries()) {
+      let answer=unavailableFleet
+      let expiresAt=Date.now()+30000
+      if(query.projectKey) {
+        try {
+          const data=await readProjectFleet(STATE_DIR,query.projectKey)
+          if(shuttingDown)return
+          const received=Date.now(),serverNow=fleetCloudTime(data)
+          const deadlines=data.instances.filter(r=>r.receivedAt && serverNow-Date.parse(r.receivedAt)<90000)
+            .map(r=>received+Date.parse(r.receivedAt!)+90000-serverNow)
+          expiresAt=Math.min(received+30000,...deadlines)
+          answer=await answerFleetStatus(data)
+        } catch { /* never fall back to local or unrestricted data */ }
+      }
+      jobStore.completeFleetQuery(query.key,fleetReplyEnvelope(answer,expiresAt))
+    }
+  } finally { fleetQueryActive=false }
+}
+
 async function drainInboundDeliveries(): Promise<void> {
   if (inboundDrainActive) return
   inboundDrainActive = true
@@ -1192,6 +1219,17 @@ async function drainInboundDeliveries(): Promise<void> {
               inbound,
               download.controller.signal,
             )
+            // Classify before steering an active job or downloading attachments. Controls retain their old path.
+            if (!inbound.fileIds.length && !handoffControl(inbound.text) && !isExplicitUpdateRequest(inbound.text)) {
+              let route=jobStore.fleetQueryRoute(inbound.idempotencyKey)
+              if(!route) {
+                const context=jobStore.getSlackThreadReplyIntent(inbound.idempotencyKey)?.snapshotJson
+                  ?? jobStore.fleetTriageContext(inbound.chatId,inbound.threadTs,inbound.repoPath)
+                route=await classifyFleetRequest(inbound.text,context)
+                jobStore.stageFleetRoute(inbound,route,fleetProject(inbound.repoPath)?.key??null)
+              }
+              if(route==='fleet-status') { void drainFleetQueries().catch(() => {}); continue }
+            }
             attachments = await downloadInboundFiles(
               inbound,
               download.controller.signal,
@@ -1738,8 +1776,8 @@ function shutdown(): void {
   // Keep the singleton lock and SQLite handle until the process exits. Releasing
   // either while Bolt still owns a Socket Mode connection allows a replacement
   // gateway to overlap with this one and split Slack events.
-  setTimeout(() => process.exit(0), 2000)
-  void slackApp?.stop().finally(() => process.exit(0))
+  setTimeout(() => process.exit(0), 5000)
+  void Promise.all([stopIsolatedCodexProcesses(), slackApp?.stop()]).finally(() => process.exit(0))
 }
 
 function stopOrphanedUpdateCandidate(): void {
@@ -2794,7 +2832,7 @@ try {
   // generation-bound readiness record are both established.
   clearIntentionalServiceStop(STATE_DIR)
   fleetReporter = startConfiguredFleet(STATE_DIR, identity.appId, connectedProjectDir,
-    () => jobStore.fleetFacts(), () => slackSocket?.connected === true,
+    () => jobStore.fleetFacts(Date.now(), connectedProjectDir), () => slackSocket?.connected === true,
     { teamId: identity.teamId, name: identity.botName, botToken: BOT_TOKEN })
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 
@@ -2839,6 +2877,7 @@ try {
   setInterval(() => { void scheduleCatchupSweep() }, CATCHUP_SWEEP_INTERVAL_MS).unref()
   setInterval(recoverUpdateNotificationWorker, UPDATE_RECOVERY_INTERVAL_MS).unref()
   setInterval(() => scheduleInboundDrain(), 5_000).unref()
+  setInterval(() => { void drainFleetQueries().catch(() => {}) }, 5_000).unref()
   setInterval(() => { void drainSlackThreadReplyIntents() }, THREAD_INTENT_DRAIN_INTERVAL_MS).unref()
   setInterval(stopOrphanedUpdateCandidate, 5_000).unref()
 } catch (err) {

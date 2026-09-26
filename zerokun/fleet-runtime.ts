@@ -6,6 +6,7 @@ import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from 
 import { CloudHandoffClient, readCloudConfig } from './cloud-handoff.ts'
 import { projectFleetStatus, startFleetReporter, type FleetLocalFacts } from './fleet-status.ts'
 import { listRegisteredSlackApps, readRegisteredSlackApp } from './slack-app-registry.ts'
+import { fleetProject } from './fleet-project.ts'
 import { FleetSenderClient, FleetSenderDiagnostic } from './fleet-sender.ts'
 import { FleetSessionExpired } from './fleet-status.ts'
 
@@ -74,6 +75,7 @@ export function startConfiguredFleet(state: string, appId: string, project: stri
   let config: FleetRegistration | undefined
   let warned = false
   let sender: FleetSenderClient | undefined
+  const scopedProject = fleetProject(project)
   const warn = options.warn ?? (message => process.stderr.write(message + '\n'))
   const client = () => {
     if (!config) throw new Error('monitoring registration pending')
@@ -138,7 +140,7 @@ export function startConfiguredFleet(state: string, appId: string, project: stri
       send: async (generation, sequence, snapshot) => {
         if (fleetIsOff(state)) return
         if (!config) throw new Error('monitoring registration pending')
-        if (sender) { await sender.send(generation, sequence, snapshot); return }
+        if (sender) { await sender.send(generation, sequence, snapshot, scopedProject?.key); return }
         const result = await client().fleetRpc('report', { p_id: config.instanceId, p_generation: generation, p_sequence: sequence, p_snapshot: snapshot })
         if (result !== true) throw new Error('stale monitoring generation')
       },

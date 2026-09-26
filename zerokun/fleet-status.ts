@@ -12,6 +12,7 @@ export interface FleetSnapshot {
   runnerHealthy: boolean
 }
 export interface FleetLocalFacts {
+  occupiedElsewhere?: boolean
   running: number; queued: number; limited: boolean; approval: boolean; deferred: boolean
   lastAcceptedAt: number | null; summary: string | null; summaryAt: number | null
 }
@@ -30,7 +31,7 @@ export function projectFleetStatus(facts: FleetLocalFacts, runtime: {
 }): FleetSnapshot {
   const state: FleetState = !runtime.slackConnected || !runtime.runnerHealthy ? 'unknown'
     : facts.limited ? 'limited' : facts.running ? 'busy'
-      : runtime.paused || facts.queued > 0 || facts.deferred ? 'waiting' : 'available'
+      : runtime.paused || facts.occupiedElsewhere || facts.queued > 0 || facts.deferred ? 'waiting' : 'available'
   return { state, project: runtime.project, queued: facts.queued,
     lastAcceptedAt: facts.lastAcceptedAt,
     summary: facts.running || facts.limited ? facts.summary : facts.approval ? '別タスクの画面案は承認待ちです' : null,

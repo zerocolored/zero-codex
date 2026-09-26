@@ -1,6 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
+import { fleetReplyForDelivery } from './fleet-query.ts'
 import { toSlackMrkdwn } from './slack-mrkdwn.ts'
 import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
 import { startFleetRunnerPulse } from './fleet-runtime.ts'
@@ -954,6 +955,12 @@ CREATE TABLE IF NOT EXISTS commentary_notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_commentary_notifications_pending
   ON commentary_notifications(delivered_at, not_before, seq);
+CREATE TABLE IF NOT EXISTS fleet_queries (
+ idempotency_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
+ repo_path TEXT NOT NULL, project_key TEXT, input TEXT NOT NULL,
+ route TEXT NOT NULL CHECK(route IN ('work','fleet-status')), created_at INTEGER NOT NULL,
+ completed_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS status_notifications (
   id TEXT PRIMARY KEY,
   idempotency_key TEXT NOT NULL UNIQUE,
@@ -962,7 +969,7 @@ CREATE TABLE IF NOT EXISTS status_notifications (
   thread_ts TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN (
     'accepted', 'interrupt-accepted', 'closed-control',
-    'inactive-interrupt', 'attachment-control-failed', 'rate-limited', 'execution-started'
+    'inactive-interrupt', 'attachment-control-failed', 'rate-limited', 'execution-started', 'fleet-status'
   )),
   payload TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -1891,9 +1898,10 @@ function ensureJobSchemaMigrations(db: Database): void {
     const schema = db.query<{ sql: string }, []>(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'status_notifications'",
     ).get()!.sql
-    if (schema.includes("'execution-started'")) return
+    const missingKinds = ['execution-started', 'fleet-status'].filter(kind => !schema.includes(`'${kind}'`))
+    if (!missingKinds.length) return
     db.exec(schema.replace('status_notifications', 'status_notifications_next')
-      .replace("'rate-limited'", "'rate-limited', 'execution-started'"))
+      .replace("'rate-limited'", ["'rate-limited'", ...missingKinds.map(kind => `'${kind}'`)].join(', ')))
     db.exec(`INSERT INTO status_notifications_next SELECT * FROM status_notifications;
       DROP TABLE status_notifications;
       ALTER TABLE status_notifications_next RENAME TO status_notifications;
@@ -6547,6 +6555,37 @@ export class JobStore {
     return retrySqlite(() => fail.immediate())
   }
 
+  fleetQueryRoute(key: string): 'work' | 'fleet-status' | null {
+    return this.db.query<{route:'work'|'fleet-status'},[string]>('SELECT route FROM fleet_queries WHERE idempotency_key=?').get(key)?.route ?? null
+  }
+
+  fleetTriageContext(chat: string, thread: string, repo: string): string {
+    const jobs=this.db.query<{task:string},[string,string,string]>("SELECT task FROM jobs WHERE chat_id=? AND thread_ts=? AND repo_path=? ORDER BY seq DESC LIMIT 4").all(chat,thread,repo)
+    const queries=this.db.query<{input:string,route:string},[string,string,string]>("SELECT input,route FROM fleet_queries WHERE chat_id=? AND thread_ts=? AND repo_path=? ORDER BY created_at DESC LIMIT 4").all(chat,thread,repo)
+    return JSON.stringify({recentTasks:jobs,recentQueries:queries}).slice(-20000)
+  }
+
+  stageFleetRoute(inbound: InboundDeliveryRecord, route: 'work' | 'fleet-status', projectKey: string | null): void {
+    retrySqlite(()=>this.db.transaction(()=>{
+      this.db.run(`INSERT OR IGNORE INTO fleet_queries VALUES(?,?,?,?,?,?,?,?,NULL)`,[
+        inbound.idempotencyKey,inbound.chatId,inbound.threadTs,inbound.repoPath,projectKey,inbound.text,route,Date.now()])
+      if(route==='fleet-status') this.tombstoneInboundDelivery(inbound.idempotencyKey)
+    }).immediate())
+  }
+
+  pendingFleetQueries(): Array<{key:string;projectKey:string|null}> {
+    return this.db.query<{key:string;projectKey:string|null},[]>(`SELECT idempotency_key AS key, project_key AS projectKey FROM fleet_queries WHERE route='fleet-status' AND completed_at IS NULL ORDER BY created_at LIMIT 1`).all()
+  }
+
+  completeFleetQuery(key:string, payload:string): void {
+    retrySqlite(()=>this.db.transaction(()=>{
+      const row=this.db.query<{chat_id:string;thread_ts:string},[string]>(`SELECT chat_id,thread_ts FROM fleet_queries WHERE idempotency_key=? AND completed_at IS NULL AND route='fleet-status'`).get(key)
+      if(!row)return
+      this.stageStatusNotificationRow({idempotencyKey:`fleet-status:${key}`,jobId:null,chatId:row.chat_id,threadTs:row.thread_ts,kind:'fleet-status',payload,createdAt:Date.now()})
+      this.db.run('UPDATE fleet_queries SET completed_at=? WHERE idempotency_key=?',[Date.now(),key])
+    }).immediate())
+  }
+
   completeInboundDelivery(idempotencyKey: string): void {
     retrySqlite(() => this.db.run(
       `DELETE FROM inbound_deliveries WHERE idempotency_key = ?`,
@@ -9007,32 +9046,35 @@ export class JobStore {
   }
 
   /** Small public projection: never select task/result/raw logs for monitoring. */
-  fleetFacts(now = Date.now()): FleetLocalFacts {
+  fleetFacts(now = Date.now(), project?: string): FleetLocalFacts {
     const counts = this.activeCounts()
-    counts.queued = this.db.query<{ n: number }, []>(`SELECT count(*) AS n FROM jobs WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}`).get()!.n
-    const current = this.db.query<{ id: string; attempts: number; not_before: number | null; rate_limit_terminal_json: string | null }, []>(
+    const allQueued = counts.queued
+    const allRunning = counts.running
+    if(project) counts.running=this.db.query<{n:number},[string]>("SELECT count(*) AS n FROM jobs WHERE runtime='codex' AND status='running' AND repo_path=?").get(project)!.n
+    counts.queued = this.db.query<{ n: number }, any[]>(`SELECT count(*) AS n FROM jobs WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE} AND (? IS NULL OR repo_path=?)`).get(project ?? null, project ?? null)!.n
+    const current = this.db.query<{ id: string; attempts: number; not_before: number | null; rate_limit_terminal_json: string | null }, any[]>(
       `SELECT id, attempts, not_before, rate_limit_terminal_json FROM jobs
-       WHERE runtime='codex' AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
+       WHERE (? IS NULL OR repo_path=?) AND runtime='codex' AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
        ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, seq LIMIT 1`,
-    ).get()
+    ).get(project ?? null, project ?? null)
     const summary = current ? this.db.query<{ payload: string; created_at: number }, [string, number]>(
       `SELECT payload,created_at FROM commentary_notifications WHERE job_id=? AND attempt=?
        AND delivered_at IS NOT NULL AND suppressed_at IS NULL ORDER BY seq DESC LIMIT 1`,
     ).get(current.id, current.attempts) : null
-    const last = this.db.query<{ at: number | null }, []>(
-      `SELECT MAX(at) AS at FROM (SELECT MAX(created_at) AS at FROM jobs WHERE runtime='codex'
-       UNION ALL SELECT MAX(created_at) FROM job_controls WHERE kind='steer')`,
-    ).get()?.at ?? null
-    const limited = !counts.running && (Boolean(current?.rate_limit_terminal_json) || Boolean(this.db.query<{ yes: number }, []>(
-      "SELECT 1 AS yes FROM cloud_handoff_jobs WHERE state IN ('saving','waiting') LIMIT 1",
-    ).get()))
-    const approval = Boolean(this.db.query<{ yes: number }, []>(
-      "SELECT 1 AS yes FROM ui_approval_requests WHERE status IN ('publishing','awaiting') LIMIT 1",
-    ).get())
+    const last = this.db.query<{ at: number | null }, any[]>(
+      `SELECT MAX(at) AS at FROM (SELECT MAX(created_at) AS at FROM jobs WHERE runtime='codex' AND (? IS NULL OR repo_path=?)
+       UNION ALL SELECT MAX(c.created_at) FROM job_controls c JOIN jobs j ON j.id=c.job_id WHERE c.kind='steer' AND (? IS NULL OR j.repo_path=?))`,
+    ).get(project ?? null, project ?? null, project ?? null, project ?? null)?.at ?? null
+    const limited = !counts.running && (Boolean(current?.rate_limit_terminal_json) || Boolean(this.db.query<{ yes: number }, any[]>(
+      "SELECT 1 AS yes FROM cloud_handoff_jobs WHERE state IN ('saving','waiting') AND (? IS NULL OR job_id IN (SELECT id FROM jobs WHERE repo_path=?)) LIMIT 1",
+    ).get(project ?? null, project ?? null)))
+    const approval = Boolean(this.db.query<{ yes: number }, any[]>(
+      "SELECT 1 AS yes FROM ui_approval_requests WHERE status IN ('publishing','awaiting') AND (? IS NULL OR job_id IN (SELECT id FROM jobs WHERE repo_path=?)) LIMIT 1",
+    ).get(project ?? null, project ?? null))
     // Public Slack milestones only. Credentials and local paths are not a fleet summary.
     const text = summary?.payload.replace(/^💬\s*/, '').trim() ?? null
     const safe = text && !containsCredentialMaterial(text) ? fleetSummaryWithoutPaths(text) : null
-    return { ...counts, limited, approval, deferred: Boolean(current?.not_before && current.not_before > now),
+    return { ...counts, limited, approval, occupiedElsewhere: allRunning > counts.running || allQueued > counts.queued, deferred: Boolean(current?.not_before && current.not_before > now),
       lastAcceptedAt: last, summary: limited ? null : safe, summaryAt: !limited && safe ? summary!.created_at : null }
   }
 
@@ -13422,7 +13464,7 @@ export interface CommentaryNotification {
 export type StatusNotificationKind =
   | 'accepted' | 'interrupt-accepted' | 'closed-control'
   | 'inactive-interrupt' | 'attachment-control-failed' | 'rate-limited'
-  | 'execution-started'
+  | 'execution-started' | 'fleet-status'
   | 'interjection-answer'
 
 export interface StatusNotification {
@@ -16795,7 +16837,7 @@ export class SlackNotifier implements JobNotifier {
   }
 
   async status(notification: StatusNotification, signal?: AbortSignal): Promise<void> {
-    let payload = notification.payload
+    let payload = notification.kind === 'fleet-status' ? fleetReplyForDelivery(notification.payload) : notification.payload
     if (notification.kind === 'interjection-answer' && notification.jobId) {
       const job = this.store.get(notification.jobId)
       const interjection = (notification as Partial<InterjectionNotification>).interjection
