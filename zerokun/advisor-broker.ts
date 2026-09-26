@@ -762,6 +762,20 @@ function collectCapped(stream: ReadableStream<Uint8Array>): {
   }
 }
 
+// A losing Bun.sleep in Promise.race keeps the broker alive until its deadline
+// (up to minutes), even after the transport and every reviewer have finished.
+// Dispose the deadline on success AND rejection; do not weaken the timeout.
+async function raceDeadline<T, U>(work: Promise<T>, ms: number, timeout: U): Promise<T | U> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([work, new Promise<U>(resolve => {
+      timer = setTimeout(() => resolve(timeout), ms)
+    })])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export async function runBounded(
   command: string[],
   options: {
@@ -818,7 +832,7 @@ export async function runBounded(
       // mistake it for proof that descendants were contained.
       try { child.kill('SIGKILL') } catch {}
     }
-    await Promise.race([exit.catch(() => 1), Bun.sleep(1_000)])
+    await raceDeadline(exit.catch(() => 1), 1_000, undefined)
     if (remaining.length > 0) {
       throw new AdvisorOwnedProcessStillLiveError(
         `advisor subprocess startup cleanup is incomplete: ${remaining.join(', ')}`,
@@ -860,10 +874,10 @@ export async function runBounded(
   let forcedCleanup = false
   let outcome = options.timeoutMs === undefined
     ? { kind: 'exit' as const, exitCode: await exit }
-    : await Promise.race([
+    : await raceDeadline(
       exit.then(exitCode => ({ kind: 'exit' as const, exitCode })),
-      Bun.sleep(options.timeoutMs).then(() => ({ kind: 'timeout' as const })),
-    ])
+      options.timeoutMs, { kind: 'timeout' as const },
+    )
   tracking = false
   await tracker
   if (outcome.kind === 'timeout') {
@@ -886,10 +900,10 @@ export async function runBounded(
         `advisor subprocess cleanup is incomplete: ${remaining.join(', ')}`,
       )
     }
-    const killed = await Promise.race([
+    const killed = await raceDeadline(
       exit.then(exitCode => ({ kind: 'exit' as const, exitCode })),
-      Bun.sleep(1_000).then(() => ({ kind: 'timeout' as const })),
-    ])
+      1_000, { kind: 'timeout' as const },
+    )
     outcome = killed.kind === 'exit' ? killed : { kind: 'exit', exitCode: 137 }
   }
   let remaining: number[]
@@ -918,17 +932,17 @@ export async function runBounded(
     ? `advisor subprocess tracking was temporarily unavailable: ${trackingError}`
     : undefined
   const relays = Promise.all([stdout.promise, stderr.promise])
-  let relayOutput = await Promise.race([
+  let relayOutput = await raceDeadline(
     relays.then(value => ({ kind: 'done' as const, value })),
-    Bun.sleep(2_000).then(() => ({ kind: 'timeout' as const })),
-  ])
+    2_000, { kind: 'timeout' as const },
+  )
   if (relayOutput.kind === 'timeout') {
     timedOut = true
     await Promise.all([stdout.cancel(), stderr.cancel()])
-    relayOutput = await Promise.race([
+    relayOutput = await raceDeadline(
       relays.then(value => ({ kind: 'done' as const, value })),
-      Bun.sleep(1_000).then(() => ({ kind: 'timeout' as const })),
-    ])
+      1_000, { kind: 'timeout' as const },
+    )
   }
   const [stdoutText, stderrText] = relayOutput.kind === 'done'
     ? relayOutput.value
@@ -3734,10 +3748,10 @@ async function main(): Promise<void> {
       task = Promise.resolve(recovered)
       roundTasks.set(taskKey, task)
     }
-    const outcome = await Promise.race([
+    const outcome = await raceDeadline(
       task.then(result => ({ kind: 'complete' as const, result })),
-      Bun.sleep(15_000).then(() => ({ kind: 'pending' as const })),
-    ])
+      15_000, { kind: 'pending' as const },
+    )
     if (outcome.kind === 'pending') {
       return toolText({
         complete: false,

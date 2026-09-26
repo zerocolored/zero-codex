@@ -881,6 +881,11 @@ for line in sys.stdin:
         }] if mode == "phased-native-history-resume" else []
         emit({"id": request_id, "result": {"data": children, "nextCursor": None}})
     elif method == "turn/steer":
+        if mode.startswith("progress") and goal_status == "complete":
+            # A steer queued before completion can arrive afterwards. A real
+            # server rejects it; it must not complete the same turn twice.
+            emit({"id": request_id, "error": {"code": -32000, "message": "turn is no longer active"}})
+            continue
         if os.environ.get("ZERO_CONTINUATION_STEER") == "1":
             steer_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
             control_log = os.environ.get("ZERO_CONTROL_LOG")
@@ -5800,16 +5805,19 @@ describe('production App Server executor', () => {
 
   test('進捗ACKがtimeout後に届いても本体turnは正常完了する', async () => {
     const value = fixture('progress-late-ack')
+    const rpcLog = join(value.root, 'late-ack-rpc.log')
     const reports: string[] = []
     const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
       stateDir: value.state,
       skipEffectiveConfigCheck: true,
-      extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-late-ack' },
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-late-ack', ZERO_RPC_LOG: rpcLog },
       progressActivatedAtMs: Date.now(),
       progressScheduleForTesting: {
-        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+        // Test one late ACK, not cadence supersession during process startup.
+        // The fixture still delays that ACK 80ms beyond the 20ms request limit.
+        firstMs: 10, secondMs: 60_000, thirdMs: 120_000, repeatMs: 60_000,
       },
       progressSteerTimeoutMsForTesting: 20,
       onProgressProbeStarted: () => true,
@@ -5819,6 +5827,9 @@ describe('production App Server executor', () => {
     })
     expect(result.result).toBe('遅いACKの後も完了しました ✅')
     expect(reports).toEqual(['遅い応答でも作業を続けています 🔎'])
+    const calls = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(1)
+    expect(calls.filter(call => call.method === 'turn/steer')).toHaveLength(1)
     value.store.close()
   }, 15_000)
 

@@ -1022,6 +1022,18 @@ describe('advisor broker boundaries', () => {
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(100)
   })
 
+  test('完了したtransportのdeadline timerはbrokerの自然終了を妨げない', async () => {
+    const result = await runBounded([process.execPath, '--config=/dev/null', '--no-env-file', '-e',
+      `import { runBounded } from ${JSON.stringify(join(import.meta.dir, 'advisor-broker.ts'))};
+       const result = await runBounded(['/bin/sleep', '0.1'], { timeoutMs: 60_000 });
+       if (result.exitCode !== 0 || result.timedOut) process.exit(1);
+       console.log('naturally finished');`,
+    ], { timeoutMs: 3_000, env: { PATH: '/usr/bin:/bin' } })
+    expect(result.stdout.trim()).toBe('naturally finished')
+    expect(result.timedOut).toBe(false)
+    expect(result.exitCode).toBe(0)
+  })
+
   test('trackerの一時失敗は最終reapが空ならreviewer結果を失敗へ昇格しない', async () => {
     const result = await runBounded([
       '/usr/bin/python3', '-c', 'print("review complete")',
