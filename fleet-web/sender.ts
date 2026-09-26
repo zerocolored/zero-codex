@@ -14,7 +14,7 @@ async function body(request: Request): Promise<any> {
 }
 export async function senderRequest(request: Request, env: SenderEnv, rpc: Rpc, fetcher: typeof fetch): Promise<Response> {
   const action = new URL(request.url).pathname.slice('/api/sender/'.length)
-  if (request.method !== 'POST' || !['enroll', 'begin', 'report'].includes(action)) return reply(404, 'not_found')
+  if (request.method !== 'POST' || !['enroll', 'begin', 'report', 'project-report', 'project-status'].includes(action)) return reply(404, 'not_found')
   // No browser cookies or Origin-authorized writes on machine endpoints.
   if (request.headers.has('origin')) return reply(403, 'machine_only')
   if (!request.headers.get('content-type')?.startsWith('application/json')) return reply(415, 'json_required')
@@ -55,6 +55,13 @@ export async function senderRequest(request: Request, env: SenderEnv, rpc: Rpc, 
   }
   if (!/^Bearer [a-f0-9]{64}$/.test(auth) || !uuid(input.instanceId)) return reply(401, 'sender_auth_required')
   const common = { p_id: input.instanceId, p_token: auth.slice(7) }
+  if (action.startsWith('project-')) {
+    if (typeof input.projectKey !== 'string' || !/^[a-f0-9]{64}$/.test(input.projectKey)) return reply(400, 'invalid_project')
+    const result = await rpc(action === 'project-status' ? 'project_status' : 'project_report', { ...common, p_project: input.projectKey,
+      ...(action === 'project-report' ? {p_generation:input.generation,p_sequence:input.sequence,p_snapshot:input.snapshot} : {}) })
+    if (result?.status !== 200) return reply([400,401,403,409].includes(result?.status) ? result.status : 503, 'project_unavailable')
+    return Response.json(result, {headers:{'Cache-Control':'no-store'}})
+  }
   const result = action === 'begin'
     ? await rpc('sender_begin', common)
     : await rpc('sender_report', { ...common, p_generation: input.generation, p_sequence: input.sequence, p_snapshot: input.snapshot })

@@ -260,6 +260,12 @@ function readOwnerOnlyOutput(path: string): string {
   }
 }
 
+let isolatedStopping = false
+const isolatedProcesses = new Set<Bun.Subprocess>()
+export async function stopIsolatedCodexProcesses(): Promise<void> {
+  isolatedStopping = true
+  await Promise.all([...isolatedProcesses].map(terminateClassifier))
+}
 let activeClassifiers = 0
 const classifierWaiters: Array<() => void> = []
 
@@ -325,22 +331,25 @@ export async function runSlackThreadIntentClassifier(
   snapshotJson: string,
   options: { timeoutMs?: number; model?: string } = {},
 ): Promise<SlackThreadIntentDecision> {
-  const release = await takeClassifierSlot()
+  return parseSlackThreadIntentDecision(await runIsolatedCodexJson(buildSlackThreadIntentPrompt(snapshotJson), {
+    type: 'object', additionalProperties: false, required: ['audience'],
+    properties: { audience: { type: 'string', enum: ['addressed', 'not-addressed'] } },
+  }, options))
+}
+
+/** Tool-free standalone process; only caller-supplied bounded data reaches the model. */
+export async function runIsolatedCodexJson(prompt: string, schema: object,
+  options: { timeoutMs?: number; model?: string; independent?: boolean } = {}): Promise<string> {
+  if (Buffer.byteLength(prompt) > 100_000) throw new Error('model input too large')
+  const release = options.independent ? () => {} : await takeClassifierSlot()
   let runtime: string | null = null
   let proc: Bun.Subprocess | null = null
   try {
+    if (isolatedStopping) throw new Error('isolated Codex is stopping')
     runtime = mkdtempSync(join(tmpdir(), 'zerochan-thread-intent-'))
     chmodSync(runtime, 0o700)
     const schemaPath = join(runtime, 'schema.json')
     const outputPath = join(runtime, 'output.json')
-    const schema = {
-      type: 'object',
-      additionalProperties: false,
-      required: ['audience'],
-      properties: {
-        audience: { type: 'string', enum: ['addressed', 'not-addressed'] },
-      },
-    }
     writeFileSync(schemaPath, JSON.stringify(schema), { mode: 0o600, flag: 'wx' })
     // Codex writes through the existing descriptor/path. Pre-creating avoids
     // relying on the process umask for the model result's confidentiality.
@@ -360,6 +369,8 @@ export async function runSlackThreadIntentClassifier(
       '--ignore-rules',
       '--sandbox', 'read-only',
       '--config', 'approval_policy="never"',
+      '--config', 'web_search="disabled"',
+      '--config', 'tools.web_search=false',
       '--output-schema', schemaPath,
       '--output-last-message', outputPath,
       '--color', 'never',
@@ -386,7 +397,8 @@ export async function runSlackThreadIntentClassifier(
       detached: true,
     })
     proc = spawned
-    spawned.stdin.write(buildSlackThreadIntentPrompt(snapshotJson))
+    isolatedProcesses.add(spawned)
+    spawned.stdin.write(prompt)
     spawned.stdin.end()
     const timeoutMs = slackThreadIntentClassifierTimeoutMs(options.timeoutMs)
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -401,10 +413,11 @@ export async function runSlackThreadIntentClassifier(
     }
     if (timer) clearTimeout(timer)
     if (outcome !== 0) throw new Error(`thread intent classifier exited ${outcome}`)
-    return parseSlackThreadIntentDecision(readOwnerOnlyOutput(outputPath))
+    return readOwnerOnlyOutput(outputPath)
   } finally {
     try {
       if (proc?.exitCode === null) await terminateClassifier(proc)
+      if (proc) isolatedProcesses.delete(proc)
       if (runtime) rmSync(runtime, { recursive: true, force: true })
     } finally {
       release()
