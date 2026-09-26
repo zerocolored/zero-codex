@@ -18,6 +18,72 @@ Codexには次のように依頼します。
 セットアップして
 ```
 
+## Codexを使わず1コマンドで行う
+
+Codexへ依頼せず、同じ範囲をshellから通す場合は[`zerokun/quick-setup.sh`](zerokun/quick-setup.sh)を使います。
+`bootstrap-macos.sh`の基本導入に加えて、codex-configのglobal `AGENTS.md`配置、Slack設定、
+channel紐付け、起動までを1コマンドで順に実行します。
+
+```bash
+bash zerokun/quick-setup.sh \
+  --project /absolute/path/to/project \
+  --app-name 'Zeroちゃん-新Mac' --bot-name zerochan-new-mac \
+  --channel C0123456789
+```
+
+`--channel`は繰り返し指定できます。`--doctor`は何も変更せず状態だけを表示し、
+`--skip-slack` / `--skip-codex-config` / `--skip-permissions` / `--skip-chrome` /
+`--skip-go-chrome-mcp`はそれぞれの段階を省略します。
+
+### macOS権限(TCC)
+
+Zeroちゃんを動かすterminal.appには、**アクセシビリティ / 画面収録 / フルディスクアクセス**が要ります。
+既定の置き場`~/Desktop/Project`はTCC保護下にあり、フルディスクアクセスが無いと
+launchd・cron経由の実行が`Operation not permitted`で止まります。
+
+**この許可はscriptから付与できません。** `TCC.db`はSIP保護で書き込めず、`tccutil`はresetしか持ちません。
+quick-setup.shが行うのは次までで、チェックを入れるのは本人です。
+
+1. systemの`TCC.db`を読んで、install済みのterminal.appごとに3つの状態を一覧する
+2. 不足していれば該当の設定paneを開き、Enterで再判定する
+3. フルディスクアクセスへ追加するCLIの実体path(`codex` / `claude` / `grok` / `bun` / `node` / `python3` / `/bin/bash`)をclipboardへ入れる
+
+オートメーション(Apple Events)は事前付与ができません。Slack・Chromeを最初に操作したときの
+dialogで許可します。誤って拒否した場合は`tccutil reset AppleEvents <bundle id>`で出し直せます。
+
+### Chrome拡張
+
+既定でClaude・ChatGPTの導入を確認し、未導入ならWeb Storeのページを開きます。
+`--chrome-extension <id>`で追加でき、`--force-extensions`を付けた場合は
+machine policy(`/Library/Preferences/com.google.Chrome`の`ExtensionInstallForcelist`)で
+強制installします。この場合Chromeに「組織によって管理されています」が付き、ユーザーは拡張を無効化できません。
+
+```bash
+sudo defaults delete /Library/Preferences/com.google.Chrome ExtensionInstallForcelist   # 取り消す
+```
+
+### go-chrome-mcp
+
+実Chromeを操作するMCP([ernie1358/go-chrome-mcp](https://github.com/ernie1358/go-chrome-mcp))を
+導入します。clone、`npm install`、Claude Code(`~/.claude.json`の`mcpServers`)とCodex
+(`~/.codex/config.toml`の`[mcp_servers.go-chrome-mcp]`)への登録、読み込み済みかの判定までを行います。
+置き場の既定はzero-codexと同じ階層の`go-chrome-mcp`で、`GO_CHROME_MCP_DIR`で変えられます。
+
+**拡張の読み込みだけは本人操作です。** Web Storeではなくunpackedで読み込むため、policyでは
+installできません。またChromeはコマンドラインから`chrome://extensions`を開けません。
+
+1. Chromeで`chrome://extensions`を開く
+2. 「デベロッパーモード」をON
+3. 「パッケージ化されていない拡張機能を読み込む」
+4. cloneしたdirectoryを選ぶ(pathはclipboardへ入れてあります)
+
+読み込み済みかどうかは、Chromeのprofileが持つ`location=4`(unpacked)と実pathの一致で判定します。
+Codexへの登録は`config.toml`への追記のため、codex-configの適用より後に実行します。
+
+loginは自動化せず、未了の段階で停止して実行すべきcommandを表示します。
+Herdr serverが動いていないと`zerochan start`はworkspace createに失敗するため、
+Herdrのpane内で実行するか、先に`herdr`でserverを起動しておきます。
+
 ## 「一言でセットアップ」の範囲
 
 CodexなどのAIエージェントが技術的な選択、commandの順序、再実行、検証に加え、ブラウザでの
