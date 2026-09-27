@@ -1,3 +1,4 @@
+import { waitForAdvisorSettlement } from './advisor-settlement.ts'
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
 import { installedComputerUseClient, installedComputerUseNodeRepl } from './installed-computer-use.ts'
@@ -3938,6 +3939,9 @@ export function buildCodexDeveloperInstructions(
         'For failure diagnostics only, name GPT, Grok or Claude Code and its safe cause in Slack; omit secrets and internal paths.',
         'If any answer is missing, report its cause and preserve obtained answers. Continue the primary work;',
         'do not loop a terminal round or wait for all three answers merely because the transport suggests retrying.',
+        'The broker automatically continues a durably saved, interrupted, unsent Claude slot on restart.',
+        'Poll its ORIGINAL returned binding; do not create a new panel. continuedOriginalRequest means the old question was resumed,',
+        'not that newer Slack input was reviewed. Assess its scope before applying those answers.',
         'Exception: recoveredAfterInterruption=true with retryable=true means an interrupted process, not a completed logical round.',
         'After nextRetryAt, recover the SAME binding with retryUnavailable=true and the ORIGINAL primaryEvidence, native response and marker.',
         'Never create another native advisor. Assess changed input scope; inputUpdateIsRecoveryOnly=true is only for unchanged scope.',
@@ -8542,6 +8546,27 @@ export async function executeCodexJob(
               }
               taskGoalStatus = goal?.status
               if (taskGoalStatus) controls.recordGoalStatus?.(taskGoalStatus)
+            }
+            // Drain before closing input, so a same-thread update/cancel can
+            // still interrupt this wait and use the normal turn barrier.
+            if (stage === 'complete' && terminal.turn.status === 'completed'
+              && !pausedInterjection) {
+              const settlement = await waitForAdvisorSettlement({
+                stateDir: managedStateDir, jobId: job.id,
+                attemptNonce: advisorAttempt.attemptNonce,
+                processNonce: advisorAttempt.processNonce,
+                contextDigest: advisorAttempt.contextDigest,
+                interrupted: () => {
+                  const next = controls.next()
+                  // A late thread question retires this parent after its answer.
+                  // Drain first so that transition cannot kill a sent reviewer.
+                  return options.signal?.aborted === true || controls.cancellationRequested()
+                    || (next !== null && next.kind !== 'interjection')
+                },
+              })
+              if (settlement === 'unavailable' || settlement === 'timeout') {
+                reportAdvisorVerificationWarning(`completion-settlement-${settlement}`, new Error('advisor settlement unavailable'))
+              }
             }
             let barrier = controls.finishTurn({
               executorNonce: advisorAttempt.attemptNonce,
