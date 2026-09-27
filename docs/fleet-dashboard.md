@@ -6,6 +6,10 @@
 
 ## 表示の意味
 
+- プロジェクト名つきの報告を一度でも受理したinstanceだけを一覧・台数・状態集計に含める。登録のみ、空白のプロジェクト報告のみの行は非表示件数で示す。登録自体は削除しない。
+- オンライン（90秒以内の通信、Slack接続・runner正常）を上に、通信断・接続未確認を下に表示する。同じグループ内は名前・ID順を維持し、自動更新で並びを再計算する。
+- `202609270001_fleet_project_seen.sql` は起動実績を保持する。旧方式の再起動で最新snapshotが消えても一覧には残る。既存の有効なプロジェクト報告・フォルダ報告から実績を移行し、PC更新は不要。migration適用後にWorkerの画面assetsを配布する。
+
 - 30秒ごとに報告。サーバー受信から90秒経つと「状態不明」。PCスリープ・通信断も空きとは表示しない。
 - Slack接続とrunnerの10秒ごとの生存報告（35秒以内）が必要。キュー・開始延期・更新待ちを空きから区別する。
 - 別タスクの承認待ちだけなら、新規受付可能として表示できる。
@@ -52,7 +56,7 @@ Workerは `auth.test` と `bots.info` でworkspace・bot・user・appの対応�
 2. このPCのいずれかのアプリで `zerochan cloud login` 済みなら、その認証を使える。未設定なら同コマンドでPC専用Authを設定する。監視だけなら `cloud activate` は不要。監視登録は引き継ぎ有効化を変更しない。
 3. 管理者が `zerochan_fleet_instances` に `id`（新UUID）、`user_id`（認証の利用者）、`space_id`、`installation_id`、`app_id`、`team_id`、`name`（表示名）、`pc_label`（任意のPC表示名）を登録する。別PCでは別のinstallation/instance IDを使う。同じアプリでも上書きしない。
 4. 対象プロジェクトで `zerochan fleet register <instance-id> <認証済みSlack-app-id>` を実行。認証元は同じPCの登録済みアプリだけを選べる。同じsessionファイルとrefresh lockを使い、refresh tokenを複製しない。
-5. 作業終了後に再起動。`zerochan fleet status` で設定を確認。Webで最終通信が更新されることを確認する。登録のみ・未起動の行は「状態不明」のまま。
+5. 作業終了後に再起動。`zerochan fleet status` で設定を確認。Webで最終通信が更新されることを確認する。登録のみ・未起動の行は一覧・集計に含めない。
 
 設定は各アプリのprivate state内 `fleet.json`。projectLabelは省略すると起動プロジェクトのbasename。必要な場合だけ任意の短い表示名を設定する。フルパスは送らない。installation IDのファイルはPCごとに作られるので他PCへコピーしない。
 
