@@ -224,7 +224,7 @@ sys.exit(1 if {outcome!r} == "failure" else 0)
             stack.enter_context(patch.object(runtime, "_materialize_verified_executable", return_value=(executable, (), "fixture")))
             stack.enter_context(patch.object(runtime, "_validate_materialized_executable"))
             stack.enter_context(patch.object(runtime, "_open_chrome", side_effect=opened))
-            stack.enter_context(patch.object(runtime, "LOGIN_TIMEOUT_SECONDS", 1 if outcome == "timeout" else 10))
+            stack.enter_context(patch.object(runtime, "LOGIN_TIMEOUT_SECONDS", 3 if outcome == "timeout" else 10))
             stack.enter_context(contextlib.redirect_stdout(output))
             stack.enter_context(contextlib.redirect_stderr(output))
             arguments = [str(reviewer), str(self.live), str(executable), "/usr/bin:/bin", "C"]
