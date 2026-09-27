@@ -6023,7 +6023,8 @@ describe('production App Server executor', () => {
       extraEnvironment: { ZERO_FIXTURE_MODE: 'progress' },
       progressActivatedAtMs: Date.now(),
       progressScheduleForTesting: {
-        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+        // Only publication retry is under test; later probes must not race completion.
+        firstMs: 10, secondMs: 10_000, thirdMs: 20_000, repeatMs: 10_000,
       },
       progressPublishRetryMsForTesting: 10,
       onProgressProbeStarted: () => true,

@@ -8,7 +8,7 @@ import { toSlackMrkdwn } from './slack-mrkdwn.ts'
 import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
 import { startFleetRunnerPulse } from './fleet-runtime.ts'
 import { resolveArtifactSource, previousThreadArtifactRoots } from './artifact-source.ts'
-import { advisorFailureMessage, type AdvisorFailure } from './advisor-availability.ts'
+import { advisorFailureMessage, PUBLIC_ADVISOR_FAILURE_MESSAGES, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
   existsSync,
@@ -16146,6 +16146,10 @@ const ADVISOR_COVERAGE_QUANTITY = /(?:全|全て|全員|\d+\s*\/\s*[35]|[0-9０-
 
 function advisorCoverageClause(clause: string): boolean {
   const normalized = clause.replace(/\s+/g, ' ').trim()
+  // A phase-scoped host row is reserved even when model prose changes the
+  // surrounding paragraph. Only a complete validated delivery notice may
+  // bypass this classifier in stripModelAuthoredAdvisorCoverage.
+  if (/^(?:初期設計|最終レビュー第[12]回) — (?:GPT|Grok|Claude Code): /u.test(normalized)) return true
   if (!normalized || !ADVISOR_COVERAGE_ASSERTION.test(normalized)) return false
   const namedModels = normalized.match(/(?:Codex|Claude|Grok)/giu) ?? []
   const coverageQuantity = ADVISOR_COVERAGE_QUANTITY.test(normalized)
@@ -16220,6 +16224,13 @@ function stripModelAuthoredAdvisorCoverage(
   let removed = false
   const kept = text.split(/(\r?\n[ \t]*\r?\n+)/).map(paragraph => {
     if (/^\r?\n[ \t]*\r?\n+$/.test(paragraph)) return paragraph
+    // Delivery reprocesses already sealed host prose. Preserve the whole
+    // bounded notice, including multi-sentence diagnostics, only on that path.
+    if (validHostAdvisorNotice(paragraph.trim())) {
+      if (preserveHostCoverageLine) return paragraph
+      removed = true
+      return ''
+    }
     const clauses = (paragraph.match(/.*?(?:[。！？!?]|\.(?=[ \t\r\n]|$)|\r?\n|$)/gs) ?? [paragraph])
       .filter(clause => clause.length > 0)
     const coverageContext = clauses.some(advisorCoverageClause)
@@ -16242,6 +16253,46 @@ function stripModelAuthoredAdvisorCoverage(
   }
 }
 
+function advisorPhaseLabel(phase: HostAdvisorCoverage['phases'][number]): string {
+  return phase.phase === 'investigation' ? '初期設計' : `最終レビュー第${phase.round}回`
+}
+
+const ADVISOR_NOTICE_HEADER = '一部の独立レビュー回答を取得できませんでした。'
+const ADVISOR_NOTICE_FOOTER = '取得済みの回答と実行記録を保持しています。'
+const ADVISOR_NAMES = { codex: 'GPT', grok: 'Grok', claude: 'Claude Code' } as const
+
+function validHostAdvisorNotice(text: string): boolean {
+  const lines = text.split(/\r?\n/)
+  if (lines.length < 3 || lines.length > 11
+    || lines[0] !== ADVISOR_NOTICE_HEADER || lines.at(-1) !== ADVISOR_NOTICE_FOOTER) return false
+  return lines.slice(1, -1).every(line => {
+    const match = /^(?:初期設計|最終レビュー第[12]回) — (.+)$/u.exec(line)
+    return match !== null && (PUBLIC_ADVISOR_FAILURE_MESSAGES.has(match[1]!)
+      || Object.values(ADVISOR_NAMES).some(name => match[1] === `${name}: 回答を取得しました。`))
+  })
+}
+
+function hostAdvisorFailureNotice(coverage: HostAdvisorCoverage): string {
+  const phases = [...coverage.phases].sort((left, right) => left.finishedAt - right.finishedAt)
+  const affected = new Set(phases.flatMap(phase => (phase.failures ?? []).map(value => value.advisor)))
+  if (affected.size === 0) return ''
+  const lines: string[] = []
+  for (const phase of phases) {
+    for (const advisor of affected) {
+      const failure = phase.failures?.find(value => value.advisor === advisor)
+      if (failure) {
+        lines.push(`${advisorPhaseLabel(phase)} — ${advisorFailureMessage(failure)}`)
+        continue
+      }
+      const slots = phase.slots.filter(slot => slot.slot === advisor || slot.slot.startsWith(`${advisor}-`))
+      if (slots.length > 0 && slots.every(slot => slot.state === 'response-obtained')) {
+        lines.push(`${advisorPhaseLabel(phase)} — ${ADVISOR_NAMES[advisor]}: 回答を取得しました。`)
+      }
+    }
+  }
+  return `${ADVISOR_NOTICE_HEADER}\n${lines.join('\n')}\n${ADVISOR_NOTICE_FOOTER}\n\n`
+}
+
 function hostAdvisorCoverageLine(coverage?: HostAdvisorCoverage): string {
   if (!coverage || coverage.phases.length === 0) {
     return '独立レビュー実行記録(ホスト確認): 完了した実行記録なし（実行済みとは報告しません）。'
@@ -16249,9 +16300,7 @@ function hostAdvisorCoverageLine(coverage?: HostAdvisorCoverage): string {
   const phases = [...coverage.phases]
     .sort((left, right) => left.finishedAt - right.finishedAt)
     .map(value => {
-      const label = value.phase === 'investigation'
-        ? '初期設計'
-        : `最終レビュー第${value.round}回`
+      const label = advisorPhaseLabel(value)
       return `${label}—起動${value.started}/${value.total}・回答${value.responsesObtained}/${value.total}`
         + `・起動済み回答未確認${value.startedNoResponse}/${value.total}`
         + `・起動未確認${value.startUnconfirmed}/${value.total}`
@@ -16273,11 +16322,7 @@ export function enforceHostAdvisorCoverage(
   const stripped = stripModelAuthoredAdvisorCoverage(text, purpose === 'delivery')
   if (purpose !== 'result') return stripped.text
   if (coverage?.phases.length) {
-    const failures = [...new Map(coverage.phases.flatMap(phase => phase.failures ?? [])
-      .map(failure => [failure.advisor, failure] as const)).values()]
-    const notice = failures.length > 0
-      ? `一部の独立レビュー回答を取得できませんでした。\n${failures.map(advisorFailureMessage).join('\n')}\n取得済みの回答と実行記録を保持しています。\n\n`
-      : ''
+    const notice = hostAdvisorFailureNotice(coverage)
     return stripped.text
       ? `${notice}${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
       : `${notice}${hostAdvisorCoverageLine(coverage)}`
