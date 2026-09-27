@@ -11,6 +11,7 @@ import { resolveArtifactSource, previousThreadArtifactRoots } from './artifact-s
 import { advisorFailureMessage, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
+  existsSync,
   chmodSync,
   closeSync,
   constants,
@@ -17372,6 +17373,7 @@ export function updateIsRunning(lockDir: string): boolean {
  */
 export function updateTransactionPending(journalFile: string): boolean {
   try {
+    if (existsSync(join(dirname(journalFile), 'release-transaction.json'))) return true
     lstatSync(journalFile)
     return true
   } catch (error) {

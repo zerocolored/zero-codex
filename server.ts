@@ -2856,8 +2856,8 @@ try {
       const access = loadAccess()
       const destination = automaticUpdateRecipient(access.allowFrom)
       await checkAutomaticUpdate({
-        root: slackAppRegistryRoot(), stateDir: STATE_DIR,
-        detect: () => remoteUpdateHead(import.meta.dir),
+        root: slackAppRegistryRoot(), stateDir: STATE_DIR, independent: true,
+        detect: () => remoteUpdateHead(import.meta.dir, true),
         recoverPending: stateDir => {
           if (stateDir !== STATE_DIR && !listRegisteredSlackApps().some(app => app.stateDir === stateDir)) return
           resumePendingUpdateWorker({
