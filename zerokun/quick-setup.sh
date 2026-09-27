@@ -30,8 +30,8 @@
 #   bash zerokun/quick-setup.sh --skip-permissions  TCCの判定を省略
 #   bash zerokun/quick-setup.sh --skip-chrome       Chrome拡張を省略
 #   bash zerokun/quick-setup.sh --skip-go-chrome-mcp go-chrome-mcpを省略
-#   bash zerokun/quick-setup.sh --force-extensions  Chrome拡張をmachine policyで強制install
-#   bash zerokun/quick-setup.sh --no-wait           本人操作の待ち合わせをせず判定だけ出す
+#   bash zerokun/quick-setup.sh --force-extensions  Chrome拡張のpolicy設定値を書き込む (適用は別途確認)
+#   bash zerokun/quick-setup.sh --no-wait           本人操作を待たず通常の導入を進める
 #
 # Herdr serverが動いていないと`zerochan start`はworkspace createに失敗する。
 # Herdrのpane内で実行するか、先に`herdr`でserverを起動しておく。
@@ -50,7 +50,7 @@ CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 GO_CHROME_MCP_DIR="${GO_CHROME_MCP_DIR:-$PROJECT_ROOT/go-chrome-mcp}"
 GO_CHROME_MCP_REPO="${GO_CHROME_MCP_REPO:-https://github.com/ernie1358/go-chrome-mcp.git}"
 
-TARGET_PROJECT="${ZEROKUN_PROJECT_DIR:-}"
+TARGET_PROJECT="${ZEROKUN_PROJECT_DIR:-$PROJECT_ROOT/zerokun-workspace}"
 SLACK_APP_NAME=""
 SLACK_BOT_NAME=""
 SLACK_CHANNELS=()
@@ -62,6 +62,7 @@ SKIP_CHROME=0
 SKIP_GO_CHROME_MCP=0
 FORCE_EXTENSIONS=0
 WAIT_FOR_GRANT=1
+MANUAL_PENDING=()
 
 # このMacで実際に使っている拡張。すべてWeb Store配布のため policy でも install できる。
 CHROME_EXTENSIONS=(
@@ -105,6 +106,11 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+for extension in "${CHROME_EXTENSIONS[@]}"; do
+  [[ "${extension%%:*}" =~ ^[a-p]{32}$ ]] \
+    || { echo "Chrome拡張IDはa-pの32文字で指定してください" >&2; exit 2; }
+done
+
 step() { printf '\n\033[1m▶ %s\033[0m\n' "$1"; }
 ok()   { printf '  \033[32m✅ %s\033[0m\n' "$1"; }
 warn() { printf '  \033[33m⚠️  %s\033[0m\n' "$1"; }
@@ -123,13 +129,13 @@ SYS_TCC="/Library/Application Support/com.apple.TCC/TCC.db"
 
 tcc_db_readable() {
   command -v sqlite3 >/dev/null 2>&1 || return 1
-  sqlite3 "$SYS_TCC" 'select 1 from access limit 1;' >/dev/null 2>&1
+  sqlite3 -readonly "$SYS_TCC" 'select 1 from access limit 1;' >/dev/null 2>&1
 }
 
 # tcc_auth <service> <client> -> 2=許可 / 0=拒否 / 空=未設定
 tcc_auth() {
-  sqlite3 "$SYS_TCC" \
-    "select max(auth_value) from access where service='$1' and client='$2';" 2>/dev/null
+  sqlite3 -readonly "$SYS_TCC" \
+    "select max(auth_value) from access where service='$1' and client='$2';" 2>/dev/null || true
 }
 
 open_pane() { open "x-apple.systempreferences:com.apple.preference.security?$1" >/dev/null 2>&1 || true; }
@@ -225,11 +231,12 @@ check_permissions() {
       runtime_binaries | sed 's/^/      ・/'
       runtime_binaries | pbcopy 2>/dev/null || true
       open_pane Privacy_AllFiles
-      pause_for_grant || return 0
+      pause_for_grant || { MANUAL_PENDING+=("macOSのフルディスクアクセスを確認してください"); return 0; }
       if tcc_db_readable; then
         ok "フルディスクアクセス: 許可を確認"
       else
         warn "まだ反映されていません。terminal.appを再起動してから再実行してください"
+        MANUAL_PENDING+=("macOSのフルディスクアクセスを確認してください")
         return 0
       fi
     else
@@ -270,6 +277,7 @@ check_permissions() {
   else
     warn "3つ揃っているterminal.appがありません"
     if [ "$mode" = fix ]; then
+      MANUAL_PENDING+=("macOSのアクセシビリティ・画面収録・フルディスクアクセスを再確認してください")
       echo "    設定paneを順に開きます。使うterminal.appを追加してチェックを入れてください。"
       for pane in Privacy_Accessibility Privacy_ScreenCapture Privacy_AllFiles; do
         open_pane "$pane"
@@ -287,13 +295,14 @@ check_permissions() {
 
 # ------------------------------------------------------------------ Chrome拡張
 # 既定は Web Store のページを開いて本人に追加してもらう。
-# --force-extensions を付けた場合だけ、machine policy で強制installする。
+# --force-extensions はpolicy設定値の書込みだけを行い、適用は本人が確認する。
 check_chrome() {
   local mode="$1" id name found profile any_missing=0
   step "Chrome拡張"
 
   if [ ! -d "$HOME/Library/Application Support/Google/Chrome" ]; then
     warn "Google Chromeのprofileが見つかりません。Chromeを一度起動してから再実行してください"
+    [ "$mode" != fix ] || MANUAL_PENDING+=("Chromeを起動して拡張の導入を確認してください")
     return 0
   fi
 
@@ -310,16 +319,17 @@ check_chrome() {
     any_missing=1
     warn "$name: 未導入 ($id)"
     [ "$mode" = fix ] || continue
+    MANUAL_PENDING+=("Chrome拡張 $name の導入・有効化を確認してください")
 
     if [ "$FORCE_EXTENSIONS" = 1 ]; then
-      # Chromeはmachine policyとして /Library/Preferences/com.google.Chrome を読む。
-      # 全てWeb Store配布のためforcelistで入る。Chromeに「組織によって管理されています」が付く。
+      # defaultsはrecommended levelであり、強制導入の適用成功を保証しない。
+      # 設定値の書込みとChromeでの有効性確認を区別する。
       if sudo defaults read /Library/Preferences/com.google.Chrome ExtensionInstallForcelist 2>/dev/null | grep -q "$id"; then
-        ok "$name: policy登録済み (Chrome再起動で入ります)"
+        warn "$name: 設定値は登録済みですが、強制導入の適用は未確認です"
       else
         sudo defaults write /Library/Preferences/com.google.Chrome ExtensionInstallForcelist \
           -array-add "$id;https://clients2.google.com/service/update2/crx"
-        ok "$name: policy登録 (Chrome再起動で入ります)"
+        warn "$name: 設定値を書き込みましたが、強制導入の適用は未確認です"
       fi
     else
       open "https://chromewebstore.google.com/detail/$id" >/dev/null 2>&1 || true
@@ -329,15 +339,18 @@ check_chrome() {
   done
 
   if [ "$any_missing" = 1 ] && [ "$mode" = fix ] && [ "$FORCE_EXTENSIONS" = 1 ]; then
-    echo "    ※ policyを外す場合:"
-    echo "      sudo defaults delete /Library/Preferences/com.google.Chrome ExtensionInstallForcelist"
+    echo "    chrome://policy で適用を確認してください。defaults方式は強制導入を保証しません。"
+    echo "    強制導入が必要なら、管理者がChromeの構成profile/MDMで配布してください。"
+    echo "    ※ policyを外す場合は、管理者が今回追加した拡張IDだけを取り除いてください。"
+    echo "      他の拡張のpolicyは残してください。"
   fi
   return 0
 }
 
 # Grok Buildは ~/.grok/bin へ入り、bootstrap直後のshellではPATHに乗っていない。
 # Homebrewとbunも、profileを読み直していないshellから呼べるようにしておく。
-export PATH="$HOME/.grok/bin:$HOME/.bun/bin:/opt/homebrew/bin:$PATH"
+CALLER_PATH="$PATH"
+export PATH="$HOME/.local/bin:$HOME/.grok/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 # ------------------------------------------------------------ go-chrome-mcp
 # ClaudeやCodexから実Chromeを操作するMCP。Web Storeには無く、unpackedで読み込む。
@@ -347,6 +360,15 @@ setup_go_chrome_mcp() {
   local mode="$1" loaded=0
 
   step "go-chrome-mcp (実Chrome操作のMCP)"
+
+  if [ "$mode" = fix ]; then
+    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+      command -v brew >/dev/null 2>&1 || fail "Node.js/npmの導入に必要なHomebrewがありません"
+      brew install node || fail "Node.js/npmを導入できません"
+    fi
+    command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 \
+      || fail "Node.js/npmを解決できません"
+  fi
 
   if [ -d "$GO_CHROME_MCP_DIR/.git" ]; then
     ok "clone済み: $GO_CHROME_MCP_DIR"
@@ -362,54 +384,87 @@ setup_go_chrome_mcp() {
   if [ -d "$GO_CHROME_MCP_DIR/node_modules" ]; then
     ok "依存: 導入済み"
   elif [ "$mode" = fix ]; then
-    (cd "$GO_CHROME_MCP_DIR" && npm install --silent) && ok "npm install 完了" \
-      || warn "npm install に失敗 (broker起動時のpreflightが再試行します)"
+    (cd "$GO_CHROME_MCP_DIR" && npm install --silent) \
+      || fail "npm installに失敗したためMCP設定は登録しません"
+    ok "npm install 完了"
   else
     warn "依存: 未導入"
+  fi
+  if [ "$mode" = fix ]; then
+    (cd "$GO_CHROME_MCP_DIR" && npm ls --omit=dev --depth=0 >/dev/null 2>&1) \
+      || fail "MCPの依存関係を確認できないため設定は登録しません"
   fi
 
   # Claude Code への登録 (~/.claude.json の mcpServers)
   if [ "$mode" != fix ]; then
-    if grep -q '"go-chrome-mcp"' "$HOME/.claude.json" 2>/dev/null; then
+    if python3 - "$HOME/.claude.json" <<'PY_CHECK'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        data = json.load(source)
+    servers = data.get("mcpServers", {}) if isinstance(data, dict) else {}
+    registered = isinstance(servers, dict) and "go-chrome-mcp" in servers
+except (OSError, ValueError):
+    registered = False
+sys.exit(0 if registered else 1)
+PY_CHECK
+    then
       ok "Claude Code: 登録済み"
     else
       warn "Claude Code: 未登録"
     fi
   else
+    [ -f "$GO_CHROME_MCP_DIR/mcp-broker.js" ] \
+      || fail "mcp-broker.jsがありません。MCP設定は登録しません"
     python3 - "$HOME/.claude.json" "$GO_CHROME_MCP_DIR" <<'PY'
-import json, os, shutil, sys
+import json, os, stat, sys, tempfile
 path, repo = sys.argv[1], sys.argv[2]
 entry = {"type": "stdio", "command": "node",
          "args": [os.path.join(repo, "mcp-broker.js")], "env": {}}
 data = {}
-if os.path.exists(path):
-    with open(path) as f:
-        data = json.load(f)
+original = None
+identity = None
+def identity_of(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+if os.path.lexists(path):
+    metadata = os.lstat(path)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.getuid():
+        raise SystemExit("既存Claude設定は通常fileではないため変更しません")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as f:
+        identity = identity_of(os.fstat(f.fileno()))
+        if identity != identity_of(metadata): raise SystemExit("Claude設定が変化したため変更しません")
+        original = f.read()
+    data = json.loads(original)
 servers = data.setdefault("mcpServers", {})
-if servers.get("go-chrome-mcp") == entry:
-    print("  ✅ Claude Code: 登録済み")
+if "go-chrome-mcp" in servers:
+    print("  ✅ Claude Code: 既存MCP設定を保持 (無効化や独自設定も変更しません)")
 else:
-    if os.path.exists(path):
-        shutil.copy2(path, path + ".bak")
     servers["go-chrome-mcp"] = entry
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    if original is not None:
+        backup, backup_path = tempfile.mkstemp(prefix=".claude.json.backup-", dir=os.path.dirname(path))
+        with os.fdopen(backup, "w") as f:
+            f.write(original); f.flush(); os.fsync(f.fileno())
+    fd, temporary = tempfile.mkstemp(prefix=".claude.json.next-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush(); os.fsync(f.fileno())
+        current = identity_of(os.lstat(path)) if os.path.lexists(path) else None
+        if current != identity: raise SystemExit("Claude設定が並行更新されたため変更しません")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
     print("  ✅ Claude Code: mcpServersへ登録 (~/.claude.json)")
 PY
   fi
 
-  # Codex への登録 (~/.codex/config.toml)。codex-configのinstall.pyより後に行う。
-  local toml="$CODEX_HOME/config.toml"
-  if grep -q '^\[mcp_servers\.go-chrome-mcp\]' "$toml" 2>/dev/null; then
-    ok "Codex: 登録済み"
+  # CLIにTOMLのparse/escapingを任せ、quoted tableや特殊文字pathも保持する。
+  if CODEX_HOME="$CODEX_HOME" codex mcp get go-chrome-mcp >/dev/null 2>&1; then
+    ok "Codex: 既存MCP設定を保持 (無効化や独自設定も変更しません)"
   elif [ "$mode" = fix ]; then
-    mkdir -p "$CODEX_HOME"
-    cat >> "$toml" <<EOF
-
-[mcp_servers.go-chrome-mcp]
-command = "node"
-args = [ "$GO_CHROME_MCP_DIR/mcp-broker.js" ]
-EOF
+    CODEX_HOME="$CODEX_HOME" codex mcp add go-chrome-mcp -- node "$GO_CHROME_MCP_DIR/mcp-broker.js" >/dev/null \
+      || fail "CodexへのMCP登録に失敗しました"
     ok "Codex: config.tomlへ登録"
   else
     warn "Codex: 未登録"
@@ -427,7 +482,7 @@ for f in glob.glob(os.path.join(root, "*", "Secure Preferences")):
         continue
     for ext in d.get("extensions", {}).get("settings", {}).values():
         p = ext.get("path", "")
-        if p and os.path.realpath(p) == repo:
+        if p and ext.get("location") == 4 and ext.get("state") == 1 and os.path.realpath(p) == repo:
             print(os.path.basename(os.path.dirname(f)))
             sys.exit(0)
 print("")
@@ -438,13 +493,16 @@ PY
     ok "Chrome拡張: 読み込み済み ($loaded)"
   else
     warn "Chrome拡張: 未読み込み"
+    [ "$mode" != fix ] || MANUAL_PENDING+=("go-chrome-mcp拡張の読み込み・有効化を確認してください")
     echo "    unpackedの拡張はpolicyでinstallできません。次は本人操作です。"
     echo "      1. Chromeで chrome://extensions を開く (コマンドラインからは開けません)"
     echo "      2. 「デベロッパーモード」をON"
     echo "      3. 「パッケージ化されていない拡張機能を読み込む」"
     echo "      4. $GO_CHROME_MCP_DIR を選ぶ"
-    printf '%s' "$GO_CHROME_MCP_DIR" | pbcopy 2>/dev/null \
-      && echo "    (pathはclipboardへ入れました。⇧⌘G で貼れます)"
+    if [ "$mode" = fix ]; then
+      printf '%s' "$GO_CHROME_MCP_DIR" | pbcopy 2>/dev/null \
+        && echo "    (pathはclipboardへ入れました。⇧⌘G で貼れます)"
+    fi
     [ "$mode" = fix ] && { pause_for_grant || true; }
   fi
   return 0
@@ -456,17 +514,32 @@ echo "== Zeroちゃん quick setup =="
 echo "   repo: $REPO_DIR"
 
 if [ "$DOCTOR" = 1 ]; then
-  bash "$BOOTSTRAP" --doctor || true
+  doctor_status=0
+  PATH="$CALLER_PATH" bash "$BOOTSTRAP" --doctor || doctor_status=1
   [ "$SKIP_PERMISSIONS" = 1 ] || check_permissions check
   [ "$SKIP_CHROME" = 1 ] || check_chrome check
   [ "$SKIP_GO_CHROME_MCP" = 1 ] || setup_go_chrome_mcp check
-  exit 0
+  exit "$doctor_status"
 fi
 
 
 # ------------------------------------------------------------------ 1. 基本導入
+bootstrap_args=(--repo-dir "$REPO_DIR")
+if [ -n "$TARGET_PROJECT" ]; then
+  [ ! -e "$TARGET_PROJECT" ] || [ -d "$TARGET_PROJECT" ] \
+    || fail "対象projectはdirectoryで指定してください: $TARGET_PROJECT"
+  if [ -d "$TARGET_PROJECT" ]; then
+    TARGET_PROJECT="$(CDPATH='' cd -P "$TARGET_PROJECT" && pwd -P)"
+  else
+    case "$TARGET_PROJECT" in /*) ;; *) TARGET_PROJECT="$PWD/$TARGET_PROJECT" ;; esac
+  fi
+  [ "$TARGET_PROJECT" != "$REPO_DIR" ] || fail "対象projectはZeroちゃん本体と別にしてください"
+  bootstrap_args+=(--project-dir "$TARGET_PROJECT")
+elif [ "${#SLACK_CHANNELS[@]}" -gt 0 ]; then
+  fail "--channelには--projectが必要です"
+fi
 step "基本導入 (Herdr / Codex CLI / Grok Build / Claude Code / Bun)"
-bash "$BOOTSTRAP" --skip-slack
+bash "$BOOTSTRAP" --skip-slack "${bootstrap_args[@]}"
 ok "基本導入 完了"
 
 # ------------------------------------------------------------------ 2. login確認
@@ -568,7 +641,7 @@ else
   echo "  ※ 同時稼働するMacではSlack Appを分けます。既存Appを共有すると状態が分断されます。"
   echo "  ※ token (xapp- / xoxb-) は表示されないpromptへ直接貼ります。chatへ送らないでください。"
 
-  slack_args=(--slack-only)
+  slack_args=(--slack-only "${bootstrap_args[@]}")
   [ -n "$SLACK_APP_NAME" ] && slack_args+=(--slack-app-name "$SLACK_APP_NAME")
   [ -n "$SLACK_BOT_NAME" ] && slack_args+=(--slack-bot-name "$SLACK_BOT_NAME")
   bash "$BOOTSTRAP" "${slack_args[@]}"
@@ -590,7 +663,7 @@ else
     if zerochan set slack-channel "$ch"; then
       ok "紐付け: $ch"
     else
-      warn "紐付け失敗: $ch"
+      fail "紐付け失敗: $ch。起動せず停止しました"
     fi
   done
 fi
@@ -604,9 +677,8 @@ if ! herdr status >/dev/null 2>&1; then
   echo "    先に 'herdr' でserverを起動し、そのpane内で実行し直してください。"
 fi
 
-if [ -n "$TARGET_PROJECT" ] && [ -d "$TARGET_PROJECT" ]; then
-  cd "$TARGET_PROJECT"
-fi
+[ -d "$TARGET_PROJECT" ] || fail "bootstrapが対象projectを作成していません: $TARGET_PROJECT"
+cd "$TARGET_PROJECT"
 zerochan start
 ok "zerochan start 実行"
 
@@ -627,3 +699,9 @@ cat <<EOF
   python3 ${CODEX_CONFIG_DIR}/update.py   codex-configの更新
 
 EOF
+
+if [ "${#MANUAL_PENDING[@]}" -gt 0 ]; then
+  for pending in "${MANUAL_PENDING[@]}"; do
+    warn "未確認: $pending"
+  done
+fi

@@ -413,6 +413,7 @@ bash -n \
   codex-channel.sh \
   zerokun/setup.sh \
   zerokun/bootstrap-macos.sh \
+  zerokun/quick-setup.sh \
   zerokun/interactive-bootstrap.sh \
   zerokun/watchdog.sh \
   zerokun/state-dir.sh

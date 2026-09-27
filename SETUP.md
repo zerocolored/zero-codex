@@ -39,6 +39,8 @@ bash zerokun/quick-setup.sh \
 `--channel`は繰り返し指定できます。`--doctor`は何も変更せず状態だけを表示し、
 `--skip-slack` / `--skip-codex-config` / `--skip-permissions` / `--skip-chrome` /
 `--skip-go-chrome-mcp`はそれぞれの段階を省略します。
+`--no-wait`は本人操作の待ち合わせだけを省略し、通常の導入・設定変更は実行します。
+指定したprojectは基本導入とSlack設定の両方へ引き継ぎます。channel紐付け失敗時は起動せず停止します。
 
 ### macOS権限(TCC)
 
@@ -60,12 +62,12 @@ dialogで許可します。誤って拒否した場合は`tccutil reset AppleEve
 
 既定でClaude・ChatGPTの導入を確認し、未導入ならWeb Storeのページを開きます。
 `--chrome-extension <id>`で追加でき、`--force-extensions`を付けた場合は
-machine policy(`/Library/Preferences/com.google.Chrome`の`ExtensionInstallForcelist`)で
-強制installします。この場合Chromeに「組織によって管理されています」が付き、ユーザーは拡張を無効化できません。
+`/Library/Preferences/com.google.Chrome`の`ExtensionInstallForcelist`へ設定値を書き込みます。
+`defaults`方式はrecommended levelのため、これだけで強制導入の成功は保証しません。
+`chrome://policy`で適用を確認し、強制導入が必要なら管理者が構成profile/MDMで配布してください。
+根拠: [ChromiumのMac Quick Start](https://www.chromium.org/administrators/mac-quick-start/)。
 
-```bash
-sudo defaults delete /Library/Preferences/com.google.Chrome ExtensionInstallForcelist   # 取り消す
-```
+解除時は管理者が今回追加した拡張IDだけをpolicyから取り除きます。他の拡張の登録を消さないでください。
 
 ### go-chrome-mcp
 
@@ -73,6 +75,9 @@ sudo defaults delete /Library/Preferences/com.google.Chrome ExtensionInstallForc
 導入します。clone、`npm install`、Claude Code(`~/.claude.json`の`mcpServers`)とCodex
 (`~/.codex/config.toml`の`[mcp_servers.go-chrome-mcp]`)への登録、読み込み済みかの判定までを行います。
 置き場の既定はzero-codexと同じ階層の`go-chrome-mcp`で、`GO_CHROME_MCP_DIR`で変えられます。
+Node.js/npmがなければHomebrewで導入し、依存関係の検査が成功してから登録します。
+既存Claude設定はowner-onlyの別名backupを残して更新し、Codex設定は`codex mcp add`で登録します。
+両方とも既存の`go-chrome-mcp`定義があれば保持し、無効化や独自の接続先を上書きしません。
 
 **拡張の読み込みだけは本人操作です。** Web Storeではなくunpackedで読み込むため、policyでは
 installできません。またChromeはコマンドラインから`chrome://extensions`を開けません。
@@ -82,8 +87,8 @@ installできません。またChromeはコマンドラインから`chrome://ext
 3. 「パッケージ化されていない拡張機能を読み込む」
 4. cloneしたdirectoryを選ぶ(pathはclipboardへ入れてあります)
 
-読み込み済みかどうかは、Chromeのprofileが持つ`location=4`(unpacked)と実pathの一致で判定します。
-Codexへの登録は`config.toml`への追記のため、codex-configの適用より後に実行します。
+読み込み済みかどうかは、Chromeのprofileが持つ`location=4`(unpacked)、有効状態、実pathの一致で判定します。
+Codexへの登録はcodex-configの適用より後に実行します。
 
 loginは自動化せず、未了の段階で停止して実行すべきcommandを表示します。
 Herdr serverが動いていないと`zerochan start`はworkspace createに失敗するため、
