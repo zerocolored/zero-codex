@@ -1,6 +1,6 @@
 import { readdirSync } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { isAbsolute, join, resolve } from 'path'
 import { prepareManagedStateRoot, requireManagedStateRoot } from './managed-path.ts'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import { parseStateSlackTokens } from './child-environment.ts'
@@ -81,20 +81,34 @@ export function saveNewSlackApp(appId: string, botToken: string, appToken: strin
   })
 }
 
-export function readRegisteredSlackApp(appId: string, home = homedir()): RegisteredSlackApp | null {
+function readRegisteredSlackAppMetadata(appId: string, home: string): RegisteredSlackApp | null {
   requireAppId(appId)
   const content = readOptionalBoundedOwnerOnlyRegularFile(
     join(slackAppRegistryRoot(home), `${appId}.json`), 8192,
   )
   if (content === null) return null
   const record = JSON.parse(content)
-  if (record?.version !== 1 || record.appId !== appId || typeof record.stateDir !== 'string') {
+  if (record?.version !== 1 || record.appId !== appId || typeof record.stateDir !== 'string'
+    || !isAbsolute(record.stateDir) || record.stateDir.includes('\0')) {
     throw new Error('Slackアプリの登録情報が不正です')
   }
-  return { version: 1, appId, stateDir: requireManagedStateRoot(record.stateDir) }
+  return { version: 1, appId, stateDir: resolve(record.stateDir) }
 }
 
-export function listRegisteredSlackApps(home = homedir()): RegisteredSlackApp[] {
+export function readRegisteredSlackApp(appId: string, home = homedir()): RegisteredSlackApp | null {
+  const record = readRegisteredSlackAppMetadata(appId, home)
+  return record ? { ...record, stateDir: requireManagedStateRoot(record.stateDir) } : null
+}
+
+/** Permission denies must also cover registered directories that no longer exist. */
+export function registeredSlackAppStatePaths(home = homedir()): string[] {
+  return registeredSlackAppIds(home).flatMap(appId => {
+    const record = readRegisteredSlackAppMetadata(appId, home)
+    return record ? [record.stateDir] : []
+  })
+}
+
+function registeredSlackAppIds(home = homedir()): string[] {
   let names: string[]
   try { names = readdirSync(slackAppRegistryRoot(home)) }
   catch (error) {
@@ -102,7 +116,11 @@ export function listRegisteredSlackApps(home = homedir()): RegisteredSlackApp[] 
     throw error
   }
   return names.filter(name => /^A[A-Z0-9]{1,63}\.json$/.test(name)).sort()
-    .map(name => readRegisteredSlackApp(name.slice(0, -5), home)!)
+    .map(name => name.slice(0, -5))
+}
+
+export function listRegisteredSlackApps(home = homedir()): RegisteredSlackApp[] {
+  return registeredSlackAppIds(home).map(appId => readRegisteredSlackApp(appId, home)!)
 }
 
 /** Adopt the existing installation in place; never copy its credentials or queue. */

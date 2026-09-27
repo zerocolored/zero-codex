@@ -125,7 +125,7 @@ CLAUDE_DENIED_OPTION_NAMES = frozenset(
     }
 )
 CLAUDE_BENIGN_EFFORT_VALUES = frozenset(
-    {"auto", "low", "medium", "high", "max"}
+    {"auto", "low", "medium", "high", "xhigh", "max"}
 )
 CLAUDE_BENIGN_FLAG = re.compile(
     r"--[A-Za-z0-9][A-Za-z0-9-]{0,63}(?:=[^\s\x00-\x1f\x7f]{0,256})?\Z"
@@ -2174,7 +2174,7 @@ def _keep_xhigh_screen(text: str) -> bool:
     plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
     lines = [line.strip() for line in plain.splitlines() if line.strip()]
     return (
-        sum(line == "Use Fable 5.1 at high effort by default?" for line in lines) == 1
+        sum(bool(re.fullmatch(r"Use Fable 5\.1 .*high effort.*default\?", line)) for line in lines) == 1
         and sum(line == "❯ Keep xhigh" for line in lines) == 1
         and sum(line == "Switch Fable 5.1 to high effort" for line in lines) == 1
         and sum("❯" in line for line in lines) == 1
@@ -2182,9 +2182,74 @@ def _keep_xhigh_screen(text: str) -> bool:
     )
 
 
+def _trust_screen_choice(text: str, project_root: str) -> Optional[Tuple[str, str]]:
+    """Recognize only the owned two-choice trust dialog, including narrow panes."""
+    plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
+    lines = plain.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == "Accessing workspace:"]
+    ends = [i for i, line in enumerate(lines) if "Enter to confirm" in line and "Esc to cancel" in line]
+    if not project_root or len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        return None
+    start, end = starts[0], ends[0]
+    if any(_INTERACTIVE_HINT.search(_semantic_terminal_line(line)) for line in lines[:start]):
+        return None
+    if any(_semantic_terminal_line(line) for line in lines[end + 1:]):
+        return None
+    path = ""
+    path_end = start
+    for i in range(start + 1, end):
+        fragment = lines[i].strip()
+        if not fragment and not path:
+            continue
+        path += fragment
+        if path == project_root:
+            path_end = i
+            break
+        if not project_root.startswith(path):
+            return None
+    if path != project_root:
+        return None
+    active = lines[path_end + 1:end]
+    if _STARTUP_FORBIDDEN_UI.search("\n".join(lines[:start] + active)):
+        return None
+    choices = []
+    for line in active:
+        match = re.fullmatch(r"\s*([❯›▶▷])?\s*(?:[12]\.\s*)?(Yes, I trust this folder|No, exit)\s*", line)
+        if match:
+            choices.append((bool(match[1]), match[2]))
+        elif (_TRUST_SELECTION.search(line) or re.match(r"\s*\d+[.)]\s", line)
+              or (choices and _semantic_terminal_line(line))):
+            return None
+    if (len(choices) != 2 or sum(selected for selected, _ in choices) != 1
+            or {label for _, label in choices} != {"Yes, I trust this folder", "No, exit"}):
+        return None
+    selected = next(i for i, choice in enumerate(choices) if choice[0])
+    trusted = next(i for i, choice in enumerate(choices) if choice[1] == "Yes, I trust this folder")
+    return ("trust", "") if selected == trusted else ("exit", "Down" if trusted > selected else "Up")
+
+
+def _startup_screen_state(text: str, project_root: str) -> Tuple[str, str]:
+    trust = _trust_screen_choice(text, project_root)
+    if trust:
+        return ("trust-" + trust[0], trust[1])
+    plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
+    active = "\n".join(line for line in plain.splitlines()
+                       if not _EMPTY_PROMPT_LINE.fullmatch(line) and line.strip() != project_root)
+    if _STARTUP_FORBIDDEN_UI.search(active):
+        return ("prohibited-ui", "")
+    if _keep_xhigh_screen(text):
+        return ("keep-xhigh", "")
+    if _empty_claude_prompt_screen(text):
+        return ("empty-prompt", "")
+    return ("unrecognized-screen", "")
+
+
 def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str, object]:
     """Metadata-ready can precede the effort question. Confirm only the owned UI."""
     accepted_effort = False
+    accepted_trust = False
+    moved_to_trust = False
+    last_state = "unrecognized-screen"
     deadline = time.monotonic() + CLAUDE_SETTLE_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         _result, first = _agent_information(target)
@@ -2198,12 +2263,17 @@ def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str
             raise UnsafeRequest("ephemeral Claude disappeared before visible readiness")
         _validate_owned_agent(second, workspace, require_ready=False)
         second_text = _read_visible(target)
+        first_screen = _startup_screen_state(first_text, str(workspace.get("project_root", "")))
+        second_screen = _startup_screen_state(second_text, str(workspace.get("project_root", "")))
+        last_state = second_screen[0]
         stable = (type(first.get("state_change_seq")) is int
                   and first.get("state_change_seq") == second.get("state_change_seq")
-                  and first_text == second_text)
+                  and all(first.get(key) == second.get(key)
+                          for key in ("agent_status", "interactive_ready", "launch_pending"))
+                  and first_screen == second_screen)
         if not stable:
             continue
-        if _keep_xhigh_screen(second_text):
+        if last_state == "keep-xhigh":
             if not accepted_effort:
                 _validate_owned_topology(workspace)
                 result = _run_herdr(["agent", "send-keys", target, "Enter"])
@@ -2211,178 +2281,69 @@ def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str
                     raise UnsafeRequest("ephemeral Claude effort confirmation failed")
                 accepted_effort = True
             continue
-        plain = _ANSI_SEQUENCE.sub("", second_text).replace("\r", "")
-        if _STARTUP_FORBIDDEN_UI.search(plain):
+        if last_state == "prohibited-ui":
             raise UnsafeRequest("ephemeral Claude has a prohibited startup UI")
-        if _empty_claude_prompt_screen(second_text):
-            _validate_owned_agent(second, workspace, require_ready=True)
+        if last_state in {"trust-trust", "trust-exit"}:
+            if (not accepted_trust and second.get("agent_status") == "blocked"
+                    and second.get("launch_pending") is True):
+                _validate_owned_topology(workspace)
+                if last_state == "trust-exit":
+                    # Explicitly authorized initial trust only. Reobserve twice
+                    # before Enter; never retry a selection key on a stale UI.
+                    if moved_to_trust:
+                        continue
+                    key = second_screen[1]
+                    moved_to_trust = True
+                else:
+                    key = "Enter"
+                    accepted_trust = True
+                result = _run_herdr(["agent", "send-keys", target, key])
+                if result.returncode != 0:
+                    raise UnsafeRequest("ephemeral Claude trust confirmation failed")
+            continue
+        if (last_state == "empty-prompt"
+                and second.get("agent_status") in {"idle", "done"}
+                and second.get("interactive_ready") is True
+                and second.get("launch_pending") is not True):
             return second
         # Metadata can precede a fully painted startup screen. Do not turn an
         # incidental frame into a launch failure; wait within the same attempt.
         continue
-    raise UnsafeRequest("ephemeral Claude visible ready prompt did not settle")
+    raise UnsafeRequest(f"ephemeral Claude visible ready prompt did not settle ({last_state})")
 
 
 def _strict_trust_screen(text: str, project_root: str) -> bool:
-    plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
-    lines = plain.splitlines()
-    starts = [index for index, line in enumerate(lines) if "Accessing workspace:" in line]
-    ends = [
-        index
-        for index, line in enumerate(lines)
-        if "Enter to confirm · Esc to cancel" in line
-    ]
-    if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
-        return False
-    prefix = [_semantic_terminal_line(line) for line in lines[: starts[0]]]
-    suffix = [_semantic_terminal_line(line) for line in lines[ends[0] + 1 :]]
-    if any(_INTERACTIVE_HINT.search(line) for line in prefix if line):
-        return False
-    if any(line for line in suffix):
-        return False
-    active_lines = lines[starts[0] : ends[0] + 1]
-    if sum(len(_TRUST_SELECTION.findall(line)) for line in active_lines) != 1:
-        return False
-    if not any(_FIRST_CHOICE_SELECTED.search(line) for line in active_lines):
-        return False
-    active_tail = "\n".join(lines[starts[0] :])
-    choices = re.findall(r"(?m)^\s*[\u2500-\u257f❯›▶▷◉●○◆◇]*\s*[0-9]+\.", active_tail)
-    if len(choices) != 2:
-        return False
-    semantic_lines = []
-    for line in lines[starts[0] : ends[0] + 1]:
-        normalized = _semantic_terminal_line(line)
-        if normalized:
-            semantic_lines.append(normalized)
-    observed = " ".join(semantic_lines)
-    legacy_expected = " ".join(
-        (
-            "Accessing workspace:",
-            project_root,
-            "Quick safety check: Is this a project you created or one you trust?",
-            "1. Yes, I trust this folder",
-            "2. No, exit",
-            "Enter to confirm · Esc to cancel",
-        )
-    )
-    claude_2_1_246_expected = " ".join(
-        (
-            "Accessing workspace:",
-            project_root,
-            "Quick safety check: Is this a project you created or one you trust? "
-            "(Like your own code, a well-known open source project, or work from your team). "
-            "If not, take a moment to review what's in this folder first.",
-            "Claude Code'll be able to read, edit, and execute files here.",
-            "Security guide",
-            "1. Yes, I trust this folder",
-            "2. No, exit",
-            "Enter to confirm · Esc to cancel",
-        )
-    )
-    return observed in {legacy_expected, claude_2_1_246_expected}
+    return _trust_screen_choice(text, project_root) == ("trust", "")
+
+
+def _startup_failure_code(error: BaseException) -> str:
+    message = str(error)
+    if "prohibited startup UI" in message:
+        return "prohibited-ui"
+    if "trust confirmation failed" in message:
+        return "trust-confirmation-failed"
+    if "effort confirmation failed" in message:
+        return "effort-confirmation-failed"
+    if "visible ready prompt did not settle" in message:
+        return "trust-confirmation-timeout" if "(trust-" in message else "readiness-timeout"
+    if "identity" in message or "receipt" in message:
+        return "identity-check-failed"
+    return "startup-failed"
 
 
 def _settle_after_trust(
     target: str,
     workspace: Dict[str, object],
 ) -> Dict[str, object]:
-    _result, first_agent = _agent_information(target)
-    if first_agent is None:
-        raise UnsafeRequest("ephemeral Claude disappeared at its trust screen")
-    _validate_owned_agent(first_agent, workspace, require_ready=False)
-    if first_agent.get("agent_status") != "blocked" or first_agent.get("launch_pending") is not True:
-        raise UnsafeRequest("ephemeral Claude startup blocker is not the trust screen")
-    first_text = _read_visible(target)
-    if not _strict_trust_screen(first_text, str(workspace["project_root"])):
-        raise UnsafeRequest("ephemeral Claude startup blocker is not the exact trust screen")
-    first_sequence = first_agent.get("state_change_seq")
-    if type(first_sequence) is not int:
-        raise UnsafeRequest("ephemeral Claude trust screen state is invalid")
-    time.sleep(1.0)
-    _result, second_agent = _agent_information(target)
-    second_text = _read_visible(target)
-    if second_agent is not None:
-        _validate_owned_agent(second_agent, workspace, require_ready=False)
-    if (
-        second_agent is None
-        or second_agent.get("agent_status") != "blocked"
-        or second_agent.get("launch_pending") is not True
-        or type(second_agent.get("state_change_seq")) is not int
-        or second_agent.get("state_change_seq") != first_sequence
-        or second_text != first_text
-        or not _strict_trust_screen(second_text, str(workspace["project_root"]))
-    ):
-        raise UnsafeRequest("ephemeral Claude trust screen did not settle")
-    accepted = _run_herdr(["agent", "send-keys", target, "Enter"])
-    if accepted.returncode != 0:
-        raise UnsafeRequest("ephemeral Claude trust confirmation failed")
-
-    deadline = time.monotonic() + CLAUDE_SETTLE_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        _result, agent = _agent_information(target)
-        if agent is None:
-            raise UnsafeRequest("ephemeral Claude disappeared after trust confirmation")
-        _validate_owned_agent(agent, workspace, require_ready=False)
-        if (
-            agent.get("agent_status") in {"idle", "done"}
-            and agent.get("interactive_ready") is True
-            and agent.get("launch_pending") is not True
-        ):
-            return agent
-        if agent.get("agent_status") == "blocked":
-            blocked_text = _read_visible(target)
-            if (
-                agent.get("launch_pending") is True
-                and agent.get("state_change_seq") == first_sequence
-                and blocked_text == first_text
-                and _strict_trust_screen(
-                    blocked_text,
-                    str(workspace["project_root"]),
-                )
-            ):
-                # Herdr can briefly report the already-confirmed trust screen
-                # until Claude consumes the single Enter key. Never resend it.
-                time.sleep(0.25)
-                continue
-            raise UnsafeRequest("ephemeral Claude reached another blocked startup UI")
-        time.sleep(0.25)
-    raise UnsafeRequest("ephemeral Claude did not become ready after trust confirmation")
+    return _settle_visible_ready(target, workspace)
 
 
 def _settle_after_agent_not_ready(
     target: str,
     workspace: Dict[str, object],
 ) -> Dict[str, object]:
-    _result, first_agent = _agent_information(target)
-    if first_agent is None:
-        raise UnsafeRequest("ephemeral Claude disappeared after startup")
-    _validate_owned_agent(first_agent, workspace, require_ready=False)
-    if _keep_xhigh_screen(_read_visible(target)):
-        return _settle_visible_ready(target, workspace)
-    if (
-        first_agent.get("agent_status") == "blocked"
-        and first_agent.get("launch_pending") is True
-    ):
-        return _settle_after_trust(target, workspace)
+    return _settle_visible_ready(target, workspace)
 
-    _validate_owned_agent(first_agent, workspace, require_ready=True)
-    first_sequence = first_agent.get("state_change_seq")
-    first_text = _read_visible(target)
-    if type(first_sequence) is not int or not _empty_claude_prompt_screen(first_text):
-        raise UnsafeRequest("ephemeral Claude is not at the exact empty ready prompt")
-    time.sleep(1.0)
-    _result, second_agent = _agent_information(target)
-    second_text = _read_visible(target)
-    if second_agent is None:
-        raise UnsafeRequest("ephemeral Claude disappeared at its ready prompt")
-    _validate_owned_agent(second_agent, workspace, require_ready=True)
-    if (
-        second_agent.get("state_change_seq") != first_sequence
-        or second_text != first_text
-        or not _empty_claude_prompt_screen(second_text)
-    ):
-        raise UnsafeRequest("ephemeral Claude ready prompt did not settle")
-    return second_agent
 
 
 def _protected_unchanged(project_root: str, request_dir: str) -> bool:
@@ -4202,8 +4163,8 @@ def _open_ephemeral_workspace(
             _result, agent = _agent_information(agent_name)
             if agent is None:
                 raise UnsafeRequest("ephemeral Claude was not registered after startup")
-            _validate_owned_agent(agent, workspace_receipt, require_ready=True)
-        elif _error_code(started) == "agent_not_ready":
+            _validate_owned_agent(agent, workspace_receipt, require_ready=False)
+        elif _error_code(started) in {"agent_not_ready", "timeout"}:
             agent = _settle_after_agent_not_ready(agent_name, workspace_receipt)
         else:
             raise UnsafeRequest("ephemeral Claude could not start")
@@ -4212,6 +4173,14 @@ def _open_ephemeral_workspace(
         if not _same_caller(caller, _current_pane()):
             raise UnsafeRequest("ephemeral Claude startup changed the calling pane")
 
+        _require_open_root_identity(
+            args.project_root,
+            root,
+            root_descriptor,
+            root_metadata,
+        )
+        agent = _settle_visible_ready(agent_name, workspace_receipt)
+        processes = _settled_process_receipt(workspace_receipt)
         session = agent.get("agent_session")
         native_session = (
             session.get("value")
@@ -4221,15 +4190,6 @@ def _open_ephemeral_workspace(
         sequence = agent.get("state_change_seq")
         if not isinstance(native_session, str) or not native_session or type(sequence) is not int:
             raise UnsafeRequest("ephemeral Claude native identity is incomplete")
-        _require_open_root_identity(
-            args.project_root,
-            root,
-            root_descriptor,
-            root_metadata,
-        )
-        processes = _settled_process_receipt(workspace_receipt)
-        agent = _settle_visible_ready(agent_name, workspace_receipt)
-        sequence = agent.get("state_change_seq")
         _write_request_record(
             args.project_root,
             args.request_dir,
@@ -4279,6 +4239,10 @@ def _open_ephemeral_workspace(
         return 0
     except BaseException as startup_error:
         _suppress_open_signals()
+        # Preserve a bounded, non-secret diagnosis before closing the only UI
+        # that can explain an open failure. Never relay the screen or argv here.
+        print(json.dumps({"status": "ephemeral-claude-startup-failed",
+                          "code": _startup_failure_code(startup_error)}), flush=True)
         if workspace_validated and workspace_receipt is not None:
             cleanup_process_ids = None
             cleanup_process_group_id = None
@@ -4572,7 +4536,7 @@ def _owned_target(
     # Bind the two current observations, not the stale startup sequence.
     if not session_matches:
         raise UnsafeRequest("ephemeral Claude identity changed before fifth-advisor prompt")
-    if not _empty_claude_prompt_screen(_read_visible(target)):
+    if _startup_screen_state(_read_visible(target), str(workspace.get("project_root", "")))[0] != "empty-prompt":
         raise UnsafeRequest("ephemeral Claude is not at an empty visible prompt")
     processes = _process_receipt(workspace)
     if not _same_owned_process_identity(processes, agent_receipt):
@@ -4847,12 +4811,10 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
 
 
 def _persist_send_receipt(prepared: _PreparedSend) -> None:
-    """Publish delivery evidence only after the complete request was sent.
+    """Claim this request before any bytes can reach Herdr.
 
-    A preflight or connected socket is not evidence that a prompt reached
-    Herdr. Keeping the no-replace receipt absent until sendall succeeds makes
-    interruption recovery conservative: a crash before that boundary remains
-    start-unconfirmed instead of being counted as a started Claude reviewer.
+    This is delivery *possibility*, not model-start evidence. The exclusive,
+    durable claim prevents concurrent calls or a lost reply from resending.
     """
     root_descriptor = None
     request_descriptor = None
@@ -4879,6 +4841,7 @@ def _persist_send_receipt(prepared: _PreparedSend) -> None:
                 "target": prepared.target,
                 "marker": prepared.marker_line,
                 "status": "delivery-possible",
+                "state_change_seq": prepared.state_change_seq,
             },
         )
     finally:
@@ -4906,8 +4869,8 @@ def _attempt_send(prepared: _PreparedSend) -> int:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(PROMPT_SOCKET_TIMEOUT_SECONDS)
                 connection.connect(prepared.socket_path)
-                connection.sendall(prepared.request)
                 _persist_send_receipt(prepared)
+                connection.sendall(prepared.request)
                 _announce_send(prepared)
                 while b"\n" not in response:
                     chunk = connection.recv(65_536)
@@ -4927,12 +4890,24 @@ def _attempt_send(prepared: _PreparedSend) -> int:
             ):
                 raise UnsafeRequest("Herdr prompt returned an invalid response envelope")
             succeeded = isinstance(document.get("result"), dict)
+            # Never relay the server's message: it may contain prompt material.
+            # Only these errors establish rejection before any terminal write
+            # in Herdr's agent.prompt handler. Timeout/stalled/unknown errors
+            # remain delivery-possible and must never authorize a resend.
+            error = document.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            known_codes = {
+                "agent_not_ready", "agent_blocked", "empty_agent_prompt",
+                "agent_prompt_stalled", "agent_prompt_failed", "timeout",
+            }
+            send_code = code if isinstance(code, str) and code in known_codes else "unknown-error"
         except Exception as error:
             _write_json_record({"status": "prompt-command-timeout-or-error"})
             print(f"Herdr prompt transport failed: {type(error).__name__}", file=sys.stderr)
             return 5
         _write_json_record(
-            {"status": "prompt-command-returned", "returncode": 0 if succeeded else 1}
+            {"status": "prompt-command-returned", "returncode": 0 if succeeded else 1,
+             **({} if succeeded else {"code": send_code})}
         )
         return 0 if succeeded else 5
     except Exception:

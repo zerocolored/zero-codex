@@ -248,6 +248,123 @@ export function bindProjectSlackApp(repoPathInput: string, appIdInput: string, v
   })
 }
 
+interface AppSwitchJournal {
+  version: 1
+  direction: 'forward' | 'rollback'
+  before: ProjectChannelConfig
+  targetAppId: string
+  routes: Array<{ appId: string; stateDir: string; channels: string[]; configuredAt?: Record<string, number>; explicitMode?: boolean }>
+}
+
+/** Explicit CLI selection moves routing only; jobs, threads and credentials stay put. */
+export function switchProjectSlackApp(
+  repoPathInput: string,
+  targetAppIdInput: string,
+  registeredApps: Array<{ appId: string; stateDir: string }>,
+): void {
+  const repoPath = realpathSync(repoPathInput)
+  const targetAppId = requireSlackAppId(targetAppIdInput)
+  const apps = registeredApps.map(app => ({ appId: requireSlackAppId(app.appId), stateDir: realpathSync(app.stateDir) }))
+  if (!apps.some(app => app.appId === targetAppId)) throw new Error('選択したSlackアプリが未登録です')
+  // The same lock order is used for every switch, including reverse switches.
+  // Lock all registered states so legacy routes can be discovered without races.
+  const leases: Array<{ path: string; lease: ProcessLockLease }> = []
+  const stores = new Map<string, JobStore>()
+  const journalFile = join(configDirectory(repoPath), 'slack-app-switch.json')
+  try {
+    for (const state of [...new Set(apps.map(app => app.stateDir))].sort()) {
+      const lease = acquireMutationLock(state)
+      leases.push({ path: mutationLockPath(state), lease })
+      assertUpdateIdle(state)
+      const store = new JobStore(resolveZeroJobDatabasePath(state))
+      stores.set(state, store)
+      recoverJournal(state, store)
+    }
+    withProjectConfigLock(repoPath, () => {
+      const saveConfig = (config: ProjectChannelConfig) => atomicWritePrivateFile(projectChannelConfigPath(repoPath), JSON.stringify(config, null, 2) + '\n')
+      const saveJournal = (journal: AppSwitchJournal) => atomicWritePrivateFile(journalFile, JSON.stringify(journal) + '\n')
+      const apply = (journal: AppSwitchJournal) => {
+        // Check every destination before removing any route.
+        for (const route of journal.routes) {
+          const channels = journal.direction === 'rollback' ? route.channels
+            : route.appId === journal.targetAppId ? journal.before.slackChannels : []
+          stores.get(route.stateDir)!.assertSlackChannelRoutesAvailable(route.appId, repoPath, channels)
+        }
+        // Remove old routes first. Existing accepted jobs and thread history are untouched.
+        const ordered = [...journal.routes].sort((a, b) => Number(a.appId === journal.targetAppId) - Number(b.appId === journal.targetAppId))
+        for (const route of ordered) {
+          const channels = journal.direction === 'rollback' ? route.channels
+            : route.appId === journal.targetAppId ? journal.before.slackChannels : []
+          const store = stores.get(route.stateDir)!
+          if (journal.direction === 'rollback' && route.configuredAt) {
+            // Rebuild only this project's rows with their original catch-up times.
+            store.syncSlackChannelRoutes({ appId: route.appId, repoPath, channelIds: [] })
+            const restored: string[] = []
+            for (const channel of channels) {
+              restored.push(channel)
+              store.syncSlackChannelRoutes({ appId: route.appId, repoPath, channelIds: restored, configuredAt: route.configuredAt[channel] })
+            }
+          } else {
+            store.syncSlackChannelRoutes({ appId: route.appId, repoPath, channelIds: channels })
+          }
+          if (journal.direction === 'rollback' && route.explicitMode === false) store.restoreSlackChannelImplicitModeAfterRollback(route.appId)
+        }
+        saveConfig(journal.direction === 'rollback' ? journal.before : { ...journal.before, slackAppId: journal.targetAppId })
+        unlinkSync(journalFile)
+      }
+      const pending = readOptionalBoundedOwnerOnlyRegularFile(journalFile, MAX_JOURNAL_BYTES)
+      if (pending !== null) {
+        const journal = JSON.parse(pending) as AppSwitchJournal
+        if (journal.version !== 1 || !['forward', 'rollback'].includes(journal.direction)
+          || !apps.some(app => app.appId === journal.targetAppId) || !Array.isArray(journal.routes)
+          || journal.before?.version !== 1 || (journal.before.slackAppId !== undefined && !apps.some(app => app.appId === journal.before.slackAppId))
+          || !journal.routes.some(route => route.appId === journal.targetAppId)
+          || new Set(journal.routes.map(route => route.appId)).size !== journal.routes.length
+          || journal.routes.some(route => !apps.some(app => app.appId === route.appId && app.stateDir === route.stateDir))) {
+          throw new Error('Slackアプリ切り替えの保存記録と登録情報が一致しません')
+        }
+        journal.before.slackChannels = normalizeChannels(journal.before.slackChannels)
+        for (const route of journal.routes) {
+          route.channels = normalizeChannels(route.channels)
+          if (route.configuredAt && route.channels.some(channel => !Number.isSafeInteger(route.configuredAt![channel]) || route.configuredAt![channel]! <= 0)) {
+            throw new Error('Slackアプリ切り替えの経路時刻を読み取れません')
+          }
+        }
+        const current = readProjectChannelConfig(repoPath)
+        if (current.slackAppId !== journal.before.slackAppId && current.slackAppId !== journal.targetAppId) {
+          throw new Error('Slackアプリ切り替え中に接続先が変更されています')
+        }
+        apply(journal)
+      }
+      const before = readProjectChannelConfig(repoPath)
+      if (before.slackAppId && !apps.some(app => app.appId === before.slackAppId)) {
+        throw new Error('元のSlackアプリが未登録です。既存設定は変更していません')
+      }
+      const routes = apps.map(app => {
+        const owned = stores.get(app.stateDir)!.listSlackChannelRoutes(app.appId).filter(route => route.repoPath === repoPath)
+        return { ...app, channels: owned.map(route => route.channelId), configuredAt: Object.fromEntries(owned.map(route => [route.channelId, route.configuredAt])), explicitMode: stores.get(app.stateDir)!.slackChannelRoutingIsExplicit(app.appId) }
+      })
+      if (before.slackAppId === targetAppId && routes.every(route => JSON.stringify(route.channels) === JSON.stringify(route.appId === targetAppId ? before.slackChannels : []))) return
+      stores.get(apps.find(app => app.appId === targetAppId)!.stateDir)!
+        .assertSlackChannelRoutesAvailable(targetAppId, repoPath, before.slackChannels)
+      const journal: AppSwitchJournal = { version: 1, direction: 'forward', before, targetAppId, routes }
+      saveJournal(journal)
+      try { apply(journal) }
+      catch (error) {
+        // Record rollback direction BEFORE restoring anything; a crash while
+        // rolling back must never be interpreted as a request to roll forward.
+        journal.direction = 'rollback'
+        saveJournal(journal)
+        try { apply(journal) } catch { /* Keep the durable rollback for the next selection. */ }
+        throw error
+      }
+    })
+  } finally {
+    for (const store of stores.values()) store.close()
+    for (const entry of leases.reverse()) releaseProcessLock(entry.path, entry.lease)
+  }
+}
+
 function journalPath(stateDir: string): string {
   return join(stateDir, 'channel-route-transaction.json')
 }
@@ -383,6 +500,9 @@ export function mutateProjectChannelConfig(input: {
   try {
     store = new JobStore(resolveZeroJobDatabasePath(stateDir))
     assertUpdateIdle(stateDir)
+    if (existsSync(join(configDirectory(repoPath), 'slack-app-switch.json'))) {
+      throw new Error('Slackアプリの切り替えを復旧するため zerochan set slack-app を再実行してください')
+    }
     recoverJournal(stateDir, store)
     const layout = resolveProjectLayout(repoPath)
     if (layout.kind === 'multi-repo-workspace') ensureLocalConfigDirectory(repoPath)
@@ -472,7 +592,8 @@ export function projectChannelStatus(input: {
   try {
     store = new JobStore(resolveZeroJobDatabasePath(stateDir))
     assertUpdateIdle(stateDir)
-    recoverJournal(stateDir, store)
+    const pendingSwitch = existsSync(join(configDirectory(repoPath), 'slack-app-switch.json'))
+    if (!pendingSwitch) recoverJournal(stateDir, store)
     const config = readProjectChannelConfig(repoPath)
     const layout = resolveProjectLayout(repoPath)
     const routes = store.listSlackChannelRoutes(appId)
@@ -485,6 +606,7 @@ export function projectChannelStatus(input: {
     const lines = [
       `📁 project: ${repoPath}`,
       `🔗 Slackアプリ: ${appId}`,
+      ...(pendingSwitch ? ['⚠️ アプリ切り替えが中断されています。zerochan set slack-app を再実行すると復旧します。'] : []),
       ...(layout.kind === 'multi-repo-workspace'
         ? [`🧩 repositories: ${layout.memberNames.join(', ')}`]
         : []),

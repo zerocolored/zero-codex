@@ -130,14 +130,17 @@ function setupTestPath(fakeHome: string, botAppId?: string): string {
   return `${localBin}:${fakeBin}:${process.env.PATH ?? '/usr/bin:/bin'}`
 }
 
-function setupDoctorGrok(fakeHome: string): void {
+function setupDoctorGrok(fakeHome: string, versionedDownload = false): void {
   const grokRoot = join(fakeHome, '.grok')
   const grokBin = join(grokRoot, 'bin')
   mkdirSync(grokBin, { recursive: true, mode: 0o700 })
   chmodSync(grokRoot, 0o700)
   chmodSync(grokBin, 0o700)
   const source = join(fakeHome, 'fixture-grok.c')
-  const executable = join(grokBin, 'grok-1.0.0')
+  const downloads = join(grokRoot, 'downloads')
+  if (versionedDownload) mkdirSync(downloads, { mode: 0o700 })
+  const name = `grok-1.0.41-macos-${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}`
+  const executable = versionedDownload ? join(downloads, name) : join(grokBin, 'grok-1.0.0')
   writeFileSync(source, '#include <stdio.h>\nint main(void) { puts("grok 1.0.0"); return 0; }\n', {
     mode: 0o600,
   })
@@ -147,7 +150,7 @@ function setupDoctorGrok(fakeHome: string): void {
   if (compiled.exitCode !== 0) throw new Error(compiled.stderr.toString())
   rmSync(source, { force: true })
   chmodSync(executable, 0o700)
-  symlinkSync('grok-1.0.0', join(grokBin, 'grok'))
+  symlinkSync(versionedDownload ? `../downloads/${name}` : 'grok-1.0.0', join(grokBin, 'grok'))
   writeFileSync(join(grokRoot, 'auth.json'), '{"fixture":true}\n', { mode: 0o600 })
 
   const reviewerRoot = join(fakeHome, '.zerokun/runtime/grok-reviewer')
@@ -368,11 +371,11 @@ describe('macOS bootstrap', () => {
     }
   })
 
-  test('--doctor reports installed tool versions without changing HOME', () => {
+  test.each([false, true])('--doctor reports installed tool versions without changing HOME (versioned download=%s)', versionedDownload => {
     if (process.platform !== 'darwin') return
     const fakeHome = mkdtempSync(join(tmpdir(), 'zerokun-bootstrap-doctor-'))
     try {
-      setupDoctorGrok(fakeHome)
+      setupDoctorGrok(fakeHome, versionedDownload)
       const before = treeSnapshot(fakeHome)
       const result = Bun.spawnSync([bootstrap, '--doctor'], {
         env: { ...process.env, HOME: fakeHome },

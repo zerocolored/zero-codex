@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -371,7 +372,7 @@ for line in sys.stdin:
     if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume", "thread/inject_items"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"method": method, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
+            stream.write(json.dumps({"method": method, "developerInstructions": params.get("developerInstructions"), "injectedItems": params.get("items") if method == "thread/inject_items" else None, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
     if method == "initialized":
         continue
     if method == "initialize":
@@ -497,10 +498,14 @@ for line in sys.stdin:
             emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": user_item}})
         else:
             emit({"id": request_id, "result": {"turn": active_turn}})
+            if os.environ.get("ZERO_EARLY_ITEM"):
+                emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
+                emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
             emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
         if mode == "late-command-completion":
             late_item_type = os.environ.get("ZERO_LATE_ITEM_TYPE", "commandExecution")
-            emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "inProgress"}}})
+            if not os.environ.get("ZERO_LATE_START"):
+                emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "inProgress"}}})
         turn_latch_stage = os.environ.get("ZERO_TURN_LATCH_STAGE")
         if turn_latch_stage == stage:
             turn_latch_ready = os.environ["ZERO_TURN_LATCH_READY"]
@@ -519,16 +524,24 @@ for line in sys.stdin:
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "inProgress", "itemsView": "full", "items": []}}},
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "保持して待機しました"}], "error": None}}},
             ])
-        elif mode in ("goal-native", "late-command-completion"):
+        elif mode in ("goal-native", "goal-native-capacity", "late-command-completion"):
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "interim", "text": "残タスクがあります"}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": [], "error": None}}},
             ])
             if mode == "late-command-completion":
+                if os.environ.get("ZERO_LATE_START"):
+                    emit({"method": "diagnostic/padding", "params": {"text": "x" * (21 * 1024 * 1024)}})
+                    emit({"method": "item/started", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "late-diagnostic-marker", "status": "inProgress"}}})
                 emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "completed", "exitCode": 0}}})
-            emit_batch([
-                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "native-final", "text": "Goalを完遂しました"}], "error": None}}},
-            ])
+            if mode == "goal-native-capacity":
+                failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None}
+                items = [{"type": "commandExecution", "id": "native-write", "command": "fixture-only", "status": "completed", "exitCode": 0}]
+                emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "failed", "itemsView": "full", "items": items, "error": failure}}})
+            else:
+                emit_batch([
+                    {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "native-final", "text": "Goalを完遂しました"}], "error": None}}},
+                ])
         elif mode == "goal-blocked":
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "判断を待っています"}], "error": None}}})
         elif is_legacy_continuation:
@@ -1027,7 +1040,7 @@ function fixture(
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
-    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-blocked' | 'goal-proposal' | 'resume-early-start'
+    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-native-capacity' | 'goal-blocked' | 'goal-proposal' | 'resume-early-start'
     | 'error-steer' | 'rate-error' | 'rate-terminal-only' | 'rate-retrying' | 'rate-retrying-two-turn'
     | 'capacity-error' | 'network-once' | 'network-always' | 'network-native' | 'network-permanent' | 'network-session-missing'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
@@ -1147,6 +1160,11 @@ function fixture(
     bindTurn: (executorNonce, threadId, turnId) => {
       store.bindAppServerTurn(
         job.id, job.workerId!, job.controlEpoch, executorNonce, threadId, turnId,
+      )
+    },
+    bindNativeTurn: (nonce, threadId, parentTurnId, turnId) => {
+      store.bindNativeAppServerTurn(
+        job.id, job.workerId!, job.controlEpoch, nonce, threadId, parentTurnId, turnId,
       )
     },
     beginInitialDispatch: ({
@@ -2362,6 +2380,42 @@ describe('production App Server executor', () => {
   }, 30_000)
   }
 
+  for (const resume of [false, true]) {
+    test(`承認済みIAM修復の現行指示をApp Server ${resume ? 'resume' : 'start'}へ送る`, async () => {
+      const value = fixture('normal', true, '承認した対象ジョブ・実行主体への必要アクセスを修復してください')
+      const rpcLog = join(value.root, 'iam-policy-rpc.log')
+      try {
+        const result = await executeCodexJob({
+          ...value.job, ...(resume ? { sessionId: 'thread-existing', resumed: true } : {}),
+        }, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true,
+          extraEnvironment: { ZERO_FIXTURE_MODE: 'normal', ZERO_RPC_LOG: rpcLog, ZERO_LOG_HANDSHAKES: '1' },
+          liveControls: value.hooks,
+        })
+        expect(result.result).toBe('通常完了')
+        const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        const handshake = rpc.filter(row => row.method === (resume ? 'thread/resume' : 'thread/start'))
+        expect(handshake).toHaveLength(1)
+        expect(handshake[0].developerInstructions).toContain('IAM repair is permitted')
+        expect(handshake[0].developerInstructions).toContain('target resource, existing grantee principal, and exact permission or role')
+        expect(handshake[0].developerInstructions).toContain('other applicable restrictions')
+        expect(handshake[0].developerInstructions).not.toContain('change IAM to bypass a denial')
+        if (resume) {
+          const injected = rpc.filter(row => row.method === 'thread/inject_items')
+          expect(injected).toHaveLength(1)
+          expect(injected[0].injectedItems).toEqual([{
+            type: 'message', role: 'developer',
+            content: [{ type: 'input_text', text: handshake[0].developerInstructions }],
+          }])
+          expect(handshake[0].developerInstructions).toContain('supersedes older developer instructions in resumed history')
+          expect(rpc.findIndex(row => row.method === 'thread/inject_items'))
+            .toBeLessThan(rpc.findIndex(row => row.method === 'turn/start'))
+        }
+      } finally { value.store.close() }
+    }, 30_000)
+  }
+
   test('resumeの指示注入で先行開始したnative turnへ最新依頼を一度届け正常完了する', async () => {
     const value = fixture('resume-early-start', false, '追加の条件を反映して続けてください')
     const rpcLog = join(value.root, 'resume-early-rpc.log')
@@ -2416,6 +2470,49 @@ describe('production App Server executor', () => {
       value.store.close()
     }, 30_000)
   }
+
+  test('native turnで変更後にcapacityとなってもworkerは失敗通知せず同じthreadを再queueする', async () => {
+    const value = fixture('goal-native-capacity', true)
+    const rpcLog = join(value.root, 'native-capacity-rpc.log')
+    expect(value.store.releaseUnstartedClaim(
+      value.job.id, value.job.workerId!, 'return fixture claim',
+    )).toBe(true)
+    let observedError: unknown
+    try {
+      const stats = await runQueuedJobs({
+        store: value.store, maxJobsPerSession: 5, pollMs: 1, stopWhenIdle: true,
+        openJobMonitor: async current => {
+          value.store.beginMonitorPreparation(current.id, current.workerId!)
+          value.store.commitMonitorRequired(current.id, current.workerId!)
+        },
+        executor: async (current, signal) => {
+          Object.assign(value.job, current)
+          try {
+            return await executeCodexJob(current, {
+              codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+              skipEffectiveConfigCheck: true,
+              extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-native-capacity', ZERO_RPC_LOG: rpcLog },
+              ...createExecutorPidLifecycle(value.store, current.id),
+              liveControls: value.hooks, signal,
+            })
+          } catch (error) { observedError = error; throw error }
+        },
+      })
+      expect(observedError).toBeInstanceOf(CodexRateLimitError)
+      expect((observedError as CodexRateLimitError).safeToRetryAfterDelivery).toBe(false)
+      expect(stats).toEqual({ completed: 0, failed: 0, workersStarted: 1 })
+      expect(value.store.get(value.job.id)).toMatchObject({
+        status: 'queued', terminalOutcome: null, executorPid: null,
+        sessionId: 'thread-app-server-1',
+        rateLimitRecovery: { turnId: 'native-next', reason: 'capacity', safeToReplay: false },
+      })
+      expect(value.store.terminalNotificationCount()).toBe(0)
+      expect(value.store.pendingStatusNotifications().map(row => row.payload))
+        .toContainEqual(expect.stringContaining('モデルが混雑'))
+      const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(1)
+    } finally { value.store.close() }
+  }, 30_000)
 
   for (const shouldResume of [false, true]) {
     test(`${shouldResume ? 'native resume' : 'fresh physical session'}の履歴注入を一意にする`, async () => {
@@ -2792,6 +2889,101 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 30_000)
   }
+
+  test('job244: 実executorで先行・終了後startを許容し20MiB超の直近証拠を保存する', async () => {
+    const value = fixture('late-command-completion', true)
+    const processIds: number[] = []
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'late-command-completion', ZERO_EARLY_ITEM: '1', ZERO_LATE_START: '1' },
+        onProcessId: pid => { processIds.push(pid) }, liveControls: value.hooks,
+      })
+      expect(result).toEqual({ sessionId: 'thread-app-server-1', result: 'Goalを完遂しました' })
+      expect(processIds).toHaveLength(1)
+      const name = readdirSync(value.logDir).find(name => name.startsWith(value.job.id) && name.endsWith('.stdout.log'))!
+      const path = join(value.logDir, name)
+      expect(statSync(path).size).toBe(20 * 1024 * 1024)
+      const info = JSON.parse(readFileSync(`${path}.tail.json`, 'utf8'))
+      expect(info.prefixTruncated).toBe(true)
+      const tail = readFileSync(`${path}.tail-${1 - info.latestSegment}.log`, 'utf8')
+        + readFileSync(`${path}.tail-${info.latestSegment}.log`, 'utf8')
+      expect(tail).toContain('late-diagnostic-marker')
+      expect(tail).toContain('native-final')
+      for (const slot of [0, 1]) expect(statSync(`${path}.tail-${slot}.log`).size).toBeLessThanOrEqual(1024 * 1024)
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test.each([false, true])('complete executorはadvisorを回収する前に親を終了せず入力受付も閉じない: interjection=%s', async interjection => {
+    const value = fixture('interjection-late-answer', true)
+    const acknowledge = value.hooks.acknowledgeInitialDispatch
+    const finish = value.hooks.finishTurn
+    let claimCreated = false
+    let finishObserved = false
+    let released = false
+    let inputOpenAtRelease = false
+    let finishedAfterRelease = false
+    let inputTimer: ReturnType<typeof setTimeout> | undefined
+    let stagedInterjection = false
+    let releaseTimer: ReturnType<typeof setTimeout> | undefined
+    value.hooks.acknowledgeInitialDispatch = args => {
+      acknowledge!(args)
+      if (claimCreated) return
+      claimCreated = true
+      const context = JSON.parse(readFileSync(join(value.state, 'advisor-context', value.job.id, `${args.executorNonce}.json`), 'utf8'))
+      const registration = JSON.parse(readFileSync(join(value.state, 'executors', `${value.job.id}.json`), 'utf8'))
+      const processNonce = dirname(registration.fingerprint.allow.path).split('/').at(-1)!
+      const input = readAdvisorInputSnapshot(value.state, value.job.id)
+      const root = join(value.state, 'advisor-journal', value.job.id, args.executorNonce)
+      mkdirSync(root, { recursive: true, mode: 0o700 })
+      const lock = join(root, 'active-round.lock')
+      writeFileSync(lock, JSON.stringify({ version: 2, jobId: value.job.id,
+        attemptNonce: args.executorNonce, processNonce,
+        contextDigest: createHash('sha256').update(JSON.stringify(context)).digest('hex'),
+        inputRevision: input.revision, inputDigest: input.digest, phase: 'investigation', round: 1,
+        brokerProcessId: process.pid }), { mode: 0o600 })
+      if (interjection) inputTimer = setTimeout(() => {
+        const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
+        if (!target) return
+        value.store.stageLiveInterjection(target, {
+          chatId: value.job.chatId, threadTs: value.job.threadTs,
+          messageId: '1800000000.000200', userId: 'UOTHER', task: 'いまどこまで進んでいますか？',
+        })
+        stagedInterjection = true
+      }, 250)
+      releaseTimer = setTimeout(() => {
+        inputOpenAtRelease = value.store.liveControlTarget(value.job.chatId, value.job.threadTs) !== null
+        released = true
+        rmSync(lock)
+      }, 1000)
+    }
+    value.hooks.finishTurn = args => {
+      if (!finishObserved) finishedAfterRelease = released
+      finishObserved = true
+      return finish!(args)
+    }
+    try {
+      const execution = executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: 'interjection-late-answer' },
+        liveControls: value.hooks,
+      })
+      if (interjection) {
+        const notification = await waitForInterjectionNotification(value.store)
+        value.store.markInterjectionNotificationDelivered(notification.id)
+      }
+      const result = await execution
+      expect(result.result).toBe('通常完了')
+      expect(finishedAfterRelease).toBe(true)
+      expect(inputOpenAtRelease).toBe(true)
+      expect(stagedInterjection).toBe(interjection)
+    } finally {
+      if (releaseTimer) clearTimeout(releaseTimer)
+      if (inputTimer) clearTimeout(inputTimer)
+      value.store.close()
+    }
+  }, 15_000)
 
   test('production write jobはhost工程を挟まずCodexのcomplete turnだけで完了する', async () => {
     const value = fixture(

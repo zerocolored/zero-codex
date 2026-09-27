@@ -1,6 +1,52 @@
 import { expect, test } from 'bun:test'
 import { join } from 'path'
 
+test('real PTY selects another registered app and migrates project channels', () => {
+  const program = String.raw`
+import os, pty, select, subprocess, sys, time
+master, slave = pty.openpty()
+proc = subprocess.Popen([sys.argv[1], '--no-env-file', '-e', sys.argv[2]], stdin=slave, stdout=slave, stderr=slave)
+output = b''
+try:
+    deadline = time.monotonic() + 15
+    while b' n: ' not in output and time.monotonic() < deadline:
+        if select.select([master], [], [], .1)[0]: output += os.read(master, 4096)
+    assert b' n: ' in output
+    os.write(master, b'2\r')
+    while proc.poll() is None and time.monotonic() < deadline:
+        if select.select([master], [], [], .1)[0]: output += os.read(master, 4096)
+    assert proc.wait(timeout=2) == 0, output.decode(errors='replace')
+    assert '接続先を変更し、チャンネル設定1件を引き継ぎました'.encode() in output
+    assert b'SWITCH_VERIFIED' in output
+finally:
+    if proc.poll() is None: proc.kill(); proc.wait()
+    os.close(master); os.close(slave)
+print('interactive app switch passed')
+`
+  const javascript = `
+    import {mkdtempSync,mkdirSync,rmSync,realpathSync} from 'fs';
+    import {tmpdir} from 'os'; import {join} from 'path';
+    import {runSlackAppCommand} from ${JSON.stringify(join(import.meta.dir, 'slack-app-command.ts'))};
+    import {registerSlackApp} from ${JSON.stringify(join(import.meta.dir, 'slack-app-registry.ts'))};
+    import {bindProjectSlackApp,mutateProjectChannelConfig,readProjectChannelConfig} from ${JSON.stringify(join(import.meta.dir, 'project-channel-config.ts'))};
+    import {JobStore} from ${JSON.stringify(join(import.meta.dir, 'job-runner.ts'))};
+    const home=realpathSync(mkdtempSync(join(tmpdir(),'zero-switch-pty-')));
+    try {
+      const project=join(home,'project');mkdirSync(project);Bun.spawnSync(['/usr/bin/git','init','-q',project]);
+      const old=join(home,'old'),next=join(home,'next');mkdirSync(old,{mode:448});mkdirSync(next,{mode:448});
+      registerSlackApp('AOLD',old,home);registerSlackApp('AZNEW',next,home);
+      bindProjectSlackApp(project,'AOLD');mutateProjectChannelConfig({operation:'set',repoPath:project,stateDir:old,appId:'AOLD',channelId:'CONE'});
+      await runSlackAppCommand(project,{home,prepare:()=>{},installWatchdog:()=>{}});
+      const a=new JobStore(join(old,'jobs.sqlite3')),b=new JobStore(join(next,'jobs.sqlite3'));
+      if(readProjectChannelConfig(project).slackAppId!=='AZNEW'||a.resolveSlackChannelRoute('AOLD','CONE')!==null||b.resolveSlackChannelRoute('AZNEW','CONE')!==project)throw Error('switch mismatch');
+      a.close();b.close();console.log('SWITCH_VERIFIED');
+    }finally{rmSync(home,{recursive:true,force:true})}
+  `
+  const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, process.execPath, javascript], { timeout: 25_000 })
+  expect(result.exitCode, result.stderr.toString()).toBe(0)
+  expect(result.stdout.toString()).toContain('interactive app switch passed')
+})
+
 test('real PTY echoes selection and edits but keeps subsequent registration tokens hidden', () => {
   const program = String.raw`
 import os, pty, select, subprocess, sys, termios, time

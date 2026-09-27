@@ -6,7 +6,9 @@ import {
   decodeHerdrRuntimeIdentity,
   environmentForPinnedHerdrRuntime,
   encodeHerdrRuntimeIdentity,
+  herdrCommandEmitsEnvelope,
   herdrControlPlaneFingerprint,
+  parseHerdrCommandEnvelope,
   herdrRuntimeFingerprint,
   readPinnedHerdrRuntime,
   requireHerdrRuntime,
@@ -202,5 +204,37 @@ describe('Herdr runtime binding', () => {
     } finally {
       value.stop()
     }
+  })
+})
+
+describe('Herdr CLI envelope contract', () => {
+  test('pane入力系コマンドは空stdoutを正常応答として受け入れる', () => {
+    for (const args of [
+      ['pane', 'run', 'w1:p1', "'/usr/bin/env' 'ZEROKUN_STATE_DIR=/s' '/repo/codex-channel.sh' '/p'"],
+      ['pane', 'send-text', 'w1:p1', '--text', 'hello'],
+      ['pane', 'send-keys', 'w1:p1', 'enter'],
+    ]) {
+      expect(herdrCommandEmitsEnvelope(args)).toBe(false)
+      expect(parseHerdrCommandEnvelope(args, '')).toEqual({})
+      expect(parseHerdrCommandEnvelope(args, '\n')).toEqual({})
+    }
+  })
+  test('封筒を出すコマンドの空stdoutは失敗のままにする', () => {
+    for (const args of [
+      ['workspace', 'create', '--cwd', '/p'],
+      ['pane', 'list', '--workspace', 'w1'],
+      ['pane', 'wait-output', '--match', 'x', 'w1:p1'],
+      ['pane', 'process-info', '--pane', 'w1:p1'],
+    ]) {
+      expect(herdrCommandEmitsEnvelope(args)).toBe(true)
+      expect(() => parseHerdrCommandEnvelope(args, '')).toThrow('不正なJSON')
+    }
+  })
+  test('pane入力系でも非空stdoutは封筒として検証する', () => {
+    const args = ['pane', 'run', 'w1:p1', 'echo hi']
+    expect(parseHerdrCommandEnvelope(args, '{"id":"cli:pane:run"}'))
+      .toEqual({ id: 'cli:pane:run' })
+    expect(() => parseHerdrCommandEnvelope(args, 'not json')).toThrow('不正なJSON')
+    expect(() => parseHerdrCommandEnvelope(args, '[]')).toThrow('応答が不正')
   })
 })

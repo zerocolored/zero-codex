@@ -33,6 +33,7 @@ import {
   parseEphemeralClaudeDeliveryEvidence,
   persistEphemeralClaudeDeliveryEvidence,
   readEphemeralClaudeCleanupReceipt,
+  readEphemeralClaudeDelivery,
   readEphemeralClaudeProvisionalCleanupReceipt,
   readEphemeralClaudeWorkspaceTarget,
   reconcileEphemeralClaudeSessions,
@@ -312,9 +313,11 @@ describe('ephemeral Claude lifecycle state', () => {
       target: target.target,
       marker: `REQUEST_MARKER=${'A'.repeat(32)}`,
       status: 'delivery-possible',
+      state_change_seq: 42,
     })}\n`)
-    persistEphemeralClaudeDeliveryEvidence(state, delivered)
-    persistEphemeralClaudeDeliveryEvidence(state, delivered)
+    expect(persistEphemeralClaudeDeliveryEvidence(state, delivered)).toBe(`REQUEST_MARKER=${'A'.repeat(32)}`)
+    expect(persistEphemeralClaudeDeliveryEvidence(state, delivered)).toBe(`REQUEST_MARKER=${'A'.repeat(32)}`)
+    expect(readEphemeralClaudeDelivery(delivered)).toEqual({ marker: `REQUEST_MARKER=${'A'.repeat(32)}`, stateChangeSeq: 42 })
     const evidencePath = join(
       state, 'advisor-journal', 'job-123', 'a'.repeat(32),
       EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE,

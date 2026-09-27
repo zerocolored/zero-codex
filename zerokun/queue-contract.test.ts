@@ -116,6 +116,7 @@ describe('Zero-kun Codex wiring', () => {
     expect(server).toContain('resolveInboundWriteEnabled(inbound.chatId, event.userId, access.writeAllowFrom)')
     expect(server).toContain('writeEnabled')
     expect(executor).toContain("[':minimal', 'read']")
+    expect(executor).toContain("primaryWorkspaceAccess ? [[':root', 'read'] as const]")
     expect(executor).not.toContain("extends=${tomlString(job.writeEnabled")
     expect(executor).toContain('permissions.${profile}.network.enabled=')
     expect(executor).toContain('permissions.${profile}.network.allow_local_binding=')
@@ -218,7 +219,8 @@ describe('Zero-kun Codex wiring', () => {
     expect(executor).toContain("features.browser_use=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain("features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain('features.browser_use_full_cdp_access=false')
-    expect(executor).toContain('features.computer_use=false')
+    expect(executor).toContain("features.computer_use=${computerUseEnabled ? 'true' : 'false'}")
+    expect(executor).toContain('const computerUseEnabled = job.writeEnabled && executionWriteEnabled')
     expect(executor).toContain("features.in_app_browser=${browserAccessEnabled ? 'true' : 'false'}")
     expect(executor).toContain('There is one primary Codex workflow now.')
     expect(executor).toContain(

@@ -71,6 +71,7 @@ import {
   parseEphemeralClaudeOpen,
   parseEphemeralClaudeProvisionalRecovery,
   persistEphemeralClaudeDeliveryEvidence,
+  readEphemeralClaudeDelivery,
   readEphemeralClaudeCleanupReceipt,
   readEphemeralClaudeProvisionalCleanupReceipt,
   readEphemeralClaudeWorkspaceTarget,
@@ -116,14 +117,35 @@ import { recoverAdvisorSlot } from './advisor-retry.ts'
 import {
   saveClaudeResponseDiagnostic,
   captureClaudeFailureDiagnostic,
+  parseClaudeStartupDiagnostic,
+  type ClaudeFailureDiagnostic,
   type ClaudeResponseAnalysis,
   type ClaudeDiagnosticRead,
   type ClaudeDiagnosticReceipt,
 } from './claude-response-diagnostic.ts'
 
+const CLAUDE_SEND_CODES = ['agent_not_ready', 'agent_blocked', 'empty_agent_prompt',
+  'agent_prompt_stalled', 'agent_prompt_failed', 'timeout', 'unknown-error'] as const
+type ClaudeSendCode = typeof CLAUDE_SEND_CODES[number]
 export type FifthAdvisorSendOutcome =
   | { kind: 'unconfirmed' }
-  | { kind: 'possibly-delivered'; marker: string; stateChangeSeq?: number }
+  | { kind: 'possibly-delivered'; marker: string; stateChangeSeq?: number; sendCode?: ClaudeSendCode;
+      sendStatus?: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed' }
+
+export function claudeSendRejectedBeforeInput(outcome: FifthAdvisorSendOutcome): boolean {
+  return outcome.kind === 'possibly-delivered' && outcome.sendCode !== undefined
+    && ['agent_not_ready', 'agent_blocked', 'empty_agent_prompt'].includes(outcome.sendCode)
+}
+
+export const CLAUDE_START_CONFIRMATION_MS = 120_000
+
+/** A bounded start failure, never proof of non-delivery or permission to retry. */
+export function claudeStartRemainsUnconfirmed(elapsedMs: number, modelStarted: boolean, transcript: string, marker: string): boolean {
+  return elapsedMs >= CLAUDE_START_CONFIRMATION_MS && !modelStarted
+    && CLAUDE_REQUEST_MARKER.test(marker)
+    && !transcript.replace(/\s/g, '').includes(marker)
+    && emptyClaudePrompt(transcript)
+}
 
 export class AdvisorContainmentError extends Error {}
 export class AdvisorOwnedProcessStillLiveError extends AdvisorContainmentError {}
@@ -140,10 +162,35 @@ export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOu
   if (started.length !== 1 || typeof started[0]!.marker !== 'string') {
     return { kind: 'unconfirmed' }
   }
+  const returned = records.filter(record => record.status === 'prompt-command-returned')
+  const sendCode = returned.length === 1 && returned[0]!.returncode === 1
+    && CLAUDE_SEND_CODES.includes(returned[0]!.code as ClaudeSendCode)
+    ? returned[0]!.code as ClaudeSendCode : undefined
   return { kind: 'possibly-delivered', marker: started[0]!.marker,
+    sendStatus: returned.length === 1 && returned[0]!.returncode === 0 ? 'accepted'
+      : returned.length === 1 && returned[0]!.returncode === 1 ? 'rejected'
+      : records.some(record => record.status === 'prompt-command-timeout-or-error') ? 'transport-error' : 'unconfirmed',
+    ...(sendCode ? { sendCode } : {}),
     ...(Number.isSafeInteger(started[0]!.state_change_seq)
       ? { stateChangeSeq: Number(started[0]!.state_change_seq) } : {}),
   }
+}
+
+/** A failed journal write cannot negate an observed send or stop acquisition. */
+export function recoverFifthAdvisorSendOutcome(
+  stdout: string,
+  readMarker: () => { marker: string; stateChangeSeq?: number } | undefined,
+  persist: () => unknown,
+  warn: (error: unknown) => void,
+): FifthAdvisorSendOutcome {
+  const announced = parseFifthAdvisorSendOutcome(stdout)
+  const durableMarker = announced.kind === 'unconfirmed' ? readMarker() : undefined
+  const outcome: FifthAdvisorSendOutcome = announced.kind !== 'unconfirmed'
+    ? announced : durableMarker ? { kind: 'possibly-delivered', ...durableMarker } : announced
+  if (outcome.kind !== 'unconfirmed') {
+    try { persist() } catch (error) { warn(error) }
+  }
+  return outcome
 }
 
 const CLAUDE_MARKER_INSTRUCTION =
@@ -188,6 +235,13 @@ export function analyzeClaudeResponse(transcript: string, marker: string): Claud
   const result = (code: ClaudeResponseAnalysis['code'], response: string | null = null): ClaudeResponseAnalysis => ({
     response, code, markerLines, exactOccurrences, wrappedMarkerPairs,
   })
+  // Instruction and marker have different display widths. Either can wrap
+  // independently in the same owned terminal; their content must still match.
+  const hasPromptInstruction = (index: number) => (index >= 1
+    && values[index - 1] === CLAUDE_MARKER_INSTRUCTION)
+    || (index >= 2
+      && values[index - 2] === CLAUDE_NARROW_MARKER_INSTRUCTION_HEAD
+      && values[index - 1] === CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL)
 
   let promptEnd: number
   let responseMarker: number
@@ -196,17 +250,14 @@ export function analyzeClaudeResponse(transcript: string, marker: string): Claud
     && wrappedMarkerPairs.length === 0) {
     const promptMarker = markerLines[0]!
     responseMarker = markerLines[1]!
-    if (promptMarker < 1
-      || values[promptMarker - 1] !== CLAUDE_MARKER_INSTRUCTION) return result('prompt-boundary-mismatch')
+    if (!hasPromptInstruction(promptMarker)) return result('prompt-boundary-mismatch')
     promptEnd = promptMarker
   } else if (markerLines.length === 1
     && exactOccurrences === 1
     && wrappedMarkerPairs.length === 1) {
     const wrappedMarker = wrappedMarkerPairs[0]!
     responseMarker = markerLines[0]!
-    if (wrappedMarker < 2
-      || values[wrappedMarker - 2] !== CLAUDE_NARROW_MARKER_INSTRUCTION_HEAD
-      || values[wrappedMarker - 1] !== CLAUDE_NARROW_MARKER_INSTRUCTION_TAIL) return result('prompt-boundary-mismatch')
+    if (!hasPromptInstruction(wrappedMarker)) return result('prompt-boundary-mismatch')
     promptEnd = wrappedMarker + 1
   } else return result('marker-count-mismatch')
 
@@ -226,6 +277,9 @@ export const MAX_ADVISOR_PROMPT_BYTES = 2 * 1024 * 1024
 export const GROK_REVIEW_TIMEOUT_MS = 60 * 60 * 1_000
 export const GROK_OAUTH_TIMEOUT_MS = 10 * 60 * 1_000
 export const CLAUDE_HELPER_TIMEOUT_MS = 140_000
+// Open includes Herdr's 310s process budget, startup dialogs/painting and
+// exact-workspace cleanup. The transport must not kill a valid slow startup.
+export const CLAUDE_OPEN_TIMEOUT_MS = 15 * 60 * 1_000
 const PROTECTED_COMPONENT = /^(?:\.env.*|.*(?:auth|credential|token|secret).*|sessions|logs|memories)$/i
 const GROK_AUTH_REQUIRED_MARKER = 'GROK_REVIEWER_AUTH_REQUIRED\n'
 const MAX_GROK_AUTH_BYTES = 1024 * 1024
@@ -1830,11 +1884,13 @@ async function main(): Promise<void> {
     round: 1 | 2 | 3,
     evidence: string,
     reviewContext = context,
+    continuingInterruptedRequest = false,
   ): Promise<Record<string, unknown>> => {
     let requestDir: string | undefined
     let beforeSnapshot: AdvisorRepositorySnapshot | undefined
     let target: EphemeralClaudeTarget | undefined
     let marker = ''
+    let deliveryUnknown = false
     let response: string | undefined
     let stateChangeSeqAfter: number | undefined
     let modelStartObserved = false
@@ -1854,6 +1910,11 @@ async function main(): Promise<void> {
     let diagnosticTranscript: string | undefined
     let diagnosticTranscriptReadIndex: number | undefined
     let responseDiagnostic: ClaudeDiagnosticReceipt | undefined
+    let failureStage: 'startup' | 'send' | 'acquisition' = 'startup'
+    let diagnosticFailure: ClaudeFailureDiagnostic | undefined
+    let diagnosticSendCode: ClaudeSendCode | undefined
+    let diagnosticSendStatus: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed' = 'unconfirmed'
+    let startupCode: ClaudeFailureDiagnostic['startupCode']
     const persistDiagnostic = () => {
       responseDiagnostic = saveClaudeResponseDiagnostic({
         stateDir,
@@ -1864,6 +1925,9 @@ async function main(): Promise<void> {
         transcriptReadIndex: diagnosticTranscriptReadIndex,
         phase,
         round,
+        failure: diagnosticFailure,
+        sendCode: diagnosticSendCode,
+        sendStatus: diagnosticSendStatus,
       })
     }
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
@@ -1912,7 +1976,11 @@ async function main(): Promise<void> {
         round,
       })
       chmodSync(requestDir, 0o700)
+      const continuationInput = continuingInterruptedRequest ? readAdvisorInputSnapshot(stateDir, context.jobId) : undefined
       const prompt = advisorPrompt(reviewContext, input, phase, round, evidence)
+        + (continuationInput && continuationInput.digest !== input.digest
+          ? `\n中断した元の相談の続行です。新しい依頼をレビュー済みとは扱わないでください。\n最新追記が対象の変更・取消・権限の制限を含む場合は、元の対象を調査せず、その変更をprimaryへ返してください。\n最新入力revision: ${continuationInput.revision} / digest: ${continuationInput.digest}\n最新入力(JSON): ${JSON.stringify(safeInput(continuationInput.transcript, 'continuation transcript', MAX_TRANSCRIPT_CHARS))}`
+          : '')
       writeFileSync(join(requestDir, 'prompt'), prompt, { flag: 'wx', mode: 0o600 })
       const helper = resolveFifthAdvisorHelper()
       const python = realpathSync('/usr/bin/python3')
@@ -1931,10 +1999,11 @@ async function main(): Promise<void> {
       const opened = await runBounded(fingerprintedCommand(
         [python, helper, 'open', ...helperArgs], jobFingerprint,
       ), {
-        env: helperEnvironment, timeoutMs: CLAUDE_HELPER_TIMEOUT_MS,
+        env: helperEnvironment, timeoutMs: CLAUDE_OPEN_TIMEOUT_MS,
       })
       if (opened.timedOut || opened.forcedCleanup
         || opened.outputTruncated || opened.exitCode !== 0) {
+        startupCode = parseClaudeStartupDiagnostic(opened.stdout)
         throw new Error(`ephemeral Claude open failed (${opened.exitCode}): ${opened.stderr}`)
       }
       target = parseEphemeralClaudeOpen(opened.stdout)
@@ -1956,17 +2025,34 @@ async function main(): Promise<void> {
         cleanupWarnings.push(`repository audit after Claude open unavailable: ${error}`)
       }
       await verifyHerdrRuntimeIdentityAsync(claudeRuntime, brokerEnvironment(claudeRuntime))
+      deliveryUnknown = true
+      failureStage = 'send'
+      const sendStartedAt = Date.now()
       const send = await runBounded(fingerprintedCommand([
         python, helper, 'send', ...helperArgs, '--owned',
       ], jobFingerprint), { env: helperEnvironment, timeoutMs: 140_000 })
-      const sendOutcome = parseFifthAdvisorSendOutcome(send.stdout)
+      const sendOutcome = recoverFifthAdvisorSendOutcome(
+        send.stdout,
+        () => readEphemeralClaudeDelivery(requestDir!),
+        () => persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir!),
+        error => cleanupWarnings.push(`delivery journal unavailable: ${error}`),
+      )
+      deliveryUnknown = false
       if (sendOutcome.kind === 'unconfirmed') {
         throw new Error(`Claude prompt delivery failed (${send.exitCode}): ${send.stderr.slice(-2_000)}`)
       }
       {
         marker = sendOutcome.marker
+        diagnosticSendCode = sendOutcome.sendCode
+        diagnosticSendStatus = sendOutcome.sendStatus ?? 'unconfirmed'
+        // Record every transport outcome before acquisition can be interrupted.
+        // Accepted transport is not proof that Claude actually started.
+        persistDiagnostic()
+        if (claudeSendRejectedBeforeInput(sendOutcome)) {
+          throw new Error(`Claude prompt delivery failed: Herdr rejected input (${sendOutcome.sendCode})`)
+        }
+        failureStage = 'acquisition'
         if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
-        persistEphemeralClaudeDeliveryEvidence(stateDir, requestDir)
         const acquisitionDeadline = Date.now() + 60 * 60 * 1_000
         // Once prompt-started is durable, helper timeout/exit 5 is an ambiguous
         // transport outcome, not permission to resend or abandon acquisition.
@@ -1982,8 +2068,9 @@ async function main(): Promise<void> {
           if ((current.state_change_seq ?? 0) > target.stateChangeSeq) {
             modelStartObserved = true
           }
-          if (!modelStartObserved || !['idle', 'done'].includes(current.agent_status ?? '')) continue
+          if (!['idle', 'done'].includes(current.agent_status ?? '')) continue
           let transcript = ''
+          let stateChangedDuringRead = false
           for (const lines of [300, 600, 1200]) {
             const observation: ClaudeDiagnosticRead = {
               requestedLines: lines,
@@ -2006,6 +2093,8 @@ async function main(): Promise<void> {
                 || !['idle', 'done'].includes(afterRead.agent_status ?? '')) {
                 observation.outcome = identityMatches ? 'state-changed' : 'identity-changed'
                 transcript = ''
+                if (!identityMatches) throw new Error('owned ephemeral Claude identity changed during read')
+                stateChangedDuringRead = true
                 break
               }
               const { response: completeResponse, ...analysis } = analyzeClaudeResponse(transcript, marker)
@@ -2013,7 +2102,7 @@ async function main(): Promise<void> {
               observation.analysis = analysis
               diagnosticTranscript = transcript
               diagnosticTranscriptReadIndex = diagnosticReads.length - 1
-              if (completeResponse) {
+              if (completeResponse && modelStartObserved) {
                 response = completeResponse
                 reason = 'Claude response obtained but subsequent cleanup validation did not complete'
                 stateChangeSeqAfter = current.state_change_seq
@@ -2026,6 +2115,14 @@ async function main(): Promise<void> {
             }
           }
           if (response) break
+          if (stateChangedDuringRead) continue
+          // Only the same owned, stable idle screen after the bounded reads
+          // can exhaust startup confirmation. Keep delivery-possible: closing
+          // this read-only advisor never authorizes a second prompt or retry.
+          if (claudeStartRemainsUnconfirmed(Date.now() - sendStartedAt, modelStartObserved, transcript, marker)) {
+            throw new Error('Claude prompt delivery failed: start unconfirmed after the startup confirmation deadline')
+          }
+          if (!modelStartObserved) { await Bun.sleep(28_000); continue }
           reason = 'Claude reached a terminal prompt but its complete marked response was unavailable'
           // The same terminal state and sequence were revalidated after every
           // bounded transcript read. No later output can complete this turn,
@@ -2034,6 +2131,8 @@ async function main(): Promise<void> {
         }
         if (!response && Date.now() >= acquisitionDeadline) {
           reason = 'required ephemeral Claude response exceeded the one-hour acquisition deadline'
+          diagnosticFailure = { ...diagnosticFailure, stage: 'acquisition', cause: 'timeout' }
+          persistDiagnostic()
         }
       }
     } catch (error) {
@@ -2045,6 +2144,9 @@ async function main(): Promise<void> {
       }
       reason = String(error)
       if (error instanceof AdvisorFailureError) failure = error.failure
+      failure ??= classifyAdvisorFailure('claude', reason)
+      diagnosticFailure = { ...diagnosticFailure, stage: failureStage, cause: failure.cause, ...(startupCode ? { startupCode } : {}) }
+      persistDiagnostic()
     } finally {
       if (!response && marker && target && claudeRuntime && diagnosticReads.length === 0) {
         const runtime = claudeRuntime
@@ -2210,7 +2312,7 @@ async function main(): Promise<void> {
             cleanupVerified,
             cleanupStatus,
             cleanupReceiptDigest,
-            promptMayHaveBeenDelivered: Boolean(marker),
+            promptMayHaveBeenDelivered: Boolean(marker) || deliveryUnknown,
           })
           removeVerifiedEphemeralClaudeRequestDirectory(stateDir, requestDir)
         } catch (error) {
@@ -2266,7 +2368,7 @@ async function main(): Promise<void> {
       containmentVerified: helperContainmentVerified
         && (!workspaceCreationAttempted || cleanupVerified),
       ...(containmentStatus ? { containmentStatus } : {}),
-      promptMayHaveBeenDelivered: Boolean(marker),
+      promptMayHaveBeenDelivered: Boolean(marker) || deliveryUnknown,
       reason,
       responseDiagnostic,
       failure: failure ?? classifyAdvisorFailure('claude', reason),
@@ -2436,11 +2538,33 @@ async function main(): Promise<void> {
   // Slot writes survive a main-process interruption independently. Never drop
   // an acquired answer merely because its peer was still working.
   const interruptedSlots = (input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
-    phase: 'investigation' | 'design' | 'review', round: 1 | 2 | 3, evidenceDigest: unknown) =>
+    phase: 'investigation' | 'design' | 'review', round: 1 | 2 | 3, evidenceDigest: unknown,
+    currentClaude?: Record<string, unknown>) =>
     readInterruptedAdvisorSlots(roundJournalPath(input, phase, round), {
       contextDigest, phase, round, inputRevision: input.revision, inputDigest: input.digest,
       primaryEvidenceDigest: evidenceDigest,
-    })
+    }, currentClaude)
+  const continuationUnavailable = (path: string, journal: Record<string, unknown>): boolean => {
+    try {
+      const raw = readOptionalPrivateFile(`${path}.continuation-unavailable`)
+      if (!raw || Buffer.byteLength(raw) > 4096) return false
+      const value = JSON.parse(raw)
+      return value.version === 1 && value.contextDigest === contextDigest
+        && value.recoveryId === journal.recoveryId
+        && value.requestDigest === journal.continuationRequestDigest
+    } catch { return false }
+  }
+  const readContinuationRequest = (path: string, journal: Record<string, unknown>): RoundRequest | null => {
+    try {
+      const raw = readOptionalPrivateFile(`${path}.request`)
+      if (!raw || Buffer.byteLength(raw) > 2 * 1024 * 1024
+        || journal.continuationRequestDigest !== createHash('sha256').update(raw).digest('hex')) return null
+      const request = roundRequestSchema.parse(JSON.parse(raw))
+      if (request.phase !== journal.phase || request.round !== journal.round
+        || request.inputRevision !== journal.inputRevision || request.inputDigest !== journal.inputDigest) return null
+      return request
+    } catch { return null }
+  }
   const recoveredRoundResult = (
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
     phase: 'investigation' | 'design' | 'review',
@@ -2481,7 +2605,8 @@ async function main(): Promise<void> {
     const recoveredGrokPerspectives = journal.version === THREE_ADVISOR_JOURNAL_VERSION
       ? [advisorPerspectiveForPhase(phase)]
       : ['solution', 'risk'] as const
-    const savedSlots = interruptedSlots(input, phase, round, journal.primaryEvidenceDigest)
+    const savedSlots = interruptedSlots(input, phase, round, journal.primaryEvidenceDigest,
+      journal.claude as Record<string, unknown> | undefined)
     const recoveredGrok = savedSlots.grok ?? recoveredGrokPerspectives.map(perspective => {
       const recorded = journalGrok.find(value => value.perspective === perspective) ?? {}
       const executionState = advisorExecutionState(recorded, 'grok')
@@ -2499,6 +2624,7 @@ async function main(): Promise<void> {
         reason: recorded.containmentVerified === true
           ? 'reviewer process ended at the verified interjection boundary'
           : 'reviewer containment remained an explicit bounded residual after interruption',
+        failure: recorded.failure ?? { advisor: 'grok', cause: 'interrupted' },
       }
     })
     const recordedClaude = journal.claude && typeof journal.claude === 'object'
@@ -2519,6 +2645,8 @@ async function main(): Promise<void> {
       containmentVerified: recordedClaude.containmentVerified === true,
       containmentStatus: recordedClaude.containmentStatus,
       promptMayHaveBeenDelivered: recordedClaude.promptMayHaveBeenDelivered === true,
+      failure: recordedClaude.failure ?? { advisor: 'claude', cause: 'interrupted' },
+      responseDiagnostic: recordedClaude.responseDiagnostic,
       reason: recordedClaude.containmentVerified === true
         ? 'ephemeral reviewer was closed at the verified interjection boundary'
         : 'ephemeral reviewer cleanup remained an explicit bounded residual after interruption',
@@ -2527,13 +2655,21 @@ async function main(): Promise<void> {
       ? journal.native as Array<Record<string, unknown>>
       : []
     const allAdopted = allAdvisorAttemptsAdopted(recoveredNative, recoveredGrok, recoveredClaude)
-    const retryable = !allAdopted && Number(journal.retryCount ?? 0) < 3
+    const interruptedUnsentClaude = recoveredClaude.adopted !== true
+      && recoveredClaude.promptMayHaveBeenDelivered === false
+      && (recoveredClaude.failure as { cause?: string } | undefined)?.cause === 'interrupted'
+    const continuationFailed = continuationUnavailable(roundJournalPath(input, phase, round), journal)
+      || (typeof journal.continuationRequestDigest === 'string'
+        && !readContinuationRequest(roundJournalPath(input, phase, round), journal))
+    const retryable = !continuationFailed && !allAdopted && Number(journal.retryCount ?? 0) < 3
       && recordedClaude.containmentVerified === true
+      && (typeof journal.continuationRequestDigest !== 'string' || interruptedUnsentClaude)
     const latestInput = readAdvisorInputSnapshot(stateDir, context.jobId)
     const inputUnchanged = latestInput.revision === input.revision && latestInput.digest === input.digest
     return toolText({
       complete: allAdopted && inputUnchanged,
       restoredSavedResponses: allAdopted,
+      continuationUnavailable: continuationFailed,
       waitingForAdvisors: retryable,
       recoveredAfterInterruption: true,
       attemptsFinished: !retryable,
@@ -2572,12 +2708,33 @@ async function main(): Promise<void> {
     })
   }
 
-  server.registerTool('advisor_round', {
-    description: 'Durably start one ordered Three-Advisor attempt round. Unavailable outcomes are contained and journaled; call advisor_round_poll until the same binding reaches a terminal receipt.',
-    inputSchema: advisorRoundInputSchema,
-  }, async ({
+  const roundRequestSchema = z.object(advisorRoundInputSchema)
+  type RoundRequest = z.infer<typeof roundRequestSchema>
+  // Resume the original question from durable host input, not from a model's
+  // optional retry instruction. Only a contained, interrupted, unsent Claude
+  // slot qualifies. Terminal failures and delivery-possible slots stay final.
+  const continuationRequest = (
+    binding: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
+    phase: 'investigation' | 'design' | 'review', round: 1 | 2 | 3,
+  ): RoundRequest | null => {
+    if (!completeWorkflow) return null
+    const recovered = recoveredRoundResult(binding, phase, round, true)
+    if (!recovered) return null
+    const payload = resultPayload(recovered)
+    const claude = payload?.claude as Record<string, unknown> | undefined
+    if (!claude || claude.adopted === true || claude.containmentVerified !== true
+      || claude.promptMayHaveBeenDelivered !== false
+      || (claude.failure as { cause?: string } | undefined)?.cause !== 'interrupted') return null
+    const path = roundJournalPath(binding, phase, round)
+    try {
+      const journal = JSON.parse(readOptionalPrivateFile(path) ?? '{}')
+      if (continuationUnavailable(path, journal) || Number(journal.retryCount ?? 0) >= 3) return null
+      return readContinuationRequest(path, journal)
+    } catch { return null }
+  }
+  const startRound = async ({
     phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis, retryUnavailable, inputUpdateIsRecoveryOnly, reviewWorktrees,
-  }) => {
+  }: RoundRequest, automaticContinuation = false): Promise<ReturnType<typeof toolText>> => {
     if (phaseScope === 'prepare' && phase === 'review') {
       return toolText({ complete: false, reason: 'review is unavailable in the pre-edit process' }, true)
     }
@@ -2623,6 +2780,21 @@ async function main(): Promise<void> {
       'agentId' in value ? [value.agentId] : []
     ))
     const taskKey = roundTaskKey(phase, round, inputRevision, inputDigest)
+    if (!automaticContinuation && !activeRoundKeys.has(taskKey) && completeWorkflow) {
+      const ledger = unifiedRoundLedger(phase, round as 1 | 2)
+      if (!ledger.invalid && ledger.entries.length === 1) {
+        const prior = ledger.entries[0]!
+        const request = continuationRequest(prior.input, phase, round as 1 | 2 | 3)
+        if (request) {
+          const result = await continueRound(request)
+          if (resultPayload(result)?.pending === true) return result
+          // Return saved peer answers and the original binding even when
+          // preclaim continuation failed, just like startup/poll recovery.
+          const recovered = recoveredRoundResult(prior.input, phase, round as 1 | 2 | 3, true)
+          return recovered ?? result
+        }
+      }
+    }
     let retryResult: {
       grok: Array<Record<string, unknown>>, claude: Record<string, unknown>,
       native: Array<Record<string, unknown>>, evidenceDigest: string,
@@ -2632,6 +2804,22 @@ async function main(): Promise<void> {
       recoveryInputRevision?: number,
       recoveryInputDigest?: string,
     } | undefined
+    if (automaticContinuation) {
+      const recovered = resultPayload(recoveredRoundResult(
+        { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3, true,
+      )!)
+      const journal = JSON.parse(readOptionalPrivateFile(roundJournalPath(
+        { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3,
+      )) ?? '{}')
+      retryResult = {
+        native: journal.native,
+        grok: recovered!.grok as Array<Record<string, unknown>>,
+        claude: recovered!.claude as Record<string, unknown>,
+        evidenceDigest: String(journal.primaryEvidenceDigest),
+        interruptionRecovery: true,
+        retryCount: Number(journal.retryCount ?? 0) + 1,
+      }
+    }
     let retryBackoff = false
     if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
       const binding = { revision: inputRevision, digest: inputDigest }
@@ -2713,7 +2901,8 @@ async function main(): Promise<void> {
         if (recovered && journal && claude?.containmentVerified === true
           && Date.now() - Number(journal.finishedAt) >= 30_000) {
           retryResult ??= { native: journal.native as Array<Record<string, unknown>>,
-            grok: [], claude, evidenceDigest: String(journal.primaryEvidenceDigest),
+            grok: [], claude: { ...claude, failure: claude.failure ?? { advisor: 'claude', cause: 'interrupted' } },
+            evidenceDigest: String(journal.primaryEvidenceDigest),
             interruptionRecovery: true,
             retryCount: Number(journal.retryCount ?? 0) + 1,
             recoveryInputRevision: Number(journal.recoveryInputRevision ?? 0),
@@ -2728,7 +2917,7 @@ async function main(): Promise<void> {
           // Each external answer is persisted immediately, independently of
           // its peer. Reuse it after the old generation has been retired.
           Object.assign(retryResult, interruptedSlots({ revision: inputRevision, digest: inputDigest },
-            phase, round as 1 | 2 | 3, retryResult.evidenceDigest))
+            phase, round as 1 | 2 | 3, retryResult.evidenceDigest, claude))
         }
       }
       if (!retryResult) return toolText({ complete: false, waitingForAdvisors: true,
@@ -2867,7 +3056,8 @@ async function main(): Promise<void> {
           })
         }
         if (!investigation.entries[0]!.terminal
-          || journalSlotSummary(investigation.entries[0]!.terminal!).responsesObtained !== journalSlotSummary(investigation.entries[0]!.terminal!).total) {
+          || (investigation.entries[0]!.terminal!.recoveredAfterInterruption === true
+            && resultPayload(recoveredRoundResult(investigation.entries[0]!.input, 'investigation', 1, true) ?? toolText({}))?.attemptsFinished !== true)) {
           return toolText({
             complete: false,
             uncertain: true,
@@ -3078,6 +3268,14 @@ async function main(): Promise<void> {
     if (retryResult && retryResult.evidenceDigest !== evidenceDigest) {
       return toolText({ complete: false, reason: 'The advisor question changed; do not mix previous answers with different evidence.' }, true)
     }
+    if (!automaticContinuation && retryResult && retryResult.claude.adopted !== true
+      && retryResult.claude.promptMayHaveBeenDelivered !== false
+      && allAdvisorAttemptsAdopted(retryResult.native, retryResult.grok, { adopted: true })) {
+      return toolText({ ...retryResult, complete: false, waitingForAdvisors: false,
+        attemptsFinished: true, retryable: false,
+        reason: 'Claude delivery is possible; preserve the saved outcome without resending or consuming retry budget.' })
+    }
+
     const expectedNativePerspective = advisorPerspectiveForPhase(phase)
     const nativePerspectives = new Set(nativeAdvisors.map(value => value.perspective))
     if (nativePerspectives.size !== 1
@@ -3281,7 +3479,12 @@ async function main(): Promise<void> {
     let reviewOneRepositoryBaselineDigest: string | undefined
     const journalPath = join(currentJournalRoot, `${phase}-${round}.json`)
     const startedAt = Date.now()
+    const continuationRequestRaw = JSON.stringify({ phase, round, inputRevision, inputDigest,
+      primaryEvidence, nativeAdvisors, roundTwoBasis, reviewWorktrees })
+    atomicWritePrivateFile(`${journalPath}.request`, continuationRequestRaw)
+    const continuationRequestDigest = createHash('sha256').update(continuationRequestRaw).digest('hex')
     const requestedJournal = {
+      continuationRequestDigest,
       retryCount: retryResult?.retryCount ?? 0,
       interruptionRecovery: retryResult?.interruptionRecovery === true,
       version: THREE_ADVISOR_JOURNAL_VERSION,
@@ -3327,10 +3530,11 @@ async function main(): Promise<void> {
       if (!current || !(currentStatus === 'required-reviewer-failed'
         || (['completed', 'reviewers-completed'].includes(currentStatus)
           && journalSlotSummary(JSON.parse(current)).responsesObtained < journalSlotSummary(JSON.parse(current)).total)
-        || (currentStatus === 'stale-input' && inputUpdateIsRecoveryOnly === true))) {
+        || (currentStatus === 'stale-input' && (inputUpdateIsRecoveryOnly === true || automaticContinuation)))) {
         return toolText({ complete: false, waitingForAdvisors: true, reason: 'Advisor round changed before retry.' }, true)
       }
-      if (retryResult.claude.adopted !== true) {
+      if (retryResult.claude.adopted !== true
+        && retryResult.claude.promptMayHaveBeenDelivered === false) {
         try {
           retireAdvisorClaudeCleanupOutcome(stateDir, {
             jobId: context.jobId, attemptNonce: context.attemptNonce,
@@ -3348,6 +3552,10 @@ async function main(): Promise<void> {
         recoveryInputRevision: retryResult.recoveryInputRevision,
         recoveryInputDigest: retryResult.recoveryInputDigest,
         grok: JSON.parse(current).grok,
+        // A reused Claude slot may have only its terminal journal left. Keep
+        // it durable across the gap before per-slot cache writes resume.
+        ...(retryResult.claude.adopted === true || retryResult.claude.promptMayHaveBeenDelivered !== false
+          ? { claude: JSON.parse(current).claude } : {}),
       })}\n`)
     } else if (!createExclusivePrivateFile(journalPath, `${JSON.stringify(requestedJournal)}\n`)) {
       return toolText({
@@ -3359,28 +3567,42 @@ async function main(): Promise<void> {
     let retryRepositoryDigest: string | undefined
     try { retryRepositoryDigest = advisorRepositoryDigest(snapshotAdvisorRepository(projectLayout)) } catch {}
     const savedSlots: { grok?: Array<Record<string, unknown>>, claude?: Record<string, unknown> } = {
-      ...(retryResult?.grok?.[0]?.adopted === true ? { grok: retryResult.grok } : {}),
-      ...(retryResult?.claude?.adopted === true ? { claude: retryResult.claude } : {}),
+      ...(retryResult?.grok?.length ? { grok: retryResult.grok } : {}),
+      ...(retryResult?.claude ? { claude: retryResult.claude } : {}),
     }
-    const persistSlot = (kind: 'grok' | 'claude', value: Record<string, unknown>) => {
-      if (kind === 'grok') savedSlots.grok = [value]
-      else savedSlots.claude = value
+    const persistSlots = () => {
       atomicWritePrivateFile(`${journalPath}.slots`, JSON.stringify({
         contextDigest, phase, round, inputRevision: boundInput.revision,
         inputDigest: boundInput.digest, evidenceDigest, native: nativeEvidence,
         ...savedSlots,
       }))
     }
+    const persistSlot = (kind: 'grok' | 'claude', value: Record<string, unknown>) => {
+      if (kind === 'grok') savedSlots.grok = [value]
+      else savedSlots.claude = value
+      persistSlots()
+    }
+    const beginSlot = (kind: 'grok' | 'claude') => {
+      delete savedSlots[kind]
+      persistSlots()
+    }
     const grokPromise = recoverAdvisorSlot({
-      advisor: 'grok', saved: retryResult?.grok?.[0]?.adopted === true ? retryResult.grok[0] : undefined,
+      advisor: 'grok', saved: automaticContinuation || retryResult?.grok?.[0]?.adopted === true ? retryResult?.grok?.[0] : undefined,
+      retryFinishedFailure: !automaticContinuation,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
       run: async () => (await runGrokPanel(boundInput, phase, round, evidence, reviewContext))[0]!,
+      beforeRun: () => beginSlot('grok'),
       persist: result => persistSlot('grok', result),
     }).then(result => [result])
     const claudePromise = recoverAdvisorSlot({
-      advisor: 'claude', saved: retryResult?.claude?.adopted === true ? retryResult.claude : undefined,
+      advisor: 'claude',
+      retryFinishedFailure: !automaticContinuation,
+      saved: retryResult?.claude?.adopted === true
+        || retryResult?.claude?.promptMayHaveBeenDelivered !== false
+        ? retryResult?.claude : undefined,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
-      run: () => runClaude(boundInput, phase, round as 1 | 2 | 3, evidence, reviewContext),
+      run: () => runClaude(boundInput, phase, round as 1 | 2 | 3, evidence, reviewContext, automaticContinuation),
+      beforeRun: () => beginSlot('claude'),
       persist: result => persistSlot('claude', result),
       beforeRetry: result => retireAdvisorClaudeCleanupOutcome(stateDir, {
         jobId: context.jobId, attemptNonce: context.attemptNonce,
@@ -3452,9 +3674,10 @@ async function main(): Promise<void> {
         ? createHash('sha256').update(result.response).digest('hex')
         : undefined,
       reasonDigest: result.adopted !== true
-        ? createHash('sha256').update(String(result.reason ?? 'unavailable')).digest('hex')
+        ? result.reason === undefined && typeof result.reasonDigest === 'string'
+          ? result.reasonDigest : createHash('sha256').update(String(result.reason ?? 'unavailable')).digest('hex')
         : undefined,
-      failure: result.adopted !== true ? classifyAdvisorFailure('grok', String(result.reason ?? '')) : undefined,
+      failure: result.adopted !== true ? result.failure ?? classifyAdvisorFailure('grok', String(result.reason ?? '')) : undefined,
       authenticationRecoveryAttempted: result.authenticationRecoveryAttempted === true
         ? true
         : undefined,
@@ -3478,7 +3701,8 @@ async function main(): Promise<void> {
         : undefined,
       responseDiagnostic: claude.responseDiagnostic,
       reasonDigest: claude.adopted !== true
-        ? createHash('sha256').update(String(claude.reason ?? 'unavailable')).digest('hex')
+        ? claude.reason === undefined && typeof claude.reasonDigest === 'string'
+          ? claude.reasonDigest : createHash('sha256').update(String(claude.reason ?? 'unavailable')).digest('hex')
         : undefined,
       failure: claude.adopted !== true ? claude.failure ?? classifyAdvisorFailure('claude', String(claude.reason ?? '')) : undefined,
     }
@@ -3507,6 +3731,7 @@ async function main(): Promise<void> {
     })
     atomicWritePrivateFile(`${journalPath}.responses`, responseCache)
     atomicWritePrivateFile(journalPath, `${JSON.stringify({
+      continuationRequestDigest,
       retryCount: retryResult?.retryCount ?? 0,
       interruptionRecovery: retryResult?.interruptionRecovery === true,
       version: THREE_ADVISOR_JOURNAL_VERSION,
@@ -3547,6 +3772,8 @@ async function main(): Promise<void> {
     })}\n`)
     return toolText({
       complete,
+      attemptsFinished: true,
+      ...(automaticContinuation ? { continuedOriginalRequest: true, scopeAssessmentRequired: !inputUnchanged } : {}),
       inputRevision: boundInput.revision,
       inputDigest: boundInput.digest,
       inputUnchanged,
@@ -3596,7 +3823,36 @@ async function main(): Promise<void> {
       inputRevision,
       inputDigest,
     })
-  })
+  }
+  const continueRound = async (request: RoundRequest): Promise<ReturnType<typeof toolText>> => {
+    let result: ReturnType<typeof toolText>
+    try { result = await startRound(request, true) } catch {
+      result = toolText({ complete: false, reason: 'interrupted advisor continuation could not start' }, true)
+    }
+    if (resultPayload(result)?.pending === true) return result
+    // Scope/snapshot/evidence validation can fail before taking the active
+    // claim. Remember that bounded attempt rather than redirecting every poll
+    // back into the same failing automatic continuation.
+    try {
+      const path = roundJournalPath({ revision: request.inputRevision, digest: request.inputDigest },
+        request.phase, request.round as 1 | 2 | 3)
+      const journal = JSON.parse(readOptionalPrivateFile(path) ?? '{}')
+      if (journal.recoveredAfterInterruption === true && typeof journal.recoveryId === 'string'
+        && typeof journal.continuationRequestDigest === 'string') {
+        atomicWritePrivateFile(`${path}.continuation-unavailable`, JSON.stringify({
+          version: 1, contextDigest, recoveryId: journal.recoveryId,
+          requestDigest: journal.continuationRequestDigest,
+        }))
+      }
+    } catch { /* Optional bookkeeping failure must not require another attempt. */ }
+    return toolText({ ...resultPayload(result), complete: false, attemptsFinished: true,
+      waitingForAdvisors: false, retryable: false, continuationUnavailable: true,
+      nextAction: '中断した相談の自動続行を終了しました。取得済み回答と不足理由を保持し、本作業を継続してください。' })
+  }
+  server.registerTool('advisor_round', {
+    description: 'Durably start one ordered Three-Advisor attempt round. Resume an interrupted unsent slot from its saved original question; never resend delivery-possible prompts. Poll the returned binding.',
+    inputSchema: advisorRoundInputSchema,
+  }, request => startRound(request))
 
   server.registerTool('advisor_round_poll', {
     description: 'Poll a previously started advisor attempt round. Keep exactly one poll outstanding and wait for its result; never batch, parallelize, or pre-queue duplicate polls. Pending polls are unlimited and never cancel, authenticate, or restart reviewers. When receiptRequired is returned, make exactly one next call with that exact receipt and the same binding.',
@@ -3638,6 +3894,10 @@ async function main(): Promise<void> {
           reason: `the attempt-wide ${phase} phase ledger is inconsistent`,
         }, true)
       }
+    }
+    if (!activeRoundKeys.has(taskKey)) {
+      const request = continuationRequest(binding, phase, boundRound)
+      if (request) await continueRound(request)
     }
     let task = roundTasks.get(taskKey)
     if (!task) {
@@ -3808,6 +4068,19 @@ async function main(): Promise<void> {
   })
 
   await server.connect(new StdioServerTransport())
+  // The parent may resume without issuing another advisor tool call. A
+  // retired unsent slot is still this same consultation, so continue it when
+  // its broker is recreated. Never require the LLM to remember a retry flag.
+  if (completeWorkflow) try {
+    for (const [phase, round] of [['investigation', 1], ['review', 1], ['review', 2]] as const) {
+      const ledger = unifiedRoundLedger(phase, round)
+      if (ledger.invalid || ledger.entries.length !== 1) continue
+      const request = continuationRequest(ledger.entries[0]!.input, phase, round)
+      if (request) { await continueRound(request); break }
+    }
+  } catch {
+    process.stderr.write('zerochan: interrupted advisor continuation unavailable; retaining saved outcomes.\n')
+  }
 }
 
 if (import.meta.main) {

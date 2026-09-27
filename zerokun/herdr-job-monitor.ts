@@ -46,6 +46,7 @@ import {
 import {
   environmentForPinnedHerdrRuntime,
   currentHerdrBinary,
+  herdrCommandEmitsEnvelope,
   herdrControlPlaneFingerprint,
   herdrRuntimeFingerprint,
   verifyHerdrRuntimeIdentityAsync,
@@ -1215,6 +1216,8 @@ async function invokeHerdr(
       `Herdr ${args.slice(0, 2).join(' ')} ${timedOut ? 'timed out' : 'failed'}: ${detail}`,
     )
   }
+  if (!herdrCommandEmitsEnvelope(args)
+    && Buffer.from(stdout).toString('utf8').trim() === '') return {}
   return parseJsonOutput(stdout, `Herdr ${args.slice(0, 2).join(' ')}`)
 }
 

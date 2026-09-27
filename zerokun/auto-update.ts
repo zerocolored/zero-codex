@@ -7,6 +7,9 @@ import { tryAcquireProcessLock, releaseProcessLock, inspectProcessLock } from '.
 import { preflightRepositories } from './update.ts'
 
 export const AUTO_UPDATE_INTERVAL_MS = 30 * 60_000
+export function automaticUpdateRecipient(allowFrom: string[]): string {
+  return allowFrom.find(id => /^[UW][A-Z0-9]+$/.test(id)) ?? ''
+}
 type RecordState = { checkedAt?: number; pendingState?: string; pendingId?: string; targetSha?: string; failedSha?: string }
 function readJson(path: string): any {
   const value = readOptionalPrivateFile(path)
@@ -47,7 +50,8 @@ export async function checkAutomaticUpdate(options: {
         // Persist before cooldown: a later manual request can replace this outcome.
         atomicWritePrivateFile(path, JSON.stringify(saved) + '\n')
       }
-      if (request.id === saved.pendingId && !request.outcome?.notifiedAt) {
+      if (request.id === saved.pendingId && !request.outcome?.notifiedAt
+        && !(request.source === 'automatic' && request.outcome?.notificationSkippedAt)) {
         // The originating gateway may be stopped. Let another running app
         // recover its durable worker, including notification-only outcomes.
         options.recoverPending?.(saved.pendingState)

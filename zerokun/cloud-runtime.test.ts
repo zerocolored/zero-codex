@@ -3,13 +3,19 @@ import { execFileSync } from 'child_process'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import { JobStore } from './job-runner.ts'
-import { CloudRuntime } from './cloud-runtime.ts'
+import { JobStore, publicJobFailureSummary } from './job-runner.ts'
+import { CloudRuntime, CLOUD_PREPARATION_FAILURE_MESSAGES } from './cloud-runtime.ts'
 import { CloudHandoffClient, CloudHandoffError, digestBytes, type CloudHandoff } from './cloud-handoff.ts'
 import { writeCheckpoint } from './handoff-coordinator.ts'
 import { resolveProjectLayout } from './project-layout.ts'
 import { buildCodexDeveloperInstructions } from './codex-executor.ts'
 const roots: string[] = []
+test('configuration failures reach Slack without exposing arbitrary Git diagnostics', () => {
+  for (const message of Object.values(CLOUD_PREPARATION_FAILURE_MESSAGES)) {
+    expect(publicJobFailureSummary(message)).toBe(message)
+    expect(publicJobFailureSummary(message + ' credential=private')).toBe('内部処理でエラーが発生しました。')
+  }
+})
 test('permanent ownership refusal is not classified as a retryable preparation outage', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-prepare-classification-')); roots.push(root)
   const store = new JobStore(join(root, 'jobs.sqlite3'))
@@ -23,6 +29,32 @@ test('permanent ownership refusal is not classified as a retryable preparation o
   store.close()
 })
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
+test('missing origin is permanent and preserves the original checkout', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-missing-origin-')); roots.push(root)
+  const repo = join(root, 'repo'); mkdirSync(repo); git(repo, 'init', '--quiet')
+  writeFileSync(join(repo, 'uncommitted.txt'), 'keep me')
+  const state = join(root, 'state'), store = new JobStore(join(state, 'jobs.sqlite3'))
+  try {
+    const job = store.enqueue({ chatId: 'C1', threadTs: '1.0', messageId: '1.0', userId: 'U1', repoPath: repo, task: 'task', writeEnabled: true }).job
+    const runtime = new CloudRuntime(store, state, new MemberClient(new CloudFixture(), ownerA, 'UA'), join(root, 'managed'))
+    await expect(runtime.prepare(job)).rejects.toMatchObject({ permanent: true,
+      message: '対象リポジトリに origin が設定されていないため開始できません。接続先を設定した後、このスレッドで再度依頼してください。' })
+    expect(readFileSync(join(repo, 'uncommitted.txt'), 'utf8')).toBe('keep me')
+    expect(git(repo, 'remote')).toBe('')
+  } finally { store.close() }
+})
+test('reachable origin without an integration branch is a permanent configuration failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-missing-branch-')); roots.push(root)
+  const repo = join(root, 'repo'), remote = join(root, 'remote')
+  mkdirSync(repo); mkdirSync(remote); git(repo, 'init', '--quiet'); git(remote, 'init', '--bare', '--quiet')
+  git(repo, 'remote', 'add', 'origin', remote)
+  const state = join(root, 'state'), store = new JobStore(join(state, 'jobs.sqlite3'))
+  try {
+    const job = store.enqueue({ chatId: 'C1', threadTs: '1.0', messageId: '1.0', userId: 'U1', repoPath: repo, task: 'task', writeEnabled: true }).job
+    const runtime = new CloudRuntime(store, state, new MemberClient(new CloudFixture(), ownerA, 'UA'), join(root, 'managed'))
+    await expect(runtime.prepare(job)).rejects.toMatchObject({ permanent: true, message: CLOUD_PREPARATION_FAILURE_MESSAGES.noBranch })
+  } finally { store.close() }
+})
 test('cloud multi-repo pin repair preserves existing HEAD, index and uncommitted files and passes real Claude snapshot', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-pin-repair-')); roots.push(root)
   const project = join(root, 'project'); mkdirSync(project)

@@ -1,4 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { fleetProject } from './zerokun/fleet-project.ts'
+import { classifyFleetRequest, separateSecurityWorkflow, readProjectFleet, fleetCloudTime, answerFleetStatus, unavailableFleet, fleetReplyEnvelope } from './zerokun/fleet-query.ts'
 /**
  * Standalone Slack gateway for Codex.
  *
@@ -8,6 +10,7 @@
  */
 
 import { App } from '@slack/bolt'
+import { startConfiguredFleet } from './zerokun/fleet-runtime.ts'
 import { createHash, randomBytes } from 'crypto'
 import {
   closeSync, constants, existsSync, fsyncSync, openSync, writeFileSync,
@@ -39,7 +42,7 @@ import {
   mentionsBot,
 } from './gate.ts'
 import { requestUpdate, resumePendingUpdateWorker } from './zerokun/update-request.ts'
-import { checkAutomaticUpdate, remoteUpdateHead } from './zerokun/auto-update.ts'
+import { automaticUpdateRecipient, checkAutomaticUpdate, remoteUpdateHead } from './zerokun/auto-update.ts'
 import { slackAppRegistryRoot, listRegisteredSlackApps } from './zerokun/slack-app-registry.ts'
 import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
 import {
@@ -115,6 +118,7 @@ import {
 import {
   buildSlackThreadIntentSnapshot,
   runSlackThreadIntentClassifier,
+  stopIsolatedCodexProcesses,
   serializeSlackThreadIntentSnapshot,
   slackThreadIntentInputDigest,
   slackThreadIntentClassifierLeaseMs,
@@ -478,6 +482,7 @@ slackApp = new App({
 })
 
 let slackSocket: SlackSocketSupervisor | null = null
+let fleetReporter: { stop(): void } | null = null
 
 function describeSlackSocketEvent(event: SlackSocketSupervisorEvent): string {
   if (event.phase === 'lost') return 'socket mode disconnected; reconnecting'
@@ -1170,6 +1175,31 @@ function scheduleInboundDrain(delayMs = 0): void {
   inboundRetryTimer.unref()
 }
 
+let fleetQueryActive=false
+async function drainFleetQueries(): Promise<void> {
+  if(fleetQueryActive||shuttingDown)return
+  fleetQueryActive=true
+  try {
+    for(const query of jobStore.pendingFleetQueries()) {
+      let answer=unavailableFleet
+      let expiresAt=Date.now()+30000
+      const queryProject=fleetProject(query.repoPath)?.key
+      if(queryProject) {
+        try {
+          const data=await readProjectFleet(STATE_DIR,queryProject)
+          if(shuttingDown)return
+          const received=Date.now(),serverNow=fleetCloudTime(data)
+          const deadlines=data.instances.filter(r=>r.receivedAt && serverNow-Date.parse(r.receivedAt)<90000)
+            .map(r=>received+Date.parse(r.receivedAt!)+90000-serverNow)
+          expiresAt=Math.min(received+30000,...deadlines)
+          answer=await answerFleetStatus(data)
+        } catch { /* never fall back to local or unrestricted data */ }
+      }
+      jobStore.completeFleetQuery(query.key,fleetReplyEnvelope(answer,expiresAt))
+    }
+  } finally { fleetQueryActive=false }
+}
+
 async function drainInboundDeliveries(): Promise<void> {
   if (inboundDrainActive) return
   inboundDrainActive = true
@@ -1190,6 +1220,17 @@ async function drainInboundDeliveries(): Promise<void> {
               inbound,
               download.controller.signal,
             )
+            // Classify before steering an active job or downloading attachments. Controls retain their old path.
+            if (!handoffControl(inbound.text) && !isExplicitUpdateRequest(inbound.text)) {
+              let route=jobStore.fleetQueryRoute(inbound.idempotencyKey)
+              if(!route) {
+                const context=jobStore.getSlackThreadReplyIntent(inbound.idempotencyKey)?.snapshotJson
+                  ?? jobStore.fleetTriageContext(inbound.chatId,inbound.threadTs,inbound.repoPath)
+                route=await classifyFleetRequest(inbound.text,context)
+                jobStore.stageFleetRoute(inbound,route,fleetProject(inbound.repoPath)?.key??null)
+              }
+              if(route==='fleet-status') { void drainFleetQueries().catch(() => {}); continue }
+            }
             attachments = await downloadInboundFiles(
               inbound,
               download.controller.signal,
@@ -1207,7 +1248,13 @@ async function drainInboundDeliveries(): Promise<void> {
         // makes host paths indistinguishable from user-authored text later.
         const taskFor = () => inbound.text.trim() || '(添付ファイルを確認してください)'
         const task = taskFor()
-        const target = inbound.expectedControlJobId !== null
+        const auditRequest = jobStore.fleetQueryRoute(inbound.idempotencyKey) === 'security-audit'
+        const auditTarget = inbound.expectedControlJobId
+          ? jobStore.get(inbound.expectedControlJobId)?.workflow === 'security-audit'
+          : jobStore.get(jobStore.liveControlTarget(inbound.chatId,inbound.threadTs)?.jobId ?? '')?.workflow === 'security-audit'
+        // Audit inputs never steer development, and a later fix never steers an audit.
+        const separateWorkflow = separateSecurityWorkflow(auditRequest?'security-audit':'work',auditTarget?'security-audit':undefined,interrupt)
+        const target = separateWorkflow ? null : inbound.expectedControlJobId !== null
           && inbound.expectedControlEpoch !== null
           ? {
               jobId: inbound.expectedControlJobId,
@@ -1261,7 +1308,7 @@ async function drainInboundDeliveries(): Promise<void> {
         // A reply admitted through active-thread authority belongs only to the
         // exact job/epoch persisted with it. Never reinterpret it as a sibling
         // FIFO job after cancellation or another terminal race.
-        if (inbound.expectedControlJobId !== null) {
+        if (inbound.expectedControlJobId !== null && !separateWorkflow) {
           jobStore.tombstoneInboundDelivery(inbound.idempotencyKey, {
             kind: 'closed-control',
             payload: 'この返信を反映する前に現在の処理が終了しました。必要なら新しい依頼として送ってください。',
@@ -1280,6 +1327,7 @@ async function drainInboundDeliveries(): Promise<void> {
           continue
         }
         jobStore.enqueue({
+          workflow: auditRequest ? 'security-audit' : 'work',
           chatId: inbound.chatId,
           threadTs: inbound.threadTs,
           messageId: inbound.messageId,
@@ -1730,13 +1778,14 @@ function shutdown(): void {
   // 'disconnecting' event alone is not enough: a SIGTERM that lands during a
   // backoff has no live socket to emit it.
   slackSocket?.stop()
+  fleetReporter?.stop()
   process.stderr.write('slack channel: shutting down\n')
   clearGatewayReadiness(READY_FILE)
   // Keep the singleton lock and SQLite handle until the process exits. Releasing
   // either while Bolt still owns a Socket Mode connection allows a replacement
   // gateway to overlap with this one and split Slack events.
-  setTimeout(() => process.exit(0), 2000)
-  void slackApp?.stop().finally(() => process.exit(0))
+  setTimeout(() => process.exit(0), 5000)
+  void Promise.all([stopIsolatedCodexProcesses(), slackApp?.stop()]).finally(() => process.exit(0))
 }
 
 function stopOrphanedUpdateCandidate(): void {
@@ -2790,6 +2839,9 @@ try {
   // legacy launcher) re-enables crash alerts only after Socket Mode and the
   // generation-bound readiness record are both established.
   clearIntentionalServiceStop(STATE_DIR)
+  fleetReporter = startConfiguredFleet(STATE_DIR, identity.appId, connectedProjectDir,
+    () => jobStore.fleetFolderFacts(Date.now(), connectedProjectDir), () => slackSocket?.connected === true,
+    { teamId: identity.teamId, name: identity.botName, botToken: BOT_TOKEN })
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
 
   // Sweep once on startup for new mentions/DMs, and recover replies in owned threads.
@@ -2802,8 +2854,7 @@ try {
   const checkForUpdates = async () => {
     try {
       const access = loadAccess()
-      const destination = access.allowFrom[0] ?? Object.keys(access.channels).sort()[0]
-      if (!destination) return // Wait until an actual notification recipient is configured.
+      const destination = automaticUpdateRecipient(access.allowFrom)
       await checkAutomaticUpdate({
         root: slackAppRegistryRoot(), stateDir: STATE_DIR,
         detect: () => remoteUpdateHead(import.meta.dir),
@@ -2834,6 +2885,7 @@ try {
   setInterval(() => { void scheduleCatchupSweep() }, CATCHUP_SWEEP_INTERVAL_MS).unref()
   setInterval(recoverUpdateNotificationWorker, UPDATE_RECOVERY_INTERVAL_MS).unref()
   setInterval(() => scheduleInboundDrain(), 5_000).unref()
+  setInterval(() => { void drainFleetQueries().catch(() => {}) }, 5_000).unref()
   setInterval(() => { void drainSlackThreadReplyIntents() }, THREAD_INTENT_DRAIN_INTERVAL_MS).unref()
   setInterval(stopOrphanedUpdateCandidate, 5_000).unref()
 } catch (err) {

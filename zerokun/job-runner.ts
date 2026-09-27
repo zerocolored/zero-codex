@@ -1,6 +1,12 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { executeSecurityAudit, copyAuditReportForFollowup } from './security-audit.ts'
+import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
+import { fleetReplyForDelivery } from './fleet-query.ts'
+import { toSlackMrkdwn } from './slack-mrkdwn.ts'
+import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
+import { startFleetRunnerPulse } from './fleet-runtime.ts'
 import { resolveArtifactSource, previousThreadArtifactRoots } from './artifact-source.ts'
 import { advisorFailureMessage, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
@@ -50,7 +56,7 @@ import {
   type ProcessLockLease,
 } from './process-lock.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
-import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, type CloudControl } from './cloud-runtime.ts'
+import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, CLOUD_PREPARATION_FAILURE_MESSAGES, type CloudControl } from './cloud-runtime.ts'
 import { CLOUD_SAVE_FAILED_MESSAGE } from './cloud-handoff.ts'
 import { createAdvisorInputSnapshot, readAdvisorInputSnapshot } from './advisor-input.ts'
 import {
@@ -279,9 +285,22 @@ const CLAIMABLE_CODEX_JOB_PREDICATE = `
       AND approval_wait.seq < jobs.seq
   )
 `
+// Deferred work only blocks its own conversation, never unrelated requests.
+const READY_CODEX_JOB_PREDICATE = `
+  ${CLAIMABLE_CODEX_JOB_PREDICATE}
+  AND (jobs.cancel_requested_at IS NOT NULL OR jobs.not_before IS NULL OR jobs.not_before <= ?)
+  AND NOT EXISTS (
+    SELECT 1 FROM jobs earlier
+    WHERE earlier.runtime = 'codex' AND earlier.status IN ('queued', 'running')
+      AND earlier.chat_id = jobs.chat_id AND earlier.thread_ts = jobs.thread_ts
+      AND earlier.seq < jobs.seq
+      AND NOT EXISTS (SELECT 1 FROM cloud_handoff_jobs transferred
+        WHERE transferred.job_id = earlier.id AND transferred.state = 'transferred')
+  )
+`
 const PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE = `
   (jobs.runtime = 'codex' AND jobs.status = 'running')
-  OR (${CLAIMABLE_CODEX_JOB_PREDICATE})
+  OR (${READY_CODEX_JOB_PREDICATE})
 `
 const SLACK_DM_HISTORY_RETRY_BASE_MS = 24 * 60 * 60 * 1_000
 const SLACK_DM_HISTORY_RETRY_MAX_MS = 7 * 24 * 60 * 60 * 1_000
@@ -416,6 +435,7 @@ export interface JobInterjectionRecord {
 export type JobLiveInputRecord = JobControlRecord | JobInterjectionRecord
 
 export interface EnqueueInput {
+  workflow?: 'work' | 'security-audit'
   chatId: string
   threadTs: string
   messageId: string
@@ -523,6 +543,9 @@ type InboundDeliveryRow = {
 }
 
 export interface JobRecord {
+  workflow?: 'work' | 'security-audit'
+  auditReportPath?: string
+  auditReportUnavailable?: boolean
   /** Actual host receipts, independent of what the resumed model remembers saying. */
   previousSlackDelivery?: { seq: number; bodyDelivered: boolean; filesDelivered: number; filesDeclared: number }
   /** Host-only logical history scope when executing in a dedicated cloud worktree. */
@@ -622,6 +645,7 @@ export type GitHubPublicationRecoveryContext = {
 }
 
 type JobRow = {
+  workflow?: 'work' | 'security-audit'
   seq: number
   id: string
   idempotency_key: string
@@ -938,6 +962,12 @@ CREATE TABLE IF NOT EXISTS commentary_notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_commentary_notifications_pending
   ON commentary_notifications(delivered_at, not_before, seq);
+CREATE TABLE IF NOT EXISTS fleet_queries (
+ idempotency_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
+ repo_path TEXT NOT NULL, project_key TEXT, input TEXT NOT NULL,
+ route TEXT NOT NULL CHECK(route IN ('work','fleet-status','security-audit')), created_at INTEGER NOT NULL,
+ completed_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS status_notifications (
   id TEXT PRIMARY KEY,
   idempotency_key TEXT NOT NULL UNIQUE,
@@ -946,7 +976,7 @@ CREATE TABLE IF NOT EXISTS status_notifications (
   thread_ts TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN (
     'accepted', 'interrupt-accepted', 'closed-control',
-    'inactive-interrupt', 'attachment-control-failed', 'rate-limited', 'execution-started'
+    'inactive-interrupt', 'attachment-control-failed', 'rate-limited', 'execution-started', 'fleet-status'
   )),
   payload TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -1381,6 +1411,19 @@ CREATE TABLE IF NOT EXISTS job_phase_dispatches (
 );
 CREATE INDEX IF NOT EXISTS idx_job_phase_dispatches_status
   ON job_phase_dispatches(job_id, attempt, status, phase_sequence);
+CREATE TABLE IF NOT EXISTS job_native_turns (
+  job_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  control_epoch INTEGER NOT NULL,
+  executor_nonce TEXT NOT NULL,
+  app_thread_id TEXT NOT NULL,
+  parent_turn_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  observed_at INTEGER,
+  PRIMARY KEY (job_id, attempt, turn_id),
+  FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
 CREATE TABLE IF NOT EXISTS slack_read_cursors (
   scope TEXT NOT NULL CHECK (scope IN ('owned-thread', 'catchup-recent', 'catchup-parent', 'scheduler')),
   cursor_key TEXT NOT NULL,
@@ -1869,15 +1912,26 @@ function persistThreadHistorySnapshot(
 }
 
 function ensureJobSchemaMigrations(db: Database): void {
+  db.transaction(() => {
+    const schema = db.query<{sql:string},[]>("SELECT sql FROM sqlite_master WHERE name='fleet_queries'").get()!.sql
+    if (!schema.includes("'security-audit'")) {
+      db.exec(schema.replace('fleet_queries','fleet_queries_next').replace("'fleet-status'", "'fleet-status','security-audit'"))
+      db.exec('INSERT INTO fleet_queries_next SELECT * FROM fleet_queries; DROP TABLE fleet_queries; ALTER TABLE fleet_queries_next RENAME TO fleet_queries;')
+    }
+    const columns = db.query<{name:string},[]>('PRAGMA table_info(jobs)').all()
+    if (!columns.some(c=>c.name==='workflow')) db.exec("ALTER TABLE jobs ADD COLUMN workflow TEXT NOT NULL DEFAULT 'work' CHECK(workflow IN ('work','security-audit'))")
+  }).immediate()
+
   // SQLite cannot alter CHECK constraints. Preserve every outbox receipt and
   // retry field while adding the new kind, including on existing installations.
   db.transaction(() => {
     const schema = db.query<{ sql: string }, []>(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'status_notifications'",
     ).get()!.sql
-    if (schema.includes("'execution-started'")) return
+    const missingKinds = ['execution-started', 'fleet-status'].filter(kind => !schema.includes(`'${kind}'`))
+    if (!missingKinds.length) return
     db.exec(schema.replace('status_notifications', 'status_notifications_next')
-      .replace("'rate-limited'", "'rate-limited', 'execution-started'"))
+      .replace("'rate-limited'", ["'rate-limited'", ...missingKinds.map(kind => `'${kind}'`)].join(', ')))
     db.exec(`INSERT INTO status_notifications_next SELECT * FROM status_notifications;
       DROP TABLE status_notifications;
       ALTER TABLE status_notifications_next RENAME TO status_notifications;
@@ -2893,6 +2947,7 @@ function mapRow(row: JobRow): JobRecord {
           ? 'lost-staged'
           : (() => { throw new Error(`invalid monitor_state for job ${row.id}`) })()
   return {
+    workflow: row.workflow ?? 'work',
     seq: row.seq,
     id: row.id,
     idempotencyKey: row.idempotency_key,
@@ -4885,6 +4940,13 @@ export class JobStore {
     }
   }
 
+  /** Undo only the explicit-mode activation introduced by a failed route transfer. */
+  restoreSlackChannelImplicitModeAfterRollback(appIdInput: string): void {
+    const appId = requireSlackAppId(appIdInput)
+    this.db.run(`DELETE FROM slack_channel_route_state WHERE app_id = ?
+      AND NOT EXISTS (SELECT 1 FROM slack_channel_routes WHERE app_id = ?)`, [appId, appId])
+  }
+
   /**
    * Replace one project's derived channel index in a single immediate
    * transaction. The project-local config is the durable user declaration;
@@ -6524,6 +6586,43 @@ export class JobStore {
     return retrySqlite(() => fail.immediate())
   }
 
+  fleetQueryRoute(key: string): 'work' | 'fleet-status' | 'security-audit' | null {
+    return this.db.query<{route:'work'|'fleet-status'|'security-audit'},[string]>('SELECT route FROM fleet_queries WHERE idempotency_key=?').get(key)?.route ?? null
+  }
+
+  fleetTriageContext(chat: string, thread: string, repo: string): string {
+    const jobs=this.db.query<{task:string},[string,string,string]>("SELECT task FROM jobs WHERE chat_id=? AND thread_ts=? AND repo_path=? ORDER BY seq DESC LIMIT 4").all(chat,thread,repo)
+    const queries=this.db.query<{input:string,route:string},[string,string,string]>("SELECT input,route FROM fleet_queries WHERE chat_id=? AND thread_ts=? AND repo_path=? ORDER BY created_at DESC LIMIT 4").all(chat,thread,repo)
+    return JSON.stringify({recentTasks:jobs,recentQueries:queries}).slice(-20000)
+  }
+
+  previousSecurityAudit(job:JobRecord):string|null {
+    return this.db.query<{id:string},[string,string,string,number]>(
+      "SELECT id FROM jobs WHERE workflow='security-audit' AND status='completed' AND chat_id=? AND thread_ts=? AND repo_path=? AND seq<? ORDER BY seq DESC LIMIT 1",
+    ).get(job.chatId,job.threadTs,job.historyRepoPath??job.repoPath,job.seq)?.id??null
+  }
+
+  stageFleetRoute(inbound: InboundDeliveryRecord, route: 'work' | 'fleet-status' | 'security-audit', projectKey: string | null): void {
+    retrySqlite(()=>this.db.transaction(()=>{
+      this.db.run(`INSERT OR IGNORE INTO fleet_queries (idempotency_key,chat_id,thread_ts,repo_path,project_key,input,route,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,NULL)`,[
+        inbound.idempotencyKey,inbound.chatId,inbound.threadTs,inbound.repoPath,projectKey,inbound.text,route,Date.now()])
+      if(route==='fleet-status') this.tombstoneInboundDelivery(inbound.idempotencyKey)
+    }).immediate())
+  }
+
+  pendingFleetQueries(): Array<{key:string;projectKey:string|null;repoPath:string}> {
+    return this.db.query<{key:string;projectKey:string|null;repoPath:string},[]>(`SELECT idempotency_key AS key, project_key AS projectKey, repo_path AS repoPath FROM fleet_queries WHERE route='fleet-status' AND completed_at IS NULL ORDER BY created_at LIMIT 1`).all()
+  }
+
+  completeFleetQuery(key:string, payload:string): void {
+    retrySqlite(()=>this.db.transaction(()=>{
+      const row=this.db.query<{chat_id:string;thread_ts:string},[string]>(`SELECT chat_id,thread_ts FROM fleet_queries WHERE idempotency_key=? AND completed_at IS NULL AND route='fleet-status'`).get(key)
+      if(!row)return
+      this.stageStatusNotificationRow({idempotencyKey:`fleet-status:${key}`,jobId:null,chatId:row.chat_id,threadTs:row.thread_ts,kind:'fleet-status',payload,createdAt:Date.now()})
+      this.db.run('UPDATE fleet_queries SET completed_at=? WHERE idempotency_key=?',[Date.now(),key])
+    }).immediate())
+  }
+
   completeInboundDelivery(idempotencyKey: string): void {
     retrySqlite(() => this.db.run(
       `DELETE FROM inbound_deliveries WHERE idempotency_key = ?`,
@@ -7177,6 +7276,48 @@ export class JobStore {
       ],
     ))
     if (updated.changes !== 1) throw new Error(`App Server turn binding changed for ${jobIdInput}`)
+  }
+
+  /** Bind an App Server native goal continuation only to a completed owned parent. */
+  bindNativeAppServerTurn(
+    jobId: string,
+    workerId: string,
+    epoch: number,
+    executorNonce: string,
+    threadId: string,
+    parentTurnId: string,
+    turnId: string,
+  ): void {
+    for (const value of [jobId, workerId, executorNonce, threadId, parentTurnId, turnId]) {
+      requireText(value, 'native turn binding')
+    }
+    const bind = this.db.transaction(() => {
+      const job = this.db.query<JobRow, [string]>(
+        'SELECT * FROM jobs WHERE id = ?',
+      ).get(jobId)
+      if (!job || job.runtime !== 'codex' || job.status !== 'running'
+        || job.worker_id !== workerId || job.control_epoch !== epoch
+        || job.executor_nonce !== executorNonce || job.active_thread_id !== threadId
+        || (job.active_turn_id !== null && job.active_turn_id !== parentTurnId)
+        || job.cancel_requested_at !== null || parentTurnId === turnId
+        || !this.hasObservedTurnSource({
+          jobId, attempt: job.attempts, controlEpoch: epoch,
+          executorNonce, threadId, turnId: parentTurnId,
+        })) {
+        throw new Error(`native App Server parent binding changed for ${jobId}`)
+      }
+      // The ledger and current binding commit together; no historical dispatch
+      // is rewritten and an unobserved native turn cannot authorize recovery.
+      this.db.run(
+        `INSERT INTO job_native_turns (
+           job_id, attempt, control_epoch, executor_nonce, app_thread_id,
+           parent_turn_id, turn_id, started_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [jobId, job.attempts, epoch, executorNonce, threadId, parentTurnId, turnId, Date.now()],
+      )
+      this.bindAppServerTurn(jobId, workerId, epoch, executorNonce, threadId, turnId)
+    })
+    retrySqlite(() => bind())
   }
 
   recordTaskGoalStatus(jobId: string, status: string): void {
@@ -8264,6 +8405,14 @@ export class JobStore {
         }
       }
       this.db.run(
+        `UPDATE job_native_turns SET observed_at = ?
+         WHERE job_id = ? AND attempt = ? AND control_epoch = ?
+           AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?
+           AND observed_at IS NULL`,
+        [now, options.jobId, job.attempts, Math.floor(options.epoch),
+          options.executorNonce, options.threadId, options.turnId],
+      )
+      this.db.run(
         `UPDATE job_controls SET status = 'observed', observed_at = ?
          WHERE job_id = ? AND control_epoch = ? AND status = 'acknowledged'
            AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?`,
@@ -8605,9 +8754,9 @@ export class JobStore {
         `INSERT OR IGNORE INTO jobs (
            id, idempotency_key, chat_id, thread_ts, message_id, user_id,
            repo_path, task, attachments_json, thread_attachments_json,
-           runtime, write_enabled, status,
+           runtime, write_enabled, status, workflow,
            control_epoch, accepts_control, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?, 'queued', 1, 1, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?, 'queued', ?, 1, 1, ?)`,
         [
           id,
           idempotencyKey,
@@ -8619,7 +8768,8 @@ export class JobStore {
           task,
           JSON.stringify(attachments),
           JSON.stringify(threadAttachments),
-          input.writeEnabled ? 1 : 0,
+          input.workflow === 'security-audit' ? 0 : input.writeEnabled ? 1 : 0,
+          input.workflow ?? 'work',
           Date.now(),
         ],
       )
@@ -8649,15 +8799,23 @@ export class JobStore {
       // so deriving this decision from `position > 1` misses the common case
       // of exactly one queued predecessor.  Compare only earlier rows instead;
       // the new job can then never exclude its blocker by excluding itself.
-      const blockedByPriorJob = this.db.query<{ present: number }, [number]>(
+      const blockedByPriorJob = this.db.query<{ present: number }, [number, number]>(
         `SELECT 1 AS present FROM jobs
          WHERE jobs.seq < ?
            AND (${PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE})
          LIMIT 1`,
-      ).get(row.seq) !== null
+      ).get(row.seq, Date.now()) !== null
       const waitsBehindPriorJob = result.changes === 1 && blockedByPriorJob
 
-      if (result.changes === 1 && input.notifyAccepted && waitsBehindPriorJob) {
+      if (result.changes === 1 && input.workflow === 'security-audit') {
+        this.stageStatusNotificationRow({
+          idempotencyKey: `security-audit-accepted:${idempotencyKey}`,
+          jobId: row.id, chatId, threadTs,
+          kind: 'execution-started', createdAt: Date.now(),
+          payload: 'セキュリティ検査として受け付けました。コードを修正せず13工程を順に検査し、検査不能・失敗も含めたレポートをこのスレッドへ添付します。'
+            + (waitsBehindPriorJob ? ' 現在の作業が終わり次第、開始します。' : ''),
+        })
+      } else if (result.changes === 1 && input.notifyAccepted && waitsBehindPriorJob) {
         this.stageStatusNotificationRow({
           idempotencyKey: `accepted:${idempotencyKey}`,
           jobId: row.id,
@@ -8983,31 +9141,64 @@ export class JobStore {
     }, { queued: 0, running: 0 })
   }
 
-  countClaimable(now = Date.now()): number {
-    const head = this.db.query<{
-      not_before: number | null
-      cancel_requested_at: number | null
-    }, []>(
-      `SELECT not_before, cancel_requested_at FROM jobs
-       WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}
-       ORDER BY seq ASC LIMIT 1`,
+  /** Current folder and details come from the same live job; otherwise use the startup folder. */
+  fleetFolderFacts(now: number, startup: string): FleetLocalFacts {
+    const current=this.db.query<{repo_path:string},[]>(
+      `SELECT repo_path FROM jobs WHERE runtime='codex' AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
+       ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, seq LIMIT 1`,
     ).get()
-    return head && (head.cancel_requested_at !== null
-      || head.not_before === null || head.not_before <= now) ? 1 : 0
+    const currentProject=current?fleetProject(current.repo_path)?.key??null:null
+    if(current && !currentProject) return {currentProject:null,running:0,queued:0,limited:false,approval:false,deferred:false,
+      occupiedElsewhere:true,lastAcceptedAt:null,summary:null,summaryAt:null}
+    return {...this.fleetFacts(now,current?.repo_path??startup),currentProject}
+  }
+
+  /** Small public projection: never select task/result/raw logs for monitoring. */
+  fleetFacts(now = Date.now(), project?: string): FleetLocalFacts {
+    const counts = this.activeCounts()
+    const allQueued = counts.queued
+    const allRunning = counts.running
+    if(project) counts.running=this.db.query<{n:number},[string]>("SELECT count(*) AS n FROM jobs WHERE runtime='codex' AND status='running' AND repo_path=?").get(project)!.n
+    counts.queued = this.db.query<{ n: number }, any[]>(`SELECT count(*) AS n FROM jobs WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE} AND (? IS NULL OR repo_path=?)`).get(project ?? null, project ?? null)!.n
+    const current = this.db.query<{ id: string; attempts: number; not_before: number | null; rate_limit_terminal_json: string | null }, any[]>(
+      `SELECT id, attempts, not_before, rate_limit_terminal_json FROM jobs
+       WHERE (? IS NULL OR repo_path=?) AND runtime='codex' AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
+       ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, seq LIMIT 1`,
+    ).get(project ?? null, project ?? null)
+    const summary = current ? this.db.query<{ payload: string; created_at: number }, [string, number]>(
+      `SELECT payload,created_at FROM commentary_notifications WHERE job_id=? AND attempt=?
+       AND delivered_at IS NOT NULL AND suppressed_at IS NULL ORDER BY seq DESC LIMIT 1`,
+    ).get(current.id, current.attempts) : null
+    const last = this.db.query<{ at: number | null }, any[]>(
+      `SELECT MAX(at) AS at FROM (SELECT MAX(created_at) AS at FROM jobs WHERE runtime='codex' AND (? IS NULL OR repo_path=?)
+       UNION ALL SELECT MAX(c.created_at) FROM job_controls c JOIN jobs j ON j.id=c.job_id WHERE c.kind='steer' AND (? IS NULL OR j.repo_path=?))`,
+    ).get(project ?? null, project ?? null, project ?? null, project ?? null)?.at ?? null
+    const limited = !counts.running && (Boolean(current?.rate_limit_terminal_json) || Boolean(this.db.query<{ yes: number }, any[]>(
+      "SELECT 1 AS yes FROM cloud_handoff_jobs WHERE state IN ('saving','waiting') AND (? IS NULL OR job_id IN (SELECT id FROM jobs WHERE repo_path=?)) LIMIT 1",
+    ).get(project ?? null, project ?? null)))
+    const approval = Boolean(this.db.query<{ yes: number }, any[]>(
+      "SELECT 1 AS yes FROM ui_approval_requests WHERE status IN ('publishing','awaiting') AND (? IS NULL OR job_id IN (SELECT id FROM jobs WHERE repo_path=?)) LIMIT 1",
+    ).get(project ?? null, project ?? null))
+    // Public Slack milestones only. Credentials and local paths are not a fleet summary.
+    const text = summary?.payload.replace(/^💬\s*/, '').trim() ?? null
+    const safe = text && !containsCredentialMaterial(text) ? fleetSummaryWithoutPaths(text) : null
+    return { ...counts, limited, approval, occupiedElsewhere: allRunning > counts.running || allQueued > counts.queued, deferred: Boolean(current?.not_before && current.not_before > now),
+      lastAcceptedAt: last, summary: limited ? null : safe, summaryAt: !limited && safe ? summary!.created_at : null }
+  }
+
+  countClaimable(now = Date.now()): number {
+    return this.claimableHeadId(now) === null ? 0 : 1
   }
 
   claimableHeadId(now = Date.now()): string | null {
     const head = this.db.query<{
       id: string
-      not_before: number | null
-      cancel_requested_at: number | null
-    }, []>(
-      `SELECT id, not_before, cancel_requested_at FROM jobs
-       WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}
+    }, [number]>(
+      `SELECT id FROM jobs
+       WHERE ${READY_CODEX_JOB_PREDICATE}
        ORDER BY seq ASC LIMIT 1`,
-    ).get()
-    return head && (head.cancel_requested_at !== null
-      || head.not_before === null || head.not_before <= now) ? head.id : null
+    ).get(now)
+    return head?.id ?? null
   }
 
   claimNext(
@@ -9024,12 +9215,12 @@ export class JobStore {
         "SELECT 1 AS present FROM jobs WHERE runtime = 'codex' AND status = 'running' LIMIT 1",
       ).get()
       if (active) return null
-      const row = this.db.query<JobRow, []>(
+      const row = this.db.query<JobRow, [number]>(
         `SELECT * FROM jobs
-         WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE}
+         WHERE ${READY_CODEX_JOB_PREDICATE}
          ORDER BY seq ASC
          LIMIT 1`,
-      ).get()
+      ).get(claimAt)
       if (!row) return null
       if (row.cancel_requested_at === null
         && row.not_before !== null && row.not_before > claimAt) return null
@@ -9053,10 +9244,10 @@ export class JobStore {
         // would incorrectly skip a newer ordinary failure and resurrect an
         // older, no-longer-adjacent session.
         const preceding = this.db.query<
-          { session_id: string | null; status: JobStatus },
+          { session_id: string | null; status: JobStatus; workflow: string },
           [string, string, string, number, number]
         >(
-          `SELECT jobs.session_id, jobs.status
+          `SELECT jobs.session_id, jobs.status, jobs.workflow
            FROM jobs
            WHERE jobs.runtime = 'codex'
              AND jobs.chat_id = ?
@@ -9077,7 +9268,7 @@ export class JobStore {
         // When the executor knows the session itself is unusable it clears or
         // retires that session explicitly; every other same-thread failure is
         // valuable continuation context for the user's next "resume" request.
-        const prior = preceding?.session_id
+        const prior = row.workflow !== 'security-audit' && preceding?.workflow !== 'security-audit' && preceding?.session_id
           && (preceding.status === 'completed' || preceding.status === 'failed')
           && sessionUsesCurrentProtocol(preceding.session_id)
           && this.db.query<{ present: number }, [string]>(
@@ -9097,6 +9288,10 @@ export class JobStore {
         sessionId = resumed && prior ? prior.session_id : null
       }
 
+      if (row.workflow === 'security-audit') {
+        sessionId = null
+        resumed = false
+      }
       const update = this.db.run(
         `UPDATE jobs
          SET status = 'running',
@@ -9455,6 +9650,93 @@ export class JobStore {
     ).get(jobId))
   }
 
+  private hasObservedTurnSource(receipt: Pick<CodexRateLimitTerminalReceipt,
+    'jobId' | 'attempt' | 'controlEpoch' | 'executorNonce' | 'threadId' | 'turnId'
+  >): boolean {
+    const dispatch = this.db.query<{
+      status: string
+      control_epoch: number
+      executor_nonce: string | null
+      app_thread_id: string | null
+      turn_id: string | null
+      observed_at: number | null
+    }, [string, number]>(
+      `SELECT status, control_epoch, executor_nonce, app_thread_id, turn_id, observed_at
+       FROM job_initial_dispatches WHERE job_id = ? AND attempt = ?`,
+    ).get(receipt.jobId, receipt.attempt)
+    const initialDispatchMatches = dispatch?.status === 'observed'
+      && dispatch.observed_at !== null
+      && dispatch.control_epoch === receipt.controlEpoch
+      && dispatch.executor_nonce === receipt.executorNonce
+      && dispatch.app_thread_id === receipt.threadId
+      && dispatch.turn_id === receipt.turnId
+    const phaseDispatch = this.db.query<{
+      status: string
+      control_epoch: number
+      logical_nonce: string
+      app_thread_id: string
+      turn_id: string | null
+      observed_at: number | null
+    }, [string, number, string]>(
+      `SELECT status, control_epoch, logical_nonce, app_thread_id, turn_id, observed_at
+       FROM job_phase_dispatches
+       WHERE job_id = ? AND attempt = ? AND turn_id = ?`,
+    ).get(receipt.jobId, receipt.attempt, receipt.turnId)
+    const phaseDispatchMatches = phaseDispatch?.status === 'observed'
+      && phaseDispatch.observed_at !== null
+      && phaseDispatch.control_epoch === receipt.controlEpoch
+      && phaseDispatch.logical_nonce === receipt.executorNonce
+      && phaseDispatch.app_thread_id === receipt.threadId
+      && phaseDispatch.turn_id === receipt.turnId
+    const interjectionDispatches = this.db.query<{
+      status: string
+      control_epoch: number
+      answer_request_id: number | null
+      answer_logical_nonce: string | null
+      answer_thread_id: string | null
+      answer_turn_id: string | null
+      answer_dispatched_at: number | null
+      answer_acknowledged_at: number | null
+    }, [string, number, string]>(
+      `SELECT status, control_epoch, answer_request_id, answer_logical_nonce,
+              answer_thread_id, answer_turn_id, answer_dispatched_at,
+              answer_acknowledged_at
+       FROM job_interjections
+       WHERE job_id = ? AND control_epoch = ? AND answer_turn_id = ?`,
+    ).all(receipt.jobId, receipt.controlEpoch, receipt.turnId)
+    const interjectionDispatchMatches = interjectionDispatches.length === 1
+      && ['ready', 'paused'].includes(interjectionDispatches[0]!.status)
+      && interjectionDispatches[0]!.control_epoch === receipt.controlEpoch
+      && interjectionDispatches[0]!.answer_request_id !== null
+      && interjectionDispatches[0]!.answer_logical_nonce === receipt.executorNonce
+      && interjectionDispatches[0]!.answer_thread_id === receipt.threadId
+      && interjectionDispatches[0]!.answer_turn_id === receipt.turnId
+      && interjectionDispatches[0]!.answer_dispatched_at !== null
+      && interjectionDispatches[0]!.answer_acknowledged_at !== null
+    const continuation = this.db.query<{ present: number }, [
+      string, number, string, string, string,
+      string, number, number, string, string, string,
+    ]>(
+      `SELECT 1 AS present FROM job_controls
+       WHERE job_id = ? AND control_epoch = ? AND status = 'observed'
+         AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?
+         AND request_id IS NOT NULL AND dispatched_at IS NOT NULL
+         AND acknowledged_at IS NOT NULL AND observed_at IS NOT NULL
+       UNION ALL
+       SELECT 1 AS present FROM job_native_turns
+       WHERE job_id = ? AND attempt = ? AND control_epoch = ?
+         AND executor_nonce = ? AND app_thread_id = ? AND turn_id = ?
+         AND observed_at IS NOT NULL
+       LIMIT 1`,
+    ).get(
+      receipt.jobId, receipt.controlEpoch, receipt.executorNonce, receipt.threadId, receipt.turnId,
+      receipt.jobId, receipt.attempt, receipt.controlEpoch,
+      receipt.executorNonce, receipt.threadId, receipt.turnId,
+    )
+    return Boolean(initialDispatchMatches || phaseDispatchMatches
+      || interjectionDispatchMatches || continuation)
+  }
+
   private durableRateLimitTerminalForRunningJob(
     jobIdInput: string,
   ): CodexRateLimitTerminalReceipt | null {
@@ -9479,69 +9761,7 @@ export class JobStore {
       || row.pending_result !== null
       || row.cancel_requested_at !== null
       || row.terminal_outcome !== null) return null
-    const dispatch = this.db.query<{
-      status: string
-      control_epoch: number
-      executor_nonce: string | null
-      app_thread_id: string | null
-      turn_id: string | null
-      observed_at: number | null
-    }, [string, number]>(
-      `SELECT status, control_epoch, executor_nonce, app_thread_id, turn_id, observed_at
-       FROM job_initial_dispatches WHERE job_id = ? AND attempt = ?`,
-    ).get(row.id, row.attempts)
-    const initialDispatchMatches = dispatch?.status === 'observed'
-      && dispatch.observed_at !== null
-      && dispatch.control_epoch === receipt.controlEpoch
-      && dispatch.executor_nonce === receipt.executorNonce
-      && dispatch.app_thread_id === receipt.threadId
-      && dispatch.turn_id === receipt.turnId
-    const phaseDispatch = this.db.query<{
-      status: string
-      control_epoch: number
-      logical_nonce: string
-      app_thread_id: string
-      turn_id: string | null
-      observed_at: number | null
-    }, [string, number, string]>(
-      `SELECT status, control_epoch, logical_nonce, app_thread_id, turn_id, observed_at
-       FROM job_phase_dispatches
-       WHERE job_id = ? AND attempt = ? AND turn_id = ?`,
-    ).get(row.id, row.attempts, receipt.turnId)
-    const phaseDispatchMatches = phaseDispatch?.status === 'observed'
-      && phaseDispatch.observed_at !== null
-      && phaseDispatch.control_epoch === receipt.controlEpoch
-      && phaseDispatch.logical_nonce === receipt.executorNonce
-      && phaseDispatch.app_thread_id === receipt.threadId
-      && phaseDispatch.turn_id === receipt.turnId
-    const interjectionDispatches = this.db.query<{
-      status: string
-      control_epoch: number
-      answer_request_id: number | null
-      answer_logical_nonce: string | null
-      answer_thread_id: string | null
-      answer_turn_id: string | null
-      answer_dispatched_at: number | null
-      answer_acknowledged_at: number | null
-    }, [string, number, string]>(
-      `SELECT status, control_epoch, answer_request_id, answer_logical_nonce,
-              answer_thread_id, answer_turn_id, answer_dispatched_at,
-              answer_acknowledged_at
-       FROM job_interjections
-       WHERE job_id = ? AND control_epoch = ? AND answer_turn_id = ?`,
-    ).all(row.id, receipt.controlEpoch, receipt.turnId)
-    const interjectionDispatchMatches = interjectionDispatches.length === 1
-      && ['ready', 'paused'].includes(interjectionDispatches[0]!.status)
-      && interjectionDispatches[0]!.control_epoch === receipt.controlEpoch
-      && interjectionDispatches[0]!.answer_request_id !== null
-      && interjectionDispatches[0]!.answer_logical_nonce === receipt.executorNonce
-      && interjectionDispatches[0]!.answer_thread_id === receipt.threadId
-      && interjectionDispatches[0]!.answer_turn_id === receipt.turnId
-      && interjectionDispatches[0]!.answer_dispatched_at !== null
-      && interjectionDispatches[0]!.answer_acknowledged_at !== null
-    if (!initialDispatchMatches && !phaseDispatchMatches && !interjectionDispatchMatches) {
-      return null
-    }
+    if (!this.hasObservedTurnSource(receipt)) return null
     const currentProtocol = this.db.query<{ present: number }, [string, number]>(
       `SELECT 1 AS present FROM codex_session_protocols
        WHERE session_id = ? AND protocol_version = ?`,
@@ -9600,35 +9820,7 @@ export class JobStore {
        WHERE job_id = ? AND attempt = ? LIMIT 1`,
     ).get(row.id, row.attempts)
     if (currentPhase) return null
-    const sourceDispatch = this.db.query<{ present: number }, [
-      string, number, number, string, string, string,
-      string, number, number, string, string, string,
-      string, number, string, string, string,
-    ]>(
-      `SELECT 1 AS present FROM job_initial_dispatches
-       WHERE job_id = ? AND attempt = ? AND control_epoch = ?
-         AND status = 'observed' AND executor_nonce = ?
-         AND app_thread_id = ? AND turn_id = ? AND observed_at IS NOT NULL
-       UNION ALL
-       SELECT 1 AS present FROM job_phase_dispatches
-       WHERE job_id = ? AND attempt = ? AND control_epoch = ?
-         AND status = 'observed' AND logical_nonce = ?
-         AND app_thread_id = ? AND turn_id = ? AND observed_at IS NOT NULL
-       UNION ALL
-       SELECT 1 AS present FROM job_interjections
-       WHERE job_id = ? AND control_epoch = ? AND status IN ('ready', 'paused')
-         AND answer_request_id IS NOT NULL AND answer_logical_nonce = ?
-         AND answer_thread_id = ? AND answer_turn_id = ?
-         AND answer_dispatched_at IS NOT NULL AND answer_acknowledged_at IS NOT NULL
-       LIMIT 1`,
-    ).get(
-      row.id, receipt.attempt, receipt.controlEpoch, receipt.executorNonce,
-      receipt.threadId, receipt.turnId,
-      row.id, receipt.attempt, receipt.controlEpoch, receipt.executorNonce,
-      receipt.threadId, receipt.turnId,
-      row.id, receipt.controlEpoch, receipt.executorNonce,
-      receipt.threadId, receipt.turnId,
-    )
+    const sourceDispatch = this.hasObservedTurnSource(receipt)
     const currentProtocol = this.db.query<{ present: number }, [string, number]>(
       `SELECT 1 AS present FROM codex_session_protocols
        WHERE session_id = ? AND protocol_version = ?`,
@@ -11715,12 +11907,12 @@ export class JobStore {
         deliverable = row.job_id !== null
           && row.job_status === 'queued'
           && row.job_seq !== null
-          && this.db.query<{ present: number }, [number]>(
+          && this.db.query<{ present: number }, [number, number]>(
             `SELECT 1 AS present FROM jobs
              WHERE jobs.seq < ?
                AND (${PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE})
              LIMIT 1`,
-          ).get(row.job_seq) !== null
+          ).get(row.job_seq, Date.now()) !== null
       } else if (row.kind === 'rate-limited'
         && row.idempotency_key.startsWith(RATE_LIMIT_WAIT_NOTIFICATION_PREFIX)) {
         deliverable = row.job_id !== null
@@ -12195,6 +12387,7 @@ export class JobStore {
         }
         this.db.run('DELETE FROM job_interjections WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_controls WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM job_native_turns WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_phase_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_initial_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM jobs WHERE id = ?', [row.id])
@@ -13148,6 +13341,12 @@ export class JobStore {
           receipt.reason,
         )
         requeued += 1
+      } else if (job.workflow === 'security-audit') {
+        this.db.run(`UPDATE jobs SET status='queued', worker_id=NULL, executor_pid=NULL,
+          pending_session_id=NULL,pending_result=NULL,session_id=NULL,resumed=0,not_before=NULL,
+          accepts_control=1,executor_nonce=NULL,active_thread_id=NULL,active_turn_id=NULL WHERE id=?`,[job.id])
+        this.supersedeLifecycleNotifications(job.id)
+        requeued += 1
       } else if (job.writeEnabled) {
         // A reviewed result with a durable host-publication checkpoint has
         // known effects: the exact commit/branch/PR receipt is either pending
@@ -13381,7 +13580,7 @@ export interface CommentaryNotification {
 export type StatusNotificationKind =
   | 'accepted' | 'interrupt-accepted' | 'closed-control'
   | 'inactive-interrupt' | 'attachment-control-failed' | 'rate-limited'
-  | 'execution-started'
+  | 'execution-started' | 'fleet-status'
   | 'interjection-answer'
 
 export interface StatusNotification {
@@ -13513,6 +13712,7 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  if ((Object.values(CLOUD_PREPARATION_FAILURE_MESSAGES) as string[]).includes(error)) return error
   if (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE) {
     return FORCED_SERVICE_STOP_FAILURE_MESSAGE
   }
@@ -14790,6 +14990,12 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         continue
       }
       if (error instanceof CodexInterruptedError || options.signal?.aborted) {
+        if (job.workflow === 'security-audit') {
+          await updateMonitor(job, '保存済みの検査結果を保持して再開を待ちます')
+          await quiesceLifecycleBeforeStateChange()
+          options.store.requeue(job.id, message || 'audit worker interrupted')
+          return stats
+        }
         const appServerUncertain = options.store.initialTurnMayHaveBeenDelivered(job.id)
           || !options.store.initialTurnDispatchIsSafeToRetry(job.id)
           || options.store.controlMayHaveBeenDelivered(job.id)
@@ -16697,7 +16903,7 @@ export class SlackNotifier implements JobNotifier {
     notificationId?: string,
     parentSignal?: AbortSignal,
   ): Promise<void> {
-    const chunks = splitSlackChunks(text)
+    const chunks = splitSlackChunks(toSlackMrkdwn(text))
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index]!
       await withSlackDeadline(signal => this.uploadDependencies.postMessage({
@@ -16753,7 +16959,7 @@ export class SlackNotifier implements JobNotifier {
   }
 
   async status(notification: StatusNotification, signal?: AbortSignal): Promise<void> {
-    let payload = notification.payload
+    let payload = notification.kind === 'fleet-status' ? fleetReplyForDelivery(notification.payload) : notification.payload
     if (notification.kind === 'interjection-answer' && notification.jobId) {
       const job = this.store.get(notification.jobId)
       const interjection = (notification as Partial<InterjectionNotification>).interjection
@@ -16780,7 +16986,7 @@ export class SlackNotifier implements JobNotifier {
       ) || '確認した内容を元の作業へ反映して続けます。'
     }
     const deliver = async (): Promise<void> => {
-      const chunks = splitSlackChunks(payload)
+      const chunks = splitSlackChunks(toSlackMrkdwn(payload))
       for (let index = 0; index < chunks.length; index += 1) {
         await withSlackDeadline(childSignal => this.uploadDependencies.postMessage({
           chatId: notification.chatId,
@@ -16882,7 +17088,7 @@ export class SlackNotifier implements JobNotifier {
       'progress',
     )
     if (!safeText) throw new Error('UI/UX approval proposal became empty after sanitization')
-    const promptText = `${safeText}\n\nこの方向で実装してよいですか？`
+    const promptText = toSlackMrkdwn(`${safeText}\n\nこの方向で実装してよいですか？`)
     if (promptText.length > SLACK_CHUNK_CHARS) {
       throw new Error('UI/UX approval proposal exceeds one durable Slack message')
     }
@@ -17830,7 +18036,7 @@ export async function terminateTrackedExecutors(
       throw new Error(`executor PID ${pid}のcommandを確認できません`)
     }
     const command = commandProbe.command
-    const supervised = command.includes('codex-supervisor') && command.includes(registration.jobId)
+    const supervised = (command.includes('codex-supervisor') || command.includes('security-audit-supervisor.ts')) && command.includes(registration.jobId)
     const legacyDirect = command.includes(registration.jobId)
       && /(?:^|[\/\s])codex(?:[\/\s]|$)|codex-cli/i.test(command)
     if (!supervised && !legacyDirect) {
@@ -18429,9 +18635,11 @@ async function runCli(): Promise<void> {
   const herdrIdentityTimer = setInterval(checkHerdrIdentity, 5_000)
   herdrIdentityTimer.unref()
   let serviceControlPauseWarning = ''
+  let fleetPaused = true
   const shouldPause = (): boolean => {
-    if (slackIdentityChanged() || herdrIdentityInvalid) return true
+    if (slackIdentityChanged() || herdrIdentityInvalid) { fleetPaused = true; return true }
     const paused = updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
+    fleetPaused = paused
     if (paused) {
       try {
         acknowledgeServiceControlPauseIfRequested(dir)
@@ -18511,6 +18719,8 @@ async function runCli(): Promise<void> {
   for (const jobId of startupRetainedMonitorJobIds) ensureMonitorGuard(jobId)
 
   const cloudRuntime = CloudRuntime.configured(store, dir)
+  // Observe the scheduler's last decision; never acknowledge a stop/update from a monitoring timer.
+  const stopFleetPulse = startFleetRunnerPulse(dir, () => fleetPaused)
   let cloudRetry: Promise<void> | undefined
   const cloudRetryTimer = cloudRuntime ? setInterval(() => {
     if (cloudRetry || shouldPause()) return
@@ -18534,7 +18744,7 @@ async function runCli(): Promise<void> {
   try {
     await runQueuedJobs({
       store,
-      prepareCloudJob: cloudRuntime ? job => cloudRuntime.prepare(job) : undefined,
+      prepareCloudJob: cloudRuntime ? job => job.workflow === 'security-audit' ? Promise.resolve() : cloudRuntime.prepare(job) : undefined,
       parkCloudQuota: cloudRuntime ? (job, resetAt) => cloudRuntime.pause(job, resetAt) : undefined,
       maxJobsPerSession: configuredMaxJobsPerSession(
         process.env.ZEROKUN_MAX_JOBS_PER_SESSION,
@@ -18635,7 +18845,26 @@ async function runCli(): Promise<void> {
         }
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
+          if (job.workflow === 'security-audit') {
+            const raw = await executeSecurityAudit(job, {
+              stateDir: dir, signal: executionController.signal,
+              ...executorPidLifecycle,
+              cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
+              progress: message => mirrorMonitorMessage(message),
+            })
+            const auditResult = finalizeSuccessfulExecution(job, raw, dir, log)
+            store.ensureExecutionResultStaged(job.id, auditResult.sessionId, auditResult.result)
+            return auditResult
+          }
           const executionJob = cloudRuntime?.executionJob(job) ?? job
+          const previousAudit = store.previousSecurityAudit(executionJob)
+          if (previousAudit) {
+            try {
+              executionJob.auditReportPath = copyAuditReportForFollowup(executionJob, dir, previousAudit)
+            } catch {
+              executionJob.auditReportUnavailable = true
+            }
+          }
           executionJob.previousSlackDelivery = store.previousSlackDelivery(job.id)
           const execution = await executeCodexJob(executionJob, {
             signal: executionController.signal,
@@ -18656,6 +18885,11 @@ async function runCli(): Promise<void> {
                 executorNonce,
                 threadId,
                 turnId,
+              ),
+              bindNativeTurn: (nonce, threadId, parentTurnId, turnId) => (
+                store.bindNativeAppServerTurn(
+                  job.id, job.workerId!, job.controlEpoch, nonce, threadId, parentTurnId, turnId,
+                )
               ),
               beginInitialDispatch: ({
                 executorNonce, threadId, requestId, inputRevision, inputDigest,
@@ -18997,6 +19231,7 @@ async function runCli(): Promise<void> {
     if (monitorFatal) throw monitorFatal
   } finally {
     const interrupted = controller.signal.aborted && !monitorFatal
+    stopFleetPulse()
     if (cloudRetryTimer) clearInterval(cloudRetryTimer)
     if (cloudRetry) await cloudRetry
     clearInterval(maintenanceTimer)

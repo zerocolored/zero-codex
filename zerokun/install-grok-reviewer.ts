@@ -170,7 +170,7 @@ export function renderedGrokIdentity(grokPhysical: string): Buffer {
 
 export function reviewerConfig(home: string): string {
   return `[models]
-default = "grok-4.6"
+default = "grok-4.7"
 default_reasoning_effort = "xhigh"
 
 [compat.claude]

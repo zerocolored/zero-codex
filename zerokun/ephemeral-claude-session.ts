@@ -589,10 +589,50 @@ export function readEphemeralClaudeProvisionalCleanupReceipt(
   }
 }
 
+function readEphemeralClaudeSendReceipt(requestDir: string): { raw: string; marker: string; stateChangeSeq?: number } | undefined {
+  const sendReceipt = readOptionalOwnerOnlyRegularFile(join(requestDir, 'ephemeral-send-receipt.json'))
+  if (sendReceipt === null) return
+  if (Buffer.byteLength(sendReceipt) > 128 * 1024) {
+    throw new EphemeralClaudeCleanupPendingError('ephemeral Claude send receipt is too large')
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(sendReceipt) } catch {
+    throw new EphemeralClaudeCleanupPendingError('ephemeral Claude send receipt is invalid JSON')
+  }
+  const intent = readEphemeralClaudeIntent(requestDir)
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+    || Object.keys(parsed as Record<string, unknown>).filter(key => key !== 'state_change_seq').sort().join(',')
+      !== 'marker,nonce,status,target,version'
+    || ((parsed as Record<string, unknown>).state_change_seq !== undefined
+      && (!Number.isSafeInteger((parsed as Record<string, unknown>).state_change_seq)
+        || Number((parsed as Record<string, unknown>).state_change_seq) < 0))
+    || (parsed as Record<string, unknown>).version !== 2
+    || (parsed as Record<string, unknown>).nonce !== intent.nonce
+    || (parsed as Record<string, unknown>).target !== intent.agentName
+    || typeof (parsed as Record<string, unknown>).marker !== 'string'
+    || !/^REQUEST_MARKER=[0-9A-F]{32}$/.test(
+      String((parsed as Record<string, unknown>).marker),
+    )
+    || (parsed as Record<string, unknown>).status !== 'delivery-possible') {
+    throw new EphemeralClaudeCleanupPendingError('ephemeral Claude send receipt is invalid')
+  }
+  return { raw: sendReceipt, marker: String((parsed as Record<string, unknown>).marker),
+    ...((parsed as Record<string, unknown>).state_change_seq !== undefined
+      ? { stateChangeSeq: Number((parsed as Record<string, unknown>).state_change_seq) } : {}),
+  }
+}
+
+export function readEphemeralClaudeDelivery(requestDir: string): { marker: string; stateChangeSeq?: number } | undefined {
+  const receipt = readEphemeralClaudeSendReceipt(requestDir)
+  if (!receipt) return
+  const { raw: _raw, ...delivery } = receipt
+  return delivery
+}
+
 export function persistEphemeralClaudeDeliveryEvidence(
   stateDirInput: string,
   requestDir: string,
-): void {
+): string | undefined {
   const stateDir = requireManagedStateRoot(stateDirInput)
   const lifecycleRoot = requireManagedDirectory(
     stateDir,
@@ -607,29 +647,9 @@ export function persistEphemeralClaudeDeliveryEvidence(
     throw new EphemeralClaudeCleanupPendingError('ephemeral Claude delivery path is invalid')
   }
   requireManagedDirectory(stateDir, requestDir)
-  const sendReceipt = readOptionalOwnerOnlyRegularFile(join(requestDir, 'ephemeral-send-receipt.json'))
-  if (sendReceipt === null) return
-  if (Buffer.byteLength(sendReceipt) > 128 * 1024) {
-    throw new EphemeralClaudeCleanupPendingError('ephemeral Claude send receipt is too large')
-  }
-  let parsed: unknown
-  try { parsed = JSON.parse(sendReceipt) } catch {
-    throw new EphemeralClaudeCleanupPendingError('ephemeral Claude send receipt is invalid JSON')
-  }
-  const intent = readEphemeralClaudeIntent(requestDir)
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
-    || Object.keys(parsed as Record<string, unknown>).sort().join(',')
-      !== 'marker,nonce,status,target,version'
-    || (parsed as Record<string, unknown>).version !== 2
-    || (parsed as Record<string, unknown>).nonce !== intent.nonce
-    || (parsed as Record<string, unknown>).target !== intent.agentName
-    || typeof (parsed as Record<string, unknown>).marker !== 'string'
-    || !/^REQUEST_MARKER=[0-9A-F]{32}$/.test(
-      String((parsed as Record<string, unknown>).marker),
-    )
-    || (parsed as Record<string, unknown>).status !== 'delivery-possible') {
-    throw new EphemeralClaudeCleanupPendingError('ephemeral Claude send receipt is invalid')
-  }
+  const receipt = readEphemeralClaudeSendReceipt(requestDir)
+  if (!receipt) return
+  const { marker, raw: sendReceipt } = receipt
   const jobRoot = ensureManagedDirectory(stateDir, join(stateDir, 'advisor-journal', components[0]!))
   const attemptRoot = ensureManagedDirectory(stateDir, join(jobRoot, components[1]!))
   const evidencePath = join(attemptRoot, EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE)
@@ -667,7 +687,7 @@ export function persistEphemeralClaudeDeliveryEvidence(
     }
     // This is an attempt-level may-have-delivered latch. Later fresh rounds
     // intentionally keep the first valid receipt digest instead of conflicting.
-    return
+    return marker
   }
   try {
     const persisted = readOptionalBoundedOwnerOnlyRegularFile(
@@ -681,6 +701,7 @@ export function persistEphemeralClaudeDeliveryEvidence(
       `ephemeral Claude delivery evidence could not be verified: ${error}`,
     )
   }
+  return marker
 }
 
 function readEphemeralClaudeIntent(requestDir: string): EphemeralClaudeIntent {

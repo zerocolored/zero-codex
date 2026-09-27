@@ -4,6 +4,10 @@ Slack の DM・メンションを、Herdr上で動くローカルのCodexへ安�
 Slack Appの表示名はセットアップ時に自由に設定できます。Slackへ投稿する本文は一人称で、表示名を
 固定しません。ローカルの監視tabや管理ログでは、runtime名として `Zeroちゃん` を使います。
 
+## 全員の稼働状況
+
+[稼働状況ページ](https://zerochan-fleet.s-hashimoto-dcd.workers.dev)では、共通パスワードで各PC・アプリの受付状況、作業要約、最終受付・通信時刻を確認できます。クラウド認証済みPCのアプリは起動時に自動登録します。閲覧専用で、生ログやフルパスは送信しません。登録・公開・検証手順は [docs/fleet-dashboard.md](docs/fleet-dashboard.md)、送信設定の確認は `zerochan fleet status` です。
+
 ## 仕組み
 
 ```text
@@ -154,6 +158,9 @@ freshにした第2回でその差分と直接の回帰だけを確認します�
 `未起動／起動未確認／起動済み未回答／回答取得`に分けて返します。
 3者の有効な回答が揃うまで設計・レビューを完了扱いにしません。未回収時はSlackへ担当名と原因を通知します。
 終了と回収を確認した外部枠の一時失敗は30秒・60秒後に自動再試行し、取得済み枠は再起動しません。
+Claudeは未送信を確認できた失敗だけを再起動します。送達可能性がある依頼は、保存したmarkerで同じagentの回答を取得し、broker再開時も自動再送しません。
+回答だけでなく、終了確認済みの失敗原因と診断記録も枠ごとに保存します。別のreviewerの待機中に処理が中断しても、既知の起動失敗や時間切れを「中断」に置き換えません。送信結果（受理・拒否・通信失敗・不明）はモデルの実際の開始とは区別して診断へ記録します。
+起動helperには内部の起動待ち・初回確認・終了処理を含め15分の予算を設け、説明文の変更や一時的な描画遅れだけでは起動を拒否しません。
 なお不足する場合は同じroundの`retryUnavailable=true`で欠員だけを復旧します。これは追加review roundではありません。
 認証切れ・設定不備は必要な復旧操作を案内し未完了で待機します。復旧後は同じスレッドで再開できます。
 回答本文はowner-onlyのローカルstateへ保存します。追加入力の意味はメインCodexが判定し、
@@ -276,6 +283,9 @@ bash zerokun/interactive-bootstrap.sh \
 利用上限時の保存と、別Appへの明示的な引き継ぎを扱います。各PCで追加設定が必要で、
 通常のupdateだけでは有効になりません。SQLiteや認証ファイルをPC間でコピーしないでください。
 
+ジョブに画面操作（実機E2Eなど）をさせる場合は [Computer Use](docs/computer-use.md) を参照してください。
+Macごと・対象アプリごとに1回の永続承認が必要で、これも update だけでは有効になりません。
+
 ### 3. projectとSlackチャンネルを設定して起動する
 
 コマンドを忘れた場合は `zerochan help`、個別の説明は `zerochan stop --help` や
@@ -301,6 +311,11 @@ zerochan start
 ```
 
 通常はインスタンス名の指定は不要です。各プロジェクトのApp IDから保存先を選びます。
+接続先を変更する場合も、対象フォルダで `zerochan set slack-app` を実行して別のアプリを選択します。
+既存のチャンネル設定は新しいアプリへ引き継がれ、旧アプリ側の当該プロジェクトのチャンネル紐付けは解除されます。
+トークンの再入力や設定ファイルの手動削除は不要です。新しいアプリを対象チャンネルへ招待し、`zerochan start` で起動してください。
+旧アプリのジョブ・スレッド履歴や他プロジェクトは移動・削除しません。既存スレッドは旧アプリに残るため、新しいアプリへの依頼は新しいメンションから開始してください。
+切り替えが中断された場合は、同じ `zerochan set slack-app` の再実行で保存済みの処理を復旧します。
 同じAppを複数プロジェクトで選ぶ場合は、そのAppのgateway・キューを共有します。
 別Appならキューと稼働状態は分離しますが、同じOSユーザーのCodex・Claude・Grok認証や
 利用上限は別枠になりません。別PCではそのPC用のAppを登録してください。
@@ -309,8 +324,9 @@ zerochan start
 起動中は既定で30分ごとにリモートの `main` を確認し、更新があれば同じ更新処理を自動実行します。
 実行中の作業は中断せず、更新中に届いた依頼はキューへ保持し、再起動後に再開します。
 このMac全体の設定は `zerochan auto-update status` で確認し、`off` / `on` で切り替えます（再起動不要）。
-更新結果だけを登録済みユーザーのDMへ通知します。ユーザー未登録なら設定済みチャンネルを使い、
-通知先がまだない初期設定中は自動更新を開始しません。通信障害は通常作業を止めず次回に再確認します。
+自動更新の結果は登録済みユーザーのDMだけへ通知します。宛先未設定やDM送信失敗時は通知を省略し、
+チャンネルへは投稿しません。通知の可否にかかわらず自動更新は行います。
+Slackで手動依頼した更新結果は従来どおり依頼元スレッドへ返します。更新確認の通信障害は次回に再確認します。
 未コミット変更・別ブランチ・分岐履歴があるcloneは自動更新しません。失敗時の復旧は既存updaterが行い、
 復旧も失敗した場合は記録を保持します。`off` は開始済みの更新を中断しません。
 更新処理で失敗した同じ版を自動で繰り返し適用せず、次の版を待ちます。原因解消後に同じ版を
@@ -555,16 +571,21 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 
 - Zeroちゃんが参加していないchannel、未許可DM、bot投稿は受け取りません。
 - pairing は1時間で失効し、同時 pending は3件までです。
-- Codex 0.149.0+ の named permission profile を使います。minimal runtimeから始め、
-  対象repository、当該jobの添付、scratch、outboxだけを許可します。HOME・state・共用tempはdenyします。
+- Codex 0.149.0+ の named permission profile を使います。書込み許可済みの主実行は、
+  通常のhost読取り、対象repositoryへの書込み、OSの一時領域を許可します。
+  実行ファイル・SDKの配置先ごとの読取りallowlistは使いません。読取り専用工程は
+  従来のminimal runtimeのままです。Zeroのstate、他アプリのSlack登録領域、Codex設定領域は保護します。
 - read senderはrepository readのみ、write senderだけrepository・`.git` writeとnetworkを許可し、
   どちらも `-a never` で対話的な権限昇格を行いません。
 - host runtimeをSlack経由で書き換えられないよう、Zeroちゃん自身のrepositoryへのwrite jobは拒否します。
   Codex shellのHOME/TMPDIRはjob scratchへ隔離し、commitには固定の中立identityを使います。
-  CodexへHOME credentialを公開せず、認証が必要なGitHub操作だけをrepository限定brokerへ渡します。
+  GitHub認証はrepository限定brokerへ渡します。書込み許可済み主担当のCloud操作は通常のgcloudを使い、
+  SDKと既存Cloud SDK設定だけを追加許可します（認証cache更新のため設定directoryはwrite）。
+  主実行のhost読取りにはHOME内の通常設定も含みますが、HOME全体への書込みや認証情報のコピーは行いません。
+  このCLI経路は同じshellからoperatorのcredentialを隔離する方式ではありません。
 - 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
-  linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。HOMEのglobal
-  Git/GitHub credentialはmodelへ公開しません。brokerはlogin済み`gh`をcredential helperとして使い、
+  linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。読取り専用工程にはHOMEを公開しません。
+  brokerはlogin済み`gh`をcredential helperとして使い、
   current projectのcanonical `github.com` repositoryだけを操作します。作業判断はCodexが行います。
 - App Serverは認証済み`CODEX_HOME`を使うためuser configも読みます。そのため起動直前の
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、

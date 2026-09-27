@@ -6439,6 +6439,117 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
+  for (const source of ['native', 'control'] as const) {
+    test(`${source} turnのcapacityは再起動と未送達attemptを跨いで同じ作業を継続する`, () => {
+      const dir = fixtureDir()
+      const path = join(dir, 'jobs.sqlite3')
+      let store = new JobStore(path)
+      store.enqueue(input({ messageId: `continuation-${source}`, writeEnabled: true }))
+      const job = store.claimNext('continuation-worker')!
+      const snapshot = readAdvisorInputSnapshot(dir, job.id)
+      const nonce = '6'.repeat(32)
+      const threadId = 'thread-continuation'
+      const binding = { jobId: job.id, epoch: job.controlEpoch, executorNonce: nonce, threadId }
+      store.beginInitialTurnDispatch({
+        ...binding, attempt: job.attempts, requestId: 101,
+        inputRevision: snapshot.revision, inputDigest: snapshot.digest,
+      })
+      store.acknowledgeInitialTurnDispatch({
+        ...binding, workerId: job.workerId!, attempt: job.attempts,
+        requestId: 101, turnId: 'parent',
+      })
+      expect(() => store.bindNativeAppServerTurn(
+        job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'parent', 'premature',
+      )).toThrow('parent binding changed')
+      store.finishAppServerTurn({ ...binding, turnId: 'parent', retainInput: true })
+      if (source === 'native') {
+        for (const [worker, epoch, logicalNonce, thread, parent] of [
+          ['other-worker', job.controlEpoch, nonce, threadId, 'parent'],
+          [job.workerId!, job.controlEpoch + 1, nonce, threadId, 'parent'],
+          [job.workerId!, job.controlEpoch, '7'.repeat(32), threadId, 'parent'],
+          [job.workerId!, job.controlEpoch, nonce, 'other-thread', 'parent'],
+          [job.workerId!, job.controlEpoch, nonce, threadId, 'unknown-parent'],
+        ] as const) {
+          expect(() => store.bindNativeAppServerTurn(
+            job.id, worker, epoch, logicalNonce, thread, parent, 'child',
+          )).toThrow('parent binding changed')
+        }
+        store.bindNativeAppServerTurn(
+          job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'parent', 'middle',
+        )
+        store.finishAppServerTurn({ ...binding, turnId: 'middle', retainInput: true })
+        store.bindNativeAppServerTurn(
+          job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'middle', 'child',
+        )
+      } else {
+        const target = store.liveControlTarget(job.chatId, job.threadTs)!
+        store.stageLiveControl(target, {
+          chatId: job.chatId, threadTs: job.threadTs, messageId: 'continuation-control-followup',
+          userId: 'UOTHER', task: '追加条件', kind: 'steer', writeEnabled: true,
+        })
+        const control = store.nextReadyControl(job.id, job.controlEpoch)!
+        store.beginControlDispatch({ ...binding, controlId: control.id, requestId: 102 })
+        store.acknowledgeControl(control.id, 102, 'child')
+        store.bindAppServerTurn(job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'child')
+      }
+      const resumeAt = Date.now() - 1
+      store.finishAppServerTurn({
+        ...binding, turnId: 'child', retainInput: true,
+        rateLimitResumeAt: resumeAt, rateLimitReason: 'capacity', rateLimitSafeToReplay: false,
+      })
+      expect(store.hasDurableRateLimitTerminal(job.id)).toBe(true)
+      const db = new Database(path)
+      const table = source === 'native' ? 'job_native_turns' : 'job_controls'
+      const corruptions: [string, string | number | null][] = [
+        ['executor_nonce', 'foreign-nonce'], ['app_thread_id', 'foreign-thread'],
+        ['turn_id', 'foreign-turn'], ['control_epoch', job.controlEpoch + 1],
+        ['observed_at', null],
+        ...(source === 'native' ? [['attempt', job.attempts + 1]] as [string, number][]
+          : [['status', 'acknowledged']] as [string, string][]),
+      ]
+      for (const [column, invalid] of corruptions) {
+        const original = db.query(`SELECT ${column} AS value FROM ${table} WHERE turn_id = 'child'`)
+          .get() as { value: string | number | null }
+        db.run(`UPDATE ${table} SET ${column} = ? WHERE job_id = ? AND turn_id = 'child'`,
+          [invalid, job.id])
+        expect(store.hasDurableRateLimitTerminal(job.id)).toBe(false)
+        db.run(`UPDATE ${table} SET ${column} = ? WHERE job_id = ? AND turn_id = ?`,
+          [original.value, job.id, column === 'turn_id' ? 'foreign-turn' : 'child'])
+        expect(store.hasDurableRateLimitTerminal(job.id)).toBe(true)
+      }
+      for (const column of ['executor_pid', 'cancel_requested_at'] as const) {
+        db.run(`UPDATE jobs SET ${column} = 123 WHERE id = ?`, [job.id])
+        expect(store.hasDurableRateLimitTerminal(job.id)).toBe(false)
+        db.run(`UPDATE jobs SET ${column} = NULL WHERE id = ?`, [job.id])
+      }
+      db.close()
+      store.close()
+      store = new JobStore(path)
+      expect(store.recoverInterrupted()).toEqual({ requeued: 1, failedWrites: 0, failedUncertain: 0 })
+      const next = store.claimNext('continuation-second', 20, Date.now())!
+      expect(next).toMatchObject({ attempts: 2, resumed: true, sessionId: threadId,
+        rateLimitRecovery: { turnId: 'child', safeToReplay: false } })
+      store.close()
+      store = new JobStore(path)
+      expect(store.recoverInterrupted()).toEqual({ requeued: 1, failedWrites: 0, failedUncertain: 0 })
+      expect(store.get(job.id)).toMatchObject({ status: 'queued', sessionId: threadId,
+        rateLimitRecovery: { turnId: 'child', safeToReplay: false } })
+      const final = store.claimNext('continuation-final', 20, Date.now())!
+      store.fail(final.id, 'fixture terminal after recovery')
+      const notification = store.pendingTerminalNotifications()[0]!
+      store.markTerminalNotificationDelivered(notification.id)
+      expect(store.pruneSettled({
+        stateDir: dir, now: Date.now() + 10_000, retentionMs: 1, tombstoneRetentionMs: 60_000,
+      }).jobs).toBe(1)
+      expect(store.get(job.id)).toBeNull()
+      const pruned = new Database(path)
+      expect(pruned.query('SELECT COUNT(*) AS count FROM job_native_turns').get())
+        .toEqual({ count: 0 })
+      pruned.close()
+      store.close()
+    })
+  }
+
   test('bareまたは破損したrate-limit hintはwrite jobの再実行を認可しない', () => {
     for (const kind of ['bare', 'malformed'] as const) {
       const dir = fixtureDir()
@@ -7640,7 +7751,29 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
-  test('先頭jobがrate-limit待ちなら後続jobは追い越さない', () => {
+  test('延期中でも別スレッドは進み、同一スレッドの順序は保持する', () => {
+    const store = makeStore()
+    const first = store.enqueue(input({ messageId: 'first' })).job
+    const second = store.enqueue(input({ messageId: 'second', repoPath: '/another-project' })).job
+    const independent = store.enqueue(input({ messageId: 'third', threadTs: 'different-thread' })).job
+    const now = Date.now()
+    expect(store.claimNext('worker')?.id).toBe(first.id)
+    store.requeueAt(first.id, now + 60_000, 'temporary network failure')
+    expect(store.countClaimable(now)).toBe(1)
+    expect(store.claimableHeadId(now)).toBe(independent.id)
+    expect(store.claimNext('worker', undefined, now)?.id).toBe(independent.id)
+    expect(store.claimNext('another-worker', undefined, now)).toBeNull()
+    store.complete(independent.id, 'independent-session', 'done')
+    expect(store.countClaimable(now)).toBe(0)
+    expect(store.claimableHeadId(now)).toBeNull()
+    expect(store.claimNext('worker', undefined, now)).toBeNull()
+    expect(store.claimNext('worker', undefined, now + 60_000)?.id).toBe(first.id)
+    store.complete(first.id, 'first-session', 'done')
+    expect(store.claimNext('worker', undefined, now + 60_000)?.id).toBe(second.id)
+    store.close()
+  })
+
+  test('先頭jobがrate-limit待ちなら同一スレッドの後続jobは追い越さない', () => {
     const store = makeStore()
     const first = store.enqueue(input({ messageId: 'first', task: 'first' })).job
     store.enqueue(input({ messageId: 'second', task: 'second' }))
@@ -7650,6 +7783,28 @@ describe('single FIFO worker', () => {
     expect(store.claimNext('serial-worker')).toBeNull()
     expect(store.countClaimable()).toBe(0)
     store.close()
+  })
+
+  test('延期の順序と二重claim防止は再起動と複数workerでも保持される', () => {
+    const path = join(fixtureDir(), 'jobs.sqlite3')
+    let store = new JobStore(path)
+    const first = store.enqueue(input({ messageId: 'first' })).job
+    store.enqueue(input({ messageId: 'second' }))
+    const other = store.enqueue(input({ messageId: 'other', threadTs: 'other-thread' })).job
+    store.claimNext('worker')
+    store.requeueAt(first.id, Date.now() + 60_000, 'network')
+    store.close()
+    store = new JobStore(path)
+    const peer = new JobStore(path)
+    try {
+      expect(store.claimableHeadId()).toBe(other.id)
+      expect(store.claimNext('worker')?.id).toBe(other.id)
+      expect(peer.claimNext('peer')).toBeNull()
+      store.complete(other.id, 'other-session', 'done')
+      expect(peer.claimableHeadId()).toBeNull()
+      expect(peer.claimNext('peer')).toBeNull()
+      expect(peer.claimNext('peer', undefined, Date.now() + 60_000)?.id).toBe(first.id)
+    } finally { peer.close(); store.close() }
   })
 
   test('monitor消失復旧はqueued/running jobを二重処理できないterminal失敗へ固定する', () => {
@@ -9954,6 +10109,30 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     store.close()
   })
 
+  test('IAM修復はwrite主体の明示承認範囲だけを許可し、認証とread-only境界を維持する', () => {
+    const store = makeStore()
+    const repo = fixtureDir('zerokun-iam-policy-')
+    git(['init', '-q'], repo)
+    store.enqueue(input({ repoPath: repo, writeEnabled: true }))
+    const job = store.claimNext('iam-policy-worker')!
+    const write = buildCodexDeveloperInstructions(job, '/tmp/job-outbox', false, 'a'.repeat(32))
+    const read = buildCodexDeveloperInstructions(
+      { ...job, writeEnabled: false }, '/tmp/job-outbox', false, 'a'.repeat(32),
+    )
+    expect(write).toContain('IAM repair is permitted when the current authorized user task explicitly approves')
+    expect(write).toContain('target resource, existing grantee principal, and exact permission or role')
+    expect(write).toContain('do not authorize privilege expansion')
+    expect(write).toContain('Honor an already received explicit approval for that exact repair')
+    expect(write).toContain('etag-aware updates, not a blind policy replacement')
+    expect(write).toContain('additional access beyond the approved scope')
+    expect(write).toContain('permission to repair IAM alone does not authorize those side effects')
+    expect(write).toContain('credential files or tokens, change accounts, run login, or create credential keys')
+    expect(write).toContain('prior assistant claim that all IAM changes are forbidden is not a current policy rule')
+    expect(write).not.toContain('change IAM to bypass a denial')
+    expect(read).not.toContain('IAM repair is permitted')
+    store.close()
+  })
+
   test('write jobは作業とreviewをAGENTSへ委ねhost工程を要求しない', () => {
     const repo = fixtureDir('zerokun-instructions-write-')
     git(['init', '-q'], repo)
@@ -11436,7 +11615,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       })
       const args = JSON.parse(readFileSync(capture, 'utf8')) as string[]
       expect(args.some(value => (
-        value.includes('filesystem={') && value.includes('":minimal"="read"')
+        value.includes('filesystem={') && value.includes('":root"="read"')
       ))).toBe(true)
       expect(args.some(value => value.includes('network.enabled=true'))).toBe(true)
       expect(args.some(value => value.includes('network.domains={"*"="allow"'))).toBe(true)
@@ -11921,7 +12100,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         message = error instanceof Error ? error.message : String(error)
       }
       const expectedLog = join(logs, `${job.id}.new.stdout.log`)
-      expect(message).toContain(`全文ログ: ${expectedLog}`)
+      expect(message).toContain(`ログ（保存上限あり）: ${expectedLog}`)
       expect(existsSync(expectedLog)).toBe(true)
       expect(message).not.toContain(`${job.id}.stdout.log`)
     } finally {
@@ -12018,7 +12197,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     }
   })
 
-  test('permission profileはHOME/stateを閉じ、repo・当該添付・outboxだけを再許可する', () => {
+  test('primaryは標準のhost読取りとrepo書込みを許可しstateとCodex設定を保護する', () => {
     const dir = fixtureDir()
     const state = join(dir, 'state')
     const repo = join(dir, 'repo')
@@ -12060,8 +12239,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
           args: ['/runtime/cloud-logging-broker.ts', '/state/context.json'],
         },
         localVerificationEnabled: true,
+        computerUseEnabled: true,
       }).join('\n')
-      expect(overrides).toContain('":minimal"="read"')
+      expect(overrides).toContain('":root"="read"')
       expect(overrides).not.toContain('extends=')
       expect(overrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(join(repo, '.git')))}="write"`)
@@ -12070,11 +12250,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain(`${JSON.stringify(realpathSync(state))}="deny"`)
       expect(overrides).not.toContain(JSON.stringify(browserCaptureDirForJob(state, job.id)))
       expect(overrides).toContain(`${JSON.stringify(realpathSync(codexHome))}="deny"`)
-      expect(overrides).toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
-      expect(overrides).toContain('"PATH"="/usr/bin:/bin:/usr/sbin:/sbin')
-      if (existsSync('/opt/homebrew/Cellar')) {
-        expect(overrides).toContain(`${JSON.stringify(realpathSync('/opt/homebrew/Cellar'))}="read"`)
-      }
+      expect(overrides).not.toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
+      const primaryPath = (Bun.TOML.parse(overrides) as any).shell_environment_policy.set.PATH
+      expect(primaryPath.split(':')).toContain('/usr/bin')
+      expect(primaryPath).not.toContain(`${join(homedir(), '.codex')}/`)
       expect(overrides).toContain('"*PROXY*"')
       expect(overrides).toContain('network.enabled=true')
       expect(overrides).toContain('network.allow_local_binding=true')
@@ -12097,14 +12276,25 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         expect(roleConfig.model_reasoning_effort).toBe(effort)
         expect(roleConfig.sandbox_mode).toBe('read-only')
         expect(roleConfig.approval_policy).toBe('never')
+        expect((roleConfig.features as any).computer_use).toBe(false)
+        expect((roleConfig.features as any).plugins).toBe(false)
+        expect((roleConfig.mcp_servers as any)['computer-use'].enabled).toBe(false)
+        expect((roleConfig.mcp_servers as any).node_repl.enabled).toBe(false)
       }
-      expect(overrides).toContain('features.plugins=false')
+      expect(overrides).toContain('features.plugins=true')
       expect(overrides).toContain('features.goals=false')
       expect(overrides).toContain('features.browser_use=true')
       expect(overrides).toContain('features.browser_use_external=true')
       expect(overrides).toContain('features.browser_use_full_cdp_access=false')
-      expect(overrides).toContain('features.computer_use=false')
+      expect(overrides).toContain('features.computer_use=true')
       expect(overrides).toContain('features.in_app_browser=true')
+      // CUA nodeカーネルはOpenSSL設定とChatGPT.app同梱リソースを読む
+      expect(overrides).toContain(`${JSON.stringify(realpathSync('/System/Library/OpenSSL'))}="read"`)
+      if (existsSync('/Applications/ChatGPT.app')) {
+        expect(overrides).toContain(`${JSON.stringify(realpathSync('/Applications/ChatGPT.app'))}="read"`)
+      }
+      expect(overrides).not.toContain('com.openai.sky.CUAService')
+      expect(overrides).not.toContain('\"/Applications\"=\"read\"')
       expect(overrides).toContain('mcp_servers={zerokun_advisors=')
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
@@ -12158,6 +12348,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         },
         executionWriteEnabled: true,
         localVerificationEnabled: true,
+        computerUseEnabled: true,
         multiAgentEnabled: false,
       }).join('\n')
       expect(implementationOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
@@ -12176,6 +12367,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         },
         executionWriteEnabled: false,
         localVerificationEnabled: true,
+        computerUseEnabled: true,
         browserAccessEnabled: true,
         multiAgentEnabled: true,
       }).join('\n')
@@ -12189,6 +12381,39 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(reviewOverrides).toContain('features.browser_use_external=true')
       expect(reviewOverrides).toContain('features.browser_use_full_cdp_access=false')
       expect(reviewOverrides).toContain('features.computer_use=false')
+      expect(reviewOverrides).toContain('features.plugins=false')
+      expect(reviewOverrides).not.toContain('/System/Library/OpenSSL')
+      // Job-owned declarations must not expand host access to personal application data.
+      mkdirSync(join(repo, '.zerokun'), { recursive: true })
+      writeFileSync(join(repo, '.zerokun', 'computer-use-read-paths'), [
+        '# コメント行と空行は無視',
+        '',
+        '~/Library/Application Support',
+        join(homedir(), '.ssh'),
+        '/etc',
+      ].join('\n'))
+      const projectGrantOverrides = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        executionWriteEnabled: true,
+        browserAccessEnabled: true,
+      }).join('\n')
+      expect(projectGrantOverrides).not.toContain(
+        `${JSON.stringify(realpathSync(join(homedir(), 'Library', 'Application Support')))}="read"`,
+      )
+      expect(projectGrantOverrides).not.toContain('.ssh')
+      expect(projectGrantOverrides).not.toContain('"/etc"="read"')
+      // computer_use が無効な build では宣言ファイルがあっても付与しない
+      const reviewWithGrantFile = buildCodexPermissionOverrides(job, {
+        stateDir: state,
+        artifactDir: outbox,
+        scratchDir: scratch,
+        executionWriteEnabled: false,
+        browserAccessEnabled: true,
+      }).join('\n')
+      expect(reviewWithGrantFile).not.toContain('Application Support')
+      rmSync(join(repo, '.zerokun'), { recursive: true, force: true })
       expect(() => buildCodexPermissionOverrides(
         { ...job, repoPath: homedir() },
         { stateDir: state, artifactDir: outbox, scratchDir: scratch },
@@ -14103,6 +14328,27 @@ describe('Slack output guard', () => {
     store.close()
   })
 
+  test('Slack outbound converts Markdown for progress and completion after sanitization', async () => {
+    const store = makeStore()
+    const job = store.enqueue(input({ messageId: 'mrkdwn-outbound' })).job
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+    await notifier.progress(job, '## 確認\n\n**テスト成功**。`**raw**` は保持。')
+    await notifier.completed(job, '**完了**。 [結果](https://example.com/result)')
+    expect(posted[0]).toContain('*確認*\n\n*テスト成功* 。')
+    expect(posted[0]).toContain('`**raw**`')
+    expect(posted[1]).toContain('*完了* 。')
+    expect(posted[1]).toContain('<https://example.com/result|結果>')
+    await notifier.status({ id: 'format-status', idempotencyKey: 'format-status', jobId: job.id,
+      chatId: job.chatId, threadTs: job.threadTs, kind: 'accepted', attempts: 0,
+      payload: '**受付済み**',
+    })
+    expect(posted[2]).toBe('*受付済み*')
+    store.close()
+  })
+
   test('想定外の巨大結果でもSlack 5通を超えない', () => {
     const chunks = splitSlackChunks('x'.repeat(100_000))
     expect(chunks.length).toBeLessThanOrEqual(5)
@@ -15496,7 +15742,7 @@ describe('durable UI/UX approval wait', () => {
       inputDigest: snapshot.digest,
       repositoryDigest: advisorRepositoryDigest(repositorySnapshot),
       repositorySnapshot,
-      proposalText: '余白と情報階層を整理した案です。',
+      proposalText: '**比較案**：余白と情報階層を整理した案です。',
       beforePath: before,
       afterPath: after,
     })
@@ -15538,6 +15784,8 @@ describe('durable UI/UX approval wait', () => {
     expect(posted).toHaveLength(1)
     expect(posted[0]).toMatchObject({ chatId: root.chatId, threadTs: root.threadTs })
     expect(posted[0]?.text).toContain('この方向で実装してよいですか？')
+    expect(posted[0]?.text).toContain('*比較案*')
+    expect(posted[0]?.text).not.toContain('**比較案**')
     expect(posted[0]?.text).not.toContain(directory)
     expect(posted[0]?.clientMessageId).toMatch(/^[0-9a-f-]{36}$/)
     expect(store.uiApprovalRequest(requestId)).toMatchObject({

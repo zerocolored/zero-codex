@@ -702,7 +702,7 @@ describe('fifth-advisor helper installer', () => {
       .toBe(false)
   })
 
-  test('agent_not_ready後のblocked launchはexact trust検査へだけ渡す', () => {
+  test('agent_not_ready後は同じowned startup state machineで待つ', () => {
     const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
     const program = [
       'import importlib.util,json,sys',
@@ -713,7 +713,7 @@ describe('fifth-advisor helper installer', () => {
       'blocked={"name":"fifth-test","agent":"claude","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","cwd":"/tmp/project","agent_status":"blocked","interactive_ready":False,"launch_pending":True,"state_change_seq":8}',
       'module._agent_information=lambda target: ({},dict(blocked))',
       'module._read_visible=lambda target: "trust screen"',
-      'module._settle_after_trust=lambda target,workspace: {"path":"strict-trust"}',
+      'module._settle_visible_ready=lambda target,workspace: {"path":"visible-ready"}',
       'resolved=module._settle_after_agent_not_ready("fifth-test",workspace)',
       'print(json.dumps(resolved,sort_keys=True))',
     ].join('\n')
@@ -721,10 +721,10 @@ describe('fifth-advisor helper installer', () => {
       stdout: 'pipe', stderr: 'pipe',
     })
     expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout.toString())).toEqual({ path: 'strict-trust' })
+    expect(JSON.parse(result.stdout.toString())).toEqual({ path: 'visible-ready' })
   })
 
-  test('Claude 2.1.246の警告付きtrust画面だけを完全一致で受理する', () => {
+  test('trust画面の説明文変更は許容し選択と対象を検査する', () => {
     const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
     const program = [
       'import importlib.util,json,sys',
@@ -748,73 +748,7 @@ describe('fifth-advisor helper installer', () => {
       stdout: 'pipe', stderr: 'pipe',
     })
     expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout.toString())).toEqual({ changed: false, exact: true })
-  })
-
-  test('trust確認直後に同じblocked画面が残ってもEnterを再送せずreadyを待つ', () => {
-    const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
-    const program = [
-      'import importlib.util,json,sys,types',
-      'spec=importlib.util.spec_from_file_location("fifth_advisor",sys.argv[1])',
-      'module=importlib.util.module_from_spec(spec)',
-      'spec.loader.exec_module(module)',
-      'workspace={"agent_name":"fifth-test","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","project_root":"/tmp/project"}',
-      'blocked={"name":"fifth-test","agent":"claude","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","cwd":"/tmp/project","agent_status":"blocked","interactive_ready":False,"launch_pending":True,"state_change_seq":8}',
-      'ready={"name":"fifth-test","agent":"claude","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","cwd":"/tmp/project","agent_status":"idle","interactive_ready":True,"launch_pending":False,"state_change_seq":9}',
-      'screen="\\n".join(["Accessing workspace:","/tmp/project","Quick safety check: Is this a project you created or one you trust?","❯ 1. Yes, I trust this folder","  2. No, exit","Enter to confirm · Esc to cancel"])',
-      'agents=iter([blocked,blocked,blocked,ready])',
-      'screens=iter([screen,screen,screen])',
-      'calls=[]',
-      'module._agent_information=lambda target: ({},dict(next(agents)))',
-      'module._read_visible=lambda target: next(screens)',
-      'module._run_herdr=lambda args: (calls.append(list(args)) or types.SimpleNamespace(returncode=0))',
-      'module.time.sleep=lambda seconds: None',
-      'module.time.monotonic=lambda: 0.0',
-      'resolved=module._settle_after_trust("fifth-test",workspace)',
-      'print(json.dumps({"status":resolved["agent_status"],"calls":calls},sort_keys=True))',
-    ].join('\n')
-    const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], {
-      stdout: 'pipe', stderr: 'pipe',
-    })
-    expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout.toString())).toEqual({
-      calls: [['agent', 'send-keys', 'fifth-test', 'Enter']],
-      status: 'idle',
-    })
-  })
-
-  test('trust確認後の別blocked画面には追加キーを送らずfail closedにする', () => {
-    const helper = realpathSync(join(import.meta.dir, 'fifth-advisor.py'))
-    const program = [
-      'import importlib.util,json,sys,types',
-      'spec=importlib.util.spec_from_file_location("fifth_advisor",sys.argv[1])',
-      'module=importlib.util.module_from_spec(spec)',
-      'spec.loader.exec_module(module)',
-      'workspace={"agent_name":"fifth-test","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","project_root":"/tmp/project"}',
-      'blocked={"name":"fifth-test","agent":"claude","workspace_id":"wOWN","pane_id":"wOWN:p1","terminal_id":"term_012345abcdef","cwd":"/tmp/project","agent_status":"blocked","interactive_ready":False,"launch_pending":True,"state_change_seq":8}',
-      'changed=dict(blocked,state_change_seq=9)',
-      'screen="\\n".join(["Accessing workspace:","/tmp/project","Quick safety check: Is this a project you created or one you trust?","❯ 1. Yes, I trust this folder","  2. No, exit","Enter to confirm · Esc to cancel"])',
-      'agents=iter([blocked,blocked,changed])',
-      'screens=iter([screen,screen,"WARNING: Claude Code running in Bypass Permissions mode"])',
-      'calls=[]',
-      'module._agent_information=lambda target: ({},dict(next(agents)))',
-      'module._read_visible=lambda target: next(screens)',
-      'module._run_herdr=lambda args: (calls.append(list(args)) or types.SimpleNamespace(returncode=0))',
-      'module.time.sleep=lambda seconds: None',
-      'module.time.monotonic=lambda: 0.0',
-      'error=None',
-      'try: module._settle_after_trust("fifth-test",workspace)',
-      'except module.UnsafeRequest as caught: error=str(caught)',
-      'print(json.dumps({"error":error,"calls":calls},sort_keys=True))',
-    ].join('\n')
-    const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], {
-      stdout: 'pipe', stderr: 'pipe',
-    })
-    expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout.toString())).toEqual({
-      calls: [['agent', 'send-keys', 'fifth-test', 'Enter']],
-      error: 'ephemeral Claude reached another blocked startup UI',
-    })
+    expect(JSON.parse(result.stdout.toString())).toEqual({ changed: true, exact: true })
   })
 
   test('sendは本文をprocess argvへ載せずowner-only Herdr socketへ1回だけ送る', async () => {
@@ -1249,5 +1183,11 @@ describe('fifth-advisor helper installer', () => {
 
 test('visible startup readiness keeps xhigh once and rejects prohibited UI', () => {
   const result = Bun.spawnSync(['/usr/bin/python3', join(import.meta.dir, 'fifth-visible-ready.test.py')], { stdout: 'pipe', stderr: 'pipe' })
+  expect(result.exitCode, result.stderr.toString()).toBe(0)
+})
+
+
+test('send interruption keeps its claim and never resends the same request', () => {
+  const result = Bun.spawnSync(['/usr/bin/python3', join(import.meta.dir, 'fifth-send-recovery.test.py')], { stdout: 'pipe', stderr: 'pipe' })
   expect(result.exitCode, result.stderr.toString()).toBe(0)
 })

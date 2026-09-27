@@ -218,7 +218,7 @@ describe('Codex App Server session', () => {
         releaseDrain()
         await expect(session.waitForReader()).rejects.toThrow()
         expect(pulls).toBe(3)
-        expect(observedChunks).toBe(1)
+        expect(observedChunks).toBe(2)
         expect(observedNotifications).toBe(failure === 'notification-callback' ? 1 : 0)
       } finally {
         releaseDrain()
@@ -1827,7 +1827,7 @@ describe('Codex App Server session', () => {
     expect(distinct.permissionEvidence.commandCount).toBe(2)
   })
 
-  test('item/completedの先行と重複turn/startedをprotocol違反にする', async () => {
+  test('先行itemは隔離し重複turn/startedはprotocol違反にする', async () => {
     const beforeStarted = mockTransport()
     const first = new CodexAppServerSession(beforeStarted.input, beforeStarted.stream)
     beforeStarted.emit({
@@ -1835,7 +1835,8 @@ describe('Codex App Server session', () => {
       params: { threadId: 'thread-order', turnId: 'turn-order', item: { type: 'reasoning' } },
     })
     beforeStarted.close()
-    await expect(first.waitForReader()).rejects.toThrow('before turn/started')
+    await first.waitForReader()
+    expect(first.takeTurnTerminal('thread-order', 'turn-order')).toBeNull()
 
     const duplicate = mockTransport()
     const second = new CodexAppServerSession(duplicate.input, duplicate.stream)
@@ -1849,6 +1850,80 @@ describe('Codex App Server session', () => {
     duplicate.emit(started)
     duplicate.close()
     await expect(second.waitForReader()).rejects.toThrow('repeated turn/started')
+  })
+
+  test('job244: 先行itemは正式開始後だけ通知し、終了後のstart/completedは混ぜない', async () => {
+    const transport = mockTransport()
+    const callbacks: string[] = []
+    const session = new CodexAppServerSession(transport.input, transport.stream, {
+      onNotification: n => callbacks.push(n.method),
+    })
+    const params = { threadId: 'thread', turnId: 'turn', item: {
+      type: 'agentMessage', id: 'answer', text: '正しい回答', phase: 'final_answer',
+    } }
+    transport.emit({ method: 'item/started', params })
+    transport.emit({ method: 'item/completed', params })
+    transport.emit({ method: 'turn/started', params: { threadId: 'thread', turn: {
+      id: 'turn', status: 'inProgress', itemsView: 'full', items: [], error: null,
+    } } })
+    transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+      id: 'turn', status: 'completed', itemsView: 'summary', items: [], error: null,
+    } } })
+    transport.emit({ method: 'item/started', params: { ...params, item: {
+      ...params.item, id: 'late', text: '混ぜない回答',
+    } } })
+    transport.emit({ method: 'item/completed', params: { ...params, item: {
+      ...params.item, id: 'late', text: '混ぜない回答',
+    } } })
+    transport.close()
+    await session.waitForReader()
+    expect(callbacks).toEqual(['turn/started', 'item/started', 'item/completed', 'turn/completed'])
+    const terminal = session.takeTurnTerminal('thread', 'turn')!
+    expect(JSON.stringify(terminal.turn.items)).toContain('正しい回答')
+    expect(JSON.stringify(terminal)).not.toContain('混ぜない回答')
+  })
+
+  test('job244: 未開始子turnの保留上限でも親は継続し、不完全な権限証拠は成功にしない', async () => {
+    for (const overflow of ['count', 'bytes']) {
+      const transport = mockTransport()
+      const session = new CodexAppServerSession(transport.input, transport.stream)
+      const childCount = overflow === 'count' ? 257 : 1
+      for (let i = 0; i < childCount; i++) transport.emit({ method: 'item/started', params: {
+        threadId: `child-${i}`, turnId: 'child-turn', item: {
+          type: 'reasoning', id: 'item', text: overflow === 'bytes' ? 'x'.repeat(1024 * 1024) : '',
+        },
+      } })
+      transport.emit({ method: 'turn/started', params: { threadId: 'parent', turn: {
+        id: 'parent-turn', status: 'inProgress', itemsView: 'full', items: [], error: null,
+      } } })
+      transport.emit({ method: 'turn/completed', params: { threadId: 'parent', turn: {
+        id: 'parent-turn', status: 'completed', itemsView: 'full',
+        items: [{ type: 'agentMessage', text: '親の正しい回答' }], error: null,
+      } } })
+      transport.close()
+      await session.waitForReader()
+      const terminal = session.takeTurnTerminal('parent', 'parent-turn')!
+      expect(appServerFinalMessage(terminal.turn)).toBe('親の正しい回答')
+      expect(terminal.permissionEvidence.unexpectedItemSeen).toBe(true)
+    }
+  })
+
+  test('job244: 開始未観測のterminalは保留回答を採用せず公式terminalを使う', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    transport.emit({ method: 'item/completed', params: { threadId: 'thread', turnId: 'turn',
+      item: { type: 'agentMessage', id: 'unconfirmed', text: '保留回答' },
+    } })
+    transport.emit({ method: 'turn/completed', params: { threadId: 'thread', turn: {
+      id: 'turn', status: 'completed', itemsView: 'full',
+      items: [{ type: 'agentMessage', text: '公式回答' }], error: null,
+    } } })
+    transport.close()
+    await session.waitForReader()
+    const terminal = session.takeTurnTerminal('thread', 'turn')!
+    expect(appServerFinalMessage(terminal.turn)).toBe('公式回答')
+    expect(terminal.permissionEvidence.unexpectedItemSeen).toBe(true)
+    expect(JSON.stringify(terminal)).not.toContain('保留回答')
   })
 
   test('terminal後はstarted済みのversion互換subAgentActivityだけを遅延完了として許可する', async () => {
@@ -2061,7 +2136,7 @@ describe('Codex App Server session', () => {
     await expect(session.waitForReader()).rejects.toThrow('reused a completed turn id')
   })
 
-  test('遅延itemは別thread・turn・item・typeと二重完了を受け入れない', async () => {
+  test('遅延itemの別thread・turn・item・typeと二重完了は結果へ混ぜない', async () => {
     for (const type of ['commandExecution', 'mcpToolCall', 'futureItem']) {
     for (const mismatch of ['thread', 'turn', 'item', 'type', 'duplicate']) {
       const transport = mockTransport()
@@ -2085,12 +2160,15 @@ describe('Codex App Server session', () => {
       transport.emit(completion)
       if (mismatch === 'duplicate') transport.emit(completion)
       transport.close()
-      await expect(session.waitForReader()).rejects.toThrow('before turn/started')
+      await session.waitForReader()
+      const terminal = session.takeTurnTerminal('thread', 'turn')!
+      expect(terminal.turn.items).toEqual([])
+      expect(terminal.permissionEvidence.firstCommand?.exitCode).toBe(type === 'commandExecution' ? null : undefined)
     }
     }
   })
 
-  test('terminal後の通常itemとstarted無しのsubAgentActivityは拒否する', async () => {
+  test('terminal後の通常itemとstarted無しのsubAgentActivityは隔離する', async () => {
     const lateCommand = mockTransport()
     const first = new CodexAppServerSession(lateCommand.input, lateCommand.stream)
     lateCommand.emit({ method: 'turn/started', params: { threadId: 'thread-late', turn: {
@@ -2106,7 +2184,8 @@ describe('Codex App Server session', () => {
       item: { type: 'commandExecution', id: 'late-command' },
     } })
     lateCommand.close()
-    await expect(first.waitForReader()).rejects.toThrow('before turn/started')
+    await first.waitForReader()
+    expect(first.takeTurnTerminal('thread-late', 'turn-late')).toBeNull()
 
     const missingStarted = mockTransport()
     const second = new CodexAppServerSession(missingStarted.input, missingStarted.stream)
@@ -2116,7 +2195,8 @@ describe('Codex App Server session', () => {
       },
     } })
     missingStarted.close()
-    await expect(second.waitForReader()).rejects.toThrow('before turn/started')
+    await second.waitForReader()
+    expect(second.takeTurnTerminal('thread-missing', 'turn-missing')).toBeNull()
   })
 
   test('遅延subAgentActivityは65turn超でもstarted済みの同一identityだけを許可する', async () => {
@@ -2287,7 +2367,7 @@ describe('Codex App Server session', () => {
       item: { type: 'agentMessage', id: 'after-terminal', text: '書き換えられてはいけない回答' },
     } })
     transport.close()
-    await expect(session.waitForReader()).rejects.toThrow('before turn/started')
+    await session.waitForReader()
     const terminal = session.takeTurnTerminal('thread-seal', 'turn-seal')
     expect(terminal).not.toBeNull()
     expect(appServerFinalMessage(terminal!.turn)).toBe('確定した回答')

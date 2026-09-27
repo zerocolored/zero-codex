@@ -99,6 +99,42 @@ function parseHerdrRuntimeIdentity(value: unknown): HerdrRuntimeIdentity {
   return identity
 }
 
+/**
+ * Herdrのpane入力系コマンド（pane run / send-text / send-keys）は成功してもstdoutへ
+ * 何も書かない。socket APIに対応するsuccess response typeが存在せず、CLIも封筒を出さない
+ * （herdr 0.9.1で実測）。これらにJSON封筒を要求すると `JSON.parse('')` で必ず落ちるため、
+ * 封筒を出すコマンドと出さないコマンドをここで1か所に固定する。
+ */
+const HERDR_ENVELOPELESS_COMMANDS = new Set([
+  'pane run',
+  'pane send-text',
+  'pane send-keys',
+])
+
+export function herdrCommandEmitsEnvelope(args: string[]): boolean {
+  return !HERDR_ENVELOPELESS_COMMANDS.has(args.slice(0, 2).join(' '))
+}
+
+/**
+ * 成功したHerdr CLI呼び出しのstdoutを封筒へ変換する。封筒を出さないコマンドの空出力だけを
+ * 空レコードとして受け入れ、それ以外は従来どおりJSON封筒を必須にする。
+ */
+export function parseHerdrCommandEnvelope(
+  args: string[],
+  stdout: string,
+  label = `Herdr ${args.slice(0, 2).join(' ')}`,
+): Record<string, unknown> {
+  if (!herdrCommandEmitsEnvelope(args) && stdout.trim() === '') return {}
+  let value: unknown
+  try { value = JSON.parse(stdout) } catch {
+    throw new Error(`${label}が不正なJSONを返しました`)
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label}の応答が不正です`)
+  }
+  return value as Record<string, unknown>
+}
+
 export function herdrRuntimeFingerprint(identity: HerdrRuntimeIdentity): string {
   return createHash('sha256').update(JSON.stringify(identity)).digest('hex')
 }

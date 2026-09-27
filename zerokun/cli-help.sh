@@ -21,6 +21,7 @@ zerochan_help() {
         '  zerochan auto-update on|off|status  自動更新の設定・確認' \
         '  zerochan unset slack-channel  チャンネル紐付けを解除' \
         '  zerochan cloud login|activate|status  クラウド引き継ぎ設定' \
+        '  zerochan fleet status     稼働状況ページへの送信設定を確認' \
         '' \
         'チャンネルは参加者全員が利用・書き込み可能です。個別登録は不要です。' \
         'DMの利用者設定（Slackアプリを紐付けたプロジェクトのフォルダで実行）:' \
@@ -79,6 +80,7 @@ zerochan_help() {
       printf '%s\n' '使い方: zerochan set slack-app' \
         'Slackアプリを対話形式で登録、または登録済みアプリから選択します。' \
         '登録は任意のフォルダで可能です。プロジェクト内で選択すると、そのプロジェクトへ紐付きます。' \
+        '別のアプリを選ぶと既存チャンネル設定を引き継いで接続先を変更します。旧アプリの履歴・作業は保持します。' \
         'トークンは非表示の端末入力で登録します。引数やチャットへ貼らないでください。' \
         '' '使い方: zerochan set slack-channel C0123456789' \
         '対象プロジェクトへ cd して、SlackのチャンネルID（名前ではありません）を指定します。' \
@@ -88,6 +90,16 @@ zerochan_help() {
       printf '%s\n' '使い方: zerochan unset slack-channel' \
         '現在のプロジェクトのチャンネル紐付けを解除します。アプリの登録情報は削除しません。' \
         '確認: zerochan status'
+      ;;
+    fleet)
+      printf '%s\n' '使い方: zerochan fleet identity|status|off|register <instance-id> <auth-app-id>' \
+        'identity: このPCの監視用IDを表示。PC名やフルパスは送信しません。' \
+        'register: 管理者が発行したinstance IDと、このPCの認証済みアプリIDを登録。' \
+        'status: 対象プロジェクトの送信設定を確認。off: 送信を無効化。' \
+        '通常は起動時に自動登録します。アプリごとのinstance ID発行・registerは不要です。' \
+        '認証は既存のcloud login設定を共有し、引き継ぎ機能を勝手に有効化しません。' \
+        '各PCでクラウド認証を一度設定してください。別PCへ認証ファイルをコピーしないでください。' \
+        '管理者向けの初回設定は docs/fleet-dashboard.md を参照してください。'
       ;;
     cloud)
       printf '%s\n' '使い方: zerochan cloud login|activate|status' \
