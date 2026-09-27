@@ -1884,6 +1884,7 @@ async function main(): Promise<void> {
     round: 1 | 2 | 3,
     evidence: string,
     reviewContext = context,
+    continuingInterruptedRequest = false,
   ): Promise<Record<string, unknown>> => {
     let requestDir: string | undefined
     let beforeSnapshot: AdvisorRepositorySnapshot | undefined
@@ -1975,7 +1976,11 @@ async function main(): Promise<void> {
         round,
       })
       chmodSync(requestDir, 0o700)
+      const continuationInput = continuingInterruptedRequest ? readAdvisorInputSnapshot(stateDir, context.jobId) : undefined
       const prompt = advisorPrompt(reviewContext, input, phase, round, evidence)
+        + (continuationInput && continuationInput.digest !== input.digest
+          ? `\n中断した元の相談の続行です。新しい依頼をレビュー済みとは扱わないでください。\n最新追記が対象の変更・取消・権限の制限を含む場合は、元の対象を調査せず、その変更をprimaryへ返してください。\n最新入力revision: ${continuationInput.revision} / digest: ${continuationInput.digest}\n最新入力(JSON): ${JSON.stringify(safeInput(continuationInput.transcript, 'continuation transcript', MAX_TRANSCRIPT_CHARS))}`
+          : '')
       writeFileSync(join(requestDir, 'prompt'), prompt, { flag: 'wx', mode: 0o600 })
       const helper = resolveFifthAdvisorHelper()
       const python = realpathSync('/usr/bin/python3')
@@ -2539,6 +2544,27 @@ async function main(): Promise<void> {
       contextDigest, phase, round, inputRevision: input.revision, inputDigest: input.digest,
       primaryEvidenceDigest: evidenceDigest,
     }, currentClaude)
+  const continuationUnavailable = (path: string, journal: Record<string, unknown>): boolean => {
+    try {
+      const raw = readOptionalPrivateFile(`${path}.continuation-unavailable`)
+      if (!raw || Buffer.byteLength(raw) > 4096) return false
+      const value = JSON.parse(raw)
+      return value.version === 1 && value.contextDigest === contextDigest
+        && value.recoveryId === journal.recoveryId
+        && value.requestDigest === journal.continuationRequestDigest
+    } catch { return false }
+  }
+  const readContinuationRequest = (path: string, journal: Record<string, unknown>): RoundRequest | null => {
+    try {
+      const raw = readOptionalPrivateFile(`${path}.request`)
+      if (!raw || Buffer.byteLength(raw) > 2 * 1024 * 1024
+        || journal.continuationRequestDigest !== createHash('sha256').update(raw).digest('hex')) return null
+      const request = roundRequestSchema.parse(JSON.parse(raw))
+      if (request.phase !== journal.phase || request.round !== journal.round
+        || request.inputRevision !== journal.inputRevision || request.inputDigest !== journal.inputDigest) return null
+      return request
+    } catch { return null }
+  }
   const recoveredRoundResult = (
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
     phase: 'investigation' | 'design' | 'review',
@@ -2629,13 +2655,21 @@ async function main(): Promise<void> {
       ? journal.native as Array<Record<string, unknown>>
       : []
     const allAdopted = allAdvisorAttemptsAdopted(recoveredNative, recoveredGrok, recoveredClaude)
-    const retryable = !allAdopted && Number(journal.retryCount ?? 0) < 3
+    const interruptedUnsentClaude = recoveredClaude.adopted !== true
+      && recoveredClaude.promptMayHaveBeenDelivered === false
+      && (recoveredClaude.failure as { cause?: string } | undefined)?.cause === 'interrupted'
+    const continuationFailed = continuationUnavailable(roundJournalPath(input, phase, round), journal)
+      || (typeof journal.continuationRequestDigest === 'string'
+        && !readContinuationRequest(roundJournalPath(input, phase, round), journal))
+    const retryable = !continuationFailed && !allAdopted && Number(journal.retryCount ?? 0) < 3
       && recordedClaude.containmentVerified === true
+      && (typeof journal.continuationRequestDigest !== 'string' || interruptedUnsentClaude)
     const latestInput = readAdvisorInputSnapshot(stateDir, context.jobId)
     const inputUnchanged = latestInput.revision === input.revision && latestInput.digest === input.digest
     return toolText({
       complete: allAdopted && inputUnchanged,
       restoredSavedResponses: allAdopted,
+      continuationUnavailable: continuationFailed,
       waitingForAdvisors: retryable,
       recoveredAfterInterruption: true,
       attemptsFinished: !retryable,
@@ -2674,12 +2708,33 @@ async function main(): Promise<void> {
     })
   }
 
-  server.registerTool('advisor_round', {
-    description: 'Durably start one ordered Three-Advisor attempt round. Unavailable outcomes are contained and journaled; call advisor_round_poll until the same binding reaches a terminal receipt.',
-    inputSchema: advisorRoundInputSchema,
-  }, async ({
+  const roundRequestSchema = z.object(advisorRoundInputSchema)
+  type RoundRequest = z.infer<typeof roundRequestSchema>
+  // Resume the original question from durable host input, not from a model's
+  // optional retry instruction. Only a contained, interrupted, unsent Claude
+  // slot qualifies. Terminal failures and delivery-possible slots stay final.
+  const continuationRequest = (
+    binding: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
+    phase: 'investigation' | 'design' | 'review', round: 1 | 2 | 3,
+  ): RoundRequest | null => {
+    if (!completeWorkflow) return null
+    const recovered = recoveredRoundResult(binding, phase, round, true)
+    if (!recovered) return null
+    const payload = resultPayload(recovered)
+    const claude = payload?.claude as Record<string, unknown> | undefined
+    if (!claude || claude.adopted === true || claude.containmentVerified !== true
+      || claude.promptMayHaveBeenDelivered !== false
+      || (claude.failure as { cause?: string } | undefined)?.cause !== 'interrupted') return null
+    const path = roundJournalPath(binding, phase, round)
+    try {
+      const journal = JSON.parse(readOptionalPrivateFile(path) ?? '{}')
+      if (continuationUnavailable(path, journal) || Number(journal.retryCount ?? 0) >= 3) return null
+      return readContinuationRequest(path, journal)
+    } catch { return null }
+  }
+  const startRound = async ({
     phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis, retryUnavailable, inputUpdateIsRecoveryOnly, reviewWorktrees,
-  }) => {
+  }: RoundRequest, automaticContinuation = false): Promise<ReturnType<typeof toolText>> => {
     if (phaseScope === 'prepare' && phase === 'review') {
       return toolText({ complete: false, reason: 'review is unavailable in the pre-edit process' }, true)
     }
@@ -2725,6 +2780,21 @@ async function main(): Promise<void> {
       'agentId' in value ? [value.agentId] : []
     ))
     const taskKey = roundTaskKey(phase, round, inputRevision, inputDigest)
+    if (!automaticContinuation && !activeRoundKeys.has(taskKey) && completeWorkflow) {
+      const ledger = unifiedRoundLedger(phase, round as 1 | 2)
+      if (!ledger.invalid && ledger.entries.length === 1) {
+        const prior = ledger.entries[0]!
+        const request = continuationRequest(prior.input, phase, round as 1 | 2 | 3)
+        if (request) {
+          const result = await continueRound(request)
+          if (resultPayload(result)?.pending === true) return result
+          // Return saved peer answers and the original binding even when
+          // preclaim continuation failed, just like startup/poll recovery.
+          const recovered = recoveredRoundResult(prior.input, phase, round as 1 | 2 | 3, true)
+          return recovered ?? result
+        }
+      }
+    }
     let retryResult: {
       grok: Array<Record<string, unknown>>, claude: Record<string, unknown>,
       native: Array<Record<string, unknown>>, evidenceDigest: string,
@@ -2734,6 +2804,22 @@ async function main(): Promise<void> {
       recoveryInputRevision?: number,
       recoveryInputDigest?: string,
     } | undefined
+    if (automaticContinuation) {
+      const recovered = resultPayload(recoveredRoundResult(
+        { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3, true,
+      )!)
+      const journal = JSON.parse(readOptionalPrivateFile(roundJournalPath(
+        { revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3,
+      )) ?? '{}')
+      retryResult = {
+        native: journal.native,
+        grok: recovered!.grok as Array<Record<string, unknown>>,
+        claude: recovered!.claude as Record<string, unknown>,
+        evidenceDigest: String(journal.primaryEvidenceDigest),
+        interruptionRecovery: true,
+        retryCount: Number(journal.retryCount ?? 0) + 1,
+      }
+    }
     let retryBackoff = false
     if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
       const binding = { revision: inputRevision, digest: inputDigest }
@@ -2970,7 +3056,8 @@ async function main(): Promise<void> {
           })
         }
         if (!investigation.entries[0]!.terminal
-          || journalSlotSummary(investigation.entries[0]!.terminal!).responsesObtained !== journalSlotSummary(investigation.entries[0]!.terminal!).total) {
+          || (investigation.entries[0]!.terminal!.recoveredAfterInterruption === true
+            && resultPayload(recoveredRoundResult(investigation.entries[0]!.input, 'investigation', 1, true) ?? toolText({}))?.attemptsFinished !== true)) {
           return toolText({
             complete: false,
             uncertain: true,
@@ -3181,7 +3268,7 @@ async function main(): Promise<void> {
     if (retryResult && retryResult.evidenceDigest !== evidenceDigest) {
       return toolText({ complete: false, reason: 'The advisor question changed; do not mix previous answers with different evidence.' }, true)
     }
-    if (retryResult && retryResult.claude.adopted !== true
+    if (!automaticContinuation && retryResult && retryResult.claude.adopted !== true
       && retryResult.claude.promptMayHaveBeenDelivered !== false
       && allAdvisorAttemptsAdopted(retryResult.native, retryResult.grok, { adopted: true })) {
       return toolText({ ...retryResult, complete: false, waitingForAdvisors: false,
@@ -3392,7 +3479,12 @@ async function main(): Promise<void> {
     let reviewOneRepositoryBaselineDigest: string | undefined
     const journalPath = join(currentJournalRoot, `${phase}-${round}.json`)
     const startedAt = Date.now()
+    const continuationRequestRaw = JSON.stringify({ phase, round, inputRevision, inputDigest,
+      primaryEvidence, nativeAdvisors, roundTwoBasis, reviewWorktrees })
+    atomicWritePrivateFile(`${journalPath}.request`, continuationRequestRaw)
+    const continuationRequestDigest = createHash('sha256').update(continuationRequestRaw).digest('hex')
     const requestedJournal = {
+      continuationRequestDigest,
       retryCount: retryResult?.retryCount ?? 0,
       interruptionRecovery: retryResult?.interruptionRecovery === true,
       version: THREE_ADVISOR_JOURNAL_VERSION,
@@ -3438,7 +3530,7 @@ async function main(): Promise<void> {
       if (!current || !(currentStatus === 'required-reviewer-failed'
         || (['completed', 'reviewers-completed'].includes(currentStatus)
           && journalSlotSummary(JSON.parse(current)).responsesObtained < journalSlotSummary(JSON.parse(current)).total)
-        || (currentStatus === 'stale-input' && inputUpdateIsRecoveryOnly === true))) {
+        || (currentStatus === 'stale-input' && (inputUpdateIsRecoveryOnly === true || automaticContinuation)))) {
         return toolText({ complete: false, waitingForAdvisors: true, reason: 'Advisor round changed before retry.' }, true)
       }
       if (retryResult.claude.adopted !== true
@@ -3495,7 +3587,8 @@ async function main(): Promise<void> {
       persistSlots()
     }
     const grokPromise = recoverAdvisorSlot({
-      advisor: 'grok', saved: retryResult?.grok?.[0]?.adopted === true ? retryResult.grok[0] : undefined,
+      advisor: 'grok', saved: automaticContinuation || retryResult?.grok?.[0]?.adopted === true ? retryResult?.grok?.[0] : undefined,
+      retryFinishedFailure: !automaticContinuation,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
       run: async () => (await runGrokPanel(boundInput, phase, round, evidence, reviewContext))[0]!,
       beforeRun: () => beginSlot('grok'),
@@ -3503,11 +3596,12 @@ async function main(): Promise<void> {
     }).then(result => [result])
     const claudePromise = recoverAdvisorSlot({
       advisor: 'claude',
+      retryFinishedFailure: !automaticContinuation,
       saved: retryResult?.claude?.adopted === true
         || retryResult?.claude?.promptMayHaveBeenDelivered !== false
         ? retryResult?.claude : undefined,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
-      run: () => runClaude(boundInput, phase, round as 1 | 2 | 3, evidence, reviewContext),
+      run: () => runClaude(boundInput, phase, round as 1 | 2 | 3, evidence, reviewContext, automaticContinuation),
       beforeRun: () => beginSlot('claude'),
       persist: result => persistSlot('claude', result),
       beforeRetry: result => retireAdvisorClaudeCleanupOutcome(stateDir, {
@@ -3637,6 +3731,7 @@ async function main(): Promise<void> {
     })
     atomicWritePrivateFile(`${journalPath}.responses`, responseCache)
     atomicWritePrivateFile(journalPath, `${JSON.stringify({
+      continuationRequestDigest,
       retryCount: retryResult?.retryCount ?? 0,
       interruptionRecovery: retryResult?.interruptionRecovery === true,
       version: THREE_ADVISOR_JOURNAL_VERSION,
@@ -3677,6 +3772,8 @@ async function main(): Promise<void> {
     })}\n`)
     return toolText({
       complete,
+      attemptsFinished: true,
+      ...(automaticContinuation ? { continuedOriginalRequest: true, scopeAssessmentRequired: !inputUnchanged } : {}),
       inputRevision: boundInput.revision,
       inputDigest: boundInput.digest,
       inputUnchanged,
@@ -3726,7 +3823,36 @@ async function main(): Promise<void> {
       inputRevision,
       inputDigest,
     })
-  })
+  }
+  const continueRound = async (request: RoundRequest): Promise<ReturnType<typeof toolText>> => {
+    let result: ReturnType<typeof toolText>
+    try { result = await startRound(request, true) } catch {
+      result = toolText({ complete: false, reason: 'interrupted advisor continuation could not start' }, true)
+    }
+    if (resultPayload(result)?.pending === true) return result
+    // Scope/snapshot/evidence validation can fail before taking the active
+    // claim. Remember that bounded attempt rather than redirecting every poll
+    // back into the same failing automatic continuation.
+    try {
+      const path = roundJournalPath({ revision: request.inputRevision, digest: request.inputDigest },
+        request.phase, request.round as 1 | 2 | 3)
+      const journal = JSON.parse(readOptionalPrivateFile(path) ?? '{}')
+      if (journal.recoveredAfterInterruption === true && typeof journal.recoveryId === 'string'
+        && typeof journal.continuationRequestDigest === 'string') {
+        atomicWritePrivateFile(`${path}.continuation-unavailable`, JSON.stringify({
+          version: 1, contextDigest, recoveryId: journal.recoveryId,
+          requestDigest: journal.continuationRequestDigest,
+        }))
+      }
+    } catch { /* Optional bookkeeping failure must not require another attempt. */ }
+    return toolText({ ...resultPayload(result), complete: false, attemptsFinished: true,
+      waitingForAdvisors: false, retryable: false, continuationUnavailable: true,
+      nextAction: '中断した相談の自動続行を終了しました。取得済み回答と不足理由を保持し、本作業を継続してください。' })
+  }
+  server.registerTool('advisor_round', {
+    description: 'Durably start one ordered Three-Advisor attempt round. Resume an interrupted unsent slot from its saved original question; never resend delivery-possible prompts. Poll the returned binding.',
+    inputSchema: advisorRoundInputSchema,
+  }, request => startRound(request))
 
   server.registerTool('advisor_round_poll', {
     description: 'Poll a previously started advisor attempt round. Keep exactly one poll outstanding and wait for its result; never batch, parallelize, or pre-queue duplicate polls. Pending polls are unlimited and never cancel, authenticate, or restart reviewers. When receiptRequired is returned, make exactly one next call with that exact receipt and the same binding.',
@@ -3768,6 +3894,10 @@ async function main(): Promise<void> {
           reason: `the attempt-wide ${phase} phase ledger is inconsistent`,
         }, true)
       }
+    }
+    if (!activeRoundKeys.has(taskKey)) {
+      const request = continuationRequest(binding, phase, boundRound)
+      if (request) await continueRound(request)
     }
     let task = roundTasks.get(taskKey)
     if (!task) {
@@ -3938,6 +4068,19 @@ async function main(): Promise<void> {
   })
 
   await server.connect(new StdioServerTransport())
+  // The parent may resume without issuing another advisor tool call. A
+  // retired unsent slot is still this same consultation, so continue it when
+  // its broker is recreated. Never require the LLM to remember a retry flag.
+  if (completeWorkflow) try {
+    for (const [phase, round] of [['investigation', 1], ['review', 1], ['review', 2]] as const) {
+      const ledger = unifiedRoundLedger(phase, round)
+      if (ledger.invalid || ledger.entries.length !== 1) continue
+      const request = continuationRequest(ledger.entries[0]!.input, phase, round)
+      if (request) { await continueRound(request); break }
+    }
+  } catch {
+    process.stderr.write('zerochan: interrupted advisor continuation unavailable; retaining saved outcomes.\n')
+  }
 }
 
 if (import.meta.main) {

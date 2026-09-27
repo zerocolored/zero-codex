@@ -2915,6 +2915,76 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 30_000)
 
+  test.each([false, true])('complete executorはadvisorを回収する前に親を終了せず入力受付も閉じない: interjection=%s', async interjection => {
+    const value = fixture('interjection-late-answer', true)
+    const acknowledge = value.hooks.acknowledgeInitialDispatch
+    const finish = value.hooks.finishTurn
+    let claimCreated = false
+    let finishObserved = false
+    let released = false
+    let inputOpenAtRelease = false
+    let finishedAfterRelease = false
+    let inputTimer: ReturnType<typeof setTimeout> | undefined
+    let stagedInterjection = false
+    let releaseTimer: ReturnType<typeof setTimeout> | undefined
+    value.hooks.acknowledgeInitialDispatch = args => {
+      acknowledge!(args)
+      if (claimCreated) return
+      claimCreated = true
+      const context = JSON.parse(readFileSync(join(value.state, 'advisor-context', value.job.id, `${args.executorNonce}.json`), 'utf8'))
+      const registration = JSON.parse(readFileSync(join(value.state, 'executors', `${value.job.id}.json`), 'utf8'))
+      const processNonce = dirname(registration.fingerprint.allow.path).split('/').at(-1)!
+      const input = readAdvisorInputSnapshot(value.state, value.job.id)
+      const root = join(value.state, 'advisor-journal', value.job.id, args.executorNonce)
+      mkdirSync(root, { recursive: true, mode: 0o700 })
+      const lock = join(root, 'active-round.lock')
+      writeFileSync(lock, JSON.stringify({ version: 2, jobId: value.job.id,
+        attemptNonce: args.executorNonce, processNonce,
+        contextDigest: createHash('sha256').update(JSON.stringify(context)).digest('hex'),
+        inputRevision: input.revision, inputDigest: input.digest, phase: 'investigation', round: 1,
+        brokerProcessId: process.pid }), { mode: 0o600 })
+      if (interjection) inputTimer = setTimeout(() => {
+        const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
+        if (!target) return
+        value.store.stageLiveInterjection(target, {
+          chatId: value.job.chatId, threadTs: value.job.threadTs,
+          messageId: '1800000000.000200', userId: 'UOTHER', task: 'いまどこまで進んでいますか？',
+        })
+        stagedInterjection = true
+      }, 250)
+      releaseTimer = setTimeout(() => {
+        inputOpenAtRelease = value.store.liveControlTarget(value.job.chatId, value.job.threadTs) !== null
+        released = true
+        rmSync(lock)
+      }, 1000)
+    }
+    value.hooks.finishTurn = args => {
+      if (!finishObserved) finishedAfterRelease = released
+      finishObserved = true
+      return finish!(args)
+    }
+    try {
+      const execution = executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: 'interjection-late-answer' },
+        liveControls: value.hooks,
+      })
+      if (interjection) {
+        const notification = await waitForInterjectionNotification(value.store)
+        value.store.markInterjectionNotificationDelivered(notification.id)
+      }
+      const result = await execution
+      expect(result.result).toBe('通常完了')
+      expect(finishedAfterRelease).toBe(true)
+      expect(inputOpenAtRelease).toBe(true)
+      expect(stagedInterjection).toBe(interjection)
+    } finally {
+      if (releaseTimer) clearTimeout(releaseTimer)
+      if (inputTimer) clearTimeout(inputTimer)
+      value.store.close()
+    }
+  }, 15_000)
+
   test('production write jobはhost工程を挟まずCodexのcomplete turnだけで完了する', async () => {
     const value = fixture(
       'normal',
