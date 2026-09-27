@@ -129,7 +129,8 @@ const CLAUDE_SEND_CODES = ['agent_not_ready', 'agent_blocked', 'empty_agent_prom
 type ClaudeSendCode = typeof CLAUDE_SEND_CODES[number]
 export type FifthAdvisorSendOutcome =
   | { kind: 'unconfirmed' }
-  | { kind: 'possibly-delivered'; marker: string; stateChangeSeq?: number; sendCode?: ClaudeSendCode }
+  | { kind: 'possibly-delivered'; marker: string; stateChangeSeq?: number; sendCode?: ClaudeSendCode;
+      sendStatus?: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed' }
 
 export function claudeSendRejectedBeforeInput(outcome: FifthAdvisorSendOutcome): boolean {
   return outcome.kind === 'possibly-delivered' && outcome.sendCode !== undefined
@@ -166,6 +167,9 @@ export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOu
     && CLAUDE_SEND_CODES.includes(returned[0]!.code as ClaudeSendCode)
     ? returned[0]!.code as ClaudeSendCode : undefined
   return { kind: 'possibly-delivered', marker: started[0]!.marker,
+    sendStatus: returned.length === 1 && returned[0]!.returncode === 0 ? 'accepted'
+      : returned.length === 1 && returned[0]!.returncode === 1 ? 'rejected'
+      : records.some(record => record.status === 'prompt-command-timeout-or-error') ? 'transport-error' : 'unconfirmed',
     ...(sendCode ? { sendCode } : {}),
     ...(Number.isSafeInteger(started[0]!.state_change_seq)
       ? { stateChangeSeq: Number(started[0]!.state_change_seq) } : {}),
@@ -1908,6 +1912,7 @@ async function main(): Promise<void> {
     let failureStage: 'startup' | 'send' | 'acquisition' = 'startup'
     let diagnosticFailure: ClaudeFailureDiagnostic | undefined
     let diagnosticSendCode: ClaudeSendCode | undefined
+    let diagnosticSendStatus: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed' = 'unconfirmed'
     let startupCode: ClaudeFailureDiagnostic['startupCode']
     const persistDiagnostic = () => {
       responseDiagnostic = saveClaudeResponseDiagnostic({
@@ -1921,6 +1926,7 @@ async function main(): Promise<void> {
         round,
         failure: diagnosticFailure,
         sendCode: diagnosticSendCode,
+        sendStatus: diagnosticSendStatus,
       })
     }
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
@@ -2032,10 +2038,11 @@ async function main(): Promise<void> {
       }
       {
         marker = sendOutcome.marker
-        if (sendOutcome.sendCode) {
-          diagnosticSendCode = sendOutcome.sendCode
-          persistDiagnostic()
-        }
+        diagnosticSendCode = sendOutcome.sendCode
+        diagnosticSendStatus = sendOutcome.sendStatus ?? 'unconfirmed'
+        // Record every transport outcome before acquisition can be interrupted.
+        // Accepted transport is not proof that Claude actually started.
+        persistDiagnostic()
         if (claudeSendRejectedBeforeInput(sendOutcome)) {
           throw new Error(`Claude prompt delivery failed: Herdr rejected input (${sendOutcome.sendCode})`)
         }
@@ -2526,11 +2533,12 @@ async function main(): Promise<void> {
   // Slot writes survive a main-process interruption independently. Never drop
   // an acquired answer merely because its peer was still working.
   const interruptedSlots = (input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
-    phase: 'investigation' | 'design' | 'review', round: 1 | 2 | 3, evidenceDigest: unknown) =>
+    phase: 'investigation' | 'design' | 'review', round: 1 | 2 | 3, evidenceDigest: unknown,
+    currentClaude?: Record<string, unknown>) =>
     readInterruptedAdvisorSlots(roundJournalPath(input, phase, round), {
       contextDigest, phase, round, inputRevision: input.revision, inputDigest: input.digest,
       primaryEvidenceDigest: evidenceDigest,
-    })
+    }, currentClaude)
   const recoveredRoundResult = (
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
     phase: 'investigation' | 'design' | 'review',
@@ -2571,7 +2579,8 @@ async function main(): Promise<void> {
     const recoveredGrokPerspectives = journal.version === THREE_ADVISOR_JOURNAL_VERSION
       ? [advisorPerspectiveForPhase(phase)]
       : ['solution', 'risk'] as const
-    const savedSlots = interruptedSlots(input, phase, round, journal.primaryEvidenceDigest)
+    const savedSlots = interruptedSlots(input, phase, round, journal.primaryEvidenceDigest,
+      journal.claude as Record<string, unknown> | undefined)
     const recoveredGrok = savedSlots.grok ?? recoveredGrokPerspectives.map(perspective => {
       const recorded = journalGrok.find(value => value.perspective === perspective) ?? {}
       const executionState = advisorExecutionState(recorded, 'grok')
@@ -2589,7 +2598,7 @@ async function main(): Promise<void> {
         reason: recorded.containmentVerified === true
           ? 'reviewer process ended at the verified interjection boundary'
           : 'reviewer containment remained an explicit bounded residual after interruption',
-        failure: { advisor: 'grok', cause: 'interrupted' },
+        failure: recorded.failure ?? { advisor: 'grok', cause: 'interrupted' },
       }
     })
     const recordedClaude = journal.claude && typeof journal.claude === 'object'
@@ -2610,7 +2619,8 @@ async function main(): Promise<void> {
       containmentVerified: recordedClaude.containmentVerified === true,
       containmentStatus: recordedClaude.containmentStatus,
       promptMayHaveBeenDelivered: recordedClaude.promptMayHaveBeenDelivered === true,
-      failure: { advisor: 'claude', cause: 'interrupted' },
+      failure: recordedClaude.failure ?? { advisor: 'claude', cause: 'interrupted' },
+      responseDiagnostic: recordedClaude.responseDiagnostic,
       reason: recordedClaude.containmentVerified === true
         ? 'ephemeral reviewer was closed at the verified interjection boundary'
         : 'ephemeral reviewer cleanup remained an explicit bounded residual after interruption',
@@ -2805,7 +2815,7 @@ async function main(): Promise<void> {
         if (recovered && journal && claude?.containmentVerified === true
           && Date.now() - Number(journal.finishedAt) >= 30_000) {
           retryResult ??= { native: journal.native as Array<Record<string, unknown>>,
-            grok: [], claude: { ...claude, failure: { advisor: 'claude', cause: 'interrupted' } },
+            grok: [], claude: { ...claude, failure: claude.failure ?? { advisor: 'claude', cause: 'interrupted' } },
             evidenceDigest: String(journal.primaryEvidenceDigest),
             interruptionRecovery: true,
             retryCount: Number(journal.retryCount ?? 0) + 1,
@@ -2821,7 +2831,7 @@ async function main(): Promise<void> {
           // Each external answer is persisted immediately, independently of
           // its peer. Reuse it after the old generation has been retired.
           Object.assign(retryResult, interruptedSlots({ revision: inputRevision, digest: inputDigest },
-            phase, round as 1 | 2 | 3, retryResult.evidenceDigest))
+            phase, round as 1 | 2 | 3, retryResult.evidenceDigest, claude))
         }
       }
       if (!retryResult) return toolText({ complete: false, waitingForAdvisors: true,
@@ -3450,6 +3460,10 @@ async function main(): Promise<void> {
         recoveryInputRevision: retryResult.recoveryInputRevision,
         recoveryInputDigest: retryResult.recoveryInputDigest,
         grok: JSON.parse(current).grok,
+        // A reused Claude slot may have only its terminal journal left. Keep
+        // it durable across the gap before per-slot cache writes resume.
+        ...(retryResult.claude.adopted === true || retryResult.claude.promptMayHaveBeenDelivered !== false
+          ? { claude: JSON.parse(current).claude } : {}),
       })}\n`)
     } else if (!createExclusivePrivateFile(journalPath, `${JSON.stringify(requestedJournal)}\n`)) {
       return toolText({
@@ -3461,22 +3475,30 @@ async function main(): Promise<void> {
     let retryRepositoryDigest: string | undefined
     try { retryRepositoryDigest = advisorRepositoryDigest(snapshotAdvisorRepository(projectLayout)) } catch {}
     const savedSlots: { grok?: Array<Record<string, unknown>>, claude?: Record<string, unknown> } = {
-      ...(retryResult?.grok?.[0]?.adopted === true ? { grok: retryResult.grok } : {}),
-      ...(retryResult?.claude?.adopted === true ? { claude: retryResult.claude } : {}),
+      ...(retryResult?.grok?.length ? { grok: retryResult.grok } : {}),
+      ...(retryResult?.claude ? { claude: retryResult.claude } : {}),
     }
-    const persistSlot = (kind: 'grok' | 'claude', value: Record<string, unknown>) => {
-      if (kind === 'grok') savedSlots.grok = [value]
-      else savedSlots.claude = value
+    const persistSlots = () => {
       atomicWritePrivateFile(`${journalPath}.slots`, JSON.stringify({
         contextDigest, phase, round, inputRevision: boundInput.revision,
         inputDigest: boundInput.digest, evidenceDigest, native: nativeEvidence,
         ...savedSlots,
       }))
     }
+    const persistSlot = (kind: 'grok' | 'claude', value: Record<string, unknown>) => {
+      if (kind === 'grok') savedSlots.grok = [value]
+      else savedSlots.claude = value
+      persistSlots()
+    }
+    const beginSlot = (kind: 'grok' | 'claude') => {
+      delete savedSlots[kind]
+      persistSlots()
+    }
     const grokPromise = recoverAdvisorSlot({
       advisor: 'grok', saved: retryResult?.grok?.[0]?.adopted === true ? retryResult.grok[0] : undefined,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
       run: async () => (await runGrokPanel(boundInput, phase, round, evidence, reviewContext))[0]!,
+      beforeRun: () => beginSlot('grok'),
       persist: result => persistSlot('grok', result),
     }).then(result => [result])
     const claudePromise = recoverAdvisorSlot({
@@ -3486,6 +3508,7 @@ async function main(): Promise<void> {
         ? retryResult?.claude : undefined,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
       run: () => runClaude(boundInput, phase, round as 1 | 2 | 3, evidence, reviewContext),
+      beforeRun: () => beginSlot('claude'),
       persist: result => persistSlot('claude', result),
       beforeRetry: result => retireAdvisorClaudeCleanupOutcome(stateDir, {
         jobId: context.jobId, attemptNonce: context.attemptNonce,
@@ -3557,9 +3580,10 @@ async function main(): Promise<void> {
         ? createHash('sha256').update(result.response).digest('hex')
         : undefined,
       reasonDigest: result.adopted !== true
-        ? createHash('sha256').update(String(result.reason ?? 'unavailable')).digest('hex')
+        ? result.reason === undefined && typeof result.reasonDigest === 'string'
+          ? result.reasonDigest : createHash('sha256').update(String(result.reason ?? 'unavailable')).digest('hex')
         : undefined,
-      failure: result.adopted !== true ? classifyAdvisorFailure('grok', String(result.reason ?? '')) : undefined,
+      failure: result.adopted !== true ? result.failure ?? classifyAdvisorFailure('grok', String(result.reason ?? '')) : undefined,
       authenticationRecoveryAttempted: result.authenticationRecoveryAttempted === true
         ? true
         : undefined,
@@ -3583,7 +3607,8 @@ async function main(): Promise<void> {
         : undefined,
       responseDiagnostic: claude.responseDiagnostic,
       reasonDigest: claude.adopted !== true
-        ? createHash('sha256').update(String(claude.reason ?? 'unavailable')).digest('hex')
+        ? claude.reason === undefined && typeof claude.reasonDigest === 'string'
+          ? claude.reasonDigest : createHash('sha256').update(String(claude.reason ?? 'unavailable')).digest('hex')
         : undefined,
       failure: claude.adopted !== true ? claude.failure ?? classifyAdvisorFailure('claude', String(claude.reason ?? '')) : undefined,
     }

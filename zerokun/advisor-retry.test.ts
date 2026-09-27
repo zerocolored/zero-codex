@@ -1,6 +1,34 @@
 import { expect, test } from 'bun:test'
 import { recoverAdvisorSlot } from './advisor-retry.ts'
 
+test.each(['claude', 'grok'] as const)('再試行の結果保存前に中断しても旧失敗を現行結果として残さない: %s', async advisor => {
+  let saved: { adopted: boolean; containmentVerified: boolean; promptMayHaveBeenDelivered: boolean; reason: string } | undefined
+  let calls = 0
+  const failure = { adopted: false, containmentVerified: true, promptMayHaveBeenDelivered: false, reason: 'startup failure' }
+  await expect(recoverAdvisorSlot({ advisor,
+    beforeRun: () => { saved = undefined },
+    run: async () => {
+      expect(saved).toBeUndefined()
+      if (++calls === 2) throw new Error('interrupted after new process/prompt started')
+      return failure
+    },
+    persist: result => { saved = result },
+    beforeRetry: () => { expect(saved).toBe(failure) },
+    wait: async () => {},
+  })).rejects.toThrow('interrupted after new process/prompt started')
+  expect(calls).toBe(2)
+  expect(saved).toBeUndefined()
+})
+
+test('再試行開始の永続化に失敗した場合は新しいprocessを起動しない', async () => {
+  let calls = 0
+  await expect(recoverAdvisorSlot({ advisor: 'claude',
+    beforeRun: () => { throw new Error('cannot invalidate saved slot') },
+    run: async () => { calls++; return { adopted: true } }, persist: () => {},
+  })).rejects.toThrow('cannot invalidate saved slot')
+  expect(calls).toBe(0)
+})
+
 test('一時失敗だけ30秒・60秒後に再取得し結果を毎回保存する', async () => {
   let calls = 0
   const waits: number[] = [], saved: boolean[] = []

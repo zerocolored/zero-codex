@@ -14,6 +14,7 @@ import {
 } from 'fs'
 import { basename, dirname, join } from 'path'
 import { readAdvisorInputSnapshot } from './advisor-input.ts'
+import { ADVISOR_FAILURE_CAUSES } from './advisor-availability.ts'
 import {
   advisorRepositoryDigest,
   resolveAdvisorProjectLayout,
@@ -41,8 +42,16 @@ const NONCE = /^[0-9a-f]{32}$/
 const REVISION = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/
 const ROUND = /^(investigation|design|review)-([123])\.json$/
 
-/** Per-slot answers survive retirement independently of the final response cache. */
-export function readInterruptedAdvisorSlots(journalPath: string, journal: Record<string, unknown>) {
+function sameClaudeAttempt(slot: any, current?: Record<string, unknown>): boolean {
+  return slot?.adopted === true || !current?.workspaceCreationAttempted
+    || current.cleanupVerified === true && current.containmentVerified === true
+      && current.cleanupReceiptDigest === slot?.cleanupReceiptDigest
+      && current.promptMayHaveBeenDelivered === slot?.promptMayHaveBeenDelivered
+}
+
+/** Finished slot outcomes survive retirement independently of their peers. */
+export function readInterruptedAdvisorSlots(journalPath: string, journal: Record<string, unknown>,
+  currentClaude = journal.status === 'requested' ? undefined : journal.claude as Record<string, unknown> | undefined) {
   const result: { grok?: Array<Record<string, unknown>>, claude?: Record<string, unknown> } = {}
   try {
     const raw = readOptionalBoundedOwnerOnlyRegularFile(`${journalPath}.slots`, 2 * 1024 * 1024)
@@ -51,20 +60,29 @@ export function readInterruptedAdvisorSlots(journalPath: string, journal: Record
     if (slots.contextDigest !== journal.contextDigest || slots.phase !== journal.phase
       || slots.round !== journal.round || slots.inputRevision !== journal.inputRevision
       || slots.inputDigest !== journal.inputDigest || slots.evidenceDigest !== journal.primaryEvidenceDigest) return result
-    const valid = (slot: any) => slot?.adopted === true && slot.containmentVerified === true
-      && typeof slot.response === 'string' && slot.response.trim().length > 0
-    if (Array.isArray(slots.grok) && slots.grok.length === 1 && valid(slots.grok[0])
+    const valid = (slot: any, advisor: 'grok' | 'claude') => slot?.containmentVerified === true
+      && (slot.adopted === true
+        ? typeof slot.response === 'string' && slot.response.trim().length > 0
+        : slot.adopted === false && slot.failure?.advisor === advisor
+          && ADVISOR_FAILURE_CAUSES.includes(slot.failure.cause)
+          && (typeof slot.reason === 'string' && slot.reason.trim().length > 0
+            || typeof slot.reasonDigest === 'string' && SHA256.test(slot.reasonDigest)))
+    if (Array.isArray(slots.grok) && slots.grok.length === 1 && valid(slots.grok[0], 'grok')
       && validThreeAdvisorGrokAttempts(slots.grok.map(savedAdvisorSlotJournal), journal.phase as AdvisorPhase)) {
       result.grok = slots.grok
     }
-    if (valid(slots.claude) && validTerminalClaudeAttempt(savedAdvisorSlotJournal(slots.claude))) result.claude = slots.claude
+    if (sameClaudeAttempt(slots.claude, currentClaude) && valid(slots.claude, 'claude')
+      && validTerminalClaudeAttempt(savedAdvisorSlotJournal(slots.claude))) result.claude = slots.claude
   } catch { /* Optional cache failure is not evidence of an acquired answer. */ }
   return result
 }
 
 export function savedAdvisorSlotJournal(slot: Record<string, unknown>): Record<string, unknown> {
-  const { response, reason: _reason, reasonDigest: _reasonDigest, failure: _failure, ...metadata } = slot
-  return { ...metadata, responseDigest: createHash('sha256').update(String(response)).digest('hex') }
+  const { response, reason, reasonDigest, responseDigest: _responseDigest, failure, ...metadata } = slot
+  return slot.adopted === true
+    ? { ...metadata, responseDigest: sha256(String(response)) }
+    : { ...metadata, failure, reasonDigest: typeof reason === 'string' && reason.trim()
+      ? sha256(reason) : reasonDigest }
 }
 
 type FileSnapshot = {
@@ -706,8 +724,7 @@ export function finalizeRetiredAdvisorRounds(
           if (hasUnverifiedClaudeResidual && !options.allowUnverifiedClaudeResidual) {
             throw new Error('retired advisor Claude workspace cleanup is still pending')
           }
-          const saved = readInterruptedAdvisorSlots(journalPath, journal)
-          const claude = saved.claude ? savedAdvisorSlotJournal(saved.claude) : recoveredClaudeJournal(
+          const currentClaude = recoveredClaudeJournal(
             cleanupOutcome,
             hasUnverifiedClaudeResidual
               ? {
@@ -717,6 +734,11 @@ export function finalizeRetiredAdvisorRounds(
                 }
               : null,
           )
+          const saved = readInterruptedAdvisorSlots(journalPath, journal, currentClaude)
+          const retainedClaude = journal.claude as Record<string, unknown> | undefined
+          const claude = saved.claude ? savedAdvisorSlotJournal(saved.claude)
+            : retainedClaude?.adopted === false && validTerminalClaudeAttempt(retainedClaude)
+              && sameClaudeAttempt(retainedClaude, currentClaude) ? retainedClaude : currentClaude
           const terminalStatus = inputUnchanged && repositoryUnchanged
             ? 'required-reviewer-failed'
             : 'stale-input'
