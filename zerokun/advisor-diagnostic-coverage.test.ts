@@ -103,12 +103,13 @@ test('診断ログを無視しても未取得の実回答を成功に変えな�
   expect(coverage?.phases[0]).toMatchObject({ responsesObtained: 2, startUnconfirmed: 1 })
 })
 
-test('構造化した認証・課金・通信診断をjournalからSlack通知まで保持する', async () => {
-  for (const cause of ['authentication', 'billing', 'configuration', 'auth-check', 'network'] as const) {
+test.each([false, true])('中断復旧=%sでも元の失敗原因をjournalからSlack通知まで保持する', async recoveredAfterInterruption => {
+  for (const cause of ['authentication', 'billing', 'configuration', 'auth-check', 'network', 'startup', 'timeout', 'response'] as const) {
     const f = fixture()
     const observations = await f.observe(true)
     const failure = { advisor: 'claude' as const, cause }
     writeFileSync(f.journalPath, JSON.stringify({ ...f.journal, status: 'required-reviewer-failed',
+      recoveredAfterInterruption,
       claude: { ...f.journal.claude, adopted: false, executionState: 'unavailable-before-start',
         workspaceCreationAttempted: false, promptMayHaveBeenDelivered: false,
         freshEphemeral: false, cleanupVerified: false, cleanupStatus: undefined,

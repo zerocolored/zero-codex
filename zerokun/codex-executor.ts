@@ -1887,6 +1887,9 @@ export function collectHostAdvisorCoverage(
           const entry = advisor === 'claude' ? journal.claude
             : advisor === 'grok' ? (journal.grok as unknown[])[0] : (journal.native as unknown[])[0]
           const failure = (entry as Record<string, unknown>)?.failure as AdvisorFailure | undefined
+          if (failure?.advisor === advisor && ADVISOR_FAILURE_CAUSES.includes(failure.cause)) {
+            return { advisor, cause: failure.cause }
+          }
           if (journal.recoveredAfterInterruption === true && advisor !== 'codex') {
             return { advisor, cause: 'interrupted' as const }
           }

@@ -93,6 +93,7 @@ export function saveClaudeResponseDiagnostic(options: {
   failure?: ClaudeFailureDiagnostic
   sendCode?: 'agent_not_ready' | 'agent_blocked' | 'empty_agent_prompt'
     | 'agent_prompt_stalled' | 'agent_prompt_failed' | 'timeout' | 'unknown-error'
+  sendStatus?: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed'
 }): ClaudeDiagnosticReceipt {
   try {
     if (!/^[a-f0-9]{32}$/.test(options.attempt)) return { status: 'unavailable' }
@@ -129,6 +130,7 @@ export function saveClaudeResponseDiagnostic(options: {
       round: options.round,
       failure: options.failure,
       sendCode: options.sendCode,
+      sendStatus: options.sendStatus,
       reads: options.reads.slice(-3),
       transcript: {
         available: options.transcript !== undefined,
