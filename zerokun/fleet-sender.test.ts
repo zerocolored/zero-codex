@@ -12,7 +12,8 @@ const env: Env = { ASSETS: { fetch: async () => new Response('page') }, SUPABASE
   SUPABASE_PUBLISHABLE_KEY: 'public', FLEET_SPACE_ID: 'space', FLEET_GATEWAY_SECRET: 'gateway', FLEET_SLACK_TEAM_ID: 'TTEST' }
 const facts = () => ({ running: 0, queued: 0, limited: false, approval: false, deferred: false, lastAcceptedAt: null, summary: null, summaryAt: null })
 const snapshot = projectFleetStatus(facts(), { project: 'example', slackConnected: false, runnerHealthy: false, paused: false })
-function fixture() {
+function fixture(settings: Partial<Env> = {}) {
+  const workerEnv = { ...env, ...settings }
   const state = mkdtempSync(join(tmpdir(), 'fleet-sender-'))
   const calls: { url: string; body: any; auth: string | null }[] = []
   let team = 'TTEST', app = 'ATEST', user = 'UTEST', failReport = 0, now = Date.now()
@@ -33,8 +34,9 @@ function fixture() {
     if (path.endsWith('_sender_report')) return Response.json({ status: failReport || 200 })
     throw Error('unexpected endpoint')
   }) as typeof fetch)
-  const fetcher = ((url: any, init: any) => worker.fetch(new Request(String(url), init), env)) as typeof fetch
+  const fetcher = ((url: any, init: any) => worker.fetch(new Request(String(url), init), workerEnv)) as typeof fetch
   return { state, calls, worker, fetcher, now: () => now, advance() { now += 1000000 },
+    setTeams(x: string) { workerEnv.FLEET_SLACK_TEAM_IDS = x },
     setTeam(x: string) { team = x }, setApp(x: string) { app = x }, setUser(x: string) { user = x }, fail(x: number) { failReport = x },
     cleanup() { rmSync(state, { recursive: true, force: true }) } }
 }
@@ -99,4 +101,51 @@ test('network failure has bounded timeout and never follows redirects carrying c
     await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, fetcher).begin()).rejects.toThrow('offline')
     expect(existsSync(join(f.state, 'fleet-sender-credential.json'))).toBe(false)
   } finally { f.cleanup() }
+})
+
+for (const team of ['TTEST', 'TSECOND']) test(`authorized workspace ${team} enrolls and reports`, async () => {
+  const f = fixture({ FLEET_SLACK_TEAM_IDS: ' TTEST, TSECOND, TTEST ' })
+  f.setTeam(team)
+  try {
+    const client = new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher)
+    const started = await client.begin(); await client.send(started.generation, 1, snapshot)
+    expect(f.calls.find(c => c.url.endsWith('_sender_enroll'))!.body.p_team).toBe(team)
+    expect(f.calls.some(c => c.url.endsWith('_sender_report'))).toBe(true)
+  } finally { f.cleanup() }
+})
+for (const team of ['TTEST', 'TUNKNOWN']) test(`explicit workspace list excludes ${team} without legacy fallback`, async () => {
+  const f = fixture({ FLEET_SLACK_TEAM_IDS: 'TSECOND' }); f.setTeam(team)
+  try {
+    await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()).rejects.toThrow('登録対象外')
+    expect(f.calls.some(c => c.url.endsWith('/bots.info') || c.url.endsWith('_sender_enroll'))).toBe(false)
+  } finally { f.cleanup() }
+})
+for (const list of ['', ' ', 'TTEST,', ',TTEST', 'TTEST,,TSECOND', 'TTEST,*', 'TTEST,tsecond', 'TTEST TSECOND']) {
+  test(`invalid workspace list ${JSON.stringify(list)} fails closed`, async () => {
+    const f = fixture({ FLEET_SLACK_TEAM_IDS: list })
+    try {
+      await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()).rejects.toThrow('登録設定が未完了')
+      expect(f.calls).toHaveLength(0)
+    } finally { f.cleanup() }
+  })
+}
+for (const mismatch of ['app', 'user']) test(`second allowed workspace still verifies ${mismatch}`, async () => {
+  const f = fixture({ FLEET_SLACK_TEAM_IDS: 'TTEST,TSECOND' }); f.setTeam('TSECOND')
+  if (mismatch === 'app') f.setApp('AOTHER'); else f.setUser('UOTHER')
+  try {
+    await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()).rejects.toThrow('認証IDが一致しません')
+    expect(f.calls.some(c => c.url.endsWith('_sender_enroll'))).toBe(false)
+  } finally { f.cleanup() }
+})
+test('running gateway recovers after its workspace is authorized without PC restart', async () => {
+  const f = fixture(); f.setTeam('TSECOND')
+  const reporter = startConfiguredFleet(f.state, 'ATEST', '/private/project', facts, () => true,
+    { home: f.state, botToken, fetcher: f.fetcher, now: f.now, warn: () => {} })!
+  try {
+    await reporter.tick()
+    expect(f.calls.some(c => c.url.endsWith('_sender_enroll'))).toBe(false)
+    f.setTeams('TTEST,TSECOND'); f.advance(); await reporter.tick()
+    expect(f.calls.find(c => c.url.endsWith('_sender_enroll'))!.body.p_team).toBe('TSECOND')
+    expect(f.calls.some(c => c.url.endsWith('_sender_report'))).toBe(true)
+  } finally { reporter.stop(); f.cleanup() }
 })

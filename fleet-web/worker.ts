@@ -6,6 +6,7 @@ export interface Env {
   FLEET_SPACE_ID: string
   FLEET_GATEWAY_SECRET: string
   FLEET_SLACK_TEAM_ID?: string
+  FLEET_SLACK_TEAM_IDS?: string
 }
 const cookieName = '__Host-zero-fleet'
 const security = {
