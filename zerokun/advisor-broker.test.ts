@@ -685,8 +685,8 @@ async function brokerFixture(options: {
           arguments: {
             phase,
             round,
-            inputRevision: selectedInput.revision,
-            inputDigest: selectedInput.digest,
+            inputRevision: payload.inputRevision ?? selectedInput.revision,
+            inputDigest: payload.inputDigest ?? selectedInput.digest,
             ...(typeof payload.receipt === 'string' ? { receipt: payload.receipt } : {}),
           },
         })
@@ -762,6 +762,8 @@ function armRetiredRequestedRound(
     phase?: 'investigation' | 'review'
     nativeResponse?: string
     retainedClaude?: Record<string, unknown>
+    continuation?: boolean
+    continuationReviewWorktrees?: string[]
   } = {},
 ): { journalPath: string; lockPath: string } {
   const version = options.version ?? 8
@@ -779,7 +781,15 @@ function armRetiredRequestedRound(
   const brokerProcessId = 4242
   const journalPath = join(revisionRoot, `${phase}-1.json`)
   const lockPath = join(fixture.journalRoot, 'active-round.lock')
+  const requestRaw = JSON.stringify({ phase, round: 1,
+    ...(options.continuationReviewWorktrees ? { reviewWorktrees: options.continuationReviewWorktrees } : {}),
+    inputRevision: input.revision, inputDigest: input.digest,
+    primaryEvidence: 'bounded primary evidence',
+    nativeAdvisors: [{ perspective, agentId: `/root/native-${perspective}`, response: options.nativeResponse }],
+  })
+  if (options.continuation) writeFileSync(`${journalPath}.request`, requestRaw, { mode: 0o600 })
   writeFileSync(journalPath, `${JSON.stringify({
+    ...(options.continuation ? { continuationRequestDigest: createHash('sha256').update(requestRaw).digest('hex') } : {}),
     version,
     ...(version === 9 ? { advisorPolicy: 'three-phase-specific-conditional-final-v2' } : {}),
     status: 'requested',
@@ -2889,6 +2899,127 @@ print('review complete')
     } finally {
       await fixture.close()
     }
+  }, 15_000)
+
+  test('終了済みの初期設計欠員は最終レビューの試行を妨げない', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true })
+    try {
+      const initial = await fixture.call('investigation', 'revision-two', 'unavailable')
+      expect(initial.payload).toMatchObject({ attemptsFinished: true, allAdopted: false })
+      const review = await fixture.call('review', 'revision-two', 'unavailable')
+      expect(review.payload).toMatchObject({ attemptsFinished: true, phase: 'review' })
+      expect(review.payload.claude).toMatchObject({ attempted: true })
+    } finally { await fixture.close() }
+  }, 20_000)
+
+  test.each(['round', 'poll', 'new-input', 'startup'] as const)('送信前中断はモデルのretry指定なしでClaudeだけ続行する: %s', async entry => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const nativeResponse = `solution response\n${nativeAdvisorMarker(fixture.nonce,
+        fixture.revisionTwo.revision, fixture.revisionTwo.digest, 'investigation', 1, 'solution')}`
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo,
+        { version: 9, nativeResponse, continuation: true, persistClaudeOutcome: false })
+      expect(finalizeRetiredAdvisorRounds(fixture.state)).toEqual({ finalized: 1 })
+      const binding = entry === 'new-input' ? fixture.stageRevision('続けてください。最新制約を守ってください') : fixture.revisionTwo
+      await fixture.restart()
+      if (entry === 'startup') {
+        const deadline = Date.now() + 15_000
+        while (JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count === 0 && Date.now() < deadline) await Bun.sleep(50)
+        expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(1)
+      }
+      let result = entry === 'poll'
+        ? await fixture.poll('investigation', binding)
+        : await fixture.call('investigation', binding)
+      while (result.payload.pending === true) result = await fixture.poll('investigation', fixture.revisionTwo)
+      expect(result.payload.claude).toMatchObject({ adopted: true, executionState: 'response-obtained' })
+      expect(result.payload.grok).toMatchObject([{ adopted: false, executionState: 'start-unconfirmed' }])
+      if (entry === 'new-input') expect(result.payload).toMatchObject({ staleInput: true, inputRevision: fixture.revisionTwo.revision })
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(1)
+      if (entry === 'new-input') expect(state.prompt).toContain('最新制約を守ってください')
+      expect(state.close_count).toBe(1)
+      expect(JSON.parse(readFileSync(armed.journalPath, 'utf8')).retryCount).toBe(1)
+      await fixture.restart()
+      await fixture.call('investigation', binding)
+      expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(1)
+    } finally { await fixture.close() }
+  }, 30_000)
+
+  test.each(['finished-failure', 'delivery-possible', 'changed-request', 'saved-peer'] as const)('自動続行の送信境界と取得済み回答を保持する: %s', async scenario => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const nativeResponse = `solution response\n${nativeAdvisorMarker(fixture.nonce,
+        fixture.revisionTwo.revision, fixture.revisionTwo.digest, 'investigation', 1, 'solution')}`
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo,
+        { version: 9, nativeResponse, continuation: true, persistClaudeOutcome: false })
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+      const savedPeer = { adopted: true, attempted: true, perspective: 'solution',
+        executionState: 'response-obtained', containmentVerified: true,
+        processId: 42424, response: 'keep exact acquired answer' }
+      if (scenario === 'finished-failure' || scenario === 'saved-peer') {
+        writeFileSync(`${armed.journalPath}.slots`, JSON.stringify({
+          contextDigest: fixture.contextDigest, phase: 'investigation', round: 1,
+          inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
+          evidenceDigest: journal.primaryEvidenceDigest,
+          ...(scenario === 'saved-peer' ? { grok: [savedPeer] } : { claude: {
+            attempted: true, adopted: false, required: true, lifecycle: 'ephemeral-v2',
+            executionState: 'unavailable-before-start', workspaceCreationAttempted: false,
+            freshEphemeral: false, cleanupVerified: false, containmentVerified: true,
+            promptMayHaveBeenDelivered: false, reason: 'real preflight failure',
+            failure: { advisor: 'claude', cause: 'startup' },
+          } }),
+        }), { mode: 0o600 })
+      }
+      if (scenario === 'delivery-possible') persistAdvisorClaudeCleanupOutcome(fixture.state, {
+        jobId: fixture.jobId, attemptNonce: fixture.nonce,
+        inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
+        inputDigestPrefix: fixture.revisionTwo.digest.slice(0, 16), phase: 'investigation', round: 1,
+        workspaceCreationAttempted: true, freshEphemeral: true, cleanupVerified: true,
+        cleanupStatus: 'closed-and-verified', cleanupReceiptDigest: 'c'.repeat(64),
+        promptMayHaveBeenDelivered: true,
+      })
+      finalizeRetiredAdvisorRounds(fixture.state)
+      if (scenario === 'changed-request') writeFileSync(`${armed.journalPath}.request`, '{}', { mode: 0o600 })
+      await fixture.restart()
+      const result = await fixture.call('investigation', 'revision-two')
+      expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count)
+        .toBe(scenario === 'saved-peer' ? 1 : 0)
+      if (scenario === 'saved-peer') expect(result.payload.grok).toEqual([savedPeer])
+      if (scenario === 'finished-failure') expect(result.payload.claude.failure.cause).toBe('startup')
+      if (scenario === 'delivery-possible') expect(result.payload.claude.promptMayHaveBeenDelivered).toBe(true)
+    } finally { await fixture.close() }
+  }, 30_000)
+
+  test.each([false, true])('続行の起動前検証失敗をpollと再起動でループしない: startup=%s', async startup => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const nativeResponse = `solution response\n${nativeAdvisorMarker(fixture.nonce,
+        fixture.revisionTwo.revision, fixture.revisionTwo.digest, 'investigation', 1, 'solution')}`
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo,
+        { version: 9, nativeResponse, continuation: true, continuationReviewWorktrees: ['missing-worktree'] })
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+      const savedPeer = { adopted: true, attempted: true, perspective: 'solution',
+        executionState: 'response-obtained', containmentVerified: true,
+        processId: 42424, response: 'saved peer answer even when continuation fails' }
+      writeFileSync(`${armed.journalPath}.slots`, JSON.stringify({
+        contextDigest: fixture.contextDigest, phase: 'investigation', round: 1,
+        inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
+        evidenceDigest: journal.primaryEvidenceDigest, grok: [savedPeer],
+      }), { mode: 0o600 })
+      finalizeRetiredAdvisorRounds(fixture.state)
+      if (startup) await fixture.restart()
+      for (let n = 0; n < 2; n++) {
+        const result = await fixture.call('investigation', 'revision-two')
+        expect(result.payload).toMatchObject({ continuationUnavailable: true, attemptsFinished: true, retryable: false,
+          phase: 'investigation', round: 1, inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest })
+        expect(result.payload.native).toBeArray()
+        expect(result.payload.grok).toEqual([savedPeer])
+        expect(result.payload.claude.failure.cause).toBe('interrupted')
+        expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(0)
+        expect(existsSync(`${armed.journalPath}.continuation-unavailable`)).toBe(true)
+        await fixture.restart()
+      }
+    } finally { await fixture.close() }
   }, 15_000)
 
   test('初回中断で回答cacheがなくても未取得外部枠を再起動して3回答揃える', async () => {

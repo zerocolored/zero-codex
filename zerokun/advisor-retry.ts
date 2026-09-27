@@ -11,6 +11,7 @@ export type RetryableAdvisorResult = {
 /** Retry a finished, contained failure, never an in-flight or adopted slot. */
 export async function recoverAdvisorSlot<T extends RetryableAdvisorResult>(options: {
   advisor: 'grok' | 'claude'
+  retryFinishedFailure?: boolean
   run: () => Promise<T>
   saved?: T
   persist: (result: T) => void
@@ -26,7 +27,7 @@ export async function recoverAdvisorSlot<T extends RetryableAdvisorResult>(optio
   }
   let result = options.saved ?? await run()
   options.persist(result)
-  for (let retry = 0; retry < 2 && result.adopted !== true; retry += 1) {
+  for (let retry = 0; options.retryFinishedFailure !== false && retry < 2 && result.adopted !== true; retry += 1) {
     const { cause } = result.failure ?? classifyAdvisorFailure(options.advisor, String(result.reason ?? ''))
     // Authentication and configuration need repair, not blind repeated calls.
     if ((options.advisor === 'claude' && result.promptMayHaveBeenDelivered !== false)
