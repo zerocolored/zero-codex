@@ -73,6 +73,7 @@ import {
   finalizeRetiredAdvisorRounds,
   persistAdvisorClaudeCleanupOutcome,
   recordAdvisorExecutorRetirement,
+  readInterruptedAdvisorSlots,
 } from './advisor-round-recovery.ts'
 
 const temporaryDirs: string[] = []
@@ -760,6 +761,7 @@ function armRetiredRequestedRound(
     version?: 8 | 9
     phase?: 'investigation' | 'review'
     nativeResponse?: string
+    retainedClaude?: Record<string, unknown>
   } = {},
 ): { journalPath: string; lockPath: string } {
   const version = options.version ?? 8
@@ -813,6 +815,7 @@ function armRetiredRequestedRound(
         responseTransportDigest: '4'.repeat(64),
       }],
     startedAt,
+    ...(options.retainedClaude ? { claude: options.retainedClaude } : {}),
   })}\n`, { mode: 0o600 })
   writeFileSync(lockPath, `${JSON.stringify({
     version: 2,
@@ -983,15 +986,19 @@ describe('advisor broker boundaries', () => {
   test('prompt-startedのexact markerだけを送達可能として分類する', () => {
     const marker = 'REQUEST_MARKER=' + 'A'.repeat(32)
     expect(parseFifthAdvisorSendOutcome(JSON.stringify({ status: 'prompt-started', marker, state_change_seq: 42 })))
-      .toEqual({ kind: 'possibly-delivered', marker, stateChangeSeq: 42 })
+      .toEqual({ kind: 'possibly-delivered', marker, stateChangeSeq: 42, sendStatus: 'unconfirmed' })
     expect(parseFifthAdvisorSendOutcome([
       JSON.stringify({ status: 'prompt-started', marker }),
       JSON.stringify({ status: 'prompt-command-rejected' }),
-    ].join('\n'))).toEqual({ kind: 'possibly-delivered', marker })
+    ].join('\n'))).toEqual({ kind: 'possibly-delivered', marker, sendStatus: 'unconfirmed' })
     expect(parseFifthAdvisorSendOutcome([
       JSON.stringify({ status: 'prompt-started', marker }),
       JSON.stringify({ status: 'prompt-command-timeout-or-error' }),
-    ].join('\n'))).toEqual({ kind: 'possibly-delivered', marker })
+    ].join('\n'))).toEqual({ kind: 'possibly-delivered', marker, sendStatus: 'transport-error' })
+    expect(parseFifthAdvisorSendOutcome([
+      JSON.stringify({ status: 'prompt-started', marker }),
+      JSON.stringify({ status: 'prompt-command-returned', returncode: 0 }),
+    ].join('\n'))).toEqual({ kind: 'possibly-delivered', marker, sendStatus: 'accepted' })
     expect(parseFifthAdvisorSendOutcome(
       JSON.stringify({ status: 'prompt-command-rejected' }),
     )).toEqual({ kind: 'unconfirmed' })
@@ -1011,6 +1018,7 @@ describe('advisor broker boundaries', () => {
         JSON.stringify({ status: 'prompt-started', marker }),
         JSON.stringify({ status: 'prompt-command-returned', returncode: 1, code }),
       ].join('\n'))
+      expect(outcome).toMatchObject({ sendStatus: 'rejected', sendCode: code })
       expect(claudeSendRejectedBeforeInput(outcome)).toBe(['agent_not_ready', 'agent_blocked', 'empty_agent_prompt'].includes(code))
     }
   })
@@ -1583,6 +1591,7 @@ print('review complete')
       const diagnostic = JSON.parse(readFileSync(join(directory, name), 'utf8'))
       expect(diagnostic.failure).toMatchObject({ stage: 'send', cause: 'startup' })
       expect(diagnostic.sendCode).toBe('agent_not_ready')
+      expect(diagnostic.sendStatus).toBe('rejected')
       expect(JSON.stringify(first.payload)).not.toContain('private rejection detail')
     } finally { await fixture.close() }
   }, 30_000)
@@ -2945,6 +2954,137 @@ print('review complete')
         .toMatchObject({ retryCount: 1, interruptionRecovery: true,
           recoveryInputRevision: recoveryInput.revision, recoveryInputDigest: recoveryInput.digest })
       expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(1)
+    } finally { await fixture.close() }
+  }, 20_000)
+
+  test.each(['startup', 'timeout', 'response'] as const)('終了済みClaude失敗を中断・再起動後にも保持する: %s', async cause => {
+    const fixture = await brokerFixture()
+    try {
+      const nativeResponse = `solution response\n${nativeAdvisorMarker(fixture.nonce,
+        fixture.revisionTwo.revision, fixture.revisionTwo.digest, 'investigation', 1, 'solution')}`
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo, { version: 9, nativeResponse })
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+      const claude = { attempted: true, adopted: false, required: true, lifecycle: 'ephemeral-v2',
+        workspaceCreationAttempted: true, freshEphemeral: true, cleanupVerified: true,
+        cleanupStatus: 'closed-and-verified', cleanupReceiptDigest: 'a'.repeat(64),
+        containmentVerified: true, promptMayHaveBeenDelivered: true,
+        executionState: 'start-unconfirmed', reason: `original ${cause} failure`,
+        failure: { advisor: 'claude', cause },
+        responseDiagnostic: { status: 'saved', path: 'diagnostic.json', sha256: 'd'.repeat(64) } }
+      const slots = { contextDigest: fixture.contextDigest, phase: 'investigation', round: 1,
+        inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
+        evidenceDigest: journal.primaryEvidenceDigest, claude }
+      for (const invalid of [
+        { ...slots, evidenceDigest: 'f'.repeat(64) },
+        { ...slots, claude: { ...claude, cleanupVerified: false } },
+        { ...slots, claude: { ...claude, containmentStatus: 'owned-process-still-live' } },
+        { ...slots, claude: { ...claude, failure: { advisor: 'claude', cause: 'untrusted' } } },
+      ]) {
+        writeFileSync(`${armed.journalPath}.slots`, JSON.stringify(invalid), { mode: 0o600 })
+        expect(readInterruptedAdvisorSlots(armed.journalPath, journal).claude).toBeUndefined()
+      }
+      writeFileSync(`${armed.journalPath}.slots`, JSON.stringify(slots), { mode: 0o600 })
+      finalizeRetiredAdvisorRounds(fixture.state)
+      const terminal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+      expect(terminal.claude.failure).toEqual(claude.failure)
+      expect(terminal.claude.responseDigest).toBeUndefined()
+      expect(terminal.claude.responseDiagnostic).toEqual(claude.responseDiagnostic)
+      expect(terminal.claude.reasonDigest).toMatch(/^[a-f0-9]{64}$/)
+      expect(terminal.claude.reason).toBeUndefined()
+      // The terminal journal remains authoritative even if its optional slot
+      // cache is no longer available after retirement.
+      if (cause === 'timeout') rmSync(`${armed.journalPath}.slots`)
+      const coverage = collectHostAdvisorCoverage(fixture.state, fixture.jobId, fixture.nonce, true)
+      expect(coverage?.phases[0]?.failures).toContainEqual({ advisor: 'claude', cause })
+      for (let restart = 0; restart < 2; restart++) {
+        const result = await fixture.poll('investigation', 'revision-two')
+        expect(result.payload.claude).toMatchObject({ adopted: false, failure: claude.failure,
+          responseDiagnostic: claude.responseDiagnostic })
+        expect(result.payload.slotSummary.responsesObtained).toBe(1)
+        await fixture.restart()
+      }
+      if (cause === 'timeout') {
+        const current = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+        current.startedAt -= 31_000
+        current.finishedAt -= 31_000
+        const raw = JSON.stringify(current)
+        writeFileSync(armed.journalPath, raw, { mode: 0o600 })
+        const receiptPath = join(fixture.state, 'advisor-retirement', fixture.jobId, fixture.nonce, `${fixture.nonce}.json`)
+        const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'))
+        receipt.terminalJournalDigest = createHash('sha256').update(raw).digest('hex')
+        writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 })
+        const retried = await fixture.call('investigation', 'revision-two', 'adopted', 1,
+          { retryUnavailable: true, inputUpdateIsRecoveryOnly: true })
+        expect(retried.payload.claude, JSON.stringify(retried.payload)).toMatchObject({ adopted: false, failure: claude.failure,
+          responseDiagnostic: claude.responseDiagnostic })
+        const after = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+        expect(after.claude.reasonDigest).toBe(terminal.claude.reasonDigest)
+      }
+    } finally { await fixture.close() }
+  }, 20_000)
+
+  test('再試行開始journalの保存直後に中断しても再利用Claudeの原因と診断を保持する', async () => {
+    const fixture = await brokerFixture()
+    try {
+      const retainedClaude = { attempted: true, adopted: false, required: true, lifecycle: 'ephemeral-v2',
+        workspaceCreationAttempted: true, freshEphemeral: true, cleanupVerified: true,
+        cleanupStatus: 'closed-and-verified', cleanupReceiptDigest: 'c'.repeat(64),
+        containmentVerified: true, promptMayHaveBeenDelivered: true,
+        executionState: 'start-unconfirmed', reasonDigest: 'e'.repeat(64),
+        failure: { advisor: 'claude', cause: 'timeout' },
+        responseDiagnostic: { status: 'saved', path: 'diagnostic.json', sha256: 'd'.repeat(64) } }
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo,
+        { version: 9, persistClaudeOutcome: false, retainedClaude })
+      persistAdvisorClaudeCleanupOutcome(fixture.state, {
+        jobId: fixture.jobId, attemptNonce: fixture.nonce,
+        inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
+        inputDigestPrefix: fixture.revisionTwo.digest.slice(0, 16), phase: 'investigation', round: 1,
+        workspaceCreationAttempted: true, freshEphemeral: true, cleanupVerified: true,
+        cleanupStatus: 'closed-and-verified', cleanupReceiptDigest: 'c'.repeat(64),
+        promptMayHaveBeenDelivered: true,
+      })
+      expect(existsSync(`${armed.journalPath}.slots`)).toBe(false)
+      finalizeRetiredAdvisorRounds(fixture.state)
+      expect(JSON.parse(readFileSync(armed.journalPath, 'utf8')).claude).toEqual(retainedClaude)
+      await fixture.restart()
+      expect((await fixture.poll('investigation', 'revision-two')).payload.claude)
+        .toMatchObject({ failure: retainedClaude.failure, responseDiagnostic: retainedClaude.responseDiagnostic })
+    } finally { await fixture.close() }
+  }, 20_000)
+
+  test('古い未送達失敗cacheが再試行の送達可能性を上書きしない', async () => {
+    const fixture = await brokerFixture()
+    try {
+      const armed = armRetiredRequestedRound(fixture, fixture.revisionTwo,
+        { version: 9, persistClaudeOutcome: false })
+      const journal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+      writeFileSync(`${armed.journalPath}.slots`, JSON.stringify({
+        contextDigest: fixture.contextDigest, phase: 'investigation', round: 1,
+        inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
+        evidenceDigest: journal.primaryEvidenceDigest,
+        claude: { attempted: true, adopted: false, required: true, lifecycle: 'ephemeral-v2',
+          workspaceCreationAttempted: false, freshEphemeral: false, cleanupVerified: false,
+          containmentVerified: true, promptMayHaveBeenDelivered: false,
+          executionState: 'unavailable-before-start', reason: 'first startup failed',
+          failure: { advisor: 'claude', cause: 'startup' } },
+      }), { mode: 0o600 })
+      persistAdvisorClaudeCleanupOutcome(fixture.state, {
+        jobId: fixture.jobId, attemptNonce: fixture.nonce,
+        inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest,
+        inputDigestPrefix: fixture.revisionTwo.digest.slice(0, 16), phase: 'investigation', round: 1,
+        workspaceCreationAttempted: true, freshEphemeral: true, cleanupVerified: true,
+        cleanupStatus: 'closed-and-verified', cleanupReceiptDigest: 'c'.repeat(64),
+        promptMayHaveBeenDelivered: true,
+      })
+      finalizeRetiredAdvisorRounds(fixture.state)
+      const terminal = JSON.parse(readFileSync(armed.journalPath, 'utf8'))
+      expect(terminal.claude).toMatchObject({ promptMayHaveBeenDelivered: true,
+        cleanupReceiptDigest: 'c'.repeat(64), adopted: false })
+      expect(readInterruptedAdvisorSlots(armed.journalPath, terminal).claude).toBeUndefined()
+      await fixture.restart()
+      const polled = await fixture.poll('investigation', 'revision-two')
+      expect(polled.payload.claude).toMatchObject({ promptMayHaveBeenDelivered: true,
+        cleanupReceiptDigest: 'c'.repeat(64), failure: { cause: 'interrupted' } })
     } finally { await fixture.close() }
   }, 20_000)
 
