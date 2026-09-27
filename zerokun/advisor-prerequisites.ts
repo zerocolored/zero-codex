@@ -1,5 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
+import { releaseRuntimeRelative } from './runtime-release.ts'
+
 import {
   closeSync,
   constants,
@@ -21,7 +23,7 @@ import {
 } from './install-grok-reviewer.ts'
 import { resolveCodexExecutableDetails } from './standalone-codex.ts'
 
-export const DEDICATED_GROK_RUNTIME_RELATIVE_PATH = '.zerokun/runtime/grok-reviewer' as const
+export const DEDICATED_GROK_RUNTIME_RELATIVE_PATH = `${releaseRuntimeRelative()}/grok-reviewer`
 export const DEDICATED_GROK_RELATIVE_PATH = `${DEDICATED_GROK_RUNTIME_RELATIVE_PATH}/bin/grok` as const
 export const DEDICATED_GROK_OAUTH_RELATIVE_PATH = `${DEDICATED_GROK_RUNTIME_RELATIVE_PATH}/bin/grok-login-oauth` as const
 

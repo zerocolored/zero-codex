@@ -31,7 +31,7 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
   NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED \
   SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE AWS_CA_BUNDLE \
   GLOBAL_AGENT_HTTP_PROXY npm_config_proxy npm_config_https_proxy
-unset BUN_OPTIONS BUN_CONFIG_PRELOAD NODE_OPTIONS
+unset BUN_OPTIONS BUN_CONFIG_PRELOAD NODE_OPTIONS ZEROKUN_UPDATE_SCOPE
 unset ZEROKUN_UPDATE_TESTING ZEROKUN_SLACK_IDENTITY_TEST_APP_ID \
   ZEROKUN_SETUP_TEST_STOP_PROBE
 command -v bun >/dev/null 2>&1 || { echo "❌ bun が見つかりません。" >&2; exit 1; }
@@ -150,6 +150,14 @@ if [ "$LAUNCH_MODE" = "update" ]; then
   fi
   exec bun --config=/dev/null --no-env-file \
     "$REPO_DIR/zerokun/update.ts"
+fi
+
+# Resolve once to a physical release. Children keep this version even while a
+# different app activates a newer one. Preserve the command basename on dispatch.
+PINNED_REPO="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR")" || exit 1
+if [ "$PINNED_REPO" != "$REPO_DIR" ]; then
+  PINNED_COMMAND="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR" "$INVOKED_AS")" || exit 1
+  exec /bin/bash "$PINNED_COMMAND" "$@"
 fi
 
 # stop is global to this installed Slack App and intentionally does not select,
@@ -306,7 +314,7 @@ if [ "$AUTHORIZED_UPDATE_RESTART" != "1" ] && [ "$LAUNCH_MODE" != "managed-start
     assert-idle "$STATE_DIR" || exit 1
 fi
 
-if [ -f "$STATE_DIR/update-transaction.json" ] && [ "$AUTHORIZED_UPDATE_RESTART" != "1" ]; then
+if { [ -f "$STATE_DIR/update-transaction.json" ] || [ -f "$STATE_DIR/release-transaction.json" ]; } && [ "$AUTHORIZED_UPDATE_RESTART" != "1" ]; then
   echo "⚠️  未完了の自己更新を検出しました。旧版へ復旧します。" >&2
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/update.ts" --recover-only
 fi

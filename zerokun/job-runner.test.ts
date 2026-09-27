@@ -8814,6 +8814,38 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
+  test('instance release barrier pauses only its own real queue; waiting intent does not block a peer', async () => {
+    const stores = [makeStore(), makeStore()]
+    const jobs = stores.map(store => store.enqueue(input({ writeEnabled: true })).job)
+    const journals = stores.map(store => join(dirname(store.dbPath), 'update-transaction.json'))
+    const barrier = join(dirname(stores[0]!.dbPath), 'release-transaction.json')
+    writeFileSync(barrier, '{}', { mode: 0o600 })
+    writeFileSync(join(dirname(stores[1]!.dbPath), 'release-target.json'), '{}', { mode: 0o600 })
+    const controls = stores.map(() => new AbortController())
+    const executions = [0, 0]
+    const runners = stores.map((store, index) => runQueuedJobs({
+      store, maxJobsPerSession: 5, pollMs: 5, executorStagesResult: true,
+      shouldPause: () => updateTransactionPending(journals[index]!),
+      signal: controls[index]!.signal,
+      executor: async current => {
+        executions[index]! += 1
+        return stageFixtureExecution(store, current, '01941f65-7e97-7f41-8968-c2e676dd68b8', 'done')
+      },
+    }))
+    try {
+      for (let n = 0; n < 100 && executions[1] === 0; n++) await Bun.sleep(5)
+      expect(executions).toEqual([0, 1])
+      expect(stores[0]!.get(jobs[0]!.id)?.status).toBe('queued')
+      rmSync(barrier)
+      for (let n = 0; n < 100 && executions[0] === 0; n++) await Bun.sleep(5)
+      expect(executions).toEqual([1, 1])
+    } finally {
+      controls.forEach(control => control.abort())
+      await Promise.all(runners)
+      stores.forEach(store => store.close())
+    }
+  })
+
   test('pre-check直後にupdate barrierが現れてもclaimを副作用前に戻す', async () => {
     const store = makeStore()
     const queued = store.enqueue(input({ writeEnabled: true })).job

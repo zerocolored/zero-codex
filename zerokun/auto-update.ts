@@ -4,7 +4,8 @@ import { prepareManagedStateRoot } from './managed-path.ts'
 import { atomicWritePrivateFile, readOptionalPrivateFile } from './safe-file.ts'
 import { slackAppRegistryRoot } from './slack-app-registry.ts'
 import { tryAcquireProcessLock, releaseProcessLock, inspectProcessLock } from './process-lock.ts'
-import { preflightRepositories } from './update.ts'
+import { readReleaseTransaction } from './independent-update.ts'
+import { preflightRepositories, remoteIndependentHead } from './update.ts'
 
 export const AUTO_UPDATE_INTERVAL_MS = 30 * 60_000
 export function automaticUpdateRecipient(allowFrom: string[]): string {
@@ -26,6 +27,7 @@ export function configureAutomaticUpdates(root: string, enabled: boolean): void 
 /** Short-lived shared scheduler lock, never the updater's own mutation lock. */
 export async function checkAutomaticUpdate(options: {
   root: string
+  independent?: boolean
   stateDir: string
   now?: () => number
   detect: () => Promise<string | undefined>
@@ -33,14 +35,15 @@ export async function checkAutomaticUpdate(options: {
   recoverPending?: (stateDir: string) => void
 }): Promise<string> {
   prepareManagedStateRoot(options.root)
-  const lockPath = join(options.root, 'auto-update-check.lock')
+  const scope = options.independent ? prepareManagedStateRoot(options.stateDir) : options.root
+  const lockPath = join(scope, 'auto-update-check.lock')
   const lock = tryAcquireProcessLock(lockPath)
   if (!lock.acquired) return 'busy'
   try {
     if (!automaticUpdatesEnabled(options.root)) return 'disabled'
-    const updating = inspectProcessLock(join(options.root, 'shared-update.lock'))
+    const updating = inspectProcessLock(options.independent ? join(scope, 'update.lock', 'pid') : join(options.root, 'shared-update.lock'))
     if (updating.status === 'active' || updating.status === 'unknown') return 'busy'
-    const path = join(options.root, 'auto-update-check.json')
+    const path = join(scope, 'auto-update-check.json')
     const saved: RecordState = readJson(path)
     const now = (options.now ?? Date.now)()
     if (saved.pendingState && saved.pendingId) {
@@ -69,17 +72,17 @@ export async function checkAutomaticUpdate(options: {
     atomicWritePrivateFile(path, JSON.stringify({ checkedAt: now, failedSha: saved.failedSha }) + '\n')
     // Fetch writes refs too. Serialize it with manual updates/registration,
     // releasing this lease before launching the updater that acquires it itself.
-    const mutationPath = join(options.root, 'shared-update.lock')
+    const mutationPath = join(scope, options.independent ? 'release-check.lock' : 'shared-update.lock')
     const mutation = tryAcquireProcessLock(mutationPath)
     if (!mutation.acquired) return 'busy'
     let sha: string | undefined
-    try { sha = await options.detect() }
+    try { sha = (options.independent ? readReleaseTransaction(options.stateDir)?.candidate.sha : undefined) ?? await options.detect() }
     finally { releaseProcessLock(mutationPath, mutation.lease) }
     if (!sha) return 'current'
     if (sha === saved.failedSha) return 'failed-version'
     // The preference may have changed during the bounded network request.
     if (!automaticUpdatesEnabled(options.root)) return 'disabled'
-    const beforeEnqueue = inspectProcessLock(join(options.root, 'shared-update.lock'))
+    const beforeEnqueue = inspectProcessLock(options.independent ? join(scope, 'update.lock', 'pid') : join(options.root, 'shared-update.lock'))
     if (beforeEnqueue.status === 'active' || beforeEnqueue.status === 'unknown') return 'busy'
     const result = await options.enqueue(sha)
     atomicWritePrivateFile(path, JSON.stringify({
@@ -93,7 +96,8 @@ export async function checkAutomaticUpdate(options: {
 }
 
 /** Fetch metadata only; the existing updater owns validation and checkout changes. */
-export async function remoteUpdateHead(repo: string): Promise<string | undefined> {
+export async function remoteUpdateHead(repo: string, independent = false): Promise<string | undefined> {
+  if (independent) return remoteIndependentHead(repo)
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 30_000)
   try {

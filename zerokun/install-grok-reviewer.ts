@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { releaseRuntimeRelative } from './runtime-release.ts'
 
 import {
   chmodSync,
@@ -21,7 +22,7 @@ import { dirname, join } from 'path'
 import { createHash, randomUUID } from 'crypto'
 import { resolveCodexExecutableDetails } from './standalone-codex.ts'
 
-const ZEROKUN_GROK_RUNTIME_RELATIVE_PATH = ['.zerokun', 'runtime', 'grok-reviewer'] as const
+const ZEROKUN_GROK_RUNTIME_RELATIVE_PATH = [...releaseRuntimeRelative().split('/'), 'grok-reviewer']
 
 function ensurePrivateDirectory(path: string): string {
   mkdirSync(path, { recursive: true, mode: 0o700 })
@@ -266,7 +267,10 @@ export function installGrokReviewer(homeInput = homedir()): string {
   const grokPhysical = resolveCodexExecutableDetails(grok).physical
 
   const zerokunRoot = ensurePrivateDirectory(join(home, '.zerokun'))
-  const runtimeRoot = ensurePrivateDirectory(join(zerokunRoot, 'runtime'))
+  let runtimeRoot = zerokunRoot
+  for (const part of releaseRuntimeRelative().split('/').slice(1)) {
+    runtimeRoot = ensurePrivateDirectory(join(runtimeRoot, part))
+  }
   const reviewerRoot = ensurePrivateDirectory(join(runtimeRoot, 'grok-reviewer'))
   const bin = ensurePrivateDirectory(join(reviewerRoot, 'bin'))
   const sourceRoot = join(import.meta.dir, 'grok-reviewer')

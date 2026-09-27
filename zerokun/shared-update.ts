@@ -1,3 +1,4 @@
+import { readRuntimeRelease } from './runtime-release.ts'
 import { join } from 'path'
 import { unlinkSync } from 'fs'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
@@ -5,6 +6,8 @@ import { homedir } from 'os'
 import { listRegisteredSlackApps, slackAppRegistryRoot } from './slack-app-registry.ts'
 
 export function assertSharedSourceReady(stateDir: string, home = homedir()): void {
+  // A pinned release is independent of the historical mutable checkout.
+  if (readRuntimeRelease(stateDir, home)) return
   const owner = readOptionalBoundedOwnerOnlyRegularFile(join(slackAppRegistryRoot(home), 'shared-update-owner.json'), 8192)
   if (owner === null) return
   const record = JSON.parse(owner)

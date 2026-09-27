@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { releaseRuntimeRelative } from './runtime-release.ts'
 
 import { randomUUID } from 'crypto'
 import {
@@ -113,7 +114,10 @@ function sourceHelper(): { content: Buffer; path: string } {
 export function installFifthAdvisorHelper(homeInput = homedir()): string {
   const home = realpathSync(homeInput)
   const zerokunDirectory = ensureOwnedDirectory(join(home, '.zerokun'), true)
-  const runtimeDirectory = ensureOwnedDirectory(join(zerokunDirectory, 'runtime'), true)
+  let runtimeDirectory = zerokunDirectory
+  for (const part of releaseRuntimeRelative().split('/').slice(1)) {
+    runtimeDirectory = ensureOwnedDirectory(join(runtimeDirectory, part), true)
+  }
   const target = join(runtimeDirectory, 'fifth-advisor.py')
   const source = sourceHelper()
   atomicOwnerExecutable(target, source.content)
@@ -128,7 +132,7 @@ export function resolveFifthAdvisorHelper(homeInput = homedir()): string {
     || !owned(zerokunMetadata) || (zerokunMetadata.mode & 0o077) !== 0) {
     throw new Error(`unsafe fifth-advisor directory: ${zerokunDirectory}`)
   }
-  const runtimeDirectory = join(zerokunDirectory, 'runtime')
+  const runtimeDirectory = join(home, releaseRuntimeRelative())
   const runtimeMetadata = lstatSync(runtimeDirectory)
   if (!runtimeMetadata.isDirectory() || runtimeMetadata.isSymbolicLink()
     || !owned(runtimeMetadata) || (runtimeMetadata.mode & 0o077) !== 0) {

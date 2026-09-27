@@ -1,5 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
+import { resolveUpdateController } from './update-controller.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
   chmodSync,
@@ -119,6 +120,7 @@ interface RequestOptions {
 interface WorkerOptions {
   stateDir?: string
   updaterPath?: string
+  usePublishedController?: boolean
   executeUpdater?: () => Promise<number>
   notify?: (request: UpdateRequest, text: string) => Promise<void>
   maxNotifyAttempts?: number
@@ -953,12 +955,14 @@ export async function runUpdateWorker(
     ...(request.outcome!.notificationSkippedAt ? { notificationSkipped: true } : {}),
   }
   const logPath = join(dir, 'update-request.log')
-  const updaterPath = options.updaterPath
+  const updaterPath = options.updaterPath && options.usePublishedController
+    ? resolveUpdateController(options.updaterPath) : options.updaterPath
   const legacyCutover = options.legacyCutover
     ?? process.env.ZEROKUN_LEGACY_CUTOVER === '1'
   const projectDir = request.projectDir ?? options.projectDir ?? process.env.ZEROKUN_PROJECT_DIR
   const updaterEnvironment = {
     ...buildUpdaterEnvironment(),
+    ZEROKUN_UPDATE_SCOPE: request.source === 'automatic' ? 'instance' : 'all',
     ZEROKUN_JOB_DB: resolveZeroJobDatabasePath(dir),
     ZEROKUN_STATE_DIR: dir,
     ZEROKUN_LEGACY_CUTOVER: legacyCutover ? '1' : '0',
@@ -1075,6 +1079,7 @@ async function runCli(): Promise<void> {
     throw new Error('--legacy-cutoverは0または1で指定してください')
   }
   const result = await runUpdateWorker(args[1], {
+    usePublishedController: true,
     stateDir: optionValue(args, '--state-dir'),
     updaterPath: optionValue(args, '--updater'),
     legacyCutover: legacyCutover === undefined ? undefined : legacyCutover === '1',

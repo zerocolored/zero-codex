@@ -229,6 +229,12 @@ async function runLauncher(
       'if [[ "$*" == *process-lock.ts*stop-owner* ]] && [ "${FAKE_PROCESS_LOCK_STOP_FAIL:-0}" = "1" ]; then',
       '  exit 3',
       'fi',
+      'if [[ "$*" == *runtime-release.ts* ]]; then',
+      // These launcher fixtures have no release pin; runtime selection stays
+      // on the real launcher checkout. Pin dispatch has its own integration tests.
+      `  printf '%s\\n' ${JSON.stringify(dirname(LAUNCHER))}`,
+      '  exit 0',
+      'fi',
       'if [[ "$*" == *project-selection.ts* || "$*" == *project-app-state.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',

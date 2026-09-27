@@ -7,6 +7,7 @@ import {
   existsSync,
   chmodSync,
   copyFileSync,
+  appendFileSync,
   fchmodSync,
   fstatSync,
   mkdirSync,
@@ -39,6 +40,7 @@ import {
   type ProcessLockLease,
   releaseProcessLock,
   tryAcquireProcessLock,
+  inspectProcessLock,
   undelegateProcessLock,
   encodeProcessLockDelegate,
 } from './process-lock.ts'
@@ -96,6 +98,8 @@ import { requireTmuxCommand, runTmuxCommand, tmuxSessionExists } from './tmux-co
 import { listRegisteredSlackApps, slackAppRegistryRoot } from './slack-app-registry.ts'
 import { coordinateSharedUpdate, type UpdatePeer } from './shared-update.ts'
 import { installUpdateRequestRuntime } from './update-runtime.ts'
+import { readRuntimeRelease, runtimeRootForState, validateRelease, installLegacyCommands, type RuntimeRelease } from './runtime-release.ts'
+import { activateIndependentTargets, collectIndependentTargets, readReleaseTransaction, type ReleaseTarget, type ActivationHooks } from './independent-update.ts'
 
 interface Repository {
   label: string
@@ -3551,7 +3555,7 @@ async function mainSingle(testing = false, argv = process.argv.slice(2), selecte
 }
 
 /** One source checkout is shared by the registered Slack apps on this Mac. */
-async function main(testing = false, argv = process.argv.slice(2)): Promise<void> {
+async function legacyMain(testing = false, argv = process.argv.slice(2)): Promise<void> {
   for (const flag of ['--skip-tests', '--no-restart']) {
     if (!testing && argv.includes(flag)) fail(`${flag} はテスト環境でのみ使用できます`)
   }
@@ -3695,8 +3699,265 @@ async function main(testing = false, argv = process.argv.slice(2)): Promise<void
   }
 }
 
+
+export async function remoteIndependentHead(repo: string): Promise<string | undefined> {
+  const remote = requireCommand(['git', 'remote', 'get-url', 'origin'], { cwd: repo })
+  const sha = (await requireCommandAsync(['git', 'ls-remote', remote, 'refs/heads/main'], { timeoutMs: 30_000 })).trim().split(/\s+/)[0] ?? ''
+  if (!/^[a-f0-9]{40}$/.test(sha)) fail('更新先mainのcommitを確認できません')
+  return sha === requireCommand(['git', 'rev-parse', 'HEAD'], { cwd: repo }) ? undefined : sha
+}
+
+async function waitForUpdateLease(state: string, signal?: AbortSignal): Promise<UpdateLockCoordinator> {
+  while (true) {
+    if (signal?.aborted) fail('更新を中断しました')
+    try { return acquireUpdateLock(state) }
+    catch (error) {
+      const owner = inspectProcessLock(join(state, 'update.lock', 'pid'))
+      if (owner.status !== 'active') throw error
+      await Bun.sleep(250)
+    }
+  }
+}
+
+/** Build away from every running checkout. Publishing never pauses an app. */
+async function prepareIndependentRelease(rootRepo: string, stateDir: string, signal: AbortSignal): Promise<RuntimeRelease> {
+  const registry = prepareManagedStateRoot(slackAppRegistryRoot())
+  const builder = ensureManagedDirectory(registry, join(registry, 'release-builder'))
+  const lease = await waitForUpdateLease(builder, signal)
+  let temporary: string | undefined
+  let validationRoot: string | undefined
+  try {
+    const remote = requireCommand(['git', 'remote', 'get-url', 'origin'], { cwd: rootRepo })
+    const refs = await requireCommandAsync(['git', 'ls-remote', remote, 'refs/heads/main'], { signal })
+    const sha = refs.trim().split(/\s+/)[0] ?? ''
+    if (!/^[a-f0-9]{40}$/.test(sha)) fail('更新先mainのcommitを確認できません')
+    const releases = ensureManagedDirectory(registry, join(registry, 'releases'))
+    const destination = join(releases, sha)
+    const release: RuntimeRelease = { version: 1, sha, path: destination }
+    if (existsSync(destination)) {
+      const raw = readOptionalBoundedOwnerOnlyRegularFile(join(destination, '.zerochan-release.json'), 8192)
+      const pending = raw && JSON.parse(raw)
+      if (pending?.version === 1 && pending.sha === sha && pending.ready === false
+        && realpathSync(destination) === destination) {
+        renameSync(destination, join(releases, `.incomplete-${sha}-${randomUUID()}`))
+      } else return validateRelease(release)
+    }
+    temporary = mkdtempSync(join(releases, '.build-'))
+    const checkout = join(temporary, 'checkout')
+    // The trusted Git verifier requires its staging root under physical /tmp.
+    // Keep the checkout on the release filesystem for atomic publication.
+    validationRoot = createUpdaterTemporaryDirectory('zerokun-update-candidate-')
+    const isolatedHome = join(validationRoot, 'home')
+    mkdirSync(join(isolatedHome, 'tmp'), { recursive: true, mode: 0o700 })
+    await requireCommandAsync(['git', 'clone', '--quiet', '--no-local', '--no-checkout', remote, checkout], { signal, processGroupLease: lease })
+    await requireCommandAsync(['git', 'checkout', '--quiet', '--detach', sha], { cwd: checkout, signal, processGroupLease: lease })
+    for (const file of ['runtime-release.ts', 'independent-update.ts']) {
+      if (!existsSync(join(checkout, 'zerokun', file))) fail('更新候補がインスタンス別releaseに対応していません')
+    }
+    await validateZero(checkout, isolatedHome, rootRepo, stateDir, lease, signal)
+    // The release has its own node_modules and Git metadata, never a shared worktree.
+    chmodSync(checkout, 0o700)
+    mkdirSync(join(checkout, '.release-bin'), { mode: 0o700 })
+    for (const name of ['zerochan', 'zerokun', 'codex-channel']) symlinkSync('../codex-channel.sh', join(checkout, '.release-bin', name))
+    appendFileSync(join(checkout, '.git/info/exclude'), '\n/.zerochan-release.json\n/.release-bin/\n')
+    atomicWritePrivateFile(join(checkout, '.zerochan-release.json'), JSON.stringify({ version: 1, sha, ready: false }) + '\n')
+    renameSync(checkout, destination)
+    try {
+      for (const installer of ['install-fifth-advisor.ts', 'install-grok-reviewer.ts']) {
+        await requireCommandAsync([process.execPath, '--config=/dev/null', '--no-env-file', join(destination, 'zerokun', installer), 'install'], {
+          cwd: destination, signal, env: buildSetupEnvironment(), processGroupLease: lease,
+        })
+      }
+      atomicWritePrivateFile(join(destination, '.zerochan-release.json'), JSON.stringify({ version: 1, sha, ready: true }) + '\n')
+    } catch (error) {
+      // No pin can reference an unpublished release. Keep evidence for diagnosis;
+      // the next preparation explicitly replaces only this incomplete candidate.
+      throw error
+    }
+    return validateRelease(release)
+  } finally {
+    if (validationRoot) {
+      try { chmodSync(join(validationRoot, 'trusted-bin'), 0o700) } catch {}
+      rmSync(validationRoot, { recursive: true, force: true })
+    }
+    if (temporary) rmSync(temporary, { recursive: true, force: true })
+    lease.release()
+  }
+}
+
+async function installInstanceRuntime(target: ReleaseTarget, root: string, lease: UpdateLockCoordinator): Promise<void> {
+  // Do not run host setup: it changes shared launchers, helpers and user config.
+  await requireCommandAsync([process.execPath, '--config=/dev/null', '--no-env-file', join(root, 'zerokun', 'job-runner.ts'), 'prepare-storage'], {
+    cwd: root, processGroupLease: lease,
+    env: { ...buildSetupEnvironment(), ZEROKUN_REPO_DIR: undefined, ZEROKUN_STATE_DIR: target.stateDir, ZEROKUN_PROJECT_DIR: target.projectDir, ZEROKUN_LEGACY_CUTOVER: legacyCutoverForState(target.stateDir) },
+  })
+  for (const name of ['job-runner.ts', 'codex-executor.ts']) {
+    const link = join(target.stateDir, name)
+    const temporary = `${link}.${randomUUID()}`
+    symlinkSync(join(root, 'zerokun', name), temporary)
+    renameSync(temporary, link)
+  }
+  // Keep the already published frozen request worker, including on rollback.
+  // Recovery must not depend on the candidate release still existing.
+  atomicWritePrivateFile(join(target.stateDir, 'watchdog.sh'), readFileSync(join(root, 'zerokun', 'watchdog.sh')))
+  chmodSync(join(target.stateDir, 'watchdog.sh'), 0o700)
+}
+
+function publishReleaseCommands(release: RuntimeRelease): void {
+  const bin = join(homedir(), '.local', 'bin')
+  mkdirSync(bin, { recursive: true, mode: 0o700 })
+  for (const name of ['zerochan', 'zerokun', 'codex-channel']) {
+    const path = join(bin, name)
+    try {
+      if (!lstatSync(path).isSymbolicLink()) fail(`既存commandを上書きできません: ${name}`)
+      const old = realpathSync(path)
+      if (basename(old) !== 'codex-channel.sh') fail(`無関係なcommandを保持しました: ${name}`)
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    const tmp = `${path}.${randomUUID()}`
+    symlinkSync(join(release.path, 'codex-channel.sh'), tmp)
+    renameSync(tmp, path)
+  }
+}
+
+async function independentMain(argv: string[]): Promise<void> {
+  for (const flag of ['--skip-tests', '--no-restart']) {
+    if (argv.includes(flag)) fail(`${flag} はテスト環境でのみ使用できます`)
+  }
+  if (argv.some(arg => arg !== '--recover-only')) fail('不明な更新オプションです')
+  const recovery = argv.includes('--recover-only')
+  const rootRepo = resolveRootRepo()
+  const registry = prepareManagedStateRoot(slackAppRegistryRoot())
+  const requested = prepareManagedStateRoot(resolveZeroStateDir())
+  // Historical transactions require their historical recovery, never a guessed
+  // release pointer or deletion of a live updater's locks.
+  if (existsSync(join(registry, 'shared-update-owner.json')) || (recovery && existsSync(join(requested, 'update-transaction.json')))) {
+    if (!recovery) fail('旧方式の更新が残っています。zerochan update --recover-only で復旧してください')
+    const priorRoot = process.env.ZEROKUN_REPO_DIR
+    const ownerRaw = readOptionalBoundedOwnerOnlyRegularFile(join(registry, 'shared-update-owner.json'), 8192)
+    const journalRaw = readOptionalPrivateFile(join(requested, 'update-transaction.json'))
+    const originalRoot = ownerRaw ? JSON.parse(ownerRaw).repoPath : journalRaw ? JSON.parse(journalRaw).repoPath : rootRepo
+    process.env.ZEROKUN_REPO_DIR = realpathSync(originalRoot)
+    try { await legacyMain(false, argv) }
+    finally { if (priorRoot === undefined) delete process.env.ZEROKUN_REPO_DIR; else process.env.ZEROKUN_REPO_DIR = priorRoot }
+    return
+  }
+  const controller = new AbortController()
+  const interrupt = () => controller.abort()
+  process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt)
+  const waitSeconds = Number(process.env.ZEROKUN_UPDATE_WAIT_SECONDS ?? 21_600)
+  if (!Number.isFinite(waitSeconds) || waitSeconds < 0) fail('更新待ち時間が不正です')
+  const oldDb = process.env.ZEROKUN_JOB_DB
+  delete process.env.ZEROKUN_JOB_DB
+  try {
+    const states = recovery || process.env.ZEROKUN_UPDATE_SCOPE === 'instance' ? [requested] : [...new Set([requested, ...listRegisteredSlackApps().map(app => app.stateDir)])]
+    const { targets, unavailable } = collectIndependentTargets(states, state => {
+      if (existsSync(join(state, 'update-transaction.json'))) throw new Error('旧方式の更新journalを先に復旧してください')
+      const interrupted = readReleaseTransaction(state)
+      if (interrupted) return interrupted.target
+      if (recovery) return undefined
+      const runningProject = runningGatewayProjectDirectory(state)
+      const project = runningProject ?? readLastConnectedProject(state)?.projectDir
+        ?? (state === requested ? process.env.ZEROKUN_PROJECT_DIR : undefined)
+      // An app that has never been configured has no runtime to upgrade.
+      if (!project) return undefined
+      const oldRoot = runtimeRootForState(state, rootRepo)
+      return { stateDir: state, projectDir: validateLaunchProject(project, { runtimeRepo: oldRoot, stateDir: state }), oldRoot, running: Boolean(runningProject) }
+    })
+    for (const warning of unavailable) output(warning)
+    if (!targets.length && unavailable.length) fail('対象アプリの更新情報を確認できません')
+    if (!targets.length) { output('更新・復旧対象のインスタンスはありません'); return }
+    const candidate = recovery
+      ? readReleaseTransaction(requested)!.candidate
+      : await prepareIndependentRelease(rootRepo, requested, controller.signal)
+    const leases = new Map<string, UpdateLockCoordinator>()
+    const hooks: ActivationHooks = {
+      report: (target, status) => output(`${basename(target.stateDir)}: ${status}`),
+      acquire: async state => {
+        const lease = await waitForUpdateLease(state, controller.signal)
+        let route: ReturnType<typeof acquireChannelRouteMutationLock>
+        try { route = acquireChannelRouteMutationLock(state) } catch (error) { lease.release(); throw error }
+        leases.set(state, lease)
+        return { release() { try { route.release() } finally { leases.delete(state); lease.release() } } }
+      },
+      observe: target => {
+        const project = runningGatewayProjectDirectory(target.stateDir)
+        return { ...target, running: Boolean(project), projectDir: project ?? target.projectDir, oldRoot: runtimeRootForState(target.stateDir, target.oldRoot) }
+      },
+      drain: async target => {
+        output(`${basename(target.stateDir)}: 自分の実行中ジョブの完了待ち。他インスタンスは通常稼働を継続します`)
+        await waitForRunningJobs(target.stateDir, waitSeconds, join(target.oldRoot, 'zerokun/job-runner.ts'), controller.signal)
+        if (target.running) await assertPinnedHerdrRestartReady(target.stateDir)
+      },
+      stop: target => stopServices(target.stateDir),
+      install: (target, root) => installInstanceRuntime(target, root, leases.get(target.stateDir)!),
+      start: (target, root) => restartServices(root, target.stateDir, target.projectDir),
+      healthy: async (target, root) => {
+        if (!updatedServicesHealthy(root, target.stateDir, target.projectDir)) fail('対象アプリの新runtimeの稼働を確認できません')
+      },
+    }
+    // Freeze the legacy checkout while old gateways still reference it. This
+    // compatibility lease never acquires a peer queue lock. New instances do
+    // not consult it; only old updaters/registration are serialized by it.
+    const legacyTargets = targets.filter(target => {
+      const tx = readReleaseTransaction(target.stateDir)
+      return tx ? tx.previous === null : !readRuntimeRelease(target.stateDir)
+    })
+    const guardPath = join(registry, 'shared-update.lock')
+    let guard: ReturnType<typeof tryAcquireProcessLock> | null = null
+    if (legacyTargets.length) {
+      do {
+        if (controller.signal.aborted) fail('更新を中断しました')
+        guard = tryAcquireProcessLock(guardPath)
+        if (!guard.acquired) {
+          if (guard.kind !== 'held') fail('旧updaterの所有者を確認できません')
+          await Bun.sleep(250)
+        }
+      } while (!guard.acquired)
+    }
+    let results: Awaited<ReturnType<typeof activateIndependentTargets>>
+    try {
+      for (const target of legacyTargets) {
+        try {
+          installLegacyCommands(target.stateDir, target.oldRoot)
+          atomicWritePrivateFile(join(target.stateDir, 'legacy-runtime.json'), JSON.stringify({ version: 1, path: target.oldRoot }) + '\n')
+        } catch (error) {
+          unavailable.push(`${basename(target.stateDir)}: ${String(error)}`)
+          targets.splice(targets.indexOf(target), 1)
+        }
+      }
+      if (!recovery) {
+        atomicWritePrivateFile(join(registry, 'update-controller.json'), JSON.stringify({ version: 1, sha: candidate.sha }) + '\n')
+        // The request worker is already an immutable bundle. Switching only
+        // this entrypoint is safe while old gateway/runner jobs continue.
+        for (const target of [...targets]) {
+          try { installUpdateRequestRuntime(join(candidate.path, 'zerokun'), target.stateDir) }
+          catch (error) { unavailable.push(`${basename(target.stateDir)}: ${String(error)}`); targets.splice(targets.indexOf(target), 1) }
+        }
+        publishReleaseCommands(candidate)
+      }
+      results = await activateIndependentTargets(targets, candidate, hooks, recovery)
+    } finally {
+      if (guard?.acquired) releaseProcessLock(guardPath, guard.lease)
+    }
+    const failures = results.filter(result => result.status === 'rejected')
+    if (failures.length || unavailable.length) fail(`${failures.length + unavailable.length}件の更新が未完了です。他インスタンスの更新結果は保持しました`)
+    output(results.some(result => result.status === 'fulfilled' && result.value === 'recovered')
+      ? '復旧が完了しました。復旧したアプリへの新版適用は zerochan update を再実行してください'
+      : '✅ 全インスタンスの個別更新・検証完了（停止中のアプリは停止状態を保持）')
+  } finally {
+    if (oldDb !== undefined) process.env.ZEROKUN_JOB_DB = oldDb
+    process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt)
+  }
+}
+
+export async function runInstanceMigrationForTests(target: ReleaseTarget): Promise<void> {
+  const lease = acquireUpdateLock(target.stateDir)
+  try { await installInstanceRuntime(target, target.oldRoot, lease) }
+  finally { lease.release() }
+}
+
 export async function runUpdateForTests(argv = process.argv.slice(1)): Promise<void> {
-  await withUpdateTestPolicy(() => main(true, argv))
+  await withUpdateTestPolicy(() => legacyMain(true, argv))
 }
 
 export async function runStandaloneSetupForTests(): Promise<void> {
@@ -3709,7 +3970,7 @@ if (import.meta.main) {
     ? argv.length === 1
       ? superviseStandaloneSetup(false)
       : Promise.reject(new Error('--setup-supervisorに追加オプションは指定できません'))
-    : main(false, argv)
+    : independentMain(argv)
   action.catch(error => {
     process.stderr.write(`❌ ${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
