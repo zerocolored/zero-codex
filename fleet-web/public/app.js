@@ -3,9 +3,12 @@ let data = null, offset = 0, fetching = false, failed = false
 const labels = {available:'すぐ着手可能',busy:'作業中',limited:'利用上限で待機',waiting:'開始待ち',unknown:'状態不明'}
 function node(tag,text,cls){const el=document.createElement(tag);el.textContent=text;if(cls)el.className=cls;return el}
 function relative(value,now){if(!value)return '未受信';const age=Math.max(0,now-new Date(value).getTime());if(age<60000)return `${Math.floor(age/1000)}秒前`;if(age<3600000)return `${Math.floor(age/60000)}分前`;if(age<86400000)return `${Math.floor(age/3600000)}時間前`;return `${Math.floor(age/86400000)}日前`}
+function fresh(row,now){const age=now-Date.parse(row.receivedAt);return age>=0&&age<90000}
+function online(row,now){return fresh(row,now)&&row.snapshot?.slackConnected===true&&row.snapshot?.runnerHealthy===true}
 function render(){if(!data)return;const now=Date.now()+offset,counts={available:0,busy:0,limited:0,unknown:0};$('rows').replaceChildren()
- const active=data.instances.filter(r=>r.receivedAt&&now-Date.parse(r.receivedAt)<90000)
- for(const row of data.instances){const s=row.snapshot,stale=!row.receivedAt||now-Date.parse(row.receivedAt)>=90000
+ const active=data.instances.filter(r=>fresh(r,now)&&r.snapshot?.slackConnected===true)
+ const ordered=[...data.instances].sort((a,b)=>Number(online(b,now))-Number(online(a,now)))
+ for(const row of ordered){const s=row.snapshot,stale=!online(row,now)
  const duplicate=active.filter(r=>r.appId===row.appId&&r.teamId===row.teamId&&r.installationId!==row.installationId).length>0
  const state=failed||stale||duplicate?'unknown':s?.state??'unknown';counts[state==='waiting'?'unknown':state]++
  const el=node('article','','row'),identity=node('div','');identity.append(node('strong',row.name),node('small',`${s?.project||'プロジェクト未受信'} · ${row.pc}`))
@@ -16,7 +19,8 @@ function render(){if(!data)return;const now=Date.now()+offset,counts={available:
  const last=node('time',relative(row.receivedAt,now));last.dataset.label='最終通信';if(row.receivedAt)last.dateTime=row.receivedAt
  el.append(identity,status,summary,accepted,last);$('rows').append(el)
  }
- if(!data.instances.length)$('rows').append(node('p','登録済みのZeroちゃんはまだありません。','empty'))
+ if(!data.instances.length)$('rows').append(node('p','プロジェクトで起動したZeroちゃんはまだありません。','empty'))
+ const hidden=Number.isSafeInteger(data.hidden)&&data.hidden>0?data.hidden:0;$('hidden-note').hidden=!hidden;$('hidden-note').textContent=hidden?` · 未起動の登録 ${hidden}件は表示していません`:''
  $('total').textContent=`${data.instances.length}台`;$('counts').replaceChildren()
  for(const [key,title] of [['available','すぐ着手できる'],['busy','作業中'],['limited','利用上限で待機'],['unknown','状態不明・開始待ち']]){const el=node('div','','count');el.append(node('span',title),node('strong',String(counts[key])));$('counts').append(el)}
 }
