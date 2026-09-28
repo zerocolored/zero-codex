@@ -2,6 +2,9 @@ import json
 import os
 import runpy
 import tempfile
+import socket
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +27,9 @@ class SendRecoveryTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *args): pass
             def settimeout(self, value): pass
-            def connect(self, value): owner.events.append('connect')
+            def connect(self, value):
+                assert owner.receipt.exists(), 'slow filesystem claim must finish before connect'
+                owner.events.append('connect')
             def sendall(self, value):
                 owner.events.append('send')
                 assert owner.receipt.exists()
@@ -47,7 +52,7 @@ class SendRecoveryTests(unittest.TestCase):
 
     def test_claim_precedes_send_and_repeated_call_cannot_resend(self):
         self.assertEqual(self.m['_attempt_send'](self.prepared), 0)
-        self.assertEqual(self.events, ['connect', 'claim', 'send', 'announce'])
+        self.assertEqual(self.events, ['claim', 'connect', 'send', 'announce'])
         self.assertEqual(self.m['_attempt_send'](self.prepared), 5)
         self.assertEqual(self.events.count('send'), 1)
 
@@ -79,6 +84,41 @@ class SendRecoveryTests(unittest.TestCase):
         self.assertEqual(self.m['_attempt_send'](self.prepared), 5)
         self.assertTrue(self.receipt.exists())
         self.assertEqual(self.events.count('send'), 1)
+
+    def test_slow_claim_does_not_consume_server_idle_connection_deadline(self):
+        # A real socket server closes clients that connect but do not send.
+        # Repository audit/fsync is deliberately slower than that deadline.
+        self.g['socket'] = socket
+        path = str(Path(self.tmp.name) / 'herdr.sock')
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+        server.settimeout(2)
+        self.addCleanup(server.close)
+        received = []
+        def serve():
+            try:
+                connection, _ = server.accept()
+                with connection:
+                    connection.settimeout(0.1)
+                    received.append(connection.recv(1024))
+                    connection.sendall(b'{"id":"req","result":{}}\n')
+            except (TimeoutError, OSError):
+                pass
+        thread = threading.Thread(target=serve)
+        thread.start()
+        claim = self.g['_persist_send_receipt']
+        def slow_claim(prepared):
+            time.sleep(0.3)
+            claim(prepared)
+        self.g['_persist_send_receipt'] = slow_claim
+        self.prepared.socket_path = path
+        try:
+            self.assertEqual(self.m['_attempt_send'](self.prepared), 0)
+            self.assertEqual(received, [b'prompt'])
+        finally:
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
 
 
 if __name__ == '__main__':

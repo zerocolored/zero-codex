@@ -1226,11 +1226,20 @@ def _run_supervised(reviewer_root: Path, run_root: Path, command: list[str]) -> 
 def _verify_install(reviewer_root: Path, real_home: Path, grok: Path, auth: Path) -> int:
     try:
         home = real_home.resolve(strict=True)
-        expected_root = home / ".zerokun" / "runtime" / "grok-reviewer"
-        if reviewer_root.resolve(strict=True) != expected_root:
+        runtime_root = home / ".zerokun" / "runtime"
+        parts = reviewer_root.relative_to(runtime_root).parts
+        if not (parts == ("grok-reviewer",) or (
+            len(parts) == 3 and parts[0] == "releases"
+            and re.fullmatch(r"[a-f0-9]{40}", parts[1])
+            and parts[2] == "grok-reviewer"
+        )) or reviewer_root.resolve(strict=True) != reviewer_root:
             return 7
         _safe_owned_directory(home / ".zerokun", private=True)
-        _safe_owned_directory(home / ".zerokun" / "runtime", private=True)
+        _safe_owned_directory(runtime_root, private=True)
+        parent = runtime_root
+        for part in parts:
+            parent = parent / part
+            _safe_owned_directory(parent, private=True)
         _resolve_official_grok(real_home, grok)
         _safe_regular(auth, executable=False, maximum=MAX_AUTH_BYTES, private=True)
         _safe_owned_directory(reviewer_root, private=True)
@@ -1249,7 +1258,7 @@ def _verify_install(reviewer_root: Path, real_home: Path, grok: Path, auth: Path
                 private=required.parent.name != "bin",
             )
         return 0
-    except OSError:
+    except (OSError, ValueError):
         return 7
 
 

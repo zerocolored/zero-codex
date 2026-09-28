@@ -1,6 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
 import { Database } from 'bun:sqlite'
+import { installedGoChromeEntrypoint } from './installed-browser.ts'
 import {
   closeSync,
   constants,
@@ -3760,7 +3761,9 @@ async function prepareIndependentRelease(rootRepo: string, stateDir: string, sig
     mkdirSync(join(checkout, '.release-bin'), { mode: 0o700 })
     for (const name of ['zerochan', 'zerokun', 'codex-channel']) symlinkSync('../codex-channel.sh', join(checkout, '.release-bin', name))
     appendFileSync(join(checkout, '.git/info/exclude'), '\n/.zerochan-release.json\n/.release-bin/\n')
-    atomicWritePrivateFile(join(checkout, '.zerochan-release.json'), JSON.stringify({ version: 1, sha, ready: false }) + '\n')
+    const chromeEntrypoint = installedGoChromeEntrypoint(join(rootRepo, 'zerokun'), rootRepo)
+    const manifest = { version: 1, sha, ...(chromeEntrypoint ? { chromeEntrypoint } : {}) }
+    atomicWritePrivateFile(join(checkout, '.zerochan-release.json'), JSON.stringify({ ...manifest, ready: false }) + '\n')
     renameSync(checkout, destination)
     try {
       for (const installer of ['install-fifth-advisor.ts', 'install-grok-reviewer.ts']) {
@@ -3768,7 +3771,7 @@ async function prepareIndependentRelease(rootRepo: string, stateDir: string, sig
           cwd: destination, signal, env: buildSetupEnvironment(), processGroupLease: lease,
         })
       }
-      atomicWritePrivateFile(join(destination, '.zerochan-release.json'), JSON.stringify({ version: 1, sha, ready: true }) + '\n')
+      atomicWritePrivateFile(join(destination, '.zerochan-release.json'), JSON.stringify({ ...manifest, ready: true }) + '\n')
     } catch (error) {
       // No pin can reference an unpublished release. Keep evidence for diagnosis;
       // the next preparation explicitly replaces only this incomplete candidate.

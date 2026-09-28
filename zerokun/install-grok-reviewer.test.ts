@@ -11,6 +11,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -125,6 +126,26 @@ function reviewSync(
     rmSync(input, { force: true })
   }
 }
+
+test('installed Grok launcher works from immutable release paths and rejects unsafe release parents', () => {
+  const f = fixture()
+  const legacy = installGrokReviewer(f.home)
+  const root = join(realpathSync(f.home), '.zerokun/runtime')
+  const release = join(root, 'releases', 'a'.repeat(40))
+  mkdirSync(release, { recursive: true, mode: 0o700 })
+  renameSync(join(root, 'grok-reviewer'), join(release, 'grok-reviewer'))
+  const launcher = join(release, 'grok-reviewer/bin/grok')
+  const env = { HOME: f.home, PATH: '/usr/bin:/bin', ZEROKUN_GROK_REVIEW_ROOT: f.reviewRoot }
+  const result = reviewSync(launcher, 'Read-only synthetic review', env)
+  expect(result.exitCode, result.stderr.toString()).toBe(0)
+  expect(result.stdout.toString()).toContain('PROMPT_BYTES=')
+  chmodSync(release, 0o755)
+  expect(reviewSync(launcher, 'Read-only synthetic review', env).exitCode).toBe(127)
+  chmodSync(release, 0o700)
+  renameSync(release, join(root, 'releases', 'invalid'))
+  expect(reviewSync(join(root, 'releases/invalid/grok-reviewer/bin/grok'), 'Review', env).exitCode).toBe(127)
+  expect(existsSync(legacy)).toBe(false)
+})
 
 function compileFixtureProgram(home: string, output: string, sourceText: string): void {
   const source = join(home, `.fixture-${randomUUID()}.c`)
