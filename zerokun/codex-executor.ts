@@ -20,6 +20,7 @@ import {
   readSync,
   realpathSync,
   rmSync,
+  writeFileSync,
   writeSync,
   type Dirent,
   type Stats,
@@ -5460,6 +5461,15 @@ export function buildCodexPermissionOverrides(
   const home = realpathSync(homedir())
   const artifactDir = requireManagedDirectory(options.stateDir, options.artifactDir)
   const scratchDir = requireManagedDirectory(options.stateDir, options.scratchDir)
+  // サンドボックスは mDNSResponder への mach-lookup を塞ぐため、getaddrinfo を
+  // 使う dns.lookup だけが ENOTFOUND になる。ジョブ内の Node に preload させて
+  // DNS へ引き直させる。scratchDir はジョブ専用で読み書きできる唯一の置き場。
+  const dnsFallbackPath = join(scratchDir, '.zerokun-dns-fallback.cjs')
+  writeFileSync(
+    dnsFallbackPath,
+    readFileSync(join(import.meta.dir, 'sandbox-dns-fallback.cjs'), 'utf8'),
+    { mode: 0o600 },
+  )
   const liveInputRoot = options.liveInputDir
     ? requireManagedDirectory(options.stateDir, options.liveInputDir)
     : null
@@ -5674,6 +5684,7 @@ export function buildCodexPermissionOverrides(
     `"TMPDIR"=${tomlString(scratchDir)}`,
     `"XDG_CONFIG_HOME"=${tomlString(join(scratchDir, '.config'))}`,
     `"XDG_CACHE_HOME"=${tomlString(join(scratchDir, '.cache'))}`,
+    `"NODE_OPTIONS"=${tomlString(`--require ${dnsFallbackPath}`)}`,
     `"PATH"=${tomlString(cloudBin ? `${cloudBin}:${toolchain.path}` : toolchain.path)}`,
     ...(cloudConfig ? [`"CLOUDSDK_CONFIG"=${tomlString(cloudConfig)}`] : []),
     ...(cloudRuntime ? [
