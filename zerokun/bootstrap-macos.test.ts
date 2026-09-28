@@ -720,6 +720,13 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('Homebrew/install/HEAD/install.sh')
     expect(script).toContain('isolated_network_command "$(command -v brew)" install tmux')
     expect(script).toContain('isolated_network_command "$(command -v brew)" install gh')
+    // Cloud Logging コネクタは host の gcloud を実行する。入っていないと、ジョブ側は
+    // 「接続が提供されていない」と見えて実行時証拠を取れず、毎回ブロックで終わる。
+    expect(script).toContain('isolated_network_command "$(command -v brew)" install --cask gcloud-cli')
+    // 認証は人が1回 gcloud auth login する必要があり bootstrap では完了しない。
+    // 導入を必須扱いにして落とさず、使えないことだけ知らせる。
+    expect(script).toContain('warn "gcloud を確認できません')
+    expect(script).not.toMatch(/for required in [^\n]*gcloud/)
     expect(script).toContain('https://herdr.dev/install.sh')
     expect(script).toContain('HERDR_INSTALL_DIR="$HOME/.local/bin"')
     expect(script).not.toContain('"$(command -v brew)" install herdr')

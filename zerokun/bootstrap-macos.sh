@@ -1127,6 +1127,17 @@ install_cli_tools() {
   if ! command -v gh >/dev/null 2>&1; then
     isolated_network_command "$(command -v brew)" install gh
   fi
+  # Cloud Logging コネクタ(zerokun/cloud-logging-broker.ts)は host の gcloud を
+  # 実行する。入っていないと、ジョブ側は接続が「提供されていない」ように見え、
+  # 実行時証拠を取れないまま毎回ブロックで終わる(2026-09-28 に実機で発生)。
+  # broker が探すのは /opt/homebrew/bin/gcloud 等の固定パスなので、cask で入れる。
+  # 取得に失敗しても bootstrap 全体は止めない。gcloud が無くても Zeroちゃん本体は
+  # 動き、欠けるのは Cloud Logging の読み取りだけ。ここで fail にすると、
+  # 付随機能のために導入そのものが完了しなくなる。
+  if ! command -v gcloud >/dev/null 2>&1; then
+    isolated_network_command "$(command -v brew)" install --cask gcloud-cli \
+      || warn "gcloud を導入できません。Cloud Logging コネクタは使えません"
+  fi
   herdr_compatible || install_herdr_standalone
   hash -r
   herdr_compatible \
@@ -1162,6 +1173,10 @@ export PATH="$BUN_INSTALL/bin:$PATH"'
   for required in git tmux herdr gh bun; do
     command -v "$required" >/dev/null 2>&1 || fail "$required の導入を確認できません"
   done
+  # gcloud は未認証でも導入だけは確認する。認証は人が 1 回 `gcloud auth login`
+  # する必要があり、bootstrap では完了させられない。
+  command -v gcloud >/dev/null 2>&1 \
+    || warn "gcloud を確認できません。Cloud Logging コネクタは使えません"
   secure_standalone_codex >/dev/null \
     || fail "Codex公式standaloneの安全性を確認できませんでした"
   grok_build_executable >/dev/null \
