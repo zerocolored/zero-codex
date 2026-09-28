@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
@@ -45,4 +45,39 @@ test('missing, task-controlled, writable, symlinked or unrelated neighbor is not
   expect(installedGoChromeEntrypoint(f.runtime,f.project)).toBeUndefined()
   rmSync(f.browser,{recursive:true})
   expect(isolated(f,{})['go-chrome-mcp']).toBeUndefined()
+})
+
+test('immutable releases retain the validated Chrome installation across updates', () => {
+  const f = fixture()
+  const runtime = join(f.root, 'releases', 'a'.repeat(40), 'zerokun')
+  mkdirSync(runtime, { recursive: true, mode: 0o700 })
+  const manifest = join(runtime, '../.zerochan-release.json')
+  writeFileSync(manifest, JSON.stringify({ version: 1, sha: 'a'.repeat(40), ready: true,
+    chromeEntrypoint: join(f.browser, 'mcp-broker.js') }), { mode: 0o600 })
+  const release = { ...f, runtime }
+  expect(isolated(release, {})['go-chrome-mcp'].args).toContain(join(f.browser, 'mcp-broker.js'))
+  expect(isolated(release, { mcp_servers: { 'go-chrome-mcp': { command: 'node', args: ['/disabled'], enabled: false } } })['go-chrome-mcp'].enabled).toBe(false)
+  expect(installedGoChromeEntrypoint(runtime, f.root, f.root)).toBeUndefined()
+  chmodSync(join(f.browser, 'mcp-broker.js'), 0o666)
+  expect(installedGoChromeEntrypoint(runtime, f.project, f.root)).toBeUndefined()
+})
+
+test('older immutable releases discover the standard installation without changing app grants', () => {
+  const f = fixture()
+  const runtime = join(f.root, 'releases', 'b'.repeat(40), 'zerokun')
+  mkdirSync(runtime, { recursive: true, mode: 0o700 })
+  const home = join(f.root, 'home')
+  const browser = join(home, 'dev/go-chrome-mcp')
+  mkdirSync(browser, { recursive: true, mode: 0o700 })
+  for (const name of ['mcp-broker.js', 'package.json', 'manifest.json']) {
+    writeFileSync(join(browser, name), readFileSync(join(f.browser, name)), { mode: 0o600 })
+  }
+  writeFileSync(join(runtime, '../.zerochan-release.json'), JSON.stringify({ version: 1, sha: 'b'.repeat(40), ready: true }), { mode: 0o600 })
+  expect(installedGoChromeEntrypoint(runtime, f.project, home)).toBe(join(browser, 'mcp-broker.js'))
+  writeFileSync(join(runtime, '../.zerochan-release.json'), JSON.stringify({ version: 1, sha: 'b'.repeat(40),
+    chromeEntrypoint: '/missing/mcp-broker.js' }), { mode: 0o600 })
+  expect(installedGoChromeEntrypoint(runtime, f.project, home)).toBeUndefined()
+  writeFileSync(join(runtime, '../.zerochan-release.json'), JSON.stringify({ version: 1, sha: 'c'.repeat(40),
+    chromeEntrypoint: join(browser, 'mcp-broker.js') }), { mode: 0o600 })
+  expect(installedGoChromeEntrypoint(runtime, f.project, home)).toBeUndefined()
 })

@@ -4865,11 +4865,14 @@ def _announce_send(prepared: _PreparedSend) -> None:
 def _attempt_send(prepared: _PreparedSend) -> int:
     try:
         try:
+            # Auditing a large repository can outlast Herdr's idle-connection
+            # deadline. Finish the durable claim before opening the socket;
+            # never leave an accepted connection waiting for filesystem work.
+            _persist_send_receipt(prepared)
             response = bytearray()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(PROMPT_SOCKET_TIMEOUT_SECONDS)
                 connection.connect(prepared.socket_path)
-                _persist_send_receipt(prepared)
                 connection.sendall(prepared.request)
                 _announce_send(prepared)
                 while b"\n" not in response:

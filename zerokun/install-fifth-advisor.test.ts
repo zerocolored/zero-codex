@@ -596,6 +596,7 @@ describe('fifth-advisor helper installer', () => {
       ' def settimeout(self,value): pass',
       ' def connect(self,value): raise TimeoutError("private diagnostic content")',
       'm.socket.socket=lambda *args: Connection()',
+      'm._persist_send_receipt=lambda prepared: None',
       'sys.exit(m._attempt_send(types.SimpleNamespace(socket_path="unused")))',
     ].join('\n')
     const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, helper], { stdout: 'pipe', stderr: 'pipe' })
