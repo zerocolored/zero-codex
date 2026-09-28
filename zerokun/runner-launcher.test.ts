@@ -88,7 +88,7 @@ describe('Herdr-owned runner launcher', () => {
       `writePinnedHerdrRuntime(${JSON.stringify(state)}, decodeHerdrRuntimeIdentity(encoded))`,
       `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid))`,
       "process.on('SIGINT', () => {})",
-      "process.on('SIGTERM', () => process.exit(0))",
+      `process.on('SIGTERM', () => setTimeout(() => { writeFileSync(${JSON.stringify(pidFile + ".drained")}, 'done'); process.exit(0) }, 3_200))`,
       'await Bun.sleep(60_000)',
       '',
     ].join('\n'), { mode: 0o700 })
@@ -143,8 +143,9 @@ describe('Herdr-owned runner launcher', () => {
     expect(signalProcessIfLive(launcherIdentity!, 'SIGTERM')).toBe(true)
     expect(await Promise.race([
       launched.exited.then(() => true),
-      Bun.sleep(2_000).then(() => false),
+      Bun.sleep(6_000).then(() => false),
     ])).toBe(true)
+    expect(readFileSync(pidFile + '.drained', 'utf8')).toBe('done')
     expect(() => process.kill(runnerPid, 0)).toThrow()
     herdrServer.stop(true)
   })

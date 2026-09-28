@@ -1,5 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
+import { slackDeliveryShutdownGraceMs } from './slack-http.ts'
 import { closeSync, lstatSync, realpathSync, writeSync } from 'fs'
 import { basename, dirname, isAbsolute, join } from 'path'
 import { requireManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
@@ -190,7 +191,7 @@ try {
         } else {
           signalProcessIfLive(expected, 'SIGKILL')
         }
-      }, 3_000)
+      }, slackDeliveryShutdownGraceMs())
     }
   }
   const stopInt = () => stop('SIGINT')
