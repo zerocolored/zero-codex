@@ -145,7 +145,7 @@ describe('public Codex defaults', () => {
     const abort = runner.indexOf('if (signal?.aborted)', target)
     const bytes = runner.indexOf('this.uploadDependencies.uploadBytes(', abort)
     const intent = runner.indexOf(
-      'this.store.beginArtifactDelivery(job.id, requested, target.fileId)',
+      'this.store.beginStagedArtifactUpload(job.id, requested, target.fileId)',
       bytes,
     )
     const receipt = runner.indexOf('this.store.markArtifactDelivered(job.id, requested)', bytes)

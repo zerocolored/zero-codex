@@ -8,6 +8,12 @@ export function slackHttpTimeoutMs(value = process.env.ZEROKUN_SLACK_HTTP_TIMEOU
   return Number.isFinite(parsed) && parsed >= 100 ? parsed : DEFAULT_SLACK_HTTP_TIMEOUT_MS
 }
 
+// A started delivery has at most target, byte transfer and finalization calls.
+// The launcher must not kill it before those network deadlines can settle.
+export function slackDeliveryShutdownGraceMs(): number {
+  return 3 * slackHttpTimeoutMs() + 10_000
+}
+
 export function slackWebClientOptions(timeout = slackHttpTimeoutMs()): {
   timeout: number
   retryConfig: { retries: number }
@@ -73,7 +79,7 @@ export async function postDirectSlackUpload(
     }
   }
   if (response.statusCode !== 200) {
-    throw new Error(`Slack external upload failed: HTTP ${response.statusCode ?? 'unknown'}`)
+    throw Object.assign(new Error('Slack external upload failed'), { statusCode: response.statusCode })
   }
 }
 
