@@ -101,6 +101,12 @@ function setupTestPath(fakeHome: string, botAppId?: string): string {
   writeFileSync(join(fakeBin, 'bun'), [
     '#!/bin/bash',
     'set -euo pipefail',
+    // This suite tests setup orchestration, not registry availability. setup.sh
+    // deliberately uses an empty cache; never delegate this to a real install.
+    'if [[ "$*" == "--config=/dev/null --no-env-file install --frozen-lockfile --silent" ]]; then',
+    `  printf '%s\\n' "$*" >> ${JSON.stringify(join(fakeHome, 'fixture-install.log'))}`,
+    '  exit 0',
+    'fi',
     'if [[ "$*" == *"slack-app-identity.ts verify-file"* ]]; then',
     '  env_file="${@: -1}"',
     "  app_token=\"$(/usr/bin/sed -n 's/^SLACK_APP_TOKEN=//p' \"$env_file\")\"",
@@ -2204,6 +2210,9 @@ codex --version
 
       expect(result.exitCode).toBe(0)
       expect(result.stderr.toString()).toContain('watchdog のlaunchd登録に失敗')
+      expect(readFileSync(join(fakeHome, 'fixture-install.log'), 'utf8').trim()).toBe(
+        '--config=/dev/null --no-env-file install --frozen-lockfile --silent',
+      )
       expect(existsSync(join(fakeHome, '.local/bin/zerokun-jobs'))).toBe(true)
       expect(readFileSync(join(fakeHome, '.zshrc'), 'utf8')).toContain("alias zerokun=")
       expect(readFileSync(join(stateDir, '.env'), 'utf8')).toBe('LEGACY_SENTINEL=keep\n')
@@ -2212,6 +2221,7 @@ codex --version
     } finally {
       if (claudeParent) {
         try { claudeParent.kill() } catch {}
+        await claudeParent.exited
       }
       rmSync(fakeHome, { recursive: true, force: true })
     }
