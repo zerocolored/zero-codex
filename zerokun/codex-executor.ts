@@ -11200,7 +11200,9 @@ function readEffectiveConfigPreflightSpec(path: string): EffectiveConfigPrefligh
 
 async function verifyEffectiveCodexConfigSpec(path: string): Promise<void> {
   const spec = readEffectiveConfigPreflightSpec(path)
-  await recoverOrphanSeatbeltFingerprints(spec.stateDir)
+  // Update validation runs beside live jobs. Their durable fingerprints are
+  // not orphans: only runner startup, after retiring executors, owns global
+  // recovery. This invocation creates and retires its own random attempt.
   const fingerprintEarliest = readProcessIdentity(process.pid)
   if (!fingerprintEarliest) {
     throw new CodexCleanupPendingError('effective config verifier generation is unavailable')

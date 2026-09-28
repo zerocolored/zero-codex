@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -28,6 +29,7 @@ import {
   createSeatbeltFingerprint,
   reapSeatbeltFingerprint,
   removeSeatbeltFingerprint,
+  verifySeatbeltFingerprint,
 } from './seatbelt-fingerprint.ts'
 
 const temporaryRoots: string[] = []
@@ -836,7 +838,7 @@ for await (const chunk of Bun.stdin.stream()) {
     15_000,
   )
 
-  test('leased preflight helperのapp-serverは親process groupを継承する', async () => {
+  test('leased preflightは同じstateの稼働jobと別検証を保持し自分のprocess groupだけを回収する', async () => {
     const root = mkdtempSync(join(tmpdir(), 'zerokun-config-leased-test-'))
     temporaryRoots.push(root)
     const repo = join(root, 'repo')
@@ -902,41 +904,70 @@ for line in sys.stdin:
       stateDir: state,
       resultPath,
     }) + '\n', { mode: 0o600 })
-    const leased = await runLeasedCommandForTests([
-      process.execPath,
-      '--config=/dev/null',
-      '--no-env-file',
-      join(import.meta.dir, 'codex-executor.ts'),
-      'verify-effective-config',
-      spec,
-    ], state, {
-      cwd: repo,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root },
-      timeoutMs: 5_000,
-    })
-    const groups = readFileSync(groupFile, 'utf8').trim().split('\n').map(Number)
-    // Discovery plus requirements/effective-config validation each use a
-    // fresh App Server, and every one must stay in the leased process group.
-    expect(groups).toHaveLength(3)
-    for (const group of groups) expect(group).toBe(leased.groupId)
-    expect(leased.groupId).not.toBe(process.pid)
-    expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toEqual({
-      version: 1,
-      overrides,
-    })
-    const helperSource = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
-    const helper = helperSource.slice(
-      helperSource.indexOf('async function verifyEffectiveCodexConfigSpec('),
-      helperSource.indexOf('async function verifyCodexConfig('),
-    )
-    expect(helper.indexOf('removeSeatbeltFingerprint(spec.stateDir, fingerprint)'))
-      .toBeLessThan(helper.indexOf('atomicWritePrivateFile(spec.resultPath'))
-    const source = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
-    const appServer = source.slice(
-      source.indexOf('async function readCodexAppServer('),
-      source.indexOf('function assertCompatibleRequirements('),
-    )
-    expect(appServer).not.toContain('process.kill(-proc.pid')
+    const activeFingerprint = createSeatbeltFingerprint(state, 'active-job', 'a'.repeat(32))
+    const concurrentPreflight = createSeatbeltFingerprint(state, 'update-config', 'b'.repeat(32))
+    const activeReady = join(root, 'active-ready')
+    const activeChild = process.platform === 'darwin' ? Bun.spawn([
+      '/usr/bin/sandbox-exec', '-p', `(version 1)(allow default)(deny file-read-data (literal ${JSON.stringify(activeFingerprint.deny.path)}))`,
+      '/usr/bin/python3', '-c',
+      'import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text("ready"); time.sleep(60)',
+      activeReady,
+    ], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' }) : undefined
+    try {
+      if (activeChild) {
+        const deadline = Date.now() + 5_000
+        while (!existsSync(activeReady) && Date.now() < deadline) await Bun.sleep(10)
+        expect(existsSync(activeReady)).toBe(true)
+      }
+      const leased = await runLeasedCommandForTests([
+        process.execPath,
+        '--config=/dev/null',
+        '--no-env-file',
+        join(import.meta.dir, 'codex-executor.ts'),
+        'verify-effective-config',
+        spec,
+      ], state, {
+        cwd: repo,
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root },
+        timeoutMs: 5_000,
+      })
+      // A config check shares state with running jobs and other checks. It owns
+      // only its random attempt, never the global orphan recovery boundary.
+      if (activeChild) expect(activeChild.exitCode).toBeNull()
+      verifySeatbeltFingerprint(state, activeFingerprint)
+      verifySeatbeltFingerprint(state, concurrentPreflight)
+      expect(readdirSync(join(state, 'sandbox-obligations/update-config'))).toEqual(['b'.repeat(32)])
+      const groups = readFileSync(groupFile, 'utf8').trim().split('\n').map(Number)
+      // Discovery plus requirements/effective-config validation each use a
+      // fresh App Server, and every one must stay in the leased process group.
+      expect(groups).toHaveLength(3)
+      for (const group of groups) expect(group).toBe(leased.groupId)
+      expect(leased.groupId).not.toBe(process.pid)
+      expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toEqual({
+        version: 1,
+        overrides,
+      })
+      const helperSource = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+      const helper = helperSource.slice(
+        helperSource.indexOf('async function verifyEffectiveCodexConfigSpec('),
+        helperSource.indexOf('async function verifyCodexConfig('),
+      )
+      expect(helper.indexOf('removeSeatbeltFingerprint(spec.stateDir, fingerprint)'))
+        .toBeLessThan(helper.indexOf('atomicWritePrivateFile(spec.resultPath'))
+      const source = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
+      const appServer = source.slice(
+        source.indexOf('async function readCodexAppServer('),
+        source.indexOf('function assertCompatibleRequirements('),
+      )
+      expect(appServer).not.toContain('process.kill(-proc.pid')
+    } finally {
+      if (activeChild) {
+        activeChild.kill()
+        await activeChild.exited
+      }
+      if (existsSync(activeFingerprint.allow.path)) removeSeatbeltFingerprint(state, activeFingerprint)
+      if (existsSync(concurrentPreflight.allow.path)) removeSeatbeltFingerprint(state, concurrentPreflight)
+    }
   })
 
   test('App Serverで実際に残るuser legacy sandboxを拒否する', async () => {
