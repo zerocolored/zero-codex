@@ -349,6 +349,13 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
     expect(prompt).toContain('お願い: <誰> が <何> してください')
     expect(prompt).toContain('Do not open with what you')
     expect(prompt).toContain('If you genuinely need nothing from the reader')
+    // 自分のサンドボックスが *KEY* を落とすことを知らないと「管理者が
+    // SUPABASE_SERVICE_ROLE_KEY を設定してください」という叶わない依頼で止まる
+    // (2026-09-28 実測)。除外規則と代替経路を毎回の prompt に入れる。
+    expect(prompt).toContain('Environment and credentials:')
+    expect(prompt).toContain('*TOKEN*, *SECRET*, *PASSWORD*, *KEY*, *PROXY*, SLACK_*, ZEROKUN_* or CODEX_HOME')
+    expect(prompt).toContain('Never ask anyone to set such a variable')
+    expect(prompt).toContain('dotenvx -q run -- <command>')
     const other = store.enqueue(input({ threadTs: '1800000000.000999', messageId: '1800000000.000999' })).job
     expect(store.previousSlackDelivery(other.id)).toBeUndefined()
   } finally { store.close() }
