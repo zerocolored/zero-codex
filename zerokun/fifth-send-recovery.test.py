@@ -121,5 +121,42 @@ class SendRecoveryTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
 
 
+class AnswerFileContractTests(unittest.TestCase):
+    def setUp(self):
+        self.m = runpy.run_path(str(Path(__file__).with_name('fifth-advisor.py')), run_name='test')
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.fd)
+        self.output = self.root / 'answer.md'
+        self.marker = 'REQUEST_MARKER=' + 'A' * 32
+
+    def test_only_precreated_empty_private_output_can_be_authorized(self):
+        with self.assertRaises(FileNotFoundError):
+            self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+        self.output.touch(mode=0o600)
+        prompt = self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+        self.assertIn(str(self.output), prompt)
+        self.assertIn('CLAUDE_ANSWER_BEGIN=' + 'A' * 32, prompt)
+        self.assertIn('SHA256=<actual file SHA-256>', prompt)
+        self.assertEqual(self.output.read_bytes(), b'')
+        self.output.write_text('old answer')
+        with self.assertRaises(self.m['UnsafeRequest']):
+            self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+
+    def test_unsafe_output_is_not_followed_or_authorized(self):
+        other = self.root / 'other'
+        other.write_text('unchanged')
+        self.output.symlink_to(other)
+        with self.assertRaises(OSError):
+            self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+        self.assertEqual(other.read_text(), 'unchanged')
+        self.output.unlink()
+        self.output.touch(mode=0o644)
+        with self.assertRaises(self.m['UnsafeRequest']):
+            self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+
+
 if __name__ == '__main__':
     unittest.main()

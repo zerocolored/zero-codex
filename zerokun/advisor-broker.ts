@@ -25,6 +25,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { AdvisorFailureError, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
+import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
 export { claudeSubscriptionStatusIsReady } from './claude-auth-status.ts'
 import {
@@ -1892,6 +1893,7 @@ async function main(): Promise<void> {
     let marker = ''
     let deliveryUnknown = false
     let response: string | undefined
+    let answerArtifact: { path: string, sha256: string, bytes: number } | undefined
     let stateChangeSeqAfter: number | undefined
     let modelStartObserved = false
     let reason = 'Claude advisor was not sent'
@@ -1982,6 +1984,7 @@ async function main(): Promise<void> {
           ? `\n中断した元の相談の続行です。新しい依頼をレビュー済みとは扱わないでください。\n最新追記が対象の変更・取消・権限の制限を含む場合は、元の対象を調査せず、その変更をprimaryへ返してください。\n最新入力revision: ${continuationInput.revision} / digest: ${continuationInput.digest}\n最新入力(JSON): ${JSON.stringify(safeInput(continuationInput.transcript, 'continuation transcript', MAX_TRANSCRIPT_CHARS))}`
           : '')
       writeFileSync(join(requestDir, 'prompt'), prompt, { flag: 'wx', mode: 0o600 })
+      writeFileSync(join(requestDir, CLAUDE_ANSWER_FILE), '', { flag: 'wx', mode: 0o600 })
       const helper = resolveFifthAdvisorHelper()
       const python = realpathSync('/usr/bin/python3')
       const helperArgs = ['--project-root', claudeProjectRoot, '--request-dir', requestDir]
@@ -2029,7 +2032,7 @@ async function main(): Promise<void> {
       failureStage = 'send'
       const sendStartedAt = Date.now()
       const send = await runBounded(fingerprintedCommand([
-        python, helper, 'send', ...helperArgs, '--owned',
+        python, helper, 'send', ...helperArgs, '--owned', '--answer-file',
       ], jobFingerprint), { env: helperEnvironment, timeoutMs: 140_000 })
       const sendOutcome = recoverFifthAdvisorSendOutcome(
         send.stdout,
@@ -2095,6 +2098,40 @@ async function main(): Promise<void> {
                 transcript = ''
                 if (!identityMatches) throw new Error('owned ephemeral Claude identity changed during read')
                 stateChangedDuringRead = true
+                break
+              }
+              const fileAnswer = modelStartObserved
+                ? readClaudeAnswerFile(requestDir!, marker, transcript) : null
+              if (fileAnswer) {
+                const afterFile = unwrapAgent(await herdrJson(claudeRuntime,
+                  ['agent', 'get', target.target], 'Herdr answer file recheck', jobFingerprint))
+                if (!ephemeralClaudeAgentMatches(afterFile, target, claudeProjectRoot)) {
+                  throw new Error('owned ephemeral Claude identity changed during answer file read')
+                }
+                if (afterFile.state_change_seq !== current.state_change_seq
+                  || !['idle', 'done'].includes(afterFile.agent_status ?? '')) {
+                  observation.outcome = 'state-changed'
+                  stateChangedDuringRead = true
+                  break
+                }
+                if (containsCredentialMaterial(fileAnswer.response)) {
+                  throw new Error('Claude answer file contains credential material')
+                }
+                const directory = ensureManagedDirectory(stateDir,
+                  join(journalRoot, `revision-${input.revision}-${input.digest.slice(0, 16)}`))
+                const path = join(directory, `claude-answer-${diagnosticAttempt}.json`)
+                // Persist the full answer before workspace/request cleanup,
+                // even if a later cleanup check fails.
+                atomicWritePrivateFile(path, JSON.stringify({ version: 1, phase, round,
+                  marker, sha256: fileAnswer.sha256, bytes: fileAnswer.bytes,
+                  response: fileAnswer.response }))
+                answerArtifact = { path: relative(stateDir, path),
+                  sha256: fileAnswer.sha256, bytes: fileAnswer.bytes }
+                response = fileAnswer.response
+                stateChangeSeqAfter = current.state_change_seq
+                observation.outcome = 'complete'
+                diagnosticTranscript = transcript
+                diagnosticTranscriptReadIndex = diagnosticReads.length - 1
                 break
               }
               const { response: completeResponse, ...analysis } = analyzeClaudeResponse(transcript, marker)
@@ -2344,6 +2381,7 @@ async function main(): Promise<void> {
         stateChangeSeqAfter,
         response,
         responseDiagnostic,
+        answerArtifact,
         cleanupWarnings,
       }
     }
@@ -2371,6 +2409,7 @@ async function main(): Promise<void> {
       promptMayHaveBeenDelivered: Boolean(marker) || deliveryUnknown,
       reason,
       responseDiagnostic,
+      answerArtifact,
       failure: failure ?? classifyAdvisorFailure('claude', reason),
       cleanupWarnings,
     }

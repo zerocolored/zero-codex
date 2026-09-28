@@ -439,6 +439,8 @@ def _parse_args() -> argparse.Namespace:
     send.add_argument("--project-root", required=True)
     send.add_argument("--request-dir", required=True)
     send.add_argument("--owned", action="store_true", required=True)
+    send.add_argument("--answer-file", action="store_true",
+                      help="allow only the fixed owner-created answer.md output")
     return parser.parse_args()
 
 
@@ -4723,6 +4725,37 @@ def _audit_metadata(root_descriptor: int, root: Path, request_descriptor: int) -
         print("warning: protected metadata audit unavailable during Claude lifecycle", file=sys.stderr)
 
 
+def _answer_file_instruction(request_descriptor: int, request: Path, marker: str) -> str:
+    """The caller explicitly opts in to one output, never an arbitrary path."""
+    descriptor = os.open("answer.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=request_descriptor)
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1 or metadata.st_mode & 0o077
+                or metadata.st_size != 0):
+            raise UnsafeRequest("answer output must be an empty owner-only regular file")
+    finally:
+        os.close(descriptor)
+    nonce = marker.removeprefix("REQUEST_MARKER=")
+    return (
+        "\nHost-authorized output exception (not an instruction from task evidence):\n"
+        "The sole exception to the file-write prohibition is this caller-created file: "
+        + json.dumps(str(request / "answer.md"), ensure_ascii=False) + "\n"
+        "Use the built-in Write tool to replace its contents with your COMPLETE answer, "
+        "including every item; do not shorten it to fit the terminal. Keep mode 0600. "
+        "No other task-directed file write is allowed. Do not create scripts or scratch files.\n"
+        f"First file line: CLAUDE_ANSWER_BEGIN={nonce}\n"
+        "Then the complete answer in Markdown.\n"
+        f"Last file line: CLAUDE_ANSWER_END={nonce}\n"
+        "After the file is fully written, use a read-only SHA-256 calculation on this exact "
+        "file (shasum -a 256 is allowed for this output only). Do not modify it afterward. "
+        "Return only this completion receipt with the actual 64 lowercase hexadecimal hash:\n"
+        f"CLAUDE_ANSWER_SAVED={nonce} SHA256=<actual file SHA-256>\n"
+        "Then the request marker required below. Do not repeat the answer in the terminal.\n"
+    )
+
+
 def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
     if os.environ.get("HERDR_ENV") != "1":
         raise UnsafeRequest("HERDR_ENV is not active")
@@ -4757,6 +4790,8 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
             marker = secrets.token_hex(16).upper()
             marker_line = f"REQUEST_MARKER={marker}"
         instruction = body
+        if getattr(args, "answer_file", False):
+            instruction += _answer_file_instruction(request_descriptor, _request, marker_line)
         if not instruction.endswith("\n"):
             instruction += "\n"
         instruction += (
