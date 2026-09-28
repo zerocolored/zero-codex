@@ -59,6 +59,7 @@ const EPHEMERAL_CLAUDE_STAGED_REQUEST_FILES = new Set(
   EPHEMERAL_CLAUDE_ATOMIC_RECORDS.map(name => `.${name}.pending`),
 )
 const EPHEMERAL_CLAUDE_REQUEST_FILES = new Set([
+  'answer.md',
   'prompt',
   'protected-snapshot.json',
   EPHEMERAL_CLAUDE_INTENT,

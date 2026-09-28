@@ -174,7 +174,7 @@ function successfulFakeHerdr(
     close_count: 0,
   })}\n`, { mode: 0o600 })
   writeFileSync(binary, `#!/usr/bin/python3
-import json, os, signal, subprocess, sys, time, traceback
+import hashlib, json, os, signal, subprocess, sys, time, traceback
 path = ${JSON.stringify(statePath)}
 claude = ${JSON.stringify(claude)}
 def record_fixture_failure(kind, value, tb):
@@ -290,7 +290,23 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
             with open(os.path.join(state["project"], ".env.audit-fixture"), "w") as handle:
                 handle.write("synthetic concurrent runtime metadata")
         marker = next((line for line in reversed(prompt.splitlines()) if line.startswith("REQUEST_MARKER=")), "")
-        if state.get("response_capture"):
+        if state.get("answer_file_lines"):
+            prefix = "The sole exception to the file-write prohibition is this caller-created file: "
+            output = json.loads(next(line[len(prefix):] for line in prompt.splitlines() if line.startswith(prefix)))
+            nonce = marker.split("=", 1)[1]
+            body = "\\n".join("synthetic FAQ %d" % i for i in range(1, state["answer_file_lines"] + 1))
+            raw = "CLAUDE_ANSWER_BEGIN=" + nonce + "\\n" + body + "\\nCLAUDE_ANSWER_END=" + nonce + "\\n"
+            with open(output, "w", encoding="utf-8") as handle:
+                handle.write(raw)
+            os.chmod(output, 0o600)
+            digest = hashlib.sha256(raw.encode()).hexdigest()
+            if state.get("answer_file_corrupt"):
+                with open(output, "a") as handle:
+                    handle.write("partial replacement")
+            print("CLAUDE_ANSWER_SAVED=" + nonce + " SHA256=" + digest)
+            print(marker)
+            print("❯")
+        elif state.get("response_capture"):
             capture = state["response_capture"]
             print(capture.replace(state["capture_marker"], marker))
         else:
@@ -1709,6 +1725,32 @@ print('review complete')
       expect(final.close_count).toBe(1)
     } finally { await fixture.close() }
   }, 30_000)
+
+  test.each([{ corrupt: false, lines: 1500 }, { corrupt: false, lines: 20000 }, { corrupt: true, lines: 1500 }])('Claude answer file collects long payloads and rejects changes: %j', async ({ corrupt, lines }) => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const initial = JSON.parse(readFileSync(path, 'utf8'))
+      initial.answer_file_lines = lines
+      initial.answer_file_corrupt = corrupt
+      writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
+      const result = await fixture.call('investigation', 'revision-two')
+      expect(result.payload.claude.adopted).toBe(!corrupt)
+      expect(result.payload.claude.cleanupVerified).toBe(true)
+      if (!corrupt) {
+        const expected = Array.from({ length: lines }, (_, i) => `synthetic FAQ ${i + 1}`).join('\n')
+        expect(result.payload.claude.response).toBe(expected)
+        const artifact = JSON.parse(readFileSync(join(fixture.state, result.payload.claude.answerArtifact.path), 'utf8'))
+        expect(artifact.response).toBe(expected)
+        const replay = await fixture.call('investigation', 'revision-two')
+        expect(replay.payload.claude.response).toBe(expected)
+      }
+      const after = JSON.parse(readFileSync(path, 'utf8'))
+      expect(after.prompt_count).toBe(1)
+      expect(after.close_count).toBe(1)
+      expect(after.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 40_000)
 
   test.each(['audit_drift', 'startup_audit_drift', 'git_audit_failure'])('Claude実回答は並行metadata変化 %s で破棄せず一度の起動で3回答を保存する', async drift => {
     const fixture = await brokerFixture({ externalSuccess: true })
