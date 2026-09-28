@@ -25,7 +25,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { AdvisorFailureError, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
-import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile } from './claude-answer-file.ts'
+import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
 export { claudeSubscriptionStatusIsReady } from './claude-auth-status.ts'
 import {
@@ -2057,6 +2057,7 @@ async function main(): Promise<void> {
         failureStage = 'acquisition'
         if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
         const acquisitionDeadline = Date.now() + 60 * 60 * 1_000
+        const settling = new ClaudeResponseSettling()
         // Once prompt-started is durable, helper timeout/exit 5 is an ambiguous
         // transport outcome, not permission to resend or abandon acquisition.
         // Continue tracking the exact occupant and one-time marker instead.
@@ -2071,9 +2072,10 @@ async function main(): Promise<void> {
           if ((current.state_change_seq ?? 0) > target.stateChangeSeq) {
             modelStartObserved = true
           }
-          if (!['idle', 'done'].includes(current.agent_status ?? '')) continue
+          if (!['idle', 'done'].includes(current.agent_status ?? '')) { settling.reset(); continue }
           let transcript = ''
           let stateChangedDuringRead = false
+          let pendingAnswerDigest = ''
           for (const lines of [300, 600, 1200]) {
             const observation: ClaudeDiagnosticRead = {
               requestedLines: lines,
@@ -2100,8 +2102,20 @@ async function main(): Promise<void> {
                 stateChangedDuringRead = true
                 break
               }
-              const fileAnswer = modelStartObserved
-                ? readClaudeAnswerFile(requestDir!, marker, transcript) : null
+              let fileAnswer: ReturnType<typeof readClaudeAnswerFile> = null
+              try {
+                fileAnswer = modelStartObserved ? readClaudeAnswerFile(requestDir!, marker, transcript) : null
+              } catch (error) {
+                if (!(error instanceof ClaudeAnswerPendingError)) throw error
+                pendingAnswerDigest = error.progressDigest
+                reason = error.message
+                observation.outcome = 'answer-pending'
+                diagnosticTranscript = transcript
+                diagnosticTranscriptReadIndex = diagnosticReads.length - 1
+                // A missing receipt at 300 rows must not skip larger reads or
+                // the next stable poll. Unsafe files still fail immediately.
+                continue
+              }
               if (fileAnswer) {
                 const afterFile = unwrapAgent(await herdrJson(claudeRuntime,
                   ['agent', 'get', target.target], 'Herdr answer file recheck', jobFingerprint))
@@ -2152,7 +2166,7 @@ async function main(): Promise<void> {
             }
           }
           if (response) break
-          if (stateChangedDuringRead) continue
+          if (stateChangedDuringRead) { settling.reset(); continue }
           // Only the same owned, stable idle screen after the bounded reads
           // can exhaust startup confirmation. Keep delivery-possible: closing
           // this read-only advisor never authorizes a second prompt or retry.
@@ -2160,10 +2174,13 @@ async function main(): Promise<void> {
             throw new Error('Claude prompt delivery failed: start unconfirmed after the startup confirmation deadline')
           }
           if (!modelStartObserved) { await Bun.sleep(28_000); continue }
-          reason = 'Claude reached a terminal prompt but its complete marked response was unavailable'
-          // The same terminal state and sequence were revalidated after every
-          // bounded transcript read. No later output can complete this turn,
-          // so record the advisor as unavailable instead of waiting an hour.
+          const progress = createHash('sha256').update(transcript).digest('hex')
+          if (!settling.exhausted(`${current.state_change_seq}:${progress}:${pendingAnswerDigest}`, Date.now())) continue
+          reason = pendingAnswerDigest ? reason
+            : 'Claude complete marked response remained unavailable after bounded settling'
+          failure = { advisor: 'claude', cause: 'response' }
+          diagnosticFailure = { stage: 'acquisition', cause: 'response' }
+          persistDiagnostic()
           break
         }
         if (!response && Date.now() >= acquisitionDeadline) {
@@ -2434,7 +2451,7 @@ async function main(): Promise<void> {
     }),
   ])
   const advisorRoundInputSchema = {
-    retryUnavailable: z.boolean().optional().describe('Retry only missing answers in this same round, preserving adopted answers. Wait for nextRetryAt first.'),
+    retryUnavailable: z.boolean().optional().describe('Resume only an interrupted, unsent slot when the broker explicitly marks it retryable; never retry merely because an advisor answer is unavailable.'),
     inputUpdateIsRecoveryOnly: z.boolean().optional().describe('True only when newer Slack input resolves the failure without changing the reviewed request.'),
     phase: completeWorkflow
       ? z.enum(['investigation', 'review'])
@@ -2539,8 +2556,8 @@ async function main(): Promise<void> {
       ?? readTerminalJournal(input, phase, round, 'required-reviewer-failed')
       ?? readTerminalJournal(input, phase, round, 'stale-input')
     if (!journal) return null
-    const raw = readOptionalPrivateFile(`${roundJournalPath(input, phase, round)}.responses`)
-    if (!raw || Buffer.byteLength(raw) > 2 * 1024 * 1024
+    const raw = readOptionalBoundedOwnerOnlyRegularFile(`${roundJournalPath(input, phase, round)}.responses`, MAX_ADVISOR_RESPONSE_CACHE_BYTES)
+    if (!raw || Buffer.byteLength(raw) > MAX_ADVISOR_RESPONSE_CACHE_BYTES
       || createHash('sha256').update(raw).digest('hex') !== journal.responseCacheDigest) return null
     try {
       const saved = JSON.parse(raw)
@@ -2564,6 +2581,7 @@ async function main(): Promise<void> {
       const allAdopted = allAdvisorAttemptsAdopted(saved.native, saved.grok, saved.claude)
       return toolText({
         complete: inputUnchanged && allAdopted,
+        roundTerminal: inputUnchanged,
         restoredSavedResponses: true, phase, round,
         inputRevision: input.revision, inputDigest: input.digest, inputUnchanged,
         ...(inputUnchanged ? {} : { staleInput: true }),
@@ -2878,8 +2896,8 @@ async function main(): Promise<void> {
     }
     if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
       const retryPath = `${roundJournalPath({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3)}.responses`
-      const raw = readOptionalPrivateFile(retryPath)
-      if (raw && Buffer.byteLength(raw) <= 2 * 1024 * 1024) {
+      const raw = readOptionalBoundedOwnerOnlyRegularFile(retryPath, MAX_ADVISOR_RESPONSE_CACHE_BYTES)
+      if (raw) {
         try {
           const saved = JSON.parse(raw)
           const durable = JSON.parse(readOptionalPrivateFile(retryPath.slice(0, -10)) ?? '{}')
@@ -3752,12 +3770,12 @@ async function main(): Promise<void> {
       undefined,
       { version: THREE_ADVISOR_JOURNAL_VERSION, phase },
     )
-    const complete = inputUnchanged
+    const roundTerminal = inputUnchanged
       && (phaseScope === 'complete' || repositoryUnchanged)
-      && allAdvisorAttemptsAdopted(nativeEvidence, grokJournal, claudeJournal)
       && validThreeAdvisorNativeAttempts(nativeEvidence, phase)
       && validThreeAdvisorGrokAttempts(grokJournal, phase)
       && validTerminalClaudeAttempt(claudeJournal)
+    const complete = roundTerminal && allAdvisorAttemptsAdopted(nativeEvidence, grokJournal, claudeJournal)
     const finishedAt = Date.now()
     const responseCache = JSON.stringify({
       contextDigest, phase, round, complete, finishedAt, retryRepositoryDigest, evidenceDigest,
@@ -3811,6 +3829,7 @@ async function main(): Promise<void> {
     })}\n`)
     return toolText({
       complete,
+      roundTerminal,
       attemptsFinished: true,
       ...(automaticContinuation ? { continuedOriginalRequest: true, scopeAssessmentRequired: !inputUnchanged } : {}),
       inputRevision: boundInput.revision,
@@ -3836,13 +3855,12 @@ async function main(): Promise<void> {
         ),
         waitingForAdvisors: false,
         attemptsFinished: true,
-        nextRetryAt: finishedAt + 30_000,
         nextAction: '取得済み回答と欠員の理由を保持し、適用されるAGENTS.mdに従って本作業を継続してください。回答数だけを理由に待機・再試行しないでください。',
       } : {}),
       slotSummary,
       grok,
       claude,
-    }, !complete)
+    }, !roundTerminal)
     } catch (error) {
       return toolText({
         complete: false,
@@ -3998,7 +4016,7 @@ async function main(): Promise<void> {
       }
     }
     const journalPath = roundJournalPath(binding, phase, boundRound)
-    if (payload?.complete !== true) {
+    if (payload?.complete !== true && payload?.roundTerminal !== true) {
       // A failure before a durable journal was claimed is retryable once its
       // precondition is corrected. Durable terminal attempts are never resent.
       if (readOptionalPrivateFile(journalPath) === null) roundTasks.delete(taskKey)
@@ -4040,6 +4058,9 @@ async function main(): Promise<void> {
           }
           atomicWritePrivateFile(journalPath, `${JSON.stringify(journal)}\n`)
         }
+      }
+      if (!journal && payload.roundTerminal === true) {
+        journal = readTerminalJournal(binding, phase, boundRound, 'required-reviewer-failed')
       }
       if (!journal) {
         throw new Error('reviewer completion journal is missing or invalid')

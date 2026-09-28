@@ -3,7 +3,7 @@ import { createHash } from 'crypto'
 import { chmodSync, linkSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { readClaudeAnswerFile, MAX_CLAUDE_ANSWER_BYTES } from './claude-answer-file.ts'
+import { readClaudeAnswerFile, MAX_CLAUDE_ANSWER_BYTES, ClaudeAnswerPendingError, ClaudeResponseSettling } from './claude-answer-file.ts'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
@@ -73,10 +73,25 @@ test('real narrow Claude display wraps nonce and SHA across hard lines', () => {
   const f = fixture()
   const hash = createHash('sha256').update(f.raw).digest('hex')
   const line = `CLAUDE_ANSWER_SAVED=${nonce} SHA256=${hash}`
-  for (const width of [25, 42, 50, 80, 120]) {
+  for (const width of [10, 14, 18, 19, 25, 42, 50, 80, 120]) {
     const wrapped = line.match(new RegExp(`.{1,${width}}`, 'g'))!.join('\n  ')
     const wrappedMarker = marker.match(new RegExp(`.{1,${width}}`, 'g'))!.join('\n  ')
     expect(readClaudeAnswerFile(f.dir, marker, `⏺ ${wrapped}\n  ${wrappedMarker}\n❯`)?.response).toBe('独立した回答です。')
   }
   expect(() => readClaudeAnswerFile(f.dir, marker, `CLAUDE_ANSWER_SAVED=${nonce} SHA256=\nwrong\n${hash}\n${marker}`)).toThrow()
+})
+
+test('pending output can complete later without losing the owned answer', () => {
+  const f = fixture()
+  expect(() => readClaudeAnswerFile(f.dir, marker, '❯')).toThrow(ClaudeAnswerPendingError)
+  expect(readClaudeAnswerFile(f.dir, marker, f.terminal())?.response).toBe('独立した回答です。')
+})
+test('settling requires ten seconds of unchanged evidence and resets on progress', () => {
+  const state = new ClaudeResponseSettling()
+  expect(state.exhausted('first', 0)).toBe(false)
+  expect(state.exhausted('first', 9999)).toBe(false)
+  expect(state.exhausted('changed', 10000)).toBe(false)
+  expect(state.exhausted('changed', 20000)).toBe(true)
+  state.reset()
+  expect(state.exhausted('changed', 20001)).toBe(false)
 })
