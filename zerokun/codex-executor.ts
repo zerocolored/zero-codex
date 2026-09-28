@@ -4270,6 +4270,18 @@ export function buildCodexWorkerPrompt(
       'If the user says the proposal is missing, supply the complete proposal and its attachments in this job output; do not merely repeat that approval is pending.',
     )
   }
+  // CIのログを読む手段が無いと「原因未確定」で止まる。PRのCIはブランチ単体
+  // ではなくマージ結果を検査するので、自分のコミットだけ通っても意味がない。
+  // 手元で同じ条件を作れば再現できる(2026-09-28: develop を取り込むと重複
+  // プロパティで tsc が落ちた。ブランチ単体では通っていた)。
+  control.push(
+    'CI verification: a pull request runs its checks against the MERGE of your branch and its',
+    'base branch, not your commit alone, so a check can fail while your branch alone passes.',
+    'When a check fails and you cannot read its log, reproduce the same condition yourself before',
+    'reporting the cause as undetermined: fetch the base branch, merge it into your branch without',
+    'committing, run the command the workflow runs, then undo the merge. Report the failing command',
+    'and its output. "Cause undetermined" is only acceptable after that reproduction also comes back clean.',
+  )
   // 環境変数フィルタを知らないまま「未設定です」と読むと、実現不可能な依頼
   // (「管理者が SERVICE_ROLE_KEY を設定してください」)で止まる。除外規則は
   // shell_environment_policy.exclude と同じものを明示し、代わりの取得経路を示す。

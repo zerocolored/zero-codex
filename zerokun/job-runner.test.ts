@@ -356,6 +356,11 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
     expect(prompt).toContain('*TOKEN*, *SECRET*, *PASSWORD*, *KEY*, SLACK_* or ZEROKUN_*, and CODEX_HOME')
     expect(prompt).toContain('Never ask anyone to set such a variable')
     expect(prompt).toContain('dotenvx -q run -- <command>')
+    // CIはマージ結果を検査するので、ブランチ単体が通っても落ちる。ログを
+    // 読めないときは手元で同じ条件を作って再現させる(2026-09-28 実測)。
+    expect(prompt).toContain('CI verification:')
+    expect(prompt).toContain('against the MERGE of your branch and its')
+    expect(prompt).toContain('"Cause undetermined" is only acceptable after that reproduction also comes back clean')
     const other = store.enqueue(input({ threadTs: '1800000000.000999', messageId: '1800000000.000999' })).job
     expect(store.previousSlackDelivery(other.id)).toBeUndefined()
   } finally { store.close() }
