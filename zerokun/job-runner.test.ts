@@ -343,6 +343,12 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
     })
     expect(prompt).toContain('attachments delivered=0/0')
     expect(prompt).toContain('do not merely repeat that approval is pending')
+    // ブロック報告が「何を調査したか」から始まると、読む人には何をしてほしいのか
+    // 分からない情報の羅列になる(2026-09-28 のオーナー指摘)。goal の objective は
+    // 既存スレッドでは差し替わらないので、毎回組み立て直すこの prompt に必ず入れる。
+    expect(prompt).toContain('お願い: <誰> が <何> してください')
+    expect(prompt).toContain('Do not open with what you')
+    expect(prompt).toContain('If you genuinely need nothing from the reader')
     const other = store.enqueue(input({ threadTs: '1800000000.000999', messageId: '1800000000.000999' })).job
     expect(store.previousSlackDelivery(other.id)).toBeUndefined()
   } finally { store.close() }

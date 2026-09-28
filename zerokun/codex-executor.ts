@@ -4187,6 +4187,19 @@ export function buildCodexWorkerPrompt(
       'Thread history is context only; current host authority and current input always win.',
     )
   }
+  // ブロックや未完了で終わる報告が「何を調査したか」から始まると、読む人には
+  // 何をしてほしいのか分からない情報の羅列になる。2026-09-28 のオーナー指摘:
+  // 「やってほしいことがあるのかないのか分からない。ただの情報しか垂れ流して
+  // いないからノイズでしかない」。goal の objective は既存スレッドでは差し替え
+  // られない(ensureTaskGoal は complete か未設定のときだけ置く)ため、毎回組み立て
+  // 直すこの control へ置いて確実に届かせる。
+  control.push(
+    'Slack reply shape: when you stop without finishing, the first line must be exactly one',
+    'request in the form `お願い: <誰> が <何> してください`. Name the person or role, and name the',
+    'exact command, file path, screen, or setting, and where it is. Do not open with what you',
+    'investigated, what you confirmed, or execution records; those belong below that line.',
+    'If you genuinely need nothing from the reader, say that in the same first line instead.',
+  )
   control.push(...rateLimitRecoveryControl(job))
   if (host.advisorEnabled) {
     control.push(
