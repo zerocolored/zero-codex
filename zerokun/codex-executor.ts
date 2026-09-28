@@ -4275,7 +4275,7 @@ export function buildCodexWorkerPrompt(
   // shell_environment_policy.exclude と同じものを明示し、代わりの取得経路を示す。
   control.push(
     'Environment and credentials: this sandbox strips every inherited variable whose name matches',
-    '*TOKEN*, *SECRET*, *PASSWORD*, *KEY*, *PROXY*, SLACK_*, ZEROKUN_* or CODEX_HOME. An empty',
+    '*TOKEN*, *SECRET*, *PASSWORD*, *KEY*, SLACK_* or ZEROKUN_*, and CODEX_HOME. An empty',
     'credential variable therefore never means the operator failed to configure it, and nobody can',
     'fix it by exporting one for you. Never ask anyone to set such a variable. Load credentials from',
     'the repository instead: a workspace that encrypts them with dotenvx keeps .env next to .env.keys',
@@ -5759,7 +5759,11 @@ export function buildCodexPermissionOverrides(
     'model_provider="openai"',
     'model_providers={}',
     'shell_environment_policy.inherit="core"',
-    'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","*PROXY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
+    // *PROXY* を除外してはいけない。network_proxy が有効なとき、codex は
+    // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY を子シェルへ渡して、そこ経由でのみ外へ
+    // 出られるようにする。消すと直接接続だけが残り、seatbelt に EPERM で弾かれて
+    // ジョブから一切通信できなくなる(2026-09-28 実測)。proxy の URL は秘密ではない。
+    'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
     `shell_environment_policy.set={${shellEnvironment}}`,
     `web_search=${tomlString(executionWriteEnabled ? 'live' : 'disabled')}`,
     `tools.web_search=${executionWriteEnabled ? 'true' : 'false'}`,
