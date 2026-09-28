@@ -41,7 +41,7 @@ export type ClaudeDiagnosticRead = {
   observedAt: string
   stateBefore: { status?: string; sequence?: number }
   stateAfter?: { status?: string; sequence?: number }
-  outcome: ClaudeResponseAnalysis['code'] | 'state-changed' | 'identity-changed' | 'read-failed' | 'failure-snapshot'
+  outcome: ClaudeResponseAnalysis['code'] | 'answer-pending' | 'state-changed' | 'identity-changed' | 'read-failed' | 'failure-snapshot'
   analysis?: Omit<ClaudeResponseAnalysis, 'response'>
 }
 

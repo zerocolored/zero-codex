@@ -5,6 +5,28 @@ import { readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 
 export const CLAUDE_ANSWER_FILE = 'answer.md'
 export const MAX_CLAUDE_ANSWER_BYTES = 4 * 1024 * 1024
+// JSON can expand one source byte to six (control-character escapes), plus
+// the other advisors and ledger fields. Use the same bound on every restore.
+export const MAX_ADVISOR_RESPONSE_CACHE_BYTES = 16 * MAX_CLAUDE_ANSWER_BYTES
+
+export class ClaudeAnswerPendingError extends Error {
+  readonly progressDigest: string
+  constructor(message: string, raw: string | null) {
+    super(message)
+    this.progressDigest = createHash('sha256').update(raw ?? '').digest('hex')
+  }
+}
+
+/** Let stable incomplete output settle without resending or waiting an hour. */
+export class ClaudeResponseSettling {
+  private key: string | undefined
+  private since = 0
+  reset(): void { this.key = undefined }
+  exhausted(key: string, now: number): boolean {
+    if (key !== this.key) { this.key = key; this.since = now }
+    return now - this.since >= 10_000
+  }
+}
 
 /** A fixed caller-owned output bound to the one-time send and terminal digest.
  * Never searches sessions or combines partial terminal snapshots.
@@ -33,9 +55,10 @@ export function readClaudeAnswerFile(requestDir: string, marker: string, transcr
   const records: { hash: string, end: number }[] = []
   const receiptPattern = new RegExp(`^CLAUDE_ANSWER_SAVED=${nonce}SHA256=([a-f0-9]{64})$`)
   for (let index = 0; index < terminal.length; index++) {
-    if (!terminal[index]!.startsWith('CLAUDE_ANSWER_SAVED=')) continue
+    if (!terminal[index] || (!terminal[index]!.startsWith('CLAUDE_ANSWER_SAVED=')
+      && !'CLAUDE_ANSWER_SAVED='.startsWith(terminal[index]!))) continue
     let record = ''
-    for (let end = index; end < Math.min(index + 8, terminal.length); end++) {
+    for (let end = index; end < Math.min(index + 32, terminal.length); end++) {
       record += terminal[end]!.replace(/\s/g, '')
       if (record.length > 160) break
       const match = receiptPattern.exec(record)
@@ -44,31 +67,32 @@ export function readClaudeAnswerFile(requestDir: string, marker: string, transcr
   }
   // Only a truly empty output may fall back to a complete terminal answer.
   if (!raw && records.length === 0) return null
-  if (!raw || records.length !== 1) throw new Error('Claude answer file completion receipt unavailable')
+  if (!raw || records.length !== 1) throw new ClaudeAnswerPendingError('Claude answer file completion receipt unavailable', raw)
   const receipt = records[0]!
   const hash = receipt.hash
   if (createHash('sha256').update(raw).digest('hex') !== hash) {
-    throw new Error('Claude answer file digest mismatch')
+    throw new ClaudeAnswerPendingError('Claude answer file digest mismatch', raw)
   }
   let terminalMarker = false
   for (let index = receipt.end + 1; index < terminal.length; index++) {
-    if (!terminal[index]!.startsWith('REQUEST_MARKER=')) continue
+    if (!terminal[index] || (!terminal[index]!.startsWith('REQUEST_MARKER=')
+      && !'REQUEST_MARKER='.startsWith(terminal[index]!))) continue
     let record = ''
-    for (let end = index; end < Math.min(index + 8, terminal.length); end++) {
+    for (let end = index; end < Math.min(index + 32, terminal.length); end++) {
       record += terminal[end]!.replace(/\s/g, '')
       if (record === marker) { terminalMarker = true; break }
       if (record.length >= marker.length) break
     }
   }
-  if (!terminalMarker) throw new Error('Claude answer file terminal marker unavailable')
+  if (!terminalMarker) throw new ClaudeAnswerPendingError('Claude answer file terminal marker unavailable', raw)
   const lines = raw.replace(/\r\n/g, '\n').trimEnd().split('\n')
   const begin = `CLAUDE_ANSWER_BEGIN=${nonce}`
   const end = `CLAUDE_ANSWER_END=${nonce}`
   if (lines[0] !== begin || lines.at(-1) !== end
     || lines.filter(line => line === begin || line === end).length !== 2) {
-    throw new Error('Claude answer file boundaries mismatch')
+    throw new ClaudeAnswerPendingError('Claude answer file boundaries mismatch', raw)
   }
   const response = lines.slice(1, -1).join('\n').trim()
-  if (!response) throw new Error('Claude answer file is empty')
+  if (!response) throw new ClaudeAnswerPendingError('Claude answer file is empty', raw)
   return { response, sha256: hash, bytes: Buffer.byteLength(raw) }
 }

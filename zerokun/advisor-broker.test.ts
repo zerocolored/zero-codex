@@ -275,6 +275,8 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
     raise SystemExit(0)
 if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source", "recent-unwrapped", "--lines"]:
     prompt = state.get("prompt")
+    state["response_reads"] = state.get("response_reads", 0) + 1
+    save()
     if state.get("change_during_read") and not state.get("read_changed"):
         state["read_changed"] = True
         state["state_change_seq"] += 1
@@ -300,9 +302,12 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
                 handle.write(raw)
             os.chmod(output, 0o600)
             digest = hashlib.sha256(raw.encode()).hexdigest()
-            if state.get("answer_file_corrupt"):
+            if state.get("answer_file_corrupt") or state["response_reads"] <= state.get("answer_file_corrupt_reads", 0):
                 with open(output, "a") as handle:
                     handle.write("partial replacement")
+            if state["response_reads"] <= state.get("answer_file_receipt_delay_reads", 0):
+                print("❯")
+                raise SystemExit(0)
             print("CLAUDE_ANSWER_SAVED=" + nonce + " SHA256=" + digest)
             print(marker)
             print("❯")
@@ -1527,10 +1532,11 @@ print('review complete')
       const { result, payload } = await fixture.call(
         'investigation', 'revision-two', 'unavailable',
       )
-      expect(result.isError).toBe(true)
+      expect(result.isError).not.toBe(true)
       expect(payload).toMatchObject({
         complete: false,
         allAdopted: false,
+        roundTerminal: true,
         waitingForAdvisors: false,
         attemptsFinished: true,
         advisorUnavailable: expect.any(Array),
@@ -1726,7 +1732,7 @@ print('review complete')
     } finally { await fixture.close() }
   }, 30_000)
 
-  test.each([{ corrupt: false, lines: 1500 }, { corrupt: false, lines: 20000 }, { corrupt: true, lines: 1500 }])('Claude answer file collects long payloads and rejects changes: %j', async ({ corrupt, lines }) => {
+  test.each([{ corrupt: false, lines: 1500 }, { corrupt: false, lines: 20000 }, { corrupt: false, lines: 150000 }, { corrupt: true, lines: 1500 }])('Claude answer file collects long payloads and rejects changes: %j', async ({ corrupt, lines }) => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
       const path = fixture.externalEvidence!.fakeHerdrState
@@ -1742,6 +1748,11 @@ print('review complete')
         expect(result.payload.claude.response).toBe(expected)
         const artifact = JSON.parse(readFileSync(join(fixture.state, result.payload.claude.answerArtifact.path), 'utf8'))
         expect(artifact.response).toBe(expected)
+        const journalPath = join(fixture.journalRoot,
+          `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`, 'investigation-1.json')
+        const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
+        expect(readInterruptedAdvisorSlots(journalPath, journal).claude?.response).toBe(expected)
+        await fixture.restart()
         const replay = await fixture.call('investigation', 'revision-two')
         expect(replay.payload.claude.response).toBe(expected)
       }
@@ -1749,6 +1760,25 @@ print('review complete')
       expect(after.prompt_count).toBe(1)
       expect(after.close_count).toBe(1)
       expect(after.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 40_000)
+
+  test.each(['answer_file_receipt_delay_reads', 'answer_file_corrupt_reads'])('Claude file completion settles across polls without another prompt: %s', async field => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const initial = JSON.parse(readFileSync(path, 'utf8'))
+      initial.answer_file_lines = 1500
+      initial[field] = 3
+      writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
+      const result = await fixture.call('investigation', 'revision-two')
+      expect(result.payload.claude.adopted).toBe(true)
+      expect(result.payload.claude.response.split('\n')).toHaveLength(1500)
+      expect(result.payload.claude.cleanupVerified).toBe(true)
+      const after = JSON.parse(readFileSync(path, 'utf8'))
+      expect(after.response_reads).toBeGreaterThan(3)
+      expect(after.prompt_count).toBe(1)
+      expect(after.close_count).toBe(1)
     } finally { await fixture.close() }
   }, 40_000)
 
@@ -2052,9 +2082,10 @@ print('review complete')
     try {
       writeFileSync(join(fixture.repo, 'README.md'), 'edited before investigation\n', { mode: 0o600 })
       const { result, payload } = await fixture.call('investigation', 'revision-two')
-      expect(result.isError).toBe(true)
+      expect(result.isError).not.toBe(true)
       expect(payload).toMatchObject({
         complete: false,
+        roundTerminal: true,
         allAdopted: false,
         advisorUnavailable: expect.any(Array),
         slotSummary: {
@@ -2076,9 +2107,10 @@ print('review complete')
       writeFileSync(oversized, '', { mode: 0o600 })
       truncateSync(oversized, 65 * 1024 * 1024)
       const { result, payload } = await fixture.call('investigation', 'revision-two')
-      expect(result.isError).toBe(true)
+      expect(result.isError).not.toBe(true)
       expect(payload).toMatchObject({
         complete: false,
+        roundTerminal: true,
         allAdopted: false,
         advisorUnavailable: expect.arrayContaining([
           expect.objectContaining({ advisor: 'grok' }),
@@ -2358,6 +2390,40 @@ print('review complete')
       await fixture.close()
     }
   }, 60_000)
+
+  test('欠員roundの受領記録から取得済み指摘の必須修正だけをround 2で検証できる', async () => {
+    const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
+    try {
+      await fixture.call('investigation', 'revision-two')
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const state = JSON.parse(readFileSync(path, 'utf8'))
+      state.answer_file_lines = 1500
+      state.answer_file_corrupt = true
+      writeFileSync(path, JSON.stringify(state), { mode: 0o600 })
+      const first = await fixture.call('review', 'revision-two', 'adopted', 1, { reviewWorktrees: ['.'] })
+      expect(first.result.isError).not.toBe(true)
+      expect(first.payload).toMatchObject({ complete: false, roundTerminal: true, allAdopted: false,
+        slotSummary: { responsesObtained: 2 }, claude: { adopted: false } })
+      expect(first.payload.nextRetryAt).toBeUndefined()
+      expect(first.payload.pollObservedAt).toBeGreaterThan(0)
+      const repeated = await fixture.call('review', 'revision-two')
+      expect(repeated.payload).toMatchObject({ complete: false, alreadyObserved: true })
+      const after = JSON.parse(readFileSync(path, 'utf8'))
+      expect(after.prompt_count).toBe(2)
+      after.answer_file_corrupt = false
+      writeFileSync(path, JSON.stringify(after), { mode: 0o600 })
+      writeFileSync(join(fixture.repo, 'round-two-fix.ts'), 'export const fixed = true\n')
+      const second = await fixture.call('review', 'revision-two', 'adopted', 2, {
+        nativeAgentId: '/root/native-partial-risk-r2',
+        roundTwoBasis: {
+          roundOneSources: ['native'], mandatoryFindingSummary: '主要処理の不具合',
+          taskOwnedFixDelta: '主要処理の必須修正',
+          taskOwnedFixPaths: [{ repository: '.', path: 'round-two-fix.ts' }],
+        },
+      })
+      expect(second.payload).toMatchObject({ complete: true, allAdopted: true })
+    } finally { await fixture.close() }
+  }, 80_000)
 
   test('linked worktreeだけの修正でも保存したround 1から外部round 2を完了する', async () => {
     const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
@@ -2972,7 +3038,9 @@ print('review complete')
       let result = entry === 'poll'
         ? await fixture.poll('investigation', binding)
         : await fixture.call('investigation', binding)
-      while (result.payload.pending === true) result = await fixture.poll('investigation', fixture.revisionTwo)
+      while (result.payload.pending === true || result.payload.receiptRequired === true) {
+        result = await fixture.poll('investigation', fixture.revisionTwo)
+      }
       expect(result.payload.claude).toMatchObject({ adopted: true, executionState: 'response-obtained' })
       expect(result.payload.grok).toMatchObject([{ adopted: false, executionState: 'start-unconfirmed' }])
       if (entry === 'new-input') expect(result.payload).toMatchObject({ staleInput: true, inputRevision: fixture.revisionTwo.revision })
