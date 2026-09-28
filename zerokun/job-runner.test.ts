@@ -12172,6 +12172,30 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(runtime.path).not.toContain('relative')
   })
 
+  test.skipIf(process.platform !== 'darwin' || !existsSync('/opt/homebrew/Caskroom'))(
+    'Homebrew cask の実体(Caskroom)も読めるようにする',
+    () => {
+      // Homebrew は formula を Cellar、cask を Caskroom へ置く。bin の symlink は
+      // どちらの実体も指すため、Caskroom を落とすと cask で入れた実行体は
+      // sandbox から辿れず起動できない。2026-09-28、Cloud Logging コネクタが
+      // 「gcloud の起動拒否」で使えなかったのはこれが原因。
+      const dir = fixtureDir()
+      const runtime = resolveCodexToolchainRuntime({
+        sourcePath: '/opt/homebrew/bin:/usr/bin:/bin',
+        repoPath: join(dir, 'repo'),
+        stateDir: join(dir, 'state'),
+        artifactDir: join(dir, 'outbox'),
+        scratchDir: join(dir, 'tmp'),
+        homeDir: dir,
+      })
+      expect(runtime.readPaths).toContain(realpathSync('/opt/homebrew/Caskroom'))
+      // formula 側の実体も従来どおり読める。
+      if (existsSync('/opt/homebrew/Cellar')) {
+        expect(runtime.readPaths).toContain(realpathSync('/opt/homebrew/Cellar'))
+      }
+    },
+  )
+
   test.skipIf(process.platform !== 'darwin')(
     'macOSでは選択中の開発者directoryを読めるようにする',
     () => {

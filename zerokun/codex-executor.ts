@@ -5341,7 +5341,11 @@ export function resolveCodexToolchainRuntime(options: {
     if (!existingDirectory(prefixInput)) continue
     const prefix = realpathSync(prefixInput)
     if (!accepted.some(path => pathContains(prefix, realpathSync(path)))) continue
-    for (const child of ['bin', 'sbin', 'Cellar', 'opt', 'lib', 'share']) {
+    // Homebrew は formula を Cellar、cask を Caskroom へ置く。bin の symlink は
+    // どちらの実体も指すため、Caskroom を落とすと cask で入れた実行体(gcloud 等)は
+    // sandbox から辿れず起動できない。2026-09-28、Cloud Logging コネクタが
+    // 「gcloud の起動拒否」で使えなかったのはこれが原因。
+    for (const child of ['bin', 'sbin', 'Cellar', 'Caskroom', 'opt', 'lib', 'share']) {
       const path = join(prefixInput, child)
       if (!existingDirectory(path)) continue
       readPaths.add(resolve(path))
