@@ -47,6 +47,7 @@ function harness(options: { payloadSha?: string; failPlace?: boolean; identityAv
         }
       }
       if (tool === '/usr/bin/codesign') return { exitCode: 0, stdout: '', stderr: '' }
+      if (String(tool).endsWith('/lsregister')) return { exitCode: 0, stdout: '', stderr: '' }
       if (tool === '/usr/libexec/PlistBuddy') {
         const command = String(rest[1] ?? '')
         if (command.startsWith('Print :CFBundleIdentifier')) {
@@ -257,4 +258,30 @@ test('すでに分かれているidentifierは二重に伸ばさない', async (
   const again = await installVerificationBuild(h.context, h.commands,
     { app: APP, payload: payload(h, 'again.zip'), sha256: 'a'.repeat(64) })
   expect(again.bundleIdentifier).toBe('com.bellsalesai.live-agent.verification')
+})
+
+// identifier を書き換えても LaunchServices が古い記録を持つと、Computer Use は
+// 一覧に出たアプリを掴めず Invalid app を返す。置いた実体で登録し直す。
+test('置いた後にLaunchServicesへ登録し直す', async () => {
+  const h = harness()
+  installOriginal(h)
+  const result = await installVerificationBuild(h.context, h.commands,
+    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
+  expect(result.launchServicesRefreshed).toBe(true)
+  const registerIndex = h.calls.findIndex(call => String(call[0]).endsWith('/lsregister'))
+  const placeIndex = h.calls.map(call => call[0]).lastIndexOf('/bin/mv')
+  expect(registerIndex).toBeGreaterThan(placeIndex)
+  // staging ではなく、置いた先を登録する。
+  expect(h.calls[registerIndex]![2]).toBe(join(APPLICATIONS_ROOT, APP))
+})
+
+test('戻したあとも登録し直す', async () => {
+  const h = harness()
+  installOriginal(h)
+  await installVerificationBuild(h.context, h.commands,
+    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
+  const before = h.calls.filter(call => String(call[0]).endsWith('/lsregister')).length
+  const restored = await restoreInstalledBuild(h.context, h.commands, { app: APP })
+  expect(restored.launchServicesRefreshed).toBe(true)
+  expect(h.calls.filter(call => String(call[0]).endsWith('/lsregister')).length).toBe(before + 1)
 })

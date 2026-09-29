@@ -38,10 +38,23 @@ export const VERIFICATION_SIGNING_IDENTITY = 'zerokun verification (local only)'
 export const VERIFICATION_IDENTIFIER_SUFFIX = '.verification'
 const SHA256 = /^[0-9a-f]{64}$/
 const COMMAND_TIMEOUT_MS = 10 * 60 * 1000
+const LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 
 export type AppSwapCommands = {
   run: (argv: readonly string[], signal?: AbortSignal) => Promise<{ exitCode: number; stdout: string; stderr: string }>
   sha256: (path: string) => Promise<string>
+}
+
+// bundle の identifier を差し替えても LaunchServices は古い記録を持ったままで、
+// Computer Use は一覧に出たアプリを掴めず Invalid app を返す。置いた直後に
+// 登録し直して、記録を実体へ合わせる。
+async function refreshLaunchServices(
+  commands: AppSwapCommands,
+  bundle: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const registered = await commands.run([LSREGISTER, '-f', bundle], signal)
+  return registered.exitCode === 0
 }
 
 /** 製品版と許可を取り合わないよう、検証版だけ別の identifier にする。 */
@@ -215,10 +228,13 @@ export async function installVerificationBuild(
     if (existsSync(backup)) await commands.run(['/bin/mv', backup, target], signal)
     throw new Error('App swap could not place the verification build')
   }
+  // 置いた実体に対して登録し直す。staging のままだと消えた path が記録される。
+  const launchServicesRefreshed = await refreshLaunchServices(commands, target, signal)
   return {
     complete: true,
     app: name,
     installed: describeInstalled(name),
+    launchServicesRefreshed,
     previousHeld: existsSync(backup),
     restoreWith: 'app_swap_restore',
     bundleIdentifier,
@@ -247,7 +263,9 @@ export async function restoreInstalledBuild(
   }
   const moved = await commands.run(['/bin/mv', backup, target], signal)
   if (moved.exitCode !== 0) throw new Error('App swap could not restore the original application')
-  return { complete: true, app: name, restored: true, installed: describeInstalled(name) }
+  // 戻した製品版も登録し直す。検証版のidentifierが記録に残ると同じ症状になる。
+  const launchServicesRefreshed = await refreshLaunchServices(commands, target, signal)
+  return { complete: true, app: name, restored: true, installed: describeInstalled(name), launchServicesRefreshed }
 }
 
 function toolText(payload: unknown, isError = false) {
