@@ -5876,6 +5876,12 @@ export function buildCodexPermissionOverrides(
     `features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}`,
     'features.browser_use_full_cdp_access=false',
     `features.computer_use=${computerUseEnabled ? 'true' : 'false'}`,
+    // Computer Use は既定でアプリごとに許可を求める。実機検証で触るのは検証用
+    // アプリと、そこへ入るためのブラウザだけなので、その2つだけを明示して許す。
+    // システム設定は入れない。許可されると、あらゆる設定を変更できてしまう。
+    ...(computerUseEnabled ? [
+      'computer_use.macos.bundle_ids={"com.google.Chrome"="allow","com.bellsalesai.live-agent"="allow"}',
+    ] : []),
     `features.in_app_browser=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}`,
     `features.network_proxy=${networkEnabled ? 'true' : 'false'}`,
