@@ -3,7 +3,7 @@ import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync } 
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createHash } from 'crypto'
-import { captureClaudeFailureDiagnostic, saveClaudeResponseDiagnostic, parseClaudeStartupDiagnostic, MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES } from './claude-response-diagnostic.ts'
+import { ClaudeReadError, claudeReadCommandFailure, captureClaudeFailureDiagnostic, saveClaudeResponseDiagnostic, parseClaudeStartupDiagnostic, MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES } from './claude-response-diagnostic.ts'
 import { analyzeClaudeResponse, extractCompleteClaudeResponse, AdvisorOwnedProcessStillLiveError } from './advisor-broker.ts'
 
 const roots: string[] = []
@@ -166,4 +166,34 @@ test('failure capture preserves owned-process containment evidence while allowin
   expect(cleanupReached).toBe(true)
   expect(result.read.outcome).toBe('read-failed')
   expect(JSON.stringify(result)).not.toContain(error.message)
+})
+
+test.each(['before-state', 'transcript', 'after-state'] as const)('capture retains the failing stage %s without raw exception text', async stage => {
+  let calls = 0
+  const result = await captureClaudeFailureDiagnostic({
+    getState: async () => {
+      calls++
+      if ((calls === 1 && stage === 'before-state') || (calls === 2 && stage === 'after-state')) throw new Error('private exception')
+      return { agent_status: 'blocked' }
+    },
+    readTranscript: async () => { if (stage === 'transcript') throw new Error('private exception'); return 'owned output' },
+    matchesIdentity: () => true,
+  })
+  expect(result.read.failure).toEqual({ stage, kind: 'exception' })
+  expect(result.transcript).toBeUndefined()
+  expect(JSON.stringify(result)).not.toContain('private exception')
+})
+
+test('command failures retain only fixed codes and transport metadata', async () => {
+  for (const code of ['agent_not_idle', 'private arbitrary server detail']) {
+    const diagnostic = claudeReadCommandFailure({ exitCode: 1, timedOut: true, forcedCleanup: true, outputTruncated: true,
+      stdout: '', stderr: JSON.stringify({ error: { code, message: 'private stderr detail' } }) })
+    const result = await captureClaudeFailureDiagnostic({
+      getState: async () => ({ agent_status: 'blocked' }),
+      readTranscript: async () => { throw new ClaudeReadError(diagnostic) }, matchesIdentity: () => true,
+    })
+    expect(result.read.failure).toEqual({ stage: 'transcript', kind: 'command', exitCode: 1,
+      timedOut: true, forcedCleanup: true, outputTruncated: true, code: code === 'agent_not_idle' ? code : 'unknown-error' })
+    expect(JSON.stringify(result)).not.toContain('private')
+  }
 })
