@@ -245,6 +245,36 @@ export const SLACK_QUEUED_START_MESSAGE = '作業を開始しました。' as co
 export const SLACK_RATE_LIMIT_WAIT_MESSAGE = '⏸ レートリミットのため待機中です。自動で再開します。' as const
 const RATE_LIMIT_WAIT_NOTIFICATION_PREFIX = 'rate-limit-waiting:' as const
 
+// 終了報告の1行目は「読む人の出番」だけを表す。仕事の内部状態(blocked/paused)は
+// 読む人の関心ではなく、知りたいのは「自分が何かする必要があるのか」の一点。
+// 本人に書かせると書きぶりに左右されるので、ホストが状態から必ず組み立てる。
+export const READER_ACTION_BANNER = {
+  done: '✅ 完了 ／ 対応不要',
+  decide: '🙋 要判断 ／ あなたの決定が要ります',
+  act: '⏸️ 待ち ／ あなたの作業が要ります',
+  auto: '⏸️ 待ち ／ 対応不要（自動で再開します）',
+  failed: '🛑 失敗 ／ 対応不要（私が追います）',
+  stopped: '🛑 中止 ／ 対応不要',
+} as const
+
+/** 目標状態から、読む人の出番を決める。paused は判断待ち、blocked は作業待ち。 */
+export function readerActionBanner(taskGoalStatus: string | null | undefined): string {
+  switch (taskGoalStatus) {
+    case 'paused': return READER_ACTION_BANNER.decide
+    case 'usageLimited': case 'budgetLimited': return READER_ACTION_BANNER.auto
+    case 'blocked': case 'active': return READER_ACTION_BANNER.act
+    default: return READER_ACTION_BANNER.done
+  }
+}
+
+/**
+ * 依頼者を宛先にする。メンションが無いと通知が飛ばず、本人はスレッドを見に
+ * 行かない限り気付かない(ベルミくん側は既にそうしている)。
+ */
+export function addressedTo(userId: string | null | undefined): string {
+  return userId ? `<@${userId}> ` : ''
+}
+
 function rateLimitWaitNotificationKey(
   jobId: string,
   attempt: number,
@@ -17189,10 +17219,15 @@ export class SlackNotifier implements JobNotifier {
     const attachmentsBeforeWaiting = ['blocked', 'paused'].includes(job.taskGoalStatus ?? '') && output.files.length > 0
     const postBody = async () => {
       if (notificationId && this.store.terminalNotificationBodyDelivered(notificationId)) return
-      const waiting = job.taskGoalStatus && job.taskGoalStatus !== 'complete'
-      await this.post(job, waiting
-        ? `⏸️ 未完了・待機中です。\n\n${safeText || '続行に必要な条件を確認してください。'}`
-        : safeText || 'できました ✅', notificationId, signal)
+      const banner = readerActionBanner(job.taskGoalStatus)
+      const body = safeText
+        || (banner === READER_ACTION_BANNER.done ? '' : '続行に必要な条件を確認してください。')
+      await this.post(
+        job,
+        `${banner}\n\n${addressedTo(job.userId)}${body}`.trimEnd(),
+        notificationId,
+        signal,
+      )
       if (signal?.aborted) return
       if (notificationId) this.store.markTerminalNotificationBodyDelivered(notificationId)
     }
@@ -17326,13 +17361,19 @@ export class SlackNotifier implements JobNotifier {
     if (!notificationId || !this.store.terminalNotificationBodyDelivered(notificationId)) {
       await this.post(
         job,
+        // 停止操作による中断は障害ではない。読む人の出番も違うので印を分ける。
         cancelled
-          ? '🛑 中止しました。すでに完了した変更は自動では戻していません。'
-          : (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE
-              ? '🛑 停止操作により中断しました。'
-              : '🙇 うまく完了できませんでした。')
-            + `\n原因: ${publicJobFailureSummary(error)}`
-            + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
+          ? `${READER_ACTION_BANNER.stopped}\n\n${addressedTo(job.userId)}`
+            + '中止しました。すでに完了した変更は自動では戻していません。'
+          : error === FORCED_SERVICE_STOP_FAILURE_MESSAGE
+            ? `${READER_ACTION_BANNER.stopped}\n\n${addressedTo(job.userId)}`
+              + '停止操作により中断しました。'
+              + `\n原因: ${publicJobFailureSummary(error)}`
+              + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`
+            : `${READER_ACTION_BANNER.failed}\n\n${addressedTo(job.userId)}`
+              + 'うまく完了できませんでした。'
+              + `\n原因: ${publicJobFailureSummary(error)}`
+              + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
         notificationId,
         signal,
       )

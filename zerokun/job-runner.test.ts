@@ -5111,7 +5111,8 @@ describe('single FIFO worker', () => {
     })
     await notifier.failed(stoppedJob, stoppedReason)
     expect(posted).toEqual([
-      '🛑 停止操作により中断しました。'
+      '🛑 中止 ／ 対応不要'
+        + `\n\n<@${stoppedJob.userId}> 停止操作により中断しました。`
         + `\n原因: ${stoppedReason}`
         + `\nキュー #${stoppedJob.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
     ])
@@ -13460,7 +13461,8 @@ describe('Slack output guard', () => {
     await notifier.failed(job, raw)
 
     expect(posted).toEqual([
-      '🙇 うまく完了できませんでした。'
+      '🛑 失敗 ／ 対応不要（私が追います）'
+        + `\n\n<@${job.userId}> うまく完了できませんでした。`
         + '\n原因: 補助レビューの回答と保存履歴を照合できませんでした。'
         + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
     ])
@@ -13742,7 +13744,11 @@ describe('Slack output guard', () => {
       store.get(queued.id) ?? running,
       '5つの独立レビュー枠をすべて試行しました。残る3枠は利用不能でした。通常回答です。',
     )
-    expect(posted).toEqual(['通常回答です。'])
+    // 本文からadvisor自己申告が除かれることが主題。1行目の出番表示と宛先は別責務。
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toEndWith('通常回答です。')
+    expect(posted[0]).not.toContain('独立レビュー枠')
 
     posted.length = 0
     await notifier.completed(
@@ -13757,7 +13763,9 @@ describe('Slack output guard', () => {
       + '初期設計—起動5/5・回答4/5・起動済み回答未確認1/5'
       + '・起動未確認0/5・起動前利用不能0/5。'
     await notifier.completed(store.get(queued.id) ?? running, observed)
-    expect(posted).toEqual([observed])
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toEndWith(observed)
     store.close()
   })
 
@@ -13846,7 +13854,9 @@ describe('Slack output guard', () => {
     })
     const saved = store.get(queued.id)!
     await notifier.completed(saved, saved.result!)
-    expect(posted).toEqual([answer])
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toEndWith(answer)
     store.close()
   })
 
@@ -15372,7 +15382,9 @@ describe('durable terminal notifications', () => {
     await flushTerminalNotifications(store, notifier, () => {}, 1)
     await flushTerminalNotifications(store, notifier, () => {}, 1)
     expect(posted).toHaveLength(1)
-    expect(posted[0]).not.toContain('未完了・待機中')
+    // 完了は無印にしない。読まずに「対応不要」と分かることが目的。
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toContain(`<@${job.userId}>`)
     expect(posted[0]).toContain('回答2/3')
     expect(store.get(job.id)?.taskGoalStatus).toBe('complete')
     expect(posted[0]).toContain('Claude Code: 認証が必要です')
