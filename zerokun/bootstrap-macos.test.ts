@@ -742,6 +742,11 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('https://claude.ai/install.sh')
     expect(script).toContain('/bin/bash "$installer" stable')
     expect(script).toContain('resolve_claude_binary >/dev/null || install_claude_code')
+    // 実行時のadvisorは共有書き込みできる場所の実行fileを起動しない。bootstrapが
+    // それより甘い基準で「導入済み」と判定すると、Homebrew版を見て公式installerを
+    // 飛ばし、advisorだけ起動できないMacができる(2026-09-29 実測)。
+    expect(script).toContain('path_has_shared_write')
+    expect(script).toContain('claude_binary_candidate "$HOME/.local/bin/claude" && return 0')
     expect(script).not.toContain('claude auth login')
     expect(script).toContain('"$binary" auth status --json')
     expect(script).toContain('USER="$user_name"')

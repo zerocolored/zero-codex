@@ -193,15 +193,45 @@ resolve_herdr_binary() {
   printf '%s\n' "$binary"
 }
 
-resolve_claude_binary() {
-  local binary resolved
-  binary="$(command -v claude 2>/dev/null)" || return 1
+# 実行時のadvisorは、自分以外が書き換えられる場所の実行fileを起動しない。
+# bootstrapがそれより甘い基準で「導入済み」と判定すると、公式installerが
+# 飛ばされ、導入は成功したのにadvisorだけ起動できないMacができる。
+# Homebrewの /opt/homebrew/bin と Caskroom は group 書き込み可なので該当する。
+path_has_shared_write() {
+  local path="$1" mode group other
+  while :; do
+    mode="$(/usr/bin/stat -f '%OLp' "$path" 2>/dev/null)" || return 0
+    case "$mode" in
+      ???) ;;
+      *) return 0 ;;
+    esac
+    group="${mode%?}"
+    group="${group#?}"
+    other="${mode#??}"
+    case "$group" in 2|3|6|7) return 0 ;; esac
+    case "$other" in 2|3|6|7) return 0 ;; esac
+    case "$path" in /) return 1 ;; esac
+    path="$(dirname "$path")"
+  done
+}
+
+claude_binary_candidate() {
+  local binary="$1" resolved
   case "$binary" in /*) ;; *) return 1 ;; esac
   [ -f "$binary" ] && [ -x "$binary" ] || return 1
   resolved="$(/usr/bin/perl -MCwd=realpath -e 'print realpath($ARGV[0]) // q{}' "$binary" 2>/dev/null)" || return 1
   [ -f "$resolved" ] && [ -x "$resolved" ] || return 1
   [ "$(/usr/bin/stat -f '%u' "$resolved" 2>/dev/null)" = "$(/usr/bin/id -u)" ] || return 1
+  path_has_shared_write "$(dirname "$resolved")" && return 1
   printf '%s\n' "$binary"
+}
+
+resolve_claude_binary() {
+  local binary
+  # 公式installerの導入先を先に見る。PATHの先頭がHomebrewでも、安全な方を選ぶ。
+  claude_binary_candidate "$HOME/.local/bin/claude" && return 0
+  binary="$(command -v claude 2>/dev/null)" || return 1
+  claude_binary_candidate "$binary"
 }
 
 claude_subscription_ready() {
