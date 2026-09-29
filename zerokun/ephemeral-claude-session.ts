@@ -46,6 +46,7 @@ export const MAX_EPHEMERAL_CLAUDE_DELIVERY_EVIDENCE_BYTES = 4 * 1024
 const EPHEMERAL_CLAUDE_INTENT = 'ephemeral-session-intent.json'
 const EPHEMERAL_CLAUDE_WORKSPACE_RECEIPT = 'ephemeral-workspace-receipt.json'
 const EPHEMERAL_CLAUDE_ATOMIC_RECORDS = [
+  'instruction.md',
   'protected-snapshot.json',
   EPHEMERAL_CLAUDE_INTENT,
   EPHEMERAL_CLAUDE_WORKSPACE_RECEIPT,
@@ -59,6 +60,7 @@ const EPHEMERAL_CLAUDE_STAGED_REQUEST_FILES = new Set(
   EPHEMERAL_CLAUDE_ATOMIC_RECORDS.map(name => `.${name}.pending`),
 )
 const EPHEMERAL_CLAUDE_REQUEST_FILES = new Set([
+  'instruction.md',
   'answer.md',
   'prompt',
   'protected-snapshot.json',

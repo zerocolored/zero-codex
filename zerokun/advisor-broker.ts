@@ -118,11 +118,15 @@ import { recoverAdvisorSlot } from './advisor-retry.ts'
 import {
   saveClaudeResponseDiagnostic,
   captureClaudeFailureDiagnostic,
+  ClaudeReadError,
+  claudeReadFailure,
+  claudeReadCommandFailure,
   parseClaudeStartupDiagnostic,
   type ClaudeFailureDiagnostic,
   type ClaudeResponseAnalysis,
   type ClaudeDiagnosticRead,
   type ClaudeDiagnosticReceipt,
+  type ClaudeReadFailure,
 } from './claude-response-diagnostic.ts'
 
 const CLAUDE_SEND_CODES = ['agent_not_ready', 'agent_blocked', 'empty_agent_prompt',
@@ -150,6 +154,11 @@ export function claudeStartRemainsUnconfirmed(elapsedMs: number, modelStarted: b
 
 export class AdvisorContainmentError extends Error {}
 export class AdvisorOwnedProcessStillLiveError extends AdvisorContainmentError {}
+
+export function claudeContainmentFailureStatus(previous: string | undefined, error: unknown): string {
+  return previous === 'owned-process-still-live' || error instanceof AdvisorOwnedProcessStillLiveError
+    ? 'owned-process-still-live' : 'unverified-bounded-residual'
+}
 
 export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOutcome {
   const records = stdout.split(/\r?\n/).flatMap(line => {
@@ -1060,12 +1069,16 @@ async function herdrText(
   label: string,
   fingerprint?: FingerprintPaths,
 ): Promise<string> {
-  await verifyHerdrRuntimeIdentityAsync(runtime, brokerEnvironment(runtime))
+  try { await verifyHerdrRuntimeIdentityAsync(runtime, brokerEnvironment(runtime)) }
+  catch (error) {
+    if (error instanceof AdvisorContainmentError) throw error
+    throw new ClaudeReadError({ stage: 'runtime-verification', kind: 'exception' })
+  }
   const result = await runBounded(fingerprintedCommand([currentHerdrBinary(runtime), ...args], fingerprint), {
     env: brokerEnvironment(runtime), timeoutMs: 130_000,
   })
   if (result.timedOut || result.forcedCleanup || result.outputTruncated || result.exitCode !== 0) {
-    throw new Error(`${label} failed (${result.exitCode}): ${result.stderr.slice(-2_000)}`)
+    throw new ClaudeReadError(claudeReadCommandFailure(result))
   }
   return stripAnsi(result.stdout)
 }
@@ -1910,6 +1923,8 @@ async function main(): Promise<void> {
     const diagnosticAttempt = randomBytes(16).toString('hex')
     const diagnosticReads: ClaudeDiagnosticRead[] = []
     let diagnosticTranscript: string | undefined
+    let diagnosticTranscriptSource: 'recent-unwrapped' | 'visible' = 'recent-unwrapped'
+    let diagnosticContainmentError: AdvisorContainmentError | undefined
     let diagnosticTranscriptReadIndex: number | undefined
     let responseDiagnostic: ClaudeDiagnosticReceipt | undefined
     let failureStage: 'startup' | 'send' | 'acquisition' = 'startup'
@@ -1924,6 +1939,7 @@ async function main(): Promise<void> {
         attempt: diagnosticAttempt,
         reads: diagnosticReads,
         transcript: diagnosticTranscript,
+        transcriptSource: diagnosticTranscriptSource,
         transcriptReadIndex: diagnosticTranscriptReadIndex,
         phase,
         round,
@@ -1935,6 +1951,44 @@ async function main(): Promise<void> {
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
       ? projectLayout.projectPath
       : projectLayout.gitRoot
+    const captureFailureScreen = async () => {
+      if (!target || !claudeRuntime) return undefined
+      const runtime = claudeRuntime
+      const ownedTarget = target
+      let snapshot: Awaited<ReturnType<typeof captureClaudeFailureDiagnostic>> | undefined
+      for (const source of ['recent-unwrapped', 'visible'] as const) {
+        snapshot = await captureClaudeFailureDiagnostic({
+          source, requestedLines: source === 'visible' ? 120 : 1200,
+          getState: async () => unwrapAgent(await herdrJson(
+            runtime, ['agent', 'get', ownedTarget.target], 'Herdr failure diagnostic identity', jobFingerprint,
+          )),
+          readTranscript: async () => decodeHerdrReadOutput(await herdrText(runtime, [
+            'agent', 'read', ownedTarget.target, '--source', source, '--lines', source === 'visible' ? '120' : '1200',
+          ], 'Herdr failure diagnostic read', jobFingerprint)),
+          matchesIdentity: current => ephemeralClaudeAgentMatches(current, ownedTarget, claudeProjectRoot!),
+          onError: error => {
+            if (error instanceof AdvisorContainmentError) {
+              diagnosticContainmentError = error
+              helperContainmentVerified = false
+              containmentStatus = claudeContainmentFailureStatus(containmentStatus, error)
+            }
+          },
+        })
+        diagnosticReads.push(snapshot.read)
+        if (diagnosticReads.length > 3) diagnosticReads.shift()
+        diagnosticTranscriptReadIndex = undefined
+        if (snapshot.transcript !== undefined) {
+          diagnosticTranscript = snapshot.transcript
+          diagnosticTranscriptSource = source
+          diagnosticTranscriptReadIndex = diagnosticReads.length - 1
+        }
+        persistDiagnostic()
+        // Visible output is diagnostic only, never an answer. Do not fall back
+        // after identity drift or a containment failure.
+        if (snapshot.read.outcome !== 'read-failed' || !helperContainmentVerified) break
+      }
+      return snapshot
+    }
     try {
       if (!claudeProjectRoot) {
         return {
@@ -2000,7 +2054,7 @@ async function main(): Promise<void> {
 
       workspaceCreationAttempted = true
       const opened = await runBounded(fingerprintedCommand(
-        [python, helper, 'open', ...helperArgs], jobFingerprint,
+        [python, helper, 'open', ...helperArgs, '--answer-file'], jobFingerprint,
       ), {
         env: helperEnvironment, timeoutMs: CLAUDE_OPEN_TIMEOUT_MS,
       })
@@ -2058,6 +2112,7 @@ async function main(): Promise<void> {
         if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
         const acquisitionDeadline = Date.now() + 60 * 60 * 1_000
         const settling = new ClaudeResponseSettling()
+        const blockedSettling = new ClaudeResponseSettling()
         // Once prompt-started is durable, helper timeout/exit 5 is an ambiguous
         // transport outcome, not permission to resend or abandon acquisition.
         // Continue tracking the exact occupant and one-time marker instead.
@@ -2072,6 +2127,27 @@ async function main(): Promise<void> {
           if ((current.state_change_seq ?? 0) > target.stateChangeSeq) {
             modelStartObserved = true
           }
+          if (current.agent_status === 'blocked') {
+            settling.reset()
+            const snapshot = await captureFailureScreen()
+            if (snapshot?.read.outcome === 'identity-changed') throw new Error('owned ephemeral Claude identity changed during blocked observation')
+            if (diagnosticContainmentError) throw diagnosticContainmentError
+            const observed = snapshot?.read.stateAfter ?? (snapshot?.read.stateBefore.status
+              ? snapshot.read.stateBefore : { status: current.agent_status, sequence: current.state_change_seq })
+            if (snapshot?.read.outcome === 'state-changed' || observed?.status !== 'blocked') {
+              blockedSettling.reset(); continue
+            }
+            const progress = createHash('sha256').update(snapshot?.transcript ?? JSON.stringify(snapshot?.read.failure)).digest('hex')
+            if (!blockedSettling.exhausted(`${observed.sequence}:${progress}`, Date.now())) continue
+            failure = { advisor: 'claude', cause: 'response' }
+            diagnosticFailure = { stage: 'acquisition', cause: 'response' }
+            reason = snapshot?.transcript === undefined
+              ? 'Claude response blocked; terminal observation unavailable; no input was sent'
+              : 'Claude response acquisition stopped at a stable blocked interactive state; no input was sent'
+            persistDiagnostic()
+            break
+          }
+          blockedSettling.reset()
           if (!['idle', 'done'].includes(current.agent_status ?? '')) { settling.reset(); continue }
           let transcript = ''
           let stateChangedDuringRead = false
@@ -2085,10 +2161,13 @@ async function main(): Promise<void> {
             }
             diagnosticReads.push(observation)
             if (diagnosticReads.length > 3) diagnosticReads.shift()
+            let readStage: ClaudeReadFailure['stage'] = 'transcript'
             try {
               transcript = decodeHerdrReadOutput(await herdrText(claudeRuntime, [
                 'agent', 'read', target.target, '--source', 'recent-unwrapped', '--lines', String(lines),
               ], 'Herdr acquisition read', jobFingerprint))
+              diagnosticTranscriptSource = 'recent-unwrapped'
+              readStage = 'after-state'
               const afterRead = unwrapAgent(await herdrJson(
                 claudeRuntime, ['agent', 'get', target.target], 'Herdr acquisition recheck', jobFingerprint,
               ))
@@ -2159,6 +2238,9 @@ async function main(): Promise<void> {
                 stateChangeSeqAfter = current.state_change_seq
                 break
               }
+            } catch (error) {
+              observation.failure = claudeReadFailure(error, readStage)
+              throw error
             } finally {
               // Persist each owned snapshot before close/removal, even when the
               // next read fails. Keep content out of the returned advisor object.
@@ -2192,9 +2274,7 @@ async function main(): Promise<void> {
     } catch (error) {
       if (error instanceof AdvisorContainmentError) {
         helperContainmentVerified = false
-        containmentStatus = error instanceof AdvisorOwnedProcessStillLiveError
-          ? 'owned-process-still-live'
-          : 'unverified-bounded-residual'
+        containmentStatus = claudeContainmentFailureStatus(containmentStatus, error)
       }
       reason = String(error)
       if (error instanceof AdvisorFailureError) failure = error.failure
@@ -2202,29 +2282,9 @@ async function main(): Promise<void> {
       diagnosticFailure = { ...diagnosticFailure, stage: failureStage, cause: failure.cause, ...(startupCode ? { startupCode } : {}) }
       persistDiagnostic()
     } finally {
-      if (!response && marker && target && claudeRuntime && diagnosticReads.length === 0) {
-        const runtime = claudeRuntime
-        const ownedTarget = target
-        const snapshot = await captureClaudeFailureDiagnostic({
-          getState: async () => unwrapAgent(await herdrJson(
-            runtime, ['agent', 'get', ownedTarget.target], 'Herdr failure diagnostic identity', jobFingerprint,
-          )),
-          readTranscript: async () => decodeHerdrReadOutput(await herdrText(runtime, [
-            'agent', 'read', ownedTarget.target, '--source', 'recent-unwrapped', '--lines', '1200',
-          ], 'Herdr failure diagnostic read', jobFingerprint)),
-          matchesIdentity: current => ephemeralClaudeAgentMatches(current, ownedTarget, claudeProjectRoot!),
-          onError: error => {
-            if (error instanceof AdvisorContainmentError) {
-              helperContainmentVerified = false
-              containmentStatus = error instanceof AdvisorOwnedProcessStillLiveError
-                ? 'owned-process-still-live' : 'unverified-bounded-residual'
-            }
-          },
-        })
-        diagnosticReads.push(snapshot.read)
-        diagnosticTranscript = snapshot.transcript
-        diagnosticTranscriptReadIndex = snapshot.transcript === undefined ? undefined : 0
-        persistDiagnostic()
+      if (!response && marker && target && claudeRuntime
+        && (diagnosticReads.length === 0 || diagnosticReads.at(-1)?.outcome === 'read-failed')) {
+        await captureFailureScreen()
       }
       if (requestDir && claudeRuntime) {
         try {
@@ -2339,12 +2399,10 @@ async function main(): Promise<void> {
         } catch (error) {
           if (error instanceof AdvisorContainmentError) {
             helperContainmentVerified = false
-            containmentStatus = error instanceof AdvisorOwnedProcessStillLiveError
-              ? 'owned-process-still-live'
-              : 'unverified-bounded-residual'
+            containmentStatus = claudeContainmentFailureStatus(containmentStatus, error)
           } else if (workspaceCreationAttempted && !cleanupVerified) {
             helperContainmentVerified = false
-            containmentStatus = 'unverified-bounded-residual'
+            containmentStatus = claudeContainmentFailureStatus(containmentStatus, error)
           }
           response = undefined
           cleanupWarnings.push(`ephemeral Claude cleanup verification failed: ${error}`)
