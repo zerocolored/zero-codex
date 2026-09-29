@@ -23,7 +23,7 @@ type Harness = {
 
 // 実機の /Applications は触らない。mv / rm / ditto を受け取って、その場で
 // 同じ効果を作る。窓口が「何を・どの順で」やるかだけを検査する。
-function harness(options: { payloadSha?: string; failPlace?: boolean } = {}): Harness {
+function harness(options: { payloadSha?: string; failPlace?: boolean; identityAvailable?: boolean } = {}): Harness {
   const root = mkdtempSync(join(tmpdir(), 'zerokun-app-swap-'))
   const applications = join(root, 'Applications')
   const artifactDir = join(root, 'artifacts')
@@ -37,6 +37,15 @@ function harness(options: { payloadSha?: string; failPlace?: boolean } = {}): Ha
     run: async argv => {
       calls.push([...argv])
       const [tool, ...rest] = argv
+      if (tool === '/usr/bin/security') {
+        return {
+          exitCode: 0,
+          stdout: options.identityAvailable === false ? '0 valid identities found'
+            : '1) ABC "zerokun verification (local only)"',
+          stderr: '',
+        }
+      }
+      if (tool === '/usr/bin/codesign') return { exitCode: 0, stdout: '', stderr: '' }
       if (tool === '/usr/bin/ditto') {
         const [, , , , destination] = argv
         const bundle = join(destination!, APP)
@@ -171,4 +180,36 @@ test('statusは検証版が残っているかを示す', async () => {
   mkdirSync(join(h.context.backupRoot, APP, 'Contents'), { recursive: true })
   expect((appSwapStatus(h.context).applications as Array<Record<string, unknown>>)[0]!
     .verificationBuildStaged).toBe(true)
+})
+
+// adhoc のままだと再ビルドごとに別アプリ扱いになり、画面収録などの許可を
+// 毎回取り直すことになる。置く前に安定した署名へ付け替える。
+function installOriginal(h: Harness): string {
+  const installed = join(h.root, 'Applications', APP)
+  mkdirSync(join(installed, 'Contents'), { recursive: true })
+  writeFileSync(join(installed, 'Contents', 'Info.plist'), 'original')
+  return installed
+}
+
+test('置く前に検証用の署名へ付け替える', async () => {
+  const h = harness()
+  installOriginal(h)
+  await installVerificationBuild(h.context, h.commands,
+    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
+  const signIndex = h.calls.findIndex(call => call[0] === '/usr/bin/codesign')
+  const placeIndex = h.calls.findIndex(call => call[0] === '/bin/mv')
+  expect(signIndex).toBeGreaterThanOrEqual(0)
+  expect(signIndex).toBeLessThan(placeIndex)
+  expect(h.calls[signIndex]).toContain('zerokun verification (local only)')
+})
+
+test('証明書が無いMacでも差し替えは続き、許可が要ることを伝える', async () => {
+  const h = harness({ identityAvailable: false })
+  installOriginal(h)
+  const result = await installVerificationBuild(h.context, h.commands,
+    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
+  expect(result.complete).toBe(true)
+  expect(result.stableIdentity).toBe(false)
+  expect(String(result.permissionNote)).toContain('granted again')
+  expect(h.calls.some(call => call[0] === '/usr/bin/codesign')).toBe(false)
 })

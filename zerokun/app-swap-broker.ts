@@ -21,12 +21,32 @@ import { requireManagedStateRoot } from './managed-path.ts'
 export const MANAGED_APPS = ['bellMe.app'] as const
 export const APPLICATIONS_ROOT = '/Applications'
 const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024 * 1024
+/**
+ * 検証用ビルドは adhoc 署名で出てくる。adhoc は再ビルドのたびに別アプリ扱いに
+ * なるため、画面収録などの許可を毎回取り直すことになる。bootstrap が用意した
+ * 検証専用の自己署名で上書きすると、利用者の許可は1回で済む。会社の配布用
+ * 証明書ではないので、他の Mac では何の効力も持たない。
+ */
+export const VERIFICATION_SIGNING_IDENTITY = 'zerokun verification (local only)'
 const SHA256 = /^[0-9a-f]{64}$/
 const COMMAND_TIMEOUT_MS = 10 * 60 * 1000
 
 export type AppSwapCommands = {
   run: (argv: readonly string[], signal?: AbortSignal) => Promise<{ exitCode: number; stdout: string; stderr: string }>
   sha256: (path: string) => Promise<string>
+}
+
+/** 署名できたかを返す。証明書が無い Mac でも差し替えそのものは続ける。 */
+async function signForStableIdentity(
+  commands: AppSwapCommands,
+  bundle: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const available = await commands.run(['/usr/bin/security', 'find-identity', '-p', 'codesigning'], signal)
+  if (available.exitCode !== 0 || !available.stdout.includes(VERIFICATION_SIGNING_IDENTITY)) return false
+  const signed = await commands.run(
+    ['/usr/bin/codesign', '--force', '--deep', '--sign', VERIFICATION_SIGNING_IDENTITY, bundle], signal)
+  return signed.exitCode === 0
 }
 
 export type AppSwapContext = {
@@ -142,6 +162,10 @@ export async function installVerificationBuild(
     throw new Error('App swap payload is not an application bundle')
   }
 
+  // 置く前に署名する。置いた後だと、許可の無い状態のアプリが一瞬でも
+  // 「アプリケーション」に居ることになる。
+  const stableIdentity = await signForStableIdentity(commands, staged, signal)
+
   // 既存は消さずに退避する。ここで失敗したら何も置かない。
   if (existsSync(target)) {
     const moved = await commands.run(['/bin/mv', target, backup], signal)
@@ -163,6 +187,10 @@ export async function installVerificationBuild(
     installed: describeInstalled(name),
     previousHeld: existsSync(backup),
     restoreWith: 'app_swap_restore',
+    stableIdentity,
+    ...(stableIdentity ? {} : {
+      permissionNote: 'This build is ad-hoc signed, so screen recording and similar permissions must be granted again for it. Say so when you report a permission prompt.',
+    }),
   }
 }
 
