@@ -747,6 +747,23 @@ describe('macOS bootstrap', () => {
     // 飛ばし、advisorだけ起動できないMacができる(2026-09-29 実測)。
     expect(script).toContain('path_has_shared_write')
     expect(script).toContain('claude_binary_candidate "$HOME/.local/bin/claude" && return 0')
+    // 実音声E2Eの音声はここでしか作れない。公開SHAと展開後の実行fileの両方を
+    // 照合してから使う(2026-09-29 実測の値で固定)。
+    expect(script).toContain('6bd492249ac83c119f6fe38f2e44804e83ebc2c7f75295b21715080beb673a28')
+    expect(script).toContain('b4db0626f90bca175f4a1833394410f7abd263d2d85fdaa64100861181dcdea5')
+    expect(script).toContain('install_voicevox_engine')
+    // 検証用ビルドがadhocのままだと、ビルドのたびに別アプリ扱いになり画面収録
+    // などの許可を取り直すことになる。会社の配布用証明書は使わない。
+    expect(script).toContain('zerokun verification (local only)')
+    expect(script).toContain('install_verification_signing_identity')
+    // 空passwordのPKCS12はmacOSのimportがMAC検証で弾く。既定のmacalgでも弾かれる。
+    expect(script).toContain('-macalg sha1')
+    expect(script).toContain('openssl rand -hex 24')
+    // 自己署名は信頼評価を通らないが codesign では使える。-v を付けると見失う。
+    expect(script).toContain('security find-identity -p codesigning')
+    // どちらも欠けてもZeroちゃん本体は動く。bootstrapを止めない。
+    expect(script).toContain('warn "VOICEVOX Engine を取得できません')
+    expect(script).toContain('warn "検証用署名証明書を作れません')
     expect(script).not.toContain('claude auth login')
     expect(script).toContain('"$binary" auth status --json')
     expect(script).toContain('USER="$user_name"')
