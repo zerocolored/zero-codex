@@ -24,6 +24,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
+import { registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { AdvisorFailureError, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
 import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
@@ -3964,6 +3965,24 @@ async function main(): Promise<void> {
       waitingForAdvisors: false, retryable: false, continuationUnavailable: true,
       nextAction: '中断した相談の自動続行を終了しました。取得済み回答と不足理由を保持し、本作業を継続してください。' })
   }
+  server.registerTool('advisor_native_prepare', {
+    description: 'Before spawning the native GPT slot, durably register its original request. Repeated calls return the SAME taskName, prompt and input binding; never spawn a duplicate after interruption.',
+    inputSchema: {
+      phase: z.enum(['investigation', 'review']), round: z.union([z.literal(1), z.literal(2)]),
+      inputRevision: z.number().int().min(1), inputDigest: z.string().regex(/^[0-9a-f]{64}$/),
+      request: z.string().min(1).max(MAX_INPUT_CHARS),
+    },
+  }, async request => {
+    try {
+      const input = readAdvisorInputSnapshot(stateDir, context.jobId)
+      if (request.inputRevision !== input.revision || request.inputDigest !== input.digest) {
+        return toolText({ complete: false, staleInput: true, inputRevision: input.revision, inputDigest: input.digest }, true)
+      }
+      const registered = registerNativeAdvisor({ ...request, contextPath: contextInput, attemptNonce: context.attemptNonce })
+      return toolText({ ...registered, reusedOriginalRequest: registered.inputRevision !== input.revision,
+        nextAction: 'Use this exact taskName and prompt for the one native spawn. If already spawned, retain that child and recover its answer; do not spawn again.' })
+    } catch { return toolText({ complete: false, reason: 'Native request registration unavailable; preserve the existing child and do not claim a recovered answer.' }, true) }
+  })
   server.registerTool('advisor_round', {
     description: 'Durably start one ordered Three-Advisor attempt round. Resume an interrupted unsent slot from its saved original question; never resend delivery-possible prompts. Poll the returned binding.',
     inputSchema: advisorRoundInputSchema,

@@ -726,8 +726,8 @@ function completedFinalResponse(
     expectedParentThreadId,
     inheritedParentTurns,
   )
-  if (ownedTurns.length < 1 || ownedTurns.length > 2) {
-    throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
+  if (ownedTurns.length < 1 || ownedTurns.length > 128) {
+    throw new Error(`${label} must contain one completed turn within the recovery history bound`)
   }
   let finalResponse: string | null = null
   let parentInteractionCount = 0
@@ -778,7 +778,7 @@ function completedFinalResponse(
       throw new Error(`${label} delegated to another subagent`)
     }
     if (turn.status === 'interrupted') {
-      if (turnIndex !== 0 || messages.length !== 0 || finalResponse !== null) {
+      if (messages.length !== 0 || finalResponse !== null) {
         throw new Error(`${label} interrupted precursor contains a final response`)
       }
       continue
