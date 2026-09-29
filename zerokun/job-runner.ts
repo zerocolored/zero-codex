@@ -8,6 +8,7 @@ import { toSlackMrkdwn } from './slack-mrkdwn.ts'
 import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
 import { startFleetRunnerPulse } from './fleet-runtime.ts'
 import { resolveArtifactSource, previousThreadArtifactRoots } from './artifact-source.ts'
+import { existingJobTempDirectory } from './job-temp.ts'
 import { advisorFailureMessage, PUBLIC_ADVISOR_FAILURE_MESSAGES, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
@@ -16133,7 +16134,8 @@ export function sealArtifactResult(job: JobRecord, result: string, dir = stateDi
     throw new Error(`sealed artifact root is not a directory: ${sealedRoot}`)
   }
 
-  const sourceRoots = [outbox, scratchDirForJob(dir, job.id), ...previousThreadArtifactRoots(job, dir)]
+  const jobTempDir = existingJobTempDirectory(dir, job.id)
+  const sourceRoots = [outbox, scratchDirForJob(dir, job.id), ...(jobTempDir ? [jobTempDir] : []), ...previousThreadArtifactRoots(job, dir)]
   const sealed: string[] = []
   for (const requested of [...new Set(output.files)]) {
     const source = resolveArtifactSource(requested, sourceRoots)
