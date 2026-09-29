@@ -6900,6 +6900,7 @@ describe('production App Server executor', () => {
           const resumedPrompt = JSON.parse(readFileSync(prompts, 'utf8').trim().split('\n')[1]!).text
           expect(resumedPrompt).toStartWith('--- Transport recovery: continue the SAME task')
           expect(resumedPrompt).toContain('Do not blindly replay')
+          expect(resumedPrompt).toContain('Host-retained prior delivered artifacts:')
           expect(messages).toHaveLength(1)
         }
         if (mode === 'network-native') expect(messages).toHaveLength(1)

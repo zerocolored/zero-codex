@@ -37,6 +37,21 @@ test('startup diagnostics survive cleanup without terminal text or arbitrary err
   })
 })
 
+test('起動準備の失敗箇所とsnapshot終了状態を秘密本文なしで保存する', () => {
+  const options = fixture()
+  const receipt = saveClaudeResponseDiagnostic({ ...options,
+    failure: { stage: 'startup', cause: 'unknown', operation: 'request-directory' },
+    snapshot: { outcome: 'command-failed', exitCode: 7, timedOut: false,
+      forcedCleanup: false, outputTruncated: false },
+  })
+  expect(receipt.status).toBe('saved')
+  expect(JSON.parse(readFileSync(join(options.stateDir, receipt.path!), 'utf8'))).toMatchObject({
+    failure: { operation: 'request-directory' },
+    snapshot: { outcome: 'command-failed', exitCode: 7 },
+    transcript: { available: false, text: '' },
+  })
+})
+
 test('parser reports missing boundaries while accepting complete responses with unfamiliar UI', () => {
   const envelope = [instruction, marker, '回答内容', marker, '❯'].join('\n')
   expect(analyzeClaudeResponse(envelope, marker)).toMatchObject({ code: 'complete', response: '回答内容', markerLines: [1, 3] })

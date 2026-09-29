@@ -1,3 +1,4 @@
+import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
 import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
 import { waitForAdvisorSettlement } from './advisor-settlement.ts'
 import { ensureJobTempDirectory, existingJobTempDirectory, jobTempRoot } from './job-temp.ts'
@@ -5396,6 +5397,7 @@ export function buildCodexPermissionOverrides(
     gitRoots?: readonly string[]
     writeGitRoots?: readonly string[]
     profile?: string
+    reproductionMcp?: { command: string; args: string[] }
     advisorMcp?: { command: string; args: string[] }
     browserMcp?: { command: string; args: string[] }
     githubMcp?: { command: string; args: string[] }
@@ -5699,6 +5701,11 @@ export function buildCodexPermissionOverrides(
     '"NODE_REPL_TRUSTED_CODE_PATHS"=""',
   ].join(',')
   const mcpEntries: string[] = []
+  if (options.reproductionMcp) {
+    mcpEntries.push(
+      `zerokun_reproduction={command=${tomlString(options.reproductionMcp.command)},args=[${options.reproductionMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["codex_reproduction_start","codex_reproduction_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=3700}`,
+    )
+  }
   if (options.advisorMcp) {
     mcpEntries.push(
       `zerokun_advisors={command=${tomlString(options.advisorMcp.command)},args=[${options.advisorMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["advisor_native_prepare","advisor_round","advisor_round_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_native_prepare={approval_mode="approve"},advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"}}}`,
@@ -6631,6 +6638,8 @@ export async function executeCodexJob(
   ensureManagedDirectory(stateDir, scratchDir)
   const jobTempDir = ensureJobTempDirectory(stateDir, job.id)
   const liveInputRoot = liveControlInputDir(stateDir, job.id)
+  const retainedArtifacts = retainDeliveredArtifacts(job, stateDir, liveInputRoot)
+  const priorArtifactPrompt = retainedArtifactInstructions(retainedArtifacts.manifest)
   ensureManagedDirectory(stateDir, join(stateDir, 'executors'))
   const finalOutputDir = ensureManagedDirectory(
     stateDir,
@@ -6654,6 +6663,7 @@ export async function executeCodexJob(
     }
     return path
   }
+  const reproductionBrokerPath = requireSafeBroker('codex-reproduction-broker.ts')
   const brokerPath = requireSafeBroker('advisor-broker.ts')
   const browserBrokerPath = requireSafeBroker('browser-verification-broker.ts')
   const githubBrokerPath = requireSafeBroker('github-credential-broker.ts')
@@ -6888,6 +6898,16 @@ export async function executeCodexJob(
             ],
           }
         : undefined
+      const reproductionEnabled = job.writeEnabled && stage === 'complete' && !continuationDecision
+      const reproductionContextPath = join(runtimeDir, 'reproduction-context.json')
+      if (reproductionEnabled) atomicWritePrivateFile(reproductionContextPath, JSON.stringify({
+        version: 1, job, stateDir: managedStateDir, artifactDir, scratchDir,
+        liveInputDir: liveInputRoot, fingerprintAllowPath: seatbeltFingerprint.allow.path,
+      }))
+      const reproductionMcp = reproductionEnabled ? {
+        command: realpathSync(process.execPath),
+        args: ['--config=/dev/null', '--no-env-file', reproductionBrokerPath, reproductionContextPath, managedStateDir],
+      } : undefined
       const permissionProfile = `zerokun_job_${randomUUID().replaceAll('-', '')}`
       const cloudLoggingMcp = job.writeEnabled && stage === 'complete' && !continuationDecision
         ? {
@@ -6918,6 +6938,7 @@ export async function executeCodexJob(
         writeGitRoots,
         profile: permissionProfile,
         advisorMcp,
+        reproductionMcp,
         browserMcp,
         githubMcp,
         cloudLoggingMcp,
@@ -6961,7 +6982,7 @@ export async function executeCodexJob(
           reviewRound,
           browserMcp !== undefined,
           continuationDecision,
-        ),
+        ) + (reproductionEnabled ? '\nWhen the user explicitly asks to execute an independent Codex reproduction, use zerokun_reproduction.codex_reproduction_start with the exact prompt file and a workspace under this job scratch; do not launch nested codex through the sandboxed shell. This is not an extra advisor. The host runs authenticated Codex exec while its tools remain isolated. The call waits for completion; poll its returned id to recover the same execution, never duplicate it. Read final.txt and compare actual outputs with the retained prior artifacts. Execution success alone does not verify similarity.\n' : ''),
       }
     } catch (error) {
       const runtimeDir = advisorRuntimeDirForJob(stateDir, job.id, processNonce)
@@ -8257,7 +8278,7 @@ export async function executeCodexJob(
                 publicationOnlyPlans,
                 reviewWorkAction,
                 implementationReviewPlans,
-              )),
+              )) + priorArtifactPrompt,
             phaseClientUserMessageId ?? job.idempotencyKey,
             {
               cwd: job.repoPath,

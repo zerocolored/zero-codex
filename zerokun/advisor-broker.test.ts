@@ -398,6 +398,8 @@ async function brokerFixture(options: {
   claudeBlocked?: boolean
   claudeBlockedRecovers?: boolean
   claudeReadError?: boolean
+  snapshotDepthOverflow?: boolean
+  developerShimCollision?: boolean
   transientProbeDenial?: boolean
   onExternalPrompt?: (count: number, repo: string) => void
 } = {}): Promise<BrokerFixture> {
@@ -415,6 +417,9 @@ async function brokerFixture(options: {
   writeFileSync(join(repo, 'README.md'), 'fixture\n', { mode: 0o600 })
   git(['add', 'README.md'], repo)
   git(['commit', '-qm', 'test fixture'], repo)
+  if (options.snapshotDepthOverflow) {
+    mkdirSync(join(repo, ...Array.from({ length: 66 }, () => 'deep')), { recursive: true })
+  }
 
   const binary = join(root, 'herdr')
   const fakeHerdrState = join(root, 'fake-herdr-state.json')
@@ -619,10 +624,23 @@ async function brokerFixture(options: {
   writeFileSync(contextPath, `${JSON.stringify(context)}\n`, { mode: 0o600 })
   const contextDigest = createHash('sha256').update(JSON.stringify(context)).digest('hex')
   const fingerprint = createSeatbeltFingerprint(state, job.id, nonce)
+  const preload = join(root, 'developer-shim-collision.ts')
+  if (options.developerShimCollision) {
+    // Reproduce Bun's inode-cache collision for Apple's hardlinked shims.
+    // Exercise the real broker/helper lifecycle with only path resolution faulted.
+    writeFileSync(preload, `import * as fs from 'node:fs';
+import { mock } from 'bun:test';
+const original = fs.realpathSync;
+mock.module('fs', () => ({ ...fs, realpathSync: (path, ...args) =>
+  path === '/usr/bin/python3' ? '/usr/bin/git' : original(path, ...args) }));
+`, { mode: 0o600 })
+  }
   const createTransport = () => new StdioClientTransport({
     command: process.execPath,
     args: [
-      '--config=/dev/null', '--no-env-file', realpathSync(join(import.meta.dir, 'advisor-broker.ts')),
+      '--config=/dev/null', '--no-env-file',
+      ...(options.developerShimCollision ? ['--preload', preload] : []),
+      realpathSync(join(import.meta.dir, 'advisor-broker.ts')),
       contextPath, state, runtimeDir, fingerprint.allow.path, fingerprint.deny.path,
       'complete', nonce, claudePhysical,
     ],
@@ -2176,6 +2194,34 @@ print('review complete')
       await fixture.close()
     }
   }, 15_000)
+
+  test('macOS shimのrealpathがGitへ衝突してもPython helperを起動し回収する', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, developerShimCollision: true })
+    try {
+      const { payload } = await fixture.call('investigation', 'revision-two')
+      expect(payload.claude).toMatchObject({ adopted: true, executionState: 'response-obtained', cleanupVerified: true })
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
+      expect(state.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 30_000)
+
+  test('起動前snapshotが失敗してもClaudeを一度起動・回収してowned workspaceを閉じる', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, snapshotDepthOverflow: true })
+    try {
+      const { payload } = await fixture.call('investigation', 'revision-two')
+      expect(payload.claude).toMatchObject({ adopted: true, executionState: 'response-obtained', cleanupVerified: true })
+      const claude = payload.claude as { responseDiagnostic: { path: string }, cleanupWarnings: string[] }
+      expect(claude.cleanupWarnings).toContain('initial repository metadata snapshot was unavailable')
+      const diagnostic = JSON.parse(readFileSync(join(fixture.state, claude.responseDiagnostic.path), 'utf8'))
+      expect(diagnostic.snapshot).toMatchObject({ outcome: 'command-failed' })
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
+      expect(state.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 30_000)
 
   test('単一workflowはsnapshot不能な大型dirty fileでもreviewer transportを止めない', async () => {
     const fixture = await brokerFixture()

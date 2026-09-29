@@ -859,6 +859,32 @@ describe('fifth-advisor helper installer', () => {
     }
   }, 15_000)
 
+  test('snapshot未生成でも所有権記録を書いて読み戻せる', () => {
+    const home = fixture()
+    const { project, request } = gitProject(home)
+    const helper = installFifthAdvisorHelper(home)
+    const result = Bun.spawnSync(['/usr/bin/python3', '-c', [
+      'import importlib.util,sys,json,os',
+      'spec=importlib.util.spec_from_file_location("fifth_advisor_under_test",sys.argv[1])',
+      'module=importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'root,request=sys.argv[2:4]',
+      'assert not os.path.exists(os.path.join(request,module.SNAPSHOT_NAME))',
+      'payload={"version":2,"fixture":"owned-intent"}',
+      'module._write_request_record(root,request,module.SESSION_INTENT_NAME,payload)',
+      'assert module._load_request_record(root,request,module.SESSION_INTENT_NAME)==payload',
+      'try: module._write_request_record(root,request,module.SESSION_INTENT_NAME,{"fixture":"overwrite"})',
+      'except module.UnsafeRequest: pass',
+      'else: raise AssertionError("existing ownership overwritten")',
+      'assert module._load_request_record(root,request,module.SESSION_INTENT_NAME)==payload',
+      'print("ownership retained without metadata snapshot")',
+    ].join('\n'), helper, project, request], { stdout: 'pipe', stderr: 'pipe' })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(result.stdout.toString()).toContain('ownership retained without metadata snapshot')
+    expect(result.stderr.toString()).toContain('audit unavailable')
+    expect(existsSync(join(request, 'protected-snapshot.json'))).toBe(false)
+  })
+
   test('metadata監査例外は起動や送信を拒否する例外に昇格しない', () => {
     const home = fixture()
     const helper = installFifthAdvisorHelper(home)
@@ -1120,16 +1146,18 @@ describe('fifth-advisor helper installer', () => {
     }
   })
 
-  test('provisional recoverはnonce labelだけを閉じforeign差があっても冪等に完了する', () => {
+  test.each([true, false])('provisional recoverはnonce labelだけを閉じforeign差があっても冪等に完了する (snapshot=%s)', (withSnapshot) => {
     const home = fixture()
     const { project, request } = gitProject(home)
     const helper = installFifthAdvisorHelper(home)
     const lifecycle = fakeLifecycle(home, project)
-    const snapshot = Bun.spawnSync([
-      '/usr/bin/python3', helper, 'snapshot',
-      '--project-root', project, '--request-dir', request,
-    ], { env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe' })
-    expect(snapshot.exitCode, snapshot.stderr.toString()).toBe(0)
+    if (withSnapshot) {
+      const snapshot = Bun.spawnSync([
+        '/usr/bin/python3', helper, 'snapshot',
+        '--project-root', project, '--request-dir', request,
+      ], { env: lifecycle.environment, stdout: 'pipe', stderr: 'pipe' })
+      expect(snapshot.exitCode, snapshot.stderr.toString()).toBe(0)
+    }
     writeLifecycleIntent(request, project)
     rmSync(project, { recursive: true, force: true })
 
