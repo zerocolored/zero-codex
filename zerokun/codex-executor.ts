@@ -4312,6 +4312,16 @@ export function buildCodexWorkerPrompt(
     'credentials without editing any configuration file. Prefer that over modifying the operator\'s',
     'stored configuration, which you must not change to switch environments.',
   )
+  // 「アプリケーション」への書き込みは job に許していない。窓口があることを
+  // 知らないと、置くだけの作業を毎回人へ投げて止まる(2026-09-29 実測)。
+  control.push(
+    'Desktop application verification: you cannot write to /Applications, but zerokun_app_swap can.',
+    'Build the verification bundle, declare the zip as an artifact of this job, then call',
+    'app_swap_install with its sha256. The operator\'s own copy is set aside, not deleted, and',
+    'app_swap_restore puts it back — always restore once the verification is finished, and say in',
+    'your answer whether a verification build is still in place. Do not ask anyone to move an',
+    'application for you while that tool is offered.',
+  )
   // 別環境の資格情報を「人からもらうもの」と思い込み、自分では取りに行かずに
   // 止まっていた。配備そのものと同じ出どころから実行時に取れば、どこにも
   // 書き残さずに済む(2026-09-29: develop の URL は自分で取れたのに、鍵は
@@ -5469,6 +5479,7 @@ export function buildCodexPermissionOverrides(
     advisorMcp?: { command: string; args: string[] }
     browserMcp?: { command: string; args: string[] }
     githubMcp?: { command: string; args: string[] }
+    appSwapMcp?: { command: string; args: string[] }
     cloudLoggingMcp?: { command: string; args: string[] }
     seatbeltFingerprintAllowPath?: string
     executionWriteEnabled?: boolean
@@ -5812,6 +5823,13 @@ export function buildCodexPermissionOverrides(
     const cloud = options.cloudLoggingMcp
     mcpEntries.push(
       `zerokun_cloud_logging={command=${tomlString(cloud.command)},args=[${cloud.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["cloud_logging_read","cloud_run_describe","project_audit_read"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=90,tools={cloud_logging_read={approval_mode="approve"},cloud_run_describe={approval_mode="approve"},project_audit_read={approval_mode="approve"}}}`,
+    )
+  }
+  if (options.appSwapMcp) {
+    const swap = options.appSwapMcp
+    const swapTools = ['app_swap_status', 'app_swap_install', 'app_swap_restore']
+    mcpEntries.push(
+      `zerokun_app_swap={command=${tomlString(swap.command)},args=[${swap.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=[${swapTools.map(tomlString).join(',')}],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=900,tools={${swapTools.map(tool => `${tool}={approval_mode="approve"}`).join(',')}}}`,
     )
   }
   const mcpServers = `{${mcpEntries.join(',')}}`
@@ -6750,6 +6768,7 @@ export async function executeCodexJob(
   const browserBrokerPath = requireSafeBroker('browser-verification-broker.ts')
   const githubBrokerPath = requireSafeBroker('github-credential-broker.ts')
   const cloudLoggingBrokerPath = requireSafeBroker('cloud-logging-broker.ts')
+  const appSwapBrokerPath = requireSafeBroker('app-swap-broker.ts')
   const localAdvisorAccess = false
   const claudeAdvisorLookup = (() => {
     try { return resolveClaudeExecutableLookup() } catch { return undefined }
@@ -6990,6 +7009,17 @@ export async function executeCodexJob(
             ],
           }
         : undefined
+      // 実機検証には検証用ビルドを「アプリケーション」へ置く必要がある。書き込みを
+      // 直接許すと全アプリが差し替え可能になるため、対象と戻し方を固定した窓口を渡す。
+      const appSwapMcp = job.writeEnabled && stage === 'complete' && !continuationDecision
+        ? {
+            command: realpathSync(process.execPath),
+            args: [
+              '--config=/dev/null', '--no-env-file', appSwapBrokerPath,
+              logicalAttempt.contextPath, managedStateDir, artifactDir,
+            ],
+          }
+        : undefined
       const executionWriteEnabled = stage === 'complete'
         ? job.writeEnabled
         : stage === 'implementation'
@@ -7013,6 +7043,7 @@ export async function executeCodexJob(
         browserMcp,
         githubMcp,
         cloudLoggingMcp,
+        appSwapMcp,
         seatbeltFingerprintAllowPath: seatbeltFingerprint.allow.path,
         executionWriteEnabled,
         localVerificationEnabled: browserMcp !== undefined,

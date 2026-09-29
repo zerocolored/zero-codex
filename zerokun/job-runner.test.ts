@@ -368,6 +368,11 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
     expect(prompt).toContain('obtain them')
     expect(prompt).toContain('the same source the deployment itself reads')
     expect(prompt).toContain('Never write such a value into a file')
+    // 窓口があることを知らないと、置くだけの作業を毎回人へ投げて止まる。
+    // 戻し忘れた実機は本番と見分けがつかないので、報告も義務づける。
+    expect(prompt).toContain('zerokun_app_swap can')
+    expect(prompt).toContain('always restore once the verification is finished')
+    expect(prompt).toContain('Do not ask anyone to move an')
     // CIはマージ結果を検査するので、ブランチ単体が通っても落ちる。ログを
     // 読めないときは手元で同じ条件を作って再現させる(2026-09-28 実測)。
     expect(prompt).toContain('CI verification:')
