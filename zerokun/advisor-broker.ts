@@ -68,6 +68,7 @@ import {
 } from './advisor-snapshot.ts'
 import {
   createEphemeralClaudeRequestDirectory,
+  discardUnopenedEphemeralClaudeRequestDirectory,
   ephemeralClaudeAgentMatches,
   parseEphemeralClaudeClose,
   parseEphemeralClaudeOpen,
@@ -155,6 +156,21 @@ export function claudeStartRemainsUnconfirmed(elapsedMs: number, modelStarted: b
 
 export class AdvisorContainmentError extends Error {}
 export class AdvisorOwnedProcessStillLiveError extends AdvisorContainmentError {}
+
+/** A metadata audit is observational; only an owned-process hazard stops startup. */
+export async function observeClaudeStartupSnapshot(
+  run: () => Promise<Pick<ProcessResult, 'exitCode' | 'timedOut' | 'forcedCleanup' | 'outputTruncated'>>,
+): Promise<import('./claude-response-diagnostic.ts').ClaudeSnapshotDiagnostic> {
+  try {
+    const result = await run()
+    const failed = result.timedOut || result.forcedCleanup || result.outputTruncated || result.exitCode !== 0
+    return { outcome: failed ? 'command-failed' : 'completed', exitCode: result.exitCode,
+      timedOut: result.timedOut, forcedCleanup: result.forcedCleanup, outputTruncated: result.outputTruncated }
+  } catch (error) {
+    if (error instanceof AdvisorContainmentError) throw error
+    return { outcome: 'exception' }
+  }
+}
 
 export function claudeContainmentFailureStatus(previous: string | undefined, error: unknown): string {
   return previous === 'owned-process-still-live' || error instanceof AdvisorOwnedProcessStillLiveError
@@ -808,12 +824,14 @@ export async function runBounded(
     stdin?: string | Uint8Array
     /** Transport helpers are bounded; a model reviewer omits this whole-process deadline. */
     timeoutMs?: number
+    signal?: AbortSignal
     terminationGraceMs?: number
     seedProcessForTesting?: typeof seedTrackedProcess
     captureProcessesForTesting?: typeof captureTrackedProcesses
     reapProcessesForTesting?: typeof reapTrackedProcesses
   },
 ): Promise<ProcessResult> {
+  if (options.signal?.aborted) throw new Error('subprocess cancelled before start')
   const input = options.stdin === undefined ? undefined : Buffer.from(options.stdin)
   if (input && input.byteLength > MAX_ADVISOR_PROMPT_BYTES) {
     throw new Error('advisor subprocess stdin exceeds the shared transport byte limit')
@@ -896,16 +914,27 @@ export async function runBounded(
   }
   let timedOut = false
   let forcedCleanup = false
-  let outcome = options.timeoutMs === undefined
-    ? { kind: 'exit' as const, exitCode: await exit }
-    : await Promise.race([
-      exit.then(exitCode => ({ kind: 'exit' as const, exitCode })),
-      Bun.sleep(options.timeoutMs).then(() => ({ kind: 'timeout' as const })),
-    ])
+  let abort!: () => void
+  const interrupted = new Promise<{ kind: 'aborted' }>(resolve => { abort = () => resolve({ kind: 'aborted' }) })
+  options.signal?.addEventListener('abort', abort, { once: true })
+  if (options.signal?.aborted) abort()
+  const outcomes = [exit.then(exitCode => ({ kind: 'exit' as const, exitCode })), interrupted]
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined
+  let outcome: { kind: 'exit'; exitCode: number } | { kind: 'aborted' } | { kind: 'timeout' }
+  try {
+    outcome = options.timeoutMs === undefined
+      ? await Promise.race(outcomes)
+      : await Promise.race([...outcomes, new Promise<{ kind: 'timeout' }>(resolve => {
+          deadlineTimer = setTimeout(() => resolve({ kind: 'timeout' }), options.timeoutMs)
+        })])
+  } finally {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
+    options.signal?.removeEventListener('abort', abort)
+  }
   tracking = false
   await tracker
-  if (outcome.kind === 'timeout') {
-    timedOut = true
+  if (outcome.kind === 'timeout' || outcome.kind === 'aborted') {
+    timedOut = outcome.kind === 'timeout'
     let remaining: number[]
     try {
       remaining = await reapProcesses({
@@ -1930,6 +1959,8 @@ async function main(): Promise<void> {
     let responseDiagnostic: ClaudeDiagnosticReceipt | undefined
     let failureStage: 'startup' | 'send' | 'acquisition' = 'startup'
     let diagnosticFailure: ClaudeFailureDiagnostic | undefined
+    let diagnosticOperation: ClaudeFailureDiagnostic['operation'] = 'runtime'
+    let diagnosticSnapshot: import('./claude-response-diagnostic.ts').ClaudeSnapshotDiagnostic | undefined
     let diagnosticSendCode: ClaudeSendCode | undefined
     let diagnosticSendStatus: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed' = 'unconfirmed'
     let startupCode: ClaudeFailureDiagnostic['startupCode']
@@ -1945,6 +1976,7 @@ async function main(): Promise<void> {
         phase,
         round,
         failure: diagnosticFailure,
+        snapshot: diagnosticSnapshot,
         sendCode: diagnosticSendCode,
         sendStatus: diagnosticSendStatus,
       })
@@ -2015,6 +2047,7 @@ async function main(): Promise<void> {
         brokerEnvironment(claudeRuntime),
       )
       helperEnvironment = brokerHelperEnvironment(claudeRuntime, claudeLookupInput)
+      diagnosticOperation = 'authentication'
       await assertClaudeSubscriptionLogin(helperEnvironment)
       try {
         beforeSnapshot = phaseScope === 'complete'
@@ -2023,6 +2056,7 @@ async function main(): Promise<void> {
       } catch (error) {
         cleanupWarnings.push(`initial repository audit unavailable: ${error}`)
       }
+      diagnosticOperation = 'request-directory'
       requestDir = createEphemeralClaudeRequestDirectory({
         stateDir,
         jobId: context.jobId,
@@ -2033,6 +2067,7 @@ async function main(): Promise<void> {
         round,
       })
       chmodSync(requestDir, 0o700)
+      diagnosticOperation = 'prompt-files'
       const continuationInput = continuingInterruptedRequest ? readAdvisorInputSnapshot(stateDir, context.jobId) : undefined
       const prompt = advisorPrompt(reviewContext, input, phase, round, evidence)
         + (continuationInput && continuationInput.digest !== input.digest
@@ -2041,18 +2076,20 @@ async function main(): Promise<void> {
       writeFileSync(join(requestDir, 'prompt'), prompt, { flag: 'wx', mode: 0o600 })
       writeFileSync(join(requestDir, CLAUDE_ANSWER_FILE), '', { flag: 'wx', mode: 0o600 })
       const helper = resolveFifthAdvisorHelper()
-      const python = realpathSync('/usr/bin/python3')
+      // Apple's developer shims share an inode. Bun realpath can conflate
+      // their names after cache warmup; preserve Python's dispatch basename.
+      const python = '/usr/bin/python3'
       const helperArgs = ['--project-root', claudeProjectRoot, '--request-dir', requestDir]
-      const snapshot = await runBounded(fingerprintedCommand(
-        [python, helper, 'snapshot', ...helperArgs], jobFingerprint,
-      ), {
-        env: helperEnvironment, timeoutMs: 130_000,
-      })
-      if (snapshot.timedOut || snapshot.forcedCleanup
-        || snapshot.outputTruncated || snapshot.exitCode !== 0) {
-        throw new Error(`helper snapshot failed: ${snapshot.stderr}`)
+      diagnosticOperation = 'snapshot'
+      diagnosticSnapshot = await observeClaudeStartupSnapshot(() => runBounded(fingerprintedCommand(
+          [python, helper, 'snapshot', ...helperArgs], jobFingerprint,
+        ), { env: helperEnvironment, timeoutMs: 130_000 }))
+      if (diagnosticSnapshot.outcome !== 'completed') {
+        cleanupWarnings.push('initial repository metadata snapshot was unavailable')
       }
+      persistDiagnostic()
 
+      diagnosticOperation = 'open'
       workspaceCreationAttempted = true
       const opened = await runBounded(fingerprintedCommand(
         [python, helper, 'open', ...helperArgs, '--answer-file'], jobFingerprint,
@@ -2085,6 +2122,7 @@ async function main(): Promise<void> {
       await verifyHerdrRuntimeIdentityAsync(claudeRuntime, brokerEnvironment(claudeRuntime))
       deliveryUnknown = true
       failureStage = 'send'
+      diagnosticOperation = 'send'
       const sendStartedAt = Date.now()
       const send = await runBounded(fingerprintedCommand([
         python, helper, 'send', ...helperArgs, '--owned', '--answer-file',
@@ -2280,17 +2318,30 @@ async function main(): Promise<void> {
       reason = String(error)
       if (error instanceof AdvisorFailureError) failure = error.failure
       failure ??= classifyAdvisorFailure('claude', reason)
-      diagnosticFailure = { ...diagnosticFailure, stage: failureStage, cause: failure.cause, ...(startupCode ? { startupCode } : {}) }
+      diagnosticFailure = { ...diagnosticFailure, stage: failureStage, cause: failure.cause,
+        operation: failureStage === 'acquisition' ? 'acquisition' : diagnosticOperation,
+        ...(startupCode ? { startupCode } : {}) }
       persistDiagnostic()
     } finally {
       if (!response && marker && target && claudeRuntime
         && (diagnosticReads.length === 0 || diagnosticReads.at(-1)?.outcome === 'read-failed')) {
         await captureFailureScreen()
       }
-      if (requestDir && claudeRuntime) {
+      if (requestDir && !workspaceCreationAttempted && helperContainmentVerified) {
+        // Snapshot/prompt preparation never starts a workspace. Its failure
+        // must not invoke a helper requiring an intent that cannot exist, or
+        // poison the next bounded attempt with an EEXIST collision.
+        try {
+          discardUnopenedEphemeralClaudeRequestDirectory(stateDir, requestDir)
+          requestDir = undefined
+        } catch (error) {
+          cleanupWarnings.push(`unopened Claude request cleanup unavailable: ${error}`)
+        }
+      }
+      if (requestDir && workspaceCreationAttempted && claudeRuntime) {
         try {
           const helper = resolveFifthAdvisorHelper()
-          const python = realpathSync('/usr/bin/python3')
+          const python = '/usr/bin/python3'
           const cleanupEnvironment = helperEnvironment
             ?? brokerHelperEnvironment(claudeRuntime, claudeLookupInput)
           const helperArgs = [
@@ -2301,7 +2352,7 @@ async function main(): Promise<void> {
           // the independently owned workspace close below.
           try {
             const verifyBeforeClose = await runBounded(fingerprintedCommand([
-              realpathSync('/usr/bin/python3'), helper, 'verify',
+              '/usr/bin/python3', helper, 'verify',
               ...helperArgs,
             ], jobFingerprint), { env: cleanupEnvironment, timeoutMs: 130_000 })
             if (verifyBeforeClose.timedOut || verifyBeforeClose.forcedCleanup

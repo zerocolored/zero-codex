@@ -12,6 +12,15 @@ export type ClaudeFailureDiagnostic = {
   stage: 'startup' | 'send' | 'acquisition'
   cause: AdvisorFailure['cause']
   startupCode?: typeof STARTUP_CODES[number]
+  operation?: 'runtime' | 'authentication' | 'request-directory' | 'prompt-files' | 'snapshot' | 'open' | 'send' | 'acquisition'
+}
+
+export type ClaudeSnapshotDiagnostic = {
+  outcome: 'completed' | 'command-failed' | 'exception'
+  exitCode?: number | null
+  timedOut?: boolean
+  forcedCleanup?: boolean
+  outputTruncated?: boolean
 }
 
 export function parseClaudeStartupDiagnostic(stdout: string): ClaudeFailureDiagnostic['startupCode'] {
@@ -136,6 +145,7 @@ export function saveClaudeResponseDiagnostic(options: {
   phase?: string
   round?: number
   failure?: ClaudeFailureDiagnostic
+  snapshot?: ClaudeSnapshotDiagnostic
   sendCode?: 'agent_not_ready' | 'agent_blocked' | 'empty_agent_prompt'
     | 'agent_prompt_stalled' | 'agent_prompt_failed' | 'timeout' | 'unknown-error'
   sendStatus?: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed'
@@ -175,6 +185,7 @@ export function saveClaudeResponseDiagnostic(options: {
       phase: options.phase,
       round: options.round,
       failure: options.failure,
+      snapshot: options.snapshot,
       sendCode: options.sendCode,
       sendStatus: options.sendStatus,
       reads: options.reads.slice(-3),

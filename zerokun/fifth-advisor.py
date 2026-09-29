@@ -1402,7 +1402,9 @@ def _write_request_record(
     root_descriptor, root = _physical_git_root(project_root)
     request_descriptor, _request = _request_directory(request_dir, root)
     try:
-        _load_snapshot(request_descriptor, root, root_descriptor)
+        # Ownership is recorded in the intent/workspace receipts. A missing
+        # observational snapshot must not prevent writing those receipts.
+        _audit_metadata(root_descriptor, root, request_descriptor)
         _exclusive_json_record(request_descriptor, name, payload)
     finally:
         os.close(request_descriptor)
@@ -1470,7 +1472,7 @@ def _load_request_record(
     root_descriptor, root = _physical_git_root(project_root)
     request_descriptor, _request = _request_directory(request_dir, root)
     try:
-        _load_snapshot(request_descriptor, root, root_descriptor)
+        _audit_metadata(root_descriptor, root, request_descriptor)
         return _read_request_record(request_descriptor, name)
     finally:
         os.close(request_descriptor)
@@ -2997,9 +2999,10 @@ def _load_cleanup_records(
     Optional[Dict[str, object]],
     Optional[Exception],
 ]:
+    # Intent and workspace receipts establish ownership; the optional metadata
+    # audit must never prevent closing that exact owned workspace.
     request_descriptor, request = _owner_request_directory(request_dir)
     try:
-        snapshot = _read_snapshot_document(request_descriptor)
         intent = _read_request_record(request_descriptor, SESSION_INTENT_NAME)
         workspace = _read_request_record(request_descriptor, WORKSPACE_RECEIPT_NAME)
         _validate_workspace_receipt(intent, workspace)
@@ -3013,12 +3016,9 @@ def _load_cleanup_records(
             or not recorded_root.is_absolute()
             or ".." in recorded_root.parts
             or str(supplied_root) != recorded_root_text
-            or snapshot.get("project_root") != recorded_root_text
-            or snapshot.get("project_root_dev") != intent.get("project_root_dev")
-            or snapshot.get("project_root_ino") != intent.get("project_root_ino")
         ):
             raise UnsafeRequest(
-                "cleanup receipts do not match the protected project snapshot"
+                "cleanup receipts do not match the recorded project identity"
             )
         try:
             request.relative_to(recorded_root)
@@ -3703,7 +3703,6 @@ def _write_provisional_cleanup_record(
 ) -> None:
     request_descriptor, _request = _owner_request_directory(request_dir)
     try:
-        snapshot = _read_snapshot_document(request_descriptor)
         observed_intent = _read_request_record(
             request_descriptor,
             SESSION_INTENT_NAME,
@@ -3711,9 +3710,6 @@ def _write_provisional_cleanup_record(
         _validate_session_intent(observed_intent)
         if (
             observed_intent != intent
-            or snapshot.get("project_root") != intent.get("project_root")
-            or snapshot.get("project_root_dev") != intent.get("project_root_dev")
-            or snapshot.get("project_root_ino") != intent.get("project_root_ino")
             or _request_entry_exists(request_descriptor, WORKSPACE_RECEIPT_NAME)
         ):
             raise UnsafeRequest(
@@ -3920,7 +3916,6 @@ def _recover_provisional_command(args: argparse.Namespace) -> int:
         _discard_staged_records(request_descriptor)
         intent = _read_request_record(request_descriptor, SESSION_INTENT_NAME)
         _validate_session_intent(intent)
-        snapshot = _read_snapshot_document(request_descriptor)
         supplied_root = Path(args.project_root)
         recorded_root = intent.get("project_root")
         if (
@@ -3928,9 +3923,6 @@ def _recover_provisional_command(args: argparse.Namespace) -> int:
             or not supplied_root.is_absolute()
             or ".." in supplied_root.parts
             or str(supplied_root) != recorded_root
-            or snapshot.get("project_root") != recorded_root
-            or snapshot.get("project_root_dev") != intent.get("project_root_dev")
-            or snapshot.get("project_root_ino") != intent.get("project_root_ino")
         ):
             raise UnsafeRequest("provisional cleanup state identity changed")
         try:

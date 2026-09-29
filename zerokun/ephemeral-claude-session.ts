@@ -901,6 +901,23 @@ export function removeVerifiedEphemeralClaudeRequestDirectory(
   removeEmptyParents([trashRoot])
 }
 
+/** Caller holds the round lease; no open command may be in flight. */
+export function discardUnopenedEphemeralClaudeRequestDirectory(
+  stateDir: string,
+  requestDir: string,
+): void {
+  const request = requireEphemeralRequestDirectory(stateDir, requestDir)
+  // Check names without reading their contents. Even a staged intent means
+  // workspace creation might have begun. Never infer "unsent" from a journal
+  // when the local lifecycle records say otherwise.
+  for (const name of readdirSync(request)) {
+    if (!['prompt', 'answer.md', 'protected-snapshot.json', '.protected-snapshot.json.pending'].includes(name)) {
+      throw new EphemeralClaudeCleanupPendingError('ephemeral Claude request may have begun opening')
+    }
+  }
+  removeVerifiedEphemeralClaudeRequestDirectory(stateDir, request)
+}
+
 export type EphemeralClaudeReconcileDependencies = {
   resolveHelper?: () => string
   resolveClaudeLookup?: () => string

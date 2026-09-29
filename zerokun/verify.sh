@@ -392,6 +392,7 @@ for entry in \
   zerokun/standalone-codex.ts \
   zerokun/codex-executor.ts \
   zerokun/chrome-session-broker.ts \
+  zerokun/codex-reproduction-broker.ts \
   zerokun/project-layout.ts \
   zerokun/project-selection.ts \
   zerokun/codex-supervisor.ts \

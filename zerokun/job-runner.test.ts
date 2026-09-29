@@ -12256,6 +12256,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         stateDir: state,
         artifactDir: outbox,
         scratchDir: scratch,
+        reproductionMcp: {
+          command: '/usr/bin/true',
+          args: ['/runtime/codex-reproduction-broker.ts', '/state/context.json', '/state'],
+        },
         advisorMcp: {
           command: '/usr/bin/true',
           args: ['/runtime/advisor-broker.ts', '/state/context.json'],
@@ -12275,6 +12279,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         localVerificationEnabled: true,
         computerUseEnabled: true,
       }).join('\n')
+      const reproduction = (Bun.TOML.parse(overrides) as any).mcp_servers.zerokun_reproduction
+      expect(reproduction.enabled_tools).toEqual(['codex_reproduction_start', 'codex_reproduction_poll'])
+      expect(reproduction.required).toBe(false)
+      expect(reproduction.tool_timeout_sec).toBeGreaterThan(3600)
       expect(overrides).toContain('":root"="read"')
       expect(overrides).not.toContain('extends=')
       expect(overrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
@@ -12329,7 +12337,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       }
       expect(overrides).not.toContain('com.openai.sky.CUAService')
       expect(overrides).not.toContain('\"/Applications\"=\"read\"')
-      expect(overrides).toContain('mcp_servers={zerokun_advisors=')
+      expect((Bun.TOML.parse(overrides) as any).mcp_servers.zerokun_advisors.enabled).toBe(true)
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
       expect(overrides).toContain(',zerokun_cloud_logging=')

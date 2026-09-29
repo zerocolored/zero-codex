@@ -26,6 +26,7 @@ import {
   EphemeralClaudeCleanupPendingError,
   EphemeralClaudeOwnedProcessStillLiveError,
   createEphemeralClaudeRequestDirectory,
+  discardUnopenedEphemeralClaudeRequestDirectory,
   ephemeralClaudeAgentMatches,
   parseEphemeralClaudeClose,
   parseEphemeralClaudeOpen,
@@ -109,6 +110,41 @@ function request(state: string, overrides: Partial<Parameters<
 function privateFile(path: string, content: string): void {
   writeFileSync(path, content, { flag: 'wx', mode: 0o600 })
 }
+
+test('起動前の失敗を片付けて同じroundを作成でき、別roundの記録を保持する', () => {
+  const state = fixtureState()
+  const failed = request(state)
+  const other = request(state, { phase: 'review' })
+  privateFile(join(failed, 'prompt'), 'synthetic request')
+  privateFile(join(failed, 'answer.md'), '')
+  privateFile(join(failed, '.protected-snapshot.json.pending'), '{}')
+  privateFile(join(other, 'prompt'), 'keep other round')
+  discardUnopenedEphemeralClaudeRequestDirectory(state, failed)
+  expect(existsSync(failed)).toBe(false)
+  expect(request(state)).toBe(failed)
+  expect(readFileSync(join(other, 'prompt'), 'utf8')).toBe('keep other round')
+})
+
+test.each(['ephemeral-session-intent.json', '.ephemeral-session-intent.json.pending',
+  'ephemeral-workspace-receipt.json', 'ephemeral-send-receipt.json'])('起動・送信の可能性がある記録を削除しない: %s', name => {
+  const state = fixtureState()
+  const dir = request(state)
+  privateFile(join(dir, name), '{}')
+  expect(() => discardUnopenedEphemeralClaudeRequestDirectory(state, dir)).toThrow('may have begun opening')
+  expect(readFileSync(join(dir, name), 'utf8')).toBe('{}')
+  expect(() => request(state)).toThrow('already owns')
+})
+
+test('起動前cleanupでsymlink先やtask外のファイルを変更しない', () => {
+  const state = fixtureState()
+  const dir = request(state)
+  const outside = join(dirname(state), 'keep.txt')
+  privateFile(outside, 'keep')
+  symlinkSync(outside, join(dir, 'prompt'))
+  expect(() => discardUnopenedEphemeralClaudeRequestDirectory(state, dir)).toThrow('unsafe file')
+  expect(readFileSync(outside, 'utf8')).toBe('keep')
+  expect(existsSync(dir)).toBe(true)
+})
 
 function workspaceReceipt(projectRoot: string): Record<string, unknown> {
   return {
