@@ -157,6 +157,20 @@ class AnswerFileContractTests(unittest.TestCase):
         with self.assertRaises(self.m['UnsafeRequest']):
             self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
 
+    def test_long_instructions_are_preserved_with_one_short_execution_request(self):
+        full = 'Review the synthetic task.\n' * 2000 + self.marker + '\n'
+        prompt = self.m['_file_prompt_transport'](self.fd, self.root, full, self.marker)
+        saved = self.root / 'instruction.md'
+        self.assertEqual(saved.read_text(), full)
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+        self.assertLess(len(prompt), 1000)
+        self.assertEqual(len(prompt.splitlines()), 2)
+        self.assertIn('Read and carry out my task instructions', prompt)
+        self.assertEqual(prompt.splitlines()[-1], self.marker)
+        with self.assertRaises(self.m['UnsafeRequest']):
+            self.m['_file_prompt_transport'](self.fd, self.root, 'replacement', self.marker)
+        self.assertEqual(saved.read_text(), full)
+
 
 if __name__ == '__main__':
     unittest.main()
