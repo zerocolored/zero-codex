@@ -1,3 +1,4 @@
+import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
 import { waitForAdvisorSettlement } from './advisor-settlement.ts'
 import { ensureJobTempDirectory, existingJobTempDirectory, jobTempRoot } from './job-temp.ts'
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
@@ -3872,12 +3873,14 @@ export async function assertNativeAdvisorHistory(options: {
 function nativeAdvisorStartupRecoveryInstructions(): string {
   return [
     'Native GPT startup recovery is an exception to the single-process attempt rule, not a new advisor slot or review round.',
-    'Before reporting a native slot unavailable, inspect the spawn result and list_agents.',
+    'Before reporting a native slot unavailable, inspect the spawn result and list_agents AND host-recovered native advisor history.',
+    'list_agents is a live process registry, not the durable answer store. Absence after interruption does not prove answer loss.',
+    'Preserve the original marker and child identity. Never interrupt a native advisor merely to answer a user interjection.',
     'If startup explicitly failed before a child was created (for example MCP initialization Bad file descriptor,',
     'temporary transport failure or capacity), and no matching child exists, retry that SAME logical slot',
     'with the same model, reasoning effort, scope and marker after delays of 5, 15, 30, then 60 seconds.',
     'Continue recoverable pre-start retries at 60-second intervals until started or the user cancels; report the safe cause and waiting status.',
-    'Use a fresh task_name suffix for a failed creation. Do not restart Grok/Claude or call a new advisor round.',
+    'Reuse the registered taskName after a confirmed pre-creation failure; never allocate another registered slot. Do not restart Grok/Claude or call a new advisor round.',
     'If a child exists or delivery is uncertain, recover and wait for that exact child instead of spawning a duplicate.',
     'A failed list_agents call is unknown state, not proof that no child exists; restore observation before retrying.',
     'Authentication, quota exhaustion with no known recovery time, invalid configuration or model errors are not transient:',
@@ -3934,6 +3937,9 @@ export function buildCodexDeveloperInstructions(
         'reasoning_effort=high, and fork_turns=none. For each final-review round, attempt exactly',
         'one fresh risk_reviewer with model=gpt-6-astra, reasoning_effort=medium, and fork_turns=none.',
         'Fresh native creation and the current input marker apply only to a NEW logical round, never interruption recovery.',
+        'BEFORE spawning, call advisor_native_prepare with phase, round, current inputRevision/inputDigest and your independent review request.',
+        'Use its EXACT taskName, prompt, model and reasoningEffort for the spawn. This durable registration lets the host recover the same child.',
+        'Repeated prepare returns the ORIGINAL slot; never use it to spawn a duplicate. Host-recovered answers retain their original binding.',
         'Do not substitute another model or add a second',
         'native advisor. Wait for the started attempt, then pass its exact marked response and real',
         'agent ID to advisor_round. If the native slot did',
@@ -4977,7 +4983,8 @@ export function buildCodexInterjectionPausePrompt(
     'A same-thread message is waiting for a separate read-only response. Finish only the atomic',
     'tool operation already in progress. Start no new tool call and make no further repository,',
     'Git, network, or external-state change. Do not inspect or answer the waiting message in this',
-    'process. End this turn promptly so the host can fully retire it and resume the same Codex',
+    'process. Do not interrupt or close native advisors: the host drains their work before retiring this process.',
+    'Preserve their exact identities and original request markers. End this parent turn so the host can resume the same Codex',
     'thread with read-only permissions.',
     `The final line should be exactly [ZERO_INTERJECTION_PAUSED:${interjection.id}].`,
     '--- end Zero host conversational pause ---',
@@ -5689,7 +5696,7 @@ export function buildCodexPermissionOverrides(
   const mcpEntries: string[] = []
   if (options.advisorMcp) {
     mcpEntries.push(
-      `zerokun_advisors={command=${tomlString(options.advisorMcp.command)},args=[${options.advisorMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["advisor_round","advisor_round_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"}}}`,
+      `zerokun_advisors={command=${tomlString(options.advisorMcp.command)},args=[${options.advisorMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["advisor_native_prepare","advisor_round","advisor_round_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_native_prepare={approval_mode="approve"},advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"}}}`,
     )
   }
   if (options.browserMcp) {
@@ -8170,6 +8177,31 @@ export async function executeCodexJob(
           }
           if (phaseClientUserMessageId === 'cancelled') throw new CodexUserCancelledError()
         }
+        let retainedNativePrompt = ''
+        if (nativeAdvisorHistoryEnabled && resumeThreadId && !isInterjectionStage) {
+          await bestEffortAdvisorVerification('native-answer-recovery', async () => {
+            const recovery = {
+              parentThreadId: currentThreadId!, repoPath: job.repoPath,
+              attemptNonce: advisorAttempt.attemptNonce,
+              registrations: readNativeAdvisorRegistrations(logicalAttempt.contextPath, advisorAttempt.attemptNonce,
+                kind => reportAdvisorVerificationWarning(`native-recovery-${kind}`, new Error(kind))),
+              read: async (method: string, params: Record<string, unknown>) => (
+                await session.request(method, params, { timeoutMs: 15_000 })
+              ).result,
+              interrupted: () => options.signal?.aborted === true || controls.cancellationRequested(),
+            }
+            const retained = await recoverNativeAdvisorAnswers({ ...recovery,
+              inputRevision: advisorAttempt.inputSnapshot.revision,
+              inputDigest: advisorAttempt.inputSnapshot.digest,
+              onWarning: kind => reportAdvisorVerificationWarning(`native-recovery-${kind}`, new Error(kind)),
+            })
+            retainedNativePrompt = retainedNativeAdvisorPrompt(retained)
+            // A fresh process baseline includes this attempt's durable children.
+            // Only positively bound children are removed from that exclusion.
+            const owned = new Set(retained.map(child => child.threadId))
+            parentChildBaseline = parentChildBaseline!.filter(id => !owned.has(id))
+          })
+        }
         let initialRequestId: number | null = null
         try {
           if (stage === 'complete') {
@@ -8179,7 +8211,7 @@ export async function executeCodexJob(
           activeTurnTransientFailure = null
           currentTurnId = await session.startTurn(
             currentThreadId,
-            isInterjectionStage
+            retainedNativePrompt + (isInterjectionStage
               ? buildCodexInterjectionPrompt(
                 job,
                 boundInterjection!,
@@ -8220,7 +8252,7 @@ export async function executeCodexJob(
                 publicationOnlyPlans,
                 reviewWorkAction,
                 implementationReviewPlans,
-              ),
+              )),
             phaseClientUserMessageId ?? job.idempotencyKey,
             {
               cwd: job.repoPath,
@@ -8807,10 +8839,28 @@ export async function executeCodexJob(
         }
       } finally {
         try {
-          session.closeInput()
-        } catch (error) {
-          protocolError ??= error
-          terminate()
+          // Closing stdin also reaps the native children. Drain while RPCs
+          // are live, including when a conversational interjection paused us.
+          if (nativeAdvisorHistoryEnabled && currentThreadId && protocolError == null && !userCancelled) {
+            await bestEffortAdvisorVerification('native-before-retirement', async () => {
+              const outcome = await settleNativeAdvisors({
+                parentThreadId: currentThreadId!, repoPath: job.repoPath,
+                attemptNonce: advisorAttempt.attemptNonce,
+                registrations: readNativeAdvisorRegistrations(logicalAttempt.contextPath, advisorAttempt.attemptNonce,
+                kind => reportAdvisorVerificationWarning(`native-recovery-${kind}`, new Error(kind))),
+                read: async (method, params) => (await session.request(method, params, { timeoutMs: 15_000 })).result,
+                interrupted: () => options.signal?.aborted === true || controls.cancellationRequested(),
+              })
+              if (outcome === 'timeout' || outcome === 'unavailable') throw new Error(`native advisor settlement ${outcome}`)
+            })
+          }
+        } finally {
+          try {
+            session.closeInput()
+          } catch (error) {
+            protocolError ??= error
+            terminate()
+          }
         }
       }
       if (protocolCompleted && protocolError == null && !userCancelled) finishLogicalTurn()

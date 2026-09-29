@@ -107,6 +107,7 @@ function git(args: string[], cwd: string): string {
 }
 
 type BrokerFixture = {
+  prepareNative(binding?: AdvisorInputSnapshot): Promise<Record<string, unknown>>
   state: string
   repo: string
   jobId: string
@@ -651,6 +652,15 @@ async function brokerFixture(options: {
     journalRoot,
     contextDigest,
     fingerprint,
+    async prepareNative(binding = revisionTwo) {
+      const result = await client.callTool({ name: 'advisor_native_prepare', arguments: {
+        phase: 'investigation', round: 1, inputRevision: binding.revision,
+        inputDigest: binding.digest, request: 'Independent synthetic source review.',
+      } })
+      const block = (result.content as Array<{ type: string; text?: string }>).find(value => value.type === 'text')
+      if (!block?.text) throw new Error('native registration missing')
+      return JSON.parse(block.text) as Record<string, unknown>
+    },
     async restart() {
       await client.close()
       transport = createTransport()
@@ -4072,3 +4082,18 @@ test('live processの証拠を後続の診断・close・監査失敗で弱めな
   expect(claudeContainmentFailureStatus(undefined, new Error('unverified')))
     .toBe('unverified-bounded-residual')
 })
+
+
+test('native request登録はMCP再起動を跨いで同じ依頼・identityを返す', async () => {
+  const fixture = await brokerFixture()
+  try {
+    const stale = await fixture.prepareNative(fixture.revisionOne)
+    expect(stale.staleInput).toBe(true)
+    const first = await fixture.prepareNative()
+    expect(first.taskName).toMatch(/^zero_native_[a-f0-9]{32}$/)
+    expect(first.prompt).toContain(String(first.marker))
+    await fixture.restart()
+    const restored = await fixture.prepareNative()
+    expect(restored).toEqual(first)
+  } finally { await fixture.close() }
+}, 30_000)

@@ -1,3 +1,4 @@
+import { registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'crypto'
 import {
@@ -878,12 +879,27 @@ for line in sys.stdin:
         }], "nextCursor": None}})
     elif method == "thread/turns/list":
         emit({"id": request_id, "result": {"data": [], "nextCursor": None}})
+    elif method == "thread/read" and os.environ.get("ZERO_NATIVE_DRAIN_CHILD") and value.get("params", {}).get("threadId") == "drain-child":
+        fixture_path = os.environ["ZERO_NATIVE_DRAIN_CHILD"]
+        with open(fixture_path, "r", encoding="utf-8") as stream:
+            child_fixture = json.load(stream)
+        child_fixture["reads"] += 1
+        child = child_fixture["child"]
+        if child_fixture["reads"] >= 2:
+            child["turns"][0]["status"] = "completed"
+            child["turns"][0]["items"] = [{"type": "agentMessage", "phase": "final_answer", "text": "Synthetic independent answer.\\n" + child_fixture["marker"]}]
+        with open(fixture_path, "w", encoding="utf-8") as stream:
+            json.dump(child_fixture, stream)
+        emit({"id": request_id, "result": {"thread": child}})
     elif method == "thread/read":
         emit({"id": request_id, "result": {"thread": {"id": requested_thread or thread_id, "turns": []}}})
     elif method == "thread/list":
         children = [{
             "id": "historical-child", "parentThreadId": requested_thread or thread_id,
         }] if mode == "phased-native-history-resume" else []
+        if os.environ.get("ZERO_NATIVE_DRAIN_CHILD"):
+            with open(os.environ["ZERO_NATIVE_DRAIN_CHILD"], "r", encoding="utf-8") as stream:
+                children = [json.load(stream)["child"]]
         emit({"id": request_id, "result": {"data": children, "nextCursor": None}})
     elif method == "turn/steer":
         if os.environ.get("ZERO_CONTINUATION_STEER") == "1":
@@ -4472,6 +4488,40 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('親executorは暗号化inputの登録済みGPTが完成する前にApp Serverを閉じない', async () => {
+    const value = fixture('normal', false)
+    const childPath = join(value.root, 'native-child.json')
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'normal', ZERO_NATIVE_DRAIN_CHILD: childPath },
+      nativeAdvisorHistoryFixtureForTesting: async () => { throw new Error('no synthetic publication evidence') },
+      onSessionId: parentThreadId => {
+        const root = join(value.state, 'advisor-context', value.job.id)
+        const name = readdirSync(root).find(name => /^[a-f0-9]{32}\.json$/.test(name))!
+        const contextPath = join(root, name)
+        const context = JSON.parse(readFileSync(contextPath, 'utf8'))
+        const input = readAdvisorInputSnapshot(value.state, value.job.id)
+        const registered = registerNativeAdvisor({ contextPath, attemptNonce: context.attemptNonce,
+          phase: 'investigation', round: 1, inputRevision: input.revision, inputDigest: input.digest,
+          request: 'Read-only synthetic source review.' })
+        writeFileSync(childPath, JSON.stringify({ reads: 0, marker: registered.marker,
+          child: { id: 'drain-child', parentThreadId, cwd: value.job.repoPath, agentRole: 'solution_analyst',
+            source: { subAgent: { thread_spawn: { parent_thread_id: parentThreadId,
+              agent_role: 'solution_analyst', agent_path: registered.agentPath } } },
+            turns: [{ id: 'original-child-turn', status: 'inProgress', itemsView: 'full', items: [] }],
+          },
+        }), { mode: 0o600 })
+      },
+      liveControls: value.hooks,
+    })
+    expect(result.sessionId).toBe('thread-app-server-1')
+    const child = JSON.parse(readFileSync(childPath, 'utf8'))
+    expect(child.reads).toBeGreaterThanOrEqual(2)
+    expect(child.child.turns[0].status).toBe('completed')
+    value.store.close()
+  }, 30_000)
+
   test('fresh Slack jobは未materialize履歴APIを呼ばず空baselineでpublication gateを通す', async () => {
     const value = fixture('phased-native-history-fresh', true)
     const rpcLog = join(value.root, 'native-history-fresh-rpc.log')
@@ -4539,7 +4589,8 @@ describe('production App Server executor', () => {
     expect(rpc.filter(entry => entry.method === 'thread/start')).toHaveLength(1)
     expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(2)
     expect(rpc.filter(entry => entry.method === 'turn/start')).toHaveLength(3)
-    expect(rpc.filter(entry => entry.method === 'thread/list')).toHaveLength(0)
+    expect(rpc.findIndex(entry => entry.method === 'thread/list'))
+      .toBeGreaterThan(rpc.findIndex(entry => entry.method === 'turn/start'))
     expect(rpc.filter(entry => entry.method === 'thread/turns/list')).toHaveLength(0)
     completeFixtureJob(value.store, value.job, result.sessionId, result.result)
     expect(value.store.get(value.job.id)?.status).toBe('completed')
