@@ -48,6 +48,7 @@ function harness(options: { payloadSha?: string; failPlace?: boolean; identityAv
       }
       if (tool === '/usr/bin/codesign') return { exitCode: 0, stdout: '', stderr: '' }
       if (String(tool).endsWith('/lsregister')) return { exitCode: 0, stdout: '', stderr: '' }
+      if (tool === '/usr/bin/pkill') return { exitCode: 1, stdout: '', stderr: '' }
       if (tool === '/usr/libexec/PlistBuddy') {
         const command = String(rest[1] ?? '')
         if (command.startsWith('Print :CFBundleIdentifier')) {
@@ -284,4 +285,27 @@ test('戻したあとも登録し直す', async () => {
   const restored = await restoreInstalledBuild(h.context, h.commands, { app: APP })
   expect(restored.launchServicesRefreshed).toBe(true)
   expect(h.calls.filter(call => String(call[0]).endsWith('/lsregister')).length).toBe(before + 1)
+})
+
+// 起動中のアプリは起動時の identity を保つ。残したまま置き換えると、解決が
+// 旧 ID を返し続け、Computer Use から掴めない。
+test('差し替える前に起動中のアプリを終了させる', async () => {
+  const h = harness()
+  installOriginal(h)
+  await installVerificationBuild(h.context, h.commands,
+    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
+  const quitIndex = h.calls.findIndex(call => call[0] === '/usr/bin/pkill')
+  const placeIndex = h.calls.findIndex(call => call[0] === '/bin/mv')
+  expect(quitIndex).toBeGreaterThanOrEqual(0)
+  expect(quitIndex).toBeLessThan(placeIndex)
+})
+
+test('戻す前にも終了させる', async () => {
+  const h = harness()
+  installOriginal(h)
+  await installVerificationBuild(h.context, h.commands,
+    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
+  const before = h.calls.filter(call => call[0] === '/usr/bin/pkill').length
+  await restoreInstalledBuild(h.context, h.commands, { app: APP })
+  expect(h.calls.filter(call => call[0] === '/usr/bin/pkill').length).toBe(before + 1)
 })

@@ -45,6 +45,18 @@ export type AppSwapCommands = {
   sha256: (path: string) => Promise<string>
 }
 
+// 起動中のアプリは起動時の identity を保ったままなので、置き換えても解決は
+// 旧 ID を返し続ける。LaunchServices へ登録し直しても変わらない。差し替えの
+// 前に終了させて、古い identity を持つプロセスを残さない。
+async function quitRunningApp(
+  commands: AppSwapCommands,
+  name: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  // 該当が無いときの終了コード1は正常。ここで失敗扱いにしない。
+  await commands.run(['/usr/bin/pkill', '-f', `${APPLICATIONS_ROOT}/${name}/`], signal)
+}
+
 // bundle の identifier を差し替えても LaunchServices は古い記録を持ったままで、
 // Computer Use は一覧に出たアプリを掴めず Invalid app を返す。置いた直後に
 // 登録し直して、記録を実体へ合わせる。
@@ -206,6 +218,8 @@ export async function installVerificationBuild(
     throw new Error('App swap payload is not an application bundle')
   }
 
+  // 古い identity のプロセスが残っていると、置き換えても解決が旧 ID を返す。
+  await quitRunningApp(commands, name, signal)
   // identifier を分けてから署名する。署名後に Info.plist を書き換えると署名が
   // 壊れるので、この順序でなければならない。
   const bundleIdentifier = await separateBundleIdentity(commands, staged, signal)
@@ -257,6 +271,7 @@ export async function restoreInstalledBuild(
   if (!existsSync(backup)) {
     return { complete: true, app: name, restored: false, reason: 'no verification build is staged' }
   }
+  await quitRunningApp(commands, name, signal)
   if (existsSync(target)) {
     const discarded = await commands.run(['/bin/rm', '-rf', target], signal)
     if (discarded.exitCode !== 0) throw new Error('App swap could not remove the verification build')
