@@ -5959,16 +5959,18 @@ describe('production App Server executor', () => {
 
   test('進捗ACKがtimeout後に届いても本体turnは正常完了する', async () => {
     const value = fixture('progress-late-ack')
+    const rpcLog = join(value.root, 'progress-late-ack-rpc.log')
     const reports: string[] = []
     const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
       stateDir: value.state,
       skipEffectiveConfigCheck: true,
-      extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-late-ack' },
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-late-ack', ZERO_RPC_LOG: rpcLog },
       progressActivatedAtMs: Date.now(),
       progressScheduleForTesting: {
-        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+        // Only exercise the late ACK, not another slot during slow host startup.
+        firstMs: 10, secondMs: 10_000, thirdMs: 20_000, repeatMs: 10_000,
       },
       progressSteerTimeoutMsForTesting: 20,
       onProgressProbeStarted: () => true,
@@ -5978,6 +5980,8 @@ describe('production App Server executor', () => {
     })
     expect(result.result).toBe('遅いACKの後も完了しました ✅')
     expect(reports).toEqual(['遅い応答でも作業を続けています 🔎'])
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(rpc.filter(value => value.method === 'turn/steer')).toHaveLength(1)
     value.store.close()
   }, 15_000)
 
@@ -5995,7 +5999,8 @@ describe('production App Server executor', () => {
       },
       progressActivatedAtMs: Date.now(),
       progressScheduleForTesting: {
-        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+        // Keep later slots outside this single-probe scenario.
+        firstMs: 10, secondMs: 10_000, thirdMs: 20_000, repeatMs: 10_000,
       },
       progressProbeRetryMsForTesting: 10,
       onProgressProbeStarted: () => true,
@@ -6051,7 +6056,8 @@ describe('production App Server executor', () => {
       extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-final-answer' },
       progressActivatedAtMs: Date.now(),
       progressScheduleForTesting: {
-        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+        // Keep later slots outside this single-probe scenario.
+        firstMs: 10, secondMs: 10_000, thirdMs: 20_000, repeatMs: 10_000,
       },
       onProgressProbeStarted: () => true,
       onProgressProbeSuperseded: () => {},
@@ -6077,9 +6083,10 @@ describe('production App Server executor', () => {
       progressActivatedAtMs: startedAt,
       progressScheduleForTesting: {
         firstMs: 10,
-        secondMs: 1_000,
-        thirdMs: 2_000,
-        repeatMs: 1_000,
+        // Keep later slots outside this single-probe scenario.
+        secondMs: 10_000,
+        thirdMs: 20_000,
+        repeatMs: 10_000,
       },
       onProgressProbeStarted: () => true,
       onProgressProbeSuperseded: () => {},
