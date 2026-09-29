@@ -14369,12 +14369,16 @@ describe('Slack output guard', () => {
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
       postMessage: async value => { posted.push(value.text) },
     })
-    await notifier.progress(job, '## 確認\n\n**テスト成功**。`**raw**` は保持。')
-    await notifier.completed(job, '**完了**。 [結果](https://example.com/result)')
+    await notifier.progress(job, '## 確認\n\n**テスト成功**。`**raw**` は保持。\n\n| 項目 | 結果 |\n| - | - |\n| API | **成功** |')
+    await notifier.completed(job, '**完了**。 [結果](https://example.com/result)\n\n```md\n| 項目 | 結果 |\n| - | - |\n| UI | **成功** |\n```')
     expect(posted[0]).toContain('*確認*\n\n*テスト成功* 。')
-    expect(posted[0]).toContain('`**raw**`')
+    expect(posted[0]).toContain('**raw**')
+    expect(posted[0]).not.toContain('`')
+    expect(posted[0]).toContain('• 項目: API\n  結果: *成功*')
     expect(posted[1]).toContain('*完了* 。')
     expect(posted[1]).toContain('<https://example.com/result|結果>')
+    expect(posted[1]).toContain('• 項目: UI\n  結果: *成功*')
+    expect(posted[1]).not.toContain('`')
     await notifier.status({ id: 'format-status', idempotencyKey: 'format-status', jobId: job.id,
       chatId: job.chatId, threadTs: job.threadTs, kind: 'accepted', attempts: 0,
       payload: '**受付済み**',
