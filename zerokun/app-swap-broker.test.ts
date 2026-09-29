@@ -49,6 +49,7 @@ function harness(options: { payloadSha?: string; failPlace?: boolean; identityAv
       if (tool === '/usr/bin/codesign') return { exitCode: 0, stdout: '', stderr: '' }
       if (String(tool).endsWith('/lsregister')) return { exitCode: 0, stdout: '', stderr: '' }
       if (tool === '/usr/bin/pkill') return { exitCode: 1, stdout: '', stderr: '' }
+      if (tool === '/usr/bin/open') return { exitCode: 0, stdout: '', stderr: '' }
       if (tool === '/usr/libexec/PlistBuddy') {
         const command = String(rest[1] ?? '')
         if (command.startsWith('Print :CFBundleIdentifier')) {
@@ -308,4 +309,19 @@ test('戻す前にも終了させる', async () => {
   const before = h.calls.filter(call => call[0] === '/usr/bin/pkill').length
   await restoreInstalledBuild(h.context, h.commands, { app: APP })
   expect(h.calls.filter(call => call[0] === '/usr/bin/pkill').length).toBe(before + 1)
+})
+
+// 差し替え前に終了させる以上、置いた後に起動し直さないと Computer Use が
+// 掴む相手が居ない。登録し直した後に起動しないと、古い記録のまま立ち上がる。
+test('置いて登録し直した後に起動する', async () => {
+  const h = harness()
+  installOriginal(h)
+  const result = await installVerificationBuild(h.context, h.commands,
+    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
+  expect(result.launched).toBe(true)
+  const openIndex = h.calls.findIndex(call => call[0] === '/usr/bin/open')
+  const registerIndex = h.calls.findIndex(call => String(call[0]).endsWith('/lsregister'))
+  expect(registerIndex).toBeGreaterThanOrEqual(0)
+  expect(openIndex).toBeGreaterThan(registerIndex)
+  expect(h.calls[openIndex]![2]).toBe(join(APPLICATIONS_ROOT, APP))
 })

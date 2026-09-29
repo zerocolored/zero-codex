@@ -69,6 +69,17 @@ async function refreshLaunchServices(
   return registered.exitCode === 0
 }
 
+// Computer Use が掴めるのは走っているアプリだけ。差し替えの前に終了させる
+// 以上、置いた後は自分で起動し直さないと、掴む相手が居ない状態になる。
+async function launchInstalledApp(
+  commands: AppSwapCommands,
+  bundle: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const launched = await commands.run(['/usr/bin/open', '-g', bundle], signal)
+  return launched.exitCode === 0
+}
+
 /** 製品版と許可を取り合わないよう、検証版だけ別の identifier にする。 */
 async function separateBundleIdentity(
   commands: AppSwapCommands,
@@ -244,11 +255,14 @@ export async function installVerificationBuild(
   }
   // 置いた実体に対して登録し直す。staging のままだと消えた path が記録される。
   const launchServicesRefreshed = await refreshLaunchServices(commands, target, signal)
+  // 登録し直した後に起動する。順序が逆だと、古い記録のまま立ち上がる。
+  const launched = await launchInstalledApp(commands, target, signal)
   return {
     complete: true,
     app: name,
     installed: describeInstalled(name),
     launchServicesRefreshed,
+    launched,
     previousHeld: existsSync(backup),
     restoreWith: 'app_swap_restore',
     bundleIdentifier,
