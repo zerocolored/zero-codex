@@ -5502,6 +5502,14 @@ export function buildCodexPermissionOverrides(
     readFileSync(join(import.meta.dir, 'sandbox-dns-fallback.cjs'), 'utf8'),
     { mode: 0o600 },
   )
+  // 塞がれた結果が errno としてしか見えないと、箱の何が原因かを推理できず
+  // 人への依頼で止まる。既知の形だけ、何が塞いでいるかを stderr へ出す。
+  const diagnosticsPath = join(scratchDir, '.zerokun-sandbox-diagnostics.cjs')
+  writeFileSync(
+    diagnosticsPath,
+    readFileSync(join(import.meta.dir, 'sandbox-diagnostics.cjs'), 'utf8'),
+    { mode: 0o600 },
+  )
   const liveInputRoot = options.liveInputDir
     ? requireManagedDirectory(options.stateDir, options.liveInputDir)
     : null
@@ -5716,7 +5724,7 @@ export function buildCodexPermissionOverrides(
     `"TMPDIR"=${tomlString(scratchDir)}`,
     `"XDG_CONFIG_HOME"=${tomlString(join(scratchDir, '.config'))}`,
     `"XDG_CACHE_HOME"=${tomlString(join(scratchDir, '.cache'))}`,
-    `"NODE_OPTIONS"=${tomlString(`--require ${dnsFallbackPath}`)}`,
+    `"NODE_OPTIONS"=${tomlString(`--require ${dnsFallbackPath} --require ${diagnosticsPath}`)}`,
     `"PATH"=${tomlString(cloudBin ? `${cloudBin}:${toolchain.path}` : toolchain.path)}`,
     ...(cloudConfig ? [`"CLOUDSDK_CONFIG"=${tomlString(cloudConfig)}`] : []),
     ...(cloudRuntime ? [
