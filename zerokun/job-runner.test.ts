@@ -12358,12 +12358,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         'slack-edge.com', '**.slack-edge.com',
         'slack-msgs.com', '**.slack-msgs.com',
       ]) expect(overrides).toContain(`${JSON.stringify(slackDomain)}="deny"`)
-      // Computer Use は既定でアプリごとに許可を求め、拒否のたびに人へ依頼して
-      // 止まる。実機検証で触る2つだけを明示して許す(2026-09-29 実測)。
-      expect(overrides).toContain('computer_use.macos.bundle_ids=')
-      expect(overrides).toContain('"com.google.Chrome"="allow"')
-      // システム設定を許すと、あらゆる設定を変更できてしまう。
-      expect(overrides).not.toContain('com.apple.systempreferences')
+      // アプリ承認は config から与えられない。bundle_ids も default_app_access も
+      // 設定としては通るが実行時の判定に使われない(2026-09-29 実測)。効かない
+      // 設定を置くと、許可済みだと誤解したまま原因を探すことになる。
+      expect(overrides).not.toContain('computer_use.macos.bundle_ids')
+      expect(overrides).not.toContain('computer_use.default_app_access')
       expect(overrides).toContain('features.apps=false')
       expect(overrides.split('\n').filter(value => value.startsWith('model=')))
         .toEqual(['model="gpt-6-astra"'])

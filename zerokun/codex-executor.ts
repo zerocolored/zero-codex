@@ -4350,6 +4350,9 @@ export function buildCodexWorkerPrompt(
     )
     if (host.browserEnabled) {
       control.push(
+        'Chrome is not a Computer Use target. Its app approval cannot be granted to a Slack job, so',
+        'driving the browser through Computer Use always fails; use go-chrome-mcp for anything in the',
+        'browser and keep Computer Use for the desktop application under test.',
         'For the operator’s signed-in Chrome, use go-chrome-mcp when exposed. It is a separate',
         'connection from the localhost verifier; desktop node_repl is not automatically available',
         'inside Slack jobs. Begin with tabs_list and use explicit tabId values from its response.',
@@ -5876,12 +5879,10 @@ export function buildCodexPermissionOverrides(
     `features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}`,
     'features.browser_use_full_cdp_access=false',
     `features.computer_use=${computerUseEnabled ? 'true' : 'false'}`,
-    // Computer Use は既定でアプリごとに許可を求める。実機検証で触るのは検証用
-    // アプリと、そこへ入るためのブラウザだけなので、その2つだけを明示して許す。
-    // システム設定は入れない。許可されると、あらゆる設定を変更できてしまう。
-    ...(computerUseEnabled ? [
-      'computer_use.macos.bundle_ids={"com.google.Chrome"="allow","com.bellsalesai.live-agent"="allow"}',
-    ] : []),
+    // Computer Use のアプリ許可は config から与えられない。bundle_ids も
+    // default_app_access="allow" も設定としては通るが、実行時の承認判定には
+    // 使われず「was not approved to use ...」が返る(2026-09-29 実測)。承認は
+    // ChatGPT 側が持っていて対話的にしか与えられないため、ここでは触らない。
     `features.in_app_browser=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}`,
     `features.network_proxy=${networkEnabled ? 'true' : 'false'}`,
