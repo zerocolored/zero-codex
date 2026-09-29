@@ -5,6 +5,7 @@
  * transport. It intentionally stays outside CI because it consumes the user's
  * existing ChatGPT subscription session.
  */
+import { ensureJobTempDirectory } from './job-temp.ts'
 import {
   closeSync,
   constants,
@@ -256,12 +257,13 @@ async function runAppServer<T>(
     stateDir,
     artifactDir,
     scratchDir,
+    jobTempDir: ensureJobTempDirectory(stateDir, value.id),
     profile,
     executionWriteEnabled: permissionOptions.executionWriteEnabled,
   })
   const childEnvironment = {
     ...buildCodexChildEnvironment(),
-    TMPDIR: scratchDir,
+    TMPDIR: ensureJobTempDirectory(stateDir, value.id),
   }
   for (const key of ['OPENAI_API_KEY', 'OPENAI_ORG_ID', 'OPENAI_PROJECT_ID']) {
     if (key in childEnvironment) {
@@ -404,6 +406,7 @@ async function verifyAmbientMcpDiscoveryIsSideEffectFree(
   const profile = `zerokun_live_mcp_${randomUUID().replaceAll('-', '')}`
   const base = buildCodexPermissionOverrides(value, {
     stateDir, artifactDir: artifact, scratchDir: scratch, profile,
+    jobTempDir: ensureJobTempDirectory(stateDir, value.id),
   })
   let isolated: string[]
   try {
@@ -412,7 +415,7 @@ async function verifyAmbientMcpDiscoveryIsSideEffectFree(
       repo,
       base,
       profile,
-      { ...buildCodexChildEnvironment(), CODEX_HOME: codexHome, TMPDIR: scratch },
+      { ...buildCodexChildEnvironment(), CODEX_HOME: codexHome, TMPDIR: ensureJobTempDirectory(stateDir, value.id) },
     )
     // Give a local connect that was scheduled before App Server shutdown a
     // chance to reach the listener before declaring discovery side-effect free.
