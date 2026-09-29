@@ -1,5 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
+import { slackDeliveryShutdownGraceMs } from './slack-http.ts'
 import { Database } from 'bun:sqlite'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
 import {
@@ -2965,15 +2966,17 @@ async function stopServices(
       'job runner launcher',
       /runner-launcher\.ts(?:\s|$)/,
       signal,
+      slackDeliveryShutdownGraceMs() + 5_000,
     )
   }
 
-  await stopRunnerLaunchReceiptForUpdate(stateDir, signal)
-
+  // Let the normal daemon drain started Slack uploads before receipt cleanup
+  // uses forceful process-tree reaping for pre-lock/orphan generations.
   const runnerLock = join(stateDir, 'job-runner.lock', 'pid')
   const runnerPid = readPid(runnerLock)
   if (runnerPid) {
-    await stopLockedProcess(runnerLock, runnerPid, 'job runner', /job-runner\.ts\s+daemon(?:\s|$)/, signal)
+    await stopLockedProcess(runnerLock, runnerPid, 'job runner', /job-runner\.ts\s+daemon(?:\s|$)/, signal,
+      slackDeliveryShutdownGraceMs() + 5_000)
   }
 
   const lateLauncherPid = readPid(launcherLock)
@@ -2988,6 +2991,7 @@ async function stopServices(
       'job runner launcher',
       /runner-launcher\.ts(?:\s|$)/,
       signal,
+      slackDeliveryShutdownGraceMs() + 5_000,
     )
   }
   await stopRunnerLaunchReceiptForUpdate(stateDir, signal)

@@ -121,5 +121,56 @@ class SendRecoveryTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
 
 
+class AnswerFileContractTests(unittest.TestCase):
+    def setUp(self):
+        self.m = runpy.run_path(str(Path(__file__).with_name('fifth-advisor.py')), run_name='test')
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.fd)
+        self.output = self.root / 'answer.md'
+        self.marker = 'REQUEST_MARKER=' + 'A' * 32
+
+    def test_only_precreated_empty_private_output_can_be_authorized(self):
+        with self.assertRaises(FileNotFoundError):
+            self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+        self.output.touch(mode=0o600)
+        prompt = self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+        self.assertIn(str(self.output), prompt)
+        self.assertIn('CLAUDE_ANSWER_BEGIN=' + 'A' * 32, prompt)
+        self.assertIn('SHA256=<actual file SHA-256>', prompt)
+        self.assertEqual(self.output.read_bytes(), b'')
+        self.output.write_text('old answer')
+        with self.assertRaises(self.m['UnsafeRequest']):
+            self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+
+    def test_unsafe_output_is_not_followed_or_authorized(self):
+        other = self.root / 'other'
+        other.write_text('unchanged')
+        self.output.symlink_to(other)
+        with self.assertRaises(OSError):
+            self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+        self.assertEqual(other.read_text(), 'unchanged')
+        self.output.unlink()
+        self.output.touch(mode=0o644)
+        with self.assertRaises(self.m['UnsafeRequest']):
+            self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+
+    def test_long_instructions_are_preserved_with_one_short_execution_request(self):
+        full = 'Review the synthetic task.\n' * 2000 + self.marker + '\n'
+        prompt = self.m['_file_prompt_transport'](self.fd, self.root, full, self.marker)
+        saved = self.root / 'instruction.md'
+        self.assertEqual(saved.read_text(), full)
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+        self.assertLess(len(prompt), 1000)
+        self.assertEqual(len(prompt.splitlines()), 2)
+        self.assertIn('Read and carry out my task instructions', prompt)
+        self.assertEqual(prompt.splitlines()[-1], self.marker)
+        with self.assertRaises(self.m['UnsafeRequest']):
+            self.m['_file_prompt_transport'](self.fd, self.root, 'replacement', self.marker)
+        self.assertEqual(saved.read_text(), full)
+
+
 if __name__ == '__main__':
     unittest.main()

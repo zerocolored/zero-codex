@@ -172,5 +172,58 @@ class VisibleReadyTests(unittest.TestCase):
         self.assertEqual(classify(Exception('private arbitrary error payload')), 'startup-failed')
 
 
+class ShellReadyTests(unittest.TestCase):
+    def setUp(self):
+        self.m = runpy.run_path(str(Path(__file__).with_name('fifth-advisor.py')), run_name='test')
+        self.g = self.m['_wait_owned_shell'].__globals__
+        self.clock = iter(range(1000))
+        self.g['time'] = SimpleNamespace(monotonic=lambda: next(self.clock), sleep=lambda _: None)
+        self.topology = []
+        self.g['_validate_owned_topology'] = lambda *args, **kw: self.topology.append(kw)
+        self.g['_require_absent_agent'] = lambda _: None
+        self.g['_successful_result'] = lambda value: value
+        self.calls = []
+
+    def test_waits_for_init_children_then_two_shell_observations(self):
+        samples = iter([
+            (7, [7, 8]),  # pyenv init shares the shell's process group
+            (8, [8]),     # pyenv rehash owns foreground
+            (7, [7]), (7, [7]),
+        ])
+        def observe(args):
+            self.calls.append(args)
+            group, pids = next(samples)
+            return {'process_info': {'pane_id': 'w1:p1', 'shell_pid': 7,
+                    'foreground_process_group_id': group, 'foreground_processes': [{'pid': pid} for pid in pids]}}
+        self.g['_run_herdr'] = observe
+        self.m['_wait_owned_shell']({'pane_id': 'w1:p1'})
+        self.assertEqual(len(self.calls), 4)
+        self.assertTrue(all(args == ['pane', 'process-info', '--pane', 'w1:p1'] for args in self.calls))
+        self.assertEqual(self.topology[:-1], [{'require_project_path': False}] * 4)
+        self.assertEqual(self.topology[-1], {})
+
+    def test_busy_or_wrong_pane_never_receives_start_or_keys(self):
+        self.g['_run_herdr'] = lambda args: self.calls.append(args) or {'process_info': {
+            'pane_id': 'foreign', 'shell_pid': 7, 'foreground_process_group_id': 7,
+            'foreground_processes': [{'pid': 7}]}}
+        with self.assertRaises(self.m['UnsafeRequest']):
+            self.m['_wait_owned_shell']({'pane_id': 'w1:p1'})
+        self.assertTrue(all(args[:2] == ['pane', 'process-info'] for args in self.calls))
+
+    def test_output_directory_permission_is_exactly_one_caller_bound_directory(self):
+        base = list(self.m['CLAUDE_ARGUMENTS'])
+        validate = self.m['_valid_claude_option_arguments']
+        directory = '/private/tmp/owned-answer-request'
+        self.assertTrue(validate(base))
+        self.assertFalse(validate(base, directory))
+        self.assertTrue(validate(base + ['--add-dir=' + directory], directory))
+        self.assertFalse(validate(base + ['--add-dir=' + directory]))
+        self.assertFalse(validate(base + ['--add-dir=/Users'], directory))
+        self.assertFalse(validate(base + ['--add-dir=' + directory] * 2, directory))
+        self.assertFalse(validate(base + ['--add-dir=' + directory, '--add-dir=/Users'], directory))
+        command = self.m['_claude_start_command']('owned', 'w1:p1', directory)
+        self.assertEqual(command[-1], '--add-dir=' + directory)
+
+
 if __name__ == '__main__':
     unittest.main()

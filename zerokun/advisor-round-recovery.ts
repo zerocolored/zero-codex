@@ -1,3 +1,4 @@
+import { MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { createHash, randomBytes } from 'crypto'
 import {
   closeSync,
@@ -54,7 +55,7 @@ export function readInterruptedAdvisorSlots(journalPath: string, journal: Record
   currentClaude = journal.status === 'requested' ? undefined : journal.claude as Record<string, unknown> | undefined) {
   const result: { grok?: Array<Record<string, unknown>>, claude?: Record<string, unknown> } = {}
   try {
-    const raw = readOptionalBoundedOwnerOnlyRegularFile(`${journalPath}.slots`, 2 * 1024 * 1024)
+    const raw = readOptionalBoundedOwnerOnlyRegularFile(`${journalPath}.slots`, MAX_ADVISOR_RESPONSE_CACHE_BYTES)
     if (!raw) return result
     const slots = JSON.parse(raw)
     if (slots.contextDigest !== journal.contextDigest || slots.phase !== journal.phase

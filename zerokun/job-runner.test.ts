@@ -15009,7 +15009,7 @@ describe('durable terminal notifications', () => {
     await firstTargetStarted
     controller.abort()
     releaseFirstTarget()
-    await expect(first).rejects.toThrow('aborted before byte transfer')
+    await expect(first).rejects.toThrow('stage=target outcome=aborted')
     expect(byteUploads).toBe(0)
     expect(value.store.artifactDeliveryState(value.job.id, value.artifact)).toBe('ready')
     await notifier.completed(value.job, value.result, value.notificationId)
@@ -15042,7 +15042,7 @@ describe('durable terminal notifications', () => {
       value.job,
       value.result,
       value.notificationId,
-    )).rejects.toThrow('getUploadURLExternal rejected')
+    )).rejects.toThrow('stage=target outcome=request_failed')
     expect(value.store.artifactDeliveryState(value.job.id, value.artifact)).toBe('ready')
     await notifier.completed(value.job, value.result, value.notificationId)
     expect(targetRequests).toBe(2)
@@ -15070,7 +15070,7 @@ describe('durable terminal notifications', () => {
     })
     await expect(notifier.completed(
       value.job, value.result, value.notificationId,
-    )).rejects.toThrow('request construction failed')
+    )).rejects.toThrow('stage=transfer outcome=request_failed')
     expect(value.store.artifactDeliveryState(value.job.id, value.artifact)).toBe('ready')
     await notifier.completed(value.job, value.result, value.notificationId)
     expect(uploadAttempts).toBe(2)
@@ -15079,7 +15079,7 @@ describe('durable terminal notifications', () => {
     value.store.close()
   })
 
-  test('byte transfer開始後の失敗はambiguous固定で自動再送しない', async () => {
+  test('byte転送失敗は新しい未共有targetで回復できる', async () => {
     const value = productionArtifactFixture('artifact-transfer-ambiguous')
     let targetRequests = 0
     let byteUploads = 0
@@ -15087,28 +15087,26 @@ describe('durable terminal notifications', () => {
       addReaction: async () => {},
       requestUploadTarget: async () => {
         targetRequests += 1
-        return { uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FTEST' }
+        return { uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: `FTEST${targetRequests}` }
       },
       uploadBytes: async (_url, _data, beforeRequestWrite) => {
         beforeRequestWrite()
         byteUploads += 1
-        throw new Error('PUT response missing')
+        if (byteUploads === 1) throw new Error('PUT response missing')
       },
-      inspectUpload: async () => false,
+      inspectUpload: async () => { throw new Error('must not inspect unshared transfer') },
+      completeUpload: async ({ fileId }) => { expect(fileId).toBe('FTEST2') },
     })
     await expect(notifier.completed(
       value.job,
       value.result,
       value.notificationId,
-    )).rejects.toBeInstanceOf(ArtifactDeliveryAmbiguousError)
+    )).rejects.toThrow('stage=transfer')
     expect(value.store.artifactDeliveryState(value.job.id, value.artifact)).toBe('ambiguous')
-    await expect(notifier.completed(
-      value.job,
-      value.result,
-      value.notificationId,
-    )).rejects.toBeInstanceOf(ArtifactDeliveryAmbiguousError)
-    expect(targetRequests).toBe(1)
-    expect(byteUploads).toBe(1)
+    await notifier.completed(value.job, value.result, value.notificationId)
+    expect(value.store.artifactDelivered(value.job.id, value.artifact)).toBe(true)
+    expect(targetRequests).toBe(2)
+    expect(byteUploads).toBe(2)
     value.store.close()
   })
 
@@ -15125,8 +15123,9 @@ describe('durable terminal notifications', () => {
       uploadBytes: async (_url, _data, beforeRequestWrite) => {
         beforeRequestWrite()
         byteUploads += 1
-        throw new Error('response lost after possible byte transfer')
+
       },
+      completeUpload: async () => { throw new Error('complete response lost') },
       inspectUpload: async input => {
         inspections += 1
         expect(input).toEqual({
@@ -15146,6 +15145,203 @@ describe('durable terminal notifications', () => {
     expect(byteUploads).toBe(1)
     expect(value.store.artifactDeliveryState(value.job.id, value.artifact)).toBe('delivered')
     value.store.close()
+  })
+
+  test('artifact転送済みcheckpointはDB再開後に同じIDのcompleteだけを一度呼ぶ', async () => {
+    const value = productionArtifactFixture('artifact-uploaded-restart')
+    const attempt = value.store.beginStagedArtifactUpload(value.job.id, value.artifact, 'FUPLOADED')!
+    expect(value.store.advanceArtifactUpload(value.job.id, value.artifact, attempt, 'transferring', 'uploaded')).toBe(true)
+    const path = value.store.dbPath
+    value.store.close()
+    const store = new JobStore(path)
+    let completions = 0
+    try {
+      const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+        requestUploadTarget: async () => { throw new Error('must not acquire target') },
+        uploadBytes: async () => { throw new Error('must not resend bytes') },
+        completeUpload: async ({ fileId }) => { expect(fileId).toBe('FUPLOADED'); completions++ },
+      })
+      await notifier.completed(value.job, value.result, value.notificationId)
+      await notifier.completed(value.job, value.result, value.notificationId)
+      expect(completions).toBe(1)
+      expect(store.artifactDelivered(value.job.id, value.artifact)).toBe(true)
+    } finally { store.close() }
+  })
+
+  test('artifactの遅延した旧byte転送は新しい試行の後に共有できない', async () => {
+    const value = productionArtifactFixture('artifact-fenced-upload')
+    let announce!: () => void, release!: () => void
+    const started = new Promise<void>(r => { announce = r })
+    const pending = new Promise<void>(r => { release = r })
+    let targets = 0
+    const shared: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: `FFENCE${++targets}` }),
+      uploadBytes: async (_url, _bytes, commit) => { commit(); if (targets === 1) { announce(); await pending } },
+      completeUpload: async ({ fileId }) => { shared.push(fileId) },
+    })
+    try {
+      const old = notifier.completed(value.job, value.result, value.notificationId)
+      await started
+      await notifier.completed(value.job, value.result, value.notificationId)
+      release()
+      await old
+      expect(shared).toEqual(['FFENCE2'])
+      expect(value.store.artifactDelivered(value.job.id, value.artifact)).toBe(true)
+    } finally { release(); value.store.close() }
+  })
+
+  test('artifact inspect通信失敗は照合予算を消費せず元の秘密なし診断を維持する', async () => {
+    const value = productionArtifactFixture('artifact-inspect-error')
+    let completions = 0
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FINSPECT' }),
+      uploadBytes: async (_url, _bytes, commit) => { commit() },
+      completeUpload: async () => { completions++; throw Object.assign(new Error('private upload URL secret MUST_NOT_LEAK'), {code:'ETIMEDOUT'}) },
+      inspectUpload: async () => { throw Object.assign(new Error('MUST_NOT_LEAK'), {code:'ETIMEDOUT'}) },
+    })
+    try {
+      const logs: string[] = []
+      for (let index = 0; index < 7; index++) {
+        await flushTerminalNotifications(value.store, notifier, text => logs.push(text), 1)
+        await Bun.sleep(2 ** (index + 1) + 2)
+      }
+      expect(completions).toBe(1)
+      expect(value.store.artifactDeliveryState(value.job.id, value.artifact)).toBe('ambiguous')
+      const checkpoint = value.store.artifactUploadCheckpoint(value.job.id, value.artifact)!
+      expect(checkpoint.last_error).toBe('stage=complete outcome=ETIMEDOUT')
+      expect(logs.join('')).toContain('stage=inspect outcome=ETIMEDOUT')
+      expect(logs.join('')).not.toContain('MUST_NOT_LEAK')
+      expect(value.store.terminalNotificationCount()).toBe(1)
+    } finally { value.store.close() }
+  })
+
+  test('artifact共有前の通信失敗は5回を超えても復旧しcompleteは一度だけ', async () => {
+    const value = productionArtifactFixture('artifact-retry-six')
+    let targets = 0, completions = 0
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: `FRETRY${++targets}` }),
+      uploadBytes: async (_url, _bytes, commit) => { commit(); if (targets < 7) throw new Error('timeout') },
+      completeUpload: async ({ fileId }) => { expect(fileId).toBe('FRETRY7'); completions++ },
+      inspectUpload: async () => { throw new Error('unshared file must not be inspected') },
+    })
+    try {
+      for (let index = 0; index < 6; index++) {
+        await expect(notifier.completed(value.job, value.result, value.notificationId)).rejects.toThrow('stage=transfer outcome=timeout')
+      }
+      await notifier.completed(value.job, value.result, value.notificationId)
+      expect(completions).toBe(1)
+      expect(value.store.artifactDelivered(value.job.id, value.artifact)).toBe(true)
+    } finally { value.store.close() }
+  })
+
+  for (const refusal of ['ratelimited', 'file_not_found', 'http429']) {
+    test(`artifact complete明示拒否${refusal}は新IDから復旧し旧IDを再共有しない`, async () => {
+      const value = productionArtifactFixture(`artifact-complete-reject-${refusal}`)
+      let targets = 0
+      const shared: string[] = []
+      const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+        requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: `FREFUSE${++targets}` }),
+        uploadBytes: async (_url, _bytes, commit) => { commit() },
+        completeUpload: async ({ fileId }) => {
+          shared.push(fileId)
+          if (shared.length === 1) throw Object.assign(new Error('MUST_NOT_LEAK'), refusal === 'http429'
+            ? {code:'slack_webapi_rate_limited_error',retryAfter:1}
+            : {code:'slack_webapi_platform_error',data:{ok:false,error:refusal}})
+        },
+        inspectUpload: async () => { throw new Error('known refusal must not become inspect-only') },
+      })
+      try {
+        await expect(notifier.completed(value.job, value.result, value.notificationId)).rejects.toThrow('stage=complete')
+        await notifier.completed(value.job, value.result, value.notificationId)
+        expect(shared).toEqual(['FREFUSE1','FREFUSE2'])
+        expect(value.store.artifactDelivered(value.job.id, value.artifact)).toBe(true)
+      } finally { value.store.close() }
+    })
+  }
+
+  test('artifact completeのpartial successを許すAPI errorは新IDで再送しない', async () => {
+    const value = productionArtifactFixture('artifact-complete-partial-error')
+    let targets = 0, completions = 0
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: `FPARTIAL${++targets}` }),
+      uploadBytes: async (_url, _bytes, commit) => { commit() },
+      completeUpload: async () => { completions++; throw Object.assign(new Error('partial response'), {code:'slack_webapi_platform_error',data:{ok:false,error:'internal_error'}}) },
+      inspectUpload: async () => true,
+    })
+    try {
+      await expect(notifier.completed(value.job, value.result, value.notificationId)).rejects.toBeInstanceOf(ArtifactDeliveryAmbiguousError)
+      await notifier.completed(value.job, value.result, value.notificationId)
+      expect(targets).toBe(1)
+      expect(completions).toBe(1)
+      expect(value.store.artifactDelivered(value.job.id, value.artifact)).toBe(true)
+    } finally { value.store.close() }
+  })
+
+  test('artifact HTTP429のRetry-Afterより前に永続queueを再試行しない', async () => {
+    const value = productionArtifactFixture('artifact-rate-delay')
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      requestUploadTarget: async () => { throw Object.assign(new Error('private'), {code:'slack_webapi_rate_limited_error',retryAfter:90}) },
+    })
+    try {
+      const before = Date.now()
+      await flushTerminalNotifications(value.store, notifier, () => {}, 1)
+      const db = new Database(value.store.dbPath, {readonly:true})
+      try {
+        const row = db.query<{not_before:number},[string]>('SELECT not_before FROM terminal_notifications WHERE id=?').get(value.notificationId)!
+        expect(row.not_before).toBeGreaterThanOrEqual(before + 90_000)
+        expect(value.store.pendingTerminalNotifications()).toHaveLength(0)
+      } finally { db.close() }
+    } finally { value.store.close() }
+  })
+
+  test('artifact completeでfile_not_foundが継続しても新規転送は5回で止まる', async () => {
+    const value = productionArtifactFixture('artifact-missing-file-budget')
+    let targets = 0, abandoned = 0
+    const missing = () => Object.assign(new Error('private'), {code:'slack_webapi_platform_error',data:{ok:false,error:'file_not_found'}})
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+      requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: `FMISSING${++targets}` }),
+      uploadBytes: async (_url, _bytes, commit) => { commit() },
+      completeUpload: async () => { throw missing() },
+      inspectUpload: async () => { throw missing() },
+      addReaction: async () => {},
+      postMessage: async ({text}) => { if (text.includes('添付を打ち切りました')) abandoned++; return {messageId:'123.456'} },
+    })
+    try {
+      for (let index = 0; index < 10; index++) {
+        await flushTerminalNotifications(value.store, notifier, () => {}, 1)
+        await Bun.sleep(2 ** index + 2)
+      }
+      expect(targets).toBe(5)
+      expect(abandoned).toBe(1)
+      expect(value.store.artifactDeliveryState(value.job.id, value.artifact)).toBe('abandoned')
+      expect(value.store.terminalNotificationCount()).toBe(0)
+    } finally { value.store.close() }
+  })
+
+  test('legacy画像承認はhost requestがなくても添付放棄後に承認本文を送らない', async () => {
+    const store = makeStore()
+    try {
+      store.enqueue(input({messageId:'legacy-image-approval-failure'}))
+      const job = store.claimNext('serial-worker')!
+      store.recordTaskGoalStatus(job.id, 'blocked')
+      const files = ['/tmp/sealed/Before.png','/tmp/sealed/After.png']
+      const result = `この方向で本実装してよいですか\n<zerokun_files>${JSON.stringify(files)}</zerokun_files>`
+      store.complete(job.id, 'legacy-image-approval', result)
+      const notification = store.pendingTerminalNotifications()[0]!
+      for (const [index,path] of files.entries()) {
+        store.beginArtifactDelivery(job.id, path, `FLEGACY${index}`)
+      }
+      store.abandonAmbiguousArtifacts(job.id, files, 'fixture')
+      const messages: string[] = []
+      const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+        postMessage: async ({text}) => { messages.push(text); return {messageId:'123.456'} },
+      })
+      await notifier.artifactsAbandoned(store.get(job.id)!, 'fixture', notification.id)
+      expect(messages.join('')).not.toContain('この方向で本実装してよいですか')
+      expect(messages.join('')).toContain('添付を打ち切りました')
+      expect(store.terminalNotificationBodyDelivered(notification.id)).toBe(false)
+    } finally { store.close() }
   })
 
   test('files.infoはchannelとthread_tsの両方が一致した共有だけを採択する', () => {
@@ -15554,7 +15750,8 @@ describe('durable terminal notifications', () => {
     store.close()
   })
 
-  test('承認本文未送でも不明な添付を有限照合して障害通知だけを投稿する', async () => {
+  for (const rejection of ['missing_scope', 'file_deleted', 'http403']) {
+  test(`通常のblocked成果物はinspect拒否${rejection}を有限確認して本文を保持する`, async () => {
     const store = makeStore()
     try {
       store.enqueue(input({ messageId: 'blocked-upload-budget' }))
@@ -15564,7 +15761,7 @@ describe('durable terminal notifications', () => {
       mkdirSync(outbox, { recursive: true })
       const source = join(outbox, 'proposal.txt')
       writeFileSync(source, 'proposal')
-      const result = sealArtifactResult(job, `承認してください\n<zerokun_files>${JSON.stringify([source])}</zerokun_files>`, dirname(store.dbPath))
+      const result = sealArtifactResult(job, `比較の中間記録です\n<zerokun_files>${JSON.stringify([source])}</zerokun_files>`, dirname(store.dbPath))
       store.complete(job.id, 'blocked-session', result)
       let uploads = 0, reactions = 0
       const messages: string[] = []
@@ -15572,23 +15769,25 @@ describe('durable terminal notifications', () => {
         requestUploadTarget: async () => ({ uploadUrl: 'https://files.slack.com/upload/v1/test', fileId: 'FUNKNOWN' }),
         uploadBytes: async (_url, _bytes, commit) => { commit(); uploads++ },
         completeUpload: async () => { throw new Error('response lost') },
-        inspectUpload: async () => false,
+        inspectUpload: async () => { throw Object.assign(new Error('private MUST_NOT_LEAK'), rejection === 'http403' ? {code:'slack_webapi_http_error',statusCode:403} : {code:'slack_webapi_platform_error',data:{ok:false,error:rejection}}) },
         addReaction: async () => { reactions++ },
         postMessage: async ({ text }) => { messages.push(text); return { messageId: '123.456' } },
       })
-      for (let attempt = 0; attempt < 5; attempt++) {
+      for (let attempt = 0; attempt < 6; attempt++) {
         await flushTerminalNotifications(store, notifier, () => {}, 1)
         await Bun.sleep(2 ** (attempt + 1) + 2)
       }
       expect(uploads).toBe(1)
       expect(reactions).toBe(0)
-      expect(messages).toHaveLength(1)
-      expect(messages[0]).toContain('添付を打ち切りました')
-      expect(messages[0]).toContain('承認依頼は送らず待機しています')
-      expect(messages[0]).not.toContain('承認してください')
+      expect(messages).toHaveLength(2)
+      expect(messages[1]).toContain('添付を打ち切りました')
+      expect(messages.join('')).not.toContain('承認依頼')
+      expect(messages[0]).toContain('比較の中間記録です')
       expect(store.terminalNotificationCount()).toBe(0)
     } finally { store.close() }
   })
+
+  }
 
   test('byte開始後の曖昧性だけをartifact単位で5回確認して打ち切る', async () => {
     const store = makeStore()

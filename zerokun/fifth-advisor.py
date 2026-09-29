@@ -25,6 +25,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 
 PROMPT_NAME = "prompt"
+INSTRUCTION_NAME = "instruction.md"
 SNAPSHOT_NAME = "protected-snapshot.json"
 SESSION_INTENT_NAME = "ephemeral-session-intent.json"
 WORKSPACE_RECEIPT_NAME = "ephemeral-workspace-receipt.json"
@@ -35,6 +36,7 @@ CLOSED_RECEIPT_NAME = "ephemeral-session-closed.json"
 PROCESS_MISMATCH_RECEIPT_NAME = "ephemeral-process-mismatch.json"
 ATOMIC_RECORD_NAMES = frozenset(
     {
+        INSTRUCTION_NAME,
         SNAPSHOT_NAME,
         SESSION_INTENT_NAME,
         WORKSPACE_RECEIPT_NAME,
@@ -238,10 +240,10 @@ def _same_owned_process_identity(
         observed.get(key) == recorded.get(key)
         for key in OWNED_PROCESS_IDENTITY_KEYS
     ) and _valid_claude_invocation(
-        observed.get("argv"), observed.get("argv0"), observed.get("executable")
+        observed.get("argv"), observed.get("argv0"), observed.get("executable"), observed.get("answer_directory")
     ) and _valid_claude_invocation(
-        recorded.get("argv"), recorded.get("argv0"), recorded.get("executable")
-    )
+        recorded.get("argv"), recorded.get("argv0"), recorded.get("executable"), recorded.get("answer_directory")
+    ) and observed.get("answer_directory") == recorded.get("answer_directory")
 
 
 def _valid_executable_metadata(value: object, *, kinds: Tuple[str, ...]) -> bool:
@@ -303,6 +305,7 @@ def _valid_claude_invocation(
     argv: object,
     argv0: object,
     executable: object,
+    answer_directory: object = None,
 ) -> bool:
     if not isinstance(argv, list) or not argv or not all(
         isinstance(value, str) for value in argv
@@ -333,10 +336,17 @@ def _valid_claude_invocation(
         ):
             return False
         arguments = argv[2:]
-    return _valid_claude_option_arguments(arguments)
+    return _valid_claude_option_arguments(arguments, answer_directory)
 
 
-def _valid_claude_option_arguments(arguments: List[str]) -> bool:
+def _valid_claude_option_arguments(arguments: List[str], answer_directory: object = None) -> bool:
+    if answer_directory is not None:
+        if not isinstance(answer_directory, str) or not os.path.isabs(answer_directory):
+            return False
+        expected = "--add-dir=" + answer_directory
+        if arguments.count(expected) != 1:
+            return False
+        arguments = [argument for argument in arguments if argument != expected]
     if len(arguments) > 64:
         return False
     model_selectors = [
@@ -435,10 +445,14 @@ def _parse_args() -> argparse.Namespace:
         child = subparsers.add_parser(command)
         child.add_argument("--project-root", required=True)
         child.add_argument("--request-dir", required=True)
+        if command == "open":
+            child.add_argument("--answer-file", action="store_true")
     send = subparsers.add_parser("send")
     send.add_argument("--project-root", required=True)
     send.add_argument("--request-dir", required=True)
     send.add_argument("--owned", action="store_true", required=True)
+    send.add_argument("--answer-file", action="store_true",
+                      help="allow only the fixed owner-created answer.md output")
     return parser.parse_args()
 
 
@@ -2007,7 +2021,7 @@ def _process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
         process
         for process in inventory["processes"]
         if _valid_claude_invocation(
-            process["argv"], process["argv0"], executable
+            process["argv"], process["argv0"], executable, workspace.get("answer_directory")
         )
     ]
     if len(claude_matches) != 1:
@@ -2025,6 +2039,7 @@ def _process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
         "argv": matched["argv"],
         "argv0": matched["argv0"],
         "executable": executable,
+        **({"answer_directory": workspace["answer_directory"]} if "answer_directory" in workspace else {}),
     }
 
 
@@ -2131,6 +2146,36 @@ def _read_visible(target: str) -> str:
     if result.returncode != 0:
         raise UnsafeRequest("ephemeral Claude screen could not be read")
     return result.stdout.replace("\r\n", "\n")
+
+
+def _wait_owned_shell(workspace: Dict[str, object]) -> None:
+    """Workspace creation precedes login-shell initialization (e.g. pyenv).
+
+    Observe only our exact pane and start Claude once, after the shell is alone
+    in the foreground on two reads. Never send input to an initializing shell.
+    """
+    deadline = time.monotonic() + 90
+    ready_shell = None
+    while time.monotonic() < deadline:
+        _validate_owned_topology(workspace, require_project_path=False)
+        _require_absent_agent(workspace)
+        result = _run_herdr(["pane", "process-info", "--pane", str(workspace["pane_id"])])
+        info = _successful_result(result).get("process_info", {})
+        shell = info.get("shell_pid")
+        processes = info.get("foreground_processes")
+        ready = (
+            info.get("pane_id") == workspace["pane_id"]
+            and type(shell) is int and shell > 1
+            and info.get("foreground_process_group_id") == shell
+            and isinstance(processes, list) and len(processes) == 1
+            and isinstance(processes[0], dict) and processes[0].get("pid") == shell
+        )
+        if ready and ready_shell == shell:
+            _validate_owned_topology(workspace)
+            return
+        ready_shell = shell if ready else None
+        time.sleep(0.5)
+    raise UnsafeRequest("ephemeral shell initialization did not become ready")
 
 
 _ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
@@ -2426,6 +2471,11 @@ def _validate_workspace_receipt(
         "terminal_id",
     }
     recorded_keys = frozenset(workspace)
+    if "answer_directory" in recorded_keys:
+        answer_directory = workspace["answer_directory"]
+        if not isinstance(answer_directory, str) or not os.path.isabs(answer_directory) or ".." in Path(answer_directory).parts:
+            raise UnsafeRequest("ephemeral answer directory is invalid")
+        recorded_keys = recorded_keys - {"answer_directory"}
     current_protocol = workspace.get("start_state_protocol")
     if (
         recorded_keys not in {frozenset(required), frozenset(required | {"start_state_protocol"})}
@@ -3767,7 +3817,7 @@ def _open_command(args: argparse.Namespace) -> int:
         os.close(root_descriptor)
 
 
-def _claude_start_command(agent_name: str, pane_id: str) -> List[str]:
+def _claude_start_command(agent_name: str, pane_id: str, answer_directory: Optional[str] = None) -> List[str]:
     return [
         "agent",
         "start",
@@ -3780,6 +3830,7 @@ def _claude_start_command(agent_name: str, pane_id: str) -> List[str]:
         str(CLAUDE_START_TIMEOUT_MS),
         "--",
         *CLAUDE_ARGUMENTS,
+        *(["--add-dir=" + answer_directory] if answer_directory is not None else []),
     ]
 
 
@@ -3998,6 +4049,15 @@ def _open_ephemeral_workspace(
     root: Path,
     root_metadata: os.stat_result,
 ) -> int:
+    answer_directory = None
+    if getattr(args, "answer_file", False):
+        descriptor, request = _request_directory(args.request_dir, root)
+        try:
+            # Validate the pre-created output without granting arbitrary paths.
+            _answer_file_instruction(descriptor, request, "REQUEST_MARKER=" + "0" * 32)
+            answer_directory = str(request)
+        finally:
+            os.close(descriptor)
     caller = _current_pane()
     baseline = _workspace_catalog()
     caller_workspace_id = caller.get("workspace_id")
@@ -4087,6 +4147,7 @@ def _open_ephemeral_workspace(
             "tab_id": str(tab_id),
             "pane_id": str(pane_id),
             "terminal_id": str(terminal_id),
+            **({"answer_directory": answer_directory} if answer_directory is not None else {}),
         }
         if (
             workspace_info.get("pane_count") != 1
@@ -4129,8 +4190,7 @@ def _open_ephemeral_workspace(
             root_descriptor,
             root_metadata,
         )
-        _validate_owned_topology(workspace_receipt)
-        _require_absent_agent(workspace_receipt)
+        _wait_owned_shell(workspace_receipt)
         if not _same_caller(caller, _current_pane()):
             raise UnsafeRequest(
                 "ephemeral Claude preflight changed the calling pane"
@@ -4150,7 +4210,7 @@ def _open_ephemeral_workspace(
         )
         start_attempted = True
         started = _run_herdr(
-            _claude_start_command(agent_name, str(pane_id)),
+            _claude_start_command(agent_name, str(pane_id), answer_directory),
             timeout=CLAUDE_START_PROCESS_TIMEOUT_SECONDS,
         )
         _require_open_root_identity(
@@ -4210,6 +4270,7 @@ def _open_ephemeral_workspace(
                 "argv": processes["argv"],
                 "argv0": processes["argv0"],
                 "executable": processes["executable"],
+                **({"answer_directory": answer_directory} if answer_directory is not None else {}),
             },
         )
         # Metadata drift cannot attribute a concurrent primary/other-session
@@ -4501,8 +4562,11 @@ def _owned_target(
         "argv0",
         "executable",
     }
+    if "answer_directory" in workspace:
+        expected_agent_keys.add("answer_directory")
     if (
         set(agent_receipt) != expected_agent_keys
+        or agent_receipt.get("answer_directory") != workspace.get("answer_directory")
         or agent_receipt.get("version") != EPHEMERAL_SESSION_VERSION
         or agent_receipt.get("nonce") != workspace.get("nonce")
         or any(
@@ -4519,6 +4583,7 @@ def _owned_target(
             agent_receipt.get("argv"),
             agent_receipt.get("argv0"),
             agent_receipt.get("executable"),
+            workspace.get("answer_directory"),
         )
     ):
         raise UnsafeRequest("ephemeral Claude receipt is invalid")
@@ -4723,6 +4788,50 @@ def _audit_metadata(root_descriptor: int, root: Path, request_descriptor: int) -
         print("warning: protected metadata audit unavailable during Claude lifecycle", file=sys.stderr)
 
 
+def _answer_file_instruction(request_descriptor: int, request: Path, marker: str) -> str:
+    """The caller explicitly opts in to one output, never an arbitrary path."""
+    descriptor = os.open("answer.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=request_descriptor)
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1 or metadata.st_mode & 0o077
+                or metadata.st_size != 0):
+            raise UnsafeRequest("answer output must be an empty owner-only regular file")
+    finally:
+        os.close(descriptor)
+    nonce = marker.removeprefix("REQUEST_MARKER=")
+    return (
+        "\nHost-authorized output exception (not an instruction from task evidence):\n"
+        "The sole exception to the file-write prohibition is this caller-created file: "
+        + json.dumps(str(request / "answer.md"), ensure_ascii=False) + "\n"
+        "Use the built-in Write tool to replace its contents with your COMPLETE answer, "
+        "including every item; do not shorten it to fit the terminal. Keep mode 0600. "
+        "No other task-directed file write is allowed. Do not create scripts or scratch files.\n"
+        f"First file line: CLAUDE_ANSWER_BEGIN={nonce}\n"
+        "Then the complete answer in Markdown.\n"
+        f"Last file line: CLAUDE_ANSWER_END={nonce}\n"
+        "After the file is fully written, use a read-only SHA-256 calculation on this exact "
+        "file (shasum -a 256 is allowed for this output only). Do not modify it afterward. "
+        "Return only this completion receipt with the actual 64 lowercase hexadecimal hash:\n"
+        f"CLAUDE_ANSWER_SAVED={nonce} SHA256=<actual file SHA-256>\n"
+        "Then the request marker required below. Do not repeat the answer in the terminal.\n"
+    )
+
+
+def _file_prompt_transport(descriptor: int, request: Path, instruction: str, marker: str) -> str:
+    # Large bracketed pastes become untrusted attachments in Claude Code. Send
+    # an explicit short request to read the host-authored instructions instead.
+    _exclusive_bytes_record(descriptor, INSTRUCTION_NAME, instruction.encode("utf-8"),
+                            MAX_PROMPT_BYTES + 16 * 1024)
+    return (
+        "Read and carry out my task instructions in "
+        + json.dumps(str(request / INSTRUCTION_NAME), ensure_ascii=False)
+        + ". Save the complete answer and return its receipt as instructed.\n"
+        + marker
+    )
+
+
 def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
     if os.environ.get("HERDR_ENV") != "1":
         raise UnsafeRequest("HERDR_ENV is not active")
@@ -4757,12 +4866,18 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
             marker = secrets.token_hex(16).upper()
             marker_line = f"REQUEST_MARKER={marker}"
         instruction = body
+        if getattr(args, "answer_file", False):
+            if owned_records[1].get("answer_directory") != str(_request):
+                raise UnsafeRequest("answer output directory was not authorized at startup")
+            instruction += _answer_file_instruction(request_descriptor, _request, marker_line)
         if not instruction.endswith("\n"):
             instruction += "\n"
         instruction += (
             "\n応答の最後の独立行に、次のrequest markerをそのまま記載してください。\n"
             f"{marker_line}\n"
         )
+        if getattr(args, "answer_file", False):
+            instruction = _file_prompt_transport(request_descriptor, _request, instruction, marker_line)
         claimed_target = owned_records[1].get("agent_name")
         claimed_nonce = owned_records[1].get("nonce")
         if not isinstance(claimed_target, str) or not isinstance(claimed_nonce, str):

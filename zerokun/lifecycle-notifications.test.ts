@@ -1494,9 +1494,8 @@ describe('durable lifecycle notifications', () => {
       }),
       uploadBytes: async (_url, _data, beforeTransfer) => {
         beforeTransfer()
-        throw new Error('fixture lost response after transfer')
       },
-      completeUpload: async () => {},
+      completeUpload: async () => { throw new Error('fixture lost response after sharing request') },
       inspectUpload: async () => false,
       addReaction: async () => { reactions += 1 },
     })

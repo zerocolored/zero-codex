@@ -25,6 +25,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { AdvisorFailureError, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
+import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
 export { claudeSubscriptionStatusIsReady } from './claude-auth-status.ts'
 import {
@@ -117,11 +118,15 @@ import { recoverAdvisorSlot } from './advisor-retry.ts'
 import {
   saveClaudeResponseDiagnostic,
   captureClaudeFailureDiagnostic,
+  ClaudeReadError,
+  claudeReadFailure,
+  claudeReadCommandFailure,
   parseClaudeStartupDiagnostic,
   type ClaudeFailureDiagnostic,
   type ClaudeResponseAnalysis,
   type ClaudeDiagnosticRead,
   type ClaudeDiagnosticReceipt,
+  type ClaudeReadFailure,
 } from './claude-response-diagnostic.ts'
 
 const CLAUDE_SEND_CODES = ['agent_not_ready', 'agent_blocked', 'empty_agent_prompt',
@@ -149,6 +154,11 @@ export function claudeStartRemainsUnconfirmed(elapsedMs: number, modelStarted: b
 
 export class AdvisorContainmentError extends Error {}
 export class AdvisorOwnedProcessStillLiveError extends AdvisorContainmentError {}
+
+export function claudeContainmentFailureStatus(previous: string | undefined, error: unknown): string {
+  return previous === 'owned-process-still-live' || error instanceof AdvisorOwnedProcessStillLiveError
+    ? 'owned-process-still-live' : 'unverified-bounded-residual'
+}
 
 export function parseFifthAdvisorSendOutcome(stdout: string): FifthAdvisorSendOutcome {
   const records = stdout.split(/\r?\n/).flatMap(line => {
@@ -1059,12 +1069,16 @@ async function herdrText(
   label: string,
   fingerprint?: FingerprintPaths,
 ): Promise<string> {
-  await verifyHerdrRuntimeIdentityAsync(runtime, brokerEnvironment(runtime))
+  try { await verifyHerdrRuntimeIdentityAsync(runtime, brokerEnvironment(runtime)) }
+  catch (error) {
+    if (error instanceof AdvisorContainmentError) throw error
+    throw new ClaudeReadError({ stage: 'runtime-verification', kind: 'exception' })
+  }
   const result = await runBounded(fingerprintedCommand([currentHerdrBinary(runtime), ...args], fingerprint), {
     env: brokerEnvironment(runtime), timeoutMs: 130_000,
   })
   if (result.timedOut || result.forcedCleanup || result.outputTruncated || result.exitCode !== 0) {
-    throw new Error(`${label} failed (${result.exitCode}): ${result.stderr.slice(-2_000)}`)
+    throw new ClaudeReadError(claudeReadCommandFailure(result))
   }
   return stripAnsi(result.stdout)
 }
@@ -1892,6 +1906,7 @@ async function main(): Promise<void> {
     let marker = ''
     let deliveryUnknown = false
     let response: string | undefined
+    let answerArtifact: { path: string, sha256: string, bytes: number } | undefined
     let stateChangeSeqAfter: number | undefined
     let modelStartObserved = false
     let reason = 'Claude advisor was not sent'
@@ -1908,6 +1923,8 @@ async function main(): Promise<void> {
     const diagnosticAttempt = randomBytes(16).toString('hex')
     const diagnosticReads: ClaudeDiagnosticRead[] = []
     let diagnosticTranscript: string | undefined
+    let diagnosticTranscriptSource: 'recent-unwrapped' | 'visible' = 'recent-unwrapped'
+    let diagnosticContainmentError: AdvisorContainmentError | undefined
     let diagnosticTranscriptReadIndex: number | undefined
     let responseDiagnostic: ClaudeDiagnosticReceipt | undefined
     let failureStage: 'startup' | 'send' | 'acquisition' = 'startup'
@@ -1922,6 +1939,7 @@ async function main(): Promise<void> {
         attempt: diagnosticAttempt,
         reads: diagnosticReads,
         transcript: diagnosticTranscript,
+        transcriptSource: diagnosticTranscriptSource,
         transcriptReadIndex: diagnosticTranscriptReadIndex,
         phase,
         round,
@@ -1933,6 +1951,44 @@ async function main(): Promise<void> {
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
       ? projectLayout.projectPath
       : projectLayout.gitRoot
+    const captureFailureScreen = async () => {
+      if (!target || !claudeRuntime) return undefined
+      const runtime = claudeRuntime
+      const ownedTarget = target
+      let snapshot: Awaited<ReturnType<typeof captureClaudeFailureDiagnostic>> | undefined
+      for (const source of ['recent-unwrapped', 'visible'] as const) {
+        snapshot = await captureClaudeFailureDiagnostic({
+          source, requestedLines: source === 'visible' ? 120 : 1200,
+          getState: async () => unwrapAgent(await herdrJson(
+            runtime, ['agent', 'get', ownedTarget.target], 'Herdr failure diagnostic identity', jobFingerprint,
+          )),
+          readTranscript: async () => decodeHerdrReadOutput(await herdrText(runtime, [
+            'agent', 'read', ownedTarget.target, '--source', source, '--lines', source === 'visible' ? '120' : '1200',
+          ], 'Herdr failure diagnostic read', jobFingerprint)),
+          matchesIdentity: current => ephemeralClaudeAgentMatches(current, ownedTarget, claudeProjectRoot!),
+          onError: error => {
+            if (error instanceof AdvisorContainmentError) {
+              diagnosticContainmentError = error
+              helperContainmentVerified = false
+              containmentStatus = claudeContainmentFailureStatus(containmentStatus, error)
+            }
+          },
+        })
+        diagnosticReads.push(snapshot.read)
+        if (diagnosticReads.length > 3) diagnosticReads.shift()
+        diagnosticTranscriptReadIndex = undefined
+        if (snapshot.transcript !== undefined) {
+          diagnosticTranscript = snapshot.transcript
+          diagnosticTranscriptSource = source
+          diagnosticTranscriptReadIndex = diagnosticReads.length - 1
+        }
+        persistDiagnostic()
+        // Visible output is diagnostic only, never an answer. Do not fall back
+        // after identity drift or a containment failure.
+        if (snapshot.read.outcome !== 'read-failed' || !helperContainmentVerified) break
+      }
+      return snapshot
+    }
     try {
       if (!claudeProjectRoot) {
         return {
@@ -1982,6 +2038,7 @@ async function main(): Promise<void> {
           ? `\n中断した元の相談の続行です。新しい依頼をレビュー済みとは扱わないでください。\n最新追記が対象の変更・取消・権限の制限を含む場合は、元の対象を調査せず、その変更をprimaryへ返してください。\n最新入力revision: ${continuationInput.revision} / digest: ${continuationInput.digest}\n最新入力(JSON): ${JSON.stringify(safeInput(continuationInput.transcript, 'continuation transcript', MAX_TRANSCRIPT_CHARS))}`
           : '')
       writeFileSync(join(requestDir, 'prompt'), prompt, { flag: 'wx', mode: 0o600 })
+      writeFileSync(join(requestDir, CLAUDE_ANSWER_FILE), '', { flag: 'wx', mode: 0o600 })
       const helper = resolveFifthAdvisorHelper()
       const python = realpathSync('/usr/bin/python3')
       const helperArgs = ['--project-root', claudeProjectRoot, '--request-dir', requestDir]
@@ -1997,7 +2054,7 @@ async function main(): Promise<void> {
 
       workspaceCreationAttempted = true
       const opened = await runBounded(fingerprintedCommand(
-        [python, helper, 'open', ...helperArgs], jobFingerprint,
+        [python, helper, 'open', ...helperArgs, '--answer-file'], jobFingerprint,
       ), {
         env: helperEnvironment, timeoutMs: CLAUDE_OPEN_TIMEOUT_MS,
       })
@@ -2029,7 +2086,7 @@ async function main(): Promise<void> {
       failureStage = 'send'
       const sendStartedAt = Date.now()
       const send = await runBounded(fingerprintedCommand([
-        python, helper, 'send', ...helperArgs, '--owned',
+        python, helper, 'send', ...helperArgs, '--owned', '--answer-file',
       ], jobFingerprint), { env: helperEnvironment, timeoutMs: 140_000 })
       const sendOutcome = recoverFifthAdvisorSendOutcome(
         send.stdout,
@@ -2054,6 +2111,8 @@ async function main(): Promise<void> {
         failureStage = 'acquisition'
         if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
         const acquisitionDeadline = Date.now() + 60 * 60 * 1_000
+        const settling = new ClaudeResponseSettling()
+        const blockedSettling = new ClaudeResponseSettling()
         // Once prompt-started is durable, helper timeout/exit 5 is an ambiguous
         // transport outcome, not permission to resend or abandon acquisition.
         // Continue tracking the exact occupant and one-time marker instead.
@@ -2068,9 +2127,31 @@ async function main(): Promise<void> {
           if ((current.state_change_seq ?? 0) > target.stateChangeSeq) {
             modelStartObserved = true
           }
-          if (!['idle', 'done'].includes(current.agent_status ?? '')) continue
+          if (current.agent_status === 'blocked') {
+            settling.reset()
+            const snapshot = await captureFailureScreen()
+            if (snapshot?.read.outcome === 'identity-changed') throw new Error('owned ephemeral Claude identity changed during blocked observation')
+            if (diagnosticContainmentError) throw diagnosticContainmentError
+            const observed = snapshot?.read.stateAfter ?? (snapshot?.read.stateBefore.status
+              ? snapshot.read.stateBefore : { status: current.agent_status, sequence: current.state_change_seq })
+            if (snapshot?.read.outcome === 'state-changed' || observed?.status !== 'blocked') {
+              blockedSettling.reset(); continue
+            }
+            const progress = createHash('sha256').update(snapshot?.transcript ?? JSON.stringify(snapshot?.read.failure)).digest('hex')
+            if (!blockedSettling.exhausted(`${observed.sequence}:${progress}`, Date.now())) continue
+            failure = { advisor: 'claude', cause: 'response' }
+            diagnosticFailure = { stage: 'acquisition', cause: 'response' }
+            reason = snapshot?.transcript === undefined
+              ? 'Claude response blocked; terminal observation unavailable; no input was sent'
+              : 'Claude response acquisition stopped at a stable blocked interactive state; no input was sent'
+            persistDiagnostic()
+            break
+          }
+          blockedSettling.reset()
+          if (!['idle', 'done'].includes(current.agent_status ?? '')) { settling.reset(); continue }
           let transcript = ''
           let stateChangedDuringRead = false
+          let pendingAnswerDigest = ''
           for (const lines of [300, 600, 1200]) {
             const observation: ClaudeDiagnosticRead = {
               requestedLines: lines,
@@ -2080,10 +2161,13 @@ async function main(): Promise<void> {
             }
             diagnosticReads.push(observation)
             if (diagnosticReads.length > 3) diagnosticReads.shift()
+            let readStage: ClaudeReadFailure['stage'] = 'transcript'
             try {
               transcript = decodeHerdrReadOutput(await herdrText(claudeRuntime, [
                 'agent', 'read', target.target, '--source', 'recent-unwrapped', '--lines', String(lines),
               ], 'Herdr acquisition read', jobFingerprint))
+              diagnosticTranscriptSource = 'recent-unwrapped'
+              readStage = 'after-state'
               const afterRead = unwrapAgent(await herdrJson(
                 claudeRuntime, ['agent', 'get', target.target], 'Herdr acquisition recheck', jobFingerprint,
               ))
@@ -2097,6 +2181,52 @@ async function main(): Promise<void> {
                 stateChangedDuringRead = true
                 break
               }
+              let fileAnswer: ReturnType<typeof readClaudeAnswerFile> = null
+              try {
+                fileAnswer = modelStartObserved ? readClaudeAnswerFile(requestDir!, marker, transcript) : null
+              } catch (error) {
+                if (!(error instanceof ClaudeAnswerPendingError)) throw error
+                pendingAnswerDigest = error.progressDigest
+                reason = error.message
+                observation.outcome = 'answer-pending'
+                diagnosticTranscript = transcript
+                diagnosticTranscriptReadIndex = diagnosticReads.length - 1
+                // A missing receipt at 300 rows must not skip larger reads or
+                // the next stable poll. Unsafe files still fail immediately.
+                continue
+              }
+              if (fileAnswer) {
+                const afterFile = unwrapAgent(await herdrJson(claudeRuntime,
+                  ['agent', 'get', target.target], 'Herdr answer file recheck', jobFingerprint))
+                if (!ephemeralClaudeAgentMatches(afterFile, target, claudeProjectRoot)) {
+                  throw new Error('owned ephemeral Claude identity changed during answer file read')
+                }
+                if (afterFile.state_change_seq !== current.state_change_seq
+                  || !['idle', 'done'].includes(afterFile.agent_status ?? '')) {
+                  observation.outcome = 'state-changed'
+                  stateChangedDuringRead = true
+                  break
+                }
+                if (containsCredentialMaterial(fileAnswer.response)) {
+                  throw new Error('Claude answer file contains credential material')
+                }
+                const directory = ensureManagedDirectory(stateDir,
+                  join(journalRoot, `revision-${input.revision}-${input.digest.slice(0, 16)}`))
+                const path = join(directory, `claude-answer-${diagnosticAttempt}.json`)
+                // Persist the full answer before workspace/request cleanup,
+                // even if a later cleanup check fails.
+                atomicWritePrivateFile(path, JSON.stringify({ version: 1, phase, round,
+                  marker, sha256: fileAnswer.sha256, bytes: fileAnswer.bytes,
+                  response: fileAnswer.response }))
+                answerArtifact = { path: relative(stateDir, path),
+                  sha256: fileAnswer.sha256, bytes: fileAnswer.bytes }
+                response = fileAnswer.response
+                stateChangeSeqAfter = current.state_change_seq
+                observation.outcome = 'complete'
+                diagnosticTranscript = transcript
+                diagnosticTranscriptReadIndex = diagnosticReads.length - 1
+                break
+              }
               const { response: completeResponse, ...analysis } = analyzeClaudeResponse(transcript, marker)
               observation.outcome = analysis.code
               observation.analysis = analysis
@@ -2108,6 +2238,9 @@ async function main(): Promise<void> {
                 stateChangeSeqAfter = current.state_change_seq
                 break
               }
+            } catch (error) {
+              observation.failure = claudeReadFailure(error, readStage)
+              throw error
             } finally {
               // Persist each owned snapshot before close/removal, even when the
               // next read fails. Keep content out of the returned advisor object.
@@ -2115,7 +2248,7 @@ async function main(): Promise<void> {
             }
           }
           if (response) break
-          if (stateChangedDuringRead) continue
+          if (stateChangedDuringRead) { settling.reset(); continue }
           // Only the same owned, stable idle screen after the bounded reads
           // can exhaust startup confirmation. Keep delivery-possible: closing
           // this read-only advisor never authorizes a second prompt or retry.
@@ -2123,10 +2256,13 @@ async function main(): Promise<void> {
             throw new Error('Claude prompt delivery failed: start unconfirmed after the startup confirmation deadline')
           }
           if (!modelStartObserved) { await Bun.sleep(28_000); continue }
-          reason = 'Claude reached a terminal prompt but its complete marked response was unavailable'
-          // The same terminal state and sequence were revalidated after every
-          // bounded transcript read. No later output can complete this turn,
-          // so record the advisor as unavailable instead of waiting an hour.
+          const progress = createHash('sha256').update(transcript).digest('hex')
+          if (!settling.exhausted(`${current.state_change_seq}:${progress}:${pendingAnswerDigest}`, Date.now())) continue
+          reason = pendingAnswerDigest ? reason
+            : 'Claude complete marked response remained unavailable after bounded settling'
+          failure = { advisor: 'claude', cause: 'response' }
+          diagnosticFailure = { stage: 'acquisition', cause: 'response' }
+          persistDiagnostic()
           break
         }
         if (!response && Date.now() >= acquisitionDeadline) {
@@ -2138,9 +2274,7 @@ async function main(): Promise<void> {
     } catch (error) {
       if (error instanceof AdvisorContainmentError) {
         helperContainmentVerified = false
-        containmentStatus = error instanceof AdvisorOwnedProcessStillLiveError
-          ? 'owned-process-still-live'
-          : 'unverified-bounded-residual'
+        containmentStatus = claudeContainmentFailureStatus(containmentStatus, error)
       }
       reason = String(error)
       if (error instanceof AdvisorFailureError) failure = error.failure
@@ -2148,29 +2282,9 @@ async function main(): Promise<void> {
       diagnosticFailure = { ...diagnosticFailure, stage: failureStage, cause: failure.cause, ...(startupCode ? { startupCode } : {}) }
       persistDiagnostic()
     } finally {
-      if (!response && marker && target && claudeRuntime && diagnosticReads.length === 0) {
-        const runtime = claudeRuntime
-        const ownedTarget = target
-        const snapshot = await captureClaudeFailureDiagnostic({
-          getState: async () => unwrapAgent(await herdrJson(
-            runtime, ['agent', 'get', ownedTarget.target], 'Herdr failure diagnostic identity', jobFingerprint,
-          )),
-          readTranscript: async () => decodeHerdrReadOutput(await herdrText(runtime, [
-            'agent', 'read', ownedTarget.target, '--source', 'recent-unwrapped', '--lines', '1200',
-          ], 'Herdr failure diagnostic read', jobFingerprint)),
-          matchesIdentity: current => ephemeralClaudeAgentMatches(current, ownedTarget, claudeProjectRoot!),
-          onError: error => {
-            if (error instanceof AdvisorContainmentError) {
-              helperContainmentVerified = false
-              containmentStatus = error instanceof AdvisorOwnedProcessStillLiveError
-                ? 'owned-process-still-live' : 'unverified-bounded-residual'
-            }
-          },
-        })
-        diagnosticReads.push(snapshot.read)
-        diagnosticTranscript = snapshot.transcript
-        diagnosticTranscriptReadIndex = snapshot.transcript === undefined ? undefined : 0
-        persistDiagnostic()
+      if (!response && marker && target && claudeRuntime
+        && (diagnosticReads.length === 0 || diagnosticReads.at(-1)?.outcome === 'read-failed')) {
+        await captureFailureScreen()
       }
       if (requestDir && claudeRuntime) {
         try {
@@ -2285,12 +2399,10 @@ async function main(): Promise<void> {
         } catch (error) {
           if (error instanceof AdvisorContainmentError) {
             helperContainmentVerified = false
-            containmentStatus = error instanceof AdvisorOwnedProcessStillLiveError
-              ? 'owned-process-still-live'
-              : 'unverified-bounded-residual'
+            containmentStatus = claudeContainmentFailureStatus(containmentStatus, error)
           } else if (workspaceCreationAttempted && !cleanupVerified) {
             helperContainmentVerified = false
-            containmentStatus = 'unverified-bounded-residual'
+            containmentStatus = claudeContainmentFailureStatus(containmentStatus, error)
           }
           response = undefined
           cleanupWarnings.push(`ephemeral Claude cleanup verification failed: ${error}`)
@@ -2344,6 +2456,7 @@ async function main(): Promise<void> {
         stateChangeSeqAfter,
         response,
         responseDiagnostic,
+        answerArtifact,
         cleanupWarnings,
       }
     }
@@ -2371,6 +2484,7 @@ async function main(): Promise<void> {
       promptMayHaveBeenDelivered: Boolean(marker) || deliveryUnknown,
       reason,
       responseDiagnostic,
+      answerArtifact,
       failure: failure ?? classifyAdvisorFailure('claude', reason),
       cleanupWarnings,
     }
@@ -2395,7 +2509,7 @@ async function main(): Promise<void> {
     }),
   ])
   const advisorRoundInputSchema = {
-    retryUnavailable: z.boolean().optional().describe('Retry only missing answers in this same round, preserving adopted answers. Wait for nextRetryAt first.'),
+    retryUnavailable: z.boolean().optional().describe('Resume only an interrupted, unsent slot when the broker explicitly marks it retryable; never retry merely because an advisor answer is unavailable.'),
     inputUpdateIsRecoveryOnly: z.boolean().optional().describe('True only when newer Slack input resolves the failure without changing the reviewed request.'),
     phase: completeWorkflow
       ? z.enum(['investigation', 'review'])
@@ -2500,8 +2614,8 @@ async function main(): Promise<void> {
       ?? readTerminalJournal(input, phase, round, 'required-reviewer-failed')
       ?? readTerminalJournal(input, phase, round, 'stale-input')
     if (!journal) return null
-    const raw = readOptionalPrivateFile(`${roundJournalPath(input, phase, round)}.responses`)
-    if (!raw || Buffer.byteLength(raw) > 2 * 1024 * 1024
+    const raw = readOptionalBoundedOwnerOnlyRegularFile(`${roundJournalPath(input, phase, round)}.responses`, MAX_ADVISOR_RESPONSE_CACHE_BYTES)
+    if (!raw || Buffer.byteLength(raw) > MAX_ADVISOR_RESPONSE_CACHE_BYTES
       || createHash('sha256').update(raw).digest('hex') !== journal.responseCacheDigest) return null
     try {
       const saved = JSON.parse(raw)
@@ -2525,6 +2639,7 @@ async function main(): Promise<void> {
       const allAdopted = allAdvisorAttemptsAdopted(saved.native, saved.grok, saved.claude)
       return toolText({
         complete: inputUnchanged && allAdopted,
+        roundTerminal: inputUnchanged,
         restoredSavedResponses: true, phase, round,
         inputRevision: input.revision, inputDigest: input.digest, inputUnchanged,
         ...(inputUnchanged ? {} : { staleInput: true }),
@@ -2839,8 +2954,8 @@ async function main(): Promise<void> {
     }
     if (retryUnavailable && !activeRoundKeys.has(taskKey)) {
       const retryPath = `${roundJournalPath({ revision: inputRevision, digest: inputDigest }, phase, round as 1 | 2 | 3)}.responses`
-      const raw = readOptionalPrivateFile(retryPath)
-      if (raw && Buffer.byteLength(raw) <= 2 * 1024 * 1024) {
+      const raw = readOptionalBoundedOwnerOnlyRegularFile(retryPath, MAX_ADVISOR_RESPONSE_CACHE_BYTES)
+      if (raw) {
         try {
           const saved = JSON.parse(raw)
           const durable = JSON.parse(readOptionalPrivateFile(retryPath.slice(0, -10)) ?? '{}')
@@ -3713,12 +3828,12 @@ async function main(): Promise<void> {
       undefined,
       { version: THREE_ADVISOR_JOURNAL_VERSION, phase },
     )
-    const complete = inputUnchanged
+    const roundTerminal = inputUnchanged
       && (phaseScope === 'complete' || repositoryUnchanged)
-      && allAdvisorAttemptsAdopted(nativeEvidence, grokJournal, claudeJournal)
       && validThreeAdvisorNativeAttempts(nativeEvidence, phase)
       && validThreeAdvisorGrokAttempts(grokJournal, phase)
       && validTerminalClaudeAttempt(claudeJournal)
+    const complete = roundTerminal && allAdvisorAttemptsAdopted(nativeEvidence, grokJournal, claudeJournal)
     const finishedAt = Date.now()
     const responseCache = JSON.stringify({
       contextDigest, phase, round, complete, finishedAt, retryRepositoryDigest, evidenceDigest,
@@ -3772,6 +3887,7 @@ async function main(): Promise<void> {
     })}\n`)
     return toolText({
       complete,
+      roundTerminal,
       attemptsFinished: true,
       ...(automaticContinuation ? { continuedOriginalRequest: true, scopeAssessmentRequired: !inputUnchanged } : {}),
       inputRevision: boundInput.revision,
@@ -3797,13 +3913,12 @@ async function main(): Promise<void> {
         ),
         waitingForAdvisors: false,
         attemptsFinished: true,
-        nextRetryAt: finishedAt + 30_000,
         nextAction: '取得済み回答と欠員の理由を保持し、適用されるAGENTS.mdに従って本作業を継続してください。回答数だけを理由に待機・再試行しないでください。',
       } : {}),
       slotSummary,
       grok,
       claude,
-    }, !complete)
+    }, !roundTerminal)
     } catch (error) {
       return toolText({
         complete: false,
@@ -3959,7 +4074,7 @@ async function main(): Promise<void> {
       }
     }
     const journalPath = roundJournalPath(binding, phase, boundRound)
-    if (payload?.complete !== true) {
+    if (payload?.complete !== true && payload?.roundTerminal !== true) {
       // A failure before a durable journal was claimed is retryable once its
       // precondition is corrected. Durable terminal attempts are never resent.
       if (readOptionalPrivateFile(journalPath) === null) roundTasks.delete(taskKey)
@@ -4001,6 +4116,9 @@ async function main(): Promise<void> {
           }
           atomicWritePrivateFile(journalPath, `${JSON.stringify(journal)}\n`)
         }
+      }
+      if (!journal && payload.roundTerminal === true) {
+        journal = readTerminalJournal(binding, phase, boundRound, 'required-reviewer-failed')
       }
       if (!journal) {
         throw new Error('reviewer completion journal is missing or invalid')

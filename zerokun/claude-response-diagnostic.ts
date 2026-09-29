@@ -38,11 +38,48 @@ export type ClaudeResponseAnalysis = {
 
 export type ClaudeDiagnosticRead = {
   requestedLines: number
+  source?: 'recent-unwrapped' | 'visible'
   observedAt: string
   stateBefore: { status?: string; sequence?: number }
   stateAfter?: { status?: string; sequence?: number }
-  outcome: ClaudeResponseAnalysis['code'] | 'state-changed' | 'identity-changed' | 'read-failed' | 'failure-snapshot'
+  outcome: ClaudeResponseAnalysis['code'] | 'answer-pending' | 'state-changed' | 'identity-changed' | 'read-failed' | 'failure-snapshot'
   analysis?: Omit<ClaudeResponseAnalysis, 'response'>
+  failure?: ClaudeReadFailure
+}
+
+export type ClaudeReadFailure = {
+  stage: 'before-state' | 'transcript' | 'after-state' | 'runtime-verification'
+  kind: 'command' | 'exception'
+  exitCode?: number | null
+  timedOut?: boolean
+  forcedCleanup?: boolean
+  outputTruncated?: boolean
+  code?: 'agent_not_idle' | 'agent_not_found' | 'pane_not_found' | 'invalid_params' | 'timeout' | 'unknown-error'
+}
+
+/** Preserve machine evidence, never transport text (which can contain secrets). */
+export class ClaudeReadError extends Error {
+  constructor(readonly diagnostic: ClaudeReadFailure) { super('Claude terminal observation failed') }
+}
+
+export function claudeReadFailure(error: unknown, stage: ClaudeReadFailure['stage']): ClaudeReadFailure {
+  return error instanceof ClaudeReadError ? { ...error.diagnostic } : { stage, kind: 'exception' }
+}
+
+export function claudeReadCommandFailure(result: {
+  exitCode: number | null; timedOut?: boolean; forcedCleanup?: boolean; outputTruncated?: boolean
+  stdout: string; stderr: string
+}): ClaudeReadFailure {
+  let code: ClaudeReadFailure['code'] = 'unknown-error'
+  for (const stream of [result.stderr, result.stdout]) {
+    try {
+      const candidate = JSON.parse(stream)?.error?.code
+      if (['agent_not_idle', 'agent_not_found', 'pane_not_found', 'invalid_params', 'timeout'].includes(candidate)) code = candidate
+    } catch { /* No raw diagnostic content is retained. */ }
+  }
+  return { stage: 'transcript', kind: 'command', exitCode: result.exitCode,
+    timedOut: Boolean(result.timedOut), forcedCleanup: Boolean(result.forcedCleanup),
+    outputTruncated: Boolean(result.outputTruncated), code }
 }
 
 /** Capture a failing nonterminal turn too, without treating it as an answer. */
@@ -51,15 +88,21 @@ export async function captureClaudeFailureDiagnostic<T extends { agent_status?: 
   readTranscript: () => Promise<string>
   matchesIdentity: (state: T) => boolean
   onError?: (error: unknown) => void
+  source?: 'recent-unwrapped' | 'visible'
+  requestedLines?: number
 }): Promise<{ read: ClaudeDiagnosticRead; transcript?: string }> {
   const read: ClaudeDiagnosticRead = {
-    requestedLines: 1200, observedAt: new Date().toISOString(), stateBefore: {}, outcome: 'read-failed',
+    requestedLines: options.requestedLines ?? 1200, source: options.source ?? 'recent-unwrapped',
+    observedAt: new Date().toISOString(), stateBefore: {}, outcome: 'read-failed',
   }
+  let stage: ClaudeReadFailure['stage'] = 'before-state'
   try {
     const before = await options.getState()
     read.stateBefore = { status: before.agent_status, sequence: before.state_change_seq }
     if (!options.matchesIdentity(before)) { read.outcome = 'identity-changed'; return { read } }
+    stage = 'transcript'
     const transcript = await options.readTranscript()
+    stage = 'after-state'
     const after = await options.getState()
     read.stateAfter = { status: after.agent_status, sequence: after.state_change_seq }
     if (!options.matchesIdentity(after)) { read.outcome = 'identity-changed'; return { read } }
@@ -67,6 +110,7 @@ export async function captureClaudeFailureDiagnostic<T extends { agent_status?: 
       ? 'failure-snapshot' : 'state-changed'
     return { read, transcript }
   } catch (error) {
+    read.failure = claudeReadFailure(error, stage)
     // Let the owner retain a containment failure without leaking transport
     // error text into the document or throwing past workspace cleanup.
     try { options.onError?.(error) } catch {}
@@ -87,6 +131,7 @@ export function saveClaudeResponseDiagnostic(options: {
   attempt: string
   reads: ClaudeDiagnosticRead[]
   transcript?: string
+  transcriptSource?: 'recent-unwrapped' | 'visible'
   transcriptReadIndex?: number
   phase?: string
   round?: number
@@ -124,7 +169,8 @@ export function saveClaudeResponseDiagnostic(options: {
     const document = `${JSON.stringify({
       version: 1,
       capturedAt: new Date().toISOString(),
-      source: 'herdr-recent-unwrapped',
+      source: options.transcriptSource ? `herdr-${options.transcriptSource}` : options.transcriptReadIndex === undefined ? 'herdr-recent-unwrapped'
+        : `herdr-${options.reads[options.transcriptReadIndex]?.source ?? 'recent-unwrapped'}`,
       scope: 'bounded-terminal-snapshot-not-full-session',
       phase: options.phase,
       round: options.round,

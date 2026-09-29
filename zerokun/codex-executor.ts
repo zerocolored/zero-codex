@@ -1,4 +1,5 @@
 import { waitForAdvisorSettlement } from './advisor-settlement.ts'
+import { ensureJobTempDirectory, existingJobTempDirectory, jobTempRoot } from './job-temp.ts'
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
 import { installedComputerUseClient, installedComputerUseNodeRepl } from './installed-computer-use.ts'
@@ -1365,6 +1366,12 @@ function assertEffectiveCodexPermissionSnapshot(
     const expectedDomains = overrideValue(overrides, domainsKey)
     if (normalizedJson(effectiveNetwork?.domains) !== normalizedJson(expectedDomains)) {
       throw new Error(`Codex managed config changed ${profile}.network.domains`)
+    }
+  }
+  const unixSocketsKey = `permissions.${profile}.network.unix_sockets`
+  if (overrides.some(value => value.startsWith(`${unixSocketsKey}=`))) {
+    if (normalizedJson(effectiveNetwork?.unix_sockets) !== normalizedJson(overrideValue(overrides, unixSocketsKey))) {
+      throw new Error(`Codex managed config changed ${profile}.network.unix_sockets`)
     }
   }
   for (const override of overrides) {
@@ -5452,6 +5459,8 @@ export function buildCodexPermissionOverrides(
     stateDir: string
     artifactDir: string
     scratchDir: string
+    /** Host-created short runtime temp. Omitted only for legacy callers/fixtures. */
+    jobTempDir?: string
     liveInputDir?: string
     gitRoot?: string | null
     gitRoots?: readonly string[]
@@ -5511,6 +5520,10 @@ export function buildCodexPermissionOverrides(
   const home = realpathSync(homedir())
   const artifactDir = requireManagedDirectory(options.stateDir, options.artifactDir)
   const scratchDir = requireManagedDirectory(options.stateDir, options.scratchDir)
+  const jobTempDir = options.jobTempDir ?? scratchDir
+  if (options.jobTempDir && existingJobTempDirectory(options.stateDir, job.id) !== options.jobTempDir) {
+    throw new Error('job temporary directory does not match this job')
+  }
   // サンドボックスは mDNSResponder への mach-lookup を塞ぐため、getaddrinfo を
   // 使う dns.lookup だけが ENOTFOUND になる。ジョブ内の Node に preload させて
   // DNS へ引き直させる。scratchDir はジョブ専用で読み書きできる唯一の置き場。
@@ -5733,13 +5746,17 @@ export function buildCodexPermissionOverrides(
     }
   }
 
+  // A primary can normally write OS temp. Protect all sibling jobs (including
+  // ones created later), then reopen this job even when inherited TMPDIR was it.
+  rules.set(jobTempRoot(), 'deny')
+  rules.set(jobTempDir, 'write')
   const filesystem = [...rules.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([path, access]) => `${tomlString(path)}=${tomlString(access)}`)
     .join(',')
   const shellEnvironment = [
     `"HOME"=${tomlString(scratchDir)}`,
-    `"TMPDIR"=${tomlString(scratchDir)}`,
+    `"TMPDIR"=${tomlString(jobTempDir)}`,
     `"XDG_CONFIG_HOME"=${tomlString(join(scratchDir, '.config'))}`,
     `"XDG_CACHE_HOME"=${tomlString(join(scratchDir, '.cache'))}`,
     `"NODE_OPTIONS"=${tomlString(`--require ${dnsFallbackPath} --require ${diagnosticsPath}`)}`,
@@ -5802,6 +5819,7 @@ export function buildCodexPermissionOverrides(
     `permissions.${profile}.filesystem={${filesystem}}`,
     `permissions.${profile}.network.enabled=${networkEnabled ? 'true' : 'false'}`,
     `permissions.${profile}.network.allow_local_binding=${networkEnabled ? 'true' : 'false'}`,
+    `permissions.${profile}.network.unix_sockets={${networkEnabled ? `${tomlString(jobTempDir)}="allow"` : ''}}`,
     ...(executionWriteEnabled || browserAccessEnabled ? [
       `permissions.${profile}.network.domains={"*"="allow","slack.com"="deny","**.slack.com"="deny","slack-edge.com"="deny","**.slack-edge.com"="deny","slack-msgs.com"="deny","**.slack-msgs.com"="deny"}`,
     ] : localVerificationEnabled ? [
@@ -6703,6 +6721,7 @@ export async function executeCodexJob(
   const scratchDir = scratchDirForJob(stateDir, job.id)
   ensureManagedDirectory(stateDir, artifactDir)
   ensureManagedDirectory(stateDir, scratchDir)
+  const jobTempDir = ensureJobTempDirectory(stateDir, job.id)
   const liveInputRoot = liveControlInputDir(stateDir, job.id)
   ensureManagedDirectory(stateDir, join(stateDir, 'executors'))
   const finalOutputDir = ensureManagedDirectory(
@@ -6984,6 +7003,7 @@ export async function executeCodexJob(
         stateDir,
         artifactDir,
         scratchDir,
+        jobTempDir,
         liveInputDir: liveInputRoot,
         gitRoot: advisorProjectLayout.gitRoot,
         gitRoots: advisorProjectLayout.gitRoots,
@@ -7196,7 +7216,7 @@ export async function executeCodexJob(
         ...buildCodexChildEnvironment(),
         ...options.extraEnvironment,
         ...(officialCodexSnapshot ? {} : { ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1' }),
-        TMPDIR: scratchDir,
+        TMPDIR: jobTempDir,
       },
       stdin: 'pipe' as const,
       stdout: 'pipe' as const,
@@ -7756,7 +7776,7 @@ export async function executeCodexJob(
       let inputChangedBeforeDispatch = false
       let observedSessionId: string | null = sessionId
       let finalMessage = ''
-      const continuedArtifactMessage = new ContinuedArtifactMessage(artifactDirForJob(managedStateDir, job.id), [scratchDir, ...previousThreadArtifactRoots(job, managedStateDir)])
+      const continuedArtifactMessage = new ContinuedArtifactMessage(artifactDirForJob(managedStateDir, job.id), [scratchDir, jobTempDir, ...previousThreadArtifactRoots(job, managedStateDir)])
       let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null
@@ -11406,6 +11426,7 @@ async function verifyCodexConfig(inheritProcessGroup = false): Promise<void> {
         const profile = `zerokun_probe_${mode}_${randomUUID().replaceAll('-', '')}`
         const overrides = buildCodexPermissionOverrides(probe, {
           stateDir, artifactDir, scratchDir, profile,
+          jobTempDir: ensureJobTempDirectory(stateDir, probe.id),
           seatbeltFingerprintAllowPath: fingerprint.allow.path,
         })
         verifyOfficialCodexSnapshot(officialCodexSnapshot)

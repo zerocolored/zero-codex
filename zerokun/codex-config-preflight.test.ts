@@ -320,6 +320,26 @@ describe('Codex app-server config preflight', () => {
     )
     expect(calls).toEqual(['configRequirements/read', 'config/read'])
 
+    const socketOverrides = [...overrides, `permissions.${profile}.network.unix_sockets={"/private/tmp/owned-job"="allow"}`]
+    for (const sockets of [
+      { '/private/tmp/owned-job': 'allow' },
+      {},
+      { '/private/tmp/owned-job': 'allow', '/var/run/foreign.sock': 'allow' },
+    ]) {
+      const socketSession = {
+        async request(method: string) {
+          return { requestId: 1, result: method === 'configRequirements/read'
+            ? { requirements: null }
+            : { config: { ...effective, permissions: { [profile]: {
+              ...effective.permissions[profile], network: { enabled: false, unix_sockets: sockets },
+            } } } } }
+        },
+      }
+      const check = assertCurrentAppServerCodexPermissionConfig(socketSession, '/repo', socketOverrides, profile)
+      if (Object.keys(sockets).length === 1) await check
+      else await expect(check).rejects.toThrow('network.unix_sockets')
+    }
+
     const unsafeSession = {
       async request(method: string, _params: Record<string, unknown>) {
         return {

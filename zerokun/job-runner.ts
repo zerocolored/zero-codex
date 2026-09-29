@@ -8,6 +8,7 @@ import { toSlackMrkdwn } from './slack-mrkdwn.ts'
 import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
 import { startFleetRunnerPulse } from './fleet-runtime.ts'
 import { resolveArtifactSource, previousThreadArtifactRoots } from './artifact-source.ts'
+import { existingJobTempDirectory } from './job-temp.ts'
 import { advisorFailureMessage, PUBLIC_ADVISOR_FAILURE_MESSAGES, type AdvisorFailure } from './advisor-availability.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
@@ -2702,6 +2703,9 @@ function ensureJobSchemaMigrations(db: Database): void {
     'PRAGMA table_info(artifact_deliveries)',
   ).all()
   for (const [name, definition] of [
+    ['upload_stage', 'TEXT'],
+    ['upload_attempt', 'TEXT'],
+    ['upload_attempts', 'INTEGER NOT NULL DEFAULT 0'],
     ['remote_file_id', 'TEXT'],
     ['started_at', 'INTEGER'],
     ['ambiguity_checks', 'INTEGER NOT NULL DEFAULT 0'],
@@ -12179,11 +12183,54 @@ export class JobStore {
     return retrySqlite(() => begin.immediate())
   }
 
+  artifactUploadCheckpoint(jobId: string, artifactPath: string) {
+    return this.db.query<{
+      upload_stage: string | null; upload_attempt: string | null
+      upload_attempts: number; remote_file_id: string | null; last_error: string | null
+    }, [string, string]>(
+      `SELECT upload_stage, upload_attempt, upload_attempts, remote_file_id, last_error
+       FROM artifact_deliveries WHERE job_id = ? AND artifact_path = ?`,
+    ).get(jobId, artifactPath)
+  }
+
+  beginStagedArtifactUpload(jobId: string, artifactPath: string, fileId: string): string | null {
+    if (!/^[A-Za-z0-9._-]{1,256}$/.test(fileId)) throw new Error('invalid Slack file id')
+    const attempt = randomUUID()
+    // An incomplete byte transfer cannot share a file. Replacing its attempt
+    // fences a late old uploader before it can reach completeUploadExternal.
+    const result = this.db.run(
+      `UPDATE artifact_deliveries SET started_at = ?, remote_file_id = ?,
+         upload_stage = 'transferring', upload_attempt = ?, upload_attempts = upload_attempts + 1
+       WHERE job_id = ? AND artifact_path = ? AND delivered_at IS NULL AND abandoned_at IS NULL
+         AND (started_at IS NULL OR upload_stage = 'transferring')`,
+      [Date.now(), fileId, attempt, jobId, artifactPath],
+    )
+    return result.changes === 1 ? attempt : null
+  }
+
+  advanceArtifactUpload(jobId: string, path: string, attempt: string, from: string, to: string): boolean {
+    return this.db.run(
+      `UPDATE artifact_deliveries SET upload_stage = ?
+       WHERE job_id = ? AND artifact_path = ? AND upload_attempt = ? AND upload_stage = ?
+         AND delivered_at IS NULL AND abandoned_at IS NULL`,
+      [to, jobId, path, attempt, from],
+    ).changes === 1
+  }
+
+  recordArtifactUploadFailure(jobId: string, path: string, attempt: string, diagnostic: string): void {
+    this.db.run(
+      `UPDATE artifact_deliveries SET last_error = COALESCE(last_error, ?)
+       WHERE job_id = ? AND artifact_path = ? AND upload_attempt = ?
+         AND delivered_at IS NULL AND abandoned_at IS NULL`,
+      [diagnostic, jobId, path, attempt],
+    )
+  }
+
   recordArtifactAmbiguityCheck(jobId: string, artifactPath: string, error: string): number {
     const record = this.db.transaction(() => {
       const updated = this.db.run(
         `UPDATE artifact_deliveries
-         SET ambiguity_checks = ambiguity_checks + 1, last_error = ?
+         SET ambiguity_checks = ambiguity_checks + 1, last_error = COALESCE(last_error, ?)
          WHERE job_id = ? AND artifact_path = ? AND started_at IS NOT NULL
            AND delivered_at IS NULL AND abandoned_at IS NULL`,
         [error, jobId, artifactPath],
@@ -12205,7 +12252,7 @@ export class JobStore {
     const unique = [...new Set(artifactPaths)]
     const abandon = this.db.transaction(() => unique.reduce((count, artifactPath) => (
       count + this.db.run(
-        `UPDATE artifact_deliveries SET abandoned_at = ?, last_error = ?
+        `UPDATE artifact_deliveries SET abandoned_at = ?, last_error = COALESCE(last_error, ?)
          WHERE job_id = ? AND artifact_path = ? AND started_at IS NOT NULL
            AND delivered_at IS NULL AND abandoned_at IS NULL`,
         [Date.now(), error, jobId, artifactPath],
@@ -13719,16 +13766,81 @@ export class ArtifactPublicationBlockedError extends Error {
   }
 }
 
+/** Never relay arbitrary SDK messages, upload URLs, response bodies or tokens. */
+export function artifactUploadDiagnostic(stage: string, error: unknown): string {
+  const value = error as { code?: string; data?: { error?: string }; statusCode?: number; message?: string }
+  const allowed = new Set(['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
+    'ABORT_ERR', 'missing_scope', 'not_authed', 'invalid_auth', 'token_revoked', 'ratelimited',
+    'file_not_found', 'channel_not_found', 'not_in_channel', 'upload_failed', 'already_complete'])
+  const code = (value?.code === 'slack_webapi_rate_limited_error' ? 'ratelimited' : undefined)
+    ?? [value?.data?.error, value?.code].find(code => code && allowed.has(code))
+  const status = Number.isInteger(value?.statusCode) && value.statusCode! >= 100 && value.statusCode! <= 599
+    ? value.statusCode : undefined
+  const message = typeof value?.message === 'string' ? value.message : ''
+  const outcome = code ?? (status ? `http_${status}` : /timed out|timeout/i.test(message)
+    ? 'timeout' : /abort/i.test(message) ? 'aborted' : 'request_failed')
+  return `stage=${['target', 'transfer', 'complete', 'inspect'].includes(stage) ? stage : 'unknown'} outcome=${outcome}`
+}
+
+function artifactPlatformErrorCode(error: unknown): string | undefined {
+  const value = error as { code?: unknown; data?: { ok?: unknown; error?: unknown } }
+  return value?.code === 'slack_webapi_platform_error' && value.data?.ok === false
+    && typeof value.data.error === 'string' ? value.data.error : undefined
+}
+
+function artifactInspectWasRejected(error: unknown): boolean {
+  const platformCode = artifactPlatformErrorCode(error)
+  if (platformCode !== undefined) {
+    return !['ratelimited', 'internal_error', 'fatal_error', 'service_unavailable', 'request_timeout']
+      .includes(platformCode)
+  }
+  const value = error as { code?: string; statusCode?: number }
+  if (['slack_webapi_rate_limited_error', 'slack_webapi_request_error', 'ETIMEDOUT',
+    'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ABORT_ERR'].includes(value?.code ?? '')) return false
+  if (value?.statusCode === 429 || (value?.statusCode !== undefined && value.statusCode >= 500)) return false
+  const diagnostic = artifactUploadDiagnostic('inspect', error)
+  // Unknown application-level refusals remain bounded; never classify them
+  // as a perpetual network outage merely because their error code is new.
+  return !diagnostic.endsWith('outcome=timeout') && !diagnostic.endsWith('outcome=aborted')
+}
+
+function artifactShareWasNotApplied(error: unknown, attempts: number): boolean {
+  // Only these responses prove that this sharing request did not apply.
+  // In particular internal_error/fatal_error may have partially succeeded.
+  const value = error as { code?: unknown }
+  const code = artifactPlatformErrorCode(error)
+  return value?.code === 'slack_webapi_rate_limited_error' || code === 'ratelimited'
+    || (code === 'file_not_found' && attempts < MAX_ARTIFACT_DELIVERY_ATTEMPTS)
+}
+
+class ArtifactDeliveryRetryError extends Error {
+  readonly retryAfterMs: number
+  constructor(diagnostic: string, error: unknown) {
+    super(diagnostic)
+    const value = error as { retryAfter?: unknown; data?: { response_metadata?: { retryAfter?: unknown } } }
+    const seconds = Number(value?.retryAfter ?? value?.data?.response_metadata?.retryAfter)
+    this.retryAfterMs = Number.isFinite(seconds) && seconds > 0 && seconds <= 7 * 86400
+      ? Math.ceil(seconds * 1000) : 0
+  }
+}
+
+function artifactDeliveryBackoff(error: unknown, base: number): number {
+  return error instanceof ArtifactDeliveryRetryError ? Math.max(base, error.retryAfterMs) : base
+}
+
 export class ArtifactDeliveryAmbiguousError extends Error {
   readonly artifactPaths: string[]
+  readonly checkedPaths: string[]
 
-  constructor(artifactPaths: readonly string[], cause?: unknown) {
+  constructor(artifactPaths: readonly string[], cause?: unknown, checkedPaths = artifactPaths) {
     super(
-      'artifact upload result is ambiguous; byte transfer will not be replayed',
+      'artifact upload result is ambiguous; byte transfer will not be replayed'
+        + (cause instanceof Error && /^stage=/.test(cause.message) ? `; ${cause.message}` : ''),
       cause === undefined ? undefined : { cause },
     )
     this.name = 'ArtifactDeliveryAmbiguousError'
     this.artifactPaths = [...new Set(artifactPaths)]
+    this.checkedPaths = [...new Set(checkedPaths)]
   }
 }
 
@@ -14276,7 +14388,7 @@ export async function flushTerminalNotifications(
       const message = error instanceof Error ? error.message : String(error)
       if (error instanceof ArtifactDeliveryAmbiguousError
         && notification.kind === 'completed') {
-        const exhausted = error.artifactPaths.filter(path => (
+        const exhausted = error.checkedPaths.filter(path => (
           store.recordArtifactAmbiguityCheck(notification.job.id, path, message)
             >= MAX_ARTIFACT_DELIVERY_ATTEMPTS
         ))
@@ -14316,7 +14428,8 @@ export async function flushTerminalNotifications(
           }
         }
       }
-      const backoff = Math.min(retryMs * (2 ** Math.min(notification.attempts, 10)), 6 * 60 * 60 * 1000)
+      const backoff = artifactDeliveryBackoff(error,
+        Math.min(retryMs * (2 ** Math.min(notification.attempts, 10)), 6 * 60 * 60 * 1000))
       store.deferTerminalNotification(notification.id, message, Date.now(), backoff)
       log(`terminal notification ${notification.id} deferred: ${message}`)
       // A permanently broken artifact or Slack policy must not suppress every
@@ -14345,7 +14458,7 @@ export async function flushUiApprovalNotifications(
       if (signal?.aborted) return
       const message = error instanceof Error ? error.message : String(error)
       if (error instanceof ArtifactDeliveryAmbiguousError) {
-        const exhausted = error.artifactPaths.filter(path => (
+        const exhausted = error.checkedPaths.filter(path => (
           store.recordArtifactAmbiguityCheck(notification.job.id, path, message)
             >= MAX_ARTIFACT_DELIVERY_ATTEMPTS
         ))
@@ -14360,10 +14473,10 @@ export async function flushUiApprovalNotifications(
           continue
         }
       }
-      const backoff = Math.min(
+      const backoff = artifactDeliveryBackoff(error, Math.min(
         retryMs * (2 ** Math.min(notification.request.attempts, 10)),
         6 * 60 * 60 * 1000,
-      )
+      ))
       store.deferUiApprovalNotification(notification.id, message, Date.now(), backoff)
       log(`UI approval notification ${notification.id} deferred: ${message}`)
     }
@@ -16052,7 +16165,8 @@ export function sealArtifactResult(job: JobRecord, result: string, dir = stateDi
     throw new Error(`sealed artifact root is not a directory: ${sealedRoot}`)
   }
 
-  const sourceRoots = [outbox, scratchDirForJob(dir, job.id), ...previousThreadArtifactRoots(job, dir)]
+  const jobTempDir = existingJobTempDirectory(dir, job.id)
+  const sourceRoots = [outbox, scratchDirForJob(dir, job.id), ...(jobTempDir ? [jobTempDir] : []), ...previousThreadArtifactRoots(job, dir)]
   const sealed: string[] = []
   for (const requested of [...new Set(output.files)]) {
     const source = resolveArtifactSource(requested, sourceRoots)
@@ -16751,7 +16865,7 @@ export function slackArtifactPublicationBlockedMessage(): string {
 }
 
 class ArtifactDeliverySuppressedError extends Error {
-  constructor(readonly disposition: 'delivered' | 'abandoned') {
+  constructor(readonly disposition: 'delivered' | 'abandoned' | 'ambiguous') {
     super(`artifact delivery is already ${disposition}`)
     this.name = 'ArtifactDeliverySuppressedError'
   }
@@ -16823,7 +16937,7 @@ export class SlackNotifier implements JobNotifier {
     private readonly store: JobStore,
     dependencies: Partial<SlackUploadDependencies> = {},
   ) {
-    this.client = new WebClient(token, slackWebClientOptions())
+    this.client = new WebClient(token, { ...slackWebClientOptions(), rejectRateLimitedCalls: true })
     this.uploadDependencies = {
       postMessage: dependencies.postMessage ?? (async (input, signal) => {
         const result = await postDirectSlackApi('chat.postMessage', this.token, {
@@ -17089,64 +17203,92 @@ export class SlackNotifier implements JobNotifier {
   private async deliverSealedArtifact(
     job: JobRecord,
     requested: string,
-    filename: string,
+    filename: string | undefined,
     signal?: AbortSignal,
   ): Promise<void> {
-    const deliveryState = this.store.artifactDeliveryState(job.id, requested)
-    if (deliveryState === 'delivered') return
-    if (deliveryState === 'abandoned') {
-      throw new Error(`required Slack attachment was abandoned: ${filename}`)
-    }
-    if (deliveryState === 'ambiguous') {
-      const fileId = this.store.artifactRemoteFileId(job.id, requested)
-      if (fileId && await this.uploadDependencies.inspectUpload({
-        fileId,
-        chatId: job.chatId,
-        threadTs: job.threadTs,
-      })) {
-        this.store.markArtifactDelivered(job.id, requested)
-        return
+    const state = this.store.artifactDeliveryState(job.id, requested)
+    if (state === 'delivered') return
+    if (state === 'abandoned') throw new Error('required Slack attachment was abandoned')
+    const checkpoint = this.store.artifactUploadCheckpoint(job.id, requested)
+    const recoverable = checkpoint?.upload_stage === 'uploaded'
+      || checkpoint?.upload_stage === 'transferring'
+    if (state === 'ambiguous' && !recoverable) {
+      const fileId = checkpoint?.remote_file_id
+      let diagnostic = checkpoint?.last_error ?? 'stage=legacy outcome=unknown'
+      try {
+        if (fileId && await this.uploadDependencies.inspectUpload({
+          fileId, chatId: job.chatId, threadTs: job.threadTs,
+        })) {
+          this.store.markArtifactDelivered(job.id, requested)
+          return
+        }
+      } catch (error) {
+        diagnostic += '; ' + artifactUploadDiagnostic('inspect', error)
+        if (artifactInspectWasRejected(error)) {
+          throw new ArtifactDeliveryAmbiguousError([requested], new Error(diagnostic))
+        }
+        throw new ArtifactDeliveryRetryError(diagnostic, error)
       }
-      throw new ArtifactDeliveryAmbiguousError([requested])
+      throw new ArtifactDeliveryAmbiguousError([requested], new Error(diagnostic))
     }
     const file = readUploadableArtifact(job, requested, dirname(this.store.dbPath))
+    filename ??= file.filename
+    const uploadFilename = filename
     await this.completeStartedSideEffect(async () => {
-      const target = await this.uploadDependencies.requestUploadTarget(
-        filename,
-        file.data.byteLength,
-      )
-      const uploadUrl = requireSlackUploadUrl(target.uploadUrl)
-      if (!target.fileId) throw new Error('Slack upload target omitted file id')
-      if (signal?.aborted) throw new Error('Slack attachment upload aborted before byte transfer')
-      let transferCommitted = false
+      let attempt = checkpoint?.upload_stage === 'uploaded' ? checkpoint.upload_attempt : null
+      let fileId = checkpoint?.upload_stage === 'uploaded' ? checkpoint.remote_file_id : null
+      let stage = 'target'
       try {
-        await this.uploadDependencies.uploadBytes(uploadUrl, file.data, () => {
-          const delivery = this.store.beginArtifactDelivery(job.id, requested, target.fileId)
-          if (delivery === 'delivered' || delivery === 'abandoned') {
-            throw new ArtifactDeliverySuppressedError(delivery)
+        if (!attempt || !fileId) {
+          const target = await this.uploadDependencies.requestUploadTarget(uploadFilename, file.data.byteLength)
+          const uploadUrl = requireSlackUploadUrl(target.uploadUrl)
+          if (signal?.aborted) throw new Error('aborted')
+          stage = 'transfer'
+          await this.uploadDependencies.uploadBytes(uploadUrl, file.data, () => {
+            attempt = this.store.beginStagedArtifactUpload(job.id, requested, target.fileId)
+            if (!attempt) throw new ArtifactDeliverySuppressedError('ambiguous')
+            fileId = target.fileId
+          })
+          if (!attempt || !fileId) throw new Error('transport skipped durable boundary')
+          if (!this.store.advanceArtifactUpload(job.id, requested, attempt, 'transferring', 'uploaded')) {
+            throw new ArtifactDeliverySuppressedError('ambiguous')
           }
-          if (delivery === 'ambiguous') {
-            throw new ArtifactDeliveryAmbiguousError([requested])
-          }
-          transferCommitted = true
-        })
-        if (!transferCommitted) {
-          throw new Error('Slack upload transport skipped the durable transfer boundary')
+        }
+        // Persist the non-replayable sharing boundary BEFORE calling Slack.
+        // The CAS also prevents an older replaced attempt from publishing.
+        stage = 'complete'
+        if (!this.store.advanceArtifactUpload(job.id, requested, attempt, 'uploaded', 'completing')) {
+          throw new ArtifactDeliverySuppressedError('ambiguous')
         }
         await this.uploadDependencies.completeUpload({
-          fileId: target.fileId,
-          filename,
-          chatId: job.chatId,
-          threadTs: job.threadTs,
+          fileId, filename: uploadFilename, chatId: job.chatId, threadTs: job.threadTs,
         })
         this.store.markArtifactDelivered(job.id, requested)
       } catch (error) {
-        if (error instanceof ArtifactDeliverySuppressedError) return
-        if (error instanceof ArtifactDeliveryAmbiguousError) throw error
-        if (!transferCommitted) throw error
-        throw new ArtifactDeliveryAmbiguousError([requested], error)
+        if (error instanceof ArtifactDeliverySuppressedError) {
+          if (this.store.artifactDelivered(job.id, requested)) return
+          throw new Error('artifact delivery attempt superseded; retry reconciliation')
+        }
+        const diagnostic = artifactUploadDiagnostic(stage, error)
+        if (attempt) this.store.recordArtifactUploadFailure(job.id, requested, attempt, diagnostic)
+        if (stage === 'complete' && attempt && artifactShareWasNotApplied(error,
+          this.store.artifactUploadCheckpoint(job.id, requested)?.upload_attempts ?? Infinity)
+          && this.store.advanceArtifactUpload(job.id, requested, attempt, 'completing', 'transferring')) {
+          // Retry with a fresh target; never repeat complete for the old ID.
+          throw new ArtifactDeliveryRetryError(diagnostic, error)
+        }
+        if (stage === 'complete') {
+          throw new ArtifactDeliveryAmbiguousError([requested], new Error(diagnostic), [])
+        }
+        throw new ArtifactDeliveryRetryError(diagnostic, error)
       }
-    }, `Slack ${filename} delivery`, signal)
+    }, 'Slack artifact delivery', signal)
+  }
+
+  private isUiApprovalAttachmentWait(job: JobRecord): boolean {
+    if (!job.uiApprovalRequestId) return false
+    const request = this.store.uiApprovalRequest(job.uiApprovalRequestId)
+    return request?.jobId === job.id && ['publishing', 'awaiting'].includes(request.status)
   }
 
   async uiApproval(notification: UiApprovalNotification, signal?: AbortSignal): Promise<void> {
@@ -17223,7 +17365,13 @@ export class SlackNotifier implements JobNotifier {
       undefined,
       'delivery',
     )
+    // Preserve attachment-before-body ordering for waiting results, independently
+    // of whether the host has an actual UI approval request.
     const attachmentsBeforeWaiting = ['blocked', 'paused'].includes(job.taskGoalStatus ?? '') && output.files.length > 0
+    // Older goal-based image proposals predate host approval receipts. Preserve
+    // their image-before-question barrier; image names never grant approval.
+    const preserveImageGate = this.isUiApprovalAttachmentWait(job)
+      || output.files.some(path => /\.(?:png|jpe?g|webp|gif|svg)$/i.test(path))
     const postBody = async () => {
       if (notificationId && this.store.terminalNotificationBodyDelivered(notificationId)) return
       const banner = readerActionBanner(job.taskGoalStatus)
@@ -17240,85 +17388,21 @@ export class SlackNotifier implements JobNotifier {
     }
     if (!attachmentsBeforeWaiting) await postBody()
     const ambiguousPaths: string[] = []
+    const checkedPaths: string[] = []
     let ambiguityCause: unknown
     for (const requested of output.files) {
-      const deliveryState = this.store.artifactDeliveryState(job.id, requested)
-      if (deliveryState === 'delivered' || deliveryState === 'abandoned') continue
-      if (deliveryState === 'ambiguous') {
-        const fileId = this.store.artifactRemoteFileId(job.id, requested)
-        if (fileId) {
-          try {
-            if (await this.uploadDependencies.inspectUpload({
-              fileId,
-              chatId: job.chatId,
-              threadTs: job.threadTs,
-            })) {
-              this.store.markArtifactDelivered(job.id, requested)
-              continue
-            }
-          } catch (error) {
-            ambiguityCause ??= error
-          }
+      const state = this.store.artifactDeliveryState(job.id, requested)
+      if (state === 'delivered' || state === 'abandoned') continue
+      try {
+        await this.deliverSealedArtifact(job, requested, undefined, signal)
+      } catch (error) {
+        if (error instanceof ArtifactPublicationBlockedError) {
+          this.store.blockArtifactByPublicationPolicy(job.id, requested)
+          continue
         }
-        ambiguousPaths.push(requested)
-        continue
-      }
-      let file: ReturnType<typeof readUploadableArtifact>
-      try {
-        file = readUploadableArtifact(job, requested, dirname(this.store.dbPath))
-      } catch (error) {
-        if (!(error instanceof ArtifactPublicationBlockedError)) throw error
-        this.store.blockArtifactByPublicationPolicy(job.id, requested)
-        continue
-      }
-      try {
-        await this.completeStartedSideEffect(async () => {
-          // Requesting an upload URL cannot publish bytes. Keep the durable
-          // delivery intent clear through this phase so explicit API rejection
-          // and pre-transfer shutdown remain safely retryable.
-          const target = await this.uploadDependencies.requestUploadTarget(
-            file.filename,
-            file.data.byteLength,
-          )
-          const uploadUrl = requireSlackUploadUrl(target.uploadUrl)
-          if (!target.fileId) throw new Error('Slack upload target omitted file id')
-          if (signal?.aborted) throw new Error('Slack artifact upload aborted before byte transfer')
-          let transferCommitted = false
-          try {
-            // The transport invokes this synchronous callback after creating
-            // the ClientRequest but immediately before request.end(data). Once
-            // the durable checkpoint commits, no shutdown or error may replay
-            // the possible byte transfer for this exact Slack file ID.
-            await this.uploadDependencies.uploadBytes(uploadUrl, file.data, () => {
-              const delivery = this.store.beginArtifactDelivery(job.id, requested, target.fileId)
-              if (delivery === 'delivered' || delivery === 'abandoned') {
-                throw new ArtifactDeliverySuppressedError(delivery)
-              }
-              if (delivery === 'ambiguous') {
-                throw new ArtifactDeliveryAmbiguousError([requested])
-              }
-              transferCommitted = true
-            })
-            if (!transferCommitted) {
-              throw new Error('Slack upload transport skipped the durable transfer boundary')
-            }
-            await this.uploadDependencies.completeUpload({
-              fileId: target.fileId,
-              filename: file.filename,
-              chatId: job.chatId,
-              threadTs: job.threadTs,
-            })
-            this.store.markArtifactDelivered(job.id, requested)
-          } catch (error) {
-            if (error instanceof ArtifactDeliverySuppressedError) return
-            if (error instanceof ArtifactDeliveryAmbiguousError) throw error
-            if (!transferCommitted) throw error
-            throw new ArtifactDeliveryAmbiguousError([requested], error)
-          }
-        }, 'Slack artifact delivery', signal)
-      } catch (error) {
         if (!(error instanceof ArtifactDeliveryAmbiguousError)) throw error
         ambiguousPaths.push(...error.artifactPaths)
+        checkedPaths.push(...error.checkedPaths)
         ambiguityCause ??= error.cause
       }
       if (signal?.aborted) return
@@ -17327,17 +17411,18 @@ export class SlackNotifier implements JobNotifier {
       await this.post(
         job,
         slackArtifactPublicationBlockedMessage()
-          + (attachmentsBeforeWaiting ? '\n比較案の添付が揃っていないため、承認依頼は送らず待機しています。再開を依頼してください。' : ''),
+          + (this.isUiApprovalAttachmentWait(job) ? '\n比較案の添付が揃っていないため、承認依頼は送らず待機しています。再開を依頼してください。' : ''),
         notificationId ? `${notificationId}:artifact-policy` : undefined,
         signal,
       )
       if (signal?.aborted) return
     }
     if (ambiguousPaths.length > 0) {
-      throw new ArtifactDeliveryAmbiguousError(ambiguousPaths, ambiguityCause)
+      throw new ArtifactDeliveryAmbiguousError(ambiguousPaths, ambiguityCause, checkedPaths)
     }
-    if (attachmentsBeforeWaiting && this.store.publicationBlockedArtifactCount(job.id) === 0
-      && this.store.abandonedArtifactCount(job.id) === 0) {
+    if (attachmentsBeforeWaiting && (!preserveImageGate
+      || (this.store.publicationBlockedArtifactCount(job.id) === 0
+        && this.store.abandonedArtifactCount(job.id) === 0))) {
       await postBody()
     }
   }
@@ -17396,10 +17481,14 @@ export class SlackNotifier implements JobNotifier {
     signal?: AbortSignal,
   ): Promise<void> {
     this.log(`job ${job.id} artifact delivery abandoned: ${error}`)
+    if (!this.isUiApprovalAttachmentWait(job) && job.result
+      && this.store.unsettledArtifactCount(job.id) === 0) {
+      await this.completed(job, job.result, notificationId, signal)
+    }
     await this.post(
       job,
       slackArtifactsAbandonedMessage()
-        + (['blocked', 'paused'].includes(job.taskGoalStatus ?? '')
+        + (this.isUiApprovalAttachmentWait(job)
           ? '\n比較案の添付を確認できないため、承認依頼は送らず待機しています。' : ''),
       notificationId ? `${notificationId}:artifacts-abandoned` : undefined,
       signal,
