@@ -30,7 +30,6 @@ function harness(options: { payloadSha?: string; failPlace?: boolean; identityAv
   const backupRoot = join(root, 'app-swap')
   for (const dir of [applications, artifactDir, backupRoot]) mkdirSync(dir, { recursive: true })
   const calls: string[][] = []
-  let identifier = 'com.bellsalesai.live-agent'
   const rewrite = (path: string) => (
     path === join(APPLICATIONS_ROOT, APP) ? join(applications, APP) : path
   )
@@ -50,16 +49,6 @@ function harness(options: { payloadSha?: string; failPlace?: boolean; identityAv
       if (String(tool).endsWith('/lsregister')) return { exitCode: 0, stdout: '', stderr: '' }
       if (tool === '/usr/bin/pkill') return { exitCode: 1, stdout: '', stderr: '' }
       if (tool === '/usr/bin/open') return { exitCode: 0, stdout: '', stderr: '' }
-      if (tool === '/usr/libexec/PlistBuddy') {
-        const command = String(rest[1] ?? '')
-        if (command.startsWith('Print :CFBundleIdentifier')) {
-          return { exitCode: 0, stdout: `${identifier}\n`, stderr: '' }
-        }
-        if (command.startsWith('Set :CFBundleIdentifier ')) {
-          identifier = command.slice('Set :CFBundleIdentifier '.length).trim()
-        }
-        return { exitCode: 0, stdout: '', stderr: '' }
-      }
       if (tool === '/usr/bin/ditto') {
         const [, , , , destination] = argv
         const bundle = join(destination!, APP)
@@ -228,39 +217,8 @@ test('証明書が無いMacでも差し替えは続き、許可が要ること�
   expect(h.calls.some(call => call[0] === '/usr/bin/codesign')).toBe(false)
 })
 
-// 同じ identifier のままだと、画面収録の許可は製品版の条件で登録され、検証版は
-// 対象外のまま。許可し直すと今度は製品版が弾かれ、差し替えるたびに行き来する。
-test('検証版は製品版と別のidentifierになる', async () => {
-  const h = harness()
-  installOriginal(h)
-  const result = await installVerificationBuild(h.context, h.commands,
-    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
-  expect(result.bundleIdentifier).toBe('com.bellsalesai.live-agent.verification')
-})
 
-// 署名の後に Info.plist を書き換えると署名が壊れる。
-test('identifierを分けてから署名する', async () => {
-  const h = harness()
-  installOriginal(h)
-  await installVerificationBuild(h.context, h.commands,
-    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
-  const setIndex = h.calls.findIndex(call =>
-    call[0] === '/usr/libexec/PlistBuddy' && String(call[2]).startsWith('Set :CFBundleIdentifier'))
-  const signIndex = h.calls.findIndex(call => call[0] === '/usr/bin/codesign')
-  expect(setIndex).toBeGreaterThanOrEqual(0)
-  expect(setIndex).toBeLessThan(signIndex)
-})
 
-test('すでに分かれているidentifierは二重に伸ばさない', async () => {
-  const h = harness()
-  installOriginal(h)
-  await installVerificationBuild(h.context, h.commands,
-    { app: APP, payload: payload(h), sha256: 'a'.repeat(64) })
-  await restoreInstalledBuild(h.context, h.commands, { app: APP })
-  const again = await installVerificationBuild(h.context, h.commands,
-    { app: APP, payload: payload(h, 'again.zip'), sha256: 'a'.repeat(64) })
-  expect(again.bundleIdentifier).toBe('com.bellsalesai.live-agent.verification')
-})
 
 // identifier を書き換えても LaunchServices が古い記録を持つと、Computer Use は
 // 一覧に出たアプリを掴めず Invalid app を返す。置いた実体で登録し直す。

@@ -28,14 +28,10 @@ const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024 * 1024
  * 証明書ではないので、他の Mac では何の効力も持たない。
  */
 export const VERIFICATION_SIGNING_IDENTITY = 'zerokun verification (local only)'
-/**
- * macOS は1つの bundle identifier につき署名条件を1つしか覚えない。検証版が
- * 製品と同じ identifier のままだと、画面収録などの許可は製品版の条件で登録
- * され、検証版は同じ行を見ても対象外になる。許可し直すと今度は製品版が弾かれ、
- * 差し替えるたびに行き来する。identifier を分けると、それぞれが自分の行を
- * 持ち、どちらも1回許可すれば以後は聞かれない。
- */
-export const VERIFICATION_IDENTIFIER_SUFFIX = '.verification'
+// 検証版だけ identifier を変える案は取り下げた(2026-09-29)。許可の行を分けられる
+// 一方で、Computer Use が対象を解決できず Invalid app になる。登録し直し・
+// 起動中プロセスの終了・置いた後の起動を順に足しても解消しなかった。許可を
+// 取り直す手間より、実機を操作できないことの方が高くつく。
 const SHA256 = /^[0-9a-f]{64}$/
 const COMMAND_TIMEOUT_MS = 10 * 60 * 1000
 const LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
@@ -78,29 +74,6 @@ async function launchInstalledApp(
 ): Promise<boolean> {
   const launched = await commands.run(['/usr/bin/open', '-g', bundle], signal)
   return launched.exitCode === 0
-}
-
-/** 製品版と許可を取り合わないよう、検証版だけ別の identifier にする。 */
-async function separateBundleIdentity(
-  commands: AppSwapCommands,
-  bundle: string,
-  signal?: AbortSignal,
-): Promise<string | null> {
-  const plist = join(bundle, 'Contents', 'Info.plist')
-  const read = await commands.run(
-    ['/usr/libexec/PlistBuddy', '-c', 'Print :CFBundleIdentifier', plist], signal)
-  if (read.exitCode !== 0) return null
-  const current = read.stdout.trim()
-  if (!current) return null
-  if (current.endsWith(VERIFICATION_IDENTIFIER_SUFFIX)) return current
-  const separated = `${current}${VERIFICATION_IDENTIFIER_SUFFIX}`
-  const written = await commands.run(
-    ['/usr/libexec/PlistBuddy', '-c', `Set :CFBundleIdentifier ${separated}`, plist], signal)
-  if (written.exitCode !== 0) return null
-  // 一覧で製品版と見分けられるようにする。取り違えたまま操作するのを防ぐ。
-  await commands.run(
-    ['/usr/libexec/PlistBuddy', '-c', 'Set :CFBundleDisplayName bellMe (verification)', plist], signal)
-  return separated
 }
 
 /** 署名できたかを返す。証明書が無い Mac でも差し替えそのものは続ける。 */
@@ -231,9 +204,6 @@ export async function installVerificationBuild(
 
   // 古い identity のプロセスが残っていると、置き換えても解決が旧 ID を返す。
   await quitRunningApp(commands, name, signal)
-  // identifier を分けてから署名する。署名後に Info.plist を書き換えると署名が
-  // 壊れるので、この順序でなければならない。
-  const bundleIdentifier = await separateBundleIdentity(commands, staged, signal)
   // 置く前に署名する。置いた後だと、許可の無い状態のアプリが一瞬でも
   // 「アプリケーション」に居ることになる。
   const stableIdentity = await signForStableIdentity(commands, staged, signal)
@@ -265,7 +235,6 @@ export async function installVerificationBuild(
     launched,
     previousHeld: existsSync(backup),
     restoreWith: 'app_swap_restore',
-    bundleIdentifier,
     stableIdentity,
     ...(stableIdentity ? {} : {
       permissionNote: 'This build is ad-hoc signed, so screen recording and similar permissions must be granted again for it. Say so when you report a permission prompt.',
