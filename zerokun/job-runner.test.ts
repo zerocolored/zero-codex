@@ -360,6 +360,11 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
     // 使う手段が設定ファイルの書き換えしかないと思い込んで止まる(2026-09-29 実測)。
     expect(prompt).toContain('applies only to variables inherited from the host')
     expect(prompt).toContain('reaches that command untouched')
+    // 別環境の資格情報を「人からもらうもの」と思い込んで止まっていた。取りに
+    // 行く経路と、書き残さない条件を対にして伝える(2026-09-29 実測)。
+    expect(prompt).toContain('obtain them')
+    expect(prompt).toContain('the same source the deployment itself reads')
+    expect(prompt).toContain('Never write such a value into a file')
     // CIはマージ結果を検査するので、ブランチ単体が通っても落ちる。ログを
     // 読めないときは手元で同じ条件を作って再現させる(2026-09-28 実測)。
     expect(prompt).toContain('CI verification:')
