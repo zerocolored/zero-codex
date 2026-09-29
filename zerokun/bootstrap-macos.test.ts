@@ -756,6 +756,12 @@ describe('macOS bootstrap', () => {
     // などの許可を取り直すことになる。会社の配布用証明書は使わない。
     expect(script).toContain('zerokun verification (local only)')
     expect(script).toContain('install_verification_signing_identity')
+    // 実機検証はディープリンクでアプリへ入る。既定の「外部アプリを開きますか」は
+    // ブラウザ自身のダイアログで、job からは押せない(2026-09-29 実測)。
+    expect(script).toContain('install_chrome_app_launch_policy')
+    expect(script).toContain('AutoLaunchProtocolsFromOrigins')
+    expect(script).toContain('bellsales')
+    expect(script).toContain('warn "Chrome のディープリンク許可を設定できません')
     // 空passwordのPKCS12はmacOSのimportがMAC検証で弾く。既定のmacalgでも弾かれる。
     expect(script).toContain('-macalg sha1')
     expect(script).toContain('openssl rand -hex 24')

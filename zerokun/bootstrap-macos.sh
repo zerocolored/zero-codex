@@ -1240,6 +1240,21 @@ SIGNING_CONFIG
   ok "検証用署名証明書"
 }
 
+# 実機検証は develop 画面の「アプリを起動」からディープリンクで入る。既定では
+# Chrome が「外部アプリを開きますか」を出すが、これはページではなくブラウザ自身の
+# ダイアログで、job からは押せない。許可元と scheme を固定して確認を省く。
+# Chrome は起動時にしか読まないため、反映には Chrome の再起動が要る。
+install_chrome_app_launch_policy() {
+  if /usr/bin/defaults read com.google.Chrome AutoLaunchProtocolsFromOrigins >/dev/null 2>&1; then
+    ok "Chrome ディープリンク許可"
+    return
+  fi
+  /usr/bin/defaults write com.google.Chrome AutoLaunchProtocolsFromOrigins -array \
+    '<dict><key>allowed_origins</key><array><string>https://develop.bellme.ai</string><string>https://www.bellme.ai</string><string>http://localhost:13109</string></array><key>protocol</key><string>bellsales</string></dict>' \
+    2>/dev/null || { warn "Chrome のディープリンク許可を設定できません。実機検証で確認画面が出ます"; return 0; }
+  ok "Chrome ディープリンク許可"
+}
+
 install_grok_build() {
   local installer logical="$HOME/.grok/bin/grok"
   if grok_build_executable >/dev/null; then
@@ -1289,6 +1304,7 @@ install_cli_tools() {
   # 1回で済ませる機能だけが落ちるので、失敗しても bootstrap は止めない。
   install_voicevox_engine
   install_verification_signing_identity
+  install_chrome_app_launch_policy
   herdr_compatible || install_herdr_standalone
   hash -r
   herdr_compatible \
