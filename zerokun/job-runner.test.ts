@@ -360,6 +360,9 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
     // 使う手段が設定ファイルの書き換えしかないと思い込んで止まる(2026-09-29 実測)。
     expect(prompt).toContain('applies only to variables inherited from the host')
     expect(prompt).toContain('reaches that command untouched')
+    // 1行目の出番表示はホストが付ける。本人が状態を言い直すと本文が埋もれる。
+    expect(prompt).toContain('Slack brevity:')
+    expect(prompt).toContain('three short lines or fewer')
     // 別環境の資格情報を「人からもらうもの」と思い込んで止まっていた。取りに
     // 行く経路と、書き残さない条件を対にして伝える(2026-09-29 実測)。
     expect(prompt).toContain('obtain them')

@@ -4365,6 +4365,16 @@ export function buildCodexWorkerPrompt(
       )
     }
   }
+  // 読む人は毎回「で、自分は何かするのか」を知りたいだけ。1行目の出番表示は
+  // ホストが付けるので、本人は状態を言い直さず、用件だけ短く書く。証跡を本文へ
+  // 流し込むと、必要な一言が埋もれて読まれない(2026-09-29 オーナー指摘)。
+  control.push(
+    'Slack brevity: the host prefixes your reply with one line stating whether the reader must act,',
+    'so never restate the status yourself. Keep the reply body to three short lines or fewer: what',
+    'changed, what remains, and — when you need something — the single `お願い:` line first. Put',
+    'execution records, command output, counts, and evidence in an attached file, not in the message.',
+    'Expand only when someone asks for more in the thread.',
+  )
   control.push(SLACK_PUBLIC_PROSE_GUIDANCE)
   control.push('--- end Zero host control ---')
   return [base, ...control].join('\n')
