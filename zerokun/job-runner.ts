@@ -249,6 +249,7 @@ const RATE_LIMIT_WAIT_NOTIFICATION_PREFIX = 'rate-limit-waiting:' as const
 // 読む人の関心ではなく、知りたいのは「自分が何かする必要があるのか」の一点。
 // 本人に書かせると書きぶりに左右されるので、ホストが状態から必ず組み立てる。
 export const READER_ACTION_BANNER = {
+  progress: '💬 経過 ／ 対応不要',
   done: '✅ 完了 ／ 対応不要',
   decide: '🙋 要判断 ／ あなたの決定が要ります',
   act: '⏸️ 待ち ／ あなたの作業が要ります',
@@ -17024,10 +17025,16 @@ export class SlackNotifier implements JobNotifier {
       ? safeText.slice('💬 '.length)
       : safeText
     if (!slackText) return
+    // 途中の投稿も「読む人の出番」で分ける。ただの経過と返事待ちが同じ見た目だと、
+    // 返事待ちが独り言に埋もれる。ホストは文面から用件を判定できないので、本人が
+    // 依頼を `お願い:` で書き出したときだけ要判断とする。経過で毎回通知すると
+    // うるさいので、宛先を付けるのは要判断のときだけ。
+    const needsDecision = slackText.startsWith('お願い:')
+    const banner = needsDecision ? READER_ACTION_BANNER.decide : READER_ACTION_BANNER.progress
     await this.trackLifecycleSideEffect(
       () => this.post(
         job,
-        slackText,
+        `${banner}\n\n${needsDecision ? addressedTo(job.userId) : ''}${slackText}`,
         notificationId,
         signal,
       ),

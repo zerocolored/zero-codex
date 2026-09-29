@@ -13371,7 +13371,10 @@ describe('Slack output guard', () => {
       postMessage: async value => { posted.push(value.text) },
     })
     await notifier.progress(job, raw, 'progress-self-question')
-    expect(posted).toEqual([sanitized])
+    // 本文の除去が主題。1行目の出番表示は別責務。
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('💬 経過 ／ 対応不要')
+    expect(posted[0]).toEndWith(sanitized)
     store.close()
   })
 
@@ -13444,7 +13447,34 @@ describe('Slack output guard', () => {
     await notifier.progress(job, '💬 原因を確認しています 🔎', 'commentary-prefix')
     await notifier.progress(job, '通常の進捗です 🧪', 'ordinary-progress')
 
-    expect(posted).toEqual(['原因を確認しています 🔎', '通常の進捗です 🧪'])
+    expect(posted).toHaveLength(2)
+    expect(posted[0]).toStartWith('💬 経過 ／ 対応不要')
+    expect(posted[0]).toEndWith('原因を確認しています 🔎')
+    expect(posted[1]).toEndWith('通常の進捗です 🧪')
+    // 経過では宛先を付けない。毎回通知するとうるさい。
+    for (const text of posted) expect(text).not.toContain(`<@${job.userId}>`)
+    store.close()
+  })
+
+  // 途中で返事が要る投稿が、ただの経過と同じ見た目だと埋もれる。本人が依頼を
+  // `お願い:` で書き出したときだけ要判断にし、そこで初めて宛先を付ける。
+  test('途中でも返事が要る投稿は要判断として依頼者を宛先にする', async () => {
+    const store = makeStore()
+    const job = store.enqueue(input({ messageId: 'progress-decision' })).job
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+
+    await notifier.progress(job, 'お願い: 表示方向を決めてください。', 'progress-decision')
+    await notifier.progress(job, '比較サンプルを用意しています。', 'progress-plain')
+
+    expect(posted).toHaveLength(2)
+    expect(posted[0]).toStartWith('🙋 要判断 ／ あなたの決定が要ります')
+    expect(posted[0]).toContain(`<@${job.userId}>`)
+    expect(posted[0]).toEndWith('お願い: 表示方向を決めてください。')
+    expect(posted[1]).toStartWith('💬 経過 ／ 対応不要')
+    expect(posted[1]).not.toContain(`<@${job.userId}>`)
     store.close()
   })
 

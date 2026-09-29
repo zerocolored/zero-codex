@@ -4375,6 +4375,14 @@ export function buildCodexWorkerPrompt(
     'execution records, command output, counts, and evidence in an attached file, not in the message.',
     'Expand only when someone asks for more in the thread.',
   )
+  // 途中で返事が要るのに、ただの経過と同じ見た目だと埋もれる。ホストは文面から
+  // 用件を判定できないので、依頼だけ決まった書き出しにさせ、そこを見て印を変える。
+  control.push(
+    'When a message you send before finishing needs an answer, a decision, or an approval from the',
+    'reader, start that message with the `お願い:` line. The host marks such a message as needing a',
+    'decision and addresses the reader directly; anything else is posted as progress the reader may',
+    'skip. Do not use that opening for a message that merely reports what you are doing.',
+  )
   control.push(SLACK_PUBLIC_PROSE_GUIDANCE)
   control.push('--- end Zero host control ---')
   return [base, ...control].join('\n')
