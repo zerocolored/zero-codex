@@ -4296,6 +4296,15 @@ export function buildCodexWorkerPrompt(
     'if it still fails name the step that failed — the decryptor was missing, the host did not',
     'resolve, or the service refused — never "not configured".',
   )
+  // 除外は「引き継いだ環境変数」にしか効かない。自分でコマンドの前に置いた
+  // 代入はそのまま届く。これを知らないと、別環境の資格情報を使う手段が
+  // 設定ファイルの書き換えしかないと思い込んで止まる(2026-09-29 実測)。
+  control.push(
+    'That filter applies only to variables inherited from the host. A variable you assign yourself',
+    'on a single command line reaches that command untouched, so you can point one run at different',
+    'credentials without editing any configuration file. Prefer that over modifying the operator\'s',
+    'stored configuration, which you must not change to switch environments.',
+  )
   if (!job.writeEnabled) {
     control.push(
       'Access mode: read-only.',
