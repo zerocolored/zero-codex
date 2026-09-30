@@ -175,8 +175,14 @@ bootstrapはApple Command Line Tools、Homebrew、Git、GitHub CLI、Bun、tmux�
 codex login
 grok login
 # Herdrの一時paneで claude を起動し、subscription loginを完了して終了する
-gh auth login --hostname github.com --git-protocol https --web
+gh auth login --hostname github.com --git-protocol https --web --scopes workflow
 ```
+
+GitHub Actionsのworkflowを変更してpushするには、通常の`repo`に加えて`workflow` scopeが必要です。
+既存ログインに不足している場合は、ホストの可視Terminalで
+`gh auth refresh --hostname github.com --scopes workflow`を実行し、本人が認証を完了します。
+Zeroちゃんはpushの明示的なworkflow権限拒否を区別して報告します。権限の自動拡大や、
+workflow変更の削除、同じ失敗の無条件再送は行いません。
 
 これは初回セットアップ用です。稼働後にGrok 1.0.5が既知の未認証応答だけを返した場合は、
 ZeroちゃんがmacOSの固定OAuth helperをphase内で1回だけ試します。復旧できない場合もGrok枠だけを

@@ -3933,6 +3933,9 @@ export function buildCodexDeveloperInstructions(
         'reviewers but never selects work phases, publishes changes, or imposes a response quorum.',
         'For linked worktree edits, pass reviewWorktrees (project-relative physical paths) in review round 1.',
         'Round 2 reuses those worktrees. taskOwnedFixPaths.repository is the project-relative worktree path.',
+        'A resumed task may have completed initial design in an earlier job. Missing attempt-local',
+        'design records do not block final review or require repeating initial design. Preserve prior',
+        'answers as context without rewriting markers or claiming current approval from old evidence.',
         'For the single combined initial-design consultation use advisor_round phase=investigation',
         'round=1. For post-implementation final review round 1 use phase=review round=1. Only when',
         'you adopt at least one round-1 mandatory finding and implement a non-empty task-owned fix',
@@ -4229,6 +4232,8 @@ export function buildCodexWorkerPrompt(
     control.push(
       'Advisor transport: zerokun_advisors is the only permitted route for external reviewers.',
       'Conversation resumption preserves prior work and context, but a new attempt can have no advisor ledger yet.',
+      'Missing attempt-local design records do not block final review or require repeating initial design.',
+      'Preserve earlier design context, assess changed requirements, and start the required current final review.',
       'If advisor_round or advisor_round_poll returns notStarted=true, use its current binding to start advisor_round',
       'with retryUnavailable=false. This is normal initialization, not corruption or a reason to block for an administrator.',
       'Never promote historical answers into current approvals merely by replacing their binding markers.',

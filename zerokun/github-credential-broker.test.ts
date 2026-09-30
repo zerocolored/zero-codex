@@ -371,6 +371,49 @@ describe('GitHub credential broker', () => {
     })
   })
 
+  for (const remoteOutcome of ['unchanged', 'unavailable', 'published'] as const) {
+    test(`push失敗の診断を保持してremote=${remoteOutcome}を照合する`, async () => {
+      const value = fixture()
+      let reads = 0
+      let pushes = 0
+      const commands: GitHubPublicationCommands = {
+        async runGit(_repo, args) {
+          if (args[0] === 'ls-remote') {
+            reads++
+            if (reads === 1) return result(0)
+            if (remoteOutcome === 'unavailable') return result(128, '', 'private read error')
+            return result(0, remoteOutcome === 'published'
+              ? `${value.commitSha}\trefs/heads/zerochan/direct-workflow\n` : '')
+          }
+          if (args[0] === 'push') {
+            pushes++
+            return result(1, 'private output', 'remote: refusing to allow an OAuth App to create or update workflow `private.yml` without `workflow` scope')
+          }
+          throw new Error('unexpected git command')
+        },
+        async runGh() { throw new Error('must not change authentication') },
+      }
+      await connectedBroker(value.context, commands, async client => {
+        const response = await callBrokerTool(client, { name: 'github_publish_branch', arguments: {
+          repository: 'example/broker-fixture', branch: 'zerochan/direct-workflow', commitSha: value.commitSha,
+        } })
+        const payload = responseJson(response)
+        if (remoteOutcome === 'published') {
+          expect(response.isError).not.toBe(true)
+          expect(payload).toMatchObject({ complete: true, commitSha: value.commitSha })
+        } else {
+          expect(response.isError).toBe(true)
+          expect(payload).toMatchObject({ complete: false, reasonCode: 'workflow_scope_required',
+            requiredScope: 'workflow', retryable: false,
+            publicationState: remoteOutcome === 'unavailable' ? 'unconfirmed' : 'not-confirmed' })
+          expect(JSON.stringify(payload)).not.toContain('private')
+        }
+        expect(pushes).toBe(1)
+        expect(reads).toBe(2)
+      })
+    })
+  }
+
   test('既存remote branchが古い場合もhost判断で止めずnon-force pushの結果を採用する', async () => {
     const value = fixture()
     const previous = value.commitSha
