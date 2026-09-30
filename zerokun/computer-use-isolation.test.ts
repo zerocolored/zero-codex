@@ -28,7 +28,7 @@ test('review stages keep plugin isolation disabled', () => {
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, realpathSync } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
-import { installedComputerUseClient, installedComputerUseNodeRepl } from './installed-computer-use.ts'
+import { installedComputerUseClient, installedComputerUseNodeRepl, installedComputerUseNodeServer } from './installed-computer-use.ts'
 
 test('native CUA resolver rejects project overlap and symlink transport replacements', () => {
   const root = mkdtempSync(join(tmpdir(), 'cua-runtime-'))
@@ -80,6 +80,24 @@ test('desktop Node connection requires operator provenance and honors disablemen
   expect(trustedComputerUseNodeTransport({...server,enabled:false}, [layer('user')])).toBe(false)
 })
 
+test('official Node worker has a readable runtime cwd without changing host metadata or explicit cwd', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cua-node-cwd-')))
+  const app = join(root, 'ChatGPT.app'); const project = join(root, 'project')
+  const command = join(app, 'Contents/Resources/cua_node/bin/node_repl')
+  mkdirSync(dirname(command), {recursive:true}); mkdirSync(project)
+  writeFileSync(command, 'fixture', {mode:0o700})
+  const server = {command, enabled:true, args:[], env:{NODE_REPL_TRUSTED_SERVICES:'fixture'}, tools:{js:{approval_mode:'prompt'}}}
+  try {
+    expect(installedComputerUseNodeServer(project, server, app)).toEqual({...server,cwd:dirname(command)})
+    expect(installedComputerUseNodeServer(project, {...server,cwd:null}, app)?.cwd).toBe(dirname(command))
+    expect(installedComputerUseNodeServer(project, {...server,cwd:project}, app)).toEqual({...server,cwd:project})
+    expect(server).not.toHaveProperty('cwd')
+    expect(installedComputerUseNodeServer(root, server, app)).toBeUndefined()
+    rmSync(command); symlinkSync('/usr/bin/true', command)
+    expect(installedComputerUseNodeServer(project, server, app)).toBeUndefined()
+  } finally {rmSync(root,{recursive:true,force:true})}
+})
+
 test('desktop Node connection preserves host metadata only for authorized primary work', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'cua-node-config-')))
   const server = {enabled:true,command:'/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',args:[],env:{NODE_REPL_TRUSTED_SERVICES:'fixture'},tools:{js:{approval_mode:'prompt'}}}
@@ -91,7 +109,7 @@ test('desktop Node connection preserves host metadata only for authorized primar
     return (Bun.TOML.parse(values.find(v=>v.startsWith('mcp_servers='))!) as any).mcp_servers.node_repl
   }
   try {
-    if (installedComputerUseNodeRepl(root, server.command)) expect(result()).toEqual(server)
+    if (installedComputerUseNodeRepl(root, server.command)) expect(result()).toEqual({...server,cwd:dirname(server.command)})
     expect(result(flags.map(v=>v==='features.computer_use=true'?'features.computer_use=false':v)).enabled).toBe(false)
     expect(result(flags,[...layers,{name:{type:'project'},config}]).enabled).toBe(false)
     expect(result(flags,[]).enabled).toBe(false)

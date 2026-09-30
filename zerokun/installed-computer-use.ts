@@ -1,5 +1,5 @@
 import { lstatSync, realpathSync } from 'fs'
-import { join, relative, isAbsolute, sep } from 'path'
+import { dirname, join, relative, isAbsolute, sep } from 'path'
 
 /** Only the installed official Node runtime may inherit the desktop connection. */
 export function installedComputerUseNodeRepl(
@@ -26,6 +26,20 @@ export function installedComputerUseNodeRepl(
     }
     return true
   } catch { return false }
+}
+
+/** The trusted worker calls process.cwd() before executing any user code. */
+export function installedComputerUseNodeServer(
+  projectRoot: string,
+  server: Record<string, unknown>,
+  applicationRoot = '/Applications/ChatGPT.app',
+): Record<string, unknown> | undefined {
+  if (!installedComputerUseNodeRepl(projectRoot, server.command, applicationRoot)) return
+  // A managed multi-repository workspace denies its container directory while
+  // allowing selected children. Inheriting that container as cwd crashes Node
+  // with EPERM/uv_cwd. The verified app directory is already readable by CUA;
+  // use it without opening the container or changing an operator-specified cwd.
+  return { ...server, cwd: server.cwd ?? dirname(server.command as string) }
 }
 
 /** Resolve the operator-installed native CUA client, never a project transport. */
