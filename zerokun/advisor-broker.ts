@@ -2611,7 +2611,7 @@ async function main(): Promise<void> {
     notStarted: true,
     phase, round, inputRevision: input.revision, inputDigest: input.digest,
     reason: 'No advisor round has started in this attempt; this is not a ledger inconsistency.',
-    nextAction: 'Continue the retained conversation and work. Start advisor_round with this current binding and retryUnavailable=false, completing required preceding phases first (investigation before review-1, review-1 and its mandatory fix delta before review-2). Do not block or request administrative repair for an unstarted round. Historical answers remain context, not new approvals.',
+    nextAction: 'Continue the retained conversation and work. Start advisor_round with this current binding and retryUnavailable=false. Review-1 does not require an attempt-local initial-design round; do not repeat completed initial design to fill this ledger. Review-2 still requires this attempt\'s completed review-1 and its mandatory fix delta. Do not block or request administrative repair for an unstarted round. Historical answers remain context, not new approvals.',
   })
   const reviewDeltaBaselinePath = (
     input: Pick<AdvisorInputSnapshot, 'revision' | 'digest'>,
@@ -2643,7 +2643,14 @@ async function main(): Promise<void> {
     }
   }
   const repositoryReviewWarning = (journal: Record<string, unknown>) => {
-    if (journal.phase !== 'review' || journal.round !== 2) return {}
+    if (journal.phase !== 'review') return {}
+    if (journal.round === 1) {
+      return journal.initialDesignStatus === 'not-recorded-this-attempt'
+        ? { initialDesignStatus: journal.initialDesignStatus,
+          initialDesignWarning: 'Initial-design completion is not recorded in this attempt. This is not evidence that earlier work lacked design review. Preserve prior task context without relabeling old answers; the current slotSummary describes final review only.' }
+        : {}
+    }
+    if (journal.round !== 2) return {}
     const stable = journal.repositoryDeltaCurrentDigestAfter
       === (journal.roundTwoBasis as Record<string, unknown>)?.repositoryCurrentDigest
     return {
@@ -3097,6 +3104,17 @@ async function main(): Promise<void> {
           : 'Saved advisor responses are not available for this retry. Report the missing advisor and dependency; preserve the work. Do not repeat this retry unchanged.',
       }, true)
     }
+    // Observe only: a resumed conversation does not import another attempt's
+    // journal. Missing or malformed design bookkeeping must not block review.
+    let initialDesignStatus: 'not-recorded-this-attempt' | undefined
+    if (phaseScope === 'complete' && phase === 'review' && round === 1) {
+      try {
+        const design = unifiedRoundLedger('investigation', 1)
+        if (design.invalid || design.entries.length !== 1 || !design.entries[0]?.terminal) {
+          initialDesignStatus = 'not-recorded-this-attempt'
+        }
+      } catch { initialDesignStatus = 'not-recorded-this-attempt' }
+    }
     let priorUnifiedEntry: UnifiedPhaseLedgerEntry | undefined
     if (phaseScope === 'complete') {
       const ledger = unifiedRoundLedger(phase, round as 1 | 2)
@@ -3209,31 +3227,10 @@ async function main(): Promise<void> {
           reason: `the prior ${phase} phase did not reach a reusable terminal outcome; reviewers will not be restarted`,
         }, true)
       }
-      if (phase === 'review' && round === 1) {
-        const investigation = unifiedRoundLedger('investigation', 1)
-        if (investigation.invalid || investigation.entries.length !== 1) {
-          return toolText({
-            complete: false,
-            reason: 'the attempt-wide initial-design advisor phase has not completed',
-          }, true)
-        }
-        if (investigation.entries[0]!.status === 'requested') {
-          return toolText({
-            complete: false,
-            pending: true,
-            reason: 'the attempt-wide initial-design advisor phase is still active',
-          })
-        }
-        if (!investigation.entries[0]!.terminal
-          || (investigation.entries[0]!.terminal!.recoveredAfterInterruption === true
-            && resultPayload(recoveredRoundResult(investigation.entries[0]!.input, 'investigation', 1, true) ?? toolText({}))?.attemptsFinished !== true)) {
-          return toolText({
-            complete: false,
-            uncertain: true,
-            reason: 'the attempt-wide initial-design advisor phase did not reach a reusable terminal outcome',
-          }, true)
-        }
-      }
+      // Initial design can belong to a previous Slack job/attempt. Its local
+      // ledger is evidence, not authority to suppress an independent final
+      // review. Never synthesize or rebind historical answers here. The review
+      // ledger, active-round claim and round-2 delta checks still apply.
       if (phase === 'review' && round === 2) {
         if (!context.writeEnabled) {
           return toolText({
@@ -3669,6 +3666,7 @@ async function main(): Promise<void> {
     const continuationRequestDigest = createHash('sha256').update(continuationRequestRaw).digest('hex')
     const requestedJournal = {
       continuationRequestDigest,
+      ...(initialDesignStatus ? { initialDesignStatus } : {}),
       retryCount: retryResult?.retryCount ?? 0,
       interruptionRecovery: retryResult?.interruptionRecovery === true,
       version: THREE_ADVISOR_JOURNAL_VERSION,
@@ -3916,6 +3914,7 @@ async function main(): Promise<void> {
     atomicWritePrivateFile(`${journalPath}.responses`, responseCache)
     atomicWritePrivateFile(journalPath, `${JSON.stringify({
       continuationRequestDigest,
+      ...(initialDesignStatus ? { initialDesignStatus } : {}),
       retryCount: retryResult?.retryCount ?? 0,
       interruptionRecovery: retryResult?.interruptionRecovery === true,
       version: THREE_ADVISOR_JOURNAL_VERSION,
@@ -3969,10 +3968,9 @@ async function main(): Promise<void> {
       round,
       durationMs: finishedAt - startedAt,
       ...(repositoryUnchanged === undefined ? {} : { repositoryUnchanged }),
-      ...(phase === 'review' && round === 2
-        ? repositoryReviewWarning({ phase, round, roundTwoBasis: roundTwoJournalBinding,
-          repositoryDeltaCurrentDigestAfter: roundTwoRepositoryCurrentDigestAfter })
-        : {}),
+      ...repositoryReviewWarning({ phase, round, initialDesignStatus,
+        roundTwoBasis: roundTwoJournalBinding,
+        repositoryDeltaCurrentDigestAfter: roundTwoRepositoryCurrentDigestAfter }),
       allAdopted: allAdvisorAttemptsAdopted(nativeEvidence, grok, claude),
       ...(!allAdvisorAttemptsAdopted(nativeEvidence, grok, claude) ? {
         advisorUnavailable: unavailableAdvisorReasons(

@@ -2307,20 +2307,37 @@ print('review complete')
     }
   }, 20_000)
 
-  test('単一workflowは初期phase前のreviewを外部起動前に拒否する', async () => {
-    const fixture = await brokerFixture({ writeEnabled: true })
-    try {
-      const review = await fixture.call('review', 'revision-two')
-      expect(review.result.isError).toBe(true)
-      expect(review.payload).toMatchObject({
-        complete: false,
-        reason: 'the attempt-wide initial-design advisor phase has not completed',
-      })
-      expect(readdirSync(fixture.journalRoot)).toEqual([])
-    } finally {
-      await fixture.close()
-    }
-  }, 15_000)
+  for (const designState of ['absent', 'malformed'] as const) {
+    test(`継続jobは初期設計ledgerが${designState}でも最終3者を一度だけ起動する`, async () => {
+      const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
+      try {
+        const revisionRoot = join(fixture.journalRoot,
+          `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`)
+        if (designState === 'malformed') {
+          mkdirSync(revisionRoot, { recursive: true, mode: 0o700 })
+          writeFileSync(join(revisionRoot, 'investigation-1.json'), '{broken', { mode: 0o600 })
+        }
+        const review = await fixture.call('review', 'revision-two')
+        expect(review.result.isError).not.toBe(true)
+        expect(review.payload).toMatchObject({
+          complete: true,
+          initialDesignStatus: 'not-recorded-this-attempt',
+          slotSummary: { total: 3, started: 3, responsesObtained: 3 },
+        })
+        expect(review.payload.initialDesignWarning).toContain('final review only')
+        const journalPath = join(revisionRoot, 'review-1.json')
+        const before = readFileSync(journalPath, 'utf8')
+        const repeated = await fixture.call('review', 'revision-two')
+        expect(repeated.payload).toMatchObject({
+          initialDesignStatus: 'not-recorded-this-attempt',
+          slotSummary: { total: 3, started: 3, responsesObtained: 3 },
+        })
+        expect(readFileSync(journalPath, 'utf8')).toBe(before)
+        if (designState === 'absent') expect(existsSync(join(revisionRoot, 'investigation-1.json'))).toBe(false)
+        else expect(readFileSync(join(revisionRoot, 'investigation-1.json'), 'utf8')).toBe('{broken')
+      } finally { await fixture.close() }
+    }, 20_000)
+  }
 
   test('単一workflowはrevisionが進んでも同じphaseを再起動しない', async () => {
     const fixture = await brokerFixture({ writeEnabled: true })
@@ -2435,7 +2452,9 @@ print('review complete')
       expect(retry.payload).toMatchObject({ complete: false, notStarted: true })
       const review = await fixture.poll('review', 'revision-two')
       expect(review.payload).toMatchObject({ complete: false, notStarted: true })
-      expect(String(review.payload.nextAction)).toContain('investigation before review-1')
+      expect(String(review.payload.nextAction)).toContain('Review-1 does not require an attempt-local initial-design round')
+      expect(String(review.payload.nextAction)).not.toContain('investigation before review-1')
+      expect(String(review.payload.nextAction)).toContain('mandatory fix delta')
       expect((await fixture.call('investigation', 'revision-two')).payload).toMatchObject({ complete: true })
       expect((await fixture.poll('investigation', 'revision-two')).payload).toMatchObject({ complete: true })
     } finally { await fixture.close() }
