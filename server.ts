@@ -2865,9 +2865,9 @@ try {
             legacyCutover: legacyCutoverForState(stateDir) === '1',
           })
         },
-        enqueue: sha => requestUpdate({
+        enqueue: (sha, attemptId) => requestUpdate({
           source: 'automatic', chatId: destination, threadTs: '', userId: '',
-          messageId: `auto:${sha}`,
+          messageId: `auto:${sha}:${attemptId}`,
         }, {
           stateDir: STATE_DIR, workerFile: UPDATE_REQUEST_FILE,
           updaterPath: UPDATE_ENTRYPOINT, projectDir: process.cwd(),

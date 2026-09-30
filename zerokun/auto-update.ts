@@ -1,4 +1,5 @@
 import { join } from 'path'
+import { randomUUID } from 'crypto'
 import { homedir } from 'os'
 import { prepareManagedStateRoot } from './managed-path.ts'
 import { atomicWritePrivateFile, readOptionalPrivateFile } from './safe-file.ts'
@@ -31,7 +32,7 @@ export async function checkAutomaticUpdate(options: {
   stateDir: string
   now?: () => number
   detect: () => Promise<string | undefined>
-  enqueue: (sha: string) => Promise<{ request: { id: string }; accepted: boolean }>
+  enqueue: (sha: string, attemptId: string) => Promise<{ request: { id: string }; accepted: boolean }>
   recoverPending?: (stateDir: string) => void
 }): Promise<string> {
   prepareManagedStateRoot(options.root)
@@ -48,11 +49,6 @@ export async function checkAutomaticUpdate(options: {
     const now = (options.now ?? Date.now)()
     if (saved.pendingState && saved.pendingId) {
       const request = readJson(join(saved.pendingState, 'update-request.json'))
-      if (request.id === saved.pendingId && request.outcome?.success === false && saved.targetSha) {
-        saved.failedSha = saved.targetSha
-        // Persist before cooldown: a later manual request can replace this outcome.
-        atomicWritePrivateFile(path, JSON.stringify(saved) + '\n')
-      }
       if (request.id === saved.pendingId && !request.outcome?.notifiedAt
         && !(request.source === 'automatic' && request.outcome?.notificationSkippedAt)) {
         // The originating gateway may be stopped. Let another running app
@@ -69,7 +65,7 @@ export async function checkAutomaticUpdate(options: {
     if (saved.checkedAt !== undefined && now >= saved.checkedAt
       && now - saved.checkedAt < AUTO_UPDATE_INTERVAL_MS) return 'not-due'
     // Persist before network/spawn: transient failures do not become restart loops.
-    atomicWritePrivateFile(path, JSON.stringify({ checkedAt: now, failedSha: saved.failedSha }) + '\n')
+    atomicWritePrivateFile(path, JSON.stringify({ checkedAt: now }) + '\n')
     // Fetch writes refs too. Serialize it with manual updates/registration,
     // releasing this lease before launching the updater that acquires it itself.
     const mutationPath = join(scope, options.independent ? 'release-check.lock' : 'shared-update.lock')
@@ -79,15 +75,16 @@ export async function checkAutomaticUpdate(options: {
     try { sha = (options.independent ? readReleaseTransaction(options.stateDir)?.candidate.sha : undefined) ?? await options.detect() }
     finally { releaseProcessLock(mutationPath, mutation.lease) }
     if (!sha) return 'current'
-    if (sha === saved.failedSha) return 'failed-version'
     // The preference may have changed during the bounded network request.
     if (!automaticUpdatesEnabled(options.root)) return 'disabled'
     const beforeEnqueue = inspectProcessLock(options.independent ? join(scope, 'update.lock', 'pid') : join(options.root, 'shared-update.lock'))
     if (beforeEnqueue.status === 'active' || beforeEnqueue.status === 'unknown') return 'busy'
-    const result = await options.enqueue(sha)
+    // A completed failed request keeps its delivery identity forever. A retry
+    // is a new attempt, after the same durable cooldown, even for the same SHA.
+    const result = await options.enqueue(sha, randomUUID())
     atomicWritePrivateFile(path, JSON.stringify({
       checkedAt: now, pendingState: options.stateDir, pendingId: result.request.id,
-      ...(result.accepted ? { targetSha: sha } : {}), failedSha: saved.failedSha,
+      ...(result.accepted ? { targetSha: sha } : {}),
     }) + '\n')
     return result.accepted ? 'scheduled' : 'pending'
   } finally {

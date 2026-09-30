@@ -2504,7 +2504,8 @@ export async function reconcileHerdrJobMonitors(input: {
           closed += 1
           continue
         }
-        if (obligation?.state !== 'preparing') {
+        if (obligation?.state !== 'preparing'
+          && status !== 'running' && status !== 'queued') {
           throw new HerdrJobMonitorPendingError(
             `required monitor binding disappeared before its final output was observed for ${name}`,
           )
@@ -2516,7 +2517,17 @@ export async function reconcileHerdrJobMonitors(input: {
             `staged execution remains blocked after losing its Herdr monitor: ${name}`,
           )
         }
-        removeClosedMonitorDirectory(stateDir, directory)
+        if (disposition === 'terminalized') {
+          // The work cannot be safely replayed, but a dead display must not
+          // block every later job/update. Preserve all feeds and receipts.
+          if (!archiveStoppedHerdrMonitor({
+            stateDir, jobId: name, status: input.getJob(name)?.status ?? 'failed',
+            processStatus: process => control.processGenerationStatus(process),
+          })) throw new HerdrJobMonitorPendingError(`could not archive lost monitor for ${name}`)
+          await input.onMonitorRetired?.(name)
+        } else {
+          removeClosedMonitorDirectory(stateDir, directory)
+        }
         closed += 1
         continue
       }
