@@ -1,3 +1,4 @@
+import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCliConfig } from './deployment-cli-runtime.ts'
 import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
 import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
 import { waitForAdvisorSettlement } from './advisor-settlement.ts'
@@ -1969,6 +1970,9 @@ function parseNativeAdvisorJournalEntries(
       attempted: true,
       adopted: reviewer.adopted as boolean,
       ...(reviewer.agentId === undefined ? {} : { agentId: reviewer.agentId as string }),
+      ...(reviewer.inputRevision === undefined ? {} : {
+        inputRevision: reviewer.inputRevision as number, inputDigest: reviewer.inputDigest as string,
+      }),
       ...(reviewer.responseDigest === undefined
         ? {} : { responseDigest: reviewer.responseDigest as string }),
       ...(reviewer.responseTransportDigest === undefined
@@ -3949,6 +3953,8 @@ export function buildCodexDeveloperInstructions(
         'BEFORE spawning, call advisor_native_prepare with phase, round, current inputRevision/inputDigest and your independent review request.',
         'Use its EXACT taskName, prompt, model and reasoningEffort for the spawn. This durable registration lets the host recover the same child.',
         'Repeated prepare returns the ORIGINAL slot; never use it to spawn a duplicate. Host-recovered answers retain their original binding.',
+        'Submit the exact original answer even when the outer round uses newer input; the host retains its registered inputRevision/inputDigest.',
+        'scopeAssessmentRequired means assess that historical answer against changed requirements; it does not mean a new advisor reviewed them.',
         'Do not substitute another model or add a second',
         'native advisor. Wait for the started attempt, then pass its exact marked response and real',
         'agent ID to advisor_round. If the native slot did',
@@ -4014,6 +4020,9 @@ export function buildCodexDeveloperInstructions(
       'Use that transport when shell Git cannot access SSH host keys or HTTPS credentials.',
       'Use the installed gcloud CLI for authorized Google Cloud work, including builds and deployment.',
       'The primary shell preserves the host Cloud SDK configuration through CLOUDSDK_CONFIG.',
+      'For authorized Railway/Cloudflare work, installed railway/wrangler CLIs also reuse existing host login through narrow config links under isolated HOME.',
+      'Use their whoami commands to check authentication; do not read or print the config files or copy tokens. Normal CLI refresh is allowed.',
+      'A Computer Use app approval error does not prove CLI authentication is unavailable. Check the native CLI before declaring browser approval a blocker.',
       'Use explicit project/region/resource arguments and existing authentication; decide operations',
       'from the current request and repository instructions. Do not extract or export the host CLI',
       'login credentials, change accounts, run login, or create replacement principals or credential',
@@ -5432,6 +5441,7 @@ export function buildCodexPermissionOverrides(
     nativeCloudAccessEnabled?: boolean
     /** Fixture injection; production resolves the installed host SDK. */
     googleCloudRuntime?: GoogleCloudRuntime | null
+    deploymentCliConfigs?: DeploymentCliConfig[]
     /** Local Docker daemon access belongs only to the normal write-authorized primary. */
     nativeDockerAccessEnabled?: boolean
     /** Fixture injection; production resolves the host's selected local engine. */
@@ -5585,6 +5595,11 @@ export function buildCodexPermissionOverrides(
   const cloudPathAllowed = (path: string): boolean => !cloudProtected.some(root => (
     pathContains(root, path) || pathContains(path, root)
   ))
+  const deploymentConfigs = options.nativeCloudAccessEnabled && primaryWorkspaceAccess
+    ? (options.deploymentCliConfigs ?? resolveDeploymentCliConfigs()).filter(config => cloudPathAllowed(config.directory)) : []
+  for (const config of deploymentConfigs) {
+    if (linkDeploymentCliConfig(state, scratchDir, config)) rules.set(config.directory, 'write')
+  }
   const selectedDocker = options.nativeDockerAccessEnabled && primaryWorkspaceAccess
     ? (options.dockerRuntime === undefined ? resolveDockerRuntime() : options.dockerRuntime)
     : null
@@ -11116,6 +11131,9 @@ export async function executeCodexJob(
                 repoPath: job.repoPath,
                 parentChildBaseline: completeParentChildBaseline ?? execution.parentChildBaseline,
                 rounds: completeAdvisorRounds ?? [],
+                registrations: readNativeAdvisorRegistrations(join(managedStateDir, 'advisor-context',
+                  job.id.replace(/[^A-Za-z0-9._-]/g, '_'), `${execution.advisorAttemptNonce}.json`),
+                execution.advisorAttemptNonce, () => {}),
                 read: (method, params) => bestEffortAdvisorVerification(`coverage-${method}`, () => (
                   readCodexAppServer(codexBin, job.repoPath, overrides, method,
                     buildCodexChildEnvironment(), {

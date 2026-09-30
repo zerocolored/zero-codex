@@ -130,6 +130,7 @@ type BrokerFixture = {
       retryUnavailable?: boolean
       inputUpdateIsRecoveryOnly?: boolean
       nativeAgentId?: string
+      nativeResponse?: string
       reviewWorktrees?: string[]
       roundTwoBasis?: {
         roundOneSources: Array<'native' | 'grok' | 'claude'>
@@ -698,6 +699,7 @@ mock.module('fs', () => ({ ...fs, realpathSync: (path, ...args) =>
       retryUnavailable?: boolean
         inputUpdateIsRecoveryOnly?: boolean
         nativeAgentId?: string
+      nativeResponse?: string
       reviewWorktrees?: string[]
         roundTwoBasis?: {
           roundOneSources: Array<'native' | 'grok' | 'claude'>
@@ -736,7 +738,7 @@ mock.module('fs', () => ({ ...fs, realpathSync: (path, ...args) =>
                 {
                   perspective: expectedPerspective,
                   agentId: overrides.nativeAgentId ?? `/root/native-${expectedPerspective}`,
-                  response: responseFor(expectedPerspective),
+                  response: overrides.nativeResponse ?? responseFor(expectedPerspective),
                 },
               ]
               : [
@@ -4141,5 +4143,42 @@ test('native request登録はMCP再起動を跨いで同じ依頼・identityを�
     await fixture.restart()
     const restored = await fixture.prepareNative()
     expect(restored).toEqual(first)
+  } finally { await fixture.close() }
+}, 30_000)
+
+
+test('追加指示後も登録済みGPT回答の元のbindingを保存し再起動後も取得済みと扱う', async () => {
+  const fixture = await brokerFixture({ externalSuccess: true })
+  try {
+    const registered = await fixture.prepareNative()
+    const newer = fixture.stageRevision('追加の受入条件。元のレビュー回答も保持する。')
+    const preparedAgain = await fixture.prepareNative(newer)
+    expect(preparedAgain.marker).toBe(registered.marker)
+    const answer = `Original independent findings.\n${registered.marker}`
+    const { result, payload } = await fixture.call('investigation', newer, 'adopted', 1, {
+      nativeAgentId: String(registered.agentPath), nativeResponse: answer,
+    })
+    expect(result.isError).not.toBe(true)
+    expect(payload).toMatchObject({ allAdopted: true, scopeAssessmentRequired: true,
+      inputRevision: newer.revision, slotSummary: { responsesObtained: 3 },
+      native: [{ adopted: true, inputRevision: fixture.revisionTwo.revision,
+        inputDigest: fixture.revisionTwo.digest, responseDigest: nativeAdvisorResponseDigest(answer) }] })
+    await fixture.restart()
+    const restored = await fixture.call('investigation', newer, 'adopted', 1, {
+      nativeAgentId: String(registered.agentPath), nativeResponse: answer,
+    })
+    expect(restored.payload).toMatchObject({ allAdopted: true, scopeAssessmentRequired: true,
+      native: [{ inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest }] })
+  } finally { await fixture.close() }
+}, 30_000)
+
+test('登録済みGPT回答を新しい入力markerへ書き換えて渡した場合は採択しない', async () => {
+  const fixture = await brokerFixture()
+  try {
+    await fixture.prepareNative()
+    const newer = fixture.stageRevision('別の要件を追加')
+    const result = await fixture.call('investigation', newer)
+    expect(result.result.isError).toBe(true)
+    expect(result.payload.reason).toContain('round marker')
   } finally { await fixture.close() }
 }, 30_000)
