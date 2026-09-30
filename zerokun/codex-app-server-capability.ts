@@ -157,7 +157,7 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
     required: [
       /threadId:\s*string/,
       /turnId\?:\s*string \| null/,
-      /cursor\?:\s*string \| null/,
+      /cursor\?:\s*(?:string|ThreadItemsListCursor) \| null/,
       /limit\?:\s*number \| null/,
       /sortDirection\?:\s*SortDirection \| null/,
     ],
@@ -270,6 +270,17 @@ function readGeneratedType(root: string, relativePath: string): string {
 export function assertCodexAppServerGeneratedCapabilities(outputDir: string): void {
   for (const contract of CAPABILITY_CONTRACTS) {
     const source = readGeneratedType(outputDir, contract.relativePath)
+    // Newer Codex schemas name the request cursor union and add item anchors.
+    // Our caller still paginates with strings; validate that capability rather
+    // than rejecting a compatible alias or accepting an anchor-only cursor.
+    if (contract.relativePath === 'v2/ThreadItemsListParams.ts'
+      && /cursor\?:\s*ThreadItemsListCursor \| null/.test(source)) {
+      const cursor = readGeneratedType(outputDir, 'v2/ThreadItemsListCursor.ts')
+        .replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+      if (!/\bexport\s+type\s+ThreadItemsListCursor\s*=\s*(?:[A-Za-z_$][\w$]*\s*\|\s*)*string(?:\s*\|\s*[A-Za-z_$][\w$]*)*\s*;/.test(cursor)) {
+        throw new Error('installed Codex App Server is missing Zeroちゃん capability v2/ThreadItemsListCursor.ts:string cursor')
+      }
+    }
     for (const requirement of contract.required) {
       if (!requirement.test(source)) {
         throw new Error(

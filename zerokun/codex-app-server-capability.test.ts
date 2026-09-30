@@ -244,6 +244,27 @@ describe('Codex App Server capability gate', () => {
       .toThrow('SubAgentActivityKind')
   })
 
+  test('item cursorはinline文字列と文字列を含む現行aliasを受理する', () => {
+    const root = fixture()
+    expect(() => assertCodexAppServerGeneratedCapabilities(root)).not.toThrow()
+    const path = join(root, 'v2/ThreadItemsListParams.ts')
+    writeFileSync(path, readFileSync(path, 'utf8').replace('cursor?: string | null', 'cursor?: ThreadItemsListCursor | null'))
+    const alias = join(root, 'v2/ThreadItemsListCursor.ts')
+    expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow()
+    for (const type of ['string | ThreadItemsListAnchor', 'ThreadItemsListAnchor | string']) {
+      writeFileSync(alias, `export type ThreadItemsListCursor = ${type};`)
+      expect(() => assertCodexAppServerGeneratedCapabilities(root)).not.toThrow()
+    }
+    for (const type of ['ThreadItemsListAnchor', 'number', '{ id: string }', '/* string | */ ThreadItemsListAnchor', '"string"']) {
+      writeFileSync(alias, `// export type ThreadItemsListCursor = string;\nexport type ThreadItemsListCursor = ${type};`)
+      expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('string cursor')
+    }
+    writeFileSync(alias, 'export type ThreadItemsListCursor = string | ThreadItemsListAnchor;')
+    const response = join(root, 'v2/ThreadItemsListResponse.ts')
+    writeFileSync(response, readFileSync(response, 'utf8').replace('nextCursor: string | null', 'nextCursor: number | null'))
+    expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('ThreadItemsListResponse')
+  })
+
   test('遅延subagent照合に必要なinterrupted kindを欠くreleaseをfail-closeする', () => {
     const root = fixture()
     writeFileSync(
