@@ -4,7 +4,7 @@ import { waitForAdvisorSettlement } from './advisor-settlement.ts'
 import { ensureJobTempDirectory, existingJobTempDirectory, jobTempRoot } from './job-temp.ts'
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
-import { installedComputerUseClient, installedComputerUseNodeRepl } from './installed-computer-use.ts'
+import { installedComputerUseClient, installedComputerUseNodeServer } from './installed-computer-use.ts'
 import { GO_CHROME_ENABLED_TOOLS, GO_CHROME_DISABLED_TOOLS } from './chrome-tools.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { DiagnosticTail } from './diagnostic-tail.ts'
@@ -619,12 +619,14 @@ export function mcpIsolationOverridesForConfig(
     }
     if (name === 'node_repl' && projectRoot && overrides.includes('features.computer_use=true')
       && trustedComputerUsePluginEnabled(config, layers)
-      && trustedComputerUseNodeTransport(server, layers)
-      && installedComputerUseNodeRepl(projectRoot, server.command)) {
+      && trustedComputerUseNodeTransport(server, layers)) {
       // Current official Computer Use uses node_repl + @oai/sky. Preserve the
       // operator's runtime metadata and approval settings, not just its command.
-      additions.push(`${tomlString(name)}=${mcpConfigToml(server)}`)
-      continue
+      const installedServer = installedComputerUseNodeServer(projectRoot, server)
+      if (installedServer) {
+        additions.push(`${tomlString(name)}=${mcpConfigToml(installedServer)}`)
+        continue
+      }
     }
     if (browserTransportEnabled && name === 'go-chrome-mcp' && server.enabled === true) {
       // Preserve the installed browser transport when it is a simple,
