@@ -383,6 +383,89 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
   } finally { store.close() }
 })
 
+test('Computer Useで画面が取れないときは人へ頼む前にホストの表示状態を自分で読ませる', () => {
+  // 2026-09-25・09-30 に、蓋の閉じたホストで cgWindowNotFound を受けた計4ジョブが、表示状態を
+  // 確かめずに「検証用Macで bellMe のウィジェットを前面表示してください」と頼んで止まった。
+  // 前面化は実測で何も変えず、効く依頼は蓋を開ける(外部ディスプレイを繋ぐ)こと。蓋が開いていて画面だけ
+  // 消えているなら、画面を点けてもらう。
+  const store = makeStore()
+  try {
+    store.enqueue(input({ writeEnabled: true }))
+    const job = store.claimNext('display-state-worker')!
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+    const host = { attemptNonce: 'a'.repeat(32), artifactDir: '/tmp/display-outbox', advisorEnabled: false }
+    // 本番の complete stage は browserEnabled と computerUseEnabled を同じ値で渡す。
+    const prompt = buildCodexWorkerPrompt(job, snapshot, {
+      ...host, browserEnabled: true, computerUseEnabled: true,
+    })
+    // 引き金と順序: Computer Use で画面が取れなかったら、人へ頼む前に蓋と画面の状態を自分で読む。
+    expect(prompt).toContain('Host display state: when Computer Use returns cgWindowNotFound (error -10005), a Computer Use request')
+    expect(prompt).toContain("times out, or any Computer Use screen capture (get_app_state or a screenshot) fails or comes back entirely black, read this Mac's display")
+    expect(prompt).toContain('state yourself before you ask anyone for anything.')
+    expect(prompt).toContain('`ioreg -r -k AppleClamshellState -d 4 | grep AppleClamshellState`')
+    expect(prompt).toContain('"AppleClamshellState" = Yes means the lid is closed')
+    expect(prompt).toContain('`pmset -g log | grep -E "Display is turned (on|off)|Clamshell" | tail -n 5`')
+    // 何も出力されなければ状態は不明。蓋が開いている・画面が点いている、とは読まない。
+    expect(prompt).toContain('A command that prints nothing leaves its state unknown; never read that as an open lid or a display that is on.')
+    // 外部ディスプレイで使う Mac は蓋が閉じていても画面が点いたまま。蓋が原因と言えるのは、直近の点灯の
+    // 後に 'Clamshell Sleep' が来たときだけ。蓋が閉じていた間は点灯から 'Clamshell Sleep' までが
+    // 111回中110回で12秒以内だったので、点いた直後なら30秒後に読み直させる。
+    expect(prompt).toContain('With the lid closed, the lid is the cause when a "Clamshell Sleep" line comes after the latest')
+    expect(prompt).toContain('"Display is turned on" line. If the lid is closed and the display turned on last, read the log again 30 seconds later;')
+    expect(prompt).toContain('a new "Clamshell Sleep" line means the display wakes only for seconds, so a capture that worked once')
+    // 蓋が閉じたままでも 'Wake Back to Sleep' で 'Clamshell Sleep' なしに消えることがある(09-30 11:40 実測)。
+    // 蓋を原因から外すのは、読み直しても点いたままのときだけにする。
+    expect(prompt).toContain('is not a recovery. If instead the latest line still shows the display turned on and no "Clamshell Sleep"')
+    expect(prompt).toContain('line has appeared, something such as an external display is keeping this Mac awake with the lid closed')
+    expect(prompt).toContain('and the lid is not the cause; the same holds once someone replies that an external display is connected and on.')
+    expect(prompt).not.toContain('If none appears')
+    // 依頼は既存の「お願い: <誰> が <何> してください」の形で、誰がどの Mac の蓋を開けるかまで書く。
+    expect(prompt).toContain('If the lid is the cause, or "AppleClamshellState" = Yes and either the latest line shows the display turned off')
+    // 蓋が閉じていると確定して pmset が何も出さないときも、蓋を開ける依頼は実行できるのでそれを頼む。
+    expect(prompt).toContain('or the pmset command prints nothing,')
+    // 蓋が開いている(または蓋の無い)Mac で画面だけ消えているときに蓋を頼むと、叶わない依頼がまた繰り返される。
+    expect(prompt).toContain('Otherwise, when ioreg shows "AppleClamshellState" = No and the latest line shows the display')
+    expect(prompt).toContain('turned off, never ask anyone to open the lid; your single request is')
+    expect(prompt).toContain('`お願い: <誰> が <このMacの名前> の画面を点けてください（キーかトラックパッドに触れる。外部ディスプレイならその電源を入れる）`')
+    // ioreg が何も出さないときは蓋の状態が不明(蓋の無い Mac もここに来る)。閉じた蓋に「画面を点けて」だけを
+    // 頼むと叶わないので、蓋の有無どちらでも実行できる1つの依頼にする。
+    expect(prompt).not.toContain('"AppleClamshellState" = No or prints nothing')
+    expect(prompt).toContain('When ioreg prints nothing and the latest line shows the display turned off, the lid state is unknown,')
+    expect(prompt).toContain('`お願い: <誰> が <このMacの名前> の画面を点けてください（蓋のあるMacで蓋が閉じていれば開ける。それ以外はキーかトラックパッドに触れるか、外部ディスプレイの電源を入れる）`')
+    expect(prompt).not.toContain('If the lid is the cause or the latest line shows the display turned off')
+    expect(prompt).toContain('`お願い: <誰> が <このMacの名前> の蓋を開けてください（または外部ディスプレイを繋いでください）`')
+    expect(prompt).toContain('naming as <誰> the person or role who can physically reach this Mac and taking its name from `scutil --get ComputerName`.')
+    // 前面化は layer・onscreen・bounds を何も変えなかった。言い換えや別の担い手を経由した依頼も同じ。
+    expect(prompt).toContain('In any of these states never ask anyone, directly or through someone else, to bring an app or its widget')
+    expect(prompt).toContain('to the front or to show it again; making it frontmost was measured to change nothing.')
+    // bellMe(DEV 版も同じ窓設定)は通常の窓より上の floating level に居続ける窓で、前面化は効かない。
+    // 画面が点いていれば Computer Use はこの窓を取れる(同じ job で成功と cgWindowNotFound が交互に出た)。
+    expect(prompt).toContain('When Computer Use cannot find or capture bellMe (com.bellsalesai.live-agent, or com.bellsalesai.live-agent.dev')
+    expect(prompt).toContain('for its dev build), a bring-to-front request is never the fix: its UI is an untitled, transparent, borderless')
+    expect(prompt).toContain('window kept above ordinary windows at floating level (NSFloatingWindowLevel), not an ordinary window.')
+    // 蓋を閉じた sleep は idle sleep ではないので、caffeinate では画面は点かない。
+    expect(prompt).toContain('Neither caffeinate nor a PreventUserIdleDisplaySleep assertion keeps the display on while the lid')
+    expect(prompt).toContain('is closed, since a closed lid is not idle sleep; never propose them as a workaround.')
+    // ジョブの箱の中の screencapture は画面が点いていても失敗する。表示状態の証拠にしない。
+    expect(prompt).toContain('A shell `screencapture` inside this sandbox fails with "could not create image from display" even')
+    expect(prompt).toContain('while the display is on, so that failure alone proves nothing about the display.')
+    // ブラウザの道具は既存の規定どおり実際のエラーを報告する。ヘッドレスの検証器は画面を使わない。
+    expect(prompt).toContain('This rule does not cover browser tools, whose own rules apply: report a go-chrome-mcp or')
+    expect(prompt).toContain('zerokun_browser.verify_local_page failure with its actual tool error; the headless verifier never uses the display.')
+    // 毎回組み立て直す信頼済みの host control の中に置く。
+    const rule = prompt.indexOf('Host display state:')
+    expect(rule).toBeGreaterThan(prompt.indexOf('--- Zero host control (trusted'))
+    expect(rule).toBeLessThan(prompt.indexOf('--- end Zero host control ---'))
+    // read-only の箱では pmset -g log が記録を読めず、grep と tail を通すと exit 0 の空出力に
+    // なって表示状態を誤読させる(2026-09-30 実測)。Computer Use を持つ書き込み job にだけ渡す。
+    expect(buildCodexWorkerPrompt(job, snapshot, { ...host, browserEnabled: true }))
+      .not.toContain('Host display state:')
+    expect(buildCodexWorkerPrompt({ ...job, writeEnabled: false }, snapshot, {
+      ...host, browserEnabled: true, computerUseEnabled: true,
+    })).not.toContain('Host display state:')
+  } finally { store.close() }
+})
+
 function stageInboundAttachment(options: {
   store: JobStore
   stateDir: string

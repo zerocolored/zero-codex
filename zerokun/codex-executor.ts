@@ -4376,6 +4376,63 @@ export function buildCodexWorkerPrompt(
         'discover node_repl tools rather than assuming a direct get_app_state MCP tool exists.',
         'Existing per-app approvals still apply.',
         'Do not bypass app approval or claim a missing connection without trying the exposed native tool.')
+      // 画面が取れないとき、ホストの表示状態を確かめずに「検証用Macで bellMe のウィジェットを
+      // 前面表示してください」と叶わない依頼を出して止まった(2026-09-25・09-30 に計4ジョブ)。
+      // 真因はホストの MacBook の蓋が閉じていたこと(09-30 に ioreg で AppleClamshellState=Yes)。
+      // 両日とも pmset は、蓋が閉じた間の点灯のたびに 'Clamshell Sleep' の DarkWake と Display is turned off を
+      // 記録した(点灯から消灯までは111回中110回が12秒以内。だから30秒後に読み直させる)。ただし蓋を閉じた
+      // まま充電器を繋いだ点灯は 'Wake Back to Sleep' で消え、'Clamshell Sleep' が付かない(09-30 11:40 実測)
+      // ので、AppleClamshellState=Yes で最新行が消灯なら、それだけでも蓋を頼ませ、蓋を原因から外すのは
+      // 読み直しても点いたままのときだけにする。ioreg が何も出さないとき(蓋の無い Mac も含む)は蓋の
+      // 状態が分からないので、蓋の有無どちらでも実行できる1つの依頼にまとめる。
+      // 同じ job の中で bellMe の get_app_state は成功と cgWindowNotFound を行き来しており、原因は
+      // 窓の種類ではなく消灯。frontmost にしても layer・onscreen・bounds は変わらず、caffeinate が
+      // PreventUserIdleDisplaySleep を保持していても蓋を閉じた sleep は止まらない。外部ディスプレイで
+      // 蓋を閉じて使う Mac は蓋が閉じていても点いたままなので、新しい 'Clamshell Sleep' の有無で
+      // 見分ける(この構成はこのホストでは未実測)。蓋が開いている・蓋の無い Mac で画面だけ消えている
+      // ときに蓋を頼むと同じ叶わない依頼になるので、そのときは画面を点けてもらう。箱の中の
+      // screencapture は画面が点いていても失敗し(09-30 の job と、蓋を開けて画面が点いた状態の
+      // codex sandbox で確認)、ヘッドレスの verify_local_page は画面を使わない。
+      // read-only の箱では pmset -g log が記録を読めず、grep と tail を通すと exit 0 の空出力になって
+      // 表示状態を誤読させるので、pmset を読める Computer Use 付きの job にだけ、毎回組み立て直す
+      // この control で渡す(goal の objective は既存スレッドで差し替わらない)。
+      control.push(
+        'Host display state: when Computer Use returns cgWindowNotFound (error -10005), a Computer Use request',
+        "times out, or any Computer Use screen capture (get_app_state or a screenshot) fails or comes back entirely black, read this Mac's display",
+        'state yourself before you ask anyone for anything. Run',
+        '`ioreg -r -k AppleClamshellState -d 4 | grep AppleClamshellState`',
+        '("AppleClamshellState" = Yes means the lid is closed) and read the latest lines of',
+        '`pmset -g log | grep -E "Display is turned (on|off)|Clamshell" | tail -n 5`.',
+        'A command that prints nothing leaves its state unknown; never read that as an open lid or a display that is on.',
+        'With the lid closed, the lid is the cause when a "Clamshell Sleep" line comes after the latest',
+        '"Display is turned on" line. If the lid is closed and the display turned on last, read the log again 30 seconds later;',
+        'a new "Clamshell Sleep" line means the display wakes only for seconds, so a capture that worked once',
+        'is not a recovery. If instead the latest line still shows the display turned on and no "Clamshell Sleep"',
+        'line has appeared, something such as an external display is keeping this Mac awake with the lid closed',
+        'and the lid is not the cause; the same holds once someone replies that an external display is connected and on.',
+        'If the lid is the cause, or "AppleClamshellState" = Yes and either the latest line shows the display turned off',
+        'or the pmset command prints nothing,',
+        'your single request is',
+        '`お願い: <誰> が <このMacの名前> の蓋を開けてください（または外部ディスプレイを繋いでください）`,',
+        'naming as <誰> the person or role who can physically reach this Mac and taking its name from `scutil --get ComputerName`.',
+        'Otherwise, when ioreg shows "AppleClamshellState" = No and the latest line shows the display',
+        'turned off, never ask anyone to open the lid; your single request is',
+        '`お願い: <誰> が <このMacの名前> の画面を点けてください（キーかトラックパッドに触れる。外部ディスプレイならその電源を入れる）`.',
+        'When ioreg prints nothing and the latest line shows the display turned off, the lid state is unknown,',
+        'which is also what a Mac without a lid shows, so use one request that works either way:',
+        '`お願い: <誰> が <このMacの名前> の画面を点けてください（蓋のあるMacで蓋が閉じていれば開ける。それ以外はキーかトラックパッドに触れるか、外部ディスプレイの電源を入れる）`.',
+        'In any of these states never ask anyone, directly or through someone else, to bring an app or its widget',
+        'to the front or to show it again; making it frontmost was measured to change nothing.',
+        'When Computer Use cannot find or capture bellMe (com.bellsalesai.live-agent, or com.bellsalesai.live-agent.dev',
+        'for its dev build), a bring-to-front request is never the fix: its UI is an untitled, transparent, borderless',
+        'window kept above ordinary windows at floating level (NSFloatingWindowLevel), not an ordinary window.',
+        'Neither caffeinate nor a PreventUserIdleDisplaySleep assertion keeps the display on while the lid',
+        'is closed, since a closed lid is not idle sleep; never propose them as a workaround.',
+        'A shell `screencapture` inside this sandbox fails with "could not create image from display" even',
+        'while the display is on, so that failure alone proves nothing about the display.',
+        'This rule does not cover browser tools, whose own rules apply: report a go-chrome-mcp or',
+        'zerokun_browser.verify_local_page failure with its actual tool error; the headless verifier never uses the display.',
+      )
     }
     if (job.githubPublicationRecovery) {
       control.push(
