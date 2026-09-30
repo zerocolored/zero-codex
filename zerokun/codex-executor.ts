@@ -110,6 +110,7 @@ import {
   zerochanAdvisorRoleOverrides,
 } from './codex-runtime-selection.ts'
 import { resolveGoogleCloudRuntime, type GoogleCloudRuntime } from './google-cloud-runtime.ts'
+import { prepareDockerConfig, resolveDockerRuntime, type DockerRuntime } from './docker-runtime.ts'
 import {
   advisorPerspectiveForPhase,
   THREE_ADVISOR_JOURNAL_VERSION,
@@ -5429,6 +5430,10 @@ export function buildCodexPermissionOverrides(
     nativeCloudAccessEnabled?: boolean
     /** Fixture injection; production resolves the installed host SDK. */
     googleCloudRuntime?: GoogleCloudRuntime | null
+    /** Local Docker daemon access belongs only to the normal write-authorized primary. */
+    nativeDockerAccessEnabled?: boolean
+    /** Fixture injection; production resolves the host's selected local engine. */
+    dockerRuntime?: DockerRuntime | null
     /** Fixture-only selection override. Production uses the release constants. */
     model?: string
     /** Fixture-only selection override. Production uses the release constants. */
@@ -5578,6 +5583,12 @@ export function buildCodexPermissionOverrides(
   const cloudPathAllowed = (path: string): boolean => !cloudProtected.some(root => (
     pathContains(root, path) || pathContains(path, root)
   ))
+  const selectedDocker = options.nativeDockerAccessEnabled && primaryWorkspaceAccess
+    ? (options.dockerRuntime === undefined ? resolveDockerRuntime() : options.dockerRuntime)
+    : null
+  const dockerRuntime = selectedDocker && cloudPathAllowed(selectedDocker.socketPath)
+    ? { ...selectedDocker, pluginDirs: selectedDocker.pluginDirs.filter(cloudPathAllowed) } : null
+  const dockerConfig = dockerRuntime ? prepareDockerConfig(state, scratchDir, dockerRuntime) : null
   const cloudBin = cloudRuntime?.bin && cloudPathAllowed(cloudRuntime.bin) ? cloudRuntime.bin : null
   const cloudConfig = cloudRuntime?.config && cloudPathAllowed(cloudRuntime.config)
     ? cloudRuntime.config : null
@@ -5690,6 +5701,11 @@ export function buildCodexPermissionOverrides(
     `"XDG_CONFIG_HOME"=${tomlString(join(scratchDir, '.config'))}`,
     `"XDG_CACHE_HOME"=${tomlString(join(scratchDir, '.cache'))}`,
     `"PATH"=${tomlString(cloudBin ? `${cloudBin}:${toolchain.path}` : toolchain.path)}`,
+    ...(dockerRuntime && dockerConfig ? [
+      `"DOCKER_HOST"=${tomlString(dockerRuntime.host)}`,
+      `"DOCKER_CONFIG"=${tomlString(dockerConfig)}`,
+      '"DOCKER_CONTEXT"=""',
+    ] : []),
     ...(cloudConfig ? [`"CLOUDSDK_CONFIG"=${tomlString(cloudConfig)}`] : []),
     ...(cloudRuntime ? [
       '"CLOUDSDK_CORE_DISABLE_PROMPTS"="1"',
@@ -5753,7 +5769,10 @@ export function buildCodexPermissionOverrides(
     `permissions.${profile}.filesystem={${filesystem}}`,
     `permissions.${profile}.network.enabled=${networkEnabled ? 'true' : 'false'}`,
     `permissions.${profile}.network.allow_local_binding=${networkEnabled ? 'true' : 'false'}`,
-    `permissions.${profile}.network.unix_sockets={${networkEnabled ? `${tomlString(jobTempDir)}="allow"` : ''}}`,
+    `permissions.${profile}.network.unix_sockets={${[
+      ...(networkEnabled ? [`${tomlString(jobTempDir)}="allow"`] : []),
+      ...(dockerRuntime ? [`${tomlString(dockerRuntime.socketPath)}="allow"`] : []),
+    ].join(',')}}`,
     ...(executionWriteEnabled || browserAccessEnabled ? [
       `permissions.${profile}.network.domains={"*"="allow","slack.com"="deny","**.slack.com"="deny","slack-edge.com"="deny","**.slack-edge.com"="deny","slack-msgs.com"="deny","**.slack-msgs.com"="deny"}`,
     ] : localVerificationEnabled ? [
@@ -6965,6 +6984,7 @@ export async function executeCodexJob(
           && stage !== 'implementation' && stage !== 'interjection',
         taskGoalEnabled: stage === 'complete',
         nativeCloudAccessEnabled: stage === 'complete' && !continuationDecision,
+        nativeDockerAccessEnabled: stage === 'complete' && !continuationDecision,
         computerUseEnabled: executionWriteEnabled && browserEnabled,
         model,
         reasoningEffort,
