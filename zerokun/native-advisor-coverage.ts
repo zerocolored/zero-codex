@@ -1,7 +1,9 @@
 import { realpathSync } from 'node:fs'
 import type { AdvisorExecutionState } from './advisor-broker.ts'
+import type { NativeAdvisorRegistration } from './native-advisor-recovery.ts'
 import { isFinalAppServerAgentMessage } from './codex-app-server-session.ts'
 import {
+  nativeAdvisorInputBinding,
   nativeAdvisorMarker,
   nativeAdvisorResponseHasExactMarker,
   nativeAdvisorResponseDigest,
@@ -47,6 +49,7 @@ export async function observeNativeAdvisorCoverage(options: {
   repoPath: string
   parentChildBaseline: string[]
   rounds: NativeAdvisorRoundEvidence[]
+  registrations?: NativeAdvisorRegistration[]
   read: (method: 'thread/list' | 'thread/read', params: RecordValue) => Promise<RecordValue | undefined>
 }): Promise<NativeAdvisorObservation[]> {
   const observations = options.rounds.flatMap(round => round.native.map(entry => ({
@@ -69,8 +72,7 @@ export async function observeNativeAdvisorCoverage(options: {
     })
     if (!result) break
     for (const child of records(result.data)) {
-      if (typeof child.id === 'string' && child.parentThreadId === options.parentThreadId
-        && !baseline.has(child.id)) children.set(child.id, child)
+      if (typeof child.id === 'string' && child.parentThreadId === options.parentThreadId) children.set(child.id, child)
     }
     if (typeof result.nextCursor !== 'string' || !result.nextCursor
       || cursors.has(result.nextCursor)) break
@@ -80,6 +82,16 @@ export async function observeNativeAdvisorCoverage(options: {
   const repo = realpathSync(options.repoPath)
   const threads = new Map<string, RecordValue>()
   for (const observation of observations) {
+    const round = options.rounds.find(value => value.phase === observation.phase
+      && value.round === observation.round && value.inputRevision === observation.inputRevision
+      && value.inputDigest === observation.inputDigest)!
+    const entry = round.native.find(value => value.perspective === observation.perspective)!
+    const registration = options.registrations?.find(value => value.phase === observation.phase
+      && value.round === observation.round && value.perspective === observation.perspective
+      && value.inputRevision <= observation.inputRevision
+      && value.marker === nativeAdvisorMarker(options.attemptNonce, value.inputRevision,
+        value.inputDigest, value.phase, value.round, value.perspective))
+    const binding = nativeAdvisorInputBinding(round, registration ?? entry)
     const role = observation.perspective === 'solution' ? 'solution_analyst' : 'risk_reviewer'
     const candidates = [...children.values()].filter(child => {
       const source = spawnSource(child)
@@ -102,10 +114,15 @@ export async function observeNativeAdvisorCoverage(options: {
       try {
         if (typeof thread.cwd !== 'string' || realpathSync(thread.cwd) !== repo) continue
       } catch { continue }
-      const marker = nativeAdvisorMarker(options.attemptNonce, observation.inputRevision,
-        observation.inputDigest, observation.phase, observation.round, observation.perspective)
+      const registeredChild = registration !== undefined && registration.agentPath === source.agent_path
+      if (baseline.has(id) && !registeredChild) continue
+      // A registered slot must resolve to its original child, including when
+      // a newer Codex omits that child's encrypted spawn input from history.
+      if (registration && !registeredChild) continue
+      const marker = nativeAdvisorMarker(options.attemptNonce, binding.inputRevision,
+        binding.inputDigest, observation.phase, observation.round, observation.perspective)
       const finals: string[] = []
-      let inputObserved = false
+      let inputObserved = registeredChild
       for (const turn of records(thread.turns)) {
         for (const item of records(turn.items)) {
           if (item.type === 'userMessage' && records(item.content).some(content => (
@@ -133,10 +150,7 @@ export async function observeNativeAdvisorCoverage(options: {
     // the unique completed answer; two completed answers remain ambiguous
     // unless the broker explicitly selected one physical/logical agent.
     const obtained = matched.filter(value => value.state === 'response-obtained')
-    const claimed = options.rounds.find(value => value.phase === observation.phase
-      && value.round === observation.round && value.inputRevision === observation.inputRevision
-      && value.inputDigest === observation.inputDigest)?.native
-      .find(value => value.perspective === observation.perspective)?.agentId
+    const claimed = entry.agentId
     const selected = obtained.filter(value => {
       const thread = threads.get(value.threadId!)!
       return typeof claimed === 'string'

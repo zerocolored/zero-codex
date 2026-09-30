@@ -150,6 +150,8 @@ function validTerminalNativeAttemptsFor(
     || new Set(agentIds).size !== agentIds.length) return false
   for (const attempt of attempts) {
     if (attempt.attempted !== true || typeof attempt.adopted !== 'boolean') return false
+    if ((attempt.inputRevision !== undefined || attempt.inputDigest !== undefined)
+      && (!positiveInteger(attempt.inputRevision) || !sha256(attempt.inputDigest))) return false
     if (attempt.adopted) {
       if (!nativeAgentId(attempt.agentId)
         || !sha256(attempt.responseDigest)

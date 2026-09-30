@@ -24,7 +24,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { registerNativeAdvisor } from './native-advisor-recovery.ts'
+import { readNativeAdvisorRegistrations, registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { AdvisorFailureError, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
 import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
@@ -2705,6 +2705,8 @@ async function main(): Promise<void> {
         allAdopted, waitingForAdvisors: false, attemptsFinished: true,
         slotSummary: journalSlotSummary(journal),
         native: saved.native, grok: saved.grok, claude: saved.claude,
+        ...(saved.native.some((value: { inputRevision?: number }) => value.inputRevision !== undefined
+          && value.inputRevision !== input.revision) ? { scopeAssessmentRequired: true } : {}),
         ...repositoryReviewWarning(journal),
       })
     } catch { return null }
@@ -3459,6 +3461,8 @@ async function main(): Promise<void> {
       agentId?: string
       responseDigest?: string
       responseTransportDigest?: string
+      inputRevision?: number
+      inputDigest?: string
       reasonDigest?: string
       failure?: ReturnType<typeof classifyAdvisorFailure>
     }> => nativeAdvisors.map(advisor => {
@@ -3477,8 +3481,20 @@ async function main(): Promise<void> {
           }
         }
         const response = safeInput(advisor.response, `${advisor.perspective} native advisor response`)
+        // Prepare is durable across steering. Use its original binding, not
+        // the current outer round revision, and verify it against host input.
+        const registered = readNativeAdvisorRegistrations(contextInput, context.attemptNonce)
+          .find(value => value.phase === phase && value.round === round
+            && value.perspective === advisor.perspective)
+        const nativeInput = registered
+          ? readAdvisorInputSnapshot(stateDir, context.jobId, registered.inputRevision)
+          : boundInput
+        if (registered && (nativeInput.digest !== registered.inputDigest
+          || nativeInput.revision > boundInput.revision)) {
+          throw new Error('native advisor original input is not canonical for this round')
+        }
         const marker = nativeAdvisorMarker(
-          context.attemptNonce, boundInput.revision, boundInput.digest,
+          context.attemptNonce, nativeInput.revision, nativeInput.digest,
           phase, round as 1 | 2 | 3, advisor.perspective,
         )
         if (!nativeAdvisorResponseHasExactMarker(response, marker)) {
@@ -3495,6 +3511,7 @@ async function main(): Promise<void> {
           agentId: advisor.agentId,
           responseDigest: nativeAdvisorResponseDigest(response),
           responseTransportDigest: nativeAdvisorResponseTransportDigest(response),
+          ...(registered ? { inputRevision: nativeInput.revision, inputDigest: nativeInput.digest } : {}),
         }
       })
     let boundInput = input
@@ -3522,7 +3539,7 @@ async function main(): Promise<void> {
       return toolText({ complete: false, reason: String(error) }, true)
     }
     if (retryResult && retryResult.native.some(saved => saved.adopted === true
-      && ['agentId', 'responseDigest', 'responseTransportDigest'].some(key =>
+      && ['agentId', 'responseDigest', 'responseTransportDigest', 'inputRevision', 'inputDigest'].some(key =>
         saved[key] !== (nativeEvidence.find(value => value.perspective === saved.perspective) as Record<string, unknown> | undefined)?.[key]))) {
       return toolText({ complete: false, reason: 'Reuse the already obtained native advisor answer for this round.' }, true)
     }
@@ -3966,6 +3983,9 @@ async function main(): Promise<void> {
         nextAction: '取得済み回答と欠員の理由を保持し、適用されるAGENTS.mdに従って本作業を継続してください。回答数だけを理由に待機・再試行しないでください。',
       } : {}),
       slotSummary,
+      native: nativeEvidence,
+      ...(nativeEvidence.some(value => value.inputRevision !== undefined
+        && value.inputRevision !== boundInput.revision) ? { scopeAssessmentRequired: true } : {}),
       grok,
       claude,
     }, !roundTerminal)

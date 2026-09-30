@@ -1250,3 +1250,23 @@ describe('native Codex advisor host evidence', () => {
     expect(() => assertNativeAdvisorEvidence(options)).toThrow('delegated')
   })
 })
+
+
+test('新しいround入力と元のGPT回答bindingを履歴照合でも区別する', () => {
+  const { options } = fixture()
+  const round = options.rounds[0]!
+  for (const entry of round.native) {
+    entry.inputRevision = round.inputRevision
+    entry.inputDigest = round.inputDigest
+  }
+  round.inputRevision = 2
+  round.inputDigest = 'b'.repeat(64)
+  expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
+  expect(resolveNativeAdvisorThreadIds(options)[0]!.native).toEqual(round.native)
+  for (const change of [{ inputRevision: 3 }, { inputDigest: 'c'.repeat(64) }, { inputDigest: undefined }]) {
+    const invalid = structuredClone(options)
+    Object.assign(invalid.rounds[0]!.native[0]!, change)
+    expect(() => assertNativeAdvisorEvidence(invalid)).toThrow()
+    expect(() => resolveNativeAdvisorThreadIds(invalid)).toThrow()
+  }
+})
