@@ -20,6 +20,7 @@ import {
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import {
+  drainIndependentTarget,
   activeJobCounts,
   activeJobCountsFromDatabase,
   assertPinnedRepositoryState,
@@ -1477,6 +1478,23 @@ describe('updater helpers', () => {
     expect(activeJobCounts(JSON.stringify([
       { status: 'running' },
     ]))).toEqual({ running: 1, queued: 0 })
+  })
+
+  test('independent update recovers through the validated candidate when the old runner is broken', async () => {
+    const fixture = updaterFixture()
+    serviceUpdaterEnvironment(fixture, `zerokun-update-${Date.now()}`)
+    const candidate = join(fixture.base, 'candidate'); mkdirSync(join(candidate, 'zerokun'), { recursive: true })
+    copyFileSync(join(fixture.repo.local, 'zerokun/job-runner.ts'), join(candidate, 'zerokun/job-runner.ts'))
+    copyFileSync(join(fixture.repo.local, 'zerokun/fixture-lock.ts'), join(candidate, 'zerokun/fixture-lock.ts'))
+    writeFileSync(join(fixture.repo.local, 'zerokun/job-runner.ts'), "throw new Error('old monitor recovery is broken')")
+    const dbPath = join(fixture.state, 'jobs.sqlite3')
+    const db = new Database(dbPath)
+    db.exec("CREATE TABLE jobs (status TEXT NOT NULL, runtime TEXT NOT NULL); INSERT INTO jobs VALUES ('running','codex'),('queued','codex')")
+    db.close(); chmodSync(dbPath, 0o600)
+    await drainIndependentTarget({ stateDir: fixture.state, oldRoot: fixture.repo.local, projectDir: fixture.project, running: false },
+      { version: 1, path: candidate, sha: 'a'.repeat(40) }, 10)
+    expect(activeJobCountsFromDatabase(dbPath)).toEqual({ running: 0, queued: 1 })
+    expect(existsSync(join(fixture.state, 'recovery-herdr.json'))).toBe(true)
   })
 
   test('別paneからの停止job回収は保存済みHerdr runtimeを使う', () => {

@@ -71,20 +71,30 @@ test('off during remote check prevents update reservation', async () => {
   })).toBe('disabled')
 })
 
-test('failed version is not retried and notified repeatedly; newer version is scheduled', async () => {
-  const root = temp(); const stateDir = temp(); let now = AUTO_UPDATE_INTERVAL_MS * 2; let sha = 'a'.repeat(40); let attempts = 0
-  writeFileSync(join(root, 'auto-update-check.json'), JSON.stringify({ pendingState: stateDir, pendingId: 'old', checkedAt: 1, targetSha: sha }), { mode: 0o600 })
-  writeFileSync(join(stateDir, 'update-request.json'), JSON.stringify({ id: 'old', outcome: { success: false, completedAt: 2, notifiedAt: 3 } }), { mode: 0o600 })
+test('same failed SHA retries after cooldown with a new delivery identity, including legacy failedSha', async () => {
+  const root = temp(); const stateDir = temp(); let now = 100
+  const sha = 'a'.repeat(40); let runs = 0; const messages: string[] = []
+  const settings = { stateDir, isWorkerRunning: () => false, isUpdateRunning: () => false, launchWorker: () => {} }
+  const old = await requestUpdate({ source: 'automatic', chatId: 'U123', threadTs: '', userId: '', messageId: `auto:${sha}` }, settings)
+  await runUpdateWorker(old.request.id, { stateDir, executeUpdater: async () => { runs++; return 1 }, notify: async (_, text) => { messages.push(text) } })
+  // Exercise the old on-disk quarantine format as well as the real request deduper.
+  const completedAt = Date.now(); now = completedAt + 1
+  writeFileSync(join(root, 'auto-update-check.json'), JSON.stringify({ pendingState: stateDir, pendingId: old.request.id, checkedAt: completedAt, targetSha: sha, failedSha: sha }))
+  let requestId = ''
   const options = { root, stateDir, now: () => now, detect: async () => sha,
-    enqueue: async () => { attempts++; return { accepted: true, request: { id: 'new' } } },
+    enqueue: async (target: string, attempt: string) => {
+      const result = await requestUpdate({ source: 'automatic', chatId: 'U123', threadTs: '', userId: '', messageId: `auto:${target}:${attempt}` }, settings)
+      requestId = result.request.id; return result
+    },
   }
-  expect(await checkAutomaticUpdate(options)).toBe('failed-version')
+  expect(await checkAutomaticUpdate(options)).toBe('not-due')
   now += AUTO_UPDATE_INTERVAL_MS
-  expect(await checkAutomaticUpdate(options)).toBe('failed-version')
-  expect(attempts).toBe(0)
-  now += AUTO_UPDATE_INTERVAL_MS; sha = 'b'.repeat(40)
   expect(await checkAutomaticUpdate(options)).toBe('scheduled')
-  expect(attempts).toBe(1)
+  expect(requestId).not.toBe(old.request.id)
+  const worker = { stateDir, executeUpdater: async () => { runs++; return 0 }, notify: async (_, text: string) => { messages.push(text) } }
+  await runUpdateWorker(requestId, worker); await runUpdateWorker(requestId, worker)
+  expect(runs).toBe(2); expect(messages).toHaveLength(2)
+  expect(await checkAutomaticUpdate(options)).toBe('not-due')
 })
 
 test('automatic request retains manual outcome awaiting notification', async () => {
@@ -102,17 +112,17 @@ test('automatic request retains manual outcome awaiting notification', async () 
   expect(launched).toEqual([manual.request.id, manual.request.id])
 })
 
-test('failed SHA persists during cooldown even if manual request replaces its outcome', async () => {
+test('manual replacement of failed outcome does not disable retries', async () => {
   const root = temp(); const stateDir = temp(); const sha = 'a'.repeat(40); let now = 100
-  writeFileSync(join(root, 'auto-update-check.json'), JSON.stringify({ pendingState: stateDir, pendingId: 'old', checkedAt: 1, targetSha: sha }), { mode: 0o600 })
+  writeFileSync(join(root, 'auto-update-check.json'), JSON.stringify({ pendingState: stateDir, pendingId: 'old', checkedAt: 1, targetSha: sha, failedSha: sha }), { mode: 0o600 })
   writeFileSync(join(stateDir, 'update-request.json'), JSON.stringify({ id: 'old', outcome: { success: false, completedAt: 90, notifiedAt: 91 } }), { mode: 0o600 })
   const options = { root, stateDir, now: () => now, detect: async () => sha,
-    enqueue: async () => { throw new Error('must not repeat failed version') },
+    enqueue: async () => ({ accepted: true, request: { id: 'new' } }),
   }
   expect(await checkAutomaticUpdate(options)).toBe('not-due')
   writeFileSync(join(stateDir, 'update-request.json'), JSON.stringify({ id: 'manual' }), { mode: 0o600 })
   now += AUTO_UPDATE_INTERVAL_MS
-  expect(await checkAutomaticUpdate(options)).toBe('failed-version')
+  expect(await checkAutomaticUpdate(options)).toBe('scheduled')
 })
 
 test('another app recovers the originating app durable worker instead of blocking forever', async () => {
