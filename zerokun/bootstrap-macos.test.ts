@@ -720,6 +720,13 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('Homebrew/install/HEAD/install.sh')
     expect(script).toContain('isolated_network_command "$(command -v brew)" install tmux')
     expect(script).toContain('isolated_network_command "$(command -v brew)" install gh')
+    // Cloud Logging コネクタは host の gcloud を実行する。入っていないと、ジョブ側は
+    // 「接続が提供されていない」と見えて実行時証拠を取れず、毎回ブロックで終わる。
+    expect(script).toContain('isolated_network_command "$(command -v brew)" install --cask gcloud-cli')
+    // 認証は人が1回 gcloud auth login する必要があり bootstrap では完了しない。
+    // 導入を必須扱いにして落とさず、使えないことだけ知らせる。
+    expect(script).toContain('warn "gcloud を確認できません')
+    expect(script).not.toMatch(/for required in [^\n]*gcloud/)
     expect(script).toContain('https://herdr.dev/install.sh')
     expect(script).toContain('HERDR_INSTALL_DIR="$HOME/.local/bin"')
     expect(script).not.toContain('"$(command -v brew)" install herdr')
@@ -735,6 +742,34 @@ describe('macOS bootstrap', () => {
     expect(script).toContain('https://claude.ai/install.sh')
     expect(script).toContain('/bin/bash "$installer" stable')
     expect(script).toContain('resolve_claude_binary >/dev/null || install_claude_code')
+    // 実行時のadvisorは共有書き込みできる場所の実行fileを起動しない。bootstrapが
+    // それより甘い基準で「導入済み」と判定すると、Homebrew版を見て公式installerを
+    // 飛ばし、advisorだけ起動できないMacができる(2026-09-29 実測)。
+    expect(script).toContain('path_has_shared_write')
+    expect(script).toContain('claude_binary_candidate "$HOME/.local/bin/claude" && return 0')
+    // 実音声E2Eの音声はここでしか作れない。公開SHAと展開後の実行fileの両方を
+    // 照合してから使う(2026-09-29 実測の値で固定)。
+    expect(script).toContain('6bd492249ac83c119f6fe38f2e44804e83ebc2c7f75295b21715080beb673a28')
+    expect(script).toContain('b4db0626f90bca175f4a1833394410f7abd263d2d85fdaa64100861181dcdea5')
+    expect(script).toContain('install_voicevox_engine')
+    // 検証用ビルドがadhocのままだと、ビルドのたびに別アプリ扱いになり画面収録
+    // などの許可を取り直すことになる。会社の配布用証明書は使わない。
+    expect(script).toContain('zerokun verification (local only)')
+    expect(script).toContain('install_verification_signing_identity')
+    // 実機検証はディープリンクでアプリへ入る。既定の「外部アプリを開きますか」は
+    // ブラウザ自身のダイアログで、job からは押せない(2026-09-29 実測)。
+    expect(script).toContain('install_chrome_app_launch_policy')
+    expect(script).toContain('AutoLaunchProtocolsFromOrigins')
+    expect(script).toContain('bellsales')
+    expect(script).toContain('warn "Chrome のディープリンク許可を設定できません')
+    // 空passwordのPKCS12はmacOSのimportがMAC検証で弾く。既定のmacalgでも弾かれる。
+    expect(script).toContain('-macalg sha1')
+    expect(script).toContain('openssl rand -hex 24')
+    // 自己署名は信頼評価を通らないが codesign では使える。-v を付けると見失う。
+    expect(script).toContain('security find-identity -p codesigning')
+    // どちらも欠けてもZeroちゃん本体は動く。bootstrapを止めない。
+    expect(script).toContain('warn "VOICEVOX Engine を取得できません')
+    expect(script).toContain('warn "検証用署名証明書を作れません')
     expect(script).not.toContain('claude auth login')
     expect(script).toContain('"$binary" auth status --json')
     expect(script).toContain('USER="$user_name"')

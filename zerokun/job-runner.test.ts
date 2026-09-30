@@ -343,6 +343,41 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
     })
     expect(prompt).toContain('attachments delivered=0/0')
     expect(prompt).toContain('do not merely repeat that approval is pending')
+    // ブロック報告が「何を調査したか」から始まると、読む人には何をしてほしいのか
+    // 分からない情報の羅列になる(2026-09-28 のオーナー指摘)。goal の objective は
+    // 既存スレッドでは差し替わらないので、毎回組み立て直すこの prompt に必ず入れる。
+    expect(prompt).toContain('お願い: <誰> が <何> してください')
+    expect(prompt).toContain('Do not open with what you')
+    expect(prompt).toContain('If you genuinely need nothing from the reader')
+    // 自分のサンドボックスが *KEY* を落とすことを知らないと「管理者が
+    // SUPABASE_SERVICE_ROLE_KEY を設定してください」という叶わない依頼で止まる
+    // (2026-09-28 実測)。除外規則と代替経路を毎回の prompt に入れる。
+    expect(prompt).toContain('Environment and credentials:')
+    expect(prompt).toContain('*TOKEN*, *SECRET*, *PASSWORD*, *KEY*, SLACK_* or ZEROKUN_*, and CODEX_HOME')
+    expect(prompt).toContain('Never ask anyone to set such a variable')
+    expect(prompt).toContain('dotenvx -q run -- <command>')
+    // 除外は引き継いだ変数にしか効かない。これを知らないと、別環境の資格情報を
+    // 使う手段が設定ファイルの書き換えしかないと思い込んで止まる(2026-09-29 実測)。
+    expect(prompt).toContain('applies only to variables inherited from the host')
+    expect(prompt).toContain('reaches that command untouched')
+    // 1行目の出番表示はホストが付ける。本人が状態を言い直すと本文が埋もれる。
+    expect(prompt).toContain('Slack brevity:')
+    expect(prompt).toContain('three short lines or fewer')
+    // 別環境の資格情報を「人からもらうもの」と思い込んで止まっていた。取りに
+    // 行く経路と、書き残さない条件を対にして伝える(2026-09-29 実測)。
+    expect(prompt).toContain('obtain them')
+    expect(prompt).toContain('the same source the deployment itself reads')
+    expect(prompt).toContain('Never write such a value into a file')
+    // 窓口があることを知らないと、置くだけの作業を毎回人へ投げて止まる。
+    // 戻し忘れた実機は本番と見分けがつかないので、報告も義務づける。
+    expect(prompt).toContain('zerokun_app_swap can')
+    expect(prompt).toContain('always restore once the verification is finished')
+    expect(prompt).toContain('Do not ask anyone to move an')
+    // CIはマージ結果を検査するので、ブランチ単体が通っても落ちる。ログを
+    // 読めないときは手元で同じ条件を作って再現させる(2026-09-28 実測)。
+    expect(prompt).toContain('CI verification:')
+    expect(prompt).toContain('against the MERGE of your branch and its')
+    expect(prompt).toContain('"Cause undetermined" is only acceptable after that reproduction also comes back clean')
     const other = store.enqueue(input({ threadTs: '1800000000.000999', messageId: '1800000000.000999' })).job
     expect(store.previousSlackDelivery(other.id)).toBeUndefined()
   } finally { store.close() }
@@ -5084,7 +5119,8 @@ describe('single FIFO worker', () => {
     })
     await notifier.failed(stoppedJob, stoppedReason)
     expect(posted).toEqual([
-      '🛑 停止操作により中断しました。'
+      '🛑 中止 ／ 対応不要'
+        + `\n\n<@${stoppedJob.userId}> 停止操作により中断しました。`
         + `\n原因: ${stoppedReason}`
         + `\nキュー #${stoppedJob.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
     ])
@@ -12185,6 +12221,30 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(runtime.path).not.toContain('relative')
   })
 
+  test.skipIf(process.platform !== 'darwin' || !existsSync('/opt/homebrew/Caskroom'))(
+    'Homebrew cask の実体(Caskroom)も読めるようにする',
+    () => {
+      // Homebrew は formula を Cellar、cask を Caskroom へ置く。bin の symlink は
+      // どちらの実体も指すため、Caskroom を落とすと cask で入れた実行体は
+      // sandbox から辿れず起動できない。2026-09-28、Cloud Logging コネクタが
+      // 「gcloud の起動拒否」で使えなかったのはこれが原因。
+      const dir = fixtureDir()
+      const runtime = resolveCodexToolchainRuntime({
+        sourcePath: '/opt/homebrew/bin:/usr/bin:/bin',
+        repoPath: join(dir, 'repo'),
+        stateDir: join(dir, 'state'),
+        artifactDir: join(dir, 'outbox'),
+        scratchDir: join(dir, 'tmp'),
+        homeDir: dir,
+      })
+      expect(runtime.readPaths).toContain(realpathSync('/opt/homebrew/Caskroom'))
+      // formula 側の実体も従来どおり読める。
+      if (existsSync('/opt/homebrew/Cellar')) {
+        expect(runtime.readPaths).toContain(realpathSync('/opt/homebrew/Cellar'))
+      }
+    },
+  )
+
   test.skipIf(process.platform !== 'darwin')(
     'macOSでは選択中の開発者directoryを読めるようにする',
     () => {
@@ -12307,7 +12367,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       const primaryPath = (Bun.TOML.parse(overrides) as any).shell_environment_policy.set.PATH
       expect(primaryPath.split(':')).toContain('/usr/bin')
       expect(primaryPath).not.toContain(`${join(homedir(), '.codex')}/`)
-      expect(overrides).toContain('"*PROXY*"')
+      // codex は network_proxy 有効時に HTTP_PROXY/HTTPS_PROXY/ALL_PROXY を
+      // 子シェルへ渡す。除外すると直接接続しか残らず seatbelt の EPERM で
+      // ジョブが一切通信できなくなる(2026-09-28 実測)。
+      expect(overrides).not.toContain('"*PROXY*"')
       expect(overrides).toContain('network.enabled=true')
       expect(overrides).toContain('network.allow_local_binding=true')
       expect(overrides).toContain('features.network_proxy=true')
@@ -12316,6 +12379,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         'slack-edge.com', '**.slack-edge.com',
         'slack-msgs.com', '**.slack-msgs.com',
       ]) expect(overrides).toContain(`${JSON.stringify(slackDomain)}="deny"`)
+      // アプリ承認は config から与えられない。bundle_ids も default_app_access も
+      // 設定としては通るが実行時の判定に使われない(2026-09-29 実測)。効かない
+      // 設定を置くと、許可済みだと誤解したまま原因を探すことになる。
+      expect(overrides).not.toContain('computer_use.macos.bundle_ids')
+      expect(overrides).not.toContain('computer_use.default_app_access')
       expect(overrides).toContain('features.apps=false')
       expect(overrides.split('\n').filter(value => value.startsWith('model=')))
         .toEqual(['model="gpt-6-astra"'])
@@ -13334,7 +13402,10 @@ describe('Slack output guard', () => {
       postMessage: async value => { posted.push(value.text) },
     })
     await notifier.progress(job, raw, 'progress-self-question')
-    expect(posted).toEqual([sanitized])
+    // 本文の除去が主題。1行目の出番表示は別責務。
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('💬 経過 ／ 対応不要')
+    expect(posted[0]).toEndWith(sanitized)
     store.close()
   })
 
@@ -13407,7 +13478,34 @@ describe('Slack output guard', () => {
     await notifier.progress(job, '💬 原因を確認しています 🔎', 'commentary-prefix')
     await notifier.progress(job, '通常の進捗です 🧪', 'ordinary-progress')
 
-    expect(posted).toEqual(['原因を確認しています 🔎', '通常の進捗です 🧪'])
+    expect(posted).toHaveLength(2)
+    expect(posted[0]).toStartWith('💬 経過 ／ 対応不要')
+    expect(posted[0]).toEndWith('原因を確認しています 🔎')
+    expect(posted[1]).toEndWith('通常の進捗です 🧪')
+    // 経過では宛先を付けない。毎回通知するとうるさい。
+    for (const text of posted) expect(text).not.toContain(`<@${job.userId}>`)
+    store.close()
+  })
+
+  // 途中で返事が要る投稿が、ただの経過と同じ見た目だと埋もれる。本人が依頼を
+  // `お願い:` で書き出したときだけ要判断にし、そこで初めて宛先を付ける。
+  test('途中でも返事が要る投稿は要判断として依頼者を宛先にする', async () => {
+    const store = makeStore()
+    const job = store.enqueue(input({ messageId: 'progress-decision' })).job
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+
+    await notifier.progress(job, 'お願い: 表示方向を決めてください。', 'progress-decision')
+    await notifier.progress(job, '比較サンプルを用意しています。', 'progress-plain')
+
+    expect(posted).toHaveLength(2)
+    expect(posted[0]).toStartWith('🙋 要判断 ／ あなたの決定が要ります')
+    expect(posted[0]).toContain(`<@${job.userId}>`)
+    expect(posted[0]).toEndWith('お願い: 表示方向を決めてください。')
+    expect(posted[1]).toStartWith('💬 経過 ／ 対応不要')
+    expect(posted[1]).not.toContain(`<@${job.userId}>`)
     store.close()
   })
 
@@ -13427,7 +13525,8 @@ describe('Slack output guard', () => {
     await notifier.failed(job, raw)
 
     expect(posted).toEqual([
-      '🙇 うまく完了できませんでした。'
+      '🛑 失敗 ／ 対応不要（私が追います）'
+        + `\n\n<@${job.userId}> うまく完了できませんでした。`
         + '\n原因: 補助レビューの回答と保存履歴を照合できませんでした。'
         + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
     ])
@@ -13709,7 +13808,11 @@ describe('Slack output guard', () => {
       store.get(queued.id) ?? running,
       '5つの独立レビュー枠をすべて試行しました。残る3枠は利用不能でした。通常回答です。',
     )
-    expect(posted).toEqual(['通常回答です。'])
+    // 本文からadvisor自己申告が除かれることが主題。1行目の出番表示と宛先は別責務。
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toEndWith('通常回答です。')
+    expect(posted[0]).not.toContain('独立レビュー枠')
 
     posted.length = 0
     await notifier.completed(
@@ -13724,7 +13827,9 @@ describe('Slack output guard', () => {
       + '初期設計—起動5/5・回答4/5・起動済み回答未確認1/5'
       + '・起動未確認0/5・起動前利用不能0/5。'
     await notifier.completed(store.get(queued.id) ?? running, observed)
-    expect(posted).toEqual([observed])
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toEndWith(observed)
     store.close()
   })
 
@@ -13813,7 +13918,9 @@ describe('Slack output guard', () => {
     })
     const saved = store.get(queued.id)!
     await notifier.completed(saved, saved.result!)
-    expect(posted).toEqual([answer])
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toEndWith(answer)
     store.close()
   })
 
@@ -15539,7 +15646,9 @@ describe('durable terminal notifications', () => {
     await flushTerminalNotifications(store, notifier, () => {}, 1)
     await flushTerminalNotifications(store, notifier, () => {}, 1)
     expect(posted).toHaveLength(1)
-    expect(posted[0]).not.toContain('未完了・待機中')
+    // 完了は無印にしない。読まずに「対応不要」と分かることが目的。
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toContain(`<@${job.userId}>`)
     expect(posted[0]).toContain('回答2/3')
     expect(store.get(job.id)?.taskGoalStatus).toBe('complete')
     expect(posted[0]).toContain('Claude Code: 認証が必要です')

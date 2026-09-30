@@ -1996,7 +1996,7 @@ export function buildCandidatePermissionOverrides(
     'features.multi_agent=false',
     'features.skill_mcp_dependency_install=false',
     'shell_environment_policy.inherit="core"',
-    'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","*PROXY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
+    'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
     'mcp_servers={}',
     'hooks={}',
   ]

@@ -193,15 +193,45 @@ resolve_herdr_binary() {
   printf '%s\n' "$binary"
 }
 
-resolve_claude_binary() {
-  local binary resolved
-  binary="$(command -v claude 2>/dev/null)" || return 1
+# 実行時のadvisorは、自分以外が書き換えられる場所の実行fileを起動しない。
+# bootstrapがそれより甘い基準で「導入済み」と判定すると、公式installerが
+# 飛ばされ、導入は成功したのにadvisorだけ起動できないMacができる。
+# Homebrewの /opt/homebrew/bin と Caskroom は group 書き込み可なので該当する。
+path_has_shared_write() {
+  local path="$1" mode group other
+  while :; do
+    mode="$(/usr/bin/stat -f '%OLp' "$path" 2>/dev/null)" || return 0
+    case "$mode" in
+      ???) ;;
+      *) return 0 ;;
+    esac
+    group="${mode%?}"
+    group="${group#?}"
+    other="${mode#??}"
+    case "$group" in 2|3|6|7) return 0 ;; esac
+    case "$other" in 2|3|6|7) return 0 ;; esac
+    case "$path" in /) return 1 ;; esac
+    path="$(dirname "$path")"
+  done
+}
+
+claude_binary_candidate() {
+  local binary="$1" resolved
   case "$binary" in /*) ;; *) return 1 ;; esac
   [ -f "$binary" ] && [ -x "$binary" ] || return 1
   resolved="$(/usr/bin/perl -MCwd=realpath -e 'print realpath($ARGV[0]) // q{}' "$binary" 2>/dev/null)" || return 1
   [ -f "$resolved" ] && [ -x "$resolved" ] || return 1
   [ "$(/usr/bin/stat -f '%u' "$resolved" 2>/dev/null)" = "$(/usr/bin/id -u)" ] || return 1
+  path_has_shared_write "$(dirname "$resolved")" && return 1
   printf '%s\n' "$binary"
+}
+
+resolve_claude_binary() {
+  local binary
+  # 公式installerの導入先を先に見る。PATHの先頭がHomebrewでも、安全な方を選ぶ。
+  claude_binary_candidate "$HOME/.local/bin/claude" && return 0
+  binary="$(command -v claude 2>/dev/null)" || return 1
+  claude_binary_candidate "$binary"
 }
 
 claude_subscription_ready() {
@@ -1093,6 +1123,138 @@ install_claude_code() {
   append_profile_block '# zerokun bootstrap: Claude Code' 'export PATH="$HOME/.local/bin:$PATH"'
 }
 
+# VOICEVOX Engine は実音声E2Eの音声を作る。無いと合成が0秒になり、検証は
+# 「原音を人が録って添付する」まで止まる。公開SHAを照合してから展開する。
+VOICEVOX_VERSION="0.25.2"
+VOICEVOX_ARCHIVE_SHA="6bd492249ac83c119f6fe38f2e44804e83ebc2c7f75295b21715080beb673a28"
+VOICEVOX_ENGINE_SHA="b4db0626f90bca175f4a1833394410f7abd263d2d85fdaa64100861181dcdea5"
+VOICEVOX_ROOT="$HOME/.local/share/voicevox_engine"
+
+voicevox_engine_binary() {
+  local binary="$VOICEVOX_ROOT/$VOICEVOX_VERSION/macos-arm64/run"
+  [ -f "$binary" ] && [ -x "$binary" ] || return 1
+  [ "$(/usr/bin/shasum -a 256 "$binary" | /usr/bin/awk '{print $1}')" = "$VOICEVOX_ENGINE_SHA" ] || return 1
+  printf '%s\n' "$binary"
+}
+
+install_voicevox_engine() {
+  local archive actual
+  if voicevox_engine_binary >/dev/null; then
+    ok "VOICEVOX Engine ${VOICEVOX_VERSION}"
+    return
+  fi
+  # 展開に 7z が要る。Engine より先に揃える。
+  if ! /usr/bin/env command -v 7zz >/dev/null 2>&1; then
+    isolated_network_command "$(command -v brew)" install sevenzip \
+      || { warn "7z を導入できません。VOICEVOX Engine は展開できません"; return 0; }
+    hash -r
+  fi
+  /bin/mkdir -p "$VOICEVOX_ROOT" || { warn "VOICEVOX の置き場を作れません"; return 0; }
+  archive="$VOICEVOX_ROOT/voicevox_engine-macos-arm64-${VOICEVOX_VERSION}.7z.001"
+  if ! secure_download "$archive" \
+    "https://github.com/VOICEVOX/voicevox_engine/releases/download/${VOICEVOX_VERSION}/voicevox_engine-macos-arm64-${VOICEVOX_VERSION}.7z.001"; then
+    /bin/rm -f "$archive"
+    warn "VOICEVOX Engine を取得できません。実音声の新規生成はできません"
+    return 0
+  fi
+  actual="$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')"
+  if [ "$actual" != "$VOICEVOX_ARCHIVE_SHA" ]; then
+    /bin/rm -f "$archive"
+    warn "VOICEVOX Engine の配布物SHAが公開値と一致しません。導入を中止しました"
+    return 0
+  fi
+  if ! 7zz x "$archive" "-o$VOICEVOX_ROOT/$VOICEVOX_VERSION" -y >/dev/null; then
+    /bin/rm -rf "${VOICEVOX_ROOT:?}/$VOICEVOX_VERSION"
+    warn "VOICEVOX Engine を展開できません"
+    return 0
+  fi
+  /bin/rm -f "$archive"
+  # 展開物の実行fileまで照合する。配布物が正しくても中身の取り違えは起こる。
+  voicevox_engine_binary >/dev/null \
+    || { warn "VOICEVOX Engine の実行fileSHAが記録と一致しません"; return 0; }
+  ok "VOICEVOX Engine ${VOICEVOX_VERSION}"
+}
+
+# 実機検証用のビルドは adhoc 署名のため、ビルドのたびに別アプリ扱いになり、
+# 画面収録などの許可を毎回取り直すことになる。検証専用の自己署名証明書で
+# 署名すれば、利用者の許可は1回で済む。会社の配布用証明書は使わない。
+VERIFICATION_SIGNING_IDENTITY="zerokun verification (local only)"
+
+# 自己署名なので keychain の信頼評価は通らない(CSSMERR_TP_NOT_TRUSTED)。
+# それでも codesign は使えるため、-v を付けずに存在だけを見る。
+verification_signing_identity() {
+  /usr/bin/security find-identity -p codesigning 2>/dev/null \
+    | /usr/bin/grep -q "$VERIFICATION_SIGNING_IDENTITY"
+}
+
+install_verification_signing_identity() {
+  local work config transfer
+  if verification_signing_identity; then
+    ok "検証用署名証明書"
+    return
+  fi
+  work="$(/usr/bin/mktemp -d /tmp/zerokun-signing.XXXXXX)" \
+    || { warn "検証用署名証明書の作業directoryを作れません"; return 0; }
+  /bin/chmod 0700 "$work"
+  config="$work/openssl.cnf"
+  /bin/cat > "$config" <<'SIGNING_CONFIG'
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = zerokun verification (local only)
+[ext]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+SIGNING_CONFIG
+  if ! /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout "$work/key.pem" -out "$work/cert.pem" -config "$config" >/dev/null 2>&1; then
+    /bin/rm -rf "$work"
+    warn "検証用署名証明書を作れません。実機検証では許可を毎回求められます"
+    return 0
+  fi
+  # 空passwordのPKCS12はmacOSのimportがMAC検証で弾く。受け渡しのためだけの
+  # 使い捨てpasswordを起こし、keychainへ入れたら捨てる。macalg/pbeも、macOSが
+  # 読める旧方式に固定する(既定のままだとMAC検証に失敗する)。
+  transfer="$(/usr/bin/openssl rand -hex 24)"
+  if ! /usr/bin/openssl pkcs12 -export -macalg sha1 \
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES \
+    -inkey "$work/key.pem" -in "$work/cert.pem" \
+    -passout "pass:$transfer" -out "$work/identity.p12" >/dev/null 2>&1; then
+    /bin/rm -rf "$work"
+    warn "検証用署名証明書を書き出せません"
+    return 0
+  fi
+  # login keychain へ入れる。codesign から鍵を使えるようにする。
+  if ! /usr/bin/security import "$work/identity.p12" -k "$HOME/Library/Keychains/login.keychain-db" \
+    -P "$transfer" -T /usr/bin/codesign >/dev/null 2>&1; then
+    /bin/rm -rf "$work"
+    warn "検証用署名証明書をkeychainへ登録できません"
+    return 0
+  fi
+  /bin/rm -rf "$work"
+  verification_signing_identity \
+    || { warn "検証用署名証明書を登録後に確認できません"; return 0; }
+  ok "検証用署名証明書"
+}
+
+# 実機検証は develop 画面の「アプリを起動」からディープリンクで入る。既定では
+# Chrome が「外部アプリを開きますか」を出すが、これはページではなくブラウザ自身の
+# ダイアログで、job からは押せない。許可元と scheme を固定して確認を省く。
+# Chrome は起動時にしか読まないため、反映には Chrome の再起動が要る。
+install_chrome_app_launch_policy() {
+  if /usr/bin/defaults read com.google.Chrome AutoLaunchProtocolsFromOrigins >/dev/null 2>&1; then
+    ok "Chrome ディープリンク許可"
+    return
+  fi
+  /usr/bin/defaults write com.google.Chrome AutoLaunchProtocolsFromOrigins -array \
+    '<dict><key>allowed_origins</key><array><string>https://develop.bellme.ai</string><string>https://www.bellme.ai</string><string>http://localhost:13109</string></array><key>protocol</key><string>bellsales</string></dict>' \
+    2>/dev/null || { warn "Chrome のディープリンク許可を設定できません。実機検証で確認画面が出ます"; return 0; }
+  ok "Chrome ディープリンク許可"
+}
+
 install_grok_build() {
   local installer logical="$HOME/.grok/bin/grok"
   if grok_build_executable >/dev/null; then
@@ -1127,6 +1289,22 @@ install_cli_tools() {
   if ! command -v gh >/dev/null 2>&1; then
     isolated_network_command "$(command -v brew)" install gh
   fi
+  # Cloud Logging コネクタ(zerokun/cloud-logging-broker.ts)は host の gcloud を
+  # 実行する。入っていないと、ジョブ側は接続が「提供されていない」ように見え、
+  # 実行時証拠を取れないまま毎回ブロックで終わる(2026-09-28 に実機で発生)。
+  # broker が探すのは /opt/homebrew/bin/gcloud 等の固定パスなので、cask で入れる。
+  # 取得に失敗しても bootstrap 全体は止めない。gcloud が無くても Zeroちゃん本体は
+  # 動き、欠けるのは Cloud Logging の読み取りだけ。ここで fail にすると、
+  # 付随機能のために導入そのものが完了しなくなる。
+  if ! command -v gcloud >/dev/null 2>&1; then
+    isolated_network_command "$(command -v brew)" install --cask gcloud-cli \
+      || warn "gcloud を導入できません。Cloud Logging コネクタは使えません"
+  fi
+  # どちらも欠けても Zeroちゃん本体は動く。実音声E2Eと、実機検証で許可を
+  # 1回で済ませる機能だけが落ちるので、失敗しても bootstrap は止めない。
+  install_voicevox_engine
+  install_verification_signing_identity
+  install_chrome_app_launch_policy
   herdr_compatible || install_herdr_standalone
   hash -r
   herdr_compatible \
@@ -1162,6 +1340,10 @@ export PATH="$BUN_INSTALL/bin:$PATH"'
   for required in git tmux herdr gh bun; do
     command -v "$required" >/dev/null 2>&1 || fail "$required の導入を確認できません"
   done
+  # gcloud は未認証でも導入だけは確認する。認証は人が 1 回 `gcloud auth login`
+  # する必要があり、bootstrap では完了させられない。
+  command -v gcloud >/dev/null 2>&1 \
+    || warn "gcloud を確認できません。Cloud Logging コネクタは使えません"
   secure_standalone_codex >/dev/null \
     || fail "Codex公式standaloneの安全性を確認できませんでした"
   grok_build_executable >/dev/null \
