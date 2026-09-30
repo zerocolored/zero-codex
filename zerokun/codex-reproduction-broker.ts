@@ -73,11 +73,17 @@ export async function reproductionCommand(context: ReproductionContext, cwd: str
 
 export class CodexReproductions {
   private controller = new AbortController()
-  private pending = new Set<Promise<void>>()
+  private pending = new Map<string, Promise<void>>()
+  private failedRuns = new Map<string, unknown>()
   private closed = false
   private containmentFailure: Error | undefined
   private transportFailure: unknown
-  constructor(readonly context: ReproductionContext, private command = reproductionCommand, private run: Runner = runBounded) {}
+  constructor(
+    readonly context: ReproductionContext,
+    private command = reproductionCommand,
+    private run: Runner = runBounded,
+    private lock = { acquire: tryAcquireProcessLock, release: releaseProcessLock },
+  ) {}
   private containmentGuard(): string {
     const root = ensureManagedDirectory(this.context.stateDir, join(this.context.stateDir, 'reproductions', this.context.job.id))
     // One outer executor fingerprint spans MCP reconnects. A fresh fingerprint
@@ -90,18 +96,42 @@ export class CodexReproductions {
     return ensureManagedDirectory(this.context.stateDir, join(this.context.stateDir, 'reproductions', this.context.job.id, id))
   }
   poll(id: string): RunResult {
+    if (this.containmentFailure) throw this.containmentFailure
+    if (this.failedRuns.has(id)) throw this.failedRuns.get(id)
     const value = readOptionalBoundedOwnerOnlyRegularFile(join(this.directory(id), 'result.json'), 16_384)
     if (!value) throw new Error('reproduction has not started')
     return JSON.parse(value) as RunResult
+  }
+  /** A bounded RPC wait never sets a deadline on the owned execution. */
+  async waitForResult(id: string, waitMs = 20_000, signal?: AbortSignal): Promise<RunResult> {
+    const current = this.poll(id)
+    if (current.status !== 'running' || signal?.aborted) return current
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let cancelled!: () => void
+    const abort = new Promise<void>(resolve => { cancelled = resolve })
+    signal?.addEventListener('abort', cancelled, { once: true })
+    if (signal?.aborted) cancelled()
+    try {
+      await Promise.race([
+        new Promise<void>(resolve => { timer = setTimeout(resolve, waitMs) }),
+        ...(this.pending.has(id) ? [this.pending.get(id)!.catch(() => {})] : []),
+        abort,
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      signal?.removeEventListener('abort', cancelled)
+    }
+    return this.poll(id)
   }
   start(requestPath: string, workspace: string): RunResult {
     if (this.containmentFailure) throw this.containmentFailure
     if (readOptionalBoundedOwnerOnlyRegularFile(this.containmentGuard(), 1024)) throw new AdvisorOwnedProcessStillLiveError('This executor attempt requires host containment before another execution')
     if (this.closed) throw new Error('reproduction broker is closing')
     const request = reproductionRequest(this.context, requestPath, workspace)
+    if (this.pending.has(request.id)) return this.poll(request.id)
     const directory = this.directory(request.id), journal = join(directory, 'result.json')
     const lockPath = join(directory, 'process.lock')
-    const lease = tryAcquireProcessLock(lockPath)
+    const lease = this.lock.acquire(lockPath)
     if (!lease.acquired) return this.poll(request.id)
     try {
     const existing = readOptionalBoundedOwnerOnlyRegularFile(journal, 16_384)
@@ -112,7 +142,7 @@ export class CodexReproductions {
         prior.status = 'interrupted'; prior.reason = 'The previous execution was interrupted; its files are retained.'
         atomicWritePrivateFile(journal, JSON.stringify(prior))
       }
-      releaseProcessLock(lockPath, lease.lease)
+      this.lock.release(lockPath, lease.lease)
       return prior
     }
     const output = ensureManagedDirectory(this.context.stateDir, join(this.context.liveInputDir, 'codex-reproduction', request.id))
@@ -125,7 +155,7 @@ export class CodexReproductions {
         const hostFinalPath = join(directory, 'final.txt')
         const { argv, environment } = await this.command(this.context, request.cwd, hostFinalPath, this.controller.signal)
         const ran = await this.run(argv, { cwd: request.cwd, env: environment, stdin: request.bytes,
-          timeoutMs: 60 * 60_000, signal: this.controller.signal })
+          signal: this.controller.signal })
         result.exitCode = ran.exitCode; result.eventBytes = Buffer.byteLength(ran.stdout)
         result.diagnosticsTruncated = ran.outputTruncated
         // Private diagnostics are not copied into model-readable artifacts.
@@ -138,8 +168,7 @@ export class CodexReproductions {
         })
         result.status = this.controller.signal.aborted ? 'interrupted'
           : ran.exitCode === 0 && !ran.timedOut && !ran.forcedCleanup && started && final?.length ? 'completed' : 'failed'
-        if (result.status !== 'completed') result.reason = ran.timedOut ? 'Execution deadline reached; outputs retained.'
-          : 'Independent execution did not complete; do not claim a verified comparison.'
+        if (result.status !== 'completed') result.reason = 'Independent execution or output collection did not complete; outputs retained. Do not claim a verified comparison.'
       } catch (error) {
         if (error instanceof AdvisorOwnedProcessStillLiveError || error instanceof CodexOwnedProcessStillLiveError) {
           this.containmentFailure = new AdvisorOwnedProcessStillLiveError('Owned processes remain live; host containment required'); this.controller.abort(); this.closed = true
@@ -157,15 +186,15 @@ export class CodexReproductions {
         try {
           atomicWritePrivateFile(journal, JSON.stringify(result))
           atomicWritePrivateFile(result.receiptPath, JSON.stringify({ ...result, comparisonVerified: false }))
-        } finally { if (!this.containmentFailure) releaseProcessLock(lockPath, lease.lease) }
+        } finally { if (!this.containmentFailure) this.lock.release(lockPath, lease.lease) }
       }
-    })().catch(error => { this.transportFailure = error; throw error })
-    this.pending.add(work)
-    void work.finally(() => this.pending.delete(work)).catch(() => {})
+    })().catch(error => { this.transportFailure = error; this.failedRuns.set(request.id, error); throw error })
+    this.pending.set(request.id, work)
+    void work.finally(() => this.pending.delete(request.id)).catch(() => {})
     return { ...result }
-    } catch (error) { releaseProcessLock(lockPath, lease.lease); throw error }
+    } catch (error) { this.lock.release(lockPath, lease.lease); throw error }
   }
-  async settled() { await Promise.allSettled([...this.pending]); if (this.containmentFailure) throw this.containmentFailure; if (this.transportFailure) throw this.transportFailure }
+  async settled() { await Promise.allSettled([...this.pending.values()]); if (this.containmentFailure) throw this.containmentFailure; if (this.transportFailure) throw this.transportFailure }
   async close() {
     this.closed = true; this.controller.abort()
     await this.settled()
@@ -190,19 +219,24 @@ export function readReproductionContext(path: string, stateInput: string): Repro
   return context
 }
 
+export function createReproductionServer(runs: CodexReproductions): McpServer {
+  const server = new McpServer({ name: 'zerochan-codex-reproduction', version: '1.0.0' })
+  const reply = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }] })
+  server.registerTool('codex_reproduction_start', {
+    description: 'Execute the user-requested independent Codex exec reproduction with the exact UTF-8 prompt file via stdin. Workspace must be inside current job scratch. Repository and retained inputs are read-only; write outputs in workspace. No host argv/config/env accepted. Start returns immediately. Poll the same id until terminal; running is not a failure or a reason to stop. There is no total execution deadline. Completed means execution only, not similarity validation. Never use as an additional advisor.',
+    inputSchema: { requestPath: z.string().max(4096), workspace: z.string().max(4096) },
+  }, async args => { try { return reply(runs.start(args.requestPath, args.workspace)) } catch (error) { if (error instanceof AdvisorOwnedProcessStillLiveError) return { ...reply({ status: 'containment_failed', reason: 'Owned process cleanup failed. Stop this execution and preserve host records.' }), isError: true }; return { ...reply({ status: 'rejected', reason: 'Use a nonsecret prompt and workspace owned by this job.' }), isError: true } } })
+  server.registerTool('codex_reproduction_poll', { description: 'Wait up to 20 seconds for the same execution and return its status, without restarting or stopping it. Repeat while running; no total execution deadline.', inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } },
+    async (args, extra) => { try { return reply(await runs.waitForResult(args.id, 20_000, extra.signal)) } catch (error) { if (error instanceof AdvisorOwnedProcessStillLiveError) return { ...reply({ status: 'containment_failed', reason: 'Owned process cleanup failed. Stop this execution and preserve host records.' }), isError: true }; return { ...reply({ status: 'unavailable', reason: 'Execution state could not be verified; preserve host records and do not start another execution.' }), isError: true } } })
+  return server
+}
+
 async function main() {
   const [path, state] = process.argv.slice(2)
   if (!path || !state || process.argv.length !== 4) throw new Error('invalid reproduction invocation')
   const context = readReproductionContext(path, state)
   const runs = new CodexReproductions(context)
-  const server = new McpServer({ name: 'zerochan-codex-reproduction', version: '1.0.0' })
-  const reply = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }] })
-  server.registerTool('codex_reproduction_start', {
-    description: 'Execute the user-requested independent Codex exec reproduction with the exact UTF-8 prompt file via stdin. Workspace must be inside current job scratch. Repository and retained inputs are read-only; write outputs in workspace. No host argv/config/env accepted. Poll the returned id; completed means execution only, not similarity validation. Never use as an additional advisor.',
-    inputSchema: { requestPath: z.string().max(4096), workspace: z.string().max(4096) },
-  }, async args => { try { const started = runs.start(args.requestPath, args.workspace); await runs.settled(); return reply(runs.poll(started.id)) } catch (error) { if (error instanceof AdvisorOwnedProcessStillLiveError) return { ...reply({ status: 'containment_failed', reason: 'Owned process cleanup failed. Stop this execution and preserve host records.' }), isError: true }; return { ...reply({ status: 'rejected', reason: 'Use a nonsecret prompt and workspace owned by this job.' }), isError: true } } })
-  server.registerTool('codex_reproduction_poll', { description: 'Read the same independent execution, without restarting it.', inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } },
-    async args => { try { return reply(runs.poll(args.id)) } catch { return { ...reply({ status: 'unavailable' }), isError: true } } })
+  const server = createReproductionServer(runs)
   let stopping = false
   const close = async () => { if (stopping) return; stopping = true; clearInterval(cancelCheck); try { await runs.close() } catch { process.exitCode = 1; process.stderr.write('Codex reproduction owned process cleanup failed\n') } finally { await server.close() } }
   const db = new Database(resolveZeroJobDatabasePath(state), { readonly: true })
