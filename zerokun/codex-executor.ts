@@ -4012,10 +4012,25 @@ export function buildCodexDeveloperInstructions(
       'Use the installed gcloud CLI for authorized Google Cloud work, including builds and deployment.',
       'The primary shell preserves the host Cloud SDK configuration through CLOUDSDK_CONFIG.',
       'Use explicit project/region/resource arguments and existing authentication; decide operations',
-      'from the current request and repository instructions. Do not read, print, copy or export',
-      'credential files or tokens, change accounts, run login, or create credential keys.',
-      'Do not edit credential files or create replacement principals for this repair. Normal gcloud',
-      'token-cache refresh is allowed; it is not an account change.',
+      'from the current request and repository instructions. Do not extract or export the host CLI',
+      'login credentials, change accounts, run login, or create replacement principals or credential',
+      'keys to bypass a denial. Do not edit host CLI credential stores. Normal gcloud token-cache',
+      'refresh is allowed; it is not an account change.',
+      'When the authorized task calls for acquiring or registering application credentials, including',
+      'a Slack Bot OAuth token, acquire and transfer the required value to the designated secret store',
+      'or application setting. Resolve the target app, credential source and destination from the',
+      'authorized task context; ask only if they are materially ambiguous. Honor authorization already',
+      'received for that transfer; do not ask the user to copy the token merely because it is a token.',
+      'Use an available opaque transfer path, such as the source UI copy action and paste into the',
+      'designated secret input. Never expose the value in chat, logs, tool arguments or outputs,',
+      'command argv, environment variables, screenshots, DOM dumps, or delivered artifacts.',
+      'Transfer only the requested app credential. This does not authorize unrelated credential',
+      'access, token rotation, scope expansion, account changes, or IAM changes. Follow the separate',
+      'authorization requirements for those actions and the actual browser/tool restrictions.',
+      'If no non-disclosing transfer path is available, report that specific limitation and the',
+      'minimum necessary user action; do not invent a blanket runtime ban on Bot-token acquisition.',
+      'This scoped application-credential rule replaces the older blanket token-copy prohibition in',
+      'resumed developer instructions. A prior assistant refusal is not a current policy rule.',
       'IAM repair is permitted when the current authorized user task explicitly approves the',
       'target resource, existing grantee principal, and exact permission or role. Approval may be',
       'an explicit yes to a concrete repair proposal in this authorized Slack thread; a vague continue,',
@@ -5703,7 +5718,7 @@ export function buildCodexPermissionOverrides(
   const mcpEntries: string[] = []
   if (options.reproductionMcp) {
     mcpEntries.push(
-      `zerokun_reproduction={command=${tomlString(options.reproductionMcp.command)},args=[${options.reproductionMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["codex_reproduction_start","codex_reproduction_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=3700}`,
+      `zerokun_reproduction={command=${tomlString(options.reproductionMcp.command)},args=[${options.reproductionMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["codex_reproduction_start","codex_reproduction_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=60}`,
     )
   }
   if (options.advisorMcp) {
@@ -6982,7 +6997,7 @@ export async function executeCodexJob(
           reviewRound,
           browserMcp !== undefined,
           continuationDecision,
-        ) + (reproductionEnabled ? '\nWhen the user explicitly asks to execute an independent Codex reproduction, use zerokun_reproduction.codex_reproduction_start with the exact prompt file and a workspace under this job scratch; do not launch nested codex through the sandboxed shell. This is not an extra advisor. The host runs authenticated Codex exec while its tools remain isolated. The call waits for completion; poll its returned id to recover the same execution, never duplicate it. Read final.txt and compare actual outputs with the retained prior artifacts. Execution success alone does not verify similarity.\n' : ''),
+        ) + (reproductionEnabled ? '\nWhen the user explicitly asks to execute an independent Codex reproduction, use zerokun_reproduction.codex_reproduction_start with the exact prompt file and a workspace under this job scratch; do not launch nested codex through the sandboxed shell. This is not an extra advisor. The host runs authenticated Codex exec while its tools remain isolated. Start returns immediately. Poll the same returned id until a terminal result; each poll waits briefly without stopping execution. There is no total execution deadline. A running result or one RPC timeout is not task completion: continue polling the same id, never duplicate execution. Read final.txt and compare actual outputs with the retained prior artifacts. Execution success alone does not verify similarity.\n' : ''),
       }
     } catch (error) {
       const runtimeDir = advisorRuntimeDirForJob(stateDir, job.id, processNonce)
