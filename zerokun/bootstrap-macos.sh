@@ -1190,7 +1190,7 @@ verify_logins() {
   claude_subscription_ready \
     || fail "Claude Codeはsubscription login済みである必要があります。Herdrで先にloginしてください。Zeroちゃんは認証操作を行いません"
   gh auth status --hostname github.com >/dev/null 2>&1 \
-    || fail "GitHub CLIが未ログインです。先にgh auth login --hostname github.com --git-protocol https --webを完了してください。Zeroちゃんは認証操作を行いません"
+    || fail "GitHub CLIが未ログインです。先にgh auth login --hostname github.com --git-protocol https --web --scopes workflowを完了してください。Zeroちゃんは認証操作を行いません"
   ok "Codex / Grok CLI / Claude Code / GitHub CLIは事前ログイン済みです"
 }
 
