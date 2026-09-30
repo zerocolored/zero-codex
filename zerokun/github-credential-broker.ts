@@ -613,10 +613,10 @@ export function registerGitHubCredentialTools(
   })
 
   server.registerTool('github_pull_request', {
-    description: 'Create, approve, or merge a pull request in a repository belonging to the current project. Codex chooses the action; the broker only supplies authenticated, repository-scoped transport and checks the exact head SHA.',
+    description: 'Create, describe, approve, or merge a pull request in a repository belonging to the current project. "describe" replaces the body of an existing pull request. Codex chooses the action; the broker only supplies authenticated, repository-scoped transport and checks the exact head SHA.',
     inputSchema: {
       repository: z.string().max(256),
-      action: z.enum(['create', 'approve', 'merge']),
+      action: z.enum(['create', 'describe', 'approve', 'merge']),
       pullRequestNumber: z.number().int().positive().optional(),
       expectedHeadSha: z.string().regex(SHA),
       baseBranch: z.string().min(1).max(255).optional(),
@@ -682,6 +682,23 @@ export function registerGitHubCredentialTools(
         commands, input.repository, input.pullRequestNumber, extra.signal,
       )
       assertExpectedHead(view, expected)
+      // 本文を書き直す手段が無いと、作った後に分かったことを本文へ反映できず、
+      // 「本文を貼り替えてください」と人へ頼んで止まる(2026-09-30 実測)。
+      if (input.action === 'describe') {
+        if (input.body === undefined) throw new Error('pull request body is required')
+        if (containsCredentialMaterial(input.body)) {
+          throw new Error('pull request text is invalid or contains protected material')
+        }
+        const described = await commands.runGh([
+          'pr', 'edit', String(view.number), '--repo', input.repository, '--body-file', '-',
+        ], input.body, extra.signal)
+        if (described.exitCode !== 0) commandFailure(described, 'GitHub pull request description')
+        // 書けたことを GitHub 側から読み直して確かめる。書き込みの戻り値だけを
+        // 根拠にすると、反映されていないまま完了と報告してしまう。
+        view = await readPullRequest(commands, input.repository, view.number, extra.signal)
+        assertExpectedHead(view, expected)
+        return toolText({ complete: true, action: input.action, pullRequest: view })
+      }
       if (input.action === 'approve') {
         if (view.state !== 'OPEN') throw new Error('only an open pull request can be approved')
         if (!await approvalExists(
