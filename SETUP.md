@@ -123,6 +123,18 @@ Primary Codexのmodelは`gpt-6-astra`、reasoning effortは`low`としてrelease
 利用者のCodex設定、shell環境、state内`.env`を揃える必要はなく、どのMacでも同じ値で起動します。
 Grok、Claude、review用Codexの選択には`AGENTS.md`のadvisor契約が別途適用されます。
 
+GUI初期設計では、primary Codexが`advisor_round`の`uiProposal`へ比較する画面状態と
+Beforeの情報を渡し、Claude Fable 5.1がUIデザイン・frontend-only sample・After PNGを作成します。
+hostがrepositoryとagent設定の外にinput／prototype／evidence／runtimeを作り、
+この初期設計だけにsample作成と導入済みbrowserによるloopback previewを許可します。
+通常の調査・最終レビューはread-onlyのままです。
+
+Afterはhostがdecode・再encodeしてjob outboxへ保存し、advisor結果の`claude.uiArtifacts`に
+生成者、sampleの場所、画像の場所とdigestを返します。primaryは画像の内容と比較条件を確認し、
+既存のBefore／After添付・ユーザー承認へ進みます。製品への実装はその承認後です。
+Fableや撮影環境が利用不能な場合は理由と生成者を明記し、適用されるAGENTSのfallbackに従います。
+試作rootは判断まで保持し、作業終了時に記録したdevice／inodeとowned processの終了を確認して片付けます。
+
 次の本人操作や情報指定だけは、必要な場合にユーザーへ依頼します。Slack App作成そのものは含みません。
 
 1. macOSのCommand Line Toolsなどのinstall dialog

@@ -62,6 +62,7 @@ const EPHEMERAL_CLAUDE_STAGED_REQUEST_FILES = new Set(
 const EPHEMERAL_CLAUDE_REQUEST_FILES = new Set([
   'instruction.md',
   'answer.md',
+  'ui-artifacts.json',
   'prompt',
   'protected-snapshot.json',
   EPHEMERAL_CLAUDE_INTENT,
@@ -911,7 +912,7 @@ export function discardUnopenedEphemeralClaudeRequestDirectory(
   // workspace creation might have begun. Never infer "unsent" from a journal
   // when the local lifecycle records say otherwise.
   for (const name of readdirSync(request)) {
-    if (!['prompt', 'answer.md', 'protected-snapshot.json', '.protected-snapshot.json.pending'].includes(name)) {
+    if (!['prompt', 'answer.md', 'ui-artifacts.json', 'protected-snapshot.json', '.protected-snapshot.json.pending'].includes(name)) {
       throw new EphemeralClaudeCleanupPendingError('ephemeral Claude request may have begun opening')
     }
   }
