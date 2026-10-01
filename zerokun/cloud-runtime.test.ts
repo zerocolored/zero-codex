@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync,
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { JobStore, publicJobFailureSummary } from './job-runner.ts'
-import { CloudRuntime, CLOUD_PREPARATION_FAILURE_MESSAGES } from './cloud-runtime.ts'
+import { CloudRuntime, CLOUD_PREPARATION_FAILURE_MESSAGES, continuationCheckpointBase } from './cloud-runtime.ts'
 import { CloudHandoffClient, CloudHandoffError, digestBytes, type CloudHandoff } from './cloud-handoff.ts'
 import { writeCheckpoint } from './handoff-coordinator.ts'
 import { resolveProjectLayout } from './project-layout.ts'
@@ -266,7 +266,7 @@ class MemberClient extends CloudHandoffClient {
   }
 }
 
-test('two independent local workers transfer uncommitted work, attachments and output A -> B -> A', async () => {
+test('follow-up branch in the same managed repository preserves prior work through handoff A -> B -> A', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-runtime-test-')); roots.push(root)
   const source = join(root, 'source'); mkdirSync(source)
   git(source, 'init', '--quiet')
@@ -289,12 +289,44 @@ test('two independent local workers transfer uncommitted work, attachments and o
     storeA.bindCloudHandoff(jobA.id, cloud.h.id, 1, JSON.stringify(cloud.h))
     writeCheckpoint(join(stateA, 'cloud-workspaces', `${cloud.h.id}.json`), Buffer.from(JSON.stringify({ epoch: 1,
       project: projectA, repositories: [{ root: workA, name: 'project', base }] })))
+    // An existing workspace can retain the old generated guidance. Current
+    // developer instructions must replace its branch pin without rewriting it.
+    const oldInstructions = '# Managed continuation workspace\nContinue in these worktrees and branches; do not create, move, delete or edit other worktrees.\n'
+    writeFileSync(join(projectA,'AGENTS.md'),oldInstructions)
     await runtimeA.prepare(jobA)
+    const execution = runtimeA.executionJob(jobA)
+    expect(execution.task).toContain('Branches are not permanently pinned')
+    expect(buildCodexDeveloperInstructions(execution,join(stateA,'artifacts')))
+      .toContain('This replaces the old generated Managed continuation workspace instruction')
+    expect(readFileSync(join(projectA,'AGENTS.md'),'utf8')).toBe(oldInstructions)
+    // Model the repo-policy operation after its original branch was merged:
+    // fetch a newer integration commit and branch in the same physical root.
+    const integration = git(source,'branch','--show-current')
+    writeFileSync(join(source,'upstream.txt'),'new integration change\n')
+    writeFileSync(join(source,'credentials.yml'),'synthetic upstream fixture, no credentials\n')
+    git(source,'add','upstream.txt','credentials.yml');git(source,'commit','--quiet','-m','integration advance')
+    const latest = git(source,'rev-parse','HEAD')
+    git(workA,'fetch',source,`${integration}:refs/remotes/origin/${integration}`)
+    git(workA,'switch','-c','fixture-follow-up','FETCH_HEAD')
+    expect(git(workA,'rev-parse','HEAD')).toBe(latest)
+    expect(git(workA,'rev-parse','fixture-task')).toBe(base)
+    writeFileSync(join(workA,'committed.txt'),'unpublished task commit\n')
+    git(workA,'add','committed.txt');git(workA,'commit','--quiet','-m','task change')
     writeFileSync(join(workA, 'file.txt'), 'staged\n'); git(workA, 'add', 'file.txt')
     writeFileSync(join(workA, 'file.txt'), 'unstaged-A\n')
     writeFileSync(join(workA, 'new.txt'), 'untracked-A\n')
+    await runtimeA.prepare(jobA)
+    expect(runtimeA.executionJob(jobA).repoPath).toBe(realpathSync(workA))
+    expect(git(workA,'branch','--show-current')).toBe('fixture-follow-up')
+    expect(git(workA,'show',':file.txt')).toBe('staged')
+    expect(readFileSync(join(workA,'file.txt'),'utf8')).toBe('unstaged-A\n')
     storeA.recordCloudContext(jobA.id, 'A-output', 'A investigated the cause; implementation is in progress.')
     await Promise.all([runtimeA.pause(jobA, undefined), runtimeA.pause(jobA, undefined)])
+    const packet = JSON.parse(Buffer.from(cloud.bytes).toString())
+    expect(packet.repositories[0].base).toBe(latest)
+    expect(packet.repositories[0].staged).not.toContain('upstream.txt')
+    expect(packet.repositories[0].staged).not.toContain('credentials.yml')
+    expect(packet.repositories[0].staged).toContain('committed.txt')
     expect(cloud.publications).toBe(1)
     expect(storeA.countClaimable(Date.now() + 999999999)).toBe(0)
     const request = { channel: 'C1', thread: '1.0', message: '2.0', user: 'USER', bot: 'UB',
@@ -322,6 +354,10 @@ test('two independent local workers transfer uncommitted work, attachments and o
     expect(readFileSync(join(workB, 'file.txt'), 'utf8')).toBe('unstaged-A\n')
     expect(git(workB, 'show', ':file.txt')).toBe('staged')
     expect(readFileSync(join(workB, 'new.txt'), 'utf8')).toBe('untracked-A\n')
+    expect(readFileSync(join(workB,'upstream.txt'),'utf8')).toBe('new integration change\n')
+    expect(readFileSync(join(workB,'committed.txt'),'utf8')).toBe('unpublished task commit\n')
+    expect(git(workB,'diff','--cached','--name-only')).not.toContain('upstream.txt')
+    expect(git(workB,'diff','--cached','--name-only')).not.toContain('credentials.yml')
     expect(readFileSync(jobB.attachments[0]!, 'utf8')).toBe('original attachment')
     expect(readFileSync(executionB.attachments.find(p => p.endsWith('/HANDOFF.md'))!, 'utf8')).toContain('A investigated')
     expect(git(workB, 'branch', '--show-current')).toContain('handoff-2')
@@ -334,10 +370,39 @@ test('two independent local workers transfer uncommitted work, attachments and o
     expect(executionA.repoPath).not.toBe(projectA)
     expect(readFileSync(join(executionA.repoPath, 'file.txt'), 'utf8')).toBe('continued-B\n')
     expect(readFileSync(join(workA, 'file.txt'), 'utf8')).toBe('unstaged-A\n')
+    expect(git(workA,'rev-parse','fixture-task')).toBe(base)
     const contextA = executionA.attachments.find(p => p.endsWith('/HANDOFF.md'))!
     expect(readFileSync(contextA, 'utf8')).toContain('B continued')
     expect(readFileSync(contextA, 'utf8')).toContain('A investigated')
     expect(cloud.h.epoch).toBe(3)
     expect(storeA.cloudHandoff(jobA.id)?.state).toBe('transferred')
   } finally { storeA.close(); storeB.close() }
+})
+
+test('checkpoint base never advances beyond incorporated origin history or drops unpublished work', () => {
+  const root = mkdtempSync(join(tmpdir(),'cloud-checkpoint-base-')); roots.push(root)
+  git(root,'init','--quiet')
+  writeFileSync(join(root,'base.txt'),'base');git(root,'add','.');git(root,'commit','--quiet','-m','base')
+  const base = git(root,'rev-parse','HEAD')
+  expect(continuationCheckpointBase(root,base,'main')).toBe(base)
+  git(root,'update-ref','refs/remotes/origin/main',base)
+  git(root,'switch','-c','task')
+  writeFileSync(join(root,'task.txt'),'task');git(root,'add','.');git(root,'commit','--quiet','-m','task')
+  const taskHead = git(root,'rev-parse','HEAD')
+  git(root,'switch','-c','integration',base)
+  writeFileSync(join(root,'upstream.txt'),'upstream');git(root,'add','.');git(root,'commit','--quiet','-m','upstream')
+  const latest = git(root,'rev-parse','HEAD')
+  git(root,'update-ref','refs/remotes/origin/main',latest)
+  git(root,'switch','task')
+  expect(continuationCheckpointBase(root,base,'main')).toBe(base)
+  git(root,'merge','--no-edit','integration')
+  expect(continuationCheckpointBase(root,base,'main')).toBe(latest)
+  expect(git(root,'rev-parse','task~1')).toBe(taskHead)
+  writeFileSync(join(root,'task.txt'),'dirty')
+  const status = git(root,'status','--porcelain')
+  expect(continuationCheckpointBase(root,base,'main')).toBe(latest)
+  expect(git(root,'status','--porcelain')).toBe(status)
+  // An unrelated origin history must not become the base of this task.
+  git(root,'update-ref','refs/remotes/origin/main',base)
+  expect(continuationCheckpointBase(root,latest,'main')).toBe(latest)
 })

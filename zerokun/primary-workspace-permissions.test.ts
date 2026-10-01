@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { dirname, join } from 'path'
-import { buildCodexChildEnvironment, buildCodexPermissionOverrides } from './codex-executor.ts'
+import { buildCodexChildEnvironment, buildCodexDeveloperInstructions, buildCodexPermissionOverrides } from './codex-executor.ts'
 import { prepareManagedStateRoot, ensureManagedDirectory } from './managed-path.ts'
 import type { JobRecord } from './job-runner.ts'
 import { registerSlackApp } from './slack-app-registry.ts'
@@ -42,6 +42,56 @@ test('primary uses ordinary host reads without granting arbitrary host writes; r
     expect(review[f.state]).toBe('deny')
     expect(review[realpathSync(tmpdir())]).toBe('deny')
   } finally { rmSync(f.root, {recursive:true,force:true}) }
+})
+
+test('product integration retains direct Slack network restrictions and private host authentication', () => {
+  const f = fixture()
+  try {
+    const parse = (job = f.job, write = true, browser = true) => (Bun.TOML.parse(buildCodexPermissionOverrides(job, {
+      stateDir:f.state,scratchDir:f.scratch,artifactDir:f.out,profile:'zero_integration',
+      executionWriteEnabled:write,browserAccessEnabled:browser,
+    }).join('\n')) as any).permissions.zero_integration
+    expect(parse().network.domains['*']).toBe('allow')
+    for (const domain of ['slack.com','**.slack.com','slack-edge.com','**.slack-edge.com','slack-msgs.com','**.slack-msgs.com']) {
+      expect(parse().network.domains[domain]).toBe('deny')
+    }
+    expect(parse().filesystem[f.state]).toBe('deny')
+    expect(parse().filesystem[join(realpathSync(homedir()),'.claude/channels/slack')]).toBe('deny')
+    expect(parse(f.job,false).network.domains['slack.com']).toBe('deny')
+    expect(parse({...f.job,writeEnabled:false},false).network.domains['slack.com']).toBe('deny')
+    expect(parse({...f.job,writeEnabled:false},false,false).network.enabled).toBe(false)
+    const env = buildCodexChildEnvironment({SLACK_BOT_TOKEN:'xoxb-fixture',SLACK_APP_TOKEN:'xapp-fixture',PATH:'/usr/bin'})
+    expect(env.SLACK_BOT_TOKEN).toBeUndefined()
+    expect(env.SLACK_APP_TOKEN).toBeUndefined()
+  } finally {rmSync(f.root,{recursive:true,force:true})}
+})
+
+test('integration authorization distinguishes product tests, host delivery and missing evidence', () => {
+  const f = fixture()
+  try {
+    expect(Bun.spawnSync(['git','init','-q',f.repo]).exitCode).toBe(0)
+    const write = buildCodexDeveloperInstructions(f.job,f.out)
+    const read = buildCodexDeveloperInstructions({...f.job,writeEnabled:false},f.out)
+    for (const instructions of [write,read]) {
+      expect(instructions).toContain('Never deliver this assistant\'s replies, progress, or completion notifications')
+      expect(instructions).toContain('Never obtain or reuse the host assistant\'s Slack credentials')
+      expect(instructions).not.toContain('Never post to Slack yourself')
+    }
+    expect(write).toContain('explicit authorization for the sending app, destination,')
+    expect(write).toContain('generic continue alone is not send authorization')
+    expect(write).toContain('Honor an explicit approval already received')
+    expect(write).toContain('before retrying an uncertain send')
+    expect(write).toContain('Do not construct direct Slack API')
+    expect(write).toContain('Existing Slack network restrictions')
+    expect(write).toContain('recipient access nor automatic Bot-to-Bot admission')
+    expect(write).toContain('An empty audit registry proves only that no evidence is registered there')
+    expect(write).toContain('do not prescribe a different environment without an observed requirement')
+    expect(write).toContain('A blocked integration check does not block independent authorized implementation')
+    expect(write).toContain('This replaces the old generated Managed continuation workspace instruction')
+    expect(read).not.toContain('A user-authorized product integration test may send Slack messages')
+    expect(read).not.toContain('create a new task branch')
+    expect(read).toContain('Do not edit files, Git, settings, external services, or data')
+  } finally {rmSync(f.root,{recursive:true,force:true})}
 })
 
 test('a custom CODEX_HOME does not expose the default Codex private directory', () => {

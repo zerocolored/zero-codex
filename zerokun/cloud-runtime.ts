@@ -9,7 +9,10 @@ import { ensureWorkspacePin, resolveProjectLayout } from './project-layout.ts'
 import type { JobRecord, JobStore } from './job-runner.ts'
 import { localRepositoryIdentity, provisionLocalWorkspaceSettings } from './local-workspace-settings.ts'
 
-type Workspace = { epoch: number; project: string; repositories: Array<{ root: string; name: string; base: string }> }
+type IntegrationBranch = 'develop' | 'main' | 'master'
+type Workspace = { epoch: number; project: string; repositories: Array<{
+  root: string; name: string; base: string; integrationBranch?: IntegrationBranch
+}> }
 export type CloudControl = { channel: string; thread: string; message: string; user: string;
   bot: string; project: string; writeEnabled: boolean; action: 'handoff' | 'continue' }
 export const CLOUD_PREPARATION_FAILURE_MESSAGES = {
@@ -17,7 +20,7 @@ export const CLOUD_PREPARATION_FAILURE_MESSAGES = {
   noOrigin: '対象リポジトリに origin が設定されていないため開始できません。接続先を設定した後、このスレッドで再度依頼してください。',
   noBranch: '接続先に develop・main・master のいずれの統合ブランチもないため開始できません。リポジトリ設定を確認してください。',
 } as const
-const CONTINUATION_INSTRUCTIONS = '\n\n# Managed continuation workspace\nThis task already has dedicated worktrees prepared from fetched integration commits. Continue in these worktrees and branches; do not create, move, delete or edit other worktrees. Preserve uncommitted work for handoff. Do not commit cloud credentials or host state.\n'
+const CONTINUATION_INSTRUCTIONS = '\n\n# Managed continuation workspace\nThis task already has dedicated repositories prepared from fetched integration commits. Keep these physical repository roots; do not create, move, delete or edit other worktrees. Branches are not permanently pinned: after verifying that a task branch was merged, follow repository policy and create a new task branch from the freshly fetched integration commit in the same repository for authorized follow-up work. Preserve prior commits and uncommitted work for handoff; never reset, automatically stash or force-push to change branches. This replaces older generated instructions requiring continuation on the same branches. Do not commit cloud credentials or host state.\n'
 export class CloudPreparationError extends Error {
   constructor(readonly permanent = false, reason?: string) { super(reason ?? (permanent
     ? 'このスレッドの所有状態または作業場所の設定により開始できません。引き継ぎ先への「引き継いで」、元の担当への「続けて」、またはリポジトリ設定を確認してください。'
@@ -28,6 +31,22 @@ function git(root: string, args: string[]): string {
   return execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-C', root, ...args],
     { encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }).trim()
+}
+
+/** Exclude incorporated upstream history, never unpublished task commits.
+ * Use only locally fetched origin refs; no network or working-tree mutation.
+ * Legacy/imported receipts use the same integration preference as preparation.
+ */
+export function continuationCheckpointBase(root: string, base: string, branch?: IntegrationBranch): string {
+  for (const name of branch ? [branch] : ['develop', 'main', 'master']) {
+    try {
+      const candidate = git(root, ['merge-base', 'HEAD', `refs/remotes/origin/${name}`])
+      if (!/^[a-f0-9]{40,64}$/.test(candidate)) continue
+      git(root, ['merge-base', '--is-ancestor', base, candidate])
+      return candidate
+    } catch { /* Missing/diverged refs cannot establish a newer checkpoint base. */ }
+  }
+  return base
 }
 
 /** Cloud use is explicit per installation; merely updating does not upload
@@ -87,7 +106,7 @@ export class CloudRuntime {
       const name = basename(source)
       const root = join(project, name)
       const branches = git(source, ['ls-remote', '--heads', 'origin', 'develop', 'main', 'master'])
-      const branch = ['develop', 'main', 'master'].find(value => branches.includes(`refs/heads/${value}`))
+      const branch = (['develop', 'main', 'master'] as const).find(value => branches.includes(`refs/heads/${value}`))
       if (!branch) throw new CloudPreparationError(true, CLOUD_PREPARATION_FAILURE_MESSAGES.noBranch)
       git(source, ['fetch', 'origin', branch])
       const base = git(source, ['rev-parse', 'FETCH_HEAD'])
@@ -96,7 +115,7 @@ export class CloudRuntime {
       git(source, ['clone', '--no-checkout', '--no-hardlinks', '--', source, root])
       git(root, ['remote', 'set-url', 'origin', git(source, ['remote', 'get-url', 'origin'])])
       git(root, ['switch', '-c', `zerochan/${h.id}/${attempt}/${name}`, base])
-      repositories.push({ root, name, base })
+      repositories.push({ root, name, base, integrationBranch: branch })
     }
     const instructions = layout.rootInstructionPaths.filter(p => basename(p) === 'AGENTS.md')
       .map(p => readFileSync(p, 'utf8')).join('\n\n')
@@ -181,7 +200,8 @@ export class CloudRuntime {
       const history = [inherited, this.store.cloudHistory(job.id)].filter(Boolean).join('\n\n')
       const attachments = [...new Set([...job.attachments, ...(job.threadAttachments ?? []).map(a => a.path)])]
       const packet: HandoffPackage = { version: 1, task: job.task, history,
-        repositories: workspace.repositories.map(r => captureRepository(r.root, r.name, r.base)),
+        repositories: workspace.repositories.map(r => captureRepository(r.root, r.name,
+          continuationCheckpointBase(r.root, r.base, r.integrationBranch))),
         attachments: attachments.map((path, i) => captureAttachment(path.startsWith(`${workspace.project}/`)
           ? workspace.project : this.stateDir, path, `attachments/${i}-${basename(path)}`)),
         notes: ['Continue the same task. Inspect already-applied effects before further actions. Do not replay GitHub, Slack, deployment or database operations blindly.',
