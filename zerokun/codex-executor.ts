@@ -618,11 +618,10 @@ export function mcpIsolationOverridesForConfig(
     if (hasCommand === hasUrl) {
       throw new Error(`Codex effective MCP server ${name} has an ambiguous transport`)
     }
-    if (name === 'node_repl' && projectRoot && overrides.includes('features.computer_use=true')
-      && trustedComputerUsePluginEnabled(config, layers)
+    if (name === 'node_repl' && projectRoot && trustedDesktopRuntimeEnabled(config, overrides, layers)
       && trustedComputerUseNodeTransport(server, layers)) {
-      // Current official Computer Use uses node_repl + @oai/sky. Preserve the
-      // operator's runtime metadata and approval settings, not just its command.
+      // Official Browser and Computer Use share node_repl. Preserve the
+      // operator's service metadata and approval settings, not just its command.
       const installedServer = installedComputerUseNodeServer(projectRoot, server)
       if (installedServer) {
         additions.push(`${tomlString(name)}=${mcpConfigToml(installedServer)}`)
@@ -772,8 +771,7 @@ export function nativeAdvisorHistoryPermissionOverrides(
   return isolated
 }
 
-function trustedComputerUsePluginEnabled(config: Record<string, unknown>, layers: unknown): boolean {
-  const pluginName = 'computer-use@openai-bundled'
+function trustedDesktopPluginEnabled(config: Record<string, unknown>, layers: unknown, pluginName: string): boolean {
   if ((config.plugins as Record<string, { enabled?: boolean }> | undefined)?.[pluginName]?.enabled !== true) return false
   let trusted = false
   for (const layer of Array.isArray(layers) ? layers : []) {
@@ -787,20 +785,37 @@ function trustedComputerUsePluginEnabled(config: Record<string, unknown>, layers
   return trusted
 }
 
-/** Keep native desktop access from enabling unrelated installed plugins. */
+function trustedComputerUsePluginEnabled(config: Record<string, unknown>, layers: unknown): boolean {
+  return trustedDesktopPluginEnabled(config, layers, 'computer-use@openai-bundled')
+}
+
+function desktopPluginAllowed(name: string, overrides: string[]): boolean {
+  if (!overrides.includes('features.plugins=true')) return false
+  if (name === 'computer-use@openai-bundled') return overrides.includes('features.computer_use=true')
+  if (!overrides.includes('features.browser_use=true')) return false
+  if (name === 'chrome@openai-bundled') return overrides.includes('features.browser_use_external=true')
+  return name === 'browser@openai-bundled' && overrides.includes('features.in_app_browser=true')
+}
+
+function trustedDesktopRuntimeEnabled(config: Record<string, unknown>, overrides: string[], layers: unknown): boolean {
+  return ['computer-use@openai-bundled', 'chrome@openai-bundled', 'browser@openai-bundled']
+    .some(name => desktopPluginAllowed(name, overrides) && trustedDesktopPluginEnabled(config, layers, name))
+}
+
+/** Preserve authorized official desktop plugins without enabling unrelated ones. */
 export function computerUsePluginIsolationOverrides(
   config: Record<string, unknown>, overrides: string[], layers?: unknown,
 ): string[] {
-  if (!overrides.includes('features.computer_use=true')) return overrides
+  if (!overrides.includes('features.plugins=true')) return overrides
   const plugins = config.plugins
   if (plugins !== undefined && plugins !== null
     && (typeof plugins !== 'object' || Array.isArray(plugins))) {
     throw new Error('Codex plugin configuration is invalid')
   }
   const configured = (plugins ?? {}) as Record<string, { enabled?: boolean }>
-  const names = new Set([...Object.keys(configured), 'computer-use@openai-bundled'])
+  const names = new Set([...Object.keys(configured), 'computer-use@openai-bundled', 'chrome@openai-bundled', 'browser@openai-bundled'])
   const table = [...names].sort().map(name =>
-    `${tomlString(name)}={enabled=${name === 'computer-use@openai-bundled' && trustedComputerUsePluginEnabled(config, layers)}}`).join(',')
+    `${tomlString(name)}={enabled=${desktopPluginAllowed(name, overrides) && trustedDesktopPluginEnabled(config, layers, name)}}`).join(',')
   return replaceUniqueConfigOverride(overrides, 'plugins', `{${table}}`)
 }
 
@@ -1395,10 +1410,9 @@ function assertEffectiveCodexPermissionSnapshot(
     if (key === 'plugins') {
       const plugins = config.plugins as Record<string, { enabled?: boolean }> | undefined
       const expected = overrideValue(overrides, 'plugins') as Record<string, { enabled: boolean }>
-      if (!plugins || plugins['computer-use@openai-bundled']?.enabled !== expected['computer-use@openai-bundled']?.enabled
-        || Object.entries(plugins).some(([name, value]) =>
-          name !== 'computer-use@openai-bundled' && value?.enabled !== false)) {
-        throw new Error('Codex effective plugins exceed native Computer Use scope')
+      if (!plugins || Object.entries(expected).some(([name, value]) => plugins[name]?.enabled !== value.enabled)
+        || Object.entries(plugins).some(([name, value]) => !Object.hasOwn(expected, name) && value?.enabled !== false)) {
+        throw new Error('Codex effective plugins exceed authorized desktop scope')
       }
       continue
     }
@@ -4357,9 +4371,12 @@ export function buildCodexWorkerPrompt(
     )
     if (host.browserEnabled) {
       control.push(
-        'For the operator’s signed-in Chrome, use go-chrome-mcp when exposed. It is a separate',
-        'connection from the localhost verifier; desktop node_repl is not automatically available',
-        'inside Slack jobs. Begin with tabs_list and use explicit tabId values from its response.',
+        'For the operator’s signed-in Chrome, first follow the installed official Chrome skill',
+        'and use its browser-client through node_repl when available. This is the ChatGPT browser',
+        'extension connection. Preserve its website approvals and any explicit browser selection.',
+        'Go Chrome MCP is a separate extension connection. Use it only when the official Chrome',
+        'capability is unavailable and the applicable browser instructions permit that fallback.',
+        'For Go Chrome MCP, begin with tabs_list and use explicit tabId values from its response.',
         'The Chrome transport waits for its initial connection. Report the actual tool error if',
         'it fails, not an unverified claim that the user must open or log into Chrome again.',
         'Tabs are reserved per job. Use another tab if one is busy, and call release_tab when',
@@ -4379,6 +4396,10 @@ export function buildCodexWorkerPrompt(
         'Read the installed computer-use skill. Current clients use node_repl with @oai/sky;',
         'discover node_repl tools rather than assuming a direct get_app_state MCP tool exists.',
         'Existing per-app approvals still apply.',
+        'This unattended job cannot display an interactive approval dialog. An app approval denial',
+        'must not be reported as a pending dialog. Do not repeatedly retry the same denial or',
+        'ask the user to wait for a prompt that was not emitted. Report the exact failed capability',
+        'and use an already-authorized alternative when the task and browser instructions allow it.',
         'Do not bypass app approval or claim a missing connection without trying the exposed native tool.')
     }
     if (job.githubPublicationRecovery) {
@@ -5723,15 +5744,16 @@ export function buildCodexPermissionOverrides(
     }
     rules.set(realpathSync(verified.path), 'read')
   }
-  if (computerUseEnabled) {
-    // CUA（デスクトップ操作）の node カーネルとプラグイン実行体は、
-    // ChatGPT.app 同梱リソース・OpenSSL 設定・plugin cache を読む。
-    // HOME は deny のままで、必要な subtree だけを read で再許可する。
+  if (primaryWorkspaceAccess && browserAccessEnabled) {
+    // Official Browser and CUA use the installed Node runtime and plugin code.
+    // CODEX_HOME remains denied; reopen only these runtime subtrees for reads.
     for (const cuaPath of [
       '/Applications/ChatGPT.app',
       '/System/Library/OpenSSL',
       join(codexHome || join(home, '.codex'), 'computer-use'),
       join(codexHome || join(home, '.codex'), 'plugins/cache/openai-bundled/computer-use'),
+      join(codexHome || join(home, '.codex'), 'plugins/cache/openai-bundled/chrome'),
+      join(codexHome || join(home, '.codex'), 'plugins/cache/openai-bundled/browser'),
     ]) {
       if (!existsSync(cuaPath)) continue
       const metadata = lstatSync(cuaPath)
@@ -5852,9 +5874,9 @@ export function buildCodexPermissionOverrides(
     'apps._default.open_world_enabled=false',
     'apps._default.destructive_enabled=false',
     'features.apps=false',
-    // CUA（デスクトップ操作）は openai-bundled プラグインが担うため、
-    // computer_use を許可するステージだけプラグインも解錠する。
-    `features.plugins=${computerUseEnabled ? 'true' : 'false'}`,
+    // Retain only operator-enabled official desktop/browser plugins after
+    // discovery; read-only and advisor stages must not unlock desktop plugins.
+    `features.plugins=${primaryWorkspaceAccess && browserAccessEnabled ? 'true' : 'false'}`,
     'features.remote_plugin=false',
     'features.hooks=false',
     `features.goals=${options.taskGoalEnabled === true ? 'true' : 'false'}`,

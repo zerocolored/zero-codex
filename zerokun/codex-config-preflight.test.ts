@@ -192,6 +192,26 @@ async function check(testCase: Parameters<typeof fixture>[0]): Promise<void> {
 }
 
 describe('Codex app-server config preflight', () => {
+  test('official Chrome plugin is accepted only when the isolated config retained it', async () => {
+    const desktopOverrides = [...overrides,
+      'plugins={"chrome@openai-bundled"={enabled=true},"computer-use@openai-bundled"={enabled=false}}',
+    ]
+    const config = Bun.TOML.parse(desktopOverrides.join('\n')) as any
+    const session = {
+      async request(method: string) {
+        return { requestId: 1, result: method === 'configRequirements/read' ? { requirements: null } : { config } }
+      },
+    }
+    await assertCurrentAppServerCodexPermissionConfig(session, '/repo', desktopOverrides, profile)
+    config.plugins['unexpected@local'] = { enabled: true }
+    await expect(assertCurrentAppServerCodexPermissionConfig(session, '/repo', desktopOverrides, profile))
+      .rejects.toThrow('authorized desktop scope')
+    delete config.plugins['unexpected@local']
+    config.plugins['chrome@openai-bundled'].enabled = false
+    await expect(assertCurrentAppServerCodexPermissionConfig(session, '/repo', desktopOverrides, profile))
+      .rejects.toThrow('authorized desktop scope')
+  })
+
   const advisorDefinition = {
     command: '/usr/bin/false', args: [], enabled: true, required: false,
     enabled_tools: ['advisor_round', 'advisor_round_poll'],
