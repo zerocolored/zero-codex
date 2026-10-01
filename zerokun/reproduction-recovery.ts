@@ -42,9 +42,12 @@ function existingDirectory(state: string, path: string): string | undefined {
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
 }
 
-function validatedResult(context: ReproductionContext, source: PriorJob, id: string, directory: string): RunResult {
+function validatedResult(context: ReproductionContext, source: PriorJob, id: string, directory: string): RunResult | undefined {
   const raw = readOptionalBoundedOwnerOnlyRegularFile(join(directory, 'result.json'), 16_384)
-  if (!raw) throw new Error('missing previous execution record')
+  // Older poll implementations created directories in each caller's job even
+  // when the run belonged to an earlier job. An absent journal is not a run;
+  // keep looking for its source. Present but invalid records still fail closed.
+  if (raw === null) return undefined
   const value = JSON.parse(raw) as RunResult
   if (value.id !== id || !['running', 'completed', 'failed', 'interrupted', 'containment_failed'].includes(value.status)
     || typeof value.workspace !== 'string' || !isAbsolute(value.workspace)
@@ -118,6 +121,7 @@ export function recoverPreviousReproduction(context: ReproductionContext, id: st
     const directory = existingDirectory(context.stateDir, join(root, id))
     if (!directory) continue
     const result = validatedResult(context, source, id, directory)
+    if (!result) continue
     const containment = readdirSync(root).some(name => /^containment-[a-f0-9]{64}\.json$/.test(name))
     if (containment || result.status === 'containment_failed') throw new Error('previous execution requires containment')
     const lock = inspectProcessLock(join(directory, 'process.lock'))

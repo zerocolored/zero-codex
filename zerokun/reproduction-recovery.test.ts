@@ -57,6 +57,39 @@ test('same conversation resume recovers stranded running record and partial work
   await f.runs.close()
 })
 
+function legacyPollDirectories(f: ReturnType<typeof fixture>) {
+  // Older brokers created a current-job directory even when merely polling
+  // another job's id. Later resumptions must search past those empty entries.
+  for (const [job, seq] of [['poll-one', 106], ['poll-two', 108]] as const) {
+    f.sql(`INSERT INTO jobs VALUES('${job}',${seq},'chat','thread','/repo','completed')`)
+    f.dir('reproductions', job, f.id)
+  }
+  f.dir('reproductions', 'current', f.id)
+}
+
+test.each(['running', 'completed'])('legacy empty poll directories do not hide the original %s execution', async status => {
+  const f = fixture(status), original = readFileSync(join(f.journal, 'result.json'), 'utf8')
+  legacyPollDirectories(f)
+  const result = f.runs.poll(f.id)
+  expect(result.status).toBe(status === 'running' ? 'interrupted' : 'completed')
+  expect(result.recovery?.sourceJob).toBe(105)
+  expect(result.recovery?.copiedFiles).toBe(2)
+  expect(readFileSync(join(result.workspace, 'output', 'partial.json'), 'utf8')).toBe('{"count":12}')
+  expect(readFileSync(join(f.journal, 'result.json'), 'utf8')).toBe(original)
+  expect(f.starts()).toBe(0)
+  await f.runs.close()
+})
+
+test.each(['empty', 'malformed', 'symlink'])('a present %s record is not skipped as a legacy empty poll directory', kind => {
+  const f = fixture(); legacyPollDirectories(f)
+  const path = join(f.context.stateDir, 'reproductions', 'poll-two', f.id, 'result.json')
+  if (kind === 'symlink') symlinkSync(join(f.journal, 'result.json'), path)
+  else writeFileSync(path, kind === 'empty' ? '' : '{invalid', { mode: 0o600 })
+  expect(() => f.runs.poll(f.id)).toThrow()
+  expect(existsSync(join(f.context.liveInputDir, 'codex-reproduction', f.id))).toBe(false)
+  expect(f.starts()).toBe(0)
+})
+
 test.each([
   "UPDATE jobs SET chat_id='other'", "UPDATE jobs SET thread_ts='other'", "UPDATE jobs SET repo_path='/other'",
   'UPDATE jobs SET seq=110',
@@ -126,6 +159,7 @@ test('recovery excludes runtime, credentials, compiler caches, links, special an
 
 test('MCP poll returns historical recovery instead of the former unavailable response', async () => {
   const f = fixture(), server = createReproductionServer(f.runs)
+  legacyPollDirectories(f)
   const client = new Client({ name: 'resume-test', version: '1' }), [left, right] = InMemoryTransport.createLinkedPair()
   try {
     await server.connect(right); await client.connect(left)
