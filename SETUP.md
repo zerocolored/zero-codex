@@ -69,6 +69,12 @@ dialogで許可します。誤って拒否した場合は`tccutil reset AppleEve
 
 解除時は管理者が今回追加した拡張IDだけをpolicyから取り除きます。他の拡張の登録を消さないでください。
 
+Zeroちゃんのブラウザ操作では、利用者設定で有効な公式ChromeプラグインとChatGPT拡張を優先します。
+Go Chrome MCPは別の拡張で、接続やサイト権限も別です。片方のエラーから、もう片方も利用不能とは判断しません。
+Computer Useのアプリ承認も別に扱います。Slackからの無人実行は承認ダイアログを表示しないため、
+`Computer Use was not approved`が返っても「許可画面が出るまで待つ」とは案内しません。
+失敗した経路と実際のエラーを確認し、既に許可された経路で続行できるかを調べます。
+
 ### go-chrome-mcp
 
 実Chromeを操作するMCP([ernie1358/go-chrome-mcp](https://github.com/ernie1358/go-chrome-mcp))を
