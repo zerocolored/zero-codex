@@ -2,6 +2,61 @@ import { createHash } from 'crypto'
 import { lstatSync, realpathSync } from 'fs'
 import { join } from 'path'
 import { readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
+import { containsCredentialMaterial, normalizePublicGuardText, redactCredentialMaterial } from './public-output-guard.ts'
+
+function decodeCredentialText(value: string): string {
+  let decoded = value
+  for (let round = 0; round < 4 && decoded.includes('%'); round += 1) {
+    const next = normalizePublicGuardText(decoded.replace(/(?:%[0-9a-f]{2})+/gi, run => {
+      try { return decodeURIComponent(run) } catch {
+        return run.replace(/%([0-9a-f]{2})/gi, (_match, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+      }
+    }))
+    if (next === decoded) break
+    decoded = next
+  }
+  return decoded
+}
+
+/** Credential-shaped prose must not discard an otherwise complete review. */
+export function sanitizeClaudeAnswer(response: string): { response: string; redacted: boolean } {
+  const normalized = normalizePublicGuardText(response)
+  const keyHeader = /-----(?:BEGIN|END)[ \t]+(?:[A-Z]+[ \t]+)*PRIVATE[ \t]+KEY-----/i
+  // Decode only credential-bearing lines; unrelated encoded URLs stay intact.
+  let pemPayload = false
+  let sanitized = normalized.split('\n').map(line => {
+    const decoded = decodeCredentialText(line)
+    const isPayload = pemPayload && /^[ \t]*(?:[A-Za-z0-9+/=_.-]+|Proc-Type:.*|DEK-Info:.*)?[ \t\r]*$/i.test(decoded)
+    pemPayload = /-----BEGIN[ \t]+(?:[A-Z]+[ \t]+)*PRIVATE[ \t]+KEY-----/i.test(decoded) || isPayload
+    return isPayload || keyHeader.test(decoded) || containsCredentialMaterial(decoded)
+      || /\bBearer\s+["'`<([{]/i.test(decoded) ? decoded : line
+  }).join('\n')
+  const replacement = '[credential removed]'
+  // Serialized JSON, single-line PEM, and quoted/diff payloads are still keys.
+  // Preserve intervening prose when BEGIN and END are merely cited separately.
+  sanitized = sanitized.replace(/-----BEGIN[ \t]+(?:[A-Z]+[ \t]+)*PRIVATE[ \t]+KEY-----([\s\S]*?)-----END[ \t]+(?:[A-Z]+[ \t]+)*PRIVATE[ \t]+KEY-----/gi,
+    (block, body: string, offset: number, text: string) => {
+      const payload = decodeCredentialText(body).replace(/\\r\\n|\\n|\\r/g, '\n')
+        .replace(/^[ \t]*(?:(?:[>+|]|-(?!-)|\d+:)[ \t]*)+/gm, '')
+        .replace(/^[ \t]*(?:Proc-Type:|DEK-Info:)[^\r\n]*/gim, '')
+        .split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+      const prefix = text.slice(text.lastIndexOf('\n', offset - 1) + 1, offset).trim()
+      const standalone = /^(?:(?:[>+|]|-|\d+:)\s*)*$/.test(prefix)
+      const hasKeyBytes = payload.some(line => /[A-Za-z0-9+/=_.-]{16,}/.test(line))
+      return standalone || hasKeyBytes || payload.every(line => /^[A-Za-z0-9+/=_.-]+$/.test(line))
+        ? replacement : block
+    })
+  // A header mentioned in prose is not an unterminated key extending to EOF.
+  // Consume the header and contiguous PEM payload, including legacy PEM metadata.
+  const privateKey = /-----BEGIN[ \t]+(?:[A-Z]+[ \t]+)*PRIVATE[ \t]+KEY-----[ \t]*(?:(?:\r?\n|\\r\\n|\\n)[ \t]*(?:[A-Za-z0-9+/=_.-]+|Proc-Type:[^\r\n]*|DEK-Info:[^\r\n]*|(?=\r?\n))[ \t]*(?=\r?\n|\\r\\n|\\n|$|["']))*(?:[A-Za-z0-9+/=_.-]{16,}(?=[ \t]*(?:$|["'])))?/gi
+  sanitized = sanitized.replace(privateKey, replacement)
+  // Prefix-only guard matches must not retain a wrapped value or password tail.
+  sanitized = sanitized.replace(/\b(?:Authorization\s*:\s*)?Bearer\s+(?:"(?:\\.|[^"\\\r\n])*(?:"|$)|'(?:\\.|[^'\\\r\n])*(?:'|$)|`(?:\\.|[^`\\\r\n])*(?:`|$)|<[^>\r\n]*(?:>|$)|\([^\)\r\n]*(?:\)|$)|\[[^\]\r\n]*(?:\]|$)|\{[^}\r\n]*(?:}|$))/gim, replacement)
+  sanitized = sanitized.replace(/(?:password|passwd|api[_-]?key|access[_-]?key|secret|token)\s*[:=]\s*[^\r\n]*/gi,
+    value => containsCredentialMaterial(value) ? replacement : value)
+  if (sanitized === normalized && !containsCredentialMaterial(normalized)) return { response, redacted: false }
+  return { response: redactCredentialMaterial(sanitized, replacement), redacted: true }
+}
 
 export const CLAUDE_ANSWER_FILE = 'answer.md'
 export const MAX_CLAUDE_ANSWER_BYTES = 4 * 1024 * 1024

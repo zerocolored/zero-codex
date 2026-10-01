@@ -26,7 +26,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { readNativeAdvisorRegistrations, registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { AdvisorFailureError, advisorFailureMessage, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
-import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
+import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, sanitizeClaudeAnswer, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
 import { retryAdvisorConnection } from './advisor-connection-retry.ts'
 export { claudeSubscriptionStatusIsReady } from './claude-auth-status.ts'
@@ -1973,7 +1973,8 @@ async function main(): Promise<void> {
     let marker = ''
     let deliveryUnknown = false
     let response: string | undefined
-    let answerArtifact: { path: string, sha256: string, bytes: number } | undefined
+    let answerArtifact: { path: string, sha256: string, bytes: number, responseSha256: string, responseBytes: number, redacted: boolean } | undefined
+    let responseRedacted = false
     let stateChangeSeqAfter: number | undefined
     let modelStartObserved = false
     let reason = 'Claude advisor was not sent'
@@ -2315,20 +2316,23 @@ async function main(): Promise<void> {
                       stateChangedDuringRead = true
                       break
                     }
-                    if (containsCredentialMaterial(fileAnswer.response)) {
-                      throw new Error('Claude answer file contains credential material')
+                    const sanitized = sanitizeClaudeAnswer(fileAnswer.response)
+                    const responseMetadata = {
+                      responseSha256: createHash('sha256').update(sanitized.response).digest('hex'),
+                      responseBytes: Buffer.byteLength(sanitized.response), redacted: sanitized.redacted,
                     }
                     const directory = ensureManagedDirectory(stateDir,
                       join(journalRoot, `revision-${input.revision}-${input.digest.slice(0, 16)}`))
                     const path = join(directory, `claude-answer-${diagnosticAttempt}.json`)
-                    // Persist the full answer before workspace/request cleanup,
-                    // even if a later cleanup check fails.
+                    // Keep original receipt evidence separate from the sanitized
+                    // response digest. Never persist the unredacted answer.
                     atomicWritePrivateFile(path, JSON.stringify({ version: 1, phase, round,
                       marker, sha256: fileAnswer.sha256, bytes: fileAnswer.bytes,
-                      response: fileAnswer.response }))
+                      ...responseMetadata, response: sanitized.response }))
                     answerArtifact = { path: relative(stateDir, path),
-                      sha256: fileAnswer.sha256, bytes: fileAnswer.bytes }
-                    response = fileAnswer.response
+                      sha256: fileAnswer.sha256, bytes: fileAnswer.bytes, ...responseMetadata }
+                    response = sanitized.response
+                    responseRedacted = sanitized.redacted
                     stateChangeSeqAfter = current.state_change_seq
                     observation.outcome = 'complete'
                     diagnosticTranscript = transcript
@@ -2341,7 +2345,9 @@ async function main(): Promise<void> {
                   diagnosticTranscript = transcript
                   diagnosticTranscriptReadIndex = diagnosticReads.length - 1
                   if (completeResponse && modelStartObserved) {
-                    response = completeResponse
+                    const sanitized = sanitizeClaudeAnswer(completeResponse)
+                    response = sanitized.response
+                    responseRedacted = sanitized.redacted
                     reason = 'Claude response obtained but subsequent cleanup validation did not complete'
                     stateChangeSeqAfter = current.state_change_seq
                     break
@@ -2575,6 +2581,7 @@ async function main(): Promise<void> {
         stateChangeSeqBefore: target.stateChangeSeq,
         stateChangeSeqAfter,
         response,
+        responseRedacted,
         responseDiagnostic,
         answerArtifact,
         cleanupWarnings,

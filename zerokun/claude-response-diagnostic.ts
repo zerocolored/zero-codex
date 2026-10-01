@@ -3,7 +3,7 @@ import { lstatSync } from 'fs'
 import { join, relative, sep } from 'path'
 import { ensureManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
+import { sanitizeClaudeAnswer } from './claude-answer-file.ts'
 import type { AdvisorFailure } from './advisor-availability.ts'
 
 const STARTUP_CODES = ['prohibited-ui', 'trust-confirmation-failed', 'effort-confirmation-failed',
@@ -163,8 +163,7 @@ export function saveClaudeResponseDiagnostic(options: {
     const original = options.transcript ?? ''
     // Suppress the whole transcript if a credential is detected, including
     // private-key bodies. Analyze first; redaction must not alter parser verdicts.
-    const suppressed = /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----/.test(original)
-      || containsCredentialMaterial(original)
+    const suppressed = sanitizeClaudeAnswer(original).redacted
     const sanitized = suppressed ? '[transcript withheld: credential material]' : original
       .replace(/https?:\/\/[^\s<>"'`]+/gi, '[url redacted]')
       .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email redacted]')
