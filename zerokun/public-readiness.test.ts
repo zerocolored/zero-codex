@@ -53,7 +53,7 @@ describe('public Codex defaults', () => {
     expect(broker).not.toContain('CLAUDE_TIMEOUT_MS')
     expect(fifthHelper).toContain('CLAUDE_START_TIMEOUT_MS = 300_000')
     expect(fifthHelper).toContain('["workspace", "close", workspace_id]')
-    expect(broker).toContain('Date.now() + 60 * 60 * 1_000')
+    expect(broker).not.toContain('Date.now() + 60 * 60 * 1_000')
     expect(browserBroker).toContain("server.registerTool('verify_local_page'")
     expect(browserBroker).toContain("const CHROME_APPLICATION = '/Applications/Google Chrome.app'")
     expect(browserBroker).toContain('`--proxy-bypass-list=<-loopback>;${input.address.url.hostname}:${input.address.port}`')
