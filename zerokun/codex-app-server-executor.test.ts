@@ -373,7 +373,7 @@ for line in sys.stdin:
     if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume", "thread/inject_items"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"method": method, "developerInstructions": params.get("developerInstructions"), "injectedItems": params.get("items") if method == "thread/inject_items" else None, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
+            stream.write(json.dumps({"method": method, "developerInstructions": params.get("developerInstructions"), "injectedItems": params.get("items") if method == "thread/inject_items" else None, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "approvalPolicy": params.get("approvalPolicy"), "approvalsReviewer": params.get("approvalsReviewer"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
     if method == "initialized":
         continue
     if method == "initialize":
@@ -431,9 +431,11 @@ for line in sys.stdin:
         requested_thread = requested
         handshake_cwd = cwd
         permission_profile = params.get("permissions") or ""
+        approval_policy = params.get("approvalPolicy")
+        approvals_reviewer = params.get("approvalsReviewer")
         if phase_account_switch and method == "thread/start" and capacity_state and os.path.exists(capacity_state):
             thread_id = "thread-app-server-2"
-        emit({"id": request_id, "result": {"thread": {"id": requested or thread_id, "cwd": cwd, "source": "unknown", "modelProvider": "openai", "status": {"type": "idle"}, "canAcceptDirectInput": True}, "model": model, "reasoningEffort": reasoning_effort, "modelProvider": "openai", "cwd": cwd, "approvalPolicy": "never", "activePermissionProfile": {"id": params.get("permissions"), "extends": None}, "instructionSources": [cwd + "/AGENTS.md"]}})
+        emit({"id": request_id, "result": {"thread": {"id": requested or thread_id, "cwd": cwd, "source": "unknown", "modelProvider": "openai", "status": {"type": "idle"}, "canAcceptDirectInput": True}, "model": model, "reasoningEffort": reasoning_effort, "modelProvider": "openai", "cwd": cwd, "approvalPolicy": params.get("approvalPolicy"), "approvalsReviewer": params.get("approvalsReviewer", "user"), "activePermissionProfile": {"id": params.get("permissions"), "extends": None}, "instructionSources": [cwd + "/AGENTS.md"]}})
     elif method == "turn/start":
         if mode == "hang-turn-start":
             with open(os.environ["ZERO_BLOCKED_MARKER"], "w", encoding="utf-8") as stream:
@@ -441,7 +443,7 @@ for line in sys.stdin:
             while True:
                 time.sleep(30)
         turn_params = value.get("params", {})
-        if turn_params.get("cwd") != handshake_cwd or turn_params.get("permissions") != permission_profile or turn_params.get("approvalPolicy") != "never":
+        if turn_params.get("cwd") != handshake_cwd or turn_params.get("permissions") != permission_profile or turn_params.get("approvalPolicy") != approval_policy or turn_params.get("approvalsReviewer") != approvals_reviewer:
             emit({"id": request_id, "error": {"code": -32000, "message": "turn permission binding mismatch"}})
             continue
         turn_count += 1
@@ -2590,7 +2592,7 @@ describe('production App Server executor', () => {
   }
 
   test('primary modelと推論強度をthreadとturnへ明示固定する', async () => {
-    const value = fixture('normal')
+    const value = fixture('normal', true)
     const rpcLog = join(value.root, 'runtime-selection-rpc.log')
     const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
@@ -2612,6 +2614,7 @@ describe('production App Server executor', () => {
     expect(rpc).toHaveLength(2)
     expect(rpc[0]).toMatchObject({
       method: 'thread/start',
+      approvalPolicy: 'on-request', approvalsReviewer: 'auto_review',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       config: {
         model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
@@ -2620,6 +2623,7 @@ describe('production App Server executor', () => {
     })
     expect(rpc[1]).toMatchObject({
       method: 'turn/start',
+      approvalPolicy: 'on-request', approvalsReviewer: 'auto_review',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
     })
@@ -2627,7 +2631,7 @@ describe('production App Server executor', () => {
   }, 30_000)
 
   test('resumeでもprimary modelと推論強度を再固定する', async () => {
-    const value = fixture('normal')
+    const value = fixture('normal', true)
     const rpcLog = join(value.root, 'runtime-selection-resume-rpc.log')
     const job = { ...value.job, sessionId: 'thread-existing', resumed: true }
     const result = await executeCodexJob(job, {
@@ -2647,6 +2651,7 @@ describe('production App Server executor', () => {
       .map(line => JSON.parse(line) as Record<string, unknown>)
     expect(rpc[0]).toMatchObject({
       method: 'thread/resume',
+      approvalPolicy: 'on-request', approvalsReviewer: 'auto_review',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       config: {
         model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
@@ -2656,6 +2661,7 @@ describe('production App Server executor', () => {
     expect(rpc[1]).toMatchObject({ method: 'thread/inject_items', currentInstructions: true })
     expect(rpc[2]).toMatchObject({
       method: 'turn/start',
+      approvalPolicy: 'on-request', approvalsReviewer: 'auto_review',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
     })

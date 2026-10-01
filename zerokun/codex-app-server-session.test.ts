@@ -55,6 +55,47 @@ function mockTransport(
 }
 
 describe('Codex App Server session', () => {
+  test.each([1, 'native-request'])('server request %s cannot resolve a client RPC or receive automatic approval', async id => {
+    const transport = mockTransport((request, emit) => {
+      emit({ id, method: 'mcpServer/elicitation/request', params: { message: 'User approval required' } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    await expect(session.request('config/read', {})).rejects.toThrow(
+      'App Server requires client interaction: mcpServer/elicitation/request',
+    )
+    expect(transport.sent).toHaveLength(1)
+    session.closeInput()
+    await expect(session.waitForReader()).rejects.toThrow('requires client interaction')
+  })
+
+  test.each(['thread/start', 'thread/resume'])('%s preserves native Auto-review and rejects downgrade', async method => {
+    const repo = mkdtempSync(join(tmpdir(), 'zero-native-reviewer-'))
+    let reviewer = 'auto_review'
+    const transport = mockTransport((request, emit) => {
+      emit({ id: request.id, result: {
+        thread: { id: 'thread', cwd: repo, source: 'appServer', modelProvider: 'openai',
+          status: { type: 'idle' }, canAcceptDirectInput: true, turns: [] },
+        model: 'gpt-test', modelProvider: 'openai', cwd: repo,
+        approvalPolicy: 'on-request', approvalsReviewer: reviewer,
+        activePermissionProfile: { id: 'profile', extends: null }, instructionSources: [],
+      } })
+    })
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    const params = { threadId: 'thread', cwd: repo, permissions: 'profile', model: 'gpt-test',
+      approvalPolicy: 'on-request', approvalsReviewer: 'auto_review' }
+    const run = () => method === 'thread/start' ? session.startThread(params) : session.resumeThread(params)
+    try {
+      expect((await run()).threadId).toBe('thread')
+      expect(transport.sent[0]?.params).toMatchObject({ approvalPolicy: 'on-request', approvalsReviewer: 'auto_review' })
+      reviewer = 'user'
+      await expect(run()).rejects.toThrow('did not preserve approvalsReviewer=auto_review')
+    } finally {
+      session.closeInput()
+      await session.waitForReader()
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
   test('native turn start consumes only new turns of the requested root thread', async () => {
     const transport = mockTransport()
     const session = new CodexAppServerSession(transport.input, transport.stream)

@@ -71,6 +71,15 @@ dialogで許可します。誤って拒否した場合は`tccutil reset AppleEve
 
 Zeroちゃんのブラウザ操作では、利用者設定で有効な公式ChromeプラグインとChatGPT拡張を優先します。
 Go Chrome MCPは別の拡張で、接続やサイト権限も別です。片方のエラーから、もう片方も利用不能とは判断しません。
+書込みを許可されたprimary実行は`approval_policy="on-request"`と
+`approvals_reviewer="auto_review"`で、対象の承認要求をCodex標準の自動審査へ渡します。
+Zeroちゃんでサービス別の許可リストを追加したり、承認要求へ自動でacceptを返したりはしません。
+準備・読取り専用工程とadvisorは従来どおり`never`を使います。
+管理者の制約、Codexの拒否、本人操作が必要な承認は自動審査でも残ります。
+ブラウザのアップロードが本人確認を要求する場合、Slackへ「許可」と返信するだけでは
+承認されません。確認画面を表示できるChatGPT／Codexで対象操作の許可を行う必要があります。
+根拠: [Codex Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)。
+
 Computer Useのアプリ承認も別に扱います。Slackからの無人実行は承認ダイアログを表示しないため、
 `Computer Use was not approved`が返っても「許可画面が出るまで待つ」とは案内しません。
 失敗した経路と実際のエラーを確認し、既に許可された経路で続行できるかを調べます。
