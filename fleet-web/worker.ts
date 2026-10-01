@@ -5,8 +5,6 @@ export interface Env {
   SUPABASE_PUBLISHABLE_KEY: string
   FLEET_SPACE_ID: string
   FLEET_GATEWAY_SECRET: string
-  FLEET_SLACK_TEAM_ID?: string
-  FLEET_SLACK_TEAM_IDS?: string
 }
 const cookieName = '__Host-zero-fleet'
 const security = {
