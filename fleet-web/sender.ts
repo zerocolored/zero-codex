@@ -1,18 +1,9 @@
 /** Machine-only enrollment. Slack credentials are used transiently, never persisted. */
-export type SenderEnv = { FLEET_SPACE_ID: string; FLEET_GATEWAY_SECRET: string; FLEET_SLACK_TEAM_ID?: string; FLEET_SLACK_TEAM_IDS?: string }
+export type SenderEnv = { FLEET_SPACE_ID: string; FLEET_GATEWAY_SECRET: string }
 type Rpc = (name: string, body: object) => Promise<any>
 const id = (value: unknown, prefix: string) => typeof value === 'string' && new RegExp(`^${prefix}[A-Z0-9]{1,63}$`).test(value)
 const uuid = (value: unknown) => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
 const reply = (status: number, code: string, extra: object = {}) => Response.json({ code, ...extra }, { status, headers: { 'Cache-Control': 'no-store' } })
-function allowedTeams(env: SenderEnv): Set<string> | null {
-  // An explicitly configured list replaces the legacy value, including on error.
-  // Never recover a revoked team through an implicit union or invalid-list fallback.
-  if (env.FLEET_SLACK_TEAM_IDS === undefined) return id(env.FLEET_SLACK_TEAM_ID, 'T') ? new Set([env.FLEET_SLACK_TEAM_ID!]) : null
-  const value = env.FLEET_SLACK_TEAM_IDS
-  if (typeof value !== 'string') return null
-  const teams = value.split(',').map(team => team.trim())
-  return teams.every(team => id(team, 'T')) ? new Set(teams) : null
-}
 async function body(request: Request): Promise<any> {
   const reader = request.body?.getReader(); if (!reader) throw Error('body')
   let text = '', size = 0; const decoder = new TextDecoder()
@@ -31,8 +22,6 @@ export async function senderRequest(request: Request, env: SenderEnv, rpc: Rpc, 
   if (!input || typeof input !== 'object' || Array.isArray(input)) return reply(400, 'invalid_body')
   const auth = request.headers.get('authorization') ?? ''
   if (action === 'enroll') {
-    const teams = allowedTeams(env)
-    if (!teams) return reply(503, 'enrollment_not_configured')
     if (!/^Bearer xoxb-[A-Za-z0-9._-]{10,4096}$/.test(auth) || !uuid(input.installationId) || !id(input.appId, 'A')) return reply(400, 'invalid_enrollment')
     const admitted = await rpc('sender_throttle', { p_space: env.FLEET_SPACE_ID, p_gateway: env.FLEET_GATEWAY_SECRET,
       p_ip: request.headers.get('CF-Connecting-IP') ?? 'local' })
@@ -45,7 +34,9 @@ export async function senderRequest(request: Request, env: SenderEnv, rpc: Rpc, 
     }
     const identity = await slack('auth.test', {})
     if (!identity.ok) return reply(identity.error === 'ratelimited' || identity.error === 'transport' ? 503 : 401, 'slack_auth_failed')
-    if (!teams.has(identity.team_id) || !id(identity.bot_id, 'B') || !id(identity.user_id, 'U')) return reply(403, 'slack_workspace_denied')
+    // Any workspace may enroll its own verified app. Keep the verified team ID
+    // as the boundary for project-status queries; never trust a caller-supplied team.
+    if (!id(identity.team_id, 'T') || !id(identity.bot_id, 'B') || !id(identity.user_id, 'U')) return reply(403, 'slack_app_mismatch')
     const info = await slack('bots.info', { bot: identity.bot_id })
     if (!info.ok) return reply(info.error === 'missing_scope' ? 403 : 503, info.error === 'missing_scope' ? 'slack_users_read_required' : 'slack_identity_unavailable')
     if (info.bot?.id !== identity.bot_id || info.bot?.user_id !== identity.user_id || info.bot?.app_id !== input.appId || info.bot?.deleted !== false) {

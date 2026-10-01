@@ -34,13 +34,15 @@
 
 通常は各PCで `zerochan update` を実行するだけでよい。登録済みSlackアプリのBot認証を使用し、SupabaseのURL・キー・メール・パスワードの入力、`zerochan cloud login`、手動の監視member登録は不要。停止中のアプリは更新で起動しないため、使用するプロジェクトで `zerochan start` する。
 
-管理者は `202609260001_fleet_slack_sender.sql` を適用し、Workerへ `FLEET_SLACK_TEAM_IDS`（許可するSlack workspace IDのカンマ区切り。例: `TWORKSPACE1,TWORKSPACE2`）を設定して公開する。単数の旧設定 `FLEET_SLACK_TEAM_ID` は複数設定が存在しない場合だけ使用する。空・不正な複数設定では登録を拒否し、旧設定へ戻さない。複数設定は旧設定を置き換えるため、現在許可しているworkspaceも含める。既存の `FLEET_SPACE_ID` / `FLEET_GATEWAY_SECRET` を使う。秘密はGitへ追加しない。固定HTTPS URLだけをクライアントに同梱し、runtime URLへの差し替え・redirectによるトークン転送を許可しない。
+管理者は `202609260001_fleet_slack_sender.sql` を適用し、Workerを公開する。Slackワークスペースごとの許可設定は不要。認証できたアプリは、接続先ワークスペースやアプリ名に関係なく自動登録される。旧設定 `FLEET_SLACK_TEAM_ID` / `FLEET_SLACK_TEAM_IDS` は残っていても参照しない。既存の `FLEET_SPACE_ID` / `FLEET_GATEWAY_SECRET` を使い、既存環境への公開では `wrangler deploy --keep-vars` で接続設定を保持する。秘密はGitへ追加しない。固定HTTPS URLだけをクライアントに同梱し、runtime URLへの差し替え・redirectによるトークン転送を許可しない。
 
-Workerは `auth.test` と `bots.info` でworkspace・bot・user・appの対応を検証する（Botには `users:read` が必要）。許可workspace内の各アプリは自身のapp IDに限り登録できる。管理者が許可するのはworkspace単位であり、アプリ・PC・プロジェクトごとの所属登録は不要。管理画面は許可したworkspaceの端末を集約するが、Slackのプロジェクト状況照会は同じworkspace内に限定する。アプリ名や番号を認証には使わない。Slack Bot tokenはTLS経由でWorkerへ送るが、Slack照合にだけ使用し、保存・ログ出力・DB転送しない。
+Workerは `auth.test` と `bots.info` でworkspace・bot・user・appの対応を検証する（Botには `users:read` が必要）。各アプリは自身のapp IDに限り登録でき、workspace・アプリ・PC・プロジェクトごとの所属登録は不要。管理画面は全workspaceの端末を集約するが、Slackのプロジェクト状況照会は同じworkspace内に限定する。アプリ名や番号を認証には使わない。Slack Bot tokenはTLS経由でWorkerへ送るが、Slack照合にだけ使用し、保存・ログ出力・DB転送しない。
 
-送信専用の乱数credentialはアプリ＋PCのinstanceに限定し、DBにはSHA-256のみ、PCにはowner-only `fleet-sender-credential.json` へ保存する。期限は30日で、失効・期限切れ時は同じ稼働プロセスが再認証する。一覧閲覧・引き継ぎ・他instance更新はできない。即時停止はDBのinstanceを `enabled=false` にする（自動復活しない）。Slack側の失効は次回登録・更新時に検出するため、発行済みcredentialには最大30日の残存期間がある。古い認証情報やinstance名・履歴は削除しない。
+この登録方式は運営者の所有端末だけに限定しない。登録先を知る第三者も、有効なSlack Bot認証を持っていれば自身のアプリを登録できる。対応版を起動すると既定でプロジェクト名・稼働状態・配送済み進捗要約を報告し、共通パスワードを持つ閲覧者に表示される。表示名・PCラベル・稼働内容は送信元の申告であり、端末所有者の証明ではない。送信しない場合は起動前に `zerochan fleet off` を使う。既存の監視offや管理者によるinstance無効化は引き続き尊重する。
 
-別workspaceの端末が表示されないときは、対象workspaceのIDを許可設定に含めてWorkerを再配布する。稼働中のgatewayは自動再試行するためPC更新・再起動は不要（再試行待ちは最大約8分）。未起動のアプリは対象projectで起動する。許可済みでも表示されない場合はgateway診断で登録対象外、`users:read`不足、認証ID不一致、監視off、登録無効化、通信失敗を区別する。`fleet status` の設定表示だけでは送信成功の証拠にならないため、一覧の最終通信更新も確認する。
+監視用の乱数credentialはアプリ＋PCのinstanceに限定し、DBにはSHA-256のみ、PCにはowner-only `fleet-sender-credential.json` へ保存する。期限は30日で、失効・期限切れ時は同じ稼働プロセスが再認証する。全体一覧の閲覧・引き継ぎ・他instance更新はできない。同じworkspaceで、自身が報告したフォルダと一致するプロジェクト状況の照会には使える。即時停止はDBのinstanceを `enabled=false` にする（同じinstanceは自動復活しないが、新しいinstallation IDでの登録を禁止するものではない）。Slack側の失効は次回登録・更新時に検出するため、発行済みcredentialには最大30日の残存期間がある。古い認証情報やinstance名・履歴は削除しない。
+
+旧Workerのworkspace制限で表示されなかった端末は、このWorkerへの更新後に自動再試行する。Slack認証による自動登録に対応済みのPCは更新・再起動不要（再試行待ちは最大約8分）。旧Workerの設定だけを消すと登録できなくなるため、Worker本体を先に更新する。未起動のアプリは対象projectで起動する。まだ表示されない場合はgateway診断で `users:read`不足、認証ID不一致、監視off、登録無効化、通信失敗を区別する。`fleet status` の設定表示だけでは送信成功の証拠にならないため、一覧の最終通信更新も確認する。
 
 登録は送信元IPごと15分60回まで。通常報告はSlack APIを呼ばない。通信障害はbackoffで再試行し本体を止めない。`zerochan fleet status` で新旧の送信認証方式を確認できる。監視offは引き続き尊重する。同じPCのinstanceを別PCへコピーしない。
 
