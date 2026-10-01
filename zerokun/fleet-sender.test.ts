@@ -9,35 +9,41 @@ import { FleetSessionExpired, projectFleetStatus } from './fleet-status.ts'
 const installation = '10000000-0000-4000-8000-000000000001', instance = '20000000-0000-4000-8000-000000000001'
 const botToken = 'xoxb-synthetic-bot-token'
 const env: Env = { ASSETS: { fetch: async () => new Response('page') }, SUPABASE_URL: 'https://test.supabase.co',
-  SUPABASE_PUBLISHABLE_KEY: 'public', FLEET_SPACE_ID: 'space', FLEET_GATEWAY_SECRET: 'gateway', FLEET_SLACK_TEAM_ID: 'TTEST' }
+  SUPABASE_PUBLISHABLE_KEY: 'public', FLEET_SPACE_ID: 'space', FLEET_GATEWAY_SECRET: 'gateway' }
 const facts = () => ({ running: 0, queued: 0, limited: false, approval: false, deferred: false, lastAcceptedAt: null, summary: null, summaryAt: null })
 const snapshot = projectFleetStatus(facts(), { project: 'example', slackConnected: false, runnerHealthy: false, paused: false })
-function fixture(settings: Partial<Env> = {}) {
+function fixture(settings: Partial<Env> & Record<string, unknown> = {}) {
   const workerEnv = { ...env, ...settings }
   const state = mkdtempSync(join(tmpdir(), 'fleet-sender-'))
   const calls: { url: string; body: any; auth: string | null }[] = []
-  let team = 'TTEST', app = 'ATEST', user = 'UTEST', failReport = 0, now = Date.now()
+  const identity = { ok: true, team_id: 'TTEST', bot_id: 'BTEST', user_id: 'UTEST' }
+  const bot = { id: 'BTEST', app_id: 'ATEST', user_id: 'UTEST', name: 'test', deleted: false }
+  let failReport = 0, now = Date.now(), admitted = true, enrollmentStatus = 200, legacyDenied = false, infoError = ''
   const worker = createWorker((async (url, init) => {
     const path = String(url), body = path.startsWith('https://slack.com/')
       ? Object.fromEntries(new URLSearchParams(String(init?.body))) : JSON.parse(String(init?.body))
     const auth = new Headers(init?.headers).get('authorization'); calls.push({ url: path, body, auth })
     expect(init?.redirect).toBe('manual')
-    if (path.endsWith('/auth.test')) return Response.json({ ok: true, team_id: team, bot_id: 'BTEST', user_id: 'UTEST' })
+    if (path.endsWith('/auth.test')) return Response.json(identity)
     if (path.endsWith('/bots.info')) {
       expect(new Headers(init?.headers).get('content-type')).toBe('application/x-www-form-urlencoded')
       expect(body.bot).toBe('BTEST')
-      return Response.json({ ok: true, bot: { id: 'BTEST', app_id: app, user_id: user, name: 'test', deleted: false } })
+      return Response.json(infoError ? { ok: false, error: infoError } : { ok: true, bot })
     }
-    if (path.endsWith('_sender_throttle')) return Response.json(true)
-    if (path.endsWith('_sender_enroll')) return Response.json({ status: 200, instanceId: instance, expiresAt: now + 86400000 })
+    if (path.endsWith('_sender_throttle')) return Response.json(admitted)
+    if (path.endsWith('_sender_enroll')) return Response.json({ status: enrollmentStatus, instanceId: instance, expiresAt: now + 86400000 })
     if (path.endsWith('_sender_begin')) return Response.json({ status: 200, generation: 1 })
     if (path.endsWith('_sender_report')) return Response.json({ status: failReport || 200 })
     throw Error('unexpected endpoint')
   }) as typeof fetch)
-  const fetcher = ((url: any, init: any) => worker.fetch(new Request(String(url), init), workerEnv)) as typeof fetch
+  const fetcher = ((url: any, init: any) => legacyDenied && String(url).endsWith('/enroll')
+    ? Promise.resolve(Response.json({ code: 'slack_workspace_denied' }, { status: 403 }))
+    : worker.fetch(new Request(String(url), init), workerEnv)) as typeof fetch
   return { state, calls, worker, fetcher, now: () => now, advance() { now += 1000000 },
-    setTeams(x: string) { workerEnv.FLEET_SLACK_TEAM_IDS = x },
-    setTeam(x: string) { team = x }, setApp(x: string) { app = x }, setUser(x: string) { user = x }, fail(x: number) { failReport = x },
+    setTeam(x: string) { identity.team_id = x }, setApp(x: string) { bot.app_id = x }, setUser(x: string) { bot.user_id = x },
+    setIdentity(x: Record<string, unknown>) { Object.assign(identity, x) }, setBot(x: Record<string, unknown>) { Object.assign(bot, x) },
+    throttle() { admitted = false }, disableEnrollment() { enrollmentStatus = 403 }, setInfoError(x: string) { infoError = x },
+    legacyWorkspaceDenied(x: boolean) { legacyDenied = x }, fail(x: number) { failReport = x },
     cleanup() { rmSync(state, { recursive: true, force: true }) } }
 }
 test('fresh PC without Supabase auth enrolls, sends, persists only scoped credential and reuses it', async () => {
@@ -58,10 +64,11 @@ test('fresh PC without Supabase auth enrolls, sends, persists only scoped creden
     expect(existsSync(join(f.state, 'cloud-auth.json'))).toBe(false)
   } finally { f.cleanup() }
 })
-for (const scenario of ['team', 'app', 'user']) test(`rejects mismatched Slack ${scenario} before enrollment`, async () => {
+for (const scenario of ['app', 'user', 'bot', 'deleted']) test(`rejects mismatched Slack ${scenario} before enrollment`, async () => {
   const f = fixture()
   try {
-    if (scenario === 'team') f.setTeam('TOTHER'); if (scenario === 'app') f.setApp('AOTHER'); if (scenario === 'user') f.setUser('UOTHER')
+    if (scenario === 'app') f.setApp('AOTHER'); if (scenario === 'user') f.setUser('UOTHER')
+    if (scenario === 'bot') f.setBot({ id: 'BOTHER' }); if (scenario === 'deleted') f.setBot({ deleted: true })
     await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()).rejects.toThrow()
     expect(f.calls.some(c => c.url.endsWith('_sender_enroll'))).toBe(false)
   } finally { f.cleanup() }
@@ -103,48 +110,62 @@ test('network failure has bounded timeout and never follows redirects carrying c
   } finally { f.cleanup() }
 })
 
-for (const team of ['TTEST', 'TSECOND']) test(`authorized workspace ${team} enrolls and reports`, async () => {
-  const f = fixture({ FLEET_SLACK_TEAM_IDS: ' TTEST, TSECOND, TTEST ' })
+for (const team of ['TTEST', 'TSECOND', 'TUNLISTED']) test(`workspace ${team} enrolls and reports without admission configuration`, async () => {
+  const f = fixture()
   f.setTeam(team)
+  f.setBot({ name: '別名のアシスタント' })
   try {
     const client = new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher)
     const started = await client.begin(); await client.send(started.generation, 1, snapshot)
     expect(f.calls.find(c => c.url.endsWith('_sender_enroll'))!.body.p_team).toBe(team)
+    expect(f.calls.find(c => c.url.endsWith('_sender_enroll'))!.body.p_name).toBe('別名のアシスタント')
     expect(f.calls.some(c => c.url.endsWith('_sender_report'))).toBe(true)
   } finally { f.cleanup() }
 })
-for (const team of ['TTEST', 'TUNKNOWN']) test(`explicit workspace list excludes ${team} without legacy fallback`, async () => {
-  const f = fixture({ FLEET_SLACK_TEAM_IDS: 'TSECOND' }); f.setTeam(team)
+for (const settings of [
+  { FLEET_SLACK_TEAM_ID: 'TOLD' },
+  { FLEET_SLACK_TEAM_ID: 'TOLD', FLEET_SLACK_TEAM_IDS: 'TOLD,TANOTHER' },
+  { FLEET_SLACK_TEAM_IDS: '' },
+  { FLEET_SLACK_TEAM_IDS: 'not-a-workspace,' },
+]) test(`obsolete workspace settings cannot restrict enrollment: ${JSON.stringify(settings)}`, async () => {
+  const f = fixture(settings); f.setTeam('TNEW')
   try {
-    await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()).rejects.toThrow('登録対象外')
-    expect(f.calls.some(c => c.url.endsWith('/bots.info') || c.url.endsWith('_sender_enroll'))).toBe(false)
+    await new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()
+    expect(f.calls.find(c => c.url.endsWith('_sender_enroll'))!.body.p_team).toBe('TNEW')
   } finally { f.cleanup() }
 })
-for (const list of ['', ' ', 'TTEST,', ',TTEST', 'TTEST,,TSECOND', 'TTEST,*', 'TTEST,tsecond', 'TTEST TSECOND']) {
-  test(`invalid workspace list ${JSON.stringify(list)} fails closed`, async () => {
-    const f = fixture({ FLEET_SLACK_TEAM_IDS: list })
+for (const identity of [{ team_id: '' }, { team_id: 'T' }, { team_id: 'tinvalid' }, { team_id: null }, { bot_id: '' }, { user_id: '' }]) {
+  test(`rejects malformed verified identity before enrollment: ${JSON.stringify(identity)}`, async () => {
+    const f = fixture(); f.setIdentity(identity)
     try {
-      await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()).rejects.toThrow('登録設定が未完了')
-      expect(f.calls).toHaveLength(0)
+      await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()).rejects.toThrow('認証IDが一致しません')
+      expect(f.calls.some(c => c.url.endsWith('/bots.info') || c.url.endsWith('_sender_enroll'))).toBe(false)
+      expect(existsSync(join(f.state, 'fleet-sender-credential.json'))).toBe(false)
     } finally { f.cleanup() }
   })
 }
-for (const mismatch of ['app', 'user']) test(`second allowed workspace still verifies ${mismatch}`, async () => {
-  const f = fixture({ FLEET_SLACK_TEAM_IDS: 'TTEST,TSECOND' }); f.setTeam('TSECOND')
-  if (mismatch === 'app') f.setApp('AOTHER'); else f.setUser('UOTHER')
+for (const failure of ['auth', 'scope', 'throttle', 'disabled']) test(`open registration preserves ${failure} rejection`, async () => {
+  const f = fixture(); f.setTeam('TNEW')
+  if (failure === 'auth') f.setIdentity({ ok: false })
+  if (failure === 'scope') f.setInfoError('missing_scope')
+  if (failure === 'throttle') f.throttle()
+  if (failure === 'disabled') f.disableEnrollment()
   try {
-    await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()).rejects.toThrow('認証IDが一致しません')
-    expect(f.calls.some(c => c.url.endsWith('_sender_enroll'))).toBe(false)
+    await expect(new FleetSenderClient(f.state, installation, 'ATEST', botToken, f.fetcher).begin()).rejects.toThrow()
+    expect(existsSync(join(f.state, 'fleet-sender-credential.json'))).toBe(false)
+    expect(f.calls.some(c => c.url.endsWith('_sender_begin'))).toBe(false)
+    if (failure !== 'disabled') expect(f.calls.some(c => c.url.endsWith('_sender_enroll'))).toBe(false)
+    if (failure === 'throttle') expect(f.calls.some(c => c.url.startsWith('https://slack.com/'))).toBe(false)
   } finally { f.cleanup() }
 })
-test('running gateway recovers after its workspace is authorized without PC restart', async () => {
-  const f = fixture(); f.setTeam('TSECOND')
+test('running gateway retries an old Worker denial after open-registration deployment without PC restart', async () => {
+  const f = fixture(); f.setTeam('TSECOND'); f.legacyWorkspaceDenied(true)
   const reporter = startConfiguredFleet(f.state, 'ATEST', '/private/project', facts, () => true,
     { home: f.state, botToken, fetcher: f.fetcher, now: f.now, warn: () => {} })!
   try {
     await reporter.tick()
     expect(f.calls.some(c => c.url.endsWith('_sender_enroll'))).toBe(false)
-    f.setTeams('TTEST,TSECOND'); f.advance(); await reporter.tick()
+    f.legacyWorkspaceDenied(false); f.advance(); await reporter.tick()
     expect(f.calls.find(c => c.url.endsWith('_sender_enroll'))!.body.p_team).toBe('TSECOND')
     expect(f.calls.some(c => c.url.endsWith('_sender_report'))).toBe(true)
   } finally { reporter.stop(); f.cleanup() }
