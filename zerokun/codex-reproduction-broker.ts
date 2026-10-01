@@ -16,15 +16,17 @@ import { containsCredentialMaterial } from './public-output-guard.ts'
 import { releaseProcessLock, tryAcquireProcessLock } from './process-lock.ts'
 import { runBounded, AdvisorOwnedProcessStillLiveError } from './advisor-broker.ts'
 import type { JobRecord } from './job-runner.ts'
+import { recoverPreviousReproduction } from './reproduction-recovery.ts'
 
 export type ReproductionContext = {
   version: 1; job: JobRecord; stateDir: string; artifactDir: string; scratchDir: string;
   liveInputDir: string; fingerprintAllowPath: string
 }
-type RunResult = {
+export type RunResult = {
   id: string; status: 'running' | 'completed' | 'failed' | 'interrupted' | 'containment_failed';
   promptSha256: string; workspace: string; finalPath: string; receiptPath: string;
   exitCode?: number; eventBytes?: number; diagnosticsTruncated?: boolean; reason?: string
+  recovery?: { sourceJob: number; manifestPath: string; copiedFiles: number; unavailable: number; excluded: number; finalAvailable: boolean }
 }
 type Runner = (argv: string[], options: Parameters<typeof runBounded>[1]) => ReturnType<typeof runBounded>
 
@@ -75,6 +77,7 @@ export class CodexReproductions {
   private controller = new AbortController()
   private pending = new Map<string, Promise<void>>()
   private failedRuns = new Map<string, unknown>()
+  private recoveredRuns = new Map<string, RunResult>()
   private closed = false
   private containmentFailure: Error | undefined
   private transportFailure: unknown
@@ -98,9 +101,18 @@ export class CodexReproductions {
   poll(id: string): RunResult {
     if (this.containmentFailure) throw this.containmentFailure
     if (this.failedRuns.has(id)) throw this.failedRuns.get(id)
-    const value = readOptionalBoundedOwnerOnlyRegularFile(join(this.directory(id), 'result.json'), 16_384)
-    if (!value) throw new Error('reproduction has not started')
-    return JSON.parse(value) as RunResult
+    if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid reproduction id')
+    if (this.recoveredRuns.has(id)) return this.recoveredRuns.get(id)!
+    const directory = join(this.context.stateDir, 'reproductions', this.context.job.id, id)
+    let value: string | null = null
+    try {
+      requireManagedDirectory(this.context.stateDir, directory)
+      value = readOptionalBoundedOwnerOnlyRegularFile(join(directory, 'result.json'), 16_384)
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    if (value) return JSON.parse(value) as RunResult
+    const recovered = recoverPreviousReproduction(this.context, id)
+    if (recovered.status !== 'running') this.recoveredRuns.set(id, recovered)
+    return recovered
   }
   /** A bounded RPC wait never sets a deadline on the owned execution. */
   async waitForResult(id: string, waitMs = 20_000, signal?: AbortSignal): Promise<RunResult> {
@@ -226,7 +238,7 @@ export function createReproductionServer(runs: CodexReproductions): McpServer {
     description: 'Execute the user-requested independent Codex exec reproduction with the exact UTF-8 prompt file via stdin. Workspace must be inside current job scratch. Repository and retained inputs are read-only; write outputs in workspace. No host argv/config/env accepted. Start returns immediately. Poll the same id until terminal; running is not a failure or a reason to stop. There is no total execution deadline. Completed means execution only, not similarity validation. Never use as an additional advisor.',
     inputSchema: { requestPath: z.string().max(4096), workspace: z.string().max(4096) },
   }, async args => { try { return reply(runs.start(args.requestPath, args.workspace)) } catch (error) { if (error instanceof AdvisorOwnedProcessStillLiveError) return { ...reply({ status: 'containment_failed', reason: 'Owned process cleanup failed. Stop this execution and preserve host records.' }), isError: true }; return { ...reply({ status: 'rejected', reason: 'Use a nonsecret prompt and workspace owned by this job.' }), isError: true } } })
-  server.registerTool('codex_reproduction_poll', { description: 'Wait up to 20 seconds for the same execution and return its status, without restarting or stopping it. Repeat while running; no total execution deadline.', inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } },
+  server.registerTool('codex_reproduction_poll', { description: 'Wait up to 20 seconds for the same execution, including a previous job in this conversation and repository, without restarting or stopping it. Repeat while running. A recovered terminal result provides a read-only workspace and recovery manifest in current inputs. Inspect those partial outputs and copy relevant files to current scratch to continue; interrupted is not verified success and must not cause a duplicate execution.', inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } },
     async (args, extra) => { try { return reply(await runs.waitForResult(args.id, 20_000, extra.signal)) } catch (error) { if (error instanceof AdvisorOwnedProcessStillLiveError) return { ...reply({ status: 'containment_failed', reason: 'Owned process cleanup failed. Stop this execution and preserve host records.' }), isError: true }; return { ...reply({ status: 'unavailable', reason: 'Execution state could not be verified; preserve host records and do not start another execution.' }), isError: true } } })
   return server
 }
