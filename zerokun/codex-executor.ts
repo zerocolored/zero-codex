@@ -1129,6 +1129,19 @@ async function readCodexAppServer(
   return response
 }
 
+/** Keep config, thread creation/resume and every turn on the same native route. */
+function codexApprovalSettings(overrides: string[]): {
+  approvalPolicy: 'never' | 'on-request'
+  approvalsReviewer?: 'auto_review'
+} {
+  const policy = overrideValue(overrides, 'approval_policy')
+  if (policy === 'never') return { approvalPolicy: 'never' }
+  if (policy === 'on-request' && overrideValue(overrides, 'approvals_reviewer') === 'auto_review') {
+    return { approvalPolicy: 'on-request', approvalsReviewer: 'auto_review' }
+  }
+  throw new Error('Zeroちゃん approval configuration must use never or native auto_review')
+}
+
 function assertCompatibleRequirements(
   rawRequirements: unknown,
   overrides: string[],
@@ -1159,7 +1172,8 @@ function assertCompatibleRequirements(
     }
   }
   const handledRequirementKeys = new Set([
-    'allowedApprovalPolicies', 'allowedPermissionProfiles', 'allowedSandboxModes',
+    'allowedApprovalPolicies', 'allowedApprovalsReviewers', 'autoReview',
+    'allowedPermissionProfiles', 'allowedSandboxModes',
     'allowedWebSearchModes', 'featureRequirements', 'hooks', 'network',
   ])
   for (const [key, value] of Object.entries(requirements)) {
@@ -1179,6 +1193,7 @@ function assertCompatibleRequirements(
       throw new Error(`Codex managed requirements do not allow permission profile ${profile}`)
     }
   }
+  const approvalSettings = codexApprovalSettings(overrides)
   const approvalPolicies = requirements.allowedApprovalPolicies
   if (approvalPolicies !== undefined && approvalPolicies !== null) {
     const knownApprovalPolicies = new Set(['untrusted', 'on-request', 'never'])
@@ -1204,8 +1219,28 @@ function assertCompatibleRequirements(
     }
     if (!Array.isArray(approvalPolicies)
       || approvalPolicies.some(value => !validApprovalPolicy(value))
-      || !approvalPolicies.includes('never')) {
-      throw new Error('Codex managed requirements do not allow approval policy never')
+      || !approvalPolicies.includes(approvalSettings.approvalPolicy)) {
+      throw new Error(`Codex managed requirements do not allow approval policy ${approvalSettings.approvalPolicy}`)
+    }
+  }
+  const reviewers = requirements.allowedApprovalsReviewers
+  if (reviewers !== undefined && reviewers !== null
+    && (!Array.isArray(reviewers)
+      || reviewers.some(value => !['user', 'auto_review', 'guardian_subagent'].includes(value))
+      || (approvalSettings.approvalsReviewer !== undefined
+        && !reviewers.includes(approvalSettings.approvalsReviewer)))) {
+    throw new Error('Codex managed requirements do not allow the requested approvals reviewer')
+  }
+  // Codex enforces these native reviewer requirements. Never replace them with
+  // a Zerochan risk policy or an automatically accepted elicitation response.
+  const autoReview = requirements.autoReview
+  if (autoReview !== undefined && autoReview !== null) {
+    if (typeof autoReview !== 'object' || Array.isArray(autoReview)
+      || Object.entries(autoReview).some(([key, value]) =>
+        !['requiredOnModels', 'ignoreRules'].includes(key)
+        || (value !== null && (!Array.isArray(value)
+          || value.some(entry => typeof entry !== 'string'))))) {
+      throw new Error('Codex managed requirements contain invalid autoReview')
     }
   }
   const allowedSandboxModes = requirements.allowedSandboxModes
@@ -1342,8 +1377,13 @@ function assertEffectiveCodexPermissionSnapshot(
   if (config.sandbox_workspace_write !== null && config.sandbox_workspace_write !== undefined) {
     throw new Error('Codex effective sandbox_workspace_write disables Zeroちゃん permission profile')
   }
-  if (config.approval_policy !== 'never') {
+  const approvalSettings = codexApprovalSettings(overrides)
+  if (config.approval_policy !== approvalSettings.approvalPolicy) {
     throw new Error(`Codex effective approval policy mismatch: ${String(config.approval_policy)}`)
+  }
+  if (approvalSettings.approvalsReviewer !== undefined
+    && config.approvals_reviewer !== approvalSettings.approvalsReviewer) {
+    throw new Error('Codex effective approvals reviewer mismatch')
   }
   const openAiBaseUrl = configPathValue(config, 'openai_base_url')
   if (openAiBaseUrl !== undefined && openAiBaseUrl !== null) {
@@ -4395,7 +4435,7 @@ export function buildCodexWorkerPrompt(
       control.push('Native Computer Use is enabled for this authorized primary execution when installed.',
         'Read the installed computer-use skill. Current clients use node_repl with @oai/sky;',
         'discover node_repl tools rather than assuming a direct get_app_state MCP tool exists.',
-        'Existing per-app approvals still apply.',
+        'Eligible requests are reviewed by Codex native Auto-review. Existing per-app approvals still apply.',
         'This unattended job cannot display an interactive approval dialog. An app approval denial',
         'must not be reported as a pending dialog. Do not repeatedly retry the same denial or',
         'ask the user to wait for a prompt that was not emitted. Report the exact failed capability',
@@ -5856,7 +5896,10 @@ export function buildCodexPermissionOverrides(
       `permissions.${profile}.network.domains={"127.0.0.1"="allow","localhost"="allow"}`,
     ] : []),
     `default_permissions=${tomlString(profile)}`,
-    'approval_policy="never"',
+    ...(primaryWorkspaceAccess ? [
+      'approval_policy="on-request"',
+      'approvals_reviewer="auto_review"',
+    ] : ['approval_policy="never"']),
     'project_doc_max_bytes=262144',
     'notify=[]',
     `model=${tomlString(model)}`,
@@ -7975,7 +8018,7 @@ export async function executeCodexJob(
             {
               cwd: job.repoPath,
               permissions: advisorAttempt.permissionProfile,
-              approvalPolicy: 'never',
+              ...codexApprovalSettings(advisorAttempt.permissionOverrides),
               model,
               effort: reasoningEffort,
               beforeWrite: id => {
@@ -8267,7 +8310,7 @@ export async function executeCodexJob(
         }
         const threadParams: Record<string, unknown> = {
           cwd: job.repoPath,
-          approvalPolicy: 'never',
+          ...codexApprovalSettings(advisorAttempt.permissionOverrides),
           permissions: advisorAttempt.permissionProfile,
           developerInstructions: advisorAttempt.developerInstructions,
           model,
@@ -8430,7 +8473,7 @@ export async function executeCodexJob(
             {
               cwd: job.repoPath,
               permissions: advisorAttempt.permissionProfile,
-              approvalPolicy: 'never',
+              ...codexApprovalSettings(advisorAttempt.permissionOverrides),
               model,
               effort: reasoningEffort,
               beforeWrite: requestId => {
