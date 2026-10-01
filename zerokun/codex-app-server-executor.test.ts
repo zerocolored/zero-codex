@@ -308,7 +308,7 @@ import time
 mode = os.environ.get("ZERO_FIXTURE_MODE", "normal")
 if mode in ("interrupt-no-terminal-forced", "late-error-after-complete"):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
-if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1":
+if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1" or os.environ.get("ZERO_NATIVE_DRAIN_STOP_GATE") == "1":
     signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
 if mode == "logical-stop-required":
     def logical_stop(_signum, _frame):
@@ -764,7 +764,7 @@ for line in sys.stdin:
             if mode == "late-error-after-complete":
                 time.sleep(0.2)
                 emit(late_error)
-            if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1":
+            if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1" or os.environ.get("ZERO_NATIVE_DRAIN_STOP_GATE") == "1":
                 time.sleep(0.3)
                 sys.stdout.write("{broken JSON\\n")
                 sys.stdout.flush()
@@ -890,6 +890,8 @@ for line in sys.stdin:
             child["turns"][0]["items"] = [{"type": "agentMessage", "phase": "final_answer", "text": "Synthetic independent answer.\\n" + child_fixture["marker"]}]
         with open(fixture_path, "w", encoding="utf-8") as stream:
             json.dump(child_fixture, stream)
+        if os.environ.get("ZERO_NATIVE_DRAIN_READ_TIMEOUT") == "1" and child_fixture["reads"] == 1:
+            continue
         emit({"id": request_id, "result": {"thread": child}})
     elif method == "thread/read":
         emit({"id": request_id, "result": {"thread": {"id": requested_thread or thread_id, "turns": []}}})
@@ -899,7 +901,10 @@ for line in sys.stdin:
         }] if mode == "phased-native-history-resume" else []
         if os.environ.get("ZERO_NATIVE_DRAIN_CHILD"):
             with open(os.environ["ZERO_NATIVE_DRAIN_CHILD"], "r", encoding="utf-8") as stream:
-                children = [json.load(stream)["child"]]
+                child_fixture = json.load(stream)
+                if os.environ.get("ZERO_NATIVE_DRAIN_STOP_GATE") == "1" and child_fixture["reads"] >= 2:
+                    continue
+                children = [child_fixture["child"]]
         emit({"id": request_id, "result": {"data": children, "nextCursor": None}})
     elif method == "turn/steer":
         if os.environ.get("ZERO_CONTINUATION_STEER") == "1":
@@ -2936,8 +2941,10 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 30_000)
 
-  test.each([false, true])('complete executorはadvisorを回収する前に親を終了せず入力受付も閉じない: interjection=%s', async interjection => {
-    const value = fixture('interjection-late-answer', true)
+  test.each(['none', 'late', 'interjection-answer', 'interjection-update', 'cancel'] as const)('complete executorはadvisorを回収する前に親を終了せず入力受付も閉じない: %s', async scenario => {
+    const interjection = !['none', 'cancel'].includes(scenario)
+    const mode = scenario === 'none' || scenario === 'late' || scenario === 'cancel' ? 'interjection-late-answer' : scenario
+    const value = fixture(mode, true)
     const acknowledge = value.hooks.acknowledgeInitialDispatch
     const finish = value.hooks.finishTurn
     let claimCreated = false
@@ -2946,7 +2953,7 @@ describe('production App Server executor', () => {
     let inputOpenAtRelease = false
     let finishedAfterRelease = false
     let inputTimer: ReturnType<typeof setTimeout> | undefined
-    let stagedInterjection = false
+    let stagedInterjection = mode !== 'interjection-late-answer'
     let releaseTimer: ReturnType<typeof setTimeout> | undefined
     value.hooks.acknowledgeInitialDispatch = args => {
       acknowledge!(args)
@@ -2964,7 +2971,7 @@ describe('production App Server executor', () => {
         contextDigest: createHash('sha256').update(JSON.stringify(context)).digest('hex'),
         inputRevision: input.revision, inputDigest: input.digest, phase: 'investigation', round: 1,
         brokerProcessId: process.pid }), { mode: 0o600 })
-      if (interjection) inputTimer = setTimeout(() => {
+      if (scenario === 'late') inputTimer = setTimeout(() => {
         const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
         if (!target) return
         value.store.stageLiveInterjection(target, {
@@ -2975,6 +2982,13 @@ describe('production App Server executor', () => {
       }, 250)
       releaseTimer = setTimeout(() => {
         inputOpenAtRelease = value.store.liveControlTarget(value.job.chatId, value.job.threadTs) !== null
+        if (scenario === 'cancel') {
+          const target = value.store.interruptControlTarget(value.job.chatId, value.job.threadTs)
+          value.store.stageLiveControl(target!, { chatId: value.job.chatId,
+            threadTs: value.job.threadTs, messageId: 'cancel-during-advisor-drain',
+            userId: 'UOTHER', task: '中止', kind: 'interrupt' })
+          return
+        }
         released = true
         rmSync(lock)
       }, 1000)
@@ -2987,15 +3001,21 @@ describe('production App Server executor', () => {
     try {
       const execution = executeCodexJob(value.job, {
         codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
-        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: 'interjection-late-answer' },
+        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: mode, ZERO_INTERJECTION_FIXTURE_STATE: join(value.root, 'settlement-interjection.state') },
         liveControls: value.hooks,
       })
+      if (scenario === 'cancel') {
+        await expect(execution).rejects.toBeInstanceOf(CodexUserCancelledError)
+        expect(released).toBe(false)
+        return
+      }
       if (interjection) {
         const notification = await waitForInterjectionNotification(value.store)
         value.store.markInterjectionNotificationDelivered(notification.id)
       }
       const result = await execution
-      expect(result.result).toBe('通常完了')
+      expect(result.result).toBe(scenario === 'interjection-update' ? '追加条件を反映して完了しました'
+        : scenario === 'interjection-answer' ? '元の作業を完了しました' : '通常完了')
       expect(finishedAfterRelease).toBe(true)
       expect(inputOpenAtRelease).toBe(true)
       expect(stagedInterjection).toBe(interjection)
@@ -4493,13 +4513,18 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test('親executorは暗号化inputの登録済みGPTが完成する前にApp Serverを閉じない', async () => {
-    const value = fixture('normal', false)
+  test.each(['normal', 'network-permanent', 'history-timeout', 'protocol-stop-gate'] as const)('親executorは暗号化inputの登録済みGPTが完成する前にApp Serverを閉じない: %s', async scenario => {
+    const mode = scenario === 'history-timeout' ? 'normal' : scenario === 'protocol-stop-gate' ? 'network-permanent' : scenario
+    const value = fixture(mode, false)
     const childPath = join(value.root, 'native-child.json')
-    const result = await executeCodexJob(value.job, {
+    const execution = executeCodexJob(value.job, {
       codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
       skipEffectiveConfigCheck: true,
-      extraEnvironment: { ZERO_FIXTURE_MODE: 'normal', ZERO_NATIVE_DRAIN_CHILD: childPath },
+      extraEnvironment: { ZERO_FIXTURE_MODE: mode, ZERO_NATIVE_DRAIN_CHILD: childPath,
+        ZERO_NETWORK_STATE: join(value.root, 'native-network-state'),
+        ZERO_NATIVE_DRAIN_READ_TIMEOUT: scenario === 'history-timeout' ? '1' : '0',
+        ZERO_NATIVE_DRAIN_STOP_GATE: scenario === 'protocol-stop-gate' ? '1' : '0',
+        ZERO_RPC_LOG: join(value.root, 'native-drain-rpc.log') },
       nativeAdvisorHistoryFixtureForTesting: async () => { throw new Error('no synthetic publication evidence') },
       onSessionId: parentThreadId => {
         const root = join(value.state, 'advisor-context', value.job.id)
@@ -4520,10 +4545,15 @@ describe('production App Server executor', () => {
       },
       liveControls: value.hooks,
     })
-    expect(result.sessionId).toBe('thread-app-server-1')
+    if (mode === 'network-permanent') await expect(execution).rejects.toThrow('access_programs')
+    else expect((await execution).sessionId).toBe('thread-app-server-1')
     const child = JSON.parse(readFileSync(childPath, 'utf8'))
     expect(child.reads).toBeGreaterThanOrEqual(2)
     expect(child.child.turns[0].status).toBe('completed')
+    if (scenario === 'protocol-stop-gate') {
+      const rpc = readFileSync(join(value.root, 'native-drain-rpc.log'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      expect(rpc.filter(call => call.method === 'thread/list')).toHaveLength(2)
+    }
     value.store.close()
   }, 30_000)
 
@@ -6871,6 +6901,42 @@ describe('production App Server executor', () => {
       } finally { value.store.close() }
     }, 30_000)
   }
+
+  test('親のprotocol failureでも外部レビューの回収前にexecutorを終了しない', async () => {
+    const value = fixture('network-permanent')
+    const acknowledge = value.hooks.acknowledgeInitialDispatch
+    let released = false
+    let exitedAfterRelease = false
+    let releaseTimer: ReturnType<typeof setTimeout> | undefined
+    value.hooks.acknowledgeInitialDispatch = args => {
+      acknowledge!(args)
+      const context = JSON.parse(readFileSync(join(value.state, 'advisor-context', value.job.id, `${args.executorNonce}.json`), 'utf8'))
+      const registration = JSON.parse(readFileSync(join(value.state, 'executors', `${value.job.id}.json`), 'utf8'))
+      const processNonce = dirname(registration.fingerprint.allow.path).split('/').at(-1)!
+      const input = readAdvisorInputSnapshot(value.state, value.job.id)
+      const root = join(value.state, 'advisor-journal', value.job.id, args.executorNonce)
+      mkdirSync(root, { recursive: true, mode: 0o700 })
+      const lock = join(root, 'active-round.lock')
+      writeFileSync(lock, JSON.stringify({ version: 2, jobId: value.job.id,
+        attemptNonce: args.executorNonce, processNonce,
+        contextDigest: createHash('sha256').update(JSON.stringify(context)).digest('hex'),
+        inputRevision: input.revision, inputDigest: input.digest, phase: 'investigation', round: 1,
+        brokerProcessId: process.pid }), { mode: 0o600 })
+      releaseTimer = setTimeout(() => { released = true; rmSync(lock) }, 1000)
+    }
+    try {
+      await expect(executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        onProcessExit: () => { exitedAfterRelease = released },
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'network-permanent', ZERO_NETWORK_STATE: join(value.root, 'network-state') },
+      })).rejects.toThrow('access_programs')
+      expect(exitedAfterRelease).toBe(true)
+    } finally {
+      if (releaseTimer) clearTimeout(releaseTimer)
+      value.store.close()
+    }
+  }, 15_000)
 
   for (const mode of ['network-once', 'network-always', 'network-native', 'network-permanent'] as const) {
     test(`network recovery ${mode} preserves thread and bounds dispatch`, async () => {

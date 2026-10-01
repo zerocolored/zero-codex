@@ -95,3 +95,13 @@ test('settling requires ten seconds of unchanged evidence and resets on progress
   state.reset()
   expect(state.exhausted('changed', 20001)).toBe(false)
 })
+
+
+test('開始確認期限は接続障害中の時間を含めず連続した観測から数える', () => {
+  const settling = new ClaudeResponseSettling(120_000)
+  expect(settling.exhausted('same-idle', 0)).toBe(false)
+  settling.reset() // a failed transport read breaks continuity
+  expect(settling.exhausted('same-idle', 180_000)).toBe(false)
+  expect(settling.exhausted('same-idle', 299_999)).toBe(false)
+  expect(settling.exhausted('same-idle', 300_000)).toBe(true)
+})

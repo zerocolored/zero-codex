@@ -4,6 +4,7 @@ import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from 
 import { isFinalAppServerAgentMessage } from './codex-app-server-session.ts'
 import { nativeAdvisorMarker, nativeAdvisorResponseHasExactMarker } from './native-advisor-evidence.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
+import { retryAdvisorConnection } from './advisor-connection-retry.ts'
 
 type RecordValue = Record<string, unknown>
 const record = (value: unknown): RecordValue => value !== null && typeof value === 'object'
@@ -208,16 +209,37 @@ export async function settleNativeAdvisors(options: Options & {
   interrupted: () => boolean
   timeoutMs?: number
   pollMs?: number
+  retryableReadError?: (error: unknown) => boolean
 }): Promise<'settled' | 'interrupted' | 'timeout' | 'unavailable'> {
-  const deadline = Date.now() + (options.timeoutMs ?? 60 * 60_000)
+  const deadline = options.timeoutMs === undefined ? Infinity : Date.now() + options.timeoutMs
   const warned = new Set<string>()
+  const interrupted = Symbol('native settlement interrupted')
+  const timedOut = Symbol('native settlement probe timed out')
+  const read: NativeAdvisorReader = (method, params) => retryAdvisorConnection({
+    read: async () => {
+      if (options.interrupted()) throw interrupted
+      if (Date.now() >= deadline) throw timedOut
+      return options.read(method, params)
+    },
+    retryable: error => error !== interrupted && error !== timedOut && options.retryableReadError?.(error) === true,
+    wait: async () => { await Bun.sleep(options.pollMs ?? 500) },
+  })
   while (true) {
     if (options.interrupted()) return 'interrupted'
     let incomplete = false
-    const children = await readRetainedNativeAdvisors({ ...options, onWarning: kind => {
-      incomplete = true
-      if (!warned.has(kind)) { warned.add(kind); options.onWarning?.(kind) }
-    } })
+    let children: RetainedNativeAdvisor[]
+    try {
+      children = await readRetainedNativeAdvisors({ ...options, read, onWarning: kind => {
+        incomplete = true
+        if (!warned.has(kind)) { warned.add(kind); options.onWarning?.(kind) }
+      } })
+    } catch (error) {
+      if (error === interrupted) return 'interrupted'
+      if (error === timedOut) return 'timeout'
+      throw error
+    }
+    if (options.interrupted()) return 'interrupted'
+    if (incomplete && Date.now() >= deadline) return 'timeout'
     if (!children.some(child => child.status === 'inProgress')) return incomplete ? 'unavailable' : 'settled'
     if (Date.now() >= deadline) return 'timeout'
     await Bun.sleep(Math.min(options.pollMs ?? 500, Math.max(1, deadline - Date.now())))

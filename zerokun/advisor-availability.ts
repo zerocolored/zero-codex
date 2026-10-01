@@ -1,5 +1,5 @@
 /** Stable user-facing classifications; raw CLI output never goes to Slack. */
-export const ADVISOR_FAILURE_CAUSES = ['authentication', 'billing', 'configuration', 'auth-check', 'network', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'interrupted', 'unknown'] as const
+export const ADVISOR_FAILURE_CAUSES = ['authentication', 'billing', 'configuration', 'auth-check', 'connection', 'network', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'interrupted', 'unknown'] as const
 export type AdvisorFailure = {
   advisor: 'codex' | 'grok' | 'claude'
   cause: typeof ADVISOR_FAILURE_CAUSES[number]
@@ -10,7 +10,8 @@ export class AdvisorFailureError extends Error {
 }
 
 export function classifyAdvisorFailure(advisor: AdvisorFailure['advisor'], reason: string): AdvisorFailure {
-  const cause = /project is not a Git worktree or pinned workspace|workspace configuration/i.test(reason) ? 'workspace'
+  const cause = /Herdr current pane verification (?:timed out|failed)/i.test(reason) ? 'connection'
+    : /project is not a Git worktree or pinned workspace|workspace configuration/i.test(reason) ? 'workspace'
     : /payment required|insufficient (?:credit|balance)|credit balance.*(?:low|exhausted)|billing.*(?:disabled|failed)|subscription (?:expired|inactive)/i.test(reason) ? 'billing'
     : /rate.?limit|quota|at capacity|429/i.test(reason) ? 'rate-limit'
     : /ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|network (?:error|unavailable)|connection (?:reset|timed out)/i.test(reason) ? 'network'
@@ -38,6 +39,7 @@ export function advisorFailureMessage(failure: AdvisorFailure): string {
     billing: '支払い・残高・契約に関するエラーが報告されました。利用アカウントの契約状態を確認してください。',
     configuration: '必要なログイン方式または実行設定と一致しません。このMacの設定を確認してください。',
     'auth-check': 'ログイン状態の確認処理に失敗しました。未ログインや課金不足と確定したわけではありません。',
+    connection: '連携状態の確認に失敗しました。レビュー回答の時間切れではありません。',
     network: '通信障害により回答を取得できませんでした。',
     'rate-limit': '利用制限またはモデル混雑により回答を取得できません。',
     timeout: '回答取得が制限時間を超えました。',
