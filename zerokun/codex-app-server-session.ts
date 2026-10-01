@@ -856,6 +856,13 @@ export class CodexAppServerSession {
     } catch (error) {
       throw new AppServerProtocolError(`App Server emitted invalid JSON: ${error}`)
     }
+    // JSON-RPC requests and responses have independent ID namespaces. A server
+    // request may reuse a pending client ID; it must never resolve that RPC.
+    // Native auto_review handles eligible approvals within Codex. Remaining
+    // client requests need a user-capable client, not a fabricated accept reply.
+    if ('id' in parsed && typeof parsed.method === 'string') {
+      throw new AppServerProtocolError(`App Server requires client interaction: ${parsed.method}`)
+    }
     if (typeof parsed.id === 'number') {
       const pending = this.pending.get(parsed.id)
       if (!pending) {
@@ -895,11 +902,6 @@ export class CodexAppServerSession {
         throw new AppServerProtocolError('supervisor retained notification is invalid')
       }
       throw new AppServerProtocolError('Codex supervisor retained uncertain cleanup')
-    }
-    // Any server-initiated request requires interactive authority that this
-    // unattended Slack worker deliberately does not have.
-    if ('id' in parsed) {
-      throw new AppServerProtocolError(`unexpected App Server request: ${parsed.method}`)
     }
     const notification = {
       method: parsed.method,
@@ -1108,8 +1110,13 @@ export class CodexAppServerSession {
     if (thread.canAcceptDirectInput !== true) {
       throw new AppServerProtocolError(`${method} did not allow direct turn input`)
     }
-    if (result.approvalPolicy !== 'never') {
-      throw new AppServerProtocolError(`${method} did not preserve approvalPolicy=never`)
+    if (!['never', 'on-request'].includes(String(expected.approvalPolicy))
+      || result.approvalPolicy !== expected.approvalPolicy) {
+      throw new AppServerProtocolError(`${method} did not preserve approvalPolicy=${expected.approvalPolicy}`)
+    }
+    if (expected.approvalPolicy === 'on-request'
+      && (expected.approvalsReviewer !== 'auto_review' || result.approvalsReviewer !== 'auto_review')) {
+      throw new AppServerProtocolError(`${method} did not preserve approvalsReviewer=auto_review`)
     }
     const active = record(result.activePermissionProfile, `${method} active permission profile`)
     if (active.id !== expected.permissions) {
@@ -1224,7 +1231,8 @@ export class CodexAppServerSession {
     options: {
       cwd: string
       permissions: string
-      approvalPolicy: 'never'
+      approvalPolicy: 'never' | 'on-request'
+      approvalsReviewer?: 'auto_review'
       model?: string
       effort?: string
       timeoutMs?: number
@@ -1243,6 +1251,7 @@ export class CodexAppServerSession {
       cwd: options.cwd,
       permissions: options.permissions,
       approvalPolicy: options.approvalPolicy,
+      ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
       ...(options.model ? { model: options.model } : {}),
       ...(options.effort ? { effort: options.effort } : {}),
     }, { timeoutMs: options.timeoutMs ?? 30_000, beforeWrite: options.beforeWrite })

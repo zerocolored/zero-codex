@@ -71,6 +71,15 @@ dialogで許可します。誤って拒否した場合は`tccutil reset AppleEve
 
 Zeroちゃんのブラウザ操作では、利用者設定で有効な公式ChromeプラグインとChatGPT拡張を優先します。
 Go Chrome MCPは別の拡張で、接続やサイト権限も別です。片方のエラーから、もう片方も利用不能とは判断しません。
+書込みを許可されたprimary実行は`approval_policy="on-request"`と
+`approvals_reviewer="auto_review"`で、対象の承認要求をCodex標準の自動審査へ渡します。
+Zeroちゃんでサービス別の許可リストを追加したり、承認要求へ自動でacceptを返したりはしません。
+準備・読取り専用工程とadvisorは従来どおり`never`を使います。
+管理者の制約、Codexの拒否、本人操作が必要な承認は自動審査でも残ります。
+ブラウザのアップロードが本人確認を要求する場合、Slackへ「許可」と返信するだけでは
+承認されません。確認画面を表示できるChatGPT／Codexで対象操作の許可を行う必要があります。
+根拠: [Codex Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)。
+
 Computer Useのアプリ承認も別に扱います。Slackからの無人実行は承認ダイアログを表示しないため、
 `Computer Use was not approved`が返っても「許可画面が出るまで待つ」とは案内しません。
 失敗した経路と実際のエラーを確認し、既に許可された経路で続行できるかを調べます。
@@ -113,6 +122,18 @@ GitHub transportだけを担当します。
 Primary Codexのmodelは`gpt-6-astra`、reasoning effortは`low`としてrelease codeに固定されています。
 利用者のCodex設定、shell環境、state内`.env`を揃える必要はなく、どのMacでも同じ値で起動します。
 Grok、Claude、review用Codexの選択には`AGENTS.md`のadvisor契約が別途適用されます。
+
+GUI初期設計では、primary Codexが`advisor_round`の`uiProposal`へ比較する画面状態と
+Beforeの情報を渡し、Claude Fable 5.1がUIデザイン・frontend-only sample・After PNGを作成します。
+hostがrepositoryとagent設定の外にinput／prototype／evidence／runtimeを作り、
+この初期設計だけにsample作成と導入済みbrowserによるloopback previewを許可します。
+通常の調査・最終レビューはread-onlyのままです。
+
+Afterはhostがdecode・再encodeしてjob outboxへ保存し、advisor結果の`claude.uiArtifacts`に
+生成者、sampleの場所、画像の場所とdigestを返します。primaryは画像の内容と比較条件を確認し、
+既存のBefore／After添付・ユーザー承認へ進みます。製品への実装はその承認後です。
+Fableや撮影環境が利用不能な場合は理由と生成者を明記し、適用されるAGENTSのfallbackに従います。
+試作rootは判断まで保持し、作業終了時に記録したdevice／inodeとowned processの終了を確認して片付けます。
 
 次の本人操作や情報指定だけは、必要な場合にユーザーへ依頼します。Slack App作成そのものは含みません。
 

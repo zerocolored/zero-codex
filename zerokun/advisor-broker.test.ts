@@ -128,6 +128,7 @@ type BrokerFixture = {
     round?: 1 | 2 | 3,
     overrides?: {
       primaryEvidence?: string
+      uiProposal?: { comparison: string; beforeKind: "actual" | "synthetic" | "unavailable"; beforeImage?: string }
       retryUnavailable?: boolean
       inputUpdateIsRecoveryOnly?: boolean
       nativeAgentId?: string
@@ -320,6 +321,17 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
             with open(os.path.join(state["project"], ".env.audit-fixture"), "w") as handle:
                 handle.write("synthetic concurrent runtime metadata")
         marker = next((line for line in reversed(prompt.splitlines()) if line.startswith("REQUEST_MARKER=")), "")
+        if state.get("ui_artifacts"):
+            prefix_ui = "Host-owned artifact root: "
+            ui_root = json.loads(next(line[len(prefix_ui):] for line in prompt.splitlines() if line.startswith(prefix_ui)))
+            state["ui_root"] = ui_root
+            save()
+            with open(os.path.join(ui_root, "prototype", "index.html"), "w") as handle:
+                handle.write("<!doctype html><title>Fable fixture</title><h1>Synthetic design</h1>")
+            ppm = os.path.join(ui_root, "runtime", "test.ppm")
+            with open(ppm, "wb") as handle:
+                handle.write(b"P6\\n1280 720\\n255\\n" + bytes([60, 70, 80]) * (1280 * 720))
+            subprocess.run(["/usr/bin/sips", "-s", "format", "png", ppm, "--out", os.path.join(ui_root, "evidence", "after.png")], stdout=subprocess.DEVNULL, check=True)
         if state.get("answer_file_lines"):
             prefix = "The sole exception to the file-write prohibition is this caller-created file: "
             output = json.loads(next(line[len(prefix):] for line in prompt.splitlines() if line.startswith(prefix)))
@@ -725,6 +737,7 @@ mock.module('fs', () => ({ ...fs, realpathSync: (path, ...args) =>
       round: 1 | 2 | 3 = 1,
       overrides: {
         primaryEvidence?: string
+      uiProposal?: { comparison: string; beforeKind: "actual" | "synthetic" | "unavailable"; beforeImage?: string }
       retryUnavailable?: boolean
         inputUpdateIsRecoveryOnly?: boolean
         nativeAgentId?: string
@@ -758,6 +771,7 @@ mock.module('fs', () => ({ ...fs, realpathSync: (path, ...args) =>
             inputRevision: selectedInput.revision,
             inputDigest: selectedInput.digest,
             primaryEvidence: overrides.primaryEvidence ?? 'bounded primary evidence',
+            ...(overrides.uiProposal ? { uiProposal: overrides.uiProposal } : {}),
             ...(overrides.reviewWorktrees ? { reviewWorktrees: overrides.reviewWorktrees } : {}),
             ...(overrides.retryUnavailable ? { retryUnavailable: true } : {}),
             ...(overrides.inputUpdateIsRecoveryOnly ? { inputUpdateIsRecoveryOnly: true } : {}),
@@ -1826,6 +1840,35 @@ print('review complete')
       expect(changed.payload.reason).toContain('question changed')
       expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(1)
     } finally { await fixture.close() }
+  }, 30_000)
+
+  test('Fable GUI artifacts survive broker restart without repeating the advisor and cannot be requested in review', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, writeEnabled: true })
+    let artifactRoot: string | undefined
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), ui_artifacts: true }), { mode: 0o600 })
+      const uiProposal = { comparison: 'Synthetic settings, light theme, scroll 0, no focus', beforeKind: 'synthetic' as const }
+      const result = await fixture.call('investigation', 'revision-two', 'adopted', 1, { uiProposal })
+      artifactRoot = JSON.parse(readFileSync(path, 'utf8')).ui_root
+      expect(result.payload.claude).toMatchObject({ adopted: true, cleanupVerified: true,
+        uiArtifacts: { status: 'produced', producer: 'claude-fable-5-1' } })
+      const artifacts = result.payload.claude.uiArtifacts
+      expect(existsSync(artifacts.afterPath)).toBe(true)
+      expect(existsSync(artifacts.prototypePath)).toBe(true)
+      await fixture.restart()
+      const replay = await fixture.call('investigation', 'revision-two', 'adopted', 1, { uiProposal })
+      expect(replay.payload.claude.uiArtifacts).toEqual(artifacts)
+      const review = await fixture.call('review', 'revision-two', 'adopted', 1, { uiProposal })
+      expect(review.result.isError).toBe(true)
+      expect(review.payload.reason).toContain('initial-design')
+      const final = JSON.parse(readFileSync(path, 'utf8'))
+      expect(final.prompt_count).toBe(1)
+      expect(final.close_count).toBe(1)
+    } finally {
+      await fixture.close()
+      if (artifactRoot) rmSync(artifactRoot, { recursive: true, force: true })
+    }
   }, 30_000)
 
   test('起動途中の未確定native sessionを記録せずready後のsessionで送信する', async () => {
