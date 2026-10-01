@@ -1053,9 +1053,7 @@ describe('advisor broker boundaries', () => {
       // Keep the fixture alive long enough for runBounded to record its process generation.
       '/bin/sleep 0.2',
       'if [ -n "${USER:-}" ] && [ "$USER" = "${LOGNAME:-}" ] && [ -n "${SHELL:-}" ] && [ -n "${TMPDIR:-}" ]; then',
-      options.claudeAuthConfigurationAfterReady
-      ? '  printf \'%s\\n\' \'{"loggedIn":true,"authMethod":"console","apiProvider":"firstParty","subscriptionType":"max"}\''
-      : '  printf \'%s\\n\' \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\'',
+      '  printf \'%s\\n\' \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\'',
       'else',
       '  printf \'%s\\n\' \'{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty","subscriptionType":null}\'',
       'fi',
