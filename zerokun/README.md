@@ -218,8 +218,14 @@ codex <trust-args> -C <repo> \
   Codexへ渡す前に除去します。JSON本文・structuredContent・エラー・通知が対象で、
   子の生stderrは転送しません。通常のタブIDと検索条件、操作入力は変更しません。
   画像内の秘密や任意形式のページ本文を完全に除去する仕組みではなく、過去の保存済み履歴も変更しません。
-  Web検索はwrite許可jobだけに限定し、command networkとSlack関連domainをpermission profileで制限します。
-  Slack tokenは子へ渡さず、Slack投稿をdeveloper instructionsでも禁止します。
+  Web検索はwrite許可jobだけに限定し、Slack関連domainの直接通信制限は維持します。
+  対象app・宛先・検証目的について明示承認済みの製品連携テストでは、製品の既存受付・worker経路を
+  起動して製品から送信させられます。直接Slack APIを呼ぶ・別process等で通信制限を回避することはできません。
+  hostのSlack tokenは子へ渡さず、通常返信・進捗・完了通知の直接送信は禁止したままです。
+  read-only／reviewのネットワーク制限とhost private stateのdenyは維持します。
+  managed workspaceは物理repositoryを維持し、merge済みbranchへの追加pushが禁じられる場合も、
+  最新統合commitから同じrepository内に後続branchを作れます。未検証の連携を完了扱いにせず、
+  独立して実行できる承認済み設定修正・検証は継続します。
 
 ## 権限
 

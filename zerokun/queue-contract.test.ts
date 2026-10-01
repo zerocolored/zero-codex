@@ -131,7 +131,7 @@ describe('Zero-kun Codex wiring', () => {
     expect(browserBroker).toContain('blockedCrossOriginRequestCount')
     expect(executor).toContain('default_permissions=')
     expect(executor).not.toContain("'-s'")
-    expect(executor).toContain('Never post to Slack yourself')
+    expect(executor).toContain('Never deliver this assistant')
     expect(executor).toContain('for (const writeEnabled of [false, true])')
   })
 

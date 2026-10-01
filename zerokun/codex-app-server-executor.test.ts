@@ -2397,7 +2397,7 @@ describe('production App Server executor', () => {
   }
 
   for (const resume of [false, true]) {
-    test(`承認済みIAM修復の現行指示をApp Server ${resume ? 'resume' : 'start'}へ送る`, async () => {
+    test(`承認済みIAM修復・製品連携の現行指示をApp Server ${resume ? 'resume' : 'start'}へ送る`, async () => {
       const value = fixture('normal', true, '承認した対象ジョブ・実行主体への必要アクセスを修復してください')
       const rpcLog = join(value.root, 'iam-policy-rpc.log')
       try {
@@ -2417,6 +2417,11 @@ describe('production App Server executor', () => {
         expect(handshake[0].developerInstructions).toContain('target resource, existing grantee principal, and exact permission or role')
         expect(handshake[0].developerInstructions).toContain('other applicable restrictions')
         expect(handshake[0].developerInstructions).not.toContain('change IAM to bypass a denial')
+        expect(handshake[0].developerInstructions).not.toContain('Never post to Slack yourself')
+        expect(handshake[0].developerInstructions).toContain('explicit authorization for the sending app, destination,')
+        expect(handshake[0].developerInstructions).toContain('Never deliver this assistant\'s replies')
+        expect(handshake[0].developerInstructions).toContain('does not require an already merged branch to receive new commits')
+        expect(handshake[0].developerInstructions).toContain('A blocked integration check does not block independent authorized implementation')
         if (resume) {
           const injected = rpc.filter(row => row.method === 'thread/inject_items')
           expect(injected).toHaveLength(1)
