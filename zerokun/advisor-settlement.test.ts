@@ -29,7 +29,7 @@ test('終了済みの欠員は回答を要求せず即settleする', async () =>
   const f = fixture(); f.write('required-reviewer-failed'); rmSync(f.lock)
   expect(await waitForAdvisorSettlement(f.options)).toBe('settled')
 })
-test('新指示とキャンセルは稼働中のadvisor待機を解除する', async () => {
+test('明示キャンセルは稼働中のadvisor待機を解除する', async () => {
   const f = fixture(); let interrupted = false
   const waiting = waitForAdvisorSettlement({ ...f.options, interrupted: () => interrupted })
   await Bun.sleep(10); interrupted = true
@@ -45,11 +45,26 @@ test('別generation、壊れた状態、broker終了は本作業を待機させ�
   writeFileSync(f.lock, JSON.stringify(lock), { mode: 0o600 })
   expect(await waitForAdvisorSettlement(f.options)).toBe('unavailable')
 })
-test('無限待機せず上限を返し、稼働中processやjournal自体は操作しない', async () => {
+test('明示したprobe期限だけ上限を返し、稼働中processやjournal自体は操作しない', async () => {
   const f = fixture()
   expect(await waitForAdvisorSettlement({ ...f.options, timeoutMs: 5 })).toBe('timeout')
   expect(JSON.parse(await Bun.file(f.journal).text()).status).toBe('requested')
   rmSync(f.lock); expect(await waitForAdvisorSettlement(f.options)).toBe('settled')
+})
+
+test('通常の回収待ちは従来の80分を過ぎてもlive reviewerを終了扱いにしない', async () => {
+  const f = fixture()
+  const originalNow = Date.now
+  let finished = false
+  try {
+    const waiting = waitForAdvisorSettlement({ ...f.options, timeoutMs: undefined })
+      .then(value => { finished = true; return value })
+    Date.now = () => originalNow() + 3 * 60 * 60_000
+    await Bun.sleep(20)
+    expect(finished).toBe(false)
+    rmSync(f.lock)
+    expect(await waiting).toBe('settled')
+  } finally { Date.now = originalNow }
 })
 
 test.each(['old-generation', 'same-generation'] as const)('新しいactive lockと古いterminal journalが共存しても早期終了しない: %s', async kind => {

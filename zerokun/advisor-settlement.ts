@@ -17,7 +17,9 @@ export async function waitForAdvisorSettlement(options: {
 }): Promise<'settled' | 'interrupted' | 'unavailable' | 'timeout'> {
   const root = join(options.stateDir, 'advisor-journal',
     options.jobId.replace(/[^A-Za-z0-9._-]/g, '_'), options.attemptNonce)
-  const deadline = Date.now() + (options.timeoutMs ?? 80 * 60_000)
+  // Reviewer work has no wall-clock deadline. An explicit caller deadline is
+  // retained for bounded probes/tests; user cancellation still wins each poll.
+  const deadline = options.timeoutMs === undefined ? Infinity : Date.now() + options.timeoutMs
   let broker: ReturnType<typeof readProcessIdentity>
   while (true) {
     if (options.interrupted()) return 'interrupted'

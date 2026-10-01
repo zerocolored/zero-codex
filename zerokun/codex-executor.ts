@@ -5054,7 +5054,7 @@ export function buildCodexInterjectionPausePrompt(
     'A same-thread message is waiting for a separate read-only response. Finish only the atomic',
     'tool operation already in progress. Start no new tool call and make no further repository,',
     'Git, network, or external-state change. Do not inspect or answer the waiting message in this',
-    'process. Do not interrupt or close native advisors: the host drains their work before retiring this process.',
+    'process. Do not interrupt or close any advisors (GPT, Grok, Claude): the host drains their work before retiring this process.',
     'Preserve their exact identities and original request markers. End this parent turn so the host can resume the same Codex',
     'thread with read-only permissions.',
     `The final line should be exactly [ZERO_INTERJECTION_PAUSED:${interjection.id}].`,
@@ -7394,6 +7394,22 @@ export async function executeCodexJob(
         throw new CodexCleanupPendingError('Codex supervisorが終了前のため登録を消去できません')
       }
     }
+    const drainExternalAdvisors = async (): Promise<void> => {
+      if (stage !== 'complete') return
+      await bestEffortAdvisorVerification('before-executor-retirement', async () => {
+        const settlement = await waitForAdvisorSettlement({
+          stateDir: managedStateDir, jobId: job.id,
+          attemptNonce: advisorAttempt.attemptNonce,
+          processNonce: advisorAttempt.processNonce,
+          contextDigest: advisorAttempt.contextDigest,
+          interrupted: () => options.signal?.aborted === true
+            || options.liveControls?.cancellationRequested() === true,
+        })
+        if (settlement === 'unavailable' || settlement === 'timeout') {
+          throw new Error(`advisor settlement ${settlement}`)
+        }
+      })
+    }
     const retireRegistration = async (options: {
       allowActive: boolean
       requirePresent: boolean
@@ -7401,6 +7417,7 @@ export async function executeCodexJob(
       waitForForce?: () => boolean
       onForce?: () => void
     }): Promise<void> => {
+      if (!options.allowActive) await drainExternalAdvisors()
       verifyRegistration(options)
       try {
         await reapSeatbeltFingerprint({
@@ -7799,6 +7816,24 @@ export async function executeCodexJob(
       let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null
+      const drainNativeAdvisors = async (): Promise<void> => {
+        // A failed model turn need not imply a dead history transport. Drain
+        // while read-only RPCs work; a genuinely closed stream still fails.
+        if (!nativeAdvisorHistoryEnabled || !currentThreadId || userCancelled) return
+        await bestEffortAdvisorVerification('native-before-retirement', async () => {
+          const outcome = await settleNativeAdvisors({
+            parentThreadId: currentThreadId!, repoPath: job.repoPath,
+            attemptNonce: advisorAttempt.attemptNonce,
+            registrations: readNativeAdvisorRegistrations(logicalAttempt.contextPath, advisorAttempt.attemptNonce,
+              kind => reportAdvisorVerificationWarning(`native-recovery-${kind}`, new Error(kind))),
+            read: async (method, params) => (await session.request(method, params, { timeoutMs: 15_000 })).result,
+            retryableReadError: error => error instanceof AppServerAmbiguousRequestError
+              && ['thread/list', 'thread/read'].includes(error.method),
+            interrupted: () => options.signal?.aborted === true || controls.cancellationRequested(),
+          })
+          if (outcome === 'timeout' || outcome === 'unavailable') throw new Error(`native advisor settlement ${outcome}`)
+        })
+      }
       let currentThreadSource: AppServerSessionSource | null = null
       let parentChildBaseline = parentChildBaselineInput === null
         ? null
@@ -8715,27 +8750,9 @@ export async function executeCodexJob(
               taskGoalStatus = goal?.status
               if (taskGoalStatus) controls.recordGoalStatus?.(taskGoalStatus)
             }
-            // Drain before closing input, so a same-thread update/cancel can
-            // still interrupt this wait and use the normal turn barrier.
-            if (stage === 'complete' && terminal.turn.status === 'completed'
-              && !pausedInterjection) {
-              const settlement = await waitForAdvisorSettlement({
-                stateDir: managedStateDir, jobId: job.id,
-                attemptNonce: advisorAttempt.attemptNonce,
-                processNonce: advisorAttempt.processNonce,
-                contextDigest: advisorAttempt.contextDigest,
-                interrupted: () => {
-                  const next = controls.next()
-                  // A late thread question retires this parent after its answer.
-                  // Drain first so that transition cannot kill a sent reviewer.
-                  return options.signal?.aborted === true || controls.cancellationRequested()
-                    || (next !== null && next.kind !== 'interjection')
-                },
-              })
-              if (settlement === 'unavailable' || settlement === 'timeout') {
-                reportAdvisorVerificationWarning(`completion-settlement-${settlement}`, new Error('advisor settlement unavailable'))
-              }
-            }
+            // Preserve the original reviewers across questions/task updates.
+            // Explicit cancellation still interrupts this wait immediately.
+            if (terminal.turn.status === 'completed') await drainExternalAdvisors()
             let barrier = controls.finishTurn({
               executorNonce: advisorAttempt.attemptNonce,
               threadId: currentThreadId,
@@ -8951,25 +8968,17 @@ export async function executeCodexJob(
           userCancelled = true
           terminateForCancellation()
         } else {
+          // A failed parent transport is not a failed reviewer. Collect the
+          // existing external round before termination reaps its processes.
+          await drainExternalAdvisors()
+          await drainNativeAdvisors()
           terminate()
         }
       } finally {
         try {
-          // Closing stdin also reaps the native children. Drain while RPCs
-          // are live, including when a conversational interjection paused us.
-          if (nativeAdvisorHistoryEnabled && currentThreadId && protocolError == null && !userCancelled) {
-            await bestEffortAdvisorVerification('native-before-retirement', async () => {
-              const outcome = await settleNativeAdvisors({
-                parentThreadId: currentThreadId!, repoPath: job.repoPath,
-                attemptNonce: advisorAttempt.attemptNonce,
-                registrations: readNativeAdvisorRegistrations(logicalAttempt.contextPath, advisorAttempt.attemptNonce,
-                kind => reportAdvisorVerificationWarning(`native-recovery-${kind}`, new Error(kind))),
-                read: async (method, params) => (await session.request(method, params, { timeoutMs: 15_000 })).result,
-                interrupted: () => options.signal?.aborted === true || controls.cancellationRequested(),
-              })
-              if (outcome === 'timeout' || outcome === 'unavailable') throw new Error(`native advisor settlement ${outcome}`)
-            })
-          }
+          // The error path already drained before terminate(). Never await
+          // new RPCs after SIGTERM, which could delay stdin close/force reap.
+          if (protocolError == null && !userCancelled) await drainNativeAdvisors()
         } finally {
           try {
             session.closeInput()

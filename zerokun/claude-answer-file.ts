@@ -21,10 +21,11 @@ export class ClaudeAnswerPendingError extends Error {
 export class ClaudeResponseSettling {
   private key: string | undefined
   private since = 0
+  constructor(private readonly durationMs = 10_000) {}
   reset(): void { this.key = undefined }
   exhausted(key: string, now: number): boolean {
     if (key !== this.key) { this.key = key; this.since = now }
-    return now - this.since >= 10_000
+    return now - this.since >= this.durationMs
   }
 }
 

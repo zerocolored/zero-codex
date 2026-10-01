@@ -227,3 +227,47 @@ test('userMessageが公開されても登録済みのモデル情報を失わな
   const recovered = await recoverNativeAdvisorAnswers({ ...f.options, onWarning: () => {} })
   expect(recovered[0]?.restored).toBe(true)
 })
+
+test('nativeレビューの既定待機は経過時間だけでは終了しない', async () => {
+  const f = fixture(); f.child.turns[0].status = 'inProgress'
+  const now = Date.now; let elapsed = 0; let settled = false
+  Date.now = () => now() + elapsed
+  try {
+    const waiting = settleNativeAdvisors({ ...f.options, timeoutMs: undefined })
+      .then(result => { settled = true; return result })
+    elapsed = 3 * 60 * 60_000
+    await Bun.sleep(15)
+    expect(settled).toBe(false)
+    f.complete()
+    expect(await waiting).toBe('settled')
+  } finally { Date.now = now; f.complete() }
+})
+
+
+test.each(['thread/list', 'thread/read'])('native回答の一時的な%s失敗は同じ観測を再試行する', async methodToFail => {
+  const f = fixture(); f.complete()
+  const transient = new Error('synthetic history timeout'); let failures = 4
+  expect(await settleNativeAdvisors({ ...f.options,
+    retryableReadError: error => error === transient,
+    read: async (method, params) => {
+      if (method === methodToFail && failures-- > 0) throw transient
+      return f.options.read(method, params)
+    },
+  })).toBe('settled')
+  expect(failures).toBeLessThanOrEqual(0)
+  expect(f.calls.every(call => ['thread/list', 'thread/read'].includes(call.method))).toBe(true)
+})
+test('native履歴確認の再試行中もキャンセルで終了する', async () => {
+  const f = fixture(); let cancelled = false
+  expect(await settleNativeAdvisors({ ...f.options,
+    interrupted: () => cancelled, retryableReadError: () => true,
+    read: async () => { cancelled = true; throw new Error('synthetic timeout') },
+  })).toBe('interrupted')
+})
+
+test('明示したnative履歴probe期限は通信再試行中にも適用する', async () => {
+  const f = fixture()
+  expect(await settleNativeAdvisors({ ...f.options, timeoutMs: 5,
+    retryableReadError: () => true, read: async () => { throw new Error('synthetic timeout') },
+  })).toBe('timeout')
+})

@@ -323,6 +323,9 @@ async function readBoundedCurrentPaneOutput(
   return Buffer.concat(chunks.map(chunk => Buffer.from(chunk)), total)
 }
 
+/** An unavailable observation is not evidence that the caller identity changed. */
+export class HerdrObservationUnavailableError extends Error {}
+
 async function readCurrentPaneAsync(
   binary: string,
   environment: Record<string, string | undefined>,
@@ -357,11 +360,12 @@ async function readCurrentPaneAsync(
   }
   if (timedOut || exitCode !== 0) {
     const detail = Buffer.from(stderr).toString('utf8').trim().slice(-2_000)
-    throw new Error(
+    throw new HerdrObservationUnavailableError(
       `Herdr current pane verification ${timedOut ? 'timed out' : 'failed'}: ${detail}`,
     )
   }
-  return parseCurrentPane(stdout)
+  try { return parseCurrentPane(stdout) }
+  catch { throw new HerdrObservationUnavailableError('Herdr current pane verification returned an incomplete observation') }
 }
 
 /**
