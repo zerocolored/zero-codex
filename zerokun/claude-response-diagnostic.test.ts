@@ -104,11 +104,12 @@ test('stores terminal content privately with a verifiable receipt, replacing the
 
 test('suppresses credential-bearing output before truncation and redacts common identifying text', () => {
   const options = fixture()
-  for (const secret of ['xoxb-' + 'a'.repeat(30), '-----BEGIN PRIVATE KEY-----\nprivate-body\n-----END PRIVATE KEY-----']) {
+  for (const secret of ['xoxb-' + 'a'.repeat(30), '-----BEGIN PRIVATE KEY-----\nU1lOVEhFVElDX0tFWV9CT0RZ\n-----END PRIVATE KEY-----', 'Bearer %22synthetic-credential-value%22', '-----BEGIN%20PRIVATE%20KEY-----\nU1lOVEhFVElDX0tFWV9CT0RZ\n-----END%20PRIVATE%20KEY-----']) {
     const receipt = saveClaudeResponseDiagnostic({ ...options, transcript: 'あ'.repeat(40000) + secret })
     const content = readFileSync(join(options.stateDir, receipt.path!), 'utf8')
     expect(content).not.toContain(secret)
-    expect(content).not.toContain('private-body')
+    expect(content).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
+    expect(content).not.toContain('synthetic-credential-value')
     expect(JSON.parse(content).transcript.credentialSuppressed).toBe(true)
   }
   const receipt = saveClaudeResponseDiagnostic({ ...options, transcript: 'https://example.invalid/?key=abc name@example.invalid /Users/someone/project' })

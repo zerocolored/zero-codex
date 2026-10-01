@@ -336,7 +336,7 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
             prefix = "The sole exception to the file-write prohibition is this caller-created file: "
             output = json.loads(next(line[len(prefix):] for line in prompt.splitlines() if line.startswith(prefix)))
             nonce = marker.split("=", 1)[1]
-            body = "\\n".join("synthetic FAQ %d" % i for i in range(1, state["answer_file_lines"] + 1))
+            body = state.get("answer_body", "\\n".join("synthetic FAQ %d" % i for i in range(1, state["answer_file_lines"] + 1)))
             raw = "CLAUDE_ANSWER_BEGIN=" + nonce + "\\n" + body + "\\nCLAUDE_ANSWER_END=" + nonce + "\\n"
             with open(output, "w", encoding="utf-8") as handle:
                 handle.write(raw)
@@ -356,7 +356,7 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
             print(capture.replace(state["capture_marker"], marker))
         else:
             print(prompt.rstrip("\\n"))
-            print("Claude independent review completed")
+            print(state.get("answer_body", "Claude independent review completed"))
             print(marker)
             print("❯")
     raise SystemExit(0)
@@ -1926,6 +1926,57 @@ print('review complete')
         const replay = await fixture.call('investigation', 'revision-two')
         expect(replay.payload.claude.response).toBe(expected)
       }
+      const after = JSON.parse(readFileSync(path, 'utf8'))
+      expect(after.prompt_count).toBe(1)
+      expect(after.close_count).toBe(1)
+      expect(after.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 40_000)
+
+  test.each(['file', 'terminal'])('Claude credential-shaped review is adopted, sanitized and restored: %s', async source => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const initial = JSON.parse(readFileSync(path, 'utf8'))
+      const token = 'xoxb-1234567890-abcdefghijklmnopqrstuvwxyz'
+      const prose = Array.from({ length: 1500 }, (_, i) => `Finding ${i + 1}`).join('\n')
+      const body = `${prose}\nBearer capability\nAuthorization: Bearer <token>\nAuthorization: Bearer %22synthetic-encoded-credential%22\n${token}\n-----BEGIN%20PRIVATE%20KEY-----\nU1lOVEhFVElDX0tFWV9CT0RZ\n-----END%20PRIVATE%20KEY-----\nFinal finding.`
+      initial.answer_body = body
+      if (source === 'file') initial.answer_file_lines = 1
+      writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
+      const result = await fixture.call('investigation', 'revision-two')
+      expect(result.payload.claude).toMatchObject({ adopted: true, responseRedacted: true, cleanupVerified: true })
+      const response = result.payload.claude.response
+      expect(response).toStartWith(prose)
+      expect(response).toEndWith('Final finding.')
+      expect(response).toContain('[credential removed]')
+      expect(response).not.toContain(token)
+      expect(response).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
+      const journalPath = join(fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`, 'investigation-1.json')
+      const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
+      expect(journal.claude.responseDigest).toBe(createHash('sha256').update(response).digest('hex'))
+      expect(readInterruptedAdvisorSlots(journalPath, journal).claude?.response).toBe(response)
+      const diagnostic = readFileSync(join(fixture.state, result.payload.claude.responseDiagnostic.path), 'utf8')
+      const persisted = [diagnostic, JSON.stringify(result.payload), readFileSync(`${journalPath}.responses`, 'utf8'), readFileSync(`${journalPath}.slots`, 'utf8')]
+      if (source === 'file') {
+        const raw = readFileSync(join(fixture.state, result.payload.claude.answerArtifact.path), 'utf8')
+        persisted.push(raw)
+        const artifact = JSON.parse(raw)
+        const nonce = artifact.marker.slice('REQUEST_MARKER='.length)
+        const original = `CLAUDE_ANSWER_BEGIN=${nonce}\n${body}\nCLAUDE_ANSWER_END=${nonce}\n`
+        expect(artifact).toMatchObject({ response, redacted: true,
+          responseSha256: journal.claude.responseDigest, responseBytes: Buffer.byteLength(response),
+          sha256: createHash('sha256').update(original).digest('hex'), bytes: Buffer.byteLength(original) })
+      }
+      for (const raw of persisted) {
+        expect(raw).not.toContain(token)
+        expect(raw).not.toContain('synthetic-encoded-credential')
+        expect(raw).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
+      }
+      await fixture.restart()
+      const replay = await fixture.call('investigation', 'revision-two')
+      expect(replay.payload.claude).toMatchObject({ adopted: true, response, responseRedacted: true })
       const after = JSON.parse(readFileSync(path, 'utf8'))
       expect(after.prompt_count).toBe(1)
       expect(after.close_count).toBe(1)
