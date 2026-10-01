@@ -157,6 +157,34 @@ class AnswerFileContractTests(unittest.TestCase):
         with self.assertRaises(self.m['UnsafeRequest']):
             self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
 
+    def test_gui_contract_adds_only_the_owned_artifact_root(self):
+        with tempfile.TemporaryDirectory(prefix='zero-fable-gui-') as temporary:
+            root = Path(temporary).resolve()
+            for name in ('input', 'prototype', 'evidence', 'runtime'):
+                (root / name).mkdir(mode=0o700)
+            st = root.stat()
+            manifest = dict(version=1, root=str(root), dev=st.st_dev, ino=st.st_ino,
+                            port=18347, width=1280, height=720)
+            path = self.root / 'ui-artifacts.json'
+            path.touch(mode=0o600)
+            path.write_text(json.dumps(manifest))
+            self.assertEqual(self.m['_ui_artifact_manifest'](self.fd, self.root), manifest)
+            self.output.touch(mode=0o600)
+            gui = self.m['_answer_file_instruction'](self.fd, self.root, self.marker, manifest)
+            normal = self.m['_answer_file_instruction'](self.fd, self.root, self.marker)
+            self.assertIn('loopback-only preview', gui)
+            self.assertNotIn('No other task-directed file write', gui)
+            self.assertIn('No other task-directed file write', normal)
+            command = self.m['_claude_start_command']('fifth-test', 'w1:p1', str(self.root), manifest)
+            args = command[command.index('--') + 1:]
+            self.assertTrue(self.m['_valid_claude_option_arguments'](args, str(self.root), manifest))
+            self.assertFalse(self.m['_valid_claude_option_arguments'](args, str(self.root)))
+            self.assertFalse(self.m['_valid_claude_option_arguments'](args + ['--add-dir=/tmp'], str(self.root), manifest))
+            manifest['ino'] += 1
+            path.write_text(json.dumps(manifest))
+            with self.assertRaises(self.m['UnsafeRequest']):
+                self.m['_ui_artifact_manifest'](self.fd, self.root)
+
     def test_long_instructions_are_preserved_with_one_short_execution_request(self):
         full = 'Review the synthetic task.\n' * 2000 + self.marker + '\n'
         prompt = self.m['_file_prompt_transport'](self.fd, self.root, full, self.marker)

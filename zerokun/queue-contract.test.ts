@@ -235,6 +235,8 @@ describe('Zero-kun Codex wiring', () => {
     expect(executor).toContain('const advisorMcp = testCodexBin === undefined')
     expect(executor).toContain("'complete', processNonce")
     expect(executor).toContain('zerokun_advisors is the only permitted route')
+    expect(executor).toContain('full_hearing_skip=true), omit uiProposal')
+    expect(executor).toContain('Do not create hearing artifacts or wait for direction approval.')
     expect(executor).toContain('Base any advisor-count statement only on slotSummary')
     expect(executor).not.toContain('const advisorMcp = undefined')
   })
