@@ -12,6 +12,7 @@ import { classifyFleetRequest, separateSecurityWorkflow, readProjectFleet, fleet
 import { App } from '@slack/bolt'
 import { startConfiguredFleet } from './zerokun/fleet-runtime.ts'
 import { createHash, randomBytes } from 'crypto'
+import { parseNativeConfirmationAnswer } from './zerokun/native-confirmation.ts'
 import {
   closeSync, constants, existsSync, fsyncSync, openSync, writeFileSync,
   mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync,
@@ -658,6 +659,10 @@ async function admitSlackChannelThreadReply(input: {
   fileIds?: string[]
   budgetLane?: SlackBudgetLane
 }): Promise<ThreadReplyAdmission> {
+  // Host-issued confirmation commands address the host directly. Their user,
+  // thread, lease and native-process binding are checked in deliver(), never
+  // decided by the audience classifier or interpreted as a model instruction.
+  if (parseNativeConfirmationAnswer(normalizeSlackInboundText(input.text, botUserId, false))) return 'addressed'
   if (cloudRuntime && explicitlyAddressedHandoff(input.text, botUserId)) return 'addressed'
   if (input.channelId.startsWith('D') || input.threadTs === input.messageTs) {
     return 'addressed'
@@ -1445,6 +1450,21 @@ function deliver(
   const handOver = (async () => {
     const access = loadAccess()
     const writeEnabled = resolveInboundWriteEnabled(chatId, userId, access.writeAllowFrom)
+    const confirmation = parseNativeConfirmationAnswer(normalizeSlackInboundText(text, botUserId, chatId.startsWith('D')))
+    if (confirmation) {
+      const answered = jobStore.nativeConfirmations.answer({ ...confirmation, chatId,
+        threadTs: resolvedThreadTs, userId, messageId: messageTs, writeEnabled })
+      // A confirmation reply is never queued as a new task or used to steer the
+      // model. The runner holding the original stdin consumes it once.
+      jobStore.recordDeliveryTombstone(key)
+      rememberDelivered(key)
+      if (!answered) {
+        await slackApp!.client.chat.postEphemeral({ channel: chatId, thread_ts: resolvedThreadTs,
+          user: userId, text: 'この確認には回答できません。依頼したご本人が、現在有効な確認番号を使って返信してください。',
+        }).catch(() => {})
+      }
+      return true
+    }
     const cloudAction = cloudRuntime ? handoffControl(text) : null
     if (cloudRuntime && cloudAction && botUserId && threadTs && !chatId.startsWith('D')) {
       const waiting = await cloudRuntime.client.find(chatId, threadTs)

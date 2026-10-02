@@ -3,6 +3,7 @@ import { executeSecurityAudit, copyAuditReportForFollowup } from './security-aud
 import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
+import { NativeConfirmationStore, awaitNativeConfirmation } from './native-confirmation.ts'
 import { fleetReplyForDelivery } from './fleet-query.ts'
 import { toSlackMrkdwn } from './slack-mrkdwn.ts'
 import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
@@ -4356,6 +4357,7 @@ export function requireSafeDatabasePath(dbPath: string): void {
 
 export class JobStore {
   private readonly db: Database
+  readonly nativeConfirmations: NativeConfirmationStore
 
   constructor(readonly dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 })
@@ -4407,6 +4409,7 @@ export class JobStore {
       chmodSync(`${dbPath}-wal`, 0o600)
       chmodSync(`${dbPath}-shm`, 0o600)
     } catch {}
+    this.nativeConfirmations = new NativeConfirmationStore(this.db)
     this.migrateLegacyThreadAttachments(dirname(dbPath))
   }
 
@@ -19010,6 +19013,16 @@ async function runCli(): Promise<void> {
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId, executionJob.repoPath),
             onSessionReset: () => store.clearSession(job.id),
+            onNativeConfirmation: (request, signal) => awaitNativeConfirmation({
+              store: store.nativeConfirmations,
+              binding: { ...request, jobId: job.id, epoch: job.controlEpoch },
+              signal,
+              prepareText: text => {
+                const current = store.get(job.id) ?? job
+                return sanitizeExecutionTextForSlack(current, current.sessionId ?? '', text, dir, [], 'progress')
+              },
+              publish: event => executionContext.reportCommentary(event),
+            }),
             liveControls: {
               recordGoalStatus: status => store.recordTaskGoalStatus(job.id, status),
               next: () => store.nextReadyLiveInput(job.id, job.controlEpoch),
