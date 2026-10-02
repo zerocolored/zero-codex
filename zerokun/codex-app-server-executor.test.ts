@@ -1,4 +1,5 @@
 import { registerNativeAdvisor } from './native-advisor-recovery.ts'
+import { awaitNativeConfirmation, parseNativeConfirmationAnswer } from './native-confirmation.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'crypto'
 import {
@@ -18,6 +19,7 @@ import { dirname, join } from 'path'
 import {
   JobStore,
   SlackNotifier,
+  sanitizeExecutionTextForSlack,
   finalizeSuccessfulExecution,
   extractArtifactPaths,
   createExecutorPidLifecycle,
@@ -368,6 +370,10 @@ for line in sys.stdin:
     value = json.loads(line)
     method = value.get("method")
     request_id = value.get("id")
+    if mode == "native-upload" and method is None and request_id == 0:
+        action = value.get("result", {}).get("action", "missing")
+        emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "native result: " + action}], "error": None}}})
+        continue
     rpc_log = os.environ.get("ZERO_RPC_LOG")
     log_handshakes = os.environ.get("ZERO_LOG_HANDSHAKES") == "1"
     if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume", "thread/inject_items"))):
@@ -505,6 +511,14 @@ for line in sys.stdin:
                 emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
                 emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
             emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
+        if mode == "native-upload":
+            emit({"id": 0, "method": "mcpServer/elicitation/request", "params": {
+                "threadId": "foreign-thread" if os.environ.get("ZERO_NATIVE_CONFIRMATION_FOREIGN") else (requested_thread or thread_id),
+                "turnId": turn_id, "serverName": "node_repl", "mode": "form",
+                "requestedSchema": {"type": "object", "properties": {}},
+                "_meta": {"codex_approval_kind": "mcp_tool_call", "connector_id": "browser-use", "tool_name": "upload_browser_files", "file_transfer": "upload", "tool_params": {"origin": "https://example.com"}}
+            }})
+            continue
         if mode == "late-command-completion":
             late_item_type = os.environ.get("ZERO_LATE_ITEM_TYPE", "commandExecution")
             if not os.environ.get("ZERO_LATE_START"):
@@ -1058,7 +1072,7 @@ if mode == "logical-stop-required":
 }
 
 function fixture(
-  mode: 'normal' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
+  mode: 'normal' | 'native-upload' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
     | 'interjection-answer' | 'interjection-update' | 'interjection-late-answer'
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
@@ -2632,6 +2646,40 @@ describe('production App Server executor', () => {
     })
     value.store.close()
   }, 30_000)
+
+  test.each([{ write: true, foreign: false, action: 'accept' },
+    { write: false, foreign: false, action: 'cancel' }, { write: true, foreign: true, action: 'cancel' }])(
+    'native upload confirmation stays bound to the writable root turn: %j', async scenario => {
+      const value = fixture('native-upload', scenario.write)
+      let posted = 0
+      try {
+        const result = await executeCodexJob(value.job, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true, liveControls: value.hooks,
+          extraEnvironment: { ZERO_FIXTURE_MODE: 'native-upload',
+            ...(scenario.foreign ? { ZERO_NATIVE_CONFIRMATION_FOREIGN: '1' } : {}) },
+          onNativeConfirmation: (request, signal) => awaitNativeConfirmation({
+            store: value.store.nativeConfirmations, signal,
+            binding: { ...request, jobId: value.job.id, epoch: value.job.controlEpoch },
+            prepareText: text => sanitizeExecutionTextForSlack(value.job, '', text, value.state, [], 'progress'),
+            publish: event => {
+              posted++
+              value.store.stageCommentaryNotification(value.job.id, value.job.attempts, event.sourceKey, `💬 ${event.text}`)
+              const notice = value.store.pendingCommentaryNotifications()[0]!
+              value.store.markCommentaryNotificationDelivered(notice.id)
+              const line = event.text.split('\n').find(line => line.startsWith('今回だけ許可 '))!
+              expect(value.store.nativeConfirmations.answer({ ...parseNativeConfirmationAnswer(line)!,
+                chatId: value.job.chatId, threadTs: value.job.threadTs, userId: value.job.userId,
+                messageId: '1800000000.000200', writeEnabled: scenario.write })).toBe(true)
+              return true
+            },
+          }),
+        })
+        expect(result.result).toBe(`native result: ${scenario.action}`)
+        expect(posted).toBe(scenario.action === 'accept' ? 1 : 0)
+      } finally { value.store.close() }
+    }, 30_000,
+  )
 
   test('resumeでもprimary modelと推論強度を再固定する', async () => {
     const value = fixture('normal', true)

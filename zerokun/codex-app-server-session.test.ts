@@ -55,17 +55,143 @@ function mockTransport(
 }
 
 describe('Codex App Server session', () => {
-  test.each([1, 'native-request'])('server request %s cannot resolve a client RPC or receive automatic approval', async id => {
-    const transport = mockTransport((request, emit) => {
-      emit({ id, method: 'mcpServer/elicitation/request', params: { message: 'User approval required' } })
+  test('a delayed confirmation keeps notifications and colliding client RPCs alive, then accepts exactly once', async () => {
+    const transport = mockTransport()
+    let answer!: (value: 'accept') => void
+    const observed: string[] = []
+    const session = new CodexAppServerSession(transport.input, transport.stream, {
+      onElicitation: () => new Promise(resolve => { answer = resolve }),
+      onNotification: notification => observed.push(notification.method),
     })
-    const session = new CodexAppServerSession(transport.input, transport.stream)
-    await expect(session.request('config/read', {})).rejects.toThrow(
-      'App Server requires client interaction: mcpServer/elicitation/request',
-    )
+    const rpc = session.request('config/read', {})
+    transport.emit({ id: 1, method: 'mcpServer/elicitation/request', params: { threadId: 't', turnId: 'v' } })
+    transport.emit({ method: 'thread/status/changed', params: { threadId: 't', status: { type: 'active' } } })
+    transport.emit({ id: 1, result: { config: {} } })
+    expect((await rpc).result).toEqual({ config: {} })
+    expect(observed).toContain('thread/status/changed')
     expect(transport.sent).toHaveLength(1)
+    answer('accept')
+    await Bun.sleep(0)
+    expect(transport.sent[1]).toEqual({ id: 1, result: { action: 'accept', content: {}, _meta: null } })
+    session.closeInput(); await session.waitForReader()
+  })
+
+  test.each(['close', 'resolved', 'eof'] as const)('late approval after %s never writes to stdin', async ending => {
+    const transport = mockTransport()
+    let answer!: (value: 'accept') => void
+    let signal!: AbortSignal
+    const session = new CodexAppServerSession(transport.input, transport.stream, {
+      onElicitation: (_request, abort) => { signal = abort; return new Promise(resolve => { answer = resolve }) },
+    })
+    transport.emit({ id: 0, method: 'mcpServer/elicitation/request', params: { threadId: 't', turnId: 'v' } })
+    await Bun.sleep(0)
+    if (ending === 'resolved') transport.emit({ method: 'serverRequest/resolved', params: { threadId: 't', requestId: 0 } })
+    else if (ending === 'close') session.closeInput()
+    else transport.close()
+    await Bun.sleep(0)
+    expect(signal.aborted).toBe(true)
+    answer('accept'); await Bun.sleep(0)
+    expect(transport.sent).toHaveLength(0)
+    if (ending === 'resolved') session.closeInput()
+    await session.waitForReader()
+  })
+
+  test('callback failure is a cancellation, not a reader crash or user decline', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream, {
+      onElicitation: async () => { throw new Error('unavailable') },
+    })
+    transport.emit({ id: 0, method: 'mcpServer/elicitation/request', params: {} })
+    await Bun.sleep(0)
+    expect(transport.sent[0]).toMatchObject({ id: 0, result: { action: 'cancel', content: null } })
+    session.closeInput(); await session.waitForReader()
+  })
+
+  test('a duplicate pending server ID cancels once and cannot replay a late accept', async () => {
+    const transport = mockTransport()
+    let answer!: (value: 'accept') => void
+    const session = new CodexAppServerSession(transport.input, transport.stream, {
+      onElicitation: () => new Promise(resolve => { answer = resolve }),
+    })
+    const request = { id: 0, method: 'mcpServer/elicitation/request', params: {} }
+    transport.emit(request); await Bun.sleep(0)
+    transport.emit(request); await Bun.sleep(0)
+    answer('accept'); await Bun.sleep(0)
+    expect(transport.sent).toHaveLength(1)
+    expect(transport.sent[0]).toMatchObject({ id: 0, result: { action: 'cancel' } })
+    session.closeInput(); await session.waitForReader()
+  })
+
+  test('an uncertain confirmation write is surfaced once and is never retried', async () => {
+    const transport = mockTransport()
+    let writes = 0
+    transport.input.write = () => { writes++; throw new Error('EPIPE') }
+    const session = new CodexAppServerSession(transport.input, transport.stream, { onElicitation: async () => 'accept' })
+    transport.emit({ id: 0, method: 'mcpServer/elicitation/request', params: {} })
+    expect(String(await session.waitForReaderFailure())).toContain('EPIPE')
     session.closeInput()
-    await expect(session.waitForReader()).rejects.toThrow('requires client interaction')
+    await expect(session.waitForReader()).rejects.toThrow('EPIPE')
+    expect(writes).toBe(1)
+  })
+
+  test.each([0, 1, 'native-request'])('elicitation %s is canceled without resolving a colliding client RPC or killing the session', async id => {
+    const transport = mockTransport((request, emit) => {
+      if (request.method === 'config/read') emit({ id, method: 'mcpServer/elicitation/request', params: {
+        threadId: 'thread', turnId: 'turn', serverName: 'node_repl', mode: 'form',
+        message: 'Allow upload to https://example.test',
+        requestedSchema: { type: 'object', properties: {} },
+      } })
+    })
+    const observed: string[] = []
+    const session = new CodexAppServerSession(transport.input, transport.stream, {
+      onNotification: notification => observed.push(notification.method),
+    })
+    let settled = false
+    const pending = session.request('config/read', {}).then(result => { settled = true; return result })
+    await Bun.sleep(0)
+    expect(settled).toBe(false)
+    expect(transport.sent[1]).toEqual({ id, result: {
+      action: 'cancel', content: null, _meta: { 'zerochan/clientInteractionUnavailable': true },
+    } })
+    transport.emit({ method: 'serverRequest/resolved', params: { threadId: 'thread', requestId: id } })
+    transport.emit({ id: 1, result: { config: { model: 'still-connected' } } })
+    expect((await pending).result).toEqual({ config: { model: 'still-connected' } })
+    expect(observed).toContain('serverRequest/resolved')
+    const next = session.request('configRequirements/read', {})
+    transport.emit({ id: 2, result: { requirements: null } })
+    expect((await next).result).toEqual({ requirements: null })
+    session.closeInput()
+    await session.waitForReader()
+  })
+
+  test('unsupported server requests receive a request-local error without disclosing params or granting approval', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream)
+    for (const method of ['item/commandExecution/requestApproval', 'item/tool/requestUserInput', 'future/request']) {
+      transport.emit({ id: method, method, params: { sensitive: 'never-echo-this' } })
+    }
+    await Bun.sleep(0)
+    expect(transport.sent).toHaveLength(3)
+    for (const response of transport.sent) {
+      expect(response.error).toMatchObject({ code: -32601 })
+      expect(response.result).toBeUndefined()
+      expect(JSON.stringify(response)).not.toContain('never-echo-this')
+    }
+    const pending = session.request('config/read', {})
+    transport.emit({ id: 1, result: { config: {} } })
+    await pending
+    session.closeInput()
+    await session.waitForReader()
+  })
+
+  test('late server requests after input close are not written or retried', async () => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession({ write: transport.input.write }, transport.stream)
+    session.closeInput()
+    transport.emit({ id: 0, method: 'mcpServer/elicitation/request', params: {} })
+    transport.close()
+    await session.waitForReader()
+    expect(transport.sent).toEqual([])
   })
 
   test.each(['thread/start', 'thread/resume'])('%s preserves native Auto-review and rejects downgrade', async method => {

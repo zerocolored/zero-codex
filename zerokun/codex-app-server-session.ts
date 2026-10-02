@@ -592,6 +592,9 @@ export class CodexAppServerSession {
   })
   private readerClosed = false
   private inputClosed = false
+  private readonly elicitations = new Map<number | string, {
+    controller: AbortController; threadId: unknown; turnId: unknown
+  }>()
   private itemsListState: 'unknown' | 'supported' | 'unsupported' = 'unknown'
   private codexHome: string | null = null
   private readonly reader: ReadableStreamDefaultReader<Uint8Array>
@@ -603,6 +606,8 @@ export class CodexAppServerSession {
     private readonly options: {
       onOutputChunk?(value: Uint8Array): void
       onNotification?(notification: AppServerNotification): void
+      onElicitation?(request: { id: number | string; params: Record<string, unknown> },
+        signal: AbortSignal): Promise<'accept' | 'decline' | 'cancel'>
     } = {},
   ) {
     this.reader = output.getReader()
@@ -859,9 +864,26 @@ export class CodexAppServerSession {
     // JSON-RPC requests and responses have independent ID namespaces. A server
     // request may reuse a pending client ID; it must never resolve that RPC.
     // Native auto_review handles eligible approvals within Codex. Remaining
-    // client requests need a user-capable client, not a fabricated accept reply.
+    // client requests are normal protocol traffic, not a broken stdout stream.
     if ('id' in parsed && typeof parsed.method === 'string') {
-      throw new AppServerProtocolError(`App Server requires client interaction: ${parsed.method}`)
+      const id = parsed.id
+      if (!(typeof id === 'number' && Number.isSafeInteger(id))
+        && !(typeof id === 'string' && id.length > 0 && id.length <= 512)) {
+        throw new AppServerProtocolError('App Server client interaction id is invalid')
+      }
+      // A late request after shutdown cannot receive a reply. Do not reopen
+      // stdin, retry an uncertain write, or touch the client pending-RPC map.
+      if (this.inputClosed) return
+      if (parsed.method === 'mcpServer/elicitation/request') {
+        this.handleElicitation(id, record(parsed.params ?? {}, 'elicitation params'))
+        return
+      }
+      const response = { id, error: {
+          code: -32601,
+          message: 'Zerochan does not support this client interaction. No user answer or approval was supplied.',
+        } }
+      this.input.write(`${JSON.stringify(response)}\n`)
+      return
     }
     if (typeof parsed.id === 'number') {
       const pending = this.pending.get(parsed.id)
@@ -908,6 +930,15 @@ export class CodexAppServerSession {
       params: record(parsed.params ?? {}, `App Server ${parsed.method} params`),
       sequence: ++this.notificationSequence,
     }
+    if (notification.method === 'serverRequest/resolved') {
+      const request = this.elicitations.get(notification.params.requestId as string | number)
+      if (request && request.threadId === notification.params.threadId) request.controller.abort()
+    } else if (notification.method === 'turn/completed') {
+      const turn = record(notification.params.turn, 'completed turn')
+      for (const request of this.elicitations.values()) {
+        if (request.threadId === notification.params.threadId && request.turnId === turn.id) request.controller.abort()
+      }
+    }
     if ((notification.method === 'item/started' || notification.method === 'item/completed')
       && this.deferUnstartedItem(notification)) return
     if (notification.method === 'turn/started') {
@@ -950,9 +981,43 @@ export class CodexAppServerSession {
     this.wakeNotificationWaiters()
   }
 
-  private async readLoop(): Promise<void> {
-    const fail = (error: unknown): void => {
+  private abortElicitations(): void {
+    for (const request of this.elicitations.values()) request.controller.abort()
+    this.elicitations.clear()
+  }
+
+  private handleElicitation(id: number | string, params: Record<string, unknown>): void {
+    // One live confirmation per session. A duplicate ID cancels its predecessor
+    // and receives one cancellation, never a second accept from a late reply.
+    const previous = this.elicitations.get(id)
+    previous?.controller.abort()
+    if (previous) this.elicitations.delete(id)
+    const reply = (action: 'accept' | 'decline' | 'cancel') => {
+      this.input.write(`${JSON.stringify({ id, result: {
+        action, content: action === 'accept' ? {} : null,
+        _meta: action === 'cancel' ? { 'zerochan/clientInteractionUnavailable': true } : null,
+      } })}\n`)
+    }
+    if (!this.options.onElicitation || previous || this.elicitations.size > 0) {
+      reply('cancel')
+      return
+    }
+    const request = { controller: new AbortController(), threadId: params.threadId, turnId: params.turnId }
+    this.elicitations.set(id, request)
+    void Promise.resolve().then(() => this.options.onElicitation!({ id, params }, request.controller.signal))
+      .catch(() => 'cancel' as const)
+      .then(action => {
+        if (request.controller.signal.aborted || this.inputClosed || this.readerClosed
+          || this.readerFailure !== undefined || this.elicitations.get(id) !== request) return
+        try { reply(action) } catch (error) { this.failReader(error) }
+      }).finally(() => {
+        if (this.elicitations.get(id) === request) this.elicitations.delete(id)
+      })
+  }
+
+  private failReader(error: unknown): void {
       this.readerFailure ??= error ?? new AppServerProtocolError('App Server output failed')
+      this.abortElicitations()
       this.signalReaderFailure(this.readerFailure)
       this.buffer = ''
       // Notify the owner before EOF so it can terminate the server. Keep
@@ -960,7 +1025,9 @@ export class CodexAppServerSession {
       // the supervisor, preventing the very cleanup that the owner awaits.
       this.rejectPending(this.readerFailure)
       this.wakeNotificationWaiters()
-    }
+  }
+
+  private async readLoop(): Promise<void> {
     try {
       while (true) {
         const chunk = await this.reader.read()
@@ -989,7 +1056,7 @@ export class CodexAppServerSession {
           }
           this.buffer += text.slice(start)
         } catch (error) {
-          fail(error)
+          this.failReader(error)
         }
       }
       if (this.readerFailure === undefined) {
@@ -997,9 +1064,10 @@ export class CodexAppServerSession {
         if (this.buffer.trim()) this.consumeLine(this.buffer)
       }
     } catch (error) {
-      fail(error)
+      this.failReader(error)
     } finally {
       this.readerClosed = true
+      this.abortElicitations()
       this.rejectPending(this.readerFailure ?? 'stdout closed')
       this.wakeNotificationWaiters()
       this.reader.releaseLock()
@@ -1796,6 +1864,7 @@ export class CodexAppServerSession {
   closeInput(): void {
     if (this.inputClosed) return
     this.inputClosed = true
+    this.abortElicitations()
     this.input.end?.()
   }
 

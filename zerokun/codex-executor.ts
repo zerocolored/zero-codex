@@ -1,4 +1,5 @@
 import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCliConfig } from './deployment-cli-runtime.ts'
+import { browserUploadConfirmation, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
 import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
 import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
 import { waitForAdvisorSettlement } from './advisor-settlement.ts'
@@ -4081,6 +4082,14 @@ export function buildCodexDeveloperInstructions(
       'not a pending user dialog. Report the actual rejected action and reason; never invent an approval',
       'request or wait for a dialog that was not emitted. Use an already-authorized alternative when',
       'Codex permits it. Do not bypass a denial or infer consent for unrelated or broader effects.',
+      'The host can relay native Browser Use empty upload confirmations to the requesting user',
+      'in the same Slack thread. It waits for an exact reply containing the host-issued confirmation code',
+      'and returns that answer to the same pending native request. Do not invent a confirmation code.',
+      'Only that host-issued confirmation can be answered this way; a generic continue is not approval.',
+      'Other native MCP elicitation requests are answered with action=cancel; no user answer is fabricated.',
+      'That client cancellation does not mean the user declined, and does not approve the operation.',
+      'Explain the exact requested interaction and client limitation; do not claim a dialog is open',
+      'or promise that a generic Slack reply can answer an unsupported native confirmation.',
       'Actual user or tool denials, including Browser Use upload refusals, remain binding across resume.',
       'A user decline withdraws authorization for that effect; do not retry it through another route.',
       'Retry a denied effect only after the applicable authorization or permission has actually changed',
@@ -6578,6 +6587,8 @@ export async function executeCodexJob(
     onProcessId?(processId: number): void
     onSessionId?(sessionId: string): void
     onSessionReset?(): void
+    onNativeConfirmation?(request: NativeConfirmation & { requestId: number | string; executorNonce: string },
+      signal: AbortSignal): Promise<NativeConfirmationDecision>
     onProcessExit?(exitCode: number): void
     onStdoutChunk?(value: Uint8Array): void
     onStderrChunk?(value: Uint8Array): void
@@ -7709,6 +7720,13 @@ export async function executeCodexJob(
       // turn.
       let notificationTurnId: string | null = null
       const session = new CodexAppServerSession(proc.stdin, proc.stdout, {
+        onElicitation: async ({ id, params }, signal) => {
+          const confirmation = browserUploadConfirmation(params)
+          if (!job.writeEnabled || !confirmation || !options.onNativeConfirmation
+            || confirmation.threadId !== monitorParentThreadId || confirmation.turnId !== notificationTurnId) return 'cancel'
+          return options.onNativeConfirmation({ ...confirmation, requestId: id,
+            executorNonce: advisorAttempt.attemptNonce }, signal)
+        },
         onOutputChunk: value => {
           processOutputRevision += 1
           diagnosticTail.write(value)
