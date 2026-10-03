@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
+import { browserScreenshotFromNotification } from './codex-monitor-display.ts'
 import { createHash } from 'crypto'
 import {
   appendFileSync,
@@ -13084,7 +13085,7 @@ describe('Slack output guard', () => {
     })
   })
 
-  test('hostが取得したbrowser画像をmodel markerなしでも封印対象へ統合する', () => {
+  test.each(['png', 'jpeg'] as const)('hostが取得したbrowser画像をmodel markerなしでも封印対象へ統合する: %s', format => {
     const state = fixtureDir()
     const repo = join(state, 'browser-artifact-repo')
     mkdirSync(repo)
@@ -13096,12 +13097,25 @@ describe('Slack output guard', () => {
     const captureDir = browserCaptureDirForJob(state, job.id)
     mkdirSync(captureDir, { recursive: true, mode: 0o700 })
     chmodSync(captureDir, 0o700)
-    const screenshot = join(captureDir, 'browser-capture.png')
-    const source = Buffer.from(
+    const screenshot = join(captureDir, `browser-capture.${format}`)
+    let source = Buffer.from(
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
       'base64',
     )
-    writeFileSync(screenshot, source, { mode: 0o600 })
+    if (format === 'jpeg') {
+      const inputPng = join(state, 'fixture.png')
+      writeFileSync(inputPng, source)
+      expect(Bun.spawnSync(['/usr/bin/sips', '-s', 'format', 'jpeg', inputPng, '--out', screenshot],
+        { stdout: 'ignore', stderr: 'ignore' }).exitCode).toBe(0)
+      source = readFileSync(screenshot)
+    }
+    const captured = browserScreenshotFromNotification({ method: 'item/completed', sequence: 1,
+      params: { threadId: 'native-thread', turnId: 'native-turn', item: {
+        type: 'mcpToolCall', server: 'node_repl', tool: 'js', status: 'completed',
+        result: { content: [{ type: 'image', mimeType: `image/${format}`, data: source.toString('base64') }] },
+      } } }, 'native-thread', 'native-turn')!
+    expect(captured).toMatchObject({ width: 1, height: 1, format })
+    writeFileSync(screenshot, captured.bytes, { mode: 0o600 })
     const finalized = finalizeSuccessfulExecution(job, {
       sessionId: 'browser-artifact-session',
       result: '公開画面を確認しました。',
@@ -13114,7 +13128,7 @@ describe('Slack output guard', () => {
     const output = extractArtifactPaths(finalized.result)
     expect(output.text).toBe('公開画面を確認しました。')
     expect(output.files).toHaveLength(1)
-    expect(readFileSync(output.files[0]!).subarray(0, 8)).toEqual(source.subarray(0, 8))
+    expect(readFileSync(output.files[0]!).subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     expect(finalized.capturedArtifacts).toBeUndefined()
     store.close()
   })
