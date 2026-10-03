@@ -7789,7 +7789,7 @@ export async function executeCodexJob(
                   )
                   const screenshotPath = join(
                     captureDir,
-                    `browser-${digest.slice(0, 24)}-${screenshot.width}x${screenshot.height}.png`,
+                    `browser-${digest.slice(0, 24)}-${screenshot.width}x${screenshot.height}.${screenshot.format === 'jpeg' ? 'jpg' : 'png'}`,
                   )
                   atomicWritePrivateFile(screenshotPath, screenshot.bytes)
                   capturedBrowserArtifactDigests.add(digest)
