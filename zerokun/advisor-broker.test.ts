@@ -1,3 +1,4 @@
+import { requestAdvisorStop } from './advisor-settlement.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'crypto'
 import {
@@ -1259,8 +1260,8 @@ describe('advisor broker boundaries', () => {
     5_000,
   )
 
-  test('モデル回答は時間で打ち切らず起動helperだけ有限timeoutを持つ', () => {
-    expect(GROK_REVIEW_TIMEOUT_MS).toBeUndefined()
+  test('Grokは最低15分の有限予算を持ち起動helperも有限timeoutを持つ', () => {
+    expect(GROK_REVIEW_TIMEOUT_MS).toBe(15 * 60_000)
     expect(CLAUDE_HELPER_TIMEOUT_MS).toBe(140_000)
     const helper = readFileSync(join(import.meta.dir, 'fifth-advisor.py'), 'utf8')
     const seconds = (name: string) => Number(helper.match(new RegExp(`^${name} = ([0-9]+)$`, 'm'))![1])
@@ -2033,7 +2034,7 @@ print('review complete')
     } finally { await fixture.close() }
   }, 40_000)
 
-  test('Claude workspace作成前の失敗も残留requestで再試行を妨げない', async () => {
+  test('Claude workspace作成失敗は同じroundで再起動せず取得済み回答を保持する', async () => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
       const path = fixture.externalEvidence!.fakeHerdrState
@@ -2041,11 +2042,11 @@ print('review complete')
       state.create_failures = 1
       writeFileSync(path, JSON.stringify(state), { mode: 0o600 })
       const result = await fixture.call('investigation', 'revision-two')
-      expect(result.payload).toMatchObject({ complete: true, allAdopted: true,
-        slotSummary: { responsesObtained: 3 } })
+      expect(result.payload).toMatchObject({ attemptsFinished: true, allAdopted: false,
+        slotSummary: { responsesObtained: 2 } })
       const after = JSON.parse(readFileSync(path, 'utf8'))
       expect(after.create_failures).toBe(0)
-      expect(after.prompt_count).toBe(1)
+      expect(after.prompt_count).toBe(0)
       expect(after.owned).toBe(false)
     } finally { await fixture.close() }
   }, 180_000)
@@ -4439,3 +4440,28 @@ test('認証待ち後の終端設定errorはGrok待機中のpollへ古い認証�
     expect(final.owned).toBe(false)
   } finally { await fixture.close() }
 }, 65_000)
+
+
+test('親の回答完成で未完了Claudeをexact cleanupしGrok回答を保持してroundを解放する', async () => {
+  let stopped = false
+  const fixture = await brokerFixture({ externalSuccess: true, claudeBlocked: true,
+    onPendingResult: () => {
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      if (stopped || state.prompt_count !== 1) return
+      stopped = true
+      requestAdvisorStop(join(fixture.journalRoot, 'active-round.lock'))
+    },
+  })
+  try {
+    const result = await fixture.call('investigation', 'revision-two')
+    expect(stopped).toBe(true)
+    expect(result.payload).toMatchObject({ attemptsFinished: true, allAdopted: false,
+      claude: { adopted: false, cleanupVerified: true } })
+    expect((result.payload.grok as Array<{ adopted: boolean }>).every(slot => slot.adopted)).toBe(true)
+    const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+    expect(state.prompt_count).toBe(1)
+    expect(state.close_count).toBe(1)
+    expect(state.owned).toBe(false)
+    expect(existsSync(join(fixture.journalRoot, 'active-round.lock'))).toBe(false)
+  } finally { await fixture.close() }
+}, 60_000)

@@ -39,3 +39,15 @@ test('接続再試行のsleepは中止直後に終了し、新しいreadを送�
   await expect(pending).rejects.toBe(stopped)
   expect(calls).toBe(1)
 })
+
+
+test('接続不能が続いても全体期限を延長せず利用不能になる', async () => {
+  let now = 0, calls = 0
+  await expect(retryAdvisorConnection({
+    read: async () => { calls++; throw new Error('offline') },
+    retryable: () => true, timeoutMs: 3500, now: () => now,
+    wait: async ms => { now += ms },
+  })).rejects.toThrow('deadline exceeded')
+  expect(now).toBe(3500)
+  expect(calls).toBe(3)
+})

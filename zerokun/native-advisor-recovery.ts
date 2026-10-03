@@ -211,7 +211,7 @@ export async function settleNativeAdvisors(options: Options & {
   pollMs?: number
   retryableReadError?: (error: unknown) => boolean
 }): Promise<'settled' | 'interrupted' | 'timeout' | 'unavailable'> {
-  const deadline = options.timeoutMs === undefined ? Infinity : Date.now() + options.timeoutMs
+  const deadline = Date.now() + (options.timeoutMs ?? 15 * 60_000)
   const warned = new Set<string>()
   const interrupted = Symbol('native settlement interrupted')
   const timedOut = Symbol('native settlement probe timed out')

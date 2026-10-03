@@ -228,7 +228,7 @@ test('userMessageが公開されても登録済みのモデル情報を失わな
   expect(recovered[0]?.restored).toBe(true)
 })
 
-test('nativeレビューの既定待機は経過時間だけでは終了しない', async () => {
+test('nativeレビューの既定待機も有限で主処理を永久停止しない', async () => {
   const f = fixture(); f.child.turns[0].status = 'inProgress'
   const now = Date.now; let elapsed = 0; let settled = false
   Date.now = () => now() + elapsed
@@ -237,9 +237,7 @@ test('nativeレビューの既定待機は経過時間だけでは終了しな�
       .then(result => { settled = true; return result })
     elapsed = 3 * 60 * 60_000
     await Bun.sleep(15)
-    expect(settled).toBe(false)
-    f.complete()
-    expect(await waiting).toBe('settled')
+    expect(await waiting).toBe('timeout')
   } finally { Date.now = now; f.complete() }
 })
 

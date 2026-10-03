@@ -30,6 +30,7 @@ import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, sanitizeClaudeAnswer, ClaudeA
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
 import { claudeUiProposalSchema, createClaudeUiWorkspace, claudeUiInstructions, collectClaudeUiArtifacts,
   type ClaudeUiProposal, type ClaudeUiWorkspace } from './claude-ui-artifacts.ts'
+import { watchAdvisorStopRequest } from './advisor-settlement.ts'
 import { retryAdvisorConnection } from './advisor-connection-retry.ts'
 export { claudeSubscriptionStatusIsReady } from './claude-auth-status.ts'
 import {
@@ -305,8 +306,9 @@ const MAX_REPOSITORY_SNAPSHOT_BYTES = 16 * 1024 * 1024
 const MAX_TRANSCRIPT_CHARS = 256 * 1024
 const MAX_OUTPUT_BYTES = 256 * 1024
 export const MAX_ADVISOR_PROMPT_BYTES = 2 * 1024 * 1024
-// Model work is bounded by cancellation, not elapsed wall-clock time.
-export const GROK_REVIEW_TIMEOUT_MS = undefined
+// Reviewer infrastructure must never hold a completed task indefinitely.
+export const GROK_REVIEW_TIMEOUT_MS = 15 * 60_000
+export const CLAUDE_REVIEW_TIMEOUT_MS = 60 * 60_000
 export const GROK_OAUTH_TIMEOUT_MS = 10 * 60 * 1_000
 export const CLAUDE_HELPER_TIMEOUT_MS = 140_000
 // Open includes Herdr's 310s process budget, startup dialogs/painting and
@@ -1089,8 +1091,9 @@ export function waitForClaudeSubscriptionLogin(
   })
 }
 
-function verifyAdvisorHerdrConnection(runtime: HerdrRuntimeIdentity): Promise<void> {
+function verifyAdvisorHerdrConnection(runtime: HerdrRuntimeIdentity, signal?: AbortSignal): Promise<void> {
   return retryAdvisorConnection({
+    signal,
     read: () => verifyHerdrRuntimeIdentityAsync(runtime, brokerEnvironment(runtime)),
     retryable: error => error instanceof HerdrObservationUnavailableError,
   })
@@ -1814,6 +1817,7 @@ async function main(): Promise<void> {
     reason,
   })
 
+  let roundSignal: AbortSignal | undefined
   const runGrokOnce = async (
     input: AdvisorInputSnapshot,
     phase: string,
@@ -1845,6 +1849,7 @@ async function main(): Promise<void> {
           ZEROKUN_SEATBELT_FINGERPRINT_DENY: fingerprintDeny,
         },
         timeoutMs: GROK_REVIEW_TIMEOUT_MS,
+        // Preserve the full minimum Grok budget even after the parent finishes.
         terminationGraceMs: 5_000,
       })
       if (grokReviewerAuthRequired(result)) {
@@ -2102,11 +2107,13 @@ async function main(): Promise<void> {
       // missing/stale monitor runtime cannot prevent the independent Grok slots
       // or the MCP transport itself from starting.
       claudeRuntime = readPinnedHerdrRuntime(stateDir)
-      await verifyAdvisorHerdrConnection(claudeRuntime)
+      roundSignal?.throwIfAborted()
+      await verifyAdvisorHerdrConnection(claudeRuntime, roundSignal)
       helperEnvironment = brokerHelperEnvironment(claudeRuntime, claudeLookupInput)
       diagnosticOperation = 'authentication'
       try {
         await waitForClaudeSubscriptionLogin(helperEnvironment, {
+          signal: roundSignal,
           onWaiting: value => {
             diagnosticFailure = { stage: 'startup', cause: value.cause, operation: 'authentication' }
             persistDiagnostic()
@@ -2162,6 +2169,7 @@ async function main(): Promise<void> {
       }
       persistDiagnostic()
 
+      roundSignal?.throwIfAborted()
       diagnosticOperation = 'open'
       workspaceCreationAttempted = true
       const opened = await runBounded(fingerprintedCommand(
@@ -2192,7 +2200,8 @@ async function main(): Promise<void> {
       } catch (error) {
         cleanupWarnings.push(`repository audit after Claude open unavailable: ${error}`)
       }
-      await verifyAdvisorHerdrConnection(claudeRuntime)
+      await verifyAdvisorHerdrConnection(claudeRuntime, roundSignal)
+      roundSignal?.throwIfAborted()
       deliveryUnknown = true
       failureStage = 'send'
       diagnosticOperation = 'send'
@@ -2221,10 +2230,13 @@ async function main(): Promise<void> {
         }
         failureStage = 'acquisition'
         if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
+        const acquisitionDeadline = Date.now() + CLAUDE_REVIEW_TIMEOUT_MS
         const settling = new ClaudeResponseSettling()
         const blockedSettling = new ClaudeResponseSettling()
         const startSettling = new ClaudeResponseSettling(CLAUDE_START_CONFIRMATION_MS)
         await retryAdvisorConnection({
+          signal: roundSignal,
+          timeoutMs: CLAUDE_REVIEW_TIMEOUT_MS,
           retryable: retryableClaudeObservation,
           onRetry: () => {
             // Observation gaps are not evidence of a stable blocked/idle model.
@@ -2239,7 +2251,10 @@ async function main(): Promise<void> {
             // transport outcome, not permission to resend or abandon acquisition.
             // Continue tracking the exact occupant and one-time marker instead.
             while (true) {
+              roundSignal?.throwIfAborted()
+              if (Date.now() >= acquisitionDeadline) throw new Error('Claude response acquisition deadline exceeded')
               await Bun.sleep(2_000)
+              roundSignal?.throwIfAborted()
               const current = unwrapAgent(await herdrJson(
                 ownedRuntime, ['agent', 'get', ownedTarget.target], 'Herdr acquisition agent get', jobFingerprint,
               ))
@@ -3666,6 +3681,7 @@ async function main(): Promise<void> {
       inputRevision: boundInput.revision,
       inputDigest: boundInput.digest,
       brokerProcessId: process.pid,
+      claimNonce: randomBytes(16).toString('hex'),
       startedAt: Date.now(),
     })}\n`)
     if (!activeClaim) {
@@ -3675,6 +3691,8 @@ async function main(): Promise<void> {
         reason: 'another advisor round is already active for this attempt',
       }, true)
     }
+    const stopWatcher = watchAdvisorStopRequest(activeClaimPath)
+    roundSignal = stopWatcher.signal
     activeRoundKeys.add(taskKey)
     // Defer the synchronous repository walk to a later event-loop turn so the
     // short start response can flush before any potentially large snapshot.
@@ -3881,7 +3899,7 @@ async function main(): Promise<void> {
     }
     const grokPromise = recoverAdvisorSlot({
       advisor: 'grok', saved: automaticContinuation || retryResult?.grok?.[0]?.adopted === true ? retryResult?.grok?.[0] : undefined,
-      retryFinishedFailure: !automaticContinuation,
+      retryFinishedFailure: false,
       ...(process.env.ZERO_CODEX_TESTING === '1' ? { wait: async () => {} } : {}),
       run: async () => (await runGrokPanel(boundInput, phase, round, evidence, reviewContext))[0]!,
       beforeRun: () => beginSlot('grok'),
@@ -3894,7 +3912,7 @@ async function main(): Promise<void> {
     }).then(result => [result])
     const claudePromise = recoverAdvisorSlot({
       advisor: 'claude',
-      retryFinishedFailure: !automaticContinuation,
+      retryFinishedFailure: false,
       saved: retryResult?.claude?.adopted === true
         || retryResult?.claude?.promptMayHaveBeenDelivered !== false
         ? retryResult?.claude : undefined,
@@ -4112,6 +4130,8 @@ async function main(): Promise<void> {
         reason: `advisor round failed: ${error}`,
       }, true)
     } finally {
+      stopWatcher.close()
+      roundSignal = undefined
       activeRoundKeys.delete(taskKey)
       pendingAuthentication.delete(taskKey)
       releaseExclusivePrivateFile(activeClaimPath, activeClaim)
