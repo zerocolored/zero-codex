@@ -2,7 +2,7 @@ import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCl
 import { browserUploadConfirmation, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
 import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
 import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
-import { waitForAdvisorSettlement } from './advisor-settlement.ts'
+import { ADVISOR_SETTLEMENT_TIMEOUT_MS, waitForAdvisorSettlement } from './advisor-settlement.ts'
 import { ensureJobTempDirectory, existingJobTempDirectory, jobTempRoot } from './job-temp.ts'
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
@@ -7501,10 +7501,15 @@ export async function executeCodexJob(
         throw new CodexCleanupPendingError('Codex supervisorが終了前のため登録を消去できません')
       }
     }
+    let advisorSettlementDeadline: number | undefined
+    let stopExternalAdvisors = false
     const drainExternalAdvisors = async (): Promise<void> => {
       if (stage !== 'complete') return
+      advisorSettlementDeadline ??= Date.now() + ADVISOR_SETTLEMENT_TIMEOUT_MS
       await bestEffortAdvisorVerification('before-executor-retirement', async () => {
         const settlement = await waitForAdvisorSettlement({
+          requestStop: stopExternalAdvisors,
+          timeoutMs: Math.max(0, advisorSettlementDeadline! - Date.now()),
           stateDir: managedStateDir, jobId: job.id,
           attemptNonce: advisorAttempt.attemptNonce,
           processNonce: advisorAttempt.processNonce,
@@ -7930,12 +7935,15 @@ export async function executeCodexJob(
       let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null
+      let nativeSettlementDeadline: number | undefined
       const drainNativeAdvisors = async (): Promise<void> => {
         // A failed model turn need not imply a dead history transport. Drain
         // while read-only RPCs work; a genuinely closed stream still fails.
         if (!nativeAdvisorHistoryEnabled || !currentThreadId || userCancelled) return
+        nativeSettlementDeadline ??= Date.now() + 15 * 60_000
         await bestEffortAdvisorVerification('native-before-retirement', async () => {
           const outcome = await settleNativeAdvisors({
+            timeoutMs: Math.max(0, nativeSettlementDeadline! - Date.now()),
             parentThreadId: currentThreadId!, repoPath: job.repoPath,
             attemptNonce: advisorAttempt.attemptNonce,
             registrations: readNativeAdvisorRegistrations(logicalAttempt.contextPath, advisorAttempt.attemptNonce,
@@ -8864,9 +8872,13 @@ export async function executeCodexJob(
               taskGoalStatus = goal?.status
               if (taskGoalStatus) controls.recordGoalStatus?.(taskGoalStatus)
             }
-            // Preserve the original reviewers across questions/task updates.
-            // Explicit cancellation still interrupts this wait immediately.
-            if (terminal.turn.status === 'completed') await drainExternalAdvisors()
+            // Keep accepted input open until owned advisor cleanup settles.
+            if (terminal.turn.status === 'completed') {
+              // The answer is complete. Settle unfinished external slots through
+              // their owned cleanup instead of holding replies and follow-ups forever.
+              stopExternalAdvisors = true
+              await drainExternalAdvisors()
+            }
             let barrier = controls.finishTurn({
               executorNonce: advisorAttempt.attemptNonce,
               threadId: currentThreadId,

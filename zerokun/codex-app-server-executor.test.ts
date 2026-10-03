@@ -2998,7 +2998,7 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 30_000)
 
-  test.each(['none', 'late', 'interjection-answer', 'interjection-update', 'cancel'] as const)('complete executorはadvisorを回収する前に親を終了せず入力受付も閉じない: %s', async scenario => {
+  test.each(['none', 'late', 'interjection-answer', 'interjection-update', 'cancel'] as const)('未完了advisorへ終端要求を送りcleanup後に回答・追加質問・取消を処理する: %s', async scenario => {
     const interjection = !['none', 'cancel'].includes(scenario)
     const mode = scenario === 'none' || scenario === 'late' || scenario === 'cancel' ? 'interjection-late-answer' : scenario
     const value = fixture(mode, true)
@@ -3037,7 +3037,11 @@ describe('production App Server executor', () => {
         })
         stagedInterjection = true
       }, 250)
-      releaseTimer = setTimeout(() => {
+      const earliestRelease = Date.now() + 750
+      releaseTimer = setInterval(() => {
+        if (Date.now() < earliestRelease) return
+        if (scenario !== 'cancel' && !existsSync(`${lock}.stop`)) return
+        clearInterval(releaseTimer)
         inputOpenAtRelease = value.store.liveControlTarget(value.job.chatId, value.job.threadTs) !== null
         if (scenario === 'cancel') {
           const target = value.store.interruptControlTarget(value.job.chatId, value.job.threadTs)
@@ -3048,7 +3052,7 @@ describe('production App Server executor', () => {
         }
         released = true
         rmSync(lock)
-      }, 1000)
+      }, 50)
     }
     value.hooks.finishTurn = args => {
       if (!finishObserved) finishedAfterRelease = released
