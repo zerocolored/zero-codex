@@ -6,6 +6,7 @@ import { waitForAdvisorSettlement } from './advisor-settlement.ts'
 import { ensureJobTempDirectory, existingJobTempDirectory, jobTempRoot } from './job-temp.ts'
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
+import { browserRuntimeContext, stageBrowserRuntime } from './browser-runtime-context.ts'
 import { installedComputerUseClient, installedComputerUseNodeServer } from './installed-computer-use.ts'
 import { GO_CHROME_ENABLED_TOOLS, GO_CHROME_DISABLED_TOOLS } from './chrome-tools.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
@@ -827,6 +828,8 @@ export async function resolveEffectiveCodexPermissionOverrides(
   profile: string,
   environment: Record<string, string> = buildCodexChildEnvironment(),
   options: {
+    browserRuntimeRoot?: string
+    browserRuntimeCreated?: (cleanup: () => void) => void
     signal?: AbortSignal
     timeoutMs?: number
     shutdownGraceMs?: number
@@ -846,12 +849,15 @@ export async function resolveEffectiveCodexPermissionOverrides(
     || Array.isArray(discovered.config)) {
     throw new Error('Codex config/read omitted effective config during MCP isolation')
   }
-  const isolated = computerUsePluginIsolationOverrides(
+  let isolated = computerUsePluginIsolationOverrides(
     discovered.config as Record<string, unknown>,
     mcpIsolationOverridesForConfig(
       discovered.config as Record<string, unknown>, overrides, cwd, discovered.layers,
     ),
     discovered.layers,
+  )
+  if (options.browserRuntimeRoot) isolated = stageBrowserRuntime(
+    isolated, profile, cwd, options.browserRuntimeRoot, undefined, options.browserRuntimeCreated,
   )
   await assertEffectiveCodexPermissionConfig(
     codexBin, cwd, isolated, profile, environment, options,
@@ -4401,6 +4407,7 @@ export function buildCodexWorkerPrompt(
       control.push(
         'For the operator’s signed-in Chrome, first follow the installed official Chrome skill',
         'and use its browser-client through node_repl when available. This is the ChatGPT browser',
+        'Use the current runtime path in developer instructions, not a cached path from prior turns.',
         'extension connection. Preserve its website approvals and any explicit browser selection.',
         'Go Chrome MCP is a separate extension connection. Use it only when the official Chrome',
         'capability is unavailable and the applicable browser instructions permit that fallback.',
@@ -7177,7 +7184,11 @@ export async function executeCodexJob(
       expectedRepositoryScope,
       continuationDecision,
     )
+    const browserRuntimeRoot = join(realpathSync(homedir()), '.zerochan-browser-runtime', advisorAttempt.processNonce)
+    let cleanupBrowserRuntime: (() => void) | undefined
     const retireBrowserReceiptKey = (): void => {
+      cleanupBrowserRuntime?.()
+      cleanupBrowserRuntime = undefined
       const path = advisorAttempt.browserReceiptKeyPath
       if (!path) return
       rmSync(path, { force: true })
@@ -7215,6 +7226,8 @@ export async function executeCodexJob(
           buildCodexChildEnvironment(),
           {
             signal: options.signal,
+            browserRuntimeRoot,
+            browserRuntimeCreated: cleanup => { cleanupBrowserRuntime = cleanup },
             seatbeltFingerprint: advisorAttempt.seatbeltFingerprint,
             seatbeltStateDir: managedStateDir,
           },
@@ -7224,6 +7237,10 @@ export async function executeCodexJob(
         throw error
       }
     }
+    advisorAttempt.developerInstructions += browserRuntimeContext(
+      advisorAttempt.permissionOverrides, job.repoPath, undefined,
+      browserRuntimeRoot,
+    )
     if (options.liveControls) {
       let cancelled = false
       try {
