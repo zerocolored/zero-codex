@@ -10157,6 +10157,12 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(write).toContain('Use installed tools and prepared connection files for authorized work')
     expect(write).toContain('Do not bypass a denial or infer consent for unrelated or broader effects')
     expect(write).toContain('For authorized credential acquisition or registration, use an opaque transfer')
+    expect(write).toContain('secret store, application setting, or authorized connection')
+    expect(write).toContain('and purpose authorized by the user task or existing approval for that same scope')
+    expect(write).toContain('Inspect the user-designated credential screen before asking for a separate file or manual copy')
+    expect(write).toContain('A masked/redacted placeholder or password instruction is not a usable credential')
+    expect(write).toContain('field read or transfer-file write alone does not prove credential acquisition')
+    expect(write).toContain('browser redaction and report an observed limitation instead of bypassing it')
     expect(write).toContain('Never expose credentials in chat, logs, tool arguments')
     expect(write).toContain('Do not inspect unrelated credentials')
     expect(write).toContain('Actual user or tool denials, including Browser Use upload refusals, remain binding across resume')
@@ -10165,7 +10171,38 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(write).not.toContain('IAM repair is permitted when')
     expect(write).not.toContain('Do not construct direct Slack API')
     expect(read).not.toContain('Use installed tools and prepared connection files')
+    expect(read).not.toContain('or authorized connection')
     expect(read).toContain('Do not edit files, Git, settings, external services, or data')
+    store.close()
+  })
+
+  test.each([
+    { writeEnabled: true, browserEnabled: true },
+    { writeEnabled: true, browserEnabled: false },
+    { writeEnabled: false, browserEnabled: true },
+    { writeEnabled: false, browserEnabled: false },
+  ])('Chromeの指定認証情報の取得はwriteとbrowserの両方が必要: %j', access => {
+    const store = makeStore()
+    store.enqueue(input(access))
+    const job = store.claimNext('browser-credential-worker')!
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+    const prompt = buildCodexWorkerPrompt(job, snapshot, {
+      attemptNonce: 'a'.repeat(32), artifactDir: '/tmp/job-outbox',
+      advisorEnabled: false, browserEnabled: access.browserEnabled,
+    })
+    if (access.writeEnabled && access.browserEnabled) {
+      expect(prompt).toContain('When the user authorizes obtaining credentials from a designated browser page')
+      expect(prompt).toContain('including password fields')
+      expect(prompt).toContain('An open page alone is not\nauthorization')
+      expect(prompt).toContain('Never read cookies,\nsession storage, authentication callback URLs, or unrelated credentials')
+      expect(prompt).toContain('Preserve the installed browser instructions and actual tool denials')
+      expect(prompt).toContain('never in tool\narguments, returned output, logs, screenshots, or delivered artifacts')
+      expect(prompt).toContain('Remove temporary credentials after use')
+      expect(prompt).not.toContain('session storage, password fields, or authentication callback URLs')
+    } else {
+      expect(prompt).not.toContain('including password fields')
+      if (!access.writeEnabled) expect(prompt).toContain('Access mode: read-only')
+    }
     store.close()
   })
 
