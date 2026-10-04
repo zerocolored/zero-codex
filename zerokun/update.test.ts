@@ -59,6 +59,7 @@ import {
 import { tryAcquireProcessLock } from './process-lock.ts'
 import { registerSlackApp, slackAppRegistryRoot } from './slack-app-registry.ts'
 import { UPDATE_RUNTIME_FILES } from './update-runtime.ts'
+import { UpdateDeferredError } from './update-result.ts'
 import {
   captureTrackedProcesses,
   readProcessIdentity,
@@ -1478,6 +1479,38 @@ describe('updater helpers', () => {
     expect(activeJobCounts(JSON.stringify([
       { status: 'running' },
     ]))).toEqual({ running: 1, queued: 0 })
+  })
+
+  test('only a confirmed live runner at the independent drain deadline defers without changing its job', async () => {
+    const fixture = updaterFixture()
+    const runnerFile = join(fixture.repo.local, 'zerokun/job-runner.ts')
+    writeFileSync(runnerFile, [
+      "import { acquire } from './fixture-lock.ts'",
+      `acquire(${JSON.stringify(join(fixture.state, 'job-runner.lock/pid'))})`,
+      'await Bun.sleep(60_000)',
+    ].join('\n'))
+    const dbPath = join(fixture.state, 'jobs.sqlite3')
+    const db = new Database(dbPath)
+    db.exec("CREATE TABLE jobs (status TEXT NOT NULL, runtime TEXT NOT NULL); INSERT INTO jobs VALUES ('running','codex')")
+    db.close(); chmodSync(dbPath, 0o600)
+    const target = { stateDir: fixture.state, oldRoot: fixture.repo.local, projectDir: fixture.project, running: false }
+    const candidate = { version: 1 as const, path: fixture.repo.local, sha: 'a'.repeat(40) }
+    // A stale running row alone must not produce the benign busy result.
+    const dead = await drainIndependentTarget(target, candidate, 0).catch(error => error)
+    expect(dead).toBeInstanceOf(Error)
+    expect(dead).not.toBeInstanceOf(UpdateDeferredError)
+    const runner = Bun.spawn([process.execPath, '--no-env-file', runnerFile, 'daemon'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+    serviceProcesses.push(runner)
+    const identityPath = join(fixture.state, 'job-runner.lock/pid.identity')
+    for (let n = 0; n < 100 && !existsSync(identityPath); n++) await Bun.sleep(10)
+    expect(existsSync(identityPath)).toBe(true)
+    await expect(drainIndependentTarget(target, candidate, 0)).rejects.toBeInstanceOf(UpdateDeferredError)
+    expect(runner.exitCode).toBeNull()
+    expect(activeJobCountsFromDatabase(dbPath)).toEqual({ running: 1, queued: 0 })
+    const controller = new AbortController(); controller.abort()
+    const cancelled = await drainIndependentTarget(target, candidate, 0, controller.signal).catch(error => error)
+    expect(cancelled).not.toBeInstanceOf(UpdateDeferredError)
+    expect(cancelled.message).toContain('中断')
   })
 
   test('independent update recovers through the validated candidate when the old runner is broken', async () => {

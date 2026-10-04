@@ -1,6 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
-import { resolveUpdateController } from './update-controller.ts'
+import { resolveUpdateController, UPDATE_DEFERRED_EXIT_CODE } from './update-controller.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
   chmodSync,
@@ -1011,9 +1011,13 @@ export async function runUpdateWorker(
     const text = request.source === 'automatic'
       ? success
         ? '最新版の自動アップデートが完了しました'
+        : exitCode === UPDATE_DEFERRED_EXIT_CODE
+        ? '実行中のタスクがあるため、自動更新を見送りました。タスクはそのまま継続しています。自動更新が有効な間、次回の定期確認で再試行します。'
         : `⚠️ 自動更新に失敗しました（更新処理の終了コード: ${exitCode}）。旧版への復旧状況は未確認です。管理ログを確認し、復旧が必要な場合は zerochan update --recover-only を実行してください。`
       : success
       ? '✅ 更新完了\n更新・テスト・setup・再起動が完了しました。'
+      : exitCode === UPDATE_DEFERRED_EXIT_CODE
+      ? '実行中のタスクがあるため、更新を見送りました。タスクはそのまま継続しています。完了後にもう一度更新を依頼してください。'
       : '❌ 更新失敗\n詳細はこのMacの管理ログを確認してください。'
     outcome = { success, exitCode, text, completedAt: Date.now() }
     persistRequest(dir, { ...request, outcome })
@@ -1085,7 +1089,8 @@ async function runCli(): Promise<void> {
     legacyCutover: legacyCutover === undefined ? undefined : legacyCutover === '1',
     projectDir,
   })
-  if (!result.success || (!result.notificationSent && !result.notificationSkipped)) process.exitCode = 1
+  if (!result.notificationSent && !result.notificationSkipped) process.exitCode = 1
+  else if (!result.success) process.exitCode = result.exitCode === UPDATE_DEFERRED_EXIT_CODE ? UPDATE_DEFERRED_EXIT_CODE : 1
 }
 
 if (import.meta.main) {
