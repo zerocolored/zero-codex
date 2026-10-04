@@ -24,6 +24,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
+import { GrokOAuthBrowserSession, GROK_BROWSER_ANSWERS, advisorRecoveryProgress } from './grok-oauth-browser.ts'
 import { readNativeAdvisorRegistrations, registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { AdvisorFailureError, advisorFailureMessage, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
 import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, sanitizeClaudeAnswer, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
@@ -496,9 +497,8 @@ export function grokOAuthCompletionOutput(stdout: string): boolean {
       return []
     }
   })
-  return lines.length === 2 && statuses.length === 2
-    && statuses[0] === 'oauth-browser-opened'
-    && statuses[1] === 'oauth-login-complete'
+  return lines.length === statuses.length && (JSON.stringify(statuses) === JSON.stringify(['oauth-browser-opened', 'oauth-login-complete'])
+    || JSON.stringify(statuses) === JSON.stringify(['oauth-browser-baseline-required', 'oauth-browser-check-required', 'oauth-browser-opened', 'oauth-browser-verify-required', 'oauth-login-complete']))
 }
 
 export function grokAuthRecoveryTransitionIsSafe(
@@ -798,7 +798,7 @@ function appendCapped(
   if (accepted.length < chunk.byteLength) size.truncated = true
 }
 
-function collectCapped(stream: ReadableStream<Uint8Array>): {
+function collectCapped(stream: ReadableStream<Uint8Array>, onChunk?: (chunk: Uint8Array) => void): {
   promise: Promise<string>
   cancel: () => Promise<void>
   truncated: () => boolean
@@ -812,6 +812,7 @@ function collectCapped(stream: ReadableStream<Uint8Array>): {
         const { value, done } = await reader.read()
         if (done) break
         appendCapped(chunks, size, value)
+        if (!size.truncated) onChunk?.(value)
       }
     } finally {
       reader.releaseLock()
@@ -833,6 +834,8 @@ export async function runBounded(
     cwd?: string
     env?: Record<string, string>
     stdin?: string | Uint8Array
+    onStdin?: (write: (line: string) => Promise<void>) => void
+    onStdout?: (chunk: Uint8Array) => void
     /** Transport helpers are bounded; a model reviewer omits this whole-process deadline. */
     timeoutMs?: number
     signal?: AbortSignal
@@ -846,6 +849,7 @@ export async function runBounded(
   },
 ): Promise<ProcessResult> {
   if (options.signal?.aborted) throw new Error('subprocess cancelled before start')
+  if (options.stdin !== undefined && options.onStdin) throw Error('interactive and fixed stdin cannot be combined')
   const input = options.stdin === undefined ? undefined : Buffer.from(options.stdin)
   if (input && input.byteLength > MAX_ADVISOR_PROMPT_BYTES) {
     throw new Error('advisor subprocess stdin exceeds the shared transport byte limit')
@@ -855,7 +859,7 @@ export async function runBounded(
   const child = Bun.spawn(command, {
     cwd: options.cwd ?? '/',
     env: options.env,
-    stdin: input === undefined ? 'ignore' : 'pipe',
+    stdin: input === undefined && !options.onStdin ? 'ignore' : 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
     detached: process.platform !== 'win32',
@@ -910,9 +914,21 @@ export async function runBounded(
       generation: observeProcessGeneration(rootIdentity).status }),
     warn: () => {},
   })
-  const stdout = collectCapped(child.stdout)
-  const stderr = collectCapped(child.stderr)
   let inputError: unknown
+  const stdout = collectCapped(child.stdout, value => {
+    try { options.onStdout?.(value) } catch (error) { inputError = error; try { child.kill('SIGTERM') } catch {} }
+  })
+  const stderr = collectCapped(child.stderr)
+  const interactiveSink = options.onStdin && typeof child.stdin !== 'number' ? child.stdin : undefined
+  if (options.onStdin) {
+    try {
+      options.onStdin(async line => {
+        if (!interactiveSink) throw Error('interactive stdin unavailable')
+        interactiveSink.write(line)
+        await interactiveSink.flush()
+      })
+    } catch (error) { inputError = error; try { child.kill('SIGTERM') } catch {} }
+  }
   if (input !== undefined) {
     try {
       const sink = child.stdin
@@ -948,6 +964,9 @@ export async function runBounded(
     if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
     options.signal?.removeEventListener('abort', abort)
     stopTracking()
+  }
+  if (interactiveSink) {
+    try { await Promise.race([Promise.resolve(interactiveSink.end()).catch(() => {}), Bun.sleep(1_000)]) } catch {}
   }
   if (outcome.kind === 'timeout' || outcome.kind === 'aborted') {
     timedOut = outcome.kind === 'timeout'
@@ -1919,6 +1938,7 @@ async function main(): Promise<void> {
     }
   }
 
+  let grokBrowserRecovery: GrokOAuthBrowserSession | undefined
   const runGrokOAuthRecovery = async (
     baseline: GrokAuthState,
   ): Promise<{ recovered: boolean, reason: string, state?: GrokAuthState }> => {
@@ -1931,12 +1951,20 @@ async function main(): Promise<void> {
     }
     try {
       const helper = resolveDedicatedGrokOAuthHelper(baseline.home)
-      const result = await runBounded([helper], {
-        cwd: '/',
-        env: brokerEnvironment(),
-        timeoutMs: GROK_OAUTH_TIMEOUT_MS,
-        terminationGraceMs: 5_000,
-      })
+      const browserAbort = new AbortController()
+      const browser = new GrokOAuthBrowserSession(() => browserAbort.abort())
+      grokBrowserRecovery = browser
+      let result: ProcessResult
+      try {
+        result = await runBounded([helper], {
+          cwd: '/', env: brokerEnvironment(), timeoutMs: GROK_OAUTH_TIMEOUT_MS,
+          terminationGraceMs: 5_000, signal: browserAbort.signal,
+          onStdin: write => browser.connect(write), onStdout: chunk => browser.feed(chunk),
+        })
+      } finally {
+        browser.finish()
+        if (grokBrowserRecovery === browser) grokBrowserRecovery = undefined
+      }
       if (result.exitCode !== 0 || result.timedOut || result.forcedCleanup
         || result.outputTruncated || result.stderr !== ''
         || !grokOAuthCompletionOutput(result.stdout)) {
@@ -4203,6 +4231,17 @@ async function main(): Promise<void> {
     inputSchema: advisorRoundInputSchema,
   }, request => startRound(request))
 
+  server.registerTool('advisor_grok_oauth_respond', {
+    description: 'Reply once to the current Grok OAuth browser request returned by advisor_round_poll. Use official Chrome control to observe only opaque tab IDs until authorization UI verification is requested. Never pass URLs, credentials, tab contents or input values. Reuse the existing OAuth flow; never start another login.',
+    inputSchema: { requestId: z.string().uuid(), answer: z.enum(GROK_BROWSER_ANSWERS) },
+  }, async ({ requestId, answer }) => {
+    try {
+      if (!grokBrowserRecovery) throw Error('Grok browser recovery is not active')
+      await grokBrowserRecovery.respond(requestId, answer)
+      return toolText({ accepted: true, nextAction: '同じadvisor roundをpollして次の状態を確認してください。' })
+    } catch (error) { return toolText({ accepted: false, reason: String(error) }, true) }
+  })
+
   server.registerTool('advisor_round_poll', {
     description: 'Poll a previously started advisor attempt round. Keep exactly one poll outstanding and wait for its result; never batch, parallelize, or pre-queue duplicate polls. Pending polls are unlimited and never cancel, authenticate, or restart reviewers. When receiptRequired is returned, make exactly one next call with that exact receipt and the same binding.',
     inputSchema: {
@@ -4290,10 +4329,7 @@ async function main(): Promise<void> {
       return toolText({
         complete: false,
         pending: true,
-        ...(waitingForAuthentication.length ? {
-          waitingForAuthentication,
-          nextAction: '認証状態の回復を待って自動再確認しています。この待機理由をユーザーへ一度だけ伝え、同じ依頼のpollを続けてください。ログイン操作や依頼の再送を繰り返さないでください。',
-        } : {}),
+        ...advisorRecoveryProgress(grokBrowserRecovery?.pending(), waitingForAuthentication),
         phase,
         round,
         inputRevision,
