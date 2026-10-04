@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync, readFileSync, symlinkSync } from 'fs'
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync, readFileSync, symlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createHash } from 'crypto'
@@ -52,6 +52,28 @@ test('取消は起動済みowned processを終了・回収する', async () => {
   const ran = await result
   expect(ran.exitCode).not.toBe(0); expect(ran.timedOut).toBe(false)
 }, 10000)
+test('exit callback欠落でも実際の終了と終了コードを観測して無期限待機を解消する', async () => {
+  const result = await runBounded(['/bin/sh', '-c', 'sleep 0.1; printf done; exit 7'], {
+    exitCallbackForTesting: () => new Promise(() => {}),
+  })
+  expect(result.exitCode).toBe(7)
+  expect(result.stdout).toBe('done')
+  expect(result.timedOut).toBe(false)
+}, 5_000)
+
+test('実行要求を子へ渡す前にowned processを保存し、保存失敗時には要求を実行しない', async () => {
+  const f = fixture(), touched = join(f.workspace, 'must-not-exist')
+  let pid = 0
+  await expect(runBounded(['/bin/sh'], {
+    stdin: `printf unsafe > ${JSON.stringify(touched)}\n`,
+    onSpawn: value => { pid = value; throw new Error('fixture persistence failure') },
+    terminationGraceMs: 20,
+  })).rejects.toThrow('identity could not be tracked')
+  expect(pid).toBeGreaterThan(1)
+  const { readProcessIdentity } = await import('./process-generation.ts')
+  expect(readProcessIdentity(pid)).toBeUndefined()
+  expect(existsSync(touched)).toBe(false)
+})
 test('host最終出力はモデル可書込outboxを使わず、broker再起動後も同一実行を再利用する', async () => {
   const f = fixture(); let final = ''
   const command = async (_ctx: ReproductionContext, _cwd: string, path: string) => { final = path; expect(path.startsWith(join(f.context.stateDir, 'reproductions'))).toBe(true); return { argv: ['fake'], environment: {} } }
@@ -66,7 +88,14 @@ test('broker取消でも子を回収し、中断記録を保持する', async ()
   const f = fixture()
   const runs = new CodexReproductions(f.context, async () => ({ argv: [process.execPath, '-e', 'process.stdin.resume();setInterval(()=>{},1000)'], environment: {} }))
   const started = runs.start(f.request, f.workspace)
-  await Bun.sleep(100); await runs.close(); expect(runs.poll(started.id).status).toBe('interrupted')
+  await Bun.sleep(100)
+  const lock = join(f.context.stateDir, 'reproductions', f.context.job.id, started.id, 'process.lock')
+  const identity = JSON.parse(readFileSync(lock + '.identity', 'utf8'))
+  expect(identity.delegate.pid).not.toBe(process.pid)
+  expect(identity.delegate.groupId).toBe(identity.delegate.pid)
+  expect(identity.delegate.bootSession).toBeDefined()
+  await runs.close(); expect(runs.poll(started.id).status).toBe('interrupted')
+  expect(existsSync(lock)).toBe(false)
 }, 10000)
 test('確認されたowned子孫残存は通常失敗にせず、後続実行と正常closeを拒否する', async () => {
   const { AdvisorOwnedProcessStillLiveError } = await import('./advisor-broker.ts')

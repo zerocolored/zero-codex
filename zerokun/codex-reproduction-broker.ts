@@ -13,7 +13,7 @@ import { resolveOfficialStandaloneCodex, verifyOfficialCodexSnapshot } from './s
 import { ensureJobTempDirectory } from './job-temp.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
-import { releaseProcessLock, tryAcquireProcessLock } from './process-lock.ts'
+import { delegateProcessLock, undelegateProcessLock, releaseProcessLock, tryAcquireProcessLock, type ProcessLockDelegate } from './process-lock.ts'
 import { runBounded, AdvisorOwnedProcessStillLiveError } from './advisor-broker.ts'
 import type { JobRecord } from './job-runner.ts'
 import { recoverPreviousReproduction } from './reproduction-recovery.ts'
@@ -109,8 +109,11 @@ export class CodexReproductions {
       requireManagedDirectory(this.context.stateDir, directory)
       value = readOptionalBoundedOwnerOnlyRegularFile(join(directory, 'result.json'), 16_384)
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-    if (value) return JSON.parse(value) as RunResult
-    const recovered = recoverPreviousReproduction(this.context, id)
+    if (value) {
+      const result = JSON.parse(value) as RunResult
+      if (result.status !== 'running' || this.pending.has(id)) return result
+    }
+    const recovered = recoverPreviousReproduction(this.context, id, value !== null)
     if (recovered.status !== 'running') this.recoveredRuns.set(id, recovered)
     return recovered
   }
@@ -142,20 +145,17 @@ export class CodexReproductions {
     const request = reproductionRequest(this.context, requestPath, workspace)
     if (this.pending.has(request.id)) return this.poll(request.id)
     const directory = this.directory(request.id), journal = join(directory, 'result.json')
+    // An existing request is never an implicit retry. Poll reconciles both
+    // same-job reconnects and retained runs without launching a second child.
+    if (readOptionalBoundedOwnerOnlyRegularFile(journal, 16_384)) return this.poll(request.id)
     const lockPath = join(directory, 'process.lock')
     const lease = this.lock.acquire(lockPath)
     if (!lease.acquired) return this.poll(request.id)
     try {
     const existing = readOptionalBoundedOwnerOnlyRegularFile(journal, 16_384)
     if (existing) {
-      const prior = JSON.parse(existing) as RunResult
-      // A lost parent is not authorization to run an independent request twice.
-      if (prior.status === 'running') {
-        prior.status = 'interrupted'; prior.reason = 'The previous execution was interrupted; its files are retained.'
-        atomicWritePrivateFile(journal, JSON.stringify(prior))
-      }
       this.lock.release(lockPath, lease.lease)
-      return prior
+      return this.poll(request.id)
     }
     const output = ensureManagedDirectory(this.context.stateDir, join(this.context.liveInputDir, 'codex-reproduction', request.id))
     const result: RunResult = { id: request.id, status: 'running', promptSha256: request.promptSha256,
@@ -163,11 +163,19 @@ export class CodexReproductions {
     atomicWritePrivateFile(join(directory, 'request.txt'), request.bytes)
     atomicWritePrivateFile(journal, JSON.stringify(result))
     const work = (async () => {
+      let delegate: ProcessLockDelegate | undefined
       try {
         const hostFinalPath = join(directory, 'final.txt')
         const { argv, environment } = await this.command(this.context, request.cwd, hostFinalPath, this.controller.signal)
         const ran = await this.run(argv, { cwd: request.cwd, env: environment, stdin: request.bytes,
-          signal: this.controller.signal })
+          signal: this.controller.signal, onSpawn: pid => {
+            delegate = delegateProcessLock(lockPath, lease.lease, pid)
+            if (!delegate) throw new Error('independent execution ownership could not be persisted')
+          } })
+        if (delegate && !undelegateProcessLock(lockPath, delegate)) {
+          throw new Error('independent execution ownership could not be released')
+        }
+        delegate = undefined
         result.exitCode = ran.exitCode; result.eventBytes = Buffer.byteLength(ran.stdout)
         result.diagnosticsTruncated = ran.outputTruncated
         // Private diagnostics are not copied into model-readable artifacts.
@@ -198,7 +206,13 @@ export class CodexReproductions {
         try {
           atomicWritePrivateFile(journal, JSON.stringify(result))
           atomicWritePrivateFile(result.receiptPath, JSON.stringify({ ...result, comparisonVerified: false }))
-        } finally { if (!this.containmentFailure) this.lock.release(lockPath, lease.lease) }
+        } finally {
+          // Failed startup/transport also goes through runBounded cleanup.
+          // A still-live delegate keeps the lease; never erase that evidence.
+          if (!this.containmentFailure && (!delegate || undelegateProcessLock(lockPath, delegate))) {
+            this.lock.release(lockPath, lease.lease)
+          }
+        }
       }
     })().catch(error => { this.transportFailure = error; this.failedRuns.set(request.id, error); throw error })
     this.pending.set(request.id, work)
@@ -238,7 +252,7 @@ export function createReproductionServer(runs: CodexReproductions): McpServer {
     description: 'Execute the user-requested independent Codex exec reproduction with the exact UTF-8 prompt file via stdin. Workspace must be inside current job scratch. Repository and retained inputs are read-only; write outputs in workspace. No host argv/config/env accepted. Start returns immediately. Poll the same id until terminal; running is not a failure or a reason to stop. There is no total execution deadline. Completed means execution only, not similarity validation. Never use as an additional advisor.',
     inputSchema: { requestPath: z.string().max(4096), workspace: z.string().max(4096) },
   }, async args => { try { return reply(runs.start(args.requestPath, args.workspace)) } catch (error) { if (error instanceof AdvisorOwnedProcessStillLiveError) return { ...reply({ status: 'containment_failed', reason: 'Owned process cleanup failed. Stop this execution and preserve host records.' }), isError: true }; return { ...reply({ status: 'rejected', reason: 'Use a nonsecret prompt and workspace owned by this job.' }), isError: true } } })
-  server.registerTool('codex_reproduction_poll', { description: 'Wait up to 20 seconds for the same execution, including a previous job in this conversation and repository, without restarting or stopping it. Repeat while running. A recovered terminal result provides a read-only workspace and recovery manifest in current inputs. Inspect those partial outputs and copy relevant files to current scratch to continue; interrupted is not verified success and must not cause a duplicate execution.', inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } },
+  server.registerTool('codex_reproduction_poll', { description: 'Wait up to 20 seconds for the same execution, including a previous job in this conversation and repository, without restarting or stopping it. Host-side process ownership checks also recover a lost broker in the same job; no shell ps diagnosis is needed. Repeat while running. A recovered terminal result provides a read-only workspace and recovery manifest in current inputs. Inspect those partial outputs and copy relevant files to current scratch to continue; interrupted is not verified success and must not cause a duplicate execution.', inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } },
     async (args, extra) => { try { return reply(await runs.waitForResult(args.id, 20_000, extra.signal)) } catch (error) { if (error instanceof AdvisorOwnedProcessStillLiveError) return { ...reply({ status: 'containment_failed', reason: 'Owned process cleanup failed. Stop this execution and preserve host records.' }), isError: true }; return { ...reply({ status: 'unavailable', reason: 'Execution state could not be verified; preserve host records and do not start another execution.' }), isError: true } } })
   return server
 }
