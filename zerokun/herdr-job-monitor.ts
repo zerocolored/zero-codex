@@ -1528,9 +1528,16 @@ async function verifyViewer(
   }
   if (!manifest.paneId) throw new Error(`monitor pane is missing for job ${manifest.jobId}`)
   const info = await control.processInfo(manifest.paneId)
+  // A retained viewer keeps running from its original release after an update.
+  // Once activated, bind to the argv and process generation recorded at launch.
+  // Only first activation uses the current release's executable path.
+  const expectedDigest = manifest.viewerArgvDigest ?? argvDigest(expectedArgv)
+  if (manifest.viewerProcess && !sameProcessGeneration(receipt.process, manifest.viewerProcess)) {
+    throw new Error(`monitor viewer process generation changed for job ${manifest.jobId}`)
+  }
   const matching = info.foregroundProcesses.filter(processInfo => (
     processInfo.pid === receipt.process.pid
-    && JSON.stringify(processInfo.argv) === JSON.stringify(expectedArgv)
+    && argvDigest(processInfo.argv) === expectedDigest
     && realpathSync(processInfo.cwd) === directory
   ))
   if (info.paneId !== manifest.paneId

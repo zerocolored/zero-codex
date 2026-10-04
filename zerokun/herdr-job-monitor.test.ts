@@ -13,6 +13,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { createHash } from 'crypto'
 import type { JobRecord } from './job-runner.ts'
 import type { HerdrRuntimeIdentity } from './herdr-runtime.ts'
 import {
@@ -32,6 +33,7 @@ import {
   retainFailedHerdrJobMonitor,
   stripTerminalControls,
   watchHerdrJobMonitor,
+  verifyHerdrJobMonitorActive,
   type HerdrJobMonitorControl,
   type HerdrMonitorPane,
   type HerdrMonitorProcessInfo,
@@ -1015,6 +1017,38 @@ describe('Herdr job monitor', () => {
     expect(reconciled.retainedJobIds).toEqual([record.id])
     expect(control.createCalls).toBe(1)
     expect(control.runCalls).toBe(1)
+  })
+
+  test('release更新後も記録済みargvと同じviewerを再開・監視・終了まで引き継ぐ', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job()
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    const processInfo = control.process!.foregroundProcesses[0]!
+    processInfo.argv[3] = join(state, 'previous-release', 'herdr-job-monitor-view.ts')
+    const manifestPath = join(state, 'job-monitors', record.id, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    manifest.viewerArgvDigest = createHash('sha256').update(JSON.stringify(processInfo.argv)).digest('hex')
+    writeFileSync(manifestPath, JSON.stringify(manifest) + '\n', { mode: 0o600 })
+
+    const retained = await reconcileHerdrJobMonitors({
+      stateDir: state, runtime: runtime(), getJob: () => ({ status: 'queued' }), control,
+    })
+    expect(retained.retainedJobIds).toEqual([record.id])
+    await verifyHerdrJobMonitorActive({ stateDir: state, runtime: runtime(), jobId: record.id, control })
+    expect(control.createCalls).toBe(1)
+    expect(control.runCalls).toBe(1)
+
+    const recordedArgv = [...processInfo.argv]
+    processInfo.argv.push('--unexpected-change')
+    await expect(verifyHerdrJobMonitorActive({
+      stateDir: state, runtime: runtime(), jobId: record.id, control,
+    })).rejects.toThrow('not uniquely bound')
+    processInfo.argv = recordedArgv
+    await closeHerdrJobMonitor({
+      stateDir: state, runtime: runtime(), jobId: record.id, outcome: 'completed', control,
+    })
+    expect(control.closeCalls).toBe(1)
   })
 
   test('rate-limit相当のqueued jobはtabを保持し中止確定後だけreconcileで閉じる', async () => {
