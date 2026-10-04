@@ -18,6 +18,9 @@ import {
   verifyOfficialCodexSnapshot,
 } from './standalone-codex.ts'
 import { type SlackReply } from '../gate.ts'
+import { CodexCleanupPendingError } from './codex-executor.ts'
+import { subprocessExitCode } from './process-exit-code.ts'
+import { ensureManagedDirectory } from './managed-path.ts'
 
 export const SLACK_THREAD_INTENT_PROMPT_VERSION = 1 as const
 export const MAX_THREAD_INTENT_MESSAGES = 40
@@ -305,25 +308,49 @@ export function slackThreadIntentClassifierLeaseMs(
   return slackThreadIntentClassifierTimeoutMs(configured) + CLASSIFIER_KILL_GRACE_MS + 30_000
 }
 
+function classifierGroupAlive(proc: Bun.Subprocess): boolean {
+  try { process.kill(-proc.pid, 0); return true }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH' }
+}
+
 function signalClassifierGroup(proc: Bun.Subprocess, signal: NodeJS.Signals): void {
   try {
     process.kill(-proc.pid, signal)
-  } catch {
-    try { proc.kill(signal) } catch {}
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+      throw new CodexCleanupPendingError('isolated model process group could not be stopped')
+    }
   }
 }
 
+const classifierCleanup = new WeakMap<Bun.Subprocess, Promise<void>>()
+const supervisedClassifiers = new WeakSet<Bun.Subprocess>()
 async function terminateClassifier(proc: Bun.Subprocess): Promise<void> {
-  if (proc.exitCode !== null) return
-  signalClassifierGroup(proc, 'SIGTERM')
-  await Promise.race([
-    proc.exited,
-    new Promise<void>(resolve => setTimeout(resolve, CLASSIFIER_KILL_GRACE_MS)),
-  ])
-  if (proc.exitCode === null) {
+  const existing = classifierCleanup.get(proc)
+  if (existing) return existing
+  const cleanup = (async () => {
+    let exited = proc.exitCode !== null || proc.signalCode !== null
+    void proc.exited.then(() => { exited = true }, () => {})
+    const waitGone = async (graceMs = CLASSIFIER_KILL_GRACE_MS) => {
+      const deadline = Date.now() + graceMs
+      while ((!exited || classifierGroupAlive(proc)) && Date.now() < deadline) await Bun.sleep(25)
+      return exited && !classifierGroupAlive(proc)
+    }
+    if (exited && !classifierGroupAlive(proc)) return
+    if (supervisedClassifiers.has(proc)) {
+      // The supervisor owns descendant generations, including detached groups.
+      // Keep it alive to finish its ledger and cleanup; recovery can retry it.
+      try { proc.kill('SIGTERM') } catch {}
+      if (!await waitGone(10_000)) throw new CodexCleanupPendingError('audit model supervisor cleanup is pending')
+      return
+    }
+    signalClassifierGroup(proc, 'SIGTERM')
+    if (await waitGone()) return
     signalClassifierGroup(proc, 'SIGKILL')
-    await proc.exited
-  }
+    if (!await waitGone()) throw new CodexCleanupPendingError('isolated model process group cleanup is pending')
+  })()
+  classifierCleanup.set(proc, cleanup)
+  try { await cleanup } catch (error) { classifierCleanup.delete(proc); throw error }
 }
 
 /** Subscription-only, ephemeral Codex classifier. Failures throw so callers can durably retry. */
@@ -339,12 +366,19 @@ export async function runSlackThreadIntentClassifier(
 
 /** Tool-free standalone process; only caller-supplied bounded data reaches the model. */
 export async function runIsolatedCodexJson(prompt: string, schema: object,
-  options: { timeoutMs?: number; model?: string; independent?: boolean } = {}): Promise<string> {
+  options: { timeoutMs?: number; model?: string; independent?: boolean; signal?: AbortSignal;
+    onProcessId?: (pid: number) => void; onProcessExit?: (code: number) => void;
+    supervision?: { jobId: string; stateDir: string } } = {}): Promise<string> {
   if (Buffer.byteLength(prompt) > 100_000) throw new Error('model input too large')
+  if (options.signal?.aborted) throw new DOMException('model interrupted', 'AbortError')
   const release = options.independent ? () => {} : await takeClassifierSlot()
   let runtime: string | null = null
   let proc: Bun.Subprocess | null = null
+  let processRegistered = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
   try {
+    if (options.signal?.aborted) throw new DOMException('model interrupted', 'AbortError')
     if (isolatedStopping) throw new Error('isolated Codex is stopping')
     runtime = mkdtempSync(join(tmpdir(), 'zerochan-thread-intent-'))
     chmodSync(runtime, 0o700)
@@ -388,7 +422,15 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
       ...(configuredModel ? ['--model', configuredModel] : []),
       '-',
     ]
-    const spawned = Bun.spawn(args, {
+    let command = args
+    if (options.supervision) {
+      const { jobId, stateDir } = options.supervision
+      if (!/^[a-zA-Z0-9-]+$/.test(jobId)) throw Error('invalid audit job identity')
+      const registration = join(ensureManagedDirectory(stateDir, join(stateDir, 'executors')), `${jobId}.json`)
+      command = [process.execPath, '--config=/dev/null', '--no-env-file',
+        join(import.meta.dir, 'security-audit-supervisor.ts'), jobId, registration, ...args]
+    }
+    const spawned = Bun.spawn(command, {
       cwd: runtime,
       env: classifierEnvironment(),
       stdin: 'pipe',
@@ -398,15 +440,26 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
     })
     proc = spawned
     isolatedProcesses.add(spawned)
+    if (options.supervision) supervisedClassifiers.add(spawned)
+    options.onProcessId?.(spawned.pid)
+    processRegistered = true
+    const interrupted = new Promise<'interrupted'>(resolve => {
+      onAbort = () => resolve('interrupted')
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+      if (options.signal?.aborted) onAbort()
+    })
     spawned.stdin.write(prompt)
     spawned.stdin.end()
     const timeoutMs = slackThreadIntentClassifierTimeoutMs(options.timeoutMs)
-    let timer: ReturnType<typeof setTimeout> | undefined
     const timedOut = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => resolve('timeout'), timeoutMs)
       timer.unref()
     })
-    const outcome = await Promise.race([proc.exited, timedOut])
+    const outcome = await Promise.race([proc.exited, timedOut, interrupted])
+    if (outcome === 'interrupted') {
+      await terminateClassifier(proc)
+      throw new DOMException('model interrupted', 'AbortError')
+    }
     if (outcome === 'timeout') {
       await terminateClassifier(proc)
       throw new Error('thread intent classifier timed out')
@@ -415,10 +468,17 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
     if (outcome !== 0) throw new Error(`thread intent classifier exited ${outcome}`)
     return readOwnerOnlyOutput(outputPath)
   } finally {
+    if (timer) clearTimeout(timer)
+    if (onAbort) options.signal?.removeEventListener('abort', onAbort)
     try {
-      if (proc?.exitCode === null) await terminateClassifier(proc)
+      // Parent exit does not prove that its descendants have stopped.
+      if (proc) await terminateClassifier(proc)
+      if (proc?.exitCode === 86 && options.supervision) {
+        throw new CodexCleanupPendingError('audit model supervision/cleanup is pending')
+      }
       if (proc) isolatedProcesses.delete(proc)
       if (runtime) rmSync(runtime, { recursive: true, force: true })
+      if (proc && processRegistered) options.onProcessExit?.(subprocessExitCode(proc.exitCode, proc.signalCode))
     } finally {
       release()
     }
