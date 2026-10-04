@@ -44,6 +44,7 @@ import {
 } from './gate.ts'
 import { requestUpdate, resumePendingUpdateWorker } from './zerokun/update-request.ts'
 import { automaticUpdateRecipient, checkAutomaticUpdate, remoteUpdateHead } from './zerokun/auto-update.ts'
+import { startBrowserConfigRefresh } from './zerokun/browser-config-refresh.ts'
 import { slackAppRegistryRoot, listRegisteredSlackApps } from './zerokun/slack-app-registry.ts'
 import { acquirePluginLock as claimPluginLock } from './plugin-lock.ts'
 import {
@@ -484,6 +485,7 @@ slackApp = new App({
 
 let slackSocket: SlackSocketSupervisor | null = null
 let fleetReporter: { stop(): void } | null = null
+let browserConfigRefresh: { stop(): void } | null = null
 
 function describeSlackSocketEvent(event: SlackSocketSupervisorEvent): string {
   if (event.phase === 'lost') return 'socket mode disconnected; reconnecting'
@@ -1799,6 +1801,7 @@ function shutdown(): void {
   // backoff has no live socket to emit it.
   slackSocket?.stop()
   fleetReporter?.stop()
+  browserConfigRefresh?.stop()
   process.stderr.write('slack channel: shutting down\n')
   clearGatewayReadiness(READY_FILE)
   // Keep the singleton lock and SQLite handle until the process exits. Releasing
@@ -2863,6 +2866,8 @@ try {
     () => jobStore.fleetFolderFacts(Date.now(), connectedProjectDir), () => slackSocket?.connected === true,
     { teamId: identity.teamId, name: identity.botName, botToken: BOT_TOKEN })
   process.stderr.write(`slack channel: connected (${botUserId}) app=${identity.appId}\n`)
+  browserConfigRefresh = startBrowserConfigRefresh(slackAppRegistryRoot(),
+    message => process.stderr.write(`zerochan: ${message}\n`))
 
   // Sweep once on startup for new mentions/DMs, and recover replies in owned threads.
   scheduleInboundDrain()
