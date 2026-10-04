@@ -1,5 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 import { executeSecurityAudit, copyAuditReportForFollowup } from './security-audit.ts'
+import { createSecurityAuditProgress } from './security-audit-progress.ts'
 import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
@@ -18985,12 +18986,14 @@ async function runCli(): Promise<void> {
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
           if (job.workflow === 'security-audit') {
-            const raw = await executeSecurityAudit(job, {
+            const progress = createSecurityAuditProgress(job, executionContext, mirrorMonitorMessage, log)
+            let raw: JobExecutionResult
+            try { raw = await executeSecurityAudit(job, {
               stateDir: dir, signal: executionController.signal,
               ...executorPidLifecycle,
               cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
-              progress: message => mirrorMonitorMessage(message),
-            })
+              progress: progress.report,
+            }) } finally { progress.close() }
             const auditResult = finalizeSuccessfulExecution(job, raw, dir, log)
             store.ensureExecutionResultStaged(job.id, auditResult.sessionId, auditResult.result)
             return auditResult

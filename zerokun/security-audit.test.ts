@@ -7,6 +7,7 @@ import {
   rmSync,
   existsSync,
   symlinkSync,
+  realpathSync,
 } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
@@ -22,6 +23,7 @@ import {
   executeSecurityAudit,
   auditClean,
   copyAuditReportForFollowup,
+  snapshotAuditSource,
   type AuditStep,
 } from './security-audit.ts'
 import {
@@ -39,6 +41,7 @@ import {
 import { containsCredentialMaterial } from './public-output-guard.ts'
 import {
   CodexInterruptedError,
+  CodexCleanupPendingError,
   CodexUserCancelledError,
   buildCodexDeveloperInstructions,
 } from './codex-executor.ts'
@@ -89,6 +92,145 @@ const model = async (prompt: string) => {
   expect(prompt).toContain('untrusted evidence')
   return JSON.stringify({ findings: [], note: 'fixture source reviewed' })
 }
+test('cleanup failure is retained even when interruption is also requested', async () => {
+  const { job, state, store } = fixture()
+  const controller = new AbortController()
+  try {
+    await expect(executeSecurityAudit(job, { stateDir: state, signal: controller.signal, model: async () => {
+      controller.abort()
+      throw new CodexCleanupPendingError('fixture process group still live')
+    } })).rejects.toBeInstanceOf(CodexCleanupPendingError)
+  } finally { store.close() }
+})
+test('snapshot follows Git inventory, preserves tracked edits and excludes nested repositories', async () => {
+  const { repo, state, store } = fixture()
+  const put = (name: string, content = 'export const value = 1') => {
+    const path = join(repo, name)
+    mkdirSync(join(path, '..'), { recursive: true })
+    writeFileSync(path, content)
+  }
+  const git = (...args: string[]) => {
+    const run = Bun.spawnSync(['git', ...args], { cwd: repo, stdout: 'pipe', stderr: 'pipe' })
+    expect(run.exitCode).toBe(0)
+  }
+  try {
+    git('init', '-q')
+    git('config', 'core.precomposeunicode', 'true')
+    put('tracked-ignored.ts')
+    const unicodeName = 'か\u3099.ts'
+    put(unicodeName)
+    git('add', 'app.ts', 'tracked-ignored.ts', unicodeName)
+    put('.gitignore', 'generated/\ntracked-ignored.ts\n')
+    put('app.ts', 'export const edited = true')
+    put('space name.ts')
+    put('line\nbreak.ts')
+    put('generated/ignored.ts')
+    put('.worktrees/other/app.ts')
+    git('-C', '.worktrees/other', 'init', '-q')
+    put('real-nested/app.ts')
+    git('-C', 'real-nested', 'init', '-q')
+    put('nested/.git', 'gitdir: /unread-target')
+    put('nested/app.ts')
+    put('.env', 'DO_NOT_COPY=fixture')
+    symlinkSync(join(repo, 'app.ts'), join(repo, 'linked.ts'))
+    const source = join(state, 'source')
+    mkdirSync(source, { mode: 0o700 })
+    const snapshot = await snapshotAuditSource(repo, source, { stateDir: state, root: state, source, repo, settings: {}, jobId: 'fixture' } as AuditToolContext)
+    expect(snapshot.files).toEqual(['.gitignore', 'app.ts', 'line\nbreak.ts', 'space name.ts', 'tracked-ignored.ts', unicodeName])
+    expect(readFileSync(join(source, 'app.ts'), 'utf8')).toBe('export const edited = true')
+    expect(snapshot.omitted.some(x => x.startsWith('nested: nested repository'))).toBe(true)
+    expect(existsSync(join(source, 'generated'))).toBe(false)
+  } finally { store.close() }
+})
+
+test('legacy audit resumes original cache indices and filters scanner input without changing source', async () => {
+  const { job, state, repo, store } = fixture()
+  const controller = new AbortController()
+  const root = join(state, 'security-audits', job.id)
+  try {
+    await expect(executeSecurityAudit(job, { stateDir: state, signal: controller.signal, model: async () => {
+      controller.abort(); throw new DOMException('interrupted', 'AbortError')
+    } })).rejects.toBeInstanceOf(CodexInterruptedError)
+    const path = join(root, 'journal.json')
+    const journal = JSON.parse(readFileSync(path, 'utf8'))
+    journal.files = ['.worktrees/other/app.ts', 'a.ts', 'b.ts', 'nested/other.ts']
+    journal.omitted = ['nested/.git: protected/generated directory or file']
+    for (const file of journal.files) {
+      mkdirSync(join(root, 'source', file, '..'), { recursive: true })
+      writeFileSync(join(root, 'source', file), `export const original = ${JSON.stringify(file)}\n`, { mode: 0o600 })
+    }
+    writeFileSync(path, JSON.stringify(journal), { mode: 0o600 })
+    const finding = (title: string) => ({ title, severity: 'low', location: 'a.ts:1', evidence: 'fixture evidence', recommendation: 'review fixture' })
+    writeFileSync(join(root, 'review-1', '0.json'), JSON.stringify({ findings: [finding('excluded finding')], note: '' }), { mode: 0o600 })
+    writeFileSync(join(root, 'review-1', '1.json'), JSON.stringify({ findings: [finding('retained finding')], note: '' }), { mode: 0o600 })
+    const cacheBefore = readFileSync(join(root, 'review-1', '1.json'), 'utf8')
+    writeFileSync(join(repo, 'app.ts'), 'changed after original snapshot')
+    const prompts: string[] = [], calls: number[] = []
+    await executeSecurityAudit(job, { stateDir: state, model: async prompt => {
+      prompts.push(prompt)
+      expect(prompt).not.toContain('.worktrees')
+      expect(prompt).not.toContain('nested/other.ts')
+      expect(prompt).not.toContain('changed after original snapshot')
+      return model(prompt)
+    }, tool: async (n, ctx) => {
+      calls.push(n)
+      expect(ctx.source).toBe(realpathSync(join(root, 'selected-source')))
+      expect(existsSync(join(ctx.source, '.worktrees'))).toBe(false)
+      expect(existsSync(join(ctx.source, 'nested'))).toBe(false)
+      expect(readFileSync(join(ctx.source, 'a.ts'), 'utf8')).toContain('original')
+      expect(existsSync(join(root, 'source', '.worktrees/other/app.ts'))).toBe(true)
+      expect(readFileSync(join(root, 'review-1', '1.json'), 'utf8')).toBe(cacheBefore)
+      return result(n)
+    } })
+    expect(prompts).toHaveLength(7)
+    expect(prompts[0]).toContain('"file":"b.ts"')
+    expect(calls).toEqual([1, 5, 6, 7, 8, 9, 10, 11, 12])
+    const final = JSON.parse(readFileSync(path, 'utf8'))
+    expect(final.files).toEqual(journal.files)
+    expect(final.steps).toHaveLength(13)
+    expect(final.steps[0].status).toBe('findings')
+    expect(final.steps[0].findings.map((x: { title: string }) => x.title)).toEqual(['retained finding'])
+    expect(existsSync(join(root, 'selected-source'))).toBe(false)
+    expect(readFileSync(join(repo, 'app.ts'), 'utf8')).toBe('changed after original snapshot')
+  } finally { store.close() }
+})
+
+test('interrupted E2E is not repeated while its code review remains resumable', async () => {
+  const { job, state, store } = fixture()
+  const controller = new AbortController(), calls: number[] = []
+  const root = join(state, 'security-audits', job.id)
+  try {
+    await expect(executeSecurityAudit(job, { stateDir: state, model, signal: controller.signal, tool: async n => {
+      calls.push(n)
+      mkdirSync(join(root, 'stage-1'), { mode: 0o700 })
+      controller.abort(); checkAuditInterrupted({ signal: controller.signal }); return result(n)
+    } })).rejects.toBeInstanceOf(CodexInterruptedError)
+    let modelCalls = 0
+    await executeSecurityAudit(job, { stateDir: state, model: async prompt => { modelCalls++; return model(prompt) }, tool: async n => { calls.push(n); return result(n) } })
+    expect(calls).toEqual([1, 5, 6, 7, 8, 9, 10, 11, 12])
+    expect(modelCalls).toBe(3)
+    const journal = JSON.parse(readFileSync(join(root, 'journal.json'), 'utf8'))
+    expect(journal.steps[0].note).toContain('not replayed')
+    expect(journal.steps[0].status).toBe('interrupted')
+  } finally { store.close() }
+})
+
+for (const interruptedStage of [2, 3, 4]) test(`code review ${interruptedStage} resumes instead of being skipped`, async () => {
+  const { job, state, store } = fixture()
+  const controller = new AbortController()
+  let stage = 0, called = 0
+  try {
+    await expect(executeSecurityAudit(job, { stateDir: state, signal: controller.signal, progress: text => { stage = Number(text.split('/')[0]) }, tool: async n => result(n), model: async prompt => {
+      if (stage === interruptedStage) { controller.abort(); throw new DOMException('interrupted', 'AbortError') }
+      return model(prompt)
+    } })).rejects.toBeInstanceOf(CodexInterruptedError)
+    await executeSecurityAudit(job, { stateDir: state, tool: async n => result(n), model: async prompt => { called++; return model(prompt) } })
+    expect(called).toBe(5 - interruptedStage)
+    const journal = JSON.parse(readFileSync(join(state, 'security-audits', job.id, 'journal.json'), 'utf8'))
+    expect(journal.steps).toHaveLength(13)
+    expect(journal.steps[interruptedStage - 1].status).toBe('completed')
+  } finally { store.close() }
+})
 describe('security audit workflow', () => {
   test('daemon interruption preserves audit queue while explicit cancellation stays distinct', async () => {
     const { store, job } = fixture()

@@ -1617,7 +1617,10 @@ describe('updater helpers', () => {
       )
       expect(paneCommand).not.toContain(replaceToken)
       expect(paneCommand).toContain(updateRestartTokenDigest(replaceToken))
-      for (let attempt = 0; attempt < 100 && !existsSync(observedEnvironment); attempt += 1) {
+      // Shell redirection creates the file before printf writes its complete line.
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (existsSync(observedEnvironment)
+          && readFileSync(observedEnvironment, 'utf8').endsWith('\n')) break
         await Bun.sleep(20)
       }
       expect(readFileSync(observedEnvironment, 'utf8').trim())
