@@ -71,12 +71,16 @@ test('off during remote check prevents update reservation', async () => {
   })).toBe('disabled')
 })
 
-test('same failed SHA retries after cooldown with a new delivery identity, including legacy failedSha', async () => {
+for (const exitCode of [1, 75]) test(`same incomplete SHA retries after cooldown with a new delivery identity, including legacy failedSha (exit ${exitCode})`, async () => {
   const root = temp(); const stateDir = temp(); let now = 100
   const sha = 'a'.repeat(40); let runs = 0; const messages: string[] = []
   const settings = { stateDir, isWorkerRunning: () => false, isUpdateRunning: () => false, launchWorker: () => {} }
   const old = await requestUpdate({ source: 'automatic', chatId: 'U123', threadTs: '', userId: '', messageId: `auto:${sha}` }, settings)
-  await runUpdateWorker(old.request.id, { stateDir, executeUpdater: async () => { runs++; return 1 }, notify: async (_, text) => { messages.push(text) } })
+  await runUpdateWorker(old.request.id, { stateDir, executeUpdater: async () => { runs++; return exitCode }, notify: async (_, text) => { messages.push(text) } })
+  if (exitCode === 75) {
+    expect(messages[0]).toContain('次回の定期確認で再試行')
+    expect(messages[0]).not.toMatch(/失敗|復旧/)
+  }
   // Exercise the old on-disk quarantine format as well as the real request deduper.
   const completedAt = Date.now(); now = completedAt + 1
   writeFileSync(join(root, 'auto-update-check.json'), JSON.stringify({ pendingState: stateDir, pendingId: old.request.id, checkedAt: completedAt, targetSha: sha, failedSha: sha }))

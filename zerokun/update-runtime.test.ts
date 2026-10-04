@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdtempSync,
@@ -32,6 +33,34 @@ function fixture(): { root: string; state: string } {
 }
 
 describe('atomic update request runtime', () => {
+  test('a pre-change installer file list can boot the new worker and deliver a deferred outcome', async () => {
+    const { root, state } = fixture()
+    // Frozen list from release 7d59f05: the installer executing the first upgrade
+    // cannot know about newly added companion files.
+    const oldFiles = ['update-request.ts', 'update-controller.ts', 'process-generation.ts',
+      'process-lock.ts', 'child-environment.ts', 'safe-file.ts', 'managed-path.ts',
+      'state-dir.ts', 'slack-http.ts', 'slack-app-identity.ts', 'tmux-command.ts']
+    for (const name of oldFiles) copyFileSync(join(import.meta.dir, name), join(root, name))
+    expect(existsSync(join(root, 'update-result.ts'))).toBe(false)
+    const worker = await import(join(root, 'update-request.ts'))
+    const { UPDATE_DEFERRED_EXIT_CODE } = await import('./update-result.ts')
+    const request = await worker.requestUpdate({ source: 'automatic', chatId: 'U123', threadTs: '', userId: 'U123', messageId: 'auto:test' },
+      { stateDir: state, launchWorker: () => {} })
+    const messages: string[] = []
+    const result = await worker.runUpdateWorker(request.request.id, { stateDir: state,
+      executeUpdater: async () => UPDATE_DEFERRED_EXIT_CODE,
+      notify: async (_: unknown, text: string) => { messages.push(text) } })
+    expect(result).toEqual({ success: false, exitCode: 75, notificationSent: true })
+    expect(messages[0]).toContain('自動更新を見送りました')
+    expect(messages[0]).not.toContain('失敗')
+    const replay = Bun.spawnSync([process.execPath, '--config=/dev/null', '--no-env-file',
+      join(root, 'update-request.ts'), 'run', request.request.id, '--state-dir', state], {
+      env: { HOME: root, PATH: process.env.PATH }, stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(replay.exitCode).toBe(75)
+    expect(replay.stderr.toString()).toBe('')
+  })
+
   for (const failAt of ['staged', 'published'] as const) {
     test(`${failAt}境界で停止しても旧entrypointを維持する`, () => {
       const { state } = fixture()

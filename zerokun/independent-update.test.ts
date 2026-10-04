@@ -3,7 +3,8 @@ import { mkdtempSync, realpathSync, renameSync, mkdirSync, readFileSync, rmSync,
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Database } from 'bun:sqlite'
-import { activateRelease, collectIndependentTargets, activateIndependentTargets, readReleaseTransaction, type ActivationHooks, type ReleaseTarget } from './independent-update.ts'
+import { activateRelease, collectIndependentTargets, activateIndependentTargets, readReleaseTransaction, summarizeIndependentResults, type ActivationHooks, type ReleaseTarget } from './independent-update.ts'
+import { UpdateDeferredError } from './update-result.ts'
 import { readRuntimeRelease, installLegacyCommands, runtimeCommandForState, RELEASE_JOURNAL, type RuntimeRelease } from './runtime-release.ts'
 import { slackAppRegistryRoot } from './slack-app-registry.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
@@ -86,6 +87,40 @@ test('one failed activation does not roll back a successful peer or discard inta
   expect(readRuntimeRelease(bad.stateDir, f.home)).toBeNull()
   expect(db.query('SELECT * FROM jobs').all()).toEqual([{ id: 1, status: 'queued' }]); db.close()
   expect(f.locks.size).toBe(0)
+})
+
+test('busy deferral preserves the running job and releases only its waiting barrier while peers update', async () => {
+  const f = fixture(), busy = f.targets[0]!
+  const db = new Database(join(busy.stateDir, 'jobs.sqlite3'))
+  db.exec("CREATE TABLE jobs(id INTEGER PRIMARY KEY,status TEXT); INSERT INTO jobs VALUES(1,'running')")
+  f.hooks.drain = async target => {
+    if (target === busy) throw new UpdateDeferredError('running task')
+  }
+  try {
+    const results = await activateIndependentTargets(f.targets, f.release, f.hooks)
+    expect(summarizeIndependentResults(results, [])).toBe('deferred')
+    expect(db.query('SELECT * FROM jobs').all()).toEqual([{id:1,status:'running'}])
+    expect(readRuntimeRelease(busy.stateDir, f.home)).toBeNull()
+    expect(readReleaseTransaction(busy.stateDir, f.home)).toBeNull()
+    expect(f.events.some(event => event.includes(busy.stateDir))).toBe(false)
+    expect(f.locks.size).toBe(0)
+    expect(readRuntimeRelease(f.targets[1]!.stateDir, f.home)?.sha).toBe(f.release.sha)
+    expect(readRuntimeRelease(f.targets[2]!.stateDir, f.home)?.sha).toBe(f.release.sha)
+    const deferred = {status:'rejected' as const,reason:new UpdateDeferredError('busy')}
+    expect(summarizeIndependentResults([deferred, deferred], [])).toBe('deferred')
+    expect(summarizeIndependentResults([deferred, {status:'rejected', reason:new Error('unhealthy')}], [])).toBe('failed')
+    expect(summarizeIndependentResults([deferred], ['unavailable app'])).toBe('failed')
+    expect(summarizeIndependentResults([{status:'fulfilled',value:'current'}], [])).toBe('complete')
+  } finally { db.close() }
+})
+
+test('a deferred-shaped error after stopping services or during barrier cleanup remains a failure', async () => {
+  const f = fixture(), target = f.targets[0]!
+  f.hooks.install = async (_target, root) => { if (root === f.release.path) throw new UpdateDeferredError('not a drain result') }
+  expect(summarizeIndependentResults(await activateIndependentTargets([target],f.release,f.hooks),[])).toBe('failed')
+  f.hooks.drain = async () => { throw new UpdateDeferredError('busy') }
+  f.hooks.acquire = () => ({release() { throw new Error('release failed') }})
+  expect(summarizeIndependentResults(await activateIndependentTargets([target],f.release,f.hooks),[])).toBe('failed')
 })
 
 test('same release does not acquire lock or restart; stopped instance remains stopped', async () => {
