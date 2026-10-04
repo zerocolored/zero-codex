@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { captureClaudeUsage, ownedClaudeUsageSession } from './task-usage.ts'
 
 import { createHash, randomBytes, timingSafeEqual } from 'crypto'
 import {
@@ -34,7 +35,7 @@ import { claudeUiProposalSchema, createClaudeUiWorkspace, claudeUiInstructions, 
 import { watchAdvisorStopRequest } from './advisor-settlement.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { startProcessPolling } from './supervisor-watch.ts'
-import { observeProcessGeneration } from './process-generation.ts'
+import { observeProcessGeneration, readProcessIdentity, type ProcessIdentity } from './process-generation.ts'
 import { retryAdvisorConnection } from './advisor-connection-retry.ts'
 export { claudeSubscriptionStatusIsReady } from './claude-auth-status.ts'
 import {
@@ -2017,6 +2018,8 @@ async function main(): Promise<void> {
     let requestDir: string | undefined
     let beforeSnapshot: AdvisorRepositorySnapshot | undefined
     let target: EphemeralClaudeTarget | undefined
+    let usageProcess: ProcessIdentity | undefined
+    let usageSession: string | undefined
     let marker = ''
     let deliveryUnknown = false
     let response: string | undefined
@@ -2219,6 +2222,13 @@ async function main(): Promise<void> {
         throw new Error(`ephemeral Claude open failed (${opened.exitCode}): ${opened.stderr}`)
       }
       target = parseEphemeralClaudeOpen(opened.stdout)
+      try {
+        const receipt = JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(join(requestDir, 'ephemeral-agent-receipt.json'), 128 * 1024) ?? 'null')
+        if (receipt?.workspace_id === target.workspaceId && receipt?.pane_id === target.paneId
+          && receipt?.terminal_id === target.terminalId && Number.isSafeInteger(receipt?.claude_pid)) {
+          usageProcess = readProcessIdentity(receipt.claude_pid)
+        }
+      } catch { /* Usage metadata must never prevent review or owned cleanup. */ }
       try {
         const afterOpenVerify = await runBounded(fingerprintedCommand(
           [python, helper, 'verify', ...helperArgs], jobFingerprint,
@@ -2521,6 +2531,7 @@ async function main(): Promise<void> {
               cleanupWarnings.push('ephemeral Claude open output disagreed with its durable workspace receipt')
             }
             if (!target) target = receiptTarget
+            if (usageProcess) usageSession = ownedClaudeUsageSession(join(homedir(), '.claude'), claudeProjectRoot!, usageProcess)
             const close = await runBounded(fingerprintedCommand([
               python, helper, 'close', ...helperArgs,
             ], jobFingerprint), {
@@ -2598,6 +2609,10 @@ async function main(): Promise<void> {
           cleanupWarnings.push(`ephemeral Claude cleanup verification failed: ${error}`)
         }
       }
+      try {
+        captureClaudeUsage(stateDir, context.jobId, diagnosticAttempt, usageSession ?? target?.nativeSession,
+          claudeProjectRoot ?? context.repoPath, join(homedir(), '.claude'))
+      } catch { cleanupWarnings.push('Claude numeric usage record unavailable') }
       if (requestDir && cleanupVerified) {
         try {
           persistAdvisorClaudeCleanupOutcome(stateDir, {

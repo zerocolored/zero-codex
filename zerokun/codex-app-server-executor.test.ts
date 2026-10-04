@@ -1,3 +1,4 @@
+import { readTaskUsage } from './task-usage.ts'
 import { registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { awaitNativeConfirmation, parseNativeConfirmationAnswer } from './native-confirmation.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -511,6 +512,12 @@ for line in sys.stdin:
                 emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
                 emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
             emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
+        if os.environ.get("ZERO_USAGE_EVENT"):
+            assert "zerokun_usage=" in " ".join(sys.argv)
+            assert "task_usage_read" in phase_prompt
+            counters = {"inputTokens": 100, "cachedInputTokens": 60, "cacheWriteInputTokens": 0, "outputTokens": 20, "reasoningOutputTokens": 5}
+            for _ in range(2):
+                emit({"method": "thread/tokenUsage/updated", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "tokenUsage": {"total": counters, "last": counters}}})
         if mode == "native-upload":
             emit({"id": 0, "method": "mcpServer/elicitation/request", "params": {
                 "threadId": "foreign-thread" if os.environ.get("ZERO_NATIVE_CONFIRMATION_FOREIGN") else (requested_thread or thread_id),
@@ -1452,6 +1459,22 @@ function fixture(
 }
 
 describe('production App Server executor', () => {
+  test('usage recorder and host tool are available to a read-only job without exposing raw logs', async () => {
+    const value = fixture('normal')
+    try {
+      await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'normal', ZERO_USAGE_EVENT: '1' },
+      })
+      const result = readTaskUsage(value.state, {jobId:value.job.id,repoPath:value.repo})
+      expect(result.jobs[0]!.codex.tokens?.inputTokens).toBe(100)
+      expect(result.jobs[0]!.codex.tokens?.cachedInputTokens).toBe(60)
+      expect(result.jobs[0]!.codex.measuredTurns).toBe(1)
+      expect(readdirSync(join(value.state,'task-usage',value.job.id))).toHaveLength(1)
+    } finally {value.store.close()}
+  }, 30_000)
+
   test('Slackへ出すadvisor件数はモデル文やcached集計でなくterminal slotから導出する', () => {
     const state = secureRoot()
     prepareManagedStateRoot(state)
