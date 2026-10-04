@@ -1,3 +1,4 @@
+import { createUsageRecorder } from './task-usage.ts'
 import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCliConfig } from './deployment-cli-runtime.ts'
 import { browserUploadConfirmation, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
 import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
@@ -36,7 +37,7 @@ import { previousThreadArtifactRoots } from './artifact-source.ts'
 import { ContinuedArtifactMessage } from './continued-artifact-message.ts'
 import { homedir, tmpdir } from 'os'
 import { registeredSlackAppStatePaths } from './slack-app-registry.ts'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import type {
   JobControlRecord,
   JobExecutionResult,
@@ -4157,6 +4158,10 @@ export function buildCodexDeveloperInstructions(
       'A prior assistant refusal based only on obsolete Zero gates is not a current policy rule.',
       'This does not dismiss a refusal reporting an actual user or tool denial. A read-only helper',
       'or missing transport does not itself prohibit otherwise authorized primary operations.',
+      'For your own task token usage or API-equivalent cost questions, call zerokun_usage.task_usage_read first.',
+      'It reads numeric host records for this conversation, including past jobs; no user-uploaded usage export is needed for retained records.',
+      'List tasks, then select the intended task numbers and exclude later cost questions. Respect partial/unavailable, unknown model and cache accounting notes.',
+      'Do not confuse an empty project audit registry with missing token logs. Never inspect private host logs directly or claim a full total from partial providers.',
       'For diagnostic logs, zerokun_cloud_logging.cloud_logging_read is also available.',
       'For Cloud Run configuration, use zerokun_cloud_logging.cloud_run_describe with explicit',
       'project, region and service. Inspect traffic and describe each serving revision before',
@@ -4311,6 +4316,11 @@ export function buildCodexWorkerPrompt(
     `Durable input revision: ${input.revision}`,
     `Durable input digest: ${input.digest}`,
     `Job ID: ${job.id}`,
+    `Task number: ${job.seq}`,
+    'For token usage or API-equivalent cost of your own work, first call zerokun_usage.task_usage_read.',
+    'This host tool reads numeric records for the current conversation, including retained prior logs. Select task numbers for the requested work; exclude later cost questions.',
+    'Unknown or partial usage is not zero. Use the accounting notes and distinguish hypothetical API rates from actual subscription billing.',
+    'An empty project_audit_read registry says nothing about token usage. Do not ask the user to export usage before trying task_usage_read.',
     `Slack thread: ${job.chatId} / ${job.threadTs}`,
     `Current sender: ${job.userId}`,
     `Project root: ${job.repoPath}`,
@@ -4635,6 +4645,11 @@ export function buildCodexPhasePrompt(
     `Durable input revision: ${input.revision}`,
     `Durable input digest: ${input.digest}`,
     `Job ID: ${job.id}`,
+    `Task number: ${job.seq}`,
+    'For token usage or API-equivalent cost of your own work, first call zerokun_usage.task_usage_read.',
+    'This host tool reads numeric records for the current conversation, including retained prior logs. Select task numbers for the requested work; exclude later cost questions.',
+    'Unknown or partial usage is not zero. Use the accounting notes and distinguish hypothetical API rates from actual subscription billing.',
+    'An empty project_audit_read registry says nothing about token usage. Do not ask the user to export usage before trying task_usage_read.',
     `Slack thread: ${job.chatId} / ${job.threadTs}`,
     `Project root: ${job.repoPath}`,
     `Artifact directory: ${artifactDir}`,
@@ -5171,6 +5186,11 @@ export function buildCodexInterjectionPrompt(
     '--- Zero host interjection response control (trusted) ---',
     `Logical attempt nonce: ${attemptNonce}`,
     `Job ID: ${job.id}`,
+    `Task number: ${job.seq}`,
+    'For token usage or API-equivalent cost of your own work, first call zerokun_usage.task_usage_read.',
+    'This host tool reads numeric records for the current conversation, including retained prior logs. Select task numbers for the requested work; exclude later cost questions.',
+    'Unknown or partial usage is not zero. Use the accounting notes and distinguish hypothetical API rates from actual subscription billing.',
+    'An empty project_audit_read registry says nothing about token usage. Do not ask the user to export usage before trying task_usage_read.',
     `Slack thread: ${job.chatId} / ${job.threadTs}`,
     `Interjection ID: ${interjection.id}`,
     `Durable input revision: ${interjection.inputRevision}`,
@@ -5554,6 +5574,7 @@ export function buildCodexPermissionOverrides(
     browserMcp?: { command: string; args: string[] }
     githubMcp?: { command: string; args: string[] }
     cloudLoggingMcp?: { command: string; args: string[] }
+    usageMcp?: { command: string; args: string[] }
     seatbeltFingerprintAllowPath?: string
     executionWriteEnabled?: boolean
     localVerificationEnabled?: boolean
@@ -5906,6 +5927,10 @@ export function buildCodexPermissionOverrides(
     mcpEntries.push(
       `zerokun_cloud_logging={command=${tomlString(cloud.command)},args=[${cloud.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["cloud_logging_read","cloud_run_describe","project_audit_read"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=90,tools={cloud_logging_read={approval_mode="approve"},cloud_run_describe={approval_mode="approve"},project_audit_read={approval_mode="approve"}}}`,
     )
+  }
+  if (options.usageMcp) {
+    const usage = options.usageMcp
+    mcpEntries.push(`zerokun_usage={command=${tomlString(usage.command)},args=[${usage.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["task_usage_read"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=90}`)
   }
   const mcpServers = `{${mcpEntries.join(',')}}`
   return [
@@ -6854,6 +6879,11 @@ export async function executeCodexJob(
   const browserBrokerPath = requireSafeBroker('browser-verification-broker.ts')
   const githubBrokerPath = requireSafeBroker('github-credential-broker.ts')
   const cloudLoggingBrokerPath = requireSafeBroker('cloud-logging-broker.ts')
+  const usageBrokerPath = requireSafeBroker('task-usage-broker.ts')
+  const usageContextDir = ensureManagedDirectory(managedStateDir, join(managedStateDir, 'task-usage-context'))
+  atomicWritePrivateFile(join(usageContextDir, `${job.id}.json`), JSON.stringify({
+    version: 1, jobId: job.id, repoPath: job.historyRepoPath ?? job.repoPath,
+  }))
   const localAdvisorAccess = false
   const claudeAdvisorLookup = (() => {
     try { return resolveClaudeExecutableLookup() } catch { return undefined }
@@ -7094,6 +7124,10 @@ export async function executeCodexJob(
         command: realpathSync(process.execPath),
         args: ['--config=/dev/null', '--no-env-file', reproductionBrokerPath, reproductionContextPath, managedStateDir],
       } : undefined
+      const usageMcp = !continuationDecision ? {
+        command: realpathSync(process.execPath),
+        args: ['--config=/dev/null', '--no-env-file', usageBrokerPath, managedStateDir, job.id],
+      } : undefined
       const permissionProfile = `zerokun_job_${randomUUID().replaceAll('-', '')}`
       const cloudLoggingMcp = job.writeEnabled && stage === 'complete' && !continuationDecision
         ? {
@@ -7128,6 +7162,7 @@ export async function executeCodexJob(
         browserMcp,
         githubMcp,
         cloudLoggingMcp,
+        usageMcp,
         seatbeltFingerprintAllowPath: seatbeltFingerprint.allow.path,
         executionWriteEnabled,
         localVerificationEnabled: browserMcp !== undefined,
@@ -7688,6 +7723,9 @@ export async function executeCodexJob(
         openSafeLog(`${stdoutPath}.tail-1.log`, 'truncate'),
       ]
       const diagnosticTail = new DiagnosticTail(tailDescriptors)
+      let usageRecorder: ReturnType<typeof createUsageRecorder> | undefined
+      try { usageRecorder = createUsageRecorder(managedStateDir, job.id, advisorAttempt.processNonce, model, basename(stdoutPath)) }
+      catch { process.stderr.write('zerochan: numeric usage recording unavailable\n') }
       let stdoutBytes = 0
       let stdoutTail = ''
       const stdoutDecoder = new TextDecoder('utf-8', { fatal: true })
@@ -7793,6 +7831,8 @@ export async function executeCodexJob(
             .slice(-MAX_LOG_TAIL_CHARS)
         },
         onNotification: notification => {
+          try { usageRecorder?.observe(notification) }
+          catch { usageRecorder?.markPartial() }
           // Preserve projection order and synchronously hand each public
           // commentary item to durable host storage. Capture persistence
           // failures here, then surface them from the single owner loop.
@@ -9246,6 +9286,7 @@ export async function executeCodexJob(
             `App Server emitted an error after the accepted terminal: ${JSON.stringify(lateAppServerError)}`,
           )
       }
+      try { usageRecorder?.close() } catch { process.stderr.write('zerochan: numeric usage record could not be saved\n') }
       closeSync(stdoutDescriptor)
       tailDescriptors.forEach(closeSync)
       try {

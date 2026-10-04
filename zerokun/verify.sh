@@ -391,6 +391,7 @@ for entry in \
   zerokun/herdr-job-monitor-view.ts \
   zerokun/standalone-codex.ts \
   zerokun/codex-executor.ts \
+  zerokun/task-usage-broker.ts \
   zerokun/chrome-session-broker.ts \
   zerokun/codex-reproduction-broker.ts \
   zerokun/project-layout.ts \
