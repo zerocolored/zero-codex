@@ -5882,7 +5882,7 @@ export function buildCodexPermissionOverrides(
   }
   if (options.advisorMcp) {
     mcpEntries.push(
-      `zerokun_advisors={command=${tomlString(options.advisorMcp.command)},args=[${options.advisorMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["advisor_native_prepare","advisor_round","advisor_round_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_native_prepare={approval_mode="approve"},advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"}}}`,
+      `zerokun_advisors={command=${tomlString(options.advisorMcp.command)},args=[${options.advisorMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["advisor_native_prepare","advisor_round","advisor_round_poll","advisor_grok_oauth_respond"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=30,tools={advisor_native_prepare={approval_mode="approve"},advisor_round={approval_mode="approve"},advisor_round_poll={approval_mode="approve"},advisor_grok_oauth_respond={approval_mode="approve"}}}`,
     )
   }
   if (options.browserMcp) {

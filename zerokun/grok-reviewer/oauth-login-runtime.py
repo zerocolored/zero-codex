@@ -869,6 +869,51 @@ def _plain_pty_output(captured: bytes, *, final: bool = False) -> bytes:
     return plain
 
 
+def _browser_decision(status: str, allowed: set[str], deadline: float) -> str:
+    """Only the caller's browser control observes tabs; IPC carries fixed enums.
+
+    Keep the OAuth URL in this process. EOF, malformed input and
+    missing browser control preserve the real auth instead of guessing a tab.
+    """
+    _emit(status)
+    descriptor = sys.stdin.fileno()
+    captured = bytearray()
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(descriptor, selectors.EVENT_READ)
+        while True:
+            _raise_if_interrupted()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LoginFailure("oauth-login-timeout", 124)
+            if not selector.select(min(0.1, remaining)):
+                continue
+            chunk = os.read(descriptor, 65)
+            if not chunk or len(captured) + len(chunk) > 64:
+                raise LoginFailure("oauth-login-browser-control-unavailable")
+            captured.extend(chunk)
+            if b"\n" not in captured:
+                continue
+            # Reject multiple responses in one read; the caller responds per request.
+            if not captured.endswith(b"\n") or captured.count(b"\n") != 1:
+                raise LoginFailure("oauth-login-browser-control-rejected")
+            try:
+                answer = bytes(captured[:-1]).decode("ascii")
+            except UnicodeDecodeError as error:
+                raise LoginFailure("oauth-login-browser-control-rejected") from error
+            if answer not in allowed:
+                raise LoginFailure("oauth-login-browser-control-rejected")
+            return answer
+    finally:
+        selector.close()
+
+
+def _open_chrome_once(url: str, deadline: float) -> None:
+    decision = _browser_decision("oauth-browser-check-required", {"native-opened", "manual-open"}, deadline)
+    if decision == "manual-open":
+        _open_chrome(url, deadline)
+
+
 def _open_chrome(url: str, deadline: float) -> None:
     if '"' in url or "\\" in url or "\n" in url or "\r" in url:
         raise LoginFailure("oauth-login-url-rejected")
@@ -940,6 +985,7 @@ def _run_login(
     deadline: float,
 ) -> None:
     _validate_materialized_executable(grok, copied_identity, copied_digest)
+    _browser_decision("oauth-browser-baseline-required", {"baseline-ready"}, deadline)
     master, slave = pty.openpty()
     process: subprocess.Popen[bytes] | None = None
     slave_open = True
@@ -1000,7 +1046,7 @@ def _run_login(
                     except UnicodeDecodeError as error:
                         raise LoginFailure("oauth-login-url-rejected") from error
                     candidate = _validate_oauth_url(candidate)
-                    _open_chrome(candidate, deadline)
+                    _open_chrome_once(candidate, deadline)
                     _raise_if_interrupted()
                     browser_opened = True
                     _emit("oauth-browser-opened")
@@ -1019,6 +1065,7 @@ def _run_login(
             or len(_completed_url_tokens(plain)) != 1
         ):
             raise LoginFailure("oauth-login-failed", 1)
+        _browser_decision("oauth-browser-verify-required", {"browser-verified"}, deadline)
         remaining = max(0.0, deadline - time.monotonic())
         if not _wait_group_exit(process, min(FINAL_REAP_SECONDS, remaining)):
             _terminate_group(process)

@@ -222,7 +222,7 @@ GitHub Actionsのworkflowを変更してpushするには、通常の`repo`に加
 Zeroちゃんはpushの明示的なworkflow権限拒否を区別して報告します。権限の自動拡大や、
 workflow変更の削除、同じ失敗の無条件再送は行いません。
 
-これは初回セットアップ用です。稼働後にGrok 1.0.5が既知の未認証応答だけを返した場合は、
+これは初回セットアップ用です。稼働後にGrokが既知の未認証応答だけを返した場合は、
 ZeroちゃんがmacOSの固定OAuth helperをphase内で1回だけ試します。復旧できない場合もGrok枠だけを
 利用不能として扱い、primary Codexのtaskは継続します。rate limit、quota、network障害ではOAuthを
 起動しません。
@@ -232,6 +232,11 @@ ZeroちゃんがmacOSの固定OAuth helperをphase内で1回だけ試します�
 既存の認証情報を保持します。反映後の中断では新しい認証情報が残る場合があります。
 並行する手動loginを完全に排他できないため、自動復旧中に別途`grok login`を実行しないでください。
 OAuthの旧32文字・UUID形式のstateと通常のANSI表示に対応しています。
+再認証中のbrowser確認はadvisorのpollからprimary Codexへ引き継ぎます。公式Chrome連携で
+今回増えたtabが1つなら追加openを省略し、0個のときだけhelperが開きます。
+primaryは一意な公式認可画面の「Authorize／許可」を確認し、必要な場合だけ1回操作します。
+Grok終了後もtab identityの最終確認を受けるまで認証情報を確定しません。
+helperとbrokerの間で渡すのは固定応答だけで、URL・credential・画面本文を渡しません。
 このhelperはZeroちゃん専用の同梱物です。codex-configのAGENTS.mdやhelperだけを更新しても
 置き換わらないため、Zeroちゃん側の修正版は`zerochan update`で配備してください。
 

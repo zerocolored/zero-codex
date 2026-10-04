@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -51,6 +52,35 @@ class OAuthTests(unittest.TestCase):
     def assert_live(self, value=b"old-fixture"):
         self.assertEqual((self.live / ".grok/auth.json").read_bytes(), value)
         self.assertEqual(list((self.live / ".grok").glob(".oauth-auth-*")), [])
+
+    def test_native_browser_is_not_opened_a_second_time(self):
+        with patch.object(runtime, "_browser_decision", return_value="native-opened"), patch.object(runtime, "_open_chrome") as opened:
+            runtime._open_chrome_once(oauth_url(), time.monotonic() + 5)
+        opened.assert_not_called()
+
+    def test_legacy_browser_is_opened_once(self):
+        with patch.object(runtime, "_browser_decision", return_value="manual-open"), patch.object(runtime, "_open_chrome") as opened:
+            runtime._open_chrome_once(oauth_url(), time.monotonic() + 5)
+        opened.assert_called_once_with(oauth_url(), unittest.mock.ANY)
+
+    def test_browser_control_accepts_only_one_requested_fixed_response(self):
+        for value in (b"baseline-ready\n", b"abort\n", b"native-opened\n", b"baseline-ready\nnative-opened\n", b"", b"x" * 65):
+            read_fd, write_fd = os.pipe()
+            os.write(write_fd, value)
+            os.close(write_fd)
+            with os.fdopen(read_fd, "rb") as input_stream, patch.object(runtime.sys, "stdin", input_stream), patch.object(runtime, "_emit") as emit:
+                if value == b"baseline-ready\n":
+                    self.assertEqual(runtime._browser_decision("oauth-browser-baseline-required", {"baseline-ready"}, time.monotonic()+1), "baseline-ready")
+                else:
+                    with self.assertRaises(runtime.LoginFailure):
+                        runtime._browser_decision("oauth-browser-baseline-required", {"baseline-ready"}, time.monotonic()+1)
+                emit.assert_called_once_with("oauth-browser-baseline-required")
+
+    def test_browser_observation_failure_does_not_open_another_tab(self):
+        with patch.object(runtime, "_browser_decision", side_effect=runtime.LoginFailure("oauth-login-browser-control-rejected")), patch.object(runtime, "_open_chrome") as opened:
+            with self.assertRaises(runtime.LoginFailure):
+                runtime._open_chrome_once(oauth_url(), time.monotonic()+1)
+        opened.assert_not_called()
 
     def test_state_legacy_and_uuid(self):
         for state in ("s" * 32, "01234567-89ab-cdef-0123-456789abcdef"):
@@ -224,6 +254,11 @@ sys.exit(1 if {outcome!r} == "failure" else 0)
             stack.enter_context(patch.object(runtime, "_materialize_verified_executable", return_value=(executable, (), "fixture")))
             stack.enter_context(patch.object(runtime, "_validate_materialized_executable"))
             stack.enter_context(patch.object(runtime, "_open_chrome", side_effect=opened))
+            def decision(status, _allowed, _deadline):
+                if status == "oauth-browser-verify-required" and outcome == "browser-reject":
+                    raise runtime.LoginFailure("oauth-login-browser-control-rejected")
+                return {"oauth-browser-baseline-required": "baseline-ready", "oauth-browser-check-required": "manual-open", "oauth-browser-verify-required": "browser-verified"}[status]
+            stack.enter_context(patch.object(runtime, "_browser_decision", side_effect=decision))
             stack.enter_context(patch.object(runtime, "LOGIN_TIMEOUT_SECONDS", 3 if outcome == "timeout" else 10))
             stack.enter_context(contextlib.redirect_stdout(output))
             stack.enter_context(contextlib.redirect_stderr(output))
@@ -240,6 +275,9 @@ sys.exit(1 if {outcome!r} == "failure" else 0)
         self.assertNotIn("fixture", output.getvalue())
         self.assertNotIn("https://", output.getvalue())
         self.assert_live(b"new-cli-fixture" if outcome == "success" else b"other-login-fixture" if outcome == "concurrent" else b"old-fixture")
+
+    def test_missing_final_browser_confirmation_preserves_live_auth(self):
+        self.run_login_fixture("browser-reject")
 
     def test_linux_helper_remains_unsupported_without_touching_auth(self):
         with patch.object(runtime.sys, "platform", "linux"):
