@@ -9,6 +9,7 @@ import { ensureManagedDirectory, prepareManagedStateRoot } from './managed-path.
 import { releaseProcessLock, tryAcquireProcessLock } from './process-lock.ts'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import { recoverPreviousReproduction } from './reproduction-recovery.ts'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
@@ -39,6 +40,113 @@ function fixture(status = 'running') {
   return { root, context, dir, workspace, journal, id, result, runs, starts: () => starts,
     sql(sql: string) { const db = new Database(join(stateDir, 'jobs.sqlite3')); try { db.exec(sql) } finally { db.close() } } }
 }
+
+function sameJobFixture() {
+  const f = fixture()
+  f.context.job.id = 'prior'; f.context.job.seq = 105; f.context.job.status = 'running'
+  f.context.scratchDir = f.dir('tmp', 'prior')
+  f.context.artifactDir = f.dir('outbox', 'prior')
+  f.context.liveInputDir = f.dir('live-input', 'prior')
+  return f
+}
+
+test.each(['completed', 'containment_failed'])('recovery rereads a concurrently published %s result after ownership release', status => {
+  const f = sameJobFixture()
+  const recover = () => recoverPreviousReproduction(f.context, f.id, true, () => {
+    writeFileSync(join(f.journal, 'result.json'), JSON.stringify({ ...f.result, status, exitCode: 0 }), { mode: 0o600 })
+    return { status: 'missing' }
+  })
+  if (status === 'completed') expect(recover().status).toBe('completed')
+  else expect(recover).toThrow('requires containment')
+  expect(JSON.parse(readFileSync(join(f.journal, 'result.json'), 'utf8')).status).toBe(status)
+  expect(f.starts()).toBe(0)
+})
+
+test('same-job reconnect recovers a lost broker without relaunching or rewriting its source journal', async () => {
+  const f = sameJobFixture(), original = readFileSync(join(f.journal, 'result.json'), 'utf8')
+  const value = f.runs.poll(f.id)
+  expect(value.status).toBe('interrupted')
+  expect(value.recovery?.sourceJob).toBe(105)
+  expect(value.recovery?.copiedFiles).toBe(2)
+  expect(value.recovery?.finalAvailable).toBe(false)
+  expect(readFileSync(join(value.workspace, 'output', 'partial.json'), 'utf8')).toBe('{"count":12}')
+  expect(readFileSync(join(f.journal, 'result.json'), 'utf8')).toBe(original)
+  const prompt = join(f.context.scratchDir, 'request.txt')
+  writeFileSync(prompt, readFileSync(join(f.journal, 'request.txt')), { mode: 0o600 })
+  expect(f.runs.start(prompt, f.workspace)).toEqual(value)
+  expect(f.starts()).toBe(0)
+  expect(JSON.parse(readFileSync(value.receiptPath, 'utf8')).comparisonVerified).toBe(false)
+  await f.runs.close()
+})
+
+test('same-job poll preserves a live owner and rejects unknown ownership', async () => {
+  const f = sameJobFixture(), path = join(f.journal, 'process.lock')
+  const lease = tryAcquireProcessLock(path)
+  if (!lease.acquired) throw new Error('fixture lease unavailable')
+  try {
+    expect(f.runs.poll(f.id).status).toBe('running')
+    expect(existsSync(join(f.context.liveInputDir, 'codex-reproduction', f.id))).toBe(false)
+  } finally { releaseProcessLock(path, lease.lease) }
+  writeFileSync(path, 'invalid', { mode: 0o600 })
+  expect(() => f.runs.poll(f.id)).toThrow('ownership is unknown')
+  expect(f.starts()).toBe(0)
+  await f.runs.close()
+})
+
+test('same-job MCP polling returns recovered partial files immediately, with no sandbox process inspection', async () => {
+  const f = sameJobFixture()
+  writeFileSync(join(f.journal, 'final.txt'), 'Unsealed final output', { mode: 0o600 })
+  const server = createReproductionServer(f.runs), client = new Client({ name: 'same-job-test', version: '1' })
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair()
+  await server.connect(serverSide); await client.connect(clientSide)
+  try {
+    const before = Date.now(), response = await client.callTool({ name: 'codex_reproduction_poll', arguments: { id: f.id } })
+    expect(Date.now() - before).toBeLessThan(5_000)
+    const result = JSON.parse((response.content as { text: string }[])[0]!.text)
+    expect(result.status).toBe('interrupted')
+    expect(result.recovery.finalAvailable).toBe(true)
+    expect(readFileSync(result.finalPath, 'utf8')).toBe('Unsealed final output')
+    expect(f.starts()).toBe(0)
+  } finally { await client.close(); await server.close(); await f.runs.close() }
+})
+
+test('a child group outliving its broker remains running until that exact group exits', async () => {
+  const f = sameJobFixture(), path = join(f.journal, 'process.lock')
+  const module = new URL('./process-lock.ts', import.meta.url).pathname
+  // Keep the worker under the test runner: --no-orphans would otherwise
+  // remove the fixture with its owner before recovery can observe the lease.
+  const child = Bun.spawn(['/bin/sleep', '30'], { detached: true, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+  const { readProcessIdentity, observeProcessGeneration, signalProcessIfLive } = await import('./process-generation.ts')
+  const identity = readProcessIdentity(child.pid)
+  try {
+    expect(identity).toBeDefined()
+    const script = `import {tryAcquireProcessLock,delegateProcessLock} from ${JSON.stringify(module)};
+      const lock=${JSON.stringify(path)};const lease=tryAcquireProcessLock(lock);if(!lease.acquired)process.exit(2);
+      if(!delegateProcessLock(lock,lease.lease,${child.pid}))process.exit(3);`
+    const owner = Bun.spawn([process.execPath, '--config=/dev/null', '--no-env-file', '-e', script], { stdout: 'ignore', stderr: 'pipe' })
+    expect(await owner.exited).toBe(0)
+    expect(f.runs.poll(f.id).status).toBe('running')
+    expect(observeProcessGeneration(identity!).status).toBe('alive')
+  } finally {
+    if (identity) signalProcessIfLive(identity, 'SIGTERM')
+    for (let n = 0; identity && n < 100 && observeProcessGeneration(identity).status !== 'dead'; n++) await Bun.sleep(20)
+  }
+  expect(f.runs.poll(f.id).status).toBe('interrupted')
+  expect(f.starts()).toBe(0)
+  await f.runs.close()
+}, 10_000)
+
+test('a proven-dead prior broker is recoverable even when its database job still says running', async () => {
+  const f = fixture(); f.sql("UPDATE jobs SET status='running'")
+  const path = join(f.journal, 'process.lock'), module = new URL('./process-lock.ts', import.meta.url).pathname
+  const script = `import {tryAcquireProcessLock} from ${JSON.stringify(module)};
+    if(!tryAcquireProcessLock(${JSON.stringify(path)}).acquired)process.exit(2);`
+  const owner = Bun.spawn([process.execPath, '--config=/dev/null', '--no-env-file', '-e', script], { stdout: 'ignore', stderr: 'pipe' })
+  expect(await owner.exited).toBe(0)
+  expect(f.runs.poll(f.id).status).toBe('interrupted')
+  expect(f.starts()).toBe(0)
+  await f.runs.close()
+})
 
 test('same conversation resume recovers stranded running record and partial workspace without another execution', async () => {
   const f = fixture(), original = readFileSync(join(f.journal, 'result.json'), 'utf8')

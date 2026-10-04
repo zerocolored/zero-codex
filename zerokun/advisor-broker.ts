@@ -31,6 +31,9 @@ import { assertClaudeAuthStatus } from './claude-auth-status.ts'
 import { claudeUiProposalSchema, createClaudeUiWorkspace, claudeUiInstructions, collectClaudeUiArtifacts,
   type ClaudeUiProposal, type ClaudeUiWorkspace } from './claude-ui-artifacts.ts'
 import { watchAdvisorStopRequest } from './advisor-settlement.ts'
+import { waitForDirectExit } from './subprocess-exit-wait.ts'
+import { startProcessPolling } from './supervisor-watch.ts'
+import { observeProcessGeneration } from './process-generation.ts'
 import { retryAdvisorConnection } from './advisor-connection-retry.ts'
 export { claudeSubscriptionStatusIsReady } from './claude-auth-status.ts'
 import {
@@ -837,6 +840,9 @@ export async function runBounded(
     seedProcessForTesting?: typeof seedTrackedProcess
     captureProcessesForTesting?: typeof captureTrackedProcesses
     reapProcessesForTesting?: typeof reapTrackedProcesses
+    /** Persist the owned child before delivering its stdin request. */
+    onSpawn?: (pid: number) => void
+    exitCallbackForTesting?: (callback: Promise<number>) => Promise<number>
   },
 ): Promise<ProcessResult> {
   if (options.signal?.aborted) throw new Error('subprocess cancelled before start')
@@ -867,6 +873,7 @@ export async function runBounded(
     if (process.platform !== 'win32' && rootIdentity.pgid !== rootIdentity.pid) {
       throw new AdvisorContainmentError('advisor subprocess process group is not isolated')
     }
+    options.onSpawn?.(child.pid)
   } catch (error) {
     let remaining: number[] = []
     try {
@@ -892,18 +899,17 @@ export async function runBounded(
       ? error
       : new AdvisorContainmentError(`advisor subprocess identity could not be tracked: ${error}`)
   }
-  let tracking = true
   let trackingError: unknown
-  const tracker = (async () => {
-    try {
-      while (tracking) {
-        captureProcesses([child.pid], child.pid, tracked)
-        await Bun.sleep(50)
-      }
-    } catch (error) {
-      trackingError = error
-    }
-  })()
+  const stopTracking = startProcessPolling(
+    () => { captureProcesses([child.pid], child.pid, tracked) },
+    error => { trackingError = error }, 50,
+  )
+  const observedExit = waitForDirectExit({
+    callback: options.exitCallbackForTesting?.(exit) ?? exit,
+    state: () => ({ exitCode: child.exitCode, signalCode: child.signalCode,
+      generation: observeProcessGeneration(rootIdentity).status }),
+    warn: () => {},
+  })
   const stdout = collectCapped(child.stdout)
   const stderr = collectCapped(child.stderr)
   let inputError: unknown
@@ -926,7 +932,7 @@ export async function runBounded(
   const interrupted = new Promise<{ kind: 'aborted' }>(resolve => { abort = () => resolve({ kind: 'aborted' }) })
   options.signal?.addEventListener('abort', abort, { once: true })
   if (options.signal?.aborted) abort()
-  const outcomes = [exit.then(exitCode => ({ kind: 'exit' as const, exitCode })), interrupted]
+  const outcomes = [observedExit.then(exitCode => ({ kind: 'exit' as const, exitCode })), interrupted]
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined
   let outcome: { kind: 'exit'; exitCode: number } | { kind: 'aborted' } | { kind: 'timeout' }
   try {
@@ -935,12 +941,14 @@ export async function runBounded(
       : await Promise.race([...outcomes, new Promise<{ kind: 'timeout' }>(resolve => {
           deadlineTimer = setTimeout(() => resolve({ kind: 'timeout' }), options.timeoutMs)
         })])
+  } catch (error) {
+    inputError ??= error
+    outcome = { kind: 'aborted' }
   } finally {
     if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
     options.signal?.removeEventListener('abort', abort)
+    stopTracking()
   }
-  tracking = false
-  await tracker
   if (outcome.kind === 'timeout' || outcome.kind === 'aborted') {
     timedOut = outcome.kind === 'timeout'
     let remaining: number[]

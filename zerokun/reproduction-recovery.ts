@@ -113,21 +113,35 @@ function copyWorkspace(state: string, source: string, destination: string) {
 
 /** Recover only an existing run in the same conversation. Never launch a child
  * or rewrite the source journal, including a journal stranded by ENOSPC. */
-export function recoverPreviousReproduction(context: ReproductionContext, id: string): RunResult {
+export function recoverPreviousReproduction(context: ReproductionContext, id: string, currentJob = false,
+  inspectOwner: typeof inspectProcessLock = inspectProcessLock): RunResult {
   if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid reproduction id')
-  for (const source of priorJobs(context)) {
+  // A reconnect can resume the SAME durable job. Its old broker journal is
+  // just as recoverable as a previous job; the caller must first exclude its
+  // own in-flight execution. Never infer liveness from the JSON status alone.
+  const sources = currentJob
+    ? [{ id: context.job.id, seq: context.job.seq, status: context.job.status }]
+    : priorJobs(context)
+  for (const source of sources) {
     const root = existingDirectory(context.stateDir, join(context.stateDir, 'reproductions', source.id))
     if (!root) continue
     const directory = existingDirectory(context.stateDir, join(root, id))
     if (!directory) continue
-    const result = validatedResult(context, source, id, directory)
+    let result = validatedResult(context, source, id, directory)
     if (!result) continue
     const containment = readdirSync(root).some(name => /^containment-[a-f0-9]{64}\.json$/.test(name))
     if (containment || result.status === 'containment_failed') throw new Error('previous execution requires containment')
-    const lock = inspectProcessLock(join(directory, 'process.lock'))
+    const lock = inspectOwner(join(directory, 'process.lock'))
     if (lock.status === 'unknown') throw new Error('previous execution ownership is unknown')
     if (lock.status === 'active') return { ...result, status: 'running', reason: 'The previous execution still owns its process lock. Continue polling this same id.' }
-    if (source.status === 'running' || source.status === 'queued') throw new Error('previous job is still active')
+    if (!currentJob && lock.status !== 'stale'
+      && (source.status === 'running' || source.status === 'queued')) throw new Error('previous job is still active')
+    // The writer publishes its terminal journal BEFORE releasing ownership.
+    // Re-read after observing that release: otherwise a concurrent completion
+    // is downgraded to interrupted and cached for the rest of the conversation.
+    result = validatedResult(context, source, id, directory)
+    if (!result) throw new Error('execution record disappeared during recovery')
+    if (result.status === 'containment_failed') throw new Error('previous execution requires containment')
     if (result.status === 'running') {
       result.status = 'interrupted'
       result.reason = 'The previous executor stopped before publishing a terminal result. Retained files are partial evidence, not a completed or verified execution. Do not repeat the original execution.'
