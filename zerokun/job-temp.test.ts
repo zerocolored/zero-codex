@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import { existsSync, chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
+import { homedir } from 'os'
 import { ensureJobTempDirectory, jobTempRoot } from './job-temp.ts'
 import { ensureManagedDirectory, prepareManagedStateRoot } from './managed-path.ts'
 import { artifactDirForJob, buildCodexChildEnvironment, buildCodexPermissionOverrides, resolveEffectiveCodexPermissionOverrides } from './codex-executor.ts'
@@ -37,9 +38,9 @@ test('short physical job temp survives restart and separates app state without m
         stateDir: f.state, scratchDir: f.scratch, artifactDir: f.artifact, jobTempDir: f.temp,
         executionWriteEnabled, profile: 'ipc_test',
       }).join('\n')) as any
-      expect(config.shell_environment_policy.set.HOME).toBe(f.scratch)
+      expect(config.shell_environment_policy.set.HOME).toBe(executionWriteEnabled ? realpathSync(homedir()) : f.scratch)
       expect(config.shell_environment_policy.set.TMPDIR).toBe(f.temp)
-      expect(config.permissions.ipc_test.filesystem[jobTempRoot()]).toBe('deny')
+      expect(config.permissions.ipc_test.filesystem[jobTempRoot()]).toBe(executionWriteEnabled ? 'read' : 'deny')
       expect(config.permissions.ipc_test.filesystem[f.temp]).toBe('write')
       expect(config.permissions.ipc_test.network.unix_sockets).toEqual(executionWriteEnabled ? { [f.temp]: 'allow' } : {})
       expect(config.permissions.ipc_test.network.enabled).toBe(executionWriteEnabled)
@@ -114,7 +115,7 @@ test.skipIf(!codex)('real App Server preserves scoped Unix grants and the offlin
   } finally { f.cleanup() }
 }, 30_000)
 
-test.skipIf(process.platform !== 'darwin' || !codex || !node)('real sandbox allows dynamic job IPC but denies sibling read/write/unlink/connect and host sockets', async () => {
+test.skipIf(process.platform !== 'darwin' || !codex || !node)('real sandbox allows dynamic job IPC but restricts sibling writes/connects and retains read isolation outside primary', async () => {
   const f = fixture()
   const foreign = await import('node:net')
   const hostSocket = join(f.root, 'host.sock'), siblingSocket = join(f.sibling, 'other.sock')
@@ -168,7 +169,7 @@ test.skipIf(process.platform !== 'darwin' || !codex || !node)('real sandbox allo
       ], { env: buildCodexChildEnvironment(), stdout: 'pipe', stderr: 'pipe', timeout: 15_000 })
       expect({ exit: result.exitCode, error: result.stderr.toString() }).toEqual({ exit: 0, error: '' })
       expect(JSON.parse(result.stdout.toString())).toEqual(mode === 'offline' ? { bind: true, connect: true }
-        : { pong: 'pong', read: true, write: true, unlink: true, alias: true, aliasConnect: true, hostAliasConnect: true, sibling: true, host: true })
+        : { pong: 'pong', read: mode !== 'write', write: true, unlink: true, alias: mode !== 'write', aliasConnect: true, hostAliasConnect: true, sibling: true, host: true })
     }
   } finally {
     await Promise.all(servers.map(server => new Promise<void>(resolve => server.close(() => resolve()))))

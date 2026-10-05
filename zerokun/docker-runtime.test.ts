@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { createServer } from 'net'
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'fs'
 import { join } from 'path'
+import { homedir } from 'os'
 import { resolveDockerRuntime, type DockerRuntime } from './docker-runtime.ts'
 import { buildCodexChildEnvironment, buildCodexPermissionOverrides } from './codex-executor.ts'
 import { prepareManagedStateRoot, ensureManagedDirectory } from './managed-path.ts'
@@ -56,14 +57,14 @@ test('explicit host wins over saved context; remote, malformed, missing and non-
   } finally { await f.close() }
 })
 
-test('write primary receives exact socket and credential-free plugin config, never host HOME or config', async () => {
+test('write primary receives exact socket and credential-free Docker config while retaining native HOME', async () => {
   const f = await fixture()
   try {
     const parsed = Bun.TOML.parse(f.flags().join('\n')) as any
     expect(parsed.permissions.docker_test.network.unix_sockets).toEqual({ [f.scratch]: 'allow', [f.socket]: 'allow' })
     const env = parsed.shell_environment_policy.set
     expect(env.DOCKER_HOST).toBe(f.runtime.host)
-    expect(env.HOME).toBe(f.scratch)
+    expect(env.HOME).toBe(realpathSync(homedir()))
     expect(env.DOCKER_CONTEXT).toBe('')
     expect(env.DOCKER_CONFIG).toBe(join(f.scratch, '.zero-docker'))
     expect(JSON.parse(readFileSync(join(env.DOCKER_CONFIG, 'config.json'), 'utf8'))).toEqual({ cliPluginsExtraDirs: [f.plugins] })

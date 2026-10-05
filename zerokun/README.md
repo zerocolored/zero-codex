@@ -213,16 +213,18 @@ codex <trust-args> -C <repo> \
 - apps・plugins・hookと一般MCPは無効化し、必要なwrite jobで`zerokun_browser`、
   `zerokun_github`、設定済みでowner管理の`go-chrome-mcp`だけを追加します。
   `go-chrome-mcp`はproject設定からの差替えを拒否し、cookie取得・任意JavaScript等を無効化したうえで、
-  hostのChrome bridgeへ接続します。Codex shell自体のHOME/TMPDIR隔離は維持します。
+  hostのChrome bridgeへ接続します。書込みprimaryのshellは通常のHOME・XDG設定を引き継ぎ、TMPDIRはジョブ専用に分離します。
+  read-only工程はHOME・XDGも隔離します。
   Chrome MCPの応答はローカルproxyを通し、URLの認証パラメータ・userinfoとJWT形式の値を
   Codexへ渡す前に除去します。JSON本文・structuredContent・エラー・通知が対象で、
   子の生stderrは転送しません。通常のタブIDと検索条件、操作入力は変更しません。
   画像内の秘密や任意形式のページ本文を完全に除去する仕組みではなく、過去の保存済み履歴も変更しません。
-  Web検索はwrite許可jobだけに限定し、Slack関連domainの直接通信制限は維持します。
+  Web検索はwrite許可jobだけに限定し、書込みprimaryにサービス別domain制限は重ねません。
   対象app・宛先・検証目的について明示承認済みの製品連携テストでは、製品の既存受付・worker経路を
-  起動して製品から送信させられます。直接Slack APIを呼ぶ・別process等で通信制限を回避することはできません。
+  起動して製品から送信させられます。依頼のないSlack API直接送信や、read-only／reviewの通信制限を回避する操作は禁止します。
   hostのSlack tokenは子へ渡さず、通常返信・進捗・完了通知の直接送信は禁止したままです。
-  read-only／reviewのネットワーク制限とhost private stateのdenyは維持します。
+  別プロセスのread-only／review工程はネットワーク制限とhost private stateのdenyを維持します。
+  書込みprimaryと配下のnative子はこのOS読取り隔離の対象ではありません。
   managed workspaceは物理repositoryを維持し、merge済みbranchへの追加pushが禁じられる場合も、
   最新統合commitから同じrepository内に後続branchを作れます。未検証の連携を完了扱いにせず、
   独立して実行できる承認済み設定修正・検証は継続します。
@@ -256,13 +258,16 @@ Zeroちゃん本体のrepositoryはhost runtimeの信頼境界なので、そこ
 既定projectとして初期化します。既存projectのproject固有`AGENTS.md`は任意で、存在する場合だけ
 global `AGENTS.md`の後に読み込みとinstruction sourceを検証します。
 
-両profileともHOME、state全体、共用tempを先にdenyし、必要なpathだけをより具体的なruleで
-再許可します。Codex CLI 0.149.0以上を必須とし、古いCLIはjob受付前に拒否します。
+read-only profileはHOME、state全体、共用tempをdenyし、必要なpathだけを再許可します。
+書込みprimaryは通常のhost読取りとCodex標準の権限審査を使います。独自のread-denyを置くと
+承認済みの昇格もsandbox内に固定されOS認証ストアを使えないため、primaryでは旧deny pathを
+基底profileのread-onlyへ変換します。秘密・bot設定・他ジョブの取得は禁止指示で維持しますが、
+primaryからのOS上の読取り隔離は保証しません。Codex CLI 0.149.0以上を必須とし、古いCLIはjob受付前に拒否します。
 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
 linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。またHOMEのglobal
-Git/GitHub credentialはmodelへ公開しません。認証済み操作はhost runtimeがlogin済み`gh`を使う
-repository限定brokerへ委譲します。Codexはそのtoolでbranch publish、PR作成・承認・merge、GitHub
-checks確認を行えます。Codex shell HOMEはread/writeともjob scratchへ分離します。commit identityはZeroちゃんが中立の固定値を
+Gitのglobal設定はshellへ引き継ぎません。認証済み操作にはhost runtimeがlogin済み`gh`を使う
+repository限定brokerも利用できます。Codexはそのtoolでbranch publish、PR作成・承認・merge、GitHub
+checks確認を行えます。書込みprimaryのshellは通常のHOME・XDG設定探索先を引き継ぎ、read-only段はjob scratchへ分離します。commit identityはZeroちゃんが中立の固定値を
 子processへ設定するため、repository localの`user.name`/`user.email`は必須ではありません。
 
 Codex から Slack tool/API を呼ばせません。最終文は runner が bot token で投稿します。成果物を
@@ -419,24 +424,32 @@ sandbox-safe contract test・型検査・build・shell検査を実行します�
 新しい入力版のroundへ提出した場合も、そのGPTが追加指示まで確認したとは扱いません。
 主担当が回答の対象範囲を確認し、再開時の人数集計は登録済みの同じ子と完了回答を照合します。
 
-書込みを許可された通常ジョブでは、既存のRailway・Wrangler認証設定directoryを
-一時HOME内の専用pathへリンクします。ホストHOME全体の引継ぎやtokenのコピーはしません。
-Railwayは`~/.railway`、Wranglerは既存の`~/.wrangler`を優先し、なければ
-XDG設定directory（macOS既定は`~/Library/Preferences/.wrangler`）を参照します。
-既存のジョブ側directoryや別のリンクは上書きしません。
+書込みを許可された主担当は、通常のホストHOMEと設定済みのXDG設定探索先を引き継ぎます。
+設定探索はCLI名の一覧に依存せず、Supabaseを含む導入済みCLIが既存ログインを利用できます。
+XDGが未設定なら各CLIのOS標準の探索動作を維持します。tokenをコピー・環境変数へ転記しません。
+job scratchとTMPDIRはジョブ専用です。主担当からの非公開state・他ジョブのOS読取り隔離は解除し、
+秘密の取得・表示禁止と、基底profileでの書込み制限を維持します。
+HOME全体への書込みは既定で付与せず、通常の設定更新・cache・lockが必要なら対象pathの追加許可を審査します。
+KeychainなどOS認証ストアが必要な正規CLIは、対象commandのnative escalationで審査します。
+既存のgcloud・Railway・Wranglerの限定的な設定更新許可とDocker専用設定は維持します。
+read-onlyジョブ・review段は隔離HOMEとXDGを使い、追加のホスト設定書込み許可を付けません。
 
-認証状態は各CLIの`whoami`で確認します。ホストでログイン済みでも、旧版の隔離HOMEでは
-未認証になることがありました。Computer UseのChrome承認とCLI認証は別々に診断します。
-アプリ操作が必要な場合の本人承認は維持し、CLIが未認証なら本人によるログインが必要です。
-設定参照・通常の認証更新は主担当へ許可しますが、token本文の読取り・表示・コピーは禁止です。
-これはgcloudと同様の既存認証の利用許可で、認証情報を主担当からOSレベルで隔離する仕組みではありません。
-read-onlyジョブ・旧review stage・会話割込みには追加のリンクや書込み許可を付けません。
+認証状態は各CLIの正規の状態確認で診断し、認証情報本文を読取り・表示・コピーしません。
+CLIの未認証表示だけで本人のログイン不足と決めつけず、まずその実行環境の設定探索先を確認します。
+既存の認証済みCLI、Browser、Chromeなど、依頼に適した利用可能な正規経路を使えます。
+本当に本人認証が必要な場合だけ必要な操作を依頼します。CLI認証とChrome接続は別々に診断します。
+既存認証の利用は、認証情報を主担当からOSレベルで完全に隔離する仕組みではありません。
+
+書込みprimaryから起動するnative Codex子エージェントは親の権限を引き継ぎます。
+roleの`read-only`／`never`指定だけでは、ホストHOME・private stateのOS読取り隔離を保証しません。
+別プロセスで起動するread-only工程・review工程と外部advisorには、それぞれの隔離設定を適用します。
+認証情報本文・bot管理状態・他ジョブの取得、コピー、表示、変更の禁止はnative子にも適用します。
 
 ## Cloud Logging・Cloud Run のホスト認証
 
 書込みを許可された通常ジョブの主担当Codexは、導入済みの`gcloud`を通常のshellから利用できます。
 SDKの実体とHomebrewの中継pathを読取り許可し、`CLOUDSDK_CONFIG`で既存のホスト設定を引き継ぎます。
-HOME全体は分離したままです。独自のCloud書込みAPIや新しいログインは不要です。
+書込みprimaryのHOMEは通常のホストHOMEです。独自のCloud書込みAPIや新しいログインは不要です。
 build・deployなどはユーザーの依頼範囲と既存IAMに従ってCodexが判断します。
 対象resource・付与先principal・必要accessをユーザーが明示承認したIAM修復は、主担当が既存認証で
 現状確認し、不足する承認済みbindingだけを最小scopeへ適用・再読取検証できます。同じ承認を再要求しません。

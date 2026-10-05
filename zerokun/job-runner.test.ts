@@ -12384,11 +12384,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).not.toContain('extends=')
       expect(overrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(join(repo, '.git')))}="write"`)
-      expect(overrides).toContain(`${JSON.stringify(join(realpathSync(repo), '.zerochan'))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(join(realpathSync(repo), '.zerochan'))}="read"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(attachment))}="read"`)
-      expect(overrides).toContain(`${JSON.stringify(realpathSync(state))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(state))}="read"`)
       expect(overrides).not.toContain(JSON.stringify(browserCaptureDirForJob(state, job.id)))
-      expect(overrides).toContain(`${JSON.stringify(realpathSync(codexHome))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(codexHome))}="read"`)
       expect(overrides).not.toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
       const primaryPath = (Bun.TOML.parse(overrides) as any).shell_environment_policy.set.PATH
       expect(primaryPath.split(':')).toContain('/usr/bin')
@@ -12602,7 +12602,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     }
   })
 
-  test('multi-repo workspaceは親をdenyし、pin済みmemberだけをwriteする', () => {
+  test('multi-repo workspaceは親をread-onlyにし、pin済みmemberだけをwriteする', () => {
     const dir = fixtureDir()
     const workspace = join(dir, 'workspace')
     const state = join(dir, 'state')
@@ -12631,14 +12631,14 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         scratchDir: scratch,
         gitRoots: members,
       }).join('\n')
-      expect(overrides).toContain(`${JSON.stringify(realpathSync(workspace))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(workspace))}="read"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(instructions))}="read"`)
       for (const member of members) {
         expect(overrides).toContain(`${JSON.stringify(member)}="write"`)
         expect(overrides).toContain(`${JSON.stringify(join(member, '.git'))}="write"`)
-        expect(overrides).toContain(`${JSON.stringify(join(member, '.zerochan'))}="deny"`)
+        expect(overrides).toContain(`${JSON.stringify(join(member, '.zerochan'))}="read"`)
       }
-      expect(overrides).toContain(`${JSON.stringify(join(realpathSync(workspace), '.zerochan'))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(join(realpathSync(workspace), '.zerochan'))}="read"`)
     } finally {
       store.close()
     }
@@ -12787,10 +12787,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         ...overrides.flatMap(value => ['-c', value]),
         '-P', 'zerokun_job', '--', '/bin/zsh', '-c', [
           'set -e',
-          'if /bin/cat "$1" >/dev/null 2>&1; then exit 41; fi',
-          'if /bin/cat "$2" >/dev/null 2>&1; then exit 42; fi',
-          'if /bin/cat "$3" >/dev/null 2>&1; then exit 43; fi',
-          'if /bin/cat "$4" >/dev/null 2>&1; then exit 44; fi',
+          'if (printf blocked > "$1") 2>/dev/null; then exit 41; fi',
+          'if (printf blocked > "$2") 2>/dev/null; then exit 42; fi',
+          'if (printf blocked > "$3") 2>/dev/null; then exit 43; fi',
+          'if (printf blocked > "$4") 2>/dev/null; then exit 44; fi',
           'if /usr/bin/touch parent-write.txt 2>/dev/null; then exit 45; fi',
           "printf 'backend change\\n' > backend/result.txt",
           "printf 'frontend change\\n' > frontend/result.txt",
@@ -13025,7 +13025,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     runSandboxCommit(submodule, join(submoduleBase, 'state'), 'submodule sandbox commit')
   }, 30_000)
 
-  test.skipIf(process.platform !== 'darwin')('実Codex sandboxは完了・GC・再起動後の同一thread添付だけをread許可する', () => {
+  test.skipIf(process.platform !== 'darwin')('実Codex sandboxは保持添付を使えprimary stateはread-only、reviewはdenyを保つ', () => {
     const codex = resolveOfficialStandaloneCodex().physical
     const dir = fixtureDir()
     const state = join(dir, 'state')
@@ -13097,7 +13097,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         '-P', 'zerokun_job',
         '--',
         '/bin/zsh', '-c',
-        'test ! -r "$1" && test -r "$2" && test "$(/bin/cat "$2")" = "persisted thread attachment" && touch "$3/from-sandbox" && touch .git/from-sandbox',
+        'test -r "$1" && test ! -w "$1" && test -r "$2" && test "$(/bin/cat "$2")" = "persisted thread attachment" && touch "$3/from-sandbox" && touch .git/from-sandbox',
         'zerokun-sandbox', secret, attachment, outbox,
       ], { stdout: 'pipe', stderr: 'pipe' })
       expect(result.exitCode, result.stderr.toString()).toBe(0)
@@ -13112,7 +13112,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       const readProfile = Bun.spawnSync([
         codex, 'sandbox', '-C', repo,
         ...readOverrides.flatMap(value => ['-c', value]),
-        '-P', 'zerokun_job', '--', '/usr/bin/true',
+        '-P', 'zerokun_job', '--', '/bin/sh', '-c', 'test ! -r "$1"', 'readonly-probe', secret,
       ], { stdout: 'pipe', stderr: 'pipe' })
       expect(readProfile.exitCode, readProfile.stderr.toString()).toBe(0)
 
