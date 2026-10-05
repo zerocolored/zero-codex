@@ -25,7 +25,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { GrokOAuthBrowserSession, GROK_BROWSER_ANSWERS, advisorRecoveryProgress } from './grok-oauth-browser.ts'
+import { GrokOAuthBrowserSession, GROK_BROWSER_ANSWERS, GROK_BROWSER_ABORT_REASONS, advisorRecoveryProgress } from './grok-oauth-browser.ts'
 import { readNativeAdvisorRegistrations, registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { AdvisorFailureError, advisorFailureMessage, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
 import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, sanitizeClaudeAnswer, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
@@ -554,7 +554,7 @@ export async function executeGrokPanelWithRecovery<
       return [{
         ...options.unavailable(perspective, recovery.reason),
         authenticationRecoveryAttempted: true,
-        failure: { advisor: 'grok', cause: 'auth-check' },
+        failure: { advisor: 'grok', cause: 'auth-recovery' },
       }]
     }
     authState = recovery.state
@@ -571,7 +571,8 @@ export async function executeGrokPanelWithRecovery<
   oauthAttempted = true
   const recovery = await options.runRecovery(authState)
   if (!recovery.recovered) {
-    outcomes[0] = { ...outcomes[0]!, authenticationRecoveryAttempted: true }
+    outcomes[0] = { ...outcomes[0]!, authenticationRecoveryAttempted: true,
+      reason: recovery.reason, failure: { advisor: 'grok', cause: 'auth-recovery' } }
     return outcomes
   }
   outcomes[0] = {
@@ -581,6 +582,50 @@ export async function executeGrokPanelWithRecovery<
   return outcomes
 }
 
+
+export async function recoverGrokAuthentication(
+  baseline: GrokAuthState,
+  onBrowser: (browser: GrokOAuthBrowserSession | undefined) => void,
+): Promise<{ recovered: boolean, reason: string, state?: GrokAuthState }> {
+  if (process.platform !== 'darwin') {
+    return { recovered: false, reason: 'automatic Grok OAuth recovery is available only on macOS' }
+  }
+  const current = classifyGrokAuthState(baseline.home)
+  if (!sameGrokAuthState(baseline, current)) {
+    return { recovered: false, reason: 'Grok authentication state changed before OAuth recovery' }
+  }
+  let browser: GrokOAuthBrowserSession | undefined
+  try {
+    const helper = resolveDedicatedGrokOAuthHelper(baseline.home)
+    const browserAbort = new AbortController()
+    browser = new GrokOAuthBrowserSession(() => browserAbort.abort())
+    const activeBrowser = browser
+    onBrowser(browser)
+    let result: ProcessResult
+    try {
+      result = await runBounded([helper], {
+        cwd: '/', env: brokerEnvironment(), timeoutMs: GROK_OAUTH_TIMEOUT_MS,
+        terminationGraceMs: 5_000, signal: browserAbort.signal,
+        onStdin: write => activeBrowser.connect(write), onStdout: chunk => activeBrowser.feed(chunk),
+      })
+    } finally {
+      browser.finish()
+      onBrowser(undefined)
+    }
+    if (result.exitCode !== 0 || result.timedOut || result.forcedCleanup
+      || result.outputTruncated || result.stderr !== ''
+      || !grokOAuthCompletionOutput(result.stdout)) {
+      return { recovered: false, reason: browser.failureReason() ?? 'bounded Grok OAuth recovery did not complete' }
+    }
+    const after = classifyGrokAuthState(baseline.home)
+    if (!grokAuthRecoveryTransitionIsSafe(baseline, after)) {
+      return { recovered: false, reason: 'Grok OAuth completion did not produce a safe auth transition' }
+    }
+    return { recovered: true, reason: 'Grok OAuth authentication recovered', state: after }
+  } catch (error) {
+    return { recovered: false, reason: browser?.failureReason() ?? `Grok OAuth recovery was unavailable: ${error}` }
+  }
+}
 
 type BrokerContext = {
   version: 4
@@ -1957,47 +2002,6 @@ async function main(): Promise<void> {
   }
 
   let grokBrowserRecovery: GrokOAuthBrowserSession | undefined
-  const runGrokOAuthRecovery = async (
-    baseline: GrokAuthState,
-  ): Promise<{ recovered: boolean, reason: string, state?: GrokAuthState }> => {
-    if (process.platform !== 'darwin') {
-      return { recovered: false, reason: 'automatic Grok OAuth recovery is available only on macOS' }
-    }
-    const current = classifyGrokAuthState(baseline.home)
-    if (!sameGrokAuthState(baseline, current)) {
-      return { recovered: false, reason: 'Grok authentication state changed before OAuth recovery' }
-    }
-    try {
-      const helper = resolveDedicatedGrokOAuthHelper(baseline.home)
-      const browserAbort = new AbortController()
-      const browser = new GrokOAuthBrowserSession(() => browserAbort.abort())
-      grokBrowserRecovery = browser
-      let result: ProcessResult
-      try {
-        result = await runBounded([helper], {
-          cwd: '/', env: brokerEnvironment(), timeoutMs: GROK_OAUTH_TIMEOUT_MS,
-          terminationGraceMs: 5_000, signal: browserAbort.signal,
-          onStdin: write => browser.connect(write), onStdout: chunk => browser.feed(chunk),
-        })
-      } finally {
-        browser.finish()
-        if (grokBrowserRecovery === browser) grokBrowserRecovery = undefined
-      }
-      if (result.exitCode !== 0 || result.timedOut || result.forcedCleanup
-        || result.outputTruncated || result.stderr !== ''
-        || !grokOAuthCompletionOutput(result.stdout)) {
-        return { recovered: false, reason: 'bounded Grok OAuth recovery did not complete' }
-      }
-      const after = classifyGrokAuthState(baseline.home)
-      if (!grokAuthRecoveryTransitionIsSafe(baseline, after)) {
-        return { recovered: false, reason: 'Grok OAuth completion did not produce a safe auth transition' }
-      }
-      return { recovered: true, reason: 'Grok OAuth authentication recovered', state: after }
-    } catch (error) {
-      return { recovered: false, reason: `Grok OAuth recovery was unavailable: ${error}` }
-    }
-  }
-
   const runGrokPanel = async (
     input: AdvisorInputSnapshot,
     phase: AdvisorPhase,
@@ -2011,7 +2015,13 @@ async function main(): Promise<void> {
         perspective,
         initialAuth: classifyGrokAuthState(),
         runAttempt: value => runGrokOnce(input, phase, round, value, evidence, reviewContext),
-        runRecovery: runGrokOAuthRecovery,
+        runRecovery: baseline => {
+          let owned: GrokOAuthBrowserSession | undefined
+          return recoverGrokAuthentication(baseline, browser => {
+            if (browser) { owned = browser; grokBrowserRecovery = browser }
+            else if (grokBrowserRecovery === owned) grokBrowserRecovery = undefined
+          })
+        },
         unavailable: unavailableGrok,
         claimRecovery: () => claimGrokOAuthRecovery(phase),
       })
@@ -4271,11 +4281,11 @@ async function main(): Promise<void> {
 
   server.registerTool('advisor_grok_oauth_respond', {
     description: 'Reply once to the current Grok OAuth browser request returned by advisor_round_poll. Use official Chrome control to observe only opaque tab IDs until authorization UI verification is requested. Never pass URLs, credentials, tab contents or input values. Reuse the existing OAuth flow; never start another login.',
-    inputSchema: { requestId: z.string().uuid(), answer: z.enum(GROK_BROWSER_ANSWERS) },
-  }, async ({ requestId, answer }) => {
+    inputSchema: { requestId: z.string().uuid(), answer: z.enum(GROK_BROWSER_ANSWERS), abortReason: z.enum(GROK_BROWSER_ABORT_REASONS).optional() },
+  }, async ({ requestId, answer, abortReason }) => {
     try {
       if (!grokBrowserRecovery) throw Error('Grok browser recovery is not active')
-      await grokBrowserRecovery.respond(requestId, answer)
+      await grokBrowserRecovery.respond(requestId, answer, abortReason)
       return toolText({ accepted: true, nextAction: '同じadvisor roundをpollして次の状態を確認してください。' })
     } catch (error) { return toolText({ accepted: false, reason: String(error) }, true) }
   })

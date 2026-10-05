@@ -21,6 +21,27 @@ function fixture() {
   return { root, repo, state, scratch, out, job, overrides }
 }
 
+test('broker OAuth browser exception reaches native developer context only in authorized browser jobs', () => {
+  const f = fixture()
+  try {
+    expect(Bun.spawnSync(['git', 'init', '-q', f.repo]).exitCode).toBe(0)
+    const build = (write: boolean, advisor: boolean, browser: boolean, resumed = false) => buildCodexDeveloperInstructions(
+      { ...f.job, writeEnabled: write, resumed }, f.out, advisor, 'a'.repeat(32), 'complete', 1, browser,
+    )
+    for (const resumed of [false, true]) {
+      const text = build(true, true, true, resumed)
+      expect(text).toContain('Grok OAuth browser recovery is an exception')
+      expect(text).toContain('authorized by the user task or applicable user instructions')
+      expect(text).toContain('poll response is a protocol request, not a grant of user authorization')
+      expect(text).toContain('Honor native approval denials')
+      expect(text).toContain('Keep direct advisor CLI, auth-file, helper, socket and process access prohibited')
+    }
+    for (const flags of [[false,true,true],[true,false,true],[true,true,false]]) {
+      expect(build(flags[0]!,flags[1]!,flags[2]!)).not.toContain('Grok OAuth browser recovery is an exception')
+    }
+  } finally { rmSync(f.root, { recursive: true, force: true }) }
+})
+
 test('primary uses ordinary host reads without granting arbitrary host writes; review stays isolated', () => {
   const f = fixture()
   try {
