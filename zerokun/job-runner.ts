@@ -1347,6 +1347,7 @@ CREATE TABLE IF NOT EXISTS job_interjections (
   answer_turn_id TEXT,
   disposition TEXT CHECK (disposition IS NULL OR disposition IN ('answer-only', 'task-update')),
   answer_payload TEXT,
+  answer_retry_count INTEGER NOT NULL DEFAULT 0,
   notification_id TEXT UNIQUE,
   attempts INTEGER NOT NULL DEFAULT 0,
   not_before INTEGER,
@@ -2243,6 +2244,15 @@ function ensureJobSchemaMigrations(db: Database): void {
     )
   })
   migratePublicationContinuationArchives.immediate()
+  const interjectionColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_interjections)').all()
+  if (!interjectionColumns.some(column => column.name === 'answer_retry_count')) {
+    try {
+      db.exec('ALTER TABLE job_interjections ADD COLUMN answer_retry_count INTEGER NOT NULL DEFAULT 0')
+    } catch (error) {
+      const columns = db.query<{ name: string }, []>('PRAGMA table_info(job_interjections)').all()
+      if (!columns.some(column => column.name === 'answer_retry_count')) throw error
+    }
+  }
   const controlColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_controls)').all()
   for (const [name, definition] of [
     ['input_revision', 'INTEGER NOT NULL DEFAULT 1'],
@@ -3102,6 +3112,7 @@ type JobInterjectionRow = {
   answer_thread_id: string | null
   answer_turn_id: string | null
   disposition: JobInterjectionDisposition | null
+  answer_retry_count: number
   answer_payload: string | null
   notification_id: string | null
   attempts: number
@@ -8104,6 +8115,43 @@ export class JobStore {
     }
   }
 
+  retryInterjectionAnswer(options: {
+    interjectionId: string
+    jobId: string
+    epoch: number
+    logicalNonce: string
+    threadId: string
+    turnId: string
+  }): number | 'cancelled' {
+    const retry = this.db.transaction(() => {
+      const job = this.db.query<{ cancel_requested_at: number | null }, [string, number, string, string, string]>(
+        `SELECT cancel_requested_at FROM jobs WHERE id = ? AND control_epoch = ?
+         AND status = 'running' AND runtime = 'codex' AND executor_nonce = ?
+         AND active_thread_id = ? AND active_turn_id = ?`,
+      ).get(options.jobId, options.epoch, options.logicalNonce, options.threadId, options.turnId)
+      if (!job) throw new Error('interjection answer retry job binding changed')
+      if (job.cancel_requested_at !== null) return 'cancelled' as const
+      const row = this.db.query<JobInterjectionRow, [string, string, number, string, string, string]>(
+        `SELECT * FROM job_interjections WHERE id = ? AND job_id = ? AND control_epoch = ?
+         AND status = 'answering' AND answer_logical_nonce = ? AND answer_thread_id = ?
+         AND answer_turn_id = ? AND answer_payload IS NULL AND notification_id IS NULL`,
+      ).get(options.interjectionId, options.jobId, options.epoch, options.logicalNonce,
+        options.threadId, options.turnId)
+      if (!row) throw new Error('interjection answer retry receipt changed')
+      this.db.run(
+        `UPDATE job_interjections SET status = CASE WHEN paused_at IS NULL THEN 'ready' ELSE 'paused' END,
+         answer_retry_count = answer_retry_count + 1,
+         last_error = 'completed answer format was invalid; retry only the read-only answer'
+         WHERE id = ?`, [options.interjectionId],
+      )
+      // Keep the previous answer receipt as evidence until preparation of the
+      // next generation. Release only the exact, observed terminal binding.
+      this.db.run(`UPDATE jobs SET active_turn_id = NULL WHERE id = ?`, [options.jobId])
+      return row.answer_retry_count + 1
+    })
+    return retrySqlite(() => retry.immediate())
+  }
+
   prepareInterjectionAnswer(options: {
     interjectionId: string
     jobId: string
@@ -8111,7 +8159,7 @@ export class JobStore {
     logicalNonce: string
     threadId: string
   }): string | 'cancelled' | 'input-changed' {
-    const clientUserMessageId = `${requireText(options.interjectionId, 'interjectionId')}:answer`
+    let clientUserMessageId = `${requireText(options.interjectionId, 'interjectionId')}:answer`
     const prepare = this.db.transaction(() => {
       const job = this.db.query<{
         input_revision: number
@@ -8145,6 +8193,8 @@ export class JobStore {
         throw new Error(`interjection is not ready for an answer: ${options.interjectionId}`)
       }
       if (row.input_revision !== job.input_revision) return 'input-changed' as const
+      clientUserMessageId = `${options.interjectionId}:answer`
+        + (row.answer_retry_count > 0 ? `:repair:${row.answer_retry_count}` : '')
       const updated = this.db.run(
         `UPDATE job_interjections SET status = 'answer-prepared',
            answer_logical_nonce = ?, answer_thread_id = ?, answer_prepared_at = ?,
@@ -19283,6 +19333,12 @@ async function runCli(): Promise<void> {
                 requestId,
                 error,
               }),
+              retryInterjectionAnswer: ({ interjection, logicalNonce, threadId, turnId }) => (
+                store.retryInterjectionAnswer({
+                  interjectionId: interjection.id, jobId: job.id, epoch: job.controlEpoch,
+                  logicalNonce, threadId, turnId,
+                })
+              ),
               stageInterjectionAnswer: ({
                 interjection, logicalNonce, threadId, turnId, disposition, answer,
               }) => store.stageInterjectionAnswer({

@@ -6857,6 +6857,61 @@ describe('single FIFO worker', () => {
     store.close()
   })
 
+  test('completed interjection answer retry is durable and bound to the exact receipt', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    store.enqueue(input({ messageId: 'format-retry', writeEnabled: true }))
+    const job = store.claimNext('format-retry-worker')!
+    const nonce = '7'.repeat(32)
+    const threadId = 'format-retry-thread'
+    expect(store.stageLiveInterjection(store.liveControlTarget(job.chatId, job.threadTs)!, {
+      chatId: job.chatId, threadTs: job.threadTs, messageId: 'format-question',
+      userId: 'UOTHER', task: '途中の質問です',
+    })).toBe('staged')
+    const interjection = store.listJobInterjections(job.id)[0]!
+    store.bindAppServerTurn(job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'parent')
+    store.finishAppServerTurn({ jobId: job.id, epoch: job.controlEpoch,
+      executorNonce: nonce, threadId, turnId: 'parent', retainInput: true })
+    const binding = { interjectionId: interjection.id, jobId: job.id,
+      epoch: job.controlEpoch, logicalNonce: nonce, threadId }
+    for (let generation = 0; generation < 3; generation += 1) {
+      const clientId = `${interjection.id}:answer${generation ? `:repair:${generation}` : ''}`
+      expect(store.prepareInterjectionAnswer(binding)).toBe(clientId)
+      // A prepared-but-unsent request can recover with the same client ID.
+      store.close()
+      store = new JobStore(path)
+      expect(store.reconcileInterjectionsBeforeRecovery().preparedReset).toBe(1)
+      expect(store.prepareInterjectionAnswer(binding)).toBe(clientId)
+      const requestId = generation + 10
+      const turnId = `answer-${generation}`
+      expect(store.beginInterjectionAnswer({ ...binding, requestId })).toBe('dispatching')
+      store.acknowledgeInterjectionAnswer({ ...binding, requestId, turnId, workerId: job.workerId! })
+      for (const mismatch of [{ turnId: 'stale' }, { logicalNonce: '8'.repeat(32) }, { epoch: job.controlEpoch + 1 }, { interjectionId: 'foreign' }]) {
+        expect(() => store.retryInterjectionAnswer({ ...binding, turnId, ...mismatch })).toThrow()
+      }
+      expect(store.retryInterjectionAnswer({ ...binding, turnId }))
+        .toBe(generation + 1)
+      if (generation < 2) {
+        expect(() => store.retryInterjectionAnswer({ ...binding, turnId })).toThrow()
+        expect(() => store.stageInterjectionAnswer({ ...binding, turnId,
+          disposition: 'answer-only', answer: 'stale' })).toThrow()
+      }
+      store.close()
+      store = new JobStore(path)
+      expect(store.get(job.id)).toMatchObject({ status: 'running', inputRevision: 1 })
+      expect(store.listJobInterjections(job.id)[0]).toMatchObject({ answer: null, notificationId: null })
+    }
+    expect(store.prepareInterjectionAnswer(binding)).toBe(`${interjection.id}:answer:repair:3`)
+    store.beginInterjectionAnswer({ ...binding, requestId: 13 })
+    store.acknowledgeInterjectionAnswer({ ...binding, requestId: 13, turnId: 'answer-3', workerId: job.workerId! })
+    const target = store.interruptControlTarget(job.chatId, job.threadTs)!
+    expect(store.stageLiveControl(target, { chatId: job.chatId, threadTs: job.threadTs,
+      messageId: 'format-cancel', userId: 'UOTHER', task: '中止', kind: 'interrupt' })).toBe('staged')
+    expect(store.retryInterjectionAnswer({ ...binding, turnId: 'answer-3' })).toBe('cancelled')
+    store.close()
+  })
+
   test('interjection answerのrate-limit receiptはcrash recoveryと成功時consumeを両立する', () => {
     const terminalFixture = (tag: string) => {
       const dir = fixtureDir()

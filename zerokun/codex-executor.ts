@@ -5204,12 +5204,33 @@ export function buildCodexInterjectionPrompt(
     'when it adds, removes, approves, rejects, or changes work or acceptance criteria. If both are',
     'present, answer the question and use task-update. Do not perform the requested work in this',
     'read-only turn and do not expose internal engine, advisor, path, token, or runtime details.',
-    `First line: [ZERO_THREAD_REPLY_BEGIN:${interjection.id}:<answer-only|task-update>]`,
-    'Then the Slack-facing answer, with no host commentary.',
-    `Final line: [ZERO_THREAD_REPLY_END:${interjection.id}]`,
-    'Replace only the disposition placeholder. Emit exactly one complete envelope and nothing else.',
+    'Return exactly one JSON object matching the response schema, with no prose outside it.',
+    `Set interjectionId to ${interjection.id}. Set disposition to answer-only or task-update.`,
+    'Put only the Slack-facing Japanese answer in answer. Do not include host markers.',
+    'If an earlier answer had invalid formatting, repair only that answer; never redo the original work.',
     '--- end Zero host interjection response control ---',
   ].join('\n')
+}
+
+export function codexInterjectionRetryDelayMs(retryCount: number): number {
+  if (retryCount <= 1) return 250
+  if (retryCount === 2) return 1_000
+  return Math.min(300_000, 30_000 * 2 ** Math.min(4, retryCount - 3))
+}
+
+export class CodexInterjectionFormatError extends Error {}
+
+export function codexInterjectionOutputSchema(interjectionId: string): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['interjectionId', 'disposition', 'answer'],
+    properties: {
+      interjectionId: { type: 'string', enum: [interjectionId] },
+      disposition: { type: 'string', enum: ['answer-only', 'task-update'] },
+      answer: { type: 'string' },
+    },
+  }
 }
 
 export function parseCodexInterjectionReply(
@@ -5218,25 +5239,48 @@ export function parseCodexInterjectionReply(
 ): { disposition: JobInterjectionDisposition; answer: string } {
   const normalized = value.replace(/\r\n/g, '\n').trim()
   if (!normalized || normalized.includes('\0')) {
-    throw new Error('Codex interjection response is empty or invalid')
+    throw new CodexInterjectionFormatError('Codex interjection response is empty or invalid')
   }
+  if (normalized.startsWith('{')) {
+    let decoded: unknown
+    try { decoded = JSON.parse(normalized) } catch {
+      throw new CodexInterjectionFormatError('Codex interjection response is not valid JSON')
+    }
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+      throw new CodexInterjectionFormatError('Codex interjection response is not an object')
+    }
+    const reply = decoded as Record<string, unknown>
+    if (Object.keys(reply).sort().join(',') !== 'answer,disposition,interjectionId'
+      || reply.interjectionId !== interjectionId
+      || (reply.disposition !== 'answer-only' && reply.disposition !== 'task-update')
+      || typeof reply.answer !== 'string') {
+      throw new CodexInterjectionFormatError('Codex interjection response has invalid identity or fields')
+    }
+    const answer = reply.answer.trim()
+    if (!answer || answer.includes('\0') || answer.length > MAX_RESULT_CHARS
+      || /\[ZERO_(?:THREAD_REPLY|INTERJECTION)[^\]]*\]/.test(answer)) {
+      throw new CodexInterjectionFormatError('Codex interjection response body is missing or invalid')
+    }
+    return { disposition: reply.disposition, answer }
+  }
+  // Retain strict compatibility with already persisted legacy envelopes.
   const lines = normalized.split('\n')
   const prefix = `[ZERO_THREAD_REPLY_BEGIN:${interjectionId}:`
   const first = lines[0] ?? ''
   const end = `[ZERO_THREAD_REPLY_END:${interjectionId}]`
   if (!first.startsWith(prefix) || !first.endsWith(']') || lines.at(-1) !== end) {
-    throw new Error('Codex interjection response omitted its exact host envelope')
+    throw new CodexInterjectionFormatError('Codex interjection response omitted its exact host envelope')
   }
   const disposition = first.slice(prefix.length, -1)
   if (disposition !== 'answer-only' && disposition !== 'task-update') {
-    throw new Error('Codex interjection response used an invalid disposition')
+    throw new CodexInterjectionFormatError('Codex interjection response used an invalid disposition')
   }
   if (lines.slice(1, -1).some(line => /\[ZERO_(?:THREAD_REPLY|INTERJECTION)[^\]]*\]/.test(line))) {
-    throw new Error('Codex interjection response contains a nested host marker')
+    throw new CodexInterjectionFormatError('Codex interjection response contains a nested host marker')
   }
   const answer = lines.slice(1, -1).join('\n').trim()
   if (!answer || answer.length > MAX_RESULT_CHARS) {
-    throw new Error('Codex interjection response body is missing or too long')
+    throw new CodexInterjectionFormatError('Codex interjection response body is missing or too long')
   }
   return { disposition, answer }
 }
@@ -6591,6 +6635,12 @@ export interface CodexLiveControlHooks {
     requestId: number
     error: string
   }): void
+  retryInterjectionAnswer(options: {
+    interjection: JobInterjectionRecord
+    logicalNonce: string
+    threadId: string
+    turnId: string
+  }): number | 'cancelled'
   stageInterjectionAnswer(options: {
     interjection: JobInterjectionRecord
     logicalNonce: string
@@ -7977,6 +8027,7 @@ export async function executeCodexJob(
       let protocolError: unknown = processPersistenceError
       let transientFailureSafeToRetry = false
       let protocolCompleted = false
+      let interjectionAnswerRetry: number | null = null
       let userCancelled = false
       let inputChangedBeforeDispatch = false
       let observedSessionId: string | null = sessionId
@@ -8583,6 +8634,8 @@ export async function executeCodexJob(
               ...codexApprovalSettings(advisorAttempt.permissionOverrides),
               model,
               effort: reasoningEffort,
+              ...(isInterjectionStage
+                ? { outputSchema: codexInterjectionOutputSchema(boundInterjection!.id) } : {}),
               beforeWrite: requestId => {
                 initialRequestId = requestId
                 const disposition = isInterjectionStage
@@ -8852,14 +8905,40 @@ export async function executeCodexJob(
             if (stage === 'interjection'
               && terminal.turn.status === 'completed'
               && !controls.cancellationRequested()) {
-              const acceptedTurn = await session.loadFullTurn(currentThreadId, reconciledTurn)
-              const message = appServerFinalMessage(acceptedTurn)
-              if (!message) {
-                throw new AppServerProtocolError(
-                  'completed interjection turn omitted final message',
-                )
+              let acceptedTurn = await session.loadFullTurn(currentThreadId, reconciledTurn)
+              let message = appServerFinalMessage(acceptedTurn) ?? ''
+              let reply: ReturnType<typeof parseCodexInterjectionReply> | undefined
+              // Read the same authoritative turn again before regenerating. Never
+              // fill missing fields from notifications, other turns, or guesses.
+              for (let read = 0; read < 2; read += 1) {
+                try {
+                  reply = parseCodexInterjectionReply(message, boundInterjection!.id)
+                  break
+                } catch (error) {
+                  if (!(error instanceof CodexInterjectionFormatError)) throw error
+                  if (read === 0) {
+                    acceptedTurn = await session.loadFullTurn(currentThreadId, reconciledTurn)
+                    message = appServerFinalMessage(acceptedTurn) ?? ''
+                    continue
+                  }
+                  const recovery = controls.retryInterjectionAnswer({
+                    interjection: boundInterjection!,
+                    logicalNonce: advisorAttempt.attemptNonce,
+                    threadId: currentThreadId,
+                    turnId: currentTurnId,
+                  })
+                  if (recovery === 'cancelled') userCancelled = true
+                  else interjectionAnswerRetry = recovery
+                }
               }
-              const reply = parseCodexInterjectionReply(message, boundInterjection!.id)
+              if (userCancelled) break
+              if (interjectionAnswerRetry !== null) {
+                finalTurn = acceptedTurn
+                finalMessage = message
+                protocolCompleted = true
+                break
+              }
+              if (!reply) throw new CodexInterjectionFormatError('interjection answer recovery produced no reply')
               const staged = controls.stageInterjectionAnswer({
                 interjection: boundInterjection!,
                 logicalNonce: advisorAttempt.attemptNonce,
@@ -9332,7 +9411,7 @@ export async function executeCodexJob(
           type: 'error', message: detail,
         })}\n`.slice(-MAX_LOG_TAIL_CHARS)
       }
-      if (protocolCompleted && protocolError == null && finalMessage) {
+      if (protocolCompleted && protocolError == null && finalMessage && interjectionAnswerRetry === null) {
         if (!userCancelled && stage === 'complete') {
           finalMessage = continuedArtifactMessage.resolve(finalMessage, activeInputRevision, taskGoalStatus)
         }
@@ -9364,6 +9443,7 @@ export async function executeCodexJob(
         retireCompletedRegistration,
         retireCancelledRegistration,
         userCancelled,
+        interjectionAnswerRetry,
         inputChangedBeforeDispatch,
         finalTurn,
         parentTurnIds,
@@ -9700,6 +9780,23 @@ export async function executeCodexJob(
     }
   }
 
+  const waitForInterjectionAnswerRetry = async (
+    retryCount: number,
+    controls: CodexLiveControlHooks,
+  ): Promise<void> => {
+    // A malformed read-only answer is not a failed parent task. Fast transient
+    // repairs are followed by bounded-rate recovery (at most one / five minutes).
+    // Retire the previous process before waiting; never replay parent work.
+    const deadline = Date.now() + codexInterjectionRetryDelayMs(retryCount)
+    process.stderr.write(`zerochan: interjection answer format recovery ${retryCount}; retaining parent task.\n`)
+    while (Date.now() < deadline) {
+      if (controls.cancellationRequested()) throw new CodexUserCancelledError()
+      if (options.signal?.aborted) throw new CodexInterruptedError('interjection answer recovery interrupted')
+      await Bun.sleep(Math.min(APP_SERVER_CONTROL_POLL_MS, Math.max(1, deadline - Date.now())))
+    }
+    if (controls.cancellationRequested()) throw new CodexUserCancelledError()
+  }
+
   let sessionId = job.sessionId
   let resumed = job.resumed
   let resumeFallbackAttempted = false
@@ -9857,7 +9954,7 @@ export async function executeCodexJob(
       interjection: JobInterjectionRecord,
       round: 1 | 2 | 3,
       boundInput?: AdvisorInputSnapshot,
-    ): Promise<JobInterjectionDisposition | 'input-changed'> => {
+    ): Promise<JobInterjectionDisposition | 'input-changed' | 'retry-answer'> => {
       if (!sessionId) throw new Error('interjection answer omitted its durable Codex thread')
       const execution = await runAttempt(
         sessionId,
@@ -9923,6 +10020,10 @@ export async function executeCodexJob(
         await execution.retireCompletedRegistration()
       }
       phaseSequence += 1
+      if ('interjectionAnswerRetry' in execution && typeof execution.interjectionAnswerRetry === 'number') {
+        await waitForInterjectionAnswerRetry(execution.interjectionAnswerRetry, controls)
+        return 'retry-answer'
+      }
       while (!controls.interjectionDelivered(interjection)) {
         if (controls.cancellationRequested()) throw new CodexUserCancelledError()
         if (options.signal?.aborted) {
@@ -9945,7 +10046,9 @@ export async function executeCodexJob(
     ): Promise<JobInterjectionDisposition | 'input-changed'> => {
       while (true) {
         try {
-          return await answerInterjection(interjection, round, boundInput)
+          const result = await answerInterjection(interjection, round, boundInput)
+          if (result === 'retry-answer') continue
+          return result
         } catch (error) {
           if (!(error instanceof CodexRateLimitError)) throw error
           const failedPhaseSequence = phaseSequence
@@ -11110,7 +11213,7 @@ export async function executeCodexJob(
 
   const answerCompleteInterjection = async (
     interjection: JobInterjectionRecord,
-  ): Promise<JobInterjectionDisposition | 'input-changed'> => {
+  ): Promise<JobInterjectionDisposition | 'input-changed' | 'retry-answer'> => {
     if (!completeControls || !sessionId) {
       throw new Error('interjection answer omitted its live-control thread binding')
     }
@@ -11182,6 +11285,10 @@ export async function executeCodexJob(
       await execution.retireCompletedRegistration()
     }
     completePhaseSequence += 1
+    if ('interjectionAnswerRetry' in execution && typeof execution.interjectionAnswerRetry === 'number') {
+      await waitForInterjectionAnswerRetry(execution.interjectionAnswerRetry, completeControls)
+      return 'retry-answer'
+    }
     while (!completeControls.interjectionDelivered(interjection)) {
       if (completeControls.cancellationRequested()) throw new CodexUserCancelledError()
       if (options.signal?.aborted) {
@@ -11197,11 +11304,20 @@ export async function executeCodexJob(
     }
   }
 
+  const answerCompleteInterjectionWithRetry = async (
+    interjection: JobInterjectionRecord,
+  ): Promise<JobInterjectionDisposition | 'input-changed'> => {
+    while (true) {
+      const response = await answerCompleteInterjection(interjection)
+      if (response !== 'retry-answer') return response
+    }
+  }
+
   while (true) {
     if (completeThreadReady) {
       const pendingInterjection = completeControls?.nextInterjection() ?? null
       if (pendingInterjection) {
-        await answerCompleteInterjection(pendingInterjection)
+        await answerCompleteInterjectionWithRetry(pendingInterjection)
         continue
       }
     }
@@ -11250,7 +11366,7 @@ export async function executeCodexJob(
         await execution.retireCompletedRegistration()
       }
       completePhaseSequence += 1
-      const response = await answerCompleteInterjection(terminalInterjection)
+      const response = await answerCompleteInterjectionWithRetry(terminalInterjection)
       if (response !== 'answer-only' || pausedByInterjection) continue
       // A late answer-only message must not rerun an already completed task.
       // Keep the accepted result and make the later common publication path
