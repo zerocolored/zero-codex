@@ -2,7 +2,15 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { approvePairing, mutateAccess, readAccess, rememberChannel, writeAccess } from './access.ts'
+import {
+  approvePairing,
+  mutateAccess,
+  parseDefaultAllowFrom,
+  readAccess,
+  rememberChannel,
+  seedDefaultAllowFrom,
+  writeAccess,
+} from './access.ts'
 
 const directories: string[] = []
 
@@ -193,5 +201,49 @@ mutateAccess(access => {
       writeAllowFrom: [],
       pending: { concurrent: { senderId: 'U9999999999' } },
     })
+  })
+})
+
+describe('setup時の既定allowlist', () => {
+  test('カンマと空白のどちらでも区切り、大文字へ揃えて重複を落とす', () => {
+    expect(parseDefaultAllowFrom('U0A0DCGSJA0, u0ajnav797s U06R9GU88RF,U0A0DCGSJA0'))
+      .toEqual(['U0A0DCGSJA0', 'U0AJNAV797S', 'U06R9GU88RF'])
+  })
+
+  test('未設定と空文字は「既定なし」として扱う', () => {
+    expect(parseDefaultAllowFrom(undefined)).toEqual([])
+    expect(parseDefaultAllowFrom('   ')).toEqual([])
+  })
+
+  test('Slack user ID の形式でない値は黙って捨てずに失敗させる', () => {
+    expect(() => parseDefaultAllowFrom('U0A0DCGSJA0,not-a-user')).toThrow('invalid Slack user ID')
+    // channel ID を渡した事故を allowlist へ通さない。
+    expect(() => parseDefaultAllowFrom('C0BNENVB7EW')).toThrow('invalid Slack user ID')
+  })
+
+  test('新規access.jsonへ既定allowFromを入れる。既存の許可は消さず、二度目は何も足さない', () => {
+    const dir = fixture()
+    const path = join(dir, 'access.json')
+    writeFileSync(path, JSON.stringify({
+      dmPolicy: 'pairing',
+      allowFrom: ['U000ALREADY'],
+      writeAllowFrom: [],
+      channels: {},
+      pending: {},
+    }))
+    expect(seedDefaultAllowFrom('U0A0DCGSJA0,U0AJNAV797S', path)).toEqual(['U0A0DCGSJA0', 'U0AJNAV797S'])
+    expect(readAccess(path).allowFrom).toEqual(['U000ALREADY', 'U0A0DCGSJA0', 'U0AJNAV797S'])
+    expect(seedDefaultAllowFrom('U0A0DCGSJA0,U0AJNAV797S', path)).toEqual([])
+    expect(readAccess(path).allowFrom).toEqual(['U000ALREADY', 'U0A0DCGSJA0', 'U0AJNAV797S'])
+  })
+
+  test('既定allowlistはwriteAllowFromへ波及しない', () => {
+    const dir = fixture()
+    const path = join(dir, 'access.json')
+    writeFileSync(path, JSON.stringify({
+      dmPolicy: 'pairing', allowFrom: [], writeAllowFrom: [], channels: {}, pending: {},
+    }))
+    seedDefaultAllowFrom('U0A0DCGSJA0', path)
+    expect(readAccess(path).writeAllowFrom).toEqual([])
   })
 })

@@ -425,6 +425,13 @@ zerochan-access pair abc123
 zerochan-access status
 ```
 
+新しいMacで決まった人を最初から許可しておく場合は、setup時に渡します
+（`access.json`を作る時だけ`allowFrom`へ足します。IDはrepositoryに置きません）。
+
+```bash
+ZEROKUN_DEFAULT_ALLOW_FROM="U0123456789,U9876543210" bash zerokun/setup.sh
+```
+
 チャンネルは利用するSlack Appを招待し、対象projectで `zerochan set slack-channel <channel-id>` を
 実行すると利用できます。参加者は全員利用でき、bot投稿は無視します。新しい依頼は
 そのSlack Appへのメンションが必要ですが、同じスレッドの続きはメンション不要です。
