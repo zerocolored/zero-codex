@@ -33,6 +33,8 @@ import { assertClaudeAuthStatus } from './claude-auth-status.ts'
 import { claudeUiProposalSchema, createClaudeUiWorkspace, claudeUiInstructions, collectClaudeUiArtifacts,
   type ClaudeUiProposal, type ClaudeUiWorkspace } from './claude-ui-artifacts.ts'
 import { watchAdvisorStopRequest } from './advisor-settlement.ts'
+import { GROK_REVIEW_TIMEOUT_MS, GROK_OAUTH_TIMEOUT_MS } from './advisor-timeouts.ts'
+export { GROK_REVIEW_TIMEOUT_MS, GROK_OAUTH_TIMEOUT_MS } from './advisor-timeouts.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { startProcessPolling } from './supervisor-watch.ts'
 import { observeProcessGeneration, readProcessIdentity, type ProcessIdentity } from './process-generation.ts'
@@ -312,9 +314,7 @@ const MAX_TRANSCRIPT_CHARS = 256 * 1024
 const MAX_OUTPUT_BYTES = 256 * 1024
 export const MAX_ADVISOR_PROMPT_BYTES = 2 * 1024 * 1024
 // Reviewer infrastructure must never hold a completed task indefinitely.
-export const GROK_REVIEW_TIMEOUT_MS = 15 * 60_000
 export const CLAUDE_REVIEW_TIMEOUT_MS = 60 * 60_000
-export const GROK_OAUTH_TIMEOUT_MS = 10 * 60 * 1_000
 export const CLAUDE_HELPER_TIMEOUT_MS = 140_000
 // Open includes Herdr's 310s process budget, startup dialogs/painting and
 // exact-workspace cleanup. The transport must not kill a valid slow startup.
@@ -614,6 +614,24 @@ type ProcessResult = {
   forcedCleanup: boolean
   outputTruncated: boolean
   trackingWarning?: string
+}
+
+/** Preserve host-observed failure facts without publishing raw model output. */
+export function grokFailureDiagnostics(result: Pick<ProcessResult,
+  'exitCode' | 'timedOut' | 'forcedCleanup' | 'outputTruncated' | 'stderr'>) {
+  return {
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+    forcedCleanup: result.forcedCleanup,
+    outputTruncated: result.outputTruncated,
+    timeoutMs: GROK_REVIEW_TIMEOUT_MS,
+    reason: result.timedOut
+      ? `Grok reviewer exceeded its response time limit (${GROK_REVIEW_TIMEOUT_MS} ms; exit ${result.exitCode})`
+      : `Grok reviewer ended without a complete response (exit ${result.exitCode})`,
+    failure: result.timedOut
+      ? { advisor: 'grok', cause: 'timeout' } as const
+      : classifyAdvisorFailure('grok', result.stderr),
+  }
 }
 
 type FingerprintPaths = { allow: string, deny: string }
@@ -1906,8 +1924,7 @@ async function main(): Promise<void> {
           executionState: 'start-unconfirmed',
           containmentVerified: true,
           durationMs: Date.now() - startedAt,
-          reason: `Grok reviewer ended without a complete response (exit ${result.exitCode})`,
-          failure: classifyAdvisorFailure('grok', result.stderr),
+          ...grokFailureDiagnostics(result),
         }
       }
       return {
@@ -4035,6 +4052,12 @@ async function main(): Promise<void> {
       executionState: result.executionState,
       containmentVerified: result.containmentVerified === true,
       containmentStatus: result.containmentStatus,
+      durationMs: result.durationMs,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      forcedCleanup: result.forcedCleanup,
+      outputTruncated: result.outputTruncated,
+      timeoutMs: result.timeoutMs,
       processId: result.adopted === true || result.executionState === 'started-no-response'
         ? result.processId
         : undefined,
