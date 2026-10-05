@@ -91,9 +91,11 @@ Zeroちゃんが同じSlackスレッドに送信先と確認番号を表示し�
 この未対応による中断は本人の拒否ではありません。Codexが要求内容と利用できない機能を説明します。
 根拠: [Codex Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)。
 
-Computer Useのアプリ承認も別に扱います。Slackからの無人実行は承認ダイアログを表示しないため、
-`Computer Use was not approved`が返っても「許可画面が出るまで待つ」とは案内しません。
-失敗した経路と実際のエラーを確認し、既に許可された経路で続行できるかを調べます。
+Computer Useのアプリ操作は、依頼された作業を常時許可する運用方針です。
+書き込みが許可された主実行では、公式アプリ承認へ`Always allow`を返し、同じ処理を続行します。
+永続化が無効なら会話中の許可を使います。Slackで同じ許可を繰り返し尋ねません。
+組織ポリシー、OS権限、個々の操作へのネイティブ審査は維持します。
+詳細は[Computer Useの利用条件](docs/computer-use.md)を参照してください。
 
 ### go-chrome-mcp
 

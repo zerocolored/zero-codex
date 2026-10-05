@@ -55,6 +55,17 @@ function mockTransport(
 }
 
 describe('Codex App Server session', () => {
+  test.each(['session', 'always'] as const)('app access returns native persistence metadata: %s', async persist => {
+    const transport = mockTransport()
+    const session = new CodexAppServerSession(transport.input, transport.stream, {
+      onElicitation: async () => ({ action: 'accept', persist }),
+    })
+    transport.emit({ id: 0, method: 'mcpServer/elicitation/request', params: { threadId: 't', turnId: 'v' } })
+    await Bun.sleep(0)
+    expect(transport.sent).toEqual([{ id: 0, result: { action: 'accept', content: {}, _meta: { persist } } }])
+    session.closeInput(); await session.waitForReader()
+  })
+
   test('a delayed confirmation keeps notifications and colliding client RPCs alive, then accepts exactly once', async () => {
     const transport = mockTransport()
     let answer!: (value: 'accept') => void

@@ -1,6 +1,6 @@
 import { createUsageRecorder } from './task-usage.ts'
 import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCliConfig } from './deployment-cli-runtime.ts'
-import { browserUploadConfirmation, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
+import { browserUploadConfirmation, computerUseAppApproval, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
 import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
 import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
 import { ADVISOR_SETTLEMENT_TIMEOUT_MS, waitForAdvisorSettlement } from './advisor-settlement.ts'
@@ -4110,7 +4110,9 @@ export function buildCodexDeveloperInstructions(
       'in the same Slack thread. It waits for an exact reply containing the host-issued confirmation code',
       'and returns that answer to the same pending native request. Do not invent a confirmation code.',
       'Only that host-issued confirmation can be answered this way; a generic continue is not approval.',
-      'Other native MCP elicitation requests are answered with action=cancel; no user answer is fabricated.',
+      'For authorized primary Computer Use, the operator has enabled standing app-access permission.',
+      'The host answers official app-access requests and requests Always allow when offered by the native client.',
+      'Other native MCP elicitation requests are answered with action=cancel; no form answer is fabricated.',
       'That client cancellation does not mean the user declined, and does not approve the operation.',
       'Explain the exact requested interaction and client limitation; do not claim a dialog is open',
       'or promise that a generic Slack reply can answer an unsupported native confirmation.',
@@ -4471,8 +4473,10 @@ export function buildCodexWorkerPrompt(
       control.push('Native Computer Use is enabled for this authorized primary execution when installed.',
         'Read the installed computer-use skill. Current clients use node_repl with @oai/sky;',
         'discover node_repl tools rather than assuming a direct get_app_state MCP tool exists.',
-        'Eligible requests are reviewed by Codex native Auto-review. Existing per-app approvals still apply.',
-        'This unattended job cannot display an interactive approval dialog. An app approval denial',
+        'The operator permits app access for this authorized primary execution. The host answers native',
+        'app-access requests with Always allow when supported, or session permission otherwise.',
+        'Continue the task after approval without asking the user to operate the app manually.',
+        'Native organization policies and action-level Auto-review remain authoritative. An app approval denial',
         'must not be reported as a pending dialog. Do not repeatedly retry the same denial or',
         'ask the user to wait for a prompt that was not emitted. Report the exact failed capability',
         'and use an already-authorized alternative when the task and browser instructions allow it.',
@@ -6622,6 +6626,8 @@ export async function executeCodexJob(
   options: {
     /** Explicit fixture injection. Production callers must use the official standalone install. */
     codexBinForTesting?: string
+    /** Let a synthetic App Server exercise the primary browser/CUA request path. */
+    browserAccessForTesting?: boolean
     /** Fixture-only model override. Production always uses the release constant. */
     model?: string
     /** Fixture-only reasoning override. Production always uses the release constant. */
@@ -7086,7 +7092,7 @@ export async function executeCodexJob(
             ...(claudeAdvisorLookup ? [claudeAdvisorLookup] : []),
           ],
         } : undefined
-      const browserEnabled = testCodexBin === undefined && job.writeEnabled
+      const browserEnabled = (testCodexBin === undefined || options.browserAccessForTesting === true) && job.writeEnabled
         && process.platform === 'darwin' && stage !== 'interjection' && !continuationDecision
       const browserReceiptKey = browserEnabled ? randomBytes(32).toString('hex') : undefined
       const browserReceiptKeyPath = browserEnabled
@@ -7812,6 +7818,10 @@ export async function executeCodexJob(
       let notificationTurnId: string | null = null
       const session = new CodexAppServerSession(proc.stdin, proc.stdout, {
         onElicitation: async ({ id, params }, signal) => {
+          if (!job.writeEnabled || signal.aborted
+            || params.threadId !== monitorParentThreadId || params.turnId !== notificationTurnId) return 'cancel'
+          const appApproval = advisorAttempt.computerUseEnabled ? computerUseAppApproval(params) : null
+          if (appApproval) return { action: 'accept', persist: appApproval.persist }
           const confirmation = browserUploadConfirmation(params)
           if (!job.writeEnabled || !confirmation || !options.onNativeConfirmation
             || confirmation.threadId !== monitorParentThreadId || confirmation.turnId !== notificationTurnId) return 'cancel'

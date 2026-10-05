@@ -371,8 +371,10 @@ for line in sys.stdin:
     value = json.loads(line)
     method = value.get("method")
     request_id = value.get("id")
-    if mode == "native-upload" and method is None and request_id == 0:
+    if mode in ("native-upload", "native-app") and method is None and request_id == 0:
         action = value.get("result", {}).get("action", "missing")
+        if mode == "native-app":
+            action += ":" + str((value.get("result", {}).get("_meta") or {}).get("persist", "none"))
         emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "native result: " + action}], "error": None}}})
         continue
     rpc_log = os.environ.get("ZERO_RPC_LOG")
@@ -518,12 +520,15 @@ for line in sys.stdin:
             counters = {"inputTokens": 100, "cachedInputTokens": 60, "cacheWriteInputTokens": 0, "outputTokens": 20, "reasoningOutputTokens": 5}
             for _ in range(2):
                 emit({"method": "thread/tokenUsage/updated", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "tokenUsage": {"total": counters, "last": counters}}})
-        if mode == "native-upload":
+        if mode in ("native-upload", "native-app"):
+            approval_meta = {"codex_approval_kind": "mcp_tool_call", "connector_id": "browser-use", "tool_name": "upload_browser_files", "file_transfer": "upload", "tool_params": {"origin": "https://example.com"}}
+            if mode == "native-app":
+                approval_meta = {"codex_approval_kind": "mcp_tool_call", "connector_id": "computer-use", "tool_name": "get_app_state", "tool_params": {"app": "com.google.Chrome"}, "persist": ["session"] if os.environ.get("ZERO_NATIVE_SESSION_ONLY") else ["session", "always"]}
             emit({"id": 0, "method": "mcpServer/elicitation/request", "params": {
                 "threadId": "foreign-thread" if os.environ.get("ZERO_NATIVE_CONFIRMATION_FOREIGN") else (requested_thread or thread_id),
                 "turnId": turn_id, "serverName": "node_repl", "mode": "form",
                 "requestedSchema": {"type": "object", "properties": {}},
-                "_meta": {"codex_approval_kind": "mcp_tool_call", "connector_id": "browser-use", "tool_name": "upload_browser_files", "file_transfer": "upload", "tool_params": {"origin": "https://example.com"}}
+                "_meta": approval_meta
             }})
             continue
         if mode == "late-command-completion":
@@ -1079,7 +1084,7 @@ if mode == "logical-stop-required":
 }
 
 function fixture(
-  mode: 'normal' | 'native-upload' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
+  mode: 'normal' | 'native-upload' | 'native-app' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
     | 'interjection-answer' | 'interjection-update' | 'interjection-late-answer'
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
@@ -2703,6 +2708,29 @@ describe('production App Server executor', () => {
       } finally { value.store.close() }
     }, 30_000,
   )
+
+  test.skipIf(process.platform !== 'darwin').each([
+    { write: true, foreign: false, sessionOnly: false, result: 'accept:always' },
+    { write: true, foreign: false, sessionOnly: true, result: 'accept:session' },
+    { write: false, foreign: false, sessionOnly: false, result: 'cancel:none' },
+    { write: true, foreign: true, sessionOnly: false, result: 'cancel:none' },
+    { write: true, foreign: false, sessionOnly: false, disabled: true, result: 'cancel:none' },
+  ])('native app permission continues the same authorized root turn without Slack confirmation: %j', async scenario => {
+    const value = fixture('native-app', scenario.write)
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        browserAccessForTesting: !scenario.disabled,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'native-app',
+          ...(scenario.foreign ? { ZERO_NATIVE_CONFIRMATION_FOREIGN: '1' } : {}),
+          ...(scenario.sessionOnly ? { ZERO_NATIVE_SESSION_ONLY: '1' } : {}) },
+        onNativeConfirmation: async () => { throw new Error('app approval must not ask again in Slack') },
+      })
+      expect(result.result).toBe(`native result: ${scenario.result}`)
+      expect(value.store.pendingCommentaryNotifications()).toHaveLength(0)
+    } finally { value.store.close() }
+  }, 30_000)
 
   test('resumeでもprimary modelと推論強度を再固定する', async () => {
     const value = fixture('normal', true)
