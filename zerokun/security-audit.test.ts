@@ -28,9 +28,13 @@ import {
 } from './security-audit.ts'
 import {
   auditCommand,
+  runAuditTool,
   checkAuditInterrupted,
   auditTargetAllows,
   scannerFindings,
+  auditPlaywrightConfigs,
+  cleanupAuditZap,
+  redactAuditCookies,
   zapScopeFiles,
   type AuditToolContext,
 } from './security-audit-tools.ts'
@@ -39,6 +43,7 @@ import {
   classifyFleetRequest,
 } from './fleet-query.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
+import { readOwnerOnlyOutput } from './slack-thread-intent.ts'
 import {
   CodexInterruptedError,
   CodexCleanupPendingError,
@@ -92,6 +97,198 @@ const model = async (prompt: string) => {
   expect(prompt).toContain('untrusted evidence')
   return JSON.stringify({ findings: [], note: 'fixture source reviewed' })
 }
+test('audit output accepts real review sizes while classifier and confidentiality limits remain enforced', () => {
+  const { root, store } = fixture()
+  try {
+    const path = join(root, 'response.json')
+    const large = JSON.stringify({ findings: [], note: '監査結果'.repeat(1000) })
+    writeFileSync(path, large, { mode: 0o600 })
+    expect(() => readOwnerOnlyOutput(path)).toThrow('unsafe')
+    expect(readOwnerOnlyOutput(path, 1_000_000)).toBe(large)
+    writeFileSync(path, 'x'.repeat(1_000_001))
+    expect(() => readOwnerOnlyOutput(path, 1_000_000)).toThrow('unsafe')
+    expect(() => readOwnerOnlyOutput(path, Number.MAX_SAFE_INTEGER)).toThrow('limit')
+    const link = join(root, 'response-link.json')
+    symlinkSync(path, link)
+    expect(() => readOwnerOnlyOutput(link, 1_000_000)).toThrow('unsafe')
+  } finally { store.close() }
+})
+
+test('transient source review failure is retried without replaying scanners or duplicating findings', async () => {
+  const { state, store, job } = fixture()
+  let calls = 0
+  const stages: number[] = []
+  try {
+    await executeSecurityAudit(job, { stateDir: state, tool: async n => { stages.push(n); return result(n) }, model: async (_prompt, _schema, options) => {
+      expect(options?.purpose).toBe('security-audit')
+      if (++calls === 1) throw Error('temporary model failure')
+      return JSON.stringify({ findings: [{ title: 'fixture', severity: 'low', location: 'app.ts:1', evidence: 'synthetic evidence', recommendation: 'review fixture' }], note: '' })
+    } })
+    const journal = JSON.parse(readFileSync(join(state, 'security-audits', job.id, 'journal.json'), 'utf8'))
+    expect(calls).toBe(5)
+    expect(stages).toEqual([1, 5, 6, 7, 8, 9, 10, 11, 12])
+    expect(journal.steps[0].status).toBe('findings')
+    expect(journal.steps[0].findings).toHaveLength(1)
+    expect(journal.steps[0].note).toContain('app.ts:1: attempt 1/2: temporary model failure')
+  } finally { store.close() }
+})
+
+test('persistent source review failure remains incomplete with bounded diagnostic evidence', async () => {
+  const { state, store, job } = fixture()
+  let calls = 0
+  try {
+    await executeSecurityAudit(job, { stateDir: state, tool: async n => result(n), model: async () => {
+      calls++
+      throw Error('Authorization: Bearer fixture-sensitive-value')
+    } })
+    const raw = readFileSync(join(state, 'security-audits', job.id, 'journal.json'), 'utf8')
+    const journal = JSON.parse(raw)
+    expect(calls).toBe(8)
+    expect(raw).not.toContain('fixture-sensitive-value')
+    expect(journal.steps.slice(0, 4).every((s: AuditStep) => s.status === 'failed' && s.note.includes('attempt 2/2'))).toBe(true)
+  } finally { store.close() }
+})
+
+test('oversized generated lines reach every review within the complete UTF-8 prompt budget without gaps', async () => {
+  const { state, repo, store, job } = fixture()
+  const lines = ['日本語😀"\\\t'.repeat(16000), 'second'.repeat(20000), 'export const tail = 1']
+  writeFileSync(join(repo, 'app.ts'), lines.join('\n'))
+  const parts: Array<{ file: string; start: number; text: string; offsetUtf16?: number }> = []
+  try {
+    await executeSecurityAudit(job, { stateDir: state, tool: async n => result(n), model: async prompt => {
+      expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(100_000)
+      const part = JSON.parse(prompt.split('\nSource: ')[1]!)
+      expect(part.text).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u)
+      parts.push(part)
+      return JSON.stringify({ findings: [], note: '' })
+    } })
+    const journal = JSON.parse(readFileSync(join(state, 'security-audits', job.id, 'journal.json'), 'utf8'))
+    expect(journal.steps.slice(0, 4).every((s: AuditStep) => s.status === 'completed')).toBe(true)
+    expect(parts.length % 4).toBe(0)
+    const perStage = parts.length / 4
+    expect(perStage).toBeGreaterThan(3)
+    for (let n = 0; n < 4; n++) {
+      const stage = parts.slice(n * perStage, (n + 1) * perStage)
+      expect(stage.map(p => p.text).join('')).toBe(auditClean(lines.map((line, i) => `${i + 1}: ${line}\n`).join('')))
+      for (const line of [1, 2]) {
+        let offset = 0
+        for (const part of stage.filter(p => p.start === line)) {
+          expect(part.offsetUtf16).toBe(offset)
+          offset += part.text.length
+        }
+      }
+    }
+  } finally { store.close() }
+}, 20000)
+
+test('pnpm advisories retain dependency paths and malformed responses cannot pass as clean', () => {
+  const clean = { advisories: {}, metadata: { vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0 } } }
+  expect(scannerFindings('pnpm', clean)).toEqual([])
+  expect(scannerFindings('pnpm', { ...clean, advisories: { 1: { module_name: 'fixture', title: 'fixture vulnerability', severity: 'moderate', vulnerable_versions: '<2', patched_versions: '>=2', findings: [{ paths: ['worker>fixture'] }] } } })[0]).toMatchObject({ location: 'fixture', severity: 'medium', evidence: 'Affected: <2; paths: worker>fixture' })
+  for (const invalid of [{}, { error: 'registry unavailable' }, { advisories: [] }, { ...clean, advisories: { bad: {} } }])
+    expect(() => scannerFindings('pnpm', invalid)).toThrow('schema')
+})
+
+test('Playwright discovery supports workspaces without following unrelated checkouts or symlinks', () => {
+  const { repo, store } = fixture()
+  try {
+    for (const dir of ['packages/web', '.worktrees/other', 'node_modules/fixture']) {
+      mkdirSync(join(repo, dir), { recursive: true })
+      writeFileSync(join(repo, dir, 'playwright.config.ts'), 'export default {}')
+    }
+    symlinkSync(join(repo, 'packages'), join(repo, 'linked-packages'))
+    expect(auditPlaywrightConfigs(repo)).toEqual(['packages/web/playwright.config.ts'])
+    writeFileSync(join(repo, 'playwright.config.mjs'), 'export default {}')
+    expect(auditPlaywrightConfigs(repo)).toEqual(['playwright.config.mjs'])
+  } finally { store.close() }
+})
+
+test('audit Docker commands retain the selected engine under an isolated HOME', async () => {
+  const { root, repo, state, store, job } = fixture()
+  try {
+    const executable = join(root, 'docker')
+    writeFileSync(executable, '#!/bin/sh\nprintf "%s\\n%s\\n" "$DOCKER_HOST" "$HOME"\n', { mode: 0o700 })
+    const r = await auditCommand([executable], root, { root, source: repo, repo, stateDir: state, jobId: job.id,
+      settings: { activeScan: false, codeqlLicensed: false, images: [] }, dockerHost: 'unix:///fixture/selected.sock' })
+    expect(r.exitCode).toBe(0)
+    expect(r.stdout.split('\n')).toEqual(['unix:///fixture/selected.sock', join(root, 'home'), ''])
+  } finally { store.close() }
+})
+
+test('unreachable Docker remains cleanup pending and empty cookies cannot expand diagnostics', async () => {
+  const { root, repo, state, store, job } = fixture()
+  const previousHost = process.env.DOCKER_HOST, previousContext = process.env.DOCKER_CONTEXT
+  try {
+    delete process.env.DOCKER_CONTEXT
+    process.env.DOCKER_HOST = `unix://${root}/absent-docker.sock`
+    await expect(cleanupAuditZap({ root, source: repo, repo, stateDir: state, jobId: job.id,
+      settings: { activeScan: false, codeqlLicensed: false, images: [] } })).rejects.toBeInstanceOf(CodexCleanupPendingError)
+    expect(redactAuditCookies('exit=1; diagnostic', [{ value: '' }])).toBe('exit=1; diagnostic')
+    expect(redactAuditCookies('a.b a x 1', [{ value: '' }, { value: 'a' }, { value: 'a.b' }, { value: '1' }]))
+      .toBe('[認証情報を除去] [認証情報を除去] x [認証情報を除去]')
+    expect(redactAuditCookies('fixture', [{ value: 'fixture' }, { value: '認' }])).toBe('[認証情報を除去]')
+  } finally {
+    if (previousHost === undefined) delete process.env.DOCKER_HOST; else process.env.DOCKER_HOST = previousHost
+    if (previousContext === undefined) delete process.env.DOCKER_CONTEXT; else process.env.DOCKER_CONTEXT = previousContext
+    store.close()
+  }
+})
+
+test('Gitleaks exit zero without its structured report is never a clean scan', async () => {
+  const { root, repo, state, store, job } = fixture()
+  const priorPath = process.env.PATH
+  try {
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    writeFileSync(join(bin, 'gitleaks'), '#!/bin/sh\nif [ "$1" = version ]; then echo fixture; fi\nexit 0\n', { mode: 0o700 })
+    process.env.PATH = `${bin}:${priorPath ?? '/usr/bin:/bin'}`
+    const s = await runAuditTool(9, { root, source: repo, repo, stateDir: state, jobId: job.id,
+      settings: { activeScan: false, codeqlLicensed: false, images: [] } })
+    expect(s.status).toBe('unavailable')
+    expect(s.note).toContain('Gitleaks directory report unavailable')
+    expect(s.evidenceDigest).toBeNull()
+  } finally {
+    if (priorPath === undefined) delete process.env.PATH
+    else process.env.PATH = priorPath
+    store.close()
+  }
+})
+
+test('an E2E runner that exits zero with no executed tests remains incomplete', async () => {
+  const { root, repo, state, store, job } = fixture()
+  const priorPath = process.env.PATH
+  try {
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    writeFileSync(join(bin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+    process.env.PATH = `${bin}:${priorPath ?? '/usr/bin:/bin'}`
+    writeFileSync(join(repo, 'playwright.config.mjs'), 'export default {}')
+    const cliDir = join(repo, 'node_modules/@playwright/test')
+    mkdirSync(cliDir, { recursive: true })
+    writeFileSync(join(cliDir, 'cli.js'), `console.log(process.argv.includes('--version') ? 'fixture' : JSON.stringify({suites:[],stats:{expected:0,unexpected:0,flaky:0,skipped:0}}))`)
+    const s = await runAuditTool(12, { root, source: repo, repo, stateDir: state, jobId: job.id,
+      settings: { activeScan: false, codeqlLicensed: false, images: [], authentication: 'none', e2ePort: 3100 } })
+    expect(s.exitCode).toBe(0)
+    expect(s.status).toBe('unavailable')
+    expect(s.note).toContain('実行されたテストがありません')
+  } finally {
+    if (priorPath === undefined) delete process.env.PATH
+    else process.env.PATH = priorPath
+    store.close()
+  }
+})
+
+test('ZAP hooks restore the authorized subpath after packaged scans replace it with the root', () => {
+  const { root, store } = fixture()
+  try {
+    const path = join(root, 'hook.py')
+    writeFileSync(path, zapScopeFiles('https://example.test/allowed/app?fixture=1').hook)
+    const r = Bun.spawnSync(['python3', '-c',
+      `import runpy,sys\nh=runpy.run_path(sys.argv[1])\nassert h['zap_spider']('client','https://example.test/') == ('client','https://example.test/allowed/app?fixture=1')\nassert h['zap_active_scan']('client','https://example.test/','policy') == ('client','https://example.test/allowed/app?fixture=1','policy')`, path], { stdout: 'pipe', stderr: 'pipe' })
+    expect(r.stderr.toString()).toBe('')
+    expect(r.exitCode).toBe(0)
+  } finally { store.close() }
+})
 test('cleanup failure is retained even when interruption is also requested', async () => {
   const { job, state, store } = fixture()
   const controller = new AbortController()
@@ -741,7 +938,7 @@ describe('security audit workflow', () => {
       settings: { activeScan: false, codeqlLicensed: false, images: [] },
     }
     try {
-      const script = `const fs=require('fs');console.log(JSON.stringify({writes:${JSON.stringify(paths)}.map(p=>{try{fs.writeFileSync(p,'tampered');return false}catch{return true}}),privateReadBlocked:(()=>{try{fs.readFileSync(${JSON.stringify(privatePath)});return false}catch{return true}})()}))`
+      const script = `const fs=require('fs');console.log(JSON.stringify({writes:${JSON.stringify(paths)}.map(p=>{try{fs.writeFileSync(p,'tampered');return false}catch{return true}}),privateReadBlocked:(()=>{try{fs.readFileSync(${JSON.stringify(privatePath)});return false}catch{return true}})(),parentReadlink:(()=>{try{fs.readlinkSync(${JSON.stringify(state)});return 'symlink'}catch(e){return e.code}})()}))`
       const result = await auditCommand(
         [process.execPath, '-e', script],
         run,
@@ -752,6 +949,7 @@ describe('security audit workflow', () => {
       expect(JSON.parse(result.stdout)).toEqual({
         writes: [true, true, true],
         privateReadBlocked: true,
+        parentReadlink: 'EINVAL',
       })
       for (const p of paths) expect(readFileSync(p, 'utf8')).toBe('unchanged')
     } finally {
