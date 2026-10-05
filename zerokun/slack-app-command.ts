@@ -2,8 +2,8 @@ import { homedir } from 'os'
 import { WebClient } from '@slack/web-api'
 import { readProjectChannelConfig, switchProjectSlackApp } from './project-channel-config.ts'
 import { resolveProjectLayout } from './project-layout.ts'
-import { adoptLegacySlackApp, listRegisteredSlackApps, saveNewSlackApp, withSlackAppRegistryLock } from './slack-app-registry.ts'
-import { verifySlackAppTokenPair } from './slack-app-identity.ts'
+import { adoptLegacySlackApp, listRegisteredSlackApps, requireAppId, saveNewSlackApp, withSlackAppRegistryLock, type RegisteredSlackApp } from './slack-app-registry.ts'
+import { appIdFromAppToken, verifySlackAppTokenPair } from './slack-app-identity.ts'
 import { slackWebClientOptions } from './slack-http.ts'
 import { prepareSlackAppState } from './slack-app-state.ts'
 import { installAppWatchdog } from './watchdog-profile.ts'
@@ -101,26 +101,46 @@ export async function runSlackAppCommand(project: string, hooks: {
   adoptLegacySlackApp(home)
   const existing = listRegisteredSlackApps(home)
   existing.forEach((app, index) => output(`${index + 1}: ${app.appId}\n`))
-  let selected = existing[0]
-  const choice = existing.length ? await input('登録済みアプリの番号、または新規登録は n', { echo: true }) : 'n'
-  if (choice === 'n') {
+  let selected: RegisteredSlackApp | undefined
+  let expectedAppId: string | undefined
+  while (existing.length) {
+    const choice = (await input('登録済みアプリの番号または App ID、新規登録は n', { echo: true })).trim()
+    if (choice === 'n') break
+    if (/^[1-9][0-9]*$/.test(choice)) {
+      selected = existing[Number(choice) - 1]
+      if (selected) break
+    } else {
+      try { expectedAppId = requireAppId(choice) } catch { /* Retry without reflecting input. */ }
+      if (expectedAppId) {
+        selected = existing.find(app => app.appId === expectedAppId)
+        if (!selected) output(`${expectedAppId} は未登録です。このアプリのトークンを入力して新規登録します。\n`)
+        break
+      }
+    }
+    output('一覧の番号、Aで始まる App ID、または新規登録の n を入力してください。\n')
+  }
+  if (!selected) {
     const botToken = await input('Bot Token xoxb-（非表示）')
     const appToken = await input('App-Level Token xapp-（非表示）')
     if (!/^xoxb-[A-Za-z0-9._-]{10,}$/.test(botToken)) throw new Error('Bot Tokenの形式が不正です')
+    const mismatch = '指定した App ID とトークンのアプリが一致しません（既存設定は変更していません）'
+    if (expectedAppId) {
+      let tokenAppId
+      try { tokenAppId = appIdFromAppToken(appToken) }
+      catch { throw new Error('App-Level Tokenの形式が不正です') }
+      if (tokenAppId !== expectedAppId) throw new Error(mismatch)
+    }
     let identity
     try {
       identity = await (hooks.verify ?? verifyTokens)(botToken, appToken)
     } catch {
       throw new Error('Slack認証を確認できませんでした。トークンの組み合わせ・権限・接続を確認してください（既存設定は変更していません）')
     }
+    if (expectedAppId && identity.appId !== expectedAppId) throw new Error(mismatch)
     if (existing.some(app => app.appId === identity.appId)) {
       throw new Error('このアプリは登録済みです。再実行して一覧から選択してください')
     }
     selected = saveNewSlackApp(identity.appId, botToken, appToken, home)
-  } else {
-    if (!/^[1-9][0-9]*$/.test(choice)) throw new Error('一覧の番号を入力してください')
-    selected = existing[Number(choice) - 1]
-    if (!selected) throw new Error('一覧の番号を入力してください')
   }
   // Existing legacy installations are adopted in place, not re-provisioned
   // while their gateway may still be running.
