@@ -4,6 +4,7 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   rmSync,
   existsSync,
   symlinkSync,
@@ -20,7 +21,11 @@ import {
   finalizeSuccessfulExecution,
 } from './job-runner.ts'
 import {
-  executeSecurityAudit,
+  executeSecurityAudit as executeAudit,
+  type AuditOptions,
+  AUDIT_STEPS,
+  renderAuditReport,
+  auditHasReadinessOnlyResult,
   auditClean,
   copyAuditReportForFollowup,
   snapshotAuditSource,
@@ -29,6 +34,8 @@ import {
 import {
   auditCommand,
   runAuditTool,
+  runAuditProbe,
+  assertSemgrepCodeResult,
   checkAuditInterrupted,
   auditTargetAllows,
   scannerFindings,
@@ -91,6 +98,9 @@ function result(number: number): AuditStep {
     evidenceDigest: null,
   }
 }
+const executeSecurityAudit = (job: JobRecord, options: AuditOptions) => executeAudit(job, {
+  milestone: async () => {}, probe: async n => result(n), ...options,
+})
 const model = async (prompt: string) => {
   expect(prompt).toContain('SECURITY AUDIT')
   expect(prompt).toContain('No edits')
@@ -126,7 +136,7 @@ test('transient source review failure is retried without replaying scanners or d
     } })
     const journal = JSON.parse(readFileSync(join(state, 'security-audits', job.id, 'journal.json'), 'utf8'))
     expect(calls).toBe(5)
-    expect(stages).toEqual([1, 5, 6, 7, 8, 9, 10, 11, 12])
+    expect(stages).toEqual([1, 5, 6, 7, 8, 9, 10, 11])
     expect(journal.steps[0].status).toBe('findings')
     expect(journal.steps[0].findings).toHaveLength(1)
     expect(journal.steps[0].note).toContain('app.ts:1: attempt 1/2: temporary model failure')
@@ -242,7 +252,7 @@ test('Gitleaks exit zero without its structured report is never a clean scan', a
     mkdirSync(bin)
     writeFileSync(join(bin, 'gitleaks'), '#!/bin/sh\nif [ "$1" = version ]; then echo fixture; fi\nexit 0\n', { mode: 0o700 })
     process.env.PATH = `${bin}:${priorPath ?? '/usr/bin:/bin'}`
-    const s = await runAuditTool(9, { root, source: repo, repo, stateDir: state, jobId: job.id,
+    const s = await runAuditTool(8, { root, source: repo, repo, stateDir: state, jobId: job.id,
       settings: { activeScan: false, codeqlLicensed: false, images: [] } })
     expect(s.status).toBe('unavailable')
     expect(s.note).toContain('Gitleaks directory report unavailable')
@@ -266,7 +276,7 @@ test('an E2E runner that exits zero with no executed tests remains incomplete', 
     const cliDir = join(repo, 'node_modules/@playwright/test')
     mkdirSync(cliDir, { recursive: true })
     writeFileSync(join(cliDir, 'cli.js'), `console.log(process.argv.includes('--version') ? 'fixture' : JSON.stringify({suites:[],stats:{expected:0,unexpected:0,flaky:0,skipped:0}}))`)
-    const s = await runAuditTool(12, { root, source: repo, repo, stateDir: state, jobId: job.id,
+    const s = await runAuditTool(11, { root, source: repo, repo, stateDir: state, jobId: job.id,
       settings: { activeScan: false, codeqlLicensed: false, images: [], authentication: 'none', e2ePort: 3100 } })
     expect(s.exitCode).toBe(0)
     expect(s.status).toBe('unavailable')
@@ -340,7 +350,7 @@ test('snapshot follows Git inventory, preserves tracked edits and excludes neste
   } finally { store.close() }
 })
 
-test('legacy audit resumes original cache indices and filters scanner input without changing source', async () => {
+test('resumable audit preserves original cache indices and filters scanner input without changing source', async () => {
   const { job, state, repo, store } = fixture()
   const controller = new AbortController()
   const root = join(state, 'security-audits', job.id)
@@ -381,10 +391,10 @@ test('legacy audit resumes original cache indices and filters scanner input with
     } })
     expect(prompts).toHaveLength(7)
     expect(prompts[0]).toContain('"file":"b.ts"')
-    expect(calls).toEqual([1, 5, 6, 7, 8, 9, 10, 11, 12])
+    expect(calls).toEqual([1, 5, 6, 7, 8, 9, 10, 11])
     const final = JSON.parse(readFileSync(path, 'utf8'))
     expect(final.files).toEqual(journal.files)
-    expect(final.steps).toHaveLength(13)
+    expect(final.steps).toHaveLength(12)
     expect(final.steps[0].status).toBe('findings')
     expect(final.steps[0].findings.map((x: { title: string }) => x.title)).toEqual(['retained finding'])
     expect(existsSync(join(root, 'selected-source'))).toBe(false)
@@ -404,7 +414,7 @@ test('interrupted E2E is not repeated while its code review remains resumable', 
     } })).rejects.toBeInstanceOf(CodexInterruptedError)
     let modelCalls = 0
     await executeSecurityAudit(job, { stateDir: state, model: async prompt => { modelCalls++; return model(prompt) }, tool: async n => { calls.push(n); return result(n) } })
-    expect(calls).toEqual([1, 5, 6, 7, 8, 9, 10, 11, 12])
+    expect(calls).toEqual([1, 5, 6, 7, 8, 9, 10, 11])
     expect(modelCalls).toBe(3)
     const journal = JSON.parse(readFileSync(join(root, 'journal.json'), 'utf8'))
     expect(journal.steps[0].note).toContain('not replayed')
@@ -424,7 +434,7 @@ for (const interruptedStage of [2, 3, 4]) test(`code review ${interruptedStage} 
     await executeSecurityAudit(job, { stateDir: state, tool: async n => result(n), model: async prompt => { called++; return model(prompt) } })
     expect(called).toBe(5 - interruptedStage)
     const journal = JSON.parse(readFileSync(join(state, 'security-audits', job.id, 'journal.json'), 'utf8'))
-    expect(journal.steps).toHaveLength(13)
+    expect(journal.steps).toHaveLength(12)
     expect(journal.steps[interruptedStage - 1].status).toBe('completed')
   } finally { store.close() }
 })
@@ -596,7 +606,7 @@ describe('security audit workflow', () => {
       expect(
         store
           .pendingStatusNotifications()
-          .filter((n) => n.payload.includes('13工程')),
+          .filter((n) => n.payload.includes('12工程')),
       ).toHaveLength(1)
       expect(
         store.statusNotificationDeliverable(
@@ -645,7 +655,7 @@ describe('security audit workflow', () => {
       next.close()
     }
   })
-  test('13 stages settle, missing scanners remain visible, report retry does not rerun tools', async () => {
+  test('12 stages settle, missing scanners remain visible, report retry does not rerun tools', async () => {
     const { job, state, repo, store } = fixture()
     const calls: number[] = []
     writeFileSync(join(repo, '.env'), 'PRIVATE_TOKEN=not-for-the-model')
@@ -670,7 +680,7 @@ describe('security audit workflow', () => {
         ? {
             ...result(n),
             status: 'unavailable' as const,
-            note: 'license not configured',
+            note: 'scanner temporarily unavailable',
           }
         : n === 8
           ? {
@@ -697,21 +707,21 @@ describe('security audit workflow', () => {
           return model(prompt)
         },
       })
-      expect(calls).toEqual([1, 5, 6, 7, 8, 9, 10, 11, 12])
+      expect(calls).toEqual([1, 5, 6, 7, 8, 9, 10, 11])
       const journal = JSON.parse(
         readFileSync(
           join(state, 'security-audits', job.id, 'journal.json'),
           'utf8',
         ),
       )
-      expect(journal.steps).toHaveLength(13)
+      expect(journal.steps).toHaveLength(12)
       expect(journal.steps[6].status).toBe('unavailable')
       const file = JSON.parse(
         run.result.match(/<zerokun_files>(.*?)<\/zerokun_files>/s)![1]!,
       )[0]
       const report = readFileSync(file, 'utf8')
       expect(report).toContain('CVE fixture')
-      expect(report).toContain('license not configured')
+      expect(report).toContain('scanner temporarily unavailable')
       expect(report).not.toContain('not-for-the-model')
       expect(report).toContain('.env: protected')
       for (const name of secretFiles)
@@ -722,7 +732,7 @@ describe('security audit workflow', () => {
       expect(
         await executeSecurityAudit(job, { stateDir: state, tool, model }),
       ).toEqual(run)
-      expect(calls).toHaveLength(9)
+      expect(calls).toHaveLength(8)
       expect(report).not.toContain('token.ts: protected')
       expect(report).not.toContain('credentials.service.ts: protected')
       expect(existsSync(join(state, 'security-audits', job.id, 'source'))).toBe(
@@ -767,8 +777,8 @@ describe('security audit workflow', () => {
       })
       const path = join(state, 'security-audits', job.id, 'journal.json'),
         j = JSON.parse(readFileSync(path, 'utf8'))
-      j.steps = j.steps.slice(0, 11)
-      j.steps[10].status = 'running'
+      j.steps = j.steps.slice(0, 10)
+      j.steps[9].status = 'running'
       j.result = null
       j.reportDigest = null
       writeFileSync(path, JSON.stringify(j), { mode: 0o600 })
@@ -781,8 +791,8 @@ describe('security audit workflow', () => {
           return result(n)
         },
       })
-      expect(calls).toEqual([12])
-      expect(JSON.parse(readFileSync(path, 'utf8')).steps[10].status).toBe(
+      expect(calls).toEqual([11])
+      expect(JSON.parse(readFileSync(path, 'utf8')).steps[9].status).toBe(
         'interrupted',
       )
     } finally {
@@ -991,4 +1001,239 @@ describe('security audit workflow', () => {
       store.close()
     }
   }, 15000)
+})
+
+describe('availability gate', () => {
+  for (let missing = 1; missing <= AUDIT_STEPS.length; missing++) test(`unavailable stage ${missing} checks all stages and starts no full scan`, async () => {
+    const { state, store, job } = fixture()
+    const probes: number[] = [], phases: string[] = []
+    let full = 0
+    try {
+      const run = await executeAudit(job, { stateDir: state,
+        milestone: async phase => { phases.push(phase) },
+        probe: async n => { probes.push(n); return { ...result(n), ...(n === missing ? { status: 'unavailable' as const, note: 'fixture prerequisite missing' } : {}) } },
+        tool: async n => { full++; return result(n) }, model: async () => { full++; return '{}' },
+      })
+      expect(probes).toEqual(Array.from({ length: 12 }, (_, i) => i + 1))
+      expect(phases).toEqual(['checking'])
+      expect(full).toBe(0)
+      expect(run.result).toContain('1工程に不備')
+      expect(run.result).toContain('本検査は開始していません')
+      const root = join(state, 'security-audits', job.id)
+      const journal = JSON.parse(readFileSync(join(root, 'journal.json'), 'utf8'))
+      expect(journal.steps).toEqual([])
+      expect(journal.result).toBeNull()
+      expect(existsSync(join(root, 'source'))).toBe(false)
+      const replay = await executeAudit(job, { stateDir: state, probe: async () => { throw Error('must not rerun blocked probes') } })
+      expect(replay).toEqual(run)
+      const saved = JSON.parse(readFileSync(join(root, 'preflight.json'), 'utf8'))
+      expect(saved.steps).toHaveLength(12)
+      expect(saved.finishedAt).toBeGreaterThan(0)
+      const files = JSON.parse(run.result.match(/<zerokun_files>(.*?)<\/zerokun_files>/s)![1]!)
+      expect(readFileSync(files[0], 'utf8')).toContain('対象コードの脆弱性検査結果ではありません')
+    } finally { store.close() }
+  })
+  test('both delivered milestones enclose all probes and gate full execution', async () => {
+    const { state, store, job } = fixture()
+    const events: string[] = []
+    let release!: () => void
+    const ready = new Promise<void>(resolve => { release = resolve })
+    try {
+      const running = executeAudit(job, { stateDir: state,
+        milestone: async phase => { events.push(phase); if (phase === 'ready') await ready },
+        probe: async n => { events.push(`probe:${n}`); return { ...result(n), status: 'findings' } },
+        model: async (...args) => { events.push('model'); return model(args[0]) },
+        tool: async n => { events.push(`tool:${n}`); return result(n) },
+      })
+      for (let i = 0; i < 100 && !events.includes('ready'); i++) await Bun.sleep(10)
+      expect(events).toEqual(['checking', ...Array.from({ length: 12 }, (_, i) => `probe:${i + 1}`), 'ready'])
+      release(); await running
+      expect(events[14]).toBe('model')
+      expect(events).toContain('tool:11')
+      const cached = await executeAudit(job, { stateDir: state, probe: async () => { throw Error('must not run') } })
+      expect(cached.result).toContain('全12工程')
+    } finally { release(); store.close() }
+  })
+  test('probe exceptions and invalid identities are aggregated, cancellation is not swallowed', async () => {
+    const { state, store, job } = fixture()
+    try {
+      const run = await executeAudit(job, { stateDir: state, milestone: async () => {}, probe: async n => {
+        if (n === 2) throw Error('fixture auth unavailable')
+        return result(n === 4 ? 3 : n)
+      } })
+      expect(run.result).toContain('2工程に不備')
+      expect(run.result).toContain('fixture auth unavailable')
+      expect(run.result).toContain('identity mismatch')
+      let probes = 0
+      const controller = new AbortController()
+      await expect(executeAudit({ ...job, id: randomUUID() }, { stateDir: state, signal: controller.signal, milestone: async () => {}, probe: async n => {
+        probes++; if (n === 3) { controller.abort(); checkAuditInterrupted({ signal: controller.signal }) }; return result(n)
+      } })).rejects.toBeInstanceOf(CodexInterruptedError)
+      expect(probes).toBe(3)
+    } finally { store.close() }
+  })
+  test('delivery rejection starts no probe and no scan', async () => {
+    const { state, store, job } = fixture()
+    let probes = 0
+    try {
+      await expect(executeAudit(job, { stateDir: state, milestone: async () => { throw Error('delivery unavailable') }, probe: async n => { probes++; return result(n) } })).rejects.toThrow('delivery unavailable')
+      expect(probes).toBe(0)
+      expect(existsSync(join(state, 'security-audits', job.id, 'journal.json'))).toBe(false)
+    } finally { store.close() }
+  })
+  test('legacy complete report is retained but legacy partial stages cannot be renumbered or replayed', async () => {
+    const { state, store, job } = fixture()
+    try {
+      const complete = await executeSecurityAudit(job, { stateDir: state, model, tool: async n => result(n) })
+      const path = join(state, 'security-audits', job.id, 'journal.json')
+      const journal = JSON.parse(readFileSync(path, 'utf8')); journal.version = 1
+      writeFileSync(path, JSON.stringify(journal), { mode: 0o600 })
+      expect(await executeAudit(job, { stateDir: state })).toEqual(complete)
+      expect(renderAuditReport({ ...journal, steps: [result(7)] })).toContain('CodeQL')
+      journal.result = null; journal.reportDigest = null
+      writeFileSync(path, JSON.stringify(journal), { mode: 0o600 })
+      let probes = 0
+      await expect(executeAudit(job, { stateDir: state, milestone: async () => {}, probe: async n => { probes++; return result(n) } })).rejects.toThrow('旧13工程')
+      expect(probes).toBe(0)
+      expect(JSON.parse(readFileSync(path, 'utf8')).version).toBe(1)
+    } finally { store.close() }
+  })
+})
+
+test('Semgrep CE output or absent cross-file evidence cannot satisfy the Code requirement', () => {
+  const valid = { engine_requested: 'PRO', paths: { scanned: ['hello.js'] }, results: [], interfile_languages_used: ['js'] }
+  expect(() => assertSemgrepCodeResult(valid)).not.toThrow()
+  for (const data of [{}, { ...valid, engine_requested: 'OSS' }, { ...valid, paths: { scanned: [] } }, { ...valid, interfile_languages_used: [] }])
+    expect(() => assertSemgrepCodeResult(data)).toThrow('CE fallback')
+})
+
+test('report availability runs a real render and private write/read roundtrip', async () => {
+  const { root, repo, state, store, job } = fixture()
+  try {
+    const r = await runAuditProbe(12, { root, source: repo, repo, stateDir: state, jobId: job.id, settings: { activeScan: false, codeqlLicensed: false, images: [] } })
+    expect(r.status).toBe('completed')
+    expect(r.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
+    expect(r.findings).toEqual([])
+    expect(readdirSync(root).filter(name => name.startsWith('probe-'))).toEqual([])
+  } finally { store.close() }
+})
+
+test('Socket preflight reuses a confirmed scan and never retries an ambiguous creation', async () => {
+  const { root, repo, state, store, job } = fixture()
+  const token = 'sktsec_synthetic_fixture_not_real'
+  const bin = join(state, 'security-audit-tools/socket/node_modules/.bin')
+  mkdirSync(bin, { recursive: true, mode: 0o700 })
+  writeFileSync(join(state, 'security-audit-socket-token'), token, { mode: 0o600 })
+  // A fixture executable exercises the real authenticated command adapter and receipt handling.
+  writeFileSync(join(bin, 'socket'), `#!/usr/bin/env node
+const a=process.argv.slice(2);if(a[0]==='--version'){console.log('fixture');process.exit(0)}
+if(a[1]==='create'){console.log(JSON.stringify({ok:true,data:{id:'fixture-scan'}}));process.exit(0)}
+if(a[1]==='report'&&a[2]==='fixture-scan'){console.log(JSON.stringify({ok:true,data:{healthy:true,scanId:'fixture-scan',alerts:{}}}));process.exit(0)}
+process.exit(2);
+`, { mode: 0o700 })
+  const receipt = join(root, 'receipt.json')
+  const ctx: AuditToolContext = { root, source: repo, repo, stateDir: state, jobId: job.id, socketReceiptPath: receipt, settings: { socketOrg: 'fixture', activeScan: false, codeqlLicensed: false, images: [] } }
+  try {
+    expect((await runAuditTool(9, ctx)).status).toBe('completed')
+    expect(JSON.parse(readFileSync(receipt, 'utf8'))).toEqual({ org: 'fixture', scanId: 'fixture-scan' })
+    // Make creation fail. A resume must issue only report, so it still succeeds.
+    writeFileSync(join(bin, 'socket'), readFileSync(join(bin, 'socket'), 'utf8').replace("if(a[1]==='create'){", "if(a[1]==='create'){process.exit(91);"), { mode: 0o700 })
+    expect((await runAuditTool(9, ctx)).status).toBe('completed')
+    writeFileSync(receipt, JSON.stringify({ org: 'fixture', scanId: null }), { mode: 0o600 })
+    const ambiguous = await runAuditTool(9, ctx)
+    expect(ambiguous.status).toBe('unavailable')
+    expect(ambiguous.note).toContain('not replayed')
+    expect(JSON.stringify(ambiguous)).not.toContain(token)
+  } finally { store.close() }
+})
+
+test('Semgrep adapter requires authenticated policy and Pro output, without disclosing token diagnostics', async () => {
+  const { root, repo, state, store, job } = fixture()
+  const token = 'synthetic_semgrep_not_a_real_token'
+  const bin = join(state, 'security-audit-tools/semgrep/bin')
+  mkdirSync(bin, { recursive: true, mode: 0o700 })
+  writeFileSync(join(state, 'security-audit-semgrep-token'), token, { mode: 0o600 })
+  const executable = join(bin, 'semgrep')
+  const fixtureCLI = (kind: string) => `#!/usr/bin/env node
+const a=process.argv.slice(2);if(a[0]==='--version'){console.log('fixture');process.exit(0)}
+if(a[0]==='install-semgrep-pro'){process.exit(process.env.SEMGREP_APP_TOKEN?0:9)}
+if(a[0]!=='scan'||!a.includes('--pro')||!a.includes('policy')||process.env.SEMGREP_REPO_NAME!=='fixture/repo')process.exit(9);
+console.error(process.env.SEMGREP_APP_TOKEN);
+console.log(JSON.stringify({engine_requested:${JSON.stringify(kind)},paths:{scanned:['app.ts']},interfile_languages_used:['js'],results:[],errors:[]}));
+`
+  const ctx: AuditToolContext = { root, source: repo, repo, stateDir: state, jobId: job.id, settings: { semgrepRepo: 'fixture/repo', activeScan: false, codeqlLicensed: false, images: [] } }
+  try {
+    writeFileSync(executable, fixtureCLI('PRO'), { mode: 0o700 })
+    const valid = await runAuditTool(6, ctx)
+    expect(valid.status).toBe('completed')
+    expect(JSON.stringify(valid)).not.toContain(token)
+    writeFileSync(executable, fixtureCLI('OSS'), { mode: 0o700 })
+    const fallback = await runAuditTool(6, ctx)
+    expect(fallback.status).toBe('unavailable')
+    expect(JSON.stringify(fallback)).not.toContain(token)
+  } finally { store.close() }
+})
+
+test('a readiness-only response cannot shadow the previous completed audit report', async () => {
+  const { state, store, job } = fixture()
+  try {
+    const done = await executeSecurityAudit(job, { stateDir: state, model, tool: async n => result(n) })
+    store.claimNext('fixture'); store.complete(job.id, done.sessionId, done.result)
+    const blockedJob = store.enqueue({ chatId: job.chatId, threadTs: job.threadTs, messageId: '1.3', userId: job.userId, repoPath: job.repoPath, task: 'check again', workflow: 'security-audit' }).job
+    const blocked = await executeSecurityAudit(blockedJob, { stateDir: state, probe: async n => ({ ...result(n), status: 'unavailable', note: 'fixture missing' }) })
+    store.claimNext('fixture'); store.complete(blockedJob.id, blocked.sessionId, blocked.result)
+    const followup = store.enqueue({ chatId: job.chatId, threadTs: job.threadTs, messageId: '1.4', userId: job.userId, repoPath: job.repoPath, task: 'fix report', workflow: 'work' }).job
+    expect(auditHasReadinessOnlyResult(state, blockedJob.id)).toBe(true)
+    const previous = store.previousSecurityAudit(followup, id => !auditHasReadinessOnlyResult(state, id))
+    expect(previous).toBe(job.id)
+    expect(readFileSync(copyAuditReportForFollowup(followup, state, previous!), 'utf8')).toContain('セキュリティ検査レポート')
+    writeFileSync(join(state, 'security-audits', blockedJob.id, 'journal.json'), 'invalid', { mode: 0o600 })
+    expect(auditHasReadinessOnlyResult(state, blockedJob.id)).toBe(false)
+  } finally { store.close() }
+})
+
+test('Trivy readiness scans a fixed sample image and only reads metadata for actual targets', async () => {
+  const { root, repo, state, store, job } = fixture()
+  const previousPath = process.env.PATH, previousHost = process.env.DOCKER_HOST, previousContext = process.env.DOCKER_CONTEXT
+  try {
+    const bin = join(root, 'bin'), tools = join(state, 'security-audit-tools/trivy-0.69.3')
+    mkdirSync(bin, { mode: 0o700 }); mkdirSync(tools, { recursive: true, mode: 0o700 })
+    process.env.PATH = `${bin}:${previousPath ?? '/usr/bin:/bin'}`
+    process.env.DOCKER_HOST = `unix://${root}/fixture.sock`; delete process.env.DOCKER_CONTEXT
+    writeFileSync(join(bin, 'docker'), `#!/usr/bin/env node
+if(process.argv[2]==='manifest'&&process.argv[3]==='inspect'){console.log('{"schemaVersion":2}');process.exit(0)}process.exit(99);
+`, { mode: 0o700 })
+    writeFileSync(join(tools, 'trivy'), `#!/usr/bin/env node
+const a=process.argv.slice(2);if(a[0]==='--version'){console.log('Version: 0.69.3');process.exit(0)}
+if(a[0]==='image'&&a.at(-1)!=='busybox:1.37.0'){console.error('actual target scanned prematurely');process.exit(91)}
+console.log(JSON.stringify({SchemaVersion:2,Results:[]}));
+`, { mode: 0o700 })
+    const c: AuditToolContext = { root, source: repo, repo, stateDir: state, jobId: job.id, dockerHost: `unix://${root}/fixture.sock`, settings: { activeScan: false, codeqlLicensed: false, images: ['registry.example/actual:1'] } }
+    const preflight = await runAuditProbe(7, c)
+    expect({status:preflight.status,note:preflight.note}).toEqual({status:'completed',note:'設定確認と小規模な実行確認に成功しました。本コードの検査結果ではありません。'})
+    expect(readdirSync(root).filter(name => name.startsWith('probe-'))).toEqual([])
+    // The full scan still targets the actual configured image.
+    expect((await runAuditTool(7, c)).status).toBe('unavailable')
+    // A host-only image cannot satisfy registry access for the isolated scanner.
+    writeFileSync(join(bin, 'docker'), '#!/bin/sh\nexit 1\n', { mode: 0o700 })
+    const localOnly = await runAuditProbe(7, c)
+    expect(localOnly.status).toBe('unavailable')
+    expect(localOnly.note).toContain('local-only images are not supported')
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath
+    if (previousHost === undefined) delete process.env.DOCKER_HOST; else process.env.DOCKER_HOST = previousHost
+    if (previousContext === undefined) delete process.env.DOCKER_CONTEXT; else process.env.DOCKER_CONTEXT = previousContext
+    store.close()
+  }
+})
+
+test('probe cleanup removes ordinary failures but retains pending process cleanup evidence', async () => {
+  const { root, repo, state, store, job } = fixture()
+  const c: AuditToolContext = { root, source: repo, repo, stateDir: state, jobId: job.id, settings: { activeScan: false, codeqlLicensed: false, images: [] } }
+  try {
+    expect((await runAuditProbe(6, c)).status).toBe('unavailable')
+    expect(readdirSync(root).filter(name => name.startsWith('probe-'))).toEqual([])
+    await expect(runAuditProbe(2, c, async () => { throw new CodexCleanupPendingError('fixture cleanup pending') })).rejects.toBeInstanceOf(CodexCleanupPendingError)
+    expect(readdirSync(root).filter(name => name.startsWith('probe-'))).toHaveLength(1)
+  } finally { store.close() }
 })
