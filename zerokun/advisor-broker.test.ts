@@ -55,6 +55,7 @@ import {
   recoverFifthAdvisorSendOutcome,
   GROK_OAUTH_TIMEOUT_MS,
   GROK_REVIEW_TIMEOUT_MS,
+  grokFailureDiagnostics,
   MAX_ADVISOR_PROMPT_BYTES,
 } from './advisor-broker.ts'
 import { JobStore } from './job-runner.ts'
@@ -1260,8 +1261,8 @@ describe('advisor broker boundaries', () => {
     5_000,
   )
 
-  test('Grokは最低15分の有限予算を持ち起動helperも有限timeoutを持つ', () => {
-    expect(GROK_REVIEW_TIMEOUT_MS).toBe(15 * 60_000)
+  test('Grokは1時間の有限予算を持ち起動helperも有限timeoutを持つ', () => {
+    expect(GROK_REVIEW_TIMEOUT_MS).toBe(60 * 60_000)
     expect(CLAUDE_HELPER_TIMEOUT_MS).toBe(140_000)
     const helper = readFileSync(join(import.meta.dir, 'fifth-advisor.py'), 'utf8')
     const seconds = (name: string) => Number(helper.match(new RegExp(`^${name} = ([0-9]+)$`, 'm'))![1])
@@ -1270,6 +1271,21 @@ describe('advisor broker boundaries', () => {
       + seconds('CLAUDE_PROCESS_SETTLE_TIMEOUT_SECONDS')
     expect(CLAUDE_OPEN_TIMEOUT_MS).toBeGreaterThan(startup * 1_000 + CLAUDE_HELPER_TIMEOUT_MS)
     expect(CLAUDE_OPEN_TIMEOUT_MS).toBeLessThanOrEqual(15 * 60 * 1_000)
+  })
+
+  test('Grokのtimeoutとexit 126を区別して秘密のstderrを保存しない', () => {
+    const input = { exitCode: 126, timedOut: true, forcedCleanup: false,
+      outputTruncated: false, stderr: 'private diagnostic fixture' }
+    const timedOut = grokFailureDiagnostics(input)
+    expect(timedOut).toMatchObject({ exitCode: 126, timedOut: true,
+      timeoutMs: 3_600_000, failure: { advisor: 'grok', cause: 'timeout' } })
+    expect(timedOut.reason).toContain('time limit')
+    expect(JSON.stringify(timedOut)).not.toContain(input.stderr)
+    expect(grokFailureDiagnostics({ ...input, timedOut: false })).toMatchObject({
+      timedOut: false, failure: { advisor: 'grok', cause: 'unknown' },
+    })
+    expect(grokFailureDiagnostics({ ...input, timedOut: false, stderr: '429 rate limit' }))
+      .toMatchObject({ failure: { advisor: 'grok', cause: 'rate-limit' } })
   })
 
   test.skipIf(process.platform === 'win32')(
@@ -4236,6 +4252,11 @@ int main(void) {
         terminationGraceMs: 5_000,
       })
       expect(result.timedOut, JSON.stringify(result)).toBe(true)
+      expect(grokFailureDiagnostics(result)).toMatchObject({
+        timedOut: true, exitCode: result.exitCode,
+        failure: { advisor: 'grok', cause: 'timeout' },
+      })
+      expect(grokReviewerAuthRequired(result)).toBe(false)
       expect(Date.now() - started).toBeLessThan(6_500)
       expect(readFileSync(termFile, 'utf8')).toBe('received\n')
       const pids = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number)

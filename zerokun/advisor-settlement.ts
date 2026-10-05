@@ -3,6 +3,8 @@ import { createHash } from 'crypto'
 import { lstatSync } from 'fs'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import { observeProcessGeneration, readProcessIdentity } from './process-generation.ts'
+import { ADVISOR_SETTLEMENT_TIMEOUT_MS } from './advisor-timeouts.ts'
+export { ADVISOR_SETTLEMENT_TIMEOUT_MS } from './advisor-timeouts.ts'
 
 // A stop request is tied to the exact active claim, never a PID or next round.
 export function requestAdvisorStop(lockPath: string, expectedRaw?: string): void {
@@ -32,8 +34,6 @@ export function watchAdvisorStopRequest(lockPath: string, pollMs = 500): {
   timer.unref()
   return { signal: controller.signal, close: () => clearInterval(timer) }
 }
-
-export const ADVISOR_SETTLEMENT_TIMEOUT_MS = 30 * 60_000
 
 /** A successful parent turn must not reap a still-working reviewer. This is
  * lifecycle draining, not a response quorum: a terminal unavailable outcome
