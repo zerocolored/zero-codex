@@ -2251,6 +2251,8 @@ print('review complete')
     })
     expect(await run()).toEqual([expect.objectContaining({
       authenticationRecoveryAttempted: true,
+      reason: 'fixture recovery failed',
+      failure: { advisor: 'grok', cause: 'auth-recovery' },
     })])
     expect(await run()).toEqual([expect.not.objectContaining({
       authenticationRecoveryAttempted: true,

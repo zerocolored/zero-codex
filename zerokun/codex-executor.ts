@@ -1,4 +1,5 @@
 import { createUsageRecorder } from './task-usage.ts'
+import { GROK_OAUTH_BROWSER_AUTHORIZATION } from './grok-oauth-observation.ts'
 import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCliConfig } from './deployment-cli-runtime.ts'
 import { nativeCliShellEnvironment, NATIVE_CONFIG_ENV_KEYS } from './native-cli-environment.ts'
 import { browserUploadConfirmation, computerUseAppApproval, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
@@ -4048,6 +4049,7 @@ export function buildCodexDeveloperInstructions(
         'configuration failures make that advisor unavailable; they do not require task goal blocked.',
         'Never inspect or invoke Grok, Claude, Herdr, their authentication, helper files, sockets,',
         'or processes directly; zerokun_advisors is the only external-advisor route.',
+        ...(job.writeEnabled && _browserEnabled ? [GROK_OAUTH_BROWSER_AUTHORIZATION] : []),
         'When reporting advisor coverage, use only the returned slotSummary. requested/total means',
         'slots requested, not slots started. Say all three ran or answered only when slotSummary',
         'proves started=3 or responsesObtained=3 respectively. Otherwise report the exact counts',
