@@ -84,12 +84,17 @@ zerochan-access write deny U0123456789
   完全一致の`中止`も同じthread-scoped操作として受け付けます。
 - commit、push、deploy、PR は write 許可だけでは自動実行されず、Slack request が求めた範囲に
   限られます。
-- HOMEのcredential/configはCodexへ公開しません。commitには固定の実行用identityを使い、
-  認証付きGitHub操作はrepository限定broker、Cloud Logging検索は明示project指定の読取専用brokerへ渡します。
+- 書込みprimaryはホストのHOME・XDG設定と既存CLI認証を利用できます。commitには固定の実行用identityを使い、
+  repository限定GitHub brokerや明示project指定の読取専用Cloud Logging brokerも補助経路として利用できます。
   Cloud Loggingのアクセス可否はホストのGoogle Cloud IAMで判断し、repository別の追加許可設定は不要です。
-  ホストの認証が使える限り、scratch HOMEに認証がないことだけではblockしません。
+  CLIの未認証表示だけで本人のログイン不足とせず、実行環境の設定探索先と必要なnative permissionを確認します。
 - 通常cloneに加え、Git自身の登録情報・back pointer・gitlink・`core.worktree`が一致する正規の
   linked worktree/submoduleを利用できます。任意pathを指す偽の`.git` pointerは拒否します。
+
+書込みprimaryから起動するnative Codex子エージェントは親の権限を引き継ぎます。
+roleの`read-only`／`never`指定だけでは、ホストHOME・private stateのOS読取り隔離を保証しません。
+別プロセスで起動するread-only工程・review工程と外部advisorには、それぞれの隔離設定を適用します。
+認証情報本文・bot管理状態・他ジョブの取得、コピー、表示、変更の禁止はnative子にも適用します。
 
 ## Channel policy
 
@@ -135,8 +140,11 @@ zerochan-access write deny U0123456789
   pairing追加とwrite revokeが競合しても古い権限を復活させません。
 - `access.json`、`.env`、SQLite DB は mode 0600、state directory は mode 0700 を使います。
 - Codex 子プロセスには Slack token、GitHub/AWS等の任意環境変数、state path変数を渡しません。
-- HOME/state/shared tempをsandboxでdenyし、repository、当該jobの添付、scratch、outboxだけを
-  pathごとに再許可します。
+- read-only工程ではHOME/state/shared tempをsandboxでdenyし、repository、当該jobの添付、scratch、outboxを
+  pathごとに再許可します。書込みprimaryは通常のホスト読取りを許可し、private stateや他ジョブのOS読取り隔離を保証しません。
+  基本の書込み許可には対象repository・Git metadata、当該jobのscratch/outbox/temp、および通常のOS一時領域を含みます。
+  これを超える追加path・OS認証ストアの利用はCodex標準の承認審査へ渡します。
+  認証情報本文・bot管理状態・他ジョブの取得、コピー、表示、変更は指示で禁止します。
 - 添付ファイルは認可後に gateway が state の `inbox/` へ保存し、そのjobに記録したfileだけを
   Codex profileへread許可します。
 - 成果物 upload は50MBまでで、job専用 `outbox/<job-id>/` 直下の空でないregular fileだけを許可します。

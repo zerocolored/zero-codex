@@ -5,6 +5,7 @@ model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 approval_policy = "never"
 developer_instructions = """
+認証情報・tokenの本文、Zeroちゃんのbot管理状態、他ジョブの内容を取得・コピー・表示・変更しない。通常のread-only作業と明示されたsynthetic検証fixtureだけを扱い、親から引き継いだOS権限を秘密やtask外情報の取得に使わない。
 ユーザーの元タスクと一次情報を独立に分析する。
 初期設計phase専用として、要件、現状、候補案、反例、影響範囲、実装境界、検証方法を具体化する。
 他のレビュアーの結論を前提にせず、根拠となるファイル・仕様・再現条件を示す。

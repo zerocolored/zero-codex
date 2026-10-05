@@ -110,7 +110,7 @@ Slack bot
   操作には明示的な`tabId`が必要です。同じタブはjob間で予約し、Chrome操作も直列化します。
   作業終了時は`release_tab`で予約を解除します。スクリーンショットは画像として受け取り、
   browser toolからhostの任意pathへ保存することはできません。
-  Chrome拡張との接続にはhost側の既存bridgeを使いますが、Codex shellのHOMEはjob scratchへ隔離したままです。
+  Chrome拡張との接続にはhost側の既存bridgeを使いますが、書込みprimaryのCodex shellは通常のHOME・XDG設定探索先を引き継ぎます。read-only段は隔離したままです。
   それ以外の一般MCPは無効のままです。localhost用には
   `verify_local_page`も残し、署名済みGoogle Chromeをowner-onlyの一時profileで起動して、明示したorigin以外の
   HTTP/WebSocketを遮断します。HTTP 2xx、描画後DOMの期待文字列、1280×720 PNG、遮断request数、
@@ -575,15 +575,17 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - Codex 0.149.0+ の named permission profile を使います。書込み許可済みの主実行は、
   通常のhost読取り、対象repositoryへの書込み、OSの一時領域を許可します。
   実行ファイル・SDKの配置先ごとの読取りallowlistは使いません。読取り専用工程は
-  従来のminimal runtimeのままです。Zeroのstate、他アプリのSlack登録領域、Codex設定領域は保護します。
+  従来のminimal runtimeのままです。主担当にはOSの読取り隔離を追加せず、秘密の取得・表示禁止と
+  基底profileでのstate等への書込み制限を維持します。
 - read senderはrepository readのみ、write senderだけrepository・`.git` writeとnetworkを許可し、
-  どちらも `-a never` で対話的な権限昇格を行いません。
+  read-only段は `never`、書込み主担当は `on-request` / `auto_review` でCodex標準の権限審査を使います。
 - host runtimeをSlack経由で書き換えられないよう、Zeroちゃん自身のrepositoryへのwrite jobは拒否します。
-  Codex shellのHOME/TMPDIRはjob scratchへ隔離し、commitには固定の中立identityを使います。
+  書込みprimaryのshellは通常のHOME・XDG設定探索先を使い、TMPDIRはジョブ専用に分離します。read-only段のHOMEはscratchへ隔離し、commitには固定の中立identityを使います。
   GitHub認証はrepository限定brokerへ渡します。書込み許可済み主担当のCloud操作は通常のgcloudを使い、
   SDKと既存Cloud SDK設定だけを追加許可します（認証cache更新のため設定directoryはwrite）。
   主実行のhost読取りにはHOME内の通常設定も含みますが、HOME全体への書込みや認証情報のコピーは行いません。
   このCLI経路は同じshellからoperatorのcredentialを隔離する方式ではありません。
+  HOME・XDG探索先を復元し、設定更新は対象pathの追加許可、OS認証ストアは正規CLIのnative escalationで扱います。
 - 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
   linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。読取り専用工程にはHOMEを公開しません。
   brokerはlogin済み`gh`をcredential helperとして使い、
@@ -601,7 +603,12 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - apps・plugins・hookと一般MCPは無効化し、localhost表示確認用`zerokun_browser`、認証情報を
   隠したGitHub transport用`zerokun_github`、ログ取得用`zerokun_cloud_logging`、およびoperatorが設定済みの検証済みChrome transportだけを
   必要なwrite jobで有効にします。
-  Web検索はwrite許可jobだけに限定し、write jobのcommand networkはproxyを通してSlack関連domainを拒否します。
+  Web検索はwrite許可jobだけに限定します。書込みprimaryのcommand networkはproxyを通し、Zeroちゃん独自のサービス別domain制限は重ねません。
+  read-only／review工程の通信制限と、依頼のないSlack直接送信の禁止は維持します。
+- 書込みprimaryから起動するnative Codex子エージェントは親の権限を引き継ぎます。
+  roleの`read-only`／`never`指定だけでは、ホストHOME・private stateのOS読取り隔離を保証しません。
+  別プロセスで起動するread-only工程・review工程と外部advisorには、それぞれの隔離設定を適用します。
+  認証情報本文・bot管理状態・他ジョブの取得、コピー、表示、変更の禁止はnative子にも適用します。
 - 通常の受付・開始はリアクションのみです。ただし、先行作業による待機通知を送信済みの依頼は、
   実行開始時に同じSlackスレッドへ「作業を開始しました。」を新規投稿します。
   開始通知はジョブ単位で保存し、再開・再起動による重複を防ぎ、通信失敗時は同じ通知IDで再送します。
