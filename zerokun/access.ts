@@ -158,6 +158,41 @@ function addUnique(values: string[], value: string): void {
   if (!values.includes(value)) values.push(value)
 }
 
+/**
+ * 既定allowlistの値はこのrepositoryに置かず、setup実行時に
+ * `ZEROKUN_DEFAULT_ALLOW_FROM` で渡す。workspaceごとに違う値を、
+ * 公開コードへ焼き付けずに済ませるため。
+ */
+export function parseDefaultAllowFrom(raw: string | undefined): string[] {
+  const ids: string[] = []
+  for (const token of (raw ?? '').split(/[,\s]+/)) {
+    if (token === '') continue
+    addUnique(ids, requireUserId(token))
+  }
+  return ids
+}
+
+/**
+ * 既定allowlistをaccess.jsonへ足す。足すだけで、既にある許可もwriteAllowFromも
+ * 触らない。二度実行しても差分が出ないので、setupの再実行で権限が増減しない。
+ */
+export function seedDefaultAllowFrom(
+  raw: string | undefined,
+  path = join(accessStateDir(), 'access.json'),
+): string[] {
+  const ids = parseDefaultAllowFrom(raw)
+  if (ids.length === 0) return []
+  return mutateAccess(access => {
+    const added: string[] = []
+    for (const id of ids) {
+      if (access.allowFrom.includes(id)) continue
+      access.allowFrom.push(id)
+      added.push(id)
+    }
+    return added
+  }, path)
+}
+
 export function approvePairing(
   code: string,
   options: { stateDir?: string; now?: number } = {},
@@ -206,6 +241,7 @@ function usage(): string {
     'usage:',
     '  zerochan-access status',
     '  zerochan-access pair <code>',
+    '  zerochan-access seed-defaults   (ZEROKUN_DEFAULT_ALLOW_FROM を allowFrom へ足す)',
     '  zerochan-access allow|deny <user-id>',
     '  zerochan-access write allow|deny <user-id>',
     '  zerochan-access policy pairing|allowlist|disabled',
@@ -231,6 +267,13 @@ async function runCli(args = process.argv.slice(2)): Promise<void> {
   if (command === 'pair') {
     const result = approvePairing(subcommand ?? '', { stateDir: dir })
     process.stdout.write(`paired ${result.senderId}; write access is still disabled\n`)
+    return
+  }
+  if (command === 'seed-defaults') {
+    const added = seedDefaultAllowFrom(process.env.ZEROKUN_DEFAULT_ALLOW_FROM, path)
+    process.stdout.write(added.length === 0
+      ? 'default allowlist: 追加なし\n'
+      : `default allowlist: ${added.join(', ')}\n`)
     return
   }
   if (command === 'allow' || command === 'deny') {

@@ -629,8 +629,19 @@ fi
 
 # 2. 設定ファイル(既存があれば触らない)
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-existing "$CH/access.json" "$CH/.env"
-[ -f "$CH/access.json" ] || cp "$TPL/access.json.example" "$CH/access.json"
+if [ -f "$CH/access.json" ]; then
+  ACCESS_CREATED=0
+else
+  cp "$TPL/access.json.example" "$CH/access.json"
+  ACCESS_CREATED=1
+fi
 [ ! -f "$CH/access.json" ] || chmod 600 "$CH/access.json"
+# 新しいMacでも決まった人が最初からDMできるように、access.jsonを作った時だけ
+# 既定allowlistを入れる。既存機の権限は触らない。
+if [ "$ACCESS_CREATED" = "1" ] && [ -n "${ZEROKUN_DEFAULT_ALLOW_FROM:-}" ]; then
+  ZEROKUN_STATE_DIR="$CH" bun --config=/dev/null --no-env-file \
+    "$REPO_DIR/zerokun/access.ts" seed-defaults
+fi
 [ -f "$CH/.env" ] || { cp "$TPL/env.example" "$CH/.env"; chmod 600 "$CH/.env"; }
 
 # 3. SQLite直列job runner・Codex executor・watchdog・管理CLI

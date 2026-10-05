@@ -16,6 +16,7 @@ Slack依頼を空のdedup ledgerで再実行しないようにします。
 ```text
 zerochan-access status
 zerochan-access pair <code>
+zerochan-access seed-defaults
 zerochan-access allow|deny <user-id>
 zerochan-access write allow|deny <user-id>
 zerochan-access policy pairing|allowlist|disabled
@@ -62,6 +63,20 @@ zerochan-access deny U0123456789
 
 旧版のchannel allowlistにいた人は、移行時にDMの`allowFrom`へ一度だけ引き継ぎます。
 以後のchannel参加者はDM許可へ自動追加されず、DMはpairingまたはこのコマンドで管理します。
+
+### 新しいMacで最初から許可しておく
+
+毎回pairingし直さずに済ませたい人がいる場合は、setup時に`ZEROKUN_DEFAULT_ALLOW_FROM`で渡します。
+
+```bash
+ZEROKUN_DEFAULT_ALLOW_FROM="U0123456789,U9876543210" bash zerokun/setup.sh
+```
+
+`access.json`を新しく作った時だけ`allowFrom`へ足します。既にあるaccess.jsonは触らないので、
+setupを再実行しても権限は増減しません。`writeAllowFrom`にも波及しません。
+値はrepositoryに置かず、このenv経由で渡します（workspaceごとに違うIDであり、
+公開repositoryへ焼き付ける対象ではないため）。同じ操作は後からでも
+`zerochan-access seed-defaults`（同じenvを読む）または`zerochan-access allow <user-id>`でできます。
 
 ## Repository write（チャンネルは参加者全員、DMだけ個別設定）
 
