@@ -10,6 +10,35 @@ function object(value: unknown): Record<string, unknown> | null {
     ? value as Record<string, unknown> : null
 }
 
+/** The operator permits app access for authorized primary Computer Use jobs.
+ * Match the official app-access request, not audio recording, file transfer,
+ * site access, arbitrary forms, or an Auto-review decision. Native app policy
+ * is checked before this request is emitted and remains authoritative.
+ */
+export function computerUseAppApproval(params: Record<string, unknown>): {
+  threadId: string; turnId: string; appId: string; persist: 'session' | 'always'
+} | null {
+  const schema = object(params.requestedSchema)
+  const meta = object(params._meta)
+  const toolParams = object(meta?.tool_params)
+  if (params.mode !== 'form' || params.serverName !== 'node_repl'
+    || typeof params.threadId !== 'string' || !params.threadId
+    || typeof params.turnId !== 'string' || !params.turnId
+    || !schema || schema.type !== 'object' || !object(schema.properties)
+    || Object.keys(object(schema.properties)!).length !== 0
+    || Object.keys(schema).some(key => !['type', 'properties', 'required', 'additionalProperties'].includes(key))
+    || (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.length !== 0))
+    || meta?.codex_approval_kind !== 'mcp_tool_call' || meta.connector_id !== 'computer-use'
+    || typeof meta.tool_name !== 'string' || !/^[a-z][a-z0-9_]{0,127}$/.test(meta.tool_name)
+    || !toolParams || Object.keys(toolParams).length !== 1
+    || typeof toolParams.app !== 'string' || toolParams.app.length > 255
+    || !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(toolParams.app)
+    || !Array.isArray(meta.persist) || meta.persist.length === 0
+    || meta.persist.some(value => value !== 'session' && value !== 'always')) return null
+  return { threadId: params.threadId, turnId: params.turnId, appId: toolParams.app,
+    persist: meta.persist.includes('always') ? 'always' : 'session' }
+}
+
 /** Only the native browser's empty upload confirmation needs no additional form data. */
 export function browserUploadConfirmation(params: Record<string, unknown>): NativeConfirmation | null {
   const schema = object(params.requestedSchema)

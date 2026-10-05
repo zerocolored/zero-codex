@@ -607,7 +607,8 @@ export class CodexAppServerSession {
       onOutputChunk?(value: Uint8Array): void
       onNotification?(notification: AppServerNotification): void
       onElicitation?(request: { id: number | string; params: Record<string, unknown> },
-        signal: AbortSignal): Promise<'accept' | 'decline' | 'cancel'>
+        signal: AbortSignal): Promise<'accept' | 'decline' | 'cancel'
+          | { action: 'accept'; persist: 'session' | 'always' }>
     } = {},
   ) {
     this.reader = output.getReader()
@@ -992,10 +993,13 @@ export class CodexAppServerSession {
     const previous = this.elicitations.get(id)
     previous?.controller.abort()
     if (previous) this.elicitations.delete(id)
-    const reply = (action: 'accept' | 'decline' | 'cancel') => {
+    const reply = (decision: 'accept' | 'decline' | 'cancel'
+      | { action: 'accept'; persist: 'session' | 'always' }) => {
+      const action = typeof decision === 'string' ? decision : decision.action
       this.input.write(`${JSON.stringify({ id, result: {
         action, content: action === 'accept' ? {} : null,
-        _meta: action === 'cancel' ? { 'zerochan/clientInteractionUnavailable': true } : null,
+        _meta: typeof decision === 'object' ? { persist: decision.persist }
+          : action === 'cancel' ? { 'zerochan/clientInteractionUnavailable': true } : null,
       } })}\n`)
     }
     if (!this.options.onElicitation || previous || this.elicitations.size > 0) {
