@@ -37,6 +37,21 @@ test('startup diagnostics survive cleanup without terminal text or arbitrary err
   })
 })
 
+test('起動準備の失敗箇所とsnapshot終了状態を秘密本文なしで保存する', () => {
+  const options = fixture()
+  const receipt = saveClaudeResponseDiagnostic({ ...options,
+    failure: { stage: 'startup', cause: 'unknown', operation: 'request-directory' },
+    snapshot: { outcome: 'command-failed', exitCode: 7, timedOut: false,
+      forcedCleanup: false, outputTruncated: false },
+  })
+  expect(receipt.status).toBe('saved')
+  expect(JSON.parse(readFileSync(join(options.stateDir, receipt.path!), 'utf8'))).toMatchObject({
+    failure: { operation: 'request-directory' },
+    snapshot: { outcome: 'command-failed', exitCode: 7 },
+    transcript: { available: false, text: '' },
+  })
+})
+
 test('parser reports missing boundaries while accepting complete responses with unfamiliar UI', () => {
   const envelope = [instruction, marker, '回答内容', marker, '❯'].join('\n')
   expect(analyzeClaudeResponse(envelope, marker)).toMatchObject({ code: 'complete', response: '回答内容', markerLines: [1, 3] })
@@ -89,11 +104,12 @@ test('stores terminal content privately with a verifiable receipt, replacing the
 
 test('suppresses credential-bearing output before truncation and redacts common identifying text', () => {
   const options = fixture()
-  for (const secret of ['xoxb-' + 'a'.repeat(30), '-----BEGIN PRIVATE KEY-----\nprivate-body\n-----END PRIVATE KEY-----']) {
+  for (const secret of ['xoxb-' + 'a'.repeat(30), '-----BEGIN PRIVATE KEY-----\nU1lOVEhFVElDX0tFWV9CT0RZ\n-----END PRIVATE KEY-----', 'Bearer %22synthetic-credential-value%22', '-----BEGIN%20PRIVATE%20KEY-----\nU1lOVEhFVElDX0tFWV9CT0RZ\n-----END%20PRIVATE%20KEY-----']) {
     const receipt = saveClaudeResponseDiagnostic({ ...options, transcript: 'あ'.repeat(40000) + secret })
     const content = readFileSync(join(options.stateDir, receipt.path!), 'utf8')
     expect(content).not.toContain(secret)
-    expect(content).not.toContain('private-body')
+    expect(content).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
+    expect(content).not.toContain('synthetic-credential-value')
     expect(JSON.parse(content).transcript.credentialSuppressed).toBe(true)
   }
   const receipt = saveClaudeResponseDiagnostic({ ...options, transcript: 'https://example.invalid/?key=abc name@example.invalid /Users/someone/project' })

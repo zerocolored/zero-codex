@@ -85,16 +85,33 @@ test('一方の回答は他方が保留中でも直ちに保存される', async
   expect(saved).toEqual(['grok', 'claude'])
 })
 
-test('3回失敗しても成功へ変換せず返し、tight loopしない', async () => {
+test('回復するまで3回を超えて再試行し、tight loopしない', async () => {
   let calls = 0
   const waits: number[] = []
   const result = await recoverAdvisorSlot({ advisor: 'grok',
-    run: async () => { calls++; return { adopted: false, containmentVerified: true, reason: '429' } },
+    run: async () => { calls++; return { adopted: calls === 7, containmentVerified: true, reason: '429' } },
     persist: () => {}, wait: async ms => { waits.push(ms) },
   })
-  expect(calls).toBe(3)
-  expect(waits).toEqual([30_000, 60_000])
-  expect(result.adopted).toBe(false)
+  expect(calls).toBe(7)
+  expect(waits).toEqual([30_000, 60_000, 120_000, 240_000, 300_000, 300_000])
+  expect(result.adopted).toBe(true)
+})
+
+test('Grok認証失敗は回復後に同じslotを取得し、明示中止では再試行しない', async () => {
+  let calls = 0
+  const controller = new AbortController()
+  const error = new Error('cancel')
+  await expect(recoverAdvisorSlot({ advisor: 'grok', signal: controller.signal,
+    run: async () => { calls++; return { adopted: false, containmentVerified: true, reason: 'Not signed in' } },
+    persist: () => {}, wait: async () => { controller.abort(error) },
+  })).rejects.toBe(error)
+  expect(calls).toBe(1)
+  calls = 0
+  expect((await recoverAdvisorSlot({ advisor: 'grok',
+    run: async () => ({ adopted: ++calls === 5, containmentVerified: true, reason: 'Not signed in' }),
+    persist: () => {}, wait: async () => {},
+  })).adopted).toBe(true)
+  expect(calls).toBe(5)
 })
 
 
@@ -122,4 +139,17 @@ test('再開時の保存済みClaude送達不明結果も新規起動しない',
   })
   expect(result).toBe(saved)
   expect(calls).toBe(0)
+})
+
+
+test('Grokの認証待ちはbackoff中にも通知でき、中止時は新しい実行を開始しない', async () => {
+  const controller = new AbortController(); let waiting = false; let retried = false
+  await expect(recoverAdvisorSlot({ advisor: 'grok', signal: controller.signal,
+    run: async () => ({ adopted: false, containmentVerified: true,
+      failure: { advisor: 'grok' as const, cause: 'authentication' as const } }),
+    persist: () => {}, onWaiting: () => { waiting = true },
+    beforeRetry: () => { retried = true },
+    wait: async () => { expect(waiting).toBe(true); controller.abort(new Error('cancel')) },
+  })).rejects.toThrow('cancel')
+  expect(retried).toBe(false)
 })

@@ -13,6 +13,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { createHash } from 'crypto'
 import type { JobRecord } from './job-runner.ts'
 import type { HerdrRuntimeIdentity } from './herdr-runtime.ts'
 import {
@@ -32,6 +33,7 @@ import {
   retainFailedHerdrJobMonitor,
   stripTerminalControls,
   watchHerdrJobMonitor,
+  verifyHerdrJobMonitorActive,
   type HerdrJobMonitorControl,
   type HerdrMonitorPane,
   type HerdrMonitorProcessInfo,
@@ -1017,6 +1019,38 @@ describe('Herdr job monitor', () => {
     expect(control.runCalls).toBe(1)
   })
 
+  test('release更新後も記録済みargvと同じviewerを再開・監視・終了まで引き継ぐ', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job()
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    const processInfo = control.process!.foregroundProcesses[0]!
+    processInfo.argv[3] = join(state, 'previous-release', 'herdr-job-monitor-view.ts')
+    const manifestPath = join(state, 'job-monitors', record.id, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    manifest.viewerArgvDigest = createHash('sha256').update(JSON.stringify(processInfo.argv)).digest('hex')
+    writeFileSync(manifestPath, JSON.stringify(manifest) + '\n', { mode: 0o600 })
+
+    const retained = await reconcileHerdrJobMonitors({
+      stateDir: state, runtime: runtime(), getJob: () => ({ status: 'queued' }), control,
+    })
+    expect(retained.retainedJobIds).toEqual([record.id])
+    await verifyHerdrJobMonitorActive({ stateDir: state, runtime: runtime(), jobId: record.id, control })
+    expect(control.createCalls).toBe(1)
+    expect(control.runCalls).toBe(1)
+
+    const recordedArgv = [...processInfo.argv]
+    processInfo.argv.push('--unexpected-change')
+    await expect(verifyHerdrJobMonitorActive({
+      stateDir: state, runtime: runtime(), jobId: record.id, control,
+    })).rejects.toThrow('not uniquely bound')
+    processInfo.argv = recordedArgv
+    await closeHerdrJobMonitor({
+      stateDir: state, runtime: runtime(), jobId: record.id, outcome: 'completed', control,
+    })
+    expect(control.closeCalls).toBe(1)
+  })
+
   test('rate-limit相当のqueued jobはtabを保持し中止確定後だけreconcileで閉じる', async () => {
     const state = fixtureDirectory()
     const control = new FakeControl()
@@ -1063,30 +1097,36 @@ describe('Herdr job monitor', () => {
     expect(existsSync(join(state, 'job-monitors', record.id))).toBe(true)
   })
 
-  test('startupもrequired monitor消失jobを自動terminal化せずfail closedにする', async () => {
-    const state = fixtureDirectory()
-    const control = new FakeControl()
-    const record = job()
+  test('stopped executors and globally absent dead monitor allow failure recovery with logs preserved', async () => {
+    const state = fixtureDirectory(); const control = new FakeControl(); const record = job()
     await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
-    control.tabs.splice(0)
-    control.panes.splice(0)
-    control.generationStatus = 'dead'
+    appendHerdrJobMonitorStatus(state, record.id, 'preserve interrupted work evidence')
+    const feed = readFileSync(join(state, 'job-monitors', record.id, 'status.0.feed'), 'utf8')
+    control.tabs.splice(0); control.panes.splice(0); control.generationStatus = 'dead'
     control.process!.foregroundProcesses = []
-    const recovered: Array<{ jobId: string; status: string }> = []
+    let status: 'running' | 'failed' = 'running'; let recoveries = 0; let retired = false
+    const options = {
+      stateDir: state, runtime: runtime(), getJob: () => ({ status }),
+      listMonitorObligations: () => retired ? [] : [{ id: record.id, status, state: 'required' as const }],
+      recoverMissingBindingAfterExecutorsStopped: () => { status = 'failed'; recoveries++; return 'terminalized' as const },
+      onMonitorRetired: () => { retired = true }, control,
+    }
+    expect((await reconcileHerdrJobMonitors(options)).closed).toBe(1)
+    await reconcileHerdrJobMonitors(options)
+    expect(recoveries).toBe(1); expect(status).toBe('failed'); expect(retired).toBe(true)
+    expect(control.closeCalls).toBe(0); expect(control.createCalls).toBe(1)
+    expect(readFileSync(join(state, 'job-monitors-detached', record.id, 'status.0.feed'), 'utf8')).toBe(feed)
+  })
 
+  test('lost monitor recovery still refuses a callback that leaves the job running', async () => {
+    const state = fixtureDirectory(); const control = new FakeControl(); const record = job()
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    control.tabs.splice(0); control.panes.splice(0); control.generationStatus = 'dead'
+    control.process!.foregroundProcesses = []
     await expect(reconcileHerdrJobMonitors({
-      stateDir: state,
-      runtime: runtime(),
-      getJob: () => ({ status: 'running' }),
-      recoverMissingBindingAfterExecutorsStopped: (jobId, observedStatus) => {
-        recovered.push({ jobId, status: observedStatus })
-        return 'terminalized'
-      },
-      control,
-    })).rejects.toThrow('before its final output was observed')
-
-    expect(recovered).toEqual([])
-    expect(control.closeCalls).toBe(0)
+      stateDir: state, runtime: runtime(), getJob: () => ({ status: 'running' }),
+      recoverMissingBindingAfterExecutorsStopped: () => 'terminalized', control,
+    })).rejects.toThrow('did not terminalize')
     expect(existsSync(join(state, 'job-monitors', record.id))).toBe(true)
   })
 

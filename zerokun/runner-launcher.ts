@@ -144,6 +144,18 @@ try {
   let daemon: ReturnType<typeof Bun.spawn> | undefined
   let daemonIdentity: ProcessIdentity | undefined
   let daemonReceipt: PublishedRunnerLaunchReceipt | undefined
+  let failedLaunchCleanup: { intent: PreparedRunnerLaunchReceipt; runner?: ProcessIdentity } | undefined
+  const retryFailedLaunchCleanup = (): void => {
+    if (!failedLaunchCleanup) return
+    const { intent, runner } = failedLaunchCleanup
+    const receipt = readRunnerLaunchReceipt(stateDir)
+    if (receipt) {
+      if (receipt.intentId !== intent.intentId) throw new Error('failed launch receipt changed before cleanup')
+      if (runner) clearRunnerLaunchReceiptAfterReap(stateDir, receipt, runner)
+      else clearUnspawnedRunnerLaunchIntent(stateDir, intent)
+    }
+    failedLaunchCleanup = undefined
+  }
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined
   let wakeRestartDelay: (() => void) | undefined
   let standbyObservation = ''
@@ -202,6 +214,11 @@ try {
   let firstPidPublished = false
   try {
     while (!shutdownStarted) {
+      try {
+      // Retain proof of our failed/reaped startup across storage failures.
+      // A prepared receipt owned by this live launcher cannot be abandoned
+      // by the generic adoption path below.
+      retryFailedLaunchCleanup()
       // A launcher can be rebuilt around a still-running orphan runner. Do not
       // spawn lock-losing competitors: job-runner validates Codex and Slack
       // credentials before it acquires the daemon lease. Repeated competitors
@@ -368,15 +385,9 @@ try {
         if (daemon) {
           await reapFailedStartup(daemon, daemonIdentity)
         }
-        if (launchIntent) {
-          const receipt = readRunnerLaunchReceipt(stateDir)
-          if (receipt?.intentId === launchIntent.intentId) {
-            if (daemonIdentity) {
-              clearRunnerLaunchReceiptAfterReap(stateDir, receipt, daemonIdentity)
-            } else if (!daemon) {
-              clearUnspawnedRunnerLaunchIntent(stateDir, launchIntent)
-            }
-          }
+        if (launchIntent && (daemonIdentity || !daemon)) {
+          failedLaunchCleanup = { intent: launchIntent, runner: daemonIdentity }
+          retryFailedLaunchCleanup()
         }
         daemon = undefined
         daemonIdentity = undefined
@@ -424,6 +435,15 @@ try {
       ]!
       restartAttempt += 1
       await waitInterruptibly(delayMs)
+      } catch (error) {
+        // In particular ENOSPC while clearing a reaped child's receipt must
+        // not kill the supervisor. Keep the receipt and exact child identity;
+        // the next iteration reconciles them before spawning anything.
+        appendLauncherLog(`runner supervision failed; automatic recovery will retry: ${
+          error instanceof Error ? error.message : String(error)
+        }`)
+        await waitInterruptibly(5_000)
+      }
     }
   } finally {
     if (forceKillTimer) clearTimeout(forceKillTimer)

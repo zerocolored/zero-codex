@@ -580,6 +580,22 @@ describe('native Codex advisor host evidence', () => {
     expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
   })
 
+  test('同一物理子が2回中断後に完成しても元のmarkerとdigestで採択する', () => {
+    const { options, solutionId } = fixture()
+    const solution = options.childResponses.get(solutionId) as { thread: { turns: Array<Record<string, unknown>> } }
+    solution.thread.turns.unshift(
+      { status: 'interrupted', itemsView: 'full', items: [] },
+      { status: 'interrupted', itemsView: 'full', items: [] },
+    )
+    const resolved = resolveNativeAdvisorThreadIds({
+      attemptNonce: options.attemptNonce, parentThreadId: options.parentThreadId,
+      repoPath: options.repoPath, rounds: options.rounds, parentResponse: options.parentResponse,
+      childResponses: options.childResponses,
+    })
+    expect(resolved[0]!.native[0]!.agentId).toBe(solutionId)
+    expect(() => assertNativeAdvisorEvidence({ ...options, rounds: resolved })).not.toThrow()
+  })
+
   test('completed advisorから親rootへのinteracted 1件だけを再委任とみなさない', () => {
     const accepted = fixture()
     const acceptedSolution = accepted.options.childResponses.get(accepted.solutionId) as {
@@ -845,7 +861,7 @@ describe('native Codex advisor host evidence', () => {
     )
   })
 
-  test('interrupted precursorのfinal・再委任・複数precursorを拒否する', () => {
+  test('interrupted precursorのfinal・再委任・過大な履歴を拒否する', () => {
     const interruptedFinal = fixture()
     const finalChild = interruptedFinal.options.childResponses.get(
       interruptedFinal.solutionId,
@@ -877,11 +893,10 @@ describe('native Codex advisor host evidence', () => {
       excessive.solutionId,
     ) as { thread: { turns: Array<Record<string, unknown>> } }
     excessiveChild.thread.turns.unshift(
-      { status: 'interrupted', itemsView: 'full', items: [] },
-      { status: 'interrupted', itemsView: 'full', items: [] },
+      ...Array.from({ length: 128 }, () => ({ status: 'interrupted', itemsView: 'full', items: [] })),
     )
     expect(() => assertNativeAdvisorEvidence(excessive.options)).toThrow(
-      'at most one interrupted precursor',
+      'recovery history bound',
     )
   })
 
@@ -1234,4 +1249,24 @@ describe('native Codex advisor host evidence', () => {
     })
     expect(() => assertNativeAdvisorEvidence(options)).toThrow('delegated')
   })
+})
+
+
+test('新しいround入力と元のGPT回答bindingを履歴照合でも区別する', () => {
+  const { options } = fixture()
+  const round = options.rounds[0]!
+  for (const entry of round.native) {
+    entry.inputRevision = round.inputRevision
+    entry.inputDigest = round.inputDigest
+  }
+  round.inputRevision = 2
+  round.inputDigest = 'b'.repeat(64)
+  expect(() => assertNativeAdvisorEvidence(options)).not.toThrow()
+  expect(resolveNativeAdvisorThreadIds(options)[0]!.native).toEqual(round.native)
+  for (const change of [{ inputRevision: 3 }, { inputDigest: 'c'.repeat(64) }, { inputDigest: undefined }]) {
+    const invalid = structuredClone(options)
+    Object.assign(invalid.rounds[0]!.native[0]!, change)
+    expect(() => assertNativeAdvisorEvidence(invalid)).toThrow()
+    expect(() => resolveNativeAdvisorThreadIds(invalid)).toThrow()
+  }
 })

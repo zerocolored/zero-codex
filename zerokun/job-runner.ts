@@ -1,8 +1,10 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 import { executeSecurityAudit, copyAuditReportForFollowup } from './security-audit.ts'
+import { createSecurityAuditProgress } from './security-audit-progress.ts'
 import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
+import { NativeConfirmationStore, awaitNativeConfirmation } from './native-confirmation.ts'
 import { fleetReplyForDelivery } from './fleet-query.ts'
 import { toSlackMrkdwn } from './slack-mrkdwn.ts'
 import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
@@ -4387,6 +4389,7 @@ export function requireSafeDatabasePath(dbPath: string): void {
 
 export class JobStore {
   private readonly db: Database
+  readonly nativeConfirmations: NativeConfirmationStore
 
   constructor(readonly dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 })
@@ -4438,6 +4441,7 @@ export class JobStore {
       chmodSync(`${dbPath}-wal`, 0o600)
       chmodSync(`${dbPath}-shm`, 0o600)
     } catch {}
+    this.nativeConfirmations = new NativeConfirmationStore(this.db)
     this.migrateLegacyThreadAttachments(dirname(dbPath))
   }
 
@@ -19030,12 +19034,14 @@ async function runCli(): Promise<void> {
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
           if (job.workflow === 'security-audit') {
-            const raw = await executeSecurityAudit(job, {
+            const progress = createSecurityAuditProgress(job, executionContext, mirrorMonitorMessage, log)
+            let raw: JobExecutionResult
+            try { raw = await executeSecurityAudit(job, {
               stateDir: dir, signal: executionController.signal,
               ...executorPidLifecycle,
               cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
-              progress: message => mirrorMonitorMessage(message),
-            })
+              progress: progress.report,
+            }) } finally { progress.close() }
             const auditResult = finalizeSuccessfulExecution(job, raw, dir, log)
             store.ensureExecutionResultStaged(job.id, auditResult.sessionId, auditResult.result)
             return auditResult
@@ -19058,6 +19064,16 @@ async function runCli(): Promise<void> {
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId, executionJob.repoPath),
             onSessionReset: () => store.clearSession(job.id),
+            onNativeConfirmation: (request, signal) => awaitNativeConfirmation({
+              store: store.nativeConfirmations,
+              binding: { ...request, jobId: job.id, epoch: job.controlEpoch },
+              signal,
+              prepareText: text => {
+                const current = store.get(job.id) ?? job
+                return sanitizeExecutionTextForSlack(current, current.sessionId ?? '', text, dir, [], 'progress')
+              },
+              publish: event => executionContext.reportCommentary(event),
+            }),
             liveControls: {
               recordGoalStatus: status => store.recordTaskGoalStatus(job.id, status),
               next: () => store.nextReadyLiveInput(job.id, job.controlEpoch),

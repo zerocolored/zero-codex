@@ -274,6 +274,7 @@ if [[ "$CANDIDATE_SANDBOX" == "1" ]]; then
     zerokun/herdr-job-monitor.test.ts \
     zerokun/native-advisor-evidence.test.ts \
     zerokun/native-advisor-coverage.test.ts \
+    zerokun/native-advisor-recovery.test.ts \
     zerokun/codex-app-server-capability.test.ts \
     zerokun/codex-app-server-session.test.ts \
     zerokun/seatbelt-fingerprint.test.ts \
@@ -390,7 +391,9 @@ for entry in \
   zerokun/herdr-job-monitor-view.ts \
   zerokun/standalone-codex.ts \
   zerokun/codex-executor.ts \
+  zerokun/task-usage-broker.ts \
   zerokun/chrome-session-broker.ts \
+  zerokun/codex-reproduction-broker.ts \
   zerokun/project-layout.ts \
   zerokun/project-selection.ts \
   zerokun/codex-supervisor.ts \

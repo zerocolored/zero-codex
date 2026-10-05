@@ -42,6 +42,54 @@ function input(messageId = '1787000000.000100') {
 }
 
 describe('Slack update request', () => {
+  for (const automatic of [false, true]) {
+    test(`busy updater exit survives the process gate and durable notification replay (${automatic ? 'automatic' : 'manual'})`, async () => {
+      const stateDir = fixtureDir()
+      const updater = join(stateDir, 'deferred-updater.ts')
+      writeFileSync(updater, 'process.exit(75)\n')
+      const request = await requestUpdate({ ...input(), ...(automatic ? { source: 'automatic' as const, chatId: 'U123', threadTs: '' } : {}) }, {
+        stateDir, launchWorker: () => {},
+      })
+      let executions = 0
+      const messages: string[] = []
+      const first = await runUpdateWorker(request.request.id, {
+        stateDir,
+        executeUpdater: async () => {
+          executions++
+          return executeUpdater(updater, join(stateDir, 'child.log'), 5_000, 500, {
+            HOME: stateDir, PATH: process.env.PATH, ZEROKUN_STATE_DIR: stateDir,
+          })
+        },
+        notify: async (_, text) => { if (!automatic) throw new Error('offline'); messages.push(text) }, maxNotifyAttempts: 1,
+      })
+      expect(first).toEqual({ success: false, exitCode: 75, notificationSent: automatic })
+      const outcome = JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8')).outcome
+      expect(outcome).toMatchObject({ success: false, exitCode: 75 })
+      expect(outcome.text).toContain('実行中のタスクがあるため')
+      expect(outcome.text).toContain('タスクはそのまま継続しています')
+      expect(outcome.text).toContain(automatic ? '次回の定期確認で再試行' : '完了後にもう一度更新を依頼')
+      expect(outcome.text).not.toMatch(/失敗|復旧|recover-only|⚠/)
+      const options = { stateDir,
+        executeUpdater: async () => { executions++; return 1 },
+        notify: async (_: unknown, text: string) => { messages.push(text) },
+      }
+      expect(await runUpdateWorker(request.request.id, options)).toEqual({ success: false, exitCode: 75, notificationSent: true })
+      await runUpdateWorker(request.request.id, options)
+      expect(executions).toBe(1)
+      expect(messages).toEqual([outcome.text])
+    })
+  }
+
+  test('automatic genuine failure still reports failure and recovery uncertainty', async () => {
+    const stateDir = fixtureDir(), messages: string[] = []
+    const request = await requestUpdate({ ...input(), source: 'automatic', chatId: 'U123', threadTs: '' }, { stateDir, launchWorker: () => {} })
+    await runUpdateWorker(request.request.id, { stateDir, executeUpdater: async () => 1,
+      notify: async (_, text) => { messages.push(text) } })
+    expect(messages[0]).toContain('自動更新に失敗')
+    expect(messages[0]).toContain('旧版への復旧状況は未確認')
+    expect(messages[0]).not.toContain('見送り')
+  })
+
   test('gate identityを取得できなければupdaterを開始しない', async () => {
     const stateDir = fixtureDir()
     const probe = join(stateDir, 'updater-started')

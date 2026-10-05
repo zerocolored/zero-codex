@@ -1,6 +1,7 @@
 import { existsSync, rmSync } from 'fs'
 import { join } from 'path'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
+import { UpdateDeferredError } from './update-result.ts'
 import { readRuntimeRelease, writeRuntimeRelease, validateRelease, releaseIdentity, RELEASE_JOURNAL, type RuntimeRelease } from './runtime-release.ts'
 
 export interface ReleaseTarget { stateDir: string; projectDir: string; oldRoot: string; running: boolean }
@@ -124,4 +125,12 @@ export function collectIndependentTargets(states: string[], resolve: (state: str
     catch (error) { unavailable.push(`${state.split('/').at(-1)}: ${String(error)}`) }
   }
   return { targets, unavailable }
+}
+
+export function summarizeIndependentResults(
+  results: readonly PromiseSettledResult<unknown>[], unavailable: readonly string[],
+): 'complete' | 'deferred' | 'failed' {
+  const failures = results.filter(result => result.status === 'rejected')
+  if (unavailable.length || failures.some(result => !(result.reason instanceof UpdateDeferredError))) return 'failed'
+  return failures.length ? 'deferred' : 'complete'
 }

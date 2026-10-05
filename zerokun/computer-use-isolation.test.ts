@@ -25,10 +25,41 @@ test('review stages keep plugin isolation disabled', () => {
   expect(computerUsePluginIsolationOverrides({}, overrides)).toEqual(overrides)
 })
 
+const browserFlags = ['features.plugins=true', 'features.computer_use=false',
+  'features.browser_use=true', 'features.browser_use_external=true', 'features.in_app_browser=true']
+
+test('official browser plugins retain operator approval independently of Computer Use', () => {
+  const config = { plugins: {
+    'chrome@openai-bundled': { enabled: true },
+    'browser@openai-bundled': { enabled: true },
+    'computer-use@openai-bundled': { enabled: true },
+    'messages@openai-bundled': { enabled: true },
+  } }
+  const user = { name: { type: 'user' }, config }
+  const result = (flags = browserFlags, layers: unknown[] = [user], cfg = config) =>
+    (Bun.TOML.parse(computerUsePluginIsolationOverrides(cfg, flags, layers)
+      .find(value => value.startsWith('plugins='))!) as any).plugins
+  expect(result()['chrome@openai-bundled'].enabled).toBe(true)
+  expect(result()['browser@openai-bundled'].enabled).toBe(true)
+  expect(result()['computer-use@openai-bundled'].enabled).toBe(false)
+  expect(result()['messages@openai-bundled'].enabled).toBe(false)
+  expect(result(browserFlags, [])['chrome@openai-bundled'].enabled).toBe(false)
+  for (const type of ['project', 'sessionFlags']) {
+    expect(result(browserFlags, [{ name: { type }, config }])['chrome@openai-bundled'].enabled).toBe(false)
+  }
+  expect(result(browserFlags, [user, { name: { type: 'project' }, config }])['chrome@openai-bundled'].enabled).toBe(false)
+  const disabled = { plugins: { ...config.plugins, 'chrome@openai-bundled': { enabled: false } } }
+  expect(result(browserFlags, [user], disabled)['chrome@openai-bundled'].enabled).toBe(false)
+  expect(result(browserFlags, [user, { name: { type: 'system' }, config: disabled }])['chrome@openai-bundled'].enabled).toBe(false)
+  expect(result(browserFlags.map(v => v.replace('browser_use_external=true', 'browser_use_external=false')))['chrome@openai-bundled'].enabled).toBe(false)
+  expect(result(browserFlags.map(v => v.replace('in_app_browser=true', 'in_app_browser=false')))['browser@openai-bundled'].enabled).toBe(false)
+  expect(result(browserFlags.map(v => v.replace('browser_use=true', 'browser_use=false')))['chrome@openai-bundled'].enabled).toBe(false)
+})
+
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, realpathSync } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
-import { installedComputerUseClient, installedComputerUseNodeRepl } from './installed-computer-use.ts'
+import { installedComputerUseClient, installedComputerUseNodeRepl, installedComputerUseNodeServer } from './installed-computer-use.ts'
 
 test('native CUA resolver rejects project overlap and symlink transport replacements', () => {
   const root = mkdtempSync(join(tmpdir(), 'cua-runtime-'))
@@ -80,6 +111,48 @@ test('desktop Node connection requires operator provenance and honors disablemen
   expect(trustedComputerUseNodeTransport({...server,enabled:false}, [layer('user')])).toBe(false)
 })
 
+test('official Node worker has a readable runtime cwd without changing host metadata or explicit cwd', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cua-node-cwd-')))
+  const app = join(root, 'ChatGPT.app'); const project = join(root, 'project')
+  const command = join(app, 'Contents/Resources/cua_node/bin/node_repl')
+  mkdirSync(dirname(command), {recursive:true}); mkdirSync(project)
+  writeFileSync(command, 'fixture', {mode:0o700})
+  const server = {command, enabled:true, args:[], env:{NODE_REPL_TRUSTED_SERVICES:'fixture'}, tools:{js:{approval_mode:'prompt'}}}
+  try {
+    expect(installedComputerUseNodeServer(project, server, app)).toEqual({...server,cwd:dirname(command)})
+    expect(installedComputerUseNodeServer(project, {...server,cwd:null}, app)?.cwd).toBe(dirname(command))
+    expect(installedComputerUseNodeServer(project, {...server,cwd:project}, app)).toEqual({...server,cwd:project})
+    expect(server).not.toHaveProperty('cwd')
+    expect(installedComputerUseNodeServer(root, server, app)).toBeUndefined()
+    rmSync(command); symlinkSync('/usr/bin/true', command)
+    expect(installedComputerUseNodeServer(project, server, app)).toBeUndefined()
+  } finally {rmSync(root,{recursive:true,force:true})}
+})
+
+test('browser service can resolve an existing trust root beneath a denied parent without expanding trust', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'chrome-service-trust-')))
+  const app = join(root, 'ChatGPT.app'), project = join(root, 'project'), home = join(root, 'codex')
+  const command = join(app, 'Contents/Resources/cua_node/bin/node_repl')
+  const service = join(home, 'plugins/browser/1/scripts/browser-service.mjs')
+  mkdirSync(dirname(command), { recursive: true }); mkdirSync(project); mkdirSync(dirname(service), { recursive: true })
+  writeFileSync(command, 'fixture', { mode: 0o700 }); writeFileSync(service, 'fixture')
+  const env = { NODE_REPL_TRUSTED_SERVICES: JSON.stringify({ browser: service }),
+    NODE_REPL_TRUSTED_CODE_PATHS: home, CONNECTION_METADATA: 'preserve' }
+  const server = { command, env, tools: { js: { approval_mode: 'prompt' } } }
+  try {
+    const adapted = installedComputerUseNodeServer(project, server, app) as any
+    expect(adapted.env.NODE_REPL_TRUSTED_CODE_PATHS).toBe(`${home}:${dirname(service)}`)
+    expect(adapted.env.CONNECTION_METADATA).toBe('preserve')
+    expect(adapted.tools).toEqual(server.tools)
+    expect(server.env.NODE_REPL_TRUSTED_CODE_PATHS).toBe(home)
+    expect(installedComputerUseNodeServer(project, { ...server, env: { ...env, NODE_REPL_TRUSTED_CODE_PATHS: app } }, app)?.env)
+      .toEqual({ ...env, NODE_REPL_TRUSTED_CODE_PATHS: app })
+    expect(installedComputerUseNodeServer(home, server, app)?.env).toEqual(env)
+    rmSync(service); symlinkSync(command, service)
+    expect(installedComputerUseNodeServer(project, server, app)?.env).toEqual(env)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test('desktop Node connection preserves host metadata only for authorized primary work', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'cua-node-config-')))
   const server = {enabled:true,command:'/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',args:[],env:{NODE_REPL_TRUSTED_SERVICES:'fixture'},tools:{js:{approval_mode:'prompt'}}}
@@ -91,11 +164,32 @@ test('desktop Node connection preserves host metadata only for authorized primar
     return (Bun.TOML.parse(values.find(v=>v.startsWith('mcp_servers='))!) as any).mcp_servers.node_repl
   }
   try {
-    if (installedComputerUseNodeRepl(root, server.command)) expect(result()).toEqual(server)
+    if (installedComputerUseNodeRepl(root, server.command)) expect(result()).toEqual({...server,cwd:dirname(server.command)})
     expect(result(flags.map(v=>v==='features.computer_use=true'?'features.computer_use=false':v)).enabled).toBe(false)
     expect(result(flags,[...layers,{name:{type:'project'},config}]).enabled).toBe(false)
     expect(result(flags,[]).enabled).toBe(false)
   } finally {rmSync(root,{recursive:true,force:true})}
+})
+
+test('Chrome-only jobs preserve the official Node service and approval metadata', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'chrome-node-config-')))
+  const server = { enabled: true, command: '/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+    args: [], env: { NODE_REPL_TRUSTED_SERVICES: 'fixture' }, tools: { js: { approval_mode: 'prompt' } } }
+  const config = { plugins: { 'chrome@openai-bundled': { enabled: true } }, mcp_servers: { node_repl: server } }
+  const layers = [{ name: { type: 'user' }, config }]
+  const flags = [...browserFlags, 'mcp_servers={}']
+  const result = (overrides = flags, provenance = layers, cfg = config) =>
+    (Bun.TOML.parse(mcpIsolationOverridesForConfig(cfg, overrides, root, provenance)
+      .find(v => v.startsWith('mcp_servers='))!) as any).mcp_servers.node_repl
+  try {
+    if (installedComputerUseNodeRepl(root, server.command)) {
+      expect(result()).toEqual({ ...server, cwd: dirname(server.command) })
+    }
+    expect(result(flags.map(v => v.replace('features.plugins=true', 'features.plugins=false'))).enabled).toBe(false)
+    expect(result(flags, [{ name: { type: 'project' }, config }]).enabled).toBe(false)
+    expect(result(flags, [], config).enabled).toBe(false)
+    expect(result(flags, layers, { ...config, mcp_servers: { node_repl: { ...server, enabled: false } } }).enabled).toBe(false)
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
 test('native CUA transport uses installed client and retains operator disablement', () => {

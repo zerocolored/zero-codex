@@ -28,7 +28,7 @@ test('正常subscriptionだけ許可し非zeroの成功JSONは許可しない', 
 
 test('不完全な実行結果や不正JSONを未ログインと断定しない', () => {
   const base = { exitCode: 1, stdout: '{"loggedIn":false}', stderr: '' }
-  expect(failure({ ...base, timedOut: true }).cause).toBe('timeout')
+  expect(failure({ ...base, timedOut: true }).cause).toBe('auth-check')
   expect(failure({ ...base, forcedCleanup: true }).cause).toBe('auth-check')
   expect(failure({ ...base, outputTruncated: true }).cause).toBe('auth-check')
   expect(failure({ ...base, stdout: 'not JSON' }).cause).toBe('auth-check')
@@ -45,11 +45,11 @@ test('明示された課金・通信・制限だけを分類しraw診断は公�
   expect(failure({ exitCode: 0, stdout: '{"loggedIn":true,"subscriptionType":null}', stderr: '' }).cause).toBe('configuration')
 })
 
-test('認証・課金・設定は1回、通信・確認障害は30秒60秒で再試行する', async () => {
+test('認証・通信・確認障害は回復を待ち、課金・設定不備は明示する', async () => {
   for (const cause of ['authentication', 'billing', 'configuration', 'network', 'auth-check'] as const) {
     let calls = 0
     const waits: number[] = []
-    const retryable = cause === 'network' || cause === 'auth-check'
+    const retryable = cause === 'network' || cause === 'auth-check' || cause === 'authentication'
     const result = await recoverAdvisorSlot({ advisor: 'claude',
       run: async () => ({ adopted: ++calls === 3, containmentVerified: true, promptMayHaveBeenDelivered: false, reason: 'opaque', failure: { advisor: 'claude' as const, cause } }),
       persist: () => {}, wait: async ms => { waits.push(ms) },

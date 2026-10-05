@@ -1,3 +1,4 @@
+import type { NativeAdvisorRegistration } from './native-advisor-recovery.ts'
 import { describe, expect, test } from 'bun:test'
 import { nativeAdvisorMarker, nativeAdvisorResponseDigest, type NativeAdvisorRoundEvidence } from './native-advisor-evidence.ts'
 import { observeNativeAdvisorCoverage } from './native-advisor-coverage.ts'
@@ -37,9 +38,9 @@ function fixture() {
     if (method === 'thread/list') return { data: children, nextCursor: null }
     return { thread: children.find(child => child.id === params.threadId) }
   }
-  const run = (baseline: string[] = [], evidence = rounds) => observeNativeAdvisorCoverage({
+  const run = (baseline: string[] = [], evidence = rounds, registrations?: NativeAdvisorRegistration[]) => observeNativeAdvisorCoverage({
     attemptNonce: nonce, parentThreadId: parent, repoPath: repo,
-    parentChildBaseline: baseline, rounds: evidence, read,
+    parentChildBaseline: baseline, rounds: evidence, registrations, read,
   })
   return { children, failed, calls, run }
 }
@@ -231,4 +232,46 @@ describe('host native advisor execution observations', () => {
     f.children.push({ ...f.children[0]!, id: 'old-thread', turns: [] })
     expect((await f.run())[0]!.state).toBe('response-obtained')
   })
+})
+
+
+function retainedRegistration(): NativeAdvisorRegistration {
+  return { taskName: 'zero_native_' + 'a'.repeat(32), agentPath: '/root/solution',
+    inputRevision: 1, inputDigest: digest, phase: 'investigation', round: 1,
+    perspective: 'solution', model: 'gpt-6-astra', reasoningEffort: 'high',
+    marker: nativeAdvisorMarker(nonce, 1, digest, 'investigation', 1, 'solution'), prompt: 'Synthetic registered request' }
+}
+
+test('job35: 入力更新と再開baselineを跨いだ登録済みGPT回答を取得済みと数える', async () => {
+  const f = fixture()
+  const current = [{ ...rounds[0]!, inputRevision: 2, inputDigest: 'e'.repeat(64),
+    native: [{ perspective: 'solution' as const, attempted: true, adopted: false }] }]
+  const child = f.children[0]!
+  child.turns[0]!.items.shift() // encrypted spawn input is absent
+  const result = await f.run([child.id], current, [retainedRegistration()])
+  expect(result[0]).toMatchObject({ state: 'response-obtained', threadId: child.id,
+    inputRevision: 2, inputDigest: 'e'.repeat(64) })
+  expect(result[0]!.responseDigest).toBe(nativeAdvisorResponseDigest(child.turns[0]!.items[0]!.text!))
+})
+
+test('登録済みの同じ子でも完了回答が無ければ起動済み未回答に留める', async () => {
+  const f = fixture()
+  f.children[0]!.turns[0]!.items = []
+  f.children[0]!.turns[0]!.status = 'inProgress'
+  expect((await f.run(['solution-thread'], rounds, [retainedRegistration()]))[0]!.state)
+    .toBe('started-no-response')
+})
+
+test('登録済みの名前でも別nonce・親・cwd・role・pathは起動済みと数えない', async () => {
+  for (const change of ['nonce', 'parent', 'cwd', 'role', 'path'] as const) {
+    const f = fixture()
+    const registered = retainedRegistration()
+    const child = f.children[0]!
+    if (change === 'nonce') registered.marker = registered.marker.replace(nonce, 'f'.repeat(32))
+    if (change === 'parent') child.parentThreadId = 'foreign-parent'
+    if (change === 'cwd') child.cwd = '/private/tmp'
+    if (change === 'role') child.agentRole = 'worker'
+    if (change === 'path') child.source.subAgent.thread_spawn.agent_path = '/root/foreign'
+    expect((await f.run([child.id], rounds, [registered]))[0]!.state).toBe('start-unconfirmed')
+  }
 })

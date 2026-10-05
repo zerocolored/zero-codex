@@ -3,7 +3,7 @@ import { lstatSync } from 'fs'
 import { join, relative, sep } from 'path'
 import { ensureManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
+import { sanitizeClaudeAnswer } from './claude-answer-file.ts'
 import type { AdvisorFailure } from './advisor-availability.ts'
 
 const STARTUP_CODES = ['prohibited-ui', 'trust-confirmation-failed', 'effort-confirmation-failed',
@@ -12,6 +12,15 @@ export type ClaudeFailureDiagnostic = {
   stage: 'startup' | 'send' | 'acquisition'
   cause: AdvisorFailure['cause']
   startupCode?: typeof STARTUP_CODES[number]
+  operation?: 'runtime' | 'authentication' | 'request-directory' | 'prompt-files' | 'snapshot' | 'open' | 'send' | 'acquisition'
+}
+
+export type ClaudeSnapshotDiagnostic = {
+  outcome: 'completed' | 'command-failed' | 'exception'
+  exitCode?: number | null
+  timedOut?: boolean
+  forcedCleanup?: boolean
+  outputTruncated?: boolean
 }
 
 export function parseClaudeStartupDiagnostic(stdout: string): ClaudeFailureDiagnostic['startupCode'] {
@@ -136,6 +145,7 @@ export function saveClaudeResponseDiagnostic(options: {
   phase?: string
   round?: number
   failure?: ClaudeFailureDiagnostic
+  snapshot?: ClaudeSnapshotDiagnostic
   sendCode?: 'agent_not_ready' | 'agent_blocked' | 'empty_agent_prompt'
     | 'agent_prompt_stalled' | 'agent_prompt_failed' | 'timeout' | 'unknown-error'
   sendStatus?: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed'
@@ -153,8 +163,7 @@ export function saveClaudeResponseDiagnostic(options: {
     const original = options.transcript ?? ''
     // Suppress the whole transcript if a credential is detected, including
     // private-key bodies. Analyze first; redaction must not alter parser verdicts.
-    const suppressed = /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----/.test(original)
-      || containsCredentialMaterial(original)
+    const suppressed = sanitizeClaudeAnswer(original).redacted
     const sanitized = suppressed ? '[transcript withheld: credential material]' : original
       .replace(/https?:\/\/[^\s<>"'`]+/gi, '[url redacted]')
       .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email redacted]')
@@ -175,6 +184,7 @@ export function saveClaudeResponseDiagnostic(options: {
       phase: options.phase,
       round: options.round,
       failure: options.failure,
+      snapshot: options.snapshot,
       sendCode: options.sendCode,
       sendStatus: options.sendStatus,
       reads: options.reads.slice(-3),

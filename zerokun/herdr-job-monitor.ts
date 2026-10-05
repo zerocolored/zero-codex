@@ -1528,9 +1528,16 @@ async function verifyViewer(
   }
   if (!manifest.paneId) throw new Error(`monitor pane is missing for job ${manifest.jobId}`)
   const info = await control.processInfo(manifest.paneId)
+  // A retained viewer keeps running from its original release after an update.
+  // Once activated, bind to the argv and process generation recorded at launch.
+  // Only first activation uses the current release's executable path.
+  const expectedDigest = manifest.viewerArgvDigest ?? argvDigest(expectedArgv)
+  if (manifest.viewerProcess && !sameProcessGeneration(receipt.process, manifest.viewerProcess)) {
+    throw new Error(`monitor viewer process generation changed for job ${manifest.jobId}`)
+  }
   const matching = info.foregroundProcesses.filter(processInfo => (
     processInfo.pid === receipt.process.pid
-    && JSON.stringify(processInfo.argv) === JSON.stringify(expectedArgv)
+    && argvDigest(processInfo.argv) === expectedDigest
     && realpathSync(processInfo.cwd) === directory
   ))
   if (info.paneId !== manifest.paneId
@@ -2504,7 +2511,8 @@ export async function reconcileHerdrJobMonitors(input: {
           closed += 1
           continue
         }
-        if (obligation?.state !== 'preparing') {
+        if (obligation?.state !== 'preparing'
+          && status !== 'running' && status !== 'queued') {
           throw new HerdrJobMonitorPendingError(
             `required monitor binding disappeared before its final output was observed for ${name}`,
           )
@@ -2516,7 +2524,17 @@ export async function reconcileHerdrJobMonitors(input: {
             `staged execution remains blocked after losing its Herdr monitor: ${name}`,
           )
         }
-        removeClosedMonitorDirectory(stateDir, directory)
+        if (disposition === 'terminalized') {
+          // The work cannot be safely replayed, but a dead display must not
+          // block every later job/update. Preserve all feeds and receipts.
+          if (!archiveStoppedHerdrMonitor({
+            stateDir, jobId: name, status: input.getJob(name)?.status ?? 'failed',
+            processStatus: process => control.processGenerationStatus(process),
+          })) throw new HerdrJobMonitorPendingError(`could not archive lost monitor for ${name}`)
+          await input.onMonitorRetired?.(name)
+        } else {
+          removeClosedMonitorDirectory(stateDir, directory)
+        }
         closed += 1
         continue
       }

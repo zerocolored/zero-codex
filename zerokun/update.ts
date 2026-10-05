@@ -101,7 +101,8 @@ import { listRegisteredSlackApps, slackAppRegistryRoot } from './slack-app-regis
 import { coordinateSharedUpdate, type UpdatePeer } from './shared-update.ts'
 import { installUpdateRequestRuntime } from './update-runtime.ts'
 import { readRuntimeRelease, runtimeRootForState, validateRelease, installLegacyCommands, type RuntimeRelease } from './runtime-release.ts'
-import { activateIndependentTargets, collectIndependentTargets, readReleaseTransaction, type ReleaseTarget, type ActivationHooks } from './independent-update.ts'
+import { activateIndependentTargets, collectIndependentTargets, readReleaseTransaction, summarizeIndependentResults, type ReleaseTarget, type ActivationHooks } from './independent-update.ts'
+import { UpdateDeferredError, UPDATE_DEFERRED_EXIT_CODE } from './update-result.ts'
 
 interface Repository {
   label: string
@@ -1336,6 +1337,7 @@ async function waitForRunningJobs(
   timeoutSeconds: number,
   jobRunnerFile: string,
   signal?: AbortSignal,
+  deferIfBusy = false,
 ): Promise<void> {
   const dbPath = resolveZeroJobDatabasePath(stateDir)
   if (!existsSync(dbPath)) {
@@ -1357,15 +1359,13 @@ async function waitForRunningJobs(
       output(`   queue: 実行中0件 / 待機${counts.queued}件（更新中はclaim停止）`)
       return
     }
-    const runnerPid = readPid(join(stateDir, 'job-runner.lock', 'pid'))
-    const runnerCommand = runnerPid
-      ? command(['/bin/ps', '-o', 'command=', '-p', String(runnerPid)])
-      : { exitCode: 1, stdout: '', stderr: '' }
-    const runnerAlive = Boolean(
-      runnerPid && pidIsAlive(runnerPid) && runnerCommand.exitCode === 0
-      && /job-runner\.ts\s+daemon(?:\s|$)/.test(runnerCommand.stdout),
-    )
+    const runner = inspectProcessLock(join(stateDir, 'job-runner.lock', 'pid'), /job-runner\.ts\s+daemon(?:\s|$)/)
+    if (runner.status === 'unknown') fail('job runnerの所有状態を確認できません。復旧処理は実行しません')
+    const runnerAlive = runner.status === 'active'
     if (Date.now() - startedAt >= timeoutSeconds * 1000) {
+      if (deferIfBusy && runnerAlive) {
+        throw new UpdateDeferredError(`実行中のタスク${counts.running}件があるため更新を見送りました`)
+      }
       fail(`実行中job ${counts.running}件があるため更新を停止しました`)
     }
     if (!runnerAlive) {
@@ -3826,6 +3826,15 @@ function publishReleaseCommands(release: RuntimeRelease): void {
   }
 }
 
+/** Drain with the validated release, including recovery fixes absent in the old runtime.
+ * Storage migrations are additive/backwards-compatible, as for activation rollback.
+ */
+export async function drainIndependentTarget(target: ReleaseTarget, candidate: RuntimeRelease,
+  waitSeconds: number, signal?: AbortSignal): Promise<void> {
+  await waitForRunningJobs(target.stateDir, waitSeconds, join(candidate.path, 'zerokun/job-runner.ts'), signal, true)
+  if (target.running) await assertPinnedHerdrRestartReady(target.stateDir)
+}
+
 async function independentMain(argv: string[]): Promise<void> {
   for (const flag of ['--skip-tests', '--no-restart']) {
     if (argv.includes(flag)) fail(`${flag} はテスト環境でのみ使用できます`)
@@ -3892,8 +3901,7 @@ async function independentMain(argv: string[]): Promise<void> {
       },
       drain: async target => {
         output(`${basename(target.stateDir)}: 自分の実行中ジョブの完了待ち。他インスタンスは通常稼働を継続します`)
-        await waitForRunningJobs(target.stateDir, waitSeconds, join(target.oldRoot, 'zerokun/job-runner.ts'), controller.signal)
-        if (target.running) await assertPinnedHerdrRestartReady(target.stateDir)
+        await drainIndependentTarget(target, candidate, waitSeconds, controller.signal)
       },
       stop: target => stopServices(target.stateDir),
       install: (target, root) => installInstanceRuntime(target, root, leases.get(target.stateDir)!),
@@ -3947,6 +3955,9 @@ async function independentMain(argv: string[]): Promise<void> {
       if (guard?.acquired) releaseProcessLock(guardPath, guard.lease)
     }
     const failures = results.filter(result => result.status === 'rejected')
+    if (summarizeIndependentResults(results, unavailable) === 'deferred') {
+      throw new UpdateDeferredError('実行中のタスクがあるため更新を見送りました。他インスタンスの更新結果は保持しました')
+    }
     if (failures.length || unavailable.length) fail(`${failures.length + unavailable.length}件の更新が未完了です。他インスタンスの更新結果は保持しました`)
     output(results.some(result => result.status === 'fulfilled' && result.value === 'recovered')
       ? '復旧が完了しました。復旧したアプリへの新版適用は zerochan update を再実行してください'
@@ -3979,7 +3990,8 @@ if (import.meta.main) {
       : Promise.reject(new Error('--setup-supervisorに追加オプションは指定できません'))
     : independentMain(argv)
   action.catch(error => {
-    process.stderr.write(`❌ ${error instanceof Error ? error.message : String(error)}\n`)
-    process.exitCode = 1
+    const deferred = error instanceof UpdateDeferredError
+    process.stderr.write(`${deferred ? 'ℹ️' : '❌'} ${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = deferred ? UPDATE_DEFERRED_EXIT_CODE : 1
   })
 }

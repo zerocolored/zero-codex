@@ -16,6 +16,7 @@ import {
 import { requireManagedStateRoot } from './managed-path.ts'
 import { containsCredentialMaterial } from './public-output-guard.ts'
 import { githubIssueInput, readGitHubIssue } from './github-issue-read.ts'
+import { githubPushFailure } from './github-push-diagnostic.ts'
 
 const MAX_CONTEXT_BYTES = 256 * 1024
 const MAX_JSON_BYTES = 2 * 1024 * 1024
@@ -601,9 +602,16 @@ export function registerGitHubCredentialTools(
         const pushed = await commands.runGit(selected.root, [
           'push', '--no-verify', '--porcelain', selected.remote.canonicalUrl, `${sha}:${ref}`,
         ], extra.signal)
-        if (pushed.exitCode !== 0 && await inspect() !== sha) {
-          commandFailure(pushed, 'GitHub branch publication')
+        // A nonzero exit can follow a successful remote write. Reconcile once,
+        // retaining the original diagnosis if that read itself fails.
+        let after: string | null
+        try { after = await inspect() } catch {
+          return toolText(githubPushFailure(pushed, 'unconfirmed'), true)
         }
+        if (after !== sha) {
+          return toolText(githubPushFailure(pushed, 'not-confirmed'), true)
+        }
+        return toolText({ complete: true, repository, branch, commitSha: sha })
       }
       if (await inspect() !== sha) throw new Error('GitHub branch publication was not confirmed')
       return toolText({ complete: true, repository, branch, commitSha: sha })

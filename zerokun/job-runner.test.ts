@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
+import { browserScreenshotFromNotification } from './codex-monitor-display.ts'
 import { createHash } from 'crypto'
 import {
   appendFileSync,
@@ -10242,7 +10243,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain(CODEX_WORKER_SAFETY_PROMPT)
     expect(instructions).toContain('This sender has read-only access.')
     expect(instructions).toContain('Follow AGENTS.md')
-    expect(instructions).toContain('Never post to Slack yourself')
+    expect(instructions).toContain('Never deliver this assistant\'s replies, progress, or completion notifications')
     expect(instructions).not.toContain('advisor_round')
     expect(instructions).toContain('Do not run\na host phase protocol')
     expect(instructions).not.toContain(job.id)
@@ -10260,7 +10261,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     store.close()
   })
 
-  test('IAM修復はwrite主体の明示承認範囲だけを許可し、認証とread-only境界を維持する', () => {
+  test('外部操作はCodexへ委ね既存承認を保持しread-only境界を維持する', () => {
     const store = makeStore()
     const repo = fixtureDir('zerokun-iam-policy-')
     git(['init', '-q'], repo)
@@ -10270,17 +10271,57 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     const read = buildCodexDeveloperInstructions(
       { ...job, writeEnabled: false }, '/tmp/job-outbox', false, 'a'.repeat(32),
     )
-    expect(write).toContain('IAM repair is permitted when the current authorized user task explicitly approves')
-    expect(write).toContain('target resource, existing grantee principal, and exact permission or role')
-    expect(write).toContain('do not authorize privilege expansion')
-    expect(write).toContain('Honor an already received explicit approval for that exact repair')
-    expect(write).toContain('etag-aware updates, not a blind policy replacement')
-    expect(write).toContain('additional access beyond the approved scope')
-    expect(write).toContain('permission to repair IAM alone does not authorize those side effects')
-    expect(write).toContain('credential files or tokens, change accounts, run login, or create credential keys')
-    expect(write).toContain('prior assistant claim that all IAM changes are forbidden is not a current policy rule')
-    expect(write).not.toContain('change IAM to bypass a denial')
-    expect(read).not.toContain('IAM repair is permitted')
+    expect(write).toContain('You decide authorization from the user task, approvals already received for that same scope')
+    expect(write).toContain('A resumed task retains its existing authorization')
+    expect(write).toContain('Use installed tools and prepared connection files for authorized work')
+    expect(write).toContain('Do not bypass a denial or infer consent for unrelated or broader effects')
+    expect(write).toContain('For authorized credential acquisition or registration, use an opaque transfer')
+    expect(write).toContain('secret store, application setting, or authorized connection')
+    expect(write).toContain('and purpose authorized by the user task or existing approval for that same scope')
+    expect(write).toContain('Inspect the user-designated credential screen before asking for a separate file or manual copy')
+    expect(write).toContain('A masked/redacted placeholder or password instruction is not a usable credential')
+    expect(write).toContain('field read or transfer-file write alone does not prove credential acquisition')
+    expect(write).toContain('browser redaction and report an observed limitation instead of bypassing it')
+    expect(write).toContain('Never expose credentials in chat, logs, tool arguments')
+    expect(write).toContain('Do not inspect unrelated credentials')
+    expect(write).toContain('Actual user or tool denials, including Browser Use upload refusals, remain binding across resume')
+    expect(write).toContain('A prior assistant refusal based only on obsolete Zero gates is not a current policy rule')
+    expect(write).toContain('This does not dismiss a refusal reporting an actual user or tool denial')
+    expect(write).not.toContain('IAM repair is permitted when')
+    expect(write).not.toContain('Do not construct direct Slack API')
+    expect(read).not.toContain('Use installed tools and prepared connection files')
+    expect(read).not.toContain('or authorized connection')
+    expect(read).toContain('Do not edit files, Git, settings, external services, or data')
+    store.close()
+  })
+
+  test.each([
+    { writeEnabled: true, browserEnabled: true },
+    { writeEnabled: true, browserEnabled: false },
+    { writeEnabled: false, browserEnabled: true },
+    { writeEnabled: false, browserEnabled: false },
+  ])('Chromeの指定認証情報の取得はwriteとbrowserの両方が必要: %j', access => {
+    const store = makeStore()
+    store.enqueue(input(access))
+    const job = store.claimNext('browser-credential-worker')!
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+    const prompt = buildCodexWorkerPrompt(job, snapshot, {
+      attemptNonce: 'a'.repeat(32), artifactDir: '/tmp/job-outbox',
+      advisorEnabled: false, browserEnabled: access.browserEnabled,
+    })
+    if (access.writeEnabled && access.browserEnabled) {
+      expect(prompt).toContain('When the user authorizes obtaining credentials from a designated browser page')
+      expect(prompt).toContain('including password fields')
+      expect(prompt).toContain('An open page alone is not\nauthorization')
+      expect(prompt).toContain('Never read cookies,\nsession storage, authentication callback URLs, or unrelated credentials')
+      expect(prompt).toContain('Preserve the installed browser instructions and actual tool denials')
+      expect(prompt).toContain('never in tool\narguments, returned output, logs, screenshots, or delivered artifacts')
+      expect(prompt).toContain('Remove temporary credentials after use')
+      expect(prompt).not.toContain('session storage, password fields, or authentication callback URLs')
+    } else {
+      expect(prompt).not.toContain('including password fields')
+      if (!access.writeEnabled) expect(prompt).toContain('Access mode: read-only')
+    }
     store.close()
   })
 
@@ -10318,6 +10359,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).toContain('returned slotSummary')
     expect(instructions).toContain('Advisor availability never blocks the primary task.')
     expect(instructions).toContain('Native GPT startup recovery is an exception')
+    expect(instructions).toContain('BEFORE spawning, call advisor_native_prepare')
+    expect(instructions).toContain('list_agents is a live process registry, not the durable answer store')
     expect(instructions).toContain('inspect the spawn result and list_agents')
     expect(instructions).toContain('recover and wait for that exact child instead of spawning a duplicate')
     expect(instructions).not.toContain('overrides best-effort advisor guidance')
@@ -10349,6 +10392,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     })
     expect(advised).toContain('Advisor transport: zerokun_advisors')
     expect(advised).toContain('Base any advisor-count statement only on slotSummary')
+    expect(advised).toContain('Missing attempt-local design records do not block final review')
     expect(advised).not.toContain('zero obtained answers is not a task blocker')
     expect(advised).not.toContain('until all three answers are obtained')
     expect(advised).toContain('Advisor availability never blocks the primary task.')
@@ -12397,6 +12441,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         stateDir: state,
         artifactDir: outbox,
         scratchDir: scratch,
+        reproductionMcp: {
+          command: '/usr/bin/true',
+          args: ['/runtime/codex-reproduction-broker.ts', '/state/context.json', '/state'],
+        },
         advisorMcp: {
           command: '/usr/bin/true',
           args: ['/runtime/advisor-broker.ts', '/state/context.json'],
@@ -12416,6 +12464,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         localVerificationEnabled: true,
         computerUseEnabled: true,
       }).join('\n')
+      const reproduction = (Bun.TOML.parse(overrides) as any).mcp_servers.zerokun_reproduction
+      expect(reproduction.enabled_tools).toEqual(['codex_reproduction_start', 'codex_reproduction_poll'])
+      expect(reproduction.required).toBe(false)
+      expect(reproduction.tool_timeout_sec).toBe(60)
       expect(overrides).toContain('":root"="read"')
       expect(overrides).not.toContain('extends=')
       expect(overrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
@@ -12436,11 +12488,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).toContain('network.enabled=true')
       expect(overrides).toContain('network.allow_local_binding=true')
       expect(overrides).toContain('features.network_proxy=true')
-      for (const slackDomain of [
-        'slack.com', '**.slack.com',
-        'slack-edge.com', '**.slack-edge.com',
-        'slack-msgs.com', '**.slack-msgs.com',
-      ]) expect(overrides).toContain(`${JSON.stringify(slackDomain)}="deny"`)
+      expect((Bun.TOML.parse(overrides) as any).permissions.zerokun_job.network.domains).toEqual({'*': 'allow'})
+      expect(overrides).toContain('approval_policy="on-request"')
+      expect(overrides).toContain('approvals_reviewer="auto_review"')
       // アプリ承認は config から与えられない。bundle_ids も default_app_access も
       // 設定としては通るが実行時の判定に使われない(2026-09-29 実測)。効かない
       // 設定を置くと、許可済みだと誤解したまま原因を探すことになる。
@@ -12478,12 +12528,12 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       }
       expect(overrides).not.toContain('com.openai.sky.CUAService')
       expect(overrides).not.toContain('\"/Applications\"=\"read\"')
-      expect(overrides).toContain('mcp_servers={zerokun_advisors=')
+      expect((Bun.TOML.parse(overrides) as any).mcp_servers.zerokun_advisors.enabled).toBe(true)
       expect(overrides).toContain(',zerokun_browser=')
       expect(overrides).toContain(',zerokun_github=')
       expect(overrides).toContain(',zerokun_cloud_logging=')
       expect(overrides).toContain('enabled_tools=["cloud_logging_read","cloud_run_describe","project_audit_read"]')
-      expect(overrides).toContain('enabled_tools=["advisor_round","advisor_round_poll"]')
+      expect(overrides).toContain('enabled_tools=["advisor_native_prepare","advisor_round","advisor_round_poll","advisor_grok_oauth_respond"]')
       expect(overrides).toContain('enabled_tools=["verify_local_page"]')
       expect(overrides).toContain('enabled_tools=["github_inspect","github_read_issue","github_fetch_branch","github_publish_branch","github_pull_request","github_wait_delivery"]')
       expect(overrides).toContain('tool_timeout_sec=1900')
@@ -12505,6 +12555,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(readGitHubOverrides).toContain('enabled_tools=["github_inspect","github_read_issue"]')
       expect(readGitHubOverrides).not.toContain('github_publish_branch')
       expect(readGitHubOverrides).not.toContain('github_fetch_branch')
+      expect(readGitHubOverrides).toContain('approval_policy="never"')
       expect(readGitHubOverrides).toContain('network.enabled=false')
       const preEditOverrides = buildCodexPermissionOverrides(job, {
         stateDir: state,
@@ -12516,6 +12567,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(preEditOverrides).toContain(`${JSON.stringify(realpathSync(repo))}="read"`)
       expect(preEditOverrides).not.toContain('zerokun_cloud_logging=')
       expect(preEditOverrides).toContain(`${JSON.stringify(realpathSync(join(repo, '.git')))}="read"`)
+      expect(preEditOverrides).toContain('approval_policy="never"')
+      expect(preEditOverrides).not.toContain('approvals_reviewer=')
       expect(preEditOverrides).toContain('network.enabled=false')
       expect(preEditOverrides).toContain('network.allow_local_binding=false')
       expect(preEditOverrides).toContain('web_search="disabled"')
@@ -13220,7 +13273,7 @@ describe('Slack output guard', () => {
     })
   })
 
-  test('hostが取得したbrowser画像をmodel markerなしでも封印対象へ統合する', () => {
+  test.each(['png', 'jpeg'] as const)('hostが取得したbrowser画像をmodel markerなしでも封印対象へ統合する: %s', format => {
     const state = fixtureDir()
     const repo = join(state, 'browser-artifact-repo')
     mkdirSync(repo)
@@ -13232,12 +13285,25 @@ describe('Slack output guard', () => {
     const captureDir = browserCaptureDirForJob(state, job.id)
     mkdirSync(captureDir, { recursive: true, mode: 0o700 })
     chmodSync(captureDir, 0o700)
-    const screenshot = join(captureDir, 'browser-capture.png')
-    const source = Buffer.from(
+    const screenshot = join(captureDir, `browser-capture.${format}`)
+    let source = Buffer.from(
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
       'base64',
     )
-    writeFileSync(screenshot, source, { mode: 0o600 })
+    if (format === 'jpeg') {
+      const inputPng = join(state, 'fixture.png')
+      writeFileSync(inputPng, source)
+      expect(Bun.spawnSync(['/usr/bin/sips', '-s', 'format', 'jpeg', inputPng, '--out', screenshot],
+        { stdout: 'ignore', stderr: 'ignore' }).exitCode).toBe(0)
+      source = readFileSync(screenshot)
+    }
+    const captured = browserScreenshotFromNotification({ method: 'item/completed', sequence: 1,
+      params: { threadId: 'native-thread', turnId: 'native-turn', item: {
+        type: 'mcpToolCall', server: 'node_repl', tool: 'js', status: 'completed',
+        result: { content: [{ type: 'image', mimeType: `image/${format}`, data: source.toString('base64') }] },
+      } } }, 'native-thread', 'native-turn')!
+    expect(captured).toMatchObject({ width: 1, height: 1, format })
+    writeFileSync(screenshot, captured.bytes, { mode: 0o600 })
     const finalized = finalizeSuccessfulExecution(job, {
       sessionId: 'browser-artifact-session',
       result: '公開画面を確認しました。',
@@ -13250,7 +13316,7 @@ describe('Slack output guard', () => {
     const output = extractArtifactPaths(finalized.result)
     expect(output.text).toBe('公開画面を確認しました。')
     expect(output.files).toHaveLength(1)
-    expect(readFileSync(output.files[0]!).subarray(0, 8)).toEqual(source.subarray(0, 8))
+    expect(readFileSync(output.files[0]!).subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     expect(finalized.capturedArtifacts).toBeUndefined()
     store.close()
   })
@@ -14557,12 +14623,16 @@ describe('Slack output guard', () => {
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
       postMessage: async value => { posted.push(value.text) },
     })
-    await notifier.progress(job, '## 確認\n\n**テスト成功**。`**raw**` は保持。')
-    await notifier.completed(job, '**完了**。 [結果](https://example.com/result)')
+    await notifier.progress(job, '## 確認\n\n**テスト成功**。`**raw**` は保持。\n\n| 項目 | 結果 |\n| - | - |\n| API | **成功** |')
+    await notifier.completed(job, '**完了**。 [結果](https://example.com/result)\n\n```md\n| 項目 | 結果 |\n| - | - |\n| UI | **成功** |\n```')
     expect(posted[0]).toContain('*確認*\n\n*テスト成功* 。')
-    expect(posted[0]).toContain('`**raw**`')
+    expect(posted[0]).toContain('**raw**')
+    expect(posted[0]).not.toContain('`')
+    expect(posted[0]).toContain('• 項目: API\n  結果: *成功*')
     expect(posted[1]).toContain('*完了* 。')
     expect(posted[1]).toContain('<https://example.com/result|結果>')
+    expect(posted[1]).toContain('• 項目: UI\n  結果: *成功*')
+    expect(posted[1]).not.toContain('`')
     await notifier.status({ id: 'format-status', idempotencyKey: 'format-status', jobId: job.id,
       chatId: job.chatId, threadTs: job.threadTs, kind: 'accepted', attempts: 0,
       payload: '**受付済み**',

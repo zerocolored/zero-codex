@@ -709,7 +709,7 @@ describe('process lock contention states', () => {
     const leader = Bun.spawn([
       '/bin/bash',
       '-c',
-      'sleep 30 & printf "%s\\n" "$!" > "$1"; wait',
+      'sleep 30 & printf "%s\\n" "$!" > "$1.pending"; /bin/mv "$1.pending" "$1"; wait',
       'zerokun-group-leader',
       childPidFile,
     ], { detached: true })
@@ -840,7 +840,7 @@ describe('process lock contention states', () => {
       '/bin/bash',
       '-c',
       '/bin/bash -c "trap \'\' HUP TERM; while :; do sleep 1; done" & '
-        + 'printf "%s\\n" "$!" > "$1"; wait',
+        + 'printf "%s\\n" "$!" > "$1.pending"; /bin/mv "$1.pending" "$1"; wait',
       'zerokun-orphan-group-leader',
       childPidFile,
     ], { detached: true })

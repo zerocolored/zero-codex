@@ -120,3 +120,10 @@ test.each(['result', 'progress', 'delivery'] as const)('不完全なphase別通�
   expect(result).not.toContain('回答を取得しました')
   expect(result).toContain('本文。')
 })
+
+
+test('pane確認timeoutをモデル回答の時間切れと通知しない', () => {
+  const failure = classifyAdvisorFailure('claude', 'Error: Herdr current pane verification timed out: ')
+  expect(failure.cause).toBe('connection')
+  expect(advisorFailureMessage(failure)).not.toContain('回答取得が制限時間を超えました')
+})

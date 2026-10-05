@@ -3,6 +3,9 @@ import { join } from 'path'
 import { realpathSync } from 'fs'
 import { readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 
+// Keep this wire result in a companion already copied by older installers.
+export const UPDATE_DEFERRED_EXIT_CODE = 75
+
 /** The frozen request worker can outlive a gateway from the legacy checkout. */
 export function resolveUpdateController(fallback: string, home = homedir()): string {
   const registry = join(realpathSync(home), '.codex', 'zerochan-apps')

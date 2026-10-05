@@ -69,6 +69,32 @@ dialogで許可します。誤って拒否した場合は`tccutil reset AppleEve
 
 解除時は管理者が今回追加した拡張IDだけをpolicyから取り除きます。他の拡張の登録を消さないでください。
 
+Zeroちゃんのブラウザ操作では、利用者設定で有効な公式ChromeプラグインとChatGPT拡張を優先します。
+Go Chrome MCPは別の拡張で、接続やサイト権限も別です。片方のエラーから、もう片方も利用不能とは判断しません。
+書込みを許可されたprimary実行は`approval_policy="on-request"`と
+`approvals_reviewer="auto_review"`で、対象の承認要求をCodex標準の自動審査へ渡します。
+Zeroちゃんでサービス別の許可リストを追加したり、承認要求へ自動でacceptを返したりはしません。
+primaryにはZeroちゃん独自のサービス別domain制限を重ねません。
+Codexの通信プロキシは、無関係なローカルsocketへのアクセス隔離にも必要なため維持します。
+アップロード・デプロイ・認証情報の利用も、依頼範囲と既に受領した承認を基にCodexが判断します。
+再開時に同じ承認を取り直したり、実際に出ていない許可画面を待ったりしません。
+ホストのSlack認証情報、管理状態、他ジョブの領域は引き続き隔離します。
+準備・読取り専用工程とadvisorは従来どおり`never`を使います。
+管理者の制約、Codexの拒否、本人操作が必要な承認は自動審査でも残ります。
+Browser Useのファイルアップロードで、追加入力のない本人確認が届いた場合は、
+Zeroちゃんが同じSlackスレッドに送信先と確認番号を表示します。依頼したご本人が
+`今回だけ許可 <確認番号>`または`キャンセル <確認番号>`を返信すると、
+待機中の同じ確認へ回答し、Codexは同じ処理を続けます。常時許可にはしません。
+別人・別スレッド・終了済み処理への返信や、通常の「続けて」は承認になりません。
+送信先が非公開情報として伏せられる場合や、それ以外のフォーム入力・URL形式の確認には、
+未回答を表す`cancel`を返して接続を維持します。
+この未対応による中断は本人の拒否ではありません。Codexが要求内容と利用できない機能を説明します。
+根拠: [Codex Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)。
+
+Computer Useのアプリ承認も別に扱います。Slackからの無人実行は承認ダイアログを表示しないため、
+`Computer Use was not approved`が返っても「許可画面が出るまで待つ」とは案内しません。
+失敗した経路と実際のエラーを確認し、既に許可された経路で続行できるかを調べます。
+
 ### go-chrome-mcp
 
 実Chromeを操作するMCP([ernie1358/go-chrome-mcp](https://github.com/ernie1358/go-chrome-mcp))を
@@ -107,6 +133,18 @@ GitHub transportだけを担当します。
 Primary Codexのmodelは`gpt-6-astra`、reasoning effortは`low`としてrelease codeに固定されています。
 利用者のCodex設定、shell環境、state内`.env`を揃える必要はなく、どのMacでも同じ値で起動します。
 Grok、Claude、review用Codexの選択には`AGENTS.md`のadvisor契約が別途適用されます。
+
+GUI初期設計では、primary Codexが`advisor_round`の`uiProposal`へ比較する画面状態と
+Beforeの情報を渡し、Claude Fable 5.1がUIデザイン・frontend-only sample・After PNGを作成します。
+hostがrepositoryとagent設定の外にinput／prototype／evidence／runtimeを作り、
+この初期設計だけにsample作成と導入済みbrowserによるloopback previewを許可します。
+通常の調査・最終レビューはread-onlyのままです。
+
+Afterはhostがdecode・再encodeしてjob outboxへ保存し、advisor結果の`claude.uiArtifacts`に
+生成者、sampleの場所、画像の場所とdigestを返します。primaryは画像の内容と比較条件を確認し、
+既存のBefore／After添付・ユーザー承認へ進みます。製品への実装はその承認後です。
+Fableや撮影環境が利用不能な場合は理由と生成者を明記し、適用されるAGENTSのfallbackに従います。
+試作rootは判断まで保持し、作業終了時に記録したdevice／inodeとowned processの終了を確認して片付けます。
 
 次の本人操作や情報指定だけは、必要な場合にユーザーへ依頼します。Slack App作成そのものは含みません。
 
@@ -175,10 +213,16 @@ bootstrapはApple Command Line Tools、Homebrew、Git、GitHub CLI、Bun、tmux�
 codex login
 grok login
 # Herdrの一時paneで claude を起動し、subscription loginを完了して終了する
-gh auth login --hostname github.com --git-protocol https --web
+gh auth login --hostname github.com --git-protocol https --web --scopes workflow
 ```
 
-これは初回セットアップ用です。稼働後にGrok 1.0.5が既知の未認証応答だけを返した場合は、
+GitHub Actionsのworkflowを変更してpushするには、通常の`repo`に加えて`workflow` scopeが必要です。
+既存ログインに不足している場合は、ホストの可視Terminalで
+`gh auth refresh --hostname github.com --scopes workflow`を実行し、本人が認証を完了します。
+Zeroちゃんはpushの明示的なworkflow権限拒否を区別して報告します。権限の自動拡大や、
+workflow変更の削除、同じ失敗の無条件再送は行いません。
+
+これは初回セットアップ用です。稼働後にGrokが既知の未認証応答だけを返した場合は、
 ZeroちゃんがmacOSの固定OAuth helperをphase内で1回だけ試します。復旧できない場合もGrok枠だけを
 利用不能として扱い、primary Codexのtaskは継続します。rate limit、quota、network障害ではOAuthを
 起動しません。
@@ -188,6 +232,11 @@ ZeroちゃんがmacOSの固定OAuth helperをphase内で1回だけ試します�
 既存の認証情報を保持します。反映後の中断では新しい認証情報が残る場合があります。
 並行する手動loginを完全に排他できないため、自動復旧中に別途`grok login`を実行しないでください。
 OAuthの旧32文字・UUID形式のstateと通常のANSI表示に対応しています。
+再認証中のbrowser確認はadvisorのpollからprimary Codexへ引き継ぎます。公式Chrome連携で
+今回増えたtabが1つなら追加openを省略し、0個のときだけhelperが開きます。
+primaryは一意な公式認可画面の「Authorize／許可」を確認し、必要な場合だけ1回操作します。
+Grok終了後もtab identityの最終確認を受けるまで認証情報を確定しません。
+helperとbrokerの間で渡すのは固定応答だけで、URL・credential・画面本文を渡しません。
 このhelperはZeroちゃん専用の同梱物です。codex-configのAGENTS.mdやhelperだけを更新しても
 置き換わらないため、Zeroちゃん側の修正版は`zerochan update`で配備してください。
 
@@ -334,13 +383,29 @@ zerochan update
 このMac全体の自動更新を無効化できます。再び有効にする場合は `zerochan auto-update on`。
 設定変更は再起動不要です。完了・失敗だけを登録済みユーザーへDM（未登録なら設定済みチャンネル）で通知します。
 
+ブラウザ連携の設定はgatewayが1分ごとに確認します。Codex更新などで設定が変わった場合は、
+公式app-serverのMCP設定再読み込みを実行し、常駐プロセスに旧設定が残るのを防ぎます。
+初回確認と変更時だけ実行し、複数のZeroちゃんで重複しないよう共有記録を使います。
+ログイン情報やブラウザのキャッシュは削除しません。確認失敗時も通常作業を続け、
+10分から最大1時間の間隔を空けて再試行します。app-serverを停止・再起動する処理ではありません。
+
 `origin/main`の候補版を検証し、fast-forward、setup、gateway／runnerの再起動まで自動で行います。
 正常終了後に`zerochan stop`／`zerochan start`を追加実行する必要はありません。逆に、stop／startだけでは
 checkoutの版は変わらないため、更新の代わりにはなりません。
 
 Claudeの回答取得を調べる場合は、state directory（既定 `~/.codex/zerokun`）の
 `advisor-journal/<job>/<attempt>/revision-*/claude-response-*.json` を確認します。
+GPT・Grok・Claudeのモデル回答は経過時間だけでは打ち切りません。Herdrの接続確認や
+認証状態確認が一時的に失敗した場合は、間隔を空けて回復まで再確認します。
+認証待ちの連携名と理由は進捗取得で返し、同じ待機通知を繰り返さずに案内できます。
+送信済みのClaude依頼は再送せず、同じ依頼の回答回収を続けます。
+Slackで追加メッセージを受けた場合も、開始済みの外部レビューを回収してから処理を切り替えます。
+そのため追加メッセージへの回答がレビュー完了を待つ場合があります。明示的な中止は待機中でも受け付けます。
+本人ログイン・MFA・課金・アカウントや権限の変更を再試行処理が勝手に行うことはありません。
+通信1回の制限時間と、終了時の有限な後片付けは維持します。
 長文回答は専用の一時ファイルへ保存し、完全な本文・境界・SHA-256を検証します。
+レビュー本文に認証情報らしい表現があっても回答全体は破棄せず、該当部分だけを伏せて
+保存・採択します。秘密鍵は本文ごと伏せ、元ファイルの検証値と伏せた回答の検証値を区別します。
 その依頼専用の保存directoryをClaudeの作業領域として明示し、作業フォルダ外へのアクセス確認で
 出力だけが止まることを防ぎます。他のdirectoryやユーザー全体の権限設定は変更しません。
 長い依頼も同じ専用directoryの `instruction.md` に保存し、その指示を実行する短い依頼を

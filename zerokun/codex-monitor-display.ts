@@ -24,13 +24,35 @@ export type BrowserScreenshotImage = {
   bytes: Uint8Array
   width: number
   height: number
+  format: 'png' | 'jpeg'
+}
+
+function jpegDimensions(bytes: Buffer): { width: number; height: number } | null {
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) return null
+  let offset = 2
+  while (offset + 4 <= bytes.length) {
+    if (bytes[offset++] !== 0xff) return null
+    while (bytes[offset] === 0xff) offset += 1
+    const marker = bytes[offset++]
+    if (marker === undefined || marker === 0xda || marker === 0xd9 || offset + 2 > bytes.length) return null
+    const length = bytes.readUInt16BE(offset)
+    if (length < 2 || offset + length > bytes.length) return null
+    // Baseline, extended sequential and progressive frames used by browser
+    // encoders. The trusted decoder validates all pixels before delivery.
+    if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+      if (length < 8) return null
+      return { height: bytes.readUInt16BE(offset + 3), width: bytes.readUInt16BE(offset + 5) }
+    }
+    offset += length
+  }
+  return null
 }
 
 /**
  * Extract a completed public-browser screenshot from the active root turn.
  * The image payload is treated as host transport data, never as model text:
- * only the configured Chrome bridge, exact screenshot tool, canonical base64,
- * PNG header, and bounded dimensions are accepted.
+ * only configured browser tools or official Node REPL image output, canonical
+ * base64, recognized image headers and bounded dimensions are accepted.
  */
 export function browserScreenshotFromNotification(
   notification: AppServerNotification,
@@ -44,7 +66,8 @@ export function browserScreenshotFromNotification(
   if (!item) return null
   let images: Record<string, unknown>[] = []
   if (['mcpToolCall', 'mcp_tool_call'].includes(String(item.type))
-    && item.server === 'go-chrome-mcp' && item.tool === 'screenshot'
+    && ((item.server === 'go-chrome-mcp' && item.tool === 'screenshot')
+      || (item.server === 'node_repl' && item.tool === 'js'))
     && ['completed', 'success', 'succeeded'].includes(String(item.status).toLowerCase())) {
     const result = plainRecord(item.result)
     const content = result?.content
@@ -78,19 +101,25 @@ export function browserScreenshotFromNotification(
   const image = images[0]!
   const mimeType = image.mimeType ?? image.mime_type
   const data = image.data
-  if (mimeType !== 'image/png' || typeof data !== 'string' || data.length < 44
+  if (!['image/png', 'image/jpeg'].includes(String(mimeType)) || typeof data !== 'string' || data.length < 44
     || data.length > Math.ceil(MAX_BROWSER_SCREENSHOT_BYTES / 3) * 4 + 4
     || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return null
   const bytes = Buffer.from(data, 'base64')
   if (bytes.length < 33 || bytes.length > MAX_BROWSER_SCREENSHOT_BYTES
     || bytes.toString('base64') !== data) return null
-  const magic = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
-  if (!bytes.subarray(0, 8).equals(magic) || bytes.readUInt32BE(8) !== 13
-    || bytes.subarray(12, 16).toString('ascii') !== 'IHDR') return null
-  const width = bytes.readUInt32BE(16)
-  const height = bytes.readUInt32BE(20)
+  let dimensions: { width: number; height: number } | null
+  if (mimeType === 'image/jpeg') {
+    dimensions = jpegDimensions(bytes)
+  } else {
+    const magic = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+    if (!bytes.subarray(0, 8).equals(magic) || bytes.readUInt32BE(8) !== 13
+      || bytes.subarray(12, 16).toString('ascii') !== 'IHDR') return null
+    dimensions = { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) }
+  }
+  if (!dimensions) return null
+  const { width, height } = dimensions
   if (width < 1 || height < 1 || width > 16_384 || height > 16_384) return null
-  return { bytes, width, height }
+  return { bytes, width, height, format: mimeType === 'image/jpeg' ? 'jpeg' : 'png' }
 }
 
 function stripUnsafeTerminalText(value: string): string {

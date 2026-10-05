@@ -20,6 +20,9 @@ export type NativeAdvisorJournalEntry = {
   attempted?: boolean
   /** Omitted on legacy v5-v7 evidence, where every native slot was adopted. */
   adopted?: boolean
+  /** Original request binding, retained when the parent input advances. */
+  inputRevision?: number
+  inputDigest?: string
   agentId?: string
   responseDigest?: string
   responseTransportDigest?: string
@@ -46,6 +49,23 @@ export type NativeAdvisorRoundEvidence = {
   phase: 'investigation' | 'design' | 'review'
   round: 1 | 2 | 3
   native: NativeAdvisorJournalEntry[]
+}
+
+/** A retained answer never acquires the parent round's newer input binding. */
+export function nativeAdvisorInputBinding(
+  round: NativeAdvisorRoundEvidence,
+  entry: NativeAdvisorJournalEntry,
+): { inputRevision: number; inputDigest: string } {
+  if (entry.inputRevision === undefined && entry.inputDigest === undefined) {
+    return { inputRevision: round.inputRevision, inputDigest: round.inputDigest }
+  }
+  if (!Number.isSafeInteger(entry.inputRevision) || entry.inputRevision! < 1
+    || entry.inputRevision! > round.inputRevision
+    || typeof entry.inputDigest !== 'string' || !/^[0-9a-f]{64}$/.test(entry.inputDigest)
+    || (entry.inputRevision === round.inputRevision && entry.inputDigest !== round.inputDigest)) {
+    throw new Error('native advisor original input binding is invalid')
+  }
+  return { inputRevision: entry.inputRevision!, inputDigest: entry.inputDigest }
 }
 
 const THREAD_ID = /^[A-Za-z0-9._:-]{1,256}$/
@@ -283,10 +303,11 @@ export function resolveNativeAdvisorThreadIds(options: {
         throw new Error('native advisor journal identities are not fresh and unique')
       }
       logicalAgentIds.add(entry.agentId)
+      const binding = nativeAdvisorInputBinding(evidence, entry)
       const marker = nativeAdvisorMarker(
         options.attemptNonce,
-        evidence.inputRevision,
-        evidence.inputDigest,
+        binding.inputRevision,
+        binding.inputDigest,
         evidence.phase,
         evidence.round,
         entry.perspective,
@@ -726,8 +747,8 @@ function completedFinalResponse(
     expectedParentThreadId,
     inheritedParentTurns,
   )
-  if (ownedTurns.length < 1 || ownedTurns.length > 2) {
-    throw new Error(`${label} must contain one completed turn and at most one interrupted precursor`)
+  if (ownedTurns.length < 1 || ownedTurns.length > 128) {
+    throw new Error(`${label} must contain one completed turn within the recovery history bound`)
   }
   let finalResponse: string | null = null
   let parentInteractionCount = 0
@@ -778,7 +799,7 @@ function completedFinalResponse(
       throw new Error(`${label} delegated to another subagent`)
     }
     if (turn.status === 'interrupted') {
-      if (turnIndex !== 0 || messages.length !== 0 || finalResponse !== null) {
+      if (messages.length !== 0 || finalResponse !== null) {
         throw new Error(`${label} interrupted precursor contains a final response`)
       }
       continue
@@ -980,8 +1001,9 @@ export function assertNativeAdvisorEvidence(options: {
       ).length !== 0) {
         throw new Error(`native advisor ${entry.agentId} delegated to another subagent`)
       }
+      const binding = nativeAdvisorInputBinding(evidence, entry)
       const marker = nativeAdvisorMarker(
-        options.attemptNonce, evidence.inputRevision, evidence.inputDigest,
+        options.attemptNonce, binding.inputRevision, binding.inputDigest,
         evidence.phase, evidence.round, entry.perspective,
       )
       if (nativeAdvisorResponseMatches(finalResponse, marker, entry) === null) {

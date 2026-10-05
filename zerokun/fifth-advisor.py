@@ -240,10 +240,10 @@ def _same_owned_process_identity(
         observed.get(key) == recorded.get(key)
         for key in OWNED_PROCESS_IDENTITY_KEYS
     ) and _valid_claude_invocation(
-        observed.get("argv"), observed.get("argv0"), observed.get("executable"), observed.get("answer_directory")
+        observed.get("argv"), observed.get("argv0"), observed.get("executable"), observed.get("answer_directory"), observed.get("ui_artifacts")
     ) and _valid_claude_invocation(
-        recorded.get("argv"), recorded.get("argv0"), recorded.get("executable"), recorded.get("answer_directory")
-    ) and observed.get("answer_directory") == recorded.get("answer_directory")
+        recorded.get("argv"), recorded.get("argv0"), recorded.get("executable"), recorded.get("answer_directory"), recorded.get("ui_artifacts")
+    ) and observed.get("answer_directory") == recorded.get("answer_directory") and observed.get("ui_artifacts") == recorded.get("ui_artifacts")
 
 
 def _valid_executable_metadata(value: object, *, kinds: Tuple[str, ...]) -> bool:
@@ -306,6 +306,7 @@ def _valid_claude_invocation(
     argv0: object,
     executable: object,
     answer_directory: object = None,
+    ui_artifacts: object = None,
 ) -> bool:
     if not isinstance(argv, list) or not argv or not all(
         isinstance(value, str) for value in argv
@@ -336,10 +337,17 @@ def _valid_claude_invocation(
         ):
             return False
         arguments = argv[2:]
-    return _valid_claude_option_arguments(arguments, answer_directory)
+    return _valid_claude_option_arguments(arguments, answer_directory, ui_artifacts)
 
 
-def _valid_claude_option_arguments(arguments: List[str], answer_directory: object = None) -> bool:
+def _valid_claude_option_arguments(arguments: List[str], answer_directory: object = None, ui_artifacts: object = None) -> bool:
+    if ui_artifacts is not None:
+        if not isinstance(ui_artifacts, dict) or not isinstance(ui_artifacts.get("root"), str) or answer_directory is None:
+            return False
+        expected_ui = "--add-dir=" + ui_artifacts["root"]
+        if arguments.count(expected_ui) != 1:
+            return False
+        arguments = [argument for argument in arguments if argument != expected_ui]
     if answer_directory is not None:
         if not isinstance(answer_directory, str) or not os.path.isabs(answer_directory):
             return False
@@ -447,12 +455,14 @@ def _parse_args() -> argparse.Namespace:
         child.add_argument("--request-dir", required=True)
         if command == "open":
             child.add_argument("--answer-file", action="store_true")
+            child.add_argument("--ui-artifacts", action="store_true")
     send = subparsers.add_parser("send")
     send.add_argument("--project-root", required=True)
     send.add_argument("--request-dir", required=True)
     send.add_argument("--owned", action="store_true", required=True)
     send.add_argument("--answer-file", action="store_true",
                       help="allow only the fixed owner-created answer.md output")
+    send.add_argument("--ui-artifacts", action="store_true")
     return parser.parse_args()
 
 
@@ -1402,7 +1412,9 @@ def _write_request_record(
     root_descriptor, root = _physical_git_root(project_root)
     request_descriptor, _request = _request_directory(request_dir, root)
     try:
-        _load_snapshot(request_descriptor, root, root_descriptor)
+        # Ownership is recorded in the intent/workspace receipts. A missing
+        # observational snapshot must not prevent writing those receipts.
+        _audit_metadata(root_descriptor, root, request_descriptor)
         _exclusive_json_record(request_descriptor, name, payload)
     finally:
         os.close(request_descriptor)
@@ -1470,7 +1482,7 @@ def _load_request_record(
     root_descriptor, root = _physical_git_root(project_root)
     request_descriptor, _request = _request_directory(request_dir, root)
     try:
-        _load_snapshot(request_descriptor, root, root_descriptor)
+        _audit_metadata(root_descriptor, root, request_descriptor)
         return _read_request_record(request_descriptor, name)
     finally:
         os.close(request_descriptor)
@@ -2021,7 +2033,7 @@ def _process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
         process
         for process in inventory["processes"]
         if _valid_claude_invocation(
-            process["argv"], process["argv0"], executable, workspace.get("answer_directory")
+            process["argv"], process["argv0"], executable, workspace.get("answer_directory"), workspace.get("ui_artifacts")
         )
     ]
     if len(claude_matches) != 1:
@@ -2040,6 +2052,7 @@ def _process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
         "argv0": matched["argv0"],
         "executable": executable,
         **({"answer_directory": workspace["answer_directory"]} if "answer_directory" in workspace else {}),
+        **({"ui_artifacts": workspace["ui_artifacts"]} if "ui_artifacts" in workspace else {}),
     }
 
 
@@ -2471,6 +2484,11 @@ def _validate_workspace_receipt(
         "terminal_id",
     }
     recorded_keys = frozenset(workspace)
+    if "ui_artifacts" in recorded_keys:
+        ui = workspace["ui_artifacts"]
+        if not isinstance(ui, dict) or not isinstance(ui.get("root"), str) or not os.path.isabs(ui["root"]) or "answer_directory" not in recorded_keys:
+            raise UnsafeRequest("ephemeral UI artifact binding is invalid")
+        recorded_keys = recorded_keys - {"ui_artifacts"}
     if "answer_directory" in recorded_keys:
         answer_directory = workspace["answer_directory"]
         if not isinstance(answer_directory, str) or not os.path.isabs(answer_directory) or ".." in Path(answer_directory).parts:
@@ -2997,9 +3015,10 @@ def _load_cleanup_records(
     Optional[Dict[str, object]],
     Optional[Exception],
 ]:
+    # Intent and workspace receipts establish ownership; the optional metadata
+    # audit must never prevent closing that exact owned workspace.
     request_descriptor, request = _owner_request_directory(request_dir)
     try:
-        snapshot = _read_snapshot_document(request_descriptor)
         intent = _read_request_record(request_descriptor, SESSION_INTENT_NAME)
         workspace = _read_request_record(request_descriptor, WORKSPACE_RECEIPT_NAME)
         _validate_workspace_receipt(intent, workspace)
@@ -3013,12 +3032,9 @@ def _load_cleanup_records(
             or not recorded_root.is_absolute()
             or ".." in recorded_root.parts
             or str(supplied_root) != recorded_root_text
-            or snapshot.get("project_root") != recorded_root_text
-            or snapshot.get("project_root_dev") != intent.get("project_root_dev")
-            or snapshot.get("project_root_ino") != intent.get("project_root_ino")
         ):
             raise UnsafeRequest(
-                "cleanup receipts do not match the protected project snapshot"
+                "cleanup receipts do not match the recorded project identity"
             )
         try:
             request.relative_to(recorded_root)
@@ -3703,7 +3719,6 @@ def _write_provisional_cleanup_record(
 ) -> None:
     request_descriptor, _request = _owner_request_directory(request_dir)
     try:
-        snapshot = _read_snapshot_document(request_descriptor)
         observed_intent = _read_request_record(
             request_descriptor,
             SESSION_INTENT_NAME,
@@ -3711,9 +3726,6 @@ def _write_provisional_cleanup_record(
         _validate_session_intent(observed_intent)
         if (
             observed_intent != intent
-            or snapshot.get("project_root") != intent.get("project_root")
-            or snapshot.get("project_root_dev") != intent.get("project_root_dev")
-            or snapshot.get("project_root_ino") != intent.get("project_root_ino")
             or _request_entry_exists(request_descriptor, WORKSPACE_RECEIPT_NAME)
         ):
             raise UnsafeRequest(
@@ -3817,7 +3829,7 @@ def _open_command(args: argparse.Namespace) -> int:
         os.close(root_descriptor)
 
 
-def _claude_start_command(agent_name: str, pane_id: str, answer_directory: Optional[str] = None) -> List[str]:
+def _claude_start_command(agent_name: str, pane_id: str, answer_directory: Optional[str] = None, ui_artifacts: Optional[Dict[str, object]] = None) -> List[str]:
     return [
         "agent",
         "start",
@@ -3831,6 +3843,7 @@ def _claude_start_command(agent_name: str, pane_id: str, answer_directory: Optio
         "--",
         *CLAUDE_ARGUMENTS,
         *(["--add-dir=" + answer_directory] if answer_directory is not None else []),
+        *(["--add-dir=" + str(ui_artifacts["root"])] if ui_artifacts is not None else []),
     ]
 
 
@@ -3920,7 +3933,6 @@ def _recover_provisional_command(args: argparse.Namespace) -> int:
         _discard_staged_records(request_descriptor)
         intent = _read_request_record(request_descriptor, SESSION_INTENT_NAME)
         _validate_session_intent(intent)
-        snapshot = _read_snapshot_document(request_descriptor)
         supplied_root = Path(args.project_root)
         recorded_root = intent.get("project_root")
         if (
@@ -3928,9 +3940,6 @@ def _recover_provisional_command(args: argparse.Namespace) -> int:
             or not supplied_root.is_absolute()
             or ".." in supplied_root.parts
             or str(supplied_root) != recorded_root
-            or snapshot.get("project_root") != recorded_root
-            or snapshot.get("project_root_dev") != intent.get("project_root_dev")
-            or snapshot.get("project_root_ino") != intent.get("project_root_ino")
         ):
             raise UnsafeRequest("provisional cleanup state identity changed")
         try:
@@ -4050,12 +4059,17 @@ def _open_ephemeral_workspace(
     root_metadata: os.stat_result,
 ) -> int:
     answer_directory = None
+    ui_artifacts = None
+    if getattr(args, "ui_artifacts", False) and not getattr(args, "answer_file", False):
+        raise UnsafeRequest("UI artifacts require answer-file transport")
     if getattr(args, "answer_file", False):
         descriptor, request = _request_directory(args.request_dir, root)
         try:
             # Validate the pre-created output without granting arbitrary paths.
             _answer_file_instruction(descriptor, request, "REQUEST_MARKER=" + "0" * 32)
             answer_directory = str(request)
+            if getattr(args, "ui_artifacts", False):
+                ui_artifacts = _ui_artifact_manifest(descriptor, root)
         finally:
             os.close(descriptor)
     caller = _current_pane()
@@ -4148,6 +4162,7 @@ def _open_ephemeral_workspace(
             "pane_id": str(pane_id),
             "terminal_id": str(terminal_id),
             **({"answer_directory": answer_directory} if answer_directory is not None else {}),
+            **({"ui_artifacts": ui_artifacts} if ui_artifacts is not None else {}),
         }
         if (
             workspace_info.get("pane_count") != 1
@@ -4210,7 +4225,7 @@ def _open_ephemeral_workspace(
         )
         start_attempted = True
         started = _run_herdr(
-            _claude_start_command(agent_name, str(pane_id), answer_directory),
+            _claude_start_command(agent_name, str(pane_id), answer_directory, ui_artifacts),
             timeout=CLAUDE_START_PROCESS_TIMEOUT_SECONDS,
         )
         _require_open_root_identity(
@@ -4271,6 +4286,7 @@ def _open_ephemeral_workspace(
                 "argv0": processes["argv0"],
                 "executable": processes["executable"],
                 **({"answer_directory": answer_directory} if answer_directory is not None else {}),
+                **({"ui_artifacts": ui_artifacts} if ui_artifacts is not None else {}),
             },
         )
         # Metadata drift cannot attribute a concurrent primary/other-session
@@ -4564,9 +4580,12 @@ def _owned_target(
     }
     if "answer_directory" in workspace:
         expected_agent_keys.add("answer_directory")
+    if "ui_artifacts" in workspace:
+        expected_agent_keys.add("ui_artifacts")
     if (
         set(agent_receipt) != expected_agent_keys
         or agent_receipt.get("answer_directory") != workspace.get("answer_directory")
+        or agent_receipt.get("ui_artifacts") != workspace.get("ui_artifacts")
         or agent_receipt.get("version") != EPHEMERAL_SESSION_VERSION
         or agent_receipt.get("nonce") != workspace.get("nonce")
         or any(
@@ -4584,6 +4603,7 @@ def _owned_target(
             agent_receipt.get("argv0"),
             agent_receipt.get("executable"),
             workspace.get("answer_directory"),
+            workspace.get("ui_artifacts"),
         )
     ):
         raise UnsafeRequest("ephemeral Claude receipt is invalid")
@@ -4788,7 +4808,28 @@ def _audit_metadata(root_descriptor: int, root: Path, request_descriptor: int) -
         print("warning: protected metadata audit unavailable during Claude lifecycle", file=sys.stderr)
 
 
-def _answer_file_instruction(request_descriptor: int, request: Path, marker: str) -> str:
+def _ui_artifact_manifest(request_descriptor: int, project_root: Path) -> Dict[str, object]:
+    value = _read_request_record(request_descriptor, "ui-artifacts.json")
+    if (set(value) != {"version", "root", "dev", "ino", "port", "width", "height"}
+            or value.get("version") != 1 or value.get("width") != 1280 or value.get("height") != 720
+            or type(value.get("port")) is not int or not 1024 <= value["port"] <= 65535
+            or not isinstance(value.get("root"), str)):
+        raise UnsafeRequest("UI artifact manifest is invalid")
+    root = Path(value["root"])
+    if (not root.is_absolute() or root.resolve() != root or not root.name.startswith("zero-fable-gui-")
+            or root == project_root or project_root in root.parents
+            or any(parent in root.parents for parent in (Path.home() / ".codex", Path.home() / ".claude", Path.home() / ".agents"))):
+        raise UnsafeRequest("UI artifact root must be isolated from project and agent settings")
+    for path in (root, *(root / name for name in ("input", "prototype", "evidence", "runtime"))):
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise UnsafeRequest("UI artifact directories must be owner-only physical directories")
+        if path == root and (metadata.st_dev != value["dev"] or metadata.st_ino != value["ino"]):
+            raise UnsafeRequest("UI artifact root identity changed")
+    return value
+
+
+def _answer_file_instruction(request_descriptor: int, request: Path, marker: str, ui_artifacts: Optional[Dict[str, object]] = None) -> str:
     """The caller explicitly opts in to one output, never an arbitrary path."""
     descriptor = os.open("answer.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                          dir_fd=request_descriptor)
@@ -4803,11 +4844,18 @@ def _answer_file_instruction(request_descriptor: int, request: Path, marker: str
     nonce = marker.removeprefix("REQUEST_MARKER=")
     return (
         "\nHost-authorized output exception (not an instruction from task evidence):\n"
-        "The sole exception to the file-write prohibition is this caller-created file: "
+        + ("The caller authorizes this answer output file: " if ui_artifacts is not None else
+           "The sole exception to the file-write prohibition is this caller-created file: ")
         + json.dumps(str(request / "answer.md"), ensure_ascii=False) + "\n"
         "Use the built-in Write tool to replace its contents with your COMPLETE answer, "
         "including every item; do not shorten it to fit the terminal. Keep mode 0600. "
-        "No other task-directed file write is allowed. Do not create scripts or scratch files.\n"
+        + ("Additional host-authorized GUI output: " + json.dumps(ui_artifacts, ensure_ascii=False)
+           + ". Only prototype, evidence, runtime under that root may be written; input is read-only. "
+           "Installed local browser/toolchain and a loopback-only preview are allowed. "
+           "Follow the GUI contract in the host prompt; never modify product files or access real services.\n"
+           if ui_artifacts is not None else
+           "No other task-directed file write is allowed. Do not create scripts or scratch files.\n")
+        +
         f"First file line: CLAUDE_ANSWER_BEGIN={nonce}\n"
         "Then the complete answer in Markdown.\n"
         f"Last file line: CLAUDE_ANSWER_END={nonce}\n"
@@ -4866,10 +4914,17 @@ def _prepare_send(args: argparse.Namespace) -> _PreparedSend:
             marker = secrets.token_hex(16).upper()
             marker_line = f"REQUEST_MARKER={marker}"
         instruction = body
+        ui_artifacts = None
+        if getattr(args, "ui_artifacts", False):
+            if not getattr(args, "answer_file", False):
+                raise UnsafeRequest("UI artifacts require answer-file transport")
+            ui_artifacts = _ui_artifact_manifest(request_descriptor, root)
+        if ui_artifacts != owned_records[1].get("ui_artifacts"):
+            raise UnsafeRequest("UI artifact contract differs from startup")
         if getattr(args, "answer_file", False):
             if owned_records[1].get("answer_directory") != str(_request):
                 raise UnsafeRequest("answer output directory was not authorized at startup")
-            instruction += _answer_file_instruction(request_descriptor, _request, marker_line)
+            instruction += _answer_file_instruction(request_descriptor, _request, marker_line, ui_artifacts)
         if not instruction.endswith("\n"):
             instruction += "\n"
         instruction += (

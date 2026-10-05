@@ -103,15 +103,18 @@ export function containsCredentialMaterial(value: string): boolean {
 
 export function redactCredentialMaterial(value: string, replacement: string): string {
   let sanitized = normalizePublicGuardText(value)
-  sanitized = sanitized.replace(
-    new RegExp(PERCENT_ENCODED_TOKEN.source, 'gi'),
-    token => {
-      const inspection = decodePercentLayers(token)
-      return !inspection.stable || directCredentialMatch(inspection.decoded)
-        ? replacement
-        : token
-    },
-  )
+  // Avoid a quadratic unsuccessful prefix search on long unencoded answers.
+  if (sanitized.includes('%')) {
+    sanitized = sanitized.replace(
+      new RegExp(PERCENT_ENCODED_TOKEN.source, 'gi'),
+      token => {
+        const inspection = decodePercentLayers(token)
+        return !inspection.stable || directCredentialMatch(inspection.decoded)
+          ? replacement
+          : token
+      },
+    )
+  }
   for (const source of CREDENTIAL_PATTERN_SOURCES) {
     sanitized = sanitized.replace(new RegExp(source, 'gi'), replacement)
   }

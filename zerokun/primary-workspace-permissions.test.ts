@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { dirname, join } from 'path'
-import { buildCodexChildEnvironment, buildCodexPermissionOverrides } from './codex-executor.ts'
+import { buildCodexChildEnvironment, buildCodexDeveloperInstructions, buildCodexPermissionOverrides } from './codex-executor.ts'
 import { prepareManagedStateRoot, ensureManagedDirectory } from './managed-path.ts'
 import type { JobRecord } from './job-runner.ts'
 import { registerSlackApp } from './slack-app-registry.ts'
@@ -42,6 +42,57 @@ test('primary uses ordinary host reads without granting arbitrary host writes; r
     expect(review[f.state]).toBe('deny')
     expect(review[realpathSync(tmpdir())]).toBe('deny')
   } finally { rmSync(f.root, {recursive:true,force:true}) }
+})
+
+test('primary delegates networking to Codex while read-only isolation and host credentials stay protected', () => {
+  const f = fixture()
+  try {
+    const parse = (job = f.job, write = true, browser = true) => (Bun.TOML.parse(buildCodexPermissionOverrides(job, {
+      stateDir:f.state,scratchDir:f.scratch,artifactDir:f.out,profile:'zero_integration',
+      executionWriteEnabled:write,browserAccessEnabled:browser,
+    }).join('\n')) as any).permissions.zero_integration
+    expect(parse().network.domains).toEqual({'*': 'allow'})
+    expect(parse().filesystem[f.state]).toBe('deny')
+    expect(parse().filesystem[join(realpathSync(homedir()),'.claude/channels/slack')]).toBe('deny')
+    expect(parse(f.job,false).network.domains['slack.com']).toBe('deny')
+    expect(parse({...f.job,writeEnabled:false},false).network.domains['slack.com']).toBe('deny')
+    expect(parse({...f.job,writeEnabled:false},false,false).network.enabled).toBe(false)
+    const env = buildCodexChildEnvironment({SLACK_BOT_TOKEN:'xoxb-fixture',SLACK_APP_TOKEN:'xapp-fixture',PATH:'/usr/bin'})
+    expect(env.SLACK_BOT_TOKEN).toBeUndefined()
+    expect(env.SLACK_APP_TOKEN).toBeUndefined()
+  } finally {rmSync(f.root,{recursive:true,force:true})}
+})
+
+test('integration authorization distinguishes product tests, host delivery and missing evidence', () => {
+  const f = fixture()
+  try {
+    expect(Bun.spawnSync(['git','init','-q',f.repo]).exitCode).toBe(0)
+    const write = buildCodexDeveloperInstructions(f.job,f.out)
+    const read = buildCodexDeveloperInstructions({...f.job,writeEnabled:false},f.out)
+    for (const instructions of [write,read]) {
+      expect(instructions).toContain('Never deliver this assistant\'s replies, progress, or completion notifications')
+      expect(instructions).toContain('Never obtain or reuse the host assistant\'s Slack credentials')
+      expect(instructions).not.toContain('Never post to Slack yourself')
+    }
+    expect(write).toContain('approvals already received for that same scope')
+    expect(write).toContain('do not add a separate Zero upload, deployment, credential-use, or external-service approval gate')
+    expect(write).toContain('inspect the destination and previous effects before retrying a write')
+    expect(write).toContain('Codex native Auto-review handles eligible permission requests')
+    expect(write).toContain('not a pending user dialog')
+    expect(write).toContain('Other native MCP elicitation requests are answered with action=cancel')
+    expect(write).toContain('exact reply containing the host-issued confirmation code')
+    expect(write).toContain('does not mean the user declined, and does not approve the operation')
+    expect(write).toContain('a generic Slack reply can answer an unsupported native confirmation')
+    expect(write).not.toContain('Do not construct direct Slack API')
+    expect(write).not.toContain('Existing Slack network restrictions')
+    expect(write).toContain('An empty audit registry proves only that no evidence is registered there')
+    expect(write).toContain('do not prescribe a different environment without an observed requirement')
+    expect(write).toContain('A blocked integration check does not block independent authorized implementation')
+    expect(write).toContain('This replaces the old generated Managed continuation workspace instruction')
+    expect(read).not.toContain('do not add a separate Zero upload')
+    expect(read).not.toContain('create a new task branch')
+    expect(read).toContain('Do not edit files, Git, settings, external services, or data')
+  } finally {rmSync(f.root,{recursive:true,force:true})}
 })
 
 test('a custom CODEX_HOME does not expose the default Codex private directory', () => {
@@ -118,6 +169,49 @@ const codex = Bun.which('codex')
 const node = Bun.which('node')
 const macosRuntime = process.platform === 'darwin' && codex && node
 
+test.skipIf(!macosRuntime)('real Codex sandbox transfers synthetic upload bytes while read-only networking stays denied', async () => {
+  const f = fixture()
+  const received: string[] = []
+  const server = Bun.listen({
+    hostname: '127.0.0.1', port: 0,
+    socket: {
+      data(socket, data) { received.push(data.toString()); socket.end('accepted') },
+    },
+  })
+  try {
+    const script = join(f.scratch, 'upload.cjs')
+    writeFileSync(script, `
+      const net = require('node:net');
+      const socket = net.connect(${server.port}, '127.0.0.1');
+      socket.setTimeout(3000, () => { socket.destroy(); process.exit(2); });
+      socket.on('error', () => process.exit(3));
+      socket.on('connect', () => socket.write('synthetic-upload'));
+      let reply = '';
+      socket.on('data', data => { reply += data; });
+      socket.on('end', () => process.exit(reply === 'accepted' ? 0 : 4));
+    `)
+    for (const write of [false, true]) {
+      const flags = buildCodexPermissionOverrides(f.job, {
+        stateDir: f.state, scratchDir: f.scratch, artifactDir: f.out,
+        profile: 'zero_upload_probe', executionWriteEnabled: write,
+        browserAccessEnabled: false, multiAgentEnabled: false,
+      })
+      const child = Bun.spawn([
+        codex!, ...flags.flatMap(v => ['-c', v]), 'sandbox',
+        '-P', 'zero_upload_probe', '-C', f.repo, '--', node!, script,
+      ], { env: buildCodexChildEnvironment(), stdout: 'pipe', stderr: 'pipe', timeout: 8_000 })
+      const [exitCode] = await Promise.all([
+        child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+      ])
+      expect(exitCode).toBe(write ? 0 : 3)
+      expect(received.join('')).toBe(write ? 'synthetic-upload' : '')
+    }
+  } finally {
+    server.stop(true)
+    rmSync(f.root, { recursive: true, force: true })
+  }
+}, 20_000)
+
 test.skipIf(!macosRuntime)('real Codex sandbox permits Node PATH lookup after a login shell and protects host state', () => {
   const f = fixture()
   const homeFixture = realpathSync(mkdtempSync(join(homedir(), '.zero-primary-test-')))
@@ -160,3 +254,25 @@ test.skipIf(!macosRuntime)('real Codex sandbox permits Node PATH lookup after a 
     rmSync(f.root, {recursive:true,force:true})
   }
 }, 40_000)
+
+test('primary network delegation does not enable networking or approvals for read-only stages', () => {
+  const f = fixture()
+  try {
+    for (const writeAuthorized of [true, false]) {
+      for (const executionWriteEnabled of [true, false]) {
+        const config = Bun.TOML.parse(buildCodexPermissionOverrides(
+          {...f.job, writeEnabled: writeAuthorized}, {
+            stateDir: f.state, scratchDir: f.scratch, artifactDir: f.out,
+            profile: 'zero_network_delegation', executionWriteEnabled,
+            browserAccessEnabled: false,
+          },
+        ).join('\n')) as any
+        const primary = writeAuthorized && executionWriteEnabled
+        expect(config.features.network_proxy).toBe(executionWriteEnabled)
+        expect(config.approval_policy).toBe(primary ? 'on-request' : 'never')
+        expect(config.approvals_reviewer).toBe(primary ? 'auto_review' : undefined)
+        expect(config.permissions.zero_network_delegation.network.enabled).toBe(executionWriteEnabled)
+      }
+    }
+  } finally { rmSync(f.root, {recursive:true, force:true}) }
+})

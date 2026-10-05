@@ -25,6 +25,7 @@ import { ensureManagedDirectory, requireManagedStateRoot } from './managed-path.
 export const UPDATE_RUNTIME_FILES = [
   'update-request.ts',
   'update-controller.ts',
+  'update-result.ts',
   'process-generation.ts',
   'process-lock.ts',
   'child-environment.ts',

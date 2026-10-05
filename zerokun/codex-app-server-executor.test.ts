@@ -1,3 +1,6 @@
+import { readTaskUsage } from './task-usage.ts'
+import { registerNativeAdvisor } from './native-advisor-recovery.ts'
+import { awaitNativeConfirmation, parseNativeConfirmationAnswer } from './native-confirmation.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'crypto'
 import {
@@ -17,6 +20,7 @@ import { dirname, join } from 'path'
 import {
   JobStore,
   SlackNotifier,
+  sanitizeExecutionTextForSlack,
   finalizeSuccessfulExecution,
   extractArtifactPaths,
   createExecutorPidLifecycle,
@@ -307,7 +311,7 @@ import time
 mode = os.environ.get("ZERO_FIXTURE_MODE", "normal")
 if mode in ("interrupt-no-terminal-forced", "late-error-after-complete"):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
-if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1":
+if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1" or os.environ.get("ZERO_NATIVE_DRAIN_STOP_GATE") == "1":
     signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
 if mode == "logical-stop-required":
     def logical_stop(_signum, _frame):
@@ -367,12 +371,16 @@ for line in sys.stdin:
     value = json.loads(line)
     method = value.get("method")
     request_id = value.get("id")
+    if mode == "native-upload" and method is None and request_id == 0:
+        action = value.get("result", {}).get("action", "missing")
+        emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "native result: " + action}], "error": None}}})
+        continue
     rpc_log = os.environ.get("ZERO_RPC_LOG")
     log_handshakes = os.environ.get("ZERO_LOG_HANDSHAKES") == "1"
     if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume", "thread/inject_items"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"method": method, "developerInstructions": params.get("developerInstructions"), "injectedItems": params.get("items") if method == "thread/inject_items" else None, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
+            stream.write(json.dumps({"method": method, "developerInstructions": params.get("developerInstructions"), "injectedItems": params.get("items") if method == "thread/inject_items" else None, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "approvalPolicy": params.get("approvalPolicy"), "approvalsReviewer": params.get("approvalsReviewer"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
     if method == "initialized":
         continue
     if method == "initialize":
@@ -430,9 +438,11 @@ for line in sys.stdin:
         requested_thread = requested
         handshake_cwd = cwd
         permission_profile = params.get("permissions") or ""
+        approval_policy = params.get("approvalPolicy")
+        approvals_reviewer = params.get("approvalsReviewer")
         if phase_account_switch and method == "thread/start" and capacity_state and os.path.exists(capacity_state):
             thread_id = "thread-app-server-2"
-        emit({"id": request_id, "result": {"thread": {"id": requested or thread_id, "cwd": cwd, "source": "unknown", "modelProvider": "openai", "status": {"type": "idle"}, "canAcceptDirectInput": True}, "model": model, "reasoningEffort": reasoning_effort, "modelProvider": "openai", "cwd": cwd, "approvalPolicy": "never", "activePermissionProfile": {"id": params.get("permissions"), "extends": None}, "instructionSources": [cwd + "/AGENTS.md"]}})
+        emit({"id": request_id, "result": {"thread": {"id": requested or thread_id, "cwd": cwd, "source": "unknown", "modelProvider": "openai", "status": {"type": "idle"}, "canAcceptDirectInput": True}, "model": model, "reasoningEffort": reasoning_effort, "modelProvider": "openai", "cwd": cwd, "approvalPolicy": params.get("approvalPolicy"), "approvalsReviewer": params.get("approvalsReviewer", "user"), "activePermissionProfile": {"id": params.get("permissions"), "extends": None}, "instructionSources": [cwd + "/AGENTS.md"]}})
     elif method == "turn/start":
         if mode == "hang-turn-start":
             with open(os.environ["ZERO_BLOCKED_MARKER"], "w", encoding="utf-8") as stream:
@@ -440,7 +450,7 @@ for line in sys.stdin:
             while True:
                 time.sleep(30)
         turn_params = value.get("params", {})
-        if turn_params.get("cwd") != handshake_cwd or turn_params.get("permissions") != permission_profile or turn_params.get("approvalPolicy") != "never":
+        if turn_params.get("cwd") != handshake_cwd or turn_params.get("permissions") != permission_profile or turn_params.get("approvalPolicy") != approval_policy or turn_params.get("approvalsReviewer") != approvals_reviewer:
             emit({"id": request_id, "error": {"code": -32000, "message": "turn permission binding mismatch"}})
             continue
         turn_count += 1
@@ -502,6 +512,20 @@ for line in sys.stdin:
                 emit({"method": "item/started", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
                 emit({"method": "item/completed", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "item": {"type": "reasoning", "id": "early-item"}}})
             emit({"method": "turn/started", "params": {"threadId": requested_thread or thread_id, "turn": active_turn}})
+        if os.environ.get("ZERO_USAGE_EVENT"):
+            assert "zerokun_usage=" in " ".join(sys.argv)
+            assert "task_usage_read" in phase_prompt
+            counters = {"inputTokens": 100, "cachedInputTokens": 60, "cacheWriteInputTokens": 0, "outputTokens": 20, "reasoningOutputTokens": 5}
+            for _ in range(2):
+                emit({"method": "thread/tokenUsage/updated", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "tokenUsage": {"total": counters, "last": counters}}})
+        if mode == "native-upload":
+            emit({"id": 0, "method": "mcpServer/elicitation/request", "params": {
+                "threadId": "foreign-thread" if os.environ.get("ZERO_NATIVE_CONFIRMATION_FOREIGN") else (requested_thread or thread_id),
+                "turnId": turn_id, "serverName": "node_repl", "mode": "form",
+                "requestedSchema": {"type": "object", "properties": {}},
+                "_meta": {"codex_approval_kind": "mcp_tool_call", "connector_id": "browser-use", "tool_name": "upload_browser_files", "file_transfer": "upload", "tool_params": {"origin": "https://example.com"}}
+            }})
+            continue
         if mode == "late-command-completion":
             late_item_type = os.environ.get("ZERO_LATE_ITEM_TYPE", "commandExecution")
             if not os.environ.get("ZERO_LATE_START"):
@@ -763,7 +787,7 @@ for line in sys.stdin:
             if mode == "late-error-after-complete":
                 time.sleep(0.2)
                 emit(late_error)
-            if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1":
+            if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1" or os.environ.get("ZERO_NATIVE_DRAIN_STOP_GATE") == "1":
                 time.sleep(0.3)
                 sys.stdout.write("{broken JSON\\n")
                 sys.stdout.flush()
@@ -878,12 +902,32 @@ for line in sys.stdin:
         }], "nextCursor": None}})
     elif method == "thread/turns/list":
         emit({"id": request_id, "result": {"data": [], "nextCursor": None}})
+    elif method == "thread/read" and os.environ.get("ZERO_NATIVE_DRAIN_CHILD") and value.get("params", {}).get("threadId") == "drain-child":
+        fixture_path = os.environ["ZERO_NATIVE_DRAIN_CHILD"]
+        with open(fixture_path, "r", encoding="utf-8") as stream:
+            child_fixture = json.load(stream)
+        child_fixture["reads"] += 1
+        child = child_fixture["child"]
+        if child_fixture["reads"] >= 2:
+            child["turns"][0]["status"] = "completed"
+            child["turns"][0]["items"] = [{"type": "agentMessage", "phase": "final_answer", "text": "Synthetic independent answer.\\n" + child_fixture["marker"]}]
+        with open(fixture_path, "w", encoding="utf-8") as stream:
+            json.dump(child_fixture, stream)
+        if os.environ.get("ZERO_NATIVE_DRAIN_READ_TIMEOUT") == "1" and child_fixture["reads"] == 1:
+            continue
+        emit({"id": request_id, "result": {"thread": child}})
     elif method == "thread/read":
         emit({"id": request_id, "result": {"thread": {"id": requested_thread or thread_id, "turns": []}}})
     elif method == "thread/list":
         children = [{
             "id": "historical-child", "parentThreadId": requested_thread or thread_id,
         }] if mode == "phased-native-history-resume" else []
+        if os.environ.get("ZERO_NATIVE_DRAIN_CHILD"):
+            with open(os.environ["ZERO_NATIVE_DRAIN_CHILD"], "r", encoding="utf-8") as stream:
+                child_fixture = json.load(stream)
+                if os.environ.get("ZERO_NATIVE_DRAIN_STOP_GATE") == "1" and child_fixture["reads"] >= 2:
+                    continue
+                children = [child_fixture["child"]]
         emit({"id": request_id, "result": {"data": children, "nextCursor": None}})
     elif method == "turn/steer":
         if os.environ.get("ZERO_CONTINUATION_STEER") == "1":
@@ -1035,7 +1079,7 @@ if mode == "logical-stop-required":
 }
 
 function fixture(
-  mode: 'normal' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
+  mode: 'normal' | 'native-upload' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
     | 'interjection-answer' | 'interjection-update' | 'interjection-late-answer'
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
@@ -1415,6 +1459,22 @@ function fixture(
 }
 
 describe('production App Server executor', () => {
+  test('usage recorder and host tool are available to a read-only job without exposing raw logs', async () => {
+    const value = fixture('normal')
+    try {
+      await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'normal', ZERO_USAGE_EVENT: '1' },
+      })
+      const result = readTaskUsage(value.state, {jobId:value.job.id,repoPath:value.repo})
+      expect(result.jobs[0]!.codex.tokens?.inputTokens).toBe(100)
+      expect(result.jobs[0]!.codex.tokens?.cachedInputTokens).toBe(60)
+      expect(result.jobs[0]!.codex.measuredTurns).toBe(1)
+      expect(readdirSync(join(value.state,'task-usage',value.job.id))).toHaveLength(1)
+    } finally {value.store.close()}
+  }, 30_000)
+
   test('Slackへ出すadvisor件数はモデル文やcached集計でなくterminal slotから導出する', () => {
     const state = secureRoot()
     prepareManagedStateRoot(state)
@@ -2381,7 +2441,7 @@ describe('production App Server executor', () => {
   }
 
   for (const resume of [false, true]) {
-    test(`承認済みIAM修復の現行指示をApp Server ${resume ? 'resume' : 'start'}へ送る`, async () => {
+    test(`承認済みIAM修復・製品連携の現行指示をApp Server ${resume ? 'resume' : 'start'}へ送る`, async () => {
       const value = fixture('normal', true, '承認した対象ジョブ・実行主体への必要アクセスを修復してください')
       const rpcLog = join(value.root, 'iam-policy-rpc.log')
       try {
@@ -2397,10 +2457,18 @@ describe('production App Server executor', () => {
         const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
         const handshake = rpc.filter(row => row.method === (resume ? 'thread/resume' : 'thread/start'))
         expect(handshake).toHaveLength(1)
-        expect(handshake[0].developerInstructions).toContain('IAM repair is permitted')
-        expect(handshake[0].developerInstructions).toContain('target resource, existing grantee principal, and exact permission or role')
-        expect(handshake[0].developerInstructions).toContain('other applicable restrictions')
-        expect(handshake[0].developerInstructions).not.toContain('change IAM to bypass a denial')
+        expect(handshake[0].developerInstructions).toContain('Codex native Auto-review handles eligible permission requests')
+        expect(handshake[0].developerInstructions).toContain('A resumed task retains its existing authorization')
+        expect(handshake[0].developerInstructions).toContain('do not add a separate Zero upload')
+        expect(handshake[0].developerInstructions).toContain('Do not bypass a denial')
+        expect(handshake[0].developerInstructions).toContain('Actual user or tool denials, including Browser Use upload refusals, remain binding across resume')
+        expect(handshake[0].developerInstructions).toContain('A user decline withdraws authorization for that effect; do not retry it through another route')
+        expect(handshake[0].developerInstructions).toContain('A generic continue or resumed session is not that change')
+        expect(handshake[0].developerInstructions).toContain('This does not dismiss a refusal reporting an actual user or tool denial')
+        expect(handshake[0].developerInstructions).not.toContain('IAM repair is permitted when')
+        expect(handshake[0].developerInstructions).toContain('Never deliver this assistant\'s replies')
+        expect(handshake[0].developerInstructions).toContain('does not require an already merged branch to receive new commits')
+        expect(handshake[0].developerInstructions).toContain('A blocked integration check does not block independent authorized implementation')
         if (resume) {
           const injected = rpc.filter(row => row.method === 'thread/inject_items')
           expect(injected).toHaveLength(1)
@@ -2564,7 +2632,7 @@ describe('production App Server executor', () => {
   }
 
   test('primary modelと推論強度をthreadとturnへ明示固定する', async () => {
-    const value = fixture('normal')
+    const value = fixture('normal', true)
     const rpcLog = join(value.root, 'runtime-selection-rpc.log')
     const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
@@ -2586,6 +2654,7 @@ describe('production App Server executor', () => {
     expect(rpc).toHaveLength(2)
     expect(rpc[0]).toMatchObject({
       method: 'thread/start',
+      approvalPolicy: 'on-request', approvalsReviewer: 'auto_review',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       config: {
         model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
@@ -2594,14 +2663,49 @@ describe('production App Server executor', () => {
     })
     expect(rpc[1]).toMatchObject({
       method: 'turn/start',
+      approvalPolicy: 'on-request', approvalsReviewer: 'auto_review',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
     })
     value.store.close()
   }, 30_000)
 
+  test.each([{ write: true, foreign: false, action: 'accept' },
+    { write: false, foreign: false, action: 'cancel' }, { write: true, foreign: true, action: 'cancel' }])(
+    'native upload confirmation stays bound to the writable root turn: %j', async scenario => {
+      const value = fixture('native-upload', scenario.write)
+      let posted = 0
+      try {
+        const result = await executeCodexJob(value.job, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true, liveControls: value.hooks,
+          extraEnvironment: { ZERO_FIXTURE_MODE: 'native-upload',
+            ...(scenario.foreign ? { ZERO_NATIVE_CONFIRMATION_FOREIGN: '1' } : {}) },
+          onNativeConfirmation: (request, signal) => awaitNativeConfirmation({
+            store: value.store.nativeConfirmations, signal,
+            binding: { ...request, jobId: value.job.id, epoch: value.job.controlEpoch },
+            prepareText: text => sanitizeExecutionTextForSlack(value.job, '', text, value.state, [], 'progress'),
+            publish: event => {
+              posted++
+              value.store.stageCommentaryNotification(value.job.id, value.job.attempts, event.sourceKey, `💬 ${event.text}`)
+              const notice = value.store.pendingCommentaryNotifications()[0]!
+              value.store.markCommentaryNotificationDelivered(notice.id)
+              const line = event.text.split('\n').find(line => line.startsWith('今回だけ許可 '))!
+              expect(value.store.nativeConfirmations.answer({ ...parseNativeConfirmationAnswer(line)!,
+                chatId: value.job.chatId, threadTs: value.job.threadTs, userId: value.job.userId,
+                messageId: '1800000000.000200', writeEnabled: scenario.write })).toBe(true)
+              return true
+            },
+          }),
+        })
+        expect(result.result).toBe(`native result: ${scenario.action}`)
+        expect(posted).toBe(scenario.action === 'accept' ? 1 : 0)
+      } finally { value.store.close() }
+    }, 30_000,
+  )
+
   test('resumeでもprimary modelと推論強度を再固定する', async () => {
-    const value = fixture('normal')
+    const value = fixture('normal', true)
     const rpcLog = join(value.root, 'runtime-selection-resume-rpc.log')
     const job = { ...value.job, sessionId: 'thread-existing', resumed: true }
     const result = await executeCodexJob(job, {
@@ -2621,6 +2725,7 @@ describe('production App Server executor', () => {
       .map(line => JSON.parse(line) as Record<string, unknown>)
     expect(rpc[0]).toMatchObject({
       method: 'thread/resume',
+      approvalPolicy: 'on-request', approvalsReviewer: 'auto_review',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       config: {
         model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
@@ -2630,6 +2735,7 @@ describe('production App Server executor', () => {
     expect(rpc[1]).toMatchObject({ method: 'thread/inject_items', currentInstructions: true })
     expect(rpc[2]).toMatchObject({
       method: 'turn/start',
+      approvalPolicy: 'on-request', approvalsReviewer: 'auto_review',
       model: ZEROCHAN_PRIMARY_CODEX_MODEL,
       effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
     })
@@ -2915,8 +3021,10 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 30_000)
 
-  test.each([false, true])('complete executorはadvisorを回収する前に親を終了せず入力受付も閉じない: interjection=%s', async interjection => {
-    const value = fixture('interjection-late-answer', true)
+  test.each(['none', 'late', 'interjection-answer', 'interjection-update', 'cancel'] as const)('未完了advisorへ終端要求を送りcleanup後に回答・追加質問・取消を処理する: %s', async scenario => {
+    const interjection = !['none', 'cancel'].includes(scenario)
+    const mode = scenario === 'none' || scenario === 'late' || scenario === 'cancel' ? 'interjection-late-answer' : scenario
+    const value = fixture(mode, true)
     const acknowledge = value.hooks.acknowledgeInitialDispatch
     const finish = value.hooks.finishTurn
     let claimCreated = false
@@ -2925,7 +3033,7 @@ describe('production App Server executor', () => {
     let inputOpenAtRelease = false
     let finishedAfterRelease = false
     let inputTimer: ReturnType<typeof setTimeout> | undefined
-    let stagedInterjection = false
+    let stagedInterjection = mode !== 'interjection-late-answer'
     let releaseTimer: ReturnType<typeof setTimeout> | undefined
     value.hooks.acknowledgeInitialDispatch = args => {
       acknowledge!(args)
@@ -2943,7 +3051,7 @@ describe('production App Server executor', () => {
         contextDigest: createHash('sha256').update(JSON.stringify(context)).digest('hex'),
         inputRevision: input.revision, inputDigest: input.digest, phase: 'investigation', round: 1,
         brokerProcessId: process.pid }), { mode: 0o600 })
-      if (interjection) inputTimer = setTimeout(() => {
+      if (scenario === 'late') inputTimer = setTimeout(() => {
         const target = value.store.liveControlTarget(value.job.chatId, value.job.threadTs)
         if (!target) return
         value.store.stageLiveInterjection(target, {
@@ -2952,11 +3060,22 @@ describe('production App Server executor', () => {
         })
         stagedInterjection = true
       }, 250)
-      releaseTimer = setTimeout(() => {
+      const earliestRelease = Date.now() + 750
+      releaseTimer = setInterval(() => {
+        if (Date.now() < earliestRelease) return
+        if (scenario !== 'cancel' && !existsSync(`${lock}.stop`)) return
+        clearInterval(releaseTimer)
         inputOpenAtRelease = value.store.liveControlTarget(value.job.chatId, value.job.threadTs) !== null
+        if (scenario === 'cancel') {
+          const target = value.store.interruptControlTarget(value.job.chatId, value.job.threadTs)
+          value.store.stageLiveControl(target!, { chatId: value.job.chatId,
+            threadTs: value.job.threadTs, messageId: 'cancel-during-advisor-drain',
+            userId: 'UOTHER', task: '中止', kind: 'interrupt' })
+          return
+        }
         released = true
         rmSync(lock)
-      }, 1000)
+      }, 50)
     }
     value.hooks.finishTurn = args => {
       if (!finishObserved) finishedAfterRelease = released
@@ -2966,15 +3085,21 @@ describe('production App Server executor', () => {
     try {
       const execution = executeCodexJob(value.job, {
         codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
-        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: 'interjection-late-answer' },
+        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: mode, ZERO_INTERJECTION_FIXTURE_STATE: join(value.root, 'settlement-interjection.state') },
         liveControls: value.hooks,
       })
+      if (scenario === 'cancel') {
+        await expect(execution).rejects.toBeInstanceOf(CodexUserCancelledError)
+        expect(released).toBe(false)
+        return
+      }
       if (interjection) {
         const notification = await waitForInterjectionNotification(value.store)
         value.store.markInterjectionNotificationDelivered(notification.id)
       }
       const result = await execution
-      expect(result.result).toBe('通常完了')
+      expect(result.result).toBe(scenario === 'interjection-update' ? '追加条件を反映して完了しました'
+        : scenario === 'interjection-answer' ? '元の作業を完了しました' : '通常完了')
       expect(finishedAfterRelease).toBe(true)
       expect(inputOpenAtRelease).toBe(true)
       expect(stagedInterjection).toBe(interjection)
@@ -4472,6 +4597,50 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test.each(['normal', 'network-permanent', 'history-timeout', 'protocol-stop-gate'] as const)('親executorは暗号化inputの登録済みGPTが完成する前にApp Serverを閉じない: %s', async scenario => {
+    const mode = scenario === 'history-timeout' ? 'normal' : scenario === 'protocol-stop-gate' ? 'network-permanent' : scenario
+    const value = fixture(mode, false)
+    const childPath = join(value.root, 'native-child.json')
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+      skipEffectiveConfigCheck: true,
+      extraEnvironment: { ZERO_FIXTURE_MODE: mode, ZERO_NATIVE_DRAIN_CHILD: childPath,
+        ZERO_NETWORK_STATE: join(value.root, 'native-network-state'),
+        ZERO_NATIVE_DRAIN_READ_TIMEOUT: scenario === 'history-timeout' ? '1' : '0',
+        ZERO_NATIVE_DRAIN_STOP_GATE: scenario === 'protocol-stop-gate' ? '1' : '0',
+        ZERO_RPC_LOG: join(value.root, 'native-drain-rpc.log') },
+      nativeAdvisorHistoryFixtureForTesting: async () => { throw new Error('no synthetic publication evidence') },
+      onSessionId: parentThreadId => {
+        const root = join(value.state, 'advisor-context', value.job.id)
+        const name = readdirSync(root).find(name => /^[a-f0-9]{32}\.json$/.test(name))!
+        const contextPath = join(root, name)
+        const context = JSON.parse(readFileSync(contextPath, 'utf8'))
+        const input = readAdvisorInputSnapshot(value.state, value.job.id)
+        const registered = registerNativeAdvisor({ contextPath, attemptNonce: context.attemptNonce,
+          phase: 'investigation', round: 1, inputRevision: input.revision, inputDigest: input.digest,
+          request: 'Read-only synthetic source review.' })
+        writeFileSync(childPath, JSON.stringify({ reads: 0, marker: registered.marker,
+          child: { id: 'drain-child', parentThreadId, cwd: value.job.repoPath, agentRole: 'solution_analyst',
+            source: { subAgent: { thread_spawn: { parent_thread_id: parentThreadId,
+              agent_role: 'solution_analyst', agent_path: registered.agentPath } } },
+            turns: [{ id: 'original-child-turn', status: 'inProgress', itemsView: 'full', items: [] }],
+          },
+        }), { mode: 0o600 })
+      },
+      liveControls: value.hooks,
+    })
+    if (mode === 'network-permanent') await expect(execution).rejects.toThrow('access_programs')
+    else expect((await execution).sessionId).toBe('thread-app-server-1')
+    const child = JSON.parse(readFileSync(childPath, 'utf8'))
+    expect(child.reads).toBeGreaterThanOrEqual(2)
+    expect(child.child.turns[0].status).toBe('completed')
+    if (scenario === 'protocol-stop-gate') {
+      const rpc = readFileSync(join(value.root, 'native-drain-rpc.log'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      expect(rpc.filter(call => call.method === 'thread/list')).toHaveLength(2)
+    }
+    value.store.close()
+  }, 30_000)
+
   test('fresh Slack jobは未materialize履歴APIを呼ばず空baselineでpublication gateを通す', async () => {
     const value = fixture('phased-native-history-fresh', true)
     const rpcLog = join(value.root, 'native-history-fresh-rpc.log')
@@ -4539,7 +4708,8 @@ describe('production App Server executor', () => {
     expect(rpc.filter(entry => entry.method === 'thread/start')).toHaveLength(1)
     expect(rpc.filter(entry => entry.method === 'thread/resume')).toHaveLength(2)
     expect(rpc.filter(entry => entry.method === 'turn/start')).toHaveLength(3)
-    expect(rpc.filter(entry => entry.method === 'thread/list')).toHaveLength(0)
+    expect(rpc.findIndex(entry => entry.method === 'thread/list'))
+      .toBeGreaterThan(rpc.findIndex(entry => entry.method === 'turn/start'))
     expect(rpc.filter(entry => entry.method === 'thread/turns/list')).toHaveLength(0)
     completeFixtureJob(value.store, value.job, result.sessionId, result.result)
     expect(value.store.get(value.job.id)?.status).toBe('completed')
@@ -5959,16 +6129,18 @@ describe('production App Server executor', () => {
 
   test('進捗ACKがtimeout後に届いても本体turnは正常完了する', async () => {
     const value = fixture('progress-late-ack')
+    const rpcLog = join(value.root, 'progress-late-ack-rpc.log')
     const reports: string[] = []
     const result = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
       logDir: value.logDir,
       stateDir: value.state,
       skipEffectiveConfigCheck: true,
-      extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-late-ack' },
+      extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-late-ack', ZERO_RPC_LOG: rpcLog },
       progressActivatedAtMs: Date.now(),
       progressScheduleForTesting: {
-        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+        // Only exercise the late ACK, not another slot during slow host startup.
+        firstMs: 10, secondMs: 10_000, thirdMs: 20_000, repeatMs: 10_000,
       },
       progressSteerTimeoutMsForTesting: 20,
       onProgressProbeStarted: () => true,
@@ -5978,6 +6150,8 @@ describe('production App Server executor', () => {
     })
     expect(result.result).toBe('遅いACKの後も完了しました ✅')
     expect(reports).toEqual(['遅い応答でも作業を続けています 🔎'])
+    const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(rpc.filter(value => value.method === 'turn/steer')).toHaveLength(1)
     value.store.close()
   }, 15_000)
 
@@ -5995,7 +6169,8 @@ describe('production App Server executor', () => {
       },
       progressActivatedAtMs: Date.now(),
       progressScheduleForTesting: {
-        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+        // Keep later slots outside this single-probe scenario.
+        firstMs: 10, secondMs: 10_000, thirdMs: 20_000, repeatMs: 10_000,
       },
       progressProbeRetryMsForTesting: 10,
       onProgressProbeStarted: () => true,
@@ -6051,7 +6226,8 @@ describe('production App Server executor', () => {
       extraEnvironment: { ZERO_FIXTURE_MODE: 'progress-final-answer' },
       progressActivatedAtMs: Date.now(),
       progressScheduleForTesting: {
-        firstMs: 10, secondMs: 1_000, thirdMs: 2_000, repeatMs: 1_000,
+        // Keep later slots outside this single-probe scenario.
+        firstMs: 10, secondMs: 10_000, thirdMs: 20_000, repeatMs: 10_000,
       },
       onProgressProbeStarted: () => true,
       onProgressProbeSuperseded: () => {},
@@ -6077,9 +6253,10 @@ describe('production App Server executor', () => {
       progressActivatedAtMs: startedAt,
       progressScheduleForTesting: {
         firstMs: 10,
-        secondMs: 1_000,
-        thirdMs: 2_000,
-        repeatMs: 1_000,
+        // Keep later slots outside this single-probe scenario.
+        secondMs: 10_000,
+        thirdMs: 20_000,
+        repeatMs: 10_000,
       },
       onProgressProbeStarted: () => true,
       onProgressProbeSuperseded: () => {},
@@ -6809,6 +6986,42 @@ describe('production App Server executor', () => {
     }, 30_000)
   }
 
+  test('親のprotocol failureでも外部レビューの回収前にexecutorを終了しない', async () => {
+    const value = fixture('network-permanent')
+    const acknowledge = value.hooks.acknowledgeInitialDispatch
+    let released = false
+    let exitedAfterRelease = false
+    let releaseTimer: ReturnType<typeof setTimeout> | undefined
+    value.hooks.acknowledgeInitialDispatch = args => {
+      acknowledge!(args)
+      const context = JSON.parse(readFileSync(join(value.state, 'advisor-context', value.job.id, `${args.executorNonce}.json`), 'utf8'))
+      const registration = JSON.parse(readFileSync(join(value.state, 'executors', `${value.job.id}.json`), 'utf8'))
+      const processNonce = dirname(registration.fingerprint.allow.path).split('/').at(-1)!
+      const input = readAdvisorInputSnapshot(value.state, value.job.id)
+      const root = join(value.state, 'advisor-journal', value.job.id, args.executorNonce)
+      mkdirSync(root, { recursive: true, mode: 0o700 })
+      const lock = join(root, 'active-round.lock')
+      writeFileSync(lock, JSON.stringify({ version: 2, jobId: value.job.id,
+        attemptNonce: args.executorNonce, processNonce,
+        contextDigest: createHash('sha256').update(JSON.stringify(context)).digest('hex'),
+        inputRevision: input.revision, inputDigest: input.digest, phase: 'investigation', round: 1,
+        brokerProcessId: process.pid }), { mode: 0o600 })
+      releaseTimer = setTimeout(() => { released = true; rmSync(lock) }, 1000)
+    }
+    try {
+      await expect(executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        onProcessExit: () => { exitedAfterRelease = released },
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'network-permanent', ZERO_NETWORK_STATE: join(value.root, 'network-state') },
+      })).rejects.toThrow('access_programs')
+      expect(exitedAfterRelease).toBe(true)
+    } finally {
+      if (releaseTimer) clearTimeout(releaseTimer)
+      value.store.close()
+    }
+  }, 15_000)
+
   for (const mode of ['network-once', 'network-always', 'network-native', 'network-permanent'] as const) {
     test(`network recovery ${mode} preserves thread and bounds dispatch`, async () => {
       const value = fixture(mode, mode === 'network-once')
@@ -6842,6 +7055,7 @@ describe('production App Server executor', () => {
           const resumedPrompt = JSON.parse(readFileSync(prompts, 'utf8').trim().split('\n')[1]!).text
           expect(resumedPrompt).toStartWith('--- Transport recovery: continue the SAME task')
           expect(resumedPrompt).toContain('Do not blindly replay')
+          expect(resumedPrompt).toContain('Host-retained prior delivered artifacts:')
           expect(messages).toHaveLength(1)
         }
         if (mode === 'network-native') expect(messages).toHaveLength(1)

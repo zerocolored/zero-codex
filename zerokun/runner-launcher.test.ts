@@ -150,7 +150,7 @@ describe('Herdr-owned runner launcher', () => {
     herdrServer.stop(true)
   })
 
-  test('runnerの予期しない終了後に同一launcherが再起動し、意図的停止で終了する', async () => {
+  for (const diskFailure of ['none', 'published', 'prepared']) test(`runner exits and supervisor recovers (receipt ENOSPC=${diskFailure})`, async () => {
     if (process.platform !== 'darwin') return
     const dir = mkdtempSync(join(tmpdir(), 'zerokun-runner-recovery-'))
     directories.push(dir)
@@ -193,8 +193,27 @@ describe('Herdr-owned runner launcher', () => {
       'await Bun.sleep(60_000)',
       '',
     ].join('\n'), { mode: 0o700 })
+    const preload = join(dir, 'disk-failure.ts')
+    writeFileSync(preload, [
+      "import { mock } from 'bun:test'",
+      `import * as receipt from ${JSON.stringify(join(import.meta.dir, 'runner-launch-receipt.ts'))}`,
+      'const original = { ...receipt }; let failed = false; let publicationFailed = false',
+      ...(diskFailure === 'prepared' ? [
+        // Hold the first bootstrap before its child-side publication, reproducing
+        // storage failure while the receipt is still prepared (not published).
+        'const spawn = Bun.spawn; let held = false',
+        "Bun.spawn = (argv, opts) => { if (!held && argv.includes('zerokun-runner-bootstrap')) { held = true; return spawn(['/bin/sleep', '30'], opts) }; return spawn(argv, opts) }",
+      ] : []),
+      `mock.module(${JSON.stringify(join(import.meta.dir, 'runner-launch-receipt.ts'))}, () => ({ ...original,`,
+      ...(diskFailure === 'prepared' ? [
+        " publishRunnerLaunchReceipt(...args) { if (!publicationFailed) { publicationFailed = true; throw Object.assign(new Error('simulated publication disk full'), { code: 'ENOSPC' }) }; return original.publishRunnerLaunchReceipt(...args) },",
+      ] : []),
+      " clearRunnerLaunchReceiptAfterReap(...args) { if (!failed) { failed = true; throw Object.assign(new Error('simulated disk full'), { code: 'ENOSPC' }) }; return original.clearRunnerLaunchReceiptAfterReap(...args) }",
+      '}))',
+    ].join('\n'))
     const launched = Bun.spawn([
       process.execPath, '--config=/dev/null', '--no-env-file',
+      ...(diskFailure !== 'none' ? ['--preload', preload] : []),
       join(import.meta.dir, 'runner-launcher.ts'), runner, state, join(state, 'runner.log'),
       join(state, 'job-runner-starter.lock'),
     ], {
@@ -227,7 +246,8 @@ describe('Herdr-owned runner launcher', () => {
       processes.push(secondIdentity!)
       expect(parentPid(secondPid)).toBe(launched.pid)
       expect(readFileSync(join(state, 'runner.log'), 'utf8')).toContain(
-        'job runner exited unexpectedly (code 23); automatic recovery will retry',
+        diskFailure !== 'none' ? 'runner supervision failed; automatic recovery will retry: simulated disk full'
+          : 'job runner exited unexpectedly (code 23); automatic recovery will retry',
       )
 
       expect(signalProcessIfLive(launcherIdentity!, 'SIGTERM')).toBe(true)
@@ -241,7 +261,7 @@ describe('Herdr-owned runner launcher', () => {
     } finally {
       herdrServer.stop(true)
     }
-  })
+  }, 20_000)
 
   test('既存runnerのlease中はstandbyし、lease消失後だけ1回起動する', async () => {
     if (process.platform !== 'darwin') return

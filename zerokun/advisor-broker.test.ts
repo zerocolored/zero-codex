@@ -1,3 +1,4 @@
+import { requestAdvisorStop } from './advisor-settlement.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'crypto'
 import {
@@ -26,6 +27,7 @@ import {
   advisorReceiptChallenge,
   advisorPrompt,
   assertClaudeSubscriptionLogin,
+  waitForClaudeSubscriptionLogin,
   brokerEnvironment,
   claudeSendRejectedBeforeInput,
   claudeContainmentFailureStatus,
@@ -107,6 +109,7 @@ function git(args: string[], cwd: string): string {
 }
 
 type BrokerFixture = {
+  prepareNative(binding?: AdvisorInputSnapshot): Promise<Record<string, unknown>>
   state: string
   repo: string
   jobId: string
@@ -126,9 +129,11 @@ type BrokerFixture = {
     round?: 1 | 2 | 3,
     overrides?: {
       primaryEvidence?: string
+      uiProposal?: { comparison: string; beforeKind: "actual" | "synthetic" | "unavailable"; beforeImage?: string }
       retryUnavailable?: boolean
       inputUpdateIsRecoveryOnly?: boolean
       nativeAgentId?: string
+      nativeResponse?: string
       reviewWorktrees?: string[]
       roundTwoBasis?: {
         roundOneSources: Array<'native' | 'grok' | 'claude'>
@@ -216,6 +221,10 @@ def workspace_value():
 def agent_value():
     return {"name": state["agent_name"], "agent": "claude", "agent_session": {"agent": "claude", "kind": "native", "source": "session", "value": None if state.get("late_native_session") and not state.get("visible_observed") else "fixture-native-session"}, "workspace_id": workspace, "pane_id": pane, "tab_id": tab, "terminal_id": terminal, "cwd": state["project"], "agent_status": state["agent_status"], "interactive_ready": True, "launch_pending": False, "state_change_seq": state["state_change_seq"]}
 if args == ["pane", "current", "--current"]:
+    if state.get("prompt") and state.get("connection_failures", 0) > 0:
+        state["connection_failures"] -= 1
+        save()
+        missing("fixture_connection_unavailable")
     success({"pane": {"workspace_id": caller_workspace, "pane_id": caller_pane, "tab_id": caller_tab, "terminal_id": caller_terminal}})
 if args == ["workspace", "list"]:
     values = [caller_value()]
@@ -272,6 +281,17 @@ if len(args) == 3 and args[:2] == ["agent", "get"]:
     if not state["owned"] or not state["agent"] or args[2] != state["agent_name"]:
         missing("agent_not_found")
     success({"agent": agent_value()})
+if len(args) == 7 and args[:2] == ["agent", "read"] and args[4] == "visible" and state.get("prompt") and state.get("visible_read_error"):
+    print(json.dumps({"error": {"code": state["visible_read_error"], "message": "synthetic fallback read failure"}}), file=sys.stderr)
+    raise SystemExit(1)
+if len(args) == 7 and args[:2] == ["agent", "read"] and state.get("prompt") and state.get("failure_screen_failures", 0) > 0:
+    state["failure_screen_failures"] -= 1
+    if state["failure_screen_failures"] == 0:
+        state["agent_status"] = "done"
+        state["state_change_seq"] += 1
+    save()
+    print(json.dumps({"error": {"code": "timeout", "message": "synthetic observation failure"}}), file=sys.stderr)
+    raise SystemExit(1)
 if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source", "visible", "--lines"]:
     state["visible_observed"] = True
     save()
@@ -302,11 +322,22 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
             with open(os.path.join(state["project"], ".env.audit-fixture"), "w") as handle:
                 handle.write("synthetic concurrent runtime metadata")
         marker = next((line for line in reversed(prompt.splitlines()) if line.startswith("REQUEST_MARKER=")), "")
+        if state.get("ui_artifacts"):
+            prefix_ui = "Host-owned artifact root: "
+            ui_root = json.loads(next(line[len(prefix_ui):] for line in prompt.splitlines() if line.startswith(prefix_ui)))
+            state["ui_root"] = ui_root
+            save()
+            with open(os.path.join(ui_root, "prototype", "index.html"), "w") as handle:
+                handle.write("<!doctype html><title>Fable fixture</title><h1>Synthetic design</h1>")
+            ppm = os.path.join(ui_root, "runtime", "test.ppm")
+            with open(ppm, "wb") as handle:
+                handle.write(b"P6\\n1280 720\\n255\\n" + bytes([60, 70, 80]) * (1280 * 720))
+            subprocess.run(["/usr/bin/sips", "-s", "format", "png", ppm, "--out", os.path.join(ui_root, "evidence", "after.png")], stdout=subprocess.DEVNULL, check=True)
         if state.get("answer_file_lines"):
             prefix = "The sole exception to the file-write prohibition is this caller-created file: "
             output = json.loads(next(line[len(prefix):] for line in prompt.splitlines() if line.startswith(prefix)))
             nonce = marker.split("=", 1)[1]
-            body = "\\n".join("synthetic FAQ %d" % i for i in range(1, state["answer_file_lines"] + 1))
+            body = state.get("answer_body", "\\n".join("synthetic FAQ %d" % i for i in range(1, state["answer_file_lines"] + 1)))
             raw = "CLAUDE_ANSWER_BEGIN=" + nonce + "\\n" + body + "\\nCLAUDE_ANSWER_END=" + nonce + "\\n"
             with open(output, "w", encoding="utf-8") as handle:
                 handle.write(raw)
@@ -326,7 +357,7 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
             print(capture.replace(state["capture_marker"], marker))
         else:
             print(prompt.rstrip("\\n"))
-            print("Claude independent review completed")
+            print(state.get("answer_body", "Claude independent review completed"))
             print(marker)
             print("❯")
     raise SystemExit(0)
@@ -397,6 +428,12 @@ async function brokerFixture(options: {
   claudeBlocked?: boolean
   claudeBlockedRecovers?: boolean
   claudeReadError?: boolean
+  claudeAuthReadyFile?: string
+  claudeAuthConfigurationAfterReady?: boolean
+  grokDelaySeconds?: number
+  onPendingResult?: (payload: Record<string, unknown>) => void
+  snapshotDepthOverflow?: boolean
+  developerShimCollision?: boolean
   transientProbeDenial?: boolean
   onExternalPrompt?: (count: number, repo: string) => void
 } = {}): Promise<BrokerFixture> {
@@ -414,6 +451,9 @@ async function brokerFixture(options: {
   writeFileSync(join(repo, 'README.md'), 'fixture\n', { mode: 0o600 })
   git(['add', 'README.md'], repo)
   git(['commit', '-qm', 'test fixture'], repo)
+  if (options.snapshotDepthOverflow) {
+    mkdirSync(join(repo, ...Array.from({ length: 66 }, () => 'deep')), { recursive: true })
+  }
 
   const binary = join(root, 'herdr')
   const fakeHerdrState = join(root, 'fake-herdr-state.json')
@@ -506,14 +546,23 @@ async function brokerFixture(options: {
   writeFileSync(claude, options.externalSuccess ? [
     '#!/bin/sh',
     'if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then',
-    '  printf \'%s\\n\' \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\'',
+    ...(options.claudeAuthReadyFile ? [
+      "  if [ ! -f '" + options.claudeAuthReadyFile.replaceAll("'", "'\\''") + "' ]; then",
+      '    printf \'%s\\n\' \'{"loggedIn":false}\'',
+      '    exit 0',
+      '  fi',
+    ] : []),
+    options.claudeAuthConfigurationAfterReady
+      ? '  printf \'%s\\n\' \'{"loggedIn":true,"authMethod":"console","apiProvider":"firstParty","subscriptionType":"max"}\''
+      : '  printf \'%s\\n\' \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\'',
     '  exit 0',
     'fi',
     'exec /bin/sleep 300',
     '',
   ].join('\n') : [
     '#!/bin/sh',
-    'printf \'%s\\n\' \'{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty","subscriptionType":null}\'',
+    'printf \'%s\\n\' \'Payment Required\' >&2',
+    'exit 1',
     '',
   ].join('\n'), { mode: 0o700 })
   if (options.externalSuccess) {
@@ -544,7 +593,7 @@ async function brokerFixture(options: {
       '#include <string.h>',
       '#include <unistd.h>',
       'int main(void) {',
-      '  usleep(300000);',
+      `  usleep(${options.grokDelaySeconds === undefined ? 300000 : Math.max(0, Math.floor(options.grokDelaySeconds)) * 1_000_000});`,
       '  printf("Grok independent review completed pid=%d\\n", getpid());',
       '  return 0;',
       '}',
@@ -618,10 +667,23 @@ async function brokerFixture(options: {
   writeFileSync(contextPath, `${JSON.stringify(context)}\n`, { mode: 0o600 })
   const contextDigest = createHash('sha256').update(JSON.stringify(context)).digest('hex')
   const fingerprint = createSeatbeltFingerprint(state, job.id, nonce)
+  const preload = join(root, 'developer-shim-collision.ts')
+  if (options.developerShimCollision) {
+    // Reproduce Bun's inode-cache collision for Apple's hardlinked shims.
+    // Exercise the real broker/helper lifecycle with only path resolution faulted.
+    writeFileSync(preload, `import * as fs from 'node:fs';
+import { mock } from 'bun:test';
+const original = fs.realpathSync;
+mock.module('fs', () => ({ ...fs, realpathSync: (path, ...args) =>
+  path === '/usr/bin/python3' ? '/usr/bin/git' : original(path, ...args) }));
+`, { mode: 0o600 })
+  }
   const createTransport = () => new StdioClientTransport({
     command: process.execPath,
     args: [
-      '--config=/dev/null', '--no-env-file', realpathSync(join(import.meta.dir, 'advisor-broker.ts')),
+      '--config=/dev/null', '--no-env-file',
+      ...(options.developerShimCollision ? ['--preload', preload] : []),
+      realpathSync(join(import.meta.dir, 'advisor-broker.ts')),
       contextPath, state, runtimeDir, fingerprint.allow.path, fingerprint.deny.path,
       'complete', nonce, claudePhysical,
     ],
@@ -651,6 +713,15 @@ async function brokerFixture(options: {
     journalRoot,
     contextDigest,
     fingerprint,
+    async prepareNative(binding = revisionTwo) {
+      const result = await client.callTool({ name: 'advisor_native_prepare', arguments: {
+        phase: 'investigation', round: 1, inputRevision: binding.revision,
+        inputDigest: binding.digest, request: 'Independent synthetic source review.',
+      } })
+      const block = (result.content as Array<{ type: string; text?: string }>).find(value => value.type === 'text')
+      if (!block?.text) throw new Error('native registration missing')
+      return JSON.parse(block.text) as Record<string, unknown>
+    },
     async restart() {
       await client.close()
       transport = createTransport()
@@ -667,9 +738,11 @@ async function brokerFixture(options: {
       round: 1 | 2 | 3 = 1,
       overrides: {
         primaryEvidence?: string
+      uiProposal?: { comparison: string; beforeKind: "actual" | "synthetic" | "unavailable"; beforeImage?: string }
       retryUnavailable?: boolean
         inputUpdateIsRecoveryOnly?: boolean
         nativeAgentId?: string
+      nativeResponse?: string
       reviewWorktrees?: string[]
         roundTwoBasis?: {
           roundOneSources: Array<'native' | 'grok' | 'claude'>
@@ -699,6 +772,7 @@ async function brokerFixture(options: {
             inputRevision: selectedInput.revision,
             inputDigest: selectedInput.digest,
             primaryEvidence: overrides.primaryEvidence ?? 'bounded primary evidence',
+            ...(overrides.uiProposal ? { uiProposal: overrides.uiProposal } : {}),
             ...(overrides.reviewWorktrees ? { reviewWorktrees: overrides.reviewWorktrees } : {}),
             ...(overrides.retryUnavailable ? { retryUnavailable: true } : {}),
             ...(overrides.inputUpdateIsRecoveryOnly ? { inputUpdateIsRecoveryOnly: true } : {}),
@@ -708,7 +782,7 @@ async function brokerFixture(options: {
                 {
                   perspective: expectedPerspective,
                   agentId: overrides.nativeAgentId ?? `/root/native-${expectedPerspective}`,
-                  response: responseFor(expectedPerspective),
+                  response: overrides.nativeResponse ?? responseFor(expectedPerspective),
                 },
               ]
               : [
@@ -745,6 +819,7 @@ async function brokerFixture(options: {
         block = result.content.find(value => value.type === 'text')
         if (!block || block.type !== 'text') throw new Error('advisor broker omitted poll result')
         payload = JSON.parse(block.text) as Record<string, unknown>
+        if (payload.pending === true) options.onPendingResult?.(payload)
       }
       if (existsSync(fakeHerdrState + '.errors')) {
         throw new Error(`Fake Herdr failed: ${readFileSync(fakeHerdrState + '.errors', 'utf8')}`)
@@ -1185,8 +1260,8 @@ describe('advisor broker boundaries', () => {
     5_000,
   )
 
-  test('外部reviewerの各起動境界は有限timeoutを持つ', () => {
-    expect(GROK_REVIEW_TIMEOUT_MS).toBe(60 * 60 * 1_000)
+  test('Grokは最低15分の有限予算を持ち起動helperも有限timeoutを持つ', () => {
+    expect(GROK_REVIEW_TIMEOUT_MS).toBe(15 * 60_000)
     expect(CLAUDE_HELPER_TIMEOUT_MS).toBe(140_000)
     const helper = readFileSync(join(import.meta.dir, 'fifth-advisor.py'), 'utf8')
     const seconds = (name: string) => Number(helper.match(new RegExp(`^${name} = ([0-9]+)$`, 'm'))![1])
@@ -1768,6 +1843,35 @@ print('review complete')
     } finally { await fixture.close() }
   }, 30_000)
 
+  test('Fable GUI artifacts survive broker restart without repeating the advisor and cannot be requested in review', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, writeEnabled: true })
+    let artifactRoot: string | undefined
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), ui_artifacts: true }), { mode: 0o600 })
+      const uiProposal = { comparison: 'Synthetic settings, light theme, scroll 0, no focus', beforeKind: 'synthetic' as const }
+      const result = await fixture.call('investigation', 'revision-two', 'adopted', 1, { uiProposal })
+      artifactRoot = JSON.parse(readFileSync(path, 'utf8')).ui_root
+      expect(result.payload.claude).toMatchObject({ adopted: true, cleanupVerified: true,
+        uiArtifacts: { status: 'produced', producer: 'claude-fable-5-1' } })
+      const artifacts = result.payload.claude.uiArtifacts
+      expect(existsSync(artifacts.afterPath)).toBe(true)
+      expect(existsSync(artifacts.prototypePath)).toBe(true)
+      await fixture.restart()
+      const replay = await fixture.call('investigation', 'revision-two', 'adopted', 1, { uiProposal })
+      expect(replay.payload.claude.uiArtifacts).toEqual(artifacts)
+      const review = await fixture.call('review', 'revision-two', 'adopted', 1, { uiProposal })
+      expect(review.result.isError).toBe(true)
+      expect(review.payload.reason).toContain('initial-design')
+      const final = JSON.parse(readFileSync(path, 'utf8'))
+      expect(final.prompt_count).toBe(1)
+      expect(final.close_count).toBe(1)
+    } finally {
+      await fixture.close()
+      if (artifactRoot) rmSync(artifactRoot, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   test('起動途中の未確定native sessionを記録せずready後のsessionで送信する', async () => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
@@ -1830,6 +1934,57 @@ print('review complete')
     } finally { await fixture.close() }
   }, 40_000)
 
+  test.each(['file', 'terminal'])('Claude credential-shaped review is adopted, sanitized and restored: %s', async source => {
+    const fixture = await brokerFixture({ externalSuccess: true })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const initial = JSON.parse(readFileSync(path, 'utf8'))
+      const token = 'xoxb-1234567890-abcdefghijklmnopqrstuvwxyz'
+      const prose = Array.from({ length: 1500 }, (_, i) => `Finding ${i + 1}`).join('\n')
+      const body = `${prose}\nBearer capability\nAuthorization: Bearer <token>\nAuthorization: Bearer %22synthetic-encoded-credential%22\n${token}\n-----BEGIN%20PRIVATE%20KEY-----\nU1lOVEhFVElDX0tFWV9CT0RZ\n-----END%20PRIVATE%20KEY-----\nFinal finding.`
+      initial.answer_body = body
+      if (source === 'file') initial.answer_file_lines = 1
+      writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
+      const result = await fixture.call('investigation', 'revision-two')
+      expect(result.payload.claude).toMatchObject({ adopted: true, responseRedacted: true, cleanupVerified: true })
+      const response = result.payload.claude.response
+      expect(response).toStartWith(prose)
+      expect(response).toEndWith('Final finding.')
+      expect(response).toContain('[credential removed]')
+      expect(response).not.toContain(token)
+      expect(response).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
+      const journalPath = join(fixture.journalRoot,
+        `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`, 'investigation-1.json')
+      const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
+      expect(journal.claude.responseDigest).toBe(createHash('sha256').update(response).digest('hex'))
+      expect(readInterruptedAdvisorSlots(journalPath, journal).claude?.response).toBe(response)
+      const diagnostic = readFileSync(join(fixture.state, result.payload.claude.responseDiagnostic.path), 'utf8')
+      const persisted = [diagnostic, JSON.stringify(result.payload), readFileSync(`${journalPath}.responses`, 'utf8'), readFileSync(`${journalPath}.slots`, 'utf8')]
+      if (source === 'file') {
+        const raw = readFileSync(join(fixture.state, result.payload.claude.answerArtifact.path), 'utf8')
+        persisted.push(raw)
+        const artifact = JSON.parse(raw)
+        const nonce = artifact.marker.slice('REQUEST_MARKER='.length)
+        const original = `CLAUDE_ANSWER_BEGIN=${nonce}\n${body}\nCLAUDE_ANSWER_END=${nonce}\n`
+        expect(artifact).toMatchObject({ response, redacted: true,
+          responseSha256: journal.claude.responseDigest, responseBytes: Buffer.byteLength(response),
+          sha256: createHash('sha256').update(original).digest('hex'), bytes: Buffer.byteLength(original) })
+      }
+      for (const raw of persisted) {
+        expect(raw).not.toContain(token)
+        expect(raw).not.toContain('synthetic-encoded-credential')
+        expect(raw).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
+      }
+      await fixture.restart()
+      const replay = await fixture.call('investigation', 'revision-two')
+      expect(replay.payload.claude).toMatchObject({ adopted: true, response, responseRedacted: true })
+      const after = JSON.parse(readFileSync(path, 'utf8'))
+      expect(after.prompt_count).toBe(1)
+      expect(after.close_count).toBe(1)
+      expect(after.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 40_000)
+
   test.each(['answer_file_receipt_delay_reads', 'answer_file_corrupt_reads'])('Claude file completion settles across polls without another prompt: %s', async field => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
@@ -1879,7 +2034,7 @@ print('review complete')
     } finally { await fixture.close() }
   }, 40_000)
 
-  test('Claude workspace作成前の失敗も残留requestで再試行を妨げない', async () => {
+  test('Claude workspace作成失敗は同じroundで再起動せず取得済み回答を保持する', async () => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
       const path = fixture.externalEvidence!.fakeHerdrState
@@ -1887,11 +2042,11 @@ print('review complete')
       state.create_failures = 1
       writeFileSync(path, JSON.stringify(state), { mode: 0o600 })
       const result = await fixture.call('investigation', 'revision-two')
-      expect(result.payload).toMatchObject({ complete: true, allAdopted: true,
-        slotSummary: { responsesObtained: 3 } })
+      expect(result.payload).toMatchObject({ attemptsFinished: true, allAdopted: false,
+        slotSummary: { responsesObtained: 2 } })
       const after = JSON.parse(readFileSync(path, 'utf8'))
       expect(after.create_failures).toBe(0)
-      expect(after.prompt_count).toBe(1)
+      expect(after.prompt_count).toBe(0)
       expect(after.owned).toBe(false)
     } finally { await fixture.close() }
   }, 180_000)
@@ -2167,6 +2322,34 @@ print('review complete')
     }
   }, 15_000)
 
+  test('macOS shimのrealpathがGitへ衝突してもPython helperを起動し回収する', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, developerShimCollision: true })
+    try {
+      const { payload } = await fixture.call('investigation', 'revision-two')
+      expect(payload.claude).toMatchObject({ adopted: true, executionState: 'response-obtained', cleanupVerified: true })
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
+      expect(state.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 30_000)
+
+  test('起動前snapshotが失敗してもClaudeを一度起動・回収してowned workspaceを閉じる', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, snapshotDepthOverflow: true })
+    try {
+      const { payload } = await fixture.call('investigation', 'revision-two')
+      expect(payload.claude).toMatchObject({ adopted: true, executionState: 'response-obtained', cleanupVerified: true })
+      const claude = payload.claude as { responseDiagnostic: { path: string }, cleanupWarnings: string[] }
+      expect(claude.cleanupWarnings).toContain('initial repository metadata snapshot was unavailable')
+      const diagnostic = JSON.parse(readFileSync(join(fixture.state, claude.responseDiagnostic.path), 'utf8'))
+      expect(diagnostic.snapshot).toMatchObject({ outcome: 'command-failed' })
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
+      expect(state.owned).toBe(false)
+    } finally { await fixture.close() }
+  }, 30_000)
+
   test('単一workflowはsnapshot不能な大型dirty fileでもreviewer transportを止めない', async () => {
     const fixture = await brokerFixture()
     try {
@@ -2249,20 +2432,37 @@ print('review complete')
     }
   }, 20_000)
 
-  test('単一workflowは初期phase前のreviewを外部起動前に拒否する', async () => {
-    const fixture = await brokerFixture({ writeEnabled: true })
-    try {
-      const review = await fixture.call('review', 'revision-two')
-      expect(review.result.isError).toBe(true)
-      expect(review.payload).toMatchObject({
-        complete: false,
-        reason: 'the attempt-wide initial-design advisor phase has not completed',
-      })
-      expect(readdirSync(fixture.journalRoot)).toEqual([])
-    } finally {
-      await fixture.close()
-    }
-  }, 15_000)
+  for (const designState of ['absent', 'malformed'] as const) {
+    test(`継続jobは初期設計ledgerが${designState}でも最終3者を一度だけ起動する`, async () => {
+      const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
+      try {
+        const revisionRoot = join(fixture.journalRoot,
+          `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`)
+        if (designState === 'malformed') {
+          mkdirSync(revisionRoot, { recursive: true, mode: 0o700 })
+          writeFileSync(join(revisionRoot, 'investigation-1.json'), '{broken', { mode: 0o600 })
+        }
+        const review = await fixture.call('review', 'revision-two')
+        expect(review.result.isError).not.toBe(true)
+        expect(review.payload).toMatchObject({
+          complete: true,
+          initialDesignStatus: 'not-recorded-this-attempt',
+          slotSummary: { total: 3, started: 3, responsesObtained: 3 },
+        })
+        expect(review.payload.initialDesignWarning).toContain('final review only')
+        const journalPath = join(revisionRoot, 'review-1.json')
+        const before = readFileSync(journalPath, 'utf8')
+        const repeated = await fixture.call('review', 'revision-two')
+        expect(repeated.payload).toMatchObject({
+          initialDesignStatus: 'not-recorded-this-attempt',
+          slotSummary: { total: 3, started: 3, responsesObtained: 3 },
+        })
+        expect(readFileSync(journalPath, 'utf8')).toBe(before)
+        if (designState === 'absent') expect(existsSync(join(revisionRoot, 'investigation-1.json'))).toBe(false)
+        else expect(readFileSync(join(revisionRoot, 'investigation-1.json'), 'utf8')).toBe('{broken')
+      } finally { await fixture.close() }
+    }, 20_000)
+  }
 
   test('単一workflowはrevisionが進んでも同じphaseを再起動しない', async () => {
     const fixture = await brokerFixture({ writeEnabled: true })
@@ -2377,7 +2577,9 @@ print('review complete')
       expect(retry.payload).toMatchObject({ complete: false, notStarted: true })
       const review = await fixture.poll('review', 'revision-two')
       expect(review.payload).toMatchObject({ complete: false, notStarted: true })
-      expect(String(review.payload.nextAction)).toContain('investigation before review-1')
+      expect(String(review.payload.nextAction)).toContain('Review-1 does not require an attempt-local initial-design round')
+      expect(String(review.payload.nextAction)).not.toContain('investigation before review-1')
+      expect(String(review.payload.nextAction)).toContain('mandatory fix delta')
       expect((await fixture.call('investigation', 'revision-two')).payload).toMatchObject({ complete: true })
       expect((await fixture.poll('investigation', 'revision-two')).payload).toMatchObject({ complete: true })
     } finally { await fixture.close() }
@@ -4072,3 +4274,194 @@ test('live processの証拠を後続の診断・close・監査失敗で弱めな
   expect(claudeContainmentFailureStatus(undefined, new Error('unverified')))
     .toBe('unverified-bounded-residual')
 })
+
+
+test('native request登録はMCP再起動を跨いで同じ依頼・identityを返す', async () => {
+  const fixture = await brokerFixture()
+  try {
+    const stale = await fixture.prepareNative(fixture.revisionOne)
+    expect(stale.staleInput).toBe(true)
+    const first = await fixture.prepareNative()
+    expect(first.taskName).toMatch(/^zero_native_[a-f0-9]{32}$/)
+    expect(first.prompt).toContain(String(first.marker))
+    await fixture.restart()
+    const restored = await fixture.prepareNative()
+    expect(restored).toEqual(first)
+  } finally { await fixture.close() }
+}, 30_000)
+
+
+test('追加指示後も登録済みGPT回答の元のbindingを保存し再起動後も取得済みと扱う', async () => {
+  const fixture = await brokerFixture({ externalSuccess: true })
+  try {
+    const registered = await fixture.prepareNative()
+    const newer = fixture.stageRevision('追加の受入条件。元のレビュー回答も保持する。')
+    const preparedAgain = await fixture.prepareNative(newer)
+    expect(preparedAgain.marker).toBe(registered.marker)
+    const answer = `Original independent findings.\n${registered.marker}`
+    const { result, payload } = await fixture.call('investigation', newer, 'adopted', 1, {
+      nativeAgentId: String(registered.agentPath), nativeResponse: answer,
+    })
+    expect(result.isError).not.toBe(true)
+    expect(payload).toMatchObject({ allAdopted: true, scopeAssessmentRequired: true,
+      inputRevision: newer.revision, slotSummary: { responsesObtained: 3 },
+      native: [{ adopted: true, inputRevision: fixture.revisionTwo.revision,
+        inputDigest: fixture.revisionTwo.digest, responseDigest: nativeAdvisorResponseDigest(answer) }] })
+    await fixture.restart()
+    const restored = await fixture.call('investigation', newer, 'adopted', 1, {
+      nativeAgentId: String(registered.agentPath), nativeResponse: answer,
+    })
+    expect(restored.payload).toMatchObject({ allAdopted: true, scopeAssessmentRequired: true,
+      native: [{ inputRevision: fixture.revisionTwo.revision, inputDigest: fixture.revisionTwo.digest }] })
+  } finally { await fixture.close() }
+}, 30_000)
+
+test('登録済みGPT回答を新しい入力markerへ書き換えて渡した場合は採択しない', async () => {
+  const fixture = await brokerFixture()
+  try {
+    await fixture.prepareNative()
+    const newer = fixture.stageRevision('別の要件を追加')
+    const result = await fixture.call('investigation', newer)
+    expect(result.result.isError).toBe(true)
+    expect(result.payload.reason).toContain('round marker')
+  } finally { await fixture.close() }
+}, 30_000)
+
+
+test('同じClaudeの接続確認が連続失敗しても再送やcloseをせず完全回答を回収する', async () => {
+  const fixture = await brokerFixture({ externalSuccess: true })
+  try {
+    const path = fixture.externalEvidence!.fakeHerdrState
+    const initial = JSON.parse(readFileSync(path, 'utf8'))
+    initial.connection_failures = 4
+    writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
+    const result = await fixture.call('investigation', 'revision-two')
+    expect(result.payload).toMatchObject({ allAdopted: true, claude: { adopted: true, cleanupVerified: true } })
+    const final = JSON.parse(readFileSync(path, 'utf8'))
+    expect(final.connection_failures).toBe(0)
+    expect(final.prompt_count).toBe(1)
+    expect(final.close_count).toBe(1)
+    expect(final.owned).toBe(false)
+  } finally { await fixture.close() }
+}, 60_000)
+
+test('Claude認証確認は未loginから回復するまで再確認しloginやpromptは送らない', async () => {
+  const root = fixtureDir()
+  const executable = join(root, 'claude')
+  const marker = join(root, 'ready')
+  const calls = join(root, 'calls')
+  writeFileSync(executable, '#!/usr/bin/python3\nimport os,sys,time\ntime.sleep(0.2)\nassert sys.argv[1:] == ["auth","status","--json"]\nwith open(' + JSON.stringify(calls) + ',"a") as f: f.write("check\\n")\nprint(\'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\' if os.path.exists(' + JSON.stringify(marker) + ') else \'{"loggedIn":false}\')\n', { mode: 0o700 })
+  let waits = 0
+  await waitForClaudeSubscriptionLogin({ ...brokerEnvironment(), ZEROKUN_CLAUDE_BIN_PATH: executable }, {
+    wait: async () => { if (++waits === 4) writeFileSync(marker, 'ready') },
+  })
+  expect(waits).toBe(4)
+  expect(readFileSync(calls, 'utf8').trim().split('\n')).toHaveLength(5)
+}, 15_000)
+
+
+test('blocked状態の両画面読取りが連続失敗しても接続回復まで同じClaudeを保持する', async () => {
+  const fixture = await brokerFixture({ externalSuccess: true, claudeBlocked: true })
+  try {
+    const path = fixture.externalEvidence!.fakeHerdrState
+    const initial = JSON.parse(readFileSync(path, 'utf8'))
+    initial.failure_screen_failures = 8
+    writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
+    const result = await fixture.call('investigation', 'revision-two')
+    expect(result.payload).toMatchObject({ allAdopted: true, claude: { adopted: true, cleanupVerified: true } })
+    const final = JSON.parse(readFileSync(path, 'utf8'))
+    expect(final.failure_screen_failures).toBe(0)
+    expect(final.prompt_count).toBe(1)
+    expect(final.close_count).toBe(1)
+  } finally { await fixture.close() }
+}, 60_000)
+
+
+test('未loginの待機理由をpollへ返し、認証回復後に同じroundだけを開始する', async () => {
+  const ready = join(fixtureDir(), 'authenticated')
+  let notified = false
+  const fixture = await brokerFixture({ externalSuccess: true, claudeAuthReadyFile: ready,
+    onPendingResult: payload => {
+      if (!payload.waitingForAuthentication) return
+      expect(payload.waitingForAuthentication).toContainEqual(expect.objectContaining({ advisor: 'claude', cause: 'authentication' }))
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.prompt_count).toBe(0)
+      expect(state.owned).toBe(false)
+      notified = true
+      writeFileSync(ready, 'synthetic readiness', { mode: 0o600 })
+    },
+  })
+  try {
+    expect((await fixture.call('investigation', 'revision-two')).payload).toMatchObject({ allAdopted: true })
+    expect(notified).toBe(true)
+    const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+    expect(state.prompt_count).toBe(1)
+    expect(state.close_count).toBe(1)
+  } finally { await fixture.close() }
+}, 60_000)
+
+
+test('blockedの主読取りtimeoutをfallback読取りの非対応errorで上書きしない', async () => {
+  const fixture = await brokerFixture({ externalSuccess: true, claudeBlocked: true })
+  try {
+    const path = fixture.externalEvidence!.fakeHerdrState
+    const initial = JSON.parse(readFileSync(path, 'utf8'))
+    initial.failure_screen_failures = 3
+    initial.visible_read_error = 'invalid_params'
+    writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
+    expect((await fixture.call('investigation', 'revision-two')).payload).toMatchObject({ allAdopted: true })
+    const final = JSON.parse(readFileSync(path, 'utf8'))
+    expect(final.failure_screen_failures).toBe(0)
+    expect(final.prompt_count).toBe(1)
+    expect(final.close_count).toBe(1)
+  } finally { await fixture.close() }
+}, 60_000)
+
+test('認証待ち後の終端設定errorはGrok待機中のpollへ古い認証待ちを残さない', async () => {
+  const ready = join(fixtureDir(), 'authenticated')
+  let notified = false, cleared = false
+  const fixture = await brokerFixture({ externalSuccess: true, claudeAuthReadyFile: ready,
+    claudeAuthConfigurationAfterReady: true, grokDelaySeconds: 45,
+    onPendingResult: payload => {
+      if (payload.waitingForAuthentication) {
+        notified = true
+        writeFileSync(ready, 'synthetic readiness', { mode: 0o600 })
+      } else if (notified) cleared = true
+    },
+  })
+  try {
+    expect((await fixture.call('investigation', 'revision-two')).payload).toMatchObject({
+      claude: { adopted: false, failure: { cause: 'configuration' } },
+    })
+    expect(notified).toBe(true)
+    expect(cleared).toBe(true)
+    const final = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+    expect(final.prompt_count).toBe(0)
+    expect(final.owned).toBe(false)
+  } finally { await fixture.close() }
+}, 65_000)
+
+
+test('親の回答完成で未完了Claudeをexact cleanupしGrok回答を保持してroundを解放する', async () => {
+  let stopped = false
+  const fixture = await brokerFixture({ externalSuccess: true, claudeBlocked: true,
+    onPendingResult: () => {
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      if (stopped || state.prompt_count !== 1) return
+      stopped = true
+      requestAdvisorStop(join(fixture.journalRoot, 'active-round.lock'))
+    },
+  })
+  try {
+    const result = await fixture.call('investigation', 'revision-two')
+    expect(stopped).toBe(true)
+    expect(result.payload).toMatchObject({ attemptsFinished: true, allAdopted: false,
+      claude: { adopted: false, cleanupVerified: true } })
+    expect((result.payload.grok as Array<{ adopted: boolean }>).every(slot => slot.adopted)).toBe(true)
+    const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+    expect(state.prompt_count).toBe(1)
+    expect(state.close_count).toBe(1)
+    expect(state.owned).toBe(false)
+    expect(existsSync(join(fixture.journalRoot, 'active-round.lock'))).toBe(false)
+  } finally { await fixture.close() }
+}, 60_000)

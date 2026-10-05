@@ -22,7 +22,7 @@ export function assertClaudeAuthStatus(result: AuthCommandResult): void {
   const fail = (cause: AdvisorFailure['cause'], diagnostic: string): never => {
     throw new AdvisorFailureError({ advisor: 'claude', cause }, diagnostic)
   }
-  if (result.timedOut) fail('timeout', 'Claude authentication status timed out')
+  if (result.timedOut) fail('auth-check', 'Claude authentication status timed out')
   if (result.forcedCleanup || result.outputTruncated) fail('auth-check', 'Claude subscription login could not be verified: incomplete command result')
   let parsed: unknown
   try { parsed = JSON.parse(result.stdout) } catch {}

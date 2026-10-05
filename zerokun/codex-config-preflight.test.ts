@@ -192,6 +192,26 @@ async function check(testCase: Parameters<typeof fixture>[0]): Promise<void> {
 }
 
 describe('Codex app-server config preflight', () => {
+  test('official Chrome plugin is accepted only when the isolated config retained it', async () => {
+    const desktopOverrides = [...overrides,
+      'plugins={"chrome@openai-bundled"={enabled=true},"computer-use@openai-bundled"={enabled=false}}',
+    ]
+    const config = Bun.TOML.parse(desktopOverrides.join('\n')) as any
+    const session = {
+      async request(method: string) {
+        return { requestId: 1, result: method === 'configRequirements/read' ? { requirements: null } : { config } }
+      },
+    }
+    await assertCurrentAppServerCodexPermissionConfig(session, '/repo', desktopOverrides, profile)
+    config.plugins['unexpected@local'] = { enabled: true }
+    await expect(assertCurrentAppServerCodexPermissionConfig(session, '/repo', desktopOverrides, profile))
+      .rejects.toThrow('authorized desktop scope')
+    delete config.plugins['unexpected@local']
+    config.plugins['chrome@openai-bundled'].enabled = false
+    await expect(assertCurrentAppServerCodexPermissionConfig(session, '/repo', desktopOverrides, profile))
+      .rejects.toThrow('authorized desktop scope')
+  })
+
   const advisorDefinition = {
     command: '/usr/bin/false', args: [], enabled: true, required: false,
     enabled_tools: ['advisor_round', 'advisor_round_poll'],
@@ -319,6 +339,33 @@ describe('Codex app-server config preflight', () => {
       session, '/repo', overrides, profile,
     )
     expect(calls).toEqual(['configRequirements/read', 'config/read'])
+
+    const delegatedOverrides = overrides.map(value => value === 'approval_policy="never"'
+      ? 'approval_policy="on-request"' : value).concat('approvals_reviewer="auto_review"')
+    const delegatedConfig = { ...effective, approval_policy: 'on-request', approvals_reviewer: 'auto_review' }
+    const delegatedSession = (requirements: unknown, config: unknown = delegatedConfig) => ({
+      async request(method: string) {
+        return { requestId: 1, result: method === 'configRequirements/read'
+          ? { requirements } : { config } }
+      },
+    })
+    await assertCurrentAppServerCodexPermissionConfig(delegatedSession({
+      allowedApprovalPolicies: ['on-request'], allowedApprovalsReviewers: ['auto_review'],
+      autoReview: { requiredOnModels: ['gpt-test'], ignoreRules: [] },
+    }), '/repo', delegatedOverrides, profile)
+    for (const requirements of [
+      { allowedApprovalPolicies: ['never'] },
+      { allowedApprovalsReviewers: ['user'] },
+      { autoReview: { requiredOnModels: 'invalid' } },
+    ]) {
+      await expect(assertCurrentAppServerCodexPermissionConfig(
+        delegatedSession(requirements), '/repo', delegatedOverrides, profile,
+      )).rejects.toThrow('managed requirements')
+    }
+    await expect(assertCurrentAppServerCodexPermissionConfig(
+      delegatedSession(null, { ...delegatedConfig, approvals_reviewer: 'user' }),
+      '/repo', delegatedOverrides, profile,
+    )).rejects.toThrow('effective approvals reviewer mismatch')
 
     const socketOverrides = [...overrides, `permissions.${profile}.network.unix_sockets={"/private/tmp/owned-job"="allow"}`]
     for (const sockets of [
