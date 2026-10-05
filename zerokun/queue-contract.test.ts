@@ -259,7 +259,10 @@ describe('Zero-kun Codex wiring', () => {
     expect(runner).not.toContain("'確認します 👀'")
     expect(runner).not.toContain('確認を始めますね')
     expect(runner).not.toContain('時間がかかる場合は、途中経過もこのスレッドでお知らせします')
-    expect(runner).toContain('できました ✅')
+    // 終了報告の1行目は読む人の出番を表す。本人の書きぶりに任せない。
+    expect(runner).toContain('✅ 完了 ／ 対応不要')
+    expect(runner).toContain('🙋 要判断 ／ あなたの決定が要ります')
+    expect(runner).toContain('⏸️ 待ち ／ あなたの作業が要ります')
     expect(runner).not.toContain(' worker=${job.workerId}')
     expect(runner).not.toContain('Zeroちゃんの job ${job.id.slice')
     expect(runner).not.toContain('Codexの処理が完了しました。')

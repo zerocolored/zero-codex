@@ -344,8 +344,183 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
     })
     expect(prompt).toContain('attachments delivered=0/0')
     expect(prompt).toContain('do not merely repeat that approval is pending')
+    // ブロック報告が「何を調査したか」から始まると、読む人には何をしてほしいのか
+    // 分からない情報の羅列になる(2026-09-28 のオーナー指摘)。goal の objective は
+    // 既存スレッドでは差し替わらないので、毎回組み立て直すこの prompt に必ず入れる。
+    expect(prompt).toContain('お願い: <誰> が <何> してください')
+    expect(prompt).toContain('Do not open with what you')
+    expect(prompt).toContain('If you genuinely need nothing from the reader')
+    // 自分のサンドボックスが *KEY* を落とすことを知らないと「管理者が
+    // SUPABASE_SERVICE_ROLE_KEY を設定してください」という叶わない依頼で止まる
+    // (2026-09-28 実測)。除外規則と代替経路を毎回の prompt に入れる。
+    expect(prompt).toContain('Environment and credentials:')
+    expect(prompt).toContain('*TOKEN*, *SECRET*, *PASSWORD*, *KEY*, SLACK_* or ZEROKUN_*, and CODEX_HOME')
+    expect(prompt).toContain('Never ask anyone to set such a variable')
+    expect(prompt).toContain('dotenvx -q run -- <command>')
+    // 除外は引き継いだ変数にしか効かない。これを知らないと、別環境の資格情報を
+    // 使う手段が設定ファイルの書き換えしかないと思い込んで止まる(2026-09-29 実測)。
+    expect(prompt).toContain('applies only to variables inherited from the host')
+    expect(prompt).toContain('reaches that command untouched')
+    // 1行目の出番表示はホストが付ける。本人が状態を言い直すと本文が埋もれる。
+    expect(prompt).toContain('Slack brevity:')
+    expect(prompt).toContain('three short lines or fewer')
+    // 別環境の資格情報を「人からもらうもの」と思い込んで止まっていた。取りに
+    // 行く経路と、書き残さない条件を対にして伝える(2026-09-29 実測)。
+    expect(prompt).toContain('obtain them')
+    expect(prompt).toContain('the same source the deployment itself reads')
+    expect(prompt).toContain('Never write such a value into a file')
+    // 窓口があることを知らないと、置くだけの作業を毎回人へ投げて止まる。
+    // 戻し忘れた実機は本番と見分けがつかないので、報告も義務づける。
+    expect(prompt).toContain('zerokun_app_swap can')
+    expect(prompt).toContain('always restore once the verification is finished')
+    expect(prompt).toContain('Do not ask anyone to move an')
+    // CIはマージ結果を検査するので、ブランチ単体が通っても落ちる。ログを
+    // 読めないときは手元で同じ条件を作って再現させる(2026-09-28 実測)。
+    expect(prompt).toContain('CI verification:')
+    expect(prompt).toContain('against the MERGE of your branch and its')
+    expect(prompt).toContain('"Cause undetermined" is only acceptable after that reproduction also comes back clean')
     const other = store.enqueue(input({ threadTs: '1800000000.000999', messageId: '1800000000.000999' })).job
     expect(store.previousSlackDelivery(other.id)).toBeUndefined()
+  } finally { store.close() }
+})
+
+test('Computer Useで画面が取れないときは人へ頼む前にホストの表示状態を自分で読ませる', () => {
+  // 2026-09-25・09-30 に、蓋の閉じたホストで cgWindowNotFound を受けた計4ジョブが、表示状態を
+  // 確かめずに「検証用Macで bellMe のウィジェットを前面表示してください」と頼んで止まった。
+  // 前面化は実測で何も変えず、効く依頼は蓋を開ける(外部ディスプレイを繋ぐ)こと。蓋が開いていて画面だけ
+  // 消えているなら、画面を点けてもらう。
+  const store = makeStore()
+  try {
+    store.enqueue(input({ writeEnabled: true }))
+    const job = store.claimNext('display-state-worker')!
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+    const host = { attemptNonce: 'a'.repeat(32), artifactDir: '/tmp/display-outbox', advisorEnabled: false }
+    // 本番の complete stage は browserEnabled と computerUseEnabled を同じ値で渡す。
+    const prompt = buildCodexWorkerPrompt(job, snapshot, {
+      ...host, browserEnabled: true, computerUseEnabled: true,
+    })
+    // 引き金と順序: Computer Use で画面が取れなかったら、人へ頼む前に蓋と画面の状態を自分で読む。
+    expect(prompt).toContain('Host display state: when Computer Use returns cgWindowNotFound (error -10005), a Computer Use request')
+    expect(prompt).toContain("times out, or any Computer Use screen capture (get_app_state or a screenshot) fails or comes back entirely black, read this Mac's display")
+    expect(prompt).toContain('state yourself before you ask anyone for anything.')
+    expect(prompt).toContain('`ioreg -r -k AppleClamshellState -d 4 | grep AppleClamshellState`')
+    expect(prompt).toContain('"AppleClamshellState" = Yes means the lid is closed')
+    expect(prompt).toContain('`pmset -g log | grep -E "Display is turned (on|off)|Clamshell" | tail -n 5`')
+    // 何も出力されなければ状態は不明。蓋が開いている・画面が点いている、とは読まない。
+    expect(prompt).toContain('A command that prints nothing leaves its state unknown; never read that as an open lid or a display that is on.')
+    // 外部ディスプレイで使う Mac は蓋が閉じていても画面が点いたまま。蓋が原因と言えるのは、直近の点灯の
+    // 後に 'Clamshell Sleep' が来たときだけ。蓋が閉じていた間は点灯から 'Clamshell Sleep' までが
+    // 111回中110回で12秒以内だったので、点いた直後なら30秒後に読み直させる。
+    expect(prompt).toContain('With the lid closed, the lid is the cause when a "Clamshell Sleep" line comes after the latest')
+    expect(prompt).toContain('"Display is turned on" line. If the lid is closed and the display turned on last, read the log again 30 seconds later;')
+    expect(prompt).toContain('a new "Clamshell Sleep" line means the display wakes only for seconds, so a capture that worked once')
+    // 蓋が閉じたままでも 'Wake Back to Sleep' で 'Clamshell Sleep' なしに消えることがある(09-30 11:40 実測)。
+    // 蓋を原因から外すのは、読み直しても点いたままのときだけにする。
+    expect(prompt).toContain('is not a recovery. If instead the latest line still shows the display turned on and no "Clamshell Sleep"')
+    expect(prompt).toContain('line has appeared, something such as an external display is keeping this Mac awake with the lid closed')
+    expect(prompt).toContain('and the lid is not the cause; the same holds once someone replies that an external display is connected and on.')
+    expect(prompt).not.toContain('If none appears')
+    // 依頼は既存の「お願い: <誰> が <何> してください」の形で、誰がどの Mac の蓋を開けるかまで書く。
+    expect(prompt).toContain('If the lid is the cause, or "AppleClamshellState" = Yes and either the latest line shows the display turned off')
+    // 蓋が閉じていると確定して pmset が何も出さないときも、蓋を開ける依頼は実行できるのでそれを頼む。
+    expect(prompt).toContain('or the pmset command prints nothing,')
+    // 蓋が開いている(または蓋の無い)Mac で画面だけ消えているときに蓋を頼むと、叶わない依頼がまた繰り返される。
+    expect(prompt).toContain('Otherwise, when ioreg shows "AppleClamshellState" = No and the latest line shows the display')
+    expect(prompt).toContain('turned off, never ask anyone to open the lid; your single request is')
+    expect(prompt).toContain('`お願い: <誰> が <このMacの名前> の画面を点けてください（キーかトラックパッドに触れる。外部ディスプレイならその電源を入れる）`')
+    // ioreg が何も出さないときは蓋の状態が不明(蓋の無い Mac もここに来る)。閉じた蓋に「画面を点けて」だけを
+    // 頼むと叶わないので、蓋の有無どちらでも実行できる1つの依頼にする。
+    expect(prompt).not.toContain('"AppleClamshellState" = No or prints nothing')
+    expect(prompt).toContain('When ioreg prints nothing and the latest line shows the display turned off, the lid state is unknown,')
+    expect(prompt).toContain('`お願い: <誰> が <このMacの名前> の画面を点けてください（蓋のあるMacで蓋が閉じていれば開ける。それ以外はキーかトラックパッドに触れるか、外部ディスプレイの電源を入れる）`')
+    expect(prompt).not.toContain('If the lid is the cause or the latest line shows the display turned off')
+    expect(prompt).toContain('`お願い: <誰> が <このMacの名前> の蓋を開けてください（または外部ディスプレイを繋いでください）`')
+    expect(prompt).toContain('naming as <誰> the person or role who can physically reach this Mac and taking its name from `scutil --get ComputerName`.')
+    // 前面化は layer・onscreen・bounds を何も変えなかった。言い換えや別の担い手を経由した依頼も同じ。
+    expect(prompt).toContain('In any of these states never ask anyone, directly or through someone else, to bring an app or its widget')
+    expect(prompt).toContain('to the front or to show it again; making it frontmost was measured to change nothing.')
+    // bellMe(DEV 版も同じ窓設定)は通常の窓より上の floating level に居続ける窓で、前面化は効かない。
+    // 画面が点いていれば Computer Use はこの窓を取れる(同じ job で成功と cgWindowNotFound が交互に出た)。
+    expect(prompt).toContain('When Computer Use cannot find or capture bellMe (com.bellsalesai.live-agent, or com.bellsalesai.live-agent.dev')
+    expect(prompt).toContain('for its dev build), a bring-to-front request is never the fix: its UI is an untitled, transparent, borderless')
+    expect(prompt).toContain('window kept above ordinary windows at floating level (NSFloatingWindowLevel), not an ordinary window.')
+    // 蓋を閉じた sleep は idle sleep ではないので、caffeinate では画面は点かない。
+    expect(prompt).toContain('Neither caffeinate nor a PreventUserIdleDisplaySleep assertion keeps the display on while the lid')
+    expect(prompt).toContain('is closed, since a closed lid is not idle sleep; never propose them as a workaround.')
+    // ジョブの箱の中の screencapture は画面が点いていても失敗する。表示状態の証拠にしない。
+    expect(prompt).toContain('A shell `screencapture` inside this sandbox fails with "could not create image from display" even')
+    expect(prompt).toContain('while the display is on, so that failure alone proves nothing about the display.')
+    // ブラウザの道具は既存の規定どおり実際のエラーを報告する。ヘッドレスの検証器は画面を使わない。
+    expect(prompt).toContain('This rule does not cover browser tools, whose own rules apply: report a go-chrome-mcp or')
+    expect(prompt).toContain('zerokun_browser.verify_local_page failure with its actual tool error; the headless verifier never uses the display.')
+    // 毎回組み立て直す信頼済みの host control の中に置く。
+    const rule = prompt.indexOf('Host display state:')
+    expect(rule).toBeGreaterThan(prompt.indexOf('--- Zero host control (trusted'))
+    expect(rule).toBeLessThan(prompt.indexOf('--- end Zero host control ---'))
+    // read-only の箱では pmset -g log が記録を読めず、grep と tail を通すと exit 0 の空出力に
+    // なって表示状態を誤読させる(2026-09-30 実測)。Computer Use を持つ書き込み job にだけ渡す。
+    expect(buildCodexWorkerPrompt(job, snapshot, { ...host, browserEnabled: true }))
+      .not.toContain('Host display state:')
+    expect(buildCodexWorkerPrompt({ ...job, writeEnabled: false }, snapshot, {
+      ...host, browserEnabled: true, computerUseEnabled: true,
+    })).not.toContain('Host display state:')
+  } finally { store.close() }
+})
+
+test('ブラウザはComputer Useで動かさず、Go Chrome MCPは公式Chromeが使えないときだけ使わせる', () => {
+  // 2026-10-05 に main #151(公式Chromeを隔離jobの第一選択に戻す)を取り込んだとき、同じ browser
+  // ブロックへ両サイドの文がそのまま残り、feae772 の「ブラウザのことは何でも go-chrome-mcp で」と
+  // #151 の「Go Chrome MCP は公式Chromeが使えないときだけ」が並んだ。worker が前者を採ると #151 の
+  // 修正が実行時に打ち消される。Chrome を Computer Use で動かさないこと(feae772)と経路の優先順位
+  // (#151)は両立するので、経路の優先順位は #151 の行だけに持たせ、Computer Use を外す文からは
+  // 道具名を外して下の行へ送る。
+  const store = makeStore()
+  try {
+    store.enqueue(input({ writeEnabled: true }))
+    const job = store.claimNext('browser-route-worker')!
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+    const host = { attemptNonce: 'a'.repeat(32), artifactDir: '/tmp/browser-route-outbox', advisorEnabled: false }
+    const prompt = buildCodexWorkerPrompt(job, snapshot, {
+      ...host, browserEnabled: true, computerUseEnabled: true,
+    })
+    // 信頼済みの host control だけを見る。Slack 本文に go-chrome-mcp が混じっても誤爆させない。
+    const start = prompt.indexOf('--- Zero host control (trusted')
+    const end = prompt.indexOf('--- end Zero host control ---')
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(end).toBeGreaterThan(start)
+    const control = prompt.slice(start, end)
+    // Chrome へアプリ承認を与えられないので、ブラウザを Computer Use で動かす試みは必ず失敗する。
+    expect(control).toContain('Chrome is not a Computer Use target. Its app approval cannot be granted to a Slack job, so')
+    expect(control).toContain('driving the browser through Computer Use always fails; use the browser capabilities below')
+    expect(control).toContain('for anything in the browser and keep Computer Use for the desktop application under test.')
+    // 経路は公式Chromeが先。Go Chrome MCP はそれが使えないときのフォールバックに留める。
+    expect(control).toContain('For the operator’s signed-in Chrome, first follow the installed official Chrome skill')
+    expect(control).toContain('Go Chrome MCP is a separate extension connection. Use it only when the official Chrome')
+    expect(control).toContain('capability is unavailable and the applicable browser instructions permit that fallback.')
+    // フォールバック宣言の2行の間へ別の文が割り込むのが今回直した事故の形なので、続きであることも固定する。
+    expect(control).toContain('Use it only when the official Chrome\ncapability is unavailable and the applicable browser instructions permit that fallback.')
+    // 無条件に go-chrome-mcp を優先させる指示は、言い換えても入れない。Go Chrome MCP に触れる行は
+    // フォールバック宣言・tabs_list の手順・表示状態規則の例示の3行だけで、4行目が増えたら落とす。
+    expect(control).not.toContain('use go-chrome-mcp for anything in the')
+    expect(control).not.toContain('use go-chrome-mcp when exposed')
+    const goChromeLines = control.split('\n').filter(line => /go.?chrome.?mcp/i.test(line))
+    for (const line of goChromeLines) {
+      expect(line).toMatch(/Use it only when the official Chrome|begin with tabs_list|whose own rules apply/)
+    }
+    expect(goChromeLines).toHaveLength(3)
+    // 'the browser capabilities below' が指す先を保つため、Computer Use を外す文を経路の説明より前に置く。
+    const exclusion = control.indexOf('Chrome is not a Computer Use target.')
+    const official = control.indexOf('first follow the installed official Chrome skill')
+    const fallback = control.indexOf('Go Chrome MCP is a separate extension connection.')
+    expect(exclusion).toBeGreaterThanOrEqual(0)
+    expect(official).toBeGreaterThan(exclusion)
+    expect(fallback).toBeGreaterThan(official)
+    // browser を渡さない job へは Chrome の経路説明そのものを出さない。
+    expect(buildCodexWorkerPrompt(job, snapshot, { ...host, computerUseEnabled: true }))
+      .not.toContain('Chrome is not a Computer Use target')
+    expect(buildCodexWorkerPrompt({ ...job, writeEnabled: false }, snapshot, {
+      ...host, browserEnabled: true, computerUseEnabled: true,
+    })).not.toContain('Chrome is not a Computer Use target')
   } finally { store.close() }
 })
 
@@ -5085,7 +5260,8 @@ describe('single FIFO worker', () => {
     })
     await notifier.failed(stoppedJob, stoppedReason)
     expect(posted).toEqual([
-      '🛑 停止操作により中断しました。'
+      '🛑 中止 ／ 対応不要'
+        + `\n\n<@${stoppedJob.userId}> 停止操作により中断しました。`
         + `\n原因: ${stoppedReason}`
         + `\nキュー #${stoppedJob.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
     ])
@@ -12216,6 +12392,30 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(runtime.path).not.toContain('relative')
   })
 
+  test.skipIf(process.platform !== 'darwin' || !existsSync('/opt/homebrew/Caskroom'))(
+    'Homebrew cask の実体(Caskroom)も読めるようにする',
+    () => {
+      // Homebrew は formula を Cellar、cask を Caskroom へ置く。bin の symlink は
+      // どちらの実体も指すため、Caskroom を落とすと cask で入れた実行体は
+      // sandbox から辿れず起動できない。2026-09-28、Cloud Logging コネクタが
+      // 「gcloud の起動拒否」で使えなかったのはこれが原因。
+      const dir = fixtureDir()
+      const runtime = resolveCodexToolchainRuntime({
+        sourcePath: '/opt/homebrew/bin:/usr/bin:/bin',
+        repoPath: join(dir, 'repo'),
+        stateDir: join(dir, 'state'),
+        artifactDir: join(dir, 'outbox'),
+        scratchDir: join(dir, 'tmp'),
+        homeDir: dir,
+      })
+      expect(runtime.readPaths).toContain(realpathSync('/opt/homebrew/Caskroom'))
+      // formula 側の実体も従来どおり読める。
+      if (existsSync('/opt/homebrew/Cellar')) {
+        expect(runtime.readPaths).toContain(realpathSync('/opt/homebrew/Cellar'))
+      }
+    },
+  )
+
   test.skipIf(process.platform !== 'darwin')(
     'macOSでは選択中の開発者directoryを読めるようにする',
     () => {
@@ -12338,13 +12538,21 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       const primaryPath = (Bun.TOML.parse(overrides) as any).shell_environment_policy.set.PATH
       expect(primaryPath.split(':')).toContain('/usr/bin')
       expect(primaryPath).not.toContain(`${join(homedir(), '.codex')}/`)
-      expect(overrides).toContain('"*PROXY*"')
+      // codex は network_proxy 有効時に HTTP_PROXY/HTTPS_PROXY/ALL_PROXY を
+      // 子シェルへ渡す。除外すると直接接続しか残らず seatbelt の EPERM で
+      // ジョブが一切通信できなくなる(2026-09-28 実測)。
+      expect(overrides).not.toContain('"*PROXY*"')
       expect(overrides).toContain('network.enabled=true')
       expect(overrides).toContain('network.allow_local_binding=true')
       expect(overrides).toContain('features.network_proxy=true')
       expect((Bun.TOML.parse(overrides) as any).permissions.zerokun_job.network.domains).toEqual({'*': 'allow'})
       expect(overrides).toContain('approval_policy="on-request"')
       expect(overrides).toContain('approvals_reviewer="auto_review"')
+      // アプリ承認は config から与えられない。bundle_ids も default_app_access も
+      // 設定としては通るが実行時の判定に使われない(2026-09-29 実測)。効かない
+      // 設定を置くと、許可済みだと誤解したまま原因を探すことになる。
+      expect(overrides).not.toContain('computer_use.macos.bundle_ids')
+      expect(overrides).not.toContain('computer_use.default_app_access')
       expect(overrides).toContain('features.apps=false')
       expect(overrides.split('\n').filter(value => value.startsWith('model=')))
         .toEqual(['model="gpt-6-astra"'])
@@ -13379,7 +13587,10 @@ describe('Slack output guard', () => {
       postMessage: async value => { posted.push(value.text) },
     })
     await notifier.progress(job, raw, 'progress-self-question')
-    expect(posted).toEqual([sanitized])
+    // 本文の除去が主題。1行目の出番表示は別責務。
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('💬 経過 ／ 対応不要')
+    expect(posted[0]).toEndWith(sanitized)
     store.close()
   })
 
@@ -13452,7 +13663,34 @@ describe('Slack output guard', () => {
     await notifier.progress(job, '💬 原因を確認しています 🔎', 'commentary-prefix')
     await notifier.progress(job, '通常の進捗です 🧪', 'ordinary-progress')
 
-    expect(posted).toEqual(['原因を確認しています 🔎', '通常の進捗です 🧪'])
+    expect(posted).toHaveLength(2)
+    expect(posted[0]).toStartWith('💬 経過 ／ 対応不要')
+    expect(posted[0]).toEndWith('原因を確認しています 🔎')
+    expect(posted[1]).toEndWith('通常の進捗です 🧪')
+    // 経過では宛先を付けない。毎回通知するとうるさい。
+    for (const text of posted) expect(text).not.toContain(`<@${job.userId}>`)
+    store.close()
+  })
+
+  // 途中で返事が要る投稿が、ただの経過と同じ見た目だと埋もれる。本人が依頼を
+  // `お願い:` で書き出したときだけ要判断にし、そこで初めて宛先を付ける。
+  test('途中でも返事が要る投稿は要判断として依頼者を宛先にする', async () => {
+    const store = makeStore()
+    const job = store.enqueue(input({ messageId: 'progress-decision' })).job
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+
+    await notifier.progress(job, 'お願い: 表示方向を決めてください。', 'progress-decision')
+    await notifier.progress(job, '比較サンプルを用意しています。', 'progress-plain')
+
+    expect(posted).toHaveLength(2)
+    expect(posted[0]).toStartWith('🙋 要判断 ／ あなたの決定が要ります')
+    expect(posted[0]).toContain(`<@${job.userId}>`)
+    expect(posted[0]).toEndWith('お願い: 表示方向を決めてください。')
+    expect(posted[1]).toStartWith('💬 経過 ／ 対応不要')
+    expect(posted[1]).not.toContain(`<@${job.userId}>`)
     store.close()
   })
 
@@ -13472,7 +13710,8 @@ describe('Slack output guard', () => {
     await notifier.failed(job, raw)
 
     expect(posted).toEqual([
-      '🙇 うまく完了できませんでした。'
+      '🛑 失敗 ／ 対応不要（私が追います）'
+        + `\n\n<@${job.userId}> うまく完了できませんでした。`
         + '\n原因: 補助レビューの回答と保存履歴を照合できませんでした。'
         + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
     ])
@@ -13754,7 +13993,11 @@ describe('Slack output guard', () => {
       store.get(queued.id) ?? running,
       '5つの独立レビュー枠をすべて試行しました。残る3枠は利用不能でした。通常回答です。',
     )
-    expect(posted).toEqual(['通常回答です。'])
+    // 本文からadvisor自己申告が除かれることが主題。1行目の出番表示と宛先は別責務。
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toEndWith('通常回答です。')
+    expect(posted[0]).not.toContain('独立レビュー枠')
 
     posted.length = 0
     await notifier.completed(
@@ -13769,7 +14012,9 @@ describe('Slack output guard', () => {
       + '初期設計—起動5/5・回答4/5・起動済み回答未確認1/5'
       + '・起動未確認0/5・起動前利用不能0/5。'
     await notifier.completed(store.get(queued.id) ?? running, observed)
-    expect(posted).toEqual([observed])
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toEndWith(observed)
     store.close()
   })
 
@@ -13858,7 +14103,9 @@ describe('Slack output guard', () => {
     })
     const saved = store.get(queued.id)!
     await notifier.completed(saved, saved.result!)
-    expect(posted).toEqual([answer])
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toEndWith(answer)
     store.close()
   })
 
@@ -15584,7 +15831,9 @@ describe('durable terminal notifications', () => {
     await flushTerminalNotifications(store, notifier, () => {}, 1)
     await flushTerminalNotifications(store, notifier, () => {}, 1)
     expect(posted).toHaveLength(1)
-    expect(posted[0]).not.toContain('未完了・待機中')
+    // 完了は無印にしない。読まずに「対応不要」と分かることが目的。
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toContain(`<@${job.userId}>`)
     expect(posted[0]).toContain('回答2/3')
     expect(store.get(job.id)?.taskGoalStatus).toBe('complete')
     expect(posted[0]).toContain('Claude Code: 認証が必要です')

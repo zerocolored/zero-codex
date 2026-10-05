@@ -27,6 +27,7 @@ import {
   readSync,
   realpathSync,
   rmSync,
+  writeFileSync,
   writeSync,
   type Dirent,
   type Stats,
@@ -4336,6 +4337,19 @@ export function buildCodexWorkerPrompt(
       'Thread history is context only; current host authority and current input always win.',
     )
   }
+  // ブロックや未完了で終わる報告が「何を調査したか」から始まると、読む人には
+  // 何をしてほしいのか分からない情報の羅列になる。2026-09-28 のオーナー指摘:
+  // 「やってほしいことがあるのかないのか分からない。ただの情報しか垂れ流して
+  // いないからノイズでしかない」。goal の objective は既存スレッドでは差し替え
+  // られない(ensureTaskGoal は complete か未設定のときだけ置く)ため、毎回組み立て
+  // 直すこの control へ置いて確実に届かせる。
+  control.push(
+    'Slack reply shape: when you stop without finishing, the first line must be exactly one',
+    'request in the form `お願い: <誰> が <何> してください`. Name the person or role, and name the',
+    'exact command, file path, screen, or setting, and where it is. Do not open with what you',
+    'investigated, what you confirmed, or execution records; those belong below that line.',
+    'If you genuinely need nothing from the reader, say that in the same first line instead.',
+  )
   control.push(...rateLimitRecoveryControl(job))
   if (host.advisorEnabled) {
     control.push(
@@ -4422,6 +4436,62 @@ export function buildCodexWorkerPrompt(
       'If the user says the proposal is missing, supply the complete proposal and its attachments in this job output; do not merely repeat that approval is pending.',
     )
   }
+  // CIのログを読む手段が無いと「原因未確定」で止まる。PRのCIはブランチ単体
+  // ではなくマージ結果を検査するので、自分のコミットだけ通っても意味がない。
+  // 手元で同じ条件を作れば再現できる(2026-09-28: develop を取り込むと重複
+  // プロパティで tsc が落ちた。ブランチ単体では通っていた)。
+  control.push(
+    'CI verification: a pull request runs its checks against the MERGE of your branch and its',
+    'base branch, not your commit alone, so a check can fail while your branch alone passes.',
+    'When a check fails and you cannot read its log, reproduce the same condition yourself before',
+    'reporting the cause as undetermined: fetch the base branch, merge it into your branch without',
+    'committing, run the command the workflow runs, then undo the merge. Report the failing command',
+    'and its output. "Cause undetermined" is only acceptable after that reproduction also comes back clean.',
+  )
+  // 環境変数フィルタを知らないまま「未設定です」と読むと、実現不可能な依頼
+  // (「管理者が SERVICE_ROLE_KEY を設定してください」)で止まる。除外規則は
+  // shell_environment_policy.exclude と同じものを明示し、代わりの取得経路を示す。
+  control.push(
+    'Environment and credentials: this sandbox strips every inherited variable whose name matches',
+    '*TOKEN*, *SECRET*, *PASSWORD*, *KEY*, SLACK_* or ZEROKUN_*, and CODEX_HOME. An empty',
+    'credential variable therefore never means the operator failed to configure it, and nobody can',
+    'fix it by exporting one for you. Never ask anyone to set such a variable. Load credentials from',
+    'the repository instead: a workspace that encrypts them with dotenvx keeps .env next to .env.keys',
+    'and both are readable here, so run the command under `dotenvx -q run -- <command>` the way that',
+    "repository's own scripts do. Take that route before reporting a credential as unavailable, and",
+    'if it still fails name the step that failed — the decryptor was missing, the host did not',
+    'resolve, or the service refused — never "not configured".',
+  )
+  // 除外は「引き継いだ環境変数」にしか効かない。自分でコマンドの前に置いた
+  // 代入はそのまま届く。これを知らないと、別環境の資格情報を使う手段が
+  // 設定ファイルの書き換えしかないと思い込んで止まる(2026-09-29 実測)。
+  control.push(
+    'That filter applies only to variables inherited from the host. A variable you assign yourself',
+    'on a single command line reaches that command untouched, so you can point one run at different',
+    'credentials without editing any configuration file. Prefer that over modifying the operator\'s',
+    'stored configuration, which you must not change to switch environments.',
+  )
+  // 「アプリケーション」への書き込みは job に許していない。窓口があることを
+  // 知らないと、置くだけの作業を毎回人へ投げて止まる(2026-09-29 実測)。
+  control.push(
+    'Desktop application verification: you cannot write to /Applications, but zerokun_app_swap can.',
+    'Build the verification bundle, declare the zip as an artifact of this job, then call',
+    'app_swap_install with its sha256. The operator\'s own copy is set aside, not deleted, and',
+    'app_swap_restore puts it back — always restore once the verification is finished, and say in',
+    'your answer whether a verification build is still in place. Do not ask anyone to move an',
+    'application for you while that tool is offered.',
+  )
+  // 別環境の資格情報を「人からもらうもの」と思い込み、自分では取りに行かずに
+  // 止まっていた。配備そのものと同じ出どころから実行時に取れば、どこにも
+  // 書き残さずに済む(2026-09-29: develop の URL は自分で取れたのに、鍵は
+  // 依頼していた)。
+  control.push(
+    'When a run needs credentials for an environment other than the workspace default, obtain them',
+    'at run time from the same source the deployment itself reads, using the access you already',
+    'have, and pass them inline to that one command. Never write such a value into a file, a commit,',
+    'a report, or your answer, and never print it; reference it only by the name it is stored under.',
+    'Ask a person for a credential only when no source you can reach holds it.',
+  )
   if (!job.writeEnabled) {
     control.push(
       'Access mode: read-only.',
@@ -4439,6 +4509,9 @@ export function buildCodexWorkerPrompt(
     )
     if (host.browserEnabled) {
       control.push(
+        'Chrome is not a Computer Use target. Its app approval cannot be granted to a Slack job, so',
+        'driving the browser through Computer Use always fails; use the browser capabilities below',
+        'for anything in the browser and keep Computer Use for the desktop application under test.',
         'For the operator’s signed-in Chrome, first follow the installed official Chrome skill',
         'and use its browser-client through node_repl when available. This is the ChatGPT browser',
         'Use the current runtime path in developer instructions, not a cached path from prior turns.',
@@ -4477,6 +4550,63 @@ export function buildCodexWorkerPrompt(
         'ask the user to wait for a prompt that was not emitted. Report the exact failed capability',
         'and use an already-authorized alternative when the task and browser instructions allow it.',
         'Do not bypass app approval or claim a missing connection without trying the exposed native tool.')
+      // 画面が取れないとき、ホストの表示状態を確かめずに「検証用Macで bellMe のウィジェットを
+      // 前面表示してください」と叶わない依頼を出して止まった(2026-09-25・09-30 に計4ジョブ)。
+      // 真因はホストの MacBook の蓋が閉じていたこと(09-30 に ioreg で AppleClamshellState=Yes)。
+      // 両日とも pmset は、蓋が閉じた間の点灯のたびに 'Clamshell Sleep' の DarkWake と Display is turned off を
+      // 記録した(点灯から消灯までは111回中110回が12秒以内。だから30秒後に読み直させる)。ただし蓋を閉じた
+      // まま充電器を繋いだ点灯は 'Wake Back to Sleep' で消え、'Clamshell Sleep' が付かない(09-30 11:40 実測)
+      // ので、AppleClamshellState=Yes で最新行が消灯なら、それだけでも蓋を頼ませ、蓋を原因から外すのは
+      // 読み直しても点いたままのときだけにする。ioreg が何も出さないとき(蓋の無い Mac も含む)は蓋の
+      // 状態が分からないので、蓋の有無どちらでも実行できる1つの依頼にまとめる。
+      // 同じ job の中で bellMe の get_app_state は成功と cgWindowNotFound を行き来しており、原因は
+      // 窓の種類ではなく消灯。frontmost にしても layer・onscreen・bounds は変わらず、caffeinate が
+      // PreventUserIdleDisplaySleep を保持していても蓋を閉じた sleep は止まらない。外部ディスプレイで
+      // 蓋を閉じて使う Mac は蓋が閉じていても点いたままなので、新しい 'Clamshell Sleep' の有無で
+      // 見分ける(この構成はこのホストでは未実測)。蓋が開いている・蓋の無い Mac で画面だけ消えている
+      // ときに蓋を頼むと同じ叶わない依頼になるので、そのときは画面を点けてもらう。箱の中の
+      // screencapture は画面が点いていても失敗し(09-30 の job と、蓋を開けて画面が点いた状態の
+      // codex sandbox で確認)、ヘッドレスの verify_local_page は画面を使わない。
+      // read-only の箱では pmset -g log が記録を読めず、grep と tail を通すと exit 0 の空出力になって
+      // 表示状態を誤読させるので、pmset を読める Computer Use 付きの job にだけ、毎回組み立て直す
+      // この control で渡す(goal の objective は既存スレッドで差し替わらない)。
+      control.push(
+        'Host display state: when Computer Use returns cgWindowNotFound (error -10005), a Computer Use request',
+        "times out, or any Computer Use screen capture (get_app_state or a screenshot) fails or comes back entirely black, read this Mac's display",
+        'state yourself before you ask anyone for anything. Run',
+        '`ioreg -r -k AppleClamshellState -d 4 | grep AppleClamshellState`',
+        '("AppleClamshellState" = Yes means the lid is closed) and read the latest lines of',
+        '`pmset -g log | grep -E "Display is turned (on|off)|Clamshell" | tail -n 5`.',
+        'A command that prints nothing leaves its state unknown; never read that as an open lid or a display that is on.',
+        'With the lid closed, the lid is the cause when a "Clamshell Sleep" line comes after the latest',
+        '"Display is turned on" line. If the lid is closed and the display turned on last, read the log again 30 seconds later;',
+        'a new "Clamshell Sleep" line means the display wakes only for seconds, so a capture that worked once',
+        'is not a recovery. If instead the latest line still shows the display turned on and no "Clamshell Sleep"',
+        'line has appeared, something such as an external display is keeping this Mac awake with the lid closed',
+        'and the lid is not the cause; the same holds once someone replies that an external display is connected and on.',
+        'If the lid is the cause, or "AppleClamshellState" = Yes and either the latest line shows the display turned off',
+        'or the pmset command prints nothing,',
+        'your single request is',
+        '`お願い: <誰> が <このMacの名前> の蓋を開けてください（または外部ディスプレイを繋いでください）`,',
+        'naming as <誰> the person or role who can physically reach this Mac and taking its name from `scutil --get ComputerName`.',
+        'Otherwise, when ioreg shows "AppleClamshellState" = No and the latest line shows the display',
+        'turned off, never ask anyone to open the lid; your single request is',
+        '`お願い: <誰> が <このMacの名前> の画面を点けてください（キーかトラックパッドに触れる。外部ディスプレイならその電源を入れる）`.',
+        'When ioreg prints nothing and the latest line shows the display turned off, the lid state is unknown,',
+        'which is also what a Mac without a lid shows, so use one request that works either way:',
+        '`お願い: <誰> が <このMacの名前> の画面を点けてください（蓋のあるMacで蓋が閉じていれば開ける。それ以外はキーかトラックパッドに触れるか、外部ディスプレイの電源を入れる）`.',
+        'In any of these states never ask anyone, directly or through someone else, to bring an app or its widget',
+        'to the front or to show it again; making it frontmost was measured to change nothing.',
+        'When Computer Use cannot find or capture bellMe (com.bellsalesai.live-agent, or com.bellsalesai.live-agent.dev',
+        'for its dev build), a bring-to-front request is never the fix: its UI is an untitled, transparent, borderless',
+        'window kept above ordinary windows at floating level (NSFloatingWindowLevel), not an ordinary window.',
+        'Neither caffeinate nor a PreventUserIdleDisplaySleep assertion keeps the display on while the lid',
+        'is closed, since a closed lid is not idle sleep; never propose them as a workaround.',
+        'A shell `screencapture` inside this sandbox fails with "could not create image from display" even',
+        'while the display is on, so that failure alone proves nothing about the display.',
+        'This rule does not cover browser tools, whose own rules apply: report a go-chrome-mcp or',
+        'zerokun_browser.verify_local_page failure with its actual tool error; the headless verifier never uses the display.',
+      )
     }
     if (job.githubPublicationRecovery) {
       control.push(
@@ -4486,6 +4616,24 @@ export function buildCodexWorkerPrompt(
       )
     }
   }
+  // 読む人は毎回「で、自分は何かするのか」を知りたいだけ。1行目の出番表示は
+  // ホストが付けるので、本人は状態を言い直さず、用件だけ短く書く。証跡を本文へ
+  // 流し込むと、必要な一言が埋もれて読まれない(2026-09-29 オーナー指摘)。
+  control.push(
+    'Slack brevity: the host prefixes your reply with one line stating whether the reader must act,',
+    'so never restate the status yourself. Keep the reply body to three short lines or fewer: what',
+    'changed, what remains, and — when you need something — the single `お願い:` line first. Put',
+    'execution records, command output, counts, and evidence in an attached file, not in the message.',
+    'Expand only when someone asks for more in the thread.',
+  )
+  // 途中で返事が要るのに、ただの経過と同じ見た目だと埋もれる。ホストは文面から
+  // 用件を判定できないので、依頼だけ決まった書き出しにさせ、そこを見て印を変える。
+  control.push(
+    'When a message you send before finishing needs an answer, a decision, or an approval from the',
+    'reader, start that message with the `お願い:` line. The host marks such a message as needing a',
+    'decision and addresses the reader directly; anything else is posted as progress the reader may',
+    'skip. Do not use that opening for a message that merely reports what you are doing.',
+  )
   control.push(SLACK_PUBLIC_PROSE_GUIDANCE)
   control.push('--- end Zero host control ---')
   return [base, ...control].join('\n')
@@ -5533,7 +5681,11 @@ export function resolveCodexToolchainRuntime(options: {
     if (!existingDirectory(prefixInput)) continue
     const prefix = realpathSync(prefixInput)
     if (!accepted.some(path => pathContains(prefix, realpathSync(path)))) continue
-    for (const child of ['bin', 'sbin', 'Cellar', 'opt', 'lib', 'share']) {
+    // Homebrew は formula を Cellar、cask を Caskroom へ置く。bin の symlink は
+    // どちらの実体も指すため、Caskroom を落とすと cask で入れた実行体(gcloud 等)は
+    // sandbox から辿れず起動できない。2026-09-28、Cloud Logging コネクタが
+    // 「gcloud の起動拒否」で使えなかったのはこれが原因。
+    for (const child of ['bin', 'sbin', 'Cellar', 'Caskroom', 'opt', 'lib', 'share']) {
       const path = join(prefixInput, child)
       if (!existingDirectory(path)) continue
       readPaths.add(resolve(path))
@@ -5573,6 +5725,7 @@ export function buildCodexPermissionOverrides(
     advisorMcp?: { command: string; args: string[] }
     browserMcp?: { command: string; args: string[] }
     githubMcp?: { command: string; args: string[] }
+    appSwapMcp?: { command: string; args: string[] }
     cloudLoggingMcp?: { command: string; args: string[] }
     usageMcp?: { command: string; args: string[] }
     seatbeltFingerprintAllowPath?: string
@@ -5634,6 +5787,23 @@ export function buildCodexPermissionOverrides(
   if (options.jobTempDir && existingJobTempDirectory(options.stateDir, job.id) !== options.jobTempDir) {
     throw new Error('job temporary directory does not match this job')
   }
+  // サンドボックスは mDNSResponder への mach-lookup を塞ぐため、getaddrinfo を
+  // 使う dns.lookup だけが ENOTFOUND になる。ジョブ内の Node に preload させて
+  // DNS へ引き直させる。scratchDir はジョブ専用で読み書きできる唯一の置き場。
+  const dnsFallbackPath = join(scratchDir, '.zerokun-dns-fallback.cjs')
+  writeFileSync(
+    dnsFallbackPath,
+    readFileSync(join(import.meta.dir, 'sandbox-dns-fallback.cjs'), 'utf8'),
+    { mode: 0o600 },
+  )
+  // 塞がれた結果が errno としてしか見えないと、箱の何が原因かを推理できず
+  // 人への依頼で止まる。既知の形だけ、何が塞いでいるかを stderr へ出す。
+  const diagnosticsPath = join(scratchDir, '.zerokun-sandbox-diagnostics.cjs')
+  writeFileSync(
+    diagnosticsPath,
+    readFileSync(join(import.meta.dir, 'sandbox-diagnostics.cjs'), 'utf8'),
+    { mode: 0o600 },
+  )
   const liveInputRoot = options.liveInputDir
     ? requireManagedDirectory(options.stateDir, options.liveInputDir)
     : null
@@ -5864,6 +6034,7 @@ export function buildCodexPermissionOverrides(
     `"TMPDIR"=${tomlString(jobTempDir)}`,
     `"XDG_CONFIG_HOME"=${tomlString(join(scratchDir, '.config'))}`,
     `"XDG_CACHE_HOME"=${tomlString(join(scratchDir, '.cache'))}`,
+    `"NODE_OPTIONS"=${tomlString(`--require ${dnsFallbackPath} --require ${diagnosticsPath}`)}`,
     `"PATH"=${tomlString(cloudBin ? `${cloudBin}:${toolchain.path}` : toolchain.path)}`,
     ...(dockerRuntime && dockerConfig ? [
       `"DOCKER_HOST"=${tomlString(dockerRuntime.host)}`,
@@ -5928,6 +6099,13 @@ export function buildCodexPermissionOverrides(
       `zerokun_cloud_logging={command=${tomlString(cloud.command)},args=[${cloud.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["cloud_logging_read","cloud_run_describe","project_audit_read"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=90,tools={cloud_logging_read={approval_mode="approve"},cloud_run_describe={approval_mode="approve"},project_audit_read={approval_mode="approve"}}}`,
     )
   }
+  if (options.appSwapMcp) {
+    const swap = options.appSwapMcp
+    const swapTools = ['app_swap_status', 'app_swap_install', 'app_swap_restore']
+    mcpEntries.push(
+      `zerokun_app_swap={command=${tomlString(swap.command)},args=[${swap.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=[${swapTools.map(tomlString).join(',')}],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=900,tools={${swapTools.map(tool => `${tool}={approval_mode="approve"}`).join(',')}}}`,
+    )
+  }
   if (options.usageMcp) {
     const usage = options.usageMcp
     mcpEntries.push(`zerokun_usage={command=${tomlString(usage.command)},args=[${usage.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["task_usage_read"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=90}`)
@@ -5963,7 +6141,11 @@ export function buildCodexPermissionOverrides(
     'model_provider="openai"',
     'model_providers={}',
     'shell_environment_policy.inherit="core"',
-    'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","*PROXY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
+    // *PROXY* を除外してはいけない。network_proxy が有効なとき、codex は
+    // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY を子シェルへ渡して、そこ経由でのみ外へ
+    // 出られるようにする。消すと直接接続だけが残り、seatbelt に EPERM で弾かれて
+    // ジョブから一切通信できなくなる(2026-09-28 実測)。proxy の URL は秘密ではない。
+    'shell_environment_policy.exclude=["*TOKEN*","*SECRET*","*PASSWORD*","*KEY*","SLACK_*","ZEROKUN_*","CODEX_HOME"]',
     `shell_environment_policy.set={${shellEnvironment}}`,
     `web_search=${tomlString(executionWriteEnabled ? 'live' : 'disabled')}`,
     `tools.web_search=${executionWriteEnabled ? 'true' : 'false'}`,
@@ -5982,6 +6164,10 @@ export function buildCodexPermissionOverrides(
     `features.browser_use_external=${browserAccessEnabled ? 'true' : 'false'}`,
     'features.browser_use_full_cdp_access=false',
     `features.computer_use=${computerUseEnabled ? 'true' : 'false'}`,
+    // Computer Use のアプリ許可は config から与えられない。bundle_ids も
+    // default_app_access="allow" も設定としては通るが、実行時の承認判定には
+    // 使われず「was not approved to use ...」が返る(2026-09-29 実測)。承認は
+    // ChatGPT 側が持っていて対話的にしか与えられないため、ここでは触らない。
     `features.in_app_browser=${browserAccessEnabled ? 'true' : 'false'}`,
     `features.multi_agent=${multiAgentEnabled ? 'true' : 'false'}`,
     `features.network_proxy=${networkEnabled ? 'true' : 'false'}`,
@@ -6879,6 +7065,7 @@ export async function executeCodexJob(
   const browserBrokerPath = requireSafeBroker('browser-verification-broker.ts')
   const githubBrokerPath = requireSafeBroker('github-credential-broker.ts')
   const cloudLoggingBrokerPath = requireSafeBroker('cloud-logging-broker.ts')
+  const appSwapBrokerPath = requireSafeBroker('app-swap-broker.ts')
   const usageBrokerPath = requireSafeBroker('task-usage-broker.ts')
   const usageContextDir = ensureManagedDirectory(managedStateDir, join(managedStateDir, 'task-usage-context'))
   atomicWritePrivateFile(join(usageContextDir, `${job.id}.json`), JSON.stringify({
@@ -7138,6 +7325,17 @@ export async function executeCodexJob(
             ],
           }
         : undefined
+      // 実機検証には検証用ビルドを「アプリケーション」へ置く必要がある。書き込みを
+      // 直接許すと全アプリが差し替え可能になるため、対象と戻し方を固定した窓口を渡す。
+      const appSwapMcp = job.writeEnabled && stage === 'complete' && !continuationDecision
+        ? {
+            command: realpathSync(process.execPath),
+            args: [
+              '--config=/dev/null', '--no-env-file', appSwapBrokerPath,
+              logicalAttempt.contextPath, managedStateDir, artifactDir,
+            ],
+          }
+        : undefined
       const executionWriteEnabled = stage === 'complete'
         ? job.writeEnabled
         : stage === 'implementation'
@@ -7162,6 +7360,7 @@ export async function executeCodexJob(
         browserMcp,
         githubMcp,
         cloudLoggingMcp,
+        appSwapMcp,
         usageMcp,
         seatbeltFingerprintAllowPath: seatbeltFingerprint.allow.path,
         executionWriteEnabled,
