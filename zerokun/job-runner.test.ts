@@ -467,6 +467,63 @@ test('Computer Useで画面が取れないときは人へ頼む前にホスト�
   } finally { store.close() }
 })
 
+test('ブラウザはComputer Useで動かさず、Go Chrome MCPは公式Chromeが使えないときだけ使わせる', () => {
+  // 2026-10-05 に main #151(公式Chromeを隔離jobの第一選択に戻す)を取り込んだとき、同じ browser
+  // ブロックへ両サイドの文がそのまま残り、feae772 の「ブラウザのことは何でも go-chrome-mcp で」と
+  // #151 の「Go Chrome MCP は公式Chromeが使えないときだけ」が並んだ。worker が前者を採ると #151 の
+  // 修正が実行時に打ち消される。Chrome を Computer Use で動かさないこと(feae772)と経路の優先順位
+  // (#151)は両立するので、経路の優先順位は #151 の行だけに持たせ、Computer Use を外す文からは
+  // 道具名を外して下の行へ送る。
+  const store = makeStore()
+  try {
+    store.enqueue(input({ writeEnabled: true }))
+    const job = store.claimNext('browser-route-worker')!
+    const snapshot = readAdvisorInputSnapshot(dirname(store.dbPath), job.id)
+    const host = { attemptNonce: 'a'.repeat(32), artifactDir: '/tmp/browser-route-outbox', advisorEnabled: false }
+    const prompt = buildCodexWorkerPrompt(job, snapshot, {
+      ...host, browserEnabled: true, computerUseEnabled: true,
+    })
+    // 信頼済みの host control だけを見る。Slack 本文に go-chrome-mcp が混じっても誤爆させない。
+    const start = prompt.indexOf('--- Zero host control (trusted')
+    const end = prompt.indexOf('--- end Zero host control ---')
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(end).toBeGreaterThan(start)
+    const control = prompt.slice(start, end)
+    // Chrome へアプリ承認を与えられないので、ブラウザを Computer Use で動かす試みは必ず失敗する。
+    expect(control).toContain('Chrome is not a Computer Use target. Its app approval cannot be granted to a Slack job, so')
+    expect(control).toContain('driving the browser through Computer Use always fails; use the browser capabilities below')
+    expect(control).toContain('for anything in the browser and keep Computer Use for the desktop application under test.')
+    // 経路は公式Chromeが先。Go Chrome MCP はそれが使えないときのフォールバックに留める。
+    expect(control).toContain('For the operator’s signed-in Chrome, first follow the installed official Chrome skill')
+    expect(control).toContain('Go Chrome MCP is a separate extension connection. Use it only when the official Chrome')
+    expect(control).toContain('capability is unavailable and the applicable browser instructions permit that fallback.')
+    // フォールバック宣言の2行の間へ別の文が割り込むのが今回直した事故の形なので、続きであることも固定する。
+    expect(control).toContain('Use it only when the official Chrome\ncapability is unavailable and the applicable browser instructions permit that fallback.')
+    // 無条件に go-chrome-mcp を優先させる指示は、言い換えても入れない。Go Chrome MCP に触れる行は
+    // フォールバック宣言・tabs_list の手順・表示状態規則の例示の3行だけで、4行目が増えたら落とす。
+    expect(control).not.toContain('use go-chrome-mcp for anything in the')
+    expect(control).not.toContain('use go-chrome-mcp when exposed')
+    const goChromeLines = control.split('\n').filter(line => /go.?chrome.?mcp/i.test(line))
+    for (const line of goChromeLines) {
+      expect(line).toMatch(/Use it only when the official Chrome|begin with tabs_list|whose own rules apply/)
+    }
+    expect(goChromeLines).toHaveLength(3)
+    // 'the browser capabilities below' が指す先を保つため、Computer Use を外す文を経路の説明より前に置く。
+    const exclusion = control.indexOf('Chrome is not a Computer Use target.')
+    const official = control.indexOf('first follow the installed official Chrome skill')
+    const fallback = control.indexOf('Go Chrome MCP is a separate extension connection.')
+    expect(exclusion).toBeGreaterThanOrEqual(0)
+    expect(official).toBeGreaterThan(exclusion)
+    expect(fallback).toBeGreaterThan(official)
+    // browser を渡さない job へは Chrome の経路説明そのものを出さない。
+    expect(buildCodexWorkerPrompt(job, snapshot, { ...host, computerUseEnabled: true }))
+      .not.toContain('Chrome is not a Computer Use target')
+    expect(buildCodexWorkerPrompt({ ...job, writeEnabled: false }, snapshot, {
+      ...host, browserEnabled: true, computerUseEnabled: true,
+    })).not.toContain('Chrome is not a Computer Use target')
+  } finally { store.close() }
+})
+
 function stageInboundAttachment(options: {
   store: JobStore
   stateDir: string

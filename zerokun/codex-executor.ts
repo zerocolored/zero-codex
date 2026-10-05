@@ -4510,8 +4510,8 @@ export function buildCodexWorkerPrompt(
     if (host.browserEnabled) {
       control.push(
         'Chrome is not a Computer Use target. Its app approval cannot be granted to a Slack job, so',
-        'driving the browser through Computer Use always fails; use go-chrome-mcp for anything in the',
-        'browser and keep Computer Use for the desktop application under test.',
+        'driving the browser through Computer Use always fails; use the browser capabilities below',
+        'for anything in the browser and keep Computer Use for the desktop application under test.',
         'For the operator’s signed-in Chrome, first follow the installed official Chrome skill',
         'and use its browser-client through node_repl when available. This is the ChatGPT browser',
         'Use the current runtime path in developer instructions, not a cached path from prior turns.',
