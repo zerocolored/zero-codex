@@ -105,7 +105,7 @@ case "$INVOKED_AS" in
       LAUNCH_MODE="status"
       PROJECT="$(pwd -P)"
     else
-      echo "使い方: zerochan | zerochan start | zerochan stop [--force] | zerochan update [--recover-only] | zerochan --restart | zerochan set slack-app | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
+      echo "使い方: zerochan <command>（引数なしは従来方式の起動）" >&2
       echo "コマンド一覧: zerochan help / 詳細: zerochan <command> --help" >&2
       exit 2
     fi

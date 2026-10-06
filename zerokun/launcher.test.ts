@@ -371,7 +371,8 @@ describe('codex-channel.sh replacement guard', () => {
       invokedAs: 'zerochan', cwd: project, args: ['update', '--skip-tests'],
     })
     expect(invalid.exitCode).toBe(2)
-    expect(invalid.output).toContain('zerochan update [--recover-only]')
+    expect(invalid.output).toContain('使い方: zerochan <command>')
+    expect(invalid.output).toContain('詳細: zerochan <command> --help')
     expect(existsSync(invalidLog)).toBe(false)
   })
 
@@ -414,7 +415,8 @@ describe('codex-channel.sh replacement guard', () => {
       invokedAs: 'zerochan', cwd: project, args: ['stop', '--unsafe'],
     })
     expect(invalidStop.exitCode).toBe(2)
-    expect(invalidStop.output).toContain('zerochan stop [--force]')
+    expect(invalidStop.output).toContain('使い方: zerochan <command>')
+    expect(invalidStop.output).toContain('詳細: zerochan <command> --help')
   })
 
   test('Herdr外のzerochan startは可視workspace作成helperへ委譲する', async () => {
