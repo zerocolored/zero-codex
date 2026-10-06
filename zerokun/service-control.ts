@@ -1480,6 +1480,9 @@ export async function startManagedService(
     // All managed service processes are absent above. A restored/foreign old
     // tab is not a running service: preserve it and create a fresh owned tab.
     await cleanupRecordedTab(stateDir, controlRuntime, projectDir, close)
+    // An accepted start supersedes an explicit stop. A failed launch is an
+    // outage, not a user-requested stop; keep watchdog reporting enabled.
+    clearIntentionalServiceStop(stateDir)
     launchAttempted = true
     const started = await startBot({
       rootRepo,
@@ -1557,7 +1560,6 @@ export async function startManagedService(
         || activeCounts(stateDir).running > 0) {
         fail('起動失敗generationの完全停止を確認できません')
       }
-      writeIntentionalServiceStop(stateDir)
       if (attemptedRuntime) {
         const tabCleanup = await cleanupRecordedTab(
           stateDir,

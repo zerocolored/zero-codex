@@ -1162,9 +1162,23 @@ describe('zerochan stop/start', () => {
     expect(services.runner.exitCode).toBeNull()
   })
 
-  test('start失敗時は今回publishしたgenerationだけを完全停止する', async () => {
+  test('startの事前検査拒否は既存の停止意思を変更しない', async () => {
+    const { state, project } = fixture()
+    writeIntentionalServiceStop(state)
+    writeFileSync(join(state, 'update-transaction.json'), '{}')
+    let attempted = false
+    await expect(startManagedService(dirname(import.meta.dir), state, project, 'A0123456789', {
+      ...testHooks,
+      startBot: async () => { attempted = true; throw new Error('must not start') },
+    })).rejects.toThrow()
+    expect(attempted).toBe(false)
+    expect(intentionalServiceStopIsSet(state)).toBe(true)
+  })
+
+  test.each([false, true])('start失敗時は今回generationだけを停止し障害通知を抑制しない（既存停止marker: %s）', async priorStop => {
     const { base, state, project } = fixture()
     createJobDatabase(state)
+    if (priorStop) writeIntentionalServiceStop(state)
     let services: Awaited<ReturnType<typeof spawnManagedServices>> | undefined
     const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
       cwd: dirname(import.meta.dir), stdout: 'pipe', stderr: 'pipe',
@@ -1178,6 +1192,7 @@ describe('zerochan stop/start', () => {
         ...testHooks,
         pauseTimeoutMs: 1_000,
         startBot: async options => {
+          expect(intentionalServiceStopIsSet(state)).toBe(false)
           options.onRuntimeSelected?.(fakeRuntime)
           services = await spawnManagedServices(state, base)
           publishRuntime(state)
@@ -1194,6 +1209,6 @@ describe('zerochan stop/start', () => {
     )).rejects.toThrow('fixture startup failure')
     expect(await services!.gateway.exited).toBe(0)
     expect(await services!.runner.exited).toBe(0)
-    expect(intentionalServiceStopIsSet(state)).toBe(true)
+    expect(intentionalServiceStopIsSet(state)).toBe(false)
   })
 })
