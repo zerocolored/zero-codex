@@ -292,7 +292,7 @@ describe('Slack bridge resilience wiring', () => {
     )
     const owned = message.indexOf("const ownedThread = typeof threadTs === 'string'")
     const audience = message.indexOf('const admission = await admitSlackChannelThreadReply({', owned)
-    const addressed = message.indexOf('|| ownedThread', audience)
+    const addressed = message.indexOf('|| (!isBot && ownedThread)', audience)
     const gate = message.indexOf('const result = await gate(', addressed)
     expect(owned).toBeGreaterThan(-1)
     expect(audience).toBeGreaterThan(owned)
@@ -508,7 +508,7 @@ describe('Slack bridge resilience wiring', () => {
     expect(server).toContain("!isDM && typeof threadTs === 'string' && mentionsBot(text, botUserId)")
     expect(server.match(/resolvedThreadTs !== message\.ts && mentionsBot\(text, botUserId\)/g))
       .toHaveLength(2)
-    expect(server.match(/resolveIsMention\(isDM, text, botUserId\) \|\| ownedThread/g))
+    expect(server.match(/resolveIsMention\(isDM, text, botUserId\) \|\| \(!isBot && ownedThread\)/g))
       .toHaveLength(3)
   })
 

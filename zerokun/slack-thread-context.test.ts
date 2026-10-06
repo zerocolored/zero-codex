@@ -205,3 +205,22 @@ describe('buildInitialSlackThreadContext', () => {
     expect(plan.context.text).not.toContain('CI notification')
   })
 })
+
+
+test('bot mention ZIP trigger is adopted with bot identity; unmentioned bot context is excluded', () => {
+  const result = buildInitialSlackThreadContext({
+    chatId: CHANNEL, threadTs: ROOT, triggerTs: TRIGGER, botUserId: BOT, botId: 'BZERO',
+    messages: [
+      { ts: ROOT, user: 'U0ALICE', text: '解析してください' },
+      { ts: '1788000001.000001', thread_ts: ROOT, bot_id: 'BREPORT', text: '無指定のbot出力', files: [{ id: 'FNOISE' }] },
+      { ts: '1788000002.000001', thread_ts: ROOT, bot_id: 'BZERO', text: `<@${BOT}> 自己投稿`, files: [{ id: 'FSELF' }] },
+      { ts: TRIGGER, thread_ts: ROOT, bot_id: 'BREPORT', subtype: 'file_share', text: `<@${BOT}> 添付ZIPを解析して`, files: [{ id: 'FZIP' }] },
+    ],
+  })
+  expect(result.messageCount).toBe(2)
+  expect(result.trigger.userId).toBe('BREPORT')
+  expect(result.trigger.text).toBe('添付ZIPを解析して')
+  expect(result.fileIds).toEqual(['FZIP'])
+  expect(result.text).not.toContain('無指定のbot出力')
+  expect(result.text).not.toContain('自己投稿')
+})

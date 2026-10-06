@@ -17,7 +17,7 @@ import {
   resolveOfficialStandaloneCodex,
   verifyOfficialCodexSnapshot,
 } from './standalone-codex.ts'
-import { type SlackReply } from '../gate.ts'
+import { slackSenderId, type SlackReply } from '../gate.ts'
 import { CodexCleanupPendingError } from './codex-executor.ts'
 import { subprocessExitCode } from './process-exit-code.ts'
 import { ensureManagedDirectory } from './managed-path.ts'
@@ -114,7 +114,7 @@ export function buildSlackThreadIntentSnapshot(input: {
   const aliases = new Map<string, string>()
   aliases.set(input.candidate.userId, '@candidate')
   for (const message of selected) {
-    const userId = message.user ?? message.bot_id
+    const userId = slackSenderId(message) ?? message.user
     if (!userId || userId === input.botUserId || aliases.has(userId)) continue
     aliases.set(userId, `@participant-${aliases.size}`)
   }
@@ -124,7 +124,7 @@ export function buildSlackThreadIntentSnapshot(input: {
     // Other Slack apps are participants, not this assistant. Modern Slack bot
     // history includes the bot user ID even when bot_id is also present.
     const assistant = Boolean(input.botUserId && message.user === input.botUserId)
-    const userId = message.user ?? message.bot_id ?? ''
+    const userId = slackSenderId(message) ?? message.user ?? ''
     const speaker = assistant
       ? 'assistant' as const
       : candidate
