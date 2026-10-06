@@ -107,7 +107,7 @@ roleの`read-only`／`never`指定だけでは、ホストHOME・private state�
 - 実行中の同じthreadへの返信は安全に一時停止して先に回答し、別threadは独立したFIFO jobになります。
 - 招待・最初のlive mentionでchannelを内部記録し、再起動後の履歴回収に使います。
 - 新しいthreadはproject-localの`.zerochan/config.json`で紐付けたprojectへ固定されます。
-  `zerochan unset slack-channel <channel-id>`で解除でき、同じchannelを2つのprojectへ重複登録は
+  `zerochan unset slack-channel`でそのprojectの紐付けをすべて解除でき、同じchannelを2つのprojectへ重複登録は
   できません。既存threadの固定先は解除後も変わらず、`routes.json`は不要です。
 
 ## 設定 schema
