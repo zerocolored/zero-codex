@@ -1,6 +1,7 @@
 # Access Control Reference
 
-設定済みチャンネルでは、人間の参加者全員が個別登録なしで利用・repository変更を依頼できます。
+設定済みチャンネルでは、人間の参加者全員と、Zeroちゃんを明示メンションした他のBotが、
+個別登録なしで利用・repository変更を依頼できます。
 DMだけは受信許可と書込み許可を分離し、pairingだけでは書込み権限は付きません。
 
 設定ファイルは既定で `~/.codex/zerokun/access.json` にあります。旧版の
@@ -70,7 +71,7 @@ zerochan-access write allow U0123456789
 zerochan-access write deny U0123456789
 ```
 
-- チャンネルの人間の参加者: 個別登録なしでrepositoryと`.git`のwrite、依頼に必要なnetworkを許可します。
+- チャンネルの人間の参加者と、明示メンションで受け付けたBot: 個別登録なしでrepositoryと`.git`のwrite、依頼に必要なnetworkを許可します。
 - DMで`writeAllowFrom` にいない sender: minimal runtimeから組み立てたnamed profileでrepository readと
   job専用outbox writeだけを許可します。調査と回答だけです。
 - DMで`writeAllowFrom` にいる sender: minimal runtimeから組み立てたnamed profileでrepositoryと`.git`の
@@ -100,7 +101,11 @@ roleの`read-only`／`never`指定だけでは、ホストHOME・private state�
 
 利用するSlack Appをchannelへ招待し、対象projectで
 `zerochan set slack-channel <channel-id>`を実行すると、そのchannelの人は誰でも利用できます。
-利用者allowlistはありません。bot投稿とSlack user IDでないsenderは常に無視します。
+利用者allowlistはありません。他のBotからも、そのSlack Appへの明示メンションがあれば、
+ZIPなどの添付を含む依頼を受け付けて同じthreadへ返信します。自己投稿、送信者IDが不正な投稿、Bot DMは無視します。
+Botは所有済みthreadや`requireMention: false`でも毎回明示メンションが必要です。
+Bot自身の発言やメンションのない自動通知に反応しないことで連鎖を抑えますが、
+相互にメンションし続ける別Botとの連携は送信側でもループを避けてください。
 
 - 新しいchannel依頼は、そのSlack Appへのメンションが必要です。
 - いったんそのAppが採用したthreadの人による返信は、senderが変わってもメンション不要です。

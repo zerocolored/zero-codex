@@ -5181,7 +5181,7 @@ export class JobStore {
       || Number(messageId) <= Number(threadTs)) {
       throw new Error('thread intent timestamps are invalid')
     }
-    if (!/^[UW][A-Z0-9]+$/.test(userId)) throw new Error('thread intent user is invalid')
+    if (!/^[UWB][A-Z0-9]+$/.test(userId)) throw new Error('thread intent user is invalid')
     if (!Number.isSafeInteger(input.promptVersion) || input.promptVersion < 1) {
       throw new Error('thread intent prompt version is invalid')
     }

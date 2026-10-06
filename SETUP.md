@@ -375,7 +375,8 @@ DMを使う場合は、最初に返るpairing codeを端末で承認します。
 zerochan-access pair <表示されたcode>
 ```
 
-チャンネルの人間の参加者は、個別登録なしでrepository変更も依頼できます。
+チャンネルの人間の参加者と、Zeroちゃんを明示メンションした他のBotは、個別登録なしでrepository変更も依頼できます。
+BotからのZIPなどの添付も処理します。自己投稿・メンションのないBot投稿・Bot DMは対象外です。
 DMでrepositoryの変更も許可する場合だけ、別途write権限を付けます。
 
 ```bash

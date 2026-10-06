@@ -96,7 +96,9 @@ Slack bot
   判断・認証・権限などが必要な待機は未完了として通知し、完了リアクションを付けません。
   停止指示とレート制限は従来の処理を維持します。Goalは依頼範囲を広げる許可ではありません。
   Claude・Grok・補助CodexにはGoalを設定せず、更新候補の検証でも有効化しません。
-- 設定済みチャンネルの人間の参加者は、個別登録なしでrepository・`.git` writeとネットワークを使えます。
+- 設定済みチャンネルの人間の参加者と、Zeroちゃんを明示メンションした他のBotは、
+  個別登録なしでrepository・`.git` writeとネットワークを使えます。Botは添付付き投稿にも対応し、
+  所有済みスレッドでも毎回明示メンションが必要です。自己投稿とBot DMは受け付けません。
   DMだけは`writeAllowFrom`の明示許可が必要です。Mac全体のsandboxは解除しません。
 - write許可されたWebタスクでは、primary Codexへ利用可能なBrowser／Chrome能力を渡し、localhostだけでなく
   依頼対象の公開HTTPS環境も実際に開いて確認できます。設定済みの`go-chrome-mcp`は起動時に取得した
