@@ -14,7 +14,9 @@ export function advisorRecoveryProgress(
     ...(waitingForAuthentication.length ? { waitingForAuthentication } : {}),
     ...(browser ? {
       grokOAuthBrowser: browser,
-      nextAction: browser.stage === 'authorize'
+      nextAction: browser.hostManaged
+        ? '設定済みChromeをホストが確認しています。同じroundをpollしてください。別経路からブラウザ操作や成功応答を送らないでください。拒否する場合だけabortを返してください。'
+        : browser.stage === 'authorize'
         ? 'grokOAuthBrowserの認可画面確認と最大1回のclickの指示を実行し、同じroundをpollしてください。この段階では成功応答を送信しません。中止が必要な場合だけabortを返してください。'
         : 'grokOAuthBrowserの指示を実行し、指定のfixed responseをadvisor_grok_oauth_respondへ一度返してください。新しいloginを起動しないでください。',
     } : waitingForAuthentication.length ? {
@@ -39,10 +41,12 @@ export class GrokOAuthBrowserSession {
   private closed = false
   private abortReason?: GrokBrowserAbortReason
   private current?: { requestId: string; stage: Stage; nextAction: string }
-  constructor(private readonly abortHelper: () => void) {}
+  constructor(private readonly abortHelper: () => void, private readonly hostManaged = false) {}
   connect(write: (line: string) => Promise<void>) { this.writer = write }
-  pending() { return this.current ? { ...this.current,
-    ...(this.current.stage === 'authorize' ? { observationScript: GROK_OAUTH_OBSERVATION_SCRIPT } : {}),
+  pending(): { requestId: string; stage: Stage; nextAction: string; hostManaged?: boolean; observationScript?: string } | undefined { return this.current ? { ...this.current,
+    ...(this.hostManaged ? { hostManaged: true,
+      nextAction: 'ホストの設定済みChrome確認中です。同じadvisor roundをpollしてください。別のブラウザ操作は不要です。' }
+      : this.current.stage === 'authorize' ? { observationScript: GROK_OAUTH_OBSERVATION_SCRIPT } : {}),
   } : undefined }
   finish() { this.closed = true; this.current = undefined; this.writer = undefined }
   failureReason() { return this.abortReason ? `Grok OAuth browser recovery stopped: ${this.abortReason}` : undefined }

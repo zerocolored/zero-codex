@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { runInNewContext } from 'node:vm'
-import { GROK_OAUTH_OBSERVATION_SCRIPT } from './grok-oauth-observation.ts'
+import { GROK_OAUTH_OBSERVATION_SCRIPT, grokOAuthAuthorizeScript } from './grok-oauth-observation.ts'
 
 function element(tag: string, text = '', attrs: Record<string, string> = {}, shown = true) {
   const matches = (selector: string) => selector.split(',').some(part => {
@@ -59,4 +59,26 @@ test('wrong title, wrong app and duplicate buttons never become ready', () => {
   expect(observe({ heading: 'Another app' }).ready).toBe(false)
   const duplicate = observe({ extra: [element('button', 'Authorize')] })
   expect(duplicate.ready).toBe(false); expect(duplicate.authorizeName).toBeNull()
+})
+
+test.each(['Authorize', '許可'] as const)('final %s operation rechecks current UI before one click', name => {
+  let clicks = 0
+  let forbidden = false
+  const button = Object.assign(Object.create(element('button', name)), { click: () => { clicks++ } })
+  const context = {
+    location: { protocol: 'https:', hostname: 'auth.x.ai', port: '',
+      get href(): never { throw Error('must not read OAuth URL') } },
+    document: { title: 'Authorize — Grok', querySelectorAll: (selector: string) => selector === 'button,[role="button"]'
+      ? [button] : [element('h1', 'Authorize Grok Build'), button, ...(forbidden ? [element('input', '', { type: 'password' })] : [])] },
+    getComputedStyle: () => ({ visibility: 'visible' }),
+  }
+  const script = grokOAuthAuthorizeScript(name)
+  forbidden = true
+  expect(runInNewContext(script, context)).toEqual({ clicked: false })
+  expect(clicks).toBe(0)
+  forbidden = false
+  expect(runInNewContext(script, context)).toEqual({ clicked: true })
+  expect(clicks).toBe(1)
+  expect(runInNewContext(grokOAuthAuthorizeScript(name === 'Authorize' ? '許可' : 'Authorize'), context)).toEqual({ clicked: false })
+  expect(clicks).toBe(1)
 })

@@ -241,9 +241,11 @@ ZeroちゃんがmacOSの固定OAuth helperをphase内で1回だけ試します�
 既存の認証情報を保持します。反映後の中断では新しい認証情報が残る場合があります。
 並行する手動loginを完全に排他できないため、自動復旧中に別途`grok login`を実行しないでください。
 OAuthの旧32文字・UUID形式のstateと通常のANSI表示に対応しています。
-再認証中のbrowser確認はadvisorのpollからprimary Codexへ引き継ぎます。公式Chrome連携で
-今回増えたtabが1つなら追加openを省略し、0個のときだけhelperが開きます。
-primaryは一意な公式認可画面の「Authorize／許可」を確認し、必要な場合だけ1回操作します。
+再認証では、実効設定で検証済みのGo Chrome接続があればホストが固定操作で確認します。
+明示的に無効化した接続や独自接続を上書きしません。この接続がない場合は、advisorのpollから
+primary Codexの公式Chrome連携へ引き継ぎます。今回増えたtabが1つなら追加openを省略し、
+0個のときだけhelperが開きます。一意な公式認可画面の「Authorize／許可」を2回確認し、
+直前にも全条件を再確認した場合だけ1回操作します。通常の任意JavaScriptツールは開放しません。
 Grok終了後もtab identityの最終確認を受けるまで認証情報を確定しません。
 helperとbrokerの間で渡すのは固定応答だけで、URL・credential・画面本文を渡しません。
 このhelperはZeroちゃん専用の同梱物です。codex-configのAGENTS.mdやhelperだけを更新しても
