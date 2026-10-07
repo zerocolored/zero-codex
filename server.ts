@@ -98,7 +98,7 @@ import {
   takeSlackTokensFromEnvironment,
 } from './zerokun/child-environment.ts'
 import { verifySlackAppTokenPair } from './zerokun/slack-app-identity.ts'
-import { clearIntentionalServiceStop } from './zerokun/service-control-state.ts'
+import { clearIntentionalServiceStop, writeIntentionalServiceStop, takeGatewayStartupLease } from './zerokun/service-control-state.ts'
 import {
   copyLiveControlAttachments,
   isSlackInterruptCommand,
@@ -134,6 +134,7 @@ import { CloudRuntime } from './zerokun/cloud-runtime.ts'
 import { handoffControl, explicitlyAddressedHandoff } from './zerokun/handoff-control.ts'
 
 const STATE_DIR = resolveZeroStateDir()
+const releaseStartupLease = takeGatewayStartupLease(STATE_DIR)
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -2797,7 +2798,12 @@ async function pollThreads(): Promise<void> {
 }
 
 process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)
+process.on('SIGINT', () => {
+  // Ctrl-C is an explicit stop. SIGTERM remains recoverable for supervised
+  // restarts and unexpected gateway exits.
+  try { writeIntentionalServiceStop(STATE_DIR) }
+  finally { shutdown() }
+})
 
 // A closed lid or a dropped Wi-Fi makes every in-flight Slack call reject at
 // once, including calls this file fires and never awaits. Bun turns an
@@ -2889,6 +2895,7 @@ try {
   // legacy launcher) re-enables crash alerts only after Socket Mode and the
   // generation-bound readiness record are both established.
   clearIntentionalServiceStop(STATE_DIR)
+  releaseStartupLease()
   fleetReporter = startConfiguredFleet(STATE_DIR, identity.appId, connectedProjectDir,
     () => jobStore.fleetFolderFacts(Date.now(), connectedProjectDir), () => slackSocket?.connected === true,
     { teamId: identity.teamId, name: identity.botName, botToken: BOT_TOKEN })

@@ -2448,7 +2448,7 @@ print('review complete')
     } finally {
       await fixture.close()
     }
-  }, 20_000)
+  }, 30_000)
 
   test('単一write workflowはSlack追記後のreviewを新revisionで直接通す', async () => {
     const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })

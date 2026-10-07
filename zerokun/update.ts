@@ -3798,7 +3798,7 @@ async function installInstanceRuntime(target: ReleaseTarget, root: string, lease
     cwd: root, processGroupLease: lease,
     env: { ...buildSetupEnvironment(), ZEROKUN_REPO_DIR: undefined, ZEROKUN_STATE_DIR: target.stateDir, ZEROKUN_PROJECT_DIR: target.projectDir, ZEROKUN_LEGACY_CUTOVER: legacyCutoverForState(target.stateDir) },
   })
-  for (const name of ['job-runner.ts', 'codex-executor.ts']) {
+  for (const name of ['job-runner.ts', 'codex-executor.ts', 'service-control.ts']) {
     const link = join(target.stateDir, name)
     const temporary = `${link}.${randomUUID()}`
     symlinkSync(join(root, 'zerokun', name), temporary)

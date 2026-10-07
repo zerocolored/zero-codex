@@ -18269,8 +18269,8 @@ async function runCli(): Promise<void> {
   let serviceControlPauseWarning = ''
   let fleetPaused = true
   const shouldPause = (): boolean => {
-    if (slackIdentityChanged() || herdrIdentityInvalid) { fleetPaused = true; return true }
-    const paused = updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
+    const paused = slackIdentityChanged() || herdrIdentityInvalid
+      || updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
     fleetPaused = paused
     if (paused) {
       try {
