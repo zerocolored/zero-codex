@@ -1,4 +1,5 @@
 import { createUsageRecorder } from './task-usage.ts'
+import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
 import { GROK_OAUTH_BROWSER_AUTHORIZATION } from './grok-oauth-observation.ts'
 import type { GrokChromeCapability } from './grok-oauth-chrome.ts'
 import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCliConfig } from './deployment-cli-runtime.ts'
@@ -1641,6 +1642,7 @@ export const CODEX_WORKER_SAFETY_PROMPT = [
   'review, tests, UI/UX approval, Git, pull requests, merge, deployment, and completion.',
   'You own that workflow: do exactly the requested work, do not broaden a simple operational',
   'request into unrelated product changes, and do not wait for a separate Zero host phase.',
+  PROPORTIONATE_DESIGN_INSTRUCTIONS,
   '',
   'Keep tactical commentary useful for the local monitor, but do not send every command, retry,',
   'tool failure, file inspection, or advisor detail to Slack. A commentary update is eligible for',
@@ -4160,7 +4162,7 @@ export function buildCodexDeveloperInstructions(
       'Use that transport when shell Git cannot access SSH host keys or HTTPS credentials.',
       'Use the installed gcloud CLI for authorized Google Cloud work, including builds and deployment.',
       'The primary shell preserves the host Cloud SDK configuration through CLOUDSDK_CONFIG.',
-      'For authorized Railway/Cloudflare work, installed railway/wrangler CLIs also reuse existing host login through narrow config links under isolated HOME.',
+      'For authorized Railway/Cloudflare work, installed railway/wrangler CLIs also reuse existing host login through the normal host configuration paths.',
       'Use their whoami commands to check authentication; do not read or print the config files or copy tokens. Normal CLI refresh is allowed.',
       'A Computer Use app approval error does not prove CLI authentication is unavailable. Check the native CLI before declaring browser approval a blocker.',
       'Use explicit destination/project/resource arguments and the authentication designated for the task.',

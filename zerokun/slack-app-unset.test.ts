@@ -8,6 +8,8 @@ import { resolveProjectAppState } from './project-app-state.ts'
 import { assertSlackProjectAdmission, isSlackProjectStop, SlackProjectDisconnectedError } from './slack-project-admission.ts'
 import { detachedProjectStatus } from './slack-app-unset.ts'
 import { registerSlackApp } from './slack-app-registry.ts'
+import { Database } from 'bun:sqlite'
+import { releaseProcessLock, tryAcquireProcessLock } from './process-lock.ts'
 
 const roots: string[] = []
 const stores: JobStore[] = []
@@ -117,6 +119,19 @@ test('failed route cleanup stays fail-closed and rerunning unset repairs it', ()
   expect(f.store.resolveSlackChannelRoute('ATEST', 'COWN')).toBeNull()
 })
 
+test('legacy all-app unset journal does not impose runtime support on unrelated apps', () => {
+  const f = fixture()
+  const other = join(f.root, 'old-unrelated'); mkdirSync(other, { mode: 0o700 })
+  const old = join(f.root, 'old-runtime'); mkdirSync(old)
+  writeFileSync(join(other, 'legacy-runtime.json'), JSON.stringify({ version: 1, path: old }), { mode: 0o600 })
+  const apps = [...f.apps, { appId: 'AOTHER', stateDir: other }]
+  const journal = join(f.project, '.zerochan', 'slack-app-unset.json')
+  writeFileSync(journal, JSON.stringify({ version: 1, repoPath: f.project, apps }), { mode: 0o600 })
+  unsetProjectSlackApp(f.project, apps)
+  expect(readProjectChannelConfig(f.project).slackAppId).toBeNull()
+  expect(existsSync(journal)).toBe(false)
+})
+
 test('pre-feature pinned runtime refuses before detaching', () => {
   const f = fixture()
   const oldRoot = join(f.root, 'old-runtime'); mkdirSync(oldRoot)
@@ -146,6 +161,96 @@ test('historical app threads also stop receiving after a switch and unset', () =
   expect(() => f.store.stageInboundDeliveryAndAdoptSlackThread({ ...f.input, messageId: '1800000000.000200' }, { appId: 'ATEST', initialContextEligible: false })).toThrow(SlackProjectDisconnectedError)
   expect(f.store.resolveSlackChannelRoute('ATEST', 'COTHER')).toBe(f.other)
   expect(f.store.listThreads()[0]?.repoPath).toBe(f.project)
+})
+
+test('unrelated app update and route lock do not block detach or migrate its database', () => {
+  const f = fixture()
+  const other = join(f.root, 'unrelated'); mkdirSync(other, { mode: 0o700 })
+  const path = join(other, 'jobs.sqlite3')
+  const db = new Database(path)
+  db.exec('CREATE TABLE unrelated (value TEXT)'); db.close()
+  const before = readFileSync(path)
+  const marker = join(other, 'update-transaction.json')
+  writeFileSync(marker, '{}', { mode: 0o600 })
+  const lock = join(other, 'channel-route.lock')
+  const held = tryAcquireProcessLock(lock)
+  expect(held.acquired).toBe(true)
+  if (!held.acquired) throw new Error('fixture lock failed')
+  try {
+    unsetProjectSlackApp(f.project, [...f.apps, { appId: 'AOTHER', stateDir: other }])
+    expect(readProjectChannelConfig(f.project).slackAppId).toBeNull()
+    expect(readFileSync(path)).toEqual(before)
+    expect(readFileSync(marker, 'utf8')).toBe('{}')
+    expect(existsSync(lock)).toBe(true)
+  } finally { releaseProcessLock(lock, held.lease) }
+})
+
+test.each(['malformed-json', 'invalid-operation'])('unrelated route journal is not validated or recovered during discovery: %s', kind => {
+  const f = fixture()
+  const other = join(f.root, 'unrelated'); mkdirSync(other, { mode: 0o700 })
+  const path = join(other, 'channel-route-transaction.json')
+  const raw = kind === 'malformed-json' ? '{' : JSON.stringify({ repoPath: f.other, beforeChannels: ['invalid-channel'] })
+  writeFileSync(path, raw, { mode: 0o600 })
+  unsetProjectSlackApp(f.project, [...f.apps, { appId: 'AOTHER', stateDir: other }])
+  expect(readProjectChannelConfig(f.project).slackAppId).toBeNull()
+  expect(readFileSync(path, 'utf8')).toBe(raw)
+  expect(existsSync(join(other, 'jobs.sqlite3'))).toBe(false)
+})
+
+test('discovery waits for an unrelated temporary SQLite write lock', async () => {
+  const f = fixture()
+  const other = join(f.root, 'unrelated'); mkdirSync(other, { mode: 0o700 })
+  const path = join(other, 'jobs.sqlite3')
+  const db = new Database(path); db.exec('CREATE TABLE unrelated (value TEXT)'); db.close()
+  const child = Bun.spawn([process.execPath, '--config=/dev/null', '--no-env-file', '-e',
+    "import {Database} from 'bun:sqlite'; const db=new Database(process.argv[1]); db.exec('BEGIN EXCLUSIVE'); console.log('locked'); await Bun.sleep(300); db.exec('COMMIT'); db.close();", path],
+  { stdout: 'pipe', stderr: 'pipe' })
+  try {
+    const reader = child.stdout.getReader()
+    const ready = await reader.read(); reader.releaseLock()
+    expect(new TextDecoder().decode(ready.value)).toContain('locked')
+    unsetProjectSlackApp(f.project, [...f.apps, { appId: 'AOTHER', stateDir: other }])
+    expect(readProjectChannelConfig(f.project).slackAppId).toBeNull()
+    expect(await child.exited).toBe(0)
+  } finally { if (child.exitCode === null) child.kill(); await child.exited }
+})
+
+test('unsupported runtime is rejected before schema migration or shared-app journal recovery', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'zero-unset-preflight-'))); roots.push(root)
+  const project = join(root, 'project'), state = join(root, 'state'), old = join(root, 'old')
+  for (const path of [project, state, old]) mkdirSync(path, { mode: 0o700 })
+  expect(Bun.spawnSync(['git', 'init', '-q', project]).exitCode).toBe(0)
+  bindProjectSlackApp(project, 'ATEST')
+  const dbPath = join(state, 'jobs.sqlite3')
+  const db = new Database(dbPath); db.exec('CREATE TABLE untouched (value TEXT)'); db.close()
+  const before = readFileSync(dbPath)
+  const journalPath = join(state, 'channel-route-transaction.json')
+  const journal = JSON.stringify({ version: 1, operation: 'sync', appId: 'ATEST', repoPath: project, beforeChannels: [], afterChannels: [], createdAt: Date.now() })
+  writeFileSync(journalPath, journal, { mode: 0o600 })
+  writeFileSync(join(state, 'legacy-runtime.json'), JSON.stringify({ version: 1, path: old }), { mode: 0o600 })
+  expect(() => unsetProjectSlackApp(project, [{ appId: 'ATEST', stateDir: state }])).toThrow('zerochan update')
+  expect(readFileSync(dbPath)).toEqual(before)
+  expect(readFileSync(journalPath, 'utf8')).toBe(journal)
+  expect(readProjectChannelConfig(project).slackAppId).toBe('ATEST')
+})
+
+test('related app update still prevents detach before any config or routes change', () => {
+  const f = fixture()
+  writeFileSync(join(f.state, 'update-transaction.json'), '{}', { mode: 0o600 })
+  expect(() => unsetProjectSlackApp(f.project, f.apps)).toThrow('更新中')
+  expect(readProjectChannelConfig(f.project).slackAppId).toBe('ATEST')
+  expect(f.store.resolveSlackChannelRoute('ATEST', 'COWN')).toBe(f.project)
+  expect(existsSync(join(f.project, '.zerochan', 'slack-app-unset.json'))).toBe(false)
+})
+
+test('historical owner update remains in scope after switching to another app', () => {
+  const f = fixture()
+  const next = join(f.root, 'next'); mkdirSync(next, { mode: 0o700 })
+  const apps = [...f.apps, { appId: 'ANEXT', stateDir: next }]
+  switchProjectSlackApp(f.project, 'ANEXT', apps)
+  writeFileSync(join(f.state, 'update-transaction.json'), '{}', { mode: 0o600 })
+  expect(() => unsetProjectSlackApp(f.project, apps)).toThrow('更新中')
+  expect(readProjectChannelConfig(f.project).slackAppId).toBe('ANEXT')
 })
 
 test('cloud controls are blocked when new; accepted cloud controls can finish', () => {
