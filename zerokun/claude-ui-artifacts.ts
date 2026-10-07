@@ -5,7 +5,6 @@ import { isAbsolute, join, relative, resolve, sep } from 'path'
 import { createServer } from 'net'
 import { z } from 'zod'
 import { ensureManagedDirectory } from './managed-path.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 import { reencodeBrowserScreenshot } from './ui-approval.ts'
 
 /** Inputs describe the comparison, never grant paths or permissions. */
@@ -52,7 +51,6 @@ export async function createClaudeUiWorkspace(input: {
   stateDir: string; jobId: string; proposal: ClaudeUiProposal; projectRoots?: string[]
 }): Promise<ClaudeUiWorkspace> {
   const proposal = claudeUiProposalSchema.parse(input.proposal)
-  if (containsCredentialMaterial(proposal.comparison)) throw new Error('UI comparison contains credential material')
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'zero-fable-gui-')))
   chmodSync(root, 0o700)
   const protectedRoots = [input.stateDir, ...(input.projectRoots ?? []),
@@ -139,8 +137,8 @@ export function collectClaudeUiArtifacts(input: {
   const samplePath = join(workspace.root, 'prototype', 'index.html')
   const sample = readArtifact(samplePath, 2 * 1024 * 1024)
   const html = sample.toString('utf8')
-  if (containsCredentialMaterial(html) || /(?:\b(?:src|href|action)\s*=\s*["']|\burl\(\s*["']?)(?:https?:\/\/|\/\/|file:|ftp:)/i.test(html)) {
-    throw new Error('Fable sample contains credentials or an external resource; primary must inspect it')
+  if (/(?:\b(?:src|href|action)\s*=\s*["']|\burl\(\s*["']?)(?:https?:\/\/|\/\/|file:|ftp:)/i.test(html)) {
+    throw new Error('Fable sample contains an external resource; primary must inspect it')
   }
   const sourceDir = join(workspace.root, 'evidence')
   const source = join(sourceDir, 'after.png')

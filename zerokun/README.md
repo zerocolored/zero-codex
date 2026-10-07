@@ -125,8 +125,8 @@ Codexの結論を別のreview snapshotやpublication coordinatorで差し戻し�
 
 永続archive自体をscopeごとの直近64 jobへ圧縮し、省略済みjob数とcutoffだけを別台帳へ残します。
 snapshotも直近64 job block、128 Ki文字／256 KiBを上限とし、UTF-8 block境界で古いものから省略します。
-各archiveはevent数・文字数・byte数も制限します。credential、URL、machine-local path、Slack／内部ID、
-`<zerokun_files>`成果物path、host control風markerは保存前に除去し、履歴本文はhost authority、write許可、
+各archiveはevent数・文字数・byte数も制限します。文章、URL、path、ID、認証方式の例は内容による
+拒否・伏字をせず保持します。`<zerokun_files>`とhost control markerは通信metadataとして分離します。履歴本文はhost authority、write許可、
 UI/UX承認、repository、sandboxを変更できません。添付binaryはSlack thread・repository・source messageへ
 固定したhost側catalogで保持し、同じthreadの後続jobとnative resume/cold startへ読み取り専用で再提示します。
 upgrade前にすでにretention GCされたjobはbackfillできないため、その範囲だけはSlack本文または再添付から
@@ -276,9 +276,10 @@ job専用outbox・scratch配下の成果物を送信用にコピーし、open済
 50MB上限で読みます。project内の成果物はoutboxへコピーして指定します。
 同じSlackスレッド・同じprojectの過去のoutboxからも再添付できます。
 1件の準備失敗で他の添付を取り消しません。保護された設定・認証ファイル、
-対象外のpath、空file、symlink、device/FIFOはuploadしません。terminal本文と成果物ごとの
-送信直前に同じbyte列を軽量走査し、平文で明白なcredential patternがあるfileだけ添付を省略します。
-PNG・PDF・ZIPなど形式自体は制限せず、archive展開、復号、OCRは行いません。
+対象外のpath、空file、symlink、device/FIFOはuploadしません。本文、URLのpath・query・fragment、
+添付名と添付内容を認証情報らしい文字列や内部IDらしい形式で拒否・書き換えません。
+独立レビューの依頼・回答、再起動後の復元、会話履歴とhandoffも同じ方針です。
+PNG・PDF・ZIPなど形式自体は制限しません。
 送信済み状態をSQLiteへ別々に残すため、添付失敗時に本文は再投稿しません。upload URL取得までの確実な
 未送信失敗だけを指数backoffで再試行します。byte転送後は完了receiptまで同じprocessで待ち、突然死や
 応答欠落で結果を証明できない場合は重複防止のためbyteを自動再送せずambiguousに固定し、永続化したSlack file IDを`files.info`で同じchannel・threadへ照合します。upload URL取得までの未送信失敗は回数で捨てず再試行し、曖昧な成果物だけ最大5回の配送状態

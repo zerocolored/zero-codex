@@ -102,19 +102,13 @@ test('stores terminal content privately with a verifiable receipt, replacing the
   expect(JSON.parse(readFileSync(path, 'utf8')).transcript.text).toBe('later snapshot')
 })
 
-test('suppresses credential-bearing output before truncation and redacts common identifying text', () => {
+test('preserves diagnostic content without credential or identifier rewriting', () => {
   const options = fixture()
-  for (const secret of ['xoxb-' + 'a'.repeat(30), '-----BEGIN PRIVATE KEY-----\nU1lOVEhFVElDX0tFWV9CT0RZ\n-----END PRIVATE KEY-----', 'Bearer %22synthetic-credential-value%22', '-----BEGIN%20PRIVATE%20KEY-----\nU1lOVEhFVElDX0tFWV9CT0RZ\n-----END%20PRIVATE%20KEY-----']) {
-    const receipt = saveClaudeResponseDiagnostic({ ...options, transcript: 'あ'.repeat(40000) + secret })
-    const content = readFileSync(join(options.stateDir, receipt.path!), 'utf8')
-    expect(content).not.toContain(secret)
-    expect(content).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
-    expect(content).not.toContain('synthetic-credential-value')
-    expect(JSON.parse(content).transcript.credentialSuppressed).toBe(true)
-  }
-  const receipt = saveClaudeResponseDiagnostic({ ...options, transcript: 'https://example.invalid/?key=abc name@example.invalid /Users/someone/project' })
-  const text = JSON.parse(readFileSync(join(options.stateDir, receipt.path!), 'utf8')).transcript.text
-  expect(text).toBe('[url redacted] [email redacted] /[user]/project')
+  const transcript = 'view bearer vs callback\nhttps://example.test/report#' + 'a'.repeat(64)
+    + '\nAuthorization: Bearer synthetic-example\nname@example.test /Users/example/project'
+  const receipt = saveClaudeResponseDiagnostic({ ...options, transcript })
+  expect(JSON.parse(readFileSync(join(options.stateDir, receipt.path!), 'utf8')).transcript)
+    .toMatchObject({ text: transcript, credentialSuppressed: false, sanitized: false })
 })
 
 test('bounds multibyte evidence preserving both ends, and distinguishes absent output', () => {

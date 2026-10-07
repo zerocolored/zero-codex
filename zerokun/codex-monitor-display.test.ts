@@ -136,7 +136,7 @@ describe('Codex monitor display', () => {
     expect(display.observe(notification('future/event', {
       threadId: 'root-thread', payload: { jsonrpc: '2.0' },
     }), 'root-thread')).toEqual([])
-    expect(sanitizeMonitorText('{"jsonrpc":"2.0","id":"secret"}')).toBeNull()
+    expect(sanitizeMonitorText('{"jsonrpc":"2.0","id":"example"}')).toBe('{"jsonrpc":"2.0","id":"example"}')
   })
 
   test('Slack向け節目だけをkind付き完全envelopeから取り出す', () => {
@@ -189,37 +189,12 @@ describe('Codex monitor display', () => {
     }), 'root-thread')).toEqual(['💬 テスト設定を調整しています'])
   })
 
-  test('絶対path、URL、ID、terminal制御を除去しcredential含有行は棄却する', () => {
-    const safe = sanitizeMonitorText(
-      '\u001b[31m/Users/example/project\u001b[0m https://example.test/a '
-        + '123e4567-e89b-12d3-a456-426614174000 U0123456789',
-    )
-    expect(safe).toBe(
-      '（内部パスを省略） （URLを省略） （内部IDを省略） （内部IDを省略）',
-    )
-    expect(sanitizeMonitorText('Authorization: Bearer abcdefghijklmnop')).toBeNull()
-    expect(sanitizeMonitorText('token=xoxb-12345678901234567890')).toBeNull()
-    expect(sanitizeMonitorText('private_key=not-for-display')).toBeNull()
-    for (const value of [
-      'cwd=/Users/example/project を確認中',
-      '/System/Libraryを確認中',
-      '/workspace/projectを確認中',
-      '~/private/projectを確認中',
-      'file:///Users/example/project/index.html',
-      'postgres://user:pass@localhost/database',
-    ]) {
-      const sanitized = sanitizeMonitorText(value)
-      expect(sanitized).not.toBeNull()
-      expect(sanitized).not.toContain('/Users')
-      expect(sanitized).not.toContain('/System')
-      expect(sanitized).not.toContain('/workspace')
-      expect(sanitized).not.toContain('~/')
-      expect(sanitized).not.toContain('://')
-      expect(sanitized).not.toContain('user:pass')
-    }
-    expect(sanitizeMonitorText('処理結果 {"jsonrpc":"2.0","turnId":"secret"}')).toBeNull()
+  test('URL・ID・認証方式の説明を保持しterminal制御だけを除去する', () => {
+    const text = '/Users/example/project https://example.test/report#' + 'a'.repeat(64)
+      + ' U0123456789 Authorization: Bearer synthetic-example'
+    expect(sanitizeMonitorText('\u001b[31m' + text + '\u001b[0m')).toBe(text)
+    expect(sanitizeMonitorText('view bearer vs callback')).toBe('view bearer vs callback')
     expect(sanitizeMonitorText('あ'.repeat(8_193))).toBeNull()
-    expect(sanitizeMonitorText('COMPLETED')).toBe('COMPLETED')
   })
 
   test('同turnで同種コマンドを連打してもカテゴリ表示を増やさない', () => {

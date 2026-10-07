@@ -673,7 +673,7 @@ for line in sys.stdin:
                     if mode == "phased-promotion-history-failed":
                         required_history = (
                             "--- Prior Slack thread history " in phase_prompt
-                            and "develop適用できますか?developからmainへのPRも作っておいて、URLをください。" in phase_prompt
+                            and "develop適用できますか？developからmainへのPRも作っておいて、URLをください。" in phase_prompt
                             and "こちら続きを進めて" in phase_prompt
                         )
                         if not required_history:
@@ -4067,7 +4067,7 @@ describe('production App Server executor', () => {
     expect(value.job.task).toBe('こちら続きを進めて')
     expect(value.job.resumed).toBe(false)
     expect(value.store.threadHistorySnapshot(value.job.id).transcript).toContain(
-      'develop適用できますか?developからmainへのPRも作っておいて、URLをください。',
+      'develop適用できますか？developからmainへのPRも作っておいて、URLをください。',
     )
     const execution = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,

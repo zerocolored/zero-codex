@@ -172,18 +172,33 @@ test('failed publication cancels without leaving a pending confirmation', async 
 })
 
 test.each(['http://127.0.0.1', 'http://localhost', 'https://example.test', 'http://device.local', 'http://192.168.0.1'])(
-  'a hidden destination %s never produces an actionable confirmation', async origin => {
+  'the displayed destination %s supports the exact pending confirmation', async origin => {
     const f = fixture()
-    let published = false
     expect(await awaitNativeConfirmation({ store: f.store.nativeConfirmations,
       binding: { ...f.binding, origin }, signal: new AbortController().signal,
-      prepareText: f.prepareText, publish: () => { published = true; return true },
-    })).toBe('cancel')
-    expect(published).toBe(false)
+      prepareText: f.prepareText, publish: event => {
+        expect(event.text).toContain(origin)
+        f.publish(event)
+        const notification = f.deliver()
+        const code = /今回だけ許可 ([a-f0-9]{12})/.exec(notification.payload)![1]!
+        expect(f.store.nativeConfirmations.answer({ ...f.answer, code })).toBe(true)
+        return true
+      },
+    })).toBe('accept')
     expect(f.store.pendingCommentaryNotifications()).toHaveLength(0)
-    expect(f.db.query('SELECT status FROM native_confirmations').get()).toEqual({ status: 'closed' })
+    expect(f.db.query('SELECT status FROM native_confirmations').get()).toEqual({ status: 'consumed' })
   },
 )
+
+test('missing destination text still cannot solicit an ambiguous approval', async () => {
+  const f = fixture()
+  let published = false
+  expect(await awaitNativeConfirmation({ store: f.store.nativeConfirmations, binding: f.binding,
+    signal: new AbortController().signal, prepareText: () => 'destination unavailable',
+    publish: () => { published = true; return true },
+  })).toBe('cancel')
+  expect(published).toBe(false)
+})
 
 test('the public destination and code survive the real notifier formatting and second redaction', async () => {
   const f = fixture(), controller = new AbortController()

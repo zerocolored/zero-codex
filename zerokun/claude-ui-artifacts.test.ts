@@ -33,10 +33,10 @@ async function fixture() {
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'zero-ui-artifact-test-')))
   chmodSync(stateDir, 0o700); roots.push(stateDir)
   const workspace = await createClaudeUiWorkspace({ stateDir, jobId: 'test-job', proposal: {
-    comparison: 'Synthetic settings screen, dark theme, scroll 0, no focus', beforeKind: 'synthetic',
+    comparison: 'Synthetic settings screen: view bearer vs callback, dark theme, scroll 0, no focus', beforeKind: 'synthetic',
   } })
   roots.push(workspace.root)
-  writeFileSync(join(workspace.root, 'prototype', 'index.html'), '<!doctype html><title>Settings</title><h1>Settings</h1>', { mode: 0o600 })
+  writeFileSync(join(workspace.root, 'prototype', 'index.html'), '<!doctype html><title>Settings</title><h1>Settings</h1><p>Authorization: Bearer synthetic-example</p>', { mode: 0o600 })
   return { workspace, stateDir, jobId: 'test-job' }
 }
 function png(workspace: ClaudeUiWorkspace, width = 1280) {

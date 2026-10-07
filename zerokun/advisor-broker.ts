@@ -29,7 +29,7 @@ import { z } from 'zod'
 import { GrokOAuthBrowserSession, GROK_BROWSER_ANSWERS, GROK_BROWSER_ABORT_REASONS, advisorRecoveryProgress } from './grok-oauth-browser.ts'
 import { readNativeAdvisorRegistrations, registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { AdvisorFailureError, advisorFailureMessage, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
-import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, sanitizeClaudeAnswer, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
+import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
 import { connectGrokChrome, driveGrokChrome, type GrokChromeControl } from './grok-oauth-chrome.ts'
 import { claudeUiProposalSchema, createClaudeUiWorkspace, claudeUiInstructions, collectClaudeUiArtifacts,
@@ -110,7 +110,6 @@ import {
   readAdvisorInputSnapshot,
   type AdvisorInputSnapshot,
 } from './advisor-input.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 import {
   advisorPerspectiveForPhase,
   threeAdvisorRepositoryDeltaDigest,
@@ -774,8 +773,8 @@ function parseContext(pathInput: string, stateDir: string): BrokerContext {
 }
 
 function safeInput(value: string, label: string, maximum = MAX_INPUT_CHARS): string {
-  if (!value || value.length > maximum || value.includes('\0') || containsCredentialMaterial(value)) {
-    throw new Error(`${label} is empty, too large, or contains protected credential material`)
+  if (!value || value.length > maximum || value.includes('\0')) {
+    throw new Error(`${label} is empty, too large, or contains a NUL character`)
   }
   return value
 }
@@ -2452,23 +2451,21 @@ async function main(): Promise<void> {
                       stateChangedDuringRead = true
                       break
                     }
-                    const sanitized = sanitizeClaudeAnswer(fileAnswer.response)
                     const responseMetadata = {
-                      responseSha256: createHash('sha256').update(sanitized.response).digest('hex'),
-                      responseBytes: Buffer.byteLength(sanitized.response), redacted: sanitized.redacted,
+                      responseSha256: createHash('sha256').update(fileAnswer.response).digest('hex'),
+                      responseBytes: Buffer.byteLength(fileAnswer.response), redacted: false,
                     }
                     const directory = ensureManagedDirectory(stateDir,
                       join(journalRoot, `revision-${input.revision}-${input.digest.slice(0, 16)}`))
                     const path = join(directory, `claude-answer-${diagnosticAttempt}.json`)
-                    // Keep original receipt evidence separate from the sanitized
-                    // response digest. Never persist the unredacted answer.
+                    // Preserve the original answer bytes and its receipt evidence.
                     atomicWritePrivateFile(path, JSON.stringify({ version: 1, phase, round,
                       marker, sha256: fileAnswer.sha256, bytes: fileAnswer.bytes,
-                      ...responseMetadata, response: sanitized.response }))
+                      ...responseMetadata, response: fileAnswer.response }))
                     answerArtifact = { path: relative(stateDir, path),
                       sha256: fileAnswer.sha256, bytes: fileAnswer.bytes, ...responseMetadata }
-                    response = sanitized.response
-                    responseRedacted = sanitized.redacted
+                    response = fileAnswer.response
+                    responseRedacted = false
                     stateChangeSeqAfter = current.state_change_seq
                     observation.outcome = 'complete'
                     diagnosticTranscript = transcript
@@ -2481,9 +2478,8 @@ async function main(): Promise<void> {
                   diagnosticTranscript = transcript
                   diagnosticTranscriptReadIndex = diagnosticReads.length - 1
                   if (completeResponse && modelStartObserved) {
-                    const sanitized = sanitizeClaudeAnswer(completeResponse)
-                    response = sanitized.response
-                    responseRedacted = sanitized.redacted
+                    response = completeResponse
+                    responseRedacted = false
                     reason = 'Claude response obtained but subsequent cleanup validation did not complete'
                     stateChangeSeqAfter = current.state_change_seq
                     break
