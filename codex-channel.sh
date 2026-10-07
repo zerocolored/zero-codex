@@ -46,6 +46,15 @@ if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "set" ] && [ "${2:-}" = "slack
   exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-command.ts" "$(pwd -P)"
 fi
 STATE_DIR="$(zerokun_resolve_state_dir)"
+if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "unset" ] && [ "${2:-}" = "slack-app" ]; then
+  [ "$#" -eq 2 ] || { echo '使い方: zerochan unset slack-app' >&2; exit 2; }
+  exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-unset.ts" unset "$(pwd -P)"
+fi
+if [ "$INVOKED_AS" = "zerochan" ] && [ "$#" -eq 1 ] && [ "$1" = "status" ]; then
+  status_result=0
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-unset.ts" status "$(pwd -P)" || status_result=$?
+  [ "$status_result" -eq 3 ] || exit "$status_result"
+fi
 if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "security" ]; then
   STATE_DIR="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" "$(pwd -P)" "$STATE_DIR")"
   shift

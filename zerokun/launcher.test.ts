@@ -238,7 +238,7 @@ async function runLauncher(
       'if [[ "$*" == *project-selection.ts* || "$*" == *project-app-state.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
-      'if [[ "$*" == *project-channel-config.ts* ]]; then',
+      'if [[ "$*" == *project-channel-config.ts* || "$*" == *slack-app-unset.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
       'if [[ "$*" == *readiness.ts* ]]; then',

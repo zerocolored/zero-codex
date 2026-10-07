@@ -21,6 +21,7 @@ zerochan_help() {
         '  zerochan update           更新・検証・再起動' \
         '  zerochan update --recover-only  中断された更新の復旧だけを実行' \
         '  zerochan auto-update on|off|status  自動更新の設定・確認' \
+        '  zerochan unset slack-app      現在projectのアプリ・チャンネル紐付けを解除' \
         '  zerochan unset slack-channel  チャンネル紐付けを解除' \
         '  zerochan cloud login|activate|status  クラウド引き継ぎ設定' \
         '  zerochan fleet identity   このPCの監視用IDを表示' \
@@ -117,7 +118,11 @@ zerochan_help() {
         '確認: zerochan status / 起動: zerochan start'
       ;;
     unset)
-      printf '%s\n' '使い方: zerochan unset slack-channel' \
+      printf '%s\n' '使い方: zerochan unset slack-app' \
+        '現在のプロジェクトのアプリ・チャンネル紐付けを解除し、新規依頼（既存スレッド・DMを含む）の受付を停止します。' \
+        '受付済み作業・結果通知・停止操作、アプリ登録・トークン・履歴、他のプロジェクトは保持します。' \
+        '再接続: zerochan set slack-app → zerochan set slack-channel <channel-id>。解除中の投稿は実行しません。' \
+        '' '使い方: zerochan unset slack-channel' \
         '現在のプロジェクトのチャンネル紐付けをすべて解除します。チャンネルIDは付けません。アプリの登録情報は削除しません。' \
         '確認: zerochan status'
       ;;

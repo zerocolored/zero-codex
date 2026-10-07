@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { assertSlackProjectAdmission } from './slack-project-admission.ts'
 import { executeSecurityAudit, copyAuditReportForFollowup } from './security-audit.ts'
 import { createSecurityAuditProgress } from './security-audit-progress.ts'
 import { fleetProject } from './fleet-project.ts'
@@ -5591,6 +5592,8 @@ export class JobStore {
         return { outcome: 'duplicate' as const, repoPath, initialContextRequired: false }
       }
 
+      if (!this.hasDurableEvent(idempotencyKey)) assertSlackProjectAdmission(repoPath, messageId)
+
       const pendingBootstrap = !existingThread
         ? this.db.query<{ present: number }, [string, string]>(
             `SELECT 1 AS present FROM inbound_deliveries
@@ -5715,6 +5718,12 @@ export class JobStore {
           )
           return 'authority-closed' as const
         }
+      }
+
+      if (!this.hasDurableEvent(idempotencyKey)) {
+        assertSlackProjectAdmission(input.repoPath, messageId, {
+          allowDisconnectedStop: Boolean(input.isInterrupt && boundJobId !== null),
+        })
       }
 
       const inserted = this.db.run(
@@ -9043,6 +9052,7 @@ export class JobStore {
   }
 
   stageCloudControl(input: CloudControl): void {
+    if (!this.hasDurableEvent(`${input.channel}:${input.message}`)) assertSlackProjectAdmission(input.project, input.message)
     this.db.run(`INSERT OR IGNORE INTO cloud_handoff_controls(event_id,payload,created_at) VALUES(?,?,?)`,
       [`${input.channel}:${input.message}`, JSON.stringify(input), Date.now()])
   }

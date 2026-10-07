@@ -9,6 +9,7 @@ export interface GatewayReadiness {
   release: string
   projectDir: string
   channelRoutingVersion?: 1
+  projectDisconnectVersion?: 1
   slackAppId?: string
 }
 
@@ -51,6 +52,7 @@ export function writeGatewayReadiness(
       release: release.trim() || 'unknown',
       projectDir,
       channelRoutingVersion: 1,
+      projectDisconnectVersion: 1,
       slackAppId: appId,
     } satisfies GatewayReadiness), { mode: 0o600, flag: 'wx' })
     renameSync(temporary, path)

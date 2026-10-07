@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { assertSlackProjectAdmission, isSlackProjectStop, SlackProjectDisconnectedError } from './zerokun/slack-project-admission.ts'
 import { fleetProject } from './zerokun/fleet-project.ts'
 import { classifyFleetRequest, separateSecurityWorkflow, readProjectFleet, fleetCloudTime, answerFleetStatus, unavailableFleet, fleetReplyEnvelope } from './zerokun/fleet-query.ts'
 /**
@@ -667,6 +668,16 @@ async function admitSlackChannelThreadReply(input: {
   // thread, lease and native-process binding are checked in deliver(), never
   // decided by the audience classifier or interpreted as a model instruction.
   if (parseNativeConfirmationAnswer(normalizeSlackInboundText(input.text, botUserId, false))) return 'addressed'
+  if (isSlackProjectStop(input.text, botUserId, input.channelId.startsWith('D'))) return 'addressed'
+  try {
+    assertSlackProjectAdmission(resolveUnclaimedRepoPath(input.channelId, input.threadTs), input.messageTs)
+  } catch (error) {
+    if (error instanceof SlackProjectDisconnectedError) {
+      jobStore.recordDeliveryTombstone(`${input.channelId}:${input.messageTs}`)
+      return 'handled'
+    }
+    if (!(error instanceof SlackChannelRouteRequiredError) && !(error instanceof SlackProjectUnavailableError)) throw error
+  }
   if (cloudRuntime && explicitlyAddressedHandoff(input.text, botUserId)) return 'addressed'
   if (input.channelId.startsWith('D') || input.threadTs === input.messageTs) {
     return 'addressed'
@@ -1472,6 +1483,9 @@ function deliver(
       return true
     }
     const cloudAction = cloudRuntime ? handoffControl(text) : null
+    if (cloudAction || (writeEnabled && isExplicitUpdateRequest(text))) {
+      assertSlackProjectAdmission(resolveUnclaimedRepoPath(chatId, resolvedThreadTs), messageTs)
+    }
     if (cloudRuntime && cloudAction && botUserId && threadTs && !chatId.startsWith('D')) {
       const waiting = await cloudRuntime.client.find(chatId, threadTs)
       if (waiting && cloudAction === 'continue') {
@@ -1562,6 +1576,11 @@ function deliver(
       process.stderr.write(
         `slack channel: route changed while accepting ${key}; catch-up will retry\n`,
       )
+      return false
+    }
+    if (err instanceof SlackProjectDisconnectedError) {
+      jobStore.recordDeliveryTombstone(key)
+      rememberDelivered(key)
       return false
     }
     if (err instanceof SlackChannelRouteRequiredError

@@ -317,6 +317,14 @@ AIが前節と同じ方法でBot TokenとApp-Level Tokenを取得し、対話端
 再び `zerochan set slack-app` を実行して登録済みAppを選択してください。
 既存の単一App設定は移動せずに取り込むため、キューや履歴は保持されます。
 
+このプロジェクトだけSlackから切り離すには `zerochan unset slack-app` を実行します。
+アプリ・チャンネルの紐付けを解除し、既存スレッドやDMを含む新規依頼の受付を停止します。
+受付済みの作業・結果通知・その作業の停止操作は継続し、アプリ登録・トークン・履歴・他のプロジェクトは保持します。
+`zerochan status` は「未設定（解除済み）」になります。再接続は `zerochan set slack-app` →
+`zerochan set slack-channel <channel-id>` の順です。解除中の投稿は再接続後も実行しません。
+以前このプロジェクトを担当したアプリも含め、古い実行版が残る場合は先に該当アプリを `zerochan update` で更新してください。
+解除が中断した場合は `zerochan unset slack-app` の再実行で復旧できます。
+
 `zerochan help` は全体の操作一覧、`zerochan <command> --help` は個別の説明です。
 トークン未設定時でもヘルプは表示できます。
 
