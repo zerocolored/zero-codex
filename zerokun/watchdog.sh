@@ -455,10 +455,35 @@ if alert:
 PY
 }
 
+recover_service() {
+  # Resolve only this app's installed runtime; don't run the shared zerochan
+  # command, which may select another app or a different release.
+  local runner source_dir controller bun_bin
+  runner="$(/usr/bin/readlink "$STATE_DIR/job-runner.ts" 2>/dev/null)" || return 0
+  case "$runner" in /*/zerokun/job-runner.ts) ;; *) return 0 ;; esac
+  source_dir="${runner%/job-runner.ts}"
+  controller="$(/usr/bin/readlink "$STATE_DIR/service-control.ts" 2>/dev/null)" || controller="$source_dir/service-control.ts"
+  case "$controller" in /*/zerokun/service-control.ts) ;; *) return 0 ;; esac
+  [ -f "$controller" ] || return 0
+  # Older installed releases have no recovery entrypoint.
+  [ -f "${controller%/service-control.ts}/herdr-recovery.ts" ] || return 0
+  for bun_bin in "$HOME/.local/bin/bun" "$HOME/.bun/bin/bun" /opt/homebrew/bin/bun /usr/local/bin/bun; do
+    [ -x "$bun_bin" ] || continue
+    PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" \
+      "$bun_bin" --config=/dev/null --no-env-file "$controller" \
+      recover "${source_dir%/zerokun}" "$STATE_DIR"
+    return $?
+  done
+  return 1
+}
+
 run_watchdog() {
   STATE_DIR="$(resolve_state_dir)" || return 1
   STATE_FILE="$STATE_DIR/watchdog-state.json"
   prepare_state_dir || return 1
+  # Recovery is independent of notification credentials, mute, and delivery.
+  # The service controller serializes with start/stop/update and preserves jobs.
+  recover_service || printf 'zerokun watchdog: recovery deferred; retrying next tick\n' >&2
   if [ -e "$STATE_FILE" ] && ! private_regular_file "$STATE_FILE"; then
     printf 'zerokun watchdog: unsafe state file; refusing to read it\n' >&2
     return 1

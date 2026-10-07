@@ -355,6 +355,10 @@ zerochan start
 ```
 
 `zerochan`だけでも起動できます。`zerochan start`は重複起動を避けて既存processを共有します。
+macOSでは60秒ごとのOS監視が、起動済みアプリのgateway・処理担当・復旧担当の欠落を検出して復旧します。
+Herdrの起動ペインが失われた場合も専用workspaceを作り直します。実行中の作業がある間は置換を待ち、
+`zerochan stop`やCtrl-Cで明示的に停止したアプリや、一度も起動していないアプリは起動しません。
+Herdrとの一時的な通信障害では既存processを保ち、次の監視で再確認します。通知の無効化は復旧を止めません。
 runtime log tabを作り直したい場合は`zerochan stop`のあと`zerochan start`を実行します。
 実行中jobがあって通常停止を拒否された場合だけ、`zerochan stop --force`でZeroちゃん所有のprocessを
 強制停止できます。待機中jobは保持され、途中のjobは同じSlack threadから再開できます。

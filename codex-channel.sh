@@ -24,6 +24,7 @@ done
 . "$REPO_DIR/zerokun/state-dir.sh"
 
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+unset ZEROKUN_STARTUP_LEASE
 # Remove untrusted child-process transport and test overrides before the first
 # Bun helper, including project selection.
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
@@ -332,8 +333,11 @@ fi
 # Keep a generation-bound lease only while this launcher is responsible for
 # the gap; it is released before the final gateway exec so later real failures
 # can still alert normally.
-if [ "$LAUNCH_MODE" = "restart" ] && [ "$INVOKED_AS" = "zerochan" ]; then
+if [ "$AUTHORIZED_UPDATE_RESTART" != "1" ] \
+   && { [ "$LAUNCH_MODE" = "start" ] || [ "$LAUNCH_MODE" = "restart" ]; }; then
   acquire_restart_maintenance || exit 1
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/service-control.ts" \
+    assert-idle "$STATE_DIR" || exit 1
 fi
 
 # candidateへfast-forwardした直後にcrashした場合でも、候補版の最小Codex versionや
@@ -476,6 +480,15 @@ if [ -n "$existing_bridge_pid" ]; then
   if [ "${ZEROKUN_DRY_RUN:-0}" = "1" ]; then
     echo "   (dry-run: 実際には停止・起動しません)" >&2
     exit 0
+  fi
+  # Interactive replacement has the same planned outage as --restart. Publish
+  # its lease before stopping the gateway, then recheck the mutation barrier.
+  if [ "$AUTHORIZED_UPDATE_RESTART" != "1" ]; then
+    if [ -z "$RESTART_MAINTENANCE_LEASE" ]; then
+      acquire_restart_maintenance || exit 1
+    fi
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/service-control.ts" \
+      assert-idle "$STATE_DIR" || exit 1
   fi
   lock_process_is "$LOCK_FILE" "$existing_bridge_pid" 'server\.ts' || {
     echo "❌ gateway identityが確認待ちの間に変化したためsignalしません。" >&2
@@ -679,6 +692,10 @@ echo "   runtime : verified Herdr pane + job単位のCodex"
 echo "   trust   : read/writeともrepository sandbox / advisorは固定broker"
 echo "   caffeinate: ON (Ctrl-Cでgatewayを停止)"
 
-release_restart_maintenance || exit 1
+# Keep the lease across exec and asynchronous Slack connection. The gateway
+# consumes it before creating children and releases it only after readiness.
+if [ -n "$RESTART_MAINTENANCE_LEASE" ]; then
+  export ZEROKUN_STARTUP_LEASE="$RESTART_MAINTENANCE_LEASE"
+fi
 trap - EXIT
 exec caffeinate -dimsu bun --config=/dev/null --no-env-file "$REPO_DIR/server.ts"

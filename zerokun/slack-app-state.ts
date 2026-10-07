@@ -19,7 +19,7 @@ export function prepareSlackAppState(stateDir: string, appId: string, sourceDir 
     atomicWritePrivateFile(access, readFileSync(join(sourceDir, 'templates/access.json.example')))
   }
   installUpdateRequestRuntime(sourceDir, state)
-  for (const name of ['job-runner.ts', 'codex-executor.ts']) {
+  for (const name of ['job-runner.ts', 'codex-executor.ts', 'service-control.ts']) {
     const destination = join(state, name)
     const target = join(sourceDir, name)
     let existing

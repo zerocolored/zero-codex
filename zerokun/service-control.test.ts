@@ -15,6 +15,7 @@ import {
   inspectManagedServiceStatus,
   startManagedService,
   stopManagedService,
+  recoverManagedService,
 } from './service-control.ts'
 import {
   acknowledgeServiceControlPauseIfRequested,
@@ -24,6 +25,7 @@ import {
   intentionalServiceStopIsSet,
   serviceControlPauseAcknowledged,
   writeIntentionalServiceStop,
+  takeGatewayStartupLease,
 } from './service-control-state.ts'
 import {
   herdrRuntimeFingerprint,
@@ -32,6 +34,10 @@ import {
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
 import { writeGatewayReadiness } from './readiness.ts'
+import { writeLastConnectedProject } from './project-selection.ts'
+import { registerSlackApp } from './slack-app-registry.ts'
+import { acquireUpdateLock } from './update.ts'
+import { tryAcquireProcessLock, releaseProcessLock, encodeProcessLockLease, inspectProcessLock } from './process-lock.ts'
 import {
   observeProcessGeneration,
   readProcessIdentity,
@@ -220,7 +226,7 @@ async function spawnManagedServices(
     '',
   ].join('\n')
   writeFileSync(runner, runnerSource)
-  mkdirSync(join(state, 'job-runner.lock'), { mode: 0o700 })
+  mkdirSync(join(state, 'job-runner.lock'), { mode: 0o700, recursive: true })
   const gateway = Bun.spawn([process.execPath, server], {
     stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
   })
@@ -252,7 +258,202 @@ const testHooks = {
   closeRecordedTab: async () => 'none' as const,
 }
 
+describe('OS watchdog service recovery', () => {
+  const root = dirname(import.meta.dir)
+  function publishReadiness(state: string, project: string, gatewayPid: number) {
+    const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { cwd: root }).stdout.toString().trim()
+    writeGatewayReadiness(join(state, 'gateway-ready.json'), release, gatewayPid, project, 'A0123456789')
+  }
+
+  test('pane loss with idle orphan runner restarts once, preserves queued work and stays healthy', async () => {
+    const { base, state, project } = fixture()
+    createJobDatabase(state, [{ status: 'queued' }])
+    const old = await spawnManagedServices(state, base)
+    publishRuntime(state); publishReadiness(state, project, old.gateway.pid)
+    old.gateway.kill('SIGTERM'); old.launcher.kill('SIGTERM')
+    await Promise.all([old.gateway.exited, old.launcher.exited])
+    let starts = 0
+    const hooks = {
+      ...testHooks,
+      recoveryRuntime: async () => fakeRuntime,
+      startBot: async () => {
+        starts++
+        expect(await old.runner.exited).toBe(0)
+        const nextBase = join(base, 'restarted'); mkdirSync(nextBase)
+        const next = await spawnManagedServices(state, nextBase)
+        publishRuntime(state); publishReadiness(state, project, next.gateway.pid)
+        return { paneId: fakeRuntime.paneId, runtime: fakeRuntime, gatewayPid: next.gateway.pid }
+      },
+    }
+    expect(await recoverManagedService(root, state, hooks)).toBe('recovered')
+    expect(await recoverManagedService(root, state, hooks)).toBe('healthy')
+    expect(starts).toBe(1)
+    const db = new Database(join(state, 'jobs.sqlite3'), { readonly: true })
+    expect(db.query('SELECT status FROM jobs').all()).toEqual([{ status: 'queued' }]); db.close()
+    expect(intentionalServiceStopIsSet(state)).toBe(false)
+  }, 15_000)
+
+  test('active orphan job is preserved, then recovers after it finishes', async () => {
+    const { base, state, project } = fixture()
+    createJobDatabase(state, [{ status: 'running' }])
+    const old = await spawnManagedServices(state, base)
+    publishRuntime(state); publishReadiness(state, project, old.gateway.pid)
+    old.gateway.kill('SIGTERM'); old.launcher.kill('SIGTERM')
+    await Promise.all([old.gateway.exited, old.launcher.exited])
+    let reachedStart = false
+    const hooks = { ...testHooks, recoveryRuntime: async () => fakeRuntime,
+      startBot: async () => { reachedStart = true; throw new Error('fixture reached start') } }
+    expect(await recoverManagedService(root, state, hooks)).toBe('busy')
+    expect(old.runner.exitCode).toBeNull(); expect(reachedStart).toBe(false)
+    const db = new Database(join(state, 'jobs.sqlite3')); db.exec("UPDATE jobs SET status='completed'"); db.close()
+    await expect(recoverManagedService(root, state, hooks)).rejects.toThrow('fixture reached start')
+    expect(reachedStart).toBe(true)
+    expect(await old.runner.exited).toBe(0)
+    expect(intentionalServiceStopIsSet(state)).toBe(false)
+    await expect(recoverManagedService(root, state, hooks)).rejects.toThrow('fixture reached start')
+  }, 15_000)
+
+  test('explicit stop, never-started apps, and update ownership never trigger recovery', async () => {
+    const { state } = fixture()
+    let invoked = false
+    const hooks = { ...testHooks, recoveryRuntime: async () => { invoked = true; return fakeRuntime } }
+    expect(await recoverManagedService(root, state, hooks)).toBe('not-started')
+    writeIntentionalServiceStop(state)
+    expect(await recoverManagedService(root, state, hooks)).toBe('stopped')
+    clearIntentionalServiceStop(state)
+    const lock = acquireUpdateLock(state)
+    try { expect(await recoverManagedService(root, state, hooks)).toBe('busy') }
+    finally { lock.release() }
+    mkdirSync(join(state, 'restart.lock'), { mode: 0o700 })
+    const restartPath = join(state, 'restart.lock', 'pid')
+    const restart = tryAcquireProcessLock(restartPath)
+    if (!restart.acquired) throw new Error('fixture restart lock unavailable')
+    try { expect(await recoverManagedService(root, state, hooks)).toBe('busy') }
+    finally { releaseProcessLock(restartPath, restart.lease) }
+    expect(invoked).toBe(false)
+  })
+
+  test('transient Herdr outage never signals the orphan runner', async () => {
+    const { base, state, project } = fixture(); createJobDatabase(state)
+    const old = await spawnManagedServices(state, base)
+    publishRuntime(state); publishReadiness(state, project, old.gateway.pid)
+    old.gateway.kill('SIGTERM'); old.launcher.kill('SIGTERM')
+    await Promise.all([old.gateway.exited, old.launcher.exited])
+    await expect(recoverManagedService(root, state, {
+      ...testHooks, recoveryRuntime: async () => { throw new Error('temporary Herdr outage') },
+    })).rejects.toThrow('temporary Herdr outage')
+    expect(old.runner.exitCode).toBeNull()
+  })
+
+  test('concurrent watchdog ticks cannot create two recovery workspaces or launches', async () => {
+    const { state, project } = fixture(); createJobDatabase(state)
+    writePinnedHerdrRuntime(state, fakeRuntime); publishReadiness(state, project, 999999)
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const reached = new Promise<void>(resolve => { entered = resolve })
+    let starts = 0
+    const hooks = { ...testHooks,
+      recoveryRuntime: async () => { entered(); await gate; return fakeRuntime },
+      startBot: async () => { starts++; throw new Error('fixture launch failure') },
+    }
+    const first = recoverManagedService(root, state, hooks)
+    await reached
+    expect(await recoverManagedService(root, state, hooks)).toBe('busy')
+    release()
+    await expect(first).rejects.toThrow('fixture launch failure')
+    expect(starts).toBe(1)
+  })
+
+  test('deleted readiness still retries from the durable last connection, including stale running jobs', async () => {
+    const { base, state, project } = fixture()
+    createJobDatabase(state, [{ status: 'running' }, { status: 'queued' }])
+    registerSlackApp('A0123456789', state, base)
+    const otherState = join(base, 'removed-app-state')
+    mkdirSync(otherState, { mode: 0o700 })
+    registerSlackApp('AOTHER', otherState, base)
+    rmSync(otherState, { recursive: true })
+    writeLastConnectedProject(state, project)
+    writePinnedHerdrRuntime(state, fakeRuntime)
+    publishReadiness(state, project, 999999)
+    rmSync(join(state, 'gateway-ready.json'))
+    let attempts = 0
+    const hooks = { ...testHooks, registryHome: base,
+      recoveryRuntime: async () => fakeRuntime,
+      startBot: async () => { attempts++; throw new Error('fixture failed startup') },
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(recoverManagedService(root, state, hooks)).rejects.toThrow('fixture failed startup')
+    }
+    expect(attempts).toBe(2)
+    const db = new Database(join(state, 'jobs.sqlite3'), { readonly: true })
+    expect(db.query('SELECT status FROM jobs').all()).toEqual([{ status: 'running' }, { status: 'queued' }])
+    db.close()
+    writeIntentionalServiceStop(state)
+    expect(await recoverManagedService(root, state, hooks)).toBe('stopped')
+    expect(attempts).toBe(2)
+  })
+
+  test('live service PIDs with a missing pane recover, while temporary Herdr failures preserve them', async () => {
+    const { base, state, project } = fixture(); createJobDatabase(state)
+    const old = await spawnManagedServices(state, base)
+    publishRuntime(state); publishReadiness(state, project, old.gateway.pid)
+    let recovering = false
+    let transient = true
+    const hooks = { ...testHooks,
+      verifyControlRuntime: async () => {
+        if (!recovering) throw new Error(transient ? 'temporary outage' : '{"code":"pane_not_found"}')
+      },
+      recoveryRuntime: async () => { recovering = true; return fakeRuntime },
+      startBot: async () => { throw new Error('fixture reached start') },
+    }
+    await expect(recoverManagedService(root, state, hooks)).rejects.toThrow('temporary outage')
+    expect(old.gateway.exitCode).toBeNull(); expect(old.runner.exitCode).toBeNull()
+    transient = false
+    await expect(recoverManagedService(root, state, hooks)).rejects.toThrow('fixture reached start')
+    expect(await old.runner.exited).toBe(0)
+    expect(await old.gateway.exited).toBe(0)
+  }, 15_000)
+})
+
 describe('zerochan service control state', () => {
+  test('startup handoff stays busy through the readiness gap and removes its child environment value', async () => {
+    const { state, project } = fixture()
+    writeLastConnectedProject(state, project)
+    mkdirSync(join(state, 'restart.lock'), { mode: 0o700 })
+    const path = join(state, 'restart.lock', 'pid')
+    const attempt = tryAcquireProcessLock(path)
+    if (!attempt.acquired) throw new Error('fixture lock unavailable')
+    const environment: Record<string, string | undefined> = { ZEROKUN_STARTUP_LEASE: encodeProcessLockLease(attempt.lease) }
+    const release = takeGatewayStartupLease(state, environment)
+    expect(environment.ZEROKUN_STARTUP_LEASE).toBeUndefined()
+    expect(await recoverManagedService(dirname(import.meta.dir), state, testHooks)).toBe('busy')
+    expect(inspectProcessLock(path).status).toBe('active')
+    release()
+    expect(inspectProcessLock(path).status).toBe('missing')
+  })
+
+  test('the gateway Ctrl-C handler records intentional stop before shutdown and prevents recovery', async () => {
+    const { state, project } = fixture()
+    writeLastConnectedProject(state, project)
+    const source = readFileSync(join(dirname(import.meta.dir), 'server.ts'), 'utf8')
+    const registration = source.match(/process\.on\('SIGINT', \(\) => \{[\s\S]*?\n\}\)/)?.[0]
+    expect(registration).toBeDefined()
+    let interrupt!: () => void
+    let shutdownObservedStop = false
+    // Execute the actual gateway registration with only its lifecycle boundary
+    // substituted; no Slack connection or production state is involved.
+    new Function('process', 'writeIntentionalServiceStop', 'shutdown', 'STATE_DIR', registration!)(
+      { on: (signal: string, handler: () => void) => { expect(signal).toBe('SIGINT'); interrupt = handler } },
+      writeIntentionalServiceStop,
+      () => { shutdownObservedStop = intentionalServiceStopIsSet(state) },
+      state,
+    )
+    interrupt()
+    expect(shutdownObservedStop).toBe(true)
+    expect(await recoverManagedService(dirname(import.meta.dir), state, testHooks)).toBe('stopped')
+  })
+
   test('runner pause requestは同一PIDだけがackしowned requestだけを消す', () => {
     const { state } = fixture()
     const request = createServiceControlPauseRequest(state, process.pid)
