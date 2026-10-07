@@ -1,10 +1,11 @@
 import { homedir } from 'os'
-import { readProjectChannelConfig } from './project-channel-config.ts'
+import { assertProjectSlackAppAttached, readProjectChannelConfig } from './project-channel-config.ts'
 import { readRegisteredSlackApp } from './slack-app-registry.ts'
 import { legacyCutoverForState } from './state-dir.ts'
 
 /** Project binding wins over stale shell exports. Unbound legacy projects keep their state. */
 export function resolveProjectAppState(project: string, fallbackState: string, home = homedir()): string {
+  assertProjectSlackAppAttached(project)
   const appId = readProjectChannelConfig(project).slackAppId
   if (!appId) return fallbackState
   const app = readRegisteredSlackApp(appId, home)
