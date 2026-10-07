@@ -3,7 +3,6 @@ import { lstatSync } from 'fs'
 import { join, relative, sep } from 'path'
 import { ensureManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
-import { sanitizeClaudeAnswer } from './claude-answer-file.ts'
 import type { AdvisorFailure } from './advisor-availability.ts'
 
 const STARTUP_CODES = ['prohibited-ui', 'trust-confirmation-failed', 'effort-confirmation-failed',
@@ -161,13 +160,7 @@ export function saveClaudeResponseDiagnostic(options: {
       if ((lstatSync(current).mode & 0o077) !== 0) return { status: 'unavailable' }
     }
     const original = options.transcript ?? ''
-    // Suppress the whole transcript if a credential is detected, including
-    // private-key bodies. Analyze first; redaction must not alter parser verdicts.
-    const suppressed = sanitizeClaudeAnswer(original).redacted
-    const sanitized = suppressed ? '[transcript withheld: credential material]' : original
-      .replace(/https?:\/\/[^\s<>"'`]+/gi, '[url redacted]')
-      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email redacted]')
-      .replace(/\/(?:Users|home)\/[^/\s]+/g, '/[user]')
+    const sanitized = original
     const bytes = Buffer.from(sanitized, 'utf8')
     // Keep both boundaries: prompt echo at the start, terminal footer at the end.
     const truncated = bytes.length > MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES
@@ -194,7 +187,7 @@ export function saveClaudeResponseDiagnostic(options: {
         originalBytes: Buffer.byteLength(original),
         storedBytes: Buffer.byteLength(text),
         truncated,
-        credentialSuppressed: suppressed,
+        credentialSuppressed: false,
         sanitized: text !== original,
         text,
       },

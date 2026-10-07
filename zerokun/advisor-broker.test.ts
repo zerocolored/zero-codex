@@ -110,7 +110,7 @@ function git(args: string[], cwd: string): string {
 }
 
 type BrokerFixture = {
-  prepareNative(binding?: AdvisorInputSnapshot): Promise<Record<string, unknown>>
+  prepareNative(binding?: AdvisorInputSnapshot, request?: string): Promise<Record<string, unknown>>
   state: string
   repo: string
   jobId: string
@@ -714,10 +714,10 @@ mock.module('fs', () => ({ ...fs, realpathSync: (path, ...args) =>
     journalRoot,
     contextDigest,
     fingerprint,
-    async prepareNative(binding = revisionTwo) {
+    async prepareNative(binding = revisionTwo, request = 'Independent synthetic source review.') {
       const result = await client.callTool({ name: 'advisor_native_prepare', arguments: {
         phase: 'investigation', round: 1, inputRevision: binding.revision,
-        inputDigest: binding.digest, request: 'Independent synthetic source review.',
+        inputDigest: binding.digest, request,
       } })
       const block = (result.content as Array<{ type: string; text?: string }>).find(value => value.type === 'text')
       if (!block?.text) throw new Error('native registration missing')
@@ -1976,7 +1976,7 @@ print('review complete')
     } finally { await fixture.close() }
   }, 40_000)
 
-  test.each(['file', 'terminal'])('Claude credential-shaped review is adopted, sanitized and restored: %s', async source => {
+  test.each(['file', 'terminal'])('Claude review content is preserved verbatim across adoption and restart: %s', async source => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
       const path = fixture.externalEvidence!.fakeHerdrState
@@ -1988,13 +1988,9 @@ print('review complete')
       if (source === 'file') initial.answer_file_lines = 1
       writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
       const result = await fixture.call('investigation', 'revision-two')
-      expect(result.payload.claude).toMatchObject({ adopted: true, responseRedacted: true, cleanupVerified: true })
+      expect(result.payload.claude).toMatchObject({ adopted: true, responseRedacted: false, cleanupVerified: true })
       const response = result.payload.claude.response
-      expect(response).toStartWith(prose)
-      expect(response).toEndWith('Final finding.')
-      expect(response).toContain('[credential removed]')
-      expect(response).not.toContain(token)
-      expect(response).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
+      expect(response).toBe(body)
       const journalPath = join(fixture.journalRoot,
         `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`, 'investigation-1.json')
       const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
@@ -2008,18 +2004,13 @@ print('review complete')
         const artifact = JSON.parse(raw)
         const nonce = artifact.marker.slice('REQUEST_MARKER='.length)
         const original = `CLAUDE_ANSWER_BEGIN=${nonce}\n${body}\nCLAUDE_ANSWER_END=${nonce}\n`
-        expect(artifact).toMatchObject({ response, redacted: true,
+        expect(artifact).toMatchObject({ response, redacted: false,
           responseSha256: journal.claude.responseDigest, responseBytes: Buffer.byteLength(response),
           sha256: createHash('sha256').update(original).digest('hex'), bytes: Buffer.byteLength(original) })
       }
-      for (const raw of persisted) {
-        expect(raw).not.toContain(token)
-        expect(raw).not.toContain('synthetic-encoded-credential')
-        expect(raw).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
-      }
       await fixture.restart()
       const replay = await fixture.call('investigation', 'revision-two')
-      expect(replay.payload.claude).toMatchObject({ adopted: true, response, responseRedacted: true })
+      expect(replay.payload.claude).toMatchObject({ adopted: true, response, responseRedacted: false })
       const after = JSON.parse(readFileSync(path, 'utf8'))
       expect(after.prompt_count).toBe(1)
       expect(after.close_count).toBe(1)
@@ -4330,7 +4321,9 @@ test('native request登録はMCP再起動を跨いで同じ依頼・identityを�
   try {
     const stale = await fixture.prepareNative(fixture.revisionOne)
     expect(stale.staleInput).toBe(true)
-    const first = await fixture.prepareNative()
+    const request = 'Assess authorization isolation (view bearer vs callback). Authorization: Bearer synthetic-example'
+    const first = await fixture.prepareNative(undefined, request)
+    expect(String(first.prompt)).toStartWith(request + '\n')
     expect(first.taskName).toMatch(/^zero_native_[a-f0-9]{32}$/)
     expect(first.prompt).toContain(String(first.marker))
     await fixture.restart()
@@ -4343,11 +4336,11 @@ test('native request登録はMCP再起動を跨いで同じ依頼・identityを�
 test('追加指示後も登録済みGPT回答の元のbindingを保存し再起動後も取得済みと扱う', async () => {
   const fixture = await brokerFixture({ externalSuccess: true })
   try {
-    const registered = await fixture.prepareNative()
+    const registered = await fixture.prepareNative(undefined, 'Assess authorization isolation (view bearer vs callback).')
     const newer = fixture.stageRevision('追加の受入条件。元のレビュー回答も保持する。')
     const preparedAgain = await fixture.prepareNative(newer)
     expect(preparedAgain.marker).toBe(registered.marker)
-    const answer = `Original independent findings.\n${registered.marker}`
+    const answer = `Original independent findings: view bearer vs callback. Authorization: Bearer synthetic-example\n${registered.marker}`
     const { result, payload } = await fixture.call('investigation', newer, 'adopted', 1, {
       nativeAgentId: String(registered.agentPath), nativeResponse: answer,
     })

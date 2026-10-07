@@ -154,5 +154,5 @@ Bot自身の発言やメンションのない自動通知に反応しないこ�
   Codex profileへread許可します。
 - 成果物 upload は50MBまでで、job専用 `outbox/<job-id>/` 直下の空でないregular fileだけを許可します。
   symlinkによるoutbox外へのescape、device、FIFO、他jobのfileは拒否します。
-- 成果物のfile形式は制限しません。送信byte列の明白な平文credentialだけをbest-effortで検出して省略し、
-  archive展開・復号・OCRは行わないため、社内利用でも成果物へ秘密を含めない運用を前提とします。
+- 成果物のfile形式・内容パターンによる拒否や伏字は行いません。本文・URL・ID・添付名・添付byte列を保持します。
+  fileの所有範囲・種類・サイズと配送先の検証は維持します。

@@ -209,11 +209,11 @@ test.each([
 test('worktree continuation uses original history repository and preserves completed host final', () => {
   const f = fixture('completed')
   f.context.job.historyRepoPath = '/repo'; f.context.job.repoPath = '/repo-worktree'
-  writeFileSync(join(f.journal, 'final.txt'), 'Completed independent extraction', { mode: 0o600 })
+  writeFileSync(join(f.journal, 'final.txt'), 'Completed independent extraction: view bearer vs callback; Authorization: Bearer synthetic-example', { mode: 0o600 })
   const value = f.runs.poll(f.id)
   expect(value.status).toBe('completed')
   expect(value.recovery?.finalAvailable).toBe(true)
-  expect(readFileSync(value.finalPath, 'utf8')).toBe('Completed independent extraction')
+  expect(readFileSync(value.finalPath, 'utf8')).toBe('Completed independent extraction: view bearer vs callback; Authorization: Bearer synthetic-example')
 })
 
 test('active owner is polled without copying mutable files, then terminal files become available', () => {
@@ -257,12 +257,13 @@ test('recovery excludes runtime, credentials, compiler caches, links, special an
   linkSync(join(f.workspace, 'auth.json'), join(f.workspace, 'hardlink.json'))
   writeFileSync(join(f.workspace, 'too-large.json'), ''); truncateSync(join(f.workspace, 'too-large.json'), 65 * 1024 * 1024)
   const value = f.runs.poll(f.id)
-  for (const name of ['.env', 'auth.json', 'swift-cache', 'sensitive.txt', 'linked-directory', 'linked.json', 'hardlink.json', 'too-large.json']) {
+  for (const name of ['.env', 'auth.json', 'swift-cache', 'linked-directory', 'linked.json', 'hardlink.json', 'too-large.json']) {
     expect(existsSync(join(value.workspace, name))).toBe(false)
   }
   expect(value.recovery!.excluded).toBeGreaterThan(0)
   expect(value.recovery!.unavailable).toBeGreaterThan(0)
-  expect(value.recovery!.copiedFiles).toBe(2)
+  expect(value.recovery!.copiedFiles).toBe(3)
+  expect(readFileSync(join(value.workspace, 'sensitive.txt'), 'utf8')).toBe('Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789')
 })
 
 test('MCP poll returns historical recovery instead of the former unavailable response', async () => {

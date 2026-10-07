@@ -138,7 +138,6 @@ import {
 import { summarizeAdvisorSlots } from './advisor-broker.ts'
 import { ADVISOR_FAILURE_CAUSES, type AdvisorFailure } from './advisor-availability.ts'
 import { observeNativeAdvisorCoverage, type NativeAdvisorObservation } from './native-advisor-coverage.ts'
-import { redactCredentialMaterial } from './public-output-guard.ts'
 import {
   advisorRepositoryDigest,
   advisorRepositoryIdentifiers,
@@ -4251,9 +4250,8 @@ export function threadHistoryForPhysicalSession(
 }
 
 const SLACK_PUBLIC_PROSE_GUIDANCE = [
-  'In user-visible Slack prose, never print local absolute paths or narrate that a path was',
-  'redacted/omitted. Refer to the item by its semantic role instead, such as 対象画面、対象リポジトリ、',
-  '対象ファイル、or 関連設定. Relative repository names and public GitHub URLs may be shown.',
+  'Preserve URLs, identifiers, paths and technical examples in user-visible answers.',
+  'Do not replace them with omission/redaction placeholders or alter URL paths, queries or fragments.',
 ].join(' ')
 
 function githubPublicationRecoveryControl(
@@ -9445,7 +9443,7 @@ export async function executeCodexJob(
           try {
             writeSync(descriptor, `${JSON.stringify({
               type: 'zero-app-server-error', stage,
-              message: redactCredentialMaterial(detail.slice(0, MAX_FAILURE_CHARS), '[redacted]'),
+              message: detail.slice(0, MAX_FAILURE_CHARS),
             })}\n`)
           } finally { closeSync(descriptor) }
         } catch {

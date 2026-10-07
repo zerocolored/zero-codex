@@ -3,7 +3,6 @@ import { randomBytes } from 'node:crypto'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import { isFinalAppServerAgentMessage } from './codex-app-server-session.ts'
 import { nativeAdvisorMarker, nativeAdvisorResponseHasExactMarker } from './native-advisor-evidence.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 import { retryAdvisorConnection } from './advisor-connection-retry.ts'
 
 type RecordValue = Record<string, unknown>
@@ -61,7 +60,6 @@ export function readNativeAdvisorRegistrations(contextPath: string, attemptNonce
         || !/^zero_native_[a-f0-9]{32}$/.test(value.taskName)
         || value.agentPath !== `/root/${value.taskName}`
         || typeof value.prompt !== 'string' || value.prompt.length > 28_000
-        || containsCredentialMaterial(value.prompt)
         || value.marker !== nativeAdvisorMarker(attemptNonce, value.inputRevision, value.inputDigest, phase, round, value.perspective)
         || !value.prompt.endsWith(value.marker)) throw new Error('native request registration invalid')
       return [value]
@@ -87,7 +85,7 @@ export function registerNativeAdvisor(options: {
     .find(value => value.phase === options.phase && value.round === options.round)
   if (saved) return saved // Same slot survives changed input; never allocate a replacement identity.
   if (!options.request.trim() || options.request.length > 24_000
-    || options.request.includes('\0') || containsCredentialMaterial(options.request)) throw new Error('unsafe native request')
+    || options.request.includes('\0')) throw new Error('unsafe native request')
   const perspective = options.phase === 'review' ? 'risk' : 'solution'
   const marker = nativeAdvisorMarker(options.attemptNonce, options.inputRevision, options.inputDigest,
     options.phase, options.round, perspective)
@@ -194,7 +192,6 @@ export async function readRetainedNativeAdvisors(options: Options): Promise<Reta
         const finals = records(turn.items).filter(isFinalAppServerAgentMessage)
         const text = finals.at(-1)?.text
         if (typeof text === 'string' && text.length <= 24_000 && !text.includes('\0')
-          && !containsCredentialMaterial(text)
           && nativeAdvisorResponseHasExactMarker(text.trimEnd(), binding.marker)) binding.response = text.trimEnd()
       }
       recovered.push(binding)

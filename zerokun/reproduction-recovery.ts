@@ -6,14 +6,12 @@ import { ensureManagedDirectory, requireManagedDirectory } from './managed-path.
 import { atomicWritePrivateFile, readOptionalBoundedAtomicOwnedFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import { inspectProcessLock } from './process-lock.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 import type { ReproductionContext, RunResult } from './codex-reproduction-broker.ts'
 
 const MAX_FILE = 64 * 1024 * 1024
 const MAX_TOTAL = 1024 * 1024 * 1024
 const MAX_ENTRIES = 20_000
 const FORMATS = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.webp', '.svg', '.json', '.jsonl', '.csv', '.tsv', '.txt', '.md', '.py', '.js', '.ts', '.swift', '.html', '.css', '.sha256'])
-const BINARY = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.webp'])
 // A reproduction workspace can be the scratch HOME. Never promote its runtime,
 // credentials, caches, or private diagnostics into the next model's inputs.
 const EXCLUDED = /^(?:\..*|node_modules|__pycache__|.*cache.*|clang|runtime|auth(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?|.*(?:webhook-secret|private-key).*|events\.jsonl|stderr\.txt)$/i
@@ -99,7 +97,6 @@ function copyWorkspace(state: string, source: string, destination: string) {
         if (!data || (['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'] as const).some(key => metadata[key] !== after[key])) {
           unavailable++; omission(path, 'source-changed'); continue
         }
-        if (!BINARY.has(extension) && containsCredentialMaterial(data.toString('utf8'))) { excluded++; continue }
         atomicWritePrivateFile(join(target, name), data)
         bytes += data.length
         files.push({ path: relative(destination, join(target, name)), bytes: data.length, sha256: createHash('sha256').update(data).digest('hex') })
@@ -153,7 +150,7 @@ export function recoverPreviousReproduction(context: ReproductionContext, id: st
     // supplied by the persisted result JSON.
     const final = readOptionalBoundedAtomicOwnedFile(join(directory, 'final.txt'), 2 * 1024 * 1024)
     const finalPath = join(output, 'final.txt')
-    const finalAvailable = Boolean(final && !containsCredentialMaterial(final.toString('utf8')))
+    const finalAvailable = Boolean(final)
     if (finalAvailable) atomicWritePrivateFile(finalPath, final!)
     const manifestPath = join(output, 'recovery.json')
     const recovery = { sourceJob: source.seq, manifestPath, copiedFiles: recovered.files.length,

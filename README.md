@@ -43,7 +43,7 @@ Slack bot
   Slackの再送がなくても常駐workerがbackoff後に再判定して既存フローを再開します。
 - 論理履歴の永続archive自体をscopeごとの直近64 jobに圧縮し、省略件数だけを台帳へ残します。
   各実行snapshotも直近64 job blockかつ128 Ki文字／256 KiBまでです。現在の依頼とhost権限が常に優先され、
-  過去の回答は参考情報として再確認されます。credential、local path、内部ID、成果物pathは保存前に除去し、
+  過去の回答は参考情報として再確認されます。本文・URL・path・IDは書き換えず、成果物タグとhost制御metadataだけを分離し、
   添付はSlackスレッドへ永続的にひも付け、同じスレッドの継続・失敗後の再開・Codex sessionの
   rotation・zerochan再起動後にも、検証済みの同一ファイルを読み取り専用で再利用します。導入前にすでに30日GCされた
   jobは復元できません。
@@ -68,13 +68,14 @@ Slack bot
   受付には`eyes`、正常完了時には元メッセージへ`white_check_mark` reactionを付けます。本文は
   Slackアシスタントとして一人称の簡潔で温かい日本語と自然な絵文字1〜2個を使い、固定の表示名や
   質問や回答に含まれる製品名・実装名を理由に、回答を削除したり非公開の定型文へ置き換えたりしません。
-  APIキーなどの認証情報、実行環境のパス・内部IDの保護は維持します。
+  依頼・回答に含まれる認証情報らしい表現、URL、path、IDは、内容パターンで拒否・伏字にしません。
 - Codex 子プロセスには Slack token や任意の親process環境を渡しません。Slack 投稿は gateway/runner の bot 経路だけです。
 - 起動時のHerdr socket・pane・terminal・workspaceを固定し、job開始前に同じidentityを再検証します。
   staleなHerdr環境ではCodexを起動しません。
 - job開始時に同じHerdr workspaceへ非フォーカスの`Zeroちゃん #<queue>`監視tabを1つ作り、実行中の
-  開始・調査・テスト・レビュー・完了を人が読める日本語タイムラインで表示します。生のJSON-RPC、コマンド全文、
-  絶対path、内部ID、認証情報は表示せず、診断用stdout/stderrだけをowner-onlyの`job-logs`へ保存します。監視tab内でCodexを
+  開始・調査・テスト・レビュー・完了を人が読める日本語タイムラインで表示します。command eventはカテゴリで示し、
+  commentary内のURL・path・ID・技術例は内容判定で書き換えません。端末制御文字と表示長だけを制限します。
+  診断用stdout/stderrはowner-onlyの`job-logs`へ保存します。監視tab内でCodexを
   再起動することはなく、rate-limit再開中は
   同じtabを保持します。正常完了と中止ではCodexとその所有processの終了・SQLite terminal確定後に
   自動で閉じます。通常失敗では、安全な固定分類の原因と最終出力を表示してtabを確認用に残します。

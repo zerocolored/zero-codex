@@ -36,7 +36,6 @@ import {
   SERIAL_WORKER_COUNT,
   createSlackIdentityPauseGuard,
   extractArtifactPaths,
-  encodeSlackGuardNonce,
   enforceHostAdvisorCoverage,
   flushUiApprovalNotifications,
   flushTerminalNotifications,
@@ -13137,24 +13136,6 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
 })
 
 describe('Slack output guard', () => {
-  test('commit保護nonceは内部名称やID形式と衝突しない', () => {
-    const formerlyColliding = encodeSlackGuardNonce(
-      '09d00000-0000-4000-8000-000000000000',
-    )
-    const second = encodeSlackGuardNonce(
-      '0b840000-0000-4000-8000-000000000000',
-    )
-
-    expect(formerlyColliding).not.toMatch(/gpt|grok/i)
-    expect(second).not.toMatch(/gpt|grok/i)
-    expect(formerlyColliding).not.toMatch(/[0-9a-f]{32,64}/i)
-    expect(formerlyColliding).not.toMatch(/\b[UCBWD][A-Z0-9]{8,}\b/)
-    expect(formerlyColliding).not.toBe(second)
-    expect(() => encodeSlackGuardNonce('not-a-uuid')).toThrow(
-      'Slack guard placeholder entropy is invalid',
-    )
-  })
-
   test('rate-limit通知は表示名を固定せず内部job識別子を含めない', () => {
     const message = slackRateLimitMessage(Date.UTC(2026, 0, 2, 3, 4))
     expect(message).not.toContain('Zeroちゃん')
@@ -13320,7 +13301,7 @@ describe('Slack output guard', () => {
     }
   })
 
-  test('modelがhost controlを反復しても既知ID・pathをSlack結果へ残さない', () => {
+  test('host controlだけを除き本文のID・pathは保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'private-project')
     mkdirSync(repo)
@@ -13362,24 +13343,8 @@ describe('Slack output guard', () => {
       sessionId,
       result: raw,
     }, state)
-    expect(finalized.result).toContain('依頼内容の確認結果です。')
-    expect(finalized.result).not.toContain(job.id)
-    expect(finalized.result).not.toContain(sessionId)
-    expect(finalized.result).not.toContain(repo)
-    expect(finalized.result).not.toContain(outbox)
-    expect(finalized.result).not.toContain(job.chatId)
-    expect(finalized.result).not.toContain(job.userId)
-    expect(finalized.result).not.toContain(job.executorNonce!)
-    expect(finalized.result).toContain('Codex worker job 123 finished through Herdr App Server and Grok.')
-    expect(finalized.result).toContain('クロードコードのアドバイザーとブローカーが確認しました。')
-    expect(finalized.result).not.toContain('\u200b')
-    expect(finalized.result).not.toContain('/opt/homebrew/bin')
-    expect(finalized.result).not.toContain('wabc:pdef')
-    expect(finalized.result).not.toContain('term_deadbeef')
-    expect(finalized.result).not.toContain('~/.codex')
-    expect(finalized.result).not.toContain('.claude/session')
-    expect(finalized.result).not.toContain('file:///opt/homebrew')
-    expect(finalized.result).not.toMatch(/processId|stateChangeSeq|durationMs/i)
+    expect(finalized.result).toBe('依頼内容の確認結果です。\n' + raw.split('--- end Zero host progress check ---\n')[1])
+    expect(finalized.result).not.toContain('Logical attempt nonce:')
     store.close()
   })
 
@@ -13425,9 +13390,9 @@ describe('Slack output guard', () => {
     )
     expect(sanitized).toContain('一次調査では、質問抽出の待ち時間がボトルネック候補です。')
     expect(sanitized).not.toContain('内部構成は公開していません。')
-    expect(sanitized).not.toContain(repo)
+    expect(sanitized).toContain(repo)
     expect(sanitized).toContain('Codex worker')
-    expect(sanitized).not.toMatch(/xoxb|session-private/i)
+    expect(sanitized).toBe(raw)
 
     const posted: string[] = []
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
@@ -13828,7 +13793,7 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('内部構成の説明は残し実credentialだけをSlackから落とす', () => {
+  test('認証情報に似た文字列も説明文も原文で保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
     mkdirSync(repo)
@@ -13845,9 +13810,7 @@ describe('Slack output guard', () => {
       task: `Codex と Grok の違いを説明して。token=${token} app=${appToken}`,
     }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'mixed-public-and-internal-answer',
-      result: [
+    const expected = [
         'Codex と Grok は役割が異なります。',
         'Zeroちゃん内部は Codex App Server と Herdr の MCP broker 経由で動作します。',
         `token=${token}`,
@@ -13857,18 +13820,12 @@ describe('Slack output guard', () => {
         bearer,
         jwt,
         invisibleToken,
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'mixed-public-and-internal-answer',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('Codex と Grok は役割が異なります。')
-    expect(finalized.result).toContain('Zeroちゃん内部は Codex App Server と Herdr の MCP broker 経由で動作します。')
-    expect(finalized.result).not.toContain(token)
-    expect(finalized.result).not.toContain(appToken)
-    expect(finalized.result).not.toContain(enterpriseToken)
-    expect(finalized.result).not.toContain(cookieToken)
-    expect(finalized.result).not.toContain('Bearer')
-    expect(finalized.result).not.toContain('eyJhbGci')
-    expect(finalized.result).not.toContain('\u200E')
-    expect(finalized.result).toContain('認証情報を省略')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
@@ -14054,24 +14011,20 @@ describe('Slack output guard', () => {
       task: 'HTTPのMIME typeとcommit IDを報告してください',
     }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'completion-evidence-answer',
-      result: [
+    const expected = [
         'HTTP: 200, text/html; charset=utf-8',
         'API: application/json',
         `Commit: ${commit}`,
         `コミットID: ${shortCommit}`,
         `Commit: ${unverified}`,
         'not-mime: text/html/../../Users/alice/secret',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'completion-evidence-answer',
+      result: expected,
     }, state)
 
-    expect(finalized.result).toContain('HTTP: 200, text/html; charset=utf-8')
-    expect(finalized.result).toContain('API: application/json')
-    expect(finalized.result).toContain(`Commit: ${commit}`)
-    expect(finalized.result).toContain(`コミットID: ${shortCommit}`)
-    expect(finalized.result).not.toContain(unverified)
-    expect(finalized.result).not.toContain('/Users/alice/secret')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
@@ -14102,16 +14055,14 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('公開URLは保持しlocal URI・多重encode・Windows pathだけを落とす', () => {
+  test('公開URL・local URI・多重encode・Windows pathを原文で保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
     mkdirSync(repo)
     const store = new JobStore(join(state, 'jobs.sqlite3'))
     store.enqueue(input({ repoPath: repo, task: '公開リンクと確認結果を教えて' }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'public-url-answer',
-      result: [
+    const expected = [
         'docs: https://developer.apple.com/library/archive/documentation',
         'data: https://example.com/docs/data?next=%2Fdocs',
         'safe-query: https://example.com/search?q=/docs/intro',
@@ -14230,87 +14181,36 @@ describe('Slack output guard', () => {
         `encoded-math-forward: ${encodeURIComponent('⟋Users⟋alice⟋secret')}`,
         `encoded-math-reverse: ${encodeURIComponent('⟍⟍server⟍share⟍secret')}`,
         'confusable: ∕Users∕alice∕Projects∕zero∕state.db',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'public-url-answer',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('https://developer.apple.com/library/archive/documentation')
-    expect(finalized.result).toContain('https://example.com/docs/data?next=%2Fdocs')
-    expect(finalized.result).toContain('https://example.com/search?q=/docs/intro')
-    expect(finalized.result).toContain('https://example.com/docs/home/guide')
-    expect(finalized.result).toContain('https://example.com/Users/alice/report')
-    expect(finalized.result).toContain('https://example.com/home/about')
-    expect(finalized.result).toContain('https://example.com/var/data')
-    expect(finalized.result).toContain('https://example.com/tmp/download')
-    expect(finalized.result).toContain('https://[2606:4700:4700::1111]/dns')
-    expect(finalized.result).toContain('//cdn.example.com/x.js')
-    expect(finalized.result).toContain('example.com:443/path')
-    expect(finalized.result).toContain('https://example.com/#/home/dashboard')
-    expect(finalized.result).toContain('https://example.com/#/Users/list')
-    expect(finalized.result).toContain('https://example.com/#/var/charts')
-    expect(finalized.result).toContain('https://example.com/home/account/settings')
-    expect(finalized.result).toContain('https://example.com/Users/list/detail')
-    expect(finalized.result).toContain('https://example.com/users/alice/profile')
-    expect(finalized.result).toContain('https://example.com/var/data/charts')
-    expect(finalized.result).toContain('https://example.com/docs/usr/bin')
-    expect(finalized.result).toContain('https://example.com/#/home/account/settings')
-    expect(finalized.result).toContain('https://example.com/#/Users/list/detail')
-    expect(finalized.result).toContain('https://example.com/#/var/data/charts')
-    expect(finalized.result).toContain('https://example.com/#/Users/alice/secret')
-    expect(finalized.result).toContain('https://example.com/#%2FUsers%2Falice%2Fsecret')
-    expect(finalized.result).toContain('%65%78%61%6d%70%6c%65%2e%63%6f%6d%2fdocs')
-    expect(finalized.result).toContain('exam%70le.com/docs')
-    expect(finalized.result).not.toMatch(/localhost\.?\/|10\.0\.0\.5|buildbox|\[::1\]|\[fc00::1\]|\.ssh\/|file:(?:\/|%)|https:%2F|\$HOME%|%24|%255C|C:(?:\\)?Users|\\\\(?:\?\\UNC\\)?server|∕Users|⧵⧵server|∖∖server|⧹⧹server|╲╲server|╱Users/i)
-    expect(finalized.result).not.toMatch(/example\.com\/\?path=\/Users|example\.com\/search\?q=%2FUsers%2Falice|example\.com\/\?file=/i)
-    expect(finalized.result).not.toMatch(/example\.com\/(?:\?|#)(?:redirect|next|target|location|dest|artifact|where)=/i)
-    expect(finalized.result).not.toMatch(/example\.com\/\?(?:\/Users\/alice\/secret|%2FUsers%2Falice%2Fsecret)/i)
-    expect(finalized.result).not.toMatch(/example\.com\/(?:%2FUsers%2Falice|home\/alice\/\.config|usr\/bin|opt\/homebrew|Applications\/Xcode\.app|System\/Library|tmp\/secret\.txt|Volumes\/Work)/i)
-    expect(finalized.result).not.toContain('https://example.com/#/usr/bin')
-    expect(finalized.result).not.toContain('//example.com/Users/alice/Projects/private.log')
-    expect(finalized.result).not.toContain('www.example.com/home/alice/.config/app')
-    expect(finalized.result).not.toMatch(/Uѕers|hοme|uѕr|Ѕystem|hοmebrew/)
-    expect(finalized.result).not.toContain('%43%3AUsers%2Falice%2Fsecret.txt')
-    expect(finalized.result).not.toContain('C%3AUsers%2Falice%2Fsecret.txt')
-    expect(finalized.result).not.toContain(String.raw`\\%5Cserver%5Cshare%5Csecret`)
-    expect(finalized.result).not.toContain('$%7BHOME%7D%2Fsecret%2Ffile')
-    expect(finalized.result).not.toContain('${HOME%7D%2Fsecret')
-    expect(finalized.result).not.toContain('${HOME%257D%252Fsecret')
-    expect(finalized.result).not.toMatch(/\$\{HO%4DE\}|\$\{H%4FME\}|\\work\\secret/i)
-    expect(finalized.result).not.toContain('$H%4FME%2Fsecret')
-    expect(finalized.result).not.toContain('%2Fworkspace%2Fprivate-project%2Fsecret.txt')
-    expect(finalized.result).not.toContain('%252Fworkspace%252Fprivate-project%252Fsecret.txt')
-    expect(finalized.result).not.toContain('%2Frepo%2Fsecret')
-    expect(finalized.result).not.toContain('C:repo/src/file.ts')
-    expect(finalized.result).not.toMatch(/C:secret\.txt|D:private\.env|C:repo|%43%3Asecret\.txt/i)
-    expect(finalized.result).not.toMatch(/C꞉\\Users|C∶secret\.txt/i)
-    expect(finalized.result).not.toMatch(/localhost:3000|127\.0\.0\.1:8765|10\.0\.0\.5:8080|buildbox:3000|\[::1\]:3000|server\.local:8080/i)
-    expect(finalized.result).not.toMatch(/localhost[∶꞉]3000|10\.0\.0\.5∶8080|localhost∕admin|10\.0\.%30\.5|local%68ost|%6C%6F%63|%31%30%2e%30|%68%74%74%70/i)
-    expect(finalized.result).not.toMatch(/⟋Users|⟍⟍server|%E2%9F%8[BD]/i)
-    expect(finalized.result).toContain('対象箇所')
-    expect(finalized.result).not.toContain('内部パスを省略')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
-  test('既知host home prefixをpublic URLへ埋め込んでもrouteとして公開しない', () => {
+  test('host home prefixに似た公開URLも保持する', () => {
     const state = fixtureDir()
     const store = new JobStore(join(state, 'jobs.sqlite3'))
     store.enqueue(input({ repoPath: '/Users/runtime-user/dev/zero', task: '状況を教えて' }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'known-host-home-prefix',
-      result: [
+    const expected = [
         'private-path: https://example.com/Users/runtime-user/dev',
         'private-hash: https://example.com/#/Users/runtime-user/dev',
         'confusable-private-path: https://example.com/Users/runtime-uѕer/dev',
         'confusable-private-hash: https://example.com/#/Users/runtime-uѕer/dev',
         'safe-route: https://example.com/Users/list/detail',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'known-host-home-prefix',
+      result: expected,
     }, state)
-    expect(finalized.result).not.toContain('/Users/runtime-user/dev')
-    expect(finalized.result).not.toContain('/Users/runtime-uѕer/dev')
-    expect(finalized.result).toContain('https://example.com/Users/list/detail')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
-  test('percent encodingした製品名は残しruntime IDは落とす', () => {
+  test('percent encodingした製品名とIDを保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo-percent-internal-id')
     mkdirSync(repo)
@@ -14318,9 +14218,7 @@ describe('Slack output guard', () => {
     store.enqueue(input({ repoPath: repo, task: '状況を教えて' }))
     const job = store.claimNext('serial-worker')!
     const encodedJobId = job.id.replaceAll('-', '%2D')
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'percent-internal-answer',
-      result: [
+    const expected = [
         '確認が完了しました。',
         'Cod%65xで処理しました。',
         '%43%6F%64%65%78で処理しました。',
@@ -14332,14 +14230,12 @@ describe('Slack output guard', () => {
         'pid%3D12345',
         'five-layer: %2525252565',
         '進捗は50%25です。',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'percent-internal-answer',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('確認が完了しました。')
-    expect(finalized.result).toContain('進捗は50%25です。')
-    expect(finalized.result).toContain('Cod%65xで処理しました。')
-    expect(finalized.result).toContain('Cl%61ude%20Codeで動いています。')
-    expect(finalized.result).not.toMatch(/pid%3D|%2525252565/i)
-    expect(finalized.result).not.toContain(encodedJobId)
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
@@ -14371,8 +14267,8 @@ describe('Slack output guard', () => {
     const outbox = artifactDirForJob(state, job.id)
     mkdirSync(outbox, { recursive: true })
     for (const [filename, expected] of [
-      ['report.codex', 'result.codex'],
-      ['report.claude', 'result.claude'],
+      ['report.codex', 'report.codex'],
+      ['report.claude', 'report.claude'],
       ['report.grok', 'report.grok'],
       ['report.o3', 'report.o3'],
       ['unsafe codex report.png', 'unsafe codex report.png'],
@@ -14392,16 +14288,14 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('日本語やJSON escapeへ直結したhost pathもSlackへ残さない', () => {
+  test('日本語やJSON escapeを含むpathも原文で保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
     mkdirSync(repo)
     const store = new JobStore(join(state, 'jobs.sqlite3'))
     store.enqueue(input({ repoPath: repo, task: '内部処理の結果だけ教えて' }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'adjacent-path-answer',
-      result: [
+    const expected = [
         '確認しました。',
         '内部処理は/opt/homebrew/bin/herdrで動作します。',
         'cwd:/Users/example/.codex/config.toml',
@@ -14427,17 +14321,16 @@ describe('Slack output guard', () => {
         'local-triple: zerokun:///etc/passwd',
         'encoded: https://example.invalid/%2FUsers%2Flocal%2F.ssh%2Fid_rsa',
         '[詳細](https://example.invalid/opt/homebrew/bin/herdr)',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'adjacent-path-answer',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('確認しました。')
-    expect(finalized.result).not.toMatch(/\/opt\/homebrew|\/Users\/example|~\/\.codex|\\\/Users/i)
-    expect(finalized.result).not.toMatch(/My Project|秘密|\.zerokun|example\.invalid|file:\/\/|vscode:\/\//i)
-    expect(finalized.result).not.toMatch(/id_rsa|passwd|credentials|homebrew\/bin|\/srv|\/System|\/\/Users|\/\/\/tmp/i)
-    expect(finalized.result).not.toMatch(/~\/\.ssh|~\/\.aws|\$HOME|zerokun:\/\/|codex:\/\//i)
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
-  test('host生成の添付suffixをユーザー本文とみなさずfollow-up pathと内部名を消す', () => {
+  test('follow-upのpathとIDを回答で書き換えない', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
     mkdirSync(repo)
@@ -14463,21 +14356,17 @@ describe('Slack output guard', () => {
       attachments: [attachment],
       kind: 'steer',
     })).toBe('staged')
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'attachment-host-suffix-session',
-      result: [
+    const expected = [
         '確認しました。Codex の内部処理結果です。',
         `添付は ${attachment} です。`,
         '相対表示は .codex/zerokun/live-input/example.txt です。',
         '送信元は 1800000001.000200 / UFOLLOWUP123 です。',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'attachment-host-suffix-session',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('確認しました。')
-    expect(finalized.result).toContain('Codex の内部処理結果です。')
-    expect(finalized.result).not.toMatch(/\.codex|live-input/i)
-    expect(finalized.result).not.toContain(attachment)
-    expect(finalized.result).not.toContain('1800000001.000200')
-    expect(finalized.result).not.toContain('UFOLLOWUP123')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
@@ -14503,6 +14392,29 @@ describe('Slack output guard', () => {
       payload: '**受付済み**',
     })
     expect(posted[2]).toBe('*受付済み*')
+    store.close()
+  })
+
+  test('生成URLのpath・query・fragmentを原文のまま永続化してSlackへ届ける', async () => {
+    const store = makeStore()
+    const state = dirname(store.dbPath)
+    const job = store.enqueue(input({ task: 'レポートを生成して', messageId: 'preserve-report-url' })).job
+    const running = store.claimNext('serial-worker')!
+    const url = 'https://reports.example.test/reports/view/rpt_' + 'a'.repeat(64)
+      + '/ZERO_REPORT_123?ref=ZERO_TOKEN_456&token=synthetic_example_123456789#ZERO_REPORT_' + 'b'.repeat(64)
+    const text = 'レポート: ' + url + '\nview bearer vs callback'
+    const finalized = finalizeSuccessfulExecution(running, { sessionId: 'report-session', result: text }, state)
+    expect(finalized.result).toBe(text)
+    store.complete(job.id, 'report-session', finalized.result)
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+    await notifier.completed(store.get(job.id)!, finalized.result)
+    expect(posted).toEqual([text])
+    store.enqueue(input({ task: 'さっきのURLを確認して', messageId: 'preserve-report-url-next' }))
+    const next = store.claimNext('serial-worker')!
+    expect(store.threadHistorySnapshot(next.id).transcript).toContain(url)
     store.close()
   })
 
@@ -14563,8 +14475,8 @@ describe('Slack output guard', () => {
       const [internalSealed] = extractArtifactPaths(internalSealedResult).files
       const internalUpload = readUploadableArtifact(job, internalSealed!, state)
       expect(internalUpload.data.toString()).toBe('safe internal-name report')
-      expect(internalUpload.filename).toBe('result.txt')
-      expect(internalUpload.filename).not.toContain(job.id)
+      expect(internalUpload.filename).toBe(`${job.id}.txt`)
+      expect(internalUpload.filename).toContain(job.id)
       const encodedNameResult = sealArtifactResult(
         job,
         `完了\n<zerokun_files>${JSON.stringify([encodedLocalName])}</zerokun_files>`,
@@ -14573,8 +14485,7 @@ describe('Slack output guard', () => {
       const [encodedNameSealed] = extractArtifactPaths(encodedNameResult).files
       const encodedNameUpload = readUploadableArtifact(job, encodedNameSealed!, state)
       expect(encodedNameUpload.data.toString()).toBe('safe encoded-name report')
-      expect(encodedNameUpload.filename).toBe('result.txt')
-      expect(encodedNameUpload.filename).not.toMatch(/Users|\.ssh|id_rsa|%2F/i)
+      expect(encodedNameUpload.filename).toBe('report%2FUsers%2Falice%2F.ssh%2Fid_rsa.txt')
       const implementationNameResult = sealArtifactResult(
         job,
         `完了\n<zerokun_files>${JSON.stringify([implementationName])}</zerokun_files>`,
@@ -14619,7 +14530,7 @@ describe('Slack output guard', () => {
     }
   })
 
-  test('任意のbinaryと実装名を許可し、明白なcredential bytesだけを拒否する', () => {
+  test('任意のbinaryを内容パターンで拒否せず配送する', () => {
     const dir = fixtureDir()
     const state = join(dir, 'state')
     const repo = join(dir, 'repo')
@@ -14647,8 +14558,7 @@ describe('Slack output guard', () => {
       const [sealedBinary, sealedNotes, sealedCredential] = extractArtifactPaths(sealedResult).files
       expect(readUploadableArtifact(job, sealedBinary!, state).data).toEqual(readFileSync(binary))
       expect(readUploadableArtifact(job, sealedNotes!, state).data.toString()).toContain('Codex and Claude')
-      expect(() => readUploadableArtifact(job, sealedCredential!, state))
-        .toThrow(ArtifactPublicationBlockedError)
+      expect(readUploadableArtifact(job, sealedCredential!, state).data).toEqual(readFileSync(credential))
     } finally {
       store.close()
     }
@@ -14852,7 +14762,7 @@ describe('durable terminal notifications', () => {
     }
   }
 
-  test('内部IDを含むartifact名はupload URL取得とcompleteの両方で同じ安全名にする', async () => {
+  test('IDを含むartifact名をuploadとcompleteでそのまま保持する', async () => {
     const store = makeStore()
     const state = dirname(store.dbPath)
     const queued = store.enqueue(input({ messageId: 'artifact-internal-title' })).job
@@ -14886,12 +14796,11 @@ describe('durable terminal notifications', () => {
     await notifier.completed(
       store.get(queued.id)!, result, notification.id,
     )
-    expect(observedNames).toEqual(['result.txt', 'result.txt'])
-    expect(observedNames.join(' ')).not.toContain(running.id)
+    expect(observedNames).toEqual([`${running.id}.txt`, `${running.id}.txt`])
     store.close()
   })
 
-  test('不可視文字で分割したcredentialをartifact名からも除去する', async () => {
+  test('credentialに似たartifact名も原文で保持する', async () => {
     const store = makeStore()
     const state = dirname(store.dbPath)
     const queued = store.enqueue(input({ messageId: 'artifact-invisible-token-title' })).job
@@ -14923,13 +14832,11 @@ describe('durable terminal notifications', () => {
       },
     })
     await notifier.completed(store.get(queued.id)!, result, notification.id)
-    expect(observedNames).toEqual(['result.txt', 'result.txt'])
-    expect(observedNames.join(' ')).not.toContain('xoxb')
-    expect(observedNames.join(' ')).not.toContain('\u200E')
+    expect(observedNames).toEqual([source.split('/').at(-1)!, source.split('/').at(-1)!])
     store.close()
   })
 
-  test('credential artifactだけをupload前に止め、同じ結果の安全なbinaryは配送する', async () => {
+  test('credentialに似たbytesを含むartifactも同じ結果のbinaryも配送する', async () => {
     const store = makeStore()
     const state = dirname(store.dbPath)
     const queued = store.enqueue(input({ messageId: 'artifact-publication-policy' })).job
@@ -14968,15 +14875,13 @@ describe('durable terminal notifications', () => {
       completeUpload: async () => {},
     })
     await notifier.completed(store.get(queued.id)!, result, notification.id)
-    expect(store.artifactDeliveryState(queued.id, blocked!)).toBe('abandoned')
+    expect(store.artifactDeliveryState(queued.id, blocked!)).toBe('delivered')
     expect(store.artifactDeliveryState(queued.id, safe!)).toBe('delivered')
-    expect(store.publicationBlockedArtifactCount(queued.id)).toBe(1)
+    expect(store.publicationBlockedArtifactCount(queued.id)).toBe(0)
     expect(store.abandonedArtifactCount(queued.id)).toBe(0)
-    expect(uploadTargets).toEqual(['safe.png'])
-    expect(uploaded).toEqual([readFileSync(safeSource)])
-    expect(posted).toHaveLength(1)
-    expect(posted[0]?.text).toBe(slackArtifactPublicationBlockedMessage())
-    expect(posted[0]?.clientMessageId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(uploadTargets).toEqual(['blocked.bin', 'safe.png'])
+    expect(uploaded).toEqual([readFileSync(blockedSource), readFileSync(safeSource)])
+    expect(posted).toHaveLength(0)
     store.close()
   })
 

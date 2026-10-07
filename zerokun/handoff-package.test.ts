@@ -6,11 +6,11 @@ import { join } from 'path'
 import { captureRepository, decodePackage, encodePackage, restoreRepository } from './handoff-package.ts'
 
 const owned: string[] = []
-test('portable conversation redacts quoted credentials without blocking continuation', () => {
+test('portable conversation preserves quoted content without blocking continuation', () => {
   const packet = decodePackage(encodePackage({ version: 1, task: 'Example {"api_key":"example-private-value"}',
     history: 'Use {"password":"example-private-password"} then continue', repositories: [], attachments: [], notes: [] }))
-  expect(packet.task).not.toContain('example-private-value')
-  expect(packet.history).not.toContain('example-private-password')
+  expect(packet.task).toBe('Example {"api_key":"example-private-value"}')
+  expect(packet.history).toBe('Use {"password":"example-private-password"} then continue')
   expect(packet.history).toContain('continue')
 })
 afterEach(() => { for (const path of owned.splice(0)) rmSync(path, { recursive: true, force: true }) })
@@ -87,7 +87,7 @@ test('ordinary source filenames mentioning tokens or credential brokers remain p
   for (const name of ['tokenizer.ts', 'design-tokens.css', 'github-credential-broker.ts']) writeFileSync(join(root, name), '// ordinary source')
   expect(captureRepository(root, 'project', base).untracked).toHaveLength(3)
 })
-test('known secret file names and quoted JSON credentials cannot be uploaded', () => {
+test('protected files stay excluded but ordinary file content is not classified', () => {
   const { root, base } = fixture()
   for (const name of ['secrets.yaml', 'cloud-auth.json', 'zapier-webhook-secret']) {
     writeFileSync(join(root, name), 'synthetic protected fixture')
@@ -95,8 +95,8 @@ test('known secret file names and quoted JSON credentials cannot be uploaded', (
     rmSync(join(root, name))
   }
   writeFileSync(join(root, 'ordinary.json'), JSON.stringify({ password: 'abcdefghijklmnop' }))
-  expect(() => captureRepository(root, 'project', base)).toThrow('credential')
+  expect(captureRepository(root, 'project', base).untracked).toHaveLength(1)
   rmSync(join(root, 'ordinary.json'))
   writeFileSync(join(root, 'notes.txt'), 'https://hooks.zapier.com/hooks/catch/synthetic-fixture/not-real/')
-  expect(() => captureRepository(root, 'project', base)).toThrow('credential')
+  expect(captureRepository(root, 'project', base).untracked).toHaveLength(1)
 })

@@ -822,9 +822,8 @@ describe('Herdr job monitor', () => {
     expect(status.trimEnd().split('\n').every(line => (
       /^\[(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d JST\] /.test(line)
     ))).toBe(true)
-    expect(status).toContain('詳細を安全のため省略しました')
-    expect(status).not.toContain('/Users/example/project')
-    expect(status).not.toContain('abcdefghijklmnop')
+    expect(status).toContain('確認先 /Users/example/project Authorization: Bearer abcdefghijklmnop')
+    expect(status).not.toContain('詳細を安全のため省略しました')
     appendHerdrJobMonitorStatus(
       state,
       record.id,
@@ -834,9 +833,8 @@ describe('Herdr job monitor', () => {
       join(state, 'job-monitors', record.id, 'status.0.feed'),
       'utf8',
     )
-    expect(statusAfterJson).toContain('詳細を安全のため省略しました')
-    expect(statusAfterJson).not.toContain('jsonrpc')
-    expect(statusAfterJson).not.toContain('turnId')
+    expect(statusAfterJson).toContain('失敗として確定します: {"jsonrpc":"2.0","turnId":"internal"}')
+    expect(statusAfterJson).not.toContain('詳細を安全のため省略しました')
 
     await closeHerdrJobMonitor({
       stateDir: state,
