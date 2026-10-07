@@ -1859,6 +1859,32 @@ print('review complete')
     } finally { await fixture.close() }
   }, 30_000)
 
+  test.each(['missing', 'invalid'] as const)('Fable %s Before does not prevent fresh independent analysis', async kind => {
+    const fixture = await brokerFixture({ externalSuccess: true, writeEnabled: true })
+    let artifactRoot: string | undefined
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), ui_artifacts: kind === 'missing' }), { mode: 0o600 })
+      if (kind === 'invalid') {
+        mkdirSync(join(fixture.state, 'outbox', fixture.jobId), { recursive: true, mode: 0o700 })
+        writeFileSync(join(fixture.state, 'outbox', fixture.jobId, 'missing.png'), 'not a PNG', { mode: 0o600 })
+      }
+      const result = await fixture.call('investigation', 'revision-two', 'adopted', 1, {
+        uiProposal: { comparison: 'Inbox, light theme', beforeKind: 'actual', beforeImage: 'missing.png' },
+      })
+      const state = JSON.parse(readFileSync(path, 'utf8'))
+      artifactRoot = state.ui_root
+      expect(result.payload.claude).toMatchObject({ adopted: true, cleanupVerified: true })
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
+      if (kind === 'missing') expect(result.payload.claude.cleanupWarnings).toContain('missing-before-image')
+      else expect(result.payload.claude.uiArtifacts.status).toBe('unavailable')
+    } finally {
+      await fixture.close()
+      if (artifactRoot) rmSync(artifactRoot, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   test('Fable GUI artifacts survive broker restart without repeating the advisor and cannot be requested in review', async () => {
     const fixture = await brokerFixture({ externalSuccess: true, writeEnabled: true })
     let artifactRoot: string | undefined

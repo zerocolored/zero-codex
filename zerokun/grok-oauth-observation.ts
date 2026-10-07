@@ -26,6 +26,21 @@ export function observeGrokOAuthPage() {
 // function returned by the expression. Keep the invocation in the wire value.
 export const GROK_OAUTH_OBSERVATION_SCRIPT = `(${observeGrokOAuthPage.toString()})()`
 
+// Host-only fixed operations. The final observation and click share one JS
+// invocation, so no browser command can slip between validation and input.
+export function grokOAuthAuthorizeScript(name: 'Authorize' | '許可'): string {
+  return `(() => {
+    const observed = ${GROK_OAUTH_OBSERVATION_SCRIPT};
+    if (!observed.ready || observed.authorizeName !== ${JSON.stringify(name)}) return { clicked: false };
+    const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(element =>
+      element.getClientRects().length > 0 && getComputedStyle(element).visibility !== 'hidden'
+      && (element.getAttribute('aria-label') || element.textContent || '').trim() === ${JSON.stringify(name)});
+    if (buttons.length !== 1 || buttons[0].disabled || buttons[0].getAttribute('aria-disabled') === 'true') return { clicked: false };
+    buttons[0].click();
+    return { clicked: true };
+  })()`
+}
+
 export const GROK_OAUTH_BROWSER_AUTHORIZATION = [
   'Grok OAuth browser recovery is an exception to the prohibition on inspecting advisor authentication directly.',
   'For Grok reviews authorized by the user task or applicable user instructions, routine renewal of the existing',

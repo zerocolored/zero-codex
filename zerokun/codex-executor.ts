@@ -1,5 +1,6 @@
 import { createUsageRecorder } from './task-usage.ts'
 import { GROK_OAUTH_BROWSER_AUTHORIZATION } from './grok-oauth-observation.ts'
+import type { GrokChromeCapability } from './grok-oauth-chrome.ts'
 import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCliConfig } from './deployment-cli-runtime.ts'
 import { nativeCliShellEnvironment, NATIVE_CONFIG_ENV_KEYS } from './native-cli-environment.ts'
 import { browserUploadConfirmation, computerUseAppApproval, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
@@ -822,6 +823,17 @@ export function computerUsePluginIsolationOverrides(
   const table = [...names].sort().map(name =>
     `${tomlString(name)}={enabled=${desktopPluginAllowed(name, overrides) && trustedDesktopPluginEnabled(config, layers, name)}}`).join(',')
   return replaceUniqueConfigOverride(overrides, 'plugins', `{${table}}`)
+}
+
+export function grokChromeCapabilityForOverrides(overrides: string[], binding: Omit<GrokChromeCapability, 'version' | 'entrypoint'>): GrokChromeCapability | undefined {
+  const servers = overrideValue(overrides, 'mcp_servers') as Record<string, any> | undefined
+  const server = servers?.['go-chrome-mcp']
+  const args = server?.args
+  if (server?.enabled !== true || server.command !== realpathSync(process.execPath)
+    || !Array.isArray(args) || args.length !== 4 || args[0] !== '--config=/dev/null'
+    || args[1] !== '--no-env-file' || args[2] !== join(import.meta.dir, 'chrome-session-broker.ts')
+    || typeof args[3] !== 'string' || !isAbsolute(args[3])) return
+  return { version: 1, ...binding, entrypoint: args[3] }
 }
 
 export async function resolveEffectiveCodexPermissionOverrides(
@@ -7381,6 +7393,13 @@ export async function executeCodexJob(
         await retireUnregisteredAttempt('Codex preflight')
         throw error
       }
+    }
+    if (!options.skipEffectiveConfigCheck) {
+      const capability = grokChromeCapabilityForOverrides(advisorAttempt.permissionOverrides, {
+        jobId: job.id, attemptNonce: logicalAttempt.attemptNonce, processNonce: advisorAttempt.processNonce,
+      })
+      if (capability) atomicWritePrivateFile(join(
+        advisorRuntimeDirForJob(stateDir, job.id, advisorAttempt.processNonce), 'grok-oauth-chrome.json'), JSON.stringify(capability))
     }
     advisorAttempt.developerInstructions += browserRuntimeContext(
       advisorAttempt.permissionOverrides, job.repoPath, undefined,
