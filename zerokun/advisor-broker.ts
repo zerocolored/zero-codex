@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
 import { captureClaudeUsage, ownedClaudeUsageSession } from './task-usage.ts'
 
 import { createHash, randomBytes, timingSafeEqual } from 'crypto'
@@ -1340,6 +1341,7 @@ export function advisorPrompt(
       '他者へ再委任せず、指定された非秘密情報のread-only確認と独立の分析だけを返してください。',
     ]),
     '他advisorの結論は参照しないでください。',
+    PROPORTIONATE_DESIGN_INSTRUCTIONS,
     '',
     `入力revision: ${input.revision}`,
     `入力digest: ${input.digest}`,
