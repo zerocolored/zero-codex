@@ -569,7 +569,7 @@ describe('fifth-advisor helper installer', () => {
       'm._valid_claude_invocation=lambda *args: True',
       'm._validate_owned_agent=lambda *args,**kwargs: None',
       'm._read_visible=lambda target: "❯\\n"',
-      'm._process_receipt=lambda workspace: dict(receipt)',
+      'm._process_receipt=lambda workspace, recorded=None: dict(receipt)',
       'm._agent_information=lambda target: ({},{"state_change_seq":7})',
       'assert m._owned_target({"caller":{}},workspace,receipt)=="fifth-test"',
       'observations=iter([7,8])',

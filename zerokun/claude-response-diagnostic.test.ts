@@ -3,7 +3,7 @@ import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync } 
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createHash } from 'crypto'
-import { ClaudeReadError, claudeReadCommandFailure, captureClaudeFailureDiagnostic, saveClaudeResponseDiagnostic, parseClaudeStartupDiagnostic, MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES } from './claude-response-diagnostic.ts'
+import { ClaudeReadError, claudeReadCommandFailure, captureClaudeFailureDiagnostic, saveClaudeResponseDiagnostic, parseClaudeStartupDiagnostic, claudeStartupFailure, MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES } from './claude-response-diagnostic.ts'
 import { analyzeClaudeResponse, extractCompleteClaudeResponse, AdvisorOwnedProcessStillLiveError } from './advisor-broker.ts'
 
 const roots: string[] = []
@@ -206,4 +206,15 @@ test('command failures retain only fixed codes and transport metadata', async ()
       timedOut: true, forcedCleanup: true, outputTruncated: true, code: code === 'agent_not_idle' ? code : 'unknown-error' })
     expect(JSON.stringify(result)).not.toContain('private')
   }
+})
+
+
+test('startup UI categories preserve actual unavailability without publishing screen content', () => {
+  for (const [code, cause] of [['authentication-ui', 'authentication'], ['rate-limit-ui', 'rate-limit'], ['billing-ui', 'billing']] as const) {
+    const parsed = parseClaudeStartupDiagnostic(JSON.stringify({ status: 'ephemeral-claude-startup-failed', code }))
+    expect(claudeStartupFailure(parsed)).toEqual({ advisor: 'claude', cause })
+  }
+  expect(claudeStartupFailure('prohibited-ui')).toBeUndefined()
+  expect(claudeStartupFailure(undefined)).toBeUndefined()
+  expect(parseClaudeStartupDiagnostic(JSON.stringify({status: 'ephemeral-claude-startup-failed', code: 'private arbitrary UI'}))).toBeUndefined()
 })
