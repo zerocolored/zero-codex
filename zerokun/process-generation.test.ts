@@ -6,6 +6,7 @@ import {
   processStartKey,
   readBootSession,
   readProcessIdentity,
+  readProcessTable,
   resetBootSessionCacheForTests,
   sameProcessGeneration,
 } from './process-generation.ts'
@@ -51,8 +52,11 @@ describe('Darwin process generation', () => {
     expect(processGroupSignalAllowed(expected, undefined)).toBe(false)
   })
 
-  test.skipIf(process.platform !== 'darwin'
-    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
+  // Linux (WSL2) reads the same generation from /proc; both kernels are asserted for real.
+  const noLiveProcessTable = (process.platform !== 'darwin' && process.platform !== 'linux')
+    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1'
+
+  test.skipIf(noLiveProcessTable)(
     'live PIDのgenerationを安定して取得する', () => {
     const first = readProcessIdentity(process.pid)
     const second = readProcessIdentity(process.pid)
@@ -64,14 +68,26 @@ describe('Darwin process generation', () => {
     },
   )
 
-  test.skipIf(process.platform !== 'darwin'
-    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
+  test.skipIf(noLiveProcessTable)(
     '存在しないPIDはmissingでありunknownへ丸めない', () => {
     const current = readProcessIdentity(process.pid)!
     expect(observeProcessGeneration({ ...current, pid: 2_147_483_647 })).toEqual({
       status: 'dead',
       reason: 'missing',
     })
+    },
+  )
+
+  test.skipIf(noLiveProcessTable)(
+    'process tableは自分自身をuid付きで含み、boot sessionはUUID形式である', () => {
+    const session = readBootSession()
+    expect(session).toMatch(/^[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}$/)
+    const self = readProcessTable().find(identity => identity.pid === process.pid)
+    expect(self).toBeDefined()
+    expect(self!.uid).toBe(process.getuid!())
+    expect(self!.ppid).toBe(process.ppid)
+    expect(self!.bootSession).toBe(session!)
+    expect(sameProcessGeneration(self!, readProcessIdentity(process.pid)!)).toBe(true)
     },
   )
 

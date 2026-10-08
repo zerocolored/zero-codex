@@ -1,4 +1,5 @@
 import { dlopen, FFIType } from 'bun:ffi'
+import { readdirSync, readFileSync } from 'fs'
 
 const PROC_PIDTBSDINFO = 3
 const PROC_BSDINFO_SIZE = 136
@@ -11,8 +12,12 @@ const PROC_START_SEC_OFFSET = 120
 const PROC_START_USEC_OFFSET = 128
 const ZOMBIE_STATUS = 5
 const STOPPED_STATUS = 4
+/** Any non-zombie, non-stopped Linux state; callers only compare against the two above. */
+const LINUX_RUNNING_STATUS = 2
 const INITIAL_PID_CAPACITY = 4_096
 const MAX_PID_CAPACITY = 131_072
+const LINUX_BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
+const SC_CLK_TCK = 2
 
 const libproc = process.platform === 'darwin'
   ? dlopen('/usr/lib/libSystem.B.dylib', {
@@ -26,6 +31,32 @@ const libproc = process.platform === 'darwin'
       },
     })
   : undefined
+
+// Linux (WSL2): the same generation (boot id + start time) comes from /proc.
+// Start times are kernel clock ticks since boot; btime + ticks/CLK_TCK gives an
+// epoch second and the remainder a sub-second part, so one PID reused after a
+// restart never matches the recorded generation.
+const libcLinux = process.platform === 'linux'
+  ? dlopen('libc.so.6', {
+      sysconf: { args: [FFIType.i32], returns: FFIType.i64 },
+    })
+  : undefined
+let cachedLinuxClock: { ticksPerSecond: number; bootTimeSec: number } | undefined
+
+function linuxClock(): { ticksPerSecond: number; bootTimeSec: number } | undefined {
+  if (cachedLinuxClock) return cachedLinuxClock
+  if (!libcLinux) return undefined
+  const ticksPerSecond = Number(libcLinux.symbols.sysconf(SC_CLK_TCK))
+  let bootTimeSec = 0
+  try {
+    const match = /^btime (\d+)$/m.exec(readFileSync('/proc/stat', 'utf8'))
+    if (match) bootTimeSec = Number(match[1])
+  } catch { return undefined }
+  if (!Number.isSafeInteger(ticksPerSecond) || ticksPerSecond <= 0
+    || !Number.isSafeInteger(bootTimeSec) || bootTimeSec <= 0) return undefined
+  cachedLinuxClock = { ticksPerSecond, bootTimeSec }
+  return cachedLinuxClock
+}
 
 let cachedBootSession: string | undefined
 
@@ -87,6 +118,14 @@ export function sameProcessGeneration(
 }
 
 function systemBootSession(): string | undefined {
+  if (process.platform === 'linux') {
+    try {
+      const value = readFileSync(LINUX_BOOT_ID_PATH, 'utf8').trim().toUpperCase()
+      return /^[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}$/.test(value) ? value : undefined
+    } catch {
+      return undefined
+    }
+  }
   if (process.platform !== 'darwin') {
     return undefined
   }
@@ -125,8 +164,53 @@ export function resetBootSessionCacheForTests(): void {
   cachedBootSession = undefined
 }
 
+function linuxRawProcessIdentity(pid: number): ProcessIdentity | undefined {
+  const clock = linuxClock()
+  const session = readBootSession()
+  if (!clock || !session) return undefined
+  let stat: string
+  let status: string
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    status = readFileSync(`/proc/${pid}/status`, 'utf8')
+  } catch {
+    return undefined
+  }
+  // "<pid> (<comm>) <state> <ppid> <pgrp> ..." where comm may contain spaces
+  // and parentheses, so the fixed fields are parsed after the last ')'.
+  const close = stat.lastIndexOf(')')
+  const observedPid = Number(stat.slice(0, stat.indexOf(' ')))
+  if (close < 0 || observedPid !== pid) return undefined
+  const fields = stat.slice(close + 1).trim().split(/\s+/)
+  const state = fields[0]
+  const ppid = Number(fields[1])
+  const pgid = Number(fields[2])
+  const startTicks = Number(fields[19])
+  const uidMatch = /^Uid:\s+\d+\s+(\d+)/m.exec(status)
+  if (!state || !Number.isSafeInteger(ppid) || !Number.isSafeInteger(pgid)
+    || !Number.isSafeInteger(startTicks) || !uidMatch) return undefined
+  const startSec = clock.bootTimeSec + Math.floor(startTicks / clock.ticksPerSecond)
+  const startUsec = Math.floor(((startTicks % clock.ticksPerSecond) * 1_000_000) / clock.ticksPerSecond)
+  if (startSec <= 0 || pgid <= 0) return undefined
+  return {
+    pid,
+    ppid,
+    pgid,
+    status: state === 'Z' ? ZOMBIE_STATUS
+      : state === 'T' || state === 't' ? STOPPED_STATUS
+      : LINUX_RUNNING_STATUS,
+    uid: Number(uidMatch[1]),
+    bootSession: session,
+    startSec,
+    startUsec,
+    started: processStartKey({ bootSession: session, startSec, startUsec }),
+  }
+}
+
 function rawProcessIdentity(pid: number): ProcessIdentity | undefined {
-  if (!libproc || !Number.isSafeInteger(pid) || pid <= 0) return undefined
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined
+  if (process.platform === 'linux') return linuxRawProcessIdentity(pid)
+  if (!libproc) return undefined
   const session = readBootSession()
   if (!session) return undefined
   const buffer = new Uint8Array(PROC_BSDINFO_SIZE)
@@ -230,7 +314,28 @@ export function processIdentityIsStopped(identity: Pick<ProcessIdentity, 'status
   return identity.status === STOPPED_STATUS
 }
 
+function linuxProcessTable(): ProcessIdentity[] {
+  let names: string[]
+  try {
+    names = readdirSync('/proc')
+  } catch {
+    throw new Error('process tableを取得できません')
+  }
+  const table: ProcessIdentity[] = []
+  for (const name of names) {
+    if (!/^[1-9][0-9]*$/.test(name)) continue
+    const pid = Number(name)
+    if (pid <= 1) continue
+    // A process can exit between readdir and the per-PID read; critical PIDs
+    // are re-probed directly by the reaper, so an unreadable entry is skipped.
+    const identity = linuxRawProcessIdentity(pid)
+    if (identity && identity.status !== ZOMBIE_STATUS) table.push(identity)
+  }
+  return table
+}
+
 export function readProcessTable(): ProcessIdentity[] {
+  if (process.platform === 'linux') return linuxProcessTable()
   if (!libproc) throw new Error('Darwin process table is unavailable')
   let capacity = INITIAL_PID_CAPACITY
   while (true) {

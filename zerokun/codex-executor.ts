@@ -202,6 +202,7 @@ import {
   recoverOrphanSeatbeltFingerprints,
   reapSeatbeltFingerprint,
   removeSeatbeltFingerprint,
+  sandboxedCommand,
   verifySeatbeltFingerprint,
   type SeatbeltFingerprint,
 } from './seatbelt-fingerprint.ts'
@@ -912,16 +913,10 @@ async function readCodexAppServer(
     ...overrides.flatMap(value => ['-c', value]),
     'app-server', '--stdio',
   ]
+  // darwin: the Seatbelt profile this used to build inline; linux: the Landlock
+  // launcher (seatbelt-fingerprint.ts). Either way the wrapper execs in place.
   const command = options.seatbeltFingerprint
-    ? [
-      realpathSync('/usr/bin/sandbox-exec'),
-      '-p', [
-        '(version 1)',
-        '(allow default)',
-        `(deny file-read-data (literal ${JSON.stringify(options.seatbeltFingerprint.deny.path)}))`,
-      ].join('\n'),
-      ...appServerCommand,
-    ]
+    ? sandboxedCommand(options.seatbeltFingerprint, options.seatbeltStateDir!, appServerCommand)
     : appServerCommand
   const proc = Bun.spawn(command, {
     cwd,

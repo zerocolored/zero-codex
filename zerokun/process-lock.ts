@@ -108,7 +108,9 @@ export const UPDATE_LOCK_OWNER_PATTERN = /(?:update\.ts|zerokun-update|setup\.sh
 const LOCK_EX = 2
 const LOCK_NB = 4
 const LOCK_UN = 8
-const libSystem = dlopen('/usr/lib/libSystem.B.dylib', {
+// flock(2) has the same signature in Darwin libSystem and glibc; Linux (WSL2)
+// loads it from libc so the lock module no longer fails to import there.
+const libSystem = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {
   flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 })
 

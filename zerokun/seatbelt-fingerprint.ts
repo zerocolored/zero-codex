@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'crypto'
 import {
   closeSync,
   constants,
+  type Dirent,
   fstatSync,
   fsyncSync,
   lstatSync,
@@ -13,7 +14,8 @@ import {
   rmSync,
   writeSync,
 } from 'fs'
-import { isAbsolute, join, relative, sep } from 'path'
+import { basename, dirname, isAbsolute, join, relative, sep } from 'path'
+import { realpathSync } from 'fs'
 import { ensureManagedDirectory, requireManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
 import {
   observeProcessGeneration,
@@ -26,6 +28,12 @@ import {
 const MAX_CANDIDATE_PROCESSES = 8_192
 const MAX_TAG_BYTES = 256
 const FINGERPRINT_DIRECTORY = 'sandbox-obligations'
+// Linux (WSL2): the launcher's evidence that a Landlock obligation was armed.
+const LINUX_RECEIPT_DIRECTORY = 'sandbox-receipts'
+const LINUX_LAUNCHER = 'linux-sandbox-launcher.py'
+const LINUX_SCOPE_PREFIX = 'zerokun-fp-'
+const LINUX_CGROUP_ROOT = '/sys/fs/cgroup/user.slice'
+const LINUX_CGROUP_SEARCH_DEPTH = 6
 
 export type SeatbeltTagIdentity = {
   path: string
@@ -229,6 +237,125 @@ export function removeSeatbeltFingerprint(
   rmSync(fingerprint.deny.path)
   rmSync(fingerprint.allow.path)
   rmdirSync(join(fingerprint.allow.path, '..'))
+  if (process.platform === 'linux') {
+    // Launch receipts are evidence, not the obligation; retire them with the tags.
+    const receipts = linuxSandboxReceiptPath(stateDir, fingerprint)
+    rmSync(receipts, { recursive: true, force: true })
+    try { rmdirSync(dirname(receipts)) } catch { /* other attempts of the job remain */ }
+  }
+}
+
+function attemptNonceOf(denyPath: string): string {
+  const nonce = basename(dirname(denyPath))
+  if (!/^[0-9a-f]{32}$/.test(nonce) || basename(denyPath) !== 'deny') {
+    throw new Error('Seatbelt fingerprint deny path is not an attempt tag')
+  }
+  return nonce
+}
+
+/**
+ * systemd scope unit prefix for one attempt. The launcher appends its own PID
+ * because one attempt launches Codex several times in sequence (config read,
+ * capability check, job), and a scope name is only free again once systemd has
+ * collected the previous one.
+ */
+export function linuxSandboxScopeUnit(fingerprint: SeatbeltFingerprint): string {
+  return `${LINUX_SCOPE_PREFIX}${attemptNonceOf(fingerprint.deny.path)}`
+}
+
+/** Directory where the Linux launcher writes `<pid>.json` before it execs. */
+export function linuxSandboxReceiptPath(stateDir: string, fingerprint: SeatbeltFingerprint): string {
+  const state = requireManagedStateRoot(stateDir)
+  const nonce = attemptNonceOf(fingerprint.deny.path)
+  const job = basename(dirname(dirname(fingerprint.deny.path)))
+  if (!/^[A-Za-z0-9._-]{1,256}$/.test(job)) throw new Error('Seatbelt fingerprint job directory is invalid')
+  return join(state, LINUX_RECEIPT_DIRECTORY, job, nonce)
+}
+
+function linuxLauncherPath(): string {
+  const path = join(import.meta.dir, LINUX_LAUNCHER)
+  const metadata = lstatSync(path, { bigint: true })
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1n
+    || !ownerMatches(metadata.uid) || (metadata.mode & 0o022n) !== 0n) {
+    throw new Error(`Linux sandbox launcher is unsafe: ${path}`)
+  }
+  return path
+}
+
+/**
+ * Wrap a Codex command so that every descendant carries this attempt's kernel
+ * obligation. macOS uses the Seatbelt profile that `sandbox_check` later
+ * recognises; Linux execs through the Landlock/cgroup launcher (see
+ * linux-sandbox-launcher.py). The wrapper execs in place, so the spawned PID is
+ * still the command's PID. The darwin array is byte-for-byte what
+ * codex-executor built before this helper existed.
+ */
+export function sandboxedCommand(
+  fingerprint: SeatbeltFingerprint,
+  stateDir: string,
+  command: readonly string[],
+): string[] {
+  if (command.length === 0) throw new Error('sandboxed command is empty')
+  if (process.platform === 'darwin') {
+    return [
+      realpathSync('/usr/bin/sandbox-exec'),
+      '-p', [
+        '(version 1)',
+        '(allow default)',
+        `(deny file-read-data (literal ${JSON.stringify(fingerprint.deny.path)}))`,
+      ].join('\n'),
+      ...command,
+    ]
+  }
+  if (process.platform === 'linux') {
+    return [
+      '/usr/bin/python3', '-I', linuxLauncherPath(),
+      fingerprint.allow.path, fingerprint.deny.path, linuxSandboxReceiptPath(stateDir, fingerprint),
+      '--', ...command,
+    ]
+  }
+  throw new Error(`sandboxed Codex launch is unsupported on ${process.platform}`)
+}
+
+function readCgroupProcs(directory: string): number[] {
+  try {
+    return readFileSync(join(directory, 'cgroup.procs'), 'utf8')
+      .split('\n')
+      .filter(line => /^[1-9][0-9]*$/.test(line))
+      .map(Number)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * PIDs inside every scope of this attempt. Scopes live under the user's
+ * delegated systemd tree; the search is bounded and never follows symlinks.
+ * A scope that systemd already collected simply contributes no members.
+ */
+function linuxScopeMembers(denyPath: string): Set<number> {
+  const prefix = `${LINUX_SCOPE_PREFIX}${attemptNonceOf(denyPath)}-`
+  const members = new Set<number>()
+  const stack: Array<{ path: string; depth: number }> = [{ path: LINUX_CGROUP_ROOT, depth: 0 }]
+  while (stack.length > 0) {
+    const { path, depth } = stack.pop()!
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(path, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const child = join(path, entry.name)
+      if (entry.name.startsWith(prefix) && entry.name.endsWith('.scope')) {
+        for (const pid of readCgroupProcs(child)) members.add(pid)
+      } else if (depth < LINUX_CGROUP_SEARCH_DEPTH) {
+        stack.push({ path: child, depth: depth + 1 })
+      }
+    }
+  }
+  return members
 }
 
 function querySandboxChecksForPaths(
@@ -236,12 +363,22 @@ function querySandboxChecksForPaths(
   allowPath: string,
   denyPath: string,
 ): SandboxCheckResult[] {
-  if (process.platform !== 'darwin') throw new Error('Seatbelt fingerprint requires macOS')
+  if (process.platform !== 'darwin' && process.platform !== 'linux') {
+    throw new Error('Seatbelt fingerprint requires macOS or Linux')
+  }
   if (!isAbsolute(allowPath) || !isAbsolute(denyPath) || allowPath === denyPath) {
     throw new Error('Seatbelt fingerprint paths are invalid')
   }
   if (candidates.length > MAX_CANDIDATE_PROCESSES) {
     throw new Error(`Seatbelt candidate count exceeds ${MAX_CANDIDATE_PROCESSES}`)
+  }
+  if (process.platform === 'linux') {
+    // Membership of the attempt's scope cgroups is the Linux kernel signature:
+    // inherited across fork/setsid/reparent and listed by the kernel itself.
+    const members = linuxScopeMembers(denyPath)
+    return candidates.map(candidate => ({
+      pid: candidate.pid, allow: 0, deny: members.has(candidate.pid) ? 1 : 0,
+    }))
   }
   const result = Bun.spawnSync([
     '/usr/bin/python3', '-I', '-c', SANDBOX_CHECK_SCRIPT,
