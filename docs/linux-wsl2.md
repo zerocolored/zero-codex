@@ -49,7 +49,11 @@ deny の **全祖先の兄弟**を 1 つずつ許可するしかなく、launche
 - `libc.so.6`（`process-lock.ts` / `process-generation.ts` が `flock` / `sysconf` を FFI で呼ぶ）
 
 process の世代（boot id + 起動時刻）は `/proc/<pid>/stat` と
-`/proc/sys/kernel/random/boot_id` から読む。macOS の `libproc` と同じ型を返す。
+`/proc/sys/kernel/random/boot_id` から読む。macOS の `libproc` と同じ型を返すが、
+`startSec` / `startUsec` は **boot からの経過**（起動 tick ÷ `CLK_TCK`）で epoch ではない。
+`/proc/stat` の `btime` を足して epoch にすると、WSL2 の realtime clock が後ろへ飛ぶたびに
+`btime` も動き、executor と supervisor で読んだ値がずれて generation 照合が全件落ちる
+（2026-10-08 に実測。`dmesg` に `Time jumped backwards` が 30 秒前後ごとに出る機体）。
 
 ## 既知の制限
 

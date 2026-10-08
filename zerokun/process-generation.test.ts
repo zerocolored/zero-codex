@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'fs'
 import {
   commandOwnedByState,
   observeProcessGeneration,
@@ -88,6 +89,29 @@ describe('Darwin process generation', () => {
     expect(self!.ppid).toBe(process.ppid)
     expect(self!.bootSession).toBe(session!)
     expect(sameProcessGeneration(self!, readProcessIdentity(process.pid)!)).toBe(true)
+    },
+  )
+
+  // 2026-10-08: WSL2 は realtime clock が数十秒ごとに後ろへ飛ぶ（dmesg "Time jumped
+  // backwards"）。/proc/stat の btime は realtime − uptime なので一緒に動き、executor が
+  // cache した btime と supervisor が読み直した btime がずれて registration の generation
+  // 照合（startSec）が全件落ちた。Linux の generation は boot_id + 起動 tick だけで組み、
+  // 時計から独立していることを固定する。
+  test.skipIf(process.platform !== 'linux' || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
+    'Linuxのgenerationはboot相対の起動tickだけで決まり、realtime clockに依存しない', () => {
+    const stat = readFileSync(`/proc/${process.pid}/stat`, 'utf8')
+    const startTicks = Number(stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[19])
+    const ticksPerSecond = Number(Bun.spawnSync(['/usr/bin/getconf', 'CLK_TCK'], {
+      stdout: 'pipe', stderr: 'ignore', stdin: 'ignore',
+    }).stdout.toString().trim())
+    expect(ticksPerSecond).toBeGreaterThan(0)
+    const identity = readProcessIdentity(process.pid)!
+    expect(identity.startSec).toBe(Math.floor(startTicks / ticksPerSecond))
+    expect(identity.startUsec).toBe(
+      Math.floor(((startTicks % ticksPerSecond) * 1_000_000) / ticksPerSecond),
+    )
+    const btime = Number(/^btime (\d+)$/m.exec(readFileSync('/proc/stat', 'utf8'))![1])
+    expect(identity.startSec).toBeLessThan(btime)
     },
   )
 

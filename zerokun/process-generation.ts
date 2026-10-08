@@ -33,29 +33,26 @@ const libproc = process.platform === 'darwin'
   : undefined
 
 // Linux (WSL2): the same generation (boot id + start time) comes from /proc.
-// Start times are kernel clock ticks since boot; btime + ticks/CLK_TCK gives an
-// epoch second and the remainder a sub-second part, so one PID reused after a
-// restart never matches the recorded generation.
+// Start times are kernel clock ticks since boot and stay boot-relative here:
+// startSec/startUsec are seconds and microseconds *since boot*, never epoch.
+// /proc/stat's btime is realtime minus uptime, and WSL2's realtime clock jumps
+// backwards every few tens of seconds, so an epoch conversion read at different
+// moments by the executor and the supervisor disagrees and every generation
+// check fails. Boot id + ticks is stable across processes and unique per boot.
 const libcLinux = process.platform === 'linux'
   ? dlopen('libc.so.6', {
       sysconf: { args: [FFIType.i32], returns: FFIType.i64 },
     })
   : undefined
-let cachedLinuxClock: { ticksPerSecond: number; bootTimeSec: number } | undefined
+let cachedLinuxTicksPerSecond: number | undefined
 
-function linuxClock(): { ticksPerSecond: number; bootTimeSec: number } | undefined {
-  if (cachedLinuxClock) return cachedLinuxClock
+function linuxTicksPerSecond(): number | undefined {
+  if (cachedLinuxTicksPerSecond) return cachedLinuxTicksPerSecond
   if (!libcLinux) return undefined
   const ticksPerSecond = Number(libcLinux.symbols.sysconf(SC_CLK_TCK))
-  let bootTimeSec = 0
-  try {
-    const match = /^btime (\d+)$/m.exec(readFileSync('/proc/stat', 'utf8'))
-    if (match) bootTimeSec = Number(match[1])
-  } catch { return undefined }
-  if (!Number.isSafeInteger(ticksPerSecond) || ticksPerSecond <= 0
-    || !Number.isSafeInteger(bootTimeSec) || bootTimeSec <= 0) return undefined
-  cachedLinuxClock = { ticksPerSecond, bootTimeSec }
-  return cachedLinuxClock
+  if (!Number.isSafeInteger(ticksPerSecond) || ticksPerSecond <= 0) return undefined
+  cachedLinuxTicksPerSecond = ticksPerSecond
+  return ticksPerSecond
 }
 
 let cachedBootSession: string | undefined
@@ -68,10 +65,31 @@ export interface ProcessIdentity {
   /** Effective UID reported by proc_bsdinfo (Darwin). */
   uid?: number
   bootSession: string
+  /**
+   * Darwin: epoch seconds. Linux: seconds since boot (see linuxTicksPerSecond).
+   * Only ever compared with other identities; use processStartEpochMs for wall time.
+   */
   startSec: number
   startUsec: number
   /** Stable, JSON-safe generation key used by in-memory trackers. */
   started: string
+}
+
+/**
+ * Wall-clock start of a process for sanity bounds against epoch timestamps.
+ * On Linux this adds the current btime on demand (approximate while the WSL2
+ * clock drifts) instead of baking it into the generation.
+ */
+export function processStartEpochMs(identity: Pick<ProcessIdentity, 'startSec' | 'startUsec'>): number {
+  let bootEpochSec = 0
+  if (process.platform === 'linux') {
+    try {
+      bootEpochSec = Number(/^btime (\d+)$/m.exec(readFileSync('/proc/stat', 'utf8'))?.[1] ?? 0)
+    } catch {
+      bootEpochSec = 0
+    }
+  }
+  return (bootEpochSec + identity.startSec) * 1000 + Math.floor(identity.startUsec / 1000)
 }
 
 export type ProcessGenerationProbe =
@@ -165,9 +183,9 @@ export function resetBootSessionCacheForTests(): void {
 }
 
 function linuxRawProcessIdentity(pid: number): ProcessIdentity | undefined {
-  const clock = linuxClock()
+  const ticksPerSecond = linuxTicksPerSecond()
   const session = readBootSession()
-  if (!clock || !session) return undefined
+  if (!ticksPerSecond || !session) return undefined
   let stat: string
   let status: string
   try {
@@ -189,9 +207,9 @@ function linuxRawProcessIdentity(pid: number): ProcessIdentity | undefined {
   const uidMatch = /^Uid:\s+\d+\s+(\d+)/m.exec(status)
   if (!state || !Number.isSafeInteger(ppid) || !Number.isSafeInteger(pgid)
     || !Number.isSafeInteger(startTicks) || !uidMatch) return undefined
-  const startSec = clock.bootTimeSec + Math.floor(startTicks / clock.ticksPerSecond)
-  const startUsec = Math.floor(((startTicks % clock.ticksPerSecond) * 1_000_000) / clock.ticksPerSecond)
-  if (startSec <= 0 || pgid <= 0) return undefined
+  const startSec = Math.floor(startTicks / ticksPerSecond)
+  const startUsec = Math.floor(((startTicks % ticksPerSecond) * 1_000_000) / ticksPerSecond)
+  if (startTicks < 0 || pgid <= 0) return undefined
   return {
     pid,
     ppid,
