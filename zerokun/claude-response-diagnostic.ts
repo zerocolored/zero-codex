@@ -5,7 +5,7 @@ import { ensureManagedDirectory, requireManagedStateRoot } from './managed-path.
 import { atomicWritePrivateFile } from './safe-file.ts'
 import type { AdvisorFailure } from './advisor-availability.ts'
 
-const STARTUP_CODES = ['prohibited-ui', 'trust-confirmation-failed', 'effort-confirmation-failed',
+const STARTUP_CODES = ['prohibited-ui', 'authentication-ui', 'rate-limit-ui', 'billing-ui', 'trust-confirmation-failed', 'effort-confirmation-failed',
   'trust-confirmation-timeout', 'readiness-timeout', 'identity-check-failed', 'startup-failed'] as const
 export type ClaudeFailureDiagnostic = {
   stage: 'startup' | 'send' | 'acquisition'
@@ -30,6 +30,12 @@ export function parseClaudeStartupDiagnostic(stdout: string): ClaudeFailureDiagn
     } catch { /* Other helper records are not startup diagnostics. */ }
   }
   return undefined
+}
+
+export function claudeStartupFailure(code: ClaudeFailureDiagnostic['startupCode']): AdvisorFailure | undefined {
+  const cause = code === 'authentication-ui' ? 'authentication'
+    : code === 'rate-limit-ui' ? 'rate-limit' : code === 'billing-ui' ? 'billing' : undefined
+  return cause ? { advisor: 'claude', cause } : undefined
 }
 
 export const MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES = 64 * 1024

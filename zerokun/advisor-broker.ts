@@ -137,6 +137,7 @@ import {
   claudeReadFailure,
   claudeReadCommandFailure,
   parseClaudeStartupDiagnostic,
+  claudeStartupFailure,
   type ClaudeFailureDiagnostic,
   type ClaudeResponseAnalysis,
   type ClaudeDiagnosticRead,
@@ -2280,6 +2281,7 @@ async function main(): Promise<void> {
       if (opened.timedOut || opened.forcedCleanup
         || opened.outputTruncated || opened.exitCode !== 0) {
         startupCode = parseClaudeStartupDiagnostic(opened.stdout)
+        failure = claudeStartupFailure(startupCode)
         throw new Error(`ephemeral Claude open failed (${opened.exitCode}): ${opened.stderr}`)
       }
       target = parseEphemeralClaudeOpen(opened.stdout)
