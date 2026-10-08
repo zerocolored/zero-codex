@@ -1977,7 +1977,7 @@ const browser=await chromium.launch({channel:'chrome'});try{const page=await bro
     put('entry.js', 'import {consume} from "./sink.js"; consume(source());\n')
     put('sink.js', 'export function consume(value) { sink(value); }\n')
     put('safe.js', 'import {consume} from "./sink.js"; consume(clean(source()));\n')
-    put('probe-rules.yml', 'rules:\n  - id: zero-probe-crossfile\n    languages: [javascript]\n    message: synthetic cross-file probe\n    severity: ERROR\n    mode: taint\n    pattern-sources:\n      - pattern: source()\n    pattern-sinks:\n      - pattern: sink(...)\n    pattern-sanitizers:\n      - pattern: clean(...)\n')
+    put('probe-rules.yml', 'rules:\n  - id: zero-probe-crossfile\n    languages: [javascript]\n    message: synthetic cross-file probe\n    severity: ERROR\n    mode: taint\n    options:\n      interfile: true\n    pattern-sources:\n      - pattern: source()\n    pattern-sinks:\n      - pattern: sink(...)\n    pattern-sanitizers:\n      - pattern: clean(...)\n')
     accept(await runAuditTool(6, { ...c, semgrepProbe: true }))
     if (!step.findings.some(f => f.title.endsWith('zero-probe-crossfile') && f.location.includes('sink.js')))
       throw Error('known cross-file finding was not detected')
