@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test'
 import { Database } from 'bun:sqlite'
-import { classifyTaskModel, parseModelCatalog, TaskModelSelections, TASK_MODEL_SCHEMA, TaskModelSelectionError, type ModelDecision } from './task-model-selection.ts'
+import { classifyTaskModel, parseModelCatalog, loadTaskModelCatalog, TaskModelSelections, TASK_MODEL_SCHEMA, TaskModelSelectionError, type ModelDecision } from './task-model-selection.ts'
 import { CodexUsageTracker } from './task-usage.ts'
 const models = [{id:'gpt-6-astra',medium:true},{id:'gpt-6-sol',medium:true}]
 const none = {decision:'none',model:null,evidence:'',continuation:false} as ModelDecision
@@ -108,5 +108,41 @@ describe('task model selection',()=>{
   tracker.setModel('gpt-6-sol')
   tracker.observe({method:'turn/started',params:{threadId:'thread',turn:{id:'two'}}})
   expect(tracker.document(false).turns.map(t=>t.model)).toEqual(['gpt-6-astra','gpt-6-sol'])
+ })
+})
+
+
+describe('current model catalog',()=>{
+ const entry=(model:string)=>({model,supportedReasoningEfforts:[{reasoningEffort:'medium'}]})
+ test('preserves available provider metadata without assuming GPT IDs',async()=>{
+  const catalog=parseModelCatalog({data:[{...entry('other-provider-v2'),displayName:'Other 2',description:'Latest Other family',upgrade:null}]})
+  expect(catalog).toEqual([{id:'other-provider-v2',medium:true,displayName:'Other 2',description:'Latest Other family'}])
+  await classifyTaskModel('Otherで直して',catalog,null,undefined,async prompt=>{
+   expect(prompt).toContain(JSON.stringify(catalog))
+   return JSON.stringify({...none,decision:'select',model:'other-provider-v2',evidence:'Otherで'})
+  })
+ })
+ test('assembles all pages and independently reloads the catalog',async()=>{
+  const cursors:(string|null)[]=[]
+  let version=1
+  const read=async(cursor:string|null)=>{cursors.push(cursor);return cursor?{data:[entry('other-v'+version)],nextCursor:null}:{data:[entry('gpt-6-astra')],nextCursor:'next'}}
+  expect((await loadTaskModelCatalog(read)).map(m=>m.id)).toEqual(['gpt-6-astra','other-v1'])
+  version=2
+  expect((await loadTaskModelCatalog(read)).map(m=>m.id)).toEqual(['gpt-6-astra','other-v2'])
+  expect(cursors).toEqual([null,'next',null,'next'])
+ })
+ test('rejects incomplete, looping and excessively paginated catalogs',async()=>{
+  await expect(loadTaskModelCatalog(async cursor=>{if(cursor)throw Error('offline');return {data:[entry('old')],nextCursor:'next'}})).rejects.toThrow('offline')
+  await expect(loadTaskModelCatalog(async()=>({data:[],nextCursor:'same'}))).rejects.toThrow('unavailable')
+  let count=0
+  await expect(loadTaskModelCatalog(async()=>({data:[],nextCursor:String(++count)}))).rejects.toThrow('unavailable')
+  expect(count).toBe(20)
+  await expect(loadTaskModelCatalog(async()=>({data:[],nextCursor:123}))).rejects.toThrow('unavailable')
+ })
+ test('cancellation prevents classification with a partially fetched catalog',async()=>{
+  const controller=new AbortController()
+  let calls=0
+  await expect(loadTaskModelCatalog(async()=>{calls++;controller.abort();return {data:[entry('old')],nextCursor:'next'}},controller.signal)).rejects.toThrow()
+  expect(calls).toBe(1)
  })
 })

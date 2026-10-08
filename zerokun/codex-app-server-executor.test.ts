@@ -310,6 +310,7 @@ import subprocess
 import sys
 import time
 
+catalog_calls = 0
 mode = os.environ.get("ZERO_FIXTURE_MODE", "normal")
 if mode in ("interrupt-no-terminal-forced", "late-error-after-complete"):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
@@ -397,7 +398,11 @@ for line in sys.stdin:
                 time.sleep(30)
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
     elif method == "model/list":
-        emit({"id": request_id, "result": {"data": [{"model": m, "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]} for m in ["gpt-6-astra", "gpt-6-sol"]], "nextCursor": None}})
+        catalog_calls += 1
+        catalog_models = ["gpt-6-astra", "gpt-6-sol"]
+        if os.environ.get("ZERO_NEW_CATALOG") == "1" and catalog_calls > 1:
+            catalog_models.append("gpt-6.1-sol")
+        emit({"id": request_id, "result": {"data": [{"model": m, "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]} for m in catalog_models], "nextCursor": None}})
     elif method == "thread/inject_items":
         if mode == "resume-early-start":
             goal_status = "active"
@@ -5761,6 +5766,28 @@ describe('production App Server executor', () => {
     expect(rpc.filter(row=>row.method==='turn/interrupt')).toHaveLength(1)
     expect(rpc.filter(row=>row.method==='thread/resume')[0].model).toBe('gpt-6-sol')
     expect(rpc.filter(row=>row.method==='turn/start').map(row=>row.model)).toEqual(['gpt-6-astra','gpt-6-sol'])
+    expect(value.store.listJobControls(value.job.id)[0]?.status).toBe('observed')
+    value.store.close()
+  },30_000)
+
+  test('model change refreshes the catalog and starts the newly available Sol', async () => {
+    const value=fixture('defer'), rpcLog=join(value.root,'model-switch.jsonl')
+
+    const result=await executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,
+      selectModel:async (requests,catalog)=> {
+        if(requests.length===1) { expect(catalog.some(m=>m.id==='gpt-6.1-sol')).toBe(false); return 'gpt-6-astra' }
+        expect(catalog.some(m=>m.id==='gpt-6.1-sol')).toBe(true); return 'gpt-6.1-sol'
+      },
+      extraEnvironment:{ZERO_FIXTURE_MODE:'defer',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1',ZERO_NEW_CATALOG:'1'},
+    })
+    expect(result.result).toContain('追加入力')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    expect(rpc.filter(row=>row.method==='turn/steer')).toHaveLength(0)
+    expect(rpc.filter(row=>row.method==='turn/interrupt')).toHaveLength(1)
+    expect(rpc.filter(row=>row.method==='thread/resume')[0].model).toBe('gpt-6.1-sol')
+    expect(rpc.filter(row=>row.method==='turn/start').map(row=>row.model)).toEqual(['gpt-6-astra','gpt-6.1-sol'])
     expect(value.store.listJobControls(value.job.id)[0]?.status).toBe('observed')
     value.store.close()
   },30_000)

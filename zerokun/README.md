@@ -172,6 +172,9 @@ codex <trust-args> -C <repo> \
 - primary modelの既定は`gpt-6-astra`／`medium`です。独立したtool-free LLMが依頼本文の明示指定を
   引用・比較から区別し、App Serverの`model/list`と照合して入力revisionごとにSQLiteへ保存します。
   判定失敗・曖昧・非対応時は主担当の作業を開始せず、元依頼を履歴に保持して同じスレッドでの再開を案内します。
+  モデル名の言い間違い・表記揺れはLLMが解釈し、正確な旧版名もその系列の最新版へ解決します。
+  選択のたびにCodexの一覧を取得し、ID・説明・更新先を判断材料にします。別系列へは代替しません。
+  最新版は取得した一覧で確認できる範囲であり、Codex側のキャッシュを強制更新する機能ではありません。
   継続は保存値を使い、別タスクには既定値を使います。モデル変更のlive controlは旧turnへsteerせず、
   interruptのterminal確認後にモデルを再設定して次turnへ一度だけ渡します。
   選択値と`medium`を`thread/start`／`thread/resume`、全`turn/start`へ明示し、handshakeの実効値も照合します。
