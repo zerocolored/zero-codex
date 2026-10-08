@@ -396,6 +396,8 @@ for line in sys.stdin:
             while True:
                 time.sleep(30)
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
+    elif method == "model/list":
+        emit({"id": request_id, "result": {"data": [{"model": m, "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]} for m in ["gpt-6-astra", "gpt-6-sol"]], "nextCursor": None}})
     elif method == "thread/inject_items":
         if mode == "resume-early-start":
             goal_status = "active"
@@ -437,7 +439,7 @@ for line in sys.stdin:
         cwd = params.get("cwd")
         if method == "thread/resume" and os.environ.get("ZERO_RESUME_CWD"):
             cwd = os.environ["ZERO_RESUME_CWD"]
-        model = params.get("model") or "gpt-test"
+        model = "gpt-6-astra" if os.environ.get("ZERO_MODEL_MISMATCH") == "1" else params.get("model") or "gpt-test"
         reasoning_effort = params.get("config", {}).get("model_reasoning_effort") or "medium"
         developer_instructions = params.get("developerInstructions") or ""
         handshake_method = method
@@ -1085,7 +1087,7 @@ for line in sys.stdin:
     elif method == "turn/interrupt":
         emit({"id": request_id, "result": {}})
         if mode not in ("interrupt-no-terminal", "interrupt-no-terminal-forced"):
-            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "interrupted", "itemsView": "full", "items": [], "error": None}}})
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed" if os.environ.get("ZERO_MODEL_INTERRUPT_FAILED") == "1" else "interrupted", "itemsView": "full", "items": [], "error": None}}})
 if mode == "interrupt-no-terminal-forced":
     while True:
         time.sleep(30)
@@ -2711,6 +2713,53 @@ describe('production App Server executor', () => {
     }, 30_000)
   }
 
+  test.each([false, true])('semantic selection reaches start/resume and turns (resume=%s)', async resume => {
+    const value = fixture('normal', true)
+    const rpcLog = join(value.root, 'semantic-model.jsonl')
+    if (resume) { value.job.sessionId = 'thread-existing'; value.job.resumed = true }
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+      skipEffectiveConfigCheck: true, liveControls: value.hooks,
+      selectModel: async (requests, catalog) => {
+        expect(requests[0]?.task).toBe(value.job.task)
+        expect(catalog).toContainEqual({id:'gpt-6-sol',medium:true})
+        return 'gpt-6-sol'
+      },
+      extraEnvironment: {ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+    })
+    expect(result.result).toBe('通常完了')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    const handshakes=rpc.filter(row=>['thread/start','thread/resume'].includes(row.method))
+    expect(handshakes[0].model).toBe('gpt-6-sol')
+    expect(handshakes[0].allowProviderModelFallback).toBe(false)
+    expect(rpc.filter(row=>row.method==='turn/start').every(row=>row.model==='gpt-6-sol' && row.effort==='medium')).toBe(true)
+    value.store.close()
+  }, 30_000)
+
+  test('unavailable semantic selection cannot dispatch a primary thread or fall back', async () => {
+    const value=fixture('normal',true), rpcLog=join(value.root,'unavailable-model.jsonl')
+    await expect(executeCodexJob(value.job,{
+      codexBinForTesting:value.executable, logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,selectModel:async()=> 'unknown-model',
+      extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+    })).rejects.toThrow('ZERO_MODEL_SELECTION:unsupported')
+    expect(existsSync(rpcLog)?readFileSync(rpcLog,'utf8').trim():'').toBe('')
+    value.store.close()
+  },30_000)
+
+  test('provider model mismatch rejects a Sol request without falling back',async()=>{
+    const value=fixture('normal',true),rpcLog=join(value.root,'model-mismatch.jsonl')
+    await expect(executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,selectModel:async()=> 'gpt-6-sol',
+      extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1',ZERO_MODEL_MISMATCH:'1'},
+    })).rejects.toThrow('activated a different model')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    expect(rpc.filter(row=>row.method==='thread/start')).toHaveLength(1)
+    expect(rpc.filter(row=>row.method==='turn/start')).toHaveLength(0)
+    value.store.close()
+  },30_000)
+
   test('primary modelと推論強度をthreadとturnへ明示固定する', async () => {
     const value = fixture('normal', true)
     const rpcLog = join(value.root, 'runtime-selection-rpc.log')
@@ -2834,7 +2883,7 @@ describe('production App Server executor', () => {
         model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
       },
     })
-    expect(rpc[0]?.allowProviderModelFallback).toBeNull()
+    expect(rpc[0]?.allowProviderModelFallback).toBe(false)
     expect(rpc[1]).toMatchObject({ method: 'thread/inject_items', currentInstructions: true })
     expect(rpc[2]).toMatchObject({
       method: 'turn/start',
@@ -5696,6 +5745,56 @@ describe('production App Server executor', () => {
     expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
     value.store.close()
   })
+
+  test('model change interrupts the old turn and dispatches the input once under Sol', async () => {
+    const value=fixture('defer'), rpcLog=join(value.root,'model-switch.jsonl')
+
+    const result=await executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,
+      selectModel:async requests=>requests.length>1?'gpt-6-sol':'gpt-6-astra',
+      extraEnvironment:{ZERO_FIXTURE_MODE:'defer',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+    })
+    expect(result.result).toContain('追加入力')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    expect(rpc.filter(row=>row.method==='turn/steer')).toHaveLength(0)
+    expect(rpc.filter(row=>row.method==='turn/interrupt')).toHaveLength(1)
+    expect(rpc.filter(row=>row.method==='thread/resume')[0].model).toBe('gpt-6-sol')
+    expect(rpc.filter(row=>row.method==='turn/start').map(row=>row.model)).toEqual(['gpt-6-astra','gpt-6-sol'])
+    expect(value.store.listJobControls(value.job.id)[0]?.status).toBe('observed')
+    value.store.close()
+  },30_000)
+
+  test('model-switch terminal failure preserves input and never starts Sol',async()=>{
+    const value=fixture('defer'),rpcLog=join(value.root,'model-switch-failure.jsonl')
+    await expect(executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,
+      selectModel:async requests=>requests.length>1?'gpt-6-sol':'gpt-6-astra',
+      extraEnvironment:{ZERO_FIXTURE_MODE:'defer',ZERO_RPC_LOG:rpcLog,ZERO_MODEL_INTERRUPT_FAILED:'1'},
+    })).rejects.toThrow('model switch interrupted turn ended in failure')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    expect(rpc.filter(row=>row.method==='turn/start').map(row=>row.model)).toEqual(['gpt-6-astra'])
+    expect(value.store.listJobControls(value.job.id)[0]?.status).toBe('ready')
+    value.store.close()
+  },30_000)
+
+  test('cancellation aborts model classification before any primary thread starts',async()=>{
+    const value=fixture('normal'),rpcLog=join(value.root,'model-classify-cancel.jsonl')
+    await expect(executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,
+      selectModel:async(_requests,_catalog,signal)=>new Promise((resolve,reject)=>{
+        const target=value.store.liveControlTarget(value.job.chatId,value.job.threadTs)!
+        value.store.stageLiveControl(target,{chatId:value.job.chatId,threadTs:value.job.threadTs,
+          messageId:'1800000000.000300',userId:'UROOT',task:'中止',kind:'interrupt'})
+        signal!.addEventListener('abort',()=>reject(new DOMException('cancelled','AbortError')),{once:true})
+      }),
+      extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+    })).rejects.toBeInstanceOf(CodexUserCancelledError)
+    expect(existsSync(rpcLog)?readFileSync(rpcLog,'utf8').trim():'').toBe('')
+    value.store.close()
+  },30_000)
 
   test('同じthreadの別user返信をactive turnへsteerする', async () => {
     const value = fixture('steer')

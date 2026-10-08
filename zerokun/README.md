@@ -169,8 +169,14 @@ codex <trust-args> -C <repo> \
   session自体を明示的にretireしていなければ、同じSlack thread・同じ物理作業場所の次jobでそのsessionをresumeします。
   クラウド作業場所へ移る場合はsessionとcwdのローカル台帳を照合し、不一致・旧台帳未登録なら
   保存済みスレッド履歴を渡して新規sessionを開始します。旧sessionや元の作業ファイルは削除しません。
-- primary modelは`gpt-6-astra`、reasoning effortは`medium`をrelease codeからApp Server起動、
-  `thread/start`／`thread/resume`、全`turn/start`へ明示します。handshakeの実効値も照合し、
+- primary modelの既定は`gpt-6-astra`／`medium`です。独立したtool-free LLMが依頼本文の明示指定を
+  引用・比較から区別し、App Serverの`model/list`と照合して入力revisionごとにSQLiteへ保存します。
+  判定失敗・曖昧・非対応時は主担当の作業を開始せず、元依頼を履歴に保持して同じスレッドでの再開を案内します。
+  継続は保存値を使い、別タスクには既定値を使います。モデル変更のlive controlは旧turnへsteerせず、
+  interruptのterminal確認後にモデルを再設定して次turnへ一度だけ渡します。
+  選択値と`medium`を`thread/start`／`thread/resume`、全`turn/start`へ明示し、handshakeの実効値も照合します。
+  App Serverプロセス自体の既定モデルは引き続きrelease管理です。
+
   `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。
   設計advisorは`high`、レビューadvisorは`medium`です。release内のread-only／neverなrole TOMLを
   App Serverの`agents.<role>.config_file`へ指定し、ホストに残った旧role設定より優先します。

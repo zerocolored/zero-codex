@@ -1,3 +1,4 @@
+import { parseModelCatalog, requireAvailableTaskModel, TaskModelSelectionError, type ModelRequest, type TaskModel } from './task-model-selection.ts'
 import { createUsageRecorder } from './task-usage.ts'
 import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
 import { GROK_OAUTH_BROWSER_AUTHORIZATION } from './grok-oauth-observation.ts'
@@ -6713,7 +6714,9 @@ export async function executeCodexJob(
     codexBinForTesting?: string
     /** Let a synthetic App Server exercise the primary browser/CUA request path. */
     browserAccessForTesting?: boolean
-    /** Fixture-only model override. Production always uses the release constant. */
+    /** Host selector persists semantic decisions; raw CLI/environment overrides remain forbidden. */
+    selectModel?(requests: ModelRequest[], models: TaskModel[], signal?: AbortSignal): Promise<string>
+    /** Fixture-only model override. */
     model?: string
     /** Fixture-only reasoning override. Production always uses the release constant. */
     reasoningEffort?: string
@@ -6884,7 +6887,7 @@ export async function executeCodexJob(
       throw new Error(`Codex executable changed after resolution: ${requestedCodex}`)
     }
   }
-  const model = testCodexBin === undefined
+  let model = testCodexBin === undefined
     ? ZEROCHAN_PRIMARY_CODEX_MODEL
     : options.model ?? ZEROCHAN_PRIMARY_CODEX_MODEL
   const reasoningEffort = testCodexBin === undefined
@@ -8078,6 +8081,32 @@ export async function executeCodexJob(
       let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null
+      let modelCatalog: TaskModel[] = []
+      let modelSwitch: { control: JobControlRecord; model: string; resumeGoal: boolean; deadline: number } | null = null
+      const selectInputModel = async (requests: ModelRequest[]): Promise<string> => {
+        if (!options.selectModel) return model
+        const controller = new AbortController()
+        const abort = () => controller.abort()
+        options.signal?.addEventListener('abort', abort, { once: true })
+        if (options.signal?.aborted) abort()
+        const poll = setInterval(() => { if (controls.cancellationRequested()) abort() }, APP_SERVER_CONTROL_POLL_MS)
+        try {
+          const selected = await options.selectModel(requests, modelCatalog, controller.signal)
+          if (controls.cancellationRequested()) throw new CodexUserCancelledError()
+          return requireAvailableTaskModel(selected, modelCatalog)
+        } catch (error) {
+          if (controls.cancellationRequested()) throw new CodexUserCancelledError()
+          throw error
+        } finally { clearInterval(poll); options.signal?.removeEventListener('abort', abort) }
+      }
+      const modelRequests = (revision?: number): ModelRequest[] => readAdvisorInputSnapshot(managedStateDir, job.id)
+        .entries.filter(e => revision === undefined || e.revision <= revision)
+        .map(e => ({ revision: e.revision, task: e.task }))
+      const modelThreadParams = () => ({
+        cwd: job.repoPath, ...codexApprovalSettings(advisorAttempt.permissionOverrides),
+        permissions: advisorAttempt.permissionProfile, developerInstructions: advisorAttempt.developerInstructions,
+        model, config: { model_reasoning_effort: reasoningEffort }, allowProviderModelFallback: false,
+      })
       let nativeSettlementDeadline: number | undefined
       const drainNativeAdvisors = async (): Promise<void> => {
         // A failed model turn need not imply a dead history transport. Drain
@@ -8172,6 +8201,7 @@ export async function executeCodexJob(
         )
       }
       const waitForProtocolActivity = async (): Promise<void> => {
+        if (modelSwitch && Date.now() >= modelSwitch.deadline) throw new AppServerProtocolError('model switch terminal confirmation timed out')
         if (watchdogTriggered) throw new CodexCleanupPendingError(
           'Codex supervisor stalled after its direct child exited',
         )
@@ -8196,9 +8226,16 @@ export async function executeCodexJob(
       const startControlTurn = async (
         threadId: string,
         control: JobControlRecord,
+        resumePausedGoal = false,
       ): Promise<string> => {
         let requestId: number | null = null
         try {
+          const selected = await selectInputModel(modelRequests(control.inputRevision))
+          if (selected !== model) {
+            model = selected
+            await session.resumeThread({ threadId, ...modelThreadParams() })
+            usageRecorder?.setModel(model)
+          }
           const turnId = await session.startTurn(
             threadId,
             buildCodexLiveControlPrompt(
@@ -8213,7 +8250,7 @@ export async function executeCodexJob(
               },
               job,
               continuationDecision ? options.publicationContinuation : undefined,
-            ),
+            ) + (resumePausedGoal ? '\nThe host paused the native goal only to switch the execution model. Continue the same task, inspect its existing goal, and resume it before continuing work; do not create a duplicate task.' : ''),
             control.idempotencyKey,
             {
               cwd: job.repoPath,
@@ -8257,6 +8294,18 @@ export async function executeCodexJob(
           // App Server writes share one ordered lane. A user question must not
           // race the advisory progress steer that was already written.
           await progressSteerInFlight
+        }
+        if (control.kind === 'steer' && options.selectModel) {
+          const selected = await selectInputModel(modelRequests(control.inputRevision))
+          if (selected !== model) {
+            // Never send the new task to the old model. Keep its durable control pending
+            // until this exact turn terminates; cancellation can still preempt the switch.
+            const resumeGoal = stage === 'complete' && (await readTaskGoal(session, threadId))?.status === 'active'
+            modelSwitch = { control, model: selected, resumeGoal, deadline: Date.now() + 30_000 }
+            if (resumeGoal) await session.request('thread/goal/set', { threadId, status: 'paused' }, { timeoutMs: 15_000 })
+            await session.interrupt(threadId, turnId)
+            return
+          }
         }
         const supersededProbe = activeProgressProbe
         if (supersededProbe) {
@@ -8496,6 +8545,23 @@ export async function executeCodexJob(
         if (processPersistenceError) throw processPersistenceError
         if (abortedBeforeProcessExit) throw new CodexInterruptedError('Codex job was interrupted')
         await session.initialize()
+        if (options.selectModel) {
+          let cursor: string | null = null
+          const seen = new Set<string>()
+          do {
+            const page: Record<string, unknown> = (await session.request('model/list', { cursor, limit: 100 }, { timeoutMs: 15_000 })).result
+            modelCatalog.push(...parseModelCatalog(page))
+            const next: unknown = page.nextCursor
+            if (next !== null && next !== undefined && typeof next !== 'string') throw new TaskModelSelectionError('unavailable')
+            cursor = typeof next === 'string' ? next : null
+            if (cursor && (seen.has(cursor) || seen.size >= 20)) throw new TaskModelSelectionError('unavailable')
+            if (cursor) seen.add(cursor)
+          } while (cursor)
+          const requests = advisorAttempt.inputSnapshot.entries.map(e => ({ revision: e.revision, task: e.task }))
+          if (boundInterjection) requests.push({ revision: -boundInterjection.createdAt, task: boundInterjection.task })
+          model = await selectInputModel(requests)
+          usageRecorder?.setModel(model)
+        }
         if (!options.skipEffectiveConfigCheck) {
           await assertCurrentAppServerCodexPermissionConfig(
             session,
@@ -8515,6 +8581,7 @@ export async function executeCodexJob(
           developerInstructions: advisorAttempt.developerInstructions,
           model,
           config: { model_reasoning_effort: reasoningEffort },
+          allowProviderModelFallback: false,
         }
         const resumeThreadId = resumed && sessionId ? sessionId : null
         const startedFreshThread = resumeThreadId === null
@@ -8525,7 +8592,6 @@ export async function executeCodexJob(
           ? await session.resumeThread({ threadId: resumeThreadId, ...threadParams })
           : await session.startThread({
             ...threadParams,
-            allowProviderModelFallback: false,
             ephemeral: false,
           })
         currentThreadId = threadHandshake.threadId
@@ -9002,7 +9068,7 @@ export async function executeCodexJob(
             // goal is active. App Server owns continuation; never send a second
             // synthetic user request or restart the development workflow here.
             if (stage === 'complete' && terminal.turn.status === 'completed'
-              && !pausedInterjection && !rateLimit.rateLimited && !controls.cancellationRequested()) {
+              && !modelSwitch && !pausedInterjection && !rateLimit.rateLimited && !controls.cancellationRequested()) {
               try {
                 const completedTurn = reconciledTurn.itemsView === 'full'
                   ? reconciledTurn : await session.loadFullTurn(currentThreadId!, reconciledTurn)
@@ -9054,7 +9120,7 @@ export async function executeCodexJob(
               executorNonce: advisorAttempt.attemptNonce,
               threadId: currentThreadId,
               turnId: currentTurnId,
-              retainInput: stage !== 'complete' || rateLimit.rateLimited
+              retainInput: modelSwitch !== null || stage !== 'complete' || rateLimit.rateLimited
                 || (terminal.turn.status === 'failed' && isTransientCodexNetworkError(terminal.turn.error)),
               ...(rateLimit.rateLimited && rateLimit.resetsAtMs !== null
                 ? {
@@ -9073,6 +9139,22 @@ export async function executeCodexJob(
                 )
               }
               break
+            }
+            if (modelSwitch && (terminal.turn.status === 'interrupted' || terminal.turn.status === 'completed')) {
+              while (barrier.pendingInbound > 0 && !barrier.cancelled) {
+                await waitForProtocolActivity()
+                barrier = controls.finishTurn({ executorNonce: advisorAttempt.attemptNonce,
+                  threadId: currentThreadId, turnId: currentTurnId, retainInput: true })
+              }
+              if (barrier.cancelled) { userCancelled = true; break }
+              const pending = modelSwitch
+              modelSwitch = null
+              currentTurnId = await startControlTurn(currentThreadId, pending.control, pending.resumeGoal)
+              continue
+            }
+            if (modelSwitch) {
+              modelSwitch = null
+              throw new AppServerProtocolError('model switch interrupted turn ended in failure; input retained')
             }
             const turnFailed = terminal.turn.status !== 'completed'
             const turnFailure = turnFailed
@@ -9234,7 +9316,7 @@ export async function executeCodexJob(
           const pausePending = pausedInterjection as JobInterjectionRecord | null
           if (control && control.kind === 'interrupt') {
             await dispatchControl(currentThreadId, currentTurnId, control)
-          } else if (stage === 'interjection' || pausePending) {
+          } else if (modelSwitch || stage === 'interjection' || pausePending) {
             // Preserve FIFO while the read-only answer turn is active. Later
             // questions and task updates also remain durable after a pause was
             // acknowledged; cancellation alone may preempt either turn.
