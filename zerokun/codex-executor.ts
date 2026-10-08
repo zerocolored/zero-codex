@@ -1,4 +1,4 @@
-import { parseModelCatalog, requireAvailableTaskModel, TaskModelSelectionError, type ModelRequest, type TaskModel } from './task-model-selection.ts'
+import { loadTaskModelCatalog, requireAvailableTaskModel, type ModelRequest, type TaskModel } from './task-model-selection.ts'
 import { createUsageRecorder } from './task-usage.ts'
 import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
 import { GROK_OAUTH_BROWSER_AUTHORIZATION } from './grok-oauth-observation.ts'
@@ -8081,7 +8081,6 @@ export async function executeCodexJob(
       let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
       let currentThreadId: string | null = null
-      let modelCatalog: TaskModel[] = []
       let modelSwitch: { control: JobControlRecord; model: string; resumeGoal: boolean; deadline: number } | null = null
       const selectInputModel = async (requests: ModelRequest[]): Promise<string> => {
         if (!options.selectModel) return model
@@ -8091,6 +8090,8 @@ export async function executeCodexJob(
         if (options.signal?.aborted) abort()
         const poll = setInterval(() => { if (controls.cancellationRequested()) abort() }, APP_SERVER_CONTROL_POLL_MS)
         try {
+          const modelCatalog = await loadTaskModelCatalog(async cursor =>
+            (await session.request('model/list', { cursor, limit: 100, includeHidden: false }, { timeoutMs: 15_000 })).result, controller.signal)
           const selected = await options.selectModel(requests, modelCatalog, controller.signal)
           if (controls.cancellationRequested()) throw new CodexUserCancelledError()
           return requireAvailableTaskModel(selected, modelCatalog)
@@ -8546,17 +8547,6 @@ export async function executeCodexJob(
         if (abortedBeforeProcessExit) throw new CodexInterruptedError('Codex job was interrupted')
         await session.initialize()
         if (options.selectModel) {
-          let cursor: string | null = null
-          const seen = new Set<string>()
-          do {
-            const page: Record<string, unknown> = (await session.request('model/list', { cursor, limit: 100 }, { timeoutMs: 15_000 })).result
-            modelCatalog.push(...parseModelCatalog(page))
-            const next: unknown = page.nextCursor
-            if (next !== null && next !== undefined && typeof next !== 'string') throw new TaskModelSelectionError('unavailable')
-            cursor = typeof next === 'string' ? next : null
-            if (cursor && (seen.has(cursor) || seen.size >= 20)) throw new TaskModelSelectionError('unavailable')
-            if (cursor) seen.add(cursor)
-          } while (cursor)
           const requests = advisorAttempt.inputSnapshot.entries.map(e => ({ revision: e.revision, task: e.task }))
           if (boundInterjection) requests.push({ revision: -boundInterjection.createdAt, task: boundInterjection.task })
           model = await selectInputModel(requests)
