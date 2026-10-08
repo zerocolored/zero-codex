@@ -139,8 +139,11 @@ workflowとして実行します。Codexは対象projectの`AGENTS.md`に従い�
 deploy確認まで自分で進めます。ZeroちゃんはFIFO、同一thread継続、process回収、認証情報を隠した
 GitHub transportだけを担当します。
 
-Primary Codexのmodelは`gpt-6-astra`、reasoning effortは`low`としてrelease codeに固定されています。
-利用者のCodex設定、shell環境、state内`.env`を揃える必要はなく、どのMacでも同じ値で起動します。
+Primary Codexの既定は`gpt-6-astra`／`medium`です。依頼本文で「GPT-6 Solで実行して」などと
+明示すると、独立したLLMが引用・比較との違いを判定し、利用可能なモデルと照合して起動します。
+推論強度は`medium`です。選択はタスクに保存し、継続時も保持します。曖昧・非対応の指定には確認を返し、
+別モデルで自動実行しません。元の依頼はスレッド履歴に保持するので、同じスレッドから回答できます。
+利用者のCodex設定、shell環境、state内`.env`でモデルを上書きすることはできません。
 Grok、Claude、review用Codexの選択には`AGENTS.md`のadvisor契約が別途適用されます。
 
 GUI初期設計では、primary Codexが`advisor_round`の`uiProposal`へ比較する画面状態と

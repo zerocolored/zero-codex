@@ -603,7 +603,10 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   current projectのcanonical `github.com` repositoryだけを操作します。作業判断はCodexが行います。
 - App Serverは認証済み`CODEX_HOME`を使うためuser configも読みます。そのため起動直前の
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、
-  primary model=`gpt-6-astra`、reasoning effort=`medium`をrelease側から上書きして実効値を照合し、
+  プロセスの既定model=`gpt-6-astra`、reasoning effort=`medium`をrelease側から設定します。
+  タスク本文での明示モデル指定は独立LLMで判定し、利用可能なモデル一覧と照合・保存した値をthread/turnへ渡します。
+  引用や比較だけでは変更せず、曖昧・非対応・判定失敗では別モデルへ自動フォールバックしません。
+  thread開始・再開時にも実効値を照合し、
   endpoint/provider差替え、legacy sandbox、named permissionの変更を拒否します。安全規則は
   `developerInstructions`、未信頼のSlack本文はJSON-RPC inputへ分離し、子環境はallowlistです。
 - Codexが返す`instructionSources`を照合し、存在するglobal `AGENTS.md`とproject

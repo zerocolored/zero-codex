@@ -2355,6 +2355,7 @@ describe('Codex job store', () => {
     })
     expect(hydrated).toMatchObject({
       text: 'root\n補足\n確認して',
+      modelRequestText: '確認して',
       fileIds: ['FROOT1', 'FMIDDLE1'],
       initialContextState: 'hydrated',
     })
@@ -2366,6 +2367,7 @@ describe('Codex job store', () => {
     expect(store.recoverInboundDeliveries()).toBe(1)
     const recovered = store.claimNextInboundDelivery()!
     expect(recovered.initialContextState).toBe('hydrated')
+    expect(recovered.modelRequestText).toBe('確認して')
     expect(recovered.fileIds).toEqual(['FROOT1', 'FMIDDLE1'])
     store.completeInboundDelivery(recovered.idempotencyKey)
     expect(store.claimNextInboundDelivery()).toBeNull()

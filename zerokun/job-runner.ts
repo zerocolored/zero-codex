@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { TaskModelSelections, TASK_MODEL_SCHEMA, MODEL_SELECTION_MESSAGES } from './task-model-selection.ts'
 import { assertSlackProjectAdmission } from './slack-project-admission.ts'
 import { executeSecurityAudit, copyAuditReportForFollowup } from './security-audit.ts'
 import { createSecurityAuditProgress } from './security-audit-progress.ts'
@@ -434,6 +435,7 @@ export interface JobInterjectionRecord {
 export type JobLiveInputRecord = JobControlRecord | JobInterjectionRecord
 
 export interface EnqueueInput {
+  modelRequestText?: string
   workflow?: 'work' | 'security-audit'
   chatId: string
   threadTs: string
@@ -490,6 +492,7 @@ export interface LiveControlInput {
 }
 
 export interface InboundDeliveryRecord extends InboundDeliveryInput {
+  modelRequestText?: string
   seq: number
   idempotencyKey: string
   fileIds: string[]
@@ -539,6 +542,7 @@ type InboundDeliveryRow = {
   expected_control_epoch: number | null
   downloaded_files_json: string
   initial_context_state: InboundInitialContextState
+  model_request_text: string | null
 }
 
 export interface JobRecord {
@@ -1912,6 +1916,7 @@ function persistThreadHistorySnapshot(
 }
 
 function ensureJobSchemaMigrations(db: Database): void {
+  db.exec(TASK_MODEL_SCHEMA)
   db.transaction(() => {
     const schema = db.query<{sql:string},[]>("SELECT sql FROM sqlite_master WHERE name='fleet_queries'").get()!.sql
     if (!schema.includes("'security-audit'")) {
@@ -2343,6 +2348,7 @@ function ensureJobSchemaMigrations(db: Database): void {
     }
   }
   for (const [name, definition] of [
+    ['model_request_text', 'TEXT'],
     ['expected_control_job_id', 'TEXT'],
     ['expected_control_epoch', 'INTEGER'],
     ['downloaded_files_json', "TEXT NOT NULL DEFAULT '[]'"],
@@ -2845,6 +2851,7 @@ function mapInboundDeliveryRow(row: InboundDeliveryRow): InboundDeliveryRecord {
     expectedControlEpoch: row.expected_control_epoch,
     downloadedFiles: parseInboundDownloadedFiles(row.downloaded_files_json),
     initialContextState: row.initial_context_state,
+    ...(row.model_request_text !== null ? { modelRequestText: row.model_request_text } : {}),
   }
 }
 
@@ -6390,7 +6397,7 @@ export class JobStore {
          SET idempotency_key = ?, message_id = ?, user_id = ?, text = ?,
              file_ids_json = ?, write_enabled = ?, is_interrupt = ?,
              downloaded_files_json = '[]', not_before = NULL, last_error = NULL,
-             initial_context_state = ?
+             initial_context_state = ?, model_request_text = ?
          WHERE idempotency_key = ? AND status = 'processing'
            AND initial_context_state = 'pending'`,
         [
@@ -6402,6 +6409,7 @@ export class JobStore {
           canonical.writeEnabled ? 1 : 0,
           canonical.isInterrupt ? 1 : 0,
           input.mode === 'context' ? 'hydrated' : 'none',
+          canonical.text,
           key,
         ],
       )
@@ -8849,6 +8857,7 @@ export class JobStore {
         'SELECT * FROM jobs WHERE idempotency_key = ?',
       ).get(idempotencyKey)
       if (!row) throw new Error('failed to read enqueued job')
+      this.db.run('INSERT OR IGNORE INTO task_model_sources VALUES (?,?)', [row.id,input.modelRequestText ?? task])
 
       const position = this.db.query<{ position: number }, [number]>(
         `SELECT COUNT(*) AS position
@@ -8934,6 +8943,8 @@ export class JobStore {
     const row = this.db.query<JobRow, [string]>('SELECT * FROM jobs WHERE id = ?').get(id)
     return row ? mapRow(row) : null
   }
+
+  taskModels(): TaskModelSelections { return new TaskModelSelections(this.db) }
 
   previousSlackDelivery(id: string): JobRecord['previousSlackDelivery'] {
     const prior = this.db.query<{ id: string; seq: number }, [string]>(
@@ -9088,9 +9099,10 @@ export class JobStore {
       chatId: job.chatId, threadTs: job.threadTs, kind: 'rate-limited', payload: CLOUD_SAVE_FAILED_MESSAGE, createdAt: Date.now() })
   }
 
-  enqueueCloudImport(input: EnqueueInput, cloudId: string, epoch: number, receipt: string): ReturnType<JobStore['enqueue']> {
+  enqueueCloudImport(input: EnqueueInput, cloudId: string, epoch: number, receipt: string, primaryModel?: string): ReturnType<JobStore['enqueue']> {
     const commit = this.db.transaction(() => {
       const result = this.enqueue(input)
+      if (primaryModel) this.taskModels().seedHandoff(result.job.id, input.task, primaryModel)
       this.bindCloudHandoff(result.job.id, cloudId, epoch, receipt)
       this.db.run(`UPDATE cloud_handoff_jobs SET state='transferred',updated_at=?
         WHERE cloud_id=? AND job_id<>? AND state IN ('saving','waiting')`, [Date.now(), cloudId, result.job.id])
@@ -13881,6 +13893,9 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  for (const [reason, message] of Object.entries(MODEL_SELECTION_MESSAGES)) {
+    if (error.includes(`ZERO_MODEL_SELECTION:${reason}`)) return message
+  }
   if ((Object.values(CLOUD_PREPARATION_FAILURE_MESSAGES) as string[]).includes(error)) return error
   if (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE) {
     return FORCED_SERVICE_STOP_FAILURE_MESSAGE
@@ -18505,6 +18520,7 @@ async function runCli(): Promise<void> {
             stateDir: dir,
             logDir: join(dir, 'job-logs'),
             threadHistory: store.threadHistorySnapshot(job.id, job.attempts),
+            selectModel: (requests, models, signal) => store.taskModels().resolve(job.id, requests, models, signal),
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId, executionJob.repoPath),
             onSessionReset: () => store.clearSession(job.id),

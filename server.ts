@@ -1351,6 +1351,7 @@ async function drainInboundDeliveries(): Promise<void> {
         }
         jobStore.enqueue({
           workflow: auditRequest ? 'security-audit' : 'work',
+          modelRequestText: inbound.modelRequestText ?? inbound.text,
           chatId: inbound.chatId,
           threadTs: inbound.threadTs,
           messageId: inbound.messageId,

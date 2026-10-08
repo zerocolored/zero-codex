@@ -366,7 +366,7 @@ export async function runSlackThreadIntentClassifier(
 
 /** Tool-free standalone process; only caller-supplied bounded data reaches the model. */
 export async function runIsolatedCodexJson(prompt: string, schema: object,
-  options: { timeoutMs?: number; model?: string; independent?: boolean; signal?: AbortSignal;
+  options: { timeoutMs?: number; model?: string; reasoningEffort?: 'medium'; independent?: boolean; signal?: AbortSignal;
     onProcessId?: (pid: number) => void; onProcessExit?: (code: number) => void;
     supervision?: { jobId: string; stateDir: string } } = {}): Promise<string> {
   if (Buffer.byteLength(prompt) > 100_000) throw new Error('model input too large')
@@ -420,6 +420,7 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
       '--disable', 'js_repl',
       '--disable', 'view_image',
       ...(configuredModel ? ['--model', configuredModel] : []),
+      ...(options.reasoningEffort ? ['--config', 'model_reasoning_effort="medium"'] : []),
       '-',
     ]
     let command = args
