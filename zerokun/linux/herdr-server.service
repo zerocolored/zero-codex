@@ -1,0 +1,26 @@
+# Herdr headless server for Zeroちゃん on Linux / WSL2.
+#
+# macOS では人が `herdr` の TUI を開いた時点でサーバが立つが、WSL2 では誰も TUI を
+# 開かないので、socket API を持つサーバを systemd --user で常駐させる。
+# `zerochan start` は Herdr 外から実行すると `herdr workspace create` で専用 workspace を
+# 作るため、このサーバさえ動いていれば pane 内起動と同じ経路に乗る。
+#
+# 導入（docs/linux-wsl2.md）:
+#   install -D -m 0644 zerokun/linux/herdr-server.service ~/.config/systemd/user/herdr-server.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now herdr-server.service
+#   loginctl enable-linger "$USER"   # ログインシェルが無くても user service を起こす
+[Unit]
+Description=Herdr headless server (terminal workspace manager for Zero-chan)
+Documentation=https://herdr.dev/docs/cli-reference/
+
+[Service]
+ExecStart=%h/.local/bin/herdr server
+Restart=on-failure
+RestartSec=2
+# `herdr server stop` や systemctl stop で pane の shell も一緒に終える
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

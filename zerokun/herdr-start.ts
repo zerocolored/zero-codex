@@ -111,6 +111,29 @@ function requiredRecord(value: unknown, label: string): Record<string, unknown> 
   return value as Record<string, unknown>
 }
 
+/**
+ * herdr CLI reports failures such as a stopped server as an exit-0 envelope
+ * `{id, error:{code,message}}` (herdr 0.9.3). Surface that message instead of
+ * the generic "result is missing" error, and on Linux, where nobody opens the
+ * TUI, say how the headless server is started.
+ */
+function requireSuccessEnvelope(
+  envelope: Record<string, unknown>,
+  args: string[],
+): Record<string, unknown> {
+  if (!Object.hasOwn(envelope, 'error') || envelope.error == null) return envelope
+  const error = typeof envelope.error === 'object' && !Array.isArray(envelope.error)
+    ? envelope.error as Record<string, unknown>
+    : {}
+  const code = typeof error.code === 'string' ? error.code : 'unknown'
+  const message = typeof error.message === 'string' ? error.message : JSON.stringify(envelope.error)
+  const hint = code === 'server_not_running' && process.platform === 'linux'
+    ? '\nLinux/WSL2 では Herdr の TUI を開かないので headless server を常駐させてください:'
+      + ' systemctl --user start herdr-server （導入は docs/linux-wsl2.md）'
+    : ''
+  throw new Error(`Herdr ${args.slice(0, 2).join(' ')}に失敗しました (${code}): ${message}${hint}`)
+}
+
 function commandEnvironment(): Record<string, string> {
   const home = process.env.HOME
   if (!home) throw new Error('HOMEがありません')
@@ -232,7 +255,10 @@ export async function startZeroInHerdrWorkspace(
     throw new Error('Zeroちゃんが部分起動状態です。zerochan stop --force の後に zerochan start を実行してください')
   }
 
-  const invoke = hooks.invoke ?? productionInvoker(resolveHerdrBinary())
+  const rawInvoke = hooks.invoke ?? productionInvoker(resolveHerdrBinary())
+  const invoke = async (args: string[]): Promise<Record<string, unknown>> => (
+    requireSuccessEnvelope(await rawInvoke(args), args)
+  )
   const label = `Zeroちゃん ${basename(projectDir)}`
   const envelope = await invoke([
     'workspace', 'create', '--cwd', projectDir, '--label', label, '--focus',
