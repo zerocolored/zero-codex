@@ -55,6 +55,40 @@ describe('zerochan project selection', () => {
     })).toThrow('verified Codex sandbox')
   })
 
+  // Linux版Codex sandboxはCODEX_SANDBOXを立てない。updaterが渡すdeny済みfileの
+  // 不在を証拠にする（zerokun/verify.sh の candidate_sandbox_active と同じ契約）。
+  test('Linux候補sandboxはdeny済みfileが不在のときだけstaging済みGitを採用する', () => {
+    const root = mkdtempSync(join(realpathSync('/tmp'), 'zerokun-update-candidate-'))
+    const bin = join(root, 'trusted-bin')
+    mkdirSync(bin, { mode: 0o700 })
+    const git = join(bin, 'git')
+    writeFileSync(git, '#!/bin/sh\n', { mode: 0o500 })
+    chmodSync(git, 0o500)
+    chmodSync(bin, 0o500)
+    chmodSync(root, 0o700)
+    const present = join(root, 'live-verify.sh')
+    writeFileSync(present, '#!/bin/sh\n', { mode: 0o600 })
+    try {
+      const inside = {
+        ZERO_CODEX_CANDIDATE_SANDBOX: '1',
+        ZERO_CODEX_CANDIDATE_SANDBOX_DENIED: join(root, 'missing', 'verify.sh'),
+        ZERO_CODEX_CANDIDATE_GIT: git,
+      }
+      expect(projectGitExecutable(inside, 'linux')).toBe(git)
+      // macOSでは不在証拠だけでは採用しない。
+      expect(() => projectGitExecutable(inside, 'darwin')).toThrow('verified Codex sandbox')
+      for (const denied of [present, 'relative/verify.sh', undefined]) {
+        expect(() => projectGitExecutable({
+          ...inside,
+          ZERO_CODEX_CANDIDATE_SANDBOX_DENIED: denied,
+        }, 'linux')).toThrow('verified Codex sandbox')
+      }
+    } finally {
+      chmodSync(bin, 0o700)
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   test('validates and returns the physical Git project path', () => {
     const value = fixture()
     const alias = join(value.root, 'project-alias')

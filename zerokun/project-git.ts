@@ -1,6 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 
-import { lstatSync, realpathSync } from 'fs'
+import { existsSync, lstatSync, realpathSync } from 'fs'
 import { basename, dirname, isAbsolute } from 'path'
 
 function candidateGitExecutable(input: string): string {
@@ -37,12 +37,29 @@ function candidateGitExecutable(input: string): string {
   return physical
 }
 
+/**
+ * Linux `codex sandbox` (bubblewrap) sets no CODEX_SANDBOX marker. The updater
+ * names a file of the live install that the sandbox denies; it is absent inside
+ * the sandbox and always present outside it. Same contract as
+ * candidate_sandbox_active in zerokun/verify.sh.
+ */
+function linuxCandidateSandboxActive(
+  environment: Record<string, string | undefined>,
+  platform = process.platform,
+): boolean {
+  if (platform !== 'linux') return false
+  const denied = environment.ZERO_CODEX_CANDIDATE_SANDBOX_DENIED
+  if (!denied || !isAbsolute(denied) || /[\r\n\0]/.test(denied)) return false
+  return !existsSync(denied)
+}
+
 export function projectGitExecutable(
   environment: Record<string, string | undefined> = process.env,
+  platform = process.platform,
 ): string {
   const candidate = environment.ZERO_CODEX_CANDIDATE_GIT
   const candidateMode = environment.ZERO_CODEX_CANDIDATE_SANDBOX === '1'
-    && environment.CODEX_SANDBOX === 'seatbelt'
+    && (environment.CODEX_SANDBOX === 'seatbelt' || linuxCandidateSandboxActive(environment, platform))
   if (candidate === undefined && !candidateMode) return '/usr/bin/git'
   if (!candidate || !candidateMode) {
     throw new Error('candidate Git requires the verified Codex sandbox')

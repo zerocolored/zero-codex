@@ -39,6 +39,7 @@ import {
   selectUpdateProjectDirectory,
   setupTimeoutBudgetMs,
   stageVerifiedCandidateCodex,
+  linuxCandidateFilesystemRules,
   updateRestartTokenDigest,
   validateResolvedCandidatePermissionOverrides,
   restoreRollbackDatabase,
@@ -1171,6 +1172,103 @@ describe('updater helpers', () => {
     } finally {
       staged.cleanup()
     }
+  })
+
+  // 2026-10-09: Linux (WSL2) の自動更新は `codex sandbox --allow-unix-socket` が
+  // Linux版Codexに無く exit 1 で全滅していた。Linuxはsandboxの印（CODEX_SANDBOX）
+  // も立たないので、updaterが渡す「deny済みの実在file」が消えていることを証拠にする。
+  test('Linux候補sandboxはdeny済みfileの不在を証拠にstaging済みGitを採用する', () => {
+    const staged = stagedCandidateGitFixture()
+    const dir = fixtureDir()
+    const present = join(dir, 'live-verify.sh')
+    writeFileSync(present, '#!/bin/bash\n', { mode: 0o600 })
+    try {
+      const linux = process.platform === 'linux'
+      const inside = runCandidateGitShell('staged_candidate_git', {
+        ZERO_CODEX_CANDIDATE_SANDBOX: '1',
+        ZERO_CODEX_CANDIDATE_SANDBOX_DENIED: join(dir, 'missing', 'verify.sh'),
+        ZERO_CODEX_CANDIDATE_GIT: staged.git,
+      })
+      expect(inside.exitCode, inside.stderr).toBe(0)
+      expect(inside.stdout.trim()).toBe(staged.git)
+      if (linux) {
+        const check = runCandidateGitShell('candidate_git_diff_check', {
+          ZERO_CODEX_CANDIDATE_SANDBOX: '1',
+          ZERO_CODEX_CANDIDATE_SANDBOX_DENIED: join(dir, 'missing', 'verify.sh'),
+          ZERO_CODEX_CANDIDATE_GIT: staged.git,
+        })
+        expect(check.exitCode, check.stderr).toBe(0)
+      }
+
+      // 証拠fileが見えている＝sandbox外。staging済みgitを黙って使わない。
+      for (const environment of [
+        { ZERO_CODEX_CANDIDATE_SANDBOX_DENIED: present },
+        { ZERO_CODEX_CANDIDATE_SANDBOX_DENIED: 'relative/verify.sh' },
+        {},
+      ]) {
+        const outside = runCandidateGitShell('candidate_git_diff_check', {
+          ZERO_CODEX_CANDIDATE_SANDBOX: '1',
+          ZERO_CODEX_CANDIDATE_GIT: staged.git,
+          ...environment,
+        })
+        expect(outside.exitCode).not.toBe(0)
+        expect(outside.stderr).toContain('検証済みCodex sandbox内でのみ使用できます')
+      }
+      // macOSでは不在証拠だけではsandbox扱いにしない（seatbelt markerが要る）。
+      if (!linux) {
+        const darwin = runCandidateGitShell('candidate_git_diff_check', {
+          ZERO_CODEX_CANDIDATE_SANDBOX: '1',
+          ZERO_CODEX_CANDIDATE_SANDBOX_DENIED: join(dir, 'missing', 'verify.sh'),
+          ZERO_CODEX_CANDIDATE_GIT: staged.git,
+        })
+        expect(darwin.exitCode).not.toBe(0)
+      }
+
+      // verify.sh 本体の入口も同じ判定で止まる（bun install より前）。
+      const gate = Bun.spawnSync(['/bin/bash', join(import.meta.dir, 'verify.sh'), '--candidate-sandbox'], {
+        env: {
+          PATH: '/usr/bin:/bin', HOME: dir,
+          ZERO_CODEX_CANDIDATE_SANDBOX: '1',
+          ZERO_CODEX_CANDIDATE_SANDBOX_DENIED: present,
+        },
+        stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(gate.exitCode).toBe(2)
+      expect(gate.stderr.toString()).toContain('updaterのCodex sandbox内でのみ使用できます')
+    } finally {
+      staged.cleanup()
+    }
+  })
+
+  test('Linux候補sandboxのfilesystem ruleはdeny配下のdenyとbun readを落としwriteは残す', () => {
+    const rules: Array<[string, 'deny' | 'read' | 'write']> = [
+      [':minimal', 'read'],
+      ['/home/dev', 'deny'],
+      ['/home/dev/projects/zero-codex', 'deny'],
+      ['/home/dev/.codex/zerokun', 'deny'],
+      ['/home/dev/.bun/bin/bun', 'read'],
+      ['/tmp/zerokun-update-candidate-x/trusted-bin', 'read'],
+      ['/home/dev/.codex/zerochan-apps/releases/.build-x/checkout', 'write'],
+      ['/tmp/zerokun-update-candidate-x/home', 'write'],
+    ]
+    expect(linuxCandidateFilesystemRules(rules, '/home/dev/.bun/bin/bun')).toEqual([
+      [':minimal', 'read'],
+      ['/home/dev', 'deny'],
+      ['/tmp/zerokun-update-candidate-x/trusted-bin', 'read'],
+      ['/home/dev/.codex/zerochan-apps/releases/.build-x/checkout', 'write'],
+      ['/tmp/zerokun-update-candidate-x/home', 'write'],
+    ])
+    // homeの外にあるdenyはそのまま残る。
+    expect(linuxCandidateFilesystemRules([
+      [':minimal', 'read'],
+      ['/home/dev', 'deny'],
+      ['/srv/zero-codex', 'deny'],
+      ['/srv/zero-codex/state', 'deny'],
+    ], '/usr/local/bin/bun')).toEqual([
+      [':minimal', 'read'],
+      ['/home/dev', 'deny'],
+      ['/srv/zero-codex', 'deny'],
+    ])
   })
 
   test('rollback用SQLite snapshotをsidecarごと原子的に復元する', () => {

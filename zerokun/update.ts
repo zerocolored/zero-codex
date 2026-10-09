@@ -587,10 +587,38 @@ export function stageVerifiedCandidateCodex(
     || !/^git version \d+\.\d+(?:\.\d+)?(?:\s|$)/.test(gitVersion.stdout.toString())) {
     fail('stagingしたcandidate検証用Gitを実行できません')
   }
+  if (process.platform === 'linux') stageLinuxCandidateTools(directory, candidateCodexExecutable(codexBin))
   chmodSync(executable, 0o500)
   chmodSync(gitExecutable, 0o500)
   chmodSync(directory, 0o500)
   return { directory, executable, gitExecutable }
+}
+
+/**
+ * Linux `codex sandbox` re-executes itself under bubblewrap, which it looks
+ * for next to its own executable (`codex-resources/bwrap`, bundled with the
+ * standalone release) before falling back to a system `bwrap`. Inside the
+ * sandbox the developer home is denied, so bun (process.execPath lives under
+ * ~/.bun) is staged beside the trusted codex copy as well; the candidate PATH
+ * already starts with trusted-bin.
+ */
+function stageLinuxCandidateTools(directory: string, physicalCodex: string): void {
+  const resources = join(directory, 'codex-resources')
+  for (const bundled of [
+    join(dirname(dirname(physicalCodex)), 'codex-resources', 'bwrap'),
+    join(dirname(physicalCodex), 'codex-resources', 'bwrap'),
+  ]) {
+    if (!secureExecutable(bundled)) continue
+    mkdirSync(resources, { mode: 0o700 })
+    const staged = join(resources, 'bwrap')
+    copySecureExecutable(bundled, staged, () => {}, true)
+    chmodSync(staged, 0o500)
+    chmodSync(resources, 0o500)
+    break
+  }
+  const bun = join(directory, 'bun')
+  copySecureExecutable(process.execPath, bun, () => {}, true)
+  chmodSync(bun, 0o500)
 }
 
 type UpdatePhase =
@@ -2012,6 +2040,33 @@ export function buildCandidatePermissionOverrides(
   ]
 }
 
+export type CandidateFilesystemRule = [path: string, access: 'deny' | 'read' | 'write']
+
+/**
+ * Linux `codex sandbox` (bubblewrap) differs from Seatbelt in two ways that the
+ * macOS rule set trips over (measured on codex-cli 0.162.0 / WSL2):
+ * - a deny nested under a denied ancestor aborts bubblewrap outright
+ *   ("Can't mkdir parents for ...: Read-only file system"), while a write
+ *   nested under a denied ancestor is bound fine;
+ * - a read nested under a denied ancestor is silently absent, so bun cannot be
+ *   read from $HOME and is staged into trusted-bin instead (see
+ *   stageLinuxCandidateTools).
+ * The ancestor's deny already covers the dropped rules.
+ */
+export function linuxCandidateFilesystemRules(
+  rules: readonly CandidateFilesystemRule[],
+  bunExecutable = realpathSync(process.execPath),
+): CandidateFilesystemRule[] {
+  const denied = rules.filter(([, access]) => access === 'deny').map(([path]) => path)
+  const underDenied = (path: string) => denied.some(root => path.startsWith(`${root}/`))
+  return rules.filter(([path, access]) => {
+    if (path === ':minimal') return true
+    if (access === 'read' && path === bunExecutable) return false
+    if (access === 'write') return true
+    return !underDenied(path)
+  })
+}
+
 async function validateZero(
   rootRepo: string,
   isolatedHome: string,
@@ -2029,7 +2084,8 @@ async function validateZero(
   const stagedCodexBin = stagedCodex.executable
   const profile = `zerokun_update_${randomUUID().replaceAll('-', '')}`
   const candidateSocketRoot = realpathSync(join(isolatedHome, 'tmp'))
-  const filesystem = new Map<string, 'deny' | 'read' | 'write'>([
+  const linuxSandbox = process.platform === 'linux'
+  const filesystemRules: CandidateFilesystemRule[] = [
     [':minimal', 'read'],
     [realpathSync(homedir()), 'deny'],
     [realpathSync(liveRepo), 'deny'],
@@ -2038,7 +2094,10 @@ async function validateZero(
     [realpathSync(trustedToolDirectory), 'read'],
     [realpathSync(rootRepo), 'write'],
     [realpathSync(isolatedHome), 'write'],
-  ])
+  ]
+  const filesystem = new Map<string, 'deny' | 'read' | 'write'>(
+    linuxSandbox ? linuxCandidateFilesystemRules(filesystemRules) : filesystemRules,
+  )
   const filesystemToml = [...filesystem]
     .map(([path, access]) => `${JSON.stringify(path)}=${JSON.stringify(access)}`)
     .join(',')
@@ -2066,11 +2125,20 @@ async function validateZero(
     ...permissionOverrides.flatMap(value => ['-c', value]),
     '-P', profile,
     '--include-managed-config',
-    '--allow-unix-socket', candidateSocketRoot,
+    // Seatbelt needs the socket allowance for the candidate tmp; Linux codex
+    // (bubblewrap) has no such flag and keeps sockets inside the writable roots.
+    ...(linuxSandbox ? [] : ['--allow-unix-socket', candidateSocketRoot]),
     '--',
     '/usr/bin/env',
     `TMPDIR=${candidateSocketRoot}`,
     'ZERO_CODEX_CANDIDATE_SANDBOX=1',
+    // Linux codex sets no CODEX_SANDBOX marker. verify.sh / project-git.ts
+    // prove the sandbox instead by this live file being absent: bubblewrap
+    // leaves denied trees (and files under an explicitly denied directory) out
+    // of its root, while outside the sandbox the live install always has it.
+    ...(linuxSandbox
+      ? [`ZERO_CODEX_CANDIDATE_SANDBOX_DENIED=${join(realpathSync(liveRepo), 'zerokun', 'verify.sh')}`]
+      : []),
     `ZERO_CODEX_CANDIDATE_GIT=${stagedCodex.gitExecutable}`,
     '/bin/bash', verifyScript, '--candidate-sandbox',
   ], {
@@ -2170,7 +2238,8 @@ const UPDATE_RESTART_TRAMPOLINE = [
   'launcher="$4"',
   'project="$5"',
   '[[ "$replace_token_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "restart handoff digest is invalid" >&2; exit 65; }',
-  '[ "$(/usr/bin/stat -f %Lp "$replace_token_file" 2>/dev/null)" = 600 ] || { echo "restart handoff token mode is unsafe" >&2; exit 66; }',
+  // BSD stat on macOS, GNU stat on Linux; both print the octal permission bits.
+  `[ "$(${process.platform === 'darwin' ? '/usr/bin/stat -f %Lp' : '/usr/bin/stat -c %a'} "$replace_token_file" 2>/dev/null)" = 600 ] || { echo "restart handoff token mode is unsafe" >&2; exit 66; }`,
   'if ! replace_token_with_sentinel="$(bun --config=/dev/null --no-env-file "$safe_file_helper" read-owned-regular "$replace_token_file" 2>/dev/null; status=$?; [ "$status" -eq 0 ] || exit "$status"; /usr/bin/printf .)"; then',
   '  echo "restart handoff token is unavailable or unsafe" >&2',
   '  exit 67',
