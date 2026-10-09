@@ -264,7 +264,10 @@ export function linuxSandboxScopeUnit(fingerprint: SeatbeltFingerprint): string 
 }
 
 /** Directory where the Linux launcher writes `<pid>.json` before it execs. */
-export function linuxSandboxReceiptPath(stateDir: string, fingerprint: SeatbeltFingerprint): string {
+export function linuxSandboxReceiptPath(
+  stateDir: string,
+  fingerprint: { deny: { path: string } },
+): string {
   const state = requireManagedStateRoot(stateDir)
   const nonce = attemptNonceOf(fingerprint.deny.path)
   const job = basename(dirname(dirname(fingerprint.deny.path)))
@@ -295,6 +298,34 @@ export function sandboxedCommand(
   stateDir: string,
   command: readonly string[],
 ): string[] {
+  return sandboxedCommandForPaths(fingerprint.allow.path, fingerprint.deny.path, stateDir, command)
+}
+
+/**
+ * Same wrapper for callers that only hold the two tag paths (App Server
+ * capability probe, advisor broker). The attempt directory layout
+ * `<state>/sandbox-obligations/<job>/<nonce>/{allow,deny}` fixes the state dir.
+ */
+export function sandboxedCommandForTags(
+  tags: { allow: string; deny: string },
+  command: readonly string[],
+): string[] {
+  const attemptDir = dirname(tags.deny)
+  if (!isAbsolute(tags.deny) || basename(tags.deny) !== 'deny' || basename(tags.allow) !== 'allow'
+    || dirname(tags.allow) !== attemptDir
+    || basename(dirname(dirname(attemptDir))) !== FINGERPRINT_DIRECTORY) {
+    throw new Error('Seatbelt fingerprint tags are outside the obligation layout')
+  }
+  attemptNonceOf(tags.deny)
+  return sandboxedCommandForPaths(tags.allow, tags.deny, dirname(dirname(dirname(attemptDir))), command)
+}
+
+function sandboxedCommandForPaths(
+  allowPath: string,
+  denyPath: string,
+  stateDir: string,
+  command: readonly string[],
+): string[] {
   if (command.length === 0) throw new Error('sandboxed command is empty')
   if (process.platform === 'darwin') {
     return [
@@ -302,7 +333,7 @@ export function sandboxedCommand(
       '-p', [
         '(version 1)',
         '(allow default)',
-        `(deny file-read-data (literal ${JSON.stringify(fingerprint.deny.path)}))`,
+        `(deny file-read-data (literal ${JSON.stringify(denyPath)}))`,
       ].join('\n'),
       ...command,
     ]
@@ -310,7 +341,7 @@ export function sandboxedCommand(
   if (process.platform === 'linux') {
     return [
       '/usr/bin/python3', '-I', linuxLauncherPath(),
-      fingerprint.allow.path, fingerprint.deny.path, linuxSandboxReceiptPath(stateDir, fingerprint),
+      allowPath, denyPath, linuxSandboxReceiptPath(stateDir, { deny: { path: denyPath } }),
       '--', ...command,
     ]
   }

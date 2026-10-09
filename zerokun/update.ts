@@ -103,6 +103,7 @@ import { installUpdateRequestRuntime } from './update-runtime.ts'
 import { readRuntimeRelease, runtimeRootForState, validateRelease, installLegacyCommands, type RuntimeRelease } from './runtime-release.ts'
 import { activateIndependentTargets, collectIndependentTargets, readReleaseTransaction, summarizeIndependentResults, type ReleaseTarget, type ActivationHooks } from './independent-update.ts'
 import { UpdateDeferredError, UPDATE_DEFERRED_EXIT_CODE } from './update-result.ts'
+import { officialStandaloneTarget } from './standalone-codex.ts'
 
 interface Repository {
   label: string
@@ -531,10 +532,14 @@ function candidateCodexExecutable(codexBin: string): string {
   }
   const platform = process.platform === 'darwin' ? 'darwin' : process.platform
   const architecture = process.arch === 'arm64' ? 'arm64' : process.arch
-  const target = process.platform === 'darwin'
-    ? process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin'
-    : null
-  if (!target) fail('candidate検証用Codex binaryをこのplatformで解決できません')
+  // npm ships the same vendor triple as the official standalone
+  // (@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex on Linux).
+  let target: string
+  try {
+    target = officialStandaloneTarget()
+  } catch {
+    return fail('candidate検証用Codex binaryをこのplatformで解決できません')
+  }
   const native = join(
     packageRoot,
     'node_modules',

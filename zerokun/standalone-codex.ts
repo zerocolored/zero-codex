@@ -300,13 +300,25 @@ function readTrustedManifest(path: string): { value: Record<string, unknown>; id
   }
 }
 
-function expectedStandaloneTarget(): string {
-  if (process.platform !== 'darwin') {
-    throw new Error('Codex official standalone runtime is currently supported only on macOS')
+/**
+ * Target triple the official installer (chatgpt.com/codex/install.sh) uses for
+ * the release directory name and the manifest's `target`. Linux ships the
+ * musl build (`codex-package-<arch>-unknown-linux-musl.tar.gz`); the same
+ * 2-link layout under ~/.codex/packages/standalone is produced there.
+ */
+export function officialStandaloneTarget(): string {
+  const architecture = process.arch === 'arm64' ? 'aarch64'
+    : process.arch === 'x64' ? 'x86_64'
+      : null
+  if (process.platform !== 'darwin' && process.platform !== 'linux') {
+    throw new Error('Codex official standalone runtime is supported only on macOS and Linux')
   }
-  if (process.arch === 'arm64') return 'aarch64-apple-darwin'
-  if (process.arch === 'x64') return 'x86_64-apple-darwin'
-  throw new Error(`Codex official standalone does not support architecture ${process.arch}`)
+  if (!architecture) {
+    throw new Error(`Codex official standalone does not support architecture ${process.arch}`)
+  }
+  return process.platform === 'darwin'
+    ? `${architecture}-apple-darwin`
+    : `${architecture}-unknown-linux-musl`
 }
 
 function supportedVersion(version: string): boolean {
@@ -322,9 +334,10 @@ function supportedVersion(version: string): boolean {
 }
 
 /**
- * Resolve only the layout installed by bootstrap-macos.sh. No PATH, Homebrew,
- * npm wrapper, or ZEROKUN_CODEX_BIN fallback is part of this production trust
- * boundary.
+ * Resolve only the layout installed by the official installer (bootstrap-macos.sh
+ * on macOS, `CODEX_NON_INTERACTIVE=true sh install.sh` on Linux). No PATH,
+ * Homebrew, npm wrapper, or ZEROKUN_CODEX_BIN fallback is part of this
+ * production trust boundary.
  */
 function resolveOfficialStandaloneCodexAtHome(homeDirectory: string): OfficialCodexSnapshot {
   try {
@@ -352,7 +365,7 @@ function resolveOfficialStandaloneCodexAtHome(homeDirectory: string): OfficialCo
     if (links[1].resolvedTarget !== releaseDir) {
       throw new Error('Codex official standalone current link has an unexpected target')
     }
-    const target = expectedStandaloneTarget()
+    const target = officialStandaloneTarget()
     const manifest = readTrustedManifest(join(releaseDir, 'codex-package.json'))
     const version = manifest.value.version
     if (JSON.stringify(Object.keys(manifest.value).sort()) !== JSON.stringify(OFFICIAL_MANIFEST_KEYS)

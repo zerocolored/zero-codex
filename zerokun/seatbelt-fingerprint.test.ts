@@ -17,6 +17,7 @@ import {
   reapSeatbeltFingerprint,
   removeSeatbeltFingerprint,
   sandboxedCommand,
+  sandboxedCommandForTags,
   verifySeatbeltFingerprint,
 } from './seatbelt-fingerprint.ts'
 
@@ -243,6 +244,24 @@ describe('Seatbelt descendant fingerprint', () => {
     } else {
       expect(() => sandboxedCommand(fingerprint, root, ['/bin/echo'])).toThrow()
     }
+  })
+
+  // capability probe / advisor broker は tag の path 2 本しか持たない。state dir は tag の
+  // 配置（<state>/sandbox-obligations/<job>/<nonce>/{allow,deny}）から一意に決まるので、
+  // そこから同じ wrapper を組めることを固定する（darwin では従来の inline と同一）。
+  test('sandboxedCommandForTagsはtag pathだけから同じwrapperを組む', () => {
+    const root = prepareManagedStateRoot(mkdtempSync(join(tmpdir(), 'zero-sandbox-tags-cmd-')))
+    temporaryDirs.push(root)
+    const fingerprint = createSeatbeltFingerprint(root, 'job-tags', 'e'.repeat(32))
+    const tags = { allow: fingerprint.allow.path, deny: fingerprint.deny.path }
+    if (process.platform === 'darwin' || process.platform === 'linux') {
+      expect(sandboxedCommandForTags(tags, ['/bin/echo', 'hi']))
+        .toEqual(sandboxedCommand(fingerprint, root, ['/bin/echo', 'hi']))
+    }
+    expect(() => sandboxedCommandForTags({ allow: tags.allow, deny: '/elsewhere/deny' }, ['/bin/echo']))
+      .toThrow()
+    expect(() => sandboxedCommandForTags({ allow: tags.allow, deny: join(root, 'deny') }, ['/bin/echo']))
+      .toThrow()
   })
 
   test.skipIf(linuxOnly)(

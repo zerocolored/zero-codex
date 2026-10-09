@@ -86,14 +86,38 @@ server が止まっていると herdr CLI は exit 0 のまま `{"error":{"code"
 `herdr-start.ts` はこの封筒をそのまま message に出し、Linux では `systemctl --user start herdr-server`
 を添える。
 
+## Codex（official standalone）
+
+`codex-channel.sh` は Herdr 検査の後に `zerokun/standalone-codex.ts version` で **公式 installer が置く
+standalone だけ**を採用する（PATH / npm / `ZEROKUN_CODEX_BIN` は信頼境界の外）。公式 installer は
+Linux でも同じ 2-link layout を作る。
+
+```bash
+# chatgpt.com/codex/install.sh は linux-x86_64 / aarch64 に musl build を配る
+curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh
+CODEX_NON_INTERACTIVE=true sh /tmp/codex-install.sh     # npm 版が居ても消さない（PATH 順の警告だけ）
+#   ~/.local/bin/codex -> ~/.codex/packages/standalone/current/bin/codex
+#   ~/.codex/packages/standalone/releases/<version>-x86_64-unknown-linux-musl/codex-package.json
+bun --config=/dev/null --no-env-file zerokun/standalone-codex.ts version   # 例: 0.162.0
+codex login   # ChatGPT ログイン（人の作業）
+```
+
+`officialStandaloneTarget()` が Linux で `<arch>-unknown-linux-musl` を返し、release directory 名・manifest の
+`target`・ELF header を照合する（macOS の Mach-O 照合と同じ厳しさ。`bootstrap-macos.sh` の python 検査は
+macOS 専用のまま）。
+
+実測（2026-10-09, codex 0.162.0）: `zerokun_require_codex_version` が通り、
+`codex-executor.ts verify-system-config` が `system config, App Server history, and managed Codex permissions
+are compatible` を返す。この probe（`codex-app-server-capability.ts`）と advisor broker の Grok / Claude 起動も
+inline の `sandbox-exec` ではなく `sandboxedCommandForTags()` を通るので、Linux では launcher で包まれる。
+
 ## 既知の制限
 
-- **`zerochan start` はまだ Codex の official standalone 検査で止まる。** `codex-channel.sh` は
-  Herdr 検査の後に `zerokun/standalone-codex.ts version` を呼び、`expectedStandaloneTarget()` が
-  darwin 以外で `Codex official standalone runtime is currently supported only on macOS` を投げる
-  （`bootstrap-macos.sh` が置く `~/.codex` 配下の公式 standalone + manifest 配置が前提）。
-  npm の `codex-cli 0.154.0` が PATH にあっても採用されない。Linux 用の standalone 配置と検証が次の作業
-- Slack App の token（state dir の `.env`）と Codex / GitHub CLI のログインは macOS と同じく人が用意する
+- `zerochan start` の残りは **Slack App の token（state dir の `.env`）** と各 CLI のログイン。
+  `zerokun/setup.sh` / `quick-setup.sh` が Linux で通るかは未確認（`bootstrap-macos.sh` 前提の箇所がある）
+- `zerochan update` の候補検証（`update.ts` の `candidateCodexExecutable`）は npm package の
+  `@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex` を見るよう target を揃えたが、
+  Linux での自己更新そのものは未実測
 - cgroup は同一 uid の process なら `cgroup.procs` へ自分を書いて抜けられる（delegated subtree 内）。
   macOS の Seatbelt profile ほど敵対的な脱出には強くない。目的は「うっかり setsid した子」の回収で、
   その範囲では kernel が一覧を返すので十分
