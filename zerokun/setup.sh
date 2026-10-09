@@ -30,7 +30,7 @@ CUTOVER_MARKER="$CH/.codex-legacy-cutover"
 valid_cutover_marker() {
   local metadata first second third lines physical
   [ -f "$CUTOVER_MARKER" ] && [ ! -L "$CUTOVER_MARKER" ] || return 1
-  metadata="$(/usr/bin/stat -f '%u:%l' "$CUTOVER_MARKER" 2>/dev/null || true)"
+  metadata="$(zerokun_stat_owner_links "$CUTOVER_MARKER" || true)"
   [ "$metadata" = "$(/usr/bin/id -u):1" ] || return 1
   physical="$(cd "$CH" 2>/dev/null && pwd -P)" || return 1
   first="$(/usr/bin/sed -n '1p' "$CUTOVER_MARKER" 2>/dev/null)" || return 1
@@ -61,7 +61,7 @@ case "${ZEROKUN_LEGACY_CUTOVER:-0}" in
       LEGACY_CUTOVER_INITIAL=1
     fi
     LEGACY_ENV="$CH/.env"
-    LEGACY_ENV_METADATA="$(/usr/bin/stat -f '%u:%l' "$LEGACY_ENV" 2>/dev/null || true)"
+    LEGACY_ENV_METADATA="$(zerokun_stat_owner_links "$LEGACY_ENV" || true)"
     if [ ! -f "$LEGACY_ENV" ] || [ -L "$LEGACY_ENV" ] || [ ! -s "$LEGACY_ENV" ] \
       || [ "$LEGACY_ENV_METADATA" != "$(/usr/bin/id -u):1" ] \
       || [ "$(/usr/bin/grep -Ec '^SLACK_BOT_TOKEN=' "$LEGACY_ENV" || true)" != "1" ] \
@@ -138,8 +138,8 @@ resolve_regular_path() {
 
 resolve_launcher_link_target() {
   local path="$1" raw
-  [ "$(/usr/bin/stat -f '%u:%l:%HT' "$path" 2>/dev/null || true)" \
-    = "$(/usr/bin/id -u):1:Symbolic Link" ] || return 1
+  [ "$(zerokun_stat_owner_links "$path" || true):$(zerokun_stat_type "$path" || true)" \
+    = "$(/usr/bin/id -u):1:symlink" ] || return 1
   raw="$(readlink "$path")" || return 1
   case "$raw" in
     /*) ;;
@@ -641,8 +641,9 @@ ln -sfn "$REPO_DIR/zerokun/service-control.ts" "$CH/service-control.ts"
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/update-runtime.ts" \
   install "$REPO_DIR/zerokun" "$CH" >/dev/null
 install -m 0700 "$REPO_DIR/zerokun/watchdog.sh" "$CH/watchdog.sh"
-mkdir -p "$HOME/Library/LaunchAgents"
 WATCHDOG_LABEL="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/watchdog-profile.ts" label "$CH")"
+if [ "$ZEROKUN_KERNEL" = "Darwin" ]; then
+mkdir -p "$HOME/Library/LaunchAgents"
 WATCHDOG_PLIST="$HOME/Library/LaunchAgents/$WATCHDOG_LABEL.plist"
 if [ -e "$WATCHDOG_PLIST" ] || [ -L "$WATCHDOG_PLIST" ]; then
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-owned-regular "$WATCHDOG_PLIST"
@@ -661,6 +662,57 @@ else
   else
     echo "⚠️ watchdog のlaunchd登録に失敗しました。CLIとaliasの設置は続行します。" >&2
   fi
+fi
+else
+# Linux (WSL2): launchd の StartInterval=60 と同じ内容を systemd --user の timer にする。
+# unit 名は launchd の label と同じにして、state ごとに 1 組だけ持つ。
+WATCHDOG_UNIT_DIR="$HOME/.config/systemd/user"
+mkdir -p "$WATCHDOG_UNIT_DIR"
+chmod 700 "$WATCHDOG_UNIT_DIR"
+for watchdog_unit in "$WATCHDOG_LABEL.service" "$WATCHDOG_LABEL.timer"; do
+  if [ -e "$WATCHDOG_UNIT_DIR/$watchdog_unit" ] || [ -L "$WATCHDOG_UNIT_DIR/$watchdog_unit" ]; then
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-owned-regular "$WATCHDOG_UNIT_DIR/$watchdog_unit"
+  fi
+done
+WATCHDOG_STATE_PHYSICAL="$(cd "$CH" && pwd -P)"
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Zero-chan watchdog (bridge/job-runner state transitions to Slack DM)' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  "ExecStart=/bin/bash $WATCHDOG_STATE_PHYSICAL/watchdog.sh" \
+  "Environment=ZEROKUN_STATE_DIR=$WATCHDOG_STATE_PHYSICAL" \
+  "Environment=ZEROKUN_LEGACY_CUTOVER=$LEGACY_CUTOVER" \
+  'StandardOutput=null' \
+  'StandardError=null' \
+  | bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" atomic-write-private "$WATCHDOG_UNIT_DIR/$WATCHDOG_LABEL.service"
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Zero-chan watchdog every 60 seconds' \
+  '' \
+  '[Timer]' \
+  'OnBootSec=60' \
+  'OnUnitActiveSec=60' \
+  'AccuracySec=5' \
+  "Unit=$WATCHDOG_LABEL.service" \
+  '' \
+  '[Install]' \
+  'WantedBy=timers.target' \
+  | bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" atomic-write-private "$WATCHDOG_UNIT_DIR/$WATCHDOG_LABEL.timer"
+if [ "${ZEROKUN_SKIP_WATCHDOG_LAUNCHD:-0}" = "1" ]; then
+  echo "   watchdog のsystemd timer登録をスキップしました"
+# update.ts --setup-supervisor re-runs this script with a sanitized environment
+# that has no XDG_RUNTIME_DIR, and systemctl --user cannot find the session bus
+# without it ("Failed to connect to bus: No medium found"). The per-user runtime
+# directory is fixed by uid, so name it explicitly.
+elif command -v systemctl >/dev/null 2>&1 \
+  && XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user daemon-reload \
+  && XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user enable --now "$WATCHDOG_LABEL.timer" >/dev/null 2>&1; then
+  echo "   watchdog をsystemd --userへ登録しました(60秒間隔・停止時の自動復旧)"
+else
+  echo "⚠️ watchdog のsystemd timer登録に失敗しました。CLIとaliasの設置は続行します。" >&2
+fi
 fi
 ln -sfn "$REPO_DIR/zerokun/job-runner.ts" "$HOME/.local/bin/zerokun-jobs"
 ln -sfn "$REPO_DIR/zerokun/access.ts" "$HOME/.local/bin/zerochan-access"
@@ -706,11 +758,16 @@ case "$CH" in
   *) UPDATE_SHELL_DEFAULT=1 ;;
 esac
 if [ "$UPDATE_SHELL_DEFAULT" = "1" ]; then
-ZSHRC="$HOME/.zshrc"
-ZSHRC_TMP="$(mktemp "$HOME/.zshrc.zerokun-tmp.XXXXXX")"
+# The managed block is plain export/alias, so it goes to the login shell's rc:
+# zsh (macOS default) → ~/.zshrc, bash (Linux/WSL2 default) → ~/.bashrc.
+case "$(basename -- "${SHELL:-/bin/zsh}")" in
+  bash) ZSHRC="$HOME/.bashrc" ;;
+  *) ZSHRC="$HOME/.zshrc" ;;
+esac
+ZSHRC_TMP="$(mktemp "$ZSHRC.zerokun-tmp.XXXXXX")"
 if [ -e "$ZSHRC" ] || [ -L "$ZSHRC" ]; then
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-owned-regular "$ZSHRC"
-  ZSHRC_MODE="$(stat -f '%Lp' "$ZSHRC")"
+  ZSHRC_MODE="$(zerokun_stat_perm "$ZSHRC")"
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" read-owned-regular "$ZSHRC" | awk '
     $0 == "# >>> zerokun setup >>>" { if (skip) exit 2; skip=1; next }
     $0 == "# <<< zerokun setup <<<" { if (!skip) exit 2; skip=0; next }
@@ -740,7 +797,7 @@ EOF
   } >> "$ZSHRC_TMP"
 mv -f -- "$ZSHRC_TMP" "$ZSHRC"
 ZSHRC_TMP=""
-echo "   .zshrc のZeroちゃん管理ブロックを更新しました(新しいターミナルで有効)"
+echo "   $(basename -- "$ZSHRC") のZeroちゃん管理ブロックを更新しました(新しいターミナルで有効)"
 else
   echo "   アプリ専用設定のため、既定のシェル設定は保持しました"
 fi

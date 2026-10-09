@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+. "$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/stat-compat.sh"
+
 zerokun_lexical_path() {
   local input="$1" current rest component
   case "$input" in
@@ -71,7 +73,7 @@ zerokun_path_selects_legacy() {
 zerokun_owned_regular_file() {
   local file="$1" metadata
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
-  metadata="$(/usr/bin/stat -f '%u:%l' "$file" 2>/dev/null || true)"
+  metadata="$(zerokun_stat_owner_links "$file" || true)"
   [ "$metadata" = "$(/usr/bin/id -u):1" ]
 }
 
@@ -100,7 +102,7 @@ zerokun_valid_cutover_marker() {
 zerokun_valid_legacy_cutover_state() {
   local state="$1" selected_physical legacy_physical owner
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
-  owner="$(/usr/bin/stat -f '%u' "$state" 2>/dev/null || true)"
+  owner="$(zerokun_stat_owner "$state" || true)"
   [ "$owner" = "$(/usr/bin/id -u)" ] || return 1
   zerokun_valid_slack_environment "$state" || return 1
   zerokun_valid_cutover_marker "$state" && return 0
