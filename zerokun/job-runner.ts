@@ -1,4 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { TaskModelSelections, TASK_MODEL_SCHEMA, MODEL_SELECTION_MESSAGES } from './task-model-selection.ts'
+import { assertSlackProjectAdmission } from './slack-project-admission.ts'
 import { executeSecurityAudit, copyAuditReportForFollowup, auditHasReadinessOnlyResult } from './security-audit.ts'
 import { createSecurityAuditProgress, deliverAuditMilestone } from './security-audit-progress.ts'
 import { fleetProject } from './fleet-project.ts'
@@ -63,12 +65,6 @@ import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
 import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, CLOUD_PREPARATION_FAILURE_MESSAGES, type CloudControl } from './cloud-runtime.ts'
 import { CLOUD_SAVE_FAILED_MESSAGE } from './cloud-handoff.ts'
 import { createAdvisorInputSnapshot, readAdvisorInputSnapshot } from './advisor-input.ts'
-import {
-  containsCredentialMaterial,
-  normalizeImplementationGuardText,
-  normalizePublicGuardText,
-  redactCredentialMaterial,
-} from './public-output-guard.ts'
 import {
   applyStateEnvironment,
   parseStateSlackTokens,
@@ -439,6 +435,7 @@ export interface JobInterjectionRecord {
 export type JobLiveInputRecord = JobControlRecord | JobInterjectionRecord
 
 export interface EnqueueInput {
+  modelRequestText?: string
   workflow?: 'work' | 'security-audit'
   chatId: string
   threadTs: string
@@ -495,6 +492,7 @@ export interface LiveControlInput {
 }
 
 export interface InboundDeliveryRecord extends InboundDeliveryInput {
+  modelRequestText?: string
   seq: number
   idempotencyKey: string
   fileIds: string[]
@@ -544,6 +542,7 @@ type InboundDeliveryRow = {
   expected_control_epoch: number | null
   downloaded_files_json: string
   initial_context_state: InboundInitialContextState
+  model_request_text: string | null
 }
 
 export interface JobRecord {
@@ -1347,6 +1346,7 @@ CREATE TABLE IF NOT EXISTS job_interjections (
   answer_turn_id TEXT,
   disposition TEXT CHECK (disposition IS NULL OR disposition IN ('answer-only', 'task-update')),
   answer_payload TEXT,
+  answer_retry_count INTEGER NOT NULL DEFAULT 0,
   notification_id TEXT UNIQUE,
   attempts INTEGER NOT NULL DEFAULT 0,
   not_before INTEGER,
@@ -1916,6 +1916,7 @@ function persistThreadHistorySnapshot(
 }
 
 function ensureJobSchemaMigrations(db: Database): void {
+  db.exec(TASK_MODEL_SCHEMA)
   db.transaction(() => {
     const schema = db.query<{sql:string},[]>("SELECT sql FROM sqlite_master WHERE name='fleet_queries'").get()!.sql
     if (!schema.includes("'security-audit'")) {
@@ -2243,6 +2244,15 @@ function ensureJobSchemaMigrations(db: Database): void {
     )
   })
   migratePublicationContinuationArchives.immediate()
+  const interjectionColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_interjections)').all()
+  if (!interjectionColumns.some(column => column.name === 'answer_retry_count')) {
+    try {
+      db.exec('ALTER TABLE job_interjections ADD COLUMN answer_retry_count INTEGER NOT NULL DEFAULT 0')
+    } catch (error) {
+      const columns = db.query<{ name: string }, []>('PRAGMA table_info(job_interjections)').all()
+      if (!columns.some(column => column.name === 'answer_retry_count')) throw error
+    }
+  }
   const controlColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_controls)').all()
   for (const [name, definition] of [
     ['input_revision', 'INTEGER NOT NULL DEFAULT 1'],
@@ -2338,6 +2348,7 @@ function ensureJobSchemaMigrations(db: Database): void {
     }
   }
   for (const [name, definition] of [
+    ['model_request_text', 'TEXT'],
     ['expected_control_job_id', 'TEXT'],
     ['expected_control_epoch', 'INTEGER'],
     ['downloaded_files_json', "TEXT NOT NULL DEFAULT '[]'"],
@@ -2840,6 +2851,7 @@ function mapInboundDeliveryRow(row: InboundDeliveryRow): InboundDeliveryRecord {
     expectedControlEpoch: row.expected_control_epoch,
     downloadedFiles: parseInboundDownloadedFiles(row.downloaded_files_json),
     initialContextState: row.initial_context_state,
+    ...(row.model_request_text !== null ? { modelRequestText: row.model_request_text } : {}),
   }
 }
 
@@ -3102,6 +3114,7 @@ type JobInterjectionRow = {
   answer_thread_id: string | null
   answer_turn_id: string | null
   disposition: JobInterjectionDisposition | null
+  answer_retry_count: number
   answer_payload: string | null
   notification_id: string | null
   attempts: number
@@ -5170,7 +5183,7 @@ export class JobStore {
       || Number(messageId) <= Number(threadTs)) {
       throw new Error('thread intent timestamps are invalid')
     }
-    if (!/^[UW][A-Z0-9]+$/.test(userId)) throw new Error('thread intent user is invalid')
+    if (!/^[UWB][A-Z0-9]+$/.test(userId)) throw new Error('thread intent user is invalid')
     if (!Number.isSafeInteger(input.promptVersion) || input.promptVersion < 1) {
       throw new Error('thread intent prompt version is invalid')
     }
@@ -5580,6 +5593,8 @@ export class JobStore {
         return { outcome: 'duplicate' as const, repoPath, initialContextRequired: false }
       }
 
+      if (!this.hasDurableEvent(idempotencyKey)) assertSlackProjectAdmission(repoPath, messageId)
+
       const pendingBootstrap = !existingThread
         ? this.db.query<{ present: number }, [string, string]>(
             `SELECT 1 AS present FROM inbound_deliveries
@@ -5704,6 +5719,12 @@ export class JobStore {
           )
           return 'authority-closed' as const
         }
+      }
+
+      if (!this.hasDurableEvent(idempotencyKey)) {
+        assertSlackProjectAdmission(input.repoPath, messageId, {
+          allowDisconnectedStop: Boolean(input.isInterrupt && boundJobId !== null),
+        })
       }
 
       const inserted = this.db.run(
@@ -6376,7 +6397,7 @@ export class JobStore {
          SET idempotency_key = ?, message_id = ?, user_id = ?, text = ?,
              file_ids_json = ?, write_enabled = ?, is_interrupt = ?,
              downloaded_files_json = '[]', not_before = NULL, last_error = NULL,
-             initial_context_state = ?
+             initial_context_state = ?, model_request_text = ?
          WHERE idempotency_key = ? AND status = 'processing'
            AND initial_context_state = 'pending'`,
         [
@@ -6388,6 +6409,7 @@ export class JobStore {
           canonical.writeEnabled ? 1 : 0,
           canonical.isInterrupt ? 1 : 0,
           input.mode === 'context' ? 'hydrated' : 'none',
+          canonical.text,
           key,
         ],
       )
@@ -8104,6 +8126,43 @@ export class JobStore {
     }
   }
 
+  retryInterjectionAnswer(options: {
+    interjectionId: string
+    jobId: string
+    epoch: number
+    logicalNonce: string
+    threadId: string
+    turnId: string
+  }): number | 'cancelled' {
+    const retry = this.db.transaction(() => {
+      const job = this.db.query<{ cancel_requested_at: number | null }, [string, number, string, string, string]>(
+        `SELECT cancel_requested_at FROM jobs WHERE id = ? AND control_epoch = ?
+         AND status = 'running' AND runtime = 'codex' AND executor_nonce = ?
+         AND active_thread_id = ? AND active_turn_id = ?`,
+      ).get(options.jobId, options.epoch, options.logicalNonce, options.threadId, options.turnId)
+      if (!job) throw new Error('interjection answer retry job binding changed')
+      if (job.cancel_requested_at !== null) return 'cancelled' as const
+      const row = this.db.query<JobInterjectionRow, [string, string, number, string, string, string]>(
+        `SELECT * FROM job_interjections WHERE id = ? AND job_id = ? AND control_epoch = ?
+         AND status = 'answering' AND answer_logical_nonce = ? AND answer_thread_id = ?
+         AND answer_turn_id = ? AND answer_payload IS NULL AND notification_id IS NULL`,
+      ).get(options.interjectionId, options.jobId, options.epoch, options.logicalNonce,
+        options.threadId, options.turnId)
+      if (!row) throw new Error('interjection answer retry receipt changed')
+      this.db.run(
+        `UPDATE job_interjections SET status = CASE WHEN paused_at IS NULL THEN 'ready' ELSE 'paused' END,
+         answer_retry_count = answer_retry_count + 1,
+         last_error = 'completed answer format was invalid; retry only the read-only answer'
+         WHERE id = ?`, [options.interjectionId],
+      )
+      // Keep the previous answer receipt as evidence until preparation of the
+      // next generation. Release only the exact, observed terminal binding.
+      this.db.run(`UPDATE jobs SET active_turn_id = NULL WHERE id = ?`, [options.jobId])
+      return row.answer_retry_count + 1
+    })
+    return retrySqlite(() => retry.immediate())
+  }
+
   prepareInterjectionAnswer(options: {
     interjectionId: string
     jobId: string
@@ -8111,7 +8170,7 @@ export class JobStore {
     logicalNonce: string
     threadId: string
   }): string | 'cancelled' | 'input-changed' {
-    const clientUserMessageId = `${requireText(options.interjectionId, 'interjectionId')}:answer`
+    let clientUserMessageId = `${requireText(options.interjectionId, 'interjectionId')}:answer`
     const prepare = this.db.transaction(() => {
       const job = this.db.query<{
         input_revision: number
@@ -8145,6 +8204,8 @@ export class JobStore {
         throw new Error(`interjection is not ready for an answer: ${options.interjectionId}`)
       }
       if (row.input_revision !== job.input_revision) return 'input-changed' as const
+      clientUserMessageId = `${options.interjectionId}:answer`
+        + (row.answer_retry_count > 0 ? `:repair:${row.answer_retry_count}` : '')
       const updated = this.db.run(
         `UPDATE job_interjections SET status = 'answer-prepared',
            answer_logical_nonce = ?, answer_thread_id = ?, answer_prepared_at = ?,
@@ -8796,6 +8857,7 @@ export class JobStore {
         'SELECT * FROM jobs WHERE idempotency_key = ?',
       ).get(idempotencyKey)
       if (!row) throw new Error('failed to read enqueued job')
+      this.db.run('INSERT OR IGNORE INTO task_model_sources VALUES (?,?)', [row.id,input.modelRequestText ?? task])
 
       const position = this.db.query<{ position: number }, [number]>(
         `SELECT COUNT(*) AS position
@@ -8882,6 +8944,8 @@ export class JobStore {
     return row ? mapRow(row) : null
   }
 
+  taskModels(): TaskModelSelections { return new TaskModelSelections(this.db) }
+
   previousSlackDelivery(id: string): JobRecord['previousSlackDelivery'] {
     const prior = this.db.query<{ id: string; seq: number }, [string]>(
       `SELECT prior.id, prior.seq FROM jobs current JOIN jobs prior
@@ -8917,13 +8981,13 @@ export class JobStore {
     const messages = this.db.query<{ payload: string }, [string]>(
       'SELECT payload FROM cloud_handoff_context WHERE job_id=? ORDER BY created_at,rowid',
     ).all(id).map(row => row.payload).join('\n\n')
-    return redactCredentialMaterial(`${prior}\n\nCurrent task events:\n${events.map(event => `[${event.kind}] ${event.text}`).join('\n\n')}\n\nVisible Codex output (including messages not posted to Slack):\n${messages}`, '[credential removed]')
+    return `${prior}\n\nCurrent task events:\n${events.map(event => `[${event.kind}] ${event.text}`).join('\n\n')}\n\nVisible Codex output (including messages not posted to Slack):\n${messages}`
   }
 
   recordCloudContext(id: string, sourceKey: string, text: string): void {
     if (!this.cloudHandoff(id)) return
     this.db.run('INSERT OR IGNORE INTO cloud_handoff_context(job_id,source_key,payload,created_at) VALUES(?,?,?,?)',
-      [id, sourceKey, redactCredentialMaterial(text, '[credential removed]'), Date.now()])
+      [id, sourceKey, text, Date.now()])
   }
 
   pendingCloudSaves(): JobRecord[] {
@@ -8993,6 +9057,7 @@ export class JobStore {
   }
 
   stageCloudControl(input: CloudControl): void {
+    if (!this.hasDurableEvent(`${input.channel}:${input.message}`)) assertSlackProjectAdmission(input.project, input.message)
     this.db.run(`INSERT OR IGNORE INTO cloud_handoff_controls(event_id,payload,created_at) VALUES(?,?,?)`,
       [`${input.channel}:${input.message}`, JSON.stringify(input), Date.now()])
   }
@@ -9034,9 +9099,10 @@ export class JobStore {
       chatId: job.chatId, threadTs: job.threadTs, kind: 'rate-limited', payload: CLOUD_SAVE_FAILED_MESSAGE, createdAt: Date.now() })
   }
 
-  enqueueCloudImport(input: EnqueueInput, cloudId: string, epoch: number, receipt: string): ReturnType<JobStore['enqueue']> {
+  enqueueCloudImport(input: EnqueueInput, cloudId: string, epoch: number, receipt: string, primaryModel?: string): ReturnType<JobStore['enqueue']> {
     const commit = this.db.transaction(() => {
       const result = this.enqueue(input)
+      if (primaryModel) this.taskModels().seedHandoff(result.job.id, input.task, primaryModel)
       this.bindCloudHandoff(result.job.id, cloudId, epoch, receipt)
       this.db.run(`UPDATE cloud_handoff_jobs SET state='transferred',updated_at=?
         WHERE cloud_id=? AND job_id<>? AND state IN ('saving','waiting')`, [Date.now(), cloudId, result.job.id])
@@ -9190,7 +9256,7 @@ export class JobStore {
     ).get(project ?? null, project ?? null))
     // Public Slack milestones only. Credentials and local paths are not a fleet summary.
     const text = summary?.payload.replace(/^💬\s*/, '').trim() ?? null
-    const safe = text && !containsCredentialMaterial(text) ? fleetSummaryWithoutPaths(text) : null
+    const safe = text ? fleetSummaryWithoutPaths(text) : null
     return { ...counts, limited, approval, occupiedElsewhere: allRunning > counts.running || allQueued > counts.queued, deferred: Boolean(current?.not_before && current.not_before > now),
       lastAcceptedAt: last, summary: limited ? null : safe, summaryAt: !limited && safe ? summary!.created_at : null }
   }
@@ -11376,12 +11442,11 @@ export class JobStore {
     const attempt = Math.floor(attemptInput)
     const inputRevision = Math.floor(inputRevisionInput)
     const kind = kindInput
-    const payload = normalizePublicGuardText(payloadInput).trim()
+    const payload = payloadInput.trim()
     if (!Number.isSafeInteger(attempt) || attempt < 1
       || !Number.isSafeInteger(inputRevision) || inputRevision < 1
       || !['PLAN', 'VERIFY', 'BLOCKED'].includes(kind)
       || !payload.startsWith('💬 ') || payload.length > 700
-      || containsCredentialMaterial(payload)
       || !Number.isSafeInteger(now) || now <= 0) {
       throw new Error('milestone commentary notification is invalid')
     }
@@ -11428,11 +11493,10 @@ export class JobStore {
     const jobId = requireText(jobIdInput, 'jobId')
     const attempt = Math.floor(attemptInput)
     const sourceKey = requireText(sourceKeyInput, 'commentary source key')
-    const payload = normalizePublicGuardText(payloadInput).trim()
+    const payload = payloadInput.trim()
     if (!Number.isSafeInteger(attempt) || attempt < 1
       || !/^[0-9a-f]{64}$/.test(sourceKey)
       || !payload.startsWith('💬 ') || payload.length > 700
-      || containsCredentialMaterial(payload)
       || !Number.isSafeInteger(now) || now <= 0) {
       throw new Error('commentary notification is invalid')
     }
@@ -13838,6 +13902,9 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  for (const [reason, message] of Object.entries(MODEL_SELECTION_MESSAGES)) {
+    if (error.includes(`ZERO_MODEL_SELECTION:${reason}`)) return message
+  }
   if ((Object.values(CLOUD_PREPARATION_FAILURE_MESSAGES) as string[]).includes(error)) return error
   if (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE) {
     return FORCED_SERVICE_STOP_FAILURE_MESSAGE
@@ -15379,8 +15446,6 @@ export function splitSlackChunks(text: string): string[] {
 
 const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024
 const ARTIFACT_READ_CHUNK_BYTES = 64 * 1024
-const ARTIFACT_CREDENTIAL_SCAN_CHUNK_BYTES = 256 * 1024
-const ARTIFACT_CREDENTIAL_SCAN_OVERLAP_BYTES = 16 * 1024
 
 function safeJobId(jobId: string): string {
   return jobId.replace(/[^A-Za-z0-9._-]/g, '_')
@@ -15570,31 +15635,6 @@ export function extractArtifactPaths(result: string): { text: string; files: str
 // Kept only to suppress legacy queued refusal messages; never classify new answers.
 const SELF_IMPLEMENTATION_NON_DISCLOSURE = '内部構成は公開していません。'
 
-/**
- * Path redaction is a safety boundary, but its implementation marker is not
- * useful conversation text. Keep the redaction while presenting it as a
- * semantic placeholder, including for legacy monitor text that used ASCII
- * parentheses and can re-enter a resumed thread.
- */
-export function naturalizeSlackRedactions(value: string): string {
-  const pathMarker = /[（(]\s*内部パスを省略\s*[）)]/g
-  return value
-    .replace(pathMarker, '対象箇所')
-    .replace(/対象箇所(?:\s*[、,・／/]\s*対象箇所)+/g, '対象箇所')
-}
-
-export function encodeSlackGuardNonce(uuid: string): string {
-  const entropy = uuid.replaceAll('-', '').toLowerCase()
-  if (!/^[0-9a-f]{32}$/.test(entropy)) {
-    throw new Error('Slack guard placeholder entropy is invalid')
-  }
-  // Keep all 128 random bits while separating every hex nibble with a
-  // non-hex character.  This prevents the nonce itself from looking like a
-  // runtime ID or accidentally spelling a protected implementation name
-  // (for example the old alphabet could produce "gpt").
-  return [...entropy].map(character => `z${character}`).join('')
-}
-
 export function sanitizeExecutionTextForSlack(
   job: JobRecord,
   sessionId: string,
@@ -15603,16 +15643,6 @@ export function sanitizeExecutionTextForSlack(
   additionalSensitiveValues: readonly string[] = [],
   purpose: 'result' | 'progress' = 'result',
 ): string {
-  const normalizeGuardText = normalizePublicGuardText
-  const slackAuthoredTask = (task: string, attachments: readonly string[]): string => {
-    if (attachments.length === 0) return task
-    // Compatibility for rows created before task/attachment authority was
-    // separated. Strip exactly the suffix generated by the host, once; an
-    // identical block genuinely typed by the user remains before this copy.
-    const legacySuffix = `\n添付ファイル（ローカル絶対パス）:\n${attachments
-      .map(path => `- ${path}`).join('\n')}`
-    return task.endsWith(legacySuffix) ? task.slice(0, -legacySuffix.length) : task
-  }
   const visible: string[] = []
   let insideHostBlock = false
   for (const line of text.split(/\r?\n/)) {
@@ -15632,496 +15662,10 @@ export function sanitizeExecutionTextForSlack(
     visible.push(line)
   }
 
-  let sanitized = normalizeGuardText(visible.join('\n'))
-  let inputEntries = [{
-    task: job.task,
-    attachments: job.attachments,
-    messageId: job.messageId,
-    userId: job.userId,
-  }]
-  try {
-    inputEntries = readAdvisorInputSnapshot(dir, job.id).entries.map(entry => ({
-      task: entry.task,
-      attachments: entry.attachments,
-      messageId: entry.messageId,
-      userId: entry.userId,
-    }))
-  } catch {}
-  const userText = normalizeGuardText(inputEntries
-    .map(entry => slackAuthoredTask(entry.task, entry.attachments))
-    .join('\n'))
-  const sensitiveValues = [
-    artifactDirForJob(dir, job.id),
-    sealedArtifactDirForJob(dir, job.id),
-    ...job.attachments,
-    ...(job.threadAttachments ?? []).map(attachment => attachment.path),
-    ...(job.threadAttachments ?? []).map(attachment => attachment.sourceMessageId),
-    ...(job.threadAttachments ?? []).map(attachment => attachment.fileId),
-    ...inputEntries.flatMap(entry => entry.attachments),
-    ...inputEntries.map(entry => entry.messageId),
-    ...inputEntries.map(entry => entry.userId),
-    job.repoPath,
-    dir,
-    sessionId,
-    job.id,
-    `${job.chatId} / ${job.threadTs}`,
-    job.messageId,
-    job.threadTs,
-    job.chatId,
-    job.userId,
-    job.executorNonce,
-    ...additionalSensitiveValues,
-  ].filter((value): value is string => typeof value === 'string' && value.length >= 4)
-    .map(normalizeGuardText)
-    .sort((left, right) => right.length - left.length)
-  for (const value of new Set(sensitiveValues)) {
-    sanitized = sanitized.split(value).join('（内部情報を省略）')
-  }
-
-  // A commit SHA is useful completion evidence, but a bare hex token is also
-  // indistinguishable from Zero's runtime IDs. Preserve it only when the
-  // answer labels it as a commit and Git confirms that it names a commit in
-  // the repository handled by this job.
-  const gitBinary = '/usr/bin/git'
-  let commitVerificationRoots: string[] = []
-  try {
-    const layout = resolveAdvisorProjectLayout(job.repoPath)
-    commitVerificationRoots = layout.gitRoots.length > 0
-      ? layout.gitRoots
-      : [job.repoPath]
-  } catch {}
-  const verifiedGitCommits = new Map<string, boolean>()
-  const isVerifiedGitCommit = (value: string): boolean => {
-    const normalized = value.toLowerCase()
-    const cached = verifiedGitCommits.get(normalized)
-    if (cached != null) return cached
-    let verified = false
-    if (/^[0-9a-f]{7,64}$/i.test(value)) {
-      let matches = 0
-      for (const root of commitVerificationRoots) try {
-        const result = Bun.spawnSync([
-          gitBinary, '-C', root, 'cat-file', '-e', `${value}^{commit}`,
-        ], {
-          env: {
-            PATH: '/usr/bin:/bin',
-            HOME: '/',
-            GIT_CONFIG_GLOBAL: '/dev/null',
-            GIT_CONFIG_NOSYSTEM: '1',
-            GIT_TERMINAL_PROMPT: '0',
-            GIT_ASKPASS: '/usr/bin/false',
-            GIT_OPTIONAL_LOCKS: '0',
-            LC_ALL: 'C',
-            LANG: 'C',
-          },
-          stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
-        })
-        if (result.exitCode === 0) matches += 1
-      } catch {}
-      // A short SHA that names commits in multiple independent repositories
-      // is ambiguous in a project-wide Slack answer. Full object IDs remain
-      // useful even when identical content happens to exist in two members.
-      verified = matches === 1 || (matches > 0 && value.length >= 40)
-    }
-    verifiedGitCommits.set(normalized, verified)
-    return verified
-  }
-  const protectedGitCommits: string[] = []
-  const gitCommitPlaceholderNonce = encodeSlackGuardNonce(randomUUID())
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9_])((?:commit(?:[ \t]*(?:id|sha|hash))?|コミット(?:[ \t]*(?:ID|SHA|ハッシュ))?)[ \t]*[:：#]?[ \t]*`?)([0-9a-f]{7,64})(`?)(?![0-9a-f])/gi,
-    (match, prefix: string, value: string, suffix: string) => {
-      if (!isVerifiedGitCommit(value)) return match
-      const index = protectedGitCommits.push(value) - 1
-      return `${prefix}\uE004${gitCommitPlaceholderNonce}_${index}\uE005${suffix}`
-    },
-  )
-
-  // Protect path and runtime-identity shapes independently of product names.
-  const redactPathUnlessUserAuthored = (value: string): string => (
-    userText.includes(normalizeGuardText(value)) ? value : '（内部パスを省略）'
-  )
-  const pathCredential = /(?:^|[\\/])(?:\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.netrc|\.git-credentials|id_(?:rsa|dsa|ecdsa|ed25519)|credentials)(?:[\\/]|$)/i
-  const conventionalLocalRoot = /(?:^|[\\/])(?:Users|home|private|tmp|var|etc|opt|usr|srv|System|Library|Applications|Volumes)(?:[\\/]|$)/i
-  const homePathPrefix = /^(?:~|\$HOME|\$\{HOME\})(?:[\\/]|$)/i
-  const absolutePlatformPath = /^(?:\\\\|[A-Za-z]:[\\/])/i
-  const driveRelativePlatformPath = /^[A-Za-z]:[^\s`'"<>。、！？!?;,\)\]}]+/i
-  const inspectPathSpelling = (value: string): { decoded: string; stable: boolean } => {
-    const mapConfusableSeparators = (input: string): string => input
-      .replace(/[\u2044\u2215\u2571\u27CB\u29F8]/g, '/')
-      .replace(/[\u2216\u2572\u27CD\u29F5\u29F9]/g, '\\')
-      .replace(/[\u2236\uA789]/g, ':')
-    const decodeOnce = (input: string): string => input.replace(
-      /(?:%[0-9a-f]{2})+/gi,
-      run => {
-        try {
-          return decodeURIComponent(run)
-        } catch {
-          return run.replace(/%([0-9a-f]{2})/gi, (_match, hex: string) => (
-            String.fromCharCode(Number.parseInt(hex, 16))
-          ))
-        }
-      },
-    )
-    let decoded = mapConfusableSeparators(normalizeGuardText(value))
-    for (let round = 0; round < 4; round += 1) {
-      const next = mapConfusableSeparators(decodeOnce(decoded))
-      if (next === decoded) return { decoded, stable: true }
-      decoded = next
-    }
-    return { decoded, stable: decodeOnce(decoded) === decoded }
-  }
-  const containsDecodedInternalIdentity = (value: string): boolean => {
-    const decoded = normalizeGuardText(value)
-    return sensitiveValues.some(sensitive => decoded.includes(sensitive))
-      || /\bw[A-Za-z0-9_-]+:[pt][A-Za-z0-9_-]+\b|\bterm_[A-Za-z0-9_-]+\b/.test(decoded)
-      || /(?<![A-Za-z0-9_])"?(?:pid|process[ _-]?id|state[ _-]?change[ _-]?seq|duration[ _-]?ms)"?(?:\s*[:=]\s*|\s+(?:is\s+)?)"?\d+"?(?![A-Za-z0-9_])/i.test(decoded)
-      || /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/i.test(decoded)
-      || /\b[0-9a-f]{32,64}\b/i.test(decoded)
-      || /\b[UCBWD][A-Z0-9]{8,}\b/.test(decoded)
-  }
-  const normalizedUrlPath = (value: string): string => {
-    const inspection = inspectPathSpelling(value)
-    return inspection.stable ? inspection.decoded.replace(/^\/+/, '/') : ''
-  }
-  const hostPathSegments = [
-    'Users', 'home', 'private', 'tmp', 'var', 'etc', 'opt', 'usr', 'srv',
-    'System', 'Library', 'Applications', 'Volumes', 'bin', 'sbin', 'lib',
-    'libexec', 'local', 'share', 'homebrew', 'Application Support', 'Caches',
-    'Preferences', 'Logs', 'LaunchAgents', 'LaunchDaemons', 'Desktop',
-    'Documents', 'Downloads', 'Projects',
-  ] as const
-  const hostPathSegmentSkeletons = new Map(hostPathSegments.map(segment => [
-    normalizeImplementationGuardText(segment),
-    segment,
-  ]))
-  const canonicalHostPath = (value: string): string => normalizedUrlPath(value)
-    .split('/')
-    .map(segment => hostPathSegmentSkeletons.get(
-      normalizeImplementationGuardText(segment),
-    ) ?? segment)
-    .join('/')
-  const sensitiveHostHomePrefixes = new Set(sensitiveValues.flatMap(value => {
-    const match = canonicalHostPath(value).match(/^\/(?:Users|home)\/[^/]+/)
-    return match ? [match[0]] : []
-  }))
-  const sensitiveHostHomePrefixSkeletons = new Set(
-    [...sensitiveHostHomePrefixes].map(normalizeImplementationGuardText),
-  )
-  const startsWithConventionalHostRoot = (value: string): boolean => (
-    /^\/(?:Users|home|private|tmp|var|etc|opt|usr|srv|System|Library|Applications|Volumes)(?:\/|$)/.test(
-      canonicalHostPath(value),
-    )
-  )
-  const resemblesConventionalHostPath = (value: string): boolean => {
-    if (value.length === 0) return false
-    const inspection = inspectPathSpelling(value)
-    if (!inspection.stable) return true
-    const path = canonicalHostPath(value)
-    const candidateHomePrefix = path.match(/^\/(?:Users|home)\/[^/]+/)?.[0]
-    const fileLikeLeaf = /\.[A-Za-z0-9][A-Za-z0-9._-]{0,15}$/.test(path)
-    return [...sensitiveHostHomePrefixes].some(prefix => (
-      path === prefix || path.startsWith(`${prefix}/`)
-    ))
-      || (candidateHomePrefix != null
-        && sensitiveHostHomePrefixSkeletons.has(
-          normalizeImplementationGuardText(candidateHomePrefix),
-        ))
-      || /^\/private\/(?:tmp|var)(?:\/|$)/.test(path)
-      || /^\/System\/(?:Volumes|Library)(?:\/|$)/.test(path)
-      || /^\/etc(?:\/|$)/.test(path)
-      || /^\/usr\/(?:bin|sbin|lib|libexec|local|share)(?:\/|$)/.test(path)
-      || /^\/opt\/homebrew(?:\/|$)/.test(path)
-      || /^\/Applications\/[^/]+\.app(?:\/|$)/.test(path)
-      || /^\/Library\/(?:Application Support|Caches|Preferences|Logs|LaunchAgents|LaunchDaemons)(?:\/|$)/.test(path)
-      || /^\/Volumes\/[^/]+(?:\/|$)/.test(path)
-      || /^\/(?:Users|home)\/[^/]+\/(?:Desktop|Documents|Downloads|Library|Applications|Projects|\.config|\.ssh|\.aws|\.gnupg|\.kube|\.docker)(?:\/|$)/.test(path)
-      || (/^\/(?:Users|home|tmp|var|srv)(?:\/|$)/.test(path) && fileLikeLeaf)
-  }
-  const redactPath = (value: string, always = false): string => {
-    const normalized = normalizeGuardText(value)
-    return always || pathCredential.test(normalized)
-      ? '（内部パスを省略）'
-      : redactPathUnlessUserAuthored(value)
-  }
-  // Home-relative credential/config paths are unsafe even when the sender
-  // pasted them. Match through the enclosing clause so a path with spaces or
-  // Unicode cannot leave a revealing suffix behind.
-  sanitized = sanitized.replace(
-    /\$\{(?:[A-Za-z0-9_]|%[0-9a-f]{2}){1,64}(?:\}|(?:%[0-9a-f]{2})+)[^\s`'"<>。、！？!?;,\)\]}]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      return !inspection.stable || homePathPrefix.test(inspection.decoded)
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  sanitized = sanitized.replace(
-    /(?:~|\$HOME|\$\{HOME\})(?:[\\/\u2044\u2215\u2216\u2571\u2572\u27CB\u27CD\u29F5\u29F8\u29F9]|%[0-9a-f]{2})+[^\r\n`'"<>。、！？!?;,\)\]}]*/gim,
-    value => redactPath(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(?:~[\\/])?\.(?:codex|claude|zerokun|ssh|aws|gnupg|kube|docker)(?:[\\/][^\r\n`'"<>。、！？!?;,\)\]}]*)?/gim,
-    value => redactPath(value, pathCredential.test(value)),
-  )
-  // Inspect every URL-like scheme as one unit. Decode separators only in the
-  // detector, never in the visible text. Internal/local schemes and URLs that
-  // embed a local root or credential path are removed as a whole, closing
-  // host, triple-slash and percent-encoded variants without leaking suffixes.
-  const protectedMimeTypes: string[] = []
-  const mimePlaceholderNonce = randomUUID().replaceAll('-', '')
-  sanitized = sanitized.replace(
-    /\b(?:application|audio|font|image|message|model|multipart|text|video)\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,127}(?![A-Za-z0-9!#$&^_.+\\/%-])/gi,
-    value => {
-      const index = protectedMimeTypes.push(value) - 1
-      return `\uE006${mimePlaceholderNonce}_${index}\uE007`
-    },
-  )
-  const protectedPublicUrls: string[] = []
-  const urlPlaceholderNonce = randomUUID().replaceAll('-', '')
-  const isLocalHostname = (input: string): boolean => {
-    const hostname = input.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase()
-    return hostname === 'localhost' || hostname.endsWith('.localhost')
-      || hostname === '0.0.0.0' || hostname === '::1' || /^127(?:\.|$)/.test(hostname)
-      || hostname.endsWith('.local') || hostname.endsWith('.invalid')
-      || hostname.endsWith('.test') || hostname.endsWith('.internal')
-      || hostname.endsWith('.lan') || hostname.endsWith('.home')
-      || hostname.endsWith('.home.arpa')
-      || (!hostname.includes('.') && !hostname.includes(':'))
-      || /^10\./.test(hostname) || /^192\.168\./.test(hostname)
-      || /^172\.(?:1[6-9]|2\d|3[01])\./.test(hostname)
-      || /^169\.254\./.test(hostname)
-      || /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(hostname)
-      || /^198\.(?:18|19)\./.test(hostname)
-      || /^(?:fc|fd|fe[89ab])[0-9a-f]*:/i.test(hostname)
-      || hostname === '::' || hostname.startsWith('::ffff:')
-  }
-  const isLocalEndpointSpelling = (input: string): boolean => {
-    const inspection = inspectPathSpelling(input)
-    if (!inspection.stable) return true
-    const decoded = inspection.decoded
-    const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(decoded)
-    const hasEndpoint = /^(?:\[[0-9a-f:.%]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)(?::\d{1,5})?(?:[/?#])[^\s]*$/i.test(decoded)
-    if (!hasScheme && !hasEndpoint) return false
-    try {
-      const parsed = new URL(hasScheme ? decoded : `http://${decoded}`)
-      return isLocalHostname(parsed.hostname)
-    } catch {
-      return false
-    }
-  }
-  const protectPublicUrl = (value: string, _encoded = false): string => {
-    const inspection = inspectPathSpelling(value)
-    let parsed: URL
-    try {
-      parsed = new URL(inspection.decoded.startsWith('//')
-        ? `https:${inspection.decoded}`
-        : inspection.decoded)
-    } catch {
-      return redactPath(value, true)
-    }
-    const protocol = parsed.protocol.toLowerCase()
-    const publicProtocol = protocol === 'https:' || protocol === 'http:'
-    const localHost = isLocalHostname(parsed.hostname)
-    const payloadInspection = inspectPathSpelling(
-      `${parsed.pathname}${parsed.search}${parsed.hash}`,
-    )
-    const queryInspection = inspectPathSpelling(`${parsed.search}${parsed.hash}`)
-    const userAuthoredPublicUrl = userText.includes(normalizeGuardText(value))
-    const unsafeHostPathParameter = (parameter: string): boolean => {
-      const parameterInspection = inspectPathSpelling(parameter)
-      return !parameterInspection.stable
-        || startsWithConventionalHostRoot(parameterInspection.decoded)
-        || /^(?:~|\$HOME|\$\{HOME\})(?:[\\/]|$)/i.test(parameterInspection.decoded)
-        || /^(?:[A-Za-z]:[\\/]|\\\\)/.test(parameterInspection.decoded)
-        || pathCredential.test(parameterInspection.decoded)
-    }
-    const rawHash = parsed.hash.replace(/^#/, '')
-    const hashUsesParameters = rawHash.includes('=') || rawHash.includes('&')
-    const searchParts = [...parsed.searchParams.entries()].flat()
-    const hashParts = hashUsesParameters
-      ? [...new URLSearchParams(rawHash).entries()].flat()
-      : []
-    const modelOnlyHostPathParameter = !userAuthoredPublicUrl
-      && (searchParts.some(unsafeHostPathParameter)
-        || hashParts.some(unsafeHostPathParameter)
-        || (!hashUsesParameters && resemblesConventionalHostPath(rawHash)))
-    const modelOnlyHostPathname = !userAuthoredPublicUrl
-      && resemblesConventionalHostPath(parsed.pathname)
-    const localPathInPayload = pathCredential.test(payloadInspection.decoded)
-      || /(?:^|[?&#=])(?:~|\$HOME|\$\{HOME\})(?:[\\/]|$)/i.test(payloadInspection.decoded)
-      || /(?:^|[?&#=])(?:[A-Za-z]:[\\/]|\\\\)/.test(payloadInspection.decoded)
-      || modelOnlyHostPathParameter || modelOnlyHostPathname
-    const modelOnlyEncodedInternalIdentity = !userAuthoredPublicUrl
-      && /%[0-9a-f]{2}/i.test(value)
-      && containsDecodedInternalIdentity(inspection.decoded)
-    const unsafe = !inspection.stable || !publicProtocol || localHost
-      || parsed.username.length > 0 || parsed.password.length > 0
-      || pathCredential.test(inspection.decoded)
-      || containsCredentialMaterial(inspection.decoded)
-      || !payloadInspection.stable || !queryInspection.stable || localPathInPayload
-      || modelOnlyEncodedInternalIdentity
-    if (unsafe) return redactPath(value, true)
-    const index = protectedPublicUrls.push(value) - 1
-    return `\uE000${urlPlaceholderNonce}_${index}\uE001`
-  }
-  sanitized = sanitized.replace(
-    /[a-z][a-z0-9+.-]*:\/\/\[[0-9a-f:.%]+\](?::\d{1,5})?(?:[\/?#][^\s`'"<>。、！？!;,\)\]}]*)?/gim,
-    value => protectPublicUrl(value),
-  )
-  sanitized = sanitized.replace(
-    /[a-z][a-z0-9+.-]*:\/\/[^\s`'"<>。、！？!;,\)\]}]*/gim,
-    value => protectPublicUrl(value),
-  )
-  sanitized = sanitized.replace(
-    /[a-z][a-z0-9+.-]*:%[^\s`'"<>。、！？!;,\)\]}]*/gim,
-    value => protectPublicUrl(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(^|[\s(\[])(\/\/(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d{1,5})?(?:\/[^\s`'"<>。、！？!;,\)\]}]*)?)/gim,
-    (_value, prefix: string, url: string) => `${prefix}${protectPublicUrl(url)}`,
-  )
-  // Public URLs are placeholders at this point, so inspect every remaining
-  // percent-mixed token as a single unit. This closes obfuscated product names
-  // and runtime IDs without decoding or rewriting harmless public prose.
-  sanitized = sanitized.replace(
-    /[^\s`'"<>。、！？!?;,\(\)\[\]\{\}]*%[0-9a-f]{2}[^\s`'"<>。、！？!?;,\(\)\[\]\{\}]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      if (!inspection.stable) return '（内部情報を省略）'
-      if (userText.includes(normalizeGuardText(value))) return value
-      return containsDecodedInternalIdentity(inspection.decoded)
-        ? '（内部情報を省略）'
-        : value
-    },
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9_.-])(?:\[[0-9a-f:.%]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)(?:(?:[:\u2236\uA789]\d{1,5})(?:[\/\u2044\u2215\u2571\u27CB\u29F8][^\s`'"<>。、！？!?;,\)\]}]*)?|[\/\u2044\u2215\u2571\u27CB\u29F8][^\s`'"<>。、！？!?;,\)\]}]+)(?![A-Za-z0-9_.-])/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      let parsed: URL
-      try {
-        parsed = new URL(`http://${inspection.decoded}`)
-      } catch {
-        return value
-      }
-      const userAuthoredPublicUrl = userText.includes(normalizeGuardText(value))
-      return !inspection.stable || isLocalHostname(parsed.hostname)
-        || (!userAuthoredPublicUrl && resemblesConventionalHostPath(parsed.pathname))
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  // Mixed literal/percent-encoded HOME spellings must be decoded as one unit;
-  // starting at the first percent sequence would otherwise omit the `$H` prefix.
-  sanitized = sanitized.replace(
-    /\$(?:[A-Za-z]*%[0-9a-f]{2}|%[0-9a-f]{2})[^\s`'"<>。、！？!?;,\)\]}]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      return !inspection.stable || homePathPrefix.test(inspection.decoded)
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  // Inspect a percent-mixed URL/endpoint as one token, including the literal
-  // host prefix. Starting at the first percent byte would miss private hosts
-  // such as `10.0.%30.5` and leave a misleading prefix visible.
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9_.-])[A-Za-z0-9[\].:%-]*%[0-9a-f]{2}[A-Za-z0-9[\].:%/?#-]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      return !inspection.stable || isLocalEndpointSpelling(inspection.decoded)
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  // Encoded absolute/home paths without a scheme must be classified as one
-  // token. Inspect a bounded number of decoding layers and redact the original
-  // spelling so no decoded suffix is exposed.
-  sanitized = sanitized.replace(
-    /(?:[A-Za-z]|\\{1,2})?%[0-9a-f]{2}[^\s`'"<>。、！？!?;,\)\]}]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      return !inspection.stable || conventionalLocalRoot.test(inspection.decoded)
-        || pathCredential.test(inspection.decoded)
-        || homePathPrefix.test(inspection.decoded)
-        || absolutePlatformPath.test(inspection.decoded)
-        || driveRelativePlatformPath.test(inspection.decoded)
-        || isLocalEndpointSpelling(inspection.decoded)
-        || inspection.decoded.startsWith('/')
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  // Absolute and network-style paths use a deliberately fail-closed tail.
-  // Spaces and non-ASCII components are indistinguishable from prose without
-  // filesystem access, so redact to the next sentence delimiter instead of
-  // exposing a partially matched suffix.
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9])\/{1,}[^\r\n`'"<>。、！？!?;,\)\]}]+/gm,
-    value => redactPath(value, pathCredential.test(value)),
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9])(?:\\\\\?\\UNC\\|\\\\\?\\)[^\r\n`'"<>。、！？!;,\)\]}]+/gm,
-    value => redactPath(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9])(?:[A-Za-z][\u2236\uA789:](?=[^\r\n`'"<>。、！？!?;,\)\]}]+)|\\\\|[\u2216\u2572\u27CD\u29F5\u29F9]{2})[^\r\n`'"<>。、！？!?;,\)\]}]+/gm,
-    value => redactPath(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9])[\u2044\u2215\u2571\u27CB\u29F8]{1,}[^\r\n`'"<>。、！？!?;,\)\]}]+/gm,
-    value => redactPath(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9\\])(?:\\\/){1,}[^\r\n`'"<>。、！？!?;,\)\]}]+/gm,
-    value => redactPath(value, pathCredential.test(value)),
-  )
-  sanitized = sanitized.replace(
-    /\bw[A-Za-z0-9_-]+:[pt][A-Za-z0-9_-]+\b|\bterm_[A-Za-z0-9_-]+\b/g,
-    value => userText.includes(value) ? value : '（内部IDを省略）',
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9_])"?(?:pid|process[ _-]?id|state[ _-]?change[ _-]?seq|duration[ _-]?ms)"?(?:\s*[:=]\s*|\s+(?:is\s+)?)"?\d+"?(?![A-Za-z0-9_])/gi,
-    value => userText.includes(value) ? value : '（内部情報を省略）',
-  )
-  protectedPublicUrls.forEach((url, index) => {
-    sanitized = sanitized.replaceAll(`\uE000${urlPlaceholderNonce}_${index}\uE001`, url)
-  })
-  protectedMimeTypes.forEach((mimeType, index) => {
-    sanitized = sanitized.replaceAll(`\uE006${mimePlaceholderNonce}_${index}\uE007`, mimeType)
-  })
-
-  // Credentials are never safe to echo into a shared Slack thread, even when
-  // the sender pasted the same value in the request. User input must not
-  // turn into a credential allowlist.
-  sanitized = redactCredentialMaterial(sanitized, '（認証情報を省略）')
-
-  const zeroMarker = /\[ZERO_/i.exec(sanitized)
-  if (zeroMarker) sanitized = sanitized.slice(0, zeroMarker.index).trimEnd()
-  sanitized = sanitized.replace(
-    /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi,
-    value => userText.includes(value) ? value : '（内部IDを省略）',
-  )
-  sanitized = sanitized.replace(
-    /\b[0-9a-f]{32,64}\b/gi,
-    value => userText.includes(value) ? value : '（内部IDを省略）',
-  )
-  sanitized = sanitized.replace(
-    /\b[UCBWD][A-Z0-9]{8,}\b/g,
-    value => userText.includes(value) ? value : '（内部IDを省略）',
-  )
-  protectedGitCommits.forEach((commit, index) => {
-    sanitized = sanitized.replaceAll(
-      `\uE004${gitCommitPlaceholderNonce}_${index}\uE005`, commit,
-    )
-  })
-  if (purpose === 'progress') {
-    sanitized = sanitized.split(/\r?\n/)
-      .filter(line => line.trim().replace(/^💬\s*/, '') !== SELF_IMPLEMENTATION_NON_DISCLOSURE)
-      .join('\n')
-  }
-  sanitized = naturalizeSlackRedactions(sanitized).trim()
-  return sanitized
+  // Host protocol records are transport metadata; ordinary answer text, URLs,
+  // identifiers and credential-shaped examples pass through unchanged.
+  return visible.filter(line => purpose !== 'progress'
+    || line.trim().replace(/^💬\s*/, '') !== SELF_IMPLEMENTATION_NON_DISCLOSURE).join('\n').trim()
 }
 
 /**
@@ -16712,43 +16256,9 @@ function readBoundedArtifact(descriptor: number, file: string): Buffer {
   return Buffer.concat(chunks, total)
 }
 
-/**
- * Lightweight internal-use guard: inspect the exact bytes that would be sent
- * for obvious credential spellings, while deliberately preserving arbitrary
- * binary formats. It does not unpack archives, decrypt content, or perform OCR.
- */
-function artifactContainsObviousCredential(data: Buffer): boolean {
-  for (let offset = 0; offset < data.byteLength; offset += ARTIFACT_CREDENTIAL_SCAN_CHUNK_BYTES) {
-    const start = Math.max(0, offset - ARTIFACT_CREDENTIAL_SCAN_OVERLAP_BYTES)
-    const end = Math.min(data.byteLength, offset + ARTIFACT_CREDENTIAL_SCAN_CHUNK_BYTES)
-    const window = data.subarray(start, end)
-    if (containsCredentialMaterial(window.toString('latin1'))
-      || containsCredentialMaterial(window.toString('utf8'))) return true
-  }
-  return false
-}
-
 function slackVisibleArtifactFilename(job: JobRecord, filename: string, dir: string): string {
-  const normalized = normalizePublicGuardText(filename)
-  const internalValues = [
-    job.id,
-    job.sessionId,
-    job.executorNonce,
-    job.chatId,
-    job.threadTs,
-    job.messageId,
-    job.userId,
-  ].filter((value): value is string => typeof value === 'string' && value.length >= 4)
-  const sanitized = sanitizeExecutionTextForSlack(
-    job,
-    job.sessionId ?? '',
-    normalized,
-    dir,
-  )
-  const unsafe = sanitized !== normalized
-    || internalValues.some(value => normalized.includes(value.normalize('NFKC')))
-    || /[\0\r\n/\\]/.test(normalized)
-    || Buffer.byteLength(normalized) > 180
+  const normalized = filename
+  const unsafe = /[\0\r\n/\\]/.test(normalized) || Buffer.byteLength(normalized) > 180
   if (!unsafe) return filename
   const extension = extname(normalized)
   const safeExtension = /^\.[A-Za-z0-9]{1,10}$/.test(extension)
@@ -16784,9 +16294,6 @@ export function readUploadableArtifact(
     const separator = encodedName.lastIndexOf('--')
     const filename = separator >= 0 ? encodedName.slice(separator + 2) : encodedName
     const data = readBoundedArtifact(descriptor, file)
-    if (artifactContainsObviousCredential(data)) {
-      throw new ArtifactPublicationBlockedError()
-    }
     return {
       path: candidate,
       filename: slackVisibleArtifactFilename(job, filename, dir),
@@ -18786,8 +18293,8 @@ async function runCli(): Promise<void> {
   let serviceControlPauseWarning = ''
   let fleetPaused = true
   const shouldPause = (): boolean => {
-    if (slackIdentityChanged() || herdrIdentityInvalid) { fleetPaused = true; return true }
-    const paused = updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
+    const paused = slackIdentityChanged() || herdrIdentityInvalid
+      || updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
     fleetPaused = paused
     if (paused) {
       try {
@@ -19030,6 +18537,7 @@ async function runCli(): Promise<void> {
             stateDir: dir,
             logDir: join(dir, 'job-logs'),
             threadHistory: store.threadHistorySnapshot(job.id, job.attempts),
+            selectModel: (requests, models, signal) => store.taskModels().resolve(job.id, requests, models, signal),
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId, executionJob.repoPath),
             onSessionReset: () => store.clearSession(job.id),
@@ -19300,6 +18808,12 @@ async function runCli(): Promise<void> {
                 requestId,
                 error,
               }),
+              retryInterjectionAnswer: ({ interjection, logicalNonce, threadId, turnId }) => (
+                store.retryInterjectionAnswer({
+                  interjectionId: interjection.id, jobId: job.id, epoch: job.controlEpoch,
+                  logicalNonce, threadId, turnId,
+                })
+              ),
               stageInterjectionAnswer: ({
                 interjection, logicalNonce, threadId, turnId, disposition, answer,
               }) => store.stageInterjectionAnswer({

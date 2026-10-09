@@ -31,7 +31,7 @@ function fixture(): string {
   temporaryDirs.push(base)
   const state = join(base, 'state')
   const project = join(base, 'project')
-  mkdirSync(state)
+  mkdirSync(state, { mode: 0o700 })
   mkdirSync(join(state, FIXTURE_PROCESS_DIR), { mode: 0o700 })
   mkdirSync(project)
   const initialized = Bun.spawnSync(['git', 'init', '-q', project], {
@@ -198,12 +198,30 @@ async function runLauncher(
     "releaseProcessLock(starterLock, starter.lease)",
     '',
   ].join('\n'), { mode: 0o700 })
+  const fakeGateway = join(state, 'fixture-gateway.ts')
+  writeFileSync(fakeGateway, [
+    `import { takeGatewayStartupLease } from ${JSON.stringify(join(import.meta.dir, 'service-control-state.ts'))}`,
+    `import { inspectProcessLock } from ${JSON.stringify(join(import.meta.dir, 'process-lock.ts'))}`,
+    `import { writeGatewayReadiness } from ${JSON.stringify(join(import.meta.dir, 'readiness.ts'))}`,
+    `import { writeFileSync } from 'fs'`,
+    `const state = ${JSON.stringify(state)}`,
+    'const hasLease = Boolean(process.env.ZEROKUN_STARTUP_LEASE)',
+    'const release = takeGatewayStartupLease(state)',
+    "if (process.env.ZEROKUN_STARTUP_LEASE !== undefined) throw new Error('lease leaked')",
+    "if (hasLease && inspectProcessLock(state + '/restart.lock/pid').status !== 'active') throw new Error('startup gap')",
+    "writeGatewayReadiness(state + '/gateway-ready.json', 'manual', process.pid, process.cwd(), 'A0123456789')",
+    'release()',
+    "if (hasLease) writeFileSync(state + '/startup-lease-verified', 'ready-before-release')",
+  ].join('\n'))
   for (const command of ['bun', 'caffeinate']) {
     const path = join(fakeBin, command)
     writeFileSync(path, [
       '#!/bin/bash',
       '[ -z "${FAKE_BUN_LOG:-}" ] || printf "%s\\n" "$*" >> "$FAKE_BUN_LOG"',
       '[ -z "${FAKE_ENV_LOG:-}" ] || /usr/bin/env >> "$FAKE_ENV_LOG"',
+      'if [[ "$*" == *server.ts* ]]; then',
+      `  exec ${JSON.stringify(process.execPath)} --config=/dev/null --no-env-file ${JSON.stringify(fakeGateway)}`,
+      'fi',
       'if [[ "$*" == *slack-app-identity.ts* ]] && [ "${FAKE_IDENTITY_FAIL:-0}" = "1" ]; then',
       '  echo "Slack App token identity verification failed: different Slack Apps" >&2',
       '  exit 1',
@@ -238,7 +256,7 @@ async function runLauncher(
       'if [[ "$*" == *project-selection.ts* || "$*" == *project-app-state.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
-      'if [[ "$*" == *project-channel-config.ts* ]]; then',
+      'if [[ "$*" == *project-channel-config.ts* || "$*" == *slack-app-unset.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
       'if [[ "$*" == *readiness.ts* ]]; then',
@@ -371,7 +389,8 @@ describe('codex-channel.sh replacement guard', () => {
       invokedAs: 'zerochan', cwd: project, args: ['update', '--skip-tests'],
     })
     expect(invalid.exitCode).toBe(2)
-    expect(invalid.output).toContain('zerochan update [--recover-only]')
+    expect(invalid.output).toContain('使い方: zerochan <command>')
+    expect(invalid.output).toContain('詳細: zerochan <command> --help')
     expect(existsSync(invalidLog)).toBe(false)
   })
 
@@ -414,7 +433,8 @@ describe('codex-channel.sh replacement guard', () => {
       invokedAs: 'zerochan', cwd: project, args: ['stop', '--unsafe'],
     })
     expect(invalidStop.exitCode).toBe(2)
-    expect(invalidStop.output).toContain('zerochan stop [--force]')
+    expect(invalidStop.output).toContain('使い方: zerochan <command>')
+    expect(invalidStop.output).toContain('詳細: zerochan <command> --help')
   })
 
   test('Herdr外のzerochan startは可視workspace作成helperへ委譲する', async () => {
@@ -617,6 +637,7 @@ describe('codex-channel.sh replacement guard', () => {
     expect(() => process.kill(gateway.pid, 0)).toThrow()
     expect(() => process.kill(runner.pid, 0)).not.toThrow()
     expect(existsSync(join(state, 'restart.lock', 'pid'))).toBe(false)
+    expect(readFileSync(join(state, 'startup-lease-verified'), 'utf8')).toBe('ready-before-release')
   })
 
   test('zerochan --restartはSIGTERMを無視するgatewayもexact generationで回収する', async () => {

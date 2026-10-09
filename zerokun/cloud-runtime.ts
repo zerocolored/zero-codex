@@ -199,7 +199,9 @@ export class CloudRuntime {
         : ''
       const history = [inherited, this.store.cloudHistory(job.id)].filter(Boolean).join('\n\n')
       const attachments = [...new Set([...job.attachments, ...(job.threadAttachments ?? []).map(a => a.path)])]
+      const primaryModel = this.store.taskModels().latest(job.id)
       const packet: HandoffPackage = { version: 1, task: job.task, history,
+        ...(primaryModel ? { primaryModel } : {}),
         repositories: workspace.repositories.map(r => captureRepository(r.root, r.name,
           continuationCheckpointBase(r.root, r.base, r.integrationBranch))),
         attachments: attachments.map((path, i) => captureAttachment(path.startsWith(`${workspace.project}/`)
@@ -304,7 +306,7 @@ export class CloudRuntime {
       this.store.enqueueCloudImport({ chatId: input.channel, threadTs: input.thread, messageId: input.message,
         userId: input.user, repoPath: input.project, writeEnabled: input.writeEnabled,
         task: `同じSlackスレッドの処理を引き継いで続けてください。作業場所にあるHANDOFF.mdを読み、既存の変更と実行済み操作を確認して残作業から進めてください。新規の依頼として設計をやり直さないでください。\n\n元の依頼:\n${packet.task}`,
-        attachments: prepared.attachments }, h.id, active.epoch, JSON.stringify(active))
+        attachments: prepared.attachments }, h.id, active.epoch, JSON.stringify(active), packet.primaryModel)
     })
   }
 }

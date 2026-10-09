@@ -22,11 +22,14 @@ test('native browser flow needs baseline and final verification, and never reque
   await f.session.respond(f.session.pending()!.requestId, 'native-opened')
   f.emit('oauth-browser-opened')
   expect(f.session.pending()!.stage).toBe('authorize')
+  expect(f.session.pending()!.observationScript).toContain('authorizeName')
+  expect(f.session.pending()!.nextAction).toContain('本文全文')
   const progress = advisorRecoveryProgress(f.session.pending(), [{ advisor: 'claude', cause: 'authentication' }])
   expect(progress.nextAction).toContain('click')
   expect(progress.nextAction).toContain('成功応答を送信しません')
   expect(progress.nextAction).not.toContain('fixed response')
   f.emit('oauth-browser-verify-required')
+  expect(f.session.pending()!.observationScript).toBeUndefined()
   await f.session.respond(f.session.pending()!.requestId, 'browser-verified')
   f.emit('oauth-login-complete')
   expect(f.session.pending()).toBeUndefined()
@@ -41,6 +44,16 @@ test('wrong-stage response cannot advance the helper and abort terminates only t
   await f.session.respond(f.session.pending()!.requestId, 'abort')
   expect(f.aborted()).toBe(1)
   expect(f.session.pending()).toBeUndefined()
+})
+
+test('native denial survives helper shutdown as a fixed reason without page contents', async () => {
+  const f = fixture(); f.emit('oauth-browser-baseline-required')
+  const id = f.session.pending()!.requestId
+  await expect(f.session.respond(id, 'baseline-ready', 'approval-denied')).rejects.toThrow('abort reason')
+  await f.session.respond(id, 'abort', 'approval-denied')
+  f.session.finish()
+  expect(f.session.failureReason()).toBe('Grok OAuth browser recovery stopped: approval-denied')
+  expect(f.aborted()).toBe(1); expect(f.written).toEqual([])
 })
 
 test('Claude authentication wait preserves the actionable Grok browser request', () => {

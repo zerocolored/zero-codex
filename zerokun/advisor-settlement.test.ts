@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { requestAdvisorStop, watchAdvisorStopRequest, waitForAdvisorSettlement } from './advisor-settlement.ts'
+import { GROK_REVIEW_TIMEOUT_MS, GROK_OAUTH_TIMEOUT_MS, ADVISOR_SETTLEMENT_TIMEOUT_MS } from './advisor-timeouts.ts'
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 function fixture() {
@@ -65,6 +66,30 @@ test('既定待機も期限で終了しlive reviewerやlockを直接変更しな
     expect(JSON.parse(await Bun.file(f.journal).text()).status).toBe('requested')
     expect(await Bun.file(f.lock).exists()).toBe(true)
   } finally { Date.now = originalNow }
+})
+
+test('親の既定待機はGrokの1時間と認証復旧後の1時間を途中で打ち切らない', async () => {
+  const f = fixture()
+  const originalNow = Date.now
+  let finished = false
+  const waiting = waitForAdvisorSettlement({ ...f.options, timeoutMs: undefined })
+    .then(value => { finished = true; return value })
+  try {
+    for (const elapsed of [31 * 60_000, GROK_REVIEW_TIMEOUT_MS,
+      2 * GROK_REVIEW_TIMEOUT_MS + GROK_OAUTH_TIMEOUT_MS]) {
+      Date.now = () => originalNow() + elapsed
+      await Bun.sleep(15)
+      expect(finished).toBe(false)
+    }
+    expect(ADVISOR_SETTLEMENT_TIMEOUT_MS).toBeGreaterThan(
+      2 * GROK_REVIEW_TIMEOUT_MS + GROK_OAUTH_TIMEOUT_MS)
+    rmSync(f.lock)
+    expect(await waiting).toBe('settled')
+  } finally {
+    rmSync(f.lock, { force: true })
+    Date.now = originalNow
+    await waiting
+  }
 })
 
 test.each(['old-generation', 'same-generation'] as const)('新しいactive lockと古いterminal journalが共存しても早期終了しない: %s', async kind => {

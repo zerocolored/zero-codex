@@ -53,7 +53,7 @@ test('explicit selection transfers legacy channel routes without asking for toke
   new JobStore(join(next, 'jobs.sqlite3')).close()
   mutateProjectChannelConfig({ operation: 'set', repoPath: project, stateDir: old, appId: 'AOLD', channelId: 'COLD' })
   const hooks = { home, output: () => {}, installWatchdog: () => {} }
-  await runSlackAppCommand(project, { ...hooks, input: async () => '2' })
+  await runSlackAppCommand(project, { ...hooks, input: async () => 'AZNEW', verify: async () => { throw new Error('must not reverify') } })
   expect(readProjectChannelConfig(project).slackAppId).toBe('AZNEW')
   const oldStore = new JobStore(join(old, 'jobs.sqlite3'))
   const nextStore = new JobStore(join(next, 'jobs.sqlite3'))
@@ -63,4 +63,79 @@ test('explicit selection transfers legacy channel routes without asking for toke
   await runSlackAppCommand(project, { ...hooks, input: async () => '1' })
   expect(readProjectChannelConfig(project).slackAppId).toBe('AOLD')
   expect(readProjectChannelConfig(project).slackChannels).toEqual(['COLD'])
+})
+
+test('an unregistered App ID continues into hidden token registration for that exact app', async () => {
+  const { home, project } = fixture()
+  registerSlackApp('AOLD', prepareManagedStateRoot(join(home, 'old')), home)
+  const inputs = ['  ANEW  ', 'xoxb-synthetic-only-12345', 'xapp-1-ANEW-synthetic-only-12345']
+  const echoes: Array<boolean | undefined> = []
+  const output: string[] = []
+  await runSlackAppCommand(project, {
+    home, installWatchdog: () => {},
+    input: async (_, options) => { echoes.push(options?.echo); return inputs.shift()! },
+    output: text => output.push(text), verify: async () => ({ appId: 'ANEW' }),
+  })
+  expect(inputs).toEqual([])
+  expect(echoes).toEqual([true, undefined, undefined])
+  expect(output.join('')).toContain('ANEW は未登録です')
+  expect(output.join('')).not.toContain('synthetic-only')
+  expect(readProjectChannelConfig(project).slackAppId).toBe('ANEW')
+  expect(listRegisteredSlackApps(home).map(app => app.appId)).toEqual(['ANEW', 'AOLD'])
+  expect(statSync(join(home, '.codex/zerochan-apps/states/ANEW/.env')).mode & 0o777).toBe(0o600)
+})
+
+for (const stage of ['token-id', 'verified-id', 'malformed-token'] as const) {
+  test(`App ID registration rejects ${stage} before saving or switching`, async () => {
+    const { home, project } = fixture()
+    const old = prepareManagedStateRoot(join(home, 'old'))
+    registerSlackApp('AOLD', old, home)
+    mutateProjectChannelConfig({ operation: 'set', repoPath: project, stateDir: old, appId: 'AOLD', channelId: 'COLD' })
+    const before = readProjectChannelConfig(project)
+    const token = stage === 'malformed-token' ? 'invalid-synthetic-token'
+      : `xapp-1-${stage === 'token-id' ? 'AOTHER' : 'ANEW'}-synthetic-only-12345`
+    const inputs = ['ANEW', 'xoxb-synthetic-only-12345', token]
+    let verifications = 0
+    await expect(runSlackAppCommand(project, {
+      home, input: async () => inputs.shift()!, output: () => {},
+      verify: async () => { verifications++; return { appId: 'AOTHER' } },
+      prepare: () => { throw new Error('must not prepare') },
+      installWatchdog: () => { throw new Error('must not install') },
+    })).rejects.toThrow(stage === 'malformed-token' ? 'App-Level Tokenの形式が不正です' : '指定した App ID とトークンのアプリが一致しません')
+    expect(verifications).toBe(stage === 'verified-id' ? 1 : 0)
+    expect(readProjectChannelConfig(project)).toEqual(before)
+    expect(listRegisteredSlackApps(home).map(app => app.appId)).toEqual(['AOLD'])
+    expect(existsSync(join(home, '.codex/zerochan-apps/states'))).toBe(false)
+    const store = new JobStore(join(old, 'jobs.sqlite3'))
+    expect(store.resolveSlackChannelRoute('AOLD', 'COLD')).toBe(project)
+    store.close()
+  })
+}
+
+test('invalid selections retry without reflecting their contents, then accept a number', async () => {
+  const { home, outside } = fixture()
+  registerSlackApp('ATEST', prepareManagedStateRoot(join(home, 'old')), home)
+  const inputs = ['', '0', '2', '999999999999999999999999', '1.0', 'xoxb-synthetic-only-12345', '1']
+  const messages: string[] = []
+  await runSlackAppCommand(outside, {
+    home, input: async () => { if (!inputs.length) throw new Error('unexpected prompt'); return inputs.shift()! },
+    output: text => messages.push(text),
+    verify: async () => { throw new Error('must not verify') },
+  })
+  expect(inputs).toEqual([])
+  expect(messages.filter(text => text.includes('入力してください'))).toHaveLength(6)
+  expect(messages.join('')).not.toContain('synthetic-only')
+  expect(messages.join('')).toContain('Slackアプリ登録: ATEST')
+})
+
+test('cancelling a retried selection does not prepare or change the project', async () => {
+  const { home, project } = fixture()
+  registerSlackApp('ATEST', prepareManagedStateRoot(join(home, 'old')), home)
+  let prompts = 0
+  await expect(runSlackAppCommand(project, {
+    home, output: () => {}, input: async () => { if (++prompts === 1) return '0'; throw new Error('入力を中止しました') },
+    prepare: () => { throw new Error('must not prepare') },
+  })).rejects.toThrow('入力を中止しました')
+  expect(prompts).toBe(2)
+  expect(readProjectChannelConfig(project).slackAppId).toBeUndefined()
 })

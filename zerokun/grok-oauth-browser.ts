@@ -1,7 +1,10 @@
 import { randomUUID } from 'crypto'
+import { GROK_OAUTH_OBSERVATION_SCRIPT } from './grok-oauth-observation.ts'
 
 export const GROK_BROWSER_ANSWERS = ['baseline-ready', 'native-opened', 'manual-open', 'browser-verified', 'abort'] as const
 export type GrokBrowserAnswer = typeof GROK_BROWSER_ANSWERS[number]
+export const GROK_BROWSER_ABORT_REASONS = ['approval-denied', 'interactive-login', 'unexpected-ui', 'tab-changed', 'browser-unavailable'] as const
+export type GrokBrowserAbortReason = typeof GROK_BROWSER_ABORT_REASONS[number]
 type Stage = 'baseline' | 'check' | 'authorize' | 'verify'
 export function advisorRecoveryProgress(
   browser: ReturnType<GrokOAuthBrowserSession['pending']>,
@@ -11,7 +14,9 @@ export function advisorRecoveryProgress(
     ...(waitingForAuthentication.length ? { waitingForAuthentication } : {}),
     ...(browser ? {
       grokOAuthBrowser: browser,
-      nextAction: browser.stage === 'authorize'
+      nextAction: browser.hostManaged
+        ? '設定済みChromeをホストが確認しています。同じroundをpollしてください。別経路からブラウザ操作や成功応答を送らないでください。拒否する場合だけabortを返してください。'
+        : browser.stage === 'authorize'
         ? 'grokOAuthBrowserの認可画面確認と最大1回のclickの指示を実行し、同じroundをpollしてください。この段階では成功応答を送信しません。中止が必要な場合だけabortを返してください。'
         : 'grokOAuthBrowserの指示を実行し、指定のfixed responseをadvisor_grok_oauth_respondへ一度返してください。新しいloginを起動しないでください。',
     } : waitingForAuthentication.length ? {
@@ -22,7 +27,7 @@ export function advisorRecoveryProgress(
 const instructions: Record<Stage, string> = {
   baseline: '公式Chrome controlで既存タブのopaque ID集合だけを保存し、baseline-readyを返してください。URL・title・本文・入力値は読まないでください。取得不能ならabort。',
   check: '保存したbaselineと現在のopaque ID集合を比較してください。既存IDの消失・複数増加・取得不能ならabort。新規1件ならnative-opened、0件ならmanual-openを一度だけ返してください。URL・title・本文はまだ読まないでください。',
-  authorize: '新規タブがexact 1件であることを確認してください。helper終了待ちを一度pollした後、まだ実行中の場合だけ、そのtabのnormalized originと認可UIを確認します。originがhttpsのauth.x.ai/accounts.x.ai(port 443)、titleがAuthorize — Grokまたは公式site suffix付き、見出しがGrok Build、一意のbutton Authorize/許可で、email・username・password・passkey・MFA・CAPTCHA・account選択・課金・規約・scope変更UIがないことを2回のstable visible readで確認します。click直前にも同じtab identity・origin・title・button・禁止UI不在を全再評価し、そのreadで解決したbuttonを別のbrowser操作を挟まず1回だけclickしてください。URL全体・query・入力値を取得せず、Sign inやContinueは操作しません。click済みなら再操作せずpoll。判断不能ならabort。',
+  authorize: 'helper終了待ちを一度pollし、verify段階なら本文を読まず最終ID確認へ進んでください。まだ認可待ちの場合だけ、baselineから増えたexact 1件の同じtabを確認し、公式Chromeのtab.playwright.evaluateへobservationScriptを渡してください。返却は真偽値・件数・固定ボタン名のみです。本文全文・DOM snapshot・screenshot・URL全体・query・入力値・account情報は取得しません。ready=trueの同一結果を2回確認します。click直前にtab IDの同一性を再確認し、返されたauthorizeNameの一意なbutton locatorを作り、同じobservationScriptで全条件を再評価してください。最終結果が前回と同じready=trueの場合だけ、そのlocatorを他のbrowser操作を挟まず1回clickします。Authorizeと許可を推測で選ばずauthorizeNameを使ってください。Sign in・Continue・禁止UIや判断不能ならabort。clickの結果が曖昧なら再クリックせずpollしてください。',
   verify: 'Chrome controlで今回の新規タブがexact 1件で既存IDの消失がないことを確認し、browser-verifiedを返してください。URLや本文を追加取得しないでください。曖昧ならabort。Grokの正常終了だけでは実authへ反映されず、この確認後に公開されます。',
 }
 
@@ -34,11 +39,17 @@ export class GrokOAuthBrowserSession {
   private writer?: (line: string) => Promise<void>
   private sequence = 0
   private closed = false
+  private abortReason?: GrokBrowserAbortReason
   private current?: { requestId: string; stage: Stage; nextAction: string }
-  constructor(private readonly abortHelper: () => void) {}
+  constructor(private readonly abortHelper: () => void, private readonly hostManaged = false) {}
   connect(write: (line: string) => Promise<void>) { this.writer = write }
-  pending() { return this.current ? { ...this.current } : undefined }
+  pending(): { requestId: string; stage: Stage; nextAction: string; hostManaged?: boolean; observationScript?: string } | undefined { return this.current ? { ...this.current,
+    ...(this.hostManaged ? { hostManaged: true,
+      nextAction: 'ホストの設定済みChrome確認中です。同じadvisor roundをpollしてください。別のブラウザ操作は不要です。' }
+      : this.current.stage === 'authorize' ? { observationScript: GROK_OAUTH_OBSERVATION_SCRIPT } : {}),
+  } : undefined }
   finish() { this.closed = true; this.current = undefined; this.writer = undefined }
+  failureReason() { return this.abortReason ? `Grok OAuth browser recovery stopped: ${this.abortReason}` : undefined }
   private abort() { this.finish(); this.abortHelper() }
   private request(stage: Stage) { this.current = { requestId: randomUUID(), stage, nextAction: instructions[stage] } }
   feed(chunk: Uint8Array) {
@@ -66,9 +77,10 @@ export class GrokOAuthBrowserSession {
       else { this.abort(); return }
     }
   }
-  async respond(requestId: string, answer: GrokBrowserAnswer) {
+  async respond(requestId: string, answer: GrokBrowserAnswer, abortReason?: GrokBrowserAbortReason) {
     if (this.closed || !this.writer || this.current?.requestId !== requestId) throw Error('Grok browser request is no longer current')
-    if (answer === 'abort') { this.abort(); return }
+    if (abortReason && (answer !== 'abort' || !GROK_BROWSER_ABORT_REASONS.includes(abortReason))) throw Error('Grok browser abort reason does not match response')
+    if (answer === 'abort') { this.abortReason = abortReason; this.abort(); return }
     const stage = this.current.stage
     if (!((stage === 'baseline' && answer === 'baseline-ready')
       || (stage === 'check' && (answer === 'native-opened' || answer === 'manual-open'))

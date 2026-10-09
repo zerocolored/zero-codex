@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { assertSlackProjectAdmission, isSlackProjectStop, SlackProjectDisconnectedError } from './zerokun/slack-project-admission.ts'
 import { fleetProject } from './zerokun/fleet-project.ts'
 import { classifyFleetRequest, separateSecurityWorkflow, readProjectFleet, fleetCloudTime, answerFleetStatus, unavailableFleet, fleetReplyEnvelope } from './zerokun/fleet-query.ts'
 /**
@@ -31,7 +32,7 @@ import {
   isInvalidSlackCursor,
   advanceReadCursor,
   retreatReadCursor,
-  isSlackBotAuthored,
+  isSlackBotAuthored, slackSenderId, isSlackSenderEligible, SLACK_BOT_ID_RE,
   refreshSlackDirectMessageAvailability,
   slackDirectMessageFailureDisposition,
   slackReplyScanFailureDisposition,
@@ -97,7 +98,7 @@ import {
   takeSlackTokensFromEnvironment,
 } from './zerokun/child-environment.ts'
 import { verifySlackAppTokenPair } from './zerokun/slack-app-identity.ts'
-import { clearIntentionalServiceStop } from './zerokun/service-control-state.ts'
+import { clearIntentionalServiceStop, writeIntentionalServiceStop, takeGatewayStartupLease } from './zerokun/service-control-state.ts'
 import {
   copyLiveControlAttachments,
   isSlackInterruptCommand,
@@ -133,6 +134,7 @@ import { CloudRuntime } from './zerokun/cloud-runtime.ts'
 import { handoffControl, explicitlyAddressedHandoff } from './zerokun/handoff-control.ts'
 
 const STATE_DIR = resolveZeroStateDir()
+const releaseStartupLease = takeGatewayStartupLease(STATE_DIR)
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -318,7 +320,7 @@ async function gate(
   activeThreadAuthority = false,
 ): Promise<GateResult> {
   const isDM = channelType === 'im'
-  if (isBot || !SLACK_USER_ID_RE.test(senderId)) return { action: 'drop' }
+  if (isBot ? !SLACK_BOT_ID_RE.test(senderId) : !SLACK_USER_ID_RE.test(senderId)) return { action: 'drop' }
   if (!isDM) {
     const access = loadAccess()
     const decision = decideChannelPolicy(
@@ -500,6 +502,7 @@ function describeSlackSocketEvent(event: SlackSocketSupervisorEvent): string {
 }
 
 let botUserId: string | undefined
+let botId: string | undefined
 let slackAppId: string | undefined
 
 function currentSlackAppId(): string {
@@ -626,9 +629,9 @@ function stageEarlierSlackThreadIntentCandidates(input: {
     if (!message.ts || message.ts === input.threadTs
       || Number(message.ts) >= Number(input.messageTs)
       || (message.thread_ts ?? input.threadTs) !== input.threadTs
-      || isSlackBotAuthored(message)) continue
-    const userId = message.user as string | undefined
-    if (!userId || !SLACK_USER_ID_RE.test(userId)) continue
+      || !isSlackSenderEligible(message, botUserId, botId)) continue
+    const userId = slackSenderId(message)
+    if (!userId) continue
     const text = typeof message.text === 'string' ? message.text : ''
     if (!ownedThread && !mentionsBot(text, botUserId)) continue
     const key = `${input.channelId}:${message.ts}`
@@ -648,7 +651,7 @@ function stageEarlierSlackThreadIntentCandidates(input: {
 }
 
 /**
- * LLM admission for every human reply inside a channel thread. It runs before
+ * LLM admission for eligible human and explicitly mentioned bot channel replies. It runs before
  * active authority, update detection, attachment downloads, queueing and Slack
  * acknowledgement. A model/runtime failure remains an invisible durable retry.
  */
@@ -661,10 +664,21 @@ async function admitSlackChannelThreadReply(input: {
   fileIds?: string[]
   budgetLane?: SlackBudgetLane
 }): Promise<ThreadReplyAdmission> {
+  if (SLACK_BOT_ID_RE.test(input.userId) && !mentionsBot(input.text, botUserId)) return 'ignored'
   // Host-issued confirmation commands address the host directly. Their user,
   // thread, lease and native-process binding are checked in deliver(), never
   // decided by the audience classifier or interpreted as a model instruction.
   if (parseNativeConfirmationAnswer(normalizeSlackInboundText(input.text, botUserId, false))) return 'addressed'
+  if (isSlackProjectStop(input.text, botUserId, input.channelId.startsWith('D'))) return 'addressed'
+  try {
+    assertSlackProjectAdmission(resolveUnclaimedRepoPath(input.channelId, input.threadTs), input.messageTs)
+  } catch (error) {
+    if (error instanceof SlackProjectDisconnectedError) {
+      jobStore.recordDeliveryTombstone(`${input.channelId}:${input.messageTs}`)
+      return 'handled'
+    }
+    if (!(error instanceof SlackChannelRouteRequiredError) && !(error instanceof SlackProjectUnavailableError)) throw error
+  }
   if (cloudRuntime && explicitlyAddressedHandoff(input.text, botUserId)) return 'addressed'
   if (input.channelId.startsWith('D') || input.threadTs === input.messageTs) {
     return 'addressed'
@@ -808,16 +822,17 @@ async function replayDueSlackThreadReplyIntent(
     budgetLane: 'owned',
   })
   if (admission !== 'addressed') return
+  const isBot = SLACK_BOT_ID_RE.test(intent.userId)
   const ownedThread = jobStore.getThread(intent.chatId, intent.threadTs) !== null
   const threadAuthorityTarget = activeThreadAuthorityTarget(
-    intent.chatId, intent.threadTs, intent.candidateText, false, false,
+    intent.chatId, intent.threadTs, intent.candidateText, false, isBot,
   )
   const result = await gate(
     intent.userId,
     intent.chatId,
     'channel',
-    mentionsBot(intent.candidateText, botUserId) || ownedThread,
-    false,
+    mentionsBot(intent.candidateText, botUserId) || (!isBot && ownedThread),
+    isBot,
     threadAuthorityTarget !== null,
   )
   if (result.action !== 'deliver') {
@@ -1082,6 +1097,7 @@ async function hydrateInitialThreadContext(
     threadTs: inbound.threadTs,
     triggerTs: inbound.messageId,
     botUserId,
+    botId,
     hasMore: Boolean(response.has_more || response.response_metadata?.next_cursor),
   })
   const access = loadAccess()
@@ -1335,6 +1351,7 @@ async function drainInboundDeliveries(): Promise<void> {
         }
         jobStore.enqueue({
           workflow: auditRequest ? 'security-audit' : 'work',
+          modelRequestText: inbound.modelRequestText ?? inbound.text,
           chatId: inbound.chatId,
           threadTs: inbound.threadTs,
           messageId: inbound.messageId,
@@ -1468,6 +1485,9 @@ function deliver(
       return true
     }
     const cloudAction = cloudRuntime ? handoffControl(text) : null
+    if (cloudAction || (writeEnabled && isExplicitUpdateRequest(text))) {
+      assertSlackProjectAdmission(resolveUnclaimedRepoPath(chatId, resolvedThreadTs), messageTs)
+    }
     if (cloudRuntime && cloudAction && botUserId && threadTs && !chatId.startsWith('D')) {
       const waiting = await cloudRuntime.client.find(chatId, threadTs)
       if (waiting && cloudAction === 'continue') {
@@ -1560,6 +1580,11 @@ function deliver(
       )
       return false
     }
+    if (err instanceof SlackProjectDisconnectedError) {
+      jobStore.recordDeliveryTombstone(key)
+      rememberDelivered(key)
+      return false
+    }
     if (err instanceof SlackChannelRouteRequiredError
       || err instanceof SlackProjectUnavailableError) {
       try {
@@ -1595,12 +1620,11 @@ function deliver(
 slackApp.event('app_mention', async ({ event }) => {
   if (updateTransactionPending(UPDATE_JOURNAL_FILE)) return
   // Symmetric with the message handler: bot posts that @mention this app are
-  // rejected by the same membership-based gate instead of gaining an implicit
-  // automation-to-automation control path.
+  // accepted only with an explicit mention and a non-self bot identity.
   const ev = event as any
   const isBot = isSlackBotAuthored(ev)
-  const senderId: string | undefined = isBot ? ev.bot_id : ev.user
-  if (!senderId || isBot || !SLACK_USER_ID_RE.test(senderId)) return
+  const senderId = slackSenderId(ev)
+  if (!senderId || !isSlackSenderEligible(ev, botUserId, botId)) return
   const channelId = event.channel
   const threadTs = event.thread_ts || event.ts
   const text = stripSlackUserMention(event.text, botUserId).trim()
@@ -1670,12 +1694,11 @@ slackApp.event('message', async ({ event }) => {
     && msg.subtype !== 'bot_message'
     && msg.subtype !== 'file_share'
     && msg.subtype !== 'thread_broadcast') return
-  if (msg.user === botUserId) return
 
   // For bots, identify by bot_id (B-prefix) since msg.user may be unset on
-  // classic incoming-webhook posts. The gate rejects every bot sender.
-  const senderId = isBot ? (msg.bot_id as string) : (msg.user as string)
-  if (!senderId || isBot || !SLACK_USER_ID_RE.test(senderId)) return
+  // classic incoming-webhook posts. Keep that bot identity through durable replay.
+  const senderId = slackSenderId(msg)
+  if (!senderId || !isSlackSenderEligible(msg, botUserId, botId)) return
   const channelId = msg.channel as string
   const channelType = msg.channel_type as string
   const threadTs = msg.thread_ts
@@ -1702,7 +1725,7 @@ slackApp.event('message', async ({ event }) => {
     })
     if (admission !== 'addressed') return
   }
-  const isMention = resolveIsMention(isDM, text, botUserId) || ownedThread
+  const isMention = resolveIsMention(isDM, text, botUserId) || (!isBot && ownedThread)
   const threadAuthorityTarget = activeThreadAuthorityTarget(
     channelId, typeof threadTs === 'string' ? threadTs : undefined, text, isDM, isBot,
   )
@@ -2139,7 +2162,7 @@ async function processPendingReplyScanPages(
       response.messages,
       new Set(),
       { ...sweepPolicy, limit: response.messages.length || 1 },
-      botUserId,
+      botUserId, botId,
     )
     const requiredEventKeys = new Set(
       allCandidates.map(message => `${scan.channelId}:${message.ts!}`),
@@ -2149,23 +2172,23 @@ async function processPendingReplyScanPages(
       response.messages,
       durablyHandled,
       { ...sweepPolicy, limit: response.messages.length || 1 },
-      botUserId,
+      botUserId, botId,
     ).map(message => message.ts!))
     const plan = planCatchupSweep(
-      response.messages, durablyHandled, sweepPolicy, botUserId,
+      response.messages, durablyHandled, sweepPolicy, botUserId, botId,
     )
     candidateCount += plan.length
 
     for (const message of plan) {
       const isBot = isSlackBotAuthored(message)
-      const senderId = isBot ? message.bot_id : message.user
+      const senderId = slackSenderId(message)
       if (!senderId || !message.ts) continue
       const text = message.text ?? ''
       const normalizedText = normalizeSlackInboundText(text, botUserId, isDM)
       const resolvedThreadTs = message.thread_ts || scan.threadTs
       const ownedThread = !isDM
         && jobStore.getThread(scan.channelId, resolvedThreadTs) !== null
-      if (isBot || !SLACK_USER_ID_RE.test(senderId)) {
+      if (!isSlackSenderEligible(message, botUserId, botId)) {
         outstanding.delete(message.ts)
         if (candidateTimestamps.has(message.ts)) {
           requiredEventKeys.delete(`${scan.channelId}:${message.ts}`)
@@ -2196,7 +2219,7 @@ async function processPendingReplyScanPages(
         senderId,
         scan.channelId,
         isDM ? 'im' : 'channel',
-        resolveIsMention(isDM, text, botUserId) || ownedThread,
+        resolveIsMention(isDM, text, botUserId) || (!isBot && ownedThread),
         isBot,
         threadAuthorityTarget !== null,
       )
@@ -2350,12 +2373,12 @@ async function catchupSweep(): Promise<void> {
         durablyHandled.add(`${channelId}:${message.ts}`)
       }
     }
-    const plan = planCatchupSweep(catchup.messages, durablyHandled, sweepPolicy, botUserId)
+    const plan = planCatchupSweep(catchup.messages, durablyHandled, sweepPolicy, botUserId, botId)
     const allRecentCandidates = planCatchupSweep(
       catchup.recentMessages,
       new Set(),
       { ...sweepPolicy, limit: catchup.recentMessages.length || 1 },
-      botUserId,
+      botUserId, botId,
     )
     const recentCandidateTimestamps = new Set(allRecentCandidates.map(message => message.ts!))
     const requiredRecentEventKeys = new Set(
@@ -2365,13 +2388,13 @@ async function catchupSweep(): Promise<void> {
       catchup.recentMessages,
       durablyHandled,
       { ...sweepPolicy, limit: catchup.recentMessages.length || 1 },
-      botUserId,
+      botUserId, botId,
     ).map(message => message.ts!))
     const allScanCandidates = planCatchupSweep(
       catchup.scanReplies,
       new Set(),
       { ...sweepPolicy, limit: catchup.scanReplies.length || 1 },
-      botUserId,
+      botUserId, botId,
     )
     const scanCandidateTimestamps = new Set(allScanCandidates.map(message => message.ts!))
     const requiredScanEventKeys = new Set(
@@ -2381,20 +2404,20 @@ async function catchupSweep(): Promise<void> {
       catchup.scanReplies,
       durablyHandled,
       { ...sweepPolicy, limit: catchup.scanReplies.length || 1 },
-      botUserId,
+      botUserId, botId,
     ).map(message => message.ts!))
     candidateCount += plan.length
 
     for (const message of plan) {
       const isBot = isSlackBotAuthored(message)
-      const senderId = isBot ? message.bot_id : message.user
+      const senderId = slackSenderId(message)
       if (!senderId || !message.ts) continue
       const text = message.text ?? ''
       const normalizedText = normalizeSlackInboundText(text, botUserId, isDM)
       const resolvedThreadTs = message.thread_ts || message.ts
       const ownedThread = !isDM
         && jobStore.getThread(channelId, resolvedThreadTs) !== null
-      if (isBot || !SLACK_USER_ID_RE.test(senderId)) {
+      if (!isSlackSenderEligible(message, botUserId, botId)) {
         outstandingScanReplies.delete(message.ts)
         outstandingRecentMessages.delete(message.ts)
         if (scanCandidateTimestamps.has(message.ts)) {
@@ -2430,7 +2453,7 @@ async function catchupSweep(): Promise<void> {
         senderId,
         channelId,
         isDM ? 'im' : 'channel',
-        resolveIsMention(isDM, text, botUserId) || ownedThread,
+        resolveIsMention(isDM, text, botUserId) || (!isBot && ownedThread),
         isBot,
         threadAuthorityTarget !== null,
       )
@@ -2696,7 +2719,7 @@ async function pollThreads(): Promise<void> {
           access.dmPolicy === 'disabled' ? [] : effectiveDmAllowFrom(access),
           botUserId,
         )
-        : planThreadPoll(replies, cursorTs, access.channels[channelId], botUserId)
+        : planThreadPoll(replies, cursorTs, access.channels[channelId], botUserId, botId)
 
       const plan = planned
 
@@ -2706,13 +2729,15 @@ async function pollThreads(): Promise<void> {
         )
       }
       const handedOver = await confirmedWithin(plan.deliver.map(async (r) => {
+        const senderId = slackSenderId(r)
+        if (!senderId) return true
         const fileIds = (r.files ?? []).map((f: any) => f.id)
         if (!channelId.startsWith('D')) {
           const admission = await admitSlackChannelThreadReply({
             channelId,
             threadTs,
             messageTs: r.ts!,
-            userId: r.user!,
+            userId: senderId,
             text: r.text ?? '',
             fileIds,
             budgetLane: 'owned',
@@ -2725,12 +2750,12 @@ async function pollThreads(): Promise<void> {
           threadTs,
           r.text ?? '',
           channelId.startsWith('D'),
-          Boolean(r.bot_id),
+          isSlackBotAuthored(r),
         )
         const accepted = await deliver(
           channelId,
           r.ts!,
-          r.user!,
+          senderId,
           normalizeSlackInboundText(r.text ?? '', botUserId, channelId.startsWith('D')),
           threadTs,
           fileIds.length ? fileIds : undefined,
@@ -2774,7 +2799,12 @@ async function pollThreads(): Promise<void> {
 }
 
 process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)
+process.on('SIGINT', () => {
+  // Ctrl-C is an explicit stop. SIGTERM remains recoverable for supervised
+  // restarts and unexpected gateway exits.
+  try { writeIntentionalServiceStop(STATE_DIR) }
+  finally { shutdown() }
+})
 
 // A closed lid or a dropped Wi-Fi makes every in-flight Slack call reject at
 // once, including calls this file fires and never awaits. Bun turns an
@@ -2806,7 +2836,11 @@ try {
   // Socket Mode connection. A mixed old/new pair must never receive events
   // from one App while posting as another bot.
   const identity = await verifySlackAppTokenPair(APP_TOKEN, {
-    authTest: () => slackApp.client.auth.test({}),
+    authTest: async () => {
+      const auth = await slackApp.client.auth.test({})
+      botId = auth.bot_id
+      return auth
+    },
     botsInfo: async bot => {
       const result = await slackApp.client.bots.info({ bot })
       return { app_id: result.bot?.app_id }
@@ -2862,6 +2896,7 @@ try {
   // legacy launcher) re-enables crash alerts only after Socket Mode and the
   // generation-bound readiness record are both established.
   clearIntentionalServiceStop(STATE_DIR)
+  releaseStartupLease()
   fleetReporter = startConfiguredFleet(STATE_DIR, identity.appId, connectedProjectDir,
     () => jobStore.fleetFolderFacts(Date.now(), connectedProjectDir), () => slackSocket?.connected === true,
     { teamId: identity.teamId, name: identity.botName, botToken: BOT_TOKEN })

@@ -269,3 +269,22 @@ test('明示したnative履歴probe期限は通信再試行中にも適用する
     retryableReadError: () => true, read: async () => { throw new Error('synthetic timeout') },
   })).toBe('timeout')
 })
+
+// The production review failed before spawn solely because "bearer vs" matched
+// a credential heuristic. Both registration and recovered answer must be exact.
+test.each(['view bearer vs callback', 'Authorization: Bearer synthetic-example',
+  'https://example.test/reports/view/rpt_' + 'a'.repeat(64) + '#' + 'b'.repeat(64),
+  'Ａ案とＢ案：token=synthetic_example_123456789'])('content does not reject or rewrite native requests and answers: %s', async request => {
+  const f = fixture()
+  const registered = registerNativeAdvisor({ contextPath: f.contextPath, attemptNonce: f.nonce,
+    phase: 'review', round: 1, inputRevision: 1, inputDigest: f.digest, request })
+  expect(registered.prompt).toStartWith(request + '\n')
+  const registrations = readNativeAdvisorRegistrations(f.contextPath, f.nonce)
+  expect(registrations.find(value => value.phase === 'review')).toEqual(registered)
+  expect(registerNativeAdvisor({ contextPath: f.contextPath, attemptNonce: f.nonce,
+    phase: 'review', round: 1, inputRevision: 2, inputDigest: 'c'.repeat(64), request: 'later' })).toEqual(registered)
+  f.complete()
+  const response = request + '\n' + f.registration.marker
+  f.child.turns[0].items[0].text = response
+  expect((await readRetainedNativeAdvisors(f.options))[0]?.response).toBe(response)
+})

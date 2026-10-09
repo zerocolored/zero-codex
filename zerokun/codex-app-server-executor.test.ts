@@ -44,6 +44,8 @@ import {
 } from './publication-continuation.ts'
 import {
   CodexCleanupPendingError,
+  parseCodexInterjectionReply,
+  codexInterjectionRetryDelayMs,
   artifactDirForJob,
   CodexPublicationPreflightRetryError,
   CodexRateLimitError,
@@ -308,6 +310,7 @@ import subprocess
 import sys
 import time
 
+catalog_calls = 0
 mode = os.environ.get("ZERO_FIXTURE_MODE", "normal")
 if mode in ("interrupt-no-terminal-forced", "late-error-after-complete"):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
@@ -331,6 +334,8 @@ permission_profile = ""
 steer_client_id = None
 progress_probe_count = 0
 persisted_items = {}
+item_reads = {}
+valid_interjection_message = None
 goal_status = None
 
 def observe_emission(value):
@@ -371,8 +376,10 @@ for line in sys.stdin:
     value = json.loads(line)
     method = value.get("method")
     request_id = value.get("id")
-    if mode == "native-upload" and method is None and request_id == 0:
+    if mode in ("native-upload", "native-app") and method is None and request_id == 0:
         action = value.get("result", {}).get("action", "missing")
+        if mode == "native-app":
+            action += ":" + str((value.get("result", {}).get("_meta") or {}).get("persist", "none"))
         emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "native result: " + action}], "error": None}}})
         continue
     rpc_log = os.environ.get("ZERO_RPC_LOG")
@@ -380,7 +387,7 @@ for line in sys.stdin:
     if rpc_log and (method in ("turn/start", "turn/steer", "turn/interrupt", "thread/turns/list", "thread/read", "thread/items/list", "thread/list") or (log_handshakes and method in ("thread/start", "thread/resume", "thread/inject_items"))):
         params = value.get("params", {})
         with open(rpc_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"method": method, "developerInstructions": params.get("developerInstructions"), "injectedItems": params.get("items") if method == "thread/inject_items" else None, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "approvalPolicy": params.get("approvalPolicy"), "approvalsReviewer": params.get("approvalsReviewer"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
+            stream.write(json.dumps({"method": method, "developerInstructions": params.get("developerInstructions"), "injectedItems": params.get("items") if method == "thread/inject_items" else None, "requestId": request_id, "clientUserMessageId": params.get("clientUserMessageId"), "outputSchema": params.get("outputSchema"), "turnId": params.get("turnId"), "expectedTurnId": params.get("expectedTurnId"), "excludeTurns": params.get("excludeTurns"), "model": params.get("model"), "config": params.get("config"), "effort": params.get("effort"), "approvalPolicy": params.get("approvalPolicy"), "approvalsReviewer": params.get("approvalsReviewer"), "allowProviderModelFallback": params.get("allowProviderModelFallback"), "currentInstructions": any(text in json.dumps(params.get("items", [])) for text in ("Advisor availability never blocks the primary task.", "continue investigation, implementation, tests, and publication."))}, ensure_ascii=False) + "\\n")
     if method == "initialized":
         continue
     if method == "initialize":
@@ -390,6 +397,12 @@ for line in sys.stdin:
             while True:
                 time.sleep(30)
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
+    elif method == "model/list":
+        catalog_calls += 1
+        catalog_models = ["gpt-6-astra", "gpt-6-sol"]
+        if os.environ.get("ZERO_NEW_CATALOG") == "1" and catalog_calls > 1:
+            catalog_models.append("gpt-6.1-sol")
+        emit({"id": request_id, "result": {"data": [{"model": m, "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]} for m in catalog_models], "nextCursor": None}})
     elif method == "thread/inject_items":
         if mode == "resume-early-start":
             goal_status = "active"
@@ -431,7 +444,7 @@ for line in sys.stdin:
         cwd = params.get("cwd")
         if method == "thread/resume" and os.environ.get("ZERO_RESUME_CWD"):
             cwd = os.environ["ZERO_RESUME_CWD"]
-        model = params.get("model") or "gpt-test"
+        model = "gpt-6-astra" if os.environ.get("ZERO_MODEL_MISMATCH") == "1" else params.get("model") or "gpt-test"
         reasoning_effort = params.get("config", {}).get("model_reasoning_effort") or "medium"
         developer_instructions = params.get("developerInstructions") or ""
         handshake_method = method
@@ -518,12 +531,15 @@ for line in sys.stdin:
             counters = {"inputTokens": 100, "cachedInputTokens": 60, "cacheWriteInputTokens": 0, "outputTokens": 20, "reasoningOutputTokens": 5}
             for _ in range(2):
                 emit({"method": "thread/tokenUsage/updated", "params": {"threadId": requested_thread or thread_id, "turnId": turn_id, "tokenUsage": {"total": counters, "last": counters}}})
-        if mode == "native-upload":
+        if mode in ("native-upload", "native-app"):
+            approval_meta = {"codex_approval_kind": "mcp_tool_call", "connector_id": "browser-use", "tool_name": "upload_browser_files", "file_transfer": "upload", "tool_params": {"origin": "https://example.com"}}
+            if mode == "native-app":
+                approval_meta = {"codex_approval_kind": "mcp_tool_call", "connector_id": "computer-use", "tool_name": "get_app_state", "tool_params": {"app": "com.google.Chrome"}, "persist": ["session"] if os.environ.get("ZERO_NATIVE_SESSION_ONLY") else ["session", "always"]}
             emit({"id": 0, "method": "mcpServer/elicitation/request", "params": {
                 "threadId": "foreign-thread" if os.environ.get("ZERO_NATIVE_CONFIRMATION_FOREIGN") else (requested_thread or thread_id),
                 "turnId": turn_id, "serverName": "node_repl", "mode": "form",
                 "requestedSchema": {"type": "object", "properties": {}},
-                "_meta": {"codex_approval_kind": "mcp_tool_call", "connector_id": "browser-use", "tool_name": "upload_browser_files", "file_transfer": "upload", "tool_params": {"origin": "https://example.com"}}
+                "_meta": approval_meta
             }})
             continue
         if mode == "late-command-completion":
@@ -576,10 +592,17 @@ for line in sys.stdin:
             emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "id": "continued-final", "text": continuation_answers[mode]}], "error": None}}})
         elif mode in ("interjection-answer", "interjection-update", "interjection-late-answer", "phased-interjection-update") and stage == "interjection":
             disposition = "answer-only" if mode in ("interjection-answer", "interjection-late-answer") else "task-update"
-            marker = re.search(r"\\[ZERO_THREAD_REPLY_BEGIN:([^:\\]]+):<answer-only\\|task-update>\\]", phase_prompt)
+            marker = re.search(r"Interjection ID: ([^\\n]+)", phase_prompt)
             interjection_id = marker.group(1) if marker else "missing"
             answer = "PDF処理はそのまま続いています 🔎" if disposition == "answer-only" else "追加条件を取り込んで続けます 🛠️"
             message = "[ZERO_THREAD_REPLY_BEGIN:" + interjection_id + ":" + disposition + "]\\n" + answer + "\\n[ZERO_THREAD_REPLY_END:" + interjection_id + "]"
+            if value.get("params", {}).get("outputSchema"):
+                message = json.dumps({"interjectionId": interjection_id, "disposition": disposition, "answer": answer}, ensure_ascii=False)
+            valid_interjection_message = message
+            repair_mode = os.environ.get("ZERO_INTERJECTION_REPAIR", "")
+            client_id = value.get("params", {}).get("clientUserMessageId", "")
+            if repair_mode and (":repair:" not in client_id or repair_mode == "always" or (repair_mode == "twice" and ":repair:2" not in client_id)):
+                message = answer + "\\n[ZERO_THREAD_REPLY_END:" + interjection_id + "]"
             if fixture_state:
                 with open(fixture_state, "w", encoding="utf-8") as stream:
                     stream.write(disposition)
@@ -657,7 +680,7 @@ for line in sys.stdin:
                     if mode == "phased-promotion-history-failed":
                         required_history = (
                             "--- Prior Slack thread history " in phase_prompt
-                            and "develop適用できますか?developからmainへのPRも作っておいて、URLをください。" in phase_prompt
+                            and "develop適用できますか？developからmainへのPRも作っておいて、URLをください。" in phase_prompt
                             and "こちら続きを進めて" in phase_prompt
                         )
                         if not required_history:
@@ -866,6 +889,9 @@ for line in sys.stdin:
         }], "nextCursor": None}})
     elif method == "thread/items/list":
         requested_turn_id = value.get("params", {}).get("turnId")
+        item_reads[requested_turn_id] = item_reads.get(requested_turn_id, 0) + 1
+        if os.environ.get("ZERO_INTERJECTION_REPAIR") == "refresh" and valid_interjection_message and item_reads[requested_turn_id] >= 2:
+            persisted_items[requested_turn_id] = [{"type": "agentMessage", "id": "interjection-answer", "text": valid_interjection_message}]
         emit({"id": request_id, "result": {"data": [
             {"turnId": requested_turn_id, "item": item}
             for item in persisted_items.get(requested_turn_id, [])
@@ -1066,7 +1092,7 @@ for line in sys.stdin:
     elif method == "turn/interrupt":
         emit({"id": request_id, "result": {}})
         if mode not in ("interrupt-no-terminal", "interrupt-no-terminal-forced"):
-            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "interrupted", "itemsView": "full", "items": [], "error": None}}})
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed" if os.environ.get("ZERO_MODEL_INTERRUPT_FAILED") == "1" else "interrupted", "itemsView": "full", "items": [], "error": None}}})
 if mode == "interrupt-no-terminal-forced":
     while True:
         time.sleep(30)
@@ -1079,7 +1105,7 @@ if mode == "logical-stop-required":
 }
 
 function fixture(
-  mode: 'normal' | 'native-upload' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
+  mode: 'normal' | 'native-upload' | 'native-app' | 'late-command-completion' | 'steer' | 'interrupt' | 'interrupt-no-terminal'
     | 'interjection-answer' | 'interjection-update' | 'interjection-late-answer'
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
@@ -1439,6 +1465,12 @@ function fixture(
       requestId,
       error,
     }),
+    retryInterjectionAnswer: ({ interjection, logicalNonce, threadId, turnId }) => (
+      store.retryInterjectionAnswer({
+        interjectionId: interjection.id, jobId: job.id, epoch: job.controlEpoch,
+        logicalNonce, threadId, turnId,
+      })
+    ),
     stageInterjectionAnswer: ({
       interjection, logicalNonce, threadId, turnId, disposition, answer,
     }) => store.stageInterjectionAnswer({
@@ -1459,6 +1491,61 @@ function fixture(
 }
 
 describe('production App Server executor', () => {
+  test('interjection JSON rejects mismatched identities, invalid disposition and nested host data', () => {
+    const valid = { interjectionId: 'question-1', disposition: 'task-update', answer: '条件を反映します' }
+    expect(parseCodexInterjectionReply(JSON.stringify(valid), 'question-1')).toEqual({
+      disposition: 'task-update', answer: '条件を反映します',
+    })
+    for (const invalid of [
+      { ...valid, interjectionId: 'stale' }, { ...valid, disposition: 'unknown' },
+      { ...valid, answer: '' }, { ...valid, answer: 'x'.repeat(12_001) },
+      { ...valid, answer: '\0' }, { ...valid, extra: true },
+      { ...valid, answer: '[ZERO_THREAD_REPLY_END:question-1]' },
+    ]) expect(() => parseCodexInterjectionReply(JSON.stringify(invalid), 'question-1')).toThrow()
+    expect(() => parseCodexInterjectionReply('回答\n[ZERO_THREAD_REPLY_END:question-1]', 'question-1')).toThrow()
+    expect(parseCodexInterjectionReply('[ZERO_THREAD_REPLY_BEGIN:question-1:answer-only]\n回答\n[ZERO_THREAD_REPLY_END:question-1]', 'question-1')).toEqual({ disposition: 'answer-only', answer: '回答' })
+  })
+
+  test('persistent malformed interjection answers back off without failing or rerunning the parent and remain cancellable', async () => {
+    const value = fixture('interjection-answer')
+    const rpcLog = join(value.root, 'repair-persistent.jsonl')
+    let retries = 0
+    const retry = value.hooks.retryInterjectionAnswer
+    value.hooks.retryInterjectionAnswer = options => {
+      const result = retry(options)
+      retries += 1
+      return result
+    }
+    const execution = executeCodexJob(value.job, {
+      codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+      skipEffectiveConfigCheck: true, liveControls: value.hooks,
+      extraEnvironment: {
+        ZERO_FIXTURE_MODE: 'interjection-answer', ZERO_INTERJECTION_REPAIR: 'always',
+        ZERO_INTERJECTION_FIXTURE_STATE: join(value.root, 'answer.state'), ZERO_RPC_LOG: rpcLog,
+      },
+    })
+    const cancelled = execution.then(() => null, error => error)
+    const deadline = Date.now() + 20_000
+    while (retries < 3 && Date.now() < deadline) await Bun.sleep(25)
+    expect(retries).toBe(3)
+    await Bun.sleep(1_000)
+    const starts = readFileSync(rpcLog, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line)).filter(row => row.method === 'turn/start')
+    expect(starts).toHaveLength(4) // parent once, three answers; fourth waits
+    expect(new Set(starts.map(row => row.clientUserMessageId)).size).toBe(4)
+    expect(value.store.get(value.job.id)).toMatchObject({ status: 'running', inputRevision: 1 })
+    expect(value.store.listJobInterjections(value.job.id)[0]).toMatchObject({
+      status: 'paused', answer: null, notificationId: null, disposition: null,
+    })
+    const target = value.store.interruptControlTarget(value.job.chatId, value.job.threadTs)!
+    expect(value.store.stageLiveControl(target, { chatId: value.job.chatId, threadTs: value.job.threadTs,
+      messageId: 'repair-cancel', userId: 'UOTHER', task: '中止', kind: 'interrupt' })).toBe('staged')
+    expect(await cancelled).toBeInstanceOf(CodexUserCancelledError)
+    expect(codexInterjectionRetryDelayMs(3)).toBe(30_000)
+    expect(codexInterjectionRetryDelayMs(100)).toBe(300_000)
+    value.store.close()
+  }, 30_000)
+
   test('usage recorder and host tool are available to a read-only job without exposing raw logs', async () => {
     const value = fixture('normal')
     try {
@@ -2631,6 +2718,53 @@ describe('production App Server executor', () => {
     }, 30_000)
   }
 
+  test.each([false, true])('semantic selection reaches start/resume and turns (resume=%s)', async resume => {
+    const value = fixture('normal', true)
+    const rpcLog = join(value.root, 'semantic-model.jsonl')
+    if (resume) { value.job.sessionId = 'thread-existing'; value.job.resumed = true }
+    const result = await executeCodexJob(value.job, {
+      codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+      skipEffectiveConfigCheck: true, liveControls: value.hooks,
+      selectModel: async (requests, catalog) => {
+        expect(requests[0]?.task).toBe(value.job.task)
+        expect(catalog).toContainEqual({id:'gpt-6-sol',medium:true})
+        return 'gpt-6-sol'
+      },
+      extraEnvironment: {ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+    })
+    expect(result.result).toBe('通常完了')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    const handshakes=rpc.filter(row=>['thread/start','thread/resume'].includes(row.method))
+    expect(handshakes[0].model).toBe('gpt-6-sol')
+    expect(handshakes[0].allowProviderModelFallback).toBe(false)
+    expect(rpc.filter(row=>row.method==='turn/start').every(row=>row.model==='gpt-6-sol' && row.effort==='medium')).toBe(true)
+    value.store.close()
+  }, 30_000)
+
+  test('unavailable semantic selection cannot dispatch a primary thread or fall back', async () => {
+    const value=fixture('normal',true), rpcLog=join(value.root,'unavailable-model.jsonl')
+    await expect(executeCodexJob(value.job,{
+      codexBinForTesting:value.executable, logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,selectModel:async()=> 'unknown-model',
+      extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+    })).rejects.toThrow('ZERO_MODEL_SELECTION:unsupported')
+    expect(existsSync(rpcLog)?readFileSync(rpcLog,'utf8').trim():'').toBe('')
+    value.store.close()
+  },30_000)
+
+  test('provider model mismatch rejects a Sol request without falling back',async()=>{
+    const value=fixture('normal',true),rpcLog=join(value.root,'model-mismatch.jsonl')
+    await expect(executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,selectModel:async()=> 'gpt-6-sol',
+      extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1',ZERO_MODEL_MISMATCH:'1'},
+    })).rejects.toThrow('activated a different model')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    expect(rpc.filter(row=>row.method==='thread/start')).toHaveLength(1)
+    expect(rpc.filter(row=>row.method==='turn/start')).toHaveLength(0)
+    value.store.close()
+  },30_000)
+
   test('primary modelと推論強度をthreadとturnへ明示固定する', async () => {
     const value = fixture('normal', true)
     const rpcLog = join(value.root, 'runtime-selection-rpc.log')
@@ -2704,6 +2838,29 @@ describe('production App Server executor', () => {
     }, 30_000,
   )
 
+  test.skipIf(process.platform !== 'darwin').each([
+    { write: true, foreign: false, sessionOnly: false, result: 'accept:always' },
+    { write: true, foreign: false, sessionOnly: true, result: 'accept:session' },
+    { write: false, foreign: false, sessionOnly: false, result: 'cancel:none' },
+    { write: true, foreign: true, sessionOnly: false, result: 'cancel:none' },
+    { write: true, foreign: false, sessionOnly: false, disabled: true, result: 'cancel:none' },
+  ])('native app permission continues the same authorized root turn without Slack confirmation: %j', async scenario => {
+    const value = fixture('native-app', scenario.write)
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        browserAccessForTesting: !scenario.disabled,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'native-app',
+          ...(scenario.foreign ? { ZERO_NATIVE_CONFIRMATION_FOREIGN: '1' } : {}),
+          ...(scenario.sessionOnly ? { ZERO_NATIVE_SESSION_ONLY: '1' } : {}) },
+        onNativeConfirmation: async () => { throw new Error('app approval must not ask again in Slack') },
+      })
+      expect(result.result).toBe(`native result: ${scenario.result}`)
+      expect(value.store.pendingCommentaryNotifications()).toHaveLength(0)
+    } finally { value.store.close() }
+  }, 30_000)
+
   test('resumeでもprimary modelと推論強度を再固定する', async () => {
     const value = fixture('normal', true)
     const rpcLog = join(value.root, 'runtime-selection-resume-rpc.log')
@@ -2731,7 +2888,7 @@ describe('production App Server executor', () => {
         model_reasoning_effort: ZEROCHAN_PRIMARY_CODEX_REASONING_EFFORT,
       },
     })
-    expect(rpc[0]?.allowProviderModelFallback).toBeNull()
+    expect(rpc[0]?.allowProviderModelFallback).toBe(false)
     expect(rpc[1]).toMatchObject({ method: 'thread/inject_items', currentInstructions: true })
     expect(rpc[2]).toMatchObject({
       method: 'turn/start',
@@ -3964,7 +4121,7 @@ describe('production App Server executor', () => {
     expect(value.job.task).toBe('こちら続きを進めて')
     expect(value.job.resumed).toBe(false)
     expect(value.store.threadHistorySnapshot(value.job.id).transcript).toContain(
-      'develop適用できますか?developからmainへのPRも作っておいて、URLをください。',
+      'develop適用できますか？developからmainへのPRも作っておいて、URLをください。',
     )
     const execution = await executeCodexJob(value.job, {
       codexBinForTesting: value.executable,
@@ -5301,7 +5458,7 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test('write phaseを退役してread-onlyで回答後に配送済み更新だけをfresh準備から再開する', async () => {
+  test.each(['', 'once'])('write phaseを退役してread-onlyで回答後に配送済み更新だけをfresh準備から再開する (repair=%s)', async repair => {
     const value = fixture('phased-interjection-update', true)
     const phaseLog = join(value.root, 'interjection-write-phases.log')
     const promptLog = join(value.root, 'interjection-write-prompts.log')
@@ -5338,6 +5495,7 @@ describe('production App Server executor', () => {
       skipEffectiveConfigCheck: true,
       extraEnvironment: {
         ZERO_FIXTURE_MODE: 'phased-interjection-update',
+        ZERO_INTERJECTION_REPAIR: repair,
         ZERO_PHASE_LOG: phaseLog,
         ZERO_PROMPT_LOG: promptLog,
         ZERO_INTERJECTION_FIXTURE_STATE: fixtureState,
@@ -5370,21 +5528,22 @@ describe('production App Server executor', () => {
 
     expect(result).toMatchObject({ sessionId: 'thread-app-server-1', result: '公開できます' })
     expect(gates).toEqual(['prepare-r1', 'prepare-r2', 'review-r2-1'])
-    expect(processIds).toHaveLength(6)
-    expect(new Set(processIds).size).toBe(6)
+    const count = repair ? 7 : 6
+    expect(processIds).toHaveLength(count)
+    expect(new Set(processIds).size).toBe(count)
     const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
       .map(line => line.split('\t'))
     expect(phases.map(row => row[0])).toEqual([
-      'prepare', 'implementation', 'interjection',
+      'prepare', 'implementation', 'interjection', ...(repair ? ['interjection'] : []),
       'prepare', 'implementation', 'review',
     ])
-    expect(phases.map(row => row[2])).toEqual(Array(6).fill('thread-app-server-1'))
+    expect(phases.map(row => row[2])).toEqual(Array(count).fill('thread-app-server-1'))
     expect(phases.map(row => row[3])).toEqual([
-      'thread/start', 'thread/resume', 'thread/resume',
+      'thread/start', 'thread/resume', 'thread/resume', ...(repair ? ['thread/resume'] : []),
       'thread/resume', 'thread/resume', 'thread/resume',
     ])
     expect(phases.map(row => row[4])).toEqual([
-      'read', 'write', 'read', 'read', 'write', 'read',
+      'read', 'write', 'read', ...(repair ? ['read'] : []), 'read', 'write', 'read',
     ])
     const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
       .map(line => JSON.parse(line) as { stage: string, text: string })
@@ -5592,6 +5751,78 @@ describe('production App Server executor', () => {
     value.store.close()
   })
 
+  test('model change interrupts the old turn and dispatches the input once under Sol', async () => {
+    const value=fixture('defer'), rpcLog=join(value.root,'model-switch.jsonl')
+
+    const result=await executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,
+      selectModel:async requests=>requests.length>1?'gpt-6-sol':'gpt-6-astra',
+      extraEnvironment:{ZERO_FIXTURE_MODE:'defer',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+    })
+    expect(result.result).toContain('追加入力')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    expect(rpc.filter(row=>row.method==='turn/steer')).toHaveLength(0)
+    expect(rpc.filter(row=>row.method==='turn/interrupt')).toHaveLength(1)
+    expect(rpc.filter(row=>row.method==='thread/resume')[0].model).toBe('gpt-6-sol')
+    expect(rpc.filter(row=>row.method==='turn/start').map(row=>row.model)).toEqual(['gpt-6-astra','gpt-6-sol'])
+    expect(value.store.listJobControls(value.job.id)[0]?.status).toBe('observed')
+    value.store.close()
+  },30_000)
+
+  test('model change refreshes the catalog and starts the newly available Sol', async () => {
+    const value=fixture('defer'), rpcLog=join(value.root,'model-switch.jsonl')
+
+    const result=await executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,
+      selectModel:async (requests,catalog)=> {
+        if(requests.length===1) { expect(catalog.some(m=>m.id==='gpt-6.1-sol')).toBe(false); return 'gpt-6-astra' }
+        expect(catalog.some(m=>m.id==='gpt-6.1-sol')).toBe(true); return 'gpt-6.1-sol'
+      },
+      extraEnvironment:{ZERO_FIXTURE_MODE:'defer',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1',ZERO_NEW_CATALOG:'1'},
+    })
+    expect(result.result).toContain('追加入力')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    expect(rpc.filter(row=>row.method==='turn/steer')).toHaveLength(0)
+    expect(rpc.filter(row=>row.method==='turn/interrupt')).toHaveLength(1)
+    expect(rpc.filter(row=>row.method==='thread/resume')[0].model).toBe('gpt-6.1-sol')
+    expect(rpc.filter(row=>row.method==='turn/start').map(row=>row.model)).toEqual(['gpt-6-astra','gpt-6.1-sol'])
+    expect(value.store.listJobControls(value.job.id)[0]?.status).toBe('observed')
+    value.store.close()
+  },30_000)
+
+  test('model-switch terminal failure preserves input and never starts Sol',async()=>{
+    const value=fixture('defer'),rpcLog=join(value.root,'model-switch-failure.jsonl')
+    await expect(executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,
+      selectModel:async requests=>requests.length>1?'gpt-6-sol':'gpt-6-astra',
+      extraEnvironment:{ZERO_FIXTURE_MODE:'defer',ZERO_RPC_LOG:rpcLog,ZERO_MODEL_INTERRUPT_FAILED:'1'},
+    })).rejects.toThrow('model switch interrupted turn ended in failure')
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    expect(rpc.filter(row=>row.method==='turn/start').map(row=>row.model)).toEqual(['gpt-6-astra'])
+    expect(value.store.listJobControls(value.job.id)[0]?.status).toBe('ready')
+    value.store.close()
+  },30_000)
+
+  test('cancellation aborts model classification before any primary thread starts',async()=>{
+    const value=fixture('normal'),rpcLog=join(value.root,'model-classify-cancel.jsonl')
+    await expect(executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,
+      selectModel:async(_requests,_catalog,signal)=>new Promise((resolve,reject)=>{
+        const target=value.store.liveControlTarget(value.job.chatId,value.job.threadTs)!
+        value.store.stageLiveControl(target,{chatId:value.job.chatId,threadTs:value.job.threadTs,
+          messageId:'1800000000.000300',userId:'UROOT',task:'中止',kind:'interrupt'})
+        signal!.addEventListener('abort',()=>reject(new DOMException('cancelled','AbortError')),{once:true})
+      }),
+      extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+    })).rejects.toBeInstanceOf(CodexUserCancelledError)
+    expect(existsSync(rpcLog)?readFileSync(rpcLog,'utf8').trim():'').toBe('')
+    value.store.close()
+  },30_000)
+
   test('同じthreadの別user返信をactive turnへsteerする', async () => {
     const value = fixture('steer')
     const processIds: number[] = []
@@ -5613,7 +5844,7 @@ describe('production App Server executor', () => {
     value.store.close()
   })
 
-  test.each([false, true])('同じthreadの質問へ先に回答してから元のtaskを同じCodex threadで再開する (unknown cleanup=%s)', async injectUnknown => {
+  test.each([[false, ''], [true, ''], [false, 'once'], [false, 'twice'], [false, 'refresh']] as const)('同じthreadの質問へ先に回答してから元のtaskを同じCodex threadで再開する (unknown cleanup=%s, repair=%s)', async (injectUnknown, repair) => {
     const value = fixture('interjection-answer')
     const fixtureState = join(value.root, 'interjection-answer.state')
     const promptLog = join(value.root, 'interjection-answer-prompts.log')
@@ -5646,6 +5877,7 @@ describe('production App Server executor', () => {
       skipEffectiveConfigCheck: true,
       extraEnvironment: {
         ZERO_FIXTURE_MODE: 'interjection-answer',
+        ZERO_INTERJECTION_REPAIR: repair,
         ZERO_INTERJECTION_FIXTURE_STATE: fixtureState,
         ZERO_PROMPT_LOG: promptLog,
         ZERO_PHASE_LOG: phaseLog,
@@ -5657,7 +5889,7 @@ describe('production App Server executor', () => {
       liveControls: value.hooks,
     })
 
-    const notification = await waitForInterjectionNotification(value.store)
+    const notification = await waitForInterjectionNotification(value.store, 15_000)
     expect(value.store.get(value.job.id)?.inputRevision).toBe(1)
     expect(value.store.listJobControls(value.job.id)).toHaveLength(0)
     expect(value.store.listJobInterjections(value.job.id)[0]).toMatchObject({
@@ -5691,25 +5923,31 @@ describe('production App Server executor', () => {
     expect(deliveryTrace).toEqual(['staged', 'delivered', 'promoted'])
     const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
       .map(line => JSON.parse(line) as { stage: string, text: string })
-    expect(prompts.map(prompt => prompt.stage)).toEqual([
-      'complete', 'interjection', 'complete',
-    ])
+    const answerCount = repair === 'twice' ? 3 : repair === 'once' ? 2 : 1
+    const expectedStages = ['complete', ...Array(answerCount).fill('interjection'), 'complete']
+    expect(prompts.map(prompt => prompt.stage)).toEqual(expectedStages)
     expect(prompts[0]!.text).not.toContain('今はどこまで進んでいますか？')
     expect(prompts[1]!.text).toContain('今はどこまで進んでいますか？')
-    expect(prompts[2]!.text).not.toContain('今はどこまで進んでいますか？')
+    expect(prompts.at(-1)!.text).not.toContain('今はどこまで進んでいますか？')
     const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
       .map(line => line.split('\t'))
-    expect(phases.map(row => row[0])).toEqual(['complete', 'interjection', 'complete'])
-    expect(phases.map(row => row[3])).toEqual(['thread/start', 'thread/resume', 'thread/resume'])
+    expect(phases.map(row => row[0])).toEqual(expectedStages)
+    expect(phases.map(row => row[3])).toEqual(expectedStages.map((_, i) => i === 0 ? 'thread/start' : 'thread/resume'))
     expect(new Set(phases.map(row => row[2])).size).toBe(1)
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n')
-      .map(line => JSON.parse(line) as { method: string })
-    expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(3)
+      .map(line => JSON.parse(line) as { method: string; clientUserMessageId?: string; outputSchema?: unknown })
+    const starts = rpc.filter(row => row.method === 'turn/start')
+    expect(starts).toHaveLength(expectedStages.length)
+    expect(starts[1]!.outputSchema).toBeDefined()
+    expect(starts[0]!.outputSchema).toBeNull()
+    for (let generation = 1; generation < answerCount; generation += 1) {
+      expect(starts[generation + 1]!.clientUserMessageId)
+        .toBe(`${starts[1]!.clientUserMessageId}:repair:${generation}`)
+    }
     expect(rpc.filter(row => row.method === 'turn/steer')).toHaveLength(1)
-    expect(rpc.filter(row => row.method === 'thread/resume')).toEqual([
-      expect.objectContaining({ excludeTurns: true }),
-      expect.objectContaining({ excludeTurns: true }),
-    ])
+    expect(rpc.filter(row => row.method === 'thread/resume')).toEqual(
+      expectedStages.slice(1).map(() => expect.objectContaining({ excludeTurns: true })),
+    )
     value.store.close()
   }, 30_000)
 
@@ -5997,7 +6235,7 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test('元turnがterminal済みのlate質問へ回答して完了済みtaskを再実行しない', async () => {
+  test.each(['', 'once'])('元turnがterminal済みのlate質問へ回答して完了済みtaskを再実行しない (repair=%s)', async repair => {
     const value = fixture('interjection-late-answer')
     const phaseLog = join(value.root, 'late-interjection-phases.log')
     const rpcLog = join(value.root, 'late-interjection-rpc.log')
@@ -6043,6 +6281,7 @@ describe('production App Server executor', () => {
       skipEffectiveConfigCheck: true,
       extraEnvironment: {
         ZERO_FIXTURE_MODE: 'interjection-late-answer',
+        ZERO_INTERJECTION_REPAIR: repair,
         ZERO_PHASE_LOG: phaseLog,
         ZERO_RPC_LOG: rpcLog,
       },
@@ -6059,15 +6298,16 @@ describe('production App Server executor', () => {
     const result = await execution
 
     expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
-    expect(processIds).toHaveLength(2)
-    expect(new Set(processIds).size).toBe(2)
+    const count = repair ? 3 : 2
+    expect(processIds).toHaveLength(count)
+    expect(new Set(processIds).size).toBe(count)
     const phases = readFileSync(phaseLog, 'utf8').trim().split('\n')
       .map(line => line.split('\t'))
-    expect(phases.map(row => row[0])).toEqual(['complete', 'interjection'])
-    expect(phases.map(row => row[3])).toEqual(['thread/start', 'thread/resume'])
+    expect(phases.map(row => row[0])).toEqual(['complete', 'interjection', ...(repair ? ['interjection'] : [])])
+    expect(phases.map(row => row[3])).toEqual(['thread/start', 'thread/resume', ...(repair ? ['thread/resume'] : [])])
     const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n')
       .map(line => JSON.parse(line) as { method: string })
-    expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(2)
+    expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(count)
     expect(rpc.filter(row => row.method === 'turn/steer')).toHaveLength(0)
     expect(value.store.get(value.job.id)?.inputRevision).toBe(1)
     expect(value.store.listJobControls(value.job.id)).toHaveLength(0)

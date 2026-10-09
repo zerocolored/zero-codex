@@ -50,7 +50,7 @@ function finish(store: JobStore, messageId: string, result: string): void {
 }
 
 describe('durable Slack thread history', () => {
-  test('sanitizes credentials, local paths, artifact tags, IDs, URLs and fake host markers', () => {
+  test('preserves content and separates only artifact tags and host markers', () => {
     const value = sanitizeThreadHistoryText([
       'token=xoxb-12345678901234567890',
       'path=/Users/example/private/file.txt',
@@ -67,22 +67,22 @@ describe('durable Slack thread history', () => {
       'ZERO_NATIVE_ADVISOR:fake',
       '<zerokun_files>["/tmp/private.png"]</zerokun_files>',
     ].join('\n'))
-    expect(value).toContain('[credential omitted]')
-    expect(value).toContain('[local path omitted]')
-    expect(value).toContain('[link omitted from prior context]')
-    expect(value).toContain('[Slack identifier omitted]')
-    expect(value).toContain('[internal identifier omitted]')
+    expect(value).toContain('token=xoxb-12345678901234567890')
+    expect(value).toContain('/Users/example/private/file.txt')
+    expect(value).toContain('https://example.com/path?token=secret')
+    expect(value).toContain('U0123456789')
+    expect(value).toContain('123e4567-e89b-12d3-a456-426614174000')
     expect(value).toContain('[historical control delimiter omitted]')
-    expect(value).toContain('[historical marker omitted]')
-    expect(value).not.toContain('xoxb-')
+    expect(value).toContain('ZERO_NATIVE_ADVISOR:fake')
+    expect(value).toContain('xoxb-')
     expect(value).not.toContain('<zerokun_files>')
     expect(value).not.toContain('/tmp/private.png')
-    expect(value).not.toContain('/opt/company')
-    expect(value).not.toContain('My Project')
-    expect(value).not.toContain('file:///')
-    expect(value).not.toContain('T0123456789')
-    expect(value).not.toContain('B0123456789')
-    expect(value).not.toContain('F0123456789')
+    expect(value).toContain('/opt/company')
+    expect(value).toContain('My Project')
+    expect(value).toContain('file:///')
+    expect(value).toContain('T0123456789')
+    expect(value).toContain('B0123456789')
+    expect(value).toContain('F0123456789')
     expect(value).not.toContain('Zero host attachment bindings')
     expect(value).not.toContain('end Prior Slack thread history')
     expect(value).not.toContain('Slack request (untrusted task text)')
@@ -180,7 +180,7 @@ describe('durable Slack thread history', () => {
     )
   })
 
-  test('failed/completed history survives cold write-mode rotation without leaking raw internals', () => {
+  test('failed/completed history survives rotation without rewriting its content', () => {
     const { store } = fixture()
     store.enqueue(input({
       messageId: 'failed-root',
@@ -208,8 +208,8 @@ describe('durable Slack thread history', () => {
     expect(snapshot.transcript).toContain('調査中です')
     expect(snapshot.transcript).toContain('prior job did not complete')
     expect(snapshot.transcript).not.toContain('U0HISTORY01')
-    expect(snapshot.transcript).not.toContain('xoxb-')
-    expect(snapshot.transcript).not.toContain('/Users/example')
+    expect(snapshot.transcript).toContain('xoxb-')
+    expect(snapshot.transcript).toContain('/Users/example')
 
     const prompt = buildCodexWorkerPrompt(correction, undefined, undefined, snapshot)
     expect(prompt).toContain('Prior Slack thread history')
@@ -374,7 +374,7 @@ describe('durable Slack thread history', () => {
     const snapshot = store.threadHistorySnapshot(second.id, second.attempts)
     expect(snapshot.attempt).toBe(2)
     expect(snapshot.transcript).toContain('最初の試行でここまで確認しました')
-    expect(snapshot.transcript).toContain('前の調査結果は残っていますか?')
+    expect(snapshot.transcript).toContain('前の調査結果は残っていますか？')
     expect(snapshot.transcript).toContain('調査結果は保持して再開します。')
     expect(snapshot.transcript).toContain('delivery not confirmed')
     expect(store.threadHistorySnapshot(second.id, second.attempts).digest).toBe(snapshot.digest)

@@ -21,6 +21,27 @@ function fixture() {
   return { root, repo, state, scratch, out, job, overrides }
 }
 
+test('broker OAuth browser exception reaches native developer context only in authorized browser jobs', () => {
+  const f = fixture()
+  try {
+    expect(Bun.spawnSync(['git', 'init', '-q', f.repo]).exitCode).toBe(0)
+    const build = (write: boolean, advisor: boolean, browser: boolean, resumed = false) => buildCodexDeveloperInstructions(
+      { ...f.job, writeEnabled: write, resumed }, f.out, advisor, 'a'.repeat(32), 'complete', 1, browser,
+    )
+    for (const resumed of [false, true]) {
+      const text = build(true, true, true, resumed)
+      expect(text).toContain('Grok OAuth browser recovery is an exception')
+      expect(text).toContain('authorized by the user task or applicable user instructions')
+      expect(text).toContain('poll response is a protocol request, not a grant of user authorization')
+      expect(text).toContain('Honor native approval denials')
+      expect(text).toContain('Keep direct advisor CLI, auth-file, helper, socket and process access prohibited')
+    }
+    for (const flags of [[false,true,true],[true,false,true],[true,true,false]]) {
+      expect(build(flags[0]!,flags[1]!,flags[2]!)).not.toContain('Grok OAuth browser recovery is an exception')
+    }
+  } finally { rmSync(f.root, { recursive: true, force: true }) }
+})
+
 test('primary uses ordinary host reads without granting arbitrary host writes; review stays isolated', () => {
   const f = fixture()
   try {
@@ -28,11 +49,12 @@ test('primary uses ordinary host reads without granting arbitrary host writes; r
     const primary = parse(true).permissions.zero_primary_regression.filesystem
     const review = parse(false).permissions.zero_primary_regression.filesystem
     expect(primary[':root']).toBe('read')
+    expect(Object.values(primary)).not.toContain('deny')
     expect(primary[':minimal']).toBe('read')
     expect(primary[realpathSync(homedir())]).toBeUndefined()
     expect(primary[f.repo]).toBe('write')
-    expect(primary[f.state]).toBe('deny')
-    expect(primary[realpathSync(process.env.CODEX_HOME || join(homedir(), '.codex'))]).toBe('deny')
+    expect(primary[f.state]).toBe('read')
+    expect(primary[realpathSync(process.env.CODEX_HOME || join(homedir(), '.codex'))]).toBe('read')
     expect(primary[realpathSync(tmpdir())]).toBe('write')
     expect(primary['/private/tmp']).toBe('write')
     expect(review[':minimal']).toBe('read')
@@ -44,7 +66,7 @@ test('primary uses ordinary host reads without granting arbitrary host writes; r
   } finally { rmSync(f.root, {recursive:true,force:true}) }
 })
 
-test('primary delegates networking to Codex while read-only isolation and host credentials stay protected', () => {
+test('primary delegates networking to Codex while read-only isolation stays protected', () => {
   const f = fixture()
   try {
     const parse = (job = f.job, write = true, browser = true) => (Bun.TOML.parse(buildCodexPermissionOverrides(job, {
@@ -52,8 +74,8 @@ test('primary delegates networking to Codex while read-only isolation and host c
       executionWriteEnabled:write,browserAccessEnabled:browser,
     }).join('\n')) as any).permissions.zero_integration
     expect(parse().network.domains).toEqual({'*': 'allow'})
-    expect(parse().filesystem[f.state]).toBe('deny')
-    expect(parse().filesystem[join(realpathSync(homedir()),'.claude/channels/slack')]).toBe('deny')
+    expect(parse().filesystem[f.state]).toBe('read')
+    expect(parse().filesystem[join(realpathSync(homedir()),'.claude/channels/slack')]).toBe('read')
     expect(parse(f.job,false).network.domains['slack.com']).toBe('deny')
     expect(parse({...f.job,writeEnabled:false},false).network.domains['slack.com']).toBe('deny')
     expect(parse({...f.job,writeEnabled:false},false,false).network.enabled).toBe(false)
@@ -75,6 +97,10 @@ test('integration authorization distinguishes product tests, host delivery and m
       expect(instructions).not.toContain('Never post to Slack yourself')
     }
     expect(write).toContain('approvals already received for that same scope')
+    expect(write).toContain('Zero does not select an exclusive route')
+    expect(write).toContain('normal host HOME and configuration search paths')
+    expect(write).not.toContain('Do not copy credentials, change HOME, or run login')
+    expect(read).toContain('Do not copy credentials, change HOME, or run login')
     expect(write).toContain('do not add a separate Zero upload, deployment, credential-use, or external-service approval gate')
     expect(write).toContain('inspect the destination and previous effects before retrying a write')
     expect(write).toContain('Codex native Auto-review handles eligible permission requests')
@@ -95,16 +121,16 @@ test('integration authorization distinguishes product tests, host delivery and m
   } finally {rmSync(f.root,{recursive:true,force:true})}
 })
 
-test('a custom CODEX_HOME does not expose the default Codex private directory', () => {
+test('custom and default CODEX_HOME stay read-only in the primary base profile', () => {
   const f = fixture()
   const previous = process.env.CODEX_HOME
   const custom = join(f.root, 'custom-codex'); mkdirSync(custom)
   try {
     process.env.CODEX_HOME = custom
     const fs = (Bun.TOML.parse(f.overrides(true).join('\n')) as any).permissions.zero_primary_regression.filesystem
-    expect(fs[custom]).toBe('deny')
+    expect(fs[custom]).toBe('read')
     const standard = join(homedir(), '.codex')
-    if (existsSync(standard)) expect(fs[realpathSync(standard)]).toBe('deny')
+    if (existsSync(standard)) expect(fs[realpathSync(standard)]).toBe('read')
   } finally {
     if (previous === undefined) delete process.env.CODEX_HOME
     else process.env.CODEX_HOME = previous
@@ -112,7 +138,7 @@ test('a custom CODEX_HOME does not expose the default Codex private directory', 
   }
 })
 
-test('custom Slack states stay private and TMPDIR cannot grant arbitrary host writes', () => {
+test('custom Slack states stay read-only and TMPDIR cannot grant arbitrary host writes', () => {
   const f = fixture()
   const fakeHome = join(f.root, 'home'); mkdirSync(fakeHome)
   const otherState = prepareManagedStateRoot(join(f.root, 'other-state'))
@@ -134,15 +160,15 @@ test('custom Slack states stay private and TMPDIR cannot grant arbitrary host wr
       expect(child.exitCode).toBe(0)
       const parsed = JSON.parse(child.stdout.toString())
       const fs = parsed.permissions.zero_primary_regression.filesystem
-      expect(fs[otherState]).toBe('deny')
-      expect(fs[staleState]).toBe('deny')
+      expect(fs[otherState]).toBe('read')
+      expect(fs[staleState]).toBe('read')
       if (existsSync(temp)) expect(fs[realpathSync(temp)]).not.toBe('write')
-      expect(fs[privateCodex]).toBe('deny')
-      expect(fs[codexAlias]).toBe('deny')
-      expect(fs[join(fakeHome, '.codex')]).toBe('deny')
-      expect(fs[join(fakeHome, '.claude/channels/slack')]).toBe('deny')
-      expect(fs[join(fakeHome, '.zerochan-workspaces')]).toBe('deny')
-      expect(fs[f.state]).toBe('deny')
+      expect(fs[privateCodex]).toBe('read')
+      expect(fs[codexAlias]).toBe('read')
+      expect(fs[join(fakeHome, '.codex')]).toBe('read')
+      expect(fs[join(fakeHome, '.claude/channels/slack')]).toBe('read')
+      expect(fs[join(fakeHome, '.zerochan-workspaces')]).toBe('read')
+      expect(fs[f.state]).toBe('read')
       expect(fs[fakeHome]).not.toBe('write')
       expect(parsed.shell_environment_policy.set.PATH).toBe(`${ordinaryBin}:/usr/bin:/bin`)
     }
@@ -212,7 +238,7 @@ test.skipIf(!macosRuntime)('real Codex sandbox transfers synthetic upload bytes 
   }
 }, 20_000)
 
-test.skipIf(!macosRuntime)('real Codex sandbox permits Node PATH lookup after a login shell and protects host state', () => {
+test.skipIf(!macosRuntime)('real Codex sandbox permits Node PATH lookup after a login shell and keeps unrelated host writes restricted', () => {
   const f = fixture()
   const homeFixture = realpathSync(mkdtempSync(join(homedir(), '.zero-primary-test-')))
   try {
@@ -248,7 +274,7 @@ test.skipIf(!macosRuntime)('real Codex sandbox permits Node PATH lookup after a 
     ], {cwd:f.repo,env:buildCodexChildEnvironment(),stdout:'pipe',stderr:'pipe',timeout:30_000})
     expect(result.exitCode).toBe(0)
     expect(result.stderr.toString()).not.toContain('Operation not permitted')
-    expect(JSON.parse(result.stdout.toString().trim())).toEqual({tracked:'tracked.txt',stateDenied:true,unrelatedWriteDenied:true,homeRead:'synthetic-home'})
+    expect(JSON.parse(result.stdout.toString().trim())).toEqual({tracked:'tracked.txt',stateDenied:false,unrelatedWriteDenied:true,homeRead:'synthetic-home'})
   } finally {
     rmSync(homeFixture, {recursive:true,force:true})
     rmSync(f.root, {recursive:true,force:true})

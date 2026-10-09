@@ -3,6 +3,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { browserRuntimeContext, stageBrowserRuntime } from './browser-runtime-context.ts'
+import dialogTransport from './fixtures/browser-dialog-transport.json'
+import { browserDialogCompatibility } from './browser-dialog-compat.ts'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
@@ -118,6 +120,20 @@ test('staging preserves explicit distribution denials and disabled transports', 
   const disabled = f.input.map(x => x === 'features.browser_use=true' ? 'features.browser_use=false' : x)
   expect(f.stage(disabled)).toEqual(disabled)
   expect(existsSync(f.destination)).toBe(false)
+})
+
+test.each([0o644, 0o444])('dialog fix changes only the job copy and retains native approval configuration (mode=%s)', mode => {
+  const f = stagingFixture()
+  const source = dialogTransport.methods.join('\n')
+  const installed = join(f.selected, 'browser-service.mjs')
+  writeFileSync(installed, source)
+  chmodSync(installed, mode)
+  const input = [...f.input, 'approval_policy="on-request"', 'approvals_reviewer="auto_review"']
+  const output = f.stage(input)
+  expect(readFileSync(installed, 'utf8')).toBe(source)
+  expect(readFileSync(join(f.destination, 'scripts/browser-service.mjs'), 'utf8')).toBe(browserDialogCompatibility(source).source)
+  expect(output).toContain('approval_policy="on-request"')
+  expect(output).toContain('approvals_reviewer="auto_review"')
 })
 
 test('staging refuses linked distribution contents and keeps a preexisting destination intact', () => {

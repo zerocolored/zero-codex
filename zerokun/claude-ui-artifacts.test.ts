@@ -7,14 +7,36 @@ import { advisorPrompt } from './advisor-broker.ts'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
+test('missing Before preserves the requested comparison and explicitly degrades the effective evidence', async () => {
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'zero-ui-missing-')))
+  roots.push(stateDir)
+  const proposal = { comparison: 'Current inbox, light, scroll zero', beforeKind: 'actual' as const, beforeImage: 'missing.png' }
+  const workspace = await createClaudeUiWorkspace({ stateDir, jobId: 'test-job', proposal })
+  roots.push(workspace.root)
+  expect(workspace.beforeWarning).toBe('missing-before-image')
+  expect(existsSync(join(workspace.root, 'input/before.png'))).toBe(false)
+  expect(JSON.parse(readFileSync(join(workspace.root, 'input/comparison.json'), 'utf8'))).toMatchObject({
+    beforeKind: 'unavailable', requestedComparison: proposal, warning: 'missing-before-image',
+  })
+})
+
+test('a symlink Before is rejected without treating it as missing or reading its target', async () => {
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'zero-ui-unsafe-')))
+  roots.push(stateDir)
+  mkdirSync(join(stateDir, 'outbox/test-job'), { recursive: true, mode: 0o700 })
+  symlinkSync('/nonexistent-target', join(stateDir, 'outbox/test-job/before.png'))
+  await expect(createClaudeUiWorkspace({ stateDir, jobId: 'test-job', proposal: {
+    comparison: 'Current inbox', beforeKind: 'actual', beforeImage: 'before.png',
+  } })).rejects.toThrow()
+})
 async function fixture() {
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'zero-ui-artifact-test-')))
   chmodSync(stateDir, 0o700); roots.push(stateDir)
   const workspace = await createClaudeUiWorkspace({ stateDir, jobId: 'test-job', proposal: {
-    comparison: 'Synthetic settings screen, dark theme, scroll 0, no focus', beforeKind: 'synthetic',
+    comparison: 'Synthetic settings screen: view bearer vs callback, dark theme, scroll 0, no focus', beforeKind: 'synthetic',
   } })
   roots.push(workspace.root)
-  writeFileSync(join(workspace.root, 'prototype', 'index.html'), '<!doctype html><title>Settings</title><h1>Settings</h1>', { mode: 0o600 })
+  writeFileSync(join(workspace.root, 'prototype', 'index.html'), '<!doctype html><title>Settings</title><h1>Settings</h1><p>Authorization: Bearer synthetic-example</p>', { mode: 0o600 })
   return { workspace, stateDir, jobId: 'test-job' }
 }
 function png(workspace: ClaudeUiWorkspace, width = 1280) {

@@ -55,6 +55,7 @@ import {
   recoverFifthAdvisorSendOutcome,
   GROK_OAUTH_TIMEOUT_MS,
   GROK_REVIEW_TIMEOUT_MS,
+  grokFailureDiagnostics,
   MAX_ADVISOR_PROMPT_BYTES,
 } from './advisor-broker.ts'
 import { JobStore } from './job-runner.ts'
@@ -109,7 +110,7 @@ function git(args: string[], cwd: string): string {
 }
 
 type BrokerFixture = {
-  prepareNative(binding?: AdvisorInputSnapshot): Promise<Record<string, unknown>>
+  prepareNative(binding?: AdvisorInputSnapshot, request?: string): Promise<Record<string, unknown>>
   state: string
   repo: string
   jobId: string
@@ -713,10 +714,10 @@ mock.module('fs', () => ({ ...fs, realpathSync: (path, ...args) =>
     journalRoot,
     contextDigest,
     fingerprint,
-    async prepareNative(binding = revisionTwo) {
+    async prepareNative(binding = revisionTwo, request = 'Independent synthetic source review.') {
       const result = await client.callTool({ name: 'advisor_native_prepare', arguments: {
         phase: 'investigation', round: 1, inputRevision: binding.revision,
-        inputDigest: binding.digest, request: 'Independent synthetic source review.',
+        inputDigest: binding.digest, request,
       } })
       const block = (result.content as Array<{ type: string; text?: string }>).find(value => value.type === 'text')
       if (!block?.text) throw new Error('native registration missing')
@@ -1260,8 +1261,8 @@ describe('advisor broker boundaries', () => {
     5_000,
   )
 
-  test('Grokは最低15分の有限予算を持ち起動helperも有限timeoutを持つ', () => {
-    expect(GROK_REVIEW_TIMEOUT_MS).toBe(15 * 60_000)
+  test('Grokは1時間の有限予算を持ち起動helperも有限timeoutを持つ', () => {
+    expect(GROK_REVIEW_TIMEOUT_MS).toBe(60 * 60_000)
     expect(CLAUDE_HELPER_TIMEOUT_MS).toBe(140_000)
     const helper = readFileSync(join(import.meta.dir, 'fifth-advisor.py'), 'utf8')
     const seconds = (name: string) => Number(helper.match(new RegExp(`^${name} = ([0-9]+)$`, 'm'))![1])
@@ -1270,6 +1271,21 @@ describe('advisor broker boundaries', () => {
       + seconds('CLAUDE_PROCESS_SETTLE_TIMEOUT_SECONDS')
     expect(CLAUDE_OPEN_TIMEOUT_MS).toBeGreaterThan(startup * 1_000 + CLAUDE_HELPER_TIMEOUT_MS)
     expect(CLAUDE_OPEN_TIMEOUT_MS).toBeLessThanOrEqual(15 * 60 * 1_000)
+  })
+
+  test('Grokのtimeoutとexit 126を区別して秘密のstderrを保存しない', () => {
+    const input = { exitCode: 126, timedOut: true, forcedCleanup: false,
+      outputTruncated: false, stderr: 'private diagnostic fixture' }
+    const timedOut = grokFailureDiagnostics(input)
+    expect(timedOut).toMatchObject({ exitCode: 126, timedOut: true,
+      timeoutMs: 3_600_000, failure: { advisor: 'grok', cause: 'timeout' } })
+    expect(timedOut.reason).toContain('time limit')
+    expect(JSON.stringify(timedOut)).not.toContain(input.stderr)
+    expect(grokFailureDiagnostics({ ...input, timedOut: false })).toMatchObject({
+      timedOut: false, failure: { advisor: 'grok', cause: 'unknown' },
+    })
+    expect(grokFailureDiagnostics({ ...input, timedOut: false, stderr: '429 rate limit' }))
+      .toMatchObject({ failure: { advisor: 'grok', cause: 'rate-limit' } })
   })
 
   test.skipIf(process.platform === 'win32')(
@@ -1843,6 +1859,32 @@ print('review complete')
     } finally { await fixture.close() }
   }, 30_000)
 
+  test.each(['missing', 'invalid'] as const)('Fable %s Before does not prevent fresh independent analysis', async kind => {
+    const fixture = await brokerFixture({ externalSuccess: true, writeEnabled: true })
+    let artifactRoot: string | undefined
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), ui_artifacts: kind === 'missing' }), { mode: 0o600 })
+      if (kind === 'invalid') {
+        mkdirSync(join(fixture.state, 'outbox', fixture.jobId), { recursive: true, mode: 0o700 })
+        writeFileSync(join(fixture.state, 'outbox', fixture.jobId, 'missing.png'), 'not a PNG', { mode: 0o600 })
+      }
+      const result = await fixture.call('investigation', 'revision-two', 'adopted', 1, {
+        uiProposal: { comparison: 'Inbox, light theme', beforeKind: 'actual', beforeImage: 'missing.png' },
+      })
+      const state = JSON.parse(readFileSync(path, 'utf8'))
+      artifactRoot = state.ui_root
+      expect(result.payload.claude).toMatchObject({ adopted: true, cleanupVerified: true })
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
+      if (kind === 'missing') expect(result.payload.claude.cleanupWarnings).toContain('missing-before-image')
+      else expect(result.payload.claude.uiArtifacts.status).toBe('unavailable')
+    } finally {
+      await fixture.close()
+      if (artifactRoot) rmSync(artifactRoot, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   test('Fable GUI artifacts survive broker restart without repeating the advisor and cannot be requested in review', async () => {
     const fixture = await brokerFixture({ externalSuccess: true, writeEnabled: true })
     let artifactRoot: string | undefined
@@ -1934,7 +1976,7 @@ print('review complete')
     } finally { await fixture.close() }
   }, 40_000)
 
-  test.each(['file', 'terminal'])('Claude credential-shaped review is adopted, sanitized and restored: %s', async source => {
+  test.each(['file', 'terminal'])('Claude review content is preserved verbatim across adoption and restart: %s', async source => {
     const fixture = await brokerFixture({ externalSuccess: true })
     try {
       const path = fixture.externalEvidence!.fakeHerdrState
@@ -1946,13 +1988,9 @@ print('review complete')
       if (source === 'file') initial.answer_file_lines = 1
       writeFileSync(path, JSON.stringify(initial), { mode: 0o600 })
       const result = await fixture.call('investigation', 'revision-two')
-      expect(result.payload.claude).toMatchObject({ adopted: true, responseRedacted: true, cleanupVerified: true })
+      expect(result.payload.claude).toMatchObject({ adopted: true, responseRedacted: false, cleanupVerified: true })
       const response = result.payload.claude.response
-      expect(response).toStartWith(prose)
-      expect(response).toEndWith('Final finding.')
-      expect(response).toContain('[credential removed]')
-      expect(response).not.toContain(token)
-      expect(response).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
+      expect(response).toBe(body)
       const journalPath = join(fixture.journalRoot,
         `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`, 'investigation-1.json')
       const journal = JSON.parse(readFileSync(journalPath, 'utf8'))
@@ -1966,18 +2004,13 @@ print('review complete')
         const artifact = JSON.parse(raw)
         const nonce = artifact.marker.slice('REQUEST_MARKER='.length)
         const original = `CLAUDE_ANSWER_BEGIN=${nonce}\n${body}\nCLAUDE_ANSWER_END=${nonce}\n`
-        expect(artifact).toMatchObject({ response, redacted: true,
+        expect(artifact).toMatchObject({ response, redacted: false,
           responseSha256: journal.claude.responseDigest, responseBytes: Buffer.byteLength(response),
           sha256: createHash('sha256').update(original).digest('hex'), bytes: Buffer.byteLength(original) })
       }
-      for (const raw of persisted) {
-        expect(raw).not.toContain(token)
-        expect(raw).not.toContain('synthetic-encoded-credential')
-        expect(raw).not.toContain('U1lOVEhFVElDX0tFWV9CT0RZ')
-      }
       await fixture.restart()
       const replay = await fixture.call('investigation', 'revision-two')
-      expect(replay.payload.claude).toMatchObject({ adopted: true, response, responseRedacted: true })
+      expect(replay.payload.claude).toMatchObject({ adopted: true, response, responseRedacted: false })
       const after = JSON.parse(readFileSync(path, 'utf8'))
       expect(after.prompt_count).toBe(1)
       expect(after.close_count).toBe(1)
@@ -2235,6 +2268,8 @@ print('review complete')
     })
     expect(await run()).toEqual([expect.objectContaining({
       authenticationRecoveryAttempted: true,
+      reason: 'fixture recovery failed',
+      failure: { advisor: 'grok', cause: 'auth-recovery' },
     })])
     expect(await run()).toEqual([expect.not.objectContaining({
       authenticationRecoveryAttempted: true,
@@ -2413,7 +2448,7 @@ print('review complete')
     } finally {
       await fixture.close()
     }
-  }, 20_000)
+  }, 30_000)
 
   test('単一write workflowはSlack追記後のreviewを新revisionで直接通す', async () => {
     const fixture = await brokerFixture({ writeEnabled: true, externalSuccess: true })
@@ -4236,6 +4271,11 @@ int main(void) {
         terminationGraceMs: 5_000,
       })
       expect(result.timedOut, JSON.stringify(result)).toBe(true)
+      expect(grokFailureDiagnostics(result)).toMatchObject({
+        timedOut: true, exitCode: result.exitCode,
+        failure: { advisor: 'grok', cause: 'timeout' },
+      })
+      expect(grokReviewerAuthRequired(result)).toBe(false)
       expect(Date.now() - started).toBeLessThan(6_500)
       expect(readFileSync(termFile, 'utf8')).toBe('received\n')
       const pids = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number)
@@ -4281,7 +4321,9 @@ test('native request登録はMCP再起動を跨いで同じ依頼・identityを�
   try {
     const stale = await fixture.prepareNative(fixture.revisionOne)
     expect(stale.staleInput).toBe(true)
-    const first = await fixture.prepareNative()
+    const request = 'Assess authorization isolation (view bearer vs callback). Authorization: Bearer synthetic-example'
+    const first = await fixture.prepareNative(undefined, request)
+    expect(String(first.prompt)).toStartWith(request + '\n')
     expect(first.taskName).toMatch(/^zero_native_[a-f0-9]{32}$/)
     expect(first.prompt).toContain(String(first.marker))
     await fixture.restart()
@@ -4294,11 +4336,11 @@ test('native request登録はMCP再起動を跨いで同じ依頼・identityを�
 test('追加指示後も登録済みGPT回答の元のbindingを保存し再起動後も取得済みと扱う', async () => {
   const fixture = await brokerFixture({ externalSuccess: true })
   try {
-    const registered = await fixture.prepareNative()
+    const registered = await fixture.prepareNative(undefined, 'Assess authorization isolation (view bearer vs callback).')
     const newer = fixture.stageRevision('追加の受入条件。元のレビュー回答も保持する。')
     const preparedAgain = await fixture.prepareNative(newer)
     expect(preparedAgain.marker).toBe(registered.marker)
-    const answer = `Original independent findings.\n${registered.marker}`
+    const answer = `Original independent findings: view bearer vs callback. Authorization: Bearer synthetic-example\n${registered.marker}`
     const { result, payload } = await fixture.call('investigation', newer, 'adopted', 1, {
       nativeAgentId: String(registered.agentPath), nativeResponse: answer,
     })

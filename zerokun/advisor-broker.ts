@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
 import { captureClaudeUsage, ownedClaudeUsageSession } from './task-usage.ts'
 
 import { createHash, randomBytes, timingSafeEqual } from 'crypto'
@@ -25,14 +26,17 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { GrokOAuthBrowserSession, GROK_BROWSER_ANSWERS, advisorRecoveryProgress } from './grok-oauth-browser.ts'
+import { GrokOAuthBrowserSession, GROK_BROWSER_ANSWERS, GROK_BROWSER_ABORT_REASONS, advisorRecoveryProgress } from './grok-oauth-browser.ts'
 import { readNativeAdvisorRegistrations, registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { AdvisorFailureError, advisorFailureMessage, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
-import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, sanitizeClaudeAnswer, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
+import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
+import { connectGrokChrome, driveGrokChrome, type GrokChromeControl } from './grok-oauth-chrome.ts'
 import { claudeUiProposalSchema, createClaudeUiWorkspace, claudeUiInstructions, collectClaudeUiArtifacts,
   type ClaudeUiProposal, type ClaudeUiWorkspace } from './claude-ui-artifacts.ts'
 import { watchAdvisorStopRequest } from './advisor-settlement.ts'
+import { GROK_REVIEW_TIMEOUT_MS, GROK_OAUTH_TIMEOUT_MS } from './advisor-timeouts.ts'
+export { GROK_REVIEW_TIMEOUT_MS, GROK_OAUTH_TIMEOUT_MS } from './advisor-timeouts.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { startProcessPolling } from './supervisor-watch.ts'
 import { observeProcessGeneration, readProcessIdentity, type ProcessIdentity } from './process-generation.ts'
@@ -106,7 +110,6 @@ import {
   readAdvisorInputSnapshot,
   type AdvisorInputSnapshot,
 } from './advisor-input.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 import {
   advisorPerspectiveForPhase,
   threeAdvisorRepositoryDeltaDigest,
@@ -134,6 +137,7 @@ import {
   claudeReadFailure,
   claudeReadCommandFailure,
   parseClaudeStartupDiagnostic,
+  claudeStartupFailure,
   type ClaudeFailureDiagnostic,
   type ClaudeResponseAnalysis,
   type ClaudeDiagnosticRead,
@@ -312,9 +316,7 @@ const MAX_TRANSCRIPT_CHARS = 256 * 1024
 const MAX_OUTPUT_BYTES = 256 * 1024
 export const MAX_ADVISOR_PROMPT_BYTES = 2 * 1024 * 1024
 // Reviewer infrastructure must never hold a completed task indefinitely.
-export const GROK_REVIEW_TIMEOUT_MS = 15 * 60_000
 export const CLAUDE_REVIEW_TIMEOUT_MS = 60 * 60_000
-export const GROK_OAUTH_TIMEOUT_MS = 10 * 60 * 1_000
 export const CLAUDE_HELPER_TIMEOUT_MS = 140_000
 // Open includes Herdr's 310s process budget, startup dialogs/painting and
 // exact-workspace cleanup. The transport must not kill a valid slow startup.
@@ -554,7 +556,7 @@ export async function executeGrokPanelWithRecovery<
       return [{
         ...options.unavailable(perspective, recovery.reason),
         authenticationRecoveryAttempted: true,
-        failure: { advisor: 'grok', cause: 'auth-check' },
+        failure: { advisor: 'grok', cause: 'auth-recovery' },
       }]
     }
     authState = recovery.state
@@ -571,7 +573,8 @@ export async function executeGrokPanelWithRecovery<
   oauthAttempted = true
   const recovery = await options.runRecovery(authState)
   if (!recovery.recovered) {
-    outcomes[0] = { ...outcomes[0]!, authenticationRecoveryAttempted: true }
+    outcomes[0] = { ...outcomes[0]!, authenticationRecoveryAttempted: true,
+      reason: recovery.reason, failure: { advisor: 'grok', cause: 'auth-recovery' } }
     return outcomes
   }
   outcomes[0] = {
@@ -581,6 +584,60 @@ export async function executeGrokPanelWithRecovery<
   return outcomes
 }
 
+
+export async function recoverGrokAuthentication(
+  baseline: GrokAuthState,
+  onBrowser: (browser: GrokOAuthBrowserSession | undefined) => void,
+  chromeEntrypoint?: string,
+): Promise<{ recovered: boolean, reason: string, state?: GrokAuthState }> {
+  if (process.platform !== 'darwin') {
+    return { recovered: false, reason: 'automatic Grok OAuth recovery is available only on macOS' }
+  }
+  const current = classifyGrokAuthState(baseline.home)
+  if (!sameGrokAuthState(baseline, current)) {
+    return { recovered: false, reason: 'Grok authentication state changed before OAuth recovery' }
+  }
+  let browser: GrokOAuthBrowserSession | undefined
+  let chrome: GrokChromeControl | undefined
+  try {
+    const helper = resolveDedicatedGrokOAuthHelper(baseline.home)
+    if (chromeEntrypoint) chrome = await connectGrokChrome(chromeEntrypoint)
+    const browserAbort = new AbortController()
+    browser = new GrokOAuthBrowserSession(() => browserAbort.abort(), !!chrome)
+    const activeBrowser = browser
+    onBrowser(browser)
+    let stopped = false
+    const driving = chrome ? driveGrokChrome(browser, chrome, () => stopped) : undefined
+    let result: ProcessResult
+    try {
+      result = await runBounded([helper], {
+        cwd: '/', env: brokerEnvironment(), timeoutMs: GROK_OAUTH_TIMEOUT_MS,
+        terminationGraceMs: 5_000, signal: browserAbort.signal,
+        onStdin: write => activeBrowser.connect(write), onStdout: chunk => activeBrowser.feed(chunk),
+      })
+    } finally {
+      stopped = true
+      browser.finish()
+      onBrowser(undefined)
+      await driving
+      await chrome?.close()
+      chrome = undefined
+    }
+    if (result.exitCode !== 0 || result.timedOut || result.forcedCleanup
+      || result.outputTruncated || result.stderr !== ''
+      || !grokOAuthCompletionOutput(result.stdout)) {
+      return { recovered: false, reason: browser.failureReason() ?? 'bounded Grok OAuth recovery did not complete' }
+    }
+    const after = classifyGrokAuthState(baseline.home)
+    if (!grokAuthRecoveryTransitionIsSafe(baseline, after)) {
+      return { recovered: false, reason: 'Grok OAuth completion did not produce a safe auth transition' }
+    }
+    return { recovered: true, reason: 'Grok OAuth authentication recovered', state: after }
+  } catch (error) {
+    await chrome?.close().catch(() => {})
+    return { recovered: false, reason: browser?.failureReason() ?? `Grok OAuth recovery was unavailable: ${error}` }
+  }
+}
 
 type BrokerContext = {
   version: 4
@@ -614,6 +671,24 @@ type ProcessResult = {
   forcedCleanup: boolean
   outputTruncated: boolean
   trackingWarning?: string
+}
+
+/** Preserve host-observed failure facts without publishing raw model output. */
+export function grokFailureDiagnostics(result: Pick<ProcessResult,
+  'exitCode' | 'timedOut' | 'forcedCleanup' | 'outputTruncated' | 'stderr'>) {
+  return {
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+    forcedCleanup: result.forcedCleanup,
+    outputTruncated: result.outputTruncated,
+    timeoutMs: GROK_REVIEW_TIMEOUT_MS,
+    reason: result.timedOut
+      ? `Grok reviewer exceeded its response time limit (${GROK_REVIEW_TIMEOUT_MS} ms; exit ${result.exitCode})`
+      : `Grok reviewer ended without a complete response (exit ${result.exitCode})`,
+    failure: result.timedOut
+      ? { advisor: 'grok', cause: 'timeout' } as const
+      : classifyAdvisorFailure('grok', result.stderr),
+  }
 }
 
 type FingerprintPaths = { allow: string, deny: string }
@@ -699,8 +774,8 @@ function parseContext(pathInput: string, stateDir: string): BrokerContext {
 }
 
 function safeInput(value: string, label: string, maximum = MAX_INPUT_CHARS): string {
-  if (!value || value.length > maximum || value.includes('\0') || containsCredentialMaterial(value)) {
-    throw new Error(`${label} is empty, too large, or contains protected credential material`)
+  if (!value || value.length > maximum || value.includes('\0')) {
+    throw new Error(`${label} is empty, too large, or contains a NUL character`)
   }
   return value
 }
@@ -1266,6 +1341,7 @@ export function advisorPrompt(
       '他者へ再委任せず、指定された非秘密情報のread-only確認と独立の分析だけを返してください。',
     ]),
     '他advisorの結論は参照しないでください。',
+    PROPORTIONATE_DESIGN_INSTRUCTIONS,
     '',
     `入力revision: ${input.revision}`,
     `入力digest: ${input.digest}`,
@@ -1544,6 +1620,18 @@ async function main(): Promise<void> {
   const stateDir = requireManagedStateRoot(stateInput)
   const advisorRuntimeDir = requireManagedDirectory(stateDir, runtimeInput)
   const context = parseContext(contextInput, stateDir)
+  // Parent-created, per-process capability; never infer a transport from an
+  // installed path here, since the user may have disabled it in effective config.
+  let grokChromeEntrypoint: string | undefined
+  try {
+    const capability = JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(
+      join(advisorRuntimeDir, 'grok-oauth-chrome.json'), 16 * 1024) ?? 'null')
+    if (capability?.version === 1 && capability.jobId === context.jobId
+      && capability.attemptNonce === context.attemptNonce && capability.processNonce === processNonce
+      && typeof capability.entrypoint === 'string' && isAbsolute(capability.entrypoint)) {
+      grokChromeEntrypoint = capability.entrypoint
+    }
+  } catch { /* No capability: retain the official browser protocol. */ }
   if (!contained(stateDir, fingerprintAllow) || !contained(stateDir, fingerprintDeny)
     || basename(fingerprintAllow) !== 'allow' || basename(fingerprintDeny) !== 'deny'
     || dirname(fingerprintAllow) !== dirname(fingerprintDeny)) {
@@ -1906,8 +1994,7 @@ async function main(): Promise<void> {
           executionState: 'start-unconfirmed',
           containmentVerified: true,
           durationMs: Date.now() - startedAt,
-          reason: `Grok reviewer ended without a complete response (exit ${result.exitCode})`,
-          failure: classifyAdvisorFailure('grok', result.stderr),
+          ...grokFailureDiagnostics(result),
         }
       }
       return {
@@ -1940,47 +2027,6 @@ async function main(): Promise<void> {
   }
 
   let grokBrowserRecovery: GrokOAuthBrowserSession | undefined
-  const runGrokOAuthRecovery = async (
-    baseline: GrokAuthState,
-  ): Promise<{ recovered: boolean, reason: string, state?: GrokAuthState }> => {
-    if (process.platform !== 'darwin') {
-      return { recovered: false, reason: 'automatic Grok OAuth recovery is available only on macOS' }
-    }
-    const current = classifyGrokAuthState(baseline.home)
-    if (!sameGrokAuthState(baseline, current)) {
-      return { recovered: false, reason: 'Grok authentication state changed before OAuth recovery' }
-    }
-    try {
-      const helper = resolveDedicatedGrokOAuthHelper(baseline.home)
-      const browserAbort = new AbortController()
-      const browser = new GrokOAuthBrowserSession(() => browserAbort.abort())
-      grokBrowserRecovery = browser
-      let result: ProcessResult
-      try {
-        result = await runBounded([helper], {
-          cwd: '/', env: brokerEnvironment(), timeoutMs: GROK_OAUTH_TIMEOUT_MS,
-          terminationGraceMs: 5_000, signal: browserAbort.signal,
-          onStdin: write => browser.connect(write), onStdout: chunk => browser.feed(chunk),
-        })
-      } finally {
-        browser.finish()
-        if (grokBrowserRecovery === browser) grokBrowserRecovery = undefined
-      }
-      if (result.exitCode !== 0 || result.timedOut || result.forcedCleanup
-        || result.outputTruncated || result.stderr !== ''
-        || !grokOAuthCompletionOutput(result.stdout)) {
-        return { recovered: false, reason: 'bounded Grok OAuth recovery did not complete' }
-      }
-      const after = classifyGrokAuthState(baseline.home)
-      if (!grokAuthRecoveryTransitionIsSafe(baseline, after)) {
-        return { recovered: false, reason: 'Grok OAuth completion did not produce a safe auth transition' }
-      }
-      return { recovered: true, reason: 'Grok OAuth authentication recovered', state: after }
-    } catch (error) {
-      return { recovered: false, reason: `Grok OAuth recovery was unavailable: ${error}` }
-    }
-  }
-
   const runGrokPanel = async (
     input: AdvisorInputSnapshot,
     phase: AdvisorPhase,
@@ -1994,7 +2040,13 @@ async function main(): Promise<void> {
         perspective,
         initialAuth: classifyGrokAuthState(),
         runAttempt: value => runGrokOnce(input, phase, round, value, evidence, reviewContext),
-        runRecovery: runGrokOAuthRecovery,
+        runRecovery: baseline => {
+          let owned: GrokOAuthBrowserSession | undefined
+          return recoverGrokAuthentication(baseline, browser => {
+            if (browser) { owned = browser; grokBrowserRecovery = browser }
+            else if (grokBrowserRecovery === owned) grokBrowserRecovery = undefined
+          }, grokChromeEntrypoint)
+        },
         unavailable: unavailableGrok,
         claimRecovery: () => claimGrokOAuthRecovery(phase),
       })
@@ -2184,9 +2236,19 @@ async function main(): Promise<void> {
       diagnosticOperation = 'prompt-files'
       const continuationInput = continuingInterruptedRequest ? readAdvisorInputSnapshot(stateDir, context.jobId) : undefined
       if (uiProposal) {
-        uiWorkspace = await createClaudeUiWorkspace({ stateDir, jobId: context.jobId, proposal: uiProposal,
-          projectRoots: [context.repoPath, ...context.gitRoots] })
-        atomicWritePrivateFile(join(requestDir, 'ui-artifacts.json'), JSON.stringify(uiWorkspace))
+        try {
+          uiWorkspace = await createClaudeUiWorkspace({ stateDir, jobId: context.jobId, proposal: uiProposal,
+            projectRoots: [context.repoPath, ...context.gitRoots] })
+          const { beforeWarning, ...artifactManifest } = uiWorkspace
+          atomicWritePrivateFile(join(requestDir, 'ui-artifacts.json'), JSON.stringify(artifactManifest))
+          if (uiWorkspace.beforeWarning) cleanupWarnings.push(uiWorkspace.beforeWarning)
+        } catch {
+          // Optional proposal inputs must not prevent the independent analysis.
+          // Do not pass a rejected path or raw decoder output to the reviewer.
+          uiWorkspace = undefined
+          uiArtifacts = { status: 'unavailable', producer: 'claude-fable-5-1',
+            reason: 'GUI artifact preparation failed; Claude continued as a read-only design advisor.' }
+        }
       }
       const prompt = advisorPrompt(reviewContext, input, phase, round, evidence, uiWorkspace)
         + (continuationInput && continuationInput.digest !== input.digest
@@ -2219,6 +2281,7 @@ async function main(): Promise<void> {
       if (opened.timedOut || opened.forcedCleanup
         || opened.outputTruncated || opened.exitCode !== 0) {
         startupCode = parseClaudeStartupDiagnostic(opened.stdout)
+        failure = claudeStartupFailure(startupCode)
         throw new Error(`ephemeral Claude open failed (${opened.exitCode}): ${opened.stderr}`)
       }
       target = parseEphemeralClaudeOpen(opened.stdout)
@@ -2390,23 +2453,21 @@ async function main(): Promise<void> {
                       stateChangedDuringRead = true
                       break
                     }
-                    const sanitized = sanitizeClaudeAnswer(fileAnswer.response)
                     const responseMetadata = {
-                      responseSha256: createHash('sha256').update(sanitized.response).digest('hex'),
-                      responseBytes: Buffer.byteLength(sanitized.response), redacted: sanitized.redacted,
+                      responseSha256: createHash('sha256').update(fileAnswer.response).digest('hex'),
+                      responseBytes: Buffer.byteLength(fileAnswer.response), redacted: false,
                     }
                     const directory = ensureManagedDirectory(stateDir,
                       join(journalRoot, `revision-${input.revision}-${input.digest.slice(0, 16)}`))
                     const path = join(directory, `claude-answer-${diagnosticAttempt}.json`)
-                    // Keep original receipt evidence separate from the sanitized
-                    // response digest. Never persist the unredacted answer.
+                    // Preserve the original answer bytes and its receipt evidence.
                     atomicWritePrivateFile(path, JSON.stringify({ version: 1, phase, round,
                       marker, sha256: fileAnswer.sha256, bytes: fileAnswer.bytes,
-                      ...responseMetadata, response: sanitized.response }))
+                      ...responseMetadata, response: fileAnswer.response }))
                     answerArtifact = { path: relative(stateDir, path),
                       sha256: fileAnswer.sha256, bytes: fileAnswer.bytes, ...responseMetadata }
-                    response = sanitized.response
-                    responseRedacted = sanitized.redacted
+                    response = fileAnswer.response
+                    responseRedacted = false
                     stateChangeSeqAfter = current.state_change_seq
                     observation.outcome = 'complete'
                     diagnosticTranscript = transcript
@@ -2419,9 +2480,8 @@ async function main(): Promise<void> {
                   diagnosticTranscript = transcript
                   diagnosticTranscriptReadIndex = diagnosticReads.length - 1
                   if (completeResponse && modelStartObserved) {
-                    const sanitized = sanitizeClaudeAnswer(completeResponse)
-                    response = sanitized.response
-                    responseRedacted = sanitized.redacted
+                    response = completeResponse
+                    responseRedacted = false
                     reason = 'Claude response obtained but subsequent cleanup validation did not complete'
                     stateChangeSeqAfter = current.state_change_seq
                     break
@@ -4035,6 +4095,12 @@ async function main(): Promise<void> {
       executionState: result.executionState,
       containmentVerified: result.containmentVerified === true,
       containmentStatus: result.containmentStatus,
+      durationMs: result.durationMs,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      forcedCleanup: result.forcedCleanup,
+      outputTruncated: result.outputTruncated,
+      timeoutMs: result.timeoutMs,
       processId: result.adopted === true || result.executionState === 'started-no-response'
         ? result.processId
         : undefined,
@@ -4248,11 +4314,12 @@ async function main(): Promise<void> {
 
   server.registerTool('advisor_grok_oauth_respond', {
     description: 'Reply once to the current Grok OAuth browser request returned by advisor_round_poll. Use official Chrome control to observe only opaque tab IDs until authorization UI verification is requested. Never pass URLs, credentials, tab contents or input values. Reuse the existing OAuth flow; never start another login.',
-    inputSchema: { requestId: z.string().uuid(), answer: z.enum(GROK_BROWSER_ANSWERS) },
-  }, async ({ requestId, answer }) => {
+    inputSchema: { requestId: z.string().uuid(), answer: z.enum(GROK_BROWSER_ANSWERS), abortReason: z.enum(GROK_BROWSER_ABORT_REASONS).optional() },
+  }, async ({ requestId, answer, abortReason }) => {
     try {
       if (!grokBrowserRecovery) throw Error('Grok browser recovery is not active')
-      await grokBrowserRecovery.respond(requestId, answer)
+      if (grokBrowserRecovery.pending()?.hostManaged && answer !== 'abort') throw Error('Host-managed browser recovery accepts only cancellation from the model')
+      await grokBrowserRecovery.respond(requestId, answer, abortReason)
       return toolText({ accepted: true, nextAction: '同じadvisor roundをpollして次の状態を確認してください。' })
     } catch (error) { return toolText({ accepted: false, reason: String(error) }, true) }
   })

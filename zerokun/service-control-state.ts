@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto'
 import { rmSync } from 'fs'
 import { join } from 'path'
 import { requireManagedStateRoot } from './managed-path.ts'
+import { decodeLease, releaseProcessLock } from './process-lock.ts'
 import {
   atomicWritePrivateFile,
   readOptionalBoundedOwnerOnlyRegularFile,
@@ -10,6 +11,24 @@ import {
 export const SERVICE_CONTROL_PAUSE_REQUEST_FILE = 'service-control-pause-request.json'
 export const SERVICE_CONTROL_PAUSE_ACK_FILE = 'service-control-pause-ack.json'
 export const SERVICE_STOPPED_FILE = 'service-stopped.json'
+
+/** The legacy shell hands its startup lease through exec until Slack is ready. */
+export function takeGatewayStartupLease(
+  stateDir: string,
+  environment: Record<string, string | undefined> = process.env,
+): () => void {
+  const raw = environment.ZEROKUN_STARTUP_LEASE
+  delete environment.ZEROKUN_STARTUP_LEASE
+  if (!raw) return () => {}
+  const lease = decodeLease(raw)
+  if (!lease || (lease.pid !== process.pid && lease.pid !== process.ppid)) {
+    throw new Error('gateway startup lease does not belong to this launch')
+  }
+  const path = join(requireManagedStateRoot(stateDir), 'restart.lock', 'pid')
+  return () => {
+    if (!releaseProcessLock(path, lease)) throw new Error('gateway startup lease could not be released')
+  }
+}
 
 type PauseRequest = {
   version: 1

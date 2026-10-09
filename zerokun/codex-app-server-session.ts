@@ -607,7 +607,8 @@ export class CodexAppServerSession {
       onOutputChunk?(value: Uint8Array): void
       onNotification?(notification: AppServerNotification): void
       onElicitation?(request: { id: number | string; params: Record<string, unknown> },
-        signal: AbortSignal): Promise<'accept' | 'decline' | 'cancel'>
+        signal: AbortSignal): Promise<'accept' | 'decline' | 'cancel'
+          | { action: 'accept'; persist: 'session' | 'always' }>
     } = {},
   ) {
     this.reader = output.getReader()
@@ -992,10 +993,13 @@ export class CodexAppServerSession {
     const previous = this.elicitations.get(id)
     previous?.controller.abort()
     if (previous) this.elicitations.delete(id)
-    const reply = (action: 'accept' | 'decline' | 'cancel') => {
+    const reply = (decision: 'accept' | 'decline' | 'cancel'
+      | { action: 'accept'; persist: 'session' | 'always' }) => {
+      const action = typeof decision === 'string' ? decision : decision.action
       this.input.write(`${JSON.stringify({ id, result: {
         action, content: action === 'accept' ? {} : null,
-        _meta: action === 'cancel' ? { 'zerochan/clientInteractionUnavailable': true } : null,
+        _meta: typeof decision === 'object' ? { persist: decision.persist }
+          : action === 'cancel' ? { 'zerochan/clientInteractionUnavailable': true } : null,
       } })}\n`)
     }
     if (!this.options.onElicitation || previous || this.elicitations.size > 0) {
@@ -1303,6 +1307,7 @@ export class CodexAppServerSession {
       approvalsReviewer?: 'auto_review'
       model?: string
       effort?: string
+      outputSchema?: Record<string, unknown>
       timeoutMs?: number
       beforeWrite?(requestId: number): void
     },
@@ -1322,6 +1327,7 @@ export class CodexAppServerSession {
       ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
       ...(options.model ? { model: options.model } : {}),
       ...(options.effort ? { effort: options.effort } : {}),
+      ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
     }, { timeoutMs: options.timeoutMs ?? 30_000, beforeWrite: options.beforeWrite })
     const turn = parseTurn(response.result.turn)
     if (turn.status !== 'inProgress') {

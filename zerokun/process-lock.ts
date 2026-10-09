@@ -1302,7 +1302,7 @@ export function encodeProcessLockLease(lease: ProcessLockLease): string {
   return Buffer.from(JSON.stringify(lease)).toString('base64url')
 }
 
-function decodeLease(value: string): ProcessLockLease | undefined {
+export function decodeLease(value: string): ProcessLockLease | undefined {
   try {
     const parsed = parseIdentity(Buffer.from(value, 'base64url').toString('utf8'))
     return parsed && 'version' in parsed ? parsed : undefined

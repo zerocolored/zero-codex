@@ -3,7 +3,6 @@ import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFi
   realpathSync, writeFileSync } from 'fs'
 import { dirname, isAbsolute, join, relative, sep } from 'path'
 import { z } from 'zod'
-import { containsCredentialMaterial, redactCredentialMaterial } from './public-output-guard.ts'
 import { CLOUD_MAX_BYTES, digestBytes } from './cloud-handoff.ts'
 
 const MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -18,6 +17,7 @@ const repositorySchema = z.object({
 }).strict()
 export const packageSchema = z.object({
   version: z.literal(1), task: z.string(), history: z.string(),
+  primaryModel: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/).optional(),
   repositories: z.array(repositorySchema).max(32), attachments: z.array(fileSchema).max(1000),
   notes: z.array(z.string()).max(100),
 }).strict()
@@ -36,21 +36,6 @@ function assertPortablePath(path: string): void {
 }
 function protectedPath(path: string): boolean {
   return path.split('/').some(p => /^(?:\.env(?:\..*)?|\.ssh|\.aws|\.codex|\.claude|\.grok|node_modules|(?:cloud-)?auth(?:\.pending)?\.json|credentials?(?:\.(?:json|ya?ml|toml|ini))?|secrets?(?:\.(?:json|ya?ml|toml|ini))?|tokens?\.(?:json|ya?ml|toml|ini)|.*(?:webhook-secret|private-key)|.*\.(?:pem|key|p12|pfx)|\.npmrc|\.netrc)$/i.test(p))
-}
-export function redactHandoffText(text: string): string {
-  const normalized = text
-    .replace(/(["'](?:password|passwd|api[_-]?key|access[_-]?key|secret|token)["']\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/gi, '$1"[credential removed]"')
-    .replace(/["']((?:password|passwd|api[_-]?key|access[_-]?key|secret|token))["']\s*[:=]/gi, '$1:')
-  return redactCredentialMaterial(normalized, '[credential removed]')
-    .replace(/-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----/g, '[credential removed]')
-    .replace(/https:\/\/hooks\.zapier\.com\/hooks\/catch\/[^\s"'<>]+/gi, '[credential removed]')
-}
-function assertNoSecrets(text: string): void {
-  const credentialKeys = text.replace(/["']((?:password|passwd|api[_-]?key|access[_-]?key|secret|token))["']\s*[:=]/gi, '$1:')
-  if (containsCredentialMaterial(credentialKeys) || /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----/.test(text)
-    || /https:\/\/hooks\.zapier\.com\/hooks\/catch\/[^\s"'<>]+/i.test(text)) {
-    throw new Error('credential material cannot be included in handoff')
-  }
 }
 function readRegular(root: string, path: string): Buffer {
   assertPortablePath(path)
@@ -72,7 +57,6 @@ function readRegular(root: string, path: string): Buffer {
     if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) {
       throw new Error('handoff file changed during capture')
     }
-    assertNoSecrets(bytes.toString('utf8'))
     return bytes
   } finally { closeSync(fd) }
 }
@@ -91,13 +75,6 @@ export function captureRepository(root: string, name: string, base: string): Han
   for (const path of changed) {
     assertPortablePath(path)
     if (protectedPath(path)) throw new Error('task changes include a protected file; checkpoint is incomplete')
-    // A binary Git patch encodes BOTH previous/index bytes. Inspect those
-    // objects too, including an index change undone in the working tree.
-    for (const spec of [`${base}:${path}`, `:${path}`]) {
-      const exists = Bun.spawnSync(['git', '-C', root, 'cat-file', '-e', spec], { stdout: 'ignore', stderr: 'ignore' }).exitCode === 0
-      if (exists) assertNoSecrets(git(root, ['show', '--no-ext-diff', '--no-textconv', spec]))
-    }
-    // Deleted paths have no current bytes. Patch contents are checked below.
     try { readRegular(root, path) } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
@@ -105,7 +82,6 @@ export function captureRepository(root: string, name: string, base: string): Han
   // The base-to-index patch also carries unpublished committed changes.
   const staged = git(root, ['diff', '--cached', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', base])
   const unstaged = git(root, ['diff', '--binary', '--full-index', '--no-ext-diff', '--no-textconv'])
-  assertNoSecrets(staged); assertNoSecrets(unstaged)
   if (/^(?:new|old) mode 120000|^new file mode 120000|^index [^\n]+ 120000/m.test(`${staged}\n${unstaged}`)) {
     throw new Error('changed symlinks cannot be transported')
   }
@@ -124,8 +100,7 @@ export function captureAttachment(root: string, path: string, portableName: stri
   return { path: portableName, data: bytes.toString('base64'), digest: digestBytes(bytes), executable: false }
 }
 export function encodePackage(value: HandoffPackage): Buffer {
-  const checked = packageSchema.parse({ ...value, task: redactHandoffText(value.task), history: redactHandoffText(value.history) })
-  assertNoSecrets(checked.task); assertNoSecrets(checked.history)
+  const checked = packageSchema.parse(value)
   const bytes = Buffer.from(JSON.stringify(checked))
   if (bytes.length > CLOUD_MAX_BYTES) throw new Error('handoff package exceeds limit')
   return bytes
