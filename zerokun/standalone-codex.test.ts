@@ -12,14 +12,22 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'fs'
-import { tmpdir } from 'os'
+import { homedir, tmpdir } from 'os'
+
+// walkExecutable() rejects world-writable ancestors; Linux's /tmp is 1777, so
+// fixtures live under $HOME there (macOS's per-user $TMPDIR is 0700).
+const temporaryParent = process.platform === 'linux' ? homedir() : tmpdir()
 import { join } from 'path'
 import {
   encodeOfficialCodexSnapshot,
+  officialStandaloneTarget,
   resolveOfficialStandaloneCodex,
   resolveOfficialStandaloneCodexForTesting,
   verifyEncodedOfficialCodexSnapshot,
 } from './standalone-codex.ts'
+
+// The official standalone layout is asserted for real on both kernels.
+const noOfficialRuntime = process.platform !== 'darwin' && process.platform !== 'linux'
 import { ensureManagedDirectory, prepareManagedStateRoot } from './managed-path.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 
@@ -30,12 +38,12 @@ afterEach(() => {
 })
 
 function fixture() {
-  const temporary = mkdtempSync(join(tmpdir(), 'zerokun-official-codex-home-'))
+  const temporary = mkdtempSync(join(temporaryParent, '.zerokun-official-codex-home-'))
   temporaryRoots.push(temporary)
   const home = realpathSync(temporary)
-  const target = process.arch === 'arm64'
-    ? 'aarch64-apple-darwin'
-    : 'x86_64-apple-darwin'
+  // The official installer uses the same 2-link layout on Linux with the musl
+  // target (x86_64-unknown-linux-musl, verified on WSL2 with codex 0.162.0).
+  const target = officialStandaloneTarget()
   const standalone = join(home, '.codex/packages/standalone')
   const release = join(standalone, `releases/0.149.1-${target}`)
   const leaf = join(release, 'bin/codex')
@@ -60,7 +68,7 @@ function fixture() {
 }
 
 describe('official standalone Codex trust boundary', () => {
-  test.skipIf(process.platform !== 'darwin')('公式installerの固定2-link layoutを解決する', () => {
+  test.skipIf(noOfficialRuntime)('公式installerの固定2-link layoutを解決する', () => {
     const value = fixture()
     const resolved = resolveOfficialStandaloneCodexForTesting(value.home)
     expect(resolved.physical).toBe(value.leaf)
@@ -69,7 +77,20 @@ describe('official standalone Codex trust boundary', () => {
       .toEqual([value.logical, value.current])
   })
 
-  test.skipIf(process.platform !== 'darwin')('direct linkや余分なlink hopを拒否する', () => {
+  test('platformごとの公式standalone targetはinstallerの命名と一致する', () => {
+    const expected = process.platform === 'darwin'
+      ? (process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin')
+      : process.platform === 'linux'
+        ? (process.arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl')
+        : null
+    if (expected === null) {
+      expect(() => officialStandaloneTarget()).toThrow('Codex official standalone runtime')
+    } else {
+      expect(officialStandaloneTarget()).toBe(expected)
+    }
+  })
+
+  test.skipIf(noOfficialRuntime)('direct linkや余分なlink hopを拒否する', () => {
     const direct = fixture()
     rmSync(direct.logical)
     symlinkSync(direct.leaf, direct.logical)
@@ -83,7 +104,7 @@ describe('official standalone Codex trust boundary', () => {
     expect(() => resolveOfficialStandaloneCodexForTesting(extra.home)).toThrow('symlink layout')
   })
 
-  test.skipIf(process.platform !== 'darwin')('古い・不一致・追加field付きmanifestを拒否する', () => {
+  test.skipIf(noOfficialRuntime)('古い・不一致・追加field付きmanifestを拒否する', () => {
     for (const mutate of [
       (manifest: Record<string, unknown>) => { manifest.version = '0.148.9' },
       (manifest: Record<string, unknown>) => { manifest.target = 'wrong-target' },
@@ -117,18 +138,39 @@ describe('official standalone Codex trust boundary', () => {
     expect(() => resolveOfficialStandaloneCodexForTesting(hardlinked.home)).toThrow()
   })
 
-  test.skipIf(process.platform !== 'darwin')('snapshotの改変をproduction resolverで拒否する', () => {
+  test.skipIf(process.platform !== 'linux')('ELF以外のexecutableとhardlink executableを拒否する', () => {
+    const notElf = fixture()
+    // A Mach-O header must not pass as a Linux native binary.
+    writeFileSync(notElf.leaf, Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01]), {
+      mode: 0o700,
+    })
+    expect(() => resolveOfficialStandaloneCodexForTesting(notElf.home)).toThrow('native binary')
+
+    const script = fixture()
+    writeFileSync(script.leaf, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+    expect(() => resolveOfficialStandaloneCodexForTesting(script.home)).toThrow('native binary')
+
+    const hardlinked = fixture()
+    const sibling = join(hardlinked.release, 'bin/codex-copy')
+    rmSync(hardlinked.leaf)
+    copyFileSync(realpathSync(process.execPath), sibling)
+    chmodSync(sibling, 0o700)
+    linkSync(sibling, hardlinked.leaf)
+    expect(() => resolveOfficialStandaloneCodexForTesting(hardlinked.home)).toThrow()
+  })
+
+  test.skipIf(noOfficialRuntime)('snapshotの改変をproduction resolverで拒否する', () => {
     const actual = resolveOfficialStandaloneCodex()
     const tampered = { ...actual, packageVersion: '999.0.0' }
     expect(() => verifyEncodedOfficialCodexSnapshot(encodeOfficialCodexSnapshot(tampered)))
       .toThrow('changed after it was verified')
   })
 
-  test.skipIf(process.platform !== 'darwin'
+  test.skipIf(noOfficialRuntime
     || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
     'supervisorは公式snapshotを再検証して実体を起動する',
     async () => {
-      const root = mkdtempSync(join(tmpdir(), 'zerokun-official-supervisor-'))
+      const root = mkdtempSync(join(temporaryParent, '.zerokun-official-supervisor-'))
       temporaryRoots.push(root)
       const state = prepareManagedStateRoot(join(root, 'state'))
       ensureManagedDirectory(state, join(state, 'executors'))
@@ -172,10 +214,10 @@ describe('official standalone Codex trust boundary', () => {
     15_000,
   )
 
-  test.skipIf(process.platform !== 'darwin')(
+  test.skipIf(noOfficialRuntime)(
     'supervisorはsnapshotなし・改変snapshotをregistration前にfail-closeする',
     async () => {
-      const root = mkdtempSync(join(tmpdir(), 'zerokun-official-supervisor-reject-'))
+      const root = mkdtempSync(join(temporaryParent, '.zerokun-official-supervisor-reject-'))
       temporaryRoots.push(root)
       const marker = join(root, 'child-started')
       const fake = join(root, 'fake-codex')

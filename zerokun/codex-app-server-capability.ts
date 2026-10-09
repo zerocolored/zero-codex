@@ -9,7 +9,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import type { SeatbeltFingerprint } from './seatbelt-fingerprint.ts'
+import { sandboxedCommandForTags, type SeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 
 const MAX_GENERATED_TYPE_BYTES = 4 * 1024 * 1024
 const GENERATION_TIMEOUT_MS = 30_000
@@ -338,16 +338,13 @@ export async function verifyCodexAppServerCapabilities(
     '--out',
     outputDir,
   ]
+  // Same attempt wrapper as the executor (sandbox-exec on macOS, the
+  // Landlock/cgroup launcher on Linux); the probe only holds the tag paths.
   const command = options.seatbeltFingerprint
-    ? [
-      realpathSync('/usr/bin/sandbox-exec'),
-      '-p', [
-        '(version 1)',
-        '(allow default)',
-        `(deny file-read-data (literal ${JSON.stringify(options.seatbeltFingerprint.deny.path)}))`,
-      ].join('\n'),
-      ...appServerCommand,
-    ]
+    ? sandboxedCommandForTags({
+      allow: options.seatbeltFingerprint.allow.path,
+      deny: options.seatbeltFingerprint.deny.path,
+    }, appServerCommand)
     : appServerCommand
   const child = Bun.spawn(command, {
     env: capabilityEnvironment(environment),

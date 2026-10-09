@@ -105,7 +105,7 @@ import {
   nativeAdvisorResponseHasExactMarker,
   nativeAdvisorResponseTransportDigest,
 } from './native-advisor-evidence.ts'
-import { readSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
+import { readSeatbeltFingerprint, sandboxedCommandForTags } from './seatbelt-fingerprint.ts'
 import {
   readAdvisorInputSnapshot,
   type AdvisorInputSnapshot,
@@ -697,15 +697,8 @@ function fingerprintedCommand(
   fingerprint?: FingerprintPaths,
 ): string[] {
   if (!fingerprint) return command
-  return [
-    realpathSync('/usr/bin/sandbox-exec'),
-    '-p', [
-      '(version 1)',
-      '(allow default)',
-      `(deny file-read-data (literal ${JSON.stringify(fingerprint.deny)}))`,
-    ].join('\n'),
-    ...command,
-  ]
+  // sandbox-exec on macOS (unchanged), the Landlock/cgroup launcher on Linux.
+  return sandboxedCommandForTags(fingerprint, command)
 }
 
 function contained(root: string, candidate: string): boolean {
