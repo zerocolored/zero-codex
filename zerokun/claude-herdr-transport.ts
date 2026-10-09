@@ -64,6 +64,16 @@ async function closeOwnedTab(control: HerdrJobMonitorControl, receipt: Receipt):
   if (await exactBinding(control, receipt)) throw new Error('Claude pane close is pending')
 }
 
+/** Validate only the generation fields used to observe/signal a process. */
+function validRecoveryProcess(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false
+  const identity = value as Partial<ProcessIdentity>
+  return Number.isSafeInteger(identity.pid) && Number(identity.pid) > 1 && Number(identity.pid) <= 0x7fffffff
+    && typeof identity.bootSession === 'string'
+    && Number.isSafeInteger(identity.startSec) && Number.isSafeInteger(identity.startUsec)
+    && parseProcessStartKey(`${identity.bootSession}:${identity.startSec}:${String(identity.startUsec).padStart(6, '0')}`) !== undefined
+}
+
 /** Run only after the runner has retired registered executor generations.
  * A crash can leave a wrapper/tab after the supervisor is already gone. */
 export async function reconcileClaudeHerdrTransports(options: {
@@ -80,13 +90,24 @@ export async function reconcileClaudeHerdrTransports(options: {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (!entry.name.endsWith('.json')) continue
     const path = join(root, entry.name)
-    const text = readOptionalBoundedOwnerOnlyRegularFile(path, 64 * 1024)
-    if (!text) continue
-    const receipt = JSON.parse(text) as Receipt
-    if (receipt.version !== 1 || receipt.jobId + '.json' !== entry.name
-      || !/^[a-f0-9]{32}$/.test(receipt.nonce) || receipt.workspaceId !== options.runtime.workspaceId
-      || !Array.isArray(receipt.baselineTabIds) || typeof receipt.label !== 'string'
-      || !receipt.label.endsWith(receipt.nonce.slice(0, 8))) throw new Error('invalid Claude pane recovery receipt')
+    let receipt: Receipt
+    try {
+      const text = readOptionalBoundedOwnerOnlyRegularFile(path, 64 * 1024)
+      if (!text) continue
+      receipt = JSON.parse(text) as Receipt
+      if (!receipt || receipt.version !== 1 || receipt.jobId + '.json' !== entry.name
+        || !/^[a-f0-9]{32}$/.test(receipt.nonce) || receipt.workspaceId !== options.runtime.workspaceId
+        || !Array.isArray(receipt.baselineTabIds) || typeof receipt.label !== 'string'
+        || !receipt.label.endsWith(receipt.nonce.slice(0, 8))) throw new Error('invalid Claude pane recovery receipt')
+      for (const identity of [receipt.supervisor, receipt.wrapper]) {
+        if (identity !== undefined && !validRecoveryProcess(identity)) throw new Error('invalid Claude process identity')
+      }
+    } catch {
+      // A missing ownership proof is not evidence of a live executor. Retain
+      // this receipt without acting on its targets; do not disable both cores.
+      process.stderr.write('zerochan: Claude recovery retained an unreadable or mismatched receipt; other jobs can continue.\n')
+      continue
+    }
     if (receipt.supervisor && observeProcessGeneration(receipt.supervisor).status !== 'dead') {
       throw new Error('Claude supervisor must be recovered before its pane')
     }

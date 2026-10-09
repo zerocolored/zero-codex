@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 import type { HerdrRuntimeIdentity } from './herdr-runtime.ts'
@@ -9,6 +9,7 @@ import { observeProcessGeneration, readProcessIdentity, signalProcessGroupIfLead
 import { ClaudePaneFrames } from './claude-pane-protocol.ts'
 import { openClaudeHerdrTransport, reconcileClaudeHerdrTransports, type ClaudeHerdrTransport } from './claude-herdr-transport.ts'
 import { ClaudeControlSession, claudeResult } from './claude-control-session.ts'
+import { JobStore } from './job-runner.ts'
 
 const roots: string[] = [], processes: ProcessIdentity[] = [], transports: ClaudeHerdrTransport[] = []
 afterEach(async () => {
@@ -160,4 +161,80 @@ test('foreign occupant is retained and a later recovery closes the original tab 
   f.control.processInfo = original
   expect(await reconcileClaudeHerdrTransports({ stateDir: f.stateDir, runtime: f.runtime, controlForTesting: f.control })).toBe(1)
   expect(f.counters().closed).toBe(1)
+})
+
+const outOfRangeProcess = { pid: 2147483648, bootSession: 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', startSec: 1, startUsec: 0 }
+
+for (const kind of ['malformed', 'null', 'workspace-changed', 'symlink', 'supervisor', 'wrapper', 'supervisor-pid', 'wrapper-pid'] as const) {
+  test(`unusable Claude receipt (${kind}) leaves default Codex jobs runnable without touching its targets`, async () => {
+    const f = fixture(), receiptRoot = join(f.stateDir, 'claude-panes')
+    mkdirSync(receiptRoot, { mode: 0o700 })
+    const path = join(receiptRoot, 'retained.json')
+    const processField = kind.startsWith('supervisor') ? 'supervisor' : kind.startsWith('wrapper') ? 'wrapper' : undefined
+    const raw = kind === 'null' ? 'null' : kind === 'workspace-changed' || processField
+      ? JSON.stringify({ version: 1, jobId: 'retained', nonce: 'a'.repeat(32),
+        workspaceId: kind === 'workspace-changed' ? 'wOLD' : 'wT', baselineTabIds: [], label: 'Claude aaaaaaaa',
+        ...(processField ? { [processField]: kind.endsWith('-pid') ? outOfRangeProcess : {} } : {}) }) : '{'
+    const target = join(f.root, 'unchanged')
+    if (kind === 'symlink') {
+      writeFileSync(target, raw, { mode: 0o600 }); symlinkSync(target, path)
+    } else writeFileSync(path, raw, { mode: 0o600 })
+    let calls = 0
+    const control = new Proxy(f.control, { get() { return () => { calls++; throw new Error('unowned target') } } })
+    expect(await reconcileClaudeHerdrTransports({ stateDir: f.stateDir, runtime: f.runtime, controlForTesting: control })).toBe(0)
+    expect(calls).toBe(0)
+    expect(readFileSync(kind === 'symlink' ? target : path, 'utf8')).toBe(raw)
+    if (kind === 'symlink') expect(lstatSync(path).isSymbolicLink()).toBe(true)
+    const store = new JobStore(join(f.stateDir, 'jobs.sqlite3'))
+    try {
+      const { job } = store.enqueue({ chatId: 'CSYNTHETIC', threadTs: '1800000000.000001', messageId: '1800000000.000001',
+        userId: 'USYNTHETIC', repoPath: f.root, task: 'continue the default Codex task' })
+      expect(job.runtime).toBe('codex')
+      expect(store.claimNext('synthetic-worker')?.id).toBe(job.id)
+    } finally { store.close() }
+  })
+}
+
+for (const kind of ['malformed', 'supervisor', 'wrapper', 'supervisor-pid', 'wrapper-pid'] as const) test(`an invalid ${kind} receipt does not prevent cleanup of another valid owned Claude pane`, async () => {
+  const f = fixture(), receiptRoot = join(f.stateDir, 'claude-panes')
+  mkdirSync(receiptRoot, { mode: 0o700 })
+  const invalid = kind === 'malformed' ? '{' : JSON.stringify({ version: 1, jobId: 'a-invalid',
+    nonce: 'a'.repeat(32), workspaceId: 'wT', baselineTabIds: [], label: 'Claude aaaaaaaa',
+    [kind.startsWith('supervisor') ? 'supervisor' : 'wrapper']: kind.endsWith('-pid') ? outOfRangeProcess : {} })
+  writeFileSync(join(receiptRoot, 'a-invalid.json'), invalid, { mode: 0o600 })
+  const directory = realpathSync(mkdtempSync('/tmp/zero-claude-')); roots.push(directory)
+  chmodSync(directory, 0o700)
+  const metadata = lstatSync(directory), nonce = 'b'.repeat(32), label = 'Claude bbbbbbbb'
+  const binding = await f.control.createTab({ workspaceId: 'wT', cwd: f.root, label })
+  const path = join(receiptRoot, 'z-valid.json')
+  writeFileSync(path, JSON.stringify({ version: 1, jobId: 'z-valid', nonce, label, directory,
+    directoryDevice: metadata.dev, directoryInode: metadata.ino, workspaceId: 'wT', baselineTabIds: [], binding }), { mode: 0o600 })
+  expect(await reconcileClaudeHerdrTransports({ stateDir: f.stateDir, runtime: f.runtime, controlForTesting: f.control })).toBe(1)
+  expect(f.counters().closed).toBe(1)
+  expect(existsSync(directory)).toBe(false)
+  expect(existsSync(path)).toBe(false)
+  expect(readFileSync(join(receiptRoot, 'a-invalid.json'), 'utf8')).toBe(invalid)
+})
+
+test.skipIf(process.platform !== 'darwin')('a valid receipt with a live owned supervisor still blocks recovery', async () => {
+  const f = fixture(), receiptRoot = join(f.stateDir, 'claude-panes')
+  mkdirSync(receiptRoot, { mode: 0o700 })
+  const child = Bun.spawn([process.execPath, '-e', 'setInterval(() => {}, 1000)'], {
+    cwd: f.root, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', detached: true,
+  })
+  const supervisor = readProcessIdentity(child.pid)!
+  processes.push(supervisor)
+  const path = join(receiptRoot, 'live.json')
+  writeFileSync(path, JSON.stringify({ version: 1, jobId: 'live', nonce: 'a'.repeat(32),
+    workspaceId: 'wT', baselineTabIds: [], label: 'Claude aaaaaaaa', supervisor }), { mode: 0o600 })
+  try {
+    await expect(reconcileClaudeHerdrTransports({ stateDir: f.stateDir, runtime: f.runtime, controlForTesting: f.control }))
+      .rejects.toThrow('supervisor must be recovered')
+    expect(observeProcessGeneration(supervisor).status).toBe('alive')
+    expect(existsSync(path)).toBe(true)
+    expect(f.counters().closed).toBe(0)
+  } finally {
+    signalProcessGroupIfLeaderLive(supervisor, 'SIGKILL')
+    await child.exited
+  }
 })

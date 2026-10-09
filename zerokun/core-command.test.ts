@@ -9,6 +9,18 @@ import { claudeMainlineEnvironment } from './claude-mainline-runtime.ts'
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 
+test('default Codex start does not require Claude authentication or change the selected core', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'zero-core-default-'))); roots.push(root)
+  expect(Bun.spawnSync(['git', 'init', '-q', root]).exitCode).toBe(0)
+  let starts = 0, preflights = 0
+  expect(await startWithSelectedCore(root, async () => { starts++; return 'ready' }, () => {
+    preflights++; throw new Error('Claude is unavailable')
+  })).toBe('ready')
+  expect(starts).toBe(1)
+  expect(preflights).toBe(0)
+  expect(projectPrimaryCore(root)).toEqual({ desired: 'codex', active: 'codex' })
+})
+
 test('public core command selects only the current project without Slack setup', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'zero-core-command-'))); roots.push(root)
   expect(Bun.spawnSync(['git', 'init', '-q', root]).exitCode).toBe(0)
