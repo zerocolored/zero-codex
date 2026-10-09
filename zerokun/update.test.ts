@@ -40,6 +40,7 @@ import {
   setupTimeoutBudgetMs,
   stageVerifiedCandidateCodex,
   linuxCandidateFilesystemRules,
+  updateSourceBranch,
   updateRestartTokenDigest,
   validateResolvedCandidatePermissionOverrides,
   restoreRollbackDatabase,
@@ -1237,6 +1238,14 @@ describe('updater helpers', () => {
       expect(gate.stderr.toString()).toContain('updaterのCodex sandbox内でのみ使用できます')
     } finally {
       staged.cleanup()
+    }
+  })
+
+  test('更新元branchは端末のZEROKUN_UPDATE_BRANCHだけで切り替え、不正な名前は拒否する', () => {
+    expect(updateSourceBranch({})).toBe('main')
+    expect(updateSourceBranch({ ZEROKUN_UPDATE_BRANCH: 'fix/linux-update-path' })).toBe('fix/linux-update-path')
+    for (const invalid of ['', '-x', 'a..b', 'x/', 'a b', 'a\nb', '.hidden']) {
+      expect(() => updateSourceBranch({ ZEROKUN_UPDATE_BRANCH: invalid })).toThrow('ZEROKUN_UPDATE_BRANCHが不正です')
     }
   })
 

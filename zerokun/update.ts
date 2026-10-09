@@ -1869,7 +1869,7 @@ async function validateRemoteTargets(
       })
       await validateZero(checkout, isolatedHome, repo.path, stateDir, processGroupLease, signal)
     } finally {
-      try { chmodSync(join(parent, 'trusted-bin'), 0o700) } catch {}
+      unlockTrustedBin(parent)
       let cleanupError: unknown
       for (let attempt = 0; attempt < 50; attempt += 1) {
         try {
@@ -3452,7 +3452,7 @@ async function mainSingle(testing = false, argv = process.argv.slice(2), selecte
   if (!existsSync(projectDir)) fail(`作業ディレクトリがありません: ${projectDir}`)
   if (!existsSync(setupScript)) fail(`setup.shがありません: ${setupScript}`)
 
-  const branch = process.env.ZEROKUN_UPDATE_BRANCH ?? 'main'
+  const branch = updateSourceBranch()
   const repositories: Repository[] = [{ label: 'zero-codex', path: rootRepo, branch }]
 
   const updateLock = acquireUpdateLock(stateDir)
@@ -3781,9 +3781,31 @@ async function legacyMain(testing = false, argv = process.argv.slice(2)): Promis
 
 export async function remoteIndependentHead(repo: string): Promise<string | undefined> {
   const remote = requireCommand(['git', 'remote', 'get-url', 'origin'], { cwd: repo })
-  const sha = (await requireCommandAsync(['git', 'ls-remote', remote, 'refs/heads/main'], { timeoutMs: 30_000 })).trim().split(/\s+/)[0] ?? ''
-  if (!/^[a-f0-9]{40}$/.test(sha)) fail('更新先mainのcommitを確認できません')
+  const branch = updateSourceBranch()
+  const sha = (await requireCommandAsync(['git', 'ls-remote', remote, `refs/heads/${branch}`], { timeoutMs: 30_000 })).trim().split(/\s+/)[0] ?? ''
+  if (!/^[a-f0-9]{40}$/.test(sha)) fail(`更新先${branch}のcommitを確認できません`)
   return sha === requireCommand(['git', 'rev-parse', 'HEAD'], { cwd: repo }) ? undefined : sha
+}
+
+/**
+ * Updates come from main. ZEROKUN_UPDATE_BRANCH is the terminal-only lever for
+ * trying a branch on a real machine (the legacy flow has honoured it for the
+ * same purpose); applyStateEnvironment drops it from the state .env, so neither
+ * Slack nor configuration can move the update source.
+ */
+export function updateSourceBranch(source: Record<string, string | undefined> = process.env): string {
+  const branch = source.ZEROKUN_UPDATE_BRANCH ?? 'main'
+  if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]{0,200}$/.test(branch) || branch.includes('..') || branch.endsWith('/')) {
+    fail('ZEROKUN_UPDATE_BRANCHが不正です')
+  }
+  return branch
+}
+
+/** trusted-bin and its codex-resources are published read-only; reopen them for removal. */
+function unlockTrustedBin(parent: string): void {
+  for (const directory of [join(parent, 'trusted-bin'), join(parent, 'trusted-bin', 'codex-resources')]) {
+    try { chmodSync(directory, 0o700) } catch {}
+  }
 }
 
 async function waitForUpdateLease(state: string, signal?: AbortSignal): Promise<UpdateLockCoordinator> {
@@ -3807,9 +3829,10 @@ async function prepareIndependentRelease(rootRepo: string, stateDir: string, sig
   let validationRoot: string | undefined
   try {
     const remote = requireCommand(['git', 'remote', 'get-url', 'origin'], { cwd: rootRepo })
-    const refs = await requireCommandAsync(['git', 'ls-remote', remote, 'refs/heads/main'], { signal })
+    const branch = updateSourceBranch()
+    const refs = await requireCommandAsync(['git', 'ls-remote', remote, `refs/heads/${branch}`], { signal })
     const sha = refs.trim().split(/\s+/)[0] ?? ''
-    if (!/^[a-f0-9]{40}$/.test(sha)) fail('更新先mainのcommitを確認できません')
+    if (!/^[a-f0-9]{40}$/.test(sha)) fail(`更新先${branch}のcommitを確認できません`)
     const releases = ensureManagedDirectory(registry, join(registry, 'releases'))
     const destination = join(releases, sha)
     const release: RuntimeRelease = { version: 1, sha, path: destination }
@@ -3858,7 +3881,7 @@ async function prepareIndependentRelease(rootRepo: string, stateDir: string, sig
     return validateRelease(release)
   } finally {
     if (validationRoot) {
-      try { chmodSync(join(validationRoot, 'trusted-bin'), 0o700) } catch {}
+      unlockTrustedBin(validationRoot)
       rmSync(validationRoot, { recursive: true, force: true })
     }
     if (temporary) rmSync(temporary, { recursive: true, force: true })
