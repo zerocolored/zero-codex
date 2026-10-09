@@ -1,7 +1,7 @@
 name = "risk_reviewer"
 description = "Independent read-only critic for counterexamples, regressions, security, test gaps, and alternative approaches."
 model = "gpt-6-astra"
-model_reasoning_effort = "medium"
+model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 approval_policy = "never"
 developer_instructions = """

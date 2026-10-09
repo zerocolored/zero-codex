@@ -28,6 +28,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { GrokOAuthBrowserSession, GROK_BROWSER_ANSWERS, GROK_BROWSER_ABORT_REASONS, advisorRecoveryProgress } from './grok-oauth-browser.ts'
 import { readNativeAdvisorRegistrations, registerNativeAdvisor } from './native-advisor-recovery.ts'
+import { HostedCodexAdvisors } from './hosted-codex-advisor.ts'
+import { readPrimaryToolsContext } from './primary-tools-broker.ts'
+import { verifyOfficialCodexSnapshot } from './standalone-codex.ts'
+import { buildCodexChildEnvironment } from './codex-executor.ts'
 import { AdvisorFailureError, advisorFailureMessage, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
 import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
@@ -1601,7 +1605,7 @@ export function requiredAdvisorPhases(
 async function main(): Promise<void> {
   const [
     contextInput, stateInput, runtimeInput, fingerprintAllow, fingerprintDeny,
-    phaseScopeInput = 'complete', processNonceInput, claudeLookupInput,
+    phaseScopeInput = 'complete', processNonceInput, claudeLookupInput, primaryCoreInput = 'codex',
   ] = process.argv.slice(2)
   if (!contextInput || !stateInput || !runtimeInput || !fingerprintAllow || !fingerprintDeny) {
     throw new Error(
@@ -1612,6 +1616,7 @@ async function main(): Promise<void> {
     throw new Error('advisor broker phase scope is invalid')
   }
   const phaseScope = phaseScopeInput as 'prepare' | 'review' | 'complete'
+  if (!['codex', 'claude-code'].includes(primaryCoreInput)) throw new Error('invalid advisor primary core')
   if (!processNonceInput || !/^[0-9a-f]{32}$/.test(processNonceInput)) {
     throw new Error('advisor broker process nonce is invalid')
   }
@@ -1643,6 +1648,22 @@ async function main(): Promise<void> {
     deny: fingerprintDeny,
   }
   const contextDigest = createHash('sha256').update(JSON.stringify(context)).digest('hex')
+  const hostedCodex = primaryCoreInput === 'claude-code' ? new HostedCodexAdvisors(
+    contextInput, context.attemptNonce, async ({ registration, onSpawn, signal }) => {
+      const tools = readPrimaryToolsContext(join(advisorRuntimeDir, 'readonly-tools.json'))
+      verifyOfficialCodexSnapshot(tools.codex)
+      const overrides = tools.permissionOverrides.map(value => value.startsWith('model=')
+        ? 'model="gpt-6-astra"' : value.startsWith('model_reasoning_effort=')
+          ? `model_reasoning_effort=${JSON.stringify(registration.reasoningEffort)}` : value)
+      return runBounded([tools.codex.physical, 'exec', '--ignore-user-config', '--ignore-rules',
+        '--json', '--skip-git-repo-check', '-C', context.repoPath,
+        ...overrides.flatMap(value => ['-c', value]), '-'], {
+        cwd: context.repoPath, env: buildCodexChildEnvironment(), onSpawn, signal,
+        stdin: `You are the independent ${registration.perspective === 'solution' ? 'solution_analyst' : 'risk_reviewer'}.\n`
+          + 'Do not perform the primary task or invoke another model/agent. Read-only; approvals are never.\n'
+          + registration.prompt,
+      })
+    }) : undefined
   const projectLayout: AdvisorProjectLayout = resolveAdvisorProjectLayout(context.repoPath)
   if (projectLayout.gitRoot !== context.gitRoot
     || JSON.stringify(projectLayout.gitRoots) !== JSON.stringify(context.gitRoots)) {
@@ -3138,6 +3159,10 @@ async function main(): Promise<void> {
   const startRound = async ({
     phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis, retryUnavailable, inputUpdateIsRecoveryOnly, reviewWorktrees, uiProposal,
   }: RoundRequest, automaticContinuation = false): Promise<ReturnType<typeof toolText>> => {
+    if (hostedCodex && (phase === 'investigation' || phase === 'review') && (round === 1 || round === 2)) {
+      try { await hostedCodex.verify(phase, round, nativeAdvisors) }
+      catch (error) { return toolText({ complete: false, reason: String(error) }, true) }
+    }
     if (uiProposal && (phaseScope !== 'complete' || phase !== 'investigation' || round !== 1 || !context.writeEnabled)) {
       return toolText({ complete: false, reason: 'UI artifacts are only available in the writable workflow initial-design round' }, true)
     }
@@ -4289,6 +4314,51 @@ async function main(): Promise<void> {
       waitingForAdvisors: false, retryable: false, continuationUnavailable: true,
       nextAction: '中断した相談の自動続行を終了しました。取得済み回答と不足理由を保持し、本作業を継続してください。' })
   }
+  if (hostedCodex) {
+    server.registerTool('advisor_codex_start', {
+      description: 'Start the one independent read-only GPT-6 Astra slot for a Claude primary. Durable and idempotent: repeated calls retain the original process/outcome, never launch a replacement. Investigation uses medium effort, review uses low. Supply the same request/evidence as the external reviewers. Round 2 requires an adopted mandatory fix and an actual nonempty task-owned delta.',
+      inputSchema: {
+        phase: z.enum(['investigation', 'review']), round: z.union([z.literal(1), z.literal(2)]),
+        inputRevision: z.number().int().min(1), inputDigest: z.string().regex(/^[0-9a-f]{64}$/),
+        request: z.string().min(1).max(MAX_INPUT_CHARS), roundTwoBasis: advisorRoundInputSchema.roundTwoBasis,
+      },
+    }, async request => {
+      try {
+        const input = readAdvisorInputSnapshot(stateDir, context.jobId)
+        if (request.inputRevision !== input.revision || request.inputDigest !== input.digest) {
+          return toolText({ complete: false, staleInput: true, inputRevision: input.revision, inputDigest: input.digest }, true)
+        }
+        if (!validThreeAdvisorPhaseRound(request.phase, request.round)) throw new Error('invalid advisor phase/round')
+        if (request.round === 2) {
+          const basis = request.roundTwoBasis, first = unifiedRoundLedger('review', 1)
+          if (!basis || first.invalid || first.entries.length !== 1) throw new Error('review round 2 requires the completed first review and its mandatory-fix basis')
+          const prior = first.entries[0]!
+          if (prior.journal.status !== 'completed') throw new Error('review round 1 must be fully obtained first')
+          for (const source of basis.roundOneSources) {
+            const values = prior.journal[source]
+            if (!(Array.isArray(values) ? values : [values]).some(value => value && typeof value === 'object' && (value as any).adopted === true)) {
+              throw new Error('round 2 cited an unadopted source')
+            }
+          }
+          const baseline = readReviewDeltaBaseline(prior.input)
+          if (!baseline) throw new Error('review round 1 repository baseline unavailable')
+          const extra = baseline.snapshot.gitRoots.filter(root => !projectLayout.gitRoots.includes(root))
+            .map(root => relative(projectLayout.projectPath, root))
+          const current = extra.length ? snapshotAdvisorReviewWorktrees(projectLayout, extra) : snapshotAdvisorRepository(projectLayout)
+          const delta = summarizeAdvisorTaskOwnedFixChanges(baseline.snapshot, current, basis.taskOwnedFixPaths)
+          if (!delta.changed || delta.layoutChanged || delta.repositories.length === 0) throw new Error('round 2 has no observed task-owned fix delta')
+        } else if (request.roundTwoBasis) throw new Error('round-two basis is only valid for review round 2')
+        return toolText(await hostedCodex.start({ ...request, contextPath: contextInput, attemptNonce: context.attemptNonce }))
+      } catch (error) { return toolText({ complete: false, reason: String(error) }, true) }
+    })
+    server.registerTool('advisor_codex_poll', {
+      description: 'Wait for the original hosted GPT slot. Return nativeAdvisors verbatim to advisor_round. Polling never repeats an attempted launch or changes its original question.',
+      inputSchema: { phase: z.enum(['investigation', 'review']), round: z.union([z.literal(1), z.literal(2)]) },
+    }, async ({ phase, round }) => {
+      try { return toolText(await hostedCodex.poll(phase, round, 30_000)) }
+      catch (error) { return toolText({ complete: false, reason: String(error) }, true) }
+    })
+  }
   server.registerTool('advisor_native_prepare', {
     description: 'Before spawning the native GPT slot, durably register its original request. Repeated calls return the SAME taskName, prompt and input binding; never spawn a duplicate after interruption.',
     inputSchema: {
@@ -4297,6 +4367,7 @@ async function main(): Promise<void> {
       request: z.string().min(1).max(MAX_INPUT_CHARS),
     },
   }, async request => {
+    if (hostedCodex) return toolText({ complete: false, reason: 'Claude primary uses advisor_codex_start/poll for its one GPT slot.' }, true)
     try {
       const input = readAdvisorInputSnapshot(stateDir, context.jobId)
       if (request.inputRevision !== input.revision || request.inputDigest !== input.digest) {
@@ -4544,6 +4615,11 @@ async function main(): Promise<void> {
   })
 
   await server.connect(new StdioServerTransport())
+  if (hostedCodex) {
+    const stopHosted = () => { void hostedCodex.close().then(() => { process.exit(0) }, () => { process.exit(1) }) }
+    server.server.onclose = stopHosted
+    process.once('SIGTERM', stopHosted); process.once('SIGINT', stopHosted)
+  }
   // The parent may resume without issuing another advisor tool call. A
   // retired unsent slot is still this same consultation, so continue it when
   // its broker is recreated. Never require the LLM to remember a retry flag.

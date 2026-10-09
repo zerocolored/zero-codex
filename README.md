@@ -96,7 +96,7 @@ Slack bot
   App Serverの自動継続ターンを追跡します。同じ未完了スレッドの再開では目標と使用履歴を保持します。
   判断・認証・権限などが必要な待機は未完了として通知し、完了リアクションを付けません。
   停止指示とレート制限は従来の処理を維持します。Goalは依頼範囲を広げる許可ではありません。
-  Claude・Grok・補助CodexにはGoalを設定せず、更新候補の検証でも有効化しません。
+  advisorのClaude・Grok・補助CodexにはGoalを設定せず、更新候補の検証でも有効化しません。
 - 設定済みチャンネルの人間の参加者と、Zeroちゃんを明示メンションした他のBotは、
   個別登録なしでrepository・`.git` writeとネットワークを使えます。Botは添付付き投稿にも対応し、
   所有済みスレッドでも毎回明示メンションが必要です。自己投稿とBot DMは受け付けません。
@@ -120,9 +120,9 @@ Slack bot
   Chrome子processと一時profileの回収をまとめて返します。
   UI/UX承認前は製品repositoryを書き換えず、現在画面とscratch内だけの提案画面を撮影します。画像は
   完全decode後にpixel-bearing chunkだけへ再封印し、metadataとローカルpathをSlackへ持ち出しません。
-- advisorを使用する設計・レビューでは、GPT・Grok・Claudeの3回答取得が必須です。GrokとClaudeには
+- advisorを使用する設計・レビューでは、GPT・Grok・Claudeの3枠を試行します。GrokとClaudeには
   認証情報をモデルへ渡さない`zerokun_advisors` transportを提供します。
-  各phaseの実測状態を返し、欠員は成功扱いせず未完了で復旧します。
+  各phaseの実測状態を返し、取得できた回答と欠員の理由を保持して本作業を継続します。
   秘密・credential・個人情報をSlack依頼へ貼り付けないでください。
 - Socket Mode 停止中の DM・メンションと、採用済みスレッドの未メンション返信を履歴から回収します。
 
@@ -484,9 +484,30 @@ symlink、Gitではない直下項目は作業対象に含めません。
 Codexは変更せず回答し、公開依頼なら他者の未commit作業を保持したまま必要なrepositoryだけを操作します。
 Zeroちゃんはmember境界をpermissionへ反映しますが、対象選択、review、publication planを上書きしません。
 
-`zerochan start` はHerdr外からの起動を拒否します。引数やexportは不要です。実行した物理directoryを
+主担当はprojectごとに選択できます。未設定時は従来どおりCodexです。
+
+```bash
+zerochan set core          # 対話で選択
+zerochan set core claude   # Claude Code（最新Opus）
+zerochan start             # 起動確認後、新規依頼へ反映
+zerochan status            # 設定した担当と新規依頼の担当を確認
+zerochan set core codex    # Codexへ戻す場合も、その後start
+```
+
+設定変更前に受付済みのジョブは元の担当で続行します。Claude Codeモードでは、Herdrに専用tabを
+1つ作り、Claude自身が主担当として進めます。新規タスクはClaudeの`opus` aliasを解決し、実際の
+モデル名を保存してタスク中の再開にも使います。CodexとClaudeの会話sessionは混用しません。
+Claudeの利用可能なsubscription認証を起動時に確認し、未認証の場合はstartを終了して現在の担当を保持します。
+Codex CLIは実行sandboxと独立GPTレビューにも使うため、Claudeモードでも必要です。
+主担当の設定は`.zerochan/primary-core.json`へ保存し、既存のチャンネル設定形式は変更しません。
+旧版のrunnerが稼働中の場合は、現在のサービスを保持して起動を終了します。更新後に再起動してから設定を反映してください。
+基準タグへ戻す場合は、受付済みのClaudeジョブを完了または取消し、`zerochan set core codex`、`zerochan stop`を実行してから旧版へ切り替えてください。
+設計・最終レビューのGPT・Fable 5.1・Grokの3枠、Slackの通知と成果物配信は両モードで共通です。
+レビュー基盤の障害だけで主担当の作業を停止せず、取得結果と不足理由を保持します。
+
+`zerochan start` はHerdr外から実行すると専用workspaceを作って引き継ぎます。引数やexportは不要です。実行した物理directoryを
 対象projectとして、現在のHerdr workspaceへ新しい `Zeroちゃん runtime` tabを作り、gatewayとrunnerの
-安定起動を確認して元のterminalへ戻ります。既に正常稼働中なら何も入れ替えません。
+安定起動を確認して元のterminalへ戻ります。既に正常稼働中ならprocessを入れ替えず、主担当の設定を新規依頼へ反映します。
 
 runtime log tabを作り直す場合は `zerochan stop` → `zerochan start` を使います。`stop`はrunnerの
 新規job取得を止めてから実行中jobが0件であることを再確認し、実行中ならprocessへsignalせず拒否します。

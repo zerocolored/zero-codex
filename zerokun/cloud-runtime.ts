@@ -8,6 +8,7 @@ import { captureAttachment, captureRepository, restoreRepository, type HandoffPa
 import { ensureWorkspacePin, resolveProjectLayout } from './project-layout.ts'
 import type { JobRecord, JobStore } from './job-runner.ts'
 import { localRepositoryIdentity, provisionLocalWorkspaceSettings } from './local-workspace-settings.ts'
+import { readClaudeJobModel } from './claude-model-binding.ts'
 
 type IntegrationBranch = 'develop' | 'main' | 'master'
 type Workspace = { epoch: number; project: string; repositories: Array<{
@@ -199,8 +200,11 @@ export class CloudRuntime {
         : ''
       const history = [inherited, this.store.cloudHistory(job.id)].filter(Boolean).join('\n\n')
       const attachments = [...new Set([...job.attachments, ...(job.threadAttachments ?? []).map(a => a.path)])]
-      const primaryModel = this.store.taskModels().latest(job.id)
+      const primaryModel = job.runtime === 'claude-code'
+        ? readClaudeJobModel(this.stateDir, job.id, workspace.repositories.length === 1
+          ? workspace.repositories[0]!.root : workspace.project) : this.store.taskModels().latest(job.id)
       const packet: HandoffPackage = { version: 1, task: job.task, history,
+        ...(job.runtime === 'claude-code' ? { primaryCore: 'claude-code' } : {}),
         ...(primaryModel ? { primaryModel } : {}),
         repositories: workspace.repositories.map(r => captureRepository(r.root, r.name,
           continuationCheckpointBase(r.root, r.base, r.integrationBranch))),
@@ -304,9 +308,11 @@ export class CloudRuntime {
       // Activate before enqueue; a crash is recovered by the same event ID.
       const active = await this.client.activate(h)
       this.store.enqueueCloudImport({ chatId: input.channel, threadTs: input.thread, messageId: input.message,
+        core: packet.primaryCore ?? 'codex',
         userId: input.user, repoPath: input.project, writeEnabled: input.writeEnabled,
         task: `同じSlackスレッドの処理を引き継いで続けてください。作業場所にあるHANDOFF.mdを読み、既存の変更と実行済み操作を確認して残作業から進めてください。新規の依頼として設計をやり直さないでください。\n\n元の依頼:\n${packet.task}`,
-        attachments: prepared.attachments }, h.id, active.epoch, JSON.stringify(active), packet.primaryModel)
+        attachments: prepared.attachments }, h.id, active.epoch, JSON.stringify(active), packet.primaryModel,
+        prepared.workspace.repositories.length === 1 ? prepared.workspace.repositories[0]!.root : prepared.workspace.project)
     })
   }
 }

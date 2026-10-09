@@ -1215,7 +1215,7 @@ function runnerBelongsToAttempt(
 ): boolean {
   const runtime = readRunnerRuntime(stateDir)
   return Boolean(runtime
-    && runtime.startsWith(`zerokun-codex-runner-v1:${expectedAppId}:`)
+    && runtime.startsWith(`zerokun-codex-runner-v2:${expectedAppId}:`)
     && runtime.endsWith(`:${herdrRuntimeFingerprint(attemptedRuntime)}`))
 }
 
@@ -1343,7 +1343,7 @@ async function requireRunningServiceCompatible(
     fail('稼働中serviceと現在のHerdr control planeが一致しません')
   }
   const runnerRuntime = readRunnerRuntime(stateDir)
-  const prefix = `zerokun-codex-runner-v1:${expectedAppId}:`
+  const prefix = `zerokun-codex-runner-v2:${expectedAppId}:`
   const suffix = `:${herdrRuntimeFingerprint(pinned)}`
   if (!runnerRuntime?.startsWith(prefix) || !runnerRuntime.endsWith(suffix)) {
     fail('稼働中job runnerのSlack AppまたはHerdr runtimeが一致しません')
@@ -1697,12 +1697,13 @@ async function main(): Promise<void> {
     }
     return
   }
-  const result = await startManagedService(
+  const { startWithSelectedCore } = await import('./core-command.ts')
+  const result = await startWithSelectedCore(projectDir!, () => startManagedService(
     rootRepo,
     stateDir,
     projectDir!,
     expectedAppId!,
-  )
+  ))
   if (result.status === 'already-running') {
     process.stdout.write('✅ 既に稼働中です。\n')
     process.stdout.write('   ログtabを作り直す場合は zerochan stop → zerochan start を実行してください。\n')

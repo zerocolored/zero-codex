@@ -42,6 +42,11 @@ if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "auto-update" ]; then
   [ "$#" -eq 2 ] || { echo '使い方: zerochan auto-update on|off|status' >&2; exit 2; }
   exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/auto-update.ts" "$2"
 fi
+if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "set" ] && [ "${2:-}" = "core" ]; then
+  { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } || { echo '使い方: zerochan set core [codex|claude]' >&2; exit 2; }
+  shift 2
+  exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/core-command.ts" set "$(pwd -P)" "$@"
+fi
 if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "set" ] && [ "${2:-}" = "slack-app" ]; then
   [ "$#" -eq 2 ] || { echo '使い方: zerochan set slack-app（トークンは対話入力）' >&2; exit 2; }
   exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-command.ts" "$(pwd -P)"
@@ -52,6 +57,7 @@ if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "unset" ] && [ "${2:-}" = "sla
   exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-unset.ts" unset "$(pwd -P)"
 fi
 if [ "$INVOKED_AS" = "zerochan" ] && [ "$#" -eq 1 ] && [ "$1" = "status" ]; then
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/core-command.ts" status "$(pwd -P)"
   status_result=0
   bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-unset.ts" status "$(pwd -P)" || status_result=$?
   [ "$status_result" -eq 3 ] || exit "$status_result"
@@ -208,7 +214,7 @@ JOB_RUNNER_STARTER_LOCK="$STATE_DIR/job-runner-starter.lock"
 RESTART_MAINTENANCE_DIR="$STATE_DIR/restart.lock"
 RESTART_MAINTENANCE_LOCK="$RESTART_MAINTENANCE_DIR/pid"
 RESTART_MAINTENANCE_LEASE=""
-EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1"
+EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v2"
 
 export ZEROKUN_STATE_DIR="$STATE_DIR"
 export ZEROKUN_JOB_DB="$JOB_DB"
@@ -314,7 +320,7 @@ fi
 # launcher use that did not pass through bootstrap's interactive Slack setup.
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-identity.ts" verify-file "$STATE_DIR/.env" \
   || { echo "❌ Slack Bot/App token identityを検証できませんでした。既存processは停止しません。" >&2; exit 1; }
-EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1:$RUNNER_RUNTIME_ID"
+EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v2:$RUNNER_RUNTIME_ID"
 
 # A normal/legacy launcher must not race a managed stop/start or updater. The
 # authorized updater restart already owns this same lock and is the sole
@@ -411,7 +417,7 @@ if [ -n "$existing_bridge_pid" ]; then
   fi
   shared_runner_runtime=0
   case "$existing_runner_runtime" in
-    "zerokun-codex-runner-v1:$RUNNER_RUNTIME_ID:"*) shared_runner_runtime=1 ;;
+    "zerokun-codex-runner-v2:$RUNNER_RUNTIME_ID:"*) shared_runner_runtime=1 ;;
   esac
   if [ "$LAUNCH_MODE" = "start" ] && [ "$INVOKED_AS" = "zerochan" ] \
      && bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/readiness.ts" \

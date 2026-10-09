@@ -33,6 +33,7 @@ import {
 } from './process-generation.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 import { verifyEncodedOfficialCodexSnapshot } from './standalone-codex.ts'
+import { decodeClaudeExecutableSnapshot } from './claude-executable.ts'
 import { subprocessExitCode } from './process-exit-code.ts'
 import { startProcessPolling } from './supervisor-watch.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
@@ -114,9 +115,11 @@ async function main(): Promise<void> {
   const denyTagPath = hasFingerprint ? command[2] : undefined
   const runtimeCommand = hasFingerprint ? command.slice(3) : command
   const hasOfficialSnapshot = runtimeCommand[0] === '--official-codex-snapshot'
+  const hasClaudeSnapshot = runtimeCommand[0] === '--claude-executable-snapshot'
   const hasTestOverride = runtimeCommand[0] === '--unverified-for-tests'
   const encodedOfficialSnapshot = hasOfficialSnapshot ? runtimeCommand[1] : undefined
-  const separatorIndex = hasOfficialSnapshot ? 2 : hasTestOverride ? 1 : -1
+  const encodedClaudeSnapshot = hasClaudeSnapshot ? runtimeCommand[1] : undefined
+  const separatorIndex = hasOfficialSnapshot || hasClaudeSnapshot ? 2 : hasTestOverride ? 1 : -1
   const codexBin = separatorIndex >= 0 && runtimeCommand[separatorIndex] === '--'
     ? runtimeCommand[separatorIndex + 1]
     : undefined
@@ -128,7 +131,7 @@ async function main(): Promise<void> {
       + '(--official-codex-snapshot SNAPSHOT | --unverified-for-tests) -- CODEX_BIN [ARG ...]',
     )
   }
-  if (!hasOfficialSnapshot && (!hasTestOverride
+  if (!hasOfficialSnapshot && !hasClaudeSnapshot && (!hasTestOverride
     || process.env.ZEROKUN_SUPERVISOR_TEST_UNVERIFIED !== '1')) {
     throw new Error('Codex supervisor requires a verified official standalone snapshot')
   }
@@ -143,6 +146,10 @@ async function main(): Promise<void> {
     if (verified.physical !== codexBin) {
       throw new Error('Codex official standalone snapshot does not match the requested executable')
     }
+  }
+  if (hasClaudeSnapshot && (!encodedClaudeSnapshot
+    || decodeClaudeExecutableSnapshot(encodedClaudeSnapshot).physical !== codexBin)) {
+    throw new Error('Claude executable snapshot does not match the requested executable')
   }
   const registrationDirectory = lstatSync(dirname(registrationPath))
   const ownerMatches = typeof process.getuid !== 'function'
@@ -256,6 +263,10 @@ async function main(): Promise<void> {
   let stopTracking: (() => void) | undefined
   let childStarted = false
   try {
+    if (encodedClaudeSnapshot !== undefined
+      && decodeClaudeExecutableSnapshot(encodedClaudeSnapshot).physical !== codexBin) {
+      throw new Error('Claude executable changed before child spawn')
+    }
     if (encodedOfficialSnapshot !== undefined) {
       const verified = verifyEncodedOfficialCodexSnapshot(encodedOfficialSnapshot)
       if (verified.physical !== codexBin) {

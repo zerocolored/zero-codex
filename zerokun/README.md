@@ -1,12 +1,24 @@
-# Zeroちゃん一式（Slack → Herdr → ローカルCodex）
+# Zeroちゃん一式（Slack → Herdr → Codex / Claude Code）
 
 ## 結論
 
 常駐するSlack gatewayが受信をSQLiteへ保存し、Herdr内から起動された1本のrunnerが
-`codex app-server --stdio`をJSON-RPCで直列実行します。Codexはglobal→projectの`AGENTS.md`をjobごとに読み、
+既定の`codex app-server --stdio`、または選択されたClaude Codeを直列実行します。主担当はglobal→projectの`AGENTS.md`をjobごとに読み、
 read jobは回答まで、write jobは調査・設計・実装・review・Git・依頼されたmerge／deploy確認までを
-1つのprimary Codex workflowで完遂します。設計・レビューで使うGPT・Grok・Claudeの回答は3者分を必須とし、
-認証を隔離したtransportで未取得枠だけを復旧します。
+1つの主担当のworkflowで完遂します。設計・レビューはGPT・Grok・Fable 5.1の3枠を試行し、
+取得できた回答と利用不能の理由を保持します。回答数の下限はなく、advisorの障害だけで主担当を止めません。
+
+`zerochan set core codex|claude`はproject設定を保存し、`zerochan start`成功時に新規依頼へ反映します。
+受付済みジョブのcoreは不変です。Claudeの主担当はnative stream-jsonとprivate socketで専用Herdr tabに
+接続し、新規ジョブでは`opus`、再開では保存済みの実モデルを使います。Claude内蔵の直接実行tool、
+user/project hook、plugin、memoryは読み込まず、明示したMCPだけを使います。コマンド実行は既存の
+Codex permission sandbox、GitHub・browser・cloud logs・advisorは既存の用途別brokerへ接続します。
+Claude本体とMCP runtime全体をOSのread-only sandboxで囲む構成ではありません。
+
+追加質問は主担当を一度止め、同じClaude sessionを読み取り専用のtool構成で再開して回答します。
+追加入力は旧turnのterminalとprocess回収後に一度だけ渡します。ACK不明の入力を再送せず、
+正式な失敗terminalだけを利用上限・一時障害からの継続根拠にします。結果は入力revisionとともに
+既存のSQLite台帳へ保存し、Slack配信の再試行とモデルの再実行を分離します。
 
 ## 導入
 
@@ -181,7 +193,7 @@ codex <trust-args> -C <repo> \
   App Serverプロセス自体の既定モデルは引き続きrelease管理です。
 
   `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。
-  設計advisorは`high`、レビューadvisorは`medium`です。release内のread-only／neverなrole TOMLを
+  設計advisorは`medium`、レビューadvisorは`low`です。release内のread-only／neverなrole TOMLを
   App Serverの`agents.<role>.config_file`へ指定し、ホストに残った旧role設定より優先します。
   モデルは両方`gpt-6-astra`のままで、通常のCodex用グローバル設定は変更しません。
 - 実行中の同thread返信は`turn/steer`で同じturnへ渡し、Codexが質問と作業更新を現在の文脈で判断します。
@@ -247,14 +259,14 @@ codex <trust-args> -C <repo> \
 - read senderは1つのread-only Codex workflow、write senderは1つのwrite-authorized Codex workflowを使います。
   advisor、review、test、Git、deployの進め方はCodexが`AGENTS.md`から決め、Zeroちゃんは別phaseへ分割しません。
 - advisorが必要なjobでは、初期設計のnative Codex solution analyst 1枠、最終reviewのnative Codex risk reviewer
-  1枠に加え、`zerokun_advisors`が各roundでGrok 1枠とfresh Claude Fable 5.1 1枠を起動し3者の有効回答を必須とします。
+  1枠に加え、`zerokun_advisors`が各roundでGrok 1枠とfresh Claude Fable 5.1 1枠を試行します。取得回答と利用不能理由を保持し、回答数だけを理由に本作業を止めません。
   最終review第2回は、第1回の必須指摘をprimary Codexが採用しtask所有の修正差分を作った場合だけ、そのdeltaに
   限って起動します。軽微な指摘・advisor欠員・空deltaでは起動せず、第3回はありません。返却するslot集計は
   `未起動／起動未確認／起動済み未回答／回答取得`を区別し、primary Codexはこの構造化値だけを人数報告の根拠にします。
 - Grokの既知の未認証応答だけは、初期設計phaseと最終review phaseでそれぞれ1回に限って固定OAuth helperへ渡し、復旧できた場合も
   認証で終了した枠だけを再実行します。一時失敗は30秒・60秒後に外部枠だけを自動再試行します。
   Claudeは未送信と確認できる場合だけ再起動し、送達不明ならdurable markerで同じagentから回答を回収します。中断後も送達可能性のある依頼を自動再送しません。
-  取得済み回答は直ちに保存し、他枠の待機中の中断にも備えます。回答不足のまま終了しても成功通知にしません。
+  取得済み回答は直ちに保存し、他枠の待機中の中断にも備えます。回答不足を全員成功と報告せず、本作業の完了とは区別します。
   未取得枠の再試行は同じroundのretry指定で行い、認証や設定修復が必要なら具体的な操作を案内して待機します。
   クラウド用multi-repo作業場所は新規作成・既存再開・引き継ぎ時にworkspace設定を保証し、
   Claude helperは旧v1と非Git親のv2設定を読み取ります。既存のbranchや未コミット変更は作り直しません。

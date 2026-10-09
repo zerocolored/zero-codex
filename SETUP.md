@@ -139,7 +139,13 @@ workflowとして実行します。Codexは対象projectの`AGENTS.md`に従い�
 deploy確認まで自分で進めます。ZeroちゃんはFIFO、同一thread継続、process回収、認証情報を隠した
 GitHub transportだけを担当します。
 
-Primary Codexの既定は`gpt-6-astra`／`medium`です。依頼本文で「GPT-6 Solで実行して」などと
+主担当の既定はCodexです。project directoryで`zerochan set core claude`、続けて`zerochan start`を
+実行すると、新規依頼の主担当がClaude Codeの最新Opusになります。対話選択は`zerochan set core`、
+Codexへ戻す操作は`zerochan set core codex`と`zerochan start`です。受付済みの依頼と既存sessionは
+別のcoreへ付け替えません。ClaudeモードでもsandboxとGPT advisorにCodexを使うため、既存の
+Codex導入・認証は必要です。Claudeの本人loginは前述のセットアップ手順で行います。
+
+Codexモードの主担当モデルの既定は`gpt-6-astra`／`medium`です。依頼本文で「GPT-6 Solで実行して」などと
 明示すると、独立したLLMが引用・比較との違い、言い間違い・表記揺れを判定します。
 古い版の正確な名前を指定した場合も、その系列の最新版を選びます（例: GPT-6 Sol → GPT-6.1 Sol）。
 選択時にCodexのモデル一覧を再取得し、ID・説明・更新先から最新版を判断します。
