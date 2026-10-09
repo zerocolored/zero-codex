@@ -144,8 +144,8 @@ Advisorのmodel選択はこのprimary設定とは別に`AGENTS.md`の契約へ�
 
 ## 必要なもの
 
-- macOS（Linux / WSL2 では Codex の起動経路だけ Landlock + cgroup に差し替えて動く。
-  要件と未配線の範囲は [`docs/linux-wsl2.md`](docs/linux-wsl2.md)）
+- macOS（Linux / WSL2 では Codex の起動経路を Landlock + cgroup に差し替え、Herdr は Linux 版の
+  headless server を常駐させて使う。手順と残る制限は [`docs/linux-wsl2.md`](docs/linux-wsl2.md)）
 - Git、Bun、tmux、Herdr 0.8.2 以上（必要なworkspace/tab/pane/agent APIを含む）
 - Codex CLI 0.149.0 以上（`codex login status`が`Logged in using ChatGPT`と返すこと）
 - GitHub CLI (`gh`) と、対象repositoryへbranch push・PR作成できるlogin済みGitHub account

@@ -168,6 +168,53 @@ describe('outside-Herdr start handoff', () => {
     }
   })
 
+  // herdr CLI はサーバ未起動などの失敗を exit 0 のまま `{id, error:{code,message}}` 封筒で返す
+  // （herdr 0.9.3 Linux で実測）。result 欠落の一般エラーに丸めず、Herdr の message を出す。
+  test('Herdrのerror封筒はresult欠落に丸めずcodeとmessageをそのまま伝える', async () => {
+    const { root, state, project } = fixture()
+    const calls: string[][] = []
+    try {
+      await expect(startZeroInHerdrWorkspace(root, state, project, {
+        inspectStatus: () => ({ status: 'stopped' }),
+        invoke: async args => {
+          calls.push(args)
+          return {
+            id: 'cli:workspace:create',
+            error: {
+              code: 'server_not_running',
+              message: 'no herdr server is running at /home/u/.config/herdr/herdr.sock; run `herdr` to start or attach it',
+            },
+          }
+        },
+      })).rejects.toThrow(
+        'Herdr workspace createに失敗しました (server_not_running): no herdr server is running at /home/u/.config/herdr/herdr.sock',
+      )
+      // workspace は作られていないので close を試みない
+      expect(calls).toEqual([[
+        'workspace', 'create', '--cwd', realpathSync(project), '--label', 'Zeroちゃん project', '--focus',
+      ]])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'linux')(
+    'Linuxでserver未起動ならheadless serverの起動手順を添える', async () => {
+    const { root, state, project } = fixture()
+    try {
+      await expect(startZeroInHerdrWorkspace(root, state, project, {
+        inspectStatus: () => ({ status: 'stopped' }),
+        invoke: async () => ({
+          id: 'cli:workspace:create',
+          error: { code: 'server_not_running', message: 'no herdr server is running' },
+        }),
+      })).rejects.toThrow('systemctl --user start herdr-server')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+    },
+  )
+
   test('pane run失敗時は今回作成したexact workspaceだけを閉じservice停止を確認する', async () => {
     const { root, state, project } = fixture()
     const calls: string[][] = []

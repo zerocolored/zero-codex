@@ -55,12 +55,45 @@ process の世代（boot id + 起動時刻）は `/proc/<pid>/stat` と
 `btime` も動き、executor と supervisor で読んだ値がずれて generation 照合が全件落ちる
 （2026-10-08 に実測。`dmesg` に `Time jumped backwards` が 30 秒前後ごとに出る機体）。
 
+## Herdr（`zerochan start` の前提）
+
+`herdr-runtime.ts` は `HERDR_ENV=1` に加えて unix socket の `HERDR_SOCKET_PATH` と
+`herdr pane current --current` を要求する。Windows 側の `herdr.exe` は使えない（unix socket が無い）
+ので、**WSL の中に Linux 版 Herdr を入れ、headless server を常駐させる**。
+
+```bash
+# 1. 公式 installer（macOS の bootstrap と同じ入口。linux-x86_64 / linux-aarch64 を配布）
+curl -fsSL https://herdr.dev/install.sh | HERDR_INSTALL_DIR="$HOME/.local/bin" sh
+# 2. headless server を systemd --user で常駐（WSL2 では誰も TUI を開かないため）
+install -D -m 0644 zerokun/linux/herdr-server.service ~/.config/systemd/user/herdr-server.service
+systemctl --user daemon-reload
+systemctl --user enable --now herdr-server.service
+loginctl enable-linger "$USER"     # ログインシェルが無くても user service を起こす
+# 3. 確認
+herdr status server                 # status: running / socket: ~/.config/herdr/herdr.sock
+```
+
+実測（2026-10-09, Ubuntu 24.04 / herdr 0.9.3 linux-x86_64）:
+
+- `zerokun_require_herdr_version`（最低 0.8.2 + workspace/tab/pane/agent API の probe）が通る
+- socket は `srw-------` の owner-only で `requireOwnedNode` の条件を満たす
+- `herdr workspace create --cwd … --label … --focus` → `w1` / `w1:t1` / `w1:p1` / `term_…` を返し、
+  その pane の shell には `HERDR_ENV=1` `HERDR_SOCKET_PATH` `HERDR_PANE_ID` 等が入る
+- pane 内で `bun zerokun/herdr-runtime.ts runtime-id` が 64 桁の fingerprint を返す（= 起動 identity の
+  固定・再検証が WSL でも機能する）
+
+server が止まっていると herdr CLI は exit 0 のまま `{"error":{"code":"server_not_running",…}}` を返す。
+`herdr-start.ts` はこの封筒をそのまま message に出し、Linux では `systemctl --user start herdr-server`
+を添える。
+
 ## 既知の制限
 
-- **`zerochan start` は未配線。** `herdr-runtime.ts` は `HERDR_ENV=1` に加えて unix socket の
-  `HERDR_SOCKET_PATH` と `herdr current-pane` を要求する。Windows 機の herdr は
-  `x86_64-pc-windows-msvc` build（`herdr.exe`）で WSL 内の Linux build ではないため、この条件を
-  満たせない。WSL 内に Linux 版 herdr を入れて pane から起動する配線が別途必要
+- **`zerochan start` はまだ Codex の official standalone 検査で止まる。** `codex-channel.sh` は
+  Herdr 検査の後に `zerokun/standalone-codex.ts version` を呼び、`expectedStandaloneTarget()` が
+  darwin 以外で `Codex official standalone runtime is currently supported only on macOS` を投げる
+  （`bootstrap-macos.sh` が置く `~/.codex` 配下の公式 standalone + manifest 配置が前提）。
+  npm の `codex-cli 0.154.0` が PATH にあっても採用されない。Linux 用の standalone 配置と検証が次の作業
+- Slack App の token（state dir の `.env`）と Codex / GitHub CLI のログインは macOS と同じく人が用意する
 - cgroup は同一 uid の process なら `cgroup.procs` へ自分を書いて抜けられる（delegated subtree 内）。
   macOS の Seatbelt profile ほど敵対的な脱出には強くない。目的は「うっかり setsid した子」の回収で、
   その範囲では kernel が一覧を返すので十分
