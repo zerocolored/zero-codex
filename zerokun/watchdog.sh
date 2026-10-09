@@ -76,10 +76,22 @@ watchdog_path_selects_legacy() {
   return 1
 }
 
+# Installed copies run standalone, so the stat portability shim is inlined here
+# (same contract as zerokun/stat-compat.sh: macOS BSD stat / Linux GNU stat).
+WATCHDOG_KERNEL="$(/usr/bin/uname -s 2>/dev/null || uname -s)"
+watchdog_stat_owner() {
+  if [ "$WATCHDOG_KERNEL" = "Darwin" ]; then /usr/bin/stat -f '%u' "$1" 2>/dev/null
+  else /usr/bin/stat -c '%u' "$1" 2>/dev/null; fi
+}
+watchdog_stat_links() {
+  if [ "$WATCHDOG_KERNEL" = "Darwin" ]; then /usr/bin/stat -f '%l' "$1" 2>/dev/null
+  else /usr/bin/stat -c '%h' "$1" 2>/dev/null; fi
+}
+
 watchdog_owned_regular_file() {
   local file="$1" metadata
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
-  metadata="$(/usr/bin/stat -f '%u:%l' "$file" 2>/dev/null || true)"
+  metadata="$(watchdog_stat_owner "$file" || true):$(watchdog_stat_links "$file" || true)"
   [ "$metadata" = "$(/usr/bin/id -u):1" ]
 }
 
@@ -100,7 +112,7 @@ watchdog_valid_cutover_marker_only() {
 watchdog_valid_cutover_state() {
   local state="$1" env_file physical legacy_physical owner
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
-  owner="$(/usr/bin/stat -f '%u' "$state" 2>/dev/null || true)"
+  owner="$(watchdog_stat_owner "$state" || true)"
   [ "$owner" = "$(/usr/bin/id -u)" ] || return 1
   env_file="$state/.env"
   watchdog_owned_regular_file "$env_file" && [ -s "$env_file" ] \
@@ -189,7 +201,7 @@ prepare_state_dir() {
   mkdir -p "$STATE_DIR" 2>/dev/null || return 1
   local owner
   [ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || return 1
-  owner="$(/usr/bin/stat -f '%u' "$STATE_DIR" 2>/dev/null)" || return 1
+  owner="$(watchdog_stat_owner "$STATE_DIR")" || return 1
   [ "$owner" = "$(/usr/bin/id -u)" ] || return 1
   chmod 700 "$STATE_DIR" || return 1
 }
@@ -197,8 +209,8 @@ prepare_state_dir() {
 private_regular_file() {
   local file="$1" owner links
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
-  owner="$(/usr/bin/stat -f '%u' "$file" 2>/dev/null)" || return 1
-  links="$(/usr/bin/stat -f '%l' "$file" 2>/dev/null)" || return 1
+  owner="$(watchdog_stat_owner "$file")" || return 1
+  links="$(watchdog_stat_links "$file")" || return 1
   [ "$owner" = "$(/usr/bin/id -u)" ] && [ "$links" = "1" ]
 }
 

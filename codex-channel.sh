@@ -254,7 +254,7 @@ acquire_restart_maintenance() {
     mkdir -m 0700 "$RESTART_MAINTENANCE_DIR" \
       || { echo "❌ 再起動maintenance directoryを作成できません。" >&2; return 1; }
   fi
-  [ "$(/usr/bin/stat -f '%u:%Lp' "$RESTART_MAINTENANCE_DIR" 2>/dev/null)" \
+  [ "$(zerokun_stat_owner "$RESTART_MAINTENANCE_DIR"):$(zerokun_stat_perm "$RESTART_MAINTENANCE_DIR")" \
       = "$(/usr/bin/id -u):700" ] \
     || { echo "❌ 再起動maintenance directoryの所有権または権限が不正です。" >&2; return 1; }
   RESTART_MAINTENANCE_LEASE="$(bun --config=/dev/null --no-env-file \
@@ -690,7 +690,11 @@ echo "   project : $PROJECT"
 echo "   state   : $STATE_DIR"
 echo "   runtime : verified Herdr pane + job単位のCodex"
 echo "   trust   : read/writeともrepository sandbox / advisorは固定broker"
-echo "   caffeinate: ON (Ctrl-Cでgatewayを停止)"
+if [ "$ZEROKUN_KERNEL" = "Darwin" ]; then
+  echo "   caffeinate: ON (Ctrl-Cでgatewayを停止)"
+else
+  echo "   caffeinate: なし（Linux。Ctrl-Cでgatewayを停止）"
+fi
 
 # Keep the lease across exec and asynchronous Slack connection. The gateway
 # consumes it before creating children and releases it only after readiness.
@@ -698,4 +702,9 @@ if [ -n "$RESTART_MAINTENANCE_LEASE" ]; then
   export ZEROKUN_STARTUP_LEASE="$RESTART_MAINTENANCE_LEASE"
 fi
 trap - EXIT
-exec caffeinate -dimsu bun --config=/dev/null --no-env-file "$REPO_DIR/server.ts"
+# caffeinate is macOS-only; on Linux (WSL2) the headless session has no idle
+# sleep to inhibit, and exec-ing a missing binary would kill the gateway launch.
+if [ "$ZEROKUN_KERNEL" = "Darwin" ]; then
+  exec caffeinate -dimsu bun --config=/dev/null --no-env-file "$REPO_DIR/server.ts"
+fi
+exec bun --config=/dev/null --no-env-file "$REPO_DIR/server.ts"

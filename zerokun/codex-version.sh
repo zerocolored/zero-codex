@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+. "$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/stat-compat.sh"
+
 ZEROKUN_MIN_CODEX_VERSION="0.149.0"
 ZEROKUN_MIN_HERDR_VERSION="0.8.2"
 
@@ -60,7 +62,7 @@ zerokun_resolve_claude_binary() {
   [ -f "$binary" ] && [ -x "$binary" ] || return 1
   resolved="$(/usr/bin/perl -MCwd=realpath -e 'print realpath($ARGV[0]) // q{}' "$binary" 2>/dev/null)" || return 1
   [ -f "$resolved" ] && [ -x "$resolved" ] || return 1
-  [ "$(/usr/bin/stat -f '%u' "$resolved" 2>/dev/null)" = "$(/usr/bin/id -u)" ] || return 1
+  [ "$(zerokun_stat_owner "$resolved")" = "$(/usr/bin/id -u)" ] || return 1
   printf '%s\n' "$binary"
 }
 

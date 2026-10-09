@@ -111,13 +111,43 @@ macOS 専用のまま）。
 are compatible` を返す。この probe（`codex-app-server-capability.ts`）と advisor broker の Grok / Claude 起動も
 inline の `sandbox-exec` ではなく `sandboxedCommandForTags()` を通るので、Linux では launcher で包まれる。
 
+## Grok CLI / Slack token / setup.sh / `zerochan start`
+
+`zerokun/setup.sh` は Grok reviewer（公式 Grok CLI `~/.grok/bin/grok` 前提）と fifth-advisor helper を
+要求する。公式 installer は Linux も配っている。
+
+```bash
+curl -fsSL https://x.ai/cli/install.sh -o /tmp/grok-install.sh && bash /tmp/grok-install.sh
+#   ~/.grok/bin/grok -> ../downloads/grok-linux-x86_64（~/.bashrc に PATH 追記）
+bash zerokun/linux/register-slack-tokens.sh      # xapp- / xoxb- を非表示入力で <state>/.env へ
+bash zerokun/setup.sh                            # Linux では watchdog を systemd --user timer、管理ブロックを ~/.bashrc へ
+cd <対象project> && zerochan start               # Herdr 外から実行すると専用 workspace を作って起動する
+zerochan status                                  # ▶ Zeroちゃん: 稼働中 (PID …)
+```
+
+shell entrypoint の macOS 専用部分は `zerokun/stat-compat.sh` で吸収した:
+
+| 箇所 | macOS | Linux |
+|---|---|---|
+| 所有者・link 数・権限・種別（`state-dir.sh` / `setup.sh` / `codex-channel.sh` / `codex-version.sh` / `watchdog.sh`） | `/usr/bin/stat -f '%u' '%l' '%Lp' '%HT'` | `stat -c '%u' '%h' '%a' '%F'`（`zerokun_stat_*` / `watchdog_stat_*`） |
+| watchdog の常駐（60 秒間隔） | launchd plist（`~/Library/LaunchAgents`） | `~/.config/systemd/user/<label>.service` + `.timer`（`OnUnitActiveSec=60`）。`update.ts --setup-supervisor` 配下は環境が最小なので `XDG_RUNTIME_DIR=/run/user/<uid>` を明示して `systemctl --user` |
+| 管理ブロック（PATH / `ZEROKUN_STATE_DIR` / alias） | `~/.zshrc` | `$SHELL` が bash なら `~/.bashrc` |
+| gateway の exec | `caffeinate -dimsu bun server.ts` | `bun server.ts`（caffeinate は macOS 専用。exec が失敗すると gateway が立たず `起動確認がtimeout` になる） |
+
+実測（2026-10-09, WSL2 Ubuntu 24.04）: `setup.sh` が最後まで通り（Slack identity 検証・Codex・Grok reviewer・
+runner/CLI 設置・watchdog timer 登録）、`zerochan start` が Herdr workspace `Zeroちゃん <project>` を作って
+gateway / runner / recovery launcher を起動、pane に `slack channel: connected (U…) app=A…`、
+`gateway-ready.json` に `connectedAt` が書かれ `zerochan status` が `稼働中` を返した。
+`launcher.test.ts`（26 件）と `watchdog.test.ts`（8 件）の Linux 失敗はこの変更で 0 になった。
+
 ## 既知の制限
 
-- `zerochan start` の残りは **Slack App の token（state dir の `.env`）** と各 CLI のログイン。
-  `zerokun/setup.sh` / `quick-setup.sh` が Linux で通るかは未確認（`bootstrap-macos.sh` 前提の箇所がある）
-- `zerochan update` の候補検証（`update.ts` の `candidateCodexExecutable`）は npm package の
-  `@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex` を見るよう target を揃えたが、
-  Linux での自己更新そのものは未実測
+- `zerochan update`（自己更新）は Linux で未実測。`verify.sh` / `interactive-bootstrap.sh` /
+  `bootstrap-macos.sh` には `stat -f` が残るが、いずれも macOS 専用の経路
+- Slack の DM は pairing（`zerochan-access pair <code>`）、チャンネルは `zerochan set slack-channel <ID>` が
+  macOS と同じく必要
+- Herdr の headless server と watchdog timer は systemd --user に依存する。WSL2 が落ちると全部止まり、
+  `loginctl enable-linger` 済みでも WSL 自体の起動は Windows 側のきっかけが要る
 - cgroup は同一 uid の process なら `cgroup.procs` へ自分を書いて抜けられる（delegated subtree 内）。
   macOS の Seatbelt profile ほど敵対的な脱出には強くない。目的は「うっかり setsid した子」の回収で、
   その範囲では kernel が一覧を返すので十分
