@@ -39,6 +39,7 @@ import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import {
   readSeatbeltFingerprint,
   reapSeatbeltFingerprint,
+  sandboxedCommand,
   type SeatbeltFingerprint,
 } from './seatbelt-fingerprint.ts'
 
@@ -268,10 +269,18 @@ async function main(): Promise<void> {
       resolveDirectExit = resolve
       rejectDirectExit = reject
     })
-    const child = Bun.spawn([
+    const gateCommand = [
       '/bin/sh', '-c', 'kill -STOP $$ || exit 125; exec "$@"',
       'zerokun-codex-gate', codexBin, ...args,
-    ], {
+    ]
+    // macOS leaves the direct Codex process outside the attempt profile (its
+    // sandboxed tool commands carry it through the Codex policy instead) and
+    // that path is unchanged. Linux cannot inject the tag into Codex's own
+    // sandbox, so the whole tree is launched inside the attempt scope/Landlock
+    // domain; the launcher execs in place, so the gate PID stays the child PID.
+    const child = Bun.spawn(fingerprint && process.platform === 'linux'
+      ? sandboxedCommand(fingerprint, stateDir, gateCommand)
+      : gateCommand, {
       cwd: process.cwd(),
       env: process.env,
       stdin: 'inherit',

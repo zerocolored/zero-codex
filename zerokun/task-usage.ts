@@ -4,7 +4,7 @@ import { join } from 'path'
 import { createHash } from 'crypto'
 import { ensureManagedDirectory, requireManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
-import { observeProcessGeneration, type ProcessIdentity } from './process-generation.ts'
+import { observeProcessGeneration, processStartEpochMs, type ProcessIdentity } from './process-generation.ts'
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 const MODEL = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/
@@ -235,7 +235,7 @@ export function ownedClaudeUsageSession(home: string, project: string, process: 
     const d = JSON.parse(raw)
     const start = typeof d.startedAt === 'number' ? d.startedAt : Date.parse(d.startedAt)
     if (d.pid !== process.pid || d.cwd !== project || !UUID.test(d.sessionId ?? '')
-      || !Number.isFinite(start) || start < process.startSec * 1000 - 1000 || start > Date.now()
+      || !Number.isFinite(start) || start < processStartEpochMs(process) - 1000 || start > Date.now()
       || observeProcessGeneration(process).status !== 'alive') return
     return d.sessionId
   } catch { return }

@@ -61,7 +61,8 @@ const PS_ENV = { PATH: '/usr/bin:/bin', TZ: 'UTC', LC_ALL: 'C', LANG: 'C' }
 const LOCK_EX = 2
 const LOCK_NB = 4
 const LOCK_UN = 8
-const libSystem = dlopen('/usr/lib/libSystem.B.dylib', {
+// Frozen v2 reader; only the libc location is platform-aware so Linux can load it.
+const libSystem = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {
   flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 })
 

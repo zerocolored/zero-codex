@@ -71,7 +71,7 @@ function spawnGuardHolder(lock: string, ready: string, holdMs: number) {
       "import { dlopen, FFIType } from 'bun:ffi'",
       "import { closeSync, constants, openSync, writeFileSync } from 'fs'",
       'const [guard, ready, holdMs] = process.argv.slice(-3)',
-      "const library = dlopen('/usr/lib/libSystem.B.dylib', {",
+      "const library = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {",
       '  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },',
       '})',
       'const descriptor = openSync(guard, constants.O_RDWR | constants.O_NOFOLLOW)',
