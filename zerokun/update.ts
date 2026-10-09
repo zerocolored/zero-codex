@@ -2043,6 +2043,26 @@ export function buildCandidatePermissionOverrides(
 export type CandidateFilesystemRule = [path: string, access: 'deny' | 'read' | 'write']
 
 /**
+ * Linux counterpart of Seatbelt's `--allow-unix-socket <candidate tmp>`: with
+ * the network proxy on (the only way the Linux sandbox reaches the network at
+ * all), seccomp refuses to bind Unix sockets, which the candidate's Herdr
+ * runtime tests need under TMPDIR. codex-cli 0.162.0 has no per-prefix bind
+ * allowance (`network.unix_sockets` only governs connect by exact path), so
+ * the sandbox-wide switch is used; the sandbox root is a tmpfs that exposes no
+ * host sockets (/run holds only WSL, /var/run is absent).
+ */
+export function withLinuxCandidateNetworkOverrides(overrides: string[], profile: string): string[] {
+  const anchor = `permissions.${profile}.network.allow_local_binding=true`
+  const index = overrides.indexOf(anchor)
+  if (index < 0) fail('candidate sandboxのnetwork設定が想定と異なります')
+  return [
+    ...overrides.slice(0, index + 1),
+    `permissions.${profile}.network.dangerously_allow_all_unix_sockets=true`,
+    ...overrides.slice(index + 1),
+  ]
+}
+
+/**
  * Linux `codex sandbox` (bubblewrap) differs from Seatbelt in two ways that the
  * macOS rule set trips over (measured on codex-cli 0.162.0 / WSL2):
  * - a deny nested under a denied ancestor aborts bubblewrap outright
@@ -2104,6 +2124,7 @@ async function validateZero(
   const candidateEnvironment = buildCandidateEnvironment(isolatedHome)
   candidateEnvironment.PATH = updaterTrustedToolPath(trustedToolDirectory)
   let permissionOverrides = buildCandidatePermissionOverrides(profile, filesystemToml)
+  if (linuxSandbox) permissionOverrides = withLinuxCandidateNetworkOverrides(permissionOverrides, profile)
   if (!executionPolicy.skipCodexPermissionPreflight) {
     permissionOverrides = await requireEffectiveCodexPermissionPreflight(
       stagedCodexBin,

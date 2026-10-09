@@ -40,6 +40,7 @@ import {
   setupTimeoutBudgetMs,
   stageVerifiedCandidateCodex,
   linuxCandidateFilesystemRules,
+  withLinuxCandidateNetworkOverrides,
   updateSourceBranch,
   updateRestartTokenDigest,
   validateResolvedCandidatePermissionOverrides,
@@ -1247,6 +1248,20 @@ describe('updater helpers', () => {
     for (const invalid of ['', '-x', 'a..b', 'x/', 'a b', 'a\nb', '.hidden']) {
       expect(() => updateSourceBranch({ ZEROKUN_UPDATE_BRANCH: invalid })).toThrow('ZEROKUN_UPDATE_BRANCHが不正です')
     }
+  })
+
+  test('Linux候補sandboxはnetwork proxy下でUnix socket bindを許可し、他の設定順序は変えない', () => {
+    const profile = 'zerokun_update_test'
+    const base = buildCandidatePermissionOverrides(profile, '":minimal"="read"')
+    const linux = withLinuxCandidateNetworkOverrides(base, profile)
+    const anchor = base.indexOf(`permissions.${profile}.network.allow_local_binding=true`)
+    expect(linux.length).toBe(base.length + 1)
+    expect(linux[anchor + 1]).toBe(`permissions.${profile}.network.dangerously_allow_all_unix_sockets=true`)
+    expect([...linux.slice(0, anchor + 1), ...linux.slice(anchor + 2)]).toEqual(base)
+    // preflightの検証（mcp以外は完全一致）がそのまま通る並びであること。
+    expect(validateResolvedCandidatePermissionOverrides(linux, linux)).toEqual(linux)
+    expect(() => withLinuxCandidateNetworkOverrides(['approval_policy="never"'], profile))
+      .toThrow('network設定が想定と異なります')
   })
 
   test('Linux候補sandboxのfilesystem ruleはdeny配下のdenyとbun readを落としwriteは残す', () => {

@@ -69,10 +69,28 @@ bootstrap_path_selects_legacy() {
   return 1
 }
 
+# state resolver は Linux の public-readiness test からも source されるので、この 2 つだけ
+# BSD stat / GNU stat の両対応にする（bootstrap 本体はこれまでどおり macOS 専用）。
+bootstrap_stat_owner() {
+  if [ "$(/usr/bin/uname -s 2>/dev/null)" = "Darwin" ]; then
+    /usr/bin/stat -f '%u' "$1" 2>/dev/null
+  else
+    stat -c '%u' "$1" 2>/dev/null
+  fi
+}
+
+bootstrap_stat_owner_links() {
+  if [ "$(/usr/bin/uname -s 2>/dev/null)" = "Darwin" ]; then
+    /usr/bin/stat -f '%u:%l' "$1" 2>/dev/null
+  else
+    stat -c '%u:%h' "$1" 2>/dev/null
+  fi
+}
+
 bootstrap_owned_regular_file() {
   local file="$1" metadata
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
-  metadata="$(/usr/bin/stat -f '%u:%l' "$file" 2>/dev/null || true)"
+  metadata="$(bootstrap_stat_owner_links "$file" || true)"
   [ "$metadata" = "$(/usr/bin/id -u):1" ]
 }
 
@@ -93,7 +111,7 @@ bootstrap_valid_cutover_marker_only() {
 bootstrap_valid_cutover_state() {
   local state="$1" env_file physical legacy_physical owner
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
-  owner="$(/usr/bin/stat -f '%u' "$state" 2>/dev/null || true)"
+  owner="$(bootstrap_stat_owner "$state" || true)"
   [ "$owner" = "$(/usr/bin/id -u)" ] || return 1
   env_file="$state/.env"
   bootstrap_owned_regular_file "$env_file" && [ -s "$env_file" ] \
