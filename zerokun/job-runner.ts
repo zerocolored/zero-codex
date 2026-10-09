@@ -1,8 +1,8 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 import { TaskModelSelections, TASK_MODEL_SCHEMA, MODEL_SELECTION_MESSAGES } from './task-model-selection.ts'
 import { assertSlackProjectAdmission } from './slack-project-admission.ts'
-import { executeSecurityAudit, copyAuditReportForFollowup } from './security-audit.ts'
-import { createSecurityAuditProgress } from './security-audit-progress.ts'
+import { executeSecurityAudit, copyAuditReportForFollowup, auditHasReadinessOnlyResult } from './security-audit.ts'
+import { createSecurityAuditProgress, deliverAuditMilestone } from './security-audit-progress.ts'
 import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
@@ -6627,10 +6627,10 @@ export class JobStore {
     return JSON.stringify({recentTasks:jobs,recentQueries:queries}).slice(-20000)
   }
 
-  previousSecurityAudit(job:JobRecord):string|null {
+  previousSecurityAudit(job:JobRecord, include: (id: string) => boolean = () => true):string|null {
     return this.db.query<{id:string},[string,string,string,number]>(
-      "SELECT id FROM jobs WHERE workflow='security-audit' AND status='completed' AND chat_id=? AND thread_ts=? AND repo_path=? AND seq<? ORDER BY seq DESC LIMIT 1",
-    ).get(job.chatId,job.threadTs,job.historyRepoPath??job.repoPath,job.seq)?.id??null
+      "SELECT id FROM jobs WHERE workflow='security-audit' AND status='completed' AND chat_id=? AND thread_ts=? AND repo_path=? AND seq<? ORDER BY seq DESC",
+    ).all(job.chatId,job.threadTs,job.historyRepoPath??job.repoPath,job.seq).find(row => include(row.id))?.id??null
   }
 
   stageFleetRoute(inbound: InboundDeliveryRecord, route: 'work' | 'fleet-status' | 'security-audit', projectKey: string | null): void {
@@ -8883,7 +8883,7 @@ export class JobStore {
           idempotencyKey: `security-audit-accepted:${idempotencyKey}`,
           jobId: row.id, chatId, threadTs,
           kind: 'execution-started', createdAt: Date.now(),
-          payload: 'セキュリティ検査として受け付けました。コードを修正せず13工程を順に検査し、検査不能・失敗も含めたレポートをこのスレッドへ添付します。'
+          payload: 'セキュリティ検査として受け付けました。最初に12工程すべての利用可能状態を確認し、不備があれば本検査を開始せずお知らせします。全件確認できた後に、コードを修正せず検査し、レポートをこのスレッドへ添付します。'
             + (waitsBehindPriorJob ? ' 現在の作業が終わり次第、開始します。' : ''),
         })
       } else if (result.changes === 1 && input.notifyAccepted && waitsBehindPriorJob) {
@@ -11548,6 +11548,15 @@ export class JobStore {
       return 'staged'
     })
     return retrySqlite(() => stage.immediate())
+  }
+
+  commentarySourceDelivered(jobId: string, sourceKey: string): boolean {
+    return !!this.db.query<{ delivered: number }, [string, string]>(
+      `SELECT 1 AS delivered FROM commentary_notifications c WHERE c.job_id = ? AND c.source_key = ?
+       AND (c.delivered_at IS NOT NULL OR (c.suppressed_at IS NOT NULL AND EXISTS (
+         SELECT 1 FROM commentary_notifications prior WHERE prior.job_id=c.job_id AND prior.attempt=c.attempt
+         AND prior.seq<c.seq AND prior.payload=c.payload AND prior.delivered_at IS NOT NULL)))`,
+    ).get(jobId, sourceKey)
   }
 
   pendingCommentaryNotifications(
@@ -18500,13 +18509,21 @@ async function runCli(): Promise<void> {
               ...executorPidLifecycle,
               cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
               progress: progress.report,
+              milestone: async (phase, text) => {
+                mirrorMonitorMessage(text)
+                await deliverAuditMilestone(job, phase, text, executionContext,
+                  key => store.commentarySourceDelivered(job.id, key), {
+                    signal: executionController.signal,
+                    cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
+                  })
+              },
             }) } finally { progress.close() }
             const auditResult = finalizeSuccessfulExecution(job, raw, dir, log)
             store.ensureExecutionResultStaged(job.id, auditResult.sessionId, auditResult.result)
             return auditResult
           }
           const executionJob = cloudRuntime?.executionJob(job) ?? job
-          const previousAudit = store.previousSecurityAudit(executionJob)
+          const previousAudit = store.previousSecurityAudit(executionJob, id => !auditHasReadinessOnlyResult(dir, id))
           if (previousAudit) {
             try {
               executionJob.auditReportPath = copyAuditReportForFollowup(executionJob, dir, previousAudit)

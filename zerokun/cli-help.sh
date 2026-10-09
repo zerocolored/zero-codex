@@ -38,7 +38,8 @@ zerochan_help() {
         '  zerochan security auth-probe <PATH> <LOGGED_IN_PATTERN>  ログイン確認条件を設定' \
         '  zerochan security socket-org <ORG>           Socketの組織を設定' \
         '  zerochan security socket-token               Socketトークンを非表示の対話入力で登録' \
-        '  zerochan security codeql-license confirmed|off  CodeQL利用ライセンスの確認状態' \
+        '  zerochan security semgrep-repo <OWNER/REPO>   Semgrepの対象リポジトリ名を設定' \
+        '  zerochan security semgrep-token              Semgrepトークンを非表示の対話入力で登録' \
         '  zerochan security image <IMAGE>              検査対象コンテナイメージを追加' \
         '' \
         'チャンネルは参加者全員が利用・書き込み可能です。個別登録は不要です。' \
@@ -139,7 +140,7 @@ zerochan_help() {
     security)
       printf '%s\n' '使い方: zerochan security <command>' \
         '対象プロジェクトの検査設定を保存します。このコマンド自体は検査を実行しません。' \
-        '  status                          設定とSocket認証情報の登録有無を表示' \
+        '  status                          設定とSemgrep・Socket認証情報の登録有無を表示' \
         '  target <URL>                    対象URLを設定し、activeをoffへ戻す' \
         '  active on|off                   能動的な検査の有効・無効（先にtargetが必要）' \
         '  auth required|none              対象の認証要否を設定' \
@@ -147,7 +148,8 @@ zerochan_help() {
         '  auth-probe <PATH> <LOGGED_IN_PATTERN>  ログイン確認用pathと判定patternを設定' \
         '  socket-org <ORG>                Socketの組織を設定' \
         '  socket-token                    トークンを非表示の対話入力で登録。引数へ渡さない' \
-        '  codeql-license confirmed|off    CodeQL利用ライセンスの確認状態を設定' \
+        '  semgrep-repo <OWNER/REPO>        Semgrepの対象リポジトリ名を設定' \
+        '  semgrep-token                   Semgrepトークンを非表示の対話入力で登録。引数へ渡さない' \
         '  image <IMAGE>                   対象コンテナイメージを追加（既存一覧は保持）' \
         '空白を含むPATHやLOGGED_IN_PATTERNは引用符で囲んでください。'
       ;;

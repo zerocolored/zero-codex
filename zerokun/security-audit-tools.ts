@@ -1,4 +1,4 @@
-import { createHash } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import {
   existsSync,
   mkdtempSync,
@@ -17,6 +17,7 @@ import { fileURLToPath } from 'url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
+import { resolveDockerRuntime } from './docker-runtime.ts'
 import { ensureManagedDirectory } from './managed-path.ts'
 import {
   CodexCleanupPendingError,
@@ -29,10 +30,14 @@ import {
 } from './safe-file.ts'
 import {
   auditClean,
+  auditCodeReview,
+  renderAuditReport,
+  type AuditJournal,
   type AuditSettings,
   type AuditStep,
   type AuditFinding,
 } from './security-audit.ts'
+import { runIsolatedCodexJson } from './slack-thread-intent.ts'
 
 export type AuditToolContext = {
   root: string
@@ -46,6 +51,10 @@ export type AuditToolContext = {
   progress?: (s: string) => void
   onProcessId?: (pid: number) => void
   onProcessExit?: (code: number) => void
+  dockerHost?: string
+  /** Host-created fixture only, never read from project configuration. */
+  semgrepProbe?: boolean
+  socketReceiptPath?: string
 }
 export type CommandResult = {
   exitCode: number
@@ -101,6 +110,12 @@ export async function auditCommand(
   } = {},
 ): Promise<CommandResult> {
   checkAuditInterrupted(c)
+  let dockerEnvironment: Record<string, string> = {}
+  if (basename(args[0]!) === 'docker') {
+    const host = c.dockerHost ?? resolveDockerRuntime()?.host
+    if (!host) throw Error('Selected local Docker engine is unavailable')
+    dockerEnvironment = { DOCKER_HOST: host }
+  }
   const runtime = realpathSync(mkdtempSync('/tmp/za-'))
   chmodSync(runtime, 0o700)
   let argv = args
@@ -116,6 +131,9 @@ export async function auditCommand(
         ? realpathSync(executable)
         : executable
       const ancestors = new Set<string>()
+      // Java's NOFOLLOW_LINKS realpath calls readlink on parent directories.
+      // macOS requires read-data for that operation even for a non-symlink.
+      // Exact directory literals permit traversal/listing, never child contents.
       for (const allowed of [
         c.source,
         c.root,
@@ -135,7 +153,7 @@ export async function auditCommand(
         (allow file-write* (subpath ${quote(runtime)}) (subpath ${quote(c.root)}) (literal "/dev/null"))
         (deny file-read* (subpath ${quote(homedir())}) (subpath ${quote(c.stateDir)}) (subpath ${quote(c.repo)}))
         (allow file-read* (subpath ${quote(c.source)}) (subpath ${quote(c.root)}) (subpath ${quote(toolsRoot(c))}) (subpath ${quote(dirname(physical))}))
-        (allow file-read-metadata ${[...ancestors].map((p) => `(literal ${quote(p)})`).join(' ')})
+        (allow file-read-metadata file-read-data ${[...ancestors].map((p) => `(literal ${quote(p)})`).join(' ')})
         ${options.offline ? `(deny network-outbound) ${options.localPort ? `(allow network-outbound (remote tcp "localhost:${options.localPort}"))` : ''}` : ''}`,
         { mode: 0o600 },
       )
@@ -194,7 +212,10 @@ export async function auditCommand(
       env: environment(c, {
         TMPDIR: runtime,
         MAC_CHROMIUM_TMPDIR: runtime,
-        JAVA_TOOL_OPTIONS: `-Djava.io.tmpdir=${runtime}`,
+        // JVM user.home is derived from the OS account, not HOME. Keep CodeQL's
+        // pack/cache lookup inside the same scratch home as every other tool.
+        JAVA_TOOL_OPTIONS: `-Djava.io.tmpdir=${runtime} -Duser.home=${JSON.stringify(join(c.root, 'home'))}`,
+        ...dockerEnvironment,
         ...options.env,
       }),
       stdin: options.input === undefined ? 'ignore' : 'pipe',
@@ -289,9 +310,23 @@ async function checked(
   const r = await auditCommand(args, cwd, c, options)
   if (r.exitCode !== 0 || r.truncated)
     throw Error(
-      `${basename(args[0]!)} failed (${r.exitCode}${r.truncated ? ', output limit' : ''})`,
+      `${basename(args[0]!)} failed (${r.exitCode}${r.truncated ? ', output limit' : ''}): ${auditClean(r.stderr).slice(0, 1200)}`,
     )
   return r
+}
+async function pnpmBinary(c: AuditToolContext): Promise<string> {
+  const manifest = join(c.source, 'package.json')
+  const declared = existsSync(manifest) ? JSON.parse(readFileSync(manifest, 'utf8')).packageManager : undefined
+  const version = typeof declared === 'string'
+    ? /^pnpm@(\d+\.\d+\.\d+)(?:\+sha\d+\.[a-f0-9]+)?$/.exec(declared)?.[1]
+    : undefined
+  if (declared && String(declared).startsWith('pnpm@') && !version)
+    throw Error('pnpm packageManager must specify a release version')
+  const install = join(toolsRoot(c), `pnpm-${version ?? '10'}`)
+  const exe = join(install, 'node_modules', 'pnpm', 'bin', 'pnpm.cjs')
+  if (!existsSync(exe))
+    await checked(['npm', 'install', '--prefix', install, '--ignore-scripts', '--no-audit', '--no-fund', `pnpm@${version ?? '10'}`], c.root, c)
+  return exe
 }
 async function releaseAsset(
   repo: string,
@@ -379,13 +414,13 @@ async function releaseAsset(
   }
 }
 async function binary(
-  name: 'semgrep' | 'codeql' | 'trivy' | 'gitleaks',
+  name: 'semgrep' | 'trivy' | 'gitleaks',
   c: AuditToolContext,
 ): Promise<string> {
   const root = toolsRoot(c)
   mkdirSync(root, { recursive: true, mode: 0o700 })
-  const installed = Bun.which(name)
-  if (installed && name !== 'trivy' && name !== 'codeql') return installed
+  const installed = Bun.which(name, { PATH: process.env.PATH })
+  if (installed && name !== 'trivy' && name !== 'semgrep') return installed
   if (name === 'semgrep') {
     const python = join(root, 'semgrep', 'bin', 'python'),
       exe = join(root, 'semgrep', 'bin', 'semgrep')
@@ -404,26 +439,6 @@ async function binary(
         c,
       )
     }
-    return exe
-  }
-  if (name === 'codeql') {
-    const exe = join(root, 'codeql', 'codeql')
-    if (existsSync(exe)) return exe
-    const os =
-      process.platform === 'darwin'
-        ? 'osx64'
-        : process.platform === 'linux' && process.arch === 'x64'
-          ? 'linux64'
-          : null
-    if (!os)
-      throw Error('CodeQL has no configured native bundle for this platform')
-    const archive = await releaseAsset(
-      'github/codeql-cli-binaries',
-      'latest',
-      new RegExp(`^codeql-${os}\\.zip$`),
-      c,
-    )
-    await checked(['unzip', '-q', '-o', archive, '-d', root], root, c)
     return exe
   }
   const os =
@@ -536,7 +551,11 @@ export function zapScopeFiles(
       "def zap_started(zap, target):\n    zap.script.load('audit-auth', 'httpsender', 'ECMAScript : Graal.js', '/zap/wrk/auth.js')\n    zap.script.enable('audit-auth')\n" +
       (probe
         ? `    try:\n        zap.core.access_url(${JSON.stringify(probe.url)}, followredirects=False)\n    except Exception:\n        pass\n`
-        : ''),
+        : '') +
+      // Packaged baseline scans rewrite /app to the origin root before calling
+      // the spider. Keep the authorized path instead of widening the context.
+      `\ndef zap_spider(zap, target):\n    return zap, ${JSON.stringify(target)}\n` +
+      `\ndef zap_active_scan(zap, target, policy):\n    return zap, ${JSON.stringify(target)}, policy\n`,
     script: `function sendingRequest(msg,initiator,helper){
       var uri=msg.getRequestHeader().getURI(),port=uri.getPort();if(port<0)port=String(uri.getScheme())==='https'?443:80;
       var raw=String(uri.getEscapedPath());
@@ -560,6 +579,16 @@ export function zapScopeFiles(
   }
 }
 export async function cleanupAuditZap(c: AuditToolContext): Promise<void> {
+  try {
+    await cleanupAuditZapContainer(c)
+  } catch (error) {
+    if (error instanceof CodexCleanupPendingError) throw error
+    // Connection/context resolution can fail before docker is spawned. This is
+    // still unverified cleanup, never a settled scanner failure.
+    throw new CodexCleanupPendingError('ZAP container cleanup could not be verified')
+  }
+}
+async function cleanupAuditZapContainer(c: AuditToolContext): Promise<void> {
   const clean = { ...c, signal: undefined, cancelled: undefined }
   const inspected = await auditCommand(
     [
@@ -594,6 +623,14 @@ export async function cleanupAuditZap(c: AuditToolContext): Promise<void> {
     !/No such (?:container|object)/i.test(removed.stderr)
   )
     throw new CodexCleanupPendingError('ZAP container cleanup pending')
+}
+export function redactAuditCookies(text: string, cookies: Array<{ value: string }>): string {
+  const values = [...new Set(cookies.map(cookie => cookie.value).filter(Boolean))]
+    .sort((a, b) => b.length - a.length)
+  if (!values.length) return text
+  // One pass avoids empty-string expansion and re-redacting replacement text.
+  const pattern = values.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+  return text.replace(new RegExp(pattern, 'g'), '[認証情報を除去]')
 }
 async function verifyAuthentication(
   c: AuditToolContext,
@@ -662,6 +699,9 @@ export function scannerFindings(tool: string, data: any): AuditFinding[] {
           ? Array.isArray(data)
           : tool === 'codeql'
             ? Array.isArray(data?.runs)
+            : tool === 'pnpm'
+              ? data?.advisories && typeof data.advisories === 'object' && !Array.isArray(data.advisories) &&
+                data?.metadata?.vulnerabilities && typeof data.metadata.vulnerabilities === 'object'
             : tool === 'npm'
               ? data?.vulnerabilities &&
                 typeof data.vulnerabilities === 'object'
@@ -813,6 +853,18 @@ export function scannerFindings(tool: string, data: any): AuditFinding[] {
           r.severity,
         ),
       )
+  if (tool === 'pnpm')
+    if (data.error || !['info', 'low', 'moderate', 'high', 'critical'].every(key =>
+      Number.isInteger(data.metadata.vulnerabilities[key]) && data.metadata.vulnerabilities[key] >= 0))
+      throw Error('pnpm result schema invalid')
+  if (tool === 'pnpm')
+    for (const r of Object.values(data.advisories) as any[]) {
+      if (!r || typeof r.module_name !== 'string' || typeof r.title !== 'string' || !Array.isArray(r.findings))
+        throw Error('pnpm advisory schema invalid')
+      out.push(finding(r.title, r.module_name,
+        `Affected: ${r.vulnerable_versions ?? 'unknown'}; paths: ${r.findings.flatMap((f: any) => f.paths ?? []).join(', ')}`,
+        `Patched: ${r.patched_versions ?? 'not available'}; ${r.url ?? ''}`, r.severity))
+    }
   if (tool === 'zap')
     for (const site of data.site ?? [])
       for (const r of site.alerts ?? [])
@@ -1011,30 +1063,29 @@ try{const context=await browser.newContext({serviceWorkers:'block',acceptDownloa
     note: `ホスト管理のChromeで認証確認ページをGET確認: ${ok ? '成功' : '失敗'}。任意の既存テストへ実cookieを渡していません。全ページの操作網羅性は未検証。`,
   }
 }
-async function playwright(
-  number: number,
-  c: AuditToolContext,
-): Promise<{
-  result: CommandResult
-  version: string
-  note: string
-  findings: AuditFinding[]
-  incomplete: boolean
-}> {
-  const configs = readdirSync(c.source)
-    .sort()
-    .filter((n) => /^playwright\.config\.(?:ts|js|mts|mjs|cts|cjs)$/.test(n))
-  if (!configs.length)
-    throw Error(
-      'Playwright設定がありません。テスト不足は工程1のコードレビューに記載します。',
-    )
-  const work = join(c.root, `e2e-${number}`)
-  if (existsSync(work))
-    throw Error('既存のE2E実行領域があります。副作用を確認せず再実行しません。')
-  cpSync(c.source, work, { recursive: true, force: false, errorOnExist: true })
-  const npm = Bun.which('npm')
-  if (!npm) throw Error('npm unavailable for isolated E2E dependencies')
-  await checked(
+export function auditPlaywrightConfigs(source: string): string[] {
+  const found: string[] = []
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isSymbolicLink() || /^(?:node_modules|\.git|\.worktrees)$/.test(entry.name)) continue
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) walk(path)
+      else if (/^playwright\.config\.(?:ts|js|mts|mjs|cts|cjs)$/.test(entry.name)) found.push(relative(source, path))
+    }
+  }
+  walk(source)
+  const roots = found.filter(path => dirname(path) === '.')
+  return (roots.length ? roots : found).sort()
+}
+
+async function preparePlaywrightDependencies(work: string, configPath: string, c: AuditToolContext): Promise<string> {
+  if (existsSync(join(work, 'pnpm-lock.yaml'))) {
+    const exe = await pnpmBinary(c)
+    await checked(['node', exe, 'install', '--frozen-lockfile', '--ignore-scripts', '--config.ignore-pnpmfile=true', '--config.manage-package-manager-versions=false'], work, c, { sandbox: true })
+  } else {
+    const npm = Bun.which('npm', { PATH: process.env.PATH })
+    if (!npm) throw Error('npm unavailable for isolated E2E dependencies')
+    await checked(
     [
       npm,
       existsSync(join(work, 'package-lock.json')) ? 'ci' : 'install',
@@ -1045,17 +1096,43 @@ async function playwright(
     work,
     c,
     { sandbox: true },
-  )
-  const cli = join(work, 'node_modules', '@playwright', 'test', 'cli.js')
-  if (!existsSync(cli))
+    )
+  }
+  const configDir = join(work, dirname(configPath))
+  const cli = [join(configDir, 'node_modules', '@playwright', 'test', 'cli.js'), join(work, 'node_modules', '@playwright', 'test', 'cli.js')].find(path => existsSync(path))
+  if (!cli)
     throw Error('existing application does not provide @playwright/test')
-  const version = (
-    await checked(['node', cli, '--version'], work, c, { sandbox: true })
-  ).stdout.trim()
-  const config = join(work, 'zero-audit.playwright.config.ts')
+  return cli
+}
+
+async function playwright(
+  number: number,
+  c: AuditToolContext,
+): Promise<{
+  result: CommandResult
+  version: string
+  note: string
+  findings: AuditFinding[]
+  incomplete: boolean
+}> {
+  const configs = auditPlaywrightConfigs(c.source)
+  if (!configs.length)
+    throw Error(
+      'Playwright設定がありません。テスト不足は工程1のコードレビューに記載します。',
+    )
+  if (configs.length !== 1)
+    throw Error(`複数のPlaywright設定があります。検査対象をまとめるroot設定が必要です: ${configs.join(', ')}`)
+  const work = join(c.root, `e2e-${number}`)
+  if (existsSync(work))
+    throw Error('既存のE2E実行領域があります。副作用を確認せず再実行しません。')
+  cpSync(c.source, work, { recursive: true, force: false, errorOnExist: true })
+  const cli = await preparePlaywrightDependencies(work, configs[0]!, c)
+  const configDir = join(work, dirname(configs[0]!))
+  const version = (await checked(['node', cli, '--version'], work, c, { sandbox: true })).stdout.trim()
+  const config = join(configDir, 'zero-audit.playwright.config.ts')
   writeFileSync(
     config,
-    `import original from './${configs[0]}';
+    `import original from ${JSON.stringify('./' + basename(configs[0]!))};
 export default {...original,reporter:[['json']],outputDir:'zero-audit-results',
  use:{...original.use,browserName:'chromium',channel:'chrome',storageState:{cookies:[],origins:[]},trace:'off',video:'off',screenshot:'off'},
  projects:original.projects?.map(p=>({...p,use:{...original.use,...p.use,browserName:'chromium',channel:'chrome',storageState:{cookies:[],origins:[]},trace:'off',video:'off',screenshot:'off'}}))};`,
@@ -1096,6 +1173,10 @@ export default {...original,reporter:[['json']],outputDir:'zero-audit-results',
     visit(parsed)
     if (!parsed.stats || !Array.isArray(parsed.suites))
       throw Error('Playwright result schema invalid')
+    if (!(Number(parsed.stats.expected) + Number(parsed.stats.unexpected) + Number(parsed.stats.flaky) > 0)) {
+      incomplete = true
+      note += '\n実行されたテストがありません。検査済みとして扱いません。'
+    }
     if (Number(parsed.stats?.skipped) > 0) {
       incomplete = true
       note += '\nスキップされたケースは検査済みとして扱いません。'
@@ -1123,13 +1204,13 @@ async function dependencyAudit(
           'npm-shrinkwrap.json',
           'bun.lock',
           'bun.lockb',
+          'pnpm-lock.yaml',
           'requirements.txt',
         ].includes(e.name)
       )
         manifests.push(p)
       else if (
         [
-          'pnpm-lock.yaml',
           'yarn.lock',
           'poetry.lock',
           'Cargo.lock',
@@ -1144,6 +1225,7 @@ async function dependencyAudit(
   walk(c.source)
   manifests.sort()
   let incomplete = unsupported.length > 0
+  let evidenceCount = 0
   const digest = createHash('sha256'),
     notes: string[] = []
   step.tool = 'dependency audit'
@@ -1172,6 +1254,11 @@ async function dependencyAudit(
         notes.push(
           `${relative(c.source, manifest)}: listed requirementsのみ。任意のbuild hookを実行しないため、未列挙の推移的依存は未検証。`,
         )
+      } else if (name === 'pnpm-lock.yaml') {
+        tool = 'pnpm'
+        const exe = await pnpmBinary({ ...c, source: dir })
+        argv = ['node', exe, 'audit', '--json', '--config.ignore-scripts=true', '--config.ignore-pnpmfile=true', '--config.manage-package-manager-versions=false']
+        version = (await checked(['node', exe, '--version'], c.root, c)).stdout.trim()
       } else if (name.startsWith('bun.lock')) {
         tool = 'bun audit'
         argv = [process.execPath, 'audit', '--json']
@@ -1182,9 +1269,9 @@ async function dependencyAudit(
         version = (await checked(['npm', '--version'], c.root, c)).stdout.trim()
       }
       const r = await auditCommand(argv, dir, c, { sandbox: true })
-      digest.update(r.stdout)
-      if (r.truncated || ![0, 1].includes(r.exitCode))
-        throw Error(`${tool} failed (${r.exitCode})`)
+      if (r.stdout) { digest.update(r.stdout); evidenceCount++ }
+      if (r.truncated || ![0, 1].includes(r.exitCode) || !r.stdout.trim())
+        throw Error(`${tool} failed (${r.exitCode}): ${auditClean(r.stderr).slice(0, 1200)}`)
       const data = JSON.parse(r.stdout)
       if (tool === 'pip-audit') {
         if (!Array.isArray(data.dependencies))
@@ -1229,10 +1316,46 @@ async function dependencyAudit(
           ? 'findings'
           : 'completed',
     note: notes.join('\n'),
-    evidenceDigest: digest.digest('hex'),
+    evidenceDigest: evidenceCount ? digest.digest('hex') : null,
     finishedAt: Date.now(),
   }
 }
+export function assertSemgrepCodeResult(data: any): void {
+  if (data?.engine_requested !== 'PRO' || !Array.isArray(data?.paths?.scanned)
+    || data.paths.scanned.length === 0 || !Array.isArray(data?.results)
+    || !Array.isArray(data?.interfile_languages_used) || !data.interfile_languages_used.length)
+    throw Error('Semgrep Code Pro/cross-file execution evidence is missing; CE fallback is not accepted')
+}
+
+async function semgrepRepository(c: AuditToolContext): Promise<string> {
+  if (c.settings.semgrepRepo) return c.settings.semgrepRepo
+  const r = await auditCommand(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    'config', '--get', 'remote.origin.url'], c.repo, c, { timeoutMs: 30000 })
+  const match = r.stdout.trim().match(/^(?:https:\/\/[^/@]+\/|git@[^:]+:)([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+?)(?:\.git)?$/)
+  if (r.exitCode || !match) throw Error('Semgrep project identity unavailable; configure semgrep-repo OWNER/REPO')
+  return match[1]!
+}
+
+async function semgrepCodeScan(c: AuditToolContext): Promise<{ result: CommandResult; version: string }> {
+  const token = readOptionalBoundedOwnerOnlyRegularFile(join(c.stateDir, 'security-audit-semgrep-token'), 4096)?.trim()
+  if (!token) throw Error('Semgrep Code credential unavailable; configure semgrep-token')
+  const exe = await binary('semgrep', c)
+  const env = { SEMGREP_APP_TOKEN: token, SEMGREP_REPO_NAME: await semgrepRepository(c) }
+  const version = (await checked([exe, '--version'], c.root, c)).stdout.trim()
+  // Use the managed engine belonging to this CLI version. Installation also validates entitlement.
+  const install = await auditCommand([exe, 'install-semgrep-pro'], c.root, c, { env })
+  if (install.exitCode || install.truncated) throw Error(`Semgrep Code Pro installation/authentication failed (exit=${install.exitCode})`)
+  // Standalone policy scans fetch the account's Code rules without uploading findings/source snippets.
+  const result = await auditCommand([exe, 'scan', '--config', 'policy', '--pro',
+    ...(c.semgrepProbe ? ['--config', join(c.source, 'probe-rules.yml')] : []),
+    '--metrics', 'off', '--disable-version-check', '--json', c.source], c.source, c,
+    { sandbox: true, env })
+  result.stdout = result.stdout.replaceAll(token, '[認証情報を除去]')
+  // Diagnostics can echo credentials; publish only the exit status for this authenticated CLI.
+  result.stderr = result.exitCode ? `Semgrep Code scan failed (exit=${result.exitCode})` : ''
+  return { result, version }
+}
+
 export async function runAuditTool(
   number: number,
   c: AuditToolContext,
@@ -1251,6 +1374,14 @@ export async function runAuditTool(
     evidenceDigest: null,
   }
   let result: CommandResult | undefined
+  const evidence = createHash('sha256')
+  let evidenceRecorded = false
+  const readEvidence = (path: string): string => {
+    const raw = readFileSync(path, 'utf8')
+    evidence.update(`${basename(path)}\0${Buffer.byteLength(raw)}\0`).update(raw)
+    evidenceRecorded = true
+    return raw
+  }
   const stageRoot = join(c.root, `stage-${number}`)
   mkdirSync(stageRoot, { recursive: true, mode: 0o700 })
   const stageSource = join(stageRoot, 'source')
@@ -1263,7 +1394,7 @@ export async function runAuditTool(
   c = { ...c, root: stageRoot, source: stageSource }
   const output = join(c.root, `tool-${number}.json`)
   try {
-    if (number === 1 || number === 12) {
+    if (number === 1 || number === 11) {
       step.tool = 'Playwright channel=chrome'
       let auth: { ok: boolean; note: string; findings: AuditFinding[] }
       try {
@@ -1293,120 +1424,12 @@ export async function runAuditTool(
     if (number === 5) return await dependencyAudit(c, step)
     if (number === 6) {
       step.tool = 'semgrep'
-      const exe = await binary('semgrep', c)
-      step.version = (
-        await checked([exe, '--version'], c.root, c)
-      ).stdout.trim()
-      step.scope =
-        'p/default + p/security-audit + p/secrets; Community Edition rules'
-      result = await auditCommand(
-        [
-          exe,
-          'scan',
-          '--config',
-          'p/default',
-          '--config',
-          'p/security-audit',
-          '--config',
-          'p/secrets',
-          '--metrics',
-          'off',
-          '--json',
-          c.source,
-        ],
-        c.source,
-        c,
-        { sandbox: true },
-      )
+      const scan = await semgrepCodeScan(c)
+      result = scan.result
+      step.version = scan.version
+      step.scope = 'Semgrep Code / Pro cross-file engine / configured Code policy; local scan'
     }
     if (number === 7) {
-      step.tool = 'codeql'
-      if (!c.settings.codeqlLicensed)
-        throw Error(
-          'CodeQL利用条件の確認が未設定です（codeqlLicensed）。未実施として記録します。',
-        )
-      const exe = await binary('codeql', c)
-      step.version = String(
-        JSON.parse(
-          (await checked([exe, 'version', '--format=json'], c.root, c)).stdout,
-        ).version,
-      )
-      const all: string[] = []
-      const walk = (p: string) => {
-        for (const e of readdirSync(p, { withFileTypes: true })) {
-          if (e.isDirectory()) walk(join(p, e.name))
-          else all.push(e.name)
-        }
-      }
-      walk(c.source)
-      const supported = [
-        ['javascript-typescript', /\.[cm]?[jt]sx?$/],
-        ['python', /\.py$/],
-        ['go', /\.go$/],
-        ['java-kotlin', /\.(?:java|kt)$/],
-        ['csharp', /\.cs$/],
-        ['cpp', /\.(?:c|cc|cpp|h|hpp)$/],
-        ['ruby', /\.rb$/],
-        ['swift', /\.swift$/],
-      ] as const
-      const langs = supported
-        .filter(([, pattern]) => all.some((n) => pattern.test(n)))
-        .map(([name]) => name)
-      if (!langs.length) throw Error('CodeQL対応言語がありません')
-      step.scope =
-        langs
-          .map(
-            (lang) =>
-              `${lang} (build-mode=${['go', 'swift'].includes(lang) ? 'autobuild' : 'none'})`,
-          )
-          .join(', ') + '; security-and-quality query suites'
-      for (const lang of langs) {
-        const db = join(c.root, `codeql-${lang}`),
-          sarif = join(c.root, `codeql-${lang}.sarif`),
-          pack =
-            lang === 'javascript-typescript'
-              ? 'javascript'
-              : lang === 'java-kotlin'
-                ? 'java'
-                : lang
-        await checked(
-          [
-            exe,
-            'database',
-            'create',
-            db,
-            '--language',
-            lang,
-            '--source-root',
-            c.source,
-            '--build-mode',
-            ['go', 'swift'].includes(lang) ? 'autobuild' : 'none',
-          ],
-          c.root,
-          c,
-          { sandbox: true },
-        )
-        result = await checked(
-          [
-            exe,
-            'database',
-            'analyze',
-            db,
-            `codeql/${pack}-queries:codeql-suites/${pack}-security-and-quality.qls`,
-            '--download',
-            '--format=sarif-latest',
-            `--output=${sarif}`,
-          ],
-          c.root,
-          c,
-          { sandbox: true },
-        )
-        step.findings.push(
-          ...scannerFindings('codeql', JSON.parse(readFileSync(sarif, 'utf8'))),
-        )
-      }
-    }
-    if (number === 8) {
       step.tool = 'trivy'
       const exe = await binary('trivy', c)
       step.version = (
@@ -1441,6 +1464,8 @@ export async function runAuditTool(
             [
               exe,
               'image',
+              '--image-src',
+              'remote',
               '--scanners',
               'vuln,secret,license',
               '--format',
@@ -1466,7 +1491,7 @@ export async function runAuditTool(
         }
       }
     }
-    if (number === 9) {
+    if (number === 8) {
       step.tool = 'gitleaks'
       const exe = await binary('gitleaks', c)
       step.version = (await checked([exe, 'version'], c.root, c)).stdout.trim()
@@ -1484,11 +1509,11 @@ export async function runAuditTool(
         c,
         { sandbox: true },
       )
-      if (existsSync(output))
-        step.findings.push(
+      if (!existsSync(output)) throw Error('Gitleaks directory report unavailable')
+      step.findings.push(
           ...scannerFindings(
             'gitleaks',
-            JSON.parse(readFileSync(output, 'utf8')),
+            JSON.parse(readEvidence(output)),
           ),
         )
       const history = join(c.root, 'history.git'),
@@ -1523,20 +1548,21 @@ export async function runAuditTool(
           c,
           { sandbox: true },
         )
-        if (existsSync(path))
-          step.findings.push(
+        if (!existsSync(path)) throw Error('Gitleaks history report unavailable')
+        step.findings.push(
             ...scannerFindings(
               'gitleaks',
-              JSON.parse(readFileSync(path, 'utf8')),
+              JSON.parse(readEvidence(path)),
             ),
           )
-        if (r.exitCode > 1) throw Error('Gitleaks history scan failed')
+        step.note += `\nGit history scan: exit=${r.exitCode}`
+        if (r.truncated || ![0, 1].includes(r.exitCode)) throw Error('Gitleaks history scan failed')
       } else {
         step.note = 'Git履歴を取得できませんでした。ディレクトリ検査のみ。'
         step.status = 'unavailable'
       }
     }
-    if (number === 10) {
+    if (number === 9) {
       step.tool = 'socket'
       const token = readOptionalBoundedOwnerOnlyRegularFile(
         join(c.stateDir, 'security-audit-socket-token'),
@@ -1565,6 +1591,17 @@ export async function runAuditTool(
       step.version = (
         await checked([exe, '--version'], c.root, c)
       ).stdout.trim()
+      const receiptPath = c.socketReceiptPath ?? join(c.root, 'socket-scan.json')
+      const receiptText = readOptionalBoundedOwnerOnlyRegularFile(receiptPath, 4096)
+      const receipt = receiptText ? JSON.parse(receiptText) : null
+      let scanId: string | undefined
+      if (receipt) {
+        if (receipt.org !== c.settings.socketOrg || typeof receipt.scanId !== 'string'
+          || !/^[a-zA-Z0-9-]{1,100}$/.test(receipt.scanId))
+          throw Error('Socket scan creation was interrupted or scope changed; a new audit request is required (not replayed)')
+        scanId = receipt.scanId
+      } else {
+        atomicWritePrivateFile(receiptPath, JSON.stringify({ org: c.settings.socketOrg, scanId: null }))
       result = await auditCommand(
         [
           exe,
@@ -1573,7 +1610,7 @@ export async function runAuditTool(
           '--org',
           c.settings.socketOrg,
           '--repo',
-          `audit-${createHash('sha256').update(c.repo).digest('hex').slice(0, 16)}`,
+          `audit-${c.socketReceiptPath ? 'preflight-' : ''}${createHash('sha256').update(c.repo).digest('hex').slice(0, 16)}`,
           '--no-set-as-alerts-page',
           '--no-interactive',
           '--json',
@@ -1585,17 +1622,20 @@ export async function runAuditTool(
       )
       if (result.exitCode !== 0 || result.truncated)
         throw Error('Socket scan creation failed')
-      const created = JSON.parse(result.stdout),
-        scanId = created.ok === true ? created.data?.id : undefined
+      const created = JSON.parse(result.stdout.replaceAll(token, '[認証情報を除去]'))
+      scanId = created.ok === true ? created.data?.id : undefined
       if (typeof scanId !== 'string' || !/^[a-zA-Z0-9-]{1,100}$/.test(scanId))
         throw Error('Socket scan ID unavailable')
+
+        atomicWritePrivateFile(receiptPath, JSON.stringify({ org: c.settings.socketOrg, scanId }))
+      }
       step.note = `Socket scan: ${scanId}`
       result = await auditCommand(
         [
           exe,
           'scan',
           'report',
-          scanId,
+          scanId!,
           '--org',
           c.settings.socketOrg,
           '--fold',
@@ -1615,10 +1655,13 @@ export async function runAuditTool(
       step.note +=
         '\nSocketの構造化結果を取得。作成したscanの識別子と評価は結果欄を参照。'
     }
-    if (number === 11) {
+    if (number === 10) {
       step.tool = 'zap'
       if (!c.settings.targetUrl) throw Error('本番/検査対象URLが未指定です')
       const target = new URL(c.settings.targetUrl)
+      const docker = resolveDockerRuntime()
+      if (!docker) throw Error('Selected local Docker engine is unavailable')
+      c = { ...c, dockerHost: docker.host }
       step.scope = `${target.origin}${target.pathname}; ${c.settings.activeScan ? 'active' : 'passive baseline'}`
       if (!Bun.which('docker'))
         throw Error(
@@ -1732,6 +1775,9 @@ export async function runAuditTool(
         result = await auditCommand(args, c.root, c, {
           env: cookie ? { ZERO_AUDIT_COOKIE: cookie } : {},
         })
+        step.exitCode = result.exitCode
+        result.stdout = redactAuditCookies(result.stdout, cookies)
+        result.stderr = redactAuditCookies(result.stderr, cookies)
         if (c.settings.authentication !== 'none') {
           authenticated = existsSync(join(zapDir, 'auth-confirmed'))
           step.note += authenticated
@@ -1739,48 +1785,48 @@ export async function runAuditTool(
             : '\nZAP経由の認証probeを確認できませんでした。公開検査の結果だけを保持します。'
         }
         const report = join(zapDir, 'report.json')
-        if (!existsSync(report)) throw Error('ZAP report unavailable')
+        if (!existsSync(report)) throw Error(`ZAP report unavailable (exit=${result.exitCode}): ${auditClean(result.stderr + '\n' + result.stdout).slice(-2400)}`)
         step.findings = scannerFindings(
           'zap',
-          JSON.parse(readFileSync(report, 'utf8')),
+          JSON.parse(readEvidence(report)),
         )
       } finally {
         await cleanupAuditZap(c)
         rmSync(zapDir, { recursive: true, force: true })
       }
-      for (const v of cookies) {
-        result.stdout = result.stdout.replaceAll(v.value, '[認証情報を除去]')
-        result.stderr = result.stderr.replaceAll(v.value, '[認証情報を除去]')
-      }
       if (!authenticated) step.status = 'unavailable'
     }
     if (!result) throw Error('unsupported audit step')
     step.exitCode = result.exitCode
-    step.evidenceDigest = createHash('sha256')
-      .update(result.stdout)
-      .digest('hex')
+    step.evidenceDigest = evidenceRecorded ? evidence.digest('hex')
+      : result.stdout ? createHash('sha256').update(result.stdout).digest('hex') : null
     if (number === 6) {
       try {
         const data = JSON.parse(result.stdout)
+        assertSemgrepCodeResult(data)
         step.findings.push(...scannerFindings(step.tool, data))
         if (
           number === 6 &&
           (data.errors?.length || data.paths?.skipped?.length)
         ) {
           step.note += `\nSemgrep errors: ${data.errors?.length ?? 0}; skipped: ${data.paths?.skipped?.length ?? 0}`
+          for (const error of (data.errors ?? []).slice(0, 50)) {
+            const kind = typeof error.type === 'string' ? error.type : Array.isArray(error.type) ? error.type[0] : 'unknown'
+            step.note += `\n${auditClean(String(kind)).slice(0, 100)}: ${auditClean(String(error.path ?? 'unknown path')).slice(0, 1000)} (code=${Number(error.code)})`
+          }
           step.status = 'unavailable'
         }
       } catch {
         throw Error('scanner structured output is invalid')
       }
     }
-    if (number === 10) {
+    if (number === 9) {
       const data = JSON.parse(result.stdout)
       step.findings.push(...scannerFindings('socket', data))
       step.note += `\nScan: ${auditClean(String(data.data?.scanId ?? 'unavailable'))}; healthy=${data.data?.healthy}`
     }
     const accepted =
-      number === 11 ? [0, 1, 2] : [5, 9, 10].includes(number) ? [0, 1] : [0]
+      number === 10 ? [0, 1, 2] : [5, 8, 9].includes(number) ? [0, 1] : [0]
     if (!['unavailable', 'failed'].includes(step.status))
       step.status =
         result.truncated || !accepted.includes(result.exitCode)
@@ -1800,7 +1846,7 @@ export async function runAuditTool(
     step.status = 'unavailable'
     step.note += `\n${auditClean(error instanceof Error ? error.message : 'tool unavailable')}`
   } finally {
-    if (number === 9) {
+    if (number === 8) {
       for (const path of [
         join(c.root, 'history.git'),
         output,
@@ -1811,4 +1857,202 @@ export async function runAuditTool(
   }
   step.finishedAt = Date.now()
   return step
+}
+
+/** Actual tiny executions, isolated from project code and existing E2E scripts. */
+export async function runAuditProbe(
+  number: number,
+  original: AuditToolContext,
+  model = runIsolatedCodexJson,
+): Promise<AuditStep> {
+  checkAuditInterrupted(original)
+  if (!Number.isInteger(number) || number < 1 || number > 12) throw Error('unknown availability stage')
+  const root = mkdtempSync(join(original.root, `probe-${number}-`))
+  chmodSync(root, 0o700)
+  const source = join(root, 'source')
+  mkdirSync(source, { mode: 0o700 })
+  const put = (name: string, value: string) => {
+    mkdirSync(dirname(join(source, name)), { recursive: true, mode: 0o700 })
+    writeFileSync(join(source, name), value, { mode: 0o600 })
+  }
+  put('hello.js', 'export const hello = "Hello World";\n')
+  const c: AuditToolContext = { ...original, root, source, progress: undefined }
+  let step: AuditStep = { number, tool: 'availability probe', version: '1', scope: 'host-owned synthetic fixture',
+    status: 'completed', note: '', startedAt: Date.now(), finishedAt: null, exitCode: null,
+    findings: [], evidenceDigest: null }
+  const reasons: string[] = []
+  const attempt = async (label: string, fn: () => Promise<void>) => {
+    checkAuditInterrupted(c)
+    try { await fn() } catch (error) {
+      if (error instanceof CodexCleanupPendingError || error instanceof CodexUserCancelledError || error instanceof CodexInterruptedError) throw error
+      reasons.push(`${label}: ${auditClean(error instanceof Error ? error.message : 'unavailable').slice(0, 1500)}`)
+    }
+  }
+  const accept = (result: AuditStep) => {
+    step = { ...result, number, scope: 'host-owned synthetic fixture' }
+    if (!['completed', 'findings'].includes(result.status)) throw Error(result.note || `${result.tool}: ${result.status}`)
+  }
+  const syntheticJournal: AuditJournal = { version: 2, jobId: c.jobId, repoPath: source,
+    sessionId: randomUUID(), createdAt: Date.now(), revision: 'synthetic', files: ['hello.js'], omitted: [],
+    steps: [], result: null, reportDigest: null }
+  let retainForCleanup = false
+  try {
+  if (number <= 4) await attempt('Codex', async () => {
+    accept(await auditCodeReview(number, syntheticJournal, c, model))
+  })
+  if (number === 1 || number === 11) {
+    await attempt('E2E configuration', async () => {
+      const configs = auditPlaywrightConfigs(original.source)
+      if (configs.length !== 1 || !original.settings.e2ePort)
+        throw Error('one Playwright configuration and e2e-port are required')
+      if (process.platform !== 'darwin') throw Error('isolated local-port E2E execution requires macOS')
+      // Resolve the target's exact dependencies without importing its config or starting its server/tests.
+      const work = join(root, 'e2e-dependencies')
+      cpSync(original.source, work, { recursive: true, force: false, errorOnExist: true })
+      const cli = await preparePlaywrightDependencies(work, configs[0]!, c)
+      const configDir = join(work, dirname(configs[0]!)), testDir = join(configDir, 'zero-audit-preflight')
+      mkdirSync(testDir, { mode: 0o700 })
+      const config = join(configDir, 'zero-audit-preflight.config.mjs')
+      writeFileSync(config, "export default {testDir:'./zero-audit-preflight',reporter:[['json']],workers:1,use:{browserName:'chromium',channel:'chrome'}};\n", { mode: 0o600, flag: 'wx' })
+      writeFileSync(join(testDir, 'hello.spec.mjs'), "import {test,expect} from '@playwright/test';test('Hello World',async({page})=>{await page.setContent('<h1>Hello World</h1>');await expect(page.locator('h1')).toHaveText('Hello World')});\n", { mode: 0o600, flag: 'wx' })
+      const r = await checked(['node', cli, 'test', '--config', config], work, c, { sandbox: true, offline: true, timeoutMs: 60000 })
+      const data = JSON.parse(r.stdout)
+      if (data.stats?.expected !== 1 || data.stats?.unexpected !== 0 || data.stats?.skipped !== 0) throw Error('target Playwright Hello World did not pass')
+      step.evidenceDigest = createHash('sha256').update(r.stdout).digest('hex')
+
+    })
+    await attempt('Chrome Hello World', async () => {
+      const install = join(toolsRoot(c), 'trusted-playwright'), entry = join(install, 'node_modules/playwright/index.mjs')
+      if (!existsSync(entry)) await checked(['npm', 'install', '--prefix', install, '--ignore-scripts', '--no-audit', '--no-fund', 'playwright'], root, c)
+      const script = join(root, 'hello-chrome.mjs')
+      writeFileSync(script, `import {chromium} from ${JSON.stringify(entry)};
+const browser=await chromium.launch({channel:'chrome'});try{const page=await browser.newPage();await page.setContent('<h1>Hello World</h1>');if(await page.locator('h1').innerText()!=='Hello World')throw Error('assertion failed');console.log(JSON.stringify({passed:1}));}finally{await browser.close()}`, { mode: 0o600 })
+      const r = await checked(['node', script], root, c, { sandbox: true, offline: true, timeoutMs: 60000 })
+      if (JSON.parse(r.stdout).passed !== 1) throw Error('Chrome assertion did not pass')
+      step.evidenceDigest = createHash('sha256').update(r.stdout).digest('hex')
+    })
+    await attempt('Target authentication', async () => {
+      if (!c.settings.authentication) throw Error('auth required|none must be configured')
+      const auth = await authenticatedBrowser(c)
+      if (!auth.ok) throw Error(auth.note)
+    })
+  }
+  if (number === 5) await attempt('Dependency backends', async () => {
+    const names = new Set<string>()
+    const walk = (dir: string) => { for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory()) walk(join(dir, e.name)); else names.add(e.name)
+    } }
+    walk(original.source)
+    const kinds = ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb', 'requirements.txt'].filter(n => names.has(n))
+    if (!kinds.length) throw Error('supported dependency lockfile/requirements unavailable')
+    const unsupported = ['yarn.lock', 'poetry.lock', 'Cargo.lock', 'Gemfile.lock', 'go.sum', 'composer.lock'].filter(n => names.has(n))
+    if (unsupported.length) reasons.push(`dependency audit unsupported: ${unsupported.join(', ')}`)
+    for (const kind of kinds) await attempt(kind, async () => {
+      const dir = join(source, kind.replaceAll('.', '-')); mkdirSync(dir, { mode: 0o700 })
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'zero-audit-fixture', version: '1.0.0', private: true, dependencies: { 'is-number': '7.0.0' } }), { mode: 0o600 })
+      if (kind === 'requirements.txt') {
+        const install = join(toolsRoot(c), 'pip-audit'), exe = join(install, 'bin/pip-audit')
+        if (!existsSync(exe)) {
+          await checked(['python3', '-m', 'venv', install], root, c)
+          await checked([join(install, 'bin/pip'), 'install', 'pip-audit'], root, c)
+        }
+        writeFileSync(join(dir, kind), 'six==1.17.0\n', { mode: 0o600 })
+        const r = await auditCommand([exe, '-r', join(dir, kind), '-f', 'json', '--no-deps', '--disable-pip'], dir, c, { sandbox: true })
+        if (r.truncated || ![0, 1].includes(r.exitCode) || !Array.isArray(JSON.parse(r.stdout).dependencies)) throw Error('pip-audit fixture failed')
+      } else {
+        const command = kind === 'pnpm-lock.yaml'
+          ? ['node', await pnpmBinary(original), 'install', '--lockfile-only', '--ignore-scripts', '--config.ignore-pnpmfile=true', '--config.manage-package-manager-versions=false']
+          : kind.startsWith('bun.lock') ? [process.execPath, 'install', '--lockfile-only', '--ignore-scripts']
+          : ['npm', 'install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund']
+        await checked(command, dir, c, { sandbox: true })
+        accept(await dependencyAudit({ ...c, source: dir }, { ...step, findings: [] }))
+      }
+    })
+  })
+  if (number === 6) await attempt('Semgrep Code', async () => {
+    c.settings = { ...c.settings, semgrepRepo: await semgrepRepository(original) }
+    const policyRoot = join(root, 'policy-check'); mkdirSync(policyRoot, { mode: 0o700 })
+    // A local probe rule must not hide an empty/unavailable account policy.
+    accept(await runAuditTool(6, { ...c, root: policyRoot }))
+    put('entry.js', 'import {consume} from "./sink.js"; consume(source());\n')
+    put('sink.js', 'export function consume(value) { sink(value); }\n')
+    put('safe.js', 'import {consume} from "./sink.js"; consume(clean(source()));\n')
+    put('probe-rules.yml', 'rules:\n  - id: zero-probe-crossfile\n    languages: [javascript]\n    message: synthetic cross-file probe\n    severity: ERROR\n    mode: taint\n    options:\n      interfile: true\n    pattern-sources:\n      - pattern: source()\n    pattern-sinks:\n      - pattern: sink(...)\n    pattern-sanitizers:\n      - pattern: clean(...)\n')
+    accept(await runAuditTool(6, { ...c, semgrepProbe: true }))
+    if (!step.findings.some(f => f.title.endsWith('zero-probe-crossfile') && f.location.includes('sink.js')))
+      throw Error('known cross-file finding was not detected')
+  })
+  if (number === 7) await attempt('Trivy', async () => {
+    put('Dockerfile', 'FROM alpine:3.20\nUSER root\n')
+    // Never scan configured real images before the ready notification.
+    accept(await runAuditTool(7, { ...c, settings: { ...c.settings, images: c.settings.images.length ? ['busybox:1.37.0'] : [] } }))
+    for (const image of c.settings.images) await attempt('Image availability', async () => {
+      // Match Trivy's isolated remote source: host-only Docker images are not reachable there.
+      const remote = await auditCommand(['docker', 'manifest', 'inspect', image], root, c, { timeoutMs: 60000 })
+      if (remote.exitCode || remote.truncated || JSON.parse(remote.stdout)?.schemaVersion !== 2)
+        throw Error('configured image registry metadata unavailable; local-only images are not supported by isolated Trivy')
+    })
+  })
+  if (number === 8) await attempt('Gitleaks', async () => {
+    put('fixture.env', 'api_key="' + 'aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY' + '"\n')
+    for (const args of [['init'], ['add', '.'], ['commit', '-m', 'synthetic fixture']])
+      await checked(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'user.name=Audit Fixture', '-c', 'user.email=fixture@example.invalid', ...args], source, c)
+    accept(await runAuditTool(8, { ...c, repo: source }))
+    if (!step.findings.length) throw Error('known synthetic secret was not detected')
+    const head = await auditCommand(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', 'rev-parse', '--verify', 'HEAD'], original.repo, c)
+    if (head.exitCode) throw Error('target Git history unavailable')
+  })
+  if (number === 9) await attempt('Socket scan/report', async () => {
+    put('package.json', JSON.stringify({ name: 'zero-audit-preflight', version: '1.0.0', private: true, dependencies: { 'is-number': '7.0.0' } }))
+    accept(await runAuditTool(9, { ...c, socketReceiptPath: join(original.root, 'preflight-socket.json') }))
+  })
+  if (number === 10) {
+    await attempt('ZAP target configuration', async () => {
+      if (!c.settings.targetUrl || !c.settings.authentication) throw Error('target URL and authentication mode are required')
+      if (c.settings.authentication === 'required' && (!c.settings.authenticatedPath || !c.settings.loggedInPattern)) throw Error('authenticated target probe is missing')
+    })
+    await attempt('ZAP Hello World', async () => {
+      const docker = resolveDockerRuntime()
+      if (!docker) throw Error('Selected local Docker engine is unavailable')
+      c.dockerHost = docker.host
+      const marker = join(original.root, 'preflight-zap-owned')
+      if (existsSync(marker)) await cleanupAuditZap(c)
+      await checked(['docker', 'info', '--format', '{{.ServerVersion}}'], root, c, { timeoutMs: 30000 })
+      const image = 'ghcr.io/zaproxy/zaproxy:stable'
+      await checked(['docker', 'pull', image], root, c)
+      const site = join(root, 'site'); mkdirSync(site, { mode: 0o700 })
+      writeFileSync(join(site, 'index.html'), '<h1>Hello World</h1>', { mode: 0o600 })
+      atomicWritePrivateFile(marker, 'owned\n')
+      try {
+        const command = 'python3 -m http.server 8765 --bind 127.0.0.1 --directory /zap/wrk/site >/zap/wrk/http.log 2>&1 & ' +
+          (c.settings.activeScan ? 'zap-full-scan.py' : 'zap-baseline.py -m 1') + ' -t http://127.0.0.1:8765/ -J report.json -z "-dir /zap/wrk/zap-home"'
+        const r = await auditCommand(['docker', 'run', '--rm', '--name', `zero-audit-${c.jobId}`,
+          '--label', `zerochan.audit.job=${c.jobId}`, '--cap-drop=ALL', '--security-opt=no-new-privileges',
+          '--user', `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`, '-e', 'HOME=/zap/wrk',
+          '-v', `${root}:/zap/wrk:rw`, '--workdir', '/zap/wrk', image, 'sh', '-c', command], root, c)
+        if (r.truncated || ![0, 1, 2].includes(r.exitCode)) throw Error(`ZAP fixture scan failed (exit=${r.exitCode})`)
+        const raw = readFileSync(join(root, 'report.json'), 'utf8'), data = JSON.parse(raw)
+        scannerFindings('zap', data)
+        if (!data.site.length) throw Error('ZAP did not scan the synthetic site')
+        step.evidenceDigest = createHash('sha256').update(raw).digest('hex')
+        step.exitCode = r.exitCode
+      } finally { await cleanupAuditZap(c); rmSync(marker, { force: true }) }
+    })
+  }
+  if (number === 12) await attempt('Report compiler', async () => {
+    syntheticJournal.steps = [{ ...step, status: 'completed' }]
+    const raw = renderAuditReport(syntheticJournal), path = join(root, 'probe-report.md')
+    atomicWritePrivateFile(path, raw)
+    const copy = readOptionalBoundedOwnerOnlyRegularFile(path, 1_000_000)
+    if (copy !== raw || !copy.includes('セキュリティ検査レポート')) throw Error('report roundtrip failed')
+    step.evidenceDigest = createHash('sha256').update(raw).digest('hex')
+  })
+  return { ...step, number, status: reasons.length ? 'unavailable' : 'completed', findings: [],
+    note: reasons.length ? reasons.join('\n') : '設定確認と小規模な実行確認に成功しました。本コードの検査結果ではありません。', finishedAt: Date.now() }
+  } catch (error) {
+    retainForCleanup = error instanceof CodexCleanupPendingError
+    throw error
+  } finally {
+    if (!retainForCleanup) rmSync(root, { recursive: true, force: true })
+  }
 }

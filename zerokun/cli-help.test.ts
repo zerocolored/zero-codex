@@ -40,7 +40,7 @@ const publicCommands = [
     ['status'], ['target', 'https://example.invalid'], ['active', 'on'], ['active', 'off'],
     ['auth', 'required'], ['auth', 'none'], ['e2e-port', '3000'],
     ['auth-probe', '/account', 'Logged in'], ['socket-org', 'test-org'], ['socket-token'],
-    ['codeql-license', 'confirmed'], ['codeql-license', 'off'], ['image', 'test:latest'],
+    ['semgrep-repo', 'owner/repo'], ['semgrep-token'], ['image', 'test:latest'],
   ].map(args => ['security', ...args]),
 ]
 
