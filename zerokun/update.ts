@@ -2146,17 +2146,13 @@ async function validateZero(
     ...permissionOverrides.flatMap(value => ['-c', value]),
     '-P', profile,
     '--include-managed-config',
-    // Seatbelt needs the socket allowance for the candidate tmp; Linux codex
-    // (bubblewrap) has no such flag and keeps sockets inside the writable roots.
+    // Seatbelt only; Linux has no such flag (see withLinuxCandidateNetworkOverrides).
     ...(linuxSandbox ? [] : ['--allow-unix-socket', candidateSocketRoot]),
     '--',
     '/usr/bin/env',
     `TMPDIR=${candidateSocketRoot}`,
     'ZERO_CODEX_CANDIDATE_SANDBOX=1',
-    // Linux codex sets no CODEX_SANDBOX marker. verify.sh / project-git.ts
-    // prove the sandbox instead by this live file being absent: bubblewrap
-    // leaves denied trees (and files under an explicitly denied directory) out
-    // of its root, while outside the sandbox the live install always has it.
+    // Linux sandbox proof: this live file is denied, hence absent inside.
     ...(linuxSandbox
       ? [`ZERO_CODEX_CANDIDATE_SANDBOX_DENIED=${join(realpathSync(liveRepo), 'zerokun', 'verify.sh')}`]
       : []),
