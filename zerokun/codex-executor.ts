@@ -4032,8 +4032,8 @@ export function buildCodexDeveloperInstructions(
         'regressions. Minor findings, missing advisor responses, or infrastructure failures never',
         'trigger round 2. Never call review round 3 or the legacy separate design phase.',
         'For the initial phase, attempt exactly one solution_analyst with model=gpt-6-astra,',
-        'reasoning_effort=high, and fork_turns=none. For each final-review round, attempt exactly',
-        'one fresh risk_reviewer with model=gpt-6-astra, reasoning_effort=medium, and fork_turns=none.',
+        'reasoning_effort=medium, and fork_turns=none. For each final-review round, attempt exactly',
+        'one fresh risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none.',
         'Fresh native creation and the current input marker apply only to a NEW logical round, never interruption recovery.',
         'BEFORE spawning, call advisor_native_prepare with phase, round, current inputRevision/inputDigest and your independent review request.',
         'Use its EXACT taskName, prompt, model and reasoningEffort for the spawn. This durable registration lets the host recover the same child.',
@@ -4409,8 +4409,8 @@ export function buildCodexWorkerPrompt(
       'Preserve returned external answers; the broker retries only missing slots with a durable recovery limit.',
       'If scope changed, report the interrupted old review separately; never present old advice as approval of the new requirement.',
       'For investigation, spawn exactly one solution_analyst with model=gpt-6-astra,',
-      'reasoning_effort=high, and fork_turns=none. For each review round, spawn exactly one fresh',
-      'risk_reviewer with model=gpt-6-astra, reasoning_effort=medium, and fork_turns=none. Do not',
+      'reasoning_effort=medium, and fork_turns=none. For each review round, spawn exactly one fresh',
+      'risk_reviewer with model=gpt-6-astra, reasoning_effort=low, and fork_turns=none. Do not',
       'apply fresh native creation or current-input markers to interruption recovery; reuse the original marked answer. Do not',
       'substitute a different model and do not add another native slot.',
       nativeAdvisorStartupRecoveryInstructions(),
@@ -6707,6 +6707,25 @@ export function codexAttemptDisposition(
   return 'failed'
 }
 
+export function primaryProjectBoundary(job: Pick<JobRecord, 'repoPath' | 'writeEnabled'>) {
+  const runtimeRepo = realpathSync(join(import.meta.dir, '..'))
+  const jobRepo = realpathSync(job.repoPath)
+  if (job.writeEnabled && (pathContains(runtimeRepo, jobRepo) || pathContains(jobRepo, runtimeRepo))) {
+    throw new Error('write-enabled Slack job cannot target the Zeroちゃん runtime repository; '
+      + 'configure a separate project route to keep host runtime code immutable')
+  }
+  const advisorProjectLayout = resolveAdvisorProjectLayout(jobRepo)
+  const runtimeGitPaths = resolveGitMetadataPaths(runtimeRepo)
+  const jobGitPaths = advisorProjectLayout.gitRoots.length > 0
+    ? advisorProjectLayout.gitRoots.flatMap(resolveGitMetadataPaths) : resolveGitMetadataPaths(jobRepo)
+  if (job.writeEnabled && jobGitPaths.some(path => runtimeGitPaths.some(runtimePath =>
+    pathContains(runtimePath, path) || pathContains(path, runtimePath)))) {
+    throw new Error('write-enabled Slack job cannot target the Zeroちゃん runtime repository; '
+      + 'configure a separate project route to keep host runtime code immutable')
+  }
+  return { runtimeRepo, jobRepo, advisorProjectLayout, runtimeGitPaths, jobGitPaths }
+}
+
 export async function executeCodexJob(
   job: JobRecord,
   options: {
@@ -6804,6 +6823,7 @@ export async function executeCodexJob(
     publicationContinuation?: GitHubPublicationContinuationBundle
   },
 ): Promise<JobExecutionResult> {
+  if (job.runtime !== 'codex') throw new Error('Codex executor cannot run a job assigned to another core')
   assertCompatibleSystemCodexConfig()
   if (options.threadHistory) {
     assertDurableThreadHistorySnapshot(options.threadHistory, {
@@ -6815,37 +6835,7 @@ export async function executeCodexJob(
       currentJobSeq: job.seq,
     })
   }
-  const runtimeRepo = realpathSync(join(import.meta.dir, '..'))
-  const jobRepo = realpathSync(job.repoPath)
-  // Reject direct runtime containment before resolving a multi-repository
-  // layout. A linked worktree has a regular-file `.git`, so resolving its
-  // parent first can otherwise surface the workspace-member diagnostic rather
-  // than the invariant that write-enabled jobs never target this runtime.
-  if (job.writeEnabled && (
-    pathContains(runtimeRepo, jobRepo)
-    || pathContains(jobRepo, runtimeRepo)
-  )) {
-    throw new Error(
-      'write-enabled Slack job cannot target the Zeroちゃん runtime repository; '
-      + 'configure a separate project route to keep host runtime code immutable',
-    )
-  }
-  const advisorProjectLayout: AdvisorProjectLayout = resolveAdvisorProjectLayout(jobRepo)
-  const runtimeGitPaths = resolveGitMetadataPaths(runtimeRepo)
-  const jobGitPaths = advisorProjectLayout.gitRoots.length > 0
-    ? advisorProjectLayout.gitRoots.flatMap(resolveGitMetadataPaths)
-    : resolveGitMetadataPaths(jobRepo)
-  const sharesRuntimeGit = jobGitPaths.some(path => (
-    runtimeGitPaths.some(runtimePath => (
-      pathContains(runtimePath, path) || pathContains(path, runtimePath)
-    ))
-  ))
-  if (job.writeEnabled && sharesRuntimeGit) {
-    throw new Error(
-      'write-enabled Slack job cannot target the Zeroちゃん runtime repository; '
-      + 'configure a separate project route to keep host runtime code immutable',
-    )
-  }
+  const { runtimeRepo, jobRepo, advisorProjectLayout, runtimeGitPaths, jobGitPaths } = primaryProjectBoundary(job)
   if (options.signal?.aborted) throw new CodexInterruptedError('Codex job was interrupted')
   const testCodexBin = options.codexBinForTesting
   if (testCodexBin === undefined

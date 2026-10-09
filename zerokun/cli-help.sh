@@ -9,6 +9,7 @@ zerochan_help() {
         '初回設定（対象プロジェクトのフォルダで実行）:' \
         '  zerochan set slack-app                 Slackアプリを登録・選択' \
         '  zerochan set slack-channel C0123456789 チャンネルを紐付け' \
+        '  zerochan set core [codex|claude]       主担当を選択（既定はCodex）' \
         '  zerochan start                         起動' \
         '' \
         '日常の操作:' \
@@ -72,6 +73,7 @@ zerochan_help() {
       printf '%s\n' '使い方: zerochan start' \
         '対象プロジェクトへ cd して実行します。紐付いたSlackアプリを管理起動します。' \
         'Herdr外では専用workspaceを作成します。互換gatewayが稼働中なら共有します。' \
+        'zerochan set core で選んだ主担当を、新規依頼へ反映します。受付済みの作業は元の担当で継続します。' \
         '初回: zerochan set slack-app → zerochan set slack-channel C0123456789 → zerochan start' \
         '停止: zerochan stop（作業を中断する場合のみ zerochan stop --force）'
       ;;
@@ -85,6 +87,7 @@ zerochan_help() {
     status)
       printf '%s\n' '使い方: zerochan status' \
         '対象プロジェクトのSlackアプリ・チャンネル紐付けとgateway状態を確認します。' \
+        '主担当の設定と、新規依頼に適用される担当も表示します。' \
         '紐付け: zerochan set slack-channel C0123456789' \
         '解除: zerochan unset slack-channel'
       ;;
@@ -109,7 +112,11 @@ zerochan_help() {
         'ソース更新には zerochan update を使ってください。'
       ;;
     set)
-      printf '%s\n' '使い方: zerochan set slack-app' \
+      printf '%s\n' '使い方: zerochan set core [codex|claude]' \
+        '対象プロジェクトの主担当を選択します。引数なしは対話選択、既定はCodexです。' \
+        'Claude Codeは最新Opusを使用します。補助処理と3者レビューは共通です。' \
+        'zerochan start で新規依頼へ反映します。受付済み作業の担当は変わりません。' \
+        '' '使い方: zerochan set slack-app' \
         'Slackアプリを対話形式で登録、または登録済みアプリから選択します。' \
         '登録は任意のフォルダで可能です。プロジェクト内で選択すると、そのプロジェクトへ紐付きます。' \
         '別のアプリを選ぶと既存チャンネル設定を引き継いで接続先を変更します。旧アプリの履歴・作業は保持します。' \

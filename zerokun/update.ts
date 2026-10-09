@@ -1275,7 +1275,7 @@ export function activeJobCounts(raw: string): { queued: number; running: number 
   // The first Codex update may still call an older installed runner whose
   // records have no runtime field, so those remain relevant. Once migrated,
   // explicit Claude history must not block Codex updates forever.
-  const relevant = jobs.filter(job => job.runtime === undefined || job.runtime === 'codex')
+  const relevant = jobs.filter(job => job.runtime !== 'claude')
   return {
     queued: relevant.filter(job => job.status === 'queued').length,
     running: relevant.filter(job => job.status === 'running').length,
@@ -1292,7 +1292,7 @@ export function activeJobCountsFromDatabase(dbPath: string): {
     const hasRuntime = columns.some(column => column.name === 'runtime')
     const rows = db.query<{ status: string; count: number }, []>(
       `SELECT status, COUNT(*) AS count FROM jobs
-       WHERE status IN ('queued', 'running')${hasRuntime ? " AND runtime = 'codex'" : ''}
+       WHERE status IN ('queued', 'running')${hasRuntime ? " AND runtime <> 'claude'" : ''}
        GROUP BY status`,
     ).all()
     return {

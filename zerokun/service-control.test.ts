@@ -11,6 +11,9 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
+import { startZeroInHerdrWorkspace } from './herdr-start.ts'
+import { startWithSelectedCore } from './core-command.ts'
+import { projectPrimaryCore, setProjectPrimaryCore } from './project-channel-config.ts'
 import {
   inspectManagedServiceStatus,
   startManagedService,
@@ -247,7 +250,7 @@ function publishRuntime(
   writePinnedHerdrRuntime(state, runtime)
   writeFileSync(
     join(state, 'job-runner.lock', 'runtime'),
-    `zerokun-codex-runner-v1:${appId}:fixture:${herdrRuntimeFingerprint(runtime)}\n`,
+    `zerokun-codex-runner-v2:${appId}:fixture:${herdrRuntimeFingerprint(runtime)}\n`,
     { mode: 0o600 },
   )
 }
@@ -417,6 +420,53 @@ describe('OS watchdog service recovery', () => {
 })
 
 describe('zerochan service control state', () => {
+  for (const version of ['v1', 'v2']) test(`outside-Herdr core activation verifies the running ${version} service`, async () => {
+    const { base, state, project } = fixture()
+    expect(Bun.spawnSync(['git', 'init', '-q', project]).exitCode).toBe(0)
+    createJobDatabase(state)
+    const services = await spawnManagedServices(state, base)
+    publishRuntime(state)
+    const runtime = join(state, 'job-runner.lock', 'runtime')
+    writeFileSync(runtime, readFileSync(runtime, 'utf8').replace('runner-v2', `runner-${version}`))
+    const rootRepo = dirname(import.meta.dir)
+    const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { cwd: rootRepo, stdout: 'pipe' }).stdout.toString().trim()
+    writeGatewayReadiness(join(state, 'gateway-ready.json'), release, services.gateway.pid, project, 'A0123456789')
+    setProjectPrimaryCore(project, 'claude-code')
+    let checked = 0
+    const start = startWithSelectedCore(project, () => startZeroInHerdrWorkspace(rootRepo, state, project, {
+      reuseRunningService: async input => {
+        checked++
+        await startManagedService(input.rootRepo, input.stateDir, input.projectDir, 'A0123456789', testHooks)
+        return inspectManagedServiceStatus(state)
+      },
+      invoke: async () => { throw new Error('must not create or close a workspace') },
+    }), () => {})
+    if (version === 'v1') {
+      await expect(start).rejects.toThrow('job runner')
+      expect(projectPrimaryCore(project).active).toBe('codex')
+    } else {
+      expect((await start).status).toBe('already-running')
+      expect(projectPrimaryCore(project).active).toBe('claude-code')
+    }
+    expect(checked).toBe(1)
+    expect(projectPrimaryCore(project).desired).toBe('claude-code')
+    expect(services.gateway.exitCode).toBeNull()
+    expect(services.runner.exitCode).toBeNull()
+    expect(services.launcher.exitCode).toBeNull()
+  })
+  test('a pre-core-switch runner is preserved but cannot activate a new core', async () => {
+    const { base, state, project } = fixture()
+    createJobDatabase(state)
+    const services = await spawnManagedServices(state, base)
+    publishRuntime(state)
+    const path = join(state, 'job-runner.lock', 'runtime')
+    writeFileSync(path, readFileSync(path, 'utf8').replace('runner-v2', 'runner-v1'))
+    const release = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { cwd: dirname(import.meta.dir), stdout: 'pipe' }).stdout.toString().trim()
+    writeGatewayReadiness(join(state, 'gateway-ready.json'), release, services.gateway.pid, project, 'A0123456789')
+    await expect(startManagedService(dirname(import.meta.dir), state, project, 'A0123456789', testHooks)).rejects.toThrow('job runner')
+    expect(services.gateway.exitCode).toBeNull()
+    expect(services.runner.exitCode).toBeNull()
+  })
   test('startup handoff stays busy through the readiness gap and removes its child environment value', async () => {
     const { state, project } = fixture()
     writeLastConnectedProject(state, project)

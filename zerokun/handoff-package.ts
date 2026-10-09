@@ -18,6 +18,7 @@ const repositorySchema = z.object({
 export const packageSchema = z.object({
   version: z.literal(1), task: z.string(), history: z.string(),
   primaryModel: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/).optional(),
+  primaryCore: z.enum(['codex', 'claude-code']).optional(),
   repositories: z.array(repositorySchema).max(32), attachments: z.array(fileSchema).max(1000),
   notes: z.array(z.string()).max(100),
 }).strict()

@@ -15,6 +15,7 @@ import {
 import { dirname, join } from 'path'
 import { Database } from 'bun:sqlite'
 import { runtimeRootForState } from './runtime-release.ts'
+import { DEFAULT_PRIMARY_CORE, isPrimaryCore, type PrimaryCore } from './primary-core.ts'
 import { SlackProjectDisconnectedError } from './slack-project-admission.ts'
 import { JobStore } from './job-runner.ts'
 import {
@@ -219,6 +220,41 @@ function withProjectConfigLock<T>(repoPath: string, action: () => T): T {
     if (Date.now() >= deadline || lock.kind === 'owner-unavailable') throw new Error('別のプロジェクト設定操作が実行中です')
     Bun.sleepSync(50)
   }
+}
+
+export function projectPrimaryCore(repoPath: string): { desired: PrimaryCore; active: PrimaryCore } {
+  const dir = configDirectory(realpathSync(repoPath))
+  const defaults = { desired: DEFAULT_PRIMARY_CORE, active: DEFAULT_PRIMARY_CORE }
+  if (!existsSync(dir)) return defaults
+  const identity = directoryIdentity(dir)
+  const raw = readOptionalBoundedOwnerOnlyRegularFile(join(dir, 'primary-core.json'), MAX_CONFIG_BYTES)
+  sameDirectory(dir, identity)
+  if (!raw) return defaults
+  const config = JSON.parse(raw)
+  if (config?.version !== 1 || Object.keys(config).sort().join(',') !== 'active,desired,version'
+    || !isPrimaryCore(config.desired) || !isPrimaryCore(config.active)) throw new Error('主担当の設定が不正です')
+  return { desired: config.desired, active: config.active }
+}
+
+export function setProjectPrimaryCore(repoPathInput: string, core: PrimaryCore): void {
+  if (!isPrimaryCore(core)) throw new Error('主担当の設定が不正です')
+  const repoPath = realpathSync(repoPathInput)
+  withProjectConfigLock(repoPath, () => {
+    const before = projectPrimaryCore(repoPath)
+    // Keep the channel file compatible with the gateway still accepting input.
+    atomicWritePrivateFile(join(configDirectory(repoPath), 'primary-core.json'), JSON.stringify({ version: 1, ...before, desired: core }, null, 2) + '\n')
+  })
+}
+
+/** The caller completes runtime preflight before publishing this activation.
+ * Compare the selected value under the same lock to preserve concurrent set. */
+export function activateProjectPrimaryCore(repoPathInput: string, expected: PrimaryCore): void {
+  const repoPath = realpathSync(repoPathInput)
+  withProjectConfigLock(repoPath, () => {
+    const before = projectPrimaryCore(repoPath)
+    if (before.desired !== expected) throw new Error('起動中に主担当設定が変更されました。zerochan start を再実行してください')
+    atomicWritePrivateFile(join(configDirectory(repoPath), 'primary-core.json'), JSON.stringify({ version: 1, ...before, active: expected }, null, 2) + '\n')
+  })
 }
 
 function writeProjectChannelConfig(repoPath: string, slackChannels: string[], appId?: string): void {
@@ -486,6 +522,7 @@ export function unsetProjectSlackApp(
       if (pending === null) atomicWritePrivateFile(journalFile, JSON.stringify({ version: 1, repoPath, apps: targets }) + '\n')
       // The journal itself blocks new admission, including after a crash here.
       atomicWritePrivateFile(projectChannelConfigPath(repoPath), JSON.stringify({
+        ...before,
         version: CONFIG_VERSION, slackAppId: null, slackChannels: [],
         ...(before.slackAcceptAfter === undefined ? {} : { slackAcceptAfter: before.slackAcceptAfter }),
       } satisfies ProjectChannelConfig, null, 2) + '\n')

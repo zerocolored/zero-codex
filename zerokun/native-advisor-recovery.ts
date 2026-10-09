@@ -44,7 +44,7 @@ export type NativeAdvisorRegistration = Omit<RetainedNativeAdvisor, 'threadId' |
   taskName: string
   prompt: string
   model: 'gpt-6-astra'
-  reasoningEffort: 'high' | 'medium'
+  reasoningEffort: 'high' | 'medium' | 'low'
 }
 const registrationPath = (contextPath: string, phase: string, round: number) => `${contextPath}.native-${phase}-${round}`
 
@@ -56,7 +56,8 @@ export function readNativeAdvisorRegistrations(contextPath: string, attemptNonce
       const value = JSON.parse(raw) as NativeAdvisorRegistration
       if (value.phase !== phase || value.round !== round
         || value.perspective !== (phase === 'review' ? 'risk' : 'solution')
-        || value.model !== 'gpt-6-astra' || value.reasoningEffort !== (phase === 'review' ? 'medium' : 'high')
+        || value.model !== 'gpt-6-astra'
+        || !(phase === 'review' ? ['low', 'medium'] : ['medium', 'high']).includes(value.reasoningEffort)
         || !/^zero_native_[a-f0-9]{32}$/.test(value.taskName)
         || value.agentPath !== `/root/${value.taskName}`
         || typeof value.prompt !== 'string' || value.prompt.length > 28_000
@@ -93,7 +94,7 @@ export function registerNativeAdvisor(options: {
   const registration: NativeAdvisorRegistration = {
     taskName, agentPath: `/root/${taskName}`, marker, inputRevision: options.inputRevision,
     inputDigest: options.inputDigest, phase: options.phase, round: options.round, perspective,
-    model: 'gpt-6-astra', reasoningEffort: options.phase === 'review' ? 'medium' : 'high',
+    model: 'gpt-6-astra', reasoningEffort: options.phase === 'review' ? 'low' : 'medium',
     prompt: `${options.request}\nRead-only advisor: no writes, tests, network, credentials, external changes or delegation.\nEnd your complete answer with this exact marker on its own final line:\n${marker}`,
   }
   atomicWritePrivateFile(registrationPath(options.contextPath, options.phase, options.round), JSON.stringify(registration))

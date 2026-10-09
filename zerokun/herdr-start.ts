@@ -30,7 +30,7 @@ type HerdrStartHooks = {
   sleep?: (milliseconds: number) => Promise<void>
   timeoutMs?: number
   cleanupTimeoutMs?: number
-  repairMissingLauncher?: (input: {
+  reuseRunningService?: (input: {
     rootRepo: string
     stateDir: string
     projectDir: string
@@ -168,7 +168,7 @@ function resolveHerdrBinary(): string {
   return realpathSync(selected)
 }
 
-async function repairMissingLauncher(input: {
+async function reuseRunningService(input: {
   rootRepo: string
   stateDir: string
   projectDir: string
@@ -206,29 +206,24 @@ export async function startZeroInHerdrWorkspace(
   const launcher = realpathSync(join(rootRepo, 'codex-channel.sh'))
   const inspect = hooks.inspectStatus ?? inspectManagedServiceStatus
   const initial = inspect(stateDir)
-  if (initial.status === 'running') {
+  if (initial.status === 'running'
+    || (initial.status === 'partial' && initial.gatewayPid && initial.runnerPid && !initial.launcherPid)) {
+    // Liveness alone cannot authorize a core change. Reuse the same runtime
+    // compatibility check as an in-Herdr start, including a healthy service.
+    const reused = await (
+      hooks.reuseRunningService ?? reuseRunningService
+    )({ rootRepo, stateDir, projectDir })
+    if (reused.status !== 'running') {
+      throw new Error('Zeroちゃんの自動復旧機構を再構築できませんでした')
+    }
     return {
       status: 'already-running',
-      gatewayPid: initial.gatewayPid,
-      runnerPid: initial.runnerPid,
-      launcherPid: initial.launcherPid,
+      gatewayPid: reused.gatewayPid,
+      runnerPid: reused.runnerPid,
+      launcherPid: reused.launcherPid,
     }
   }
   if (initial.status === 'partial') {
-    if (initial.gatewayPid && initial.runnerPid && !initial.launcherPid) {
-      const repaired = await (
-        hooks.repairMissingLauncher ?? repairMissingLauncher
-      )({ rootRepo, stateDir, projectDir })
-      if (repaired.status !== 'running') {
-        throw new Error('Zeroちゃんの自動復旧機構を再構築できませんでした')
-      }
-      return {
-        status: 'already-running',
-        gatewayPid: repaired.gatewayPid,
-        runnerPid: repaired.runnerPid,
-        launcherPid: repaired.launcherPid,
-      }
-    }
     throw new Error('Zeroちゃんが部分起動状態です。zerochan stop --force の後に zerochan start を実行してください')
   }
 
@@ -304,7 +299,9 @@ async function main(): Promise<void> {
     process.exitCode = 2
     return
   }
-  const result = await startZeroInHerdrWorkspace(rootRepo, stateDir, projectDir)
+  const { startWithSelectedCore } = await import('./core-command.ts')
+  const result = await startWithSelectedCore(projectDir,
+    () => startZeroInHerdrWorkspace(rootRepo, stateDir, projectDir))
   if (result.status === 'already-running') {
     process.stdout.write('✅ Zeroちゃんは既に稼働中です。\n')
   } else {

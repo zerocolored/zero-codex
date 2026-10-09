@@ -90,7 +90,7 @@ function startRunner(state: string): Bun.Subprocess {
   }))
   writeFileSync(
     join(lockDir, 'runtime'),
-    `zerokun-codex-runner-v1:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}\n`,
+    `zerokun-codex-runner-v2:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}\n`,
   )
   return process
 }
@@ -329,7 +329,7 @@ async function runLauncher(
       HERDR_BIN_PATH: herdr,
       ZEROKUN_STATE_DIR: state,
       FAKE_RUNNER_STATE: state,
-      FAKE_RUNNER_RUNTIME: `zerokun-codex-runner-v1:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}`,
+      FAKE_RUNNER_RUNTIME: `zerokun-codex-runner-v2:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}`,
       ...env,
     },
     cwd: launch.cwd,

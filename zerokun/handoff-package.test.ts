@@ -6,6 +6,12 @@ import { join } from 'path'
 import { captureRepository, decodePackage, encodePackage, restoreRepository } from './handoff-package.ts'
 
 const owned: string[] = []
+test('portable Claude core/model survives packet encoding while old packets remain Codex-compatible', () => {
+  const packet = { version: 1 as const, task: 'continue', history: '', repositories: [], attachments: [], notes: [] }
+  expect(decodePackage(encodePackage(packet)).primaryCore).toBeUndefined()
+  expect(decodePackage(encodePackage({ ...packet, primaryCore: 'claude-code', primaryModel: 'claude-opus-5-5' })))
+    .toMatchObject({ primaryCore: 'claude-code', primaryModel: 'claude-opus-5-5' })
+})
 test('portable conversation preserves quoted content without blocking continuation', () => {
   const packet = decodePackage(encodePackage({ version: 1, task: 'Example {"api_key":"example-private-value"}',
     history: 'Use {"password":"example-private-password"} then continue', repositories: [], attachments: [], notes: [] }))

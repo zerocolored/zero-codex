@@ -35,17 +35,18 @@ describe('Zero-kun Codex wiring', () => {
     expect(server).toContain("process.env.ZEROKUN_LEGACY_CUTOVER !== '1'")
   })
 
-  test('worker runtime is ordered Codex App Server with live steer/interrupt', () => {
+  test('worker selects the ordered primary runtime with live steer/interrupt', () => {
     const server = readFileSync(join(root, 'server.ts'), 'utf8')
     const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
     const executor = readFileSync(join(import.meta.dir, 'codex-executor.ts'), 'utf8')
     expect(server).toContain('? jobStore.interruptControlTarget(inbound.chatId, inbound.threadTs)')
     expect(server).toContain(': jobStore.liveControlTarget(inbound.chatId, inbound.threadTs)')
     expect(runner).toContain('const executionJob = cloudRuntime?.executionJob(job) ?? job')
-    expect(runner).toContain('executeCodexJob(executionJob,')
+    expect(runner).toContain("executionJob.runtime === 'claude-code' ? executeClaudeJob : executeCodexJob")
+    expect(runner).toContain('primaryExecutor(executionJob,')
     expect(runner).toContain('store.saveSession(job.id, sessionId, executionJob.repoPath)')
     expect(runner).toContain('verifySlackAppTokenPair')
-    expect(runner).toContain('liveControls: {')
+    expect(runner).toContain('liveControls: createPrimaryLiveControlHooks(store, job)')
     expect(executor).toContain('production Codex jobs require the App Server live-control transport')
     expect(executor).toContain("'app-server', '--stdio'")
     expect(executor).toContain('const session = new CodexAppServerSession')

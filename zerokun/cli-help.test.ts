@@ -33,6 +33,7 @@ const publicCommands = [
   ['update'], ['update', '--recover-only'],
   ...['on', 'off', 'status'].map(value => ['auto-update', value]),
   ['set', 'slack-app'], ['set', 'slack-channel', 'C0123456789'], ['unset', 'slack-channel'],
+  ['set', 'core'], ['set', 'core', 'codex'], ['set', 'core', 'claude'],
   ...['login', 'activate', 'status'].map(value => ['cloud', value]),
   ...['identity', 'status', 'off'].map(value => ['fleet', value]),
   ['fleet', 'register', 'test-instance', 'test-auth-app'],
