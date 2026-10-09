@@ -587,10 +587,38 @@ export function stageVerifiedCandidateCodex(
     || !/^git version \d+\.\d+(?:\.\d+)?(?:\s|$)/.test(gitVersion.stdout.toString())) {
     fail('stagingしたcandidate検証用Gitを実行できません')
   }
+  if (process.platform === 'linux') stageLinuxCandidateTools(directory, candidateCodexExecutable(codexBin))
   chmodSync(executable, 0o500)
   chmodSync(gitExecutable, 0o500)
   chmodSync(directory, 0o500)
   return { directory, executable, gitExecutable }
+}
+
+/**
+ * Linux `codex sandbox` re-executes itself under bubblewrap, which it looks
+ * for next to its own executable (`codex-resources/bwrap`, bundled with the
+ * standalone release) before falling back to a system `bwrap`. Inside the
+ * sandbox the developer home is denied, so bun (process.execPath lives under
+ * ~/.bun) is staged beside the trusted codex copy as well; the candidate PATH
+ * already starts with trusted-bin.
+ */
+function stageLinuxCandidateTools(directory: string, physicalCodex: string): void {
+  const resources = join(directory, 'codex-resources')
+  for (const bundled of [
+    join(dirname(dirname(physicalCodex)), 'codex-resources', 'bwrap'),
+    join(dirname(physicalCodex), 'codex-resources', 'bwrap'),
+  ]) {
+    if (!secureExecutable(bundled)) continue
+    mkdirSync(resources, { mode: 0o700 })
+    const staged = join(resources, 'bwrap')
+    copySecureExecutable(bundled, staged, () => {}, true)
+    chmodSync(staged, 0o500)
+    chmodSync(resources, 0o500)
+    break
+  }
+  const bun = join(directory, 'bun')
+  copySecureExecutable(process.execPath, bun, () => {}, true)
+  chmodSync(bun, 0o500)
 }
 
 type UpdatePhase =
@@ -1841,7 +1869,7 @@ async function validateRemoteTargets(
       })
       await validateZero(checkout, isolatedHome, repo.path, stateDir, processGroupLease, signal)
     } finally {
-      try { chmodSync(join(parent, 'trusted-bin'), 0o700) } catch {}
+      unlockTrustedBin(parent)
       let cleanupError: unknown
       for (let attempt = 0; attempt < 50; attempt += 1) {
         try {
@@ -2012,6 +2040,53 @@ export function buildCandidatePermissionOverrides(
   ]
 }
 
+export type CandidateFilesystemRule = [path: string, access: 'deny' | 'read' | 'write']
+
+/**
+ * Linux counterpart of Seatbelt's `--allow-unix-socket <candidate tmp>`: with
+ * the network proxy on (the only way the Linux sandbox reaches the network at
+ * all), seccomp refuses to bind Unix sockets, which the candidate's Herdr
+ * runtime tests need under TMPDIR. codex-cli 0.162.0 has no per-prefix bind
+ * allowance (`network.unix_sockets` only governs connect by exact path), so
+ * the sandbox-wide switch is used; the sandbox root is a tmpfs that exposes no
+ * host sockets (/run holds only WSL, /var/run is absent).
+ */
+export function withLinuxCandidateNetworkOverrides(overrides: string[], profile: string): string[] {
+  const anchor = `permissions.${profile}.network.allow_local_binding=true`
+  const index = overrides.indexOf(anchor)
+  if (index < 0) fail('candidate sandboxのnetwork設定が想定と異なります')
+  return [
+    ...overrides.slice(0, index + 1),
+    `permissions.${profile}.network.dangerously_allow_all_unix_sockets=true`,
+    ...overrides.slice(index + 1),
+  ]
+}
+
+/**
+ * Linux `codex sandbox` (bubblewrap) differs from Seatbelt in two ways that the
+ * macOS rule set trips over (measured on codex-cli 0.162.0 / WSL2):
+ * - a deny nested under a denied ancestor aborts bubblewrap outright
+ *   ("Can't mkdir parents for ...: Read-only file system"), while a write
+ *   nested under a denied ancestor is bound fine;
+ * - a read nested under a denied ancestor is silently absent, so bun cannot be
+ *   read from $HOME and is staged into trusted-bin instead (see
+ *   stageLinuxCandidateTools).
+ * The ancestor's deny already covers the dropped rules.
+ */
+export function linuxCandidateFilesystemRules(
+  rules: readonly CandidateFilesystemRule[],
+  bunExecutable = realpathSync(process.execPath),
+): CandidateFilesystemRule[] {
+  const denied = rules.filter(([, access]) => access === 'deny').map(([path]) => path)
+  const underDenied = (path: string) => denied.some(root => path.startsWith(`${root}/`))
+  return rules.filter(([path, access]) => {
+    if (path === ':minimal') return true
+    if (access === 'read' && path === bunExecutable) return false
+    if (access === 'write') return true
+    return !underDenied(path)
+  })
+}
+
 async function validateZero(
   rootRepo: string,
   isolatedHome: string,
@@ -2029,7 +2104,8 @@ async function validateZero(
   const stagedCodexBin = stagedCodex.executable
   const profile = `zerokun_update_${randomUUID().replaceAll('-', '')}`
   const candidateSocketRoot = realpathSync(join(isolatedHome, 'tmp'))
-  const filesystem = new Map<string, 'deny' | 'read' | 'write'>([
+  const linuxSandbox = process.platform === 'linux'
+  const filesystemRules: CandidateFilesystemRule[] = [
     [':minimal', 'read'],
     [realpathSync(homedir()), 'deny'],
     [realpathSync(liveRepo), 'deny'],
@@ -2038,13 +2114,17 @@ async function validateZero(
     [realpathSync(trustedToolDirectory), 'read'],
     [realpathSync(rootRepo), 'write'],
     [realpathSync(isolatedHome), 'write'],
-  ])
+  ]
+  const filesystem = new Map<string, 'deny' | 'read' | 'write'>(
+    linuxSandbox ? linuxCandidateFilesystemRules(filesystemRules) : filesystemRules,
+  )
   const filesystemToml = [...filesystem]
     .map(([path, access]) => `${JSON.stringify(path)}=${JSON.stringify(access)}`)
     .join(',')
   const candidateEnvironment = buildCandidateEnvironment(isolatedHome)
   candidateEnvironment.PATH = updaterTrustedToolPath(trustedToolDirectory)
   let permissionOverrides = buildCandidatePermissionOverrides(profile, filesystemToml)
+  if (linuxSandbox) permissionOverrides = withLinuxCandidateNetworkOverrides(permissionOverrides, profile)
   if (!executionPolicy.skipCodexPermissionPreflight) {
     permissionOverrides = await requireEffectiveCodexPermissionPreflight(
       stagedCodexBin,
@@ -2066,11 +2146,16 @@ async function validateZero(
     ...permissionOverrides.flatMap(value => ['-c', value]),
     '-P', profile,
     '--include-managed-config',
-    '--allow-unix-socket', candidateSocketRoot,
+    // Seatbelt only; Linux has no such flag (see withLinuxCandidateNetworkOverrides).
+    ...(linuxSandbox ? [] : ['--allow-unix-socket', candidateSocketRoot]),
     '--',
     '/usr/bin/env',
     `TMPDIR=${candidateSocketRoot}`,
     'ZERO_CODEX_CANDIDATE_SANDBOX=1',
+    // Linux sandbox proof: this live file is denied, hence absent inside.
+    ...(linuxSandbox
+      ? [`ZERO_CODEX_CANDIDATE_SANDBOX_DENIED=${join(realpathSync(liveRepo), 'zerokun', 'verify.sh')}`]
+      : []),
     `ZERO_CODEX_CANDIDATE_GIT=${stagedCodex.gitExecutable}`,
     '/bin/bash', verifyScript, '--candidate-sandbox',
   ], {
@@ -2170,7 +2255,8 @@ const UPDATE_RESTART_TRAMPOLINE = [
   'launcher="$4"',
   'project="$5"',
   '[[ "$replace_token_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "restart handoff digest is invalid" >&2; exit 65; }',
-  '[ "$(/usr/bin/stat -f %Lp "$replace_token_file" 2>/dev/null)" = 600 ] || { echo "restart handoff token mode is unsafe" >&2; exit 66; }',
+  // BSD stat on macOS, GNU stat on Linux; both print the octal permission bits.
+  `[ "$(${process.platform === 'darwin' ? '/usr/bin/stat -f %Lp' : '/usr/bin/stat -c %a'} "$replace_token_file" 2>/dev/null)" = 600 ] || { echo "restart handoff token mode is unsafe" >&2; exit 66; }`,
   'if ! replace_token_with_sentinel="$(bun --config=/dev/null --no-env-file "$safe_file_helper" read-owned-regular "$replace_token_file" 2>/dev/null; status=$?; [ "$status" -eq 0 ] || exit "$status"; /usr/bin/printf .)"; then',
   '  echo "restart handoff token is unavailable or unsafe" >&2',
   '  exit 67',
@@ -3383,7 +3469,7 @@ async function mainSingle(testing = false, argv = process.argv.slice(2), selecte
   if (!existsSync(projectDir)) fail(`作業ディレクトリがありません: ${projectDir}`)
   if (!existsSync(setupScript)) fail(`setup.shがありません: ${setupScript}`)
 
-  const branch = process.env.ZEROKUN_UPDATE_BRANCH ?? 'main'
+  const branch = updateSourceBranch()
   const repositories: Repository[] = [{ label: 'zero-codex', path: rootRepo, branch }]
 
   const updateLock = acquireUpdateLock(stateDir)
@@ -3712,9 +3798,31 @@ async function legacyMain(testing = false, argv = process.argv.slice(2)): Promis
 
 export async function remoteIndependentHead(repo: string): Promise<string | undefined> {
   const remote = requireCommand(['git', 'remote', 'get-url', 'origin'], { cwd: repo })
-  const sha = (await requireCommandAsync(['git', 'ls-remote', remote, 'refs/heads/main'], { timeoutMs: 30_000 })).trim().split(/\s+/)[0] ?? ''
-  if (!/^[a-f0-9]{40}$/.test(sha)) fail('更新先mainのcommitを確認できません')
+  const branch = updateSourceBranch()
+  const sha = (await requireCommandAsync(['git', 'ls-remote', remote, `refs/heads/${branch}`], { timeoutMs: 30_000 })).trim().split(/\s+/)[0] ?? ''
+  if (!/^[a-f0-9]{40}$/.test(sha)) fail(`更新先${branch}のcommitを確認できません`)
   return sha === requireCommand(['git', 'rev-parse', 'HEAD'], { cwd: repo }) ? undefined : sha
+}
+
+/**
+ * Updates come from main. ZEROKUN_UPDATE_BRANCH is the terminal-only lever for
+ * trying a branch on a real machine (the legacy flow has honoured it for the
+ * same purpose); applyStateEnvironment drops it from the state .env, so neither
+ * Slack nor configuration can move the update source.
+ */
+export function updateSourceBranch(source: Record<string, string | undefined> = process.env): string {
+  const branch = source.ZEROKUN_UPDATE_BRANCH ?? 'main'
+  if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]{0,200}$/.test(branch) || branch.includes('..') || branch.endsWith('/')) {
+    fail('ZEROKUN_UPDATE_BRANCHが不正です')
+  }
+  return branch
+}
+
+/** trusted-bin and its codex-resources are published read-only; reopen them for removal. */
+function unlockTrustedBin(parent: string): void {
+  for (const directory of [join(parent, 'trusted-bin'), join(parent, 'trusted-bin', 'codex-resources')]) {
+    try { chmodSync(directory, 0o700) } catch {}
+  }
 }
 
 async function waitForUpdateLease(state: string, signal?: AbortSignal): Promise<UpdateLockCoordinator> {
@@ -3738,9 +3846,10 @@ async function prepareIndependentRelease(rootRepo: string, stateDir: string, sig
   let validationRoot: string | undefined
   try {
     const remote = requireCommand(['git', 'remote', 'get-url', 'origin'], { cwd: rootRepo })
-    const refs = await requireCommandAsync(['git', 'ls-remote', remote, 'refs/heads/main'], { signal })
+    const branch = updateSourceBranch()
+    const refs = await requireCommandAsync(['git', 'ls-remote', remote, `refs/heads/${branch}`], { signal })
     const sha = refs.trim().split(/\s+/)[0] ?? ''
-    if (!/^[a-f0-9]{40}$/.test(sha)) fail('更新先mainのcommitを確認できません')
+    if (!/^[a-f0-9]{40}$/.test(sha)) fail(`更新先${branch}のcommitを確認できません`)
     const releases = ensureManagedDirectory(registry, join(registry, 'releases'))
     const destination = join(releases, sha)
     const release: RuntimeRelease = { version: 1, sha, path: destination }
@@ -3789,7 +3898,7 @@ async function prepareIndependentRelease(rootRepo: string, stateDir: string, sig
     return validateRelease(release)
   } finally {
     if (validationRoot) {
-      try { chmodSync(join(validationRoot, 'trusted-bin'), 0o700) } catch {}
+      unlockTrustedBin(validationRoot)
       rmSync(validationRoot, { recursive: true, force: true })
     }
     if (temporary) rmSync(temporary, { recursive: true, force: true })

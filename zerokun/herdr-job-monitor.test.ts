@@ -86,7 +86,10 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<v
 
 function runtime(): HerdrRuntimeIdentity {
   return {
-    binary: '/usr/bin/true',
+    // An owner-only executable on every platform. Inside the updater's Linux
+    // sandbox (bubblewrap) system binaries are owned by nobody, so
+    // /usr/bin/true fails requireOwnedNode there.
+    binary: process.execPath,
     binaryDevice: 1,
     binaryInode: 2,
     binaryMode: 0o100755,

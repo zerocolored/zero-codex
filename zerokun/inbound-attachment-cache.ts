@@ -32,6 +32,9 @@ function integrityFailure(message: string): never {
 export interface InboundAttachmentIdentity {
   dev: number
   ino: number
+  // Linux reuses a freed inode number immediately, so dev+ino alone can match
+  // a file written after ours was removed; the verified size narrows it.
+  size: number
 }
 
 export function writeAllSync(
@@ -73,7 +76,7 @@ export function verifyInboundDownloadBeforeRename(
     || metadata.size !== received) {
     throw new Error('inbound attachment temporary file metadata is unsafe')
   }
-  return { dev: metadata.dev, ino: metadata.ino }
+  return { dev: metadata.dev, ino: metadata.ino, size: metadata.size }
 }
 
 /** Remove only the exact regular inode that was atomically renamed by us. */
@@ -89,7 +92,7 @@ export function removeRenamedInboundAttachment(
     throw error
   }
   const owner = typeof process.getuid !== 'function' || metadata.uid === process.getuid()
-  if (metadata.dev !== identity.dev || metadata.ino !== identity.ino
+  if (metadata.dev !== identity.dev || metadata.ino !== identity.ino || metadata.size !== identity.size
     || !metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || !owner) {
     return false
   }
