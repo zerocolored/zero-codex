@@ -97,6 +97,19 @@ test('Claude診断ログが同居しても実回答観測からSlack最終報告
   expect(result).not.toContain('未完了')
 })
 
+test.each(['active-round.lock.stop', 'future-lifecycle-note.json', 'temporary-runtime-directory', 'runtime-link'])('attempt側の補助記録%sは取得済みGPT回答を消さない', async name => {
+  const f = fixture()
+  const path = join(f.state, 'advisor-journal', f.job.id, f.nonce, name)
+  if (name === 'temporary-runtime-directory') mkdirSync(path)
+  else if (name === 'runtime-link') symlinkSync(join(f.state, 'absent'), path)
+  else writeFileSync(path, 'opaque lifecycle bookkeeping', { mode: 0o600 })
+  const observations = await f.observe(true)
+  const coverage = collectHostAdvisorCoverage(f.state, f.job.id, f.nonce, observations)
+  expect(coverage?.phases[0]).toMatchObject({ responsesObtained: 3, startUnconfirmed: 0 })
+  expect(enforceHostAdvisorCoverage('確認結果です。', coverage, 'result'))
+    .not.toContain('回答を取得できませんでした')
+})
+
 test('診断ログを無視しても未取得の実回答を成功に変えない', async () => {
   const f = fixture()
   const coverage = collectHostAdvisorCoverage(f.state, f.job.id, f.nonce, await f.observe(false))
@@ -131,4 +144,14 @@ test('採択するround journal自体の別nonceやsymlinkは引き続き拒否�
   rmSync(f.journalPath)
   symlinkSync(join(f.state, 'missing'), f.journalPath)
   expect(f.rounds).toThrow()
+})
+
+
+test.each(['active-claim', 'revision-file', 'revision-link'])('補助記録を除外しても%sは採用しない', kind => {
+  const f = fixture()
+  const root = join(f.state, 'advisor-journal', f.job.id, f.nonce)
+  const path = join(root, kind === 'active-claim' ? 'active-round.lock' : `revision-2-${'e'.repeat(16)}`)
+  if (kind === 'revision-link') symlinkSync(join(f.state, 'missing'), path)
+  else writeFileSync(path, 'not settled evidence', { mode: 0o600 })
+  expect(f.rounds).toThrow(kind === 'active-claim' ? 'active round claim' : 'unsafe attempt entry')
 })
