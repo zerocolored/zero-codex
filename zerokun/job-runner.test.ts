@@ -10862,10 +10862,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     writeFileSync(deliveryPath, `${JSON.stringify(delivery)}\n`, { mode: 0o600 })
 
     const unknown = join(attemptRoot, 'ephemeral-delivery.json.tmp')
-    writeFileSync(unknown, 'unsafe', { mode: 0o600 })
-    expect(() => assertRequiredAdvisorRounds(
+    writeFileSync(unknown, 'opaque runtime bookkeeping', { mode: 0o600 })
+    expect(assertRequiredAdvisorRounds(
       job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
-    )).toThrow('unsafe attempt entry')
+    )).toHaveLength(1)
     rmSync(unknown)
 
     const activeLock = join(attemptRoot, 'active-round.lock')

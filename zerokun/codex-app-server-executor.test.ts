@@ -3178,7 +3178,7 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 30_000)
 
-  test.each(['none', 'late', 'interjection-answer', 'interjection-update', 'cancel'] as const)('未完了advisorへ終端要求を送りcleanup後に回答・追加質問・取消を処理する: %s', async scenario => {
+  test.each(['none', 'late', 'interjection-answer', 'interjection-update', 'cancel'] as const)('稼働中advisorを親turn終了で停止せず回答・追加質問・取消を処理する: %s', async scenario => {
     const interjection = !['none', 'cancel'].includes(scenario)
     const mode = scenario === 'none' || scenario === 'late' || scenario === 'cancel' ? 'interjection-late-answer' : scenario
     const value = fixture(mode, true)
@@ -3188,6 +3188,7 @@ describe('production App Server executor', () => {
     let finishObserved = false
     let released = false
     let inputOpenAtRelease = false
+    let stopRequestedBeforeResponse = false
     let finishedAfterRelease = false
     let inputTimer: ReturnType<typeof setTimeout> | undefined
     let stagedInterjection = mode !== 'interjection-late-answer'
@@ -3220,7 +3221,7 @@ describe('production App Server executor', () => {
       const earliestRelease = Date.now() + 750
       releaseTimer = setInterval(() => {
         if (Date.now() < earliestRelease) return
-        if (scenario !== 'cancel' && !existsSync(`${lock}.stop`)) return
+        stopRequestedBeforeResponse ||= existsSync(`${lock}.stop`)
         clearInterval(releaseTimer)
         inputOpenAtRelease = value.store.liveControlTarget(value.job.chatId, value.job.threadTs) !== null
         if (scenario === 'cancel') {
@@ -3257,6 +3258,7 @@ describe('production App Server executor', () => {
       const result = await execution
       expect(result.result).toBe(scenario === 'interjection-update' ? '追加条件を反映して完了しました'
         : scenario === 'interjection-answer' ? '元の作業を完了しました' : '通常完了')
+      expect(stopRequestedBeforeResponse).toBe(false)
       expect(finishedAfterRelease).toBe(true)
       expect(inputOpenAtRelease).toBe(true)
       expect(stagedInterjection).toBe(interjection)

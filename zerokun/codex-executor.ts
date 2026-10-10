@@ -2274,7 +2274,11 @@ function collectNativeAdvisorJournalEvidence(options: {
       continue
     }
     const revisionMatch = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/.exec(revisionEntry.name)
-    if (!revisionMatch || !revisionEntry.isDirectory() || revisionEntry.isSymbolicLink()) {
+    // Lifecycle sidecars (including a retained stop request) are not round
+    // evidence. Select revision directories without opening unrelated entries;
+    // their presence must not erase independently obtained native answers.
+    if (!revisionMatch) continue
+    if (!revisionEntry.isDirectory() || revisionEntry.isSymbolicLink()) {
       throw new Error(`advisor journal contains an unsafe attempt entry: ${revisionEntry.name}`)
     }
     const inputRevision = Number(revisionMatch[1])
@@ -7628,13 +7632,11 @@ export async function executeCodexJob(
       }
     }
     let advisorSettlementDeadline: number | undefined
-    let stopExternalAdvisors = false
     const drainExternalAdvisors = async (): Promise<void> => {
       if (stage !== 'complete') return
       advisorSettlementDeadline ??= Date.now() + ADVISOR_SETTLEMENT_TIMEOUT_MS
       await bestEffortAdvisorVerification('before-executor-retirement', async () => {
         const settlement = await waitForAdvisorSettlement({
-          requestStop: stopExternalAdvisors,
           timeoutMs: Math.max(0, advisorSettlementDeadline! - Date.now()),
           stateDir: managedStateDir, jobId: job.id,
           attemptNonce: advisorAttempt.attemptNonce,
@@ -9091,9 +9093,9 @@ export async function executeCodexJob(
             }
             // Keep accepted input open until owned advisor cleanup settles.
             if (terminal.turn.status === 'completed') {
-              // The answer is complete. Settle unfinished external slots through
-              // their owned cleanup instead of holding replies and follow-ups forever.
-              stopExternalAdvisors = true
+              // Parent completion is not reviewer completion. Keep the same
+              // owned round alive until its answer and cleanup settle. The
+              // bounded drain still yields to explicit user cancellation.
               await drainExternalAdvisors()
             }
             let barrier = controls.finishTurn({
