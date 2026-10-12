@@ -6,7 +6,7 @@ import { checkAuditInterrupted } from './security-audit-tools.ts'
 /** Queue acknowledgement alone is insufficient: scanning waits for the Slack delivery receipt. */
 export async function deliverAuditMilestone(
   job: Pick<JobRecord, 'id' | 'attempts'>,
-  phase: 'checking' | 'ready',
+  phase: 'initializing' | 'checking' | 'ready',
   text: string,
   context: Pick<JobExecutionContext, 'reportCommentary'>,
   delivered: (sourceKey: string) => boolean,
