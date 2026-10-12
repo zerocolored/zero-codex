@@ -207,6 +207,23 @@ export function readProjectChannelConfig(repoPathInput: string): ProjectChannelC
   return config
 }
 
+/** Binding an unrouted stopped App must remain possible so its normal updater
+ * can select a project. Publishing routes requires a compatible pinned runtime,
+ * including when another project or the watchdog starts that App later. */
+function assertReconnectGatewayCompatible(config: ProjectChannelConfig, appId: string, stateDir: string, checkPinnedRuntime = true): void {
+  if (config.slackAppId !== null && config.slackAcceptAfter === undefined) return
+  if (checkPinnedRuntime && !existsSync(join(runtimeRootForState(stateDir, dirname(import.meta.dir)), 'zerokun', 'slack-project-admission.ts'))) {
+    throw new Error(`Slackアプリ ${appId} の実行版は再接続の受付時刻に未対応です。このプロジェクトで zerochan update を実行してください（設定は変更していません）`)
+  }
+  const gateway = inspectProcessLock(join(stateDir, 'plugin.lock'), /server\.ts(?:\s|$)/)
+  const ready = readGatewayReadiness(join(stateDir, 'gateway-ready.json'))
+  if (gateway.status === 'unknown'
+    || (gateway.status === 'active' && (ready?.pid !== gateway.pid
+      || ready.slackAppId !== appId || ready.projectDisconnectVersion !== 1))) {
+    throw new Error(`Slackアプリ ${appId} の稼働中gatewayは再接続の受付時刻に未対応です。zerochan update で更新してください（設定は変更していません）`)
+  }
+}
+
 function withProjectConfigLock<T>(repoPath: string, action: () => T): T {
   ensureLocalConfigDirectory(repoPath)
   const path = join(configDirectory(repoPath), 'config.lock')
@@ -333,6 +350,10 @@ export function switchProjectSlackApp(
       const saveConfig = (config: ProjectChannelConfig) => atomicWritePrivateFile(projectChannelConfigPath(repoPath), JSON.stringify(config, null, 2) + '\n')
       const saveJournal = (journal: AppSwitchJournal) => atomicWritePrivateFile(journalFile, JSON.stringify(journal) + '\n')
       const apply = (journal: AppSwitchJournal) => {
+        if (journal.direction === 'forward') {
+          const target = apps.find(app => app.appId === journal.targetAppId)!
+          assertReconnectGatewayCompatible(journal.before, target.appId, target.stateDir, journal.before.slackChannels.length > 0)
+        }
         // Check every destination before removing any route.
         for (const route of journal.routes) {
           const channels = journal.direction === 'rollback' ? route.channels
@@ -396,6 +417,7 @@ export function switchProjectSlackApp(
       if (before.slackAppId === targetAppId && routes.every(route => JSON.stringify(route.channels) === JSON.stringify(route.appId === targetAppId ? before.slackChannels : []))) return
       stores.get(apps.find(app => app.appId === targetAppId)!.stateDir)!
         .assertSlackChannelRoutesAvailable(targetAppId, repoPath, before.slackChannels)
+      assertReconnectGatewayCompatible(before, targetAppId, apps.find(app => app.appId === targetAppId)!.stateDir, before.slackChannels.length > 0)
       const journal: AppSwitchJournal = { version: 1, direction: 'forward', before, targetAppId, routes }
       saveJournal(journal)
       try { apply(journal) }
@@ -621,7 +643,9 @@ function recoverJournal(stateDir: string, store: JobStore): void {
   const repoPath = realpathSync(journal.repoPath)
   if (repoPath !== journal.repoPath) throw new Error('channel route journal project moved')
   assertProjectSlackAppAttached(repoPath)
-  const binding = readProjectChannelConfig(repoPath).slackAppId
+  const config = readProjectChannelConfig(repoPath)
+  const binding = config.slackAppId
+  assertReconnectGatewayCompatible(config, journal.appId, stateDir)
   if (binding && binding !== journal.appId) throw new Error('保存されたチャンネル設定とSlackアプリが一致しません')
   store.assertSlackChannelRoutesAvailable(journal.appId, repoPath, journal.afterChannels)
   if (journal.operation === 'sync') {
@@ -666,6 +690,7 @@ export function mutateProjectChannelConfig(input: {
   const lockPath = mutationLockPath(stateDir)
   let store: JobStore | undefined
   try {
+    assertReconnectGatewayCompatible(readProjectChannelConfig(repoPath), appId, stateDir)
     store = new JobStore(resolveZeroJobDatabasePath(stateDir))
     assertUpdateIdle(stateDir)
     assertProjectSlackAppAttached(repoPath)
