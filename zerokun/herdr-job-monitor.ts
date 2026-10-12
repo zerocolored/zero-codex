@@ -2239,6 +2239,8 @@ export async function reconcileHerdrJobMonitors(input: {
     status: JobStatus | 'missing',
     state: 'preparing' | 'required' | 'lost-staged',
   ) => 'terminalized' | 'unarmed' | 'staged-result'
+  /** Durable queued initialization wait; never inferred from monitor files. */
+  isAuditSetupParked?: (jobId: string) => boolean
   onMonitorRetired?: (jobId: string) => Promise<void> | void
   publicFailureReason?: (jobId: string) => string
   progressGraceMs?: number
@@ -2298,12 +2300,15 @@ export async function reconcileHerdrJobMonitors(input: {
     }
     return disposition
   }
-  const recoverAbsentForServiceStop = async (
+  const recoverAbsentParkedOrStoppedMonitor = async (
     jobId: string,
     status: JobStatus | 'missing',
     state: 'preparing' | 'required' | 'lost-staged',
   ): Promise<boolean> => {
-    if (!input.closeForServiceStop || !input.recoverMissingBindingAfterExecutorsStopped) {
+    const parkedAudit = status === 'queued' && state === 'required'
+      && input.isAuditSetupParked?.(jobId) === true
+    if ((!input.closeForServiceStop && !parkedAudit)
+      || !input.recoverMissingBindingAfterExecutorsStopped) {
       return false
     }
     if (state !== 'preparing') {
@@ -2324,7 +2329,7 @@ export async function reconcileHerdrJobMonitors(input: {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       const retainedJobIds: string[] = []
       for (const [jobId, obligation] of obligations()) {
-        if (await recoverAbsentForServiceStop(
+        if (await recoverAbsentParkedOrStoppedMonitor(
           jobId, obligation.status, obligation.state,
         )) continue
         if (obligation.state === 'lost-staged') {
@@ -2351,7 +2356,7 @@ export async function reconcileHerdrJobMonitors(input: {
   const nameSet = new Set(names)
   for (const [jobId, obligation] of obligations()) {
     if (nameSet.has(jobId)) continue
-    if (await recoverAbsentForServiceStop(
+    if (await recoverAbsentParkedOrStoppedMonitor(
       jobId, obligation.status, obligation.state,
     )) continue
     if (obligation.state === 'lost-staged') {
@@ -2504,7 +2509,7 @@ export async function reconcileHerdrJobMonitors(input: {
             jobId: name,
             outcome: status === 'failed'
               ? 'failed'
-              : job?.uiApprovalRequestId ? 'waiting' : 'completed',
+              : (job?.uiApprovalRequestId || input.isAuditSetupParked?.(name)) ? 'waiting' : 'completed',
             onMonitorRetired: input.onMonitorRetired,
             control,
           })
@@ -2561,7 +2566,7 @@ export async function reconcileHerdrJobMonitors(input: {
       closed += 1
       continue
     }
-    if (status === 'queued' && job?.uiApprovalRequestId) {
+    if (status === 'queued' && (job?.uiApprovalRequestId || input.isAuditSetupParked?.(name))) {
       await closeHerdrJobMonitor({
         stateDir,
         runtime: input.runtime,

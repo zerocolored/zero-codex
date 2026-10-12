@@ -1,3 +1,4 @@
+import { deliverAuditMilestone } from './security-audit-progress.ts'
 import { normalizeSlackInboundText } from './live-control.ts'
 import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'fs'
@@ -145,9 +146,12 @@ test('cancel during parking or waiting wins over replies and can be claimed with
 test('runner parks initialization without terminal failure, then continues the same job after answer', async () => {
   const {state,repo}=fixture();const {store,job}=queued(state,repo)
   const phases: string[]=[]
-  const run=()=>runQueuedJobs({store,stopWhenIdle:true,pollMs:1,notifier:{status:async()=>{},started:async()=>{}},executor:async current=>{
-    const settings=await initializeAudit(current,state,store.listJobControls(current.id).map(c=>({text:c.task,writeEnabled:c.writeEnabled,revision:c.inputRevision})),{organizations:orgs})
+  const run=()=>runQueuedJobs({store,stopWhenIdle:true,pollMs:1,notifier:{status:async()=>{},started:async()=>{},progress:async()=>{}},executor:async (current,signal,context)=>{
+    const answers=store.takeAuditSetupAnswers(current)
+    await deliverAuditMilestone(current,'initializing','Checking tools',context!,key=>store.commentarySourceDelivered(current.id,key),{signal},1_500)
+    const settings=await initializeAudit(current,state,answers,{organizations:orgs})
     store.finishAuditSetup(current.id,current.inputRevision)
+    for(const phase of ['checking','ready'] as const) await deliverAuditMilestone(current,phase,phase,context!,key=>store.commentarySourceDelivered(current.id,key),{signal},1_500)
     expect(settings.targetUrl).toBe('https://example.test/app');phases.push('scan')
     return {sessionId:'fixture',result:'done'}
   }})
@@ -158,6 +162,7 @@ test('runner parks initialization without terminal failure, then continues the s
     expect(store.stageThreadReply(target,liveAnswer())).toBe('staged')
     const second=await run();expect(second.completed).toBe(1);expect(phases).toEqual(['scan'])
     expect(store.get(job.id)?.status).toBe('completed')
+    expect(store.listJobControls(job.id)[0]?.status).toBe('observed')
   } finally {store.close()}
 })
 
@@ -181,3 +186,19 @@ for (const link of ['<https://example.test/app>', '<https://example.test/app|htt
     } finally {store.close()}
   })
 }
+
+test('host audit answer acceptance is bound to the current revision and cancellation',()=>{
+  const {state,repo}=fixture();const {store,job}=queued(state,repo)
+  try {
+    store.claimNext('first');store.parkAuditSetup(job.id,'setup question',1);deliverQuestion(store)
+    store.stageThreadReply(store.liveControlTarget('C1','1.1')!,liveAnswer())
+    const resumed=store.claimNext('resumed')!
+    expect(()=>store.takeAuditSetupAnswers({...resumed,inputRevision:1})).toThrow('input changed')
+    expect(store.listJobControls(job.id)[0]?.status).toBe('ready')
+    expect(store.takeAuditSetupAnswers(resumed)).toEqual([{text:answer,writeEnabled:true,revision:2}])
+    expect(store.takeAuditSetupAnswers(resumed)).toHaveLength(1)
+    expect(store.listJobControls(job.id)[0]).toMatchObject({status:'observed',requestId:null,executorNonce:null})
+    store.stageLiveControl(store.liveControlTarget('C1','1.1')!,{...liveAnswer({messageId:'1.3'}),kind:'interrupt'})
+    expect(()=>store.takeAuditSetupAnswers(resumed)).toThrow()
+  } finally {store.close()}
+})

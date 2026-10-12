@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createHash } from 'crypto'
-import type { JobRecord } from './job-runner.ts'
+import { JobStore, type JobRecord } from './job-runner.ts'
 import type { HerdrRuntimeIdentity } from './herdr-runtime.ts'
 import {
   appendHerdrJobMonitorChunk,
@@ -2217,4 +2217,96 @@ describe('Herdr job monitor', () => {
     },
     15_000,
   )
+})
+
+function auditMonitorFixture() {
+  const state = fixtureDirectory()
+  const store = new JobStore(join(state, 'jobs.sqlite'))
+  const record = store.enqueue({chatId:'C1', threadTs:'1.1', messageId:'1.1',
+    userId:'U1', repoPath:state, task:'audit', workflow:'security-audit'}).job
+  store.claimNext('worker')
+  store.beginMonitorPreparation(record.id, 'worker')
+  return {state, store, record, control:new FakeControl()}
+}
+
+for (const reply of [false, true]) test(`audit park closes monitor obligation before same-job resume (reply=${reply})`, async () => {
+  const {state, store, record, control} = auditMonitorFixture()
+  try {
+    await openHerdrJobMonitor({stateDir:state, runtime:runtime(), job:store.get(record.id)!, control,
+      beforeFirstHerdrMutation:()=>store.commitMonitorRequired(record.id,'worker')})
+    store.parkAuditSetup(record.id,'question',1)
+    if(reply) store.stageThreadReply(store.liveControlTarget('C1','1.1')!, {
+      chatId:'C1',threadTs:'1.1',messageId:'1.2',userId:'U1',task:'URL: https://example.test/',writeEnabled:true})
+    await closeHerdrJobMonitor({stateDir:state,runtime:runtime(),jobId:record.id,outcome:'waiting',control,
+      onMonitorRetired:id=>store.retireMonitorObligation(id)})
+    expect(store.get(record.id)?.status).toBe('queued')
+    expect(store.get(record.id)?.monitorState).toBe('none')
+    expect(store.monitorObligations()).toEqual([])
+    expect(existsSync(join(state,'job-monitors',record.id))).toBe(false)
+    for(const n of store.pendingStatusNotifications()) store.markStatusNotificationDelivered(n.id)
+    if(reply) {
+      expect(store.claimNext('next')?.id).toBe(record.id)
+      store.beginMonitorPreparation(record.id,'next')
+      await openHerdrJobMonitor({stateDir:state,runtime:runtime(),job:store.get(record.id)!,control:new FakeControl(),
+        beforeFirstHerdrMutation:()=>store.commitMonitorRequired(record.id,'next')})
+      expect(store.get(record.id)?.monitorState).toBe('required')
+    }
+  } finally {store.close()}
+})
+
+for (const shape of ['missing-root','missing-directory','active'] as const) {
+  test(`startup preserves parked audit and retires its monitor: ${shape}`, async () => {
+    const {state,store,record,control}=auditMonitorFixture()
+    try {
+      if(shape==='active') await openHerdrJobMonitor({stateDir:state,runtime:runtime(),job:store.get(record.id)!,control,
+        beforeFirstHerdrMutation:()=>store.commitMonitorRequired(record.id,'worker')})
+      else {
+        store.commitMonitorRequired(record.id,'worker')
+        if(shape==='missing-directory') mkdirSync(join(state,'job-monitors'),{mode:0o700})
+      }
+      store.parkAuditSetup(record.id,'question',1)
+      const result=await reconcileHerdrJobMonitors({stateDir:state,runtime:runtime(),control,
+        getJob:id=>store.get(id),listMonitorObligations:()=>store.monitorObligations(),
+        isAuditSetupParked:id=>store.auditSetupIsParked(id),
+        recoverMissingBindingAfterExecutorsStopped:id=>{store.retireMonitorObligation(id);return 'unarmed'},
+        onMonitorRetired:id=>store.retireMonitorObligation(id)})
+      expect(result.retained).toBe(0)
+      expect(store.get(record.id)).toMatchObject({status:'queued',monitorState:'none',inputRevision:1})
+      expect(store.auditSetupIsParked(record.id)).toBe(true)
+      expect(store.pendingStatusNotifications().some(n=>n.payload==='question')).toBe(true)
+      store.enqueue({chatId:'C1',threadTs:'2.1',messageId:'2.1',userId:'U1',repoPath:state,task:'next'})
+      expect(store.claimNext('other')?.id).not.toBe(record.id)
+    } finally {store.close()}
+  })
+}
+
+test('audit missing-monitor recovery refuses a possible surviving binding',async()=>{
+  const {state,store,record,control}=auditMonitorFixture()
+  try {
+    store.commitMonitorRequired(record.id,'worker');store.parkAuditSetup(record.id,'question',1)
+    control.tabs.push({tabId:'foreign:t1',workspaceId:'foreign',label:monitorTabLabel(state,record.seq),paneCount:1})
+    await expect(reconcileHerdrJobMonitors({stateDir:state,runtime:runtime(),control,
+      getJob:id=>store.get(id),listMonitorObligations:()=>store.monitorObligations(),
+      isAuditSetupParked:id=>store.auditSetupIsParked(id),
+      recoverMissingBindingAfterExecutorsStopped:id=>{store.retireMonitorObligation(id);return 'unarmed'},
+    })).rejects.toThrow()
+    expect(store.get(record.id)?.monitorState).toBe('required')
+    expect(control.closeCalls).toBe(0)
+  } finally {store.close()}
+})
+
+test('audit monitor retirement preserves cancellation and rejects ordinary active jobs',()=>{
+  const {store,record}=auditMonitorFixture()
+  try {
+    store.commitMonitorRequired(record.id,'worker')
+    store.retireMonitorObligation(record.id)
+    expect(store.get(record.id)?.monitorState).toBe('required')
+    store.parkAuditSetup(record.id,'question',1)
+    store.stageLiveControl(store.liveControlTarget('C1','1.1')!,{chatId:'C1',threadTs:'1.1',messageId:'1.2',
+      userId:'U1',task:'cancel',writeEnabled:true,kind:'interrupt'})
+    expect(store.auditSetupIsParked(record.id)).toBe(true)
+    store.retireMonitorObligation(record.id)
+    expect(store.get(record.id)?.monitorState).toBe('none')
+    expect(store.claimNext('cancel')?.cancelRequestedAt).not.toBeNull()
+  } finally {store.close()}
 })
