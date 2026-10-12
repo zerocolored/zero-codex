@@ -207,7 +207,7 @@ test('Playwright discovery supports workspaces without following unrelated check
       writeFileSync(join(repo, dir, 'playwright.config.ts'), 'export default {}')
     }
     symlinkSync(join(repo, 'packages'), join(repo, 'linked-packages'))
-    expect(auditPlaywrightConfigs(repo)).toEqual(['packages/web/playwright.config.ts'])
+    expect(auditPlaywrightConfigs(repo)).toEqual([])
     writeFileSync(join(repo, 'playwright.config.mjs'), 'export default {}')
     expect(auditPlaywrightConfigs(repo)).toEqual(['playwright.config.mjs'])
   } finally { store.close() }

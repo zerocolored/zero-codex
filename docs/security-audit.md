@@ -6,7 +6,7 @@
 
 ## 実行前の利用可能チェック
 
-本検査の前に、毎回次の順序で確認します。
+本検査の前に、毎回次の順序で確認します。未設定の場合は下記の自動初期化で質問・回答保存を行ってから実行チェックへ進みます。
 
 1. 「セキュリティ12工程が利用可能かどうかを調べています」とSlackへ投稿し、配信を確認します。
 2. 12工程すべてについて設定・認証・必要な依存を調べ、ホストが用意した小さなサンプルを実行します。CodexのJSON回答、Chrome/PlaywrightのHello World、依存監査、Semgrep Codeの既知のファイル間検出、Gitleaksの既知の疑似秘密、Socketのscan作成・report取得、ZAPのコンテナ内ローカルサイト検査、レポートの生成・保存・再読込を含みます。
@@ -32,25 +32,42 @@
 
 専用ツール領域へ不足する CLI を導入します。Semgrep Codeの認証とProエンジン、Socketの権限・利用枠、Dockerの稼働、Chromeの認証状態を実行で確認します。Semgrep CEへの自動切替は行いません。全言語・全ルールの無条件実行を保証するものではなく、CodeQLと完全に同じ検出範囲でもありません。既存E2E設定がない場合も明示し、検査のために製品側のテストやソースを自動作成・修正しません。
 
-## 対象プロジェクトの初回設定
+## 初回の自動初期化
 
-対象フォルダで実行します。設定はその PC の選択中 Slack アプリの state と対象プロジェクトに保存されます。
+初回の検査依頼でZeroちゃんが共通接続と対象repositoryを確認します。Socket組織は登録済みキーからAPIで取得し、候補が一つならそのSlackアプリ共通の設定として再利用します。複数なら同じスレッドで選択を確認します。キーを変更した場合は以前の共通組織を流用しません。明示したプロジェクト単位の組織設定は上書きしません。
+
+対象URLと認証範囲が未設定なら、その不足分だけを同じSlackスレッドで尋ねます。例えば次のように返信します。
+
+```text
+URL: https://example.com/app
+認証: 公開・未ログイン範囲
+```
+
+ログイン領域も検査する場合は次の形です。
+
+```text
+認証: ログイン後も含む
+確認パス: /app/account
+確認文言: ログアウト
+```
+
+設定変更権限を持つ送信者の明示的な回答を保存し、**同じ依頼から自動再開**します。再度「セキュリティチェックして」と依頼する必要はありません。回答待ちは永続化してworker枠を解放し、別スレッドの依頼を進めます。中止、重複返信、gateway/runner再起動も同じjobに結び付けます。検査開始時に設定を固定し、他の依頼で設定が変わっても実行中の対象へ混ぜません。
+
+E2Eの入口と静的に特定できるlocalhost portはソースから取得します。URL・認証不要の判断はソースやモデルの推測から許可しません。未対応のE2E形式・不足するテストは明示し、別サービスやHello Worldの成功を本プロジェクトの検査成功として扱いません。
+
+認証情報の登録はアプリ共通で一度だけ必要です。本人のサービス認証・権限復旧が必要な場合はその操作を案内し、キーをSlackに投稿させません。非表示入力の補助コマンドと設定確認は次のとおりです（通常のrepository初期化では手入力の設定コマンドは不要）。
 
 ```sh
-zerochan security target https://example.com/app
-zerochan security auth required
-zerochan security auth-probe /app/account 'ログイン後だけに存在する文字列'
-zerochan security e2e-port 3000
-zerochan security socket-org YOUR_ORG
 zerochan security socket-token
-zerochan security semgrep-repo OWNER/REPO
 zerochan security semgrep-token
 zerochan security status
 ```
 
+管理者用の `target URL`、`auth required|none`、`auth-probe PATH TEXT`、`e2e-port PORT`、`socket-org ORG`、`semgrep-repo OWNER/REPO` も残しています。
+
 `socket-token`と`semgrep-token`は端末で非表示入力します。トークンをコマンド引数、ソース、レポートへ書かないでください。`semgrep-repo`はSemgrepの対象リポジトリ名です。未設定ならGitのoriginから取得します。Semgrep CodeでCode policyが利用できるアカウントの認証情報が必要です。CLIは`scan --config policy --pro`でローカル解析し、検出結果・ソース断片をアップロードする`semgrep ci`は使いません。ポリシー取得とProエンジン取得にはSemgrepへの通信が発生します。CodeQLは新規検査では実行せず、GitHub Code Securityの契約設定も要求しません。
 
-ZAP は既定では passive baseline です。権限のある対象へ active scan を行う場合は `zerochan security active on` と設定します。対象 URL を変更すると active 設定は解除されます。イメージは `zerochan security image IMAGE` で追加します。隔離Trivyはレジストリから取得できるイメージを対象とし、ホストDockerにしか存在しないイメージは事前チェックで停止します。ホストのレジストリ認証情報は流用しません。URL はホスト側のプロジェクト設定だけを使用します。Slack 本文や添付に含まれる URL で検査先を変更しません。
+ZAP は既定では passive baseline です。権限のある対象へ active scan を行う場合は `zerochan security active on` と設定します。対象 URL を変更すると active 設定は解除されます。イメージは `zerochan security image IMAGE` で追加します。隔離Trivyはレジストリから取得できるイメージを対象とし、ホストDockerにしか存在しないイメージは事前チェックで停止します。ホストのレジストリ認証情報は流用しません。URLはホスト側に保存した設定を使用します。初期化の明示的なURL回答だけを設定に反映し、通常の本文・添付・repository中のURLは検査先にしません。
 
 Chrome の対象 URL 用 cookie をホストが取得し、ホスト管理の認証確認処理と ZAP へメモリ内で渡します。LLM、プロジェクトの設定ファイルや既存 E2E コードへは渡しません。専用 Chrome 確認は設定された認証ページへの GET のみで、他 origin・WebSocket・GET/HEAD 以外のリクエストを遮断します。認証確認用ページで指定した文字列を含む応答が確認できなければ、認証領域を検査済みと表示しません。ZAP は自身の HTTP sender 経由の応答で認証を確認し、ホストからの確認だけで成功にしません。cookie 以外の独自認証、MFA、期限切れ、全ページの認証維持は自動的に成功したものと扱いません。
 
@@ -65,11 +82,11 @@ Chrome の対象 URL 用 cookie をホストが取得し、ホスト管理の認
 - Slack 添付は既存の成果物配信 checkpoint を使います。再配信で検査自体を再実行しません。利用可能チェックで停止した結果も内容のハッシュを確認して再配信し、過去の本検査レポートへの修正依頼を妨げません。
 - コードレビューは全対象ファイルの分割評価です。ファイルをまたぐ意味解析の完全性を保証しません。
 - コードレビューには監査専用の回答上限（1 MB）と10分の実行枠を使います。生成コードの長い1行も、指示・ファイル一覧・JSONエスケープを含む入力全体が100 KB以内になるよう追加分割し、元の分割の開始行と文字位置を保持します。失敗した分割評価だけを最大1回再試行し、ファイル・開始行・秘匿化済みの失敗理由を残します。通常のスレッド判定の上限は変更しません。
-- pnpmの監査とE2E依存導入は`packageManager`の指定版を専用ツール領域へ導入して使います。E2Eは`--frozen-lockfile`で導入し、install scriptとpnpmfile hookを実行しません。Playwright設定はroot設定を優先し、rootにない場合は配下の単一設定も検出します。複数の独立した設定や、`@playwright/test`設定を持たない独自runnerには、プロジェクト側で検査用の入口を用意する必要があります。
+- pnpmの監査とE2E依存導入は`packageManager`の指定版を専用ツール領域へ導入して使います。E2Eは`--frozen-lockfile`で導入し、install scriptとpnpmfile hookを実行しません。ルートの `test:e2e` / `e2e` が明示するPlaywright設定または単一のルート設定を選びます。配下に一つあるだけの設定は別サービスの可能性があるため選びません。ルートscriptが選ぶ `node entry.cjs` と `pnpm -C DIR exec node ENTRY` 等にも対応し、そのworkspaceのPlaywrightでHello Worldを確認します。任意のshell commandは実行入口にしません。独自Node runnerの本検査は終了コードと完了件数（`N checks passed` またはTAP）を確認します。
 - Semgrepの部分解析エラーは種類と対象ファイルを記録し、取得済みの指摘を保持します。Gitleaksの証拠ハッシュは、stdoutではなく実際に解析したJSONを対象にします。
 - macOSの検査隔離では、Javaのパス解決に必要な親ディレクトリ自身の読み取りを許可します。配下の秘密ファイルは許可せず、JVMのhome・一時領域は工程専用領域に固定します。
 - ZAPは選択中のローカルDockerへ接続します。ホストのDocker認証設定は渡しません。URLにパスを指定した場合は、そのパスを巡回の開始点として維持します。
-- E2E は既存設定を工程専用の隔離領域で実行し、`channel: chrome` を指定します。macOS では `e2e-port` で指定した localhost のテスト環境だけへの通信を許可し、実認証は渡しません。Linux の bubblewrap ではネットワークを分離するため、このローカル接続経路は未対応として記録します。スキップ、認証未確認、設定不足を明示します。
+- E2E は既存設定を工程専用の隔離領域で実行し、`channel: chrome` を指定します。macOS では `e2e-port` で指定した localhost のテスト環境だけへの通信を許可し、実認証は渡しません。独自Node runnerも同じ隔離で実行し、ホストのDocker socketは渡しません。動的portやDockerを必要とする独自runnerは、その条件を隔離内で満たせなければ検査不能として記録します。Linux の bubblewrap ではネットワークを分離するため、このローカル接続経路は未対応として記録します。スキップ、認証未確認、設定不足を明示します。
 
 中止を依頼した場合は進行中の子プロセスを終了し、通常の中止通知を返します。途中までの工程記録は保存されますが、全工程の最終レポートとしては配信しません。
 
