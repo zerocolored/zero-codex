@@ -168,13 +168,31 @@ if [ "$LAUNCH_MODE" = "update" ]; then
     "$REPO_DIR/zerokun/update.ts"
 fi
 
-# Resolve once to a physical release. Children keep this version even while a
-# different app activates a newer one. Preserve the command basename on dispatch.
-PINNED_REPO="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR")" || exit 1
-if [ "$PINNED_REPO" != "$REPO_DIR" ]; then
-  PINNED_COMMAND="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR" "$INVOKED_AS")" || exit 1
-  exec /bin/bash "$PINNED_COMMAND" "$@"
-fi
+# Project configuration is owned by the installed CLI, just like set/unset
+# slack-app. An App's older runtime must not parse configuration written by a
+# newer management command. Only service execution follows the App's pin.
+case "$LAUNCH_MODE" in
+  set-channel|unset-channel|status) ;;
+  *)
+    PINNED_REPO="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR")" || exit 1
+    if [ "$PINNED_REPO" != "$REPO_DIR" ]; then
+      case "$LAUNCH_MODE" in
+        start|managed-start|restart)
+          bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" \
+            check-runtime "$PROJECT" "$PINNED_REPO" || exit 1
+          ;;
+      esac
+      PINNED_COMMAND="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR" "$INVOKED_AS")" || exit 1
+      # Older stop/restart launchers resolve the App from cwd before their
+      # mode-specific dispatch. The current CLI already selected STATE_DIR;
+      # avoid asking their old config reader to parse the invoking project.
+      case "$LAUNCH_MODE" in
+        managed-stop|managed-force-stop|restart) cd "$STATE_DIR" ;;
+      esac
+      exec /bin/bash "$PINNED_COMMAND" "$@"
+    fi
+    ;;
+esac
 
 # stop is global to this installed Slack App and intentionally does not select,
 # sync, or mutate a project route. The service controller still verifies the

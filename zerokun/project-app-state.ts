@@ -1,3 +1,5 @@
+import { existsSync } from 'fs'
+import { join } from 'path'
 import { homedir } from 'os'
 import { assertProjectSlackAppAttached, readProjectChannelConfig } from './project-channel-config.ts'
 import { readRegisteredSlackApp } from './slack-app-registry.ts'
@@ -13,9 +15,23 @@ export function resolveProjectAppState(project: string, fallbackState: string, h
   return app.stateDir
 }
 
+/** A pre-disconnect runtime cannot honor the reconnect intake boundary. Keep
+ * its service pin intact and use the normal updater before starting it. */
+export function assertProjectRuntimeCompatible(project: string, runtimeRoot: string): void {
+  const config = readProjectChannelConfig(project)
+  if (config.slackAcceptAfter !== undefined
+    && !existsSync(join(runtimeRoot, 'zerokun', 'slack-project-admission.ts'))) {
+    throw new Error('このアプリの実行版はSlackアプリの再接続に未対応です。このプロジェクトで zerochan update を実行してから、もう一度起動してください（設定は保持しています）')
+  }
+}
+
 if (import.meta.main) {
   try {
     const [project, fallbackState, ...extra] = process.argv.slice(2)
+    if (project === 'check-runtime' && fallbackState && extra.length === 1) {
+      assertProjectRuntimeCompatible(fallbackState, extra[0]!)
+      process.exit(0)
+    }
     if (!project || !fallbackState || extra.length) throw new Error('usage: project-app-state.ts <project> <fallback-state>')
     process.stdout.write((project === 'cutover' ? legacyCutoverForState(fallbackState) : resolveProjectAppState(project, fallbackState)) + '\n')
   } catch (error) {

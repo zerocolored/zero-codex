@@ -12084,9 +12084,9 @@ process.exit(0)
     },
   )
 
-  test.skipIf(process.platform === 'win32')(
-    'Codexが即時detachしてstdoutを保持したら公開せずcleanup pendingにする',
-    async () => {
+  test.skipIf(process.platform === 'win32').each([0, 350])(
+    'Codexがdetachしてstdoutを保持する場合は回収証明後だけ完了する (exit delay=%s)',
+    async exitDelayMs => {
       const dir = fixtureDir()
       const repo = join(dir, 'repo')
       const fakeCodex = join(dir, 'fake-codex')
@@ -12101,6 +12101,7 @@ const child = Bun.spawn(['/bin/sleep', '30'], {
 })
 child.unref()
 writeFileSync(process.env.CHILD_PID_FILE!, String(child.pid))
+await Bun.sleep(${exitDelayMs})
 writeFileSync(args[args.indexOf('--output-last-message') + 1], 'ok')
 console.log(JSON.stringify({ type: 'thread.started', thread_id: 'instant-detached-thread' }))
 console.log(JSON.stringify({ type: 'turn.started' }))
@@ -12137,16 +12138,24 @@ process.exit(0)
         ).finally(() => { settled = true })
         await waitForTestPath(childPidFile)
         childPid = Number(readFileSync(childPidFile, 'utf8'))
-        // A normal logical completion has no relay deadline. The inherited
-        // descriptor remains open beyond the removed two-second cutoff and
-        // only the explicit runner abort may enter bounded forced cleanup.
+        // Polling may catch even an immediately detached child before its
+        // parent exits. Safe, proven cleanup can then finish normally. If the
+        // descriptor holder escaped that scan, it must outlive the old relay
+        // deadline and only explicit cancellation may force cleanup.
         await Bun.sleep(2_500)
-        expect(settled).toBe(false)
+        const registration = join(dir, 'state/executors', `${job.id}.json`)
+        if (settled) {
+          const outcome = await execution
+          expect(outcome.error).toBeNull()
+          expect(outcome.value?.result).toBe('ok')
+          expect(() => process.kill(childPid, 0)).toThrow()
+          expect(existsSync(registration)).toBe(false)
+          return
+        }
         controller.abort()
         const outcome = await execution
         expect(outcome.value).toBeNull()
         expect(outcome.error).toBeInstanceOf(CodexCleanupPendingError)
-        const registration = join(dir, 'state/executors', `${job.id}.json`)
         expect(JSON.parse(readFileSync(registration, 'utf8')).phase).toBe('active')
         expect(Date.now() - startedAt).toBeLessThan(6_000)
       } finally {
