@@ -3810,18 +3810,28 @@ async function installInstanceRuntime(target: ReleaseTarget, root: string, lease
   chmodSync(join(target.stateDir, 'watchdog.sh'), 0o700)
 }
 
-function publishReleaseCommands(release: RuntimeRelease): void {
-  const bin = join(homedir(), '.local', 'bin')
+export function publishReleaseCommands(release: RuntimeRelease, home = homedir()): void {
+  const bin = join(home, '.local', 'bin')
   mkdirSync(bin, { recursive: true, mode: 0o700 })
-  for (const name of ['zerochan', 'zerokun', 'codex-channel']) {
+  const commands = [
+    ['zerochan', 'codex-channel.sh'],
+    ['zerokun', 'codex-channel.sh'],
+    ['codex-channel', 'codex-channel.sh'],
+    ['zerokun-status', 'zerokun/status.ts'],
+  ] as const
+  // Validate every existing entry before switching any shared command.
+  for (const [name, relative] of commands) {
     const path = join(bin, name)
     try {
       if (!lstatSync(path).isSymbolicLink()) fail(`既存commandを上書きできません: ${name}`)
       const old = realpathSync(path)
-      if (basename(old) !== 'codex-channel.sh') fail(`無関係なcommandを保持しました: ${name}`)
+      if (!old.endsWith(`/${relative}`)) fail(`無関係なcommandを保持しました: ${name}`)
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+  }
+  for (const [name, relative] of commands) {
+    const path = join(bin, name)
     const tmp = `${path}.${randomUUID()}`
-    symlinkSync(join(release.path, 'codex-channel.sh'), tmp)
+    symlinkSync(join(release.path, relative), tmp)
     renameSync(tmp, path)
   }
 }
