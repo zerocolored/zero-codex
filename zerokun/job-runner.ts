@@ -6665,6 +6665,15 @@ export class JobStore {
     ).get(jobId)
   }
 
+  /** The monitor may be retired after parking, including a reply or cancellation
+   * arriving before the close finishes. This is not a live-control permission. */
+  auditSetupIsParked(jobId: string): boolean {
+    return !!this.db.query<{ yes: number }, [string]>(
+      `SELECT 1 AS yes FROM jobs j JOIN audit_setup_waits w ON w.job_id=j.id
+       WHERE j.id=? AND j.workflow='security-audit' AND j.status='queued'`,
+    ).get(jobId)
+  }
+
   parkAuditSetup(jobId: string, prompt: string, inputRevision: number): void {
     retrySqlite(() => this.db.transaction(() => {
       const job=this.get(jobId)
@@ -6680,6 +6689,29 @@ export class JobStore {
         accepts_control=1,executor_nonce=NULL,active_thread_id=NULL,active_turn_id=NULL,
         pending_session_id=NULL,pending_result=NULL,not_before=NULL,finished_at=NULL,last_error=NULL WHERE id=?`,[jobId])
       this.supersedeLifecycleNotifications(jobId,Date.now())
+    }).immediate())
+  }
+
+  takeAuditSetupAnswers(job: Pick<JobRecord, 'id' | 'attempts' | 'controlEpoch' | 'inputRevision'>): Array<{
+    text: string; writeEnabled: boolean; revision: number
+  }> {
+    return retrySqlite(() => this.db.transaction(() => {
+      const current = this.get(job.id)
+      if (current?.cancelRequestedAt != null) throw new CodexUserCancelledError()
+      if (!current || current.workflow !== 'security-audit' || current.status !== 'running'
+        || current.attempts !== job.attempts || current.controlEpoch !== job.controlEpoch
+        || current.inputRevision !== job.inputRevision) {
+        throw new CodexInterruptedError('audit setup input changed before host acceptance')
+      }
+      const answers = this.listJobControls(job.id)
+        .filter(c => c.kind === 'steer' && c.status !== 'superseded' && c.inputRevision <= job.inputRevision)
+        .map(c => ({text:c.task, writeEnabled:c.writeEnabled, revision:c.inputRevision}))
+      // These inputs are consumed by the host initializer, never dispatched to
+      // App Server. Record host observation so they cannot block its start notice.
+      this.db.run(`UPDATE job_controls SET status='observed', observed_at=?
+        WHERE job_id=? AND control_epoch=? AND kind='steer' AND status='ready'
+          AND input_revision<=?`, [Date.now(),job.id,job.controlEpoch,job.inputRevision])
+      return answers
     }).immediate())
   }
 
@@ -10621,7 +10653,10 @@ export class JobStore {
       `UPDATE jobs SET monitor_state = 0
        WHERE id = ? AND runtime IN ('codex', 'claude-code')
          AND (status IN ('completed', 'failed')
-           OR (status = 'queued' AND ui_approval_request_id IS NOT NULL))`,
+           OR (status = 'queued' AND (ui_approval_request_id IS NOT NULL
+             OR (workflow = 'security-audit' AND EXISTS (
+               SELECT 1 FROM audit_setup_waits WHERE job_id = jobs.id
+             )))))`,
       [id],
     ))
   }
@@ -18095,6 +18130,11 @@ async function runCli(): Promise<void> {
           log(`preserved staged result for ${jobId} after proving its Herdr monitor was lost`)
           return 'staged-result'
         }
+        if (status === 'queued' && store.auditSetupIsParked(jobId)) {
+          store.retireMonitorObligation(jobId)
+          log(`retired ${jobId} monitor after entering audit setup wait`)
+          return 'unarmed'
+        }
         if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
           store.retireMonitorObligation(jobId)
           log(`retired ${jobId} monitor after entering UI/UX approval wait`)
@@ -18118,6 +18158,7 @@ async function runCli(): Promise<void> {
             runtime,
             getJob: jobId => store.get(jobId),
             listMonitorObligations: () => store.monitorObligations(),
+            isAuditSetupParked: jobId => store.auditSetupIsParked(jobId),
             recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
             onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
             publicFailureReason: jobId => publicJobFailureSummary(
@@ -18152,6 +18193,7 @@ async function runCli(): Promise<void> {
         runtime,
         getJob: jobId => store.get(jobId),
         listMonitorObligations: () => store.monitorObligations(),
+        isAuditSetupParked: jobId => store.auditSetupIsParked(jobId),
         recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
         onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
         publicFailureReason: jobId => publicJobFailureSummary(
@@ -18283,6 +18325,11 @@ async function runCli(): Promise<void> {
         log(`preserved staged result for ${jobId} after proving its Herdr monitor was lost`)
         return 'staged-result'
       }
+      if (status === 'queued' && store.auditSetupIsParked(jobId)) {
+        store.retireMonitorObligation(jobId)
+        log(`retired ${jobId} monitor after entering audit setup wait`)
+        return 'unarmed'
+      }
       if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
         store.retireMonitorObligation(jobId)
         log(`retired ${jobId} monitor after entering UI/UX approval wait`)
@@ -18306,6 +18353,7 @@ async function runCli(): Promise<void> {
           runtime: pinnedHerdrRuntime,
           getJob: jobId => store.get(jobId),
           listMonitorObligations: () => store.monitorObligations(),
+          isAuditSetupParked: jobId => store.auditSetupIsParked(jobId),
           recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
           onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
           publicFailureReason: jobId => publicJobFailureSummary(
@@ -18349,6 +18397,7 @@ async function runCli(): Promise<void> {
       runtime: pinnedHerdrRuntime,
       getJob: jobId => store.get(jobId),
       listMonitorObligations: () => store.monitorObligations(),
+      isAuditSetupParked: jobId => store.auditSetupIsParked(jobId),
       recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
       onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
       publicFailureReason: jobId => publicJobFailureSummary(
@@ -18605,6 +18654,7 @@ async function runCli(): Promise<void> {
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
           if (job.workflow === 'security-audit') {
+            const answers = store.takeAuditSetupAnswers(job)
             const milestone = async (phase: 'initializing' | 'checking' | 'ready', text: string) => {
               mirrorMonitorMessage(text)
               await deliverAuditMilestone(job, phase, text, executionContext,
@@ -18614,11 +18664,8 @@ async function runCli(): Promise<void> {
                 })
             }
             await milestone('initializing', 'セキュリティ12工程が利用可能かどうかを調べています。共通設定とプロジェクト構成を確認し、初回に不足する検査対象だけをこのスレッドで確認します。')
-            const settings = await initializeAudit(job, dir, [
-              // The original request is not a settings answer and its audit write flag is intentionally false.
-              ...store.listJobControls(job.id).filter(c => c.kind === 'steer' && c.status !== 'superseded')
-                .map(c => ({text: c.task, writeEnabled: c.writeEnabled, revision: c.inputRevision})),
-            ], {signal: executionController.signal, cancelled: () => store.get(job.id)?.cancelRequestedAt != null})
+            // Only durable authorized replies are settings answers, never the original request.
+            const settings = await initializeAudit(job, dir, answers, {signal: executionController.signal, cancelled: () => store.get(job.id)?.cancelRequestedAt != null})
             store.finishAuditSetup(job.id, job.inputRevision)
             const progress = createSecurityAuditProgress(job, executionContext, mirrorMonitorMessage, log)
             let raw: JobExecutionResult
