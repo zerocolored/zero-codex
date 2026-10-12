@@ -1,3 +1,4 @@
+import { loadAuditSettings } from './security-audit-setup.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
   constants,
@@ -105,6 +106,7 @@ const journalSchema = z
   .strict()
 export type AuditJournal = z.infer<typeof journalSchema>
 export type AuditOptions = {
+  settings?: AuditSettings
   stateDir: string
   signal?: AbortSignal
   cancelled?: () => boolean
@@ -121,6 +123,10 @@ export type AuditOptions = {
 export const auditSettingsSchema = z
   .object({
     targetUrl: z.string().url().optional(),
+    e2e: z.discriminatedUnion('kind', [
+      z.object({kind:z.literal('playwright'),entry:z.string().min(1).max(500)}).strict(),
+      z.object({kind:z.literal('node'),entry:z.string().min(1).max(500),cwd:z.string().min(1).max(500)}).strict(),
+    ]).optional(),
     e2ePort: z.number().int().min(1024).max(65535).optional(),
     activeScan: z.boolean().default(false),
     authentication: z.enum(['required', 'none']).optional(),
@@ -742,18 +748,7 @@ export async function executeSecurityAudit(
       await cleanupAuditZap({ ...options, root: join(root, 'stage-11'), source, repo: job.repoPath, jobId: job.id, settings: auditSettingsSchema.parse({}) })
     throw Error('旧13工程の途中記録は保持しました。工程構成が変わったため、新しいセキュリティチェックを依頼してください。旧検査の副作用は再実行しません。')
   }
-  const settingsPath = join(
-    options.stateDir,
-    'security-audit-settings',
-    `${auditProjectKey(job.repoPath)}.json`,
-  )
-  const settingsText = readOptionalBoundedOwnerOnlyRegularFile(
-    settingsPath,
-    30000,
-  )
-  const settings = auditSettingsSchema.parse(
-    settingsText ? JSON.parse(settingsText) : {},
-  )
+  const settings = options.settings ?? loadAuditSettings(options.stateDir, job.repoPath)
   // Network targets come only from host-owned project configuration.
   if (settings.targetUrl) {
     const url = new URL(settings.targetUrl)

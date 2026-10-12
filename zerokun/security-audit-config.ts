@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { loadAuditSettings, saveAuditSettings } from './security-audit-setup.ts'
 import { realpathSync } from 'fs'
 import { join } from 'path'
 import { auditProjectKey, auditSettingsSchema } from './security-audit.ts'
@@ -22,8 +23,7 @@ export async function securityAuditConfig(args: string[]): Promise<void> {
     join(state, 'security-audit-settings'),
   )
   const path = join(root, `${auditProjectKey(project)}.json`)
-  const saved = readOptionalBoundedOwnerOnlyRegularFile(path, 30000)
-  const settings = auditSettingsSchema.parse(saved ? JSON.parse(saved) : {})
+  const settings = loadAuditSettings(state, project)
   if (command === 'status') {
     process.stdout.write(
       JSON.stringify(
@@ -95,10 +95,9 @@ export async function securityAuditConfig(args: string[]): Promise<void> {
     throw Error(
       '使い方: zerochan security status | target URL | active on|off | auth required|none | e2e-port PORT | auth-probe PATH LOGGED_IN_PATTERN | socket-org ORG | socket-token | semgrep-repo OWNER/REPO | semgrep-token | image IMAGE',
     )
-  atomicWritePrivateFile(
-    path,
-    JSON.stringify(auditSettingsSchema.parse(settings)) + '\n',
-  )
+  if (command === 'socket-org') {
+    atomicWritePrivateFile(path, JSON.stringify(auditSettingsSchema.parse(settings)) + '\n')
+  } else saveAuditSettings(state, project, settings)
   process.stdout.write('このプロジェクトの検査設定を保存しました。\n')
 }
 if (import.meta.main)
