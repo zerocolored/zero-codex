@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -19,6 +20,7 @@ import {
   resolveOfficialStandaloneCodex,
   resolveOfficialStandaloneCodexForTesting,
   verifyEncodedOfficialCodexSnapshot,
+  verifyOfficialCodexSnapshotForTesting,
 } from './standalone-codex.ts'
 import { ensureManagedDirectory, prepareManagedStateRoot } from './managed-path.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
@@ -57,6 +59,19 @@ function fixture() {
   symlinkSync(release, current)
   symlinkSync(join(current, 'bin/codex'), logical)
   return { home, target, standalone, release, leaf, current, logical }
+}
+
+function updateFixture(value: ReturnType<typeof fixture>) {
+  const release = join(value.standalone, `releases/0.149.2-${value.target}`)
+  mkdirSync(join(release, 'bin'), { recursive: true, mode: 0o700 })
+  copyFileSync(value.leaf, join(release, 'bin/codex'))
+  const manifest = JSON.parse(readFileSync(join(value.release, 'codex-package.json'), 'utf8'))
+  writeFileSync(join(release, 'codex-package.json'), JSON.stringify({ ...manifest, version: '0.149.2' }), { mode: 0o600 })
+  rmSync(value.current)
+  symlinkSync(release, value.current)
+  rmSync(value.logical)
+  symlinkSync(join(value.current, 'bin/codex'), value.logical)
+  return release
 }
 
 describe('official standalone Codex trust boundary', () => {
@@ -123,6 +138,95 @@ describe('official standalone Codex trust boundary', () => {
     expect(() => verifyEncodedOfficialCodexSnapshot(encodeOfficialCodexSnapshot(tampered)))
       .toThrow('changed after it was verified')
   })
+
+  test.skipIf(process.platform !== 'darwin')('公式更新と同一target link再作成でも実行中の物理releaseを維持する', () => {
+    const value = fixture()
+    const pinned = resolveOfficialStandaloneCodexForTesting(value.home)
+    for (const [path, target] of [[value.logical, join(value.current, 'bin/codex')], [value.current, value.release]]) {
+      rmSync(path!)
+      // A task also survives the installer's interval between unlink and rename.
+      expect(verifyOfficialCodexSnapshotForTesting(pinned, value.home).physical).toBe(value.leaf)
+      symlinkSync(target!, path!)
+    }
+    expect(verifyOfficialCodexSnapshotForTesting(pinned, value.home)).toEqual(pinned)
+    const latest = updateFixture(value)
+    expect(verifyOfficialCodexSnapshotForTesting(pinned, value.home)).toEqual(pinned)
+    expect(resolveOfficialStandaloneCodexForTesting(value.home).physical).toBe(join(latest, 'bin/codex'))
+    // Serialized object key order is not part of executable identity.
+    const reordered = JSON.parse(JSON.stringify(pinned, (_, item) => item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).reverse()) : item))
+    expect(verifyOfficialCodexSnapshotForTesting(reordered, value.home)).toEqual(pinned)
+    rmSync(value.release, { recursive: true })
+    expect(() => verifyOfficialCodexSnapshotForTesting(pinned, value.home)).toThrow()
+  })
+
+  test.skipIf(process.platform !== 'darwin')('更新後も固定binary・manifest・親directoryの改変を拒否する', () => {
+    const mutations: Array<(value: ReturnType<typeof fixture>) => void> = [
+      value => { writeFileSync(value.leaf, readFileSync(value.leaf)) },
+      value => { const copy = value.leaf + '.copy'; copyFileSync(value.leaf, copy); renameSync(copy, value.leaf) },
+      value => { chmodSync(value.leaf, 0o777) },
+      value => { linkSync(value.leaf, value.leaf + '.link') },
+      value => { const path = join(value.release, 'codex-package.json'); writeFileSync(path, readFileSync(path)) },
+      value => { chmodSync(join(value.release, 'bin'), 0o777) },
+      value => { const path = join(value.release, 'bin'); renameSync(path, path + '-old'); symlinkSync(path + '-old', path) },
+      value => { const path = join(value.release, 'bin'); renameSync(path, path + '-old'); mkdirSync(path, { mode: 0o700 }); renameSync(join(path + '-old', 'codex'), value.leaf) },
+    ]
+    for (const mutate of mutations) {
+      const value = fixture()
+      const pinned = resolveOfficialStandaloneCodexForTesting(value.home)
+      updateFixture(value)
+      mutate(value)
+      expect(() => verifyOfficialCodexSnapshotForTesting(pinned, value.home)).toThrow()
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('固定snapshotのpath・node列・identity・余分fieldの偽装を拒否する', () => {
+    const value = fixture()
+    const pinned = resolveOfficialStandaloneCodexForTesting(value.home)
+    updateFixture(value)
+    const mutations: Array<(snapshot: typeof pinned) => void> = [
+      snapshot => { snapshot.physical = '/usr/bin/true' },
+      snapshot => { snapshot.logical += '-other' },
+      snapshot => { snapshot.releaseDir += '-other' },
+      snapshot => { snapshot.packageVersion = '999.0.0' },
+      snapshot => { snapshot.nodes.pop() },
+      snapshot => { snapshot.nodes.splice(-1, 0, snapshot.nodes.at(-1)!) },
+      snapshot => { snapshot.nodes.reverse() },
+      snapshot => { snapshot.nodes[0]!.identity.ino = '9999999' },
+      snapshot => { (snapshot.nodes[0]!.identity as any).ino = 1 },
+      snapshot => { snapshot.nodes.find(node => node.kind === 'symlink')!.resolvedTarget = '/usr/bin/true' },
+      snapshot => { snapshot.nodes.find(node => node.kind === 'symlink')!.target = '/usr/bin/true' },
+      snapshot => { snapshot.resolutionPaths.pop() },
+      snapshot => { (snapshot as any).extra = true },
+      snapshot => { (snapshot.manifestIdentity as any).extra = true },
+    ]
+    for (const mutate of mutations) {
+      const forged = structuredClone(pinned)
+      mutate(forged)
+      expect(() => verifyOfficialCodexSnapshotForTesting(forged, value.home)).toThrow()
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('更新後のencoded snapshotでsupervisorが旧物理releaseを起動する', async () => {
+    const value = fixture()
+    const pinned = resolveOfficialStandaloneCodexForTesting(value.home)
+    updateFixture(value)
+    const state = prepareManagedStateRoot(join(value.home, 'state'))
+    ensureManagedDirectory(state, join(state, 'executors'))
+    const registration = join(state, 'executors', 'pinned-version.json')
+    const fingerprint = createSeatbeltFingerprint(state, 'pinned-version', 'e'.repeat(32))
+    const result = Bun.spawn([
+      process.execPath, '--config=/dev/null', '--no-env-file', join(import.meta.dir, 'codex-supervisor.ts'),
+      'pinned-version', registration,
+      '--seatbelt-fingerprint', fingerprint.allow.path, fingerprint.deny.path,
+      '--official-codex-snapshot', encodeOfficialCodexSnapshot(pinned), '--', pinned.physical,
+      '--config=/dev/null', '--no-env-file', '-e', 'console.log(process.execPath)',
+    ], { cwd: value.home, env: { ...process.env, HOME: value.home }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', detached: true })
+    const [code, stdout, stderr] = await Promise.all([result.exited, new Response(result.stdout).text(), new Response(result.stderr).text()])
+    expect(code, stderr).toBe(0)
+    expect(stdout.trim()).toBe(pinned.physical)
+    expect(JSON.parse(readFileSync(registration, 'utf8')).phase).toBe('cleanup-confirmed')
+  }, 15_000)
 
   test.skipIf(process.platform !== 'darwin'
     || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
