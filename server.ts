@@ -1244,7 +1244,9 @@ async function drainInboundDeliveries(): Promise<void> {
               download.controller.signal,
             )
             // Classify before steering an active job or downloading attachments. Controls retain their old path.
-            if (!handoffControl(inbound.text) && !isExplicitUpdateRequest(inbound.text)) {
+            const setupReply = jobStore.auditSetupWaiting(inbound.expectedControlJobId
+              ?? jobStore.liveControlTarget(inbound.chatId, inbound.threadTs)?.jobId ?? '')
+            if (!setupReply && !handoffControl(inbound.text) && !isExplicitUpdateRequest(inbound.text)) {
               let route=jobStore.fleetQueryRoute(inbound.idempotencyKey)
               if(!route) {
                 const context=jobStore.getSlackThreadReplyIntent(inbound.idempotencyKey)?.snapshotJson
@@ -1276,7 +1278,10 @@ async function drainInboundDeliveries(): Promise<void> {
           ? jobStore.get(inbound.expectedControlJobId)?.workflow === 'security-audit'
           : jobStore.get(jobStore.liveControlTarget(inbound.chatId,inbound.threadTs)?.jobId ?? '')?.workflow === 'security-audit'
         // Audit inputs never steer development, and a later fix never steers an audit.
-        const separateWorkflow = separateSecurityWorkflow(auditRequest?'security-audit':'work',auditTarget?'security-audit':undefined,interrupt)
+        const waitingAuditSetup = inbound.expectedControlJobId
+          ? jobStore.auditSetupWaiting(inbound.expectedControlJobId)
+          : jobStore.auditSetupWaiting(jobStore.liveControlTarget(inbound.chatId,inbound.threadTs)?.jobId ?? '')
+        const separateWorkflow = !waitingAuditSetup && separateSecurityWorkflow(auditRequest?'security-audit':'work',auditTarget?'security-audit':undefined,interrupt)
         const target = separateWorkflow ? null : inbound.expectedControlJobId !== null
           && inbound.expectedControlEpoch !== null
           ? {

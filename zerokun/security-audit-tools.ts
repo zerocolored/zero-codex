@@ -1,3 +1,4 @@
+import { discoverAuditE2E, type AuditE2E } from './security-audit-setup.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
   existsSync,
@@ -1064,21 +1065,16 @@ try{const context=await browser.newContext({serviceWorkers:'block',acceptDownloa
   }
 }
 export function auditPlaywrightConfigs(source: string): string[] {
-  const found: string[] = []
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.isSymbolicLink() || /^(?:node_modules|\.git|\.worktrees)$/.test(entry.name)) continue
-      const path = join(dir, entry.name)
-      if (entry.isDirectory()) walk(path)
-      else if (/^playwright\.config\.(?:ts|js|mts|mjs|cts|cjs)$/.test(entry.name)) found.push(relative(source, path))
-    }
-  }
-  walk(source)
-  const roots = found.filter(path => dirname(path) === '.')
-  return (roots.length ? roots : found).sort()
+  const discovered = discoverAuditE2E(source).e2e
+  return discovered?.kind === 'playwright' ? [discovered.entry] : []
+}
+function selectedE2E(c: AuditToolContext): AuditE2E {
+  const discovery = discoverAuditE2E(c.source)
+  if (!discovery.e2e) throw Error(discovery.note)
+  return discovery.e2e
 }
 
-async function preparePlaywrightDependencies(work: string, configPath: string, c: AuditToolContext): Promise<string> {
+async function prepareE2EDependencies(work: string, c: AuditToolContext): Promise<void> {
   if (existsSync(join(work, 'pnpm-lock.yaml'))) {
     const exe = await pnpmBinary(c)
     await checked(['node', exe, 'install', '--frozen-lockfile', '--ignore-scripts', '--config.ignore-pnpmfile=true', '--config.manage-package-manager-versions=false'], work, c, { sandbox: true })
@@ -1098,11 +1094,36 @@ async function preparePlaywrightDependencies(work: string, configPath: string, c
     { sandbox: true },
     )
   }
+}
+
+async function preparePlaywrightDependencies(work: string, configPath: string, c: AuditToolContext): Promise<string> {
+  await prepareE2EDependencies(work, c)
   const configDir = join(work, dirname(configPath))
   const cli = [join(configDir, 'node_modules', '@playwright', 'test', 'cli.js'), join(work, 'node_modules', '@playwright', 'test', 'cli.js')].find(path => existsSync(path))
   if (!cli)
     throw Error('existing application does not provide @playwright/test')
   return cli
+}
+
+export function nodeE2EEvidence(stdout: string): number {
+  // Custom assertion runners can expose a final count; Node's TAP runner exposes pass/fail totals.
+  const count = /(?:^|\n)[^\n]*?\b(\d+) checks passed(?:[;.]|$)/.exec(stdout)?.[1]
+  const tap = /(?:^|\n)# pass (\d+)\r?(?:\n|$)/.exec(stdout)?.[1]
+  if (tap && /(?:^|\n)# (?:fail|cancelled|skipped|todo) [1-9]\d*\r?(?:\n|$)/.test(stdout)) return 0
+  return Number(count ?? tap ?? 0)
+}
+async function nodeE2E(number: number, c: AuditToolContext, entry: Extract<AuditE2E, {kind: 'node'}>) {
+  const work = join(c.root, `e2e-${number}`)
+  cpSync(c.source, work, {recursive: true, force: false, errorOnExist: true})
+  await prepareE2EDependencies(work, c)
+  const version = (await checked(['node', '--version'], work, c, {sandbox: true})).stdout.trim()
+  const result = await auditCommand(['node', entry.entry], join(work, entry.cwd), c, {
+    sandbox: true, offline: true, localPort: c.settings.e2ePort,
+  })
+  const checks = nodeE2EEvidence(result.stdout)
+  return {result, version, findings: [] as AuditFinding[], incomplete: checks <= 0,
+    note: `Node E2E: ${entry.cwd}/${entry.entry}; assertions: ${checks}。実認証・Docker socketは渡さず隔離実行。`
+      + (checks ? '' : '完了した検査件数を確認できません。成功したE2Eとして扱いません。')}
 }
 
 async function playwright(
@@ -1115,7 +1136,9 @@ async function playwright(
   findings: AuditFinding[]
   incomplete: boolean
 }> {
-  const configs = auditPlaywrightConfigs(c.source)
+  const selected = selectedE2E(c)
+  if (selected.kind === 'node') return nodeE2E(number, c, selected)
+  const configs = [selected.entry]
   if (!configs.length)
     throw Error(
       'Playwright設定がありません。テスト不足は工程1のコードレビューに記載します。',
@@ -1902,14 +1925,26 @@ export async function runAuditProbe(
   })
   if (number === 1 || number === 11) {
     await attempt('E2E configuration', async () => {
-      const configs = auditPlaywrightConfigs(original.source)
-      if (configs.length !== 1 || !original.settings.e2ePort)
-        throw Error('one Playwright configuration and e2e-port are required')
+      const selected = selectedE2E(original)
+      if (selected.kind === 'playwright' && !original.settings.e2ePort)
+        throw Error('E2E設定からローカルテスト用portを特定できませんでした。設定を推測して別サービスを検査しません。')
       if (process.platform !== 'darwin') throw Error('isolated local-port E2E execution requires macOS')
-      // Resolve the target's exact dependencies without importing its config or starting its server/tests.
+      // Install dependencies in a copy, without executing the target configuration or tests.
       const work = join(root, 'e2e-dependencies')
       cpSync(original.source, work, { recursive: true, force: false, errorOnExist: true })
-      const cli = await preparePlaywrightDependencies(work, configs[0]!, c)
+      if (selected.kind === 'node') {
+        await prepareE2EDependencies(work, c)
+        const hello = join(work, selected.cwd, 'zero-audit-node-hello.cjs')
+        writeFileSync(hello, `const {chromium}=require('playwright');
+(async()=>{const browser=await chromium.launch({channel:'chrome'});try{const page=await browser.newPage();await page.setContent('<h1>Hello World</h1>');require('node:assert/strict').equal(await page.locator('h1').innerText(),'Hello World');console.log(JSON.stringify({passed:1}));}finally{await browser.close()}})().catch(()=>{process.exitCode=1});`, {mode: 0o600, flag: 'wx'})
+        const r = await checked(['node', hello], join(work, selected.cwd), c, {sandbox: true, offline: true, timeoutMs: 60000})
+        if (JSON.parse(r.stdout).passed !== 1) throw Error('Node/Playwright Hello World did not pass')
+        step.evidenceDigest = createHash('sha256').update(r.stdout).digest('hex')
+        step.note += 'root packageのNode E2E入口とPlaywright/Chrome依存を確認。既存E2E本体の実行結果は本検査に記録します。'
+        return
+      }
+      const configs = [selected.entry]
+      const cli = await preparePlaywrightDependencies(work, selected.entry, c)
       const configDir = join(work, dirname(configs[0]!)), testDir = join(configDir, 'zero-audit-preflight')
       mkdirSync(testDir, { mode: 0o700 })
       const config = join(configDir, 'zero-audit-preflight.config.mjs')

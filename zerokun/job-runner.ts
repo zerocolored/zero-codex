@@ -6,6 +6,7 @@ import { reconcileClaudeHerdrTransports } from './claude-herdr-transport.ts'
 import { executeClaudeJob } from './claude-executor.ts'
 import { createPrimaryLiveControlHooks } from './primary-live-controls.ts'
 import { pinClaudeJobModel } from './claude-model-binding.ts'
+import { initializeAudit, AuditSetupRequiredError } from './security-audit-setup.ts'
 import { TaskModelSelections, TASK_MODEL_SCHEMA, MODEL_SELECTION_MESSAGES } from './task-model-selection.ts'
 import { assertSlackProjectAdmission } from './slack-project-admission.ts'
 import { executeSecurityAudit, copyAuditReportForFollowup, auditHasReadinessOnlyResult } from './security-audit.ts'
@@ -276,6 +277,11 @@ const CLAIMABLE_CODEX_JOB_PREDICATE = `
   AND NOT EXISTS (
     SELECT 1 FROM cloud_handoff_jobs cloud_wait
     WHERE cloud_wait.job_id = jobs.id AND cloud_wait.state <> 'active'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM audit_setup_waits aw WHERE aw.job_id=jobs.id AND jobs.cancel_requested_at IS NULL
+      AND (aw.waiting=1 OR EXISTS (SELECT 1 FROM status_notifications sn
+        WHERE sn.idempotency_key=aw.notification_key AND sn.delivered_at IS NULL AND sn.superseded_at IS NULL))
   )
   AND jobs.ui_approval_request_id IS NULL
   AND NOT EXISTS (
@@ -975,6 +981,10 @@ CREATE TABLE IF NOT EXISTS commentary_notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_commentary_notifications_pending
   ON commentary_notifications(delivered_at, not_before, seq);
+CREATE TABLE IF NOT EXISTS audit_setup_waits (
+ job_id TEXT PRIMARY KEY, input_revision INTEGER NOT NULL, waiting INTEGER NOT NULL DEFAULT 1,
+ notification_key TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS fleet_queries (
  idempotency_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
  repo_path TEXT NOT NULL, project_key TEXT, input TEXT NOT NULL,
@@ -6649,6 +6659,37 @@ export class JobStore {
     return JSON.stringify({recentTasks:jobs,recentQueries:queries}).slice(-20000)
   }
 
+  auditSetupWaiting(jobId: string): boolean {
+    return !!this.db.query<{yes:number},[string]>(
+      "SELECT 1 AS yes FROM audit_setup_waits w JOIN jobs j ON j.id=w.job_id WHERE w.job_id=? AND j.status IN ('queued','running') AND j.cancel_requested_at IS NULL",
+    ).get(jobId)
+  }
+
+  parkAuditSetup(jobId: string, prompt: string, inputRevision: number): void {
+    retrySqlite(() => this.db.transaction(() => {
+      const job=this.get(jobId)
+      if(!job || job.workflow!=='security-audit' || job.status!=='running') throw Error('audit setup job changed')
+      if(job.cancelRequestedAt!==null) { this.cancel(jobId); return }
+      const key=`audit-setup:${jobId}:${inputRevision}`
+      this.stageStatusNotificationRow({idempotencyKey:key,jobId,chatId:job.chatId,threadTs:job.threadTs,
+        kind:'execution-started',payload:prompt,createdAt:Date.now()})
+      this.db.run(`INSERT INTO audit_setup_waits(job_id,input_revision,waiting,notification_key) VALUES(?,?,?,?)
+        ON CONFLICT(job_id) DO UPDATE SET input_revision=excluded.input_revision,waiting=excluded.waiting,notification_key=excluded.notification_key`,
+        [jobId,inputRevision,job.inputRevision===inputRevision?1:0,key])
+      this.db.run(`UPDATE jobs SET status='queued',worker_id=NULL,started_at=NULL,executor_pid=NULL,
+        accepts_control=1,executor_nonce=NULL,active_thread_id=NULL,active_turn_id=NULL,
+        pending_session_id=NULL,pending_result=NULL,not_before=NULL,finished_at=NULL,last_error=NULL WHERE id=?`,[jobId])
+      this.supersedeLifecycleNotifications(jobId,Date.now())
+    }).immediate())
+  }
+
+  finishAuditSetup(jobId: string, revision: number): void {
+    const job = this.get(jobId)
+    if (job?.cancelRequestedAt != null) throw new CodexUserCancelledError()
+    if (!job || job.inputRevision !== revision) throw new CodexInterruptedError('audit setup input changed before scanning')
+    this.db.run('DELETE FROM audit_setup_waits WHERE job_id=?', [jobId])
+  }
+
   previousSecurityAudit(job:JobRecord, include: (id: string) => boolean = () => true):string|null {
     return this.db.query<{id:string},[string,string,string,number]>(
       "SELECT id FROM jobs WHERE workflow='security-audit' AND status='completed' AND chat_id=? AND thread_ts=? AND repo_path=? AND seq<? ORDER BY seq DESC",
@@ -6839,6 +6880,8 @@ export class JobStore {
                 ui_approval_request_id
          FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code')`,
       ).get(jobId)
+      if (input.kind === 'steer' && this.auditSetupWaiting(jobId)
+        && (!input.writeEnabled || expected.repoPath !== target?.repo_path)) return 'closed'
       if (!target || target.control_epoch !== epoch
         || target.chat_id !== chatId || target.thread_ts !== threadTs
         || !(target.status === 'running' || target.status === 'queued')
@@ -6889,6 +6932,7 @@ export class JobStore {
             [chatId, threadTs, interruptInbound.seq, jobId, epoch],
           )
         }
+        this.db.run('UPDATE audit_setup_waits SET waiting=0 WHERE job_id=?', [jobId])
         this.db.run(
           `UPDATE job_controls SET status = 'superseded',
              last_error = 'superseded by a later Slack interrupt'
@@ -6984,6 +7028,7 @@ export class JobStore {
              AND status IN ('ready', 'paused', 'answer-prepared')`,
           [snapshot.revision, snapshot.digest, jobId, epoch],
         )
+        this.db.run('UPDATE audit_setup_waits SET waiting=0 WHERE job_id=? AND input_revision<?', [jobId, inputRevision])
         if (target.ui_approval_request_id) {
           const prompt = this.db.query<{
             prompt_message_id: string | null
@@ -7167,7 +7212,7 @@ export class JobStore {
   ): 'staged' | 'duplicate' | 'closed' {
     let target: LiveControlTarget | null = expected
     for (let attempt = 0; attempt < 2 && target; attempt += 1) {
-      const disposition = target.awaitingUiApproval
+      const disposition = target.awaitingUiApproval || this.auditSetupWaiting(target.jobId)
         ? this.stageLiveControl(target, { ...input, kind: 'steer' })
         : this.stageLiveInterjection(target, input)
       if (disposition !== 'closed') return disposition
@@ -12026,7 +12071,13 @@ export class JobStore {
       ).get(id)
       if (!row) return false
       let deliverable = true
-      if (row.kind === 'accepted') {
+      if (row.idempotency_key.startsWith('audit-setup:')) {
+        deliverable = row.job_id !== null && row.cancel_requested_at === null
+          && (row.job_status === 'queued' || row.job_status === 'running')
+          && !!this.db.query<{yes:number},[string,string]>(
+            'SELECT 1 AS yes FROM audit_setup_waits WHERE job_id=? AND notification_key=?',
+          ).get(row.job_id,row.idempotency_key)
+      } else if (row.kind === 'accepted') {
         deliverable = row.job_id !== null
           && row.job_status === 'queued'
           && row.job_seq !== null
@@ -15049,6 +15100,14 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           `${workerId} requeued ${job.id} for Codex publication recovery from attempt `
           + `${recovery.sourceAttempt}`,
         )
+        continue
+      }
+      if (error instanceof AuditSetupRequiredError) {
+        await updateMonitor(job, 'セキュリティ検査の初期設定の回答を待っています')
+        await quiesceMonitorBeforeTerminal()
+        options.store.parkAuditSetup(job.id, error.prompt, error.inputRevision)
+        closeRequeuedUiApprovalMonitor = true
+        scheduleNotificationFlush()
         continue
       }
       if (error instanceof CodexUiApprovalRequiredError) {
@@ -18504,7 +18563,7 @@ async function runCli(): Promise<void> {
             ? 'cancelled'
             : job.status === 'failed'
               ? 'failed'
-              : job.uiApprovalRequestId !== null
+              : job.uiApprovalRequestId !== null || store.auditSetupWaiting(job.id)
                 || (job.taskGoalStatus && job.taskGoalStatus !== 'complete') ? 'waiting' : 'completed',
           onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
         })
@@ -18546,21 +18605,29 @@ async function runCli(): Promise<void> {
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
           if (job.workflow === 'security-audit') {
+            const milestone = async (phase: 'initializing' | 'checking' | 'ready', text: string) => {
+              mirrorMonitorMessage(text)
+              await deliverAuditMilestone(job, phase, text, executionContext,
+                key => store.commentarySourceDelivered(job.id, key), {
+                  signal: executionController.signal,
+                  cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
+                })
+            }
+            await milestone('initializing', 'セキュリティ12工程が利用可能かどうかを調べています。共通設定とプロジェクト構成を確認し、初回に不足する検査対象だけをこのスレッドで確認します。')
+            const settings = await initializeAudit(job, dir, [
+              // The original request is not a settings answer and its audit write flag is intentionally false.
+              ...store.listJobControls(job.id).filter(c => c.kind === 'steer' && c.status !== 'superseded')
+                .map(c => ({text: c.task, writeEnabled: c.writeEnabled, revision: c.inputRevision})),
+            ], {signal: executionController.signal, cancelled: () => store.get(job.id)?.cancelRequestedAt != null})
+            store.finishAuditSetup(job.id, job.inputRevision)
             const progress = createSecurityAuditProgress(job, executionContext, mirrorMonitorMessage, log)
             let raw: JobExecutionResult
             try { raw = await executeSecurityAudit(job, {
-              stateDir: dir, signal: executionController.signal,
+              stateDir: dir, settings, signal: executionController.signal,
               ...executorPidLifecycle,
               cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
               progress: progress.report,
-              milestone: async (phase, text) => {
-                mirrorMonitorMessage(text)
-                await deliverAuditMilestone(job, phase, text, executionContext,
-                  key => store.commentarySourceDelivered(job.id, key), {
-                    signal: executionController.signal,
-                    cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
-                  })
-              },
+              milestone,
             }) } finally { progress.close() }
             const auditResult = finalizeSuccessfulExecution(job, raw, dir, log)
             store.ensureExecutionResultStaged(job.id, auditResult.sessionId, auditResult.result)
