@@ -117,8 +117,9 @@ export async function discoverSocketOrganization(state: string, fetcher: typeof 
   if (slugs.length === 1) saveSocketOrganization(state, slugs[0]!)
   return slugs
 }
-export type AuditSetupReply = { text: string; writeEnabled: boolean; revision: number }
-const ANSWER_VERSION = 2
+export type AuditSetupReply = { text: string; writeEnabled: boolean; revision: number;
+  sourceJobId?: string; sourceControlId?: string; restrictionsOnly?: boolean }
+export const AUDIT_ANSWER_VERSION = 3
 /** Only explicit answer lines grant a network scope. Repository strings and model inference never do. */
 export function applyAuditSetupAnswer(settings: AuditSettings, text: string, organizations: string[]): AuditSettings {
   const next = { ...settings }
@@ -174,7 +175,8 @@ export async function initializeAudit(
   // job IDs come from the durable queue. Do not allow callers to choose a path outside that journal.
   if (!/^[a-zA-Z0-9_-]{1,100}$/.test(job.id)) throw Error('invalid audit job identity')
   const path = join(root, job.id + '.json')
-  const recordSchema = z.object({ parserVersion: z.number().int().default(1), repoPath: z.string(), appliedRevision: z.number().int(), ready: z.boolean(), settings: auditSettingsSchema }).strict()
+  const recordSchema = z.object({ parserVersion: z.number().int().default(1), repoPath: z.string(), appliedRevision: z.number().int(), ready: z.boolean(), settings: auditSettingsSchema,
+    inheritedControls: z.array(z.string()).default([]) }).strict()
   const saved = readOptionalBoundedOwnerOnlyRegularFile(path, 30000)
   const prior = saved ? recordSchema.parse(JSON.parse(saved)) : null
   if (prior && prior.repoPath !== job.repoPath) throw Error('audit initialization repository changed')
@@ -193,10 +195,26 @@ export async function initializeAudit(
   // Re-discover on every request; never keep a removed or unrelated service's E2E entry.
   settings.e2e = discovery.e2e
   if (!settings.e2ePort && discovery.port) settings.e2ePort = discovery.port
-  for (const reply of [...replies].sort((a, b) => a.revision - b.revision)) {
-    const replay = prior && !prior.ready && prior.parserVersion < ANSWER_VERSION
-    if (!reply.writeEnabled || reply.revision <= (replay ? 0 : prior?.appliedRevision ?? 0) || reply.revision > job.inputRevision) continue
+  const replay = prior && !prior.ready && prior.parserVersion < AUDIT_ANSWER_VERSION
+  const historical = replies.filter(r => r.sourceJobId && r.sourceJobId !== job.id)
+  const current = replies.filter(r => !r.sourceJobId || r.sourceJobId === job.id).sort((a, b) => a.revision - b.revision)
+  const inheritedControls = new Set(prior?.inheritedControls ?? [])
+  // History is already ordered by the store. Its revisions belong to other
+  // jobs and must never be compared with this job's revision or sorted across jobs.
+  for (const reply of [...(!prior || replay ? historical : []), ...current]) {
+    const inherited = !!reply.sourceJobId && reply.sourceJobId !== job.id
+    if (!reply.writeEnabled || (!inherited && (reply.revision <= (replay ? 0 : prior?.appliedRevision ?? 0) || reply.revision > job.inputRevision))) continue
     const next = applyAuditSetupAnswer(settings, reply.text, organizations)
+    if (inherited && reply.sourceControlId) inheritedControls.add(reply.sourceControlId)
+    // A coding task is not an audit target grant. Retain its explicit narrowing
+    // of an existing login grant, but never infer a URL, organization or new scope.
+    if (reply.restrictionsOnly) {
+      if (settings.authentication === 'required' && next.authentication !== 'required') {
+        if (next.authentication === 'none') settings.authentication = 'none'
+        else delete settings.authentication
+      }
+      continue
+    }
     if (next.socketOrg && organizations.includes(next.socketOrg)) saveSocketOrganization(state, next.socketOrg)
     settings = next
   }
@@ -228,7 +246,7 @@ export async function initializeAudit(
       needs.push(`${service}の接続が未登録です。このMacの非表示入力（zerochan security ${name}-token）で一度だけ登録後、このスレッドへ「登録した」と返信してください。キーはSlackへ投稿しないでください。`)
     }
   }
-  atomicWritePrivateFile(path, JSON.stringify({ parserVersion: ANSWER_VERSION, repoPath: job.repoPath, appliedRevision: job.inputRevision, ready: needs.length === 0, settings }) + '\n')
+  atomicWritePrivateFile(path, JSON.stringify({ parserVersion: AUDIT_ANSWER_VERSION, repoPath: job.repoPath, appliedRevision: job.inputRevision, ready: needs.length === 0, settings, inheritedControls: [...inheritedControls] }) + '\n')
   if (needs.length) throw new AuditSetupRequiredError(
     'セキュリティ検査の初期設定を進めています。共通設定とプロジェクト構成を確認しました。次の不足分だけ、このスレッドへ返信してください。\n'
     + needs.map(x => '・' + x).join('\n')
