@@ -60,7 +60,8 @@ import {
 } from './service-control-state.ts'
 import { missingPane, recoveryControlRuntime } from './herdr-recovery.ts'
 import { assertSlackProjectAdmission } from './slack-project-admission.ts'
-import { readLastConnectedProject } from './project-selection.ts'
+import { readLastConnectedProject, readStartedProjects, rememberStartedProject } from './project-selection.ts'
+import { readProjectChannelConfig } from './project-channel-config.ts'
 import { registeredSlackAppForState } from './slack-app-registry.ts'
 
 type ManagedProcess = {
@@ -1397,6 +1398,7 @@ export async function startManagedService(
           )),
       )
       if (launcher.pid) {
+        rememberStartedProject(stateDir, projectDir, expectedAppId)
         clearIntentionalServiceStop(stateDir)
         return {
           status: 'already-running',
@@ -1470,6 +1472,7 @@ export async function startManagedService(
         }
         throw error
       }
+      rememberStartedProject(stateDir, projectDir, expectedAppId)
       clearIntentionalServiceStop(stateDir)
       return {
         status: 'already-running',
@@ -1508,6 +1511,7 @@ export async function startManagedService(
     if (started.gatewayPid !== health.gatewayPid) {
       fail('起動確認中にgateway generationが変わりました')
     }
+    rememberStartedProject(stateDir, projectDir, expectedAppId)
     clearIntentionalServiceStop(stateDir)
     return {
       status: 'started',
@@ -1624,11 +1628,26 @@ export async function recoverManagedService(
     // Readiness is deliberately deleted on gateway startup/shutdown. The last
     // successful connection persists across both and authorizes retries.
     const last = readLastConnectedProject(stateDir)
-    if (!ready?.slackAppId && !last) return 'not-started'
-    const projectDir = realpathSync(last?.projectDir ?? ready!.projectDir)
-    assertSlackProjectAdmission(projectDir, String(Date.now() / 1000))
-    const registered = ready?.slackAppId ? null : registeredSlackAppForState(stateDir, hooks.registryHome)
-    const appId = requireExpectedAppId(ready?.slackAppId ?? registered?.appId ?? '')
+    const registered = registeredSlackAppForState(stateDir, hooks.registryHome)
+    const appIdValue = registered?.appId ?? ready?.slackAppId
+    if (!appIdValue) return 'not-started'
+    const appId = requireExpectedAppId(appIdValue)
+    const candidates = [...new Set([
+      ...readStartedProjects(stateDir, appId), last?.projectDir, ready?.projectDir,
+    ].filter((path): path is string => !!path))]
+    if (!candidates.length) return 'not-started'
+    let projectDir: string | undefined
+    for (const candidate of candidates) {
+      try {
+        const physical = realpathSync(candidate)
+        assertSlackProjectAdmission(physical, String(Date.now() / 1000))
+        const binding = readProjectChannelConfig(physical).slackAppId
+        if (binding !== undefined && binding !== appId) continue
+        projectDir = physical
+        break
+      } catch { /* Keep unavailable/disconnected projects for later ticks. */ }
+    }
+    if (!projectDir) throw new Error('自動復旧できる起動済みプロジェクトがまだ利用できません')
     const previous = readPinnedHerdrRuntime(stateDir)
     if (inspectManagedServiceStatus(stateDir).status === 'running') {
       try {
@@ -1641,7 +1660,13 @@ export async function recoverManagedService(
     if (inspectManagedServiceStatus(stateDir).runnerPid && activeCounts(stateDir).running > 0) return 'busy'
     // Obtain a usable control plane before touching services. Transient Herdr
     // outages leave the existing processes and work intact for the next tick.
-    const control = await (hooks.recoveryRuntime ?? recoveryControlRuntime)(stateDir, projectDir, previous)
+    const processesBeforeRecovery = inspectManagedServiceStatus(stateDir)
+    const control = await (hooks.recoveryRuntime ?? recoveryControlRuntime)(stateDir, projectDir, previous, {
+      // A power loss may leave a launch receipt with no live generations.
+      // The receipt still needs reconciliation, but is not a live process.
+      allowColdStart: !processesBeforeRecovery.gatewayPid && !processesBeforeRecovery.runnerPid
+        && !processesBeforeRecovery.launcherPid,
+    })
     await verify(control)
     const sleep = hooks.sleep ?? (milliseconds => Bun.sleep(milliseconds))
     await quiesceRunnerAndLauncher(stateDir, sleep, hooks.pauseTimeoutMs)

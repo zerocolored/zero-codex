@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'fs'
@@ -37,7 +38,7 @@ import {
   type HerdrRuntimeIdentity,
 } from './herdr-runtime.ts'
 import { writeGatewayReadiness } from './readiness.ts'
-import { writeLastConnectedProject } from './project-selection.ts'
+import { writeLastConnectedProject, rememberStartedProject, readStartedProjects } from './project-selection.ts'
 import { registerSlackApp } from './slack-app-registry.ts'
 import { acquireUpdateLock } from './update.ts'
 import { tryAcquireProcessLock, releaseProcessLock, encodeProcessLockLease, inspectProcessLock } from './process-lock.ts'
@@ -1462,4 +1463,62 @@ describe('zerochan stop/start', () => {
     expect(await services!.runner.exited).toBe(0)
     expect(intentionalServiceStopIsSet(state)).toBe(false)
   })
+})
+
+
+test('cold login selects another started project when the last one is unavailable or rebound', async () => {
+  const root = dirname(import.meta.dir)
+  const { base, state, project } = fixture(); createJobDatabase(state)
+  const other = join(base, 'other'); mkdirSync(other)
+  registerSlackApp('A0123456789', state, base)
+  rememberStartedProject(state, project, 'A0123456789')
+  rememberStartedProject(state, other, 'A0123456789')
+  writeLastConnectedProject(state, other)
+  writePinnedHerdrRuntime(state, fakeRuntime)
+  mkdirSync(join(other, '.zerochan'), { mode: 0o700 })
+  writeFileSync(join(other, '.zerochan', 'config.json'), JSON.stringify({version: 1, slackChannels: [], slackAppId: 'AOTHER'}), { mode: 0o600 })
+  let attempts = 0
+  const hooks = { ...testHooks, registryHome: base,
+    recoveryRuntime: async (_state: string, selected: string, _previous: HerdrRuntimeIdentity, options: { allowColdStart?: boolean } = {}) => {
+      expect(selected).toBe(realpathSync(project)); expect(options.allowColdStart).toBe(true)
+      attempts++; return fakeRuntime
+    },
+    startBot: async () => { throw new Error('fixture offline') },
+  }
+  await expect(recoverManagedService(root, state, hooks)).rejects.toThrow('fixture offline')
+  rmSync(other, { recursive: true })
+  await expect(recoverManagedService(root, state, hooks)).rejects.toThrow('fixture offline')
+  expect(attempts).toBe(2)
+  expect(readStartedProjects(state, 'A0123456789')).toHaveLength(2)
+  writeIntentionalServiceStop(state)
+  expect(await recoverManagedService(root, state, hooks)).toBe('stopped')
+  expect(attempts).toBe(2)
+})
+
+
+test('dead prepared launch receipt after power loss does not block cold server startup', async () => {
+  const { base, state, project } = fixture(); createJobDatabase(state)
+  const launcher = join(base, 'receipt-runner-launcher.ts')
+  writeFileSync(launcher, [
+    `import { readProcessIdentity } from ${JSON.stringify(join(import.meta.dir, 'process-generation.ts'))}`,
+    `import { prepareRunnerLaunchReceipt } from ${JSON.stringify(join(import.meta.dir, 'runner-launch-receipt.ts'))}`,
+    'prepareRunnerLaunchReceipt(process.argv[2], readProcessIdentity(process.pid))',
+  ].join('\n'))
+  const child = Bun.spawn([process.execPath, launcher, state], { stdout: 'ignore', stderr: 'pipe' }); processes.push(child)
+  expect(await child.exited).toBe(0)
+  expect(inspectManagedServiceStatus(state)).toEqual({ status: 'partial' })
+  registerSlackApp('A0123456789', state, base)
+  writeLastConnectedProject(state, project); writePinnedHerdrRuntime(state, fakeRuntime)
+  let coldStartAllowed = false
+  await expect(recoverManagedService(dirname(import.meta.dir), state, { ...testHooks, registryHome: base,
+    recoveryRuntime: async (_s, _p, _r, options = {}) => {
+      coldStartAllowed = options.allowColdStart === true
+      if (!coldStartAllowed) throw new Error('socket missing')
+      return fakeRuntime
+    },
+    startBot: async () => { throw new Error('reached startup') },
+  })).rejects.toThrow('reached startup')
+  expect(coldStartAllowed).toBe(true)
+  expect(existsSync(join(state, 'job-runner-launch.json'))).toBe(false)
+  expect(intentionalServiceStopIsSet(state)).toBe(false)
 })
