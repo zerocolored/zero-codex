@@ -12,6 +12,7 @@ import {
   writeSync,
 } from 'fs'
 import { basename, dirname, join, resolve } from 'path'
+import type { IncomingMessage } from 'http'
 import type { InboundDownloadedFile } from './job-runner.ts'
 
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -58,13 +59,49 @@ export function verifyInboundDownloadBeforeRename(
   descriptor: number,
   received: number,
   expectedSize?: number,
+  response?: Pick<IncomingMessage, 'statusCode' | 'headers' | 'complete' | 'aborted'>,
 ): InboundAttachmentIdentity {
   if (!Number.isSafeInteger(received) || received < 0 || received > MAX_ATTACHMENT_BYTES) {
     throw new Error('inbound attachment received size is invalid')
   }
   if (expectedSize !== undefined
     && (!Number.isSafeInteger(expectedSize) || expectedSize < 0
-      || expectedSize > MAX_ATTACHMENT_BYTES || received !== expectedSize)) {
+      || expectedSize > MAX_ATTACHMENT_BYTES)) {
+    throw new Error('inbound attachment Slack metadata size is invalid')
+  }
+  let transferSize = expectedSize
+  if (response) {
+    if (response.statusCode !== 200 || response.headers['content-range'] !== undefined
+      || response.complete !== true || response.aborted) {
+      throw new Error('inbound attachment HTTP response is not complete')
+    }
+    const encoding = response.headers['content-encoding']
+    if (encoding !== undefined && encoding.trim().toLowerCase() !== 'identity') {
+      throw new Error('inbound attachment HTTP content encoding is unsupported')
+    }
+    const length = response.headers['content-length']
+    const transferEncoding = response.headers['transfer-encoding']
+    if (length !== undefined) {
+      if (!/^\d+$/.test(length.trim()) || !Number.isSafeInteger(Number(length))
+        || Number(length) > MAX_ATTACHMENT_BYTES || transferEncoding !== undefined) {
+        throw new Error('inbound attachment HTTP framing is invalid')
+      }
+      transferSize = Number(length)
+      if (received !== transferSize) {
+        throw new Error('inbound attachment size does not match HTTP Content-Length')
+      }
+    } else if (transferEncoding !== undefined) {
+      if (transferEncoding.trim().toLowerCase() !== 'chunked') {
+        throw new Error('inbound attachment HTTP transfer encoding is unsupported')
+      }
+      // A complete chunked response includes its terminal chunk. The catalog
+      // size need not describe the downloaded representation (including BOM).
+      transferSize = undefined
+    }
+    // Without HTTP length/chunk framing, keep the catalog-size check: a
+    // connection close alone cannot distinguish completion from truncation.
+  }
+  if (transferSize !== undefined && received !== transferSize) {
     throw new Error('inbound attachment size does not match Slack metadata')
   }
   const metadata = fstatSync(descriptor)
