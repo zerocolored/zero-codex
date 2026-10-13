@@ -417,6 +417,147 @@ describe('Herdr job monitor', () => {
     expect([control.createCalls, control.runCalls, control.closeCalls]).toEqual(calls)
     expect(existsSync(join(state, 'job-monitors-detached', record.id, 'manifest.json'))).toBe(true)
   })
+  for (const waiting of [false, true]) {
+    test(`server restart retires dead viewer without touching restored panes (waiting=${waiting})`, async () => {
+      const state = fixtureDirectory()
+      const control = new FakeControl()
+      const record = job({ status: 'queued', monitorState: 'required' })
+      // Create the original view before simulating its armed queue record.
+      await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: { ...record, monitorState: 'none' }, control })
+      appendHerdrJobMonitorStatus(state, record.id, 'saved before restart')
+      const source = join(state, 'job-monitors', record.id)
+      const feed = readFileSync(join(source, 'status.0.feed'), 'utf8')
+      control.generationStatus = 'dead'
+      control.panes[0]!.terminalId = 'term_99999999999999'
+      const calls = [control.createCalls, control.runCalls, control.closeCalls, control.processInfoCalls]
+      let required = true
+      let recoveries = 0
+      const options = {
+        stateDir: state, runtime: { ...runtime(), socketInode: 99 }, control,
+        getJob: () => record,
+        listMonitorObligations: () => required ? [{ id: record.id, status: record.status, state: 'required' as const }] : [],
+        recoverMissingBindingAfterExecutorsStopped: () => {
+          recoveries += 1
+          required = false
+          if (waiting) return 'unarmed' as const
+          record.status = 'failed'
+          return 'terminalized' as const
+        },
+      }
+      expect((await reconcileHerdrJobMonitors(options)).closed).toBe(1)
+      expect(record.status).toBe(waiting ? 'queued' : 'failed')
+      expect(readFileSync(join(state, 'job-monitors-detached', record.id, 'status.0.feed'), 'utf8')).toBe(feed)
+      await reconcileHerdrJobMonitors(options)
+      expect(recoveries).toBe(1)
+      expect([control.createCalls, control.runCalls, control.closeCalls, control.processInfoCalls]).toEqual(calls)
+    })
+  }
+
+  test('restart after disposition commit retries archive without replaying work', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'queued' })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    control.generationStatus = 'dead'
+    const archivedRoot = join(state, 'job-monitors-detached')
+    mkdirSync(archivedRoot, { mode: 0o700 })
+    mkdirSync(join(archivedRoot, record.id), { mode: 0o700 })
+    const manifest = JSON.parse(readFileSync(join(state, 'job-monitors', record.id, 'manifest.json'), 'utf8'))
+    const collision = join(archivedRoot, `${record.id}.${manifest.operationId}`)
+    mkdirSync(collision, { mode: 0o700 })
+    let required = true
+    let recoveries = 0
+    const options = {
+      stateDir: state, runtime: { ...runtime(), socketInode: 99 }, control, getJob: () => record,
+      listMonitorObligations: () => required ? [{ id: record.id, status: record.status, state: 'required' as const }] : [],
+      recoverMissingBindingAfterExecutorsStopped: () => {
+        recoveries += 1
+        required = false
+        record.status = 'failed'
+        return 'terminalized' as const
+      },
+    }
+    await expect(reconcileHerdrJobMonitors(options)).rejects.toThrow('could not archive previous Herdr monitor')
+    expect(record.status).toBe('failed')
+    expect(required).toBe(false)
+    rmSync(collision, { recursive: true })
+    await reconcileHerdrJobMonitors(options)
+    expect(recoveries).toBe(1)
+    expect(existsSync(join(collision, 'manifest.json'))).toBe(true)
+    expect(control.closeCalls).toBe(0)
+  })
+
+  test('same waiting job survives two server restarts and preserves both viewer generations', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'queued' })
+    const archives: string[] = []
+    for (const generation of [1, 2]) {
+      control.generationStatus = 'alive'
+      const currentRuntime = { ...runtime(), socketInode: generation }
+      await openHerdrJobMonitor({ stateDir: state, runtime: currentRuntime, job: record, control })
+      appendHerdrJobMonitorStatus(state, record.id, `generation ${generation}`)
+      const source = join(state, 'job-monitors', record.id)
+      const manifest = JSON.parse(readFileSync(join(source, 'manifest.json'), 'utf8'))
+      const feed = readFileSync(join(source, 'status.0.feed'), 'utf8')
+      const archived = join(state, 'job-monitors-detached', generation === 1 ? record.id : `${record.id}.${manifest.operationId}`)
+      archives.push(archived)
+      control.generationStatus = 'dead'
+      let required = true
+      const calls = [control.createCalls, control.runCalls, control.closeCalls]
+      expect((await reconcileHerdrJobMonitors({
+        stateDir: state, runtime: { ...currentRuntime, socketInode: generation + 1 }, control,
+        getJob: () => record,
+        listMonitorObligations: () => required ? [{ id: record.id, status: record.status, state: 'required' as const }] : [],
+        recoverMissingBindingAfterExecutorsStopped: () => { required = false; return 'unarmed' },
+      })).closed).toBe(1)
+      expect(record.status).toBe('queued')
+      expect([control.createCalls, control.runCalls, control.closeCalls]).toEqual(calls)
+      expect(readFileSync(join(archived, 'status.0.feed'), 'utf8')).toBe(feed)
+    }
+    expect(readFileSync(join(archives[0]!, 'status.0.feed'), 'utf8')).toContain('generation 1')
+    expect(readFileSync(join(archives[1]!, 'status.0.feed'), 'utf8')).toContain('generation 2')
+  })
+
+  for (const viewerStatus of ['alive', 'unknown'] as const) {
+    test(`changed control plane preserves ${viewerStatus} viewer and job`, async () => {
+      const state = fixtureDirectory()
+      const control = new FakeControl()
+      const record = job({ status: 'queued' })
+      await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+      control.generationStatus = viewerStatus
+      let recovered = false
+      await expect(reconcileHerdrJobMonitors({
+        stateDir: state, runtime: { ...runtime(), socketInode: 99 }, control,
+        getJob: () => record,
+        recoverMissingBindingAfterExecutorsStopped: () => { recovered = true; return 'unarmed' },
+      })).rejects.toThrow('previous Herdr monitor is not stopped')
+      expect(recovered).toBe(false)
+      expect(existsSync(join(state, 'job-monitors', record.id, 'manifest.json'))).toBe(true)
+      expect(control.closeCalls).toBe(0)
+    })
+  }
+
+  test('changed control plane preserves staged results and requires executor reconciliation', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'queued' })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    control.generationStatus = 'dead'
+    const options = { stateDir: state, runtime: { ...runtime(), socketInode: 99 }, control, getJob: () => record }
+    await expect(reconcileHerdrJobMonitors(options)).rejects.toThrow('previous Herdr monitor is not stopped')
+    let stateValue: 'required' | 'lost-staged' = 'required'
+    await expect(reconcileHerdrJobMonitors({
+      ...options,
+      listMonitorObligations: () => [{ id: record.id, status: record.status, state: stateValue }],
+      recoverMissingBindingAfterExecutorsStopped: () => { stateValue = 'lost-staged'; return 'staged-result' },
+    })).rejects.toThrow('staged execution remains blocked')
+    expect(stateValue).toBe('lost-staged')
+    expect(existsSync(join(state, 'job-monitors', record.id, 'manifest.json'))).toBe(true)
+    expect(record.status).toBe('queued')
+    expect(control.closeCalls).toBe(0)
+  })
+
   test('stop recovery archives dead monitor logs without operating a reused pane', async () => {
     const state = fixtureDirectory()
     const control = new FakeControl()

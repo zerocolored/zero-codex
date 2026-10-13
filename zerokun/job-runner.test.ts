@@ -3532,6 +3532,47 @@ describe('Codex job store', () => {
     restarted.close()
   })
 
+  test('settled GC removes cloud and monitor children while retaining unfinished handoffs', () => {
+    const state = fixtureDir()
+    const dbPath = join(state, 'jobs.sqlite3')
+    const store = new JobStore(dbPath)
+    const database = new Database(dbPath)
+    database.exec('PRAGMA foreign_keys=ON')
+    const records = new Map<string, string>()
+    for (const phase of ['active', 'saving', 'waiting', 'importing', 'transferred', 'unnotified']) {
+      const record = store.enqueue(input({ messageId: `gc-cloud-${phase}` })).job
+      store.claimNext('worker')
+      store.complete(record.id, 'gc-session', 'done')
+      if (phase !== 'unnotified') {
+        const notice = store.pendingTerminalNotifications().find(n => n.jobId === record.id)!
+        store.markTerminalNotificationDelivered(notice.id)
+      }
+      database.run('UPDATE jobs SET finished_at=1 WHERE id=?', [record.id])
+      database.run('INSERT INTO cloud_handoff_jobs(job_id,state,cloud_id,epoch,receipt_json,updated_at) VALUES(?,?,?,?,?,?)',
+        [record.id, phase === 'unnotified' ? 'active' : phase, 'cloud-test', 1, '{}', 1])
+      database.run('INSERT INTO cloud_handoff_context(job_id,source_key,payload,created_at) VALUES(?,?,?,?)',
+        [record.id, 'context', 'synthetic', 1])
+      database.run('INSERT INTO monitor_failures(job_id,reason_digest,created_at) VALUES(?,?,?)',
+        [record.id, 'a'.repeat(64), 1])
+      records.set(phase, record.id)
+    }
+    const options = { stateDir: state, now: 10_000, retentionMs: 1000, tombstoneRetentionMs: 100_000 }
+    expect(store.pruneSettled(options).jobs).toBe(1)
+    expect(store.get(records.get('active')!)).toBeNull()
+    for (const phase of ['saving', 'waiting', 'importing', 'transferred', 'unnotified']) {
+      expect(store.get(records.get(phase)!)).not.toBeNull()
+    }
+    for (const table of ['cloud_handoff_jobs', 'cloud_handoff_context', 'monitor_failures']) {
+      expect(database.query(`SELECT COUNT(*) AS n FROM ${table} WHERE job_id=?`).get(records.get('active')!)).toEqual({ n: 0 })
+      expect(database.query(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 5 })
+    }
+    expect(store.pruneSettled(options).jobs).toBe(0)
+    expect(database.query('PRAGMA foreign_key_check').all()).toEqual([])
+    expect(store.stageInboundDelivery({ ...input({ messageId: 'gc-cloud-active' }), text: 'redelivery' })).toBe(false)
+    database.close()
+    store.close()
+  })
+
   test('settled GCは通知済みjobだけを削除し、tombstoneでSlack再配送を抑止する', () => {
     const state = fixtureDir()
     const dbPath = join(state, 'jobs.sqlite3')

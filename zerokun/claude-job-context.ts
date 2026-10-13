@@ -64,14 +64,19 @@ export function claudePrimaryInstructions(job: JobRecord, input: {
 }
 
 /** Host-owned files and MCPs. None of these paths may be supplied by model input. */
-export function prepareClaudeJobContext(job: JobRecord, stateInput: string) {
+export function prepareClaudeJobContext(job: JobRecord, stateInput: string, delegation?: { model: string; parentJobId: string }) {
   const stateDir = requireManagedStateRoot(stateInput)
   const { jobRepo, advisorProjectLayout: layout } = primaryProjectBoundary(job)
-  const artifactDir = ensureManagedDirectory(stateDir, artifactDirForJob(stateDir, job.id))
-  const scratchDir = ensureManagedDirectory(stateDir, scratchDirForJob(stateDir, job.id))
+  const filesJobId = delegation?.parentJobId ?? job.id
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(filesJobId)) throw Error('invalid delegated file scope')
+  const artifactDir = ensureManagedDirectory(stateDir, artifactDirForJob(stateDir, filesJobId))
+  const scratchDir = ensureManagedDirectory(stateDir, scratchDirForJob(stateDir, filesJobId))
   const tempDir = ensureJobTempDirectory(stateDir, job.id)
-  const inputDir = liveControlInputDir(stateDir, job.id)
-  const retained = retainDeliveredArtifacts(job, stateDir, inputDir)
+  const inputDir = liveControlInputDir(stateDir, filesJobId)
+  // Delegates share the parent's already-authorized inputs/outputs, without
+  // rewriting its retained-input manifest or its goal/dispatch records.
+  const retained = delegation ? { manifest: join(inputDir, 'prior-artifacts', 'manifest.json') }
+    : retainDeliveredArtifacts(job, stateDir, inputDir)
   // Keep one consultation ledger for the logical job across native process
   // and daemon restarts; physical restarts must not create another panel.
   const logicalDir = ensureManagedDirectory(stateDir, join(stateDir, 'claude-job-logical'))
@@ -114,9 +119,9 @@ export function prepareClaudeJobContext(job: JobRecord, stateInput: string) {
   }
   const usageDir = ensureManagedDirectory(stateDir, join(stateDir, 'task-usage-context'))
   atomicWritePrivateFile(join(usageDir, `${job.id}.json`), JSON.stringify({ version: 1, jobId: job.id, repoPath: job.historyRepoPath ?? jobRepo }))
-  const chrome = job.writeEnabled ? installedGoChromeEntrypoint(import.meta.dir, jobRepo) : undefined
+  const chrome = !delegation && job.writeEnabled ? installedGoChromeEntrypoint(import.meta.dir, jobRepo) : undefined
   const browserKey = join(runtimeDir, 'browser-receipt-key')
-  if (job.writeEnabled) {
+  if (!delegation && job.writeEnabled) {
     atomicWritePrivateFile(browserKey, randomBytes(32).toString('hex') + '\n')
     servers.zerokun_browser = spec('browser-verification-broker.ts', [contextPath, stateDir, artifactDir, scratchDir, 'complete', browserKey])
     servers.zerokun_cloud_logging = spec('cloud-logging-broker.ts', [contextPath, stateDir])
@@ -126,6 +131,7 @@ export function prepareClaudeJobContext(job: JobRecord, stateInput: string) {
         jobId: job.id, attemptNonce, processNonce, entrypoint: chrome }))
     }
   }
+  if (delegation) for (const name of Object.keys(servers)) if (name !== 'zerokun_runtime') delete servers[name]
   const mcpPath = join(runtimeDir, 'mcp.json'), settingsPath = join(runtimeDir, 'claude-settings.json')
   atomicWritePrivateFile(mcpPath, JSON.stringify({ mcpServers: servers }))
   const readonlyToolsPath = join(runtimeDir, 'readonly-tools.json')
@@ -149,9 +155,17 @@ export function prepareClaudeJobContext(job: JobRecord, stateInput: string) {
   const globalInstructions = existsSync(globalPath)
     ? readOptionalBoundedAtomicOwnedFile(globalPath, 256 * 1024, 'global instructions')?.toString('utf8') ?? '' : ''
   const systemPromptPath = join(runtimeDir, 'instructions.txt')
-  atomicWritePrivateFile(systemPromptPath, claudePrimaryInstructions(job, { artifactDir, scratchDir,
+  atomicWritePrivateFile(systemPromptPath, delegation ? [CODEX_WORKER_SAFETY_PROMPT,
+    'You are a delegated Claude worker. The parent Codex remains primary and owns integration, reviews, approval and delivery.',
+    'Implement only the assigned subtask. Read applicable project instructions, preserve concurrent changes, and do not delegate again or run another AI CLI.',
+    'Use zerokun_runtime.execute/wait_command/stop_command for sandboxed file reads, edits and tests; view_image for images.',
+    'No host settings, credentials, unrelated sessions, direct Herdr control or external publication. Do not commit, push, message others or change the parent goal.',
+    job.writeEnabled ? 'Project edits within the assigned task are authorized.' : 'This delegation is read-only; do not change project or external state.',
+    `Shared task artifacts: ${artifactDir}. Shared scratch: ${scratchDir}. Read-only task inputs: ${inputDir}. Use a subdirectory named ${job.id} for your generated files. Report changed files, checks and incomplete work to the parent.`,
+    retainedArtifactInstructions(retained.manifest),
+  ].join('\n\n') : claudePrimaryInstructions(job, { artifactDir, scratchDir,
     retainedManifest: retained.manifest, globalInstructions, chrome: Boolean(chrome) }))
-  let pinnedModel = readClaudeJobModel(stateDir, job.id, jobRepo)
+  let pinnedModel = delegation?.model ?? readClaudeJobModel(stateDir, job.id, jobRepo)
   const argumentsFor = (sessionId: string, resume: boolean, readonly = false): string[] => [
     '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--replay-user-messages',
     '--restricted', '--tools', '', '--no-chrome', '--disable-slash-commands', '--strict-mcp-config', '--mcp-config', readonly ? readonlyMcpPath : mcpPath,

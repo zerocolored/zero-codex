@@ -146,3 +146,34 @@ describe('current model catalog',()=>{
   expect(calls).toBe(1)
  })
 })
+
+describe('delegation roles and primary correction',()=>{
+ test('delegation and media stay in authored task; explicit primary selection remains separate',async()=>{
+  const f=store();const task='GPT Image 2.5を使って動画化し、opus5.5に依頼してください';f.add('one',1,task)
+  const run=async(text:string)=>classifyTaskModel(text,models,null,undefined,async prompt=>{
+   expect(prompt).toContain('PRIMARY Codex app-server worker');expect(prompt).toContain('Latest author message: '+JSON.stringify(task));return JSON.stringify(none)
+  })
+  expect(await f.selections.resolve('one',[{revision:1,task}],models,undefined,run)).toBe('gpt-6-astra')
+  f.add('two',2,'Solで主担当を続け、Opusに依頼')
+  expect(await f.selections.resolve('two',[{revision:1,task:'Solで主担当を続け、Opusに依頼'}],models,undefined,async()=>sol)).toBe('gpt-6-sol');f.db.close()
+ })
+ test('explicit correction clears a durable error and keeps last valid primary across jobs',async()=>{
+  const f=store();f.add('one',1,'Solで');await f.selections.resolve('one',[{revision:1,task:'Solで'}],models,undefined,async()=>sol)
+  f.add('two',2,'Opusに依頼')
+  await expect(f.selections.resolve('two',[{revision:1,task:'Opusに依頼'}],models,undefined,async()=>({...none,decision:'unsupported'}))).rejects.toThrow('unsupported')
+  const inputs=[{revision:1,task:'Opusに依頼'},{revision:2,task:'続けて'}]
+  await expect(f.selections.resolve('two',inputs,models,undefined,async()=>({...none,continuation:true}))).rejects.toThrow('unsupported')
+  const correction='主担当は変えない。Opusは委任先です'
+  expect(await f.selections.resolve('two',[...inputs,{revision:3,task:correction}],models,undefined,async()=>({...none,decision:'retain',evidence:correction,continuation:true}))).toBe('gpt-6-sol')
+  expect(await f.selections.resolve('two',inputs,models,undefined,async()=>{throw Error('no replay')})).toBe('gpt-6-sol');f.db.close()
+ })
+ test('correction is grounded and restores default only when no valid choice exists',async()=>{
+  const text='主担当は変えない'
+  await expect(classifyTaskModel(text,models,null,undefined,async()=>JSON.stringify({...none,decision:'retain'}))).rejects.toThrow('unavailable')
+  expect((await classifyTaskModel(text,models,null,undefined,async()=>JSON.stringify({...none,decision:'retain',evidence:text}))).decision).toBe('retain')
+  const f=store();f.add('one',1,'Opusに依頼')
+  await expect(f.selections.resolve('one',[{revision:1,task:'Opusに依頼'}],models,undefined,async()=>({...none,decision:'unsupported'}))).rejects.toThrow('unsupported')
+  f.add('two',2,text)
+  expect(await f.selections.resolve('two',[{revision:1,task:text}],models,undefined,async()=>({...none,decision:'retain',evidence:text,continuation:true}))).toBe('gpt-6-astra');f.db.close()
+ })
+})

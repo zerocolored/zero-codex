@@ -12552,6 +12552,10 @@ export class JobStore {
          FROM jobs AS j
          WHERE status IN ('completed', 'failed') AND finished_at IS NOT NULL AND finished_at < ?
            AND NOT EXISTS (
+             SELECT 1 FROM cloud_handoff_jobs AS c
+             WHERE c.job_id = j.id AND c.state <> 'active'
+           )
+           AND NOT EXISTS (
              SELECT 1 FROM terminal_notifications AS n
              WHERE n.job_id = j.id AND n.delivered_at IS NULL
            )
@@ -12687,6 +12691,9 @@ export class JobStore {
         this.db.run('DELETE FROM job_native_turns WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_phase_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_initial_dispatches WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM monitor_failures WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM cloud_handoff_context WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM cloud_handoff_jobs WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM jobs WHERE id = ?', [row.id])
         prunedCandidates.push(row)
       }
@@ -18183,7 +18190,7 @@ async function runCli(): Promise<void> {
         if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
           store.retireMonitorObligation(jobId)
           log(`retired ${jobId} monitor after entering UI/UX approval wait`)
-          return 'terminalized'
+          return 'unarmed'
         }
         if ((status === 'queued' || status === 'running')
           && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE)) {
@@ -18378,7 +18385,7 @@ async function runCli(): Promise<void> {
       if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
         store.retireMonitorObligation(jobId)
         log(`retired ${jobId} monitor after entering UI/UX approval wait`)
-        return 'terminalized'
+        return 'unarmed'
       }
       if ((status === 'queued' || status === 'running')
         && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE)) {

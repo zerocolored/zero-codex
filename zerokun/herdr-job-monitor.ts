@@ -740,7 +740,7 @@ export function archiveStoppedHerdrMonitor(input: {
   if (input.status === 'running') return false
   const stateDir = requireManagedStateRoot(input.stateDir)
   const archivedRoot = ensureManagedDirectory(stateDir, join(stateDir, DETACHED_MONITOR_ROOT))
-  const destination = join(archivedRoot, safeJobId(input.jobId))
+  let destination = join(archivedRoot, safeJobId(input.jobId))
   let directory: string
   try { directory = monitorDirectory(stateDir, input.jobId) } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
@@ -750,8 +750,15 @@ export function archiveStoppedHerdrMonitor(input: {
   if (!manifest || !manifest.viewerProcess) return false
   const status = (input.processStatus ?? (process => observeProcessGeneration(process).status))(manifest.viewerProcess)
   if (status !== 'dead') return false
-  // rename preserves every feed and receipt. Keep the source if a previous
-  // archive already exists, rather than overwriting evidence.
+  // A parked job may resume and lose another viewer on a later restart.
+  // Preserve earlier generations instead of blocking on their archive.
+  try {
+    lstatSync(destination)
+    destination = join(archivedRoot, `${safeJobId(input.jobId)}.${manifest.operationId}`)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  // Never overwrite an existing generation, including unexpected collisions.
   try { lstatSync(destination); return false } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
@@ -2427,9 +2434,33 @@ export async function reconcileHerdrJobMonitors(input: {
       }
     }
     const manifest = readMonitorManifest(stateDir, name)
-    if (!manifest || manifest.jobId !== name
-      || manifest.controlPlaneFingerprint !== herdrControlPlaneFingerprint(input.runtime)) {
+    if (!manifest || manifest.jobId !== name) {
       throw new Error(`monitor state is invalid for job ${name}`)
+    }
+    if (manifest.controlPlaneFingerprint !== herdrControlPlaneFingerprint(input.runtime)) {
+      // Herdr can restore tab IDs after restarting while the recorded viewer
+      // is gone. Those IDs no longer authorize a close/run on the new server.
+      // Startup has already reconciled executors before providing this callback.
+      if (!input.recoverMissingBindingAfterExecutorsStopped || !manifest.viewerProcess
+        || control.processGenerationStatus(manifest.viewerProcess) !== 'dead') {
+        throw new HerdrJobMonitorPendingError(`previous Herdr monitor is not stopped for ${name}`)
+      }
+      const status = input.getJob(name)?.status ?? 'missing'
+      const disposition = recoverObligation(name, status, obligations().get(name)?.state ?? 'required')
+      if (disposition === 'staged-result') {
+        throw new HerdrJobMonitorPendingError(
+          `staged execution remains blocked after losing its Herdr monitor: ${name}`,
+        )
+      }
+      // Persist the job disposition first. A crash before this rename can be
+      // retried without losing its obligation or replaying unfinished work.
+      if (!archiveStoppedHerdrMonitor({
+        stateDir, jobId: name, status: input.getJob(name)?.status ?? 'failed',
+        processStatus: process => control.processGenerationStatus(process),
+      })) throw new HerdrJobMonitorPendingError(`could not archive previous Herdr monitor for ${name}`)
+      await input.onMonitorRetired?.(name)
+      closed += 1
+      continue
     }
     // Reconcile staged generation files even when the DB row became terminal
     // during earlier result/advisor-cleanup recovery, and before a queued
