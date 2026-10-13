@@ -191,6 +191,15 @@ codex <trust-args> -C <repo> \
   interruptのterminal確認後にモデルを再設定して次turnへ一度だけ渡します。
   選択値と`medium`を`thread/start`／`thread/resume`、全`turn/start`へ明示し、handshakeの実効値も照合します。
   App Serverプロセス自体の既定モデルは引き続きrelease管理です。
+  `opus5.5に依頼して`などの委任先や`GPT Image 2.5`などの画像・動画生成モデルは、主担当変更と区別します。
+  主担当を変えないという明示的な訂正は、過去の誤判定を解除して直前の有効な主担当モデルを保持します。
+  単なる「続けて」では未解決の主担当指定を取り消しません。
+- 明示的に依頼されたOpus作業は`zerokun_delegation`のstart/poll/cancelで専用のHerdrタブへ渡します。
+  指定したnative model IDを照合し、別モデルへ自動代替しません。主担当Codexと固定Fableレビュー枠は変更しません。
+  委任先は親タスクのprojectとwrite権限を継承したsandbox内で作業し、session・goal・実行記録を分離します。
+  同じkeyの再送は保存済み実行を参照し、送達不明時に再実行しません。主担当が結果の統合・検証・公開を担当します。
+  親タスクの入力・成果物を共有し、長い回答の全文は`resultPath`から読み取れます。委任中は親の完了を受理せず、同じnative goalで結果の回収を続けます。
+
 
   `ZEROKUN_JOB_MODEL`や利用者のCodex設定には依存しません。
   設計advisorは`medium`、レビューadvisorは`low`です。release内のread-only／neverなrole TOMLを

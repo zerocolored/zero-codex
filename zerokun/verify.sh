@@ -392,6 +392,7 @@ for entry in \
   zerokun/standalone-codex.ts \
   zerokun/codex-executor.ts \
   zerokun/claude-executor.ts \
+  zerokun/claude-delegation-broker.ts \
   zerokun/claude-pane-runtime.ts \
   zerokun/primary-tools-broker.ts \
   zerokun/core-command.ts \

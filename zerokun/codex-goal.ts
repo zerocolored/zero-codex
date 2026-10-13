@@ -31,3 +31,13 @@ export async function ensureTaskGoal(session: GoalSession, threadId: string, tas
     await session.request('thread/goal/set', { threadId, status: 'active' }, { timeoutMs: 15_000 })
   }
 }
+
+/** A complete parent must first collect its still-running delegated work. This
+ * resumes the existing native goal, never starts a second synthetic user turn. */
+export async function retainGoalForDelegation(session: GoalSession, threadId: string, taskId: string,
+  goal: NativeGoal | null, delegationId: string | null): Promise<NativeGoal | null> {
+  if (!delegationId || goal?.status !== 'complete') return goal
+  const objective = taskGoalObjective(taskId) + ` Existing Claude delegation ${delegationId} is still running. Poll that same id with claude_delegate_poll, inspect its result and changes, then finish verification and delivery. Do not launch it again.`
+  await session.request('thread/goal/set', { threadId, objective, status: 'active' }, { timeoutMs: 15_000 })
+  return { objective, status: 'active' }
+}

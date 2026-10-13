@@ -1,3 +1,5 @@
+import { pendingClaudeDelegation } from './claude-delegation-state.ts'
+import { retainGoalForDelegation } from './codex-goal.ts'
 import { loadTaskModelCatalog, requireAvailableTaskModel, type ModelRequest, type TaskModel } from './task-model-selection.ts'
 import { createUsageRecorder } from './task-usage.ts'
 import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
@@ -4063,6 +4065,9 @@ export function buildCodexDeveloperInstructions(
         'configuration failures make that advisor unavailable; they do not require task goal blocked.',
         'Never inspect or invoke Grok, Claude, Herdr, their authentication, helper files, sockets,',
         'or processes directly; zerokun_advisors is the only external-advisor route.',
+        'Explicit user requests such as Opusに依頼 or HerdrでClaudeに任せて are delegated work, not primary model switches or fixed Fable reviews.',
+        'Use zerokun_delegation.claude_delegate_start/poll/cancel for that requested Claude worker. Use the requested native model ID, a stable key, and a concrete bounded subtask. Never substitute Fable or the primary model.',
+        'Obtain any required user UX approval before delegating product edits. You remain primary: provide ownership and approved scope, preserve concurrent edits, wait for the child, inspect changes, test, review and deliver. Do not complete while delegated work is running.',
         ...(job.writeEnabled && _browserEnabled ? [GROK_OAUTH_BROWSER_AUTHORIZATION] : []),
         'When reporting advisor coverage, use only the returned slotSummary. requested/total means',
         'slots requested, not slots started. Say all three ran or answered only when slotSummary',
@@ -5646,6 +5651,7 @@ export function buildCodexPermissionOverrides(
     profile?: string
     reproductionMcp?: { command: string; args: string[] }
     advisorMcp?: { command: string; args: string[] }
+    delegationMcp?: { command: string; args: string[] }
     browserMcp?: { command: string; args: string[] }
     githubMcp?: { command: string; args: string[] }
     cloudLoggingMcp?: { command: string; args: string[] }
@@ -5983,6 +5989,11 @@ export function buildCodexPermissionOverrides(
     mcpEntries.push(
       `zerokun_reproduction={command=${tomlString(options.reproductionMcp.command)},args=[${options.reproductionMcp.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["codex_reproduction_start","codex_reproduction_poll"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=60}`,
     )
+  }
+  if (options.delegationMcp) {
+    const transport = options.delegationMcp
+    const names = ['claude_delegate_start', 'claude_delegate_poll', 'claude_delegate_cancel']
+    mcpEntries.push(`zerokun_delegation={command=${tomlString(transport.command)},args=[${transport.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=[${names.map(tomlString).join(',')}],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=60,tools={${names.map(name => `${name}={approval_mode="approve"}`).join(',')}}}`)
   }
   if (options.advisorMcp) {
     mcpEntries.push(
@@ -6958,6 +6969,7 @@ export async function executeCodexJob(
     }
     return path
   }
+  const delegationBrokerPath = requireSafeBroker('claude-delegation-broker.ts')
   const reproductionBrokerPath = requireSafeBroker('codex-reproduction-broker.ts')
   const brokerPath = requireSafeBroker('advisor-broker.ts')
   const browserBrokerPath = requireSafeBroker('browser-verification-broker.ts')
@@ -7159,6 +7171,11 @@ export async function executeCodexJob(
           attachments_json: JSON.stringify(job.attachments),
           input_revision: 1,
         }, []))
+      const delegationContextPath = join(runtimeDir, 'delegation-context.json')
+      const delegationEnabled = testCodexBin === undefined && stage === 'complete' && !continuationDecision
+      if (delegationEnabled) atomicWritePrivateFile(delegationContextPath, JSON.stringify({ version: 1, stateDir: managedStateDir, job: { ...job, task: '', result: null, lastError: null } }))
+      const delegationMcp = delegationEnabled ? { command: realpathSync(process.execPath),
+        args: ['--config=/dev/null', '--no-env-file', delegationBrokerPath, delegationContextPath, managedStateDir] } : undefined
       const advisorMcp = testCodexBin === undefined && !continuationDecision
         && stage !== 'implementation' && stage !== 'interjection' ? {
           command: realpathSync(process.execPath),
@@ -7242,6 +7259,7 @@ export async function executeCodexJob(
         writeGitRoots,
         profile: permissionProfile,
         advisorMcp,
+        delegationMcp,
         reproductionMcp,
         browserMcp,
         githubMcp,
@@ -9061,6 +9079,8 @@ export async function executeCodexJob(
                 process.stderr.write('zerochan: intermediate attachment observation unavailable; continuing native goal.\n')
               }
               let goal = await readTaskGoal(session, currentThreadId)
+              goal = await retainGoalForDelegation(session, currentThreadId, job.id, goal,
+                pendingClaudeDelegation(managedStateDir, job.id))
               let nativeTurn = session.takeNativeTurnStart(currentThreadId, parentTurnIds)
               if (goal?.status === 'active' || nativeTurn) {
                 controls.finishTurn({
