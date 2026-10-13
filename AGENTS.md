@@ -1,5 +1,22 @@
 # zero-codex working instructions
 
+## push前の最新コード取り込み（必須）
+
+- pushする前に、remote、対象branchとupstream、worktree、未コミット変更を確認し、
+  remoteとbranchを明示した`git pull`で最新コードをローカルへ取り込む。
+  `git fetch`だけで済ませたり、remote-tracking refの更新をローカルの更新として報告したりしない。
+- 既存の作業branchはそのremote branchからpullし、`main`の更新もfetchして作業branchへ取り込む。
+  新規branchの初回pushではremote側に同名branchがまだないため、先に元cloneの`main`で
+  `git pull --ff-only origin main`を実行し、その最新commitを作業branchへ反映する。
+- 別worktreeで作業した場合も、元cloneの`main`を古いまま放置しない。
+  push前とPRのマージ後に元cloneで`git pull --ff-only origin main`を実行し、
+  作業branchのpush状態と元cloneの同期状態をそれぞれ確認する。
+- pullで競合や履歴分岐が生じた場合は、ローカル・リモート双方の変更を保持して統合し、
+  影響箇所を再検証してからpushする。無関係な変更を含めず、自動stash、reset、force-pushは行わない。
+  未コミット変更や認証・通信の問題で安全に同期できない場合はpushを止め、理由と未同期の状態を報告する。
+- push直前にリモートがさらに進んでいれば再度取り込み、必要な検証を行う。
+  完了報告ではpullしたbranchとcommit、push結果、元cloneとremoteのahead／behindを明記する。
+
 ## 新しいMacのセットアップ依頼
 
 ユーザーがこのcloneで「セットアップして」「新しいMacへ入れて」などと依頼した場合は、
