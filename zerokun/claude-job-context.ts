@@ -52,6 +52,7 @@ export function claudePrimaryInstructions(job: JobRecord, input: {
     'Use zerokun_github for authenticated issue reads, fetch, branch publication and pull requests when needed. A public 404 or absent shell login does not prove the host capability is unavailable.',
     'Use zerokun_usage.task_usage_read for this task\'s numeric usage, including prior tasks in this conversation. Missing/partial records are not zero.',
     ...(job.writeEnabled ? [
+      'For an authorized Unity project task, use zerokun_runtime.unity_editor action=open to start the project and action=status to verify its MCP response. The ordinary execute sandbox cannot launch a native GUI Editor or reach all license/Package Manager IPC; that local denial is not a failed Unity license. This host capability is the supported route, not permission to bypass the shell sandbox. Like a normal Unity launch, it runs this project’s Editor scripts and package code with host permissions; use it only within the user-authorized project task. Do not ask the user to launch Unity manually before trying it. Poll status without repeatedly launching. The Editor persists after the job; never close unrelated Editors. A software-terms agreement or actual login still requires the user. Project .mcp.json is not automatically loaded by this core; this tool checks the installed Unity MCP against the pinned project. Use the installed Unity CLI through execute for subsequent authorized project operations.',
       'For local browser evidence use zerokun_browser.verify_local_page. Use zerokun_cloud_logging for scoped project logs and registered historical evidence. An empty registry is not proof no evidence exists elsewhere.',
       'Use installed cloud CLIs with their normal configuration for authorized work. Never copy tokens, print secret configuration or infer authentication failure solely from a local execution denial.',
     ] : []),
@@ -99,7 +100,7 @@ export function prepareClaudeJobContext(job: JobRecord, stateInput: string) {
   const toolsContextPath = join(runtimeDir, 'tools.json'), goalPath = join(runtimeDir, 'goal.json')
   const toolsContext: PrimaryToolsContext = { version: 1, jobId: job.id, cwd: jobRepo, stateDir, goalPath, profile,
     permissionOverrides: overrides, codex: resolveOfficialStandaloneCodex(), shellEnvironment: parsed.shell_environment_policy.set,
-    fingerprintDenyPath: fingerprint.deny.path }
+    fingerprintDenyPath: fingerprint.deny.path, allowUnityEditor: job.writeEnabled }
   atomicWritePrivateFile(toolsContextPath, JSON.stringify(toolsContext))
   atomicWritePrivateFile(goalPath, JSON.stringify({ objective: taskGoalObjective(job.id), status: 'active' }))
   const spec = (file: string, args: string[]): McpSpec => ({ command: realpathSync(process.execPath),
@@ -136,6 +137,7 @@ export function prepareClaudeJobContext(job: JobRecord, stateInput: string) {
   })
   atomicWritePrivateFile(readonlyToolsPath, JSON.stringify({ ...toolsContext,
     allowGoalUpdate: false,
+    allowUnityEditor: false,
     permissionOverrides: readonlyOverrides,
     shellEnvironment: (Bun.TOML.parse(readonlyOverrides.join('\n')) as any).shell_environment_policy.set }))
   const readonlyMcpPath = join(runtimeDir, 'readonly-mcp.json')

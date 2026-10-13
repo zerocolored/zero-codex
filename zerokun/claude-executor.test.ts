@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { JobStore } from './job-runner.ts'
@@ -133,6 +133,21 @@ test('physical retry reuses the logical advisor ledger and model while renewing 
     expect(resumed.pinnedModel).toBe('claude-opus-5-5')
     expect(() => resumed.pinModel('claude-opus-different')).toThrow('changed')
   } finally { resumed.retire() }
+})
+
+test('Unity native capability is host-authorized and removed from read-only interjections', () => {
+  const f = fixture('complete')
+  for (const writeEnabled of [false, true]) {
+    const context = prepareClaudeJobContext({ ...f.job, writeEnabled }, f.state)
+    try {
+      expect(context.toolsContext.allowUnityEditor).toBe(writeEnabled)
+      const readonlyArgs = context.argumentsFor('00000000-0000-4000-8000-000000000000', false, true)
+      const mcpFile = readonlyArgs[readonlyArgs.indexOf('--mcp-config') + 1]!
+      const mcp = JSON.parse(readFileSync(mcpFile, 'utf8'))
+      const readonlyContext = JSON.parse(readFileSync(mcp.mcpServers.zerokun_runtime.args.at(-1), 'utf8'))
+      expect(readonlyContext.allowUnityEditor).toBe(false)
+    } finally { context.retire() }
+  }
 })
 
 test('Claude completion is sealed in the real job ledger only after process cleanup', async () => {

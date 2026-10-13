@@ -500,6 +500,19 @@ zerochan set core codex    # Codexへ戻す場合も、その後start
 Claudeの利用可能なsubscription認証を起動時に確認し、未認証の場合はstartを終了して現在の担当を保持します。
 Codex CLIは実行sandboxと独立GPTレビューにも使うため、Claudeモードでも必要です。
 主担当の設定は`.zerochan/primary-core.json`へ保存し、既存のチャンネル設定形式は変更しません。
+
+Claude CodeモードでUnityプロジェクトを扱う場合は、ホスト側の
+`zerokun_runtime.unity_editor`（`open` / `status`）でEditorを起動し、公式Unity MCPの
+`editor_status`応答まで確認します。対象は現在のprojectに固定され、任意のコマンド、別project、
+project内の`.mcp.json`をホスト権限で実行する機能ではありません。
+ただし通常のUnity起動と同様、project内のEditorスクリプトやパッケージのコードは
+Editorのホスト権限で実行されます。依頼で許可されたproject作業に限って使用します。
+macOSのUnity Hub標準配置にある、ProjectVersion.txtと一致するUnity署名済みEditorと、
+導入済みのUnity署名済みCLIを使います。未導入Editorの自動インストールやversion変更はしません。
+通常のshell sandboxにはUnityのライセンス／Package Manager／GUI通信を開放せず、
+この起動経路だけを分離しています。読取り専用依頼・割込み質問には公開しません。
+初回の規約同意や本人loginは本人操作が必要です。起動したEditorはjob終了後も開いたままで、
+既存Editorをこのツールから終了させることはありません。Codexモードの設定は変わりません。
 旧版のrunnerが稼働中の場合は、現在のサービスを保持して起動を終了します。更新後に再起動してから設定を反映してください。
 基準タグへ戻す場合は、受付済みのClaudeジョブを完了または取消し、`zerochan set core codex`、`zerochan stop`を実行してから旧版へ切り替えてください。
 設計・最終レビューのGPT・Fable 5.1・Grokの3枠、Slackの通知と成果物配信は両モードで共通です。

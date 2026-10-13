@@ -12,6 +12,7 @@ import { buildCodexChildEnvironment } from './codex-executor.ts'
 import { captureTrackedProcesses, reapTrackedProcesses } from './process-tree.ts'
 import { readProcessIdentity, type ProcessIdentity } from './process-generation.ts'
 import { taskGoalObjective, type NativeGoal } from './codex-goal.ts'
+import { UnityEditorRuntime } from './unity-editor-runtime.ts'
 
 /** Claude supplies decisions and tool inputs. Codex's existing permission
  * engine executes commands; it performs no model turn or task planning here. */
@@ -27,6 +28,8 @@ export interface PrimaryToolsContext {
   shellEnvironment: Record<string, string>
   fingerprintDenyPath?: string
   allowGoalUpdate?: boolean
+  /** Host-derived write authorization. Never accepted from a tool argument. */
+  allowUnityEditor?: boolean
 }
 
 interface Execution {
@@ -68,7 +71,10 @@ function spawnCommand(context: PrimaryToolsContext, argv: string[], cwd: string)
 export class PrimaryToolRuntime {
   private executions = new Map<string, Execution>()
   private closing = false
-  constructor(readonly context: PrimaryToolsContext) {}
+  readonly unity: UnityEditorRuntime
+  constructor(readonly context: PrimaryToolsContext) {
+    this.unity = new UnityEditorRuntime(context.cwd, context.allowUnityEditor === true, undefined, context.stateDir)
+  }
 
   async execute(input: { command: string; cwd?: string; yieldMs?: number }) {
     return this.startCommand(['/bin/zsh', '-c', input.command], input.cwd, input.yieldMs)
@@ -179,7 +185,7 @@ export class PrimaryToolRuntime {
 
   async close(): Promise<void> {
     this.closing = true
-    const results = await Promise.allSettled([...this.executions.keys()].map(id => this.stop(id)))
+    const results = await Promise.allSettled([this.unity.close(), ...[...this.executions.keys()].map(id => this.stop(id))])
     const failure = results.find(result => result.status === 'rejected')
     if (failure?.status === 'rejected') throw failure.reason
   }
@@ -208,6 +214,10 @@ export function registerPrimaryTools(server: McpServer, runtime: PrimaryToolRunt
     try { return textResult(await action(input)) }
     catch (error) { return { ...textResult({ error: error instanceof Error ? error.message : 'primary tool failed' }), isError: true } }
   }
+  if (runtime.context.allowUnityEditor === true) server.registerTool('unity_editor', {
+    description: 'Open the current project in its installed Unity Editor, or inspect its real MCP readiness. Uses a host-owned native launcher so license, GUI and Package Manager IPC work. No project path or arbitrary command is accepted. Prefer this over execute for Unity startup; poll action=status during import. The Editor stays open across jobs. Software terms or login require the user. connected requires an actual read-only editor_status MCP response; mere process presence is insufficient.',
+    inputSchema: { action: z.enum(['open', 'status']) },
+  }, guarded(({ action }) => runtime.unity.run(action)))
   server.registerTool('execute', {
     description: 'Run a shell command in the current task permission sandbox. Use rg/read commands for investigation and normal project tools for edits/tests. Returns a sessionId if still running; poll that exact session, never repeat an unconfirmed command. No automatic permission escalation. cwd defaults to the project.',
     inputSchema: { command: z.string().min(1).max(128 * 1024), cwd: z.string().max(4096).optional(), yieldMs: z.number().int().min(0).max(30_000).optional() },
