@@ -154,6 +154,30 @@ export function writeLastConnectedProject(
   return record
 }
 
+/** App-scoped successful starts survive missing disks and process shutdown. */
+export function readStartedProjects(stateDir: string, appId: string): string[] {
+  const raw = readOptionalBoundedOwnerOnlyRegularFile(join(stateDir, 'started-projects.json'), 512 * 1024)
+  if (raw === null) return []
+  const value = JSON.parse(raw)
+  if (value?.version !== 1 || value.appId !== appId || !Array.isArray(value.projects)
+    || value.projects.length > 512 || value.projects.some((path: unknown) =>
+      typeof path !== 'string' || !isAbsolute(path) || path.includes('\0'))) {
+    throw new Error('saved started projects are invalid')
+  }
+  return [...new Set<string>(value.projects)]
+}
+
+/** Call under the service mutation/startup lease, including already-running starts. */
+export function rememberStartedProject(stateDir: string, projectDir: string, appId: string): void {
+  if (!/^A[A-Z0-9]+$/.test(appId)) throw new Error('invalid started-project App identity')
+  const project = physicalDirectory(projectDir, 'started Slack project')
+  const projects = [project, ...readStartedProjects(stateDir, appId).filter(path => path !== project)]
+  if (projects.length > 512) throw new Error('saved started projects exceed limit')
+  const content = JSON.stringify({ version: 1, appId, projects }) + '\n'
+  if (Buffer.byteLength(content) > 512 * 1024) throw new Error('saved started projects exceed size limit')
+  atomicWritePrivateFile(join(stateDir, 'started-projects.json'), content)
+}
+
 function usage(): never {
   throw new Error(
     'usage: project-selection.ts validate-launch <project> <runtime-repo> <state-dir> [home-dir]'

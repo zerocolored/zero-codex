@@ -509,6 +509,14 @@ Codex CLIは実行sandboxと独立GPTレビューにも使うため、Claudeモ�
 対象projectとして、現在のHerdr workspaceへ新しい `Zeroちゃん runtime` tabを作り、gatewayとrunnerの
 安定起動を確認して元のterminalへ戻ります。既に正常稼働中ならprocessを入れ替えず、主担当の設定を新規依頼へ反映します。
 
+正常に起動した接続は、このMacにApp単位で保存します。Macを再起動して同じユーザーでログインすると、
+watchdogがHerdrとZeroちゃんを自動復旧します（ログイン前は起動しません）。同じSlack Appを使うprojectは
+1つのgatewayを共有し、保存済みchannel設定で再接続します。`zerochan stop`、`stop --force`、
+Ctrl-Cで意図的に停止したAppは自動再開しません。再開する場合は`zerochan start`を実行してください。
+ネットワーク未接続やprojectのdisk未接続は、起動履歴を消さずに約1分ごとの監視で再試行します。
+最後に起動したprojectが使えない場合は、同じAppで起動済みの別projectから復旧します。
+標準のHerdr sessionは自動起動できます。独自socket pathを使うHerdrは、そのserver側の起動設定も必要です。
+
 runtime log tabを作り直す場合は `zerochan stop` → `zerochan start` を使います。`stop`はrunnerの
 新規job取得を止めてから実行中jobが0件であることを再確認し、実行中ならprocessへsignalせず拒否します。
 待機中jobとSlack channel設定は保持されます。停止に成功するとgateway、runner、所有確認できたruntime tabを

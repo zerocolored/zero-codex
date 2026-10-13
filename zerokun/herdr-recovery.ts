@@ -1,3 +1,4 @@
+import { ensureHerdrServer } from './herdr-server.ts'
 import { randomUUID } from 'crypto'
 import { realpathSync } from 'fs'
 import { basename, join } from 'path'
@@ -11,6 +12,8 @@ import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from 
 export const RECOVERY_WORKSPACE_FILE = 'service-recovery-workspace.json'
 
 type Hooks = {
+  allowColdStart?: boolean
+  ensureServer?: typeof ensureHerdrServer
   verify?: (runtime: HerdrRuntimeIdentity) => Promise<void>
   invoke?: (args: string[]) => Promise<any>
   capture?: (runtime: HerdrRuntimeIdentity) => HerdrRuntimeIdentity
@@ -29,6 +32,7 @@ export async function recoveryControlRuntime(
   previous: HerdrRuntimeIdentity,
   hooks: Hooks = {},
 ): Promise<HerdrRuntimeIdentity> {
+  if (hooks.allowColdStart) await (hooks.ensureServer ?? ensureHerdrServer)(previous)
   const verify = hooks.verify ?? (runtime => verifyHerdrRuntimeIdentityAsync(
     runtime, environmentForPinnedHerdrRuntime(runtime),
   ))

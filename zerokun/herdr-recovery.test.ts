@@ -98,3 +98,28 @@ test.each(['project', 'socket', 'terminal'])('obsolete %s receipt is replaced wi
   await recoveryControlRuntime(state, nextProject, current, hooks)
   expect(creates).toBe(2)
 })
+
+
+test('cold recovery restores the exact server before looking up stale pane receipts', async () => {
+  const state = fixture(); const events: string[] = []
+  await recoveryControlRuntime(state, state, old, {
+    allowColdStart: true,
+    ensureServer: async runtime => { expect(runtime).toEqual(old); events.push('server') },
+    verify: async runtime => { events.push('verify'); if (runtime.paneId === old.paneId) throw missing },
+    invoke: async args => { events.push('create'); return created(args, state) },
+    capture: runtime => runtime,
+  })
+  expect(events[0]).toBe('server')
+  expect(events.filter(event => event === 'create')).toHaveLength(1)
+})
+
+test('a surviving service never authorizes a cold server launch', async () => {
+  const state = fixture(); let launched = false
+  await recoveryControlRuntime(state, state, old, {
+    allowColdStart: false,
+    ensureServer: async () => { launched = true },
+    verify: async runtime => { if (runtime.paneId === old.paneId) throw missing },
+    invoke: async args => created(args, state), capture: runtime => runtime,
+  })
+  expect(launched).toBe(false)
+})

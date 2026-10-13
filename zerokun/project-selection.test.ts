@@ -14,6 +14,8 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   lastConnectedProjectPath,
+  readStartedProjects,
+  rememberStartedProject,
   projectGitExecutable,
   readLastConnectedProject,
   validateLaunchProject,
@@ -192,4 +194,19 @@ describe('zerochan project selection', () => {
     symlinkSync(target, lastConnectedProjectPath(value.state))
     expect(() => readLastConnectedProject(value.state)).toThrow()
   })
+})
+
+
+test('successful project starts persist as an App-scoped set even while a disk is unavailable', () => {
+  const { root, state, project } = fixture()
+  const other = join(root, 'other'); mkdirSync(other)
+  rememberStartedProject(state, project, 'AONE')
+  rememberStartedProject(state, other, 'AONE')
+  rememberStartedProject(state, project, 'AONE')
+  const saved = readStartedProjects(state, 'AONE')
+  expect(saved).toEqual([realpathSync(project), realpathSync(other)])
+  rmSync(project, { recursive: true })
+  expect(readStartedProjects(state, 'AONE')).toEqual(saved)
+  expect(() => readStartedProjects(state, 'ATWO')).toThrow('invalid')
+  expect(lstatSync(join(state, 'started-projects.json')).mode & 0o777).toBe(0o600)
 })

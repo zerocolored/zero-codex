@@ -80,7 +80,7 @@ import {
   clearGatewayReadiness,
   writeGatewayReadiness,
 } from './zerokun/readiness.ts'
-import { writeLastConnectedProject } from './zerokun/project-selection.ts'
+import { writeLastConnectedProject, rememberStartedProject } from './zerokun/project-selection.ts'
 import {
   ensureManagedDirectory,
   requireManagedStateRoot,
@@ -2890,6 +2890,7 @@ try {
   slackSocket.arm()
   setInterval(checkApprovals, 5_000).unref()
   const connectedProjectDir = realpathSync(process.cwd())
+  rememberStartedProject(STATE_DIR, connectedProjectDir, identity.appId)
   writeLastConnectedProject(STATE_DIR, connectedProjectDir)
   writeGatewayReadiness(
     READY_FILE,
