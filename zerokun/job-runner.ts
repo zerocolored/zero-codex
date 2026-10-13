@@ -6,7 +6,7 @@ import { reconcileClaudeHerdrTransports } from './claude-herdr-transport.ts'
 import { executeClaudeJob } from './claude-executor.ts'
 import { createPrimaryLiveControlHooks } from './primary-live-controls.ts'
 import { pinClaudeJobModel } from './claude-model-binding.ts'
-import { initializeAudit, AuditSetupRequiredError } from './security-audit-setup.ts'
+import { initializeAudit, AuditSetupRequiredError, AUDIT_ANSWER_VERSION, type AuditSetupReply } from './security-audit-setup.ts'
 import { TaskModelSelections, TASK_MODEL_SCHEMA, MODEL_SELECTION_MESSAGES } from './task-model-selection.ts'
 import { assertSlackProjectAdmission } from './slack-project-admission.ts'
 import { executeSecurityAudit, copyAuditReportForFollowup, auditHasReadinessOnlyResult } from './security-audit.ts'
@@ -984,6 +984,9 @@ CREATE INDEX IF NOT EXISTS idx_commentary_notifications_pending
 CREATE TABLE IF NOT EXISTS audit_setup_waits (
  job_id TEXT PRIMARY KEY, input_revision INTEGER NOT NULL, waiting INTEGER NOT NULL DEFAULT 1,
  notification_key TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS audit_setup_history_checks (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS fleet_queries (
  idempotency_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
@@ -4452,6 +4455,7 @@ export class JobStore {
     } catch {}
     this.nativeConfirmations = new NativeConfirmationStore(this.db)
     this.migrateLegacyThreadAttachments(dirname(dbPath))
+    this.resumeLegacyAuditSetupHistory()
   }
 
   private migrateLegacyThreadAttachments(stateDir: string): void {
@@ -6679,7 +6683,7 @@ export class JobStore {
       const job=this.get(jobId)
       if(!job || job.workflow!=='security-audit' || job.status!=='running') throw Error('audit setup job changed')
       if(job.cancelRequestedAt!==null) { this.cancel(jobId); return }
-      const key=`audit-setup:${jobId}:${inputRevision}`
+      const key=`audit-setup:${jobId}:${inputRevision}:v${AUDIT_ANSWER_VERSION}`
       this.stageStatusNotificationRow({idempotencyKey:key,jobId,chatId:job.chatId,threadTs:job.threadTs,
         kind:'execution-started',payload:prompt,createdAt:Date.now()})
       this.db.run(`INSERT INTO audit_setup_waits(job_id,input_revision,waiting,notification_key) VALUES(?,?,?,?)
@@ -6692,9 +6696,49 @@ export class JobStore {
     }).immediate())
   }
 
-  takeAuditSetupAnswers(job: Pick<JobRecord, 'id' | 'attempts' | 'controlEpoch' | 'inputRevision'>): Array<{
-    text: string; writeEnabled: boolean; revision: number
-  }> {
+  /** Authorized user answers since the last finished audit/cancellation, never
+   * assistant output, attachment text, or permission-unknown original requests. */
+  auditSetupHistory(jobId: string): AuditSetupReply[] {
+    return this.db.query<{
+      task: string; input_revision: number; job_id: string; id: string; workflow: string
+    }, [string]>(`
+      SELECT c.task,c.input_revision,c.job_id,c.id,previous.workflow
+      FROM jobs current JOIN jobs previous
+        ON previous.chat_id=current.chat_id AND previous.thread_ts=current.thread_ts
+        AND previous.repo_path=current.repo_path AND previous.seq<current.seq
+      JOIN job_controls c ON c.job_id=previous.id
+      WHERE current.id=? AND current.workflow='security-audit'
+        AND previous.status IN ('failed','completed') AND previous.cancel_requested_at IS NULL
+        AND c.chat_id=current.chat_id AND c.thread_ts=current.thread_ts
+        AND c.kind='steer' AND c.write_enabled=1 AND c.status<>'superseded'
+        AND c.input_revision<=previous.input_revision
+        AND previous.seq>COALESCE((SELECT MAX(boundary.seq) FROM jobs boundary
+          WHERE boundary.chat_id=current.chat_id AND boundary.thread_ts=current.thread_ts
+            AND boundary.repo_path=current.repo_path AND boundary.seq<current.seq
+            AND ((boundary.workflow='security-audit' AND boundary.status='completed')
+              OR boundary.cancel_requested_at IS NOT NULL OR boundary.terminal_outcome='cancelled')),0)
+      ORDER BY previous.seq,c.input_revision,c.seq
+    `).all(jobId).map(row => ({text:row.task,writeEnabled:true,revision:row.input_revision,
+      sourceJobId:row.job_id,sourceControlId:row.id,...(row.workflow!=='security-audit'?{restrictionsOnly:true}:{})}))
+  }
+
+  private resumeLegacyAuditSetupHistory(): void {
+    retrySqlite(() => this.db.transaction(() => {
+      const waiting=this.db.query<{id:string},[]>(`SELECT j.id FROM jobs j
+        JOIN audit_setup_waits w ON w.job_id=j.id
+        WHERE j.workflow='security-audit' AND j.status='queued' AND j.cancel_requested_at IS NULL
+          AND w.waiting=1 AND NOT EXISTS (SELECT 1 FROM audit_setup_history_checks h WHERE h.job_id=j.id)`).all()
+      for (const row of waiting) {
+        if (!this.auditSetupHistory(row.id).some(answer => !answer.restrictionsOnly)) continue
+        // Re-evaluate an existing parked request once after upgrading. Never
+        // enqueue another job, resurrect a failed job, or alter its old controls.
+        this.db.run('INSERT OR IGNORE INTO audit_setup_history_checks VALUES (?)',[row.id])
+        this.db.run('UPDATE audit_setup_waits SET waiting=0 WHERE job_id=?',[row.id])
+      }
+    }).immediate())
+  }
+
+  takeAuditSetupAnswers(job: Pick<JobRecord, 'id' | 'attempts' | 'controlEpoch' | 'inputRevision'>): AuditSetupReply[] {
     return retrySqlite(() => this.db.transaction(() => {
       const current = this.get(job.id)
       if (current?.cancelRequestedAt != null) throw new CodexUserCancelledError()
@@ -6703,9 +6747,10 @@ export class JobStore {
         || current.inputRevision !== job.inputRevision) {
         throw new CodexInterruptedError('audit setup input changed before host acceptance')
       }
-      const answers = this.listJobControls(job.id)
+      const answers = [...this.auditSetupHistory(job.id), ...this.listJobControls(job.id)
         .filter(c => c.kind === 'steer' && c.status !== 'superseded' && c.inputRevision <= job.inputRevision)
-        .map(c => ({text:c.task, writeEnabled:c.writeEnabled, revision:c.inputRevision}))
+        .map(c => ({text:c.task, writeEnabled:c.writeEnabled, revision:c.inputRevision}))]
+      this.db.run('INSERT OR IGNORE INTO audit_setup_history_checks VALUES (?)',[job.id])
       // These inputs are consumed by the host initializer, never dispatched to
       // App Server. Record host observation so they cannot block its start notice.
       this.db.run(`UPDATE job_controls SET status='observed', observed_at=?

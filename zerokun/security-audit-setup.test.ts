@@ -1,6 +1,7 @@
 import { deliverAuditMilestone } from './security-audit-progress.ts'
 import { normalizeSlackInboundText } from './live-control.ts'
 import { afterEach, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -44,7 +45,7 @@ test('old consumed login reply is reinterpreted and Zero discovers proof without
   expect(ready).toMatchObject({authentication:'required',authenticatedPath:'/app/me',authenticationProbe:'status'})
   expect(discoveries).toBe(1)
   expect((await initializeAudit(job,state,[])).authentication).toBe('required')
-  expect(JSON.parse(readFileSync(join(state,'security-audit-initializations',job.id+'.json'),'utf8')).parserVersion).toBe(2)
+  expect(JSON.parse(readFileSync(join(state,'security-audit-initializations',job.id+'.json'),'utf8')).parserVersion).toBe(3)
 })
 
 test('login unavailable parks the same job; a login acknowledgment rechecks without repeating scope or requesting technical selectors', async () => {
@@ -262,4 +263,129 @@ test('host audit answer acceptance is bound to the current revision and cancella
     store.stageLiveControl(store.liveControlTarget('C1','1.1')!,{...liveAnswer({messageId:'1.3'}),kind:'interrupt'})
     expect(()=>store.takeAuditSetupAnswers(resumed)).toThrow()
   } finally {store.close()}
+})
+
+function failedAnsweredAudit(state: string, repo: string) {
+  const {store,job}=queued(state,repo)
+  store.claimNext('first');store.parkAuditSetup(job.id,'setup question',1);deliverQuestion(store)
+  store.stageThreadReply(store.liveControlTarget('C1','1.1')!,liveAnswer({task:'<https://example.test/app>\nログインも含む'}))
+  store.claimNext('old-runner');store.fail(job.id,'synthetic failure before answer acceptance')
+  return {store,job}
+}
+
+test('failed audit answer survives an intervening work job and a new audit with a lower revision', async()=>{
+  const {state,repo}=fixture();const {store,job:old}=failedAnsweredAudit(state,repo)
+  try {
+    const work=store.enqueue({chatId:'C1',threadTs:'1.1',messageId:'1.3',userId:'U1',repoPath:repo,task:'続けて'}).job
+    store.claimNext('work');store.complete(work.id,'synthetic','completed')
+    const next=store.enqueue({chatId:'C1',threadTs:'1.1',messageId:'1.4',userId:'U1',repoPath:repo,task:'Socketを再度試して',workflow:'security-audit'}).job
+    const current=store.claimNext('retry')!
+    expect(current.id).toBe(next.id);expect(current.inputRevision).toBe(1)
+    const inputs=store.takeAuditSetupAnswers(current)
+    expect(inputs[0]).toMatchObject({sourceJobId:old.id,revision:2})
+    let checked=0
+    const settings=await initializeAudit(current,state,inputs,{organizations:orgs,authentication:async()=>{
+      checked++;return {status:'verified',path:'/app/me',kind:'status'}
+    }})
+    expect(settings).toMatchObject({targetUrl:'https://example.test/app',authentication:'required'})
+    expect(checked).toBe(1)
+    expect(store.listJobControls(old.id)[0]?.status).toBe('ready')
+    const record=JSON.parse(readFileSync(join(state,'security-audit-initializations',next.id+'.json'),'utf8'))
+    expect(record.inheritedControls).toEqual([store.listJobControls(old.id)[0]!.id])
+    store.finishAuditSetup(current.id,current.inputRevision)
+  } finally {store.close()}
+})
+
+test('legacy parked retry automatically re-evaluates history once, then waits only for actual login',async()=>{
+  const {state,repo}=fixture();let {store}=failedAnsweredAudit(state,repo)
+  const next=store.enqueue({chatId:'C1',threadTs:'1.1',messageId:'1.3',userId:'U1',repoPath:repo,task:'再度',workflow:'security-audit'}).job
+  store.claimNext('legacy');store.parkAuditSetup(next.id,'setup question',1);deliverQuestion(store)
+  mkdirSync(join(state,'security-audit-initializations'),{recursive:true})
+  writeFileSync(join(state,'security-audit-initializations',next.id+'.json'),JSON.stringify({parserVersion:2,repoPath:repo,appliedRevision:1,ready:false,settings:blank()}),{mode:0o600})
+  // Old releases had neither the history check receipt nor a versioned notification key.
+  const db=new Database(store.dbPath)
+  db.run("UPDATE status_notifications SET idempotency_key='audit-setup:'||job_id||':1' WHERE job_id=? AND payload='setup question'",[next.id])
+  db.run("UPDATE audit_setup_waits SET notification_key='audit-setup:'||job_id||':1' WHERE job_id=?",[next.id]);db.close()
+  store.close();store=new JobStore(join(state,'jobs.sqlite'))
+  try {
+    const resumed=store.claimNext('upgraded')!;expect(resumed.id).toBe(next.id)
+    try {
+      await initializeAudit(resumed,state,store.takeAuditSetupAnswers(resumed),{organizations:orgs,authentication:async()=>({status:'no-session'})})
+      throw Error('expected login wait')
+    } catch(error) {
+      expect(error).toBeInstanceOf(AuditSetupRequiredError)
+      const required=error as AuditSetupRequiredError
+      expect(required.prompt).not.toContain('検査してよいWeb環境');expect(required.prompt).not.toContain('Web検査の範囲を')
+      expect(required.prompt).toContain('ログインし')
+      store.parkAuditSetup(next.id,required.prompt,resumed.inputRevision)
+    }
+    const notice=store.pendingStatusNotifications().find(n=>n.payload.includes('ログインし'))!
+    expect(notice).toBeDefined();store.markStatusNotificationDelivered(notice.id)
+    store.close();store=new JobStore(join(state,'jobs.sqlite'))
+    expect(store.claimNext('must-stay-parked')).toBeNull()
+    store.stageThreadReply(store.liveControlTarget('C1','1.1')!,liveAnswer({messageId:'1.4',task:'認証: 公開・未ログイン範囲'}))
+    const latest=store.claimNext('public')!
+    const ready=await initializeAudit(latest,state,store.takeAuditSetupAnswers(latest),{organizations:orgs,authentication:async()=>{throw Error('old login grant must not return')}})
+    expect(ready.authentication).toBe('none')
+  } finally {store.close()}
+})
+
+test('history excludes other boundaries, unauthorized/superseded answers and completed or cancelled audits',()=>{
+  for(const boundary of ['chat','thread','repo','unauthorized','superseded','completed','cancelled'] as const) {
+    const {state,repo}=fixture();const {store,job}=failedAnsweredAudit(state,repo)
+    try {
+      const db=new Database(store.dbPath)
+      if(boundary==='unauthorized')db.run('UPDATE job_controls SET write_enabled=0 WHERE job_id=?',[job.id])
+      if(boundary==='superseded')db.run("UPDATE job_controls SET status='superseded' WHERE job_id=?",[job.id])
+      if(boundary==='completed')db.run("UPDATE jobs SET status='completed' WHERE id=?",[job.id])
+      if(boundary==='cancelled')db.run("UPDATE jobs SET terminal_outcome='cancelled' WHERE id=?",[job.id])
+      db.close()
+      const next=store.enqueue({chatId:boundary==='chat'?'C2':'C1',threadTs:boundary==='thread'?'2.1':'1.1',messageId:'1.3',userId:'U1',repoPath:boundary==='repo'?repo+'-other':repo,task:'再度',workflow:'security-audit'}).job
+      expect(store.auditSetupHistory(next.id)).toEqual([])
+    } finally {store.close()}
+  }
+})
+
+for (const deliveryStatus of ['ready','dispatching','acknowledged','observed','ambiguous']) {
+test('newer authorized restrictions win even when their delivery is '+deliveryStatus,async()=>{
+  const {state,repo}=fixture();const {store}=failedAnsweredAudit(state,repo)
+  try {
+    const work=store.enqueue({chatId:'C1',threadTs:'1.1',messageId:'1.3',userId:'U1',repoPath:repo,task:'続けて',writeEnabled:true}).job
+    store.claimNext('work')
+    expect(store.stageLiveControl(store.liveControlTarget('C1','1.1')!,{...liveAnswer({messageId:'1.4',task:'ログインを除外'}),kind:'steer'})).toBe('staged')
+    const db=new Database(store.dbPath)
+    db.run('UPDATE job_controls SET status=? WHERE job_id=?',[deliveryStatus,work.id]);db.close()
+    store.fail(work.id,'synthetic')
+    const next=store.enqueue({chatId:'C1',threadTs:'1.1',messageId:'1.5',userId:'U1',repoPath:repo,task:'再度',workflow:'security-audit'}).job
+    let current=store.claimNext('retry')!
+    await expect(initializeAudit(current,state,store.takeAuditSetupAnswers(current),{organizations:orgs,authentication:async()=>{throw Error('revoked scope must not authenticate')}})).rejects.toBeInstanceOf(AuditSetupRequiredError)
+    expect(loadAuditSettings(state,repo).authentication).toBeUndefined()
+    store.parkAuditSetup(next.id,'setup question',1);deliverQuestion(store)
+    store.stageThreadReply(store.liveControlTarget('C1','1.1')!,liveAnswer({messageId:'1.6',task:'URL: https://new.test/app\n認証: 公開・未ログイン範囲'}))
+    current=store.claimNext('corrected')!
+    expect(await initializeAudit(current,state,store.takeAuditSetupAnswers(current),{organizations:orgs})).toMatchObject({targetUrl:'https://new.test/app',authentication:'none'})
+  } finally {store.close()}
+})
+}
+
+test('ordinary work answers cannot grant audit targets or wake an old parked audit',async()=>{
+  for(const auth of ['認証: 公開・未ログイン範囲','ログインも含む']) {
+    const {state,repo}=fixture();let store=new JobStore(join(state,'jobs.sqlite'))
+    try {
+      const work=store.enqueue({chatId:'C1',threadTs:'1.1',messageId:'1.1',userId:'U1',repoPath:repo,task:'画面を実装して',writeEnabled:true}).job
+      store.claimNext('work')
+      expect(store.stageLiveControl(store.liveControlTarget('C1','1.1')!,{...liveAnswer({task:'https://unrelated.test/\n'+auth}),kind:'steer'})).toBe('staged')
+      store.fail(work.id,'synthetic')
+      const next=store.enqueue({chatId:'C1',threadTs:'1.1',messageId:'1.3',userId:'U1',repoPath:repo,task:'セキュリティ検査',workflow:'security-audit'}).job
+      const current=store.claimNext('audit')!
+      const answers=store.auditSetupHistory(current.id)
+      expect(answers).toHaveLength(1);expect(answers[0]!.restrictionsOnly).toBe(true)
+      await expect(initializeAudit(current,state,answers,{organizations:orgs,authentication:async()=>{throw Error('no audit grant')}})).rejects.toBeInstanceOf(AuditSetupRequiredError)
+      expect(loadAuditSettings(state,repo).targetUrl).toBeUndefined()
+      expect(loadAuditSettings(state,repo).authentication).toBeUndefined()
+      store.parkAuditSetup(next.id,'setup question',1);deliverQuestion(store)
+      store.close();store=new JobStore(join(state,'jobs.sqlite'))
+      expect(store.claimNext('must-not-wake')).toBeNull()
+    } finally {store.close()}
+  }
 })
