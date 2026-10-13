@@ -1,4 +1,5 @@
 import { discoverAuditE2E, type AuditE2E } from './security-audit-setup.ts'
+import { auditReadUrl, authResponseProof, readAuthResponse, authenticationDiscoveryProgram, LOGIN_MARKERS, type AuthenticationDiscovery } from './security-audit-auth.ts'
 import { createHash, randomUUID } from 'crypto'
 import {
   existsSync,
@@ -521,7 +522,7 @@ export function auditTargetAllows(target: string, candidate: string): boolean {
 }
 export function zapScopeFiles(
   target: string,
-  probe?: { url: string; pattern: string },
+  probe?: { url: string; pattern?: string },
 ): {
   context: string
   hook: string
@@ -571,7 +572,7 @@ export function zapScopeFiles(
       ${
         probe
           ? `var expected=Java.type('java.lang.System').getenv('ZERO_AUDIT_COOKIE');
-      if(expected&&String(msg.getRequestHeader().getHeader('Cookie'))===String(expected)&&String(msg.getRequestHeader().getURI().getEscapedURI())===${JSON.stringify(probe.url)}&&msg.getResponseHeader().getStatusCode()>=200&&msg.getResponseHeader().getStatusCode()<300&&String(msg.getResponseBody()).indexOf(${JSON.stringify(probe.pattern)})>=0){
+      if(expected&&String(msg.getRequestHeader().getHeader('Cookie'))===String(expected)&&String(msg.getRequestHeader().getURI().getEscapedURI())===${JSON.stringify(probe.url)}&&msg.getResponseHeader().getStatusCode()>=200&&msg.getResponseHeader().getStatusCode()<300${probe.pattern ? `&&String(msg.getResponseBody()).indexOf(${JSON.stringify(probe.pattern)})>=0` : ''}){
         Java.type('java.nio.file.Files').writeString(Java.type('java.nio.file.Paths').get('/zap/wrk/auth-confirmed'),'confirmed');
       }`
           : ''
@@ -640,38 +641,20 @@ async function verifyAuthentication(
   if (
     !c.settings.targetUrl ||
     !c.settings.authenticatedPath ||
-    !c.settings.loggedInPattern ||
+    (c.settings.authenticationProbe !== 'status' && !c.settings.loggedInPattern) ||
     !cookies.length
   )
     return false
   const url = new URL(c.settings.authenticatedPath, c.settings.targetUrl)
-  if (!auditTargetAllows(c.settings.targetUrl, url.href))
+  if (!auditReadUrl(c.settings.targetUrl, url.href))
     throw Error('authentication probe is outside the authorized target')
-  const response = await fetch(url, {
-    headers: { Cookie: cookies.map((v) => `${v.name}=${v.value}`).join('; ') },
-    redirect: 'manual',
-    signal: AbortSignal.timeout(30000),
-  })
-  if (!response.ok || !response.body) {
-    await response.body?.cancel()
-    return false
-  }
-  const reader = response.body.getReader()
-  let text = '',
-    size = 0
-  const decoder = new TextDecoder()
-  try {
-    for (;;) {
-      const { value, done } = await reader.read()
-      if (done) break
-      size += value.length
-      if (size > 200000) return false
-      text += decoder.decode(value, { stream: true })
-    }
-    return text.includes(c.settings.loggedInPattern)
-  } finally {
-    await reader.cancel()
-  }
+  const cookie = auditCookieHeader(url.href, cookies)
+  if (!cookie) return false
+  const anonymous = await readAuthResponse(url.href, '', c.signal)
+  const authenticated = await readAuthResponse(url.href, cookie, c.signal)
+  const proof = authResponseProof(anonymous, authenticated, c.settings.loggedInPattern ? [c.settings.loggedInPattern] : [])
+  return c.settings.authenticationProbe === 'status' ? proof?.kind === 'status'
+    : !!proof && authenticated.body.includes(c.settings.loggedInPattern!)
 }
 function codeqlSeverity(run: any, result: any): string {
   const rules = run.tool?.driver?.rules ?? []
@@ -965,8 +948,74 @@ async function chromeCookies(c: AuditToolContext): Promise<
     await transport.close().catch(() => {})
   }
 }
-async function authenticatedBrowser(
+function auditCookieHeader(url: string, cookies: Awaited<ReturnType<typeof chromeCookies>>): string {
+  const u = new URL(url)
+  return cookies.filter(cookie => {
+    const path = cookie.path || '/'
+    return (!cookie.secure || u.protocol === 'https:')
+      && (cookie.expires < 0 || cookie.expires > Date.now() / 1000)
+      && (u.pathname === path || u.pathname.startsWith(path.endsWith('/') ? path : path + '/'))
+  }).map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
+}
+
+export async function discoverAuditAuthentication(
+  job: {id: string; repoPath: string}, stateDir: string, settings: AuditSettings,
+  options: Pick<AuditToolContext, 'signal' | 'cancelled' | 'onProcessId' | 'onProcessExit'> = {},
+  acquireCookies: typeof chromeCookies = chromeCookies,
+): Promise<AuthenticationDiscovery> {
+  checkAuditInterrupted(options)
+  if (settings.authentication !== 'required' || !settings.targetUrl) return {status:'unverified'}
+  const parent = ensureManagedDirectory(stateDir, join(stateDir, 'security-audit-authentication'))
+  const root = realpathSync(mkdtempSync(join(parent, 'probe-')))
+  chmodSync(root, 0o700)
+  const c: AuditToolContext = {...options,root,source:root,repo:job.repoPath,stateDir,jobId:job.id,settings}
+  let cleanupPending = false
+  try {
+    const cookies = await acquireCookies(c)
+    if (!cookies.length) return {status:'no-session'}
+    const install = join(toolsRoot(c), 'trusted-playwright'), entry = join(install, 'node_modules/playwright/index.mjs')
+    if (!existsSync(entry)) await checked(['npm','install','--prefix',install,'--ignore-scripts','--no-audit','--no-fund','playwright'],root,c)
+    const script = join(root, 'discover.mjs')
+    writeFileSync(script, authenticationDiscoveryProgram(entry), {mode:0o600})
+    const result = await auditCommand(['node',script],root,c, {
+      sandbox:true,timeoutMs:60000,input:JSON.stringify({target:settings.targetUrl,cookies,
+        probe:settings.authenticatedPath ? new URL(settings.authenticatedPath,settings.targetUrl).href : undefined,
+        pattern:settings.loggedInPattern}),
+    })
+    // Child diagnostics may contain page data. Never promote them to a setup question.
+    if (result.exitCode || result.truncated) return {status:'unavailable'}
+    const data = JSON.parse(result.stdout)
+    if (!Array.isArray(data.candidates) || data.candidates.length > 24) return {status:'unavailable'}
+    const deadline = Date.now() + 45000
+    const candidates = [...data.candidates].sort((a,b) =>
+      Number(b?.path === settings.authenticatedPath) - Number(a?.path === settings.authenticatedPath))
+    for (const candidate of candidates) {
+      checkAuditInterrupted(c)
+      if (Date.now() > deadline) break
+      if (typeof candidate?.path !== 'string' || candidate.path.length > 1000 || !candidate.path.startsWith('/')) continue
+      const url = new URL(candidate.path, settings.targetUrl).href
+      if (!auditReadUrl(settings.targetUrl, url)) continue
+      const cookie = auditCookieHeader(url,cookies)
+      if (!cookie) continue
+      try {
+        const anonymous = await readAuthResponse(url,'',c.signal)
+        const authenticated = await readAuthResponse(url,cookie,c.signal)
+        const markers = [...LOGIN_MARKERS, ...(settings.loggedInPattern ? [settings.loggedInPattern] : [])]
+          .filter(m => Array.isArray(candidate.markers) && candidate.markers.includes(m))
+        const proof = authResponseProof(anonymous,authenticated,markers)
+        if (proof) return {status:'verified',path:new URL(url).pathname,...proof}
+      } catch { checkAuditInterrupted(c) }
+    }
+    return {status:'unverified'}
+  } catch (error) {
+    if (error instanceof CodexCleanupPendingError) { cleanupPending = true; throw error }
+    checkAuditInterrupted(c); return {status:'unavailable'}
+  } finally { if (!cleanupPending) rmSync(root,{recursive:true,force:true}) }
+}
+
+export async function authenticatedBrowser(
   c: AuditToolContext,
+  acquireCookies: typeof chromeCookies = chromeCookies,
 ): Promise<{ note: string; ok: boolean; findings: AuditFinding[] }> {
   if (c.settings.authentication === 'none')
     return {
@@ -980,7 +1029,7 @@ async function authenticatedBrowser(
       ok: false,
       findings: [],
     }
-  const cookies = await chromeCookies(c)
+  const cookies = await acquireCookies(c)
   if (!(await verifyAuthentication(c, cookies)))
     return {
       note: '認証済みprobe未確認。認証領域を検査済みと扱いません。',
@@ -1008,16 +1057,17 @@ async function authenticatedBrowser(
   writeFileSync(
     script,
     `import {chromium} from ${JSON.stringify(entry)};
+const readAllowed=${auditReadUrl.toString()};
 const input=JSON.parse(await new Promise(resolve=>{let data='';process.stdin.setEncoding('utf8');process.stdin.on('data',d=>data+=d);process.stdin.on('end',()=>resolve(data))}));
 const browser=await chromium.launch({channel:'chrome'});
 try{const context=await browser.newContext({serviceWorkers:'block',acceptDownloads:false});
  await context.addCookies(input.cookies);
  const allowed=input.urls;
- await context.route('**/*',route=>{const u=new URL(route.request().url()),base=new URL(input.target),prefix=base.pathname.endsWith('/')?base.pathname.slice(0,-1):base.pathname;
-  return ['GET','HEAD'].includes(route.request().method())&&u.origin===base.origin&&(u.pathname===prefix||u.pathname.startsWith(prefix+'/'))?route.continue():route.abort();});
+ await context.route('**/*',route=>{
+  return ['GET','HEAD'].includes(route.request().method())&&readAllowed(input.target,route.request().url())?route.continue():route.abort();});
  await context.routeWebSocket('**/*',socket=>socket.close());
  const page=await context.newPage();const results=[];
- for(const url of allowed){const response=await page.goto(url,{waitUntil:'domcontentloaded',timeout:30000});results.push({url,status:response?.status()??null,authenticated:(await page.locator('body').innerText()).includes(input.pattern)});}
+ for(const url of allowed){const response=await page.goto(url,{waitUntil:'domcontentloaded',timeout:30000});results.push({url,status:response?.status()??null,authenticated:page.url()===url&&(input.kind==='status'||(await page.locator('body').innerText()).includes(input.pattern))});}
  console.log(JSON.stringify({results}));
 }finally{await browser.close()}`,
     { mode: 0o600 },
@@ -1031,6 +1081,7 @@ try{const context=await browser.newContext({serviceWorkers:'block',acceptDownloa
       target,
       urls: [auth],
       pattern: c.settings.loggedInPattern,
+      kind: c.settings.authenticationProbe,
     }),
   })
   if (result.exitCode !== 0 || result.truncated) {
@@ -1746,15 +1797,15 @@ export async function runAuditTool(
         '-v',
         `${zapDir}:/zap/wrk:rw`,
       ]
-      let probe: { url: string; pattern: string } | undefined
+      let probe: { url: string; pattern?: string } | undefined
       if (
         c.settings.authentication !== 'none' &&
         c.settings.authenticatedPath &&
-        c.settings.loggedInPattern
+        (c.settings.authenticationProbe === 'status' || c.settings.loggedInPattern)
       ) {
         try {
           const url = new URL(c.settings.authenticatedPath, target)
-          if (auditTargetAllows(target.href, url.href))
+          if (auditReadUrl(target.href, url.href) && await verifyAuthentication(c, cookies))
             probe = { url: url.href, pattern: c.settings.loggedInPattern }
           else
             step.note +=
@@ -2044,7 +2095,7 @@ const browser=await chromium.launch({channel:'chrome'});try{const page=await bro
   if (number === 10) {
     await attempt('ZAP target configuration', async () => {
       if (!c.settings.targetUrl || !c.settings.authentication) throw Error('target URL and authentication mode are required')
-      if (c.settings.authentication === 'required' && (!c.settings.authenticatedPath || !c.settings.loggedInPattern)) throw Error('authenticated target probe is missing')
+      if (c.settings.authentication === 'required' && (!c.settings.authenticatedPath || (c.settings.authenticationProbe !== 'status' && !c.settings.loggedInPattern))) throw Error('authenticated target probe is missing')
     })
     await attempt('ZAP Hello World', async () => {
       const docker = resolveDockerRuntime()

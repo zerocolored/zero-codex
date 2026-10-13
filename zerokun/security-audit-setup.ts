@@ -5,7 +5,7 @@ import { z } from 'zod'
 import { auditSettingsSchema, auditProjectKey, auditClean, type AuditSettings } from './security-audit.ts'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import { ensureManagedDirectory } from './managed-path.ts'
-import { checkAuditInterrupted } from './security-audit-tools.ts'
+import { checkAuditInterrupted, discoverAuditAuthentication } from './security-audit-tools.ts'
 
 export class AuditSetupRequiredError extends Error {
   constructor(public readonly prompt: string, public readonly inputRevision: number) { super('security audit setup requires a same-thread reply') }
@@ -118,10 +118,20 @@ export async function discoverSocketOrganization(state: string, fetcher: typeof 
   return slugs
 }
 export type AuditSetupReply = { text: string; writeEnabled: boolean; revision: number }
+const ANSWER_VERSION = 2
 /** Only explicit answer lines grant a network scope. Repository strings and model inference never do. */
 export function applyAuditSetupAnswer(settings: AuditSettings, text: string, organizations: string[]): AuditSettings {
   const next = { ...settings }
-  for (const line of auditClean(text).split('\n').map(s => s.trim())) {
+  const modes = new Set<'required' | 'none'>()
+  let fenced = false, deniesRequired = false
+  const lines = auditClean(text).split('\n').flatMap(s => {
+    const line = s.trim()
+    const inline = /^(?:URL[：:]\s*)?(<https?:\/\/[^<>]+>|https?:\/\/[^\s<>]+)\s+(.+)$/.exec(line)
+    return inline ? [inline[1]!, inline[2]!] : [line]
+  })
+  for (const line of lines) {
+    if (/^```/.test(line)) { fenced = !fenced; continue }
+    if (fenced || /^>/.test(line)) continue
     const answerLine = line.replace(/^URL[：:]\s*/i, '')
     const slackLink = /^<(https?:\/\/[^<>\s|]+)(?:\|[^<>\r\n]*)?>$/.exec(answerLine)
     // Slack's displayed label is not the authorized destination; use only its actual URL.
@@ -132,13 +142,16 @@ export function applyAuditSetupAnswer(settings: AuditSettings, text: string, org
         if (!u.username && !u.password && !u.hash && !u.search) {
           next.targetUrl = u.href; next.activeScan = false
           // A different site cannot inherit proof of authentication from an older site.
-          if (next.targetUrl !== settings.targetUrl) { delete next.authenticatedPath; delete next.loggedInPattern }
+          if (next.targetUrl !== settings.targetUrl) { delete next.authenticatedPath; delete next.loggedInPattern; delete next.authenticationProbe }
         }
       } catch { /* malformed input remains unanswered */ }
     }
-    const auth = line.replace(/^認証[：:]\s*/, '').replace(/[。.]$/, '')
-    if (/^(?:公開|公開・未ログイン範囲|未ログイン範囲|認証不要|none)$/.test(auth)) next.authentication = 'none'
-    if (/^(?:ログイン後も含む|ログイン必須|required)$/.test(auth)) next.authentication = 'required'
+    const auth = line.normalize('NFKC').replace(/^認証:\s*/, '').replace(/[。.]$/, '').trim()
+    // Whole affirmative utterances only: never grant scope from a quoted,
+    // conditional, negative or interrogative mention of login.
+    if (/^(?:公開|公開・未ログイン範囲|未ログイン範囲|認証不要|none)(?:です|でお願いします)?$/.test(auth)) modes.add('none')
+    if (/^(?:(?:ログイン|サインイン)(?:後)?(?:も含(?:む|めて)|まで|必須)|(?:ログイン|サインイン)後(?:の(?:画面|ページ|範囲))?も(?:検査|確認)(?:して|する)|required)(?:です|お願いします|ください)?$/.test(auth)) modes.add('required')
+    if (/(?:ログイン|サインイン|認証).*(?:含めない|含まない|除外|除く|しない|不要)/.test(auth) && !modes.has('none')) deniesRequired = true
     const path = /^確認パス[：:]\s*(\/[^\s]*)$/.exec(line)?.[1]
     if (path && !path.startsWith('//') && !/[?#]/.test(path)) next.authenticatedPath = path
     const pattern = /^確認文言[：:]\s*(.{1,200})$/.exec(line)?.[1]
@@ -146,18 +159,22 @@ export function applyAuditSetupAnswer(settings: AuditSettings, text: string, org
     const org = line.replace(/^Socket(?:組織)?[：:]\s*/i, '')
     if (organizations.includes(org)) next.socketOrg = org
   }
+  if (modes.size === 1) next.authentication = [...modes][0]
+  else if (modes.size > 1) delete next.authentication
+  if (deniesRequired) delete next.authentication
   return auditSettingsSchema.parse(next)
 }
 export async function initializeAudit(
   job: { id: string; repoPath: string; inputRevision: number }, state: string, replies: AuditSetupReply[],
-  options: { organizations?: typeof discoverSocketOrganization; signal?: AbortSignal; cancelled?: () => boolean } = {},
+  options: { organizations?: typeof discoverSocketOrganization; authentication?: typeof discoverAuditAuthentication;
+    signal?: AbortSignal; cancelled?: () => boolean; onProcessId?: (pid: number) => void; onProcessExit?: (code: number) => void } = {},
 ): Promise<AuditSettings> {
   checkAuditInterrupted(options)
   const root = ensureManagedDirectory(state, join(state, 'security-audit-initializations'))
   // job IDs come from the durable queue. Do not allow callers to choose a path outside that journal.
   if (!/^[a-zA-Z0-9_-]{1,100}$/.test(job.id)) throw Error('invalid audit job identity')
   const path = join(root, job.id + '.json')
-  const recordSchema = z.object({ repoPath: z.string(), appliedRevision: z.number().int(), ready: z.boolean(), settings: auditSettingsSchema }).strict()
+  const recordSchema = z.object({ parserVersion: z.number().int().default(1), repoPath: z.string(), appliedRevision: z.number().int(), ready: z.boolean(), settings: auditSettingsSchema }).strict()
   const saved = readOptionalBoundedOwnerOnlyRegularFile(path, 30000)
   const prior = saved ? recordSchema.parse(JSON.parse(saved)) : null
   if (prior && prior.repoPath !== job.repoPath) throw Error('audit initialization repository changed')
@@ -177,19 +194,32 @@ export async function initializeAudit(
   settings.e2e = discovery.e2e
   if (!settings.e2ePort && discovery.port) settings.e2ePort = discovery.port
   for (const reply of [...replies].sort((a, b) => a.revision - b.revision)) {
-    if (!reply.writeEnabled || reply.revision <= (prior?.appliedRevision ?? 0) || reply.revision > job.inputRevision) continue
+    const replay = prior && !prior.ready && prior.parserVersion < ANSWER_VERSION
+    if (!reply.writeEnabled || reply.revision <= (replay ? 0 : prior?.appliedRevision ?? 0) || reply.revision > job.inputRevision) continue
     const next = applyAuditSetupAnswer(settings, reply.text, organizations)
     if (next.socketOrg && organizations.includes(next.socketOrg)) saveSocketOrganization(state, next.socketOrg)
     settings = next
   }
   checkAuditInterrupted(options)
-  saveAuditSettings(state, job.repoPath, settings)
   const needs: string[] = []
   if (!settings.targetUrl) needs.push('検査してよいWeb環境を「URL: https://対象のアドレス」の形で教えてください。')
   if (!settings.authentication) needs.push('Web検査の範囲を「認証: 公開・未ログイン範囲」または「認証: ログイン後も含む」で教えてください。')
-  if (settings.authentication === 'required' && (!settings.authenticatedPath || !settings.loggedInPattern)) {
-    needs.push('ログイン確認用に「確認パス: /account」「確認文言: ログイン後だけの文言」を教えてください。パスワードやcookieは投稿しないでください。')
+  if (settings.authentication === 'required' && settings.targetUrl) {
+    const found = await (options.authentication ?? discoverAuditAuthentication)(job, state, settings, options)
+    checkAuditInterrupted(options)
+    if (found.status === 'verified') {
+      settings.authenticatedPath = found.path
+      settings.authenticationProbe = found.kind
+      settings.loggedInPattern = found.pattern
+    } else {
+      // Keep explicit/custom probe candidates for the next attempt. They are
+      // not proof of readiness; this job remains parked until reverified.
+      needs.push(found.status === 'no-session'
+        ? 'ログイン後まで検査する指示は受け付けました。このMacのChromeで対象サイトへログインし、このスレッドへ「ログインした」と返信してください。確認ページは自動で探します。パスワードやcookieは投稿しないでください。'
+        : 'ログイン後まで検査する指示は受け付けましたが、Chromeとの接続または認証状態の自動確認が成立していません。対象サイトをこのMacのChromeで開き、ログイン状態をご確認のうえ、このスレッドへ返信してください。確認ページは自動で再探索します。検査はまだ開始していません。')
+    }
   }
+  saveAuditSettings(state, job.repoPath, settings)
   const socketToken = readOptionalBoundedOwnerOnlyRegularFile(join(state, 'security-audit-socket-token'), 4096)?.trim()
   if (!settings.socketOrg && socketToken) needs.push(organizations.length
     ? 'Socketの組織候補から使う組織を「Socket: 組織名」で教えてください: ' + organizations.join(' / ') : orgError || 'このSocketキーで利用できる組織が見つかりません。権限の復旧後、このスレッドへ返信してください。')
@@ -198,7 +228,7 @@ export async function initializeAudit(
       needs.push(`${service}の接続が未登録です。このMacの非表示入力（zerochan security ${name}-token）で一度だけ登録後、このスレッドへ「登録した」と返信してください。キーはSlackへ投稿しないでください。`)
     }
   }
-  atomicWritePrivateFile(path, JSON.stringify({ repoPath: job.repoPath, appliedRevision: job.inputRevision, ready: needs.length === 0, settings }) + '\n')
+  atomicWritePrivateFile(path, JSON.stringify({ parserVersion: ANSWER_VERSION, repoPath: job.repoPath, appliedRevision: job.inputRevision, ready: needs.length === 0, settings }) + '\n')
   if (needs.length) throw new AuditSetupRequiredError(
     'セキュリティ検査の初期設定を進めています。共通設定とプロジェクト構成を確認しました。次の不足分だけ、このスレッドへ返信してください。\n'
     + needs.map(x => '・' + x).join('\n')

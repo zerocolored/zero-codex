@@ -18665,7 +18665,7 @@ async function runCli(): Promise<void> {
             }
             await milestone('initializing', 'セキュリティ12工程が利用可能かどうかを調べています。共通設定とプロジェクト構成を確認し、初回に不足する検査対象だけをこのスレッドで確認します。')
             // Only durable authorized replies are settings answers, never the original request.
-            const settings = await initializeAudit(job, dir, answers, {signal: executionController.signal, cancelled: () => store.get(job.id)?.cancelRequestedAt != null})
+            const settings = await initializeAudit(job, dir, answers, {...executorPidLifecycle, signal: executionController.signal, cancelled: () => store.get(job.id)?.cancelRequestedAt != null})
             store.finishAuditSetup(job.id, job.inputRevision)
             const progress = createSecurityAuditProgress(job, executionContext, mirrorMonitorMessage, log)
             let raw: JobExecutionResult
