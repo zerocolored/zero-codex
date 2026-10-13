@@ -98,7 +98,7 @@ export async function openDirectSlackDownload(
   const response = await new Promise<IncomingMessage>((resolve, reject) => {
     const request = httpsRequest(url, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${botToken}` },
+      headers: { Authorization: `Bearer ${botToken}`, 'Accept-Encoding': 'identity' },
       rejectUnauthorized: true,
       signal,
     }, resolve)

@@ -973,7 +973,7 @@ async function downloadInboundFiles(
         )
       }
       const response = await openDirectSlackDownload(file.url_private_download, BOT_TOKEN, signal)
-      if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode !== 200) {
         response.resume()
         throw new Error(`file ${fileId} download failed: HTTP ${response.statusCode ?? 'unknown'}`)
       }
@@ -1014,6 +1014,7 @@ async function downloadInboundFiles(
           descriptor,
           received,
           expectedSize,
+          response,
         )
         // The catalog is durable across daemon restarts, so make the bytes
         // durable before publishing their final name and SQLite binding.
