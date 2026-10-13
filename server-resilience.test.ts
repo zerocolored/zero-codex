@@ -419,6 +419,8 @@ describe('Slack bridge resilience wiring', () => {
     expect(server).toContain('for await (const value of response)')
     expect(server).toContain('response.destroy()')
     expect(server).toContain('received > MAX_ATTACHMENT_BYTES')
+    expect(server).toContain('expectedSize,\n          response,')
+    expect(server).toContain('if (response.statusCode !== 200)')
     expect(server).not.toContain('response.arrayBuffer()')
     expect(server).toContain("if (!/^\\d+\\.\\d+$/.test(messageTs))")
     expect(server).toContain("if (!/^F[A-Z0-9]+$/.test(fileId))")
