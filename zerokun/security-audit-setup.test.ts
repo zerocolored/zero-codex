@@ -21,6 +21,67 @@ const orgs = (state: string) => discoverSocketOrganization(state, (async () => R
 const blank = () => auditSettingsSchema.parse({})
 const answer = 'URL: https://example.test/app\n認証: 公開・未ログイン範囲'
 
+test('ordinary explicit login scope wording is recognized without widening quoted or ambiguous instructions', () => {
+  for (const text of ['ログインも含む','ログイン後まで','ログイン後までお願いします','ログイン後も含む','ログインも含めてください','ログイン後のページも検査して']) {
+    expect(applyAuditSetupAnswer(blank(),'<https://example.test/>\n'+text,[])).toMatchObject({targetUrl:'https://example.test/',authentication:'required'})
+    expect(applyAuditSetupAnswer(blank(),'<https://example.test/> '+text,[]).authentication).toBe('required')
+  }
+  for (const text of ['ログインも含む？','ログイン後までですか','ログイン後までなら','ログインは含まない','「ログインも含む」','> ログインも含む','```\nログインも含む\n```','認証: 公開\nログインも含む']) {
+    expect(applyAuditSetupAnswer(blank(),text,[]).authentication).toBeUndefined()
+  }
+  expect(applyAuditSetupAnswer({...blank(),authentication:'required'},'ログイン後も含む\nログイン後は除外',[]).authentication).toBeUndefined()
+})
+
+test('old consumed login reply is reinterpreted and Zero discovers proof without asking for paths', async () => {
+  const {state,repo}=fixture(), job={id:'old-reply',repoPath:repo,inputRevision:2}
+  saveAuditSettings(state,repo,{...blank(),targetUrl:'https://example.test/app',socketOrg:'shared-org'})
+  mkdirSync(join(state,'security-audit-initializations'),{mode:0o700})
+  writeFileSync(join(state,'security-audit-initializations',job.id+'.json'),JSON.stringify({repoPath:repo,appliedRevision:2,ready:false,settings:loadAuditSettings(state,repo)}),{mode:0o600})
+  let discoveries=0
+  const ready=await initializeAudit(job,state,[{text:'<https://example.test/app>\nログインも含む',writeEnabled:true,revision:2}],{
+    authentication:async (_job,_state,settings)=>{ discoveries++;expect(settings.authentication).toBe('required');return {status:'verified',path:'/app/me',kind:'status'} },
+  })
+  expect(ready).toMatchObject({authentication:'required',authenticatedPath:'/app/me',authenticationProbe:'status'})
+  expect(discoveries).toBe(1)
+  expect((await initializeAudit(job,state,[])).authentication).toBe('required')
+  expect(JSON.parse(readFileSync(join(state,'security-audit-initializations',job.id+'.json'),'utf8')).parserVersion).toBe(2)
+})
+
+test('login unavailable parks the same job; a login acknowledgment rechecks without repeating scope or requesting technical selectors', async () => {
+  const {state,repo}=fixture();const {store,job}=queued(state,repo)
+  let available=false, scans=0
+  const run=()=>runQueuedJobs({store,stopWhenIdle:true,pollMs:1,notifier:{status:async()=>{},started:async()=>{},progress:async()=>{}},executor:async current=>{
+    const settings=await initializeAudit(current,state,store.takeAuditSetupAnswers(current),{
+      organizations:orgs,authentication:async()=>available?{status:'verified',path:'/app/me',kind:'status'}:{status:'no-session'},
+    })
+    expect(settings.authentication).toBe('required');store.finishAuditSetup(current.id,current.inputRevision);scans++
+    return {sessionId:'fixture',result:'done'}
+  }})
+  try {
+    await run()
+    store.stageThreadReply(store.liveControlTarget('C1','1.1')!,liveAnswer({task:'<https://example.test/app>\nログインも含む'}))
+    expect((await run()).failed).toBe(0);expect(scans).toBe(0)
+    const saved=JSON.parse(readFileSync(join(state,'security-audit-initializations',job.id+'.json'),'utf8'))
+    expect(saved.settings.authentication).toBe('required');expect(saved.ready).toBe(false)
+    const questions=store.pendingStatusNotifications().map(n=>n.payload).join('\n')
+    expect(questions).not.toContain('確認パス');expect(questions).not.toContain('確認文言')
+    available=true
+    store.stageThreadReply(store.liveControlTarget('C1','1.1')!,liveAnswer({messageId:'1.3',task:'ログインした'}))
+    expect((await run()).completed).toBe(1);expect(scans).toBe(1)
+    expect(store.get(job.id)?.status).toBe('completed')
+  } finally {store.close()}
+})
+
+test('unverified discovery preserves explicit probe candidates without claiming readiness', async () => {
+  const {state,repo}=fixture()
+  saveAuditSettings(state,repo,{...blank(),targetUrl:'https://example.test/app',authentication:'required',authenticatedPath:'/app/custom',loggedInPattern:'Custom signed-in heading'})
+  await expect(initializeAudit({id:'keep-custom',repoPath:repo,inputRevision:1},state,[],{
+    organizations:orgs,authentication:async()=>({status:'unverified'}),
+  })).rejects.toBeInstanceOf(AuditSetupRequiredError)
+  expect(loadAuditSettings(state,repo)).toMatchObject({authenticatedPath:'/app/custom',loggedInPattern:'Custom signed-in heading'})
+  expect(JSON.parse(readFileSync(join(state,'security-audit-initializations/keep-custom.json'),'utf8')).ready).toBe(false)
+})
+
 test('first request persists questions, authorized reply resumes; another repo inherits only common organization', async () => {
   const {state,repo,root} = fixture()
   const job = {id:'fixture',repoPath:repo,inputRevision:1}
