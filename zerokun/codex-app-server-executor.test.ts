@@ -336,7 +336,7 @@ progress_probe_count = 0
 persisted_items = {}
 item_reads = {}
 valid_interjection_message = None
-goal_status = None
+goal_status = os.environ.get("ZERO_INITIAL_GOAL")
 
 def observe_emission(value):
     global goal_status
@@ -354,7 +354,7 @@ def observe_emission(value):
             persisted_items.setdefault(observed_turn_id, []).append(observed_item)
     elif method == "turn/completed":
         if goal_status == "active":
-            goal_status = os.environ.get("ZERO_PROPOSAL_GOAL", "blocked") if mode in ("goal-blocked", "goal-proposal") or os.environ.get("ZERO_ADVISOR_WAIT_ONLY") == "1" else "complete"
+            goal_status = os.environ.get("ZERO_PROPOSAL_GOAL", "blocked") if mode in ("goal-blocked", "goal-proposal", "goal-answer") or os.environ.get("ZERO_ADVISOR_WAIT_ONLY") == "1" else "complete"
         observed_turn = params.get("turn", {})
         observed_turn_id = observed_turn.get("id")
         terminal_items = observed_turn.get("items", [])
@@ -562,8 +562,10 @@ for line in sys.stdin:
             while not os.path.exists(turn_latch_release):
                 time.sleep(0.01)
         fixture_state = os.environ.get("ZERO_INTERJECTION_FIXTURE_STATE")
-        if mode == "goal-proposal":
-            proposal = "比較案です。この方向で本実装してよいですか？\\n<zerokun_files>" + os.environ["ZERO_PROPOSAL_FILES"] + "</zerokun_files>"
+        if mode in ("goal-proposal", "goal-answer"):
+            proposal = "比較案です。この方向で本実装してよいですか？\\n<zerokun_files>" + os.environ.get("ZERO_PROPOSAL_FILES", "[]") + "</zerokun_files>"
+            if mode == "goal-answer":
+                proposal = os.environ["ZERO_QUESTION_ANSWER"]
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": proposal}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": []}}},
@@ -1117,7 +1119,7 @@ function fixture(
     | 'interrupt-no-terminal-forced' | 'defer' | 'terminal-race'
     | 'terminal-race-accepted' | 'terminal-race-accepted-history'
     | 'terminal-race-duplicate' | 'terminal-race-stale-after-user' | 'terminal-race-cancel'
-    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-native-capacity' | 'goal-blocked' | 'goal-proposal' | 'resume-early-start'
+    | 'failed-steer' | 'failed-turn' | 'goal-native' | 'goal-native-capacity' | 'goal-blocked' | 'goal-proposal' | 'goal-answer' | 'resume-early-start'
     | 'error-steer' | 'rate-error' | 'rate-terminal-only' | 'rate-retrying' | 'rate-retrying-two-turn'
     | 'capacity-error' | 'network-once' | 'network-always' | 'network-native' | 'network-permanent' | 'network-session-missing'
     | 'capacity-after-command' | 'capacity-error-generic-terminal'
@@ -2482,6 +2484,58 @@ describe('production App Server executor', () => {
     })
     value.store.close()
   }, 30_000)
+
+  for (const goalStatus of ['blocked', 'paused', 'complete'] as const) {
+    test(`質問回答後2回native継続しても今回の説明をSlackへ一度だけ配送する ${goalStatus}`, async () => {
+      for (const [index, answer] of [
+        '開発アカウントは検証用のZendesk環境です。',
+        '環境がないため、登録の準備が必要です。',
+        '新規登録は共通の接続アプリを用意するためです。',
+      ].entries()) {
+        const value = fixture('goal-answer', true, `質問その${index}`)
+        const rpcLog = join(value.root, 'question-rpc.log')
+        const statuses: string[] = []
+        try {
+          const job = { ...value.job, sessionId: 'thread-app-server-1', resumed: true }
+          const result = await executeCodexJob(job, {
+            codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+            skipEffectiveConfigCheck: true,
+            liveControls: { ...value.hooks, recordGoalStatus: status => statuses.push(status) },
+            extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-answer', ZERO_QUESTION_ANSWER: answer,
+              ZERO_INITIAL_GOAL: 'blocked', ZERO_PROPOSAL_GOAL: goalStatus, ZERO_RPC_LOG: rpcLog,
+              ...(goalStatus === 'paused' ? { ZERO_PROPOSAL_TOOL_ONLY: '1' } : {}) },
+            finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(job, execution, value.state),
+          })
+          expect(statuses).toEqual(['active', goalStatus])
+          if (goalStatus === 'complete') {
+            expect(result.result).toBe('保持して待機しました')
+          } else {
+            expect(result.taskGoalStatus).toBe(goalStatus)
+            expect(result.result).toContain(answer)
+            expect(result.result).toContain('保持して待機しました')
+            expect(result.result.indexOf(answer)).toBeLessThan(result.result.indexOf('保持して待機しました'))
+          }
+          value.store.complete(value.job.id, result.sessionId, result.result)
+          const notification = value.store.pendingTerminalNotifications()[0]!
+          const delivered: string[] = []
+          const notifier = new SlackNotifier('xoxb-fixture', () => {}, value.store, {
+            postMessage: async ({ text }) => { delivered.push(text); return { messageId: '123.456' } },
+          })
+          const deliveredJob = { ...value.job, sessionId: result.sessionId, taskGoalStatus: result.taskGoalStatus }
+          await notifier.completed(deliveredJob, result.result, notification.id)
+          await notifier.completed(deliveredJob, result.result, notification.id)
+          expect(delivered).toHaveLength(1)
+          expect(delivered[0]).toContain('保持して待機しました')
+          if (goalStatus !== 'complete') {
+            expect(delivered[0]).toContain(answer)
+            expect(delivered[0]).toContain('未完了・待機中')
+          }
+          const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+          expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(1)
+        } finally { value.store.close() }
+      }
+    }, 60_000)
+  }
 
   for (const goalStatus of ['blocked', 'paused'] as const) {
   test(`提案後2回native継続しても画像2件をSlackへ届けた後に承認質問を投稿する ${goalStatus}`, async () => {

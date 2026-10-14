@@ -42,6 +42,7 @@ import { createHash, randomBytes, randomUUID } from 'crypto'
 import { ensureTaskGoal, readTaskGoal, type GoalStatus } from './codex-goal.ts'
 import { previousThreadArtifactRoots } from './artifact-source.ts'
 import { ContinuedArtifactMessage } from './continued-artifact-message.ts'
+import { ContinuedAnswer } from './continued-answer.ts'
 import { homedir, tmpdir } from 'os'
 import { registeredSlackAppStatePaths } from './slack-app-registry.ts'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
@@ -1668,6 +1669,10 @@ export const CODEX_WORKER_SAFETY_PROMPT = [
   'the continued task; do not discard an existing approval solely because the task resumed.',
   'History alone does not approve a new or materially changed proposal. Treat past assistant',
   'claims as provisional and re-check the current state before relying on them.',
+  'Answer the latest user question directly even when the underlying task is blocked.',
+  'A question does not itself clear that blocker or grant approval. If the native goal',
+  'continues after an answer, preserve the explanation and any corrections in the final',
+  'response; do not replace them with only a repeated waiting-status message.',
   '',
   'If you create an artifact the Slack user must receive, end the response with exactly one',
   '<zerokun_files> JSON array of absolute local paths </zerokun_files>. Do not include state,',
@@ -8090,6 +8095,7 @@ export async function executeCodexJob(
       let inputChangedBeforeDispatch = false
       let observedSessionId: string | null = sessionId
       let finalMessage = ''
+      const continuedAnswer = new ContinuedAnswer()
       const continuedArtifactMessage = new ContinuedArtifactMessage(artifactDirForJob(managedStateDir, job.id), [scratchDir, jobTempDir, ...previousThreadArtifactRoots(job, managedStateDir)])
       let taskGoalStatus: GoalStatus | undefined
       let finalTurn: AppServerTurn | null = null
@@ -9077,7 +9083,10 @@ export async function executeCodexJob(
                   ? reconciledTurn : await session.loadFullTurn(currentThreadId!, reconciledTurn)
                 reconciledTurn = completedTurn
                 const completedMessage = appServerFinalMessage(completedTurn)
-                if (completedMessage) continuedArtifactMessage.observe(completedMessage, activeInputRevision)
+                if (completedMessage) {
+                  continuedArtifactMessage.observe(completedMessage, activeInputRevision)
+                  continuedAnswer.observe(completedMessage, activeInputRevision)
+                }
               } catch {
                 // Intermediate tool-only turns can legitimately have no final message.
                 // Observation must not prevent the native goal from continuing.
@@ -9558,6 +9567,7 @@ export async function executeCodexJob(
       if (protocolCompleted && protocolError == null && finalMessage && interjectionAnswerRetry === null) {
         if (!userCancelled && stage === 'complete') {
           finalMessage = continuedArtifactMessage.resolve(finalMessage, activeInputRevision, taskGoalStatus)
+          finalMessage = continuedAnswer.resolve(finalMessage, activeInputRevision, taskGoalStatus)
         }
         atomicWritePrivateFile(finalPath, finalMessage)
       }
