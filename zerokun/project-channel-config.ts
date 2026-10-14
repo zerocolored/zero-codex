@@ -321,32 +321,87 @@ interface AppSwitchJournal {
   routes: Array<{ appId: string; stateDir: string; channels: string[]; configuredAt?: Record<string, number>; explicitMode?: boolean }>
 }
 
+type RegisteredAppState = { appId: string; stateDir: string }
+
+function readAppSwitchJournal(path: string, apps: RegisteredAppState[]): AppSwitchJournal | null {
+  const raw = readOptionalBoundedOwnerOnlyRegularFile(path, MAX_JOURNAL_BYTES)
+  if (raw === null) return null
+  const journal = JSON.parse(raw) as AppSwitchJournal
+  if (journal.version !== 1 || !['forward', 'rollback'].includes(journal.direction)
+    || !apps.some(app => app.appId === journal.targetAppId) || !Array.isArray(journal.routes)
+    || journal.before?.version !== 1 || (journal.before.slackAppId != null && !apps.some(app => app.appId === journal.before.slackAppId))
+    || !journal.routes.some(route => route.appId === journal.targetAppId)
+    || new Set(journal.routes.map(route => route.appId)).size !== journal.routes.length
+    || journal.routes.some(route => !apps.some(app => app.appId === route.appId && app.stateDir === route.stateDir))) {
+    throw new Error('Slackアプリ切り替えの保存記録と登録情報が一致しません')
+  }
+  journal.before.slackChannels = normalizeChannels(journal.before.slackChannels)
+  for (const route of journal.routes) {
+    route.channels = normalizeChannels(route.channels)
+    if (route.configuredAt && route.channels.some(channel => !Number.isSafeInteger(route.configuredAt![channel]) || route.configuredAt![channel]! <= 0)) {
+      throw new Error('Slackアプリ切り替えの経路時刻を読み取れません')
+    }
+  }
+  return journal
+}
+
+class AppSwitchScopeChanged extends Error {}
+
 /** Explicit CLI selection moves routing only; jobs, threads and credentials stay put. */
 export function switchProjectSlackApp(
   repoPathInput: string,
   targetAppIdInput: string,
   registeredApps: Array<{ appId: string; stateDir: string }>,
 ): void {
+  const deadline = Date.now() + MUTATION_LOCK_WAIT_MS
+  while (true) {
+    try { return switchProjectSlackAppAttempt(repoPathInput, targetAppIdInput, registeredApps) }
+    catch (error) {
+      // Direct callers can race without the CLI's registry lock. Release all
+      // state leases before discovering the new source; never invert lock order.
+      if (!(error instanceof AppSwitchScopeChanged) || Date.now() >= deadline) throw error
+    }
+  }
+}
+
+function switchProjectSlackAppAttempt(
+  repoPathInput: string, targetAppIdInput: string, registeredApps: RegisteredAppState[],
+): void {
   const repoPath = realpathSync(repoPathInput)
   const targetAppId = requireSlackAppId(targetAppIdInput)
   const apps = registeredApps.map(app => ({ appId: requireSlackAppId(app.appId), stateDir: realpathSync(app.stateDir) }))
   if (!apps.some(app => app.appId === targetAppId)) throw new Error('選択したSlackアプリが未登録です')
-  // The same lock order is used for every switch, including reverse switches.
-  // Lock all registered states so legacy routes can be discovered without races.
   const leases: Array<{ path: string; lease: ProcessLockLease }> = []
   const stores = new Map<string, JobStore>()
   const journalFile = join(configDirectory(repoPath), 'slack-app-switch.json')
+  const discoverTargets = () => {
+    const config = readProjectChannelConfig(repoPath)
+    const pending = readAppSwitchJournal(journalFile, apps)
+    // Thread history stays in its original app and grants no current route.
+    // Discovery is read-only: unrelated updates, DB migrations and journals
+    // must not participate in this project's selection.
+    return apps.filter(app => app.appId === targetAppId || app.appId === config.slackAppId
+      || pending?.routes.some(route => route.appId === app.appId)
+      || appHasProjectHistory(app.stateDir, repoPath, false))
+  }
+  const targets = discoverTargets()
   try {
-    for (const state of [...new Set(apps.map(app => app.stateDir))].sort()) {
+    // Keep the existing state -> project lock order, including reverse switches.
+    for (const state of [...new Set(targets.map(app => app.stateDir))].sort()) {
       const lease = acquireMutationLock(state)
       leases.push({ path: mutationLockPath(state), lease })
       assertUpdateIdle(state)
+    }
+    for (const state of [...new Set(targets.map(app => app.stateDir))].sort()) {
       const store = new JobStore(resolveZeroJobDatabasePath(state))
       stores.set(state, store)
       recoverJournal(state, store)
     }
     withProjectConfigLock(repoPath, () => {
       assertNoPendingAppUnset(repoPath)
+      if (discoverTargets().some(app => !targets.includes(app))) {
+        throw new AppSwitchScopeChanged('Slackアプリの接続状態が変更されました。選択を再実行してください')
+      }
       const saveConfig = (config: ProjectChannelConfig) => atomicWritePrivateFile(projectChannelConfigPath(repoPath), JSON.stringify(config, null, 2) + '\n')
       const saveJournal = (journal: AppSwitchJournal) => atomicWritePrivateFile(journalFile, JSON.stringify(journal) + '\n')
       const apply = (journal: AppSwitchJournal) => {
@@ -382,24 +437,9 @@ export function switchProjectSlackApp(
         saveConfig(journal.direction === 'rollback' ? journal.before : { ...journal.before, slackAppId: journal.targetAppId, ...(journal.before.slackAppId === null ? { slackAcceptAfter: Date.now() } : {}) })
         unlinkSync(journalFile)
       }
-      const pending = readOptionalBoundedOwnerOnlyRegularFile(journalFile, MAX_JOURNAL_BYTES)
+      const pending = readAppSwitchJournal(journalFile, apps)
       if (pending !== null) {
-        const journal = JSON.parse(pending) as AppSwitchJournal
-        if (journal.version !== 1 || !['forward', 'rollback'].includes(journal.direction)
-          || !apps.some(app => app.appId === journal.targetAppId) || !Array.isArray(journal.routes)
-          || journal.before?.version !== 1 || (journal.before.slackAppId != null && !apps.some(app => app.appId === journal.before.slackAppId))
-          || !journal.routes.some(route => route.appId === journal.targetAppId)
-          || new Set(journal.routes.map(route => route.appId)).size !== journal.routes.length
-          || journal.routes.some(route => !apps.some(app => app.appId === route.appId && app.stateDir === route.stateDir))) {
-          throw new Error('Slackアプリ切り替えの保存記録と登録情報が一致しません')
-        }
-        journal.before.slackChannels = normalizeChannels(journal.before.slackChannels)
-        for (const route of journal.routes) {
-          route.channels = normalizeChannels(route.channels)
-          if (route.configuredAt && route.channels.some(channel => !Number.isSafeInteger(route.configuredAt![channel]) || route.configuredAt![channel]! <= 0)) {
-            throw new Error('Slackアプリ切り替えの経路時刻を読み取れません')
-          }
-        }
+        const journal = pending
         const current = readProjectChannelConfig(repoPath)
         if (current.slackAppId !== journal.before.slackAppId && current.slackAppId !== journal.targetAppId) {
           throw new Error('Slackアプリ切り替え中に接続先が変更されています')
@@ -410,7 +450,7 @@ export function switchProjectSlackApp(
       if (before.slackAppId && !apps.some(app => app.appId === before.slackAppId)) {
         throw new Error('元のSlackアプリが未登録です。既存設定は変更していません')
       }
-      const routes = apps.map(app => {
+      const routes = targets.map(app => {
         const owned = stores.get(app.stateDir)!.listSlackChannelRoutes(app.appId).filter(route => route.repoPath === repoPath)
         return { ...app, channels: owned.map(route => route.channelId), configuredAt: Object.fromEntries(owned.map(route => [route.channelId, route.configuredAt])), explicitMode: stores.get(app.stateDir)!.slackChannelRoutingIsExplicit(app.appId) }
       })
@@ -452,7 +492,7 @@ export function assertProjectSlackAppAttached(repoPath: string): void {
 }
 
 /** Discover historical ownership without migrating or recovering unrelated apps. */
-function appHasProjectHistory(stateDir: string, repoPath: string): boolean {
+function appHasProjectHistory(stateDir: string, repoPath: string, includeThreads = true): boolean {
   const raw = readOptionalBoundedOwnerOnlyRegularFile(journalPath(stateDir), MAX_JOURNAL_BYTES)
   if (raw !== null) {
     // Discovery needs only ownership. Validate the whole operation only when
@@ -464,7 +504,7 @@ function appHasProjectHistory(stateDir: string, repoPath: string): boolean {
   const db = new Database(path, { readonly: true })
   try {
     db.exec('PRAGMA busy_timeout=5000')
-    for (const table of ['slack_threads', 'slack_channel_routes']) {
+    for (const table of includeThreads ? ['slack_threads', 'slack_channel_routes'] : ['slack_channel_routes']) {
       if (!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) continue
       if (db.query(`SELECT 1 FROM ${table} WHERE repo_path = ? LIMIT 1`).get(repoPath)) return true
     }
